@@ -215,7 +215,7 @@ fn relation_missing_at_acl_lookup_is_rejected_when_parser_confirmed_it() {
             PRIV_SELECT,
             &names,
             None,
-            read::MissingRelation::RejectIfParsed(parsed),
+            parsed,
         )
     };
     // 解析が確認していない名前は読み飛ばす（誤分類された識別子）。

@@ -715,7 +715,10 @@ impl EngineCore {
             session,
             &prepared.tokens,
             crate::sql::privilege_gate::read::classify(parsed),
-            read_snap,
+            crate::sql::privilege_gate::read::ParsedScope {
+                read_snap,
+                parsed_relations: &prepared.parsed_relations,
+            },
         )
     }
 

@@ -532,3 +532,44 @@ fn explicit_txn_check_uses_begin_snapshot_after_concurrent_drop() {
         .execute_sql_in_txn(&ctx(A), &mut s, &mut txn, "ROLLBACK")
         .expect("rollback");
 }
+
+/// 実表 `"only"` の別名 `x`（`ONLY` 直後の識別子）は、通常 SQL でも準備済み文でも関係名として扱われない。
+/// 権限があれば両経路で成功し、権限が無ければ両経路で `42501`。Parse 時に実在を確認した実表が Parse 後に
+/// DROP されたときだけ、Bind は `42P01` で拒否する（Issue #1967。規則は通常 SQL と同一）。
+#[test]
+fn alias_after_quoted_only_table_is_not_a_missing_relation_in_either_protocol() {
+    let f = fx("selpriv-only-alias");
+    f.admin_run("CREATE TABLE \"only\" (id BIGINT PRIMARY KEY)");
+    let sql = "SELECT x.id FROM \"only\" x";
+    let s = bound(f.alice, A, false);
+    let mut simple = bound(f.alice, A, false);
+    let denied = f
+        .core
+        .execute_sql_in_session(&ctx(A), &mut simple, sql)
+        .expect_err("simple denied");
+    assert_eq!(denied.wire_code(), "42501");
+    let e = f
+        .core
+        .parse_sql_prepared_with_declared_in_session(&s, sql, &[])
+        .expect_err("prepared denied");
+    assert_eq!(e.wire_code(), "42501");
+
+    f.admin_run("GRANT SELECT ON \"only\" TO alice");
+    f.core
+        .execute_sql_in_session(&ctx(A), &mut simple, sql)
+        .expect("simple granted");
+    let prepared = f
+        .core
+        .parse_sql_prepared_with_declared_in_session(&s, sql, &[])
+        .expect("prepared granted");
+    let txn = f.core.new_session_transaction();
+    f.core
+        .bind_prepared_in_txn(&s, &txn, &prepared, &[])
+        .expect("bind");
+    f.admin_run("DROP TABLE \"only\"");
+    let e = f
+        .core
+        .bind_prepared_in_txn(&s, &txn, &prepared, &[])
+        .expect_err("dropped after parse");
+    assert_eq!(e.wire_code(), "42P01");
+}

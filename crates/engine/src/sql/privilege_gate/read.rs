@@ -200,7 +200,7 @@ pub(crate) fn require_read_privileges(
         required_bits,
         &crate::sql::search_path::resolved_relation_ref_names(&resolved),
         snapshot.read_snap,
-        MissingRelation::RejectIfParsed(snapshot.parsed_relations),
+        snapshot.parsed_relations,
     )
 }
 
@@ -212,7 +212,7 @@ pub(crate) fn require_read_privileges_resolved(
     session: &SessionState,
     resolved_tokens: &[Token],
     requirement: ReadRequirement,
-    read_snap: Option<&redb::ReadTransaction>,
+    scope: ParsedScope<'_>,
 ) -> Result<(), SqlSurfaceError> {
     let Some(required_bits) = requirement.bits() else {
         return Ok(());
@@ -234,8 +234,8 @@ pub(crate) fn require_read_privileges_resolved(
         &principal,
         required_bits,
         &crate::sql::search_path::resolved_relation_ref_names(resolved_tokens),
-        read_snap,
-        MissingRelation::AlwaysReject,
+        scope.read_snap,
+        scope.parsed_relations,
     )
 }
 
@@ -248,25 +248,6 @@ pub(crate) struct ParsedScope<'a> {
     pub(crate) parsed_relations: &'a [String],
 }
 
-/// ACL 照会で relation が見つからなかったときの扱い。
-#[derive(Debug, Clone, Copy)]
-pub(super) enum MissingRelation<'a> {
-    /// 準備済み文（Parse 時に名前解決済みのトークン列）。見つからない参照先はすべて陳腐化として拒否する。
-    AlwaysReject,
-    /// 通常 SQL。構文解析がカタログで実在を確認した名前（引数）だけを陳腐化として拒否し、それ以外
-    /// （構文語・別名などの誤分類された識別子）は読み飛ばす。
-    RejectIfParsed(&'a [String]),
-}
-
-impl MissingRelation<'_> {
-    fn is_stale(&self, name: &str) -> bool {
-        match self {
-            Self::AlwaysReject => true,
-            Self::RejectIfParsed(parsed) => parsed.iter().any(|p| p == name),
-        }
-    }
-}
-
 /// 解決済みの relation 名の並びに対する判定（表名を直接渡す HTTP 表層の入口と共有する）。
 pub(super) fn require_relations(
     storage: &Storage,
@@ -275,7 +256,7 @@ pub(super) fn require_relations(
     required_bits: u16,
     candidates: &[String],
     read_snap: Option<&redb::ReadTransaction>,
-    missing: MissingRelation<'_>,
+    parsed_relations: &[String],
 ) -> Result<(), SqlSurfaceError> {
     let mut names: Vec<String> = Vec::new();
     for name in candidates {
@@ -311,7 +292,7 @@ pub(super) fn require_relations(
             // ビュー自身を含む）が ACL 照会の時点で見つからないなら、解析後に別セッションが DROP した
             // 参照先であり、検査を省略すると展開済みの基底表を権限なしで読めてしまう。拒否する。
             // 解析で実在を確認できなかった名前（構文語・別名などの誤分類）だけを読み飛ばす。
-            if missing.is_stale(name) {
+            if parsed_relations.iter().any(|p| p == name) {
                 // 内部キー（`#<schema_id>.<name>`）は利用者へ出さない（ADR D2）。公開名の名前部だけを返す。
                 return Err(SqlSurfaceError::undefined_table(
                     crate::catalog::namespace::relation_name_part(name),
@@ -356,7 +337,7 @@ pub(crate) fn require_table_select(
         PRIV_SELECT,
         &[table.to_string()],
         None,
-        MissingRelation::RejectIfParsed(&[]),
+        &[],
     )
 }
 

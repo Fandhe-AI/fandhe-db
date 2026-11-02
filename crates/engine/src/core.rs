@@ -2614,6 +2614,11 @@ pub struct PreparedSql {
     /// `CREATE TABLE` の作成対象名が `public.` で明示修飾されていたか（TABLE-27・Issue #1715）。
     /// 再 parse した `CREATE TABLE` へ戻し、作成先の判定（`search_path`）を飛ばすために使う。
     create_public: bool,
+    /// Parse 時の構造検証 parse がカタログで実在を確認した relation 名（ビュー展開前のビュー自身を含む。
+    /// 解決済みトークンと同じ内部キー表記）。Bind・Execute の読み取り権限の再検査は、この名前が ACL 照会
+    /// の時点で見つからない場合だけ「Parse 後に消えた参照先」として拒否する（通常 SQL と同じ規則。
+    /// 別名などの誤収集は対象外。Issue #1967）。
+    parsed_relations: Vec<String>,
 }
 
 /// 解決済みトークンから再 parse した `DROP TABLE` に、Parse 時に外した `public.` 修飾の
@@ -6947,6 +6952,7 @@ impl EngineCore {
                 public_qualified,
                 qualified_positions,
                 create_public,
+                parsed_relations: Vec::new(),
                 route: temp_route::PreparedRoute::Plain,
             });
         }
@@ -7008,6 +7014,7 @@ impl EngineCore {
         // 仮値での定数畳み込みは値依存エラー（0 除算等）を Bind まで遅延する
         // （`VALUES (1, 10 / $1)` の実値を Bind で受けるため。Parse は構造と型だけ検証）。
         let dummy_tokens = crate::sql::params::substitute_dummy_typed(&tokens, &kinds);
+        let parse_hits = crate::sql::temp_catalog::RelationHits::default();
         let dummy_parsed = {
             let positions: Vec<usize> = tokens
                 .iter()
@@ -7017,7 +7024,8 @@ impl EngineCore {
                 .collect();
             let _guard = crate::sql::const_expr::defer_param_value_errors(positions);
             crate::datetime::reset_session_time_zone_read();
-            let mut parsed = self.parse_tokens(dummy_tokens)?;
+            let dummy_tokens = Self::normalize_row_count_clauses(dummy_tokens)?;
+            let mut parsed = self.parse_tokens_recorded(dummy_tokens, None, None, &parse_hits)?;
             // 解決済みトークンの再 parse は `public.` 修飾の情報を持たない。`$n` を含まない文の
             // 実行は `dummy_parsed` を複製するため、ここで保持して実行時の衝突検査を通す。
             attach_public_qualified(&mut parsed, &public_qualified, create_public);
@@ -7064,6 +7072,7 @@ impl EngineCore {
             public_qualified,
             qualified_positions,
             create_public,
+            parsed_relations: parse_hits.recorded_names(),
             route: temp_route::PreparedRoute::Plain,
         })
     }
