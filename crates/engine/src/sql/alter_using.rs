@@ -417,6 +417,7 @@ pub(crate) fn redact_row_conversion_error(e: SqlSurfaceError) -> SqlSurfaceError
         | E::TooManyRows
         | E::CaseNotFound
         | E::FunctionExecutedNoReturnStatement
+        | E::RaisedException(_)
         | E::QueryCanceled { .. }
         | E::UniqueViolation
         | E::ColumnReferenceWithoutFrom

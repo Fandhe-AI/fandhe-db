@@ -550,7 +550,7 @@ fn assert_projected_as(resp: &HttpResponse, expected_class: ErrorClass) {
 
 // --- R7: 射影表が ErrorClass::ALL 全体を閉じて覆うことの機械検証 -----------
 
-const _: () = assert!(ErrorClass::ALL.len() == 101);
+const _: () = assert!(ErrorClass::ALL.len() == 102);
 
 /// `wire_code` を共有する分類と、逆引き（`from_wire_code`）が返す分類の組
 /// （ERR-6。`23502`: TABLE-16・TASK-204・Issue #904、`23505`: Issue #1180）。
@@ -1016,6 +1016,8 @@ fn err4_f_unreachable_classes_project_via_production_encoder() {
         ErrorClass::TooManyRows,
         ErrorClass::CaseNotFound,
         ErrorClass::FunctionExecutedNoReturnStatement,
+        // `RAISE EXCEPTION`（Issue #2227・SQL-70）: 同様に NoSQL 表層から到達しない。
+        ErrorClass::RaisedException,
         ErrorClass::DependentObjectsStillExist,
         ErrorClass::WrongObjectType,
         // SQL-40（Issue #1965）: `GRANT`／`REVOKE` の不正な操作（`0LP01`）。GRANT 相当の op は NoSQL 表層に無く到達不能。
