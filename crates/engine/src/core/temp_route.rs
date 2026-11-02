@@ -855,11 +855,23 @@ impl EngineCore {
             if !name.starts_with('#') {
                 continue;
             }
-            if let Ok(crate::catalog::namespace::RelationKey::InSchema { schema_id, .. }) =
-                crate::catalog::namespace::RelationKey::parse(name)
+            if let Ok(crate::catalog::namespace::RelationKey::InSchema {
+                schema_id,
+                name: rel,
+            }) = crate::catalog::namespace::RelationKey::parse(name)
             {
                 if !seen.contains(&schema_id) {
                     seen.push(schema_id);
+                    // Parse 後に DROP SCHEMA された場合は ACL 行も消えるため、USAGE 検査より先に
+                    // 生存を再検証し、解決器経路と同じ undefined table（42P01）にする（42501 に化けさせない）。
+                    let alive = self
+                        .storage
+                        .schema_names_for_tenant(tenant)
+                        .map_err(crate::catalog::table_lookup_error)?
+                        .contains_key(&schema_id);
+                    if !alive {
+                        return Err(SqlSurfaceError::undefined_table(rel));
+                    }
                     self.check_schema_usage_for(tenant, session, schema_id)?;
                 }
             }

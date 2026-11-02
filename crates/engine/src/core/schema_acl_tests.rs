@@ -294,6 +294,22 @@ fn prepared_without_params_is_rechecked_by_public_entry() {
 }
 
 #[test]
+fn prepared_recheck_reports_dropped_schema_as_undefined_table() {
+    let (core, _g, mut o, mut a) = fixture("sacl_prep_drop");
+    ok(&core, "t1", &mut o, "GRANT USAGE ON SCHEMA s TO alice");
+    assert!(a.bind_resolution_tenant("t1"));
+    let prepared = core
+        .parse_sql_prepared_with_declared_in_session(&a, "SELECT id FROM s.t", &[])
+        .expect("parse");
+    ok(&core, "t1", &mut o, "DROP SCHEMA s CASCADE");
+    // ACL 行も消えるが、権限拒否（42501）ではなく不在（42P01）として扱う。
+    let err = core
+        .recheck_prepared_schema_usage(&a, &prepared)
+        .expect_err("dropped");
+    assert_eq!(err.wire_code(), "42P01");
+}
+
+#[test]
 fn search_path_creation_target_requires_usage() {
     let (core, _g, _o, mut a) = fixture("sacl_ct");
     ok(&core, "t1", &mut a, "SET search_path = s, public");

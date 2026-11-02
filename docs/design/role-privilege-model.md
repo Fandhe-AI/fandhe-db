@@ -485,4 +485,3 @@ SQL-40 ポインタ。判定点を `sql/privilege_gate.rs` の `check`（主体�
 - 対象外: SEQUENCE・FUNCTION 単位の ACL（#2235）、所有者・PUBLIC の既定（#2236）、`ALTER DEFAULT PRIVILEGES ... IN SCHEMA`
   （#2237）、表・列権限の参照時検査（#1967〜#1969）、権限検査の共通ゲートへの統合（#1966。判定は `sql/schema_privilege.rs`
   に集約済みで、ゲートへ移す）、存在オラクルの網羅試験（#1972）。
-
