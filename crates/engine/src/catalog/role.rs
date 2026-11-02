@@ -514,6 +514,38 @@ pub(crate) fn tenant_has_roles_in_txn<R: ReadSource>(src: &R, tenant: &str) -> R
     }
 }
 
+/// users ファイルの `(tenant, name)` に対応するロールの引き結果（Issue #1971。[`resolve_tenant_role_in_txn`]）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TenantRoleLookup {
+    /// テナントにロールが 1 件も無い（カタログが正ではない。従来どおり未束縛で扱う）。
+    NotAuthoritative,
+    /// 同名のロールがある。
+    Found(RoleDef),
+    /// テナントにロールはあるが同名が無い（識別子として不正な名前を含む）。
+    Missing,
+}
+
+/// users ファイルの `(tenant, name)` に対応するロールを、1 つの読み取りで引く（Issue #1971・ADR D3・D4）。
+/// 「カタログが正か」の判定は当面「テナントにロールが 1 件以上ある」で行う継ぎ目で、#2238 でマーカー判定へ
+/// 差し替える。名前はバイト単位の完全一致で、不正な識別子は `Missing` に畳む。破損は `Err`（0 件と取り違えない）。
+pub(crate) fn resolve_tenant_role_in_txn<R: ReadSource>(
+    src: &R,
+    tenant: &str,
+    name: &str,
+) -> Result<TenantRoleLookup> {
+    validate_tenant(tenant)?;
+    if !tenant_has_roles_in_txn(src, tenant)? {
+        return Ok(TenantRoleLookup::NotAuthoritative);
+    }
+    if validate_identifier(name).is_err() {
+        return Ok(TenantRoleLookup::Missing);
+    }
+    Ok(match get_role_in_txn(src, tenant, name)? {
+        Some(def) => TenantRoleLookup::Found(def),
+        None => TenantRoleLookup::Missing,
+    })
+}
+
 /// 内部 ID を 1 つ払い出す（1 始まり・`checked_add`・再利用しない）。
 fn allocate_role_id_in_txn(write_txn: &redb::WriteTransaction) -> Result<u64> {
     let mut counter = write_txn.open_table(ROLE_ID_COUNTER_TABLE)?;
@@ -1230,6 +1262,12 @@ impl Storage {
     pub(crate) fn tenant_has_roles(&self, tenant: &str) -> Result<bool> {
         let rt = self.db().begin_read()?;
         tenant_has_roles_in_txn(&rt, tenant)
+    }
+
+    /// users ファイルのユーザーに対応するロールを同一の読み取りで引く（[`resolve_tenant_role_in_txn`]）。
+    pub(crate) fn resolve_tenant_role(&self, tenant: &str, name: &str) -> Result<TenantRoleLookup> {
+        let rt = self.db().begin_read()?;
+        resolve_tenant_role_in_txn(&rt, tenant, name)
     }
 
     /// ログイン識別子を解決する（[`resolve_login_in_txn`]）。

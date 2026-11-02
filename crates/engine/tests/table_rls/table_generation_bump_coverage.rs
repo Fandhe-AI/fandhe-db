@@ -558,11 +558,11 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // 後続の base 取り込みで role.rs の行番号が +4 行移動したための追随（対象外の理由は同じ）。
     // Issue #2233（ログイン名対応表の追随・`sync_login_names` の追加で行番号が移動。同じ理由で対象外）。
     // PR #2867 レビュー対応で role.rs の行番号が +1 行移動したための追随（同じ理由で対象外）。
-    ("catalog/role.rs", 1131),
     ("catalog/role.rs", 1163),
-    ("catalog/role.rs", 1182),
-    ("catalog/role.rs", 1201),
-    ("catalog/role.rs", 1248),
+    ("catalog/role.rs", 1195),
+    ("catalog/role.rs", 1214),
+    ("catalog/role.rs", 1233),
+    ("catalog/role.rs", 1286),
     // Issue #1961 のロール・ACL カタログの単体テスト補助（`write` ヘルパー。専用表だけを書き表世代の対象外）。
     ("catalog/role/tests.rs", 37),
     // Issue #1962 の `sql::role_ddl` の crate 内テスト補助（`commit` ヘルパー。専用表だけを書き表世代の対象外）。
