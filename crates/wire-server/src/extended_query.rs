@@ -1068,6 +1068,10 @@ pub(crate) struct ExtendedQueryState {
     /// `handshake::post_auth_loop` は Sync（'S'）・Terminate（'X'）以外の
     /// メッセージを読み捨てる。
     pub(crate) ignore_till_sync: bool,
+    /// `ignore_till_sync` を立てたエラーが内部エラー（`XX000`）だったか。真なら
+    /// `handshake::post_auth_loop` は明示 Tx を `ROLLBACK TO` で復帰できない `Failed` へ倒し
+    /// writer を即時解放する（エラー契約。Issue #1947）。Sync で `false` へ戻す。
+    pub(crate) ignore_till_sync_internal: bool,
     /// 同期回復中に読み捨てた COPY 系メッセージ（'d'/'c'/'f'）のバイト数・件数
     /// （Issue #1761）。`handshake::post_auth_loop` が加算し、Sync で 0 へ戻す。
     pub(crate) ignored_copy_bytes: usize,
@@ -1088,6 +1092,7 @@ impl ExtendedQueryState {
             statements: PreparedStatementStore::with_max_named(limits.max_prepared_statements),
             portals: PortalStore::new(),
             ignore_till_sync: false,
+            ignore_till_sync_internal: false,
             ignored_copy_bytes: 0,
             ignored_copy_messages: 0,
         }
@@ -1414,6 +1419,9 @@ fn respond_error_and_await_sync<S: WireStream>(
     stream.write_all(&body)?;
     stream.flush()?;
     state.ignore_till_sync = true;
+    if err.error_class() == ErrorClass::InternalError {
+        state.ignore_till_sync_internal = true;
+    }
     Ok(())
 }
 
@@ -1490,13 +1498,13 @@ fn handle_parse_body(
 ) -> Result<(), HandlerError> {
     // フレーム本体の構造検証（`08P01`）だけを先に行う。
     let msg = parse_parse_body(body)?;
-    // 明示トランザクションが `Failed` の間は、`ROLLBACK` と空文字列以外を、
+    // 明示トランザクションが `Failed` の間は、`ROLLBACK`・`ROLLBACK TO`（Issue #1947）と空文字列以外を、
     // パラメータ型 OID 指定の未対応（`0A000`）等の機能検証や parse より前に
     // `25P02` で拒否する（SQL-31・TASK-221。簡易クエリの
     // `EngineCore::execute_sql_in_txn` と同じ判定順序。PR #1041 レビュー指摘）。
     if txn.status() == engine::sql::transaction::TransactionStatus::Failed
         && !engine::sql::lexer::is_effectively_empty(&msg.query)
-        && !engine::sql::transaction::is_rollback_statement(&msg.query)
+        && !engine::sql::transaction::is_allowed_while_failed(&msg.query)
     {
         return Err(HandlerError::Sql(txn.take_failed_error()));
     }
@@ -1875,7 +1883,8 @@ fn handle_bind_body(
                     | PreparedStatement::Parsed {
                         parsed: ParsedSql::Transaction(
                             engine::sql::transaction::ValidatedTxnControl {
-                                control: engine::sql::transaction::TxnControl::Rollback,
+                                control: engine::sql::transaction::TxnControl::Rollback
+                                    | engine::sql::transaction::TxnControl::RollbackToSavepoint,
                                 ..
                             }
                         ),
@@ -2222,7 +2231,8 @@ fn portal_is_exempt_while_failed(state: &ExtendedQueryState, portal_name: &str) 
                 matches!(
                     **parsed,
                     ParsedSql::Transaction(engine::sql::transaction::ValidatedTxnControl {
-                        control: engine::sql::transaction::TxnControl::Rollback,
+                        control: engine::sql::transaction::TxnControl::Rollback
+                            | engine::sql::transaction::TxnControl::RollbackToSavepoint,
                         ..
                     })
                 ) && matches!(portal.state, PortalState::Ready)
@@ -2836,6 +2846,7 @@ pub(crate) fn handle_sync<S: WireStream>(
     };
 
     state.ignore_till_sync = false;
+    state.ignore_till_sync_internal = false;
     state.ignored_copy_bytes = 0;
     state.ignored_copy_messages = 0;
     // WIRE-11・SQL-31・TASK-221・Issue #1174: 明示トランザクション中

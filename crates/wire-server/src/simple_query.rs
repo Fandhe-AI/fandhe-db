@@ -1018,6 +1018,11 @@ pub(crate) fn map_outcome(outcome: SqlOutcome) -> OutcomeResponse {
         SqlOutcome::GrantRevoke(o) => OutcomeResponse::Command {
             tag: if o.is_revoke() { "REVOKE" } else { "GRANT" }.to_string(),
         },
+        // SQL-40（Issue #2236）: `ALTER ... OWNER TO` は対象の種別に応じた `ALTER <種別>` タグ
+        // （PostgreSQL と同じ。件数なし）。
+        SqlOutcome::AlterOwner(o) => OutcomeResponse::Command {
+            tag: alter_owner_tag(o.kind()).to_string(),
+        },
         // SQL-39（Issue #1962）: ロール DDL も件数を持たない固定タグ（`CREATE USER` も PostgreSQL と同じ
         // `CREATE ROLE`）。
         SqlOutcome::CreateRole(_) => OutcomeResponse::Command {
@@ -1109,7 +1114,8 @@ fn respond_command_complete_with<S: WireStream>(
             Ok(StatementStatus::Completed)
         }
         Err(_) => {
-            txn.fail();
+            // 内部エラー（`XX000`）は復帰不可（writer 即時解放。Issue #1947）。
+            txn.fail_unrecoverable();
             respond_error(
                 stream,
                 ErrorClass::InternalError,
@@ -1293,7 +1299,7 @@ fn respond_rows_with_tag<S: WireStream>(
             // 指摘 P1）。ここで `fail()` せずに `Active` のまま返すと、直前の
             // `INSERT` 等の書き込みが未確定のまま残り、後続の `COMMIT` で
             // 誤って永続化されてしまう。
-            txn.fail();
+            txn.fail_unrecoverable();
             respond_error(
                 stream,
                 ErrorClass::InternalError,
@@ -1336,7 +1342,7 @@ fn respond_rows_with_tag<S: WireStream>(
                 buffer.flush(stream)?;
                 // 行エンコード失敗も上記と同じ理由で `Active` を `Failed` へ
                 // 強制遷移させる（SQL-31・PR #1041 レビュー指摘 P1）。
-                txn.fail();
+                txn.fail_unrecoverable();
                 respond_error(
                     stream,
                     ErrorClass::InternalError,
@@ -1366,7 +1372,7 @@ fn respond_rows_with_tag<S: WireStream>(
             buffer.flush(stream)?;
             // `CommandComplete` エンコード失敗も同様に `Failed` へ遷移させる
             // （SQL-31・PR #1041 レビュー指摘 P1）。
-            txn.fail();
+            txn.fail_unrecoverable();
             respond_error(
                 stream,
                 ErrorClass::InternalError,
@@ -1374,6 +1380,18 @@ fn respond_rows_with_tag<S: WireStream>(
             )?;
             Ok(StatementStatus::Failed)
         }
+    }
+}
+
+/// `ALTER ... OWNER TO` のコマンドタグ（対象の種別ごと。PostgreSQL の `ALTER TABLE`・`ALTER VIEW`・
+/// `ALTER MATERIALIZED VIEW`・`ALTER SCHEMA` と同じ）。`SqlOutcome::AlterOwner` の写像だけが呼ぶ。
+fn alter_owner_tag(kind: engine::sql::allowlist::AlterOwnerKind) -> &'static str {
+    use engine::sql::allowlist::AlterOwnerKind;
+    match kind {
+        AlterOwnerKind::Table => "ALTER TABLE",
+        AlterOwnerKind::View => "ALTER VIEW",
+        AlterOwnerKind::MaterializedView => "ALTER MATERIALIZED VIEW",
+        AlterOwnerKind::Schema => "ALTER SCHEMA",
     }
 }
 
@@ -1389,6 +1407,19 @@ mod temp_db;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `ALTER ... OWNER TO` のコマンドタグは対象の種別ごとの `ALTER <種別>`（Issue #2236）。
+    #[test]
+    fn alter_owner_tag_follows_the_target_kind() {
+        use engine::sql::allowlist::AlterOwnerKind;
+        assert_eq!(alter_owner_tag(AlterOwnerKind::Table), "ALTER TABLE");
+        assert_eq!(alter_owner_tag(AlterOwnerKind::View), "ALTER VIEW");
+        assert_eq!(
+            alter_owner_tag(AlterOwnerKind::MaterializedView),
+            "ALTER MATERIALIZED VIEW"
+        );
+        assert_eq!(alter_owner_tag(AlterOwnerKind::Schema), "ALTER SCHEMA");
+    }
 
     /// テスト用: 行のセル数に合わせた列メタ（値の整形が列型に依存しない行のみ
     /// 使うため全列 `TEXT`。Issue #1173 で `encode_data_row` が列メタを要求する）。

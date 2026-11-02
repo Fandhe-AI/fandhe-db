@@ -169,7 +169,7 @@ fn rollback_to_unknown_name_is_3b001_and_failed_state_is_25p02() {
     let err = run(&engine, &caller, &mut s, &mut txn, "ROLLBACK TO b").unwrap_err();
     assert_eq!(err.wire_code(), "3B001");
     assert_eq!(txn.status(), TransactionStatus::Failed);
-    // Failed 中の `ROLLBACK TO` は Tx 全体の ROLLBACK とは扱わず 25P02（復帰は #1941）。
+    // savepoint が無いので Failed 中の `ROLLBACK TO` は復帰できず 25P02（Issue #1947 の保持条件外）。
     for sql in [
         "ROLLBACK TO a",
         "ROLLBACK WORK TO SAVEPOINT a",

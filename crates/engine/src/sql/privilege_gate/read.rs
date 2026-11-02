@@ -131,6 +131,7 @@ pub(crate) fn classify(parsed: &ParsedSql) -> ReadRequirement {
         | ParsedSql::CreateSchema(_)
         | ParsedSql::DropSchema(_)
         | ParsedSql::AlterSchema(_)
+        | ParsedSql::AlterOwner(_)
         | ParsedSql::AlterSequence(_)
         | ParsedSql::SequenceFunction(_) => NotApplicable,
     }
@@ -185,7 +186,8 @@ pub(crate) fn require_read_privileges(
                 required_bits,
                 granted_bits: 0,
             },
-        );
+        )
+        .map(|_| ());
     }
     let mut resolved = tokens.to_vec();
     crate::sql::relation_name::rewrite_relation_names_full(&mut resolved, resolver)?;
@@ -221,7 +223,8 @@ pub(crate) fn require_read_privileges_resolved(
                 required_bits,
                 granted_bits: 0,
             },
-        );
+        )
+        .map(|_| ());
     }
     require_relations(
         storage,
@@ -309,7 +312,8 @@ pub(crate) fn require_table_select(
                 required_bits: PRIV_SELECT,
                 granted_bits: 0,
             },
-        );
+        )
+        .map(|_| ());
     }
     require_relations(
         storage,

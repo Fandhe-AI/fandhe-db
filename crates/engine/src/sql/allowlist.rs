@@ -67,6 +67,14 @@ pub(crate) use policy::{
 };
 pub use policy::{ValidatedAlterPolicy, ValidatedCreatePolicy, ValidatedDropPolicy};
 
+// `ALTER ... OWNER TO`・`CREATE SCHEMA ... AUTHORIZATION`・`REASSIGN／DROP OWNED` の構文検証（Issue #2236）。
+mod owner;
+pub(crate) use owner::{
+    is_alter_owner_statement, is_owned_by_statement, reject_owned_by, validate_alter_owner_tokens,
+    RoleSpec,
+};
+pub use owner::{AlterOwnerKind, ValidatedAlterOwner};
+
 // GRANT／REVOKE の構文検証（SQL-40・Issue #1965）。
 mod grant;
 pub use grant::ValidatedGrantRevoke;
@@ -19824,6 +19832,8 @@ pub(crate) fn validate_drop_type_tokens(
 pub struct ValidatedCreateSchema {
     pub(crate) name: String,
     pub(crate) if_not_exists: bool,
+    /// `AUTHORIZATION <ロール>` の所有者指定（Issue #2236。省略時は作成者＝現在ロール）。
+    pub(crate) authorization: Option<RoleSpec>,
 }
 
 impl ValidatedCreateSchema {
@@ -19924,10 +19934,11 @@ pub(crate) fn is_drop_schema_statement(tokens: &[Token]) -> bool {
     ident_at(0, "DROP") && ident_at(1, "SCHEMA")
 }
 
-/// [`ValidatedCreateSchema`] の構造検証本体（TABLE-27、Issue #1713）。`AUTHORIZATION`（名前の有無を
-/// 問わない）と schema_element（`CREATE SCHEMA s CREATE TABLE ...`）は、ロール（SQL-39）が入るまで
-/// 黙って無視せず `0A000` で拒否する（fail-closed。設計記録 D10）。修飾名・不正な識別子・余分な
-/// トークンは `42601`。
+/// [`ValidatedCreateSchema`] の構造検証本体（TABLE-27、Issue #1713）。`AUTHORIZATION <ロール>`
+/// （`CREATE SCHEMA [IF NOT EXISTS] <名> AUTHORIZATION <ロール>` と名前省略形
+/// `CREATE SCHEMA AUTHORIZATION <ロール名>`。Issue #2236）は所有者の指定として受理し、schema_element
+/// （`CREATE SCHEMA s CREATE TABLE ...`）と、`CURRENT_USER` 等で名前を省略する形は黙って無視せず
+/// `0A000` で拒否する（fail-closed。設計記録 D10）。修飾名・不正な識別子・余分なトークンは `42601`。
 pub(crate) fn validate_create_schema_tokens(
     tokens: &[Token],
 ) -> Result<ValidatedCreateSchema, SqlSurfaceError> {
@@ -19935,13 +19946,29 @@ pub(crate) fn validate_create_schema_tokens(
     p.expect_ident_matching("CREATE")?;
     p.expect_ident_matching("SCHEMA")?;
     let if_not_exists = p.parse_optional_if_not_exists();
-    let authorization = || {
+    let elements = || {
         SqlSurfaceError::feature_not_supported(
-            "CREATE SCHEMA with AUTHORIZATION or schema elements is not supported",
+            "CREATE SCHEMA with schema elements is not supported",
         )
     };
+    // 名前省略形: `CREATE SCHEMA [IF NOT EXISTS] AUTHORIZATION <ロール名>`（SCHEMA 名はロール名）。
     if p.peek_ident_matches("AUTHORIZATION") {
-        return Err(authorization());
+        p.advance();
+        let spec = owner::parse_role_spec(&mut p)?;
+        let RoleSpec::Name(name) = spec.clone() else {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "CREATE SCHEMA AUTHORIZATION without a schema name requires a role name",
+            ));
+        };
+        if p.peek_ident_matches("CREATE") {
+            return Err(elements());
+        }
+        p.expect_end_of_statement()?;
+        return Ok(ValidatedCreateSchema {
+            name,
+            if_not_exists,
+            authorization: Some(spec),
+        });
     }
     if matches!(p.peek(), Some(Token::QualifiedIdent { .. })) {
         return Err(SqlSurfaceError::unsupported(
@@ -19951,13 +19978,20 @@ pub(crate) fn validate_create_schema_tokens(
     let name = p.expect_ident()?;
     crate::catalog::validate_identifier(&name)
         .map_err(|_| SqlSurfaceError::unsupported("invalid schema name in CREATE SCHEMA"))?;
-    if p.peek_ident_matches("AUTHORIZATION") || p.peek_ident_matches("CREATE") {
-        return Err(authorization());
+    let authorization = if p.peek_ident_matches("AUTHORIZATION") {
+        p.advance();
+        Some(owner::parse_role_spec(&mut p)?)
+    } else {
+        None
+    };
+    if p.peek_ident_matches("CREATE") {
+        return Err(elements());
     }
     p.expect_end_of_statement()?;
     Ok(ValidatedCreateSchema {
         name,
         if_not_exists,
+        authorization,
     })
 }
 
@@ -20348,6 +20382,40 @@ pub(crate) fn is_drop_function_statement(tokens: &[Token]) -> bool {
         && matches!(tokens.get(1), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("FUNCTION"))
 }
 
+/// 関数名の直後の任意の型の並び `( [<型>[, ...]] )` を読む（`DROP FUNCTION` と `GRANT|REVOKE ... ON FUNCTION`
+/// の共有ヘルパー。型の解析器を複製しない）。括弧が無ければ `None`（名前だけで指す）、`f()` は `Some(空)`。
+/// 型は [`crate::sql::cast::parse_cast_type`] で読み、個数は `MAX_UDF_PARAMS` で検証してから確保する。
+fn parse_function_arg_types(
+    p: &mut Parser<'_>,
+) -> Result<Option<Vec<crate::catalog::ColumnType>>, SqlSurfaceError> {
+    if !matches!(p.peek(), Some(Token::Punct('('))) {
+        return Ok(None);
+    }
+    p.advance();
+    let mut types = Vec::new();
+    if !matches!(p.peek(), Some(Token::Punct(')'))) {
+        loop {
+            if types.len() >= crate::sql::udf_call::MAX_UDF_PARAMS {
+                return Err(SqlSurfaceError::payload_too_large(
+                    "too many function parameters",
+                ));
+            }
+            let cast = crate::sql::cast::parse_cast_type(&p.tokens, &mut p.pos)?;
+            let ty = cast
+                .result_column_type()
+                .ok_or_else(|| SqlSurfaceError::unsupported("unsupported argument type"))?;
+            types.push(ty);
+            if matches!(p.peek(), Some(Token::Punct(','))) {
+                p.advance();
+            } else {
+                break;
+            }
+        }
+    }
+    p.expect_punct(')')?;
+    Ok(Some(types))
+}
+
 /// [`ValidatedDropFunction`] の構造検証本体（SQL-66、Issue #1920）。受理するのは
 /// `DROP FUNCTION [IF EXISTS] <name> [(<型>[, ...])] [CASCADE | RESTRICT]` だけで、複数名は
 /// `0A000`、その他の形（引数名つき等）は型として読めず拒否する。型は
@@ -20368,32 +20436,7 @@ pub(crate) fn validate_drop_function_tokens(
     let name = p.expect_ident()?;
     crate::catalog::validate_relation_key(&name)
         .map_err(|_| SqlSurfaceError::unsupported("invalid function name in DROP FUNCTION"))?;
-    let mut arg_types = None;
-    if matches!(p.peek(), Some(Token::Punct('('))) {
-        p.advance();
-        let mut types = Vec::new();
-        if !matches!(p.peek(), Some(Token::Punct(')'))) {
-            loop {
-                if types.len() >= crate::sql::udf_call::MAX_UDF_PARAMS {
-                    return Err(SqlSurfaceError::payload_too_large(
-                        "too many function parameters",
-                    ));
-                }
-                let cast = crate::sql::cast::parse_cast_type(&p.tokens, &mut p.pos)?;
-                let ty = cast
-                    .result_column_type()
-                    .ok_or_else(|| SqlSurfaceError::unsupported("unsupported argument type"))?;
-                types.push(ty);
-                if matches!(p.peek(), Some(Token::Punct(','))) {
-                    p.advance();
-                } else {
-                    break;
-                }
-            }
-        }
-        p.expect_punct(')')?;
-        arg_types = Some(types);
-    }
+    let arg_types = parse_function_arg_types(&mut p)?;
     let mut behavior = DropFunctionBehavior::Restrict;
     if p.peek_ident_matches("CASCADE") {
         p.advance();

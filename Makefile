@@ -131,6 +131,7 @@ crash-test-view-write: ## ビュー書き込みの crash 耐性・台帳再送�
 	scripts/crash_test_view_write.sh
 
 # 採番状態・operation_id 台帳の crash 耐性回帰テスト（Issue #1692・#1700・TABLE-24 (3)(4) ポインタ。scripts/crash_test_sequence.sh を実行）
+# Issue #1948 で savepoint の段（SQL-69・RECOVER-5 ポインタ）を追加済み（新しい CI ジョブは作らず本ターゲットに含める）
 .PHONY: crash-test-sequence
 crash-test-sequence: ## 採番状態・operation_id 台帳の crash 耐性回帰テスト
 	scripts/crash_test_sequence.sh

@@ -542,6 +542,7 @@ impl EngineCore {
                 crate::sql::sequence_scope::SequenceScope::enter(
                     Arc::clone(self.storage.sequence_allocator()),
                     session.sequences_handle(),
+                    crate::sql::schema_privilege::acl_checked_principal(session),
                 )
             });
             let outcome = self.commit_copy_in_txn(ctx, txn, batch)?;

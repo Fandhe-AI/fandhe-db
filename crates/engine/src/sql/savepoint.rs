@@ -7,7 +7,9 @@
 //! redb の ephemeral savepoint で行う（Issue #1943）。redb の savepoint は「writer が最初に
 //! テーブルを開く前の状態」にしか戻せないため、各エントリに [`SavepointKind`] を持たせ、
 //! 巻き戻せるものだけ `ROLLBACK TO` を成功させる（詳細は `docs/design/explicit-transaction.md`）。
-//! 台帳・キャッシュ・カーソル等の復元は親 Issue #1941 の残りの子 Issue の範囲。
+//! Tx 内の書き込み記録は [`WriteMarks`] で保存・復元する（Issue #1945）。
+//! `operation_id` の Tx 内登録は水位で巻き戻す（Issue #1944。永続の台帳は redb の復元で戻る）。
+//! キャッシュ等の復元は親 Issue #1941 の残りの子 Issue の範囲。
 //!
 //! 規則は PostgreSQL に準拠する。`SAVEPOINT` は常に push し、同名があっても古い側を
 //! 残したまま新しい側が隠す。探索は新しい側から行い、`RELEASE` は見つけた savepoint と
@@ -18,8 +20,22 @@
 //! 不変条件: redb の dirty フラグは一度立つと下りないため、スタックは古い側から
 //! `[Restorable…, Unrestorable…]` の順に並ぶ。
 
+use std::collections::{BTreeSet, HashSet};
+
 use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::mode::SessionState;
+
+/// `SAVEPOINT` 時点の Tx 内書き込み記録（`ActiveTxn` の `has_writes`・`written_tables`・
+/// `written_by_tenant`）の複製（Issue #1945）。`ROLLBACK TO` が redb の巻き戻しと対にして
+/// 復元し、巻き戻した書き込みが読み取り経路の選択（`Writer` か確定スナップショットか）・
+/// 遅延 FK の走査範囲・空 Tx の commit 判定に残らないようにする。`Restorable` の savepoint
+/// だけが持つ（作成時点で redb 上 dirty でないため実質空の集合で、メモリ負担は小さい）。
+#[derive(Debug, Clone, Default)]
+pub(crate) struct WriteMarks {
+    pub(crate) has_writes: bool,
+    pub(crate) written_tables: HashSet<String>,
+    pub(crate) written_by_tenant: BTreeSet<(String, String)>,
+}
 
 /// savepoint の巻き戻し可否（redb の ephemeral savepoint の制約による）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +57,12 @@ struct Entry {
     /// `SAVEPOINT` 時点のカーソル識別子の高水位（`CursorRegistry::next_id`）。`ROLLBACK TO` は
     /// この値以上の識別子を持つカーソル（savepoint より後に宣言されたもの）を閉じる。
     cursor_watermark: u64,
+    /// `SAVEPOINT` 時点の書き込み記録。`Restorable` のときだけ `Some`（`Unrestorable` は
+    /// `ROLLBACK TO` 自体が拒否されるため保持しない）。
+    write_marks: Option<WriteMarks>,
+    /// `SAVEPOINT` 時点の `operation_id` 登録ログ長（Issue #1944）。`ROLLBACK TO` はこの位置より
+    /// 後に登録された ID を取り消し、同じ Tx 内で再利用できるようにする。
+    op_id_watermark: usize,
 }
 
 /// savepoint 名の LIFO スタック（古い順に並ぶ）。
@@ -63,13 +85,22 @@ impl SavepointStack {
         kind: SavepointKind,
         session: &SessionState,
         cursor_watermark: u64,
+        op_id_watermark: usize,
+        write_marks: Option<WriteMarks>,
     ) {
         self.entries.push(Entry {
             name: name.to_string(),
             kind,
             session: Box::new(session.clone()),
             cursor_watermark,
+            op_id_watermark,
+            write_marks,
         });
+    }
+
+    /// 位置 `pos` の savepoint 作成時点の書き込み記録。範囲外・`Unrestorable` は `None`。
+    pub(crate) fn write_marks_at(&self, pos: usize) -> Option<&WriteMarks> {
+        self.entries.get(pos).and_then(|e| e.write_marks.as_ref())
     }
 
     /// 位置 `pos` の savepoint 作成時点のセッション状態。範囲外は `None`。
@@ -80,6 +111,11 @@ impl SavepointStack {
     /// 位置 `pos` の savepoint 作成時点のカーソル識別子の高水位。範囲外は `None`。
     pub(crate) fn cursor_watermark_at(&self, pos: usize) -> Option<u64> {
         self.entries.get(pos).map(|e| e.cursor_watermark)
+    }
+
+    /// 位置 `pos` の savepoint 作成時点の `operation_id` 登録ログ長。範囲外は `None`。
+    pub(crate) fn op_id_watermark_at(&self, pos: usize) -> Option<usize> {
+        self.entries.get(pos).map(|e| e.op_id_watermark)
     }
 
     /// 最も新しい同名の位置（0 が最古）。無ければ `None`。
@@ -130,10 +166,21 @@ mod tests {
     const R: SavepointKind = SavepointKind::Restorable;
 
     #[test]
+    fn op_id_watermark_is_recorded_per_entry() {
+        let mut s = SavepointStack::new();
+        s.push("a", R, &SessionState::default(), 0, 1, None);
+        s.push("b", R, &SessionState::default(), 0, 3, None);
+        assert_eq!(s.op_id_watermark_at(0), Some(1));
+        assert_eq!(s.op_id_watermark_at(1), Some(3));
+        s.truncate_after(0);
+        assert_eq!(s.op_id_watermark_at(1), None);
+    }
+
+    #[test]
     fn push_and_position_search_newest_first() {
         let mut s = SavepointStack::new();
-        s.push("a", R, &SessionState::default(), 0);
-        s.push("b", R, &SessionState::default(), 0);
+        s.push("a", R, &SessionState::default(), 0, 0, None);
+        s.push("b", R, &SessionState::default(), 0, 0, None);
         assert_eq!(s.len(), 2);
         assert_eq!(s.position("a"), Some(0));
         assert_eq!(s.position("b"), Some(1));
@@ -143,8 +190,8 @@ mod tests {
     #[test]
     fn same_name_shadows_older_one() {
         let mut s = SavepointStack::new();
-        s.push("a", R, &SessionState::default(), 0);
-        s.push("a", R, &SessionState::default(), 0);
+        s.push("a", R, &SessionState::default(), 0, 0, None);
+        s.push("a", R, &SessionState::default(), 0, 0, None);
         assert_eq!(s.position("a"), Some(1));
         s.release("a").unwrap();
         assert_eq!(s.len(), 1);
@@ -157,9 +204,9 @@ mod tests {
     #[test]
     fn release_pops_newer_savepoints_too() {
         let mut s = SavepointStack::new();
-        s.push("a", R, &SessionState::default(), 0);
-        s.push("b", R, &SessionState::default(), 0);
-        s.push("c", R, &SessionState::default(), 0);
+        s.push("a", R, &SessionState::default(), 0, 0, None);
+        s.push("b", R, &SessionState::default(), 0, 0, None);
+        s.push("c", R, &SessionState::default(), 0, 0, None);
         s.release("b").unwrap();
         assert_eq!(s.len(), 1);
         assert_eq!(s.position("a"), Some(0));
@@ -169,7 +216,7 @@ mod tests {
     #[test]
     fn release_unknown_name_is_3b001_and_keeps_stack() {
         let mut s = SavepointStack::new();
-        s.push("a", R, &SessionState::default(), 0);
+        s.push("a", R, &SessionState::default(), 0, 0, None);
         let e = s.release("zzz").unwrap_err();
         assert_eq!(e.wire_code(), "3B001");
         assert_eq!(s.len(), 1);
@@ -178,7 +225,7 @@ mod tests {
     #[test]
     fn names_match_case_sensitively() {
         let mut s = SavepointStack::new();
-        s.push("a", R, &SessionState::default(), 0);
+        s.push("a", R, &SessionState::default(), 0, 0, None);
         assert_eq!(s.position("A"), None);
         assert!(s.release("A").is_err());
         assert_eq!(s.len(), 1);
@@ -187,13 +234,15 @@ mod tests {
     #[test]
     fn kind_is_kept_and_truncate_after_keeps_target() {
         let mut s = SavepointStack::new();
-        s.push("a", R, &SessionState::default(), 0);
-        s.push("b", R, &SessionState::default(), 0);
+        s.push("a", R, &SessionState::default(), 0, 0, None);
+        s.push("b", R, &SessionState::default(), 0, 0, None);
         s.push(
             "c",
             SavepointKind::Unrestorable,
             &SessionState::default(),
             0,
+            0,
+            None,
         );
         assert_eq!(s.kind_at(0), Some(R));
         assert_eq!(s.kind_at(2), Some(SavepointKind::Unrestorable));
@@ -215,9 +264,11 @@ mod tests {
             SavepointKind::Unrestorable,
             &SessionState::default(),
             0,
+            0,
+            None,
         );
         assert!(!s.has_restorable());
-        s.push("b", R, &SessionState::default(), 0);
+        s.push("b", R, &SessionState::default(), 0, 0, None);
         assert!(s.has_restorable());
         s.release("b").unwrap();
         assert!(!s.has_restorable());
@@ -226,14 +277,51 @@ mod tests {
     #[test]
     fn same_name_shadowing_uses_newest_kind() {
         let mut s = SavepointStack::new();
-        s.push("a", R, &SessionState::default(), 0);
+        s.push("a", R, &SessionState::default(), 0, 0, None);
         s.push(
             "a",
             SavepointKind::Unrestorable,
             &SessionState::default(),
             0,
+            0,
+            None,
         );
         let pos = s.position("a").unwrap();
         assert_eq!(s.kind_at(pos), Some(SavepointKind::Unrestorable));
+    }
+
+    #[test]
+    fn write_marks_are_kept_per_entry_and_dropped_with_it() {
+        let mut s = SavepointStack::new();
+        let marks = WriteMarks {
+            has_writes: true,
+            written_tables: HashSet::from(["t".to_string()]),
+            written_by_tenant: BTreeSet::from([("x".to_string(), "t".to_string())]),
+        };
+        s.push("a", R, &SessionState::default(), 0, 0, Some(marks));
+        s.push(
+            "b",
+            R,
+            &SessionState::default(),
+            0,
+            0,
+            Some(WriteMarks::default()),
+        );
+        s.push(
+            "c",
+            SavepointKind::Unrestorable,
+            &SessionState::default(),
+            0,
+            0,
+            None,
+        );
+        assert!(s.write_marks_at(0).is_some_and(|m| m.has_writes));
+        assert!(s.write_marks_at(1).is_some_and(|m| !m.has_writes));
+        assert!(s.write_marks_at(2).is_none());
+        assert!(s.write_marks_at(3).is_none());
+        s.truncate_after(0);
+        assert!(s.write_marks_at(1).is_none());
+        s.release("a").unwrap();
+        assert!(s.write_marks_at(0).is_none());
     }
 }

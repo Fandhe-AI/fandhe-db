@@ -408,6 +408,8 @@ mod apply_deps {
                 scope: AclScope::Tables,
                 tables: &tables,
                 schemas: &[],
+                sequences: &[],
+                functions: &[],
                 items: &items,
                 grantees: &grantees,
                 grant_option: go,
@@ -518,6 +520,64 @@ mod apply_deps {
         assert!(col_rows(&s, "a").iter().any(|e| e.grantee_id == carol));
     }
 
+    /// SEQUENCE 対象の GRANT／REVOKE（所有者を持てない種別）。所有者判定が Invalid にならず、
+    /// GRANT OPTION による委譲付与と、依存解決つきの REVOKE が通る（Issue #2236 レビュー指摘）。
+    fn run_seq(
+        s: &Storage,
+        grantor: u64,
+        owner: bool,
+        is_grant: bool,
+        grantee: u64,
+        go: bool,
+        cascade: bool,
+    ) -> std::result::Result<AclApplyOutcome, AclChangeError> {
+        let items = [AclItem {
+            bits: PRIV_USAGE,
+            columns: Vec::new(),
+        }];
+        let sequences = ["acl_seq".to_string()];
+        let grantees = [GranteeSpec::Id(grantee)];
+        s.apply_acl_changes(
+            "tn",
+            &AclRequest {
+                is_grant,
+                grantor_id: grantor,
+                owner_equivalent: owner,
+                scope: AclScope::Sequences,
+                tables: &[],
+                schemas: &[],
+                sequences: &sequences,
+                functions: &[],
+                items: &items,
+                grantees: &grantees,
+                grant_option: go,
+                cascade,
+            },
+        )
+    }
+
+    #[test]
+    fn sequence_grant_and_revoke_do_not_fail_owner_check() {
+        let (_g, s) = open("acl_seq_owner");
+        let params = crate::catalog::sequence::SequenceParams {
+            increment: 1,
+            min_value: 1,
+            max_value: 100,
+            start: 1,
+            cycle: false,
+        };
+        s.create_sequence("acl_seq", &params).expect("seq");
+        let op = role(&s, "op");
+        let alice = role(&s, "alice");
+        let bob = role(&s, "bob");
+        run_seq(&s, op, true, true, alice, true, false).expect("operator grant");
+        // WITH GRANT OPTION を持つ非運用者による再付与。
+        run_seq(&s, alice, false, true, bob, false, false).expect("delegated grant");
+        // 運用者による GRANT OPTION の REVOKE（依存解決で所有者判定を通る）。
+        let r = run_seq(&s, op, true, false, alice, true, true);
+        assert!(r.is_ok(), "{r:?}");
+    }
+
     #[test]
     fn grant_option_cycle_is_judged_per_privilege_bit() {
         let (_g, s) = open("acl_dep_bits");
@@ -570,6 +630,8 @@ mod apply_deps {
                 scope: AclScope::Tables,
                 tables: &tables,
                 schemas: &[],
+                sequences: &[],
+                functions: &[],
                 items: &items,
                 grantees: &grantees,
                 grant_option: false,

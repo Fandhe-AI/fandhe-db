@@ -298,6 +298,8 @@ jobs:
   # 台帳で拒否され値を消費しないことを検証する（scripts/crash_test_sequence.sh。負の対照
   # self-check を含む）。既存の crash-test 系と同じ理由で独立ジョブとし、actions/checkout は
   # SHA 固定で参照する。private submodule（docs/spec）は取得しない。
+  # Issue #1948 の savepoint の段（SQL-69・RECOVER-5 ポインタ。ROLLBACK TO/RELEASE を含む Tx の SIGKILL と、
+  # 3 点の決定的 kill）も同ジョブで実行する。必須チェック名を増やさないため新ジョブは作らない。
   crash-test-sequence:
     runs-on: ubuntu-latest
     timeout-minutes: 15
