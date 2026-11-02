@@ -164,14 +164,18 @@ impl From<CatalogError> for AclChangeError {
 type Result<T> = std::result::Result<T, AclChangeError>;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum RelKind {
+pub(super) enum RelKind {
     Table,
     View,
     Matview,
 }
 
 /// relation の種別を引く。無ければ `TableNotFound`、索引・SEQUENCE は `WrongObjectKind`。
-fn relation_kind(write_txn: &redb::WriteTransaction, tenant: &str, key: &str) -> Result<RelKind> {
+pub(super) fn relation_kind(
+    write_txn: &redb::WriteTransaction,
+    tenant: &str,
+    key: &str,
+) -> Result<RelKind> {
     crate::catalog::namespace::ensure_tenant_key_schema_alive_in_txn(write_txn, tenant, key)?;
     let in_views = match ReadSource::open_table(write_txn, VIEWS_TABLE) {
         Ok(t) => t.get(key).map_err(CatalogError::from)?.is_some(),
@@ -381,7 +385,8 @@ fn table_column_names(write_txn: &redb::WriteTransaction, table: &str) -> Result
 
 /// REVOKE の後始末。GRANT OPTION を失った `(付与先 x, 範囲)` について、`x` が付けた付与のうち `x` の残りの
 /// GRANT OPTION で賄えない権限は依存する付与として、RESTRICT なら `2BP01`、CASCADE なら連鎖して取り消す。
-/// 範囲が表なら表の行と全列の行を、列ならその列の行を見る。列の付与は列自身の GRANT OPTION に加えて
+/// 範囲が表なら表の行と全列の行を、列ならその列の行を見る。付与者 `x` が対象の所有者なら暗黙の GRANT OPTION で
+/// 全て賄えるため依存に数えない。列の付与は列自身の GRANT OPTION に加えて
 /// 表単位の GRANT OPTION（更新後の表の行）でも賄える。
 fn resolve_dependents(
     write_txn: &redb::WriteTransaction,
@@ -414,6 +419,12 @@ fn resolve_dependents(
             | PrivilegeObject::Function(_) => objs.push(scope.clone()),
         }
         for obj in objs {
+            // 所有者は対象への全権限と GRANT OPTION を暗黙に持つ（ACL 行に載らない）ため、所有者が付けた
+            // 付与は依存として扱わない（所有者の自己付与の REVOKE が、無用な `2BP01`〔RESTRICT〕や他の
+            // 被付与者の付与の取り消し〔CASCADE〕を起こさない。Issue #2236）。列は親の表の所有者を見る。
+            if super::owner::is_owner_in_txn(write_txn, tenant, &obj, x)? {
+                continue;
+            }
             let i = states.idx(write_txn, tenant, &obj)?;
             let mut covered = go_of(states.work_of(i), x);
             if let PrivilegeObject::Column { table, .. } = &obj {
@@ -736,11 +747,15 @@ impl Storage {
             }
             let si = states.idx(&write_txn, tenant, &t.object)?;
             let entries: Vec<AclEntry> = states.work_of(si).to_vec();
+            // 所有者相当: 運用者権限（呼び出し元の `owner_equivalent`）に加え、付与者が対象の所有者のとき
+            // （Issue #2236。加算のみで運用者権限を縮めない）。列は親の表の所有者を見る。
+            let owner_equivalent = req.owner_equivalent
+                || super::owner::is_owner_in_txn(&*write_txn, tenant, &t.object, req.grantor_id)?;
             // 波及ビット: 付与者の表の GRANT OPTION で絞る（0 なら表側が警告のみで無変更のため
             // 列も変更しない）。
             let eff_p = if want_p == 0 {
                 0
-            } else if req.owner_equivalent {
+            } else if owner_equivalent {
                 want_p
             } else if let PrivilegeObject::Column { table, .. } = &t.object {
                 let table_entries = list_acl_for_object_in_txn(
@@ -756,7 +771,7 @@ impl Storage {
             // 明示ビット: 付与者が持つ GRANT OPTION。列は表単位の行も合わせて見る。
             let eff_e = if t.bits == 0 {
                 0
-            } else if req.owner_equivalent {
+            } else if owner_equivalent {
                 want
             } else {
                 let (mut go, mut any) = grantor_rights(&entries, req.grantor_id);
@@ -804,7 +819,7 @@ impl Storage {
             }
             let mut work: Vec<AclEntry> = entries.clone();
             if req.is_grant {
-                if req.grant_option && !req.owner_equivalent {
+                if req.grant_option && !owner_equivalent {
                     // 自己への GRANT OPTION 付与は循環として拒否する。
                     if grantee_ids.contains(&req.grantor_id) {
                         return Err(AclChangeError::InvalidGrant(
@@ -942,7 +957,10 @@ impl Storage {
 
 /// 触れた relation の世代を進めて DDL として記録し、commit する（`USING PLAN` の世代照合・commit 記録の契約。
 /// `tests/table_rls/table_generation_bump_coverage.rs` が commit 直前の bump を検査する）。
-fn commit_with_bumps(write_txn: crate::storage::GatedWriteTxn, tables: &[String]) -> Result<()> {
+pub(super) fn commit_with_bumps(
+    write_txn: crate::storage::GatedWriteTxn,
+    tables: &[String],
+) -> Result<()> {
     for t in tables {
         bump_table_generation_in_txn(&write_txn, t)?;
         crate::storage::commit_log::note_ddl(&write_txn, t);

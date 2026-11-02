@@ -304,6 +304,7 @@ pub enum CatalogError {
     SchemaNotFound(String),
     ReservedSchemaName(String),
     BuiltinSchema(String),
+    NotObjectOwner,
     WriteLockTimeout,
     CommitFootprintUnrecordable,
     ColumnNotFound(String),

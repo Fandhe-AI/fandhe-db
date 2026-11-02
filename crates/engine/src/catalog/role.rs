@@ -707,14 +707,19 @@ pub(crate) fn remove_memberships_of_role_in_txn(
 }
 
 /// ロール `role_id` に依存するオブジェクトがあるか（`DROP ROLE` の `2BP01` 判定。Issue #1962）。現在カタログに
-/// あるのは ACL（付与先・付与者）だけ。所有者（#2236）・ポリシーの `TO <ロール>`（#2278 段 2）の検査は、この関数へ
+/// あるのは ACL（付与先・付与者）と所有者（#2236）。ポリシーの `TO <ロール>`（#2278 段 2）の検査は、この関数へ
 /// 足す拡張点とする。
 pub(crate) fn role_has_dependents_in_txn<R: ReadSource>(
     src: &R,
     tenant: &str,
     role_id: u64,
 ) -> Result<bool> {
-    super::privilege::acl_references_role_in_txn(src, tenant, role_id)
+    if super::privilege::acl_references_role_in_txn(src, tenant, role_id)? {
+        return Ok(true);
+    }
+    // 所有者（表・ビュー・matview・SCHEMA・関数。Issue #2236）。所有者のまま消すと所有者の無い
+    // オブジェクトが残るため `2BP01`（所有権を移してから消す）。
+    super::privilege::owner::owner_references_role_in_txn(src, tenant, role_id)
 }
 
 /// `DROP ROLE` の 1 件分: 解決 → 依存検査 → メンバーシップ掃除 → 削除（呼び出し側が単一 write txn で束ねる）。

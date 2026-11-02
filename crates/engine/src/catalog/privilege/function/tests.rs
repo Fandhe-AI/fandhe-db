@@ -66,6 +66,24 @@ fn marked_function_is_judged_by_rows_only() {
 }
 
 #[test]
+fn owner_keeps_execute_after_revoke_from_public() {
+    use crate::catalog::privilege::owner::set_owner_unchecked_in_txn;
+    let (_g, s) = open("fn_acl_owner");
+    write(&s, |t| {
+        set_owner_unchecked_in_txn(t, "t1", &PrivilegeObject::Function(3), 7).expect("owner");
+        // ACL 実体化済みで行が 0 件（PUBLIC から取り消し済み）。
+        mark_acl_initialized_in_txn(t, "t1", 3).expect("mark")
+    });
+    assert_eq!(
+        s.function_privileges("t1", 3, &[7]).expect("p"),
+        PRIV_EXECUTE
+    );
+    // 所有者以外は EXECUTE できない。
+    assert_eq!(s.function_privileges("t1", 3, &[8]).expect("p"), 0);
+    assert_eq!(s.function_privileges("t1", 3, &[]).expect("p"), 0);
+}
+
+#[test]
 fn rows_without_a_mark_fail_closed() {
     let (_g, s) = open("fn_acl_corrupt");
     write(&s, |t| {

@@ -26,6 +26,9 @@
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 
 use crate::storage::read_source::ReadSource;
+
+use super::privilege::owner::OwnerGate;
+use super::privilege::PrivilegeObject;
 use crate::storage::MAX_TENANT_ID_LEN;
 
 use super::{
@@ -917,6 +920,12 @@ fn remove_function_in_txn(
     let Some(existing) = get_function_in_txn(write_txn, scope, function_key, signature)? else {
         return Ok(false);
     };
+    // 所有者行（Issue #2236）。関数 ID は再利用されないが、残すと `DROP ROLE` が `2BP01` で永久に拒否される。
+    super::privilege::owner::remove_owner_in_txn(
+        write_txn,
+        scope,
+        &super::privilege::PrivilegeObject::Function(existing.id),
+    )?;
     // 関数の ACL 行と「実体化済み」の印も同じ txn で消す（Issue #2235。残った行は `DROP ROLE` の依存検査を
     // 永久に拒否し、テナントあたりの件数上限を消費する。`CREATE OR REPLACE` は削除せず ID を保つ）。
     super::privilege::remove_function_acl_in_txn(write_txn, scope, existing.id)?;
@@ -1174,6 +1183,16 @@ impl Storage {
         check(&latest)?;
         verify_dependencies_in_txn(&write_txn, scope, &stored.function_key, deps)?;
         insert_function_in_txn(&write_txn, scope, &stored, &signature)?;
+        // 新規に作った（既存定義なし）ときだけ、予約された作成者を所有者として同じ txn に書く
+        // （置換は既存の所有者を変えない。Issue #2236）。
+        if outcome == ReplaceOutcome::Created {
+            super::privilege::owner::apply_pending_function_owner_in_txn(
+                &write_txn,
+                scope,
+                &stored.function_key,
+                stored.id,
+            )?;
+        }
         super::function_dependency::replace_edges_in_txn(
             &write_txn,
             scope,
@@ -1251,6 +1270,13 @@ impl Storage {
         verify_dependencies_in_txn(&write_txn, scope, &stored.function_key, deps)?;
         stored.id = allocate_function_id_in_txn(&write_txn)?;
         insert_function_in_txn(&write_txn, scope, &stored, &signature)?;
+        // 予約された作成者を所有者として同じ txn に書く（Issue #2236。別 txn だと DROP・同名再作成と競合する）。
+        super::privilege::owner::apply_pending_function_owner_in_txn(
+            &write_txn,
+            scope,
+            &stored.function_key,
+            stored.id,
+        )?;
         super::function_dependency::replace_edges_in_txn(
             &write_txn,
             scope,
@@ -1359,11 +1385,25 @@ impl Storage {
     /// 同名の定義がちょうど 1 件で `matcher` が真のとき、同一 write txn で削除して `true`。
     /// 0 件・2 件以上・不一致は `false`（型付き `DROP FUNCTION` 用。列挙・照合・削除を原子的にする）。
     /// 依存トリガは `cascade` が偽なら `2BP01`、真なら同じ txn で連鎖削除する（Issue #1917）。
+    #[cfg(test)]
     pub(crate) fn drop_function_matching(
         &self,
         scope: &str,
         function_key: &str,
         cascade: bool,
+        matcher: impl Fn(&FunctionDef) -> Result<bool>,
+    ) -> Result<bool> {
+        self.drop_function_matching_gated(scope, function_key, cascade, OwnerGate::Skip, matcher)
+    }
+
+    /// [`Self::drop_function_matching`] に所有者検査（Issue #2236）を足したもの。照合に成功した定義に対し、
+    /// 依存の判定・削除より前に同じ write txn で検査する（所有者でなければ `NotObjectOwner`）。
+    pub(crate) fn drop_function_matching_gated(
+        &self,
+        scope: &str,
+        function_key: &str,
+        cascade: bool,
+        gate: OwnerGate,
         matcher: impl Fn(&FunctionDef) -> Result<bool>,
     ) -> Result<bool> {
         validate_scope(scope)?;
@@ -1378,6 +1418,7 @@ impl Storage {
         if !matcher(def)? {
             return Ok(false);
         }
+        gate.check(&*write_txn, scope, &PrivilegeObject::Function(def.id))?;
         let sig = arg_signature(&def.params)?;
         resolve_dependent_triggers(&write_txn, scope, &key, cascade)?;
         reject_dependent_functions(&write_txn, scope, &key)?;
@@ -1394,11 +1435,23 @@ impl Storage {
     /// 名前（引数の型の並びを省略した形）で定義を削除し、削除した定義のシグネチャを返す。0 件は
     /// `Ok(None)`、2 件以上は `Invalid(FUNCTION_AMBIGUOUS_MESSAGE)`（作成時に同名の多重定義を拒否して
     /// いるため通常は起きない防御）。列挙と削除は同一 write txn・1 回の commit で行う。
+    #[cfg(test)]
     pub(crate) fn drop_function_by_name(
         &self,
         scope: &str,
         function_key: &str,
         cascade: bool,
+    ) -> Result<Option<String>> {
+        self.drop_function_by_name_gated(scope, function_key, cascade, OwnerGate::Skip)
+    }
+
+    /// [`Self::drop_function_by_name`] に所有者検査（Issue #2236）を足したもの（検査は同名の解決の直後）。
+    pub(crate) fn drop_function_by_name_gated(
+        &self,
+        scope: &str,
+        function_key: &str,
+        cascade: bool,
+        gate: OwnerGate,
     ) -> Result<Option<String>> {
         validate_scope(scope)?;
         let key = normalize_key(function_key)?;
@@ -1408,7 +1461,10 @@ impl Storage {
         let found = list_in_txn(&*write_txn, scope, Some(&key))?;
         let sig = match found.as_slice() {
             [] => return Ok(None),
-            [one] => arg_signature(&one.params)?,
+            [one] => {
+                gate.check(&*write_txn, scope, &PrivilegeObject::Function(one.id))?;
+                arg_signature(&one.params)?
+            }
             _ => {
                 return Err(CatalogError::Invalid(
                     FUNCTION_AMBIGUOUS_MESSAGE.to_string(),

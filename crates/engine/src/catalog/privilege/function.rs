@@ -19,6 +19,7 @@ use crate::storage::read_source::ReadSource;
 
 use super::super::role::validate_tenant;
 use super::super::{CatalogError, Result, Storage};
+use super::owner::owner_of_in_txn;
 use super::{
     corrupt, decode_row, list_acl_for_object_in_txn, object_privileges_in_txn, AclEntry,
     PrivilegeObject, ACL_TABLE, KIND_FUNCTION, MAX_ACL_ENTRIES_PER_TENANT, PRIV_EXECUTE,
@@ -69,7 +70,14 @@ pub(crate) fn function_privileges_in_txn<R: ReadSource>(
         }
         return Ok(PRIV_EXECUTE);
     }
-    object_privileges_in_txn(src, tenant, &object, role_ids)
+    let granted = object_privileges_in_txn(src, tenant, &object, role_ids)?;
+    // 関数の所有者は暗黙に EXECUTE を持つ（SCHEMA の所有者の暗黙 USAGE と同じ扱い。PUBLIC から取り消しても
+    // 所有者は呼べる。所有者行は自テナントのみ引ける）。
+    let owner_bits = match owner_of_in_txn(src, tenant, &object)? {
+        Some(owner) if role_ids.contains(&owner) => PRIV_EXECUTE,
+        _ => 0,
+    };
+    Ok(granted | owner_bits)
 }
 
 /// 印を書く（`apply.rs` が初回の変更と同じ write txn で呼ぶ）。

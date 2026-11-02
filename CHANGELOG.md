@@ -9,6 +9,8 @@
 
 ### Added
 
+- オブジェクト所有者を追加した（Issue #2236・SQL-40・RLS-12）。表・ビュー・matview・SCHEMA・関数の作成者（束縛中の現在ロール）が所有者として記録され、`DROP SCHEMA`・`ALTER SCHEMA ... RENAME`・`DROP FUNCTION` は運用者権限または所有者だけが行える（非所有者は `42501`）。`ALTER {TABLE|VIEW|MATERIALIZED VIEW|SCHEMA} ... OWNER TO` と `CREATE SCHEMA ... AUTHORIZATION` を受理し、`REASSIGN OWNED`・`DROP OWNED` は `0A000`。所有者は GRANT／REVOKE と SCHEMA の USAGE・CREATE が可能で、運用者権限は縮めない。`DROP ROLE` は所有者のロールを `2BP01` で拒否する。`GRANT ... TO PUBLIC` は同じテナントのロールにだけ作用する。CommandComplete タグは `ALTER TABLE`・`ALTER VIEW`・`ALTER MATERIALIZED VIEW`・`ALTER SCHEMA`。
+  BREAKING CHANGE: 公開 enum `ParsedSql`・`SqlOutcome` に `AlterOwner`、`CatalogError` に `NotObjectOwner` を追加した。`CREATE SCHEMA ... AUTHORIZATION` と `ALTER SCHEMA ... OWNER TO` は `0A000` から受理（または `42501`・`42704`）になる。
 - `GRANT`／`REVOKE` が SEQUENCE 単位（`ON SEQUENCE`。権限は USAGE・SELECT・UPDATE）と関数単位（`ON FUNCTION <名>[(<型>, ...)]`。権限は EXECUTE）を受理する（Issue #2235・SQL-40・RLS-12）。束縛ロール（DDL 権限ゲート通過の主体を除く）は、権限の無い `nextval`・`currval`・`setval`・`lastval` と関数呼び出しが `42501` になる（IDENTITY／SERIAL 列の暗黙の採番は SEQUENCE 権限なしで通る。新規の関数は PUBLIC が EXECUTE を持つ）。`ALL SEQUENCES／FUNCTIONS IN SCHEMA` は `0A000` のまま。公開 API の変更はない。
 - `ROLLBACK TO` が savepoint より後に宣言したカーソルを閉じ（以降の `FETCH` は `34000`）、前に宣言したカーソルは位置を保って開いたまま残ることをテストで固定した（Issue #1946・SQL-69）。公開 API の変更はない。
 - `ROLLBACK TO` の後、Tx 内の書き込み記録を savepoint 時点へ戻す。読み取りは確定状態のキャッシュ・索引を再び使い、全書き込みを巻き戻した Tx の `COMMIT` はグローバル世代を進めない（Issue #1945・SQL-69）。公開 API の変更はない。
