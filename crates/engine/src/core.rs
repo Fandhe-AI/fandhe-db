@@ -104,6 +104,9 @@ mod select_privilege_tests;
 // 書き込み系の文の権限検査（SQL-40・Issue #1968）。
 #[cfg(test)]
 mod dml_privilege_tests;
+// COPY と HTTP（NoSQL）表層の bound 書き込み入口の権限検査（SQL-40・Issue #1969）。
+#[cfg(test)]
+mod copy_privilege_tests;
 #[cfg(test)]
 mod serialization_failure_tests;
 // `40001` の可視性境界・副作用ゼロの内部観測（Issue #2407。ポインタ: ERR-7・SQL-38・TABLE-3）。
@@ -5069,6 +5072,25 @@ impl EngineCore {
             ctx.tenant_id(),
             session,
             table,
+        )
+    }
+
+    /// HTTP（NoSQL）表層の bound 書き込み API で、対象表に `required_bits` の権限があるかを判定する
+    /// （SQL-40・Issue #1969。名前解決〔`42P01`〕と束縛の後、書き込みより前）。ビットは SQL 表層の同等の
+    /// 文と同じ関数が決める。現在ロール未束縛・運用者権限のセッションは何もしない。
+    fn require_table_write_privilege(
+        &self,
+        ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
+        table: &str,
+        required_bits: u16,
+    ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+        crate::sql::privilege_gate::write::require_table_write(
+            &self.storage,
+            ctx.tenant_id(),
+            session,
+            table,
+            required_bits,
         )
     }
 
@@ -13404,6 +13426,7 @@ impl EngineCore {
     pub fn execute_bound_insert_in_session<F>(
         &self,
         ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
         table: &str,
         row_count: usize,
         operation_id: Option<&crate::recovery::required_op_id::OperationId>,
@@ -13420,6 +13443,7 @@ impl EngineCore {
         self.execute_bound_insert_with_target(
             crate::tenant::WriteTarget::Autocommit(&self.storage),
             ctx,
+            Some(session),
             table,
             row_count,
             operation_id,
@@ -13431,10 +13455,14 @@ impl EngineCore {
     /// 選べる版。Issue #1179）。`InTxn` は明示トランザクション内の `COPY FROM STDIN`
     /// （[`Self::commit_copy_in_txn`]）が共有 `redb::WriteTransaction` へ書き込む
     /// ために使い、`Autocommit` は従来の 1 文 1 commit と同一。
+    #[allow(clippy::too_many_arguments)]
     fn execute_bound_insert_with_target<F>(
         &self,
         target: crate::tenant::WriteTarget<'_>,
         ctx: &PolicyContext,
+        // `Some` は HTTP 表層の入口（INSERT 権限を判定する。SQL-40・Issue #1969）。`None` は COPY の commit
+        // 経路で、権限は `begin_copy*` の判定と commit 直前の再判定が担う。
+        privilege_session: Option<&crate::sql::mode::SessionState>,
         table: &str,
         row_count: usize,
         operation_id: Option<&crate::recovery::required_op_id::OperationId>,
@@ -13509,6 +13537,14 @@ impl EngineCore {
                 "bound insert plan does not match the requested table, row count, or operation_id",
             ));
         }
+        if let Some(session) = privilege_session {
+            self.require_table_write_privilege(
+                ctx,
+                session,
+                table,
+                crate::catalog::privilege::PRIV_INSERT,
+            )?;
+        }
         drop(read_txn);
 
         // 判定 6（②③④）: バイト量・チャンク数上限。SQL 表層の複数行 VALUES
@@ -13574,6 +13610,15 @@ impl EngineCore {
             self.ledger_mode,
         )
         .map_err(|e| self.reclassify_matview_write_error(e))?;
+        // SQL-40・Issue #1969: 構文 `42601`・名前解決 `42P01`／`3F000` の後、CopyInResponse や走査より前に
+        // 権限を判定する。一時表の経路は上の `begin_copy_temp` で return 済み（セッションの所有物なので対象外）。
+        crate::sql::privilege_gate::copy::require_copy_privileges(
+            &self.storage,
+            ctx.tenant_id(),
+            session,
+            &stmt,
+            &copy_tokens,
+        )?;
         self.begin_copy_validated(ctx, session, stmt, None)
     }
 
@@ -13645,7 +13690,14 @@ impl EngineCore {
                         clock,
                         session.time_zone().clone(),
                     )?
-                    .with_row_security(session.row_security()),
+                    .with_row_security(session.row_security())
+                    .with_privilege_recheck(
+                        crate::sql::privilege_gate::write::RelationPrivilegeRecheck::for_session(
+                            session,
+                            ctx.tenant_id(),
+                            crate::catalog::privilege::PRIV_INSERT,
+                        ),
+                    ),
                 ))
             }
             crate::sql::allowlist::CopyStatement::To(v) => {
@@ -13778,6 +13830,15 @@ impl EngineCore {
             )
         }
         .map_err(|e| self.reclassify_matview_write_error(e))?;
+        // SQL-40・Issue #1969: 権限 `42501` は読み取り専用 Tx の `25006`・文数登録・走査より前
+        // （PostgreSQL の DoCopy と同じ順序）。一時表の経路は上の `begin_copy_temp` で return 済み。
+        crate::sql::privilege_gate::copy::require_copy_privileges(
+            &self.storage,
+            ctx.tenant_id(),
+            session,
+            &stmt,
+            &copy_tokens,
+        )?;
         // Issue #1934・SQL-38 (3): 読み取り専用 Tx の `COPY FROM` は CopyInResponse の前に拒否する
         // （クライアントからデータを受け取らない。呼び出し元が `Failed` へ遷移させる）。
         if matches!(stmt, crate::sql::allowlist::CopyStatement::From(_))
@@ -13923,6 +13984,7 @@ impl EngineCore {
             // 一時表向けの印は呼び出し元（`commit_copy_in*` の各入口）が振り分け済み。ここでは使わない。
             temp: _,
             row_security,
+            privilege_recheck,
         } = batch;
         // RLS-13・Issue #2278: COPY 開始時の `row_security` を検査点の直前に復元する。公開入口
         // （`commit_copy_in`／`commit_copy_in_txn`）は呼び出し側のスコープ外で呼ばれうるため、
@@ -13932,9 +13994,24 @@ impl EngineCore {
         // COPY の束縛は wire メッセージをまたいで完了済みのため、台帳 v3 の評価時刻を
         // 書き込み区間へ明示的に渡す（Issue #2188。None は v2 の権威値）。
         let _ledger_clock_scope = crate::sql::time_fn::LedgerClockScope::enter(evaluated_at);
+        // SQL-40・Issue #1969: begin から commit までの間（wire I/O 待ち）の REVOKE を、書き込みの直前に
+        // 検出する。束縛済みかつ運用者権限なしの主体だけ `Some`。照会失敗も拒否側に倒す（fail-closed）。
+        // 判定と書き込みは別 txn（Autocommit）のため、この間の REVOKE の窓は残る（設計文書に記録）。
+        if let Some(recheck) = &privilege_recheck {
+            let tables = [table.clone()];
+            let allowed = match &target {
+                crate::tenant::WriteTarget::InTxn(w) => recheck.check_in_txn(*w, &tables),
+                crate::tenant::WriteTarget::Autocommit(_) => match self.begin_read_txn() {
+                    Ok(r) => recheck.check_in_txn(&r, &tables),
+                    Err(_) => Err(()),
+                },
+            };
+            allowed.map_err(|()| crate::sql::allowlist::SqlSurfaceError::InsufficientPrivilege)?;
+        }
         self.execute_bound_insert_with_target(
             target,
             ctx,
+            None,
             &table,
             row_count,
             operation_id.as_ref(),
@@ -13983,6 +14060,7 @@ impl EngineCore {
     pub fn execute_bound_update_in_session<F>(
         &self,
         ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
         table: &str,
         operation_id: Option<&crate::recovery::required_op_id::OperationId>,
         bind: F,
@@ -14012,6 +14090,13 @@ impl EngineCore {
                 "bound update plan does not match the requested table or operation_id",
             ));
         }
+        // SQL-40・Issue #1969: `UPDATE ... WHERE id = ...` と同じく UPDATE と SELECT を要求する。
+        self.require_table_write_privilege(
+            ctx,
+            session,
+            table,
+            crate::catalog::privilege::PRIV_UPDATE | crate::catalog::privilege::PRIV_SELECT,
+        )?;
         drop(read_txn);
 
         // 判定 4: 実書き込み（独自の write トランザクション）。
@@ -14041,8 +14126,20 @@ impl EngineCore {
     pub fn execute_bound_delete_in_session(
         &self,
         ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
         bound: &crate::sql::parser::BoundDelete,
     ) -> Result<crate::sql::exec::DeleteOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        // SQL-40・Issue #1969: 判定順は「名前解決 `42P01` → 権限 `42501`」。束縛済みの主体のときだけ
+        // 表の存在確認を先に行う（未束縛は従来と同一で追加の読み取りをしない）。
+        if session.object_privileges_enforced() {
+            drop(self.read_txn_with_schema(&bound.table)?);
+        }
+        self.require_table_write_privilege(
+            ctx,
+            session,
+            &bound.table,
+            crate::catalog::privilege::PRIV_DELETE | crate::catalog::privilege::PRIV_SELECT,
+        )?;
         crate::sql::exec::execute_delete(&self.storage, ctx, bound, self.ledger_mode)
     }
 
@@ -14055,6 +14152,7 @@ impl EngineCore {
     pub fn execute_bound_delete_checked_in_session<F>(
         &self,
         ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
         bound: &crate::sql::parser::BoundDelete,
         check: F,
     ) -> Result<crate::sql::exec::DeleteOutcome, crate::sql::allowlist::SqlSurfaceError>
@@ -14069,6 +14167,13 @@ impl EngineCore {
             .map_err(|_| crate::sql::allowlist::SqlSurfaceError::MissingOperationId)?;
         let (read_txn, schema) = self.read_txn_with_schema(&bound.table)?;
         check(&schema)?;
+        // SQL-40・Issue #1969: 単一行 DELETE は DELETE と SELECT を要求する（`DELETE ... WHERE id =` と同じ）。
+        self.require_table_write_privilege(
+            ctx,
+            session,
+            &bound.table,
+            crate::catalog::privilege::PRIV_DELETE | crate::catalog::privilege::PRIV_SELECT,
+        )?;
         drop(read_txn);
         match crate::tenant::delete_row_ledgered_capturing_unchecked(
             crate::tenant::WriteTarget::Autocommit(&self.storage),
@@ -14130,6 +14235,7 @@ impl EngineCore {
     pub fn execute_bound_predicate_update_in_session<F>(
         &self,
         ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
         table: &str,
         operation_id: Option<&crate::recovery::required_op_id::OperationId>,
         bind: F,
@@ -14173,6 +14279,13 @@ impl EngineCore {
             returning: None,
             partitioned: None,
         };
+        // SQL-40・Issue #1969: SQL 表層の述語形 UPDATE と同じ関数が必要ビットを決める。
+        self.require_table_write_privilege(
+            ctx,
+            session,
+            table,
+            crate::sql::privilege_gate::write::partitioned_update_bits(&validated),
+        )?;
         let udfs = crate::sql::udf_call::UdfRegistry::default();
         // 判定 6: 実書き込み（`Self::run_predicate_update` 内部の独自 write トランザクション）。
         self.run_predicate_update(
@@ -14194,6 +14307,7 @@ impl EngineCore {
     pub fn execute_bound_predicate_delete_in_session<F>(
         &self,
         ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
         table: &str,
         operation_id: Option<&crate::recovery::required_op_id::OperationId>,
         bind: F,
@@ -14222,6 +14336,13 @@ impl EngineCore {
             returning: None,
             partitioned: None,
         };
+        // SQL-40・Issue #1969: SQL 表層の述語形 DELETE と同じ関数が必要ビットを決める。
+        self.require_table_write_privilege(
+            ctx,
+            session,
+            table,
+            crate::sql::privilege_gate::write::partitioned_delete_bits(&validated),
+        )?;
         let udfs = crate::sql::udf_call::UdfRegistry::default();
         self.run_predicate_delete(
             crate::tenant::WriteTarget::Autocommit(&self.storage),
@@ -14249,6 +14370,7 @@ impl EngineCore {
     pub fn execute_bound_partitioned_update_in_session<F>(
         &self,
         ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
         table: &str,
         operation_id: Option<&crate::recovery::required_op_id::OperationId>,
         chunk_rows: Option<std::num::NonZeroUsize>,
@@ -14290,8 +14412,16 @@ impl EngineCore {
             returning: None,
             partitioned: Some(clause),
         };
+        // SQL-40・Issue #1969: 入口の判定と、各チャンクの write txn 内の再判定が同じビットを使う。
+        let bits = crate::sql::privilege_gate::write::partitioned_update_bits(&validated);
+        self.require_table_write_privilege(ctx, session, table, bits)?;
+        let recheck = crate::sql::privilege_gate::write::RelationPrivilegeRecheck::for_session(
+            session,
+            ctx.tenant_id(),
+            bits,
+        );
         let udfs = crate::sql::udf_call::UdfRegistry::default();
-        self.run_partitioned_update(ctx, &udfs, &validated, &schema, &limits, None)
+        self.run_partitioned_update(ctx, &udfs, &validated, &schema, &limits, recheck)
     }
 
     /// NoSQL 表層 `delete` op の分割実行修飾（Issue #1130）。
@@ -14300,6 +14430,7 @@ impl EngineCore {
     pub fn execute_bound_partitioned_delete_in_session<F>(
         &self,
         ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
         table: &str,
         operation_id: Option<&crate::recovery::required_op_id::OperationId>,
         chunk_rows: Option<std::num::NonZeroUsize>,
@@ -14332,8 +14463,16 @@ impl EngineCore {
             returning: None,
             partitioned: Some(clause),
         };
+        // SQL-40・Issue #1969: 入口の判定と、各チャンクの write txn 内の再判定が同じビットを使う。
+        let bits = crate::sql::privilege_gate::write::partitioned_delete_bits(&validated);
+        self.require_table_write_privilege(ctx, session, table, bits)?;
+        let recheck = crate::sql::privilege_gate::write::RelationPrivilegeRecheck::for_session(
+            session,
+            ctx.tenant_id(),
+            bits,
+        );
         let udfs = crate::sql::udf_call::UdfRegistry::default();
-        self.run_partitioned_delete(ctx, &udfs, &validated, &schema, &limits, None)
+        self.run_partitioned_delete(ctx, &udfs, &validated, &schema, &limits, recheck)
     }
 
     /// NoSQL 表層 `show_partitioned_dml` op（Issue #1130・RLS-9・RECOVER-11）。

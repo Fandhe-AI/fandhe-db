@@ -49,11 +49,9 @@ use std::time::SystemTime;
 
 use engine::core::EngineCore;
 use engine::error_format::{ClassifiedError, ErrorClass};
-use engine::policy::PolicyContext;
 use engine::sql::allowlist::{validate_using_plan_question, SqlSurfaceError};
 use engine::sql::exec::QueryResult;
 use engine::sql::explain::ExplainShape;
-use engine::sql::mode::SessionState;
 use engine::sql::parser::validate_search_limit_with;
 
 use super::ident::{self, InvalidIdentifier};
@@ -187,9 +185,10 @@ impl ClassifiedError for ExplainError {
 ///    未検証の生リテラルを直接処理することはない）。
 pub fn execute(
     core: &EngineCore,
-    ctx: &PolicyContext,
+    principal: &SessionPrincipal,
     validated: &Validated<'_>,
 ) -> Result<QueryResult, ExplainError> {
+    let ctx = principal.policy_context();
     let table = validated.required_str("table")?;
     ident::check_identifier(table)?;
 
@@ -215,7 +214,7 @@ pub fn execute(
     // テーブル・`limit` 範囲外・型不整合等のエラー分類・優先順位は
     // `explain` の有無で変わらない。
     if vector_present {
-        let session = SessionState::default();
+        let session = principal.session_state();
         let result =
             core.explain_bound_search_in_session(ctx, &session, table, |schema, udfs| {
                 super::gate::reject_allocated_schema(schema)?;
@@ -246,7 +245,7 @@ pub fn execute(
     // （`SearchMode::parse_literal`）の双方を行わせる。
     let mode_literal = validated.optional_str("mode")?;
 
-    let session = SessionState::default();
+    let session = principal.session_state();
     let result = core.explain_bound_plan_in_session(
         ctx,
         &session,
@@ -289,7 +288,7 @@ pub fn handle(
     validated: &Validated<'_>,
     now_wall: SystemTime,
 ) -> Vec<u8> {
-    match execute(core, principal.policy_context(), validated) {
+    match execute(core, principal, validated) {
         Ok(result) => match response::encode_explain(&result) {
             Ok(body) => http_response::encode_ok(&body, now_wall),
             Err(err) => {

@@ -48,7 +48,7 @@ use engine::declarative_filter::MetadataFilter;
 use engine::error_format::{ClassifiedError, ErrorClass};
 use engine::json::JsonValue;
 use engine::sql::allowlist::{validate_using_plan_question, SqlSurfaceError};
-use engine::sql::mode::{self, SearchMode, SessionState};
+use engine::sql::mode::{self, SearchMode};
 use engine::sql::parser::{
     bind_body_text_column, bind_column_projection, bind_vector_values, require_vector_column,
     validate_search_limit_with, BoundStatement, ProjectedColumn, Ranking,
@@ -601,7 +601,7 @@ pub fn execute(
         });
     }
 
-    let session = SessionState::default();
+    let session = principal.session_state();
     let ctx = principal.policy_context();
 
     if plan_present {

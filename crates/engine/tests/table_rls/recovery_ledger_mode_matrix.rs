@@ -221,15 +221,25 @@ fn partitioned_dml_requires_operation_id_in_both_modes_including_bound_entries()
         }
         let c = ctx("t");
         let e = core
-            .execute_bound_partitioned_delete_in_session(&c, "docs", None, None, |_s| {
-                panic!("bind must not run before the operation_id gate")
-            })
+            .execute_bound_partitioned_delete_in_session(
+                &c,
+                &engine::sql::mode::SessionState::default(),
+                "docs",
+                None,
+                None,
+                |_s| panic!("bind must not run before the operation_id gate"),
+            )
             .expect_err("rejected");
         assert_eq!(e.wire_code(), "23502", "{label}");
         let e = core
-            .execute_bound_partitioned_update_in_session(&c, "docs", None, None, |_s| {
-                panic!("bind must not run before the operation_id gate")
-            })
+            .execute_bound_partitioned_update_in_session(
+                &c,
+                &engine::sql::mode::SessionState::default(),
+                "docs",
+                None,
+                None,
+                |_s| panic!("bind must not run before the operation_id gate"),
+            )
             .expect_err("rejected");
         assert_eq!(e.wire_code(), "23502", "{label}");
         assert_eq!(rows(&core), 2, "{label}: rows untouched");

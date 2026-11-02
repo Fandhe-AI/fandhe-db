@@ -308,27 +308,39 @@ fn nosql_predicate_paths_are_rejected_when_triggers_exist() {
     );
     let op = crate::recovery::required_op_id::OperationId::parse("op-nosql").expect("op");
     let err = core
-        .execute_bound_predicate_update_in_session(&a, "trg", Some(&op), |_| {
-            Ok((
-                vec![(
-                    "n".to_string(),
-                    crate::sql::allowlist::InsertLiteral::Number("1".to_string()),
-                )],
-                vec![crate::sql::allowlist::WherePredicate::Equality {
-                    column: "a".to_string(),
-                    value: "x".to_string(),
-                }],
-            ))
-        })
+        .execute_bound_predicate_update_in_session(
+            &a,
+            &crate::sql::mode::SessionState::default(),
+            "trg",
+            Some(&op),
+            |_| {
+                Ok((
+                    vec![(
+                        "n".to_string(),
+                        crate::sql::allowlist::InsertLiteral::Number("1".to_string()),
+                    )],
+                    vec![crate::sql::allowlist::WherePredicate::Equality {
+                        column: "a".to_string(),
+                        value: "x".to_string(),
+                    }],
+                ))
+            },
+        )
         .expect_err("update");
     assert_eq!(err.wire_code(), "0A000");
     let err = core
-        .execute_bound_predicate_delete_in_session(&a, "trg", Some(&op), |_| {
-            Ok(vec![crate::sql::allowlist::WherePredicate::Equality {
-                column: "a".to_string(),
-                value: "x".to_string(),
-            }])
-        })
+        .execute_bound_predicate_delete_in_session(
+            &a,
+            &crate::sql::mode::SessionState::default(),
+            "trg",
+            Some(&op),
+            |_| {
+                Ok(vec![crate::sql::allowlist::WherePredicate::Equality {
+                    column: "a".to_string(),
+                    value: "x".to_string(),
+                }])
+            },
+        )
         .expect_err("delete");
     assert_eq!(err.wire_code(), "0A000");
     assert_eq!(calls.load(Ordering::SeqCst), 0);

@@ -415,6 +415,7 @@ pub fn execute(
     let outcome: InsertOutcome = core
         .execute_bound_insert_in_session(
             principal.policy_context(),
+            &principal.session_state(),
             table,
             rows.len(),
             operation_id.as_ref(),

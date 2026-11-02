@@ -308,15 +308,25 @@ fn bound_partitioned_entries_require_operation_id_by_default() {
     let (core, _g) = new_core("part-bound", None);
     let c = ctx("t");
     let e = core
-        .execute_bound_partitioned_delete_in_session(&c, "docs", None, None, |_s| {
-            panic!("bind must not run before the operation_id gate")
-        })
+        .execute_bound_partitioned_delete_in_session(
+            &c,
+            &engine::sql::mode::SessionState::default(),
+            "docs",
+            None,
+            None,
+            |_s| panic!("bind must not run before the operation_id gate"),
+        )
         .expect_err("must be rejected");
     assert_eq!(e.wire_code(), "23502");
     let e = core
-        .execute_bound_partitioned_update_in_session(&c, "docs", None, None, |_s| {
-            panic!("bind must not run before the operation_id gate")
-        })
+        .execute_bound_partitioned_update_in_session(
+            &c,
+            &engine::sql::mode::SessionState::default(),
+            "docs",
+            None,
+            None,
+            |_s| panic!("bind must not run before the operation_id gate"),
+        )
         .expect_err("must be rejected");
     assert_eq!(e.wire_code(), "23502");
 }

@@ -9,6 +9,8 @@
 
 ### Added
 
+- `COPY ... FROM STDIN`（INSERT）・`COPY ... TO STDOUT`（SELECT）と HTTP（NoSQL）表層の bound 書き込み入口に、現在ロールが束縛済みのセッションの表単位の権限検査を結線した（Issue #1969・SQL-40・NOSQL-2 ポインタ。権限不足は `42501`）。COPY は CopyInResponse・走査より前と CopyDone 後の commit 直前に判定し、拡張クエリは Parse・Bind・Describe でも拒否する。未束縛・運用者権限のセッションは従来と同一。
+  BREAKING CHANGE: `EngineCore::execute_bound_{insert,update,delete,delete_checked,predicate_update,predicate_delete,partitioned_update,partitioned_delete}_in_session` の第 2 引数に `session: &SessionState` を追加した（`ctx` の直後）。
 - 現在ロールが束縛済みのセッションの読み取り（SELECT・JOIN・サブクエリ・CTE・集合演算・ビュー・EXPLAIN・`DECLARE`・行ロック句・検索・拡張クエリ・HTTP の bound 読み取り API）に、`GRANT` で付与した表単位の SELECT 権限の検査を結線した（Issue #1967・SQL-40・RLS-12 ポインタ。権限不足は `42501`）。公開メソッド `SessionState::object_privileges_enforced` を追加した。現在ロールが未束縛のセッション（現状の全セッション）の挙動は変わらない。
 - 現在ロールが束縛済みのセッションの書き込み（INSERT・UPSERT・UPDATE・DELETE・TRUNCATE とその RETURNING・INSERT ... SELECT・UPDATE ... FROM・DELETE ... USING・ビュー DML・データ変更 CTE・分割実行・拡張クエリ）に、`GRANT` で付与した表単位の権限の検査を結線した（Issue #1968・SQL-40・RLS-12・SQL-19・SQL-22 ポインタ。権限不足は `42501`で、行・台帳は変化しない）。分割実行はチャンクごと、TRUNCATE CASCADE は連鎖後の全表を再判定する。現在ロールが未束縛のセッション（現状の全セッション）の挙動は変わらない。
 - `ALTER ROLE`／`ALTER USER`（属性・パスワードの変更と `RENAME TO`）と `SET ROLE`／`RESET ROLE` を追加した（Issue #1963・SQL-39）。`SET ROLE` はセッションのロールから `SET` 真のメンバーシップを辿れる対象にだけ切り替え、未所属は `42501`、他テナントのロールは不在と同じ `42704`。`PolicyContext`・DDL 権限は変えない。BREAKING CHANGE: 公開 enum `ParsedSql`・`SqlOutcome` に variant（`AlterRole`・`SetRole`）を追加した。

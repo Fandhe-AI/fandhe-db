@@ -877,6 +877,10 @@ pub struct CopyInSession {
     /// [`CopyInBatch`] へ引き継いで検査点の直前に復元する（失われると既定の on になり、
     /// `off` のセッションが拒否されるはずの書き込みを通してしまう）。
     row_security: bool,
+    /// CopyDone 後の commit 時に INSERT 権限を再判定するための値（SQL-40・Issue #1969）。COPY は begin と
+    /// commit の間が長い（wire I/O 待ち）ため、その間の REVOKE を commit で検出する。束縛済みかつ運用者
+    /// 権限なしの主体だけ `Some`（それ以外は従来と同一）。
+    privilege_recheck: Option<crate::sql::privilege_gate::write::RelationPrivilegeRecheck>,
 }
 
 /// COPY の 1 列分の種別（binary 形式の型変換を wire-server が選ぶための公開情報。
@@ -1055,7 +1059,18 @@ impl CopyInSession {
             temp: None,
             // 呼び出し元（`EngineCore::begin_copy*`）が `RowSecurityScope` を束縛した区間で作る。
             row_security: crate::sql::policy_applicability::current_row_security(),
+            privilege_recheck: None,
         })
+    }
+
+    /// commit 時の権限再判定値を持たせる（`begin_copy_validated` の `FROM` 腕が呼ぶ。Issue #1969）。
+    #[must_use]
+    pub(crate) fn with_privilege_recheck(
+        mut self,
+        recheck: Option<crate::sql::privilege_gate::write::RelationPrivilegeRecheck>,
+    ) -> Self {
+        self.privilege_recheck = recheck;
+        self
     }
 
     /// COPY 開始時のセッションの `row_security` を明示的に記録する（`begin_copy_validated` が呼ぶ）。
@@ -1159,6 +1174,7 @@ impl CopyInSession {
             mut sink,
             temp,
             row_security,
+            privilege_recheck,
             ..
         } = self;
         if let Some(fields) = splitter.finish()? {
@@ -1181,6 +1197,7 @@ impl CopyInSession {
             evaluated_at: sink.clock_used.then_some(sink.clock.txn_start_micros),
             temp,
             row_security,
+            privilege_recheck,
         })
     }
 }
@@ -1199,6 +1216,9 @@ pub struct CopyInBatch {
     pub(crate) temp: Option<crate::sql::temp_rows::TempCopyTarget>,
     /// COPY 開始時のセッションの `row_security`（[`CopyInSession`] から引き継ぐ。RLS-13・Issue #2278）。
     pub(crate) row_security: bool,
+    /// commit 時の権限再判定値（[`CopyInSession`] から引き継ぐ。Issue #1969）。
+    pub(crate) privilege_recheck:
+        Option<crate::sql::privilege_gate::write::RelationPrivilegeRecheck>,
 }
 
 impl CopyInBatch {

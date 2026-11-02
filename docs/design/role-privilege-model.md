@@ -536,3 +536,37 @@ SQL-40・RLS-12・SQL-19・SQL-22 ポインタ。書き込み系の文の対象�
 継承メンバーシップ（#2860）、所有者（#2236）、SCHEMA の USAGE（#2234）、シーケンス・関数の権限（#2235）、認証とロールの紐付け（#1971）、
 主体を持たない engine の Rust API（`parse_sql` ＋ `execute_parsed_*`、`execute_truncate_sql`）、`LOCK TABLE` の権限、
 `SHOW`／`CANCEL PARTITIONED DML` のロール単位の所有、存在オラクルの網羅試験（#1972）。
+
+## 14. Issue #1969 実装記録（COPY と HTTP 表層の bound 書き込み入口への権限検査の結線）
+
+SQL-40・NOSQL-2 ポインタ。COPY と HTTP（NoSQL）表層の書き込み入口を、§11 の `privilege_gate::check` の 1 本の判定点へ
+結線した。ACL の照会は §12・§13 と同じ `require_relations_bits` に一本化し、COPY・HTTP 用の第 2 の判定ロジックは持たない。
+経路の一覧は [privilege-check-paths.md](privilege-check-paths.md)。
+
+### 要求と結線点
+
+| 経路 | 必要ビット | 結線点 |
+| ---- | ---------- | ------ |
+| `COPY ... FROM STDIN` | 対象表の INSERT | `begin_copy*`（CopyInResponse より前）。拡張クエリは Parse・Bind・Describe |
+| `COPY ... TO STDOUT` | 読む relation の SELECT | 同上（走査より前） |
+| CopyDone 後の commit | INSERT を書き込みの直前に再判定 | `commit_copy_in_with_target`（`CopyInBatch.privilege_recheck`） |
+| HTTP の bound 書き込み 8 入口 | SQL 表層の同等の文と同じビット | 名前解決・束縛の後、書き込みより前。分割実行は各チャンクでも再判定 |
+
+- 判定順は「構文 `42601` → 名前解決 `42P01`／`3F000` → 権限 `42501`」。COPY FROM は権限を読み取り専用 Tx の `25006` より前に置く。
+- `FROM STDIN` 形はトークン走査をしない（`STDIN` を relation と誤認しないため）。`TO` 形はトークン走査の参照先に `inner.table_name()` を加える。
+- 一時表の COPY は `begin_copy_temp` が先に分岐するため対象外（セッションの所有物）。
+- HTTP の `SessionState` は `SessionPrincipal::session_state()` の 1 箇所で作る。ロールの束縛は #1971 がここへ足す。現状は未束縛で、
+  本番の挙動は従来と同一。
+- bound 書き込み API の公開シグネチャに `session: &SessionState` を追加した（破壊的変更）。
+
+### 既知の窓
+
+Autocommit の COPY commit と単発の bound DML は、判定と書き込みが別 txn のため、その間の REVOKE の窓が残る（§13 の単発 DML と同じ）。
+明示 Tx の COPY commit は共有 write txn から ACL を読む。分割実行はチャンクごとに write txn 内で再判定する。
+
+### 対象外
+
+認証済みユーザーとロールの紐付け（#1971）、列単位の判定（#2081）、継承メンバーシップ（#2232）、所有者（#2236）、
+SCHEMA の USAGE（#2234）、SEQUENCE の USAGE（`id` 省略 COPY の採番。#2235）、主体を持たない engine の Rust API、
+`SHOW`／`CANCEL PARTITIONED DML` のロール単位のジョブ所有、存在オラクルの網羅試験（#1972）。HTTP・pg wire の結合テストでロールを束縛する
+手段は #1971 まで無く、HTTP の `42501` の end-to-end 検証は engine での手動束縛セッションと wire のエラー写像の単体テストで担保する。

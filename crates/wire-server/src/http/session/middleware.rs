@@ -69,6 +69,21 @@ impl SessionPrincipal {
         &self.ctx
     }
 
+    /// この要求の主体から engine の `SessionState` を作る、HTTP 表層で唯一の入口（SQL-40・NOSQL-2・
+    /// Issue #1969）。`http/query/*` の各 op ハンドラは `SessionState::default()` を自前で組み立てず、
+    /// ここから受け取った値を engine の bound API へ渡す（engine の権限ゲートが SQL 表層と同じ判定を行う）。
+    ///
+    /// 契約: `ddl_allowed` は認証層（セッション発行）が確定した値の写しで、JSON 本文・パスから主体を
+    /// 変える経路は持たない。現在ロールの束縛は認証済みユーザーとロールの紐付け（Issue #1971）がこの関数へ
+    /// 足す拡張点で、現状は未束縛（オブジェクト権限を判定しない移行期の主体。本番の挙動は従来と同一）。
+    pub fn session_state(&self) -> engine::sql::mode::SessionState {
+        let mut session = engine::sql::mode::SessionState::default();
+        if self.ddl_allowed {
+            session.allow_ddl();
+        }
+        session
+    }
+
     /// このセッションが DDL（`create_table`／`alter_table`／`drop_table`）を
     /// 実行できるか（NOSQL-13・TASK-207、Issue #910）。
     pub fn ddl_allowed(&self) -> bool {
@@ -300,6 +315,26 @@ mod tests {
 
         let principal = authenticate(&sessions, &headers, move || now).expect("authenticate");
         assert!(principal.ddl_allowed());
+    }
+
+    #[test]
+    fn session_state_mirrors_ddl_allowed_and_leaves_the_role_unbound() {
+        // SQL-40・Issue #1969: HTTP 表層の `SessionState` は `session_state()` だけで作る。
+        // 運用者権限は認証層が確定した値の写しで、現在ロールは #1971 まで未束縛。
+        let sessions = SessionStore::new();
+        let now = Instant::now();
+        for ddl in [false, true] {
+            let token = sessions
+                .issue_with_ddl(ctx("tenant-a"), ddl, now)
+                .expect("issue_with_ddl");
+            let raw = format!("Authorization: Bearer {}\r\n", token.encoded());
+            let headers = headers_from(raw.as_bytes());
+            let principal = authenticate(&sessions, &headers, move || now).expect("authenticate");
+            let state = principal.session_state();
+            assert_eq!(state.ddl_allowed(), ddl);
+            assert_eq!(state.current_role_id(), None);
+            assert!(!state.object_privileges_enforced());
+        }
     }
 
     #[test]
