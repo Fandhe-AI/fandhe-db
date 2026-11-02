@@ -656,6 +656,7 @@ fn writes_are_identical_and_never_touch_foreign_rows() {
 #[test]
 fn copy_is_identical_with_and_without_foreign_tenant_rows() {
     let mut trials = 0usize;
+    let mut from_ok = 0usize;
     for (ci, c) in combos().iter().enumerate() {
         let obs_idx = ci % 3;
         let x = world("rls13-nl-cx", obs_idx, true, c);
@@ -675,8 +676,8 @@ fn copy_is_identical_with_and_without_foreign_tenant_rows() {
         }
         // FROM: 他テナントと同じ id(1) を含む成功バッチと、違反しうる行を含むバッチ。
         for (k, data) in [
-            b"1001\tja\t1\n1002\tja\t2\n".as_slice(),
-            b"6\tja\t6\n7\tfr\t7\n".as_slice(),
+            b"1001\t[1,0]\tja\t1\n1002\t[1,0]\tja\t2\n".as_slice(),
+            b"6\t[1,0]\tja\t6\n7\t[1,0]\tfr\t7\n".as_slice(),
         ]
         .iter()
         .enumerate()
@@ -685,10 +686,18 @@ fn copy_is_identical_with_and_without_foreign_tenant_rows() {
             let ry = copy_from_trace(&y, c, &format!("cpx-{ci}-{k}"), data);
             assert_eq!(rx, ry, "combo {ci}: COPY FROM batch {k}");
             assert_no_leak("COPY FROM", &rx);
+            // Rls::Off では成功バッチが実際に commit まで到達する（失敗の同一性だけを比べない）。
+            if k == 0 && matches!(c.rls, Rls::Off) {
+                assert!(
+                    rx.starts_with("OK 2"),
+                    "combo {ci}: COPY FROM must succeed: {rx}"
+                );
+                from_ok += 1;
+            }
             trials += 2;
         }
     }
-    assert!(trials > 0);
+    assert!(trials > 0 && from_ok > 0);
 }
 
 fn copy_to_trace(w: &World, c: &Combo, sql: &str) -> String {
@@ -706,7 +715,7 @@ fn copy_to_trace(w: &World, c: &Combo, sql: &str) -> String {
 
 fn copy_from_trace(w: &World, c: &Combo, op: &str, data: &[u8]) -> String {
     let s = session_for(w, c);
-    let sql = format!("COPY docs (id, lang, n) FROM STDIN USING OPERATION_ID '{op}'");
+    let sql = format!("COPY docs (id, embedding, lang, n) FROM STDIN USING OPERATION_ID '{op}'");
     let plan = match w.core.begin_copy(&ctx(w.obs), &s, &sql) {
         Ok(p) => p,
         Err(e) => return fmt_err("begin", &e),
