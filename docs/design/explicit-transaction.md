@@ -956,12 +956,8 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
     避ける）、基底の欠落・redb エラーは `XX000`（詳細は返さない）。
   - 復元後に作る savepoint は redb が dirty になるため `Unrestorable` になる（保守側の制約）。
     `LOCK TABLE` などで writer を先に取っても、テーブルを開くため同様に `Unrestorable`。
-- 付随状態: 復元後も `has_writes`・`written_tables`・`written_by_tenant`・
-  commit 記録の足跡は実際より大きい集合のまま残す（`seen_operation_ids` は #1944 で水位まで戻す）。読み取りは
-  writer 経由のまま復元後の root を見る・遅延 FK 検査の走査範囲は広いだけ・COMMIT は
-  内容の変わらない root を確定するだけ・他 Tx が余分に `40001` を受けうる、といずれも
-  安全側。精度の改善は #1945（Tx 内キャッシュ・世代）、カーソルは #1946、
-  `Failed` からの復帰は #1947 の範囲。
+- 付随状態: commit 記録の足跡は戻さない（書き込み記録は Issue #1945、`seen_operation_ids` は
+  Issue #1944 で復元する。次節以降参照）。カーソルは Issue #1946（次々節）、`Failed` からの復帰は #1947 の範囲。
 - 退けた案: Tx の途中で `Durability::None` の commit をして新しい writer で savepoint を取る
   案。他セッションに未確定の状態が見え、分離が壊れるため退けた。
 - テスト: `crates/engine/tests/sql_t40_up/sql69_savepoint_rollback.rs`・
@@ -986,6 +982,50 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
   の前に読む。`Unrestorable`・一時表・redb エラー・水位欠落は何も戻さず Tx を `Failed` にする。
 - テスト: `crates/engine/tests/sql_t40_up/sql69_savepoint_ledger.rs`、単体は
   `sql::savepoint`・`sql::transaction`。
+
+## savepoint 巻き戻しと Tx 内の書き込み記録・世代（Issue #1945・SQL-69 ポインタ）
+
+ポインタ: `docs/spec/04-behavior/sql-surface.md` SQL-69。本節は実装上の判断のみ。
+
+- 洗い出し: Tx 内で巻き戻しの影響を受ける状態は `ActiveTxn` の `has_writes`・`written_tables`・
+  `written_by_tenant` だけである。世代キーのキャッシュ（arena・HNSW・sparse・可視行・スカラー索引・
+  relation スナップショット）は確定済みスナップショットからしか作られず（キャッシュの構造的ゲート）、
+  未 commit 行は載らない。辞書キャッシュは dirty の間は lookup も insert もしない。いずれも
+  巻き戻しでの無効化は不要。
+- 保存と復元: `Restorable` な savepoint は作成時点の記録（`sql::savepoint::WriteMarks`）を複製して持ち、
+  `ROLLBACK TO` が redb の復元と対にして書き戻す。`Restorable` は redb 上 dirty でない時点にだけ作れるので
+  保存する集合は実質空で、スタック長は文数上限で有界のまま。
+- 突き合わせ（fail-closed）: 記録を縮める前に、復元後の表世代が確定状態と一致すること（世代差分ゼロ）を
+  `collect_dirty_tables` で確認し、不一致・読み取り失敗は `XX000` で Tx を `Failed` にする。
+- 効果: 復元後の読み取りは `TxnReadSource::Committed` へ戻り世代キーのキャッシュ・索引を再び使える。
+  全書き込みを巻き戻した Tx の `COMMIT` は writer を捨てるのでグローバル世代を進めず、commit 記録にも
+  残らない。遅延 FK の走査範囲は実際の書き込みに一致する。
+- 戻さないもの: 採番状態（`SequenceAllocator`・`currval`／`lastval`）は PostgreSQL と同じく非
+  トランザクショナルで、全体 `ROLLBACK` と同じ扱い。commit 記録の足跡（`commit_log::Frame`）は、巻き戻した行の
+  足跡が残り他の明示 Tx が余分に `40001` を受けうるが安全側（偽陰性は生まない）で、frame の保存・復元には
+  `storage::commit_log` 側の経路が要るため本 Issue の対象外。
+- テスト: `crates/engine/tests/sql_t40_up/sql69_savepoint_write_marks.rs`、単体は
+  `sql::savepoint`・`sql::transaction`。
+
+## savepoint 巻き戻しとカーソル（Issue #1946・SQL-69・WIRE-15 ポインタ）
+
+ポインタ: `docs/spec/04-behavior/sql-surface.md` SQL-69 (5)。本節は実装上の判断のみ。
+
+- 水位による閉鎖: savepoint は作成時の `CursorRegistry::next_id` を水位として持ち、`ROLLBACK TO` は
+  識別子が水位以上のカーソル（savepoint より後に宣言したもの）を閉じる。閉じた名前は `34000`
+  （不在・他セッション・巻き戻しで閉じた、のいずれも区別しない固定文言）で、名前は再宣言できる。
+- 残すもの: 水位未満のカーソルは開いたまま残る。行集合は `DECLARE` 時点で確定済み（INSENSITIVE）なので
+  巻き戻した書き込みを含まない。`FETCH` の位置は戻さず、`CLOSE` も取り消さない（PostgreSQL と同じ）。
+  `RELEASE` はカーソルに触れない。
+- `next_id` の単調性: 巻き戻しでも `next_id` は戻さないため、portal 束縛の `cursor_id` は再利用されない。
+  閉じたカーソルを指す中断 portal は再 Execute 時の照合で `34000` になる（`ROLLBACK TO` は
+  Tx 世代を変えないので、照合の決め手はカーソル識別子）。
+- 上限: 閉鎖後に保持バイト合計を計算し直すので、本数・バイトの枠は回復する。
+- 読み取り集合（SQL-38）: 閉じたカーソルの内側 SELECT の読み取りは縮めない（安全側。偽陰性を生まない）。
+- 対象外: カーソルに束縛しない portal の扱い（PostgreSQL は savepoint より後の portal を破棄する）は
+  本 Issue の範囲外。公開 API の変更なし。
+- テスト: engine `sql69_savepoint_cursor`・`sql69_savepoint_rollback`・`sql::cursor`、
+  wire-server `wire15_cursor_portal_binding`。
 
 ## READ ONLY での書き込み拒否（SQL-38 (3)・ERR-6・Issue #1934）
 

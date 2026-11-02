@@ -460,8 +460,9 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1942（SAVEPOINT 構文・スタック・`SessionTransaction` の 3 メソッドの追加）の行追加でさらに移動（旧: 1657）。書き込み内容・commit の意味は不変。
     // Issue #2230（行ロック句での writer 取得・55P03 化）の行追加でさらに移動（旧: 1818）。書き込み内容・commit の意味は不変。
     // Issue #1943（SAVEPOINT の redb 復元結線）の行追加でさらに移動（旧: 1836）。書き込み内容・commit の意味は不変。
+    // Issue #1945（savepoint 巻き戻しでの書き込み記録の保存・復元）の行追加でさらに移動（旧: 1978）。書き込み内容・commit の意味は不変。
     // Issue #1944（savepoint 巻き戻しでの冪等台帳の整合）の行追加でさらに移動（旧: 1978）。書き込み内容・commit の意味は不変。
-    ("sql/transaction.rs", 2026),
+    ("sql/transaction.rs", 2060),
     // TABLE-44・Issue #1684: 一時表ストア（セッション専用のインメモリ DB。永続 DB とは別インスタンス）の
     // 書き込みトランザクションの確定口（`TempRowStore::commit`）。確定するのは、一時コアの書き込み本体
     // （`tenant::*`・`catalog::*`。いずれも自分の DB の表世代を `bump_table_generation_in_txn` で進める）が
