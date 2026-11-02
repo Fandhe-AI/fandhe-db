@@ -107,7 +107,7 @@ crash-test-interrupt: ## crash_test.sh の中断パス（SIGTERM・プロセス�
 
 # 2 テーブル横断トランザクション・クラッシュ耐性回帰テスト（TASK-90・TABLE-10。scripts/crash_test_cross_table.sh を実行）
 .PHONY: crash-test-cross-table
-crash-test-cross-table: ## 2 テーブル横断トランザクション・クラッシュ耐性回帰テスト
+crash-test-cross-table: ## 2 テーブル横断トランザクション（storage 直叩き＋SQL 明示 Tx）のクラッシュ耐性回帰テスト
 	scripts/crash_test_cross_table.sh
 
 # 永続一意索引・クラッシュ耐性回帰テスト（Issue #1070・TABLE-16。scripts/crash_test_unique_index.sh を実行）

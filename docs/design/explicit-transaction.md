@@ -1129,3 +1129,14 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
 見えず、文数に計上せず、暗黙 Tx でも積める。巻き戻せない（`Unrestorable`・一時表を使った Tx）ときは捕捉せず `0A000`
 で Tx を失敗させる（`FailedRecoverable` でも内部エントリは `pl_release` で必ず除去する）。詳細は
 [plpgsql-subset.md](plpgsql-subset.md)「Issue #2227 追記」節。書き込み後の `ROLLBACK TO` の対応は #2879。
+
+## 明示トランザクション複数文のクラッシュ耐性（Issue #2415・SQL-31・TABLE-10 ポインタ）
+
+crash 道具 `crates/engine/examples/crash_tool_cross_table.rs` の `txn` モードは、SQL 表層（`execute_sql_in_txn`）だけで 3 表（`xt_ledger`・`xt_items`・`xt_batches`）をまたぐ明示トランザクションを繰り返す。親は TASK-332。
+
+- 1 Tx の文列: `BEGIN` → 条件付き `UPDATE`（`WHERE id = 0 AND applied = <期待値>`）→ `INSERT`（明細を 2 文に分割）→ `INSERT`（バッチ）→ `COMMIT`。
+- writer は `BEGIN` ではなく最初の書き込み文で取得される（Issue #2396）。そのため Tx 内で `SELECT` して条件を決めず、期待値を `UPDATE` の `WHERE` に畳み込み、`BEGIN` 直後の最初の文を書き込み文にする。どの文でも `55P03`・`40001` が起こりうる前提で、失敗時は `ROLLBACK` して `wire_code` だけを報告する。
+- `verify`: 台帳の適用数 S に対し、バッチ表が 0..S の連番・明細表が 0..S×4 の連番かつ導出 payload と一致、表間の件数一致、S が 0 なら失敗、別テナントから 0 行であること。1 表だけ進んだ／戻った状態（部分コミット）は失敗になる。
+- `self-check txn`: 完全な Tx は ok、台帳・明細・バッチのどれか 1 つだけ進めた DB と空 DB は ng になることを確かめ、オラクルの空振りを防ぐ。
+- `scripts/crash_test_cross_table.sh` が既存の `crash-test-cross-table` ジョブ内で batch・txn の 2 段を同じ検査（SIGKILL の終了コード 137・acked 下限・行数の単調増加）で実行する。
+- 申し送り: kill を Tx 実行中・`COMMIT` 直前・直後へ当てる制御と「中断を 1 度も観測しない実行を失敗にする」検査は #2416、DDL は #2417／#2418。
