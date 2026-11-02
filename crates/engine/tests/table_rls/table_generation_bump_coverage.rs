@@ -558,16 +558,16 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // 後続の base 取り込みで role.rs の行番号が +4 行移動したための追随（対象外の理由は同じ）。
     // Issue #2233（ログイン名対応表の追随・`sync_login_names` の追加で行番号が移動。同じ理由で対象外）。
     // PR #2867 レビュー対応で role.rs の行番号が +1 行移動したための追随（同じ理由で対象外）。
-    // Issue #2232 の取り込みで role.rs の行番号が +76 行移動したための追随（同じ理由で対象外）。
-    ("catalog/role.rs", 1239),
-    ("catalog/role.rs", 1271),
-    ("catalog/role.rs", 1290),
-    ("catalog/role.rs", 1309),
-    ("catalog/role.rs", 1362),
+    // Issue #2232 の取り込み・メンバーシップ blob の版 3 追加で role.rs の行番号が +92 行移動（同じ理由で対象外）。
+    ("catalog/role.rs", 1255),
+    ("catalog/role.rs", 1287),
+    ("catalog/role.rs", 1306),
+    ("catalog/role.rs", 1325),
+    ("catalog/role.rs", 1378),
     // Issue #2232: メンバーシップの付与・取り消し（`apply_membership_changes`）とロール作成＋付与
     // （`create_role_with_memberships`）。メンバーシップ表だけを書き、表の計画・世代に影響しない（同じ理由）。
-    ("catalog/role/membership_apply.rs", 306),
-    ("catalog/role/membership_apply.rs", 333),
+    ("catalog/role/membership_apply.rs", 309),
+    ("catalog/role/membership_apply.rs", 336),
     // Issue #1961 のロール・ACL カタログの単体テスト補助（`write` ヘルパー。専用表だけを書き表世代の対象外）。
     ("catalog/role/tests.rs", 37),
     // Issue #1962 の `sql::role_ddl` の crate 内テスト補助（`commit` ヘルパー。専用表だけを書き表世代の対象外）。

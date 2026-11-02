@@ -324,10 +324,16 @@ pub(crate) struct MembershipOptions {
     pub(crate) inherit: bool,
     pub(crate) set: bool,
     pub(crate) grantor_id: Option<u64>,
+    /// この付与が所有者相当の権限（DDL 権限ゲート通過）を根拠に行われたか。真なら ADMIN の依存評価で
+    /// 付与者の現在の ADMIN の有無によらず独立した根拠（根）として扱う。記録のない行（版 1・版 2）は偽で、
+    /// 従来の判定にフォールバックする（Issue #2232）。`grantor_id` が `Some` のときだけ意味を持つ。
+    pub(crate) grantor_root: bool,
 }
 
 /// メンバーシップ blob の版 2（`[2, bits, grantor_id(u64 LE)]`）。付与者なしは版 1 のまま保存する。
 const MEMBERSHIP_BLOB_VERSION_2: u8 = 2;
+/// メンバーシップ blob の版 3（版 2 と同じ配置で、所有者相当を根拠とした付与であること＝`grantor_root` を表す）。
+const MEMBERSHIP_BLOB_VERSION_3: u8 = 3;
 
 /// メンバーシップ blob へ符号化する。付与者なしは版 1（`[1, bits]`）、あれば版 2。
 pub(crate) fn encode_membership(opts: MembershipOptions) -> Vec<u8> {
@@ -343,7 +349,12 @@ pub(crate) fn encode_membership(opts: MembershipOptions) -> Vec<u8> {
     }
     match opts.grantor_id {
         Some(g) if g != 0 => {
-            let mut out = vec![MEMBERSHIP_BLOB_VERSION_2, bits];
+            let version = if opts.grantor_root {
+                MEMBERSHIP_BLOB_VERSION_3
+            } else {
+                MEMBERSHIP_BLOB_VERSION_2
+            };
+            let mut out = vec![version, bits];
             out.extend_from_slice(&g.to_le_bytes());
             out
         }
@@ -355,11 +366,14 @@ pub(crate) fn encode_membership(opts: MembershipOptions) -> Vec<u8> {
 pub(crate) fn decode_membership(bytes: &[u8]) -> Result<MembershipOptions> {
     let mut r = Reader::new(bytes);
     let version = r.u8()?;
-    if version != ROLE_BLOB_VERSION && version != MEMBERSHIP_BLOB_VERSION_2 {
+    if version != ROLE_BLOB_VERSION
+        && version != MEMBERSHIP_BLOB_VERSION_2
+        && version != MEMBERSHIP_BLOB_VERSION_3
+    {
         return Err(corrupt());
     }
     let bits = r.u8()?;
-    let grantor_id = if version == MEMBERSHIP_BLOB_VERSION_2 {
+    let grantor_id = if version != ROLE_BLOB_VERSION {
         let g = r.u64()?;
         if g == 0 {
             return Err(corrupt());
@@ -377,6 +391,7 @@ pub(crate) fn decode_membership(bytes: &[u8]) -> Result<MembershipOptions> {
         inherit: bits & MEMBER_INHERIT != 0,
         set: bits & MEMBER_SET != 0,
         grantor_id,
+        grantor_root: version == MEMBERSHIP_BLOB_VERSION_3,
     })
 }
 
@@ -737,6 +752,7 @@ pub(crate) fn remove_memberships_of_role_in_txn(
     for (member, granted, opts) in &orphaned {
         let detached = MembershipOptions {
             grantor_id: None,
+            grantor_root: false,
             ..*opts
         };
         table.insert(

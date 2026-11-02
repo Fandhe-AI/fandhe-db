@@ -99,6 +99,7 @@ fn membership_and_login_blob_roundtrip() {
         inherit: false,
         set: true,
         grantor_id: None,
+        grantor_root: false,
     };
     let bytes = encode_membership(opts);
     assert_eq!(bytes, vec![1, 0b101]);
@@ -112,13 +113,22 @@ fn membership_and_login_blob_roundtrip() {
     let bytes2 = encode_membership(with_grantor);
     assert_eq!(bytes2, vec![2, 0b101, 7, 0, 0, 0, 0, 0, 0, 0]);
     assert_eq!(decode_membership(&bytes2).expect("decode"), with_grantor);
+    // 版 3: 所有者相当を根拠とした付与（版 2 と同じ配置。記録のない版 2 は根ではない）。
+    let rooted = MembershipOptions {
+        grantor_root: true,
+        ..with_grantor
+    };
+    let bytes3 = encode_membership(rooted);
+    assert_eq!(bytes3, vec![3, 0b101, 7, 0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(decode_membership(&bytes3).expect("decode"), rooted);
+    assert!(!decode_membership(&bytes2).expect("decode").grantor_root);
     for bad in [
         vec![2, 0b101],
         vec![2, 0b101, 0, 0, 0, 0, 0, 0, 0, 0],
         vec![2, 0b101, 7, 0, 0, 0, 0, 0, 0],
         vec![2, 0b101, 7, 0, 0, 0, 0, 0, 0, 0, 0],
         vec![2, 0x08, 7, 0, 0, 0, 0, 0, 0, 0],
-        vec![3, 0, 7, 0, 0, 0, 0, 0, 0, 0],
+        vec![4, 0, 7, 0, 0, 0, 0, 0, 0, 0],
     ] {
         assert!(is_fixed_corrupt(decode_membership(&bad)), "{bad:?}");
     }
@@ -411,6 +421,7 @@ fn role_catalog_survives_reopen() {
                 inherit: true,
                 set: true,
                 grantor_id: None,
+                grantor_root: false,
             },
         )?;
         register_login_in_txn(t, &ident, "t1", a)
@@ -515,6 +526,7 @@ fn put_member(s: &Storage, tenant: &str, member: u64, granted: u64, set: bool) {
                 inherit: true,
                 set,
                 grantor_id: None,
+                grantor_root: false,
             },
         )
     })

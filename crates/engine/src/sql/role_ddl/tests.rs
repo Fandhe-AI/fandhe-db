@@ -212,6 +212,7 @@ fn drop_removes_memberships_in_both_directions_only_in_its_tenant() {
         inherit: true,
         set: true,
         grantor_id: None,
+        grantor_root: false,
     };
     let txn = s.begin_write_txn().expect("begin");
     // a は b のメンバー、c は a のメンバー、b と c は別の関係（無関係に残る）。
@@ -362,6 +363,7 @@ fn put_member(s: &Storage, tenant: &str, member: u64, granted: u64, set: bool) {
             inherit: true,
             set,
             grantor_id: None,
+            grantor_root: false,
         },
     )
     .expect("put membership");

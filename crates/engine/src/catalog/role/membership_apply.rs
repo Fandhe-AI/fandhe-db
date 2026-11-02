@@ -167,6 +167,9 @@ fn has_independent_admin(
         }
         found = match o.grantor_id {
             None => true,
+            // 所有者相当の権限を根拠に付けた行は、付与者の現在の ADMIN の有無を問わず独立した根拠（根）。
+            // 付与者が後から継承で ADMIN を得ても、その経路を辿って循環扱いにしない。
+            Some(_) if o.grantor_root => true,
             Some(g) if visiting.contains(&g) => false,
             // 付与者が今回の連鎖で ADMIN の行を失った（lost）なら、ADMIN の不在を所有者相当の根拠にしない。
             // 別経路で ADMIN を保つ場合だけ、その経路が独立かを再帰で確かめる（fail-closed）。
@@ -425,6 +428,7 @@ fn grant_one(
                     .unwrap_or(member.def.attributes.inherit),
                 set: pick(req.with_options, MembershipOpt::Set).unwrap_or(true),
                 grantor_id: Some(grantor),
+                grantor_root: req.owner_equivalent,
             };
             put_membership_in_txn(w, tenant, member.id, role.id, opts)?;
             Ok((1, false))

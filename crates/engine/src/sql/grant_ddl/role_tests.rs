@@ -99,7 +99,8 @@ fn grant_records_grantor_and_defaults() {
             admin: false,
             inherit: true,
             set: true,
-            grantor_id: Some(me)
+            grantor_id: Some(me),
+            grantor_root: true,
         })
     );
     // NOINHERIT 属性のロールへの既定は INHERIT 偽。属性を後から変えても既存の付与は遡って変わらない。
@@ -362,6 +363,37 @@ fn multi_member_membership_revoke_is_order_independent() {
             "{order}"
         );
         assert!(mem(&f, n, r).is_none(), "{order}: n must be revoked");
+    }
+}
+
+/// 所有者相当の付与は ADMIN の依存評価で独立した根拠として扱う（回帰）。o（所有者相当）が x・y へ ADMIN 付きで
+/// 付与し、x が z へ付与した後に `GRANT z TO o`・`GRANT y TO x` を作っても、y 経由で x は ADMIN を保つため、
+/// x の直接の ADMIN の取り消しは RESTRICT でも成功し、CASCADE でも z の付与は残る。
+#[test]
+fn owner_equivalent_grants_are_independent_admin_roots() {
+    for cascade in [false, true] {
+        let f = fx(&format!("rm_root_{cascade}"));
+        let me = role(&f, "me");
+        let r = role(&f, "r");
+        let x = role(&f, "x");
+        role(&f, "y");
+        let z = role(&f, "z");
+        role(&f, "w");
+        let owner = session(me, true);
+        run(&f, &owner, "GRANT r TO x, y WITH ADMIN TRUE").expect("x y admin");
+        run(&f, &session(x, false), "GRANT r TO z WITH ADMIN TRUE").expect("z by x");
+        run(&f, &owner, "GRANT z TO me").expect("owner inherits z");
+        run(&f, &owner, "GRANT y TO x").expect("x inherits y");
+        let sql = if cascade {
+            "REVOKE ADMIN OPTION FOR r FROM x CASCADE"
+        } else {
+            "REVOKE ADMIN OPTION FOR r FROM x"
+        };
+        run(&f, &owner, sql).expect("revoke");
+        assert!(!mem(&f, x, r).expect("x").admin);
+        assert!(mem(&f, z, r).expect("z kept").admin, "cascade={cascade}");
+        // x は y 経由の ADMIN を保つので、引き続き付与できる。
+        run(&f, &session(x, false), "GRANT r TO w").expect("x still admin via y");
     }
 }
 
