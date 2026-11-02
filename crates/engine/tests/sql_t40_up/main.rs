@@ -131,6 +131,7 @@ mod sql67_sql_function_limits;
 mod sql67_standard_body;
 mod sql68_do_block;
 mod sql68_do_limits_ledger;
+mod sql69_savepoint_cursor;
 mod sql69_savepoint_ledger;
 mod sql69_savepoint_rollback;
 mod sql69_savepoint_syntax;

@@ -291,6 +291,86 @@ fn suspended_fetch_portal_still_resumes_without_intervening_close_or_commit() {
     read_ready_for_query(&mut stream);
 }
 
+// --- `ROLLBACK TO SAVEPOINT` とカーソル束縛 portal（Issue #1946・SQL-69 (5)） --------
+//
+// `ROLLBACK TO` は世代を変えないが、savepoint より後に宣言したカーソルは engine が閉じる。
+// 閉じたカーソルへ束縛された中断 portal は `cursor_id` が解決できず `34000` で拒否され、
+// それ以前のカーソルへ束縛された portal は続きの行を送出できる。
+
+/// simple query を 1 つ送り、期待する完了タグと ReadyForQuery を読む。
+fn simple_ok(stream: &mut std::net::TcpStream, sql: &str, tag: &str) {
+    send_simple_query(stream, sql);
+    assert_eq!(read_command_complete(stream), tag);
+    read_ready_for_query(stream);
+}
+
+/// `FETCH 5 FROM c` を `pf` へ Bind し `max_rows=1` で中断させる。
+fn suspend_fetch_portal(stream: &mut std::net::TcpStream) {
+    parse_and_bind(stream, "sf", "pf", "FETCH 5 FROM c");
+    send_length_prefixed_message(stream, b'E', &execute_body("pf", 1));
+    let (kind, _) = read_message(stream);
+    assert_eq!(kind, b'D', "expected DataRow");
+    let (kind, _) = read_message(stream);
+    assert_eq!(kind, b's', "expected PortalSuspended");
+}
+
+/// savepoint より後に宣言したカーソルの中断 portal は、`ROLLBACK TO` の後に再開できない。
+#[test]
+fn suspended_fetch_portal_is_rejected_after_rollback_to_closes_cursor() {
+    let (core, _guard) = new_core_with_documents_table();
+    seed_rows(&core, 5);
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, Arc::clone(&core));
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    simple_ok(&mut stream, "BEGIN", "BEGIN");
+    simple_ok(&mut stream, "SAVEPOINT a", "SAVEPOINT");
+    simple_ok(
+        &mut stream,
+        "DECLARE c CURSOR FOR SELECT id FROM documents LIMIT 5",
+        "DECLARE CURSOR",
+    );
+    suspend_fetch_portal(&mut stream);
+    simple_ok(&mut stream, "ROLLBACK TO a", "ROLLBACK");
+
+    assert_resume_rejected_without_leaking_rows(&mut stream);
+
+    simple_ok(&mut stream, "ROLLBACK", "ROLLBACK");
+}
+
+/// savepoint より前に宣言したカーソルの中断 portal は、`ROLLBACK TO` の後も続きの行を出せる。
+#[test]
+fn suspended_fetch_portal_resumes_after_rollback_to_for_older_cursor() {
+    let (core, _guard) = new_core_with_documents_table();
+    seed_rows(&core, 5);
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, Arc::clone(&core));
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    simple_ok(&mut stream, "BEGIN", "BEGIN");
+    simple_ok(
+        &mut stream,
+        "DECLARE c CURSOR FOR SELECT id FROM documents LIMIT 5",
+        "DECLARE CURSOR",
+    );
+    simple_ok(&mut stream, "SAVEPOINT a", "SAVEPOINT");
+    suspend_fetch_portal(&mut stream);
+    simple_ok(&mut stream, "ROLLBACK TO a", "ROLLBACK");
+
+    send_length_prefixed_message(&mut stream, b'E', &execute_body("pf", 0));
+    for _ in 0..4 {
+        let (kind, _) = read_message(&mut stream);
+        assert_eq!(kind, b'D', "expected DataRow");
+    }
+    let (kind, _) = read_message(&mut stream);
+    assert_eq!(kind, b'C', "expected CommandComplete");
+    send_sync(&mut stream);
+    let (kind, _) = read_message(&mut stream);
+    assert_eq!(kind, b'Z', "expected ReadyForQuery after Sync");
+
+    simple_ok(&mut stream, "ROLLBACK", "ROLLBACK");
+}
+
 // --- 完了済み（Done）FETCH portal の再 Execute（PR #1049 レビュー指摘 Cursor
 // Bugbot Low の回帰防止） ------------------------------------------------------
 //

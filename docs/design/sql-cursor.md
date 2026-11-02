@@ -219,6 +219,12 @@ execute_portal`）で以下の 2 つを portal へ束縛し、再開前に突き
 `CLOSE`／`COMMIT`／`ROLLBACK` を挟んでいても `34000` にはしない
 （PR #1049 レビュー指摘対応）。
 
+`ROLLBACK TO SAVEPOINT` も無効化要因に加わる（Issue #1946・SQL-69 (5)）。savepoint より後に
+宣言したカーソルは engine が閉じるので、それに束縛された中断 portal は `cursor_id` が解決できず
+`34000` になる。`ROLLBACK TO` は Tx 世代を変えないため、世代ではなくカーソル識別子で弾く。
+それ以前のカーソルは位置を保ったまま残り、portal は続きから送出できる。詳細は
+[explicit-transaction.md](explicit-transaction.md) の「savepoint 巻き戻しとカーソル」節。
+
 ## 対象外・申し送り
 
 - `SCROLL`／`WITH HOLD`／`BINARY`／`FETCH ALL`／`BACKWARD`／`CLOSE ALL`／
