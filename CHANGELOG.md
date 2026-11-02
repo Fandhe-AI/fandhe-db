@@ -9,6 +9,7 @@
 
 ### Added
 
+- `GRANT`／`REVOKE` が SCHEMA 単位（`ON SCHEMA`・`ON ALL TABLES IN SCHEMA`。権限は USAGE・CREATE）を受理する（Issue #2234・SQL-40・RLS-12）。束縛ロール（DDL 権限ゲート通過の主体を除く）が USAGE の無い SCHEMA を修飾名で参照すると `42501`（他テナント・不在は `3F000`）。現在ロール未束縛のセッションの `GRANT … ON SCHEMA s` は `0A000` ではなく `42501` になる。公開 API の変更はない。
 - `ALTER ROLE`／`ALTER USER`（属性・パスワードの変更と `RENAME TO`）と `SET ROLE`／`RESET ROLE` を追加した（Issue #1963・SQL-39）。`SET ROLE` はセッションのロールから `SET` 真のメンバーシップを辿れる対象にだけ切り替え、未所属は `42501`、他テナントのロールは不在と同じ `42704`。`PolicyContext`・DDL 権限は変えない。BREAKING CHANGE: 公開 enum `ParsedSql`・`SqlOutcome` に variant（`AlterRole`・`SetRole`）を追加した。
 - `SAVEPOINT <名前>`・`RELEASE [SAVEPOINT] <名前>`・`ROLLBACK [WORK|TRANSACTION] TO [SAVEPOINT] <名前>` の構文と、明示 Tx の savepoint スタックを追加した（Issue #1942・SQL-69）。Tx の外は `25P01`、存在しない名前は新設の `3B001`（HTTP は 400）。巻き戻し本体は未実装（親 Issue #1941）のため、`ROLLBACK TO` は `0A000` で拒否して Tx を `Failed` にする（後続の `COMMIT` で書き込みを確定させない fail-closed）。CommandComplete タグは `SAVEPOINT`・`RELEASE`。
   BREAKING CHANGE: 公開 enum `TxnControl`（`Savepoint`・`RollbackToSavepoint`・`ReleaseSavepoint`）・`SqlOutcome`（`Savepoint`・`ReleaseSavepoint`）・`ErrorClass`（`InvalidSavepointSpecification`）・`SqlSurfaceError`（`InvalidSavepointSpecification`）に variant を追加した。公開構造体 `ValidatedTxnControl` に `savepoint_name` を追加し `Copy` を外した。`is_rollback_statement` は `ROLLBACK TO ...` で `false` を返す。3 文の SQLSTATE は `42601` から変わる。
