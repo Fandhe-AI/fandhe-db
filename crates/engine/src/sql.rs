@@ -213,6 +213,7 @@ mod truncate_restart_identity_tests;
 pub mod udf_ddl;
 // TRIGGER DDL（TABLE-45・Issue #1722）。
 pub mod grant_ddl;
+pub mod owner_ddl;
 pub mod policy_applicability;
 pub mod policy_ddl;
 pub(crate) mod privilege_gate;
@@ -441,6 +442,11 @@ pub enum SqlOutcome {
     ///
     /// **BREAKING CHANGE**（Issue #1965）: `SqlOutcome` への variant 追加。
     GrantRevoke(grant_ddl::GrantRevokeOutcome),
+    /// `ALTER {TABLE|VIEW|MATERIALIZED VIEW|SCHEMA} ... OWNER TO`（SQL-40、Issue #2236。コマンドタグは
+    /// 対象に応じた `ALTER <種別>`）。
+    ///
+    /// **BREAKING CHANGE**（Issue #2236）: `SqlOutcome` への variant 追加。
+    AlterOwner(owner_ddl::AlterOwnerOutcome),
     /// `CREATE ROLE`／`CREATE USER`（SQL-39、Issue #1962。コマンドタグは PostgreSQL と同じく `CREATE ROLE`）。
     ///
     /// **BREAKING CHANGE**（Issue #1962）: `SqlOutcome` への variant 追加。

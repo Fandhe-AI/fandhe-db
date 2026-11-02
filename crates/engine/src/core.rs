@@ -1960,6 +1960,8 @@ pub enum ParsedSql {
     ///
     /// **BREAKING CHANGE**（Issue #1965）: `ParsedSql` への variant 追加。
     GrantRevoke(crate::sql::allowlist::ValidatedGrantRevoke),
+    /// `ALTER {TABLE|VIEW|MATERIALIZED VIEW|SCHEMA} ... OWNER TO`（SQL-40・Issue #2236）。
+    AlterOwner(crate::sql::allowlist::ValidatedAlterOwner),
     /// `CREATE ROLE|USER`（SQL-39、Issue #1962）。
     ///
     /// **BREAKING CHANGE**（Issue #1962）: `ParsedSql` への variant 追加。
@@ -2141,6 +2143,7 @@ fn statement_clock_scope(
         | ParsedSql::AlterPolicy(_)
         | ParsedSql::DropPolicy(_)
         | ParsedSql::GrantRevoke(_)
+        | ParsedSql::AlterOwner(_)
         | ParsedSql::CreateRole(_)
         | ParsedSql::DropRole(_)
         | ParsedSql::AlterRole(_)
@@ -2221,6 +2224,7 @@ fn insert_sequence_scope(
         | ParsedSql::AlterPolicy(_)
         | ParsedSql::DropPolicy(_)
         | ParsedSql::GrantRevoke(_)
+        | ParsedSql::AlterOwner(_)
         | ParsedSql::CreateRole(_)
         | ParsedSql::DropRole(_)
         | ParsedSql::AlterRole(_)
@@ -2299,6 +2303,7 @@ fn insert_default_clock_scope(
         | ParsedSql::AlterPolicy(_)
         | ParsedSql::DropPolicy(_)
         | ParsedSql::GrantRevoke(_)
+        | ParsedSql::AlterOwner(_)
         | ParsedSql::CreateRole(_)
         | ParsedSql::DropRole(_)
         | ParsedSql::AlterRole(_)
@@ -4454,6 +4459,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::AlterPolicy(_)
                     | crate::sql::SqlOutcome::DropPolicy(_)
                     | crate::sql::SqlOutcome::GrantRevoke(_)
+                    | crate::sql::SqlOutcome::AlterOwner(_)
                     | crate::sql::SqlOutcome::CreateRole(_)
                     | crate::sql::SqlOutcome::DropRole(_)
                     | crate::sql::SqlOutcome::AlterRole(_)
@@ -4527,6 +4533,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::AlterPolicy(_)
                     | crate::sql::SqlOutcome::DropPolicy(_)
                     | crate::sql::SqlOutcome::GrantRevoke(_)
+                    | crate::sql::SqlOutcome::AlterOwner(_)
                     | crate::sql::SqlOutcome::CreateRole(_)
                     | crate::sql::SqlOutcome::DropRole(_)
                     | crate::sql::SqlOutcome::AlterRole(_)
@@ -4597,6 +4604,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::AlterPolicy(_)
                     | crate::sql::SqlOutcome::DropPolicy(_)
                     | crate::sql::SqlOutcome::GrantRevoke(_)
+                    | crate::sql::SqlOutcome::AlterOwner(_)
                     | crate::sql::SqlOutcome::CreateRole(_)
                     | crate::sql::SqlOutcome::DropRole(_)
                     | crate::sql::SqlOutcome::AlterRole(_)
@@ -4674,6 +4682,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::AlterPolicy(_)
                     | crate::sql::SqlOutcome::DropPolicy(_)
                     | crate::sql::SqlOutcome::GrantRevoke(_)
+                    | crate::sql::SqlOutcome::AlterOwner(_)
                     | crate::sql::SqlOutcome::CreateRole(_)
                     | crate::sql::SqlOutcome::DropRole(_)
                     | crate::sql::SqlOutcome::AlterRole(_)
@@ -4770,6 +4779,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::AlterPolicy(_)
                     | crate::sql::SqlOutcome::DropPolicy(_)
                     | crate::sql::SqlOutcome::GrantRevoke(_)
+                    | crate::sql::SqlOutcome::AlterOwner(_)
                     | crate::sql::SqlOutcome::CreateRole(_)
                     | crate::sql::SqlOutcome::DropRole(_)
                     | crate::sql::SqlOutcome::AlterRole(_)
@@ -6067,6 +6077,21 @@ impl EngineCore {
         // SQL-40・Issue #1965: `GRANT`／`REVOKE` は構造検証だけで束縛する（カタログ照会は実行段。権限の無い
         // 主体にロール・対象の有無を示さないため）。`ALTER DEFAULT PRIVILEGES`（#2237）は汎用 `ALTER`
         // （`ALTER TABLE` 扱い）より前に `0A000` で拒否する。
+        // Issue #2236: `ALTER {TABLE|VIEW|MATERIALIZED VIEW|SCHEMA} <名> OWNER TO` は汎用 `ALTER` と
+        // `ALTER SCHEMA` より前に束縛する（構造検証だけ。カタログ照会は実行段）。`REASSIGN OWNED`・
+        // `DROP OWNED` は汎用 `DROP` より前に固定の `0A000` で拒否する（状態に依存しない）。
+        if crate::sql::allowlist::is_owned_by_statement(&tokens) {
+            return Err(crate::sql::allowlist::reject_owned_by());
+        }
+        if crate::sql::allowlist::is_alter_owner_statement(&tokens) {
+            let stmt = crate::sql::allowlist::validate_alter_owner_tokens(&tokens)?;
+            // 一時表との衝突は参照の記録だけ行い（結果は使わない）、振り分け側が `0A000` で拒否する
+            // （`GRANT` と同じ設計）。
+            if let Some(name) = stmt.relation_name() {
+                let _ = crate::sql::allowlist::TableLookup::table_exists(&storage_lookup, name)?;
+            }
+            return Ok(ParsedSql::AlterOwner(stmt));
+        }
         if crate::sql::allowlist::is_grant_statement(&tokens)
             || crate::sql::allowlist::is_revoke_statement(&tokens)
         {
@@ -8081,6 +8106,32 @@ impl EngineCore {
             // SQL-40（Issue #1965）: 現在ロールの束縛ゲート → 実行本体。未束縛（認証層が束縛していない現状の
             // 全セッション）には対象・ロールの有無を問わず常に `42501`。ACL はテナント単位のため
             // `ctx.tenant_id()` を渡す。
+            // SQL-40（Issue #2236）: 権限ゲート（未束縛は `42501`）→ 実行本体（束縛・解決・所有者の判定を
+            // 単一の write txn で行う）。一時表を対象にした `OWNER TO` は一時表の所有者を持たないため
+            // `0A000`（`GRANT` と同じ設計）。
+            ParsedSql::AlterOwner(stmt) => {
+                crate::sql::privilege_gate::require_ddl_or_owner(
+                    session,
+                    crate::sql::privilege_gate::DdlStatementKind::AlterOwner,
+                )?;
+                if stmt
+                    .relation_name()
+                    .is_some_and(|name| session.temp_tables().contains(name))
+                {
+                    return Err(
+                        crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
+                            "OWNER TO is not supported for temporary tables",
+                        ),
+                    );
+                }
+                let outcome = crate::sql::owner_ddl::execute_alter_owner(
+                    &self.storage,
+                    ctx.tenant_id(),
+                    session,
+                    stmt,
+                )?;
+                Ok(crate::sql::SqlOutcome::AlterOwner(outcome))
+            }
             ParsedSql::GrantRevoke(stmt) => {
                 crate::sql::grant_ddl::require_grant_principal(session)?;
                 let outcome = crate::sql::grant_ddl::execute_grant_revoke(
@@ -8149,12 +8200,19 @@ impl EngineCore {
                     session,
                     crate::sql::privilege_gate::DdlStatementKind::CreateSchema,
                 )?;
-                // 作成者（束縛ロール）を所有者として同じ write txn で記録する（Issue #2236）。
+                // 所有者（`AUTHORIZATION` の指定、省略時は作成者＝束縛中の現在ロール）を同じ write txn で
+                // 記録する（Issue #2236。未束縛で指定も無ければ記録せず、運用者権限でしか扱えない）。
+                let owner = crate::sql::owner_ddl::resolve_schema_owner(
+                    &self.storage,
+                    ctx.tenant_id(),
+                    session,
+                    stmt.authorization.as_ref(),
+                )?;
                 let outcome = crate::sql::ddl::execute_create_schema(
                     &self.storage,
                     ctx.tenant_id(),
                     stmt,
-                    session.current_role_id().filter(|id| *id != 0),
+                    owner,
                 )?;
                 Ok(crate::sql::SqlOutcome::CreateSchema(outcome))
             }
@@ -8889,6 +8947,17 @@ impl EngineCore {
                 crate::sql::grant_ddl::require_grant_principal(session)?;
                 Err(SqlSurfaceError::feature_not_supported(
                     "GRANT/REVOKE is not supported inside a transaction block",
+                ))
+            }
+            // SQL-40（Issue #2236）: 所有者の変更も独立した write txn で commit され ROLLBACK で取り消せない
+            // ため明示トランザクション内では行わない。未束縛は存在を問わず `42501`（ゲートを `0A000` より前に置く）。
+            ParsedSql::AlterOwner(_) => {
+                crate::sql::privilege_gate::require_ddl_or_owner(
+                    session,
+                    crate::sql::privilege_gate::DdlStatementKind::AlterOwner,
+                )?;
+                Err(SqlSurfaceError::feature_not_supported(
+                    "ALTER ... OWNER TO is not supported inside a transaction block",
                 ))
             }
             // SQL-39（Issue #1962）: ロール DDL も独立した write txn で commit され ROLLBACK で取り消せないため
@@ -10169,6 +10238,7 @@ impl EngineCore {
                 Ok(None)
             }
             ParsedSql::GrantRevoke(_) => Ok(None),
+            ParsedSql::AlterOwner(_) => Ok(None),
             ParsedSql::CreateRole(_)
             | ParsedSql::DropRole(_)
             | ParsedSql::AlterRole(_)

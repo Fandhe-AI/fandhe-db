@@ -135,14 +135,18 @@ impl From<CatalogError> for AclChangeError {
 type Result<T> = std::result::Result<T, AclChangeError>;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum RelKind {
+pub(super) enum RelKind {
     Table,
     View,
     Matview,
 }
 
 /// relation の種別を引く。無ければ `TableNotFound`、索引・SEQUENCE は `WrongObjectKind`。
-fn relation_kind(write_txn: &redb::WriteTransaction, tenant: &str, key: &str) -> Result<RelKind> {
+pub(super) fn relation_kind(
+    write_txn: &redb::WriteTransaction,
+    tenant: &str,
+    key: &str,
+) -> Result<RelKind> {
     crate::catalog::namespace::ensure_tenant_key_schema_alive_in_txn(write_txn, tenant, key)?;
     let in_views = match ReadSource::open_table(write_txn, VIEWS_TABLE) {
         Ok(t) => t.get(key).map_err(CatalogError::from)?.is_some(),
@@ -823,7 +827,10 @@ impl Storage {
 
 /// 触れた relation の世代を進めて DDL として記録し、commit する（`USING PLAN` の世代照合・commit 記録の契約。
 /// `tests/table_rls/table_generation_bump_coverage.rs` が commit 直前の bump を検査する）。
-fn commit_with_bumps(write_txn: crate::storage::GatedWriteTxn, tables: &[String]) -> Result<()> {
+pub(super) fn commit_with_bumps(
+    write_txn: crate::storage::GatedWriteTxn,
+    tables: &[String],
+) -> Result<()> {
     for t in tables {
         bump_table_generation_in_txn(&write_txn, t)?;
         crate::storage::commit_log::note_ddl(&write_txn, t);

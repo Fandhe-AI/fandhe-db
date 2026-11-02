@@ -31,8 +31,10 @@ use super::{validate_identifier, validate_relation_key, CatalogError, Result, St
 
 mod apply;
 pub(crate) mod owner;
+mod owner_change;
 mod schema;
 pub(crate) use apply::{AclChangeError, AclItem, AclRequest, AclScope, AclWarning, GranteeSpec};
+pub(crate) use owner_change::NewOwnerRef;
 pub(crate) use schema::remove_schema_acl_in_txn;
 
 /// ACL の専用カタログ表。キーは `(tenant_id, object_kind, object_key, column, grantee_id, grantor_id)`。

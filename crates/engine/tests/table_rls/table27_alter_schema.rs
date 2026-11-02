@@ -133,9 +133,11 @@ fn rename_rejections() {
         let sql = format!("ALTER SCHEMA a RENAME TO {new}");
         assert_eq!(code_as(&core, "alice", &mut s, &sql), "42939", "{sql}");
     }
+    // `OWNER TO` は Issue #2236 で対応した。この未束縛のセッションは束縛ゲートで `42501`
+    // （実行の契約は `sql40_object_owner.rs`）。
     assert_eq!(
         code_as(&core, "alice", &mut s, "ALTER SCHEMA a OWNER TO bob"),
-        "0A000"
+        "42501"
     );
     for sql in [
         "ALTER SCHEMA",
