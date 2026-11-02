@@ -405,6 +405,10 @@
 //! 実行しており nosql まで拒否してしまっていた回帰を、codex-review
 //! PR #1089 P1 是正で表層限定へ修正した）。
 //!
+//! `wire-server login-identifier --tenant <id> --role <name>` サブコマンドは、カタログのロール
+//! （`CREATE ROLE ... LOGIN PASSWORD`）で SCRAM 接続するときの user（ログイン識別子）を表示する
+//! （Issue #2233・WIRE-18。DB は開かない）。
+//!
 //! `wire-server hash-password` サブコマンドはユーザーストア（`username:tenant_id:phc`）
 //! に登録する 1 行を生成する補助コマンド（stdin からパスワードを読み、平文を
 //! ログ・引数に残さない）。
@@ -456,6 +460,9 @@ fn main() -> ExitCode {
 
     if args.get(1).map(String::as_str) == Some("hash-password") {
         return run_hash_password(&args[2..]);
+    }
+    if args.get(1).map(String::as_str) == Some("login-identifier") {
+        return run_login_identifier(&args[2..]);
     }
 
     run_server(&args)
@@ -2626,6 +2633,13 @@ fn run_server(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // WIRE-18・Issue #2233: カタログのロールのログイン名対応表を後追いで登録する（#1962 以降に作られた
+    // 既存のロールを SCRAM 認証の対象にする。冪等）。失敗したら listen せず起動を拒否する（fail-closed。
+    // 対応表が不整合のままログイン可否を決めない）。エラーは固定文言で、識別子・テナントを含まない。
+    if core.sync_login_names().is_err() {
+        engine::log_stderr!("wire-server: failed to synchronize role login names");
+        return ExitCode::FAILURE;
+    }
     // TASK-117（PLAN-9）: opt-in 注入。未指定（既定）では `query_planner`/
     // `embedder` とも未設定のままとなり、`USING PLAN` は従来どおり
     // `CoreError::QueryPlannerUnavailable`/`EmbedderUnavailable`
@@ -3228,6 +3242,40 @@ fn open_engine_core(
             Ok(engine::core::EngineCore::from_storage_with_engine(
                 storage, kind,
             ))
+        }
+    }
+}
+
+/// `login-identifier --tenant <tenant_id> --role <role_name>` サブコマンド（Issue #2233・WIRE-18）。
+/// カタログのロールで SCRAM 接続するときの user（ログイン識別子）を stdout へ出力する。DB は開かない純関数
+/// （識別子は `tenant_id` から決定的に導出される）。運用者がこの値を利用者へ渡す。未知の引数・欠落・
+/// 不正な値は fail-closed に拒否する。
+fn run_login_identifier(args: &[String]) -> ExitCode {
+    let mut tenant: Option<&str> = None;
+    let mut role: Option<&str> = None;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--tenant" => tenant = it.next().map(String::as_str),
+            "--role" => role = it.next().map(String::as_str),
+            other => {
+                engine::log_stderr!("wire-server: login-identifier: unknown argument: {other}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    let (Some(tenant), Some(role)) = (tenant, role) else {
+        engine::log_stderr!("wire-server: login-identifier requires --tenant and --role");
+        return ExitCode::FAILURE;
+    };
+    match engine::core::EngineCore::login_identifier(tenant, role) {
+        Ok(ident) => {
+            println!("{ident}");
+            ExitCode::SUCCESS
+        }
+        Err(_) => {
+            engine::log_stderr!("wire-server: login-identifier: invalid tenant or role name");
+            ExitCode::FAILURE
         }
     }
 }

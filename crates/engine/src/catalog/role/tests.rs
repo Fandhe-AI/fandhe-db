@@ -204,11 +204,15 @@ fn login_map_inconsistency_fails_closed() {
         Ok(())
     })
     .expect("register");
-    assert_eq!(
-        s.resolve_login(&ident_ok).expect("ok"),
-        Some(("t1".to_string(), id))
-    );
-    for bad in [&ident_nologin, &ident_missing, &ident_wrong_id] {
+    let ok = s.resolve_login(&ident_ok).expect("ok").expect("some");
+    assert_eq!((ok.tenant.as_str(), ok.role.id), ("t1", id));
+    // NOLOGIN も解決できる（検証の後に認証層が拒否する。Issue #2233・J2）。
+    let nl = s
+        .resolve_login(&ident_nologin)
+        .expect("nologin resolves")
+        .expect("some");
+    assert!(!nl.role.attributes.login);
+    for bad in [&ident_missing, &ident_wrong_id] {
         assert!(is_fixed_corrupt(s.resolve_login(bad)), "{bad}");
     }
     // 未登録は None。
@@ -398,10 +402,8 @@ fn role_catalog_survives_reopen() {
     assert_eq!(got, d);
     assert!(s.tenant_has_roles("t1").expect("has"));
     assert_eq!(s.list_roles("t1").expect("list").len(), 2);
-    assert_eq!(
-        s.resolve_login(&ident).expect("login"),
-        Some(("t1".to_string(), a))
-    );
+    let resolved = s.resolve_login(&ident).expect("login").expect("some");
+    assert_eq!((resolved.tenant.as_str(), resolved.role.id), ("t1", a));
     let rt = s.db().begin_read().expect("read");
     let m = list_memberships_of_member_in_txn(&rt, "t1", a).expect("m");
     assert_eq!(m.len(), 1);
@@ -647,4 +649,77 @@ fn can_set_fails_closed_on_corrupt_membership() {
     .expect("raw");
     let rt = s.db().begin_read().expect("read");
     assert!(role_can_set_in_txn(&rt, "t1", a, b).is_err());
+}
+
+/// Issue #2233・J1: 修飾子は tenant_id から決定的に導出され、テナントごとに異なる。
+#[test]
+fn login_qualifier_is_deterministic_and_tenant_specific() {
+    let a1 = login_qualifier_for_tenant("tenant-a").expect("a");
+    let a2 = login_qualifier_for_tenant("tenant-a").expect("a again");
+    let b = login_qualifier_for_tenant("tenant-b").expect("b");
+    assert_eq!(a1, a2);
+    assert_ne!(a1, b);
+    assert_eq!(a1.len(), 32);
+    assert!(a1
+        .bytes()
+        .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)));
+    assert!(login_qualifier_for_tenant("").is_err());
+    let long = "x".repeat(300);
+    assert!(login_qualifier_for_tenant(&long).is_err());
+}
+
+/// Issue #2233・J3: 作成・改名・削除で対応表が同じ txn のまま追随する。
+#[test]
+fn login_map_follows_create_rename_drop() {
+    let (_g, _p, s) = open("role-login-follow");
+    let id = s.create_role("t1", &rdef("alice")).expect("create");
+    let ident = login_identifier_for("t1", "alice").expect("ident");
+    let got = s.resolve_login(&ident).expect("resolve").expect("some");
+    assert_eq!((got.tenant.as_str(), got.role.id), ("t1", id));
+    // 他テナントの同名ロールは別の識別子になる。
+    s.create_role("t2", &rdef("alice")).expect("t2");
+    let ident2 = login_identifier_for("t2", "alice").expect("ident2");
+    assert_ne!(ident, ident2);
+    assert_eq!(
+        s.resolve_login(&ident2).expect("r").expect("s").tenant,
+        "t2"
+    );
+    s.rename_role("t1", "alice", "alicia", &[]).expect("rename");
+    assert!(s.resolve_login(&ident).expect("old").is_none());
+    let new_ident = login_identifier_for("t1", "alicia").expect("new");
+    assert_eq!(
+        s.resolve_login(&new_ident)
+            .expect("new")
+            .expect("some")
+            .role
+            .id,
+        id
+    );
+    s.drop_roles("t1", &["alicia".to_string()], false)
+        .expect("drop");
+    assert!(s.resolve_login(&new_ident).expect("gone").is_none());
+    // 他テナントは影響を受けない。
+    assert!(s.resolve_login(&ident2).expect("t2").is_some());
+}
+
+/// Issue #2233・J3: 後追い登録は冪等で、対応表に無い既存ロールだけを登録する。
+#[test]
+fn sync_login_names_registers_missing_idempotently() {
+    let (_g, _p, s) = open("role-login-sync");
+    let id = s.create_role("t1", &rdef("alice")).expect("create");
+    s.create_role("t2", &rdef("bob")).expect("create");
+    assert_eq!(s.sync_login_names().expect("noop"), 0);
+    let ident = login_identifier_for("t1", "alice").expect("ident");
+    write(&s, |t| remove_login_in_txn(t, &ident).map(|_| ())).expect("remove");
+    assert!(s.resolve_login(&ident).expect("gone").is_none());
+    assert_eq!(s.sync_login_names().expect("sync"), 1);
+    assert_eq!(
+        s.resolve_login(&ident)
+            .expect("back")
+            .expect("some")
+            .role
+            .id,
+        id
+    );
+    assert_eq!(s.sync_login_names().expect("again"), 0);
 }
