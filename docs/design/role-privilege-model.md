@@ -783,4 +783,3 @@ SQL-40・RLS-12・SQL-19・SQL-22 ポインタ。書き込み系の文の対象�
 継承メンバーシップ（#2860）、所有者（#2236）、SCHEMA の USAGE（#2234）、シーケンス・関数の権限（#2235）、認証とロールの紐付け（#1971）、
 主体を持たない engine の Rust API（`parse_sql` ＋ `execute_parsed_*`、`execute_truncate_sql`）、`LOCK TABLE` の権限、
 `SHOW`／`CANCEL PARTITIONED DML` のロール単位の所有、存在オラクルの網羅試験（#1972）。
-

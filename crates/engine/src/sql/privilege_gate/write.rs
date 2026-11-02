@@ -350,14 +350,46 @@ fn require_with_scope(
             parsed_relations.push(t.clone());
         }
     }
+    let mut wants = build_wants(req, &candidates);
+    // 書き込み先が読み取り側にも現れる文（自己参照の `INSERT ... SELECT`・`UPDATE ... FROM`・
+    // `DELETE ... USING`・サブクエリ）は、収集器の候補の数え引きに頼らず SELECT を必ず要求する。
+    for name in self_read_targets(req, resolved_tokens) {
+        wants.push((name, PRIV_SELECT));
+    }
     require_relations_bits(
         storage,
         tenant,
         principal,
-        &build_wants(req, &candidates),
+        &wants,
         scope.read_snap,
         &parsed_relations,
     )
+}
+
+/// 書き込み先 relation のうち、トークン列に「書き込み先の宣言として必要な回数」を超えて名前が現れるもの。
+/// 超過した出現は読み取り側（SELECT 元・FROM／USING・サブクエリ）にある自己参照であり、読み取りには
+/// SELECT が要る。収集器は `"only"` のような構文語と同名の実表を、文頭が INSERT 等で別名が続く位置で
+/// 構文語として落とし、解析の記録（重複なし）も書き込み先と同名なら 1 件に畳まれるため、候補の数え引きでは
+/// 自己参照を見落とす。ここは生のトークンを数えるので、収集器の除外規則に左右されない。大文字小文字は
+/// 区別せず（引用の有無はトークンに残らない）、同名の別名・列名と重なる場合は拒否側（SELECT 要求）へ
+/// 倒れる。TRUNCATE のように読み取りを持たない文（必要ビットが TRUNCATE のみ）は対象外。
+fn self_read_targets(req: &WriteRequirement, tokens: &[Token]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (name, bits) in &req.targets {
+        if *bits == PRIV_TRUNCATE || out.contains(name) {
+            continue;
+        }
+        let declared = req.targets.iter().filter(|(n, _)| n == name).count();
+        let seen = tokens
+            .iter()
+            .filter_map(crate::sql::relation_name::unqualified_ident_name)
+            .filter(|t| t.eq_ignore_ascii_case(name))
+            .count();
+        if seen > declared {
+            out.push(name.clone());
+        }
+    }
+    out
 }
 
 /// 書き込み txn の内側で権限を再判定するための値（分割実行 DML のチャンクごとの再検査と、TRUNCATE の

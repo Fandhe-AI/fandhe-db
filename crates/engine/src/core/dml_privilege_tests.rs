@@ -457,3 +457,62 @@ fn recursive_cte_self_reference_is_not_a_relation_for_dml() {
         assert_ne!(f.alice_run(&sql), "42501", "{sql}");
     }
 }
+
+/// 書き込み先が読み取り側にも現れる文（自己参照）は、書き込み先の権限に加えて SELECT を要求する。
+/// 実表 `"only"` は文頭が INSERT で別名が続く位置で収集器が構文語として落とすため、名前の出現数の数え引きだと
+/// SELECT 要求が消えて INSERT 権限だけで内側 SELECT を実行できてしまう（Issue #1968 の指摘対応）。
+/// 通常名・引用付き `"only"` のどちらも、INSERT だけでは拒否され SELECT を足すと通る。
+#[test]
+fn self_referencing_write_requires_select_on_the_target() {
+    let f = fx("dmlpriv-selfref");
+    f.admin_run("CREATE TABLE \"only\" (k BIGINT PRIMARY KEY)");
+    for (table, sql) in [
+        (
+            "ca",
+            "INSERT INTO ca (id, embedding, n) SELECT id + 100, embedding, n FROM ca LIMIT 5",
+        ),
+        (
+            "\"only\"",
+            "INSERT INTO \"only\" (k) SELECT k + 100 FROM \"only\" x LIMIT 5",
+        ),
+        (
+            "\"only\"",
+            "INSERT INTO \"only\" (k) SELECT x.k + 100 FROM \"only\" AS x LIMIT 5",
+        ),
+    ] {
+        f.admin_run(&format!("GRANT INSERT ON {table} TO alice"));
+        assert_eq!(f.alice_run(sql), "42501", "{sql}");
+        f.admin_run(&format!("GRANT SELECT ON {table} TO alice"));
+        assert_ne!(f.alice_run(sql), "42501", "{sql}");
+        f.admin_run(&format!("REVOKE ALL ON {table} FROM alice"));
+    }
+    // UPDATE ... FROM・DELETE ... USING・サブクエリの自己参照も、書き込みの権限だけでは通らない。
+    for (table, grant, sql) in [
+        (
+            "ca",
+            "UPDATE",
+            "UPDATE ca SET n = c.n FROM ca c WHERE ca.id = c.id",
+        ),
+        (
+            "ca",
+            "DELETE",
+            "DELETE FROM ca USING ca c WHERE ca.id = c.id",
+        ),
+        (
+            "ca",
+            "DELETE",
+            "DELETE FROM ca WHERE n IN (SELECT n FROM ca LIMIT 5)",
+        ),
+        (
+            "\"only\"",
+            "DELETE",
+            "DELETE FROM \"only\" WHERE k IN (SELECT k FROM \"only\" x LIMIT 5)",
+        ),
+    ] {
+        f.admin_run(&format!("GRANT {grant} ON {table} TO alice"));
+        assert_eq!(f.alice_run(sql), "42501", "{sql}");
+        f.admin_run(&format!("GRANT SELECT ON {table} TO alice"));
+        assert_ne!(f.alice_run(sql), "42501", "{sql}");
+        f.admin_run(&format!("REVOKE ALL ON {table} FROM alice"));
+    }
+}
