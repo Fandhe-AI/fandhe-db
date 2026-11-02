@@ -461,3 +461,37 @@ fn syntax_word_named_table_is_gated_and_recursive_cte_self_reference_is_not() {
          SELECT n FROM t",
     );
 }
+
+/// 一時表を持つセッション（Issue #1967）。一時表だけを参照する文は表単位の権限なしでも成功し、実表も
+/// 参照する文は実表の権限なしなら `42501`。一時表と同名の実表があっても一時表が優先され（実表の権限は
+/// 要らない）、実表だけを参照する文は一時表を持っていても検査される。
+#[test]
+fn temp_table_sessions_keep_persistent_privilege_checks() {
+    let f = fx("sql40_temp_gate");
+    let mut owner = bound(ALICE, true);
+    f.ok("t1", &mut owner, "CREATE TABLE r (id BIGINT PRIMARY KEY)");
+    f.ok("t1", &mut owner, "CREATE TABLE sh (id BIGINT PRIMARY KEY)");
+    let mut bob = bound(BOB, false);
+    f.ok(
+        "t1",
+        &mut bob,
+        "CREATE TEMP TABLE tt (id BIGINT PRIMARY KEY)",
+    );
+    f.ok(
+        "t1",
+        &mut bob,
+        "CREATE TEMP TABLE sh (id BIGINT PRIMARY KEY)",
+    );
+    f.ok("t1", &mut bob, "SELECT id FROM tt");
+    // 一時表が優先され、同名の実表の権限は要らない。
+    f.ok("t1", &mut bob, "SELECT id FROM sh");
+    assert_eq!(f.code("t1", &mut bob, "SELECT id FROM r"), "42501");
+    assert_eq!(
+        f.code(
+            "t1",
+            &mut bob,
+            "SELECT tt.id FROM tt JOIN r ON tt.id = r.id"
+        ),
+        "42501"
+    );
+}

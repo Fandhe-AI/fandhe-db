@@ -364,6 +364,29 @@ impl EngineCore {
             }
             return Err(crate::sql::temp_catalog::temp_table_unsupported());
         }
+        if hits.persistent_hit() {
+            // 永続の関係を引いた文は、混在の拒否（`0A000`）より前に永続側の読み取り権限を判定する
+            // （SQL-40・Issue #1967。権限の無いロールへ、永続の relation が実在することを `0A000` の有無で
+            // 示さない）。一時表に解決された名前は記録されず、一時表と同名の実表は検査対象にならない。
+            // 束縛済みなのにテナントが分からないセッションは拒否する（fail-closed）。
+            if session.object_privileges_enforced() {
+                let tenant = session
+                    .resolution_tenant()
+                    .ok_or(SqlSurfaceError::InsufficientPrivilege)?;
+                crate::sql::privilege_gate::read::require_read_privileges(
+                    &self.storage,
+                    tenant,
+                    session,
+                    &tokens,
+                    resolver,
+                    crate::sql::privilege_gate::read::classify(&classified),
+                    crate::sql::privilege_gate::read::ParsedScope {
+                        read_snap: None,
+                        parsed_relations: &hits.recorded_names(),
+                    },
+                )?;
+            }
+        }
         if !hits.temp_hit() || hits.persistent_hit() {
             // 一時表の名前が関係として引かれていない（列名との衝突・サブクエリ等）、または
             // 永続の関係と混在している。いずれも一時表を扱えないため拒否する（fail-closed）。
