@@ -397,6 +397,57 @@ fn owner_equivalent_grants_are_independent_admin_roots() {
     }
 }
 
+/// 所有者相当（DDL 許可済み）の付与者が付けた行は、付与者の ADMIN の喪失による依存の対象外（回帰）。o が x へ
+/// ADMIN を付与し、DDL 許可済みの x が m へ付与しても、x の ADMIN の取り消しは RESTRICT で成功し CASCADE でも
+/// m の付与は残る。所有者相当でない付与者 x2 が付けた m2 の付与は従来どおり 2BP01・連鎖削除される。
+/// メンバーシップ自体の取り消し・`WITH ADMIN FALSE` も同じ規則に従う。
+#[test]
+fn owner_equivalent_grantor_rows_are_exempt_from_admin_dependents() {
+    for sql in [
+        "REVOKE ADMIN OPTION FOR r FROM {x}",
+        "REVOKE r FROM {x}",
+        "GRANT r TO {x} WITH ADMIN FALSE",
+    ] {
+        for cascade in [false, true] {
+            let f = fx(&format!("rm_exempt_{}_{cascade}", sql.len()));
+            let me = role(&f, "me");
+            let r = role(&f, "r");
+            let x = role(&f, "x");
+            let x2 = role(&f, "x2");
+            let m = role(&f, "m");
+            let m2 = role(&f, "m2");
+            let owner = session(me, true);
+            run(&f, &owner, "GRANT r TO x, x2 WITH ADMIN TRUE").expect("admins");
+            run(&f, &session(x, true), "GRANT r TO m").expect("m by owner-equivalent x");
+            run(&f, &session(x2, false), "GRANT r TO m2").expect("m2 by x2");
+            assert_eq!(mem(&f, m, r).expect("m").grantor_id, Some(x));
+            // x（所有者相当の付与のみ）の ADMIN を失っても m は残る。
+            let revoke_x = sql.replace("{x}", "x") + if cascade { " CASCADE" } else { "" };
+            let revoke_x = if sql.starts_with("GRANT") {
+                sql.replace("{x}", "x")
+            } else {
+                revoke_x
+            };
+            run(&f, &owner, &revoke_x).expect("x revoke must not be blocked");
+            assert!(mem(&f, m, r).is_some(), "{revoke_x}: m must stay");
+            // 所有者相当でない x2 の依存は従来どおり。
+            let revoke_x2 = sql.replace("{x}", "x2") + if cascade { " CASCADE" } else { "" };
+            if sql.starts_with("GRANT") {
+                let e = run(&f, &owner, &sql.replace("{x}", "x2")).expect_err("restrict");
+                assert_eq!(e.wire_code(), "2BP01");
+                assert!(mem(&f, m2, r).is_some());
+            } else if cascade {
+                run(&f, &owner, &revoke_x2).expect("cascade");
+                assert!(mem(&f, m2, r).is_none(), "{revoke_x2}: m2 must go");
+            } else {
+                let e = run(&f, &owner, &revoke_x2).expect_err("restrict");
+                assert_eq!(e.wire_code(), "2BP01");
+                assert!(mem(&f, m2, r).is_some());
+            }
+        }
+    }
+}
+
 /// `GRANT ... WITH ADMIN FALSE` による ADMIN の取り消しも `REVOKE ADMIN OPTION` と同じ依存検査（2BP01）を通る。
 #[test]
 fn grant_with_admin_false_respects_dependents() {

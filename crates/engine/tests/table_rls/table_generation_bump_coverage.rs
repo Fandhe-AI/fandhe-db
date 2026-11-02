@@ -567,8 +567,8 @@ const ALLOWLIST: &[(&str, u32)] = &[
     ("catalog/role.rs", 1378),
     // Issue #2232: メンバーシップの付与・取り消し（`apply_membership_changes`）とロール作成＋付与
     // （`create_role_with_memberships`）。メンバーシップ表だけを書き、表の計画・世代に影響しない（同じ理由）。
-    ("catalog/role/membership_apply.rs", 309),
-    ("catalog/role/membership_apply.rs", 336),
+    ("catalog/role/membership_apply.rs", 314),
+    ("catalog/role/membership_apply.rs", 341),
     // Issue #1961 のロール・ACL カタログの単体テスト補助（`write` ヘルパー。専用表だけを書き表世代の対象外）。
     ("catalog/role/tests.rs", 37),
     // Issue #1962 の `sql::role_ddl` の crate 内テスト補助（`commit` ヘルパー。専用表だけを書き表世代の対象外）。

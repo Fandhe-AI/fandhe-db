@@ -221,6 +221,11 @@ fn resolve_dependents(
                 if g2 != role {
                     continue;
                 }
+                // 所有者相当の権限を根拠とした付与は付与者の ADMIN に依存しないため、RESTRICT の拒否にも
+                // CASCADE の削除にも含めない（`has_independent_admin` が根として扱うのと同じ規則）。
+                if o2.grantor_root {
+                    continue;
+                }
                 if !cascade {
                     return Err(MembershipChangeError::DependentGrants);
                 }
