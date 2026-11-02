@@ -569,6 +569,10 @@ impl Storage {
                 &super::privilege::PrivilegeObject::Schema(id),
                 owner,
             )?;
+            // 所有者（作成者）の `SCHEMAS` の既定権限を同じ txn で初期 ACL へ適用する（Issue #2237）。
+            super::privilege::default_acl::apply_default_acl_to_schema_in_txn(
+                &write_txn, tenant_id, owner, id,
+            )?;
         }
         crate::recovery::commit_boundary::commit(write_txn)
             .map_err(super::convert_storage_error)?;
@@ -624,6 +628,8 @@ impl Storage {
         remove_owner_in_txn(&write_txn, tenant_id, &PrivilegeObject::Schema(id))?;
         // SCHEMA 単位の ACL 行を同じ txn で掃除する（残ると `DROP ROLE` が `2BP01` で永久に拒否される。#2234）。
         super::privilege::remove_schema_acl_in_txn(&write_txn, tenant_id, id)?;
+        // この SCHEMA 向けの既定権限（`ALTER DEFAULT PRIVILEGES ... IN SCHEMA`）も同じ txn で消す（#2237）。
+        super::privilege::default_acl::remove_schema_default_acl_in_txn(&write_txn, tenant_id, id)?;
         crate::recovery::commit_boundary::commit(write_txn)
             .map_err(super::convert_storage_error)?;
         Ok(DropSchemaResult::Dropped)
@@ -742,6 +748,8 @@ impl Storage {
         }
         // SCHEMA 単位の ACL 行も同じ txn で掃除する（#2234）。
         super::privilege::remove_schema_acl_in_txn(&write_txn, tenant_id, id)?;
+        // この SCHEMA 向けの既定権限（`ALTER DEFAULT PRIVILEGES ... IN SCHEMA`）も同じ txn で消す（#2237）。
+        super::privilege::default_acl::remove_schema_default_acl_in_txn(&write_txn, tenant_id, id)?;
         remove_owner_in_txn(&write_txn, tenant_id, &PrivilegeObject::Schema(id))?;
         let allocator = self.sequence_allocator();
         crate::recovery::commit_boundary::commit_and_finish(write_txn, (), |()| {

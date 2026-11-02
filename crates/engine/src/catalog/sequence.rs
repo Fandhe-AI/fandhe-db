@@ -1159,11 +1159,13 @@ pub(crate) fn create_table_with_implicit_sequences_in_txn(
     }
     let mut named_schema = schema.clone();
     let mut created: Vec<String> = Vec::with_capacity(serials.len());
+    let mut created_ids: Vec<u64> = Vec::with_capacity(serials.len());
     for implicit in serials {
         let column = &implicit.column;
         let seq_name =
             choose_implicit_sequence_name_in_txn(write_txn, &schema.name, column, &created)?;
-        create_sequence_in_txn(write_txn, &seq_name, &implicit.params)?;
+        let seq_id = create_sequence_in_txn(write_txn, &seq_name, &implicit.params)?;
+        created_ids.push(seq_id);
         let col = named_schema
             .columns
             .iter_mut()
@@ -1192,6 +1194,15 @@ pub(crate) fn create_table_with_implicit_sequences_in_txn(
                 column: implicit.column.clone(),
             }),
         )?;
+    }
+    // 表の作成者（所有者の予約。キーは表名）の `SEQUENCES` の既定権限を、暗黙 SEQUENCE の初期 ACL へ同じ txn で
+    // 適用する（Issue #2237）。予約が無い（未束縛の作成）なら何も適用しない。
+    if let Some((tenant, role)) = super::privilege::owner::pending_creator_for_key(&schema.name) {
+        for (seq_name, seq_id) in created.iter().zip(&created_ids) {
+            super::privilege::default_acl::apply_default_acl_to_sequence_in_txn(
+                write_txn, &tenant, role, seq_name, *seq_id,
+            )?;
+        }
     }
     Ok(created)
 }
@@ -1428,7 +1439,14 @@ impl Storage {
         let write_txn = self
             .begin_write_txn()
             .map_err(super::convert_storage_error)?;
-        create_sequence_in_txn(&write_txn, name, params)?;
+        let id = create_sequence_in_txn(&write_txn, name, params)?;
+        // 作成者（所有者の予約。キーは SEQUENCE のキー）の `SEQUENCES` の既定権限を同じ txn で初期 ACL へ適用する
+        // （Issue #2237）。予約が無い（未束縛の作成）なら何も適用しない。
+        if let Some((tenant, role)) = super::privilege::owner::pending_creator_for_key(name) {
+            super::privilege::default_acl::apply_default_acl_to_sequence_in_txn(
+                &write_txn, &tenant, role, name, id,
+            )?;
+        }
         crate::recovery::commit_boundary::commit(write_txn).map_err(super::convert_storage_error)
     }
 

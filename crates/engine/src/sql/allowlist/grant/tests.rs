@@ -221,7 +221,7 @@ fn out_of_scope_forms_are_0a000() {
     assert!(is_alter_default_privileges_statement(
         &tokenize("ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO a").expect("lex")
     ));
-    assert_eq!(reject_alter_default_privileges().wire_code(), "0A000");
+    // 本体の受理・拒否は `default_privileges` の単体テストが固定する（Issue #2237）。
     // 種別語と同名の表は表として扱う。
     assert_eq!(
         objects("GRANT SELECT ON \"schema\" TO a").tables,

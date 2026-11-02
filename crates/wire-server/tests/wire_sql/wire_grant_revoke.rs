@@ -78,6 +78,9 @@ fn wire_grant_revoke_without_bound_role_is_42501_for_every_target() {
             "GRANT CREATE ON SCHEMA nosuch TO PUBLIC",
             "REVOKE USAGE ON SCHEMA s FROM bob",
             "GRANT SELECT ON ALL TABLES IN SCHEMA s TO bob",
+            // `ALTER DEFAULT PRIVILEGES`（Issue #2237）も未束縛なら対象・ロールの有無を問わず同じ `42501`。
+            "ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO bob",
+            "ALTER DEFAULT PRIVILEGES FOR ROLE nosuch IN SCHEMA nosuch REVOKE ALL ON TABLES FROM nosuch",
         ] {
             send_simple_query(&mut stream, sql);
             expect_error_response_with_sqlstate(&mut stream, "42501");
@@ -101,10 +104,16 @@ fn wire_grant_revoke_static_rejections() {
         ("GRANT SELECT ON SCHEMA s TO bob", "0LP01"),
         ("GRANT USAGE ON SCHEMA s", "42601"),
         ("GRANT SELECT ON docs TO bob GRANTED BY carol", "0A000"),
+        // `ALTER DEFAULT PRIVILEGES`（Issue #2237）の静的拒否。
         (
-            "ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO bob",
+            "ALTER DEFAULT PRIVILEGES GRANT USAGE ON TYPES TO bob",
             "0A000",
         ),
+        (
+            "ALTER DEFAULT PRIVILEGES IN SCHEMA s GRANT USAGE ON SCHEMAS TO bob",
+            "0LP01",
+        ),
+        ("ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES", "42601"),
     ] {
         send_simple_query(&mut stream, sql);
         expect_error_response_with_sqlstate(&mut stream, state);

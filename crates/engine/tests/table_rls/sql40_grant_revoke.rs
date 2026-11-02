@@ -143,7 +143,7 @@ fn syntax_and_scope_errors_surface_through_the_session_api() {
             &core,
             "t1",
             &mut s,
-            "ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO a"
+            "ALTER DEFAULT PRIVILEGES GRANT USAGE ON TYPES TO a"
         )
         .wire_code(),
         "0A000"

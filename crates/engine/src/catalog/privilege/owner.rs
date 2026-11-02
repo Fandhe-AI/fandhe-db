@@ -345,8 +345,10 @@ fn pending_for(key: &str) -> Option<(String, u64)> {
     })
 }
 
-/// relation `key` を **この write txn で新規に作った**ときに、予約された作成者を所有者として同じ txn へ書く
-/// （表・ビュー・matview の作成本体から呼ぶ。予約が無い・名前が違えば何もしない）。
+/// relation `key` を **この write txn で新規に作った**ときに、予約された作成者を所有者として同じ txn へ書き、
+/// 続けてその作成者の `TABLES` の既定権限（`ALTER DEFAULT PRIVILEGES`、Issue #2237）を初期 ACL として適用する
+/// （表・ビュー・matview の作成本体から呼ぶ。予約が無い・名前が違えば何もしない）。既に所有者がある
+/// （＝新規に作ったのではない）ときは既定権限も適用しない。
 pub(crate) fn apply_pending_relation_owner_in_txn(
     write_txn: &redb::WriteTransaction,
     key: &str,
@@ -354,12 +356,16 @@ pub(crate) fn apply_pending_relation_owner_in_txn(
     let Some((tenant, role)) = pending_for(key) else {
         return Ok(());
     };
-    set_owner_if_absent_in_txn(
+    let created = set_owner_if_absent_in_txn(
         write_txn,
         &tenant,
         &PrivilegeObject::Table(key.to_string()),
         role,
-    )
+    )?;
+    if created {
+        super::default_acl::apply_default_acl_to_relation_in_txn(write_txn, &tenant, role, key)?;
+    }
+    Ok(())
 }
 
 /// 関数 `function_id`（キー `key`）を **この write txn で新規に作った**ときに、予約された作成者を所有者として
@@ -378,25 +384,43 @@ pub(crate) fn apply_pending_function_owner_in_txn(
     }) else {
         return Ok(());
     };
-    set_owner_if_absent_in_txn(
+    let created = set_owner_if_absent_in_txn(
         write_txn,
         &tenant,
         &PrivilegeObject::Function(function_id),
         role,
-    )
+    )?;
+    if created {
+        super::default_acl::apply_default_acl_to_function_in_txn(
+            write_txn,
+            &tenant,
+            role,
+            key,
+            function_id,
+        )?;
+    }
+    Ok(())
+}
+
+/// キー `key`（relation キー）に対する予約が有れば `(tenant, role)` を返す（SEQUENCE の作成本体が既定権限の
+/// 適用先を知るために使う。SEQUENCE は所有者行を持たないため、所有者は書かない。Issue #2237）。
+pub(crate) fn pending_creator_for_key(key: &str) -> Option<(String, u64)> {
+    pending_for(key)
 }
 
 /// 所有者行が無いときだけ、ロールの現存を確認して書く（`CREATE OR REPLACE` が既存の所有者を変えない）。
+/// 書いたとき（新規に作ったとき）は `true`。
 fn set_owner_if_absent_in_txn(
     write_txn: &redb::WriteTransaction,
     tenant: &str,
     object: &PrivilegeObject,
     owner_id: u64,
-) -> Result<()> {
+) -> Result<bool> {
     if owner_of_in_txn(write_txn, tenant, object)?.is_some() {
-        return Ok(());
+        return Ok(false);
     }
-    set_owner_in_txn(write_txn, tenant, object, owner_id)
+    set_owner_in_txn(write_txn, tenant, object, owner_id)?;
+    Ok(true)
 }
 
 #[cfg(test)]
