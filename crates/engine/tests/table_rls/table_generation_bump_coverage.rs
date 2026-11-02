@@ -568,7 +568,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #2238（users ファイルのブートストラップ `Storage::bootstrap_users_file`）と、それに伴う role.rs の
     // 行番号の移動への追随。ロール・マーカー・初期権限の専用表だけを書き、表の行・スキーマ・世代に影響しない
     // （同じ理由で対象外）。
-    ("catalog/role/bootstrap.rs", 490),
+    ("catalog/role/bootstrap.rs", 499),
     ("catalog/role/bootstrap/tests.rs", 42),
     // Issue #2232: メンバーシップの付与・取り消し（`apply_membership_changes`）とロール作成＋付与
     // （`create_role_with_memberships`）。メンバーシップ表だけを書き、表の計画・世代に影響しない（同じ理由）。

@@ -417,6 +417,15 @@ fn adopt_tenant(
             let mut table = write_txn.open_table(ROLES_TABLE)?;
             table.insert((tenant, u.username.as_str()), blob.as_slice())?;
             kind = BootstrapEntryKind::AdoptedCredentials;
+        } else if !role.scram_verifier.is_empty() || !role.legacy_phc.is_empty() {
+            // 資格情報を持つ既存ロールの採用: ファイルの値とカタログの値が異なれば報告する
+            // （カタログが正。ファイルの値は使わない）。
+            let file_scram = u.scram_verifier.as_deref().unwrap_or_default().as_bytes();
+            let phc_differs = role.legacy_phc != u.phc.as_bytes();
+            let scram_differs = !file_scram.is_empty() && role.scram_verifier != file_scram;
+            if phc_differs || scram_differs {
+                kind = BootstrapEntryKind::CredentialMismatch;
+            }
         }
         if u.ddl_listed {
             put_privileges(

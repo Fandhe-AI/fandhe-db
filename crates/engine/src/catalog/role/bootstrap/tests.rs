@@ -149,7 +149,7 @@ fn existing_roles_without_marker_are_adopted_without_widening() {
         kinds,
         vec![
             (1, BootstrapEntryKind::AdoptedCredentials),
-            (2, BootstrapEntryKind::Adopted),
+            (2, BootstrapEntryKind::CredentialMismatch),
             (3, BootstrapEntryKind::RoleMissing),
         ]
     );

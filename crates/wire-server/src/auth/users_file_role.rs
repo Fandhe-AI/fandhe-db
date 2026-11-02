@@ -247,7 +247,7 @@ pub(crate) fn verify_and_bind(
     let Some(tenant) = store.tenant_of(username) else {
         // 未知ユーザー: 実在ロールと同じ KDF 回数（Argon2id は `verify` 内のダミー照合）。
         burn_kdfs(password, false);
-        let _ = super::verify(store, username, password);
+        let _ = super::verify_from(store, username, password, start);
         return Err(fail_after_delay(start));
     };
     match engine.resolve_users_file_role(tenant, username) {
@@ -257,7 +257,7 @@ pub(crate) fn verify_and_bind(
         Ok(UsersFileRoleBinding::Role(c)) => {
             // マーカー無し（移行前）。ファイルの PHC で照合し、同じ引き結果のロールへ束縛する。
             burn_kdfs(password, false);
-            let ctx = super::verify(store, username, password)?;
+            let ctx = super::verify_from(store, username, password, start)?;
             if c.is_expired() {
                 return Err(fail_after_delay(start));
             }
@@ -268,7 +268,7 @@ pub(crate) fn verify_and_bind(
         }
         Ok(UsersFileRoleBinding::CatalogNotAuthoritative) => {
             burn_kdfs(password, false);
-            let ctx = super::verify(store, username, password)?;
+            let ctx = super::verify_from(store, username, password, start)?;
             Ok((ctx, UsersFileBinding::Unbound))
         }
         Ok(UsersFileRoleBinding::Missing) => {

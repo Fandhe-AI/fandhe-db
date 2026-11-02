@@ -384,10 +384,18 @@ impl UserStore {
         self
     }
 
-    /// ブートストラップ後の SCRAM 必須検査。ファイルに検証子の無い行は、カタログのブートストラップ済みの
-    /// 同名ロールが検証子を持つ場合に限り許す。それ以外（カタログ読み取り失敗を含む）は起動失敗
-    /// （fail-closed。恒久的にログイン不能な行・タイミング対称性の崩れを未然に防ぐ）。
-    pub fn ensure_scram_ready(&self, engine: &engine::core::EngineCore) -> Result<(), LoadError> {
+    /// ブートストラップ後の SCRAM 必須検査。ファイルに検証子の無い行のうち、カタログが正のテナント
+    /// （同名ロールがある・テナントにロールはあるが同名が無い）の行は、起動条件にせず警告文字列で返す
+    /// （カタログの同名ロールが検証子を持てばそれでログインでき、持たなければそのユーザーだけが
+    /// 認証失敗で拒否される。`DROP ROLE`・`ALTER ROLE ... PASSWORD NULL` 後の再起動や、マーカー済み
+    /// テナントへの未登録ユーザー行の追加で、他の有効ユーザーまで起動不能にしないため）。
+    /// カタログが正でないテナント・カタログ読み取り失敗の行は起動失敗（fail-closed。恒久的に
+    /// ログイン不能な行・タイミング対称性の崩れを未然に防ぐ）。
+    pub fn ensure_scram_ready(
+        &self,
+        engine: &engine::core::EngineCore,
+    ) -> Result<Vec<String>, LoadError> {
+        let mut warnings = Vec::new();
         let mut usernames: Vec<&String> = self.users.keys().collect();
         usernames.sort();
         for username in usernames {
@@ -397,18 +405,27 @@ impl UserStore {
             if r.scram_verifier.is_some() {
                 continue;
             }
-            let ok = matches!(
-                engine.resolve_users_file_role(&r.tenant_id, username),
-                Ok(engine::core::UsersFileRoleBinding::Role(c))
-                    if c.bootstrapped && !c.scram_verifier.is_empty()
-            );
-            if !ok {
-                return Err(LoadError::MissingScramVerifier {
-                    username: username.clone(),
-                });
+            match engine.resolve_users_file_role(&r.tenant_id, username) {
+                Ok(engine::core::UsersFileRoleBinding::Role(c)) => {
+                    if c.scram_verifier.is_empty() {
+                        warnings.push(format!(
+                            "wire-server: users file entry has no SCRAM verifier in the file or the catalog; the user cannot log in (user: {username})"
+                        ));
+                    }
+                }
+                Ok(engine::core::UsersFileRoleBinding::Missing) => {
+                    warnings.push(format!(
+                        "wire-server: users file entry has no SCRAM verifier and no catalog role; the user cannot log in (user: {username})"
+                    ));
+                }
+                Ok(engine::core::UsersFileRoleBinding::CatalogNotAuthoritative) | Err(_) => {
+                    return Err(LoadError::MissingScramVerifier {
+                        username: username.clone(),
+                    });
+                }
             }
         }
-        Ok(())
+        Ok(warnings)
     }
 
     /// このストアが選択している認証方式。`handshake.rs` が `Authentication*`
@@ -621,8 +638,19 @@ pub fn verify(
     username: &str,
     password: &[u8],
 ) -> Result<engine::policy::PolicyContext, AuthFailure> {
-    let start = Instant::now();
+    verify_from(store, username, password, Instant::now())
+}
 
+/// [`verify`] の固定遅延の起点を呼び出し側が指定する版（Issue #2238）。照合の前に別の KDF を
+/// 消費する経路（`users_file_role::verify_and_bind`）が、その KDF 分も [`AUTH_FAILURE_DELAY`] の
+/// 内側に含めて失敗経路ごとの所要時間を揃えるために使う（遅延の二重計時で未知ユーザーだけが
+/// 長くなる存在オラクルを作らない）。
+pub(crate) fn verify_from(
+    store: &UserStore,
+    username: &str,
+    password: &[u8],
+    start: Instant,
+) -> Result<engine::policy::PolicyContext, AuthFailure> {
     let record = store.users.get(username);
     let phc_to_check: &str = match record {
         Some(r) => &r.phc,

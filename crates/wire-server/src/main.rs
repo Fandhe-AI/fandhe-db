@@ -2664,9 +2664,16 @@ fn run_server(args: &[String]) -> ExitCode {
         }
     }
     if auth_method == wire_server::auth::AuthMethod::ScramSha256 {
-        if let Err(e) = store.ensure_scram_ready(&core) {
-            engine::log_stderr!("wire-server: {e}");
-            return ExitCode::FAILURE;
+        match store.ensure_scram_ready(&core) {
+            Ok(warnings) => {
+                for w in &warnings {
+                    engine::log_stderr!("{w}");
+                }
+            }
+            Err(e) => {
+                engine::log_stderr!("wire-server: {e}");
+                return ExitCode::FAILURE;
+            }
         }
     }
     // TASK-117（PLAN-9）: opt-in 注入。未指定（既定）では `query_planner`/
