@@ -447,7 +447,7 @@ pub(crate) fn validate_transaction_control_tokens(
 /// parse に任せる。字句解析に失敗した入力は `false`（fail-closed）。
 ///
 /// `ROLLBACK [WORK|TRANSACTION] TO ...`（Issue #1942）は Tx 全体の `ROLLBACK` ではないため
-/// `false`（Failed 中は一律 `25P02`。Failed からの `ROLLBACK TO` 復帰は #1941 の範囲）。
+/// `false`。Failed 中に `ROLLBACK TO` も通す判定は [`is_allowed_while_failed`]（Issue #1947）。
 pub fn is_rollback_statement(sql: &str) -> bool {
     let Some(tokens) = crate::sql::lexer::tokenize(sql).ok() else {
         return false;
@@ -467,6 +467,36 @@ pub fn is_rollback_statement(sql: &str) -> bool {
         _ => tail,
     };
     !ident_is(rest.first(), "TO")
+}
+
+/// 明示トランザクションが `Failed` の間に受理してよい文かを parse 前に判定する（Issue #1947・
+/// SQL-31・SQL-69 のポインタ）。真になるのは [`is_rollback_statement`] が真の `ROLLBACK`／`ABORT` と、
+/// `ROLLBACK [WORK|TRANSACTION] TO ...`（savepoint への復帰）だけ。`ABORT TO` は構文上受理しない
+/// ため偽。字句解析に失敗した入力は偽（fail-closed）。`core::EngineCore::execute_sql_in_txn` と
+/// wire-server の拡張クエリ Parse が呼ぶ。名前の妥当性・復帰の可否は通常どおり parse と
+/// [`SessionTransaction::rollback_to_savepoint`] が判定する。
+pub fn is_allowed_while_failed(sql: &str) -> bool {
+    if is_rollback_statement(sql) {
+        return true;
+    }
+    let Some(tokens) = crate::sql::lexer::tokenize(sql).ok() else {
+        return false;
+    };
+    let Some((Token::Ident(name), tail)) = tokens.split_first() else {
+        return false;
+    };
+    if !name.eq_ignore_ascii_case("ROLLBACK") {
+        return false;
+    }
+    let rest = match tail.split_first() {
+        Some((Token::Ident(kw), t))
+            if kw.eq_ignore_ascii_case("WORK") || kw.eq_ignore_ascii_case("TRANSACTION") =>
+        {
+            t
+        }
+        _ => tail,
+    };
+    ident_is(rest.first(), "TO")
 }
 
 /// [`SessionTransaction`] の対外的な状態（WIRE-19。`wire-server::result_encoder::
@@ -628,6 +658,12 @@ impl TempTxn {
 enum TxnState<'e> {
     Idle,
     Active(Box<ActiveTxn<'e>>),
+    /// 文エラー後も `ROLLBACK TO` で復帰できるよう `ActiveTxn`（writer・基底 savepoint・
+    /// savepoint スタックを含む）を保持した失敗状態（Issue #1947・SQL-31・SQL-69 のポインタ）。
+    /// 外部からは [`TransactionStatus::Failed`] に見え、`Active` 専用のアクセサ（`write_txn`・
+    /// `read_source` 等）は `Active` だけを照合するため、この状態の `ActiveTxn` は文の実行に
+    /// 使われない（fail-closed）。保持条件は [`SessionTransaction::fail`] を参照。
+    FailedRecoverable(Box<ActiveTxn<'e>>),
     /// `expired` は、持続時間の上限超過（[`SessionTransaction::release_if_expired`]）
     /// で `Failed` へ遷移し、まだ `54000` をクライアントへ報告していないことを表す。
     Failed {
@@ -775,7 +811,7 @@ impl<'e> SessionTransaction<'e> {
         match &self.state {
             TxnState::Idle => TransactionStatus::Idle,
             TxnState::Active(_) => TransactionStatus::InTransaction,
-            TxnState::Failed { .. } => TransactionStatus::Failed,
+            TxnState::Failed { .. } | TxnState::FailedRecoverable(_) => TransactionStatus::Failed,
         }
     }
 
@@ -866,8 +902,9 @@ impl<'e> SessionTransaction<'e> {
             TxnOrigin::Explicit,
             access_mode,
             isolation_level,
-            false,
+            WriterAcquire::Wait,
         )
+        .map(|_| ())
     }
 
     /// 暗黙トランザクション（Issue #1175）を開始する。`BEGIN` を含まない複数文
@@ -905,7 +942,33 @@ impl<'e> SessionTransaction<'e> {
             TxnOrigin::Implicit,
             TxnAccessMode::ReadWrite,
             None,
-            nowait,
+            if nowait {
+                WriterAcquire::NoWait
+            } else {
+                WriterAcquire::Wait
+            },
+        )
+        .map(|_| ())
+    }
+
+    /// [`Self::begin_implicit_with`] の `SKIP LOCKED` 版（autocommit の `SELECT ... FOR UPDATE
+    /// SKIP LOCKED`・Issue #2231 の入口）。取得結果を `Ok(bool)` で返し、取得失敗の分類は
+    /// [`is_write_lock_unavailable`] に集約する（SQL-38 (4)(5)。契約は spec 側を参照）。
+    pub(crate) fn try_begin_implicit(
+        &mut self,
+        storage: &'e crate::storage::Storage,
+        session: &SessionState,
+    ) -> Result<bool, SqlSurfaceError> {
+        if !matches!(self.state, TxnState::Idle) {
+            return Err(internal_error());
+        }
+        self.begin_with_origin(
+            storage,
+            session,
+            TxnOrigin::Implicit,
+            TxnAccessMode::ReadWrite,
+            None,
+            WriterAcquire::Try,
         )
     }
 
@@ -987,8 +1050,8 @@ impl<'e> SessionTransaction<'e> {
         origin: TxnOrigin,
         access_mode: TxnAccessMode,
         isolation_level: Option<RequestedIsolationLevel>,
-        nowait: bool,
-    ) -> Result<(), SqlSurfaceError> {
+        acquire: WriterAcquire,
+    ) -> Result<bool, SqlSurfaceError> {
         match &self.state {
             TxnState::Idle => {
                 // 壁時計の読み取り失敗（範囲外）は writer を開く前に fail-closed で返す
@@ -1031,12 +1094,22 @@ impl<'e> SessionTransaction<'e> {
                     // `begin_read_txn()` と同じ確定状態になる（writer の前に開くとゲート待ちの間の
                     // 他者の commit を跨ぎうる）。失敗時は writer を解放して固定文言の `XX000`。
                     TxnOrigin::Implicit => {
-                        let w = if nowait {
+                        let acquired = if acquire.is_nowait() {
                             storage.begin_explicit_write_txn_nowait()
                         } else {
                             storage.begin_explicit_write_txn()
-                        }
-                        .map_err(map_write_lock_err)?;
+                        };
+                        let w = match acquired {
+                            Ok(w) => w,
+                            // `SKIP LOCKED`（#2231）: 他者保持中だけを「取得せず」として返す。
+                            Err(e)
+                                if acquire == WriterAcquire::Try
+                                    && is_write_lock_unavailable(&e) =>
+                            {
+                                return Ok(false);
+                            }
+                            Err(e) => return Err(map_write_lock_err(e)),
+                        };
                         let snap = match open_read_snapshot(storage) {
                             Ok(snap) => snap,
                             Err(e) => {
@@ -1074,7 +1147,7 @@ impl<'e> SessionTransaction<'e> {
                     savepoint_base: None,
                     storage,
                 }));
-                Ok(())
+                Ok(true)
             }
             TxnState::Active(_) => {
                 // 入れ子の BEGIN はトランザクションを Failed へ遷移させる
@@ -1083,7 +1156,9 @@ impl<'e> SessionTransaction<'e> {
                 self.fail();
                 Err(SqlSurfaceError::ActiveSqlTransaction)
             }
-            TxnState::Failed { .. } => Err(self.take_failed_error()),
+            TxnState::Failed { .. } | TxnState::FailedRecoverable(_) => {
+                Err(self.take_failed_error())
+            }
         }
     }
 
@@ -1162,6 +1237,11 @@ impl<'e> SessionTransaction<'e> {
                 };
                 Err(self.take_failed_error())
             }
+            TxnState::FailedRecoverable(active) => {
+                // 復帰の余地（`ROLLBACK TO`）を残すため、保持中の `ActiveTxn` を戻して `25P02`。
+                self.state = TxnState::FailedRecoverable(active);
+                Err(self.take_failed_error())
+            }
         }
     }
 
@@ -1189,6 +1269,12 @@ impl<'e> SessionTransaction<'e> {
                 session_at_begin, ..
             } => {
                 *session = *session_at_begin;
+                self.state = TxnState::Idle;
+                Ok(())
+            }
+            TxnState::FailedRecoverable(active) => {
+                // 保持していた writer は drop（abort）され、permit が解放される（Issue #1947）。
+                *session = active.session_at_begin;
                 self.state = TxnState::Idle;
                 Ok(())
             }
@@ -1230,7 +1316,8 @@ impl<'e> SessionTransaction<'e> {
                 Ok(())
             }
             Err(e) => {
-                self.fail();
+                // 基底の取得失敗は不変条件違反。復帰の余地を残さない（Issue #1947）。
+                self.fail_unrecoverable();
                 Err(e)
             }
         }
@@ -1314,16 +1401,71 @@ impl<'e> SessionTransaction<'e> {
         name: &str,
         session: &mut SessionState,
     ) -> Result<(), SqlSurfaceError> {
+        if matches!(self.state, TxnState::FailedRecoverable(_)) {
+            return self.rollback_to_savepoint_from_failed(name, session);
+        }
         self.check_savepoint_state()?;
         self.check_and_register_statement(None)?;
         let result = match &mut self.state {
             TxnState::Active(active) => Self::restore_to_savepoint(active, name, session),
             _ => return Err(internal_error()),
         };
-        if result.is_err() {
-            self.fail();
+        if let Err(e) = &result {
+            self.fail_for(e);
         }
         result
+    }
+
+    /// 失敗状態（[`TxnState::FailedRecoverable`]）からの `ROLLBACK TO`（Issue #1947・SQL-31・SQL-69 の
+    /// ポインタ）。保持中の `ActiveTxn` に対して文数・持続時間の上限を検査・計上してから、`Active`
+    /// 中と同じ [`Self::restore_to_savepoint`] で巻き戻す（巻き戻しの本体は 1 つに保つ）。
+    ///
+    /// - 成功: `Active` へ戻る（writer・読み取りスナップショットは保持したまま継続できる）。
+    /// - `3B001`・`0A000`: 状態を `FailedRecoverable` に据え置く（別の savepoint で再試行できる）。
+    /// - `XX000`・上限超過（`54000`）: 保持中の `ActiveTxn` を破棄して `Failed`（復帰不可）。
+    ///
+    /// 全分岐で状態を書き戻し、`ActiveTxn` を取りこぼして `Idle` へ落ちる経路を作らない。
+    ///
+    /// 不変条件: `restore_savepoint` は開いているテーブルのハンドルがあると panic する。失敗した
+    /// 文の redb ハンドルは RAII で解放済みで、`ActiveTxn` はハンドルを保持しない。
+    fn rollback_to_savepoint_from_failed(
+        &mut self,
+        name: &str,
+        session: &mut SessionState,
+    ) -> Result<(), SqlSurfaceError> {
+        let TxnState::FailedRecoverable(mut active) =
+            std::mem::replace(&mut self.state, TxnState::Idle)
+        else {
+            return Err(internal_error());
+        };
+        if active.started_at.elapsed() > self.limits.max_duration
+            || active.statements >= self.limits.max_statements
+        {
+            self.state = TxnState::Failed {
+                session_at_begin: Box::new(active.session_at_begin),
+                expired: false,
+            };
+            return Err(SqlSurfaceError::payload_too_large(LIMIT_EXCEEDED_MESSAGE));
+        }
+        active.statements = active.statements.saturating_add(1);
+        match Self::restore_to_savepoint(&mut active, name, session) {
+            Ok(()) => {
+                active.queried = true;
+                self.state = TxnState::Active(active);
+                Ok(())
+            }
+            Err(e) => {
+                if Self::is_unrecoverable_error(&e) {
+                    self.state = TxnState::Failed {
+                        session_at_begin: Box::new(active.session_at_begin),
+                        expired: false,
+                    };
+                } else {
+                    self.state = TxnState::FailedRecoverable(active);
+                }
+                Err(e)
+            }
+        }
     }
 
     /// [`Self::rollback_to_savepoint`] の本体。失敗時の `fail()` は呼び出し側が行う。
@@ -1405,7 +1547,9 @@ impl<'e> SessionTransaction<'e> {
         match &self.state {
             TxnState::Active(_) => Ok(()),
             TxnState::Idle => Err(SqlSurfaceError::NoActiveSqlTransaction),
-            TxnState::Failed { .. } => Err(self.take_failed_error()),
+            TxnState::Failed { .. } | TxnState::FailedRecoverable(_) => {
+                Err(self.take_failed_error())
+            }
         }
     }
 
@@ -1437,7 +1581,8 @@ impl<'e> SessionTransaction<'e> {
         if active.started_at.elapsed() > self.limits.max_duration
             || active.statements >= self.limits.max_statements
         {
-            self.fail();
+            // 上限超過は復帰させない（DoS 対策。writer を即時に解放する。Issue #1947）。
+            self.fail_unrecoverable();
             return Err(SqlSurfaceError::payload_too_large(LIMIT_EXCEEDED_MESSAGE));
         }
         if let Some(id) = operation_id {
@@ -1470,7 +1615,9 @@ impl<'e> SessionTransaction<'e> {
         }
         match &self.state {
             TxnState::Idle => return Err(SqlSurfaceError::NoActiveSqlTransaction),
-            TxnState::Failed { .. } => return Err(self.take_failed_error()),
+            TxnState::Failed { .. } | TxnState::FailedRecoverable(_) => {
+                return Err(self.take_failed_error())
+            }
             TxnState::Active(active) if active.queried => {
                 self.fail();
                 return Err(SqlSurfaceError::SetTransactionAfterQuery);
@@ -1511,7 +1658,7 @@ impl<'e> SessionTransaction<'e> {
             }
         }
         if reopen_failed {
-            self.fail();
+            self.fail_unrecoverable();
             return Err(internal_error());
         }
         Ok(())
@@ -1648,21 +1795,54 @@ impl<'e> SessionTransaction<'e> {
         ctx: &crate::policy::PolicyContext,
         nowait: bool,
     ) -> Result<(), SqlSurfaceError> {
+        self.acquire_writer(
+            ctx,
+            if nowait {
+                WriterAcquire::NoWait
+            } else {
+                WriterAcquire::Wait
+            },
+        )
+        .map(|_| ())
+    }
+
+    /// [`Self::ensure_writer_with`] の `SKIP LOCKED` 版（明示 Tx の `SELECT ... FOR UPDATE SKIP LOCKED`・
+    /// Issue #2231 の入口）。取得結果を `Ok(bool)` で返し、それ以外の失敗は
+    /// [`Self::ensure_writer_with`] と同じエラーのまま返す（SQL-38 (4)(5)。契約は spec 側を参照）。
+    pub(crate) fn try_ensure_writer(
+        &mut self,
+        ctx: &crate::policy::PolicyContext,
+    ) -> Result<bool, SqlSurfaceError> {
+        self.acquire_writer(ctx, WriterAcquire::Try)
+    }
+
+    /// [`Self::ensure_writer_with`]・[`Self::try_ensure_writer`] 共通の取得本体（取得経路を 1 本に保つ）。
+    fn acquire_writer(
+        &mut self,
+        ctx: &crate::policy::PolicyContext,
+        acquire: WriterAcquire,
+    ) -> Result<bool, SqlSurfaceError> {
         let mut base_failed = false;
         let conflict = match &mut self.state {
             TxnState::Active(active) => {
                 if active.writer.is_some() {
-                    return Ok(());
+                    return Ok(true);
                 }
                 if active.access_mode == TxnAccessMode::ReadOnly {
                     return Err(SqlSurfaceError::ReadOnlySqlTransaction);
                 }
-                let w = if nowait {
+                let acquired = if acquire.is_nowait() {
                     active.storage.begin_explicit_write_txn_nowait()
                 } else {
                     active.storage.begin_explicit_write_txn()
-                }
-                .map_err(map_write_lock_err)?;
+                };
+                let w = match acquired {
+                    Ok(w) => w,
+                    Err(e) if acquire == WriterAcquire::Try && is_write_lock_unavailable(&e) => {
+                        return Ok(false);
+                    }
+                    Err(e) => return Err(map_write_lock_err(e)),
+                };
                 active.writer = Some(w);
                 // 巻き戻し先の基底 savepoint を、writer がまだテーブルを開く前のここで取る
                 // （Issue #1943。redb は dirty な writer からは作れない）。`Restorable` が無ければ
@@ -1689,8 +1869,8 @@ impl<'e> SessionTransaction<'e> {
             _ => return Err(internal_error()),
         };
         if base_failed {
-            // 新しい writer で基底を取れないのは不変条件違反。Tx を `Failed` に倒す。
-            self.fail();
+            // 新しい writer で基底を取れないのは不変条件違反。復帰不可の `Failed` に倒す。
+            self.fail_unrecoverable();
             return Err(internal_error());
         }
         if conflict {
@@ -1699,7 +1879,7 @@ impl<'e> SessionTransaction<'e> {
         if let TxnState::Active(active) = &mut self.state {
             active.registration = None;
         }
-        Ok(())
+        Ok(true)
     }
 
     /// writer 取得直後（permit 保持中）に、読み取り集合と `G_s` 以降の commit 記録の衝突を判定する。
@@ -1851,7 +2031,8 @@ impl<'e> SessionTransaction<'e> {
     /// 行・台帳・カタログに副作用は残らない。以降は `Failed` ゲートが `ROLLBACK` 以外を
     /// `25P02` で拒否する。`ensure_writer_with` の判定（#2405）が呼ぶ。
     pub(crate) fn fail_with_serialization_failure(&mut self) -> SqlSurfaceError {
-        self.fail();
+        // writer 保持のまま復帰させると以降の衝突判定を素通りするため、復帰不可で倒す（Issue #1947）。
+        self.fail_unrecoverable();
         SqlSurfaceError::SerializationFailure
     }
 
@@ -1872,11 +2053,64 @@ impl<'e> SessionTransaction<'e> {
             return;
         }
         if let TxnState::Active(active) = std::mem::replace(&mut self.state, TxnState::Idle) {
+            if Self::is_recoverable(&active) {
+                // `ROLLBACK TO` で復帰できるよう `ActiveTxn`（writer 含む）を保持する。解放は
+                // `ROLLBACK`・持続時間上限（`release_if_expired`）・復帰不可の失敗で行う。
+                self.state = TxnState::FailedRecoverable(active);
+                return;
+            }
             // `write_txn` は drop（abort）され、`permit` はその後に解放される。
             self.state = TxnState::Failed {
                 session_at_begin: Box::new(active.session_at_begin),
                 expired: false,
             };
+        }
+    }
+
+    /// 失敗した `Active` を `ROLLBACK TO` 復帰用に保持してよいか（Issue #1947）。明示 Tx で、
+    /// 巻き戻せる savepoint があり、一時表を使っておらず（`ROLLBACK TO` は `0A000` 確定）、
+    /// 巻き戻し先（writer 未取得、または基底 savepoint）が存在するときだけ真。それ以外は
+    /// 従来どおり即時に writer を解放する。
+    fn is_recoverable(active: &ActiveTxn<'_>) -> bool {
+        active.origin == TxnOrigin::Explicit
+            && active.savepoints.has_restorable()
+            && active.temp.is_none()
+            && (active.writer.is_none() || active.savepoint_base.is_some())
+    }
+
+    /// 復帰させてはならない失敗（内部エラー・直列化失敗）か。
+    fn is_unrecoverable_error(e: &SqlSurfaceError) -> bool {
+        matches!(
+            e,
+            SqlSurfaceError::Internal { .. } | SqlSurfaceError::SerializationFailure
+        )
+    }
+
+    /// エラーの種類に応じて [`Self::fail`]（復帰可）か [`Self::fail_unrecoverable`] を選ぶ。
+    /// `core.rs` の文実行ディスパッチが、文のエラー（`XX000`・`40001` は復帰不可）で呼ぶ。
+    pub(crate) fn fail_for(&mut self, e: &SqlSurfaceError) {
+        if Self::is_unrecoverable_error(e) {
+            self.fail_unrecoverable();
+        } else {
+            self.fail();
+        }
+    }
+
+    /// `ROLLBACK TO` での復帰を許さない失敗遷移（Issue #1947）。`Active`・`FailedRecoverable` の
+    /// `ActiveTxn` を破棄（writer を abort して permit を解放）して `Failed` へ。暗黙 Tx は
+    /// `Idle`。`Idle`・`Failed` では何もしない（冪等）。
+    pub fn fail_unrecoverable(&mut self) {
+        if self.abort_if_implicit() {
+            return;
+        }
+        match std::mem::replace(&mut self.state, TxnState::Idle) {
+            TxnState::Active(active) | TxnState::FailedRecoverable(active) => {
+                self.state = TxnState::Failed {
+                    session_at_begin: Box::new(active.session_at_begin),
+                    expired: false,
+                };
+            }
+            other => self.state = other,
         }
     }
 
@@ -1888,7 +2122,9 @@ impl<'e> SessionTransaction<'e> {
     /// `54000` を返す（[`Self::take_failed_error`]）。
     pub fn release_if_expired(&mut self) -> bool {
         let expired = match &self.state {
-            TxnState::Active(active) => active.started_at.elapsed() > self.limits.max_duration,
+            TxnState::Active(active) | TxnState::FailedRecoverable(active) => {
+                active.started_at.elapsed() > self.limits.max_duration
+            }
             _ => false,
         };
         if !expired {
@@ -1899,7 +2135,9 @@ impl<'e> SessionTransaction<'e> {
         if self.abort_if_implicit() {
             return true;
         }
-        if let TxnState::Active(active) = std::mem::replace(&mut self.state, TxnState::Idle) {
+        if let TxnState::Active(active) | TxnState::FailedRecoverable(active) =
+            std::mem::replace(&mut self.state, TxnState::Idle)
+        {
             self.state = TxnState::Failed {
                 session_at_begin: Box::new(active.session_at_begin),
                 expired: true,
@@ -1930,12 +2168,14 @@ impl<'e> SessionTransaction<'e> {
     /// 期限到達時点で [`Self::release_if_expired`] を呼べるようにする。writer 未取得の
     /// `Active` でも `BEGIN` 起点で効き、`BEGIN` 時点のスナップショットを保持し続けない。
     /// Issue #2409 のテストで固定）。
-    /// `Failed` は [`Self::fail`]／[`Self::release_if_expired`] の時点で共有
+    /// `Failed` は [`Self::fail_unrecoverable`]／[`Self::release_if_expired`] の時点で共有
     /// 書き込みトランザクション（書き込みゲートの permit を内包）を既に drop
-    /// 済みでライタを保持しないため、対象外（`None`）とする。
+    /// 済みでライタを保持しないため、対象外（`None`）とする。一方、復帰可能な失敗状態
+    /// （`FailedRecoverable`。Issue #1947）は writer を保持しうるため `Active` と同じく
+    /// 残り時間を返し、期限到達時に [`Self::release_if_expired`] で解放できるようにする。
     pub fn remaining_duration(&self) -> Option<Duration> {
         match &self.state {
-            TxnState::Active(active) => Some(
+            TxnState::Active(active) | TxnState::FailedRecoverable(active) => Some(
                 self.limits
                     .max_duration
                     .saturating_sub(active.started_at.elapsed()),
@@ -2095,15 +2335,41 @@ fn commit_active(
 /// `SqlSurfaceError::LockNotAvailable`（`55P03`）へ写像する。それ以外は
 /// 内部事象として `XX000` に丸める（他テナントの情報を含まない）。
 fn map_write_lock_err(e: crate::storage::StorageError) -> SqlSurfaceError {
-    match e {
-        crate::storage::StorageError::WriteLockTimeout
-        | crate::storage::StorageError::WriteTxnHeldByCurrentSession => {
-            SqlSurfaceError::LockNotAvailable
-        }
-        _ => SqlSurfaceError::Internal {
-            detail: "internal error".to_string(),
-        },
+    if is_write_lock_unavailable(&e) {
+        return SqlSurfaceError::LockNotAvailable;
     }
+    SqlSurfaceError::Internal {
+        detail: "internal error".to_string(),
+    }
+}
+
+/// writer の取得方針（`begin_with_origin`・`acquire_writer` の内部引数。Issue #2231）。
+/// 呼び出し元の公開入口が `bool` で表す待機／`NOWAIT` に、`SKIP LOCKED` 用の `Try` を加えたもの（SQL-38 (4)）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriterAcquire {
+    /// 待機する。
+    Wait,
+    /// `NOWAIT` 用。
+    NoWait,
+    /// `SKIP LOCKED` 用（取得結果を `Ok(bool)` で返す）。
+    Try,
+}
+
+impl WriterAcquire {
+    /// 待たずに取得を試みる方針か（`NoWait`・`Try`）。
+    fn is_nowait(self) -> bool {
+        !matches!(self, Self::Wait)
+    }
+}
+
+/// writer を他者が保持していて取得できなかったエラーか（`map_write_lock_err` と同じ集合）。
+/// `SKIP LOCKED`（#2231）が取得失敗の種別を区別する唯一の判定。
+fn is_write_lock_unavailable(e: &crate::storage::StorageError) -> bool {
+    matches!(
+        e,
+        crate::storage::StorageError::WriteLockTimeout
+            | crate::storage::StorageError::WriteTxnHeldByCurrentSession
+    )
 }
 
 #[cfg(test)]
@@ -2267,6 +2533,19 @@ mod tests {
         assert!(!is_rollback_statement("COMMIT"));
         // Issue #1942: `ROLLBACK TO` は Tx 全体の ROLLBACK ではない。
         assert!(!is_rollback_statement("ROLLBACK TO a"));
+        assert!(is_allowed_while_failed("ROLLBACK TO a"));
+        assert!(is_allowed_while_failed("rollback work to savepoint a"));
+        assert!(is_allowed_while_failed(
+            "ROLLBACK TRANSACTION TO SAVEPOINT a"
+        ));
+        assert!(is_allowed_while_failed("ROLLBACK"));
+        assert!(is_allowed_while_failed("ABORT"));
+        assert!(!is_allowed_while_failed("ABORT TO a"));
+        assert!(!is_allowed_while_failed("COMMIT"));
+        assert!(!is_allowed_while_failed("END"));
+        assert!(!is_allowed_while_failed("SAVEPOINT a"));
+        assert!(!is_allowed_while_failed("RELEASE a"));
+        assert!(!is_allowed_while_failed("ROLLBACK 'unterminated"));
         assert!(!is_rollback_statement("rollback work to savepoint a"));
         assert!(!is_rollback_statement(
             "ROLLBACK TRANSACTION TO SAVEPOINT a"
@@ -2910,6 +3189,39 @@ mod tests {
         txn.begin_implicit_with(&storage, &session, true)
             .expect("acquire after release");
         assert!(txn.is_implicit_active());
+    }
+
+    /// `SKIP LOCKED` の入口（Issue #2231）の取得結果と状態を固定する（SQL-38 (4)）。
+    #[test]
+    fn try_acquire_returns_false_while_held_without_changing_state() {
+        let (mut storage, _g) = open_test_storage("txn-2231-skip");
+        storage.set_write_lock_wait(Duration::from_secs(5));
+        let session = SessionState::default();
+        let holder = storage.begin_write_txn().expect("holder");
+        let started = Instant::now();
+        // 暗黙 Tx。
+        let mut implicit = SessionTransaction::new(TransactionLimits::default());
+        assert!(!implicit
+            .try_begin_implicit(&storage, &session)
+            .expect("try"));
+        assert!(matches!(implicit.status(), TransactionStatus::Idle));
+        // 明示 Tx。
+        let mut txn = SessionTransaction::new(TransactionLimits::default());
+        txn.begin(&storage, &session).expect("begin");
+        assert!(!txn.try_ensure_writer(&test_ctx()).expect("try"));
+        assert!(matches!(txn.status(), TransactionStatus::InTransaction));
+        assert!(txn.write_txn().is_none());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        drop(holder);
+        assert!(implicit
+            .try_begin_implicit(&storage, &session)
+            .expect("try"));
+        assert!(implicit.is_implicit_active());
+        drop(implicit);
+        assert!(txn.try_ensure_writer(&test_ctx()).expect("try"));
+        assert!(txn.write_txn().is_some());
+        // 取得済みなら再取得せず `Ok(true)`。
+        assert!(txn.try_ensure_writer(&test_ctx()).expect("try again"));
     }
 
     /// `BEGIN` 直後のスナップショットは、新たに開いた確定済み読み取りと同じ世代を指す

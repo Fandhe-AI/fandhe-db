@@ -54,6 +54,9 @@
 //! - `finish-do <db_path>`: 最後の奇数 k を順序 B（`DO` → 証人 INSERT）で再送して `23505`・全体の破棄、
 //!   `DO ... USING OPERATION_ID` が `0A000`、新しい k がちょうど 1 回分適用されることを確かめる。
 //! - `self-check-do <db_path>`: 負の対照（オラクルの純関数と、DB へ書いた不完全な状態）。
+//!
+//! Issue #1948（SQL-69・RECOVER-5 のポインタ）の savepoint の段（`*-savepoint`・`write-savepoint-pause`
+//! サブコマンド）は `mod savepoint` のドキュメントコメントを参照。
 
 use std::io::Write as _;
 
@@ -94,13 +97,15 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let sub = args.next();
     let path = args.next();
+    let stage = args.next();
     let (sub, path) = match (sub, path) {
         (Some(sub), Some(path)) => (sub, path),
         _ => {
             eprintln!(
                 "usage: crash_tool_sequence <write|verify|finish|self-check|write-identity|\
                  verify-identity|finish-identity|self-check-identity|write-do|verify-do|finish-do|\
-                 self-check-do> <db_path>"
+                 self-check-do|write-savepoint|verify-savepoint|finish-savepoint|\
+                 self-check-savepoint|write-savepoint-pause> <db_path> [stage]"
             );
             std::process::exit(2);
         }
@@ -118,6 +123,11 @@ fn main() {
         "verify-do" => report(do_block::verify_inner(&path)),
         "finish-do" => report(do_block::finish_inner(&path)),
         "self-check-do" => do_block::run_self_check(&path),
+        "write-savepoint" => run_write_savepoint(&path),
+        "verify-savepoint" => report(savepoint::verify_inner(&path)),
+        "finish-savepoint" => report(savepoint::finish_inner(&path)),
+        "self-check-savepoint" => savepoint::run_self_check(&path),
+        "write-savepoint-pause" => run_write_savepoint_pause(&path, stage.as_deref()),
         other => {
             eprintln!("ERROR: unknown subcommand: {other}");
             2
@@ -1363,6 +1373,454 @@ fn run_write_do(path: &str) -> i32 {
         Err(reason) => {
             eprintln!("ERROR: {reason}");
             1
+        }
+    }
+}
+/// Issue #1948（SQL-69・RECOVER-5 のポインタ）の savepoint の段（`*-savepoint` サブコマンド）。
+///
+/// `scripts/crash_test_sequence.sh` から呼ばれ、`BEGIN` 直後（書き込み前）に作った savepoint を
+/// `ROLLBACK TO`／`RELEASE` する明示 Tx を `COMMIT` まで書き続けるプロセスを SIGKILL し、再オープン後に
+/// 「巻き戻した書き込み（`j = 9`）が永続化されていない」「commit 済みの Tx は全か無かで欠けない」
+/// 「冪等台帳が commit 済みの `operation_id` だけを持つ」ことを検証する。書き込み後に作った savepoint は
+/// `ROLLBACK TO` できない（`Unrestorable`）ため、Tx の形は常に「`BEGIN` → `SAVEPOINT` → 書き込み」とする。
+///
+/// 表 `sp_rows (k BIGINT, j INTEGER)`。反復 `k` の Tx は `k % 3` で形を決める（0 = 巻き戻し＋同じ
+/// `operation_id` の再利用、1 = `RELEASE`、2 = 入れ子の巻き戻し＋基底の `RELEASE`）。commit 後に残る行は
+/// `(k, 1)`（`USING OPERATION_ID 'sp-<k>'` 付き）と `(k, 2)` のちょうど 2 行。
+/// - `write-savepoint <db_path>`: 成功ごとに `COMMITTED op=sp-<k> rows=<2(k+1)> n=<k+1>`。
+/// - `verify-savepoint <db_path>`: 読み取り専用。`RESULT` の `rows` は `2 * 適用済み k の個数`、`max` は個数。
+/// - `finish-savepoint <db_path>`: 再送の `23505`、巻き戻した内容での再送の `22023`、新しい k の 1 回適用。
+/// - `self-check-savepoint <db_path>`: 負の対照。
+/// - `write-savepoint-pause <db_path> <stage>`: `after-rollback-to`／`after-release`／`after-commit` の
+///   各点で `PAUSED stage=<stage> n=<期待する適用済み個数>` を出して停止し、決定的な SIGKILL を待つ。
+mod savepoint {
+    use super::*;
+    use engine::sql::transaction::SessionTransaction;
+
+    const TABLE_SP: &str = "sp_rows";
+    const OTHER_TENANT: &str = "crash-tool-sequence-other-sp";
+    const SEED_K: i64 = -1;
+    /// pause 段の writer が SIGKILL を待つ上限（暴走防止。到達したら非 0 で自己終了する）。
+    const PAUSE_LIMIT_SECS: u64 = 60;
+
+    /// Tx 内の観測点。
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Event {
+        RolledBack,
+        Released,
+    }
+
+    fn other_ctx() -> Result<PolicyContext, String> {
+        PolicyContext::with_visibilities(OTHER_TENANT, [Visibility::Public, Visibility::Private])
+            .map_err(|e| format!("invalid tenant context: {e}"))
+    }
+
+    fn cell_i64(cell: Option<&Cell>) -> Result<i64, String> {
+        match cell {
+            Some(Cell::SignedInteger(v)) => Ok(*v),
+            Some(Cell::Integer(v)) => i64::try_from(*v).map_err(|_| "cell overflow".to_string()),
+            other => Err(format!("unexpected cell: {other:?}")),
+        }
+    }
+
+    fn read_pairs(core: &EngineCore, ctx: &PolicyContext) -> Result<Vec<(i64, i64)>, String> {
+        let r = core
+            .execute_sql(
+                ctx,
+                &format!("SELECT k, j FROM {TABLE_SP} LIMIT {SCAN_LIMIT}"),
+            )
+            .map_err(|e| format!("scan failed: {e}"))?;
+        if r.rows.len() as u64 >= SCAN_LIMIT {
+            return Err(format!(
+                "scan limit ({SCAN_LIMIT}) reached; reduce sets/iterations"
+            ));
+        }
+        r.rows
+            .iter()
+            .map(|row| Ok((cell_i64(row.cells.first())?, cell_i64(row.cells.get(1))?)))
+            .collect()
+    }
+
+    /// 表と第 2 テナントの種行を冪等に用意する。
+    fn ensure_schema(core: &EngineCore) -> Result<(), String> {
+        let ctx = tenant_ctx()?;
+        let mut session = SessionState::default();
+        session.allow_ddl();
+        let sql = format!("CREATE TABLE {TABLE_SP} (k BIGINT, j INTEGER)");
+        match core.execute_sql_in_session(&ctx, &mut session, &sql) {
+            Ok(_) => {}
+            Err(e) if is_already_exists(&e) => {}
+            Err(e) => return Err(format!("ddl failed ({sql}): {e}")),
+        }
+        let other = other_ctx()?;
+        if read_pairs(core, &other)?.is_empty() {
+            let mut s = SessionState::default();
+            core.execute_sql_in_session(
+                &other,
+                &mut s,
+                &format!("INSERT INTO {TABLE_SP} (k, j) VALUES ({SEED_K}, 0)"),
+            )
+            .map_err(|e| format!("seed failed: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// `(k, j)` の INSERT。`with_op` なら `USING OPERATION_ID 'sp-<k>'` を付ける（内部の整数のみ連結）。
+    fn ins(k: u64, j: u8, with_op: bool) -> String {
+        let base = format!("INSERT INTO {TABLE_SP} (k, j) VALUES ({k}, {j})");
+        if with_op {
+            format!("{base} USING OPERATION_ID 'sp-{k}'")
+        } else {
+            base
+        }
+    }
+
+    fn step<'a>(
+        core: &'a EngineCore,
+        ctx: &PolicyContext,
+        session: &mut SessionState,
+        txn: &mut SessionTransaction<'a>,
+        sql: &str,
+    ) -> Result<(), String> {
+        core.execute_sql_in_txn(ctx, session, txn, sql)
+            .map(|_| ())
+            .map_err(|e| format!("statement failed ({sql}): {e}"))
+    }
+
+    /// 反復 `k` を形 `shape`（0 = 巻き戻し、1 = RELEASE、2 = 入れ子）の明示 Tx として commit まで行う。
+    /// 観測点ごとに `obs` を呼ぶ（ログ出力・sleep・pause 用）。
+    fn apply_shape(
+        core: &EngineCore,
+        ctx: &PolicyContext,
+        k: u64,
+        shape: u64,
+        obs: &mut dyn FnMut(Event) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let mut session = SessionState::default();
+        let mut txn = core.new_session_transaction();
+        let t = &mut txn;
+        let s = &mut session;
+        step(core, ctx, s, t, "BEGIN")?;
+        step(core, ctx, s, t, "SAVEPOINT a")?;
+        match shape {
+            0 => {
+                step(core, ctx, s, t, &ins(k, 9, true))?;
+                step(core, ctx, s, t, "ROLLBACK TO a")?;
+                obs(Event::RolledBack)?;
+                step(core, ctx, s, t, &ins(k, 1, true))?;
+            }
+            1 => {
+                step(core, ctx, s, t, &ins(k, 1, true))?;
+                step(core, ctx, s, t, "RELEASE a")?;
+                obs(Event::Released)?;
+            }
+            _ => {
+                step(core, ctx, s, t, "SAVEPOINT b")?;
+                step(core, ctx, s, t, &ins(k, 9, true))?;
+                step(core, ctx, s, t, "ROLLBACK TO b")?;
+                obs(Event::RolledBack)?;
+                step(core, ctx, s, t, "RELEASE a")?;
+                obs(Event::Released)?;
+                step(core, ctx, s, t, &ins(k, 1, true))?;
+            }
+        }
+        step(core, ctx, s, t, &ins(k, 2, false))?;
+        step(core, ctx, s, t, "COMMIT")
+    }
+
+    fn apply_plain(core: &EngineCore, ctx: &PolicyContext, k: u64) -> Result<(), String> {
+        apply_shape(core, ctx, k, k % 3, &mut |_| Ok(()))
+    }
+
+    fn recorded(core: &EngineCore, ctx: &PolicyContext, k: i64) -> Result<bool, String> {
+        use engine::recovery::ledger::LedgerLookup;
+        use engine::recovery::required_op_id::OperationId;
+        let op = OperationId::parse(&format!("sp-{k}")).map_err(|e| format!("op id: {e:?}"))?;
+        match core.operation_recorded(ctx, TABLE_SP, &op) {
+            Ok(LedgerLookup::Recorded) => Ok(true),
+            Ok(LedgerLookup::NotRecorded) => Ok(false),
+            Ok(LedgerLookup::NoLedger) => Err("ledger unavailable".to_string()),
+            Err(e) => Err(format!("ledger lookup failed: {e}")),
+        }
+    }
+
+    /// オラクル本体（純関数）。`rows` = 自テナントの `(k, j)`、`ledger` = 台帳に記録済みの `k`。
+    /// 戻り値は `(2 * 適用済み k の個数, 適用済み k の個数)`。
+    pub(super) fn check_state(rows: &[(i64, i64)], ledger: &[i64]) -> Result<(u64, i64), String> {
+        use std::collections::BTreeMap;
+        // (1) 巻き戻した書き込み（j = 9）が永続化されていない。
+        if rows.iter().any(|(_, j)| *j == 9) {
+            return Err("rolled-back row (j=9) is persisted".to_string());
+        }
+        let mut per_k: BTreeMap<i64, Vec<i64>> = BTreeMap::new();
+        for (k, j) in rows {
+            per_k.entry(*k).or_default().push(*j);
+        }
+        // (2) Tx は全か無か（RELEASE 済みの書き込みも COMMIT と一緒に永続化されている）。
+        for (k, js) in &mut per_k {
+            js.sort_unstable();
+            if js.as_slice() != [1, 2] {
+                return Err(format!("partial rows at k={k} (js={js:?})"));
+            }
+        }
+        // (3) commit 済み分が 0 からの連続した接頭辞（欠落なし）。
+        let applied = i64::try_from(per_k.len()).map_err(|_| "overflow".to_string())?;
+        if per_k.keys().copied().ne(0..applied) {
+            return Err("applied k values are not a contiguous prefix from 0".to_string());
+        }
+        // (4) 台帳は適用済みの k とちょうど一致する。
+        let mut l = ledger.to_vec();
+        l.sort_unstable();
+        l.dedup();
+        if l.iter().copied().ne(0..applied) {
+            return Err(format!(
+                "ledger entries do not match applied bodies (ledger={})",
+                l.len()
+            ));
+        }
+        let n = u64::try_from(applied).map_err(|_| "overflow".to_string())?;
+        Ok((n * 2, applied))
+    }
+
+    fn verify_with(core: &EngineCore, ctx: &PolicyContext) -> Result<(u64, i64), String> {
+        let rows = read_pairs(core, ctx)?;
+        let probe_to =
+            i64::try_from(rows.len() as u64 / 2 + 2).map_err(|_| "overflow".to_string())?;
+        let mut ledger = Vec::new();
+        for k in 0..probe_to {
+            if recorded(core, ctx, k)? {
+                ledger.push(k);
+            }
+        }
+        let state = check_state(&rows, &ledger)?;
+        // (5) 第 2 テナントは種行のまま、台帳に sp-* が載っていない。
+        let other = other_ctx()?;
+        if read_pairs(core, &other)? != [(SEED_K, 0)] {
+            return Err("other tenant rows changed".to_string());
+        }
+        for k in 0..probe_to {
+            if recorded(core, &other, k)? {
+                return Err("other tenant ledger holds an sp-* entry".to_string());
+            }
+        }
+        Ok(state)
+    }
+
+    pub(super) fn verify_inner(path: &str) -> Result<(u64, i64), String> {
+        let core = open_core(path)?;
+        verify_with(&core, &tenant_ctx()?)
+    }
+
+    fn next_k(core: &EngineCore, ctx: &PolicyContext) -> Result<u64, String> {
+        Ok(read_pairs(core, ctx)?.len() as u64 / 2)
+    }
+
+    fn emit(line: &str) -> Result<(), String> {
+        let stdout = std::io::stdout();
+        let mut h = stdout.lock();
+        writeln!(h, "{line}").map_err(|e| format!("stdout write failed: {e}"))?;
+        h.flush().map_err(|e| format!("stdout flush failed: {e}"))
+    }
+
+    pub(super) fn write_inner(path: &str) -> Result<(), String> {
+        let core = open_core(path)?;
+        ensure_schema(&core)?;
+        let ctx = tenant_ctx()?;
+        let first = next_k(&core, &ctx)?;
+        for k in first..first.saturating_add(MAX_ROWS) {
+            // 巻き戻し・RELEASE の直後に Tx を開いたまま短く待ち、ランダム kill がその区間に当たりやすくする。
+            let mut obs = |e: Event| -> Result<(), String> {
+                match e {
+                    Event::RolledBack => emit(&format!("ROLLEDBACK k={k}"))?,
+                    Event::Released => emit(&format!("RELEASED k={k}"))?,
+                }
+                std::thread::sleep(std::time::Duration::from_millis(12));
+                Ok(())
+            };
+            apply_shape(&core, &ctx, k, k % 3, &mut obs)?;
+            emit(&format!(
+                "COMMITTED op=sp-{k} rows={} n={}",
+                (k + 1) * 2,
+                k + 1
+            ))?;
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+        Ok(())
+    }
+
+    /// 決定的 kill 用。指定の点で `PAUSED` を出して SIGKILL を待つ（上限到達で Err）。
+    pub(super) fn write_pause_inner(path: &str, stage: &str) -> Result<(), String> {
+        if !matches!(
+            stage,
+            "after-rollback-to" | "after-release" | "after-commit"
+        ) {
+            return Err(format!("unknown stage: {stage}"));
+        }
+        let core = open_core(path)?;
+        ensure_schema(&core)?;
+        let ctx = tenant_ctx()?;
+        let mut k = next_k(&core, &ctx)?;
+        for _ in 0..2 {
+            apply_plain(&core, &ctx, k)?;
+            emit(&format!(
+                "COMMITTED op=sp-{k} rows={} n={}",
+                (k + 1) * 2,
+                k + 1
+            ))?;
+            k += 1;
+        }
+        let pause = |n: u64| -> Result<(), String> {
+            emit(&format!("PAUSED stage={stage} n={n}"))?;
+            std::thread::sleep(std::time::Duration::from_secs(PAUSE_LIMIT_SECS));
+            Err("pause limit reached without SIGKILL".to_string())
+        };
+        match stage {
+            "after-rollback-to" => {
+                let mut obs = |e: Event| match e {
+                    Event::RolledBack => pause(k),
+                    Event::Released => Ok(()),
+                };
+                apply_shape(&core, &ctx, k, 0, &mut obs)
+            }
+            "after-release" => {
+                let mut obs = |e: Event| match e {
+                    Event::Released => pause(k),
+                    Event::RolledBack => Ok(()),
+                };
+                apply_shape(&core, &ctx, k, 1, &mut obs)
+            }
+            _ => {
+                apply_shape(&core, &ctx, k, 0, &mut |_| Ok(()))?;
+                emit(&format!(
+                    "COMMITTED op=sp-{k} rows={} n={}",
+                    (k + 1) * 2,
+                    k + 1
+                ))?;
+                pause(k + 1)
+            }
+        }
+    }
+
+    pub(super) fn finish_inner(path: &str) -> Result<(u64, i64), String> {
+        let core = open_core(path)?;
+        ensure_schema(&core)?;
+        let ctx = tenant_ctx()?;
+        let (mut rows, mut max) = verify_with(&core, &ctx)?;
+        // 巻き戻し・入れ子の形を必ず含めるため、足りない分を適用する。
+        while max < 3 {
+            apply_plain(
+                &core,
+                &ctx,
+                u64::try_from(max).map_err(|_| "overflow".to_string())?,
+            )?;
+            (rows, max) = verify_with(&core, &ctx)?;
+        }
+        let applied = u64::try_from(max).map_err(|_| "overflow".to_string())?;
+
+        let expect_err = |sql: &str, code: &str| -> Result<(), String> {
+            let mut s = SessionState::default();
+            match core.execute_sql_in_session(&ctx, &mut s, sql) {
+                Err(e) if e.wire_code() == code => Ok(()),
+                Err(e) => Err(format!("unexpected error (want {code}): {e}")),
+                Ok(_) => Err(format!("statement was wrongly accepted (want {code})")),
+            }
+        };
+        // (i) 最後に commit した k の同一文の再送は 23505 で、状態は不変。
+        expect_err(&ins(applied - 1, 1, true), "23505")?;
+        if verify_with(&core, &ctx)? != (rows, max) {
+            return Err("resend changed the table".to_string());
+        }
+        // (ii) 巻き戻した内容（j = 9）での再送は 22023。台帳は commit した内容を保持している。
+        let mut probed = false;
+        for k in (0..applied).filter(|k| k % 3 != 1) {
+            expect_err(&ins(k, 9, true), "22023")?;
+            probed = true;
+        }
+        if !probed {
+            return Err("no rollback-shaped k to probe".to_string());
+        }
+        if verify_with(&core, &ctx)? != (rows, max) {
+            return Err("mismatch resend changed the table".to_string());
+        }
+        // (iii) 新しい k がちょうど 1 回分適用される。
+        apply_plain(&core, &ctx, applied)?;
+        let done = verify_with(&core, &ctx)?;
+        if done != (rows + 2, max + 1) {
+            return Err(format!("unexpected state after the new k: {done:?}"));
+        }
+        Ok(done)
+    }
+
+    pub(super) fn run_self_check(path: &str) -> i32 {
+        match self_check_inner(path) {
+            Ok(()) => {
+                println!("SELF-CHECK ok=true");
+                0
+            }
+            Err(reason) => {
+                println!("SELF-CHECK ok=false reason={reason}");
+                1
+            }
+        }
+    }
+
+    fn self_check_inner(path: &str) -> Result<(), String> {
+        let full = |k: i64| [(k, 1), (k, 2)];
+        let good: Vec<(i64, i64)> = full(0).into_iter().chain(full(1)).collect();
+        if check_state(&good, &[0, 1]) != Ok((4, 2)) {
+            return Err("oracle rejected a valid state".to_string());
+        }
+        type Case = (&'static str, Vec<(i64, i64)>, Vec<i64>);
+        let bad: Vec<Case> = vec![
+            ("rolled-back row", vec![(0, 1), (0, 2), (0, 9)], vec![0]),
+            ("half transaction", vec![(0, 1)], vec![0]),
+            ("gap in k", full(1).to_vec(), vec![1]),
+            ("ledger without body", full(0).to_vec(), vec![0, 1]),
+            ("body without ledger", good.clone(), vec![0]),
+        ];
+        for (label, rows, ledger) in &bad {
+            if check_state(rows, ledger).is_ok() {
+                return Err(format!("oracle accepted a bad state: {label}"));
+            }
+        }
+        // DB 経由: 巻き戻されるべき j = 9 の行が書かれた状態を verify 本体が検出する。
+        let core = open_core(path)?;
+        ensure_schema(&core)?;
+        let ctx = tenant_ctx()?;
+        let mut session = SessionState::default();
+        core.execute_sql_in_session(&ctx, &mut session, &ins(0, 9, false))
+            .map_err(|e| format!("self-check insert failed: {e}"))?;
+        if verify_with(&core, &ctx).is_ok() {
+            return Err("oracle accepted a persisted rolled-back row".to_string());
+        }
+        Ok(())
+    }
+}
+
+fn run_write_savepoint(path: &str) -> i32 {
+    match savepoint::write_inner(path) {
+        Ok(()) => 0,
+        Err(reason) => {
+            eprintln!("ERROR: {reason}");
+            1
+        }
+    }
+}
+
+fn run_write_savepoint_pause(path: &str, stage: Option<&str>) -> i32 {
+    let Some(stage) = stage else {
+        eprintln!("usage: crash_tool_sequence write-savepoint-pause <db_path> <stage>");
+        return 2;
+    };
+    match savepoint::write_pause_inner(path, stage) {
+        Ok(()) => 0,
+        Err(reason) => {
+            eprintln!("ERROR: {reason}");
+            if reason.starts_with("unknown stage") {
+                2
+            } else {
+                1
+            }
         }
     }
 }

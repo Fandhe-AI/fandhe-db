@@ -5,9 +5,12 @@
 //! 照会しない（`policy` と同じ設計。存在・権限・検証子の生成は `sql::role_ddl` が権限ゲートの後で行う）。
 //! 呼び出し元は `core.rs` の `parse_sql` 内の分岐だけ。
 //!
+//! メンバーシップ句 `IN ROLE`（`IN GROUP`）・`ROLE`（`USER`）・`ADMIN`（Issue #2232）は名前の列だけを取り出し、
+//! 付与は `sql::role_ddl` がロール作成と同じ txn で行う（各句の重複は `42601`、件数は上限検証）。
+//!
 //! 受理しない形（すべて固定文言。パスワードのリテラル・名前以外のトークンはエラーに含めない）:
 //! `SUPERUSER`／`BYPASSRLS`／`REPLICATION`（テナント境界を越える属性。`42501`）、`UNENCRYPTED PASSWORD`・
-//! `IN ROLE`・`ROLE`・`ADMIN` など後続 Issue の担当（`0A000`）、
+//! `SYSID` など後続 Issue の担当（`0A000`）、
 //! オプションの重複・矛盾・未知語・`$n` プレースホルダ・修飾名（`42601`）、予約名（`42939`）。
 //!
 //! パスワードの平文は [`RolePassword`] に閉じ込める。`Debug` は伏せ字で、`Display` は実装しない。
@@ -60,6 +63,12 @@ pub struct ValidatedCreateRole {
     pub(crate) valid_until_literal: Option<String>,
     /// `CONNECTION LIMIT <整数>`（-1 は無制限。範囲は構文段で検査済み）。
     pub(crate) connection_limit: Option<i32>,
+    /// `IN ROLE a, ...`（`IN GROUP` も同じ）: 新しいロールを `a` のメンバーにする。
+    pub(crate) in_roles: Vec<String>,
+    /// `ROLE b, ...`（`USER` も同じ）: `b` を新しいロールのメンバーにする。
+    pub(crate) member_roles: Vec<String>,
+    /// `ADMIN c, ...`: `c` を新しいロールの ADMIN 付きメンバーにする。
+    pub(crate) admin_roles: Vec<String>,
 }
 
 /// 構造検証済みの `DROP ROLE [IF EXISTS] <名前>[, ...]`（`DROP USER` も同じ。SQL-39、Issue #1962）。
@@ -127,6 +136,40 @@ fn set_once(slot: &mut Option<bool>, value: bool) -> Result<(), SqlSurfaceError>
     Ok(())
 }
 
+/// メンバーシップ句のロール名の列（`a, b, ...`）を読む。件数は上限検証してから積む。
+fn parse_membership_names(p: &mut Parser<'_>) -> Result<Vec<String>, SqlSurfaceError> {
+    let mut names = Vec::new();
+    loop {
+        if names.len() >= super::grant::MAX_GRANT_LIST_LEN {
+            return Err(SqlSurfaceError::unsupported("too many roles in list"));
+        }
+        let name = parse_role_name(p)?;
+        if is_reserved_syntax_word(&name) {
+            return Err(SqlSurfaceError::unsupported("invalid role name"));
+        }
+        names.push(name);
+        if matches!(p.peek(), Some(Token::Punct(','))) {
+            p.advance();
+        } else {
+            return Ok(names);
+        }
+    }
+}
+
+/// メンバーシップ句の 2 回目以降の指定を拒否しつつ名前の列を読む（`conflicting or redundant options`）。
+fn set_names_once(
+    slot: &mut Option<Vec<String>>,
+    p: &mut Parser<'_>,
+) -> Result<(), SqlSurfaceError> {
+    if slot.is_some() {
+        return Err(SqlSurfaceError::unsupported(
+            "conflicting or redundant options",
+        ));
+    }
+    *slot = Some(parse_membership_names(p)?);
+    Ok(())
+}
+
 /// `PASSWORD` の後ろ（`'<文字列>'` または `NULL`）を読む。エラー文言にリテラルを含めない。
 fn parse_password_value(p: &mut Parser<'_>) -> Result<Option<RolePassword>, SqlSurfaceError> {
     match p.advance() {
@@ -171,6 +214,9 @@ pub(crate) fn validate_create_role_tokens(
         password: opts.password.flatten(),
         valid_until_literal: opts.valid_until,
         connection_limit: opts.connection_limit,
+        in_roles: opts.in_roles.unwrap_or_default(),
+        member_roles: opts.member_roles.unwrap_or_default(),
+        admin_roles: opts.admin_roles.unwrap_or_default(),
     })
 }
 
@@ -188,6 +234,12 @@ struct ParsedRoleOptions {
     valid_until: Option<String>,
     /// `CONNECTION LIMIT` の値（Issue #2233）。
     connection_limit: Option<i32>,
+    /// `IN ROLE`／`IN GROUP` の名前列（CREATE のみ。Issue #2232）。
+    in_roles: Option<Vec<String>>,
+    /// `ROLE`／`USER` の名前列（CREATE のみ）。
+    member_roles: Option<Vec<String>>,
+    /// `ADMIN` の名前列（CREATE のみ）。
+    admin_roles: Option<Vec<String>>,
 }
 
 /// `VALID UNTIL` の後ろ（文字列リテラルのみ）を読む。エラー文言にリテラルを含めない。
@@ -317,8 +369,16 @@ fn parse_role_options(
                 }
                 out.connection_limit = Some(parse_connection_limit_value(p)?);
             }
-            // メンバーシップ（#2232）は後続 Issue の担当。
-            "IN" | "ROLE" | "USER" | "ADMIN" | "SYSID" => {
+            // メンバーシップ句（#2232。CREATE のみ。ALTER は上の腕で拒否済み）。
+            "IN" => {
+                if !(p.eat_word("ROLE") || p.eat_word("GROUP")) {
+                    return Err(SqlSurfaceError::unsupported("unrecognized role option"));
+                }
+                set_names_once(&mut out.in_roles, p)?;
+            }
+            "ROLE" | "USER" => set_names_once(&mut out.member_roles, p)?,
+            "ADMIN" => set_names_once(&mut out.admin_roles, p)?,
+            "SYSID" => {
                 return Err(SqlSurfaceError::feature_not_supported(
                     "this role option is not supported yet",
                 ));
@@ -704,21 +764,33 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_and_malformed_options() {
-        for kw in [
-            "IN ROLE x",
-            "IN GROUP x",
-            "ROLE x",
-            "USER x",
-            "ADMIN x",
-            "SYSID 1",
+    fn membership_clauses_are_parsed_and_duplicates_rejected() {
+        let v = create("CREATE ROLE r IN ROLE a, b ROLE c ADMIN d, e").expect("parse");
+        assert_eq!(v.in_roles, ["a", "b"]);
+        assert_eq!(v.member_roles, ["c"]);
+        assert_eq!(v.admin_roles, ["d", "e"]);
+        let v = create("CREATE USER u IN GROUP g USER x").expect("parse");
+        assert_eq!((v.in_roles.len(), v.member_roles.len()), (1, 1));
+        for bad in [
+            "IN ROLE a IN ROLE b",
+            "ROLE a ROLE b",
+            "ADMIN a ADMIN b",
+            "IN a",
+            "IN ROLE",
+            "ROLE current_user",
+            "IN ROLE a,",
         ] {
             assert_eq!(
-                code(create(&format!("CREATE ROLE r {kw}"))),
-                "0A000",
-                "{kw}"
+                code(create(&format!("CREATE ROLE r {bad}"))),
+                "42601",
+                "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn unsupported_and_malformed_options() {
+        assert_eq!(code(create("CREATE ROLE r SYSID 1")), "0A000");
         for sql in [
             "CREATE ROLE r LOGIN NOLOGIN",
             "CREATE ROLE r LOGIN LOGIN",

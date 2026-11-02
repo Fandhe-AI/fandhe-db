@@ -155,7 +155,12 @@ fn respond_error_and_ready<S: WireStream>(
     class: ErrorClass,
     message: &str,
 ) -> io::Result<()> {
-    txn.fail();
+    // 内部エラー（`XX000`）は `ROLLBACK TO` での復帰を許さず writer を即時解放する（Issue #1947）。
+    if class == ErrorClass::InternalError {
+        txn.fail_unrecoverable();
+    } else {
+        txn.fail();
+    }
     // `ReadyForQuery` はここでは書かない。`CopyStep::Failed` を受けた呼び出し元
     // （`simple_query`）がセッション復元の後に TimeZone 通知付きで送る（TABLE-33・Issue #1575）。
     crate::handshake::write_error_response_io(stream, class, message)

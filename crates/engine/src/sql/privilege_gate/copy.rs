@@ -11,6 +11,8 @@
 //! - `TO` 形はトークン走査の参照先に `inner.table_name()` を加える（テーブル形は `FROM` を持たないため）。
 //! - 現在ロール未束縛・運用者権限のセッションは何もしない（従来と同一）。`Some(0)` は拒否する。
 //! - 一時表（セッションの所有物）は呼び出し元が本ゲートの手前で分岐するので対象外。
+//! - ACL は明示 Tx では `BEGIN` 時のスナップショットで照会し（`read_snap`）、検証済みの対象表が照会で
+//!   見つからなければ `42P01` で拒否する（`read.rs` の `require_relations_bits` の規則をそのまま使う）。
 //! - 拒否は固定文言の `42501`。表名・ロール ID・テナントを含めない。
 
 use crate::catalog::privilege::{PRIV_INSERT, PRIV_SELECT};
@@ -38,6 +40,7 @@ pub(crate) fn require_copy_privileges(
     session: &SessionState,
     stmt: &CopyStatement,
     resolved_tokens: &[Token],
+    read_snap: Option<&redb::ReadTransaction>,
 ) -> Result<(), SqlSurfaceError> {
     let required_bits = copy_required_bits(stmt);
     let principal = Principal::from_session(session);
@@ -48,7 +51,8 @@ pub(crate) fn require_copy_privileges(
                 required_bits,
                 granted_bits: 0,
             },
-        );
+        )
+        .map(|_| ());
     }
     let mut names: Vec<String> = Vec::new();
     match stmt {
@@ -60,6 +64,12 @@ pub(crate) fn require_copy_privileges(
             names.push(v.inner.table_name().to_string());
         }
     }
+    // 構文検証（`validate_copy_tokens`）がカタログで実在を確認した対象表。ACL の照会で見つからなければ、
+    // 検証後に DROP された参照先として拒否する（fail-closed。SELECT・DML ゲートと同じ規則）。
+    let verified = vec![match stmt {
+        CopyStatement::From(v) => v.table_name.clone(),
+        CopyStatement::To(v) => v.inner.table_name().to_string(),
+    }];
     let wants: Vec<(String, u16)> = names.into_iter().map(|n| (n, required_bits)).collect();
-    require_relations_bits(storage, tenant, &principal, &wants)
+    require_relations_bits(storage, tenant, &principal, &wants, read_snap, &verified)
 }

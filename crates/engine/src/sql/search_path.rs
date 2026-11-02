@@ -253,10 +253,20 @@ fn is_syntax_keyword_here(tokens: &[Token], idx: usize) -> bool {
         return false;
     };
     if w.eq_ignore_ascii_case("IF") {
-        return is(Some(idx.saturating_add(1)), "EXISTS") || is(Some(idx.saturating_add(1)), "NOT");
+        // `IF [NOT] EXISTS` は DDL（`CREATE`／`DROP`／`ALTER`）の句。SELECT の `FROM "if" exists`（`exists` は
+        // 暗黙の別名）のように、それ以外の文では実表 `if` の参照として残す（権限検査から外さない）。
+        return ["CREATE", "DROP", "ALTER"].iter().any(|k| is(Some(0), k))
+            && (is(Some(idx.saturating_add(1)), "EXISTS")
+                || is(Some(idx.saturating_add(1)), "NOT"));
     }
     if w.eq_ignore_ascii_case("ONLY") {
-        return next_is_name;
+        // `ONLY` を修飾語として受理する文は `TRUNCATE`・`LOCK`・`ALTER`（所有者変更）・DML だけ。SELECT の
+        // `FROM` 句などでは構文語ではなく関係名（`FROM "only" AS x` の実表 `only`）であり、字句上は引用の
+        // 有無を区別できないため、それ以外の文では常に関係名として残す（権限検査から外さない。fail-closed）。
+        return next_is_name
+            && ["TRUNCATE", "LOCK", "ALTER", "DELETE", "UPDATE", "INSERT"]
+                .iter()
+                .any(|k| is(Some(0), k));
     }
     if w.eq_ignore_ascii_case("TABLE") {
         // `LOCK TABLE <表>` の `TABLE` も構文語（Issue #1958。文頭の `LOCK` の直後だけ）。
@@ -269,6 +279,51 @@ fn is_syntax_keyword_here(tokens: &[Token], idx: usize) -> bool {
                 && matches!(tokens.get(idx.saturating_add(2)), Some(Token::Punct('('))));
     }
     false
+}
+
+/// 名前解決（`schema.name` の置き換え）済みのトークン列から、テーブル参照位置にある表名だけを集める
+/// （出現順・重複なし。内部キー `#<id>.<name>` も含む）。FROM・JOIN・サブクエリの内側を位置で拾い、
+/// 列名・別名・構文語・表関数名・CTE 名は含めない。`SKIP LOCKED` の空結果前の RLS 判定
+/// （`core::row_lock_exec`・RLS-13）が、実参照表だけへ `policies_apply` を掛けるために使う。
+pub(crate) fn resolved_relation_names(tokens: &[Token]) -> Vec<String> {
+    let walk = crate::sql::relation_name::relation_positions(tokens);
+    let ctes = crate::sql::relation_name::collect_cte_scopes(tokens);
+    let mut out: Vec<String> = Vec::new();
+    for pos in walk.positions {
+        if pos.create_name {
+            continue;
+        }
+        let Some(name) = tokens
+            .get(pos.index)
+            .and_then(crate::sql::relation_name::unqualified_ident_name)
+        else {
+            continue;
+        };
+        if is_syntax_keyword_here(tokens, pos.index)
+            || ctes
+                .iter()
+                .any(|c| c.covers(pos.index) && c.name.eq_ignore_ascii_case(name))
+        {
+            continue;
+        }
+        let prev = pos.index.checked_sub(1).and_then(|i| tokens.get(i));
+        let table_function_slot = matches!(
+            prev,
+            Some(Token::Keyword(crate::sql::lexer::Keyword::From) | Token::Punct(','))
+        ) || matches!(prev, Some(Token::Ident(w)) if w.eq_ignore_ascii_case("JOIN"));
+        if table_function_slot
+            && matches!(
+                tokens.get(pos.index.saturating_add(1)),
+                Some(Token::Punct('('))
+            )
+        {
+            continue;
+        }
+        if !out.iter().any(|n| n == name) {
+            out.push(name.to_string());
+        }
+    }
+    out
 }
 
 /// 未修飾のテーブル参照の名前集め（参照ゲートの入力）。`skip` はゲート対象外のトークン添字
@@ -437,7 +492,14 @@ pub(crate) fn check_unqualified_refs(
     if !session.search_path_hides_public() {
         return Ok(());
     }
-    if is_ddl_head(tokens) && crate::sql::ddl::require_ddl_permission(session).is_err() {
+    if is_ddl_head(tokens)
+        && crate::sql::ddl::require_ddl_permission(session).is_err()
+        // `ALTER ... OWNER TO` は運用者権限が無くても、束縛ロールが対象の所有者なら実行できる（所有者経路。
+        // Issue #2236）。ロールが束縛されている間は参照ゲートを適用し、運用者権限も束縛ロールも無い
+        // （`42501` を受け取る）セッションだけを免除する。
+        && !(crate::sql::allowlist::is_alter_owner_statement(tokens)
+            && crate::sql::privilege_gate::bound_principal(session).is_ok())
+    {
         return Ok(());
     }
     // `GRANT`／`REVOKE`（SQL-40・Issue #1965）は現在ロールが束縛されていないセッションが `42501` を受け取る
@@ -657,6 +719,16 @@ mod tests {
     }
 
     #[test]
+    fn recursive_cte_self_reference_is_not_a_relation_ref() {
+        let sql = "WITH RECURSIVE docs(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM docs WHERE n<3) \
+                   SELECT n FROM docs";
+        assert!(names(sql).is_empty());
+        // 非再帰 CTE の本文の同名参照は実テーブルのまま数える。
+        let sql = "WITH docs AS (SELECT 1 FROM docs) SELECT * FROM docs";
+        assert_eq!(names(sql), vec!["docs".to_string()]);
+    }
+
+    #[test]
     fn default_value_displays_as_user_then_public() {
         assert_eq!(SearchPath::default().display(), "\"$user\", public");
     }
@@ -740,21 +812,6 @@ mod tests {
     }
 
     #[test]
-    fn recursive_cte_self_reference_is_not_a_relation() {
-        assert!(names(
-            "WITH RECURSIVE r(n) AS (SELECT 1 UNION SELECT n + 1 FROM r WHERE n < 3) SELECT n FROM r"
-        )
-        .is_empty());
-        // 再帰 CTE の本文の基底表は引き続き数える。
-        assert_eq!(
-            names(
-                "WITH RECURSIVE r(n) AS (SELECT n FROM base UNION SELECT n FROM r) SELECT n FROM r"
-            ),
-            vec!["base"]
-        );
-    }
-
-    #[test]
     fn cte_name_hides_only_where_visible() {
         // 非再帰 CTE は自身の本文から見えない（同名の実リレーションを読む）。
         assert_eq!(
@@ -832,7 +889,11 @@ mod tests {
         assert_eq!(names("TRUNCATE a, ONLY b"), vec!["a", "b"]);
         assert_eq!(names("TRUNCATE public.a, ONLY b"), vec!["b"]);
         assert_eq!(names("TRUNCATE a, ONLY b, ONLY c"), vec!["a", "b", "c"]);
-        assert_eq!(names("SELECT id FROM a, ONLY b LIMIT 5"), vec!["a", "b"]);
+        // SELECT の `FROM` 句では `ONLY` は構文語ではなく関係名（実表 `only` の可能性を残す）。
+        assert_eq!(
+            names("SELECT id FROM a, ONLY b LIMIT 5"),
+            vec!["a", "ONLY", "b"]
+        );
         // 直前が式の語に見える引用付き識別子（表名・索引名・別名）でも、導入語の後の表名は残る。
         assert_eq!(names("CREATE INDEX \"is\" ON t (a)"), vec!["t"]);
         assert_eq!(names("CREATE INDEX \"in\" ON t (a)"), vec!["t"]);

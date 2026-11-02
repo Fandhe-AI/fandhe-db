@@ -167,7 +167,7 @@ pub(crate) fn map_partitioned_failure<E>(
     let cause_error = match failure.cause {
         PartitionedStopCause::Write(e) => crate::sql::exec::map_write_error(e, op),
         PartitionedStopCause::Predicate(e) => map_predicate(e),
-        // SQL-40・Issue #1968: 権限の剥奪。固定文言の `42501`（部分完了なら `VD001` の原因クラスが `42501`）。
+        // SQL-40・Issue #1968: 権限の剥奪。関係の権限不足の固定文言（`RelationPermissionDenied`。DDL 文言にしない）の `42501`（部分完了なら `VD001` の原因クラスが `42501`）。
         PartitionedStopCause::InsufficientPrivilege => SqlSurfaceError::RelationPermissionDenied,
         PartitionedStopCause::AffectedRowsLimitExceeded { limit } => {
             SqlSurfaceError::payload_too_large(format!(

@@ -1,5 +1,5 @@
 //! 書き込み系の文の表単位権限検査（SQL-40・RLS-12・SQL-19・SQL-22 ポインタ。Issue #1968。設計は
-//! `docs/design/role-privilege-model.md` §13）の結合テスト。
+//! `docs/design/role-privilege-model.md` §17）の結合テスト。
 //!
 //! 現在ロールを束縛したセッション（`SessionState::bind_role_ids`）で、`GRANT` で付与した表単位の
 //! INSERT／UPDATE／DELETE／TRUNCATE が各文種（UPSERT・RETURNING・INSERT ... SELECT・UPDATE ... FROM・
@@ -317,8 +317,10 @@ fn qualified_target_is_checked_under_its_resolved_key() {
     let sql = "INSERT INTO app.q (v) VALUES (1) USING OPERATION_ID 'q1'";
     // 修飾名でも名前解決後のキーで ACL を引く（素通しにならない）。
     assert_eq!(f.alice_run(sql), "42501");
-    f.admin_run("GRANT USAGE ON SCHEMA app TO alice");
     f.admin_run("GRANT INSERT ON app.q TO alice");
+    // 表の権限だけでは足りず、SCHEMA の USAGE も要る（Issue #2234）。
+    assert_eq!(f.alice_run(sql), "42501");
+    f.admin_run("GRANT USAGE ON SCHEMA app TO alice");
     let r = f.alice_run(sql);
     assert_eq!(r, "ok");
 }
@@ -327,4 +329,190 @@ fn qualified_target_is_checked_under_its_resolved_key() {
 fn missing_table_still_reports_42p01_before_privilege() {
     let f = fx("dmlpriv-missing");
     assert_eq!(f.alice_run(&ins("nope", 1, "m1")), "42P01");
+}
+
+#[test]
+fn quoted_only_table_with_alias_is_checked_as_a_relation() {
+    // 実表 `"only"` を別名 `ca` で読む文は、別名と同名の表 `ca` の権限では通らない（`ONLY` を構文語と
+    // 誤認して検査対象から落とさない。Issue #1968 のレビュー指摘）。
+    let f = fx("dmlpriv-only");
+    f.admin_run("CREATE TABLE \"only\" (k BIGINT PRIMARY KEY)");
+    f.admin_run("GRANT SELECT ON ca TO alice");
+    assert_eq!(f.alice_run("SELECT k FROM \"only\" ca LIMIT 5"), "42501");
+    f.admin_run("GRANT SELECT ON \"only\" TO alice");
+    assert_ne!(f.alice_run("SELECT k FROM \"only\" ca LIMIT 5"), "42501");
+}
+
+/// 明示 Tx を BEGIN したあとで別セッションが `drop_sql` を実行し、その Tx で `sql` を流した結果の SQLSTATE。
+/// 主体は `ddl` が真なら運用者権限つき（権限検査を通る基準）、偽なら権限の無い束縛ロール。ケースごとに
+/// 新しい DB を使うので、事前に作る表・付与は `setup` で渡す。
+fn code_after_concurrent_drop(
+    label: &str,
+    ddl: bool,
+    setup: &[&str],
+    drop_sql: &str,
+    sql: &str,
+) -> String {
+    let f = fx(label);
+    for stmt in setup {
+        f.admin_run(stmt);
+    }
+    let mut s = bound(if ddl { f.admin } else { f.alice }, ddl);
+    let mut txn = f.core.new_session_transaction();
+    f.core
+        .execute_sql_in_txn(&ctx(), &mut s, &mut txn, "BEGIN")
+        .expect("begin");
+    f.admin_run(drop_sql);
+    let c = code(f.core.execute_sql_in_txn(&ctx(), &mut s, &mut txn, sql));
+    let _ = f
+        .core
+        .execute_sql_in_txn(&ctx(), &mut s, &mut txn, "ROLLBACK");
+    c
+}
+
+/// BEGIN 後に別セッションが書き込み先を DROP しても、権限の無い主体は書き込めない。書き込み文は
+/// 最新カタログで検証されるため `42P01` で止まる（権限検査より前の解析段。運用者権限の主体でも同じ
+/// 応答で、権限検査が省略されているわけではない）。いずれも行は変化しない（Issue #1968 の指摘対応）。
+#[test]
+fn explicit_txn_dml_is_denied_after_concurrent_drop_of_the_target() {
+    for (i, sql) in [
+        "INSERT INTO ca (id, embedding, n) VALUES (1, '[1.0, 0.0]', 1)",
+        "UPDATE ca SET n = 2 WHERE n > 0",
+        "DELETE FROM ca WHERE n > 0",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let alice = code_after_concurrent_drop(
+            &format!("dmlpriv-cd-t{i}"),
+            false,
+            &[],
+            "DROP TABLE ca",
+            sql,
+        );
+        let admin = code_after_concurrent_drop(
+            &format!("dmlpriv-cd-a{i}"),
+            true,
+            &[],
+            "DROP TABLE ca",
+            sql,
+        );
+        assert_eq!(alice, "42P01", "{sql}");
+        assert_eq!(admin, "42P01", "{sql}");
+    }
+}
+
+/// 実表 `"only"` の SELECT 元（別名 `x`）が、BEGIN 後に別セッションから DROP されても、解析と読み取りは
+/// BEGIN 時のスナップショットで行われる。権限の無い束縛ロールは読めず（`42501`）、運用者権限の主体は
+/// 読める（基準）。解析が実在を確認した relation を必須候補として保持し、スナップショットの ACL で
+/// 権限を確認できなければ拒否する（Issue #1968 の指摘対応）。`INSERT ... SELECT` の読み取り元は
+/// 書き込み文として最新カタログで検証されるため `42P01` で止まる（運用者権限の主体でも同じ）。
+#[test]
+fn explicit_txn_check_keeps_quoted_only_as_required_after_concurrent_drop() {
+    let setup = [
+        "CREATE TABLE \"only\" (k BIGINT PRIMARY KEY, embedding VECTOR(2), n BIGINT)",
+        "GRANT SELECT, INSERT ON ca TO alice",
+    ];
+    let drop_sql = "DROP TABLE \"only\"";
+    let select = "SELECT k FROM \"only\" x LIMIT 5";
+    assert_eq!(
+        code_after_concurrent_drop("dmlpriv-only-sel-a", false, &setup, drop_sql, select),
+        "42501"
+    );
+    assert_eq!(
+        code_after_concurrent_drop("dmlpriv-only-sel-o", true, &setup, drop_sql, select),
+        "ok"
+    );
+    let ins_sel = "INSERT INTO ca (id, embedding, n) SELECT k, embedding, n FROM \"only\" x";
+    for (label, ddl) in [("dmlpriv-only-ins-a", false), ("dmlpriv-only-ins-o", true)] {
+        assert_eq!(
+            code_after_concurrent_drop(label, ddl, &setup, drop_sql, ins_sel),
+            "42P01"
+        );
+    }
+}
+
+/// `WITH RECURSIVE` の再帰項の自己参照（CTE 名）は実表の候補に残らない。SELECT 形は SELECT 権限だけで通る。
+/// データ変更 CTE と再帰 CTE の併用は現状 `0A000` で、解析で止まり権限ゲートへ届かない。受理される形に
+/// なった時点で `42501`（再帰項の CTE 名を実表と誤認）にならないことを固定する（収集器の単体テストは
+/// `privilege_gate/read/tests.rs`。Issue #1968 の指摘対応）。
+#[test]
+fn recursive_cte_self_reference_is_not_a_relation_for_dml() {
+    let f = fx("dmlpriv-recursive");
+    f.admin_run("GRANT SELECT, INSERT, DELETE ON ca TO alice");
+    let rec = "t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 3)";
+    assert_eq!(
+        f.alice_run(&format!("WITH RECURSIVE {rec} SELECT n FROM t")),
+        "ok"
+    );
+    for sql in [
+        format!(
+            "WITH RECURSIVE d AS (DELETE FROM ca WHERE n > 100 RETURNING id), {rec} SELECT n FROM t"
+        ),
+        format!(
+            "WITH RECURSIVE {rec}, d AS (INSERT INTO ca (id, embedding, n) \
+             VALUES (1, '[1.0, 0.0]', 1) RETURNING id) SELECT n FROM t"
+        ),
+    ] {
+        assert_ne!(f.alice_run(&sql), "42501", "{sql}");
+    }
+}
+
+/// 書き込み先が読み取り側にも現れる文（自己参照）は、書き込み先の権限に加えて SELECT を要求する。
+/// 実表 `"only"` は文頭が INSERT で別名が続く位置で収集器が構文語として落とすため、名前の出現数の数え引きだと
+/// SELECT 要求が消えて INSERT 権限だけで内側 SELECT を実行できてしまう（Issue #1968 の指摘対応）。
+/// 通常名・引用付き `"only"` のどちらも、INSERT だけでは拒否され SELECT を足すと通る。
+#[test]
+fn self_referencing_write_requires_select_on_the_target() {
+    let f = fx("dmlpriv-selfref");
+    f.admin_run("CREATE TABLE \"only\" (k BIGINT PRIMARY KEY)");
+    for (table, sql) in [
+        (
+            "ca",
+            "INSERT INTO ca (id, embedding, n) SELECT id + 100, embedding, n FROM ca LIMIT 5",
+        ),
+        (
+            "\"only\"",
+            "INSERT INTO \"only\" (k) SELECT k + 100 FROM \"only\" x LIMIT 5",
+        ),
+        (
+            "\"only\"",
+            "INSERT INTO \"only\" (k) SELECT x.k + 100 FROM \"only\" AS x LIMIT 5",
+        ),
+    ] {
+        f.admin_run(&format!("GRANT INSERT ON {table} TO alice"));
+        assert_eq!(f.alice_run(sql), "42501", "{sql}");
+        f.admin_run(&format!("GRANT SELECT ON {table} TO alice"));
+        assert_ne!(f.alice_run(sql), "42501", "{sql}");
+        f.admin_run(&format!("REVOKE ALL ON {table} FROM alice"));
+    }
+    // UPDATE ... FROM・DELETE ... USING・サブクエリの自己参照も、書き込みの権限だけでは通らない。
+    for (table, grant, sql) in [
+        (
+            "ca",
+            "UPDATE",
+            "UPDATE ca SET n = c.n FROM ca c WHERE ca.id = c.id",
+        ),
+        (
+            "ca",
+            "DELETE",
+            "DELETE FROM ca USING ca c WHERE ca.id = c.id",
+        ),
+        (
+            "ca",
+            "DELETE",
+            "DELETE FROM ca WHERE n IN (SELECT n FROM ca LIMIT 5)",
+        ),
+        (
+            "\"only\"",
+            "DELETE",
+            "DELETE FROM \"only\" WHERE k IN (SELECT k FROM \"only\" x LIMIT 5)",
+        ),
+    ] {
+        f.admin_run(&format!("GRANT {grant} ON {table} TO alice"));
+        assert_eq!(f.alice_run(sql), "42501", "{sql}");
+        f.admin_run(&format!("GRANT SELECT ON {table} TO alice"));
+        assert_ne!(f.alice_run(sql), "42501", "{sql}");
+        f.admin_run(&format!("REVOKE ALL ON {table} FROM alice"));
+    }
 }

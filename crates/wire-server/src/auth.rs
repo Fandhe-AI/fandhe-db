@@ -12,6 +12,7 @@ pub mod blake2b;
 pub use engine::crypto::hmac_sha256;
 pub mod role_connections;
 pub mod scram;
+pub(crate) mod users_file_role;
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;

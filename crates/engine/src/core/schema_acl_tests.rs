@@ -87,9 +87,8 @@ fn fixture(tag: &str) -> (EngineCore, CleanupGuard, SessionState, SessionState) 
         &mut o,
         "CREATE TABLE s.t (id BIGINT PRIMARY KEY, name TEXT)",
     );
-    // 表単位の SELECT（Issue #1969 で SQL の読み取りにも要る）を PUBLIC に付け、SCHEMA の USAGE だけを
-    // 検査対象に保つ。
-    ok(&core, "t1", &mut o, "GRANT SELECT ON s.t TO PUBLIC");
+    // 表単位の SELECT 権限は付与済みにして、USAGE 検査だけを分離して試す（Issue #1967 の読み取りゲート）。
+    ok(&core, "t1", &mut o, "GRANT SELECT ON s.t TO alice");
     (core, g, o, bound(alice, false))
 }
 
@@ -167,8 +166,6 @@ fn other_tenant_schema_is_indistinguishable_from_missing() {
 #[test]
 fn all_tables_in_schema_only_covers_existing_relations() {
     let (core, _g, mut o, _a) = fixture("sacl_all_tables");
-    // fixture が付けた PUBLIC の SELECT を外し、ACL ビットを個別の GRANT だけで観測する。
-    ok(&core, "t1", &mut o, "REVOKE SELECT ON s.t FROM PUBLIC");
     ok(
         &core,
         "t1",

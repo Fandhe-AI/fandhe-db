@@ -29,7 +29,7 @@
 //! 修飾名（`pg_temp.<名前>`）の結線は別 Issue へ申し送る（`search_path`〔TABLE-27・Issue #1715〕は実装済みで、
 //! 一時表は path に関わらず先頭で解決する）。
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -179,9 +179,28 @@ impl SessionTempCatalog {
 pub(crate) struct RelationHits {
     temp: Cell<bool>,
     persistent: Cell<bool>,
+    /// parse 中に永続カタログで実在すると確認できた relation 名（表・ビューの照会が肯定で返った名前）。
+    /// 読み取り権限ゲート（`sql::privilege_gate::read`）が、ACL 照会の時点で見つからない名前を
+    /// 「解析後に消えた参照先」として拒否する根拠に使う（重複なし。件数は実在する relation 数で抑えられる）。
+    names: RefCell<Vec<(String, bool)>>,
 }
 
 impl RelationHits {
+    /// 外側の文が直接解決した relation 名の複製（ビューの展開中に引かれた基底表などは含めない）。権限検査の
+    /// 対象はこれだけで、展開中の relation はビュー所有者の権限で読む扱いのため ACL を要求しない。
+    pub(crate) fn recorded_names(&self) -> Vec<String> {
+        self.names
+            .borrow()
+            .iter()
+            .filter(|(_, direct)| *direct)
+            .map(|(n, _)| n.clone())
+            .collect()
+    }
+
+    pub(crate) fn names_cell(&self) -> &RefCell<Vec<(String, bool)>> {
+        &self.names
+    }
+
     pub(crate) fn temp_hit(&self) -> bool {
         self.temp.get()
     }
@@ -209,6 +228,9 @@ pub(crate) struct SessionRelationLookup<'a, L: TableLookup + ?Sized> {
     temp: &'a SessionTempCatalog,
     hit: &'a Cell<bool>,
     persistent_hit: Option<&'a Cell<bool>>,
+    names: Option<&'a RefCell<Vec<(String, bool)>>>,
+    /// ビューの展開中の深さ（0 が外側の文の直接参照）。
+    expansion_depth: Cell<usize>,
 }
 
 impl<'a, L: TableLookup + ?Sized> SessionRelationLookup<'a, L> {
@@ -218,6 +240,8 @@ impl<'a, L: TableLookup + ?Sized> SessionRelationLookup<'a, L> {
             temp,
             hit,
             persistent_hit: None,
+            names: None,
+            expansion_depth: Cell::new(0),
         }
     }
 
@@ -228,9 +252,25 @@ impl<'a, L: TableLookup + ?Sized> SessionRelationLookup<'a, L> {
         self
     }
 
-    fn note_persistent(&self) {
+    /// 永続の関係の名前の記録先を指定する（権限ゲートの「解析後に消えた参照先」検出用）。
+    #[must_use]
+    pub(crate) fn with_recorded_names(mut self, names: &'a RefCell<Vec<(String, bool)>>) -> Self {
+        self.names = Some(names);
+        self
+    }
+
+    fn note_persistent(&self, name: &str) {
         if let Some(cell) = self.persistent_hit {
             cell.set(true);
+        }
+        if let Some(names) = self.names {
+            let direct = self.expansion_depth.get() == 0;
+            let mut v = names.borrow_mut();
+            match v.iter_mut().find(|(n, _)| n == name) {
+                // 直接参照でも引かれた名前は、展開中にも引かれていても直接参照として扱う。
+                Some(entry) => entry.1 |= direct,
+                None => v.push((name.to_string(), direct)),
+            }
         }
     }
 
@@ -248,7 +288,7 @@ impl<L: TableLookup + ?Sized> TableLookup for SessionRelationLookup<'_, L> {
         }
         let exists = self.inner.table_exists(name)?;
         if exists {
-            self.note_persistent();
+            self.note_persistent(name);
         }
         Ok(exists)
     }
@@ -267,7 +307,7 @@ impl<L: TableLookup + ?Sized> TableLookup for SessionRelationLookup<'_, L> {
             // 同名の永続表を指していると一時表に解決されうるため、ビューに当たった時点で
             // 「永続の関係に当たった」と記録し、本文が一時表を引いた場合は混在として拒否させる
             // （永続ビューが一時表を読む fail-open を作らない）。
-            self.note_persistent();
+            self.note_persistent(name);
         }
         Ok(view)
     }
@@ -278,7 +318,7 @@ impl<L: TableLookup + ?Sized> TableLookup for SessionRelationLookup<'_, L> {
         }
         let columns = self.inner.table_columns(name)?;
         if columns.is_some() {
-            self.note_persistent();
+            self.note_persistent(name);
         }
         Ok(columns)
     }
@@ -289,7 +329,7 @@ impl<L: TableLookup + ?Sized> TableLookup for SessionRelationLookup<'_, L> {
         }
         let columns = self.inner.table_star_columns(name)?;
         if columns.is_some() {
-            self.note_persistent();
+            self.note_persistent(name);
         }
         Ok(columns)
     }
@@ -300,7 +340,7 @@ impl<L: TableLookup + ?Sized> TableLookup for SessionRelationLookup<'_, L> {
         }
         let allocated = self.inner.table_is_allocated(name)?;
         if allocated {
-            self.note_persistent();
+            self.note_persistent(name);
         }
         Ok(allocated)
     }
@@ -330,6 +370,18 @@ impl<L: TableLookup + ?Sized> TableLookup for SessionRelationLookup<'_, L> {
         self.inner.buffered_depth()
     }
 
+    fn enter_view_expansion(&self) {
+        self.expansion_depth
+            .set(self.expansion_depth.get().saturating_add(1));
+        self.inner.enter_view_expansion();
+    }
+
+    fn leave_view_expansion(&self) {
+        self.expansion_depth
+            .set(self.expansion_depth.get().saturating_sub(1));
+        self.inner.leave_view_expansion();
+    }
+
     fn materialized_view_columns(
         &self,
         name: &str,
@@ -338,7 +390,13 @@ impl<L: TableLookup + ?Sized> TableLookup for SessionRelationLookup<'_, L> {
             // 一時表は同名の永続 matview を隠す。
             return Ok(None);
         }
-        self.inner.materialized_view_columns(name)
+        let columns = self.inner.materialized_view_columns(name)?;
+        if columns.is_some() {
+            // matview も表・ビューと同じく実在を確認した参照先として記録する（Parse 後に DROP された
+            // matview を権限ゲートが「誤分類」として読み飛ばさない。Issue #1967）。
+            self.note_persistent(name);
+        }
+        Ok(columns)
     }
 }
 

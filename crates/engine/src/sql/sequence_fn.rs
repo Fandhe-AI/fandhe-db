@@ -10,7 +10,12 @@
 //! テナント境界（P0）: `setval` が書くのは呼び出し元テナントの状態行だけで、他テナントの採番へ
 //! 影響しない（TABLE-24 (2)）。`lastval`・`currval` はテナント込みのキーで引く。エラー文言に
 //! 値・テナント・他テナントの存在情報を含めない。`setval` は DDL 権限ゲートをかけない
-//! （PostgreSQL でも UPDATE 権限相当で、作用範囲が自テナントに閉じるため。判断は設計記録 §10）。
+//! （作用範囲が自テナントに閉じるため。判断は設計記録 §10）。
+//!
+//! SEQUENCE 単位の権限（Issue #2235。`role-privilege-model.md` S1・S2・S4）: ACL で判定すべき主体
+//! （`schema_privilege::acl_checked_principal`。未束縛・所有者相当は免除）は、`setval` が UPDATE、
+//! `lastval` が USAGE か SELECT を要求する。名前の解決（不在 `42P01`）が先、権限（`42501`）が後、
+//! 値域（`22003`）はその後。拒否は副作用の前に返る。
 //!
 //! 永続化の契約: autocommit は自前の書き込み txn で状態行を書き、commit 成功後にメモリ上の現在値を
 //! 反映する。トランザクション内は共有 write txn に書いて即時にメモリへ反映する（ROLLBACK しても
@@ -65,6 +70,7 @@ fn map_setval_error(e: SetvalError, poisoned: bool) -> SqlSurfaceError {
             crate::sql::ddl::map_sequence_error(c, "setval failed")
         }
         SetvalError::Alloc(_) => internal("sequence allocator unavailable"),
+        SetvalError::PermissionDenied => SqlSurfaceError::InsufficientPrivilege,
     }
 }
 
@@ -126,6 +132,7 @@ pub(crate) fn execute_autocommit(
                 name,
                 value: *value,
                 is_called: *is_called,
+                acl_role: crate::sql::schema_privilege::acl_checked_principal(session),
             };
             let id = storage
                 .set_sequence_value(
@@ -141,9 +148,13 @@ pub(crate) fn execute_autocommit(
             }
             Ok(result(f, *value))
         }
-        SequenceFnKind::Lastval => {
-            lastval(session, tenant_id, f, |id| storage.sequence_id_exists(id))
-        }
+        SequenceFnKind::Lastval => lastval(
+            session,
+            tenant_id,
+            f,
+            |id| storage.sequence_id_exists(id),
+            |id, role| storage.sequence_privileges(tenant_id, id, &[role]),
+        ),
     }
 }
 
@@ -168,6 +179,7 @@ pub(crate) fn execute_in_txn(
                 name,
                 value: *value,
                 is_called: *is_called,
+                acl_role: crate::sql::schema_privilege::acl_checked_principal(session),
             };
             let id = crate::catalog::sequence::setval_in_txn(
                 storage.sequence_allocator(),
@@ -184,9 +196,20 @@ pub(crate) fn execute_in_txn(
             Ok((result(f, *value), true))
         }
         SequenceFnKind::Lastval => {
-            let r = lastval(session, tenant_id, f, |id| {
-                crate::catalog::sequence::sequence_id_exists_in(write_txn, id)
-            })?;
+            let r = lastval(
+                session,
+                tenant_id,
+                f,
+                |id| crate::catalog::sequence::sequence_id_exists_in(write_txn, id),
+                |id, role| {
+                    crate::catalog::privilege::sequence_privileges_in_txn(
+                        write_txn,
+                        tenant_id,
+                        id,
+                        &[role],
+                    )
+                },
+            )?;
             Ok((r, false))
         }
     }
@@ -200,6 +223,7 @@ fn lastval(
     tenant_id: &str,
     f: &ValidatedSequenceFunction,
     exists: impl FnOnce(u64) -> Result<bool, CatalogError>,
+    privileges: impl Fn(u64, u64) -> Result<u16, CatalogError>,
 ) -> Result<QueryResult, SqlSurfaceError> {
     let handle = session.sequences_handle();
     let target = handle
@@ -217,5 +241,14 @@ fn lastval(
             .forget(tenant_id, id);
         return Err(SqlSurfaceError::LastvalNotYetDefined);
     }
+    // 権限検査は対象が決まり存在が確認された後（USAGE か SELECT。Issue #2235）。読み取り失敗は拒否側。
+    crate::sql::object_privilege::check_any_of(
+        crate::sql::schema_privilege::acl_checked_principal(session),
+        crate::catalog::privilege::PRIV_USAGE | crate::catalog::privilege::PRIV_SELECT,
+        &|role| {
+            privileges(id, role)
+                .map_err(|e| crate::sql::ddl::map_sequence_error(e, "lastval failed"))
+        },
+    )?;
     Ok(result(f, value))
 }

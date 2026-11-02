@@ -1,6 +1,6 @@
 //! 書き込み系の文（INSERT／UPDATE／DELETE／UPSERT／TRUNCATE とそのビュー・データ変更 CTE・
 //! `EXPLAIN ... PARTITIONED`）の表単位権限検査（SQL-40・RLS-12・SQL-19・SQL-22 ポインタ。Issue #1968。
-//! 設計は `docs/design/role-privilege-model.md` §13、経路一覧は `docs/design/privilege-check-paths.md`）。
+//! 設計は `docs/design/role-privilege-model.md` §17、経路一覧は `docs/design/privilege-check-paths.md`）。
 //!
 //! 役割: 検証済みの文から「書き込み先 relation とその必要ビット」を分類し（[`classify_write`]）、文が参照する
 //! 読み取り側の relation（INSERT ... SELECT の元・UPDATE ... FROM・サブクエリ等）に SELECT を課して、
@@ -35,7 +35,7 @@ use crate::sql::relation_name::SchemaResolver;
 use crate::storage::read_source::ReadSource;
 use crate::storage::Storage;
 
-use super::read::require_relations_bits;
+use super::read::{gate_relation_names, require_relations_bits, ParsedScope};
 use super::{check, Principal, PrivilegeTarget};
 
 /// 文の書き込み側の要求。`targets` は書き込み先 relation（キー）と必要ビット。文が参照する他の relation
@@ -252,6 +252,7 @@ pub(crate) fn classify_write(parsed: &ParsedSql) -> WriteRequirement {
         | ParsedSql::CreateSchema(_)
         | ParsedSql::DropSchema(_)
         | ParsedSql::AlterSchema(_)
+        | ParsedSql::AlterOwner(_)
         | ParsedSql::AlterSequence(_)
         | ParsedSql::SequenceFunction(_) => na(),
     }
@@ -282,6 +283,7 @@ fn check_unlooked(principal: &Principal, req: &WriteRequirement) -> Result<(), S
             granted_bits: 0,
         },
     )
+    .map(|_| ())
 }
 
 /// 文の書き込み先と参照先に必要な権限があるかを判定する（権限不足は `42501`）。`tokens` は構文解析へ
@@ -294,6 +296,7 @@ pub(crate) fn require_write_privileges(
     tokens: &[Token],
     resolver: Option<SchemaResolver<'_>>,
     parsed: &ParsedSql,
+    scope: ParsedScope<'_>,
 ) -> Result<(), SqlSurfaceError> {
     let req = classify_write(parsed);
     if req.is_not_applicable() {
@@ -305,8 +308,7 @@ pub(crate) fn require_write_privileges(
     }
     let mut resolved = tokens.to_vec();
     crate::sql::relation_name::rewrite_relation_names_full(&mut resolved, resolver)?;
-    let candidates = crate::sql::search_path::resolved_relation_ref_names(&resolved);
-    require_relations_bits(storage, tenant, &principal, &build_wants(&req, &candidates))
+    require_with_scope(storage, tenant, &principal, &req, &resolved, scope)
 }
 
 /// [`require_write_privileges`] の、名前解決済みのトークン列を受け取る版（拡張クエリの Parse・Bind・
@@ -317,6 +319,7 @@ pub(crate) fn require_write_privileges_resolved(
     session: &SessionState,
     resolved_tokens: &[Token],
     parsed: &ParsedSql,
+    scope: ParsedScope<'_>,
 ) -> Result<(), SqlSurfaceError> {
     let req = classify_write(parsed);
     if req.is_not_applicable() {
@@ -326,8 +329,67 @@ pub(crate) fn require_write_privileges_resolved(
     if !principal.needs_acl_lookup() {
         return check_unlooked(&principal, &req);
     }
-    let candidates = crate::sql::search_path::resolved_relation_ref_names(resolved_tokens);
-    require_relations_bits(storage, tenant, &principal, &build_wants(&req, &candidates))
+    require_with_scope(storage, tenant, &principal, &req, resolved_tokens, scope)
+}
+
+/// 候補（収集器の候補 ∪ 解析が直接解決した名前）から必要ビットを組み立てて ACL を照会する共通部。
+/// 書き込み先は解析が実在を確認した名前として扱い、照会の時点で見つからなければ拒否する（fail-closed。
+/// BEGIN 後の DROP でスナップショットの行を権限なしで書かせない）。
+fn require_with_scope(
+    storage: &Storage,
+    tenant: &str,
+    principal: &Principal,
+    req: &WriteRequirement,
+    resolved_tokens: &[Token],
+    scope: ParsedScope<'_>,
+) -> Result<(), SqlSurfaceError> {
+    let candidates = gate_relation_names(resolved_tokens, scope.parsed_relations);
+    let mut parsed_relations = scope.parsed_relations.to_vec();
+    for (t, _) in &req.targets {
+        if !parsed_relations.contains(t) {
+            parsed_relations.push(t.clone());
+        }
+    }
+    let mut wants = build_wants(req, &candidates);
+    // 書き込み先が読み取り側にも現れる文（自己参照の `INSERT ... SELECT`・`UPDATE ... FROM`・
+    // `DELETE ... USING`・サブクエリ）は、収集器の候補の数え引きに頼らず SELECT を必ず要求する。
+    for name in self_read_targets(req, resolved_tokens) {
+        wants.push((name, PRIV_SELECT));
+    }
+    require_relations_bits(
+        storage,
+        tenant,
+        principal,
+        &wants,
+        scope.read_snap,
+        &parsed_relations,
+    )
+}
+
+/// 書き込み先 relation のうち、トークン列に「書き込み先の宣言として必要な回数」を超えて名前が現れるもの。
+/// 超過した出現は読み取り側（SELECT 元・FROM／USING・サブクエリ）にある自己参照であり、読み取りには
+/// SELECT が要る。収集器は `"only"` のような構文語と同名の実表を、文頭が INSERT 等で別名が続く位置で
+/// 構文語として落とし、解析の記録（重複なし）も書き込み先と同名なら 1 件に畳まれるため、候補の数え引きでは
+/// 自己参照を見落とす。ここは生のトークンを数えるので、収集器の除外規則に左右されない。大文字小文字は
+/// 区別せず（引用の有無はトークンに残らない）、同名の別名・列名と重なる場合は拒否側（SELECT 要求）へ
+/// 倒れる。TRUNCATE のように読み取りを持たない文（必要ビットが TRUNCATE のみ）は対象外。
+fn self_read_targets(req: &WriteRequirement, tokens: &[Token]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (name, bits) in &req.targets {
+        if *bits == PRIV_TRUNCATE || out.contains(name) {
+            continue;
+        }
+        let declared = req.targets.iter().filter(|(n, _)| n == name).count();
+        let seen = tokens
+            .iter()
+            .filter_map(crate::sql::relation_name::unqualified_ident_name)
+            .filter(|t| t.eq_ignore_ascii_case(name))
+            .count();
+        if seen > declared {
+            out.push(name.clone());
+        }
+    }
+    out
 }
 
 /// 表名を直接受け取る入口（HTTP 表層の bound 書き込み API。Issue #1969）用。`table` は解決済みの relation
@@ -348,13 +410,18 @@ pub(crate) fn require_table_write(
                 required_bits,
                 granted_bits: 0,
             },
-        );
+        )
+        .map(|_| ());
     }
+    // 呼び出し元が名前解決（`42P01`）を済ませた表なので、照会で見つからなければ解決後に DROP された
+    // ものとして拒否する（fail-closed。DML の書き込み先と同じ規則）。
     require_relations_bits(
         storage,
         tenant,
         &principal,
         &[(table.to_string(), required_bits)],
+        None,
+        &[table.to_string()],
     )
 }
 
@@ -390,8 +457,9 @@ impl RelationPrivilegeRecheck {
     pub(crate) fn check_in_txn<R: ReadSource>(&self, src: &R, tables: &[String]) -> Result<(), ()> {
         let bits =
             relation_grant_bits_in_txn(src, &self.tenant, tables, self.role_id).map_err(|_| ())?;
+        // ACL を解決できない表（`None`）は権限を確認できないので拒否する（fail-closed。parse 時の
+        // `require_relations_bits` と同じ扱い）。
         for granted in bits {
-            // 引けない relation（不在・不正キー）は権限を確認できないので拒否する（fail-closed）。
             let Some(granted) = granted else {
                 return Err(());
             };

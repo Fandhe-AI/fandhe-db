@@ -75,9 +75,21 @@ fn facades_agree_with_gate() {
 
 #[test]
 fn privilege_table_is_total_and_unique() {
-    assert_eq!(DdlStatementKind::ALL.len(), 28);
+    assert_eq!(DdlStatementKind::ALL.len(), 29);
     for (i, a) in DdlStatementKind::ALL.iter().enumerate() {
-        assert_eq!(a.required_privilege(), RequiredPrivilege::ServerDdl);
+        let owner_capable = matches!(
+            a,
+            DdlStatementKind::DropSchema
+                | DdlStatementKind::AlterSchema
+                | DdlStatementKind::DropFunction
+                | DdlStatementKind::AlterOwner
+        );
+        let expected = if owner_capable {
+            RequiredPrivilege::ServerDdlOrOwner
+        } else {
+            RequiredPrivilege::ServerDdl
+        };
+        assert_eq!(a.required_privilege(), expected, "{a:?}");
         for b in &DdlStatementKind::ALL[i + 1..] {
             assert_ne!(a, b);
         }
@@ -113,7 +125,7 @@ fn denial_message_is_fixed_and_has_no_detail() {
     s.bind_role_ids(4242, 4242);
     let e = require_ddl(&s, DdlStatementKind::DropTable).expect_err("denied");
     assert_eq!(format!("{e:?}"), "InsufficientPrivilege");
-    assert_eq!(e.client_message(), "permission denied for DDL statement");
+    assert_eq!(e.client_message(), "permission denied");
 }
 
 // --- オブジェクト権限（#1967）-------------------------------------------------------------------
@@ -130,6 +142,7 @@ fn rel(
             granted_bits,
         },
     )
+    .map(|_| ())
 }
 
 #[test]
@@ -162,4 +175,71 @@ fn object_privilege_decision_table() {
     let p = Principal::from_session(&owner);
     assert!(!p.needs_acl_lookup());
     assert!(rel(&p, PRIV_SELECT, 0).is_ok());
+}
+
+#[test]
+fn owner_capable_kinds_defer_to_owner_check_for_bound_roles_only() {
+    let kinds = [
+        DdlStatementKind::DropSchema,
+        DdlStatementKind::AlterSchema,
+        DdlStatementKind::DropFunction,
+        DdlStatementKind::AlterOwner,
+    ];
+    for k in kinds {
+        // 運用者権限は所有者検査なしで許可。
+        assert_eq!(
+            require_ddl_or_owner(&allowed(), k).ok(),
+            Some(GateDecision::Allowed)
+        );
+        // 束縛ロールだけなら所有者検査を要求する（ゲート単体では許可しない）。
+        let mut s = SessionState::default();
+        s.bind_role_ids(7, 7);
+        assert_eq!(
+            require_ddl_or_owner(&s, k).ok(),
+            Some(GateDecision::OwnerCheckRequired(7))
+        );
+        assert!(is_denied(require_ddl(&s, k)), "{k:?}");
+        // 未束縛・PUBLIC（0）はカタログを引く前に 42501。
+        assert!(is_denied(
+            require_ddl_or_owner(&SessionState::default(), k).map(|_| ())
+        ));
+        let mut zero = SessionState::default();
+        zero.bind_role_ids(0, 0);
+        assert!(is_denied(require_ddl_or_owner(&zero, k).map(|_| ())));
+    }
+}
+
+/// 構文解析が実在を確認した参照先（ビュー展開前のビュー自身を含む）が ACL 照会の時点で見つからない
+/// ときは、通常 SQL でも検査を省略せず拒否する（解析後に別セッションが DROP した競合。Issue #1967）。
+/// 解析で実在を確認できなかった名前（構文語・別名などの誤分類）だけを読み飛ばす。
+#[test]
+fn relation_missing_at_acl_lookup_is_rejected_when_parser_confirmed_it() {
+    use crate::catalog::privilege::PRIV_SELECT;
+    let path = std::env::temp_dir().join(format!(
+        "gate-missing-{}-{:?}.redb",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let storage = crate::storage::Storage::open(&path).expect("open storage");
+    let mut s = SessionState::default();
+    s.bind_role_ids(1, 1);
+    let principal = Principal::from_session(&s);
+    let names = vec!["dropped_view".to_string()];
+    let run = |parsed: &[String]| {
+        read::require_relations(
+            &storage,
+            "t1",
+            &principal,
+            PRIV_SELECT,
+            &names,
+            None,
+            parsed,
+        )
+    };
+    // 解析が確認していない名前は読み飛ばす（誤分類された識別子）。
+    assert!(run(&[]).is_ok());
+    // 解析が確認した名前が消えていれば、存在情報を示さない固定の `42P01` で拒否する。
+    let err = run(&names).expect_err("must reject");
+    assert_eq!(err.wire_code(), "42P01");
+    let _ = std::fs::remove_file(&path);
 }

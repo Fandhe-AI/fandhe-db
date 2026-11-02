@@ -1,5 +1,5 @@
 //! `COPY` と HTTP（NoSQL）表層の bound 書き込み API の表単位権限検査（SQL-40・NOSQL-2 ポインタ。
-//! Issue #1969。設計は `docs/design/role-privilege-model.md` §14、経路一覧は
+//! Issue #1969。設計は `docs/design/role-privilege-model.md` §18、経路一覧は
 //! `docs/design/privilege-check-paths.md`）の結合テスト。
 //!
 //! 現在ロールを束縛したセッション（`SessionState::bind_role_ids`）で、COPY FROM の INSERT・COPY TO の
@@ -588,4 +588,30 @@ fn recheck_denies_missing_relation() {
     .expect("bound principal");
     let r = f.core.begin_read_txn().expect("txn");
     assert!(rc.check_in_txn(&r, &["nosuch".to_string()]).is_err());
+}
+
+/// 明示 Tx の COPY の ACL は `BEGIN` 時点のスナップショットで引く（SELECT・DML ゲートと同じ規則）。
+/// `BEGIN` の後に別セッションが付与した権限は、その Tx の COPY には効かない（最新カタログで引くと、
+/// スナップショット内の他の読み取りと判定が食い違う）。Tx の外の COPY は最新の ACL で通る。
+#[test]
+fn explicit_txn_copy_uses_begin_snapshot_acl() {
+    let f = fx("copypriv-begin-snapshot");
+    let mut s = bound(f.alice, false);
+    let mut txn = f.core.new_session_transaction();
+    f.core
+        .execute_sql_in_txn(&ctx(), &mut s, &mut txn, "BEGIN")
+        .expect("begin");
+    f.admin_run("GRANT INSERT ON ca TO alice");
+    f.admin_run("GRANT SELECT ON ca TO alice");
+    let e = f
+        .core
+        .begin_copy_in_txn(&ctx(), &s, &mut txn, &copy_from("ca", "bs1"))
+        .err()
+        .expect("insert granted after BEGIN is not visible");
+    assert_eq!(e.wire_code(), "42501");
+    f.core
+        .execute_sql_in_txn(&ctx(), &mut s, &mut txn, "ROLLBACK")
+        .expect("rollback");
+    // Tx の外では最新の ACL で通る。
+    assert!(f.begin_from(&s, &copy_from("ca", "bs2")).is_ok());
 }

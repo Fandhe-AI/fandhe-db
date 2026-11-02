@@ -364,6 +364,29 @@ impl EngineCore {
             }
             return Err(crate::sql::temp_catalog::temp_table_unsupported());
         }
+        if hits.persistent_hit() {
+            // 永続の関係を引いた文は、混在の拒否（`0A000`）より前に永続側の読み取り権限を判定する
+            // （SQL-40・Issue #1967。権限の無いロールへ、永続の relation が実在することを `0A000` の有無で
+            // 示さない）。一時表に解決された名前は記録されず、一時表と同名の実表は検査対象にならない。
+            // 束縛済みなのにテナントが分からないセッションは拒否する（fail-closed）。
+            if session.object_privileges_enforced() {
+                let tenant = session
+                    .resolution_tenant()
+                    .ok_or(SqlSurfaceError::InsufficientPrivilege)?;
+                crate::sql::privilege_gate::read::require_read_privileges(
+                    &self.storage,
+                    tenant,
+                    session,
+                    &tokens,
+                    resolver,
+                    crate::sql::privilege_gate::read::classify(&classified),
+                    crate::sql::privilege_gate::read::ParsedScope {
+                        read_snap: None,
+                        parsed_relations: &hits.recorded_names(),
+                    },
+                )?;
+            }
+        }
         if !hits.temp_hit() || hits.persistent_hit() {
             // 一時表の名前が関係として引かれていない（列名との衝突・サブクエリ等）、または
             // 永続の関係と混在している。いずれも一時表を扱えないため拒否する（fail-closed）。
@@ -542,6 +565,7 @@ impl EngineCore {
                 crate::sql::sequence_scope::SequenceScope::enter(
                     Arc::clone(self.storage.sequence_allocator()),
                     session.sequences_handle(),
+                    crate::sql::schema_privilege::acl_checked_principal(session),
                 )
             });
             let outcome = self.commit_copy_in_txn(ctx, txn, batch)?;
@@ -676,6 +700,7 @@ impl EngineCore {
         session: &SessionState,
         prepared: &super::PreparedSql,
         parsed: &ParsedSql,
+        read_snap: Option<&redb::ReadTransaction>,
     ) -> Result<(), SqlSurfaceError> {
         if !session.object_privileges_enforced() || matches!(prepared.route, PreparedRoute::Temp(_))
         {
@@ -684,12 +709,17 @@ impl EngineCore {
         let tenant = session
             .resolution_tenant()
             .ok_or(SqlSurfaceError::InsufficientPrivilege)?;
+        let scope = crate::sql::privilege_gate::read::ParsedScope {
+            read_snap: Self::acl_snapshot_for(parsed, read_snap),
+            parsed_relations: &prepared.parsed_relations,
+        };
         crate::sql::privilege_gate::read::require_read_privileges_resolved(
             &self.storage,
             tenant,
             session,
             &prepared.tokens,
             crate::sql::privilege_gate::read::classify(parsed),
+            scope,
         )?;
         // SQL-40・Issue #1969: `COPY` は Parse・Bind・Describe でも判定する（権限の無い主体に列の型情報を
         // 返さない）。Execute は `begin_copy*` が判定する。
@@ -700,6 +730,7 @@ impl EngineCore {
                 session,
                 vc.statement(),
                 &prepared.tokens,
+                scope.read_snap,
             );
         }
         // SQL-40・Issue #1968: 書き込み系の文（INSERT／UPDATE／DELETE／TRUNCATE 等）も同じ入口で判定する。
@@ -709,20 +740,8 @@ impl EngineCore {
             session,
             &prepared.tokens,
             parsed,
+            scope,
         )
-    }
-
-    /// 拡張クエリの Execute 直前の権限再検査（SQL-40・Issue #1969）。portal が Bind 元として保持する
-    /// `prepared` と、Bind が返した文（`parsed`。振り分けの包みは外した形）を、現在の主体（`SET ROLE`
-    /// 後を含む）と最新の ACL で判定する。wire-server が最初の Execute の副作用より前に呼ぶ。
-    /// 判定そのものは Bind と同じ [`Self::require_prepared_read_privileges`]（権限不足は `42501`）。
-    pub fn recheck_portal_privileges(
-        &self,
-        session: &SessionState,
-        prepared: &super::PreparedSql,
-        parsed: &ParsedSql,
-    ) -> Result<(), SqlSurfaceError> {
-        self.require_prepared_read_privileges(session, prepared, parsed)
     }
 
     /// [`Self::parse_sql_prepared_with_declared`] のセッション対応版（拡張クエリの Parse。TABLE-44・
@@ -737,8 +756,9 @@ impl EngineCore {
     ) -> Result<super::PreparedSql, SqlSurfaceError> {
         let result = self.parse_sql_prepared_in_session_inner(session, sql, declared);
         // TABLE-27・Issue #1715: `public` が見えない `search_path` のセッションは、一時表以外の未修飾の
-        // テーブル参照を `42P01` にする。判定順は構文エラー `42601` → 参照ゲート → その他の検証エラー。
-        // 既定の path のセッションは何も足さない。
+        // テーブル参照を `42P01` にする。判定順は構文エラー `42601` → 参照ゲート → 権限 → その他の検証エラー。
+        // 既定の path のセッションは何も足さない。権限検査より前に行うのは、権限の無いロールへ `42501` で
+        // 非可視の表の存在を漏らさないため。
         if session.search_path_hides_public()
             && !matches!(&result, Err(e) if e.wire_code() == "42601")
         {
@@ -747,12 +767,10 @@ impl EngineCore {
             }
         }
         // SQL-40・Issue #1967: 構文・名前解決に成功した文だけを権限検査する（`42601` → `42P01` → `42501`）。
-        // 権限検査は `search_path` の参照ゲートより後に行い、public を隠したロールに対して表の存在が
-        // `42501`／`42P01` の差として漏れないようにする。Describe 前の Parse の時点でも拒否する
-        // （権限の無い主体に列の型情報を返さない。PostgreSQL は Parse では検査しない意図的な差で、
-        // Bind で再検査する）。
+        // Describe 前の Parse の時点でも拒否する（権限の無い主体に列の型情報を返さない。PostgreSQL は
+        // Parse では検査しない意図的な差で、Bind で再検査する）。
         if let Ok(prepared) = &result {
-            self.require_prepared_read_privileges(session, prepared, &prepared.dummy_parsed)?;
+            self.require_prepared_read_privileges(session, prepared, &prepared.dummy_parsed, None)?;
         }
         result
     }
@@ -885,6 +903,106 @@ impl EngineCore {
         self.bind_prepared_in_session_snap(session, prepared, values, read_snap)
     }
 
+    /// portal の Execute 直前の読み取り権限の再検査（SQL-40・Issue #1967）。拡張クエリの Execute が、
+    /// 結果を初めて具体化する前に、Bind 後の `REVOKE` や別 portal の `SET ROLE` を反映するため、
+    /// 現在の主体と実行時のカタログ（明示 Tx では `BEGIN` 時のスナップショット）で参照先を判定し直す。
+    /// `parsed` は portal が保持する文（振り分けの包みは外して分類する）。未束縛のセッションと一時表の
+    /// 経路は何もしない。
+    pub fn recheck_prepared_read_privileges_in_txn(
+        &self,
+        session: &SessionState,
+        txn: &crate::sql::transaction::SessionTransaction<'_>,
+        prepared: &super::PreparedSql,
+        parsed: &ParsedSql,
+    ) -> Result<(), SqlSurfaceError> {
+        let read_snap = if txn.status() == crate::sql::transaction::TransactionStatus::InTransaction
+        {
+            match txn.read_source()? {
+                crate::sql::transaction::TxnReadSource::BeginSnapshot(snap) => Some(snap),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        self.require_prepared_read_privileges(
+            session,
+            prepared,
+            parsed.peel_session_route(),
+            read_snap,
+        )
+    }
+
+    /// 準備済み文の参照先（文に直接現れる表・ビュー・matview）の同一性を、実行時のカタログ（明示 Tx では
+    /// `BEGIN` 時のスナップショット）で引く（Issue #1967）。Bind は Bind 前後で取り直して一致を確かめ、portal に
+    /// 保持し、Execute は [`Self::check_prepared_relation_identity`] で照合する。現在ロール未束縛のセッションと
+    /// 一時表の経路は空（検査不要）を返す。
+    pub fn prepared_relation_identity_in_txn(
+        &self,
+        session: &SessionState,
+        txn: &crate::sql::transaction::SessionTransaction<'_>,
+        prepared: &super::PreparedSql,
+    ) -> Result<PreparedRelationIdentity, SqlSurfaceError> {
+        if !session.object_privileges_enforced() || matches!(prepared.route, PreparedRoute::Temp(_))
+        {
+            return Ok(PreparedRelationIdentity::default());
+        }
+        let mut names: Vec<String> = Vec::new();
+        for n in crate::sql::search_path::resolved_relation_ref_names(&prepared.tokens) {
+            if !names.contains(&n) {
+                names.push(n);
+            }
+            if names.len() > crate::sql::privilege_gate::read::MAX_READ_RELATION_REFS {
+                return Err(SqlSurfaceError::payload_too_large(
+                    "too many relation references",
+                ));
+            }
+        }
+        let read_snap = if txn.status() == crate::sql::transaction::TransactionStatus::InTransaction
+        {
+            match txn.read_source()? {
+                crate::sql::transaction::TxnReadSource::BeginSnapshot(snap) => Some(snap),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        // 文に直接現れる名前に加え、解析が直接解決した名前も取る（収集器の取りこぼしに依存しない）。
+        for n in &prepared.parsed_relations {
+            if !names.contains(n) {
+                names.push(n.clone());
+            }
+        }
+        let ids = match read_snap {
+            Some(snap) => crate::catalog::privilege::relation_identity_closure_in_txn(snap, &names),
+            None => self.storage.relation_identities(&names),
+        }
+        .map_err(identity_lookup_error)?;
+        Ok(PreparedRelationIdentity(ids))
+    }
+
+    /// `expected`（Bind 時の同一性）が現在のカタログと一致するかを確かめる。1 つでも違えば（DROP・置換・
+    /// 再作成・定義変更）、実行する本文が Bind 時に展開した古い定義のままなので、失効として拒否する
+    /// （fail-closed。メッセージに名前・他テナントの情報を含めない）。
+    pub fn check_prepared_relation_identity(
+        &self,
+        session: &SessionState,
+        txn: &crate::sql::transaction::SessionTransaction<'_>,
+        prepared: &super::PreparedSql,
+        expected: &PreparedRelationIdentity,
+    ) -> Result<(), SqlSurfaceError> {
+        if !session.object_privileges_enforced() {
+            return Ok(());
+        }
+        let current = self.prepared_relation_identity_in_txn(session, txn, prepared)?;
+        if &current == expected {
+            Ok(())
+        } else {
+            Err(SqlSurfaceError::feature_not_supported(
+                "the relations referenced by this portal changed since it was bound",
+            ))
+        }
+    }
+
     /// 明示トランザクションが writer 取得前（`BEGIN` 時点のスナップショットで読む）か。
     /// wire 層が、Parse 時の解決結果を使い回さず Bind で再検証すべきかの判定に使う（Issue #2403）。
     pub fn txn_reads_begin_snapshot(txn: &crate::sql::transaction::SessionTransaction<'_>) -> bool {
@@ -992,7 +1110,7 @@ impl EngineCore {
                 let parsed = self.bind_prepared_snap(prepared, values, read_snap)?;
                 // SQL-40・Issue #1967: Parse と Execute の間の `REVOKE` を反映するため、束縛済みの
                 // セッションでは Bind のたびに権限を再検査する（副作用の前）。
-                self.require_prepared_read_privileges(session, prepared, &parsed)?;
+                self.require_prepared_read_privileges(session, prepared, &parsed, read_snap)?;
                 // `COPY`（Issue #1760）は Execute で元 SQL を現在のカタログへ再解決する
                 // （`begin_copy_temp`）ため、Bind 後に一時表が作成・削除されると宛先が永続表から
                 // 一時表（または逆）へ化ける。一時カタログの世代つきで包み、Execute 前の
@@ -1271,5 +1389,44 @@ impl EngineCore {
             },
             _ => Err(internal()),
         }
+    }
+}
+
+/// Bind 時点で文が直接参照した relation の同一性（[`EngineCore::prepared_relation_identity_in_txn`]）。
+/// wire-server は portal ごとに保持して Execute 前に照合するだけで、中身は読まない。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PreparedRelationIdentity(Vec<(String, crate::catalog::privilege::RelationIdentity)>);
+
+impl PreparedRelationIdentity {
+    /// 保持している量の見積り（名前と定義のバイト数。portal の接続単位の保持量へ算入する）。
+    pub fn retained_bytes(&self) -> usize {
+        self.0.iter().fold(0usize, |acc, (n, id)| {
+            acc.saturating_add(n.len())
+                .saturating_add(id.retained_bytes())
+        })
+    }
+}
+
+/// 同一性の取得（[`EngineCore::prepared_relation_identity_in_txn`]）で起きたカタログエラーの写像。定義の合計・
+/// 件数の上限超過は他の件数上限と同じ `54000`（内部エラーにしない）、それ以外は表の照会と同じ写像。
+fn identity_lookup_error(e: crate::catalog::CatalogError) -> SqlSurfaceError {
+    match e {
+        crate::catalog::CatalogError::ViewLimitExceeded(_) => {
+            SqlSurfaceError::payload_too_large("referenced relation definitions exceed the limit")
+        }
+        other => crate::catalog::table_lookup_error(other),
+    }
+}
+
+#[cfg(test)]
+mod identity_error_tests {
+    use super::*;
+
+    #[test]
+    fn identity_limit_errors_are_54000_not_internal() {
+        let e = identity_lookup_error(crate::catalog::CatalogError::ViewLimitExceeded(
+            "x".to_string(),
+        ));
+        assert_eq!(e.wire_code(), "54000");
     }
 }

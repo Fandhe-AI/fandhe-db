@@ -6,9 +6,9 @@
 //!
 //! - 本モジュールは構文の解釈と、ほかの句との併用検査、複数句の待機方針の合成（[`RowLocking::writer_wait`]）
 //!   までを担う。ロックの取得（writer の取得・`NOWAIT`・保持期間）は `core::row_lock_exec`（#2230）、
-//!   `SKIP LOCKED` の実行は #2231、`LOCK TABLE` は #1958 の担当で、本モジュールは writer に触れない。
-//!   受理した形は `core::ParsedSql::LockingSelect` まで届き、`SKIP LOCKED` を含む形は writer に触れる前に
-//!   `0A000` で拒否する（ロックを取らずに素の SELECT として実行する fail-open を作らない）。
+//!   `SKIP LOCKED` の実行（#2231）は同モジュールの担当、`LOCK TABLE` は #1958 の担当で、本モジュールは writer に触れない。
+//!   受理した形は `core::ParsedSql::LockingSelect` まで届き、待機方針（[`WriterWait`]）に従って実行段が
+//!   writer を取得する（ロックを取らずに素の SELECT として実行する fail-open を作らない）。
 //! - 呼び出し元は `core::EngineCore::parse_tokens_in`（行数制限句の正規化の後・名前解決の前に
 //!   [`extract_row_locking`] を 1 回だけ呼び、検証済みの文を得た後に [`check_row_locking`] を呼ぶ）。
 //!   `fetch_clause::normalize_statement_tokens` の中には置かない（PL/pgSQL・ビュー本文・
@@ -89,22 +89,34 @@ impl RowLocking {
         &self.clauses
     }
 
-    /// writer 取得の待機方針を合成する（`Ok(true)` は `NOWAIT`、`Ok(false)` は待機あり）。
-    /// どれかの句が `SKIP LOCKED` なら `0A000`（#2231 まで。呼び出し元は writer・ゲートに触れる前に
-    /// 本関数を呼ぶ）、そうでなくどれかが `NOWAIT` なら nowait、それ以外は待機する。
-    pub(crate) fn writer_wait(&self) -> Result<bool, SqlSurfaceError> {
+    /// writer 取得の待機方針を複数句から合成する（SQL-38 (4)・#2231。規則は spec 側を参照）。
+    /// 呼び出し元は writer・ゲートに触れる前に呼ぶ。
+    pub(crate) fn writer_wait(&self) -> WriterWait {
         compose_writer_wait(&self.clauses)
     }
 }
 
+/// writer 取得の待機方針（行ロック句の合成結果。SQL-38 (4)・Issue #2231）。
+/// `core::row_lock_exec`（実行段）と複数文メッセージの暗黙 Tx 開始（`core.rs`）が参照する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WriterWait {
+    /// 待機あり。
+    Block,
+    /// `NOWAIT`。
+    NoWait,
+    /// `SKIP LOCKED`。
+    SkipLocked,
+}
+
 /// [`RowLocking::writer_wait`] と [`RowLockingSyntax::writer_wait`] 共通の待機方針の合成。
-fn compose_writer_wait(clauses: &[RowLockClause]) -> Result<bool, SqlSurfaceError> {
-    if clauses.iter().any(|c| c.wait == LockWaitPolicy::SkipLocked) {
-        return Err(SqlSurfaceError::feature_not_supported(
-            "SKIP LOCKED is not supported yet",
-        ));
+fn compose_writer_wait(clauses: &[RowLockClause]) -> WriterWait {
+    if clauses.iter().any(|c| c.wait == LockWaitPolicy::NoWait) {
+        WriterWait::NoWait
+    } else if clauses.iter().any(|c| c.wait == LockWaitPolicy::SkipLocked) {
+        WriterWait::SkipLocked
+    } else {
+        WriterWait::Block
     }
-    Ok(clauses.iter().any(|c| c.wait == LockWaitPolicy::NoWait))
 }
 
 /// 行ロック句つきの SELECT（行ロック句を除いた文の検証結果と、解析した句）。
@@ -113,9 +125,18 @@ fn compose_writer_wait(clauses: &[RowLockClause]) -> Result<bool, SqlSurfaceErro
 pub struct LockingSelect {
     pub(crate) statement: Statement,
     pub(crate) locking: RowLocking,
+    /// 名前解決済みのトークン列でテーブル参照位置にある表名（サブクエリ・CTE の内側を含む。列名・別名・
+    /// CTE 名は含まない。`schema.name` は内部キーへ解決済み）。`SKIP LOCKED` 実行段の RLS-13 判定が、
+    /// 外側の FROM に現れない表にも同じ判定を掛けるために使う。
+    pub(crate) read_tables: Vec<String>,
 }
 
 impl LockingSelect {
+    /// 表名の候補（サブクエリ等の内側を含む保守的な集合）。
+    pub(crate) fn read_tables(&self) -> &[String] {
+        &self.read_tables
+    }
+
     /// 行ロック句を除いた SELECT の検証結果。
     pub fn statement(&self) -> &Statement {
         &self.statement
@@ -143,10 +164,16 @@ pub(crate) struct RowLockingSyntax {
 
 impl RowLockingSyntax {
     /// 構文段階の句から writer 取得の待機方針を合成する（[`RowLocking::writer_wait`] と同じ規則）。
-    /// 複数文メッセージの暗黙 Tx が writer を取得する前に、`SKIP LOCKED`（`0A000`）の拒否と
-    /// `NOWAIT` の反映を行うために使う（Issue #2230）。
-    pub(crate) fn writer_wait(&self) -> Result<bool, SqlSurfaceError> {
+    /// 複数文メッセージの暗黙 Tx が writer を取得する前の判定に使う（Issue #2230・#2231）。
+    pub(crate) fn writer_wait(&self) -> WriterWait {
         compose_writer_wait(&self.clauses)
+    }
+
+    /// 元の句のいずれかが `SKIP LOCKED` か（合成結果ではなく句そのものを見る。複数文メッセージの判定用）。
+    pub(crate) fn has_skip_locked(&self) -> bool {
+        self.clauses
+            .iter()
+            .any(|c| c.wait == LockWaitPolicy::SkipLocked)
     }
 }
 
@@ -860,31 +887,35 @@ mod tests {
         assert_eq!((r.table(), r.alias()), ("a", Some("window")));
     }
 
-    fn wait_of(sql: &str) -> Result<bool, &'static str> {
+    fn wait_of(sql: &str) -> WriterWait {
         RowLocking {
             clauses: clauses(sql),
         }
         .writer_wait()
-        .map_err(|e| e.wire_code())
     }
 
-    /// 複数句の待機方針の合成（#2230）: SKIP LOCKED が最優先で `0A000`、次に NOWAIT、既定は待機。
+    /// 複数句の待機方針の合成（#2230・#2231。SQL-38 (4)）。
     #[test]
     fn writer_wait_composition() {
-        assert_eq!(wait_of("SELECT id FROM a FOR UPDATE"), Ok(false));
-        assert_eq!(wait_of("SELECT id FROM a FOR UPDATE FOR SHARE"), Ok(false));
-        assert_eq!(wait_of("SELECT id FROM a FOR UPDATE NOWAIT"), Ok(true));
+        use WriterWait::*;
+        assert_eq!(wait_of("SELECT id FROM a FOR UPDATE"), Block);
+        assert_eq!(wait_of("SELECT id FROM a FOR UPDATE FOR SHARE"), Block);
+        assert_eq!(wait_of("SELECT id FROM a FOR UPDATE NOWAIT"), NoWait);
         assert_eq!(
             wait_of("SELECT id FROM a FOR SHARE OF a FOR UPDATE NOWAIT"),
-            Ok(true)
+            NoWait
         );
         assert_eq!(
             wait_of("SELECT id FROM a FOR UPDATE SKIP LOCKED"),
-            Err("0A000")
+            SkipLocked
         );
         assert_eq!(
-            wait_of("SELECT id FROM a FOR UPDATE NOWAIT FOR SHARE SKIP LOCKED"),
-            Err("0A000")
+            wait_of("SELECT id FROM a FOR UPDATE OF a NOWAIT FOR SHARE OF a SKIP LOCKED"),
+            NoWait
+        );
+        assert_eq!(
+            wait_of("SELECT id FROM a FOR UPDATE OF a SKIP LOCKED FOR SHARE OF a"),
+            SkipLocked
         );
     }
 }

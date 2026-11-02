@@ -427,7 +427,8 @@ DML は `PredicateDmlError<E>` を使う）を導入した。Issue #942 では�
 ### 4. 状態機械（`crates/engine/src/sql/transaction.rs`）
 
 `SessionTransaction<'e>`（`enum TxnState<'e> { Idle, Active(Box<ActiveTxn<'e>>),
-Failed { session_at_begin: SessionState, expired: bool } }`）。`ActiveTxn` は
+FailedRecoverable(Box<ActiveTxn<'e>>), Failed { session_at_begin: SessionState, expired: bool } }`）。
+`FailedRecoverable` は巻き戻せる savepoint を持つ Tx の失敗状態（「失敗状態からの savepoint 復帰（Issue #1947）」節）。`ActiveTxn` は
 `writer: Option<GatedWriteTxn>`（permit を内包）・`read_snapshot: ReadTransaction`・`started_at`・
 `statements`・`seen_operation_ids`・`written_tables`・`written_by_tenant`・`has_writes`・
 `session_at_begin` と、dirty テーブル判定（確定済みの世代の読み取り）に使う
@@ -498,6 +499,8 @@ Failed { session_at_begin: SessionState, expired: bool } }`）。`ActiveTxn` は
   そのまま返す。Failed 状態から `COMMIT` はできないため、失敗した文が残した
   部分書き込みが永続化されることはない。**文エラーの扱いに redb の savepoint は不要**
   （`ROLLBACK TO` の巻き戻しでの利用は「savepoint の redb 結線（Issue #1943）」節を参照）。
+  ただし、巻き戻せる savepoint を持つ明示 Tx は writer を即時に解放せず `FailedRecoverable`
+  として保持し、`ROLLBACK TO` で復帰できる（「失敗状態からの savepoint 復帰（Issue #1947）」節）。
   構文・許可リスト検証のエラー（`execute_sql_in_txn` の `parse_sql` 失敗）、
   簡易クエリの複数文分割・位置検証のエラー、拡張クエリプロトコルの
   Parse／Bind／Describe／Execute のエラー応答も同じく `Failed` へ遷移させる
@@ -641,7 +644,7 @@ Issue #1931（`READ ONLY`）、挙動テストは #1940、`40001` は #2396 が�
 
 行ロック句（`SELECT ... FOR UPDATE／NO KEY UPDATE／SHARE／KEY SHARE [OF ...] [NOWAIT|SKIP LOCKED]`）と
 `LOCK TABLE` の受理・結果の契約は spec 側が定義する。本節は実装側の写像と担当の分担だけを記録し、
-各形の SQLSTATE・`SKIP LOCKED` の結果・トランザクション外の扱い・併用可否は本書へ記述しない。
+各形の SQLSTATE・トランザクション外の扱い・併用可否は本書へ記述しない。
 ポインタは `docs/spec/04-behavior/sql-surface.md` SQL-38（(3)(4)(5)(7)）・SQL-31、
 `docs/spec/04-behavior/data-model.md` TABLE-3、`docs/spec/04-behavior/persistence.md` PERSIST-4、
 関連は RLS-12・RLS-7。行ロック句の取得は #2230、`LOCK TABLE` は #1958 で実装済み（#1955 の現状欄は着手前の記録）。
@@ -655,9 +658,12 @@ Issue #1931（`READ ONLY`）、挙動テストは #1940、`40001` は #2396 が�
   （`StorageError::WriteLockTimeout` から `55P03` への写像）に従う。
   `NOWAIT` は「即時取得を試みる経路」で実現する。#2230 では `LOCK TABLE ... NOWAIT`（#1958）と同じ
   `Storage::begin_explicit_write_txn_nowait` を流用し、新しい API は作らない。
-- **複数句の合成（#2230）**: 強度・`OF` の対象は writer の取得に影響しない。待機方針は
-  `SKIP LOCKED` を含む形を `0A000`（#2231 まで。writer に触れる前に返す）、含まず `NOWAIT` を含む形を nowait、
-  それ以外を待機とする（`RowLocking::writer_wait`）。
+- **複数句の合成（#2230・#2231）**: 強度・`OF` の対象は writer の取得に影響しない。待機方針は
+  `RowLocking::writer_wait` が `WriterWait` を返す（合成規則は spec 側の SQL-38 を参照）。
+- **`SKIP LOCKED` の実装（#2231）**: 実装箇所は `crates/engine/src/core/row_lock_exec.rs`、
+  writer の取得を試みる API は `try_ensure_writer`・`try_begin_implicit`（`sql/transaction.rs`）。
+  契約の詳細は spec 側（SQL-38 (4)(5)・RLS-12・RLS-13）を参照し、本書へは記述しない。
+
 - **保持期間（#2230）**: 明示 Tx は `ensure_writer_with` で取得して COMMIT／ROLLBACK まで保持し、dirty にはしない。
   autocommit は文単位の暗黙 Tx（`begin_implicit_with(.., nowait)`）で取得し、文の終わりに解放する
   （書き込みなしとして drop）。取得後の読み取りは句のない SELECT と同じ経路を通る。
@@ -667,7 +673,7 @@ Issue #1931（`READ ONLY`）、挙動テストは #1940、`40001` は #2396 が�
 | -- | ------------- | ---- | ---- |
 | 行ロック句 4 種・`OF`・`NOWAIT`・`SKIP LOCKED` の構文 | SQL-38 (7) | #1957 | 構文解釈済み（`ParsedSql::LockingSelect`） |
 | 行ロック句によるロック取得・`NOWAIT` | SQL-38 (4) | #2230 | 実装済み（#2230。writer の取得として扱う） |
-| `SKIP LOCKED` の実行 | SQL-38 (4) | #2231 | 未実装（`0A000`） |
+| `SKIP LOCKED` の実行 | SQL-38 (4)(5) | #2231 | 実装済み（#2231。実装箇所は上記） |
 | `LOCK [TABLE]` の 8 モードの構文・取得・表名の解決 | SQL-38 (4)(7) | #1958 | 実装済み（#1958） |
 | READ ONLY トランザクション内での扱い | SQL-38 (3) | #1934 | 実装済み（#1934。書き込み系の文は `25006`） |
 | writer 取得時の直列化判定 | SQL-38 (2)・SQL-31 | #2396 系 | 1a 節の記録のとおり |
@@ -675,7 +681,7 @@ Issue #1931（`READ ONLY`）、挙動テストは #1940、`40001` は #2396 が�
 - **READ ONLY トランザクション内**: ロック句つき SELECT・`LOCK TABLE` は `25006` で拒否する
   （Issue #1934。「READ ONLY での書き込み拒否」節）。8 モードすべてを拒否する。
 - **要確認（担当 Issue が確定する。本節では決めない）**:
-  - `SKIP LOCKED` の結果規則（単一ライタの下でどの行を飛ばすか）→ #2231（SQL-38 (4)）
+  - `SKIP LOCKED` の結果規則 → #2231 で実装済み（実装箇所のみ上記に記録）
   - トランザクション外の `LOCK TABLE` のエラー契約 → #1958（#1958 本文でも要確認）
   - autocommit の文に付いたロック句が writer を保持する期間 → #2230
 - **テナント境界（fail-closed）**: ロック句の結果と `LOCK TABLE` の表名解決を、他テナントの行・表の
@@ -732,7 +738,8 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
 `Active` 中のエラーは種類を問わず `Failed` へ遷移させ、`Failed` 中は `ROLLBACK`
 以外を `25P02` で拒否する（持続時間の上限で解放した直後の最初の 1 回だけは
 `54000`。`SessionTransaction::take_failed_error`）。PR #1041 のレビューを受けて、
-入口ごとに次のとおり確認した。
+入口ごとに次のとおり確認した。なお、`FailedRecoverable` 中は `ROLLBACK TO` も受理する
+（「失敗状態からの savepoint 復帰（Issue #1947）」節）。
 
 | 入口 | `Active` 中のエラー → `Failed` | `Failed` 中の拒否 |
 | ---- | ---- | ---- |
@@ -832,7 +839,7 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
 | ---- | -------- | -------- |
 | writer の取得時点（#2396・1a） | 最初の書き込み文（取得前の読み取りは `40001` の判定対象） | 開始時（従来どおり。#2401・WIRE-16。取得前に読み取りが無いため `40001` の経路を持たない） |
 | 開始 | `BEGIN`（`begin`） | メッセージ先頭で wire 層が `begin_implicit`（`Idle` からのみ。それ以外は `XX000`） |
-| 文のエラー・上限超過・`operation_id` 再利用（`fail`） | `Failed`（`ROLLBACK` 待ち） | `Idle`（write txn を abort・ライタ解放） |
+| 文のエラー・上限超過・`operation_id` 再利用（`fail`） | `Failed`（`ROLLBACK` 待ち。巻き戻せる savepoint があれば `ROLLBACK TO` でも復帰可。#1947 節） | `Idle`（write txn を abort・ライタ解放） |
 | 確定 | `COMMIT`（上限超過は `Failed` へ遷移し `54000`） | 最後の文の成功後に `commit_implicit`（上限超過・commit 失敗のどちらも `Idle`） |
 | 期限切れ（`release_if_expired`） | `Failed`（次の文で `54000`） | `Idle`（メッセージをまたがないため通常は到達しない） |
 | `BEGIN`／`COMMIT`／`ROLLBACK` が届いた場合 | 通常の遷移 | 不変条件違反として abort して `Idle`、`XX000` |
@@ -863,7 +870,14 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
   従来どおりの読み書き Tx。`READ ONLY` の暫定ゲート（`0A000`）は Issue #1934 で除去し、
   `READ ONLY` の Tx を開始できる（「READ ONLY での書き込み拒否」節）。PostgreSQL との差異として、アクセスモードの重複・矛盾（`READ ONLY READ WRITE`）
   は `42601`（fail-closed）。引用識別子 `"READ"` も受理される（既存の `"WORK"` と同じ性質）。
-- savepoint の巻き戻し本体（#1941。構文とスタックは #1942 で実装済み。下記「SAVEPOINT 構文と savepoint スタック」節）、`COMMIT AND CHAIN`・`PREPARE TRANSACTION`。分離レベルの指定は「分離レベルの受理方針」節のポインタ先の契約に従う（`BEGIN ISOLATION LEVEL` は #1938 で実装済み、`SET TRANSACTION` 系は #1939 で実装済み）。
+- savepoint（`SAVEPOINT`／`RELEASE`／`ROLLBACK TO`）は親 #1941 配下で実装済み（#1942〜#1947）。詳細は「SAVEPOINT 構文と savepoint スタック」「savepoint の redb 結線」「savepoint 巻き戻しと冪等台帳」「savepoint 巻き戻しと Tx 内の書き込み記録・世代」「savepoint 巻き戻しとカーソル」「失敗状態からの savepoint 復帰」の各節。受理構文・エラー契約は SQL-69 のポインタ先に従う。残る対象外・申し送りは次のとおり。
+  - savepoint のクラッシュ耐性テストは #1948（作業中）。
+  - 書き込み後に作った savepoint（`Unrestorable`）の巻き戻しは `0A000` で fail-closed。engine 層の undo 記録など別方式の要否はオーナー判断（#1943 節）。
+  - 一時表を使った Tx の `ROLLBACK TO` は `0A000`（#1943 節）。
+  - commit 記録の足跡（`commit_log::Frame`）と採番状態は戻さない（#1945 節）。
+  - カーソルに束縛しない portal の破棄は扱わない（#1946 節）。
+  - savepoint 名の照合は大文字小文字を区別する（PostgreSQL の畳み込みとの既知の差。#1942 節）。
+- `COMMIT AND CHAIN`・`PREPARE TRANSACTION`。分離レベルの指定は「分離レベルの受理方針」節のポインタ先の契約に従う（`BEGIN ISOLATION LEVEL` は #1938 で実装済み、`SET TRANSACTION` 系は #1939 で実装済み）。
   別名 `START TRANSACTION`／`END`／`ABORT` は Issue #1930 で受理した（下記「別名」節）。
 - NoSQL 表層のトランザクション（設計上 `0A000`。`op` 許可リストに追加しない）。
 - 上限の既定値（20 秒・1,000 件・30 秒）と CLI のハード上限（60 秒・10,000 件。Issue #1553 で暫定採用）の確定 → オーナー判断。
@@ -909,13 +923,13 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
 - fail-closed: 巻き戻せない `ROLLBACK TO` は成功させず必ず Tx を `Failed` へ倒す
   （取り消したつもりの書き込みが後続の `COMMIT` で確定する fail-open を避ける。#1943 で
   巻き戻せる条件が定まった。次節）。
-- `is_rollback_statement` は `ROLLBACK TO ...` で `false`（Failed 中は一律 `25P02`）。
-  Failed は `ActiveTxn` を捨てるためスタックが残らず、Failed からの `ROLLBACK TO` 復帰は
-  #1941 でスタックの引き継ぎとあわせて扱う。
+- `is_rollback_statement` は `ROLLBACK TO ...` で `false`。Failed（`FailedRecoverable` を含む）中は
+  `is_allowed_while_failed` が `ROLLBACK`／`ROLLBACK TO` だけを通す。`FailedRecoverable` は
+  スタックを保持し、Failed からの復帰は #1947 で実装した（同節）。
 - 名前の照合は大文字小文字を区別する完全一致（lexer が引用の有無を保持しないため、
   混同を避ける安全側。PostgreSQL の畳み込みとの差異は既知）。
-- #1941 への申し送り: 巻き戻し本体（台帳・世代キャッシュ・カーソル・`written_tables` 等）、
-  Failed へのスタック引き継ぎ、crash-test。
+- #1941 への申し送り: 巻き戻し本体（#1943〜#1946）と Failed へのスタック引き継ぎ（#1947）は
+  実装済み。残りは crash-test（#1948）。
 - テスト: `crates/engine/tests/sql_t40_up/sql69_savepoint_syntax.rs`・
   `crates/wire-server/tests/wire_proto/sql69_savepoint_syntax.rs`、単体は
   `sql::savepoint`・`sql::transaction`・`sql::statement_splitter`。
@@ -957,7 +971,7 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
   - 復元後に作る savepoint は redb が dirty になるため `Unrestorable` になる（保守側の制約）。
     `LOCK TABLE` などで writer を先に取っても、テーブルを開くため同様に `Unrestorable`。
 - 付随状態: commit 記録の足跡は戻さない（書き込み記録は Issue #1945、`seen_operation_ids` は
-  Issue #1944 で復元する。次節以降参照）。カーソルは #1946、`Failed` からの復帰は #1947 の範囲。
+  Issue #1944 で復元する。次節以降参照）。カーソルは Issue #1946（次々節）、`Failed` からの復帰は #1947（「失敗状態からの savepoint 復帰」節）の範囲。
 - 退けた案: Tx の途中で `Durability::None` の commit をして新しい writer で savepoint を取る
   案。他セッションに未確定の状態が見え、分離が壊れるため退けた。
 - テスト: `crates/engine/tests/sql_t40_up/sql69_savepoint_rollback.rs`・
@@ -1007,6 +1021,55 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
 - テスト: `crates/engine/tests/sql_t40_up/sql69_savepoint_write_marks.rs`、単体は
   `sql::savepoint`・`sql::transaction`。
 
+## savepoint 巻き戻しとカーソル（Issue #1946・SQL-69・WIRE-15 ポインタ）
+
+ポインタ: `docs/spec/04-behavior/sql-surface.md` SQL-69 (5)。本節は実装上の判断のみ。
+
+- 水位による閉鎖: savepoint は作成時の `CursorRegistry::next_id` を水位として持ち、`ROLLBACK TO` は
+  識別子が水位以上のカーソル（savepoint より後に宣言したもの）を閉じる。閉じた名前は `34000`
+  （不在・他セッション・巻き戻しで閉じた、のいずれも区別しない固定文言）で、名前は再宣言できる。
+- 残すもの: 水位未満のカーソルは開いたまま残る。行集合は `DECLARE` 時点で確定済み（INSENSITIVE）なので
+  巻き戻した書き込みを含まない。`FETCH` の位置は戻さず、`CLOSE` も取り消さない（PostgreSQL と同じ）。
+  `RELEASE` はカーソルに触れない。
+- `next_id` の単調性: 巻き戻しでも `next_id` は戻さないため、portal 束縛の `cursor_id` は再利用されない。
+  閉じたカーソルを指す中断 portal は再 Execute 時の照合で `34000` になる（`ROLLBACK TO` は
+  Tx 世代を変えないので、照合の決め手はカーソル識別子）。
+- 上限: 閉鎖後に保持バイト合計を計算し直すので、本数・バイトの枠は回復する。
+- 読み取り集合（SQL-38）: 閉じたカーソルの内側 SELECT の読み取りは縮めない（安全側。偽陰性を生まない）。
+- 対象外: カーソルに束縛しない portal の扱い（PostgreSQL は savepoint より後の portal を破棄する）は
+  本 Issue の範囲外。公開 API の変更なし。
+- テスト: engine `sql69_savepoint_cursor`・`sql69_savepoint_rollback`・`sql::cursor`、
+  wire-server `wire15_cursor_portal_binding`。
+
+## 失敗状態からの savepoint 復帰（Issue #1947・SQL-31・SQL-69 ポインタ）
+
+文エラーで `Failed`（`25P02`）になった明示 Tx を、`ROLLBACK TO` で `InTransaction` に戻せる。
+
+- 状態: `TxnState::FailedRecoverable(ActiveTxn)` を追加した。外から見える状態は `Failed`
+  （ReadyForQuery `'E'`）のままで、`Active` だけを照合する既存のアクセサ（writer・読み取り源・
+  カーソル）は失敗した Tx に何も渡さない（fail-closed）。`ActiveTxn` に失敗フラグを足す案は、
+  直し漏れた 1 箇所が fail-open になるため退けた。
+- 保持条件（`SessionTransaction::fail`）: 明示 Tx・巻き戻せる savepoint がある・一時表を使っていない
+  （一時表の Tx は `ROLLBACK TO` が `0A000` 確定）・巻き戻し先（writer 未取得、または基底 savepoint）
+  がある。満たさなければ従来どおり即時に writer を解放する（savepoint 作成前の失敗は復帰できない）。
+- 復帰させない失敗（`fail_unrecoverable`）: 文数・持続時間の上限超過（`54000`）、`40001`（保持した
+  writer が衝突判定を素通りするため）、`XX000`（不変条件違反・redb エラー）。
+- 受理する文: `ROLLBACK` と `ROLLBACK [WORK|TRANSACTION] TO ...`（parse 前の判定は
+  `is_allowed_while_failed`。字句エラーは偽）。ほかは `25P02` で状態も保持したまま。`3B001`・`0A000`
+  は `FailedRecoverable` に据え置き、別の savepoint で再試行できる。
+- 復帰: Active 中と同じ `restore_to_savepoint` を使う（キャッシュ・カーソルの整合は同関数に足す
+  #1945・#1946 がそのまま効く）。文数・持続時間の上限に計上する。成功で `Active`、全分岐で状態を
+  書き戻す。
+- writer の保持と DoS: 復帰の余地がある間は writer を保持するが、`remaining_duration`・
+  `release_if_expired` を `FailedRecoverable` にも効かせ、`BEGIN` 起点の持続時間上限で必ず解放する
+  （期限後は `54000` を 1 度だけ返し、以降は `25P02`）。
+- 結線: engine `core.rs` の parse 前ゲートと文実行ディスパッチ（`fail_for`）、wire-server の拡張クエリ
+  Parse・Bind・Execute の免除に `ROLLBACK TO` を追加した。
+- テスト: `crates/engine/tests/sql_t40_up/sql69_savepoint_failed_recovery.rs`・
+  `crates/engine/tests/core_misc/transaction_limits.rs`（期限）・
+  `crates/wire-server/tests/wire_proto/sql69_savepoint_syntax.rs`・
+  `crates/wire-server/tests/wire942_extended_transaction.rs`、単体は `sql::transaction`。
+
 ## READ ONLY での書き込み拒否（SQL-38 (3)・ERR-6・Issue #1934）
 
 `BEGIN READ ONLY` の Tx は writer を一度も取らず、書き込み系の文を `25006`
@@ -1039,3 +1102,21 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
 - **EXPLAIN**: writer を取らないことだけを保証する。検証は従来どおり最新の確定カタログ（#2403 の既存契約）。
 - **上限**: 持続時間・文数は `BEGIN` から数え、アクセスモードに関係なく効く。
 - 並行のスナップショット一貫性・テナント境界は #1935 で検証済み（`tests/sql_t01_39/sql38_read_only_concurrency.rs`・`core/deferred_writer_tests.rs`）。`USING PLAN` 付き SELECT と `EXPLAIN` は文ごとに最新の確定状態を読む既知の残りのため、一貫性の対象外（writer を取らないことだけを確かめる）。
+
+## savepoint のクラッシュ耐性（Issue #1948・SQL-69・RECOVER-5 ポインタ）
+
+`ROLLBACK TO`・`RELEASE` を含む明示 Tx を書くプロセスを SIGKILL し、再オープン後の永続状態を検証する。
+既存の `crash-test-sequence` ジョブ（`scripts/crash_test_sequence.sh`・`crates/engine/examples/crash_tool_sequence.rs`
+の `*-savepoint` サブコマンド）へ段を足した。本番コードの変更はなく、新しい CI ジョブも作らない
+（必須チェック名を増やさないため）。
+
+- **Tx の形**: 書き込み前に作った savepoint だけが `ROLLBACK TO` できる（#1943）ので、常に
+  `BEGIN` → `SAVEPOINT` → 書き込みの順にする。反復 `k` の形は `k % 3` で決める。0 は巻き戻した
+  `operation_id` を同じ Tx 内で再利用する形、1 は `RELEASE`、2 は入れ子の巻き戻しと基底の `RELEASE`。
+- **オラクル**: (1) 巻き戻した行（`j = 9`）が存在しない、(2) commit 済みの `k` は `j` が `{1, 2}` ちょうど、
+  (3) 適用済みの `k` が 0 からの連続、(4) 台帳が適用済みの `k` とちょうど一致、(5) 第 2 テナントは不変。
+- **決定的 kill 段**: `write-savepoint-pause` が `ROLLBACK TO` 直後・`RELEASE` 直後・COMMIT 直後で停止し、
+  SIGKILL 後の適用済み個数が `PAUSED` 行の期待値と完全に一致することを確かめる。
+- **finish**: 同一文の再送は `23505`、巻き戻した内容での再送は `22023`（台帳は commit した内容を保持）。
+- **対象外**: 書き込み後に作った savepoint（`Unrestorable`）、wire-server 経由の試験、
+  `WriteDurability::None` 構成。
