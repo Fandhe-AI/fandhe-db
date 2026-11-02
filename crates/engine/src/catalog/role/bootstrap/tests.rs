@@ -285,3 +285,22 @@ fn fresh_db_bootstraps_all_tenants_in_one_run() {
     assert_eq!(r.tenants_bootstrapped, 2);
     assert_eq!(r.tenants_skipped, 0);
 }
+
+#[test]
+fn legacy_db_tenant_absent_from_file_is_protected_from_later_reseed() {
+    let (_g, s) = open("bootstrap-legacy-outside");
+    // マーカー導入前の既存 DB: t2 にロールがあるが、今回のファイルには現れない。
+    let w = s.begin_write_txn().expect("w");
+    create_role_in_txn(&w, "t2", &initial_role_def(&user(1, "bob", "t2", false))).expect("role");
+    finish(w);
+    let first = [user(1, "root", "t1", false)];
+    let r = s.bootstrap_users_file(&first).expect("bootstrap");
+    assert_eq!(r.tenants_protected, 1);
+    assert!(marked(&s, "t2"));
+    // t2 の全ロールを削除してから、古い行がファイルへ戻っても再投入しない。
+    drop_roles_now(&s, "t2", &["bob"]);
+    let later = [user(1, "root", "t1", false), user(2, "bob", "t2", true)];
+    let again = s.bootstrap_users_file(&later).expect("again");
+    assert_eq!(again.tenants_bootstrapped, 0);
+    assert!(role(&s, "t2", "bob").is_none());
+}

@@ -14,6 +14,8 @@
 //!   マーカー導入前の既存 DB（txn 開始時にロール表があり、マーカー表が無い）なら投入せず警告し、マーカーだけを
 //!   書く（D11 の移行規則。ロールを全削除したテナントへ古いファイルから主体・資格情報・権限を再作成しない。
 //!   マーカーで冪等にするため、後の起動で同じテナントが新規扱いになることもない）。
+//!   マーカー導入前の既存 DB では、ファイルに現れないロール 1 件以上のテナントにもマーカーだけを書く
+//!   （以後の起動で未マークのまま新規扱いにならない。全ロールを消して古い行を戻しても再投入しない）。
 //!
 //! 全テナント分を 1 つの write txn・1 回の commit で行い、途中で失敗したら何も書かない（部分投入を残さない）。
 //!
@@ -148,6 +150,9 @@ pub struct BootstrapReport {
     pub tenants_adopted: usize,
     /// 既存 DB のロール 0 件で投入を見送った（マーカーだけを書いた）テナント数。
     pub tenants_skipped: usize,
+    /// マーカー導入前の既存 DB で、users ファイルに現れないロール 1 件以上のテナントへマーカーを書いた数
+    /// （後続の起動で古い行が復活しても再投入されないための保護）。
+    pub tenants_protected: usize,
 }
 
 /// ブートストラップの失敗（固定文言。資格情報・tenant_id は含めない）。
@@ -361,6 +366,27 @@ fn table_exists<K: redb::Key + 'static, V: redb::Value + 'static>(
     }
 }
 
+/// ロール表にロールを持つテナント ID の一覧（重複なし・昇順）。表が無ければ空。
+fn tenants_with_roles(
+    write_txn: &redb::WriteTransaction,
+) -> std::result::Result<Vec<String>, BootstrapError> {
+    let table = match ReadSource::open_table(write_txn, ROLES_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut out: Vec<String> = Vec::new();
+    for entry in table.iter()? {
+        let (k, _) = entry?;
+        let (t, _) = k.value();
+        validate_tenant(t).map_err(|_| BootstrapError::Catalog)?;
+        if out.last().map(String::as_str) != Some(t) {
+            out.push(t.to_string());
+        }
+    }
+    Ok(out)
+}
+
 /// 全テナント分のブートストラップを `write_txn` の中で行う（commit は呼び出し側。失敗時は呼び出し側が
 /// txn を捨てるので何も残らない）。
 pub(crate) fn bootstrap_in_txn(
@@ -379,6 +405,18 @@ pub(crate) fn bootstrap_in_txn(
     let legacy_db =
         table_exists(write_txn, ROLES_TABLE)? && !table_exists(write_txn, BOOTSTRAP_MARKER_TABLE)?;
     let mut report = BootstrapReport::default();
+    if legacy_db {
+        // 移行時にファイルへ現れない既存テナントも保護する。マーカー表が一度できると `legacy_db` は偽になり、
+        // 未マークのまま残ったテナントは後続の起動で「新規」扱いになる。全ロール削除後に古い行がファイルへ
+        // 戻ると資格情報・権限が復活するため、ここでマーカーを書いて以後は再投入しない。
+        // ファイルに現れるテナントは下のループで採用・見送りの規則どおりに扱う（ここでは書かない）。
+        for tenant in tenants_with_roles(write_txn)? {
+            if !by_tenant.contains_key(tenant.as_str()) {
+                put_marker(write_txn, &tenant)?;
+                report.tenants_protected += 1;
+            }
+        }
+    }
     for (tenant, mut rows) in by_tenant {
         validate_tenant(tenant).map_err(|_| BootstrapError::InvalidInput)?;
         rows.sort_by_key(|u| u.line);
@@ -526,8 +564,11 @@ impl Storage {
             .begin_write_txn()
             .map_err(super::super::convert_storage_error)?;
         let report = bootstrap_in_txn(&write_txn, users)?;
-        let wrote =
-            report.tenants_bootstrapped + report.tenants_adopted + report.tenants_skipped > 0;
+        let wrote = report.tenants_bootstrapped
+            + report.tenants_adopted
+            + report.tenants_skipped
+            + report.tenants_protected
+            > 0;
         if wrote {
             crate::recovery::commit_boundary::commit(write_txn)
                 .map_err(super::super::convert_storage_error)?;
