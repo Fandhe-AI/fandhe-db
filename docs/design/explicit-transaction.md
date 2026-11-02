@@ -957,7 +957,7 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
   - 復元後に作る savepoint は redb が dirty になるため `Unrestorable` になる（保守側の制約）。
     `LOCK TABLE` などで writer を先に取っても、テーブルを開くため同様に `Unrestorable`。
 - 付随状態: commit 記録の足跡は戻さない（書き込み記録は Issue #1945、`seen_operation_ids` は
-  Issue #1944 で復元する。次節以降参照）。カーソルは #1946、`Failed` からの復帰は #1947（「失敗状態からの savepoint 復帰」節）の範囲。
+  Issue #1944 で復元する。次節以降参照）。カーソルは Issue #1946（次々節）、`Failed` からの復帰は #1947（「失敗状態からの savepoint 復帰」節）の範囲。
 - 退けた案: Tx の途中で `Durability::None` の commit をして新しい writer で savepoint を取る
   案。他セッションに未確定の状態が見え、分離が壊れるため退けた。
 - テスト: `crates/engine/tests/sql_t40_up/sql69_savepoint_rollback.rs`・
@@ -1006,6 +1006,26 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
   `storage::commit_log` 側の経路が要るため本 Issue の対象外。
 - テスト: `crates/engine/tests/sql_t40_up/sql69_savepoint_write_marks.rs`、単体は
   `sql::savepoint`・`sql::transaction`。
+
+## savepoint 巻き戻しとカーソル（Issue #1946・SQL-69・WIRE-15 ポインタ）
+
+ポインタ: `docs/spec/04-behavior/sql-surface.md` SQL-69 (5)。本節は実装上の判断のみ。
+
+- 水位による閉鎖: savepoint は作成時の `CursorRegistry::next_id` を水位として持ち、`ROLLBACK TO` は
+  識別子が水位以上のカーソル（savepoint より後に宣言したもの）を閉じる。閉じた名前は `34000`
+  （不在・他セッション・巻き戻しで閉じた、のいずれも区別しない固定文言）で、名前は再宣言できる。
+- 残すもの: 水位未満のカーソルは開いたまま残る。行集合は `DECLARE` 時点で確定済み（INSENSITIVE）なので
+  巻き戻した書き込みを含まない。`FETCH` の位置は戻さず、`CLOSE` も取り消さない（PostgreSQL と同じ）。
+  `RELEASE` はカーソルに触れない。
+- `next_id` の単調性: 巻き戻しでも `next_id` は戻さないため、portal 束縛の `cursor_id` は再利用されない。
+  閉じたカーソルを指す中断 portal は再 Execute 時の照合で `34000` になる（`ROLLBACK TO` は
+  Tx 世代を変えないので、照合の決め手はカーソル識別子）。
+- 上限: 閉鎖後に保持バイト合計を計算し直すので、本数・バイトの枠は回復する。
+- 読み取り集合（SQL-38）: 閉じたカーソルの内側 SELECT の読み取りは縮めない（安全側。偽陰性を生まない）。
+- 対象外: カーソルに束縛しない portal の扱い（PostgreSQL は savepoint より後の portal を破棄する）は
+  本 Issue の範囲外。公開 API の変更なし。
+- テスト: engine `sql69_savepoint_cursor`・`sql69_savepoint_rollback`・`sql::cursor`、
+  wire-server `wire15_cursor_portal_binding`。
 
 ## 失敗状態からの savepoint 復帰（Issue #1947・SQL-31・SQL-69 ポインタ）
 

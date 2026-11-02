@@ -9,6 +9,7 @@
 
 ### Added
 
+- `ROLLBACK TO` が savepoint より後に宣言したカーソルを閉じ（以降の `FETCH` は `34000`）、前に宣言したカーソルは位置を保って開いたまま残ることをテストで固定した（Issue #1946・SQL-69）。公開 API の変更はない。
 - `ROLLBACK TO` の後、Tx 内の書き込み記録を savepoint 時点へ戻す。読み取りは確定状態のキャッシュ・索引を再び使い、全書き込みを巻き戻した Tx の `COMMIT` はグローバル世代を進めない（Issue #1945・SQL-69）。公開 API の変更はない。
 - 失敗状態（`25P02`）の明示 Tx が、巻き戻せる savepoint を持つ間は `ROLLBACK TO` で復帰できるようにした。復帰まで writer を保持し、持続時間上限・文数上限・`40001`・`XX000`・一時表の使用では従来どおり即時に解放して `ROLLBACK` のみ受理する。公開関数 `sql::transaction::is_allowed_while_failed` を追加した（Issue #1947・SQL-31・SQL-69）。既存の公開 API の破壊的変更はない。
 - `ROLLBACK TO` で巻き戻した文の `operation_id` を同一 Tx 内で再利用できるようにした。巻き戻した文の台帳記録は `COMMIT` 後に残らない（Issue #1944・SQL-69・RECOVER-1）。公開 API の変更はない。
