@@ -1427,6 +1427,12 @@ fn build_error_response_body(err: &HandlerError) -> Result<Vec<u8>, result_encod
             error_response::MAY_BE_COMMITTED_DETAIL,
         );
     }
+    // `RAISE EXCEPTION`（Issue #2227・SQL-70）は利用者指定の SQLSTATE と D/H/W を付ける。
+    if let HandlerError::Sql(e) = err {
+        if e.raised().is_some() {
+            return error_response::encode_sql_error(e);
+        }
+    }
     result_encoder::encode_error_response(err.error_class().wire_code(), &err.message())
 }
 
@@ -2539,10 +2545,23 @@ fn execute_portal<'e, S: WireStream>(
             portal.state = PortalState::Failed;
         }
 
+        // PL/pgSQL の通知（Issue #2227・SQL-70）を実行区間だけ溜め、応答の前に書く。通知の書き出し失敗は
+        // 無視する（壊れたストリームなら直後の応答の書き込みが失敗し、そちらが commit 後の失敗として
+        // `PostCommit` へ包まれる）。
+        let notices = engine::notice::StatementNotices::enter();
         let outcome = crate::simple_query::execute_with_emergency_registration(stream, || {
             engine.execute_parsed_in_txn(ctx, session, txn, &parsed)
-        })
-        .map_err(HandlerError::Sql)?;
+        });
+        let pending_notices = notices.finish();
+        if let Err(e) = crate::error_response::write_notices(stream, &pending_notices) {
+            let err = io_to_handler(e);
+            return Err(if is_write_statement && outcome.is_ok() {
+                HandlerError::PostCommit(Box::new(err))
+            } else {
+                err
+            });
+        }
+        let outcome = outcome.map_err(HandlerError::Sql)?;
 
         // `parsed` がカーソル `FETCH` なら、実行が成功したこの時点（`txn` は
         // 実行後の状態）のトランザクション世代・カーソル個体識別子を portal へ

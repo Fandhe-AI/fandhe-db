@@ -41,9 +41,9 @@
 //! を fail-closed に拒否する（本モジュールの `message` 引数は固定英語文言のみを
 //! 渡す契約だが、防御的に検証する）。
 
-use engine::error_format::ErrorClass;
+use engine::error_format::{ClassifiedError, ErrorClass};
 
-use crate::result_encoder::{frame_len, push_d_field, push_s_c_m_fields, EncodeError};
+use crate::result_encoder::{frame_len, push_d_field, push_field, push_s_c_m_fields, EncodeError};
 
 /// `message` に NUL バイトが含まれないか検証する（fail-closed）。フィールドは
 /// NUL 終端のため、混入するとフレーム構造そのものが壊れる（後続フィールドの
@@ -76,9 +76,14 @@ const fn severity_for(class: ErrorClass) -> &'static str {
 /// `body`（フィールド終端込みで組み立て済み）を `ErrorResponse`（'E'）フレームへ
 /// 包む。フレーム長は [`frame_len`] の `checked` 方式に従う。
 fn wrap_frame(body: Vec<u8>) -> Result<Vec<u8>, EncodeError> {
+    wrap_frame_tagged(b'E', body)
+}
+
+/// `body` を指定タグのフレーム（`ErrorResponse`＝'E'・`NoticeResponse`＝'N'）へ包む。
+fn wrap_frame_tagged(tag: u8, body: Vec<u8>) -> Result<Vec<u8>, EncodeError> {
     let total_len = frame_len(body.len())?;
     let mut msg = Vec::with_capacity(1 + body.len() + 4);
-    msg.push(b'E');
+    msg.push(tag);
     msg.extend_from_slice(&total_len.to_be_bytes());
     msg.extend_from_slice(&body);
     Ok(msg)
@@ -144,6 +149,94 @@ pub fn encode_with_detail(
     push_d_field(&mut body, detail);
     body.push(0); // フィールド終端
     wrap_frame(body)
+}
+
+/// 文の実行エラー 1 件の `ErrorResponse`（'E'）を組み立てる（Issue #2227・SQL-70）。
+///
+/// PL/pgSQL の `RAISE EXCEPTION`（[`SqlSurfaceError::raised`]）なら、`C` は利用者が指定した SQLSTATE、
+/// `M` は利用者の文言で、`D`・`H`（あれば）と `W`（呼び出し文脈。本 DB 自身の応答と区別する印）を
+/// 付ける。`raised()` が `None`（PL 外・本 DB 自身のエラー）は従来どおり [`encode`] の
+/// `S`/`C`/`M` の 3 フィールドのまま（ERR-5 の契約。`W` を付けない）。NUL を含む値は
+/// fail-closed に拒否する（engine 側で除去済みの防御的な再検査）。
+pub fn encode_sql_error(
+    e: &engine::sql::allowlist::SqlSurfaceError,
+) -> Result<Vec<u8>, EncodeError> {
+    let Some(r) = e.raised() else {
+        return encode(e.error_class(), &e.client_message());
+    };
+    let context = r.context();
+    for v in [
+        Some(r.sqlstate()),
+        Some(r.message()),
+        r.detail(),
+        r.hint(),
+        context.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        reject_embedded_nul(v)?;
+    }
+    let mut body = Vec::new();
+    push_s_c_m_fields(
+        &mut body,
+        severity_for(e.error_class()),
+        r.sqlstate(),
+        r.message(),
+    );
+    if let Some(d) = r.detail() {
+        push_d_field(&mut body, d);
+    }
+    if let Some(h) = r.hint() {
+        push_field(&mut body, b'H', h);
+    }
+    if let Some(w) = context.as_deref() {
+        push_field(&mut body, b'W', w);
+    }
+    body.push(0); // フィールド終端
+    wrap_frame(body)
+}
+
+/// `NoticeResponse`（'N'）を組み立てる（Issue #2227・SQL-70）。フィールドは `S`・`V`・`C`・`M` と、
+/// あれば `D`・`H`。NUL を含む値は fail-closed に拒否する。
+pub fn encode_notice(n: &engine::notice::Notice) -> Result<Vec<u8>, EncodeError> {
+    for v in [
+        Some(n.sqlstate.as_str()),
+        Some(n.message.as_str()),
+        n.detail.as_deref(),
+        n.hint.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        reject_embedded_nul(v)?;
+    }
+    let severity = n.level.severity();
+    let mut body = Vec::new();
+    push_s_c_m_fields(&mut body, severity, &n.sqlstate, &n.message);
+    push_field(&mut body, b'V', severity);
+    if let Some(d) = n.detail.as_deref() {
+        push_d_field(&mut body, d);
+    }
+    if let Some(h) = n.hint.as_deref() {
+        push_field(&mut body, b'H', h);
+    }
+    body.push(0); // フィールド終端
+    wrap_frame_tagged(b'N', body)
+}
+
+/// 文の実行区間で溜まった通知を `NoticeResponse` として `stream` へ書く（応答の最初のフレームより
+/// 前に呼ぶ。エンコードに失敗した通知は捨てる。通知は情報提供で、応答そのものを壊さない）。
+pub(crate) fn write_notices<S: crate::wire_stream::WireStream>(
+    stream: &mut S,
+    notices: &[engine::notice::Notice],
+) -> std::io::Result<()> {
+    for n in notices {
+        if let Ok(frame) = encode_notice(n) {
+            stream.write_all(&frame)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

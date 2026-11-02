@@ -14,10 +14,14 @@
 //! エラー文言は固定の英語で、変数名・値・本体の断片を含めない。
 
 use crate::catalog::ColumnType;
+use crate::notice::Notice;
+use crate::notice::NoticeLevel;
 use crate::plpgsql::ast::{
-    AssignTarget, Block, Body, DeclType, DiagItem, EmbeddedKind, EmbeddedSql, IntoClause,
-    ReturnShape, SqlExpr, Stmt, TriggerVar, VarId, VarKind, VarRef,
+    AssignTarget, Block, Body, DeclType, DiagItem, EmbeddedKind, EmbeddedSql, Handler, IntoClause,
+    RaiseLevel, RaiseOpt, RaiseStmt, ReturnShape, SqlExpr, Stmt, TriggerVar, VarId, VarKind,
+    VarRef,
 };
+use crate::plpgsql::condition::{matches_code, resolve_errcode};
 use crate::plpgsql::host::{
     PlHost, PlRecord, PlScalar, ResolvedType, RowDemand, SqlOutcome, VarLookup,
 };
@@ -40,11 +44,14 @@ struct SharedCounters {
     statements: usize,
     iterations: usize,
     depth: usize,
+    /// 上限超過（文数・反復・深さ・集合返却）が起きた。立っている間、`EXCEPTION` 節は捕捉しない
+    /// （上限の迂回を防ぐ。Issue #2227）。
+    exhausted: bool,
 }
 
 thread_local! {
     static COUNTERS: std::cell::Cell<SharedCounters> =
-        const { std::cell::Cell::new(SharedCounters { live: 0, statements: 0, iterations: 0, depth: 0 }) };
+        const { std::cell::Cell::new(SharedCounters { live: 0, statements: 0, iterations: 0, depth: 0, exhausted: false }) };
 }
 
 fn counters() -> SharedCounters {
@@ -53,6 +60,13 @@ fn counters() -> SharedCounters {
 
 fn set_counters(c: SharedCounters) {
     COUNTERS.with(|cell| cell.set(c));
+}
+
+/// 実行上限の超過を記録する（以降 `EXCEPTION` 節は捕捉しない）。
+fn mark_exhausted() {
+    let mut c = counters();
+    c.exhausted = true;
+    set_counters(c);
 }
 
 /// 1 回のトップレベル起動ごとに 1 個作り、入れ子の呼び出しへ `&mut` で渡して合算する実行予算。
@@ -97,6 +111,7 @@ impl ExecBudget {
     pub(crate) fn tick_statement(&mut self) -> Result<(), SqlSurfaceError> {
         let mut c = counters();
         if c.statements >= self.limits.max_statements() {
+            mark_exhausted();
             return Err(SqlSurfaceError::payload_too_large(
                 "PL/pgSQL statement limit exceeded",
             ));
@@ -110,6 +125,7 @@ impl ExecBudget {
     pub(crate) fn tick_iteration(&mut self) -> Result<(), SqlSurfaceError> {
         let mut c = counters();
         if c.iterations >= self.limits.max_loop_iterations() {
+            mark_exhausted();
             return Err(SqlSurfaceError::payload_too_large(
                 "PL/pgSQL loop iteration limit exceeded",
             ));
@@ -123,6 +139,7 @@ impl ExecBudget {
     pub(crate) fn enter_call(&mut self) -> Result<(), SqlSurfaceError> {
         let mut c = counters();
         if c.depth >= self.limits.max_call_depth() {
+            mark_exhausted();
             return Err(SqlSurfaceError::StatementTooComplex {
                 detail: "PL/pgSQL function call depth limit exceeded",
             });
@@ -147,9 +164,12 @@ impl ExecBudget {
                 self.set_bytes = n;
                 Ok(())
             }
-            _ => Err(SqlSurfaceError::payload_too_large(
-                "PL/pgSQL set-returning result limit exceeded",
-            )),
+            _ => {
+                mark_exhausted();
+                Err(SqlSurfaceError::payload_too_large(
+                    "PL/pgSQL set-returning result limit exceeded",
+                ))
+            }
         }
     }
 }
@@ -285,6 +305,8 @@ struct Interp<'a> {
     trig: Option<&'a TriggerVars>,
     /// トリガ関数の `RETURN` の結果（`None` は RETURN 未到達）。
     trig_ret: Option<TriggerReturn>,
+    /// 実行中の `EXCEPTION` ハンドラが捕捉したエラーのスタック（引数なしの `RAISE;` が再送出する）。
+    caught: Vec<SqlSurfaceError>,
 }
 
 /// トリガ関数 1 回分の入力（Issue #2228）。core の `trigger::call::TriggerCall` から純粋な変換で
@@ -356,6 +378,7 @@ fn run_trigger_inner(
         rows: Vec::new(),
         trig: Some(vars),
         trig_ret: None,
+        caught: Vec::new(),
     };
     it.bind_fixed_vars(Vec::new())?;
     let flow = it.exec_block(&body.block)?;
@@ -417,6 +440,7 @@ fn run_inner(
         rows: Vec::new(),
         trig: None,
         trig_ret: None,
+        caught: Vec::new(),
     };
     it.bind_fixed_vars(args)?;
     let flow = it.exec_block(&body.block)?;
@@ -687,6 +711,53 @@ fn run_sql_set_inner(
 }
 
 /// 概算バイト数（集合返却の累積上限の検査に使う）。
+/// `RAISE` の書式・`USING` の値を文字列にする（NULL は `<NULL>`。PostgreSQL と同じ）。
+fn scalar_text(v: PlScalar) -> Result<String, SqlSurfaceError> {
+    if v.is_null() {
+        return Ok("<NULL>".to_string());
+    }
+    match assign_cast(v, &ColumnType::Text)?.cell {
+        Cell::Text(s) => Ok(s),
+        _ => Err(internal("RAISE value did not convert to text")),
+    }
+}
+
+/// 書式文字列の `%` を引数で順に置き換える（`%%` は `%`。個数は定義時に一致を検査済みで、
+/// 実行時に足りなければ空として扱い panic しない）。
+fn format_message<E>(
+    fmt: &str,
+    arg_count: usize,
+    mut next_arg: impl FnMut(usize) -> Result<String, E>,
+) -> Result<String, E> {
+    let mut out = String::new();
+    let mut used = 0usize;
+    let mut chars = fmt.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            if chars.peek() == Some(&'%') {
+                chars.next();
+                out.push('%');
+            } else if used < arg_count {
+                // 引数は 1 件ずつ評価し、出力が上限を超えた後は評価だけ続けて文字列を保持しない。
+                let a = next_arg(used)?;
+                used += 1;
+                if out.len() <= crate::notice::MAX_NOTICE_FIELD_BYTES {
+                    out.push_str(&a);
+                }
+            }
+        } else if out.len() <= crate::notice::MAX_NOTICE_FIELD_BYTES {
+            out.push(c);
+        }
+    }
+    // プレースホルダに使われなかった引数も評価する（評価エラーは伝播させる）。
+    while used < arg_count {
+        next_arg(used)?;
+        used += 1;
+    }
+    crate::notice::clamp_field(&mut out);
+    Ok(out)
+}
+
 fn scalar_bytes(v: &PlScalar) -> usize {
     let payload = match &v.cell {
         Cell::Text(s) | Cell::Json(s) => s.len(),
@@ -728,6 +799,10 @@ impl<'a> Interp<'a> {
                 }
                 VarKind::Local => {}
                 VarKind::Trigger(tv) => self.bind_trigger_var(id, tv)?,
+                // ハンドラに入る時に捕捉したエラーから設定する（それまでは NULL の text）。
+                VarKind::ExceptionState(_) => {
+                    self.set_slot(id, SlotTy::Scalar(ColumnType::Text), None, false)?;
+                }
             }
         }
         Ok(())
@@ -997,11 +1072,165 @@ impl<'a> Interp<'a> {
         for id in &b.decls {
             self.init_decl(*id)?;
         }
-        let f = self.exec_stmts(&b.stmts)?;
+        let f = match &b.handlers {
+            None => self.exec_stmts(&b.stmts)?,
+            Some(hs) => self.exec_guarded(b, hs)?,
+        };
         Ok(match f {
             Flow::Exit(Some(l)) if b.label.as_ref() == Some(&l) => Flow::Normal,
             other => other,
         })
+    }
+
+    /// 捕捉してよいエラーか。`Internal`（`XX000`）・`SerializationFailure`（`40001`）・実行上限の超過・
+    /// 失敗状態の Tx は捕捉しない（復帰不可・上限の迂回・fail-open の防止。Issue #2227）。
+    fn catchable(&self, e: &SqlSurfaceError) -> bool {
+        !crate::sql::transaction::SessionTransaction::is_unrecoverable_error(e)
+            && !counters().exhausted
+            && self.host.can_catch()
+    }
+
+    /// `EXCEPTION` 節つきブロックの本体を実行する。本体の前に内部 savepoint を積み、エラーが
+    /// `WHEN` に一致したら、巻き戻し→savepoint を除去→ハンドラ実行の順に進む。一致しない・捕捉
+    /// できないエラーはそのまま伝える。巻き戻せない場合（書き込み後に入ったブロック等）は一致して
+    /// いても捕捉せず `0A000` を返す。変数・`FOUND`・蓄積した行は巻き戻さない。savepoint は全出口で
+    /// 1 回だけ除去する。
+    fn exec_guarded(&mut self, b: &Block, hs: &[Handler]) -> Result<Flow, SqlSurfaceError> {
+        let sp = self.host.block_savepoint()?;
+        let err = match self.exec_stmts(&b.stmts) {
+            Ok(flow) => {
+                self.host.release_block(sp);
+                return Ok(flow);
+            }
+            Err(e) => e,
+        };
+        let code = err.effective_sqlstate().to_string();
+        let found = if self.catchable(&err) {
+            hs.iter()
+                .find(|h| h.conds.iter().any(|c| matches_code(c, &code)))
+        } else {
+            None
+        };
+        let Some(handler) = found else {
+            self.host.release_block(sp);
+            return Err(err);
+        };
+        if let Err(restore_err) = self.host.rollback_block(&sp) {
+            self.host.release_block(sp);
+            return Err(restore_err);
+        }
+        self.host.release_block(sp);
+        if let Some((sqlstate_var, sqlerrm_var)) = b.handler_vars {
+            let msg = self.host.handler_message(&err);
+            let text = |s: String| PlScalar::new(Cell::Text(s), ColumnType::Text);
+            self.set_slot(
+                sqlstate_var,
+                SlotTy::Scalar(ColumnType::Text),
+                Some(text(code)),
+                false,
+            )?;
+            self.set_slot(
+                sqlerrm_var,
+                SlotTy::Scalar(ColumnType::Text),
+                Some(text(msg)),
+                false,
+            )?;
+        }
+        self.caught.push(err);
+        let r = self.exec_stmts(&handler.stmts);
+        self.caught.pop();
+        r
+    }
+
+    /// `RAISE` の引数 1 件を評価して通知欄の上限へ切り詰めた文字列にする。
+    fn eval_raise_arg(&mut self, a: Option<&SqlExpr>) -> Result<String, SqlSurfaceError> {
+        let a = a.ok_or_else(|| internal("RAISE argument index out of range"))?;
+        let v = self.eval(a)?;
+        let mut t = scalar_text(v)?;
+        crate::notice::clamp_field(&mut t);
+        Ok(t)
+    }
+
+    /// `RAISE`。`DEBUG`／`LOG` は引数を評価して捨てる。通知（`INFO`／`NOTICE`／`WARNING`）は
+    /// `notice` の区間へ溜め、`EXCEPTION` は利用者指定の SQLSTATE を持つエラーを返す。
+    fn exec_raise(&mut self, r: &RaiseStmt) -> Result<Flow, SqlSurfaceError> {
+        if r.rethrow {
+            return Err(self.caught.last().cloned().unwrap_or_else(|| {
+                SqlSurfaceError::RaisedException(Box::new(crate::notice::RaisedError::new(
+                    "0Z002".to_string(),
+                    "RAISE without parameters cannot be used outside an exception handler",
+                    None,
+                    None,
+                )))
+            }));
+        }
+        // 引数は全件を保持せず、展開時に 1 件ずつ評価して上限付き出力へ直接書き込む。
+        let mut formatted = match &r.fmt {
+            Some(f) => Some(format_message(f, r.args.len(), |i| {
+                self.eval_raise_arg(r.args.get(i))
+            })?),
+            None => {
+                for a in &r.args {
+                    self.eval_raise_arg(Some(a))?;
+                }
+                None
+            }
+        };
+        let (mut message, mut detail, mut hint, mut errcode) = (None, None, None, None);
+        for (opt, e) in &r.using {
+            let v = self.eval(e)?;
+            if v.is_null() {
+                return Err(SqlSurfaceError::NullValueNotAllowed {
+                    detail: "RAISE statement option cannot be null",
+                });
+            }
+            let mut t = scalar_text(v)?;
+            crate::notice::clamp_field(&mut t);
+            match opt {
+                RaiseOpt::Message => message = Some(t),
+                RaiseOpt::Detail => detail = Some(t),
+                RaiseOpt::Hint => hint = Some(t),
+                RaiseOpt::Errcode => errcode = Some(resolve_errcode(&t)?),
+            }
+        }
+        let default_state = match r.level {
+            RaiseLevel::Exception => "P0001",
+            RaiseLevel::Warning => "01000",
+            _ => "00000",
+        };
+        let sqlstate = errcode
+            .or_else(|| r.condition_code.clone())
+            .unwrap_or_else(|| default_state.to_string());
+        let message = match (&r.fmt, message) {
+            (Some(_), _) => formatted.take().unwrap_or_default(),
+            (None, Some(m)) => m,
+            (None, None) => r.condition_name.clone().unwrap_or_else(|| sqlstate.clone()),
+        };
+        let notice_level = match r.level {
+            RaiseLevel::Debug | RaiseLevel::Log => return Ok(Flow::Normal),
+            RaiseLevel::Info => Some(NoticeLevel::Info),
+            RaiseLevel::Notice => Some(NoticeLevel::Notice),
+            RaiseLevel::Warning => Some(NoticeLevel::Warning),
+            RaiseLevel::Exception => None,
+        };
+        if let Some(level) = notice_level {
+            crate::notice::push_notice(Notice {
+                level,
+                sqlstate,
+                message: crate::notice::sanitize_text(&message),
+                detail: detail.map(|d| crate::notice::sanitize_text(&d)),
+                hint: hint.map(|h| crate::notice::sanitize_text(&h)),
+            });
+            return Ok(Flow::Normal);
+        }
+        let mut raised =
+            crate::notice::RaisedError::new(sqlstate, &message, detail.as_deref(), hint.as_deref());
+        raised.push_context(&format!(
+            "{} line {} at RAISE",
+            self.host.context_label(),
+            r.line
+        ));
+        Err(SqlSurfaceError::RaisedException(Box::new(raised)))
     }
 
     fn exec_stmt(&mut self, s: &Stmt) -> Result<Flow, SqlSurfaceError> {
@@ -1042,6 +1271,7 @@ impl<'a> Interp<'a> {
             Stmt::Sql(q) => self.exec_sql_stmt(q),
             Stmt::Execute { query, into, using } => self.exec_execute(query, into.as_ref(), using),
             Stmt::GetDiagnostics { items } => self.exec_diag(items),
+            Stmt::Raise(r) => self.exec_raise(r),
         }
     }
 
@@ -1472,5 +1702,33 @@ pub(crate) mod test_support {
         pub(crate) fn statements_run(&self) -> usize {
             super::counters().statements
         }
+    }
+}
+
+#[cfg(test)]
+mod raise_format_tests {
+    use super::format_message;
+    use crate::notice::{clamp_field, MAX_NOTICE_FIELD_BYTES};
+
+    /// 長大な引数を多数の `%` へ展開しても、結果は通知欄の上限内へ打ち切られる。
+    #[test]
+    fn format_message_stops_at_field_limit() {
+        let mut arg = "あ".repeat(MAX_NOTICE_FIELD_BYTES);
+        clamp_field(&mut arg);
+        assert!(arg.len() <= MAX_NOTICE_FIELD_BYTES);
+        let fmt = "%".repeat(1000);
+        let out = format_message::<()>(&fmt, 1000, |_| Ok(arg.clone())).unwrap();
+        assert!(out.len() <= MAX_NOTICE_FIELD_BYTES);
+    }
+
+    /// 切り詰めは文字境界で行い、上限以下の入力は変えない。
+    #[test]
+    fn clamp_field_respects_char_boundary() {
+        let mut s = "a".repeat(MAX_NOTICE_FIELD_BYTES - 1) + "あ";
+        clamp_field(&mut s);
+        assert_eq!(s.len(), MAX_NOTICE_FIELD_BYTES - 1);
+        let mut short = "xyz".to_string();
+        clamp_field(&mut short);
+        assert_eq!(short, "xyz");
     }
 }

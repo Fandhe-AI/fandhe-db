@@ -15,10 +15,11 @@ use crate::sql::ddl_column_type::{parse_column_type_name, SqlColumnTypeName};
 use crate::sql::lexer::{tokenize_with_params_quoted, Keyword, Token};
 
 use super::ast::{
-    AssignTarget, Block, Body, DeclType, DiagItem, EmbeddedKind, EmbeddedSql, IntoClause,
-    ParseOptions, ReturnShape, ScopeRef, ScopeView, SharedRegistry, SqlExpr, Stmt, VarDecl, VarId,
-    VarKind, VarRef,
+    AssignTarget, Block, Body, DeclType, DiagItem, EmbeddedKind, EmbeddedSql, ExceptionVar,
+    Handler, IntoClause, ParseOptions, RaiseLevel, RaiseOpt, RaiseStmt, ReturnShape, ScopeRef,
+    ScopeView, SharedRegistry, SqlExpr, Stmt, VarDecl, VarId, VarKind, VarRef,
 };
+use super::condition::{self, ExcCond};
 use super::embedded::{head_kind, reject_forbidden_clauses, split_into, RawInto};
 use super::lexer::{scan, TokKind};
 use super::{oos_err, syn_err, too_big_err};
@@ -26,7 +27,7 @@ use super::{oos_err, syn_err, too_big_err};
 /// 変数・ラベル名に使えない PL/pgSQL の予約語（PostgreSQL より厳しい。fail-closed）。
 pub(super) const RESERVED: &[&str] = &[
     "begin", "end", "if", "loop", "elsif", "elseif", "then", "declare", "else", "case", "when",
-    "while", "for", "exit", "continue", "return", "execute", "perform", "null", "in",
+    "while", "for", "exit", "continue", "return", "execute", "perform", "null", "in", "raise",
 ];
 
 /// SQL 字句解析が `Token::Keyword` 化する語（変数名にできない）。
@@ -158,7 +159,6 @@ fn check_reserved_name(name: &str, quoted: bool) -> Result<(), SqlSurfaceError> 
 
 /// 範囲外（`0A000`）の文頭の語。
 pub(super) const OUT_OF_SCOPE_STARTS: &[&str] = &[
-    "RAISE",
     "ASSERT",
     "OPEN",
     "FETCH",
@@ -226,6 +226,10 @@ struct Parser<'a> {
     chain: Vec<u32>,
     ctrl: Vec<Ctrl>,
     depth: usize,
+    /// 各行の先頭のバイト位置（`RAISE` の行番号の算出用。本体の走査前に 1 回だけ作る）。
+    line_starts: Vec<usize>,
+    /// 現在解析中の `EXCEPTION` ハンドラの入れ子の深さ（引数なしの `RAISE;` の静的検査に使う）。
+    in_handler: usize,
 }
 
 /// 入口。本体長はスキャンより前に検査する（無制限確保の禁止）。
@@ -244,6 +248,15 @@ pub(super) fn parse(src: &str, opts: &ParseOptions) -> Result<Body, SqlSurfaceEr
         chain: Vec::new(),
         ctrl: Vec::new(),
         depth: 0,
+        line_starts: std::iter::once(0)
+            .chain(
+                src.bytes()
+                    .enumerate()
+                    .filter(|(_, b)| *b == b'\n')
+                    .map(|(i, _)| i.saturating_add(1)),
+            )
+            .collect(),
+        in_handler: 0,
     };
     p.init_outer_scope()?;
     let block = p.parse_top()?;
@@ -826,10 +839,13 @@ impl<'a> Parser<'a> {
             is_loop: false,
         });
         let stmts = self.parse_stmts()?;
+        let (handlers, handler_vars) = if self.is_kw(0, "EXCEPTION") {
+            let (hs, vars) = self.parse_handlers()?;
+            (Some(hs), Some(vars))
+        } else {
+            (None, None)
+        };
         self.ctrl.pop();
-        if self.is_kw(0, "EXCEPTION") {
-            return Err(oos_err("EXCEPTION blocks are not supported in PL/pgSQL"));
-        }
         self.expect_kw("END")?;
         self.end_label(&label)?;
         self.pop_level();
@@ -848,7 +864,245 @@ impl<'a> Parser<'a> {
             label,
             decls,
             stmts,
+            handlers,
+            handler_vars,
         })
+    }
+
+    /// `EXCEPTION WHEN cond [OR cond ...] THEN stmts ...` を読む（`EXCEPTION` の位置から。`END` は
+    /// 消費しない）。ハンドラ本体の前に、暗黙の `SQLSTATE`・`SQLERRM`（text）を宣言した階層を積む。
+    fn parse_handlers(&mut self) -> Result<(Vec<Handler>, (VarId, VarId)), SqlSurfaceError> {
+        self.expect_kw("EXCEPTION")?;
+        let level = self.push_level(None);
+        let mut ids = [VarId(0); 2];
+        for (slot, (name, which)) in ids.iter_mut().zip([
+            ("sqlstate", ExceptionVar::Sqlstate),
+            ("sqlerrm", ExceptionVar::Sqlerrm),
+        ]) {
+            let id = VarId(
+                u32::try_from(self.vars.len())
+                    .map_err(|_| too_big_err("too many PL/pgSQL variables"))?,
+            );
+            self.vars.push(VarDecl {
+                name: name.to_string(),
+                kind: VarKind::ExceptionState(which),
+                constant: true,
+                not_null: false,
+                ty: DeclType::Named(SqlColumnTypeName::Text),
+                default: None,
+                scope_depth: self.chain.len().saturating_sub(1),
+            });
+            self.register(level, name.to_string(), id);
+            *slot = id;
+        }
+        let mut handlers = Vec::new();
+        self.in_handler = self.in_handler.saturating_add(1);
+        while self.eat_kw("WHEN") {
+            let mut conds = Vec::new();
+            loop {
+                conds.extend(self.parse_exc_cond()?);
+                if !self.eat_kw("OR") {
+                    break;
+                }
+            }
+            self.expect_kw("THEN")?;
+            let stmts = self.parse_stmts()?;
+            handlers.push(Handler { conds, stmts });
+        }
+        self.in_handler = self.in_handler.saturating_sub(1);
+        self.pop_level();
+        if handlers.is_empty() {
+            return Err(syn_err("EXCEPTION requires at least one WHEN clause"));
+        }
+        Ok((handlers, (ids[0], ids[1])))
+    }
+
+    /// `WHEN` の条件 1 個（`OTHERS`・`SQLSTATE '...'`・条件名）。条件名は複数コードへ展開しうる。
+    fn parse_exc_cond(&mut self) -> Result<Vec<ExcCond>, SqlSurfaceError> {
+        if self.eat_kw("OTHERS") {
+            return Ok(vec![ExcCond::Others]);
+        }
+        if self.is_kw(0, "SQLSTATE") {
+            self.pos = self.pos.saturating_add(1);
+            let code = self.take_sqlstate_literal()?;
+            return Ok(vec![ExcCond::Code(code)]);
+        }
+        let name = match self.kind(0) {
+            Some(TokKind::Word(w)) => w.to_ascii_lowercase(),
+            _ => return Err(syn_err("expected an exception condition in PL/pgSQL body")),
+        };
+        self.pos = self.pos.saturating_add(1);
+        let codes = condition::codes_for_name(&name);
+        if codes.is_empty() {
+            return Err(unrecognized_condition());
+        }
+        Ok(codes
+            .into_iter()
+            .map(|c| ExcCond::Code(c.to_string()))
+            .collect())
+    }
+
+    /// 次のトークンの文字列リテラルの値を読む（`'...'` のみ）。
+    fn take_str_literal(&mut self) -> Result<String, SqlSurfaceError> {
+        let (start, is_str) = match self.toks.get(self.pos) {
+            Some(t) => (t.start, matches!(t.kind, TokKind::Str)),
+            None => (0, false),
+        };
+        if !is_str {
+            return Err(syn_err("expected a string literal in PL/pgSQL body"));
+        }
+        let (value, _) = crate::sql::lexer::lex_string_literal(self.src, start)
+            .map_err(|_| syn_err("invalid string literal in PL/pgSQL body"))?;
+        self.pos = self.pos.saturating_add(1);
+        Ok(value)
+    }
+
+    /// `SQLSTATE` の直後の 5 文字コード（文字列リテラル）を読んで検証する。
+    fn take_sqlstate_literal(&mut self) -> Result<String, SqlSurfaceError> {
+        let code = self.take_str_literal()?;
+        condition::validate_sqlstate_text(&code)
+    }
+
+    /// 位置 `byte` の行番号（1 始まり）。
+    fn line_of(&self, byte: usize) -> u32 {
+        let n = self.line_starts.partition_point(|s| *s <= byte);
+        u32::try_from(n).unwrap_or(u32::MAX)
+    }
+
+    /// `RAISE`（文頭の `RAISE` から。`;` まで消費する）。
+    fn parse_raise(&mut self) -> Result<Stmt, SqlSurfaceError> {
+        let line = self.line_of(self.toks.get(self.pos).map_or(0, |t| t.start));
+        self.pos = self.pos.saturating_add(1);
+        let mut st = RaiseStmt {
+            level: RaiseLevel::Exception,
+            rethrow: false,
+            fmt: None,
+            args: Vec::new(),
+            condition_code: None,
+            condition_name: None,
+            using: Vec::new(),
+            line,
+        };
+        if self.is_punct(0, ';') {
+            if self.in_handler == 0 {
+                return Err(syn_err(
+                    "RAISE without parameters cannot be used outside an exception handler",
+                ));
+            }
+            self.pos = self.pos.saturating_add(1);
+            st.rethrow = true;
+            return Ok(Stmt::Raise(st));
+        }
+        let level = match self.kind(0) {
+            Some(TokKind::Word(w)) => match w.to_ascii_uppercase().as_str() {
+                "DEBUG" => Some(RaiseLevel::Debug),
+                "LOG" => Some(RaiseLevel::Log),
+                "INFO" => Some(RaiseLevel::Info),
+                "NOTICE" => Some(RaiseLevel::Notice),
+                "WARNING" => Some(RaiseLevel::Warning),
+                "EXCEPTION" => Some(RaiseLevel::Exception),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(l) = level {
+            st.level = l;
+            self.pos = self.pos.saturating_add(1);
+        }
+        match self.kind(0) {
+            Some(TokKind::Str) => {
+                let fmt = self.take_str_literal()?;
+                let mut args = Vec::new();
+                if self.is_punct(0, ',') {
+                    self.pos = self.pos.saturating_add(1);
+                    let a = self.pos;
+                    let e = self.find_end(
+                        a,
+                        &|k| matches!(k, TokKind::Word(w) if w.eq_ignore_ascii_case("USING")),
+                    )?;
+                    for (x, y) in self.split_commas(a, e) {
+                        args.push(self.build_expr(x, y, false)?);
+                    }
+                    self.pos = e;
+                }
+                if count_placeholders(&fmt) != args.len() {
+                    return Err(syn_err(
+                        "number of RAISE parameters does not match the format string",
+                    ));
+                }
+                st.fmt = Some(fmt);
+                st.args = args;
+            }
+            Some(TokKind::Word(w)) if w.eq_ignore_ascii_case("USING") => {}
+            Some(TokKind::Word(w)) if w.eq_ignore_ascii_case("SQLSTATE") => {
+                self.pos = self.pos.saturating_add(1);
+                st.condition_code = Some(self.take_sqlstate_literal()?);
+            }
+            Some(TokKind::Word(w)) => {
+                let name = w.to_ascii_lowercase();
+                let Some(code) = condition::raise_code_for_name(&name) else {
+                    return Err(unrecognized_condition());
+                };
+                self.pos = self.pos.saturating_add(1);
+                st.condition_code = Some(code.to_string());
+                st.condition_name = Some(name);
+            }
+            _ => return Err(syn_err("invalid RAISE statement in PL/pgSQL body")),
+        }
+        if self.eat_kw("USING") {
+            loop {
+                let opt = match self.kind(0) {
+                    Some(TokKind::Word(w)) => match w.to_ascii_uppercase().as_str() {
+                        "MESSAGE" => RaiseOpt::Message,
+                        "DETAIL" => RaiseOpt::Detail,
+                        "HINT" => RaiseOpt::Hint,
+                        "ERRCODE" => RaiseOpt::Errcode,
+                        "COLUMN" | "CONSTRAINT" | "DATATYPE" | "TABLE" | "SCHEMA" => {
+                            return Err(oos_err("this RAISE USING option is not supported"))
+                        }
+                        _ => return Err(syn_err("unrecognized RAISE USING option")),
+                    },
+                    _ => return Err(syn_err("expected a RAISE USING option")),
+                };
+                self.pos = self.pos.saturating_add(1);
+                if !self.eat_assign_op() {
+                    return Err(syn_err("expected = or := after a RAISE USING option"));
+                }
+                if st.using.iter().any(|(o, _)| *o == opt) {
+                    return Err(syn_err("RAISE option already specified"));
+                }
+                // 条件名・`SQLSTATE` 指定と `USING ERRCODE` の二重指定は PostgreSQL 同様に拒否する。
+                if opt == RaiseOpt::Errcode && st.condition_code.is_some() {
+                    return Err(syn_err("RAISE option already specified: ERRCODE"));
+                }
+                let a = self.pos;
+                let e = self.find_end(a, &|k| matches!(k, TokKind::Punct(',')))?;
+                let expr = self.build_expr(a, e, false)?;
+                // `ERRCODE` が文字列リテラルなら定義時に検証する（式なら実行時）。
+                if opt == RaiseOpt::Errcode && e == a.saturating_add(1) {
+                    if let Some(TokKind::Str) = self.toks.get(a).map(|t| &t.kind) {
+                        let (lit, _) = crate::sql::lexer::lex_string_literal(
+                            self.src,
+                            self.toks.get(a).map_or(0, |t| t.start),
+                        )
+                        .map_err(|_| syn_err("invalid string literal in PL/pgSQL body"))?;
+                        condition::resolve_errcode(&lit)?;
+                    }
+                }
+                st.using.push((opt, expr));
+                self.pos = e;
+                if self.is_punct(0, ',') {
+                    self.pos = self.pos.saturating_add(1);
+                } else {
+                    break;
+                }
+            }
+        }
+        if st.fmt.is_some() && st.using.iter().any(|(o, _)| *o == RaiseOpt::Message) {
+            return Err(syn_err("RAISE option already specified: MESSAGE"));
+        }
+        self.expect_punct(';')?;
+        Ok(Stmt::Raise(st))
     }
 
     fn parse_decl(&mut self) -> Result<VarId, SqlSurfaceError> {
@@ -1027,6 +1281,7 @@ impl<'a> Parser<'a> {
             "PERFORM" => self.parse_perform(),
             "EXECUTE" => self.parse_execute(),
             "GET" => self.parse_get(),
+            "RAISE" => self.parse_raise(),
             "NULL" => {
                 self.pos = self.pos.saturating_add(1);
                 self.expect_punct(';')?;
@@ -1532,5 +1787,28 @@ impl<'a> Parser<'a> {
         }
         self.expect_punct(';')?;
         Ok(Stmt::GetDiagnostics { items })
+    }
+}
+
+/// 書式文字列の `%`（`%%` を除く）の数。
+fn count_placeholders(fmt: &str) -> usize {
+    let mut n = 0usize;
+    let mut chars = fmt.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            if chars.peek() == Some(&'%') {
+                chars.next();
+            } else {
+                n = n.saturating_add(1);
+            }
+        }
+    }
+    n
+}
+
+/// 未知の例外条件名（`42704`）。名前は含めない固定文言。
+fn unrecognized_condition() -> SqlSurfaceError {
+    SqlSurfaceError::UndefinedObject {
+        name: "exception condition".to_string(),
     }
 }

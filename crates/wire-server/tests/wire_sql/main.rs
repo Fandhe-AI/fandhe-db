@@ -39,6 +39,7 @@ mod wire_lock_table;
 mod wire_policy_ddl;
 mod wire_policy_using;
 mod wire_policy_with_check;
+mod wire_privilege_oracle;
 mod wire_result_rows_cap;
 mod wire_returning;
 mod wire_role_ddl;

@@ -133,6 +133,17 @@ impl SavepointStack {
         self.entries.truncate(pos.saturating_add(1));
     }
 
+    /// 最も新しい savepoint の位置（空なら `None`）。PL/pgSQL の内部 savepoint が積んだ直後に位置を
+    /// 取るのに使う。
+    pub(crate) fn top_position(&self) -> Option<usize> {
+        self.entries.len().checked_sub(1)
+    }
+
+    /// 位置 `pos` 以上の savepoint をすべて取り除く（`pos` 自身を含む。範囲外は何もしない）。
+    pub(crate) fn truncate_from(&mut self, pos: usize) {
+        self.entries.truncate(pos);
+    }
+
     /// 巻き戻せる savepoint が 1 つでも積まれているか（基底 savepoint の要否判定）。
     pub(crate) fn has_restorable(&self) -> bool {
         self.entries

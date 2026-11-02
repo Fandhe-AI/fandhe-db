@@ -95,7 +95,7 @@ macro_rules! define_error_classes {
 pub(crate) const SHARED_WIRE_CODES: &[&str] = &["23502", "23505", "22023", "P0002"];
 
 define_error_classes! {
-    count = 101;
+    count = 102;
 
     /// 構文上受理された SQL の値・引数が不正（`22000`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidInput`] の写像。
@@ -561,6 +561,10 @@ define_error_classes! {
     /// PL/pgSQL のスカラー関数が `RETURN` に達せず本体の終わりに到達した（`2F005`。Issue #2225・
     /// SQL-68）。[`crate::sql::allowlist::SqlSurfaceError::FunctionExecutedNoReturnStatement`] の写像。
     FunctionExecutedNoReturnStatement => ("2F005", "FUNCTION_EXECUTED_NO_RETURN_STATEMENT"),
+    /// PL/pgSQL の `RAISE EXCEPTION`（既定の SQLSTATE `P0001`。Issue #2227・SQL-70）。
+    /// [`crate::sql::allowlist::SqlSurfaceError::RaisedException`] の写像。利用者が `ERRCODE` で
+    /// 指定した SQLSTATE は分類を変えず、`SqlSurfaceError::raised()` から wire 層が `C` へ出す。
+    RaisedException => ("P0001", "RAISED_EXCEPTION"),
 }
 
 impl ErrorClass {
