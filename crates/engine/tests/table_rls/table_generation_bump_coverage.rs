@@ -568,30 +568,33 @@ const ALLOWLIST: &[(&str, u32)] = &[
     ("catalog/privilege/tests.rs", 21),
     // Issue #2234: SCHEMA 単位の ACL の単体テストの `write` ヘルパ（テスト専用の commit）。
     ("catalog/privilege/schema/tests.rs", 21),
-    ("catalog/sequence.rs", 1386),
-    ("catalog/sequence.rs", 1399),
-    ("catalog/sequence.rs", 1440),
-    ("catalog/sequence.rs", 1489),
-    ("catalog/sequence.rs", 1528),
-    ("catalog/sequence.rs", 1548),
-    ("catalog/sequence.rs", 1669),
-    ("catalog/sequence.rs", 1943),
-    ("catalog/sequence.rs", 2033),
-    ("catalog/sequence.rs", 2073),
-    ("catalog/sequence.rs", 2126),
-    ("catalog/sequence.rs", 2394),
-    ("catalog/sequence.rs", 2439),
-    ("catalog/sequence.rs", 2706),
+    // Issue #2235: SEQUENCE・関数単位の ACL の単体テストの `write` ヘルパ（テスト専用の commit。専用表だけを書き表世代の対象外）。
+    ("catalog/privilege/sequence/tests.rs", 23),
+    ("catalog/privilege/function/tests.rs", 20),
+    ("catalog/sequence.rs", 1419),
+    ("catalog/sequence.rs", 1432),
+    ("catalog/sequence.rs", 1473),
+    ("catalog/sequence.rs", 1522),
+    ("catalog/sequence.rs", 1561),
+    ("catalog/sequence.rs", 1581),
+    ("catalog/sequence.rs", 1702),
+    ("catalog/sequence.rs", 1976),
+    ("catalog/sequence.rs", 2066),
+    ("catalog/sequence.rs", 2106),
+    ("catalog/sequence.rs", 2159),
+    ("catalog/sequence.rs", 2427),
+    ("catalog/sequence.rs", 2473),
+    ("catalog/sequence.rs", 2740),
     // `Storage::create_function`／`Storage::drop_function`（UDF カタログ・Issue #1919）:
     // UDF 定義は専用の関数カタログ表のみを書き、`CATALOG_TABLE`／`user_rows/{table_name}`
     // のいずれにも触れない（行を持たない定義メタデータのため、世代照合の対象テーブルが
     // 存在せずバンプ対象がない）。
     // Issue #1917: `replace_function`（862）の追加と行移動の追随（同じ表だけを書く）。
-    ("catalog/function.rs", 1135),
-    ("catalog/function.rs", 1212),
-    ("catalog/function.rs", 1303),
-    ("catalog/function.rs", 1338),
-    ("catalog/function.rs", 1374),
+    ("catalog/function.rs", 1184),
+    ("catalog/function.rs", 1261),
+    ("catalog/function.rs", 1352),
+    ("catalog/function.rs", 1387),
+    ("catalog/function.rs", 1423),
     // Issue #1921: commit 後の世代（UDF カタログ）追加による行移動の追随。`sql/udf_load.rs` の 1 件は
     // `#[cfg(test)]` 内で壊れた定義 blob を直接書くテスト補助（関数カタログ表だけを書き、世代の対象外）。
     // Issue #2798（型付き永続化の単体テスト追加）・#2218（ルーチンのロード追加）で行番号が移動したための
@@ -600,8 +603,8 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // 同上（#2798 で追加した未知バージョン blob を直接書く単体テスト補助。関数カタログ表だけを書く）。
     ("sql/udf_load.rs", 551),
     // Issue #1920: 上の `#[cfg(test)]` 内のテスト補助（多重定義・SCHEMA 接頭辞削除の状態を直接作る）。
-    ("catalog/function.rs", 1939),
-    ("catalog/function.rs", 2151),
+    ("catalog/function.rs", 1988),
+    ("catalog/function.rs", 2200),
     // Issue #1689（ALTER SEQUENCE）: `alter_sequence`／`rename_sequence`（803・842）も同じ表だけを書く
     // （定義 blob の上書き・キーの付け替え・状態行の削除）ため同じ理由で対象外。
     // Issue #1733（INSERT ... SELECT）: `core/insert_select_exec.rs` の 1007・1139 行（Issue #2613・#2614・#2615・#2212・#1726 で追随）は `#[cfg(test)]` 内の

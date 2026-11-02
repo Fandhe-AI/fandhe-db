@@ -16,8 +16,7 @@ use crate::storage::read_source::ReadSource;
 use super::super::role::validate_tenant;
 use super::super::{CatalogError, Result, Storage};
 use super::{
-    corrupt, decode_row, list_acl_for_object_in_txn, PrivilegeObject, ACL_TABLE, KIND_SCHEMA,
-    MAX_ACL_ENTRIES_PER_TENANT, PUBLIC_GRANTEE_ID,
+    corrupt, decode_row, PrivilegeObject, ACL_TABLE, KIND_SCHEMA, MAX_ACL_ENTRIES_PER_TENANT,
 };
 
 /// SCHEMA `schema_id` について、`role_ids` のいずれか（と PUBLIC）が持つ権限ビットの和を返す。
@@ -30,11 +29,7 @@ pub(crate) fn schema_privileges_in_txn<R: ReadSource>(
     schema_id: u64,
     role_ids: &[u64],
 ) -> Result<u16> {
-    let entries = list_acl_for_object_in_txn(src, tenant, &PrivilegeObject::Schema(schema_id))?;
-    Ok(entries
-        .iter()
-        .filter(|e| e.grantee_id == PUBLIC_GRANTEE_ID || role_ids.contains(&e.grantee_id))
-        .fold(0u16, |acc, e| acc | e.privileges))
+    super::object_privileges_in_txn(src, tenant, &PrivilegeObject::Schema(schema_id), role_ids)
 }
 
 /// `tenant` の SCHEMA `schema_id` の ACL 行をすべて削除する（`DROP SCHEMA` の同一 write txn から呼ぶ）。

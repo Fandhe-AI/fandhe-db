@@ -15,7 +15,7 @@
 //! 出さない。
 
 use crate::catalog::privilege::{
-    AclChangeError, AclItem, AclRequest, AclScope, AclWarning, GranteeSpec,
+    AclChangeError, AclFunctionRef, AclItem, AclRequest, AclScope, AclWarning, GranteeSpec,
 };
 use crate::catalog::CatalogError;
 use crate::sql::allowlist::{
@@ -91,6 +91,14 @@ pub(crate) fn execute_grant_revoke(
             columns: i.columns.clone(),
         })
         .collect();
+    let functions: Vec<AclFunctionRef> = objects
+        .functions
+        .iter()
+        .map(|f| AclFunctionRef {
+            name: f.name.clone(),
+            arg_types: f.arg_types.clone(),
+        })
+        .collect();
     let req = AclRequest {
         is_grant: stmt.is_grant,
         grantor_id,
@@ -99,9 +107,13 @@ pub(crate) fn execute_grant_revoke(
             GrantScope::Tables => AclScope::Tables,
             GrantScope::Schemas => AclScope::Schemas,
             GrantScope::AllTablesInSchemas => AclScope::AllTablesInSchemas,
+            GrantScope::Sequences => AclScope::Sequences,
+            GrantScope::Functions => AclScope::Functions,
         },
         tables: &objects.tables,
         schemas: &objects.schemas,
+        sequences: &objects.sequences,
+        functions: &functions,
         items: &items,
         grantees: &grantees,
         grant_option: objects.grant_option,
@@ -116,7 +128,7 @@ pub(crate) fn execute_grant_revoke(
     })
 }
 
-/// 権限カタログの失敗を SQL 表層の契約へ写像する（付与先ロール不在 `42704`・表不在 `42P01`・SCHEMA 不在 `3F000`・種別違い
+/// 権限カタログの失敗を SQL 表層の契約へ写像する（付与先ロール不在 `42704`・表不在 `42P01`・関数不在 `42883`・SCHEMA 不在 `3F000`・種別違い
 /// `42809`・列不在 `42703`・権限なし `42501`・依存する付与 `2BP01`・不正な付与 `0LP01`・未対応 `0A000`・
 /// 件数上限 `54000`・ロック timeout `55P03`・その他 `XX000`）。文言は固定か利用者自身が書いた名前だけ。
 pub(crate) fn map_acl_error(e: AclChangeError) -> SqlSurfaceError {
@@ -125,6 +137,9 @@ pub(crate) fn map_acl_error(e: AclChangeError) -> SqlSurfaceError {
         AclChangeError::GranteeNotFound(n) => SqlSurfaceError::undefined_role(n),
         AclChangeError::ColumnNotFound(c) => SqlSurfaceError::undefined_column(c),
         AclChangeError::SchemaNotFound(n) => SqlSurfaceError::invalid_schema_name(n),
+        AclChangeError::FunctionNotFound => {
+            SqlSurfaceError::undefined_function("function does not exist")
+        }
         AclChangeError::PermissionDenied => SqlSurfaceError::InsufficientPrivilege,
         AclChangeError::DependentPrivileges => SqlSurfaceError::DependentObjectsStillExist {
             name: "privilege grant".to_string(),

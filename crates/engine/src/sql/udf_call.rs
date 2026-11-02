@@ -8600,6 +8600,9 @@ fn bind_call(
     // 解決順（組み込み → 宣言的 UDF → WASM UDF）。組み込みは上で既に処理済みなので
     // ここでは宣言的 UDF を先に試し、次に WASM UDF を試す。
     if let Some(def) = env.registry.get(name).cloned() {
+        // EXECUTE 権限（Issue #2235。拒否集合は `core.rs` が文の実行区間の頭で張る。入れ子の展開もここを
+        // 通るので呼び出し元ロールで判定される）。解決の後・展開の前に検査し、拒否は副作用の前に返る。
+        crate::sql::object_privilege::check_execute(name)?;
         // 登録済み宣言的 UDF 呼び出し: 実引数を呼び出し元の文脈（`env.schema`・
         // 現在の `env.params`）で先に束縛してから、UDF 本体をパラメータ名 →
         // 束縛済み実引数の対応表で束縛し直す（インライン展開。呼び出し元は

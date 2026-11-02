@@ -224,6 +224,9 @@ pub(crate) fn plan(
         }
         return Err(missing());
     };
+    // EXECUTE 権限（Issue #2235）。解決の直後・起動の前に検査する（他の拒否より先に権限を判定しない:
+    // 関数の不在は上で `42883` になっており、存在する関数に限って権限を判定する）。
+    crate::sql::object_privilege::check_execute(&scan.name)?;
     let RoutineReturn::Set(cols) = &def.ret else {
         return Err(unsupported(
             "only set-returning LANGUAGE sql functions are supported in FROM",

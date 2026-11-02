@@ -9,6 +9,7 @@
 
 ### Added
 
+- `GRANT`／`REVOKE` が SEQUENCE 単位（`ON SEQUENCE`。権限は USAGE・SELECT・UPDATE）と関数単位（`ON FUNCTION <名>[(<型>, ...)]`。権限は EXECUTE）を受理する（Issue #2235・SQL-40・RLS-12）。束縛ロール（DDL 権限ゲート通過の主体を除く）は、権限の無い `nextval`・`currval`・`setval`・`lastval` と関数呼び出しが `42501` になる（IDENTITY／SERIAL 列の暗黙の採番は SEQUENCE 権限なしで通る。新規の関数は PUBLIC が EXECUTE を持つ）。`ALL SEQUENCES／FUNCTIONS IN SCHEMA` は `0A000` のまま。公開 API の変更はない。
 - `ROLLBACK TO` で巻き戻した文の `operation_id` を同一 Tx 内で再利用できるようにした。巻き戻した文の台帳記録は `COMMIT` 後に残らない（Issue #1944・SQL-69・RECOVER-1）。公開 API の変更はない。
 - `GRANT`／`REVOKE` が SCHEMA 単位（`ON SCHEMA`・`ON ALL TABLES IN SCHEMA`。権限は USAGE・CREATE）を受理する（Issue #2234・SQL-40・RLS-12）。束縛ロール（DDL 権限ゲート通過の主体を除く）が USAGE の無い SCHEMA を修飾名で参照すると `42501`（他テナント・不在は `3F000`）。現在ロール未束縛のセッションの `GRANT … ON SCHEMA s` は `0A000` ではなく `42501` になる。公開 API の変更はない。
 - `ALTER ROLE`／`ALTER USER`（属性・パスワードの変更と `RENAME TO`）と `SET ROLE`／`RESET ROLE` を追加した（Issue #1963・SQL-39）。`SET ROLE` はセッションのロールから `SET` 真のメンバーシップを辿れる対象にだけ切り替え、未所属は `42501`、他テナントのロールは不在と同じ `42704`。`PolicyContext`・DDL 権限は変えない。BREAKING CHANGE: 公開 enum `ParsedSql`・`SqlOutcome` に variant（`AlterRole`・`SetRole`）を追加した。

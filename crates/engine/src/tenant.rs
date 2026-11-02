@@ -1582,20 +1582,19 @@ fn reject_missing_not_null(
     Ok(())
 }
 
+/// [`sequence_runtime`] の戻り値（アロケータ・セッションの `currval` 状態・ACL で判定すべき主体〔Issue #2235〕）。
+type SequenceRuntime = (
+    std::sync::Arc<crate::catalog::sequence::SequenceAllocator>,
+    Option<crate::sql::sequence_scope::SharedSessionSequences>,
+    Option<u64>,
+);
+
 /// 採番に使うアロケータとセッション状態を解決する（`nextval` 列の採番と、移行済み表の `id` 省略
 /// INSERT の採番〔Issue #1699〕が共有する。第 2 の実装を作らない）。一時表（セッション専用の別 DB）は
 /// 永続 DB の SEQUENCE カタログを解決できず、カーソルも一時 DB へ永続化してしまうため明示的に拒否する
 /// （`42P01` の誤報を避ける）。`SequenceScope` が無い経路は `Autocommit` の `Storage` のアロケータだけを
 /// 使い（セッション状態なし）、明示トランザクションでスコープが無ければ `0A000`（fail-closed）。
-fn sequence_runtime(
-    target: &WriteTarget<'_>,
-) -> Result<
-    (
-        std::sync::Arc<crate::catalog::sequence::SequenceAllocator>,
-        Option<crate::sql::sequence_scope::SharedSessionSequences>,
-    ),
-    TenantWriteError,
-> {
+fn sequence_runtime(target: &WriteTarget<'_>) -> Result<SequenceRuntime, TenantWriteError> {
     let sql_err = |e: SqlSurfaceError| TenantWriteError::SequenceEvaluationFailed(e);
     if matches!(target, WriteTarget::Autocommit(storage) if storage.is_temp_scoped()) {
         return Err(sql_err(SqlSurfaceError::FeatureNotSupported {
@@ -1603,11 +1602,13 @@ fn sequence_runtime(
         }));
     }
     match crate::sql::sequence_scope::current() {
-        Some(c) => Ok((c.allocator, c.session)),
+        Some(c) => Ok((c.allocator, c.session, c.acl_role)),
         None => match target {
-            WriteTarget::Autocommit(storage) => {
-                Ok((std::sync::Arc::clone(storage.sequence_allocator()), None))
-            }
+            WriteTarget::Autocommit(storage) => Ok((
+                std::sync::Arc::clone(storage.sequence_allocator()),
+                None,
+                None,
+            )),
             WriteTarget::InTxn(_) => Err(sql_err(SqlSurfaceError::FeatureNotSupported {
                 detail: "nextval is not supported in this context".to_string(),
             })),
@@ -1677,7 +1678,7 @@ fn assign_pseudo_id(
     table: &str,
     row_idx: usize,
 ) -> Result<u64, TenantWriteError> {
-    let (allocator, session) = sequence_runtime(target)?;
+    let (allocator, session, _) = sequence_runtime(target)?;
     let Some((_, def)) = crate::catalog::sequence::migrated_id_sequence_in_txn(write_txn, table)?
     else {
         return Err(TenantWriteError::Catalog(
@@ -1725,7 +1726,7 @@ fn assign_sequence_values(
     row_marks: &[&[VolatileColumn]],
     row_values: &[&[crate::row_codec::Value]],
 ) -> Result<Option<Vec<Vec<crate::row_codec::Value>>>, TenantWriteError> {
-    use crate::catalog::sequence::{sequence_definition_in_txn, AllocError};
+    use crate::catalog::sequence::{sequence_definition_with_owner_in_txn, AllocError};
     use crate::sql::allowlist::SequenceFunc;
     use crate::sql::sequence_scope;
 
@@ -1733,7 +1734,7 @@ fn assign_sequence_values(
         return Ok(None);
     }
     let sql_err = |e: SqlSurfaceError| TenantWriteError::SequenceEvaluationFailed(e);
-    let (allocator, session) = sequence_runtime(target)?;
+    let (allocator, session, acl_role) = sequence_runtime(target)?;
 
     let mut out: Vec<Vec<crate::row_codec::Value>> = Vec::new();
     out.try_reserve_exact(row_values.len()).map_err(|_| {
@@ -1776,11 +1777,46 @@ fn assign_sequence_values(
                     }
                 },
             };
-            let seq_def = sequence_definition_in_txn(write_txn, seq_name)?.ok_or_else(|| {
-                TenantWriteError::Catalog(CatalogError::TableNotFound(seq_name.to_string()))
-            })?;
+            let (seq_def, seq_owner) = sequence_definition_with_owner_in_txn(write_txn, seq_name)?
+                .ok_or_else(|| {
+                    TenantWriteError::Catalog(CatalogError::TableNotFound(seq_name.to_string()))
+                })?;
             let (seq_id, params, restart_value) =
                 (seq_def.id, seq_def.params, seq_def.restart_value);
+            // SEQUENCE の権限検査（Issue #2235。S1〜S4）。解決（不在 `42P01`）の後・採番と `currval` の
+            // 判定（`55000`）より前に、書き込み txn と同じスナップショットの ACL で行う。拒否は値を消費
+            // する前に返る。暗黙の採番（SERIAL・IDENTITY・`OWNED BY` 済みの列 DEFAULT）は、書き込み先の
+            // 表の INSERT 権限だけで通す（SQL-40 (6)(a)）。所有されていない SEQUENCE を参照する利用者の
+            // `DEFAULT nextval('s')` と VALUES 内の明示の `nextval`／`currval` は検査する。
+            if let Some(role) = acl_role {
+                let implicit_owned = matches!(mark, VolatileColumn::DefaultSequence(..))
+                    && match column.default_expr.as_ref() {
+                        Some(crate::catalog::ColumnDefault::Identity { .. }) => true,
+                        Some(crate::catalog::ColumnDefault::Sequence(_)) => seq_owner
+                            .as_ref()
+                            .is_some_and(|o| o.table == schema.name && o.column == column.name),
+                        _ => false,
+                    };
+                if !implicit_owned {
+                    use crate::catalog::privilege::{PRIV_SELECT, PRIV_UPDATE, PRIV_USAGE};
+                    let needed = match func {
+                        SequenceFunc::Nextval => PRIV_USAGE | PRIV_UPDATE,
+                        SequenceFunc::Currval => PRIV_USAGE | PRIV_SELECT,
+                    };
+                    crate::sql::object_privilege::check_any_of(Some(role), needed, &|r| {
+                        crate::catalog::privilege::sequence_privileges_in_txn(
+                            write_txn,
+                            tenant_id,
+                            seq_id,
+                            &[r],
+                        )
+                        .map_err(|_| SqlSurfaceError::Internal {
+                            detail: "privilege catalog operation failed".to_string(),
+                        })
+                    })
+                    .map_err(sql_err)?;
+                }
+            }
             let value: i64 = match func {
                 SequenceFunc::Nextval => nextval_recorded(
                     &allocator,

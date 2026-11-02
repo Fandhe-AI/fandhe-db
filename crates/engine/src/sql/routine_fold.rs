@@ -202,6 +202,11 @@ impl<'a, 'b> Folder<'a, 'b> {
             self.found = true;
             return Ok(original.clone());
         }
+        // EXECUTE 権限（Issue #2235）。解決の直後・型検査と起動の前に検査する（`Detect` は呼び出しの有無を
+        // 探るだけなので、拒否で検出を妨げない。拒否は実行・Describe の両方で同じ `42501`）。
+        if let Expr::Call { name, .. } = original {
+            crate::sql::object_privilege::check_execute(name)?;
+        }
         let ret = match &def.ret {
             RoutineReturn::Scalar(t) => t.clone(),
             RoutineReturn::Trigger => {
