@@ -2029,7 +2029,7 @@ impl<'e> SessionTransaction<'e> {
     /// `ROLLBACK TO` での復帰を許さない失敗遷移（Issue #1947）。`Active`・`FailedRecoverable` の
     /// `ActiveTxn` を破棄（writer を abort して permit を解放）して `Failed` へ。暗黙 Tx は
     /// `Idle`。`Idle`・`Failed` では何もしない（冪等）。
-    pub(crate) fn fail_unrecoverable(&mut self) {
+    pub fn fail_unrecoverable(&mut self) {
         if self.abort_if_implicit() {
             return;
         }

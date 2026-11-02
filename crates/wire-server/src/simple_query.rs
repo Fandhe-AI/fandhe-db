@@ -1109,7 +1109,8 @@ fn respond_command_complete_with<S: WireStream>(
             Ok(StatementStatus::Completed)
         }
         Err(_) => {
-            txn.fail();
+            // 内部エラー（`XX000`）は復帰不可（writer 即時解放。Issue #1947）。
+            txn.fail_unrecoverable();
             respond_error(
                 stream,
                 ErrorClass::InternalError,

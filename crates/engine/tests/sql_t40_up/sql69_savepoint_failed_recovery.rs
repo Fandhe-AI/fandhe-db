@@ -370,3 +370,22 @@ fn recovery_stays_within_tenant_visibility() {
     assert_eq!(committed_rows(&core, &a), 1);
     assert_eq!(committed_rows(&core, &ctx("tenant-b")), 1);
 }
+
+/// COPY 失敗・wire 層の内部エラー（XX000）は `fail_unrecoverable` で遷移する。savepoint があっても
+/// `ROLLBACK TO` で復帰できず、writer は即時解放される（Issue #1947）。
+#[test]
+fn internal_error_failure_with_savepoint_is_not_recoverable() {
+    let (core, _g) = new_core("sql69-fr-internal");
+    let caller = ctx("tenant-a");
+    let mut s = SessionState::default();
+    let mut txn = begin_sp(&core, &caller, &mut s);
+    run(&core, &caller, &mut s, &mut txn, &insert_sql(1, "op-1")).unwrap();
+    txn.fail_unrecoverable();
+    assert_eq!(txn.status(), TransactionStatus::Failed);
+    assert_eq!(
+        code(run(&core, &caller, &mut s, &mut txn, "ROLLBACK TO a")),
+        "25P02"
+    );
+    // writer は解放済み。
+    assert_eq!(other_session_write_code(&core, 9, "other-1"), None);
+}

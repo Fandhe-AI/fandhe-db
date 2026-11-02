@@ -13680,8 +13680,8 @@ impl EngineCore {
             TransactionStatus::Failed => Err(txn.take_failed_error()),
             TransactionStatus::InTransaction => {
                 let result = self.begin_copy_active(ctx, session, txn, sql);
-                if result.is_err() {
-                    txn.fail();
+                if let Err(e) = &result {
+                    txn.fail_for(e);
                 }
                 result
             }
@@ -13899,7 +13899,7 @@ impl EngineCore {
                         Ok(outcome)
                     }
                     Err(e) => {
-                        txn.fail();
+                        txn.fail_for(&e);
                         Err(e)
                     }
                 }
