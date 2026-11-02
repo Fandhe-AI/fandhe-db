@@ -1450,6 +1450,13 @@ pub(crate) fn run_batch_search<S: BatchRowSource>(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .release(row_buf);
 
+    // 走査終了後の即時期限確認（Issue #1953）。行ループ内の確認は 1024 回ごとの間引きのため、
+    // 行先頭の確認後に期限を超えても `Ok` を返さないよう、結果返却前に時計を読んで確定させる
+    // （`gpu_batch.rs::run_tiled_batch_search` の終了時確認と同じ契約）。
+    if let Err(reason) = crate::interrupt::check_now_reason() {
+        return Err(BatchSearchError::QueryCanceled { reason });
+    }
+
     // `out` も `Vec::with_capacity`（abort-on-OOM）ではなく
     // `try_reserve_exact` でフォールブルに確保する（codex P1 指摘対応）。
     let mut out: Vec<BatchHit> = Vec::new();
@@ -1857,6 +1864,36 @@ mod tests {
             run_batch_search(&matrix, &queries).unwrap()[0].hits.len(),
             2
         );
+    }
+
+    // Issue #1953: 走査終了後に期限を超えた場合も `Ok` を返さない（間引き確認の取りこぼし防止）。
+    // 行数を 1 行にして行ループ内の確認（先頭 1 回のみ）を通過させ、走査中に期限を跨がせる。
+    #[test]
+    fn deadline_expiring_during_scan_is_detected_before_returning() {
+        let ids = [1u64];
+        let tenants = ["tenant-a".to_string()];
+        let visibilities = [Visibility::Public];
+        let vectors = [1.0f32, 0.0];
+        let matrix = ResidentMatrix::build(&ids, &tenants, &visibilities, 2, &vectors).unwrap();
+        let ctx = crate::policy::PolicyContext::new("tenant-a").unwrap();
+        let query = [1.0f32, 0.0];
+        let queries = [BatchQuery {
+            vector: &query,
+            k: 1,
+            ctx: &ctx,
+        }];
+        // 期限を既に過ぎた状態では、走査終了後の確認も `QueryCanceled` を返す。
+        let _scope = crate::interrupt::DeadlineScope::install(
+            crate::interrupt::StatementDeadline::at(std::time::Instant::now()),
+        );
+        assert!(matches!(
+            crate::interrupt::check_now_reason(),
+            Err(crate::interrupt::InterruptReason::StatementTimeout)
+        ));
+        assert!(matches!(
+            run_batch_search(&matrix, &queries),
+            Err(BatchSearchError::QueryCanceled { .. })
+        ));
     }
 
     // Cursor Bugbot 指摘対応: 容量チェックは `MAX_TENANT_ID_LEN` で予算計上する
