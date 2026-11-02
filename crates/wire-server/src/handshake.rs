@@ -602,7 +602,11 @@ fn post_auth_loop<'e, S: WireStream>(
             // 同じ検査に加えてここでも `Failed` へ遷移させる（ループ末尾へ到達しない
             // `continue` 経路が将来追加されても取りこぼさないための多層防御）。
             if extended.ignore_till_sync {
-                txn.fail();
+                if extended.ignore_till_sync_internal {
+                    txn.fail_unrecoverable();
+                } else {
+                    txn.fail();
+                }
             }
             // WIRE-11・Issue #1174: Sync を越えて保持された名前付き portal のうち
             // 所属トランザクションが終わったものを、以降の処理に先立って破棄する。
@@ -1051,7 +1055,12 @@ fn post_auth_loop<'e, S: WireStream>(
         // では何もしないため、トランザクション外・既に `Failed` の挙動は不変。
         if extended.ignore_till_sync {
             if let Some(txn) = txn.as_mut() {
-                txn.fail();
+                // 内部エラー（`XX000`）は `ROLLBACK TO` で復帰させず writer を即時解放する（Issue #1947）。
+                if extended.ignore_till_sync_internal {
+                    txn.fail_unrecoverable();
+                } else {
+                    txn.fail();
+                }
             }
         }
     }
