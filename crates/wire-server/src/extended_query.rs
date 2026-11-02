@@ -914,6 +914,10 @@ struct Portal {
     /// [`MAX_BOUND_PARAM_BYTES_PER_SESSION`] で制限する（[`PortalStore::insert`]）。
     /// portal ごとの値から都度合算するため、除去経路での減算漏れが起きない。
     bound_bytes: usize,
+    /// Bind 時点の準備済み文（権限再検査用のスナップショット。`PreparedStatement::Empty` は `None`）。
+    /// Execute の読み取り権限再検査は、現在の statement を名前で引き直さず必ずこの値を使う
+    /// （無名 statement の置換・破棄後も、実行する文と検査する文を同一にそろえる。Issue #1967）。
+    prepared_snapshot: Option<PreparedSql>,
 }
 
 /// 接続単位で portal を保持する（[`PreparedStatementStore`] と同型の設計）。
@@ -2027,6 +2031,11 @@ fn handle_bind_body(
             .map_err(HandlerError::BinaryFormat)?;
     }
 
+    let prepared_snapshot = match state.statements.get(&msg.statement_name) {
+        Some(PreparedStatement::Parsed { prepared, .. }) => Some((**prepared).clone()),
+        Some(PreparedStatement::Parameterized { prepared, .. }) => Some(prepared.clone()),
+        _ => None,
+    };
     let portal = Portal {
         source_statement: msg.statement_name,
         body: portal_body,
@@ -2037,6 +2046,7 @@ fn handle_bind_body(
         bound_txn_generation: txn.active_generation(),
         survived_sync: false,
         bound_bytes,
+        prepared_snapshot,
     };
 
     state
@@ -2312,19 +2322,18 @@ fn execute_portal<'e, S: WireStream>(
         // （Bind 後の `REVOKE` や、別 portal の `SET ROLE` を反映する。fail-closed）。準備済み文が
         // 引けない場合も拒否する。未束縛のセッションでは何もしない。
         if session.object_privileges_enforced() {
-            let source = state
+            let snapshot = state
                 .portals
                 .get(portal_name)
-                .map(|p| p.source_statement.clone())
-                .ok_or(HandlerError::UnknownPortal)?;
-            let gate =
-                match state.statements.get(&source) {
-                    Some(PreparedStatement::Parsed { prepared, .. }) => engine
-                        .recheck_prepared_read_privileges_in_txn(session, txn, prepared, &parsed),
-                    Some(PreparedStatement::Parameterized { prepared, .. }) => engine
-                        .recheck_prepared_read_privileges_in_txn(session, txn, prepared, &parsed),
-                    _ => Err(engine::sql::allowlist::SqlSurfaceError::InsufficientPrivilege),
-                };
+                .ok_or(HandlerError::UnknownPortal)?
+                .prepared_snapshot
+                .clone();
+            let gate = match snapshot.as_ref() {
+                Some(prepared) => {
+                    engine.recheck_prepared_read_privileges_in_txn(session, txn, prepared, &parsed)
+                }
+                None => Err(engine::sql::allowlist::SqlSurfaceError::InsufficientPrivilege),
+            };
             if let Err(e) = gate {
                 if let Some(portal) = state.portals.get_mut(portal_name) {
                     portal.state = PortalState::Failed;
@@ -2916,6 +2925,73 @@ pub(crate) fn handle_flush<S: WireStream>(stream: &mut S) -> io::Result<LoopSign
 
 #[cfg(test)]
 mod tests {
+    /// Issue #1967: portal は Bind 時点の準備済み文を保持し、後続の無名 statement の置換・破棄に
+    /// 影響されない（Execute の権限再検査は現在の statement を引き直さずこの値を使う）。
+    #[test]
+    fn portal_keeps_bind_time_prepared_snapshot_across_unnamed_reparse() {
+        use engine::kernel::CpuScalarProvider;
+        use engine::storage::Storage;
+        let path = std::env::temp_dir().join(format!(
+            "portal-snap-{}-{:?}.redb",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let storage = Storage::open(&path).expect("open storage");
+        let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+        let session = engine::sql::mode::SessionState::default();
+        let mut txn = engine::sql::transaction::SessionTransaction::new(
+            engine::sql::transaction::TransactionLimits::default(),
+        );
+        let mut state = ExtendedQueryState::new();
+        let parse = |q: &str| {
+            let mut b = Vec::new();
+            b.push(0u8);
+            b.extend_from_slice(q.as_bytes());
+            b.push(0);
+            b.extend_from_slice(&0i16.to_be_bytes());
+            b
+        };
+        let mut bind = vec![b'p', 0, 0];
+        bind.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+        handle_parse_body(
+            &core,
+            &session,
+            &mut txn,
+            &mut state.statements,
+            &parse("SELECT 1"),
+        )
+        .map_err(|_| ())
+        .expect("parse 1");
+        handle_bind_body(&core, &session, &mut txn, &mut state, &bind)
+            .map_err(|_| ())
+            .expect("bind");
+        let before = format!(
+            "{:?}",
+            state.portals.get("p").expect("portal").prepared_snapshot
+        );
+        handle_parse_body(
+            &core,
+            &session,
+            &mut txn,
+            &mut state.statements,
+            &parse("SELECT 2"),
+        )
+        .map_err(|_| ())
+        .expect("parse 2");
+        let after = format!(
+            "{:?}",
+            state.portals.get("p").expect("portal").prepared_snapshot
+        );
+        assert_eq!(before, after);
+        assert!(state
+            .portals
+            .get("p")
+            .expect("portal")
+            .prepared_snapshot
+            .is_some());
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// 中断 portal の保持量見積りは wire 表現（`frame_len`）より行本体・`Cell` 配列分だけ大きい
     /// （NULL 多数の行で上限会計が過小にならない。Issue #1575 レビュー指摘）。
     #[test]
@@ -3385,6 +3461,7 @@ mod tests {
     fn portal_with_bound_bytes(bound_bytes: usize) -> Portal {
         Portal {
             source_statement: String::new(),
+            prepared_snapshot: None,
             body: PortalBody::Empty,
             columns: None,
             result_formats: Vec::new(),
@@ -3548,6 +3625,7 @@ mod tests {
                     format!("p{i}"),
                     Portal {
                         source_statement: String::new(),
+                        prepared_snapshot: None,
                         body: PortalBody::Empty,
                         columns: None,
                         result_formats: Vec::new(),
@@ -3564,6 +3642,7 @@ mod tests {
             format!("p{MAX_PORTALS_PER_SESSION}"),
             Portal {
                 source_statement: String::new(),
+                prepared_snapshot: None,
                 body: PortalBody::Empty,
                 columns: None,
                 result_formats: Vec::new(),
@@ -3585,6 +3664,7 @@ mod tests {
                 String::new(),
                 Portal {
                     source_statement: String::new(),
+                    prepared_snapshot: None,
                     body: PortalBody::Empty,
                     columns: None,
                     result_formats: Vec::new(),
@@ -3601,6 +3681,7 @@ mod tests {
                 "named".to_string(),
                 Portal {
                     source_statement: String::new(),
+                    prepared_snapshot: None,
                     body: PortalBody::Empty,
                     columns: None,
                     result_formats: Vec::new(),
@@ -3626,6 +3707,7 @@ mod tests {
                 "p1".to_string(),
                 Portal {
                     source_statement: "stmt1".to_string(),
+                    prepared_snapshot: None,
                     body: PortalBody::Empty,
                     columns: None,
                     result_formats: Vec::new(),
@@ -3642,6 +3724,7 @@ mod tests {
                 "p2".to_string(),
                 Portal {
                     source_statement: "stmt2".to_string(),
+                    prepared_snapshot: None,
                     body: PortalBody::Empty,
                     columns: None,
                     result_formats: Vec::new(),
@@ -3662,6 +3745,7 @@ mod tests {
     fn portal_bound_at(generation: Option<u64>, survived_sync: bool) -> Portal {
         Portal {
             source_statement: String::new(),
+            prepared_snapshot: None,
             body: PortalBody::Empty,
             columns: None,
             result_formats: Vec::new(),
