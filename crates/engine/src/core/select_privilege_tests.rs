@@ -724,3 +724,73 @@ fn syntax_word_named_tables_are_gated_in_both_protocols() {
         "ok"
     );
 }
+
+/// ビューだけに SELECT を付与したロールは、基底表と同名の別名・列を含む問い合わせでもビューを読める
+/// （ビューの展開中に解決された基底表は ACL を要求しない。通常 SQL と準備済み文の両方。Issue #1967）。
+#[test]
+fn view_reader_is_not_asked_for_base_table_privilege_by_alias_or_column() {
+    let f = fx("selpriv-base-alias");
+    f.admin_run("CREATE VIEW v AS SELECT n FROM ca");
+    f.admin_run("GRANT SELECT ON v TO alice");
+    let s = bound(f.alice, A, false);
+    let mut simple = bound(f.alice, A, false);
+    for q in [
+        "SELECT n FROM v",
+        "SELECT ca.n FROM v AS ca",
+        "SELECT ca.n FROM v ca",
+        "SELECT n AS ca FROM v",
+    ] {
+        assert_eq!(
+            code(f.core.execute_sql_in_session(&ctx(A), &mut simple, q)),
+            "ok",
+            "simple: {q}"
+        );
+        f.core
+            .parse_sql_prepared_with_declared_in_session(&s, q, &[])
+            .unwrap_or_else(|e| panic!("prepared {q}: {e:?}"));
+    }
+    // 基底表そのものは読めない。
+    assert_eq!(
+        code(
+            f.core
+                .execute_sql_in_session(&ctx(A), &mut simple, "SELECT n FROM ca")
+        ),
+        "42501"
+    );
+}
+
+/// 入れ子のビュー（`v_outer` -> `v_inner` -> 表）を Bind した後、外側の定義は変えずに内側のビューだけが
+/// `CREATE OR REPLACE` で別の表へ向け直されたら、portal は失効する（外側の定義が不変でも、Bind 時に
+/// 展開した本文は古い。`SET ROLE` 相当の別の主体でも同じ。Issue #1967）。
+#[test]
+fn nested_view_replacement_invalidates_bound_portal() {
+    let f = fx("selpriv-nested-view");
+    f.admin_run("CREATE VIEW v_inner AS SELECT n FROM ca");
+    f.admin_run("CREATE VIEW v_outer AS SELECT n FROM v_inner");
+    f.admin_run("GRANT SELECT ON v_outer TO alice");
+    let s = bound(f.alice, A, false);
+    let prepared = f
+        .core
+        .parse_sql_prepared_with_declared_in_session(&s, "SELECT n FROM v_outer", &[])
+        .expect("parse");
+    let txn = f.core.new_session_transaction();
+    let identity = f
+        .core
+        .prepared_relation_identity_in_txn(&s, &txn, &prepared)
+        .expect("identity");
+    f.core
+        .bind_prepared_in_txn(&s, &txn, &prepared, &[])
+        .expect("bind");
+    f.core
+        .check_prepared_relation_identity(&s, &txn, &prepared, &identity)
+        .expect("unchanged");
+    f.admin_run("CREATE OR REPLACE VIEW v_inner AS SELECT n FROM cb");
+    f.admin_run("GRANT SELECT ON v_outer TO admin_r");
+    for who in [&s, &bound(f.admin, A, false)] {
+        let e = f
+            .core
+            .check_prepared_relation_identity(who, &txn, &prepared, &identity)
+            .expect_err("nested replacement must invalidate the portal");
+        assert_eq!(e.wire_code(), "0A000");
+    }
+}

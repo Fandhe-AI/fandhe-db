@@ -944,16 +944,14 @@ impl EngineCore {
         } else {
             None
         };
+        // 文に直接現れる名前に加え、解析が直接解決した名前も取る（収集器の取りこぼしに依存しない）。
+        for n in &prepared.parsed_relations {
+            if !names.contains(n) {
+                names.push(n.clone());
+            }
+        }
         let ids = match read_snap {
-            Some(snap) => names
-                .iter()
-                .map(|k| {
-                    Ok((
-                        k.clone(),
-                        crate::catalog::privilege::relation_identity_in_txn(snap, k)?,
-                    ))
-                })
-                .collect::<Result<Vec<_>, crate::catalog::CatalogError>>(),
+            Some(snap) => crate::catalog::privilege::relation_identity_closure_in_txn(snap, &names),
             None => self.storage.relation_identities(&names),
         }
         .map_err(crate::catalog::table_lookup_error)?;

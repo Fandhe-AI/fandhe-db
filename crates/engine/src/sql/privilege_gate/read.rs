@@ -248,19 +248,15 @@ pub(crate) struct ParsedScope<'a> {
     pub(crate) parsed_relations: &'a [String],
 }
 
-/// 権限検査の対象にする relation 名の合成（トークン収集器の候補 ∪ 解析が実在を確認した名前）。収集器は
-/// 字句の推測で構文語・別名を除くため取りこぼし（偽陰性。実表 `"if"`・`"only"` を構文語と誤認する等）がありうる。
-/// 解析（`RelationHits`）が relation として解決した名前のうち、文のトークンに識別子として現れるものは、
-/// 収集器が除外したかにかかわらず必ず加える（ビュー展開で初めて現れる基底表はトークンに無いので加えない。
-/// 基底表はビュー所有者の権限で読む扱い。ADR §12）。一致しすぎても拒否側にだけ倒れる。
-fn gate_relation_names(resolved_tokens: &[Token], parsed_relations: &[String]) -> Vec<String> {
+/// 権限検査の対象にする relation 名の合成（トークン収集器の候補 ∪ 解析が外側の文で直接解決した名前）。
+/// 収集器は字句の推測で構文語・別名を除くため取りこぼし（偽陰性。実表 `"if"`・`"only"` を構文語と誤認する
+/// 等）がありうる。解析（`RelationHits`）が深さ 0 で relation として解決した名前は、収集器が除外したかに
+/// かかわらず必ず加える。ビューの展開中に引かれた基底表は記録の段で除かれており（ビュー所有者の権限で読む
+/// 扱い。ADR §12）、基底表と同名の別名・列名があっても検査対象に戻らない。
+fn gate_relation_names(resolved_tokens: &[Token], direct_relations: &[String]) -> Vec<String> {
     let mut names = crate::sql::search_path::resolved_relation_ref_names(resolved_tokens);
-    for rel in parsed_relations {
-        let in_tokens = resolved_tokens.iter().any(|t| {
-            crate::sql::relation_name::unqualified_ident_name(t)
-                .is_some_and(|n| n.eq_ignore_ascii_case(rel))
-        });
-        if in_tokens && !names.contains(rel) {
+    for rel in direct_relations {
+        if !names.contains(rel) {
             names.push(rel.clone());
         }
     }

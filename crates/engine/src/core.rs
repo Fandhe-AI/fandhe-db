@@ -2614,8 +2614,8 @@ pub struct PreparedSql {
     /// `CREATE TABLE` の作成対象名が `public.` で明示修飾されていたか（TABLE-27・Issue #1715）。
     /// 再 parse した `CREATE TABLE` へ戻し、作成先の判定（`search_path`）を飛ばすために使う。
     create_public: bool,
-    /// Parse 時の構造検証 parse がカタログで実在を確認した relation 名（ビュー展開前のビュー自身を含む。
-    /// 解決済みトークンと同じ内部キー表記）。Bind・Execute の読み取り権限の再検査は、この名前が ACL 照会
+    /// Parse 時の構造検証 parse が外側の文で直接解決した relation 名（ビュー展開前のビュー自身を含み、
+    /// 展開中に引かれた基底表は含まない。解決済みトークンと同じ内部キー表記）。Bind・Execute の読み取り権限の再検査は、この名前が ACL 照会
     /// の時点で見つからない場合だけ「Parse 後に消えた参照先」として拒否する（通常 SQL と同じ規則。
     /// 別名などの誤収集は対象外。Issue #1967）。
     parsed_relations: Vec<String>,

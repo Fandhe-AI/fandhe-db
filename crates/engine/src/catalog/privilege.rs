@@ -740,17 +740,54 @@ pub(crate) fn relation_identity_in_txn<R: ReadSource>(
     Ok(RelationIdentity::Missing)
 }
 
+/// 同一性を取る relation の上限（ビューの入れ子を辿る探索の打ち切り。untrusted 入力で無制限に広げない）。
+const MAX_IDENTITY_RELATIONS: usize = 1024;
+
+/// `roots` と、そこから到達するビューの定義（入れ子の展開先。`base_relation` と本文が参照する名前）を
+/// 推移的に辿り、全 relation の [`RelationIdentity`] を同じスナップショットで返す。外側のビューの定義が
+/// 不変でも、展開先の入れ子のビューが置換されれば検知できる（Bind 時に展開済みの本文が古くなる）。
+/// 上限超過は `Err`（fail-closed）。
+pub(crate) fn relation_identity_closure_in_txn<R: ReadSource>(
+    src: &R,
+    roots: &[String],
+) -> Result<Vec<(String, RelationIdentity)>> {
+    let mut out: Vec<(String, RelationIdentity)> = Vec::new();
+    let mut queue: Vec<String> = roots.to_vec();
+    let mut cursor = 0usize;
+    while let Some(name) = queue.get(cursor).cloned() {
+        cursor += 1;
+        if out.iter().any(|(n, _)| *n == name) {
+            continue;
+        }
+        if out.len() >= MAX_IDENTITY_RELATIONS {
+            return Err(CatalogError::ViewLimitExceeded(
+                "too many relations referenced".to_string(),
+            ));
+        }
+        let identity = relation_identity_in_txn(src, &name)?;
+        if let RelationIdentity::View(bytes) = &identity {
+            let def = super::decode_view_def(bytes)?;
+            queue.push(def.base_relation.clone());
+            if let Ok(tokens) = crate::sql::lexer::tokenize(&def.body_sql) {
+                queue.extend(crate::sql::search_path::resolved_relation_ref_names(
+                    &tokens,
+                ));
+            }
+        }
+        out.push((name, identity));
+    }
+    Ok(out)
+}
+
 impl Storage {
-    /// [`relation_identity_in_txn`] を新しい読み取り Tx で `keys` 全件に対して呼ぶ。
+    /// [`relation_identity_closure_in_txn`] を新しい読み取り Tx で呼ぶ。
     pub(crate) fn relation_identities(
         &self,
-        keys: &[String],
+        roots: &[String],
     ) -> Result<Vec<(String, RelationIdentity)>> {
         use redb::ReadableDatabase;
         let rt = self.db().begin_read()?;
-        keys.iter()
-            .map(|k| Ok((k.clone(), relation_identity_in_txn(&rt, k)?)))
-            .collect()
+        relation_identity_closure_in_txn(&rt, roots)
     }
 }
 

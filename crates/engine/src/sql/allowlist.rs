@@ -2647,6 +2647,14 @@ pub trait TableLookup {
         0
     }
 
+    /// ビューの展開（[`crate::sql::view::resolve_from`] がビューの定義を辿り始めた時点）に入ったことを
+    /// 通知する。解析の記録（`SessionRelationLookup`）が、外側の文が直接参照した relation と、ビューの展開中に
+    /// 引かれた relation（権限を要求しない基底表）を区別するために使う。既定は何もしない。ラッパーは内側へ転送する。
+    fn enter_view_expansion(&self) {}
+
+    /// [`Self::enter_view_expansion`] と対になる通知（展開を終えた）。既定は何もしない。
+    fn leave_view_expansion(&self) {}
+
     /// `name` が MATERIALIZED VIEW（TABLE-42・Issue #1664）なら、その列定義を返す。matview でなければ
     /// `Ok(None)`。既定実装は常に `Ok(None)`（matview を持たない既存の実装・モックは無変更で動く）。
     /// [`crate::sql::view::resolve_from`] が、表にもビューにも該当しない名前に限って照会する。
