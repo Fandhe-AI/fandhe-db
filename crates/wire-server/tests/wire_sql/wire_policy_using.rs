@@ -1,7 +1,7 @@
 //! 利用者ポリシーの `USING` の適用（RLS-13・Issue #2276）の pg wire 結合テスト。簡易クエリ（'Q'）と
 //! 拡張クエリ（Parse／Bind／Execute／Sync）の両方で、(1) 除かれた行が結果に現れない、
 //! (2) 隠れた行だけを対象にした UPDATE／DELETE が `UPDATE 0`／`DELETE 0` の CommandComplete で成功する
-//! （エラーにならない）、(3) ポリシーを反映できないランキング付き検索が `0A000` で拒否される、を固定する。
+//! （エラーにならない）、(3) ランキング付き検索（#2279）もポリシーを通る行だけを返す、を固定する。
 //! 合成規則の全行列は engine の `tests/table_rls/rls13_policy_using.rs` が独立オラクルで確定している。
 //! ポインタ: `docs/spec/04-behavior/rls.md` の RLS-13。
 
@@ -157,7 +157,7 @@ fn extended(s: &mut TcpStream, sql: &str) -> Result<(usize, String), String> {
 }
 
 #[test]
-fn simple_query_applies_using_to_select_update_delete_and_rejects_ranked_search() {
+fn simple_query_applies_using_to_select_update_delete_and_ranked_search() {
     let (mut s, _g) = connect();
     assert_eq!(
         simple_ok(&mut s, "ALTER TABLE docs ENABLE ROW LEVEL SECURITY"),
@@ -195,17 +195,16 @@ fn simple_query_applies_using_to_select_update_delete_and_rejects_ranked_search(
         ),
         "DELETE 1"
     );
-    // ポリシーを反映できないランキング付き検索は 0A000。接続は維持される。
-    send_simple_query(
+    // ランキング付き検索（#2279）もポリシーを通る行だけを返す（id 1 は削除済み・id 2 は隠れている）。
+    let ranked = simple_select_first_column(
         &mut s,
         "SELECT id FROM docs ORDER BY embedding <=> '[1,0]' LIMIT 2",
     );
-    expect_error_response_with_sqlstate(&mut s, "0A000");
-    assert_eq!(read_ready_for_query_status(&mut s), b'I');
+    assert_eq!(ranked, vec!["3"]);
 }
 
 #[test]
-fn extended_query_applies_using_to_select_update_delete_and_rejects_ranked_search() {
+fn extended_query_applies_using_to_select_update_delete_and_ranked_search() {
     let (mut s, _g) = connect();
     simple_ok(&mut s, "ALTER TABLE docs ENABLE ROW LEVEL SECURITY");
     simple_ok(
@@ -241,6 +240,6 @@ fn extended_query_applies_using_to_select_update_delete_and_rejects_ranked_searc
             &mut s,
             "SELECT id FROM docs ORDER BY embedding <=> '[1,0]' LIMIT 2"
         ),
-        Err("0A000".to_string())
+        Ok((1, "SELECT 1".to_string()))
     );
 }
