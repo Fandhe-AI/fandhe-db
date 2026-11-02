@@ -18,6 +18,11 @@
 # Issue #2229（SQL-68・RLS-10・RECOVER-11・RECOVER-12）の `DO` ブロックの段も同じ構成で続ける
 # （`*-do` サブコマンド。複数表への `DO` の全か無か、明示 Tx の証人 INSERT との台帳の原子性、
 # 順序 B の再送が `23505` で全体破棄になることを検証する。新しい CI ジョブは作らない）。
+# Issue #1948（SQL-69・RECOVER-5 のポインタ）の savepoint の段も同じ構成で続ける（`*-savepoint`
+# サブコマンド。`BEGIN` 直後の savepoint を `ROLLBACK TO`／`RELEASE` する明示 Tx を書くプロセスを
+# SIGKILL し、巻き戻した書き込みが再起動後に見えず、commit 済みの Tx が欠けないことを検証する）。
+# 加えて、`ROLLBACK TO` 直後・`RELEASE` 直後・COMMIT 直後の 3 点で決定的に SIGKILL する段
+# （`write-savepoint-pause`）を持つ。新しい CI ジョブは作らない。
 # Makefile の crash-test-sequence ターゲット・CI の crash-test-sequence ジョブから呼ばれる。
 #
 # 使い方: scripts/crash_test_sequence.sh [セット数（既定 2）] [反復回数（既定 10）]
@@ -240,17 +245,99 @@ run_mode() {
     done
 }
 
-# 進捗の合計（3 モード分）。各モードが `completed` を加算する。
-total_iterations=$((3 * SETS * ITERATIONS))
+# savepoint の決定的 kill 段（Issue #1948）。セットごとに新規 DB を作り、3 点（`ROLLBACK TO` 直後・
+# `RELEASE` 直後・COMMIT 直後）で writer を停止させて SIGKILL し、再オープン後の適用済み個数が
+# `PAUSED` 行の期待値とちょうど一致すること（未コミット分が見えず、commit 済み分が欠けない）を検証する。
+run_savepoint_pause() {
+    echo "##### mode: savepoint-pause"
+    for set_no in $(seq 1 "${SETS}"); do
+      WORKDIR="$(mktemp -d)"
+      # shellcheck disable=SC2064
+      trap "rm -rf '${WORKDIR}'" EXIT
+      DB_PATH="${WORKDIR}/crash_test_sequence.redb"
+      WRITE_LOG="${WORKDIR}/write.log"
+
+      for stage in after-rollback-to after-release after-commit; do
+        echo "=== savepoint-pause set ${set_no}/${SETS} stage ${stage} ==="
+        : > "${WRITE_LOG}"
+        "${BIN}" write-savepoint-pause "${DB_PATH}" "${stage}" >>"${WRITE_LOG}" 2>&1 &
+        writer_pid=$!
+
+        waited=0
+        paused=false
+        while [ "${waited}" -lt 300 ]; do
+          if grep -q "^PAUSED stage=${stage} n=[0-9]*$" "${WRITE_LOG}" 2>/dev/null; then
+            paused=true
+            break
+          fi
+          if ! kill -0 "${writer_pid}" 2>/dev/null; then
+            break
+          fi
+          sleep 0.1
+          waited=$((waited + 1))
+        done
+        if [ "${paused}" != "true" ]; then
+          echo "ERROR: writer did not reach the pause point (set ${set_no} stage ${stage})" >&2
+          kill -9 "${writer_pid}" 2>/dev/null
+          wait "${writer_pid}" 2>/dev/null
+          cat "${WRITE_LOG}" >&2
+          rm -rf "${WORKDIR}"
+          trap - EXIT
+          exit 1
+        fi
+
+        expected="$(sed -n "s/^PAUSED stage=${stage} n=\([0-9]*\)$/\1/p" "${WRITE_LOG}" | tail -1)"
+        if ! kill -9 "${writer_pid}" 2>/dev/null; then
+          echo "ERROR: kill -9 failed for writer pid ${writer_pid} (set ${set_no} stage ${stage})" >&2
+          cat "${WRITE_LOG}" >&2
+          rm -rf "${WORKDIR}"
+          trap - EXIT
+          exit 1
+        fi
+        wait "${writer_pid}" 2>/dev/null
+        writer_status=$?
+        if [ "${writer_status}" -ne 137 ]; then
+          echo "ERROR: writer did not terminate via SIGKILL (wait exit status=${writer_status}, expected 137; set ${set_no} stage ${stage})" >&2
+          cat "${WRITE_LOG}" >&2
+          rm -rf "${WORKDIR}"
+          trap - EXIT
+          exit 1
+        fi
+
+        verify_output="$("${BIN}" verify-savepoint "${DB_PATH}")"
+        echo "${verify_output}"
+        rows="$(echo "${verify_output}" | sed -n 's/.*rows=\([0-9]*\).*/\1/p')"
+        max_n="$(echo "${verify_output}" | sed -n 's/.* max=\([0-9]*\).*/\1/p')"
+        if [[ "${verify_output}" != RESULT\ ok=true* ]] \
+          || ! [[ "${rows}" =~ ^[0-9]+$ ]] || ! [[ "${max_n}" =~ ^[0-9]+$ ]] \
+          || ! [[ "${expected}" =~ ^[0-9]+$ ]] \
+          || [ "${max_n}" -ne "${expected}" ] || [ "${rows}" -ne $((2 * max_n)) ]; then
+          echo "ERROR: verify mismatch at set ${set_no} stage ${stage}: expected applied=${expected}, got: ${verify_output}" >&2
+          rm -rf "${WORKDIR}"
+          trap - EXIT
+          exit 1
+        fi
+        completed=$((completed + 1))
+      done
+
+      rm -rf "${WORKDIR}"
+      trap - EXIT
+    done
+}
+
+# 進捗の合計（4 モード分 + savepoint の決定的 kill 段 3 点）。各モードが `completed` を加算する。
+total_iterations=$((4 * SETS * ITERATIONS + 3 * SETS))
 completed=0
 
 run_mode sequence write verify finish self-check
 run_mode identity write-identity verify-identity finish-identity self-check-identity
 run_mode do write-do verify-do finish-do self-check-do
+run_mode savepoint write-savepoint verify-savepoint finish-savepoint self-check-savepoint
+run_savepoint_pause
 
 if [ "${completed}" -ne "${total_iterations}" ]; then
   echo "ERROR: completed ${completed} iterations, expected ${total_iterations}" >&2
   exit 1
 fi
 
-echo "crash_test_sequence.sh: OK (3 modes x ${SETS} sets x ${ITERATIONS} iterations = ${completed} SIGKILL reps)"
+echo "crash_test_sequence.sh: OK (4 modes x ${SETS} sets x ${ITERATIONS} iterations + 3 savepoint pause stages x ${SETS} sets = ${completed} SIGKILL reps)"

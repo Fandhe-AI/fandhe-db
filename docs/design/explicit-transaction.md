@@ -1088,3 +1088,21 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
 - **EXPLAIN**: writer を取らないことだけを保証する。検証は従来どおり最新の確定カタログ（#2403 の既存契約）。
 - **上限**: 持続時間・文数は `BEGIN` から数え、アクセスモードに関係なく効く。
 - 並行のスナップショット一貫性・テナント境界は #1935 で検証済み（`tests/sql_t01_39/sql38_read_only_concurrency.rs`・`core/deferred_writer_tests.rs`）。`USING PLAN` 付き SELECT と `EXPLAIN` は文ごとに最新の確定状態を読む既知の残りのため、一貫性の対象外（writer を取らないことだけを確かめる）。
+
+## savepoint のクラッシュ耐性（Issue #1948・SQL-69・RECOVER-5 ポインタ）
+
+`ROLLBACK TO`・`RELEASE` を含む明示 Tx を書くプロセスを SIGKILL し、再オープン後の永続状態を検証する。
+既存の `crash-test-sequence` ジョブ（`scripts/crash_test_sequence.sh`・`crates/engine/examples/crash_tool_sequence.rs`
+の `*-savepoint` サブコマンド）へ段を足した。本番コードの変更はなく、新しい CI ジョブも作らない
+（必須チェック名を増やさないため）。
+
+- **Tx の形**: 書き込み前に作った savepoint だけが `ROLLBACK TO` できる（#1943）ので、常に
+  `BEGIN` → `SAVEPOINT` → 書き込みの順にする。反復 `k` の形は `k % 3` で決める。0 は巻き戻した
+  `operation_id` を同じ Tx 内で再利用する形、1 は `RELEASE`、2 は入れ子の巻き戻しと基底の `RELEASE`。
+- **オラクル**: (1) 巻き戻した行（`j = 9`）が存在しない、(2) commit 済みの `k` は `j` が `{1, 2}` ちょうど、
+  (3) 適用済みの `k` が 0 からの連続、(4) 台帳が適用済みの `k` とちょうど一致、(5) 第 2 テナントは不変。
+- **決定的 kill 段**: `write-savepoint-pause` が `ROLLBACK TO` 直後・`RELEASE` 直後・COMMIT 直後で停止し、
+  SIGKILL 後の適用済み個数が `PAUSED` 行の期待値と完全に一致することを確かめる。
+- **finish**: 同一文の再送は `23505`、巻き戻した内容での再送は `22023`（台帳は commit した内容を保持）。
+- **対象外**: 書き込み後に作った savepoint（`Unrestorable`）、wire-server 経由の試験、
+  `WriteDurability::None` 構成。
