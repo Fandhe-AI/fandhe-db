@@ -9,6 +9,8 @@
 
 ### Added
 
+- `ALTER DEFAULT PRIVILEGES [FOR ROLE ...] [IN SCHEMA ...] {GRANT|REVOKE} ... ON {TABLES|SEQUENCES|FUNCTIONS|SCHEMAS}` を追加した（Issue #2237・SQL-40・RLS-12）。実行より後に作る表（CTAS・ビュー・matview を含む）・SERIAL／IDENTITY を含む SEQUENCE・関数・SCHEMA の初期 ACL へ既定の付与を作成と同じ write txn で適用し、既存のオブジェクトと `OR REPLACE` の置換には作用しない。`FOR ROLE` は対象ロールへの SET 経路（運用者権限は免除）が要り、未束縛は `42501`・他テナントのロールは `42704`・SCHEMA は `3F000`・明示 Tx 内は `0A000`。`DROP ROLE` は既定権限の対象・付与先を `2BP01` で拒否し、`DROP SCHEMA` は当該 SCHEMA の既定権限を消す。wire のコマンドタグは `ALTER DEFAULT PRIVILEGES`。
+  BREAKING CHANGE: 公開 enum `ParsedSql`・`SqlOutcome` に `AlterDefaultPrivileges` を追加した。`ALTER DEFAULT PRIVILEGES` は `0A000` から受理（または `42501`・`42704`・`3F000` 等）へ変わる。永続化: 専用表 `default_acl`・`default_acl_init` を遅延作成する（既存データは不変）。
 - `COPY ... FROM STDIN`（INSERT）・`COPY ... TO STDOUT`（SELECT）と HTTP（NoSQL）表層の bound 書き込み入口に、現在ロールが束縛済みのセッションの表単位の権限検査を結線した（Issue #1969・SQL-40・NOSQL-2 ポインタ。権限不足は `42501`）。COPY は CopyInResponse・走査より前と CopyDone 後の commit 直前に判定し、拡張クエリは Parse・Bind・Describe でも拒否する。未束縛・運用者権限のセッションは従来と同一。
   BREAKING CHANGE: `EngineCore::execute_bound_{insert,update,delete,delete_checked,predicate_update,predicate_delete,partitioned_update,partitioned_delete}_in_session` の第 2 引数に `session: &SessionState` を追加した（`ctx` の直後）。
 - 現在ロールが束縛済みのセッションの読み取り（SELECT・JOIN・サブクエリ・CTE・集合演算・ビュー・EXPLAIN・`DECLARE`・行ロック句・検索・拡張クエリ・HTTP の bound 読み取り API）に、`GRANT` で付与した表単位の SELECT 権限の検査を結線した（Issue #1967・SQL-40・RLS-12 ポインタ。権限不足は `42501`）。公開メソッド `SessionState::object_privileges_enforced` を追加した。現在ロールが未束縛のセッション（現状の全セッション）の挙動は変わらない。

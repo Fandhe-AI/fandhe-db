@@ -774,6 +774,10 @@ pub(crate) fn role_has_dependents_in_txn<R: ReadSource>(
     if super::privilege::acl_references_role_in_txn(src, tenant, role_id)? {
         return Ok(true);
     }
+    // 既定権限（`ALTER DEFAULT PRIVILEGES`、Issue #2237）の対象ロール・付与先。残すと作成時に孤児の付与を作る。
+    if super::privilege::default_acl::default_acl_references_role_in_txn(src, tenant, role_id)? {
+        return Ok(true);
+    }
     // 所有者（表・ビュー・matview・SCHEMA・関数。Issue #2236）。所有者のまま消すと所有者の無い
     // オブジェクトが残るため `2BP01`（所有権を移してから消す）。
     super::privilege::owner::owner_references_role_in_txn(src, tenant, role_id)

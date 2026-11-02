@@ -77,12 +77,12 @@ pub use owner::{AlterOwnerKind, ValidatedAlterOwner};
 
 // GRANT／REVOKE の構文検証（SQL-40・Issue #1965）。
 mod grant;
-pub use grant::ValidatedGrantRevoke;
 pub(crate) use grant::{
     is_alter_default_privileges_statement, is_grant_statement, is_revoke_statement,
-    reject_alter_default_privileges, validate_grant_revoke_tokens, GrantScope, GrantTarget,
-    Grantee, RoleOption,
+    validate_alter_default_privileges_tokens, validate_grant_revoke_tokens, DefaultAclTarget,
+    GrantScope, GrantTarget, Grantee, RoleOption,
 };
+pub use grant::{ValidatedAlterDefaultPrivileges, ValidatedGrantRevoke};
 
 /// エラーメッセージへ含める入力断片の長さ上限。untrusted 入力をそのまま無加工で
 /// 長大にエラーへ埋め込まない（security.md「情報漏えい」対応）。値は
