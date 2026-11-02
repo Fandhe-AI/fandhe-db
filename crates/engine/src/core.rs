@@ -5443,7 +5443,7 @@ impl EngineCore {
                 resolver,
                 crate::sql::privilege_gate::read::classify(&parsed),
                 crate::sql::privilege_gate::read::ParsedScope {
-                    read_snap,
+                    read_snap: Self::acl_snapshot_for(&parsed, read_snap),
                     parsed_relations: &hits.recorded_names(),
                 },
             )?;
@@ -6565,6 +6565,22 @@ impl EngineCore {
             SessionWith::Statement(Statement::Explain(_)) => true,
             SessionWith::Statement(Statement::Select(s)) => s.using_plan().is_some(),
             SessionWith::Statement(_) => false,
+        }
+    }
+
+    /// 読み取り権限の検査（ACL・実在の照会）に使うスナップショットを、解析・実行が参照するカタログに揃える。
+    /// 最新の確定カタログで解析・実行される文（`USING PLAN` の SELECT・`EXPLAIN`。
+    /// [`Self::validated_runs_on_latest_catalog`]）は、`BEGIN` 時点のスナップショットではなく最新で判定する
+    /// （`None`）。旧スナップショットの ACL で、`BEGIN` 後に作り直された同名の表を読めてしまわないため。
+    pub(crate) fn acl_snapshot_for<'a>(
+        parsed: &ParsedSql,
+        read_snap: Option<&'a redb::ReadTransaction>,
+    ) -> Option<&'a redb::ReadTransaction> {
+        use crate::sql::allowlist::Statement;
+        match parsed.peel_session_route() {
+            ParsedSql::Statement(Statement::Explain(_)) => None,
+            ParsedSql::Statement(Statement::Select(s)) if s.using_plan().is_some() => None,
+            _ => read_snap,
         }
     }
 

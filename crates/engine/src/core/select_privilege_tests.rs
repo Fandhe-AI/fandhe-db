@@ -829,3 +829,28 @@ fn nested_view_in_multi_relation_body_with_bool_literal_invalidates_portal() {
         .expect_err("nested replacement must invalidate the portal");
     assert_eq!(e.wire_code(), "0A000");
 }
+
+/// `EXPLAIN`（と `USING PLAN` の SELECT）は明示 Tx でも最新の確定カタログで解析・実行されるため、ACL も
+/// 最新で判定する。`BEGIN` 後に別セッションが表を DROP して同名で作り直し（権限は付与しない）たとき、
+/// 旧スナップショットの ACL で新しい表を読めてはならない（Issue #1967）。通常の SELECT は従来どおり
+/// `BEGIN` 時点の ACL・カタログで判定する。
+#[test]
+fn latest_catalog_statements_check_acl_on_the_latest_catalog_in_a_transaction() {
+    let f = fx("selpriv-latest-acl");
+    f.admin_run("GRANT SELECT ON ca TO alice");
+    let mut s = bound(f.alice, A, false);
+    let mut txn = f.core.new_session_transaction();
+    f.core
+        .execute_sql_in_txn(&ctx(A), &mut s, &mut txn, "BEGIN")
+        .expect("begin");
+    // BEGIN 後に同名の表が作り直され、権限は付与されない。
+    f.admin_run("DROP TABLE ca");
+    f.admin_run("CREATE TABLE ca (embedding VECTOR(2), n BIGINT)");
+    let explain = f.core.execute_sql_in_txn(
+        &ctx(A),
+        &mut s,
+        &mut txn,
+        "EXPLAIN SELECT n FROM ca LIMIT 5",
+    );
+    assert_eq!(code(explain), "42501");
+}

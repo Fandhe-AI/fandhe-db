@@ -716,7 +716,7 @@ impl EngineCore {
             &prepared.tokens,
             crate::sql::privilege_gate::read::classify(parsed),
             crate::sql::privilege_gate::read::ParsedScope {
-                read_snap,
+                read_snap: Self::acl_snapshot_for(parsed, read_snap),
                 parsed_relations: &prepared.parsed_relations,
             },
         )
@@ -954,7 +954,7 @@ impl EngineCore {
             Some(snap) => crate::catalog::privilege::relation_identity_closure_in_txn(snap, &names),
             None => self.storage.relation_identities(&names),
         }
-        .map_err(crate::catalog::table_lookup_error)?;
+        .map_err(identity_lookup_error)?;
         Ok(PreparedRelationIdentity(ids))
     }
 
@@ -1372,5 +1372,29 @@ impl PreparedRelationIdentity {
             acc.saturating_add(n.len())
                 .saturating_add(id.retained_bytes())
         })
+    }
+}
+
+/// 同一性の取得（[`EngineCore::prepared_relation_identity_in_txn`]）で起きたカタログエラーの写像。定義の合計・
+/// 件数の上限超過は他の件数上限と同じ `54000`（内部エラーにしない）、それ以外は表の照会と同じ写像。
+fn identity_lookup_error(e: crate::catalog::CatalogError) -> SqlSurfaceError {
+    match e {
+        crate::catalog::CatalogError::ViewLimitExceeded(_) => {
+            SqlSurfaceError::payload_too_large("referenced relation definitions exceed the limit")
+        }
+        other => crate::catalog::table_lookup_error(other),
+    }
+}
+
+#[cfg(test)]
+mod identity_error_tests {
+    use super::*;
+
+    #[test]
+    fn identity_limit_errors_are_54000_not_internal() {
+        let e = identity_lookup_error(crate::catalog::CatalogError::ViewLimitExceeded(
+            "x".to_string(),
+        ));
+        assert_eq!(e.wire_code(), "54000");
     }
 }
