@@ -1287,8 +1287,31 @@ pub fn handle_connection_with_session_limits(
 /// 認証の結果（成功時の `PolicyContext`、または失敗〔`ErrorResponse` は
 /// [`authenticate`] 内で既に送出済みで、呼び出し元は接続を閉じるだけでよい〕）。
 enum AuthOutcome {
-    Success(engine::policy::PolicyContext),
+    Success(AuthenticatedPrincipal),
     Failure,
+}
+
+/// 認証に成功した主体（接続のテナントの `PolicyContext` と、主体の種別）。
+struct AuthenticatedPrincipal {
+    ctx: engine::policy::PolicyContext,
+    kind: PrincipalKind,
+}
+
+/// 認証主体の種別。users ファイルのユーザーと、カタログのロール（Issue #2233）。
+enum PrincipalKind {
+    /// users ファイルのユーザー（従来の経路。主体の名前は startup の user そのもの）。
+    UsersFile,
+    /// カタログのロール。テナントはロールの所属から決まる（クライアントの申告は使わない）。
+    CatalogRole(CatalogPrincipal),
+}
+
+/// 認証済みのカタログのロール。検証の後の判定（LOGIN 属性・`CONNECTION LIMIT`）と、セッションへの
+/// 束縛に使う。
+struct CatalogPrincipal {
+    role_id: u64,
+    role_name: String,
+    login: bool,
+    connection_limit: i32,
 }
 
 /// `store.auth_method()` に応じて cleartext／SCRAM-SHA-256 のいずれかの認証
@@ -1298,11 +1321,12 @@ enum AuthOutcome {
 fn authenticate<S: WireStream>(
     stream: &mut S,
     store: &UserStore,
+    engine: Option<&engine::core::EngineCore>,
     username: &str,
 ) -> Result<AuthOutcome> {
     match store.auth_method() {
         AuthMethod::Cleartext => authenticate_cleartext(stream, store, username),
-        AuthMethod::ScramSha256 => authenticate_scram(stream, store, username),
+        AuthMethod::ScramSha256 => authenticate_scram(stream, store, engine, username),
     }
 }
 
@@ -1319,7 +1343,12 @@ fn authenticate_cleartext<S: WireStream>(
             write_error_response(stream, ErrorClass::AuthInvalid, auth::AuthFailure::MESSAGE)?;
             Ok(AuthOutcome::Failure)
         }
-        Ok(ctx) => Ok(AuthOutcome::Success(ctx)),
+        // cleartext 方式はカタログのロールを照合しない（`:` を含む識別子は users ファイルに存在できず、
+        // 未知ユーザーとして同じ `28P01` になる。Issue #2233・J5）。
+        Ok(ctx) => Ok(AuthOutcome::Success(AuthenticatedPrincipal {
+            ctx,
+            kind: PrincipalKind::UsersFile,
+        })),
     }
 }
 
@@ -1335,6 +1364,7 @@ fn authenticate_cleartext<S: WireStream>(
 fn authenticate_scram<S: WireStream>(
     stream: &mut S,
     store: &UserStore,
+    engine: Option<&engine::core::EngineCore>,
     username: &str,
 ) -> Result<AuthOutcome> {
     // この接続でチャネルバインディングを提供できるか（TLS 接続かつ
@@ -1425,9 +1455,30 @@ fn authenticate_scram<S: WireStream>(
         return Ok(AuthOutcome::Failure);
     };
     let mock = scram::mock_verifier(mock_key, username, scram::SCRAM_ITERATIONS);
-    let (tenant_id, verifier) = match store.scram_lookup(username) {
-        Some((tenant, v)) => (Some(tenant.to_string()), v.clone()),
-        None => (None, mock),
+    // 経路の振り分けは user の形（ログイン識別子の正規形か）だけで決め、存在には依存させない
+    // （存在のオラクルにならない。Issue #2233・J5）。カタログの経路で不在・期限切れ・検証子なし・
+    // 検索失敗・検証子の解析失敗は、すべてモック検証子（`success == false`）へ畳み込み、同じ
+    // `28P01` と `AUTH_FAILURE_DELAY` へ収束させる（早期 return しない）。
+    let mut catalog_principal: Option<CatalogPrincipal> = None;
+    let (tenant_id, verifier) = if engine::core::EngineCore::is_login_identifier(username) {
+        match resolve_catalog_scram(engine, username) {
+            Some((c, v)) => {
+                let tenant = c.tenant_id.clone();
+                catalog_principal = Some(CatalogPrincipal {
+                    role_id: c.role_id,
+                    role_name: c.role_name,
+                    login: c.login,
+                    connection_limit: c.connection_limit,
+                });
+                (Some(tenant), v)
+            }
+            None => (None, mock),
+        }
+    } else {
+        match store.scram_lookup(username) {
+            Some((tenant, v)) => (Some(tenant.to_string()), v.clone()),
+            None => (None, mock),
+        }
     };
 
     let server_nonce_raw = auth::read_urandom(18)?;
@@ -1502,7 +1553,39 @@ fn authenticate_scram<S: WireStream>(
     let tenant_id = tenant_id.ok_or(HandshakeError::Protocol("unreachable: missing tenant_id"))?;
     let ctx = auth::session_policy_context(&tenant_id)
         .map_err(|_| HandshakeError::Protocol("policy context rejected tenant_id"))?;
-    Ok(AuthOutcome::Success(ctx))
+    let kind = match catalog_principal {
+        Some(p) => PrincipalKind::CatalogRole(p),
+        None => PrincipalKind::UsersFile,
+    };
+    Ok(AuthOutcome::Success(AuthenticatedPrincipal { ctx, kind }))
+}
+
+/// カタログのロールの SCRAM 検証子を引く。照合に使える（存在し・期限内で・検証子が正しい形の）ときだけ
+/// `Some`。それ以外（不在・期限切れ・検証子なし・検索失敗・解析失敗）は `None`（呼び出し側がモックへ
+/// 倒す）。`LOGIN` 属性はここでは見ない（検証の後に `28000` で拒否するため。Issue #2233・J2・J5）。
+fn resolve_catalog_scram(
+    engine: Option<&engine::core::EngineCore>,
+    identifier: &str,
+) -> Option<(engine::core::LoginRoleCredentials, scram::ScramVerifier)> {
+    let engine = engine?;
+    let creds = match engine.resolve_login_role(identifier) {
+        Ok(found) => found?,
+        Err(_) => {
+            // 識別子・テナントは記録しない（固定文言）。
+            engine::log_stderr!(
+                "wire-server: role catalog lookup failed during authentication; treating as authentication failure"
+            );
+            return None;
+        }
+    };
+    if creds.is_expired() || creds.scram_verifier.is_empty() {
+        return None;
+    }
+    let verifier = scram::ScramVerifier::parse(&creds.scram_verifier).ok()?;
+    if verifier.iterations != scram::SCRAM_ITERATIONS || verifier.salt.len() != scram::SALT_LEN {
+        return None;
+    }
+    Some((creds, verifier))
 }
 
 fn handle_connection_inner(
@@ -1631,7 +1714,7 @@ fn run_authenticated_session<S: WireStream>(
         time_zone: startup_time_zone,
         row_security: startup_row_security,
     } = params;
-    let outcome = match authenticate(stream, store, &username) {
+    let outcome = match authenticate(stream, store, engine, &username) {
         Ok(o) => o,
         Err(e) => {
             // Cursor Bugbot 指摘（Issue #940 PR #1006）: `authenticate` の
@@ -1654,15 +1737,55 @@ fn run_authenticated_session<S: WireStream>(
             return respond_and_close(stream, e, fallback);
         }
     };
-    let ctx = match outcome {
+    let AuthenticatedPrincipal { ctx, kind } = match outcome {
         AuthOutcome::Failure => return Ok(()),
-        AuthOutcome::Success(ctx) => ctx,
+        AuthOutcome::Success(p) => p,
     };
 
     // 読み取りタイムアウトは `server::accept_loop_with_limiter` が接続全体に
     // 一度だけ設定済み（WIRE-5）であり、ここで切り替えない（TLS 昇格時は
     // `handle_tls_upgrade` がハンドシェイク前後で退避・復元する）。
     write_authentication_ok(stream)?;
+    // WIRE-18・Issue #2233: カタログのロールは、パスワードの検証が通った後にだけ LOGIN 属性・
+    // `CONNECTION LIMIT` を判定する（PG の InitPostgres と同じ順序。パスワードを知らない相手には他の失敗と
+    // 区別できない）。拒否は AuthenticationOk の後の FATAL（固定文言。テナント・内部 ID を含めない）で、
+    // BackendKeyData・ReadyForQuery は送らない。ガードはセッションの寿命の間保持し、どの経路で抜けても
+    // drop で接続数が戻る。
+    let (_role_connection_guard, catalog_role) = match kind {
+        PrincipalKind::UsersFile => (None, None),
+        PrincipalKind::CatalogRole(p) => {
+            if !p.login {
+                let msg = crate::error_response::encode_fatal(
+                    ErrorClass::AuthRequired,
+                    "role is not permitted to log in",
+                )
+                .map_err(|_| io::Error::other("failed to encode ErrorResponse"))?;
+                return stream.write_all(&msg);
+            }
+            match store.role_connections().try_acquire(
+                ctx.tenant_id(),
+                p.role_id,
+                p.connection_limit,
+            ) {
+                Ok(guard) => (Some(guard), Some(p)),
+                Err(e) => {
+                    let (class, text) = match e {
+                        auth::role_connections::AcquireError::LimitExceeded => (
+                            ErrorClass::ConnectionLimitExceeded,
+                            "too many connections for role",
+                        ),
+                        auth::role_connections::AcquireError::Unavailable => (
+                            ErrorClass::InternalError,
+                            "could not check connection limit",
+                        ),
+                    };
+                    let msg = crate::error_response::encode_fatal(class, text)
+                        .map_err(|_| io::Error::other("failed to encode ErrorResponse"))?;
+                    return stream.write_all(&msg);
+                }
+            }
+        }
+    };
     // TABLE-33・Issue #1575: StartupMessage の `TimeZone` は認証成功後に解決する（認証前の入力に
     // tzdb の参照結果を観測させない）。解決できない値は AuthenticationOk の後に FATAL `22023`
     // （固定文言・値を含めない）を返して切断する（PG と同じ。BackendKeyData は送らない）。
@@ -1744,7 +1867,15 @@ fn run_authenticated_session<S: WireStream>(
     }
     // TABLE-27・Issue #1715: `search_path` の `"$user"` は、認証成功後に確定した username から
     // 展開する（接続ごとに 1 回だけ設定し、SQL 文から変える経路は持たない。ADR D6）。
-    session.set_session_user(&username);
+    // カタログのロールでは、主体そのものがロールなので生のロール名（修飾子なし）を渡し、ロールの束縛も
+    // 行う（users ファイルのユーザーとロールの対応づけは #1971 の担当）。
+    match &catalog_role {
+        Some(p) => {
+            session.set_session_user(&p.role_name);
+            session.bind_role_ids(p.role_id, p.role_id);
+        }
+        None => session.set_session_user(&username),
+    }
     // TABLE-27・Issue #1717（ADR D6）: 拡張クエリの Parse は認証コンテキストを受け取らないため、
     // `schema.name` の修飾を解決するテナントを、認証済みの `ctx` から接続に 1 回だけ束縛する
     // （SQL 文経由で変更する経路は無い）。簡易クエリは実行ごとに `ctx` で解決する。

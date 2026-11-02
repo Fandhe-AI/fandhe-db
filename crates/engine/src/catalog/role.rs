@@ -555,13 +555,18 @@ fn allocate_role_id_in_txn(write_txn: &redb::WriteTransaction) -> Result<u64> {
 }
 
 /// ロールを作り、内部 ID を返す。同名があれば `Invalid(ROLE_ALREADY_EXISTS_MESSAGE)`、件数上限超過は
-/// `ViewLimitExceeded(ROLE_LIMIT_MESSAGE)`。メンバーシップ・ログイン対応は呼び出し側が別途書く。
+/// `ViewLimitExceeded(ROLE_LIMIT_MESSAGE)`。ログイン名対応表へも同じ txn で登録する（Issue #2233）。
+/// メンバーシップは呼び出し側が別途書く。
 pub(crate) fn create_role_in_txn(
     write_txn: &redb::WriteTransaction,
     tenant: &str,
     def: &RoleDef,
 ) -> Result<u64> {
-    create_role_limited(write_txn, tenant, def, MAX_ROLES_PER_TENANT)
+    let id = create_role_limited(write_txn, tenant, def, MAX_ROLES_PER_TENANT)?;
+    // 認証前にテナントを解決する対応表は、ロールと同じ txn で常に最新へ保つ（Issue #2233・J3）。
+    let identifier = login_identifier_for(tenant, &def.name)?;
+    register_login_in_txn(write_txn, &identifier, tenant, id)?;
+    Ok(id)
 }
 
 fn create_role_limited(
@@ -604,7 +609,7 @@ impl From<CatalogError> for DropRolesError {
     }
 }
 
-/// ロールを生の削除で消し、存在して消したら `true`。依存検査・メンバーシップ掃除は [`drop_role_in_txn`] の担当。
+/// ロールを生の削除で消し（ログイン名対応表の登録も同じ txn で解除する）、存在して消したら `true`。依存検査・メンバーシップ掃除は [`drop_role_in_txn`] の担当。
 pub(crate) fn remove_role_in_txn(
     write_txn: &redb::WriteTransaction,
     tenant: &str,
@@ -615,8 +620,12 @@ pub(crate) fn remove_role_in_txn(
     if get_role_in_txn(write_txn, tenant, name)?.is_none() {
         return Ok(false);
     }
-    let mut table = write_txn.open_table(ROLES_TABLE)?;
-    table.remove((tenant, name))?;
+    {
+        let mut table = write_txn.open_table(ROLES_TABLE)?;
+        table.remove((tenant, name))?;
+    }
+    // 対応表の登録も同じ txn で解除する（削除後の認証は不在と同じ経路になる。Issue #2233・J3）。
+    remove_login_in_txn(write_txn, &login_identifier_for(tenant, name)?)?;
     Ok(true)
 }
 
@@ -851,12 +860,23 @@ pub(crate) fn rename_role_in_txn(
     if get_role_in_txn(write_txn, tenant, new_name)?.is_some() {
         return Err(invalid(ROLE_ALREADY_EXISTS_MESSAGE));
     }
+    let role_id = def.id;
     let mut renamed = def;
     renamed.name = new_name.to_string();
     let blob = encode_role_def(&renamed)?;
-    let mut table = write_txn.open_table(ROLES_TABLE)?;
-    table.remove((tenant, old_name))?;
-    table.insert((tenant, new_name), blob.as_slice())?;
+    {
+        let mut table = write_txn.open_table(ROLES_TABLE)?;
+        table.remove((tenant, old_name))?;
+        table.insert((tenant, new_name), blob.as_slice())?;
+    }
+    // 旧識別子を解除し新識別子を登録する（旧名ではログインできなくなる。Issue #2233・J3）。
+    remove_login_in_txn(write_txn, &login_identifier_for(tenant, old_name)?)?;
+    register_login_in_txn(
+        write_txn,
+        &login_identifier_for(tenant, new_name)?,
+        tenant,
+        role_id,
+    )?;
     Ok(())
 }
 
@@ -973,32 +993,124 @@ pub(crate) fn remove_login_in_txn(
     Ok(true)
 }
 
-/// ログイン識別子から `(tenant_id, role_id)` を解決する。未登録は `Ok(None)`。参照先のロールが存在し、LOGIN
-/// 属性を持ち、ID と名前が識別子に一致することを確かめ、一致しなければ `CorruptSchema`（fail-closed。
-/// 認証前にテナントを解決する入口のため、不整合を許可側へ倒さない）。
+/// [`resolve_login_in_txn`] の解決結果（認証層が検証子・属性を読むためのロール定義つき）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LoginResolution {
+    pub(crate) tenant: String,
+    pub(crate) role: RoleDef,
+}
+
+/// ログイン識別子から所属テナントとロール定義を解決する。未登録は `Ok(None)`。登録済みなのにロールが
+/// 無い・ID または名前が識別子と一致しない場合は `CorruptSchema`（fail-closed。認証前にテナントを解決する
+/// 入口のため、不整合を許可側へ倒さない）。
+///
+/// `LOGIN` 属性は検査しない: NOLOGIN のロールも検証子を引けなければ「検証後の `28000`」を実現できないため
+/// （Issue #2233・J2）。LOGIN の判定は認証層が検証の後に行う。解決は点の参照だけで行い（テナント内の走査
+/// をしない）、未登録でも同等のロール表の点参照を 1 回行って読む回数をそろえる（J4）。
 pub(crate) fn resolve_login_in_txn<R: ReadSource>(
     src: &R,
     identifier: &str,
-) -> Result<Option<(String, u64)>> {
+) -> Result<Option<LoginResolution>> {
     let (_, role_name) = decode_login_identifier(identifier)?;
     let blob = {
         let table = match src.open_table(ROLE_LOGIN_NAMES_TABLE) {
-            Ok(t) => t,
-            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Ok(t) => Some(t),
+            Err(redb::TableError::TableDoesNotExist(_)) => None,
             Err(e) => return Err(e.into()),
         };
-        let found = table.get(identifier)?;
-        match found {
-            Some(v) => v.value().to_vec(),
-            None => return Ok(None),
+        match table {
+            Some(t) => {
+                let found = t.get(identifier)?;
+                found.map(|v| v.value().to_vec())
+            }
+            None => None,
         }
     };
+    let Some(blob) = blob else {
+        // 未登録でもロール表の点参照を 1 回行う（存在の時間差を抑える。結果は捨てる）。
+        let _ = get_role_in_txn(src, DUMMY_LOOKUP_TENANT, role_name)?;
+        return Ok(None);
+    };
     let (tenant, role_id) = decode_login_blob(&blob)?;
-    let role = get_role_by_id_in_txn(src, &tenant, role_id)?.ok_or_else(corrupt)?;
-    if role.name != role_name || !role.attributes.login {
+    let role = get_role_in_txn(src, &tenant, role_name)?.ok_or_else(corrupt)?;
+    if role.id != role_id {
         return Err(corrupt());
     }
-    Ok(Some((tenant, role_id)))
+    Ok(Some(LoginResolution { tenant, role }))
+}
+
+/// 未登録の識別子の解決で行うダミー参照のテナント（実在しない固定値。結果は使わない）。
+const DUMMY_LOOKUP_TENANT: &str = "-";
+
+/// ログイン識別子の修飾子の導出に使うドメインタグ（以後変えない値。変えると既存の識別子が無効になる）。
+const LOGIN_QUALIFIER_DOMAIN: &[u8] = b"fandhe-db/login-qualifier/v1";
+
+/// `tenant_id` から決定的に導出するログイン識別子の修飾子（小文字 16 進 32 文字。Issue #2233・J1）。
+/// `hex(SHA-256(ドメインタグ || tenant_id))` の先頭 16 バイト。秘密ではない（存在の秘匿は認証側のモック検証子が担う）。
+pub(crate) fn login_qualifier_for_tenant(tenant: &str) -> Result<String> {
+    validate_tenant(tenant)?;
+    let mut input = Vec::with_capacity(LOGIN_QUALIFIER_DOMAIN.len() + tenant.len());
+    input.extend_from_slice(LOGIN_QUALIFIER_DOMAIN);
+    input.extend_from_slice(tenant.as_bytes());
+    let digest = crate::crypto::sha256::digest(&input);
+    let mut out = String::with_capacity(32);
+    for b in digest.iter().take(16) {
+        out.push_str(&format!("{b:02x}"));
+    }
+    Ok(out)
+}
+
+/// テナントとロール名からログイン識別子を作る（接続の user に渡す値。Issue #2233・J1）。
+pub(crate) fn login_identifier_for(tenant: &str, role_name: &str) -> Result<String> {
+    encode_login_identifier(&login_qualifier_for_tenant(tenant)?, role_name)
+}
+
+/// 起動時の後追い登録で走査するロール行数の上限（超過は `CorruptSchema`）。
+const MAX_LOGIN_SYNC_SCAN: usize = 1_000_000;
+
+/// 全テナントのロールを走査し、ログイン名対応表に未登録のものを 1 つの write txn で登録する（冪等。
+/// Issue #2233・J3）。登録済みの行が別のロールを指していれば `CorruptSchema`。登録した件数を返す。
+pub(crate) fn sync_login_names_in_txn(write_txn: &redb::WriteTransaction) -> Result<usize> {
+    let mut expected: Vec<(String, String, u64)> = Vec::new();
+    match ReadSource::open_table(write_txn, ROLES_TABLE) {
+        Ok(table) => {
+            for entry in table.iter()? {
+                let (k, v) = entry?;
+                let (tenant, name) = k.value();
+                if expected.len() >= MAX_LOGIN_SYNC_SCAN {
+                    return Err(corrupt());
+                }
+                let def = decode_role_def(name, v.value())?;
+                expected.push((tenant.to_string(), name.to_string(), def.id));
+            }
+        }
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(0),
+        Err(e) => return Err(e.into()),
+    }
+    let mut registered = 0usize;
+    for (tenant, name, id) in expected {
+        let identifier = login_identifier_for(&tenant, &name)?;
+        let existing = match ReadSource::open_table(write_txn, ROLE_LOGIN_NAMES_TABLE) {
+            Ok(t) => {
+                let found = t.get(identifier.as_str())?;
+                found.map(|v| v.value().to_vec())
+            }
+            Err(redb::TableError::TableDoesNotExist(_)) => None,
+            Err(e) => return Err(e.into()),
+        };
+        match existing {
+            Some(blob) => {
+                if decode_login_blob(&blob)? != (tenant.clone(), id) {
+                    return Err(corrupt());
+                }
+            }
+            None => {
+                register_login_in_txn(write_txn, &identifier, &tenant, id)?;
+                registered += 1;
+            }
+        }
+    }
+    Ok(registered)
 }
 
 impl Storage {
@@ -1115,9 +1227,22 @@ impl Storage {
     }
 
     /// ログイン識別子を解決する（[`resolve_login_in_txn`]）。
-    pub(crate) fn resolve_login(&self, identifier: &str) -> Result<Option<(String, u64)>> {
+    pub(crate) fn resolve_login(&self, identifier: &str) -> Result<Option<LoginResolution>> {
         let rt = self.db().begin_read()?;
         resolve_login_in_txn(&rt, identifier)
+    }
+
+    /// ログイン名対応表の後追い登録（[`sync_login_names_in_txn`]。単一 write txn・1 回の commit）。
+    pub(crate) fn sync_login_names(&self) -> Result<usize> {
+        let write_txn = self
+            .begin_write_txn()
+            .map_err(super::convert_storage_error)?;
+        let n = sync_login_names_in_txn(&write_txn)?;
+        if n > 0 {
+            crate::recovery::commit_boundary::commit(write_txn)
+                .map_err(super::convert_storage_error)?;
+        }
+        Ok(n)
     }
 }
 

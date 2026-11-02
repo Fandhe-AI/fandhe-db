@@ -18,9 +18,10 @@
 //! にして保存し、平文は保存もエラー応答への反映もしない。salt は CSPRNG（`crypto::random`）で作り、乱数源が
 //! 読めなければロールを作らない（fail-closed）。
 //!
-//! ログイン名対応表（`catalog::role::register_login_in_txn`）へは登録しない: テナント修飾子を提供する経路が
-//! まだ無く、カタログのロールで認証する経路（#2233）も無いため、`LOGIN` 属性はロール blob に保存するだけで
-//! ログインはできない状態になる（fail-closed）。修飾子の提供と登録は #2233 の担当。
+//! ログイン名対応表（Issue #2233）: ロールの作成・削除・改名は `catalog::role` が同じ txn で対応表
+//! （修飾子は `tenant_id` から決定的に導出）を更新する。認証（wire-server の SCRAM）が対応表から検証子・
+//! `VALID UNTIL`・`CONNECTION LIMIT` を引く。`VALID UNTIL` のリテラルはここでセッションの TimeZone により
+//! UTC マイクロ秒へ解決する（`'infinity'` は期限なし）。
 //!
 //! テナント境界（P0）: scope は呼び出し元が渡す検証済みの `tenant_id` だけ。他テナントのロールは不在と
 //! 同じ経路・同じ `42704` になる。エラー文言は固定で、内部 ID・tenant_id・依存元・パスワードを含めない。
@@ -122,19 +123,50 @@ fn build_verifier(password: Option<&RolePassword>) -> Result<Vec<u8>, SqlSurface
     Ok(verifier.to_verifier_string().into_bytes())
 }
 
+/// `VALID UNTIL` のリテラルを UTC マイクロ秒へ解決する。`'infinity'`（大小無視）は `None`（期限なし）。
+/// 解析できない値は `22007`／`22008`／`22023`（文言に値を含めない。Issue #2233）。
+fn resolve_valid_until(
+    literal: &str,
+    session: &SessionState,
+) -> Result<Option<i64>, SqlSurfaceError> {
+    use crate::datetime::{DateTimeLiteralError, TimestampTzLiteralError};
+    if literal.trim().eq_ignore_ascii_case("infinity") {
+        return Ok(None);
+    }
+    match crate::datetime::parse_timestamptz(literal, session.time_zone()) {
+        Ok(micros) => Ok(Some(micros)),
+        Err(TimestampTzLiteralError::Literal(DateTimeLiteralError::Format(_))) => Err(
+            SqlSurfaceError::invalid_datetime_format("invalid VALID UNTIL value"),
+        ),
+        Err(TimestampTzLiteralError::Literal(DateTimeLiteralError::Overflow(_))) => Err(
+            SqlSurfaceError::datetime_field_overflow("VALID UNTIL value is out of range"),
+        ),
+        Err(TimestampTzLiteralError::UnknownTimeZone) => {
+            Err(SqlSurfaceError::InvalidParameterValue {
+                detail: "time zone not recognized",
+            })
+        }
+    }
+}
+
 /// `CREATE ROLE`／`CREATE USER` を実行する（権限・明示 Tx のゲートは呼び出し元で通過済み）。
 pub(crate) fn execute_create_role(
     storage: &Storage,
     tenant_id: &str,
+    session: &SessionState,
     stmt: &ValidatedCreateRole,
 ) -> Result<CreateRoleOutcome, SqlSurfaceError> {
     let scram_verifier = build_verifier(stmt.password.as_ref())?;
+    let valid_until = match &stmt.valid_until_literal {
+        Some(lit) => resolve_valid_until(lit, session)?,
+        None => None,
+    };
     let def = RoleDef {
         id: 0,
         name: stmt.name.clone(),
         attributes: stmt.attributes,
-        connection_limit: -1,
-        valid_until: None,
+        connection_limit: stmt.connection_limit.unwrap_or(-1),
+        valid_until,
         scram_verifier,
         legacy_phc: Vec::new(),
     };
@@ -168,7 +200,7 @@ pub(crate) fn execute_drop_role(
 /// `ALTER ROLE`／`ALTER USER` を実行する（DDL 権限・明示 Tx のゲートは呼び出し元で通過済み。Issue #1963）。
 ///
 /// - オプション変更: 指定した属性・パスワードだけを書き換える（`PASSWORD NULL` は検証子を空にする。
-///   `legacy_phc`・接続数上限・有効期限は保つ）。指定が空なら存在の確認だけをする
+///   `legacy_phc` は保つ。`VALID UNTIL`・`CONNECTION LIMIT` は指定時だけ書き換える）。指定が空なら存在の確認だけをする
 /// - `RENAME TO`: 格納キーだけを移す。対象がセッションのロール・現在のロールなら `0A000`
 ///   （PostgreSQL と同じ）。新名の重複は `42710`
 ///
@@ -185,7 +217,13 @@ pub(crate) fn execute_alter_role(
                 Some(pw) => Some(build_verifier(pw.as_ref())?),
                 None => None,
             };
+            let new_valid_until = match &patch.valid_until_literal {
+                Some(lit) => Some(resolve_valid_until(lit, session)?),
+                None => None,
+            };
             if new_verifier.is_none()
+                && new_valid_until.is_none()
+                && patch.connection_limit.is_none()
                 && patch.login.is_none()
                 && patch.inherit.is_none()
                 && patch.createrole.is_none()
@@ -216,6 +254,12 @@ pub(crate) fn execute_alter_role(
                     }
                     if let Some(v) = new_verifier {
                         def.scram_verifier = v;
+                    }
+                    if let Some(v) = new_valid_until {
+                        def.valid_until = v;
+                    }
+                    if let Some(v) = patch.connection_limit {
+                        def.connection_limit = v;
                     }
                 })
                 .map_err(|e| map_role_error(e, &stmt.name))?;

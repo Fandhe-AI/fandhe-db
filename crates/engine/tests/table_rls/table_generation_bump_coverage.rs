@@ -552,10 +552,12 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1962（`Storage::drop_roles`）の追加で `create_role`・`drop_roles` の 2 か所になった（同じ理由）。
     // Issue #1963（`Storage::alter_role`・`rename_role` の追加。ロール表のキー・blob だけを書き同じ理由で対象外）。
     // 後続の base 取り込みで role.rs の行番号が +4 行移動したための追随（対象外の理由は同じ）。
-    ("catalog/role.rs", 1013),
-    ("catalog/role.rs", 1045),
-    ("catalog/role.rs", 1064),
-    ("catalog/role.rs", 1083),
+    // Issue #2233（ログイン名対応表の追随・`sync_login_names` の追加で行番号が移動。同じ理由で対象外）。
+    ("catalog/role.rs", 1125),
+    ("catalog/role.rs", 1157),
+    ("catalog/role.rs", 1176),
+    ("catalog/role.rs", 1195),
+    ("catalog/role.rs", 1242),
     // Issue #1961 のロール・ACL カタログの単体テスト補助（`write` ヘルパー。専用表だけを書き表世代の対象外）。
     ("catalog/role/tests.rs", 37),
     // Issue #1962 の `sql::role_ddl` の crate 内テスト補助（`commit` ヘルパー。専用表だけを書き表世代の対象外）。
