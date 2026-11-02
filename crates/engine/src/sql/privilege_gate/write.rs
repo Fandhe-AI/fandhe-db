@@ -246,6 +246,8 @@ pub(crate) fn classify_write(parsed: &ParsedSql) -> WriteRequirement {
         | ParsedSql::GrantRevoke(_)
         | ParsedSql::CreateRole(_)
         | ParsedSql::DropRole(_)
+        | ParsedSql::AlterRole(_)
+        | ParsedSql::SetRole(_)
         | ParsedSql::Do(_)
         | ParsedSql::CreateSchema(_)
         | ParsedSql::DropSchema(_)

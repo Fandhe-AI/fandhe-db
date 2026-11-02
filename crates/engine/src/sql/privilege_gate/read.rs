@@ -124,6 +124,8 @@ pub(crate) fn classify(parsed: &ParsedSql) -> ReadRequirement {
         | ParsedSql::GrantRevoke(_)
         | ParsedSql::CreateRole(_)
         | ParsedSql::DropRole(_)
+        | ParsedSql::AlterRole(_)
+        | ParsedSql::SetRole(_)
         | ParsedSql::Do(_)
         | ParsedSql::CreateSchema(_)
         | ParsedSql::DropSchema(_)
