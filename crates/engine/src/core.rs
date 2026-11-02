@@ -131,7 +131,7 @@ mod do_block;
 mod lock_exec;
 // カタログのロールによる認証の入口（SQL-39・WIRE-18、Issue #2233）。
 mod login_role;
-pub use login_role::{LoginLookupError, LoginRoleCredentials};
+pub use login_role::{LoginLookupError, LoginRoleCredentials, UsersFileRoleBinding};
 // `LANGUAGE sql|plpgsql` 関数の呼び出し位置の実行（SQL-67 (5)・Issue #2218）。
 mod routine_call;
 // `CREATE FUNCTION ... LANGUAGE plpgsql` の定義時検証（Issue #2217・SQL-67 (3)）。

@@ -723,3 +723,54 @@ fn sync_login_names_registers_missing_idempotently() {
     );
     assert_eq!(s.sync_login_names().expect("again"), 0);
 }
+#[test]
+fn resolve_tenant_role_three_states() {
+    let (_g, _p, s) = open("role-resolve-tenant");
+    // 表が無い・ロールが 0 件ならカタログは正ではない。
+    assert_eq!(
+        s.resolve_tenant_role("t1", "alice").expect("none"),
+        TenantRoleLookup::NotAuthoritative
+    );
+    // 他テナントにだけロールがあっても自テナントは正ではない。
+    s.create_role("t2", &rdef("alice")).expect("t2 alice");
+    assert_eq!(
+        s.resolve_tenant_role("t1", "alice").expect("other"),
+        TenantRoleLookup::NotAuthoritative
+    );
+    // 自テナントにロールはあるが同名が無い（他テナントの同名は引けない）。
+    let bob = s.create_role("t1", &rdef("bob")).expect("bob");
+    assert_eq!(
+        s.resolve_tenant_role("t1", "alice").expect("missing"),
+        TenantRoleLookup::Missing
+    );
+    // 大文字小文字は畳み込まない。
+    assert_eq!(
+        s.resolve_tenant_role("t1", "Bob").expect("case"),
+        TenantRoleLookup::Missing
+    );
+    // 不正な識別子は不在に畳む。
+    assert_eq!(
+        s.resolve_tenant_role("t1", "").expect("empty"),
+        TenantRoleLookup::Missing
+    );
+    assert_eq!(
+        s.resolve_tenant_role("t1", "b\0b").expect("nul"),
+        TenantRoleLookup::Missing
+    );
+    match s.resolve_tenant_role("t1", "bob").expect("found") {
+        TenantRoleLookup::Found(def) => {
+            assert_eq!(def.id, bob);
+            assert_eq!(def.name, "bob");
+            assert!(def.attributes.login);
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+#[test]
+fn resolve_tenant_role_corrupt_row_is_err() {
+    let (_g, _p, s) = open("role-resolve-corrupt");
+    raw_put_role(&s, "t1", "alice", &[9, 9, 9]);
+    assert!(is_fixed_corrupt(s.resolve_tenant_role("t1", "alice")));
+    assert!(is_fixed_corrupt(s.resolve_tenant_role("t1", "zzz")));
+}

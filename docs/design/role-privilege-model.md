@@ -470,7 +470,7 @@ SQL-40 ポインタ。判定点を `sql/privilege_gate.rs` の `check`（主体�
 | K4 | `search_path` 上の USAGE の無い SCHEMA は、作成先の判定（`creation_target`）では `42501`（受入基準どおり。他テナント・不在は従来どおり次の要素へ進み存在オラクルにしない）。`current_schema()`・`current_schemas()` の値の列挙では見えないものとして飛ばす。修飾名も `42501` | 受入基準の「`search_path` 経由も `42501`」に合わせる。値の列挙は権限エラーにせず可視な SCHEMA だけを返す。未修飾名は現状テナント SCHEMA へ解決されない |
 | K5 | 作成先が SCHEMA の作成系 DDL は CREATE 判定を `require_creation_target` に結線するが、`ServerDdl` ゲートを必要条件として残す | `ServerDdl` を CREATE に置き換えるとロールの束縛だけで DDL 権限が広がる。所有者の機構（#2236）・主体の束縛（#1971）の後 |
 | K7 | 修飾名の作成位置でも USAGE を要求する（PostgreSQL は CREATE だけで足りる。拒否側の意図的な差） | 解決器は位置を区別しない。権限を広げない |
-| K9 | `ALL SEQUENCES／FUNCTIONS／ROUTINES／PROCEDURES IN SCHEMA` は `0A000` のまま（単一の `ON SEQUENCE`・`ON FUNCTION` は #2235 で対応済み。`ALL ... IN SCHEMA` は後続。§14 S11） | SEQUENCE・FUNCTION 単位の ACL 適用は #2235 の中核 |
+| K9 | `ALL SEQUENCES／FUNCTIONS／ROUTINES／PROCEDURES IN SCHEMA` は `0A000` のまま（単一の `ON SEQUENCE`・`ON FUNCTION` は #2235 で対応済み。`ALL ... IN SCHEMA` は後続。§15 S11） | SEQUENCE・FUNCTION 単位の ACL 適用は #2235 の中核 |
 | K10 | `DROP SCHEMA` の同じ txn で ACL 行を掃除（commit 呼び出しは増やさない） | `DROP ROLE` の依存検査・件数上限の消費を防ぐ |
 | K11 | ビュー本文（保存済みの解決済みキー）経由の参照は USAGE を再検査しない | PostgreSQL はビューの所有者の権限で参照する。所有者の機構（#2236）まで対象外 |
 | K12 | 準備済み文は Bind でトークン列の `#<id>.` キーから SCHEMA ID を集めて USAGE を再検査 | Parse 後の `REVOKE` を Execute に反映する |
@@ -515,7 +515,27 @@ SQL-39 (3)(7)・WIRE-18 ポインタ。ロールのカタログ（#1961）・`CR
 
 HTTP `POST /v1/session` でのカタログのロールの照合、cleartext 方式でのカタログのロールの照合、users ファイルのユーザーとロールの対応づけ（#1971）、ブートストラップ専用化（#2238）、カタログのロールの DDL 権限、メンバーシップ（#2232）、存在オラクルの網羅試験（#1972）、`current_user`・`session_user` の値。
 
-## 14. Issue #2235 実装記録（SEQUENCE と FUNCTION 単位の GRANT／REVOKE）
+## 14. Issue #1971 実装記録（認証済みユーザーをカタログのロールへ紐付ける）
+
+SQL-39・WIRE-2 ポインタ。D3・D4 のうち、users ファイルのユーザーをカタログのロールへ対応づけて `SessionState` へ束縛する部分を実装した。
+
+### 実装範囲
+
+- **対応規則**: users ファイルで認証したユーザーは、その行のテナント内の同名ロールへ対応づける（`ROLES_TABLE` の点参照・バイト単位の完全一致・大文字小文字の畳み込みなし）。テナントは users ファイルからだけ導出し、他テナントの同名ロールは構造上引けない。識別子として不正な名前は不在として扱う。対応できたら `bind_role_ids(id, id)` と `set_session_user` で束縛する。
+- **カタログが正のテナント**: 継ぎ目として「テナントにロールが 1 件以上ある」で判定する（`catalog::role::resolve_tenant_role_in_txn`。#2238 のマーカー判定へ差し替える。D11 の移行規則と矛盾しない）。同名ロールが無いユーザーは `28P01`、ロールが 0 件のテナントは従来どおり未束縛。「ロールの有無」と「同名ロールの点参照」は同じ read txn で行う（判定のぶれを防ぐ）。破損は 0 件と取り違えず認証失敗に倒す。
+- **応答の収束**: SCRAM は証明の検証が成功した後に対応づけを判定し、失敗は誤パスワードと同じ `success = false`（同じ `28P01`・同じ遅延・同じ応答バイト）に畳む。cleartext は照合の前を起点にし、対応づけの失敗でも `AUTH_FAILURE_DELAY` まで待つ。`VALID UNTIL` 超過は `28P01`、`NOLOGIN` は検証後の `28000`、`CONNECTION LIMIT` 超過は `53300`（#2233 と同じ後段）。
+- **`--ddl-allowed-users` との優先関係**: カタログを正とし、食い違いは拒否側に倒す。DDL 権限は users ファイルの経路にだけ付き（ログイン識別子経由の主体には付けない）、束縛しても DDL 権限は広がらない。指定ありで同名ロールが無ければ接続できない。ブートストラップロールへの写像の移行は #2238。
+- **`engine: None`** の経路は従来どおり未束縛。
+
+### 移行の注意
+
+テナントに最初のロールを作ると、そのテナントの users ファイルのユーザーは同名の `LOGIN` ロールが無ければ接続できなくなる。先に `CREATE ROLE <ユーザー名> LOGIN` を作ってから他のロールを作る。
+
+### 対象外
+
+HTTP `POST /v1/session` での対応づけ（HTTP-4。#2238。`auth::users_file_role::verify_and_bind` は再利用できる形にしてある）、ブートストラップのマーカー・初期ロールの投入、パスワードの照合元をカタログの検証子へ切り替えること（#2238）、`CREATEROLE`／`ADMIN OPTION` の判定、メンバーシップ（#2232）、存在オラクルの網羅試験（#1972）。
+
+## 15. Issue #2235 実装記録（SEQUENCE と FUNCTION 単位の GRANT／REVOKE）
 
 ビヘイビア ID ポインタ: SQL-40（特に (6)(a)）・RLS-12（spec 本文は転記しない）。意味論は PostgreSQL 17 の公開挙動と
 D5・D8・D10、§12（#2234）の K1〜K13 に揃える。
