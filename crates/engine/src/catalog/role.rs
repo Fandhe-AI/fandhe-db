@@ -558,32 +558,45 @@ pub(crate) fn tenant_has_roles_in_txn<R: ReadSource>(src: &R, tenant: &str) -> R
 /// users ファイルの `(tenant, name)` に対応するロールの引き結果（Issue #1971。[`resolve_tenant_role_in_txn`]）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TenantRoleLookup {
-    /// テナントにロールが 1 件も無い（カタログが正ではない。従来どおり未束縛で扱う）。
+    /// マーカーもロールも無い（カタログが正ではない。従来どおり未束縛で扱う）。
     NotAuthoritative,
-    /// 同名のロールがある。
-    Found(RoleDef),
-    /// テナントにロールはあるが同名が無い（識別子として不正な名前を含む）。
-    Missing,
+    /// 同名のロールがある。`bootstrapped` はテナントのマーカーの有無、`privileges` は初期権限（Issue #2238）。
+    Found {
+        def: RoleDef,
+        bootstrapped: bool,
+        privileges: bootstrap::BootstrapPrivileges,
+    },
+    /// カタログが正だが同名が無い（識別子として不正な名前を含む）。`bootstrapped` はマーカーの有無。
+    Missing { bootstrapped: bool },
 }
 
 /// users ファイルの `(tenant, name)` に対応するロールを、1 つの読み取りで引く（Issue #1971・ADR D3・D4）。
-/// 「カタログが正か」の判定は当面「テナントにロールが 1 件以上ある」で行う継ぎ目で、#2238 でマーカー判定へ
-/// 差し替える。名前はバイト単位の完全一致で、不正な識別子は `Missing` に畳む。破損は `Err`（0 件と取り違えない）。
+/// 「カタログが正か」の判定は、テナントのブートストラップのマーカーがある、またはロールが 1 件以上ある
+/// （マーカー導入前の DB の移行規則。Issue #2238・ADR D11）。名前はバイト単位の完全一致で、不正な識別子は
+/// `Missing` に畳む。破損は `Err`（0 件と取り違えない）。
 pub(crate) fn resolve_tenant_role_in_txn<R: ReadSource>(
     src: &R,
     tenant: &str,
     name: &str,
 ) -> Result<TenantRoleLookup> {
     validate_tenant(tenant)?;
-    if !tenant_has_roles_in_txn(src, tenant)? {
+    let bootstrapped = bootstrap::tenant_bootstrapped_in_txn(src, tenant)?;
+    if !bootstrapped && !tenant_has_roles_in_txn(src, tenant)? {
         return Ok(TenantRoleLookup::NotAuthoritative);
     }
     if validate_identifier(name).is_err() {
-        return Ok(TenantRoleLookup::Missing);
+        return Ok(TenantRoleLookup::Missing { bootstrapped });
     }
     Ok(match get_role_in_txn(src, tenant, name)? {
-        Some(def) => TenantRoleLookup::Found(def),
-        None => TenantRoleLookup::Missing,
+        Some(def) => {
+            let privileges = bootstrap::bootstrap_privileges_in_txn(src, tenant, def.id)?;
+            TenantRoleLookup::Found {
+                def,
+                bootstrapped,
+                privileges,
+            }
+        }
+        None => TenantRoleLookup::Missing { bootstrapped },
     })
 }
 
@@ -796,6 +809,8 @@ pub(crate) fn drop_role_in_txn(
         return Err(invalid(ROLE_HAS_DEPENDENTS_MESSAGE));
     }
     remove_memberships_of_role_in_txn(write_txn, tenant, role.id)?;
+    // 初期権限の行も同じ txn で消す（ロール ID は再利用しないが、残骸を残さない。Issue #2238）。
+    bootstrap::remove_bootstrap_privileges_in_txn(write_txn, tenant, role.id)?;
     remove_role_in_txn(write_txn, tenant, name)
 }
 
@@ -1127,6 +1142,8 @@ pub(crate) fn remove_login_in_txn(
 pub(crate) struct LoginResolution {
     pub(crate) tenant: String,
     pub(crate) role: RoleDef,
+    /// ロールの初期権限（ブートストラップ由来。無ければ権限なし。Issue #2238）。
+    pub(crate) privileges: bootstrap::BootstrapPrivileges,
 }
 
 /// ログイン識別子から所属テナントとロール定義を解決する。未登録は `Ok(None)`。登録済みなのにロールが
@@ -1166,7 +1183,12 @@ pub(crate) fn resolve_login_in_txn<R: ReadSource>(
     if role.id != role_id {
         return Err(corrupt());
     }
-    Ok(Some(LoginResolution { tenant, role }))
+    let privileges = bootstrap::bootstrap_privileges_in_txn(src, &tenant, role.id)?;
+    Ok(Some(LoginResolution {
+        tenant,
+        role,
+        privileges,
+    }))
 }
 
 /// 未登録の識別子の解決で行うダミー参照のテナント（時間差の均質化専用。実在し得るため結果もエラーも使わない）。
@@ -1382,6 +1404,7 @@ impl Storage {
     }
 }
 
+pub(crate) mod bootstrap;
 pub(crate) mod graph;
 pub(crate) mod membership_apply;
 

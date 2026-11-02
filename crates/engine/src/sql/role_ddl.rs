@@ -234,7 +234,7 @@ pub(crate) fn execute_drop_role(
 /// `ALTER ROLE`／`ALTER USER` を実行する（DDL 権限・明示 Tx のゲートは呼び出し元で通過済み。Issue #1963）。
 ///
 /// - オプション変更: 指定した属性・パスワードだけを書き換える（`PASSWORD NULL` は検証子を空にする。
-///   `legacy_phc` は保つ。`VALID UNTIL`・`CONNECTION LIMIT` は指定時だけ書き換える）。指定が空なら存在の確認だけをする
+///   `legacy_phc` は空にする〔旧パスワードを無効にする。Issue #2238〕。`VALID UNTIL`・`CONNECTION LIMIT` は指定時だけ書き換える）。指定が空なら存在の確認だけをする
 /// - `RENAME TO`: 格納キーだけを移す。対象がセッションのロール・現在のロールなら `0A000`
 ///   （PostgreSQL と同じ）。新名の重複は `42710`
 ///
@@ -288,6 +288,9 @@ pub(crate) fn execute_alter_role(
                     }
                     if let Some(v) = new_verifier {
                         def.scram_verifier = v;
+                        // パスワードを変えたら旧形式ハッシュ（ブートストラップで取り込んだ値）も無効にする。
+                        // 残すと旧パスワードが cleartext 認証で通り続ける（`PASSWORD NULL` も同じ。Issue #2238）。
+                        def.legacy_phc.clear();
                     }
                     if let Some(v) = new_valid_until {
                         def.valid_until = v;

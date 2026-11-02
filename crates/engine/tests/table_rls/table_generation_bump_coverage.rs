@@ -560,11 +560,16 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #2233（ログイン名対応表の追随・`sync_login_names` の追加で行番号が移動。同じ理由で対象外）。
     // PR #2867 レビュー対応で role.rs の行番号が +1 行移動したための追随（同じ理由で対象外）。
     // Issue #2232 の取り込み・メンバーシップ blob の版 3 追加で role.rs の行番号が +92 行移動（同じ理由で対象外）。
-    ("catalog/role.rs", 1255),
-    ("catalog/role.rs", 1287),
-    ("catalog/role.rs", 1306),
-    ("catalog/role.rs", 1325),
-    ("catalog/role.rs", 1378),
+    ("catalog/role.rs", 1277),
+    ("catalog/role.rs", 1309),
+    ("catalog/role.rs", 1328),
+    ("catalog/role.rs", 1347),
+    ("catalog/role.rs", 1400),
+    // Issue #2238（users ファイルのブートストラップ `Storage::bootstrap_users_file`）と、それに伴う role.rs の
+    // 行番号の移動への追随。ロール・マーカー・初期権限の専用表だけを書き、表の行・スキーマ・世代に影響しない
+    // （同じ理由で対象外）。
+    ("catalog/role/bootstrap.rs", 490),
+    ("catalog/role/bootstrap/tests.rs", 42),
     // Issue #2232: メンバーシップの付与・取り消し（`apply_membership_changes`）とロール作成＋付与
     // （`create_role_with_memberships`）。メンバーシップ表だけを書き、表の計画・世代に影響しない（同じ理由）。
     ("catalog/role/membership_apply.rs", 314),
