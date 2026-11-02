@@ -463,3 +463,135 @@ fn rls13_row_security_off_copy_from_is_rejected_on_public_commit_paths() {
     ok(&core, "alice", &mut s, "SET row_security = on");
     core.commit_copy_in(&c, batch(&core, &s)).expect("on");
 }
+
+/// RLS-13・Issue #2231: `SKIP LOCKED` の空結果前の RLS 判定（期待値はアサーションが正）。
+#[test]
+fn rls13_skip_locked_rejects_row_security_off_regardless_of_writer_state() {
+    let (core, _g) = new_core("rls13-skip-locked-off");
+    let mut s = SessionState::default();
+    s.allow_ddl();
+    for sql in [
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, name TEXT)",
+        "ALTER TABLE t ENABLE ROW LEVEL SECURITY",
+        "CREATE POLICY p ON t FOR ALL USING (true) WITH CHECK (true)",
+    ] {
+        ok(&core, "alice", &mut s, sql);
+    }
+    let q = "SELECT id, name FROM t FOR UPDATE SKIP LOCKED";
+    let mut other = SessionState::default();
+    ok(&core, "alice", &mut other, "SET row_security = off");
+
+    // writer が空いている場合。
+    assert_eq!(code(&core, "alice", &mut other, q), "42501");
+
+    // 別セッションが writer を保持している場合も同じ拒否になる。
+    let mut holder = SessionState::default();
+    let mut ht = core.new_session_transaction();
+    ok_txn(&core, &mut holder, &mut ht, "BEGIN");
+    ok_txn(
+        &core,
+        &mut holder,
+        &mut ht,
+        "SELECT id, name FROM t FOR UPDATE",
+    );
+    assert_eq!(code(&core, "alice", &mut other, q), "42501");
+    let mut t2 = core.new_session_transaction();
+    ok_txn(&core, &mut other, &mut t2, "BEGIN");
+    let err = core
+        .execute_sql_in_txn(&ctx("alice"), &mut other, &mut t2, q)
+        .expect_err("off must be rejected while held");
+    assert_eq!(err.wire_code(), "42501");
+    assert_eq!(
+        t2.status(),
+        engine::sql::transaction::TransactionStatus::Failed
+    );
+
+    // on に戻せば保持中は 0 行。
+    ok(&core, "alice", &mut other, "SET row_security = on");
+    match ok(&core, "alice", &mut other, q) {
+        SqlOutcome::Query(r) => assert!(r.rows.is_empty()),
+        o => panic!("expected query, got {o:?}"),
+    }
+    ok_txn(&core, &mut holder, &mut ht, "COMMIT");
+}
+
+/// RLS-13・Issue #2231: サブクエリ内側の表への RLS 判定（期待値はアサーションが正）。
+#[test]
+fn rls13_skip_locked_rejects_row_security_off_for_subquery_only_tables() {
+    let (core, _g) = new_core("rls13-skip-locked-subquery");
+    let mut s = SessionState::default();
+    s.allow_ddl();
+    for sql in [
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, name TEXT)",
+        "CREATE TABLE u (id BIGINT PRIMARY KEY, name TEXT)",
+        "ALTER TABLE u ENABLE ROW LEVEL SECURITY",
+        "CREATE POLICY p ON u FOR ALL USING (true) WITH CHECK (true)",
+    ] {
+        ok(&core, "alice", &mut s, sql);
+    }
+    let queries = [
+        "SELECT id FROM t WHERE id IN (SELECT id FROM u) FOR UPDATE SKIP LOCKED",
+        "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.id = t.id) FOR UPDATE SKIP LOCKED",
+        "SELECT id FROM t WHERE id = (SELECT max(id) FROM u) FOR UPDATE SKIP LOCKED",
+    ];
+    let mut other = SessionState::default();
+    ok(&core, "alice", &mut other, "SET row_security = off");
+
+    // writer が空いている場合。
+    for q in queries {
+        assert_eq!(code(&core, "alice", &mut other, q), "42501", "free: {q}");
+    }
+
+    // 別セッションが writer を保持している場合も同じ拒否になる。
+    let mut holder = SessionState::default();
+    let mut ht = core.new_session_transaction();
+    ok_txn(&core, &mut holder, &mut ht, "BEGIN");
+    ok_txn(&core, &mut holder, &mut ht, "SELECT id FROM t FOR UPDATE");
+    for q in queries {
+        assert_eq!(code(&core, "alice", &mut other, q), "42501", "held: {q}");
+    }
+    ok_txn(&core, &mut holder, &mut ht, "COMMIT");
+}
+/// RLS-13・Issue #2231: 実参照表だけが RLS 判定の対象になること（期待値はアサーションが正）。
+#[test]
+fn rls13_skip_locked_rls_check_uses_resolved_relations_only() {
+    let (core, _g) = new_core("rls13-skip-locked-resolved");
+    let mut s = SessionState::default();
+    s.allow_ddl();
+    for sql in [
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, name TEXT)",
+        "CREATE TABLE u (id BIGINT PRIMARY KEY, name TEXT)",
+        "ALTER TABLE u ENABLE ROW LEVEL SECURITY",
+        "CREATE POLICY p ON u FOR ALL USING (true) WITH CHECK (true)",
+        "CREATE SCHEMA sc",
+        "CREATE TABLE sc.v (id BIGINT PRIMARY KEY)",
+        "ALTER TABLE sc.v ENABLE ROW LEVEL SECURITY",
+        "CREATE POLICY pv ON sc.v FOR ALL USING (true) WITH CHECK (true)",
+    ] {
+        ok(&core, "alice", &mut s, sql);
+    }
+    let mut other = SessionState::default();
+    ok(&core, "alice", &mut other, "SET row_security = off");
+    // 別名 u（RLS 有効表と同名）・列名 name は実参照表ではない。
+    let alias = "SELECT id FROM t AS u FOR UPDATE SKIP LOCKED";
+    let qualified = "SELECT id FROM t WHERE id IN (SELECT id FROM sc.v) FOR UPDATE SKIP LOCKED";
+
+    // writer が空いている場合。
+    match ok(&core, "alice", &mut other, alias) {
+        SqlOutcome::Query(r) => assert!(r.rows.is_empty()),
+        o => panic!("expected query, got {o:?}"),
+    }
+    assert_eq!(code(&core, "alice", &mut other, qualified), "42501");
+
+    // writer 保持中も結果は変わらない。
+    let mut holder = SessionState::default();
+    let mut ht = core.new_session_transaction();
+    ok_txn(&core, &mut holder, &mut ht, "BEGIN");
+    ok_txn(&core, &mut holder, &mut ht, "SELECT id FROM t FOR UPDATE");
+    match ok(&core, "alice", &mut other, alias) {
+        SqlOutcome::Query(r) => assert!(r.rows.is_empty()),
+        o => panic!("expected query, got {o:?}"),
+    }
+    assert_eq!(code(&core, "alice", &mut other, qualified), "42501");
+    ok_txn(&core, &mut holder, &mut ht, "COMMIT");
+}

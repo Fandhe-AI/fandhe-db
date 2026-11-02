@@ -902,8 +902,9 @@ impl<'e> SessionTransaction<'e> {
             TxnOrigin::Explicit,
             access_mode,
             isolation_level,
-            false,
+            WriterAcquire::Wait,
         )
+        .map(|_| ())
     }
 
     /// 暗黙トランザクション（Issue #1175）を開始する。`BEGIN` を含まない複数文
@@ -941,7 +942,33 @@ impl<'e> SessionTransaction<'e> {
             TxnOrigin::Implicit,
             TxnAccessMode::ReadWrite,
             None,
-            nowait,
+            if nowait {
+                WriterAcquire::NoWait
+            } else {
+                WriterAcquire::Wait
+            },
+        )
+        .map(|_| ())
+    }
+
+    /// [`Self::begin_implicit_with`] の `SKIP LOCKED` 版（autocommit の `SELECT ... FOR UPDATE
+    /// SKIP LOCKED`・Issue #2231 の入口）。取得結果を `Ok(bool)` で返し、取得失敗の分類は
+    /// [`is_write_lock_unavailable`] に集約する（SQL-38 (4)(5)。契約は spec 側を参照）。
+    pub(crate) fn try_begin_implicit(
+        &mut self,
+        storage: &'e crate::storage::Storage,
+        session: &SessionState,
+    ) -> Result<bool, SqlSurfaceError> {
+        if !matches!(self.state, TxnState::Idle) {
+            return Err(internal_error());
+        }
+        self.begin_with_origin(
+            storage,
+            session,
+            TxnOrigin::Implicit,
+            TxnAccessMode::ReadWrite,
+            None,
+            WriterAcquire::Try,
         )
     }
 
@@ -1023,8 +1050,8 @@ impl<'e> SessionTransaction<'e> {
         origin: TxnOrigin,
         access_mode: TxnAccessMode,
         isolation_level: Option<RequestedIsolationLevel>,
-        nowait: bool,
-    ) -> Result<(), SqlSurfaceError> {
+        acquire: WriterAcquire,
+    ) -> Result<bool, SqlSurfaceError> {
         match &self.state {
             TxnState::Idle => {
                 // 壁時計の読み取り失敗（範囲外）は writer を開く前に fail-closed で返す
@@ -1067,12 +1094,22 @@ impl<'e> SessionTransaction<'e> {
                     // `begin_read_txn()` と同じ確定状態になる（writer の前に開くとゲート待ちの間の
                     // 他者の commit を跨ぎうる）。失敗時は writer を解放して固定文言の `XX000`。
                     TxnOrigin::Implicit => {
-                        let w = if nowait {
+                        let acquired = if acquire.is_nowait() {
                             storage.begin_explicit_write_txn_nowait()
                         } else {
                             storage.begin_explicit_write_txn()
-                        }
-                        .map_err(map_write_lock_err)?;
+                        };
+                        let w = match acquired {
+                            Ok(w) => w,
+                            // `SKIP LOCKED`（#2231）: 他者保持中だけを「取得せず」として返す。
+                            Err(e)
+                                if acquire == WriterAcquire::Try
+                                    && is_write_lock_unavailable(&e) =>
+                            {
+                                return Ok(false);
+                            }
+                            Err(e) => return Err(map_write_lock_err(e)),
+                        };
                         let snap = match open_read_snapshot(storage) {
                             Ok(snap) => snap,
                             Err(e) => {
@@ -1110,7 +1147,7 @@ impl<'e> SessionTransaction<'e> {
                     savepoint_base: None,
                     storage,
                 }));
-                Ok(())
+                Ok(true)
             }
             TxnState::Active(_) => {
                 // 入れ子の BEGIN はトランザクションを Failed へ遷移させる
@@ -1758,21 +1795,54 @@ impl<'e> SessionTransaction<'e> {
         ctx: &crate::policy::PolicyContext,
         nowait: bool,
     ) -> Result<(), SqlSurfaceError> {
+        self.acquire_writer(
+            ctx,
+            if nowait {
+                WriterAcquire::NoWait
+            } else {
+                WriterAcquire::Wait
+            },
+        )
+        .map(|_| ())
+    }
+
+    /// [`Self::ensure_writer_with`] の `SKIP LOCKED` 版（明示 Tx の `SELECT ... FOR UPDATE SKIP LOCKED`・
+    /// Issue #2231 の入口）。取得結果を `Ok(bool)` で返し、それ以外の失敗は
+    /// [`Self::ensure_writer_with`] と同じエラーのまま返す（SQL-38 (4)(5)。契約は spec 側を参照）。
+    pub(crate) fn try_ensure_writer(
+        &mut self,
+        ctx: &crate::policy::PolicyContext,
+    ) -> Result<bool, SqlSurfaceError> {
+        self.acquire_writer(ctx, WriterAcquire::Try)
+    }
+
+    /// [`Self::ensure_writer_with`]・[`Self::try_ensure_writer`] 共通の取得本体（取得経路を 1 本に保つ）。
+    fn acquire_writer(
+        &mut self,
+        ctx: &crate::policy::PolicyContext,
+        acquire: WriterAcquire,
+    ) -> Result<bool, SqlSurfaceError> {
         let mut base_failed = false;
         let conflict = match &mut self.state {
             TxnState::Active(active) => {
                 if active.writer.is_some() {
-                    return Ok(());
+                    return Ok(true);
                 }
                 if active.access_mode == TxnAccessMode::ReadOnly {
                     return Err(SqlSurfaceError::ReadOnlySqlTransaction);
                 }
-                let w = if nowait {
+                let acquired = if acquire.is_nowait() {
                     active.storage.begin_explicit_write_txn_nowait()
                 } else {
                     active.storage.begin_explicit_write_txn()
-                }
-                .map_err(map_write_lock_err)?;
+                };
+                let w = match acquired {
+                    Ok(w) => w,
+                    Err(e) if acquire == WriterAcquire::Try && is_write_lock_unavailable(&e) => {
+                        return Ok(false);
+                    }
+                    Err(e) => return Err(map_write_lock_err(e)),
+                };
                 active.writer = Some(w);
                 // 巻き戻し先の基底 savepoint を、writer がまだテーブルを開く前のここで取る
                 // （Issue #1943。redb は dirty な writer からは作れない）。`Restorable` が無ければ
@@ -1809,7 +1879,7 @@ impl<'e> SessionTransaction<'e> {
         if let TxnState::Active(active) = &mut self.state {
             active.registration = None;
         }
-        Ok(())
+        Ok(true)
     }
 
     /// writer 取得直後（permit 保持中）に、読み取り集合と `G_s` 以降の commit 記録の衝突を判定する。
@@ -2265,15 +2335,41 @@ fn commit_active(
 /// `SqlSurfaceError::LockNotAvailable`（`55P03`）へ写像する。それ以外は
 /// 内部事象として `XX000` に丸める（他テナントの情報を含まない）。
 fn map_write_lock_err(e: crate::storage::StorageError) -> SqlSurfaceError {
-    match e {
-        crate::storage::StorageError::WriteLockTimeout
-        | crate::storage::StorageError::WriteTxnHeldByCurrentSession => {
-            SqlSurfaceError::LockNotAvailable
-        }
-        _ => SqlSurfaceError::Internal {
-            detail: "internal error".to_string(),
-        },
+    if is_write_lock_unavailable(&e) {
+        return SqlSurfaceError::LockNotAvailable;
     }
+    SqlSurfaceError::Internal {
+        detail: "internal error".to_string(),
+    }
+}
+
+/// writer の取得方針（`begin_with_origin`・`acquire_writer` の内部引数。Issue #2231）。
+/// 呼び出し元の公開入口が `bool` で表す待機／`NOWAIT` に、`SKIP LOCKED` 用の `Try` を加えたもの（SQL-38 (4)）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriterAcquire {
+    /// 待機する。
+    Wait,
+    /// `NOWAIT` 用。
+    NoWait,
+    /// `SKIP LOCKED` 用（取得結果を `Ok(bool)` で返す）。
+    Try,
+}
+
+impl WriterAcquire {
+    /// 待たずに取得を試みる方針か（`NoWait`・`Try`）。
+    fn is_nowait(self) -> bool {
+        !matches!(self, Self::Wait)
+    }
+}
+
+/// writer を他者が保持していて取得できなかったエラーか（`map_write_lock_err` と同じ集合）。
+/// `SKIP LOCKED`（#2231）が取得失敗の種別を区別する唯一の判定。
+fn is_write_lock_unavailable(e: &crate::storage::StorageError) -> bool {
+    matches!(
+        e,
+        crate::storage::StorageError::WriteLockTimeout
+            | crate::storage::StorageError::WriteTxnHeldByCurrentSession
+    )
 }
 
 #[cfg(test)]
@@ -3093,6 +3189,39 @@ mod tests {
         txn.begin_implicit_with(&storage, &session, true)
             .expect("acquire after release");
         assert!(txn.is_implicit_active());
+    }
+
+    /// `SKIP LOCKED` の入口（Issue #2231）の取得結果と状態を固定する（SQL-38 (4)）。
+    #[test]
+    fn try_acquire_returns_false_while_held_without_changing_state() {
+        let (mut storage, _g) = open_test_storage("txn-2231-skip");
+        storage.set_write_lock_wait(Duration::from_secs(5));
+        let session = SessionState::default();
+        let holder = storage.begin_write_txn().expect("holder");
+        let started = Instant::now();
+        // 暗黙 Tx。
+        let mut implicit = SessionTransaction::new(TransactionLimits::default());
+        assert!(!implicit
+            .try_begin_implicit(&storage, &session)
+            .expect("try"));
+        assert!(matches!(implicit.status(), TransactionStatus::Idle));
+        // 明示 Tx。
+        let mut txn = SessionTransaction::new(TransactionLimits::default());
+        txn.begin(&storage, &session).expect("begin");
+        assert!(!txn.try_ensure_writer(&test_ctx()).expect("try"));
+        assert!(matches!(txn.status(), TransactionStatus::InTransaction));
+        assert!(txn.write_txn().is_none());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        drop(holder);
+        assert!(implicit
+            .try_begin_implicit(&storage, &session)
+            .expect("try"));
+        assert!(implicit.is_implicit_active());
+        drop(implicit);
+        assert!(txn.try_ensure_writer(&test_ctx()).expect("try"));
+        assert!(txn.write_txn().is_some());
+        // 取得済みなら再取得せず `Ok(true)`。
+        assert!(txn.try_ensure_writer(&test_ctx()).expect("try again"));
     }
 
     /// `BEGIN` 直後のスナップショットは、新たに開いた確定済み読み取りと同じ世代を指す

@@ -271,6 +271,51 @@ fn is_syntax_keyword_here(tokens: &[Token], idx: usize) -> bool {
     false
 }
 
+/// 名前解決（`schema.name` の置き換え）済みのトークン列から、テーブル参照位置にある表名だけを集める
+/// （出現順・重複なし。内部キー `#<id>.<name>` も含む）。FROM・JOIN・サブクエリの内側を位置で拾い、
+/// 列名・別名・構文語・表関数名・CTE 名は含めない。`SKIP LOCKED` の空結果前の RLS 判定
+/// （`core::row_lock_exec`・RLS-13）が、実参照表だけへ `policies_apply` を掛けるために使う。
+pub(crate) fn resolved_relation_names(tokens: &[Token]) -> Vec<String> {
+    let walk = crate::sql::relation_name::relation_positions(tokens);
+    let ctes = crate::sql::relation_name::collect_cte_scopes(tokens);
+    let mut out: Vec<String> = Vec::new();
+    for pos in walk.positions {
+        if pos.create_name {
+            continue;
+        }
+        let Some(name) = tokens
+            .get(pos.index)
+            .and_then(crate::sql::relation_name::unqualified_ident_name)
+        else {
+            continue;
+        };
+        if is_syntax_keyword_here(tokens, pos.index)
+            || ctes
+                .iter()
+                .any(|c| c.covers(pos.index) && c.name.eq_ignore_ascii_case(name))
+        {
+            continue;
+        }
+        let prev = pos.index.checked_sub(1).and_then(|i| tokens.get(i));
+        let table_function_slot = matches!(
+            prev,
+            Some(Token::Keyword(crate::sql::lexer::Keyword::From) | Token::Punct(','))
+        ) || matches!(prev, Some(Token::Ident(w)) if w.eq_ignore_ascii_case("JOIN"));
+        if table_function_slot
+            && matches!(
+                tokens.get(pos.index.saturating_add(1)),
+                Some(Token::Punct('('))
+            )
+        {
+            continue;
+        }
+        if !out.iter().any(|n| n == name) {
+            out.push(name.to_string());
+        }
+    }
+    out
+}
+
 /// 未修飾のテーブル参照の名前集め（参照ゲートの入力）。`skip` はゲート対象外のトークン添字
 /// （準備済み文で `public.` 修飾を外した位置）。トークン列は書き換えない。
 fn unqualified_relation_refs(tokens: &[Token], skip: &[usize]) -> Vec<GateRef> {
