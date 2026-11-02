@@ -85,34 +85,34 @@ impl EngineCore {
         Ok(outcome)
     }
 
-    /// `SKIP LOCKED` が writer を取得できなかったときの 0 行結果。句を除いた文を、句なし `SELECT` と同じ
-    /// execute 経路（明示 Tx は `read_only_in_active_txn`、autocommit は `execute_parsed_statement`）で
-    /// 実行し、結果の行だけを捨てて列を返す。これにより BEGIN 時点のスナップショット・負の
-    /// `LIMIT`／`OFFSET` の `22000`・`row_security = off` の `42501` など execute 時の検査を必ず通し、
-    /// 検査に落ちる文が成功の空結果に化けない（fail-closed）。読んだ行は結果へ載せないため、他者保持中の
-    /// 行の存在・件数は観測できない。`txn` が `Some` なら明示 Tx（writer 未取得で `BeginSnapshot`）の経路。
+    /// `SKIP LOCKED` が writer を取得できなかったときの 0 行結果。句を除いた文の列メタデータを
+    /// Describe と同じ経路（`describe_parsed_in_txn_unscrubbed`／`describe_parsed_in_session_unscrubbed`。
+    /// 明示 Tx は `BEGIN` 時点のスナップショット）で導出し、行なしの結果として返す。行は読まないため、
+    /// 他者保持中の行の存在・件数は観測できず、全件走査も明示 Tx の read_set 取り込みも起きない。
+    /// `txn` が `Some` なら明示 Tx の経路。
     fn skip_locked_empty_result<'e>(
         &'e self,
-        ctx: &PolicyContext,
+        _ctx: &PolicyContext,
         session: &mut SessionState,
         txn: Option<&SessionTransaction<'e>>,
         locking: &LockingSelect,
     ) -> Result<crate::sql::SqlOutcome, SqlSurfaceError> {
-        let stmt = locking.statement().clone();
-        let outcome = match txn {
-            Some(txn) => self.read_only_in_active_txn(ctx, session, txn, stmt)?,
-            None => {
-                self.execute_parsed_statement(ctx, session, &super::ParsedSql::Statement(stmt))?
-            }
+        // 行を読む本体は実行せず、Describe と同じ列メタデータ導出（検索・集計の本体を呼ばない）だけを行う。
+        // 全件走査・結果バイト上限（54000）・明示 Tx の read_set 取り込みを起こさず、構文・列・
+        // `LIMIT`／`OFFSET` の範囲などの束縛時検査は Describe 経路で効く。
+        let parsed = super::ParsedSql::Statement(locking.statement().clone());
+        let columns = match txn {
+            Some(txn) => self.describe_parsed_in_txn_unscrubbed(session, txn, &parsed)?,
+            None => self.describe_parsed_in_session_unscrubbed(session, &parsed)?,
         };
-        match outcome {
-            crate::sql::SqlOutcome::Query(q) => Ok(crate::sql::SqlOutcome::Query(
+        match columns {
+            Some(columns) => Ok(crate::sql::SqlOutcome::Query(
                 crate::sql::exec::QueryResult {
-                    columns: q.columns,
+                    columns,
                     rows: Vec::new(),
                 },
             )),
-            _ => Err(SqlSurfaceError::Internal {
+            None => Err(SqlSurfaceError::Internal {
                 detail: "internal error".to_string(),
             }),
         }

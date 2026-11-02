@@ -496,6 +496,33 @@ fn skip_locked_returns_zero_rows_while_held_in_txn() {
     assert_eq!(format!("{r:?}"), format!("{plain:?}"));
 }
 
+/// Issue #2231: 他者保持中の `SKIP LOCKED` は行を読まずに列だけ導出するため、明示 Tx でも結果の
+/// 行数・バイト上限（`54000`）に左右されず 0 行を返し、Tx は `InTransaction` のまま続行できる。
+#[test]
+fn skip_locked_empty_result_does_not_read_rows_in_txn() {
+    let (core, path) = new_core();
+    let _cleanup = CleanupGuard(path);
+    let mut session = SessionState::default();
+    seed(&core, &mut session);
+    let mut holder = hold_writer(&core, &mut session);
+    let sql = "SELECT id, title FROM documents ORDER BY id LIMIT 10 FOR UPDATE SKIP LOCKED";
+    let mut s2 = SessionState::default();
+    let mut t2 = core.new_session_transaction();
+    core.execute_sql_in_txn(&ctx(), &mut s2, &mut t2, "BEGIN")
+        .expect("begin");
+    let r = query_of(
+        core.execute_sql_in_txn(&ctx(), &mut s2, &mut t2, sql)
+            .expect("skip"),
+    );
+    assert!(r.rows.is_empty());
+    assert_eq!(r.columns.len(), 2);
+    assert_eq!(t2.status(), TransactionStatus::InTransaction);
+    core.execute_sql_in_txn(&ctx(), &mut s2, &mut t2, "ROLLBACK")
+        .expect("rollback");
+    core.execute_sql_in_txn(&ctx(), &mut session, &mut holder, "ROLLBACK")
+        .expect("release");
+}
+
 /// 自 Tx が既に writer を保持していれば `SKIP LOCKED` は行を返す（自分の未 commit 行を含む）。
 #[test]
 fn skip_locked_returns_rows_when_own_txn_holds_writer() {
