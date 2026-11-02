@@ -1527,20 +1527,22 @@ fn authenticate_scram<S: WireStream>(
             None => (None, mock),
         }
     } else {
-        match store.scram_lookup(username) {
-            Some((tenant, v)) => {
-                // ブートストラップ済みテナントの素の username は、ファイルの検証子ではなくカタログの
-                // ロールの検証子で照合する（Issue #2238）。ロールの検証子が使えない（不在・期限切れ・
-                // 検証子なし・不正）ときはモック検証子へ倒し、同じ `28P01`・同じ遅延へ収束させる。
-                match catalog_scram_for_users_file(engine, tenant, username) {
-                    CatalogScram::NotBootstrapped => (Some(tenant.to_string()), v.clone()),
-                    CatalogScram::Verifier(role_id, cv) => {
-                        catalog_verifier_role_id = Some(role_id);
-                        (Some(tenant.to_string()), cv)
-                    }
-                    CatalogScram::Unusable => (None, mock),
+        // 経路はファイルの行（テナント）から決め、カタログを先に引く。ファイルに検証子が無くても、
+        // ブートストラップ済みならカタログのロールの検証子で照合できる（Issue #2238）。ロールの検証子が
+        // 使えない（不在・期限切れ・検証子なし・不正・読み取り失敗）ときはモック検証子へ倒し、同じ
+        // `28P01`・同じ遅延へ収束させる。
+        match store.tenant_of(username) {
+            Some(tenant) => match catalog_scram_for_users_file(engine, tenant, username) {
+                CatalogScram::NotBootstrapped => match store.scram_lookup(username) {
+                    Some((t, v)) => (Some(t.to_string()), v.clone()),
+                    None => (None, mock),
+                },
+                CatalogScram::Verifier(role_id, cv) => {
+                    catalog_verifier_role_id = Some(role_id);
+                    (Some(tenant.to_string()), cv)
                 }
-            }
+                CatalogScram::Unusable => (None, mock),
+            },
             None => (None, mock),
         }
     };

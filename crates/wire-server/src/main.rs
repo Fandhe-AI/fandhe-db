@@ -2584,13 +2584,8 @@ fn run_server(args: &[String]) -> ExitCode {
             );
             return ExitCode::FAILURE;
         }
-        match store.require_scram(&mock_key_secret) {
-            Ok(s) => s,
-            Err(e) => {
-                engine::log_stderr!("wire-server: {e}");
-                return ExitCode::FAILURE;
-            }
-        }
+        // 検証子の必須検査はブートストラップの後（カタログが検証子を持つ行を許すため。Issue #2238）。
+        store.require_scram_deferred(&mock_key_secret)
     } else {
         store
     };
@@ -2665,6 +2660,12 @@ fn run_server(args: &[String]) -> ExitCode {
         }
         Err(e) => {
             engine::log_stderr!("wire-server: users file bootstrap failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+    if auth_method == wire_server::auth::AuthMethod::ScramSha256 {
+        if let Err(e) = store.ensure_scram_ready(&core) {
+            engine::log_stderr!("wire-server: {e}");
             return ExitCode::FAILURE;
         }
     }

@@ -352,7 +352,7 @@ impl UserStore {
     /// 読んだファイルの生バイト列をそのまま渡す契約。運用者が同じ秘密
     /// ファイルを使い続ける限り、ユーザーストアの追加・削除・並べ替えや
     /// 検証子更新の前後でモック salt は変化しない（存在オラクル対策）。
-    pub fn require_scram(mut self, mock_key_secret: &[u8]) -> Result<Self, LoadError> {
+    pub fn require_scram(self, mock_key_secret: &[u8]) -> Result<Self, LoadError> {
         let mut usernames: Vec<&String> = self.users.keys().collect();
         usernames.sort();
         for username in usernames {
@@ -367,9 +367,48 @@ impl UserStore {
                 });
             }
         }
+        Ok(self.enable_scram(mock_key_secret))
+    }
+
+    /// [`UserStore::require_scram`] の検証子の必須検査を後ろへ回す版（Issue #2238）。ブートストラップ後は
+    /// 資格情報の正がカタログのため、ファイルに検証子が無い行でも、カタログのロールが検証子を持てば
+    /// SCRAM でログインできる。呼び出し元（`main.rs`）はブートストラップの後に
+    /// [`UserStore::ensure_scram_ready`] を必ず呼ぶこと（呼ばないと検証子の欠落を起動時に検出できない）。
+    pub fn require_scram_deferred(self, mock_key_secret: &[u8]) -> Self {
+        self.enable_scram(mock_key_secret)
+    }
+
+    fn enable_scram(mut self, mock_key_secret: &[u8]) -> Self {
         self.auth_method = AuthMethod::ScramSha256;
         self.scram_mock_key = Some(derive_scram_mock_key(mock_key_secret));
-        Ok(self)
+        self
+    }
+
+    /// ブートストラップ後の SCRAM 必須検査。ファイルに検証子の無い行は、カタログのブートストラップ済みの
+    /// 同名ロールが検証子を持つ場合に限り許す。それ以外（カタログ読み取り失敗を含む）は起動失敗
+    /// （fail-closed。恒久的にログイン不能な行・タイミング対称性の崩れを未然に防ぐ）。
+    pub fn ensure_scram_ready(&self, engine: &engine::core::EngineCore) -> Result<(), LoadError> {
+        let mut usernames: Vec<&String> = self.users.keys().collect();
+        usernames.sort();
+        for username in usernames {
+            let Some(r) = self.users.get(username) else {
+                continue;
+            };
+            if r.scram_verifier.is_some() {
+                continue;
+            }
+            let ok = matches!(
+                engine.resolve_users_file_role(&r.tenant_id, username),
+                Ok(engine::core::UsersFileRoleBinding::Role(c))
+                    if c.bootstrapped && !c.scram_verifier.is_empty()
+            );
+            if !ok {
+                return Err(LoadError::MissingScramVerifier {
+                    username: username.clone(),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// このストアが選択している認証方式。`handshake.rs` が `Authentication*`

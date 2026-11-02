@@ -205,10 +205,34 @@ fn verify_against_catalog(
     ))
 }
 
+/// 認証失敗の KDF 負荷を揃えるための空回し（Argon2id と SCRAM の PBKDF2 を 1 回ずつ。結果は捨てる）。
+/// ロールの不在・読み取り失敗・未知ユーザーが、実在ロールの照合（両 KDF を実行）と所要時間で
+/// 区別できないようにする（存在のオラクル対策）。
+fn burn_kdfs(password: &[u8], argon_too: bool) {
+    if argon_too {
+        let _ = argon2id::verify_phc(super::dummy_phc(), password);
+    }
+    let _ = scram_password_matches(dummy_scram_verifier(), password);
+}
+
+/// 起点から [`AUTH_FAILURE_DELAY`] に達するまで待ってから認証失敗を返す。
+fn fail_after_delay(start: Instant) -> AuthFailure {
+    let elapsed = start.elapsed();
+    if elapsed < AUTH_FAILURE_DELAY {
+        std::thread::sleep(AUTH_FAILURE_DELAY - elapsed);
+    }
+    AuthFailure
+}
+
 /// cleartext 用の「パスワード照合＋ロール対応づけ」。照合の前に起点を取り、対応づけの失敗でも
 /// [`AUTH_FAILURE_DELAY`] に達するまで待つ（誤パスワードと遅延で区別できない。J6）。戻りの
 /// [`UsersFileBinding`] は `Unbound` か `Bound` のみ。HTTP の `POST /v1/session`（HTTP-4）からも
 /// 同じ関数を使う。ブートストラップ済みテナントでは資格情報の照合元がカタログになる（Issue #2238）。
+///
+/// カタログの引きは 1 回だけで、その結果を照合と束縛の両方に使う（引き直しの間にカタログが
+/// 変わっても、未照合のロールへ束縛しない）。読み取り失敗・同名ロール不在は認証失敗（fail-closed。
+/// ファイルの旧パスワードへは落とさない）。engine がある場合は、どの経路でも Argon2id と PBKDF2 を
+/// 1 回ずつ実行して計算量を揃える。
 pub(crate) fn verify_and_bind(
     store: &UserStore,
     engine: Option<&EngineCore>,
@@ -216,25 +240,47 @@ pub(crate) fn verify_and_bind(
     password: &[u8],
 ) -> Result<(engine::policy::PolicyContext, UsersFileBinding), AuthFailure> {
     let start = Instant::now();
-    if let (Some(engine), Some(tenant)) = (engine, store.tenant_of(username)) {
-        // 読み取りの失敗は下のファイル経路へ落とす。そこでも `bind_users_file_user` が同じ失敗で
-        // `Reject` にするので、資格情報を緩める方向には働かない。
-        if let Ok(UsersFileRoleBinding::Role(c)) = engine.resolve_users_file_role(tenant, username)
-        {
-            if c.bootstrapped {
-                return verify_against_catalog(start, tenant, c, password);
-            }
+    let Some(engine) = engine else {
+        let ctx = super::verify(store, username, password)?;
+        return Ok((ctx, UsersFileBinding::Unbound));
+    };
+    let Some(tenant) = store.tenant_of(username) else {
+        // 未知ユーザー: 実在ロールと同じ KDF 回数（Argon2id は `verify` 内のダミー照合）。
+        burn_kdfs(password, false);
+        let _ = super::verify(store, username, password);
+        return Err(fail_after_delay(start));
+    };
+    match engine.resolve_users_file_role(tenant, username) {
+        Ok(UsersFileRoleBinding::Role(c)) if c.bootstrapped => {
+            verify_against_catalog(start, tenant, c, password)
         }
-    }
-    let ctx = super::verify(store, username, password)?;
-    match bind_users_file_user(engine, ctx.tenant_id(), username) {
-        UsersFileBinding::Reject => {
-            let elapsed = start.elapsed();
-            if elapsed < AUTH_FAILURE_DELAY {
-                std::thread::sleep(AUTH_FAILURE_DELAY - elapsed);
+        Ok(UsersFileRoleBinding::Role(c)) => {
+            // マーカー無し（移行前）。ファイルの PHC で照合し、同じ引き結果のロールへ束縛する。
+            burn_kdfs(password, false);
+            let ctx = super::verify(store, username, password)?;
+            if c.is_expired() {
+                return Err(fail_after_delay(start));
             }
-            Err(AuthFailure)
+            Ok((
+                ctx,
+                UsersFileBinding::Bound(BoundUsersFileRole::from_credentials(c)),
+            ))
         }
-        binding => Ok((ctx, binding)),
+        Ok(UsersFileRoleBinding::CatalogNotAuthoritative) => {
+            burn_kdfs(password, false);
+            let ctx = super::verify(store, username, password)?;
+            Ok((ctx, UsersFileBinding::Unbound))
+        }
+        Ok(UsersFileRoleBinding::Missing) => {
+            burn_kdfs(password, true);
+            Err(fail_after_delay(start))
+        }
+        Err(_) => {
+            engine::log_stderr!(
+                "wire-server: role catalog lookup failed while verifying a users-file user; treating as authentication failure"
+            );
+            burn_kdfs(password, true);
+            Err(fail_after_delay(start))
+        }
     }
 }
