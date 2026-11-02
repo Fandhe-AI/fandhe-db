@@ -22,6 +22,8 @@
 //!   名前は `sql::relation_name` が SCHEMA 修飾を解決済みの内部キーで受け取る（SEQUENCE は relation キー、
 //!   関数は関数キー）。型の並びは `DROP FUNCTION` と共有のヘルパーで読む。
 //!
+//! `ALTER DEFAULT PRIVILEGES`（Issue #2237）の構文検証は子モジュール `default_privileges` が担う。
+//!
 //! 構文段で拒否する形: 句の欠落・重複・順序違い・未知の権限語・空の列リスト・末尾の余り（`42601`）、
 //! 対象の種別に許されない権限・PUBLIC への `WITH GRANT OPTION`（`0LP01`）、範囲外の対象種別
 //! （`ALL SEQUENCES／FUNCTIONS IN SCHEMA`・`PROCEDURE`・`ROUTINE`・`DATABASE` 等）・組み込み SCHEMA 名・
@@ -202,17 +204,12 @@ pub(crate) fn is_revoke_statement(tokens: &[Token]) -> bool {
     matches!(tokens.first(), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("REVOKE"))
 }
 
-/// 先頭 3 語が `ALTER DEFAULT PRIVILEGES` か（汎用 `ALTER`〔`ALTER TABLE` 扱い〕より前に分岐して
-/// `0A000` にする。#2237 の担当）。
+/// 先頭 3 語が `ALTER DEFAULT PRIVILEGES` か（汎用 `ALTER`〔`ALTER TABLE` 扱い〕より前に振り分けるために
+/// 使う。構造検証は子モジュール `default_privileges`、Issue #2237）。
 pub(crate) fn is_alter_default_privileges_statement(tokens: &[Token]) -> bool {
     is_word(tokens.first(), "ALTER")
         && is_word(tokens.get(1), "DEFAULT")
         && is_word(tokens.get(2), "PRIVILEGES")
-}
-
-/// 先頭 3 語が `ALTER DEFAULT PRIVILEGES` の文を `0A000` で拒否する（#2237）。
-pub(crate) fn reject_alter_default_privileges() -> SqlSurfaceError {
-    SqlSurfaceError::feature_not_supported("ALTER DEFAULT PRIVILEGES is not supported yet")
 }
 
 fn syntax(detail: &str) -> SqlSurfaceError {
@@ -743,6 +740,10 @@ pub(crate) fn validate_grant_revoke_tokens(
     };
     Ok(ValidatedGrantRevoke { is_grant, target })
 }
+
+mod default_privileges;
+pub use default_privileges::ValidatedAlterDefaultPrivileges;
+pub(crate) use default_privileges::{validate_alter_default_privileges_tokens, DefaultAclTarget};
 
 #[cfg(test)]
 mod tests;

@@ -62,6 +62,7 @@ mod sql39_alter_set_role;
 mod sql39_role_ddl;
 mod sql39_role_login;
 mod sql39_users_file_role;
+mod sql40_default_privileges;
 mod sql40_grant_revoke;
 mod sql40_object_owner;
 mod sql40_schema_grant;

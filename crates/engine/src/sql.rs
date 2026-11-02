@@ -212,6 +212,7 @@ mod truncate_restart_identity_tests;
 // `CREATE FUNCTION`／`DROP FUNCTION` の UDF カタログ書き込み経路（SQL-66・Issue #1920）。
 pub mod udf_ddl;
 // TRIGGER DDL（TABLE-45・Issue #1722）。
+pub mod default_privileges_ddl;
 pub mod grant_ddl;
 pub mod owner_ddl;
 pub mod policy_applicability;
@@ -443,6 +444,11 @@ pub enum SqlOutcome {
     ///
     /// **BREAKING CHANGE**（Issue #1965）: `SqlOutcome` への variant 追加。
     GrantRevoke(grant_ddl::GrantRevokeOutcome),
+    /// `ALTER DEFAULT PRIVILEGES`（SQL-40、Issue #2237）が成功したことを示す応答（CommandComplete タグ
+    /// `ALTER DEFAULT PRIVILEGES`）。
+    ///
+    /// **BREAKING CHANGE**（Issue #2237）: `SqlOutcome` への variant 追加。
+    AlterDefaultPrivileges(default_privileges_ddl::AlterDefaultPrivilegesOutcome),
     /// `ALTER {TABLE|VIEW|MATERIALIZED VIEW|SCHEMA} ... OWNER TO`（SQL-40、Issue #2236。コマンドタグは
     /// 対象に応じた `ALTER <種別>`）。
     ///
