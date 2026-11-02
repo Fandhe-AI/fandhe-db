@@ -15,7 +15,9 @@
 //! - 所有者の扱いは暫定で、常に「所有者ではない」として適用する（狭める側＝fail-closed）。初期ロールの
 //!   `BYPASSRLS`・所有者除外・`row_security` は #2278 がこの前段へ足す。
 //!
-//! 適用できない経路（ランキング付き検索・索引・キャッシュ依存の経路。#2279 の担当）は、適用表に限り
+//! ランキング付き検索（距離順・ハイブリッド。#2279）は `sql::exec` の行フック（`on_visible_row`）が
+//! RLS 段の直後で適用する。キャッシュはテナント境界だけの内容のまま保ち、ポリシーは問い合わせごとの
+//! 候補マスクとして掛ける。適用できない経路（Rust API の検索・`USING PLAN` の辞書構築）は、適用表に限り
 //! [`reject_if_policies_apply`] で固定文言の `0A000` として拒否し、ポリシーを黙って素通りさせない。
 
 use crate::catalog::policy::{list_policies_in_source, PolicyCommand, PolicyDef};

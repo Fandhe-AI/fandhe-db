@@ -3879,7 +3879,8 @@ impl EngineCore {
         CoreError,
     > {
         // RLS-13（Issue #2276）: 辞書はテナント可視行から作る。ポリシーで隠れた行の語が辞書へ入ると
-        // クエリ展開から存在が推測できるため、適用表では辞書構築を拒否する（#2279 の担当）。
+        // クエリ展開から存在が推測できるため、適用表では辞書構築を拒否する（`USING PLAN` は #2279 でも拒否を維持。
+        // 辞書は別 txn の列挙とキャッシュを使うため、判断 A を崩さず安全に合成する設計が要る。設計記録参照）。
         self.reject_if_row_policies_apply(ctx, table)?;
         if let Some(hit) = self.dictionary_cache.lookup(&self.storage, table, ctx) {
             return Ok(hit);
@@ -11278,7 +11279,7 @@ impl EngineCore {
                 // `bind_in_session` の束縛結果だけから ANN／SCALAR の静的判定を
                 // 報告する（[`Self::run_search_explain`] 参照）。
                 crate::sql::allowlist::ExplainTarget::Search(validated) => {
-                    self.run_search_explain(&validated, session)
+                    self.run_search_explain(ctx, &validated, session)
                 }
                 // Issue #922（SQL-27）: 集計 SELECT（`GROUP BY`・`DISTINCT` の
                 // 脱糖形いずれも）。行走査・索引消費を一切行わず、`bind_aggregate`
@@ -12809,6 +12810,11 @@ impl EngineCore {
         } else {
             (crate::sql::scalar_plan::ScalarPlan::IndexPartial, None)
         };
+        // RLS-13（Issue #2279）: 実行側（`sql::exec`）と同じく、ポリシー適用表では ANN 形状を
+        // `Subset` 系へ補正する。判定は `post_check_txn`（索引宣言を読むのと同じスナップショット）から行い、
+        // `row_security = off`（`42501`）は計画段でもそのまま伝播させる。
+        let row_policy_present =
+            crate::sql::row_policy::policies_apply(&post_check_txn, ctx, table)?;
         let (explain_engine, index_names) = self.explain_engine_for(
             &post_check_txn,
             table,
@@ -12831,6 +12837,7 @@ impl EngineCore {
             scalar_filter_column_names.as_deref(),
             &expression_index_names,
             &partial_index_names,
+            row_policy_present,
         );
         drop(post_check_txn);
         Ok(crate::sql::explain::build_explain_result_with_indexes(
@@ -12917,6 +12924,7 @@ impl EngineCore {
         scalar_filter_columns: Option<&[&str]>,
         expression_index_names: &[String],
         partial_index_names: &[String],
+        row_policy_present: bool,
     ) -> (
         crate::sql::explain::ExplainEngine,
         crate::sql::explain::ExplainIndexNames,
@@ -12950,15 +12958,19 @@ impl EngineCore {
         } else {
             false
         };
-        let ann_plan =
-            crate::sql::hnsw_cache::classify_ann_plan(crate::sql::hnsw_cache::AnnShapeInput {
-                hnsw_enabled,
-                engine_kind_unknown: self.search_engine_kind().is_none(),
-                is_hybrid,
-                is_precision,
-                filters_empty,
-                scalar_prefilter,
-            });
+        let ann_plan = crate::sql::hnsw_cache::classify_ann_plan(
+            crate::sql::hnsw_cache::ann_shape_with_row_policy(
+                crate::sql::hnsw_cache::AnnShapeInput {
+                    hnsw_enabled,
+                    engine_kind_unknown: self.search_engine_kind().is_none(),
+                    is_hybrid,
+                    is_precision,
+                    filters_empty,
+                    scalar_prefilter,
+                },
+                row_policy_present,
+            ),
+        );
 
         // codex-review P1 指摘対応（Issue #1066 PR #1155）: `HnswScope::All` は
         // `hnsw_targeted_in_txn` が宣言の有無を見ず常に `true` を返す（適格性が
@@ -13056,6 +13068,7 @@ impl EngineCore {
     /// （`wire_code` のパリティ）。
     fn run_search_explain(
         &self,
+        ctx: &PolicyContext,
         validated: &crate::sql::allowlist::ValidatedStatement,
         session: &crate::sql::mode::SessionState,
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
@@ -13068,7 +13081,7 @@ impl EngineCore {
             &self.result_limits,
         )?;
         Ok(crate::sql::SqlOutcome::Explain(
-            self.search_explain_from_bound(&read_txn, &schema, &bound),
+            self.search_explain_from_bound(ctx, &read_txn, &schema, &bound)?,
         ))
     }
 
@@ -13099,10 +13112,14 @@ impl EngineCore {
     /// の索引名注記も連動して出なくなる）。
     fn search_explain_from_bound(
         &self,
+        ctx: &PolicyContext,
         read_txn: &redb::ReadTransaction,
         schema: &crate::catalog::TableSchema,
         bound: &crate::sql::parser::BoundStatement,
-    ) -> crate::sql::exec::QueryResult {
+    ) -> Result<crate::sql::exec::QueryResult, crate::sql::allowlist::SqlSurfaceError> {
+        // RLS-13（Issue #2279）: 実行側と同じ ANN 形状補正のため、同じ `read_txn` からポリシーの適用可否を求める。
+        let row_policy_present =
+            crate::sql::row_policy::policies_apply(read_txn, ctx, bound.table())?;
         let is_hybrid = matches!(bound.ranking(), crate::sql::parser::Ranking::Hybrid { .. });
         let is_precision = bound.mode().mode() == crate::sql::mode::SearchMode::Precision;
         let filters_empty = !bound.has_where_filters();
@@ -13221,8 +13238,13 @@ impl EngineCore {
             scalar_filter_column_names.as_deref(),
             &expression_index_names,
             &partial_index_names,
+            row_policy_present,
         );
-        crate::sql::explain::build_search_explain_result(bound.mode(), &engine, &index_names)
+        Ok(crate::sql::explain::build_search_explain_result(
+            bound.mode(),
+            &engine,
+            &index_names,
+        ))
     }
 
     /// `EXPLAIN SELECT <集計>`（`GROUP BY`・`SELECT DISTINCT` の脱糖形いずれも。
@@ -13644,7 +13666,7 @@ impl EngineCore {
             ));
         }
         self.check_bound_limit(bound.limit())?;
-        Ok(self.search_explain_from_bound(&read_txn, &schema, &bound))
+        self.search_explain_from_bound(ctx, &read_txn, &schema, &bound)
     }
 
     /// 束縛済み広域取得計画（[`crate::sql::parser::BoundScan`]）の
@@ -17553,7 +17575,7 @@ impl VectorCore for EngineCore {
             Err(e) => return Err(CoreError::Catalog(e)),
         };
         // RLS-13（Issue #2276）: 利用者ポリシーの適用表では、アリーナ・索引・キャッシュの検索経路が
-        // ポリシーを反映できない（#2279 の担当）ため、固定文言で拒否する（黙って素通りさせない）。
+        // Rust API はポリシーを反映できない（SQL 表層は #2279 で適用済み。ここは拒否を維持）ため、固定文言で拒否する（黙って素通りさせない）。
         self.reject_if_row_policies_apply(ctx, table)?;
         let expected_dim = match schema.vector_dim() {
             Some(dim) if dim != 0 && dim <= crate::storage::MAX_EMBEDDING_DIM => dim,

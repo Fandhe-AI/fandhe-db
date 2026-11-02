@@ -785,10 +785,23 @@ pub(crate) fn execute_statement_with_cache(
     hnsw_cache: Option<crate::sql::hnsw_cache::HnswCacheAccess<'_>>,
     scalar_cache: Option<crate::sql::scalar_index::ScalarCacheAccess<'_>>,
 ) -> Result<QueryResult, SqlSurfaceError> {
-    // RLS-13（Issue #2276）: ランキング付き検索（距離順・ハイブリッド・`USING PLAN`）は、アリーナ・
-    // HNSW・スカラー索引・疎索引・各キャッシュがテナント可視集合だけをキーにしており、利用者ポリシーを
-    // 反映できない（#2279 の担当）。適用表では固定文言の `0A000` で拒否し、ポリシーを素通りさせない。
-    crate::sql::row_policy::reject_if_policies_apply(read_txn, ctx, &bound.table)?;
+    // RLS-13（Issue #2279）: 利用者ポリシーは、アリーナ構築と同じ read txn から 1 回だけ解決し、下の
+    // `on_visible_row`（RLS 段の直後・利用者の `WHERE` より前）で各行へ適用する。キャッシュ
+    // （アリーナ・HNSW・疎索引・スカラー索引）はテナント境界だけの内容のまま保ち（`rls_capture` は
+    // `on_visible_row` の判定と無関係に RLS 段の行を採取する）、ポリシーは問い合わせごとの候補マスクとして
+    // 掛ける。ポリシーを迂回しうる経路（遅延投影・キャッシュ高速経路・索引の信頼マスク・疎キャッシュ・
+    // FullVisible の ANN）は `row_policy` がある間は無効化する。`row_security = off`（`42501`）・
+    // 解決失敗（`XX000`）はそのまま伝播させる（fail-closed）。設計記録は
+    // `docs/design/row-security-policy-composition.md`。
+    let row_policy = crate::sql::row_policy::resolve_row_policy(
+        read_txn,
+        ctx,
+        schema,
+        &bound.table,
+        crate::sql::row_policy::PolicyCmd::Select,
+    )?;
+    let policy_present = row_policy.is_some();
+    let row_filters_present = bound.has_where_filters() || policy_present;
     // 書き込みトランザクション由来（自トランザクションの未 commit 変更を読む経路。
     // Issue #1179）ではテーブル世代キーのキャッシュ群を一切使わない（未 commit の
     // 内容から作ったエントリを共有しない。`storage::read_source` モジュールドキュメント
@@ -840,7 +853,7 @@ pub(crate) fn execute_statement_with_cache(
     // キャッシュ経路（下記 `sparse_cache_eligible`／`hnsw_full_visible_eligible`）
     // が OR 条件を一切適用せず全可視行を対象にしてしまう fail-open のバグに
     // なる（security.md「不安全な設計」対応）。
-    let filters_empty = !bound.has_where_filters();
+    let filters_empty = !row_filters_present;
     let sparse_cache_eligible = sparse_cache.is_some() && is_hybrid && filters_empty;
     // Issue #408: `HnswIndexCache` の適用条件は `Ranking::Distance`（hybrid でない）
     // かつフィルタなし。`sparse_cache_eligible` の hybrid 版と対称の条件（`sql/
@@ -901,21 +914,25 @@ pub(crate) fn execute_statement_with_cache(
         },
         None => false,
     };
-    let ann_plan =
-        crate::sql::hnsw_cache::classify_ann_plan(crate::sql::hnsw_cache::AnnShapeInput {
-            hnsw_enabled,
-            // Issue #411 追記（codex-review P1 指摘・PR #437）:
-            // `sql::exec` の 4 boolean は `AnnPlan::UnknownCustomProvider` と
-            // `AnnPlan::PlainScanEngine` のどちらであっても等しく `false`
-            // （いずれも `HnswFullVisible`／`HnswSubset` ではない）ため、この
-            // 判別は `EXPLAIN`（`core.rs`）専用の表示情報。ここでは常に
-            // `false`（「エンジン種別は既知」）を渡す。
-            engine_kind_unknown: false,
-            is_hybrid,
-            is_precision,
-            filters_empty,
-            scalar_prefilter: plan.scalar_prefilter,
-        });
+    let ann_plan = crate::sql::hnsw_cache::classify_ann_plan(
+        crate::sql::hnsw_cache::ann_shape_with_row_policy(
+            crate::sql::hnsw_cache::AnnShapeInput {
+                hnsw_enabled,
+                // Issue #411 追記（codex-review P1 指摘・PR #437）:
+                // `sql::exec` の 4 boolean は `AnnPlan::UnknownCustomProvider` と
+                // `AnnPlan::PlainScanEngine` のどちらであっても等しく `false`
+                // （いずれも `HnswFullVisible`／`HnswSubset` ではない）ため、この
+                // 判別は `EXPLAIN`（`core.rs`）専用の表示情報。ここでは常に
+                // `false`（「エンジン種別は既知」）を渡す。
+                engine_kind_unknown: false,
+                is_hybrid,
+                is_precision,
+                filters_empty,
+                scalar_prefilter: plan.scalar_prefilter,
+            },
+            policy_present,
+        ),
+    );
     let hnsw_full_visible_eligible =
         !is_hybrid && ann_plan == crate::sql::hnsw_cache::AnnPlan::HnswFullVisible;
     let hnsw_subset_eligible =
@@ -1095,7 +1112,7 @@ pub(crate) fn execute_statement_with_cache(
     // Issue #1179）では投影の遅延（確定済みスナップショットの再オープン）を使わず、
     // 候補構築時に投影列を保持する既存の eager 経路へ倒す。
     let defer_projection = read_txn.snapshot().is_some()
-        && !bound.has_where_filters()
+        && !row_filters_present
         && (!is_hybrid || skip_sparse_accumulation)
         && !needed_column_indices.is_empty();
 
@@ -1122,6 +1139,11 @@ pub(crate) fn execute_statement_with_cache(
     // スクラッチバッファ。`expr_scratch` と同じ理由で行ループの外に 1 回だけ
     // 確保し、行ごとに使い回す。
     let mut or_scratch: Vec<crate::sql::expr_program::StackValue> = Vec::new();
+
+    // RLS-13（Issue #2279）: 利用者ポリシー評価用のスクラッチ。`expr_scratch` と同じ理由で行ループの
+    // 外に 1 回だけ確保する。
+    let mut policy_scratch: Vec<crate::sql::expr_program::StackValue> = Vec::new();
+    let row_policy_ref = row_policy.as_ref();
 
     let on_visible_row = |slot: usize,
                           id: u64,
@@ -1154,6 +1176,25 @@ pub(crate) fn execute_statement_with_cache(
         // 下のループで選択的に複製する。
         let scanned = row_codec::scan_scalar_columns(schema, metadata)
             .map_err(|e| ArenaError::Storage(StorageError::Codec(e.to_string())))?;
+        // RLS-13（Issue #2279）: 利用者ポリシー段。テナント境界（RLS 段）の内側・利用者の `WHERE`
+        // より前に無条件で評価する（`HINT ORDER` でも切り替えない。隠れた行にだけ評価エラーを起こす
+        // 式が利用者の `WHERE` に混じっても、ポリシーが先に行を除くため存在が推測できない）。偽なら
+        // スロットを消費させず、疎コーパスにも蓄積しない（BM25 の統計に隠れた行を入れない）。
+        // `scan_scalar_columns` は全列を復号するため、ポリシーの参照列の取り違えは起きない。
+        if let Some(policy) = row_policy_ref {
+            if !policy
+                .passes(
+                    &scanned,
+                    id,
+                    embedding,
+                    embedding.len(),
+                    &mut policy_scratch,
+                )
+                .map_err(expr_eval_error_to_arena)?
+            {
+                return Ok(false);
+            }
+        }
         // Issue #919・SQL-26: `scan_scalar_columns`（マスクなし）は全列を
         // デコードするため、マスク外＝実 NULL の取り違えは生じない。
         // DISTANCE 先行時（`!plan.scalar_prefilter`）の SCALAR 事後フィルタ判定を
@@ -1449,8 +1490,7 @@ pub(crate) fn execute_statement_with_cache(
     // 遅延デコードを担うため、高速経路側に追加条件は要らない
     // （`defer_projection` と本条件はいずれも同じ「SCALAR 段が恒等写像」を
     // 判定しており、hybrid 時の `skip_sparse_accumulation` 要求も共通）。
-    let cache_fast_path_eligible =
-        !bound.has_where_filters() && (!is_hybrid || skip_sparse_accumulation);
+    let cache_fast_path_eligible = !row_filters_present && (!is_hybrid || skip_sparse_accumulation);
 
     // Issue #474: SCALAR 事前フィルタの索引対応述語形状の静的判定
     // （`sql::scalar_plan::classify_scalar_plan`）。索引の gated 構築（下記）と
@@ -1780,36 +1820,37 @@ pub(crate) fn execute_statement_with_cache(
                             // 落ちるだけで、クエリの正しさ・テナント境界は不変。
                             // 部分索引由来の候補（`candidates_exact == false`）は上位集合なので、
                             // 信頼マスクではなく `on_visible_row` 再適用経路を必ず通す（Issue #1656）。
-                            let kept = if !hnsw_subset_eligible && candidates_exact {
-                                if let Some(scalar_access) = scalar_cache.as_ref() {
-                                    scalar_access.cache.record_index_trusted_mask_scan();
-                                }
-                                // 投影段は常に `ScalarSource::Deferred(Snapshot)`
-                                // 側へ倒す。`EagerSubset` は
-                                // `candidate_columns` が候補行ぶん埋まっている
-                                // ことを前提に `kept_slots` 経由で引く契約
-                                // （Issue #654）であり、この経路では
-                                // `on_visible_row` を一度も呼ばないため空のまま
-                                // ＝ fail-closed な内部エラーになる。投影列が
-                                // 無い（`SELECT id`）場合も `needed_mask` が
-                                // 全 false になるだけで Top-k 行のデコードは
-                                // 実質発生しない（`tests/scalar_index_mask_search.rs::
-                                // trusted_mask_matches_plain_scan_for_each_predicate_shape`
-                                // の `SELECT id` ケースが固定する）。
-                                mask_trusted_defer = true;
-                                slots
-                            } else {
-                                VectorArena::filter_cached_rls_rows_subset(
-                                    expected_dim,
-                                    snapshot.arena(),
-                                    snapshot.metadata(),
-                                    &slots,
-                                    on_visible_row,
-                                    crate::arena::MAX_ARENA_ROWS,
-                                    crate::arena::MAX_ARENA_TOTAL_BYTES,
-                                )
-                                .map_err(|e| map_arena_error(&bound.table, e))?
-                            };
+                            let kept =
+                                if !hnsw_subset_eligible && candidates_exact && !policy_present {
+                                    if let Some(scalar_access) = scalar_cache.as_ref() {
+                                        scalar_access.cache.record_index_trusted_mask_scan();
+                                    }
+                                    // 投影段は常に `ScalarSource::Deferred(Snapshot)`
+                                    // 側へ倒す。`EagerSubset` は
+                                    // `candidate_columns` が候補行ぶん埋まっている
+                                    // ことを前提に `kept_slots` 経由で引く契約
+                                    // （Issue #654）であり、この経路では
+                                    // `on_visible_row` を一度も呼ばないため空のまま
+                                    // ＝ fail-closed な内部エラーになる。投影列が
+                                    // 無い（`SELECT id`）場合も `needed_mask` が
+                                    // 全 false になるだけで Top-k 行のデコードは
+                                    // 実質発生しない（`tests/scalar_index_mask_search.rs::
+                                    // trusted_mask_matches_plain_scan_for_each_predicate_shape`
+                                    // の `SELECT id` ケースが固定する）。
+                                    mask_trusted_defer = true;
+                                    slots
+                                } else {
+                                    VectorArena::filter_cached_rls_rows_subset(
+                                        expected_dim,
+                                        snapshot.arena(),
+                                        snapshot.metadata(),
+                                        &slots,
+                                        on_visible_row,
+                                        crate::arena::MAX_ARENA_ROWS,
+                                        crate::arena::MAX_ARENA_TOTAL_BYTES,
+                                    )
+                                    .map_err(|e| map_arena_error(&bound.table, e))?
+                                };
                             if let Some(scalar_access) = scalar_cache.as_ref() {
                                 scalar_access.cache.record_index_scan();
                                 scalar_access.cache.record_index_mask_scan();
@@ -2079,6 +2120,23 @@ pub(crate) fn execute_statement_with_cache(
     // になるようにする。`core::MAX_SEARCH_K` でクランプする（下記 `const _` で
     // `2 <= core::MAX_SEARCH_K` を固定済みのため `k_eff` は常に provider・RRF
     // 設定の許容範囲に収まる）。
+    // RLS-13（Issue #2279）: ポリシー適用表の `Subset` 形状では、テナント可視の全集合スナップショット
+    // から索引ベースを用意する（`prepare_subset` はベース未構築だと構築せず plain scan に縮退するため）。
+    // スナップショットが無い（キャッシュ無効・書き込み txn 由来）ときは何もせず、厳密走査で正しい結果になる。
+    if policy_present && (hnsw_subset_eligible || hnsw_hybrid_subset_eligible) {
+        if let (Some(access), Some(snapshot)) =
+            (hnsw_cache.as_ref(), scalar_snapshot_for_index.as_ref())
+        {
+            crate::sql::hnsw_cache::prepare_base_from_full_visible(
+                access,
+                crate::storage::read_source::require_snapshot(read_txn)?,
+                &bound.table,
+                ctx,
+                snapshot.arena(),
+            );
+        }
+    }
+
     let k_eff = if is_precision {
         if plan.scalar_prefilter {
             bound.limit.max(2)
