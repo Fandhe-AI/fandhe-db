@@ -712,23 +712,23 @@ impl EngineCore {
         declared: &[Option<crate::sql::params::DeclaredParamType>],
     ) -> Result<super::PreparedSql, SqlSurfaceError> {
         let result = self.parse_sql_prepared_in_session_inner(session, sql, declared);
-        // SQL-40・Issue #1967: 構文・名前解決に成功した文だけを権限検査する（`42601` → `42P01` → `42501`）。
-        // Describe 前の Parse の時点でも拒否する（権限の無い主体に列の型情報を返さない。PostgreSQL は
-        // Parse では検査しない意図的な差で、Bind で再検査する）。
-        if let Ok(prepared) = &result {
-            self.require_prepared_read_privileges(session, prepared, &prepared.dummy_parsed)?;
-        }
         // TABLE-27・Issue #1715: `public` が見えない `search_path` のセッションは、一時表以外の未修飾の
         // テーブル参照を `42P01` にする。判定順は構文エラー `42601` → 参照ゲート → その他の検証エラー。
         // 既定の path のセッションは何も足さない。
-        if !session.search_path_hides_public() {
-            return result;
+        if session.search_path_hides_public()
+            && !matches!(&result, Err(e) if e.wire_code() == "42601")
+        {
+            if let Ok(tokens) = crate::sql::lexer::tokenize_with_params(sql) {
+                crate::sql::search_path::check_unqualified_refs(session, &tokens, &[])?;
+            }
         }
-        if matches!(&result, Err(e) if e.wire_code() == "42601") {
-            return result;
-        }
-        if let Ok(tokens) = crate::sql::lexer::tokenize_with_params(sql) {
-            crate::sql::search_path::check_unqualified_refs(session, &tokens, &[])?;
+        // SQL-40・Issue #1967: 構文・名前解決に成功した文だけを権限検査する（`42601` → `42P01` → `42501`）。
+        // 権限検査は `search_path` の参照ゲートより後に行い、public を隠したロールに対して表の存在が
+        // `42501`／`42P01` の差として漏れないようにする。Describe 前の Parse の時点でも拒否する
+        // （権限の無い主体に列の型情報を返さない。PostgreSQL は Parse では検査しない意図的な差で、
+        // Bind で再検査する）。
+        if let Ok(prepared) = &result {
+            self.require_prepared_read_privileges(session, prepared, &prepared.dummy_parsed)?;
         }
         result
     }

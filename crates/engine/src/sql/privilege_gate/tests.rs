@@ -17,7 +17,25 @@ fn bound_only() -> SessionState {
 }
 
 fn is_denied(r: Result<(), SqlSurfaceError>) -> bool {
-    matches!(&r, Err(e @ SqlSurfaceError::InsufficientPrivilege) if e.wire_code() == "42501")
+    matches!(
+        &r,
+        Err(e @ (SqlSurfaceError::InsufficientPrivilege | SqlSurfaceError::RelationPermissionDenied))
+            if e.wire_code() == "42501"
+    )
+}
+
+#[test]
+fn relation_denial_message_is_fixed_and_not_ddl() {
+    let mut s = SessionState::default();
+    s.bind_role_ids(4242, 4242);
+    let e = rel(
+        &Principal::from_session(&s),
+        crate::catalog::privilege::PRIV_SELECT,
+        0,
+    )
+    .expect_err("denied");
+    assert!(matches!(e, SqlSurfaceError::RelationPermissionDenied));
+    assert_eq!(e.client_message(), "permission denied for relation");
 }
 
 #[test]

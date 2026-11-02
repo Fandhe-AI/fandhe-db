@@ -7696,7 +7696,7 @@ pub(crate) fn truncate_tables_unchecked(
                 if let Some(recheck) = privilege_recheck {
                     recheck.check_in_txn(write_txn, all_tables).map_err(|()| {
                         TenantWriteError::SequenceEvaluationFailed(
-                            SqlSurfaceError::InsufficientPrivilege,
+                            SqlSurfaceError::RelationPermissionDenied,
                         )
                     })?;
                 }

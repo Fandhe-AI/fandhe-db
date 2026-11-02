@@ -17,8 +17,9 @@
 //!   段で不在と同じ応答になり、権限の分岐に入らない）。
 //! - ビュー・matview は、利用者に対してはそれ自身の SELECT だけを判定する（基底表はビュー所有者の権限で
 //!   読む扱い。ビューを作れるのは所有者相当の主体だけ。ADR §12）。
-//! - カタログで relation として引けない名前（誤分類された識別子）は検査しない。存在しないものは読めない
-//!   ので fail-open にならない。余分な検査は拒否側にだけ倒れる。
+//! - 最新のカタログで relation として引けない名前は拒否する（fail-closed）。名前解決を通った参照先が
+//!   BEGIN 後に DROP されても、スナップショットの行を権限なしで読ませない。CTE 名・表関数・構文語は
+//!   走査の段で除外済み。
 //! - 参照数の上限を ACL の照会より前に検査する（untrusted 入力）。
 //! - エラーは固定文言の `42501`。表名・ロール ID・テナントを含めない。
 
@@ -271,15 +272,20 @@ pub(super) fn require_relations_bits(
         .relation_grant_bits(tenant, &names, role_id)
         .map_err(crate::catalog::table_lookup_error)?;
     for ((_, required_bits), granted) in merged.iter().zip(bits) {
-        if let Some(granted) = granted {
-            check(
-                principal,
-                PrivilegeTarget::Relation {
-                    required_bits: *required_bits,
-                    granted_bits: granted,
-                },
-            )?;
-        }
+        // 最新のカタログで relation として引けない名前は、権限を確認できないので拒否する（fail-closed）。
+        // 名前解決（`42P01`）を通った参照先は BEGIN 時点のスナップショットでは存在しうる（別セッションが
+        // 後から DROP した場合）ため、素通しにするとスナップショットの行を権限なしで読める。
+        // CTE 名・表関数・構文語は走査の段で除外済みで、ここへ来る名前は実際の読み取り源である。
+        let Some(granted) = granted else {
+            return Err(SqlSurfaceError::RelationPermissionDenied);
+        };
+        check(
+            principal,
+            PrivilegeTarget::Relation {
+                required_bits: *required_bits,
+                granted_bits: granted,
+            },
+        )?;
     }
     Ok(())
 }
