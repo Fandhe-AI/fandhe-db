@@ -5149,25 +5149,24 @@ impl EngineCore {
         matches!(self.storage.relation_name_exists(relation_key), Ok(false))
     }
 
-    /// 新規作成した relation の所有者として、束縛中のロールを記録する（Issue #2236。CREATE TABLE・CTAS・
-    /// VIEW・MATERIALIZED VIEW の腕が成功した直後に呼ぶ）。未束縛は何も書かず、所有者の無い relation は
-    /// 運用者権限でしか扱えない（拒否側）。記録の失敗は作成の成否に影響させない（所有者行が無い状態は
-    /// fail-closed）。
-    fn record_created_relation_owner(
+    /// 新規作成する relation の所有者として、束縛中のロールを作成と同じ write txn で書くよう予約する
+    /// （Issue #2236。CREATE TABLE・CTAS・VIEW・MATERIALIZED VIEW の腕が作成の直前に呼び、返した guard を
+    /// 作成の完了まで保持する）。未束縛は予約せず、所有者の無い relation は運用者権限でしか扱えない（拒否側）。
+    /// 所有者の保存は作成本体（`catalog`）が「新規に作った」ことを確認できた txn の中で行うため、作成後の
+    /// DROP・同名再作成と競合して別の対象へ所有者を付けない。
+    fn arm_created_relation_owner(
         &self,
         ctx: &PolicyContext,
         session: &crate::sql::mode::SessionState,
         absent_before: bool,
         relation_key: &str,
-    ) {
-        if !absent_before {
-            return;
-        }
-        if let Some(role) = session.current_role_id().filter(|id| *id != 0) {
-            let _ = self
-                .storage
-                .record_relation_owner(ctx.tenant_id(), relation_key, role);
-        }
+    ) -> crate::catalog::privilege::owner::PendingOwnerGuard {
+        let role = if absent_before {
+            session.current_role_id()
+        } else {
+            None
+        };
+        crate::catalog::privilege::owner::arm_pending_owner(ctx.tenant_id(), relation_key, role)
     }
 
     /// 永続オブジェクトを作る DDL の作成先を `search_path` から判定する（TABLE-27・Issue #1715）。
@@ -5396,12 +5395,22 @@ impl EngineCore {
         // する（対象の存在オラクルの防止。fail-closed）。構文・範囲外の拒否は状態に依存しないため維持する。
         let grant_head = crate::sql::allowlist::is_grant_statement(&tokens)
             || crate::sql::allowlist::is_revoke_statement(&tokens);
+        // Issue #2236: `ALTER ... OWNER TO` も同じ契約にする。運用者権限も束縛ロールも持たないセッションには、
+        // SCHEMA 名の解決 `3F000` 等で対象の有無を示さず、権限ゲートと同じ `42501` を返す。
+        let owner_head = crate::sql::allowlist::is_alter_owner_statement(&tokens);
         let result = self.parse_tokens_gated_core(tokens, session, resolver, read_snap);
-        if grant_head {
+        if grant_head || owner_head {
             if let Err(e) = &result {
-                if matches!(e.wire_code(), "3F000" | "42P01" | "42704")
-                    && crate::sql::grant_ddl::require_grant_principal(session).is_err()
-                {
+                let unprivileged = if grant_head {
+                    crate::sql::grant_ddl::require_grant_principal(session).is_err()
+                } else {
+                    crate::sql::privilege_gate::require_ddl_or_owner(
+                        session,
+                        crate::sql::privilege_gate::DdlStatementKind::AlterOwner,
+                    )
+                    .is_err()
+                };
+                if matches!(e.wire_code(), "3F000" | "42P01" | "42704") && unprivileged {
                     return Err(crate::sql::allowlist::SqlSurfaceError::InsufficientPrivilege);
                 }
             }
@@ -5486,6 +5495,10 @@ impl EngineCore {
             // 対象表名の一時表衝突は parse 内の参照記録で固定の `0A000` として拒否する。
             || crate::sql::allowlist::is_grant_statement(&tokens)
             || crate::sql::allowlist::is_revoke_statement(&tokens)
+            // `ALTER ... OWNER TO <ロール>`（Issue #2236）も構文語（`OWNER`・`TO`）とロール名を含むため名前走査から
+            // 外す。対象 relation の一時表衝突は parse 内の参照記録（`hits.temp_hit()`）で固定の `0A000` として
+            // 拒否し、一時表の所有者は持たない。
+            || crate::sql::allowlist::is_alter_owner_statement(&tokens)
             // ロール名も関係名とは別の名前空間で一時表を読み書きしない（SQL-39・Issue #1963）。名前走査だと
             // 同名の一時表（`CREATE TEMP TABLE r` 等）を持つセッションで `ALTER ROLE r`／`SET ROLE r` が
             // 一時表の振り分けに回り、固定の `0A000` になる。
@@ -7780,12 +7793,13 @@ impl EngineCore {
                     );
                 }
                 let absent_before = self.relation_absent_before_create(&stmt.table_name);
+                let _owner_guard =
+                    self.arm_created_relation_owner(ctx, session, absent_before, &stmt.table_name);
                 let outcome = crate::sql::ddl::execute_create_table(
                     &self.storage,
                     stmt,
                     &self.schema_limits,
                 )?;
-                self.record_created_relation_owner(ctx, session, absent_before, &stmt.table_name);
                 Ok(crate::sql::SqlOutcome::CreateTable(outcome))
             }
             // SQL-52・Issue #1678: CTAS。DDL 権限ゲートを名前解決・カタログ照会（内側の問い合わせの
@@ -7802,8 +7816,9 @@ impl EngineCore {
                     stmt.table_name(),
                 )?;
                 let absent_before = self.relation_absent_before_create(stmt.table_name());
+                let _owner_guard =
+                    self.arm_created_relation_owner(ctx, session, absent_before, stmt.table_name());
                 let outcome = self.execute_create_table_as(ctx, session, stmt)?;
-                self.record_created_relation_owner(ctx, session, absent_before, stmt.table_name());
                 Ok(crate::sql::SqlOutcome::CreateTableAs(outcome))
             }
             // TABLE-44・Issue #1683: 一時表の作成は DDL 実行権限ゲートの対象外（セッション内で
@@ -7893,12 +7908,13 @@ impl EngineCore {
                 )?;
                 // TABLE-41 (2)・Issue #1660: `OR REPLACE` は互換性検査付きの置換経路へ。
                 let absent_before = self.relation_absent_before_create(stmt.name());
+                let _owner_guard =
+                    self.arm_created_relation_owner(ctx, session, absent_before, stmt.name());
                 let outcome = if stmt.or_replace() {
                     self.create_or_replace_view_in_session(session, stmt)?
                 } else {
                     crate::sql::ddl::execute_create_view(&self.storage, stmt)?
                 };
-                self.record_created_relation_owner(ctx, session, absent_before, stmt.name());
                 Ok(crate::sql::SqlOutcome::CreateView(outcome))
             }
             // TABLE-42・Issue #1664: DDL 権限ゲートを名前解決・カタログ照会より先に置く
@@ -7912,8 +7928,9 @@ impl EngineCore {
                 self.require_creation_target(ctx, session, stmt.public_qualified, stmt.name())?;
                 crate::sql::schema_dependency::check_view_body(stmt.name(), stmt.body_sql())?;
                 let absent_before = self.relation_absent_before_create(stmt.name());
+                let _owner_guard =
+                    self.arm_created_relation_owner(ctx, session, absent_before, stmt.name());
                 let outcome = self.execute_create_materialized_view(ctx, session, stmt)?;
-                self.record_created_relation_owner(ctx, session, absent_before, stmt.name());
                 Ok(crate::sql::SqlOutcome::CreateMaterializedView(outcome))
             }
             // TABLE-42・Issue #1665: 権限ゲートを名前解決より先に置く（`CREATE` と同じ）。

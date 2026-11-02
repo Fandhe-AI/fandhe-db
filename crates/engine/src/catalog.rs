@@ -12142,6 +12142,8 @@ impl Storage {
             let mut table = write_txn.open_table(CATALOG_TABLE)?;
             table.insert(schema.name.as_str(), encoded.as_slice())?;
         }
+        // 予約された作成者を所有者として同じ txn に書く（Issue #2236。別 txn だと DROP・同名再作成と競合する）。
+        privilege::owner::apply_pending_relation_owner_in_txn(write_txn, schema.name.as_str())?;
         Ok(())
     }
 
@@ -15164,6 +15166,8 @@ impl Storage {
             views_table.insert(name, encoded.as_slice())?;
             // commit 記録（SQL-38・Issue #2404）: ビュー定義の変更は表世代を進めないため DDL として記録する。
             crate::storage::commit_log::note_ddl(&write_txn, name);
+            // 予約された作成者を所有者として同じ txn に書く（Issue #2236）。
+            privilege::owner::apply_pending_relation_owner_in_txn(&write_txn, name)?;
         }
         crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
     }
@@ -15937,6 +15941,11 @@ impl Storage {
             views_table.insert(name, encoded.as_slice())?;
             // commit 記録（SQL-38・Issue #2404）: ビュー定義の変更は表世代を進めないため DDL として記録する。
             crate::storage::commit_log::note_ddl(&write_txn, name);
+            // 新規に作った（旧定義なし）ときだけ、予約された作成者を所有者として同じ txn に書く
+            // （置換は既存の所有者を変えない。Issue #2236）。
+            if current.is_none() {
+                privilege::owner::apply_pending_relation_owner_in_txn(&write_txn, name)?;
+            }
             // 置換（旧定義あり）では、未 commit の新定義を前提に依存ビューを同一 txn で
             // 再検証する。失敗は `?` で txn ごと破棄され、旧定義が残る（原子性）。
             if current.is_some() {

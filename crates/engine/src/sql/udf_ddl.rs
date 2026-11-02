@@ -81,18 +81,20 @@ pub(crate) fn udf_cast_from_function_type(ft: &FunctionType) -> Option<CastType>
     (function_type_from_udf_cast(&cast).ok().as_ref() == Some(ft)).then_some(cast)
 }
 
-/// 新規作成した関数の所有者として、束縛中のロールを記録する（Issue #2236）。未束縛（認証層が
-/// ロールを束縛していない従来のセッション）では何も書かず、所有者の無い関数は運用者権限でしか
-/// 扱えない（拒否側）。記録の失敗は作成の成否に影響させない（所有者行が無い状態は fail-closed）。
-fn record_creator_as_owner(
-    storage: &Storage,
+/// 新規作成する関数の所有者として、束縛中のロールを作成と同じ write txn で書くよう予約する（Issue #2236）。
+/// 返した guard を作成の呼び出しが終わるまで保持する。未束縛（認証層がロールを束縛していない従来の
+/// セッション）では予約せず、所有者の無い関数は運用者権限でしか扱えない（拒否側）。保存は `catalog` の
+/// 作成本体が新規作成を確認できた txn の中で行うため、DROP・同名再作成と競合して別の定義へ所有者を付けない。
+fn arm_creator_as_owner(
     tenant_id: &str,
     session: &SessionState,
     function_key: &str,
-) {
-    if let Some(role) = session.current_role_id().filter(|id| *id != 0) {
-        let _ = storage.record_function_owner(tenant_id, function_key, role);
-    }
+) -> crate::catalog::privilege::owner::PendingOwnerGuard {
+    crate::catalog::privilege::owner::arm_pending_owner(
+        tenant_id,
+        function_key,
+        session.current_role_id(),
+    )
 }
 
 /// カタログへ書く [`FunctionDef`] を検証済みの定義から組み立てる（`CREATE`・`OR REPLACE` 共通）。
@@ -222,10 +224,11 @@ pub(crate) fn execute_create_function_persistent(
     )?;
     reject_session_local_dependency(session, &prepared.body)?;
     let def = catalog_def_from_prepared(&prepared, body_source, attrs)?;
+    let owner_guard = arm_creator_as_owner(tenant_id, session, &def.function_key);
     storage
         .create_function_with_limit(tenant_id, &def, max_functions)
         .map_err(map_function_error)?;
-    record_creator_as_owner(storage, tenant_id, session, &def.function_key);
+    drop(owner_guard);
     let key = prepared.key.clone();
     commit_function_definition(session.udfs_mut(), prepared);
     // カタログに永続化した定義はカタログ由来として印付けする（他セッションの DROP を refresh が
@@ -270,7 +273,8 @@ pub(crate) fn execute_create_or_replace_function_persistent(
     // 再度行う（並行する別セッションの置換との合成で循環が残るのを防ぐ）。
     let target = prepared.key.to_ascii_lowercase();
     let new_body = &prepared.body;
-    let replaced = storage
+    let owner_guard = arm_creator_as_owner(tenant_id, session, &def.function_key);
+    storage
         .replace_function_checked(tenant_id, &def, max_functions, &|latest| {
             let mut bodies = std::collections::BTreeMap::new();
             for d in latest {
@@ -294,10 +298,8 @@ pub(crate) fn execute_create_or_replace_function_persistent(
             Ok(())
         })
         .map_err(map_function_error)?;
-    // 置換は既存の所有者を変えない。新規に作った場合だけ作成者を所有者にする（Issue #2236）。
-    if replaced == crate::catalog::function::ReplaceOutcome::Created {
-        record_creator_as_owner(storage, tenant_id, session, &def.function_key);
-    }
+    // 置換は既存の所有者を変えない（新規に作った場合だけ、catalog が同じ txn で作成者を所有者にする。#2236）。
+    drop(owner_guard);
     let key = prepared.key.clone();
     commit_function_definition(session.udfs_mut(), prepared);
     session.udfs_mut().mark_catalog_origin(&key);
@@ -431,20 +433,20 @@ pub(crate) fn execute_create_routine_persistent(
     if or_replace {
         // 関数間の循環は、標準形の依存辺について write txn 内で検査される（`replace_function_with_deps`）。
         // 辺を持たない新定義は別の定義を呼ばないため、置換で辺だけが消える。
-        let replaced = storage
+        let owner_guard = arm_creator_as_owner(tenant_id, session, &def.function_key);
+        storage
             .replace_function_with_deps(tenant_id, &def, max_functions, &|_| Ok(()), &dependencies)
             .map_err(map_function_error)?;
-        // 置換は既存の所有者を変えない。新規に作った場合だけ作成者を所有者にする（Issue #2236）。
-        if replaced == crate::catalog::function::ReplaceOutcome::Created {
-            record_creator_as_owner(storage, tenant_id, session, &def.function_key);
-        }
+        // 置換は既存の所有者を変えない（新規に作った場合だけ、catalog が同じ txn で作成者を所有者にする。#2236）。
+        drop(owner_guard);
         // 宣言的 UDF を置き換えた場合、セッションに旧本体の展開が残らないよう取り除く。
         session.udfs_mut().remove(name);
     } else {
+        let owner_guard = arm_creator_as_owner(tenant_id, session, &def.function_key);
         storage
             .create_function_with_deps(tenant_id, &def, max_functions, &dependencies)
             .map_err(map_function_error)?;
-        record_creator_as_owner(storage, tenant_id, session, &def.function_key);
+        drop(owner_guard);
     }
     // commit 後に同じセッションへ登録する（すぐ呼べるようにする。他セッションは世代で refresh）。
     // 非カタログ登録・WASM・容量で入れられない場合は登録せず、次の refresh のロードに任せる。

@@ -1134,6 +1134,16 @@ impl Storage {
         check(&latest)?;
         verify_dependencies_in_txn(&write_txn, scope, &stored.function_key, deps)?;
         insert_function_in_txn(&write_txn, scope, &stored, &signature)?;
+        // 新規に作った（既存定義なし）ときだけ、予約された作成者を所有者として同じ txn に書く
+        // （置換は既存の所有者を変えない。Issue #2236）。
+        if outcome == ReplaceOutcome::Created {
+            super::privilege::owner::apply_pending_function_owner_in_txn(
+                &write_txn,
+                scope,
+                &stored.function_key,
+                stored.id,
+            )?;
+        }
         super::function_dependency::replace_edges_in_txn(
             &write_txn,
             scope,
@@ -1211,6 +1221,13 @@ impl Storage {
         verify_dependencies_in_txn(&write_txn, scope, &stored.function_key, deps)?;
         stored.id = allocate_function_id_in_txn(&write_txn)?;
         insert_function_in_txn(&write_txn, scope, &stored, &signature)?;
+        // 予約された作成者を所有者として同じ txn に書く（Issue #2236。別 txn だと DROP・同名再作成と競合する）。
+        super::privilege::owner::apply_pending_function_owner_in_txn(
+            &write_txn,
+            scope,
+            &stored.function_key,
+            stored.id,
+        )?;
         super::function_dependency::replace_edges_in_txn(
             &write_txn,
             scope,
@@ -1223,36 +1240,6 @@ impl Storage {
         // commit 成功後にだけ世代を進める（他セッションの refresh が検知する。SQL-66・#1921）。
         self.bump_function_generation(scope);
         Ok(stored.id)
-    }
-
-    /// 新規作成した関数 `function_key` の所有者を記録する（Issue #2236。作成に成功した直後に `sql::udf_ddl` が
-    /// 呼ぶ）。同名の定義がちょうど 1 件のときだけ、所有者行が無ければ `owner` を書く。作成と別の write txn
-    /// のため、この間でクラッシュすると所有者の無い関数が残るが、所有者行が無い対象は運用者権限でしか
-    /// 扱えない（拒否側に倒れる。ADR O6）。
-    pub(crate) fn record_function_owner(
-        &self,
-        scope: &str,
-        function_key: &str,
-        owner: u64,
-    ) -> Result<()> {
-        validate_scope(scope)?;
-        let key = normalize_key(function_key)?;
-        let write_txn = self
-            .begin_write_txn()
-            .map_err(super::convert_storage_error)?;
-        let found = list_in_txn(&*write_txn, scope, Some(&key))?;
-        let [def] = found.as_slice() else {
-            return Ok(());
-        };
-        super::privilege::owner::set_owner_if_absent_in_txn(
-            &write_txn,
-            scope,
-            &PrivilegeObject::Function(def.id),
-            owner,
-        )?;
-        crate::recovery::commit_boundary::commit(write_txn)
-            .map_err(super::convert_storage_error)?;
-        Ok(())
     }
 
     /// 本体検証より前に行う、カタログ側の重複・件数の先行判定（読み取り専用。Issue #1922）。

@@ -40,7 +40,7 @@ fn absent_table_means_no_owner() {
 fn roundtrip_and_tenant_isolation() {
     let (_g, s) = open("owner_roundtrip");
     write(&s, |t| {
-        set_owner_in_txn(t, "t1", &tbl("t"), 7).expect("set")
+        set_owner_unchecked_in_txn(t, "t1", &tbl("t"), 7).expect("set")
     });
     let rt = read(&s);
     assert!(is_owner_in_txn(&rt, "t1", &tbl("t"), 7).expect("o"));
@@ -61,11 +61,19 @@ fn roundtrip_and_tenant_isolation() {
 fn set_owner_rejects_zero_and_if_absent_keeps_existing() {
     let (_g, s) = open("owner_if_absent");
     let txn = s.begin_write_txn().expect("begin");
-    assert!(set_owner_in_txn(&txn, "t1", &tbl("t"), 0).is_err());
-    set_owner_if_absent_in_txn(&txn, "t1", &tbl("t"), 3).expect("first");
-    set_owner_if_absent_in_txn(&txn, "t1", &tbl("t"), 4).expect("second");
+    assert!(set_owner_unchecked_in_txn(&txn, "t1", &tbl("t"), 0).is_err());
+    let if_absent = |id: u64| {
+        if owner_of_in_txn(&*txn, "t1", &tbl("t"))
+            .expect("o")
+            .is_none()
+        {
+            set_owner_unchecked_in_txn(&txn, "t1", &tbl("t"), id).expect("set");
+        }
+    };
+    if_absent(3);
+    if_absent(4);
     assert_eq!(owner_of_in_txn(&*txn, "t1", &tbl("t")).expect("o"), Some(3));
-    set_owner_in_txn(&txn, "t1", &tbl("t"), 4).expect("replace");
+    set_owner_unchecked_in_txn(&txn, "t1", &tbl("t"), 4).expect("replace");
     assert_eq!(owner_of_in_txn(&*txn, "t1", &tbl("t")).expect("o"), Some(4));
 }
 
@@ -73,8 +81,8 @@ fn set_owner_rejects_zero_and_if_absent_keeps_existing() {
 fn schema_and_function_owners_are_independent_kinds() {
     let (_g, s) = open("owner_kinds");
     write(&s, |t| {
-        set_owner_in_txn(t, "t1", &PrivilegeObject::Schema(5), 1).expect("s");
-        set_owner_in_txn(t, "t1", &PrivilegeObject::Function(5), 2).expect("f");
+        set_owner_unchecked_in_txn(t, "t1", &PrivilegeObject::Schema(5), 1).expect("s");
+        set_owner_unchecked_in_txn(t, "t1", &PrivilegeObject::Function(5), 2).expect("f");
     });
     let rt = read(&s);
     assert_eq!(
@@ -93,9 +101,9 @@ fn schema_and_function_owners_are_independent_kinds() {
 fn remove_relation_owners_sweeps_all_tenants_only_for_that_key() {
     let (_g, s) = open("owner_sweep");
     write(&s, |t| {
-        set_owner_in_txn(t, "t1", &tbl("a"), 1).expect("a1");
-        set_owner_in_txn(t, "t2", &tbl("a"), 2).expect("a2");
-        set_owner_in_txn(t, "t1", &tbl("b"), 1).expect("b1");
+        set_owner_unchecked_in_txn(t, "t1", &tbl("a"), 1).expect("a1");
+        set_owner_unchecked_in_txn(t, "t2", &tbl("a"), 2).expect("a2");
+        set_owner_unchecked_in_txn(t, "t1", &tbl("b"), 1).expect("b1");
     });
     write(&s, |t| remove_relation_owners_in_txn(t, "a").expect("rm"));
     let rt = read(&s);
@@ -108,9 +116,9 @@ fn remove_relation_owners_sweeps_all_tenants_only_for_that_key() {
 fn rename_moves_owners_and_drops_orphans_at_destination() {
     let (_g, s) = open("owner_rename");
     write(&s, |t| {
-        set_owner_in_txn(t, "t1", &tbl("old"), 1).expect("o1");
-        set_owner_in_txn(t, "t2", &tbl("old"), 2).expect("o2");
-        set_owner_in_txn(t, "t3", &tbl("new"), 9).expect("orphan");
+        set_owner_unchecked_in_txn(t, "t1", &tbl("old"), 1).expect("o1");
+        set_owner_unchecked_in_txn(t, "t2", &tbl("old"), 2).expect("o2");
+        set_owner_unchecked_in_txn(t, "t3", &tbl("new"), 9).expect("orphan");
     });
     write(&s, |t| {
         rename_relation_owners_in_txn(t, "old", "new").expect("mv")
@@ -150,7 +158,7 @@ fn corrupt_blob_is_fail_closed() {
 fn references_role_is_tenant_scoped() {
     let (_g, s) = open("owner_refs");
     write(&s, |t| {
-        set_owner_in_txn(t, "t1", &PrivilegeObject::Schema(1), 7).expect("s");
+        set_owner_unchecked_in_txn(t, "t1", &PrivilegeObject::Schema(1), 7).expect("s");
     });
     let rt = read(&s);
     assert!(owner_references_role_in_txn(&rt, "t1", 7).expect("r"));
@@ -158,4 +166,14 @@ fn references_role_is_tenant_scoped() {
     // 同じ ID のロールでも他テナントの所有者行は依存にならない。
     assert!(!owner_references_role_in_txn(&rt, "t2", 7).expect("r"));
     assert!(!owner_references_role_in_txn(&rt, "t1", 0).expect("r"));
+}
+
+#[test]
+fn checked_set_owner_rejects_a_role_that_does_not_exist_in_the_txn() {
+    let (_g, s) = open("owner_role_missing");
+    let txn = s.begin_write_txn().expect("begin");
+    // ロール表が空の txn では、存在しないロールを所有者にできない（行も残らない）。
+    assert!(set_owner_in_txn(&txn, "t1", &tbl("t"), 5).is_err());
+    assert!(set_owner_if_absent_in_txn(&txn, "t1", &tbl("t"), 5).is_err());
+    assert_eq!(owner_of_in_txn(&*txn, "t1", &tbl("t")).expect("o"), None);
 }

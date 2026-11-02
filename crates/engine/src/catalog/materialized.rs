@@ -491,6 +491,10 @@ fn insert_def_in_txn(
         ));
     }
     table.insert(def.name.as_str(), encoded)?;
+    drop(table);
+    // 新規作成（同名があれば上で拒否済み）した matview の所有者として、予約された作成者を同じ txn に書く
+    // （Issue #2236。作成の全経路がこの関数を通る）。
+    super::privilege::owner::apply_pending_relation_owner_in_txn(write_txn, &def.name)?;
     Ok(())
 }
 

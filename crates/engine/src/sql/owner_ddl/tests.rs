@@ -275,3 +275,40 @@ fn create_schema_owner_resolution() {
     .expect_err("unbound");
     assert_eq!(err.wire_code(), "42501");
 }
+
+/// 作成と同じ txn で所有者を書く（Issue #2236）。予約した作成者は、新規に作った表にだけ付き、
+/// 名前の違う作成や、既存名への作成（失敗）には付かない。
+#[test]
+fn pending_owner_is_written_in_the_creating_txn_only_for_the_armed_name() {
+    use crate::catalog::privilege::owner::{arm_pending_owner, owner_of_in_txn};
+    let f = fx("owner_pending_create");
+    let r = role(&f, T, "creator");
+    let owner_of = |name: &str| {
+        let rt = redb::ReadableDatabase::begin_read(f.s.db()).expect("read");
+        owner_of_in_txn(&rt, T, &PrivilegeObject::Table(name.to_string())).expect("owner")
+    };
+    let schema =
+        |name: &str| TableSchema::new(name, vec![ColumnDef::new("a", ColumnType::Text, true)]);
+    {
+        let _g = arm_pending_owner(T, "mine", Some(r));
+        // 名前が違う作成には作用しない。
+        f.s.create_table(&schema("other")).expect("other");
+        f.s.create_table(&schema("mine")).expect("mine");
+    }
+    assert_eq!(owner_of("mine"), Some(r));
+    assert_eq!(owner_of("other"), None);
+    // guard の drop 後は予約が残らない。
+    f.s.create_table(&schema("later")).expect("later");
+    assert_eq!(owner_of("later"), None);
+}
+
+/// 存在しないロールの予約では作成そのものが失敗する（孤児の所有者行を作らない。fail-closed）。
+#[test]
+fn pending_owner_with_missing_role_fails_the_create() {
+    use crate::catalog::privilege::owner::arm_pending_owner;
+    let f = fx("owner_pending_missing_role");
+    let _g = arm_pending_owner(T, "ghost", Some(99));
+    let schema = TableSchema::new("ghost", vec![ColumnDef::new("a", ColumnType::Text, true)]);
+    assert!(f.s.create_table(&schema).is_err());
+    assert!(!f.s.relation_name_exists("ghost").expect("exists"));
+}

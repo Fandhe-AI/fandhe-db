@@ -25,8 +25,8 @@ use redb::{ReadableTable, TableDefinition};
 
 use crate::storage::read_source::ReadSource;
 
-use super::super::role::validate_tenant;
-use super::super::{CatalogError, Result, Storage};
+use super::super::role::{get_role_by_id_in_txn, validate_tenant};
+use super::super::{CatalogError, Result};
 use super::{PrivilegeObject, KIND_COLUMN, KIND_FUNCTION, KIND_SCHEMA, KIND_TABLE};
 
 /// 所有者の専用カタログ表。キーは `(object_kind, object_key, tenant_id)`。
@@ -142,8 +142,29 @@ pub(crate) fn is_owner_in_txn<R: ReadSource>(
     Ok(owner_of_in_txn(src, tenant, object)? == Some(role_id))
 }
 
-/// 所有者を書く（置き換え）。`owner_id` 0 は拒否する。
+/// 所有者を書く（置き換え）。`owner_id` 0 と、同じ write txn 内で自テナントに現存しないロールは拒否する
+/// （所有者の保存と並行する `DROP ROLE` で、存在しないロールを所有者にする孤児行を作らない）。
 pub(crate) fn set_owner_in_txn(
+    write_txn: &redb::WriteTransaction,
+    tenant: &str,
+    object: &PrivilegeObject,
+    owner_id: u64,
+) -> Result<()> {
+    validate_tenant(tenant)?;
+    if owner_id == 0 {
+        return Err(CatalogError::Invalid("invalid object owner".to_string()));
+    }
+    if get_role_by_id_in_txn(write_txn, tenant, owner_id)?.is_none() {
+        return Err(CatalogError::Invalid(
+            "object owner role does not exist".to_string(),
+        ));
+    }
+    set_owner_unchecked_in_txn(write_txn, tenant, object, owner_id)
+}
+
+/// ロールの現存を確認せずに所有者を書く（`set_owner_in_txn` の本体。ロール表を持たない単体テスト用に
+/// 分けてある。本番経路は必ず [`set_owner_in_txn`] を使う）。
+pub(crate) fn set_owner_unchecked_in_txn(
     write_txn: &redb::WriteTransaction,
     tenant: &str,
     object: &PrivilegeObject,
@@ -160,19 +181,6 @@ pub(crate) fn set_owner_in_txn(
         encode_owner(owner_id).as_slice(),
     )?;
     Ok(())
-}
-
-/// 所有者行が無いときだけ書く（`CREATE OR REPLACE` が既存の所有者を変えないため）。
-pub(crate) fn set_owner_if_absent_in_txn(
-    write_txn: &redb::WriteTransaction,
-    tenant: &str,
-    object: &PrivilegeObject,
-    owner_id: u64,
-) -> Result<()> {
-    if owner_of_in_txn(write_txn, tenant, object)?.is_some() {
-        return Ok(());
-    }
-    set_owner_in_txn(write_txn, tenant, object, owner_id)
 }
 
 /// 対象の所有者行（自テナント分）を消す（SCHEMA・関数の DROP から同じ write txn で呼ぶ）。
@@ -283,62 +291,110 @@ pub(crate) fn owner_references_role_in_txn<R: ReadSource>(
     Ok(false)
 }
 
-/// relation（表・ビュー・matview）が現存するか。
-fn relation_exists_in_txn<R: ReadSource>(src: &R, key: &str) -> Result<bool> {
-    match src.open_table(super::super::CATALOG_TABLE) {
-        Ok(t) => {
-            if t.get(key)?.is_some() {
-                return Ok(true);
-            }
-        }
-        Err(redb::TableError::TableDoesNotExist(_)) => {}
-        Err(e) => return Err(e.into()),
-    }
-    match src.open_table(super::super::VIEWS_TABLE) {
-        Ok(t) => {
-            if t.get(key)?.is_some() {
-                return Ok(true);
-            }
-        }
-        Err(redb::TableError::TableDoesNotExist(_)) => {}
-        Err(e) => return Err(e.into()),
-    }
-    match src.open_table(super::super::materialized::MATERIALIZED_VIEWS_TABLE) {
-        Ok(t) => Ok(t.get(key)?.is_some()),
-        Err(redb::TableError::TableDoesNotExist(_)) => Ok(false),
-        Err(e) => Err(e.into()),
+/// 作成と同じ write txn で書く所有者の予約（Issue #2236）。
+///
+/// 作成の commit 後に別 txn で所有者を書くと、その間に別セッションが DROP して同名を作り直した場合に
+/// 作り直された対象へ元の作成者が所有者として記録されてしまう。これを避けるため、作成者は作成の直前に
+/// 本予約を置き、`Storage` の作成本体（write txn の中）が「新規に作った」ことを確認できた時点で
+/// [`apply_pending_relation_owner_in_txn`]・[`take_pending_function_owner`] が同じ txn へ所有者行を書く。
+/// 予約はスレッドローカルで、作成の呼び出し（同一スレッドで同期的に完結する）を囲む
+/// [`PendingOwnerGuard`] の寿命の間だけ有効になる。名前（キー）が一致しない作成には作用しない。
+#[derive(Debug, Clone)]
+struct PendingOwner {
+    tenant: String,
+    key: String,
+    role: u64,
+}
+
+thread_local! {
+    static PENDING_OWNER: std::cell::RefCell<Option<PendingOwner>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// 予約の寿命を表す guard。drop で予約を解除する（エラー・panic でも残さない）。
+#[must_use = "dropping the guard immediately disarms the pending owner"]
+pub(crate) struct PendingOwnerGuard(());
+
+impl Drop for PendingOwnerGuard {
+    fn drop(&mut self) {
+        PENDING_OWNER.with(|p| *p.borrow_mut() = None);
     }
 }
 
-impl Storage {
-    /// 新規作成した relation（表・ビュー・matview）の所有者として `owner` を記録する（Issue #2236。作成に成功
-    /// した直後に `core.rs` の CREATE 系の腕が呼ぶ。呼び出し元は作成前に同名の relation が無かったことを確認する）。
-    /// 作成と別の write txn のため、この間でクラッシュすると所有者の無い relation が残るが、所有者行が無い
-    /// 対象は運用者権限でしか扱えない（拒否側に倒れる。ADR O6）。既に所有者行があれば何も変えない。
-    pub(crate) fn record_relation_owner(
-        &self,
-        tenant: &str,
-        relation_key: &str,
-        owner: u64,
-    ) -> Result<()> {
-        validate_tenant(tenant)?;
-        let write_txn = self
-            .begin_write_txn()
-            .map_err(super::super::convert_storage_error)?;
-        // 作成直後でも DROP と競合しうるため、relation が現存するときだけ書く（孤児行を作らない）。
-        if !relation_exists_in_txn(&*write_txn, relation_key)? {
-            return Ok(());
-        }
-        set_owner_if_absent_in_txn(
-            &write_txn,
-            tenant,
-            &PrivilegeObject::Table(relation_key.to_string()),
-            owner,
-        )?;
-        crate::recovery::commit_boundary::commit(write_txn)
-            .map_err(super::super::convert_storage_error)?;
-        Ok(())
+/// `tenant` の `key`（relation キーまたは関数キー）を新規作成する直前に呼び、作成者 `role` を所有者として
+/// 予約する。`role` 0（PUBLIC・未束縛）は予約しない（所有者の無い対象は運用者権限でしか扱えない＝拒否側）。
+pub(crate) fn arm_pending_owner(tenant: &str, key: &str, role: Option<u64>) -> PendingOwnerGuard {
+    let pending = role.filter(|r| *r != 0).map(|role| PendingOwner {
+        tenant: tenant.to_string(),
+        key: key.to_string(),
+        role,
+    });
+    PENDING_OWNER.with(|p| *p.borrow_mut() = pending);
+    PendingOwnerGuard(())
+}
+
+/// 予約が `key` に一致するときだけ `(tenant, role)` を返す。
+fn pending_for(key: &str) -> Option<(String, u64)> {
+    PENDING_OWNER.with(|p| {
+        p.borrow()
+            .as_ref()
+            .filter(|pend| pend.key == key)
+            .map(|pend| (pend.tenant.clone(), pend.role))
+    })
+}
+
+/// relation `key` を **この write txn で新規に作った**ときに、予約された作成者を所有者として同じ txn へ書く
+/// （表・ビュー・matview の作成本体から呼ぶ。予約が無い・名前が違えば何もしない）。
+pub(crate) fn apply_pending_relation_owner_in_txn(
+    write_txn: &redb::WriteTransaction,
+    key: &str,
+) -> Result<()> {
+    let Some((tenant, role)) = pending_for(key) else {
+        return Ok(());
+    };
+    set_owner_if_absent_in_txn(
+        write_txn,
+        &tenant,
+        &PrivilegeObject::Table(key.to_string()),
+        role,
+    )
+}
+
+/// 関数 `function_id`（キー `key`）を **この write txn で新規に作った**ときに、予約された作成者を所有者として
+/// 同じ txn へ書く（関数の作成本体から呼ぶ。`key` は正規化済みで、予約側も正規化して比較する）。
+pub(crate) fn apply_pending_function_owner_in_txn(
+    write_txn: &redb::WriteTransaction,
+    scope: &str,
+    key: &str,
+    function_id: u64,
+) -> Result<()> {
+    let Some((tenant, role)) = PENDING_OWNER.with(|p| {
+        p.borrow()
+            .as_ref()
+            .filter(|pend| pend.key.eq_ignore_ascii_case(key) && pend.tenant == scope)
+            .map(|pend| (pend.tenant.clone(), pend.role))
+    }) else {
+        return Ok(());
+    };
+    set_owner_if_absent_in_txn(
+        write_txn,
+        &tenant,
+        &PrivilegeObject::Function(function_id),
+        role,
+    )
+}
+
+/// 所有者行が無いときだけ、ロールの現存を確認して書く（`CREATE OR REPLACE` が既存の所有者を変えない）。
+fn set_owner_if_absent_in_txn(
+    write_txn: &redb::WriteTransaction,
+    tenant: &str,
+    object: &PrivilegeObject,
+    owner_id: u64,
+) -> Result<()> {
+    if owner_of_in_txn(write_txn, tenant, object)?.is_some() {
+        return Ok(());
     }
+    set_owner_in_txn(write_txn, tenant, object, owner_id)
 }
 
 #[cfg(test)]

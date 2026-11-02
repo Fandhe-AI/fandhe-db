@@ -327,7 +327,8 @@ fn table_column_names(write_txn: &redb::WriteTransaction, table: &str) -> Result
 
 /// REVOKE の後始末。GRANT OPTION を失った `(付与先 x, 範囲)` について、`x` が付けた付与のうち `x` の残りの
 /// GRANT OPTION で賄えない権限は依存する付与として、RESTRICT なら `2BP01`、CASCADE なら連鎖して取り消す。
-/// 範囲が表なら表の行と全列の行を、列ならその列の行を見る。列の付与は列自身の GRANT OPTION に加えて
+/// 範囲が表なら表の行と全列の行を、列ならその列の行を見る。付与者 `x` が対象の所有者なら暗黙の GRANT OPTION で
+/// 全て賄えるため依存に数えない。列の付与は列自身の GRANT OPTION に加えて
 /// 表単位の GRANT OPTION（更新後の表の行）でも賄える。
 fn resolve_dependents(
     write_txn: &redb::WriteTransaction,
@@ -358,6 +359,12 @@ fn resolve_dependents(
             _ => continue,
         }
         for obj in objs {
+            // 所有者は対象への全権限と GRANT OPTION を暗黙に持つ（ACL 行に載らない）ため、所有者が付けた
+            // 付与は依存として扱わない（所有者の自己付与の REVOKE が、無用な `2BP01`〔RESTRICT〕や他の
+            // 被付与者の付与の取り消し〔CASCADE〕を起こさない。Issue #2236）。列は親の表の所有者を見る。
+            if super::owner::is_owner_in_txn(write_txn, tenant, &obj, x)? {
+                continue;
+            }
             let i = states.idx(write_txn, tenant, &obj)?;
             let mut covered = go_of(states.work_of(i), x);
             if let PrivilegeObject::Column { table, .. } = &obj {
