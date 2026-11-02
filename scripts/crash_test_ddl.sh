@@ -9,10 +9,16 @@
 # （部分的な DDL が 0 件）を検証する反復を行う。骨格は `scripts/crash_test_cross_table.sh` と同じ
 # （セット × 反復の 2 段構成。セットごとに新規 DB）。冒頭で `self-check`（オラクルの空振り防止の
 # 負の対照）を実行し、失敗すれば反復へ進まない。Makefile の crash-test-ddl ターゲット・CI の
-# crash-test-cross-table ジョブの 1 step から呼ばれる。DDL 文の実行中へ kill を当てる制御は #2418、
-# DDL の途中のエラーで何も残らないことの検査は #2419 が担当する。
+# crash-test-cross-table ジョブの 1 step から呼ばれる。DDL の途中のエラーで何も残らないことの
+# 検査は #2419 が担当する。
 #
-# 使い方: scripts/crash_test_ddl.sh [セット数（既定 1）] [反復回数（既定 10）]
+# Issue #2418（SQL-23 を併せて参照）: write.log の最後の進行行（STMT / COMMITTED）で kill 位置を
+# 分類する。STMT なら文の実行中で、再起動後の n は ack 済み n（文の前）か +1（文の後）のどちらか。
+# COMMITTED なら文と文の間で、n は ack 済み n と完全一致（幽霊適用の検出）。DDL 段（stage 0/2/3/4/5）
+# の実行中の kill を run 全体で 1 度も観測しなければ失敗にする（空虚な成功の拒否）。判定単位を
+# 反復ごとにしないのは遅い runner での不安定化を避けるため（アサーションの弱体化ではない）。
+#
+# 使い方: scripts/crash_test_ddl.sh [セット数（既定 1）] [反復回数（既定 60）]
 
 set -u
 
@@ -21,7 +27,7 @@ set -u
 # 検証結果は都度 fail-closed に明示チェックする。
 
 SETS="${1:-1}"
-ITERATIONS="${2:-10}"
+ITERATIONS="${2:-60}"
 if ! [[ "${SETS}" =~ ^[0-9]+$ ]] || [ "${SETS}" -lt 1 ]; then
   echo "ERROR: sets must be a positive integer, got: ${SETS}" >&2
   exit 1
@@ -60,6 +66,12 @@ WRITE_START_TIMEOUT_TENTHS=300
 
 total_iterations=$((SETS * ITERATIONS))
 completed=0
+# kill 位置の観測数（run 全体）。before/after は実行中の kill の結果（文の前/後）、by_stage は段別
+# （0 CREATE TABLE / 1 INSERT / 2 ALTER / 3 CREATE INDEX / 4 CREATE UNIQUE INDEX / 5 DROP TABLE）。
+inflight_before=0
+inflight_after=0
+ddl_inflight=0
+declare -a inflight_by_stage=(0 0 0 0 0 0)
 
 for set_no in $(seq 1 "${SETS}"); do
   echo "### set ${set_no}/${SETS} ==="
@@ -150,18 +162,46 @@ for set_no in $(seq 1 "${SETS}"); do
       exit 1
     fi
 
-    # write.log の最後に完全に書き切られた `COMMITTED batch=<seq> rows=<total>` 行から
-    # 「kill 前に確認済みだった行数（acked）」を取り出す。`$` でパターンを終端に固定
-    # しているため、kill が出力の途中で当たって行が切れた場合はマッチせず 1 つ前の
-    # 完全な行が採用される（acked は実際より小さくなることはあっても大きくならない
-    # ＝false-fail しない）。
+    # write.log の最後に完全に書き切られた進行行（STMT=文の実行開始 / COMMITTED=ack）で kill 位置を
+    # 分類する。`$` で終端を固定しているため、出力の途中で切れた行は無視され 1 つ前の完全な行が採用される。
+    # started 同期で COMMITTED を 1 つは見ているので、acked（= ack 済みの段数 n）は必ず取れる。
+    last_line="$(grep -E '^(STMT step=[0-9]+ stage=[0-9]+|COMMITTED batch=[0-9]+ rows=[0-9]+)$' "${WRITE_LOG}" | tail -1)"
     acked="$(grep -o '^COMMITTED batch=[0-9]* rows=[0-9]*$' "${WRITE_LOG}" | tail -1 | sed -n 's/.*rows=\([0-9]*\)$/\1/p')"
-    if [ -n "${acked}" ]; then
-      # 「started」で確認した COMMITTED はコミット成功後にのみ出力されるため、
-      # 再オープン後の rows はその時点で確認済みだった acked 行数を下回ってはならない
-      # （下回れば、確認済みのはずのコミットが失われたことになる＝data loss）。
-      if [ "${rows}" -lt "${acked}" ]; then
-        echo "ERROR: row count ${rows} is below the last acknowledged commit (rows=${acked} from write.log), data loss suspected (set ${set_no} iteration ${i})" >&2
+    if ! [[ "${acked}" =~ ^[0-9]+$ ]] || [ -z "${last_line}" ]; then
+      echo "ERROR: could not classify the kill position from write.log (set ${set_no} iteration ${i})" >&2
+      cat "${WRITE_LOG}" >&2
+      rm -rf "${WORKDIR}"
+      trap - EXIT
+      exit 1
+    fi
+    if [[ "${last_line}" =~ ^STMT\ step=([0-9]+)\ stage=([0-9]+)$ ]]; then
+      # 文の実行中。直前の ack 済み n と開始した step が一致するはず（ログの整合）。
+      stmt_step="${BASH_REMATCH[1]}"
+      stmt_stage="${BASH_REMATCH[2]}"
+      if [ "${stmt_step}" -ne "${acked}" ]; then
+        echo "ERROR: in-flight step ${stmt_step} does not follow acked ${acked} (set ${set_no} iteration ${i})" >&2
+        rm -rf "${WORKDIR}"
+        trap - EXIT
+        exit 1
+      fi
+      if [ "${rows}" -eq "${acked}" ]; then
+        inflight_before=$((inflight_before + 1))
+      elif [ "${rows}" -eq $((acked + 1)) ]; then
+        inflight_after=$((inflight_after + 1))
+      else
+        echo "ERROR: n=${rows} is neither before (${acked}) nor after ($((acked + 1))) the in-flight statement (set ${set_no} iteration ${i})" >&2
+        rm -rf "${WORKDIR}"
+        trap - EXIT
+        exit 1
+      fi
+      inflight_by_stage[stmt_stage]=$((${inflight_by_stage[stmt_stage]:-0} + 1))
+      if [ "${stmt_stage}" -ne 1 ]; then
+        ddl_inflight=$((ddl_inflight + 1))
+      fi
+    else
+      # 文と文の間。ack を超える幽霊適用も、ack 済みの消失も許さない（完全一致）。
+      if [ "${rows}" -ne "${acked}" ]; then
+        echo "ERROR: n=${rows} differs from acked ${acked} although no statement was in flight (set ${set_no} iteration ${i})" >&2
         rm -rf "${WORKDIR}"
         trap - EXIT
         exit 1
@@ -198,4 +238,10 @@ if [ "${completed}" -ne "${total_iterations}" ]; then
   exit 1
 fi
 
-echo "crash_test_ddl.sh: OK (${SETS} sets x ${ITERATIONS} iterations = ${completed} SIGKILL reps)"
+# DDL 段（INSERT 以外）の実行中の中断を 1 度も観測していない実行は、DDL の途中を検証できていない。
+if [ "${ddl_inflight}" -le 0 ]; then
+  echo "ERROR: no kill landed while a DDL statement was in flight in ${completed} reps (before=${inflight_before} after=${inflight_after}); raise iterations" >&2
+  exit 1
+fi
+
+echo "crash_test_ddl.sh: OK (${SETS} sets x ${ITERATIONS} iterations = ${completed} SIGKILL reps; in-flight kills ddl=${ddl_inflight} before=${inflight_before} after=${inflight_after} by_stage=${inflight_by_stage[*]})"
