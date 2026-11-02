@@ -46,3 +46,20 @@ fn resolved_internal_keys_are_kept() {
         ["#5.t"]
     );
 }
+
+#[test]
+fn recursive_cte_self_reference_is_not_collected_for_dml_forms() {
+    // 再帰項の `t` は CTE 自身（本文から可視）で実表ではない。書き込み系・データ変更 CTE の形でも、
+    // 収集に残るのは実表（`ca`）だけ（Issue #1968）。
+    let rec = "t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 3)";
+    for sql in [
+        format!("WITH RECURSIVE {rec} INSERT INTO ca SELECT n FROM t"),
+        format!("WITH RECURSIVE {rec} DELETE FROM ca WHERE n IN (SELECT n FROM t)"),
+        format!("WITH RECURSIVE {rec} UPDATE ca SET n = 0 WHERE n IN (SELECT n FROM t)"),
+        format!("WITH RECURSIVE d AS (DELETE FROM ca RETURNING id), {rec} SELECT n FROM t"),
+    ] {
+        let got = refs(&sql);
+        assert!(!got.contains(&"t".to_string()), "{sql}: {got:?}");
+        assert!(got.contains(&"ca".to_string()), "{sql}: {got:?}");
+    }
+}

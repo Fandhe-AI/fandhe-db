@@ -342,3 +342,118 @@ fn quoted_only_table_with_alias_is_checked_as_a_relation() {
     f.admin_run("GRANT SELECT ON \"only\" TO alice");
     assert_ne!(f.alice_run("SELECT k FROM \"only\" ca LIMIT 5"), "42501");
 }
+
+/// 明示 Tx を BEGIN したあとで別セッションが `drop_sql` を実行し、その Tx で `sql` を流した結果の SQLSTATE。
+/// 主体は `ddl` が真なら運用者権限つき（権限検査を通る基準）、偽なら権限の無い束縛ロール。ケースごとに
+/// 新しい DB を使うので、事前に作る表・付与は `setup` で渡す。
+fn code_after_concurrent_drop(
+    label: &str,
+    ddl: bool,
+    setup: &[&str],
+    drop_sql: &str,
+    sql: &str,
+) -> String {
+    let f = fx(label);
+    for stmt in setup {
+        f.admin_run(stmt);
+    }
+    let mut s = bound(if ddl { f.admin } else { f.alice }, ddl);
+    let mut txn = f.core.new_session_transaction();
+    f.core
+        .execute_sql_in_txn(&ctx(), &mut s, &mut txn, "BEGIN")
+        .expect("begin");
+    f.admin_run(drop_sql);
+    let c = code(f.core.execute_sql_in_txn(&ctx(), &mut s, &mut txn, sql));
+    let _ = f
+        .core
+        .execute_sql_in_txn(&ctx(), &mut s, &mut txn, "ROLLBACK");
+    c
+}
+
+/// BEGIN 後に別セッションが書き込み先を DROP しても、権限の無い主体は書き込めない。書き込み文は
+/// 最新カタログで検証されるため `42P01` で止まる（権限検査より前の解析段。運用者権限の主体でも同じ
+/// 応答で、権限検査が省略されているわけではない）。いずれも行は変化しない（Issue #1968 の指摘対応）。
+#[test]
+fn explicit_txn_dml_is_denied_after_concurrent_drop_of_the_target() {
+    for (i, sql) in [
+        "INSERT INTO ca (id, embedding, n) VALUES (1, '[1.0, 0.0]', 1)",
+        "UPDATE ca SET n = 2 WHERE n > 0",
+        "DELETE FROM ca WHERE n > 0",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let alice = code_after_concurrent_drop(
+            &format!("dmlpriv-cd-t{i}"),
+            false,
+            &[],
+            "DROP TABLE ca",
+            sql,
+        );
+        let admin = code_after_concurrent_drop(
+            &format!("dmlpriv-cd-a{i}"),
+            true,
+            &[],
+            "DROP TABLE ca",
+            sql,
+        );
+        assert_eq!(alice, "42P01", "{sql}");
+        assert_eq!(admin, "42P01", "{sql}");
+    }
+}
+
+/// 実表 `"only"` の SELECT 元（別名 `x`）が、BEGIN 後に別セッションから DROP されても、解析と読み取りは
+/// BEGIN 時のスナップショットで行われる。権限の無い束縛ロールは読めず（`42501`）、運用者権限の主体は
+/// 読める（基準）。解析が実在を確認した relation を必須候補として保持し、スナップショットの ACL で
+/// 権限を確認できなければ拒否する（Issue #1968 の指摘対応）。`INSERT ... SELECT` の読み取り元は
+/// 書き込み文として最新カタログで検証されるため `42P01` で止まる（運用者権限の主体でも同じ）。
+#[test]
+fn explicit_txn_check_keeps_quoted_only_as_required_after_concurrent_drop() {
+    let setup = [
+        "CREATE TABLE \"only\" (k BIGINT PRIMARY KEY, embedding VECTOR(2), n BIGINT)",
+        "GRANT SELECT, INSERT ON ca TO alice",
+    ];
+    let drop_sql = "DROP TABLE \"only\"";
+    let select = "SELECT k FROM \"only\" x LIMIT 5";
+    assert_eq!(
+        code_after_concurrent_drop("dmlpriv-only-sel-a", false, &setup, drop_sql, select),
+        "42501"
+    );
+    assert_eq!(
+        code_after_concurrent_drop("dmlpriv-only-sel-o", true, &setup, drop_sql, select),
+        "ok"
+    );
+    let ins_sel = "INSERT INTO ca (id, embedding, n) SELECT k, embedding, n FROM \"only\" x";
+    for (label, ddl) in [("dmlpriv-only-ins-a", false), ("dmlpriv-only-ins-o", true)] {
+        assert_eq!(
+            code_after_concurrent_drop(label, ddl, &setup, drop_sql, ins_sel),
+            "42P01"
+        );
+    }
+}
+
+/// `WITH RECURSIVE` の再帰項の自己参照（CTE 名）は実表の候補に残らない。SELECT 形は SELECT 権限だけで通る。
+/// データ変更 CTE と再帰 CTE の併用は現状 `0A000` で、解析で止まり権限ゲートへ届かない。受理される形に
+/// なった時点で `42501`（再帰項の CTE 名を実表と誤認）にならないことを固定する（収集器の単体テストは
+/// `privilege_gate/read/tests.rs`。Issue #1968 の指摘対応）。
+#[test]
+fn recursive_cte_self_reference_is_not_a_relation_for_dml() {
+    let f = fx("dmlpriv-recursive");
+    f.admin_run("GRANT SELECT, INSERT, DELETE ON ca TO alice");
+    let rec = "t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 3)";
+    assert_eq!(
+        f.alice_run(&format!("WITH RECURSIVE {rec} SELECT n FROM t")),
+        "ok"
+    );
+    for sql in [
+        format!(
+            "WITH RECURSIVE d AS (DELETE FROM ca WHERE n > 100 RETURNING id), {rec} SELECT n FROM t"
+        ),
+        format!(
+            "WITH RECURSIVE {rec}, d AS (INSERT INTO ca (id, embedding, n) \
+             VALUES (1, '[1.0, 0.0]', 1) RETURNING id) SELECT n FROM t"
+        ),
+    ] {
+        assert_ne!(f.alice_run(&sql), "42501", "{sql}");
+    }
+}
