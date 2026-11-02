@@ -14,7 +14,8 @@
 //!
 //! `SKIP LOCKED` は待たずに取得を試み、他セッションが保持していれば 0 行を返す（結果の行は捨てる）
 //! （句なし `SELECT` と同じ execute 経路を通すため 22000／42501 等の検査も効く）。0 行はテナントの可視行に
-//! 依存しないため、他テナントの行の存在・件数のオラクルにならない（SQL-38 (5)・RLS-12）。
+//! 依存しないため、他テナントの行の存在・件数のオラクルにならない（SQL-38 (5)・RLS-12）。空結果の前に対象表の
+//! `row_security = off` 拒否（`policies_apply`。RLS-13）を行う。
 //! 取得できた場合は `SKIP LOCKED` を外した行ロック句と同じに扱い、`40001` 判定も効く。
 //!
 //! fail-closed の順序: writer の取得（`55P03`／`SKIP LOCKED` の空結果／`40001`）→ 読み取り。
@@ -27,6 +28,7 @@ use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::mode::SessionState;
 use crate::sql::row_lock::{LockingSelect, WriterWait};
 use crate::sql::transaction::SessionTransaction;
+use redb::ReadableDatabase;
 
 impl EngineCore {
     /// 開いている Tx の上で行ロック句つき `SELECT` を実行する。writer は未取得なら遅延取得
@@ -92,11 +94,14 @@ impl EngineCore {
     /// `txn` が `Some` なら明示 Tx の経路。
     fn skip_locked_empty_result<'e>(
         &'e self,
-        _ctx: &PolicyContext,
+        ctx: &PolicyContext,
         session: &mut SessionState,
         txn: Option<&SessionTransaction<'e>>,
         locking: &LockingSelect,
     ) -> Result<crate::sql::SqlOutcome, SqlSurfaceError> {
+        // 行走査を省いても、対象表の RLS 適用判定（`row_security = off` の 42501 拒否）は空結果の前に行う
+        // （RLS-13。writer の空き具合で拒否と空結果が分かれて存在のオラクルにならないよう、取得の成否に依らず同じ検査）。
+        self.reject_skip_locked_row_security_off(ctx, session, txn, locking)?;
         // 行を読む本体は実行せず、Describe と同じ列メタデータ導出（検索・集計の本体を呼ばない）だけを行う。
         // 全件走査・結果バイト上限（54000）・明示 Tx の read_set 取り込みを起こさず、構文・列・
         // `LIMIT`／`OFFSET` の範囲などの束縛時検査は Describe 経路で効く。
@@ -116,5 +121,49 @@ impl EngineCore {
                 detail: "internal error".to_string(),
             }),
         }
+    }
+
+    /// `SKIP LOCKED` の空結果の前に、文が読む各表へ `row_policy::policies_apply` を適用する。
+    /// 明示 Tx は `BEGIN` 時点のスナップショット（writer 未取得のため）、それ以外は確定済みの最新状態で判定する。
+    /// 適用表（RLS 有効）は行を読まないため素通りで、`row_security = off` のときだけ `42501` を返す。
+    fn reject_skip_locked_row_security_off(
+        &self,
+        ctx: &PolicyContext,
+        session: &SessionState,
+        txn: Option<&SessionTransaction<'_>>,
+        locking: &LockingSelect,
+    ) -> Result<(), SqlSurfaceError> {
+        use crate::sql::transaction::TxnReadSource;
+        // `row_security` は文の実行区間に束縛された値を判定点が読むため、空結果の経路でも束縛する。
+        let _row_security =
+            crate::sql::policy_applicability::RowSecurityScope::enter(session.row_security());
+        let mut tables = Vec::new();
+        super::buffered_body_tables(locking.statement(), &mut tables);
+        let check =
+            |src: &dyn Fn(&str) -> Result<bool, SqlSurfaceError>| -> Result<(), SqlSurfaceError> {
+                for t in &tables {
+                    src(t)?;
+                }
+                Ok(())
+            };
+        if let Some(txn) = txn {
+            match txn.read_source()? {
+                TxnReadSource::BeginSnapshot(snap) => {
+                    return check(&|t| crate::sql::row_policy::policies_apply(snap, ctx, t));
+                }
+                TxnReadSource::Writer(w) => {
+                    return check(&|t| crate::sql::row_policy::policies_apply(w, ctx, t));
+                }
+                TxnReadSource::Committed => {}
+            }
+        }
+        let read_txn = self
+            .storage
+            .db()
+            .begin_read()
+            .map_err(|_| SqlSurfaceError::Internal {
+                detail: "internal error".to_string(),
+            })?;
+        check(&|t| crate::sql::row_policy::policies_apply(&read_txn, ctx, t))
     }
 }

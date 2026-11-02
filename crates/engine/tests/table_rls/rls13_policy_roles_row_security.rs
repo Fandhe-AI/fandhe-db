@@ -463,3 +463,56 @@ fn rls13_row_security_off_copy_from_is_rejected_on_public_commit_paths() {
     ok(&core, "alice", &mut s, "SET row_security = on");
     core.commit_copy_in(&c, batch(&core, &s)).expect("on");
 }
+
+/// RLS-13・Issue #2231: RLS 有効な表への `FOR UPDATE SKIP LOCKED` は、writer が空いていても他者保持中でも
+/// （autocommit・明示 Tx とも）`row_security = off` なら同じ `42501` で拒否され、明示 Tx は失敗状態になる。
+/// `on` に戻すと他者保持中は 0 行になる（空結果が拒否を隠さない）。
+#[test]
+fn rls13_skip_locked_rejects_row_security_off_regardless_of_writer_state() {
+    let (core, _g) = new_core("rls13-skip-locked-off");
+    let mut s = SessionState::default();
+    s.allow_ddl();
+    for sql in [
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, name TEXT)",
+        "ALTER TABLE t ENABLE ROW LEVEL SECURITY",
+        "CREATE POLICY p ON t FOR ALL USING (true) WITH CHECK (true)",
+    ] {
+        ok(&core, "alice", &mut s, sql);
+    }
+    let q = "SELECT id, name FROM t FOR UPDATE SKIP LOCKED";
+    let mut other = SessionState::default();
+    ok(&core, "alice", &mut other, "SET row_security = off");
+
+    // writer が空いている場合。
+    assert_eq!(code(&core, "alice", &mut other, q), "42501");
+
+    // 別セッションが writer を保持している場合も同じ拒否になる。
+    let mut holder = SessionState::default();
+    let mut ht = core.new_session_transaction();
+    ok_txn(&core, &mut holder, &mut ht, "BEGIN");
+    ok_txn(
+        &core,
+        &mut holder,
+        &mut ht,
+        "SELECT id, name FROM t FOR UPDATE",
+    );
+    assert_eq!(code(&core, "alice", &mut other, q), "42501");
+    let mut t2 = core.new_session_transaction();
+    ok_txn(&core, &mut other, &mut t2, "BEGIN");
+    let err = core
+        .execute_sql_in_txn(&ctx("alice"), &mut other, &mut t2, q)
+        .expect_err("off must be rejected while held");
+    assert_eq!(err.wire_code(), "42501");
+    assert_eq!(
+        t2.status(),
+        engine::sql::transaction::TransactionStatus::Failed
+    );
+
+    // on に戻せば保持中は 0 行。
+    ok(&core, "alice", &mut other, "SET row_security = on");
+    match ok(&core, "alice", &mut other, q) {
+        SqlOutcome::Query(r) => assert!(r.rows.is_empty()),
+        o => panic!("expected query, got {o:?}"),
+    }
+    ok_txn(&core, &mut holder, &mut ht, "COMMIT");
+}
