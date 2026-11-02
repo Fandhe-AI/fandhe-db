@@ -23,12 +23,18 @@
 //! 文へ届く経路は存在しない。
 
 mod deadline;
+mod statement_timeout;
 
 pub use deadline::{
     checks_seen, current_deadline, install_fire_after_checks, DeadlineGuard, DeadlineScope,
     StatementDeadline,
 };
 pub(crate) use deadline::{effective_lock_wait, is_expired_now, lock_wait_error};
+pub use statement_timeout::{
+    format_statement_timeout, parse_statement_timeout_text, validate_statement_timeout_ms,
+    StatementTimeoutOutOfRange, DEFAULT_STATEMENT_TIMEOUT_MS, INVALID_STATEMENT_TIMEOUT_DETAIL,
+    MAX_STATEMENT_TIMEOUT_MS,
+};
 
 use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;

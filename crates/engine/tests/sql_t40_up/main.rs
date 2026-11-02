@@ -16,6 +16,7 @@ mod sql1951_statement_deadline;
 mod sql1952_deadline_loops;
 mod sql1953_deadline_vector;
 mod sql1953_deadline_writes;
+mod sql1954_statement_timeout_setting;
 mod sql24_expr_lhs_null_between_in;
 mod sql41_bool_literal_where;
 mod sql42_aggregate_arith_projection;

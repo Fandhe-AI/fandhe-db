@@ -407,6 +407,13 @@ pub enum SqlOutcome {
     SetRowSecurity {
         reset: bool,
     },
+    /// `SET [SESSION] statement_timeout ...`／`RESET statement_timeout` の成功応答（タグは `SET`・`RESET`。
+    /// SQL-71・Issue #1954）。新しい値は `SessionState::statement_timeout` が保持する。
+    ///
+    /// **Issue #1954 で追加した破壊的変更（BREAKING CHANGE）**: variant を追加した。
+    SetStatementTimeout {
+        reset: bool,
+    },
     /// `SHOW timezone`／`SHOW TIME ZONE` の応答（列名 `TimeZone`・text の 1 行。CommandComplete
     /// タグは PG と同じ `SHOW`。TABLE-33・Issue #1575）。行の形は通常の検索 SELECT と同じで、
     /// タグだけが異なるため `Query` とは別 variant にしている。

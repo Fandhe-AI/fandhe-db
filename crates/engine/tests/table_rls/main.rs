@@ -45,6 +45,7 @@ mod rls10_recursive_cte_paths;
 mod rls10_relational_paths;
 mod rls10_sql_function_paths;
 mod rls11_read_your_writes;
+mod rls12_privilege_existence_oracle;
 mod rls13_policy_ddl;
 mod rls13_policy_read_path_coverage;
 mod rls13_policy_roles_row_security;

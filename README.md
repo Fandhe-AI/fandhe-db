@@ -141,7 +141,7 @@ cargo run -p fandhe-db-wire-server -- --users <ユーザーストアのパス> -
   [--max-plpgsql-nesting-depth <1-32>] [--max-plpgsql-body-bytes <1-65536>] \
   [--max-function-call-depth <1-32>] [--max-trigger-depth <1-16>] \
   [--max-result-rows <1-100000>] \
-  [--write-lock-wait-ms <100-60000>] \
+  [--write-lock-wait-ms <100-60000>] [--statement-timeout-ms <0-2147483647>] \
   [--read-timeout-secs <1-600>] [--max-connections <1-256>] [--max-prepared-statements <1-1024>] \
   [--max-transaction-duration-ms <100-60000>] [--max-transaction-statements <1-10000>] \
   [--partitioned-dml-chunk-rows <1-1000000>] [--partitioned-dml-scan-budget <1-1000000>] \
@@ -531,6 +531,13 @@ SELECT の結果行数上限にも使われます（Issue #1796・#2211）。こ
 超過時の SQLSTATE は従来と同じ `55P03` です。autocommit の書き込み・明示トランザクションの最初の書き込み文（DML・`LOCK TABLE`。`BEGIN` と読み取りでは待たない）・分割実行 DML の
 チャンクに効き、SQL 表層と NoSQL（HTTP）表層の両方が対象です。範囲外・非数値・値欠落・2 回目以降の重複指定は
 fail-closed で起動エラーです。環境変数は設けません（詳細: [docs/design/write-lock-wait-cli.md](docs/design/write-lock-wait-cli.md)）。
+
+`--statement-timeout-ms <N>`（既定 0＝無効・範囲 `0`〜`2,147,483,647` ミリ秒）（Issue #1954・SQL-71）は、全セッションの
+`statement_timeout` の既定値を起動時に設定します。各セッションは `SET statement_timeout = '5s'` で上書きでき（単位 `ms`・`s`・`min`・`h`・`d`）、
+`RESET statement_timeout` はこの既定値へ戻ります。`SHOW statement_timeout` で現在値を確認できます。文の実行開始から設定値を超えると
+`57014` を返し、明示トランザクションは失敗状態（`25P02`）になります（`SAVEPOINT` 後なら `ROLLBACK TO` で復帰）。範囲外・非数値・値欠落・
+2 回目以降の重複指定は fail-closed で起動エラーです。`SET LOCAL`・小数・`us` 単位は未対応で、NoSQL（HTTP）表層には適用されません
+（詳細: [docs/design/statement-interrupt.md](docs/design/statement-interrupt.md)）。
 
 `--read-timeout-secs <N>`（既定 30・範囲 `1`〜`600` 秒）・`--max-connections <N>`（既定 64・範囲 `1`〜`256`）・
 `--max-prepared-statements <N>`（既定 64・範囲 `1`〜`1,024`。名前付きのみ数え、無名は数えない）（Issue #2454・WIRE-25）は、

@@ -200,8 +200,14 @@ SQL 表層・HTTP 表層の主体付き入口だけがゲートを通る。
 権限ゲートがカタログ照会より前に評価されるため、権限の無い主体には対象の有無を問わず `42501` のみが返る。
 他テナントの SCHEMA・FUNCTION 等はテナント単位のキーで構造上引けない。根拠テスト:
 `crates/wire-server/tests/wire_cli/wire_ddl_permission_cli.rs`・`sql67_function_privileges.rs`・
-`crates/wire-server/tests/http_nosql/nosql13_ddl.rs` 等。3 ケース（存在する・しない・他テナント所有）の網羅試験は
-Issue #1972 の担当（RLS-12 ポインタ）。
+`crates/wire-server/tests/http_nosql/nosql13_ddl.rs` 等。3 ケース（存在する・しない・他テナント所有）の網羅試験は Issue #1972 で追加した
+（RLS-12・SQL-40 ポインタ）。守る不変条件は、束縛ロールの応答が「他テナントだけに在る名前」と「どこにも無い名前」で
+完全一致すること（双子 DB のバイト一致）と、ゲート前置の経路（GRANT／REVOKE／SET ROLE／ロール DDL）で 3 ケースが
+`42501` に揃うこと。自テナントに在る名前との差（束縛ロールの `42501` 対 `42P01`／`3F000`、SCHEMA 修飾の表 DDL と
+拡張クエリの Parse 段）はテナント内の区別として許容する。根拠テスト:
+`crates/engine/tests/table_rls/rls12_privilege_existence_oracle.rs`（応答）・
+`crates/engine/tests/rls12_privilege_oracle_latency.rs`（応答時間の粗い確認。統計的ゲートではない）・
+`crates/wire-server/tests/wire_sql/wire_privilege_oracle.rs`（ErrorResponse のフィールド集合）。
 
 ## DDL 文種と必要権限の表
 
@@ -247,7 +253,7 @@ Issue #1972 の担当（RLS-12 ポインタ）。
 | ロールのカタログ・`CREATE ROLE` 等 | #1959 配下（#1961〜#1963・#2232・#2233） |
 | GRANT／REVOKE・DML／検索／COPY 経路への結線 | #1964 配下（#1965〜#1969・#2234〜#2237）。SELECT・カーソル・検索は #1967 で実装済み（`sql/privilege_gate/read.rs`）、DML は #1968、COPY は #1969。`ALTER DEFAULT PRIVILEGES` は #2237 で実装済み（権限ゲートは置かず、現在ロールの束縛と `FOR ROLE` の SET 経路で認可。判定は `catalog/privilege/default_acl.rs`） |
 | 認証済みユーザーとロールの紐付け・users ファイルのブートストラップ化 | #1971・#2238 |
-| 存在オラクルの網羅試験 | #1972 |
+| 存在オラクルの網羅試験 | #1972（実装済み。上記「存在オラクルへの配慮」の根拠テスト） |
 
 共通ゲート導入時は、本書の一覧を移行の突き合わせ表として使い、各行がゲートへ結線されたことを確認する。
 

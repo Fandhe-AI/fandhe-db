@@ -39,6 +39,8 @@
   BREAKING CHANGE: 公開メソッド `SessionTransaction::savepoint` に引数 `session: &SessionState`、`SessionTransaction::rollback_to_savepoint` に引数 `session: &mut SessionState` を追加した。呼び出し側は実行中の `SessionState` を渡すよう改める（savepoint 作成時点のセッション状態を複製して保持し、`ROLLBACK TO` で復元するため）。
 - `SET TRANSACTION` と `SET SESSION CHARACTERISTICS AS TRANSACTION` を受理する（Issue #1939・SQL-38 (7)(a)・SQL-31 ポインタ。契約の詳細は spec 側を参照）。
   BREAKING CHANGE: 公開 enum `SqlOutcome`・`ParsedSql` に `SetTransaction`、`SqlSurfaceError` に `SetTransactionAfterQuery` を追加した。修飾子なしの `START TRANSACTION` がセッション既定を継承するようになった。
+- セッション変数 `statement_timeout`（`SET`／`RESET`／`SHOW`）と起動時 CLI `--statement-timeout-ms` を追加し、wire の文ごとにデッドラインを張って期限超過を `57014` で返す（Issue #1954・SQL-71）。既定は `0`（無効）で挙動は変わらない。`SET LOCAL`・小数・`us` 単位は未対応。
+  BREAKING CHANGE: 公開 enum `Statement`・`SqlOutcome` に variant（`SetStatementTimeout`・`ShowStatementTimeout`／`SetStatementTimeout`）を追加した。網羅 `match` する外部コードは腕を足す。
 - `row_security`（`SET`／`RESET`／`SHOW`・StartupMessage）とポリシーの適用判定（`BYPASSRLS`・所有者・対象ロール）を追加した（Issue #2278・RLS-12・RLS-13・SQL-39）。RLS 有効な表への読み取り・書き込み・`COPY` は `row_security = off` のとき行を扱う前に `42501`（`query would be affected by row-level security policy for table "..."`。表名は自テナントのみ）で拒否する。
   BREAKING CHANGE: 公開 enum `SqlSurfaceError`・`TenantWriteError` に `RowSecurityOffRejected` を追加した（`wire_code` は既存の `42501` のまま）。網羅 `match` する外部コードは腕を足す。
 - `BEGIN READ ONLY` の Tx を開始できるようにし、書き込み系の文（DML・DDL・`COPY FROM`・ロック・`USING OPERATION_ID` 付き）を `25006`（`read_only_sql_transaction`）で拒否して Tx を `Failed` にする（Issue #1934・SQL-38 (3)・ERR-6）。判定は許可リスト方式で、writer・台帳・採番・カタログへ触れる前に拒否する。HTTP は 403 に射影する。
