@@ -2308,6 +2308,32 @@ fn execute_portal<'e, S: WireStream>(
             )
         };
 
+        // SQL-40・Issue #1967: 結果を初めて具体化する前に読み取り権限を現在の主体で再検査する
+        // （Bind 後の `REVOKE` や、別 portal の `SET ROLE` を反映する。fail-closed）。準備済み文が
+        // 引けない場合も拒否する。未束縛のセッションでは何もしない。
+        if session.object_privileges_enforced() {
+            let source = state
+                .portals
+                .get(portal_name)
+                .map(|p| p.source_statement.clone())
+                .ok_or(HandlerError::UnknownPortal)?;
+            let gate =
+                match state.statements.get(&source) {
+                    Some(PreparedStatement::Parsed { prepared, .. }) => engine
+                        .recheck_prepared_read_privileges_in_txn(session, txn, prepared, &parsed),
+                    Some(PreparedStatement::Parameterized { prepared, .. }) => engine
+                        .recheck_prepared_read_privileges_in_txn(session, txn, prepared, &parsed),
+                    _ => Err(engine::sql::allowlist::SqlSurfaceError::InsufficientPrivilege),
+                };
+            if let Err(e) = gate {
+                if let Some(portal) = state.portals.get_mut(portal_name) {
+                    portal.state = PortalState::Failed;
+                }
+                txn.fail();
+                return Err(HandlerError::Sql(e));
+            }
+        }
+
         // `engine::sql::allowlist::Statement`（`ParsedSql::Statement`）は
         // `SELECT`／`SET search_mode`／`CREATE FUNCTION`／`EXPLAIN` のみで、
         // いずれも redb への書き込み commit を伴わない（`CREATE FUNCTION`・

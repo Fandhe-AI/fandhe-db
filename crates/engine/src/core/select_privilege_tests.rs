@@ -374,6 +374,43 @@ fn extended_query_is_checked_at_parse_bind_and_describe() {
     assert_eq!(e.wire_code(), "42501");
 }
 
+/// portal の Execute 直前の再検査: Bind 済みの文でも、その後の `REVOKE` と `SET ROLE` 相当の主体
+/// 変更を反映して `42501` にする（Bind の結果を使い回さない）。
+#[test]
+fn portal_execute_rechecks_privileges_after_bind() {
+    let f = fx("selpriv-portal-exec");
+    let sql = "SELECT id FROM ca LIMIT 5";
+    f.admin_run("GRANT SELECT ON ca TO alice");
+    let s = bound(f.alice, A, false);
+    let prepared = f
+        .core
+        .parse_sql_prepared_with_declared_in_session(&s, sql, &[])
+        .expect("parse");
+    let txn = f.core.new_session_transaction();
+    let parsed = f
+        .core
+        .bind_prepared_in_txn(&s, &txn, &prepared, &[])
+        .expect("bind");
+    f.core
+        .recheck_prepared_read_privileges_in_txn(&s, &txn, &prepared, &parsed)
+        .expect("granted: execute allowed");
+    // Bind 後の REVOKE は Execute 前の再検査で拒否する。
+    f.admin_run("REVOKE SELECT ON ca FROM alice");
+    let e = f
+        .core
+        .recheck_prepared_read_privileges_in_txn(&s, &txn, &prepared, &parsed)
+        .expect_err("denied at execute");
+    assert_eq!(e.wire_code(), "42501");
+    // 現在ロールが変わった（付与の無いロール）セッションも拒否する。
+    f.admin_run("GRANT SELECT ON ca TO alice");
+    let other = bound(f.admin, A, false);
+    let e = f
+        .core
+        .recheck_prepared_read_privileges_in_txn(&other, &txn, &prepared, &parsed)
+        .expect_err("other principal denied");
+    assert_eq!(e.wire_code(), "42501");
+}
+
 #[test]
 fn bound_http_read_api_is_checked_before_binding() {
     let f = fx("selpriv-http");

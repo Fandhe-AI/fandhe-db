@@ -854,6 +854,35 @@ impl EngineCore {
         self.bind_prepared_in_session_snap(session, prepared, values, read_snap)
     }
 
+    /// portal の Execute 直前の読み取り権限の再検査（SQL-40・Issue #1967）。拡張クエリの Execute が、
+    /// 結果を初めて具体化する前に、Bind 後の `REVOKE` や別 portal の `SET ROLE` を反映するため、
+    /// 現在の主体と実行時のカタログ（明示 Tx では `BEGIN` 時のスナップショット）で参照先を判定し直す。
+    /// `parsed` は portal が保持する文（振り分けの包みは外して分類する）。未束縛のセッションと一時表の
+    /// 経路は何もしない。
+    pub fn recheck_prepared_read_privileges_in_txn(
+        &self,
+        session: &SessionState,
+        txn: &crate::sql::transaction::SessionTransaction<'_>,
+        prepared: &super::PreparedSql,
+        parsed: &ParsedSql,
+    ) -> Result<(), SqlSurfaceError> {
+        let read_snap = if txn.status() == crate::sql::transaction::TransactionStatus::InTransaction
+        {
+            match txn.read_source()? {
+                crate::sql::transaction::TxnReadSource::BeginSnapshot(snap) => Some(snap),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        self.require_prepared_read_privileges(
+            session,
+            prepared,
+            parsed.peel_session_route(),
+            read_snap,
+        )
+    }
+
     /// 明示トランザクションが writer 取得前（`BEGIN` 時点のスナップショットで読む）か。
     /// wire 層が、Parse 時の解決結果を使い回さず Bind で再検証すべきかの判定に使う（Issue #2403）。
     pub fn txn_reads_begin_snapshot(txn: &crate::sql::transaction::SessionTransaction<'_>) -> bool {
