@@ -651,6 +651,25 @@ fn delete_single_row_hidden_is_indistinguishable_from_missing() {
     );
 }
 
+/// ポリシーを一時的に外し、隠れていた行（id 2・4）の `n` が元の値（2・4）のままであることを確認して
+/// ポリシーを戻す。述語／分割実行の UPDATE が隠れた行へ作用しない性質を、ポリシー越しでなく直接固定する。
+fn assert_hidden_rows_untouched(core: &EngineCore) {
+    sql_ok(
+        core,
+        TENANT_A,
+        "ALTER TABLE docs DISABLE ROW LEVEL SECURITY",
+    );
+    assert_eq!(
+        sql_sorted_ids(core, TENANT_A, "SELECT id FROM docs WHERE n = 2 LIMIT 10"),
+        vec![2]
+    );
+    assert_eq!(
+        sql_sorted_ids(core, TENANT_A, "SELECT id FROM docs WHERE n = 4 LIMIT 10"),
+        vec![4]
+    );
+    sql_ok(core, TENANT_A, "ALTER TABLE docs ENABLE ROW LEVEL SECURITY");
+}
+
 /// RLS-13: 述語形の `update`／`delete` の影響件数・対象行は、別フィクスチャで実行した SQL の同じ述語の
 /// UPDATE／DELETE と一致する。
 #[test]
@@ -680,6 +699,8 @@ fn predicate_update_and_delete_match_sql() {
         sql_sorted_ids(&core_s, TENANT_A, probe)
     );
     assert_eq!(sql_sorted_ids(&core_h, TENANT_A, probe), VISIBLE.to_vec());
+    assert_hidden_rows_untouched(&core_h);
+    assert_hidden_rows_untouched(&core_s);
 
     // DELETE
     let (core_h, _gh) = fixture("rls13-nosql-pred-del-h", true);
@@ -731,6 +752,7 @@ fn partitioned_update_and_delete_skip_hidden_rows() {
         ),
         VISIBLE.to_vec()
     );
+    assert_hidden_rows_untouched(&core);
 
     let resp = q(
         &h,
