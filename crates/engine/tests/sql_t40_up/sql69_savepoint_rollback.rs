@@ -314,7 +314,10 @@ fn rollback_to_closes_cursors_declared_after_savepoint() {
     )
     .unwrap();
     run(&core, &caller, &mut s, &mut txn, "ROLLBACK TO a").unwrap();
-    assert!(run(&core, &caller, &mut s, &mut txn, "FETCH 1 FROM c").is_err());
+    let err = run(&core, &caller, &mut s, &mut txn, "FETCH 1 FROM c")
+        .expect_err("closed cursor must be rejected");
+    assert_eq!(err.wire_code(), "34000");
+    assert_eq!(txn.status(), TransactionStatus::Failed);
 }
 
 /// savepoint より前に宣言したカーソルは `ROLLBACK TO` 後も残る。
