@@ -794,3 +794,38 @@ fn nested_view_replacement_invalidates_bound_portal() {
         assert_eq!(e.wire_code(), "0A000");
     }
 }
+
+/// 外側のビューの本文が集合演算で入れ子のビューと別の表（bool リテラルを含む）を読む形でも、入れ子のビューの置換を検知して portal を失効させる。保存済み本文の字句解析が
+/// 失敗しても黙って見逃さない（Issue #1967）。
+#[test]
+fn nested_view_in_multi_relation_body_with_bool_literal_invalidates_portal() {
+    let f = fx("selpriv-nested-join");
+    f.admin_run("CREATE TABLE bt (id BIGINT PRIMARY KEY, n BIGINT, ok BOOLEAN)");
+    f.admin_run("CREATE VIEW v_inner AS SELECT n FROM ca");
+    f.admin_run(
+        "CREATE VIEW v_outer AS SELECT n FROM bt WHERE true \
+         UNION ALL SELECT n FROM v_inner",
+    );
+    f.admin_run("GRANT SELECT ON v_outer TO alice");
+    let s = bound(f.alice, A, false);
+    let prepared = f
+        .core
+        .parse_sql_prepared_with_declared_in_session(&s, "SELECT n FROM v_outer", &[])
+        .expect("parse");
+    let txn = f.core.new_session_transaction();
+    let identity = f
+        .core
+        .prepared_relation_identity_in_txn(&s, &txn, &prepared)
+        .expect("identity must be computable for stored bodies with internal keys");
+    f.core
+        .check_prepared_relation_identity(&s, &txn, &prepared, &identity)
+        .expect("unchanged");
+    f.admin_run("CREATE OR REPLACE VIEW v_inner AS SELECT n FROM cb");
+    f.admin_run("GRANT SELECT ON v_outer TO admin_r");
+    let other = bound(f.admin, A, false);
+    let e = f
+        .core
+        .check_prepared_relation_identity(&other, &txn, &prepared, &identity)
+        .expect_err("nested replacement must invalidate the portal");
+    assert_eq!(e.wire_code(), "0A000");
+}

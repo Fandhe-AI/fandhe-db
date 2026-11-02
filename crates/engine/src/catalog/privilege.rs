@@ -768,11 +768,13 @@ pub(crate) fn relation_identity_closure_in_txn<R: ReadSource>(
         if let RelationIdentity::View(bytes) = &identity {
             let def = super::decode_view_def(bytes)?;
             queue.push(def.base_relation.clone());
-            if let Ok(tokens) = crate::sql::lexer::tokenize(&def.body_sql) {
-                queue.extend(crate::sql::search_path::resolved_relation_ref_names(
-                    &tokens,
-                ));
-            }
+            // 保存済みの本文は展開側と同じ字句解析（bool リテラルのマーカー・引用された内部キーを受理）で読む。
+            // 読めない本文は展開側でも検証に失敗する破損として、辿りきれない入れ子を見逃さず拒否する。
+            let tokens = crate::sql::lexer::tokenize_stored_view_body(&def.body_sql)
+                .map_err(|_| CatalogError::CorruptSchema("invalid stored view body".to_string()))?;
+            queue.extend(crate::sql::search_path::resolved_relation_ref_names(
+                &tokens,
+            ));
         }
         out.push((name, identity));
     }
