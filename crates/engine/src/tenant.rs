@@ -7712,8 +7712,12 @@ fn apply_predicate_update_in_txn<E>(
 /// 全表の AFTER TRUNCATE → SEQUENCE のリセット。DELETE トリガは発火しない。RESTART IDENTITY と
 /// TRUNCATE トリガの組み合わせは、トリガ内の採番とのずれを避けるため `0A000`。
 ///
-/// 権限検査（#1968）を結線する際は、**連鎖後の最終集合**に対して検査する必要がある
-/// （名前を書いていない表まで削除するため）。
+/// 権限検査（#1968）: 構文段のゲートは利用者が書いた表だけを判定する。CASCADE で連鎖して空にする表
+/// （名前を書いていない表）は、ここで write txn 内の **連鎖後の最終集合** に対して `privilege_recheck`
+/// （束縛済みで運用者権限なしの主体だけ `Some`）で TRUNCATE 権限を判定する。台帳記録・行の削除より前に
+/// 止めるので、拒否時は何も書かれない。拒否は `SequenceEvaluationFailed` が透過する `42501` で返す
+/// （公開の `TenantWriteError` に variant を足さない）。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn truncate_tables_unchecked(
     target: WriteTarget<'_>,
     tables: &[String],
@@ -7722,6 +7726,7 @@ pub(crate) fn truncate_tables_unchecked(
     ctx: &PolicyContext,
     ledger_write: LedgerWrite<'_>,
     triggers: Option<&crate::trigger::TriggerRuntime>,
+    privilege_recheck: Option<&crate::sql::privilege_gate::write::RelationPrivilegeRecheck>,
 ) -> Result<Vec<String>, TenantWriteError> {
     // 空集合は構文層が作らない。fail-closed に倒す（何も削除せず拒否）。
     if tables.is_empty() {
@@ -7755,6 +7760,13 @@ pub(crate) fn truncate_tables_unchecked(
                         }
                     })?;
                 let all_tables: &[String] = &closure.tables;
+                if let Some(recheck) = privilege_recheck {
+                    recheck.check_in_txn(write_txn, all_tables).map_err(|()| {
+                        TenantWriteError::SequenceEvaluationFailed(
+                            SqlSurfaceError::RelationPermissionDenied,
+                        )
+                    })?;
+                }
 
                 // RESTART IDENTITY の対象（連鎖後の最終集合が所有する SEQUENCE）を行を消す前に確定する。
                 // 全テナント共有のカタログ宣言だけで決まるため、InTxn の拒否は存在オラクルにならない。

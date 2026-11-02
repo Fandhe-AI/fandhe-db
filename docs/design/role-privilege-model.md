@@ -521,7 +521,7 @@ SQL-40 (1)(2)(3)(6)・RLS-12 ポインタ。読み取り系の文が参照する
 
 ### 対象外
 
-列集合の判定（#2081）、DML の読み取り側と書き込み・分割実行・DML の EXPLAIN（#1968。本書の収集関数を再利用する）、COPY（#1969）、
+列集合の判定（#2081）、DML の読み取り側と書き込み・分割実行・DML の EXPLAIN は #1968（§17）で実装済み、COPY（#1969）、
 継承メンバーシップ（#2860 のマージ後）、所有者（#2236）、SCHEMA の USAGE（#2234）、シーケンス・関数の権限（#2235）、
 認証済みユーザーとロールの紐付け（#1971。これが入るまで本番セッションでは検査が有効にならない）、
 主体を持たない engine の Rust API（`VectorCore::search`／`get_row`、`parse_sql` ＋ `execute_parsed_*`、`describe_parsed_*`）、
@@ -572,7 +572,7 @@ SQL-40 (1)(2)(3)(6)・RLS-12 ポインタ。読み取り系の文が参照する
   （#2237）、表・列権限の参照時検査（#1967〜#1969）、権限検査の共通ゲートへの統合（#1966。判定は `sql/schema_privilege.rs`
   に集約済みで、ゲートへ移す）、存在オラクルの網羅試験（#1972）。
 
-## 13. Issue #2233 実装記録（カタログのロールで SCRAM-SHA-256 認証する）
+## 15. Issue #2233 実装記録（カタログのロールで SCRAM-SHA-256 認証する）
 
 SQL-39 (3)(7)・WIRE-18 ポインタ。ロールのカタログ（#1961）・`CREATE`／`ALTER ROLE`（#1962・#1963）の上に、認証側の照合と `VALID UNTIL`・`CONNECTION LIMIT` を実装した。
 
@@ -736,3 +736,50 @@ D5・D8・D10、§12（#2234）の K1〜K13 に揃える。
 - 継承（#2232）は判定のロール集合に未反映（直接の行と PUBLIC の行だけ）。
 - 対象外: 所有者の機構と付与者の記録（#2236）、`ALTER DEFAULT PRIVILEGES`（#2237）、表・列の参照時検査（#1967〜#1969）と共通ゲートへの
   統合（#1966 の後続）、`ALL SEQUENCES／FUNCTIONS IN SCHEMA`、PROCEDURE／ROUTINE、SECURITY DEFINER、存在オラクルの網羅試験（#1972）。
+
+## 17. Issue #1968 実装記録（INSERT／UPDATE／DELETE／UPSERT／TRUNCATE への権限検査の結線）
+
+SQL-40・RLS-12・SQL-19・SQL-22 ポインタ。書き込み系の文の対象表と参照先に、表単位の権限検査を結線した。
+判定点は §11 の `privilege_gate::check` の 1 本のまま。文種の分類は `sql/privilege_gate/write.rs`、ACL の照会は §12 の
+`read.rs` と共有する（`require_relations_bits`。relation ごとに必要ビットを持てる形へ一般化）。
+
+### 文種と必要ビット（表単位。判別できなければ厳しい側）
+
+| 文 | 対象への要求 | 参照先 |
+| -- | ------------ | ------ |
+| INSERT | INSERT。RETURNING があれば +SELECT。`ON CONFLICT DO UPDATE` は +UPDATE +SELECT。衝突対象を明示した `DO NOTHING` は +SELECT | 他の参照は SELECT |
+| INSERT ... SELECT | INSERT（RETURNING・ON CONFLICT は同上） | 内側 SELECT の全 relation に SELECT。対象が参照側にも現れれば対象にも SELECT |
+| UPDATE | UPDATE。`id` 一致形・WHERE・RETURNING・式の SET のいずれかがあれば +SELECT | WHERE のサブクエリ等に SELECT |
+| DELETE | DELETE。`id` 一致形・WHERE・RETURNING のいずれかがあれば +SELECT | 同上 |
+| UPDATE ... FROM／DELETE ... USING | UPDATE／DELETE +SELECT | FROM／USING に SELECT |
+| TRUNCATE | 列挙した全表と、CASCADE の連鎖後の最終集合の全表に TRUNCATE | なし |
+| ビュー DML | ビュー自身の INSERT／UPDATE／DELETE（基底表は検査しない） | なし |
+| データ変更 CTE | 各副文の対象にその文種の権限 | 主クエリが読む実表に SELECT |
+| `EXPLAIN ... PARTITIONED` | 本体の UPDATE／DELETE と同じ（計画を返す前に拒否） | 同上 |
+
+### 結線点
+
+- `core.rs` の `parse_tokens_gated`（簡易クエリ・明示 Tx・PL/pgSQL の埋め込み SQL）と `core/temp_route.rs` の拡張クエリ Parse・Bind・Describe。
+  判定順は「構文 `42601` → 名前解決 `42P01`／`3F000` → 権限 `42501` → 台帳・制約・RLS」で、台帳の重複判定より前に拒否するため、
+  再送の成否から過去の commit の有無が漏れない。拒否した `operation_id` は台帳に残らない。
+- 分割実行 DML は各チャンクの write txn の取得直後（ジョブ記録・台帳照合・走査・適用より前）に、その txn から ACL を読んで
+  再判定する（`RelationPrivilegeRecheck`）。同じ `operation_id` の再送での再開もこのループを通る。第 1 チャンクの拒否は副作用なしの
+  `42501`、途中で剥奪された場合は commit 済みチャンクを残して `VD001`（原因クラス `42501`）。再 GRANT 後の再送で再開できる。
+- TRUNCATE の CASCADE は、構文段の判定（列挙表）に加え `truncate_tables_unchecked` が連鎖後の最終集合を write txn 内で再判定する
+  （親表の権限だけで参照元の表まで消せる fail-open を塞ぐ）。拒否は台帳記録・行の削除より前で、公開の `TenantWriteError` に variant を足さず
+  `SequenceEvaluationFailed` が透過する `42501` で返す。
+
+### 判断の記録
+
+- 移行期の契約は #1967 と同じ（未束縛は素通し、運用者権限は所有者相当、`Some(0)` は拒否、列単位の付与だけでは満たさない）。
+- 参照 relation はトークン走査で得た出現から対象を 1 回ずつ差し引いた残りに SELECT を課す（走査器は #1967 と共有）。
+- PG より厳しい箇所: 式の SET・`ON CONFLICT` 句・`id` 一致形の UPDATE／DELETE は列を読むとみなして SELECT を要求する。
+- 対象外: `SHOW`／`CANCEL PARTITIONED DML`（ジョブ表だけを触る）、一時表（セッションの所有物）、`COPY`（#1969）、`LOCK TABLE`、
+  トリガ起点の内部書き込み・FK の参照アクション（所有者実行の意味で呼び出し元の権限を検査しない）。
+
+### 対象外（後続）
+
+列集合の判定（#2081）、HTTP 表層の bound 書き込み API（engine の `execute_bound_*` はセッションを取らず、主体を持つ入口の網羅は #1969）、
+継承メンバーシップ（#2860）、所有者（#2236）、SCHEMA の USAGE（#2234）、シーケンス・関数の権限（#2235）、認証とロールの紐付け（#1971）、
+主体を持たない engine の Rust API（`parse_sql` ＋ `execute_parsed_*`、`execute_truncate_sql`）、`LOCK TABLE` の権限、
+`SHOW`／`CANCEL PARTITIONED DML` のロール単位の所有、存在オラクルの網羅試験（#1972）。

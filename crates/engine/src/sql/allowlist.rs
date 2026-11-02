@@ -1292,6 +1292,14 @@ pub enum SqlSurfaceError {
     /// 存在情報を漏らさない」対応）。固定文言のみを保持し、テーブル名・
     /// ユーザー名を含めない。
     InsufficientPrivilege,
+    /// relation（表・ビュー・matview）に対するオブジェクト権限（SELECT／INSERT／UPDATE／DELETE／
+    /// TRUNCATE）の不足（`42501`。SQL-40・Issue #1968）。`wire_code` は
+    /// [`SqlSurfaceError::InsufficientPrivilege`] と同じ。DDL 文言と区別するための固定文言のみを保持し、
+    /// 表名・ロール ID・テナントを含めない。
+    ///
+    /// **BREAKING CHANGE**（Issue #1968）: variant を追加した。`SqlSurfaceError` を網羅的に `match`
+    /// するクレート外のコードは追随が必要。
+    RelationPermissionDenied,
     /// public のオブジェクト（表・ビュー・SEQUENCE 等）が、テナントの SCHEMA 配下のオブジェクトへ
     /// 依存する定義の拒否（`42501`。TABLE-27・Issue #1717、ADR D7）。public は全テナント共有の
     /// カタログのため、特定テナントの SCHEMA 配下を参照させない（SCHEMA の削除や他テナントの
@@ -2065,6 +2073,7 @@ impl ClassifiedError for SqlSurfaceError {
             | SqlSurfaceError::OrderByPositionNotInSelectList { .. }
             | SqlSurfaceError::AggregateOrderByNotInArguments => ErrorClass::InvalidColumnReference,
             SqlSurfaceError::InsufficientPrivilege
+            | SqlSurfaceError::RelationPermissionDenied
             | SqlSurfaceError::ConflictTargetNotVisible
             | SqlSurfaceError::RowSecurityPolicyViolation { .. }
             | SqlSurfaceError::RowSecurityOffRejected { .. }
@@ -2405,6 +2414,10 @@ impl std::fmt::Display for SqlSurfaceError {
             // `SqlSurfaceError::InsufficientPrivilege` ドキュメント参照）。
             SqlSurfaceError::InsufficientPrivilege => {
                 write!(f, "permission denied")
+            }
+            // 表名・ロール ID を含めない固定文言（security.md P0。Issue #1968）。
+            SqlSurfaceError::RelationPermissionDenied => {
+                write!(f, "permission denied for relation")
             }
             // オブジェクト名・SCHEMA 名・内部 ID を含めない固定文言（ADR D7・security.md P0）。
             SqlSurfaceError::SchemaDependencyForbidden => {

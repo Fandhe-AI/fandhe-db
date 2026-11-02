@@ -567,6 +567,14 @@ Accepted と、15 節の提案値のオーナー確認後」。後者は 2026-10
 - 適用段（`apply_predicate_*_in_txn`）はまだ `id` 列値の `u64` を受けるため、実行器が候補の rowid を `legacy_id()` で変換して渡す境界を 1 箇所に残した（後続 #2197 で差し替え）。述語へ渡す `DmlCandidate.id` も同様。
 - 採番方式の表の分割実行 UPDATE／DELETE は従来どおり `0A000` で拒否され、台帳・ジョブ記録は作られない（`table23_allocated_table_partitioned_dml_is_rejected_without_side_effects`）。
 
+## 権限の再検査（Issue #1968）
+
+現在ロールが束縛済みで運用者権限を持たないセッションの分割実行は、各チャンクの write txn の取得直後（ジョブ記録・台帳照合・走査・
+適用より前）に、その txn から対象表の ACL を読んで UPDATE／DELETE（WHERE・RETURNING があれば +SELECT）を再判定する。
+再開（同じ `operation_id` の再送）とチャンクの途中での `REVOKE` の後に続行させないため。第 1 チャンクの拒否は commit 前で
+副作用なしの `42501`、途中の拒否は既存の部分完了の写像（`VD001`、原因クラス `42501`）。再 GRANT 後の再送で再開できる。
+NoSQL 表層の分割実行はセッションを取らないため再検査を渡さない（#1969 以降で扱う）。
+
 ## スコープ外・申し送り
 
 - `crates/` 配下のコード変更・実装（#1127〜#1131 の担当）

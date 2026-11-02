@@ -41,7 +41,7 @@ pub(crate) const MAX_READ_RELATION_REFS: usize = 256;
 /// 文が要求する読み取り側の権限。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReadRequirement {
-    /// 本ゲートの対象外（DML・COPY・DDL・セッション制御等。DML の権限は #1968、COPY は #1969）。
+    /// 本ゲートの対象外（DML・COPY・DDL・セッション制御等。DML の権限は `write.rs`、COPY は #1969）。
     NotApplicable,
     /// 参照するすべての relation に表単位の SELECT。
     Select,
@@ -81,8 +81,8 @@ pub(crate) fn classify(parsed: &ParsedSql) -> ReadRequirement {
                 NotApplicable
             }
         }
-        // DML の読み取り側（SELECT 元・FROM／USING・サブクエリ）と書き込みの権限は #1968 が本モジュールの
-        // 収集関数を再利用して結線する。COPY は #1969。
+        // DML の読み取り側（SELECT 元・FROM／USING・サブクエリ）と書き込みの権限は `write.rs`（#1968）が
+        // 本モジュールの収集・照会関数を再利用して判定する。COPY は #1969。
         ParsedSql::Insert(_)
         | ParsedSql::InsertSelect(_)
         | ParsedSql::DataModifyingCte(_)
@@ -253,7 +253,10 @@ pub(crate) struct ParsedScope<'a> {
 /// 等）がありうる。解析（`RelationHits`）が深さ 0 で relation として解決した名前は、収集器が除外したかに
 /// かかわらず必ず加える。ビューの展開中に引かれた基底表は記録の段で除かれており（ビュー所有者の権限で読む
 /// 扱い。ADR §12）、基底表と同名の別名・列名があっても検査対象に戻らない。
-fn gate_relation_names(resolved_tokens: &[Token], direct_relations: &[String]) -> Vec<String> {
+pub(super) fn gate_relation_names(
+    resolved_tokens: &[Token],
+    direct_relations: &[String],
+) -> Vec<String> {
     let mut names = crate::sql::search_path::resolved_relation_ref_names(resolved_tokens);
     for rel in direct_relations {
         if !names.contains(rel) {
@@ -263,7 +266,8 @@ fn gate_relation_names(resolved_tokens: &[Token], direct_relations: &[String]) -
     names
 }
 
-/// 解決済みの relation 名の並びに対する判定（表名を直接渡す HTTP 表層の入口と共有する）。
+/// 解決済みの relation 名の並びに対する判定（表名を直接渡す HTTP 表層の入口と共有する）。全名に同じ
+/// `required_bits` を課す。
 pub(super) fn require_relations(
     storage: &Storage,
     tenant: &str,
@@ -273,17 +277,43 @@ pub(super) fn require_relations(
     read_snap: Option<&redb::ReadTransaction>,
     parsed_relations: &[String],
 ) -> Result<(), SqlSurfaceError> {
-    let mut names: Vec<String> = Vec::new();
-    for name in candidates {
-        if !names.contains(name) {
-            names.push(name.clone());
+    let wants: Vec<(String, u16)> = candidates
+        .iter()
+        .map(|n| (n.clone(), required_bits))
+        .collect();
+    require_relations_bits(
+        storage,
+        tenant,
+        principal,
+        &wants,
+        read_snap,
+        parsed_relations,
+    )
+}
+
+/// relation ごとに必要ビットが異なる版の判定（#1968 の書き込み系ゲートと共有する唯一の ACL 照会点）。
+/// 同名は必要ビットを OR して 1 件にまとめ、件数の上限を ACL の照会より前に検査する（untrusted 入力）。
+pub(super) fn require_relations_bits(
+    storage: &Storage,
+    tenant: &str,
+    principal: &Principal,
+    wants: &[(String, u16)],
+    read_snap: Option<&redb::ReadTransaction>,
+    parsed_relations: &[String],
+) -> Result<(), SqlSurfaceError> {
+    let mut merged: Vec<(String, u16)> = Vec::new();
+    for (name, bits) in wants {
+        match merged.iter_mut().find(|(n, _)| n == name) {
+            Some((_, b)) => *b |= *bits,
+            None => merged.push((name.clone(), *bits)),
         }
-        if names.len() > MAX_READ_RELATION_REFS {
+        if merged.len() > MAX_READ_RELATION_REFS {
             return Err(SqlSurfaceError::payload_too_large(
                 "too many relation references",
             ));
         }
     }
+    let names: Vec<String> = merged.iter().map(|(n, _)| n.clone()).collect();
     if names.is_empty() {
         return Ok(());
     }
@@ -298,7 +328,7 @@ pub(super) fn require_relations(
         None => storage.relation_grant_bits(tenant, &names, role_id),
     }
     .map_err(crate::catalog::table_lookup_error)?;
-    for (name, granted) in names.iter().zip(bits) {
+    for ((name, required_bits), granted) in merged.iter().zip(bits) {
         let Some(granted) = granted else {
             // 準備済み文（Parse 済みで名前解決済みのトークン列）の参照先が消えている場合は、別セッションの
             // DROP 後に展開済みの文だけが残った状態であり、検査を省略すると SET ROLE 後のロールが
@@ -318,7 +348,7 @@ pub(super) fn require_relations(
         check(
             principal,
             PrivilegeTarget::Relation {
-                required_bits,
+                required_bits: *required_bits,
                 granted_bits: granted,
             },
         )?;

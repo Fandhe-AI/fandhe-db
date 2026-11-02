@@ -242,12 +242,12 @@ fn check_required(
             // 現在ロールが未束縛の主体（#1971 まで本番のセッションはすべてここ）。オブジェクト権限は判定しない。
             None => Ok(GateDecision::Allowed),
             // PUBLIC の予約 ID は主体になれない（`bound_principal` と同じく拒否）。
-            Some(0) => Err(SqlSurfaceError::InsufficientPrivilege),
+            Some(0) => Err(SqlSurfaceError::RelationPermissionDenied),
             Some(_) => {
                 if principal.ddl_allowed || (bits != 0 && granted_bits & bits == bits) {
                     Ok(GateDecision::Allowed)
                 } else {
-                    Err(SqlSurfaceError::InsufficientPrivilege)
+                    Err(SqlSurfaceError::RelationPermissionDenied)
                 }
             }
         },
@@ -321,6 +321,7 @@ pub(crate) fn is_owner_equivalent(session: &SessionState) -> bool {
 }
 
 pub(crate) mod read;
+pub(crate) mod write;
 
 #[cfg(test)]
 mod tests;

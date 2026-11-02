@@ -101,6 +101,9 @@ mod commit_log_tests;
 // 読み取り系の文の SELECT 権限検査（SQL-40・Issue #1967）。
 #[cfg(test)]
 mod select_privilege_tests;
+// 書き込み系の文の権限検査（SQL-40・Issue #1968）。
+#[cfg(test)]
+mod dml_privilege_tests;
 // SCHEMA 単位の GRANT／REVOKE と USAGE 検査（SQL-40・Issue #2234）。
 #[cfg(test)]
 mod schema_acl_tests;
@@ -5447,6 +5450,19 @@ impl EngineCore {
                     parsed_relations: &hits.recorded_names(),
                 },
             )?;
+            // SQL-40・Issue #1968: 書き込み系の文の対象表・参照先も同じ入口で判定する（台帳・制約・RLS より前）。
+            crate::sql::privilege_gate::write::require_write_privileges(
+                &self.storage,
+                tenant,
+                session,
+                &t,
+                resolver,
+                &parsed,
+                crate::sql::privilege_gate::read::ParsedScope {
+                    read_snap: Self::acl_snapshot_for(&parsed, read_snap),
+                    parsed_relations: &hits.recorded_names(),
+                },
+            )?;
         }
         Ok(parsed)
     }
@@ -7749,7 +7765,13 @@ impl EngineCore {
                 )
                 .map(|(outcome, _base_table)| outcome),
             ParsedSql::Truncate(stmt) => {
-                let outcome = self.execute_truncate_form(ctx, stmt)?;
+                let recheck =
+                    crate::sql::privilege_gate::write::RelationPrivilegeRecheck::for_session(
+                        session,
+                        ctx.tenant_id(),
+                        crate::catalog::privilege::PRIV_TRUNCATE,
+                    );
+                let outcome = self.execute_truncate_form(ctx, stmt, recheck.as_ref())?;
                 Ok(crate::sql::SqlOutcome::Truncate(outcome))
             }
             ParsedSql::Delete(stmt) => match stmt {
@@ -9064,12 +9086,20 @@ impl EngineCore {
                 // TRUNCATE トリガが書いた表も COMMIT 時の遅延 FK 検査の対象にする（Issue #1726）。
                 let trigger_scope =
                     crate::tenant::trigger_writes::TriggerWrittenTablesScope::enter();
+                // SQL-40・Issue #1968: CASCADE の連鎖後の最終集合を write txn 内で再判定する。
+                let recheck =
+                    crate::sql::privilege_gate::write::RelationPrivilegeRecheck::for_session(
+                        session,
+                        ctx.tenant_id(),
+                        crate::catalog::privilege::PRIV_TRUNCATE,
+                    );
                 let outcome = crate::sql::exec::execute_truncate_in(
                     crate::tenant::WriteTarget::InTxn(write_txn),
                     ctx,
                     stmt,
                     self.ledger_mode,
                     Some(&self.trigger_runtime),
+                    recheck.as_ref(),
                 )?;
                 // 全表に印を付ける（漏れると遅延 FK の COMMIT 時検査が取りこぼす。P0）。
                 // CASCADE（Issue #1644）で連鎖して空にした表も書き込み済みとして扱う。
@@ -14608,7 +14638,7 @@ impl EngineCore {
             partitioned: Some(clause),
         };
         let udfs = crate::sql::udf_call::UdfRegistry::default();
-        self.run_partitioned_update(ctx, &udfs, &validated, &schema, &limits)
+        self.run_partitioned_update(ctx, &udfs, &validated, &schema, &limits, None)
     }
 
     /// NoSQL 表層 `delete` op の分割実行修飾（Issue #1130）。
@@ -14650,7 +14680,7 @@ impl EngineCore {
             partitioned: Some(clause),
         };
         let udfs = crate::sql::udf_call::UdfRegistry::default();
-        self.run_partitioned_delete(ctx, &udfs, &validated, &schema, &limits)
+        self.run_partitioned_delete(ctx, &udfs, &validated, &schema, &limits, None)
     }
 
     /// NoSQL 表層 `show_partitioned_dml` op（Issue #1130・RLS-9・RECOVER-11）。
@@ -15966,7 +15996,8 @@ impl EngineCore {
         sql: &str,
     ) -> Result<crate::sql::exec::TruncateOutcome, crate::sql::allowlist::SqlSurfaceError> {
         let stmt = crate::sql::allowlist::validate_truncate(sql, &self.storage, self.ledger_mode)?;
-        self.execute_truncate_form(ctx, &stmt)
+        // 主体を持たない Rust API は連鎖後の権限を再判定しない（セッション経由の入口が判定する）。
+        self.execute_truncate_form(ctx, &stmt, None)
     }
 
     /// [`Self::execute_truncate_sql`]・[`Self::execute_sql_in_session`] の
@@ -15978,6 +16009,7 @@ impl EngineCore {
         &self,
         ctx: &PolicyContext,
         stmt: &crate::sql::allowlist::ValidatedTruncate,
+        privilege_recheck: Option<&crate::sql::privilege_gate::write::RelationPrivilegeRecheck>,
     ) -> Result<crate::sql::exec::TruncateOutcome, crate::sql::allowlist::SqlSurfaceError> {
         crate::sql::exec::execute_truncate_in(
             crate::tenant::WriteTarget::Autocommit(&self.storage),
@@ -15986,6 +16018,7 @@ impl EngineCore {
             self.ledger_mode,
             // TRUNCATE トリガ（Issue #1726）は通過証を渡す結線済み経路だけが発火する。
             Some(&self.trigger_runtime),
+            privilege_recheck,
         )
     }
 
@@ -16178,7 +16211,13 @@ impl EngineCore {
         let limits =
             crate::sql::partitioned::apply_chunk_override(clause, &self.partitioned_dml_limits)?;
         let schema = self.load_table_schema_for_dml(stmt.table_name())?;
-        self.run_partitioned_delete(ctx, session.udfs(), stmt, &schema, &limits)
+        // SQL-40・Issue #1968: 各チャンクの write txn 内で権限を再判定する（束縛済みの主体だけ）。
+        let recheck = crate::sql::privilege_gate::write::RelationPrivilegeRecheck::for_session(
+            session,
+            ctx.tenant_id(),
+            crate::sql::privilege_gate::write::partitioned_delete_bits(stmt),
+        );
+        self.run_partitioned_delete(ctx, session.udfs(), stmt, &schema, &limits, recheck)
     }
 
     /// 述語形 `UPDATE ... PARTITIONED [CHUNK n]`（Issue #1129・SQL-19）の実行 form。
@@ -16198,7 +16237,13 @@ impl EngineCore {
         let limits =
             crate::sql::partitioned::apply_chunk_override(clause, &self.partitioned_dml_limits)?;
         let schema = self.load_table_schema_for_dml(stmt.table_name())?;
-        self.run_partitioned_update(ctx, session.udfs(), stmt, &schema, &limits)
+        // SQL-40・Issue #1968: 各チャンクの write txn 内で権限を再判定する（束縛済みの主体だけ）。
+        let recheck = crate::sql::privilege_gate::write::RelationPrivilegeRecheck::for_session(
+            session,
+            ctx.tenant_id(),
+            crate::sql::privilege_gate::write::partitioned_update_bits(stmt),
+        );
+        self.run_partitioned_update(ctx, session.udfs(), stmt, &schema, &limits, recheck)
     }
 
     /// 分割実行 DELETE の束縛以降の共通本体（Issue #1130）。SQL 表層
@@ -16214,6 +16259,7 @@ impl EngineCore {
         stmt: &crate::sql::allowlist::ValidatedPredicateDelete,
         schema: &crate::catalog::TableSchema,
         limits: &crate::sql::parser::PartitionedDmlLimits,
+        privilege_recheck: Option<crate::sql::privilege_gate::write::RelationPrivilegeRecheck>,
     ) -> Result<crate::sql::exec::DeleteOutcome, crate::sql::allowlist::SqlSurfaceError> {
         // 多層防御: 外部で組み立てた文でも構成に関わらず operation_id 必須（Issue #1704）。
         crate::recovery::required_op_id::require_partitioned(stmt.operation_id())
@@ -16251,6 +16297,7 @@ impl EngineCore {
             limits,
             self.dml_limits.max_affected_rows,
             fixed_time,
+            privilege_recheck,
         )
     }
 
@@ -16263,6 +16310,7 @@ impl EngineCore {
         stmt: &crate::sql::allowlist::ValidatedPredicateUpdate,
         schema: &crate::catalog::TableSchema,
         limits: &crate::sql::parser::PartitionedDmlLimits,
+        privilege_recheck: Option<crate::sql::privilege_gate::write::RelationPrivilegeRecheck>,
     ) -> Result<crate::sql::exec::UpdateOutcome, crate::sql::allowlist::SqlSurfaceError> {
         // 多層防御: 外部で組み立てた文でも構成に関わらず operation_id 必須（Issue #1704）。
         crate::recovery::required_op_id::require_partitioned(stmt.operation_id())
@@ -16304,6 +16352,7 @@ impl EngineCore {
             limits,
             self.dml_limits.max_affected_rows,
             fixed_time,
+            privilege_recheck,
         )
     }
 

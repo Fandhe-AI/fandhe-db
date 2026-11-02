@@ -220,6 +220,7 @@ fn drive_delete(
         &mut Hooks {
             clock: &Instant::now,
             after_chunk: Some(hook),
+            privilege: None,
         },
     )
 }

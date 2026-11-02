@@ -95,6 +95,8 @@ fn fixture(tag: &str) -> (EngineCore, CleanupGuard, SessionState, SessionState) 
         &mut o,
         "CREATE TABLE t (id BIGINT PRIMARY KEY, n BIGINT)",
     );
+    // 表単位の INSERT・SELECT（Issue #1968）は SEQUENCE の権限と別軸なので、SEQUENCE の検査だけを観測できるよう PUBLIC へ付与する。
+    ok(&core, &mut o, "GRANT INSERT, SELECT ON t TO PUBLIC");
     (core, g, o, bound(alice, false))
 }
 
@@ -130,6 +132,7 @@ fn later_column_privilege_denial_leaves_earlier_sequence_untouched() {
         &mut o,
         "CREATE TABLE t2 (id BIGINT PRIMARY KEY, a BIGINT, b BIGINT)",
     );
+    ok(&core, &mut o, "GRANT INSERT, SELECT ON t2 TO PUBLIC");
     ok(&core, &mut o, "GRANT USAGE ON SEQUENCE q TO alice");
     ok(&core, &mut o, "GRANT SELECT ON SEQUENCE q TO alice");
     let sql = "INSERT INTO t2 (id, a, b) VALUES (1, nextval('q'), nextval('q2'))";
@@ -194,11 +197,13 @@ fn implicit_owned_sequences_need_no_sequence_privilege() {
         &mut o,
         "CREATE TABLE ti (id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, v TEXT)",
     );
+    ok(&core, &mut o, "GRANT INSERT, SELECT ON ti TO PUBLIC");
     ok(
         &core,
         &mut o,
         "CREATE TABLE ts (id BIGSERIAL PRIMARY KEY, v TEXT)",
     );
+    ok(&core, &mut o, "GRANT INSERT, SELECT ON ts TO PUBLIC");
     ok(&core, &mut a, "INSERT INTO ti (v) VALUES ('a')");
     ok(&core, &mut a, "INSERT INTO ti DEFAULT VALUES");
     ok(&core, &mut a, "INSERT INTO ts (v) VALUES ('a')");
@@ -223,6 +228,7 @@ fn implicit_owned_sequences_need_no_sequence_privilege() {
         &mut o,
         "CREATE TABLE td (n BIGINT DEFAULT nextval('u'), tag TEXT)",
     );
+    ok(&core, &mut o, "GRANT INSERT, SELECT ON td TO PUBLIC");
     assert_eq!(
         code(&core, &mut a, "INSERT INTO td (tag) VALUES ('x')"),
         "42501"
