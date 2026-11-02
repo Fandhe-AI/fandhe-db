@@ -1173,7 +1173,16 @@ impl<'e> SessionTransaction<'e> {
             Ok(kind) => {
                 if let TxnState::Active(active) = &mut self.state {
                     let wm = active.cursors.next_id();
-                    active.savepoints.push(name, kind, session, wm);
+                    // 巻き戻せる savepoint だけ書き込み記録を複製する（ROLLBACK TO で復元。Issue #1945）。
+                    let marks =
+                        (kind == crate::sql::savepoint::SavepointKind::Restorable).then(|| {
+                            crate::sql::savepoint::WriteMarks {
+                                has_writes: active.has_writes,
+                                written_tables: active.written_tables.clone(),
+                                written_by_tenant: active.written_by_tenant.clone(),
+                            }
+                        });
+                    active.savepoints.push(name, kind, session, wm, marks);
                 }
                 Ok(())
             }
@@ -1244,8 +1253,17 @@ impl<'e> SessionTransaction<'e> {
     ///
     /// セッション状態は savepoint 作成時点の複製へ戻す。
     ///
-    /// 復元後も `has_writes`・`written_tables`・`written_by_tenant`・`seen_operation_ids`・
-    /// commit 記録の足跡は実際より大きい集合のまま残る（いずれも安全側。精度は #1944・#1945）。
+    /// Tx 内の書き込み記録（`has_writes`・`written_tables`・`written_by_tenant`）は savepoint
+    /// 作成時点の複製へ戻す（Issue #1945）。これにより復元後の読み取りは確定スナップショット
+    /// （世代キーのキャッシュ・索引）へ戻り、全書き込みを巻き戻した Tx の `COMMIT` は空の
+    /// write txn を commit せず（グローバル世代を進めない）、遅延 FK の走査範囲も実際の書き込みに
+    /// 一致する。記録を縮める前に、redb 復元後の表世代が確定状態と一致すること（世代差分ゼロ）を
+    /// 突き合わせ、不一致は `XX000`（fail-closed）。
+    ///
+    /// 戻さないもの: `seen_operation_ids`（Issue #1944）、commit 記録の足跡（巻き戻した行の足跡が
+    /// 残り、他の明示 Tx が余分に `40001` を受けうる安全側の過剰。偽陰性は生まない）、
+    /// 採番状態（`SequenceAllocator`・`currval`。PostgreSQL と同じく非トランザクショナルで、
+    /// 全体 `ROLLBACK` と同じ扱い）。
     pub fn rollback_to_savepoint(
         &mut self,
         name: &str,
@@ -1298,6 +1316,12 @@ impl<'e> SessionTransaction<'e> {
             writer
                 .restore_savepoint(base)
                 .map_err(|_| internal_error())?;
+            // 突き合わせ（fail-closed）: 復元後の表世代は確定状態と一致するはず。差分が残る・
+            // 世代の読み取りに失敗する場合は不変条件違反なので、記録を縮める前に拒否する。
+            let residual = collect_dirty_tables(active.storage, writer, &HashSet::new())?;
+            if !residual.is_empty() {
+                return Err(internal_error());
+            }
         }
         // セッション状態（TimeZone・search_path・セッション UDF 等）も savepoint 時点へ戻す。
         // redb の巻き戻し後に行い、失敗経路ではセッションを変更しない。
@@ -1311,6 +1335,13 @@ impl<'e> SessionTransaction<'e> {
             return Err(internal_error());
         };
         active.cursors.close_declared_since(wm);
+        // 書き込み記録を savepoint 時点へ戻す（Issue #1945）。`truncate_after` の前に読む。
+        let Some(marks) = active.savepoints.write_marks_at(pos).cloned() else {
+            return Err(internal_error());
+        };
+        active.has_writes = marks.has_writes;
+        active.written_tables = marks.written_tables;
+        active.written_by_tenant = marks.written_by_tenant;
         active.savepoints.truncate_after(pos);
         Ok(())
     }
@@ -2818,6 +2849,49 @@ mod tests {
         let fresh = storage.db().begin_read().expect("begin_read");
         let snapshot = txn.read_snapshot().expect("snapshot");
         assert_eq!(read_gen(snapshot), read_gen(&fresh));
+    }
+
+    /// Issue #1945: writer 取得後に記録した書き込みは `ROLLBACK TO` で savepoint 時点へ戻り、
+    /// 読み取りは確定スナップショットへ復帰し、全巻き戻し後の `COMMIT` はグローバル世代を進めない。
+    #[test]
+    fn rollback_to_restores_write_marks_and_commit_keeps_generation() {
+        let (storage, _g) = open_test_storage("txn-1945-marks");
+        let (mut txn, mut session) = explicit_txn(&storage);
+        txn.savepoint("a", &session).unwrap();
+        txn.ensure_writer(&test_ctx()).unwrap();
+        txn.mark_written("tenant-a", "documents");
+        assert!(txn.table_already_written("documents"));
+        let before = storage.current_generation().unwrap();
+        txn.rollback_to_savepoint("a", &mut session).unwrap();
+        assert_eq!(txn.status(), TransactionStatus::InTransaction);
+        assert!(txn.dirty_tables().unwrap().is_empty());
+        assert!(!txn.table_already_written("documents"));
+        // 対象自身は残り、2 回目の巻き戻しも成功する（ハンドルが残っていない）。
+        txn.rollback_to_savepoint("a", &mut session).unwrap();
+        txn.commit(&mut session).unwrap();
+        assert_eq!(storage.current_generation().unwrap(), before);
+    }
+
+    /// Issue #1945: 復元後に書き直せば記録が立て直され、`release` は記録を変えない。
+    #[test]
+    fn release_keeps_write_marks_and_rewrite_after_rollback_marks_again() {
+        let (storage, _g) = open_test_storage("txn-1945-release");
+        let (mut txn, mut session) = explicit_txn(&storage);
+        txn.ensure_writer(&test_ctx()).unwrap();
+        txn.mark_written("tenant-a", "documents");
+        txn.savepoint("a", &session).unwrap();
+        assert!(txn.table_already_written("documents"));
+        txn.release_savepoint("a").unwrap();
+        assert!(txn.table_already_written("documents"));
+        txn.rollback(&mut session).unwrap();
+
+        let (mut txn, mut session) = explicit_txn(&storage);
+        txn.savepoint("a", &session).unwrap();
+        txn.ensure_writer(&test_ctx()).unwrap();
+        txn.mark_written("tenant-a", "documents");
+        txn.rollback_to_savepoint("a", &mut session).unwrap();
+        txn.mark_written("tenant-a", "documents");
+        assert!(txn.table_already_written("documents"));
     }
 
     /// writer 未取得のまま書き込み記録がある状態は不変条件違反で、COMMIT・dirty 判定とも
