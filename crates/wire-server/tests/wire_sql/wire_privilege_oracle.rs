@@ -185,18 +185,19 @@ fn assert_no_leak(sql: &str, body: &[u8]) {
     }
 }
 
-/// フィールド種別が最小集合（`D`・`H` 等の補足を含まない）であること。
+/// フィールド種別が許可集合 `{S, V, C, M}` に収まり、`C`・`M` を含むこと（許可リスト方式）。
+/// `D`・`H`・`q`・`F`・`L`・`R` 等、将来加わりうる補足フィールドも漏れなく検出する。
 fn assert_minimal_fields(sql: &str, body: &[u8]) {
     let kinds: BTreeSet<u8> = fields(body).into_iter().map(|(t, _)| t).collect();
     assert!(
         kinds.contains(&b'C') && kinds.contains(&b'M'),
         "{sql}: {kinds:?}"
     );
-    for forbidden in *b"DHtcdn" {
+    for kind in &kinds {
         assert!(
-            !kinds.contains(&forbidden),
+            b"SVCM".contains(kind),
             "{sql}: unexpected field {} in {kinds:?}",
-            forbidden as char
+            *kind as char
         );
     }
 }
@@ -279,4 +280,15 @@ fn wire_leak_checkers_detect_fabricated_violations() {
     with_detail.extend_from_slice(b"owned by tenant-b\0\0");
     assert!(std::panic::catch_unwind(|| assert_minimal_fields("SELECT 1", &with_detail)).is_err());
     assert!(std::panic::catch_unwind(|| assert_no_leak("SELECT 1", &with_detail)).is_err());
+    // 許可集合外の種別（`q`・`F`・`L`・`R`）は 1 つでも加われば検出する。
+    for extra in *b"qFLR" {
+        let mut with_extra = body[..body.len() - 1].to_vec();
+        with_extra.push(extra);
+        with_extra.extend_from_slice(b"x\0\0");
+        assert!(
+            std::panic::catch_unwind(|| assert_minimal_fields("SELECT 1", &with_extra)).is_err(),
+            "kind {} not detected",
+            extra as char
+        );
+    }
 }
