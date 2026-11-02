@@ -508,7 +508,8 @@ Failed { session_at_begin: SessionState, expired: bool } }`）。`ActiveTxn` は
   `seen_operation_ids` と照合し、一致すれば `25000`
   （`InvalidTransactionState`）で `Failed` へ遷移する。台帳は自トランザクションの
   未 commit エントリを見て `23505` を返してしまうため、それより先に検査する。
-  テーブルを問わず同じ ID を拒否する（保守的な側に倒す）。
+  テーブルを問わず同じ ID を拒否する（保守的な側に倒す）。`ROLLBACK TO` で巻き戻した範囲の
+  ID は登録から外れ、同じ Tx 内で再利用できる（「savepoint 巻き戻しと冪等台帳」節）。
 
 ### 5. 上限（実装既定値。spec 由来の数値ではない）
 
@@ -956,15 +957,34 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
   - 復元後に作る savepoint は redb が dirty になるため `Unrestorable` になる（保守側の制約）。
     `LOCK TABLE` などで writer を先に取っても、テーブルを開くため同様に `Unrestorable`。
 - 付随状態: 復元後も `has_writes`・`written_tables`・`written_by_tenant`・
-  `seen_operation_ids`・commit 記録の足跡は実際より大きい集合のまま残す。読み取りは
+  commit 記録の足跡は実際より大きい集合のまま残す（`seen_operation_ids` は #1944 で水位まで戻す）。読み取りは
   writer 経由のまま復元後の root を見る・遅延 FK 検査の走査範囲は広いだけ・COMMIT は
   内容の変わらない root を確定するだけ・他 Tx が余分に `40001` を受けうる、といずれも
-  安全側。精度の改善は #1944（台帳）・#1945（Tx 内キャッシュ・世代）、カーソルは #1946、
+  安全側。精度の改善は #1945（Tx 内キャッシュ・世代）、カーソルは #1946、
   `Failed` からの復帰は #1947 の範囲。
 - 退けた案: Tx の途中で `Durability::None` の commit をして新しい writer で savepoint を取る
   案。他セッションに未確定の状態が見え、分離が壊れるため退けた。
 - テスト: `crates/engine/tests/sql_t40_up/sql69_savepoint_rollback.rs`・
   `crates/wire-server/tests/wire_proto/sql69_savepoint_syntax.rs`、単体は
+  `sql::savepoint`・`sql::transaction`。
+
+## savepoint 巻き戻しと冪等台帳（Issue #1944・SQL-69・RECOVER-1 ポインタ）
+
+`ROLLBACK TO` の後に冪等台帳と矛盾しないよう、永続側とメモリ側を分けて扱う。
+
+- 永続の台帳（`op_ledger`・`last_op`。RECOVER-2・RECOVER-7）は行と同じ共有 redb writer に
+  記録される。#1943 の `restore_savepoint(基底)` が writer 全体を戻すので、巻き戻した文の
+  台帳エントリは同時に消える。台帳テーブルを別途削除する処理は置かない（二重の取り消し・
+  テナント境界の問題を避ける）。`COMMIT` 後に巻き戻した文の記録が残らないことはテストで固定する。
+- メモリ側の `ActiveTxn.seen_operation_ids` は登録順ログと照合用集合で表す。`SAVEPOINT` が
+  ログ長を水位として記録し、`ROLLBACK TO` が水位より後の ID を集合から外す。SAVEPOINT は O(1)
+  で、ログ長は文数上限で有界になる。
+- 判断: 巻き戻した ID は同じ Tx 内で再利用できる。永続の台帳も同じ点まで戻っており、巻き戻した
+  文は未確定なので、内容が異なる再実行も新しい記録として受理する。savepoint より前に登録した
+  ID は従来どおり `25000`。`RELEASE` は登録を変えない。文数カウンタは戻さない（上限を保つ）。
+- 順序と fail-closed: 戻すのは `restore_savepoint` 成功後の経路だけで、水位は `truncate_after`
+  の前に読む。`Unrestorable`・一時表・redb エラー・水位欠落は何も戻さず Tx を `Failed` にする。
+- テスト: `crates/engine/tests/sql_t40_up/sql69_savepoint_ledger.rs`、単体は
   `sql::savepoint`・`sql::transaction`。
 
 ## READ ONLY での書き込み拒否（SQL-38 (3)・ERR-6・Issue #1934）
