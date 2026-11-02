@@ -689,7 +689,13 @@ pub(crate) fn rewrite_relation_names_full(
     }
     match deferred {
         // 列修飾が残る文は従来の `42601`（パーサー判定）を保つため、保留した解決エラーは返さない。
-        Some(_) if residual_column_qualifier => Ok(info),
+        // ただし権限不足（`42501`）は列修飾の有無で `42601` に化けさせない（USAGE の拒否を隠さない）。
+        Some(e)
+            if residual_column_qualifier
+                && !matches!(e, SqlSurfaceError::InsufficientPrivilege) =>
+        {
+            Ok(info)
+        }
         Some(e) => Err(e),
         None => Ok(info),
     }

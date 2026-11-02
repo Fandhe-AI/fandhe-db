@@ -465,6 +465,32 @@ pub(crate) fn enumerate_schema_objects_in_txn<R: ReadSource>(
     Ok(objects)
 }
 
+/// SCHEMA `schema_id` 配下の relation（表・ビュー・matview）のキーを列挙する（`GRANT ... ON ALL TABLES IN
+/// SCHEMA` の展開元。Issue #2234）。SEQUENCE・索引・型は含めない（PostgreSQL の `ALL TABLES` と同じ）。
+/// 呼び出し元の write txn のスナップショットで走査するため、「実行時点で既にあるもの」だけを返す。各種別は
+/// [`MAX_LIST_TABLES`] 件で打ち切り（超過は `Invalid`）、重複は除く。
+pub(crate) fn schema_relation_keys_in_txn<R: ReadSource>(
+    src: &R,
+    schema_id: u64,
+) -> Result<Vec<String>> {
+    let start = RelationKey::schema_prefix(schema_id);
+    let end = RelationKey::schema_prefix_end(schema_id);
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for def in [
+        CATALOG_TABLE,
+        VIEWS_TABLE,
+        super::materialized::MATERIALIZED_VIEWS_TABLE,
+    ] {
+        for key in str_keys_in_range(src, def, &start, &end)? {
+            if seen.insert(key.clone()) {
+                out.push(key);
+            }
+        }
+    }
+    Ok(out)
+}
+
 impl Storage {
     /// `tenant_id` に SCHEMA `name` を作る。判定順は識別子 → 予約名（`IF NOT EXISTS` より先。
     /// `42939`）→ 組み込み名・同名の既存（`IF NOT EXISTS` なら成功の no-op、無ければ
@@ -552,6 +578,8 @@ impl Storage {
             let mut table = write_txn.open_table(SCHEMAS_TABLE)?;
             table.remove((tenant_id, name))?;
         }
+        // SCHEMA 単位の ACL 行を同じ txn で掃除する（残ると `DROP ROLE` が `2BP01` で永久に拒否される。#2234）。
+        super::privilege::remove_schema_acl_in_txn(&write_txn, tenant_id, id)?;
         crate::recovery::commit_boundary::commit(write_txn)
             .map_err(super::convert_storage_error)?;
         Ok(DropSchemaResult::Dropped)
@@ -646,6 +674,8 @@ impl Storage {
             let mut table = write_txn.open_table(SCHEMAS_TABLE)?;
             table.remove((tenant_id, name))?;
         }
+        // SCHEMA 単位の ACL 行も同じ txn で掃除する（#2234）。
+        super::privilege::remove_schema_acl_in_txn(&write_txn, tenant_id, id)?;
         let allocator = self.sequence_allocator();
         crate::recovery::commit_boundary::commit_and_finish(write_txn, (), |()| {
             for id in &dropped_sequence_ids {

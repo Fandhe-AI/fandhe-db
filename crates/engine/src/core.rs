@@ -107,6 +107,9 @@ mod dml_privilege_tests;
 // COPY と HTTP（NoSQL）表層の bound 書き込み入口の権限検査（SQL-40・Issue #1969）。
 #[cfg(test)]
 mod copy_privilege_tests;
+// SCHEMA 単位の GRANT／REVOKE と USAGE 検査（SQL-40・Issue #2234）。
+#[cfg(test)]
+mod schema_acl_tests;
 #[cfg(test)]
 mod serialization_failure_tests;
 // `40001` の可視性境界・副作用ゼロの内部観測（Issue #2407。ポインタ: ERR-7・SQL-38・TABLE-3）。
@@ -5094,6 +5097,84 @@ impl EngineCore {
         )
     }
 
+    /// [`Self::schema_resolver`] のセッション（主体）付き版（Issue #2234、設計記録 K1・K3）。解決した SCHEMA
+    /// に対して束縛ロールの USAGE を検査する。順序は「自テナント内の解決 → 権限検査」で、他テナントの
+    /// SCHEMA・不在は解決器が先に `None`（`3F000`）にする（権限の有無が存在オラクルにならない）。USAGE が
+    /// 無ければ `42501`。判定を飛ばす主体（未束縛・所有者相当）は `sql::schema_privilege` が決める。
+    pub(crate) fn schema_resolver_for<'a>(
+        &'a self,
+        ctx: &'a PolicyContext,
+        session: &'a crate::sql::mode::SessionState,
+    ) -> impl Fn(&str) -> Result<Option<u64>, crate::sql::allowlist::SqlSurfaceError> + 'a {
+        move |schema: &str| {
+            let id = self
+                .storage
+                .schema_id(ctx.tenant_id(), schema)
+                .map_err(crate::catalog::table_lookup_error)?;
+            if let Some(id) = id {
+                self.check_schema_usage_for(ctx.tenant_id(), session, id)?;
+            }
+            Ok(id)
+        }
+    }
+
+    /// 解決済みの SCHEMA `schema_id` への USAGE を検査する（解決器・Bind の再検査・`search_path` の probe が
+    /// 共有する唯一の呼び出し点）。
+    pub(crate) fn check_schema_usage_for(
+        &self,
+        tenant_id: &str,
+        session: &crate::sql::mode::SessionState,
+        schema_id: u64,
+    ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+        crate::sql::schema_privilege::check_schema_usage(session, &|role| {
+            self.storage
+                .schema_privileges(tenant_id, schema_id, &[role])
+                .map_err(crate::catalog::table_lookup_error)
+        })
+    }
+
+    /// `search_path` の要素の可視性 probe（`current_schema()`・`current_schemas()`）。自テナントに在り、かつ
+    /// USAGE を持つ SCHEMA だけが「在る」。USAGE の無い SCHEMA は値の列挙では黙って飛ばす（設計記録 K4）。
+    /// 作成先の判定（`creation_target`）は飛ばさず `42501` にする。他テナントの SCHEMA は不在と同じ。
+    pub(crate) fn schema_visible_for(
+        &self,
+        ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
+        schema: &str,
+    ) -> Result<bool, crate::sql::allowlist::SqlSurfaceError> {
+        let Some(id) = self
+            .storage
+            .schema_id(ctx.tenant_id(), schema)
+            .map_err(crate::catalog::table_lookup_error)?
+        else {
+            return Ok(false);
+        };
+        match self.check_schema_usage_for(ctx.tenant_id(), session, id) {
+            Ok(()) => Ok(true),
+            Err(crate::sql::allowlist::SqlSurfaceError::InsufficientPrivilege) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// `creation_target` 用の probe。自テナントに在る SCHEMA に USAGE が無ければ `42501`（飛ばさない。
+    /// 他テナント・不在は `false` で、権限の有無が存在オラクルにならない。Issue #2234、設計記録 K4）。
+    fn schema_exists_requiring_usage(
+        &self,
+        ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
+        schema: &str,
+    ) -> Result<bool, crate::sql::allowlist::SqlSurfaceError> {
+        let Some(id) = self
+            .storage
+            .schema_id(ctx.tenant_id(), schema)
+            .map_err(crate::catalog::table_lookup_error)?
+        else {
+            return Ok(false);
+        };
+        self.check_schema_usage_for(ctx.tenant_id(), session, id)?;
+        Ok(true)
+    }
+
     /// 永続オブジェクトを作る DDL の作成先を `search_path` から判定する（TABLE-27・Issue #1715）。
     /// DDL 権限ゲートの直後・既存名の判定より前に呼ぶ（`42501` → `3F000`／`0A000` → `42P07` の順）。
     /// `explicit_public` は `public.` で明示修飾された作成（判定を飛ばして `public` へ作る）。
@@ -5108,15 +5189,26 @@ impl EngineCore {
     ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
         // `schema.name` で明示修飾された作成（解決済みの内部キー `#<id>.<name>`。キーを作れるのは
         // 名前解決器だけ）は作成先が文中で確定しているので、`search_path` による作成先判定を飛ばす。
-        if explicit_public || created_name.starts_with('#') {
+        if created_name.starts_with('#') {
+            // 作成先が SCHEMA で確定している作成は CREATE 権限を検査する（Issue #2234、設計記録 K5）。
+            // `ServerDdl` ゲートが必要条件として先に通るため現時点では所有者相当だけが来て観測上は
+            // 変わらない。置き換えは所有者の機構（#2236）・認証主体の束縛（#1971）の後。
+            if let Ok(crate::catalog::namespace::RelationKey::InSchema { schema_id, .. }) =
+                crate::catalog::namespace::RelationKey::parse(created_name)
+            {
+                crate::sql::schema_privilege::check_schema_create(session, &|role| {
+                    self.storage
+                        .schema_privileges(ctx.tenant_id(), schema_id, &[role])
+                        .map_err(crate::catalog::table_lookup_error)
+                })?;
+            }
             return Ok(());
         }
-        let probe = |schema: &str| {
-            self.storage
-                .schema_id(ctx.tenant_id(), schema)
-                .map(|id| id.is_some())
-                .map_err(crate::catalog::table_lookup_error)
-        };
+        if explicit_public {
+            return Ok(());
+        }
+        // 作成先の判定では、path 上の USAGE の無い SCHEMA を飛ばさず `42501` にする（受入基準。K4）。
+        let probe = |schema: &str| self.schema_exists_requiring_usage(ctx, session, schema);
         crate::sql::search_path::creation_target(session, &probe).map(|_| ())
     }
 
@@ -8248,7 +8340,7 @@ impl EngineCore {
         // TimeZone を parse 区間へも張る（ゾーン無し `TIMESTAMPTZ` リテラル・`AT LOCAL`。Issue #1576）。
         let parsed = {
             let _session_tz_scope = session_time_zone_scope(session);
-            let resolver = self.schema_resolver(ctx);
+            let resolver = self.schema_resolver_for(ctx, session);
             self.parse_tokens_gated(tokens, session, ctx.tenant_id(), Some(&resolver), None)?
         };
         // 一時カタログに対する細かいゲートは上の parse で通過済みのため、粗いゲートを持たない
@@ -8346,7 +8438,7 @@ impl EngineCore {
                     crate::sql::lock_table::validate_lock_structure_unresolved(&tokens)?;
                     return Err(crate::sql::allowlist::SqlSurfaceError::NoActiveSqlTransaction);
                 }
-                let resolver = self.schema_resolver(ctx);
+                let resolver = self.schema_resolver_for(ctx, session);
                 // 明示トランザクションの writer 取得前は、読み取り文の検証・ビュー展開を
                 // `BEGIN` 時点のスナップショットのカタログで行う（Issue #2403）。
                 let read_snap = if txn.status()
@@ -8486,7 +8578,7 @@ impl EngineCore {
                     };
                     match ctrl.control {
                         TxnControl::Savepoint => {
-                            txn.savepoint(name)?;
+                            txn.savepoint(name, session)?;
                             Ok(crate::sql::SqlOutcome::Savepoint)
                         }
                         TxnControl::ReleaseSavepoint => {
@@ -8494,8 +8586,8 @@ impl EngineCore {
                             Ok(crate::sql::SqlOutcome::ReleaseSavepoint)
                         }
                         _ => {
-                            txn.rollback_to_savepoint(name)?;
-                            // 成功経路は #1941 まで存在しない（常に Err）。
+                            txn.rollback_to_savepoint(name, session)?;
+                            // 成功時は PostgreSQL と同じ `ROLLBACK` タグ（Issue #1943。巻き戻し不能は Err）。
                             Ok(crate::sql::SqlOutcome::Rollback)
                         }
                     }
@@ -10998,12 +11090,7 @@ impl EngineCore {
                 // 以下の get で確かめてからスコープを張る（含まない文は照会コストゼロ。
                 // 他テナントの SCHEMA は不在と同じ扱い。TABLE-27 (7)・Issue #1718）。
                 let _schema_fn = if crate::sql::const_select::uses_schema_fn(&validated) {
-                    let probe = |schema: &str| {
-                        self.storage
-                            .schema_id(ctx.tenant_id(), schema)
-                            .map(|id| id.is_some())
-                            .map_err(crate::catalog::table_lookup_error)
-                    };
+                    let probe = |schema: &str| self.schema_visible_for(ctx, session, schema);
                     let values =
                         crate::sql::search_path::resolve_schema_functions(session, &probe)?;
                     Some(crate::sql::search_path::SchemaFnScope::enter(
@@ -13601,7 +13688,7 @@ impl EngineCore {
         )? {
             return Ok(plan);
         }
-        let resolver = self.schema_resolver(ctx);
+        let resolver = self.schema_resolver_for(ctx, session);
         let copy_tokens =
             crate::sql::relation_name::tokenize_resolved_with(sql, false, Some(&resolver))?;
         let stmt = crate::sql::allowlist::validate_copy_tokens(
@@ -13788,7 +13875,7 @@ impl EngineCore {
         if let Some(plan) = self.begin_copy_temp(ctx, session, Some(&mut *txn), sql)? {
             return Ok(plan);
         }
-        let resolver = self.schema_resolver(ctx);
+        let resolver = self.schema_resolver_for(ctx, session);
         let copy_tokens =
             crate::sql::relation_name::tokenize_resolved_with(sql, false, Some(&resolver))?;
         // `COPY FROM`（書き込み）の検証・schema lookup は読み取りではないので読み取り集合へ記録しない
