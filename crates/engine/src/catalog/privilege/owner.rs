@@ -136,7 +136,9 @@ pub(crate) fn is_owner_in_txn<R: ReadSource>(
     object: &PrivilegeObject,
     role_id: u64,
 ) -> Result<bool> {
-    if role_id == 0 {
+    // 所有者を持てない種別（SEQUENCE）は常に「所有者でない」。ACL（GRANT OPTION・運用者権限）の
+    // 判定だけで進めるため、`owner_components` の Invalid を GRANT／REVOKE へ伝播させない。
+    if role_id == 0 || matches!(object, PrivilegeObject::Sequence(_)) {
         return Ok(false);
     }
     Ok(owner_of_in_txn(src, tenant, object)? == Some(role_id))
