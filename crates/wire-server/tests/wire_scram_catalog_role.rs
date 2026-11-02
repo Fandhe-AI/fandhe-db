@@ -190,6 +190,17 @@ fn auth_code(body: &[u8]) -> i32 {
 
 /// 生バイトの SCRAM クライアント（RFC 5802）。`password` の正誤は呼び出し側が決める。
 fn scram_login(addr: std::net::SocketAddr, user: &str, password: &[u8]) -> Login {
+    scram_login_with_hook(addr, user, password, &|| {})
+}
+
+/// [`scram_login`] に、server-first を受け取った後（client-final を送る前）に走らせる処理を足したもの。
+/// 認証の待機中にロールの属性が変わる状況を作るために使う。
+fn scram_login_with_hook(
+    addr: std::net::SocketAddr,
+    user: &str,
+    password: &[u8],
+    after_server_first: &dyn Fn(),
+) -> Login {
     let mut stream = TcpStream::connect(addr).expect("connect");
     stream
         .set_read_timeout(Some(Duration::from_secs(20)))
@@ -239,6 +250,8 @@ fn scram_login(addr: std::net::SocketAddr, user: &str, password: &[u8]) -> Login
             iterations = v.parse().expect("iterations");
         }
     }
+
+    after_server_first();
 
     let client_final_no_proof = format!("c={},r={nonce}", base64_std::encode(b"n,,")).into_bytes();
     let mut auth_message = client_first_bare.clone();
@@ -450,4 +463,46 @@ fn malformed_identifier_is_treated_like_unknown_user() {
     assert!(!after_ok);
     assert_eq!(sqlstate(&body), "28P01");
     assert!(elapsed >= wire_server::auth::AUTH_FAILURE_DELAY);
+}
+
+/// client-final の待機中にロールの属性が変わった場合、検証の成功後の再取得で拒否される
+/// （待機前の古い値で接続を許可しない。Issue #2233）。
+#[test]
+fn attributes_changed_while_waiting_are_rechecked() {
+    // NOLOGIN への変更は AuthenticationOk の後の 28000。
+    let f = Fixture::start("recheck-nologin");
+    f.sql(TENANT, "CREATE ROLE app LOGIN PASSWORD 'pw-app'");
+    let ident = f.ident(TENANT, "app");
+    let l = scram_login_with_hook(f.addr, &ident, b"pw-app", &|| {
+        f.sql(TENANT, "ALTER ROLE app NOLOGIN");
+    });
+    let (body, after_ok, _, _) = expect_rejected(l);
+    assert!(after_ok);
+    assert_eq!(sqlstate(&body), "28000");
+
+    // CONNECTION LIMIT 0 への変更は 53300。
+    let f = Fixture::start("recheck-limit");
+    f.sql(TENANT, "CREATE ROLE app LOGIN PASSWORD 'pw-app'");
+    let ident = f.ident(TENANT, "app");
+    let l = scram_login_with_hook(f.addr, &ident, b"pw-app", &|| {
+        f.sql(TENANT, "ALTER ROLE app CONNECTION LIMIT 0");
+    });
+    let (body, after_ok, _, _) = expect_rejected(l);
+    assert!(after_ok);
+    assert_eq!(sqlstate(&body), "53300");
+
+    // 待機中の期限切れ・削除・パスワード変更は通常の 28P01（存在を区別させない）。
+    for (label, stmt) in [
+        ("expired", "ALTER ROLE app VALID UNTIL '2000-01-01'"),
+        ("dropped", "DROP ROLE app"),
+        ("password", "ALTER ROLE app PASSWORD 'pw-new'"),
+    ] {
+        let f = Fixture::start(&format!("recheck-{label}"));
+        f.sql(TENANT, "CREATE ROLE app LOGIN PASSWORD 'pw-app'");
+        let ident = f.ident(TENANT, "app");
+        let l = scram_login_with_hook(f.addr, &ident, b"pw-app", &|| f.sql(TENANT, stmt));
+        let (body, after_ok, _, _) = expect_rejected(l);
+        assert!(!after_ok, "{label}");
+        assert_eq!(sqlstate(&body), "28P01", "{label}");
+    }
 }

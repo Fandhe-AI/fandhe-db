@@ -133,6 +133,18 @@ fn resolve_valid_until(
     if literal.trim().eq_ignore_ascii_case("infinity") {
         return Ok(None);
     }
+    // 日付だけの書式（`'2030-01-01'`）は PostgreSQL と同じくセッション TimeZone の当日 0 時として扱う。
+    if let Ok(days) = crate::datetime::parse_date(literal.trim()) {
+        let naive = i64::from(days).saturating_mul(crate::datetime::MICROS_PER_DAY);
+        return session
+            .time_zone()
+            .local_to_utc_micros(naive)
+            .filter(|m| crate::datetime::validate_timestamptz_micros(*m))
+            .map(Some)
+            .ok_or_else(|| {
+                SqlSurfaceError::datetime_field_overflow("VALID UNTIL value is out of range")
+            });
+    }
     match crate::datetime::parse_timestamptz(literal, session.time_zone()) {
         Ok(micros) => Ok(Some(micros)),
         Err(TimestampTzLiteralError::Literal(DateTimeLiteralError::Format(_))) => Err(

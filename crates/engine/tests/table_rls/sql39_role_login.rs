@@ -139,3 +139,24 @@ fn sync_login_names_is_idempotent_on_current_db() {
     ok(&core, "t", "CREATE ROLE a LOGIN");
     assert_eq!(core.sync_login_names().expect("sync"), 0);
 }
+
+#[test]
+fn date_only_valid_until_is_accepted() {
+    let (_g, core) = open_core("sql39-login-date-only");
+    ok(
+        &core,
+        "t",
+        "CREATE ROLE past LOGIN VALID UNTIL '2000-01-01'",
+    );
+    ok(
+        &core,
+        "t",
+        "CREATE ROLE future LOGIN VALID UNTIL '2999-01-01'",
+    );
+    let past = lookup(&core, "t", "past").expect("past");
+    assert!(past.valid_until.is_some());
+    assert!(past.is_expired());
+    assert!(!lookup(&core, "t", "future").expect("future").is_expired());
+    ok(&core, "t", "ALTER ROLE future VALID UNTIL '2000-01-01'");
+    assert!(lookup(&core, "t", "future").expect("future").is_expired());
+}

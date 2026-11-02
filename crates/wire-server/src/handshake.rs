@@ -1532,7 +1532,22 @@ fn authenticate_scram<S: WireStream>(
     );
     let verification = scram::verify_client_final(&verifier, &auth_message, &client_final.proof);
 
-    let success = nonce_and_binding_match && verification.ok && tenant_id.is_some();
+    let mut success = nonce_and_binding_match && verification.ok && tenant_id.is_some();
+
+    // 証明の検証が通った後、セッション開始前にカタログのロールを再取得して判定し直す（Issue #2233）。
+    // server-first 送信前に読んだ属性は client-final 待ちの間に古くなりうる（`NOLOGIN`・`CONNECTION LIMIT`・
+    // `VALID UNTIL`・パスワード変更・ロールの削除／改名）ため、同じ識別子が同じロール ID・テナント・検証子を
+    // 指し、期限内であることを確認する。再取得の失敗・不一致はすべて通常の認証失敗（`28P01`・同じ遅延）へ
+    // 畳み、ロールの存在情報を漏らさない（fail-closed）。
+    if success {
+        if let Some(p) = catalog_principal.as_mut() {
+            if refresh_catalog_principal(engine, username, p, tenant_id.as_deref(), &verifier)
+                .is_none()
+            {
+                success = false;
+            }
+        }
+    }
 
     let elapsed = verify_start.elapsed();
     if !success && elapsed < auth::AUTH_FAILURE_DELAY {
@@ -1558,6 +1573,37 @@ fn authenticate_scram<S: WireStream>(
         None => PrincipalKind::UsersFile,
     };
     Ok(AuthOutcome::Success(AuthenticatedPrincipal { ctx, kind }))
+}
+
+/// 認証成功直前にカタログのロールを再取得し、最新の `LOGIN`・`CONNECTION LIMIT` を `principal` へ反映する。
+/// ロールの不在・読み取り失敗・ロール ID／テナント／検証子の不一致・`VALID UNTIL` 超過は `None`
+/// （呼び出し側が認証失敗へ倒す）。`LOGIN` 属性そのものはここでは拒否しない（検証の後の `28000` で扱う）。
+fn refresh_catalog_principal(
+    engine: Option<&engine::core::EngineCore>,
+    identifier: &str,
+    principal: &mut CatalogPrincipal,
+    tenant_id: Option<&str>,
+    verified: &scram::ScramVerifier,
+) -> Option<()> {
+    let engine = engine?;
+    let fresh = engine.resolve_login_role(identifier).ok()??;
+    if fresh.role_id != principal.role_id
+        || tenant_id != Some(fresh.tenant_id.as_str())
+        || fresh.is_expired()
+    {
+        return None;
+    }
+    let current = scram::ScramVerifier::parse(&fresh.scram_verifier).ok()?;
+    if current.salt != verified.salt
+        || current.iterations != verified.iterations
+        || current.stored_key != verified.stored_key
+        || current.server_key != verified.server_key
+    {
+        return None;
+    }
+    principal.login = fresh.login;
+    principal.connection_limit = fresh.connection_limit;
+    Some(())
 }
 
 /// カタログのロールの SCRAM 検証子を引く。照合に使える（存在し・期限内で・検証子が正しい形の）ときだけ
