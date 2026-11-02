@@ -190,6 +190,7 @@ fn real_hooks<'a>(after: Option<&'a mut dyn FnMut(usize)>) -> Hooks<'a> {
     Hooks {
         clock: &Instant::now,
         after_chunk: after,
+        privilege: None,
     }
 }
 
@@ -401,6 +402,7 @@ fn hold_limit_closes_scan_with_fake_clock() {
     let mut hooks = Hooks {
         clock: &now,
         after_chunk: Some(&mut hook),
+        privilege: None,
     };
     // 1 呼び出し 1 ms 進む疑似時計と保持時間 5 ms で、幅（1000）に達する前に締まる。
     let outcome = run_delete(
@@ -446,6 +448,7 @@ fn hold_limit_cuts_apply_stage_and_cursor_is_last_applied_id() {
     let mut hooks = Hooks {
         clock: &now,
         after_chunk: Some(&mut hook),
+        privilege: None,
     };
     run_delete(
         &storage,

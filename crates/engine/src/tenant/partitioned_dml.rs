@@ -50,6 +50,7 @@ use crate::recovery::partitioned_job::{
     self, chunk_range, ChunkCommitOutcome, JobKey, JobRecord, PartitionedJobError, ResendDecision,
 };
 use crate::sql::parser::PartitionedDmlLimits;
+use crate::sql::privilege_gate::write::RelationPrivilegeRecheck;
 use crate::storage::rowid::{split_row_key, RowId};
 
 /// 分割実行の正常終了。
@@ -92,6 +93,10 @@ pub(crate) enum PartitionedStopCause<E> {
     CancelRequested,
     /// 台帳を持たない構成（`LedgerWrite::Disabled`）での実行を拒否した（`0A000` を推奨）。
     LedgerRequired,
+    /// チャンクの write txn 内の権限再判定で、対象表の必要権限が無かった（`42501`。Issue #1968）。
+    /// 第 1 チャンクではジョブ記録・台帳より前（commit 前）に止まり副作用はゼロ。途中で `REVOKE` された
+    /// 場合は commit 済みチャンクを残して止まる（`VD001`。同じ `operation_id` の再送で再開できる）。
+    InsufficientPrivilege,
 }
 
 /// 述語形 `DELETE` の分割実行入口（`core.rs` の分割実行 form から呼ばれる）。
@@ -107,6 +112,7 @@ pub(crate) fn delete_rows_where_partitioned_unchecked<E>(
     limits: &PartitionedDmlLimits,
     max_affected_total: Option<NonZeroUsize>,
     fixed_time: Option<i64>,
+    privilege_recheck: Option<RelationPrivilegeRecheck>,
     predicate: impl FnMut(&DmlCandidate<'_>) -> Result<bool, E>,
 ) -> Result<PartitionedDmlOutcome, PartitionedDmlFailure<E>> {
     // Issue #1798: チャンク commit 後に 57014 を返すと SQL-32／SQL-71 (4) の契約（commit 済みなら
@@ -125,7 +131,7 @@ pub(crate) fn delete_rows_where_partitioned_unchecked<E>(
             fixed_time,
             Kind::Delete,
             predicate,
-            &mut Hooks::production(),
+            &mut Hooks::production(privilege_recheck),
         )
     })
 }
@@ -149,6 +155,7 @@ pub(crate) fn update_rows_where_partitioned_unchecked<E>(
     limits: &PartitionedDmlLimits,
     max_affected_total: Option<NonZeroUsize>,
     fixed_time: Option<i64>,
+    privilege_recheck: Option<RelationPrivilegeRecheck>,
     predicate: impl FnMut(&DmlCandidate<'_>) -> Result<bool, E>,
 ) -> Result<PartitionedDmlOutcome, PartitionedDmlFailure<E>> {
     // Issue #1798: チャンク commit 後に 57014 を返すと SQL-32／SQL-71 (4) の契約（commit 済みなら
@@ -170,7 +177,7 @@ pub(crate) fn update_rows_where_partitioned_unchecked<E>(
                 set_exprs,
             },
             predicate,
-            &mut Hooks::production(),
+            &mut Hooks::production(privilege_recheck),
         )
     })
 }
@@ -190,13 +197,16 @@ enum Kind<'a> {
 struct Hooks<'a> {
     clock: &'a dyn Fn() -> Instant,
     after_chunk: Option<&'a mut dyn FnMut(usize)>,
+    /// チャンクごとの権限再判定（Issue #1968）。現在ロール束縛済みで運用者権限なしの主体だけ `Some`。
+    privilege: Option<RelationPrivilegeRecheck>,
 }
 
 impl Hooks<'static> {
-    fn production() -> Self {
+    fn production(privilege: Option<RelationPrivilegeRecheck>) -> Self {
         Hooks {
             clock: &Instant::now,
             after_chunk: None,
+            privilege,
         }
     }
 }
@@ -398,6 +408,13 @@ fn chunk_loop<E>(
         let write_txn = storage
             .begin_partitioned_chunk_txn()
             .map_err(|e| w(convert_write_txn_err(e)))?;
+        // SQL-40・Issue #1968: 再開時とチャンクの途中で権限を剥奪された後に続行させない。ジョブ記録・台帳
+        // 照合・走査・適用より前に、この txn から ACL を読んで判定する（拒否は commit 前なので副作用なし）。
+        if let Some(recheck) = &hooks.privilege {
+            recheck
+                .check_in_txn(&*write_txn, &[table.to_string()])
+                .map_err(|()| PartitionedStopCause::InsufficientPrivilege)?;
+        }
         // 保持時間は permit を得てから数える（待機時間を保持時間に含めない）。
         let start = clock();
 

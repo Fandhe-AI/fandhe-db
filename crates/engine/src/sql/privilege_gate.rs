@@ -266,6 +266,7 @@ pub(crate) fn is_owner_equivalent(session: &SessionState) -> bool {
 }
 
 pub(crate) mod read;
+pub(crate) mod write;
 
 #[cfg(test)]
 mod tests;

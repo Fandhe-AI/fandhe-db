@@ -10,6 +10,7 @@
 ### Added
 
 - 現在ロールが束縛済みのセッションの読み取り（SELECT・JOIN・サブクエリ・CTE・集合演算・ビュー・EXPLAIN・`DECLARE`・行ロック句・検索・拡張クエリ・HTTP の bound 読み取り API）に、`GRANT` で付与した表単位の SELECT 権限の検査を結線した（Issue #1967・SQL-40・RLS-12 ポインタ。権限不足は `42501`）。公開メソッド `SessionState::object_privileges_enforced` を追加した。現在ロールが未束縛のセッション（現状の全セッション）の挙動は変わらない。
+- 現在ロールが束縛済みのセッションの書き込み（INSERT・UPSERT・UPDATE・DELETE・TRUNCATE とその RETURNING・INSERT ... SELECT・UPDATE ... FROM・DELETE ... USING・ビュー DML・データ変更 CTE・分割実行・拡張クエリ）に、`GRANT` で付与した表単位の権限の検査を結線した（Issue #1968・SQL-40・RLS-12・SQL-19・SQL-22 ポインタ。権限不足は `42501`で、行・台帳は変化しない）。分割実行はチャンクごと、TRUNCATE CASCADE は連鎖後の全表を再判定する。現在ロールが未束縛のセッション（現状の全セッション）の挙動は変わらない。
 - `SAVEPOINT <名前>`・`RELEASE [SAVEPOINT] <名前>`・`ROLLBACK [WORK|TRANSACTION] TO [SAVEPOINT] <名前>` の構文と、明示 Tx の savepoint スタックを追加した（Issue #1942・SQL-69）。Tx の外は `25P01`、存在しない名前は新設の `3B001`（HTTP は 400）。巻き戻し本体は未実装（親 Issue #1941）のため、`ROLLBACK TO` は `0A000` で拒否して Tx を `Failed` にする（後続の `COMMIT` で書き込みを確定させない fail-closed）。CommandComplete タグは `SAVEPOINT`・`RELEASE`。
   BREAKING CHANGE: 公開 enum `TxnControl`（`Savepoint`・`RollbackToSavepoint`・`ReleaseSavepoint`）・`SqlOutcome`（`Savepoint`・`ReleaseSavepoint`）・`ErrorClass`（`InvalidSavepointSpecification`）・`SqlSurfaceError`（`InvalidSavepointSpecification`）に variant を追加した。公開構造体 `ValidatedTxnControl` に `savepoint_name` を追加し `Copy` を外した。`is_rollback_statement` は `ROLLBACK TO ...` で `false` を返す。3 文の SQLSTATE は `42601` から変わる。
 - `SET TRANSACTION` と `SET SESSION CHARACTERISTICS AS TRANSACTION` を受理する（Issue #1939・SQL-38 (7)(a)・SQL-31 ポインタ。契約の詳細は spec 側を参照）。

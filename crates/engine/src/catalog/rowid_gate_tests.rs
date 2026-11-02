@@ -162,6 +162,7 @@ fn table23_truncate_is_allowed_and_keeps_allocator_state() {
         &ctx(),
         ledger,
         None,
+        None,
     )
     .expect("truncate allowed");
     // 再利用しない: TRUNCATE 後も次の払い出しは続きから。

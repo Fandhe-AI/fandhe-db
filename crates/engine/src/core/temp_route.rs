@@ -688,6 +688,14 @@ impl EngineCore {
             session,
             &prepared.tokens,
             crate::sql::privilege_gate::read::classify(parsed),
+        )?;
+        // SQL-40・Issue #1968: 書き込み系の文（INSERT／UPDATE／DELETE／TRUNCATE 等）も同じ入口で判定する。
+        crate::sql::privilege_gate::write::require_write_privileges_resolved(
+            &self.storage,
+            tenant,
+            session,
+            &prepared.tokens,
+            parsed,
         )
     }
 
@@ -1146,15 +1154,25 @@ impl EngineCore {
                     ))
                 }
             }
-            ParsedSql::Truncate(stmt) => Ok(crate::sql::SqlOutcome::Truncate(
-                crate::sql::exec::execute_truncate_in(
-                    target,
-                    ctx,
-                    stmt,
-                    self.ledger_mode,
-                    Some(&self.trigger_runtime),
-                )?,
-            )),
+            ParsedSql::Truncate(stmt) => {
+                // SQL-40・Issue #1968: CASCADE の連鎖後の最終集合を write txn 内で再判定する。
+                let privilege_recheck =
+                    crate::sql::privilege_gate::write::RelationPrivilegeRecheck::for_session(
+                        session,
+                        ctx.tenant_id(),
+                        crate::catalog::privilege::PRIV_TRUNCATE,
+                    );
+                Ok(crate::sql::SqlOutcome::Truncate(
+                    crate::sql::exec::execute_truncate_in(
+                        target,
+                        ctx,
+                        stmt,
+                        self.ledger_mode,
+                        Some(&self.trigger_runtime),
+                        privilege_recheck.as_ref(),
+                    )?,
+                ))
+            }
             // 読み取り系は開いている書き込みトランザクションを読み取り源にする（自トランザクションの
             // 未 commit の変更を読める。キャッシュは使われない brute-force 経路）。
             ParsedSql::LockingSelect(_) => Err(super::row_lock_not_supported()),

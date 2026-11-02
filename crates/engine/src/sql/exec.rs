@@ -3896,6 +3896,8 @@ pub fn execute_truncate(
         ledger_mode,
         // 公開入口はトリガの通過証を持たない（TRUNCATE トリガがあれば `0A000`。Issue #1726）。
         None,
+        // 主体を持たない Rust API は権限を再判定しない（セッション経由の入口が構文段で判定する）。
+        None,
     )
 }
 
@@ -3907,6 +3909,7 @@ pub(crate) fn execute_truncate_in(
     validated: &crate::sql::allowlist::ValidatedTruncate,
     ledger_mode: crate::recovery::required_op_id::LedgerMode,
     triggers: Option<&crate::trigger::TriggerRuntime>,
+    privilege_recheck: Option<&crate::sql::privilege_gate::write::RelationPrivilegeRecheck>,
 ) -> Result<TruncateOutcome, SqlSurfaceError> {
     let ledger_write = ledger_mode
         .resolve(validated.operation_id.as_ref())
@@ -3920,6 +3923,7 @@ pub(crate) fn execute_truncate_in(
         ctx,
         ledger_write,
         triggers,
+        privilege_recheck,
     )
     .map_err(map_insert_write_error)?;
 
@@ -5019,6 +5023,7 @@ pub(crate) fn execute_predicate_delete_partitioned(
     limits: &crate::sql::parser::PartitionedDmlLimits,
     max_affected_rows: Option<std::num::NonZeroUsize>,
     fixed_time: Option<i64>,
+    privilege_recheck: Option<crate::sql::privilege_gate::write::RelationPrivilegeRecheck>,
 ) -> Result<DeleteOutcome, SqlSurfaceError> {
     let ledger_write = ledger_mode
         .resolve(bound.operation_id())
@@ -5041,6 +5046,7 @@ pub(crate) fn execute_predicate_delete_partitioned(
                 limits,
                 max_affected_rows,
                 fixed_time,
+                privilege_recheck.clone(),
                 predicate,
             )
         },
@@ -5074,6 +5080,7 @@ pub(crate) fn execute_predicate_update_partitioned(
     limits: &crate::sql::parser::PartitionedDmlLimits,
     max_affected_rows: Option<std::num::NonZeroUsize>,
     fixed_time: Option<i64>,
+    privilege_recheck: Option<crate::sql::privilege_gate::write::RelationPrivilegeRecheck>,
 ) -> Result<UpdateOutcome, SqlSurfaceError> {
     let ledger_write = ledger_mode
         .resolve(bound.operation_id())
@@ -5098,6 +5105,7 @@ pub(crate) fn execute_predicate_update_partitioned(
                 limits,
                 max_affected_rows,
                 fixed_time,
+                privilege_recheck.clone(),
                 predicate,
             )
         },

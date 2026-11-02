@@ -375,6 +375,8 @@ impl TempRowStore {
                 crate::recovery::ledger::LedgerWrite::Disabled,
                 // 一時表にトリガは定義できない（定義の段で `0A000`）。
                 None,
+                // 一時表はセッションの所有物で権限対象外。
+                None,
             )
             .map_err(|_| internal())?;
         }
@@ -404,6 +406,7 @@ impl TempRowStore {
             false,
             &ctx,
             crate::recovery::ledger::LedgerWrite::Disabled,
+            None,
             None,
         )
         .map(|_| ())
