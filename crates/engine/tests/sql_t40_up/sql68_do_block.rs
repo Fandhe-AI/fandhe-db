@@ -103,14 +103,14 @@ fn body_error_leaves_no_side_effects() {
     );
     assert!(!c.is_empty());
     assert_eq!(count(&core, "alice"), 0);
-    // 実行時エラー（`0A000` の RAISE）でも同様。
+    // 実行時エラー（`RAISE EXCEPTION`。Issue #2227 で P0001 になった）でも同様。
     assert_eq!(
         code(
             &core,
             "alice",
             "DO 'BEGIN INSERT INTO t (n) VALUES (1); RAISE EXCEPTION ''x''; END'"
         ),
-        "0A000"
+        "P0001"
     );
     assert_eq!(count(&core, "alice"), 0);
 }
@@ -163,8 +163,8 @@ fn body_error_in_explicit_transaction_fails_the_transaction() {
             &mut txn,
             "DO 'BEGIN RAISE EXCEPTION ''x''; END'",
         )
-        .expect_err("raise is unsupported");
-    assert_eq!(e.wire_code(), "0A000");
+        .expect_err("raise exception fails the statement");
+    assert_eq!(e.wire_code(), "P0001");
     let e = core
         .execute_sql_in_txn(&c, &mut ts, &mut txn, "SELECT COUNT(*) FROM t")
         .expect_err("failed transaction");

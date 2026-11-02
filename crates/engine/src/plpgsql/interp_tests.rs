@@ -12,7 +12,7 @@ use std::collections::VecDeque;
 
 use super::ast::{Body, DeclType, EmbeddedSql, ParamDecl, ReturnShape, SqlExpr, VarRef};
 use super::embedded::{validate_embedded, StructuralChecker};
-use super::host::{PlHost, PlScalar, ResolvedType, RowDemand, SqlOutcome, VarLookup};
+use super::host::{PlHost, PlSavepoint, PlScalar, ResolvedType, RowDemand, SqlOutcome, VarLookup};
 use super::interp::{
     run_function, run_trigger_function, CallOutcome, ExecBudget, ReturnSpec, TriggerReturn,
     TriggerVars,
@@ -34,6 +34,10 @@ struct ScriptedHost {
     dynamic: VecDeque<SqlOutcome>,
     /// `rec(...)` の式が再帰で呼ぶ関数（入れ子呼び出し・予算の合算の確認用）。
     recurse: Option<(Body, ReturnSpec)>,
+    /// `EXCEPTION` 節の savepoint 呼び出しの記録（Issue #2227。`sp`・`rollback`・`release`）。
+    log: Vec<&'static str>,
+    /// `rollback_block` を `0A000` で失敗させる（巻き戻せないブロックの模擬）。
+    fail_rollback: bool,
 }
 
 fn int(i: i64) -> PlScalar {
@@ -196,6 +200,23 @@ impl PlHost for ScriptedHost {
         _budget: &mut ExecBudget,
     ) -> Result<SqlOutcome, SqlSurfaceError> {
         self.dynamic.pop_front().ok_or_else(bad)
+    }
+
+    fn block_savepoint(&mut self) -> Result<PlSavepoint, SqlSurfaceError> {
+        self.log.push("sp");
+        Ok(PlSavepoint(self.log.len()))
+    }
+
+    fn rollback_block(&mut self, _sp: &PlSavepoint) -> Result<(), SqlSurfaceError> {
+        self.log.push("rollback");
+        if self.fail_rollback {
+            return Err(SqlSurfaceError::feature_not_supported("cannot roll back"));
+        }
+        Ok(())
+    }
+
+    fn release_block(&mut self, _sp: PlSavepoint) {
+        self.log.push("release");
     }
 
     fn resolve_type(&mut self, ty: &DeclType) -> Result<ResolvedType, SqlSurfaceError> {
@@ -1144,4 +1165,206 @@ fn trigger_statement_budget_applies() {
     let mut budget = ExecBudget::new(small_limits(2, 10, 4), 10_000);
     let r = run_trigger_function(&body, &v, &mut ScriptedHost::default(), &mut budget);
     assert_eq!(trig_code(r), "54000");
+}
+
+// ---- RAISE と EXCEPTION（Issue #2227・SQL-70） ----
+
+fn sqlstate_of(r: Result<CallOutcome, SqlSurfaceError>) -> String {
+    match r {
+        Ok(v) => panic!("expected an error, got {v:?}"),
+        Err(e) => e.effective_sqlstate().to_string(),
+    }
+}
+
+#[test]
+fn caught_error_rolls_back_then_releases_in_order() {
+    let mut h = ScriptedHost::default();
+    let r = call_host(
+        "BEGIN BEGIN RAISE EXCEPTION 'x'; EXCEPTION WHEN OTHERS THEN a := 7; END; RETURN a; END",
+        vec![int(1)],
+        &mut h,
+    );
+    assert_eq!(ival(r), 7);
+    assert_eq!(h.log, vec!["sp", "rollback", "release"]);
+}
+
+#[test]
+fn no_error_and_early_return_release_the_savepoint_once() {
+    let mut h = ScriptedHost::default();
+    assert_eq!(
+        ival(call_host(
+            "BEGIN BEGIN NULL; EXCEPTION WHEN OTHERS THEN NULL; END; RETURN 1; END",
+            vec![int(1)],
+            &mut h
+        )),
+        1
+    );
+    assert_eq!(h.log, vec!["sp", "release"]);
+    let mut h = ScriptedHost::default();
+    assert_eq!(
+        ival(call_host(
+            "BEGIN BEGIN RETURN 2; EXCEPTION WHEN OTHERS THEN NULL; END; END",
+            vec![int(1)],
+            &mut h
+        )),
+        2
+    );
+    assert_eq!(h.log, vec!["sp", "release"]);
+}
+
+#[test]
+fn variables_are_not_rolled_back_by_a_caught_error() {
+    let mut h = ScriptedHost::default();
+    let r = call_host(
+        "BEGIN BEGIN a := 5; RAISE EXCEPTION 'x'; EXCEPTION WHEN OTHERS THEN RETURN a; END; END",
+        vec![int(1)],
+        &mut h,
+    );
+    assert_eq!(ival(r), 5);
+}
+
+#[test]
+fn unmatched_error_propagates_without_rollback() {
+    let mut h = ScriptedHost::default();
+    let r = call_host(
+        "BEGIN BEGIN RAISE EXCEPTION 'x' USING ERRCODE = '23505'; \
+         EXCEPTION WHEN division_by_zero THEN NULL; END; RETURN 1; END",
+        vec![int(1)],
+        &mut h,
+    );
+    assert_eq!(sqlstate_of(r), "23505");
+    assert_eq!(h.log, vec!["sp", "release"]);
+}
+
+#[test]
+fn error_in_handler_propagates_and_savepoint_is_released_once() {
+    let mut h = ScriptedHost::default();
+    let r = call_host(
+        "BEGIN BEGIN RAISE EXCEPTION 'x'; EXCEPTION WHEN OTHERS THEN \
+         RAISE EXCEPTION 'y' USING ERRCODE = 'P0200'; END; RETURN 1; END",
+        vec![int(1)],
+        &mut h,
+    );
+    assert_eq!(sqlstate_of(r), "P0200");
+    assert_eq!(h.log, vec!["sp", "rollback", "release"]);
+}
+
+#[test]
+fn rollback_failure_is_not_caught_and_still_releases() {
+    let mut h = ScriptedHost {
+        fail_rollback: true,
+        ..ScriptedHost::default()
+    };
+    let r = call_host(
+        "BEGIN BEGIN RAISE EXCEPTION 'x'; EXCEPTION WHEN OTHERS THEN RETURN 1; END; RETURN 0; END",
+        vec![int(1)],
+        &mut h,
+    );
+    assert_eq!(err_code(r), "0A000");
+    assert_eq!(h.log, vec!["sp", "rollback", "release"]);
+}
+
+#[test]
+fn internal_errors_are_never_caught() {
+    let mut h = ScriptedHost::default();
+    // ホストが評価できない式（`/`）は `Internal`（`XX000`）になる。OTHERS でも捕捉しない。
+    let r = call_host(
+        "BEGIN BEGIN a := 1 / 2; EXCEPTION WHEN OTHERS THEN RETURN 9; END; RETURN 0; END",
+        vec![int(1)],
+        &mut h,
+    );
+    assert_eq!(err_code(r), "XX000");
+    assert_eq!(h.log, vec!["sp", "release"]);
+}
+
+#[test]
+fn execution_limits_cannot_be_caught() {
+    let mut h = ScriptedHost::default();
+    let r = run_with(
+        "BEGIN BEGIN LOOP NULL; END LOOP; EXCEPTION WHEN OTHERS THEN RETURN 1; END; RETURN 0; END",
+        &p_int(),
+        vec![int(1)],
+        spec(ReturnShape::Scalar, Some(ColumnType::Integer)),
+        &mut h,
+        small_limits(100_000, 50, 8),
+    );
+    assert_eq!(err_code(r), "54000");
+    assert_eq!(h.log, vec!["sp", "release"]);
+}
+
+#[test]
+fn rethrow_returns_the_original_error() {
+    let mut h = ScriptedHost::default();
+    let r = call_host(
+        "BEGIN BEGIN RAISE EXCEPTION 'orig' USING ERRCODE = 'P0100'; \
+         EXCEPTION WHEN OTHERS THEN RAISE; END; RETURN 1; END",
+        vec![int(1)],
+        &mut h,
+    );
+    match r {
+        Err(e) => {
+            assert_eq!(e.effective_sqlstate(), "P0100");
+            assert_eq!(e.raised().map(|x| x.message()), Some("orig"));
+        }
+        Ok(v) => panic!("expected an error, got {v:?}"),
+    }
+}
+
+#[test]
+fn raise_levels_and_notice_defaults() {
+    use crate::notice::{NoticeLevel, StatementNotices};
+    let scope = StatementNotices::enter();
+    let mut h = ScriptedHost::default();
+    let r = call_host(
+        "BEGIN RAISE NOTICE 'a %', 1; RAISE WARNING 'w'; RAISE DEBUG 'd'; RAISE LOG 'l'; RETURN 1; END",
+        vec![int(1)],
+        &mut h,
+    );
+    assert_eq!(ival(r), 1);
+    let got = scope.finish();
+    assert_eq!(got.len(), 2);
+    assert_eq!(
+        (
+            got[0].level,
+            got[0].sqlstate.as_str(),
+            got[0].message.as_str()
+        ),
+        (NoticeLevel::Notice, "00000", "a 1")
+    );
+    assert_eq!(
+        (got[1].level, got[1].sqlstate.as_str()),
+        (NoticeLevel::Warning, "01000")
+    );
+}
+
+#[test]
+fn raise_message_defaults_and_null_options() {
+    // 書式も MESSAGE も無い場合は SQLSTATE 文字列（PostgreSQL と同じ）。
+    let r = call(
+        "BEGIN RAISE EXCEPTION USING ERRCODE = 'P0100'; RETURN 1; END",
+        vec![int(1)],
+    );
+    match r {
+        Err(e) => assert_eq!(e.raised().map(|x| x.message()), Some("P0100")),
+        Ok(v) => panic!("expected an error, got {v:?}"),
+    }
+    let r = call(
+        "BEGIN RAISE EXCEPTION unique_violation; RETURN 1; END",
+        vec![int(1)],
+    );
+    match r {
+        Err(e) => {
+            assert_eq!(e.effective_sqlstate(), "23505");
+            assert_eq!(e.raised().map(|x| x.message()), Some("unique_violation"));
+        }
+        Ok(v) => panic!("expected an error, got {v:?}"),
+    }
+    // NULL の USING 値は 22004。
+    assert_eq!(
+        err_code(call(
+            "BEGIN RAISE EXCEPTION 'x' USING DETAIL = NULL; RETURN 1; END",
+            vec![int(1)]
+        )),
+        "22004"
+    );
 }

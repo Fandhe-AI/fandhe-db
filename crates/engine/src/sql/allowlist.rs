@@ -1354,6 +1354,13 @@ pub enum SqlSurfaceError {
     /// PL/pgSQL のスカラー関数が `RETURN` に達せず終わりに到達（`2F005`。Issue #2225・SQL-68）。
     /// 固定文言のみ。
     FunctionExecutedNoReturnStatement,
+    /// PL/pgSQL の `RAISE EXCEPTION`（既定 `P0001`。Issue #2227・SQL-70）。利用者指定の
+    /// SQLSTATE・文言・DETAIL・HINT・文脈は [`crate::notice::RaisedError`] が持つ。`wire_code()` は
+    /// 常に静的な `P0001`（`ErrorClass::RaisedException`）で、利用者の SQLSTATE は
+    /// [`SqlSurfaceError::raised`] から wire 層が取り出して `C` に出す。`Internal`／
+    /// `SerializationFailure` を包まないため `SessionTransaction::is_unrecoverable_error` の
+    /// 判定は変わらない。
+    RaisedException(Box<crate::notice::RaisedError>),
     /// 実行中の文を協調的に打ち切った（Issue #1798。ERR-6: `57014`）。`crate::interrupt`
     /// の確認点が返し、commit 前の `Err` としてのみ起きる。文言は理由ごとの固定文言のみで、
     /// 件数・テナント情報は含めない（Issue #1951 で statement timeout 用の文言を追加）。
@@ -1551,6 +1558,24 @@ impl SqlSurfaceError {
                 using_expression,
             },
             other => other,
+        }
+    }
+
+    /// `RAISE EXCEPTION` 由来なら利用者指定の内容（SQLSTATE・DETAIL・HINT・文脈）を返す
+    /// （Issue #2227・SQL-70）。wire 層が `C`／`D`／`H`／`W` を組み立てる入口。
+    pub fn raised(&self) -> Option<&crate::notice::RaisedError> {
+        match self {
+            SqlSurfaceError::RaisedException(r) => Some(r),
+            _ => None,
+        }
+    }
+
+    /// 例外条件の照合・利用者への SQLSTATE 表示に使う実効 SQLSTATE（`RAISE` なら利用者指定、
+    /// それ以外は `wire_code()`）。
+    pub fn effective_sqlstate(&self) -> &str {
+        match self.raised() {
+            Some(r) => r.sqlstate(),
+            None => self.wire_code(),
         }
     }
 
@@ -2089,6 +2114,7 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::FunctionExecutedNoReturnStatement => {
                 ErrorClass::FunctionExecutedNoReturnStatement
             }
+            SqlSurfaceError::RaisedException(_) => ErrorClass::RaisedException,
             SqlSurfaceError::QueryCanceled { .. } => ErrorClass::QueryCanceled,
             SqlSurfaceError::DependentObjectsStillExist { .. } => {
                 ErrorClass::DependentObjectsStillExist
@@ -2463,6 +2489,8 @@ impl std::fmt::Display for SqlSurfaceError {
             SqlSurfaceError::FunctionExecutedNoReturnStatement => {
                 write!(f, "control reached end of function without RETURN")
             }
+            // 利用者が `RAISE` で指定した文言（生成時に NUL 除去・切り詰め済み）。
+            SqlSurfaceError::RaisedException(r) => write!(f, "{}", r.message()),
             // PostgreSQL と同じ固定文言。期限超過のみ専用文言で、切断・取り消しは従来のまま。
             SqlSurfaceError::QueryCanceled {
                 reason: crate::interrupt::InterruptReason::StatementTimeout,

@@ -826,6 +826,14 @@ fn walk_stmts(
                     classify_expr(cx, e)?;
                 }
             }
+            Stmt::Raise(r) => {
+                for e in &mut r.args {
+                    classify_expr(cx, e)?;
+                }
+                for (_, e) in &mut r.using {
+                    classify_expr(cx, e)?;
+                }
+            }
             Stmt::GetDiagnostics { .. } | Stmt::Null => {}
         }
     }
@@ -838,7 +846,13 @@ fn walk_block(b: &mut Block, vars: &mut [VarDecl], cx: &Cx<'_>) -> Result<(), Sq
             classify_expr(cx, d)?;
         }
     }
-    walk_stmts(&mut b.stmts, vars, cx)
+    walk_stmts(&mut b.stmts, vars, cx)?;
+    if let Some(hs) = &mut b.handlers {
+        for h in hs {
+            walk_stmts(&mut h.stmts, vars, cx)?;
+        }
+    }
+    Ok(())
 }
 
 /// 本体の全ての埋め込み SQL・式を SQL 構文解析器の記録で分類し、変数参照（位置・役割・変数）・正規化後の

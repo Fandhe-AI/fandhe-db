@@ -13,6 +13,7 @@
 //! `core::plpgsql_host`（Issue #2226）。[`subst`] は変数・`USING` の値を型付きトークンへ置換する純粋関数。
 
 pub(crate) mod ast;
+pub(crate) mod condition;
 pub(crate) mod embedded;
 pub(crate) mod host;
 pub(crate) mod interp;

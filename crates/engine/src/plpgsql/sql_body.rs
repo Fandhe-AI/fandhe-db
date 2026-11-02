@@ -23,7 +23,7 @@ use super::{oos_err, syn_err, too_big_err};
 /// 先頭に置けない（`0A000` で拒否する）PL/pgSQL 側の語。`OUT_OF_SCOPE_STARTS` に無い制御語を足す。
 const REJECTED_STARTS: &[&str] = &[
     "DO", "BEGIN", "END", "DECLARE", "RETURN", "IF", "LOOP", "WHILE", "FOR", "EXIT", "CONTINUE",
-    "EXECUTE", "PERFORM", "GET", "CASE",
+    "EXECUTE", "PERFORM", "GET", "CASE", "RAISE",
 ];
 
 /// 本体に許す文の先頭語。
