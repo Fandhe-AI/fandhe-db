@@ -79,6 +79,23 @@ pub(crate) enum Resolved {
 /// 破損したカタログ値に対しても無限ループにならないことを保証する。
 const MAX_VIEW_RESOLVE_STEPS: usize = 10_000;
 
+/// ビューの展開中であることを lookup へ通知する RAII（生成で `enter_view_expansion`、破棄で
+/// `leave_view_expansion`）。`resolve_from` の全ての戻り経路で対が保たれる。
+struct ExpansionScope<'a, L: TableLookup + ?Sized>(&'a L);
+
+impl<'a, L: TableLookup + ?Sized> ExpansionScope<'a, L> {
+    fn enter(lookup: &'a L) -> Self {
+        lookup.enter_view_expansion();
+        Self(lookup)
+    }
+}
+
+impl<L: TableLookup + ?Sized> Drop for ExpansionScope<'_, L> {
+    fn drop(&mut self) {
+        self.0.leave_view_expansion();
+    }
+}
+
 /// FROM に指定された `name` を解決する（[`crate::sql::allowlist::validate_sql_tokens`]
 /// の `Statement::Scan` 分岐から呼ばれる）。テーブル・ビューのいずれにも
 /// 存在しない場合は `Err(SqlSurfaceError::UndefinedTable)`。カタログに保存された
@@ -97,6 +114,8 @@ pub(crate) fn resolve_from(
     let mut chain: Vec<ChainLayer> = Vec::new();
     let mut depth: u32 = 0;
     let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // 最初のビューに当たった時点から関数の終わりまで、以降の照会は展開中のもの（深さ 1 以上）として記録される。
+    let mut expansion: Option<ExpansionScope<'_, _>> = None;
 
     let base_table = loop {
         if chain.len() >= MAX_VIEW_RESOLVE_STEPS {
@@ -112,6 +131,9 @@ pub(crate) fn resolve_from(
                 column_aliases,
                 check_option,
             }) => {
+                if expansion.is_none() {
+                    expansion = Some(ExpansionScope::enter(lookup));
+                }
                 let parsed = match reparse_stored_body(&body_sql) {
                     Ok(parsed) => parsed,
                     Err(_) => {
@@ -523,6 +545,14 @@ impl TableLookup for BufferedBodyLookup<'_> {
 
     fn buffered_depth(&self) -> usize {
         self.depth
+    }
+
+    fn enter_view_expansion(&self) {
+        self.inner.enter_view_expansion();
+    }
+
+    fn leave_view_expansion(&self) {
+        self.inner.leave_view_expansion();
     }
 
     fn materialized_view_columns(

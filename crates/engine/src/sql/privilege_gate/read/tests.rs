@@ -46,22 +46,3 @@ fn resolved_internal_keys_are_kept() {
         ["#5.t"]
     );
 }
-
-#[test]
-fn only_followed_by_name_is_an_optional_candidate_not_dropped() {
-    // `FROM ONLY t` の構文語と、引用符付きの実表 `"only"`（`FROM "only" ca`）は字句では区別できない。
-    // 認可バイパス防止のため、`ONLY` は必須参照ではなく「実在すれば検査する」候補として別に返す。
-    let toks = tokenize("SELECT id FROM \"only\" ca LIMIT 5").expect("lex");
-    // 後続名は別名の可能性があるため必須にせず、同じく「実在すれば検査する」側に回す。
-    assert!(crate::sql::search_path::resolved_relation_ref_names(&toks).is_empty());
-    assert_eq!(
-        crate::sql::search_path::resolved_optional_only_names(&toks),
-        ["only", "ca"]
-    );
-    let toks = tokenize("SELECT id FROM ONLY t").expect("lex");
-    assert!(crate::sql::search_path::resolved_relation_ref_names(&toks).is_empty());
-    assert_eq!(
-        crate::sql::search_path::resolved_optional_only_names(&toks),
-        ["ONLY", "t"]
-    );
-}

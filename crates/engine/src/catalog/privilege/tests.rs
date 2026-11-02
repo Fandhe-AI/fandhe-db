@@ -408,6 +408,8 @@ mod apply_deps {
                 scope: AclScope::Tables,
                 tables: &tables,
                 schemas: &[],
+                sequences: &[],
+                functions: &[],
                 items: &items,
                 grantees: &grantees,
                 grant_option: go,
@@ -518,6 +520,64 @@ mod apply_deps {
         assert!(col_rows(&s, "a").iter().any(|e| e.grantee_id == carol));
     }
 
+    /// SEQUENCE 対象の GRANT／REVOKE（所有者を持てない種別）。所有者判定が Invalid にならず、
+    /// GRANT OPTION による委譲付与と、依存解決つきの REVOKE が通る（Issue #2236 レビュー指摘）。
+    fn run_seq(
+        s: &Storage,
+        grantor: u64,
+        owner: bool,
+        is_grant: bool,
+        grantee: u64,
+        go: bool,
+        cascade: bool,
+    ) -> std::result::Result<AclApplyOutcome, AclChangeError> {
+        let items = [AclItem {
+            bits: PRIV_USAGE,
+            columns: Vec::new(),
+        }];
+        let sequences = ["acl_seq".to_string()];
+        let grantees = [GranteeSpec::Id(grantee)];
+        s.apply_acl_changes(
+            "tn",
+            &AclRequest {
+                is_grant,
+                grantor_id: grantor,
+                owner_equivalent: owner,
+                scope: AclScope::Sequences,
+                tables: &[],
+                schemas: &[],
+                sequences: &sequences,
+                functions: &[],
+                items: &items,
+                grantees: &grantees,
+                grant_option: go,
+                cascade,
+            },
+        )
+    }
+
+    #[test]
+    fn sequence_grant_and_revoke_do_not_fail_owner_check() {
+        let (_g, s) = open("acl_seq_owner");
+        let params = crate::catalog::sequence::SequenceParams {
+            increment: 1,
+            min_value: 1,
+            max_value: 100,
+            start: 1,
+            cycle: false,
+        };
+        s.create_sequence("acl_seq", &params).expect("seq");
+        let op = role(&s, "op");
+        let alice = role(&s, "alice");
+        let bob = role(&s, "bob");
+        run_seq(&s, op, true, true, alice, true, false).expect("operator grant");
+        // WITH GRANT OPTION を持つ非運用者による再付与。
+        run_seq(&s, alice, false, true, bob, false, false).expect("delegated grant");
+        // 運用者による GRANT OPTION の REVOKE（依存解決で所有者判定を通る）。
+        let r = run_seq(&s, op, true, false, alice, true, true);
+        assert!(r.is_ok(), "{r:?}");
+    }
+
     #[test]
     fn grant_option_cycle_is_judged_per_privilege_bit() {
         let (_g, s) = open("acl_dep_bits");
@@ -570,6 +630,8 @@ mod apply_deps {
                 scope: AclScope::Tables,
                 tables: &tables,
                 schemas: &[],
+                sequences: &[],
+                functions: &[],
                 items: &items,
                 grantees: &grantees,
                 grant_option: false,
@@ -625,6 +687,40 @@ mod apply_deps {
         assert_eq!(col_rows(&s, "a"), before);
     }
 
+    /// 列 GRANT が列 GRANT OPTION を持つ近いロールを付与者に記録しても、表単位 REVOKE が列権限を残さない。
+    #[test]
+    fn table_revoke_removes_column_grant_recorded_under_nearer_grantor() {
+        let (_g, s) = open("acl_dep_tbl_rev_nearer");
+        mk_table(&s, T);
+        let owner = role(&s, "owner");
+        let bob = role(&s, "bob");
+        let carol = role(&s, "carol");
+        run(&s, owner, true, true, PRIV_SELECT, &[], bob, true, false).expect("g1");
+        run(
+            &s,
+            bob,
+            false,
+            true,
+            PRIV_SELECT,
+            &["a"],
+            carol,
+            false,
+            false,
+        )
+        .expect("g2");
+        assert_eq!(
+            col_rows(&s, "a")
+                .iter()
+                .filter(|e| e.grantee_id == carol)
+                .count(),
+            1
+        );
+        run(&s, bob, false, false, PRIV_SELECT, &[], carol, false, false).expect("revoke");
+        assert!(col_rows(&s, "a")
+            .iter()
+            .all(|e| e.grantee_id != carol || e.privileges == 0));
+    }
+
     /// 先行ターゲットで付与が成立していれば、後続が何も付与しなくても 01006 になる（01007 ではない）。
     #[test]
     fn partial_success_across_targets_warns_not_all_privileges() {
@@ -657,4 +753,72 @@ mod apply_deps {
         assert_eq!(out.warning, Some(AclWarning::NotAllPrivileges));
         assert_eq!(out.rows_changed, 1);
     }
+}
+
+/// 保存済みビュー本文に直接書き込む（`CREATE VIEW` の検証を通らない形も作るため）。
+fn put_view(s: &Storage, name: &str, base: &str, body: &str) {
+    write(s, |t| {
+        let def = crate::catalog::ViewDef {
+            base_relation: base.to_string(),
+            body_sql: body.to_string(),
+            column_aliases: Vec::new(),
+            check_option: crate::catalog::ViewCheckOption::None,
+        };
+        let bytes = crate::catalog::encode_view_def(&def)?;
+        let mut v = t.open_table(crate::catalog::VIEWS_TABLE)?;
+        v.insert(name, bytes.as_slice())?;
+        Ok(())
+    })
+    .expect("put view");
+}
+
+/// 同一性の閉包は、保存済み本文を展開側と同じ字句解析で読み、引用された内部キー（`"#<id>.<name>"`）の
+/// 参照も辿る。読めない本文は無視せず `Err`（fail-closed。入れ子の置換を見逃して失効させ損ねない）。
+#[test]
+fn identity_closure_reads_stored_bodies_like_expansion_and_fails_closed() {
+    use redb::ReadableDatabase;
+    let (_g, s) = open("priv-identity-closure");
+    put_view(
+        &s,
+        "v_key",
+        "bt",
+        "SELECT n FROM bt UNION ALL SELECT n FROM \"#7.inner\"",
+    );
+    let rt = s.db().begin_read().expect("read");
+    let ids = relation_identity_closure_in_txn(&rt, &["v_key".to_string()]).expect("closure");
+    assert!(
+        ids.iter().any(|(n, _)| n == "#7.inner"),
+        "internal key reference must be walked: {ids:?}"
+    );
+    drop(rt);
+    put_view(
+        &s,
+        "v_bad",
+        "bt",
+        "SELECT n FROM bt WHERE n = 'unterminated",
+    );
+    let rt = s.db().begin_read().expect("read");
+    assert!(relation_identity_closure_in_txn(&rt, &["v_bad".to_string()]).is_err());
+}
+
+/// 同一性の閉包は、定義のバイト列の合計が上限を超えたら生成中に打ち切って `Err`（fail-closed）。
+#[test]
+fn identity_closure_stops_when_definition_bytes_exceed_the_budget() {
+    use redb::ReadableDatabase;
+    let (_g, s) = open("priv-identity-budget");
+    let pad = "x".repeat(40 * 1024);
+    let mut roots = Vec::new();
+    for i in 0..8 {
+        let name = format!("v{i}");
+        put_view(
+            &s,
+            &name,
+            "bt",
+            &format!("SELECT n FROM bt WHERE n = '{pad}'"),
+        );
+        roots.push(name);
+    }
+    let rt = s.db().begin_read().expect("read");
+    assert!(relation_identity_closure_in_txn(&rt, &roots).is_err());
+    assert!(relation_identity_closure_in_txn(&rt, &roots[..2]).is_ok());
 }

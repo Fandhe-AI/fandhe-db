@@ -449,6 +449,15 @@ fn parse_execute_body(body: &[u8]) -> Result<ExecuteMessage, BodyError> {
     })
 }
 
+/// 文が保持する準備済み文の共有参照（`Empty` は `None`）。保持量の会計で portal との共有を判定する。
+fn prepared_arc(stmt: &PreparedStatement) -> Option<&std::sync::Arc<PreparedSql>> {
+    match stmt {
+        PreparedStatement::Empty => None,
+        PreparedStatement::Parsed { prepared, .. }
+        | PreparedStatement::Parameterized { prepared, .. } => Some(prepared),
+    }
+}
+
 /// 接続単位で Parse 済みステートメントを保持する（`sql_bytes` は
 /// [`MAX_PREPARED_SQL_BYTES_PER_SESSION`] の累計判定用。`Empty` は空文字列の
 /// クエリテキスト——PostgreSQL は空文の Parse を構文エラーにせず受理する）。
@@ -458,14 +467,14 @@ pub(crate) enum PreparedStatement {
     /// セッションで Bind のたびにセッション対応の経路で検証し直せるよう、元の [`PreparedSql`] も
     /// 保持する（一時表を持たないセッションでは `parsed` をそのまま使い、従来と挙動が同一）。
     Parsed {
-        parsed: ParsedSql,
-        prepared: Box<PreparedSql>,
+        parsed: Box<ParsedSql>,
+        prepared: std::sync::Arc<PreparedSql>,
     },
     /// `$n` を含む文（WIRE-12）。engine の [`PreparedSql`] テンプレートと、
     /// `$n` ごとの公告 OID・バイナリ可否（[`ParamSlot`]）を保持する。Bind が
     /// `engine.bind_prepared` で値を束縛して [`ParsedSql`] を得る。
     Parameterized {
-        prepared: PreparedSql,
+        prepared: std::sync::Arc<PreparedSql>,
         slots: Vec<ParamSlot>,
     },
 }
@@ -636,6 +645,11 @@ fn int_kind(effective_oid: i32) -> BinaryParam {
 pub(crate) struct PreparedStatementStore {
     statements: std::collections::HashMap<String, (PreparedStatement, usize)>,
     total_sql_bytes: usize,
+    /// ストアからは外れたが、portal が準備済み文（`prepared_snapshot`）を保持し続けている文の
+    /// 弱参照とバイト数。最後の参照が消えるまで [`MAX_PREPARED_SQL_BYTES_PER_SESSION`] に算入する
+    /// （無名 statement の再 Parse や Close で台帳から外しても、旧文が portal 経由で生存するため）。
+    /// 要素数は生存 portal 数（[`MAX_PORTALS_PER_SESSION`] + 無名）以下に抑えられ、挿入のたびに掃除する。
+    orphans: Vec<(std::sync::Weak<PreparedSql>, usize)>,
     /// 名前付きステートメント件数の上限。既定は
     /// [`crate::limits::MAX_PREPARED_STATEMENTS_PER_SESSION`]、`--max-prepared-statements`
     /// （Issue #2454・WIRE-25 ポインタ）で起動時に上書きされる。
@@ -663,6 +677,7 @@ impl PreparedStatementStore {
         PreparedStatementStore {
             statements: std::collections::HashMap::new(),
             total_sql_bytes: 0,
+            orphans: Vec::new(),
             max_named,
         }
     }
@@ -695,18 +710,40 @@ impl PreparedStatementStore {
 
         // 既存の同名エントリ（無名の再 Parse による黙った置換）が保持していた
         // バイト数を先に差し引いてから累計判定する。
-        let existing_bytes = self.statements.get(&name).map(|(_, bytes)| *bytes);
-        let base = existing_bytes
-            .map(|b| self.total_sql_bytes.saturating_sub(b))
-            .unwrap_or(self.total_sql_bytes);
-        let new_total = base
-            .checked_add(sql_bytes)
+        // 置換される文を portal が保持している場合は、バイト数を差し引かず孤児として算入し続ける。
+        self.sweep_orphans();
+        let existing = self
+            .statements
+            .get(&name)
+            .map(|(stmt, bytes)| (*bytes, prepared_arc(stmt).map(std::sync::Arc::downgrade)));
+        let held_by_portal = existing
+            .as_ref()
+            .and_then(|(_, weak)| weak.as_ref())
+            .is_some_and(|w| w.strong_count() > 1);
+        let credit = match existing {
+            Some((bytes, _)) if !held_by_portal => bytes,
+            _ => 0,
+        };
+        let new_total = self
+            .total_sql_bytes
+            .saturating_sub(credit)
+            .checked_add(self.orphan_bytes())
+            .and_then(|t| t.checked_add(sql_bytes))
             .ok_or(StoreError::TotalBytesExceeded)?;
         if new_total > MAX_PREPARED_SQL_BYTES_PER_SESSION {
             return Err(StoreError::TotalBytesExceeded);
         }
 
-        self.total_sql_bytes = new_total;
+        let old_bytes = existing.as_ref().map_or(0, |(b, _)| *b);
+        if held_by_portal {
+            if let Some((bytes, Some(weak))) = existing {
+                self.orphans.push((weak, bytes));
+            }
+        }
+        self.total_sql_bytes = self
+            .total_sql_bytes
+            .saturating_sub(old_bytes)
+            .saturating_add(sql_bytes);
         self.statements.insert(name, (statement, sql_bytes));
         Ok(())
     }
@@ -718,10 +755,27 @@ impl PreparedStatementStore {
     /// Close（'C'。statement 対象。Issue #934）が呼ぶ。存在しない名前を渡しても
     /// 何もせず成功する（PostgreSQL と同じ挙動）。累計バイト数も併せて減算する。
     fn remove(&mut self, name: &str) {
-        if let Some((_, bytes)) = self.statements.get(name) {
-            self.total_sql_bytes = self.total_sql_bytes.saturating_sub(*bytes);
+        if let Some((stmt, bytes)) = self.statements.remove(name) {
+            self.total_sql_bytes = self.total_sql_bytes.saturating_sub(bytes);
+            if let Some(arc) = prepared_arc(&stmt) {
+                if std::sync::Arc::strong_count(arc) > 1 {
+                    self.orphans.push((std::sync::Arc::downgrade(arc), bytes));
+                }
+            }
         }
-        self.statements.remove(name);
+    }
+
+    /// 最後の参照が消えた孤児を台帳から外す。
+    fn sweep_orphans(&mut self) {
+        self.orphans.retain(|(w, _)| w.strong_count() > 0);
+    }
+
+    /// 生存している孤児のバイト数合計（飽和加算）。
+    fn orphan_bytes(&self) -> usize {
+        self.orphans
+            .iter()
+            .filter(|(w, _)| w.strong_count() > 0)
+            .fold(0usize, |acc, (_, b)| acc.saturating_add(*b))
     }
 }
 
@@ -914,6 +968,15 @@ struct Portal {
     /// [`MAX_BOUND_PARAM_BYTES_PER_SESSION`] で制限する（[`PortalStore::insert`]）。
     /// portal ごとの値から都度合算するため、除去経路での減算漏れが起きない。
     bound_bytes: usize,
+    /// Bind 時点の準備済み文（権限再検査用のスナップショット。`PreparedStatement::Empty` は `None`）。
+    /// Execute の読み取り権限再検査は、現在の statement を名前で引き直さず必ずこの値を使う
+    /// （無名 statement の置換・破棄後も、実行する文と検査する文を同一にそろえる。Issue #1967）。
+    /// 不変の準備済み文は `Arc` で statement と共有する（Bind ごとに深く複製しないため、多数の portal を
+    /// 開いても保持量は増えず、[`MAX_PREPARED_SQL_BYTES_PER_SESSION`] の算入外の複製が生じない）。
+    prepared_snapshot: Option<std::sync::Arc<PreparedSql>>,
+    /// Bind 時点で文が直接参照した relation の同一性。Execute の権限再検査の前に、同じ定義のままかを
+    /// 照合する（DROP・置換・再作成された relation の古い展開結果を実行しない。Issue #1967）。
+    relation_identity: engine::core::PreparedRelationIdentity,
 }
 
 /// 接続単位で portal を保持する（[`PreparedStatementStore`] と同型の設計）。
@@ -1064,6 +1127,10 @@ pub(crate) struct ExtendedQueryState {
     /// `handshake::post_auth_loop` は Sync（'S'）・Terminate（'X'）以外の
     /// メッセージを読み捨てる。
     pub(crate) ignore_till_sync: bool,
+    /// `ignore_till_sync` を立てたエラーが内部エラー（`XX000`）だったか。真なら
+    /// `handshake::post_auth_loop` は明示 Tx を `ROLLBACK TO` で復帰できない `Failed` へ倒し
+    /// writer を即時解放する（エラー契約。Issue #1947）。Sync で `false` へ戻す。
+    pub(crate) ignore_till_sync_internal: bool,
     /// 同期回復中に読み捨てた COPY 系メッセージ（'d'/'c'/'f'）のバイト数・件数
     /// （Issue #1761）。`handshake::post_auth_loop` が加算し、Sync で 0 へ戻す。
     pub(crate) ignored_copy_bytes: usize,
@@ -1084,6 +1151,7 @@ impl ExtendedQueryState {
             statements: PreparedStatementStore::with_max_named(limits.max_prepared_statements),
             portals: PortalStore::new(),
             ignore_till_sync: false,
+            ignore_till_sync_internal: false,
             ignored_copy_bytes: 0,
             ignored_copy_messages: 0,
         }
@@ -1410,6 +1478,9 @@ fn respond_error_and_await_sync<S: WireStream>(
     stream.write_all(&body)?;
     stream.flush()?;
     state.ignore_till_sync = true;
+    if err.error_class() == ErrorClass::InternalError {
+        state.ignore_till_sync_internal = true;
+    }
     Ok(())
 }
 
@@ -1486,13 +1557,13 @@ fn handle_parse_body(
 ) -> Result<(), HandlerError> {
     // フレーム本体の構造検証（`08P01`）だけを先に行う。
     let msg = parse_parse_body(body)?;
-    // 明示トランザクションが `Failed` の間は、`ROLLBACK` と空文字列以外を、
+    // 明示トランザクションが `Failed` の間は、`ROLLBACK`・`ROLLBACK TO`（Issue #1947）と空文字列以外を、
     // パラメータ型 OID 指定の未対応（`0A000`）等の機能検証や parse より前に
     // `25P02` で拒否する（SQL-31・TASK-221。簡易クエリの
     // `EngineCore::execute_sql_in_txn` と同じ判定順序。PR #1041 レビュー指摘）。
     if txn.status() == engine::sql::transaction::TransactionStatus::Failed
         && !engine::sql::lexer::is_effectively_empty(&msg.query)
-        && !engine::sql::transaction::is_rollback_statement(&msg.query)
+        && !engine::sql::transaction::is_allowed_while_failed(&msg.query)
     {
         return Err(HandlerError::Sql(txn.take_failed_error()));
     }
@@ -1543,13 +1614,16 @@ fn handle_parse_body(
                     return Err(HandlerError::DeclaredParamTypesExceedPlaceholders);
                 }
                 PreparedStatement::Parsed {
-                    parsed: parsed.clone(),
-                    prepared: Box::new(prepared),
+                    parsed: Box::new(parsed.clone()),
+                    prepared: std::sync::Arc::new(prepared),
                 }
             }
             None => {
                 let slots = build_param_slots(&prepared, &declared_oids)?;
-                PreparedStatement::Parameterized { prepared, slots }
+                PreparedStatement::Parameterized {
+                    prepared: std::sync::Arc::new(prepared),
+                    slots,
+                }
             }
         }
     };
@@ -1762,7 +1836,7 @@ fn handle_describe_body(
                     // カーソル文は開いているカーソルから列を引く従来の経路のまま。
                     if needs_session_revalidation(session, parsed)
                         || (EngineCore::txn_reads_begin_snapshot(txn)
-                            && !matches!(parsed, ParsedSql::Cursor(_)))
+                            && !matches!(&**parsed, ParsedSql::Cursor(_)))
                     {
                         engine
                             .describe_prepared_in_txn(session, txn, prepared)
@@ -1864,21 +1938,18 @@ fn handle_bind_body(
     // ステートメントの判定より先に行う（PR #1041 レビュー指摘:
     // 機能・対象の検証が先行すると `Failed` 中でも `25P02` 以外が返る）。
     if txn.status() == engine::sql::transaction::TransactionStatus::Failed {
-        let is_exit_or_empty = matches!(
-            state.statements.get(&msg.statement_name),
-            Some(
-                PreparedStatement::Empty
-                    | PreparedStatement::Parsed {
-                        parsed: ParsedSql::Transaction(
-                            engine::sql::transaction::ValidatedTxnControl {
-                                control: engine::sql::transaction::TxnControl::Rollback,
-                                ..
-                            }
-                        ),
-                        ..
-                    }
-            )
-        );
+        let is_exit_or_empty = match state.statements.get(&msg.statement_name) {
+            Some(PreparedStatement::Empty) => true,
+            Some(PreparedStatement::Parsed { parsed, .. }) => matches!(
+                &**parsed,
+                ParsedSql::Transaction(engine::sql::transaction::ValidatedTxnControl {
+                    control: engine::sql::transaction::TxnControl::Rollback
+                        | engine::sql::transaction::TxnControl::RollbackToSavepoint,
+                    ..
+                })
+            ),
+            _ => false,
+        };
         if !is_exit_or_empty {
             return Err(HandlerError::Sql(txn.take_failed_error()));
         }
@@ -1903,6 +1974,14 @@ fn handle_bind_body(
         return Err(HandlerError::ParamCountMismatch);
     }
 
+    // SQL-40・Issue #1967: 文が直接参照する relation の同一性を Bind の前後で取り、portal に保持する
+    // （Execute 前に照合する）。Bind が展開するビュー本文と権限の判定対象を同じ定義にそろえる。
+    let relation_identity = match prepared_arc(statement) {
+        Some(prepared) => engine
+            .prepared_relation_identity_in_txn(session, txn, prepared)
+            .map_err(HandlerError::Sql)?,
+        None => engine::core::PreparedRelationIdentity::default(),
+    };
     let mut bound_bytes = 0usize;
     let (portal_body, columns) = match statement {
         PreparedStatement::Empty => (PortalBody::Empty, None),
@@ -1984,11 +2063,11 @@ fn handle_bind_body(
                 // SQL-40・Issue #1967: 束縛済みのロールは Bind のたびに権限を再検査する（Parse 後の
                 // `REVOKE` を Execute 前に反映する。未束縛のセッションは従来の経路のまま）。
                 || session.object_privileges_enforced()
-                || matches!(parsed, ParsedSql::SessionRouted(_))
+                || matches!(&**parsed, ParsedSql::SessionRouted(_))
                 // COPY は Execute で元 SQL を現在のカタログへ再解決するため、一時表を持たない
                 // セッションでも世代つきの包みを作る（Bind 後に作られた同名の一時表への化けを
                 // Execute 前に `0A000` で拒否する。Issue #1760）。
-                || matches!(parsed, ParsedSql::Copy(_))
+                || matches!(&**parsed, ParsedSql::Copy(_))
                 // writer 取得前の明示トランザクションは、Parse 時（最新カタログ）の解決結果を使い回さず、
                 // Bind で `BEGIN` 時点のカタログにより再検証する（Issue #2403）。
                 || EngineCore::txn_reads_begin_snapshot(txn)
@@ -2005,7 +2084,7 @@ fn handle_bind_body(
                 engine
                     .recheck_prepared_schema_usage(session, prepared)
                     .map_err(HandlerError::Sql)?;
-                parsed.clone()
+                (**parsed).clone()
             };
             // WIRE-15・TASK-218: `describe_parsed_in_txn` へ切り替える
             // （`handle_describe_body` と同じ理由。`FETCH` の portal 列メタは
@@ -2033,6 +2112,18 @@ fn handle_bind_body(
             .map_err(HandlerError::BinaryFormat)?;
     }
 
+    if let Some(prepared) = prepared_arc(statement) {
+        engine
+            .check_prepared_relation_identity(session, txn, prepared, &relation_identity)
+            .map_err(HandlerError::Sql)?;
+    }
+    let prepared_snapshot = match state.statements.get(&msg.statement_name) {
+        Some(PreparedStatement::Parsed { prepared, .. }) => Some(std::sync::Arc::clone(prepared)),
+        Some(PreparedStatement::Parameterized { prepared, .. }) => {
+            Some(std::sync::Arc::clone(prepared))
+        }
+        _ => None,
+    };
     let portal = Portal {
         source_statement: msg.statement_name,
         body: portal_body,
@@ -2042,7 +2133,10 @@ fn handle_bind_body(
         cursor_binding: None,
         bound_txn_generation: txn.active_generation(),
         survived_sync: false,
-        bound_bytes,
+        // portal ごとに保持する relation 定義のコピーも、束縛値と同じ接続単位の上限へ算入する。
+        bound_bytes: bound_bytes.saturating_add(relation_identity.retained_bytes()),
+        prepared_snapshot,
+        relation_identity,
     };
 
     state
@@ -2212,7 +2306,8 @@ fn portal_is_exempt_while_failed(state: &ExtendedQueryState, portal_name: &str) 
                 matches!(
                     **parsed,
                     ParsedSql::Transaction(engine::sql::transaction::ValidatedTxnControl {
-                        control: engine::sql::transaction::TxnControl::Rollback,
+                        control: engine::sql::transaction::TxnControl::Rollback
+                            | engine::sql::transaction::TxnControl::RollbackToSavepoint,
                         ..
                     })
                 ) && matches!(portal.state, PortalState::Ready)
@@ -2313,6 +2408,43 @@ fn execute_portal<'e, S: WireStream>(
                 portal.result_formats.clone(),
             )
         };
+
+        // SQL-40・Issue #1967: 結果を初めて具体化する前に読み取り権限を現在の主体で再検査する
+        // （Bind 後の `REVOKE` や、別 portal の `SET ROLE` を反映する。fail-closed）。準備済み文が
+        // 引けない場合も拒否する。未束縛のセッションでは何もしない。
+        if session.object_privileges_enforced() {
+            // 実行する本文は Bind 時に展開した定義のまま。参照先が DROP・置換・再作成されていれば、現在の
+            // 名前の権限で通すと古い本文（別の表）を読めてしまうため、権限の再検査より前に失効させる。
+            // portal が保持する同一性は複製せず参照で照合する。
+            let gate = {
+                let portal = state
+                    .portals
+                    .get(portal_name)
+                    .ok_or(HandlerError::UnknownPortal)?;
+                match portal.prepared_snapshot.as_ref() {
+                    Some(prepared) => engine
+                        .check_prepared_relation_identity(
+                            session,
+                            txn,
+                            prepared,
+                            &portal.relation_identity,
+                        )
+                        .and_then(|()| {
+                            engine.recheck_prepared_read_privileges_in_txn(
+                                session, txn, prepared, &parsed,
+                            )
+                        }),
+                    None => Err(engine::sql::allowlist::SqlSurfaceError::InsufficientPrivilege),
+                }
+            };
+            if let Err(e) = gate {
+                if let Some(portal) = state.portals.get_mut(portal_name) {
+                    portal.state = PortalState::Failed;
+                }
+                txn.fail();
+                return Err(HandlerError::Sql(e));
+            }
+        }
 
         // `engine::sql::allowlist::Statement`（`ParsedSql::Statement`）は
         // `SELECT`／`SET search_mode`／`CREATE FUNCTION`／`EXPLAIN` のみで、
@@ -2801,6 +2933,7 @@ pub(crate) fn handle_sync<S: WireStream>(
     };
 
     state.ignore_till_sync = false;
+    state.ignore_till_sync_internal = false;
     state.ignored_copy_bytes = 0;
     state.ignored_copy_messages = 0;
     // WIRE-11・SQL-31・TASK-221・Issue #1174: 明示トランザクション中
@@ -2896,6 +3029,270 @@ pub(crate) fn handle_flush<S: WireStream>(stream: &mut S) -> io::Result<LoopSign
 
 #[cfg(test)]
 mod tests {
+    /// Issue #1967: portal は Bind 時点の準備済み文を保持し、後続の無名 statement の置換・破棄に
+    /// 影響されない（Execute の権限再検査は現在の statement を引き直さずこの値を使う）。
+    #[test]
+    fn portal_keeps_bind_time_prepared_snapshot_across_unnamed_reparse() {
+        use engine::kernel::CpuScalarProvider;
+        use engine::storage::Storage;
+        let path = std::env::temp_dir().join(format!(
+            "portal-snap-{}-{:?}.redb",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let storage = Storage::open(&path).expect("open storage");
+        let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+        let session = engine::sql::mode::SessionState::default();
+        let mut txn = engine::sql::transaction::SessionTransaction::new(
+            engine::sql::transaction::TransactionLimits::default(),
+        );
+        let mut state = ExtendedQueryState::new();
+        let parse = |q: &str| {
+            let mut b = Vec::new();
+            b.push(0u8);
+            b.extend_from_slice(q.as_bytes());
+            b.push(0);
+            b.extend_from_slice(&0i16.to_be_bytes());
+            b
+        };
+        let mut bind = vec![b'p', 0, 0];
+        bind.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+        handle_parse_body(
+            &core,
+            &session,
+            &mut txn,
+            &mut state.statements,
+            &parse("SELECT 1"),
+        )
+        .map_err(|_| ())
+        .expect("parse 1");
+        handle_bind_body(&core, &session, &mut txn, &mut state, &bind)
+            .map_err(|_| ())
+            .expect("bind");
+        let before = format!(
+            "{:?}",
+            state.portals.get("p").expect("portal").prepared_snapshot
+        );
+        handle_parse_body(
+            &core,
+            &session,
+            &mut txn,
+            &mut state.statements,
+            &parse("SELECT 2"),
+        )
+        .map_err(|_| ())
+        .expect("parse 2");
+        let after = format!(
+            "{:?}",
+            state.portals.get("p").expect("portal").prepared_snapshot
+        );
+        assert_eq!(before, after);
+        assert!(state
+            .portals
+            .get("p")
+            .expect("portal")
+            .prepared_snapshot
+            .is_some());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Issue #1967 レビュー指摘: 同じ文を多数の named portal へ Bind しても準備済み文は複製されず、
+    /// statement と全 portal が同一の `Arc` を共有する（算入外の複製で接続の保持量上限を迂回できない）。
+    #[test]
+    fn many_portals_share_one_prepared_statement() {
+        use engine::kernel::CpuScalarProvider;
+        use engine::storage::Storage;
+        let path = std::env::temp_dir().join(format!(
+            "portal-share-{}-{:?}.redb",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let storage = Storage::open(&path).expect("open storage");
+        let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+        let session = engine::sql::mode::SessionState::default();
+        let mut txn = engine::sql::transaction::SessionTransaction::new(
+            engine::sql::transaction::TransactionLimits::default(),
+        );
+        let mut state = ExtendedQueryState::new();
+        let mut parse = vec![b's', 0];
+        parse.extend_from_slice(b"SELECT 1");
+        parse.extend(std::iter::repeat_n(b' ', 100_000));
+        parse.push(0);
+        parse.extend_from_slice(&0i16.to_be_bytes());
+        handle_parse_body(&core, &session, &mut txn, &mut state.statements, &parse)
+            .map_err(|_| ())
+            .expect("parse");
+        for i in 0..MAX_PORTALS_PER_SESSION {
+            let mut bind = format!("p{i}").into_bytes();
+            bind.push(0);
+            bind.extend_from_slice(b"s\0");
+            bind.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+            handle_bind_body(&core, &session, &mut txn, &mut state, &bind)
+                .map_err(|_| ())
+                .expect("bind");
+        }
+        let statement_arc = match state.statements.get("s") {
+            Some(PreparedStatement::Parsed { prepared, .. }) => prepared,
+            _ => panic!("parsed statement expected"),
+        };
+        assert_eq!(
+            std::sync::Arc::strong_count(statement_arc),
+            1 + MAX_PORTALS_PER_SESSION
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Issue #1967 レビュー指摘: 無名 statement の再 Parse で台帳から外れた旧文でも、portal が保持して
+    /// いる間は接続の保持量に算入され続け、上限を超える前に Parse が拒否される。portal を Close すれば
+    /// 容量が戻り、再び Parse できる。
+    #[test]
+    fn replaced_statement_held_by_portal_stays_accounted_until_portal_closes() {
+        use engine::kernel::CpuScalarProvider;
+        use engine::storage::Storage;
+        let path = std::env::temp_dir().join(format!(
+            "portal-orphan-{}-{:?}.redb",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let storage = Storage::open(&path).expect("open storage");
+        let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+        let session = engine::sql::mode::SessionState::default();
+        let mut txn = engine::sql::transaction::SessionTransaction::new(
+            engine::sql::transaction::TransactionLimits::default(),
+        );
+        let mut state = ExtendedQueryState::new();
+        let parse_unnamed = |pad: usize| {
+            let mut b = vec![0u8];
+            b.extend_from_slice(b"SELECT 1");
+            b.extend(std::iter::repeat_n(b' ', pad));
+            b.push(0);
+            b.extend_from_slice(&0i16.to_be_bytes());
+            b
+        };
+        let pad = 900 * 1024;
+        let mut accepted = 0usize;
+        let mut rejected = false;
+        for i in 0..MAX_PORTALS_PER_SESSION {
+            if handle_parse_body(
+                &core,
+                &session,
+                &mut txn,
+                &mut state.statements,
+                &parse_unnamed(pad),
+            )
+            .is_err()
+            {
+                rejected = true;
+                break;
+            }
+            let mut bind = format!("p{i}").into_bytes();
+            bind.push(0);
+            bind.push(0);
+            bind.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+            handle_bind_body(&core, &session, &mut txn, &mut state, &bind)
+                .map_err(|_| ())
+                .expect("bind");
+            accepted += 1;
+        }
+        assert!(
+            rejected,
+            "旧文を保持する portal があっても Parse が拒否されない"
+        );
+        assert!(accepted <= MAX_PREPARED_SQL_BYTES_PER_SESSION / pad);
+        // 旧文を保持する portal を閉じると容量が戻る。
+        state.portals.clear_all();
+        handle_parse_body(
+            &core,
+            &session,
+            &mut txn,
+            &mut state.statements,
+            &parse_unnamed(pad),
+        )
+        .map_err(|_| ())
+        .expect("parse after portals closed");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Issue #1967 レビュー指摘: 束縛済みセッションの portal が保持する relation 定義（同一性）のコピーは、
+    /// portal の保持量（`bound_bytes`）へ算入される（大きなビューを多数の named portal へ Bind して
+    /// 接続単位の上限を超える保持を作れない）。
+    #[test]
+    fn portal_retained_bytes_include_relation_definitions_of_bound_sessions() {
+        use engine::kernel::CpuScalarProvider;
+        use engine::storage::Storage;
+        let path = std::env::temp_dir().join(format!(
+            "portal-identity-{}-{:?}.redb",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let storage = Storage::open(&path).expect("open storage");
+        let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+        let ctx = engine::policy::PolicyContext::with_visibilities(
+            "t1",
+            [
+                engine::storage::Visibility::Public,
+                engine::storage::Visibility::Private,
+            ],
+        )
+        .expect("ctx");
+        let run = |s: &mut engine::sql::mode::SessionState, sql: &str| {
+            core.execute_sql_in_session(&ctx, s, sql)
+                .unwrap_or_else(|e| panic!("{:.60}: {e:?}", sql));
+        };
+        let mut op = engine::sql::mode::SessionState::default();
+        op.allow_ddl();
+        run(&mut op, "CREATE ROLE ra");
+        run(&mut op, "CREATE ROLE alice");
+        let mut admin = engine::sql::mode::SessionState::default();
+        admin.bind_role_ids(1, 1);
+        assert!(admin.bind_resolution_tenant("t1"));
+        admin.allow_ddl();
+        let cols: Vec<String> = (0..40)
+            .map(|i| format!("{}{i:02}", "c".repeat(55)))
+            .collect();
+        let defs: Vec<String> = cols.iter().map(|c| format!("{c} BIGINT")).collect();
+        run(
+            &mut admin,
+            &format!(
+                "CREATE TABLE ca (id BIGINT PRIMARY KEY, {})",
+                defs.join(", ")
+            ),
+        );
+        run(
+            &mut admin,
+            &format!("CREATE VIEW v AS SELECT {} FROM ca", cols.join(", ")),
+        );
+        run(&mut admin, "GRANT SELECT ON v TO alice");
+        let mut alice = engine::sql::mode::SessionState::default();
+        alice.bind_role_ids(2, 2);
+        assert!(alice.bind_resolution_tenant("t1"));
+        let mut txn = engine::sql::transaction::SessionTransaction::new(
+            engine::sql::transaction::TransactionLimits::default(),
+        );
+        let mut state = ExtendedQueryState::new();
+        let mut parse = vec![b's', 0];
+        parse.extend_from_slice(b"SELECT * FROM v");
+        parse.push(0);
+        parse.extend_from_slice(&0i16.to_be_bytes());
+        handle_parse_body(&core, &alice, &mut txn, &mut state.statements, &parse)
+            .map_err(|_| ())
+            .expect("parse");
+        let mut bind = b"p".to_vec();
+        bind.push(0);
+        bind.extend_from_slice(b"s\0");
+        bind.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+        handle_bind_body(&core, &alice, &mut txn, &mut state, &bind)
+            .map_err(|_| ())
+            .expect("bind");
+        let portal = state.portals.get("p").expect("portal");
+        assert!(
+            portal.bound_bytes >= 2000,
+            "relation definition bytes must be accounted: {}",
+            portal.bound_bytes
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// 中断 portal の保持量見積りは wire 表現（`frame_len`）より行本体・`Cell` 配列分だけ大きい
     /// （NULL 多数の行で上限会計が過小にならない。Issue #1575 レビュー指摘）。
     #[test]
@@ -3365,6 +3762,8 @@ mod tests {
     fn portal_with_bound_bytes(bound_bytes: usize) -> Portal {
         Portal {
             source_statement: String::new(),
+            prepared_snapshot: None,
+            relation_identity: Default::default(),
             body: PortalBody::Empty,
             columns: None,
             result_formats: Vec::new(),
@@ -3528,6 +3927,8 @@ mod tests {
                     format!("p{i}"),
                     Portal {
                         source_statement: String::new(),
+                        prepared_snapshot: None,
+                        relation_identity: Default::default(),
                         body: PortalBody::Empty,
                         columns: None,
                         result_formats: Vec::new(),
@@ -3544,6 +3945,8 @@ mod tests {
             format!("p{MAX_PORTALS_PER_SESSION}"),
             Portal {
                 source_statement: String::new(),
+                prepared_snapshot: None,
+                relation_identity: Default::default(),
                 body: PortalBody::Empty,
                 columns: None,
                 result_formats: Vec::new(),
@@ -3565,6 +3968,8 @@ mod tests {
                 String::new(),
                 Portal {
                     source_statement: String::new(),
+                    prepared_snapshot: None,
+                    relation_identity: Default::default(),
                     body: PortalBody::Empty,
                     columns: None,
                     result_formats: Vec::new(),
@@ -3581,6 +3986,8 @@ mod tests {
                 "named".to_string(),
                 Portal {
                     source_statement: String::new(),
+                    prepared_snapshot: None,
+                    relation_identity: Default::default(),
                     body: PortalBody::Empty,
                     columns: None,
                     result_formats: Vec::new(),
@@ -3606,6 +4013,8 @@ mod tests {
                 "p1".to_string(),
                 Portal {
                     source_statement: "stmt1".to_string(),
+                    prepared_snapshot: None,
+                    relation_identity: Default::default(),
                     body: PortalBody::Empty,
                     columns: None,
                     result_formats: Vec::new(),
@@ -3622,6 +4031,8 @@ mod tests {
                 "p2".to_string(),
                 Portal {
                     source_statement: "stmt2".to_string(),
+                    prepared_snapshot: None,
+                    relation_identity: Default::default(),
                     body: PortalBody::Empty,
                     columns: None,
                     result_formats: Vec::new(),
@@ -3642,6 +4053,8 @@ mod tests {
     fn portal_bound_at(generation: Option<u64>, survived_sync: bool) -> Portal {
         Portal {
             source_statement: String::new(),
+            prepared_snapshot: None,
+            relation_identity: Default::default(),
             body: PortalBody::Empty,
             columns: None,
             result_formats: Vec::new(),

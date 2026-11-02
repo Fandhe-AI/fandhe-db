@@ -329,3 +329,45 @@ fn read_only_duration_limit_fails_statement_after_expiry() {
         .expect("rollback");
     assert_eq!(txn.status(), TransactionStatus::Idle);
 }
+/// Issue #1947（SQL-31・SQL-69）: `ROLLBACK TO` で復帰できる失敗状態は writer を保持するため、
+/// 期限は `BEGIN` 起点で効き、`release_if_expired` が解放して `54000` を 1 度だけ返す。
+/// 期限後は復帰できず（`25P02`）、`ROLLBACK` で `Idle` に戻る。
+#[test]
+fn recoverable_failed_state_is_released_by_expiry() {
+    let (engine, path) = new_core(limits_with_duration_ms(300));
+    let _cleanup = CleanupGuard(path);
+    let caller = ctx();
+    let mut session = SessionState::default();
+    let mut txn = engine.new_session_transaction();
+    for sql in ["BEGIN", "SAVEPOINT a", &insert_sql(1)] {
+        engine
+            .execute_sql_in_txn(&caller, &mut session, &mut txn, sql)
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    assert!(engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "SELEC nonsense")
+        .is_err());
+    assert_eq!(txn.status(), TransactionStatus::Failed);
+    let remaining = txn.remaining_duration().expect("writer is still held");
+    assert!(remaining <= std::time::Duration::from_millis(300));
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert!(txn.release_if_expired());
+    assert!(!txn.release_if_expired());
+    // writer は解放され、別セッションの書き込みが成功する。
+    let mut other = SessionState::default();
+    engine
+        .execute_sql_in_session(&caller, &mut other, &insert_sql(2))
+        .expect("writer released by expiry");
+    let err = engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "ROLLBACK TO a")
+        .expect_err("expired failure is reported once");
+    assert_eq!(err.wire_code(), "54000");
+    let err = engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "ROLLBACK TO a")
+        .expect_err("no longer recoverable");
+    assert_eq!(err.wire_code(), "25P02");
+    engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "ROLLBACK")
+        .expect("rollback");
+    assert_eq!(txn.status(), TransactionStatus::Idle);
+}

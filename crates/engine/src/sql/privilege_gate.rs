@@ -23,6 +23,7 @@
 //!   運用者権限（`ddl_allowed`）は所有者相当として全権限を持つ（所有者の機構 #2236 まで）。
 //! - 列単位の付与だけでは表単位の要求を満たさない（暫定の fail-closed。列集合の判定は #2081 の担当）。
 
+use crate::catalog::privilege::owner::OwnerGate;
 use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::mode::SessionState;
 
@@ -87,6 +88,7 @@ pub(crate) enum DdlStatementKind {
     AlterSchema,
     CreateFunction,
     DropFunction,
+    AlterOwner,
 }
 
 impl DdlStatementKind {
@@ -121,11 +123,13 @@ impl DdlStatementKind {
         Self::AlterSchema,
         Self::CreateFunction,
         Self::DropFunction,
+        Self::AlterOwner,
     ];
 
     /// 文種と必要権限の表。ワイルドカード腕を使わない網羅 `match` で、文種の追加時に表の更新を強制する。
-    /// 現時点はすべて運用者権限。オブジェクトごとの所有者・SCHEMA の CREATE・CREATEROLE への移行は
-    /// 後続 Issue（#2236・#2234・#1971）で、各腕をその権限へ差し替える。
+    /// 共有カタログを変える文種は運用者権限（`ServerDdl`）のまま。テナント別定義（SCHEMA・関数）の
+    /// DROP・ALTER は所有者にも許す（`ServerDdlOrOwner`。ADR D6・Issue #2236）。`OWNER TO` は文種の
+    /// 段では運用者権限を要求せず、所有者判定を含む実行本体（`sql::owner_ddl`）が判定する。
     pub(crate) fn required_privilege(self) -> RequiredPrivilege {
         match self {
             Self::CreateTable
@@ -152,10 +156,10 @@ impl DdlStatementKind {
             | Self::CreateRole
             | Self::DropRole
             | Self::CreateSchema
-            | Self::DropSchema
-            | Self::AlterSchema
-            | Self::CreateFunction
-            | Self::DropFunction => RequiredPrivilege::ServerDdl,
+            | Self::CreateFunction => RequiredPrivilege::ServerDdl,
+            Self::DropSchema | Self::AlterSchema | Self::DropFunction | Self::AlterOwner => {
+                RequiredPrivilege::ServerDdlOrOwner
+            }
         }
     }
 }
@@ -168,6 +172,29 @@ pub(crate) enum RequiredPrivilege {
     /// relation への表単位のオブジェクト権限（`catalog::privilege::PRIV_*` ビットの集合。全ビットが必要）。
     /// 後続の #1968（DML）・#1969（COPY）が同じ variant を使う。
     Object { bits: u16 },
+    /// 運用者権限、またはテナント別定義（SCHEMA・関数）の所有者（Issue #2236）。所有者かどうかは
+    /// カタログを引かないと決まらないため、ゲートは [`GateDecision::OwnerCheckRequired`] を返し、
+    /// 実行本体が書き込み txn の中で判定する。
+    ServerDdlOrOwner,
+}
+
+/// ゲートの判定結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GateDecision {
+    /// 運用者権限で許可（所有者検査は不要）。
+    Allowed,
+    /// 束縛ロール `role_id` が対象の所有者であることを、実行本体が write txn 内で確認する。
+    OwnerCheckRequired(u64),
+}
+
+impl GateDecision {
+    /// 実行本体（write txn 内）へ渡す所有者検査の要求へ変換する。
+    pub(crate) fn owner_gate(self) -> OwnerGate {
+        match self {
+            Self::Allowed => OwnerGate::Skip,
+            Self::OwnerCheckRequired(role_id) => OwnerGate::RequireOwner(role_id),
+        }
+    }
 }
 
 /// 判定の対象。
@@ -176,7 +203,7 @@ pub(crate) enum PrivilegeTarget {
     /// DDL 文種。
     Ddl(DdlStatementKind),
     /// relation（表・ビュー・matview）。`granted_bits` は呼び出し元が ACL から解決した実効権限
-    /// （現在ロールへの直接付与と PUBLIC の和。表単位の行だけで、列単位の付与は含めない）。
+    /// （現在ロールの INHERIT 閉包への付与と PUBLIC の和。表単位の行だけで、列単位の付与は含めない）。
     Relation {
         required_bits: u16,
         granted_bits: u16,
@@ -186,7 +213,10 @@ pub(crate) enum PrivilegeTarget {
 /// 権限判定の唯一の関数。権限不足は固定文言の `42501`（fail-closed）。
 /// `RequiredPrivilege` に variant を足したときは、未実装の判定を `Ok` に倒さず拒否側にする
 /// （ワイルドカード腕を置かない）。
-pub(crate) fn check(principal: &Principal, target: PrivilegeTarget) -> Result<(), SqlSurfaceError> {
+pub(crate) fn check(
+    principal: &Principal,
+    target: PrivilegeTarget,
+) -> Result<GateDecision, SqlSurfaceError> {
     match target {
         PrivilegeTarget::Ddl(kind) => check_required(principal, kind.required_privilege(), 0),
         PrivilegeTarget::Relation {
@@ -206,16 +236,16 @@ fn check_required(
     principal: &Principal,
     required: RequiredPrivilege,
     granted_bits: u16,
-) -> Result<(), SqlSurfaceError> {
+) -> Result<GateDecision, SqlSurfaceError> {
     match required {
         RequiredPrivilege::Object { bits } => match principal.current_role_id {
             // 現在ロールが未束縛の主体（#1971 まで本番のセッションはすべてここ）。オブジェクト権限は判定しない。
-            None => Ok(()),
+            None => Ok(GateDecision::Allowed),
             // PUBLIC の予約 ID は主体になれない（`bound_principal` と同じく拒否）。
             Some(0) => Err(SqlSurfaceError::RelationPermissionDenied),
             Some(_) => {
                 if principal.ddl_allowed || (bits != 0 && granted_bits & bits == bits) {
-                    Ok(())
+                    Ok(GateDecision::Allowed)
                 } else {
                     Err(SqlSurfaceError::RelationPermissionDenied)
                 }
@@ -223,19 +253,42 @@ fn check_required(
         },
         RequiredPrivilege::ServerDdl => {
             if principal.ddl_allowed {
-                Ok(())
+                Ok(GateDecision::Allowed)
             } else {
                 Err(SqlSurfaceError::InsufficientPrivilege)
+            }
+        }
+        RequiredPrivilege::ServerDdlOrOwner => {
+            if principal.ddl_allowed {
+                return Ok(GateDecision::Allowed);
+            }
+            // 未束縛はカタログを引く前に拒否する（存在オラクルの防止）。
+            match principal.current_role_id {
+                Some(id) if id != 0 => Ok(GateDecision::OwnerCheckRequired(id)),
+                _ => Err(SqlSurfaceError::InsufficientPrivilege),
             }
         }
     }
 }
 
-/// `core.rs` の DDL 腕から呼ぶ。文種付きで [`check`] を経由する。
+/// `core.rs` の DDL 腕から呼ぶ。文種付きで [`check`] を経由する。所有者検査を要する判定
+/// （[`GateDecision::OwnerCheckRequired`]）は、所有者検査を持たない呼び出し元では拒否に倒す。
 pub(crate) fn require_ddl(
     session: &SessionState,
     kind: DdlStatementKind,
 ) -> Result<(), SqlSurfaceError> {
+    match require_ddl_or_owner(session, kind)? {
+        GateDecision::Allowed => Ok(()),
+        GateDecision::OwnerCheckRequired(_) => Err(SqlSurfaceError::InsufficientPrivilege),
+    }
+}
+
+/// 所有者検査を実行本体が担う腕（`DROP SCHEMA`・`ALTER SCHEMA`・`DROP FUNCTION`・`OWNER TO`）から呼ぶ。
+/// 運用者権限があれば `Allowed`、束縛ロールだけなら `OwnerCheckRequired`、未束縛は `42501`。
+pub(crate) fn require_ddl_or_owner(
+    session: &SessionState,
+    kind: DdlStatementKind,
+) -> Result<GateDecision, SqlSurfaceError> {
     check(
         &Principal::from_session(session),
         PrivilegeTarget::Ddl(kind),
@@ -250,6 +303,7 @@ pub(crate) fn require_server_ddl(session: &SessionState) -> Result<(), SqlSurfac
         RequiredPrivilege::ServerDdl,
         0,
     )
+    .map(|_| ())
 }
 
 /// 現在ロールの束縛判定。未束縛と PUBLIC の予約 ID `0` は `42501`（カタログ照会・`0A000` より前）。
@@ -260,7 +314,8 @@ pub(crate) fn bound_principal(session: &SessionState) -> Result<u64, SqlSurfaceE
     }
 }
 
-/// 所有者の機構（#2236）ができるまでの代替判定。運用者権限の有無と一致し、ロールの束縛に影響されない。
+/// 運用者権限による「所有者相当」の判定（運用者権限の有無と一致し、ロールの束縛に影響されない）。
+/// 実際のオブジェクト所有者（#2236）は、これとは別に所有者行で判定して加算する（縮めない。ADR O1）。
 pub(crate) fn is_owner_equivalent(session: &SessionState) -> bool {
     require_server_ddl(session).is_ok()
 }

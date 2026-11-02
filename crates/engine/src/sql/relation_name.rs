@@ -431,7 +431,6 @@ pub(crate) fn relation_positions(tokens: &[Token]) -> RelationWalk {
                 1 => {
                     let kind_word = [
                         "SCHEMA",
-                        "SEQUENCE",
                         "FUNCTION",
                         "PROCEDURE",
                         "ROUTINE",
@@ -447,7 +446,11 @@ pub(crate) fn relation_positions(tokens: &[Token]) -> RelationWalk {
                     ]
                     .iter()
                     .any(|k| ident_is(Some(cur), k));
-                    if ident_is(Some(cur), "TABLE") && next_word {
+                    // `ON SEQUENCE <名>[, ...]`（Issue #2235）は `ON TABLE` と同じく relation 位置にする
+                    // （SEQUENCE も relation キーで引く。SCHEMA 修飾は表と同じ解決器で内部キーへ）。
+                    if (ident_is(Some(cur), "TABLE") || ident_is(Some(cur), "SEQUENCE"))
+                        && next_word
+                    {
                         grant_phase = 2;
                     } else if kind_word && next_word {
                         grant_phase = 4;
@@ -566,6 +569,7 @@ pub(crate) fn rewrite_relation_names_full(
         })
         .collect();
     let mut public_drop_rewrites: Vec<(usize, String)> = Vec::new();
+    let grant_function_range = grant_function_token_range(tokens);
     for (i, t) in tokens.iter().enumerate() {
         let Token::QualifiedIdent { qualifier, .. } = t else {
             continue;
@@ -576,10 +580,13 @@ pub(crate) fn rewrite_relation_names_full(
         // `DROP FUNCTION s.f`（#1920）は型の並びの括弧を省略できるため、先頭が `DROP FUNCTION` の文では
         // 3 語目の修飾名を（括弧が無くても）関数位置として扱う。
         // `DROP FUNCTION IF EXISTS s.f`（Issue #1917）は名前が 5 語目にある。
-        let drop_function_name = ident_is(tokens.first(), "DROP")
+        let drop_function_name = (ident_is(tokens.first(), "DROP")
             && ident_is(tokens.get(1), "FUNCTION")
             && (i == 2
-                || (i == 4 && ident_is(tokens.get(2), "IF") && ident_is(tokens.get(3), "EXISTS")));
+                || (i == 4 && ident_is(tokens.get(2), "IF") && ident_is(tokens.get(3), "EXISTS"))))
+            || grant_function_range
+                .as_ref()
+                .is_some_and(|r| r.contains(&i));
         // `DROP FUNCTION public.f` は `DROP TABLE public.t` と同様に裸の名前へ正規化する
         // （DROP は UDF カタログの削除だけで、組み込み関数へ化ける経路にならない）。
         if drop_function_name && qualifier.eq_ignore_ascii_case("public") {
@@ -596,7 +603,13 @@ pub(crate) fn rewrite_relation_names_full(
                 || ident_is(tokens.get(i - 1), "PROCEDURE"))
             && ident_is(tokens.get(i - 2), "EXECUTE")
             && crate::sql::allowlist::is_create_trigger_statement(tokens);
-        let strict_function_name = drop_function_name || trigger_function_name;
+        // `GRANT|REVOKE ... ON FUNCTION s.f[(型, ...)][, ...] TO|FROM ...`（Issue #2235）の関数名。括弧を省略
+        // できるため `(` の有無に依らず関数位置とし、存在しない SCHEMA は `3F000` で fail-closed にする。
+        let grant_function_name = grant_function_range
+            .as_ref()
+            .is_some_and(|r| r.contains(&i));
+        let strict_function_name =
+            drop_function_name || trigger_function_name || grant_function_name;
         let function_pos = resolver.is_some()
             && (strict_function_name || matches!(tokens.get(i + 1), Some(Token::Punct('('))))
             && !qualifier.eq_ignore_ascii_case("public")
@@ -699,6 +712,39 @@ pub(crate) fn rewrite_relation_names_full(
         Some(e) => Err(e),
         None => Ok(info),
     }
+}
+
+/// `GRANT|REVOKE ... ON FUNCTION <名>[, ...] TO|FROM` の名前並びのトークン範囲（`ON FUNCTION` の直後から
+/// 最初の最上位の `TO`／`FROM` の手前まで。Issue #2235）。GRANT／REVOKE 以外の文、`ON FUNCTION` を持たない
+/// 文は `None`。型の並びの括弧の中の語は `TO`／`FROM` と解釈しない。
+fn grant_function_token_range(tokens: &[Token]) -> Option<std::ops::Range<usize>> {
+    if !(ident_is(tokens.first(), "GRANT") || ident_is(tokens.first(), "REVOKE")) {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut start: Option<usize> = None;
+    for (i, t) in tokens.iter().enumerate() {
+        match t {
+            Token::Punct('(') => depth = depth.saturating_add(1),
+            Token::Punct(')') => depth = depth.saturating_sub(1),
+            _ if depth == 0 => match start {
+                None => {
+                    if ident_is(Some(t), "ON")
+                        && ident_is(tokens.get(i.saturating_add(1)), "FUNCTION")
+                    {
+                        start = Some(i.saturating_add(2));
+                    }
+                }
+                Some(s) => {
+                    if ident_is(Some(t), "TO") || matches!(t, Token::Keyword(Keyword::From)) {
+                        return Some(s..i);
+                    }
+                }
+            },
+            _ => {}
+        }
+    }
+    None
 }
 
 /// `nextval('s.q')`／`currval('s.q')`／`setval('s.q', ..)` の文字列引数（regclass 相当）のうち、
@@ -834,7 +880,8 @@ pub(crate) fn collect_cte_scopes(tokens: &[Token]) -> Vec<CteScope> {
         }
         let scope_end = enclosing_scope_end(tokens, start);
         let mut j = start + 1;
-        if ident_is(tokens.get(j), "RECURSIVE") {
+        let recursive = ident_is(tokens.get(j), "RECURSIVE");
+        if recursive {
             j += 1;
         }
         while let Some(name) = tokens.get(j).and_then(unqualified_ident_name) {
@@ -858,13 +905,16 @@ pub(crate) fn collect_cte_scopes(tokens: &[Token]) -> Vec<CteScope> {
             if !matches!(tokens.get(j), Some(Token::Punct('('))) {
                 break;
             }
+            let body_open = j;
             let Some(after) = skip_group(tokens, j) else {
                 break;
             };
             j = after;
             out.push(CteScope {
                 name: name.to_string(),
-                visible_from: after,
+                // `WITH RECURSIVE` の CTE は自身の本文（再帰項）から自己参照できるため、本文の開き括弧から可視
+                // にする（同名の実テーブルへの ACL 検査を誤って掛けない）。
+                visible_from: if recursive { body_open } else { after },
                 visible_to: scope_end,
             });
             if matches!(tokens.get(j), Some(Token::Punct(','))) {

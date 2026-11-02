@@ -17,9 +17,10 @@
 //!   段で不在と同じ応答になり、権限の分岐に入らない）。
 //! - ビュー・matview は、利用者に対してはそれ自身の SELECT だけを判定する（基底表はビュー所有者の権限で
 //!   読む扱い。ビューを作れるのは所有者相当の主体だけ。ADR §12）。
-//! - 最新のカタログで relation として引けない名前は拒否する（fail-closed）。名前解決を通った参照先が
-//!   BEGIN 後に DROP されても、スナップショットの行を権限なしで読ませない。CTE 名・表関数・構文語は
-//!   走査の段で除外済み。
+//! - カタログで relation として引けない名前（誤分類された識別子）は検査しない。ただし構文解析が
+//!   カタログで実在を確認した名前（`RelationHits` の記録。ビュー展開前のビュー自身を含む）が ACL 照会の
+//!   時点で見つからない場合は、解析後に DROP された参照先として拒否する（通常 SQL・準備済み文・明示 Tx の
+//!   どの経路でも同じ）。余分な検査は拒否側にだけ倒れる。
 //! - 参照数の上限を ACL の照会より前に検査する（untrusted 入力）。
 //! - エラーは固定文言の `42501`。表名・ロール ID・テナントを含めない。
 
@@ -80,7 +81,8 @@ pub(crate) fn classify(parsed: &ParsedSql) -> ReadRequirement {
                 NotApplicable
             }
         }
-        // DML（読み取り側の参照先を含む）の権限は `write::classify_write` が担う（#1968）。COPY は #1969。
+        // DML の読み取り側（SELECT 元・FROM／USING・サブクエリ）と書き込みの権限は #1968 が本モジュールの
+        // 収集関数を再利用して結線する。COPY は #1969。
         ParsedSql::Insert(_)
         | ParsedSql::InsertSelect(_)
         | ParsedSql::DataModifyingCte(_)
@@ -131,6 +133,7 @@ pub(crate) fn classify(parsed: &ParsedSql) -> ReadRequirement {
         | ParsedSql::CreateSchema(_)
         | ParsedSql::DropSchema(_)
         | ParsedSql::AlterSchema(_)
+        | ParsedSql::AlterOwner(_)
         | ParsedSql::AlterSequence(_)
         | ParsedSql::SequenceFunction(_) => NotApplicable,
     }
@@ -171,6 +174,7 @@ pub(crate) fn require_read_privileges(
     tokens: &[Token],
     resolver: Option<SchemaResolver<'_>>,
     requirement: ReadRequirement,
+    snapshot: ParsedScope<'_>,
 ) -> Result<(), SqlSurfaceError> {
     let Some(required_bits) = requirement.bits() else {
         return Ok(());
@@ -184,7 +188,8 @@ pub(crate) fn require_read_privileges(
                 required_bits,
                 granted_bits: 0,
             },
-        );
+        )
+        .map(|_| ());
     }
     let mut resolved = tokens.to_vec();
     crate::sql::relation_name::rewrite_relation_names_full(&mut resolved, resolver)?;
@@ -193,8 +198,9 @@ pub(crate) fn require_read_privileges(
         tenant,
         &principal,
         required_bits,
-        &crate::sql::search_path::resolved_relation_ref_names(&resolved),
-        &crate::sql::search_path::resolved_optional_only_names(&resolved),
+        &gate_relation_names(&resolved, snapshot.parsed_relations),
+        snapshot.read_snap,
+        snapshot.parsed_relations,
     )
 }
 
@@ -206,6 +212,7 @@ pub(crate) fn require_read_privileges_resolved(
     session: &SessionState,
     resolved_tokens: &[Token],
     requirement: ReadRequirement,
+    scope: ParsedScope<'_>,
 ) -> Result<(), SqlSurfaceError> {
     let Some(required_bits) = requirement.bits() else {
         return Ok(());
@@ -218,36 +225,70 @@ pub(crate) fn require_read_privileges_resolved(
                 required_bits,
                 granted_bits: 0,
             },
-        );
+        )
+        .map(|_| ());
     }
     require_relations(
         storage,
         tenant,
         &principal,
         required_bits,
-        &crate::sql::search_path::resolved_relation_ref_names(resolved_tokens),
-        &crate::sql::search_path::resolved_optional_only_names(resolved_tokens),
+        &gate_relation_names(resolved_tokens, scope.parsed_relations),
+        scope.read_snap,
+        scope.parsed_relations,
     )
 }
 
-/// 解決済みの relation 名の並びに対する判定（表名を直接渡す HTTP 表層の入口と共有する）。
-fn require_relations(
+/// 通常 SQL の構文解析の結果として権限ゲートへ渡す、参照先の確認の文脈。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ParsedScope<'a> {
+    /// 明示 Tx の読み取り源（`BEGIN` 時点のスナップショット）。無ければ最新の確定カタログ。
+    pub(crate) read_snap: Option<&'a redb::ReadTransaction>,
+    /// 構文解析がカタログで実在を確認した relation 名（ビュー展開前のビュー自身を含む）。
+    pub(crate) parsed_relations: &'a [String],
+}
+
+/// 権限検査の対象にする relation 名の合成（トークン収集器の候補 ∪ 解析が外側の文で直接解決した名前）。
+/// 収集器は字句の推測で構文語・別名を除くため取りこぼし（偽陰性。実表 `"if"`・`"only"` を構文語と誤認する
+/// 等）がありうる。解析（`RelationHits`）が深さ 0 で relation として解決した名前は、収集器が除外したかに
+/// かかわらず必ず加える。ビューの展開中に引かれた基底表は記録の段で除かれており（ビュー所有者の権限で読む
+/// 扱い。ADR §12）、基底表と同名の別名・列名があっても検査対象に戻らない。
+pub(super) fn gate_relation_names(
+    resolved_tokens: &[Token],
+    direct_relations: &[String],
+) -> Vec<String> {
+    let mut names = crate::sql::search_path::resolved_relation_ref_names(resolved_tokens);
+    for rel in direct_relations {
+        if !names.contains(rel) {
+            names.push(rel.clone());
+        }
+    }
+    names
+}
+
+/// 解決済みの relation 名の並びに対する判定（表名を直接渡す HTTP 表層の入口と共有する）。全名に同じ
+/// `required_bits` を課す。
+pub(super) fn require_relations(
     storage: &Storage,
     tenant: &str,
     principal: &Principal,
     required_bits: u16,
     candidates: &[String],
-    optional_only: &[String],
+    read_snap: Option<&redb::ReadTransaction>,
+    parsed_relations: &[String],
 ) -> Result<(), SqlSurfaceError> {
     let wants: Vec<(String, u16)> = candidates
         .iter()
         .map(|n| (n.clone(), required_bits))
         .collect();
-    let optional: Vec<(String, u16)> = optional_only
-        .iter()
-        .map(|n| (n.clone(), required_bits))
-        .collect();
-    require_relations_bits(storage, tenant, principal, &wants, &optional)
+    require_relations_bits(
+        storage,
+        tenant,
+        principal,
+        &wants,
+        read_snap,
+        parsed_relations,
+    )
 }
 
 /// relation ごとに必要ビットが異なる版の判定（#1968 の書き込み系ゲートと共有する唯一の ACL 照会点）。
@@ -257,7 +298,8 @@ pub(super) fn require_relations_bits(
     tenant: &str,
     principal: &Principal,
     wants: &[(String, u16)],
-    optional: &[(String, u16)],
+    read_snap: Option<&redb::ReadTransaction>,
+    parsed_relations: &[String],
 ) -> Result<(), SqlSurfaceError> {
     let mut merged: Vec<(String, u16)> = Vec::new();
     for (name, bits) in wants {
@@ -271,51 +313,37 @@ pub(super) fn require_relations_bits(
             ));
         }
     }
-    // 構文語か実表か区別できない `ONLY` は、実在する relation として引けたときだけ検査する。
-    // 必須として既に集めた名前と重なるものは必須側で検査済み。
-    let optional: Vec<&(String, u16)> = optional
-        .iter()
-        .filter(|(n, _)| !merged.iter().any(|(m, _)| m == n))
-        .collect();
-    if merged.is_empty() && optional.is_empty() {
+    let names: Vec<String> = merged.iter().map(|(n, _)| n.clone()).collect();
+    if names.is_empty() {
         return Ok(());
     }
-    if merged.len().saturating_add(optional.len()) > MAX_READ_RELATION_REFS {
-        return Err(SqlSurfaceError::payload_too_large(
-            "too many relation references",
-        ));
-    }
-    let names: Vec<String> = merged
-        .iter()
-        .map(|(n, _)| n.clone())
-        .chain(optional.iter().map(|(n, _)| n.clone()))
-        .collect();
     let role_id = principal.current_role_id().unwrap_or(0);
-    let bits = storage
-        .relation_grant_bits(tenant, &names, role_id)
-        .map_err(crate::catalog::table_lookup_error)?;
-    let optional_start = merged.len();
-    for (idx, granted) in bits.iter().enumerate().skip(optional_start) {
-        let (Some(granted), Some((_, required_bits))) =
-            (granted, optional.get(idx.saturating_sub(optional_start)))
-        else {
-            continue;
-        };
-        check(
-            principal,
-            PrivilegeTarget::Relation {
-                required_bits: *required_bits,
-                granted_bits: *granted,
-            },
-        )?;
+    // 明示 Tx（BEGIN 時のスナップショットで解析・実行する経路）では、ACL と relation の存在確認も同じ
+    // スナップショットで引く。最新カタログで引くと、BEGIN 後に別セッションが DROP した表が `None`
+    // （存在しない扱い）になり、旧スナップショットで読めてしまう認可バイパスになる。
+    let bits = match read_snap {
+        Some(snap) => {
+            crate::catalog::privilege::relation_grant_bits_in_txn(snap, tenant, &names, role_id)
+        }
+        None => storage.relation_grant_bits(tenant, &names, role_id),
     }
-    for ((_, required_bits), granted) in merged.iter().zip(bits) {
-        // 最新のカタログで relation として引けない名前は、権限を確認できないので拒否する（fail-closed）。
-        // 名前解決（`42P01`）を通った参照先は BEGIN 時点のスナップショットでは存在しうる（別セッションが
-        // 後から DROP した場合）ため、素通しにするとスナップショットの行を権限なしで読める。
-        // CTE 名・表関数・構文語は走査の段で除外済みで、ここへ来る名前は実際の読み取り源である。
+    .map_err(crate::catalog::table_lookup_error)?;
+    for ((name, required_bits), granted) in merged.iter().zip(bits) {
         let Some(granted) = granted else {
-            return Err(SqlSurfaceError::RelationPermissionDenied);
+            // 準備済み文（Parse 済みで名前解決済みのトークン列）の参照先が消えている場合は、別セッションの
+            // DROP 後に展開済みの文だけが残った状態であり、検査を省略すると SET ROLE 後のロールが
+            // 権限なしで基底表を読める認可バイパスになる。fail-closed で拒否する（fail-open にしない）。
+            // 通常 SQL でも、構文解析がカタログで実在を確認した名前（`parsed_relations`。ビュー展開前の
+            // ビュー自身を含む）が ACL 照会の時点で見つからないなら、解析後に別セッションが DROP した
+            // 参照先であり、検査を省略すると展開済みの基底表を権限なしで読めてしまう。拒否する。
+            // 解析で実在を確認できなかった名前（構文語・別名などの誤分類）だけを読み飛ばす。
+            if parsed_relations.iter().any(|p| p == name) {
+                // 内部キー（`#<schema_id>.<name>`）は利用者へ出さない（ADR D2）。公開名の名前部だけを返す。
+                return Err(SqlSurfaceError::undefined_table(
+                    crate::catalog::namespace::relation_name_part(name),
+                ));
+            }
+            continue;
         };
         check(
             principal,
@@ -344,7 +372,8 @@ pub(crate) fn require_table_select(
                 required_bits: PRIV_SELECT,
                 granted_bits: 0,
             },
-        );
+        )
+        .map(|_| ());
     }
     require_relations(
         storage,
@@ -352,6 +381,7 @@ pub(crate) fn require_table_select(
         &principal,
         PRIV_SELECT,
         &[table.to_string()],
+        None,
         &[],
     )
 }

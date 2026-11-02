@@ -797,6 +797,23 @@ pub(crate) fn sequence_definition_in_txn(
     }
 }
 
+/// 定義と所有者を write txn 内で名前から引く（Issue #2235。DEFAULT 採番が「書き込み先の表の列が所有する
+/// SEQUENCE か」を判定するために使う。無ければ `None`）。
+pub(crate) fn sequence_definition_with_owner_in_txn(
+    write_txn: &redb::WriteTransaction,
+    name: &str,
+) -> Result<Option<(SequenceDef, Option<SequenceOwner>)>> {
+    validate_relation_key(name)?;
+    match ReadSource::open_table(write_txn, SEQUENCES_TABLE) {
+        Ok(t) => match t.get(sequence_key(name))? {
+            Some(g) => Ok(Some(decode_sequence_def_with_owner(g.value())?)),
+            None => Ok(None),
+        },
+        Err(redb::TableError::TableDoesNotExist(_)) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// `ColumnDefault` が SEQUENCE `name` を参照するか（`DEFAULT nextval('<name>')` のみ真）。
 /// ワイルドカードを置かない網羅 match にして、variant を足すとここがコンパイルエラーになり、
 /// `DROP SEQUENCE` の依存判定の書き漏れを防ぐ。
@@ -914,6 +931,8 @@ pub(crate) enum SetvalError {
     Alloc(AllocError),
     /// カタログのエラー（不在 `42P01`・他種別 `42809`・破損）。
     Catalog(CatalogError),
+    /// 呼び出し主体が UPDATE 権限を持たない（`42501`。Issue #2235。値域検査より前）。
+    PermissionDenied,
 }
 
 impl From<CatalogError> for SetvalError {
@@ -933,6 +952,9 @@ pub(crate) struct SetvalArgs<'a> {
     pub(crate) name: &'a str,
     pub(crate) value: i64,
     pub(crate) is_called: bool,
+    /// ACL で判定すべき主体（束縛ロール ID）。`None` は検査しない主体（未束縛・所有者相当・セッション無し。
+    /// `sql::schema_privilege::acl_checked_principal` が決める）。
+    pub(crate) acl_role: Option<u64>,
 }
 
 /// `setval(name, value, is_called)` の本体（TABLE-24・Issue #1691）。同一 `write_txn` 内で名前の
@@ -952,6 +974,14 @@ pub(crate) fn setval_in_txn(
     validate_relation_key(args.name)?;
     let bytes = load_sequence_bytes_in_txn(write_txn, args.name)?;
     let def = decode_sequence_def(&bytes)?;
+    // 権限検査は解決の後・値域検査の前（不在の SEQUENCE は権限に関わらず先に `42P01`。D10・S4）。
+    if let Some(role) = args.acl_role {
+        let privs =
+            super::privilege::sequence_privileges_in_txn(write_txn, tenant_id, def.id, &[role])?;
+        if privs & super::privilege::PRIV_UPDATE == 0 {
+            return Err(SetvalError::PermissionDenied);
+        }
+    }
     if args.value < def.params.min_value || args.value > def.params.max_value {
         return Err(SetvalError::OutOfRange);
     }
@@ -1244,6 +1274,8 @@ pub(crate) fn drop_sequence_in_txn(write_txn: &redb::WriteTransaction, name: &st
         table.remove(sequence_key(name))?;
     }
     delete_sequence_state_in_txn(write_txn, id)?;
+    // 定義と同じ txn で全テナント分の ACL 行も消す（Issue #2235。残った行は `DROP ROLE` を永久に拒否する）。
+    super::privilege::remove_sequence_acl_in_txn(write_txn, id)?;
     Ok(id)
 }
 
@@ -1272,6 +1304,7 @@ pub(crate) fn drop_owned_sequences_in_txn(
             table.remove(sequence_key(name))?;
         }
         delete_sequence_state_in_txn(write_txn, def.id)?;
+        super::privilege::remove_sequence_acl_in_txn(write_txn, def.id)?;
     }
     Ok(ids)
 }
@@ -2426,6 +2459,7 @@ mod setval_tests {
             name,
             value,
             is_called,
+            acl_role: None,
         }
     }
 

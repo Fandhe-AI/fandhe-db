@@ -1,5 +1,5 @@
 //! 書き込み系の文の表単位権限検査（SQL-40・RLS-12・SQL-19・SQL-22 ポインタ。Issue #1968。設計は
-//! `docs/design/role-privilege-model.md` §13）の結合テスト。
+//! `docs/design/role-privilege-model.md` §17）の結合テスト。
 //!
 //! 現在ロールを束縛したセッション（`SessionState::bind_role_ids`）で、`GRANT` で付与した表単位の
 //! INSERT／UPDATE／DELETE／TRUNCATE が各文種（UPSERT・RETURNING・INSERT ... SELECT・UPDATE ... FROM・

@@ -87,8 +87,7 @@ fn fixture(tag: &str) -> (EngineCore, CleanupGuard, SessionState, SessionState) 
         &mut o,
         "CREATE TABLE s.t (id BIGINT PRIMARY KEY, name TEXT)",
     );
-    // 表単位の SELECT 権限検査（Issue #1967）が結線済みのため、SCHEMA の USAGE だけを
-    // 検証対象にできるよう表の SELECT は先に付与しておく。
+    // 表単位の SELECT 権限は付与済みにして、USAGE 検査だけを分離して試す（Issue #1967 の読み取りゲート）。
     ok(&core, "t1", &mut o, "GRANT SELECT ON s.t TO alice");
     (core, g, o, bound(alice, false))
 }

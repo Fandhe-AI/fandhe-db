@@ -131,3 +131,49 @@ fn release_unknown_savepoint_is_3b001() {
     assert_eq!(read_ready_for_query_status(&mut stream), b'E');
     expect_tag(&mut stream, "ROLLBACK", "ROLLBACK", b'I');
 }
+/// Issue #1947（SQL-31・SQL-69）: savepoint を作った後に失敗した Tx は、簡易クエリの
+/// `ROLLBACK TO` で `'E'` から `'T'` へ復帰し、継続して `COMMIT` できる。
+/// 失敗前の書き込みは取り消され、復帰後の書き込みだけが残る。
+#[test]
+fn failed_transaction_recovers_with_rollback_to_and_commits() {
+    let (core, _g) = new_core();
+    let mut stream = connect(core);
+
+    expect_tag(&mut stream, "BEGIN", "BEGIN", b'T');
+    expect_tag(&mut stream, "SAVEPOINT a", "SAVEPOINT", b'T');
+    expect_tag(&mut stream, &insert_sql(1, "op-1"), "INSERT 0 1", b'T');
+    send_simple_query(&mut stream, "SELEC nonsense");
+    expect_error_response_with_sqlstate(&mut stream, "42601");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'E');
+
+    // 失敗中は ROLLBACK TO 以外 25P02。
+    send_simple_query(&mut stream, "COMMIT");
+    expect_error_response_with_sqlstate(&mut stream, "25P02");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'E');
+
+    expect_tag(&mut stream, "ROLLBACK TO a", "ROLLBACK", b'T');
+    expect_tag(&mut stream, &insert_sql(3, "op-3"), "INSERT 0 1", b'T');
+    expect_tag(&mut stream, "COMMIT", "COMMIT", b'I');
+    // 確定したのは復帰後の 1 行（id=3）だけ。
+    send_simple_query(&mut stream, SELECT_SQL);
+    let _ = read_row_description(&mut stream);
+    let _ = read_data_row(&mut stream);
+    assert_eq!(read_command_complete(&mut stream), "SELECT 1");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'I');
+}
+
+/// savepoint を作る前に失敗した Tx は復帰できない（`ROLLBACK` のみ）。
+#[test]
+fn failure_before_any_savepoint_cannot_recover_with_rollback_to() {
+    let (core, _g) = new_core();
+    let mut stream = connect(core);
+
+    expect_tag(&mut stream, "BEGIN", "BEGIN", b'T');
+    send_simple_query(&mut stream, "SELEC nonsense");
+    expect_error_response_with_sqlstate(&mut stream, "42601");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'E');
+    send_simple_query(&mut stream, "ROLLBACK TO a");
+    expect_error_response_with_sqlstate(&mut stream, "25P02");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'E');
+    expect_tag(&mut stream, "ROLLBACK", "ROLLBACK", b'I');
+}

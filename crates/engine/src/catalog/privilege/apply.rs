@@ -13,8 +13,18 @@
 //! 所有者: ロール所有の機構（#2236）が入るまで、呼び出し元が `owner_equivalent`（DDL 権限ゲートを通過した
 //! 主体）を真にした場合に限り、対象の全権限を GRANT OPTION 付きで持つ「所有者相当」として扱う。記録される
 //! 付与者は常に現在ロール ID。したがって別の所有者相当の主体が付けた付与は REVOKE できない（所有者の概念が
-//! 入るまでの既知の制約）。継承（メンバーシップ経由の権限）は #2232 の担当で、本ファイルは付与者本人の直接の
-//! 行と PUBLIC の行だけを見る。
+//! 入るまでの既知の制約）。対象の所有者が付与者の INHERIT 閉包に含まれる場合は、所有者名義の付与者として扱う。
+//!
+//! 継承（Issue #2232）: 付与権限は付与者本人の行と PUBLIC に加え、付与者が INHERIT で継承するロール
+//! （`catalog::role::graph::effective_roles_in_txn` の閉包。書き込みと同じ txn のスナップショット）の行も
+//! 見る。記録・取り消しの対象になる付与者は、PostgreSQL の `select_best_grantor` と同じく、必要な GRANT OPTION を
+//! すべて持つ最も近いロール（全部を持つロールが無ければ最も多く持つロール。同点は近さ→ホップ順）にする。
+//!
+//! SEQUENCE・関数（Issue #2235）: 名前は書き込みと同じ txn で内部 ID へ解決する（SEQUENCE の不在 `42P01`・
+//! 表を指せば `42809`、関数の不在・型の不一致・他テナントの関数は区別せず `42883`）。関数は PostgreSQL の
+//! `proacl` が NULL の状態（PUBLIC が EXECUTE を持つ暗黙の既定）を持つため、印（`function::ACL_INIT_TABLE`）
+//! の無い関数への初回の変更は、暗黙の既定を作業状態へ展開してから判定し、差分があれば全行と印を同じ
+//! txn で書く（設計記録 S5）。
 //!
 //! 有界性: 対象の総数・CASCADE の反復回数に上限を置き、超過は固定の `LimitExceeded`（`54000`）にする。
 
@@ -28,9 +38,14 @@ use super::super::{
     bump_table_generation_in_txn, index_name_exists_in_txn, materialized_view_exists_in_txn,
     require_table_schema_write_any_identity, CatalogError, Storage, CATALOG_TABLE, VIEWS_TABLE,
 };
-use super::{
-    list_acl_for_object_in_txn, upsert_acl_in_txn, AclEntry, PrivilegeObject, PUBLIC_GRANTEE_ID,
+use super::function::{
+    acl_initialized_in_txn, implicit_default_entry, mark_acl_initialized_in_txn,
 };
+use super::{
+    corrupt, list_acl_for_object_in_txn, upsert_acl_in_txn, AclEntry, PrivilegeObject,
+    PUBLIC_GRANTEE_ID,
+};
+use crate::catalog::role::graph::{effective_roles_in_txn, Mode};
 use crate::catalog::role::{get_role_by_id_in_txn, get_role_in_txn, validate_tenant};
 
 /// 1 回の GRANT／REVOKE が走査する対象（表・列）の総数の上限（実装既定値）。
@@ -59,6 +74,19 @@ pub(crate) enum AclScope {
     Schemas,
     /// `schemas` 配下の、実行時点で既に在る relation（表・ビュー・matview）へ展開する。
     AllTablesInSchemas,
+    /// `sequences`（解決済みの relation キー。書き込みと同じ txn で内部 ID へ解決する。Issue #2235）。
+    Sequences,
+    /// `functions`（関数キーと任意の引数型。書き込みと同じ txn で内部 ID へ解決する。Issue #2235）。
+    Functions,
+}
+
+/// `ON FUNCTION` の対象 1 件（Issue #2235）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AclFunctionRef {
+    /// 解決済みの関数キー。
+    pub(crate) name: String,
+    /// 引数型の並び。`None` は名前だけで指す。
+    pub(crate) arg_types: Option<Vec<crate::catalog::ColumnType>>,
 }
 
 /// 権限 1 項目。`columns` が空なら表単位。
@@ -80,6 +108,10 @@ pub(crate) struct AclRequest<'a> {
     pub(crate) tables: &'a [String],
     /// SCHEMA 名（`scope` が `Schemas`／`AllTablesInSchemas` のとき）。利用者が書いた裸の名前。
     pub(crate) schemas: &'a [String],
+    /// SEQUENCE のキー（`scope` が `Sequences` のとき）。
+    pub(crate) sequences: &'a [String],
+    /// 関数の指定（`scope` が `Functions` のとき）。
+    pub(crate) functions: &'a [AclFunctionRef],
     pub(crate) items: &'a [AclItem],
     pub(crate) grantees: &'a [GranteeSpec],
     /// `WITH GRANT OPTION`（GRANT）／`GRANT OPTION FOR`（REVOKE）。
@@ -114,6 +146,8 @@ pub(crate) enum AclChangeError {
     ColumnNotFound(String),
     /// SCHEMA が自テナントに無い（他テナントにだけ在る場合を含む。利用者が書いた名前。`3F000`）。
     SchemaNotFound(String),
+    /// 関数が自テナントに無い・型が一致しない（他テナントにだけ在る場合を含む。`42883`。固定文言）。
+    FunctionNotFound,
     /// 付与者が未束縛・不在、または対象に何の権限も持たない（`42501`）。
     PermissionDenied,
     /// RESTRICT で依存する付与が残る（`2BP01`）。
@@ -135,14 +169,18 @@ impl From<CatalogError> for AclChangeError {
 type Result<T> = std::result::Result<T, AclChangeError>;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum RelKind {
+pub(super) enum RelKind {
     Table,
     View,
     Matview,
 }
 
 /// relation の種別を引く。無ければ `TableNotFound`、索引・SEQUENCE は `WrongObjectKind`。
-fn relation_kind(write_txn: &redb::WriteTransaction, tenant: &str, key: &str) -> Result<RelKind> {
+pub(super) fn relation_kind(
+    write_txn: &redb::WriteTransaction,
+    tenant: &str,
+    key: &str,
+) -> Result<RelKind> {
     crate::catalog::namespace::ensure_tenant_key_schema_alive_in_txn(write_txn, tenant, key)?;
     let in_views = match ReadSource::open_table(write_txn, VIEWS_TABLE) {
         Ok(t) => t.get(key).map_err(CatalogError::from)?.is_some(),
@@ -170,6 +208,18 @@ fn relation_kind(write_txn: &redb::WriteTransaction, tenant: &str, key: &str) ->
     } else {
         Err(CatalogError::TableNotFound(key.to_string()).into())
     }
+}
+
+/// SEQUENCE のキーを内部 ID へ解決する（Issue #2235）。テナント内の解決を先に行い（他テナントの SCHEMA・
+/// 不在は `TableNotFound`）、表・ビュー・索引を指すときは `WrongObjectKind`。
+fn resolve_sequence_id(write_txn: &redb::WriteTransaction, tenant: &str, key: &str) -> Result<u64> {
+    crate::catalog::namespace::ensure_tenant_key_schema_alive_in_txn(write_txn, tenant, key)?;
+    if let Some(def) = crate::catalog::sequence::sequence_definition_in_txn(write_txn, key)? {
+        return Ok(def.id);
+    }
+    // SEQUENCE ではない: 他の種別なら `WrongObjectKind`、何も無ければ `TableNotFound`。
+    relation_kind(write_txn, tenant, key)?;
+    Err(CatalogError::WrongObjectKind(key.to_string()).into())
 }
 
 /// 更新対象の 1 オブジェクトと、その要求ビット。
@@ -237,6 +287,42 @@ fn grantor_rights(entries: &[AclEntry], grantor: u64) -> (u16, u16) {
     (go, any)
 }
 
+/// 付与者の継承閉包（近い順。先頭は付与者自身）の行から、付与できる権限（GRANT OPTION の和）と何らかの権限の和を
+/// 返す。GRANT OPTION は付与者ごとに別々に判定するため、`pick_grantor` と併用する。
+fn closure_any(entries: &[AclEntry], closure: &[u64]) -> u16 {
+    closure
+        .iter()
+        .fold(0u16, |a, r| a | grantor_rights(entries, *r).1)
+}
+
+/// 対象の付与者を選ぶ（PostgreSQL の `select_best_grantor` 相当）。`want` のすべての GRANT OPTION を持つ最も近い
+/// ロール、無ければ最も多く持つロール（同点は近い方。何も持たなければ実行ロール）。列は表単位の行も合わせて
+/// 見る。
+fn pick_grantor(
+    entries: &[AclEntry],
+    table_entries: Option<&[AclEntry]>,
+    allowed: u16,
+    want: u16,
+    closure: &[u64],
+) -> u64 {
+    let mut best: Option<(u32, u64)> = None;
+    for r in closure {
+        let mut go = grantor_rights(entries, *r).0;
+        if let Some(te) = table_entries {
+            go |= grantor_rights(te, *r).0 & allowed;
+        }
+        let got = go & want;
+        if got == want {
+            return *r;
+        }
+        let n = got.count_ones();
+        if best.is_none_or(|(bn, _)| n > bn) {
+            best = Some((n, *r));
+        }
+    }
+    best.map_or(0, |(_, r)| r)
+}
+
 /// `grantor` が権限ビット `bits` について持つ GRANT OPTION の出所（上流の付与者）の集合。循環の検出に使う
 /// （有界・訪問済み集合付き）。付与する権限ビットと重なる GRANT OPTION の経路だけを辿り、別の権限の
 /// 経路を同じ上流とみなさない。
@@ -262,8 +348,11 @@ fn ancestors_of(entries: &[AclEntry], grantor: u64, bits: u16) -> Result<Vec<u64
 /// 1 オブジェクトの ACL 行の作業状態（`before` は txn スナップショット、`work` は更新後）。
 struct AclState {
     object: PrivilegeObject,
+    /// 差分の基準。印の無い関数（`implicit`）は、暗黙の既定を展開した行（保存値ではない）。
     before: Vec<AclEntry>,
     work: Vec<AclEntry>,
+    /// 暗黙の既定（PUBLIC・EXECUTE）を展開した関数か。差分があれば全行と印を書く（S5）。
+    implicit: bool,
 }
 
 /// 作業状態の集合（挿入順を保つ。表と列の依存解決で相互参照するため、1 箇所で持つ）。
@@ -271,6 +360,8 @@ struct AclState {
 struct AclStates {
     order: Vec<AclState>,
     index: HashMap<String, usize>,
+    /// 暗黙の既定を展開するときの付与者（現在ロール）。
+    seed_grantor: u64,
 }
 
 impl AclStates {
@@ -288,12 +379,24 @@ impl AclStates {
         if self.order.len() >= MAX_TARGET_VISITS {
             return Err(AclChangeError::LimitExceeded);
         }
-        let before = list_acl_for_object_in_txn(write_txn, tenant, object)?;
+        let mut implicit = false;
+        let before = match object {
+            PrivilegeObject::Function(id) if !acl_initialized_in_txn(write_txn, tenant, *id)? => {
+                // 印が無いのに行がある状態は不整合（fail-closed）。
+                if !list_acl_for_object_in_txn(write_txn, tenant, object)?.is_empty() {
+                    return Err(corrupt().into());
+                }
+                implicit = true;
+                vec![implicit_default_entry(self.seed_grantor)]
+            }
+            _ => list_acl_for_object_in_txn(write_txn, tenant, object)?,
+        };
         self.index.insert(key, self.order.len());
         self.order.push(AclState {
             object: object.clone(),
             work: before.clone(),
             before,
+            implicit,
         });
         Ok(self.order.len() - 1)
     }
@@ -323,7 +426,8 @@ fn table_column_names(write_txn: &redb::WriteTransaction, table: &str) -> Result
 
 /// REVOKE の後始末。GRANT OPTION を失った `(付与先 x, 範囲)` について、`x` が付けた付与のうち `x` の残りの
 /// GRANT OPTION で賄えない権限は依存する付与として、RESTRICT なら `2BP01`、CASCADE なら連鎖して取り消す。
-/// 範囲が表なら表の行と全列の行を、列ならその列の行を見る。列の付与は列自身の GRANT OPTION に加えて
+/// 範囲が表なら表の行と全列の行を、列ならその列の行を見る。付与者 `x` が対象の所有者なら暗黙の GRANT OPTION で
+/// 全て賄えるため依存に数えない。列の付与は列自身の GRANT OPTION に加えて
 /// 表単位の GRANT OPTION（更新後の表の行）でも賄える。
 fn resolve_dependents(
     write_txn: &redb::WriteTransaction,
@@ -350,10 +454,18 @@ fn resolve_dependents(
                     });
                 }
             }
-            PrivilegeObject::Column { .. } | PrivilegeObject::Schema(_) => objs.push(scope.clone()),
-            _ => continue,
+            PrivilegeObject::Column { .. }
+            | PrivilegeObject::Schema(_)
+            | PrivilegeObject::Sequence(_)
+            | PrivilegeObject::Function(_) => objs.push(scope.clone()),
         }
         for obj in objs {
+            // 所有者は対象への全権限と GRANT OPTION を暗黙に持つ（ACL 行に載らない）ため、所有者が付けた
+            // 付与は依存として扱わない（所有者の自己付与の REVOKE が、無用な `2BP01`〔RESTRICT〕や他の
+            // 被付与者の付与の取り消し〔CASCADE〕を起こさない。Issue #2236）。列は親の表の所有者を見る。
+            if super::owner::is_owner_in_txn(write_txn, tenant, &obj, x)? {
+                continue;
+            }
             let i = states.idx(write_txn, tenant, &obj)?;
             let mut covered = go_of(states.work_of(i), x);
             if let PrivilegeObject::Column { table, .. } = &obj {
@@ -437,7 +549,7 @@ fn has_any_column_privilege(
     write_txn: &redb::WriteTransaction,
     tenant: &str,
     table: &str,
-    grantor: u64,
+    closure: &[u64],
 ) -> Result<bool> {
     // ビュー・matview には列の ACL を作れない（`0A000` で拒否済み）ため、スキーマが無ければ「無い」。
     let schema = match require_table_schema_write_any_identity(write_txn, table) {
@@ -451,7 +563,7 @@ fn has_any_column_privilege(
             column: c.name.clone(),
         };
         let entries = list_acl_for_object_in_txn(write_txn, tenant, &obj)?;
-        if grantor_rights(&entries, grantor).1 != 0 {
+        if closure_any(&entries, closure) != 0 {
             return Ok(true);
         }
     }
@@ -480,11 +592,20 @@ impl Storage {
         if get_role_by_id_in_txn(&*write_txn, tenant, req.grantor_id)?.is_none() {
             return Err(AclChangeError::PermissionDenied);
         }
+        // 付与者の継承閉包（所有者相当は付与権限の判定を迂回するため本人だけ）。
+        let closure: Vec<u64> = if req.owner_equivalent {
+            vec![req.grantor_id]
+        } else {
+            effective_roles_in_txn(&*write_txn, tenant, req.grantor_id, Mode::Inherit)?
+                .into_iter()
+                .map(|(r, _)| r)
+                .collect()
+        };
         // 1. 対象。SCHEMA 名は書き込みと同じ txn のスナップショットで自テナントの内部 ID へ解決する
         // （不在・他テナントは区別なく `SchemaNotFound`。存在オラクルにしない）。
         let mut kinds: Vec<(String, RelKind)> = Vec::new();
         let mut schema_ids: Vec<u64> = Vec::new();
-        if req.scope != AclScope::Tables {
+        if matches!(req.scope, AclScope::Schemas | AclScope::AllTablesInSchemas) {
             for name in req.schemas {
                 let id = crate::catalog::namespace::schema_id_in_txn(&*write_txn, tenant, name)?
                     .ok_or_else(|| AclChangeError::SchemaNotFound(name.clone()))?;
@@ -493,6 +614,8 @@ impl Storage {
                 }
             }
         }
+        let mut sequence_ids: Vec<u64> = Vec::new();
+        let mut function_ids: Vec<u64> = Vec::new();
         match req.scope {
             AclScope::Tables => {
                 for t in req.tables {
@@ -501,6 +624,28 @@ impl Storage {
                 }
             }
             AclScope::Schemas => {}
+            AclScope::Sequences => {
+                for key in req.sequences {
+                    let id = resolve_sequence_id(&write_txn, tenant, key)?;
+                    if !sequence_ids.contains(&id) {
+                        sequence_ids.push(id);
+                    }
+                }
+            }
+            AclScope::Functions => {
+                for f in req.functions {
+                    let id = crate::catalog::function::resolve_function_id_in_txn(
+                        &*write_txn,
+                        tenant,
+                        &f.name,
+                        f.arg_types.as_deref(),
+                    )?
+                    .ok_or(AclChangeError::FunctionNotFound)?;
+                    if !function_ids.contains(&id) {
+                        function_ids.push(id);
+                    }
+                }
+            }
             AclScope::AllTablesInSchemas => {
                 // 実行時点（この txn のスナップショット）で既に在る relation だけへ展開する。後から作られる
                 // 表には効かない（PostgreSQL と同じ）。総数は走査上限で有界。
@@ -554,6 +699,22 @@ impl Storage {
                         item.bits,
                         false,
                     )?;
+                }
+            }
+        }
+        for (ids, wrap) in [
+            (
+                &sequence_ids,
+                PrivilegeObject::Sequence as fn(u64) -> PrivilegeObject,
+            ),
+            (
+                &function_ids,
+                PrivilegeObject::Function as fn(u64) -> PrivilegeObject,
+            ),
+        ] {
+            for id in ids {
+                for item in req.items {
+                    add_target(&mut targets, &mut index, wrap(*id), item.bits, false)?;
                 }
             }
         }
@@ -622,7 +783,10 @@ impl Storage {
         }
         // 4. 対象ごとの判定と計画。
         let mut warn_acc = WarningAcc::default();
-        let mut states = AclStates::default();
+        let mut states = AclStates {
+            seed_grantor: req.grantor_id,
+            ..AclStates::default()
+        };
         let mut affected: Vec<(u64, PrivilegeObject)> = Vec::new();
         for t in &targets {
             let allowed = t.object.allowed_privileges();
@@ -633,19 +797,50 @@ impl Storage {
             }
             let si = states.idx(&write_txn, tenant, &t.object)?;
             let entries: Vec<AclEntry> = states.work_of(si).to_vec();
+            // 所有者相当: 運用者権限（呼び出し元の `owner_equivalent`）に加え、付与者が対象の所有者のとき
+            // （Issue #2236。加算のみで運用者権限を縮めない）。列は親の表の所有者を見る。
+            // 対象の所有者が付与者の INHERIT 閉包に含まれる（付与者自身を含む）ときは、PostgreSQL の
+            // `select_best_grantor` と同じく所有者の暗黙の全 GRANT OPTION を認め、所有者名義で付与・取り消す。
+            // 閉包は INHERIT の辺だけを辿るため、継承しないメンバーシップ経由の所有者は候補にならない。
+            let owner_gid: Option<u64> = if req.owner_equivalent {
+                Some(req.grantor_id)
+            } else if matches!(t.object, PrivilegeObject::Sequence(_)) {
+                None
+            } else {
+                super::owner::owner_of_in_txn(&*write_txn, tenant, &t.object)?
+                    .filter(|o| closure.contains(o))
+            };
+            let owner_equivalent = owner_gid.is_some();
+            // 列の判定は表単位の行も参照する。
+            let table_entries: Option<Vec<AclEntry>> = match &t.object {
+                PrivilegeObject::Column { table, .. } if !owner_equivalent => {
+                    Some(list_acl_for_object_in_txn(
+                        &*write_txn,
+                        tenant,
+                        &PrivilegeObject::Table(table.clone()),
+                    )?)
+                }
+                _ => None,
+            };
+            // この対象の付与者（所有者相当は実行ロール。そうでなければ継承閉包から最良のロール）。
+            let need = if t.bits != 0 { want } else { want_p };
+            let gid = if let Some(o) = owner_gid {
+                o
+            } else {
+                match &table_entries {
+                    // 波及ビットは表の GRANT OPTION だけで絞るため、表の行だけで付与者を選ぶ。
+                    Some(te) if t.bits == 0 => pick_grantor(te, None, allowed, need, &closure),
+                    te => pick_grantor(&entries, te.as_deref(), allowed, need, &closure),
+                }
+            };
             // 波及ビット: 付与者の表の GRANT OPTION で絞る（0 なら表側が警告のみで無変更のため
             // 列も変更しない）。
             let eff_p = if want_p == 0 {
                 0
-            } else if req.owner_equivalent {
+            } else if owner_equivalent {
                 want_p
-            } else if let PrivilegeObject::Column { table, .. } = &t.object {
-                let table_entries = list_acl_for_object_in_txn(
-                    &*write_txn,
-                    tenant,
-                    &PrivilegeObject::Table(table.clone()),
-                )?;
-                let (tgo, _) = grantor_rights(&table_entries, req.grantor_id);
+            } else if let Some(te) = &table_entries {
+                let (tgo, _) = grantor_rights(te, gid);
                 want_p & tgo
             } else {
                 want_p
@@ -653,30 +848,21 @@ impl Storage {
             // 明示ビット: 付与者が持つ GRANT OPTION。列は表単位の行も合わせて見る。
             let eff_e = if t.bits == 0 {
                 0
-            } else if req.owner_equivalent {
+            } else if owner_equivalent {
                 want
             } else {
-                let (mut go, mut any) = grantor_rights(&entries, req.grantor_id);
-                if let PrivilegeObject::Column { table, .. } = &t.object {
-                    let table_entries = list_acl_for_object_in_txn(
-                        &*write_txn,
-                        tenant,
-                        &PrivilegeObject::Table(table.clone()),
-                    )?;
-                    let (tgo, tany) = grantor_rights(&table_entries, req.grantor_id);
-                    go |= tgo & allowed;
-                    any |= tany & allowed;
+                let (mut go, _) = grantor_rights(&entries, gid);
+                let mut any = closure_any(&entries, &closure);
+                if let Some(te) = &table_entries {
+                    go |= grantor_rights(te, gid).0 & allowed;
+                    any |= closure_any(te, &closure) & allowed;
                 }
                 if go == 0 {
                     let mut has_any = any != 0;
                     if !has_any {
                         if let PrivilegeObject::Table(table) = &t.object {
-                            has_any = has_any_column_privilege(
-                                &write_txn,
-                                tenant,
-                                table,
-                                req.grantor_id,
-                            )?;
+                            has_any =
+                                has_any_column_privilege(&write_txn, tenant, table, &closure)?;
                         }
                     }
                     if !has_any {
@@ -701,9 +887,9 @@ impl Storage {
             }
             let mut work: Vec<AclEntry> = entries.clone();
             if req.is_grant {
-                if req.grant_option && !req.owner_equivalent {
+                if req.grant_option && !owner_equivalent {
                     // 自己への GRANT OPTION 付与は循環として拒否する。
-                    if grantee_ids.contains(&req.grantor_id) {
+                    if grantee_ids.contains(&gid) {
                         return Err(AclChangeError::InvalidGrant(
                             "grant options cannot be granted back to your own grantor",
                         ));
@@ -720,7 +906,7 @@ impl Storage {
                     }
                     // 権限ビットごとに経路を辿る（別の権限の辺をつないで架空の循環を作らない）。
                     for bit in (0..16).map(|i| 1u16 << i).filter(|b| eff & b != 0) {
-                        let anc = ancestors_of(&path_entries, req.grantor_id, bit)?;
+                        let anc = ancestors_of(&path_entries, gid, bit)?;
                         if grantee_ids.iter().any(|g| anc.contains(g)) {
                             return Err(AclChangeError::InvalidGrant(
                                 "grant options cannot be granted back to your own grantor",
@@ -731,7 +917,7 @@ impl Storage {
                 for g in &grantee_ids {
                     if let Some(e) = work
                         .iter_mut()
-                        .find(|e| e.grantee_id == *g && e.grantor_id == req.grantor_id)
+                        .find(|e| e.grantee_id == *g && e.grantor_id == gid)
                     {
                         e.privileges |= eff;
                         if req.grant_option {
@@ -740,29 +926,34 @@ impl Storage {
                     } else {
                         work.push(AclEntry {
                             grantee_id: *g,
-                            grantor_id: req.grantor_id,
+                            grantor_id: gid,
                             privileges: eff,
                             grant_options: if req.grant_option { eff } else { 0 },
                         });
                     }
                 }
             } else {
-                for g in &grantee_ids {
-                    if let Some(e) = work
-                        .iter_mut()
-                        .find(|e| e.grantee_id == *g && e.grantor_id == req.grantor_id)
-                    {
-                        let old_go = e.grant_options;
-                        if req.grant_option {
-                            e.grant_options &= !eff;
-                        } else {
-                            e.privileges &= !eff;
-                            e.grant_options &= e.privileges;
-                        }
-                        if e.grant_options != old_go
-                            && !affected.iter().any(|(a, o)| a == g && *o == t.object)
+                // 取り消すのは `pick_grantor` が選んだ付与者名義の行だけ（付与者ごとに 1 行の契約。
+                // 継承閉包の別ロール名義で記録された付与は、その付与者自身の REVOKE でだけ消える）。
+                let grantors: [(u64, u16); 1] = [(gid, eff)];
+                for (gr, eff) in grantors {
+                    for g in &grantee_ids {
+                        if let Some(e) = work
+                            .iter_mut()
+                            .find(|e| e.grantee_id == *g && e.grantor_id == gr)
                         {
-                            affected.push((*g, t.object.clone()));
+                            let old_go = e.grant_options;
+                            if req.grant_option {
+                                e.grant_options &= !eff;
+                            } else {
+                                e.privileges &= !eff;
+                                e.grant_options &= e.privileges;
+                            }
+                            if e.grant_options != old_go
+                                && !affected.iter().any(|(a, o)| a == g && *o == t.object)
+                            {
+                                affected.push((*g, t.object.clone()));
+                            }
                         }
                     }
                 }
@@ -776,11 +967,28 @@ impl Storage {
             resolve_dependents(&write_txn, tenant, &mut states, affected, req.cascade)?;
         }
         let mut changes: Vec<Change> = Vec::new();
+        let mut init_marks: Vec<u64> = Vec::new();
         for st in &states.order {
-            diff_into(&mut changes, &st.object, &st.before, &st.work);
+            if st.implicit {
+                // 暗黙の既定のままなら何も書かない。差分があれば展開した全行と印を同じ txn で書く
+                // （行だけでは「既定のまま」と「PUBLIC から取り消し済み」を区別できない。S5）。
+                if st.work != st.before {
+                    for e in &st.work {
+                        changes.push(Change {
+                            object: st.object.clone(),
+                            entry: *e,
+                        });
+                    }
+                    if let PrivilegeObject::Function(id) = &st.object {
+                        init_marks.push(*id);
+                    }
+                }
+            } else {
+                diff_into(&mut changes, &st.object, &st.before, &st.work);
+            }
         }
         // 5. 書き込み。
-        if changes.is_empty() {
+        if changes.is_empty() && init_marks.is_empty() {
             return Ok(AclApplyOutcome {
                 warning: warn_acc.finish(),
                 rows_changed: 0,
@@ -796,6 +1004,9 @@ impl Storage {
                 c.entry.privileges,
                 c.entry.grant_options,
             )?;
+        }
+        for id in &init_marks {
+            mark_acl_initialized_in_txn(&write_txn, tenant, *id)?;
         }
         let mut touched: Vec<String> = Vec::new();
         for c in &changes {
@@ -819,7 +1030,10 @@ impl Storage {
 
 /// 触れた relation の世代を進めて DDL として記録し、commit する（`USING PLAN` の世代照合・commit 記録の契約。
 /// `tests/table_rls/table_generation_bump_coverage.rs` が commit 直前の bump を検査する）。
-fn commit_with_bumps(write_txn: crate::storage::GatedWriteTxn, tables: &[String]) -> Result<()> {
+pub(super) fn commit_with_bumps(
+    write_txn: crate::storage::GatedWriteTxn,
+    tables: &[String],
+) -> Result<()> {
     for t in tables {
         bump_table_generation_in_txn(&write_txn, t)?;
         crate::storage::commit_log::note_ddl(&write_txn, t);

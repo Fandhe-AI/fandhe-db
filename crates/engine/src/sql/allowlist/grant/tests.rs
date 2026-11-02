@@ -203,8 +203,9 @@ fn invalid_privilege_for_object_is_0lp01() {
 fn out_of_scope_forms_are_0a000() {
     for sql in [
         "GRANT USAGE ON SCHEMA public TO a",
-        "GRANT SELECT ON SEQUENCE s TO a",
-        "GRANT EXECUTE ON FUNCTION f TO a",
+        "GRANT EXECUTE ON PROCEDURE p TO a",
+        "GRANT EXECUTE ON ROUTINE r TO a",
+        "GRANT EXECUTE ON ALL ROUTINES IN SCHEMA s TO a",
         "GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA s TO a",
         "GRANT SELECT ON ALL SEQUENCES IN SCHEMA s TO a",
         "GRANT SELECT ON ALL TABLES IN SCHEMA information_schema TO a",
@@ -299,4 +300,64 @@ fn schema_forms_reject_bad_input() {
     ] {
         assert_eq!(code(sql), "0LP01", "{sql}");
     }
+}
+
+#[test]
+fn sequence_and_function_forms_are_structured() {
+    use crate::catalog::ColumnType;
+    let o = objects("GRANT USAGE, SELECT ON SEQUENCE q1, q2 TO a, PUBLIC");
+    assert_eq!(o.scope, GrantScope::Sequences);
+    assert_eq!(o.sequences, vec!["q1", "q2"]);
+    assert!(o.tables.is_empty() && o.functions.is_empty());
+    assert_eq!(
+        o.items.iter().map(|i| i.bits).collect::<Vec<_>>(),
+        vec![PRIV_USAGE, PRIV_SELECT]
+    );
+    // ALL はスコープごとの許可集合へ展開する。
+    let all = objects("GRANT ALL PRIVILEGES ON SEQUENCE q TO a");
+    assert_eq!(all.items[0].bits, PRIV_USAGE | PRIV_SELECT | PRIV_UPDATE);
+    let f = objects("GRANT EXECUTE ON FUNCTION f, g(INTEGER, TEXT), h() TO a");
+    assert_eq!(f.scope, GrantScope::Functions);
+    assert_eq!(f.functions.len(), 3);
+    assert_eq!(f.functions[0].arg_types, None);
+    assert_eq!(
+        f.functions[1].arg_types,
+        Some(vec![ColumnType::Integer, ColumnType::Text])
+    );
+    assert_eq!(f.functions[2].arg_types, Some(Vec::new()));
+    assert_eq!(
+        objects("REVOKE ALL ON FUNCTION f FROM a CASCADE").items[0].bits,
+        PRIV_EXECUTE
+    );
+    // 種別語と同名の表は表として扱う。
+    assert_eq!(
+        objects("GRANT SELECT ON sequence TO a").tables,
+        vec!["sequence"]
+    );
+    assert_eq!(
+        objects("GRANT SELECT ON function TO a").tables,
+        vec!["function"]
+    );
+}
+
+#[test]
+fn sequence_and_function_privilege_sets_are_enforced() {
+    for sql in [
+        "GRANT INSERT ON SEQUENCE s TO a",
+        "GRANT EXECUTE ON SEQUENCE s TO a",
+        "GRANT SELECT ON FUNCTION f TO a",
+        "GRANT USAGE ON FUNCTION f TO a",
+        "GRANT ALL, USAGE ON FUNCTION f TO a",
+    ] {
+        assert_eq!(code(sql), "0LP01", "{sql}");
+    }
+    assert_eq!(code("GRANT SELECT (a) ON SEQUENCE s TO a"), "42601");
+    assert_eq!(code("GRANT EXECUTE (a) ON FUNCTION f TO a"), "42601");
+    assert_eq!(
+        code("GRANT USAGE ON SEQUENCE s TO PUBLIC WITH GRANT OPTION"),
+        "0LP01"
+    );
+    // 名前が無い `ON SEQUENCE` は表 `sequence` として読まれ、USAGE は表に許されない（0LP01）。
+    assert_eq!(code("GRANT USAGE ON SEQUENCE TO a"), "0LP01");
+    assert_eq!(code("GRANT EXECUTE ON FUNCTION f(INTEGER TO a"), "42601");
 }

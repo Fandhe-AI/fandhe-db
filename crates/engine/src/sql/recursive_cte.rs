@@ -876,6 +876,14 @@ impl TableLookup for RecursiveTermLookup<'_> {
         self.inner.buffered_depth()
     }
 
+    fn enter_view_expansion(&self) {
+        self.inner.enter_view_expansion();
+    }
+
+    fn leave_view_expansion(&self) {
+        self.inner.leave_view_expansion();
+    }
+
     fn materialized_view_columns(
         &self,
         name: &str,

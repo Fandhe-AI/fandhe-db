@@ -38,6 +38,7 @@
 //! 別軸の権限であり（テーブル・カタログは全テナント共有）、RLS の判定を
 //! 一切変更しない。
 
+use crate::catalog::privilege::owner::OwnerGate;
 use crate::catalog::sequence::AlterSequenceError;
 use crate::catalog::{
     AlterApply, AlterCheckError, CascadedObject, CatalogError, ColumnDef, ColumnDefault,
@@ -376,6 +377,7 @@ pub(crate) fn map_create_table_catalog_error(e: CatalogError) -> SqlSurfaceError
         | CatalogError::SchemaNotFound(_)
         | CatalogError::ReservedSchemaName(_)
         | CatalogError::BuiltinSchema(_)
+        | CatalogError::NotObjectOwner
         // `TooManyColumns` は `ALTER TABLE ADD COLUMN`（Issue #900・
         // `Storage::alter_table_add_column`）専用の変種で、`Storage::create_table`
         // からは返らない（列数上限は `validate_create_table_tokens` が構造検証
@@ -1472,6 +1474,7 @@ fn map_alter_constraint_error(e: CatalogError) -> SqlSurfaceError {
         | CatalogError::SchemaNotFound(_)
         | CatalogError::ReservedSchemaName(_)
         | CatalogError::BuiltinSchema(_)
+        | CatalogError::NotObjectOwner
         | CatalogError::ProtectedColumn(_)
         | CatalogError::IncompatibleTypeChange { .. }
         | CatalogError::TooManyColumns { .. }
@@ -2047,6 +2050,7 @@ fn map_drop_alter_column_error(e: CatalogError) -> SqlSurfaceError {
         | CatalogError::SchemaNotFound(_)
         | CatalogError::ReservedSchemaName(_)
         | CatalogError::BuiltinSchema(_)
+        | CatalogError::NotObjectOwner
         | CatalogError::TooManyColumns { .. }
         | CatalogError::IndexAlreadyExists(_)
         | CatalogError::IndexNotFound(_)
@@ -2726,6 +2730,7 @@ fn map_add_column_error(e: CatalogError) -> SqlSurfaceError {
         | CatalogError::SchemaNotFound(_)
         | CatalogError::ReservedSchemaName(_)
         | CatalogError::BuiltinSchema(_)
+        | CatalogError::NotObjectOwner
         // `UniqueConstraintViolation` は `Storage::alter_table_add_unique_constraint`
         // 専用（TABLE-16・TASK-204、Issue #905）で、`alter_table_add_column` からは
         // 返らない（到達不能）。
@@ -3433,13 +3438,17 @@ pub struct DropSchemaOutcome {}
 /// `require_ddl_permission` を通過したセッションに限り呼ばれる実行本体（Issue #1713）。
 /// 予約名・重複・件数上限の判定は `Storage::create_schema`（単一 write txn）に一本化する。
 /// SCHEMA はテナント単位のため、`tenant_id`（呼び出し元の `PolicyContext`）を必ず渡す。
+///
+/// `owner` は作成者として記録するロール ID（束縛セッションの現在ロール。未束縛は `None` で所有者行を
+/// 書かない。Issue #2236）。
 pub(crate) fn execute_create_schema(
     storage: &Storage,
     tenant_id: &str,
     validated: &ValidatedCreateSchema,
+    owner: Option<u64>,
 ) -> Result<CreateSchemaOutcome, SqlSurfaceError> {
     storage
-        .create_schema(tenant_id, validated.name(), validated.if_not_exists)
+        .create_schema_owned(tenant_id, validated.name(), validated.if_not_exists, owner)
         .map_err(|e| map_schema_error(e, "CREATE SCHEMA failed"))?;
     Ok(CreateSchemaOutcome {})
 }
@@ -3450,28 +3459,36 @@ pub struct AlterSchemaOutcome {}
 
 /// `require_ddl_permission` を通過したセッションに限り呼ばれる実行本体（Issue #1716）。
 /// 組み込み名・存在・重複・予約名の判定は `Storage::rename_schema`（単一 write txn）に一本化する。
+///
+/// `gate` は [`crate::sql::privilege_gate::GateDecision`] 由来の所有者検査（運用者権限なら `Skip`。
+/// 所有者検査は書き込み txn の中で行い、非所有者は `42501`。Issue #2236）。
 pub(crate) fn execute_alter_schema(
     storage: &Storage,
     tenant_id: &str,
     validated: &ValidatedAlterSchema,
+    gate: OwnerGate,
 ) -> Result<AlterSchemaOutcome, SqlSurfaceError> {
     storage
-        .rename_schema(tenant_id, validated.name(), validated.new_name())
+        .rename_schema_gated(tenant_id, validated.name(), validated.new_name(), gate)
         .map_err(|e| map_schema_error(e, "ALTER SCHEMA failed"))?;
     Ok(AlterSchemaOutcome {})
 }
 
 /// `require_ddl_permission` を通過したセッションに限り呼ばれる実行本体（Issue #1713）。
 /// 組み込み SCHEMA の拒否・存在判定・空判定は `Storage::drop_schema` に一本化する。
+///
+/// `gate` は所有者検査（[`execute_alter_schema`] と同じ）。所有者が運用者権限なしで配下に relation の
+/// ある `CASCADE` を実行すると `42501`（共有カタログの削除は運用者権限。Issue #2236）。
 pub(crate) fn execute_drop_schema(
     storage: &Storage,
     tenant_id: &str,
     validated: &ValidatedDropSchema,
+    gate: OwnerGate,
 ) -> Result<DropSchemaOutcome, SqlSurfaceError> {
     if validated.cascade {
-        storage.drop_schema_cascade(tenant_id, validated.name(), validated.if_exists)
+        storage.drop_schema_cascade_gated(tenant_id, validated.name(), validated.if_exists, gate)
     } else {
-        storage.drop_schema(tenant_id, validated.name(), validated.if_exists)
+        storage.drop_schema_gated(tenant_id, validated.name(), validated.if_exists, gate)
     }
     .map_err(|e| map_schema_error(e, "DROP SCHEMA failed"))?;
     Ok(DropSchemaOutcome {})
@@ -3486,7 +3503,9 @@ pub(crate) fn map_schema_error(e: CatalogError, internal_detail: &str) -> SqlSur
         CatalogError::SchemaAlreadyExists(name) => SqlSurfaceError::DuplicateSchema { name },
         CatalogError::SchemaNotFound(name) => SqlSurfaceError::InvalidSchemaName { name },
         CatalogError::ReservedSchemaName(name) => SqlSurfaceError::ReservedName { name },
-        CatalogError::BuiltinSchema(_) => SqlSurfaceError::InsufficientPrivilege,
+        CatalogError::BuiltinSchema(_) | CatalogError::NotObjectOwner => {
+            SqlSurfaceError::InsufficientPrivilege
+        }
         CatalogError::DependentObjectsStillExist(name) => {
             SqlSurfaceError::DependentObjectsStillExist { name }
         }
@@ -3959,7 +3978,7 @@ mod tests {
     #[test]
     fn insufficient_privilege_client_message_has_no_identifying_detail() {
         let msg = SqlSurfaceError::InsufficientPrivilege.client_message();
-        assert_eq!(msg, "permission denied for DDL statement");
+        assert_eq!(msg, "permission denied");
     }
 
     /// 一時 DB の払い出しは Issue #173 の共通ヘルパー（`crate::test_util::

@@ -79,7 +79,7 @@ wire-server）へ配線すると、任意の認証済みテナントが他テナ
 対応するため、新規分類を増やさずラベルの意味を一般化する形を選んだ
 （`error_format.rs` の該当ドキュメンテーションコメントを更新済み）。
 
-`client_message()` は固定文言 `"permission denied for DDL statement"` のみを
+`client_message()` は固定文言 `"permission denied"` のみを
 返し、テーブル名・username を一切含めない。
 
 ## 判定順序（fail-closed）: 構文 → 権限 → 存在

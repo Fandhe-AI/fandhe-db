@@ -4,13 +4,14 @@
 //! 役割: 後続の `CREATE ROLE`（#1962）・`GRANT`（#1965）・権限検査ゲート（#1966）・認証（#2233・#1971）・
 //! ブートストラップ（#2238）が読み書きする、ロール関連の永続化層だけを担う。本ファイルは認証・認可の判定を
 //! しない（wire-server は無変更で、`--users` だけで認証が決まる従来の挙動は変わらない）。ロールの依存検査・
-//! メンバーシップの循環検出・DROP ROLE の掃除は呼び出し側の責務で、本ファイルの書き込みは生の書き込みである。
+//! メンバーシップの循環検出・ADMIN 判定は `role::graph`・`role::membership_apply`（Issue #2232）の責務で、本ファイルの
+//! 書き込みは生の書き込みである。
 //!
 //! 表（すべて最初の書き込みまで作らない遅延作成。読み取りの `TableDoesNotExist` は 0 件と扱う。旧 DB は
 //! 表が無いことがそのまま「空のカタログ」になる。ADR D12）:
 //! - [`ROLES_TABLE`]: `(tenant_id, role_name)` → ロール blob
 //! - [`ROLE_ID_COUNTER_TABLE`]: ロール内部 ID の採番カウンタ（1 始まり・再利用しない）
-//! - [`ROLE_MEMBERSHIPS_TABLE`]: `(tenant_id, member_id, granted_role_id)` → オプション blob
+//! - [`ROLE_MEMBERSHIPS_TABLE`]: `(tenant_id, member_id, granted_role_id)` → オプション blob（版 2 で付与者を持つ）
 //! - [`ROLE_LOGIN_NAMES_TABLE`]: 符号化済みログイン識別子 → ログイン対応 blob（認証前にテナントを解決する
 //!   ためのサーバー全体の表。ADR D1。ADR の「新しい表 3 つ」の記述とは別に 4 表目として定義する）
 //!
@@ -313,15 +314,28 @@ pub(crate) fn decode_role_def(name: &str, bytes: &[u8]) -> Result<RoleDef> {
     Ok(def)
 }
 
-/// メンバーシップのオプション（付与者は持たない。追跡が必要になれば #1965 が版 2 で足す）。
+/// メンバーシップのオプションと付与者（Issue #2232 の版 2 で付与者を持たせた）。
+///
+/// `grantor_id` が `None` の行は「付与者なし」（版 1 の行、または crate 内の生の書き込み）。付与者なしの行は
+/// 所有者相当の主体だけが取り消せ、ADMIN 依存の連鎖の起点にもならない（狭い側に倒す）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct MembershipOptions {
     pub(crate) admin: bool,
     pub(crate) inherit: bool,
     pub(crate) set: bool,
+    pub(crate) grantor_id: Option<u64>,
+    /// この付与が所有者相当の権限（DDL 権限ゲート通過）を根拠に行われたか。真なら ADMIN の依存評価で
+    /// 付与者の現在の ADMIN の有無によらず独立した根拠（根）として扱う。記録のない行（版 1・版 2）は偽で、
+    /// 従来の判定にフォールバックする（Issue #2232）。`grantor_id` が `Some` のときだけ意味を持つ。
+    pub(crate) grantor_root: bool,
 }
 
-/// メンバーシップ blob へ符号化する（版 1 + オプションビット）。
+/// メンバーシップ blob の版 2（`[2, bits, grantor_id(u64 LE)]`）。付与者なしは版 1 のまま保存する。
+const MEMBERSHIP_BLOB_VERSION_2: u8 = 2;
+/// メンバーシップ blob の版 3（版 2 と同じ配置で、所有者相当を根拠とした付与であること＝`grantor_root` を表す）。
+const MEMBERSHIP_BLOB_VERSION_3: u8 = 3;
+
+/// メンバーシップ blob へ符号化する。付与者なしは版 1（`[1, bits]`）、あれば版 2。
 pub(crate) fn encode_membership(opts: MembershipOptions) -> Vec<u8> {
     let mut bits = 0;
     for (flag, bit) in [
@@ -333,16 +347,41 @@ pub(crate) fn encode_membership(opts: MembershipOptions) -> Vec<u8> {
             bits |= bit;
         }
     }
-    vec![ROLE_BLOB_VERSION, bits]
+    match opts.grantor_id {
+        Some(g) if g != 0 => {
+            let version = if opts.grantor_root {
+                MEMBERSHIP_BLOB_VERSION_3
+            } else {
+                MEMBERSHIP_BLOB_VERSION_2
+            };
+            let mut out = vec![version, bits];
+            out.extend_from_slice(&g.to_le_bytes());
+            out
+        }
+        _ => vec![ROLE_BLOB_VERSION, bits],
+    }
 }
 
-/// メンバーシップ blob を復号する（予約ビット・末尾の余りは破損）。
+/// メンバーシップ blob を復号する（未知の版・予約ビット・付与者 0・切断・末尾の余りは破損）。
 pub(crate) fn decode_membership(bytes: &[u8]) -> Result<MembershipOptions> {
     let mut r = Reader::new(bytes);
-    if r.u8()? != ROLE_BLOB_VERSION {
+    let version = r.u8()?;
+    if version != ROLE_BLOB_VERSION
+        && version != MEMBERSHIP_BLOB_VERSION_2
+        && version != MEMBERSHIP_BLOB_VERSION_3
+    {
         return Err(corrupt());
     }
     let bits = r.u8()?;
+    let grantor_id = if version != ROLE_BLOB_VERSION {
+        let g = r.u64()?;
+        if g == 0 {
+            return Err(corrupt());
+        }
+        Some(g)
+    } else {
+        None
+    };
     r.finish()?;
     if bits & !MEMBER_ALL != 0 {
         return Err(corrupt());
@@ -351,6 +390,8 @@ pub(crate) fn decode_membership(bytes: &[u8]) -> Result<MembershipOptions> {
         admin: bits & MEMBER_ADMIN != 0,
         inherit: bits & MEMBER_INHERIT != 0,
         set: bits & MEMBER_SET != 0,
+        grantor_id,
+        grantor_root: version == MEMBERSHIP_BLOB_VERSION_3,
     })
 }
 
@@ -514,6 +555,38 @@ pub(crate) fn tenant_has_roles_in_txn<R: ReadSource>(src: &R, tenant: &str) -> R
     }
 }
 
+/// users ファイルの `(tenant, name)` に対応するロールの引き結果（Issue #1971。[`resolve_tenant_role_in_txn`]）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TenantRoleLookup {
+    /// テナントにロールが 1 件も無い（カタログが正ではない。従来どおり未束縛で扱う）。
+    NotAuthoritative,
+    /// 同名のロールがある。
+    Found(RoleDef),
+    /// テナントにロールはあるが同名が無い（識別子として不正な名前を含む）。
+    Missing,
+}
+
+/// users ファイルの `(tenant, name)` に対応するロールを、1 つの読み取りで引く（Issue #1971・ADR D3・D4）。
+/// 「カタログが正か」の判定は当面「テナントにロールが 1 件以上ある」で行う継ぎ目で、#2238 でマーカー判定へ
+/// 差し替える。名前はバイト単位の完全一致で、不正な識別子は `Missing` に畳む。破損は `Err`（0 件と取り違えない）。
+pub(crate) fn resolve_tenant_role_in_txn<R: ReadSource>(
+    src: &R,
+    tenant: &str,
+    name: &str,
+) -> Result<TenantRoleLookup> {
+    validate_tenant(tenant)?;
+    if !tenant_has_roles_in_txn(src, tenant)? {
+        return Ok(TenantRoleLookup::NotAuthoritative);
+    }
+    if validate_identifier(name).is_err() {
+        return Ok(TenantRoleLookup::Missing);
+    }
+    Ok(match get_role_in_txn(src, tenant, name)? {
+        Some(def) => TenantRoleLookup::Found(def),
+        None => TenantRoleLookup::Missing,
+    })
+}
+
 /// 内部 ID を 1 つ払い出す（1 始まり・`checked_add`・再利用しない）。
 fn allocate_role_id_in_txn(write_txn: &redb::WriteTransaction) -> Result<u64> {
     let mut counter = write_txn.open_table(ROLE_ID_COUNTER_TABLE)?;
@@ -642,6 +715,9 @@ pub(crate) fn remove_memberships_of_role_in_txn(
         return Err(invalid("invalid role membership"));
     }
     let mut doomed: Vec<(u64, u64)> = Vec::new();
+    // 付与者として参照されている行は、付与者なしへ付け替える（PostgreSQL は bootstrap superuser へ付け替える。
+    // 本実装は付与者なし＝所有者相当だけが取り消せる行にして、消えたロールの ADMIN が残らないようにする）。
+    let mut orphaned: Vec<(u64, u64, MembershipOptions)> = Vec::new();
     match ReadSource::open_table(write_txn, ROLE_MEMBERSHIPS_TABLE) {
         Ok(table) => {
             let mut seen = 0usize;
@@ -655,34 +731,52 @@ pub(crate) fn remove_memberships_of_role_in_txn(
                 if seen > MAX_MEMBERSHIP_SCAN || member == 0 || granted == 0 || member == granted {
                     return Err(corrupt());
                 }
-                decode_membership(v.value())?;
+                let opts = decode_membership(v.value())?;
                 if member == role_id || granted == role_id {
                     doomed.push((member, granted));
+                } else if opts.grantor_id == Some(role_id) {
+                    orphaned.push((member, granted, opts));
                 }
             }
         }
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(0),
         Err(e) => return Err(e.into()),
     }
-    if doomed.is_empty() {
+    if doomed.is_empty() && orphaned.is_empty() {
         return Ok(0);
     }
     let mut table = write_txn.open_table(ROLE_MEMBERSHIPS_TABLE)?;
     for (member, granted) in &doomed {
         table.remove((tenant, *member, *granted))?;
     }
+    for (member, granted, opts) in &orphaned {
+        let detached = MembershipOptions {
+            grantor_id: None,
+            grantor_root: false,
+            ..*opts
+        };
+        table.insert(
+            (tenant, *member, *granted),
+            encode_membership(detached).as_slice(),
+        )?;
+    }
     Ok(doomed.len())
 }
 
 /// ロール `role_id` に依存するオブジェクトがあるか（`DROP ROLE` の `2BP01` 判定。Issue #1962）。現在カタログに
-/// あるのは ACL（付与先・付与者）だけ。所有者（#2236）・ポリシーの `TO <ロール>`（#2278 段 2）の検査は、この関数へ
+/// あるのは ACL（付与先・付与者）と所有者（#2236）。ポリシーの `TO <ロール>`（#2278 段 2）の検査は、この関数へ
 /// 足す拡張点とする。
 pub(crate) fn role_has_dependents_in_txn<R: ReadSource>(
     src: &R,
     tenant: &str,
     role_id: u64,
 ) -> Result<bool> {
-    super::privilege::acl_references_role_in_txn(src, tenant, role_id)
+    if super::privilege::acl_references_role_in_txn(src, tenant, role_id)? {
+        return Ok(true);
+    }
+    // 所有者（表・ビュー・matview・SCHEMA・関数。Issue #2236）。所有者のまま消すと所有者の無い
+    // オブジェクトが残るため `2BP01`（所有権を移してから消す）。
+    super::privilege::owner::owner_references_role_in_txn(src, tenant, role_id)
 }
 
 /// `DROP ROLE` の 1 件分: 解決 → 依存検査 → メンバーシップ掃除 → 削除（呼び出し側が単一 write txn で束ねる）。
@@ -712,7 +806,8 @@ fn check_membership_ids(member_id: u64, granted_role_id: u64) -> Result<()> {
     Ok(())
 }
 
-/// メンバーシップを書く（生の書き込み。ロールの存在・循環は検査しない。#1963・#2232 の担当）。自分自身への
+/// メンバーシップを書く（生の書き込み。ロールの存在・循環・ADMIN は検査しない。検査は
+/// `membership_apply` の `Storage::apply_membership_changes` が担う）。自分自身への
 /// 付与と ID 0 は拒否する。
 pub(crate) fn put_membership_in_txn(
     write_txn: &redb::WriteTransaction,
@@ -757,7 +852,7 @@ pub(crate) fn remove_membership_in_txn(
     Ok(true)
 }
 
-fn get_membership<R: ReadSource>(
+pub(crate) fn get_membership<R: ReadSource>(
     src: &R,
     tenant: &str,
     member_id: u64,
@@ -775,7 +870,7 @@ fn get_membership<R: ReadSource>(
     }
 }
 
-fn list_memberships_limited<R: ReadSource>(
+pub(crate) fn list_memberships_limited<R: ReadSource>(
     src: &R,
     tenant: &str,
     member_id: u64,
@@ -809,6 +904,40 @@ pub(crate) fn list_memberships_of_member_in_txn<R: ReadSource>(
 ) -> Result<Vec<(u64, MembershipOptions)>> {
     validate_tenant(tenant)?;
     list_memberships_limited(src, tenant, member_id, MAX_ROLES_PER_TENANT)
+}
+
+/// 付与者が `grantor_id` の行を `(member_id, granted_role_id, options)` で返す（`REVOKE` の RESTRICT／CASCADE
+/// の依存判定用。テナント接頭辞の範囲走査で、行数が [`MAX_MEMBERSHIP_SCAN`] を超える・行が破損している場合は
+/// `Err`）。他テナントの行は構造上走査しない。
+pub(crate) fn list_memberships_granted_by_in_txn<R: ReadSource>(
+    src: &R,
+    tenant: &str,
+    grantor_id: u64,
+) -> Result<Vec<(u64, u64, MembershipOptions)>> {
+    validate_tenant(tenant)?;
+    let table = match src.open_table(ROLE_MEMBERSHIPS_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut out = Vec::new();
+    let mut seen = 0usize;
+    for entry in table.range((tenant, 0u64, 0u64)..)? {
+        let (k, v) = entry?;
+        let (t, member, granted) = k.value();
+        if t != tenant {
+            break;
+        }
+        seen += 1;
+        if seen > MAX_MEMBERSHIP_SCAN || member == 0 || granted == 0 || member == granted {
+            return Err(corrupt());
+        }
+        let opts = decode_membership(v.value())?;
+        if opts.grantor_id == Some(grantor_id) {
+            out.push((member, granted, opts));
+        }
+    }
+    Ok(out)
 }
 
 /// ロールの属性・検証子を `mutate` で書き換えて同じキーへ保存する（`ALTER ROLE ... 属性`。Issue #1963）。
@@ -1227,6 +1356,12 @@ impl Storage {
         tenant_has_roles_in_txn(&rt, tenant)
     }
 
+    /// users ファイルのユーザーに対応するロールを同一の読み取りで引く（[`resolve_tenant_role_in_txn`]）。
+    pub(crate) fn resolve_tenant_role(&self, tenant: &str, name: &str) -> Result<TenantRoleLookup> {
+        let rt = self.db().begin_read()?;
+        resolve_tenant_role_in_txn(&rt, tenant, name)
+    }
+
     /// ログイン識別子を解決する（[`resolve_login_in_txn`]）。
     pub(crate) fn resolve_login(&self, identifier: &str) -> Result<Option<LoginResolution>> {
         let rt = self.db().begin_read()?;
@@ -1246,6 +1381,9 @@ impl Storage {
         Ok(n)
     }
 }
+
+pub(crate) mod graph;
+pub(crate) mod membership_apply;
 
 #[cfg(test)]
 mod tests;

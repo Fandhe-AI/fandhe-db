@@ -303,8 +303,7 @@ fn implicit_transaction_waits_before_first_statement_and_reads_after_acquiring_w
 }
 
 /// 複数文メッセージ内の `FOR UPDATE NOWAIT` は暗黙 Tx の writer 取得時点で待機方針に反映され、
-/// 待機上限（5 秒）を待たずに即時 `55P03` になる。`FOR UPDATE SKIP LOCKED` は writer に触れる前に
-/// `0A000`（Issue #2230。ポインタ: SQL-38）。
+/// 複数文メッセージの暗黙 Tx と待機方針の対応（Issue #2230・#2231・SQL-38 (4)。期待値はアサーションが正）。
 #[test]
 fn multi_statement_nowait_is_immediate_55p03_and_skip_locked_is_0a000() {
     let path = temp_db::unique_db_path("write-lock-wait-row-lock-multi");

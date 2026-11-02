@@ -224,10 +224,6 @@ struct GateRef {
     name: String,
     /// `DROP INDEX`／`ALTER INDEX` の対象名か（一時表の索引は一時 DB の索引カタログで照会する）。
     is_index: bool,
-    /// `ONLY` の直後に識別子が続く位置の `ONLY` 自身。構文語 `FROM ONLY t` か、引用符付きの実表 `"only"`
-    /// か字句だけでは区別できない（引用符の有無はトークンに残らない）ため、権限ゲートは「実在する表として
-    /// 引けるときだけ」検査対象にする（引けなければ構文語として無視。Issue #1968 の指摘対応）。
-    optional: bool,
 }
 
 /// 添字 `idx` の識別子が、表名ではなく構文語として置かれているか。名前の一致だけでは判定せず、
@@ -257,10 +253,20 @@ fn is_syntax_keyword_here(tokens: &[Token], idx: usize) -> bool {
         return false;
     };
     if w.eq_ignore_ascii_case("IF") {
-        return is(Some(idx.saturating_add(1)), "EXISTS") || is(Some(idx.saturating_add(1)), "NOT");
+        // `IF [NOT] EXISTS` は DDL（`CREATE`／`DROP`／`ALTER`）の句。SELECT の `FROM "if" exists`（`exists` は
+        // 暗黙の別名）のように、それ以外の文では実表 `if` の参照として残す（権限検査から外さない）。
+        return ["CREATE", "DROP", "ALTER"].iter().any(|k| is(Some(0), k))
+            && (is(Some(idx.saturating_add(1)), "EXISTS")
+                || is(Some(idx.saturating_add(1)), "NOT"));
     }
     if w.eq_ignore_ascii_case("ONLY") {
-        return next_is_name;
+        // `ONLY` を修飾語として受理する文は `TRUNCATE`・`LOCK`・`ALTER`（所有者変更）・DML だけ。SELECT の
+        // `FROM` 句などでは構文語ではなく関係名（`FROM "only" AS x` の実表 `only`）であり、字句上は引用の
+        // 有無を区別できないため、それ以外の文では常に関係名として残す（権限検査から外さない。fail-closed）。
+        return next_is_name
+            && ["TRUNCATE", "LOCK", "ALTER", "DELETE", "UPDATE", "INSERT"]
+                .iter()
+                .any(|k| is(Some(0), k));
     }
     if w.eq_ignore_ascii_case("TABLE") {
         // `LOCK TABLE <表>` の `TABLE` も構文語（Issue #1958。文頭の `LOCK` の直後だけ）。
@@ -275,6 +281,51 @@ fn is_syntax_keyword_here(tokens: &[Token], idx: usize) -> bool {
     false
 }
 
+/// 名前解決（`schema.name` の置き換え）済みのトークン列から、テーブル参照位置にある表名だけを集める
+/// （出現順・重複なし。内部キー `#<id>.<name>` も含む）。FROM・JOIN・サブクエリの内側を位置で拾い、
+/// 列名・別名・構文語・表関数名・CTE 名は含めない。`SKIP LOCKED` の空結果前の RLS 判定
+/// （`core::row_lock_exec`・RLS-13）が、実参照表だけへ `policies_apply` を掛けるために使う。
+pub(crate) fn resolved_relation_names(tokens: &[Token]) -> Vec<String> {
+    let walk = crate::sql::relation_name::relation_positions(tokens);
+    let ctes = crate::sql::relation_name::collect_cte_scopes(tokens);
+    let mut out: Vec<String> = Vec::new();
+    for pos in walk.positions {
+        if pos.create_name {
+            continue;
+        }
+        let Some(name) = tokens
+            .get(pos.index)
+            .and_then(crate::sql::relation_name::unqualified_ident_name)
+        else {
+            continue;
+        };
+        if is_syntax_keyword_here(tokens, pos.index)
+            || ctes
+                .iter()
+                .any(|c| c.covers(pos.index) && c.name.eq_ignore_ascii_case(name))
+        {
+            continue;
+        }
+        let prev = pos.index.checked_sub(1).and_then(|i| tokens.get(i));
+        let table_function_slot = matches!(
+            prev,
+            Some(Token::Keyword(crate::sql::lexer::Keyword::From) | Token::Punct(','))
+        ) || matches!(prev, Some(Token::Ident(w)) if w.eq_ignore_ascii_case("JOIN"));
+        if table_function_slot
+            && matches!(
+                tokens.get(pos.index.saturating_add(1)),
+                Some(Token::Punct('('))
+            )
+        {
+            continue;
+        }
+        if !out.iter().any(|n| n == name) {
+            out.push(name.to_string());
+        }
+    }
+    out
+}
+
 /// 未修飾のテーブル参照の名前集め（参照ゲートの入力）。`skip` はゲート対象外のトークン添字
 /// （準備済み文で `public.` 修飾を外した位置）。トークン列は書き換えない。
 fn unqualified_relation_refs(tokens: &[Token], skip: &[usize]) -> Vec<GateRef> {
@@ -287,18 +338,6 @@ fn unqualified_relation_refs(tokens: &[Token], skip: &[usize]) -> Vec<GateRef> {
 pub(crate) fn resolved_relation_ref_names(tokens: &[Token]) -> Vec<String> {
     relation_refs(tokens, &[], true)
         .into_iter()
-        .filter(|r| !r.optional)
-        .map(|r| r.name)
-        .collect()
-}
-
-/// [`resolved_relation_ref_names`] が構文語として除外しきれない `ONLY <識別子>` の `ONLY`（実表 `"only"`
-/// の可能性があるもの）と、その直後の識別子（別名の可能性があるもの）の名前。権限ゲートは、これが実在する relation として引けた場合に限り通常の参照と
-/// 同じく検査する（別名にだけ権限がある主体が実表 `"only"` を読む認可バイパスを防ぐ）。
-pub(crate) fn resolved_optional_only_names(tokens: &[Token]) -> Vec<String> {
-    relation_refs(tokens, &[], true)
-        .into_iter()
-        .filter(|r| r.optional)
         .map(|r| r.name)
         .collect()
 }
@@ -312,10 +351,6 @@ fn relation_refs(tokens: &[Token], skip: &[usize], keep_internal_keys: bool) -> 
     // 数えるため、位置走査の側では二重に数えない。
     let object_ddl = object_ddl_names(tokens);
     let mut out = Vec::new();
-    // 曖昧な `ONLY` の直後の識別子の添字。`FROM "only" x` では `x` は別名であり実表ではない一方、
-    // `FROM ONLY t` では `t` が実表になる。字句では区別できないため、後続名も「実在すれば検査する」
-    // 候補に倒す（別名が実在しない表名のとき必須扱いで 42501 になる誤拒否を避ける。Issue #1968）。
-    let mut after_ambiguous_only: Option<usize> = None;
     for pos in walk.positions {
         if pos.create_name
             || skip.contains(&pos.index)
@@ -337,22 +372,6 @@ fn relation_refs(tokens: &[Token], skip: &[usize], keep_internal_keys: bool) -> 
         }
         // 構文語（`IF`・`ONLY`・`LATERAL` 等）は構文位置で判定する。CTE 名はその参照位置から実際に
         // 可視なものだけを除外する（非再帰 CTE は自身の本文から見えない。`sql::cte` の契約）。
-        let ambiguous_only = keep_internal_keys
-            && name.eq_ignore_ascii_case("ONLY")
-            && matches!(
-                tokens.get(pos.index.saturating_add(1)),
-                Some(t) if crate::sql::relation_name::is_ident_like(t)
-            );
-        if ambiguous_only {
-            out.push(GateRef {
-                name: name.to_string(),
-                is_index: false,
-                optional: true,
-            });
-            after_ambiguous_only = Some(pos.index.saturating_add(1));
-            continue;
-        }
-        let follows_ambiguous_only = after_ambiguous_only == Some(pos.index);
         if is_syntax_keyword_here(tokens, pos.index)
             || ctes
                 .iter()
@@ -378,7 +397,6 @@ fn relation_refs(tokens: &[Token], skip: &[usize], keep_internal_keys: bool) -> 
         out.push(GateRef {
             name: name.to_string(),
             is_index: false,
-            optional: follows_ambiguous_only,
         });
     }
     // `DROP`／`ALTER`／`REFRESH` の対象名にも位置走査と同じ除外を掛ける。Bind・Describe は書き換え後の
@@ -430,7 +448,6 @@ fn object_ddl_names(tokens: &[Token]) -> Vec<(usize, GateRef)> {
             GateRef {
                 name: name.to_string(),
                 is_index,
-                optional: false,
             },
         ));
         if matches!(tokens.get(i + 1), Some(Token::Punct(','))) {
@@ -475,7 +492,14 @@ pub(crate) fn check_unqualified_refs(
     if !session.search_path_hides_public() {
         return Ok(());
     }
-    if is_ddl_head(tokens) && crate::sql::ddl::require_ddl_permission(session).is_err() {
+    if is_ddl_head(tokens)
+        && crate::sql::ddl::require_ddl_permission(session).is_err()
+        // `ALTER ... OWNER TO` は運用者権限が無くても、束縛ロールが対象の所有者なら実行できる（所有者経路。
+        // Issue #2236）。ロールが束縛されている間は参照ゲートを適用し、運用者権限も束縛ロールも無い
+        // （`42501` を受け取る）セッションだけを免除する。
+        && !(crate::sql::allowlist::is_alter_owner_statement(tokens)
+            && crate::sql::privilege_gate::bound_principal(session).is_ok())
+    {
         return Ok(());
     }
     // `GRANT`／`REVOKE`（SQL-40・Issue #1965）は現在ロールが束縛されていないセッションが `42501` を受け取る
@@ -695,6 +719,16 @@ mod tests {
     }
 
     #[test]
+    fn recursive_cte_self_reference_is_not_a_relation_ref() {
+        let sql = "WITH RECURSIVE docs(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM docs WHERE n<3) \
+                   SELECT n FROM docs";
+        assert!(names(sql).is_empty());
+        // 非再帰 CTE の本文の同名参照は実テーブルのまま数える。
+        let sql = "WITH docs AS (SELECT 1 FROM docs) SELECT * FROM docs";
+        assert_eq!(names(sql), vec!["docs".to_string()]);
+    }
+
+    #[test]
     fn default_value_displays_as_user_then_public() {
         assert_eq!(SearchPath::default().display(), "\"$user\", public");
     }
@@ -855,7 +889,11 @@ mod tests {
         assert_eq!(names("TRUNCATE a, ONLY b"), vec!["a", "b"]);
         assert_eq!(names("TRUNCATE public.a, ONLY b"), vec!["b"]);
         assert_eq!(names("TRUNCATE a, ONLY b, ONLY c"), vec!["a", "b", "c"]);
-        assert_eq!(names("SELECT id FROM a, ONLY b LIMIT 5"), vec!["a", "b"]);
+        // SELECT の `FROM` 句では `ONLY` は構文語ではなく関係名（実表 `only` の可能性を残す）。
+        assert_eq!(
+            names("SELECT id FROM a, ONLY b LIMIT 5"),
+            vec!["a", "ONLY", "b"]
+        );
         // 直前が式の語に見える引用付き識別子（表名・索引名・別名）でも、導入語の後の表名は残る。
         assert_eq!(names("CREATE INDEX \"is\" ON t (a)"), vec!["t"]);
         assert_eq!(names("CREATE INDEX \"in\" ON t (a)"), vec!["t"]);
@@ -924,8 +962,7 @@ mod tests {
             refs,
             vec![GateRef {
                 name: "i".to_string(),
-                is_index: true,
-                optional: false
+                is_index: true
             }]
         );
         let toks = tokenize("DROP VIEW v").expect("lex");

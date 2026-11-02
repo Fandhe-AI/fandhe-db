@@ -1,6 +1,6 @@
 //! 書き込み系の文（INSERT／UPDATE／DELETE／UPSERT／TRUNCATE とそのビュー・データ変更 CTE・
 //! `EXPLAIN ... PARTITIONED`）の表単位権限検査（SQL-40・RLS-12・SQL-19・SQL-22 ポインタ。Issue #1968。
-//! 設計は `docs/design/role-privilege-model.md` §13、経路一覧は `docs/design/privilege-check-paths.md`）。
+//! 設計は `docs/design/role-privilege-model.md` §17、経路一覧は `docs/design/privilege-check-paths.md`）。
 //!
 //! 役割: 検証済みの文から「書き込み先 relation とその必要ビット」を分類し（[`classify_write`]）、文が参照する
 //! 読み取り側の relation（INSERT ... SELECT の元・UPDATE ... FROM・サブクエリ等）に SELECT を課して、
@@ -35,7 +35,7 @@ use crate::sql::relation_name::SchemaResolver;
 use crate::storage::read_source::ReadSource;
 use crate::storage::Storage;
 
-use super::read::require_relations_bits;
+use super::read::{gate_relation_names, require_relations_bits, ParsedScope};
 use super::{check, Principal, PrivilegeTarget};
 
 /// 文の書き込み側の要求。`targets` は書き込み先 relation（キー）と必要ビット。文が参照する他の relation
@@ -252,6 +252,7 @@ pub(crate) fn classify_write(parsed: &ParsedSql) -> WriteRequirement {
         | ParsedSql::CreateSchema(_)
         | ParsedSql::DropSchema(_)
         | ParsedSql::AlterSchema(_)
+        | ParsedSql::AlterOwner(_)
         | ParsedSql::AlterSequence(_)
         | ParsedSql::SequenceFunction(_) => na(),
     }
@@ -282,6 +283,7 @@ fn check_unlooked(principal: &Principal, req: &WriteRequirement) -> Result<(), S
             granted_bits: 0,
         },
     )
+    .map(|_| ())
 }
 
 /// 文の書き込み先と参照先に必要な権限があるかを判定する（権限不足は `42501`）。`tokens` は構文解析へ
@@ -294,6 +296,7 @@ pub(crate) fn require_write_privileges(
     tokens: &[Token],
     resolver: Option<SchemaResolver<'_>>,
     parsed: &ParsedSql,
+    scope: ParsedScope<'_>,
 ) -> Result<(), SqlSurfaceError> {
     let req = classify_write(parsed);
     if req.is_not_applicable() {
@@ -305,19 +308,7 @@ pub(crate) fn require_write_privileges(
     }
     let mut resolved = tokens.to_vec();
     crate::sql::relation_name::rewrite_relation_names_full(&mut resolved, resolver)?;
-    let candidates = crate::sql::search_path::resolved_relation_ref_names(&resolved);
-    let optional: Vec<(String, u16)> =
-        crate::sql::search_path::resolved_optional_only_names(&resolved)
-            .into_iter()
-            .map(|n| (n, PRIV_SELECT))
-            .collect();
-    require_relations_bits(
-        storage,
-        tenant,
-        &principal,
-        &build_wants(&req, &candidates),
-        &optional,
-    )
+    require_with_scope(storage, tenant, &principal, &req, &resolved, scope)
 }
 
 /// [`require_write_privileges`] の、名前解決済みのトークン列を受け取る版（拡張クエリの Parse・Bind・
@@ -328,6 +319,7 @@ pub(crate) fn require_write_privileges_resolved(
     session: &SessionState,
     resolved_tokens: &[Token],
     parsed: &ParsedSql,
+    scope: ParsedScope<'_>,
 ) -> Result<(), SqlSurfaceError> {
     let req = classify_write(parsed);
     if req.is_not_applicable() {
@@ -337,18 +329,34 @@ pub(crate) fn require_write_privileges_resolved(
     if !principal.needs_acl_lookup() {
         return check_unlooked(&principal, &req);
     }
-    let candidates = crate::sql::search_path::resolved_relation_ref_names(resolved_tokens);
-    let optional: Vec<(String, u16)> =
-        crate::sql::search_path::resolved_optional_only_names(resolved_tokens)
-            .into_iter()
-            .map(|n| (n, PRIV_SELECT))
-            .collect();
+    require_with_scope(storage, tenant, &principal, &req, resolved_tokens, scope)
+}
+
+/// 候補（収集器の候補 ∪ 解析が直接解決した名前）から必要ビットを組み立てて ACL を照会する共通部。
+/// 書き込み先は解析が実在を確認した名前として扱い、照会の時点で見つからなければ拒否する（fail-closed。
+/// BEGIN 後の DROP でスナップショットの行を権限なしで書かせない）。
+fn require_with_scope(
+    storage: &Storage,
+    tenant: &str,
+    principal: &Principal,
+    req: &WriteRequirement,
+    resolved_tokens: &[Token],
+    scope: ParsedScope<'_>,
+) -> Result<(), SqlSurfaceError> {
+    let candidates = gate_relation_names(resolved_tokens, scope.parsed_relations);
+    let mut parsed_relations = scope.parsed_relations.to_vec();
+    for (t, _) in &req.targets {
+        if !parsed_relations.contains(t) {
+            parsed_relations.push(t.clone());
+        }
+    }
     require_relations_bits(
         storage,
         tenant,
-        &principal,
-        &build_wants(&req, &candidates),
-        &optional,
+        principal,
+        &build_wants(req, &candidates),
+        scope.read_snap,
+        &parsed_relations,
     )
 }
 
