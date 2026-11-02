@@ -49,10 +49,15 @@ pub use trigger::{ValidatedCreateTrigger, ValidatedDropTrigger};
 // POLICY DDL の構文検証（RLS-13・Issue #2274）。
 mod role;
 pub(crate) use role::{
-    is_create_role_statement, is_drop_role_statement, validate_create_role_tokens,
-    validate_drop_role_tokens, RolePassword,
+    is_alter_role_statement, is_create_role_statement, is_drop_role_statement,
+    is_reset_role_statement, is_set_role_statement, reset_role_statement,
+    validate_alter_role_tokens, validate_create_role_tokens, validate_drop_role_tokens,
+    validate_set_role_tokens, RolePassword,
 };
-pub use role::{ValidatedCreateRole, ValidatedDropRole};
+pub use role::{
+    AlterRoleAction, RoleOptionPatch, SetRoleTarget, ValidatedAlterRole, ValidatedCreateRole,
+    ValidatedDropRole, ValidatedSetRole,
+};
 
 mod policy;
 pub(crate) use policy::{
