@@ -712,6 +712,19 @@ impl EngineCore {
         )
     }
 
+    /// 拡張クエリの Execute 直前の権限再検査（SQL-40・Issue #1969）。portal が Bind 元として保持する
+    /// `prepared` と、Bind が返した文（`parsed`。振り分けの包みは外した形）を、現在の主体（`SET ROLE`
+    /// 後を含む）と最新の ACL で判定する。wire-server が最初の Execute の副作用より前に呼ぶ。
+    /// 判定そのものは Bind と同じ [`Self::require_prepared_read_privileges`]（権限不足は `42501`）。
+    pub fn recheck_portal_privileges(
+        &self,
+        session: &SessionState,
+        prepared: &super::PreparedSql,
+        parsed: &ParsedSql,
+    ) -> Result<(), SqlSurfaceError> {
+        self.require_prepared_read_privileges(session, prepared, parsed)
+    }
+
     /// [`Self::parse_sql_prepared_with_declared`] のセッション対応版（拡張クエリの Parse。TABLE-44・
     /// Issue #1684）。一時カタログが空、または文が一時表の名前を含まなければ従来と同一。一時表の
     /// 名前を含む文は一時コアで構造検証し（一時表だけを参照する DML・読み取り・索引 DDL のみ。

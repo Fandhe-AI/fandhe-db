@@ -914,6 +914,10 @@ struct Portal {
     /// [`MAX_BOUND_PARAM_BYTES_PER_SESSION`] で制限する（[`PortalStore::insert`]）。
     /// portal ごとの値から都度合算するため、除去経路での減算漏れが起きない。
     bound_bytes: usize,
+    /// Bind 元の準備済み文（Execute 直前の権限再検査用。SQL-40・Issue #1969。`PortalBody::Empty` は `None`）。
+    /// 名前解決済みトークン列を持つため、Bind 後の再 Parse・Close に依らず Execute 時点の主体と ACL で
+    /// 参照先を判定できる。
+    prepared: Option<std::sync::Arc<PreparedSql>>,
 }
 
 /// 接続単位で portal を保持する（[`PreparedStatementStore`] と同型の設計）。
@@ -1904,6 +1908,15 @@ fn handle_bind_body(
     }
 
     let mut bound_bytes = 0usize;
+    let portal_prepared: Option<std::sync::Arc<PreparedSql>> = match statement {
+        PreparedStatement::Empty => None,
+        PreparedStatement::Parameterized { prepared, .. } => {
+            Some(std::sync::Arc::new(prepared.clone()))
+        }
+        PreparedStatement::Parsed { prepared, .. } => {
+            Some(std::sync::Arc::new((**prepared).clone()))
+        }
+    };
     let (portal_body, columns) = match statement {
         PreparedStatement::Empty => (PortalBody::Empty, None),
         PreparedStatement::Parameterized { prepared, slots } => {
@@ -2043,6 +2056,7 @@ fn handle_bind_body(
         bound_txn_generation: txn.active_generation(),
         survived_sync: false,
         bound_bytes,
+        prepared: portal_prepared,
     };
 
     state
@@ -2289,7 +2303,7 @@ fn execute_portal<'e, S: WireStream>(
     );
 
     if needs_execution {
-        let (parsed, expected_columns, result_formats) = {
+        let (parsed, expected_columns, result_formats, portal_prepared) = {
             let portal = state
                 .portals
                 .get(portal_name)
@@ -2311,8 +2325,31 @@ fn execute_portal<'e, S: WireStream>(
                 parsed,
                 portal.columns.clone(),
                 portal.result_formats.clone(),
+                portal.prepared.clone(),
             )
         };
+
+        // SQL-40・Issue #1969: Bind の権限検査は Bind 時点の主体・ACL の判定にすぎない。Bind 後の `REVOKE`
+        // の確定や `SET ROLE` の切替を反映するため、最初の Execute の副作用・走査より前に、現在の主体と
+        // 最新の ACL で参照先を再検査する（fail-closed。準備済み文を持たない portal は拒否）。COPY の
+        // portal もここを通る。既に具体化済みの中断結果の払い出し（`needs_execution` が偽）は対象外。
+        {
+            let recheck = match portal_prepared.as_deref() {
+                Some(prepared) => {
+                    engine.recheck_portal_privileges(session, prepared, parsed.peel_session_route())
+                }
+                None => Err(engine::sql::allowlist::SqlSurfaceError::InsufficientPrivilege),
+            };
+            if let Err(e) = recheck {
+                let portal = state
+                    .portals
+                    .get_mut(portal_name)
+                    .ok_or(HandlerError::UnknownPortal)?;
+                portal.state = PortalState::Failed;
+                txn.fail();
+                return Err(HandlerError::Sql(e));
+            }
+        }
 
         // `engine::sql::allowlist::Statement`（`ParsedSql::Statement`）は
         // `SELECT`／`SET search_mode`／`CREATE FUNCTION`／`EXPLAIN` のみで、
@@ -3373,6 +3410,7 @@ mod tests {
             bound_txn_generation: None,
             survived_sync: false,
             bound_bytes,
+            prepared: None,
         }
     }
 
@@ -3536,6 +3574,7 @@ mod tests {
                         bound_txn_generation: None,
                         survived_sync: false,
                         bound_bytes: 0,
+                        prepared: None,
                     },
                 )
                 .expect("insert within limit succeeds");
@@ -3552,6 +3591,7 @@ mod tests {
                 bound_txn_generation: None,
                 survived_sync: false,
                 bound_bytes: 0,
+                prepared: None,
             },
         );
         assert!(matches!(result, Err(PortalStoreError::TooManyPortals)));
@@ -3573,6 +3613,7 @@ mod tests {
                     bound_txn_generation: None,
                     survived_sync: false,
                     bound_bytes: 0,
+                    prepared: None,
                 },
             )
             .expect("insert succeeds");
@@ -3589,6 +3630,7 @@ mod tests {
                     bound_txn_generation: None,
                     survived_sync: false,
                     bound_bytes: 0,
+                    prepared: None,
                 },
             )
             .expect("insert succeeds");
@@ -3614,6 +3656,7 @@ mod tests {
                     bound_txn_generation: None,
                     survived_sync: false,
                     bound_bytes: 0,
+                    prepared: None,
                 },
             )
             .expect("insert succeeds");
@@ -3630,6 +3673,7 @@ mod tests {
                     bound_txn_generation: None,
                     survived_sync: false,
                     bound_bytes: 0,
+                    prepared: None,
                 },
             )
             .expect("insert succeeds");
@@ -3650,6 +3694,7 @@ mod tests {
             bound_txn_generation: generation,
             survived_sync,
             bound_bytes: 0,
+            prepared: None,
         }
     }
 

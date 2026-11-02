@@ -374,6 +374,49 @@ fn extended_query_is_checked_at_parse_bind_and_describe() {
     assert_eq!(e.wire_code(), "42501");
 }
 
+/// Issue #1969: Execute 直前の再検査。Bind 後の `REVOKE` の確定と、Bind 後の主体の切替（`SET ROLE` 相当）の
+/// どちらも拒否される。権限が残っていれば通る。
+#[test]
+fn portal_recheck_rejects_revoke_and_role_switch_after_bind() {
+    let f = fx("selpriv-portal-recheck");
+    let sql = "SELECT id FROM ca LIMIT 5";
+    f.admin_run("GRANT SELECT ON ca TO alice");
+    let mut s = bound(f.alice, A, false);
+    let prepared = f
+        .core
+        .parse_sql_prepared_with_declared_in_session(&s, sql, &[])
+        .expect("parse");
+    let txn = f.core.new_session_transaction();
+    let parsed = f
+        .core
+        .bind_prepared_in_txn(&s, &txn, &prepared, &[])
+        .expect("bind");
+    let parsed = parsed.peel_session_route().clone();
+    f.core
+        .recheck_portal_privileges(&s, &prepared, &parsed)
+        .expect("still granted");
+
+    // Bind 後に別セッションが REVOKE を確定する。
+    f.admin_run("REVOKE SELECT ON ca FROM alice");
+    let e = f
+        .core
+        .recheck_portal_privileges(&s, &prepared, &parsed)
+        .expect_err("revoked after bind");
+    assert_eq!(e.wire_code(), "42501");
+
+    // Bind 後に権限の無い主体へ切り替える（付与し直した上で別ロールへ）。
+    f.admin_run("GRANT SELECT ON ca TO alice");
+    f.core
+        .recheck_portal_privileges(&s, &prepared, &parsed)
+        .expect("regranted");
+    s.bind_role_ids(f.admin + 1000, f.alice);
+    let e = f
+        .core
+        .recheck_portal_privileges(&s, &prepared, &parsed)
+        .expect_err("switched to a role without privilege");
+    assert_eq!(e.wire_code(), "42501");
+}
+
 #[test]
 fn bound_http_read_api_is_checked_before_binding() {
     let f = fx("selpriv-http");
