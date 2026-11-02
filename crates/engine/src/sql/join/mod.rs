@@ -809,6 +809,8 @@ fn run_join_with_sides(
                     .map_err(|_| SqlSurfaceError::payload_too_large("JOIN output is too large"))?;
             }
             for &ti in sliced {
+                // Issue #1952: 協調的中断の確認点（出力タプルの射影ごと。commit 前の読み取り経路）。
+                crate::interrupt::check()?;
                 let tuple = tuples
                     .get(ti as usize)
                     .ok_or_else(|| SqlSurfaceError::Internal {

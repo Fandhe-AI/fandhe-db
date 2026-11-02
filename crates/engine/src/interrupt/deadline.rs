@@ -83,12 +83,18 @@ struct Slot {
     countdown: u32,
     /// 一度期限超過を検出したら以降の確認も失敗させる（ラッチ）。
     fired: bool,
+    /// テスト用プローブ: 確認回数がこの値に達したら期限超過として扱う（時計を読まない）。
+    fire_after: Option<u32>,
+    /// プローブ有効時の確認回数（[`checks_seen`] が返す）。
+    seen: u32,
 }
 
 const EMPTY: Slot = Slot {
     at: None,
     countdown: 0,
     fired: false,
+    fire_after: None,
+    seen: 0,
 };
 
 thread_local! {
@@ -141,6 +147,8 @@ impl DeadlineScope {
                 at,
                 countdown: 0,
                 fired: prev.fired,
+                fire_after: None,
+                seen: 0,
             })
         });
         DeadlineGuard {
@@ -148,6 +156,35 @@ impl DeadlineScope {
             _not_send: PhantomData,
         }
     }
+}
+
+/// テスト専用プローブ（`#[doc(hidden)]`。本番経路からは呼ばない）。時計に依存せず、`check()` が
+/// `n` 回通過した後の `n + 1` 回目で `57014` にする。走査完了後の確認点（JOIN・集約・集合演算等）
+/// だけを決定的に発火させる結合テスト（Issue #1952）が使う。`u32::MAX` なら発火せず確認回数だけ
+/// 数える（[`checks_seen`]）。drop で直前のスロットへ戻る。
+#[doc(hidden)]
+pub fn install_fire_after_checks(n: u32) -> DeadlineGuard {
+    let prev = DEADLINE.with(Cell::get);
+    DEADLINE.with(|c| {
+        c.set(Slot {
+            // 実時刻は参照されない（プローブ有効時は時計を読まない）。有効判定のための印。
+            at: Some(Instant::now()),
+            countdown: 0,
+            fired: false,
+            fire_after: Some(n),
+            seen: 0,
+        })
+    });
+    DeadlineGuard {
+        prev,
+        _not_send: PhantomData,
+    }
+}
+
+/// [`install_fire_after_checks`] 有効中の確認回数（テスト専用。無効時は 0）。
+#[doc(hidden)]
+pub fn checks_seen() -> u32 {
+    DEADLINE.with(Cell::get).seen
 }
 
 /// 現在のスレッドの実効期限（無効なら [`StatementDeadline::disabled`]）。
@@ -163,6 +200,16 @@ pub(super) fn poll() -> Option<InterruptReason> {
         let at = s.at?;
         if s.fired {
             return Some(InterruptReason::StatementTimeout);
+        }
+        if let Some(limit) = s.fire_after {
+            if s.seen >= limit {
+                s.fired = true;
+                c.set(s);
+                return Some(InterruptReason::StatementTimeout);
+            }
+            s.seen += 1;
+            c.set(s);
+            return None;
         }
         if s.countdown > 0 {
             s.countdown -= 1;
