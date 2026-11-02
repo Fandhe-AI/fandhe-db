@@ -50,6 +50,17 @@ pub(crate) enum GranteeSpec {
     Name(String),
 }
 
+/// [`AclRequest`] の対象の種別（Issue #2234）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AclScope {
+    /// `tables`（解決済みの relation キー）。
+    Tables,
+    /// `schemas`（SCHEMA 名。書き込みと同じ txn で内部 ID へ解決する）。
+    Schemas,
+    /// `schemas` 配下の、実行時点で既に在る relation（表・ビュー・matview）へ展開する。
+    AllTablesInSchemas,
+}
+
 /// 権限 1 項目。`columns` が空なら表単位。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AclItem {
@@ -65,7 +76,10 @@ pub(crate) struct AclRequest<'a> {
     pub(crate) grantor_id: u64,
     /// 所有者相当（DDL 権限ゲート通過済み）か。
     pub(crate) owner_equivalent: bool,
+    pub(crate) scope: AclScope,
     pub(crate) tables: &'a [String],
+    /// SCHEMA 名（`scope` が `Schemas`／`AllTablesInSchemas` のとき）。利用者が書いた裸の名前。
+    pub(crate) schemas: &'a [String],
     pub(crate) items: &'a [AclItem],
     pub(crate) grantees: &'a [GranteeSpec],
     /// `WITH GRANT OPTION`（GRANT）／`GRANT OPTION FOR`（REVOKE）。
@@ -98,6 +112,8 @@ pub(crate) enum AclChangeError {
     GranteeNotFound(String),
     /// 列が無い（利用者が書いた名前）。
     ColumnNotFound(String),
+    /// SCHEMA が自テナントに無い（他テナントにだけ在る場合を含む。利用者が書いた名前。`3F000`）。
+    SchemaNotFound(String),
     /// 付与者が未束縛・不在、または対象に何の権限も持たない（`42501`）。
     PermissionDenied,
     /// RESTRICT で依存する付与が残る（`2BP01`）。
@@ -170,7 +186,9 @@ fn target_key(object: &PrivilegeObject) -> String {
     match object {
         PrivilegeObject::Table(t) => format!("T\0{t}"),
         PrivilegeObject::Column { table, column } => format!("C\0{table}\0{column}"),
-        _ => String::new(),
+        PrivilegeObject::Schema(id) => format!("S\0{id}"),
+        PrivilegeObject::Sequence(id) => format!("Q\0{id}"),
+        PrivilegeObject::Function(id) => format!("F\0{id}"),
     }
 }
 
@@ -332,7 +350,7 @@ fn resolve_dependents(
                     });
                 }
             }
-            PrivilegeObject::Column { .. } => objs.push(scope.clone()),
+            PrivilegeObject::Column { .. } | PrivilegeObject::Schema(_) => objs.push(scope.clone()),
             _ => continue,
         }
         for obj in objs {
@@ -462,11 +480,42 @@ impl Storage {
         if get_role_by_id_in_txn(&*write_txn, tenant, req.grantor_id)?.is_none() {
             return Err(AclChangeError::PermissionDenied);
         }
-        // 1. 対象 relation。
+        // 1. 対象。SCHEMA 名は書き込みと同じ txn のスナップショットで自テナントの内部 ID へ解決する
+        // （不在・他テナントは区別なく `SchemaNotFound`。存在オラクルにしない）。
         let mut kinds: Vec<(String, RelKind)> = Vec::new();
-        for t in req.tables {
-            let k = relation_kind(&write_txn, tenant, t)?;
-            kinds.push((t.clone(), k));
+        let mut schema_ids: Vec<u64> = Vec::new();
+        if req.scope != AclScope::Tables {
+            for name in req.schemas {
+                let id = crate::catalog::namespace::schema_id_in_txn(&*write_txn, tenant, name)?
+                    .ok_or_else(|| AclChangeError::SchemaNotFound(name.clone()))?;
+                if !schema_ids.contains(&id) {
+                    schema_ids.push(id);
+                }
+            }
+        }
+        match req.scope {
+            AclScope::Tables => {
+                for t in req.tables {
+                    let k = relation_kind(&write_txn, tenant, t)?;
+                    kinds.push((t.clone(), k));
+                }
+            }
+            AclScope::Schemas => {}
+            AclScope::AllTablesInSchemas => {
+                // 実行時点（この txn のスナップショット）で既に在る relation だけへ展開する。後から作られる
+                // 表には効かない（PostgreSQL と同じ）。総数は走査上限で有界。
+                for id in &schema_ids {
+                    for key in
+                        crate::catalog::namespace::schema_relation_keys_in_txn(&*write_txn, *id)?
+                    {
+                        if kinds.len() >= MAX_TARGET_VISITS {
+                            return Err(AclChangeError::LimitExceeded);
+                        }
+                        let k = relation_kind(&write_txn, tenant, &key)?;
+                        kinds.push((key, k));
+                    }
+                }
+            }
         }
         // 2. 付与先。
         let mut grantee_ids: Vec<u64> = Vec::new();
@@ -495,6 +544,19 @@ impl Storage {
         // 3. 列の存在と対象の組み立て。
         let mut targets: Vec<Target> = Vec::new();
         let mut index: HashMap<String, usize> = HashMap::new();
+        if req.scope == AclScope::Schemas {
+            for id in &schema_ids {
+                for item in req.items {
+                    add_target(
+                        &mut targets,
+                        &mut index,
+                        PrivilegeObject::Schema(*id),
+                        item.bits,
+                        false,
+                    )?;
+                }
+            }
+        }
         for (table, kind) in &kinds {
             let has_columns = req.items.iter().any(|i| !i.columns.is_empty());
             let schema = if *kind == RelKind::Table && (has_columns || !req.is_grant) {

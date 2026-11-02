@@ -13,10 +13,14 @@
 //!   `REVOKE [{ADMIN|INHERIT|SET} OPTION FOR] <ロール>[, ...] FROM <付与先>[, ...] [CASCADE|RESTRICT]`。
 //!   構造化だけを行い、実行（メンバーシップの保存・循環拒否・継承）は #2232 の担当（実行段は `0A000`）。
 //!
+//! - SCHEMA 形（Issue #2234）: `GRANT|REVOKE {USAGE|CREATE|ALL [PRIVILEGES]}[, ...] ON SCHEMA <名>[, ...]`
+//!   と `GRANT|REVOKE <表の権限>[, ...] ON ALL TABLES IN SCHEMA <名>[, ...]`。SCHEMA 名は裸の識別子で、
+//!   組み込み名（`public`・`pg_catalog`・`information_schema`・`pg_temp`）は構文段の `0A000`。
+//!
 //! 構文段で拒否する形: 句の欠落・重複・順序違い・未知の権限語・空の列リスト・末尾の余り（`42601`）、
 //! 対象の種別に許されない権限・PUBLIC への `WITH GRANT OPTION`（`0LP01`）、範囲外の対象種別
-//! （`SCHEMA`・`SEQUENCE`・`FUNCTION`・`ALL ... IN SCHEMA`・`DATABASE` 等）・`GRANTED BY`・解決されずに
-//! 残った修飾名（`0A000`。状態に依存しない拒否のため存在オラクルにならない）。
+//! （`SEQUENCE`・`FUNCTION`・`ALL SEQUENCES／FUNCTIONS IN SCHEMA`・`DATABASE` 等）・組み込み SCHEMA 名・
+//! `GRANTED BY`・解決されずに残った修飾名（`0A000`。状態に依存しない拒否のため存在オラクルにならない）。
 //!
 //! 列挙の件数は [`MAX_GRANT_LIST_LEN`] で検証してから確保する（無制限確保の防止）。
 
@@ -41,6 +45,20 @@ const TABLE_PRIVILEGES: u16 = PRIV_SELECT
 
 /// 列に許す権限ビットの全体（`PrivilegeObject::Column` の許可集合と一致させる）。
 const COLUMN_PRIVILEGES: u16 = PRIV_SELECT | PRIV_INSERT | PRIV_UPDATE | PRIV_REFERENCES;
+
+/// SCHEMA に許す権限ビットの全体（`PrivilegeObject::Schema` の許可集合と一致させる）。
+const SCHEMA_PRIVILEGES: u16 = PRIV_USAGE | PRIV_CREATE;
+
+/// 権限形の対象の種別（Issue #2234）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GrantScope {
+    /// `ON [TABLE] <表>[, ...]`（`GrantObjects::tables`）。
+    Tables,
+    /// `ON SCHEMA <名>[, ...]`（`GrantObjects::schemas`）。
+    Schemas,
+    /// `ON ALL TABLES IN SCHEMA <名>[, ...]`（`GrantObjects::schemas`。実行時点の既存 relation だけへ展開）。
+    AllTablesInSchemas,
+}
 
 /// 付与先。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,8 +85,12 @@ pub(crate) struct PrivItem {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GrantObjects {
     pub(crate) items: Vec<PrivItem>,
-    /// 解決済みの表名（裸の名前または SCHEMA 配下の内部キー。重複除去済み）。
+    pub(crate) scope: GrantScope,
+    /// 解決済みの表名（裸の名前または SCHEMA 配下の内部キー。重複除去済み。`Tables` のときだけ非空）。
     pub(crate) tables: Vec<String>,
+    /// SCHEMA 名（利用者が書いた裸の名前。重複除去済み。`Schemas`・`AllTablesInSchemas` のときだけ非空。
+    /// 解決は実行段の write txn の中で行う）。
+    pub(crate) schemas: Vec<String>,
     pub(crate) grantees: Vec<Grantee>,
     /// `GRANT` の `WITH GRANT OPTION`／`REVOKE` の `GRANT OPTION FOR`。
     pub(crate) grant_option: bool,
@@ -348,10 +370,9 @@ fn parse_privilege_items(
     }
 }
 
-/// 範囲外の対象種別（`ON SCHEMA`・`ON ALL TABLES IN SCHEMA` 等）の語か。
+/// 範囲外の対象種別（`ON SEQUENCE`・`ON ALL SEQUENCES IN SCHEMA` 等）の語か。`SCHEMA` は #2234 で対象内。
 fn is_unsupported_object_kind(word: &str) -> bool {
     [
-        "SCHEMA",
         "SEQUENCE",
         "FUNCTION",
         "PROCEDURE",
@@ -385,8 +406,26 @@ fn parse_object_form(
 ) -> Result<GrantObjects, SqlSurfaceError> {
     let raw_items = parse_privilege_items(p)?;
     p.expect_ident_matching("ON")?;
+    // SCHEMA 形（Issue #2234）。`schema` という名前の表と区別するため、次が名前のときだけ種別語として読む。
+    let mut scope = GrantScope::Tables;
+    if p.peek_ident_matches("SCHEMA") && name_follows(p, 1) {
+        p.advance();
+        scope = GrantScope::Schemas;
+    } else if p.peek_ident_matches("ALL")
+        && p.peek_ident_matches_at(1, "TABLES")
+        && p.peek_ident_matches_at(2, "IN")
+        && p.peek_ident_matches_at(3, "SCHEMA")
+        && name_follows(p, 4)
+    {
+        for _ in 0..4 {
+            p.advance();
+        }
+        scope = GrantScope::AllTablesInSchemas;
+    }
     // 対象種別。範囲外の種別は構文（`TO`／`FROM` の存在）だけ確かめて `0A000`。
-    if let Some(w) = word_of(p.peek()) {
+    if scope != GrantScope::Tables {
+        // SCHEMA 形は種別語を読み終えている。
+    } else if let Some(w) = word_of(p.peek()) {
         let is_kind = is_unsupported_object_kind(&w)
             && (name_follows(p, 1)
                 || matches!(
@@ -405,7 +444,8 @@ fn parse_object_form(
         }
     }
     // 省略可能な `TABLE`（次が名前のときだけ。名前 `table` と区別）。
-    if p.peek_ident_matches("TABLE")
+    if scope == GrantScope::Tables
+        && p.peek_ident_matches("TABLE")
         && (name_follows(p, 1)
             || matches!(
                 p.tokens.get(p.pos.saturating_add(1)),
@@ -415,18 +455,25 @@ fn parse_object_form(
         p.advance();
     }
     let mut tables: Vec<String> = Vec::new();
+    let mut schemas: Vec<String> = Vec::new();
     loop {
-        if matches!(p.peek(), Some(Token::QualifiedIdent { .. })) {
-            return Err(SqlSurfaceError::feature_not_supported(
-                "unresolved schema-qualified table names are not supported",
-            ));
+        if scope == GrantScope::Tables {
+            if matches!(p.peek(), Some(Token::QualifiedIdent { .. })) {
+                return Err(SqlSurfaceError::feature_not_supported(
+                    "unresolved schema-qualified table names are not supported",
+                ));
+            }
+            let t = p
+                .expect_ident()
+                .map_err(|_| syntax("expected a table name"))?;
+            crate::catalog::validate_relation_key(&t)
+                .map_err(|_| syntax("invalid table name in GRANT/REVOKE"))?;
+            push_unique(&mut tables, t)?;
+        } else {
+            // 修飾名・`$n` は `parse_name` が `42601` にする（SCHEMA 名は裸の識別子だけ）。
+            let n = parse_name(p, "schema")?;
+            push_unique(&mut schemas, n)?;
         }
-        let t = p
-            .expect_ident()
-            .map_err(|_| syntax("expected a table name"))?;
-        crate::catalog::validate_relation_key(&t)
-            .map_err(|_| syntax("invalid table name in GRANT/REVOKE"))?;
-        push_unique(&mut tables, t)?;
         if matches!(p.peek(), Some(Token::Punct(','))) {
             p.advance();
         } else {
@@ -456,18 +503,31 @@ fn parse_object_form(
     }
     p.expect_end_of_statement()?;
 
-    // 権限の展開と、対象の種別（表／列）に許される権限かの検査（`0LP01`）。
+    // 組み込み SCHEMA（行・内部 ID を持たない仮想 SCHEMA）は名前だけで決まる `0A000`（状態に依存しない）。
+    if schemas.iter().any(|n| {
+        crate::catalog::namespace::is_builtin_schema_name(n) || n.eq_ignore_ascii_case("pg_temp")
+    }) {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "GRANT/REVOKE on built-in schemas is not supported",
+        ));
+    }
+    // 権限の展開と、対象の種別（表／列／SCHEMA）に許される権限かの検査（`0LP01`）。
     let mut items: Vec<PrivItem> = Vec::new();
     for (bits, is_all, columns) in raw_items {
-        let allowed = if columns.is_empty() {
-            TABLE_PRIVILEGES
-        } else {
-            COLUMN_PRIVILEGES
+        if scope != GrantScope::Tables && !columns.is_empty() {
+            return Err(syntax("column lists are not allowed for this object type"));
+        }
+        let allowed = match scope {
+            GrantScope::Schemas => SCHEMA_PRIVILEGES,
+            _ if columns.is_empty() => TABLE_PRIVILEGES,
+            _ => COLUMN_PRIVILEGES,
         };
         let bits = if is_all { allowed } else { bits };
         if bits & !allowed != 0 {
             return Err(SqlSurfaceError::invalid_grant_operation(
-                if columns.is_empty() {
+                if scope == GrantScope::Schemas {
+                    "invalid privilege type for schema"
+                } else if columns.is_empty() {
                     "invalid privilege type for table"
                 } else {
                     "invalid privilege type for column"
@@ -483,7 +543,9 @@ fn parse_object_form(
     }
     Ok(GrantObjects {
         items,
+        scope,
         tables,
+        schemas,
         grantees,
         grant_option,
         cascade,
