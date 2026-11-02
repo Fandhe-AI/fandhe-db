@@ -327,6 +327,7 @@ UNIQUE 索引・FK 検査（F6）は、各チャンクで行の書き込みと�
 | `crash-test-cross-table`（TABLE-10） | 10 行＋バッチ台帳を 1 トランザクション | 行と台帳が連続し、台帳の件数合計と行の総数が一致し、行数がバッチ幅の倍数（1 トランザクションの部分 commit が 0 件） |
 | `crash-test-cross-table` ジョブ内の DDL の段（PERSIST-1・TABLE-10。Issue #2417） | 1 文の DDL（`CREATE TABLE`・`ALTER TABLE ADD COLUMN`・スカラー／一意の `CREATE INDEX`・`DROP TABLE`）を 1 文ずつ実行 | カタログ・行・索引宣言・物理表が「文の前」か「文の後」のどちらか一方に完全一致し、一致する段数がちょうど 1 つ（部分的な DDL が 0 件） |
 | `crash-test-cross-table` の txn 段（SQL-31・TABLE-10・Issue #2415） | SQL 明示トランザクション（条件付き UPDATE＋2 表 INSERT） | 台帳・明細・バッチの 3 表が全部残るか全く残らないか（部分 commit が 0 件） |
+| `crash-test-txn-kill-points`（SQL-31・TABLE-10・PERSIST-1・Issue #2416） | 同上の明示 Tx を実行中・COMMIT 直前・COMMIT 直後で停止させて SIGKILL | 途中・直前は何も残らず直後は全部残る。行数・バッチ数が PAUSED 行の期待値と完全一致 |
 | `crash-test-unique-index`（TABLE-16） | UNIQUE 列への 10 行を 1 文で INSERT | 行数がバッチ幅の倍数で、既存値の再 INSERT が必ず `23505`（索引の欠落がない） |
 
 いずれも「1 トランザクション（1 文）の変更は全部残るか全く残らないか」を確認しており、

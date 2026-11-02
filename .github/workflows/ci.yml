@@ -205,6 +205,9 @@ jobs:
         run: make crash-test-cross-table
       - name: Run crash-test-ddl
         run: make crash-test-ddl
+      # Issue #2416: 明示 Tx の kill 位置制御の段も同ジョブの step で実行（必須チェック名を増やさない）
+      - name: Run crash-test-txn-kill-points
+        run: make crash-test-txn-kill-points
 
   # --------------------------------------------------
   # crash-test-unique-index（永続一意索引・クラッシュ耐性回帰テスト。
