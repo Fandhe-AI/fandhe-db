@@ -63,7 +63,56 @@ impl LoginRoleCredentials {
     }
 }
 
+/// users ファイルのユーザーとカタログのロールの対応づけ結果（Issue #1971。判定は wire-server 側）。
+#[derive(Clone, PartialEq, Eq)]
+pub enum UsersFileRoleBinding {
+    /// テナントにロールが無く、カタログが正ではない（従来どおり未束縛）。
+    CatalogNotAuthoritative,
+    /// 同名のロールがある（NOLOGIN・期限切れも返す。拒否は wire 側が検証後に行う）。
+    Role(LoginRoleCredentials),
+    /// テナントにロールはあるが同名が無い（wire 側は `28P01` へ倒す）。
+    Missing,
+}
+
+impl std::fmt::Debug for UsersFileRoleBinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("UsersFileRoleBinding(<redacted>)")
+    }
+}
+
 impl EngineCore {
+    /// users ファイルで認証したユーザーに対応する同名ロールを、そのテナント内で引く（Issue #1971・
+    /// SQL-39・WIRE-2）。呼び出し元は wire-server の `auth::users_file_role`。破損は `Err`（内容なし）。
+    pub fn resolve_users_file_role(
+        &self,
+        tenant_id: &str,
+        username: &str,
+    ) -> Result<UsersFileRoleBinding, LoginLookupError> {
+        let lookup = self
+            .storage
+            .resolve_tenant_role(tenant_id, username)
+            .map_err(|_| LoginLookupError)?;
+        match lookup {
+            role::TenantRoleLookup::NotAuthoritative => {
+                Ok(UsersFileRoleBinding::CatalogNotAuthoritative)
+            }
+            role::TenantRoleLookup::Missing => Ok(UsersFileRoleBinding::Missing),
+            role::TenantRoleLookup::Found(def) => {
+                let scram_verifier =
+                    String::from_utf8(def.scram_verifier).map_err(|_| LoginLookupError)?;
+                Ok(UsersFileRoleBinding::Role(LoginRoleCredentials {
+                    tenant_id: tenant_id.to_string(),
+                    role_id: def.id,
+                    role_name: def.name,
+                    scram_verifier,
+                    login: def.attributes.login,
+                    valid_until: def.valid_until,
+                    connection_limit: def.connection_limit,
+                }))
+            }
+        }
+    }
+
     /// `identifier` がカタログのログイン識別子の正規形か（形だけの判定。存在は調べない）。認証経路の
     /// 振り分け（カタログか users ファイルか）に使う。入力の形だけで決まるため存在のオラクルにならない。
     pub fn is_login_identifier(identifier: &str) -> bool {
