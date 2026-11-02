@@ -2550,7 +2550,14 @@ fn execute_portal<'e, S: WireStream>(
             engine.execute_parsed_in_txn(ctx, session, txn, &parsed)
         });
         let pending_notices = notices.finish();
-        let _ = crate::error_response::write_notices(stream, &pending_notices);
+        if let Err(e) = crate::error_response::write_notices(stream, &pending_notices) {
+            let err = io_to_handler(e);
+            return Err(if is_write_statement && outcome.is_ok() {
+                HandlerError::PostCommit(Box::new(err))
+            } else {
+                err
+            });
+        }
         let outcome = outcome.map_err(HandlerError::Sql)?;
 
         // `parsed` がカーソル `FETCH` なら、実行が成功したこの時点（`txn` は

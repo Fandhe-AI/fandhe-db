@@ -17,6 +17,8 @@
 //! （載るのは呼び出し元の RLS の下で評価された値だけ）。
 
 use std::cell::RefCell;
+use std::marker::PhantomData;
+use std::rc::Rc;
 
 /// 1 件のメッセージ（文言・DETAIL・HINT）の最大バイト数。
 pub const MAX_NOTICE_FIELD_BYTES: usize = 4096;
@@ -189,9 +191,13 @@ pub(crate) fn push_notice(n: Notice) {
 }
 
 /// 文 1 つの実行を包む通知の区間（RAII）。`finish` を呼ばずに落とした場合も区間を必ず戻す。
+///
+/// 区間は実行中スレッドの `SINK` を操作するため、別スレッドへ移すと作成元の区間が残り移動先の区間を
+/// 壊す。`PhantomData<Rc<()>>` で `!Send`・`!Sync` にして作成元スレッドへ固定する。
 pub struct StatementNotices {
     saved: Option<Sink>,
     active: bool,
+    _not_send: PhantomData<Rc<()>>,
 }
 
 impl StatementNotices {
@@ -201,6 +207,7 @@ impl StatementNotices {
         Self {
             saved,
             active: true,
+            _not_send: PhantomData,
         }
     }
 
