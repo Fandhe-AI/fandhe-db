@@ -64,6 +64,11 @@ struct Fixture {
 impl Fixture {
     /// users ファイルには `ops`（tenant-a・パスワード `pw-ops`）を 1 件置く（回帰確認用）。
     fn start(label: &str) -> Self {
+        Self::start_with(label, &[])
+    }
+
+    /// `ddl_users` は `--ddl-allowed-users` 相当（Issue #1971 の優先関係の確認用）。
+    fn start_with(label: &str, ddl_users: &[&str]) -> Self {
         let dir = TempDir::new(label);
         let users = dir.0.join("users.txt");
         let phc = argon2id::encode_phc(
@@ -84,7 +89,11 @@ impl Fixture {
             UserStore::load_from_file(&users)
                 .expect("users")
                 .require_scram(MOCK_KEY_SECRET)
-                .expect("scram"),
+                .expect("scram")
+                .with_ddl_allowed_users(
+                    &ddl_users.iter().map(|u| u.to_string()).collect::<Vec<_>>(),
+                )
+                .expect("ddl users"),
         );
         let core = Arc::new(EngineCore::open(dir.0.join("db.redb")).expect("open engine"));
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -505,4 +514,128 @@ fn attributes_changed_while_waiting_are_rechecked() {
         assert!(!after_ok, "{label}");
         assert_eq!(sqlstate(&body), "28P01", "{label}");
     }
+}
+
+/// 確立済みの接続で簡易クエリを 1 本流し、ReadyForQuery までに ErrorResponse があればその SQLSTATE を返す。
+fn simple_query(stream: &mut TcpStream, sql: &str) -> Option<String> {
+    let mut body = sql.as_bytes().to_vec();
+    body.push(0);
+    let mut msg = vec![b'Q'];
+    msg.extend_from_slice(&((4 + body.len()) as i32).to_be_bytes());
+    msg.extend_from_slice(&body);
+    stream.write_all(&msg).expect("query");
+    let mut code = None;
+    loop {
+        let (ty, body) = read_message(stream);
+        match ty {
+            b'E' => code = Some(sqlstate(&body)),
+            b'Z' => return code,
+            _ => {}
+        }
+    }
+}
+
+// ---- Issue #1971: users ファイルのユーザーとカタログのロールの対応づけ（SQL-39・WIRE-2） ----
+
+#[test]
+fn users_file_user_without_any_role_stays_unbound() {
+    let f = Fixture::start("ufr-unbound");
+    let mut s = expect_ready(f.login("ops", b"pw-ops"));
+    // 束縛されていないセッションは SET ROLE を許可しない（従来どおり）。
+    assert_eq!(
+        simple_query(&mut s, "SET ROLE ops").as_deref(),
+        Some("42501")
+    );
+}
+
+#[test]
+fn users_file_user_binds_to_same_name_role() {
+    let f = Fixture::start("ufr-bound");
+    f.sql(TENANT, "CREATE ROLE ops LOGIN");
+    let mut s = expect_ready(f.login("ops", b"pw-ops"));
+    assert_eq!(simple_query(&mut s, "SET ROLE ops"), None);
+}
+
+#[test]
+fn users_file_user_without_same_name_role_is_rejected_like_wrong_password() {
+    let f = Fixture::start("ufr-missing");
+    f.sql(TENANT, "CREATE ROLE someone_else LOGIN");
+    let (body, after_ok, elapsed, _) = expect_rejected(f.login("ops", b"pw-ops"));
+    assert!(!after_ok);
+    assert_eq!(sqlstate(&body), "28P01");
+    assert!(elapsed >= wire_server::auth::AUTH_FAILURE_DELAY);
+    let (wrong, _, _, _) = expect_rejected(f.login("ops", b"wrong"));
+    assert_eq!(body, wrong, "must be byte-identical to a wrong password");
+}
+
+#[test]
+fn users_file_user_with_nologin_or_expired_role() {
+    let f = Fixture::start("ufr-nologin");
+    f.sql(TENANT, "CREATE ROLE ops NOLOGIN");
+    let (body, after_ok, _, _) = expect_rejected(f.login("ops", b"pw-ops"));
+    assert!(after_ok);
+    assert_eq!(sqlstate(&body), "28000");
+    let (body, after_ok, _, _) = expect_rejected(f.login("ops", b"wrong"));
+    assert!(!after_ok);
+    assert_eq!(sqlstate(&body), "28P01");
+
+    let f = Fixture::start("ufr-expired");
+    f.sql(
+        TENANT,
+        "CREATE ROLE ops LOGIN VALID UNTIL '2000-01-01 00:00:00+00'",
+    );
+    let (body, after_ok, elapsed, _) = expect_rejected(f.login("ops", b"pw-ops"));
+    assert!(!after_ok);
+    assert_eq!(sqlstate(&body), "28P01");
+    assert!(elapsed >= wire_server::auth::AUTH_FAILURE_DELAY);
+}
+
+#[test]
+fn users_file_user_does_not_match_another_tenants_role() {
+    let f = Fixture::start("ufr-tenant");
+    f.sql("tenant-b", "CREATE ROLE ops LOGIN");
+    // 自テナントにロールが無ければ従来どおり（他テナントのロールは見えない）。
+    let mut s = expect_ready(f.login("ops", b"pw-ops"));
+    assert_eq!(
+        simple_query(&mut s, "SET ROLE ops").as_deref(),
+        Some("42501")
+    );
+    // 自テナントに別のロールができると、同名ロールが無い ops は拒否される。
+    f.sql(TENANT, "CREATE ROLE other LOGIN");
+    let (body, _, _, _) = expect_rejected(f.login("ops", b"pw-ops"));
+    assert_eq!(sqlstate(&body), "28P01");
+}
+
+#[test]
+fn users_file_user_connection_limit_follows_the_role() {
+    let f = Fixture::start("ufr-limit");
+    f.sql(TENANT, "CREATE ROLE ops LOGIN CONNECTION LIMIT 1");
+    let _first = expect_ready(f.login("ops", b"pw-ops"));
+    let (body, after_ok, _, _) = expect_rejected(f.login("ops", b"pw-ops"));
+    assert!(after_ok);
+    assert_eq!(sqlstate(&body), "53300");
+}
+
+#[test]
+fn ddl_allowed_users_never_widens_beyond_the_catalog() {
+    // 指定ありでも同名ロールが無ければ拒否（DDL 権限も付かない）。
+    let f = Fixture::start_with("ufr-ddl-missing", &["ops"]);
+    f.sql(TENANT, "CREATE ROLE other LOGIN");
+    let (body, _, _, _) = expect_rejected(f.login("ops", b"pw-ops"));
+    assert_eq!(sqlstate(&body), "28P01");
+
+    // 指定ありかつ同名 LOGIN ロール: 従来の写像を維持して DDL が通る。
+    let f = Fixture::start_with("ufr-ddl-listed", &["ops"]);
+    f.sql(TENANT, "CREATE ROLE ops LOGIN");
+    let mut s = expect_ready(f.login("ops", b"pw-ops"));
+    assert_eq!(simple_query(&mut s, "CREATE TABLE ufr_t (id BIGINT)"), None);
+
+    // 指定なしかつ同名 LOGIN ロール: 束縛しても DDL 権限は広がらない。
+    let f = Fixture::start("ufr-ddl-unlisted");
+    f.sql(TENANT, "CREATE ROLE ops LOGIN");
+    let mut s = expect_ready(f.login("ops", b"pw-ops"));
+    assert_eq!(
+        simple_query(&mut s, "CREATE TABLE ufr_t (id BIGINT)").as_deref(),
+        Some("42501")
+    );
 }
