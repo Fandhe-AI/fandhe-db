@@ -2335,9 +2335,11 @@ impl<'a> AdaptiveShaderSelector<'a> {
 /// [`BatchExecError::Input`] で返す: `Backend` にすると `batch_fallback.rs::FallbackBatchEngine` が
 /// CPU 縮退（とラッチ）へ切り替えてしまい、中断した文を黙って再実行する fail-open になるため。
 fn check_batch_interrupt() -> Result<(), BatchExecError> {
-    crate::interrupt::check_reason().map_err(|reason| {
-        BatchExecError::Input(crate::batch_search::BatchSearchError::QueryCanceled { reason })
-    })
+    crate::interrupt::check_reason()
+        .and_then(|()| crate::interrupt::check_now_reason())
+        .map_err(|reason| {
+            BatchExecError::Input(crate::batch_search::BatchSearchError::QueryCanceled { reason })
+        })
 }
 
 fn run_tiled_batch_search(

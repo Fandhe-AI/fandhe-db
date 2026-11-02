@@ -571,6 +571,14 @@ pub(crate) fn check_interrupt() -> Result<(), TenantWriteError> {
     crate::interrupt::check().map_err(TenantWriteError::TriggerFailed)
 }
 
+/// 点更新など通過回数の少ない書き込み入口用の即時確認（stride 間引きなし。Issue #1953）。
+/// 行ループを通らない主キー点更新でも、期限切れなら commit 前に `57014` で止める。
+pub(crate) fn check_interrupt_now() -> Result<(), TenantWriteError> {
+    crate::interrupt::check_now_reason().map_err(|reason| {
+        TenantWriteError::TriggerFailed(SqlSurfaceError::QueryCanceled { reason })
+    })
+}
+
 /// [`Storage::begin_write_txn`]（choke point。SQL-31・TASK-221 の単一ライタ占有に
 /// より `55P03` を返しうる）が返す `StorageError` を `TenantWriteError` へ写像する。
 /// `TenantWriteError::from(StorageError)` は汎用の `Storage(e)` へ包むだけで
@@ -5183,6 +5191,9 @@ fn update_row_columns_impl(
                     reads_existing: true,
                 },
             )?;
+
+            // 点更新は行ループを通らないため、台帳記録・commit の前に期限を即時確認する（Issue #1953）。
+            check_interrupt_now()?;
 
             // トリガの分類は台帳より前・同じ write txn の中で行う（再送ではトリガを呼ばない。Issue #1725）。
             let trigger_plan = plan_update_triggers(

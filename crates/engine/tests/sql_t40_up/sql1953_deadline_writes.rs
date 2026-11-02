@@ -110,6 +110,20 @@ fn sql71_expired_deadline_leaves_no_trace_for_autocommit_writes() {
     }
 }
 
+/// SQL-71: トリガのない表の主キー点更新（行ループを通らない経路）も期限切れなら止まり、commit されない。
+#[test]
+fn sql71_expired_deadline_stops_primary_key_point_update() {
+    let sql = "UPDATE t SET v = 99 WHERE id = 1 USING OPERATION_ID 'w-pk'";
+    let (core, _g) = open("sql1953-pk-update");
+    let before = snapshot(&core, "t");
+    let e = err_under(expired(), &core, sql);
+    assert_eq!(e.wire_code(), "57014");
+    assert_eq!(e.to_string(), TIMEOUT_MSG);
+    assert_eq!(snapshot(&core, "t"), before);
+    run(&core, sql).expect("resend without deadline must succeed (no ledger entry)");
+    assert_ne!(snapshot(&core, "t"), before);
+}
+
 /// SQL-71: 十分先の期限なら期限なしと同じ結果になる。
 #[test]
 fn sql71_far_deadline_does_not_change_write_behavior() {

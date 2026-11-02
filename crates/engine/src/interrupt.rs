@@ -194,6 +194,18 @@ pub(crate) fn check_reason() -> Result<(), InterruptReason> {
     }
 }
 
+/// 粗い境界（点更新の入口・GPU の group／tile／chunk 境界など、通過回数が [`CHECK_STRIDE`] に
+/// 届かない確認点）用の即時確認（#1953。SQL-71 のポインタ）。stride 間引きをせず毎回時計を
+/// 読む。`suppressed` 区間では no-op、デッドライン無効時は時計を読まない。
+pub(crate) fn check_now_reason() -> Result<(), InterruptReason> {
+    if SUPPRESSED.with(Cell::get) > 0 {
+        return Ok(());
+    }
+    current_deadline()
+        .check()
+        .map_err(|_| InterruptReason::StatementTimeout)
+}
+
 /// 中断しない区間で `f` を実行する。分割実行 DML（PARTITIONED）のように、チャンク commit 後に
 /// `57014` を返すと SQL-32／SQL-71 (4) の契約（commit 済みなら `VD001`）とずれる経路を包む。
 pub(crate) fn suppressed<R>(f: impl FnOnce() -> R) -> R {
@@ -221,6 +233,23 @@ mod tests {
             calls.set(calls.get() + 1);
             (calls.get() >= fire_on).then_some(InterruptReason::ClientGone)
         })
+    }
+
+    /// #1953: stride 間引きの `check_reason` は少数回の通過では期限後も気付かないが、
+    /// `check_now_reason` は毎回時計を読んで即座に失敗する（GPU の tile／chunk 境界・点更新の入口用）。
+    #[test]
+    fn check_now_reason_detects_expiry_without_stride() {
+        let _g = DeadlineScope::install(StatementDeadline::after(
+            Instant::now(),
+            std::time::Duration::from_millis(30),
+        ));
+        assert!(check_reason().is_ok());
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        // stride 内の 2 回目は時計を読まないため通ってしまう（これが GPU 境界で不十分だった理由）。
+        assert!(check_reason().is_ok());
+        assert_eq!(check_now_reason(), Err(InterruptReason::StatementTimeout));
+        // suppressed 区間では no-op。
+        assert!(suppressed(check_now_reason).is_ok());
     }
 
     #[test]
