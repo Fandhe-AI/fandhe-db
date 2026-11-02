@@ -523,6 +523,55 @@ fn skip_locked_empty_result_does_not_read_rows_in_txn() {
         .expect("release");
 }
 
+/// Issue #2231: サブクエリ（`WHERE` の `IN`・投影内スカラー・集計の `WHERE`）を含む文も、他者保持中の
+/// `SKIP LOCKED` は 42601 にならず 0 行を返し、列は句なしの同じ文と一致する（autocommit・明示 Tx）。
+#[test]
+fn skip_locked_with_subqueries_returns_zero_rows_while_held() {
+    let (core, path) = new_core();
+    let _cleanup = CleanupGuard(path);
+    let mut session = SessionState::default();
+    seed(&core, &mut session);
+    let queries = [
+        "SELECT id FROM documents WHERE id IN (SELECT id FROM authors) ORDER BY id LIMIT 10",
+        "SELECT id, (SELECT max(id) FROM authors) FROM documents ORDER BY id LIMIT 10",
+        "SELECT id FROM documents WHERE NOT EXISTS (SELECT 1 FROM authors WHERE name = 'zzz') ORDER BY id LIMIT 10",
+    ];
+    let mut holder = hold_writer(&core, &mut session);
+    for q in queries {
+        let plain = query_of(
+            core.execute_sql_in_session(&ctx(), &mut session, q)
+                .expect("plain"),
+        );
+        assert!(!plain.rows.is_empty());
+        let sql = format!("{q} FOR UPDATE SKIP LOCKED");
+        let r = autocommit_in_other_session(&core, &ctx(), &sql).expect("autocommit skip");
+        assert!(r.rows.is_empty(), "{q}");
+        assert_eq!(format!("{:?}", r.columns), format!("{:?}", plain.columns));
+        let mut s2 = SessionState::default();
+        let mut t2 = core.new_session_transaction();
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    core.execute_sql_in_txn(&ctx(), &mut s2, &mut t2, "BEGIN")
+                        .expect("begin");
+                    let r = query_of(
+                        core.execute_sql_in_txn(&ctx(), &mut s2, &mut t2, &sql)
+                            .expect("txn skip"),
+                    );
+                    assert!(r.rows.is_empty(), "{q}");
+                    assert_eq!(format!("{:?}", r.columns), format!("{:?}", plain.columns));
+                    assert_eq!(t2.status(), TransactionStatus::InTransaction);
+                    core.execute_sql_in_txn(&ctx(), &mut s2, &mut t2, "ROLLBACK")
+                        .expect("rollback");
+                })
+                .join()
+                .expect("join");
+        });
+    }
+    core.execute_sql_in_txn(&ctx(), &mut session, &mut holder, "COMMIT")
+        .expect("commit");
+}
+
 /// 自 Tx が既に writer を保持していれば `SKIP LOCKED` は行を返す（自分の未 commit 行を含む）。
 #[test]
 fn skip_locked_returns_rows_when_own_txn_holds_writer() {

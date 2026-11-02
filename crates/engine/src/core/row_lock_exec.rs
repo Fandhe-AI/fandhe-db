@@ -106,9 +106,14 @@ impl EngineCore {
         // 全件走査・結果バイト上限（54000）・明示 Tx の read_set 取り込みを起こさず、構文・列・
         // `LIMIT`／`OFFSET` の範囲などの束縛時検査は Describe 経路で効く。
         let parsed = super::ParsedSql::Statement(locking.statement().clone());
-        let columns = match txn {
-            Some(txn) => self.describe_parsed_in_txn_unscrubbed(session, txn, &parsed)?,
-            None => self.describe_parsed_in_session_unscrubbed(session, &parsed)?,
+        // サブクエリを含む `SELECT` は Describe 経路が未解決のまま束縛して `42601` になるため、通常実行と同じ
+        // 「束縛前にサブクエリを解決」を内側の評価だけ行って通す（外側の行走査は省く）。
+        let columns = match self.describe_with_resolved_subqueries(ctx, session, txn, locking)? {
+            Some(columns) => Some(columns),
+            None => match txn {
+                Some(txn) => self.describe_parsed_in_txn_unscrubbed(session, txn, &parsed)?,
+                None => self.describe_parsed_in_session_unscrubbed(session, &parsed)?,
+            },
         };
         match columns {
             Some(columns) => Ok(crate::sql::SqlOutcome::Query(
@@ -118,6 +123,213 @@ impl EngineCore {
                 },
             )),
             None => Err(SqlSurfaceError::Internal {
+                detail: "internal error".to_string(),
+            }),
+        }
+    }
+
+    /// サブクエリ（`WHERE` の `IN`／`EXISTS`／スカラー比較、投影・式の内側のスカラーサブクエリ）を含む
+    /// 広域取得・集計の列メタデータを、通常実行と同じ順序（WHERE 側の解決 → 束縛 → 投影側の解決）で
+    /// 導出する。内側の評価は参照セッション自身の `ctx`（RLS 暗黙適用）で行い、外側の行走査は省く。
+    /// 読み取り源は [`Self::reject_skip_locked_row_security_off`] と同じ選び方（明示 Tx は `BEGIN` 時点の
+    /// スナップショット等）。対象外の文形（サブクエリなし・他の文種別）は `Ok(None)` で、呼び出し元が
+    /// 従来の Describe 経路へ回す。
+    fn describe_with_resolved_subqueries(
+        &self,
+        ctx: &PolicyContext,
+        session: &SessionState,
+        txn: Option<&SessionTransaction<'_>>,
+        locking: &LockingSelect,
+    ) -> Result<Option<Vec<crate::sql::exec::ColumnMeta>>, SqlSurfaceError> {
+        use crate::sql::allowlist::Statement;
+        use crate::sql::transaction::TxnReadSource;
+        let stmt = locking.statement();
+        let needs = match stmt {
+            Statement::Scan(v) => {
+                super::dml_subquery_exec::where_has_subquery(&v.where_predicates)
+                    || !v.embedded_scalar_subqueries.is_empty()
+                    || !v.scalar_subquery_items.is_empty()
+            }
+            Statement::Aggregate(_) => true,
+            _ => false,
+        };
+        if !needs {
+            return Ok(None);
+        }
+        let _row_security =
+            crate::sql::policy_applicability::RowSecurityScope::enter(session.row_security());
+        if let Some(txn) = txn {
+            match txn.read_source()? {
+                TxnReadSource::BeginSnapshot(snap) => {
+                    return self
+                        .describe_resolved_in(ctx, session, stmt, snap)
+                        .map(Some);
+                }
+                TxnReadSource::Writer(w) => {
+                    return self.describe_resolved_in(ctx, session, stmt, w).map(Some);
+                }
+                TxnReadSource::Committed => {}
+            }
+        }
+        let read_txn = self
+            .storage
+            .db()
+            .begin_read()
+            .map_err(|_| SqlSurfaceError::Internal {
+                detail: "internal error".to_string(),
+            })?;
+        self.describe_resolved_in(ctx, session, stmt, &read_txn)
+            .map(Some)
+    }
+
+    /// [`Self::describe_with_resolved_subqueries`] の本体。`read_txn` 上で通常実行の `Scan`／`Aggregate` 腕
+    /// （`execute_read_statement_with_limits`）と同じ解決・束縛を行い、走査の代わりに行なしの列メタデータを返す。
+    fn describe_resolved_in<R: crate::storage::read_source::ReadSource>(
+        &self,
+        ctx: &PolicyContext,
+        session: &SessionState,
+        stmt: &crate::sql::allowlist::Statement,
+        read_txn: &R,
+    ) -> Result<Vec<crate::sql::exec::ColumnMeta>, SqlSurfaceError> {
+        use crate::sql::allowlist::Statement;
+        use crate::sql::subquery as sq;
+        let limits = self.result_limits;
+        let mut budget = self.nesting_limits.max_subquery_executions();
+        let mut in_value_budget = sq::MAX_SUBQUERY_IN_VALUES;
+        let correlated = crate::sql::correlated_exists::CorrelatedCtx::enabled(
+            self.join_limits,
+            self.correlated_limits,
+        );
+        match stmt {
+            Statement::Scan(v) => {
+                let mut validated = v.clone();
+                let schema = super::table_schema_in(read_txn, &validated.table_name)?;
+                validated.where_predicates = sq::resolve_where_predicates(
+                    validated.where_predicates,
+                    &[&schema],
+                    read_txn,
+                    ctx,
+                    &self.storage,
+                    session.udfs(),
+                    self.group_by_limits,
+                    self.nesting_limits,
+                    limits,
+                    &mut budget,
+                    &mut in_value_budget,
+                    &correlated,
+                )?;
+                if !validated.embedded_scalar_subqueries.is_empty() {
+                    let embedded = std::mem::take(&mut validated.embedded_scalar_subqueries);
+                    let leaves = sq::resolve_embedded_scalar_subqueries(
+                        &embedded,
+                        &[&schema],
+                        read_txn,
+                        ctx,
+                        &self.storage,
+                        session.udfs(),
+                        self.group_by_limits,
+                        self.nesting_limits,
+                        limits,
+                        &mut budget,
+                        &mut in_value_budget,
+                        &correlated,
+                    )?;
+                    validated.embedded_scalar_subqueries = embedded
+                        .into_iter()
+                        .zip(leaves)
+                        .map(|(mut e, leaf)| {
+                            e.resolved = Some(leaf);
+                            e
+                        })
+                        .collect();
+                }
+                let projection_items = std::mem::take(&mut validated.scalar_subquery_items);
+                let bound = crate::sql::parser::bind_scan_with_dummy_flags(
+                    &validated,
+                    &schema,
+                    session.udfs(),
+                    &[],
+                    &limits,
+                )?;
+                let resolved_items = sq::resolve_scalar_projection_items(
+                    &projection_items,
+                    &[&schema],
+                    read_txn,
+                    ctx,
+                    &self.storage,
+                    session.udfs(),
+                    self.group_by_limits,
+                    self.nesting_limits,
+                    limits,
+                    &mut budget,
+                    &mut in_value_budget,
+                    &correlated,
+                )?;
+                // 隠しキー列（集計形の相関スカラー）がある場合は通常実行と同じ写しで列を導き、合流で取り除く。
+                let hidden = sq::hidden_key_columns(&resolved_items);
+                let columns = if hidden.is_empty() {
+                    crate::sql::describe::scan_columns(&bound, &schema)?
+                } else {
+                    let mut with_keys = validated.clone();
+                    sq::append_hidden_key_columns(&mut with_keys, &hidden)?;
+                    let bound_with_keys = crate::sql::parser::bind_scan_with_dummy_flags(
+                        &with_keys,
+                        &schema,
+                        session.udfs(),
+                        &[],
+                        &limits,
+                    )?;
+                    crate::sql::describe::scan_columns(&bound_with_keys, &schema)?
+                };
+                let merged = sq::merge_scalar_projection_items(
+                    crate::sql::exec::QueryResult {
+                        columns,
+                        rows: Vec::new(),
+                    },
+                    resolved_items,
+                    &hidden,
+                )?;
+                Ok(merged.columns)
+            }
+            Statement::Aggregate(v) => {
+                let mut validated = v.clone();
+                let schema = super::table_schema_in(read_txn, &validated.table_name)?;
+                validated.where_predicates = sq::resolve_where_predicates(
+                    validated.where_predicates,
+                    &[&schema],
+                    read_txn,
+                    ctx,
+                    &self.storage,
+                    session.udfs(),
+                    self.group_by_limits,
+                    self.nesting_limits,
+                    limits,
+                    &mut budget,
+                    &mut in_value_budget,
+                    &correlated,
+                )?;
+                sq::resolve_aggregate_item_filters(
+                    &mut validated.items,
+                    validated
+                        .group_by
+                        .as_mut()
+                        .map_or(&mut [][..], |g| g.having_aggregates.as_mut_slice()),
+                    &[&schema],
+                    read_txn,
+                    ctx,
+                    &self.storage,
+                    session.udfs(),
+                    self.group_by_limits,
+                    self.nesting_limits,
+                    limits,
+                    &mut budget,
+                    &mut in_value_budget,
+                )?;
+                let bound =
+                    crate::sql::parser::bind_aggregate(&validated, &schema, session.udfs())?;
+                crate::sql::describe::aggregate_columns(&bound, &schema)
+            }
+            _ => Err(SqlSurfaceError::Internal {
                 detail: "internal error".to_string(),
             }),
         }
