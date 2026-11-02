@@ -448,6 +448,51 @@ fn owner_equivalent_grantor_rows_are_exempt_from_admin_dependents() {
     }
 }
 
+/// 所有者相当による既存行の更新は付与の根拠を記録し直す（回帰）。x が付けた m の行へ所有者が ADMIN を足すと、
+/// 行は所有者相当の独立した付与（grantor_root）になり、x の ADMIN を CASCADE で取り消しても m の ADMIN が残る。
+/// 旧付与者だけが与えたオプションが残る場合（所有者の付与が包含しない）は単一行で表せないため `0A000` で拒否し、
+/// 状態は変わらない。所有者相当でない付与者による更新は root を付けない。
+#[test]
+fn owner_equivalent_update_of_existing_row_records_its_own_basis() {
+    let f = fx("rm_reroot");
+    let me = role(&f, "me");
+    let r = role(&f, "r");
+    let x = role(&f, "x");
+    let m = role(&f, "m");
+    let owner = session(me, true);
+    run(&f, &owner, "GRANT r TO x WITH ADMIN TRUE").expect("x admin");
+    run(&f, &session(x, false), "GRANT r TO m").expect("m by x");
+    assert!(!mem(&f, m, r).expect("m").grantor_root);
+    // 非所有者の付与者 x による更新は root を付けない。
+    run(&f, &session(x, false), "GRANT r TO m WITH SET FALSE").expect("x update");
+    let row = mem(&f, m, r).expect("m");
+    assert!(!row.grantor_root && row.grantor_id == Some(x));
+    run(&f, &session(x, false), "GRANT r TO m WITH SET TRUE").expect("x update back");
+    // 所有者が ADMIN を足す: 既定の INHERIT・SET も所有者の付与が裏付けるため root になる。
+    run(&f, &owner, "GRANT r TO m WITH ADMIN TRUE").expect("owner adds admin");
+    let row = mem(&f, m, r).expect("m");
+    assert!(row.grantor_root && row.grantor_id == Some(me) && row.admin);
+    run(&f, &owner, "REVOKE ADMIN OPTION FOR r FROM x CASCADE").expect("cascade");
+    assert!(mem(&f, m, r).expect("m kept").admin);
+}
+
+#[test]
+fn owner_equivalent_update_not_covering_existing_options_is_refused() {
+    let f = fx("rm_reroot_refuse");
+    let me = role(&f, "me");
+    let r = role(&f, "r");
+    let x = role(&f, "x");
+    let m = mk(&f, T, "m", false);
+    let owner = session(me, true);
+    run(&f, &owner, "GRANT r TO x WITH ADMIN TRUE").expect("x admin");
+    run(&f, &session(x, false), "GRANT r TO m WITH INHERIT TRUE").expect("m by x");
+    let before = mem(&f, m, r);
+    // m は NOINHERIT のため所有者の付与の既定は INHERIT 偽だが、行には x が与えた INHERIT が残る。
+    let e = run(&f, &owner, "GRANT r TO m WITH ADMIN TRUE").expect_err("refused");
+    assert_eq!(e.wire_code(), "0A000");
+    assert_eq!(mem(&f, m, r), before);
+}
+
 /// `GRANT ... WITH ADMIN FALSE` による ADMIN の取り消しも `REVOKE ADMIN OPTION` と同じ依存検査（2BP01）を通る。
 #[test]
 fn grant_with_admin_false_respects_dependents() {

@@ -459,6 +459,27 @@ fn grant_one(
             if updated == existing {
                 return Ok((0, false));
             }
+            // 所有者相当による既存行の更新: PostgreSQL では (role, member, grantor) ごとの別行になるが、本実装は
+            // 単一行のため、更新後の行が所有者相当の今回の付与（明示 + 既定値）で裏付けられる場合だけ、行を
+            // 所有者相当の独立した付与（`grantor_root`）として記録し直す。旧付与者だけが与えたオプションが残る
+            // 場合は、root にすると過剰保持、そのままだと所有者の付与が旧付与者に依存するため、単一行で
+            // 表せないものとして副作用なく拒否する（fail-closed）。既に root の行は付与者・根拠を変えない。
+            if req.owner_equivalent && !existing.grantor_root {
+                let owner_admin = pick(req.with_options, MembershipOpt::Admin).unwrap_or(false);
+                let owner_inherit = pick(req.with_options, MembershipOpt::Inherit)
+                    .unwrap_or(member.def.attributes.inherit);
+                let owner_set = pick(req.with_options, MembershipOpt::Set).unwrap_or(true);
+                let covered = (!updated.admin || owner_admin)
+                    && (!updated.inherit || owner_inherit)
+                    && (!updated.set || owner_set);
+                if !covered {
+                    return Err(MembershipChangeError::Unsupported(
+                        "membership options granted by another grantor cannot be combined",
+                    ));
+                }
+                updated.grantor_id = Some(grantor);
+                updated.grantor_root = true;
+            }
             put_membership_in_txn(w, tenant, member.id, role.id, updated)?;
             // ADMIN が真から偽へ落ちる更新は `REVOKE ADMIN OPTION` と同じ依存検査（呼び出し側が文全体を
             // まとめて評価する。RESTRICT 契約で、依存があれば `2BP01` で txn 全体が巻き戻る）に回す。
