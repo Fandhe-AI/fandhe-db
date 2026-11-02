@@ -2133,7 +2133,8 @@ fn handle_bind_body(
         cursor_binding: None,
         bound_txn_generation: txn.active_generation(),
         survived_sync: false,
-        bound_bytes,
+        // portal ごとに保持する relation 定義のコピーも、束縛値と同じ接続単位の上限へ算入する。
+        bound_bytes: bound_bytes.saturating_add(relation_identity.retained_bytes()),
         prepared_snapshot,
         relation_identity,
     };
@@ -2412,27 +2413,29 @@ fn execute_portal<'e, S: WireStream>(
         // （Bind 後の `REVOKE` や、別 portal の `SET ROLE` を反映する。fail-closed）。準備済み文が
         // 引けない場合も拒否する。未束縛のセッションでは何もしない。
         if session.object_privileges_enforced() {
-            let (snapshot, identity) = {
+            // 実行する本文は Bind 時に展開した定義のまま。参照先が DROP・置換・再作成されていれば、現在の
+            // 名前の権限で通すと古い本文（別の表）を読めてしまうため、権限の再検査より前に失効させる。
+            // portal が保持する同一性は複製せず参照で照合する。
+            let gate = {
                 let portal = state
                     .portals
                     .get(portal_name)
                     .ok_or(HandlerError::UnknownPortal)?;
-                (
-                    portal.prepared_snapshot.clone(),
-                    portal.relation_identity.clone(),
-                )
-            };
-            // 実行する本文は Bind 時に展開した定義のまま。参照先が DROP・置換・再作成されていれば、現在の
-            // 名前の権限で通すと古い本文（別の表）を読めてしまうため、権限の再検査より前に失効させる。
-            let gate = match snapshot.as_ref() {
-                Some(prepared) => engine
-                    .check_prepared_relation_identity(session, txn, prepared, &identity)
-                    .and_then(|()| {
-                        engine.recheck_prepared_read_privileges_in_txn(
-                            session, txn, prepared, &parsed,
+                match portal.prepared_snapshot.as_ref() {
+                    Some(prepared) => engine
+                        .check_prepared_relation_identity(
+                            session,
+                            txn,
+                            prepared,
+                            &portal.relation_identity,
                         )
-                    }),
-                None => Err(engine::sql::allowlist::SqlSurfaceError::InsufficientPrivilege),
+                        .and_then(|()| {
+                            engine.recheck_prepared_read_privileges_in_txn(
+                                session, txn, prepared, &parsed,
+                            )
+                        }),
+                    None => Err(engine::sql::allowlist::SqlSurfaceError::InsufficientPrivilege),
+                }
             };
             if let Err(e) = gate {
                 if let Some(portal) = state.portals.get_mut(portal_name) {
@@ -3207,6 +3210,86 @@ mod tests {
         )
         .map_err(|_| ())
         .expect("parse after portals closed");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Issue #1967 レビュー指摘: 束縛済みセッションの portal が保持する relation 定義（同一性）のコピーは、
+    /// portal の保持量（`bound_bytes`）へ算入される（大きなビューを多数の named portal へ Bind して
+    /// 接続単位の上限を超える保持を作れない）。
+    #[test]
+    fn portal_retained_bytes_include_relation_definitions_of_bound_sessions() {
+        use engine::kernel::CpuScalarProvider;
+        use engine::storage::Storage;
+        let path = std::env::temp_dir().join(format!(
+            "portal-identity-{}-{:?}.redb",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let storage = Storage::open(&path).expect("open storage");
+        let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+        let ctx = engine::policy::PolicyContext::with_visibilities(
+            "t1",
+            [
+                engine::storage::Visibility::Public,
+                engine::storage::Visibility::Private,
+            ],
+        )
+        .expect("ctx");
+        let run = |s: &mut engine::sql::mode::SessionState, sql: &str| {
+            core.execute_sql_in_session(&ctx, s, sql)
+                .unwrap_or_else(|e| panic!("{:.60}: {e:?}", sql));
+        };
+        let mut op = engine::sql::mode::SessionState::default();
+        op.allow_ddl();
+        run(&mut op, "CREATE ROLE ra");
+        run(&mut op, "CREATE ROLE alice");
+        let mut admin = engine::sql::mode::SessionState::default();
+        admin.bind_role_ids(1, 1);
+        assert!(admin.bind_resolution_tenant("t1"));
+        admin.allow_ddl();
+        let cols: Vec<String> = (0..40)
+            .map(|i| format!("{}{i:02}", "c".repeat(55)))
+            .collect();
+        let defs: Vec<String> = cols.iter().map(|c| format!("{c} BIGINT")).collect();
+        run(
+            &mut admin,
+            &format!(
+                "CREATE TABLE ca (id BIGINT PRIMARY KEY, {})",
+                defs.join(", ")
+            ),
+        );
+        run(
+            &mut admin,
+            &format!("CREATE VIEW v AS SELECT {} FROM ca", cols.join(", ")),
+        );
+        run(&mut admin, "GRANT SELECT ON v TO alice");
+        let mut alice = engine::sql::mode::SessionState::default();
+        alice.bind_role_ids(2, 2);
+        assert!(alice.bind_resolution_tenant("t1"));
+        let mut txn = engine::sql::transaction::SessionTransaction::new(
+            engine::sql::transaction::TransactionLimits::default(),
+        );
+        let mut state = ExtendedQueryState::new();
+        let mut parse = vec![b's', 0];
+        parse.extend_from_slice(b"SELECT * FROM v");
+        parse.push(0);
+        parse.extend_from_slice(&0i16.to_be_bytes());
+        handle_parse_body(&core, &alice, &mut txn, &mut state.statements, &parse)
+            .map_err(|_| ())
+            .expect("parse");
+        let mut bind = b"p".to_vec();
+        bind.push(0);
+        bind.extend_from_slice(b"s\0");
+        bind.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+        handle_bind_body(&core, &alice, &mut txn, &mut state, &bind)
+            .map_err(|_| ())
+            .expect("bind");
+        let portal = state.portals.get("p").expect("portal");
+        assert!(
+            portal.bound_bytes >= 2000,
+            "relation definition bytes must be accounted: {}",
+            portal.bound_bytes
+        );
         let _ = std::fs::remove_file(&path);
     }
 

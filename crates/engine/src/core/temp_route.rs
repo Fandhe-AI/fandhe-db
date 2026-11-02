@@ -1364,3 +1364,13 @@ impl EngineCore {
 /// wire-server は portal ごとに保持して Execute 前に照合するだけで、中身は読まない。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PreparedRelationIdentity(Vec<(String, crate::catalog::privilege::RelationIdentity)>);
+
+impl PreparedRelationIdentity {
+    /// 保持している量の見積り（名前と定義のバイト数。portal の接続単位の保持量へ算入する）。
+    pub fn retained_bytes(&self) -> usize {
+        self.0.iter().fold(0usize, |acc, (n, id)| {
+            acc.saturating_add(n.len())
+                .saturating_add(id.retained_bytes())
+        })
+    }
+}

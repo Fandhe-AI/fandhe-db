@@ -702,6 +702,16 @@ pub(crate) enum RelationIdentity {
     MaterializedView(Vec<u8>),
 }
 
+impl RelationIdentity {
+    /// 保持している定義のバイト数（表・不在は 0）。
+    pub(crate) fn retained_bytes(&self) -> usize {
+        match self {
+            Self::Missing | Self::Table => 0,
+            Self::View(b) | Self::MaterializedView(b) => b.len(),
+        }
+    }
+}
+
 /// `key` の [`RelationIdentity`] を `src` のスナップショットで引く。形が不正なキーは `Missing`。
 pub(crate) fn relation_identity_in_txn<R: ReadSource>(
     src: &R,
@@ -743,6 +753,10 @@ pub(crate) fn relation_identity_in_txn<R: ReadSource>(
 /// 同一性を取る relation の上限（ビューの入れ子を辿る探索の打ち切り。untrusted 入力で無制限に広げない）。
 const MAX_IDENTITY_RELATIONS: usize = 1024;
 
+/// 1 文の同一性として保持する定義バイト列の合計上限（ビュー・matview の定義。生成中に打ち切る）。portal ごとに
+/// 保持されるため、接続単位の保持量上限（wire-server の `MAX_BOUND_PARAM_BYTES_PER_SESSION`）より十分小さくする。
+pub(crate) const MAX_IDENTITY_BYTES: usize = 256 * 1024;
+
 /// `roots` と、そこから到達するビューの定義（入れ子の展開先。`base_relation` と本文が参照する名前）を
 /// 推移的に辿り、全 relation の [`RelationIdentity`] を同じスナップショットで返す。外側のビューの定義が
 /// 不変でも、展開先の入れ子のビューが置換されれば検知できる（Bind 時に展開済みの本文が古くなる）。
@@ -752,6 +766,7 @@ pub(crate) fn relation_identity_closure_in_txn<R: ReadSource>(
     roots: &[String],
 ) -> Result<Vec<(String, RelationIdentity)>> {
     let mut out: Vec<(String, RelationIdentity)> = Vec::new();
+    let mut total_bytes = 0usize;
     let mut queue: Vec<String> = roots.to_vec();
     let mut cursor = 0usize;
     while let Some(name) = queue.get(cursor).cloned() {
@@ -765,6 +780,13 @@ pub(crate) fn relation_identity_closure_in_txn<R: ReadSource>(
             ));
         }
         let identity = relation_identity_in_txn(src, &name)?;
+        // 定義のバイト列は生成中に合計を数え、上限を超えたら保持せず拒否する（fail-closed）。
+        total_bytes = total_bytes.saturating_add(identity.retained_bytes());
+        if total_bytes > MAX_IDENTITY_BYTES {
+            return Err(CatalogError::ViewLimitExceeded(
+                "referenced relation definitions are too large".to_string(),
+            ));
+        }
         if let RelationIdentity::View(bytes) = &identity {
             let def = super::decode_view_def(bytes)?;
             queue.push(def.base_relation.clone());

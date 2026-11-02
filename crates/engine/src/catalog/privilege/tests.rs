@@ -800,3 +800,25 @@ fn identity_closure_reads_stored_bodies_like_expansion_and_fails_closed() {
     let rt = s.db().begin_read().expect("read");
     assert!(relation_identity_closure_in_txn(&rt, &["v_bad".to_string()]).is_err());
 }
+
+/// 同一性の閉包は、定義のバイト列の合計が上限を超えたら生成中に打ち切って `Err`（fail-closed）。
+#[test]
+fn identity_closure_stops_when_definition_bytes_exceed_the_budget() {
+    use redb::ReadableDatabase;
+    let (_g, s) = open("priv-identity-budget");
+    let pad = "x".repeat(40 * 1024);
+    let mut roots = Vec::new();
+    for i in 0..8 {
+        let name = format!("v{i}");
+        put_view(
+            &s,
+            &name,
+            "bt",
+            &format!("SELECT n FROM bt WHERE n = '{pad}'"),
+        );
+        roots.push(name);
+    }
+    let rt = s.db().begin_read().expect("read");
+    assert!(relation_identity_closure_in_txn(&rt, &roots).is_err());
+    assert!(relation_identity_closure_in_txn(&rt, &roots[..2]).is_ok());
+}
