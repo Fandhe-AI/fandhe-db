@@ -34,6 +34,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
 
+use engine::catalog::{ColumnDef, ColumnDefault, ColumnType};
 use engine::core::EngineCore;
 use engine::kernel::CpuScalarProvider;
 use engine::policy::PolicyContext;
@@ -277,6 +278,9 @@ struct IdxInfo {
 struct Catalog {
     tables: Vec<String>,
     columns: BTreeMap<String, Vec<String>>,
+    /// 追加列 `c` の列型・INSERT 用 DEFAULT・読み出し補完値（表名 → 定義）。列名だけでは
+    /// `ALTER COLUMN DROP DEFAULT` 等による DEFAULT の欠落を見逃すため別に保持する。
+    col_c_def: BTreeMap<String, ColumnDef>,
     indexes: Vec<IdxInfo>,
     /// raw redb の物理表名（一意索引の物理構造 `user_uniq/<表>` の有無の判定に使う）。
     physical: BTreeSet<String>,
@@ -289,6 +293,7 @@ impl Catalog {
             .list_tables()
             .map_err(|e| format!("list tables failed: {e}"))?;
         let mut columns = BTreeMap::new();
+        let mut col_c_def = BTreeMap::new();
         for t in &tables {
             let schema = storage
                 .get_table_schema(t)
@@ -297,6 +302,9 @@ impl Catalog {
                 t.clone(),
                 schema.columns.iter().map(|c| c.name.clone()).collect(),
             );
+            if let Some(c) = schema.columns.iter().find(|c| c.name == "c") {
+                col_c_def.insert(t.clone(), c.clone());
+            }
         }
         let indexes = storage
             .list_indexes()
@@ -316,6 +324,7 @@ impl Catalog {
         Ok(Catalog {
             tables,
             columns,
+            col_c_def,
             indexes,
             physical,
         })
@@ -338,6 +347,16 @@ fn observe(core: &EngineCore, cat: &Catalog) -> Res<State> {
                 ))
             }
         };
+        if col_c {
+            // 追加列 c の列型・DEFAULT・補完値が期待（BIGINT・DEFAULT <r>）に完全一致する。
+            let want = Some(ColumnDefault::Number(r.to_string()));
+            let ok = cat.col_c_def.get(name).is_some_and(|d| {
+                d.ty == ColumnType::BigInt && d.default_expr == want && d.fill_value == want
+            });
+            if !ok {
+                return Err(format!("column c definition mismatch: table={name}"));
+            }
+        }
         let proj = if col_c { "k, v, c" } else { "k, v" };
         let rows = select(
             core,
@@ -678,6 +697,11 @@ fn self_check(dir: &str) -> Res<()> {
     neg("wrong-default", &|p| {
         let mut v = steps(0..5);
         v[2] = "ALTER TABLE dd_0 ADD COLUMN c BIGINT DEFAULT 1".to_string();
+        run_sqls(p, &v)
+    })?;
+    neg("dropped-default", &|p| {
+        let mut v = steps(0..5);
+        v.push("ALTER TABLE dd_0 ALTER COLUMN c DROP DEFAULT".to_string());
         run_sqls(p, &v)
     })?;
     neg("extra-index", &|p| {
