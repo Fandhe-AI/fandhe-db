@@ -974,6 +974,9 @@ struct Portal {
     /// 不変の準備済み文は `Arc` で statement と共有する（Bind ごとに深く複製しないため、多数の portal を
     /// 開いても保持量は増えず、[`MAX_PREPARED_SQL_BYTES_PER_SESSION`] の算入外の複製が生じない）。
     prepared_snapshot: Option<std::sync::Arc<PreparedSql>>,
+    /// Bind 時点で文が直接参照した relation の同一性。Execute の権限再検査の前に、同じ定義のままかを
+    /// 照合する（DROP・置換・再作成された relation の古い展開結果を実行しない。Issue #1967）。
+    relation_identity: engine::core::PreparedRelationIdentity,
 }
 
 /// 接続単位で portal を保持する（[`PreparedStatementStore`] と同型の設計）。
@@ -1971,6 +1974,14 @@ fn handle_bind_body(
         return Err(HandlerError::ParamCountMismatch);
     }
 
+    // SQL-40・Issue #1967: 文が直接参照する relation の同一性を Bind の前後で取り、portal に保持する
+    // （Execute 前に照合する）。Bind が展開するビュー本文と権限の判定対象を同じ定義にそろえる。
+    let relation_identity = match prepared_arc(statement) {
+        Some(prepared) => engine
+            .prepared_relation_identity_in_txn(session, txn, prepared)
+            .map_err(HandlerError::Sql)?,
+        None => engine::core::PreparedRelationIdentity::default(),
+    };
     let mut bound_bytes = 0usize;
     let (portal_body, columns) = match statement {
         PreparedStatement::Empty => (PortalBody::Empty, None),
@@ -2101,6 +2112,11 @@ fn handle_bind_body(
             .map_err(HandlerError::BinaryFormat)?;
     }
 
+    if let Some(prepared) = prepared_arc(statement) {
+        engine
+            .check_prepared_relation_identity(session, txn, prepared, &relation_identity)
+            .map_err(HandlerError::Sql)?;
+    }
     let prepared_snapshot = match state.statements.get(&msg.statement_name) {
         Some(PreparedStatement::Parsed { prepared, .. }) => Some(std::sync::Arc::clone(prepared)),
         Some(PreparedStatement::Parameterized { prepared, .. }) => {
@@ -2119,6 +2135,7 @@ fn handle_bind_body(
         survived_sync: false,
         bound_bytes,
         prepared_snapshot,
+        relation_identity,
     };
 
     state
@@ -2395,16 +2412,26 @@ fn execute_portal<'e, S: WireStream>(
         // （Bind 後の `REVOKE` や、別 portal の `SET ROLE` を反映する。fail-closed）。準備済み文が
         // 引けない場合も拒否する。未束縛のセッションでは何もしない。
         if session.object_privileges_enforced() {
-            let snapshot = state
-                .portals
-                .get(portal_name)
-                .ok_or(HandlerError::UnknownPortal)?
-                .prepared_snapshot
-                .clone();
+            let (snapshot, identity) = {
+                let portal = state
+                    .portals
+                    .get(portal_name)
+                    .ok_or(HandlerError::UnknownPortal)?;
+                (
+                    portal.prepared_snapshot.clone(),
+                    portal.relation_identity.clone(),
+                )
+            };
+            // 実行する本文は Bind 時に展開した定義のまま。参照先が DROP・置換・再作成されていれば、現在の
+            // 名前の権限で通すと古い本文（別の表）を読めてしまうため、権限の再検査より前に失効させる。
             let gate = match snapshot.as_ref() {
-                Some(prepared) => {
-                    engine.recheck_prepared_read_privileges_in_txn(session, txn, prepared, &parsed)
-                }
+                Some(prepared) => engine
+                    .check_prepared_relation_identity(session, txn, prepared, &identity)
+                    .and_then(|()| {
+                        engine.recheck_prepared_read_privileges_in_txn(
+                            session, txn, prepared, &parsed,
+                        )
+                    }),
                 None => Err(engine::sql::allowlist::SqlSurfaceError::InsufficientPrivilege),
             };
             if let Err(e) = gate {
@@ -3653,6 +3680,7 @@ mod tests {
         Portal {
             source_statement: String::new(),
             prepared_snapshot: None,
+            relation_identity: Default::default(),
             body: PortalBody::Empty,
             columns: None,
             result_formats: Vec::new(),
@@ -3817,6 +3845,7 @@ mod tests {
                     Portal {
                         source_statement: String::new(),
                         prepared_snapshot: None,
+                        relation_identity: Default::default(),
                         body: PortalBody::Empty,
                         columns: None,
                         result_formats: Vec::new(),
@@ -3834,6 +3863,7 @@ mod tests {
             Portal {
                 source_statement: String::new(),
                 prepared_snapshot: None,
+                relation_identity: Default::default(),
                 body: PortalBody::Empty,
                 columns: None,
                 result_formats: Vec::new(),
@@ -3856,6 +3886,7 @@ mod tests {
                 Portal {
                     source_statement: String::new(),
                     prepared_snapshot: None,
+                    relation_identity: Default::default(),
                     body: PortalBody::Empty,
                     columns: None,
                     result_formats: Vec::new(),
@@ -3873,6 +3904,7 @@ mod tests {
                 Portal {
                     source_statement: String::new(),
                     prepared_snapshot: None,
+                    relation_identity: Default::default(),
                     body: PortalBody::Empty,
                     columns: None,
                     result_formats: Vec::new(),
@@ -3899,6 +3931,7 @@ mod tests {
                 Portal {
                     source_statement: "stmt1".to_string(),
                     prepared_snapshot: None,
+                    relation_identity: Default::default(),
                     body: PortalBody::Empty,
                     columns: None,
                     result_formats: Vec::new(),
@@ -3916,6 +3949,7 @@ mod tests {
                 Portal {
                     source_statement: "stmt2".to_string(),
                     prepared_snapshot: None,
+                    relation_identity: Default::default(),
                     body: PortalBody::Empty,
                     columns: None,
                     result_formats: Vec::new(),
@@ -3937,6 +3971,7 @@ mod tests {
         Portal {
             source_statement: String::new(),
             prepared_snapshot: None,
+            relation_identity: Default::default(),
             body: PortalBody::Empty,
             columns: None,
             result_formats: Vec::new(),

@@ -67,7 +67,7 @@ use redb::ReadableDatabase;
 // 一時表（TABLE-44・Issue #1684）の振り分けと実行。永続コアの私的な項目に触れるため子モジュールに
 // 置く（`core.rs` の肥大化を避ける目的も兼ねる）。
 mod temp_route;
-pub use temp_route::SessionRoutedSql;
+pub use temp_route::{PreparedRelationIdentity, SessionRoutedSql};
 
 mod ctas_exec;
 mod matview_exec;

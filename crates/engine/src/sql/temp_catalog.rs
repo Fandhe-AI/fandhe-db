@@ -366,7 +366,13 @@ impl<L: TableLookup + ?Sized> TableLookup for SessionRelationLookup<'_, L> {
             // 一時表は同名の永続 matview を隠す。
             return Ok(None);
         }
-        self.inner.materialized_view_columns(name)
+        let columns = self.inner.materialized_view_columns(name)?;
+        if columns.is_some() {
+            // matview も表・ビューと同じく実在を確認した参照先として記録する（Parse 後に DROP された
+            // matview を権限ゲートが「誤分類」として読み飛ばさない。Issue #1967）。
+            self.note_persistent(name);
+        }
+        Ok(columns)
     }
 }
 

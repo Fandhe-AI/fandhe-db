@@ -573,3 +573,75 @@ fn alias_after_quoted_only_table_is_not_a_missing_relation_in_either_protocol() 
         .expect_err("dropped after parse");
     assert_eq!(e.wire_code(), "42P01");
 }
+
+/// Bind 後にビューが DROP され、同名で別本文のビューが作られて GRANT されても、古い portal の
+/// Execute 前の照合は失効として拒否する（名前の ACL だけを見ると、新しいビューの権限で古い本文＝別の表を
+/// 読めてしまう。Issue #1967）。別の主体（`SET ROLE` 相当）でも同様。変更がなければ通る。
+#[test]
+fn replaced_view_invalidates_bound_portal_even_with_new_grant() {
+    let f = fx("selpriv-view-replaced");
+    f.admin_run("CREATE VIEW v AS SELECT n FROM ca");
+    f.admin_run("GRANT SELECT ON v TO alice");
+    let s = bound(f.alice, A, false);
+    let prepared = f
+        .core
+        .parse_sql_prepared_with_declared_in_session(&s, "SELECT n FROM v", &[])
+        .expect("parse");
+    let txn = f.core.new_session_transaction();
+    let identity = f
+        .core
+        .prepared_relation_identity_in_txn(&s, &txn, &prepared)
+        .expect("identity");
+    f.core
+        .check_prepared_relation_identity(&s, &txn, &prepared, &identity)
+        .expect("unchanged definitions stay valid");
+    let parsed = f
+        .core
+        .bind_prepared_in_txn(&s, &txn, &prepared, &[])
+        .expect("bind");
+
+    f.admin_run("DROP VIEW v");
+    f.admin_run("CREATE VIEW v AS SELECT n FROM cb");
+    f.admin_run("GRANT SELECT ON v TO alice");
+    // 名前ベースの再検査は新しいビューの権限で通ってしまう（これだけでは足りない）。
+    f.core
+        .recheck_prepared_read_privileges_in_txn(&s, &txn, &prepared, &parsed)
+        .expect("name-based recheck alone passes");
+    let e = f
+        .core
+        .check_prepared_relation_identity(&s, &txn, &prepared, &identity)
+        .expect_err("replaced view must invalidate the portal");
+    assert_eq!(e.wire_code(), "0A000");
+    // 現在ロールが変わった（新しいビューだけに権限を持つ）セッションでも同じ。
+    f.admin_run("GRANT SELECT ON v TO admin_r");
+    let other = bound(f.admin, A, false);
+    let e = f
+        .core
+        .check_prepared_relation_identity(&other, &txn, &prepared, &identity)
+        .expect_err("other principal also invalidated");
+    assert_eq!(e.wire_code(), "0A000");
+}
+
+/// Parse 後に matview が DROP されると、Bind 後の再検査は誤分類として読み飛ばさず `42P01` で拒否する。
+#[test]
+fn dropped_materialized_view_is_rejected_after_parse() {
+    let f = fx("selpriv-matview-dropped");
+    f.admin_run("CREATE MATERIALIZED VIEW mv AS SELECT n FROM ca");
+    f.admin_run("GRANT SELECT ON mv TO alice");
+    let s = bound(f.alice, A, false);
+    let prepared = f
+        .core
+        .parse_sql_prepared_with_declared_in_session(&s, "SELECT n FROM mv", &[])
+        .expect("parse");
+    let txn = f.core.new_session_transaction();
+    let parsed = f
+        .core
+        .bind_prepared_in_txn(&s, &txn, &prepared, &[])
+        .expect("bind");
+    f.admin_run("DROP MATERIALIZED VIEW mv");
+    let e = f
+        .core
+        .recheck_prepared_read_privileges_in_txn(&s, &txn, &prepared, &parsed)
+        .expect_err("dropped matview must not skip the check");
+    assert_eq!(e.wire_code(), "42P01");
+}

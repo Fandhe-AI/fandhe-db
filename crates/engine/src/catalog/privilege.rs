@@ -668,6 +668,73 @@ pub(crate) fn relation_grant_bits_in_txn<R: ReadSource>(
     Ok(out)
 }
 
+/// relation の同一性（名前ではなく定義の中身。portal の失効判定用。Issue #1967）。ビュー・matview は
+/// 定義のバイト列そのものを持つため、DROP のあとに同名で別本文を作り直すと必ず別の値になる。
+/// 表は種別だけを持つ（表の行は名前で引かれ、展開済みの本文を持たない）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RelationIdentity {
+    /// 表・ビュー・matview のいずれとしても登録されていない。
+    Missing,
+    /// 実表。
+    Table,
+    /// ビュー（定義のバイト列）。
+    View(Vec<u8>),
+    /// matview（定義のバイト列）。
+    MaterializedView(Vec<u8>),
+}
+
+/// `key` の [`RelationIdentity`] を `src` のスナップショットで引く。形が不正なキーは `Missing`。
+pub(crate) fn relation_identity_in_txn<R: ReadSource>(
+    src: &R,
+    key: &str,
+) -> Result<RelationIdentity> {
+    if validate_relation_key(key).is_err() {
+        return Ok(RelationIdentity::Missing);
+    }
+    match src.open_table(super::VIEWS_TABLE) {
+        Ok(t) => {
+            if let Some(v) = t.get(key)? {
+                return Ok(RelationIdentity::View(v.value().to_vec()));
+            }
+        }
+        Err(redb::TableError::TableDoesNotExist(_)) => {}
+        Err(e) => return Err(e.into()),
+    }
+    match src.open_table(super::materialized::MATERIALIZED_VIEWS_TABLE) {
+        Ok(t) => {
+            if let Some(v) = t.get(key)? {
+                return Ok(RelationIdentity::MaterializedView(v.value().to_vec()));
+            }
+        }
+        Err(redb::TableError::TableDoesNotExist(_)) => {}
+        Err(e) => return Err(e.into()),
+    }
+    match src.open_table(super::CATALOG_TABLE) {
+        Ok(t) => {
+            if t.get(key)?.is_some() {
+                return Ok(RelationIdentity::Table);
+            }
+        }
+        Err(redb::TableError::TableDoesNotExist(_)) => {}
+        Err(e) => return Err(e.into()),
+    }
+    Ok(RelationIdentity::Missing)
+}
+
+impl Storage {
+    /// [`relation_identity_in_txn`] を新しい読み取り Tx で `keys` 全件に対して呼ぶ。
+    pub(crate) fn relation_identities(
+        &self,
+        keys: &[String],
+    ) -> Result<Vec<(String, RelationIdentity)>> {
+        use redb::ReadableDatabase;
+        let rt = self.db().begin_read()?;
+        keys.iter()
+            .map(|k| Ok((k.clone(), relation_identity_in_txn(&rt, k)?)))
+            .collect()
+    }
+}
+
 /// `key` が表・ビュー・matview のいずれかとして登録済みか（索引・SEQUENCE は relation ではない）。
 fn relation_exists_in_txn<R: ReadSource>(src: &R, key: &str) -> Result<bool> {
     for def in [

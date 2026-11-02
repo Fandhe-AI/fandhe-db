@@ -910,6 +910,79 @@ impl EngineCore {
         )
     }
 
+    /// 準備済み文の参照先（文に直接現れる表・ビュー・matview）の同一性を、実行時のカタログ（明示 Tx では
+    /// `BEGIN` 時のスナップショット）で引く（Issue #1967）。Bind は Bind 前後で取り直して一致を確かめ、portal に
+    /// 保持し、Execute は [`Self::check_prepared_relation_identity`] で照合する。現在ロール未束縛のセッションと
+    /// 一時表の経路は空（検査不要）を返す。
+    pub fn prepared_relation_identity_in_txn(
+        &self,
+        session: &SessionState,
+        txn: &crate::sql::transaction::SessionTransaction<'_>,
+        prepared: &super::PreparedSql,
+    ) -> Result<PreparedRelationIdentity, SqlSurfaceError> {
+        if !session.object_privileges_enforced() || matches!(prepared.route, PreparedRoute::Temp(_))
+        {
+            return Ok(PreparedRelationIdentity::default());
+        }
+        let mut names: Vec<String> = Vec::new();
+        for n in crate::sql::search_path::resolved_relation_ref_names(&prepared.tokens) {
+            if !names.contains(&n) {
+                names.push(n);
+            }
+            if names.len() > crate::sql::privilege_gate::read::MAX_READ_RELATION_REFS {
+                return Err(SqlSurfaceError::payload_too_large(
+                    "too many relation references",
+                ));
+            }
+        }
+        let read_snap = if txn.status() == crate::sql::transaction::TransactionStatus::InTransaction
+        {
+            match txn.read_source()? {
+                crate::sql::transaction::TxnReadSource::BeginSnapshot(snap) => Some(snap),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let ids = match read_snap {
+            Some(snap) => names
+                .iter()
+                .map(|k| {
+                    Ok((
+                        k.clone(),
+                        crate::catalog::privilege::relation_identity_in_txn(snap, k)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, crate::catalog::CatalogError>>(),
+            None => self.storage.relation_identities(&names),
+        }
+        .map_err(crate::catalog::table_lookup_error)?;
+        Ok(PreparedRelationIdentity(ids))
+    }
+
+    /// `expected`（Bind 時の同一性）が現在のカタログと一致するかを確かめる。1 つでも違えば（DROP・置換・
+    /// 再作成・定義変更）、実行する本文が Bind 時に展開した古い定義のままなので、失効として拒否する
+    /// （fail-closed。メッセージに名前・他テナントの情報を含めない）。
+    pub fn check_prepared_relation_identity(
+        &self,
+        session: &SessionState,
+        txn: &crate::sql::transaction::SessionTransaction<'_>,
+        prepared: &super::PreparedSql,
+        expected: &PreparedRelationIdentity,
+    ) -> Result<(), SqlSurfaceError> {
+        if !session.object_privileges_enforced() {
+            return Ok(());
+        }
+        let current = self.prepared_relation_identity_in_txn(session, txn, prepared)?;
+        if &current == expected {
+            Ok(())
+        } else {
+            Err(SqlSurfaceError::feature_not_supported(
+                "the relations referenced by this portal changed since it was bound",
+            ))
+        }
+    }
+
     /// 明示トランザクションが writer 取得前（`BEGIN` 時点のスナップショットで読む）か。
     /// wire 層が、Parse 時の解決結果を使い回さず Bind で再検証すべきかの判定に使う（Issue #2403）。
     pub fn txn_reads_begin_snapshot(txn: &crate::sql::transaction::SessionTransaction<'_>) -> bool {
@@ -1288,3 +1361,8 @@ impl EngineCore {
         }
     }
 }
+
+/// Bind 時点で文が直接参照した relation の同一性（[`EngineCore::prepared_relation_identity_in_txn`]）。
+/// wire-server は portal ごとに保持して Execute 前に照合するだけで、中身は読まない。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PreparedRelationIdentity(Vec<(String, crate::catalog::privilege::RelationIdentity)>);
