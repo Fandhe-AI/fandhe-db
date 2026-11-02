@@ -15,8 +15,10 @@ use crate::storage::read_source::ReadSource;
 
 use super::super::role::validate_tenant;
 use super::super::{CatalogError, Result, Storage};
+use super::owner::owner_of_in_txn;
 use super::{
-    corrupt, decode_row, PrivilegeObject, ACL_TABLE, KIND_SCHEMA, MAX_ACL_ENTRIES_PER_TENANT,
+    corrupt, decode_row, object_privileges_in_txn, PrivilegeObject, ACL_TABLE, KIND_SCHEMA,
+    MAX_ACL_ENTRIES_PER_TENANT, PRIV_CREATE, PRIV_USAGE,
 };
 
 /// SCHEMA `schema_id` について、`role_ids` のいずれか（と PUBLIC）が持つ権限ビットの和を返す。
@@ -29,7 +31,14 @@ pub(crate) fn schema_privileges_in_txn<R: ReadSource>(
     schema_id: u64,
     role_ids: &[u64],
 ) -> Result<u16> {
-    super::object_privileges_in_txn(src, tenant, &PrivilegeObject::Schema(schema_id), role_ids)
+    let object = PrivilegeObject::Schema(schema_id);
+    let granted = object_privileges_in_txn(src, tenant, &object, role_ids)?;
+    // SCHEMA の所有者は暗黙に USAGE・CREATE を持つ（Issue #2236。所有者行は自テナントのみ引ける）。
+    let owner_bits = match owner_of_in_txn(src, tenant, &object)? {
+        Some(owner) if role_ids.contains(&owner) => PRIV_USAGE | PRIV_CREATE,
+        _ => 0,
+    };
+    Ok(granted | owner_bits)
 }
 
 /// `tenant` の SCHEMA `schema_id` の ACL 行をすべて削除する（`DROP SCHEMA` の同一 write txn から呼ぶ）。

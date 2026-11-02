@@ -31,7 +31,10 @@ use super::{validate_identifier, validate_relation_key, CatalogError, Result, St
 
 mod apply;
 mod function;
+pub(crate) mod owner;
+mod owner_change;
 mod schema;
+pub(crate) use owner_change::NewOwnerRef;
 mod sequence;
 pub(crate) use apply::{
     AclChangeError, AclFunctionRef, AclItem, AclRequest, AclScope, AclWarning, GranteeSpec,

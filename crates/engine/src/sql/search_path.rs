@@ -421,7 +421,14 @@ pub(crate) fn check_unqualified_refs(
     if !session.search_path_hides_public() {
         return Ok(());
     }
-    if is_ddl_head(tokens) && crate::sql::ddl::require_ddl_permission(session).is_err() {
+    if is_ddl_head(tokens)
+        && crate::sql::ddl::require_ddl_permission(session).is_err()
+        // `ALTER ... OWNER TO` は運用者権限が無くても、束縛ロールが対象の所有者なら実行できる（所有者経路。
+        // Issue #2236）。ロールが束縛されている間は参照ゲートを適用し、運用者権限も束縛ロールも無い
+        // （`42501` を受け取る）セッションだけを免除する。
+        && !(crate::sql::allowlist::is_alter_owner_statement(tokens)
+            && crate::sql::privilege_gate::bound_principal(session).is_ok())
+    {
         return Ok(());
     }
     // `GRANT`／`REVOKE`（SQL-40・Issue #1965）は現在ロールが束縛されていないセッションが `42501` を受け取る

@@ -103,7 +103,8 @@ fn wire_schema_ddl_lifecycle_and_sqlstates() {
         ("CREATE SCHEMA IF NOT EXISTS pg_x", "42939"),
         ("DROP SCHEMA public", "42501"),
         ("DROP SCHEMA ghost", "3F000"),
-        ("CREATE SCHEMA AUTHORIZATION bob", "0A000"),
+        // Issue #2236: 所有者の指定は解決される（存在しないロールは 42704）。
+        ("CREATE SCHEMA AUTHORIZATION bob", "42704"),
         ("CREATE SCHEMA a.b", "42601"),
     ] {
         send_simple_query(&mut stream, sql);
@@ -147,7 +148,8 @@ fn wire_alter_schema_and_set_schema_tags_and_sqlstates() {
         ("ALTER SCHEMA public RENAME TO z", "42501"),
         ("ALTER SCHEMA ghost RENAME TO z", "3F000"),
         ("ALTER SCHEMA b RENAME TO pg_x", "42939"),
-        ("ALTER SCHEMA b OWNER TO bob", "0A000"),
+        // Issue #2236: `OWNER TO` は現在ロールが束縛されていないセッションでは 42501（対象・ロールの有無を示さない）。
+        ("ALTER SCHEMA b OWNER TO bob", "42501"),
         ("ALTER TABLE items SET SCHEMA b", "42501"),
         ("ALTER TABLE items SET SCHEMA ghost", "3F000"),
         ("ALTER TABLE items SET SCHEMA pg_catalog", "0A000"),

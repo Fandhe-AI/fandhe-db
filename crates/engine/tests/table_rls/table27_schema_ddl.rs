@@ -221,9 +221,9 @@ fn syntax_table() {
     let (_p, _g, core) = open_fixture("sch-syntax");
     let mut s = allowed_session();
     for sql in [
-        "CREATE SCHEMA AUTHORIZATION bob",
-        "CREATE SCHEMA s AUTHORIZATION bob",
-        "CREATE SCHEMA IF NOT EXISTS s AUTHORIZATION bob",
+        // `AUTHORIZATION <ロール>` は Issue #2236 で対応した（`sql40_object_owner.rs`。ロール不在は `42704`）。
+        // 名前を省略して `CURRENT_USER` 等を指定する形は名前を決められないため `0A000`。
+        "CREATE SCHEMA AUTHORIZATION CURRENT_USER",
         "CREATE SCHEMA s CREATE TABLE x (a INT)",
         // `DROP SCHEMA ... CASCADE` は Issue #1717 で対応した（`table27_schema_objects.rs`）。
         "DROP SCHEMA a, b",
