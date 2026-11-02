@@ -1018,6 +1018,11 @@ pub(crate) fn map_outcome(outcome: SqlOutcome) -> OutcomeResponse {
         SqlOutcome::GrantRevoke(o) => OutcomeResponse::Command {
             tag: if o.is_revoke() { "REVOKE" } else { "GRANT" }.to_string(),
         },
+        // SQL-40（Issue #2236）: `ALTER ... OWNER TO` は対象の種別に応じた `ALTER <種別>` タグ
+        // （PostgreSQL と同じ。件数なし）。
+        SqlOutcome::AlterOwner(o) => OutcomeResponse::Command {
+            tag: alter_owner_tag(o.kind()).to_string(),
+        },
         // SQL-39（Issue #1962）: ロール DDL も件数を持たない固定タグ（`CREATE USER` も PostgreSQL と同じ
         // `CREATE ROLE`）。
         SqlOutcome::CreateRole(_) => OutcomeResponse::Command {
@@ -1377,6 +1382,18 @@ fn respond_rows_with_tag<S: WireStream>(
     }
 }
 
+/// `ALTER ... OWNER TO` のコマンドタグ（対象の種別ごと。PostgreSQL の `ALTER TABLE`・`ALTER VIEW`・
+/// `ALTER MATERIALIZED VIEW`・`ALTER SCHEMA` と同じ）。`SqlOutcome::AlterOwner` の写像だけが呼ぶ。
+fn alter_owner_tag(kind: engine::sql::allowlist::AlterOwnerKind) -> &'static str {
+    use engine::sql::allowlist::AlterOwnerKind;
+    match kind {
+        AlterOwnerKind::Table => "ALTER TABLE",
+        AlterOwnerKind::View => "ALTER VIEW",
+        AlterOwnerKind::MaterializedView => "ALTER MATERIALIZED VIEW",
+        AlterOwnerKind::Schema => "ALTER SCHEMA",
+    }
+}
+
 // engine クレートの一時 DB ヘルパーをソース取り込みで共有する（wire-server の
 // 結合テスト `tests/*.rs` と同じ方式。`crates/engine/src/test_util/temp_db.rs`
 // モジュールドキュメント参照）。`#[path]` はこのファイル（`src/simple_query.rs`）
@@ -1389,6 +1406,19 @@ mod temp_db;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `ALTER ... OWNER TO` のコマンドタグは対象の種別ごとの `ALTER <種別>`（Issue #2236）。
+    #[test]
+    fn alter_owner_tag_follows_the_target_kind() {
+        use engine::sql::allowlist::AlterOwnerKind;
+        assert_eq!(alter_owner_tag(AlterOwnerKind::Table), "ALTER TABLE");
+        assert_eq!(alter_owner_tag(AlterOwnerKind::View), "ALTER VIEW");
+        assert_eq!(
+            alter_owner_tag(AlterOwnerKind::MaterializedView),
+            "ALTER MATERIALIZED VIEW"
+        );
+        assert_eq!(alter_owner_tag(AlterOwnerKind::Schema), "ALTER SCHEMA");
+    }
 
     /// テスト用: 行のセル数に合わせた列メタ（値の整形が列型に依存しない行のみ
     /// 使うため全列 `TEXT`。Issue #1173 で `encode_data_row` が列メタを要求する）。
