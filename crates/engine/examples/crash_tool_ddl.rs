@@ -15,7 +15,7 @@
 //!
 //! サブコマンド:
 //! - `write <db_path>`: 現在の n を推定して（一致する n がちょうど 1 つでなければ開始を拒否する）
-//!   続きの文を 1 文ずつ実行し、成功のたびに `COMMITTED batch=<n> rows=<n>` を出力して flush する。
+//!   続きの文を 1 文ずつ、実行直前に `STMT` 行を出し、成功のたびに `COMMITTED batch=<n> rows=<n>` を出力して flush する。
 //! - `verify <db_path>`: `RESULT ok=true rows=<n> rounds=<R>` または `RESULT ok=false reason=<...>`。
 //!   カタログ・行・索引宣言から推定した n の期待状態が完全一致し、かつ一致する n がちょうど 1 つ
 //!   であること（0 件は部分的な DDL・破損、2 件以上はオラクルが弱すぎる）。一意索引は読み取り専用
@@ -26,8 +26,12 @@
 //!   は到達できない状態（索引の飛ばし・行の過不足・DROP 残骸・DROP 欠落・既定値違い・一意索引の物理
 //!   構造欠落・空 DB）を拒否することを確かめる。
 //!
-//! 対象外（兄弟 Issue）: DDL 文の実行中へ kill を当てる制御は #2418、DDL の途中のエラーで何も残らない
-//! ことと writer 待機の `55P03` は #2419 が担当する。本ツールは既存の SIGKILL 骨格での反復に留める。
+//! Issue #2418（SQL-23 を併せて参照）: `write` は各文の `exec` 直前に `STMT step=<s> stage=<g>` を出す。
+//! kill 位置の分類（最後の進行行が STMT なら文の実行中）と、実行中なら n が ack 済み n か +1、文の間なら
+//! 完全一致の検査、DDL 段の実行中の中断を 1 度も観測しない実行の失敗は `scripts/crash_test_ddl.sh` が行う。
+//!
+//! 対象外（兄弟 Issue）: DDL の途中のエラーで何も残らないことと writer 待機の `55P03` は #2419 が担当する。
+//! 文の内部（commit 直前・直後）で決定的に止める同期点は設けない（確率的な kill 位置の分類に留める）。
 //!
 //! 失敗メッセージには `wire_code`・表名・件数だけを含め、行の値・他テナントの存在情報は出さない。
 
@@ -50,13 +54,14 @@ const TENANT_B: &str = "crash-ddl-b";
 /// 表 `dd_<r>` へ投入する行数（k = 1..=SEED）。
 const SEED: i64 = 8;
 /// 自走するラウンド数の上限（安全弁。通常は SIGKILL で止まる。DoS 対策で表・行の増加も抑える）。
-const MAX_ROUNDS: u64 = 1_000;
+const MAX_ROUNDS: u64 = 30_000;
 /// ステップ総数の上限（ラウンド 0 は 5 段、以降は 6 段）。
 const MAX_STEPS: u64 = 5 + 6 * (MAX_ROUNDS - 1);
 /// `SELECT … LIMIT` の上限。達したら全件を見られないので fail-closed。
 const SCAN_LIMIT: u64 = 10_000;
-/// 文と文の間の待機（ミリ秒）。kill の当たる窓を広げ、無制限に回らないようにする。
-const PAUSE_MS: u64 = 10;
+/// 文と文の間の待機（マイクロ秒）。1 文の実行は 0.1ms 前後と短く、待機が長いと kill の大半が文と文の
+/// 間に当たる（#2418）。短くして実行中の割合を上げ、かつ MAX_STEPS に達して自走終了しない範囲に抑える。
+const PAUSE_US: u64 = 100;
 
 type Res<T> = Result<T, String>;
 
@@ -238,6 +243,16 @@ fn committed(n: u64) {
     let _ = std::io::stdout().flush();
 }
 
+/// 文の実行開始マーカー `STMT step=<s> stage=<g>` を出して flush する（ack ではない）。
+/// `scripts/crash_test_ddl.sh` が write.log の最後の進行行から kill 位置（文の実行中か、文と文の間か）
+/// を分類するために使う。段番号のみでテナント ID・行の値は含めない。flush 失敗は続行しない。
+fn in_stmt(step: u64) -> Res<()> {
+    let (_, stage) = locate(step);
+    let mut out = std::io::stdout();
+    writeln!(out, "STMT step={step} stage={stage}").map_err(|e| format!("emit failed: {e}"))?;
+    out.flush().map_err(|e| format!("flush failed: {e}"))
+}
+
 fn run_write(path: &str) -> i32 {
     match write(path) {
         Ok(()) => 0,
@@ -256,9 +271,12 @@ fn write(path: &str) -> Res<()> {
     };
     let core = open_core(path)?;
     for step in n0..MAX_STEPS {
+        // 開始マーカーは `exec` の直前に出す（間に待機を入れない。入れると「文の開始前」の kill を
+        // 実行中と数えてしまい、空洞化する）。待機は COMMITTED の後ろ（次の STMT の前）に置く。
+        in_stmt(step)?;
         exec(&core, TENANT_A, &step_sql(step))?;
         committed(step + 1);
-        std::thread::sleep(std::time::Duration::from_millis(PAUSE_MS));
+        std::thread::sleep(std::time::Duration::from_micros(PAUSE_US));
     }
     Ok(())
 }
