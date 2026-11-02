@@ -318,6 +318,9 @@ fn qualified_target_is_checked_under_its_resolved_key() {
     // 修飾名でも名前解決後のキーで ACL を引く（素通しにならない）。
     assert_eq!(f.alice_run(sql), "42501");
     f.admin_run("GRANT INSERT ON app.q TO alice");
+    // 表の権限だけでは足りず、SCHEMA の USAGE も要る（Issue #2234）。
+    assert_eq!(f.alice_run(sql), "42501");
+    f.admin_run("GRANT USAGE ON SCHEMA app TO alice");
     let r = f.alice_run(sql);
     assert_eq!(r, "ok");
 }
