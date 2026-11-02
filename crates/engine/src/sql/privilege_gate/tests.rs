@@ -190,3 +190,38 @@ fn owner_capable_kinds_defer_to_owner_check_for_bound_roles_only() {
         assert!(is_denied(require_ddl_or_owner(&zero, k).map(|_| ())));
     }
 }
+
+/// 構文解析が実在を確認した参照先（ビュー展開前のビュー自身を含む）が ACL 照会の時点で見つからない
+/// ときは、通常 SQL でも検査を省略せず拒否する（解析後に別セッションが DROP した競合。Issue #1967）。
+/// 解析で実在を確認できなかった名前（構文語・別名などの誤分類）だけを読み飛ばす。
+#[test]
+fn relation_missing_at_acl_lookup_is_rejected_when_parser_confirmed_it() {
+    use crate::catalog::privilege::PRIV_SELECT;
+    let path = std::env::temp_dir().join(format!(
+        "gate-missing-{}-{:?}.redb",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let storage = crate::storage::Storage::open(&path).expect("open storage");
+    let mut s = SessionState::default();
+    s.bind_role_ids(1, 1);
+    let principal = Principal::from_session(&s);
+    let names = vec!["dropped_view".to_string()];
+    let run = |parsed: &[String]| {
+        read::require_relations(
+            &storage,
+            "t1",
+            &principal,
+            PRIV_SELECT,
+            &names,
+            None,
+            read::MissingRelation::RejectIfParsed(parsed),
+        )
+    };
+    // 解析が確認していない名前は読み飛ばす（誤分類された識別子）。
+    assert!(run(&[]).is_ok());
+    // 解析が確認した名前が消えていれば、存在情報を示さない固定の `42P01` で拒否する。
+    let err = run(&names).expect_err("must reject");
+    assert_eq!(err.wire_code(), "42P01");
+    let _ = std::fs::remove_file(&path);
+}

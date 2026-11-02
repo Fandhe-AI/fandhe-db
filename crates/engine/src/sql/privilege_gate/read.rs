@@ -17,8 +17,10 @@
 //!   段で不在と同じ応答になり、権限の分岐に入らない）。
 //! - ビュー・matview は、利用者に対してはそれ自身の SELECT だけを判定する（基底表はビュー所有者の権限で
 //!   読む扱い。ビューを作れるのは所有者相当の主体だけ。ADR §12）。
-//! - カタログで relation として引けない名前（誤分類された識別子）は検査しない。存在しないものは読めない
-//!   ので fail-open にならない。余分な検査は拒否側にだけ倒れる。
+//! - カタログで relation として引けない名前（誤分類された識別子）は検査しない。ただし構文解析が
+//!   カタログで実在を確認した名前（`RelationHits` の記録。ビュー展開前のビュー自身を含む）が ACL 照会の
+//!   時点で見つからない場合は、解析後に DROP された参照先として拒否する（通常 SQL・準備済み文・明示 Tx の
+//!   どの経路でも同じ）。余分な検査は拒否側にだけ倒れる。
 //! - 参照数の上限を ACL の照会より前に検査する（untrusted 入力）。
 //! - エラーは固定文言の `42501`。表名・ロール ID・テナントを含めない。
 
@@ -172,7 +174,7 @@ pub(crate) fn require_read_privileges(
     tokens: &[Token],
     resolver: Option<SchemaResolver<'_>>,
     requirement: ReadRequirement,
-    read_snap: Option<&redb::ReadTransaction>,
+    snapshot: ParsedScope<'_>,
 ) -> Result<(), SqlSurfaceError> {
     let Some(required_bits) = requirement.bits() else {
         return Ok(());
@@ -197,8 +199,8 @@ pub(crate) fn require_read_privileges(
         &principal,
         required_bits,
         &crate::sql::search_path::resolved_relation_ref_names(&resolved),
-        read_snap,
-        false,
+        snapshot.read_snap,
+        MissingRelation::RejectIfParsed(snapshot.parsed_relations),
     )
 }
 
@@ -233,19 +235,47 @@ pub(crate) fn require_read_privileges_resolved(
         required_bits,
         &crate::sql::search_path::resolved_relation_ref_names(resolved_tokens),
         read_snap,
-        true,
+        MissingRelation::AlwaysReject,
     )
 }
 
+/// 通常 SQL の構文解析の結果として権限ゲートへ渡す、参照先の確認の文脈。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ParsedScope<'a> {
+    /// 明示 Tx の読み取り源（`BEGIN` 時点のスナップショット）。無ければ最新の確定カタログ。
+    pub(crate) read_snap: Option<&'a redb::ReadTransaction>,
+    /// 構文解析がカタログで実在を確認した relation 名（ビュー展開前のビュー自身を含む）。
+    pub(crate) parsed_relations: &'a [String],
+}
+
+/// ACL 照会で relation が見つからなかったときの扱い。
+#[derive(Debug, Clone, Copy)]
+pub(super) enum MissingRelation<'a> {
+    /// 準備済み文（Parse 時に名前解決済みのトークン列）。見つからない参照先はすべて陳腐化として拒否する。
+    AlwaysReject,
+    /// 通常 SQL。構文解析がカタログで実在を確認した名前（引数）だけを陳腐化として拒否し、それ以外
+    /// （構文語・別名などの誤分類された識別子）は読み飛ばす。
+    RejectIfParsed(&'a [String]),
+}
+
+impl MissingRelation<'_> {
+    fn is_stale(&self, name: &str) -> bool {
+        match self {
+            Self::AlwaysReject => true,
+            Self::RejectIfParsed(parsed) => parsed.iter().any(|p| p == name),
+        }
+    }
+}
+
 /// 解決済みの relation 名の並びに対する判定（表名を直接渡す HTTP 表層の入口と共有する）。
-fn require_relations(
+pub(super) fn require_relations(
     storage: &Storage,
     tenant: &str,
     principal: &Principal,
     required_bits: u16,
     candidates: &[String],
     read_snap: Option<&redb::ReadTransaction>,
-    missing_is_stale: bool,
+    missing: MissingRelation<'_>,
 ) -> Result<(), SqlSurfaceError> {
     let mut names: Vec<String> = Vec::new();
     for name in candidates {
@@ -277,7 +307,11 @@ fn require_relations(
             // 準備済み文（Parse 済みで名前解決済みのトークン列）の参照先が消えている場合は、別セッションの
             // DROP 後に展開済みの文だけが残った状態であり、検査を省略すると SET ROLE 後のロールが
             // 権限なしで基底表を読める認可バイパスになる。fail-closed で拒否する（fail-open にしない）。
-            if missing_is_stale {
+            // 通常 SQL でも、構文解析がカタログで実在を確認した名前（`parsed_relations`。ビュー展開前の
+            // ビュー自身を含む）が ACL 照会の時点で見つからないなら、解析後に別セッションが DROP した
+            // 参照先であり、検査を省略すると展開済みの基底表を権限なしで読めてしまう。拒否する。
+            // 解析で実在を確認できなかった名前（構文語・別名などの誤分類）だけを読み飛ばす。
+            if missing.is_stale(name) {
                 // 内部キー（`#<schema_id>.<name>`）は利用者へ出さない（ADR D2）。公開名の名前部だけを返す。
                 return Err(SqlSurfaceError::undefined_table(
                     crate::catalog::namespace::relation_name_part(name),
@@ -322,7 +356,7 @@ pub(crate) fn require_table_select(
         PRIV_SELECT,
         &[table.to_string()],
         None,
-        false,
+        MissingRelation::RejectIfParsed(&[]),
     )
 }
 
