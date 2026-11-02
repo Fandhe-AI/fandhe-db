@@ -4,7 +4,7 @@
 //! SCHEMA・他テナントの行に触れない）・`DROP SCHEMA` 経由の掃除と `DROP ROLE` の依存解放を固定する。
 
 use super::*;
-use crate::catalog::privilege::{upsert_acl_in_txn, PRIV_CREATE, PRIV_USAGE};
+use crate::catalog::privilege::{upsert_acl_in_txn, PRIV_CREATE, PRIV_USAGE, PUBLIC_GRANTEE_ID};
 use crate::test_util::temp_db::{unique_db_path, CleanupGuard};
 
 fn open(label: &str) -> (CleanupGuard, Storage) {

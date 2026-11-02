@@ -102,6 +102,8 @@ mod commit_log_tests;
 #[cfg(test)]
 mod schema_acl_tests;
 #[cfg(test)]
+mod sequence_function_acl_tests;
+#[cfg(test)]
 mod serialization_failure_tests;
 // `40001` の可視性境界・副作用ゼロの内部観測（Issue #2407。ポインタ: ERR-7・SQL-38・TABLE-3）。
 #[cfg(test)]
@@ -2242,6 +2244,7 @@ fn insert_sequence_scope(
         crate::sql::sequence_scope::SequenceScope::enter(
             std::sync::Arc::clone(storage.sequence_allocator()),
             session.sequences_handle(),
+            crate::sql::schema_privilege::acl_checked_principal(session),
         )
     })
 }
@@ -7485,6 +7488,7 @@ impl EngineCore {
         session: &mut crate::sql::mode::SessionState,
         parsed: &ParsedSql,
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        let _function_acl_scope = self.function_acl_scope(ctx, session)?;
         // 永続側の文を包んだ形（世代の検査は公開入口の粗いゲートが済ませている）は中身を実行する。
         if let ParsedSql::SessionRouted(routed) = parsed {
             if routed.is_persistent() {
@@ -8405,6 +8409,36 @@ impl EngineCore {
         crate::sql::udf_load::load(&self.storage, ctx.tenant_id(), session.udfs_mut())
     }
 
+    /// 関数 EXECUTE の拒否集合を文の実行区間へ張る（SQL-40・RLS-12 のポインタ、Issue #2235。設計記録
+    /// `role-privilege-model.md` S1・S7）。公開のセッション入口（簡易クエリ・明示 Tx・準備済み文の
+    /// Bind／Execute）が、UDF を束縛する区間の頭で呼び、戻り値のガードを区間の終わりまで保持する。
+    /// ACL で判定すべき主体（束縛済みかつ所有者相当でない）で、カタログ由来の関数がセッションに 1 件以上
+    /// あるときだけ、1 回の読み取り txn で拒否集合を作る。入れ子の入口（PL/pgSQL 本体の文など）はスコープが
+    /// 既にあれば何もしない（呼び出し元ロールの判定を保つ）。読み取りの失敗は `XX000`（fail-closed）。
+    fn function_acl_scope(
+        &self,
+        ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
+    ) -> Result<
+        Option<crate::sql::object_privilege::FunctionAclScope>,
+        crate::sql::allowlist::SqlSurfaceError,
+    > {
+        use crate::sql::object_privilege::FunctionAclScope;
+        if FunctionAclScope::is_active() || session.udfs().catalog_entry_count() == 0 {
+            return Ok(None);
+        }
+        let Some(role) = crate::sql::schema_privilege::acl_checked_principal(session) else {
+            return Ok(None);
+        };
+        let denied = self
+            .storage
+            .denied_function_keys(ctx.tenant_id(), role)
+            .map_err(|_| crate::sql::allowlist::SqlSurfaceError::Internal {
+                detail: "could not evaluate function privileges".to_string(),
+            })?;
+        Ok(Some(FunctionAclScope::enter(denied)))
+    }
+
     /// 他セッションの `CREATE`／`DROP FUNCTION` を反映する（SQL-66・Issue #1921）。wire-server が
     /// Query／Parse の実行前に呼ぶ。UDF カタログの世代が変わっていなければ何もしない。失敗したら
     /// カタログ由来の登録を全部消して次回再試行する（stale な定義で実行し続けない）。未ロードの
@@ -8542,6 +8576,7 @@ impl EngineCore {
         txn: &mut crate::sql::transaction::SessionTransaction<'e>,
         parsed: &ParsedSql,
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        let _function_acl_scope = self.function_acl_scope(ctx, session)?;
         use crate::sql::transaction::{TransactionStatus, TxnControl};
 
         // 永続側の文を包んだ形（世代の検査は公開入口の粗いゲートが済ませている）は中身を実行する。
@@ -12064,6 +12099,7 @@ impl EngineCore {
             crate::sql::allowlist::SqlSurfaceError,
         >,
     {
+        let _function_acl_scope = self.function_acl_scope(ctx, session)?;
         let (read_txn, schema) = self.read_txn_with_schema(table)?;
         let bound = bind(&schema, session.udfs())?;
         if bound.table() != table {
@@ -12115,6 +12151,7 @@ impl EngineCore {
             &crate::sql::udf_call::UdfRegistry,
         ) -> Result<PlanSearchBinding, crate::sql::allowlist::SqlSurfaceError>,
     {
+        let _function_acl_scope = self.function_acl_scope(ctx, session)?;
         // `LIMIT`・`question` の多層防御（`Self::run_using_plan_select` 側の
         // 検証に加え、engine 側でも独立に通す。NoSQL 表層の `search.rs::
         // bind_search` が既に同じ検証を通しているが、本メソッドが engine の
@@ -13280,6 +13317,7 @@ impl EngineCore {
         ) -> Result<crate::sql::explain::ExplainShape, E>,
         E: From<crate::sql::allowlist::SqlSurfaceError>,
     {
+        let _function_acl_scope = self.function_acl_scope(ctx, session)?;
         self.run_explain_plan(ctx, session, table, question, mode_literal, None, bind)
     }
 
@@ -13320,6 +13358,7 @@ impl EngineCore {
         )
             -> Result<crate::sql::parser::BoundScan, crate::sql::allowlist::SqlSurfaceError>,
     {
+        let _function_acl_scope = self.function_acl_scope(ctx, session)?;
         let (read_txn, schema) = self.read_txn_with_schema(table)?;
         let bound = bind(&schema, session.udfs())?;
         if bound.table() != table {
@@ -13354,6 +13393,7 @@ impl EngineCore {
             crate::sql::allowlist::SqlSurfaceError,
         >,
     {
+        let _function_acl_scope = self.function_acl_scope(ctx, session)?;
         let (read_txn, schema) = self.read_txn_with_schema(table)?;
         let bound = bind(&schema, session.udfs())?;
         if bound.table() != table {

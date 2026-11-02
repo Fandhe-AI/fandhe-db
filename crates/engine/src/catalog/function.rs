@@ -784,6 +784,52 @@ pub(crate) fn get_function_in_txn<R: ReadSource>(
     }
 }
 
+/// 関数名（と任意の引数型の並び）から内部 ID を引く（`GRANT`／`REVOKE ... ON FUNCTION` の解決。Issue #2235）。
+/// 型の並びは `DROP FUNCTION` と同じ規則で照合する（個数が違えば不一致、型注釈なしの引数は任意の型に一致、
+/// 型注釈ありは同一性トークンで比べる）。0 件・不一致は `None`（他テナントの関数も構造上引けないので同じ
+/// `None`。存在オラクルにならない）。同名の多重定義は作成時に拒否されるため通常 1 件だけ。
+pub(crate) fn resolve_function_id_in_txn<R: ReadSource>(
+    src: &R,
+    scope: &str,
+    function_key: &str,
+    arg_types: Option<&[ColumnType]>,
+) -> Result<Option<u64>> {
+    validate_scope(scope)?;
+    let key = normalize_key(function_key)?;
+    let found = list_in_txn(src, scope, Some(&key))?;
+    let [def] = found.as_slice() else {
+        return Ok(None);
+    };
+    if let Some(types) = arg_types {
+        if def.params.len() != types.len() {
+            return Ok(None);
+        }
+        for (stored, want) in def.params.iter().zip(types) {
+            let Some(stored_ty) = &stored.ty else {
+                continue;
+            };
+            let want_ty = FunctionType::from_column_type(want)?;
+            if stored_ty.identity_token() != want_ty.identity_token() {
+                return Ok(None);
+            }
+        }
+    }
+    Ok(Some(def.id))
+}
+
+/// `scope` の全関数の `(function_key, 内部 ID)` を返す（関数 EXECUTE の拒否集合の構築。件数は
+/// [`MAX_FUNCTIONS`] で有界）。
+pub(crate) fn function_ids_in_txn<R: ReadSource>(
+    src: &R,
+    scope: &str,
+) -> Result<Vec<(String, u64)>> {
+    validate_scope(scope)?;
+    Ok(list_in_txn(src, scope, None)?
+        .into_iter()
+        .map(|d| (d.function_key, d.id))
+        .collect())
+}
+
 /// `scope` の定義を `(function_key, arg_signature)` の昇順で列挙する。`only_key` を指定すると
 /// その名前の多重定義だけを返す。件数が [`MAX_FUNCTIONS`] を超えたら `CorruptSchema`
 /// （破損時の無制限確保の防止）。
@@ -880,6 +926,9 @@ fn remove_function_in_txn(
         scope,
         &super::privilege::PrivilegeObject::Function(existing.id),
     )?;
+    // 関数の ACL 行と「実体化済み」の印も同じ txn で消す（Issue #2235。残った行は `DROP ROLE` の依存検査を
+    // 永久に拒否し、テナントあたりの件数上限を消費する。`CREATE OR REPLACE` は削除せず ID を保つ）。
+    super::privilege::remove_function_acl_in_txn(write_txn, scope, existing.id)?;
     // 標準形の依存辺も同じ txn で掃除する（唯一の削除経路。`DROP SCHEMA ... CASCADE` の
     // `remove_functions_with_prefix_in_txn` もここを通る。Issue #2219）。
     super::function_dependency::remove_for_function_in_txn(

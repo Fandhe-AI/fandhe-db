@@ -30,12 +30,19 @@ use super::role::validate_tenant;
 use super::{validate_identifier, validate_relation_key, CatalogError, Result, Storage};
 
 mod apply;
+mod function;
 pub(crate) mod owner;
 mod owner_change;
 mod schema;
-pub(crate) use apply::{AclChangeError, AclItem, AclRequest, AclScope, AclWarning, GranteeSpec};
 pub(crate) use owner_change::NewOwnerRef;
+mod sequence;
+pub(crate) use apply::{
+    AclChangeError, AclFunctionRef, AclItem, AclRequest, AclScope, AclWarning, GranteeSpec,
+};
+#[allow(unused_imports)] // 判定側（`sql::object_privilege`・テスト）が使う。
+pub(crate) use function::{function_privileges_in_txn, remove_function_acl_in_txn};
 pub(crate) use schema::remove_schema_acl_in_txn;
+pub(crate) use sequence::{remove_sequence_acl_in_txn, sequence_privileges_in_txn};
 
 /// ACL の専用カタログ表。キーは `(tenant_id, object_kind, object_key, column, grantee_id, grantor_id)`。
 #[allow(clippy::type_complexity)] // 6 成分の複合キー（先頭 tenant_id）。型別名にすると redb の寿命推論が崩れる。
@@ -395,6 +402,22 @@ pub(crate) fn list_acl_for_object_in_txn<R: ReadSource>(
         out.push(e);
     }
     Ok(out)
+}
+
+/// 対象 `object` について、`role_ids` のいずれか（と PUBLIC）が持つ権限ビットの和を返す（種別を問わない
+/// 汎用の読み取り。SCHEMA・SEQUENCE・関数の判定の共通部）。継承（メンバーシップ経由）は呼び出し元が渡す
+/// ロール集合に含める。表が無い・行が無ければ 0。破損行は `Err`（fail-closed）。
+pub(crate) fn object_privileges_in_txn<R: ReadSource>(
+    src: &R,
+    tenant: &str,
+    object: &PrivilegeObject,
+    role_ids: &[u64],
+) -> Result<u16> {
+    let entries = list_acl_for_object_in_txn(src, tenant, object)?;
+    Ok(entries
+        .iter()
+        .filter(|e| e.grantee_id == PUBLIC_GRANTEE_ID || role_ids.contains(&e.grantee_id))
+        .fold(0u16, |acc, e| acc | e.privileges))
 }
 
 /// `collect_matching` の戻り値（集めた行と、続きがありうるときの再開キー）。
