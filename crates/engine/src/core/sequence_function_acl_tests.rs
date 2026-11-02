@@ -325,6 +325,8 @@ fn fn_fixture(tag: &str) -> (EngineCore, CleanupGuard, SessionState) {
         "CREATE TABLE t (id BIGINT PRIMARY KEY, n BIGINT)",
     );
     ok(&core, &mut o, "INSERT INTO t (id, n) VALUES (1, 10)");
+    // 表単位の SELECT（Issue #1967）は関数の EXECUTE と別軸なので、関数 ACL の検査だけを観測できるよう PUBLIC へ付与する。
+    ok(&core, &mut o, "GRANT SELECT ON t TO PUBLIC");
     ok(&core, &mut o, "CREATE FUNCTION addone(x) AS x + 1");
     ok(&core, &mut o, "CREATE FUNCTION outer_f(x) AS addone(x) + 1");
     ok(

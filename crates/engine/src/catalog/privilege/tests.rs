@@ -754,3 +754,71 @@ mod apply_deps {
         assert_eq!(out.rows_changed, 1);
     }
 }
+
+/// 保存済みビュー本文に直接書き込む（`CREATE VIEW` の検証を通らない形も作るため）。
+fn put_view(s: &Storage, name: &str, base: &str, body: &str) {
+    write(s, |t| {
+        let def = crate::catalog::ViewDef {
+            base_relation: base.to_string(),
+            body_sql: body.to_string(),
+            column_aliases: Vec::new(),
+            check_option: crate::catalog::ViewCheckOption::None,
+        };
+        let bytes = crate::catalog::encode_view_def(&def)?;
+        let mut v = t.open_table(crate::catalog::VIEWS_TABLE)?;
+        v.insert(name, bytes.as_slice())?;
+        Ok(())
+    })
+    .expect("put view");
+}
+
+/// 同一性の閉包は、保存済み本文を展開側と同じ字句解析で読み、引用された内部キー（`"#<id>.<name>"`）の
+/// 参照も辿る。読めない本文は無視せず `Err`（fail-closed。入れ子の置換を見逃して失効させ損ねない）。
+#[test]
+fn identity_closure_reads_stored_bodies_like_expansion_and_fails_closed() {
+    use redb::ReadableDatabase;
+    let (_g, s) = open("priv-identity-closure");
+    put_view(
+        &s,
+        "v_key",
+        "bt",
+        "SELECT n FROM bt UNION ALL SELECT n FROM \"#7.inner\"",
+    );
+    let rt = s.db().begin_read().expect("read");
+    let ids = relation_identity_closure_in_txn(&rt, &["v_key".to_string()]).expect("closure");
+    assert!(
+        ids.iter().any(|(n, _)| n == "#7.inner"),
+        "internal key reference must be walked: {ids:?}"
+    );
+    drop(rt);
+    put_view(
+        &s,
+        "v_bad",
+        "bt",
+        "SELECT n FROM bt WHERE n = 'unterminated",
+    );
+    let rt = s.db().begin_read().expect("read");
+    assert!(relation_identity_closure_in_txn(&rt, &["v_bad".to_string()]).is_err());
+}
+
+/// 同一性の閉包は、定義のバイト列の合計が上限を超えたら生成中に打ち切って `Err`（fail-closed）。
+#[test]
+fn identity_closure_stops_when_definition_bytes_exceed_the_budget() {
+    use redb::ReadableDatabase;
+    let (_g, s) = open("priv-identity-budget");
+    let pad = "x".repeat(40 * 1024);
+    let mut roots = Vec::new();
+    for i in 0..8 {
+        let name = format!("v{i}");
+        put_view(
+            &s,
+            &name,
+            "bt",
+            &format!("SELECT n FROM bt WHERE n = '{pad}'"),
+        );
+        roots.push(name);
+    }
+    let rt = s.db().begin_read().expect("read");
+    assert!(relation_identity_closure_in_txn(&rt, &roots).is_err());
+    assert!(relation_identity_closure_in_txn(&rt, &roots[..2]).is_ok());
+}

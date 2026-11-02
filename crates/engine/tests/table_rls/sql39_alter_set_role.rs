@@ -276,8 +276,14 @@ fn set_role_does_not_change_tenant_boundary_or_ddl_permission() {
     );
     ok(&core, "alice", &mut admin, "CREATE ROLE me");
     ok(&core, "bob", &mut admin, "CREATE ROLE bobs");
+    // SQL-40・Issue #1967: 束縛済みロールの SELECT は GRANT が要る。運用者権限のセッションで付与する。
+    let mut grantor = allowed_session();
+    grantor.bind_role_ids(1, 1);
+    assert!(grantor.bind_resolution_tenant("alice"));
+    ok(&core, "alice", &mut grantor, "GRANT SELECT ON t TO me");
     let mut s = SessionState::default();
     s.bind_role_ids(1, 1);
+    assert!(s.bind_resolution_tenant("alice"));
     let read = |core: &EngineCore, tenant: &str, s: &mut SessionState| match core
         .execute_sql_in_session(&ctx(tenant), s, "SELECT id FROM t")
     {

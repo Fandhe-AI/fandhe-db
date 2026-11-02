@@ -107,7 +107,56 @@ fn denial_message_is_fixed_and_has_no_detail() {
     s.bind_role_ids(4242, 4242);
     let e = require_ddl(&s, DdlStatementKind::DropTable).expect_err("denied");
     assert_eq!(format!("{e:?}"), "InsufficientPrivilege");
-    assert_eq!(e.client_message(), "permission denied for DDL statement");
+    assert_eq!(e.client_message(), "permission denied");
+}
+
+// --- オブジェクト権限（#1967）-------------------------------------------------------------------
+
+fn rel(
+    principal: &Principal,
+    required_bits: u16,
+    granted_bits: u16,
+) -> Result<(), SqlSurfaceError> {
+    check(
+        principal,
+        PrivilegeTarget::Relation {
+            required_bits,
+            granted_bits,
+        },
+    )
+    .map(|_| ())
+}
+
+#[test]
+fn object_privilege_decision_table() {
+    use crate::catalog::privilege::{PRIV_SELECT, PRIV_UPDATE};
+    // 未束縛は移行期の主体として素通し（#1971 で束縛されると有効になる）。
+    let unbound = Principal::from_session(&SessionState::default());
+    assert!(rel(&unbound, PRIV_SELECT, 0).is_ok());
+    assert!(!unbound.needs_acl_lookup());
+    // PUBLIC の予約 ID は拒否（運用者権限があっても）。
+    let mut zero = allowed();
+    zero.bind_role_ids(0, 0);
+    assert!(is_denied(rel(
+        &Principal::from_session(&zero),
+        PRIV_SELECT,
+        !0
+    )));
+    // 束縛済み: 要求ビットを全部持つときだけ許可。
+    let p = Principal::from_session(&bound_only());
+    assert!(p.needs_acl_lookup());
+    assert!(is_denied(rel(&p, PRIV_SELECT, 0)));
+    assert!(rel(&p, PRIV_SELECT, PRIV_SELECT).is_ok());
+    assert!(is_denied(rel(&p, PRIV_SELECT | PRIV_UPDATE, PRIV_SELECT)));
+    assert!(rel(&p, PRIV_SELECT | PRIV_UPDATE, PRIV_SELECT | PRIV_UPDATE).is_ok());
+    // 要求ビットが空なら（設計上の誤用）許可しない。
+    assert!(is_denied(rel(&p, 0, PRIV_SELECT)));
+    // 運用者権限は所有者相当として許可（ACL の照会も不要）。
+    let mut owner = bound_only();
+    owner.allow_ddl();
+    let p = Principal::from_session(&owner);
+    assert!(!p.needs_acl_lookup());
+    assert!(rel(&p, PRIV_SELECT, 0).is_ok());
 }
 
 #[test]
@@ -140,4 +189,39 @@ fn owner_capable_kinds_defer_to_owner_check_for_bound_roles_only() {
         zero.bind_role_ids(0, 0);
         assert!(is_denied(require_ddl_or_owner(&zero, k).map(|_| ())));
     }
+}
+
+/// 構文解析が実在を確認した参照先（ビュー展開前のビュー自身を含む）が ACL 照会の時点で見つからない
+/// ときは、通常 SQL でも検査を省略せず拒否する（解析後に別セッションが DROP した競合。Issue #1967）。
+/// 解析で実在を確認できなかった名前（構文語・別名などの誤分類）だけを読み飛ばす。
+#[test]
+fn relation_missing_at_acl_lookup_is_rejected_when_parser_confirmed_it() {
+    use crate::catalog::privilege::PRIV_SELECT;
+    let path = std::env::temp_dir().join(format!(
+        "gate-missing-{}-{:?}.redb",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let storage = crate::storage::Storage::open(&path).expect("open storage");
+    let mut s = SessionState::default();
+    s.bind_role_ids(1, 1);
+    let principal = Principal::from_session(&s);
+    let names = vec!["dropped_view".to_string()];
+    let run = |parsed: &[String]| {
+        read::require_relations(
+            &storage,
+            "t1",
+            &principal,
+            PRIV_SELECT,
+            &names,
+            None,
+            parsed,
+        )
+    };
+    // 解析が確認していない名前は読み飛ばす（誤分類された識別子）。
+    assert!(run(&[]).is_ok());
+    // 解析が確認した名前が消えていれば、存在情報を示さない固定の `42P01` で拒否する。
+    let err = run(&names).expect_err("must reject");
+    assert_eq!(err.wire_code(), "42P01");
+    let _ = std::fs::remove_file(&path);
 }

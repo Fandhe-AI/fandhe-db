@@ -49,6 +49,12 @@
 
 `LIMIT` 省略時の結果行数上限も `DECLARE` 時点で数える（[limit-omitted-result-cap.md](limit-omitted-result-cap.md) D5）。
 
+**権限検査（SQL-40・Issue #1967）**: 現在ロールが束縛済みのセッションでは、内側の問い合わせが参照する relation の
+SELECT 権限を `DECLARE` の時点で検査し（不足は `42501` で Tx は `Failed`）、`FETCH`／`CLOSE` では再検査しない。
+結果は `DECLARE` で確定済みで、`FETCH` は確定済みの行を払い出すだけで新しい読み取りを行わないため。`DECLARE` の後に
+`REVOKE` やロールの変更があっても、開いているカーソルには影響しない（PostgreSQL と同じ）。詳細は
+[role-privilege-model.md](role-privilege-model.md) §12。
+
 遅延評価（`FETCH` のたびに検索本体を再実行する方式）を採らない理由: 後から
 同じテーブルへ自分で書き込んだときに結果が変わってしまい（INSENSITIVE を満たせない）、
 読み取りトランザクションの寿命を管理するコードを新たに引き回す必要が出る。

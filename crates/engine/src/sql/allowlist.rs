@@ -2404,7 +2404,7 @@ impl std::fmt::Display for SqlSurfaceError {
             // テーブル名・ユーザー名を含めない固定文言（security.md P0。
             // `SqlSurfaceError::InsufficientPrivilege` ドキュメント参照）。
             SqlSurfaceError::InsufficientPrivilege => {
-                write!(f, "permission denied for DDL statement")
+                write!(f, "permission denied")
             }
             // オブジェクト名・SCHEMA 名・内部 ID を含めない固定文言（ADR D7・security.md P0）。
             SqlSurfaceError::SchemaDependencyForbidden => {
@@ -2646,6 +2646,14 @@ pub trait TableLookup {
     fn buffered_depth(&self) -> usize {
         0
     }
+
+    /// ビューの展開（[`crate::sql::view::resolve_from`] がビューの定義を辿り始めた時点）に入ったことを
+    /// 通知する。解析の記録（`SessionRelationLookup`）が、外側の文が直接参照した relation と、ビューの展開中に
+    /// 引かれた relation（権限を要求しない基底表）を区別するために使う。既定は何もしない。ラッパーは内側へ転送する。
+    fn enter_view_expansion(&self) {}
+
+    /// [`Self::enter_view_expansion`] と対になる通知（展開を終えた）。既定は何もしない。
+    fn leave_view_expansion(&self) {}
 
     /// `name` が MATERIALIZED VIEW（TABLE-42・Issue #1664）なら、その列定義を返す。matview でなければ
     /// `Ok(None)`。既定実装は常に `Ok(None)`（matview を持たない既存の実装・モックは無変更で動く）。

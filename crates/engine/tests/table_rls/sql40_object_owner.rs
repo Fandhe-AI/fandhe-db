@@ -302,6 +302,12 @@ fn public_grant_never_crosses_the_tenant_boundary() {
         &mut bound(ALICE, false),
         "GRANT USAGE ON SCHEMA s TO PUBLIC",
     );
+    // 表単位の SELECT（Issue #1967）も別軸で必要なので、USAGE とは独立に PUBLIC へ付与する。
+    f.ok(
+        "t1",
+        &mut bound(ALICE, false),
+        "GRANT SELECT ON s.u TO PUBLIC",
+    );
     f.ok("t1", &mut bob, "SELECT id FROM s.u");
     // t1 の PUBLIC は t2 の同名 SCHEMA にも、t2 のロールにも作用しない。
     assert_eq!(f.code("t2", &mut carol, "SELECT id FROM s.u2"), "42501");
@@ -394,5 +400,98 @@ fn owner_to_on_a_schema_qualified_relation_requires_create_on_the_schema() {
     assert_eq!(
         f.code("t1", &mut alice, "ALTER TABLE nosuch.t OWNER TO alice"),
         "3F000"
+    );
+}
+
+/// 所有者は明示付与なしで自分の表・ビューを読め（Issue #1967 の暗黙権限）、`OWNER TO` 後は旧所有者が
+/// 読めず新所有者が読める。非所有者と他テナントのロールは所有者判定でも読めない。
+#[test]
+fn owner_reads_own_relations_without_explicit_grant() {
+    let f = fx("sql40_owner_select");
+    f.ok(
+        "t1",
+        &mut bound(ALICE, true),
+        "CREATE TABLE ot (id BIGINT PRIMARY KEY)",
+    );
+    f.ok(
+        "t1",
+        &mut bound(ALICE, true),
+        "CREATE VIEW ov AS SELECT id FROM ot",
+    );
+    let mut alice = bound(ALICE, false);
+    let mut bob = bound(BOB, false);
+    f.ok("t1", &mut alice, "SELECT id FROM ot");
+    f.ok("t1", &mut alice, "SELECT id FROM ov");
+    assert_eq!(f.code("t1", &mut bob, "SELECT id FROM ot"), "42501");
+    assert_eq!(
+        f.code("t2", &mut bound(CAROL_T2, false), "SELECT id FROM ot"),
+        "42501"
+    );
+    f.ok("t1", &mut bound(ALICE, true), "ALTER TABLE ot OWNER TO bob");
+    assert_eq!(f.code("t1", &mut alice, "SELECT id FROM ot"), "42501");
+    f.ok("t1", &mut bob, "SELECT id FROM ot");
+}
+
+/// 構文語と同名の実表（`"only"`）も権限検査から外れない（別名付きでも `42501`）。権限を付与すると読める。
+/// 再帰 CTE の自己参照だけの問い合わせは、実表の権限が無いロールでも成功する（Issue #1967）。
+#[test]
+fn syntax_word_named_table_is_gated_and_recursive_cte_self_reference_is_not() {
+    let f = fx("sql40_only_table");
+    let mut op = bound(ALICE, true);
+    f.ok(
+        "t1",
+        &mut op,
+        "CREATE TABLE \"only\" (id BIGINT PRIMARY KEY)",
+    );
+    let mut bob = bound(BOB, false);
+    for sql in [
+        "SELECT id FROM \"only\"",
+        "SELECT id FROM \"only\" AS x LIMIT 5",
+        "SELECT x.id FROM \"only\" x",
+    ] {
+        assert_eq!(f.code("t1", &mut bob, sql), "42501", "{sql}");
+    }
+    f.ok("t1", &mut op, "GRANT SELECT ON \"only\" TO bob");
+    f.ok("t1", &mut bob, "SELECT id FROM \"only\" AS x LIMIT 5");
+    // 実表 t が無い再帰 CTE（自己参照 t は CTE を指す）。
+    f.ok(
+        "t1",
+        &mut bob,
+        "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 3) \
+         SELECT n FROM t",
+    );
+}
+
+/// 一時表を持つセッション（Issue #1967）。一時表だけを参照する文は表単位の権限なしでも成功し、実表も
+/// 参照する文は実表の権限なしなら `42501`。一時表と同名の実表があっても一時表が優先され（実表の権限は
+/// 要らない）、実表だけを参照する文は一時表を持っていても検査される。
+#[test]
+fn temp_table_sessions_keep_persistent_privilege_checks() {
+    let f = fx("sql40_temp_gate");
+    let mut owner = bound(ALICE, true);
+    f.ok("t1", &mut owner, "CREATE TABLE r (id BIGINT PRIMARY KEY)");
+    f.ok("t1", &mut owner, "CREATE TABLE sh (id BIGINT PRIMARY KEY)");
+    let mut bob = bound(BOB, false);
+    f.ok(
+        "t1",
+        &mut bob,
+        "CREATE TEMP TABLE tt (id BIGINT PRIMARY KEY)",
+    );
+    f.ok(
+        "t1",
+        &mut bob,
+        "CREATE TEMP TABLE sh (id BIGINT PRIMARY KEY)",
+    );
+    f.ok("t1", &mut bob, "SELECT id FROM tt");
+    // 一時表が優先され、同名の実表の権限は要らない。
+    f.ok("t1", &mut bob, "SELECT id FROM sh");
+    assert_eq!(f.code("t1", &mut bob, "SELECT id FROM r"), "42501");
+    assert_eq!(
+        f.code(
+            "t1",
+            &mut bob,
+            "SELECT tt.id FROM tt JOIN r ON tt.id = r.id"
+        ),
+        "42501"
     );
 }

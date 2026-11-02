@@ -67,7 +67,7 @@ use redb::ReadableDatabase;
 // 一時表（TABLE-44・Issue #1684）の振り分けと実行。永続コアの私的な項目に触れるため子モジュールに
 // 置く（`core.rs` の肥大化を避ける目的も兼ねる）。
 mod temp_route;
-pub use temp_route::SessionRoutedSql;
+pub use temp_route::{PreparedRelationIdentity, SessionRoutedSql};
 
 mod ctas_exec;
 mod matview_exec;
@@ -98,6 +98,9 @@ mod read_set_tests;
 // commit 記録（SQL-38・Issue #2404）。
 #[cfg(test)]
 mod commit_log_tests;
+// 読み取り系の文の SELECT 権限検査（SQL-40・Issue #1967）。
+#[cfg(test)]
+mod select_privilege_tests;
 // SCHEMA 単位の GRANT／REVOKE と USAGE 検査（SQL-40・Issue #2234）。
 #[cfg(test)]
 mod schema_acl_tests;
@@ -2611,6 +2614,11 @@ pub struct PreparedSql {
     /// `CREATE TABLE` の作成対象名が `public.` で明示修飾されていたか（TABLE-27・Issue #1715）。
     /// 再 parse した `CREATE TABLE` へ戻し、作成先の判定（`search_path`）を飛ばすために使う。
     create_public: bool,
+    /// Parse 時の構造検証 parse が外側の文で直接解決した relation 名（ビュー展開前のビュー自身を含み、
+    /// 展開中に引かれた基底表は含まない。解決済みトークンと同じ内部キー表記）。Bind・Execute の読み取り権限の再検査は、この名前が ACL 照会
+    /// の時点で見つからない場合だけ「Parse 後に消えた参照先」として拒否する（通常 SQL と同じ規則。
+    /// 別名などの誤収集は対象外。Issue #1967）。
+    parsed_relations: Vec<String>,
 }
 
 /// 解決済みトークンから再 parse した `DROP TABLE` に、Parse 時に外した `public.` 修飾の
@@ -5082,6 +5090,23 @@ impl EngineCore {
         }
     }
 
+    /// HTTP（NoSQL）表層の bound 読み取り API の入口で、対象表への SELECT 権限を判定する（SQL-40・
+    /// Issue #1967。束縛・計画・読み取り・EXPLAIN の組み立てより前）。現在ロール未束縛・運用者権限の
+    /// セッションは何もしない。`table` は呼び出し元が指定した relation 名で、権限不足は固定文言の `42501`。
+    fn require_table_select_privilege(
+        &self,
+        ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
+        table: &str,
+    ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+        crate::sql::privilege_gate::read::require_table_select(
+            &self.storage,
+            ctx.tenant_id(),
+            session,
+            table,
+        )
+    }
+
     /// [`Self::schema_resolver`] のセッション（主体）付き版（Issue #2234、設計記録 K1・K3）。解決した SCHEMA
     /// に対して束縛ロールの USAGE を検査する。順序は「自テナント内の解決 → 権限検査」で、他テナントの
     /// SCHEMA・不在は解決器が先に `None`（`3F000`）にする（権限の有無が存在オラクルにならない）。USAGE が
@@ -5390,12 +5415,50 @@ impl EngineCore {
     /// 通常の parse、あれば [`Self::route_temp_statement`]（一時コアへの振り分け。混在・対象外の
     /// 文種は `0A000`）に回す。トークン走査は保守的（一致しすぎても拒否側＝fail-closed）で、
     /// カタログを引かない文（`ALTER`・ビュー・カーソル等）や永続ビュー本文の再検証も覆う。
+    ///
+    /// SQL-40・Issue #1967: 構文解析（名前解決を含む）が成功した後、現在ロールが束縛されたセッションに限り、
+    /// 読み取り系の文の参照先へ SELECT 権限検査（[`crate::sql::privilege_gate::read`]）を行う。判定順は
+    /// 構文 `42601` → 名前解決 `42P01`／`3F000` → 権限 `42501`。`tenant` は呼び出し元の ctx のテナント。
+    /// 未束縛のセッションはトークンの複製も走査もしない（従来と同一）。
     fn parse_tokens_gated(
+        &self,
+        tokens: Vec<crate::sql::lexer::Token>,
+        session: &crate::sql::mode::SessionState,
+        tenant: &str,
+        resolver: Option<crate::sql::relation_name::SchemaResolver<'_>>,
+        read_snap: Option<&redb::ReadTransaction>,
+    ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
+        let gate_tokens = session.object_privileges_enforced().then(|| tokens.clone());
+        // parse 中に実在を確認した relation 名の記録先。ACL 照会の時点で見つからない名前を、解析後に
+        // DROP された参照先として権限ゲートが拒否する根拠になる（通常 SQL でも省略しない）。
+        let hits = crate::sql::temp_catalog::RelationHits::default();
+        let parsed =
+            self.parse_tokens_gated_grant_aware(tokens, session, resolver, read_snap, &hits)?;
+        if let Some(t) = gate_tokens {
+            crate::sql::privilege_gate::read::require_read_privileges(
+                &self.storage,
+                tenant,
+                session,
+                &t,
+                resolver,
+                crate::sql::privilege_gate::read::classify(&parsed),
+                crate::sql::privilege_gate::read::ParsedScope {
+                    read_snap: Self::acl_snapshot_for(&parsed, read_snap),
+                    parsed_relations: &hits.recorded_names(),
+                },
+            )?;
+        }
+        Ok(parsed)
+    }
+
+    /// [`Self::parse_tokens_gated`] の構文解析部（未束縛 `GRANT`／`REVOKE` のエラー正規化を持つ）。
+    fn parse_tokens_gated_grant_aware(
         &self,
         tokens: Vec<crate::sql::lexer::Token>,
         session: &crate::sql::mode::SessionState,
         resolver: Option<crate::sql::relation_name::SchemaResolver<'_>>,
         read_snap: Option<&redb::ReadTransaction>,
+        hits: &crate::sql::temp_catalog::RelationHits,
     ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
         // SQL-40（Issue #1965）: 現在ロール未束縛のセッションの `GRANT`／`REVOKE` は、状態依存の
         // 検証（SCHEMA の名前解決 `3F000`・`search_path` ゲート `42P01` 等）の結果を示さず `42501` に
@@ -5405,7 +5468,7 @@ impl EngineCore {
         // Issue #2236: `ALTER ... OWNER TO` も同じ契約にする。運用者権限も束縛ロールも持たないセッションには、
         // SCHEMA 名の解決 `3F000` 等で対象の有無を示さず、権限ゲートと同じ `42501` を返す。
         let owner_head = crate::sql::allowlist::is_alter_owner_statement(&tokens);
-        let result = self.parse_tokens_gated_core(tokens, session, resolver, read_snap);
+        let result = self.parse_tokens_gated_core(tokens, session, resolver, read_snap, hits);
         if grant_head || owner_head {
             if let Err(e) = &result {
                 let unprivileged = if grant_head {
@@ -5428,13 +5491,14 @@ impl EngineCore {
         result
     }
 
-    /// [`Self::parse_tokens_gated`] の本体（未束縛 `GRANT`／`REVOKE` のエラー正規化を持たない）。
+    /// [`Self::parse_tokens_gated_grant_aware`] の本体（未束縛 `GRANT`／`REVOKE` のエラー正規化を持たない）。
     fn parse_tokens_gated_core(
         &self,
         tokens: Vec<crate::sql::lexer::Token>,
         session: &crate::sql::mode::SessionState,
         resolver: Option<crate::sql::relation_name::SchemaResolver<'_>>,
         read_snap: Option<&redb::ReadTransaction>,
+        hits: &crate::sql::temp_catalog::RelationHits,
     ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
         // 標準 SQL の行数制限句の正規化は、参照ゲート・一時カタログ走査より前に行う（Issue #1793）。
         // 正規化が `0A000`（入れ子・非 SELECT の `WITH TIES`）で失敗した場合も、`search_path` が
@@ -5453,12 +5517,12 @@ impl EngineCore {
         };
         // 実効 `search_path` に `public` が含まれる既定のセッションは何も足さない（追加コストなし）。
         if !session.search_path_hides_public() {
-            return self.parse_tokens_gated_inner(tokens, session, resolver, read_snap);
+            return self.parse_tokens_gated_inner(tokens, session, resolver, read_snap, hits);
         }
         // TABLE-27・Issue #1715: `public` が見えないセッションでは、一時表以外の未修飾のテーブル参照を
         // `42P01` にする。判定順は構文エラー `42601` → 参照ゲート `42P01` → その他の検証エラー。
         let gate = crate::sql::search_path::check_unqualified_refs(session, &tokens, &[]);
-        let parsed = self.parse_tokens_gated_inner(tokens, session, resolver, read_snap);
+        let parsed = self.parse_tokens_gated_inner(tokens, session, resolver, read_snap, hits);
         match (parsed, gate) {
             (Err(e), _) if e.wire_code() == "42601" => Err(e),
             (_, Err(gate_err)) => Err(gate_err),
@@ -5473,10 +5537,11 @@ impl EngineCore {
         session: &crate::sql::mode::SessionState,
         resolver: Option<crate::sql::relation_name::SchemaResolver<'_>>,
         read_snap: Option<&redb::ReadTransaction>,
+        rec: &crate::sql::temp_catalog::RelationHits,
     ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
         let temp = session.temp_tables();
         if temp.is_empty() {
-            return self.parse_tokens_r(tokens, resolver, read_snap);
+            return self.parse_tokens_recorded(tokens, resolver, read_snap, rec);
         }
         // `public.<一時表の名前>` は永続側の関係を指すため、裸の名前へ解決すると一時表に化ける。
         // 解決より前に拒否する（TABLE-27・Issue #1714。fail-closed）。
@@ -5530,7 +5595,7 @@ impl EngineCore {
             return self.route_drop_index(tokens, session, resolver);
         }
         if !crate::sql::temp_catalog::tokens_reference_temp(&tokens, temp) {
-            return self.parse_tokens_r(tokens, resolver, read_snap);
+            return self.parse_tokens_recorded(tokens, resolver, read_snap, rec);
         }
         self.route_temp_statement(tokens, session, resolver)
     }
@@ -5690,6 +5755,18 @@ impl EngineCore {
 
     /// [`Self::parse_tokens`] のテナント SCHEMA 解決つき版（`resolver` は ctx を持つ入口だけが渡す。
     /// TABLE-27・Issue #1717）。`None` ならテナント SCHEMA の修飾は `3F000`。
+    fn parse_tokens_recorded(
+        &self,
+        tokens: Vec<crate::sql::lexer::Token>,
+        resolver: Option<crate::sql::relation_name::SchemaResolver<'_>>,
+        read_snap: Option<&redb::ReadTransaction>,
+        hits: &crate::sql::temp_catalog::RelationHits,
+    ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
+        let temp = crate::sql::temp_catalog::SessionTempCatalog::default();
+        self.parse_tokens_in(tokens, &temp, hits, self.ledger_mode, resolver, read_snap)
+    }
+
+    /// 同上（参照先の記録を持たない版）。
     fn parse_tokens_r(
         &self,
         tokens: Vec<crate::sql::lexer::Token>,
@@ -5792,7 +5869,8 @@ impl EngineCore {
             temp,
             hits.temp_cell(),
         )
-        .with_persistent_hit(hits.persistent_cell());
+        .with_persistent_hit(hits.persistent_cell())
+        .with_recorded_names(hits.names_cell());
         // 引用付き `NULL`（`Token::QuotedNull`）を値位置で区別する必要があるのは
         // INSERT／UPDATE／CREATE／ALTER（`WITH` 先頭の DML 含む）の許可リスト検証だけ
         // （Issue #1524）。それ以外の文種は従来どおり `Ident` として扱う（識別子位置の
@@ -5904,7 +5982,8 @@ impl EngineCore {
                 temp,
                 hits.temp_cell(),
             )
-            .with_persistent_hit(hits.persistent_cell());
+            .with_persistent_hit(hits.persistent_cell())
+            .with_recorded_names(hits.names_cell());
             // 構造検証 → 存在確認の順序は `validate_insert_tokens_with_limit` と同じ。INTO の名前が
             // 表でなくビューなら、自動更新可能なものに限りビューへの INSERT として受理する
             // （TABLE-43・Issue #1671。書き換えは Execute 時）。
@@ -6445,7 +6524,8 @@ impl EngineCore {
                     temp,
                     hits.temp_cell(),
                 )
-                .with_persistent_hit(hits.persistent_cell());
+                .with_persistent_hit(hits.persistent_cell())
+                .with_recorded_names(hits.names_cell());
                 let snap_validated = crate::sql::allowlist::validate_session_with_tokens(
                     &tokens,
                     &snap_lookup,
@@ -6485,6 +6565,22 @@ impl EngineCore {
             SessionWith::Statement(Statement::Explain(_)) => true,
             SessionWith::Statement(Statement::Select(s)) => s.using_plan().is_some(),
             SessionWith::Statement(_) => false,
+        }
+    }
+
+    /// 読み取り権限の検査（ACL・実在の照会）に使うスナップショットを、解析・実行が参照するカタログに揃える。
+    /// 最新の確定カタログで解析・実行される文（`USING PLAN` の SELECT・`EXPLAIN`。
+    /// [`Self::validated_runs_on_latest_catalog`]）は、`BEGIN` 時点のスナップショットではなく最新で判定する
+    /// （`None`）。旧スナップショットの ACL で、`BEGIN` 後に作り直された同名の表を読めてしまわないため。
+    pub(crate) fn acl_snapshot_for<'a>(
+        parsed: &ParsedSql,
+        read_snap: Option<&'a redb::ReadTransaction>,
+    ) -> Option<&'a redb::ReadTransaction> {
+        use crate::sql::allowlist::Statement;
+        match parsed.peel_session_route() {
+            ParsedSql::Statement(Statement::Explain(_)) => None,
+            ParsedSql::Statement(Statement::Select(s)) if s.using_plan().is_some() => None,
+            _ => read_snap,
         }
     }
 
@@ -6906,6 +7002,7 @@ impl EngineCore {
                 public_qualified,
                 qualified_positions,
                 create_public,
+                parsed_relations: Vec::new(),
                 route: temp_route::PreparedRoute::Plain,
             });
         }
@@ -6967,6 +7064,7 @@ impl EngineCore {
         // 仮値での定数畳み込みは値依存エラー（0 除算等）を Bind まで遅延する
         // （`VALUES (1, 10 / $1)` の実値を Bind で受けるため。Parse は構造と型だけ検証）。
         let dummy_tokens = crate::sql::params::substitute_dummy_typed(&tokens, &kinds);
+        let parse_hits = crate::sql::temp_catalog::RelationHits::default();
         let dummy_parsed = {
             let positions: Vec<usize> = tokens
                 .iter()
@@ -6976,7 +7074,8 @@ impl EngineCore {
                 .collect();
             let _guard = crate::sql::const_expr::defer_param_value_errors(positions);
             crate::datetime::reset_session_time_zone_read();
-            let mut parsed = self.parse_tokens(dummy_tokens)?;
+            let dummy_tokens = Self::normalize_row_count_clauses(dummy_tokens)?;
+            let mut parsed = self.parse_tokens_recorded(dummy_tokens, None, None, &parse_hits)?;
             // 解決済みトークンの再 parse は `public.` 修飾の情報を持たない。`$n` を含まない文の
             // 実行は `dummy_parsed` を複製するため、ここで保持して実行時の衝突検査を通す。
             attach_public_qualified(&mut parsed, &public_qualified, create_public);
@@ -7023,6 +7122,7 @@ impl EngineCore {
             public_qualified,
             qualified_positions,
             create_public,
+            parsed_relations: parse_hits.recorded_names(),
             route: temp_route::PreparedRoute::Plain,
         })
     }
@@ -7478,6 +7578,8 @@ impl EngineCore {
         // `bind_scan_with_dummy_flags` の
         // いずれが呼ばれても同じ配列を共有する）。
         Self::check_prepared_for_session(session, prepared)?;
+        // SQL-40・Issue #1967: 権限の無い主体に列の型情報を返さない（fail-closed）。
+        self.require_prepared_read_privileges(session, prepared, &prepared.dummy_parsed, None)?;
         self.describe_parsed_in_session_impl(
             session,
             &prepared.dummy_parsed,
@@ -8401,7 +8503,7 @@ impl EngineCore {
         let parsed = {
             let _session_tz_scope = session_time_zone_scope(session);
             let resolver = self.schema_resolver_for(ctx, session);
-            self.parse_tokens_gated(tokens, session, Some(&resolver), None)?
+            self.parse_tokens_gated(tokens, session, ctx.tenant_id(), Some(&resolver), None)?
         };
         // 一時カタログに対する細かいゲートは上の parse で通過済みのため、粗いゲートを持たない
         // 内部版を呼ぶ（TABLE-44・Issue #1681）。
@@ -8541,7 +8643,13 @@ impl EngineCore {
                 } else {
                     None
                 };
-                self.parse_tokens_gated(tokens, session, Some(&resolver), read_snap)
+                self.parse_tokens_gated(
+                    tokens,
+                    session,
+                    ctx.tenant_id(),
+                    Some(&resolver),
+                    read_snap,
+                )
             })();
             match parsed {
                 Ok(parsed) => parsed,
@@ -9689,6 +9797,8 @@ impl EngineCore {
         let result = (|| {
             let snap = Self::describe_snapshot(txn)?;
             Self::check_prepared_for_session(session, prepared)?;
+            // SQL-40・Issue #1967: 権限の無い主体に列の型情報を返さない（fail-closed）。
+            self.require_prepared_read_privileges(session, prepared, &prepared.dummy_parsed, snap)?;
             // カーソル文は txn の開いているカーソルから列を引く（従来の経路）。
             if matches!(prepared.dummy_parsed, ParsedSql::Cursor(_)) {
                 return self.describe_parsed_in_txn_unscrubbed(
@@ -12121,6 +12231,7 @@ impl EngineCore {
             crate::sql::allowlist::SqlSurfaceError,
         >,
     {
+        self.require_table_select_privilege(ctx, session, table)?;
         let _function_acl_scope = self.function_acl_scope(ctx, session)?;
         let (read_txn, schema) = self.read_txn_with_schema(table)?;
         let bound = bind(&schema, session.udfs())?;
@@ -12183,6 +12294,7 @@ impl EngineCore {
         // テーブル解決後に初めて解析することで、テーブル未存在＋ mode 値不正の
         // 要求で `42P01` が優先される SQL テキスト経由と同一の fail-closed
         // 順序を保つ。
+        self.require_table_select_privilege(ctx, session, table)?;
         let validated_limit =
             crate::sql::parser::validate_search_limit_with(limit, &self.result_limits)?;
         crate::sql::allowlist::validate_using_plan_question(question)?;
@@ -13339,6 +13451,7 @@ impl EngineCore {
         ) -> Result<crate::sql::explain::ExplainShape, E>,
         E: From<crate::sql::allowlist::SqlSurfaceError>,
     {
+        self.require_table_select_privilege(ctx, session, table)?;
         let _function_acl_scope = self.function_acl_scope(ctx, session)?;
         self.run_explain_plan(ctx, session, table, question, mode_literal, None, bind)
     }
@@ -13380,6 +13493,7 @@ impl EngineCore {
         )
             -> Result<crate::sql::parser::BoundScan, crate::sql::allowlist::SqlSurfaceError>,
     {
+        self.require_table_select_privilege(ctx, session, table)?;
         let _function_acl_scope = self.function_acl_scope(ctx, session)?;
         let (read_txn, schema) = self.read_txn_with_schema(table)?;
         let bound = bind(&schema, session.udfs())?;
@@ -13415,6 +13529,7 @@ impl EngineCore {
             crate::sql::allowlist::SqlSurfaceError,
         >,
     {
+        self.require_table_select_privilege(ctx, session, table)?;
         let _function_acl_scope = self.function_acl_scope(ctx, session)?;
         let (read_txn, schema) = self.read_txn_with_schema(table)?;
         let bound = bind(&schema, session.udfs())?;
@@ -13454,7 +13569,7 @@ impl EngineCore {
     /// テナント判定に使わない。
     pub fn explain_bound_search_in_session<F>(
         &self,
-        _ctx: &PolicyContext,
+        ctx: &PolicyContext,
         session: &crate::sql::mode::SessionState,
         table: &str,
         bind: F,
@@ -13468,6 +13583,7 @@ impl EngineCore {
             crate::sql::allowlist::SqlSurfaceError,
         >,
     {
+        self.require_table_select_privilege(ctx, session, table)?;
         let (read_txn, schema) = self.read_txn_with_schema(table)?;
         let bound = bind(&schema, session.udfs())?;
         if bound.table() != table {
@@ -13489,7 +13605,7 @@ impl EngineCore {
     /// と同じ。
     pub fn explain_bound_scan_in_session<F>(
         &self,
-        _ctx: &PolicyContext,
+        ctx: &PolicyContext,
         session: &crate::sql::mode::SessionState,
         table: &str,
         bind: F,
@@ -13501,6 +13617,7 @@ impl EngineCore {
         )
             -> Result<crate::sql::parser::BoundScan, crate::sql::allowlist::SqlSurfaceError>,
     {
+        self.require_table_select_privilege(ctx, session, table)?;
         let (read_txn, schema) = self.read_txn_with_schema(table)?;
         let bound = bind(&schema, session.udfs())?;
         if bound.table() != table {
@@ -13525,7 +13642,7 @@ impl EngineCore {
     /// と同じ。
     pub fn explain_bound_aggregate_in_session<F>(
         &self,
-        _ctx: &PolicyContext,
+        ctx: &PolicyContext,
         session: &crate::sql::mode::SessionState,
         table: &str,
         bind: F,
@@ -13539,6 +13656,7 @@ impl EngineCore {
             crate::sql::allowlist::SqlSurfaceError,
         >,
     {
+        self.require_table_select_privilege(ctx, session, table)?;
         let (read_txn, schema) = self.read_txn_with_schema(table)?;
         let bound = bind(&schema, session.udfs())?;
         if bound.table() != table {

@@ -880,7 +880,8 @@ pub(crate) fn collect_cte_scopes(tokens: &[Token]) -> Vec<CteScope> {
         }
         let scope_end = enclosing_scope_end(tokens, start);
         let mut j = start + 1;
-        if ident_is(tokens.get(j), "RECURSIVE") {
+        let recursive = ident_is(tokens.get(j), "RECURSIVE");
+        if recursive {
             j += 1;
         }
         while let Some(name) = tokens.get(j).and_then(unqualified_ident_name) {
@@ -904,13 +905,16 @@ pub(crate) fn collect_cte_scopes(tokens: &[Token]) -> Vec<CteScope> {
             if !matches!(tokens.get(j), Some(Token::Punct('('))) {
                 break;
             }
+            let body_open = j;
             let Some(after) = skip_group(tokens, j) else {
                 break;
             };
             j = after;
             out.push(CteScope {
                 name: name.to_string(),
-                visible_from: after,
+                // `WITH RECURSIVE` の CTE は自身の本文（再帰項）から自己参照できるため、本文の開き括弧から可視
+                // にする（同名の実テーブルへの ACL 検査を誤って掛けない）。
+                visible_from: if recursive { body_open } else { after },
                 visible_to: scope_end,
             });
             if matches!(tokens.get(j), Some(Token::Punct(','))) {

@@ -30,7 +30,7 @@ Phase 6 の共通ゲートへ移行する前に結線漏れと README の再陳�
 | 2. DDL 実行権限 | `--ddl-allowed-users` で列挙した username の接続だけが DDL を実行できる。判定点は `sql::privilege_gate::check` ただ 1 つ（`sql::ddl::require_ddl_permission` はそのファサード。カタログ照会なし・既定拒否 `42501`）。SQL 文から権限ビットを変える経路は無い | 下表「権限ビットの注入点」 |
 
 ロールと権限のカタログ（#1961）と `GRANT`／`REVOKE` の SQL 文（#1965）は実装済みだが、現在ロールを束縛する認証層（#1971）と
-権限検査ゲート（#1966〜#1969）は未実装のため、権限はまだ DML・SELECT・COPY の判定に効かない。wire の全セッションは現在ロールが未束縛で、
+権限検査ゲートは DDL（#1966）と読み取り系の文（#1967）まで実装済みで、DML（#1968）・COPY（#1969）にはまだ効かない。wire の全セッションは現在ロールが未束縛で、
 `GRANT`／`REVOKE` は対象・ロールの有無を問わず `42501` になる（後述）。所有者の概念は #2236 で追加済み（`object_owners`。`ddl_allowed` の所有者相当に加算）。
 DDL 権限は全テナント共有のカタログを変更する操作の運用者権限であり、軸 1 とは独立に評価される。
 
@@ -104,6 +104,21 @@ SQL 表層のディスパッチは `EngineCore::execute_parsed_statement`（自�
 - **`CREATE INDEX` の特例**: 組み込み以外の関数を含む索引式（`pending_user_function`）は、権限の無いセッションには
   カタログを引かず従来の `0A000` を返し、権限があればゲート後に自テナントの UDF カタログで判定する（`sql::index_udf`）
 
+### 読み取り系の文（SELECT 権限。#1967）
+
+現在ロールが束縛済みのセッションにだけ適用する（未束縛・運用者権限のセッションはトークン走査も ACL の照会もしない）。
+判定は `privilege_gate::check`（`PrivilegeTarget::Relation`）、収集と ACL 照会は `sql/privilege_gate/read.rs`。
+
+| 経路 | 検査する時点 | 実装 |
+| ---- | ------------ | ---- |
+| 簡易クエリ（`execute_sql_in_session`・`execute_sql_in_txn`）・PL/pgSQL の埋め込み SQL | 構文解析・名前解決の成功直後、実行より前 | `core.rs` の `parse_tokens_gated` |
+| `DECLARE` | DECLARE の時点（FETCH／CLOSE は再検査しない。[sql-cursor.md](sql-cursor.md) §1） | 同上（`ParsedSql::Cursor`） |
+| `EXPLAIN` | 計画を作る前に、対象の文と同じ検査 | 同上（`Statement::Explain`） |
+| 行ロック句つき SELECT | SELECT に加えて UPDATE | 同上（`ParsedSql::LockingSelect`） |
+| 拡張クエリ Parse・Bind・Describe | Parse と Describe で拒否し、Bind は束縛済みのセッションで毎回再検査する | `core/temp_route.rs` の `require_prepared_read_privileges`、wire の `needs_session_revalidation`・Bind の再検証条件 |
+| HTTP の bound 読み取り API | 入口で、束縛・計画・読み取りより前 | `EngineCore::require_table_select_privilege` |
+| ビュー・matview | それ自身の SELECT だけ（基底表は検査しない） | 収集の対象はトークン上の名前のみ |
+
 ## ゲート対象外・特例の経路
 
 | 経路 | 扱い | 根拠・理由 |
@@ -113,7 +128,7 @@ SQL 表層のディスパッチは `EngineCore::execute_parsed_statement`（自�
 | `setval`／`lastval` | `SequenceFunction`。DDL ゲートなし。ACL で判定すべき主体（束縛済みかつ所有者相当でない）には SEQUENCE の ACL を判定する（`setval`=UPDATE、`lastval`=USAGE か SELECT。Issue #2235） | 作用が呼び出し元テナントに閉じる（コード中の設計記録参照）。判定は `sql/object_privilege.rs` |
 | `nextval`／`currval`（INSERT の VALUES・DEFAULT） | `tenant::assign_sequence_values` が採番の前に SEQUENCE の ACL を判定する（`nextval`=USAGE か UPDATE、`currval`=USAGE か SELECT）。SERIAL・IDENTITY・`OWNED BY` 済みの列 DEFAULT の暗黙の採番は免除（SQL-40 (6)(a)）。採番文脈（`SequenceScope`）が主体を運び、セッションの無い経路は検査しない | Issue #2235（設計記録 `role-privilege-model.md` §14） |
 | UDF・`LANGUAGE sql\|plpgsql` 関数の呼び出し | 文の実行区間の頭で `core.rs::function_acl_scope` が EXECUTE を持たないカタログ由来の関数キーの集合を張り、解決点（`udf_call::bind_call` の宣言的 UDF 展開・`routine_fold` のルーチン呼び出し・`function_scan::plan`）で `42501` にする。新規の関数は PUBLIC が EXECUTE を持つ（既定） | Issue #2235（§14 S5・S7）。wire-server が core の外で行う INSERT 値・UPDATE／DELETE 述語の束縛は未結線（既知の差） |
-| DML・SELECT・カーソル・COPY・TRUNCATE・検索 | DDL ゲートなし。軸 1（テナント境界・可視性）のみで制御 | 現状はロール別権限を持たない |
+| DML・COPY・TRUNCATE | DDL ゲートなし。軸 1（テナント境界・可視性）のみで制御 | DML は #1968、COPY は #1969 で結線する（読み取り側の収集関数 `privilege_gate/read.rs` を再利用） |
 | UDF の呼び出し | DDL 権限の無いセッションでも呼べる（ACL の EXECUTE は別軸で、束縛ロールにだけ課す。次の行）。本体は呼び出し元の権限・可視性で実行し `SECURITY DEFINER` は拒否 | 根拠テスト `crates/engine/tests/sql_t40_up/sql67_function_privileges.rs` |
 | `search_path` の参照ゲート | `sql/search_path.rs` の `is_ddl_head`（先頭が CREATE／DROP／ALTER／REFRESH）かつ権限なしのときは参照走査を飛ばし、存在判定より前に `42501` を返す契約を保つ | 存在オラクル防止 |
 | NoSQL（HTTP `POST /v1/query`） | `create_table`／`alter_table`／`drop_table` の op だけがトークン列として SQL 表層と同じ実行器へ到達する（`http/query/ddl.rs`。第 2 の判定は無い）。それ以外の DDL 相当の op は `classify_op` の許可リストで `0A000` | `http/query/gate.rs`・`op.rs` |
@@ -165,6 +180,8 @@ Issue #1972 の担当（RLS-12 ポインタ）。
 - [ ] 権限なしで対象の有無（存在する・しない・他テナント所有）を問わず同じ `42501` になるテストを、既存の根拠テストの型に
   倣って追加する（ビヘイビア ID はポインタで紐付ける）
 - [ ] 権限ビットを SQL 文から変える経路を作らない。テナント境界（`PolicyContext`）を緩めない
+- [ ] 読み取り系の文種（`ParsedSql`・`Statement` の新しい variant）は `privilege_gate::read::classify` の網羅 `match` に分類を足し、
+  読み取りなら SELECT を要求する側へ、そうでなければ対象外の理由をコメントへ記録する
 - [ ] 本書の検査経路一覧・README の `--ddl-allowed-users` 節・`implementation-status.md` を更新する
 
 ## 移行先（未実装・ポインタのみ）
@@ -174,7 +191,7 @@ Issue #1972 の担当（RLS-12 ポインタ）。
 | ロール・権限モデルの ADR（共通ゲートへ `require_ddl_permission` を寄せる方針を含む） | #1960（PR #2828 で提案中） |
 | 権限検査の共通ゲート導入と DDL 経路への結線 | #1966（実装済み。`sql/privilege_gate.rs`） |
 | ロールのカタログ・`CREATE ROLE` 等 | #1959 配下（#1961〜#1963・#2232・#2233） |
-| GRANT／REVOKE・DML／検索／COPY 経路への結線 | #1964 配下（#1965〜#1969・#2234〜#2237） |
+| GRANT／REVOKE・DML／検索／COPY 経路への結線 | #1964 配下（#1965〜#1969・#2234〜#2237）。SELECT・カーソル・検索は #1967 で実装済み（`sql/privilege_gate/read.rs`）、DML は #1968、COPY は #1969 |
 | 認証済みユーザーとロールの紐付け・users ファイルのブートストラップ化 | #1971・#2238 |
 | 存在オラクルの網羅試験 | #1972 |
 
@@ -187,6 +204,7 @@ Issue #1972 の担当（RLS-12 ポインタ）。
 | コマンド | 記録時点の結果 |
 | -------- | -------------- |
 | `git grep -n 'privilege_gate::require_ddl(' -- crates/engine/src` | `core.rs` の DDL 腕（`CreateIndex` の特例で 1 腕あたり 2 呼び出し。`CreateFunction` は自動コミットの腕のみ、`DropFunction` の自動コミット側は `sql/udf_ddl.rs`）。束ねた Tx 内の腕は `require_server_ddl` |
+| `git grep -n 'privilege_gate::read::' -- crates/engine/src` | `core.rs`（`parse_tokens_gated`・bound 読み取り API の入口）と `core/temp_route.rs`（拡張クエリ）。#1967 の記録時点 |
 | `git grep -n 'ddl_allowed()' -- crates/engine/src` | `sql/privilege_gate.rs`（`Principal::from_session`）と `sql/mode.rs`（定義）、テストのみ |
 | `git grep -n 'allow_ddl()' -- crates/wire-server/src` | 本番注入点は `handshake.rs` と `http/query/ddl.rs`。`extended_query.rs` は `#[cfg(test)]` |
 | `git grep -n '42501' -- crates/engine/src crates/wire-server/src` | 権限ゲート以外の発生源は上表のとおり |

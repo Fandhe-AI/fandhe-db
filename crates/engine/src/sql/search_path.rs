@@ -253,10 +253,20 @@ fn is_syntax_keyword_here(tokens: &[Token], idx: usize) -> bool {
         return false;
     };
     if w.eq_ignore_ascii_case("IF") {
-        return is(Some(idx.saturating_add(1)), "EXISTS") || is(Some(idx.saturating_add(1)), "NOT");
+        // `IF [NOT] EXISTS` は DDL（`CREATE`／`DROP`／`ALTER`）の句。SELECT の `FROM "if" exists`（`exists` は
+        // 暗黙の別名）のように、それ以外の文では実表 `if` の参照として残す（権限検査から外さない）。
+        return ["CREATE", "DROP", "ALTER"].iter().any(|k| is(Some(0), k))
+            && (is(Some(idx.saturating_add(1)), "EXISTS")
+                || is(Some(idx.saturating_add(1)), "NOT"));
     }
     if w.eq_ignore_ascii_case("ONLY") {
-        return next_is_name;
+        // `ONLY` を修飾語として受理する文は `TRUNCATE`・`LOCK`・`ALTER`（所有者変更）・DML だけ。SELECT の
+        // `FROM` 句などでは構文語ではなく関係名（`FROM "only" AS x` の実表 `only`）であり、字句上は引用の
+        // 有無を区別できないため、それ以外の文では常に関係名として残す（権限検査から外さない。fail-closed）。
+        return next_is_name
+            && ["TRUNCATE", "LOCK", "ALTER", "DELETE", "UPDATE", "INSERT"]
+                .iter()
+                .any(|k| is(Some(0), k));
     }
     if w.eq_ignore_ascii_case("TABLE") {
         // `LOCK TABLE <表>` の `TABLE` も構文語（Issue #1958。文頭の `LOCK` の直後だけ）。
@@ -319,6 +329,22 @@ pub(crate) fn resolved_relation_names(tokens: &[Token]) -> Vec<String> {
 /// 未修飾のテーブル参照の名前集め（参照ゲートの入力）。`skip` はゲート対象外のトークン添字
 /// （準備済み文で `public.` 修飾を外した位置）。トークン列は書き換えない。
 fn unqualified_relation_refs(tokens: &[Token], skip: &[usize]) -> Vec<GateRef> {
+    relation_refs(tokens, skip, false)
+}
+
+/// 読み取り系の権限検査（#1967。`sql::privilege_gate::read`）が使う参照先の名前集め。名前解決器で修飾を
+/// 解決した後のトークン列を受け取り、解決済みの内部キー（`#<id>.<name>`）も含めて返す（`search_path` の
+/// ゲートと同じ位置判定・構文語・CTE 名・表関数の除外規則を共有する。第 2 の走査器は作らない）。
+pub(crate) fn resolved_relation_ref_names(tokens: &[Token]) -> Vec<String> {
+    relation_refs(tokens, &[], true)
+        .into_iter()
+        .map(|r| r.name)
+        .collect()
+}
+
+/// [`unqualified_relation_refs`] と [`resolved_relation_ref_names`] の共通本体。`keep_internal_keys` が
+/// 真なら名前解決済みの内部キーを除外しない。
+fn relation_refs(tokens: &[Token], skip: &[usize], keep_internal_keys: bool) -> Vec<GateRef> {
     let walk = crate::sql::relation_name::relation_positions(tokens);
     let ctes = crate::sql::relation_name::collect_cte_scopes(tokens);
     // `DROP`／`ALTER`／`REFRESH` のオブジェクト名は `object_ddl_names` が（索引かどうかの区別つきで）
@@ -341,7 +367,7 @@ fn unqualified_relation_refs(tokens: &[Token], skip: &[usize]) -> Vec<GateRef> {
         // 名前解決器が `schema.name` の修飾を解決して置き換えた内部キー（`#<id>.<name>`）は修飾済みの
         // 参照なので、`search_path` による未修飾名の判定対象にしない（キーを作れるのは解決器だけ。
         // 字句解析器は `#` を含む識別子を作らない。Issue #1717）。
-        if name.starts_with('#') {
+        if !keep_internal_keys && name.starts_with('#') {
             continue;
         }
         // 構文語（`IF`・`ONLY`・`LATERAL` 等）は構文位置で判定する。CTE 名はその参照位置から実際に
@@ -379,7 +405,7 @@ fn unqualified_relation_refs(tokens: &[Token], skip: &[usize]) -> Vec<GateRef> {
     out.extend(
         object_ddl
             .into_iter()
-            .filter(|(i, r)| !skip.contains(i) && !r.name.starts_with('#'))
+            .filter(|(i, r)| !skip.contains(i) && (keep_internal_keys || !r.name.starts_with('#')))
             .map(|(_, r)| r),
     );
     out
@@ -693,6 +719,16 @@ mod tests {
     }
 
     #[test]
+    fn recursive_cte_self_reference_is_not_a_relation_ref() {
+        let sql = "WITH RECURSIVE docs(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM docs WHERE n<3) \
+                   SELECT n FROM docs";
+        assert!(names(sql).is_empty());
+        // 非再帰 CTE の本文の同名参照は実テーブルのまま数える。
+        let sql = "WITH docs AS (SELECT 1 FROM docs) SELECT * FROM docs";
+        assert_eq!(names(sql), vec!["docs".to_string()]);
+    }
+
+    #[test]
     fn default_value_displays_as_user_then_public() {
         assert_eq!(SearchPath::default().display(), "\"$user\", public");
     }
@@ -853,7 +889,11 @@ mod tests {
         assert_eq!(names("TRUNCATE a, ONLY b"), vec!["a", "b"]);
         assert_eq!(names("TRUNCATE public.a, ONLY b"), vec!["b"]);
         assert_eq!(names("TRUNCATE a, ONLY b, ONLY c"), vec!["a", "b", "c"]);
-        assert_eq!(names("SELECT id FROM a, ONLY b LIMIT 5"), vec!["a", "b"]);
+        // SELECT の `FROM` 句では `ONLY` は構文語ではなく関係名（実表 `only` の可能性を残す）。
+        assert_eq!(
+            names("SELECT id FROM a, ONLY b LIMIT 5"),
+            vec!["a", "ONLY", "b"]
+        );
         // 直前が式の語に見える引用付き識別子（表名・索引名・別名）でも、導入語の後の表名は残る。
         assert_eq!(names("CREATE INDEX \"is\" ON t (a)"), vec!["t"]);
         assert_eq!(names("CREATE INDEX \"in\" ON t (a)"), vec!["t"]);

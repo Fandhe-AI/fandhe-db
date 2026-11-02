@@ -634,6 +634,221 @@ impl Storage {
     }
 }
 
+/// 読み取り系の権限検査（#1967。`sql::privilege_gate::read` から呼ばれる）の ACL 照会。`keys` の各 relation
+/// （表・ビュー・matview のキー）について、存在しなければ `None`、存在すれば `tenant` の表単位の ACL のうち
+/// 付与先が `role_id` の INHERIT 閉包のロールか PUBLIC の行の権限ビットの和を返す。列単位の行は含めない（暫定の fail-closed。
+/// #2081）。1 つの read txn で全件を引く。形が不正なキーは relation として存在しない扱い（`None`。
+/// 誤分類された識別子を拒否側へも利用者エラーへも倒さない）。ACL 行の破損・件数超過は `Err`（素通しにしない）。
+pub(crate) fn relation_grant_bits_in_txn<R: ReadSource>(
+    src: &R,
+    tenant: &str,
+    keys: &[String],
+    role_id: u64,
+) -> Result<Vec<Option<u16>>> {
+    validate_tenant(tenant)?;
+    // 同じスナップショットで INHERIT が真の辺だけの閉包を求め、到達するロール（自身を含む）への付与と
+    // 所有者の暗黙権限を合算する（INHERIT FALSE の辺・他テナントのロールには波及しない）。PUBLIC の予約
+    // ID 0 は主体になれないため閉包を求めず、PUBLIC の付与だけを数える。
+    let roles: Vec<u64> = if role_id == PUBLIC_GRANTEE_ID {
+        Vec::new()
+    } else {
+        super::role::graph::effective_roles_in_txn(
+            src,
+            tenant,
+            role_id,
+            super::role::graph::Mode::Inherit,
+        )?
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect()
+    };
+    let mut out = Vec::with_capacity(keys.len());
+    for key in keys {
+        if validate_relation_key(key).is_err() || !relation_exists_in_txn(src, key)? {
+            out.push(None);
+            continue;
+        }
+        let entries =
+            list_acl_for_object_in_txn(src, tenant, &PrivilegeObject::Table(key.clone()))?;
+        let bits = entries
+            .iter()
+            .filter(|e| e.grantee_id == PUBLIC_GRANTEE_ID || roles.contains(&e.grantee_id))
+            .fold(0u16, |acc, e| acc | e.privileges);
+        // 所有者は自身の relation の全権限を暗黙に持つ（`OWNER TO` は自己付与行を作らない・消す）。
+        // 閉包内のいずれかのロールが所有者なら、同じ読み取りスナップショットで確認して加算する。
+        let owner_id = owner::owner_of_in_txn(src, tenant, &PrivilegeObject::Table(key.clone()))?;
+        let bits = if owner_id.is_some_and(|o| roles.contains(&o)) {
+            bits | u16::MAX
+        } else {
+            bits
+        };
+        out.push(Some(bits));
+    }
+    Ok(out)
+}
+
+/// relation の同一性（名前ではなく定義の中身。portal の失効判定用。Issue #1967）。ビュー・matview は
+/// 定義のバイト列そのものを持つため、DROP のあとに同名で別本文を作り直すと必ず別の値になる。
+/// 表は種別だけを持つ（表の行は名前で引かれ、展開済みの本文を持たない）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RelationIdentity {
+    /// 表・ビュー・matview のいずれとしても登録されていない。
+    Missing,
+    /// 実表。
+    Table,
+    /// ビュー（定義のバイト列）。
+    View(Vec<u8>),
+    /// matview（定義のバイト列）。
+    MaterializedView(Vec<u8>),
+}
+
+impl RelationIdentity {
+    /// 保持している定義のバイト数（表・不在は 0）。
+    pub(crate) fn retained_bytes(&self) -> usize {
+        match self {
+            Self::Missing | Self::Table => 0,
+            Self::View(b) | Self::MaterializedView(b) => b.len(),
+        }
+    }
+}
+
+/// `key` の [`RelationIdentity`] を `src` のスナップショットで引く。形が不正なキーは `Missing`。
+pub(crate) fn relation_identity_in_txn<R: ReadSource>(
+    src: &R,
+    key: &str,
+) -> Result<RelationIdentity> {
+    if validate_relation_key(key).is_err() {
+        return Ok(RelationIdentity::Missing);
+    }
+    match src.open_table(super::VIEWS_TABLE) {
+        Ok(t) => {
+            if let Some(v) = t.get(key)? {
+                return Ok(RelationIdentity::View(v.value().to_vec()));
+            }
+        }
+        Err(redb::TableError::TableDoesNotExist(_)) => {}
+        Err(e) => return Err(e.into()),
+    }
+    match src.open_table(super::materialized::MATERIALIZED_VIEWS_TABLE) {
+        Ok(t) => {
+            if let Some(v) = t.get(key)? {
+                return Ok(RelationIdentity::MaterializedView(v.value().to_vec()));
+            }
+        }
+        Err(redb::TableError::TableDoesNotExist(_)) => {}
+        Err(e) => return Err(e.into()),
+    }
+    match src.open_table(super::CATALOG_TABLE) {
+        Ok(t) => {
+            if t.get(key)?.is_some() {
+                return Ok(RelationIdentity::Table);
+            }
+        }
+        Err(redb::TableError::TableDoesNotExist(_)) => {}
+        Err(e) => return Err(e.into()),
+    }
+    Ok(RelationIdentity::Missing)
+}
+
+/// 同一性を取る relation の上限（ビューの入れ子を辿る探索の打ち切り。untrusted 入力で無制限に広げない）。
+const MAX_IDENTITY_RELATIONS: usize = 1024;
+
+/// 1 文の同一性として保持する定義バイト列の合計上限（ビュー・matview の定義。生成中に打ち切る）。portal ごとに
+/// 保持されるため、接続単位の保持量上限（wire-server の `MAX_BOUND_PARAM_BYTES_PER_SESSION`）より十分小さくする。
+pub(crate) const MAX_IDENTITY_BYTES: usize = 256 * 1024;
+
+/// `roots` と、そこから到達するビューの定義（入れ子の展開先。`base_relation` と本文が参照する名前）を
+/// 推移的に辿り、全 relation の [`RelationIdentity`] を同じスナップショットで返す。外側のビューの定義が
+/// 不変でも、展開先の入れ子のビューが置換されれば検知できる（Bind 時に展開済みの本文が古くなる）。
+/// 上限超過は `Err`（fail-closed）。
+pub(crate) fn relation_identity_closure_in_txn<R: ReadSource>(
+    src: &R,
+    roots: &[String],
+) -> Result<Vec<(String, RelationIdentity)>> {
+    let mut out: Vec<(String, RelationIdentity)> = Vec::new();
+    let mut total_bytes = 0usize;
+    let mut queue: Vec<String> = roots.to_vec();
+    let mut cursor = 0usize;
+    while let Some(name) = queue.get(cursor).cloned() {
+        cursor += 1;
+        if out.iter().any(|(n, _)| *n == name) {
+            continue;
+        }
+        if out.len() >= MAX_IDENTITY_RELATIONS {
+            return Err(CatalogError::ViewLimitExceeded(
+                "too many relations referenced".to_string(),
+            ));
+        }
+        let identity = relation_identity_in_txn(src, &name)?;
+        // 定義のバイト列は生成中に合計を数え、上限を超えたら保持せず拒否する（fail-closed）。
+        total_bytes = total_bytes.saturating_add(identity.retained_bytes());
+        if total_bytes > MAX_IDENTITY_BYTES {
+            return Err(CatalogError::ViewLimitExceeded(
+                "referenced relation definitions are too large".to_string(),
+            ));
+        }
+        if let RelationIdentity::View(bytes) = &identity {
+            let def = super::decode_view_def(bytes)?;
+            queue.push(def.base_relation.clone());
+            // 保存済みの本文は展開側と同じ字句解析（bool リテラルのマーカー・引用された内部キーを受理）で読む。
+            // 読めない本文は展開側でも検証に失敗する破損として、辿りきれない入れ子を見逃さず拒否する。
+            let tokens = crate::sql::lexer::tokenize_stored_view_body(&def.body_sql)
+                .map_err(|_| CatalogError::CorruptSchema("invalid stored view body".to_string()))?;
+            queue.extend(crate::sql::search_path::resolved_relation_ref_names(
+                &tokens,
+            ));
+        }
+        out.push((name, identity));
+    }
+    Ok(out)
+}
+
+impl Storage {
+    /// [`relation_identity_closure_in_txn`] を新しい読み取り Tx で呼ぶ。
+    pub(crate) fn relation_identities(
+        &self,
+        roots: &[String],
+    ) -> Result<Vec<(String, RelationIdentity)>> {
+        use redb::ReadableDatabase;
+        let rt = self.db().begin_read()?;
+        relation_identity_closure_in_txn(&rt, roots)
+    }
+}
+
+/// `key` が表・ビュー・matview のいずれかとして登録済みか（索引・SEQUENCE は relation ではない）。
+fn relation_exists_in_txn<R: ReadSource>(src: &R, key: &str) -> Result<bool> {
+    for def in [
+        super::CATALOG_TABLE,
+        super::VIEWS_TABLE,
+        super::materialized::MATERIALIZED_VIEWS_TABLE,
+    ] {
+        match src.open_table(def) {
+            Ok(t) => {
+                if t.get(key)?.is_some() {
+                    return Ok(true);
+                }
+            }
+            Err(redb::TableError::TableDoesNotExist(_)) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(false)
+}
+
+impl Storage {
+    /// [`relation_grant_bits_in_txn`] を新しい読み取り Tx で呼ぶ。
+    pub(crate) fn relation_grant_bits(
+        &self,
+        tenant: &str,
+        keys: &[String],
+        role_id: u64,
+    ) -> Result<Vec<Option<u16>>> {
+        use redb::ReadableDatabase;
+        let rt = self.db().begin_read()?;
+        relation_grant_bits_in_txn(&rt, tenant, keys, role_id)
+    }
+}
+
 /// `tenant` の ACL に、ロール `role_id` が付与先（`grantee_id`）または付与者（`grantor_id`）として載る行が
 /// あるか（`DROP ROLE` の依存検査。Issue #1962・`sql::role_ddl` から `catalog::role` 経由で呼ばれる）。
 /// PUBLIC の予約 ID 0 は対象外。テナントの範囲だけを走査するため他テナントの行は構造上引けない。件数が
