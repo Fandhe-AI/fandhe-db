@@ -1716,6 +1716,16 @@ fn dollar_tag_longer_than_limit_is_rejected() {
 // ---- RAISE と EXCEPTION（Issue #2227・SQL-70） ----
 
 #[test]
+fn raise_is_reserved_and_errcode_not_doubled() {
+    // `raise` は文キーワードなので変数名にできない（宣言時に拒否する）。
+    assert!(code_result("DECLARE raise int; BEGIN raise := 1; END").is_err());
+    // 条件名・SQLSTATE 指定と USING ERRCODE の二重指定は拒否する。
+    assert!(code_result("BEGIN RAISE unique_violation USING ERRCODE = '22012'; END").is_err());
+    assert!(code_result("BEGIN RAISE SQLSTATE '22012' USING ERRCODE = '22012'; END").is_err());
+    ok("BEGIN RAISE EXCEPTION 'x' USING ERRCODE = '22012'; END");
+}
+
+#[test]
 fn raise_forms_are_accepted() {
     for src in [
         "BEGIN RAISE NOTICE 'x'; END",

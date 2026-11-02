@@ -527,14 +527,15 @@ impl Body {
     /// とみなす）を含めば真。入れ子のブロック・分岐・ループを辿る。呼び出し元（#2217 が揮発性属性と
     /// 組み合わせて `PlCallOptions::may_write` を決める）が事前の経路決定に使う。
     pub(crate) fn may_write(&self) -> bool {
+        fn block_write(b: &Block) -> bool {
+            any_write(&b.stmts)
+                || b.handlers
+                    .as_ref()
+                    .is_some_and(|hs| hs.iter().any(|h| any_write(&h.stmts)))
+        }
         fn any_write(stmts: &[Stmt]) -> bool {
             stmts.iter().any(|s| match s {
-                Stmt::Block(b) => {
-                    any_write(&b.stmts)
-                        || b.handlers
-                            .as_ref()
-                            .is_some_and(|hs| hs.iter().any(|h| any_write(&h.stmts)))
-                }
+                Stmt::Block(b) => block_write(b),
                 Stmt::If { branches, else_ } => {
                     branches.iter().any(|(_, st)| any_write(st))
                         || else_.as_deref().is_some_and(any_write)
@@ -559,6 +560,6 @@ impl Body {
                 | Stmt::Null => false,
             })
         }
-        any_write(&self.block.stmts)
+        block_write(&self.block)
     }
 }

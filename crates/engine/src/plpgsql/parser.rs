@@ -27,7 +27,7 @@ use super::{oos_err, syn_err, too_big_err};
 /// 変数・ラベル名に使えない PL/pgSQL の予約語（PostgreSQL より厳しい。fail-closed）。
 pub(super) const RESERVED: &[&str] = &[
     "begin", "end", "if", "loop", "elsif", "elseif", "then", "declare", "else", "case", "when",
-    "while", "for", "exit", "continue", "return", "execute", "perform", "null", "in",
+    "while", "for", "exit", "continue", "return", "execute", "perform", "null", "in", "raise",
 ];
 
 /// SQL 字句解析が `Token::Keyword` 化する語（変数名にできない）。
@@ -1070,6 +1070,10 @@ impl<'a> Parser<'a> {
                 }
                 if st.using.iter().any(|(o, _)| *o == opt) {
                     return Err(syn_err("RAISE option already specified"));
+                }
+                // 条件名・`SQLSTATE` 指定と `USING ERRCODE` の二重指定は PostgreSQL 同様に拒否する。
+                if opt == RaiseOpt::Errcode && st.condition_code.is_some() {
+                    return Err(syn_err("RAISE option already specified: ERRCODE"));
                 }
                 let a = self.pos;
                 let e = self.find_end(a, &|k| matches!(k, TokKind::Punct(',')))?;
