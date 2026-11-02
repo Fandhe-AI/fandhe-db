@@ -163,6 +163,7 @@ Phase 6（#1929）では PostgreSQL 準拠のロールと GRANT／REVOKE を段�
 
 - 既定権限の表を置く。キーは `(tenant_id, 対象ロール ID, schema_id または全体, object_kind)`。
   作成時の ACL の初期化に適用する。意味は PostgreSQL 17 に揃え、細目は SQL-40 のポインタに委ねる。
+- 実装済み（Issue #2237）。実装の判断と既知の差は §19。
 
 ### D8. 権限検査の共通ゲート（#1966〜#1969）
 
@@ -323,7 +324,7 @@ PostgreSQL 17 の公開挙動と本 ADR の D5・D8・D9・D10 に従い、spec 
 | J5 | （#2232 で見直し。§10 の M6）継承（INHERIT の閉包）を見る。付与者は最良のロールを選ぶ | 当初は継承を #2232 の担当として見なかった |
 | J6 | 表と列で許す権限は `PrivilegeObject::allowed_privileges` と一致させる。対象に許されない権限（`USAGE ON TABLE` 等）と PUBLIC への GRANT OPTION は `0LP01`（`ErrorClass::InvalidGrantOperation` を追加。HTTP 射影は 400・NoSQL 表層からは到達不能） | PostgreSQL 17 と同じ SQLSTATE |
 | J7 | 付与先ロールは自テナントのカタログだけで引く。不在と「他テナントにだけ在る」は同じ `42704`・同じ文言形式（`SqlSurfaceError::UndefinedRole`。利用者が書いた名前だけを含む） | D10 |
-| J8 | 範囲外の形は構文段で固定の `0A000`（`ON SCHEMA`・`ON ALL TABLES IN SCHEMA` は #2234 で解禁。§10）: `ON SCHEMA`・`ON SEQUENCE`・`ON FUNCTION`・`ON DATABASE` などの対象種別・`ALL ... IN SCHEMA`（#2234・#2235）、`GRANTED BY`、`ALTER DEFAULT PRIVILEGES`（#2237。汎用 `ALTER` より前で分岐） | 状態に依存しない拒否なので存在オラクルにならない |
+| J8 | 範囲外の形は構文段で固定の `0A000`（`ON SCHEMA`・`ON ALL TABLES IN SCHEMA` は #2234 で解禁。§10）: `ON SCHEMA`・`ON SEQUENCE`・`ON FUNCTION`・`ON DATABASE` などの対象種別・`ALL ... IN SCHEMA`（#2234・#2235）、`GRANTED BY`（`ALTER DEFAULT PRIVILEGES` は #2237 で解禁。§19） | 状態に依存しない拒否なので存在オラクルにならない |
 | J9 | 明示トランザクション内は J1 のゲートの後で `0A000` | ACL の書き込みは独立した write txn で commit され、ROLLBACK で取り消せない |
 | J10 | ビュー・matview への表単位の GRANT／REVOKE は受理する。列リストはベース表だけで、ビュー・matview は `0A000` | ビューの列の解決（別名・式列）が未整備。fail-closed |
 | J11 | 一時表は一時カタログの振り分け（`parse_tokens_gated`）で `0A000`。ACL のキーは共有カタログの relation キーで、セッション内の一時表とは名前空間が違う | 既存の混在拒否に乗る |
@@ -817,7 +818,51 @@ Autocommit の COPY commit と単発の bound DML は、判定と書き込みが
 `SHOW`／`CANCEL PARTITIONED DML` のロール単位のジョブ所有、存在オラクルの網羅試験（#1972）。HTTP の結合テストでロールを束縛する
 手段は #2238 まで無く、HTTP の `42501` の end-to-end 検証は engine での手動束縛セッションと wire のエラー写像の単体テストで担保する。
 
-## 19. Issue #2238 実装記録（users ファイルを初期ブートストラップ専用にする）
+## 19. Issue #2237 実装記録（ALTER DEFAULT PRIVILEGES）
+
+SQL-40・RLS-12 ポインタ（SQL-40 (6)(a)）。`ALTER DEFAULT PRIVILEGES [FOR {ROLE|USER} r[, ...]] [IN SCHEMA s[, ...]]
+{GRANT|REVOKE} ... ON {TABLES|SEQUENCES|FUNCTIONS|ROUTINES|SCHEMAS}` を実装した。実行より後に作るオブジェクトの初期 ACL
+にだけ作用し、既存のオブジェクトには作用しない。構文は `sql/allowlist/grant/default_privileges.rs`、実行は
+`sql/default_privileges_ddl.rs`、カタログは `catalog/privilege/default_acl.rs`。
+
+### 保存形
+
+- 専用表 `default_acl`（遅延作成）: キーは `(tenant_id, 対象ロール ID, schema_id, object_kind, grantee_id)`、値は版 1 の
+  `privileges`・`grant_options`。`schema_id` 0 は全体（`IN SCHEMA` なし）、`grantee_id` 0 は PUBLIC。PostgreSQL の
+  `pg_default_acl` と同じく差分ではなく**結果の ACL** を保存する。結果が組み込みの既定へ戻ったら行を消す。
+- 専用表 `default_acl_init`（遅延作成）: 関数の全体エントリが組み込みの既定（PUBLIC が EXECUTE）を置き換えた印。関数の
+  `acl_init`（§16）と同じ発想で、他の種別の組み込みの既定は空なので印は要らない。
+- 未知の版・許可集合の外のビット・部分集合違反・所有者自身を付与先とする行は `CorruptSchema`（fail-closed）。
+  テナントあたり 10,000 行・1 文の組み合わせ（ロール × SCHEMA × 付与先）20,000 件を上限とし、超過は `54000`。
+
+### 判断
+
+| ID | 判断 | 理由 |
+| -- | ---- | ---- |
+| P1 | 判定順は 構文（静的拒否）→ 現在ロールの束縛（未束縛は `42501`）→ 明示 Tx 内は `0A000` → 実行者の現存 → 付与先の解決（`42704`）→ 対象ロールの解決（`42704`）→ 対象ロールへの SET 経路（`42501`）→ SCHEMA の解決（`3F000`）→ 書き込み | `GRANT` と同じ。未束縛にカタログの有無を示さない。PostgreSQL は権限語の検証（`0LP01`）を FOR ROLE より先に行うが、本実装は権限語を構文段へ寄せる（J8 と同じ）ため `0LP01` の位置だけが異なる |
+| P2 | `FOR ROLE` の認可は実行者から対象ロールへ `SET` 可能な経路があること（`can_set_role`。PostgreSQL 16 以降の `check_can_set_role` と同じ）。運用者権限は免除するが現在ロールの束縛は要る | O8 の前例に揃える。他ロールの作成物の初期 ACL を勝手に開けられない |
+| P3 | `IN SCHEMA` は SCHEMA の CREATE 権限を検査しない | PostgreSQL 17 と同じ。他テナントの SCHEMA は不在と同じ `3F000` |
+| P4 | `IN SCHEMA` の組み込み名（`public`・`pg_catalog`・`information_schema`・`pg_temp`）は構文段の `0A000` | `GRANT ON SCHEMA public`（§13 K）と揃える。既知の差 |
+| P5 | `TYPES`・`LARGE OBJECTS`・`GRANTED BY` は `0A000`。`IN SCHEMA` と `ON SCHEMAS` の併用、対象の種別に許されない権限、PUBLIC への GRANT OPTION は `0LP01`。列リストは `42601` | 範囲外・状態に依存しない拒否 |
+| P6 | 初期 ACL ＝（全体エントリがあればそれ、無ければ組み込みの既定）∪（作成先 SCHEMA のスキーマ別エントリ）。合成結果が組み込みの既定と等しければ何も書かない | PostgreSQL の `get_user_default_acl` と同じ。スキーマ別のエントリは空から始める |
+| P7 | 対象ロールは作成時に記録される所有者（§14 の予約の `role`）。作成時の適用は所有者の予約と同じ write txn に相乗りし、予約の無い（未束縛の）作成には適用しない | 作成後の別 txn だと DROP・同名再作成と競合する（O6 と同じ）。改訂前オブジェクトの所有は #2238 |
+| P8 | 適用点: CREATE TABLE・CTAS・CREATE VIEW・CREATE MATERIALIZED VIEW（TABLES。PostgreSQL と同じくビューも含む）、CREATE FUNCTION（FUNCTIONS）、CREATE SCHEMA（SCHEMAS。全体エントリだけ。`AUTHORIZATION r` では r が対象）、SERIAL／IDENTITY の暗黙 SEQUENCE と CREATE SEQUENCE（SEQUENCES）。`OR REPLACE` の置換には適用しない（新規に作ったときだけ） | 受入基準「既存には影響しない」 |
+| P9 | 関数は合成結果が組み込みの既定と異なるとき、行と `acl_init` の印を同じ txn で書く | 印の無い関数に行だけを書くと `function_privileges_in_txn` が `CorruptSchema` になる（§16 S5） |
+| P10 | SEQUENCE は所有者の機構が無いため所有者行は書かず、付与者は作成ロールにする | `grantor_id` 0 は破損。運用者権限の無い作成ロールはこの行を REVOKE できない（既知の制約。#2236 の申し送り） |
+| P11 | 所有者自身（対象ロール）を付与先とする行は保存しない | 所有者は暗黙に全権限を持つ。所有者への GRANT は no-op、REVOKE は効かない（PostgreSQL との既知の差） |
+| P12 | `DROP SCHEMA`（RESTRICT・CASCADE の両経路）は同じ txn で当該 SCHEMA の既定権限を消し、SCHEMA の空判定の対象にしない。`DROP ROLE` は既定権限の対象ロール・付与先として現れるロールを `2BP01` で拒否する | PostgreSQL の自動依存と同じ。孤児の付与を作らない |
+| P13 | `REVOKE ... CASCADE`／`RESTRICT` と `GRANT OPTION FOR` は受理する。付与者は常に対象ロールで下流の依存が生じないため、効果は GRANT OPTION ビットの扱いだけ | |
+| P14 | 明示 Tx 内は `0A000`（独立した write txn で commit され ROLLBACK で取り消せない）。wire のコマンドタグは `ALTER DEFAULT PRIVILEGES` | J9・O16 と同じ |
+
+### 既知の差・対象外
+
+- `\ddp` 相当の確認手段（`pg_default_acl` ビュー等の SQL 表層）は未実装。確認用の読み取り API は
+  `Storage::list_default_acl`（crate 内部。単体テストの確定オラクル）。SQL 表層のビューは後続の担当。
+- 一時表は ACL を持たない（J11）ため既定権限の対象外。`TYPES`・`LARGE OBJECTS` の既定権限と `IN SCHEMA` の組み込み名は `0A000`。
+- 予約の無い（未束縛の）作成と、移行済み表の擬似 ID の SEQUENCE（`sequence/migrated_identity.rs`）には適用しない。
+- 世代: 既定権限の書き込みは専用表だけを書き表の世代を進めない。作成時の適用は作成側が世代を進める。
+
+## 20. Issue #2238 実装記録（users ファイルを初期ブートストラップ専用にする）
 
 SQL-39 (3)(5)・WIRE-2・HTTP-4 ポインタ。D3・D4・D11・D12 の実装。起動時に `--users` ファイルの行から初期ロールを
 投入し、以後の認証・権限はカタログを正とする。

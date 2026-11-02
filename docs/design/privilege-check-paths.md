@@ -249,7 +249,7 @@ Issue #1972 の担当（RLS-12 ポインタ）。
 | ロール・権限モデルの ADR（共通ゲートへ `require_ddl_permission` を寄せる方針を含む） | #1960（PR #2828 で提案中） |
 | 権限検査の共通ゲート導入と DDL 経路への結線 | #1966（実装済み。`sql/privilege_gate.rs`） |
 | ロールのカタログ・`CREATE ROLE` 等 | #1959 配下（#1961〜#1963・#2232・#2233） |
-| GRANT／REVOKE・DML／検索／COPY 経路への結線 | #1964 配下（#1965〜#1969・#2234〜#2237）。SELECT・カーソル・検索は #1967 で実装済み（`sql/privilege_gate/read.rs`）、DML は #1968、COPY は #1969 |
+| GRANT／REVOKE・DML／検索／COPY 経路への結線 | #1964 配下（#1965〜#1969・#2234〜#2237）。SELECT・カーソル・検索は #1967 で実装済み（`sql/privilege_gate/read.rs`）、DML は #1968、COPY は #1969。`ALTER DEFAULT PRIVILEGES` は #2237 で実装済み（権限ゲートは置かず、現在ロールの束縛と `FOR ROLE` の SET 経路で認可。判定は `catalog/privilege/default_acl.rs`） |
 | 認証済みユーザーとロールの紐付け・users ファイルのブートストラップ化 | #1971・#2238 |
 | 存在オラクルの網羅試験 | #1972 |
 

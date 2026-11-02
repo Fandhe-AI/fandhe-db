@@ -1974,6 +1974,10 @@ pub enum ParsedSql {
     ///
     /// **BREAKING CHANGE**（Issue #1965）: `ParsedSql` への variant 追加。
     GrantRevoke(crate::sql::allowlist::ValidatedGrantRevoke),
+    /// `ALTER DEFAULT PRIVILEGES`（SQL-40、Issue #2237）。
+    ///
+    /// **BREAKING CHANGE**（Issue #2237）: `ParsedSql` への variant 追加。
+    AlterDefaultPrivileges(crate::sql::allowlist::ValidatedAlterDefaultPrivileges),
     /// `ALTER {TABLE|VIEW|MATERIALIZED VIEW|SCHEMA} ... OWNER TO`（SQL-40・Issue #2236）。
     AlterOwner(crate::sql::allowlist::ValidatedAlterOwner),
     /// `CREATE ROLE|USER`（SQL-39、Issue #1962）。
@@ -2157,6 +2161,7 @@ fn statement_clock_scope(
         | ParsedSql::AlterPolicy(_)
         | ParsedSql::DropPolicy(_)
         | ParsedSql::GrantRevoke(_)
+        | ParsedSql::AlterDefaultPrivileges(_)
         | ParsedSql::AlterOwner(_)
         | ParsedSql::CreateRole(_)
         | ParsedSql::DropRole(_)
@@ -2238,6 +2243,7 @@ fn insert_sequence_scope(
         | ParsedSql::AlterPolicy(_)
         | ParsedSql::DropPolicy(_)
         | ParsedSql::GrantRevoke(_)
+        | ParsedSql::AlterDefaultPrivileges(_)
         | ParsedSql::AlterOwner(_)
         | ParsedSql::CreateRole(_)
         | ParsedSql::DropRole(_)
@@ -2318,6 +2324,7 @@ fn insert_default_clock_scope(
         | ParsedSql::AlterPolicy(_)
         | ParsedSql::DropPolicy(_)
         | ParsedSql::GrantRevoke(_)
+        | ParsedSql::AlterDefaultPrivileges(_)
         | ParsedSql::AlterOwner(_)
         | ParsedSql::CreateRole(_)
         | ParsedSql::DropRole(_)
@@ -4494,6 +4501,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::AlterPolicy(_)
                     | crate::sql::SqlOutcome::DropPolicy(_)
                     | crate::sql::SqlOutcome::GrantRevoke(_)
+                    | crate::sql::SqlOutcome::AlterDefaultPrivileges(_)
                     | crate::sql::SqlOutcome::AlterOwner(_)
                     | crate::sql::SqlOutcome::CreateRole(_)
                     | crate::sql::SqlOutcome::DropRole(_)
@@ -4568,6 +4576,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::AlterPolicy(_)
                     | crate::sql::SqlOutcome::DropPolicy(_)
                     | crate::sql::SqlOutcome::GrantRevoke(_)
+                    | crate::sql::SqlOutcome::AlterDefaultPrivileges(_)
                     | crate::sql::SqlOutcome::AlterOwner(_)
                     | crate::sql::SqlOutcome::CreateRole(_)
                     | crate::sql::SqlOutcome::DropRole(_)
@@ -4639,6 +4648,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::AlterPolicy(_)
                     | crate::sql::SqlOutcome::DropPolicy(_)
                     | crate::sql::SqlOutcome::GrantRevoke(_)
+                    | crate::sql::SqlOutcome::AlterDefaultPrivileges(_)
                     | crate::sql::SqlOutcome::AlterOwner(_)
                     | crate::sql::SqlOutcome::CreateRole(_)
                     | crate::sql::SqlOutcome::DropRole(_)
@@ -4717,6 +4727,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::AlterPolicy(_)
                     | crate::sql::SqlOutcome::DropPolicy(_)
                     | crate::sql::SqlOutcome::GrantRevoke(_)
+                    | crate::sql::SqlOutcome::AlterDefaultPrivileges(_)
                     | crate::sql::SqlOutcome::AlterOwner(_)
                     | crate::sql::SqlOutcome::CreateRole(_)
                     | crate::sql::SqlOutcome::DropRole(_)
@@ -4814,6 +4825,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::AlterPolicy(_)
                     | crate::sql::SqlOutcome::DropPolicy(_)
                     | crate::sql::SqlOutcome::GrantRevoke(_)
+                    | crate::sql::SqlOutcome::AlterDefaultPrivileges(_)
                     | crate::sql::SqlOutcome::AlterOwner(_)
                     | crate::sql::SqlOutcome::CreateRole(_)
                     | crate::sql::SqlOutcome::DropRole(_)
@@ -6239,8 +6251,8 @@ impl EngineCore {
         }
         // SQL-68・Issue #2228: `DO` はカタログ照会なしの構造検証だけで束縛する。
         // SQL-40・Issue #1965: `GRANT`／`REVOKE` は構造検証だけで束縛する（カタログ照会は実行段。権限の無い
-        // 主体にロール・対象の有無を示さないため）。`ALTER DEFAULT PRIVILEGES`（#2237）は汎用 `ALTER`
-        // （`ALTER TABLE` 扱い）より前に `0A000` で拒否する。
+        // 主体にロール・対象の有無を示さないため）。`ALTER DEFAULT PRIVILEGES`（#2237）も構造検証だけで
+        // 束縛し、汎用 `ALTER`（`ALTER TABLE` 扱い）より前に振り分ける。
         // Issue #2236: `ALTER {TABLE|VIEW|MATERIALIZED VIEW|SCHEMA} <名> OWNER TO` は汎用 `ALTER` と
         // `ALTER SCHEMA` より前に束縛する（構造検証だけ。カタログ照会は実行段）。`REASSIGN OWNED`・
         // `DROP OWNED` は汎用 `DROP` より前に固定の `0A000` で拒否する（状態に依存しない）。
@@ -6271,7 +6283,8 @@ impl EngineCore {
             return Ok(ParsedSql::GrantRevoke(stmt));
         }
         if crate::sql::allowlist::is_alter_default_privileges_statement(&tokens) {
-            return Err(crate::sql::allowlist::reject_alter_default_privileges());
+            let stmt = crate::sql::allowlist::validate_alter_default_privileges_tokens(&tokens)?;
+            return Ok(ParsedSql::AlterDefaultPrivileges(stmt));
         }
 
         if crate::sql::allowlist::is_do_statement(&tokens) {
@@ -8206,6 +8219,9 @@ impl EngineCore {
                     crate::sql::privilege_gate::DdlStatementKind::CreateSequence,
                 )?;
                 self.require_creation_target(ctx, session, stmt.public_qualified, stmt.name())?;
+                // 作成者の `SEQUENCES` の既定権限（`ALTER DEFAULT PRIVILEGES`、Issue #2237）を作成と同じ write txn で
+                // 初期 ACL へ適用するため、作成の直前に作成者を予約する（SEQUENCE は所有者行を持たない）。
+                let _owner_guard = self.arm_created_relation_owner(ctx, session, stmt.name());
                 let outcome = crate::sql::ddl::execute_create_sequence(&self.storage, stmt)?;
                 Ok(crate::sql::SqlOutcome::CreateSequence(outcome))
             }
@@ -8331,6 +8347,18 @@ impl EngineCore {
                     stmt,
                 )?;
                 Ok(crate::sql::SqlOutcome::GrantRevoke(outcome))
+            }
+            // SQL-40（Issue #2237）: `GRANT`／`REVOKE` と同じく現在ロールの束縛を最初に確かめ（未束縛は対象・
+            // ロールの有無を問わず `42501`）、解決・認可・書き込みは単一 write txn の実行本体が行う。
+            ParsedSql::AlterDefaultPrivileges(stmt) => {
+                crate::sql::grant_ddl::require_grant_principal(session)?;
+                let outcome = crate::sql::default_privileges_ddl::execute_alter_default_privileges(
+                    &self.storage,
+                    ctx.tenant_id(),
+                    session,
+                    stmt,
+                )?;
+                Ok(crate::sql::SqlOutcome::AlterDefaultPrivileges(outcome))
             }
             // SQL-39（Issue #1962）: DDL 実行権限ゲート → 実行本体。CREATEROLE／ADMIN OPTION による判定は
             // セッションへロールが束縛される #1966・#1971 の担当で、それまでは DDL 権限ゲートで代替する。
@@ -9184,6 +9212,14 @@ impl EngineCore {
                 crate::sql::grant_ddl::require_grant_principal(session)?;
                 Err(SqlSurfaceError::feature_not_supported(
                     "GRANT/REVOKE is not supported inside a transaction block",
+                ))
+            }
+            // SQL-40（Issue #2237）: 既定権限の書き込みも独立した write txn で commit され ROLLBACK で取り消せない
+            // ため明示トランザクション内では行わない。未束縛は存在を問わず `42501`（`0A000` より前）。
+            ParsedSql::AlterDefaultPrivileges(_) => {
+                crate::sql::grant_ddl::require_grant_principal(session)?;
+                Err(SqlSurfaceError::feature_not_supported(
+                    "ALTER DEFAULT PRIVILEGES is not supported inside a transaction block",
                 ))
             }
             // SQL-40（Issue #2236）: 所有者の変更も独立した write txn で commit され ROLLBACK で取り消せない
@@ -10480,6 +10516,7 @@ impl EngineCore {
                 Ok(None)
             }
             ParsedSql::GrantRevoke(_) => Ok(None),
+            ParsedSql::AlterDefaultPrivileges(_) => Ok(None),
             ParsedSql::AlterOwner(_) => Ok(None),
             ParsedSql::CreateRole(_)
             | ParsedSql::DropRole(_)

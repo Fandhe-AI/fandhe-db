@@ -647,6 +647,8 @@ username・空要素・重複要素・フラグの重複指定はいずれも fa
 （現在ロールが束縛されたセッション）として記録されます。所有者は運用者権限なしで GRANT／REVOKE・
 `ALTER ... OWNER TO`・SCHEMA と関数の削除ができますが、運用者権限が縮むことはありません
 （詳細は `docs/design/role-privilege-model.md` §14）。
+`ALTER DEFAULT PRIVILEGES`（Issue #2237）は、実行より後に作る表・ビュー・SEQUENCE・関数・SCHEMA の初期 ACL
+へ既定の付与を適用します（既存のオブジェクトには作用しません。詳細は同 §19）。
 
 `--tls-cert`／`--tls-key`／`--tls-mode`（Issue #967・親 #941・TASK-228。
 WIRE-7, WIRE-9 ポインタ）は SQL 表層（pg wire）の TLS を有効化する opt-in
