@@ -658,6 +658,11 @@ pub(crate) fn relation_grant_bits_in_txn<R: ReadSource>(
             .iter()
             .filter(|e| e.grantee_id == role_id || e.grantee_id == PUBLIC_GRANTEE_ID)
             .fold(0u16, |acc, e| acc | e.privileges);
+        // 所有者は自身の relation の全権限を暗黙に持つ（`OWNER TO` は自己付与行を作らない・消す）。
+        // 同じ読み取りスナップショットで所有者行を引き、ACL に加算する。
+        let owner =
+            owner::is_owner_in_txn(src, tenant, &PrivilegeObject::Table(key.clone()), role_id)?;
+        let bits = if owner { bits | u16::MAX } else { bits };
         out.push(Some(bits));
     }
     Ok(out)

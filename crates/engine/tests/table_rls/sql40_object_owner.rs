@@ -402,3 +402,32 @@ fn owner_to_on_a_schema_qualified_relation_requires_create_on_the_schema() {
         "3F000"
     );
 }
+
+/// 所有者は明示付与なしで自分の表・ビューを読め（Issue #1967 の暗黙権限）、`OWNER TO` 後は旧所有者が
+/// 読めず新所有者が読める。非所有者と他テナントのロールは所有者判定でも読めない。
+#[test]
+fn owner_reads_own_relations_without_explicit_grant() {
+    let f = fx("sql40_owner_select");
+    f.ok(
+        "t1",
+        &mut bound(ALICE, true),
+        "CREATE TABLE ot (id BIGINT PRIMARY KEY)",
+    );
+    f.ok(
+        "t1",
+        &mut bound(ALICE, true),
+        "CREATE VIEW ov AS SELECT id FROM ot",
+    );
+    let mut alice = bound(ALICE, false);
+    let mut bob = bound(BOB, false);
+    f.ok("t1", &mut alice, "SELECT id FROM ot");
+    f.ok("t1", &mut alice, "SELECT id FROM ov");
+    assert_eq!(f.code("t1", &mut bob, "SELECT id FROM ot"), "42501");
+    assert_eq!(
+        f.code("t2", &mut bound(CAROL_T2, false), "SELECT id FROM ot"),
+        "42501"
+    );
+    f.ok("t1", &mut bound(ALICE, true), "ALTER TABLE ot OWNER TO bob");
+    assert_eq!(f.code("t1", &mut alice, "SELECT id FROM ot"), "42501");
+    f.ok("t1", &mut bob, "SELECT id FROM ot");
+}
