@@ -1742,8 +1742,24 @@ fn assign_sequence_values(
             "failed to reserve sequence rows".to_string(),
         ))
     })?;
-    for (row_idx, orig) in row_values.iter().enumerate() {
-        let mut values = orig.to_vec();
+    // 第 1 段: 全行・全列の SEQUENCE 名の解決と権限検査を、採番を始める前に完了する。後続列の権限不足
+    // や不在で文が拒否されても、先の列の採番（メモリ上の値・`currval`/`lastval`）が残らないようにする
+    // （拒否は副作用の前に必ず起きる）。
+    type PlannedSeq = (
+        usize,
+        SequenceFunc,
+        u64,
+        crate::catalog::sequence::SequenceParams,
+        i64,
+    );
+    let mut plans: Vec<Vec<PlannedSeq>> = Vec::new();
+    plans.try_reserve_exact(row_values.len()).map_err(|_| {
+        TenantWriteError::Storage(StorageError::Codec(
+            "failed to reserve sequence plans".to_string(),
+        ))
+    })?;
+    for (row_idx, _) in row_values.iter().enumerate() {
+        let mut plan: Vec<PlannedSeq> = Vec::new();
         let marks = row_marks.get(row_idx).copied().unwrap_or(&[]);
         let mut ordered: Vec<&VolatileColumn> = marks
             .iter()
@@ -1817,6 +1833,21 @@ fn assign_sequence_values(
                     .map_err(sql_err)?;
                 }
             }
+            plan.push((idx, func, seq_id, params, restart_value));
+        }
+        plans.push(plan);
+    }
+
+    // 第 2 段: 検査済みの計画に沿って採番し、行の値へ差し替える。
+    for (row_idx, orig) in row_values.iter().enumerate() {
+        let mut values = orig.to_vec();
+        for (idx, func, seq_id, params, restart_value) in plans.get(row_idx).into_iter().flatten() {
+            let (idx, func, seq_id, restart_value) = (*idx, *func, *seq_id, *restart_value);
+            let column = schema.columns.get(idx).ok_or_else(|| {
+                TenantWriteError::Catalog(CatalogError::Invalid(
+                    "sequence column does not match the table schema".to_string(),
+                ))
+            })?;
             let value: i64 = match func {
                 SequenceFunc::Nextval => nextval_recorded(
                     &allocator,
@@ -1824,7 +1855,7 @@ fn assign_sequence_values(
                     write_txn,
                     tenant_id,
                     seq_id,
-                    &params,
+                    params,
                     restart_value,
                 )?,
                 SequenceFunc::Currval => {

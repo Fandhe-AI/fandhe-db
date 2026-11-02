@@ -119,6 +119,29 @@ fn sequence_functions_are_denied_without_privileges_and_leave_no_side_effect() {
     assert_eq!(rows(&core, &mut o, "SELECT n FROM t"), vec![vec![int(1)]]);
 }
 
+/// 複数列・複数 SEQUENCE の INSERT で後続列だけ権限不足でも、先の列の採番は起きない
+/// （権限検査が採番より前に文全体で完了する。拒否後に値・`currval`・`lastval` が不変）。
+#[test]
+fn later_column_privilege_denial_leaves_earlier_sequence_untouched() {
+    let (core, _g, mut o, mut a) = fixture("sfacl_seq_two_phase");
+    ok(&core, &mut o, "CREATE SEQUENCE q2");
+    ok(
+        &core,
+        &mut o,
+        "CREATE TABLE t2 (id BIGINT PRIMARY KEY, a BIGINT, b BIGINT)",
+    );
+    ok(&core, &mut o, "GRANT USAGE ON SEQUENCE q TO alice");
+    ok(&core, &mut o, "GRANT SELECT ON SEQUENCE q TO alice");
+    let sql = "INSERT INTO t2 (id, a, b) VALUES (1, nextval('q'), nextval('q2'))";
+    assert_eq!(code(&core, &mut a, sql), "42501");
+    // q は消費されておらず、alice の currval・lastval も未定義のまま（55000）。
+    assert_eq!(code(&core, &mut a, "SELECT lastval()"), "55000");
+    assert_eq!(code(&core, &mut a, &ins_curr(9)), "55000");
+    assert!(rows(&core, &mut o, "SELECT id FROM t2").is_empty());
+    ok(&core, &mut o, &ins_next(1));
+    assert_eq!(rows(&core, &mut o, "SELECT n FROM t"), vec![vec![int(1)]]);
+}
+
 #[test]
 fn usage_update_select_each_open_only_their_functions() {
     let (core, _g, mut o, mut a) = fixture("sfacl_seq_bits");
