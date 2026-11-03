@@ -340,6 +340,8 @@ impl Inferrer<'_> {
             }
             // jsonb パス演算子（Issue #1596）。`->>`／`#>>` は text、`->`／`#>` は
             // jsonb（`$n` の型付け対象外）なので型なしとして扱う。
+            // 距離式（SQL-74・Issue #2035）は float8 だが `$n` の型付け対象外なので型なし扱い。
+            Expr::VectorDistance { .. } => Ty::Untyped,
             Expr::JsonAccess { op, .. } => match op {
                 crate::sql::udf_call::JsonAccessOp::GetText
                 | crate::sql::udf_call::JsonAccessOp::PathText => {
@@ -506,7 +508,7 @@ impl Inferrer<'_> {
             Expr::RegexMatch { lhs, .. } => self.walk(lhs)?,
             // jsonb パス演算子の被演算子に `$n` は置けない（型を推論できないため
             // `Untyped` として割り当て、不定扱い。Issue #1596）。
-            Expr::JsonAccess { lhs, rhs, .. } => {
+            Expr::JsonAccess { lhs, rhs, .. } | Expr::VectorDistance { lhs, rhs, .. } => {
                 for e in [lhs.as_ref(), rhs.as_ref()] {
                     match as_param(e) {
                         Some(n) => self.assign(n, Ty::Untyped)?,

@@ -6686,6 +6686,11 @@ struct Parser<'a> {
     /// `42601` にする（脱糖後の形が `check_constraint` の許可形と区別できず、
     /// CHECK の受理範囲が黙って広がるのを防ぐ）。
     in_check_body: bool,
+    /// 距離式（`<列> <距離演算子> <ベクトル>`。SQL-74 (1)・Issue #2035）を値式の「その他の演算子」の
+    /// 段で受理してよいか。WHERE の葉（[`Parser::parse_where_leaf`]）を解析している間だけ真で、
+    /// 投影・SET・VALUES・UDF 本体・ORDER BY・JOIN など他の文脈は従来どおり `42601` のままにする。
+    /// CHECK 本体は真にしない（従来の拒否を維持）。
+    distance_expr_allowed: bool,
     /// 複数行 `VALUES` が持てる行数の上限（[`Self::parse_insert`] が判定に使う）。
     /// 既定値は `None`＝上限なし（Issue #997・オーナー判断の改訂
     /// 〔2026-09-27、汎用 RDB との整合〕）。`Some(limit)` は `wire-server` の
@@ -6828,6 +6833,7 @@ impl<'a> Parser<'a> {
             allow_plus_number: false,
             allow_plus_param: false,
             in_check_body: false,
+            distance_expr_allowed: false,
             max_insert_rows: None,
             from_ref: None,
             reject_from_alias: false,
@@ -9548,6 +9554,22 @@ impl<'a> Parser<'a> {
         set_operators: bool,
         leaf_count: &mut usize,
     ) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
+        // WHERE の葉の中だけ距離式を受理する（SQL-74 (1)・Issue #2035）。`in_check_body` と同じ
+        // 保存・復元の流儀で、エラー経路でも元の値へ戻す。
+        let prev = self.distance_expr_allowed;
+        self.distance_expr_allowed = !self.in_check_body;
+        let result = self.parse_where_leaf_inner(extra_close_paren, set_operators, leaf_count);
+        self.distance_expr_allowed = prev;
+        result
+    }
+
+    /// [`Self::parse_where_leaf`] の本体（距離式の受理フラグを設定済みの状態で呼ばれる）。
+    fn parse_where_leaf_inner(
+        &mut self,
+        extra_close_paren: bool,
+        set_operators: bool,
+        leaf_count: &mut usize,
+    ) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
         // Issue #1534・SQL-44 ポインタ: 単一テーブル FROM の公開名（別名があれば別名）に
         // 一致しない修飾子は `42P01`。通常 SELECT 系は #1535 の `sql::qualified_column`
         // 正規化がパース前に修飾子を解消するため、本フックは正規化を適用しない経路
@@ -11222,6 +11244,20 @@ impl<'a> Parser<'a> {
                 Some(Token::JsonExistsAny) => JsonAccessOp::ExistsAny,
                 Some(Token::JsonExistsAll) => JsonAccessOp::ExistsAll,
                 Some(Token::ArrayOverlap) => JsonAccessOp::Overlap,
+                // 距離式（SQL-74 (1)・Issue #2035）。WHERE の葉の中だけで受理し、同じ段・左結合で
+                // 構築する。右辺は加減算の段まで（比較・BETWEEN より強く結合）。
+                Some(Token::DistanceOp(kind)) if self.distance_expr_allowed => {
+                    let kind = *kind;
+                    self.advance();
+                    let rhs = self.parse_add_expr(depth + 1)?;
+                    self.consume_expr_node()?;
+                    lhs = Expr::VectorDistance {
+                        kind,
+                        lhs: Box::new(lhs),
+                        rhs: Box::new(rhs),
+                    };
+                    continue;
+                }
                 _ => break,
             };
             if self.in_check_body {
@@ -23496,7 +23532,9 @@ fn expr_contains_scalar_function(expr: &Expr) -> bool {
         Expr::IsDistinctFrom { .. } => true,
         // 正規表現マッチ（SQL-55）も従来形では書けない式述語。
         Expr::RegexMatch { .. } => true,
-        Expr::Binary { lhs, rhs, .. } | Expr::JsonAccess { lhs, rhs, .. } => {
+        Expr::Binary { lhs, rhs, .. }
+        | Expr::JsonAccess { lhs, rhs, .. }
+        | Expr::VectorDistance { lhs, rhs, .. } => {
             expr_contains_scalar_function(lhs) || expr_contains_scalar_function(rhs)
         }
         // 照合指定（TABLE-28・Issue #1609）は従来形では書けない式。SQL/JSON 問い合わせ関数
@@ -32048,6 +32086,69 @@ mod tests {
             panic!("expected -> below, got {inner:?}");
         };
         assert!(matches!(rhs.as_ref(), Expr::Binary { op: BinOp::Add, .. }));
+    }
+
+    /// SQL-74 (1)・Issue #2035: WHERE 内の距離式は「その他の演算子」の段（加減算より弱く比較より強い）で
+    /// 構文として受理し、6 つの比較・`BETWEEN`・前置 `NOT`・括弧・逆向きと組み合わせられる。
+    /// 4 種別の `kind` を AST に保持し、比較の無い裸の距離式や WHERE 以外の位置は従来どおり拒否する。
+    #[test]
+    fn where_distance_expression_parses() {
+        use crate::sql::lexer::DistanceKind;
+        use crate::sql::udf_call::BinOp;
+        let tail = "ORDER BY embedding <=> '[0.1]' LIMIT 5";
+        for (sql, want) in [
+            ("<=>", DistanceKind::Cosine),
+            ("<->", DistanceKind::L2),
+            ("<#>", DistanceKind::NegativeInnerProduct),
+            ("<+>", DistanceKind::L1),
+        ] {
+            let preds = where_predicates_for(&format!(
+                "SELECT * FROM documents WHERE embedding {sql} '[0.1]' < 0.5 {tail}"
+            ));
+            let [WherePredicate::Expression(Expr::Binary {
+                op: BinOp::Lt, lhs, ..
+            })] = preds.as_slice()
+            else {
+                panic!("expected a comparison, got {preds:?}");
+            };
+            assert!(
+                matches!(lhs.as_ref(), Expr::VectorDistance { kind, .. } if *kind == want),
+                "{sql}"
+            );
+        }
+        // 逆向き・括弧・前置 NOT（演算子が反転する）。
+        for sql in [
+            "0.5 > embedding <-> '[0.1]'",
+            "(embedding <-> '[0.1]') < 0.5",
+            "NOT embedding <-> '[0.1]' >= 0.5",
+        ] {
+            where_predicates_for(&format!("SELECT * FROM documents WHERE {sql} {tail}"));
+        }
+        // BETWEEN は `>= AND <=` の 2 述語、NOT BETWEEN は OR、`<>` も OR へ脱糖される。
+        let preds = where_predicates_for(&format!(
+            "SELECT * FROM documents WHERE embedding <-> '[0.1]' BETWEEN 0.1 AND 0.5 {tail}"
+        ));
+        assert_eq!(preds.len(), 2, "{preds:?}");
+        let preds = where_predicates_for(&format!(
+            "SELECT * FROM documents WHERE embedding <-> '[0.1]' <> 0.5 {tail}"
+        ));
+        assert!(matches!(preds.as_slice(), [WherePredicate::Or(b)] if b.len() == 2));
+        // 優先順位: 右辺は加算まで取り込み、比較より強く結合する。
+        let preds = where_predicates_for(&format!(
+            "SELECT * FROM documents WHERE embedding <-> '[0.1]' < 0.5 + 0.1 {tail}"
+        ));
+        let [WherePredicate::Expression(Expr::Binary { rhs, .. })] = preds.as_slice() else {
+            panic!("expected a comparison, got {preds:?}");
+        };
+        assert!(matches!(rhs.as_ref(), Expr::Binary { op: BinOp::Add, .. }));
+        // 従来どおり拒否する位置（比較の無い裸の距離式・投影・SET 右辺）。
+        let lookup = catalog_with(&["documents"]);
+        for sql in [
+            "SELECT * FROM documents WHERE embedding <-> '[0.1]' LIMIT 5",
+            "SELECT embedding <-> '[0.1]' FROM documents LIMIT 5",
+        ] {
+            assert!(validate_statement(sql, &lookup).is_err(), "{sql}");
+        }
     }
 
     /// Issue #1603（TABLE-35）: 量化比較 `ANY`／`SOME`／`ALL` と `&&` の構文。`SOME` は `ANY` に正規化し、

@@ -123,6 +123,11 @@ impl<'a, 'b> Folder<'a, 'b> {
                 lhs: Box::new(self.fold(lhs, conditional)?),
                 rhs: Box::new(self.fold(rhs, conditional)?),
             }),
+            Expr::VectorDistance { kind, lhs, rhs } => Ok(Expr::VectorDistance {
+                kind: *kind,
+                lhs: Box::new(self.fold(lhs, conditional)?),
+                rhs: Box::new(self.fold(rhs, conditional)?),
+            }),
             Expr::Case { whens, else_result } => {
                 let mut out = Vec::with_capacity(whens.len());
                 for (i, (c, r)) in whens.iter().enumerate() {
