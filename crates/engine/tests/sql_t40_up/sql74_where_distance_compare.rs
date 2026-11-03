@@ -1,10 +1,9 @@
 //! `WHERE` 内の距離比較（`<VECTOR 列> <距離演算子> <ベクトル> <比較演算子> <数値>` と
 //! `[NOT] BETWEEN`）の構文・束縛契約の結合テスト（SQL-74 (1)・Issue #2035）。
 //!
-//! 評価・打ち切り・EXPLAIN の経路表示は Issue #2036 の担当で、本 Issue の範囲は解析と束縛まで。
-//! 束縛が通った文は評価が結線されるまで fail-closed の `0A000` で止まり、行を 1 件も返さず、
-//! DML は 1 行も書き換えない。被演算子の違反は `0A000` より先に既存の分類で拒否される。
-//! 投影位置など WHERE 以外の距離式は従来どおり `42601` のまま。
+//! 評価は Issue #2036 で結線済みで（値の検証は `sql74_radius_search.rs`）、本ファイルは受理される
+//! 構文の範囲と、被演算子の違反が既存の分類で拒否されること（`42703`・`42883`・`22000`・`54000`・
+//! `0A000`）を固定する。投影位置など WHERE 以外の距離式は従来どおり `42601` のまま。
 
 use engine::core::EngineCore;
 use engine::kernel::CpuScalarProvider;
@@ -64,17 +63,17 @@ fn count(core: &EngineCore, session: &mut SessionState) -> usize {
     }
 }
 
-/// 6 つの比較演算子・`BETWEEN`・4 種別の距離演算子・両向きは束縛まで通り、`0A000` で止まる。
+/// 6 つの比較演算子・`BETWEEN`・4 種別の距離演算子・両向きは受理され、評価まで成功する。
 #[test]
-fn comparisons_and_between_are_gated_with_0a000() {
+fn comparisons_and_between_are_accepted() {
     let (core, mut session, _g) = setup("sql74-gate");
     for op in ["<", "<=", ">", ">=", "=", "<>", "!="] {
         let sql = format!("SELECT id FROM docs WHERE embedding <=> '[1,0,0]' {op} 0.5");
-        assert_eq!(code(&core, &mut session, &sql), "0A000", "{sql}");
+        assert_eq!(code(&core, &mut session, &sql), "ok", "{sql}");
     }
     for kind in ["<=>", "<->", "<#>", "<+>"] {
         let sql = format!("SELECT id FROM docs WHERE embedding {kind} '[1,0,0]' < 0.5");
-        assert_eq!(code(&core, &mut session, &sql), "0A000", "{sql}");
+        assert_eq!(code(&core, &mut session, &sql), "ok", "{sql}");
     }
     for sql in [
         "SELECT id FROM docs WHERE '[1,0,0]' <-> embedding < 0.5",
@@ -90,7 +89,7 @@ fn comparisons_and_between_are_gated_with_0a000() {
          ORDER BY embedding <=> '[1,0,0]' LIMIT 2",
         "EXPLAIN SELECT id FROM docs WHERE embedding <-> '[1,0,0]' < 0.5",
     ] {
-        assert_eq!(code(&core, &mut session, sql), "0A000", "{sql}");
+        assert_eq!(code(&core, &mut session, sql), "ok", "{sql}");
     }
 }
 
@@ -104,7 +103,7 @@ fn operand_violations_use_existing_classification() {
         ("WHERE t <-> '[1,0,0]' < 1", "42883"),
         ("WHERE embedding <-> '[1,0]' < 1", "22000"),
         ("WHERE embedding <-> 'abc' < 1", "22000"),
-        ("WHERE embedding <-> '[1,0,0]' < 'abc'", "0A000"),
+        ("WHERE embedding <-> '[1,0,0]' < 'abc'", "22P02"),
         ("WHERE embedding <-> embedding < 1", "0A000"),
         ("WHERE embedding <-> NULL < 1", "0A000"),
         ("WHERE '[1,0,0]' <-> '[1,0,0]' < 1", "0A000"),
@@ -131,19 +130,17 @@ fn other_positions_stay_rejected() {
     }
 }
 
-/// DML は束縛の段階で拒否され、1 行も書き換えない。
+/// DML の WHERE でも距離比較が受理され、該当行だけを書き換える（値の網羅は `sql74_radius_search.rs`）。
 #[test]
-fn dml_is_rejected_without_writing() {
+fn dml_accepts_distance_predicate() {
     let (core, mut session, _g) = setup("sql74-dml");
-    let before = count(&core, &mut session);
     for sql in [
-        "DELETE FROM docs WHERE embedding <-> '[1,0,0]' < 1 USING OPERATION_ID 'd-1'",
         "UPDATE docs SET n = 9 WHERE embedding <-> '[1,0,0]' < 1 USING OPERATION_ID 'u-1'",
+        "DELETE FROM docs WHERE embedding <-> '[0,1,0]' < 1 USING OPERATION_ID 'd-1'",
     ] {
-        let got = code(&core, &mut session, sql);
-        assert!(got == "0A000" || got == "42601", "{sql}: {got}");
+        assert_eq!(code(&core, &mut session, sql), "ok", "{sql}");
     }
-    assert_eq!(count(&core, &mut session), before);
+    assert_eq!(count(&core, &mut session), 2);
 }
 
 /// エラー文言にベクトルリテラルの値を含めない。
@@ -154,31 +151,26 @@ fn error_detail_does_not_echo_literal() {
         .execute_sql_in_session(
             &ctx(),
             &mut session,
-            "SELECT id FROM docs WHERE embedding <-> '[7.654321,0,0]' < 1",
-        )
-        .expect_err("gated");
-    assert!(!format!("{err}").contains("7.654321"));
-    let err = core
-        .execute_sql_in_session(
-            &ctx(),
-            &mut session,
             "SELECT id FROM docs WHERE embedding <-> '[7.654321,0]' < 1",
         )
         .expect_err("dim mismatch");
     assert!(!format!("{err}").contains("7.654321"));
 }
 
-/// 拡張クエリの `<=> $1`（Cosine のみ既存の `$n` パターンが受理）は Parse を通り、Execute で `0A000`。
+/// 拡張クエリの `<=> $1`（Cosine のみ既存の `$n` パターンが受理）は Execute で評価される。
 #[test]
-fn extended_query_param_is_gated() {
+fn extended_query_param_is_evaluated() {
     let (core, mut session, _g) = setup("sql74-ext");
     let prepared = core
         .parse_sql_prepared("SELECT id FROM docs WHERE embedding <=> $1 < 0.5")
         .expect("parse");
     let binds = vec![Some(b"[1,0,0]".to_vec())];
     let bound = core.bind_prepared(&prepared, &binds).expect("bind");
-    let err = core
+    match core
         .execute_parsed_in_session(&ctx(), &mut session, &bound)
-        .expect_err("gated");
-    assert_eq!(err.wire_code(), "0A000");
+        .expect("execute")
+    {
+        SqlOutcome::Query(r) => assert_eq!(r.rows.len(), 1),
+        _ => panic!("expected Query outcome"),
+    }
 }

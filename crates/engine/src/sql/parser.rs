@@ -3059,8 +3059,11 @@ pub(crate) fn bind_in_session_with_limits(
 
     let projection = bind_projection(&stmt.projection, schema, udfs, &mut node_budget)?;
 
+    let distance_binds_before = crate::sql::udf_call::distance_bind_count();
     let (metadata_filters, expr_filters, rls_predicate_present, or_filters) =
         bind_where_predicates(&stmt.where_predicates, schema, udfs, &mut node_budget, &[])?;
+    let has_distance_predicate =
+        crate::sql::udf_call::distance_bind_count() != distance_binds_before;
 
     let ranking = bind_ranking(&stmt.order_by, schema, true)?;
     check_distance_direction(
@@ -3071,6 +3074,17 @@ pub(crate) fn bind_in_session_with_limits(
 
     let (limit, offset) =
         validate_search_limit_offset_with(stmt.limit, stmt.offset, result_limits)?;
+
+    // SQL-74 (2)・Issue #2036: 距離述語を含む文は `HINT ORDER` が DISTANCE を先にしても SCALAR を
+    // 先（事前フィルタ）に倒す。距離述語を DISTANCE 段の後の事後フィルタにすると、上位 k 件が
+    // 述語で間引かれて `LIMIT` に満たない取りこぼしが起きるため、述語を満たす行だけを候補にして
+    // から検索する（結果は厳密に評価した場合と一致する）。実行（`exec`）・EXPLAIN とも
+    // `bound.evaluation_order` だけを見るので、ここで 1 回だけ決めれば両者が一致する。
+    let evaluation_order = if has_distance_predicate {
+        EvaluationOrder::DEFAULT
+    } else {
+        stmt.evaluation_order
+    };
 
     // Issue #353: `expr_filters` を束縛時に 1 回だけステップ列コンパイルする
     // （行ループでの再帰評価をなくす）。`expr_filters` と要素数・評価順が
@@ -3092,7 +3106,7 @@ pub(crate) fn bind_in_session_with_limits(
         limit,
         offset,
         mode: resolved_mode,
-        evaluation_order: stmt.evaluation_order,
+        evaluation_order,
         distance_descending: stmt.distance_descending,
     })
 }

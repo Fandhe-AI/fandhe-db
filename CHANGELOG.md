@@ -13,6 +13,8 @@
 
 ### Added
 
+- `WHERE` 内の距離比較（`<VECTOR 列> <距離演算子> <ベクトルリテラル> <比較> <数値>`、`[NOT] BETWEEN`、`NOT`、逆向き）を評価するようにした（Issue #2036・SQL-74。#2035 の束縛までを受けた評価）。述語は RLS 後の可視行だけに適用し、厳密に評価した場合と一致する。ゼロノルムのコサイン距離は NaN で、比較は PG の float8 順序（NaN 同士は等しく最大）。`HINT ORDER` で DISTANCE を先にしても距離述語を含む文は事前フィルタに倒し、取りこぼしを防ぐ。詳細は `docs/design/radius-search.md`。
+  BREAKING CHANGE: 公開 enum `BoundExpr` に `VectorDistance { kind, query }` を追加した（網羅的 `match` の下流は追随が必要）。従来 `0A000` だった距離比較は受理に変わる。
 - kNN の距離順 `ORDER BY` で `ASC`／`DESC` を受理するようにした（Issue #2009・SQL-33 (2)・SQL-75 (4)）。従来は `DESC` が `42601`。`DESC` は ANN 索引を使わず可視行を全走査し、遠い順（同点は行の順序キー昇順）で返す。`USING MODE 'precision'` との併用は `0A000`。`EXPLAIN` の `ann_plan:` は `plain_scan_descending`。公開 API の追加: `AnnPlan::PlainScanDescending`（`#[non_exhaustive]`）・`ValidatedStatement::{distance_descending, with_distance_descending}`・`BoundStatement::distance_descending`。既存の公開シグネチャの変更なし。
 - セッションの UDF 数の上限をカタログ由来（`catalog::function::MAX_FUNCTIONS`）とセッション限定（`MAX_SESSION_UDFS`）で分離した（Issue #2883・SQL-66 (5)）。カタログが満杯でも公開 API の `define_function*`・`register_wasm_udf*` が通り、セッション限定が満杯でも永続 `CREATE FUNCTION`・ロードが通る。各上限の超過は `54000`。`MAX_SESSION_UDFS` の値は 64 のままで、意味が「カタログ由来を除くセッション限定の合計」に変わる。`engine::sql::udf_call::MAX_REGISTRY_UDFS` を追加した。公開シグネチャの変更はない。
 - 明示トランザクションの書き込み後に作った `SAVEPOINT` への `ROLLBACK TO` と、一時表を使ったトランザクションの `ROLLBACK TO` を実装した（Issue #2879・SQL-69）。基底 savepoint への復元と内容差分の再適用で巻き戻す。差分を取れない場合（未知の型のテーブル・上限超過）は従来どおり固定文言の `0A000`。PL/pgSQL の `EXCEPTION` 節の内部 savepoint は従来のまま。
