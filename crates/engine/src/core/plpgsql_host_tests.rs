@@ -1493,22 +1493,19 @@ fn bigint_values_beyond_2_53_are_exact_in_values() {
         id += 1;
         insert_bf(&core, &c, id, "b", "p", SqlColumnTypeName::BigInt, big(v)).expect("lone");
         assert_eq!(b_of(&core, &c, id), v, "lone {v}");
-        // 式の中は定数式の畳み込み（f64）が正確に保てない 2^53 超を 22003 で拒否する（fail-closed）。
-        id += 1;
-        let r = insert_bf(
-            &core,
-            &c,
-            id,
-            "b",
-            "p - 1 + 1",
-            SqlColumnTypeName::BigInt,
-            big(v),
-        );
-        if v.unsigned_abs() > (1 << 53) {
-            assert_eq!(r.expect_err("expr").wire_code(), "22003", "expr {v}");
-        } else {
-            r.expect("expr");
-            assert_eq!(b_of(&core, &c, id), v, "expr {v}");
+        // 式の中も定数式の畳み込みが bigint 全域を丸めず評価する（Issue #2881）。途中で bigint の範囲を
+        // 超える `i64::MIN - 1` は PostgreSQL と同じく 22003、`p + 1 - 1` は途中が範囲内で通る。
+        for expr in ["p - 1 + 1", "p + 1 - 1"] {
+            id += 1;
+            let r = insert_bf(&core, &c, id, "b", expr, SqlColumnTypeName::BigInt, big(v));
+            let overflows =
+                (expr == "p - 1 + 1" && v == i64::MIN) || (expr == "p + 1 - 1" && v == i64::MAX);
+            if overflows {
+                assert_eq!(r.expect_err("expr").wire_code(), "22003", "{expr} {v}");
+            } else {
+                r.unwrap_or_else(|e| panic!("{expr} {v}: {}", e.wire_code()));
+                assert_eq!(b_of(&core, &c, id), v, "{expr} {v}");
+            }
         }
     }
     // 範囲を超える算術は 22003（PostgreSQL と同じ）。
@@ -1556,29 +1553,32 @@ fn extreme_finite_doubles_do_not_go_through_decimal() {
             .unwrap_or_else(|e| panic!("values lone {v:e}: {}", e.wire_code()));
         assert_eq!(f_of(&core, &c, id), v, "values lone {v:e}");
     }
-    // 式の中の 2^53 以上は畳み込みが 22003（fail-closed）、小さい側は通る。
-    id += 1;
-    insert_bf(
-        &core,
-        &c,
-        id,
-        "f",
-        "p + 0",
-        SqlColumnTypeName::Double,
-        float(1e-50),
-    )
-    .expect("tiny");
-    assert_eq!(f_of(&core, &c, id), 1e-50);
+    // 式の中の 2^53 以上の double も float8 の式として正確に畳み込まれる（Issue #2881）。
+    for v in [1e-50_f64, 1e300, -1e300, 9_007_199_254_740_994.0] {
+        id += 1;
+        insert_bf(
+            &core,
+            &c,
+            id,
+            "f",
+            "p + 0",
+            SqlColumnTypeName::Double,
+            float(v),
+        )
+        .unwrap_or_else(|e| panic!("expr {v:e}: {}", e.wire_code()));
+        assert_eq!(f_of(&core, &c, id), v, "expr {v:e}");
+    }
+    // float8 の算術が非有限になる形は 22003（PostgreSQL と同じ）。
     let e = insert_bf(
         &core,
         &c,
         99,
         "f",
-        "p + 0",
+        "p * p",
         SqlColumnTypeName::Double,
         float(1e300),
     )
-    .expect_err("big expr");
+    .expect_err("overflow");
     assert_eq!(e.wire_code(), "22003");
 }
 

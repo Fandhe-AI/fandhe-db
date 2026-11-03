@@ -289,3 +289,74 @@ fn extended_query_infers_param_types_inside_values_expressions() {
         );
     }
 }
+
+/// Issue #2881: 2^53 以上の整数の算術・比較が定数式の畳み込みで丸めなく評価され、bigint の
+/// 範囲外だけが `22003` になる（行は書かれない）。列 `DEFAULT` と operation_id 再送も同じ値で扱う。
+#[test]
+fn constant_expressions_beyond_2_53_are_exact() {
+    let path = unique_db_path("sql45-big");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let mut session = SessionState::default();
+    session.allow_ddl();
+    core.execute_sql_in_session(
+        &ctx(),
+        &mut session,
+        "CREATE TABLE big (id BIGINT PRIMARY KEY, embedding VECTOR(4), b BIGINT, ok BIGINT, \
+         d BIGINT DEFAULT 9007199254740993 * 2)",
+    )
+    .expect("create table");
+    let put = |id: u32, b: &str, ok: &str, op: &str| {
+        core.execute_insert_sql(
+            &ctx(),
+            &format!(
+                "INSERT INTO big (id, embedding, b, ok) VALUES ({id}, {VEC}, {b}, {ok}) \
+                 USING OPERATION_ID '{op}'"
+            ),
+        )
+        .map(|_| ())
+        .map_err(|e| e.wire_code().to_string())
+    };
+    put(
+        1,
+        "9007199254740992 + 1",
+        "CASE WHEN 9007199254740993 > 9007199254740992 THEN 1 ELSE 0 END",
+        "op-1",
+    )
+    .expect("1");
+    put(
+        2,
+        "9223372036854775807 - 1 + 1",
+        "CASE WHEN 9007199254740993 = 9007199254740992 THEN 1 ELSE 0 END",
+        "op-2",
+    )
+    .expect("2");
+    put(3, "0 - 9223372036854775807 - 1", "1", "op-3").expect("3");
+    // 範囲外は 22003 で、行は書かれない。
+    assert_eq!(
+        put(4, "9223372036854775807 + 1", "1", "op-4").unwrap_err(),
+        "22003"
+    );
+    assert_eq!(
+        put(5, "4611686018427387904 * 2", "1", "op-5").unwrap_err(),
+        "22003"
+    );
+    let rows = select(
+        &core,
+        &mut session,
+        "SELECT id, b, ok, d FROM big ORDER BY id LIMIT 10",
+    );
+    assert_eq!(rows.len(), 3);
+    let text = |r: usize, c: usize| dbg(&rows[r][c]);
+    assert!(text(0, 1).contains("9007199254740993"), "{}", text(0, 1));
+    assert!(text(0, 2).contains('1'), "{}", text(0, 2));
+    assert!(text(0, 3).contains("18014398509481986"), "{}", text(0, 3));
+    assert!(text(1, 1).contains("9223372036854775807"), "{}", text(1, 1));
+    assert!(text(1, 2).contains('0'), "{}", text(1, 2));
+    assert!(
+        text(2, 1).contains("-9223372036854775808"),
+        "{}",
+        text(2, 1)
+    );
+}

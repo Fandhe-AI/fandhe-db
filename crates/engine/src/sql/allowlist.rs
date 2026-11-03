@@ -33781,10 +33781,15 @@ mod tests {
                 .wire_code(),
             "42703"
         );
+        // Issue #2881: 2^53 を超える中間値も整数モードの畳み込みが丸めずに評価する。
         assert_eq!(
             parse("DEFAULT 9007199254740992 + 1 - 9007199254740992")
-                .unwrap_err()
-                .wire_code(),
+                .unwrap()
+                .default,
+            Some(InsertLiteral::Number("1".to_string()))
+        );
+        assert_eq!(
+            parse("DEFAULT power(2, 54)").unwrap_err().wire_code(),
             "22003"
         );
 
