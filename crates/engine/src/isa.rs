@@ -676,7 +676,9 @@ pub fn l2_sq_scalar(a: &[f32], b: &[f32]) -> f32 {
             let d = x - y;
             d * d
         })
-        .sum()
+        // `Iterator::sum` は空入力で -0.0 を返すため、+0.0 起点の fold で SIMD 経路（+0.0）と
+        // 空ベクトルの符号まで揃える（非空では全項非負なので結果は不変）。
+        .fold(0.0_f32, |acc, v| acc + v)
 }
 
 /// Arm Neon（4 レーン）向け L1 距離カーネル（Issue #1988）。intrinsics を使わない
