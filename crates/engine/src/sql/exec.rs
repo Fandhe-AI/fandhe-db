@@ -1005,7 +1005,7 @@ pub(crate) fn execute_statement_with_cache(
                 &bound.table,
                 access.hnsw_scope,
                 true,
-                crate::sql::hnsw_cache::query_metric_of_bound(),
+                crate::sql::hnsw_cache::query_metric_of_bound(bound),
             ),
             // 書き込みトランザクション由来では `hnsw_cache` 自体が `None` に落ちて
             // いるため到達しない。万一到達しても fail-closed（厳密 brute-force）。

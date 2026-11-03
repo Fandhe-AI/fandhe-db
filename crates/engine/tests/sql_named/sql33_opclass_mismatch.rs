@@ -301,3 +301,33 @@ fn rust_api_search_falls_back_to_exact_on_mismatch() {
     assert_eq!(mismatch, exact);
     assert_eq!(mismatch.len(), 5);
 }
+
+/// Cosine 宣言のみの表へ `<->`（L2）・`<#>`（IP）・`<+>`（L1）で問い合わせても、`EXPLAIN` は
+/// 演算子単位で `plain_scan_opclass_mismatch` を示す（物理グラフは Cosine のみ。`<=>` は HNSW のまま）。
+#[test]
+fn explain_non_cosine_operators_report_opclass_mismatch_on_cosine_index() {
+    let (core, _guard, vectors_b) = core_with_two_tenants("sql33-opclass-mismatch-ops", false);
+    ddl(&core, "CREATE INDEX idx_cos ON docs USING hnsw (embedding)");
+    let q = vec_literal(&vectors_b[0]);
+    let cos = explain_lines(
+        &core,
+        "tenant-b",
+        &format!("SELECT id FROM docs ORDER BY embedding <=> '{q}' LIMIT 5"),
+    );
+    assert_eq!(
+        line(&cos, "ann_plan: "),
+        "ann_plan: hnsw_full_visible index=idx_cos"
+    );
+    for op in ["<->", "<#>", "<+>"] {
+        let lines = explain_lines(
+            &core,
+            "tenant-b",
+            &format!("SELECT id FROM docs ORDER BY embedding {op} '{q}' LIMIT 5"),
+        );
+        assert_eq!(
+            line(&lines, "ann_plan: "),
+            "ann_plan: plain_scan_opclass_mismatch",
+            "operator {op}: {lines:?}"
+        );
+    }
+}

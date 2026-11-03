@@ -13028,7 +13028,7 @@ impl EngineCore {
             &partial_index_names,
             row_policy_present,
             false,
-            crate::sql::hnsw_cache::query_metric_of_bound(),
+            crate::sql::hnsw_cache::cosine_query_metric(),
         );
         drop(post_check_txn);
         Ok(crate::sql::explain::build_explain_result_with_indexes(
@@ -13458,7 +13458,7 @@ impl EngineCore {
             &partial_index_names,
             row_policy_present,
             bound.distance_descending(),
-            crate::sql::hnsw_cache::query_metric_of_bound(),
+            crate::sql::hnsw_cache::query_metric_of_bound(bound),
         );
         Ok(crate::sql::explain::build_search_explain_result(
             bound.mode(),
@@ -15727,7 +15727,7 @@ impl EngineCore {
                             table,
                             self.hnsw_scope,
                             true,
-                            crate::sql::hnsw_cache::query_metric_of_bound(),
+                            crate::sql::hnsw_cache::cosine_query_metric(),
                         ),
                         crate::catalog::HnswGate::Targeted { .. }
                     );

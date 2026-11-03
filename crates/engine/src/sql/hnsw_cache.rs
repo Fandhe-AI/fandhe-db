@@ -2522,11 +2522,18 @@ pub(crate) fn opclass_for_distance_kind(
     }
 }
 
-/// 束縛済み検索文の距離演算子に対応する opclass（ゲートの問い合わせ側 metric）。現状 bound は
-/// 種別を持たず `<=>` だけが受理されるため常にコサイン。Issue #1977 で bound が `DistanceKind`
-/// を保持した時点で [`opclass_for_distance_kind`] 経由の値に差し替える（呼び出し箇所は
-/// 本関数に集約済み）。
-pub(crate) fn query_metric_of_bound() -> crate::catalog::VectorOpClass {
+/// 束縛済み検索文の距離演算子に対応する opclass（ゲートの問い合わせ側 metric。Issue #1977・#1979）。
+/// `bound.distance_kind()` を [`opclass_for_distance_kind`] で写すため、`<->`／`<#>`／`<+>` は
+/// 索引が Cosine のとき `MetricMismatch`（厳密全走査）になる。SQL 実行側・EXPLAIN 側が共有する。
+pub(crate) fn query_metric_of_bound(
+    bound: &crate::sql::parser::BoundStatement,
+) -> crate::catalog::VectorOpClass {
+    opclass_for_distance_kind(bound.distance_kind())
+}
+
+/// 距離演算子を持たない問い合わせ（Rust API の `search`、`USING PLAN` の質問埋め込み検索）の
+/// 問い合わせ側 metric。これらはコサイン系なので Cosine を明示する。
+pub(crate) fn cosine_query_metric() -> crate::catalog::VectorOpClass {
     opclass_for_distance_kind(crate::sql::lexer::DistanceKind::Cosine)
 }
 
@@ -4492,7 +4499,7 @@ mod tests {
             opclass_for_distance_kind(DistanceKind::L1),
             VectorOpClass::L1
         );
-        assert_eq!(query_metric_of_bound(), VectorOpClass::Cosine);
+        assert_eq!(cosine_query_metric(), VectorOpClass::Cosine);
     }
 
     #[test]
