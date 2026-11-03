@@ -94,7 +94,9 @@ pub(crate) fn binary_param_for_wire_type(t: crate::result_encoder::WireType) -> 
         WireType::Time => BinaryParam::Time,
         WireType::TimestampTz => BinaryParam::TimestampTz,
         WireType::Interval => BinaryParam::Interval,
-        WireType::Date
+        // `bit` のバイナリ形式（`bit_send`／`bit_recv`）は対象外（Issue #2021）。
+        WireType::Bit
+        | WireType::Date
         | WireType::Timestamp
         | WireType::Json
         | WireType::Jsonb

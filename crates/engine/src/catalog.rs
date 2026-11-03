@@ -3628,6 +3628,9 @@ const CREATE_ONLY_RESERVED_TYPE_NAMES: &[&str] = &[
     "timestamptz",
     // Issue #1579（TABLE-34）。`INTERVAL` は型名解決表の語。
     "interval",
+    // Issue #2021（TABLE-48）。`BIT`・`VARBIT` は型名解決表の語。
+    "bit",
+    "varbit",
 ];
 
 /// カタログ層の公開エラー型。`redb` 操作由来のエラーは `Backend` に一本化し、
@@ -4238,6 +4241,11 @@ pub enum ColumnType {
     /// `interval`・param は `-` 固定。値の解析・整形は [`crate::datetime`] へ委譲する。
     /// PK・UNIQUE・索引・述語・集計・式は #1580・#1581 まで fail-closed。
     Interval,
+    /// 固定長ビット列（`BIT(n)`、TABLE-48・Issue #2021）。`n` は `1..=`[`crate::bit_string::MAX_BIT_LENGTH`]
+    /// （長さ省略の `BIT` は `BIT(1)`）。値は [`crate::bit_string::BitString`]（MSB 先頭・詰め物ビット 0）。
+    /// カタログタグは `bit`・param は `n` の 10 進。VECTOR 列の本数には数えない。PK・UNIQUE・索引・
+    /// 述語・並べ替え・集計・式・CAST・型変更は後続 Issue まで fail-closed（ワイルドカード腕を置かない）。
+    Bit(u32),
     /// 可変長の同型スカラー配列列（`<スカラー型>[]`、TABLE-14・TASK-198、Issue #888）。
     /// 要素型・要素数上限は [`ArrayType`] が保持する。検索経路（KNN・hybrid・ANN・
     /// 二次索引・`EXPLAIN`）からは一貫して非対象として除外する（`VECTOR` 列との
@@ -4450,6 +4458,8 @@ impl ColumnType {
             ColumnType::TimestampTz => 0,
             // `Interval` も PK／UNIQUE 非許可（Issue #1579。担当 Issue 未定の fail-closed）。
             ColumnType::Interval => 0,
+            // `Bit` も PK／UNIQUE 非許可（Issue #2021。fail-closed）。
+            ColumnType::Bit(_) => 0,
             ColumnType::Bytea => 7,
             ColumnType::Uuid => 8,
             ColumnType::Enum(_) => 9,
@@ -4490,6 +4500,7 @@ impl ColumnType {
             ColumnType::Time => ("time", "-".to_string()),
             ColumnType::TimestampTz => ("timestamptz", "-".to_string()),
             ColumnType::Interval => ("interval", "-".to_string()),
+            ColumnType::Bit(n) => ("bit", n.to_string()),
             ColumnType::Array(array_ty) => ("array", array_ty.catalog_param()),
             ColumnType::Bytea => ("bytea", "-".to_string()),
             ColumnType::Json => ("json", "-".to_string()),
@@ -4635,6 +4646,7 @@ impl ColumnType {
                 }
                 Ok(ColumnType::Interval)
             }
+            "bit" => Ok(ColumnType::Bit(parse_bit_length_param(param)?)),
             "array" => Ok(ColumnType::Array(parse_array_param(param, resolve_enum)?)),
             "bytea" => {
                 if param != "-" {
@@ -7089,6 +7101,7 @@ impl ColumnDefault {
                     | ColumnType::Time
                     | ColumnType::TimestampTz
                     | ColumnType::Interval
+                    | ColumnType::Bit(_)
                     | ColumnType::Uuid
                     | ColumnType::Enum(_)
                     | ColumnType::Json
@@ -7873,6 +7886,9 @@ pub(crate) fn is_row_identity_unsupported(e: &CatalogError) -> bool {
 enum MaterializedDefault {
     /// BYTEA のデコード済みバイト列。
     Bytes(Box<[u8]>),
+    /// BIT(n) の実体化済み値（ビット長 `len` と MSB 先頭のバイト列。Issue #2021）。
+    /// 登録時の宣言長を持ち、参照時に現在の列型と照合する。
+    Bit { len: u32, bytes: Box<[u8]> },
     /// 配列の要素列ペイロード（フレームヘッダなし。`ArrayRef::from_owned` が借用する形）。
     /// 登録時の列型 `ty` を持ち、参照時に現在の列型と照合する。
     Array {
@@ -7947,6 +7963,19 @@ impl TableSchema {
                             });
                         }
                     }
+                    ColumnType::Bit(n) => {
+                        // 失敗した列は登録しない（参照すると `None`＝invalid DEFAULT）。
+                        if let Ok(v) = crate::bit_string::BitString::parse_text(text, *n) {
+                            out.push(MaterializedDefaultEntry {
+                                logical_index: i,
+                                source: text.clone(),
+                                value: MaterializedDefault::Bit {
+                                    len: v.bit_len(),
+                                    bytes: v.as_bytes().to_vec().into_boxed_slice(),
+                                },
+                            });
+                        }
+                    }
                     ColumnType::Array(at) => {
                         // 失敗した列は登録しない（参照すると `None`＝invalid DEFAULT）。
                         let Ok(value) = crate::row_codec::parse_array_default(at, text) else {
@@ -7996,7 +8025,25 @@ impl TableSchema {
         }
         match &self.materialized_default(logical_index)?.value {
             MaterializedDefault::Bytes(b) => Some(b),
-            MaterializedDefault::Array { .. } => None,
+            MaterializedDefault::Bit { .. } | MaterializedDefault::Array { .. } => None,
+        }
+    }
+
+    /// 論理列 `logical_index` の BIT(n) `DEFAULT` を実体化済みバイト列への借用で返す
+    /// （Issue #2021）。用途・fail-closed 規則は [`Self::bytea_default_bytes`] と同じで、加えて
+    /// 登録時の宣言長が現在の列型の宣言長と一致することを照合し、食い違えば `None`。
+    pub(crate) fn bit_default_ref(
+        &self,
+        logical_index: usize,
+    ) -> Option<crate::bit_string::BitRef<'_>> {
+        let ColumnType::Bit(current) = &self.columns.get(logical_index)?.ty else {
+            return None;
+        };
+        match &self.materialized_default(logical_index)?.value {
+            MaterializedDefault::Bit { len, bytes } if len == current => {
+                crate::bit_string::BitRef::new(*len, bytes).ok()
+            }
+            _ => None,
         }
     }
 
@@ -8357,6 +8404,7 @@ impl TableSchema {
             | ColumnType::Time
             | ColumnType::TimestampTz
             | ColumnType::Interval
+            | ColumnType::Bit(_)
             | ColumnType::Bytea
             | ColumnType::Json
             | ColumnType::Jsonb
@@ -8491,6 +8539,28 @@ fn parse_char_length_param(tag: &str, param: &str) -> Result<u32> {
         return Err(CatalogError::Invalid(format!(
             "non-canonical {tag} length parameter"
         )));
+    }
+    Ok(n)
+}
+
+/// `bit(n)` のカタログ param を厳密に解釈する（Issue #2021）。`1..=MAX_BIT_LENGTH` の
+/// 正準 10 進（符号・先頭ゼロ・空文字列・`-` は拒否。TABLE-6 の「未知の形は拒否」方針）。
+fn parse_bit_length_param(param: &str) -> Result<u32> {
+    let n: u32 = if !param.is_empty() && param.bytes().all(|b| b.is_ascii_digit()) {
+        param.parse().ok()
+    } else {
+        None
+    }
+    .ok_or_else(|| CatalogError::Invalid("malformed bit length parameter".to_string()))?;
+    if n == 0 || n > crate::bit_string::MAX_BIT_LENGTH {
+        return Err(CatalogError::Invalid(
+            "bit length parameter out of range".to_string(),
+        ));
+    }
+    if n.to_string() != param {
+        return Err(CatalogError::Invalid(
+            "non-canonical bit length parameter".to_string(),
+        ));
     }
     Ok(n)
 }

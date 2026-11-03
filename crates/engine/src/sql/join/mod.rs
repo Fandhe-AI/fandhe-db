@@ -285,6 +285,7 @@ pub(crate) fn cell_payload_bytes(cell: &Cell) -> usize {
     match cell {
         Cell::Text(s) => s.len(),
         Cell::Bytes(b) => b.len(),
+        Cell::Bit(v) => v.as_bytes().len(),
         Cell::Json(s) => s.len(),
         Cell::Numeric(d) => d.to_string().len(),
         Cell::Vector(v) => v.len().saturating_mul(std::mem::size_of::<f32>()),

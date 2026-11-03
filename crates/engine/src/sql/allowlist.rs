@@ -125,6 +125,8 @@ const CREATE_TABLE_COLUMN_TYPE_KEYWORDS: &[&str] = &[
     "TIMETZ",
     "TIMESTAMPTZ",
     "INTERVAL",
+    "BIT",
+    "VARBIT",
     "BYTEA",
     "JSON",
     "JSONB",
@@ -1103,6 +1105,9 @@ pub enum SqlSurfaceError {
     /// `INTERVAL` リテラルのフィールド値が範囲外（TABLE-34・Issue #1579）。`22015`
     /// （[`crate::error_format::ErrorClass::IntervalFieldOverflow`]）。
     IntervalFieldOverflow { detail: String },
+    /// `BIT(n)` 列へ入れる文字列のビット数が宣言長と異なる（TABLE-48・Issue #2021）。`22026`
+    /// （[`crate::error_format::ErrorClass::StringDataLengthMismatch`]）。
+    StringDataLengthMismatch { detail: String },
     /// 構文上受理された値が、宣言済み型の表現として不正（TABLE-14・TASK-198、
     /// Issue #890）。ENUM 列の語彙外ラベル（[`crate::catalog::EnumLabelError`]）に
     /// 加え、UUID 列（TABLE-13〔検討中〕・TASK-197、Issue #887）の厳密文法違反
@@ -1882,6 +1887,14 @@ impl SqlSurfaceError {
         }
     }
 
+    /// `pub(crate)`: `sql::parser::bind_bit_literal`（TABLE-48・Issue #2021）が `BIT(n)` 列への
+    /// 文字列のビット数不一致（`22026`）を報告するために使う。detail に入力値を含めない。
+    pub(crate) fn string_data_length_mismatch(detail: impl Into<String>) -> Self {
+        SqlSurfaceError::StringDataLengthMismatch {
+            detail: truncate_for_error(&detail.into()),
+        }
+    }
+
     /// `pub(crate)`: `sql::parser::bind_enum_literal`（Issue #890）が ENUM 列の
     /// 語彙外ラベルを報告するために使う。エラーメッセージには語彙の一覧を
     /// 含めない（型名とクライアント自身の入力値のみ。security.md P0）。
@@ -2043,6 +2056,9 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::DatetimeFieldOverflow { .. } => ErrorClass::DatetimeFieldOverflow,
             SqlSurfaceError::InvalidDatetimeFormat { .. } => ErrorClass::InvalidDatetimeFormat,
             SqlSurfaceError::IntervalFieldOverflow { .. } => ErrorClass::IntervalFieldOverflow,
+            SqlSurfaceError::StringDataLengthMismatch { .. } => {
+                ErrorClass::StringDataLengthMismatch
+            }
             SqlSurfaceError::InvalidTextRepresentation { .. } => {
                 ErrorClass::InvalidTextRepresentation
             }
@@ -2252,6 +2268,9 @@ impl std::fmt::Display for SqlSurfaceError {
             }
             SqlSurfaceError::IntervalFieldOverflow { detail } => {
                 write!(f, "interval field overflow: {detail}")
+            }
+            SqlSurfaceError::StringDataLengthMismatch { detail } => {
+                write!(f, "string data length mismatch: {detail}")
             }
             SqlSurfaceError::InvalidTextRepresentation { detail } => {
                 write!(f, "invalid text representation: {detail}")
@@ -30768,7 +30787,7 @@ mod tests {
             assert!(is_column_type_keyword(kw), "{kw}");
             assert!(is_column_type_keyword(&kw.to_ascii_lowercase()), "{kw}");
         }
-        assert_eq!(CREATE_TABLE_COLUMN_TYPE_KEYWORDS.len(), 37);
+        assert_eq!(CREATE_TABLE_COLUMN_TYPE_KEYWORDS.len(), 39);
         for ok in ["Int4", "iNt8", "float4", "FLOAT8", "int", "int2", "varchar"] {
             assert!(is_column_type_keyword(ok), "{ok}");
         }

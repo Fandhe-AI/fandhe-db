@@ -106,6 +106,7 @@ pub(crate) fn body_column_index(schema: &TableSchema) -> Result<usize, SqlSurfac
         | ColumnType::Time
         | ColumnType::TimestampTz
         | ColumnType::Interval
+        | ColumnType::Bit(_)
         | ColumnType::Array(_)
         | ColumnType::Bytea
         | ColumnType::Json

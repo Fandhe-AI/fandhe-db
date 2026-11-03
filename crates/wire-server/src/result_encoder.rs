@@ -23,7 +23,7 @@
 //! - `ColumnMeta::Scalar{ty: Bpchar(n)}` → `bpchar`（OID 1042, typlen -1。TABLE-31・
 //!   Issue #1565）
 //! - 型修飾子（RowDescription の typmod）は `VARCHAR(n)`／`CHAR(n)` が `n + 4`
-//!   （PostgreSQL の VARHDRSZ 加算。[`column_type_modifier`]）、それ以外は常に -1
+//!   （PostgreSQL の VARHDRSZ 加算。[`column_type_modifier`]）、`BIT(n)` が `n`、それ以外は常に -1
 //! - `ColumnMeta::Scalar{ty: Vector(_)}` → `text`（OID 25。値は `[v1,v2,...]` 形式。
 //!   `VECTOR` 独自のバイナリ表現は定義しないため引き続き text 固定・受入基準 3）
 //! - `ColumnMeta::Scalar{ty: Boolean}` → `bool`（OID 16, typlen 1。値は `t`/`f`。
@@ -47,6 +47,8 @@
 //! - `ColumnMeta::Scalar{ty: Interval}`／集計結果の INTERVAL → `interval`（OID 1186,
 //!   typlen 16。TABLE-34・WIRE-13・WIRE-14・Issue #1583。バイナリは time i64・day i32・
 //!   month i32 の計 16 バイト BE。テキストは IntervalStyle=postgres）
+//! - `ColumnMeta::Scalar{ty: Bit(n)}` → `bit`（OID 1560, typlen -1, typmod `n`。TABLE-48・
+//!   Issue #2021。テキストは `0`／`1` の文字列。バイナリは対象外で `0A000`）
 //! - `ColumnMeta::Scalar{ty: Bytea}` → `bytea`（OID 17, typlen -1。同上）
 //! - `ColumnMeta::Scalar{ty: Uuid}` → `uuid`（OID 2950, typlen 16。同上）
 //! - `ColumnMeta::Scalar{ty: Json}` → `json`（OID 114, typlen -1。同上）
@@ -543,6 +545,10 @@ wire_type_enum! {
         /// テキスト表現は IntervalStyle=postgres、バイナリは time i64・day i32・month i32 の
         /// 16 バイト BE。
         Interval,
+        /// `ColumnMeta::Scalar{ty: Bit(n)}`（`BIT(n)`。TABLE-48・Issue #2021）。OID 1560・typlen -1・
+        /// typmod は `n`。テキスト表現は `0`／`1` の文字列。バイナリ形式（`bit_send`／`bit_recv`）は
+        /// 対象外で `0A000`（fail-closed）。
+        Bit,
         /// `ColumnMeta::Scalar{ty: Bytea}`（TABLE-13・TASK-197・Issue #886・
         /// WIRE-13・TASK-200・Issue #895）。テキスト表現は `\x` + 小文字 16 進
         /// （`engine::bytea::format_hex_text`。PostgreSQL 既定の `bytea_output=hex`
@@ -627,6 +633,7 @@ impl WireType {
             WireType::Time => 1083,
             WireType::TimestampTz => 1184,
             WireType::Interval => 1186,
+            WireType::Bit => 1560,
             WireType::Bytea => 17,
             WireType::Uuid => 2950,
             WireType::Json => 114,
@@ -656,6 +663,7 @@ impl WireType {
             | WireType::Text
             | WireType::Varchar
             | WireType::Bpchar
+            | WireType::Bit
             | WireType::Bytea
             | WireType::Json
             | WireType::Jsonb
@@ -705,6 +713,7 @@ impl WireType {
             WireType::Time => "time",
             WireType::TimestampTz => "timestamptz",
             WireType::Interval => "interval",
+            WireType::Bit => "bit",
             WireType::Bytea => "bytea",
             WireType::Uuid => "uuid",
             WireType::Json => "json",
@@ -763,8 +772,10 @@ impl WireType {
             WireType::Uuid => Some(D::Uuid),
             WireType::Json => Some(D::Json),
             WireType::Jsonb => Some(D::Jsonb),
+            // `bit` の宣言 OID（1560）は engine に宣言型が無く `0A000`（fail-closed。Issue #2021）。
             // 配列型の宣言は engine に宣言型が無く、従来どおり `0A000`（WIRE-24・Issue #1606）。
-            WireType::TextArray
+            WireType::Bit
+            | WireType::TextArray
             | WireType::BoolArray
             | WireType::Int4Array
             | WireType::Int8Array
@@ -819,6 +830,8 @@ impl WireType {
             // `DATE`／`TIMESTAMP`／`JSON`／`JSONB` は WIRE-14 の非対応型のまま
             // fail-closed で `0A000` に拒否する。
             WireType::Date | WireType::Timestamp | WireType::Json | WireType::Jsonb => false,
+            // `bit` のバイナリ形式（`bit_send`／`bit_recv`）は対象外（Issue #2021）。fail-closed で `0A000`。
+            WireType::Bit => false,
             // 配列のバイナリ形式は対象外（TABLE-35 (4)・WIRE-14）。fail-closed で `0A000`。
             WireType::TextArray
             | WireType::BoolArray
@@ -895,7 +908,9 @@ fn scalar_type_binary_support(ty: &engine::catalog::ColumnType) -> bool {
         | ColumnType::Json
         | ColumnType::Jsonb
         | ColumnType::Date
-        | ColumnType::Timestamp => false,
+        | ColumnType::Timestamp
+        // `bit` のバイナリ形式は対象外（Issue #2021）。
+        | ColumnType::Bit(_) => false,
     }
 }
 
@@ -925,6 +940,8 @@ fn scalar_type_modifier(ty: &engine::catalog::ColumnType) -> Result<i32, EncodeE
             .ok()
             .and_then(|n| n.checked_add(VARHDRSZ))
             .ok_or(EncodeError),
+        // `BIT(n)` の typmod は PostgreSQL と同じく `n` そのもの（VARHDRSZ を加えない。Issue #2021）。
+        ColumnType::Bit(n) => i32::try_from(*n).map_err(|_| EncodeError),
         ColumnType::Varchar(None)
         | ColumnType::Text
         | ColumnType::SmallInt
@@ -1012,6 +1029,8 @@ fn scalar_wire_type(ty: &engine::catalog::ColumnType) -> WireType {
         // INTERVAL は interval（OID 1186・typlen 16。TABLE-34・Issue #1583）。text は
         // `format_interval`（IntervalStyle=postgres）の文字列で送る。
         engine::catalog::ColumnType::Interval => WireType::Interval,
+        // BIT(n) は bit（OID 1560・typlen -1・typmod n。TABLE-48・Issue #2021）。
+        engine::catalog::ColumnType::Bit(_) => WireType::Bit,
         engine::catalog::ColumnType::Bytea => WireType::Bytea,
         engine::catalog::ColumnType::Uuid => WireType::Uuid,
         engine::catalog::ColumnType::Json => WireType::Json,
@@ -1255,6 +1274,8 @@ fn cell_to_text(
         Cell::TimestampTz(micros) => Ok(Some(engine::datetime::format_timestamptz(*micros, tz))),
         // INTERVAL は `IntervalStyle=postgres` の整形（OID 1186。Issue #1579・#1583）。
         Cell::Interval(v) => Ok(Some(engine::datetime::format_interval(v))),
+        // BIT(n) は `0`／`1` の文字列（OID 1560。TABLE-48・Issue #2021）。
+        Cell::Bit(v) => Ok(Some(v.format_text())),
         // 配列の描画は engine の `ArrayValue::to_pg_text` に集約（`CAST(.. AS text)` と共有。
         // 空配列は `{}`、NULL 要素は引用なしの `NULL`、TEXT 要素の引用規則も同所。
         // RowDescription の OID は他の非 VECTOR スカラー列と同じ text（25）のまま。WIRE-13）。
@@ -1915,6 +1936,7 @@ mod tests {
             (Some(ColumnType::Time), 1083, 8),
             (Some(ColumnType::TimestampTz), 1184, 8),
             (Some(ColumnType::Interval), 1186, 16),
+            (Some(ColumnType::Bit(4)), 1560, -1),
             (
                 Some(ColumnType::Numeric {
                     precision: 38,
@@ -2839,7 +2861,7 @@ mod tests {
     /// 保証はマクロが担う）。
     #[test]
     fn wire_type_all_is_exhaustive() {
-        assert_eq!(WireType::ALL.len(), 34);
+        assert_eq!(WireType::ALL.len(), 35);
     }
 
     /// Parse の宣言 OID 写像（Issue #2436・WIRE-24 ポインタ）: 全 variant が OID から
@@ -2850,7 +2872,9 @@ mod tests {
             assert_eq!(WireType::from_oid(t.oid()), Some(t));
             // 配列型・`record` は宣言型を持たず（None）、Parse では `0A000`（WIRE-24・Issue #1606。
             // `record` は再帰 CTE の SEARCH 順序列専用の公告型。SQL-35・Issue #2213）。
-            let is_array = t.pg_type_name().starts_with('_') || t == WireType::Record;
+            // `bit`（OID 1560）も宣言型を持たない（Parse の宣言 OID は `0A000`。Issue #2021）。
+            let is_array =
+                t.pg_type_name().starts_with('_') || t == WireType::Record || t == WireType::Bit;
             assert_eq!(t.declared_param_type().is_none(), is_array, "{t:?}");
         }
         assert_eq!(WireType::from_oid(0), None);
@@ -2863,7 +2887,7 @@ mod tests {
     /// そのものを外部オラクルで検証する（WIRE-13・TASK-200・Issue #895）。
     #[test]
     fn wire_type_table_matches_postgres_builtin_catalog() {
-        let expected: [(WireType, i32, i16, &str); 34] = [
+        let expected: [(WireType, i32, i16, &str); 35] = [
             (WireType::Numeric, 1700, -1, "numeric"),
             (WireType::Text, 25, -1, "text"),
             (WireType::Varchar, 1043, -1, "varchar"),
@@ -2879,6 +2903,7 @@ mod tests {
             (WireType::Time, 1083, 8, "time"),
             (WireType::TimestampTz, 1184, 8, "timestamptz"),
             (WireType::Interval, 1186, 16, "interval"),
+            (WireType::Bit, 1560, -1, "bit"),
             (WireType::Bytea, 17, -1, "bytea"),
             (WireType::Uuid, 2950, 16, "uuid"),
             (WireType::Json, 114, -1, "json"),
@@ -3583,6 +3608,10 @@ mod tests {
         assert_eq!(m(&scalar(ColumnType::Bpchar(5))), Some(9));
         assert_eq!(m(&scalar(ColumnType::Bpchar(1))), Some(5));
         assert_eq!(m(&scalar(ColumnType::Text)), Some(-1));
+        // BIT(n) の typmod は n そのもの（VARHDRSZ を加えない。Issue #2021）。
+        assert_eq!(m(&scalar(ColumnType::Bit(1))), Some(1));
+        assert_eq!(m(&scalar(ColumnType::Bit(83_886_080))), Some(83_886_080));
+        assert!(column_type_modifier(&scalar(ColumnType::Bit(u32::MAX))).is_err());
         assert_eq!(m(&ColumnMeta::Id), Some(-1));
         let computed = |ty| ColumnMeta::Computed {
             name: "x".to_string(),

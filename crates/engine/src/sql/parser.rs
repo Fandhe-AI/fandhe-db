@@ -840,6 +840,7 @@ pub(crate) fn bind_integer_literal(
         | ColumnType::Time
         | ColumnType::TimestampTz
         | ColumnType::Interval
+        | ColumnType::Bit(_)
         | ColumnType::Array(_)
         | ColumnType::Bytea
         | ColumnType::Json
@@ -1020,6 +1021,7 @@ pub(crate) fn bind_datetime_literal(
         | ColumnType::Integer
         | ColumnType::BigInt
         | ColumnType::Boolean
+        | ColumnType::Bit(_)
         | ColumnType::Array(_)
         | ColumnType::Bytea
         | ColumnType::Json
@@ -1488,6 +1490,7 @@ pub(crate) fn vector_column(schema: &TableSchema) -> Result<(usize, u32), SqlSur
             | ColumnType::Time
             | ColumnType::TimestampTz
             | ColumnType::Interval
+            | ColumnType::Bit(_)
             | ColumnType::Array(_)
             | ColumnType::Bytea
             | ColumnType::Json
@@ -1542,6 +1545,7 @@ pub(crate) fn text_column_index(
                 | ColumnType::Time
                 | ColumnType::TimestampTz
                 | ColumnType::Interval
+                | ColumnType::Bit(_)
                 | ColumnType::Array(_)
                 | ColumnType::Bytea
                 | ColumnType::Json
@@ -3631,6 +3635,11 @@ pub(crate) fn bind_column_default(
     if let (ColumnType::Bytea, ColumnDefault::Text(s)) = (&column.ty, default) {
         return bind_bytea_literal(s, &column.name);
     }
+    // BIT(n) も借用の `ScalarRef` で返せないため、INSERT のリテラル束縛と同じ
+    // `bind_bit_literal` を共有する（22P02／22026 の写像も共通。Issue #2021）。
+    if let (ColumnType::Bit(n), ColumnDefault::Text(s)) = (&column.ty, default) {
+        return bind_bit_literal(&column.name, *n, s);
+    }
     // 配列も借用の `ScalarRef` で返せないため、INSERT のリテラル束縛と同じ
     // `parse_array_literal` の結果（SQLSTATE 含む）をそのまま返す（Issue #1374）。
     if let (ColumnType::Array(at), ColumnDefault::Text(s)) = (&column.ty, default) {
@@ -4002,6 +4011,9 @@ fn bind_insert_row(
             (ColumnType::Interval, InsertLiteral::String(s)) => {
                 bind_datetime_literal(name, ColumnType::Interval, s)?
             }
+            (ColumnType::Bit(bit_len), InsertLiteral::String(s)) => {
+                bind_bit_literal(name, *bit_len, s)?
+            }
             (
                 ColumnType::Time,
                 InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_),
@@ -4024,6 +4036,14 @@ fn bind_insert_row(
             ) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects an INTERVAL literal (e.g. '1 day 02:00:00')"
+                )))
+            }
+            (
+                ColumnType::Bit(_),
+                InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_),
+            ) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects a bit string literal (e.g. '1010')"
                 )))
             }
             (ColumnType::Array(array_ty), InsertLiteral::String(s)) => {
@@ -4179,6 +4199,7 @@ pub(crate) fn bind_json_literal(
         | ColumnType::Time
         | ColumnType::TimestampTz
         | ColumnType::Interval
+        | ColumnType::Bit(_)
         | ColumnType::Array(_)
         | ColumnType::Bytea
         | ColumnType::Enum(_)
@@ -4223,6 +4244,34 @@ pub(crate) fn bind_enum_literal(
         Err(_) => Err(SqlSurfaceError::invalid_text_representation(format!(
             "column {column_name:?} (enum {:?}) does not accept label {s:?}",
             def.name()
+        ))),
+    }
+}
+
+/// `BIT(n)` 列（TABLE-48・Issue #2021）向けの文字列リテラル束縛。INSERT／UPDATE SET／UPSERT／
+/// 列 DEFAULT／COPY FROM が共有する単一情報源。`0`・`1` 以外の文字は `22P02`、ビット数が宣言長
+/// `n` と異なる場合は `22026`。エラー文言は固定の英語で、入力値は含めない。
+pub(crate) fn bind_bit_literal(
+    column_name: &str,
+    declared_len: u32,
+    literal: &str,
+) -> Result<crate::row_codec::Value, SqlSurfaceError> {
+    use crate::bit_string::{BitError, BitString};
+    match BitString::parse_text(literal, declared_len) {
+        Ok(v) => Ok(crate::row_codec::Value::Bit(v)),
+        Err(BitError::InvalidDigit) => Err(SqlSurfaceError::invalid_text_representation(format!(
+            "column {column_name:?}: {}",
+            BitError::InvalidDigit.message()
+        ))),
+        Err(BitError::LengthMismatch) => {
+            Err(SqlSurfaceError::string_data_length_mismatch(format!(
+                "column {column_name:?}: {}",
+                BitError::LengthMismatch.message()
+            )))
+        }
+        Err(BitError::InvalidLayout) => Err(SqlSurfaceError::invalid_input(format!(
+            "column {column_name:?}: {}",
+            BitError::InvalidLayout.message()
         ))),
     }
 }
@@ -4513,6 +4562,9 @@ pub(crate) fn bind_set_assignments(
             (ColumnType::Interval, InsertLiteral::String(s)) => {
                 bind_datetime_literal(name, ColumnType::Interval, s)?
             }
+            (ColumnType::Bit(bit_len), InsertLiteral::String(s)) => {
+                bind_bit_literal(name, *bit_len, s)?
+            }
             (
                 ColumnType::Time,
                 InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_),
@@ -4535,6 +4587,14 @@ pub(crate) fn bind_set_assignments(
             ) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects an INTERVAL literal (e.g. '1 day 02:00:00')"
+                )))
+            }
+            (
+                ColumnType::Bit(_),
+                InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_),
+            ) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects a bit string literal (e.g. '1010')"
                 )))
             }
             (ColumnType::Array(array_ty), InsertLiteral::String(s)) => {
@@ -6084,6 +6144,9 @@ fn bind_upsert_assignments(
                     (ColumnType::Interval, InsertLiteral::String(s)) => {
                         bind_datetime_literal(name, ColumnType::Interval, s)?
                     }
+                    (ColumnType::Bit(bit_len), InsertLiteral::String(s)) => {
+                        bind_bit_literal(name, *bit_len, s)?
+                    }
                     (ColumnType::Time, InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_)) => {
                         return Err(SqlSurfaceError::invalid_input(format!(
                             "column {name:?} expects a TIME literal (HH:MM:SS)"
@@ -6097,6 +6160,14 @@ fn bind_upsert_assignments(
                     (ColumnType::Interval, InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_)) => {
                         return Err(SqlSurfaceError::invalid_input(format!(
                             "column {name:?} expects an INTERVAL literal (e.g. '1 day 02:00:00')"
+                        )))
+                    }
+                    (
+                        ColumnType::Bit(_),
+                        InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_),
+                    ) => {
+                        return Err(SqlSurfaceError::invalid_input(format!(
+                            "column {name:?} expects a bit string literal (e.g. '1010')"
                         )))
                     }
                     (ColumnType::Array(array_ty), InsertLiteral::String(s)) => {
@@ -6324,6 +6395,11 @@ fn bind_file_insert(
             (ColumnType::Interval, _) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?}: INTERVAL column is not supported for file-form INSERT"
+                )))
+            }
+            (ColumnType::Bit(_), _) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?}: BIT column is not supported for file-form INSERT"
                 )))
             }
             // 配列列（TABLE-14・Issue #888）も BOOLEAN と同じく対象外として拒否する。
@@ -7594,6 +7670,10 @@ fn resolve_aggregate_input(
                     (ColumnType::Bpchar(_), _) => Err(SqlSurfaceError::undefined_function(
                         format!("column {name:?} is CHAR and cannot be used with SUM/AVG/MIN/MAX"),
                     )),
+                    // BIT(n) 列は集計の対象外（TABLE-48 (1) のビット列関数は 42883。Issue #2021）。
+                    (ColumnType::Bit(_), _) => Err(SqlSurfaceError::undefined_function(format!(
+                        "column {name:?} is BIT and cannot be used with aggregate functions"
+                    ))),
                     (ColumnType::Vector(_), AggregateFunc::Count) => {
                         Ok(AggregateInput::VectorColumnPresence)
                     }
@@ -8202,6 +8282,7 @@ fn bind_array_agg_value(
             | ColumnType::Time
             | ColumnType::TimestampTz
             | ColumnType::Interval
+            | ColumnType::Bit(_)
             | ColumnType::Vector(_)
             | ColumnType::Array(_)
             | ColumnType::Enum(_) => {
@@ -8445,6 +8526,9 @@ fn resolve_count_distinct_input(
                     ColumnType::Bpchar(_) => Ok(AggregateInput::TextColumn(index)),
                     ColumnType::Vector(_) => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} is VECTOR and cannot be used with COUNT(DISTINCT ...)"
+                    ))),
+                    ColumnType::Bit(_) => Err(SqlSurfaceError::invalid_input(format!(
+                        "column {name:?} is BIT and cannot be used with COUNT(DISTINCT ...)"
                     ))),
                     ColumnType::SmallInt => Ok(AggregateInput::SmallIntColumn(index)),
                     ColumnType::Integer => Ok(AggregateInput::IntegerColumn(index)),
@@ -9231,6 +9315,7 @@ fn resolve_order_kind(ty: &ColumnType) -> Option<OrderKind> {
         ColumnType::Enum(_) => Some(OrderKind::Enum),
         ColumnType::Interval => Some(OrderKind::Interval),
         ColumnType::Vector(_)
+        | ColumnType::Bit(_)
         | ColumnType::Array(_)
         | ColumnType::Bytea
         | ColumnType::Json
@@ -10657,6 +10742,7 @@ fn resolve_window_key(name: &str, schema: &TableSchema) -> Result<WindowKeyRef, 
             | ColumnType::Jsonb
             | ColumnType::Bpchar(_)
             | ColumnType::Interval
+            | ColumnType::Bit(_)
             | ColumnType::Enum(_) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} cannot be used as a window PARTITION BY/ORDER BY key"

@@ -283,6 +283,12 @@ impl CastType {
                     detail: "cast to or from type vector is not supported".to_string(),
                 })
             }
+            // BIT(n) の CAST は後続 Issue まで未対応（fail-closed。Issue #2021）。
+            SqlColumnTypeName::Bit(_) => {
+                return Err(SqlSurfaceError::FeatureNotSupported {
+                    detail: "cast to or from type bit is not supported".to_string(),
+                })
+            }
             SqlColumnTypeName::Alias { target, .. } => return CastType::from_sql_type_name(target),
             SqlColumnTypeName::Enum(name) => {
                 return Err(SqlSurfaceError::UndefinedType { name: name.clone() })
@@ -530,7 +536,8 @@ pub(crate) fn kind_of_column(ty: &ColumnType) -> Option<CastKind> {
         ColumnType::Uuid => Some(CastKind::Uuid),
         ColumnType::Bytea => Some(CastKind::Bytea),
         ColumnType::Array(_) => Some(CastKind::Array),
-        ColumnType::Vector(_) | ColumnType::Enum(_) => None,
+        // BIT(n) の CAST は後続 Issue まで未対応（fail-closed。Issue #2021）。
+        ColumnType::Vector(_) | ColumnType::Enum(_) | ColumnType::Bit(_) => None,
     }
 }
 
@@ -567,7 +574,7 @@ pub(crate) fn cast_type_of_column(ty: &ColumnType) -> Option<CastType> {
         ColumnType::Uuid => CastType::Uuid,
         ColumnType::Bytea => CastType::Bytea,
         ColumnType::Array(at) => CastType::Array(Box::new(elem_cast_type(at.elem())?)),
-        ColumnType::Vector(_) | ColumnType::Enum(_) => return None,
+        ColumnType::Vector(_) | ColumnType::Enum(_) | ColumnType::Bit(_) => return None,
     })
 }
 

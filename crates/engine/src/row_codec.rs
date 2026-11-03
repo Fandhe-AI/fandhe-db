@@ -191,6 +191,9 @@ pub enum Value {
     /// `INTERVAL` 列の値（TABLE-34・Issue #1579）。月・日・マイクロ秒の三要素。
     /// 他型の variant を流用しない（取り違えによる fail-open を防ぐ）。
     Interval(crate::datetime::Interval),
+    /// `BIT(n)` 列の値（TABLE-48・Issue #2021）。`Bytes` を流用しない（bytea として比較・整形
+    /// される取り違えを防ぐ）。行バイト表現は presence + `u32` LE ビット長 + `ceil(len/8)` バイト。
+    Bit(crate::bit_string::BitString),
     /// 配列列の値（TABLE-14・TASK-198、Issue #888）。要素型ごとに variant を
     /// 分けることで、同一列の要素がすべて同じ型であることを型で保証する
     /// （`ColumnType::Array` の `ArrayElemType` と対応させる）。
@@ -953,6 +956,8 @@ pub enum ScalarRef<'a> {
     TimestampTz(i64),
     /// `INTERVAL` 列（TABLE-34・Issue #1579）。月・日・マイクロ秒の三要素。
     Interval(crate::datetime::Interval),
+    /// `BIT(n)` 列の借用結果（TABLE-48・Issue #2021）。TEXT 前提の消費側へは流入させない。
+    Bit(crate::bit_string::BitRef<'a>),
     /// 配列列の借用結果（Issue #888）。構造・UTF-8・要素上限はすべて走査時に
     /// 検証済みで、[`ArrayRef::to_value`] は追加のエラー処理なしに複製できる。
     Array(ArrayRef<'a>),
@@ -1001,6 +1006,7 @@ impl<'a> ScalarRef<'a> {
             | ScalarRef::Time(_)
             | ScalarRef::TimestampTz(_)
             | ScalarRef::Interval(_)
+            | ScalarRef::Bit(_)
             | ScalarRef::Array(_)
             | ScalarRef::Bytes(_)
             | ScalarRef::Json(_)
@@ -1023,6 +1029,7 @@ impl<'a> ScalarRef<'a> {
             | ScalarRef::Time(_)
             | ScalarRef::TimestampTz(_)
             | ScalarRef::Interval(_)
+            | ScalarRef::Bit(_)
             | ScalarRef::Array(_)
             | ScalarRef::Bytes(_)
             | ScalarRef::Json(_)
@@ -1047,6 +1054,7 @@ impl<'a> ScalarRef<'a> {
             | ScalarRef::Time(_)
             | ScalarRef::TimestampTz(_)
             | ScalarRef::Interval(_)
+            | ScalarRef::Bit(_)
             | ScalarRef::Array(_)
             | ScalarRef::Bytes(_)
             | ScalarRef::Json(_)
@@ -1071,6 +1079,7 @@ impl<'a> ScalarRef<'a> {
             | ScalarRef::Time(_)
             | ScalarRef::TimestampTz(_)
             | ScalarRef::Interval(_)
+            | ScalarRef::Bit(_)
             | ScalarRef::Array(_)
             | ScalarRef::Bytes(_)
             | ScalarRef::Json(_)
@@ -1105,6 +1114,7 @@ impl<'a> ScalarRef<'a> {
             ScalarRef::Time(t) => Some(*t),
             ScalarRef::TimestampTz(_)
             | ScalarRef::Interval(_)
+            | ScalarRef::Bit(_)
             | ScalarRef::Text(_)
             | ScalarRef::Integer(_)
             | ScalarRef::BigInt(_)
@@ -1140,6 +1150,7 @@ impl<'a> ScalarRef<'a> {
             | ScalarRef::Time(_)
             | ScalarRef::TimestampTz(_)
             | ScalarRef::Interval(_)
+            | ScalarRef::Bit(_)
             | ScalarRef::Array(_)
             | ScalarRef::Bytes(_)
             | ScalarRef::Json(_)
@@ -1168,6 +1179,7 @@ impl<'a> ScalarRef<'a> {
             | ScalarRef::Time(_)
             | ScalarRef::TimestampTz(_)
             | ScalarRef::Interval(_)
+            | ScalarRef::Bit(_)
             | ScalarRef::Array(_)
             | ScalarRef::Bytes(_)
             | ScalarRef::Json(_)
@@ -1198,6 +1210,7 @@ impl<'a> ScalarRef<'a> {
             | ScalarRef::Time(_)
             | ScalarRef::TimestampTz(_)
             | ScalarRef::Interval(_)
+            | ScalarRef::Bit(_)
             | ScalarRef::Array(_)
             | ScalarRef::Json(_)
             | ScalarRef::Enum(_)
@@ -1224,6 +1237,7 @@ impl<'a> ScalarRef<'a> {
             | ScalarRef::Time(_)
             | ScalarRef::TimestampTz(_)
             | ScalarRef::Interval(_)
+            | ScalarRef::Bit(_)
             | ScalarRef::Array(_)
             | ScalarRef::Bytes(_)
             | ScalarRef::Json(_)
@@ -1386,6 +1400,81 @@ fn read_interval_payload(
         ));
     }
     Ok((v, end))
+}
+
+/// `BIT(n)` 値 1 個をスカラーペイロードへ書き込んだ場合のフレーム込みバイト数
+/// （presence(1) + ビット長(4, LE u32) + `ceil(len/8)`。Issue #2021・TABLE-48）。
+/// 値が列の宣言長と一致しない・上限を超える場合は `Invalid`（fail-closed）。
+fn bit_entry_len(
+    column: &crate::catalog::ColumnDef,
+    v: &crate::bit_string::BitString,
+) -> std::result::Result<u32, RowCodecError> {
+    let ColumnType::Bit(declared) = column.ty else {
+        return Err(RowCodecError::Invalid(format!(
+            "column {:?} expects a non-Bit value, got Bit",
+            column.name
+        )));
+    };
+    if v.bit_len() != declared {
+        return Err(RowCodecError::Invalid(format!(
+            "column {:?}: bit string length does not match the declared bit({declared})",
+            column.name
+        )));
+    }
+    // 内部表現の不変条件（バイト数・詰め物ビット 0）を最後の砦として再検証する。
+    crate::bit_string::BitString::from_parts(v.bit_len(), v.as_bytes().to_vec())
+        .map_err(|e| RowCodecError::Invalid(e.message().to_string()))?;
+    let body = u32::try_from(v.as_bytes().len())
+        .map_err(|_| RowCodecError::Invalid("bit field too long".to_string()))?;
+    if body > MAX_TEXT_FIELD_LEN {
+        return Err(RowCodecError::Invalid(format!(
+            "bit field length {body} exceeds limit {MAX_TEXT_FIELD_LEN}"
+        )));
+    }
+    body.checked_add(5)
+        .ok_or_else(|| RowCodecError::Invalid("bit field length overflow".to_string()))
+}
+
+/// `BIT(n)` の値部（ビット長 `u32` LE + 本体）を書き込む。呼び出し側が presence の書き込みと
+/// [`bit_entry_len`] による検証を済ませている前提（Issue #2021）。
+fn write_bit_payload(buf: &mut Vec<u8>, v: &crate::bit_string::BitString) {
+    buf.extend_from_slice(&v.bit_len().to_le_bytes());
+    buf.extend_from_slice(v.as_bytes());
+}
+
+/// `BIT(n)` の値部を `offset` から読み、ビット長が宣言長 `declared` と一致すること・残りバイト数が
+/// 足りること・詰め物ビットが 0 であることを、確保（複製）より前に検証して借用形と次の offset を返す。
+/// いずれかに反する行バイト列は `Invalid`（fail-closed。Issue #2021）。
+fn read_bit_payload(
+    buf: &[u8],
+    offset: usize,
+    declared: u32,
+) -> std::result::Result<(crate::bit_string::BitRef<'_>, usize), RowCodecError> {
+    let len_end = offset
+        .checked_add(4)
+        .ok_or_else(|| RowCodecError::Invalid("offset overflow before bit length".to_string()))?;
+    let len_bytes: [u8; 4] = buf
+        .get(offset..len_end)
+        .ok_or_else(|| RowCodecError::Invalid("row buffer truncated at bit length".to_string()))?
+        .try_into()
+        .map_err(|_| RowCodecError::Invalid("bit length field is not 4 bytes".to_string()))?;
+    let bit_len = u32::from_le_bytes(len_bytes);
+    if bit_len != declared {
+        return Err(RowCodecError::Invalid(
+            "bit field length does not match the declared column type".to_string(),
+        ));
+    }
+    let body_len = crate::bit_string::byte_len_for_bits(bit_len)
+        .ok_or_else(|| RowCodecError::Invalid("bit field length overflow".to_string()))?;
+    let end = len_end
+        .checked_add(body_len)
+        .ok_or_else(|| RowCodecError::Invalid("offset overflow after bit field".to_string()))?;
+    let body = buf
+        .get(len_end..end)
+        .ok_or_else(|| RowCodecError::Invalid("row buffer truncated at bit field".to_string()))?;
+    let r = crate::bit_string::BitRef::new(bit_len, body)
+        .map_err(|e| RowCodecError::Invalid(e.message().to_string()))?;
+    Ok((r, end))
 }
 
 /// 配列列のフレーム flags バイト（NULL 要素なし）。ペイロードは要素列のみ。
@@ -2395,6 +2484,7 @@ pub fn encode_row(
                     | ColumnType::Time
                     | ColumnType::TimestampTz
                     | ColumnType::Interval
+                    | ColumnType::Bit(_)
                     | ColumnType::Array(_)
                     | ColumnType::Bytea
                     | ColumnType::Json
@@ -2442,6 +2532,7 @@ pub fn encode_row(
                     | ColumnType::Time
                     | ColumnType::TimestampTz
                     | ColumnType::Interval
+                    | ColumnType::Bit(_)
                     | ColumnType::Array(_)
                     | ColumnType::Bytea
                     | ColumnType::Json
@@ -2585,6 +2676,11 @@ pub fn encode_row(
                 buf.push(PRESENCE_VALUE);
                 write_interval_payload(&mut buf, v);
             }
+            Value::Bit(v) => {
+                bit_entry_len(column, v)?;
+                buf.push(PRESENCE_VALUE);
+                write_bit_payload(&mut buf, v);
+            }
             Value::Array(array_value) => {
                 let array_ty = match &column.ty {
                     ColumnType::Array(array_ty) => array_ty,
@@ -2603,6 +2699,7 @@ pub fn encode_row(
                     | ColumnType::Time
                     | ColumnType::TimestampTz
                     | ColumnType::Interval
+                    | ColumnType::Bit(_)
                     | ColumnType::Bytea
                     | ColumnType::Json
                     | ColumnType::Jsonb
@@ -2667,6 +2764,7 @@ pub fn encode_row(
                     | ColumnType::Time
                     | ColumnType::TimestampTz
                     | ColumnType::Interval
+                    | ColumnType::Bit(_)
                     | ColumnType::Array(_)
                     | ColumnType::Bytea
                     | ColumnType::Json
@@ -2804,6 +2902,20 @@ pub fn decode_row(schema: &TableSchema, buf: &[u8]) -> Result<DecodedRow> {
                         ))
                     })?;
                     values.push(Value::Bytes(bytes.to_vec()));
+                    continue;
+                }
+                // BIT(n) の既定値も同じキャッシュから補う（Issue #2021）。
+                if column.fill_value.is_some() && matches!(column.ty, ColumnType::Bit(_)) {
+                    let r = schema.bit_default_ref(logical_index).ok_or_else(|| {
+                        RowCodecError::Invalid(format!(
+                            "column {:?} has an invalid DEFAULT for its type",
+                            column.name
+                        ))
+                    })?;
+                    values
+                        .push(Value::Bit(r.to_owned_value().map_err(|e| {
+                            RowCodecError::Invalid(e.message().to_string())
+                        })?));
                     continue;
                 }
                 // 配列の既定値も同じキャッシュから補う（Issue #1374）。
@@ -3221,6 +3333,14 @@ pub fn decode_row(schema: &TableSchema, buf: &[u8]) -> Result<DecodedRow> {
                     offset = new_offset;
                     values.push(Value::Interval(v));
                 }
+                ColumnType::Bit(declared) => {
+                    let (r, new_offset) = read_bit_payload(buf, offset, *declared)?;
+                    offset = new_offset;
+                    values
+                        .push(Value::Bit(r.to_owned_value().map_err(|e| {
+                            RowCodecError::Invalid(e.message().to_string())
+                        })?));
+                }
                 ColumnType::Array(array_ty) => {
                     let (array_ref, new_offset) =
                         parse_array_frame(buf, offset, array_ty.elem(), array_ty.max_len())?;
@@ -3556,6 +3676,7 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                     | ColumnType::Time
                     | ColumnType::TimestampTz
                     | ColumnType::Interval
+                    | ColumnType::Bit(_)
                     | ColumnType::Array(_)
                     | ColumnType::Bytea
                     | ColumnType::Json
@@ -3712,6 +3833,12 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                 buf.push(PRESENCE_VALUE);
                 write_interval_payload(&mut buf, v);
             }
+            Value::Bit(v) => {
+                let entry_len = bit_entry_len(column, v)?;
+                reserve(&mut buf, entry_len)?;
+                buf.push(PRESENCE_VALUE);
+                write_bit_payload(&mut buf, v);
+            }
             Value::Array(array_value) => {
                 let array_ty = match &column.ty {
                     ColumnType::Array(array_ty) => array_ty,
@@ -3730,6 +3857,7 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                     | ColumnType::Time
                     | ColumnType::TimestampTz
                     | ColumnType::Interval
+                    | ColumnType::Bit(_)
                     | ColumnType::Bytea
                     | ColumnType::Json
                     | ColumnType::Jsonb
@@ -3811,6 +3939,7 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                     | ColumnType::Time
                     | ColumnType::TimestampTz
                     | ColumnType::Interval
+                    | ColumnType::Bit(_)
                     | ColumnType::Array(_)
                     | ColumnType::Bytea
                     | ColumnType::Json
@@ -4082,6 +4211,7 @@ fn validate_json_column_value(column: &crate::catalog::ColumnDef, text: &str) ->
         | ColumnType::Time
         | ColumnType::TimestampTz
         | ColumnType::Interval
+        | ColumnType::Bit(_)
         | ColumnType::Array(_)
         | ColumnType::Bytea
         | ColumnType::Enum(_)
@@ -4313,6 +4443,7 @@ pub(crate) fn merge_encode_scalar_columns(
                         | ColumnType::Time
                         | ColumnType::TimestampTz
                         | ColumnType::Interval
+                        | ColumnType::Bit(_)
                         | ColumnType::Array(_)
                         | ColumnType::Bytea
                         | ColumnType::Json
@@ -4458,6 +4589,12 @@ pub(crate) fn merge_encode_scalar_columns(
                     buf.push(PRESENCE_VALUE);
                     write_interval_payload(&mut buf, v);
                 }
+                Value::Bit(v) => {
+                    let entry_len = bit_entry_len(column, v)?;
+                    reserve(&mut buf, entry_len)?;
+                    buf.push(PRESENCE_VALUE);
+                    write_bit_payload(&mut buf, v);
+                }
                 Value::Array(array_value) => {
                     let array_ty = match &column.ty {
                         ColumnType::Array(array_ty) => array_ty,
@@ -4476,6 +4613,7 @@ pub(crate) fn merge_encode_scalar_columns(
                         | ColumnType::Time
                         | ColumnType::TimestampTz
                         | ColumnType::Interval
+                        | ColumnType::Bit(_)
                         | ColumnType::Bytea
                         | ColumnType::Json
                         | ColumnType::Jsonb
@@ -4520,6 +4658,7 @@ pub(crate) fn merge_encode_scalar_columns(
                         | ColumnType::Time
                         | ColumnType::TimestampTz
                         | ColumnType::Interval
+                        | ColumnType::Bit(_)
                         | ColumnType::Array(_)
                         | ColumnType::Bytea
                         | ColumnType::Json
@@ -4670,6 +4809,15 @@ pub(crate) fn merge_encode_scalar_columns(
                     reserve(&mut buf, SCALAR_INTERVAL_ENTRY_LEN)?;
                     buf.push(PRESENCE_VALUE);
                     write_interval_payload(&mut buf, &v);
+                }
+                Some(ScalarRef::Bit(r)) => {
+                    let owned = r
+                        .to_owned_value()
+                        .map_err(|e| RowCodecError::Invalid(e.message().to_string()))?;
+                    let entry_len = bit_entry_len(column, &owned)?;
+                    reserve(&mut buf, entry_len)?;
+                    buf.push(PRESENCE_VALUE);
+                    write_bit_payload(&mut buf, &owned);
                 }
                 Some(ScalarRef::Array(array_ref)) => {
                     let payload_len = u32::try_from(array_ref.bytes.len()).map_err(|_| {
@@ -4902,6 +5050,13 @@ pub(crate) fn validate_default(
                 .map(|_| ())
                 .map_err(|_| DefaultBindError::Malformed)
         }
+        // BIT(n) の `DEFAULT` は文字列リテラル原文を宣言長で解析して検証する（Issue #2021）。
+        // 値は借用で返せないため `default_scalar` では扱わない（INSERT 時の束縛が原文を再解析する）。
+        (crate::catalog::ColumnDefault::Text(s), ColumnType::Bit(n)) => {
+            crate::bit_string::BitString::parse_text(s, *n)
+                .map(|_| ())
+                .map_err(|_| DefaultBindError::Malformed)
+        }
         // 配列の `DEFAULT` も `{..}` 原文を INSERT と同じ `parse_array_literal` で
         // 検証する（Issue #1374）。
         (crate::catalog::ColumnDefault::Text(s), ColumnType::Array(at)) => {
@@ -5081,6 +5236,8 @@ pub(crate) fn default_scalar<'a>(
                 }
             }
         }
+        // BIT(n) は借用で返せないため非対応（fail-closed。Issue #2021）。
+        (_, ColumnType::Bit(_)) => Err(DefaultBindError::Incompatible),
         (ColumnDefault::Text(s), ColumnType::Interval) => {
             use crate::datetime::IntervalLiteralError;
             match crate::datetime::parse_interval(s) {
@@ -5200,6 +5357,24 @@ fn scan_scalar_columns_validated<'a>(
                         })?;
                     if wanted {
                         sink(col_index, Some(ScalarRef::Bytes(bytes)))?;
+                    } else {
+                        sink(col_index, None)?;
+                    }
+                    continue;
+                }
+                if column.fill.is_some() && matches!(column.ty, ColumnType::Bit(_)) {
+                    // BIT(n) の既定値は原文から作ったバイト列を `TableSchema` のキャッシュから
+                    // 借用する（Issue #2021）。参照できなければ invalid DEFAULT として拒否する。
+                    let r = col_index
+                        .and_then(|i| schema.bit_default_ref(i))
+                        .ok_or_else(|| {
+                            RowCodecError::Invalid(format!(
+                                "column {:?} has an invalid DEFAULT for its type",
+                                column.name
+                            ))
+                        })?;
+                    if wanted {
+                        sink(col_index, Some(ScalarRef::Bit(r)))?;
                     } else {
                         sink(col_index, None)?;
                     }
@@ -5745,6 +5920,16 @@ fn scan_scalar_columns_validated<'a>(
                         sink(col_index, None)?;
                     }
                 }
+                ColumnType::Bit(declared) => {
+                    // 宣言長との一致・バッファ長・詰め物ビットを確保前に検証する（Issue #2021）。
+                    let (r, new_offset) = read_bit_payload(buf, offset, *declared)?;
+                    offset = new_offset;
+                    if wanted {
+                        sink(col_index, Some(ScalarRef::Bit(r)))?;
+                    } else {
+                        sink(col_index, None)?;
+                    }
+                }
                 ColumnType::Json | ColumnType::Jsonb => {
                     // フレーミング・UTF-8 検証は TEXT と共有する（Issue #889 D2）。
                     // 格納時（encode 経路）に構文検証・正規化済みのため、ここでは
@@ -5838,6 +6023,7 @@ pub fn scalar_refs_as_text<'a>(scanned: &[Option<ScalarRef<'a>>]) -> Vec<Option<
             | Some(ScalarRef::Time(_))
             | Some(ScalarRef::TimestampTz(_))
             | Some(ScalarRef::Interval(_))
+            | Some(ScalarRef::Bit(_))
             | Some(ScalarRef::Array(_))
             | Some(ScalarRef::Bytes(_))
             | Some(ScalarRef::Json(_))
@@ -5895,6 +6081,10 @@ pub fn decode_scalar_columns(schema: &TableSchema, buf: &[u8]) -> Result<Vec<Val
             Some(ScalarRef::Time(micros)) => values.push(Value::Time(micros)),
             Some(ScalarRef::TimestampTz(micros)) => values.push(Value::TimestampTz(micros)),
             Some(ScalarRef::Interval(v)) => values.push(Value::Interval(v)),
+            Some(ScalarRef::Bit(r)) => values
+                .push(Value::Bit(r.to_owned_value().map_err(|e| {
+                    RowCodecError::Invalid(e.message().to_string())
+                })?)),
             Some(ScalarRef::Array(array_ref)) => {
                 values.push(Value::Array(array_ref.to_value()?));
             }

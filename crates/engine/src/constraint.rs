@@ -2159,6 +2159,8 @@ pub(crate) fn push_canonical_component(
         ScalarRef::TimestampTz(_) => return Err("unique key column does not support TIMESTAMPTZ"),
         // INTERVAL も PK／UNIQUE 非許可（Issue #1579。担当 Issue 未定の fail-closed）。
         ScalarRef::Interval(_) => return Err("unique key column does not support INTERVAL"),
+        // BIT(n) も PK／UNIQUE 非許可（Issue #2021・TABLE-48。fail-closed）。
+        ScalarRef::Bit(_) => return Err("unique key column does not support BIT"),
         ScalarRef::Bytes(b) => push_len_prefixed(out, ColumnType::Bytea.unique_key_tag(), b),
         ScalarRef::Uuid(u) => {
             push_len_prefixed(out, ColumnType::Uuid.unique_key_tag(), u.as_bytes())
@@ -2286,6 +2288,7 @@ pub(crate) fn unique_key_from_values(
             Value::Time(t) => ScalarRef::Time(*t),
             Value::TimestampTz(t) => ScalarRef::TimestampTz(*t),
             Value::Interval(v) => ScalarRef::Interval(*v),
+            Value::Bit(v) => ScalarRef::Bit(v.as_bit_ref()),
             Value::Bytes(b) => ScalarRef::Bytes(b.as_slice()),
             Value::Enum(s) => ScalarRef::Enum(s.as_str()),
             Value::Uuid(u) => ScalarRef::Uuid(*u),
@@ -3160,6 +3163,7 @@ fn value_as_scalar_ref(value: &crate::row_codec::Value) -> Option<ScalarRef<'_>>
         | Value::Time(_)
         | Value::TimestampTz(_)
         | Value::Interval(_)
+        | Value::Bit(_)
         | Value::Numeric(_) => None,
     }
 }

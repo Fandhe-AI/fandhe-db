@@ -68,6 +68,7 @@ fn type_label(ty: &ColumnType) -> &'static str {
         ColumnType::Time => "time",
         ColumnType::TimestampTz => "timestamptz",
         ColumnType::Interval => "interval",
+        ColumnType::Bit(_) => "bit",
         ColumnType::Array(_) => "array",
         ColumnType::Bytea => "bytea",
         ColumnType::Json => "json",
@@ -115,6 +116,7 @@ fn all_type_labels() -> BTreeSet<&'static str> {
         "time",
         "timestamptz",
         "interval",
+        "bit",
         "array",
         "bytea",
         "json",
@@ -173,6 +175,8 @@ fn full_row_schema(enum_def: std::sync::Arc<engine::catalog::EnumTypeDef>) -> Ta
             ColumnDef::new("c_time", ColumnType::Time, true),
             ColumnDef::new("c_timestamptz", ColumnType::TimestampTz, true),
             ColumnDef::new("c_interval", ColumnType::Interval, true),
+            // 末尾に置く（Issue #2021）。8 の倍数でない長さで詰め物ビットを経由させる。
+            ColumnDef::new("c_bit", ColumnType::Bit(10), true),
         ],
     )
 }
@@ -247,6 +251,10 @@ fn representative_scalar_values() -> Vec<Value> {
             days: 3,
             micros: 4_005_000_006,
         }),
+        // `c_bit`（BIT(10)。MSB 先頭・詰め物ビット 0。Issue #2021）。
+        Value::Bit(
+            engine::bit_string::BitString::parse_text("1010101011", 10).expect("bit literal"),
+        ),
     ]
 }
 
@@ -1879,6 +1887,67 @@ fn array_new_elem_types_reject_truncated_and_trailing_payloads_on_decode() {
     assert!(decode_row(&schema, truncated).is_err());
     encoded.push(0xAA);
     assert!(decode_row(&schema, &encoded).is_err());
+}
+
+/// BIT(n) は 8 の倍数でない長さ・倍数の長さとも往復でき、宣言長との不一致・他型との取り違え・
+/// 詰め物ビットが非 0 の破損バイト列・切り詰め・宣言長と異なるビット長の行バイト列を拒否する
+/// （Issue #2021・TABLE-48 ポインタ）。
+#[test]
+fn bit_roundtrips_and_rejects_malformed_layouts() {
+    use engine::bit_string::BitString;
+    let bit = |s: &str| Value::Bit(BitString::parse_text(s, s.len() as u32).expect("bit"));
+    for s in [
+        "1",
+        "0",
+        "1010",
+        "10101010",
+        "101010101",
+        "0000000011111111",
+    ] {
+        roundtrip_single(ColumnType::Bit(s.len() as u32), bit(s));
+    }
+    let schema = single_col_schema(ColumnType::Bit(4));
+    // 宣言長と値のビット数が異なる値は encode が拒否する。
+    assert!(matches!(
+        encode_row(&schema, "tenant-a", Visibility::Public, &[bit("101")]),
+        Err(RowCodecError::Invalid(_))
+    ));
+    // 他型の値の取り違えも拒否する。
+    assert!(matches!(
+        encode_row(
+            &schema,
+            "tenant-a",
+            Visibility::Public,
+            &[Value::Bytes(vec![0xA0])]
+        ),
+        Err(RowCodecError::Invalid(_))
+    ));
+    let text_schema = single_col_schema(ColumnType::Bytea);
+    assert!(matches!(
+        encode_row(&text_schema, "tenant-a", Visibility::Public, &[bit("1010")]),
+        Err(RowCodecError::Invalid(_))
+    ));
+    // 詰め物ビットを立てた破損バイト列は decode が拒否する。
+    let good =
+        encode_row(&schema, "tenant-a", Visibility::Public, &[bit("1010")]).expect("encode bit");
+    let mut bad = good.clone();
+    let last = bad.len() - 1;
+    bad[last] |= 0x01;
+    assert!(matches!(
+        decode_row(&schema, &bad),
+        Err(RowCodecError::Invalid(_))
+    ));
+    // 切り詰めたバイト列も拒否する。
+    let cut = good.get(..good.len() - 1).expect("slice");
+    assert!(decode_row(&schema, cut).is_err());
+    // カタログの宣言長と異なるビット長の行バイト列は拒否する（宣言長 8 で書いた行を 4 で読む）。
+    let wide = single_col_schema(ColumnType::Bit(8));
+    let wide_bytes =
+        encode_row(&wide, "tenant-a", Visibility::Public, &[bit("10101010")]).expect("encode wide");
+    assert!(matches!(
+        decode_row(&schema, &wide_bytes),
+        Err(RowCodecError::Invalid(_))
+    ));
 }
 
 /// INTERVAL は最小・0・最大の三要素を往復でき、無限大の予約値（番兵）は encode でも decode でも

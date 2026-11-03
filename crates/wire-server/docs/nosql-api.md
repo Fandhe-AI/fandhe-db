@@ -418,6 +418,10 @@ OFFSET ...` と同じ対象名解決・実行器を共有。第 2 の実行器�
   `TEXT[]`／`BOOLEAN[]` は JSON 配列（要素種別不一致は `42601`、要素数
   超過は `54000`）。`TEXT`／`VECTOR`（旧来型）の型不一致のみ引き続き
   `22000` を維持する（新型は `42601`。表層内の非対称は既知の制約）
+- `BIT(n)` 列（SQL DDL で作成。TABLE-48・Issue #2021）への `insert`／`update` は JSON 文字列（`0`・`1` の
+  並び）を束縛する。`0`・`1` 以外の文字は `22P02`、ビット数が宣言長 `n` と異なる値は `22026`
+  （`STRING_DATA_LENGTH_MISMATCH`、HTTP `400`）で文全体を拒否し副作用を残さない。応答の列型名は
+  `"bit"`。`filter` に BIT 列を使うことは対象外で engine の非対応列判定により拒否される
 - 全型共通（`VECTOR` 列を除く。上記参照）: 「省略」（キー自体を持たない）と
   「明示的な JSON `null`」を区別する（TABLE-16・TASK-204、Issue #904。
   `DEFAULT` は省略にのみ適用し、明示 `null` には適用しない）。省略時は
@@ -1157,6 +1161,7 @@ Date: <IMF-fixdate>
 | `22023` | `OPERATION_ID_CONTENT_MISMATCH` | 400 | Bad Request | `insert` の `operation_id` 再送時の内容不一致 |
 | `22023` | `INVALID_PARAMETER_VALUE` | 400 | Bad Request | 型名の引数が範囲外（`FLOAT(p)` の精度。SQL 表層の DDL 専用で、NoSQL の `op` 語彙からは到達しない。Issue #2304） |
 | `22025` | `INVALID_ESCAPE_SEQUENCE` | 400 | Bad Request | `like` op のパターンが末尾の単独 `\`（エスケープの次の文字が無い）で終わる。SQL 表層の `LIKE ... ESCAPE` の不正な ESCAPE 値・末尾エスケープも同じ分類。NoSQL の `like` から到達する。Issue #1779 |
+| `22026` | `STRING_DATA_LENGTH_MISMATCH` | 400 | Bad Request | `BIT(n)` 列へ入れる文字列のビット数が宣言長 `n` と異なる。NoSQL の BIT 列への `insert`／`update` の文字列束縛から到達する（文字種の不正は `22P02`）。TABLE-48・Issue #2021 |
 | `22033` | `JSON_SUBSCRIPT_INVALID` | 400 | Bad Request | jsonpath の配列添字が不正（strict）。engine の jsonpath 評価器の分類で、SQL 表層へは `jsonb_path_*`（#2185）・`@?`／`@@`（#2186）・`JSON_EXISTS` 等（#2187）で配線済み。NoSQL の `op` 語彙からは到達しない。Issue #2184 |
 | `22034` | `MORE_THAN_ONE_SQL_JSON_ITEM` | 400 | Bad Request | SQL/JSON 問い合わせ関数（`JSON_VALUE`・ラッパーなしの `JSON_QUERY`）が単一項目を要する位置で 2 件以上を得た。SQL 表層専用で、NoSQL の `op` 語彙からは到達しない。Issue #2187 |
 | `22035` | `NO_SQL_JSON_ITEM` | 400 | Bad Request | `ERROR ON EMPTY` 指定で path の結果が空だった。SQL 表層専用で、NoSQL の `op` 語彙からは到達しない。Issue #2187 |

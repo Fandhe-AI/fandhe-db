@@ -404,6 +404,13 @@ fn push_value(b: &mut HashInputBuilder, v: &Value) -> Result<(), StorageError> {
             b.push_u64(i64::from(v.days) as u64);
             b.push_u64(v.micros as u64);
         }
+        // BIT(n) 値（Issue #2021・TABLE-48）。タグ 19 は未使用。ビット長を先に積み、
+        // 同一バイト列でもビット長が違う値（`B'1'` と `B'10'` の内部表現は同一バイト）を区別する。
+        Value::Bit(v) => {
+            b.push_u8(19);
+            b.push_u64(u64::from(v.bit_len()));
+            b.push_bytes(v.as_bytes())?;
+        }
         // 配列列（TABLE-14・Issue #888）は 10 とする。要素型タグ・要素数・各要素を
         // 積むことで、`{ab}`（1 要素）と `{a,b}`（2 要素）のような表記ゆれが
         // 衝突しない単射なハッシュ入力にする。

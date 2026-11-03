@@ -296,6 +296,7 @@ pub(crate) fn estimate_cell_bytes(cell: &Cell) -> usize {
         | Cell::TimestampTz(_) => 8,
         Cell::Date(_) => 4,
         Cell::Interval(_) => 16,
+        Cell::Bit(v) => v.as_bytes().len().saturating_add(8),
         Cell::Text(s) => s.len().saturating_add(8),
         Cell::Bytes(b) => b.len().saturating_add(8),
         Cell::Json(s) => s.len().saturating_add(8),

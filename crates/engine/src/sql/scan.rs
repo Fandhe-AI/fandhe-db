@@ -209,6 +209,20 @@ fn try_alloc_bytes_for_budget(
     Ok(owned)
 }
 
+/// `BIT(n)` セルの選択的複製（累計バイト量を確保前に検証。上記 BYTEA 版へ委譲。Issue #2021）。
+fn try_alloc_bit_for_budget(
+    r: crate::bit_string::BitRef<'_>,
+    budget: &mut usize,
+    cap: usize,
+) -> Result<crate::bit_string::BitString, SqlSurfaceError> {
+    let bytes = try_alloc_bytes_for_budget(r.as_bytes(), budget, cap)?;
+    crate::bit_string::BitString::from_parts(r.bit_len(), bytes).map_err(|e| {
+        SqlSurfaceError::Internal {
+            detail: e.message().to_string(),
+        }
+    })
+}
+
 /// 利用者ポリシー（RLS-13・Issue #2276）が求める復号段階へ引き上げる（ポリシーが embedding を参照すれば
 /// `Embedding`、スカラー列を参照して `Fast` なら `DimAndScalar`）。段階を下げることはしない。
 fn raise_tier_for_policy(tier: DecodeTier, needs: PolicyNeeds) -> DecodeTier {
@@ -268,6 +282,7 @@ fn decode_tier_for(schema: &TableSchema, bound: &BoundScan) -> (DecodeTier, Vec<
                         | ColumnType::Time
                         | ColumnType::TimestampTz
                         | ColumnType::Interval
+                        | ColumnType::Bit(_)
                         | ColumnType::Array(_)
                         | ColumnType::Bytea
                         | ColumnType::Json
@@ -857,6 +872,19 @@ pub(crate) fn push_scalar_column_cell(
                 return Err(scan_bug(
                     "INTERVAL column scan yielded a non-Interval scalar value",
                 ))
+            }
+            Some(None) | None => cells.push(Cell::Null),
+        },
+        ColumnType::Bit(_) => match scanned.get(*index) {
+            Some(Some(row_codec::ScalarRef::Bit(r))) => {
+                cells.push(Cell::Bit(try_alloc_bit_for_budget(
+                    *r,
+                    byte_budget,
+                    max_result_bytes,
+                )?));
+            }
+            Some(Some(_)) => {
+                return Err(scan_bug("BIT column scan yielded a non-Bit scalar value"))
             }
             Some(None) | None => cells.push(Cell::Null),
         },
