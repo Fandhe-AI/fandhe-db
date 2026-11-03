@@ -315,6 +315,9 @@ pub(crate) fn columns_have_vector(columns: &[ColumnMeta]) -> bool {
             ColumnMeta::Scalar {
                 ty: ColumnType::Vector(_),
                 ..
+            } | ColumnMeta::Computed {
+                ty: Some(ColumnType::Vector(_)),
+                ..
             }
         )
     })

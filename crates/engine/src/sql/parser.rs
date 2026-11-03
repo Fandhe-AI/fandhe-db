@@ -6564,6 +6564,20 @@ pub(crate) enum AggregateInput {
     /// （`row.embedding` が空 = 未設定という [`crate::storage::Row`] の既存契約に
     /// 従う。PR #229 codex-review 指摘対応）。
     VectorColumnPresence,
+    /// `VECTOR` 列の裸の列参照への `sum`（SQL-72 (3)・Issue #2038）。埋め込みは
+    /// `RowVector.values` から届くため列の添字は持たない。NULL（`dim == 0`）の行は飛ばし、
+    /// 累積は要素ごとに f64、確定時に f32 へ丸める（[`crate::sql::aggregate::Accumulator::VectorSum`]）。
+    /// `avg` 等が同じ入力を再利用できるよう関数名には依存させない。
+    VectorColumn { dim: u32 },
+    /// `ExprType::Vector` に束縛された式への `sum`（SQL-72 (3)・Issue #2038。
+    /// `sum(vec_div(embedding, 2))` 等）。`program` を行ごとに評価し、NULL は飛ばす。
+    VectorExpr {
+        source: crate::sql::udf_call::BoundExpr,
+        program: crate::sql::expr_program::ExprProgram,
+        /// 結果ベクトルの次元（テーブルの VECTOR 列の宣言次元。要素ごとの式は次元を保つ）。
+        /// 集計結果列を `Vector(dim)` と公告し、集合演算の型ゲート（22000）で検出するために持つ。
+        dim: u32,
+    },
     /// `string_agg(<値>, <区切り> [ORDER BY ...])`（SQL-57・Issue #1800）。区切り・内側の
     /// `ORDER BY` のプログラムを `input` の内側へ閉じ込め、`Accumulator::observe` が
     /// この 1 variant だけで評価できる自己完結な形にする（`BoundAggregateItem` の
@@ -6851,6 +6865,16 @@ impl BoundAggregateItem {
         let udfs = crate::sql::udf_call::UdfRegistry::default();
         let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
         let input = resolve_aggregate_input(func, &arg, schema, &udfs, &mut node_budget)?;
+        // `sum(<VECTOR 列>)` は SQL 表層のみ（SQL-72。NoSQL・JOIN はこの入口を使う）。従来どおり
+        // `42883` で拒否する（Issue #2038）。
+        if matches!(
+            input,
+            AggregateInput::VectorColumn { .. } | AggregateInput::VectorExpr { .. }
+        ) {
+            return Err(SqlSurfaceError::undefined_function(
+                "SUM cannot be applied to a VECTOR column by this interface",
+            ));
+        }
         let name = func.default_alias().to_string();
 
         Ok(BoundAggregateItem {
@@ -7456,7 +7480,8 @@ impl BoundAggregate {
 /// - `DATE`/`TIMESTAMP` 列 → `COUNT`・`MIN`/`MAX` を受理、`SUM`/`AVG` は
 ///   `42883`（Issue #1186。式でも同じ）
 /// - `VECTOR` 列（裸の列参照）→ `COUNT` は [`AggregateInput::VectorColumnPresence`]
-///   （非 NULL 行のみ数える）、それ以外は `42883`（Issue #1349）
+///   （非 NULL 行のみ数える）、`SUM` は [`AggregateInput::VectorColumn`]（SQL-72 (3)・
+///   Issue #2038）、それ以外は `42883`（Issue #1349）
 /// - `TEXT`・`BOOLEAN`・`ARRAY`・`BYTEA`・`JSON`／`JSONB`・`ENUM`・`UUID` 列 →
 ///   `COUNT` は受理、`SUM`/`AVG`（`TEXT` 以外は `MIN`/`MAX` も）は `42883`
 ///   （Issue #1349。該当シグネチャの関数が無い）
@@ -7571,6 +7596,11 @@ fn resolve_aggregate_input(
                     )),
                     (ColumnType::Vector(_), AggregateFunc::Count) => {
                         Ok(AggregateInput::VectorColumnPresence)
+                    }
+                    // SQL-72 (3)・Issue #2038: `sum(<VECTOR 列>)` は要素ごとの和（vector）。
+                    // MIN/MAX/AVG は従来どおり下の腕で `42883`。
+                    (ColumnType::Vector(dim), AggregateFunc::Sum) => {
+                        Ok(AggregateInput::VectorColumn { dim: *dim })
                     }
                     (ColumnType::Vector(_), _) => {
                         Err(SqlSurfaceError::undefined_function(format!(
@@ -7734,6 +7764,15 @@ fn resolve_aggregate_input(
                 // Issue #1349: 列参照と同じ型・同じ関数には同じコードを返す（ERR-2）。
                 // `TEXT`／`BOOLEAN`／`VECTOR` 式への `SUM`／`AVG`、`BOOLEAN`／`VECTOR`
                 // 式への `MIN`／`MAX` は該当シグネチャの関数が無いため `42883`。
+                // SQL-72 (3)・Issue #2038: `VECTOR` 式への `SUM` は要素ごとの和を受理する。
+                ExprType::Vector if func == AggregateFunc::Sum => {
+                    let program = crate::sql::expr_program::ExprProgram::compile(&bound);
+                    Ok(AggregateInput::VectorExpr {
+                        source: bound,
+                        program,
+                        dim: schema.vector_dim().unwrap_or(0),
+                    })
+                }
                 ExprType::Text | ExprType::Bool | ExprType::Vector
                     if matches!(func, AggregateFunc::Sum | AggregateFunc::Avg) =>
                 {
@@ -9004,12 +9043,10 @@ fn bind_aggregate_projection_expr(
             })?;
             // Issue #1811: `array_agg` の結果は式の被演算子にできない（`HAVING`／`ORDER BY` と同じく
             // 配列結果の行ビュー列を持たないため、成功させず fail-closed で拒否する）。
-            if items
-                .get(idx)
-                .is_some_and(|it| it.func == crate::sql::allowlist::AggregateFunc::ArrayAgg)
-            {
+            if items.get(idx).is_some_and(is_unorderable_aggregate) {
                 return Err(SqlSurfaceError::FeatureNotSupported {
-                    detail: "array_agg result cannot be used inside an expression".to_string(),
+                    detail: "array or vector aggregate result cannot be used inside an expression"
+                        .to_string(),
                 });
             }
             return Ok(OrderTarget::Aggregate(idx));
@@ -10688,6 +10725,16 @@ fn bind_window_item(
                     detail: "this collation is not supported in this expression".to_string(),
                 });
             }
+            // `sum(<VECTOR>) OVER (...)` は未対応（Issue #2038。ウィンドウ実行器が所有値の
+            // ベクトル入力を持たないため fail-closed。SQL-64 との組み合わせは別課題）。
+            if matches!(
+                resolved,
+                AggregateInput::VectorColumn { .. } | AggregateInput::VectorExpr { .. }
+            ) {
+                return Err(SqlSurfaceError::FeatureNotSupported {
+                    detail: "VECTOR aggregates are not supported in window functions".to_string(),
+                });
+            }
             // INTERVAL 列のウィンドウ集計は未対応（Issue #1580。担当 Issue 未定の fail-closed）。
             if matches!(resolved, AggregateInput::IntervalColumn(_)) {
                 return Err(SqlSurfaceError::FeatureNotSupported {
@@ -11471,6 +11518,9 @@ pub(crate) fn check_having_target_is_numeric(
                     | AggregateInput::TimestampTzColumn(_)
                     | AggregateInput::IntervalColumn(_)
                     | AggregateInput::ArrayAgg(_)
+                    // SQL-72 (4) 対象外: ベクトルの集計結果は数値比較できない（Issue #2038）。
+                    | AggregateInput::VectorColumn { .. }
+                    | AggregateInput::VectorExpr { .. }
             );
     if is_unsupported {
         return Err(SqlSurfaceError::invalid_input(format!(
@@ -11515,13 +11565,11 @@ fn resolve_group_reference<S: AsRef<str>>(
         ([], [idx]) => {
             // 配列値には文レベルの比較規約が無い（`group_by::cmp_cell_values` は未定義の組を
             // 等値として扱うため、通すと並びが黙って崩れる）。束縛時に拒否する（SQL-57）。
-            if items
-                .get(*idx)
-                .is_some_and(|it| it.func == crate::sql::allowlist::AggregateFunc::ArrayAgg)
-            {
+            if items.get(*idx).is_some_and(is_unorderable_aggregate) {
                 return Err(SqlSurfaceError::FeatureNotSupported {
-                    detail: "ORDER BY or HAVING on an array_agg result is not supported"
-                        .to_string(),
+                    detail:
+                        "ORDER BY or HAVING on an array or vector aggregate result is not supported"
+                            .to_string(),
                 });
             }
             Ok(OrderTarget::Aggregate(*idx))
@@ -11623,13 +11671,11 @@ fn bind_group_by_clause(
             let idx = having_hidden.get(j).copied().ok_or_else(|| {
                 crate::sql::aggregate::accumulator_bug("HAVING aggregate placeholder out of range")
             })?;
-            if items
-                .get(idx)
-                .is_some_and(|it| it.func == crate::sql::allowlist::AggregateFunc::ArrayAgg)
-            {
+            if items.get(idx).is_some_and(is_unorderable_aggregate) {
                 return Err(SqlSurfaceError::FeatureNotSupported {
-                    detail: "ORDER BY or HAVING on an array_agg result is not supported"
-                        .to_string(),
+                    detail:
+                        "ORDER BY or HAVING on an array or vector aggregate result is not supported"
+                            .to_string(),
                 });
             }
             return Ok(OrderTarget::Aggregate(idx));
@@ -11800,12 +11846,9 @@ fn bind_group_by_clause(
                 if let OrderTarget::Aggregate(idx) = target {
                     // 位置指定（`ORDER BY 2`）は名前解決を経ないため、配列値の拒否はここでも行う
                     // （`resolve_group_reference` と同じ理由。SQL-57）。
-                    if items
-                        .get(idx)
-                        .is_some_and(|it| it.func == crate::sql::allowlist::AggregateFunc::ArrayAgg)
-                    {
+                    if items.get(idx).is_some_and(is_unorderable_aggregate) {
                         return Err(SqlSurfaceError::FeatureNotSupported {
-                            detail: "ORDER BY or HAVING on an array_agg result is not supported"
+                            detail: "ORDER BY or HAVING on an array or vector aggregate result is not supported"
                                 .to_string(),
                         });
                     }
@@ -11980,9 +12023,24 @@ fn aggregate_result_column_type(item: &BoundAggregateItem) -> ColumnType {
                 crate::sql::aggregate::typed_expr_column_type(*ty)
                     .unwrap_or(EXPR_UNSUPPORTED_COLUMN_TYPE)
             }
+            // Issue #2038: `sum(vector)` の結果は式内で扱えない列（ベクトル演算は SQL-72 (4) 対象外）。
+            AggregateInput::VectorColumn { .. } | AggregateInput::VectorExpr { .. } => {
+                EXPR_UNSUPPORTED_COLUMN_TYPE
+            }
             _ => EXPR_UNSUPPORTED_COLUMN_TYPE,
         },
     }
+}
+
+/// 配列・ベクトル値を返す集計項目か（`ORDER BY`／`HAVING`／式の被演算子にできない結果。
+/// SQL-57・SQL-72 (4) の範囲外。`group_by::cmp_cell_values` は未定義の組を等値として扱うため、
+/// 通すと並びが黙って崩れる。束縛時に拒否する。Issue #2038）。
+fn is_unorderable_aggregate(item: &BoundAggregateItem) -> bool {
+    item.func == crate::sql::allowlist::AggregateFunc::ArrayAgg
+        || matches!(
+            item.input,
+            AggregateInput::VectorColumn { .. } | AggregateInput::VectorExpr { .. }
+        )
 }
 
 /// 投影式（Issue #1541）が参照する行ビューの集計列型。実セルの型と 1 対 1 の
@@ -12001,6 +12059,9 @@ fn projection_row_column_type(item: &BoundAggregateItem) -> ColumnType {
             ColumnType::Bytea
         }
         Some(ty @ ColumnType::Numeric { .. }) => ty,
+        // Issue #2038: `sum(vector)` の結果列を VECTOR 型のまま行ビューへ渡すと、式側が行の
+        // 埋め込み（`VectorRef`）へ束縛してしまうため、番兵（`BYTEA`）にして `22000` で拒否する。
+        Some(ColumnType::Vector(_)) => ColumnType::Bytea,
         None => ColumnType::Bytea,
         Some(ty) => ty,
     }
@@ -14250,8 +14311,8 @@ mod tests {
     }
 
     #[test]
-    fn binds_sum_avg_min_max_on_vector_column_as_type_mismatch() {
-        for func in ["SUM", "AVG", "MIN", "MAX"] {
+    fn binds_avg_min_max_on_vector_column_as_type_mismatch() {
+        for func in ["AVG", "MIN", "MAX"] {
             let sql = format!("SELECT {func}(embedding) FROM documents");
             let err = bind_aggregate_sql(&sql).unwrap_err();
             assert_eq!(
@@ -14260,6 +14321,21 @@ mod tests {
                 "{func}(embedding) should be 42883"
             );
         }
+    }
+
+    /// Issue #2038・SQL-72 (3): `SUM(<VECTOR 列>)` は束縛できる（結果列は `vector(dim)`）。
+    #[test]
+    fn binds_sum_on_vector_column_and_expression() {
+        let bound = bind_aggregate_sql("SELECT SUM(embedding) FROM documents").unwrap();
+        assert!(matches!(
+            bound.items[0].input,
+            AggregateInput::VectorColumn { .. }
+        ));
+        let bound = bind_aggregate_sql("SELECT SUM(vec_div(embedding, 2)) FROM documents").unwrap();
+        assert!(matches!(
+            bound.items[0].input,
+            AggregateInput::VectorExpr { .. }
+        ));
     }
 
     #[test]
@@ -14320,9 +14396,9 @@ mod tests {
     }
 
     #[test]
-    fn binds_sum_on_vector_typed_expression_as_type_mismatch() {
+    fn binds_avg_on_vector_typed_expression_as_type_mismatch() {
         let err =
-            bind_aggregate_sql("SELECT SUM(vec_div(embedding, 2)) FROM documents").unwrap_err();
+            bind_aggregate_sql("SELECT AVG(vec_div(embedding, 2)) FROM documents").unwrap_err();
         assert_eq!(err.wire_code(), "42883");
     }
 

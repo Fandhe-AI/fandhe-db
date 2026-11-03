@@ -164,6 +164,43 @@ fn sql13_single_row_aggregates_are_returned_as_text_columns_over_wire() {
     read_ready_for_query(&mut stream);
 }
 
+/// SQL-72 (3)・Issue #2038: `sum(<VECTOR 列>)` の結果列は型 OID 25（text）で、値は
+/// `[a,b,...]` のテキスト表現。alice の可視行は `[1,0]`・`[0,1]`・`[-1,0]`・`[1,0]`
+/// （他テナントの Private 行は含まれない）なので和は `[1,1]`。`GROUP BY` でも同じ形式。
+#[test]
+fn sql72_vector_sum_is_returned_as_text_oid_25_over_wire() {
+    let (core, _guard) = new_core_aggregate_docs();
+    let (mut stream, _users_path) = spawn_with_alice(core);
+
+    send_simple_query(&mut stream, "SELECT sum(embedding) AS v FROM docs");
+    let columns = read_row_description_with_oids(&mut stream);
+    assert_eq!(columns, vec![("v".to_string(), 25)]);
+    let row = read_data_row(&mut stream);
+    assert_eq!(row[0].as_deref(), Some("[1,1]"));
+    assert_eq!(read_command_complete(&mut stream), "SELECT 1");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(
+        &mut stream,
+        "SELECT lang, sum(embedding) AS v FROM docs GROUP BY lang",
+    );
+    let columns = read_row_description_with_oids(&mut stream);
+    assert_eq!(columns.get(1), Some(&("v".to_string(), 25)));
+    let mut rows = Vec::new();
+    for _ in 0..3 {
+        let row = read_data_row(&mut stream);
+        rows.push((row[0].clone(), row[1].clone()));
+    }
+    let expected: Vec<(Option<String>, Option<String>)> = vec![
+        (Some("en".to_string()), Some("[0,1]".to_string())),
+        (Some("ja".to_string()), Some("[0,0]".to_string())),
+        (Some("xx".to_string()), Some("[1,0]".to_string())),
+    ];
+    assert_eq!(rows, expected);
+    assert_eq!(read_command_complete(&mut stream), "SELECT 3");
+    read_ready_for_query(&mut stream);
+}
+
 /// SQL-13: `WHERE` 述語での絞り込み・式（`vec_norm`）を引数に取る集計。
 #[test]
 fn sql13_where_filter_and_scalar_expression_aggregate() {
@@ -422,7 +459,7 @@ fn sql_aggregate_rejections_are_fail_closed_and_connection_survives() {
     let (mut stream, _users_path) = spawn_with_alice(core);
 
     for (sql, expected_sqlstate) in [
-        ("SELECT SUM(embedding) FROM docs", "42883"),
+        ("SELECT MIN(embedding) FROM docs", "42883"),
         ("SELECT COUNT(*) FROM docs GROUP BY embedding", "22000"),
         // 集計の外の `GROUP BY` に無い列は 42803（Issue #1818・SQL-58）。
         ("SELECT COUNT(*), lang FROM docs", "42803"),
