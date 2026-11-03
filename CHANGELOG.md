@@ -9,6 +9,7 @@
 
 ### Added
 
+- セッションの UDF 数の上限をカタログ由来（`catalog::function::MAX_FUNCTIONS`）とセッション限定（`MAX_SESSION_UDFS`）で分離した（Issue #2883・SQL-66 (5)）。カタログが満杯でも公開 API の `define_function*`・`register_wasm_udf*` が通り、セッション限定が満杯でも永続 `CREATE FUNCTION`・ロードが通る。各上限の超過は `54000`。`MAX_SESSION_UDFS` の値は 64 のままで、意味が「カタログ由来を除くセッション限定の合計」に変わる。`engine::sql::udf_call::MAX_REGISTRY_UDFS` を追加した。公開シグネチャの変更はない。
 - PL/pgSQL の条件式（`IF`・`ELSIF`・`WHILE`・`EXIT/CONTINUE WHEN`・検索形 `CASE`）と値として使う論理式で `AND`・`OR`・`NOT`・`BETWEEN`・`IN (リスト)` を受理するようにした（Issue #2880・SQL-68）。従来の `0A000` から受理に変わる。NULL は 3 値論理で扱い、数値は値のまま比較する。
 - PL/pgSQL の `RAISE`（全水準・書式・`USING`・条件名・`SQLSTATE`・再送出）と `EXCEPTION WHEN` ブロックを追加した（Issue #2227・SQL-70）。捕捉はブロック開始時の内部 savepoint まで巻き戻し、変数は巻き戻さない。巻き戻せない場合（書き込み後に入ったブロック・一時表を使った Tx）は固定文言の `0A000` で失敗する。`RAISE NOTICE/INFO/WARNING` は `NoticeResponse` で応答の前に届き（`DEBUG`／`LOG` は送らない）、`RAISE EXCEPTION` は利用者指定の SQLSTATE を `C` に出して `W` を付ける（本 DB 自身のエラーは 3 フィールドのまま）。`engine::notice`（`RaisedError`・`Notice`・`StatementNotices`）と `SqlSurfaceError::{raised, effective_sqlstate}` を公開した。
   BREAKING CHANGE: 公開 enum `ErrorClass` に `RaisedException`（`P0001`）、`SqlSurfaceError` に `RaisedException` を追加した。`RAISE`・`EXCEPTION` は `0A000` から受理に変わった。

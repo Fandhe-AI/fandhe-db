@@ -66,8 +66,24 @@ pub const MAX_CASE_BRANCHES: usize = 64;
 /// ネストを、それぞれ独立に検査する（構文段の計測値だけでは UDF 呼び出しの
 /// 展開によって実際のネストがすり抜けうるため。`54000`）。
 pub const MAX_CASE_NESTING: usize = 8;
-/// セッションが保持できる UDF 定義数上限（宣言的・WASM 合算。`54000`）。
+/// セッション限定（UDF カタログ由来でない）の宣言的 UDF・WASM UDF・ルーチンの合計上限（`54000`）。
+/// カタログ由来の関数は別バケット（上限は `catalog::function::MAX_FUNCTIONS`）で数え、
+/// 互いの枠を奪わない（Issue #2883。SQL-66 (5) ポインタ）。
 pub const MAX_SESSION_UDFS: usize = 64;
+/// 1 セッションのレジストリ全体の上限（セッション限定 + カタログ由来。定数でメモリ上限を抑える）。
+pub const MAX_REGISTRY_UDFS: usize = MAX_SESSION_UDFS + crate::catalog::function::MAX_FUNCTIONS;
+
+/// 関数登録時に上限を数えるバケット（Issue #2883）。`commit_function_definition` が
+/// `mark_catalog_origin` より前に呼ばれるため、検証時点で登録先を指定する必要がある。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UdfCapacity {
+    /// セッション限定バケット（`MAX_SESSION_UDFS`）。
+    SessionLocal,
+    /// カタログ由来バケット（`MAX_FUNCTIONS`）。
+    Catalog,
+    /// 判定しない（置換の probe 用）。
+    Unchecked,
+}
 /// WASM UDF 呼び出しの引数数（TASK-149。ABI 固定シグネチャ
 /// `(Vector, Scalar) -> Scalar` のため常に 2）。
 const WASM_CALL_ARITY: usize = 2;
@@ -2647,10 +2663,17 @@ impl UdfRegistry {
         self.catalog_names.contains(&name.to_ascii_lowercase())
     }
 
-    /// カタログ由来として登録されている件数（`sql::udf_load` が「非カタログ登録が枠を占めているか」の
-    /// 判定に使う）。
+    /// カタログバケットの件数（カタログ由来として登録されている件数。上限は
+    /// `catalog::function::MAX_FUNCTIONS`）。
     pub(crate) fn catalog_entry_count(&self) -> usize {
         self.catalog_names.len()
+    }
+
+    /// セッション限定バケットの件数（カタログ由来でない宣言的・WASM・ルーチンの合計。上限は
+    /// [`MAX_SESSION_UDFS`]）。`catalog_names` ⊆ 登録キーの不変条件に基づく差分で、
+    /// 念のため `saturating_sub` でアンダーフローを避ける。
+    pub(crate) fn session_local_count(&self) -> usize {
+        self.len().saturating_sub(self.catalog_names.len())
     }
 
     /// 既に登録済みの `name` をカタログ由来として印付けする（`sql::udf_load`・
@@ -2705,7 +2728,7 @@ impl UdfRegistry {
 ///
 /// 検証項目: 名前・パラメータ名が `catalog::validate_identifier` に適合、パラメータ
 /// 重複なし、パラメータ数が [`MAX_UDF_PARAMS`] 以内、名前が組み込み・既存許可名と
-/// 非衝突、同名の再定義でないこと、セッション UDF 数が [`MAX_SESSION_UDFS`] 未満、
+/// 非衝突、同名の再定義でないこと、セッション限定の UDF 数が [`MAX_SESSION_UDFS`] 未満、
 /// 本体式がパラメータ参照・数値リテラル・算術/比較演算子・組み込み関数・登録済み
 /// UDF 呼び出しのみで構成される（列参照は拒否＝閉じた関数。束縛は `schema: None`
 /// で行うため、列名を参照すると `bind_expr` が `22000` を返す）。
@@ -2773,7 +2796,29 @@ pub(crate) fn prepare_function_with_signature(
         param_types,
         return_type,
         body,
-        true,
+        UdfCapacity::SessionLocal,
+        None,
+    )
+}
+
+/// [`prepare_function_with_signature`] のカタログバケット版（UDF カタログのロード
+/// `sql::udf_load` から。カタログ由来の件数を `MAX_FUNCTIONS` で数える）。
+pub(crate) fn prepare_function_for_catalog_load(
+    registry: &UdfRegistry,
+    name: &str,
+    params: &[String],
+    param_types: &[Option<crate::sql::cast::CastType>],
+    return_type: Option<&crate::sql::cast::CastType>,
+    body: &Expr,
+) -> Result<PreparedUdf, SqlSurfaceError> {
+    prepare_function_with_signature_inner(
+        registry,
+        name,
+        params,
+        param_types,
+        return_type,
+        body,
+        UdfCapacity::Catalog,
         None,
     )
 }
@@ -2797,13 +2842,13 @@ pub(crate) fn prepare_function_with_signature_prechecked(
         param_types,
         return_type,
         body,
-        true,
+        UdfCapacity::Catalog,
         Some(precheck),
     )
 }
 
-/// [`prepare_function_with_signature`] からレジストリ容量の上限だけを無視した版。UDF カタログのロード
-/// （`sql::udf_load`）が「容量による一時的なブロック」と「恒久的にロード不能」を区別するために使う。
+/// [`prepare_function_with_signature`] からレジストリ容量の上限だけを無視した版。
+/// `CREATE OR REPLACE` の置換（件数が増えない）の probe に使う。
 pub(crate) fn prepare_function_with_signature_ignoring_capacity(
     registry: &UdfRegistry,
     name: &str,
@@ -2819,7 +2864,7 @@ pub(crate) fn prepare_function_with_signature_ignoring_capacity(
         param_types,
         return_type,
         body,
-        false,
+        UdfCapacity::Unchecked,
         None,
     )
 }
@@ -2832,7 +2877,7 @@ fn prepare_function_with_signature_inner(
     param_types: &[Option<crate::sql::cast::CastType>],
     return_type: Option<&crate::sql::cast::CastType>,
     body: &Expr,
-    check_capacity: bool,
+    capacity: UdfCapacity,
     precheck: Option<&dyn Fn() -> Result<(), SqlSurfaceError>>,
 ) -> Result<PreparedUdf, SqlSurfaceError> {
     if param_types.len() != params.len() {
@@ -2849,7 +2894,7 @@ fn prepare_function_with_signature_inner(
         }
     }
     let mut prepared =
-        prepare_function_definition_inner(registry, name, params, body, check_capacity, precheck)?;
+        prepare_function_definition_inner(registry, name, params, body, capacity, precheck)?;
     prepared.param_types = param_types.to_vec();
     if let Some(ret) = return_type {
         if ret.expr_type().is_none() {
@@ -3318,7 +3363,14 @@ pub(crate) fn prepare_function_definition(
     params: &[String],
     body: &Expr,
 ) -> Result<PreparedUdf, SqlSurfaceError> {
-    prepare_function_definition_inner(registry, name, params, body, true, None)
+    prepare_function_definition_inner(
+        registry,
+        name,
+        params,
+        body,
+        UdfCapacity::SessionLocal,
+        None,
+    )
 }
 
 fn prepare_function_definition_inner(
@@ -3326,7 +3378,7 @@ fn prepare_function_definition_inner(
     name: &str,
     params: &[String],
     body: &Expr,
-    check_capacity: bool,
+    capacity: UdfCapacity,
     precheck: Option<&dyn Fn() -> Result<(), SqlSurfaceError>>,
 ) -> Result<PreparedUdf, SqlSurfaceError> {
     // 関数名は relation キー（裸の名前、または SCHEMA 配下の内部キー `#<id>.<name>`。
@@ -3349,10 +3401,18 @@ fn prepare_function_definition_inner(
     if let Some(precheck) = precheck {
         precheck()?;
     }
-    if check_capacity && registry.len() >= MAX_SESSION_UDFS {
-        return Err(SqlSurfaceError::payload_too_large(
-            "too many functions defined in this session",
-        ));
+    match capacity {
+        UdfCapacity::SessionLocal if registry.session_local_count() >= MAX_SESSION_UDFS => {
+            return Err(SqlSurfaceError::payload_too_large(
+                "too many functions defined in this session",
+            ));
+        }
+        UdfCapacity::Catalog
+            if registry.catalog_entry_count() >= crate::catalog::function::MAX_FUNCTIONS =>
+        {
+            return Err(SqlSurfaceError::payload_too_large("too many functions"));
+        }
+        _ => {}
     }
     if params.len() > MAX_UDF_PARAMS {
         return Err(SqlSurfaceError::payload_too_large(
@@ -3562,7 +3622,7 @@ fn precheck_wasm_registration(
             "function {name} is already defined in this session"
         )));
     }
-    if registry.len() >= MAX_SESSION_UDFS {
+    if registry.session_local_count() >= MAX_SESSION_UDFS {
         return Err(SqlSurfaceError::payload_too_large(
             "too many functions defined in this session",
         ));

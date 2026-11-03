@@ -161,9 +161,7 @@ blob の断片・tenant_id・本体の原文はエラー文言へ出さない。
   引き上げは #1917／#1922。
 - #1921（ロード）: 実装済み（「ロード経路」）。準備済み文（Parse 済み）が他セッションの DROP の後に
   陳腐化する件は未対応（refresh は Query／Parse の時点だけ）。
-- `MAX_SESSION_UDFS`（64）と `MAX_FUNCTIONS`（64）は等しく、カタログが満杯だと WASM 等のセッション内の登録を
-  入れる余地が無い。#1922 の CLI 設定はこの 2 つのハード上限を超えない範囲（下げる方向のみ）に限り、
-  両者は同じ値で動かす。
+- `MAX_SESSION_UDFS` と `MAX_FUNCTIONS` の件数共有: #2883 で分離済み（「上限の分離（Issue #2883）」）。
 - #1917: 実装済み（「書き込み経路」）。残り: 多重定義（引数の型の並びが違う同名関数）の保持・呼び出し時の
   解決規則・呼び出し時の `42725`（型付き引数・`RETURNS` の永続化は #2798 で実装済み）。複数名の
   `DROP FUNCTION f, g`・`IF EXISTS` の NoticeResponse も未対応。
@@ -174,7 +172,7 @@ blob の断片・tenant_id・本体の原文はエラー文言へ出さない。
 ## 上限の設定と権限（Issue #1922）
 
 - フラグ `--max-functions <1-64>` は 1 本で、カタログ経路（`MAX_FUNCTIONS`）の書き込み判定に値を渡す。
-  値は全テナントで共通。
+  値は全テナントで共通。セッション限定の関数（公開 API の登録）には効かない（#2883）。
 - **下げる方向のみ**: 読み取り側（一覧・削除対象の列挙・ロードのパス数）はハード上限超過を
   `CorruptSchema` として fail-closed に扱うため、上げる設定は正常な DB を破損扱いにする。範囲は
   `engine::function_limits::validate_max_functions` に一元化し、`FunctionLimits::new` と
@@ -225,3 +223,28 @@ commit 後にレジストリから取り除く。詳細は [plpgsql-subset.md](p
 - 書き込み: 作成・置換の write txn が参照先の現存・自己参照・循環を再検証してから記録する。
   関数の削除は `remove_function_in_txn` が辺を掃除する。詳細は [plpgsql-subset.md](plpgsql-subset.md)
   「Issue #2219 追記」。
+
+## 上限の分離（Issue #2883）
+
+SQL-66 (5) のポインタ（関連 SQL-9・EXT-5）。
+
+- **判断**: 分離する。レジストリが 1 つの上限（64）で全件を数えていたため、カタログが満杯だとセッション限定の
+  関数（公開 API の `define_function*`・`register_wasm_udf*`）を 1 件も登録できず、逆にセッション限定の
+  関数が 64 件あると永続 `CREATE FUNCTION` とロードが阻まれた。どちらも件数の共有が原因の欠陥だった。
+- **2 つのバケット**: `UdfRegistry` の中で別々に数える。
+  - カタログバケット: `catalog_entry_count()`。上限は `catalog::function::MAX_FUNCTIONS`（64）。永続 `CREATE`・
+    `OR REPLACE`（新規）・ロードで判定する。
+  - セッション限定バケット: `session_local_count()`（全体件数からカタログ件数を引く）。カタログ由来でない
+    宣言的 UDF・WASM UDF・ルーチンの合計で、上限は `MAX_SESSION_UDFS`（64。意味を「セッション限定の合計」に
+    変更。値と名前は維持）。
+  - 各上限の超過は従来どおり `54000`。判定順（名前 → 重複 → 件数 → 引数数 → 本体）は変えない。
+- **CLI は新設しない**: SQL の `CREATE FUNCTION` は常にカタログへの永続定義で、セッション限定の登録は Rust の
+  公開 API からしか到達できない。wire・SQL のクライアントからは到達できないため、組み込み側の定数上限で足りる。
+  `--max-functions` はカタログバケットだけに効き、範囲検証は変えない（ハード上限を超えない）。
+- **メモリ上限**: 1 セッションのレジストリは最大 `MAX_REGISTRY_UDFS`（`MAX_SESSION_UDFS + MAX_FUNCTIONS` = 128）件。
+  1 件あたりの大きさ（本体ノード数・引数数・本体長・WASM の `SandboxLimits`）は従来どおり有界。
+- **ロードの再試行**: 容量による `STALE_GENERATION` を廃止した。再試行の対象は、同名の非カタログ登録に
+  阻まれた定義だけ。
+- **テナント境界**: カタログ由来の印を付ける経路（ロード・永続 DDL の commit 後）は変えず、セッション限定の
+  登録がカタログバケットへ紛れ込む経路は無い。
+- テスト: `sql66_udf_limits.rs`（結合）、`udf_load.rs`・`function_limits.rs`（単体）。
