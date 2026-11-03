@@ -285,7 +285,8 @@ pub(crate) fn cell_payload_bytes(cell: &Cell) -> usize {
     match cell {
         Cell::Text(s) => s.len(),
         Cell::Bytes(b) => b.len(),
-        Cell::Bit(v) => v.as_bytes().len(),
+        // wire／HTTP 応答のテキスト展開（ビット数と同じ文字数）後の大きさで課金する。
+        Cell::Bit(v) => usize::try_from(v.bit_len()).unwrap_or(usize::MAX),
         Cell::Json(s) => s.len(),
         Cell::Numeric(d) => d.to_string().len(),
         Cell::Vector(v) => v.len().saturating_mul(std::mem::size_of::<f32>()),
@@ -989,6 +990,13 @@ pub(crate) fn describe_columns(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// BIT の結果予算はテキスト展開後（ビット数）で計上する。
+    #[test]
+    fn cell_payload_bytes_counts_bit_as_text_expanded_length() {
+        let v = crate::bit_string::BitString::parse_text(&"1".repeat(64), 64).expect("parse");
+        assert_eq!(cell_payload_bytes(&Cell::Bit(v)), 64);
+    }
     use crate::catalog::ColumnType;
     use crate::catalog::{ColumnDef, TableSchema};
     use crate::recovery::required_op_id::OperationId;

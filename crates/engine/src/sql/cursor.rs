@@ -297,7 +297,9 @@ pub(crate) fn estimate_cell_bytes(cell: &Cell) -> usize {
         Cell::Date(_) => 4,
         Cell::Interval(_) => 16,
         // テキスト整形（projection・wire text・COPY・JSON）は n 文字の `0`／`1` へ展開されるため、
-        // packed バイト数ではなくビット数で課金する。
+        // packed バイト数ではなくビット数で課金する。このため packed で 16 MiB 保持上限に
+        // 収まる最大長付近の BIT(n) でも、展開後が上限を超える行は意図どおり 54000 で拒否する
+        // （保持時にテキスト展開して返すメモリ量を上限で縛るための一貫した基準）。
         Cell::Bit(v) => usize::try_from(v.bit_len())
             .unwrap_or(usize::MAX)
             .saturating_add(8),
@@ -529,6 +531,22 @@ mod tests {
         fn table_exists(&self, name: &str) -> Result<bool, SqlSurfaceError> {
             Ok(name == "documents")
         }
+    }
+
+    /// カーソル課金は BIT をテキスト展開後（ビット数）で数える。最大長 BIT の 1 行は
+    /// 保持上限（16 MiB）を超えるため課金額が上限超過になる（意図した拒否）。
+    #[test]
+    fn estimate_cell_bytes_charges_bit_by_text_length() {
+        let v = crate::bit_string::BitString::parse_text(&"1".repeat(64), 64).expect("parse");
+        assert_eq!(estimate_cell_bytes(&Cell::Bit(v)), 72);
+        let big = vec![
+            0u8;
+            crate::bit_string::byte_len_for_bits(crate::bit_string::MAX_BIT_LENGTH)
+                .expect("len")
+        ];
+        let v = crate::bit_string::BitString::from_parts(crate::bit_string::MAX_BIT_LENGTH, big)
+            .expect("max bit");
+        assert!(estimate_cell_bytes(&Cell::Bit(v)) > MAX_CURSOR_BYTES_PER_SESSION);
     }
 
     fn tokens_of(sql: &str) -> Vec<Token> {

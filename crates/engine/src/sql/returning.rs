@@ -111,6 +111,12 @@ fn try_alloc_bit_for_budget(
     budget: &mut usize,
     cap: usize,
 ) -> Result<crate::bit_string::BitString, SqlSurfaceError> {
+    // wire／HTTP 応答ではテキスト展開（ビット数と同じ文字数）されるため、packed 分は委譲先が、
+    // 展開による増分（ビット数 − packed バイト数）をここで先に計上する（`sql::scan` と同方針）。
+    let expansion = usize::try_from(v.bit_len())
+        .unwrap_or(usize::MAX)
+        .saturating_sub(v.as_bytes().len());
+    *budget = try_accumulate_budget(*budget, expansion, cap)?;
     let bytes = try_alloc_bytes_for_budget(v.as_bytes(), budget, cap)?;
     crate::bit_string::BitString::from_parts(v.bit_len(), bytes).map_err(|e| {
         SqlSurfaceError::Internal {
@@ -276,6 +282,19 @@ pub(crate) fn project_row(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// BIT は packed バイト数ではなくテキスト展開後（ビット数）で課金する。
+    #[test]
+    fn try_alloc_bit_for_budget_charges_text_expanded_length() {
+        let v = crate::bit_string::BitString::parse_text(&"1".repeat(64), 64).expect("parse");
+        // packed は 8 バイトだが展開後は 64 文字。cap=63 は拒否、64 は許容。
+        let mut b = 0usize;
+        let err = try_alloc_bit_for_budget(&v, &mut b, 63).expect_err("must exceed cap");
+        assert_eq!(err.wire_code(), "54000");
+        let mut b = 0usize;
+        try_alloc_bit_for_budget(&v, &mut b, 64).expect("fits exactly");
+        assert_eq!(b, 64);
+    }
 
     /// 累計が上限を超える場合は確保前に `54000`（`PayloadTooLarge`）で拒否する
     /// （`try_accumulate_budget` は private のため本モジュール内でのみ検証可能）。

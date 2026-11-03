@@ -108,7 +108,8 @@ fn cell_payload_bytes(cell: &Cell) -> usize {
     match cell {
         Cell::Text(s) => s.len(),
         Cell::Bytes(b) => b.len(),
-        Cell::Bit(v) => v.as_bytes().len(),
+        // wire／HTTP 応答のテキスト展開（ビット数と同じ文字数）後の大きさで課金する。
+        Cell::Bit(v) => usize::try_from(v.bit_len()).unwrap_or(usize::MAX),
         Cell::Json(s) => s.len(),
         // 正確な内部表現サイズではなく十進文字列表現による近似（予算計上の
         // 目的では十分。実際の確保量を下回らない側に倒す）。
