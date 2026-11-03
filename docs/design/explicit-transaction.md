@@ -764,6 +764,11 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
 
 - 予告（#2398）: NoSQL 表層から到達できない分類に `40001` を加える。
 
+- `crates/wire-server/tests/err7_retryable_codes_no_side_effects.rs`（Issue #2421。ERR-7）:
+  明示トランザクションの最初の書き込み文の `55P03`（`'E'`）→ 後続文と `COMMIT` は `25P02`
+  → `ROLLBACK` で `'I'` に戻り、行・台帳に痕跡なし、`BEGIN` からの同一 `operation_id` の
+  全体再試行が 1 回だけ反映されることを固定。
+
 - `crates/engine/tests/sql31_transaction.rs`: BEGIN/INSERT/INSERT/COMMIT の
   可視性・ROLLBACK の完全巻き戻し・入れ子 BEGIN の `25001`・トランザクション外
   COMMIT/ROLLBACK の `25P01`・同一トランザクション内 `operation_id` 再利用の
