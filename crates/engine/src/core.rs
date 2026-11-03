@@ -6824,6 +6824,7 @@ impl EngineCore {
         &self,
         session: &crate::sql::mode::SessionState,
         stmt: &crate::sql::allowlist::ValidatedInsertSelect,
+        skip: &crate::sql::parser::LiteralSkip,
         limits: &crate::result_limits::ResultLimits,
     ) -> Result<
         crate::sql::insert_select::BoundInsertSelectTarget,
@@ -6840,7 +6841,7 @@ impl EngineCore {
             .describe_parsed_in_session_impl(
                 session,
                 &ParsedSql::Statement((*stmt.query).clone()),
-                &crate::sql::parser::LiteralSkip::NONE,
+                skip,
                 &[],
                 limits,
             )?
@@ -10474,11 +10475,12 @@ impl EngineCore {
             // SQL-63・Issue #1876: 書き込みは行わず、参照される副文の `RETURNING` 列に主クエリの外側処理を
             // 適用した列メタを返す（Execute と同じ `plan_outer_parts` を通るため列名・型・束縛エラーが一致）。
             ParsedSql::DataModifyingCte(stmt) => self
-                .describe_data_modifying_cte(session, stmt, limits)
+                .describe_data_modifying_cte(session, stmt, skip_vector_literal_validation, limits)
                 .map(Some),
             // SQL-51・Issue #1732: 束縛（列数・型）を通した上で、`RETURNING` の列メタだけを返す。
             ParsedSql::InsertSelect(stmt) => {
-                let bound = self.bind_insert_select(session, stmt, limits)?;
+                let bound =
+                    self.bind_insert_select(session, stmt, skip_vector_literal_validation, limits)?;
                 match bound.returning {
                     Some(projection) => {
                         let (_read_txn, schema) = self.read_txn_with_schema(&stmt.table_name)?;

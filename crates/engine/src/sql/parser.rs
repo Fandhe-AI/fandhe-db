@@ -1919,31 +1919,17 @@ pub fn bind_projection(
     bind_projection_with_literals(projection, schema, udfs, node_budget, &LiteralSkip::NONE)
 }
 
-/// 投影トップレベルの距離列（SQL-33 (7)・Issue #2007）のベクトルリテラルを、構造検証専用の
-/// 同次元のゼロベクトルへ置き換えた式を返す。Prepared Describe が `$n` 由来のダミー値
-/// （ベクトルとして不正）で列メタだけを導出するための縮退経路で、列・型の検証は通常経路と
-/// 同じ束縛（[`crate::sql::udf_call::bind_projection_expr_json_ok`]）に任せる。
-fn placeholder_distance_expr(expr: &Expr, schema: &TableSchema) -> Option<Expr> {
-    let Expr::VectorDistance { kind, lhs, rhs } = expr else {
-        return None;
-    };
-    if !matches!(
-        (lhs.as_ref(), rhs.as_ref()),
-        (Expr::Ident(_), Expr::String(_))
-    ) {
-        return None;
-    }
-    let dim = schema.columns.iter().find_map(|c| match c.ty {
-        ColumnType::Vector(d) => Some(d),
-        _ => None,
-    })?;
-    // 次元はスキーマ宣言値（検証済み）。リテラル文字列は `[0,0,...]` の高々 2 * dim + 2 バイト。
-    let zeros = vec!["0"; usize::try_from(dim).ok()?].join(",");
-    Some(Expr::VectorDistance {
-        kind: *kind,
-        lhs: lhs.clone(),
-        rhs: Box::new(Expr::String(format!("[{zeros}]"))),
-    })
+/// 投影トップレベルの距離列（SQL-33 (7)・Issue #2007）で、ベクトルリテラル側が文字列リテラルの
+/// 形（`<列> <距離演算子> <文字列>`）か。Prepared Describe が `$n` 由来のダミー値（ベクトルとして
+/// 不正）で列メタだけを導出する縮退経路の対象判定で、真の項目は束縛時にリテラルの文字列化・解析を
+/// 行わず（外部入力向けの 64 KiB 上限を内部ダミー値へ適用しない）、列・型の検証だけを通常経路と
+/// 同じ束縛（[`crate::sql::udf_call::bind_projection_expr_json_ok`]）で行う。
+fn is_placeholder_distance_expr(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::VectorDistance { lhs, rhs, .. }
+            if matches!((lhs.as_ref(), rhs.as_ref()), (Expr::Ident(_), Expr::String(_)))
+    )
 }
 
 /// [`bind_projection`] の本体。`skip.projection_mask` の印が立った投影項目に限り、距離列の
@@ -1995,14 +1981,13 @@ pub(crate) fn bind_projection_with_literals(
                         cols.push(resolve_projected_column(name, alias, schema)?);
                     }
                     crate::sql::allowlist::SelectItem::Expr { expr, alias } => {
-                        let placeholder = if skip.skips_projection_item(item_index) {
-                            placeholder_distance_expr(expr, schema)
-                        } else {
-                            None
-                        };
+                        let skip_literal = skip.skips_projection_item(item_index)
+                            && is_placeholder_distance_expr(expr);
+                        let _placeholder_guard = skip_literal
+                            .then(crate::sql::udf_call::DistancePlaceholderGuard::enter);
                         let (bound, ty, result_ty) =
                             crate::sql::udf_call::bind_projection_expr_json_ok(
-                                placeholder.as_ref().unwrap_or(expr),
+                                expr,
                                 schema,
                                 udfs,
                                 node_budget,

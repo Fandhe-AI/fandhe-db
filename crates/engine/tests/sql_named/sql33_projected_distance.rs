@@ -403,3 +403,41 @@ fn sql33_projected_distance_prepared_describe_checks_literal_item_beside_param_i
         .expect_err(sql);
     assert_eq!(err.wire_code(), "0A000", "{sql}");
 }
+
+/// PR #2927 指摘の回帰: 高次元表でも投影位置の距離列の Prepared Describe は内部ダミー値へ
+/// リテラル長の上限（64 KiB）を適用せず成功する。
+#[test]
+fn sql33_projected_distance_prepared_describe_high_dimension() {
+    let path = unique_db_path("sql33-proj-dist-high-dim");
+    let _g = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "wide",
+            vec![ColumnDef::new(
+                "embedding",
+                ColumnType::Vector(40_000),
+                false,
+            )],
+        ))
+        .expect("create table");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_ledger_mode(engine::recovery::required_op_id::LedgerMode::Ledgered);
+    let session = SessionState::default();
+    let prepared = core
+        .parse_sql_prepared(
+            "SELECT id, embedding <=> $1 AS d FROM wide ORDER BY embedding <=> $1 LIMIT 3",
+        )
+        .expect("parse");
+    let cols = core
+        .describe_prepared_in_session(&session, &prepared)
+        .expect("describe")
+        .expect("columns");
+    assert_eq!(
+        cols.last(),
+        Some(&ColumnMeta::Computed {
+            name: "d".to_string(),
+            ty: Some(ColumnType::Double)
+        })
+    );
+}

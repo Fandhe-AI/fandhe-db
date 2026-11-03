@@ -4009,6 +4009,27 @@ fn validate_closed_expr(
     }
 }
 
+thread_local! {
+    /// Prepared Describe が `$n` 由来のダミーリテラルの解析を省く区間でだけ真（[`DistancePlaceholderGuard`]）。
+    static DISTANCE_PLACEHOLDER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// [`DISTANCE_PLACEHOLDER`] を区間限定で立てる RAII ガード（`sql::parser::bind_projection_with_literals`
+/// が Describe 専用の縮退束縛の間だけ保持する。drop で必ず元へ戻す）。
+pub(crate) struct DistancePlaceholderGuard(bool);
+
+impl DistancePlaceholderGuard {
+    pub(crate) fn enter() -> Self {
+        Self(DISTANCE_PLACEHOLDER.with(|c| c.replace(true)))
+    }
+}
+
+impl Drop for DistancePlaceholderGuard {
+    fn drop(&mut self) {
+        DISTANCE_PLACEHOLDER.with(|c| c.set(self.0));
+    }
+}
+
 /// 距離式の被演算子を検証した結果（SQL-74 (1)・Issue #2035）。[`bind_expr_any`] が
 /// `BoundExpr::VectorDistance` の構築に使う（Issue #2036）。
 pub(super) struct BoundVectorDistance {
@@ -4054,6 +4075,14 @@ pub(super) fn bind_vector_distance_operands(
             })
         })
         .ok_or_else(unsupported)?;
+    // Prepared Describe の `$n` 由来ダミー（Issue #2007）はリテラルの解析・上限検査を省く。
+    // 結果列メタしか使わないため問い合わせベクトルは空でよい（実行経路ではこの印は立たない）。
+    if DISTANCE_PLACEHOLDER.with(std::cell::Cell::get) {
+        return Ok(BoundVectorDistance {
+            kind,
+            query: Vec::new(),
+        });
+    }
     let query = crate::sql::parser::parse_vector_literal(literal, dim)?;
     Ok(BoundVectorDistance { kind, query })
 }
