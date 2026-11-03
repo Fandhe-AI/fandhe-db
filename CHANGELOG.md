@@ -9,6 +9,7 @@
 
 ### Added
 
+- PL/pgSQL の条件式（`IF`・`ELSIF`・`WHILE`・`EXIT/CONTINUE WHEN`・検索形 `CASE`）と値として使う論理式で `AND`・`OR`・`NOT`・`BETWEEN`・`IN (リスト)` を受理するようにした（Issue #2880・SQL-68）。従来の `0A000` から受理に変わる。NULL は 3 値論理で扱い、数値は値のまま比較する。
 - PL/pgSQL の `RAISE`（全水準・書式・`USING`・条件名・`SQLSTATE`・再送出）と `EXCEPTION WHEN` ブロックを追加した（Issue #2227・SQL-70）。捕捉はブロック開始時の内部 savepoint まで巻き戻し、変数は巻き戻さない。巻き戻せない場合（書き込み後に入ったブロック・一時表を使った Tx）は固定文言の `0A000` で失敗する。`RAISE NOTICE/INFO/WARNING` は `NoticeResponse` で応答の前に届き（`DEBUG`／`LOG` は送らない）、`RAISE EXCEPTION` は利用者指定の SQLSTATE を `C` に出して `W` を付ける（本 DB 自身のエラーは 3 フィールドのまま）。`engine::notice`（`RaisedError`・`Notice`・`StatementNotices`）と `SqlSurfaceError::{raised, effective_sqlstate}` を公開した。
   BREAKING CHANGE: 公開 enum `ErrorClass` に `RaisedException`（`P0001`）、`SqlSurfaceError` に `RaisedException` を追加した。`RAISE`・`EXCEPTION` は `0A000` から受理に変わった。
 - `ALTER DEFAULT PRIVILEGES [FOR ROLE ...] [IN SCHEMA ...] {GRANT|REVOKE} ... ON {TABLES|SEQUENCES|FUNCTIONS|SCHEMAS}` を追加した（Issue #2237・SQL-40・RLS-12）。実行より後に作る表（CTAS・ビュー・matview を含む）・SERIAL／IDENTITY を含む SEQUENCE・関数・SCHEMA の初期 ACL へ既定の付与を作成と同じ write txn で適用し、既存のオブジェクトと `OR REPLACE` の置換には作用しない。`FOR ROLE` は対象ロールへの SET 経路（運用者権限は免除）が要り、未束縛は `42501`・他テナントのロールは `42704`・SCHEMA は `3F000`・明示 Tx 内は `0A000`。`DROP ROLE` は既定権限の対象・付与先を `2BP01` で拒否し、`DROP SCHEMA` は当該 SCHEMA の既定権限を消す。wire のコマンドタグは `ALTER DEFAULT PRIVILEGES`。

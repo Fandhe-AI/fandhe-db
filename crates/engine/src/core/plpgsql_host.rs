@@ -35,6 +35,7 @@ use crate::numeric::{self, Decimal};
 use crate::plpgsql::ast::{
     Body, DeclType, EmbeddedSql, ParseOptions, ReturnShape, SqlExpr, VarRole, VarSite,
 };
+use crate::plpgsql::bool_expr::{strip_outer_parens_range, Exprs, MAX_BOOL_DEPTH};
 use crate::plpgsql::embedded::validate_embedded;
 use crate::plpgsql::host::{
     PlHost, PlSavepoint, PlScalar, ResolvedType, RowDemand, SqlOutcome as HostOutcome, VarLookup,
@@ -88,6 +89,9 @@ fn internal(detail: &str) -> SqlSurfaceError {
         detail: detail.to_string(),
     }
 }
+
+/// 複合条件で評価できない形を拒否するときの固定文言（入力値・他テナントの情報を含めない）。
+const COND_UNSUPPORTED: &str = "this condition form is not supported in PL/pgSQL";
 
 fn unsupported(detail: &str) -> SqlSurfaceError {
     SqlSurfaceError::feature_not_supported(detail)
@@ -238,6 +242,7 @@ struct CorePlHost<'a, 'e> {
 }
 
 /// 条件の比較オペランド。リテラルのトークン（SQL を経由しない）か、SQL で求めた型付きの値。
+#[derive(Clone)]
 enum Operand {
     Literal(Vec<Token>),
     Value(PlScalar),
@@ -533,7 +538,7 @@ impl<'a, 'e> CorePlHost<'a, 'e> {
             Ok(CoreOutcome::Query(qr)) => Ok(!qr.rows.is_empty()),
             Ok(_) => Err(internal("PL/pgSQL condition returned an unexpected result")),
             Err(e) if e.wire_code() == "42601" => Err(unsupported(
-                "this condition form is not supported in PL/pgSQL (use a single comparison)",
+                "this condition form is not supported in PL/pgSQL",
             )),
             Err(e) => Err(e),
         }
@@ -565,6 +570,188 @@ impl<'a, 'e> CorePlHost<'a, 'e> {
                     _ => Err(internal("PL/pgSQL condition returned an unexpected result")),
                 }
             }
+        }
+    }
+
+    /// 評価済みの 2 オペランドを `op` で比べる。数値同士は評価済みの値のまま比較し（SQL へ戻すと、
+    /// 書き方によらず 2^53 以上の値が `22003` になる）、それ以外（文字列・日時等）は値のリテラルに
+    /// 置き換えて `where_probe` で比べる（`FROM` の無い `WHERE` は演算を含む式を受理しない）。
+    fn compare_operands(
+        &mut self,
+        lv: Operand,
+        op: &[Token],
+        rv: Operand,
+    ) -> Result<bool, SqlSurfaceError> {
+        if let Some(b) = native_compare(&lv, op, &rv) {
+            return Ok(b);
+        }
+        let mut lt = lv.into_bare_tokens()?;
+        lt.extend_from_slice(op);
+        lt.extend(rv.into_bare_tokens()?);
+        self.where_probe(lt)
+    }
+
+    /// 複合条件の葉のオペランドを求める。「この形は評価できない」失敗（構文・未対応の形）は固定文言の
+    /// `0A000` にし、評価の本物のエラー（`22012`・`22003` 等）はそのまま返す。比較・論理語を含む
+    /// オペランドは受理しない（fail-closed）。
+    fn leaf_operand(
+        &mut self,
+        expr: &SqlExpr,
+        env: &dyn VarLookup,
+        range: std::ops::Range<usize>,
+    ) -> Result<Option<Operand>, SqlSurfaceError> {
+        let slice = expr
+            .tokens
+            .get(range.clone())
+            .ok_or_else(|| internal("PL/pgSQL condition operand out of range"))?;
+        if has_compound_word(slice) || split_single_comparison(slice).is_some() {
+            return Err(unsupported(COND_UNSUPPORTED));
+        }
+        self.operand_value_in(expr, env, range).map_err(|e| {
+            if is_shape_failure(&e) {
+                unsupported(COND_UNSUPPORTED)
+            } else {
+                e
+            }
+        })
+    }
+
+    /// `OR`・`AND`・`NOT` を含む条件の 3 値論理による評価（NULL は `None`）。`OR`/`AND` は左から右へ
+    /// 短絡評価する（PostgreSQL の評価順に合わせ、`x <> 0 AND 10 / x > 1` は x=0 で偽）。`depth` は
+    /// 再帰深さ（`MAX_BOOL_DEPTH` 超過は `0A000`）。`eval_cond` から呼ばれる。
+    fn eval_bool_range(
+        &mut self,
+        expr: &SqlExpr,
+        env: &dyn VarLookup,
+        x: &Exprs<'_>,
+        range: std::ops::Range<usize>,
+        depth: usize,
+    ) -> Result<Option<bool>, SqlSurfaceError> {
+        if depth > MAX_BOOL_DEPTH {
+            return Err(unsupported("condition is nested too deeply"));
+        }
+        let bad = || unsupported(COND_UNSUPPORTED);
+        let range = x.strip_parens(range);
+        let ors = x.split_or(&range).ok_or_else(bad)?;
+        if ors.len() > 1 {
+            let mut saw_null = false;
+            for p in ors {
+                match self.eval_bool_range(expr, env, x, p, depth + 1)? {
+                    Some(true) => return Ok(Some(true)),
+                    None => saw_null = true,
+                    Some(false) => {}
+                }
+            }
+            return Ok(if saw_null { None } else { Some(false) });
+        }
+        let ands = x.split_and(&range).ok_or_else(bad)?;
+        if ands.len() > 1 {
+            let mut saw_null = false;
+            for p in ands {
+                match self.eval_bool_range(expr, env, x, p, depth + 1)? {
+                    Some(false) => return Ok(Some(false)),
+                    None => saw_null = true,
+                    Some(true) => {}
+                }
+            }
+            return Ok(if saw_null { None } else { Some(true) });
+        }
+        let (rest, nots) = x.strip_not(range.clone());
+        if nots > 0 {
+            let v = self.eval_bool_range(expr, env, x, rest, depth + 1)?;
+            return Ok(v.map(|b| if nots % 2 == 1 { !b } else { b }));
+        }
+        self.eval_bool_leaf(expr, env, x, range)
+    }
+
+    /// 論理結合を含まない葉（`IS NULL`・`BETWEEN`・`IN (リスト)`・比較・真偽値のオペランド）の評価。
+    /// 単独で真偽（NULL を含む）を返せない形は、`where_probe` で NULL を偽に潰さず `0A000` にする。
+    fn eval_bool_leaf(
+        &mut self,
+        expr: &SqlExpr,
+        env: &dyn VarLookup,
+        x: &Exprs<'_>,
+        range: std::ops::Range<usize>,
+    ) -> Result<Option<bool>, SqlSurfaceError> {
+        let slice = expr
+            .tokens
+            .get(range.clone())
+            .ok_or_else(|| internal("PL/pgSQL condition operand out of range"))?;
+        if let Some((operand, negated)) = split_is_null(slice) {
+            let r = range.start..range.start.saturating_add(operand.len());
+            let is_null = self.leaf_operand(expr, env, r)?.is_none();
+            return Ok(Some(is_null != negated));
+        }
+        if let Some((xr, neg, lo, hi)) = x.split_between(&range) {
+            let xv = self.leaf_operand(expr, env, xr)?;
+            let lov = self.leaf_operand(expr, env, lo)?;
+            let hiv = self.leaf_operand(expr, env, hi)?;
+            let ge = match (&xv, &lov) {
+                (Some(a), Some(b)) => {
+                    Some(self.compare_operands(a.clone(), &[Token::Ge], b.clone())?)
+                }
+                _ => None,
+            };
+            let le = match (&xv, &hiv) {
+                (Some(a), Some(b)) => {
+                    Some(self.compare_operands(a.clone(), &[Token::Le], b.clone())?)
+                }
+                _ => None,
+            };
+            let both = match (ge, le) {
+                (Some(false), _) | (_, Some(false)) => Some(false),
+                (Some(true), Some(true)) => Some(true),
+                _ => None,
+            };
+            return Ok(both.map(|b| b != neg));
+        }
+        if x.is_boolean_form(&range) {
+            let Some((xr, neg, items)) = x.split_in_list(&range) else {
+                return Err(unsupported(COND_UNSUPPORTED));
+            };
+            let Some(xv) = self.leaf_operand(expr, env, xr)? else {
+                return Ok(None);
+            };
+            let mut saw_null = false;
+            for it in items {
+                match self.leaf_operand(expr, env, it)? {
+                    None => saw_null = true,
+                    Some(iv) => {
+                        if self.compare_operands(xv.clone(), &[Token::Punct('=')], iv)? {
+                            return Ok(Some(!neg));
+                        }
+                    }
+                }
+            }
+            return Ok(if saw_null { None } else { Some(neg) });
+        }
+        if has_compound_word(slice) {
+            return Err(unsupported(COND_UNSUPPORTED));
+        }
+        if let Some((l, op, _)) = split_single_comparison(slice) {
+            let l_end = range.start.saturating_add(l.len());
+            let r_start = l_end.saturating_add(op.len());
+            let lv = self.leaf_operand(expr, env, range.start..l_end)?;
+            let rv = self.leaf_operand(expr, env, r_start..range.end)?;
+            let (Some(lv), Some(rv)) = (lv, rv) else {
+                return Ok(None);
+            };
+            return Ok(Some(self.compare_operands(lv, op, rv)?));
+        }
+        // 真偽値の変数・リテラル・関数呼び出し等の単独オペランド。
+        let mismatch =
+            || SqlSurfaceError::datatype_mismatch("argument of a condition must be type boolean");
+        match self.leaf_operand(expr, env, range)? {
+            None => Ok(None),
+            Some(Operand::Value(v)) => match v.cell {
+                Cell::Bool(b) => Ok(Some(b)),
+                _ => Err(mismatch()),
+            },
+            Some(Operand::Literal(t)) => match t.as_slice() {
+                [w] if is_word(w, "true") => Ok(Some(true)),
+                [w] if is_word(w, "false") => Ok(Some(false)),
+                _ => Err(mismatch()),
+            },
         }
     }
 
@@ -631,39 +818,6 @@ impl<'a, 'e> CorePlHost<'a, 'e> {
             .map_err(|_| not_found())
     }
 }
-/// 全体を囲む対応した外側の括弧を（入れ子の分まで）外した部分列。
-/// 全体を囲む対応した外側の括弧を（入れ子の分まで）外した部分列の、`toks` 上の範囲。
-fn strip_outer_parens_range(toks: &[Token]) -> std::ops::Range<usize> {
-    let mut lo = 0usize;
-    let mut hi = toks.len();
-    loop {
-        let Some(cur) = toks.get(lo..hi) else {
-            return lo..hi;
-        };
-        let (Some(Token::Punct('(')), Some(Token::Punct(')'))) = (cur.first(), cur.last()) else {
-            return lo..hi;
-        };
-        let mut depth = 0usize;
-        for (i, t) in cur.iter().enumerate() {
-            match t {
-                Token::Punct('(') => depth += 1,
-                Token::Punct(')') => {
-                    depth = depth.saturating_sub(1);
-                    if depth == 0 && i + 1 != cur.len() {
-                        return lo..hi;
-                    }
-                }
-                _ => {}
-            }
-        }
-        if hi.saturating_sub(lo) < 2 {
-            return lo..hi;
-        }
-        lo += 1;
-        hi -= 1;
-    }
-}
-
 /// 語（`IS`・`NOT` 等）の一致（大文字小文字を区別しない）。
 fn is_word(t: &Token, w: &str) -> bool {
     matches!(t, Token::Ident(s) if s.eq_ignore_ascii_case(w))
@@ -819,25 +973,24 @@ impl PlHost for CorePlHost<'_, '_> {
                         let (Some(lv), Some(rv)) = (lv, rv) else {
                             return Ok(None);
                         };
-                        // 数値同士は評価済みの値のまま比較する（SQL へ戻すと、書き方によらず 2^53 以上の値が
-                        // `22003` になる）。それ以外（文字列・日時等）は値のリテラルに置き換えて比較する
-                        // （`FROM` の無い `WHERE` は演算を含む式を受理しない）。
-                        if let Some(b) = native_compare(&lv, op, &rv) {
-                            return Ok(Some(b));
-                        }
-                        let mut lt = lv.into_bare_tokens()?;
-                        lt.extend_from_slice(op);
-                        lt.extend(rv.into_bare_tokens()?);
-                        return Ok(Some(self.where_probe(lt)?));
+                        return Ok(Some(self.compare_operands(lv, op, rv)?));
                     }
                     (Err(e), _) | (_, Err(e)) if !is_shape_failure(&e) => return Err(e),
                     _ => {}
                 }
             }
         }
+        // `AND`・`OR`・`NOT`・`BETWEEN`・`IN (リスト)` を含む条件は、葉（比較・`IS NULL`・真偽値）を
+        // 個別に評価して 3 値論理で結合する（Issue #2880・SQL-68）。`FROM` の無い `WHERE` は比較 1 個の
+        // 形しか受理せず、数値も 2^53 以上を扱えないため、ここでは使わない。
+        let vars: Vec<usize> = expr.var_refs.iter().map(|s| s.pos).collect();
+        let x = Exprs::new(orig, &vars);
+        if x.is_boolean_form(&base_range) {
+            return self.eval_bool_range(expr, env, &x, base_range, 0);
+        }
         // 単純比較・`IS NULL` 以外の形（複合条件・述語・真偽値の式）の最終手段。`FROM` の無い `WHERE` は
         // 比較に出る `CAST` の結果を受理しない場合があるため値を保つ裸の数値で置換し直す。この `WHERE` は
-        // 比較 1 個の形しか受理せず（`AND`・`OR`・`BETWEEN`・`IN` は `0A000`）、また SQL の評価器は 2^53
+        // 比較 1 個の形しか受理せず、また SQL の評価器は 2^53
         // 以上の値を `CAST` 形でも裸でも `22003` にするため、ここでの置換形は精度の可否を変えない。
         let bare = subst::substitute(
             &expr.tokens,

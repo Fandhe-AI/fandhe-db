@@ -117,6 +117,10 @@ fn boolean_expressions_validate_in_value_positions() {
         "DECLARE v int; b boolean; BEGIN b := v IS NULL; RETURN b; END",
         "DECLARE v int := 5; BEGIN RETURN v BETWEEN 1 AND 10; END",
         "DECLARE v int := 5; b boolean := v IS NOT NULL; BEGIN RETURN b; END",
+        "DECLARE v int := 5; BEGIN RETURN v IN (1, 2, 3); END",
+        "DECLARE v int := 5; BEGIN RETURN v NOT IN (1, 2); END",
+        "DECLARE v int := 5; BEGIN RETURN v NOT BETWEEN 1 AND 3; END",
+        "DECLARE v int := 5; BEGIN RETURN NOT (v IN (1)); END",
     ] {
         check(&core, src).unwrap_or_else(|e| panic!("expected accept for {src:?}: {e}"));
     }
