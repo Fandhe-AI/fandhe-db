@@ -47,6 +47,11 @@ pub(crate) const BOOTSTRAP_MARKER_TABLE: TableDefinition<&str, &[u8]> =
 pub(crate) const BOOTSTRAP_PRIVILEGES_TABLE: TableDefinition<(&str, u64), &[u8]> =
     TableDefinition::new("role_bootstrap_privileges");
 
+/// 「マーカー導入前の既存 DB を移行した」ことを示す DB 単位の番兵キー（マーカー表内）。`validate_tenant` は
+/// 空文字を拒否するため実テナントとは衝突しない。あるとき、マーカーの無いテナントは（ロールが無くても）
+/// 新規投入せず見送る（全ロール削除後に古い users 行が戻っても資格情報を復活させない）。
+const LEGACY_MIGRATED_KEY: &str = "";
+
 const BLOB_VERSION: u8 = 1;
 const FLAG_ALL_OBJECT_PRIVILEGES: u8 = 1 << 0;
 const FLAG_DDL: u8 = 1 << 1;
@@ -261,6 +266,23 @@ fn put_marker(write_txn: &redb::WriteTransaction, tenant: &str) -> Result<()> {
     Ok(())
 }
 
+/// 移行済み番兵があるか。表が無ければ `false`。blob が不正なら固定文言の `Catalog` エラー。
+fn legacy_migrated_in_txn(
+    write_txn: &redb::WriteTransaction,
+) -> std::result::Result<bool, BootstrapError> {
+    let table = match ReadSource::open_table(write_txn, BOOTSTRAP_MARKER_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
+        Err(e) => return Err(e.into()),
+    };
+    let found = table.get(LEGACY_MIGRATED_KEY)?;
+    match found {
+        Some(v) if v.value() == [BLOB_VERSION] => Ok(true),
+        Some(_) => Err(BootstrapError::Catalog),
+        None => Ok(false),
+    }
+}
+
 /// `DROP ROLE` が同じ txn でロールの初期権限の行を消す（`drop_role_in_txn` から呼ぶ。行が無ければ何もしない）。
 pub(crate) fn remove_bootstrap_privileges_in_txn(
     write_txn: &redb::WriteTransaction,
@@ -404,8 +426,11 @@ pub(crate) fn bootstrap_in_txn(
     // 投入がロール表・マーカー表を作るため、途中で判定すると後続のテナントを誤って既存 DB 扱いにする）。
     let legacy_db =
         table_exists(write_txn, ROLES_TABLE)? && !table_exists(write_txn, BOOTSTRAP_MARKER_TABLE)?;
+    // 一度移行した DB は番兵により永続的に「未マークのテナントを新規投入しない」扱いを保つ。
+    let no_seed = legacy_db || legacy_migrated_in_txn(write_txn)?;
     let mut report = BootstrapReport::default();
     if legacy_db {
+        put_marker(write_txn, LEGACY_MIGRATED_KEY)?;
         // 移行時にファイルへ現れない既存テナントも保護する。マーカー表が一度できると `legacy_db` は偽になり、
         // 未マークのまま残ったテナントは後続の起動で「新規」扱いになる。全ロール削除後に古い行がファイルへ
         // 戻ると資格情報・権限が復活するため、ここでマーカーを書いて以後は再投入しない。
@@ -430,7 +455,7 @@ pub(crate) fn bootstrap_in_txn(
         if tenant_has_roles_in_txn(write_txn, tenant)? {
             adopt_tenant(write_txn, tenant, &rows, &mut report)?;
             report.tenants_adopted += 1;
-        } else if legacy_db {
+        } else if no_seed {
             put_marker(write_txn, tenant)?;
             for u in &rows {
                 report.entries.push(BootstrapEntry {

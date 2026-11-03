@@ -287,6 +287,25 @@ fn fresh_db_bootstraps_all_tenants_in_one_run() {
 }
 
 #[test]
+fn legacy_db_tenant_without_roles_is_not_reseeded_when_old_row_returns() {
+    let (_g, s) = open("bootstrap-legacy-norole");
+    // マーカー導入前の既存 DB: t2 は全ロール削除済みでファイルにも行が無く、t1 だけにロールがある。
+    let w = s.begin_write_txn().expect("w");
+    create_role_in_txn(&w, "t2", &initial_role_def(&user(1, "bob", "t2", false))).expect("role");
+    create_role_in_txn(&w, "t1", &initial_role_def(&user(1, "root", "t1", false))).expect("role");
+    finish(w);
+    drop_roles_now(&s, "t2", &["bob"]);
+    s.bootstrap_users_file(&[user(1, "root", "t1", false)])
+        .expect("migrate");
+    // 移行後に t2 の古い行がファイルへ戻っても、資格情報・権限を復活させない。
+    let later = [user(1, "root", "t1", false), user(2, "bob", "t2", true)];
+    let again = s.bootstrap_users_file(&later).expect("again");
+    assert_eq!(again.tenants_bootstrapped, 0);
+    assert!(role(&s, "t2", "bob").is_none());
+    assert!(marked(&s, "t2"));
+}
+
+#[test]
 fn legacy_db_tenant_absent_from_file_is_protected_from_later_reseed() {
     let (_g, s) = open("bootstrap-legacy-outside");
     // マーカー導入前の既存 DB: t2 にロールがあるが、今回のファイルには現れない。
