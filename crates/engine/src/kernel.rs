@@ -9,6 +9,10 @@
 //! 既定コンストラクタが実際にどちらの provider を注入するかは `search_engine.rs`
 //! （TASK-131・CORE-9 の差し替え点確定化レイヤ）経由で `core.rs::EngineCore::open` を参照。
 //!
+//! コサイン距離の brute-force 経路（Issue #1987）は子モジュール `cosine` にあり、
+//! 内積経路とは規約が異なる（距離は昇順・f64、同点は id 昇順）。内積の
+//! [`SearchProvider`] は変更せず、`<=>` の実行切り替えは #1991 で行う。
+//!
 //! 経路選択の外部上書き機構（環境変数・設定フラグ等）は設けない（CORE-12）。
 //! 実行経路（CPU-SIMD／GPU）自体の決定表は `dispatch.rs::select_execution_path`
 //! （TASK-155・CORE-11, 12）に集約されており、本モジュールはあくまで provider
@@ -17,6 +21,12 @@
 use std::fmt;
 
 use crate::search_order;
+
+mod cosine;
+pub use cosine::{
+    cosine_distance, cosine_distance_from_parts, cosine_top_k, row_norms_sq, CosineSearchInput,
+    DistanceHit,
+};
 
 /// **候補**検索結果 1 件（候補識別子とスコア）。[`SearchProvider`] の戻り値型。
 ///
