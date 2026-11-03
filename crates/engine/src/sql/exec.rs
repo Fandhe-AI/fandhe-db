@@ -658,6 +658,72 @@ pub(crate) fn candidate_scalar_view<'a>(
         .collect()
 }
 
+/// 文の期限を確認する行間隔（`exact_farthest_scan` の全走査ループ。Issue #1953 と同じ流儀）。
+const DESC_SCAN_DEADLINE_STRIDE: usize = 4096;
+
+/// 距離順 `DESC`（遠い順。Issue #2009・SQL-33 (2)）の厳密全走査。`sql::exec` の DISTANCE 段から
+/// 呼ばれ、ANN 索引・[`SearchProvider`] を通さない。
+///
+/// `slots` は昇順経路と同じ候補（アリーナの行番号。スカラー索引の候補マスクがあればその行番号）。
+/// スコアは昇順経路（`CpuScalarProvider`）と同じ内積で計算し、範囲外の行と非有限スコアの行を
+/// 除く規約も同じ。選出は [`crate::kernel::select_farthest_k`]（スコアの低い順・同点は行番号昇順）。
+/// 返す `score` は昇順経路と同じ値で、並びだけが逆になる。走査量はアリーナの既存上限
+/// （`MAX_ARENA_ROWS`／総バイト数）で閉じており、新しい打ち切りは持たない。長い走査は期限を確認する。
+fn exact_farthest_scan(
+    arena: &crate::arena::VectorArena,
+    slots: &[u64],
+    query: &[f32],
+    k: usize,
+) -> Result<Vec<crate::kernel::CandidateHit>, SqlSurfaceError> {
+    let dim = arena.dim() as usize;
+    if query.len() != dim {
+        return Err(map_kernel_error(KernelError::DimMismatch {
+            expected: arena.dim(),
+            found: query.len(),
+        }));
+    }
+    if query.iter().any(|v| !v.is_finite()) {
+        return Err(map_kernel_error(KernelError::NonFiniteQuery));
+    }
+    if k == 0 || slots.is_empty() {
+        return Ok(Vec::new());
+    }
+    let vectors = arena.vectors();
+    let deadline = crate::interrupt::current_deadline();
+    deadline.check()?;
+    // 期限超過は選出器へ流す反復子の中で検知し、走査を止めてから呼び出し元へ返す（途中までの
+    // 結果は返さない）。
+    let mut failure: Option<SqlSurfaceError> = None;
+    let mut visited: usize = 0;
+    let candidates = slots
+        .iter()
+        .map_while(|&slot| {
+            visited = visited.saturating_add(1);
+            if visited.is_multiple_of(DESC_SCAN_DEADLINE_STRIDE) {
+                if let Err(e) = deadline.check() {
+                    failure = Some(e);
+                    return None;
+                }
+            }
+            Some(slot)
+        })
+        .filter_map(|slot| {
+            let start = usize::try_from(slot).ok()?.checked_mul(dim)?;
+            let end = start.checked_add(dim)?;
+            let vector = vectors.get(start..end)?;
+            let score = crate::kernel::dot(vector, query);
+            score
+                .is_finite()
+                .then_some(crate::kernel::CandidateHit { id: slot, score })
+        });
+    let out = crate::kernel::select_farthest_k(candidates, k);
+    if let Some(e) = failure {
+        return Err(e);
+    }
+    deadline.check()?;
+    Ok(out)
+}
+
 fn map_kernel_error(_e: KernelError) -> SqlSurfaceError {
     // クエリの次元・有限性は `sql::parser::bind`（ベクトルリテラル解析）が既に
     // 検証済みのため、ここへ到達するのは provider 側の契約違反・実装バグのみ
@@ -919,24 +985,30 @@ pub(crate) fn execute_statement_with_cache(
         },
         None => false,
     };
-    let ann_plan = crate::sql::hnsw_cache::classify_ann_plan(
-        crate::sql::hnsw_cache::ann_shape_with_row_policy(
-            crate::sql::hnsw_cache::AnnShapeInput {
-                hnsw_enabled,
-                // Issue #411 追記（codex-review P1 指摘・PR #437）:
-                // `sql::exec` の 4 boolean は `AnnPlan::UnknownCustomProvider` と
-                // `AnnPlan::PlainScanEngine` のどちらであっても等しく `false`
-                // （いずれも `HnswFullVisible`／`HnswSubset` ではない）ため、この
-                // 判別は `EXPLAIN`（`core.rs`）専用の表示情報。ここでは常に
-                // `false`（「エンジン種別は既知」）を渡す。
-                engine_kind_unknown: false,
-                is_hybrid,
-                is_precision,
-                filters_empty,
-                scalar_prefilter: plan.scalar_prefilter,
-            },
-            policy_present,
+    // Issue #2009・SQL-33 (2)・SQL-75 (4): 距離順 `DESC` は分類結果を `PlainScanDescending` へ
+    // 上書きする（`EXPLAIN` も同じ `ann_plan_for_direction` を通す）。これで HNSW の 2 つの
+    // 適用判定が偽になり、索引キャッシュの照会・準備は一切走らない。
+    let ann_plan = crate::sql::hnsw_cache::ann_plan_for_direction(
+        crate::sql::hnsw_cache::classify_ann_plan(
+            crate::sql::hnsw_cache::ann_shape_with_row_policy(
+                crate::sql::hnsw_cache::AnnShapeInput {
+                    hnsw_enabled,
+                    // Issue #411 追記（codex-review P1 指摘・PR #437）:
+                    // `sql::exec` の 4 boolean は `AnnPlan::UnknownCustomProvider` と
+                    // `AnnPlan::PlainScanEngine` のどちらであっても等しく `false`
+                    // （いずれも `HnswFullVisible`／`HnswSubset` ではない）ため、この
+                    // 判別は `EXPLAIN`（`core.rs`）専用の表示情報。ここでは常に
+                    // `false`（「エンジン種別は既知」）を渡す。
+                    engine_kind_unknown: false,
+                    is_hybrid,
+                    is_precision,
+                    filters_empty,
+                    scalar_prefilter: plan.scalar_prefilter,
+                },
+                policy_present,
+            ),
         ),
+        bound.distance_descending,
     );
     let hnsw_full_visible_eligible =
         !is_hybrid && ann_plan == crate::sql::hnsw_cache::AnnPlan::HnswFullVisible;
@@ -2177,6 +2249,19 @@ pub(crate) fn execute_statement_with_cache(
         Vec::new()
     } else {
         match &bound.ranking {
+            // Issue #2009・SQL-33 (2): 距離順 `DESC`（遠い順）。ANN も provider も通さず、昇順経路と
+            // 同じ候補（`slot_ids`）・同じスコア関数で可視行を全走査して返す。precision との併用は
+            // 束縛が `0A000` で拒否済みのため `completeness_unbounded` は到達しない。
+            Ranking::Distance { query } if bound.distance_descending => {
+                let raw = exact_farthest_scan(arena, &slot_ids, query, k_eff)?;
+                if raw.len() > k_eff || raw.iter().any(|h| !visible_id_counts.contains_key(&h.id)) {
+                    return Err(SqlSurfaceError::Internal {
+                        detail: "descending scan returned a result violating its contract"
+                            .to_string(),
+                    });
+                }
+                raw.into_iter().map(|h| (h.id, h.score as f64)).collect()
+            }
             Ranking::Distance { query } => {
                 // Issue #408・#409: `hnsw_cache`（`None` の場合は `execute_statement`
                 // 経由。従来どおり全件 brute-force のみ）が `Some` の場合、適用条件

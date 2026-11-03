@@ -3123,6 +3123,10 @@ pub struct ValidatedStatement {
     /// プランニング、TASK-110・PLAN-1）・ハイブリッド実行形への束縛は
     /// `sql::using_plan` の管轄で、本モジュールは構文構造の受理までを担う。
     pub(crate) using_plan: Option<String>,
+    /// 距離順 `ORDER BY` に付いた `DESC`（遠い順。Issue #2009・SQL-33 (2)）。既定は `false`
+    /// （昇順）。`true` の文は ANN 索引を使わず可視行を全走査して返す（実行は `sql::exec`）。
+    /// `order_by` が [`OrderByForm::Distance`] でないのに `true` の組は束縛が `42601` で拒否する。
+    pub(crate) distance_descending: bool,
 }
 
 impl ValidatedStatement {
@@ -3148,7 +3152,21 @@ impl ValidatedStatement {
             search_mode: None,
             evaluation_order,
             using_plan: None,
+            distance_descending: false,
         }
+    }
+
+    /// 距離順 `ORDER BY` の方向（`true` で `DESC`＝遠い順。Issue #2009・SQL-33 (2)）を設定した
+    /// コピーを返すビルダー的メソッド。[`Self::new`] と組み合わせて外部から構築する。
+    #[must_use]
+    pub fn with_distance_descending(mut self, descending: bool) -> Self {
+        self.distance_descending = descending;
+        self
+    }
+
+    /// 距離順 `ORDER BY` に `DESC` が付いているか（Issue #2009・SQL-33 (2)）。
+    pub fn distance_descending(&self) -> bool {
+        self.distance_descending
     }
 
     /// `search_mode`（TASK-161・SQL-12）を設定したコピーを返すビルダー的メソッド。
@@ -21040,6 +21058,8 @@ struct ParsedShape {
     /// `USING PLAN('<query>')`（TASK-77・SQL-5）。`Some` のとき `order_by` は必ず
     /// [`OrderByForm::UsingPlan`]。
     using_plan: Option<String>,
+    /// 距離順 `ORDER BY` 直後の `DESC`（Issue #2009・SQL-33 (2)）。`Distance` 形以外では常に `false`。
+    distance_descending: bool,
 }
 
 /// 構文木（[`ValidatedScan`] の元）。カタログ存在確認前の中間結果（Issue #454。
@@ -23202,6 +23222,7 @@ fn parse_select_shape(
             search_mode,
             evaluation_order: EvaluationOrder::DEFAULT,
             using_plan: Some(using_plan),
+            distance_descending: false,
         }));
     }
 
@@ -23353,6 +23374,18 @@ fn parse_select_shape(
         ));
     }
     let order_by = p.parse_order_by()?;
+    // Issue #2009・SQL-33 (2): 距離順 `ORDER BY` に限り方向語 `ASC`／`DESC` を 1 つ受理する
+    // （文脈語のため大文字小文字非区別）。`NULLS` 句・重複・hybrid 関数形への付与は
+    // ここで読まず、後続の `expect_keyword(Limit)` が従来どおり `42601` に落とす。
+    let mut distance_descending = false;
+    if matches!(order_by, OrderByForm::Distance { .. }) {
+        if p.peek_ident_matches("DESC") {
+            p.advance();
+            distance_descending = true;
+        } else if p.peek_ident_matches("ASC") {
+            p.advance();
+        }
+    }
 
     p.expect_keyword(Keyword::Limit)?;
     let limit_str = p.expect_number()?;
@@ -23374,6 +23407,7 @@ fn parse_select_shape(
         search_mode,
         evaluation_order,
         using_plan: None,
+        distance_descending,
     }))
 }
 
@@ -27764,6 +27798,7 @@ fn validate_select_statement(
                 search_mode: shape.search_mode,
                 evaluation_order: shape.evaluation_order,
                 using_plan: shape.using_plan,
+                distance_descending: shape.distance_descending,
             }))
         }
         // Issue #454: `ORDER BY`・`USING PLAN` のいずれも伴わない
@@ -41931,6 +41966,92 @@ mod tests {
         assert_eq!(f.exclusion, WindowFrameExclusion::CurrentRow);
         let f = frame_of("ORDER BY score ROWS UNBOUNDED PRECEDING EXCLUDE GROUP");
         assert_eq!(f.exclusion, WindowFrameExclusion::Group);
+    }
+
+    // --- 距離順 ORDER BY の方向語 ASC／DESC（Issue #2009・SQL-33 (2)） ---------
+
+    #[test]
+    fn distance_order_by_accepts_desc_and_asc_case_insensitively() {
+        let lookup = catalog_with(&["documents"]);
+        for (dir, expected) in [
+            ("", false),
+            (" ASC", false),
+            (" asc", false),
+            (" DESC", true),
+            (" desc", true),
+            (" DeSc", true),
+        ] {
+            let sql =
+                format!("SELECT * FROM documents ORDER BY embedding <=> '[0.1]'{dir} LIMIT 5");
+            let stmt = validate_statement(&sql, &lookup)
+                .unwrap_or_else(|e| panic!("{sql} must be accepted, got {e:?}"));
+            assert_eq!(stmt.distance_descending(), expected, "{sql}");
+        }
+    }
+
+    #[test]
+    fn distance_desc_combines_with_where_mode_and_hint() {
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_statement(
+            "SELECT * FROM documents WHERE id = 1 ORDER BY embedding <=> '[0.1]' DESC LIMIT 5 HINT ORDER(DISTANCE, RLS, SCALAR) USING MODE 'recall'",
+            &lookup,
+        )
+        .expect("DESC with WHERE/HINT/MODE");
+        assert!(stmt.distance_descending());
+        assert_eq!(stmt.search_mode(), Some("recall"));
+    }
+
+    #[test]
+    fn distance_desc_rejects_nulls_duplicates_missing_limit_and_offset() {
+        let lookup = catalog_with(&["documents"]);
+        for sql in [
+            "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' DESC NULLS FIRST LIMIT 5",
+            "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' DESC DESC LIMIT 5",
+            "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' ASC DESC LIMIT 5",
+            "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' DESC",
+            "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' DESC LIMIT 5 OFFSET 1",
+        ] {
+            let e = validate_statement(sql, &lookup).expect_err(sql);
+            assert_eq!(e.wire_code(), "42601", "{sql}");
+        }
+    }
+
+    #[test]
+    fn distance_desc_on_unsupported_operator_keeps_asc_error_code() {
+        let lookup = catalog_with(&["documents"]);
+        for op in ["<->", "<#>", "<+>"] {
+            let asc = validate_statement(
+                &format!("SELECT * FROM documents ORDER BY embedding {op} '[0.1]' LIMIT 5"),
+                &lookup,
+            );
+            let desc = validate_statement(
+                &format!("SELECT * FROM documents ORDER BY embedding {op} '[0.1]' DESC LIMIT 5"),
+                &lookup,
+            );
+            // 受理状況は演算子ごとに変わりうる（#1977）。DESC を付けても ASC と結果の種別が一致する。
+            assert_eq!(
+                asc.as_ref().err().map(|e| e.wire_code()),
+                desc.as_ref().err().map(|e| e.wire_code()),
+                "{op}"
+            );
+        }
+    }
+
+    #[test]
+    fn distance_descending_builder_defaults_false_and_roundtrips() {
+        let stmt = ValidatedStatement::new(
+            "documents".to_string(),
+            Projection::All,
+            OrderByForm::Distance {
+                column: "embedding".to_string(),
+                literal: "[0.1]".to_string(),
+            },
+            Vec::new(),
+            5,
+            EvaluationOrder::DEFAULT,
+        );
+        assert!(!stmt.distance_descending());
+        assert!(stmt.with_distance_descending(true).distance_descending());
     }
 }
 

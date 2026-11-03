@@ -12582,6 +12582,7 @@ impl EngineCore {
                     limit: validated_limit,
                     mode: planned.resolved_mode,
                     evaluation_order: crate::sql::plan::EvaluationOrder::DEFAULT,
+                    distance_descending: false,
                 })
             },
         )
@@ -13007,6 +13008,7 @@ impl EngineCore {
             &expression_index_names,
             &partial_index_names,
             row_policy_present,
+            false,
         );
         drop(post_check_txn);
         Ok(crate::sql::explain::build_explain_result_with_indexes(
@@ -13094,6 +13096,7 @@ impl EngineCore {
         expression_index_names: &[String],
         partial_index_names: &[String],
         row_policy_present: bool,
+        distance_descending: bool,
     ) -> (
         crate::sql::explain::ExplainEngine,
         crate::sql::explain::ExplainIndexNames,
@@ -13127,18 +13130,23 @@ impl EngineCore {
         } else {
             false
         };
-        let ann_plan = crate::sql::hnsw_cache::classify_ann_plan(
-            crate::sql::hnsw_cache::ann_shape_with_row_policy(
-                crate::sql::hnsw_cache::AnnShapeInput {
-                    hnsw_enabled,
-                    engine_kind_unknown: self.search_engine_kind().is_none(),
-                    is_hybrid,
-                    is_precision,
-                    filters_empty,
-                    scalar_prefilter,
-                },
-                row_policy_present,
+        // Issue #2009・SQL-75 (4): 距離順 `DESC` は分類結果を上書きして `PlainScanDescending`
+        // （実行側 `sql::exec` と同じ `ann_plan_for_direction` を通す）。
+        let ann_plan = crate::sql::hnsw_cache::ann_plan_for_direction(
+            crate::sql::hnsw_cache::classify_ann_plan(
+                crate::sql::hnsw_cache::ann_shape_with_row_policy(
+                    crate::sql::hnsw_cache::AnnShapeInput {
+                        hnsw_enabled,
+                        engine_kind_unknown: self.search_engine_kind().is_none(),
+                        is_hybrid,
+                        is_precision,
+                        filters_empty,
+                        scalar_prefilter,
+                    },
+                    row_policy_present,
+                ),
             ),
+            distance_descending,
         );
 
         // codex-review P1 指摘対応（Issue #1066 PR #1155）: `HnswScope::All` は
@@ -13416,6 +13424,7 @@ impl EngineCore {
             &expression_index_names,
             &partial_index_names,
             row_policy_present,
+            bound.distance_descending(),
         );
         Ok(crate::sql::explain::build_search_explain_result(
             bound.mode(),
