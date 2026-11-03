@@ -664,6 +664,10 @@ impl<'a> WriteTarget<'a> {
                 let (value, effect) = f(&write_txn)?;
                 match effect {
                     TxnEffect::Wrote => {
+                        // 共有の確定境界での即時期限確認（Issue #1953。SQL-71）。行ループの
+                        // 間引き確認や先行の確認の後に期限が切れても、commit 前なら `57014` で
+                        // 止め（`write_txn` は drop で abort し副作用ゼロ）、成功を返さない。
+                        check_interrupt_now().map_err(Er::from)?;
                         let (value, _) = crate::recovery::commit_boundary::commit_and_finish(
                             write_txn,
                             value,
@@ -685,7 +689,13 @@ impl<'a> WriteTarget<'a> {
             WriteTarget::InTxn(write_txn) => {
                 // 照合は書き込み前に失敗するため、共有 `write_txn` は汚れない（再試行しても安全）。
                 verify_view_write_scope(write_txn).map_err(Er::from)?;
-                f(write_txn).map(|(value, _)| value)
+                let (value, effect) = f(write_txn)?;
+                // 文の成功返却前の即時期限確認（Autocommit 側と同じ契約。失敗時は呼び出し元が
+                // 明示 Tx を Failed に遷移させる）。
+                if matches!(effect, TxnEffect::Wrote) {
+                    check_interrupt_now().map_err(Er::from)?;
+                }
+                Ok(value)
             }
         }
     }
