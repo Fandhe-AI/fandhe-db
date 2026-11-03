@@ -1797,7 +1797,7 @@ pub(crate) fn for_replace_by_text_key(
 /// フィールド長超過（`push_bytes`／件数プレフィクスの `u32` 上限超過）を
 /// `wire_code` `54000` へ写像する（[`for_update_where`]／[`for_delete_where`]
 /// 系の共通ヘルパー。実際には上流の既存上限〔`MAX_METADATA_FILTERS`・
-/// `MAX_EXPR_NODES`・`MAX_UDF_PARAMS`・`MAX_SESSION_UDFS`〕により事実上到達
+/// `MAX_EXPR_NODES`・`MAX_UDF_PARAMS`・`MAX_REGISTRY_UDFS`〕により事実上到達
 /// しないが、`push_bytes` 自体の fail-closed 契約を崩さないよう明示的に
 /// 写像する）。
 fn dml_hash_field_too_large() -> crate::sql::allowlist::SqlSurfaceError {

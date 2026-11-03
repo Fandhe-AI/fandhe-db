@@ -561,7 +561,7 @@ fn redefining_the_same_wasm_udf_name_is_rejected() {
 fn wasm_udf_session_limit_is_enforced() {
     let mut session = SessionState::default();
     let call_count = Arc::new(AtomicUsize::new(0));
-    // `engine::sql::udf_call::MAX_SESSION_UDFS`（宣言的・WASM 合算の上限）まで
+    // `engine::sql::udf_call::MAX_SESSION_UDFS`（セッション限定の宣言的・WASM 合算の上限。カタログ由来は別バケット）まで
     // ちょうど登録できて、上限+1 本目は `54000`（payload_too_large）へ切り替わる
     // 境界を直接固定する。
     for i in 0..engine::sql::udf_call::MAX_SESSION_UDFS {
