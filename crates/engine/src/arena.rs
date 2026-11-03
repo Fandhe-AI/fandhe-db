@@ -118,6 +118,12 @@ pub enum ArenaError {
     /// `sql::exec::map_arena_error` が `SqlSurfaceError::NumericOutOfRange`（`22003`）へ
     /// 写像する。メッセージは固定文言。
     NumericOutOfRange(String),
+    /// 構築中の協調キャンセルポイント（[`crate::interrupt`]）が文の中断（`57014`。文の期限超過
+    /// 〔Issue #1953〕・クライアント切断〔Issue #1798〕）を検出した。`sql::exec::map_arena_error` が
+    /// `SqlSurfaceError::QueryCanceled` へ戻す。理由ごとの固定文言のみで、件数・テナント情報を
+    /// 含めない。**BREAKING CHANGE**（Issue #1953）: variant を追加した（網羅的 `match` の下流は
+    /// 追随が必要）。
+    Interrupted(crate::interrupt::InterruptReason),
 }
 
 impl std::fmt::Display for ArenaError {
@@ -143,6 +149,7 @@ impl std::fmt::Display for ArenaError {
             | ArenaError::NumericOutOfRange(msg) => {
                 write!(f, "arena build rejected by hook: {msg}")
             }
+            ArenaError::Interrupted(_) => write!(f, "arena build interrupted"),
         }
     }
 }
@@ -160,7 +167,8 @@ impl std::error::Error for ArenaError {
             | ArenaError::DivisionByZero(_)
             | ArenaError::SubstringError(_)
             | ArenaError::InvalidArgumentForLogarithm(_)
-            | ArenaError::NumericOutOfRange(_) => None,
+            | ArenaError::NumericOutOfRange(_)
+            | ArenaError::Interrupted(_) => None,
         }
     }
 }
@@ -953,6 +961,7 @@ impl VectorArena {
         let out_of_bounds =
             || ArenaError::InvalidInput("cached RLS snapshot row index out of bounds".to_string());
         for (i, meta) in metadata.iter().enumerate() {
+            crate::interrupt::check_reason().map_err(ArenaError::Interrupted)?;
             let id = *source_arena.ids().get(i).ok_or_else(out_of_bounds)?;
             let tenant_id = source_arena.tenant_id(i).ok_or_else(out_of_bounds)?;
             let visibility = source_arena.visibility(i).ok_or_else(out_of_bounds)?;
@@ -1027,6 +1036,7 @@ impl VectorArena {
             || ArenaError::InvalidInput("cached RLS snapshot row index out of bounds".to_string());
         let mut prev_slot: Option<u32> = None;
         for &slot in source_slots {
+            crate::interrupt::check_reason().map_err(ArenaError::Interrupted)?;
             if let Some(prev) = prev_slot {
                 if slot <= prev {
                     return Err(ArenaError::InvalidInput(
@@ -1114,6 +1124,7 @@ impl VectorArena {
         let mut visible_row_count: usize = 0;
         let mut prev_slot: Option<u32> = None;
         for &slot in source_slots {
+            crate::interrupt::check_reason().map_err(ArenaError::Interrupted)?;
             if let Some(prev) = prev_slot {
                 if slot <= prev {
                     return Err(ArenaError::InvalidInput(
@@ -1263,6 +1274,10 @@ impl VectorArena {
 
         for entry in table.iter().map_err(StorageError::from)? {
             let (k, v) = entry.map_err(StorageError::from)?;
+            // 協調キャンセルポイント（Issue #1953）。RLS・可視性で落ちる行（他テナント行を含む）も走査
+            // コストを払うため、`predicate` より前の反復先頭に置く。確認は stride の加算だけで、行の
+            // 内容・件数に依存した応答を作らない。
+            crate::interrupt::check_reason().map_err(ArenaError::Interrupted)?;
             // 複合キーの第 2 要素が行 `id`（第 1 要素 `key_tenant` は物理キー側の
             // テナント。可視性判定自体は従来どおり行データ側のヘッダ由来の値で
             // 行うが、可視と判定した行は下で `key_tenant` とヘッダ側 `tenant_id` の
@@ -2737,6 +2752,49 @@ mod tests {
         for idx in 0..arena.len() {
             assert_eq!(arena.tenant_id(idx), Some("tenant-a"));
         }
+    }
+
+    // Issue #1953（SQL-71 のポインタ）: 期限切れの文では arena 構築の走査ループが `Interrupted` で
+    // 打ち切る。他テナントの行（`predicate` が落とす行）でも確認点が評価され、部分的な arena は
+    // 返らない。期限が無ければ（ガードが外れた後を含め）通常どおり構築できる。
+    #[test]
+    fn build_filtered_stops_with_interrupted_when_the_deadline_has_passed() {
+        let path = unique_db_path("arena-deadline-interrupted");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&schema_for("docs", 2))
+            .expect("create_table");
+        // 可視行は 0 件（全て他テナント）でも、走査は確認点を通る。
+        for i in 0..3u64 {
+            storage
+                .insert_row_into_table(
+                    "docs",
+                    i,
+                    &RowInput {
+                        tenant_id: "tenant-b",
+                        visibility: Visibility::Public,
+                        embedding: &[9.0, 9.0],
+                        metadata: b"m",
+                    },
+                )
+                .expect("seed tenant-b row");
+        }
+        {
+            let _scope = crate::interrupt::DeadlineScope::install(
+                crate::interrupt::StatementDeadline::at(std::time::Instant::now()),
+            );
+            let err = VectorArena::build_filtered(&storage, "docs", |t, _| t == "tenant-a")
+                .expect_err("deadline passed");
+            assert!(matches!(
+                err,
+                ArenaError::Interrupted(crate::interrupt::InterruptReason::StatementTimeout)
+            ));
+            assert_eq!(err.to_string(), "arena build interrupted");
+        }
+        let arena = VectorArena::build_filtered(&storage, "docs", |t, _| t == "tenant-a")
+            .expect("no deadline");
+        assert_eq!(arena.len(), 0);
     }
 
     // 対象ビヘイビア: TASK-100・RECOVER-9。`crates/engine/tests/index_failure_injection.rs`

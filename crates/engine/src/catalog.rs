@@ -16734,7 +16734,7 @@ pub(crate) fn table_lookup_error(e: CatalogError) -> SqlSurfaceError {
         // 読み取り専用の存在確認（`table_exists`）は書き込みトランザクションを
         // 取得しないため通常は到達しないが、`CatalogError` の網羅性のためここでも
         // 扱う（SQL-31・TASK-221）。
-        CatalogError::WriteLockTimeout => SqlSurfaceError::LockNotAvailable,
+        CatalogError::WriteLockTimeout => crate::interrupt::lock_wait_error(),
         CatalogError::CommitFootprintUnrecordable => SqlSurfaceError::Internal {
             detail: "catalog lookup failed".to_string(),
         },

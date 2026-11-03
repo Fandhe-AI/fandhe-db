@@ -2445,7 +2445,8 @@ fn commit_active(
 /// 内部事象として `XX000` に丸める（他テナントの情報を含まない）。
 fn map_write_lock_err(e: crate::storage::StorageError) -> SqlSurfaceError {
     if is_write_lock_unavailable(&e) {
-        return SqlSurfaceError::LockNotAvailable;
+        // 待機中に文の期限が来ていたら `55P03` ではなく `57014`（#1953）。
+        return crate::interrupt::lock_wait_error();
     }
     SqlSurfaceError::Internal {
         detail: "internal error".to_string(),
