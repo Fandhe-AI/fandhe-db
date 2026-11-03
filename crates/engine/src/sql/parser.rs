@@ -163,6 +163,36 @@ pub struct BoundStatement {
     /// 検証済みの [`EvaluationOrder`] をそのまま素通しする（意味論的な束縛の必要は
     /// ない。実行意味論の解釈は [`crate::sql::plan::ExecutionPlan`] の管轄）。
     pub(crate) evaluation_order: EvaluationOrder,
+    /// 距離順 `ORDER BY` が `DESC`（遠い順）か（Issue #2009・SQL-33 (2)）。`true` の文は
+    /// `sql::exec` が ANN を使わない厳密全走査で返す。`ranking` が [`Ranking::Distance`] の
+    /// ときだけ `true` になりうる（[`check_distance_direction`] が束縛時に保証する）。
+    /// NoSQL 表層・`USING PLAN` 経路など直接組み立てる箇所は常に `false`（昇順）。
+    pub(crate) distance_descending: bool,
+}
+
+/// 距離方向（`DESC`）と順位付け形・実効モードの整合を検査する（Issue #2009・SQL-33 (2)）。
+/// `Distance` 以外の `ORDER BY` に方向が付く組は公開ビルダーの誤用でしか作れないため
+/// `42601` で拒否する。`precision` モードの確信度ゲートは最近傍側のマージンを前提とし、
+/// 遠い順では意味が定まらないため `DESC` との併用は `0A000` で拒否する（fail-closed）。
+fn check_distance_direction(
+    descending: bool,
+    order_by: &OrderByForm,
+    mode: Option<SearchMode>,
+) -> Result<(), SqlSurfaceError> {
+    if !descending {
+        return Ok(());
+    }
+    if !matches!(order_by, OrderByForm::Distance { .. }) {
+        return Err(SqlSurfaceError::unsupported(
+            "DESC is only supported on distance ORDER BY",
+        ));
+    }
+    if mode == Some(SearchMode::Precision) {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "DESC on distance ORDER BY cannot be combined with precision mode",
+        ));
+    }
+    Ok(())
 }
 
 impl BoundStatement {
@@ -195,7 +225,21 @@ impl BoundStatement {
             offset: 0,
             mode: crate::sql::mode::resolve_mode(None, None),
             evaluation_order,
+            distance_descending: false,
         }
+    }
+
+    /// 距離順 `ORDER BY` の方向（`true` で `DESC`）を設定した crate 内ビルダー（Issue #2009）。
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_distance_descending(mut self, descending: bool) -> Self {
+        self.distance_descending = descending;
+        self
+    }
+
+    /// 距離順 `ORDER BY` が `DESC`（遠い順）か（Issue #2009・SQL-33 (2)）。
+    pub fn distance_descending(&self) -> bool {
+        self.distance_descending
     }
 
     /// `OFFSET`（Issue #2008・SQL-33 (8)）を設定したコピーを返すビルダー的メソッド。
@@ -3019,6 +3063,11 @@ pub(crate) fn bind_in_session_with_limits(
         bind_where_predicates(&stmt.where_predicates, schema, udfs, &mut node_budget, &[])?;
 
     let ranking = bind_ranking(&stmt.order_by, schema, true)?;
+    check_distance_direction(
+        stmt.distance_descending,
+        &stmt.order_by,
+        Some(resolved_mode.mode()),
+    )?;
 
     let (limit, offset) =
         validate_search_limit_offset_with(stmt.limit, stmt.offset, result_limits)?;
@@ -3044,6 +3093,7 @@ pub(crate) fn bind_in_session_with_limits(
         offset,
         mode: resolved_mode,
         evaluation_order: stmt.evaluation_order,
+        distance_descending: stmt.distance_descending,
     })
 }
 
@@ -3076,13 +3126,18 @@ pub(crate) fn bind_projection_for_describe(
     stmt: &ValidatedStatement,
     schema: &TableSchema,
     udfs: &crate::sql::udf_call::UdfRegistry,
+    session_mode: Option<SearchMode>,
     validate_vector_literal: bool,
     dummy_equality_flags: &[bool],
     result_limits: &crate::result_limits::ResultLimits,
 ) -> Result<Vec<ProjectedColumn>, SqlSurfaceError> {
-    if let Some(literal) = &stmt.search_mode {
-        SearchMode::parse_literal(literal)?;
-    }
+    let query_mode = match &stmt.search_mode {
+        Some(literal) => Some(SearchMode::parse_literal(literal)?),
+        None => None,
+    };
+    // Bind と同じ実効モード（クエリ句 > セッション変数）で DESC との整合を検査し、
+    // Describe 成功・Bind 失敗の食い違いを防ぐ。
+    let resolved_mode = mode::resolve_mode(query_mode, session_mode);
 
     let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
     let projection = bind_projection(&stmt.projection, schema, udfs, &mut node_budget)?;
@@ -3097,6 +3152,11 @@ pub(crate) fn bind_projection_for_describe(
         )?;
 
     let _ranking = bind_ranking(&stmt.order_by, schema, validate_vector_literal)?;
+    check_distance_direction(
+        stmt.distance_descending,
+        &stmt.order_by,
+        Some(resolved_mode.mode()),
+    )?;
     let _limits = validate_search_limit_offset_with(stmt.limit, stmt.offset, result_limits)?;
 
     Ok(projection)
@@ -15099,6 +15159,77 @@ mod tests {
         ))];
         let agg = Expr::Ident(crate::sql::allowlist::aggregate_placeholder(0));
         assert_eq!(substitute_group_key_exprs(&agg, &keys), agg);
+    }
+
+    // --- 距離方向 DESC の束縛（Issue #2009・SQL-33 (2)） -------------------------
+
+    #[test]
+    fn bind_carries_distance_descending_into_bound_statement() {
+        let asc =
+            bind_sql("SELECT * FROM documents ORDER BY embedding <=> '[0.1,0.2,0.3]' LIMIT 5")
+                .expect("asc");
+        assert!(!asc.distance_descending());
+        let desc =
+            bind_sql("SELECT * FROM documents ORDER BY embedding <=> '[0.1,0.2,0.3]' DESC LIMIT 5")
+                .expect("desc");
+        assert!(desc.distance_descending());
+        assert!(!desc.with_distance_descending(false).distance_descending());
+    }
+
+    #[test]
+    fn bind_rejects_desc_with_precision_mode_as_feature_not_supported() {
+        let lookup = FakeCatalog {
+            tables: ["documents"].into_iter().collect(),
+        };
+        let stmt = validate_statement(
+            "SELECT * FROM documents ORDER BY embedding <=> '[0.1,0.2,0.3]' DESC LIMIT 5 USING MODE 'precision'",
+            &lookup,
+        )
+        .expect("allowlist");
+        let err = bind(&stmt, &docs_schema()).expect_err("precision + DESC");
+        assert_eq!(err.wire_code(), "0A000");
+        // セッション変数由来の precision でも同じ。
+        let stmt = validate_statement(
+            "SELECT * FROM documents ORDER BY embedding <=> '[0.1,0.2,0.3]' DESC LIMIT 5",
+            &lookup,
+        )
+        .expect("allowlist");
+        let err = bind_with_session(&stmt, &docs_schema(), Some(SearchMode::Precision))
+            .expect_err("session precision + DESC");
+        assert_eq!(err.wire_code(), "0A000");
+    }
+
+    #[test]
+    fn describe_rejects_desc_with_precision_mode_like_bind() {
+        let lookup = FakeCatalog {
+            tables: ["documents"].into_iter().collect(),
+        };
+        let udfs = crate::sql::udf_call::UdfRegistry::default();
+        let limits = crate::result_limits::ResultLimits::default();
+        let describe = |sql: &str, session: Option<SearchMode>| {
+            let stmt = validate_statement(sql, &lookup).expect("allowlist");
+            bind_projection_for_describe(&stmt, &docs_schema(), &udfs, session, true, &[], &limits)
+        };
+        let desc = "SELECT * FROM documents ORDER BY embedding <=> '[0.1,0.2,0.3]' DESC LIMIT 5";
+        let err = describe(&format!("{desc} USING MODE 'precision'"), None)
+            .expect_err("query precision + DESC");
+        assert_eq!(err.wire_code(), "0A000");
+        let err =
+            describe(desc, Some(SearchMode::Precision)).expect_err("session precision + DESC");
+        assert_eq!(err.wire_code(), "0A000");
+        assert!(describe(desc, None).is_ok());
+    }
+
+    #[test]
+    fn check_distance_direction_rejects_descending_on_non_distance_order_by() {
+        let order_by = OrderByForm::FunctionCall {
+            name: "HYBRID".to_string(),
+            args: Vec::new(),
+        };
+        let err = check_distance_direction(true, &order_by, Some(SearchMode::Recall))
+            .expect_err("non-distance");
+        assert_eq!(err.wire_code(), "42601");
+        assert!(check_distance_direction(false, &order_by, None).is_ok());
     }
 }
 

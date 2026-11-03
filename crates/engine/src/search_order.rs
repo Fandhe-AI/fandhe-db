@@ -41,6 +41,26 @@ pub(crate) fn cmp_score_desc_then_tie(
     b_score.total_cmp(&a_score).then(a_tie.cmp(&b_tie))
 }
 
+/// 「遠い順（`DESC`）→ 同点は順序キー昇順」の全順序（Issue #2009・SQL-33 (2)）。
+///
+/// スコアは [`cmp_score_desc_then_tie`] と同じ向き（大きいほど近い）で受け取り、スコア昇順
+/// （＝近さの低い順）に並べる。NaN は全数値より遠いものとして先頭に置き、NaN 同士は順序キー
+/// 昇順にする。スコア部は昇順経路の `total_cmp` を反転しただけなので、`±0.0` を含め `DESC` は
+/// 昇順のスコア順を厳密に逆にした並びになる（同点の順序キーだけは昇順のまま）。
+pub(crate) fn cmp_far_first_then_tie(
+    a_score: f32,
+    a_tie: TieKey,
+    b_score: f32,
+    b_tie: TieKey,
+) -> Ordering {
+    match (a_score.is_nan(), b_score.is_nan()) {
+        (true, true) => a_tie.cmp(&b_tie),
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+        (false, false) => a_score.total_cmp(&b_score).then(a_tie.cmp(&b_tie)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -63,5 +83,37 @@ mod tests {
         assert_eq!(cmp_score_desc_then_tie(0.9, k2, 0.5, k1), Ordering::Less);
         assert_eq!(cmp_score_desc_then_tie(0.5, k1, 0.5, k2), Ordering::Less);
         assert_eq!(cmp_score_desc_then_tie(0.5, k2, 0.5, k1), Ordering::Greater);
+    }
+
+    #[test]
+    fn far_first_is_reverse_of_score_order_with_tie_ascending() {
+        let k1 = tie_key_for_response_id(1);
+        let k2 = tie_key_for_response_id(2);
+        // 低スコア（遠い）が先
+        assert_eq!(cmp_far_first_then_tie(0.1, k2, 0.9, k1), Ordering::Less);
+        // 同点は順序キー昇順
+        assert_eq!(cmp_far_first_then_tie(0.5, k1, 0.5, k2), Ordering::Less);
+        assert_eq!(cmp_far_first_then_tie(0.5, k2, 0.5, k1), Ordering::Greater);
+        // -0.0 は +0.0 より遠い（昇順では +0.0 が先なので厳密に逆）
+        assert_eq!(cmp_far_first_then_tie(-0.0, k2, 0.0, k1), Ordering::Less);
+        assert_eq!(cmp_score_desc_then_tie(0.0, k2, -0.0, k1), Ordering::Less);
+    }
+
+    #[test]
+    fn far_first_puts_nan_first() {
+        let k1 = tie_key_for_response_id(1);
+        let k2 = tie_key_for_response_id(2);
+        assert_eq!(
+            cmp_far_first_then_tie(f32::NAN, k2, -1e30, k1),
+            Ordering::Less
+        );
+        assert_eq!(
+            cmp_far_first_then_tie(1e30, k1, f32::NAN, k2),
+            Ordering::Greater
+        );
+        assert_eq!(
+            cmp_far_first_then_tie(f32::NAN, k1, f32::NAN, k2),
+            Ordering::Less
+        );
     }
 }
