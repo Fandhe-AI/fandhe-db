@@ -1480,7 +1480,7 @@ fn token_statement_hash(
 /// `Token`／`Keyword` とも網羅 match（ワイルドカード腕なし）で、lexer への variant 追加を
 /// コンパイルエラーにして黙った衝突を防ぐ。
 fn push_token(b: &mut HashInputBuilder, t: &crate::sql::lexer::Token) -> Result<(), StorageError> {
-    use crate::sql::lexer::{Keyword, Token};
+    use crate::sql::lexer::{DistanceKind, Keyword, Token};
     match t {
         Token::Keyword(k) => {
             b.push_u8(1);
@@ -1520,7 +1520,11 @@ fn push_token(b: &mut HashInputBuilder, t: &crate::sql::lexer::Token) -> Result<
         Token::ArrayOverlap => b.push_u8(21),
         Token::TypeCast => b.push_u8(22),
         Token::Concat => b.push_u8(23),
-        Token::DistanceOp => b.push_u8(24),
+        // Cosine=24 は台帳ハッシュ（RECOVER-10）の互換のため不変。新種別は未使用タグを割り当てる（Issue #1976）。
+        Token::DistanceOp(DistanceKind::Cosine) => b.push_u8(24),
+        Token::DistanceOp(DistanceKind::L2) => b.push_u8(34),
+        Token::DistanceOp(DistanceKind::NegativeInnerProduct) => b.push_u8(35),
+        Token::DistanceOp(DistanceKind::L1) => b.push_u8(36),
         Token::Le => b.push_u8(25),
         Token::Ge => b.push_u8(26),
         Token::QualifiedIdent { qualifier, name } => {
@@ -7657,6 +7661,28 @@ mod tests {
         let a_bc =
             for_insert_select(&[Token::Ident("a".into()), Token::Ident("bc".into())]).unwrap();
         assert_ne!(ab_c, a_bc);
+    }
+
+    /// Issue #1976（SQL-33 ポインタ）: 距離演算子 4 種は互いに異なる入力バイト列になる
+    /// （種別違いの文が同一ハッシュに潰れない）。
+    #[test]
+    fn distance_operator_kinds_produce_distinct_hashes() {
+        use crate::sql::lexer::{DistanceKind, Token};
+        let kinds = [
+            DistanceKind::Cosine,
+            DistanceKind::L2,
+            DistanceKind::NegativeInnerProduct,
+            DistanceKind::L1,
+        ];
+        let hashes: Vec<_> = kinds
+            .iter()
+            .map(|k| for_insert_select(&[Token::DistanceOp(*k)]).unwrap())
+            .collect();
+        for i in 0..hashes.len() {
+            for j in (i + 1)..hashes.len() {
+                assert_ne!(hashes[i], hashes[j], "{:?} vs {:?}", kinds[i], kinds[j]);
+            }
+        }
     }
 
     #[test]

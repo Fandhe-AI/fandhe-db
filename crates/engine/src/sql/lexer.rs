@@ -17,6 +17,32 @@
 //! [`quoted_identifier_end`]）は `sql::statement_splitter` と共有し、分割器と lexer の
 //! 解釈が食い違わないようにしている。
 
+/// pgvector 互換の距離演算子の種別（Issue #1976・SQL-33 ポインタ）。lexer が
+/// [`Token::DistanceOp`] に載せ、allowlist・params・content_hash が種別で分岐する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DistanceKind {
+    /// `<=>`（コサイン距離）
+    Cosine,
+    /// `<->`（L2 距離）
+    L2,
+    /// `<#>`（負の内積）
+    NegativeInnerProduct,
+    /// `<+>`（L1 距離）
+    L1,
+}
+
+impl DistanceKind {
+    /// 元の演算子文字列（`render_tokens` の再描画用。固定文字列のみ）。
+    pub const fn operator(self) -> &'static str {
+        match self {
+            DistanceKind::Cosine => "<=>",
+            DistanceKind::L2 => "<->",
+            DistanceKind::NegativeInnerProduct => "<#>",
+            DistanceKind::L1 => "<+>",
+        }
+    }
+}
+
 /// トークナイザが認識する字句の種類。
 ///
 /// キーワードは大文字小文字を区別せず ASCII 大文字へ正規化した上で、
@@ -108,8 +134,10 @@ pub enum Token {
     TypeCast,
     /// `||`（SQL-42・Issue #1520）。
     Concat,
-    /// `<=>`（密ベクトル距離演算子）
-    DistanceOp,
+    /// pgvector の距離演算子 4 種（種別付き。SQL-33・Issue #1976 のポインタ）。構文段が
+    /// 受理するのは現状 [`DistanceKind::Cosine`]（`<=>`）だけで、他の種別は従来どおり
+    /// 42601 で拒否される（受理範囲の拡張は Issue #1977）。
+    DistanceOp(DistanceKind),
     /// `<=`（TASK-79・SQL-9: 式述語の比較演算子）。
     Le,
     /// `>=`（TASK-79・SQL-9: 式述語の比較演算子）。
@@ -239,7 +267,7 @@ pub(crate) fn render_tokens(tokens: &[Token]) -> Option<String> {
                 out.push('\'');
             }
             Token::Punct(c) => out.push(*c),
-            Token::DistanceOp => out.push_str("<=>"),
+            Token::DistanceOp(kind) => out.push_str(kind.operator()),
             Token::Le => out.push_str("<="),
             Token::Ge => out.push_str(">="),
             Token::Arrow => out.push_str("->"),
@@ -613,8 +641,8 @@ fn tokenize_impl(
 
         // 多文字演算子（SQL-42・Issue #1520）。`--` コメントは上で先に消費済みのため
         // ここへ来る `-` は演算子。最長一致は `->>` → `->` → `-`。空白を挟んだ
-        // `- >` は従来どおり 2 トークン。`<->` は `<` と `->` に分かれる（構文段は
-        // 変更前後とも 42601 で拒否）。
+        // `- >` は従来どおり 2 トークン。`<->` は `<` 分岐が先に
+        // 距離演算子（L2）として最長一致で消費するため、ここへは来ない（Issue #1976）。
         if c == '-' {
             let mut lookahead = chars.clone();
             lookahead.next();
@@ -813,24 +841,41 @@ fn tokenize_impl(
         }
 
         if c == '<' {
-            // 最長一致: `<=>`（距離演算子）→ `<=`（比較演算子）→ `<`（比較演算子）の順で
-            // 判定する（TASK-79・SQL-9 で `<=`・裸の `<` を式述語の比較演算子として
-            // 追加。`<>` はどの分岐にも一致しないため 2 つの `Punct` トークンに分かれ、
-            // 許可リスト（`allowlist::Parser`）側の文法が受理しないことで構造的に
-            // 拒否される＝字句解析段階では拒否しない）。
+            // 最長一致: `<=>`（コサイン距離）→ `<=`（比較）の順、続けて 3 文字の
+            // `<->`（L2）・`<#>`（負の内積）・`<+>`（L1）を判定する（Issue #1976・SQL-33
+            // ポインタ）。3 文字目の `>` を確認できない限り先読みは確定させず、`<` だけを
+            // 出して `-`・`#`・`+` を既存分岐へ再ディスパッチする（`<-1`・`<--` コメント・
+            // `<#-`・`<+` は従来どおり）。裸の `<` と `<=` は TASK-79・SQL-9 の比較演算子。
+            // `<>` はどの分岐にも一致せず 2 つの `Punct` に分かれ、構文段で拒否される。
             let mut lookahead = chars.clone();
             lookahead.next();
             if matches!(lookahead.peek(), Some(&(_, '='))) {
                 lookahead.next();
                 if matches!(lookahead.peek(), Some(&(_, '>'))) {
                     lookahead.next();
-                    tokens.push(Token::DistanceOp);
+                    tokens.push(Token::DistanceOp(DistanceKind::Cosine));
                     chars = lookahead;
                     continue;
                 }
                 tokens.push(Token::Le);
                 chars = lookahead;
                 continue;
+            }
+            let kind = match lookahead.peek() {
+                Some(&(_, '-')) => Some(DistanceKind::L2),
+                Some(&(_, '#')) => Some(DistanceKind::NegativeInnerProduct),
+                Some(&(_, '+')) => Some(DistanceKind::L1),
+                _ => None,
+            };
+            if let Some(kind) = kind {
+                let mut third = lookahead.clone();
+                third.next();
+                if matches!(third.peek(), Some(&(_, '>'))) {
+                    third.next();
+                    tokens.push(Token::DistanceOp(kind));
+                    chars = third;
+                    continue;
+                }
             }
             // `<@`（jsonb 被包含。Issue #1598）。`<=` の判定より後ろで足りる（2 文字目が異なる）。
             if matches!(lookahead.peek(), Some(&(_, '@'))) {
@@ -1934,7 +1979,7 @@ mod tests {
             tokens,
             vec![
                 Token::Ident("embedding".to_string()),
-                Token::DistanceOp,
+                Token::DistanceOp(DistanceKind::Cosine),
                 Token::StringLiteral("x".to_string()),
             ]
         );
@@ -2005,7 +2050,7 @@ mod tests {
         assert!(tokenize("a & b").is_err());
         assert_eq!(toks("a ?& b"), vec![a(), JsonExistsAll, b()]);
         // 既存の `<` 系の最長一致は不変。
-        assert_eq!(toks("a <=> b")[1], DistanceOp);
+        assert_eq!(toks("a <=> b")[1], DistanceOp(DistanceKind::Cosine));
         assert_eq!(toks("a <= b")[1], Le);
         assert_eq!(toks("a < b")[1], Punct('<'));
         // `?||` は `?|` の後に単独の `|`（未対応）で拒否される。
@@ -2037,7 +2082,8 @@ mod tests {
         assert_eq!(toks("a#>b"), vec![a(), HashArrow, b()]);
         assert_eq!(toks("->>>"), vec![ArrowText, Punct('>')]);
         assert_eq!(toks("#>>>"), vec![HashArrowText, Punct('>')]);
-        assert_eq!(toks("a<->b"), vec![a(), Punct('<'), Arrow, b()]);
+        assert_eq!(toks("a<->b"), vec![a(), DistanceOp(DistanceKind::L2), b()]);
+        assert_eq!(toks("a < -> b"), vec![a(), Punct('<'), Arrow, b()]);
         assert_eq!(
             toks("1::int"),
             vec![Number("1".into()), TypeCast, ident("int")]
@@ -2312,7 +2358,7 @@ mod tests {
             tokens,
             vec![
                 Token::Ident("embedding".to_string()),
-                Token::DistanceOp,
+                Token::DistanceOp(DistanceKind::Cosine),
                 Token::Param(1),
             ]
         );
@@ -2400,7 +2446,7 @@ mod tests {
                 Token::Number("8".to_string()),
                 Token::Le,
                 Token::Number("9".to_string()),
-                Token::DistanceOp,
+                Token::DistanceOp(DistanceKind::Cosine),
                 Token::Number("10".to_string()),
             ]
         );
@@ -2599,6 +2645,68 @@ mod tests {
                 Token::Punct(']')
             ]
         );
+    }
+
+    /// Issue #1976（SQL-33 ポインタ）: `<->`・`<#>`・`<+>` が最長一致で種別付きの
+    /// 1 トークンになること、および `<` 始まりの既存字句が変わらないこと。
+    #[test]
+    fn distance_operators_lex_with_kind_and_longest_match() {
+        use Token::*;
+        let a = || ident("a");
+        let b = || ident("b");
+        let l2 = DistanceOp(DistanceKind::L2);
+        let ip = DistanceOp(DistanceKind::NegativeInnerProduct);
+        let l1 = DistanceOp(DistanceKind::L1);
+        let cos = DistanceOp(DistanceKind::Cosine);
+        assert_eq!(toks("a <-> b"), vec![a(), l2.clone(), b()]);
+        assert_eq!(toks("a<->b"), vec![a(), l2.clone(), b()]);
+        assert_eq!(toks("a <#> b"), vec![a(), ip.clone(), b()]);
+        assert_eq!(toks("a<+>b"), vec![a(), l1.clone(), b()]);
+        assert_eq!(toks("a <=> b"), vec![a(), cos.clone(), b()]);
+        // 距離トークンの後ろの余り `>` は別トークン（構文段で拒否される）。
+        assert_eq!(toks("<->>"), vec![l2.clone(), Punct('>')]);
+        assert_eq!(toks("<#>>"), vec![ip.clone(), Punct('>')]);
+        assert_eq!(toks("<+>>"), vec![l1.clone(), Punct('>')]);
+        // 文字列リテラル内は不変。
+        assert_eq!(toks("'<->'"), vec![StringLiteral("<->".to_string())]);
+    }
+
+    /// Issue #1976: 3 文字目が `>` でない `<-`・`<#`・`<+` は `<` 単独と後続の既存分岐へ戻る。
+    #[test]
+    fn distance_operator_prefixes_fall_back_to_existing_tokens() {
+        use Token::*;
+        let a = || ident("a");
+        let b = || ident("b");
+        let n1 = || Number("1".to_string());
+        assert_eq!(toks("a<-1"), vec![a(), Punct('<'), Punct('-'), n1()]);
+        assert_eq!(toks("a < -1"), vec![a(), Punct('<'), Punct('-'), n1()]);
+        assert_eq!(
+            toks("a <- > b"),
+            vec![a(), Punct('<'), Punct('-'), Punct('>'), b()]
+        );
+        // `<--` の後ろは行コメント。
+        assert_eq!(toks("a <-- x"), vec![a(), Punct('<')]);
+        assert_eq!(toks("a<#-b"), vec![a(), Punct('<'), HashMinus, b()]);
+        assert_eq!(toks("a <#-- b"), vec![a(), Punct('<'), Punct('#')]);
+        assert_eq!(toks("a<+b"), vec![a(), Punct('<'), Punct('+'), b()]);
+        assert_eq!(toks("a<+1"), vec![a(), Punct('<'), Punct('+'), n1()]);
+        assert_eq!(toks("a <# b"), vec![a(), Punct('<'), Punct('#'), b()]);
+        // 既存の `<` 系は不変。
+        assert_eq!(toks("a <= b")[1], Le);
+        assert_eq!(toks("a <> b"), vec![a(), Punct('<'), Punct('>'), b()]);
+        assert_eq!(toks("a <@ b")[1], JsonContainedBy);
+        assert_eq!(toks("a < b")[1], Punct('<'));
+    }
+
+    /// Issue #1976: `render_tokens` → `tokenize` の往復で 4 種すべてが同じトークン列に戻る。
+    #[test]
+    fn distance_operators_round_trip_through_render_tokens() {
+        let toks = |sql: &str| tokenize(sql).expect("tokenize should succeed");
+        for sql in ["a <=> b", "a <-> b", "a <#> b", "a <+> b"] {
+            let tokens = toks(sql);
+            let rendered = render_tokens(&tokens).expect("render");
+            assert_eq!(toks(&rendered), tokens, "round trip failed: {sql}");
+        }
     }
 }
 
