@@ -387,3 +387,19 @@ fn sql33_projected_distance_prepared_describe_validates_real_literal_beside_para
         assert_eq!(err.wire_code(), "22000", "{sql}");
     }
 }
+
+/// PR #2927 指摘の回帰: ORDER BY が実リテラルのとき、投影内の `$n` 項目があっても
+/// 実リテラルの距離項目はクエリベクトル一致を Describe 時点で検査し、通常の Describe と
+/// 同じく `0A000` で拒否する（項目ごとの判定）。
+#[test]
+fn sql33_projected_distance_prepared_describe_checks_literal_item_beside_param_item() {
+    let (core, _g) = setup("sql33-proj-dist-prepared-item-mismatch");
+    let session = SessionState::default();
+    let sql = "SELECT embedding <=> $1 AS a, embedding <=> '[0,1,0]' AS b FROM documents \
+               ORDER BY embedding <=> '[1,0,0]' LIMIT 3";
+    let prepared = core.parse_sql_prepared(sql).expect("parse");
+    let err = core
+        .describe_prepared_in_session(&session, &prepared)
+        .expect_err(sql);
+    assert_eq!(err.wire_code(), "0A000", "{sql}");
+}

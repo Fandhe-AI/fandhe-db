@@ -214,15 +214,15 @@ fn check_distance_kind(
 /// 投影の距離列（SQL-33 (7)・Issue #2007）と距離 `ORDER BY` の整合を検査する。
 /// 構文段（`parse_select_shape`）が列・種別の一致を保証するが、`ValidatedStatement::new` を直接
 /// 使う呼び出し元も迂回できないよう束縛段でも守る（多層防御）。距離列があるのに順位付けが
-/// 距離でない・種別が違う組は `42601`。`compare_query` が真（実リテラル）でクエリベクトルが
+/// 距離でない・種別が違う組は `42601`。`compare_query(列の添字)` が真（実リテラル）でクエリベクトルが
 /// ビット単位で一致しない組は `0A000`（未対応の形。ベクトル値はエラーに含めない）。
 fn check_projected_distance(
     projection: &[ProjectedColumn],
     ranking: &Ranking,
     kind: crate::sql::lexer::DistanceKind,
-    compare_query: bool,
+    compare_query: &dyn Fn(usize) -> bool,
 ) -> Result<(), SqlSurfaceError> {
-    for col in projection {
+    for (index, col) in projection.iter().enumerate() {
         let ProjectedColumn::Computed {
             expr:
                 crate::sql::udf_call::BoundExpr::VectorDistance {
@@ -249,7 +249,7 @@ fn check_projected_distance(
                 .iter()
                 .zip(query.iter())
                 .all(|(a, b)| a.to_bits() == b.to_bits());
-        if compare_query && !same {
+        if compare_query(index) && !same {
             return Err(SqlSurfaceError::feature_not_supported(
                 "a projected distance must use the same query vector as the distance ORDER BY",
             ));
@@ -1899,10 +1899,6 @@ impl LiteralSkip {
     fn skips_projection_item(&self, index: usize) -> bool {
         self.projection_mask.get(index).copied().unwrap_or(false)
     }
-
-    fn has_projection_mark(&self) -> bool {
-        self.projection_mask.iter().any(|b| *b)
-    }
 }
 
 /// SELECT リストの許可形状（[`Projection`]）を束縛する共通ヘルパー（TASK-77・
@@ -3252,7 +3248,7 @@ pub(crate) fn bind_in_session_with_limits(
         Some(resolved_mode.mode()),
     )?;
     check_distance_kind(stmt.distance_kind, &stmt.order_by)?;
-    check_projected_distance(&projection, &ranking, stmt.distance_kind, true)?;
+    check_projected_distance(&projection, &ranking, stmt.distance_kind, &|_| true)?;
 
     check_limit_omission(stmt.limit_implicit, Some(resolved_mode.mode()))?;
     let (limit, offset, result_cap) = bind_limit_and_offset(stmt, result_limits)?;
@@ -3387,7 +3383,8 @@ pub(crate) fn bind_projection_for_describe(
         &projection,
         &ranking,
         stmt.distance_kind,
-        !skip.order_by && !skip.has_projection_mark(),
+        // 投影項目ごとに判定する: `$n` 由来の項目だけ比較を省き、実リテラルの項目は常に検証する。
+        &|index| !skip.order_by && !skip.skips_projection_item(index),
     )?;
     check_limit_omission(stmt.limit_implicit, Some(resolved_mode.mode()))?;
     let _limits = bind_limit_and_offset(stmt, result_limits)?;
