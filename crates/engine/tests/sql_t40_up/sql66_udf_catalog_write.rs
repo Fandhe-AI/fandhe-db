@@ -505,3 +505,26 @@ fn implicit_create_function_does_not_cross_tenants() {
     assert_eq!(code(&core, "bob", &mut b2, CALL_DBL), "42883");
     ok(&core, "bob", &mut b2, "CREATE FUNCTION dbl(x) AS x * 5");
 }
+
+/// 同一メッセージ内の標準形の関数が、先行する未 commit の関数への依存辺を記録する（Issue #2882 の
+/// レビュー指摘）。commit 後の `DROP FUNCTION` は RESTRICT・CASCADE とも `2BP01` で止まる。
+#[test]
+fn standard_body_in_same_message_records_dependency_on_uncommitted_function() {
+    let path = unique_db_path("sql66-implicit-std-dep");
+    let _g = CleanupGuard(path.clone());
+    let core = open(&path);
+    let mut s = ddl_session();
+    run_message(
+        &core,
+        "alice",
+        &mut s,
+        &[
+            "CREATE FUNCTION f(x int) RETURNS int RETURN x + 1",
+            "CREATE FUNCTION g(x int) RETURNS int RETURN f(x)",
+        ],
+    )
+    .expect("message commits");
+    for sql in ["DROP FUNCTION f", "DROP FUNCTION f CASCADE"] {
+        assert_eq!(code(&core, "alice", &mut s, sql), "2BP01", "{sql}");
+    }
+}

@@ -342,6 +342,11 @@ pub(crate) fn execute_create_or_replace_function_persistent(
     Ok(())
 }
 
+/// 定義時検証の関数。共有 write txn があれば渡され（同一メッセージ内の未 commit の定義を見るため）、
+/// 依存辺を返す。
+pub(crate) type RoutineValidator<'a> = dyn Fn(Option<&redb::WriteTransaction>) -> Result<Vec<FunctionDependency>, SqlSurfaceError>
+    + 'a;
+
 /// `LANGUAGE sql|plpgsql` の関数 1 件の定義入力（[`execute_create_routine_persistent`] の引数束）。
 /// 本体は原文のまま保存し、解析・束縛・実行は呼び出し時の経路（`core::routine_call`。#2218）が担う。
 pub(crate) struct RoutineSpec<'a> {
@@ -379,7 +384,7 @@ pub(crate) fn execute_create_routine_persistent(
     spec: &RoutineSpec<'_>,
     or_replace: bool,
     max_functions: usize,
-    validate: &dyn Fn() -> Result<Vec<FunctionDependency>, SqlSurfaceError>,
+    validate: &RoutineValidator<'_>,
     target: CatalogWrite<'_>,
 ) -> Result<(), SqlSurfaceError> {
     let name = spec.name;
@@ -448,7 +453,11 @@ pub(crate) fn execute_create_routine_persistent(
         (Some(function_type_from_udf_cast(ty)?), ReturnShape::Scalar)
     };
     // 標準形は定義時に名前を解決し、参照先への依存辺を返す（それ以外は空）。
-    let dependencies = validate()?;
+    // 共有 write txn のときは、その txn 内の未 commit の定義も名前解決に見せる（同一メッセージ内の依存）。
+    let dependencies = validate(match &target {
+        CatalogWrite::Autocommit => None,
+        CatalogWrite::InTxn(w) => Some(*w),
+    })?;
     let def = FunctionDef {
         id: 1,
         function_key: lower.clone(),

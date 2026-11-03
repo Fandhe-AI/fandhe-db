@@ -833,6 +833,18 @@ pub(crate) fn function_ids_in_txn<R: ReadSource>(
 /// `scope` の定義を `(function_key, arg_signature)` の昇順で列挙する。`only_key` を指定すると
 /// その名前の多重定義だけを返す。件数が [`MAX_FUNCTIONS`] を超えたら `CorruptSchema`
 /// （破損時の無制限確保の防止）。
+/// 共有 write txn から `scope` の同名の多重定義を返す（同じ txn 内の未 commit の定義を含む。
+/// 標準形の関数本体の依存収集が、同一メッセージ内の先行 `CREATE FUNCTION` を見るために使う）。
+pub(crate) fn list_overloads_in_txn(
+    w: &redb::WriteTransaction,
+    scope: &str,
+    function_key: &str,
+) -> Result<Vec<FunctionDef>> {
+    validate_scope(scope)?;
+    let key = normalize_key(function_key)?;
+    list_in_txn(w, scope, Some(&key))
+}
+
 fn list_in_txn<R: ReadSource>(
     src: &R,
     scope: &str,

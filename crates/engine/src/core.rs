@@ -11002,7 +11002,7 @@ impl EngineCore {
                     &spec,
                     or_replace,
                     self.function_limits.max_functions(),
-                    &|| {
+                    &|w| {
                         if is_plpgsql {
                             self.validate_plpgsql_definition(
                                 &params,
@@ -11018,6 +11018,7 @@ impl EngineCore {
                                 &params,
                                 &param_types,
                                 &body_source,
+                                w,
                             )
                         } else {
                             self.validate_sql_function_definition(
