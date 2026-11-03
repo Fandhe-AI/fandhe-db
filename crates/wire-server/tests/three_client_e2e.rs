@@ -1466,9 +1466,9 @@ fn three_clients_verify_aggregate_queries_and_rls_invariance() {
             );
         }
 
-        // 拒否経路: 非数値型への集計（VECTOR 列への SUM。関数解決失敗の 42883）・
+        // 拒否経路: 非数値型への集計（VECTOR 列への MIN。関数解決失敗の 42883）・
         // 許可形状外（集計と裸の列の混在。42601）はいずれも接続を破棄せず拒否される。
-        const REJECT_TYPE_MISMATCH_SQL: &str = "SELECT SUM(embedding) FROM docs";
+        const REJECT_TYPE_MISMATCH_SQL: &str = "SELECT MIN(embedding) FROM docs";
         run_psql_session_expect_sqlstate(port, user, pw, &[], REJECT_TYPE_MISMATCH_SQL, "42883");
         run_psycopg_session_expect_sqlstate(port, user, pw, &[], REJECT_TYPE_MISMATCH_SQL, "42883");
         run_pg_session_expect_sqlstate(port, user, pw, &[], REJECT_TYPE_MISMATCH_SQL, "42883");

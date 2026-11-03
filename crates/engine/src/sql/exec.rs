@@ -659,22 +659,26 @@ pub(crate) fn candidate_scalar_view<'a>(
         .collect()
 }
 
-/// 文の期限を確認する行間隔（`exact_farthest_scan` の全走査ループ。Issue #1953 と同じ流儀）。
-const DESC_SCAN_DEADLINE_STRIDE: usize = 4096;
+/// 文の期限を確認する行間隔（`exact_full_scan` の全走査ループ。Issue #1953 と同じ流儀）。
+const FULL_SCAN_DEADLINE_STRIDE: usize = 4096;
 
-/// 距離順 `DESC`（遠い順。Issue #2009・SQL-33 (2)）の厳密全走査。`sql::exec` の DISTANCE 段から
-/// 呼ばれ、ANN 索引・[`SearchProvider`] を通さない。
+/// 距離順の厳密全走査（Issue #2009 の `DESC`、Issue #2242 の `LIMIT` 省略）。`sql::exec` の
+/// DISTANCE 段から呼ばれ、ANN 索引・[`SearchProvider`] を通さない（カスタム provider が近似でも
+/// 厳密さを保つため）。`farthest_first` が `true` なら遠い順（`DESC`）、`false` なら近い順。
 ///
-/// `slots` は昇順経路と同じ候補（アリーナの行番号。スカラー索引の候補マスクがあればその行番号）。
-/// スコアは昇順経路（`CpuScalarProvider`）と同じ内積で計算し、範囲外の行と非有限スコアの行を
-/// 除く規約も同じ。選出は [`crate::kernel::select_farthest_k`]（スコアの低い順・同点は行番号昇順）。
-/// 返す `score` は昇順経路と同じ値で、並びだけが逆になる。走査量はアリーナの既存上限
-/// （`MAX_ARENA_ROWS`／総バイト数）で閉じており、新しい打ち切りは持たない。長い走査は期限を確認する。
-fn exact_farthest_scan(
+/// `slots` は通常経路と同じ候補（アリーナの行番号。スカラー索引の候補マスクがあればその行番号）。
+/// スコアは通常経路（`CpuScalarProvider`）と同じ内積で計算する（距離種別の切り替えはこの 1 か所）。
+/// 範囲外の行と非有限スコアの行を除く規約も同じ。近い順の選出は [`crate::kernel::TopKSelector`]
+/// （スコアの高い順・同点は順序キー昇順）、遠い順は [`crate::kernel::select_farthest_k`]
+/// （スコアの低い順・同点は順序キー昇順）。返す `score` は通常経路と同じ値。走査量はアリーナの
+/// 既存上限（`MAX_ARENA_ROWS`／総バイト数）で閉じており、新しい打ち切りは持たない。保持件数は
+/// 高々 `k` 件で、事前確保は `k` に依存させない。長い走査は期限を確認する。
+fn exact_full_scan(
     arena: &crate::arena::VectorArena,
     slots: &[u64],
     query: &[f32],
     k: usize,
+    farthest_first: bool,
 ) -> Result<Vec<crate::kernel::CandidateHit>, SqlSurfaceError> {
     let dim = arena.dim() as usize;
     if query.len() != dim {
@@ -700,7 +704,7 @@ fn exact_farthest_scan(
         .iter()
         .map_while(|&slot| {
             visited = visited.saturating_add(1);
-            if visited.is_multiple_of(DESC_SCAN_DEADLINE_STRIDE) {
+            if visited.is_multiple_of(FULL_SCAN_DEADLINE_STRIDE) {
                 if let Err(e) = deadline.check() {
                     failure = Some(e);
                     return None;
@@ -717,7 +721,15 @@ fn exact_farthest_scan(
                 .is_finite()
                 .then_some(crate::kernel::CandidateHit { id: slot, score })
         });
-    let out = crate::kernel::select_farthest_k(candidates, k);
+    let out = if farthest_first {
+        crate::kernel::select_farthest_k(candidates, k)
+    } else {
+        let mut selector = crate::kernel::TopKSelector::new(k);
+        for hit in candidates {
+            selector.push(hit);
+        }
+        selector.into_sorted_vec()
+    };
     if let Some(e) = failure {
         return Err(e);
     }
@@ -1040,6 +1052,7 @@ pub(crate) fn execute_statement_with_cache(
         ),
         bound.distance_descending,
         metric_mismatch,
+        bound.result_cap.is_some(),
     );
     let hnsw_full_visible_eligible =
         !is_hybrid && ann_plan == crate::sql::hnsw_cache::AnnPlan::HnswFullVisible;
@@ -2286,12 +2299,17 @@ pub(crate) fn execute_statement_with_cache(
             // Issue #2009・SQL-33 (2): 距離順 `DESC`（遠い順）。ANN も provider も通さず、昇順経路と
             // 同じ候補（`slot_ids`）・同じスコア関数で可視行を全走査して返す。precision との併用は
             // 束縛が `0A000` で拒否済みのため `completeness_unbounded` は到達しない。
-            Ranking::Distance { query } if bound.distance_descending => {
-                let raw = exact_farthest_scan(arena, &slot_ids, query, k_eff)?;
+            //
+            // Issue #2242・SQL-34: `LIMIT` 省略（`result_cap`）も同じ厳密全走査で返す（方向は
+            // `distance_descending` に従う）。取得件数 `k_eff` は `OFFSET + cap + 1`。
+            Ranking::Distance { query }
+                if bound.distance_descending || bound.result_cap.is_some() =>
+            {
+                let raw =
+                    exact_full_scan(arena, &slot_ids, query, k_eff, bound.distance_descending)?;
                 if raw.len() > k_eff || raw.iter().any(|h| !visible_id_counts.contains_key(&h.id)) {
                     return Err(SqlSurfaceError::Internal {
-                        detail: "descending scan returned a result violating its contract"
-                            .to_string(),
+                        detail: "exact scan returned a result violating its contract".to_string(),
                     });
                 }
                 raw.into_iter().map(|h| (h.id, h.score as f64)).collect()
@@ -2872,6 +2890,15 @@ pub(crate) fn execute_statement_with_cache(
     // `offset == 0` は no-op。precision モードは「`LIMIT + OFFSET` の precision 結果から先頭
     // `OFFSET` 件を除いたもの」と定義する（ゲートが `OFFSET` 件以下に絞れば空集合）。
     let verified = verified.skip_front(bound.offset);
+    // Issue #2242・SQL-34: `LIMIT` 省略の距離順は、RLS 安全網と `OFFSET` の後（可視行のみを数えた
+    // 件数）が結果行数上限を超えたら、黙って切り詰めず `54000` で文全体を拒否する（行は 1 件も
+    // 返さない）。不可視行は計数にも判定の時点にも現れないため、`54000` の有無から他テナントの
+    // 行数は推測できない（RLS-7/8/10）。
+    if let Some(cap) = bound.result_cap {
+        if verified.len() > cap {
+            return Err(crate::sql::scan::row_limit_exceeded());
+        }
+    }
 
     // Issue #453: `defer_projection` が真のとき、`candidate_columns` は
     // 全スロットぶん空 `Vec` が積まれているだけ（`on_visible_row` の早期リターン・

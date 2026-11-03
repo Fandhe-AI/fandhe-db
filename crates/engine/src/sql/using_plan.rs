@@ -281,6 +281,7 @@ pub(crate) fn bind_expansion(
         evaluation_order: stmt.evaluation_order(),
         distance_descending: false,
         distance_kind: crate::sql::lexer::DistanceKind::Cosine,
+        result_cap: None,
     })
 }
 

@@ -390,6 +390,10 @@ fn embedding_referencing_aggregate_decodes_exactly_visible_rows() {
     for sql in [
         "SELECT SUM(vec_norm(embedding)) FROM docs",
         "SELECT lang, SUM(vec_norm(embedding)) FROM docs GROUP BY lang",
+        // Issue #2038・SQL-72 (3): `sum(<VECTOR>)` も Embedding tier になり、他テナントの行は
+        // 本体デコードに到達しない。
+        "SELECT SUM(embedding) FROM docs",
+        "SELECT lang, SUM(embedding) FROM docs GROUP BY lang",
     ] {
         let (_result, d) = run_layer_a(&storage, &schema, &alice, sql);
         assert_eq!(

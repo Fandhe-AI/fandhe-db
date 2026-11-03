@@ -58,6 +58,9 @@ pub(crate) enum AggregateRowValue<'a> {
     Time(i64),
     TimestampTz(i64),
     Interval(Interval),
+    /// `VECTOR` の値（`sum(<VECTOR>)`。SQL-72 (3)・Issue #2038）。列参照は行の埋め込みの借用、
+    /// 式（`vec_div` 等）は所有。
+    Vector(Cow<'a, [f32]>),
     /// `COUNT` 専用列の生の値（distinct 経路でだけ型を確かめる）。
     CountOnly {
         kind: CountOnlyKind,
@@ -81,6 +84,9 @@ fn expr_embedding<'v>(
         None => Err(accumulator_bug(match kind {
             "BoolExpr" => {
                 "BoolExpr references the VECTOR column but the row's embedding was not decoded"
+            }
+            "VectorExpr" => {
+                "VectorExpr references the VECTOR column but the row's embedding was not decoded"
             }
             "ScalarExpr" => {
                 "ScalarExpr references the VECTOR column but the row's embedding was not decoded"
@@ -125,6 +131,35 @@ pub(crate) fn eval_aggregate_input<'a>(
                 V::Null
             } else {
                 V::Present
+            }
+        }
+        // SQL-72 (3)・Issue #2038: `dim == 0` は NULL。未デコード（導出漏れ）は fail-closed。
+        AggregateInput::VectorColumn { .. } => {
+            if vector.dim == 0 {
+                V::Null
+            } else {
+                match vector.values {
+                    Some(v) => V::Vector(Cow::Borrowed(v)),
+                    None => {
+                        return Err(accumulator_bug(
+                            "VectorColumn observed a row whose embedding was not decoded",
+                        ))
+                    }
+                }
+            }
+        }
+        AggregateInput::VectorExpr {
+            source, program, ..
+        } => {
+            let embedding = expr_embedding(source, vector, "VectorExpr")?;
+            match program.eval(id, embedding, scanned, scratch)? {
+                ExprValue::Vector(c) => V::Vector(c),
+                ExprValue::Null => V::Null,
+                _ => {
+                    return Err(accumulator_bug(
+                        "vector-typed BoundExpr evaluated to a non-vector value",
+                    ))
+                }
             }
         }
         AggregateInput::IdU64 => V::Id(id),
@@ -297,6 +332,12 @@ impl AggregateRowValue<'_> {
                     "COUNT(DISTINCT) accumulator observed an input type that bind-time resolution should have rejected",
                 ))
             }
+            // `sum(DISTINCT <vector>)` は構文層が拒否済みで到達しない（Issue #2038）。
+            AggregateRowValue::Vector(_) => {
+                return Err(accumulator_bug(
+                    "COUNT(DISTINCT) accumulator observed a VECTOR value",
+                ))
+            }
             AggregateRowValue::Id(id) => Some(id.to_be_bytes().to_vec()),
             AggregateRowValue::Bool(b) => Some(vec![u8::from(*b)]),
             AggregateRowValue::Text(s) => Some(s.as_bytes().to_vec()),
@@ -456,5 +497,40 @@ mod tests {
             owned.distinct_key().unwrap()
         );
         assert_eq!(owned.distinct_key().unwrap(), Some(b"ab".to_vec()));
+    }
+
+    /// Issue #2038・SQL-72 (3): `sum(<VECTOR 列>)` の入力評価。`dim == 0` は NULL（埋め込み未設定）、
+    /// 未デコードの非 NULL 行は導出漏れとして fail-closed、`distinct_key` は到達しない。
+    #[test]
+    fn vector_column_maps_null_borrowed_and_undecoded() {
+        let input = AggregateInput::VectorColumn { dim: 2 };
+        fn eval_with<'a>(
+            input: &AggregateInput,
+            vector: &RowVector<'a>,
+        ) -> Result<AggregateRowValue<'a>, SqlSurfaceError> {
+            eval_aggregate_input(input, 7, vector, &[], &mut Vec::new())
+        }
+        let null = RowVector {
+            dim: 0,
+            values: None,
+        };
+        assert_eq!(eval_with(&input, &null).unwrap(), AggregateRowValue::Null);
+        let values = [1.0f32, 2.0];
+        let decoded = RowVector {
+            dim: 2,
+            values: Some(&values),
+        };
+        assert_eq!(
+            eval_with(&input, &decoded).unwrap(),
+            AggregateRowValue::Vector(Cow::Borrowed(&values[..]))
+        );
+        let undecoded = RowVector {
+            dim: 2,
+            values: None,
+        };
+        assert!(eval_with(&input, &undecoded).is_err());
+        assert!(AggregateRowValue::Vector(Cow::Borrowed(&values[..]))
+            .distinct_key()
+            .is_err());
     }
 }

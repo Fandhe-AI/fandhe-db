@@ -3636,6 +3636,21 @@ impl EngineCore {
         &self,
         bound: &crate::sql::parser::BoundStatement,
     ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+        // Issue #2242: `LIMIT` 省略（暗黙上限の印 `result_cap`）付きの計画は、`cap` が設定値と一致し、
+        // 取得上限が `cap + 1`、`OFFSET` が検索上限以内のときだけ通す（印の偽装で巨大な取得上限を
+        // 通す経路を作らない。`check_bound_scan_limit` と同型）。
+        if let Some(cap) = bound.result_cap() {
+            let max = self.result_limits.max_result_rows();
+            if cap != max
+                || Some(bound.limit()) != max.checked_add(1)
+                || bound.offset() > MAX_SEARCH_K
+            {
+                return Err(crate::sql::allowlist::SqlSurfaceError::invalid_input(
+                    format!("LIMIT {} out of range (must be 1..={max})", bound.limit()),
+                ));
+            }
+            return Ok(());
+        }
         self.check_bound_limit(bound.limit())?;
         if bound.fetch_count() > self.result_limits.max_result_rows() {
             return Err(crate::sql::allowlist::SqlSurfaceError::payload_too_large(
@@ -12602,6 +12617,7 @@ impl EngineCore {
                     evaluation_order: crate::sql::plan::EvaluationOrder::DEFAULT,
                     distance_descending: false,
                     distance_kind: crate::sql::lexer::DistanceKind::Cosine,
+                    result_cap: None,
                 })
             },
         )
@@ -13029,6 +13045,8 @@ impl EngineCore {
             row_policy_present,
             false,
             crate::sql::hnsw_cache::cosine_query_metric(),
+            // USING PLAN（hybrid）の `LIMIT` 省略は対象外（`42601` のまま。Issue #2242）。
+            false,
         );
         drop(post_check_txn);
         Ok(crate::sql::explain::build_explain_result_with_indexes(
@@ -13118,6 +13136,7 @@ impl EngineCore {
         row_policy_present: bool,
         distance_descending: bool,
         query_metric: crate::catalog::VectorOpClass,
+        limit_omitted: bool,
     ) -> (
         crate::sql::explain::ExplainEngine,
         crate::sql::explain::ExplainIndexNames,
@@ -13174,6 +13193,7 @@ impl EngineCore {
             ),
             distance_descending,
             metric_mismatch,
+            limit_omitted,
         );
 
         // codex-review P1 指摘対応（Issue #1066 PR #1155）: `HnswScope::All` は
@@ -13459,6 +13479,7 @@ impl EngineCore {
             row_policy_present,
             bound.distance_descending(),
             crate::sql::hnsw_cache::query_metric_of_bound(bound),
+            bound.result_cap().is_some(),
         );
         Ok(crate::sql::explain::build_search_explain_result(
             bound.mode(),

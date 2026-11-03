@@ -1437,6 +1437,8 @@ fn build_aggregate_shape(
                             AggregateInput::ScalarExpr { .. }
                                 | AggregateInput::TypedExpr { .. }
                                 | AggregateInput::VectorColumnPresence
+                                | AggregateInput::VectorColumn { .. }
+                                | AggregateInput::VectorExpr { .. }
                         ) {
                             return Err(SqlSurfaceError::unsupported(
                                 "aggregate over this column type is not supported in JOIN",
