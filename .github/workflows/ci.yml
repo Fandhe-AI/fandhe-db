@@ -189,6 +189,8 @@ jobs:
   # Fandhe-AI/actions のみ）。private submodule（docs/spec）は取得しない（spec 抜きで
   # ビルド・テストが成立する方針を維持）。
   # branch protection の必須チェックへ追加する運用は rust-ci と同様ユーザー作業（PR 本文参照）。
+  # Issue #2417: 1 文の DDL（CREATE/ALTER ADD COLUMN/CREATE INDEX/DROP TABLE）の SIGKILL 耐性
+  # （scripts/crash_test_ddl.sh）も同じジョブの step で実行する（ジョブ名を変えず必須チェックを増やさない）。
   crash-test-cross-table:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -201,6 +203,11 @@ jobs:
         run: rustup show
       - name: Run crash-test-cross-table
         run: make crash-test-cross-table
+      - name: Run crash-test-ddl
+        run: make crash-test-ddl
+      # Issue #2416: 明示 Tx の kill 位置制御の段も同ジョブの step で実行（必須チェック名を増やさない）
+      - name: Run crash-test-txn-kill-points
+        run: make crash-test-txn-kill-points
 
   # --------------------------------------------------
   # crash-test-unique-index（永続一意索引・クラッシュ耐性回帰テスト。

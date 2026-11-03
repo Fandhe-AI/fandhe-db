@@ -86,6 +86,19 @@ fn respond_error<S: WireStream>(
     crate::handshake::write_error_response_io(stream, class, message)
 }
 
+/// 文の実行エラー（`SqlSurfaceError`）の ErrorResponse を書く（Issue #2227・SQL-70）。通常は
+/// [`respond_error`] と同じ `S`/`C`/`M` の 3 フィールドで、PL/pgSQL の `RAISE EXCEPTION` だけ
+/// 利用者指定の SQLSTATE と `D`/`H`/`W` を付ける（`crate::error_response::encode_sql_error`）。
+fn respond_sql_error<S: WireStream>(
+    stream: &mut S,
+    e: &engine::sql::allowlist::SqlSurfaceError,
+) -> io::Result<()> {
+    let frame = crate::error_response::encode_sql_error(e).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidData, "failed to encode ErrorResponse")
+    })?;
+    write_all(stream, &frame)
+}
+
 /// 失敗応答の `ReadyForQuery` を書く（Issue #1575 レビュー指摘）。ErrorResponse の送出後に
 /// 呼び出し元がセッション復元（`MessageSnapshot`／暗黙トランザクションのスナップショット）を
 /// 済ませてから呼ぶことで、復元後の TimeZone の `ParameterStatus` が必ず `ReadyForQuery`
@@ -456,6 +469,8 @@ pub(crate) fn run_copy_statement_as<'e, S: WireStream>(
     finish: Finish,
     role: StatementRole,
 ) -> io::Result<crate::copy::CopyStep> {
+    // SQL-71・Issue #1954: COPY も文単位のデッドラインの下で実行する（関数末尾まで生存させる）。
+    let _deadline = install_statement_deadline(session);
     use engine::sql::transaction::TransactionStatus;
     match txn.status() {
         TransactionStatus::Idle => {
@@ -631,6 +646,19 @@ pub(crate) enum StatementRole {
     ImplicitFinal,
 }
 
+/// セッションの `statement_timeout`（SQL-71・Issue #1954）から現在時刻起点の文デッドラインを張る。
+/// 簡易クエリの各文（[`run_statement_as`]・[`run_copy_statement_as`]）と拡張クエリの Execute が
+/// 文の実行開始時に呼ぶ。`0`（無効）なら期限は増えない。入れ子は engine 側が早い方を採る。
+/// 戻り値のガードは文の実行が終わるまで名前付き束縛で保持すること（drop で期限が外れる）。
+pub(crate) fn install_statement_deadline(
+    session: &SessionState,
+) -> engine::interrupt::DeadlineGuard {
+    engine::interrupt::DeadlineScope::install(engine::interrupt::StatementDeadline::after(
+        std::time::Instant::now(),
+        session.statement_timeout(),
+    ))
+}
+
 /// [`run_statement`] の本体（[`StatementRole`] で暗黙トランザクション内の位置を指定する）。
 #[allow(clippy::too_many_arguments)]
 fn run_statement_as<'e, S: WireStream>(
@@ -643,6 +671,12 @@ fn run_statement_as<'e, S: WireStream>(
     finish: Finish,
     role: StatementRole,
 ) -> io::Result<StatementStatus> {
+    // SQL-71・Issue #1954: 期限は文ごとに張る（同じ `'Q'` 内の `SET statement_timeout` が後続文へ
+    // 効くよう、メッセージ単位では張らない）。ガードは関数末尾まで生存させる。
+    let _deadline = install_statement_deadline(session);
+    // PL/pgSQL の `RAISE NOTICE` 等の通知を、この 1 文の実行区間だけ溜める（Issue #2227・SQL-70）。
+    // 区間は実行の外側（緊急応答の登録区間の外）に張り、応答の最初のフレームより前に書き出す。
+    let notices = engine::notice::StatementNotices::enter();
     let outcome = match role {
         StatementRole::Standalone => execute_with_emergency_registration(stream, || {
             engine.execute_sql_in_txn(ctx, session, txn, stmt_sql)
@@ -656,6 +690,8 @@ fn run_statement_as<'e, S: WireStream>(
             Ok(outcome)
         }),
     };
+    let pending_notices = notices.finish();
+    crate::error_response::write_notices(stream, &pending_notices)?;
 
     match outcome {
         Ok(outcome) => match map_outcome(outcome) {
@@ -674,7 +710,7 @@ fn run_statement_as<'e, S: WireStream>(
             // から返す（`Active` 中は `fail()` 済み・`Failed` 中の再エラーは
             // 据え置き）ため、ここで読む `txn.status()` は直前のエラーを反映
             // 済み（WIRE-19・SQL-31・TASK-221・PR #1041 レビュー指摘 P1）。
-            respond_error(stream, e.error_class(), &e.client_message())?;
+            respond_sql_error(stream, &e)?;
             Ok(StatementStatus::Failed)
         }
     }
@@ -811,6 +847,10 @@ pub(crate) fn map_outcome(outcome: SqlOutcome) -> OutcomeResponse {
         },
         // RLS-13・Issue #2278: `SET row_security`／`RESET row_security` は `SET`／`RESET` タグ。
         SqlOutcome::SetRowSecurity { reset } => OutcomeResponse::Command {
+            tag: if reset { "RESET" } else { "SET" }.to_string(),
+        },
+        // SQL-71・Issue #1954: `SET statement_timeout`／`RESET statement_timeout` も `SET`／`RESET` タグ。
+        SqlOutcome::SetStatementTimeout { reset } => OutcomeResponse::Command {
             tag: if reset { "RESET" } else { "SET" }.to_string(),
         },
         SqlOutcome::Show(result) => OutcomeResponse::Rows {

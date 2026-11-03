@@ -5,7 +5,7 @@
 - ステータス: 採用（設計記録。Issue #1798 で実装）
 - ビヘイビア ID（ポインタのみ）: SQL-34・WIRE-11（関連: WIRE-15・ERR-6・SQL-71）。spec 本文は転記しない
 - 対象: engine の協調的中断の仕組み（`engine::interrupt`）と `57014`、wire-server の切断検出（`liveness`）
-- 後続: #1950／#1952／#1953／#1954（statement_timeout。#1951 の機構は本文「文単位のデッドライン」節）
+- 後続: #1950／#1953（statement_timeout。#1952・#1954 は完了。#1951 の機構は本文「文単位のデッドライン」節）
 
 ## 背景
 
@@ -42,7 +42,7 @@ SQL-71 のポインタ。statement_timeout の engine 側の機構で、同じ `
 - エラー文言: `StatementTimeout` は `canceling statement due to statement timeout`、それ以外は従来の `canceling statement due to user request`。いずれも固定文言で件数・テナント・期限値を含めない
 - `parallel_search` のワーカースレッドからは thread-local が見えない（期限の伝搬は対象外）
 
-後続への申し送り: セッション状態・`SET`／`SHOW statement_timeout`・wire の `'Q'`／`'E'` での導入は #1954、走査・結合・集約・ソートの確認点は #1952（完了。次節）、書き込み・COPY・ベクトル検索の確認点とロック待ちの期限内計上（`remaining_at`／`current_deadline`）は #1953、分割実行 DML への期限適用は #1950。
+後続への申し送り: セッション状態・`SET`／`SHOW statement_timeout`・wire の `'Q'`／`'E'` での導入は #1954（完了。「wire・CLI の結線」節）、走査・結合・集約・ソートの確認点は #1952（完了。次節）、書き込み・COPY・ベクトル検索の確認点とロック待ちの期限内計上（`remaining_at`／`current_deadline`）は #1953、分割実行 DML への期限適用は #1950。
 
 ### 確認点の網羅表（Issue #1952）
 
@@ -91,9 +91,23 @@ spec 側の判断（CancelRequest の受理契約の新設）が必要で、Issu
 - CancelRequest は長さを厳密に検証し（16 バイト）、secret は定数時間で比べ、一致の有無にかかわらず応答を送らずに閉じる。TLS 前後の経路を同じ関数で扱う
 - アイドル中に届いたキャンセルは無視し、文の開始時に中断状態を戻す
 
+### wire・CLI の結線（Issue #1954）
+
+SQL-71・SQL-46 のポインタ。#1951 の機構を、セッション変数 `statement_timeout` と起動時 CLI に結線した。
+
+- 値の置き場: `SessionState` の `statement_timeout_ms`（現在値）と `statement_timeout_reset_ms`（`RESET`／`SET ... TO DEFAULT` の戻り先）。`BEGIN`・`SAVEPOINT` で複製され `ROLLBACK`・`ROLLBACK TO` で復元されるため、Tx 内の `SET` の巻き戻しは追加実装なしで得られる
+- 構文: `SET [SESSION] statement_timeout {= | TO} {<整数> | '<整数>[<単位>]' | DEFAULT}`・`RESET statement_timeout`・`SHOW statement_timeout`（列名 `statement_timeout`・text）。単位は `ms`・`s`・`min`・`h`・`d`（大文字小文字を区別。単位なしはミリ秒）。範囲は `0`〜`2147483647`（`0` は無効）で、範囲外・不正値は `22023`（固定文言で入力値を反射しない）。`SHOW` は割り切れる最大の単位で表示する。範囲検証・パース・表示は `interrupt/statement_timeout.rs` に集約した
+- 期限を張る位置: 文の実行開始時（`simple_query::install_statement_deadline`）。簡易クエリは `run_statement_as`（単独・暗黙 Tx の各文）と `run_copy_statement_as`、拡張クエリは Execute（`execute_portal`。`max_rows` による再開も Execute ごとに新しい期限）。`'Q'` メッセージ単位で 1 回だけ張る案は、同じメッセージ内の `SET statement_timeout = ...; <後続文>` が後続文に効かないため不採用。Parse／Bind／Describe には張らない。入れ子（Execute と COPY）は engine 側が早い方を採る
+- 期限超過時: `57014`（既存の固定文言）。明示 Tx は `Failed`（以降は `25P02`）で、`SAVEPOINT` 後なら `ROLLBACK TO` で復帰できる（`QueryCanceled` は復帰不可クラスではない）。autocommit は副作用ゼロ
+- 起動時 CLI: `--statement-timeout-ms <0-2147483647>`（未指定は `0`）。厳密な 10 進パース・範囲外・値欠落・重複指定は起動エラー。`EngineCore::with_default_statement_timeout` へ 1 回だけ注入し、各セッションは認証成功後に現在値と reset 値の両方へ取り込む（上限ではなく既定値なので `SET` で上書きできる）。StartupMessage の `statement_timeout` は従来どおり読み捨てる
+- 不受理（受理を狭める側）: `SET LOCAL statement_timeout` は `0A000`（`row_security` などと同じ。COMMIT 時に値を戻す機構を作らない）。小数（`'1.5s'`）・`us` 単位・16 進は `22023`。PostgreSQL との差として記録する
+- セッションを持たない入口（`execute_sql` 等）では `SET`／`SHOW statement_timeout` は `42601`。READ ONLY Tx でも `SET`／`SHOW` は可
+- NoSQL（HTTP）表層・分割実行 DML・`parallel_search` ワーカーへの適用は本節の対象外
+
 ## テスト
 
 - engine: `crates/engine/tests/sql1798_interrupt.rs`（毒行の手前で止まること・明示トランザクションの `Failed`・autocommit の副作用ゼロ・stride・ガード drop）と `interrupt.rs` の単体テスト。デッドラインは `interrupt/deadline.rs` の単体テストと `crates/engine/tests/sql_t40_up/sql1951_statement_deadline.rs`（sleep なしの決定的テスト）
+- #1954: engine は `tests/sql_t40_up/sql1954_statement_timeout_setting.rs`（決定的）と `tests/core_misc/describe_parity.rs`、wire は `tests/wire_sql/wire_statement_timeout_setting.rs`・`tests/wire_cli/wire_statement_timeout_cli.rs`（決定的）と単独バイナリ `tests/wire1954_statement_timeout.rs`（時間依存。最終的に `57014` になることだけを固定し経過時間は測らない）
 - wire: `crates/wire-server/tests/wire1798_limit_omitted_streaming.rs`（simple / extended の上限内完走と上限超過、`max_rows` 分割、切断後のスロット回収）と `liveness.rs` の単体テスト
 - 切断後のスロット回収はタイミングに依存するため、「最終的に回復する」ことだけを固定する
 
@@ -101,5 +115,5 @@ spec 側の判断（CancelRequest の受理契約の新設）が必要で、Issu
 
 - CancelRequest の受け付け（spec 判断待ち）
 - 分割実行 DML の中断（#1950）
-- デッドラインの wire／CLI 結線（#1954）と書き込み・COPY・ベクトル検索ループへの確認点の拡充（#1953）
+- 書き込み・COPY・ベクトル検索ループへの確認点の拡充（#1953）。`SET LOCAL statement_timeout`・小数／`us` 単位・StartupMessage 由来の値・暗黙 Tx 開始時の writer 待機の期限内計上・NoSQL 表層への適用
 - 切断検出の CLI による無効化・間隔変更

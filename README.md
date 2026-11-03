@@ -94,7 +94,7 @@ cargo test -p fandhe-db-wire-server --test wire_framing
 | `make lint-docs` | ドキュメント／設定ファイル系 lint（markdownlint・yamllint・editorconfig-checker・commitlint） |
 | `make fmt` / `make fmt-check` / `make lint` / `make test` / `make deny` | Rust 系チェック（workspace 追加により有効化済み） |
 | `make test-default-build` | 既定ビルド（feature `fault-injection`・`wasm-udf` 無効）専用の回帰テスト（`ci` に含む）。`make test` は `--all-features` のため対象外のテストをピンポイント実行 |
-| `make crash-test` / `make crash-test-interrupt` / `make crash-test-cross-table` / `make crash-test-unique-index` / `make crash-test-partitioned-dml` / `make tmp-leak-check` / `make core-api-check` / `make sort-determinism-check` / `make simd-codegen-check` | `ci` に含まれるガード系（クラッシュ耐性・テスト一時領域の残置検出・コア API 差分・ソート非決定性・SIMD 生成コード検査）。個別実行や詳細は `make help` を参照 |
+| `make crash-test` / `make crash-test-interrupt` / `make crash-test-cross-table` / `make crash-test-ddl` / `make crash-test-txn-kill-points` / `make crash-test-unique-index` / `make crash-test-partitioned-dml` / `make tmp-leak-check` / `make core-api-check` / `make sort-determinism-check` / `make simd-codegen-check` | `ci` に含まれるガード系（クラッシュ耐性・テスト一時領域の残置検出・コア API 差分・ソート非決定性・SIMD 生成コード検査）。個別実行や詳細は `make help` を参照 |
 | `make check-cross` / `make simd-codegen-check-cross` | aarch64 クロスコンパイル確認（`ci.yml` の cross-check ジョブから実行。`ci` には含めない）。beta toolchain での週次先行検知は `toolchain-canary.yml` |
 | `make scripts-test` | `scripts/tests` 配下の Python 補助スクリプトの単体テスト（要 `python3`・標準ライブラリのみ。`ci` に含む） |
 | `make test-eval` | `scripts/eval` のユニットテスト（要 `python3`。CI には未配線） |
@@ -141,7 +141,7 @@ cargo run -p fandhe-db-wire-server -- --users <ユーザーストアのパス> -
   [--max-plpgsql-nesting-depth <1-32>] [--max-plpgsql-body-bytes <1-65536>] \
   [--max-function-call-depth <1-32>] [--max-trigger-depth <1-16>] \
   [--max-result-rows <1-100000>] \
-  [--write-lock-wait-ms <100-60000>] \
+  [--write-lock-wait-ms <100-60000>] [--statement-timeout-ms <0-2147483647>] \
   [--read-timeout-secs <1-600>] [--max-connections <1-256>] [--max-prepared-statements <1-1024>] \
   [--max-transaction-duration-ms <100-60000>] [--max-transaction-statements <1-10000>] \
   [--partitioned-dml-chunk-rows <1-1000000>] [--partitioned-dml-scan-budget <1-1000000>] \
@@ -552,6 +552,13 @@ SELECT の結果行数上限にも使われます（Issue #1796・#2211）。こ
 超過時の SQLSTATE は従来と同じ `55P03` です。autocommit の書き込み・明示トランザクションの最初の書き込み文（DML・`LOCK TABLE`。`BEGIN` と読み取りでは待たない）・分割実行 DML の
 チャンクに効き、SQL 表層と NoSQL（HTTP）表層の両方が対象です。範囲外・非数値・値欠落・2 回目以降の重複指定は
 fail-closed で起動エラーです。環境変数は設けません（詳細: [docs/design/write-lock-wait-cli.md](docs/design/write-lock-wait-cli.md)）。
+
+`--statement-timeout-ms <N>`（既定 0＝無効・範囲 `0`〜`2,147,483,647` ミリ秒）（Issue #1954・SQL-71）は、全セッションの
+`statement_timeout` の既定値を起動時に設定します。各セッションは `SET statement_timeout = '5s'` で上書きでき（単位 `ms`・`s`・`min`・`h`・`d`）、
+`RESET statement_timeout` はこの既定値へ戻ります。`SHOW statement_timeout` で現在値を確認できます。文の実行開始から設定値を超えると
+`57014` を返し、明示トランザクションは失敗状態（`25P02`）になります（`SAVEPOINT` 後なら `ROLLBACK TO` で復帰）。範囲外・非数値・値欠落・
+2 回目以降の重複指定は fail-closed で起動エラーです。`SET LOCAL`・小数・`us` 単位は未対応で、NoSQL（HTTP）表層には適用されません
+（詳細: [docs/design/statement-interrupt.md](docs/design/statement-interrupt.md)）。
 
 `--read-timeout-secs <N>`（既定 30・範囲 `1`〜`600` 秒）・`--max-connections <N>`（既定 64・範囲 `1`〜`256`）・
 `--max-prepared-statements <N>`（既定 64・範囲 `1`〜`1,024`。名前付きのみ数え、無名は数えない）（Issue #2454・WIRE-25）は、

@@ -9,6 +9,8 @@
 
 ### Added
 
+- PL/pgSQL の `RAISE`（全水準・書式・`USING`・条件名・`SQLSTATE`・再送出）と `EXCEPTION WHEN` ブロックを追加した（Issue #2227・SQL-70）。捕捉はブロック開始時の内部 savepoint まで巻き戻し、変数は巻き戻さない。巻き戻せない場合（書き込み後に入ったブロック・一時表を使った Tx）は固定文言の `0A000` で失敗する。`RAISE NOTICE/INFO/WARNING` は `NoticeResponse` で応答の前に届き（`DEBUG`／`LOG` は送らない）、`RAISE EXCEPTION` は利用者指定の SQLSTATE を `C` に出して `W` を付ける（本 DB 自身のエラーは 3 フィールドのまま）。`engine::notice`（`RaisedError`・`Notice`・`StatementNotices`）と `SqlSurfaceError::{raised, effective_sqlstate}` を公開した。
+  BREAKING CHANGE: 公開 enum `ErrorClass` に `RaisedException`（`P0001`）、`SqlSurfaceError` に `RaisedException` を追加した。`RAISE`・`EXCEPTION` は `0A000` から受理に変わった。
 - `ALTER DEFAULT PRIVILEGES [FOR ROLE ...] [IN SCHEMA ...] {GRANT|REVOKE} ... ON {TABLES|SEQUENCES|FUNCTIONS|SCHEMAS}` を追加した（Issue #2237・SQL-40・RLS-12）。実行より後に作る表（CTAS・ビュー・matview を含む）・SERIAL／IDENTITY を含む SEQUENCE・関数・SCHEMA の初期 ACL へ既定の付与を作成と同じ write txn で適用し、既存のオブジェクトと `OR REPLACE` の置換には作用しない。`FOR ROLE` は対象ロールへの SET 経路（運用者権限は免除）が要り、未束縛は `42501`・他テナントのロールは `42704`・SCHEMA は `3F000`・明示 Tx 内は `0A000`。`DROP ROLE` は既定権限の対象・付与先を `2BP01` で拒否し、`DROP SCHEMA` は当該 SCHEMA の既定権限を消す。wire のコマンドタグは `ALTER DEFAULT PRIVILEGES`。
   BREAKING CHANGE: 公開 enum `ParsedSql`・`SqlOutcome` に `AlterDefaultPrivileges` を追加した。`ALTER DEFAULT PRIVILEGES` は `0A000` から受理（または `42501`・`42704`・`3F000` 等）へ変わる。永続化: 専用表 `default_acl`・`default_acl_init` を遅延作成する（既存データは不変）。
 - 利用者ポリシー（`CREATE POLICY ... USING`）を kNN・ハイブリッド検索と索引走査の経路へ適用した（Issue #2279・RLS-13 ポインタ）。ポリシー適用表のランキング付き検索（距離順・ハイブリッド・`HINT ORDER`。wire・HTTP の `op: search` を含む）は `0A000` ではなく、ポリシーを通る行だけで順位・件数・スコアを決める（除外行は上位 k の枠を消費しない）。`EXPLAIN` は適用表で `FullVisible` を報告しない。`EngineCore::search`・`PrefilterIndex`・`USING PLAN` の辞書構築は適用表で従来どおり `0A000`。公開 API の変更はない。
@@ -35,6 +37,8 @@
   BREAKING CHANGE: 公開メソッド `SessionTransaction::savepoint` に引数 `session: &SessionState`、`SessionTransaction::rollback_to_savepoint` に引数 `session: &mut SessionState` を追加した。呼び出し側は実行中の `SessionState` を渡すよう改める（savepoint 作成時点のセッション状態を複製して保持し、`ROLLBACK TO` で復元するため）。
 - `SET TRANSACTION` と `SET SESSION CHARACTERISTICS AS TRANSACTION` を受理する（Issue #1939・SQL-38 (7)(a)・SQL-31 ポインタ。契約の詳細は spec 側を参照）。
   BREAKING CHANGE: 公開 enum `SqlOutcome`・`ParsedSql` に `SetTransaction`、`SqlSurfaceError` に `SetTransactionAfterQuery` を追加した。修飾子なしの `START TRANSACTION` がセッション既定を継承するようになった。
+- セッション変数 `statement_timeout`（`SET`／`RESET`／`SHOW`）と起動時 CLI `--statement-timeout-ms` を追加し、wire の文ごとにデッドラインを張って期限超過を `57014` で返す（Issue #1954・SQL-71）。既定は `0`（無効）で挙動は変わらない。`SET LOCAL`・小数・`us` 単位は未対応。
+  BREAKING CHANGE: 公開 enum `Statement`・`SqlOutcome` に variant（`SetStatementTimeout`・`ShowStatementTimeout`／`SetStatementTimeout`）を追加した。網羅 `match` する外部コードは腕を足す。
 - `row_security`（`SET`／`RESET`／`SHOW`・StartupMessage）とポリシーの適用判定（`BYPASSRLS`・所有者・対象ロール）を追加した（Issue #2278・RLS-12・RLS-13・SQL-39）。RLS 有効な表への読み取り・書き込み・`COPY` は `row_security = off` のとき行を扱う前に `42501`（`query would be affected by row-level security policy for table "..."`。表名は自テナントのみ）で拒否する。
   BREAKING CHANGE: 公開 enum `SqlSurfaceError`・`TenantWriteError` に `RowSecurityOffRejected` を追加した（`wire_code` は既存の `42501` のまま）。網羅 `match` する外部コードは腕を足す。
 - `BEGIN READ ONLY` の Tx を開始できるようにし、書き込み系の文（DML・DDL・`COPY FROM`・ロック・`USING OPERATION_ID` 付き）を `25006`（`read_only_sql_transaction`）で拒否して Tx を `Failed` にする（Issue #1934・SQL-38 (3)・ERR-6）。判定は許可リスト方式で、writer・台帳・採番・カタログへ触れる前に拒否する。HTTP は 403 に射影する。

@@ -242,19 +242,19 @@
 
 出典は #2222 の目標欄（public）と PostgreSQL 17 ドキュメントの PL/pgSQL 章の節立て。
 細目で迷う要素は #2224 で PostgreSQL 17 ドキュメントに基づき確定する（SQL-68 ポインタ）。
-Issue #2222 の目標欄は `RAISE` を挙げつつ #2227 へ配置しているため、**初版は `RAISE` も `0A000`**、
-Issue #2227 で受理する。
+Issue #2222 の目標欄は `RAISE` を挙げつつ #2227 へ配置しているため、初版は `RAISE` も `0A000` とし、
+Issue #2227 で受理した（末尾の「Issue #2227 追記」節）。
 
 | 区分 | 受理（初版） | 範囲外（`0A000`） |
 | ---- | ------------ | ----------------- |
-| ブロック | ラベル付きブロック、`DECLARE`、`BEGIN ... END`、`NULL;` | `EXCEPTION` 節（#2227）、`#variable_conflict` 等のコンパイラ指示 |
+| ブロック | ラベル付きブロック、`DECLARE`、`BEGIN ... END`、`NULL;`、`EXCEPTION` 節（#2227） | `#variable_conflict` 等のコンパイラ指示 |
 | 宣言 | 型・`CONSTANT`・`NOT NULL`・`:=`／`DEFAULT` の初期値・`%TYPE`・`%ROWTYPE`・`RECORD` | `ALIAS FOR`・カーソル変数（`refcursor`）・多相型 |
 | 代入 | `:=`・`=` | — |
 | 条件 | `IF`／`ELSIF`／`ELSE`、`CASE`（単純形・検索形） | — |
 | ループ | `LOOP`・`WHILE`・`FOR`（整数範囲〔`REVERSE`・`BY`〕・問い合わせ結果の行）、`EXIT`／`CONTINUE`（ラベル・`WHEN`） | `FOREACH`、カーソルの `FOR`（`FOR ... IN EXECUTE` は #2224 で確定） |
 | 戻り値 | `RETURN`、`RETURN NEXT`／`RETURN QUERY`（集合返却は #2220 の基盤が前提。未整備なら `0A000`） | `OUT`／`INOUT` 引数（引数モードは PR #2773 で拒否済み） |
 | SQL | `SELECT ... INTO [STRICT]`、`PERFORM`、`INSERT`／`UPDATE`／`DELETE`（`RETURNING ... INTO`）、`EXECUTE ... [INTO] [USING]`、`FOUND`、`GET DIAGNOSTICS ... = ROW_COUNT` | DDL・トランザクション制御（`COMMIT`／`ROLLBACK`）・`SET`／`RESET`・`CALL`・`COPY`、`ROW_COUNT` 以外の診断項目・`GET STACKED DIAGNOSTICS` |
-| 通知・例外 | — | `RAISE`（全水準）・`ASSERT`（#2227。SQL-70 ポインタ） |
+| 通知・例外 | `RAISE`（全水準・書式・`USING` の `MESSAGE`／`DETAIL`／`HINT`／`ERRCODE`・条件名・`SQLSTATE`・引数なしの再送出。#2227。SQL-70 ポインタ） | `ASSERT`・`GET STACKED DIAGNOSTICS`・`USING` の `COLUMN`／`TABLE` 等（`0A000`） |
 | カーソル | — | `OPEN`／`FETCH`／`MOVE`／`CLOSE` |
 
 範囲外の構文は `0A000` で拒否し、別の意味へ読み替えない（fail-closed）。
@@ -323,8 +323,8 @@ Issue #2227 で受理する。
   `FROM`／`JOIN` の表名・別名・`INSERT` の列リスト・`UPDATE ... SET` の代入先・型名・CTE 名）は変数にならない。
   分類結果（位置・役割）は #2226 の呼び出し時の値置換が使う
 - 範囲外の追加確定: `FOR ... IN EXECUTE`・`RETURN QUERY EXECUTE`・カーソル `FOR` は `0A000`。
-  本体内の `USING OPERATION_ID`・深さ 0 の `PARTITIONED` は `0A000`（D8）。`RAISE`・`ASSERT` は
-  `0A000` のまま（#2227 で受理）
+  本体内の `USING OPERATION_ID`・深さ 0 の `PARTITIONED` は `0A000`（D8）。`RAISE`・`EXCEPTION` は
+  #2227 で受理した。`ASSERT` は `0A000` のまま
 - 本体内のドル引用（例: `EXECUTE $q$...$q$`）は、#2216 のマージまでは SQL 字句解析器が `$` を拒否するため
   `42601`。スキャナはドル引用 1 個を 1 トークンとして読み飛ばす（中の `;` で文を分けない）
 - 変数名・ラベルが PL/pgSQL の予約語（`BEGIN`・`END`・`IF`・`LOOP` 等）と同じ場合は `42601`
@@ -849,3 +849,80 @@ SQL-67 の (2)(3)(5)(6)(7) のポインタ。仕様本文は転記しない。
 - `SECURITY DEFINER` の意味づけはロール・権限の確定待ちで、拒否（`0A000`）だけを固定した。
 - 関数経由の書き込みの crash 注入、レイテンシ観測、wire-server 結合テストは行っていない。
 - トリガ発火経由の越境・上限は #1720。
+
+## Issue #2227 追記（`RAISE` と `EXCEPTION` ブロック。SQL-70・SQL-68・SQL-69・ERR-1／2／4／5 ポインタ）
+
+親 #2222・依存 #2226・#1941・#1943・#2228・#2217（いずれもマージ済み）。期待値は PostgreSQL 17 の公開された
+挙動に合わせる。本節は設計判断の記録で、spec 本文は転記しない（ID ポインタのみ）。
+
+### 受理範囲と構文段
+
+- `RAISE [DEBUG|LOG|INFO|NOTICE|WARNING|EXCEPTION] '書式' [, 式...] [USING 項目 = 式, ...]`、`RAISE 条件名`、
+  `RAISE SQLSTATE '...'`、`RAISE USING ...`、引数なしの `RAISE;`（再送出）。書式は文字列リテラル 1 個で、`%` を
+  引数で順に置き換え、`%%` は `%`。`%` の数と引数の数の不一致は定義時に `42601`。値の NULL は `<NULL>`。
+- `USING` は `MESSAGE`・`DETAIL`・`HINT`・`ERRCODE` だけ。他の項目は `0A000`、重複・書式と `MESSAGE` の併用は
+  `42601`。`ERRCODE` は 5 文字のコードか条件名。実装定義クラス `VD` の指定（実行時の値を含む）と不正なコードは
+  `42601`、未知の条件名は `42704`。`USING` の値が NULL なら `22004`。
+- `EXCEPTION WHEN 条件 [OR 条件...] THEN ...`。条件は `OTHERS`・条件名・`SQLSTATE '...'`。条件名の表は
+  `plpgsql::condition`（PostgreSQL 17 の公開仕様のエラー条件名。1 名が複数コードに対応する場合、`WHEN` は全部に
+  一致し `RAISE` は表の先頭を使う）。コードがカテゴリ（末尾 `000`）なら同じクラスのエラーに一致する。
+  `OTHERS` は `57014`（`query_canceled`）と `P0004`（`assert_failure`）を捕捉しない。
+- ハンドラ内では暗黙の text 変数 `SQLSTATE`・`SQLERRM` を参照できる（入れ子のブロックの `EXCEPTION` ごとに 1 組）。
+  `SQLERRM` は入口の出口と同じ `scrub_error` を通した文言（SCHEMA 配下の内部キー `#<id>.` を出さない）。
+- ハンドラの外の引数なし `RAISE;` は定義時に `42601`（静的に判定できるため）。ハンドラ内のエラーは外側へ伝わる。
+
+### 捕捉と巻き戻し
+
+- `EXCEPTION` 節つきブロックは、`DECLARE` の初期化の後・本体の前に内部 savepoint を積む（初期化のエラーは
+  そのブロックでは捕捉しない）。本体のエラーが `WHEN` に一致したら、巻き戻し → savepoint を除去 → ハンドラの順。
+  savepoint は成功・捕捉・伝播のすべての出口で 1 回だけ除去する。**変数・`FOUND`・`RETURN NEXT` で蓄積した行は
+  巻き戻さない**（PostgreSQL と同じ）。
+- 内部 savepoint は `SessionTransaction::{pl_savepoint_push, pl_rollback_to, pl_release}`（`pub(crate)`）。利用者の
+  `SAVEPOINT` と同じスタックを使うが、名前が NUL を含み利用者が書けないため `RELEASE`／`ROLLBACK TO` の名前検索には
+  現れない。文数・持続時間に計上せず、暗黙 Tx（autocommit の `DO`）でも使える。巻き戻しの本体は名前検索から分離した
+  `restore_at` を共有する。不変条件: redb の `restore_savepoint` は開いているテーブルハンドルがあると panic するが、
+  「ハンドルが開いている」なら writer は dirty で、以降に積んだ savepoint は `Unrestorable` になり、復元の前に
+  `0A000` で返す。つまり `Restorable` の復元は構造上ハンドルが無い境界でだけ起きる。
+- **巻き戻せない場合は fail-closed**: 書き込み後に入ったブロック（`Unrestorable`）と一時表を使った Tx は、一致する
+  ハンドラがあっても捕捉せず固定文言の `0A000` で Tx を失敗させる（巻き戻さずに捕捉すると取り消したつもりの書き込みが
+  確定する fail-open になるため）。エラーが起きないブロックは `Unrestorable` でも普通に動く。巻き戻せる範囲の拡張
+  （書き込み後の SAVEPOINT への `ROLLBACK TO`。engine 側の undo log）は既存の #2879 の範囲で、本 Issue では扱わない。
+- **捕捉しないエラー**: `Internal`（`XX000`）・`SerializationFailure`（`40001`。`SessionTransaction::
+  is_unrecoverable_error` と同じ集合）、実行上限の超過（文数・反復・深さ・集合返却。`ExecBudget` の共有カウンタに
+  `exhausted` を立て、立っている間は捕捉しない＝上限の迂回を防ぐ）、Tx が失敗状態のとき。利用者が
+  `RAISE ... ERRCODE = 'XX000'` で指定したコードは `RaisedException` なので `OTHERS` で捕捉できる（分類と照合コードは別軸）。
+- トリガ関数の本番の呼び出し口（`UnwiredInvoker`）は #1720 系の未結線のまま。トリガ関数での捕捉は core の内部 API
+  `invoke_trigger_function_in_txn` の経路で検証する範囲に留まる。本番結線時は、BEFORE トリガ内の捕捉でテーブル
+  ハンドルが開いていないことを証明するか `0A000` にすること（`restore_savepoint` の panic 回避）。
+
+### エラー型と wire
+
+- `ErrorClass::RaisedException`（`P0001`）・`SqlSurfaceError::RaisedException(Box<RaisedError>)`（BREAKING）。
+  `wire_code()` は静的な `P0001` で、利用者指定の SQLSTATE・文言・DETAIL・HINT・文脈は `RaisedError` が持ち、
+  `SqlSurfaceError::raised()`／`effective_sqlstate()` で取り出す。既存の `Internal`／`SerializationFailure` を包まない
+  ため `is_unrecoverable_error` の判定は変わらない。引数なしの `RAISE` のエラー（ハンドラ外。定義時に拒否済みの
+  防御）は `RaisedException` に SQLSTATE `0Z002` を載せて返す（専用の `ErrorClass` は作らない）。
+- 利用者テキスト（文言・DETAIL・HINT・文脈）は生成時に NUL を除去し 4 KiB へ切り詰める。`scrub_error` は
+  `RaisedException` の利用者テキストを書き換えない。
+- wire-server: `error_response::encode_sql_error` が `RaisedException` のとき `C` に利用者の SQLSTATE を出し、`D`・`H`・
+  `W`（呼び出し文脈）を付ける。**PL 外（本 DB 自身）のエラーは従来どおり `S`/`C`/`M` の 3 フィールドのまま**で、
+  `W` が付くのは `RAISE` 由来だけ。これにより利用者が指定した `23505` と本 DB 自身の `23505`（`DuplicateOperationId`
+  等。再送判定の根拠になる）を `W` の有無で区別できる（SQL-70 (2)・RECOVER-7 ポインタ）。
+- 通知: `engine::notice::StatementNotices`（thread-local の RAII 区間）。wire-server が文の実行を包み、応答の最初の
+  フレームより前（エラー時も）に `NoticeResponse`（'N'。`S`・`V`・`C`・`M`、あれば `D`・`H`）を書く。簡易・拡張の
+  両プロトコル。`INFO`／`NOTICE`／`WARNING` だけ送り、`DEBUG`／`LOG` は引数を評価して捨てる。既定の SQLSTATE は
+  `NOTICE`／`INFO` が `00000`、`WARNING` が `01000`。区間の外（HTTP／NoSQL）の通知は捨てる（NoSQL の応答に通知を
+  含めない）。上限は 1 文 1,024 件・1 MiB で、超過分は捨てて固定文言の `WARNING` を 1 件足す。
+- `W` の形式は `PL/pgSQL function inline_code_block line <n> at RAISE`（`DO`）、関数・トリガ関数は
+  `PL/pgSQL function line <n> at RAISE`（関数定義は名前を保持しないため名前は出さない）。行番号は本体の原文の
+  先頭行が 1。
+- HTTP: `RaisedException` は 400（`RAISED_EXCEPTION`）。利用者の SQLSTATE は NoSQL 側へは出さない。
+
+### 既知差（PostgreSQL 17 との違い）
+
+- `NoticeResponse` は RowDescription より前に送る（PostgreSQL は後）。
+- `W` は `RAISE` 由来のエラーだけに付ける。`RAISE` 以外の PL 由来エラー（例: `SELECT INTO STRICT` の `P0002`）は
+  `W` なし（文脈の thread-local 区間は未実装）。関数名は出ない。通知には `W` を付けない。
+- `ASSERT`・`GET STACKED DIAGNOSTICS`・`USING` の `COLUMN`／`TABLE` 等は `0A000` のまま。
+- NoSQL の書き込みがトリガを発火して PL のエラーが出る経路（SQL-70 (5)）は、トリガの本番結線（#1720 系）まで E2E で
+  到達しない。

@@ -1326,6 +1326,9 @@ pub struct EngineCore {
     /// 明示トランザクション（SQL-31・TASK-221）の持続時間・文数の上限。差し替えは
     /// [`Self::with_transaction_limits`] のみ。
     transaction_limits: crate::sql::transaction::TransactionLimits,
+    /// 全セッションの `statement_timeout` 既定値（SQL-71・Issue #1954。`0` は無効）。差し替えは
+    /// [`Self::with_default_statement_timeout`] のみ（起動時 CLI から 1 回だけ注入する）。
+    default_statement_timeout: std::time::Duration,
     /// 述語形 UPDATE/DELETE の 1 文あたり影響行数上限・複数行 `VALUES` の
     /// 1 文あたり行数上限（Issue #997。オーナー判断 2026-09-27: プロセス全体を
     /// 起動時 CLI フラグで設定可能にする。セッション・テナント単位は対象外）。
@@ -2047,6 +2050,15 @@ fn show_row_security_columns() -> Vec<crate::sql::exec::ColumnMeta> {
     }]
 }
 
+/// `SHOW statement_timeout` の結果列（列名 `statement_timeout`・text の 1 列。実行と Describe が共有する。
+/// SQL-71・Issue #1954）。
+fn show_statement_timeout_columns() -> Vec<crate::sql::exec::ColumnMeta> {
+    vec![crate::sql::exec::ColumnMeta::Computed {
+        name: "statement_timeout".to_string(),
+        ty: Some(crate::catalog::ColumnType::Text),
+    }]
+}
+
 /// `SHOW search_path` の結果列（列名 `search_path`・text の 1 列。実行と Describe が共有する。
 /// TABLE-27・Issue #1715）。
 fn show_search_path_columns() -> Vec<crate::sql::exec::ColumnMeta> {
@@ -2550,6 +2562,8 @@ fn read_only_permits(parsed: &ParsedSql) -> bool {
                 | Statement::ShowSearchPath
                 | Statement::SetRowSecurity { .. }
                 | Statement::ShowRowSecurity
+                | Statement::SetStatementTimeout { .. }
+                | Statement::ShowStatementTimeout
         ),
         // SQL-39・Issue #1963: `SET ROLE`／`RESET ROLE` はセッション変数だけを変える（READ ONLY Tx でも可）。
         ParsedSql::Cursor(_) | ParsedSql::Do(_) | ParsedSql::SetRole(_) => true,
@@ -3066,6 +3080,7 @@ impl EngineCore {
             require_where_for_dml: false,
             batch_limits: crate::batch_limits::BatchLimits::default(),
             transaction_limits: crate::sql::transaction::TransactionLimits::default(),
+            default_statement_timeout: std::time::Duration::ZERO,
             dml_limits: crate::sql::parser::DmlLimits::default(),
             schema_limits: crate::schema_limits::SchemaLimits::default(),
             scan_limits: crate::scan_limits::ScanLimits::default(),
@@ -3343,6 +3358,20 @@ impl EngineCore {
     ) -> Self {
         self.transaction_limits = limits;
         self
+    }
+
+    /// 全セッションの `statement_timeout` 既定値を差し替えたビルダーを返す（SQL-71・Issue #1954）。
+    /// `wire-server` の起動時 CLI `--statement-timeout-ms` から 1 回だけ注入する契約（範囲検証は
+    /// `interrupt::validate_statement_timeout_ms`）。各セッションは認証成功後に
+    /// `SessionState::apply_default_statement_timeout` で取り込み、`SET` で上書きできる。
+    pub fn with_default_statement_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.default_statement_timeout = timeout;
+        self
+    }
+
+    /// 起動時に注入された `statement_timeout` の既定値（未注入は 0＝無効）。
+    pub fn default_statement_timeout(&self) -> std::time::Duration {
+        self.default_statement_timeout
     }
 
     /// 書き込みロック待機上限（超過は `55P03`）を差し替えたビルダーを返す（Issue #1554・
@@ -4448,6 +4477,13 @@ impl EngineCore {
                     "SET/SHOW row_security requires a session-aware entry point",
                 ))
             }
+            // SQL-71・Issue #1954: `statement_timeout` もセッション変数（同じ決定的な契約）。
+            crate::sql::allowlist::Statement::SetStatementTimeout { .. }
+            | crate::sql::allowlist::Statement::ShowStatementTimeout => {
+                Err(crate::sql::allowlist::SqlSurfaceError::unsupported(
+                    "SET/SHOW statement_timeout requires a session-aware entry point",
+                ))
+            }
             // TASK-79（SQL-9）: UDF 定義はセッションへ登録する statement のため、
             // セッションを持たないこのエントリポイントでは受理しない（`SET` と同じ
             // 「値の妥当性に関わらず一律 `42601`」の決定的な契約を踏襲する）。
@@ -4471,6 +4507,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::SetTimeZone
                     | crate::sql::SqlOutcome::SetSearchPath { .. }
                     | crate::sql::SqlOutcome::SetRowSecurity { .. }
+                    | crate::sql::SqlOutcome::SetStatementTimeout { .. }
                     | crate::sql::SqlOutcome::Show(_)
                     | crate::sql::SqlOutcome::CreateFunction { .. }
                     | crate::sql::SqlOutcome::Explain(_)
@@ -4546,6 +4583,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::SetTimeZone
                     | crate::sql::SqlOutcome::SetSearchPath { .. }
                     | crate::sql::SqlOutcome::SetRowSecurity { .. }
+                    | crate::sql::SqlOutcome::SetStatementTimeout { .. }
                     | crate::sql::SqlOutcome::Show(_)
                     | crate::sql::SqlOutcome::CreateFunction { .. }
                     | crate::sql::SqlOutcome::Explain(_)
@@ -4618,6 +4656,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::SetTimeZone
                     | crate::sql::SqlOutcome::SetSearchPath { .. }
                     | crate::sql::SqlOutcome::SetRowSecurity { .. }
+                    | crate::sql::SqlOutcome::SetStatementTimeout { .. }
                     | crate::sql::SqlOutcome::Show(_)
                     | crate::sql::SqlOutcome::CreateFunction { .. }
                     | crate::sql::SqlOutcome::Explain(_)
@@ -4697,6 +4736,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::SetTimeZone
                     | crate::sql::SqlOutcome::SetSearchPath { .. }
                     | crate::sql::SqlOutcome::SetRowSecurity { .. }
+                    | crate::sql::SqlOutcome::SetStatementTimeout { .. }
                     | crate::sql::SqlOutcome::Show(_)
                     | crate::sql::SqlOutcome::CreateFunction { .. }
                     | crate::sql::SqlOutcome::Explain(_)
@@ -4795,6 +4835,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::SetTimeZone
                     | crate::sql::SqlOutcome::SetSearchPath { .. }
                     | crate::sql::SqlOutcome::SetRowSecurity { .. }
+                    | crate::sql::SqlOutcome::SetStatementTimeout { .. }
                     | crate::sql::SqlOutcome::Show(_)
                     | crate::sql::SqlOutcome::CreateFunction { .. }
                     | crate::sql::SqlOutcome::Explain(_)
@@ -5995,6 +6036,13 @@ impl EngineCore {
         if crate::sql::allowlist::is_show_row_security(&tokens) {
             return Ok(ParsedSql::Statement(
                 crate::sql::allowlist::Statement::ShowRowSecurity,
+            ));
+        }
+
+        // SQL-71・Issue #1954: `SHOW statement_timeout` も厳密一致のみ先に取り出す。
+        if crate::sql::allowlist::is_show_statement_timeout(&tokens) {
+            return Ok(ParsedSql::Statement(
+                crate::sql::allowlist::Statement::ShowStatementTimeout,
             ));
         }
 
@@ -9172,7 +9220,9 @@ impl EngineCore {
                 | Statement::SetSearchPath { .. }
                 | Statement::ShowSearchPath
                 | Statement::SetRowSecurity { .. }
-                | Statement::ShowRowSecurity),
+                | Statement::ShowRowSecurity
+                | Statement::SetStatementTimeout { .. }
+                | Statement::ShowStatementTimeout),
             ) => self.execute_validated_in_session(ctx, session, stmt.clone()),
             // SQL-66（Issue #1920・#1922）: `CREATE [OR REPLACE] FUNCTION` は DDL 権限が無ければ `42501` で
             // 拒否する（fail-closed）。権限のあるセッションでも UDF カタログへ書く永続 DDL は独立した
@@ -9711,6 +9761,8 @@ impl EngineCore {
             | Statement::ShowSearchPath
             | Statement::SetRowSecurity { .. }
             | Statement::ShowRowSecurity
+            | Statement::SetStatementTimeout { .. }
+            | Statement::ShowStatementTimeout
             | Statement::CreateFunction { .. }
             | Statement::MaterializedView(_)
             | Statement::RecursiveCte(_)
@@ -10600,6 +10652,11 @@ impl EngineCore {
             ParsedSql::Statement(Statement::ShowRowSecurity) => {
                 Ok(Some(show_row_security_columns()))
             }
+            // SQL-71・Issue #1954: `SET`／`RESET statement_timeout` は結果列なし、`SHOW` は 1 列固定。
+            ParsedSql::Statement(Statement::SetStatementTimeout { .. }) => Ok(None),
+            ParsedSql::Statement(Statement::ShowStatementTimeout) => {
+                Ok(Some(show_statement_timeout_columns()))
+            }
             ParsedSql::Statement(Statement::CreateFunction { .. }) => Ok(None),
             // `EXPLAIN` は常に単一の `Computed` 列（`QUERY PLAN`）を返す
             // （`sql::explain::build_explain_result` と同一の列。中身の生成には
@@ -10939,6 +10996,34 @@ impl EngineCore {
                 }
                 Ok(crate::sql::SqlOutcome::SetRowSecurity { reset })
             }
+            // SQL-71・Issue #1954: 構文段で範囲検証済みの値をセッションへ代入する（失敗した SET は値を変えない）。
+            // `DEFAULT`・`RESET` は reset 値（起動時 CLI の既定、無ければ 0）へ戻す。
+            crate::sql::allowlist::Statement::SetStatementTimeout { value, reset } => {
+                match value {
+                    crate::sql::allowlist::StatementTimeoutSetting::Millis(ms) => {
+                        session.set_statement_timeout_ms(ms)
+                    }
+                    crate::sql::allowlist::StatementTimeoutSetting::Default => {
+                        session.reset_statement_timeout()
+                    }
+                }
+                Ok(crate::sql::SqlOutcome::SetStatementTimeout { reset })
+            }
+            crate::sql::allowlist::Statement::ShowStatementTimeout => Ok(
+                crate::sql::SqlOutcome::Show(crate::sql::exec::QueryResult {
+                    columns: show_statement_timeout_columns(),
+                    rows: vec![crate::sql::exec::ResultRow {
+                        id: 0,
+                        score: 0.0,
+                        cells: vec![crate::sql::exec::Cell::Text(
+                            crate::interrupt::format_statement_timeout(
+                                u64::try_from(session.statement_timeout().as_millis())
+                                    .unwrap_or(u64::MAX),
+                            ),
+                        )],
+                    }],
+                }),
+            ),
             crate::sql::allowlist::Statement::ShowRowSecurity => Ok(crate::sql::SqlOutcome::Show(
                 crate::sql::exec::QueryResult {
                     columns: show_row_security_columns(),

@@ -328,12 +328,12 @@ fn plpgsql_definition_limits_and_scope_are_checked_at_definition_time() {
     let path = unique_db_path("sql67_plpgsql_def");
     let _g = CleanupGuard(path.clone());
     let core = open(&path);
-    // 範囲外の構文（EXCEPTION ブロック）は 0A000。
+    // 範囲外の構文（ASSERT。EXCEPTION ブロックは Issue #2227 で対応済み）は 0A000。
     assert_eq!(
         code(
             &core,
-            "CREATE FUNCTION f(a int) RETURNS int LANGUAGE plpgsql AS $$ BEGIN RETURN a; \
-             EXCEPTION WHEN OTHERS THEN RETURN 0; END $$"
+            "CREATE FUNCTION f(a int) RETURNS int LANGUAGE plpgsql AS $$ BEGIN ASSERT a > 0; \
+             RETURN a; END $$"
         ),
         "0A000"
     );

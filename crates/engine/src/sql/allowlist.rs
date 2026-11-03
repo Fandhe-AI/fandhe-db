@@ -1354,6 +1354,13 @@ pub enum SqlSurfaceError {
     /// PL/pgSQL のスカラー関数が `RETURN` に達せず終わりに到達（`2F005`。Issue #2225・SQL-68）。
     /// 固定文言のみ。
     FunctionExecutedNoReturnStatement,
+    /// PL/pgSQL の `RAISE EXCEPTION`（既定 `P0001`。Issue #2227・SQL-70）。利用者指定の
+    /// SQLSTATE・文言・DETAIL・HINT・文脈は [`crate::notice::RaisedError`] が持つ。`wire_code()` は
+    /// 常に静的な `P0001`（`ErrorClass::RaisedException`）で、利用者の SQLSTATE は
+    /// [`SqlSurfaceError::raised`] から wire 層が取り出して `C` に出す。`Internal`／
+    /// `SerializationFailure` を包まないため `SessionTransaction::is_unrecoverable_error` の
+    /// 判定は変わらない。
+    RaisedException(Box<crate::notice::RaisedError>),
     /// 実行中の文を協調的に打ち切った（Issue #1798。ERR-6: `57014`）。`crate::interrupt`
     /// の確認点が返し、commit 前の `Err` としてのみ起きる。文言は理由ごとの固定文言のみで、
     /// 件数・テナント情報は含めない（Issue #1951 で statement timeout 用の文言を追加）。
@@ -1551,6 +1558,24 @@ impl SqlSurfaceError {
                 using_expression,
             },
             other => other,
+        }
+    }
+
+    /// `RAISE EXCEPTION` 由来なら利用者指定の内容（SQLSTATE・DETAIL・HINT・文脈）を返す
+    /// （Issue #2227・SQL-70）。wire 層が `C`／`D`／`H`／`W` を組み立てる入口。
+    pub fn raised(&self) -> Option<&crate::notice::RaisedError> {
+        match self {
+            SqlSurfaceError::RaisedException(r) => Some(r),
+            _ => None,
+        }
+    }
+
+    /// 例外条件の照合・利用者への SQLSTATE 表示に使う実効 SQLSTATE（`RAISE` なら利用者指定、
+    /// それ以外は `wire_code()`）。
+    pub fn effective_sqlstate(&self) -> &str {
+        match self.raised() {
+            Some(r) => r.sqlstate(),
+            None => self.wire_code(),
         }
     }
 
@@ -2089,6 +2114,7 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::FunctionExecutedNoReturnStatement => {
                 ErrorClass::FunctionExecutedNoReturnStatement
             }
+            SqlSurfaceError::RaisedException(_) => ErrorClass::RaisedException,
             SqlSurfaceError::QueryCanceled { .. } => ErrorClass::QueryCanceled,
             SqlSurfaceError::DependentObjectsStillExist { .. } => {
                 ErrorClass::DependentObjectsStillExist
@@ -2463,6 +2489,8 @@ impl std::fmt::Display for SqlSurfaceError {
             SqlSurfaceError::FunctionExecutedNoReturnStatement => {
                 write!(f, "control reached end of function without RETURN")
             }
+            // 利用者が `RAISE` で指定した文言（生成時に NUL 除去・切り詰め済み）。
+            SqlSurfaceError::RaisedException(r) => write!(f, "{}", r.message()),
             // PostgreSQL と同じ固定文言。期限超過のみ専用文言で、切断・取り消しは従来のまま。
             SqlSurfaceError::QueryCanceled {
                 reason: crate::interrupt::InterruptReason::StatementTimeout,
@@ -3317,6 +3345,15 @@ pub enum Statement {
     },
     /// `SHOW row_security`（RLS-13・Issue #2278）。列名 `row_security` の text 1 行（`on`／`off`）。
     ShowRowSecurity,
+    /// `SET [SESSION] statement_timeout {TO|=} <ms|'<n>[unit]'|DEFAULT>`／`RESET statement_timeout`
+    /// （SQL-71・Issue #1954）。値は構文段で範囲検証済み（不正値は `22023`）。`reset` は `RESET` 由来か。
+    /// **#1954 で追加した破壊的変更（BREAKING CHANGE）**: variant 追加。
+    SetStatementTimeout {
+        value: StatementTimeoutSetting,
+        reset: bool,
+    },
+    /// `SHOW statement_timeout`（SQL-71・Issue #1954）。列名 `statement_timeout` の text 1 行。
+    ShowStatementTimeout,
     /// `CREATE FUNCTION <name>(<param>[, <param>...]) AS <expr>`（TASK-79・SQL-9）。
     /// カタログ照会を必要としない（セッションのみに影響するため FROM テーブルの
     /// 存在確認は行わない）。パラメータ名重複・登録済み名との衝突・列参照の禁止
@@ -19084,6 +19121,8 @@ pub(crate) fn require_row_query_statement(
         | Statement::ShowSearchPath
         | Statement::SetRowSecurity { .. }
         | Statement::ShowRowSecurity
+        | Statement::SetStatementTimeout { .. }
+        | Statement::ShowStatementTimeout
         | Statement::CreateFunction { .. } => Err(SqlSurfaceError::unsupported(format!(
             "{what} requires a SELECT query"
         ))),
@@ -23798,6 +23837,84 @@ pub fn parse_row_security_bool(text: &str) -> Option<bool> {
     }
 }
 
+/// `SET statement_timeout` の値（SQL-71・Issue #1954）。`Default` は reset 値（起動時 CLI 既定、無ければ 0）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatementTimeoutSetting {
+    Millis(u32),
+    Default,
+}
+
+/// 文が `SHOW statement_timeout`（末尾 `;` 可）か。厳密一致のみ真。
+pub(crate) fn is_show_statement_timeout(tokens: &[Token]) -> bool {
+    let mut p = Parser::new(tokens);
+    p.expect_ident_matching("SHOW").is_ok()
+        && p.expect_ident_matching("statement_timeout").is_ok()
+        && p.expect_end_of_statement().is_ok()
+}
+
+/// 文が `SET [SESSION|LOCAL] statement_timeout ...` の頭か。`SET LOCAL` も真にして
+/// [`parse_set_statement_timeout`] が `0A000` で拒否する。TimeZone 系の頭判定より前に評価する。
+fn is_set_statement_timeout_head(tokens: &[Token]) -> bool {
+    let name_at = |i: usize| matches!(tokens.get(i), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("statement_timeout"));
+    let modifier_at_1 = matches!(tokens.get(1), Some(Token::Ident(w))
+        if w.eq_ignore_ascii_case("SESSION") || w.eq_ignore_ascii_case("LOCAL"));
+    name_at(1) || (modifier_at_1 && name_at(2))
+}
+
+/// `SET [SESSION] statement_timeout {TO|=} {<整数>|'<整数>[<単位>]'|DEFAULT}`（SQL-71・Issue #1954）。
+/// `SET LOCAL` は `0A000`、範囲外・不正値は `22023`（入力値を応答に含めない）、値の欠落は `42601`。
+fn parse_set_statement_timeout(
+    tokens: &[Token],
+) -> Result<StatementTimeoutSetting, SqlSurfaceError> {
+    let invalid = || SqlSurfaceError::InvalidParameterValue {
+        detail: crate::interrupt::INVALID_STATEMENT_TIMEOUT_DETAIL,
+    };
+    let mut p = Parser::new(tokens);
+    p.expect_ident_matching("SET")?;
+    if p.peek_ident_matches("LOCAL") {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "SET LOCAL is not supported".to_string(),
+        });
+    }
+    if p.peek_ident_matches("SESSION") {
+        p.advance();
+    }
+    p.expect_ident_matching("statement_timeout")?;
+    if p.peek_ident_matches("TO") {
+        p.advance();
+    } else {
+        p.expect_punct('=')?;
+    }
+    let to_millis = |text: &str| -> Result<StatementTimeoutSetting, SqlSurfaceError> {
+        let ms = crate::interrupt::parse_statement_timeout_text(text).ok_or_else(invalid)?;
+        crate::interrupt::validate_statement_timeout_ms(ms).map_err(|_| invalid())?;
+        let ms = u32::try_from(ms).map_err(|_| invalid())?;
+        Ok(StatementTimeoutSetting::Millis(ms))
+    };
+    let value = match p.advance() {
+        Some(Token::Ident(w)) if w.eq_ignore_ascii_case("DEFAULT") => {
+            StatementTimeoutSetting::Default
+        }
+        Some(Token::StringLiteral(w)) | Some(Token::Number(w)) => to_millis(w)?,
+        Some(_) => return Err(invalid()),
+        None => {
+            return Err(SqlSurfaceError::unsupported(
+                "expected statement_timeout value".to_string(),
+            ))
+        }
+    };
+    p.expect_end_of_statement()?;
+    Ok(value)
+}
+
+/// 文が `RESET statement_timeout`（末尾 `;` 可）か。
+fn is_reset_statement_timeout(tokens: &[Token]) -> bool {
+    let mut p = Parser::new(tokens);
+    p.expect_ident_matching("RESET").is_ok()
+        && p.expect_ident_matching("statement_timeout").is_ok()
+        && p.expect_end_of_statement().is_ok()
+}
+
 /// 文が `SHOW row_security`（末尾 `;` 可）か。厳密一致のみ真。
 pub(crate) fn is_show_row_security(tokens: &[Token]) -> bool {
     let mut p = Parser::new(tokens);
@@ -27279,6 +27396,18 @@ fn validate_sql_tokens_impl(
             value: RowSecuritySetting::Default,
             reset: true,
         }),
+        // SQL-71・Issue #1954: `statement_timeout` も TimeZone 系より先に判定する（同じ理由）。
+        _ if is_set_statement && is_set_statement_timeout_head(tokens) => {
+            let value = parse_set_statement_timeout(tokens)?;
+            Ok(Statement::SetStatementTimeout {
+                value,
+                reset: false,
+            })
+        }
+        _ if is_reset_statement_timeout(tokens) => Ok(Statement::SetStatementTimeout {
+            value: StatementTimeoutSetting::Default,
+            reset: true,
+        }),
         _ if is_set_statement && is_set_search_path_head(tokens) => {
             let value = parse_set_search_path(tokens)?;
             Ok(Statement::SetSearchPath {
@@ -27375,6 +27504,8 @@ fn validate_sql_tokens_impl(
                 | Statement::ShowSearchPath
                 | Statement::SetRowSecurity { .. }
                 | Statement::ShowRowSecurity
+                | Statement::SetStatementTimeout { .. }
+                | Statement::ShowStatementTimeout
                 | Statement::CreateFunction { .. }
                 | Statement::Explain(_)
                 // Issue #929（SQL-29 (c)）: `validate_select_statement` は集合演算
@@ -27693,10 +27824,14 @@ pub fn validate_statement(
         Statement::SetSearchMode { .. }
         | Statement::SetTimeZone { .. }
         | Statement::SetSearchPath { .. }
-        | Statement::SetRowSecurity { .. } => Err(SqlSurfaceError::unsupported(
+        | Statement::SetRowSecurity { .. }
+        | Statement::SetStatementTimeout { .. } => Err(SqlSurfaceError::unsupported(
             "SET is not a query statement (use a session-aware entry point)",
         )),
-        Statement::ShowTimeZone | Statement::ShowSearchPath | Statement::ShowRowSecurity => Err(SqlSurfaceError::unsupported(
+        Statement::ShowTimeZone
+        | Statement::ShowSearchPath
+        | Statement::ShowRowSecurity
+        | Statement::ShowStatementTimeout => Err(SqlSurfaceError::unsupported(
             "SHOW is not a query statement (use a session-aware entry point)",
         )),
         Statement::CreateFunction { .. } => Err(SqlSurfaceError::unsupported(

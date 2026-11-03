@@ -13,6 +13,15 @@
 # TABLE-10 を参照）。Makefile の crash-test-cross-table ターゲット・CI の
 # crash-test-cross-table ジョブから呼ばれる。
 #
+# Issue #2415: 同じ骨格を txn モード（SQL 明示トランザクションで 3 表をまたぐ複数文。
+# SQL-31・TABLE-10）でも実行する（既存ジョブ内。必須チェック名は不変）。
+#
+# Issue #2416: txn モードでは write.log の最後の行（IN_TXN / COMMITTED）から kill が Tx の
+# 途中に当たったかを分類し、ack を超える幽霊コミットの上限検査を足す。txn 段全体で 1 度も
+# 「Tx の途中」を観測しなければ失敗にする（空虚な成功の拒否）。判定単位をセットごとにしない
+# のは遅い runner での不安定化を避けるため（アサーションの弱体化ではない）。実行中・COMMIT
+# 直前・直後の 3 点は scripts/crash_test_txn_kill_points.sh がセットごとに決定的に検証する。
+#
 # 使い方: scripts/crash_test_cross_table.sh [セット数（既定 2）] [反復回数（既定 10）]
 
 set -u
@@ -50,144 +59,187 @@ fi
 # 開始同期をここで取る（コールド runner での初回コミット遅延を見込んだ余裕）。
 WRITE_START_TIMEOUT_TENTHS=300
 
-total_iterations=$((SETS * ITERATIONS))
-completed=0
+# 1 モード分（セット × 反復）を実行する。mode は batch（storage API 直叩き）または txn
+# （SQL 明示トランザクション。Issue #2415）。検査ロジックは両モード共通。
+run_mode() {
+  local mode="$1"
+  for set_no in $(seq 1 "${SETS}"); do
+    echo "### mode ${mode} set ${set_no}/${SETS} ==="
 
-for set_no in $(seq 1 "${SETS}"); do
-  echo "### set ${set_no}/${SETS} ==="
+    WORKDIR="$(mktemp -d)"
+    # セットごとに新規 DB を作り直す（TASK-90 の受け入れ条件）。set のトラップは
+    # このセットのループを抜けるたびに実行され、次セットの WORKDIR 再代入前に
+    # 前セットの WORKDIR を必ず片付ける。
+    # shellcheck disable=SC2064
+    trap "rm -rf '${WORKDIR}'" EXIT
+    DB_PATH="${WORKDIR}/crash_test_cross_table_${mode}.redb"
+    WRITE_LOG="${WORKDIR}/write.log"
 
-  WORKDIR="$(mktemp -d)"
-  # セットごとに新規 DB を作り直す（TASK-90 の受け入れ条件）。set のトラップは
-  # このセットのループを抜けるたびに実行され、次セットの WORKDIR 再代入前に
-  # 前セットの WORKDIR を必ず片付ける。
-  # shellcheck disable=SC2064
-  trap "rm -rf '${WORKDIR}'" EXIT
-  DB_PATH="${WORKDIR}/crash_test_cross_table.redb"
-  WRITE_LOG="${WORKDIR}/write.log"
+    last_rows=0
 
-  last_rows=0
+    for i in $(seq 1 "${ITERATIONS}"); do
+      echo "=== set ${set_no}/${SETS} iteration ${i}/${ITERATIONS} ==="
 
-  for i in $(seq 1 "${ITERATIONS}"); do
-    echo "=== set ${set_no}/${SETS} iteration ${i}/${ITERATIONS} ==="
+      : > "${WRITE_LOG}"
+      "${BIN}" write "${DB_PATH}" "${mode}" >>"${WRITE_LOG}" 2>&1 &
+      writer_pid=$!
 
-    : > "${WRITE_LOG}"
-    "${BIN}" write "${DB_PATH}" >>"${WRITE_LOG}" 2>&1 &
-    writer_pid=$!
+      # 書き込みが実際に進み始めるまでポーリングする（タイムアウト付き。fail-closed）。
+      waited=0
+      started=false
+      while [ "${waited}" -lt "${WRITE_START_TIMEOUT_TENTHS}" ]; do
+        if grep -q "^COMMITTED " "${WRITE_LOG}" 2>/dev/null; then
+          started=true
+          break
+        fi
+        if ! kill -0 "${writer_pid}" 2>/dev/null; then
+          # writer が同期点に到達する前に終了した（起動失敗など）。
+          break
+        fi
+        sleep 0.1
+        waited=$((waited + 1))
+      done
 
-    # 書き込みが実際に進み始めるまでポーリングする（タイムアウト付き。fail-closed）。
-    waited=0
-    started=false
-    while [ "${waited}" -lt "${WRITE_START_TIMEOUT_TENTHS}" ]; do
-      if grep -q "^COMMITTED " "${WRITE_LOG}" 2>/dev/null; then
-        started=true
-        break
-      fi
-      if ! kill -0 "${writer_pid}" 2>/dev/null; then
-        # writer が同期点に到達する前に終了した（起動失敗など）。
-        break
-      fi
-      sleep 0.1
-      waited=$((waited + 1))
-    done
-
-    if [ "${started}" != "true" ]; then
-      timeout_ms=$((WRITE_START_TIMEOUT_TENTHS * 100))
-      echo "ERROR: writer did not report progress within ${timeout_ms}ms (set ${set_no} iteration ${i})" >&2
-      kill -9 "${writer_pid}" 2>/dev/null
-      wait "${writer_pid}" 2>/dev/null
-      rm -rf "${WORKDIR}"
-      trap - EXIT
-      exit 1
-    fi
-
-    # コミット中に kill が当たる確率を上げるための短いランダム待機（10〜300ms）。
-    wait_ms=$((10 + RANDOM % 291))
-    sleep "0.$(printf '%03d' "${wait_ms}")"
-
-    if ! kill -9 "${writer_pid}" 2>/dev/null; then
-      echo "ERROR: kill -9 failed for writer pid ${writer_pid} at set ${set_no} iteration ${i} (writer may have already exited on its own); this iteration cannot verify SIGKILL crash resilience" >&2
-      cat "${WRITE_LOG}" >&2
-      rm -rf "${WORKDIR}"
-      trap - EXIT
-      exit 1
-    fi
-
-    wait "${writer_pid}" 2>/dev/null
-    writer_status=$?
-    # `wait` は SIGKILL で終了したプロセスに対して 128+9=137 を返す。それ以外は
-    # SIGKILL を検証できていない反復であり、テストの目的を満たさないため拒否する。
-    if [ "${writer_status}" -ne 137 ]; then
-      echo "ERROR: writer pid ${writer_pid} did not terminate via SIGKILL at set ${set_no} iteration ${i} (wait exit status=${writer_status}, expected 137)" >&2
-      cat "${WRITE_LOG}" >&2
-      rm -rf "${WORKDIR}"
-      trap - EXIT
-      exit 1
-    fi
-
-    verify_output="$("${BIN}" verify "${DB_PATH}")"
-    echo "${verify_output}"
-
-    if [[ "${verify_output}" != RESULT\ ok=true* ]]; then
-      echo "ERROR: verify failed at set ${set_no} iteration ${i}: ${verify_output}" >&2
-      rm -rf "${WORKDIR}"
-      trap - EXIT
-      exit 1
-    fi
-
-    rows="$(echo "${verify_output}" | sed -n 's/.*rows=\([0-9]*\).*/\1/p')"
-    if ! [[ "${rows}" =~ ^[0-9]+$ ]]; then
-      echo "ERROR: could not parse row count from verify output: ${verify_output}" >&2
-      rm -rf "${WORKDIR}"
-      trap - EXIT
-      exit 1
-    fi
-
-    # write.log の最後に完全に書き切られた `COMMITTED batch=<seq> rows=<total>` 行から
-    # 「kill 前に確認済みだった行数（acked）」を取り出す。`$` でパターンを終端に固定
-    # しているため、kill が出力の途中で当たって行が切れた場合はマッチせず 1 つ前の
-    # 完全な行が採用される（acked は実際より小さくなることはあっても大きくならない
-    # ＝false-fail しない）。
-    acked="$(grep -o '^COMMITTED batch=[0-9]* rows=[0-9]*$' "${WRITE_LOG}" | tail -1 | sed -n 's/.*rows=\([0-9]*\)$/\1/p')"
-    if [ -n "${acked}" ]; then
-      # 「started」で確認した COMMITTED はコミット成功後にのみ出力されるため、
-      # 再オープン後の rows はその時点で確認済みだった acked 行数を下回ってはならない
-      # （下回れば、確認済みのはずのコミットが失われたことになる＝data loss）。
-      if [ "${rows}" -lt "${acked}" ]; then
-        echo "ERROR: row count ${rows} is below the last acknowledged commit (rows=${acked} from write.log), data loss suspected (set ${set_no} iteration ${i})" >&2
+      if [ "${started}" != "true" ]; then
+        timeout_ms=$((WRITE_START_TIMEOUT_TENTHS * 100))
+        echo "ERROR: writer did not report progress within ${timeout_ms}ms (set ${set_no} iteration ${i})" >&2
+        kill -9 "${writer_pid}" 2>/dev/null
+        wait "${writer_pid}" 2>/dev/null
         rm -rf "${WORKDIR}"
         trap - EXIT
         exit 1
       fi
-    fi
 
-    # "started" が true な時点で write は kill 前に少なくとも 1 回 COMMITTED を
-    # 出力済み（＝1 バッチのコミットが実際に成功した後にのみ出力される同期点を通過済み）
-    # なので、rows は必ず last_rows より真に増えているはずである。
-    if [ "${rows}" -le "${last_rows}" ]; then
-      echo "ERROR: row count did not increase across restarts (${last_rows} -> ${rows}) despite a committed batch, data loss suspected (set ${set_no} iteration ${i})" >&2
+      # コミット中に kill が当たる確率を上げるための短いランダム待機（10〜300ms）。
+      wait_ms=$((10 + RANDOM % 291))
+      sleep "0.$(printf '%03d' "${wait_ms}")"
+
+      if ! kill -9 "${writer_pid}" 2>/dev/null; then
+        echo "ERROR: kill -9 failed for writer pid ${writer_pid} at set ${set_no} iteration ${i} (writer may have already exited on its own); this iteration cannot verify SIGKILL crash resilience" >&2
+        cat "${WRITE_LOG}" >&2
+        rm -rf "${WORKDIR}"
+        trap - EXIT
+        exit 1
+      fi
+
+      wait "${writer_pid}" 2>/dev/null
+      writer_status=$?
+      # `wait` は SIGKILL で終了したプロセスに対して 128+9=137 を返す。それ以外は
+      # SIGKILL を検証できていない反復であり、テストの目的を満たさないため拒否する。
+      if [ "${writer_status}" -ne 137 ]; then
+        echo "ERROR: writer pid ${writer_pid} did not terminate via SIGKILL at set ${set_no} iteration ${i} (wait exit status=${writer_status}, expected 137)" >&2
+        cat "${WRITE_LOG}" >&2
+        rm -rf "${WORKDIR}"
+        trap - EXIT
+        exit 1
+      fi
+
+      verify_output="$("${BIN}" verify "${DB_PATH}" "${mode}")"
+      echo "${verify_output}"
+
+      if [[ "${verify_output}" != RESULT\ ok=true* ]]; then
+        echo "ERROR: verify failed at set ${set_no} iteration ${i}: ${verify_output}" >&2
+        rm -rf "${WORKDIR}"
+        trap - EXIT
+        exit 1
+      fi
+
+      rows="$(echo "${verify_output}" | sed -n 's/.*rows=\([0-9]*\).*/\1/p')"
+      if ! [[ "${rows}" =~ ^[0-9]+$ ]]; then
+        echo "ERROR: could not parse row count from verify output: ${verify_output}" >&2
+        rm -rf "${WORKDIR}"
+        trap - EXIT
+        exit 1
+      fi
+
+      # write.log の最後に完全に書き切られた `COMMITTED batch=<seq> rows=<total>` 行から
+      # 「kill 前に確認済みだった行数（acked）」を取り出す。`$` でパターンを終端に固定
+      # しているため、kill が出力の途中で当たって行が切れた場合はマッチせず 1 つ前の
+      # 完全な行が採用される（acked は実際より小さくなることはあっても大きくならない
+      # ＝false-fail しない）。
+      acked="$(grep -o '^COMMITTED batch=[0-9]* rows=[0-9]*$' "${WRITE_LOG}" | tail -1 | sed -n 's/.*rows=\([0-9]*\)$/\1/p')"
+      if [ -n "${acked}" ]; then
+        # 「started」で確認した COMMITTED はコミット成功後にのみ出力されるため、
+        # 再オープン後の rows はその時点で確認済みだった acked 行数を下回ってはならない
+        # （下回れば、確認済みのはずのコミットが失われたことになる＝data loss）。
+        if [ "${rows}" -lt "${acked}" ]; then
+          echo "ERROR: row count ${rows} is below the last acknowledged commit (rows=${acked} from write.log), data loss suspected (set ${set_no} iteration ${i})" >&2
+          rm -rf "${WORKDIR}"
+          trap - EXIT
+          exit 1
+        fi
+      fi
+
+      # "started" が true な時点で write は kill 前に少なくとも 1 回 COMMITTED を
+      # 出力済み（＝1 バッチのコミットが実際に成功した後にのみ出力される同期点を通過済み）
+      # なので、rows は必ず last_rows より真に増えているはずである。
+      if [ "${rows}" -le "${last_rows}" ]; then
+        echo "ERROR: row count did not increase across restarts (${last_rows} -> ${rows}) despite a committed batch, data loss suspected (set ${set_no} iteration ${i})" >&2
+        rm -rf "${WORKDIR}"
+        trap - EXIT
+        exit 1
+      fi
+      if [ "${mode}" = "txn" ]; then
+        # 書き切られた最後の進行行で kill 位置を分類する。TXN_BATCH（道具側）= 4 と対応。
+        last_line="$(grep -E '^(IN_TXN batch=[0-9]+|COMMITTED batch=[0-9]+ rows=[0-9]+)$' "${WRITE_LOG}" | tail -1)"
+        acked_n="${acked:-0}"
+        max_rows=$((acked_n + 4))
+        if [ "${rows}" -gt "${max_rows}" ]; then
+          echo "ERROR: row count ${rows} exceeds acked ${acked_n} + one transaction, phantom commit suspected (set ${set_no} iteration ${i})" >&2
+          rm -rf "${WORKDIR}"
+          trap - EXIT
+          exit 1
+        fi
+        if [[ "${last_line}" == IN_TXN* ]]; then
+          saw_in_flight=true
+        elif [ "${rows}" -ne "${acked_n}" ]; then
+          echo "ERROR: row count ${rows} differs from acked ${acked_n} although no transaction was in flight (set ${set_no} iteration ${i})" >&2
+          rm -rf "${WORKDIR}"
+          trap - EXIT
+          exit 1
+        fi
+      fi
+      last_rows="${rows}"
+      completed=$((completed + 1))
+    done
+
+    # 空虚な成功（DB 未作成・0 行のまま検証をすり抜ける）を拒否する。
+    if [ "${last_rows}" -le 0 ]; then
+      echo "ERROR: final row count for set ${set_no} is not positive (${last_rows})" >&2
       rm -rf "${WORKDIR}"
       trap - EXIT
       exit 1
     fi
-    last_rows="${rows}"
-    completed=$((completed + 1))
-  done
 
-  # 空虚な成功（DB 未作成・0 行のまま検証をすり抜ける）を拒否する。
-  if [ "${last_rows}" -le 0 ]; then
-    echo "ERROR: final row count for set ${set_no} is not positive (${last_rows})" >&2
     rm -rf "${WORKDIR}"
     trap - EXIT
-    exit 1
-  fi
+  done
+}
 
-  rm -rf "${WORKDIR}"
-  trap - EXIT
-done
-
-if [ "${completed}" -ne "${total_iterations}" ]; then
-  echo "ERROR: completed ${completed} iterations, expected ${total_iterations}" >&2
+# txn モードの検査オラクルが空振りしないこと（部分コミット・空 DB を検出できること）を先に確かめる。
+SELF_CHECK_DIR="$(mktemp -d)"
+if ! "${BIN}" self-check "${SELF_CHECK_DIR}" txn; then
+  echo "ERROR: txn mode self-check failed" >&2
+  rm -rf "${SELF_CHECK_DIR}"
   exit 1
 fi
+rm -rf "${SELF_CHECK_DIR}"
 
-echo "crash_test_cross_table.sh: OK (${SETS} sets x ${ITERATIONS} iterations = ${completed} SIGKILL reps)"
+total_iterations=$((SETS * ITERATIONS))
+total_completed=0
+saw_in_flight=false
+for run_mode_name in batch txn; do
+  completed=0
+  run_mode "${run_mode_name}"
+  if [ "${completed}" -ne "${total_iterations}" ]; then
+    echo "ERROR: mode ${run_mode_name} completed ${completed} iterations, expected ${total_iterations}" >&2
+    exit 1
+  fi
+  total_completed=$((total_completed + completed))
+  if [ "${run_mode_name}" = "txn" ] && [ "${saw_in_flight}" != "true" ]; then
+    echo "ERROR: txn mode never observed an in-flight transaction (SIGKILL always landed outside a transaction)" >&2
+    exit 1
+  fi
+done
+
+echo "crash_test_cross_table.sh: OK (${SETS} sets x ${ITERATIONS} iterations x 2 modes (batch, txn) = ${total_completed} SIGKILL reps)"

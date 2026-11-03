@@ -764,6 +764,11 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
 
 - 予告（#2398）: NoSQL 表層から到達できない分類に `40001` を加える。
 
+- `crates/wire-server/tests/err7_retryable_codes_no_side_effects.rs`（Issue #2421。ERR-7）:
+  明示トランザクションの最初の書き込み文の `55P03`（`'E'`）→ 後続文と `COMMIT` は `25P02`
+  → `ROLLBACK` で `'I'` に戻り、行・台帳に痕跡なし、`BEGIN` からの同一 `operation_id` の
+  全体再試行が 1 回だけ反映されることを固定。
+
 - `crates/engine/tests/sql31_transaction.rs`: BEGIN/INSERT/INSERT/COMMIT の
   可視性・ROLLBACK の完全巻き戻し・入れ子 BEGIN の `25001`・トランザクション外
   COMMIT/ROLLBACK の `25P01`・同一トランザクション内 `operation_id` 再利用の
@@ -1120,3 +1125,32 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
 - **finish**: 同一文の再送は `23505`、巻き戻した内容での再送は `22023`（台帳は commit した内容を保持）。
 - **対象外**: 書き込み後に作った savepoint（`Unrestorable`）、wire-server 経由の試験、
   `WriteDurability::None` 構成。
+
+## PL/pgSQL の内部 savepoint（Issue #2227・SQL-70）
+
+`EXCEPTION` 節つきの PL/pgSQL ブロックは、本体の前に `SessionTransaction::pl_savepoint_push` で内部 savepoint を積み、
+捕捉時に `pl_rollback_to`、全出口で `pl_release` する。利用者の `SAVEPOINT` と同じ `SavepointStack` を使い、
+不変条件 `[Restorable…, Unrestorable…]` を保つ。名前は NUL を含み利用者が書けないため `RELEASE`／`ROLLBACK TO` から
+見えず、文数に計上せず、暗黙 Tx でも積める。巻き戻せない（`Unrestorable`・一時表を使った Tx）ときは捕捉せず `0A000`
+で Tx を失敗させる（`FailedRecoverable` でも内部エントリは `pl_release` で必ず除去する）。詳細は
+[plpgsql-subset.md](plpgsql-subset.md)「Issue #2227 追記」節。書き込み後の `ROLLBACK TO` の対応は #2879。
+
+## 明示トランザクション複数文のクラッシュ耐性（Issue #2415・SQL-31・TABLE-10 ポインタ）
+
+crash 道具 `crates/engine/examples/crash_tool_cross_table.rs` の `txn` モードは、SQL 表層（`execute_sql_in_txn`）だけで 3 表（`xt_ledger`・`xt_items`・`xt_batches`）をまたぐ明示トランザクションを繰り返す。親は TASK-332。
+
+- 1 Tx の文列: `BEGIN` → 条件付き `UPDATE`（`WHERE id = 0 AND applied = <期待値>`）→ `INSERT`（明細を 2 文に分割）→ `INSERT`（バッチ）→ `COMMIT`。
+- writer は `BEGIN` ではなく最初の書き込み文で取得される（Issue #2396）。そのため Tx 内で `SELECT` して条件を決めず、期待値を `UPDATE` の `WHERE` に畳み込み、`BEGIN` 直後の最初の文を書き込み文にする。どの文でも `55P03`・`40001` が起こりうる前提で、失敗時は `ROLLBACK` して `wire_code` だけを報告する。
+- `verify`: 台帳の適用数 S に対し、バッチ表が 0..S の連番・明細表が 0..S×4 の連番かつ導出 payload と一致、表間の件数一致、S が 0 なら失敗、別テナントから 0 行であること。1 表だけ進んだ／戻った状態（部分コミット）は失敗になる。
+- `self-check txn`: 完全な Tx は ok、台帳・明細・バッチのどれか 1 つだけ進めた DB と空 DB は ng になることを確かめ、オラクルの空振りを防ぐ。
+- `scripts/crash_test_cross_table.sh` が既存の `crash-test-cross-table` ジョブ内で batch・txn の 2 段を同じ検査（SIGKILL の終了コード 137・acked 下限・行数の単調増加）で実行する。
+- 申し送り: kill 位置の制御と中断未観測の検査は #2416 で実装済み（次節）。DDL は #2417（道具）・#2418（kill 位置の分類）で実装済み。
+
+## 明示トランザクションの kill 位置制御（Issue #2416・PERSIST-1・SQL-31・TABLE-10 ポインタ）
+
+- 道具は 1 Tx の文列を `run_one_txn` に共通化し、観測点 4 種（台帳 `UPDATE` 直後・明細前半 `INSERT` 直後・バッチ `INSERT` 直後で `COMMIT` 前・`COMMIT` が `Ok` を返した直後）を通知する。ランダム kill 用の `write ... txn` と決定的 kill 用の `write-pause` が同じ Tx 本体を使う。
+- 出力プロトコル: `write ... txn` は台帳 `UPDATE` 直後に `IN_TXN batch=<k>`、`COMMIT` 成功後に `COMMITTED batch=<k> rows=<n>` を出す。`write-pause <db> <in-txn|before-commit|after-commit> <warmup>` は `warmup` 件をコミットしたのち、指定点で `PAUSED point=<p> batch=<k> expect_rows=<n> expect_batches=<m>` を出して停止する（上限 60 秒。SIGKILL が来なければ非 0 終了）。
+- 期待値: 途中・COMMIT 直前の kill では当該 Tx は何も残らず、COMMIT 直後の kill では全部残る。`COMMIT` は redb の Immediate commit を同期的に行い、ack 前でも `Ok` 返却後は永続済みのため、直後は完全一致で検証できる。
+- `scripts/crash_test_txn_kill_points.sh`（`make crash-test-txn-kill-points`）が 3 点をセットごとに実行し、PAUSED が最後の進行行であること・終了コード 137・verify の `rows`／`batches` が期待値と完全一致することを確かめる。観測できなかった点があれば失敗にする。
+- ランダム段（`crash_test_cross_table.sh` の txn 段）は最後の進行行で kill 位置を分類し、`rows <= acked + 4` の上限検査を足し、txn 段全体で `IN_TXN` を 1 度も観測しなければ失敗にする。判定を段全体にするのは遅い runner での不安定化を避けるため（3 点の網羅は決定的段が担う）。
+- 実行場所: 既存の `crash-test-cross-table` ジョブの step（必須チェック名は不変）。DDL の道具は #2417、kill 位置の分類は #2418、DDL エラー・`55P03` は #2419。

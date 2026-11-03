@@ -160,6 +160,8 @@ fn classify_statement(s: &Statement) -> ReadRequirement {
         | Statement::ShowSearchPath
         | Statement::SetRowSecurity { .. }
         | Statement::ShowRowSecurity
+        | Statement::SetStatementTimeout { .. }
+        | Statement::ShowStatementTimeout
         | Statement::CreateFunction { .. } => ReadRequirement::NotApplicable,
     }
 }

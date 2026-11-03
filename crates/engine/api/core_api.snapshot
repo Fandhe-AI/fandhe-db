@@ -32,6 +32,7 @@ pub mod json;
 pub mod jsonpath_limits;
 pub mod kernel;
 pub mod nesting_limits;
+pub mod notice;
 pub mod numeric;
 pub mod parallel_search;
 pub mod plpgsql_limits;

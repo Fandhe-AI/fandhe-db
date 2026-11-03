@@ -2021,6 +2021,11 @@ fn run_authenticated_session<S: WireStream>(
             }
         }
     }
+    // SQL-71・Issue #1954: 起動時 CLI の `statement_timeout` 既定値を認証成功後に 1 回だけ取り込む
+    // （現在値と reset 値の両方。StartupMessage の `statement_timeout` は従来どおり読み捨てる）。
+    if let Some(engine) = engine {
+        session.apply_default_statement_timeout(engine.default_statement_timeout());
+    }
     // SQL-66・Issue #1921: 認証済みテナントの UDF カタログをセッションへロードする（別接続で作った関数・
     // 再起動前に作った関数を呼べるようにする）。カタログ全体が読めなければ fail-closed で接続を拒否する:
     // AuthenticationOk の後に FATAL `XX000`（固定文言。tenant・内部キー・本体を含めない）を返して切断し、

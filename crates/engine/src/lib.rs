@@ -262,6 +262,7 @@ pub mod jsonpath_limits;
 pub mod kernel;
 pub(crate) mod key_index;
 pub mod nesting_limits;
+pub mod notice;
 pub mod numeric;
 pub mod parallel_search;
 // PL/pgSQL の構文解析器（Issue #2224・SQL-68）。結線（`LANGUAGE plpgsql` の受理・実行器）は
