@@ -138,7 +138,7 @@ pub fn vector_literal(values: &[f32]) -> Result<VectorLiteral, SqlC1Error> {
 }
 
 /// SQL-1（純粋 Top-k）の規範形クエリ文字列を組み立てる: `SELECT id FROM <table>
-/// ORDER BY <column> <=> '<literal>' LIMIT <k>`。
+/// ORDER BY <column> <#> '<literal>' LIMIT <k>`。
 ///
 /// `table`・`column` は識別子検証を経てから埋め込む（呼び出し元がすべて定数を
 /// 渡す構成であっても、未検証文字列連結の経路をコード上に残さないため）。
@@ -158,7 +158,7 @@ pub fn c1_statement(
         return Err(SqlC1Error::InvalidIdentifier("column"));
     }
     Ok(format!(
-        "SELECT id FROM {table} ORDER BY {column} <=> '{literal}' LIMIT {k}"
+        "SELECT id FROM {table} ORDER BY {column} <#> '{literal}' LIMIT {k}"
     ))
 }
 
@@ -171,7 +171,7 @@ fn is_valid_filter_token(token: &str) -> bool {
 }
 
 /// SCALAR 事前フィルタ付き DISTANCE の規範形クエリ文字列を組み立てる: `SELECT id
-/// FROM <table> WHERE <filter_column> = '<filter_token>' ORDER BY <column> <=>
+/// FROM <table> WHERE <filter_column> = '<filter_token>' ORDER BY <column> <#>
 /// '<literal>' LIMIT <k>`（Issue #487。可視比率 × 行数スイープが
 /// `sql::hnsw_cache::search_with_overlay`（`Subset` 形状）を発火させるために使う）。
 ///
@@ -201,7 +201,7 @@ pub fn c1_where_statement(
         return Err(SqlC1Error::InvalidIdentifier("filter_token"));
     }
     Ok(format!(
-        "SELECT id FROM {table} WHERE {filter_column} = '{filter_token}' ORDER BY {column} <=> '{literal}' LIMIT {k}"
+        "SELECT id FROM {table} WHERE {filter_column} = '{filter_token}' ORDER BY {column} <#> '{literal}' LIMIT {k}"
     ))
 }
 

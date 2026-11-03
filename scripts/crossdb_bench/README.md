@@ -443,8 +443,8 @@ tenant-a=public・tenant-b=private が連続した区間にまとまっている
 - **fsync 等の永続化設定は未変更**: 公平性のためではなく、単に「素の Docker
   イメージ・デフォルト設定」を比較対象にする方針のため。本番運用のチューニング
   差は本ベンチの対象外。
-- **距離指標**: 自作 DB の `<=>` は内積（`crates/engine/src/kernel.rs`
-  「スコアは内積」参照）。pgvector は `<#>`（負の内積）、Qdrant は
+- **距離指標**: 自作 DB・pgvector とも `<#>`（負の内積。SQL-33 のポインタ。
+  `crates/engine/src/kernel.rs`「スコアは内積」参照）、Qdrant は
   `Distance.DOT`、LanceDB は `metric="dot"` に揃えている。sqlite-vec の
   vec0 は内積相当の `distance_metric` を持たない（実機確認: `l2`/`l1`/`cosine`
   のみ受理）ため、コサイン距離で近似し `meta` に注記する。

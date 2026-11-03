@@ -5,7 +5,7 @@
 依存追加なし: Python 標準ライブラリの `http.client`（keep-alive の 1 TCP
 接続を使い回す）・`json` のみで REST API を叩く。
 
-自作 DB の `<=>` が内積（`crates/engine/src/kernel.rs` 参照。値が大きいほど
+自作 DB の `<#>`（負の内積。`crates/engine/src/kernel.rs` 参照。値が大きいほど
 上位）であるため、`dense_vector` フィールドは `similarity: dot_product`
 （フィクスチャの embedding は単位ノルムのため要件を満たす）で作る。RLS 相当は、
 自作 DB の現行契約（実機確認: どのテナントの wire セッションからも

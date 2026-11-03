@@ -1574,3 +1574,17 @@ Issue #1405（fix(engine)!: CREATE TYPE の型名の重複を 42710 で返す。
 **Issue #1976（feat(engine): lexer に距離演算子 `<->` `<#>` `<+>` を追加し DistanceOp を種別付きにする。SQL-33 ポインタ）**: `Token::DistanceOp` が `DistanceKind`（`Cosine`・`L2`・`NegativeInnerProduct`・`L1`）を持ち、lexer は 3 つの新演算子を最長一致で 1 トークンに字句化する（3 文字目が `>` でない `<-1`・`<--`・`<#-`・`<+` は従来どおり）。構文段の受理点（allowlist の ORDER BY・params のベクトル位置）は `Cosine` のみに一致させ、新演算子は従来どおり `42601`（受理範囲の拡張は Issue #1977）。content_hash のタグは `<=>` を 24 のまま不変とし、新種別に 34〜36 を割り当てた。
 
 **Issue #1986（docs(design): コサイン距離の実装方式を比較し ADR に記録する。SQL-33・TASK-237／238 ポインタ。詳細は [cosine-distance-method.md](cosine-distance-method.md)）**: 正規化帰着（A）・保存時正規化（B／B′）・ノルム併用（C1：1 パス融合、C2：arena 常駐の行ノルム²）を、精度・メモリ・書き込みコスト・検索コストで比較した。実 pgvector 0.8.7 との照合で、A は未正規化入力で値が一致せず不採用、C1／C2 は最大差 3.8e-8（ほぼ重複行で 1.9e-7）。推奨は C2（追加 4 B/行・永続形式は不変）で、ステータスは Proposed（オーナー確認待ち）。計測は `crates/engine/benches/cosine_method_bench.rs`（`make bench-cosine-method`。手動専用・CI 非配線）。production のカーネルは変更しない（#1987 が実装）。
+
+## Issue #1994: crossdb ベンチハーネスと bench／examples を `<#>` へ統一
+
+親 #1989（SQL-33 のポインタ）で `<=>` がコサイン距離へ変わるのに備え、自作 DB 側の
+ハーネス・bench・example の SQL を `<#>`（負の内積・昇順）へ統一した。pgvector 側と
+同じ演算子・同じ意味（HNSW は `vector_ip_ops`）で比較できる。
+
+- 対象: `scripts/crossdb_bench/`、`crates/engine/benches/`、`crates/engine/examples/feature_bench.rs`、
+  ハーネス出力を検査する engine テスト（`c1_bench_accept`・`hybrid_profile_accept`・`scan_stage_profile_accept`）
+- 変更しない: `cosine_method_bench.rs` の pgvector 向け SQL（既にコサインの意味）
+- 静的検査: `scripts/crossdb_bench/tests/test_distance_operator_parity.py`（手動実行）
+- 未検証: `<#>` の実行は #1977・#1991 のマージ後に確認する。具体的には `c1_bench_accept` の
+  e2e オラクル照合、`scan_stage_profile_accept`、HNSW への到達（`EXPLAIN` の `engine: hnsw`）、
+  `self_db.py` の `explain`・`udf_call` が `unsupported` に丸められていないこと
