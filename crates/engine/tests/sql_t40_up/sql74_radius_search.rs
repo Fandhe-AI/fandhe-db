@@ -390,8 +390,19 @@ fn tenant_boundary_is_preserved() {
         &mut os,
         "INSERT INTO d (id, embedding, n) VALUES (100, '[3,4,0]', 1) USING OPERATION_ID 'o-100'",
     )
-    .ok();
+    .expect("other tenant insert must succeed");
     let sql = "SELECT id FROM d WHERE embedding <-> '[3,4,0]' < 0.5";
+    // 他テナントのコンテキストからは挿入行が距離述語に一致する（前提の成立確認）。
+    match core
+        .execute_sql_in_session(&other, &mut os, sql)
+        .expect("other tenant select")
+    {
+        SqlOutcome::Query(r) => {
+            let got: Vec<u64> = r.rows.iter().map(first_id).collect();
+            assert!(got.contains(&100), "other tenant must match its own row");
+        }
+        _ => panic!("expected Query outcome"),
+    }
     assert_eq!(ids(&core, &mut s, sql), vec![1]);
 }
 
