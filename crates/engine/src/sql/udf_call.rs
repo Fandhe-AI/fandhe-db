@@ -5150,24 +5150,34 @@ fn classify_projection_integer_literal(raw: &str) -> Option<(i64, NumericKind)> 
     (v.unsigned_abs() <= TYPED_INT_EXACT_MAX as u64).then_some((v, kind))
 }
 
-/// 整数モード（[`BindEnv::exact_int`]）の整数リテラル分類。桁のみ（先頭 `-` なし。負数は構文段が
-/// `0 - n` へ脱糖する）で |v| <= 2^63 のものを i128 と最小の整数型（i32 に収まれば `Int4`、そうでなければ
-/// `Int8`）へ分類する。2^63 は `0 - 9223372036854775808` で i64::MIN を作るために許す葉の上限で、
+/// 整数モード（[`BindEnv::exact_int`]）の整数リテラル分類。先頭 `-` 任意＋桁のみで |v| <= 2^63 のものを i128 と最小の整数型
+/// （i32 に収まれば `Int4`、そうでなければ `Int8`）へ分類する。2^63 は `0 - 9223372036854775808` で i64::MIN を作るために許す葉の上限で、
 /// 単独で残る値は呼び出し元が i64 範囲で検査する。範囲外・整数形でない場合は `None`（従来の経路）。
 pub(crate) fn classify_exact_int_literal(raw: &str) -> Option<(i128, NumericKind)> {
-    if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) {
+    // パーサは負の整数リテラルを `Expr::Number("-n")` の 1 ノードへ畳むため、先頭 `-` を受理する
+    // （負側は -2^63 = i64::MIN まで。大きさの上限は正負で同じ 2^63）。
+    let (negative, digits) = match raw.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, raw),
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    let v = raw.parse::<u64>().ok()?;
-    if v > EXACT_INT_LEAF_MAX {
+    let mag = digits.parse::<u64>().ok()?;
+    if mag > EXACT_INT_LEAF_MAX {
         return None;
     }
+    let v = if negative {
+        -i128::from(mag)
+    } else {
+        i128::from(mag)
+    };
     let kind = if i32::try_from(v).is_ok() {
         NumericKind::Int4
     } else {
         NumericKind::Int8
     };
-    Some((i128::from(v), kind))
+    Some((v, kind))
 }
 
 /// 整数モードで葉として許す整数の大きさの上限（2^63）。
@@ -7306,14 +7316,53 @@ pub(super) fn numeric_kind(
     env: &BindEnv<'_>,
 ) -> Option<NumericKind> {
     // Issue #2881: 整数モードの整数リテラルは 2^53 を超えても整数種別（倍精度へ落とさない）。
-    if env.exact_int {
-        if let Expr::Number(raw) = expr {
-            return classify_exact_int_literal(raw).map(|(_, k)| k);
-        }
-    }
-    match projection_kind(expr, bound, env.schema) {
+    let kind = if env.exact_int {
+        exact_mode_kind(expr, bound, env.schema)
+    } else {
+        projection_kind(expr, bound, env.schema)
+    };
+    match kind {
         ProjKind::Num(k) => Some(k),
         ProjKind::Null | ProjKind::Other => None,
+    }
+}
+
+/// 整数モード（[`BindEnv::exact_int`]）の数値種別。整数リテラルは 2^53 を超えても整数種別とし、
+/// `CASE`／`COALESCE` の分岐へも同じ分類を伝播する（投影経路の [`projection_kind`] は
+/// 2^53 超を倍精度へ落とすため、分岐内のリテラルが `Other` になるのを防ぐ。Issue #2881）。
+/// それ以外の形は [`projection_kind`] に委ねる。
+fn exact_mode_kind(expr: &Expr, bound: &BoundExpr, schema: Option<&TableSchema>) -> ProjKind {
+    match (expr, bound) {
+        (Expr::Number(raw), _) => match classify_exact_int_literal(raw) {
+            Some((_, k)) => ProjKind::Num(k),
+            None => ProjKind::Other,
+        },
+        (
+            Expr::Case { whens, else_result },
+            BoundExpr::Case {
+                whens: bound_whens,
+                else_result: bound_else,
+            },
+        ) if whens.len() == bound_whens.len() => {
+            let mut acc = ProjKind::Null;
+            for ((_, r), (_, br)) in whens.iter().zip(bound_whens.iter()) {
+                acc = common_proj_kind(acc, exact_mode_kind(r, br, schema));
+            }
+            if let Some(e) = else_result {
+                acc = common_proj_kind(acc, exact_mode_kind(e, bound_else, schema));
+            }
+            acc
+        }
+        (Expr::Coalesce(args), BoundExpr::Coalesce(bound_args))
+            if args.len() == bound_args.len() =>
+        {
+            let mut acc = ProjKind::Null;
+            for (a, b) in args.iter().zip(bound_args.iter()) {
+                acc = common_proj_kind(acc, exact_mode_kind(a, b, schema));
+            }
+            acc
+        }
+        _ => projection_kind(expr, bound, schema),
     }
 }
 

@@ -360,3 +360,59 @@ fn constant_expressions_beyond_2_53_are_exact() {
         text(2, 1)
     );
 }
+
+/// Issue #2881: 負の整数リテラル（`-n`）と `CASE`／`COALESCE` の分岐内の 2^53 超の整数も整数モードで
+/// 丸めなく評価される。
+#[test]
+fn negative_literals_and_branches_beyond_2_53_are_exact() {
+    let path = unique_db_path("sql45-big-neg");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let mut session = SessionState::default();
+    session.allow_ddl();
+    core.execute_sql_in_session(
+        &ctx(),
+        &mut session,
+        "CREATE TABLE bign (id BIGINT PRIMARY KEY, embedding VECTOR(4), b BIGINT)",
+    )
+    .expect("create table");
+    let put = |id: u32, b: &str| {
+        core.execute_insert_sql(
+            &ctx(),
+            &format!(
+                "INSERT INTO bign (id, embedding, b) VALUES ({id}, {VEC}, {b}) \
+                 USING OPERATION_ID 'opn-{id}'"
+            ),
+        )
+        .map(|_| ())
+        .map_err(|e| e.wire_code().to_string())
+    };
+    put(1, "-9007199254740993 + 1").expect("1");
+    put(2, "-9223372036854775808 + 0").expect("2");
+    put(3, "COALESCE(9007199254740993, 0) - 9007199254740992").expect("3");
+    put(
+        4,
+        "CASE WHEN 1 = 1 THEN 9007199254740993 ELSE 0 END - 9007199254740992",
+    )
+    .expect("4");
+    let rows = select(
+        &core,
+        &mut session,
+        "SELECT id, b FROM bign ORDER BY id LIMIT 10",
+    );
+    assert_eq!(rows.len(), 4);
+    let text = |r: usize| dbg(&rows[r][1]);
+    assert!(text(0).contains("-9007199254740992"), "{}", text(0));
+    assert!(text(1).contains("-9223372036854775808"), "{}", text(1));
+    assert!(
+        text(2).contains('1') && !text(2).contains("90"),
+        "{}",
+        text(2)
+    );
+    assert!(
+        text(3).contains('1') && !text(3).contains("90"),
+        "{}",
+        text(3)
+    );
+}

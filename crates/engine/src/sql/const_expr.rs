@@ -422,19 +422,71 @@ fn pg_float_typed(expr: &Expr) -> bool {
 /// 型付き float 自身の範囲検査は外すが、型なしの小数リテラルを f64 へ丸めて受理しないよう、
 /// 非有限または |v| > 2^53 の小数リテラルは `22003`（fail-closed）。型付き値（`Call`）の内側は辿らない。
 fn check_untyped_decimal_leaves(expr: &Expr) -> Result<(), SqlSurfaceError> {
+    let out_of_range =
+        || SqlSurfaceError::numeric_out_of_range("constant expression loses integer precision");
     match expr {
-        Expr::Number(n) if !n.bytes().all(|b| b.is_ascii_digit()) => match n.parse::<f64>() {
-            Ok(v) if v.is_finite() && v.abs() <= MAX_EXACT_F64 => Ok(()),
-            _ => Err(SqlSurfaceError::numeric_out_of_range(
-                "constant expression loses integer precision",
-            )),
-        },
+        Expr::Number(n) if !n.bytes().all(|b| b.is_ascii_digit()) => {
+            if decimal_literal_exact_within_f64_range(n) {
+                Ok(())
+            } else {
+                Err(out_of_range())
+            }
+        }
         Expr::Binary { lhs, rhs, .. } => {
             check_untyped_decimal_leaves(lhs)?;
             check_untyped_decimal_leaves(rhs)
         }
+        Expr::Coalesce(args) => args.iter().try_for_each(check_untyped_decimal_leaves),
+        Expr::Case { whens, else_result } => {
+            for (c, r) in whens {
+                check_untyped_decimal_leaves(c)?;
+                check_untyped_decimal_leaves(r)?;
+            }
+            match else_result {
+                Some(e) => check_untyped_decimal_leaves(e),
+                None => Ok(()),
+            }
+        }
         _ => Ok(()),
     }
+}
+
+/// 小数リテラル（先頭 `-` 任意）の厳密な大きさが有限かつ 2^53 以下か。f64 への丸めに頼らず、
+/// 整数部の桁（先頭の 0 を除く）と、整数部がちょうど 2^53 のときの小数部の非零で判定する。
+/// 解釈できない形は偽（fail-closed）。
+fn decimal_literal_exact_within_f64_range(raw: &str) -> bool {
+    // 指数表記は厳密な十進展開を持たないため、従来どおり f64 の大きさで判定する。
+    if raw.bytes().any(|b| b == b'e' || b == b'E') {
+        return raw
+            .parse::<f64>()
+            .is_ok_and(|v| v.is_finite() && v.abs() <= MAX_EXACT_F64);
+    }
+    let body = raw.strip_prefix('-').unwrap_or(raw);
+    let (int_part, frac_part) = match body.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (body, ""),
+    };
+    if !int_part.bytes().all(|b| b.is_ascii_digit())
+        || !frac_part.bytes().all(|b| b.is_ascii_digit())
+        || (int_part.is_empty() && frac_part.is_empty())
+    {
+        return false;
+    }
+    let int_trim = int_part.trim_start_matches('0');
+    // 2^53 = 9007199254740992（16 桁）。17 桁以上は確実に超過。
+    if int_trim.len() > 16 {
+        return false;
+    }
+    let int_val: u64 = if int_trim.is_empty() {
+        0
+    } else {
+        match int_trim.parse() {
+            Ok(v) => v,
+            Err(_) => return false,
+        }
+    };
+    let max = MAX_EXACT_F64 as u64;
+    int_val < max || (int_val == max && frac_part.bytes().all(|b| b == b'0'))
 }
 
 /// 整数モードで、`children` のいずれかが整数の運び手（`Numeric`）に評価されるなら `22003`。
