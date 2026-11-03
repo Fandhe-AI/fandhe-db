@@ -173,6 +173,7 @@ bench-knn-profile`。S0-cold/S0-hot・可視比率スイープ双方に効く）
 - brute-force 対照: `engine::kernel::CpuScalarProvider`（production が使う
   総当たりカーネル）で正解 top-10 を求め、`Recall@10 = |HNSW top-10 ∩ brute
   top-10| / 10` をクエリ平均する。
+- （追記 Issue #1986: 下記の正規化前提は SQL-33 の改訂前の契約。改訂後の扱いは [cosine-distance-method.md](cosine-distance-method.md) と #1996／#1999 で決める。）
 - コーパス: 決定的シード・クラスタ中心 + ジッタ → L2 正規化（`hnsw.rs`
   冒頭の「cosine は正規化済みベクトルを渡して内積に一致させる」契約に
   合わせる）という、埋め込みらしい緩いクラスタ構造を採用した。クエリも
