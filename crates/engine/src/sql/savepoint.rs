@@ -7,6 +7,7 @@
 //! redb の ephemeral savepoint で行う（Issue #1943）。redb の savepoint は「writer が最初に
 //! テーブルを開く前の状態」にしか戻せないため、各エントリに [`SavepointKind`] を持たせ、
 //! 巻き戻せるものだけ `ROLLBACK TO` を成功させる（詳細は `docs/design/explicit-transaction.md`）。
+//! 書き込み後の savepoint は基底への復元 + 差分の再適用で戻す（Issue #2879。下記）。
 //! Tx 内の書き込み記録は [`WriteMarks`] で保存・復元する（Issue #1945）。
 //! `operation_id` の Tx 内登録は水位で巻き戻す（Issue #1944。永続の台帳は redb の復元で戻る）。
 //! キャッシュ等の復元は親 Issue #1941 の残りの子 Issue の範囲。
@@ -17,13 +18,21 @@
 //! （lexer が引用の有無を保持しないため、混同を避ける安全側の選択）。
 //! スタック長は `SessionTransaction` の文数上限で有界になる。
 //!
-//! 不変条件: redb の dirty フラグは一度立つと下りないため、スタックは古い側から
-//! `[Restorable…, Unrestorable…]` の順に並ぶ。
+//! 書き込み後の savepoint（Issue #2879）は redb の API だけでは作れないため、`SAVEPOINT` 時点の
+//! 「確定済み状態との行単位差分」（`storage::table_image`）を [`StateImage`] として保持し、
+//! `ROLLBACK TO` が基底へ復元した後に再適用する（`SavepointKind::Imaged`）。差分を取れない
+//! （未知の型のテーブル・上限超過）場合だけ `Unrestorable` に落とし、`ROLLBACK TO` は従来どおり
+//! `0A000` で fail-closed に拒否する。
+//!
+//! 不変条件: スタックの種別は `Restorable`／`Imaged`／`Unrestorable` が混在しうる（`Imaged` は
+//! 差分の取得可否で決まり、`Unrestorable` になっても後続の savepoint は再び `Imaged` になれる）。
+//! `Restorable` は writer が dirty になる前（と一時側が未使用の間）にだけ作られる。
 
 use std::collections::{BTreeSet, HashSet};
 
 use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::mode::SessionState;
+use crate::storage::table_image::TableImage;
 
 /// `SAVEPOINT` 時点の Tx 内書き込み記録（`ActiveTxn` の `has_writes`・`written_tables`・
 /// `written_by_tenant`）の複製（Issue #1945）。`ROLLBACK TO` が redb の巻き戻しと対にして
@@ -37,12 +46,38 @@ pub(crate) struct WriteMarks {
     pub(crate) written_by_tenant: BTreeSet<(String, String)>,
 }
 
-/// savepoint の巻き戻し可否（redb の ephemeral savepoint の制約による）。
+/// `SAVEPOINT` 時点の書き込み済み内容の差分（Issue #2879）。永続側と一時側（TABLE-44）を別々に
+/// 持ち、`ROLLBACK TO` が両方を基底へ復元してから再適用する。
+#[derive(Debug, Clone, Default)]
+pub(crate) struct StateImage {
+    /// 永続側の差分。`None` は「作成時点で永続側は未書き込み」（基底へ戻すだけでよい）。
+    pub(crate) persistent: Option<TableImage>,
+    /// 一時側の差分。`None` は「作成時点で一時側の書き込みトランザクションが未開始」。
+    pub(crate) temp: Option<TableImage>,
+    /// 作成時点で確定済み状態と表世代が異なる永続表の集合。再適用後の突き合わせ（fail-closed）に使う。
+    pub(crate) dirty_tables: HashSet<String>,
+}
+
+impl StateImage {
+    /// 差分が占めるバイト数の見積り（Tx 全体の上限判定に使う）。
+    pub(crate) fn bytes(&self) -> usize {
+        self.persistent
+            .as_ref()
+            .map_or(0, TableImage::bytes)
+            .saturating_add(self.temp.as_ref().map_or(0, TableImage::bytes))
+    }
+}
+
+/// savepoint の巻き戻し可否。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SavepointKind {
-    /// 作成時に writer が未取得、または redb 上で dirty でなかった。基底 savepoint へ戻せる。
+    /// 作成時に writer が未取得、または redb 上で dirty でなかった（一時側も未使用）。
+    /// 基底 savepoint へ戻すだけでよい。
     Restorable,
-    /// 作成時に writer が既に書き込み済み（dirty）だった。redb の API では戻せず、
+    /// 作成時に書き込み済みの内容を [`StateImage`] として保持している。基底へ戻した後に
+    /// 差分を再適用して戻す（Issue #2879）。
+    Imaged,
+    /// 差分を取れなかった（未知の型のテーブル・上限超過・PL/pgSQL の内部 savepoint が書き込み後）。
     /// `ROLLBACK TO` は `0A000` で fail-closed に拒否する。
     Unrestorable,
 }
@@ -57,9 +92,11 @@ struct Entry {
     /// `SAVEPOINT` 時点のカーソル識別子の高水位（`CursorRegistry::next_id`）。`ROLLBACK TO` は
     /// この値以上の識別子を持つカーソル（savepoint より後に宣言されたもの）を閉じる。
     cursor_watermark: u64,
-    /// `SAVEPOINT` 時点の書き込み記録。`Restorable` のときだけ `Some`（`Unrestorable` は
+    /// `SAVEPOINT` 時点の書き込み記録。`Restorable`／`Imaged` のときだけ `Some`（`Unrestorable` は
     /// `ROLLBACK TO` 自体が拒否されるため保持しない）。
     write_marks: Option<WriteMarks>,
+    /// `Imaged` のときの差分。それ以外は `None`。
+    image: Option<Box<StateImage>>,
     /// `SAVEPOINT` 時点の `operation_id` 登録ログ長（Issue #1944）。`ROLLBACK TO` はこの位置より
     /// 後に登録された ID を取り消し、同じ Tx 内で再利用できるようにする。
     op_id_watermark: usize,
@@ -95,7 +132,41 @@ impl SavepointStack {
             cursor_watermark,
             op_id_watermark,
             write_marks,
+            image: None,
         });
+    }
+
+    /// 書き込み後の savepoint を差分つきで積む（`SavepointKind::Imaged`。Issue #2879）。
+    pub(crate) fn push_imaged(
+        &mut self,
+        name: &str,
+        session: &SessionState,
+        cursor_watermark: u64,
+        op_id_watermark: usize,
+        write_marks: WriteMarks,
+        image: StateImage,
+    ) {
+        self.entries.push(Entry {
+            name: name.to_string(),
+            kind: SavepointKind::Imaged,
+            session: Box::new(session.clone()),
+            cursor_watermark,
+            op_id_watermark,
+            write_marks: Some(write_marks),
+            image: Some(Box::new(image)),
+        });
+    }
+
+    /// 位置 `pos` の savepoint の差分。`Imaged` 以外・範囲外は `None`。
+    pub(crate) fn image_at(&self, pos: usize) -> Option<&StateImage> {
+        self.entries.get(pos).and_then(|e| e.image.as_deref())
+    }
+
+    /// 積まれている全 savepoint の差分の合計バイト数（Tx 全体の上限判定に使う）。
+    pub(crate) fn image_bytes_total(&self) -> usize {
+        self.entries.iter().fold(0usize, |acc, e| {
+            acc.saturating_add(e.image.as_deref().map_or(0, StateImage::bytes))
+        })
     }
 
     /// 位置 `pos` の savepoint 作成時点の書き込み記録。範囲外・`Unrestorable` は `None`。
@@ -144,11 +215,12 @@ impl SavepointStack {
         self.entries.truncate(pos);
     }
 
-    /// 巻き戻せる savepoint が 1 つでも積まれているか（基底 savepoint の要否判定）。
-    pub(crate) fn has_restorable(&self) -> bool {
+    /// 巻き戻せる（`Unrestorable` でない）savepoint が 1 つでも積まれているか
+    /// （基底 savepoint の要否・失敗状態の保持判定）。
+    pub(crate) fn has_rollbackable(&self) -> bool {
         self.entries
             .iter()
-            .any(|e| e.kind == SavepointKind::Restorable)
+            .any(|e| e.kind != SavepointKind::Unrestorable)
     }
 
     /// `RELEASE name`。最も新しい同名とそれより新しい savepoint をすべて pop する。
@@ -267,9 +339,9 @@ mod tests {
     }
 
     #[test]
-    fn has_restorable_tracks_kinds() {
+    fn has_rollbackable_tracks_kinds() {
         let mut s = SavepointStack::new();
-        assert!(!s.has_restorable());
+        assert!(!s.has_rollbackable());
         s.push(
             "a",
             SavepointKind::Unrestorable,
@@ -278,11 +350,11 @@ mod tests {
             0,
             None,
         );
-        assert!(!s.has_restorable());
+        assert!(!s.has_rollbackable());
         s.push("b", R, &SessionState::default(), 0, 0, None);
-        assert!(s.has_restorable());
+        assert!(s.has_rollbackable());
         s.release("b").unwrap();
-        assert!(!s.has_restorable());
+        assert!(!s.has_rollbackable());
     }
 
     #[test]
@@ -334,5 +406,42 @@ mod tests {
         assert!(s.write_marks_at(1).is_none());
         s.release("a").unwrap();
         assert!(s.write_marks_at(0).is_none());
+    }
+
+    #[test]
+    fn imaged_entries_keep_image_marks_and_count_as_rollbackable() {
+        let mut s = SavepointStack::new();
+        s.push(
+            "u",
+            SavepointKind::Unrestorable,
+            &SessionState::default(),
+            0,
+            0,
+            None,
+        );
+        assert!(!s.has_rollbackable());
+        let image = StateImage {
+            dirty_tables: HashSet::from(["t".to_string()]),
+            ..StateImage::default()
+        };
+        s.push_imaged(
+            "i",
+            &SessionState::default(),
+            0,
+            0,
+            WriteMarks {
+                has_writes: true,
+                ..WriteMarks::default()
+            },
+            image,
+        );
+        assert!(s.has_rollbackable());
+        assert_eq!(s.kind_at(1), Some(SavepointKind::Imaged));
+        assert!(s.write_marks_at(1).is_some_and(|m| m.has_writes));
+        assert!(s.image_at(0).is_none());
+        assert!(s.image_at(1).is_some_and(|i| i.dirty_tables.contains("t")));
+        assert_eq!(s.image_bytes_total(), 0);
+        s.truncate_after(0);
+        assert!(s.image_at(1).is_none());
     }
 }

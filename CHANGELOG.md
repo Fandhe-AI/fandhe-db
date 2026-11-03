@@ -13,6 +13,7 @@
 
 ### Added
 
+- 明示トランザクションの書き込み後に作った `SAVEPOINT` への `ROLLBACK TO` と、一時表を使ったトランザクションの `ROLLBACK TO` を実装した（Issue #2879・SQL-69）。基底 savepoint への復元と内容差分の再適用で巻き戻す。差分を取れない場合（未知の型のテーブル・上限超過）は従来どおり固定文言の `0A000`。PL/pgSQL の `EXCEPTION` 節の内部 savepoint は従来のまま。
 - 文単位のデッドライン（`engine::interrupt::DeadlineScope`。Issue #1951）を、書き込み・COPY・分割実行 DML・ベクトル検索・GPU バッチの経路へ結線した（Issue #1953・SQL-71・SQL-32 ポインタ）。期限切れは `57014`（固定文言）で、autocommit は副作用ゼロ・明示 Tx は `25P02`（savepoint があれば `ROLLBACK TO` で復帰）・台帳にも残らない。分割実行は実行中のチャンクだけを破棄し、最初の commit 前は `57014`・後は `VD001`（原因 `57014`）で、同じ `operation_id` の再送で再開できる。書き込みロック（writer gate）の待機は文の期限で短縮され、期限が先に来たときは `55P03` ではなく `57014` を返す。期限が無効なら従来と挙動・性能は変わらない（導入口の wire 結線は #1954）。
   BREAKING CHANGE: 公開 enum `ArenaError` に `Interrupted(InterruptReason)`、`BatchSearchError` に `QueryCanceled { reason }` を追加した（網羅的 `match` の下流は追随が必要）。
 - PL/pgSQL の条件式（`IF`・`ELSIF`・`WHILE`・`EXIT/CONTINUE WHEN`・検索形 `CASE`）と値として使う論理式で `AND`・`OR`・`NOT`・`BETWEEN`・`IN (リスト)` を受理するようにした（Issue #2880・SQL-68）。従来の `0A000` から受理に変わる。NULL は 3 値論理で扱い、数値は値のまま比較する。

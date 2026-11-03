@@ -139,8 +139,9 @@ fn release_unknown_name_is_3b001_and_fails_transaction() {
     assert_eq!(visible_rows(&engine, &caller), 0);
 }
 
+/// Issue #2879: 書き込み後の savepoint へ戻せる。savepoint 前の行は COMMIT で残り、後の行は残らない。
 #[test]
-fn rollback_to_savepoint_after_writes_is_fail_closed_and_commit_does_not_persist() {
+fn rollback_to_savepoint_after_writes_keeps_only_earlier_rows() {
     let (engine, path) = new_core();
     let _c = CleanupGuard(path);
     let caller = ctx("tenant-a");
@@ -149,13 +150,11 @@ fn rollback_to_savepoint_after_writes_is_fail_closed_and_commit_does_not_persist
     run(&engine, &caller, &mut s, &mut txn, "BEGIN").unwrap();
     run(&engine, &caller, &mut s, &mut txn, &insert_sql(1, "op-1")).unwrap();
     run(&engine, &caller, &mut s, &mut txn, "SAVEPOINT a").unwrap();
-    let err = run(&engine, &caller, &mut s, &mut txn, "ROLLBACK TO a").unwrap_err();
-    assert_eq!(err.wire_code(), "0A000");
-    assert_eq!(txn.status(), TransactionStatus::Failed);
-    let err = run(&engine, &caller, &mut s, &mut txn, "COMMIT").unwrap_err();
-    assert_eq!(err.wire_code(), "25P02");
-    run(&engine, &caller, &mut s, &mut txn, "ROLLBACK").unwrap();
-    assert_eq!(visible_rows(&engine, &caller), 0);
+    run(&engine, &caller, &mut s, &mut txn, &insert_sql(2, "op-2")).unwrap();
+    run(&engine, &caller, &mut s, &mut txn, "ROLLBACK TO a").unwrap();
+    assert_eq!(txn.status(), TransactionStatus::InTransaction);
+    run(&engine, &caller, &mut s, &mut txn, "COMMIT").unwrap();
+    assert_eq!(visible_rows(&engine, &caller), 1);
 }
 
 #[test]

@@ -92,22 +92,24 @@ fn rollback_to_restores_state_and_hides_writes() {
     assert_eq!(select_count(&mut stream, b'I'), "SELECT 0");
 }
 
+/// Issue #2879（SQL-69）: 書き込み後の savepoint へ `ROLLBACK TO` できる。`CommandComplete` の後も
+/// `'T'` のままで、savepoint 前の行は COMMIT 後に残り、後の行は残らない。
 #[test]
-fn rollback_to_savepoint_after_writes_is_0a000_and_leaves_failed_state() {
+fn rollback_to_savepoint_after_writes_succeeds_and_keeps_earlier_rows() {
     let (core, _g) = new_core();
     let mut stream = connect(core);
 
     expect_tag(&mut stream, "BEGIN", "BEGIN", b'T');
     expect_tag(&mut stream, &insert_sql(1, "op-1"), "INSERT 0 1", b'T');
     expect_tag(&mut stream, "SAVEPOINT a", "SAVEPOINT", b'T');
-    send_simple_query(&mut stream, "ROLLBACK TO a");
-    expect_error_response_with_sqlstate(&mut stream, "0A000");
-    assert_eq!(read_ready_for_query_status(&mut stream), b'E');
-
-    send_simple_query(&mut stream, "ROLLBACK TO a");
-    expect_error_response_with_sqlstate(&mut stream, "25P02");
-    assert_eq!(read_ready_for_query_status(&mut stream), b'E');
-    expect_tag(&mut stream, "ROLLBACK", "ROLLBACK", b'I');
+    expect_tag(&mut stream, &insert_sql(2, "op-2"), "INSERT 0 1", b'T');
+    expect_tag(&mut stream, "ROLLBACK TO a", "ROLLBACK", b'T');
+    expect_tag(&mut stream, "COMMIT", "COMMIT", b'I');
+    send_simple_query(&mut stream, SELECT_SQL);
+    let _ = read_row_description(&mut stream);
+    let _ = read_data_row(&mut stream);
+    assert_eq!(read_command_complete(&mut stream), "SELECT 1");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'I');
 }
 
 #[test]

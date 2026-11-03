@@ -80,9 +80,9 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // ための追随（旧: 930／961）。
     // Issue #1690（`Storage::sequence_allocator` の追加）で行番号が移動したための追随（旧: 950／981）。
     // PR #2566 レビュー対応（一時 DB 判定 `Storage::is_temp_scoped` の追加。+12 行）で追随（旧: 963／994）。
-    // Issue #1958（`begin_explicit_write_txn_nowait` の追加。+20 行）の取り込みでさらに移動。
-    ("storage.rs", 1163),
-    ("storage.rs", 1197),
+    // Issue #1958（`begin_explicit_write_txn_nowait` の追加。+20 行）の取り込みでさらに移動。 Issue #2879（storage.rs への +1 行）で移動。
+    ("storage.rs", 1164),
+    ("storage.rs", 1198),
     ("recovery/panic_hook.rs", 404),
     ("txn.rs", 210),
     ("txn.rs", 387),
@@ -464,13 +464,13 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1944（savepoint 巻き戻しでの冪等台帳の整合）の行追加でさらに移動（旧: 1978）。書き込み内容・commit の意味は不変。
     // Issue #1947（失敗状態からの ROLLBACK TO 復帰）の行追加でさらに移動（旧: 2060）。書き込み内容・commit の意味は不変。
     // Issue #2231（`SKIP LOCKED` の取得入口 `try_ensure_writer`・`try_begin_implicit` と取得方針 `WriterAcquire` の追加）の行追加でさらに移動（旧: 2230）。書き込み内容・commit の意味は不変。
-    ("sql/transaction.rs", 2431),
+    ("sql/transaction.rs", 2580),
     // TABLE-44・Issue #1684: 一時表ストア（セッション専用のインメモリ DB。永続 DB とは別インスタンス）の
     // 書き込みトランザクションの確定口（`TempRowStore::commit`）。確定するのは、一時コアの書き込み本体
     // （`tenant::*`・`catalog::*`。いずれも自分の DB の表世代を `bump_table_generation_in_txn` で進める）が
     // 開いているトランザクションに積んだ変更だけで、本箇所自体は新たな `user_rows/{table}` 書き込みを
-    // 行わない。一時 DB の世代は一時コア専用のキャッシュ（永続コアと共有しない）だけが読む。
-    ("sql/temp_rows.rs", 264),
+    // 行わない。一時 DB の世代は一時コア専用のキャッシュ（永続コアと共有しない）だけが読む。 Issue #2879（`committed_read` の追加。+8 行）の行追加で移動（旧: 264）。
+    ("sql/temp_rows.rs", 272),
     // Issue #1129（分割実行 DML の取り消し）: 取り消し済み記録への縮小（`partitioned_job::
     // cancel_in_txn`）はジョブ表（`PARTITIONED_JOB_TABLE`・索引表）だけを書き、
     // `CATALOG_TABLE`／`user_rows/{table}` のいずれにも触れない（commit 済みチャンクの行は
