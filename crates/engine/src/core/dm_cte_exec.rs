@@ -166,7 +166,7 @@ impl EngineCore {
                 .describe_parsed_in_session_impl(
                     session,
                     &parsed,
-                    crate::sql::parser::LiteralSkip::NONE,
+                    &crate::sql::parser::LiteralSkip::NONE,
                     &[],
                     limits,
                 )?

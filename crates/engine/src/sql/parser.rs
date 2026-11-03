@@ -1880,27 +1880,28 @@ pub(crate) const ANONYMOUS_COLUMN_NAME: &str = "?column?";
 /// Prepared Describe がベクトルリテラルの実パースを省いてよい位置（Issue #2007・PR #2927 指摘対応）。
 /// `$n` 由来のダミー値の位置だけを印にし、同じ文中の実リテラルは Describe でも必ず検証する
 /// （fail-closed）。`EngineCore` の Parse が元トークン列から導出し、Describe の束縛へ渡す。
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct LiteralSkip {
     /// `ORDER BY` 距離形のリテラルが `$n` 由来か。
     pub(crate) order_by: bool,
-    /// 投影項目（`Projection::Items` の添字）ごとの「距離列のリテラルが `$n` 由来か」のビット集合。
-    /// 添字 64 以上は印を持てず、常に検証する側に倒れる。
-    pub(crate) projection_mask: u64,
+    /// 投影項目（`Projection::Items` の添字）ごとの「距離列のリテラルが `$n` 由来か」の可変長
+    /// フラグ列。範囲外の添字は印なし（常に検証する側）。
+    pub(crate) projection_mask: Vec<bool>,
 }
 
 impl LiteralSkip {
     /// 何も省かない（実リテラルを持つ通常の Describe・Execute 前検査）。
     pub(crate) const NONE: Self = Self {
         order_by: false,
-        projection_mask: 0,
+        projection_mask: Vec::new(),
     };
 
-    fn skips_projection_item(self, index: usize) -> bool {
-        u32::try_from(index)
-            .ok()
-            .and_then(|i| self.projection_mask.checked_shr(i))
-            .is_some_and(|m| m & 1 == 1)
+    fn skips_projection_item(&self, index: usize) -> bool {
+        self.projection_mask.get(index).copied().unwrap_or(false)
+    }
+
+    fn has_projection_mark(&self) -> bool {
+        self.projection_mask.iter().any(|b| *b)
     }
 }
 
@@ -1919,7 +1920,7 @@ pub fn bind_projection(
     udfs: &crate::sql::udf_call::UdfRegistry,
     node_budget: &mut usize,
 ) -> Result<Vec<ProjectedColumn>, SqlSurfaceError> {
-    bind_projection_with_literals(projection, schema, udfs, node_budget, LiteralSkip::NONE)
+    bind_projection_with_literals(projection, schema, udfs, node_budget, &LiteralSkip::NONE)
 }
 
 /// 投影トップレベルの距離列（SQL-33 (7)・Issue #2007）のベクトルリテラルを、構造検証専用の
@@ -1956,7 +1957,7 @@ pub(crate) fn bind_projection_with_literals(
     schema: &TableSchema,
     udfs: &crate::sql::udf_call::UdfRegistry,
     node_budget: &mut usize,
-    skip: LiteralSkip,
+    skip: &LiteralSkip,
 ) -> Result<Vec<ProjectedColumn>, SqlSurfaceError> {
     match projection {
         Projection::All => {
@@ -3350,7 +3351,7 @@ pub(crate) fn bind_projection_for_describe(
     schema: &TableSchema,
     udfs: &crate::sql::udf_call::UdfRegistry,
     session_mode: Option<SearchMode>,
-    skip: LiteralSkip,
+    skip: &LiteralSkip,
     dummy_equality_flags: &[bool],
     result_limits: &crate::result_limits::ResultLimits,
 ) -> Result<Vec<ProjectedColumn>, SqlSurfaceError> {
@@ -3386,7 +3387,7 @@ pub(crate) fn bind_projection_for_describe(
         &projection,
         &ranking,
         stmt.distance_kind,
-        !skip.order_by && skip.projection_mask == 0,
+        !skip.order_by && !skip.has_projection_mark(),
     )?;
     check_limit_omission(stmt.limit_implicit, Some(resolved_mode.mode()))?;
     let _limits = bind_limit_and_offset(stmt, result_limits)?;
@@ -15571,7 +15572,7 @@ mod tests {
                 &docs_schema(),
                 &udfs,
                 session,
-                LiteralSkip::NONE,
+                &LiteralSkip::NONE,
                 &[],
                 &limits,
             )

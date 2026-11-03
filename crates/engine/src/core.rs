@@ -6840,7 +6840,7 @@ impl EngineCore {
             .describe_parsed_in_session_impl(
                 session,
                 &ParsedSql::Statement((*stmt.query).clone()),
-                crate::sql::parser::LiteralSkip::NONE,
+                &crate::sql::parser::LiteralSkip::NONE,
                 &[],
                 limits,
             )?
@@ -7725,7 +7725,7 @@ impl EngineCore {
         self.describe_parsed_in_session_impl(
             session,
             &prepared.dummy_parsed,
-            prepared.literal_skip,
+            &prepared.literal_skip,
             &prepared.where_equality_dummy_flags,
             &self.result_limits,
         )
@@ -9854,7 +9854,7 @@ impl EngineCore {
         self.describe_parsed_in_session_impl(
             session,
             parsed,
-            crate::sql::parser::LiteralSkip::NONE,
+            &crate::sql::parser::LiteralSkip::NONE,
             &[],
             &self.result_limits,
         )
@@ -9934,7 +9934,7 @@ impl EngineCore {
         self.describe_parsed_in_session_snap(
             session,
             parsed,
-            crate::sql::parser::LiteralSkip::NONE,
+            &crate::sql::parser::LiteralSkip::NONE,
             &[],
             &self.result_limits,
             snap,
@@ -10029,7 +10029,7 @@ impl EngineCore {
             self.describe_parsed_in_session_snap(
                 session,
                 parsed,
-                prepared.literal_skip,
+                &prepared.literal_skip,
                 &prepared.where_equality_dummy_flags,
                 &self.result_limits,
                 snap,
@@ -10176,7 +10176,7 @@ impl EngineCore {
             .describe_parsed_in_session_impl(
                 session,
                 &ParsedSql::Statement(statement),
-                crate::sql::parser::LiteralSkip::NONE,
+                &crate::sql::parser::LiteralSkip::NONE,
                 &[],
                 &crate::result_limits::ResultLimits::default(),
             )?
@@ -10250,7 +10250,7 @@ impl EngineCore {
                     .describe_parsed_in_session_impl(
                         session,
                         &ParsedSql::Statement(*body),
-                        crate::sql::parser::LiteralSkip::NONE,
+                        &crate::sql::parser::LiteralSkip::NONE,
                         &[],
                         &crate::result_limits::ResultLimits::default(),
                     )?
@@ -10295,7 +10295,7 @@ impl EngineCore {
         &self,
         session: &crate::sql::mode::SessionState,
         validated: &crate::sql::allowlist::ValidatedRecursiveCte,
-        skip_vector_literal_validation: crate::sql::parser::LiteralSkip,
+        skip_vector_literal_validation: &crate::sql::parser::LiteralSkip,
         limits: &crate::result_limits::ResultLimits,
         snap: Option<&redb::ReadTransaction>,
     ) -> Result<Vec<crate::sql::exec::ColumnMeta>, crate::sql::allowlist::SqlSurfaceError> {
@@ -10376,7 +10376,7 @@ impl EngineCore {
         &self,
         session: &crate::sql::mode::SessionState,
         parsed: &ParsedSql,
-        skip_vector_literal_validation: crate::sql::parser::LiteralSkip,
+        skip_vector_literal_validation: &crate::sql::parser::LiteralSkip,
         dummy_equality_flags: &[bool],
         limits: &crate::result_limits::ResultLimits,
     ) -> Result<Option<Vec<crate::sql::exec::ColumnMeta>>, crate::sql::allowlist::SqlSurfaceError>
@@ -10411,7 +10411,7 @@ impl EngineCore {
         &self,
         session: &crate::sql::mode::SessionState,
         parsed: &ParsedSql,
-        skip_vector_literal_validation: crate::sql::parser::LiteralSkip,
+        skip_vector_literal_validation: &crate::sql::parser::LiteralSkip,
         dummy_equality_flags: &[bool],
         limits: &crate::result_limits::ResultLimits,
         snap: Option<&redb::ReadTransaction>,
@@ -11934,7 +11934,7 @@ impl EngineCore {
                 self.describe_recursive_cte(
                     &*session,
                     &validated,
-                    crate::sql::parser::LiteralSkip::NONE,
+                    &crate::sql::parser::LiteralSkip::NONE,
                     &limits,
                     read_txn.snapshot(),
                 )?;
@@ -12219,7 +12219,7 @@ impl EngineCore {
         session: &crate::sql::mode::SessionState,
         cte: &crate::sql::allowlist::JoinCteInputs,
         k: usize,
-        skip_vector_literal_validation: crate::sql::parser::LiteralSkip,
+        skip_vector_literal_validation: &crate::sql::parser::LiteralSkip,
         limits: &crate::result_limits::ResultLimits,
         snap: Option<&redb::ReadTransaction>,
     ) -> Result<Vec<crate::sql::exec::ColumnMeta>, crate::sql::allowlist::SqlSurfaceError> {
