@@ -199,7 +199,9 @@ fn reject_non_constant_with(expr: &Expr, allow_placeholders: bool) -> Result<(),
                 _ => reject_non_constant_with(a, allow_placeholders),
             })
         }
-        Expr::Binary { lhs, rhs, .. } | Expr::JsonAccess { lhs, rhs, .. } => {
+        Expr::Binary { lhs, rhs, .. }
+        | Expr::JsonAccess { lhs, rhs, .. }
+        | Expr::VectorDistance { lhs, rhs, .. } => {
             reject_non_constant_with(lhs, allow_placeholders)?;
             reject_non_constant_with(rhs, allow_placeholders)
         }
@@ -264,7 +266,9 @@ fn expr_uses_schema_fn(expr: &Expr) -> bool {
             crate::sql::udf_call::is_schema_fn_name(&name.to_ascii_lowercase())
                 || args.iter().any(expr_uses_schema_fn)
         }
-        Expr::Binary { lhs, rhs, .. } | Expr::JsonAccess { lhs, rhs, .. } => {
+        Expr::Binary { lhs, rhs, .. }
+        | Expr::JsonAccess { lhs, rhs, .. }
+        | Expr::VectorDistance { lhs, rhs, .. } => {
             expr_uses_schema_fn(lhs) || expr_uses_schema_fn(rhs)
         }
         Expr::Case { whens, else_result } => {

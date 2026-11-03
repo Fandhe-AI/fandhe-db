@@ -376,7 +376,9 @@ fn check_expr_with(
             }
             args.iter().try_for_each(|e| check_expr_with(e, site, udf))
         }
-        Expr::Binary { lhs, rhs, .. } | Expr::JsonAccess { lhs, rhs, .. } => {
+        Expr::Binary { lhs, rhs, .. }
+        | Expr::JsonAccess { lhs, rhs, .. }
+        | Expr::VectorDistance { lhs, rhs, .. } => {
             check_expr_with(lhs, site, udf)?;
             check_expr_with(rhs, site, udf)
         }
@@ -516,6 +518,7 @@ pub(crate) fn expr_contains_collate(expr: &Expr) -> bool {
         Expr::Call { args, .. } => args.iter().any(expr_contains_collate),
         Expr::Binary { lhs, rhs, .. }
         | Expr::JsonAccess { lhs, rhs, .. }
+        | Expr::VectorDistance { lhs, rhs, .. }
         | Expr::Quantified { lhs, rhs, .. } => {
             expr_contains_collate(lhs) || expr_contains_collate(rhs)
         }
@@ -641,6 +644,11 @@ pub(crate) fn fold_session_local_literals(expr: &Expr) -> Result<Expr, SqlSurfac
         },
         Expr::JsonAccess { op, lhs, rhs } => Expr::JsonAccess {
             op: *op,
+            lhs: Box::new(rec(lhs)?),
+            rhs: Box::new(rec(rhs)?),
+        },
+        Expr::VectorDistance { kind, lhs, rhs } => Expr::VectorDistance {
+            kind: *kind,
             lhs: Box::new(rec(lhs)?),
             rhs: Box::new(rec(rhs)?),
         },
@@ -800,6 +808,10 @@ pub(crate) fn check_bound_index_expression_determinism(
             rec(lhs)?;
             rec(rhs)
         }
+        // 距離式（SQL-74・Issue #2035）は式索引・部分索引の述語に置けない（fail-closed）。
+        Expr::VectorDistance { .. } => Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "distance expressions are not supported in an index expression".to_string(),
+        }),
         Expr::Case { whens, else_result } => {
             for (cond, result) in whens {
                 rec(cond)?;

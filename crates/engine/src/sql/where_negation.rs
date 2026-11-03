@@ -43,7 +43,9 @@ use crate::sql::udf_call::{BinOp, Expr};
 /// 深さはパーサーが `MAX_EXPR_DEPTH` で有界にしているため再帰は有界。
 pub(crate) fn expr_node_count(expr: &Expr) -> usize {
     match expr {
-        Expr::Binary { lhs, rhs, .. } | Expr::JsonAccess { lhs, rhs, .. } => 1usize
+        Expr::Binary { lhs, rhs, .. }
+        | Expr::JsonAccess { lhs, rhs, .. }
+        | Expr::VectorDistance { lhs, rhs, .. } => 1usize
             .saturating_add(expr_node_count(lhs))
             .saturating_add(expr_node_count(rhs)),
         Expr::Call { args, .. } | Expr::Coalesce(args) => args
