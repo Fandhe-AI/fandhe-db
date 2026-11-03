@@ -751,12 +751,13 @@ fn unsafe_is_confined_to_isa_module_with_safety_comments() {
     // 計 12 箇所の `unsafe {` が現れる（実際のビルドで有効になるのは対象 arch の
     // 分岐のみだが、`cfg` 行はソース上に残ったまま走査されるため、arch に
     // 依存せず常に 12 を期待できる）。Issue #1988（SQL-33）で追加した `l1` の
-    // Neon・Avx2Fma・Avx512 ディスパッチ 3 箇所を加えて計 15 箇所、Issue #1983（SQL-33）で
-    // 追加した `l2_sq`／`l2_sq_block4` の Neon ディスパッチ 2 箇所を加えて計 17 箇所となる
-    // （x86_64 アームは SIMD 本体が未実装〔Issue #1982〕で `unsafe` を持たない scalar 委譲）。
+    // Neon・Avx2Fma・Avx512 ディスパッチ 3 箇所を加えて 15 箇所、Issue #1983（SQL-33）で
+    // 追加した `l2_sq`／`l2_sq_block4` の Neon ディスパッチ 2 箇所、Issue #2022（TABLE-48）で
+    // 追加した popcount の hamming／jaccard_counts × Neon・Avx2・Avx512Vpopcntdq
+    // ディスパッチ 6 箇所を加えて計 23 箇所となる。
     assert_eq!(
-        unsafe_block_count, 17,
-        "expected exactly 17 `unsafe {{` blocks in isa.rs (Issue #1983 l2_sq/l2_sq_block4 Neon dispatch x2 + Issue #1988 l1 dispatch x3 + Neon/Avx2Fma/Avx512 dot dispatch \
+        unsafe_block_count, 23,
+        "expected exactly 23 `unsafe {{` blocks in isa.rs (Issue #2022 popcount dispatch x6 + Issue #1983 l2_sq/l2_sq_block4 Neon dispatch x2 + Issue #1988 l1 dispatch x3 + Neon/Avx2Fma/Avx512 dot dispatch \
          + Avx2Fma/Avx512 dot_block4 dispatch + F16c/NeonFp16 dot_f16 dispatch added by \
          Issue #514 + Neon dot_block4 dispatch added by Issue #511 + Avx2Widen/AvxVnni/ \
          Avx512Vnni dot_i8 dispatch added by Issue #522 + NeonDotprod dot_i8 dispatch added \
@@ -893,4 +894,106 @@ fn f16_detection_is_stable_within_process() {
         assert_eq!(isa::current_f16().isa(), baseline);
     }
     assert_eq!(isa::detect_f16().isa(), baseline);
+}
+
+// ---------- popcount カーネル（Issue #2022・親 #2020・TABLE-48 ポインタ） ----------
+
+/// 1 ビットずつ数える素朴な参照実装（`(hamming, intersection, union)`）。
+/// 8 バイトまとめ数えのスカラー版を参照実装として扱わないための独立実装。
+fn popcount_bit_reference(a: &[u8], b: &[u8]) -> (u64, u64, u64) {
+    let (mut x, mut i, mut u) = (0u64, 0u64, 0u64);
+    for (p, q) in a.iter().zip(b) {
+        for bit in 0..8 {
+            let (p, q) = ((p >> (7 - bit)) & 1 == 1, (q >> (7 - bit)) & 1 == 1);
+            x += u64::from(p != q);
+            i += u64::from(p && q);
+            u += u64::from(p || q);
+        }
+    }
+    (x, i, u)
+}
+
+fn popcount_cases() -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut rng = XorShift64Star::new(0x2022_0b17);
+    let lens = [
+        0usize, 1, 7, 8, 9, 15, 16, 31, 32, 33, 63, 64, 65, 127, 128, 129, 1000, 1024, 1536, 8000,
+    ];
+    let mut cases = Vec::new();
+    for &len in &lens {
+        let rand = |rng: &mut XorShift64Star| -> Vec<u8> {
+            (0..len).map(|_| (rng.next_u64() >> 32) as u8).collect()
+        };
+        cases.push((rand(&mut rng), rand(&mut rng)));
+        cases.push((vec![0u8; len], vec![0u8; len]));
+        cases.push((vec![0xFFu8; len], vec![0xFFu8; len]));
+        cases.push((vec![0xFFu8; len], vec![0u8; len]));
+        cases.push((vec![0xAAu8; len], vec![0x55u8; len]));
+    }
+    cases
+}
+
+/// `current_popcount().isa()` が std の検出マクロから独立に求めた期待値と一致する。
+#[test]
+fn popcount_detection_matches_std_feature_macros() {
+    #[cfg(target_arch = "x86_64")]
+    let expected = if std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512vpopcntdq")
+    {
+        isa::DetectedPopcountIsa::Avx512Vpopcntdq
+    } else if std::arch::is_x86_feature_detected!("avx2")
+        && std::arch::is_x86_feature_detected!("fma")
+    {
+        isa::DetectedPopcountIsa::Avx2
+    } else {
+        isa::DetectedPopcountIsa::Scalar
+    };
+    #[cfg(target_arch = "aarch64")]
+    let expected = if std::arch::is_aarch64_feature_detected!("neon") {
+        isa::DetectedPopcountIsa::Neon
+    } else {
+        isa::DetectedPopcountIsa::Scalar
+    };
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let expected = isa::DetectedPopcountIsa::Scalar;
+    assert_eq!(isa::current_popcount().isa(), expected);
+}
+
+/// ディスパッチ経路・scalar・ビット単位参照が Hamming で完全一致する。
+#[test]
+fn dispatched_hamming_matches_bit_reference_exactly() {
+    let k = isa::current_popcount();
+    for (a, b) in popcount_cases() {
+        let (want, _, _) = popcount_bit_reference(&a, &b);
+        assert_eq!(isa::hamming_scalar(&a, &b), want, "scalar len={}", a.len());
+        assert_eq!(k.hamming(&a, &b), want, "dispatched len={}", a.len());
+        assert_eq!(k.hamming(&b, &a), want, "symmetry len={}", a.len());
+    }
+}
+
+/// ディスパッチ経路・scalar・ビット単位参照が Jaccard カウントで完全一致する。
+#[test]
+fn dispatched_jaccard_counts_match_bit_reference_exactly() {
+    let k = isa::current_popcount();
+    for (a, b) in popcount_cases() {
+        let (_, i, u) = popcount_bit_reference(&a, &b);
+        let want = isa::JaccardCounts {
+            intersection: i,
+            union: u,
+        };
+        assert_eq!(isa::jaccard_counts_scalar(&a, &b), want, "len={}", a.len());
+        let got = k.jaccard_counts(&a, &b);
+        assert_eq!(got, want, "dispatched len={}", a.len());
+        assert!(got.intersection <= got.union);
+    }
+}
+
+/// 長さが異なる入力は短い方へ切り詰める（scalar と一致。長さの検証は kernel/bit.rs）。
+#[test]
+fn popcount_truncates_to_shorter_operand_like_scalar() {
+    let k = isa::current_popcount();
+    let a = vec![0xFFu8; 37];
+    let b = vec![0xF0u8; 21];
+    assert_eq!(k.hamming(&a, &b), isa::hamming_scalar(&a, &b));
+    assert_eq!(k.hamming(&a, &b), 21 * 4);
+    assert_eq!(k.jaccard_counts(&a, &b), isa::jaccard_counts_scalar(&a, &b));
 }

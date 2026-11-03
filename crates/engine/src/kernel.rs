@@ -13,6 +13,9 @@
 //! 内積経路とは規約が異なる（距離は昇順・f64、同点は id 昇順）。内積の
 //! [`SearchProvider`] は変更せず、`<=>` の実行切り替えは #1991 で行う。
 //!
+//! 二値（bit）ベクトルの Hamming・Jaccard 距離と Top-k（Issue #2022・TABLE-48 ポインタ）は
+//! 子モジュール `bit` にあり、popcount は `isa.rs` の `PopcountKernel` に委ねる。
+//!
 //! L2 距離の brute-force 経路（Issue #1981）は [`search_l2`]。二乗距離のまま昇順選出し、
 //! 平方根は最終出力用の [`l2_distance_from_sq`] だけで取る。SQL 接続は別 Issue。
 //!
@@ -24,6 +27,9 @@
 use std::fmt;
 
 use crate::search_order;
+
+mod bit;
+pub use bit::{bit_top_k, hamming_distance, jaccard_distance, BitMetric, BitSearchInput};
 
 mod cosine;
 pub use cosine::{
