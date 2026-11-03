@@ -97,6 +97,8 @@ mod csr;
 mod i8_query;
 /// 距離（類似度）計算の metric 抽象（Issue #1997）。
 mod metric;
+#[cfg(test)]
+mod metric_recall_tests;
 mod parallel_build;
 /// `search_layer` の隣接ループへ挿入する受理判定後 prefetch（Issue #490）。
 /// `pub(super)` 限定で本モジュール外へは公開しない。
@@ -711,6 +713,13 @@ pub enum HnswError {
     /// join したうえで fail-closed に拒否し、部分的に結線された索引を
     /// `Ok` で返さない（モジュール冒頭「失敗契約」参照）。
     WorkerPanicked,
+    /// Cosine metric の構築で、正規化できない行（ゼロノルム・ノルム²のアンダー／
+    /// オーバーフロー）があった（Issue #1998。索引全体を拒否する fail-closed。行の除外は
+    /// #2241 の担当）。ベクトル値は含めない。
+    NonNormalizableVector { node: usize },
+    /// Cosine metric の探索クエリが正規化できない（ゼロノルム等）。呼び出し元は
+    /// brute-force へ縮退する（全行 NaN の結果になる）。
+    NonNormalizableQuery,
 }
 
 impl fmt::Display for HnswError {
@@ -746,6 +755,12 @@ impl fmt::Display for HnswError {
                     f,
                     "hnsw parallel build worker panicked or a lock was poisoned"
                 )
+            }
+            HnswError::NonNormalizableVector { node } => {
+                write!(f, "vector for node {node} cannot be normalized for cosine")
+            }
+            HnswError::NonNormalizableQuery => {
+                write!(f, "hnsw search query cannot be normalized for cosine")
             }
         }
     }
@@ -2137,8 +2152,15 @@ impl HnswIndex {
         vectors: &[f32],
         seed: u64,
     ) -> Result<Self, HnswError> {
-        Self::build_inner::<false>(params, ResidentPrecision::F32, dim, vectors, seed)
-            .map(|(index, _)| index)
+        Self::build_inner::<false>(
+            HnswMetric::InnerProduct,
+            params,
+            ResidentPrecision::F32,
+            dim,
+            vectors,
+            seed,
+        )
+        .map(|(index, _)| index)
     }
 
     /// [`Self::build`] の常駐精度 opt-in 版（Issue #514・親 #513。ポインタ:
@@ -2155,20 +2177,29 @@ impl HnswIndex {
         vectors: &[f32],
         seed: u64,
     ) -> Result<Self, HnswError> {
-        Self::build_impl(params, precision, dim, vectors, seed)
+        Self::build_impl(
+            HnswMetric::InnerProduct,
+            params,
+            precision,
+            dim,
+            vectors,
+            seed,
+        )
     }
 
     /// [`Self::build`]／[`Self::build_with_precision`] が共有する構築本体
     /// （`OBSERVE=false` に固定した [`build_inner`](Self::build_inner) の薄い
     /// ラッパー）。
     fn build_impl(
+        metric: HnswMetric,
         params: HnswParams,
         precision: ResidentPrecision,
         dim: u32,
         vectors: &[f32],
         seed: u64,
     ) -> Result<Self, HnswError> {
-        Self::build_inner::<false>(params, precision, dim, vectors, seed).map(|(index, _)| index)
+        Self::build_inner::<false>(metric, params, precision, dim, vectors, seed)
+            .map(|(index, _)| index)
     }
 
     /// [`build`](Self::build) と同一アルゴリズムを実行しつつ、
@@ -2185,7 +2216,14 @@ impl HnswIndex {
         vectors: &[f32],
         seed: u64,
     ) -> Result<(Self, HnswRepairStats), HnswError> {
-        Self::build_inner::<true>(params, ResidentPrecision::F32, dim, vectors, seed)
+        Self::build_inner::<true>(
+            HnswMetric::InnerProduct,
+            params,
+            ResidentPrecision::F32,
+            dim,
+            vectors,
+            seed,
+        )
     }
 
     /// [`build`](Self::build)・[`build_with_precision`]
@@ -2198,6 +2236,7 @@ impl HnswIndex {
     /// 常駐表現にのみ影響し（Issue #514）、グラフ構築（挿入・修復）は精度に
     /// よらず常に f32 で行う。
     fn build_inner<const OBSERVE: bool>(
+        metric: HnswMetric,
         params: HnswParams,
         precision: ResidentPrecision,
         dim: u32,
@@ -2213,7 +2252,7 @@ impl HnswIndex {
         // この Arc の中身は変化しない）。
         let owned_vectors: Arc<[f32]> = Arc::from(vectors);
         let mut builder = GraphBuilder {
-            metric: HnswMetric::default(),
+            metric,
             params,
             nodes: Vec::with_capacity(n),
             entry_point: None,
@@ -2268,6 +2307,8 @@ impl HnswIndex {
             entry_point,
         } = builder;
         let graph = csr::CsrGraph::from_nodes(&nodes)?;
+        // L2 は f16・SQ8 用カーネルが無いので F32 へ縮退する（Issue #1998）。
+        let precision = metric.effective_precision(precision);
         let (node_vectors, resident_precision) = match precision {
             ResidentPrecision::F32 => (NodeVectors::F32(vectors), ResidentPrecision::F32),
             ResidentPrecision::F16 => {
@@ -2350,12 +2391,44 @@ impl HnswIndex {
         seed: u64,
         threads: usize,
     ) -> Result<Self, HnswError> {
-        Self::build_with_threads_impl(params, ResidentPrecision::F32, dim, vectors, seed, threads)
+        Self::build_with_threads_impl(
+            HnswMetric::InnerProduct,
+            params,
+            ResidentPrecision::F32,
+            dim,
+            vectors,
+            seed,
+            threads,
+        )
+    }
+
+    /// metric 指定の構築入口（Issue #1998・親 #1996。crate 内専用。`threads == 1` は逐次と
+    /// 同一経路）。`vectors` は生の行で、Cosine では検証後にここで 1 回だけ正規化し、そのコピーを
+    /// 挿入・修復・凍結のすべてで使う（C2′）。正規化できない行は `NonNormalizableVector`。
+    /// 呼び出し元は #2000（SQL 経路の結線）で追加予定。それまでは単体テストのみ。
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub(crate) fn build_with_metric(
+        params: HnswParams,
+        metric: HnswMetric,
+        precision: ResidentPrecision,
+        dim: u32,
+        vectors: &[f32],
+        seed: u64,
+        threads: usize,
+    ) -> Result<Self, HnswError> {
+        Self::build_with_threads_impl(metric, params, precision, dim, vectors, seed, threads)
+    }
+
+    /// この索引の距離種別（#2000 が cache キー・EXPLAIN へ反映する）。
+    #[allow(dead_code)]
+    pub(crate) fn metric(&self) -> HnswMetric {
+        self.metric
     }
 
     /// [`Self::build_with_threads`]／[`Self::build_parallel`] が共有する
     /// 常駐精度対応版の構築本体（Issue #514）。
     fn build_with_threads_impl(
+        metric: HnswMetric,
         params: HnswParams,
         precision: ResidentPrecision,
         dim: u32,
@@ -2369,10 +2442,21 @@ impl HnswIndex {
             });
         }
         let n = validate_build_input(&params, dim, vectors)?;
+        // Cosine は検証後に 1 回だけ正規化し、以降（逐次・並列・修復・凍結）はすべて
+        // 正規化済みコピーを使う。
+        let normalized;
+        let vectors = if metric.needs_normalization() {
+            normalized = metric::normalize_rows(vectors, dim as usize)?;
+            &normalized[..]
+        } else {
+            vectors
+        };
         if threads == 1 || n <= SEQUENTIAL_PREFIX_NODES {
-            return Self::build_impl(params, precision, dim, vectors, seed);
+            return Self::build_impl(metric, params, precision, dim, vectors, seed);
         }
-        parallel_build::build_parallel_graph(params, precision, dim, vectors, seed, threads, n)
+        parallel_build::build_parallel_graph(
+            metric, params, precision, dim, vectors, seed, threads, n,
+        )
     }
 
     /// [`build_with_threads`](Self::build_with_threads) と同一アルゴリズム・
@@ -2447,6 +2531,7 @@ impl HnswIndex {
             return Ok((index, profile));
         }
         let (index, mut profile) = parallel_build::build_parallel_graph_observed(
+            HnswMetric::InnerProduct,
             params,
             ResidentPrecision::F32,
             dim,
@@ -2515,15 +2600,37 @@ impl HnswIndex {
         let n = validate_build_input(&params, dim, vectors)?;
         let desired = crate::parallel_search::thread_count_for(n).min(MAX_BUILD_THREADS);
         if desired <= 1 || n <= SEQUENTIAL_PREFIX_NODES {
-            return Self::build_impl(params, precision, dim, vectors, seed);
+            return Self::build_impl(
+                HnswMetric::InnerProduct,
+                params,
+                precision,
+                dim,
+                vectors,
+                seed,
+            );
         }
         let guard = crate::parallel_search::WorkerBudgetGuard::acquire(desired);
         let granted = guard.granted();
         if granted <= 1 {
             drop(guard);
-            return Self::build_impl(params, precision, dim, vectors, seed);
+            return Self::build_impl(
+                HnswMetric::InnerProduct,
+                params,
+                precision,
+                dim,
+                vectors,
+                seed,
+            );
         }
-        let result = Self::build_with_threads_impl(params, precision, dim, vectors, seed, granted);
+        let result = Self::build_with_threads_impl(
+            HnswMetric::InnerProduct,
+            params,
+            precision,
+            dim,
+            vectors,
+            seed,
+            granted,
+        );
         drop(guard);
         result
     }
@@ -3092,6 +3199,18 @@ impl HnswIndex {
         self.resident_precision
     }
 
+    /// Cosine のときだけクエリを [`metric::normalize_into`] で正規化したバッファを返す
+    /// （他 metric は `None`＝そのまま使う）。次元・有限値の検証後に呼ぶ。正規化できない
+    /// クエリは `NonNormalizableQuery`（呼び出し元は brute-force へ縮退する）。
+    fn prepare_query(&self, query: &[f32]) -> Result<Option<Vec<f32>>, HnswError> {
+        if !self.metric.needs_normalization() {
+            return Ok(None);
+        }
+        let mut out = vec![0.0_f32; query.len()];
+        metric::normalize_into(query, &mut out).map_err(|()| HnswError::NonNormalizableQuery)?;
+        Ok(Some(out))
+    }
+
     /// 索引済みノード `node` の格納ベクトルが `candidate`（呼び出し元のクエリ
     /// スナップショットから取り出した現在の行）と「一致するとみなせるか」を
     /// 判定する（Issue #514・D4）。`sql::hnsw_cache::Overlay::compute` の
@@ -3111,6 +3230,19 @@ impl HnswIndex {
         if candidate.len() != dim {
             return None;
         }
+        // Cosine の常駐行は正規化済みなので、比較側も同じ関数で正規化する。正規化できない
+        // 行は「変更あり」（保守側）として扱う。
+        let normalized_candidate;
+        let candidate: &[f32] = if self.metric.needs_normalization() {
+            let mut out = vec![0.0_f32; dim];
+            if metric::normalize_into(candidate, &mut out).is_err() {
+                return Some(false);
+            }
+            normalized_candidate = out;
+            &normalized_candidate
+        } else {
+            candidate
+        };
         match &self.vectors {
             NodeVectors::F32(v) => {
                 let stored = node_vector(v, dim, node).ok()?;
@@ -3415,6 +3547,10 @@ impl HnswIndex {
         if query.iter().any(|v| !v.is_finite()) {
             return Err(HnswError::NonFiniteQuery);
         }
+        // Cosine はクエリを 1 回だけ正規化し、以降はそのバッファを下位へ渡す
+        // （resume 側も同じ関数で決定的に再計算するので値は一致する）。
+        let normalized_query = self.prepare_query(query)?;
+        let query: &[f32] = normalized_query.as_deref().unwrap_or(query);
         if ef == 0 || ef > MAX_EF {
             return Err(HnswError::InvalidParams {
                 reason: "ef must be in 1..=MAX_EF",
@@ -3731,6 +3867,10 @@ impl HnswIndex {
         if query.iter().any(|v| !v.is_finite()) {
             return Err(HnswError::NonFiniteQuery);
         }
+        // Cosine はクエリを 1 回だけ正規化し、以降はそのバッファを下位へ渡す
+        // （resume 側も同じ関数で決定的に再計算するので値は一致する）。
+        let normalized_query = self.prepare_query(query)?;
+        let query: &[f32] = normalized_query.as_deref().unwrap_or(query);
         if ef == 0 || ef > MAX_EF {
             return Err(HnswError::InvalidParams {
                 reason: "ef must be in 1..=MAX_EF",
@@ -3880,6 +4020,10 @@ impl HnswIndex {
         if query.iter().any(|v| !v.is_finite()) {
             return Err(HnswError::NonFiniteQuery);
         }
+        // Cosine はクエリを 1 回だけ正規化し、以降はそのバッファを下位へ渡す
+        // （resume 側も同じ関数で決定的に再計算するので値は一致する）。
+        let normalized_query = self.prepare_query(query)?;
+        let query: &[f32] = normalized_query.as_deref().unwrap_or(query);
         if ef == 0 || ef > MAX_EF {
             return Err(HnswError::InvalidParams {
                 reason: "ef must be in 1..=MAX_EF",
