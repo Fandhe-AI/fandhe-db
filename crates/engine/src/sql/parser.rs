@@ -172,6 +172,26 @@ pub struct BoundStatement {
     /// [`Ranking::Distance`] 以外のときは常に `Cosine`（[`check_distance_kind`] が束縛時に保証）。
     /// 非 Cosine の文は束縛を通るが、実行は `sql::exec` の入口が `0A000` で止める（仮置き）。
     pub(crate) distance_kind: crate::sql::lexer::DistanceKind,
+    /// 距離順 `ORDER BY` の `LIMIT` 省略時の暗黙の結果行数上限（Issue #2242・SQL-34 (2)(3)(4)）。
+    /// `Some(cap)` のとき `limit` は `cap + 1`（超過検出用の 1 件余分）で、実行段は ANN を
+    /// 使わない厳密全走査で返し、RLS 安全網と `OFFSET` の後に `cap` 件を超えたら `54000` で
+    /// 文全体を拒否する。束縛段だけが立てる（`pub(crate)`。公開の setter・`new` は常に `None`）。
+    pub(crate) result_cap: Option<usize>,
+}
+
+/// `LIMIT` 省略（暗黙上限）の距離順 SELECT と取得モードの整合を検査する（Issue #2242）。
+/// `precision` の確信度ゲートを全件順位付けに当てた意味が定まらないため、`DESC` と同じく
+/// `0A000` で拒否する（fail-closed。Execute と Describe で同じ判定にする）。
+fn check_limit_omission(
+    limit_implicit: bool,
+    mode: Option<SearchMode>,
+) -> Result<(), SqlSurfaceError> {
+    if limit_implicit && mode == Some(SearchMode::Precision) {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "omitting LIMIT on distance ORDER BY cannot be combined with precision mode",
+        ));
+    }
+    Ok(())
 }
 
 /// 距離種別と順位付け形の整合を検査する（Issue #1977）。`Distance` 以外の `ORDER BY` に
@@ -248,7 +268,13 @@ impl BoundStatement {
             evaluation_order,
             distance_descending: false,
             distance_kind: crate::sql::lexer::DistanceKind::Cosine,
+            result_cap: None,
         }
+    }
+
+    /// `LIMIT` 省略時の暗黙の結果行数上限（Issue #2242）。`Some` のとき `limit` は `cap + 1`。
+    pub(crate) fn result_cap(&self) -> Option<usize> {
+        self.result_cap
     }
 
     /// 距離演算子の種別を設定した crate 内ビルダー（Issue #1977。テスト専用）。
@@ -3108,15 +3134,18 @@ pub(crate) fn bind_in_session_with_limits(
     )?;
     check_distance_kind(stmt.distance_kind, &stmt.order_by)?;
 
-    let (limit, offset) =
-        validate_search_limit_offset_with(stmt.limit, stmt.offset, result_limits)?;
+    check_limit_omission(stmt.limit_implicit, Some(resolved_mode.mode()))?;
+    let (limit, offset, result_cap) = bind_limit_and_offset(stmt, result_limits)?;
 
     // SQL-74 (2)・Issue #2036: 距離述語を含む文は `HINT ORDER` が DISTANCE を先にしても SCALAR を
     // 先（事前フィルタ）に倒す。距離述語を DISTANCE 段の後の事後フィルタにすると、上位 k 件が
     // 述語で間引かれて `LIMIT` に満たない取りこぼしが起きるため、述語を満たす行だけを候補にして
     // から検索する（結果は厳密に評価した場合と一致する）。実行（`exec`）・EXPLAIN とも
     // `bound.evaluation_order` だけを見るので、ここで 1 回だけ決めれば両者が一致する。
-    let evaluation_order = if has_distance_predicate {
+    // Issue #2242: `LIMIT` 省略（厳密全走査）でも同様に SCALAR 先へ倒す。DISTANCE 先行だと
+    // 「近い順 cap+1 件 → 事後フィルタ」になり、WHERE に合う行が上限を超えていても黙って
+    // 少なく返す（fail-open）ため。結果は厳密全走査なので評価順で意味は変わらない。
+    let evaluation_order = if has_distance_predicate || result_cap.is_some() {
         EvaluationOrder::DEFAULT
     } else {
         stmt.evaluation_order
@@ -3145,7 +3174,31 @@ pub(crate) fn bind_in_session_with_limits(
         evaluation_order,
         distance_descending: stmt.distance_descending,
         distance_kind: stmt.distance_kind,
+        result_cap,
     })
+}
+
+/// 距離順 SELECT の `LIMIT`／`OFFSET` を束縛し `(limit, offset, result_cap)` を返す
+/// （Issue #2242）。`LIMIT` 省略（[`ValidatedStatement::limit_implicit`]）は範囲検証せず、
+/// 取得上限を `offset + cap + 1` に置いて実行段が超過を `54000` にする。`offset + cap + 1` は
+/// `checked_add` で計算し、溢れたら `Internal`（fail-closed）。明示 `LIMIT` は従来契約のまま。
+fn bind_limit_and_offset(
+    stmt: &ValidatedStatement,
+    result_limits: &crate::result_limits::ResultLimits,
+) -> Result<(usize, usize, Option<usize>), SqlSurfaceError> {
+    if !stmt.limit_implicit {
+        let (limit, offset) =
+            validate_search_limit_offset_with(stmt.limit, stmt.offset, result_limits)?;
+        return Ok((limit, offset, None));
+    }
+    let offset = validate_search_offset(stmt.offset)?;
+    let cap = result_limits.max_result_rows();
+    let overflow = || SqlSurfaceError::Internal {
+        detail: "result row limit overflows the fetch bound".to_string(),
+    };
+    let limit = cap.checked_add(1).ok_or_else(overflow)?;
+    offset.checked_add(limit).ok_or_else(overflow)?;
+    Ok((limit, offset, Some(cap)))
 }
 
 /// Describe（拡張クエリプロトコルの 'D' 種別 S。値未確定でも呼べる契約。
@@ -3209,7 +3262,8 @@ pub(crate) fn bind_projection_for_describe(
         Some(resolved_mode.mode()),
     )?;
     check_distance_kind(stmt.distance_kind, &stmt.order_by)?;
-    let _limits = validate_search_limit_offset_with(stmt.limit, stmt.offset, result_limits)?;
+    check_limit_omission(stmt.limit_implicit, Some(resolved_mode.mode()))?;
+    let _limits = bind_limit_and_offset(stmt, result_limits)?;
 
     Ok(projection)
 }
@@ -14186,6 +14240,56 @@ mod tests {
         let bound = bind_sql(SELECT_NO_MODE).expect("bind should succeed");
         assert_eq!(bound.mode.mode, SearchMode::Recall);
         assert_eq!(bound.mode.source, mode::ModeSource::Default);
+    }
+
+    // --- 距離順 `LIMIT` 省略の束縛（Issue #2242・SQL-34） ------------------------------
+
+    #[test]
+    fn bind_limit_omitted_sets_cap_and_fetches_cap_plus_one_after_offset() {
+        let default_cap = crate::result_limits::ResultLimits::default().max_result_rows();
+        let bound = bind_sql_with_session(
+            "SELECT * FROM documents ORDER BY embedding <=> '[0.1,0.2,0.3]' OFFSET 7",
+            None,
+        )
+        .expect("bind should succeed");
+        assert_eq!(bound.result_cap(), Some(default_cap));
+        assert_eq!(bound.limit, default_cap + 1);
+        assert_eq!(bound.offset, 7);
+        assert_eq!(bound.fetch_count(), default_cap + 1 + 7);
+
+        let explicit = bind_sql_with_session(SELECT_NO_MODE, None).expect("bind");
+        assert_eq!(explicit.result_cap(), None);
+    }
+
+    #[test]
+    fn bind_limit_omitted_rejects_precision_in_clause_and_session() {
+        let omitted = "SELECT * FROM documents ORDER BY embedding <=> '[0.1,0.2,0.3]'";
+        let err = bind_sql_with_session(omitted, Some(SearchMode::Precision)).unwrap_err();
+        assert_eq!(err.wire_code(), "0A000");
+        let err =
+            bind_sql_with_session(&format!("{omitted} USING MODE 'precision'"), None).unwrap_err();
+        assert_eq!(err.wire_code(), "0A000");
+    }
+
+    #[test]
+    fn bind_limit_omitted_rejects_offset_over_search_limit() {
+        let err = bind_sql_with_session(
+            "SELECT * FROM documents ORDER BY embedding <=> '[0.1,0.2,0.3]' OFFSET 4294967295",
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn bind_limit_omitted_forces_default_evaluation_order() {
+        let bound = bind_sql_with_session(
+            "SELECT * FROM documents WHERE lang = 'ja' ORDER BY embedding <=> '[0.1,0.2,0.3]' \
+             HINT ORDER(DISTANCE, SCALAR, RLS)",
+            None,
+        )
+        .expect("bind should succeed");
+        assert_eq!(bound.evaluation_order, EvaluationOrder::DEFAULT);
     }
 
     // --- bind_aggregate（TASK-166・SQL-13） -------------------------------------

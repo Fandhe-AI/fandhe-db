@@ -76,13 +76,6 @@ fn ids_ordered(core: &EngineCore, session: &mut SessionState, sql: &str) -> Vec<
     }
 }
 
-fn code(core: &EngineCore, session: &mut SessionState, sql: &str) -> String {
-    match core.execute_sql_in_session(&ctx(), session, sql) {
-        Ok(_) => "ok".to_string(),
-        Err(e) => e.wire_code().to_string(),
-    }
-}
-
 /// 境界テスト用の小さな表（値はすべて f32 で厳密）。
 fn boundary_table(label: &str) -> (EngineCore, SessionState, CleanupGuard) {
     let (core, mut session, g) = setup(
@@ -351,9 +344,9 @@ fn distance_first_hint_still_fills_limit() {
     assert_eq!(post, pre);
 }
 
-/// `LIMIT` なし（ORDER BY なし）は全可視行を厳密に評価する。ORDER BY があって `LIMIT` が無い形は従来の `42601`。
+/// `LIMIT` なし（ORDER BY なし）は全可視行を厳密に評価する。ORDER BY があって `LIMIT` が無い形も受理し、厳密全走査で距離昇順に返す。
 #[test]
-fn no_limit_is_exact_and_order_by_without_limit_is_rejected() {
+fn no_limit_is_exact_and_order_by_without_limit_is_accepted() {
     let rows = 200;
     let (core, mut s, _g) = grid_table("r74-nolimit", rows);
     let query = [1.0f32, -0.5, 0.25, 2.0];
@@ -366,15 +359,28 @@ fn no_limit_is_exact_and_order_by_without_limit_is_rejected() {
         "SELECT id FROM d WHERE embedding <+> '[1,-0.5,0.25,2]' <= 6",
     );
     assert_eq!(got, want);
-    assert_eq!(
-        code(
-            &core,
-            &mut s,
-            "SELECT id FROM d WHERE embedding <+> '[1,-0.5,0.25,2]' <= 6 \
-             ORDER BY embedding <=> '[1,-0.5,0.25,2]'"
-        ),
-        "42601"
+    // LIMIT 省略の ORDER BY は受理され、半径内の全行が距離昇順で返る（厳密全走査）。
+    let ordered = ids_ordered(
+        &core,
+        &mut s,
+        "SELECT id FROM d WHERE embedding <+> '[1,-0.5,0.25,2]' <= 6 \
+         ORDER BY embedding <=> '[1,-0.5,0.25,2]'",
     );
+    let mut sorted_ids = ordered.clone();
+    sorted_ids.sort_unstable();
+    assert_eq!(sorted_ids, want);
+    // 順序は既存の kNN と同じ内積の降順（同点は id 昇順）。
+    let dots: Vec<f32> = ordered
+        .iter()
+        .map(|i| {
+            grid_vec(*i as usize)
+                .iter()
+                .zip(&query)
+                .map(|(a, b)| a * b)
+                .sum::<f32>()
+        })
+        .collect();
+    assert!(dots.windows(2).all(|w| w[0] >= w[1]), "{dots:?}");
 }
 
 /// 他テナントの Private 行がクエリの直近にあっても、自テナントの結果にも件数にも現れない。

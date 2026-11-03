@@ -2422,6 +2422,10 @@ pub enum AnnPlan {
     /// 分類関数ではなく [`ann_plan_for_direction`] が、ゲート（`catalog::hnsw_gate_in_txn`）の
     /// `MetricMismatch` を受けて上書きして与える。
     PlainScanOpclassMismatch,
+    /// 距離順 `ORDER BY` が `LIMIT` を省略（または `LIMIT ALL`）しているため、ANN 索引を使わず
+    /// 可視行を厳密全走査して距離順にすべて返す（Issue #2242・SQL-33・SQL-34・SQL-75）。
+    /// 分類関数ではなく [`ann_plan_for_direction`] が上書きして与える。
+    PlainScanLimitOmitted,
 }
 
 /// [`classify_ann_plan`] の入力（`sql::exec::execute_statement_with_cache` と
@@ -2486,22 +2490,25 @@ pub fn classify_ann_plan(input: AnnShapeInput) -> AnnPlan {
 /// 距離方向（`DESC`）・距離種別の不一致による ANN 判定の上書き（Issue #2009・#1979・SQL-33・
 /// SQL-75 (4)・INDEX-7）。
 ///
-/// 優先順位は「`DESC` → 距離種別の不一致 → 既存の分類（`classify_ann_plan`）」。`descending` なら
-/// 常に [`AnnPlan::PlainScanDescending`]、そうでなく `metric_mismatch`（ゲートが
-/// `MetricMismatch` を返した）なら [`AnnPlan::PlainScanOpclassMismatch`]、どちらでもなければ入力を
+/// 優先順位は「`DESC` → 距離種別の不一致 → `LIMIT` 省略 → 既存の分類（`classify_ann_plan`）」。
+/// `descending` なら常に [`AnnPlan::PlainScanDescending`]、そうでなく `metric_mismatch`（ゲートが
+/// `MetricMismatch` を返した）なら [`AnnPlan::PlainScanOpclassMismatch`]、そうでなく
+/// `limit_omitted`（Issue #2242）なら [`AnnPlan::PlainScanLimitOmitted`]、いずれでもなければ入力を
 /// そのまま返す。実行側（`sql::exec`）と `EXPLAIN`（`core.rs::explain_engine_for`）が同じ関数を
-/// 通すことで、表示と実際の経路の判断元を 1 つにする。`LIMIT` 省略（Issue #2242）の理由が増える
-/// 場合は不一致の後ろに足す。公開の [`AnnShapeInput`] へフィールドを足さない（外部からの構造体
-/// リテラルを壊さない）ための crate 内部関数。
+/// 通すことで、表示と実際の経路の判断元を 1 つにする。公開の [`AnnShapeInput`] へフィールドを
+/// 足さない（外部からの構造体リテラルを壊さない）ための crate 内部関数。
 pub(crate) fn ann_plan_for_direction(
     plan: AnnPlan,
     descending: bool,
     metric_mismatch: bool,
+    limit_omitted: bool,
 ) -> AnnPlan {
     if descending {
         AnnPlan::PlainScanDescending
     } else if metric_mismatch {
         AnnPlan::PlainScanOpclassMismatch
+    } else if limit_omitted {
+        AnnPlan::PlainScanLimitOmitted
     } else {
         plan
     }
@@ -4516,18 +4523,31 @@ mod tests {
                             filters_empty,
                             scalar_prefilter,
                         });
-                        assert_eq!(ann_plan_for_direction(plan, false, false), plan);
+                        assert_eq!(ann_plan_for_direction(plan, false, false, false), plan);
                         assert_eq!(
-                            ann_plan_for_direction(plan, false, true),
+                            ann_plan_for_direction(plan, false, false, true),
+                            AnnPlan::PlainScanLimitOmitted
+                        );
+                        // LIMIT 省略より DESC・距離種別の不一致が優先する。
+                        assert_eq!(
+                            ann_plan_for_direction(plan, false, true, true),
+                            AnnPlan::PlainScanOpclassMismatch
+                        );
+                        assert_eq!(
+                            ann_plan_for_direction(plan, true, false, true),
+                            AnnPlan::PlainScanDescending
+                        );
+                        assert_eq!(
+                            ann_plan_for_direction(plan, false, true, false),
                             AnnPlan::PlainScanOpclassMismatch
                         );
                         // DESC は距離種別の不一致より優先する。
                         assert_eq!(
-                            ann_plan_for_direction(plan, true, true),
+                            ann_plan_for_direction(plan, true, true, false),
                             AnnPlan::PlainScanDescending
                         );
                         assert_eq!(
-                            ann_plan_for_direction(plan, true, false),
+                            ann_plan_for_direction(plan, true, false, false),
                             AnnPlan::PlainScanDescending
                         );
                     }
@@ -4535,7 +4555,7 @@ mod tests {
             }
         }
         assert_eq!(
-            ann_plan_for_direction(AnnPlan::UnknownCustomProvider, true, false),
+            ann_plan_for_direction(AnnPlan::UnknownCustomProvider, true, false, false),
             AnnPlan::PlainScanDescending
         );
     }

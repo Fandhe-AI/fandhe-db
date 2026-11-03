@@ -46,6 +46,6 @@
 - しきい値を DISTANCE 段へ持ち上げて途中で打ち切り、HNSW を早期終了する最適化は、ORDER BY の
   スコアと WHERE の距離が一致してから行う（#1977・#1987・#1991 待ち。正規化していないデータ
   ではコサインのしきい値が内積の順に対して単調にならない）。
-- `ORDER BY` があって `LIMIT` が無い形は #2242。投影・CASE の結果位置の距離値は #2006。
+- `ORDER BY` があって `LIMIT` が無い形は #2242 で実装済み（厳密全走査。[limit-omitted-result-cap.md](limit-omitted-result-cap.md) 参照）。投影・CASE の結果位置の距離値は #2006。
 - HAVING・JOIN での距離比較、しきい値側の `$n` は対象外（従来の拒否のまま）。
 - NoSQL の filter は対象外。
