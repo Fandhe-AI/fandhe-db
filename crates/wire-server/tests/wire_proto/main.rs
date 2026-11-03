@@ -43,4 +43,6 @@ mod wire23_copy_binary_from;
 mod wire23_copy_binary_to;
 mod wire24_declared_param_oids;
 mod wire26_numeric_pg17_vectors;
+mod wire_policy_copy;
+mod wire_policy_nonleak;
 mod wire_require_operation_id_matrix;

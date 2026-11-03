@@ -69,6 +69,12 @@ cat <<'EOF'
   crash-test-cross-table
       2 テーブル横断トランザクション・クラッシュ耐性回帰テスト
       $ scripts/crash_test_cross_table.sh
+  crash-test-ddl
+      1 文の DDL（CREATE/ALTER ADD COLUMN/CREATE INDEX/DROP TABLE）の crash 耐性回帰テスト
+      $ scripts/crash_test_ddl.sh
+  crash-test-txn-kill-points
+      明示トランザクションの実行中・COMMIT 直前・直後の SIGKILL 回帰テスト
+      $ scripts/crash_test_txn_kill_points.sh
   crash-test-unique-index
       永続一意索引・クラッシュ耐性回帰テスト
       $ scripts/crash_test_unique_index.sh
@@ -139,6 +145,8 @@ cat <<'EOF'
       $ scripts/crash_test.sh
       $ scripts/crash_test_interrupt.sh
       $ scripts/crash_test_cross_table.sh
+      $ scripts/crash_test_ddl.sh
+      $ scripts/crash_test_txn_kill_points.sh
       $ scripts/crash_test_unique_index.sh
       $ scripts/crash_test_partitioned_dml.sh
       $ scripts/crash_test_temp_table.sh

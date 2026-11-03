@@ -54,4 +54,6 @@ mod nosql_api_doc_examples;
 mod nosql_bigint_f64_exact_range;
 mod nosql_or_in_rewrite;
 mod nosql_result_limits;
+mod rls13_nosql_policy;
+mod rls13_nosql_policy_nonleak;
 mod table23_nosql_pk_row_address;

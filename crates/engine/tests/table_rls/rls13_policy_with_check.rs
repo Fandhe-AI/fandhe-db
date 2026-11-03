@@ -404,3 +404,125 @@ fn policies_and_state_are_independent_per_tenant() {
     assert!(row_ids(&core, "alice").is_empty());
     assert_eq!(row_ids(&core, "bob"), vec!["1"]);
 }
+
+// ---------------------------------------------------------------------
+// COPY ... FROM STDIN への WITH CHECK 適用（RLS-13・Issue #2280）。
+// COPY は複数行 INSERT と同じ束縛済み実行器（`execute_bound_insert_with_target`）へ委譲するので、
+// INSERT と同じ検査点で `42501` になり、1 行でも違反すれば全体を拒否する（原子性）。
+// 設計記録は `docs/design/row-security-policy-composition.md` の「NoSQL・COPY への適用（#2280）」。
+// ---------------------------------------------------------------------
+
+/// `COPY t (id, owner, n) FROM STDIN` のバッチを作る（wire-server の CopyIn 完了処理と同じ形）。
+fn copy_batch(
+    core: &EngineCore,
+    tenant: &str,
+    s: &SessionState,
+    op: &str,
+    data: &[u8],
+) -> engine::sql::copy::CopyInBatch {
+    use engine::core::CopyPlan;
+    let sql = format!("COPY t (id, owner, n) FROM STDIN USING OPERATION_ID '{op}'");
+    let CopyPlan::From(mut cs) = core.begin_copy(&ctx(tenant), s, &sql).expect("begin_copy") else {
+        panic!("expected COPY FROM plan");
+    };
+    cs.feed(data).expect("feed");
+    cs.finish().expect("finish")
+}
+
+#[test]
+fn copy_from_satisfying_batch_succeeds() {
+    let (_g, core, s) = setup_with_policy(
+        "rls13wc-copy-ok",
+        "CREATE POLICY p ON t FOR INSERT WITH CHECK (owner = 'a')",
+    );
+    let batch = copy_batch(&core, "alice", &s, "cp-ok", b"1\ta\t1\n2\ta\t2\n3\ta\t3\n");
+    let out = core.commit_copy_in(&ctx("alice"), batch).expect("commit");
+    assert_eq!(out.rows_affected, 3);
+    assert_eq!(row_ids(&core, "alice"), vec!["1", "2", "3"]);
+}
+
+#[test]
+fn copy_from_violation_is_42501_and_writes_nothing() {
+    let (_g, core, s) = setup_with_policy(
+        "rls13wc-copy-bad",
+        "CREATE POLICY p ON t FOR INSERT WITH CHECK (owner = 'a')",
+    );
+    // 3 行目だけが違反。先行の 2 行も書かれない。
+    let batch = copy_batch(
+        &core,
+        "alice",
+        &s,
+        "cp-bad",
+        b"1\ta\t1\n2\ta\t2\n3\tSECRETVAL\t3\n",
+    );
+    let err = core
+        .commit_copy_in(&ctx("alice"), batch)
+        .expect_err("violation");
+    assert_eq!(err.wire_code(), "42501");
+    let msg = err.to_string();
+    assert!(
+        !msg.contains("SECRETVAL") && !msg.contains("alice"),
+        "{msg}"
+    );
+    assert!(row_ids(&core, "alice").is_empty());
+}
+
+#[test]
+fn copy_from_violation_in_explicit_txn_fails_the_transaction() {
+    use engine::sql::transaction::TransactionStatus;
+    let (_g, core, mut s) = setup_with_policy(
+        "rls13wc-copy-txn",
+        "CREATE POLICY p ON t FOR INSERT WITH CHECK (owner = 'a')",
+    );
+    let mut txn = core.new_session_transaction();
+    core.execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, "BEGIN")
+        .expect("begin");
+    let batch = copy_batch(&core, "alice", &s, "cp-txn", b"1\tzzz\t1\n");
+    let err = core
+        .commit_copy_in_txn(&ctx("alice"), &mut txn, batch)
+        .expect_err("violation");
+    assert_eq!(err.wire_code(), "42501");
+    assert_eq!(txn.status(), TransactionStatus::Failed);
+    core.execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, "ROLLBACK")
+        .expect("rollback");
+    assert!(row_ids(&core, "alice").is_empty());
+}
+
+#[test]
+fn copy_from_without_insert_policy_is_default_deny() {
+    // ENABLE だけで INSERT に適用できるポリシーが無い表は、SQL の INSERT と同じく既定拒否。
+    let (_g, core) = open_fixture("rls13wc-copy-deny");
+    let mut s = session();
+    ok(
+        &core,
+        "alice",
+        &mut s,
+        "ALTER TABLE t ENABLE ROW LEVEL SECURITY",
+    );
+    ok(
+        &core,
+        "alice",
+        &mut s,
+        "ALTER TABLE t FORCE ROW LEVEL SECURITY",
+    );
+    let batch = copy_batch(&core, "alice", &s, "cp-deny", b"1\ta\t1\n");
+    let err = core
+        .commit_copy_in(&ctx("alice"), batch)
+        .expect_err("default deny");
+    assert_eq!(err.wire_code(), "42501");
+}
+
+#[test]
+fn copy_from_is_unaffected_by_other_tenants_policy() {
+    let (_g, core, _s) = setup_with_policy(
+        "rls13wc-copy-tenant",
+        "CREATE POLICY p ON t FOR INSERT WITH CHECK (owner = 'a')",
+    );
+    // bob のテーブルには ENABLE もポリシーも無い。alice のポリシーは bob の COPY に効かない。
+    let sb = session();
+    let batch = copy_batch(&core, "bob", &sb, "cp-bob", b"1\tzzz\t1\n");
+    let out = core.commit_copy_in(&ctx("bob"), batch).expect("bob commit");
+    assert_eq!(out.rows_affected, 1);
+    assert_eq!(row_ids(&core, "bob"), vec!["1"]);
+    assert!(row_ids(&core, "alice").is_empty());
+}

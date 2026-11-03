@@ -73,7 +73,7 @@
 | COPY | `COPY … FROM`（`commit_copy_in`）／`COPY … TO`（`run_scan_plan`） | FROM は INSERT と同じ WITH CHECK、TO は SELECT と同じ USING | #2280 |
 | 検索 | kNN 厳密走査（`PrefilterIndex`・`SearchTimeFilter`） | 論点 5 のマスク合成 | #2279 |
 | 検索 | HNSW（`sql/hnsw_cache.rs`）・ハイブリッド（`sql/hnsw_hybrid.rs`）・二次索引（`sql/scalar_index.rs`）・`RlsSafetyNet` | 論点 5 のマスク合成 | #2279 |
-| NoSQL | `http/query/{scan,search,aggregate,insert,update,delete}.rs`（upsert を含む） | SQL と同じ実行器へ束縛済み計画で渡す既存設計を維持 | #2280 |
+| NoSQL | `http/query/{scan,search,aggregate,insert,update,delete}.rs`（NoSQL に `upsert` は無い） | SQL と同じ実行器へ束縛済み計画で渡す既存設計を維持（経路の対応は「NoSQL・COPY への適用（#2280）」節） | #2280 |
 
 ## 論点 2: PERMISSIVE・RESTRICTIVE・既定拒否
 
@@ -173,6 +173,9 @@
 - 新しい `wire_code` は設けない。`42501` は既存の分類で表し、HTTP 射影は `http/status.rs` の既存写像に従う
 - NoSQL（HTTP）からのポリシー管理は `http/query/gate.rs`・`op.rs` の `classify_op` 許可リストの外として扱い、
   既存経路どおり `0A000` で拒否する
+- `WITH CHECK` 違反は HTTP では 403・`wire_code` `42501`（`code` は既存の補助ラベル `FORBIDDEN_TENANT_MISMATCH`。
+  新しいラベルは作らない）になる（#2280）。適用表への `search` + `plan` の辞書構築は SQL の `USING PLAN` と同じ
+  経路で拒否され、現状の分類は `XX000`・500（`0A000` への分類替えは未対応。後述）
 - DDL の SQLSTATE（`42501`・`42710`・`42704`・`42703`・`42804`）は PG 17 と同じとし、詳細は ERR-4・RLS-13 のポインタに委ねる
 
 ## 親 #2272 の合成規則との対応
@@ -276,7 +279,7 @@
 | #2278 | ロール・`BYPASSRLS`・`row_security`（論点 3）・判断 A |
 | #2279 | 索引走査・HNSW・ハイブリッド（論点 5）・判断 B・C |
 | #2280 | NoSQL・COPY（論点 1 のインベントリ・エラー契約） |
-| #2281 | 非漏えい試験（論点 4・5 の各規則） |
+| #2281 | 非漏えい試験（論点 4・5 の各規則）。下の「非漏えい試験（#2281）」節 |
 
 未決事項: マスクのキャッシュ化（判断 C）、Rust API の検索・`USING PLAN` の辞書構築への適用、PR #2828 のマージ後の相互リンクの追従。
 （ポリシー再帰の深さ上限は #2276 で「入れ子なし（深さ 1）」と確定した。下の「USING の適用（#2276）」節の判断 6）
@@ -482,3 +485,98 @@ HNSW のグラフ走査はテナント内の隠れたノードを経由しうる
 - **未対応（後続）**: `RETURNING` の新しい行への SELECT ポリシー、対象行の選択への `USING`（#2276）
 - **PG との差**: NOT NULL・行キー衝突（`23505`）は検査点より前に検出されるため、RLS 違反と同時に起きたときのエラーが
   PG と異なりうる（他テナントへの漏えいはない）
+
+## NoSQL・COPY への適用（#2280）
+
+親 #2272 の合成規則は、SQL 以外の入口にも同じ形で成立する。engine のポリシー段は NoSQL・COPY が通る共有実行器へ
+すでに組み込まれており、wire-server に第 2 の評価器は作っていない（`PolicyContext` も変えない）。本 Issue の
+成果物は経路のトレース確認と、表層ごとの一致・非漏えいテストである（本番コードの変更なし）。
+
+### 経路の対応
+
+| 表層の入口 | engine の入口 | ポリシー段 |
+| ---------- | ------------- | ---------- |
+| HTTP `scan` | `execute_bound_scan_in_session` | `sql/scan.rs` の SELECT USING（PK 点取得・GIN 候補を含む） |
+| HTTP `search`（`vector`） | `execute_bound_search_in_session` → `run_select_plan` | `sql/exec.rs` の SELECT USING（#2279） |
+| HTTP `search`（`plan`） | `execute_bound_plan_search_in_session` | 適用表では辞書構築を拒否（SQL の `USING PLAN` と同じ） |
+| HTTP `aggregate`（`group_by` 含む） | `execute_bound_aggregate_in_session` | `sql/aggregate.rs`・`sql/group_by.rs` の SELECT USING |
+| HTTP `insert` | `execute_bound_insert_in_session` | INSERT の WITH CHECK（`RowPolicyWrite::Insert`） |
+| HTTP `update`／`delete`（単一行・述語・`partitioned`） | `execute_bound_{update,delete}_*` | 対象選択に USING、書く行に WITH CHECK（SQL と同じ実行器） |
+| pg wire `COPY … FROM`（text・csv・binary） | `commit_copy_in*` → `execute_bound_insert_with_target` | INSERT と同じ WITH CHECK。1 行でも違反すれば全体を拒否（`42501`） |
+| pg wire `COPY … TO`（表形・`(SELECT …)` 形） | `begin_copy*` → `run_scan_plan`／SELECT 実行器 | SELECT と同じ USING（SELECT ポリシーが無ければ 0 行） |
+
+### `get`・`upsert` の扱い
+
+NoSQL の op 語彙（`Op::ALL` の 11 値）に `get`・`upsert` は無く、語彙は広げない（許可リストの閉包は P0 性質）。
+点取得は `scan` の主キー等値と `update`／`delete` の `where` 単一行形で表し、いずれも SQL の同じ形と同じ実行器を通る。
+`insert` は `on_conflict` を持たないので、`ON CONFLICT` の規則（#2277）は SQL 表層だけに現れる。
+
+### HTTP の主体
+
+HTTP の主体はロール未束縛で、`row_security` は常に on（NoSQL から変更できない）。所有者除外・`BYPASSRLS`
+（#2278）は engine 側に実体があっても HTTP 主体には効かず、利用者ポリシーを適用する側（fail-closed）に倒れる。
+HTTP のロール束縛は #2238 の担当で、入ると SQL のロール束縛あり主体との差が埋まる。本 Issue のテストは
+`FORCE ROW LEVEL SECURITY` を付けた表で書き、束縛の前後どちらでも成り立つ。
+
+### 非漏えいの固定内容
+
+- ポリシーで隠れた id への `update`／`delete`／主キー等値の `scan` は、存在しない id と応答（Date ヘッダ以外）が一致する
+- `explain: true`（`scan`・`aggregate`・`search`）は隠れた行を増やしても応答が変わらない（除外前の件数・候補数を出さない）
+- 拒否本文に行の値・テナント ID・トークンを含めない
+- 隠れた同テナント行との id 衝突は `23505`（一意性はテナント内で判定する。親 #2272 の規則・PG 17 と同じ）。
+  他テナントの行と衝突する id は成功する（他テナントの存在は漏れない）
+- NoSQL からポリシー DDL へは届かない（`create_policy` は `0A000`、`alter_table` の行セキュリティ用キーは `42601`）
+
+### 既知の差・申し送り
+
+- 適用表への `USING PLAN`（HTTP の `search` + `plan` を含む）の拒否は、現状 `XX000`・500 で fail-closed に
+  なっている（`run_using_plan_select` の辞書構築が `CatalogError::Invalid` を返し、SQL・HTTP とも内部エラーへ写る）。
+  設計の意図（`0A000`）に分類を合わせるのは別 Issue。テストは SQL との一致と非漏えいだけを固定している
+- 非漏えいの網羅（スコア・順位・件数・エラー・応答のバイト一致）は #2281 の「非漏えい試験（#2281）」節。
+  タイミング差の統計的検証は同節の「対象外」を参照
+
+### テスト
+
+| 場所 | 内容 |
+| ---- | ---- |
+| `crates/engine/tests/table_rls/rls13_policy_with_check.rs` | COPY FROM の WITH CHECK（autocommit・明示 Tx・既定拒否・テナント独立） |
+| `crates/engine/tests/table_rls/rls13_policy_using.rs` | COPY TO（表形・括弧形）が組合せ行列で SELECT のオラクルと一致 |
+| `crates/wire-server/tests/http_nosql/rls13_nosql_policy.rs` | HTTP 各 op の SQL 一致・非漏えい・403／`42501` 射影 |
+| `crates/wire-server/tests/wire_proto/wire_policy_copy.rs` | pg wire の COPY FROM（text・csv・binary・Tx）・COPY TO |
+
+## 非漏えい試験（#2281）
+
+テストのみを追加した（本番コードは変えていない。RLS-13 ポインタ、補助 RLS-12・ERR-4）。親 #2272 の不変条件
+「テナント境界が先に適用され、ポリシーは内側で AND 合成されて狭めるだけ」を、兄弟 Issue の経路別テストを
+書き直さずに、経路横断の回帰として固定する。
+
+### 双子 DB 方式
+
+観測側テナントの表・行・RLS・ポリシーを先に作り（内部 ID を揃える）、他テナントが Private 行（観測側と同じ id
+を含む）・自前の RLS・ポリシー・同名の関数・観測側に無い表を置いた DB（X）と、置いていない DB（Y）を比べる。
+同じ文の列を流し、結果行・件数・スコア・順位・`EXPLAIN`・SQLSTATE・`client_message`・失敗した段（SQL）、
+ステータス・ヘッダ・本文（HTTP）、全メッセージ（pg wire）がバイト一致することを固定する。期待値は
+テスト側の独立なオラクル（Rust の真実表）で出し、production の可視性判定は呼ばない。陽性対照として、
+観測側が見る行集合がオラクルと一致すること・拒否応答に WATCH 値（他テナントだけの名前・値・テナント ID・
+内部キーの印）が出ないこと・検査器自身が捏造した違反を検出することを同じテストで固定する。
+
+### 要件とテストの対応
+
+| 要件 | テスト |
+| ---- | ------ |
+| 他テナントの行は全組合せで読めず書けない・除外行の存在が応答に出ない | `rls13_policy_tenant_nonleak.rs`（RLS 状態 4 種 × ポリシー集合 × `row_security` × 入口 3 種。読み取り 11 プローブ・書き込み 8 プローブ・COPY の双方向）、HTTP の `rls13_nosql_policy_nonleak.rs`、pg wire の `wire_policy_nonleak.rs` |
+| 制約判定はテナント内の全行で行い、他テナントの行は入らない | `rls13_policy_constraint_scope.rs`（一意性・主キー・FK・`ON CONFLICT`・COPY FROM の一意性） |
+| ポリシー式・関数・部分クエリが他テナントの行へ届かない | `rls13_policy_expr_scope.rs`（式内の部分クエリ・UDF・`current_user` の拒否、`SECURITY DEFINER` の `0A000`、呼び出し元権限の関数・`DO`・部分クエリ・CTE・ビュー） |
+
+### 到達不能な分岐
+
+`BYPASSRLS`（`CREATE／ALTER ROLE ... BYPASSRLS` は構文段で `42501`）と所有者（所有者表の結線は #2236 待ち）の
+Skip 分岐は、現状 SQL から値を供給できない。判定そのものは `sql/policy_applicability.rs` の全組合せ単体テストが担い、
+本試験は SQL から届く拒否応答が X/Y で一致することだけを固定する。テスト用のバイパスフックは本番コードへ足さない
+（fail-open 経路になりうる）。#2278 段 2・#2236 でこれらが結線されたら、双子 DB の組合せ軸へ足す。
+
+### 対象外
+
+- タイミング差の統計的検証: 他テナントの行の有無による時間差はポリシー固有の性質ではなくテナント境界側の既存性質で、
+  テナント内の時間差は一意制約と同じ扱いで許容している（#2279 節）。必要なら別 Issue とする
+- 適用表への `USING PLAN` の分類（`XX000`・500）は #2280 節の既知の差のまま。SQL と HTTP の一致と非漏えいは既存テストで固定済み
