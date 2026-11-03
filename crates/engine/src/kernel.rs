@@ -13,6 +13,9 @@
 //! 内積経路とは規約が異なる（距離は昇順・f64、同点は id 昇順）。内積の
 //! [`SearchProvider`] は変更せず、`<=>` の実行切り替えは #1991 で行う。
 //!
+//! L2 距離の brute-force 経路（Issue #1981）は [`search_l2`]。二乗距離のまま昇順選出し、
+//! 平方根は最終出力用の [`l2_distance_from_sq`] だけで取る。SQL 接続は別 Issue。
+//!
 //! 経路選択の外部上書き機構（環境変数・設定フラグ等）は設けない（CORE-12）。
 //! 実行経路（CPU-SIMD／GPU）自体の決定表は `dispatch.rs::select_execution_path`
 //! （TASK-155・CORE-11, 12）に集約されており、本モジュールはあくまで provider
@@ -403,6 +406,63 @@ pub(crate) fn search_l1(input: SearchInput<'_>) -> Result<Vec<CandidateHit>, Ker
             continue;
         };
         let distance = l1(vector, input.query);
+        if !distance.is_finite() {
+            continue;
+        }
+        selector.push(CandidateHit {
+            id,
+            score: -distance,
+        });
+    }
+    Ok(selector.into_sorted_vec())
+}
+
+/// L2 二乗距離（Issue #1981・SQL-33）。現状は [`crate::isa::l2_sq_scalar`] を直接呼ぶ。
+/// #1982／#1983 が ISA 別カーネルを足した時点で `isa::current()` 経由へ切り替える。
+#[allow(dead_code)] // SQL 接続（別 Issue）までは単体テストのみが呼び出し元
+pub(crate) fn l2_sq(a: &[f32], b: &[f32]) -> f32 {
+    crate::isa::l2_sq_scalar(a, b)
+}
+
+/// 二乗距離から最終出力用の L2 距離（f64）を得る（Issue #1981。距離値の SQL 出力は #2006）。
+///
+/// 有限で非負の f32 に対して f64 の平方根は単調かつ異なる値を異なる値へ写すため、二乗距離の
+/// 順序と最終距離の順序は一致する。選出は常に二乗距離で行い、平方根は出力時だけ取る。
+#[allow(dead_code)] // 距離値の SQL 出力（#2006）までは単体テストのみが呼び出し元
+pub(crate) fn l2_distance_from_sq(sq: f32) -> f64 {
+    f64::from(sq).sqrt()
+}
+
+/// L2 距離による総当たり Top-k（距離の昇順・同距離は id 昇順。Issue #1981・SQL-33）。
+///
+/// 検証順・除外規約は [`search_l1`] と同じ。返す [`CandidateHit::score`] は負の二乗距離
+/// （`-l2_sq`）で、有限 f32 の符号反転は正確なため [`TopKSelector`] の順序がそのまま
+/// 距離昇順・同点 id 昇順になる。格納値が非有限の行・二乗和が +Inf に溢れた行は除外する
+/// （fail-closed。書き込み経路の検証があっても二重の安全網として残す）。
+/// SQL 表層（`ORDER BY v <-> q`）への接続は別 Issue の役割で、ゲートは変えていない。
+#[allow(dead_code)] // SQL 接続（別 Issue）までは単体テストのみが呼び出し元
+pub(crate) fn search_l2(input: SearchInput<'_>) -> Result<Vec<CandidateHit>, KernelError> {
+    let dim = input.dim as usize;
+    if input.query.len() != dim {
+        return Err(KernelError::DimMismatch {
+            expected: input.dim,
+            found: input.query.len(),
+        });
+    }
+    if input.query.iter().any(|v| !v.is_finite()) {
+        return Err(KernelError::NonFiniteQuery);
+    }
+    if input.k == 0 || input.ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut selector = TopKSelector::new(input.k);
+    for (idx, &id) in input.ids.iter().enumerate() {
+        let start = idx.saturating_mul(dim);
+        let end = start.saturating_add(dim);
+        let Some(vector) = input.vectors.get(start..end) else {
+            continue;
+        };
+        let distance = l2_sq(vector, input.query);
         if !distance.is_finite() {
             continue;
         }
@@ -1039,6 +1099,156 @@ mod tests {
             let got: Vec<u64> = hits.iter().map(|h| h.id).collect();
             assert_eq!(got, expected_ids, "dim={dim}");
         }
+    }
+
+    // ---- L2 距離 Top-k（Issue #1981・SQL-33） ----
+
+    fn l2_input<'a>(
+        ids: &'a [u64],
+        vectors: &'a [f32],
+        dim: u32,
+        query: &'a [f32],
+        k: usize,
+    ) -> SearchInput<'a> {
+        SearchInput {
+            ids,
+            vectors,
+            dim,
+            query,
+            k,
+        }
+    }
+
+    #[test]
+    fn l2_sq_basic_values() {
+        assert_eq!(l2_sq(&[3.0, 4.0], &[0.0, 0.0]), 25.0);
+        assert_eq!(l2_sq(&[1.0, 0.0], &[0.0, 1.0]), 2.0);
+        assert_eq!(l2_sq(&[1.5, -2.0], &[1.5, -2.0]), 0.0);
+        assert_eq!(l2_sq(&[], &[]), 0.0);
+        assert_eq!(l2_distance_from_sq(25.0), 5.0);
+    }
+
+    #[test]
+    fn search_l2_orders_by_distance_ascending_then_id() {
+        // dim=2、クエリ [0,0]。二乗距離は id=1:9, 2:1, 3:1, 4:13, 5:0。
+        let ids = [1u64, 2, 3, 4, 5];
+        let vectors = [3.0, 0.0, 0.0, 1.0, -1.0, 0.0, 2.0, -3.0, 0.0, 0.0];
+        let hits = search_l2(l2_input(&ids, &vectors, 2, &[0.0, 0.0], 10)).unwrap();
+        let got: Vec<u64> = hits.iter().map(|h| h.id).collect();
+        assert_eq!(got, vec![5, 2, 3, 1, 4]);
+        assert_eq!(hits[0].score, 0.0);
+        assert_eq!(hits[1].score, -1.0);
+        assert_eq!(hits[3].score, -9.0);
+    }
+
+    #[test]
+    fn search_l2_tie_at_k_boundary_keeps_smaller_id() {
+        let ids = [7u64, 3, 9];
+        let vectors = [1.0, -1.0, 1.0];
+        let hits = search_l2(l2_input(&ids, &vectors, 1, &[0.0], 2)).unwrap();
+        let got: Vec<u64> = hits.iter().map(|h| h.id).collect();
+        assert_eq!(got, vec![3, 7]);
+    }
+
+    #[test]
+    fn search_l2_zero_vectors() {
+        // ゼロクエリでもコサインと違い NaN にならず、距離は各行のノルム二乗になる。
+        let ids = [1u64, 2, 3];
+        let vectors = [3.0, 4.0, 0.0, 0.0, 1.0, 0.0];
+        let hits = search_l2(l2_input(&ids, &vectors, 2, &[0.0, 0.0], 5)).unwrap();
+        let got: Vec<(u64, f32)> = hits.iter().map(|h| (h.id, h.score)).collect();
+        assert_eq!(got, vec![(2, 0.0), (3, -1.0), (1, -25.0)]);
+        // ゼロベクトルの行とゼロクエリは距離 0 で先頭。
+        assert_eq!(hits[0].id, 2);
+        assert!(hits.iter().all(|h| h.score.is_finite()));
+    }
+
+    #[test]
+    fn search_l2_edge_cases_fail_closed() {
+        let ids = [1u64];
+        let vectors = [1.0, 2.0];
+        assert!(search_l2(l2_input(&ids, &vectors, 2, &[0.0, 0.0], 0))
+            .unwrap()
+            .is_empty());
+        assert!(search_l2(l2_input(&[], &[], 2, &[0.0, 0.0], 3))
+            .unwrap()
+            .is_empty());
+        let err = search_l2(l2_input(&ids, &vectors, 2, &[0.0], 3)).unwrap_err();
+        assert!(matches!(err, KernelError::DimMismatch { .. }));
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let err = search_l2(l2_input(&ids, &vectors, 2, &[bad, 0.0], 3)).unwrap_err();
+            assert_eq!(err, KernelError::NonFiniteQuery);
+        }
+        // 非有限の格納値・二乗和の溢れ（2e19^2 は f32 で +Inf）の行は除外される。
+        let ids = [1u64, 2, 3];
+        let vectors = [f32::NAN, 0.0, 1.0, 1.0, 2.0e19, 0.0];
+        let hits = search_l2(l2_input(&ids, &vectors, 2, &[0.0, 0.0], 5)).unwrap();
+        assert_eq!(hits.iter().map(|h| h.id).collect::<Vec<_>>(), vec![2]);
+        // ids に対してベクトルが足りない行は skip される。
+        let ids = [1u64, 2, 3];
+        let vectors = [1.0, 1.0, 2.0, 2.0];
+        let hits = search_l2(l2_input(&ids, &vectors, 2, &[0.0, 0.0], 5)).unwrap();
+        assert_eq!(hits.iter().map(|h| h.id).collect::<Vec<_>>(), vec![1, 2]);
+    }
+
+    #[test]
+    fn search_l2_matches_bruteforce_scalar_reference() {
+        // 整数値ベクトルなら丸め差が生じず id 列が完全一致する。
+        for dim in [1usize, 7, 16, 100, 768] {
+            for rows in [1usize, 5, 200] {
+                for k in [1usize, 25, rows + 10] {
+                    let mut x = 0x9e37_79b9_7f4a_7c15u64 ^ (dim * 1000 + rows) as u64;
+                    let mut next = || {
+                        x ^= x << 13;
+                        x ^= x >> 7;
+                        x ^= x << 17;
+                        (x % 9) as f32 - 4.0
+                    };
+                    let vectors: Vec<f32> = (0..rows * dim).map(|_| next()).collect();
+                    let query: Vec<f32> = (0..dim).map(|_| next()).collect();
+                    let ids: Vec<u64> = (0..rows as u64).map(|i| i * 3 + 1).collect();
+
+                    let mut expected: Vec<(f32, u64)> = ids
+                        .iter()
+                        .zip(vectors.chunks(dim))
+                        .map(|(&id, v)| (crate::isa::l2_sq_scalar(v, &query), id))
+                        .collect();
+                    expected.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+                    let expected_ids: Vec<u64> = expected.iter().take(k).map(|e| e.1).collect();
+
+                    let hits = search_l2(l2_input(&ids, &vectors, dim as u32, &query, k)).unwrap();
+                    let got: Vec<u64> = hits.iter().map(|h| h.id).collect();
+                    assert_eq!(got, expected_ids, "dim={dim} rows={rows} k={k}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn l2_ordering_matches_sqrt_ordering() {
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x % 20_000) as f32 / 1000.0 - 10.0
+        };
+        let dim = 16usize;
+        let query: Vec<f32> = (0..dim).map(|_| next()).collect();
+        let mut sq: Vec<(f32, u64)> = (0..300u64)
+            .map(|id| {
+                let v: Vec<f32> = (0..dim).map(|_| next()).collect();
+                (l2_sq(&v, &query), id)
+            })
+            .collect();
+        sq.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        let mut by_dist = sq.clone();
+        by_dist.sort_by(|a, b| {
+            l2_distance_from_sq(a.0)
+                .total_cmp(&l2_distance_from_sq(b.0))
+                .then(a.1.cmp(&b.1))
+        });
+        assert_eq!(sq, by_dist);
     }
 
     /// 参照用の距離関数（大きいほど近いスコアへ正規化）。選出器が距離種別に依存しないことの確認用
