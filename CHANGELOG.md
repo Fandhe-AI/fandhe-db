@@ -13,6 +13,7 @@
 
 ### Added
 
+- 距離順 `ORDER BY` で `LIMIT` を省略（`LIMIT ALL`・`OFFSET` 単独を含む）できるようにした（Issue #2242・SQL-33・SQL-34・SQL-75 ポインタ）。ANN 索引を使わず可視行を厳密全走査して距離順にすべて返す。可視件数（`OFFSET` 適用後）が `--max-result-rows` を超えたら行を返さず `54000`。`USING MODE 'precision'` との併用は `0A000`。hybrid 関数形・`USING PLAN` の省略は従来どおり `42601`。`EXPLAIN` の `ann_plan:` に `plain_scan_limit_omitted` を追加した（`AnnPlan::PlainScanLimitOmitted` の追加は `#[non_exhaustive]` のため非破壊）。従来 `42601` だった入力は受理に変わる。
 - kNN の `ORDER BY` と `$n` のベクトル位置が距離演算子 4 種（`<=>`／`<->`／`<#>`／`<+>`）を受け付けるようにした（Issue #1977・SQL-33・WIRE-12 ポインタ）。`ValidatedStatement::{distance_kind, with_distance_kind}` と `BoundStatement::distance_kind` を追加。`<->`／`<#>`／`<+>` は従来の `42601` から、構文・束縛を通って実行時 `0A000`（カーネル接続は後続 Issue）に変わる。`<=>` の挙動は不変。
 - `WHERE` 内の距離比較（`<VECTOR 列> <距離演算子> <ベクトルリテラル> <比較> <数値>`、`[NOT] BETWEEN`、`NOT`、逆向き）を評価するようにした（Issue #2036・SQL-74。#2035 の束縛までを受けた評価）。述語は RLS 後の可視行だけに適用し、厳密に評価した場合と一致する。ゼロノルムのコサイン距離は NaN で、比較は PG の float8 順序（NaN 同士は等しく最大）。`HINT ORDER` で DISTANCE を先にしても距離述語を含む文は事前フィルタに倒し、取りこぼしを防ぐ。詳細は `docs/design/radius-search.md`。
   BREAKING CHANGE: 公開 enum `BoundExpr` に `VectorDistance { kind, query }` を追加した（網羅的 `match` の下流は追随が必要）。従来 `0A000` だった距離比較は受理に変わる。

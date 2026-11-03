@@ -714,6 +714,8 @@ fn ann_plan_token(plan: AnnPlan) -> &'static str {
         // Issue #2009・SQL-75 (4): 距離順 `DESC` は索引を使わない厳密全走査。
         AnnPlan::PlainScanDescending => "plain_scan_descending",
         AnnPlan::PlainScanOpclassMismatch => "plain_scan_opclass_mismatch",
+        // Issue #2242・SQL-75: 距離順 `ORDER BY` の `LIMIT` 省略は索引を使わない厳密全走査。
+        AnnPlan::PlainScanLimitOmitted => "plain_scan_limit_omitted",
     }
 }
 
@@ -1168,7 +1170,7 @@ mod tests {
     }
 
     #[test]
-    fn build_explain_result_reports_all_seven_ann_plan_tokens() {
+    fn build_explain_result_reports_all_eight_ann_plan_tokens() {
         for (plan, expected) in [
             (AnnPlan::PlainScanEngine, "plain_scan_engine"),
             (AnnPlan::PlainScanPrecision, "plain_scan_precision"),
@@ -1180,6 +1182,7 @@ mod tests {
                 AnnPlan::PlainScanOpclassMismatch,
                 "plain_scan_opclass_mismatch",
             ),
+            (AnnPlan::PlainScanLimitOmitted, "plain_scan_limit_omitted"),
         ] {
             let planned = PlannedQuery::new(
                 QueryExpansion::default(),
@@ -1224,6 +1227,7 @@ mod tests {
             "unknown_custom_provider",
             "plain_scan_descending",
             "plain_scan_opclass_mismatch",
+            "plain_scan_limit_omitted",
         ];
 
         let hnsw_params = ValidatedHnswParams::new(HnswParams::default())
