@@ -260,23 +260,21 @@ fn offset_accepts_exactly_max_search_k_and_rejects_one_over() {
     assert_eq!(err.wire_code(), "22000");
 }
 
-// ---------- 検索 SELECT・EXPLAIN は引き続き OFFSET を拒否する ----------
+// ---------- 検索 SELECT の OFFSET は Issue #2008（SQL-33 (8)）で受理（詳細は sql33_knn_offset.rs） ----------
 
 #[test]
-fn search_select_with_offset_is_still_rejected_as_syntax_error() {
+fn search_select_with_offset_is_accepted() {
     let path = unique_db_path("offset-search-form-rejected");
     let _guard = CleanupGuard(path.clone());
     let storage = Storage::open(&path).expect("open storage");
     storage.create_table(&schema()).expect("create table");
     let core = new_core(storage);
 
-    let err = core
-        .execute_sql(
-            &ctx("tenant-a"),
-            "SELECT id FROM docs ORDER BY embedding <=> '[0,0]' LIMIT 5 OFFSET 1",
-        )
-        .expect_err("ranked search SELECT must not accept OFFSET");
-    assert_eq!(err.wire_code(), "42601");
+    core.execute_sql(
+        &ctx("tenant-a"),
+        "SELECT id FROM docs ORDER BY embedding <=> '[0,0]' LIMIT 5 OFFSET 1",
+    )
+    .expect("ranked search SELECT accepts OFFSET (Issue #2008・SQL-33 (8))");
 }
 
 // ---------- GROUP BY 集計への OFFSET ----------

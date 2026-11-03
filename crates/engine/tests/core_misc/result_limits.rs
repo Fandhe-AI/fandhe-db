@@ -238,6 +238,35 @@ fn offset_range_is_not_linked_to_the_setting() {
     ok(&core, "SELECT id FROM docs LIMIT 10 OFFSET 10000");
 }
 
+/// Issue #2008・SQL-33 (8): kNN の `LIMIT + OFFSET` は設定値（結果行数上限）以下でなければ
+/// 固定文言の `54000` で拒否される。OFFSET 単独の範囲は設定値と連動しない。
+#[test]
+fn knn_limit_plus_offset_is_bounded_by_the_setting() {
+    let path = unique_db_path("result-limits-knn-offset");
+    let _guard = CleanupGuard(path.clone());
+    let core = core_with(&path, Some(50));
+    for template in [
+        |l: usize, o: usize| {
+            format!("SELECT id FROM docs ORDER BY embedding <=> '[1,1]' LIMIT {l} OFFSET {o}")
+        },
+        |l: usize, o: usize| {
+            format!(
+                "SELECT id FROM docs ORDER BY HYBRID(embedding, '[1,1]', body, 'common') LIMIT {l} OFFSET {o}"
+            )
+        },
+        |l: usize, o: usize| {
+            format!(
+                "SELECT id FROM docs ORDER BY embedding <=> '[1,1]' LIMIT {l} OFFSET {o} USING MODE 'precision'"
+            )
+        },
+    ] {
+        ok(&core, &template(25, 25));
+        assert_eq!(code(&core, &template(25, 26)), "54000");
+        assert_eq!(code(&core, &template(51, 0)), "22000");
+        assert_eq!(code(&core, &template(1, 10_001)), "22000");
+    }
+}
+
 #[test]
 fn bound_plan_entry_rechecks_against_configured_limit() {
     let path = unique_db_path("result-limits-bound-entry");

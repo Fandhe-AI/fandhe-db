@@ -412,6 +412,66 @@ fn seed_rows_on_core(
     }
 }
 
+/// Issue #2008・SQL-33 (8)・SQL-73 (3): HNSW 経路の kNN `OFFSET` が、既定エンジン（厳密走査）の
+/// `LIMIT k OFFSET m` と整合すること。ANN は近似のため完全一致ではなく Recall 基準（0.9）で
+/// 判定する。`OFFSET` ページを連結しても重複がなく、`OFFSET` 付きでも HNSW 索引が使われる
+/// （キャッシュの build が走る）ことを併せて固定する。
+#[test]
+fn knn_offset_on_hnsw_matches_default_engine() {
+    let dir = unique_db_path("hnsw-cache-offset-hnsw");
+    let _cleanup = CleanupGuard(dir.clone());
+    let storage = Storage::open(&dir).expect("open storage");
+    storage.create_table(&schema(DIM)).expect("create table");
+    let vectors = gen_clustered_corpus(21, DIM as usize, BASE_ROWS, 12);
+    seed_rows(&storage, "tenant-a", 1, &vectors, "offset");
+    let kind =
+        search_engine::hnsw_kind(engine::hnsw::HnswParams::default()).expect("valid hnsw params");
+    let core = EngineCore::from_storage_with_engine(storage, kind);
+
+    let ref_dir = unique_db_path("hnsw-cache-offset-ref");
+    let _ref_cleanup = CleanupGuard(ref_dir.clone());
+    let ref_storage = Storage::open(&ref_dir).expect("open ref storage");
+    ref_storage
+        .create_table(&schema(DIM))
+        .expect("create ref table");
+    seed_rows(&ref_storage, "tenant-a", 1, &vectors, "offset-ref");
+    let ref_core = EngineCore::from_storage(ref_storage, search_engine::default_engine());
+
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    let offset_ids = |c: &EngineCore, q: &[f32], k: usize, m: usize| -> Vec<u64> {
+        let sql = format!(
+            "SELECT id FROM docs ORDER BY embedding <=> '{}' LIMIT {k} OFFSET {m}",
+            vec_literal(q)
+        );
+        let result = c.execute_sql(&ctx, &sql).expect("offset query");
+        result.rows.iter().map(|r| r.id).collect()
+    };
+
+    let mut recalls = Vec::new();
+    for i in 0..10 {
+        let q = &vectors[i * (BASE_ROWS / 10)];
+        let mut paged: Vec<u64> = Vec::new();
+        for page in 0..3 {
+            let got = offset_ids(&core, q, 10, page * 10);
+            let want = offset_ids(&ref_core, q, 10, page * 10);
+            assert_eq!(want.len(), 10);
+            assert_eq!(got.len(), 10, "HNSW page must be full");
+            recalls.push(recall_at_k(&got, &want));
+            paged.extend(got);
+        }
+        let mut dedup = paged.clone();
+        dedup.sort_unstable();
+        dedup.dedup();
+        assert_eq!(dedup.len(), paged.len(), "pages must not overlap");
+    }
+    let avg = recalls.iter().sum::<f64>() / recalls.len() as f64;
+    assert!(avg >= 0.9, "offset recall too low: {avg}");
+    assert!(
+        core.hnsw_index_cache_stats().builds >= 1,
+        "OFFSET queries must still use the HNSW index"
+    );
+}
+
 /// R4: テナント境界。tenant-a の private 行は tenant-b の可視結果に現れず、
 /// キャッシュエントリは `(table, ctx)` ごとに独立する。
 /// [`r4_tenant_isolation_never_leaks_across_ctx`]／[`f16_r4_tenant_isolation_never_leaks_across_ctx`]
