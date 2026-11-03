@@ -2131,6 +2131,27 @@ pub fn order_by_distance_literal_is_param(tokens: &[Token]) -> bool {
     })
 }
 
+/// `tokens`（`$n` 置換前の元トークン列）の SELECT リスト（先頭 `SELECT` から括弧深度 0 の
+/// `FROM` まで）に、投影位置の距離列 `<列> <距離演算子> $n`（SQL-33 (7)・Issue #2007）の `$n` が
+/// あるかを判定する。[`order_by_distance_literal_is_param`] と同じ用途（Prepared Describe が
+/// ダミー値のベクトルリテラル実パースを省いてよいかの判定）で、括弧内（関数引数・
+/// ウィンドウ・副問い合わせ）は対象外。
+pub fn select_list_distance_literal_is_param(tokens: &[Token]) -> bool {
+    let mut depth: usize = 0;
+    let mut prev_is_distance_op = false;
+    for t in tokens {
+        match t {
+            Token::Punct('(') => depth = depth.saturating_add(1),
+            Token::Punct(')') => depth = depth.saturating_sub(1),
+            Token::Keyword(lexer::Keyword::From) if depth == 0 => return false,
+            Token::Param(_) if depth == 0 && prev_is_distance_op => return true,
+            _ => {}
+        }
+        prev_is_distance_op = matches!(t, Token::DistanceOp(_));
+    }
+    false
+}
+
 /// 型付き値の負値（`-` + `$typed:<型>` + 数値）か。
 fn is_typed_negative(produced: &[Token]) -> bool {
     matches!(
@@ -2757,6 +2778,22 @@ mod tests {
         )
         .expect("tokenize_with_params should succeed");
         assert!(order_by_distance_literal_is_param(&tokens));
+    }
+
+    #[test]
+    fn select_list_distance_literal_is_param_detects_projection_param_only() {
+        // 投影位置の `$n`（SQL-33 (7)・Issue #2007）だけを検出し、WHERE・ORDER BY の `$n` と
+        // 括弧内（関数引数）は対象外。
+        let t = |sql: &str| tokenize_with_params(sql).expect("tokenize");
+        assert!(select_list_distance_literal_is_param(&t(
+            "SELECT id, embedding <=> $1 AS d FROM documents ORDER BY embedding <=> $1 LIMIT 3"
+        )));
+        assert!(!select_list_distance_literal_is_param(&t(
+            "SELECT id FROM documents ORDER BY embedding <=> $1 LIMIT 3"
+        )));
+        assert!(!select_list_distance_literal_is_param(&t(
+            "SELECT id, embedding <=> '[1,0,0]' AS d FROM documents WHERE embedding <=> $1 < 1 ORDER BY embedding <=> '[1,0,0]' LIMIT 3"
+        )));
     }
 
     #[test]

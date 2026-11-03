@@ -211,6 +211,53 @@ fn check_distance_kind(
     Ok(())
 }
 
+/// 投影の距離列（SQL-33 (7)・Issue #2007）と距離 `ORDER BY` の整合を検査する。
+/// 構文段（`parse_select_shape`）が列・種別の一致を保証するが、`ValidatedStatement::new` を直接
+/// 使う呼び出し元も迂回できないよう束縛段でも守る（多層防御）。距離列があるのに順位付けが
+/// 距離でない・種別が違う組は `42601`。`compare_query` が真（実リテラル）でクエリベクトルが
+/// ビット単位で一致しない組は `0A000`（未対応の形。ベクトル値はエラーに含めない）。
+fn check_projected_distance(
+    projection: &[ProjectedColumn],
+    ranking: &Ranking,
+    kind: crate::sql::lexer::DistanceKind,
+    compare_query: bool,
+) -> Result<(), SqlSurfaceError> {
+    for col in projection {
+        let ProjectedColumn::Computed {
+            expr:
+                crate::sql::udf_call::BoundExpr::VectorDistance {
+                    kind: item_kind,
+                    query: item_query,
+                },
+            ..
+        } = col
+        else {
+            continue;
+        };
+        let Ranking::Distance { query } = ranking else {
+            return Err(SqlSurfaceError::unsupported(
+                "a projected distance requires a distance ORDER BY",
+            ));
+        };
+        if *item_kind != kind {
+            return Err(SqlSurfaceError::unsupported(
+                "a projected distance must use the same operator as the distance ORDER BY",
+            ));
+        }
+        let same = item_query.len() == query.len()
+            && item_query
+                .iter()
+                .zip(query.iter())
+                .all(|(a, b)| a.to_bits() == b.to_bits());
+        if compare_query && !same {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "a projected distance must use the same query vector as the distance ORDER BY",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// 距離方向（`DESC`）と順位付け形・実効モードの整合を検査する（Issue #2009・SQL-33 (2)）。
 /// `Distance` 以外の `ORDER BY` に方向が付く組は公開ビルダーの誤用でしか作れないため
 /// `42601` で拒否する。`precision` モードの確信度ゲートは最近傍側のマージンを前提とし、
@@ -1845,6 +1892,45 @@ pub fn bind_projection(
     udfs: &crate::sql::udf_call::UdfRegistry,
     node_budget: &mut usize,
 ) -> Result<Vec<ProjectedColumn>, SqlSurfaceError> {
+    bind_projection_with_literals(projection, schema, udfs, node_budget, true)
+}
+
+/// 投影トップレベルの距離列（SQL-33 (7)・Issue #2007）のベクトルリテラルを、構造検証専用の
+/// 同次元のゼロベクトルへ置き換えた式を返す。Prepared Describe が `$n` 由来のダミー値
+/// （ベクトルとして不正）で列メタだけを導出するための縮退経路で、列・型の検証は通常経路と
+/// 同じ束縛（[`crate::sql::udf_call::bind_projection_expr_json_ok`]）に任せる。
+fn placeholder_distance_expr(expr: &Expr, schema: &TableSchema) -> Option<Expr> {
+    let Expr::VectorDistance { kind, lhs, rhs } = expr else {
+        return None;
+    };
+    if !matches!(
+        (lhs.as_ref(), rhs.as_ref()),
+        (Expr::Ident(_), Expr::String(_))
+    ) {
+        return None;
+    }
+    let dim = schema.columns.iter().find_map(|c| match c.ty {
+        ColumnType::Vector(d) => Some(d),
+        _ => None,
+    })?;
+    // 次元はスキーマ宣言値（検証済み）。リテラル文字列は `[0,0,...]` の高々 2 * dim + 2 バイト。
+    let zeros = vec!["0"; usize::try_from(dim).ok()?].join(",");
+    Some(Expr::VectorDistance {
+        kind: *kind,
+        lhs: lhs.clone(),
+        rhs: Box::new(Expr::String(format!("[{zeros}]"))),
+    })
+}
+
+/// [`bind_projection`] の本体。`validate_literals == false` のときだけ、投影の距離列の
+/// ベクトルリテラルを実解析せずダミーで置き換える（Prepared Describe 専用。Issue #2007）。
+pub(crate) fn bind_projection_with_literals(
+    projection: &Projection,
+    schema: &TableSchema,
+    udfs: &crate::sql::udf_call::UdfRegistry,
+    node_budget: &mut usize,
+    validate_literals: bool,
+) -> Result<Vec<ProjectedColumn>, SqlSurfaceError> {
     match projection {
         Projection::All => {
             let mut cols = Vec::with_capacity(schema.columns.len() + 1);
@@ -1885,9 +1971,14 @@ pub fn bind_projection(
                         cols.push(resolve_projected_column(name, alias, schema)?);
                     }
                     crate::sql::allowlist::SelectItem::Expr { expr, alias } => {
+                        let placeholder = if validate_literals {
+                            None
+                        } else {
+                            placeholder_distance_expr(expr, schema)
+                        };
                         let (bound, ty, result_ty) =
                             crate::sql::udf_call::bind_projection_expr_json_ok(
-                                expr,
+                                placeholder.as_ref().unwrap_or(expr),
                                 schema,
                                 udfs,
                                 node_budget,
@@ -3133,6 +3224,7 @@ pub(crate) fn bind_in_session_with_limits(
         Some(resolved_mode.mode()),
     )?;
     check_distance_kind(stmt.distance_kind, &stmt.order_by)?;
+    check_projected_distance(&projection, &ranking, stmt.distance_kind, true)?;
 
     check_limit_omission(stmt.limit_implicit, Some(resolved_mode.mode()))?;
     let (limit, offset, result_cap) = bind_limit_and_offset(stmt, result_limits)?;
@@ -3244,7 +3336,13 @@ pub(crate) fn bind_projection_for_describe(
     let resolved_mode = mode::resolve_mode(query_mode, session_mode);
 
     let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
-    let projection = bind_projection(&stmt.projection, schema, udfs, &mut node_budget)?;
+    let projection = bind_projection_with_literals(
+        &stmt.projection,
+        schema,
+        udfs,
+        &mut node_budget,
+        validate_vector_literal,
+    )?;
 
     let (_metadata_filters, _expr_filters, _rls_predicate_present, _or_filters) =
         bind_where_predicates(
@@ -3255,13 +3353,19 @@ pub(crate) fn bind_projection_for_describe(
             dummy_equality_flags,
         )?;
 
-    let _ranking = bind_ranking(&stmt.order_by, schema, validate_vector_literal)?;
+    let ranking = bind_ranking(&stmt.order_by, schema, validate_vector_literal)?;
     check_distance_direction(
         stmt.distance_descending,
         &stmt.order_by,
         Some(resolved_mode.mode()),
     )?;
     check_distance_kind(stmt.distance_kind, &stmt.order_by)?;
+    check_projected_distance(
+        &projection,
+        &ranking,
+        stmt.distance_kind,
+        validate_vector_literal,
+    )?;
     check_limit_omission(stmt.limit_implicit, Some(resolved_mode.mode()))?;
     let _limits = bind_limit_and_offset(stmt, result_limits)?;
 

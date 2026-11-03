@@ -14,6 +14,7 @@ mod sql33_distance_kind_acceptance;
 mod sql33_knn_desc;
 mod sql33_knn_limit_omitted;
 mod sql33_opclass_mismatch;
+mod sql33_projected_distance;
 mod sql_aggregate;
 mod sql_aggregate_public_api;
 mod sql_allowlist;

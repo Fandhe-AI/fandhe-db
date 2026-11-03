@@ -7164,8 +7164,12 @@ impl EngineCore {
         }
         // ダミー置換前の元トークン列から判定する（置換後は `$n` 自体が
         // 消えるため、置換後トークン列からは判定できない）。
+        // SQL-33 (7)・Issue #2007: 投影位置の距離列の `$n` も同じ「ベクトルリテラル検証の省略」
+        // 対象。ORDER BY 側と区別せず 1 つの印にまとめる（片側が実リテラルの場合も Describe では
+        // 検証を省くが、Bind／Execute で必ず検証される。fail-closed）。
         let order_by_distance_literal_is_param =
-            crate::sql::params::order_by_distance_literal_is_param(&tokens);
+            crate::sql::params::order_by_distance_literal_is_param(&tokens)
+                || crate::sql::params::select_list_distance_literal_is_param(&tokens);
         // Issue #1342・#1546: 型推論（カタログとトークン列だけで決まる）を先に行い、
         // 確定した置換リテラル種別の型付きダミーで 1 回だけ構造検証 parse する。
         // 式内 `$n`（`1 + $1` 等）は文字列ダミーでは定数畳み込み／束縛の型検査に落ちるため、

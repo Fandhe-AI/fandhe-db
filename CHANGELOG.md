@@ -13,6 +13,7 @@
 
 ### Added
 
+- 距離順 `ORDER BY` を持つ検索 SELECT の投影位置に距離列 `<VECTOR 列> <距離演算子> <リテラル|$n> [AS 別名]` を受理し、float8 で返すようにした（Issue #2007・SQL-33 (7) ポインタ）。列・演算子種別・クエリベクトルが `ORDER BY` と同一の形だけを受理する（種別・列の不一致や距離 `ORDER BY` のない文は `42601`、クエリベクトルの不一致は `0A000`）。値は RLS 後の行から計算し、ゼロノルムのコサインは NaN。`<->`／`<#>`／`<+>` の実行はカーネル接続（#1981・#1991）まで `0A000` のまま。従来 `42601` だった入力は受理に変わる。公開 API の変更はない。
 - `sum(<VECTOR 列>)` と VECTOR 型の式（`sum(vec_div(embedding, 2))` 等）の `sum` を受け付けるようにした（Issue #2038・SQL-72 (3) ポインタ）。要素ごとに f64 で累積して f32 へ丸め、NULL 行は飛ばし、対象 0 行なら NULL、次元不一致は `22000`、f32 範囲超過は `22003`。`GROUP BY`・`FILTER`・他の集計への `HAVING` と併用できる。結果列は `vector`（wire の型 OID は 25）。挙動変更: `SUM(<VECTOR 列>)` は `42883` から受理に変わる。`MIN`／`MAX`／`AVG`、NoSQL、JOIN、FROM なしの SELECT、ウィンドウ（`0A000`）、集計結果の `HAVING`／`ORDER BY`／演算（`0A000`／`42601`）は従来どおり拒否。公開 API の変更はない。
 - 距離順 `ORDER BY` で `LIMIT` を省略（`LIMIT ALL`・`OFFSET` 単独を含む）できるようにした（Issue #2242・SQL-33・SQL-34・SQL-75 ポインタ）。ANN 索引を使わず可視行を厳密全走査して距離順にすべて返す。可視件数（`OFFSET` 適用後）が `--max-result-rows` を超えたら行を返さず `54000`。`USING MODE 'precision'` との併用は `0A000`。hybrid 関数形・`USING PLAN` の省略は従来どおり `42601`。`EXPLAIN` の `ann_plan:` に `plain_scan_limit_omitted` を追加した（`AnnPlan::PlainScanLimitOmitted` の追加は `#[non_exhaustive]` のため非破壊）。従来 `42601` だった入力は受理に変わる。
 - kNN の `ORDER BY` と `$n` のベクトル位置が距離演算子 4 種（`<=>`／`<->`／`<#>`／`<+>`）を受け付けるようにした（Issue #1977・SQL-33・WIRE-12 ポインタ）。`ValidatedStatement::{distance_kind, with_distance_kind}` と `BoundStatement::distance_kind` を追加。`<->`／`<#>`／`<+>` は従来の `42601` から、構文・束縛を通って実行時 `0A000`（カーネル接続は後続 Issue）に変わる。`<=>` の挙動は不変。
