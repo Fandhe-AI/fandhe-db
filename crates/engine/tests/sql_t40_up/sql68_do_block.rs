@@ -200,3 +200,21 @@ fn multi_statement_message_with_do_is_treated_as_a_write() {
         StatementEffect::Write
     );
 }
+
+/// Issue #2880: 条件式の `AND`・`OR`・`NOT`・`BETWEEN`・`IN` が DO ブロックでも分岐を決める。
+#[test]
+fn compound_conditions_choose_the_branch() {
+    let (core, _g) = setup("sql68-do-compound");
+    run(
+        &core,
+        "alice",
+        "DO 'DECLARE v int := 3; BEGIN \
+         IF v > 0 AND v < 10 THEN INSERT INTO t (n) VALUES (1); END IF; \
+         IF v < 0 OR v > 10 THEN INSERT INTO t (n) VALUES (2); END IF; \
+         IF NOT (v IN (1, 2)) AND v BETWEEN 2 AND 4 THEN INSERT INTO t (n) VALUES (3); END IF; \
+         END'",
+    )
+    .expect("do");
+    assert_eq!(count(&core, "alice"), 2);
+    assert_eq!(count(&core, "bob"), 0);
+}
