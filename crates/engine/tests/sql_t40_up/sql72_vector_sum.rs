@@ -256,3 +256,22 @@ fn unsupported_shapes_stay_fail_closed() {
         assert_eq!(code, expected, "{sql}");
     }
 }
+
+/// PR #2925 レビュー指摘の回帰: 集計結果（`Computed`）のベクトル列も、重複除去を伴う集合演算
+/// （UNION/INTERSECT/EXCEPT）の型ゲートで明示的に拒否する（行キー化の `XX000` に到達させない）。
+/// `UNION ALL` は行キーを作らないため従来どおり通す。
+#[test]
+fn vector_sum_is_rejected_by_deduplicating_set_operations() {
+    let (core, _g) = build_core("sql72-sum-setop", &SEEDS_A, &SEEDS_B_HUGE);
+    for op in ["UNION", "INTERSECT", "EXCEPT"] {
+        let sql = format!("SELECT sum(embedding) FROM t {op} SELECT sum(embedding) FROM t");
+        let code = code_of(&core, &sql);
+        assert_ne!(code, "XX000", "{sql}");
+        assert_eq!(code, "22000", "{sql}");
+    }
+    let r = exec(
+        &core,
+        "SELECT sum(embedding) FROM t UNION ALL SELECT sum(embedding) FROM t",
+    );
+    assert_eq!(r.rows.len(), 2);
+}
