@@ -642,18 +642,20 @@ fn profile_arm_contract_matches_scalar_index_cache_stats() {
 
     let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
 
+    // Issue #1994: `<#>` の実行経路（Issue #1991）が main に入るまで、実行系の本テストだけは
+    // 現行で実行可能な `<=>`（L2）を使う。#1991 のマージ後に `<#>` へ戻す。
     let sql_index = format!(
         // `LIMIT` を一致件数（10）以上に取り、Top-k がタイブレーク順序に依存
         // せず一致行集合の全体（部分集合ではなく）になるようにする（クエリ
         // ベクトルが原点のため候補間の距離が同点になり得る）。
-        "SELECT id FROM docs {} ORDER BY embedding <#> '[0.0,0.0,0.0,0.0]' LIMIT 20",
+        "SELECT id FROM docs {} ORDER BY embedding <=> '[0.0,0.0,0.0,0.0]' LIMIT 20",
         where_clause_for_arm(ProfileArm::Index, "lang", TARGET_LANG)
     );
     let sql_plain = format!(
         // `LIMIT` を一致件数（10）以上に取り、Top-k がタイブレーク順序に依存
         // せず一致行集合の全体（部分集合ではなく）になるようにする（クエリ
         // ベクトルが原点のため候補間の距離が同点になり得る）。
-        "SELECT id FROM docs {} ORDER BY embedding <#> '[0.0,0.0,0.0,0.0]' LIMIT 20",
+        "SELECT id FROM docs {} ORDER BY embedding <=> '[0.0,0.0,0.0,0.0]' LIMIT 20",
         where_clause_for_arm(ProfileArm::Plain, "lang", TARGET_LANG)
     );
 

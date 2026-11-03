@@ -231,6 +231,9 @@ mod e2e {
         let query = [1.0f32, 0.0, 0.0];
         let literal = vector_literal(&query).expect("finite query vector");
         let sql = c1_statement("docs", "embedding", &literal, 3).expect("well-formed statement");
+        // Issue #1994: `<#>` の実行経路（Issue #1991）が main に入るまで、実行系の本テストだけは
+        // 現行で実行可能な `<=>`（L2。参照オラクルも L2）へ置き換える。#1991 のマージ後に外す。
+        let sql = sql.replace("<#>", "<=>");
 
         let result = core
             .execute_sql(&ctx, &sql)
