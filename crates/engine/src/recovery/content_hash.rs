@@ -1480,7 +1480,7 @@ fn token_statement_hash(
 /// `Token`／`Keyword` とも網羅 match（ワイルドカード腕なし）で、lexer への variant 追加を
 /// コンパイルエラーにして黙った衝突を防ぐ。
 fn push_token(b: &mut HashInputBuilder, t: &crate::sql::lexer::Token) -> Result<(), StorageError> {
-    use crate::sql::lexer::{DistanceKind, Keyword, Token};
+    use crate::sql::lexer::{BitDistanceKind, DistanceKind, Keyword, Token};
     match t {
         Token::Keyword(k) => {
             b.push_u8(1);
@@ -1525,6 +1525,9 @@ fn push_token(b: &mut HashInputBuilder, t: &crate::sql::lexer::Token) -> Result<
         Token::DistanceOp(DistanceKind::L2) => b.push_u8(34),
         Token::DistanceOp(DistanceKind::NegativeInnerProduct) => b.push_u8(35),
         Token::DistanceOp(DistanceKind::L1) => b.push_u8(36),
+        // 二値ベクトル距離（Issue #2021）。37・38 は未使用タグ。
+        Token::BitDistanceOp(BitDistanceKind::Hamming) => b.push_u8(37),
+        Token::BitDistanceOp(BitDistanceKind::Jaccard) => b.push_u8(38),
         Token::Le => b.push_u8(25),
         Token::Ge => b.push_u8(26),
         Token::QualifiedIdent { qualifier, name } => {
@@ -7716,13 +7719,20 @@ mod tests {
             DistanceKind::NegativeInnerProduct,
             DistanceKind::L1,
         ];
-        let hashes: Vec<_> = kinds
+        let mut hashes: Vec<_> = kinds
             .iter()
             .map(|k| for_insert_select(&[Token::DistanceOp(*k)]).unwrap())
             .collect();
+        // Issue #2021: 二値ベクトル距離 2 種も f32 距離 4 種と衝突しない。
+        for k in [
+            crate::sql::lexer::BitDistanceKind::Hamming,
+            crate::sql::lexer::BitDistanceKind::Jaccard,
+        ] {
+            hashes.push(for_insert_select(&[Token::BitDistanceOp(k)]).unwrap());
+        }
         for i in 0..hashes.len() {
             for j in (i + 1)..hashes.len() {
-                assert_ne!(hashes[i], hashes[j], "{:?} vs {:?}", kinds[i], kinds[j]);
+                assert_ne!(hashes[i], hashes[j], "kind index {i} vs {j}");
             }
         }
     }

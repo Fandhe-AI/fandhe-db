@@ -2503,6 +2503,7 @@ pub(crate) fn decode_bind_values_nullable_typed(
             Token::Keyword(_)
             | Token::Punct(_)
             | Token::DistanceOp(_)
+            | Token::BitDistanceOp(_)
             | Token::Le
             | Token::Ge
             | Token::Arrow
