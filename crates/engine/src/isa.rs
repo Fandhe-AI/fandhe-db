@@ -574,6 +574,20 @@ pub fn l1_scalar(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).sum()
 }
 
+/// L2 二乗距離のスカラー参照実装（左から右への逐次和。Issue #1981・SQL-33）。
+///
+/// `kernel.rs::l2_sq` の実体、およびテストの参照実装として公開する。長さが異なる場合は
+/// `zip` により短い方へ切り詰める（[`l1_scalar`] と同じ）。ISA 別版は #1982／#1983 の担当。
+pub fn l2_sq_scalar(a: &[f32], b: &[f32]) -> f32 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| {
+            let d = x - y;
+            d * d
+        })
+        .sum()
+}
+
 /// Arm Neon（4 レーン）向け L1 距離カーネル（Issue #1988）。intrinsics を使わない
 /// safe fn で、呼び出しには `unsafe` が必要（[`SimdKernel::l1`] の SAFETY 参照）。
 /// NEON は baseline のためインライン化されると生成コード検査でシンボルが見つからなく
