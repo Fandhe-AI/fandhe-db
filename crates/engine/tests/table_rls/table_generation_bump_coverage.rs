@@ -478,8 +478,8 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // 実行器側（`tenant/partitioned_dml.rs::finalize_cancel`）と `CANCEL PARTITIONED DML`
     // 文（`sql/partitioned.rs::execute_cancel`）の 2 箇所。
     // Issue #1544（`Kind::Update` への `set_exprs` 追加）で行が移動したための追随（旧: 254）。
-    ("tenant/partitioned_dml.rs", 284),
-    ("sql/partitioned.rs", 335),
+    ("tenant/partitioned_dml.rs", 291),
+    ("sql/partitioned.rs", 340),
     // `tenant::WriteTarget::with_txn`（SQL-31・TASK-221。`insert_row_unchecked`・
     // `insert_rows_unchecked`・`insert_typed_row_unchecked`・
     // `truncate_tables_unchecked` が autocommit／明示トランザクションの本体を
@@ -516,7 +516,8 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // `tenant.rs`・`catalog.rs` の各エントリを現行行へ追随（commit 対象は変わらない）。
     // Issue #1723（`TenantWriteError::TriggerFailed` の追加）で現行行へ追随（commit 対象は変わらない）。
     // Issue #2277 の追加と Issue #2276 の追随で現行行へ更新（commit 対象は変わらない）。
-    ("tenant.rs", 639),
+    // Issue #1953（書き込み経路のデッドライン確認結線）の行追加で追随（旧: 659。commit 対象は変わらない）。
+    ("tenant.rs", 671),
     // Issue #1688（SEQUENCE のカタログ）: `catalog/sequence.rs` の `create_sequence`／`drop_sequence` は
     // SEQUENCE の定義表・状態表・ID カウンタだけを書く。表の行スキーマ（`user_rows/{table}`）も
     // 表のスキーマ世代も変えないため、`bump_table_generation_in_txn` を伴わない。Issue #1690 の

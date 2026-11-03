@@ -2215,4 +2215,47 @@ mod tests {
             "a result-contract violation must not be treated as a fallback trigger"
         );
     }
+
+    // Issue #1953（SQL-71 のポインタ）: 文の期限切れによる中断は `Input` 経路で返り、CPU への縮退も
+    // ラッチも起こさない（中断した文を黙って再実行しない）。縮退イベントは 0 件のまま。
+    #[test]
+    fn deadline_cancellation_does_not_trigger_cpu_fallback() {
+        let observer = std::sync::Arc::new(RecordingObserver::new());
+        let observer_for_engine: Box<dyn FallbackObserver> = {
+            struct ArcObserver(std::sync::Arc<RecordingObserver>);
+            impl FallbackObserver for ArcObserver {
+                fn on_fallback(&self, event: FallbackEvent) {
+                    self.0.on_fallback(event);
+                }
+            }
+            Box::new(ArcObserver(observer.clone()))
+        };
+        let engine = build_engine_with_backend(
+            |matrix| Ok(Box::new(GpuReferenceBackend::new(matrix)) as Box<dyn BatchBackend>),
+            observer_for_engine,
+        );
+        let ctx_a = ctx("tenant-a");
+        let query = [1.0f32, 0.0];
+        let queries = vec![BatchQuery {
+            vector: &query,
+            k: 2,
+            ctx: &ctx_a,
+        }];
+        {
+            let _scope = crate::interrupt::DeadlineScope::install(
+                crate::interrupt::StatementDeadline::at(std::time::Instant::now()),
+            );
+            let err = engine.batch_search(&queries).unwrap_err();
+            assert_eq!(
+                err,
+                BatchSearchError::QueryCanceled {
+                    reason: crate::interrupt::InterruptReason::StatementTimeout
+                }
+            );
+        }
+        assert!(observer.events().is_empty());
+        // 期限が外れれば primary のまま通常どおり動く（ラッチされていない）。
+        assert_eq!(engine.batch_search(&queries).expect("search ok").len(), 1);
+        assert!(observer.events().is_empty());
+    }
 }

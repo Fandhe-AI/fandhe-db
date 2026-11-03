@@ -618,6 +618,9 @@ impl EngineCore {
         target: &crate::sql::temp_rows::TempCopyTarget,
         batch: crate::sql::copy::CopyInBatch,
     ) -> Result<crate::sql::exec::InsertOutcome, SqlSurfaceError> {
+        // Issue #1953（SQL-71）: 公開入口を通らない一時表経路でも COPY 開始時の期限を復元して確認する。
+        let _deadline_scope = crate::interrupt::DeadlineScope::install(batch.deadline);
+        batch.deadline.check()?;
         self.check_temp_copy_target(ctx, session, target)?;
         let store = &target.store;
         let core = store.core()?;
@@ -641,6 +644,10 @@ impl EngineCore {
         target: &crate::sql::temp_rows::TempCopyTarget,
         batch: crate::sql::copy::CopyInBatch,
     ) -> Result<crate::sql::exec::InsertOutcome, SqlSurfaceError> {
+        // Issue #1953（SQL-71）: 同上。期限切れの `Err` は呼び出し元（`commit_copy_in_txn_in_session`）が
+        // `txn.fail()` へ渡す。
+        let _deadline_scope = crate::interrupt::DeadlineScope::install(batch.deadline);
+        batch.deadline.check()?;
         self.check_temp_copy_target(ctx, session, target)?;
         txn.check_and_register_statement(None)?;
         let store = &target.store;

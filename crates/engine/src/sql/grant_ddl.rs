@@ -196,7 +196,7 @@ pub(crate) fn map_membership_error(e: MembershipChangeError) -> SqlSurfaceError 
             CatalogError::ViewLimitExceeded(_) => {
                 SqlSurfaceError::payload_too_large("too many role memberships")
             }
-            CatalogError::WriteLockTimeout => SqlSurfaceError::LockNotAvailable,
+            CatalogError::WriteLockTimeout => crate::interrupt::lock_wait_error(),
             CatalogError::Invalid(_) => SqlSurfaceError::invalid_input("invalid role membership"),
             _ => SqlSurfaceError::Internal {
                 detail: "role membership operation failed".to_string(),
@@ -236,7 +236,7 @@ pub(crate) fn map_acl_error(e: AclChangeError) -> SqlSurfaceError {
             CatalogError::ViewLimitExceeded(_) => {
                 SqlSurfaceError::payload_too_large("too many privilege entries")
             }
-            CatalogError::WriteLockTimeout => SqlSurfaceError::LockNotAvailable,
+            CatalogError::WriteLockTimeout => crate::interrupt::lock_wait_error(),
             CatalogError::Invalid(_) => SqlSurfaceError::invalid_input("invalid privilege entry"),
             _ => SqlSurfaceError::Internal {
                 detail: "privilege catalog operation failed".to_string(),
