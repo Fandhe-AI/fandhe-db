@@ -41,6 +41,18 @@ pub(crate) fn cmp_score_desc_then_tie(
     b_score.total_cmp(&a_score).then(a_tie.cmp(&b_tie))
 }
 
+/// 「距離昇順 → 同点は順序キー昇順」の全順序（コサイン距離カーネル `kernel/cosine.rs` の
+/// Top-k 選出が使う。Issue #1987）。距離は f64 のまま `total_cmp` で比較する。
+/// NaN の並び順は #2240 の範囲で、現状の選出器は NaN を事前に除外するため到達しない。
+pub(crate) fn cmp_distance_asc_then_tie(
+    a_dist: f64,
+    a_tie: TieKey,
+    b_dist: f64,
+    b_tie: TieKey,
+) -> Ordering {
+    a_dist.total_cmp(&b_dist).then(a_tie.cmp(&b_tie))
+}
+
 /// 「遠い順（`DESC`）→ 同点は順序キー昇順」の全順序（Issue #2009・SQL-33 (2)）。
 ///
 /// スコアは [`cmp_score_desc_then_tie`] と同じ向き（大きいほど近い）で受け取り、スコア昇順
@@ -64,6 +76,19 @@ pub(crate) fn cmp_far_first_then_tie(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn distance_asc_then_tie_ascending() {
+        let k1 = tie_key_for_response_id(1);
+        let k2 = tie_key_for_response_id(2);
+        assert_eq!(cmp_distance_asc_then_tie(0.1, k2, 0.5, k1), Ordering::Less);
+        assert_eq!(cmp_distance_asc_then_tie(0.5, k1, 0.5, k2), Ordering::Less);
+        assert_eq!(
+            cmp_distance_asc_then_tie(0.5, k2, 0.5, k1),
+            Ordering::Greater
+        );
+        assert_eq!(cmp_distance_asc_then_tie(0.5, k1, 0.5, k1), Ordering::Equal);
+    }
 
     #[test]
     fn tie_key_order_matches_legacy_id_order() {

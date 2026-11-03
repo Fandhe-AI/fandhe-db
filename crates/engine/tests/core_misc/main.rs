@@ -36,6 +36,7 @@ mod core_api_stability;
 mod core_bound_plan_entry;
 mod core_explain_bound_entries;
 mod core_explain_plan_entry;
+mod cosine_kernel;
 mod datetime_column;
 mod declarative_filter;
 mod decode_tier_scalar_types;
