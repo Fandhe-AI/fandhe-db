@@ -191,12 +191,13 @@ pub fn cosine_top_k(input: CosineSearchInput<'_>) -> Result<Vec<DistanceHit>, Ke
     let mut base = 0usize;
     for ids4 in input.ids.chunks(4) {
         // 4 行そろって範囲内のときだけブロックカーネルへ回す。端数・範囲外を含む塊は 1 行ずつ。
-        let rows4 = match ids4.len() {
-            4 => (0..4)
-                .map(|i| row(base + i))
-                .collect::<Option<Vec<&[f32]>>>()
-                .and_then(|v| <[&[f32]; 4]>::try_from(v).ok()),
-            _ => None,
+        let rows4 = if ids4.len() == 4 {
+            match (row(base), row(base + 1), row(base + 2), row(base + 3)) {
+                (Some(r0), Some(r1), Some(r2), Some(r3)) => Some([r0, r1, r2, r3]),
+                _ => None,
+            }
+        } else {
+            None
         };
         if let Some(rows) = rows4 {
             let dots = dot_block4(rows, input.query);
