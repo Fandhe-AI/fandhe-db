@@ -13027,6 +13027,7 @@ impl EngineCore {
             &partial_index_names,
             row_policy_present,
             false,
+            crate::sql::hnsw_cache::query_metric_of_bound(),
         );
         drop(post_check_txn);
         Ok(crate::sql::explain::build_explain_result_with_indexes(
@@ -13115,6 +13116,7 @@ impl EngineCore {
         partial_index_names: &[String],
         row_policy_present: bool,
         distance_descending: bool,
+        query_metric: crate::catalog::VectorOpClass,
     ) -> (
         crate::sql::explain::ExplainEngine,
         crate::sql::explain::ExplainIndexNames,
@@ -13137,17 +13139,22 @@ impl EngineCore {
         // 使う（新規に `begin_read()` しない）。カタログ読み取り自体の失敗
         // （走査上限超過・デコード失敗）は fail-closed に `false`
         // （brute-force 表示）・索引名なしへ倒す。
-        let hnsw_enabled = if declarations_enabled {
-            crate::catalog::hnsw_targeted_in_txn(
+        // Issue #1979: ゲートは索引の距離種別と問い合わせの距離種別も照合する 3 状態
+        // （`catalog::hnsw_gate_in_txn`。実行側 `sql::exec` と同一）。
+        let hnsw_gate = if declarations_enabled {
+            crate::catalog::hnsw_gate_in_txn(
                 read_txn,
                 &self.index_catalog_gate_cache,
                 table,
                 self.hnsw_scope,
                 true,
+                query_metric,
             )
         } else {
-            false
+            crate::catalog::HnswGate::NotTargeted
         };
+        let hnsw_enabled = matches!(hnsw_gate, crate::catalog::HnswGate::Targeted { .. });
+        let metric_mismatch = matches!(hnsw_gate, crate::catalog::HnswGate::MetricMismatch { .. });
         // Issue #2009・SQL-75 (4): 距離順 `DESC` は分類結果を上書きして `PlainScanDescending`
         // （実行側 `sql::exec` と同じ `ann_plan_for_direction` を通す）。
         let ann_plan = crate::sql::hnsw_cache::ann_plan_for_direction(
@@ -13165,6 +13172,7 @@ impl EngineCore {
                 ),
             ),
             distance_descending,
+            metric_mismatch,
         );
 
         // codex-review P1 指摘対応（Issue #1066 PR #1155）: `HnswScope::All` は
@@ -13244,10 +13252,16 @@ impl EngineCore {
 
         // Issue #1978: `hnsw_params:` の `metric=` は HNSW 宣言の opclass。宣言を読むのは
         // 上記ゲートと同じキャッシュ済み要約だけ（opt-in なしではカタログに触れない）。
-        let ann_metric = if declarations_enabled {
-            crate::catalog::hnsw_metric_in_txn(read_txn, &self.index_catalog_gate_cache, table)
-        } else {
-            crate::catalog::VectorOpClass::Cosine
+        // Issue #1979: `metric=` は同じゲート結果から決め、`ann_plan:` 行と食い違わせない
+        // （`Targeted` は問い合わせ側、`MetricMismatch` は不一致の理由が分かる宣言側、
+        // `NotTargeted` は Issue #1978 の決定規則）。
+        let ann_metric = match hnsw_gate {
+            crate::catalog::HnswGate::Targeted { metric } => metric,
+            crate::catalog::HnswGate::MetricMismatch { index_metric } => index_metric,
+            crate::catalog::HnswGate::NotTargeted if declarations_enabled => {
+                crate::catalog::hnsw_metric_in_txn(read_txn, &self.index_catalog_gate_cache, table)
+            }
+            crate::catalog::HnswGate::NotTargeted => crate::catalog::VectorOpClass::Cosine,
         };
         (
             crate::sql::explain::ExplainEngine::new(
@@ -13443,6 +13457,7 @@ impl EngineCore {
             &partial_index_names,
             row_policy_present,
             bound.distance_descending(),
+            crate::sql::hnsw_cache::query_metric_of_bound(),
         );
         Ok(crate::sql::explain::build_search_explain_result(
             bound.mode(),
@@ -15701,12 +15716,19 @@ impl EngineCore {
         } else {
             match self.storage.db().begin_read() {
                 Ok(read_txn) => {
-                    let targeted = crate::catalog::hnsw_targeted_in_txn(
-                        &read_txn,
-                        &self.index_catalog_gate_cache,
-                        table,
-                        self.hnsw_scope,
-                        true,
+                    // Issue #1979: 距離種別の不一致（`MetricMismatch`）は `Targeted` でないため
+                    // 既存の厳密経路（`snapshot.search_with`）へ縮退する。Rust API の問い合わせ
+                    // 距離はコサイン系。
+                    let targeted = matches!(
+                        crate::catalog::hnsw_gate_in_txn(
+                            &read_txn,
+                            &self.index_catalog_gate_cache,
+                            table,
+                            self.hnsw_scope,
+                            true,
+                            crate::sql::hnsw_cache::query_metric_of_bound(),
+                        ),
+                        crate::catalog::HnswGate::Targeted { .. }
                     );
                     let generation = crate::storage::current_generation_in_txn(&read_txn).ok();
                     (targeted, generation)

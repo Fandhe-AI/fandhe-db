@@ -308,3 +308,25 @@ HNSW の適格性ゲート（`catalog::hnsw_targeted_in_txn`）は**テーブル
 ## 追記（Issue #2191・TABLE-28）: 宣言の照合
 
 起動時 opt-in のとき、宣言の `COLLATE` が TEXT 系列の辞書の並び（索引の照合）になる。照合指定のない宣言は列の実効照合に従う。同じ列に解決後の照合が異なる宣言が複数あるときは、列の実効照合と同じ順序の宣言があればその照合、なければ索引名の昇順で最初の宣言の照合に決める。opt-in がなければ、宣言はカタログに記録されるだけで構築に効かない（従来どおり）。詳細は [collation-aware-index.md](collation-aware-index.md)。
+
+## 追記（Issue #1979・INDEX-7・SQL-33・SQL-75）: 距離種別の不一致
+
+HNSW 経路の適格性ゲートは宣言の有無に加え、索引の距離種別（opclass）と問い合わせの距離演算子も照合する
+（`catalog::hnsw_gate_in_txn`。`sql::exec`・Rust API・`EXPLAIN` が同じ関数を通す）。結果は 3 状態:
+
+| 状態 | 条件 | 経路 |
+| ---- | ---- | ---- |
+| `NotTargeted` | opt-in なし・`Declared` で宣言なし・カタログを読めない | 厳密全走査（読めない場合は `gate_read_failures` に計上。不一致には写さない） |
+| `Targeted` | 問い合わせの距離種別が実効の索引 metric 集合に含まれ、物理グラフが対応する | HNSW |
+| `MetricMismatch` | 含まれない、または物理グラフが未対応 | 厳密全走査（`ann_plan: plain_scan_opclass_mismatch`） |
+
+- 実効の索引 metric 集合は `All` では「コサイン ∪ 宣言」（All では暗黙のコサイン HNSW があり、宣言は記録だけで
+  経路を変えない。上記「HNSW（テーブル単位）」節・Issue #1065 の受入条件 4 と同じ）、`Declared` では宣言のみ。
+- 物理グラフが対応する距離種別は `catalog::hnsw_supported_metric`（現状コサインだけ）。opclass 別カーネル
+  （Issue #1996・#1999）で広げる。近似を誤った距離で返さないため、宣言と一致していても未対応なら厳密に倒す。
+- 現時点で実際に不一致になるのは、`Declared` で非コサインの宣言しかない表への `<=>`。ほかの組合せは
+  Issue #1977（`<->` `<#>` `<+>` の受理）以降に起きる。問い合わせ側の metric は
+  `sql::hnsw_cache::query_metric_of_bound` に集約済みで、#1977 で差し替える。
+- `hnsw_params:` の `metric=` は同じゲート結果から決める（`Targeted` は問い合わせ側、`MetricMismatch` は宣言側）。
+- 縮退先は既存の厳密経路で、RLS の可視集合には触れない（`tests/sql_named/sql33_opclass_mismatch.rs` で固定）。
+

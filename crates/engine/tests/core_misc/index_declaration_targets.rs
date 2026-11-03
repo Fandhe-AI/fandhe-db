@@ -836,3 +836,45 @@ fn expression_declaration_does_not_change_query_results_or_column_index_paths() 
         .expect("drop expression index");
     assert_eq!(ids(&dist("lang", "ja")), lang_before);
 }
+
+/// Issue #1979（INDEX-7・SQL-33）: `HnswScope::All` では非 Cosine だけの HNSW 宣言があっても、
+/// 暗黙のコサイン HNSW が残るため `<=>` の経路と Top-k は宣言なしと同じ（宣言は記録のみ）。
+#[test]
+fn scope_all_with_only_non_cosine_declaration_keeps_cosine_path_and_topk() {
+    let build = |label: &str, declare_l2: bool| {
+        let path = unique_db_path(label);
+        let guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&schema_with_vector("table_a"))
+            .expect("create table_a");
+        let vectors = gen_vectors(3, DIM as usize, HNSW_ROWS);
+        seed_rows(&storage, "table_a", "tenant-a", &vectors, "base");
+        if declare_l2 {
+            storage
+                .create_index(&engine::catalog::IndexDef::new(
+                    "idx_l2".to_string(),
+                    "table_a".to_string(),
+                    engine::catalog::IndexKind::Hnsw(engine::catalog::VectorOpClass::L2),
+                    vec!["embedding".to_string()],
+                ))
+                .expect("declare l2 hnsw index");
+        }
+        let kind = search_engine::hnsw_kind(engine::hnsw::HnswParams::default())
+            .expect("valid hnsw params");
+        let core =
+            EngineCore::from_storage_with_engine(storage, kind).with_hnsw_scope(HnswScope::All);
+        (core, guard, vectors)
+    };
+    let (plain, _g0, vectors) = build("index-decl-all-no-decl", false);
+    let (declared, _g1, _) = build("index-decl-all-l2-only", true);
+    let (before, _) = observe(&plain, "table_a", &vectors[0], true, "no declaration");
+    let (after, _) = observe(
+        &declared,
+        "table_a",
+        &vectors[0],
+        true,
+        "l2-only declaration",
+    );
+    assert_eq!(before, after);
+}

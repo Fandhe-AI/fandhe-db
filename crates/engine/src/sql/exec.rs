@@ -971,21 +971,28 @@ pub(crate) fn execute_statement_with_cache(
     // `EngineCore::index_catalog_gate_cache` を共有し、クエリのたびに再走査
     // しない（codex-review P2 対応・PR #1124）。`hnsw_cache` が `None`（起動時
     // opt-in なし）の場合はカタログに一切触れない。
-    let hnsw_enabled = match hnsw_cache.as_ref() {
+    // Issue #1979: ゲートは索引の距離種別（opclass）と問い合わせの距離種別も照合する 3 状態
+    // （`catalog::hnsw_gate_in_txn`）。`Targeted` だけが HNSW を有効にし、`MetricMismatch` は
+    // 下の `ann_plan_for_direction` で `PlainScanOpclassMismatch` へ上書きして厳密全走査に倒す
+    // （HNSW の 4 boolean は `ann_plan` から導くので、自動で brute-force へ落ちる）。
+    let hnsw_gate = match hnsw_cache.as_ref() {
         Some(access) => match read_txn.snapshot() {
-            Some(snapshot) => crate::catalog::hnsw_targeted_in_txn(
+            Some(snapshot) => crate::catalog::hnsw_gate_in_txn(
                 snapshot,
                 access.index_gate_cache,
                 &bound.table,
                 access.hnsw_scope,
                 true,
+                crate::sql::hnsw_cache::query_metric_of_bound(),
             ),
             // 書き込みトランザクション由来では `hnsw_cache` 自体が `None` に落ちて
             // いるため到達しない。万一到達しても fail-closed（厳密 brute-force）。
-            None => false,
+            None => crate::catalog::HnswGate::NotTargeted,
         },
-        None => false,
+        None => crate::catalog::HnswGate::NotTargeted,
     };
+    let hnsw_enabled = matches!(hnsw_gate, crate::catalog::HnswGate::Targeted { .. });
+    let metric_mismatch = matches!(hnsw_gate, crate::catalog::HnswGate::MetricMismatch { .. });
     // Issue #2009・SQL-33 (2)・SQL-75 (4): 距離順 `DESC` は分類結果を `PlainScanDescending` へ
     // 上書きする（`EXPLAIN` も同じ `ann_plan_for_direction` を通す）。これで HNSW の 2 つの
     // 適用判定が偽になり、索引キャッシュの照会・準備は一切走らない。
@@ -1010,6 +1017,7 @@ pub(crate) fn execute_statement_with_cache(
             ),
         ),
         bound.distance_descending,
+        metric_mismatch,
     );
     let hnsw_full_visible_eligible =
         !is_hybrid && ann_plan == crate::sql::hnsw_cache::AnnPlan::HnswFullVisible;

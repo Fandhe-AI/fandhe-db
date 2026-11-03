@@ -2417,6 +2417,11 @@ pub enum AnnPlan {
     /// モードに関係なく ANN 索引を使わず可視行を全走査する（Issue #2009・SQL-33 (2)・
     /// SQL-75 (4)）。分類関数ではなく [`ann_plan_for_direction`] が上書きして与える。
     PlainScanDescending,
+    /// 索引の距離種別（opclass）と距離演算子が合わない（または物理グラフが未対応の距離種別）ため、
+    /// ANN 索引を使わず可視行を厳密全走査する（Issue #1979・INDEX-7・SQL-33・SQL-75）。
+    /// 分類関数ではなく [`ann_plan_for_direction`] が、ゲート（`catalog::hnsw_gate_in_txn`）の
+    /// `MetricMismatch` を受けて上書きして与える。
+    PlainScanOpclassMismatch,
 }
 
 /// [`classify_ann_plan`] の入力（`sql::exec::execute_statement_with_cache` と
@@ -2478,20 +2483,51 @@ pub fn classify_ann_plan(input: AnnShapeInput) -> AnnPlan {
     }
 }
 
-/// 距離方向（`DESC`）による ANN 判定の上書き（Issue #2009・SQL-33 (2)・SQL-75 (4)）。
+/// 距離方向（`DESC`）・距離種別の不一致による ANN 判定の上書き（Issue #2009・#1979・SQL-33・
+/// SQL-75 (4)・INDEX-7）。
 ///
-/// `descending` なら分類結果にかかわらず常に [`AnnPlan::PlainScanDescending`] を返し、`false` なら
-/// 入力をそのまま返す。実行側（`sql::exec`）と `EXPLAIN`（`core.rs::explain_engine_for`）が
-/// 同じ関数を通すことで、表示と実際の経路の判断元を 1 つにする。厳密走査に倒す理由が増える
-/// 場合（演算子クラスの不一致・`LIMIT` 省略）も、この関数へ理由を足す。優先順位は
-/// 方向（`DESC`）→ 既存の分類（`classify_ann_plan`）。公開の [`AnnShapeInput`] へフィールドを
-/// 足さない（外部からの構造体リテラルを壊さない）ための crate 内部関数。
-pub(crate) fn ann_plan_for_direction(plan: AnnPlan, descending: bool) -> AnnPlan {
+/// 優先順位は「`DESC` → 距離種別の不一致 → 既存の分類（`classify_ann_plan`）」。`descending` なら
+/// 常に [`AnnPlan::PlainScanDescending`]、そうでなく `metric_mismatch`（ゲートが
+/// `MetricMismatch` を返した）なら [`AnnPlan::PlainScanOpclassMismatch`]、どちらでもなければ入力を
+/// そのまま返す。実行側（`sql::exec`）と `EXPLAIN`（`core.rs::explain_engine_for`）が同じ関数を
+/// 通すことで、表示と実際の経路の判断元を 1 つにする。`LIMIT` 省略（Issue #2242）の理由が増える
+/// 場合は不一致の後ろに足す。公開の [`AnnShapeInput`] へフィールドを足さない（外部からの構造体
+/// リテラルを壊さない）ための crate 内部関数。
+pub(crate) fn ann_plan_for_direction(
+    plan: AnnPlan,
+    descending: bool,
+    metric_mismatch: bool,
+) -> AnnPlan {
     if descending {
         AnnPlan::PlainScanDescending
+    } else if metric_mismatch {
+        AnnPlan::PlainScanOpclassMismatch
     } else {
         plan
     }
+}
+
+/// 距離演算子の種別を索引の opclass へ写す（Issue #1979）。catalog が lexer に依存しないよう
+/// `sql` 層に置く。
+pub(crate) fn opclass_for_distance_kind(
+    kind: crate::sql::lexer::DistanceKind,
+) -> crate::catalog::VectorOpClass {
+    use crate::catalog::VectorOpClass;
+    use crate::sql::lexer::DistanceKind;
+    match kind {
+        DistanceKind::Cosine => VectorOpClass::Cosine,
+        DistanceKind::L2 => VectorOpClass::L2,
+        DistanceKind::NegativeInnerProduct => VectorOpClass::Ip,
+        DistanceKind::L1 => VectorOpClass::L1,
+    }
+}
+
+/// 束縛済み検索文の距離演算子に対応する opclass（ゲートの問い合わせ側 metric）。現状 bound は
+/// 種別を持たず `<=>` だけが受理されるため常にコサイン。Issue #1977 で bound が `DistanceKind`
+/// を保持した時点で [`opclass_for_distance_kind`] 経由の値に差し替える（呼び出し箇所は
+/// 本関数に集約済み）。
+pub(crate) fn query_metric_of_bound() -> crate::catalog::VectorOpClass {
+    opclass_for_distance_kind(crate::sql::lexer::DistanceKind::Cosine)
 }
 
 /// 利用者ポリシー（RLS-13・Issue #2279）が適用される問い合わせの ANN 形状入力を補正する。
@@ -4437,6 +4473,29 @@ mod tests {
     }
 
     #[test]
+    fn distance_kind_maps_to_opclass_and_bound_defaults_to_cosine() {
+        use crate::catalog::VectorOpClass;
+        use crate::sql::lexer::DistanceKind;
+        assert_eq!(
+            opclass_for_distance_kind(DistanceKind::Cosine),
+            VectorOpClass::Cosine
+        );
+        assert_eq!(
+            opclass_for_distance_kind(DistanceKind::L2),
+            VectorOpClass::L2
+        );
+        assert_eq!(
+            opclass_for_distance_kind(DistanceKind::NegativeInnerProduct),
+            VectorOpClass::Ip
+        );
+        assert_eq!(
+            opclass_for_distance_kind(DistanceKind::L1),
+            VectorOpClass::L1
+        );
+        assert_eq!(query_metric_of_bound(), VectorOpClass::Cosine);
+    }
+
+    #[test]
     fn ann_plan_for_direction_overrides_only_when_descending() {
         for hnsw_enabled in [false, true] {
             for is_precision in [false, true] {
@@ -4450,9 +4509,18 @@ mod tests {
                             filters_empty,
                             scalar_prefilter,
                         });
-                        assert_eq!(ann_plan_for_direction(plan, false), plan);
+                        assert_eq!(ann_plan_for_direction(plan, false, false), plan);
                         assert_eq!(
-                            ann_plan_for_direction(plan, true),
+                            ann_plan_for_direction(plan, false, true),
+                            AnnPlan::PlainScanOpclassMismatch
+                        );
+                        // DESC は距離種別の不一致より優先する。
+                        assert_eq!(
+                            ann_plan_for_direction(plan, true, true),
+                            AnnPlan::PlainScanDescending
+                        );
+                        assert_eq!(
+                            ann_plan_for_direction(plan, true, false),
                             AnnPlan::PlainScanDescending
                         );
                     }
@@ -4460,7 +4528,7 @@ mod tests {
             }
         }
         assert_eq!(
-            ann_plan_for_direction(AnnPlan::UnknownCustomProvider, true),
+            ann_plan_for_direction(AnnPlan::UnknownCustomProvider, true, false),
             AnnPlan::PlainScanDescending
         );
     }

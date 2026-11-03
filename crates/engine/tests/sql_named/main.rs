@@ -11,6 +11,7 @@ mod legacy_table;
 mod temp_db;
 
 mod sql33_knn_desc;
+mod sql33_opclass_mismatch;
 mod sql_aggregate;
 mod sql_aggregate_public_api;
 mod sql_allowlist;
