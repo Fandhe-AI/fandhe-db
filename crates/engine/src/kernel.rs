@@ -353,6 +353,57 @@ pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
     crate::isa::current().dot(a, b)
 }
 
+/// L1（マンハッタン）距離。実体は `isa.rs::current().l1`（Issue #1988・SQL-33）へ
+/// 委譲し、[`dot`] と同じく単一のカーネル・単一の加算順序を全呼び出し元で共有する。
+pub(crate) fn l1(a: &[f32], b: &[f32]) -> f32 {
+    crate::isa::current().l1(a, b)
+}
+
+/// L1 距離による総当たり Top-k（距離の昇順・同距離は id 昇順。Issue #1988・SQL-33）。
+///
+/// [`SearchProvider`] trait には載せない独立関数で、SQL 表層（`ORDER BY v <+> q`）への
+/// 接続は距離種別付き演算子の受理と昇順経路（別 Issue）の役割。検証順・除外規約は
+/// [`CpuScalarProvider::search`] と同じ（次元不一致 → 非有限クエリ → `k == 0`／空入力 →
+/// 範囲外行 skip）。
+///
+/// 返す [`CandidateHit::score`] は「負の L1 距離」（`-l1`）である。有限 f32 の符号反転は
+/// 正確なので、既存 [`TopKSelector`] の「スコア降順・同点 id 昇順」がそのまま
+/// 「距離昇順・同距離 id 昇順」になる（`CandidateHit` の「大きいほど上位」契約を保つ）。
+/// 距離が +Inf に溢れた行は既存契約（非有限スコアは除外・fail-closed）に従い除外する。
+#[allow(dead_code)] // SQL 接続（別 Issue）までは単体テストのみが呼び出し元
+pub(crate) fn search_l1(input: SearchInput<'_>) -> Result<Vec<CandidateHit>, KernelError> {
+    let dim = input.dim as usize;
+    if input.query.len() != dim {
+        return Err(KernelError::DimMismatch {
+            expected: input.dim,
+            found: input.query.len(),
+        });
+    }
+    if input.query.iter().any(|v| !v.is_finite()) {
+        return Err(KernelError::NonFiniteQuery);
+    }
+    if input.k == 0 || input.ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut selector = TopKSelector::new(input.k);
+    for (idx, &id) in input.ids.iter().enumerate() {
+        let start = idx.saturating_mul(dim);
+        let end = start.saturating_add(dim);
+        let Some(vector) = input.vectors.get(start..end) else {
+            continue;
+        };
+        let distance = l1(vector, input.query);
+        if !distance.is_finite() {
+            continue;
+        }
+        selector.push(CandidateHit {
+            id,
+            score: -distance,
+        });
+    }
+    Ok(selector.into_sorted_vec())
+}
+
 /// 4 行 × 1 クエリの内積（`dot` の行ブロック版。Issue #510・TASK-156・CORE-14。
 /// ポインタ: `docs/design/dot-kernel-row-block.md`）。
 ///
@@ -821,5 +872,98 @@ mod tests {
             })
             .unwrap_err();
         assert_eq!(err, KernelError::NonFiniteQuery);
+    }
+
+    // ---- L1 距離 Top-k（Issue #1988・SQL-33） ----
+
+    fn l1_input<'a>(
+        ids: &'a [u64],
+        vectors: &'a [f32],
+        dim: u32,
+        query: &'a [f32],
+        k: usize,
+    ) -> SearchInput<'a> {
+        SearchInput {
+            ids,
+            vectors,
+            dim,
+            query,
+            k,
+        }
+    }
+
+    #[test]
+    fn search_l1_orders_by_distance_ascending_then_id() {
+        // dim=2、クエリ [0,0]。距離は id=1:3, 2:1, 3:1, 4:5, 5:0。
+        let ids = [1u64, 2, 3, 4, 5];
+        let vectors = [3.0, 0.0, 0.0, 1.0, -1.0, 0.0, 2.0, -3.0, 0.0, 0.0];
+        let query = [0.0, 0.0];
+        let hits = search_l1(l1_input(&ids, &vectors, 2, &query, 10)).unwrap();
+        let got: Vec<u64> = hits.iter().map(|h| h.id).collect();
+        assert_eq!(got, vec![5, 2, 3, 1, 4]);
+        assert_eq!(hits[0].score, 0.0);
+        assert_eq!(hits[1].score, -1.0);
+    }
+
+    #[test]
+    fn search_l1_tie_at_k_boundary_keeps_smaller_id() {
+        let ids = [7u64, 3, 9];
+        let vectors = [1.0, 1.0, 1.0];
+        let query = [0.0];
+        let hits = search_l1(l1_input(&ids, &vectors, 1, &query, 2)).unwrap();
+        let got: Vec<u64> = hits.iter().map(|h| h.id).collect();
+        assert_eq!(got, vec![3, 7]);
+    }
+
+    #[test]
+    fn search_l1_edge_cases_fail_closed() {
+        let ids = [1u64];
+        let vectors = [1.0, 2.0];
+        assert!(search_l1(l1_input(&ids, &vectors, 2, &[0.0, 0.0], 0))
+            .unwrap()
+            .is_empty());
+        assert!(search_l1(l1_input(&[], &[], 2, &[0.0, 0.0], 3))
+            .unwrap()
+            .is_empty());
+        let err = search_l1(l1_input(&ids, &vectors, 2, &[0.0], 3)).unwrap_err();
+        assert!(matches!(err, KernelError::DimMismatch { .. }));
+        let err = search_l1(l1_input(&ids, &vectors, 2, &[f32::NAN, 0.0], 3)).unwrap_err();
+        assert_eq!(err, KernelError::NonFiniteQuery);
+        // 非有限の格納値を持つ行は除外される。
+        let ids = [1u64, 2];
+        let vectors = [f32::NAN, 0.0, 1.0, 1.0];
+        let hits = search_l1(l1_input(&ids, &vectors, 2, &[0.0, 0.0], 5)).unwrap();
+        assert_eq!(hits.iter().map(|h| h.id).collect::<Vec<_>>(), vec![2]);
+    }
+
+    #[test]
+    fn search_l1_matches_bruteforce_scalar_reference() {
+        // 整数値ベクトルなら SIMD と scalar の丸め差が生じず id 列が完全一致する。
+        for dim in [1usize, 7, 16, 100, 768] {
+            let rows = 200usize;
+            let mut x = 0x9e37_79b9_7f4a_7c15u64 ^ dim as u64;
+            let mut next = || {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x % 9) as f32 - 4.0
+            };
+            let vectors: Vec<f32> = (0..rows * dim).map(|_| next()).collect();
+            let query: Vec<f32> = (0..dim).map(|_| next()).collect();
+            let ids: Vec<u64> = (0..rows as u64).map(|i| i * 3 + 1).collect();
+            let k = 25;
+
+            let mut expected: Vec<(f32, u64)> = ids
+                .iter()
+                .zip(vectors.chunks(dim))
+                .map(|(&id, v)| (crate::isa::l1_scalar(v, &query), id))
+                .collect();
+            expected.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+            let expected_ids: Vec<u64> = expected.iter().take(k).map(|e| e.1).collect();
+
+            let hits = search_l1(l1_input(&ids, &vectors, dim as u32, &query, k)).unwrap();
+            let got: Vec<u64> = hits.iter().map(|h| h.id).collect();
+            assert_eq!(got, expected_ids, "dim={dim}");
+        }
     }
 }

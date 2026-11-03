@@ -334,6 +334,42 @@ impl SimdKernel {
         }
     }
 
+    /// L1（マンハッタン）距離 `sum |a_i - b_i|`（Issue #1988・SQL-33。ポインタ:
+    /// spec `docs/spec/04-behavior/sql-surface.md`）。`kernel.rs::l1` が呼ぶ。
+    ///
+    /// 長さが異なる場合は [`l1_scalar`] と同じく短い方へ切り詰める。ISA 別カーネルは
+    /// 乗算を持たないため FMA 契約の差は生じないが、レーン分割による加算順序の違いで
+    /// scalar と丸め誤差の範囲で異なり得る（同一プロセス内では常に同一ISAなので決定的）。
+    pub fn l1(self, a: &[f32], b: &[f32]) -> f32 {
+        match self {
+            SimdKernel::Scalar => l1_scalar(a, b),
+            #[cfg(target_arch = "aarch64")]
+            SimdKernel::Neon(_) => {
+                // SAFETY: この variant は `NeonToken::try_new` が実行時確認できた場合
+                // にのみ構築される sealed トークンを保持する（`dot_impl` の Neon 分岐と
+                // 同じ根拠）。値の存在が CPU 対応の証明であり、`l1_neon` の
+                // `#[target_feature]` 契約を満たす。
+                unsafe { l1_neon(a, b) }
+            }
+            #[cfg(target_arch = "x86_64")]
+            SimdKernel::Avx2Fma(_) => {
+                // SAFETY: この variant は `Avx2FmaToken::try_new` が avx2 と fma を
+                // 実行時確認できた場合にのみ構築される sealed トークンを保持する
+                // （`dot_impl` の Avx2Fma 分岐と同じ根拠）。`l1_avx2_fma` の
+                // `#[target_feature]` 契約を満たす。
+                unsafe { l1_avx2_fma(a, b) }
+            }
+            #[cfg(target_arch = "x86_64")]
+            SimdKernel::Avx512(_) => {
+                // SAFETY: この variant は `Avx512Token::try_new` が avx512f を実行時
+                // 確認できた場合にのみ構築される sealed トークンを保持する
+                // （`dot_impl` の Avx512 分岐と同じ根拠）。`l1_avx512` の
+                // `#[target_feature]` 契約を満たす。
+                unsafe { l1_avx512(a, b) }
+            }
+        }
+    }
+
     /// 4 行 × 1 クエリの内積（`dot` の行ブロック版。Issue #510・TASK-156・CORE-14。
     /// ポインタ: `docs/design/dot-kernel-row-block.md`）。
     ///
@@ -528,6 +564,75 @@ pub fn current() -> SimdKernel {
 /// `batch_search.rs`・`rls.rs` が共有）の実体、およびテストの参照実装として公開する。
 pub fn dot_scalar(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+}
+
+/// L1 距離のスカラー参照実装（左から右への逐次和。Issue #1988・SQL-33）。
+///
+/// `kernel.rs::l1` の非 SIMD 環境での実体、およびテストの参照実装として公開する。
+/// 長さが異なる場合は `zip` により短い方へ切り詰める（[`dot_scalar`] と同じ）。
+pub fn l1_scalar(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).sum()
+}
+
+/// Arm Neon（4 レーン）向け L1 距離カーネル（Issue #1988）。intrinsics を使わない
+/// safe fn で、呼び出しには `unsafe` が必要（[`SimdKernel::l1`] の SAFETY 参照）。
+/// NEON は baseline のためインライン化されると生成コード検査でシンボルが見つからなく
+/// なるので `#[inline(never)]` とする（`dot_block4_neon` と同じ理由）。
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[inline(never)]
+fn l1_neon(a: &[f32], b: &[f32]) -> f32 {
+    l1_lanes::<4>(a, b)
+}
+
+/// x86_64 AVX2（8 レーン）向け L1 距離カーネル（Issue #1988）。
+/// 呼び出しには `unsafe` が必要（[`SimdKernel::l1`] の SAFETY 参照）。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+fn l1_avx2_fma(a: &[f32], b: &[f32]) -> f32 {
+    l1_lanes::<8>(a, b)
+}
+
+/// x86_64 AVX-512（`avx512f`。16 レーン）向け L1 距離カーネル（Issue #1988）。
+/// 呼び出しには `unsafe` が必要（[`SimdKernel::l1`] の SAFETY 参照）。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+fn l1_avx512(a: &[f32], b: &[f32]) -> f32 {
+    l1_lanes::<16>(a, b)
+}
+
+/// L1 距離カーネルの共通本体。`LANES` 個のレーンアキュムレータへ `|x - y|` を積算し、
+/// レーン和（[`lane_sum`]）に端数の逐次和を足す。添字アクセスは使わない。
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[inline(always)]
+fn l1_lanes<const LANES: usize>(a: &[f32], b: &[f32]) -> f32 {
+    // 長さ不一致は短い方へ切り詰める（`l1_scalar` と同じ意味論。`len` は両方の長さ以下
+    // なので範囲スライスは panic しない。`dot_lanes` と同形）。
+    let len = a.len().min(b.len());
+    let a = &a[..len];
+    let b = &b[..len];
+    let mut lanes = [0f32; LANES];
+    let (a_chunks, a_rem) = a.as_chunks::<LANES>();
+    let (b_chunks, b_rem) = b.as_chunks::<LANES>();
+    for (a_chunk, b_chunk) in a_chunks.iter().zip(b_chunks.iter()) {
+        for (lane, (x, y)) in lanes.iter_mut().zip(a_chunk.iter().zip(b_chunk.iter())) {
+            *lane += (x - y).abs();
+        }
+        // aarch64 のみ: レーンごとの厳密な逐次加算を LLVM がスカラーアキュムレータ 4 本の
+        // 縮約と見なし、チャンク方向へ転置してベクトル化する（要素挿入 `mov v.d[1]` が
+        // 残り生成コード検査が落ちる）。毎周回 `black_box` で 4 レーンを 1 本のベクトル
+        // 値として束ね、`fabd`＋`fadd v.4s` のループに固定する（値は変えない）。
+        #[cfg(target_arch = "aarch64")]
+        {
+            lanes = core::hint::black_box(lanes);
+        }
+    }
+    let tail: f32 = a_rem
+        .iter()
+        .zip(b_rem.iter())
+        .map(|(x, y)| (x - y).abs())
+        .sum();
+    lane_sum(lanes) + tail
 }
 
 /// Arm Neon（128 bit・4 レーン）向け内積カーネル。
