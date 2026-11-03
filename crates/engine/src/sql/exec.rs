@@ -856,6 +856,17 @@ impl SearchProvider for CosineDenseAdapter<'_> {
             query: input.query,
             k: input.k,
         })?;
+        // provider は untrusted: NaN 除去・スコア変換・再整列の前に生の結果全体で契約
+        // （件数・可視 id の多重集合・距離昇順・NaN 末尾）を検証し、違反は fail-closed に拒否する。
+        let mut visible_id_counts: std::collections::HashMap<u64, usize> =
+            std::collections::HashMap::with_capacity(input.ids.len());
+        for &id in input.ids {
+            let c = visible_id_counts.entry(id).or_insert(0);
+            *c = c.saturating_add(1);
+        }
+        if !crate::core::distance_result_is_valid(&hits, input.k, &visible_id_counts) {
+            return Err(KernelError::WorkerPanicked);
+        }
         let mut out: Vec<crate::kernel::CandidateHit> = hits
             .into_iter()
             .filter(|h| !h.distance.is_nan())
@@ -6566,6 +6577,26 @@ mod tests {
         }
     }
 
+    /// Issue #1991 レビュー指摘: 不可視 id の NaN 行・k 超過・距離順違反は NaN 除去前に拒否する。
+    #[test]
+    fn cosine_dense_adapter_rejects_contract_violations_before_nan_removal() {
+        let run = |hits: Vec<crate::kernel::DistanceHit>, k: usize| {
+            let inner = CosineOnly(hits);
+            let adapter = CosineDenseAdapter { inner: &inner };
+            adapter.search(SearchInput {
+                ids: &[1_u64, 2],
+                vectors: &[0.0, 0.0],
+                dim: 1,
+                query: &[1.0],
+                k,
+            })
+        };
+        assert!(run(vec![dh(1, 0.1), dh(99, f64::NAN)], 2).is_err());
+        assert!(run(vec![dh(1, 0.1), dh(2, f64::NAN), dh(2, f64::NAN)], 2).is_err());
+        assert!(run(vec![dh(1, 0.9), dh(2, 0.1)], 2).is_err());
+        assert!(run(vec![dh(1, 0.1), dh(2, f64::NAN)], 2).is_ok());
+    }
+
     /// Issue #1991: HYBRID 密側アダプタは NaN 行を除き、`1 - d` のスコア降順・同点は id 昇順で返す。
     #[test]
     fn cosine_dense_adapter_returns_finite_hits_in_score_order() {
@@ -6577,7 +6608,7 @@ mod tests {
             dh(9, f64::NAN),
         ]);
         let adapter = CosineDenseAdapter { inner: &inner };
-        let ids = [0_u64];
+        let ids = [4_u64, 2, 7, 1, 9];
         let hits = adapter
             .search(SearchInput {
                 ids: &ids,
