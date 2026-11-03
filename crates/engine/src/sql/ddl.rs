@@ -3172,7 +3172,9 @@ pub(crate) fn execute_create_index(
         });
     }
     let kind = match validated.method() {
-        crate::sql::allowlist::IndexMethod::Hnsw => IndexKind::Hnsw,
+        crate::sql::allowlist::IndexMethod::Hnsw => {
+            IndexKind::Hnsw(crate::catalog::VectorOpClass::Cosine)
+        }
         crate::sql::allowlist::IndexMethod::Gin(opclass) => IndexKind::Gin(opclass),
         crate::sql::allowlist::IndexMethod::Btree => IndexKind::Scalar,
     };

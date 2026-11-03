@@ -834,7 +834,7 @@ fn matview_index_declaration_rules() {
     let hnsw = IndexDef::new(
         "ix_h".to_string(),
         "mv".to_string(),
-        IndexKind::Hnsw,
+        IndexKind::Hnsw(crate::catalog::VectorOpClass::Cosine),
         vec!["label".to_string()],
     );
     assert!(matches!(

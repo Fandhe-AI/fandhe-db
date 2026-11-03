@@ -18,7 +18,7 @@
 //! - 索引宣言の有無でクエリ結果集合・RLS 境界が変わらない
 //! - 宣言の永続化と `DROP TABLE` による一掃
 
-use engine::catalog::{ColumnDef, ColumnType, IndexDef, IndexKind, TableSchema};
+use engine::catalog::{ColumnDef, ColumnType, IndexDef, IndexKind, TableSchema, VectorOpClass};
 use engine::core::EngineCore;
 use engine::kernel::CpuScalarProvider;
 use engine::policy::PolicyContext;
@@ -214,7 +214,7 @@ fn create_and_drop_index_succeed_and_persist_across_reopen() {
     assert_eq!(lang.table, TABLE);
     assert_eq!(lang.columns, vec!["lang".to_string(), "id".to_string()]);
     let vec_idx = defs.iter().find(|d| d.name == "idx_vec").expect("idx_vec");
-    assert_eq!(vec_idx.kind, IndexKind::Hnsw);
+    assert_eq!(vec_idx.kind, IndexKind::Hnsw(VectorOpClass::Cosine));
     assert_eq!(vec_idx.columns, vec!["embedding".to_string()]);
 }
 
@@ -658,4 +658,28 @@ fn drop_table_clears_index_declarations() {
     .expect("recreate table");
     run(&core, &mut s, "CREATE INDEX idx_lang ON docs (lang)")
         .expect("recreate index after drop table");
+}
+
+/// Issue #1978（INDEX-7・SQL-33 (5)）AC1: opclass 付きの HNSW 宣言は再オープン後も復元される。
+#[test]
+fn hnsw_opclass_declaration_survives_reopen() {
+    for opclass in [VectorOpClass::L2, VectorOpClass::Ip, VectorOpClass::L1] {
+        let (path, _guard) = open_fixture("index-ddl-hnsw-opclass-reopen");
+        {
+            let storage = Storage::open(&path).expect("open storage");
+            storage
+                .create_index(&IndexDef::new(
+                    "idx_vec".to_string(),
+                    TABLE.to_string(),
+                    IndexKind::Hnsw(opclass),
+                    vec!["embedding".to_string()],
+                ))
+                .expect("create hnsw index");
+        }
+        let storage = Storage::open(&path).expect("reopen storage");
+        let defs = storage.list_indexes().expect("list indexes");
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].kind, IndexKind::Hnsw(opclass));
+        assert_eq!(defs[0].columns, vec!["embedding".to_string()]);
+    }
 }
