@@ -111,13 +111,15 @@ impl NodeSource for PreparedI8Source<'_> {
                         signed: &qc.signed,
                         shifted: &qc.shifted,
                     };
-                    // 整数オペランドの準備は内積専用。他 metric での SQ8 の扱い
-                    // （縮退か拒否か）は親 #1996 で決めるため、現状は腕 1 つ。
+                    // 整数オペランドの準備は内積専用。Cosine は正規化済み内積なので同じ腕。
+                    // L2 は凍結時に F32 へ縮退するため到達しない（防御として NaN →
+                    // `finite_score` で fail-closed に拒否する）。
                     match metric {
-                        HnswMetric::InnerProduct => {
+                        HnswMetric::InnerProduct | HnswMetric::Cosine => {
                             let int_dot = self.kernel.dot_i8(row, row_sum, operands);
                             sq8::score_from_int_dot(int_dot, qc.scale_q)
                         }
+                        HnswMetric::L2 => f32::NAN,
                     }
                 }
                 I8QueryPlan::Dequant => metric.score_sq8_dequant(row, self.params.scales(), query),
