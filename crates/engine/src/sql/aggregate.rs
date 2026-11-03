@@ -2929,8 +2929,10 @@ pub(crate) fn aggregate_result_type(
         // `SUM(REAL)` は PostgreSQL と同じく real（`Accumulator::RealSum`）。
         (Sum | Min | Max, AggregateInput::RealColumn(_)) => ColumnType::Real,
         (Avg, AggregateInput::RealColumn(_)) => ColumnType::Double,
-        // SQL-72 (3)・Issue #2038: 列は次元つき vector、式は静的な次元が無いので `None`（text 公告）。
-        (Sum, AggregateInput::VectorColumn { dim }) => ColumnType::Vector(*dim),
+        // SQL-72 (3)・Issue #2038: 列・式とも次元つき vector で公告する（式の次元は宣言次元。集合演算の型ゲートが検出できるようにする）。
+        (Sum, AggregateInput::VectorColumn { dim } | AggregateInput::VectorExpr { dim, .. }) => {
+            ColumnType::Vector(*dim)
+        }
         (Sum | Avg | Min | Max, AggregateInput::DoubleColumn(_)) => ColumnType::Double,
         (Sum | Avg | Min | Max, AggregateInput::ScalarExpr { .. }) => ColumnType::Double,
         (

@@ -6520,6 +6520,9 @@ pub(crate) enum AggregateInput {
     VectorExpr {
         source: crate::sql::udf_call::BoundExpr,
         program: crate::sql::expr_program::ExprProgram,
+        /// 結果ベクトルの次元（テーブルの VECTOR 列の宣言次元。要素ごとの式は次元を保つ）。
+        /// 集計結果列を `Vector(dim)` と公告し、集合演算の型ゲート（22000）で検出するために持つ。
+        dim: u32,
     },
     /// `string_agg(<値>, <区切り> [ORDER BY ...])`（SQL-57・Issue #1800）。区切り・内側の
     /// `ORDER BY` のプログラムを `input` の内側へ閉じ込め、`Accumulator::observe` が
@@ -7713,6 +7716,7 @@ fn resolve_aggregate_input(
                     Ok(AggregateInput::VectorExpr {
                         source: bound,
                         program,
+                        dim: schema.vector_dim().unwrap_or(0),
                     })
                 }
                 ExprType::Text | ExprType::Bool | ExprType::Vector

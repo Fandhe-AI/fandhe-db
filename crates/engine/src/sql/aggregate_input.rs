@@ -148,7 +148,9 @@ pub(crate) fn eval_aggregate_input<'a>(
                 }
             }
         }
-        AggregateInput::VectorExpr { source, program } => {
+        AggregateInput::VectorExpr {
+            source, program, ..
+        } => {
             let embedding = expr_embedding(source, vector, "VectorExpr")?;
             match program.eval(id, embedding, scanned, scratch)? {
                 ExprValue::Vector(c) => V::Vector(c),

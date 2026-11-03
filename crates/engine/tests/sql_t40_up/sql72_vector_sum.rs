@@ -275,3 +275,23 @@ fn vector_sum_is_rejected_by_deduplicating_set_operations() {
     );
     assert_eq!(r.rows.len(), 2);
 }
+
+/// PR #2925 レビュー指摘の回帰: VECTOR 式（`vec_div(embedding, 2)` 等）への `sum` も、
+/// 列への `sum` と同じく集合演算の型ゲートで 22000 になる（結果型の公告が VECTOR を保つ）。
+#[test]
+fn vector_expr_sum_is_rejected_by_deduplicating_set_operations() {
+    let (core, _g) = build_core("sql72-sum-expr-setop", &SEEDS_A, &SEEDS_B_HUGE);
+    for op in ["UNION", "INTERSECT", "EXCEPT"] {
+        let sql = format!(
+            "SELECT sum(vec_div(embedding, 2)) FROM t {op} SELECT sum(vec_div(embedding, 2)) FROM t"
+        );
+        let code = code_of(&core, &sql);
+        assert_ne!(code, "XX000", "{sql}");
+        assert_eq!(code, "22000", "{sql}");
+    }
+    let r = exec(
+        &core,
+        "SELECT sum(vec_div(embedding, 2)) FROM t UNION ALL SELECT sum(vec_div(embedding, 2)) FROM t",
+    );
+    assert_eq!(r.rows.len(), 2);
+}
