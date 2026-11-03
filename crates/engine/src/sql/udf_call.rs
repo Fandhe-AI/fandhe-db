@@ -348,6 +348,20 @@ pub enum Expr {
         lhs: Box<Expr>,
         rhs: Box<Expr>,
     },
+    /// ベクトルの距離式 `<lhs> <距離演算子> <rhs>`（対象ビヘイビア: SQL-74 (1)・Issue #2035）。
+    /// WHERE の比較・`BETWEEN` の被演算子としてだけ構文段が生成する
+    /// （`allowlist::Parser::parse_json_access_rest`。優先順位は JSON 演算子と同じ
+    /// 「その他の演算子」の段で左結合）。算術・比較の網羅 match へ流れ込まないよう
+    /// [`Expr::JsonAccess`] と同じく [`BinOp`] とは別 variant にしている。
+    /// 束縛段（`bind_vector_distance_operands`）が被演算子を検証し、評価が結線されるまで
+    /// （Issue #2036）は fail-closed の `0A000` で止める。
+    ///
+    /// 変更履歴: 本 variant の追加は `Expr` の網羅的 match を持つ外部コードへの破壊的変更。
+    VectorDistance {
+        kind: crate::sql::lexer::DistanceKind,
+        lhs: Box<Expr>,
+        rhs: Box<Expr>,
+    },
     /// 括弧なしの SQL 値関数（`CURRENT_TIMESTAMP`・`CURRENT_DATE`・`LOCALTIMESTAMP` 等。
     /// 対象ビヘイビア: SQL-37・Issue #1586）。構文段（`allowlist::Parser::parse_primary_expr`）が
     /// **引用されていない**識別子の予約語一致でだけ生成する（引用識別子は列参照のまま）。
@@ -1939,7 +1953,8 @@ pub(crate) fn contains_typed_numeric(expr: &Expr) -> bool {
         | Expr::RegexMatch {
             lhs, pattern: rhs, ..
         }
-        | Expr::JsonAccess { lhs, rhs, .. } => {
+        | Expr::JsonAccess { lhs, rhs, .. }
+        | Expr::VectorDistance { lhs, rhs, .. } => {
             contains_typed_numeric(lhs) || contains_typed_numeric(rhs)
         }
         Expr::Case { whens, else_result } => {
@@ -2072,7 +2087,8 @@ pub(crate) fn first_non_builtin_call_with(
         | Expr::RegexMatch {
             lhs, pattern: rhs, ..
         }
-        | Expr::JsonAccess { lhs, rhs, .. } => {
+        | Expr::JsonAccess { lhs, rhs, .. }
+        | Expr::VectorDistance { lhs, rhs, .. } => {
             first_non_builtin_call_with(lhs, allow_current_time, allow_json_fns)
                 .or_else(|| first_non_builtin_call_with(rhs, allow_current_time, allow_json_fns))
         }
@@ -3092,7 +3108,8 @@ fn expr_reaches_function(
         | Expr::RegexMatch {
             lhs, pattern: rhs, ..
         }
-        | Expr::JsonAccess { lhs, rhs, .. } => {
+        | Expr::JsonAccess { lhs, rhs, .. }
+        | Expr::VectorDistance { lhs, rhs, .. } => {
             expr_reaches_function(lhs, target, registry, visited)
                 || expr_reaches_function(rhs, target, registry, visited)
         }
@@ -3176,7 +3193,8 @@ fn collect_call_names(expr: &Expr, out: &mut Vec<String>) {
         | Expr::RegexMatch {
             lhs, pattern: rhs, ..
         }
-        | Expr::JsonAccess { lhs, rhs, .. } => {
+        | Expr::JsonAccess { lhs, rhs, .. }
+        | Expr::VectorDistance { lhs, rhs, .. } => {
             collect_call_names(lhs, out);
             collect_call_names(rhs, out);
         }
@@ -3767,6 +3785,9 @@ fn validate_closed_expr(
         Expr::JsonAccess { .. } => Err(SqlSurfaceError::FeatureNotSupported {
             detail: "JSON operators are not supported in a function body".to_string(),
         }),
+        Expr::VectorDistance { .. } => Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "distance operators are not supported in a function body".to_string(),
+        }),
         Expr::Ident(name) => {
             // `params` は `define_function` で正規化済み（小文字）。本体側の参照は
             // 引用なし識別子として書かれた原文字列のままなので、比較のたびに同じ
@@ -3960,6 +3981,56 @@ fn validate_closed_expr(
         // 時刻の値関数は呼び出し側の文脈（読み取り文）の時刻へ展開時に束縛される。
         Expr::ValueFunction { .. } => Ok(()),
     }
+}
+
+/// 距離式の被演算子を検証した結果（SQL-74 (1)・Issue #2035）。評価の結線
+/// （Issue #2036）が `BoundExpr` の構築に使うまでは、検証の成否だけが観測される。
+#[allow(dead_code)] // Issue #2036 が評価で消費する。それまで束縛ゲートは成否のみを見る。
+pub(super) struct BoundVectorDistance {
+    pub(crate) kind: crate::sql::lexer::DistanceKind,
+    pub(crate) query: Vec<f32>,
+}
+
+/// 距離式 `<VECTOR 列> <距離演算子> <ベクトルリテラル>` の被演算子を検証する
+/// （SQL-74 (1)・Issue #2035。[`bind_expr_any`] の `Expr::VectorDistance` 腕から呼ばれる）。
+///
+/// 距離は 4 種別とも対称なので `'[..]' <-> embedding` も受理し、(列, リテラル) に正規化する。
+/// 検証順序（fail-closed）: (1) 列側を通常の識別子束縛で解決（未知の列は `42703`、2 本目以降の
+/// VECTOR 列は `22000`）、(2) VECTOR 型でなければ `42883`、(3) リテラルを
+/// [`crate::sql::parser::parse_vector_literal`] で解析（長さ超過 `54000`・不正／次元不一致 `22000`）。
+/// 列×列・NULL・ベクトルを返す式・リテラル同士は `0A000`。エラーにリテラルの値を含めない。
+pub(super) fn bind_vector_distance_operands(
+    kind: crate::sql::lexer::DistanceKind,
+    lhs: &Expr,
+    rhs: &Expr,
+    env: &mut BindEnv<'_>,
+    node_budget: &mut usize,
+) -> Result<BoundVectorDistance, SqlSurfaceError> {
+    let unsupported = || SqlSurfaceError::FeatureNotSupported {
+        detail: "distance operands must be a VECTOR column and a vector literal".to_string(),
+    };
+    let (column, literal) = match (lhs, rhs) {
+        (Expr::Ident(_), Expr::String(s)) => (lhs, s),
+        (Expr::String(s), Expr::Ident(_)) => (rhs, s),
+        _ => return Err(unsupported()),
+    };
+    let (_, ty) = bind_expr_any(column, env, node_budget)?;
+    if ty != ExprType::Vector {
+        return Err(SqlSurfaceError::undefined_function(
+            "operator does not exist for the given operand types",
+        ));
+    }
+    let dim = env
+        .schema
+        .and_then(|sc| {
+            sc.columns.iter().find_map(|c| match c.ty {
+                ColumnType::Vector(d) => Some(d),
+                _ => None,
+            })
+        })
+        .ok_or_else(unsupported)?;
+    let query = crate::sql::parser::parse_vector_literal(literal, dim)?;
+    Ok(BoundVectorDistance { kind, query })
 }
 
 /// 束縛環境: 列参照の解決元（`SELECT`/`WHERE` の式では `Some(schema)`、UDF 本体の
@@ -6492,6 +6563,15 @@ pub(super) fn bind_expr_any(
             }
         }
         Expr::JsonAccess { op, lhs, rhs } => bind_json_access(*op, lhs, rhs, env, node_budget),
+        // 距離式（SQL-74 (1)・Issue #2035）。被演算子を検証したうえで、評価が結線される
+        // （Issue #2036）まで fail-closed の `0A000` で止める。ゲートはこの 1 か所だけで、
+        // すべての束縛経路（投影の CASE・ビュー・DML の WHERE 等）がここを通る。
+        Expr::VectorDistance { kind, lhs, rhs } => {
+            bind_vector_distance_operands(*kind, lhs, rhs, env, node_budget)?;
+            Err(SqlSurfaceError::FeatureNotSupported {
+                detail: "distance comparison in WHERE is not supported yet".to_string(),
+            })
+        }
         Expr::ValueFunction { kind, precision } => bind_value_function(*kind, *precision, env),
         Expr::SqlJsonQuery(q) => crate::sql::jsonpath_fn::bind_sql_json_query(q, env, node_budget),
         // `CAST`／`<type> '<literal>'`（SQL-47・Issue #1590）。規則表の判定と束縛は `sql::cast`。

@@ -227,7 +227,8 @@ fn prescan(expr: &Expr) -> Result<(), SqlSurfaceError> {
         | Expr::RegexMatch {
             lhs, pattern: rhs, ..
         }
-        | Expr::JsonAccess { lhs, rhs, .. } => {
+        | Expr::JsonAccess { lhs, rhs, .. }
+        | Expr::VectorDistance { lhs, rhs, .. } => {
             prescan(lhs)?;
             prescan(rhs)
         }
@@ -338,6 +339,8 @@ fn check_intermediate_precision(expr: &Expr, numeric: bool) -> Result<(), SqlSur
         }
         // jsonb パス演算子は列参照を要し、定数式では `prescan` が列参照として拒否する。
         Expr::JsonAccess { .. } => Ok(()),
+        // 距離式（SQL-74・Issue #2035）は定数式として畳み込まない（束縛段が `0A000` で拒否する）。
+        Expr::VectorDistance { .. } => Ok(()),
         Expr::NullIf(lhs, rhs)
         | Expr::IsDistinctFrom { lhs, rhs, .. }
         | Expr::RegexMatch {

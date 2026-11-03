@@ -897,7 +897,9 @@ pub(crate) fn expr_columns_within(columns: &[String], expr: &Expr) -> Result<(),
             }
             Ok(())
         }
-        Expr::Binary { lhs, rhs, .. } | Expr::JsonAccess { lhs, rhs, .. } => {
+        Expr::Binary { lhs, rhs, .. }
+        | Expr::JsonAccess { lhs, rhs, .. }
+        | Expr::VectorDistance { lhs, rhs, .. } => {
             expr_columns_within(columns, lhs)?;
             expr_columns_within(columns, rhs)
         }

@@ -8705,6 +8705,11 @@ fn map_expr_children(expr: &Expr, f: &mut dyn FnMut(&Expr) -> Expr) -> Expr {
             lhs: Box::new(f(lhs)),
             rhs: Box::new(f(rhs)),
         },
+        Expr::VectorDistance { kind, lhs, rhs } => Expr::VectorDistance {
+            kind: *kind,
+            lhs: Box::new(f(lhs)),
+            rhs: Box::new(f(rhs)),
+        },
         Expr::ArrayConstructor(_) | Expr::Subscript { .. } | Expr::Quantified { .. } => {
             match expr.try_map_array_children(&mut |e| Ok::<Expr, Infallible>(f(e))) {
                 Some(Ok(mapped)) => mapped,
@@ -10935,7 +10940,9 @@ pub(crate) fn collect_expr_idents(expr: &Expr, out: &mut std::collections::HashS
                 collect_expr_idents(arg, out);
             }
         }
-        Expr::Binary { lhs, rhs, .. } | Expr::JsonAccess { lhs, rhs, .. } => {
+        Expr::Binary { lhs, rhs, .. }
+        | Expr::JsonAccess { lhs, rhs, .. }
+        | Expr::VectorDistance { lhs, rhs, .. } => {
             collect_expr_idents(lhs, out);
             collect_expr_idents(rhs, out);
         }
@@ -11961,6 +11968,11 @@ fn rewrite_group_row_idents(
         },
         Expr::JsonAccess { op, lhs, rhs } => Expr::JsonAccess {
             op: *op,
+            lhs: Box::new(rec(lhs)?),
+            rhs: Box::new(rec(rhs)?),
+        },
+        Expr::VectorDistance { kind, lhs, rhs } => Expr::VectorDistance {
+            kind: *kind,
             lhs: Box::new(rec(lhs)?),
             rhs: Box::new(rec(rhs)?),
         },
