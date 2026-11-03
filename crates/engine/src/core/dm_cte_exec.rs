@@ -163,7 +163,13 @@ impl EngineCore {
         if let DmMain::Read(read) = &stmt.main {
             let parsed = super::ParsedSql::Statement((**read).clone());
             return self
-                .describe_parsed_in_session_impl(session, &parsed, false, &[], limits)?
+                .describe_parsed_in_session_impl(
+                    session,
+                    &parsed,
+                    crate::sql::parser::LiteralSkip::NONE,
+                    &[],
+                    limits,
+                )?
                 .ok_or_else(|| SqlSurfaceError::Internal {
                     detail: "internal error".to_string(),
                 });

@@ -364,3 +364,26 @@ fn sql33_projected_distance_prepared_describe_and_execute() {
         other => panic!("expected Query, got {other:?}"),
     }
 }
+
+/// PR #2927 指摘の回帰: Prepared Describe の検証省略は `$n` 由来のダミー値の位置に限る。
+/// 投影側だけ・ORDER BY 側だけに `$n` がある文でも、もう一方の不正な実リテラルは
+/// Describe（Bind 前）で `22000` として検出する（通常の Describe と同じ）。
+#[test]
+fn sql33_projected_distance_prepared_describe_validates_real_literal_beside_param() {
+    let (core, _g) = setup("sql33-proj-dist-prepared-mixed");
+    let session = SessionState::default();
+    for sql in [
+        // 投影のみ `$1`、ORDER BY は不正な実リテラル。
+        "SELECT embedding <=> $1 AS d FROM documents ORDER BY embedding <=> 'invalid' LIMIT 3",
+        // ORDER BY のみ `$1`、投影は不正な実リテラル。
+        "SELECT embedding <=> 'invalid' AS d FROM documents ORDER BY embedding <=> $1 LIMIT 3",
+        // 投影内の `$1` 項目と不正な実リテラル項目の混在。
+        "SELECT embedding <=> $1 AS a, embedding <=> 'invalid' AS b FROM documents ORDER BY embedding <=> $1 LIMIT 3",
+    ] {
+        let prepared = core.parse_sql_prepared(sql).expect("parse");
+        let err = core
+            .describe_prepared_in_session(&session, &prepared)
+            .expect_err(sql);
+        assert_eq!(err.wire_code(), "22000", "{sql}");
+    }
+}

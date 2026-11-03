@@ -2131,25 +2131,39 @@ pub fn order_by_distance_literal_is_param(tokens: &[Token]) -> bool {
     })
 }
 
-/// `tokens`（`$n` 置換前の元トークン列）の SELECT リスト（先頭 `SELECT` から括弧深度 0 の
-/// `FROM` まで）に、投影位置の距離列 `<列> <距離演算子> $n`（SQL-33 (7)・Issue #2007）の `$n` が
-/// あるかを判定する。[`order_by_distance_literal_is_param`] と同じ用途（Prepared Describe が
-/// ダミー値のベクトルリテラル実パースを省いてよいかの判定）で、括弧内（関数引数・
-/// ウィンドウ・副問い合わせ）は対象外。
-pub fn select_list_distance_literal_is_param(tokens: &[Token]) -> bool {
+/// `tokens`（`$n` 置換前の元トークン列）の SELECT リスト（括弧深度 0 の `SELECT` から同深度の
+/// `FROM` まで）で、投影項目（カンマ区切り）ごとに、投影位置の距離列 `<列> <距離演算子> $n`
+/// （SQL-33 (7)・Issue #2007）の `$n` を持つ項目の添字をビット集合で返す。
+/// [`order_by_distance_literal_is_param`] と同じ用途（Prepared Describe がダミー値のベクトル
+/// リテラル実パースを省いてよい位置の判定）で、ORDER BY 側とは別の印として項目ごとに持つ
+/// （片側・片項目に `$n` があるだけで他の実リテラルの検証を省かない）。括弧内（関数引数・
+/// ウィンドウ・副問い合わせ）は対象外。添字 64 以上は印を持てない（常に検証する側）。
+pub fn select_list_distance_param_mask(tokens: &[Token]) -> u64 {
     let mut depth: usize = 0;
     let mut prev_is_distance_op = false;
+    let mut item: usize = 0;
+    let mut mask: u64 = 0;
     for t in tokens {
         match t {
             Token::Punct('(') => depth = depth.saturating_add(1),
             Token::Punct(')') => depth = depth.saturating_sub(1),
-            Token::Keyword(lexer::Keyword::From) if depth == 0 => return false,
-            Token::Param(_) if depth == 0 && prev_is_distance_op => return true,
+            // CTE 本文の後ろの外側 SELECT から数え直す。
+            Token::Keyword(lexer::Keyword::Select) if depth == 0 => {
+                item = 0;
+                mask = 0;
+            }
+            Token::Keyword(lexer::Keyword::From) if depth == 0 => return mask,
+            Token::Punct(',') if depth == 0 => item = item.saturating_add(1),
+            Token::Param(_) if depth == 0 && prev_is_distance_op => {
+                if let Some(bit) = u32::try_from(item).ok().and_then(|i| 1u64.checked_shl(i)) {
+                    mask |= bit;
+                }
+            }
             _ => {}
         }
         prev_is_distance_op = matches!(t, Token::DistanceOp(_));
     }
-    false
+    0
 }
 
 /// 型付き値の負値（`-` + `$typed:<型>` + 数値）か。
@@ -2785,15 +2799,31 @@ mod tests {
         // 投影位置の `$n`（SQL-33 (7)・Issue #2007）だけを検出し、WHERE・ORDER BY の `$n` と
         // 括弧内（関数引数）は対象外。
         let t = |sql: &str| tokenize_with_params(sql).expect("tokenize");
-        assert!(select_list_distance_literal_is_param(&t(
-            "SELECT id, embedding <=> $1 AS d FROM documents ORDER BY embedding <=> $1 LIMIT 3"
-        )));
-        assert!(!select_list_distance_literal_is_param(&t(
-            "SELECT id FROM documents ORDER BY embedding <=> $1 LIMIT 3"
-        )));
-        assert!(!select_list_distance_literal_is_param(&t(
-            "SELECT id, embedding <=> '[1,0,0]' AS d FROM documents WHERE embedding <=> $1 < 1 ORDER BY embedding <=> '[1,0,0]' LIMIT 3"
-        )));
+        assert_eq!(
+            select_list_distance_param_mask(&t(
+                "SELECT id, embedding <=> $1 AS d FROM documents ORDER BY embedding <=> $1 LIMIT 3"
+            )),
+            0b10
+        );
+        assert_eq!(
+            select_list_distance_param_mask(&t(
+                "SELECT id FROM documents ORDER BY embedding <=> $1 LIMIT 3"
+            )),
+            0
+        );
+        assert_eq!(
+            select_list_distance_param_mask(&t(
+                "SELECT id, embedding <=> '[1,0,0]' AS d FROM documents WHERE embedding <=> $1 < 1 ORDER BY embedding <=> '[1,0,0]' LIMIT 3"
+            )),
+            0
+        );
+        // 項目ごとの印: 実リテラルの項目と `$n` の項目が混在しても `$n` の項目だけが立つ。
+        assert_eq!(
+            select_list_distance_param_mask(&t(
+                "SELECT embedding <=> 'x' AS a, embedding <=> $1 AS b FROM documents ORDER BY embedding <=> $1"
+            )),
+            0b10
+        );
     }
 
     #[test]
