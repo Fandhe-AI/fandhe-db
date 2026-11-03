@@ -25,6 +25,7 @@ mod bigint_f64_exact_range;
 mod boolean_column;
 mod bound_plan_public_api;
 mod bytea_column;
+mod bytea_unique_on_conflict;
 mod catalog_fill_value_separation;
 mod chunking;
 mod cjk_tokenizer_impact;
