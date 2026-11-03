@@ -180,7 +180,7 @@ fn reset_observation_tls() {
 /// エントリポイントのみ別ロックで排他する（モジュール冒頭「ロック
 /// 不変条件」）。`levels` は並列フェーズ開始前に確定し以後不変（ロック不要）。
 struct BuildGraph {
-    /// 距離（類似度）種別（Issue #1997。現状は内積のみ。凍結時に `GraphBuilder` へ引き継ぐ）。
+    /// 距離（類似度）種別（Issue #1997。内積・L2・Cosine。凍結時に `GraphBuilder` へ引き継ぐ）。
     metric: HnswMetric,
     dim: usize,
     params: HnswParams,
@@ -200,6 +200,7 @@ struct BuildGraph {
 
 impl BuildGraph {
     fn new(
+        metric: HnswMetric,
         params: HnswParams,
         dim: usize,
         vectors: Arc<[f32]>,
@@ -211,7 +212,7 @@ impl BuildGraph {
             .map(|&level| RwLock::new(vec![Vec::new(); level + 1]))
             .collect();
         Self {
-            metric: HnswMetric::default(),
+            metric,
             dim,
             params,
             vectors,
@@ -697,7 +698,9 @@ fn insert_node_locked(
 /// 4. 凍結（`RwLock::into_inner`）して [`super::HnswIndex`] を組み立て、
 ///    既存の `repair_reachability`（単一スレッド後始末。`super::HnswIndex::
 ///    build` と共有）を実行する。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_parallel_graph(
+    metric: HnswMetric,
     params: HnswParams,
     precision: ResidentPrecision,
     dim: u32,
@@ -712,7 +715,14 @@ pub(crate) fn build_parallel_graph(
     let levels: Vec<usize> = (0..n).map(|_| assign_level(&mut rng, params.m)).collect();
 
     let owned_vectors: Arc<[f32]> = Arc::from(vectors);
-    let graph = BuildGraph::new(params, dim_usize, owned_vectors.clone(), levels, false);
+    let graph = BuildGraph::new(
+        metric,
+        params,
+        dim_usize,
+        owned_vectors.clone(),
+        levels,
+        false,
+    );
 
     let prefix_end = super::SEQUENTIAL_PREFIX_NODES.min(n);
     let mut seq_visited = VisitedScratch::default();
@@ -815,7 +825,9 @@ pub(crate) fn build_parallel_graph(
 /// （[`super::HnswIndex::build_with_threads_observed`] のドキュメンテーション
 /// コメントも参照）。エラー分岐（`WorkerPanicked` の判定・`first_error` の
 /// 伝播）のロジックは完全に同一。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_parallel_graph_observed(
+    metric: HnswMetric,
     params: HnswParams,
     precision: ResidentPrecision,
     dim: u32,
@@ -837,7 +849,14 @@ pub(crate) fn build_parallel_graph_observed(
     let level_assign = level_assign_start.elapsed();
 
     let owned_vectors: Arc<[f32]> = Arc::from(vectors);
-    let graph = BuildGraph::new(params, dim_usize, owned_vectors.clone(), levels, true);
+    let graph = BuildGraph::new(
+        metric,
+        params,
+        dim_usize,
+        owned_vectors.clone(),
+        levels,
+        true,
+    );
 
     let prefix_start = Instant::now();
     let prefix_end = super::SEQUENTIAL_PREFIX_NODES.min(n);
@@ -1071,7 +1090,14 @@ mod tests {
         let dim = 4usize;
         let vectors: Vec<f32> = vec![0.0; dim * 3];
         let owned: Arc<[f32]> = Arc::from(vectors.as_slice());
-        let graph = BuildGraph::new(params, dim, owned.clone(), vec![0, 0, 0], false);
+        let graph = BuildGraph::new(
+            HnswMetric::default(),
+            params,
+            dim,
+            owned.clone(),
+            vec![0, 0, 0],
+            false,
+        );
 
         // 意図的にロック保持中に panic させ poison を作る（`catch_unwind` で
         // テストプロセス自体を落とさずに済ませる）。
@@ -1801,7 +1827,7 @@ mod tests {
         prefix_end: usize,
     ) -> BuildGraph {
         let owned: Arc<[f32]> = Arc::from(vectors);
-        let graph = BuildGraph::new(params, dim, owned, levels, false);
+        let graph = BuildGraph::new(HnswMetric::default(), params, dim, owned, levels, false);
         let mut visited = VisitedScratch::default();
         for node_idx in 0..prefix_end {
             let node_id = node_idx as u32;
@@ -2014,7 +2040,14 @@ mod tests {
             .map(|_| assign_level(&mut rng, params.m))
             .collect();
         let owned: Arc<[f32]> = Arc::from(vectors.as_slice());
-        let graph = BuildGraph::new(params, dim, owned.clone(), levels, false);
+        let graph = BuildGraph::new(
+            HnswMetric::default(),
+            params,
+            dim,
+            owned.clone(),
+            levels,
+            false,
+        );
         let mut visited = VisitedScratch::default();
         for node_idx in 0..rows {
             let node_id = node_idx as u32;
