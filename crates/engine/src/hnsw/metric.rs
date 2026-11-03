@@ -1,0 +1,162 @@
+//! HNSW の距離（類似度）計算を 1 か所へ集める metric 抽象（Issue #1997。
+//! 親 Issue #1996。ビヘイビア INDEX-7・SQL-33 のポインタ）。
+//!
+//! # 役割
+//!
+//! 構築（`GraphBuilder`）・探索（`HnswIndex`）・近傍選択ヒューリスティック・
+//! 修復パス・並列構築（`parallel_build`）・SQ8 探索ソース（`i8_query`）は、
+//! 距離計算をすべて本モジュールの [`HnswMetric`] 経由で呼ぶ。後続 Issue
+//! （#1998: L2・コサイン、#1999: 負の内積・L1）は variant と match の腕を足すだけで
+//! 済む。キャッシュキー・永続化・EXPLAIN への反映は #2000 の担当。
+//!
+//! # スコア規約
+//!
+//! 返す値は常に「**大きいほど近い**」類似度スコア（`kernel::CandidateHit`・
+//! `ScoredNode` と同じ規約）。距離系 metric を足すときは `kernel::search_l1`／
+//! `search_l2` と同じく距離の符号反転値を返し、近傍選択の `d > cand.score` 比較と
+//! `ScoredNode` の `Ord` をそのまま使えるようにする。
+//!
+//! # 現状（挙動不変）
+//!
+//! variant は [`HnswMetric::InnerProduct`] のみ。各メソッドは従来の直接呼び出し
+//! （`kernel::dot`・`isa::current_f16().dot_f16`・`sq8::dot_i8_f32`）と同一の関数へ
+//! 委譲するため、結果はビット単位で変わらない。新しい `unsafe` は持たない。
+
+use super::HnswError;
+use crate::kernel::dot;
+
+/// HNSW が使う距離（類似度）種別。`Copy` の fieldless enum で、`GraphBuilder`・
+/// `HnswIndex`・`BuildGraph` が保持し、距離計算の free 関数へ引数で渡す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum HnswMetric {
+    /// 内積（大きいほど近い）。従来の唯一の挙動。
+    #[default]
+    InnerProduct,
+}
+
+impl HnswMetric {
+    /// f32 行同士の類似度（大きいほど近い）。`InnerProduct` は `kernel::dot` と同一
+    /// （引数順も保つ。加算順序・FMA の結果をビット単位で保つため）。
+    #[inline]
+    pub(crate) fn score_f32(self, a: &[f32], b: &[f32]) -> f32 {
+        match self {
+            HnswMetric::InnerProduct => dot(a, b),
+        }
+    }
+
+    /// f16 常駐行 × f32 クエリの類似度。`InnerProduct` は
+    /// `isa::current_f16().dot_f16` と同一。
+    #[inline]
+    pub(crate) fn score_f16(self, row: &[u16], query: &[f32]) -> f32 {
+        match self {
+            HnswMetric::InnerProduct => crate::isa::current_f16().dot_f16(row, query),
+        }
+    }
+
+    /// SQ8 常駐行の復号 dot × f32 クエリの類似度。`InnerProduct` は
+    /// `sq8::dot_i8_f32` と同一。
+    #[inline]
+    pub(crate) fn score_sq8_dequant(self, row: &[i8], scales: &[f32], query: &[f32]) -> f32 {
+        match self {
+            HnswMetric::InnerProduct => crate::sq8::dot_i8_f32(row, scales, query),
+        }
+    }
+}
+
+/// 非有限スコア（`Inf`・`NaN`）を `NonFiniteScore { node }` として拒否する共通
+/// ヘルパー（fail-closed。各スコア算出の直後で呼ぶ）。
+#[inline]
+pub(crate) fn finite_score(score: f32, node: u32) -> Result<f32, HnswError> {
+    if score.is_finite() {
+        Ok(score)
+    } else {
+        Err(HnswError::NonFiniteScore { node })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 固定シードの擬似乱数（テスト専用。非暗号）。
+    fn fill(seed: u64, n: usize) -> Vec<f32> {
+        let mut s = seed | 1;
+        (0..n)
+            .map(|_| {
+                s ^= s >> 12;
+                s ^= s << 25;
+                s ^= s >> 27;
+                let v = s.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 40;
+                (v as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    const DIMS: [usize; 10] = [1, 3, 4, 7, 8, 15, 16, 17, 128, 768];
+
+    /// INDEX-7・SQL-33: 内積 metric は `kernel::dot` とビット同一。
+    #[test]
+    fn inner_product_f32_is_bit_identical_to_kernel_dot() {
+        for &d in &DIMS {
+            let a = fill(11 + d as u64, d);
+            let b = fill(97 + d as u64, d);
+            assert_eq!(
+                HnswMetric::InnerProduct.score_f32(&a, &b).to_bits(),
+                dot(&a, &b).to_bits(),
+                "dim={d}"
+            );
+        }
+    }
+
+    /// f16 常駐行の内積は `dot_f16` とビット同一。
+    #[test]
+    fn inner_product_f16_is_bit_identical_to_dot_f16() {
+        for &d in &DIMS {
+            let q = fill(5 + d as u64, d);
+            // 指数部が極端にならない有限 f16 ビット列（上位ビットを落として生成）。
+            let row: Vec<u16> = fill(7 + d as u64, d)
+                .iter()
+                .map(|v| ((v.to_bits() >> 16) as u16) & 0x3fff)
+                .collect();
+            assert_eq!(
+                HnswMetric::InnerProduct.score_f16(&row, &q).to_bits(),
+                crate::isa::current_f16().dot_f16(&row, &q).to_bits(),
+                "dim={d}"
+            );
+        }
+    }
+
+    /// SQ8 復号 dot は `sq8::dot_i8_f32` とビット同一。
+    #[test]
+    fn inner_product_sq8_dequant_is_bit_identical_to_dot_i8_f32() {
+        for &d in &DIMS {
+            let q = fill(3 + d as u64, d);
+            let scales: Vec<f32> = fill(13 + d as u64, d)
+                .iter()
+                .map(|v| v.abs() + 0.01)
+                .collect();
+            let row: Vec<i8> = (0..d)
+                .map(|i| ((i * 37 % 255) as i32 - 127) as i8)
+                .collect();
+            assert_eq!(
+                HnswMetric::InnerProduct
+                    .score_sq8_dequant(&row, &scales, &q)
+                    .to_bits(),
+                crate::sq8::dot_i8_f32(&row, &scales, &q).to_bits(),
+                "dim={d}"
+            );
+        }
+    }
+
+    /// 非有限スコアは `NonFiniteScore { node }` で拒否し、有限値は素通しする。
+    #[test]
+    fn finite_score_rejects_non_finite() {
+        for bad in [f32::INFINITY, f32::NEG_INFINITY, f32::NAN] {
+            assert!(matches!(
+                finite_score(bad, 9),
+                Err(HnswError::NonFiniteScore { node: 9 })
+            ));
+        }
+        assert_eq!(finite_score(1.5, 0).ok(), Some(1.5));
+    }
+}
