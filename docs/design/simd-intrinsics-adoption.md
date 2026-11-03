@@ -130,6 +130,7 @@
 | `Avx512VnniToken` | `avx512f,avx512bw,avx512vnni` | `("avx512f")` && `("avx512bw")` && `("avx512vnni")` |
 | `NeonFp16Token` | `neon,fp16` | `is_aarch64_feature_detected!("neon")` && `("fp16")` |
 | `NeonDotprodToken` | `neon,dotprod` | `("neon")` && `("dotprod")` |
+| `Avx512VpopcntdqToken` | `avx512f,avx512vpopcntdq` | `("avx512f")` && `("avx512vpopcntdq")` |
 
 - いずれのトークンも既存の sealed トークン（`Avx2FmaToken` 等）と同じ
   設計に従う: フィールドは private・構築は `pub(crate) fn try_new() ->
@@ -231,6 +232,7 @@ target_feature として扱われるため `is_aarch64_feature_detected!` は
 | #517〜#519 | 多アキュムレータ化 | 決定 5（オーナー判断条件） | 同上 + Recall ゲート再実測 |
 | #520〜#523 | SQ8・VNNI（`AvxVnniToken`／`Avx512VnniToken`） | 決定 1・決定 2・決定 3・決定 5 | 同上。#521（対称 SQ8 量子化・i8 常駐表現）・#522（VNNI 512bit／256bit・i16 widen フォールバックの整数 i8×i8 dot カーネル。`Avx2FmaToken` を widen 経路に再利用し新規トークンは `AvxVnniToken`／`Avx512VnniToken` の 2 種のみ）実装済み（`docs/design/hnsw-sq8-resident.md`「Issue #522」節参照。#523〔Recall ゲート同一閾値検証・前後比較〕は未実施） |
 | #524〜#526 | NEON dotprod（`NeonDotprodToken`） | 決定 3・決定 4（1.98 前提） | #525 実装済み（`docs/design/hnsw-sq8-resident.md`「Issue #525」節参照） |
+| #2022 | popcount（`Avx512VpopcntdqToken`。AVX2 は `Avx2FmaToken` を再利用、NEON は `NeonToken`） | 決定 2・決定 3 | 実装済み（親 #2020・TABLE-48 ポインタ）。intrinsics は使わず `count_ones` の自動ベクトル化（AVX2: `vpshufb`＋`vpsadbw`、VPOPCNTDQ: `vpopcntq`、NEON: `cnt`）を生成コード検査で確認する。末尾 8 バイト未満は零埋め固定長バッファで 1 語として数え `vpinsrb` を避ける。AVX-512F 単独版は AVX2 版と同一コードになり検査が空振りするため採用しない |
 | #527〜#529 | tail 処理統一 | 決定 2 | 同上 |
 | #530 | 前後比較 | — | [`benchmark-judgement-policy.md`](benchmark-judgement-policy.md) §3〜§5 準拠 |
 
