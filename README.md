@@ -542,8 +542,9 @@ JOIN 文の `LIMIT`・NoSQL の `limit` の範囲判定にだけ効き、超過�
 SELECT の結果行数上限にも使われます（Issue #1796・#2211）。この場合は全件を実体化して実行し、可視の結果行が設定値を
 超えたら黙って切り詰めず `54000` で文全体を拒否します（DataRow は 1 件も送りません。他テナントの不可視行は数えません）。
 集合演算（`MAX_SET_OP_ROWS`＝10,000 固定）・`GROUP BY` のグループ数・JOIN の出力行数は別軸の上限で、本フラグを
-上げても連動しないため、先にそちらで `54000` になることがあります。サブクエリ内側・書き込み系入力・距離 `ORDER BY` の
-`LIMIT` 省略は別 Issue（#1853・#2212・#2242）で対応します
+上げても連動しないため、先にそちらで `54000` になることがあります。サブクエリ内側・書き込み系入力の
+`LIMIT` 省略は別 Issue（#1853・#2212）で対応します。距離 `ORDER BY` の `LIMIT` 省略（`LIMIT ALL`・`OFFSET` 単独を含む）は
+索引を使わない厳密全走査で返し、上限超過は `54000`、`USING MODE 'precision'` との併用は `0A000` です（Issue #2242）
 （詳細: [docs/design/result-limits-cli.md](docs/design/result-limits-cli.md)・
 [docs/design/limit-omitted-result-cap.md](docs/design/limit-omitted-result-cap.md)）。
 

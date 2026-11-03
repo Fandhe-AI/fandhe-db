@@ -47,7 +47,7 @@
 | `LIMIT` 省略・`LIMIT ALL` で、可視結果が `cap` を超えた | `54000`（`SqlSurfaceError::payload_too_large`） | 文全体を拒否する。固定の英語文言（例: `result exceeds the row limit`）で、行の内容・テナント・件数を含めない |
 | 明示 `LIMIT n` の範囲外（現状） | `22000` | #1796 で改訂するまで現行契約を維持する |
 | 明示 `LIMIT n`（n > cap）で、ベクトル順位付けを持たない文（目標挙動） | 実結果が `cap` 以内なら受理、超えれば `54000` | 移行の判断と実装は #1796 に委ねる。それまでは `22000` |
-| ベクトル順位付け（kNN・hybrid）の `LIMIT k` | `22000`（範囲 `..=cap`）を維持 | 距離 ORDER BY の省略は #2242 |
+| ベクトル順位付け（kNN・hybrid）の `LIMIT k` | `22000`（範囲 `..=cap`）を維持 | 距離 ORDER BY の省略は #2242 で実装済み（下の実装メモ） |
 | `LIMIT 0`・負の `LIMIT`／`OFFSET` | 本 ADR では決めない | #1796 で扱う（SQL-34・ERR-6 ポインタ） |
 
 ### D4 部分結果を送らない
@@ -96,7 +96,7 @@
 | NoSQL（HTTP）`scan` の `limit` | 必須のまま（上限値の共有のみ） |
 | 書き込み系入力（`INSERT ... SELECT`・CTAS・matview・COPY） | `write_input_cap` に集約済み（#2212） |
 | 部分クエリ内側の `LIMIT` 省略 | #1852・#1853 |
-| 距離 ORDER BY の省略 | #2242 |
+| 距離 ORDER BY の省略 | #2242（実装済み） |
 
 ## 対象外
 
@@ -111,7 +111,7 @@
 - 束縛段: `bind_scan_with_dummy_flags` が印付きの文を取得上限 `cap + 1`・`BoundScan::result_cap = Some(cap)` に差し替える。`EngineCore::check_bound_scan_limit` は印付きの計画を「`cap` が設定値と一致し取得上限が `cap + 1` 以下」のときだけ通す。NoSQL 表層の `BoundScan::new` は印を持たず契約は不変
 - 実行段: 広域取得は `sql::scan::execute_scan_with_budget` の入口 1 か所で `rows.len() > cap` を `54000` にする（Scan・ウィンドウ・cursor の内側・COPY・INSERT…SELECT・CTE・ビュー畳み込みが共有）。JOIN・`GROUP BY`／DISTINCT（HAVING と OFFSET の適用後）・集合演算全体・評価後射影形ビューの外側は各経路の結果に同じ判定をかける。文言は固定で件数・テナントを含めない
 - `MAX_SET_OP_ROWS`（固定 10,000）は別軸として残る。cap を 10,000 より上げても集合演算は 10,000 で `54000` になる
-- 従来どおり `42601`: 距離 ORDER BY・`USING PLAN` の省略（#2242）、サブクエリ内側・集合演算の括弧付き枝・ビュー／CTAS／matview の本文の省略（#1852／#1853／#2212）
+- 従来どおり `42601`: hybrid 関数形・`USING PLAN` の省略（#2242 では対象外のまま）、サブクエリ内側・集合演算の括弧付き枝・ビュー／CTAS／matview の本文の省略（#1852／#1853／#2212）
 - 現行契約を維持（本 Issue では見送り）: `LIMIT 0`・明示 `LIMIT n (n > cap)` は `22000`（SQL-34・ERR-6 ポインタ）。`validate_search_limit_with` は kNN と `FETCH n` でも共有されるため影響範囲が広い
 - #1797 へ（完了。下記）: `cap + 1` 件到達時の走査・結合・集約の早期中断。#1798 へ: wire の分割送出・キャンセル
 
@@ -141,4 +141,16 @@
 - 上げた側の境界: `crates/engine/tests/sql34_result_rows_raised_cap.rs`。cap 10,001 で省略・`LIMIT ALL` の ちょうど成功と +1 の `54000`、明示 `LIMIT` は設定値まで受理
 - D1 の申し送り（ハード上限）: cap 100,000 で取得上限 100,001 を設定しても、走査上限（`storage::MAX_SCAN_TOTAL_ROWS`）・可視行上限（`tenant::MAX_VISIBLE_ROWS`）に先に当たらず、100,000 行ちょうどは成功（順序なし・`ORDER BY`）、100,001 行は `54000` になることをテストで確認した。修正は不要
 - 別軸の上限: 集合演算の枝・全体は `MAX_SET_OP_ROWS`（10,000 固定）、`GROUP BY` は `MAX_GROUPS`、JOIN は出力行数上限が先に効く。本フラグとは連動させない（result-limits-cli.md D7・SQL-46 (6)）。現行挙動をテストで固定した
-- 申し送り: サブクエリ内側・派生テーブル・CTE 本文・ビュー本文の省略は #1852・#1853、書き込み・実体化の入力は #2212、`max_rows` 分割送出・キャンセルは #1798、距離 `ORDER BY`・`USING PLAN` は #2242
+- 申し送り: サブクエリ内側・派生テーブル・CTE 本文・ビュー本文の省略は #1852・#1853、書き込み・実体化の入力は #2212、`max_rows` 分割送出・キャンセルは #1798、`USING PLAN`・hybrid の省略は対象外（距離 `ORDER BY` は #2242 で実装済み）
+
+## 実装メモ（Issue #2242: 距離順 ORDER BY の LIMIT 省略）
+
+ビヘイビア: SQL-33 (2)(8)・SQL-34 (2)(3)(4)・SQL-75 (4)（ポインタのみ）。
+
+- 構文: 距離順 `ORDER BY` だけが `LIMIT` 省略・`LIMIT ALL`・`OFFSET` 単独を受理する。`ValidatedStatement` は番兵 `limit = u32::MAX` と `limit_implicit = true` を持つ（`pub(crate)`。検証経路だけが立てる）。hybrid 関数形・`USING PLAN` は従来どおり `42601`。
+- 束縛: `BoundStatement::result_cap = Some(cap)`、`limit = cap + 1`、取得件数は `offset + cap + 1`（`checked_add`。溢れは `Internal`）。明示 `LIMIT`（`LIMIT 0`・`n > cap` は `22000`）は不変。`HINT ORDER` で DISTANCE を先にしても SCALAR 先へ倒す（DISTANCE 先行の事後フィルタで件数が減り超過を見逃す fail-open を避ける。SQL-74 と同型）。
+- 実行: ANN・provider を通さず `sql::exec::exact_full_scan`（DESC と共通）で厳密全走査する。RLS 安全網と `OFFSET` の後の件数が `cap` を超えたら `54000`（行は 1 件も返さない）。不可視行は計数に入らない。走査量は既存のアリーナ上限に従い、新しい走査上限は作らない。
+- 多層防御: `core::check_bound_search` は印付き計画を「`cap` が設定値と一致・取得上限が `cap + 1`・`OFFSET` が検索上限以内」のときだけ通す。
+- 取得モード: `USING MODE 'precision'`（セッション変数による実効モードを含む）との併用は `0A000`（確信度ゲートを全件順位付けに当てた意味が決まっていないため、DESC と同じ扱い。spec 側での確認が必要）。
+- EXPLAIN: `ann_plan: plain_scan_limit_omitted`（優先順位は `DESC`・距離種別の不一致の後ろ）。
+- 対象外: hybrid・`USING PLAN` の省略、非 Cosine の実行（#1981・#1991）、距離列の投影（#2007）、NoSQL search の省略（#2243）。
