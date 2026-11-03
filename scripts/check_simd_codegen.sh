@@ -302,6 +302,12 @@ required_segments_for() {
     # （`#[target_feature]` fn のため独立シンボルとして生成される）。
     echo "11l1_avx2_fma"
     echo "9l1_avx512"
+    # Issue #2022（TABLE-48）: popcount カーネル（Hamming・Jaccard カウント。
+    # いずれも `#[target_feature]` fn のため独立シンボルとして生成される）。
+    echo "12hamming_avx2"
+    echo "24hamming_avx512_vpopcntdq"
+    echo "19jaccard_counts_avx2"
+    echo "31jaccard_counts_avx512_vpopcntdq"
   else
     echo "10SimdKernel20dot_with_scalar_tail"
     echo "10SimdKernel20dot_with_padded_tail"
@@ -323,6 +329,9 @@ required_segments_for() {
     # Issue #1988（SQL-33）: L1 距離カーネル `isa::l1_neon`。NEON は baseline の
     # ため `#[inline(never)]` を付与しており独立シンボルとして必ず現れる。
     echo "7l1_neon"
+    # Issue #2022（TABLE-48）: popcount カーネル。`#[inline(never)]` で独立シンボル。
+    echo "12hamming_neon"
+    echo "19jaccard_counts_neon"
   fi
 }
 
@@ -384,6 +393,24 @@ expected_rules_for() {
       "l1_avx512" \
       '^[[:space:]]*(vpandd|vandps)[[:space:]].*%zmm' \
       "f32x16 abs via sign-mask (vpandd/vandps on %zmm) actually emitted"
+    # Issue #2022: popcount が自動ベクトル化された証跡を要求する。AVX2 はニブル LUT
+    # 方式（vpshufb＋vpsadbw、いずれも %ymm）、VPOPCNTDQ は vpopcntq（%zmm）。
+    for seg in "hamming_avx2" "jaccard_counts_avx2"; do
+      printf '%s\t%s\t%s\n' \
+        "${seg}" \
+        '^[[:space:]]*vpshufb[[:space:]].*%ymm' \
+        "nibble-LUT popcount (vpshufb on %ymm) actually emitted (not scalarized)"
+      printf '%s\t%s\t%s\n' \
+        "${seg}" \
+        '^[[:space:]]*vpsadbw[[:space:]].*%ymm' \
+        "byte-sum reduction (vpsadbw on %ymm) actually emitted"
+    done
+    for seg in "hamming_avx512_vpopcntdq" "jaccard_counts_avx512_vpopcntdq"; do
+      printf '%s\t%s\t%s\n' \
+        "${seg}" \
+        '^[[:space:]]*vpopcntq[[:space:]].*%zmm' \
+        "64-bit lane popcount (vpopcntq on %zmm) actually emitted"
+    done
   else
     printf '%s\t%s\t%s\n' \
       "dot_f16_neon_fp16" \
@@ -408,6 +435,13 @@ expected_rules_for() {
       "l1_neon" \
       '^[[:space:]]*(fabd|fabs)[[:space:]]+v[0-9]+\.4s' \
       "f32x4 abs-difference (fabd/fabs v.4s) actually emitted"
+    # Issue #2022: popcount が NEON の `cnt v.16b` へベクトル化された証跡を要求する。
+    for seg in "hamming_neon" "jaccard_counts_neon"; do
+      printf '%s\t%s\t%s\n' \
+        "${seg}" \
+        '^[[:space:]]*cnt[[:space:]]+v[0-9]+\.16b' \
+        "byte popcount (cnt v.16b) actually emitted (not scalarized)"
+    done
   fi
 }
 
@@ -894,6 +928,22 @@ pub mod isa_probe {
 }
 RUST
 
+  # fail (Issue #2022): 関数名は `hamming_avx2` だが実体は black_box で逐次化した
+  # スカラー popcount（%ymm の vpshufb／vpsadbw を出さない）。popcount の非 vacuous
+  # 検査が縮退を実際に検出できることを確認する。
+  cat > "${dir}/fx_fail_popcount_missing_instruction.rs" <<'RUST'
+pub mod isa_probe {
+    #[inline(never)]
+    pub fn hamming_avx2(a: &[u8], b: &[u8]) -> u64 {
+        let mut acc = 0u64;
+        for (x, y) in a.iter().zip(b.iter()) {
+            acc = core::hint::black_box(acc + u64::from((x ^ y).count_ones()));
+        }
+        acc
+    }
+}
+RUST
+
   # fail (Issue #1988): 関数名は `l1_avx2_fma` だが実体は SIMD 化されない
   # スカラー逐次和（%ymm 上の `vsubps`／`vandps` を出さない）。L1 の非 vacuous 検査が
   # 縮退を実際に検出できることを確認する。
@@ -1334,6 +1384,16 @@ self_test() {
         overall=1
       else
         echo "self-test ok: fail_l1_missing_instruction correctly rejected"
+      fi
+    fi
+
+    asm="$(compile_fixture "${scratch}/fail_popcount_missing_instruction" "${scratch}/fx_fail_popcount_missing_instruction.rs" "${TARGET}")" || { overall=1; asm=""; }
+    if [ -n "${asm}" ]; then
+      if run_scan "${asm}" x86_64 "isa_probe" "12hamming_avx2" >/dev/null 2>&1; then
+        echo "self-test FAILED: expected fail_popcount_missing_instruction to be rejected (no ymm vpshufb)" >&2
+        overall=1
+      else
+        echo "self-test ok: fail_popcount_missing_instruction correctly rejected"
       fi
     fi
   else
