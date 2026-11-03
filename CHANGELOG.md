@@ -7,6 +7,10 @@
 
 ## 0.2.0
 
+### Fixed
+
+- 複数文メッセージで `CREATE [OR REPLACE] FUNCTION` の後続文が失敗したとき、関数がカタログに残る不具合を直した（Issue #2882・SQL-66・WIRE-16・RECOVER-12 ポインタ）。`CREATE FUNCTION` を書き込み扱いにして暗黙トランザクションの共有 write txn へ書き、後続文の失敗でカタログ・セッションごと巻き戻す。世代は commit 成功後にだけ進める。挙動の変化: `CREATE FUNCTION f ...; <後続文>` は暗黙トランザクションに入り（後続が未対応の DDL・`DROP FUNCTION` なら `0A000` で全体をロールバック）、`CREATE FUNCTION f ...; BEGIN; ...` は `0A000`。明示トランザクション内と暗黙トランザクション内の `DROP FUNCTION` は従来どおり `0A000`。公開 API の変更はない。
+
 ### Added
 
 - セッションの UDF 数の上限をカタログ由来（`catalog::function::MAX_FUNCTIONS`）とセッション限定（`MAX_SESSION_UDFS`）で分離した（Issue #2883・SQL-66 (5)）。カタログが満杯でも公開 API の `define_function*`・`register_wasm_udf*` が通り、セッション限定が満杯でも永続 `CREATE FUNCTION`・ロードが通る。各上限の超過は `54000`。`MAX_SESSION_UDFS` の値は 64 のままで、意味が「カタログ由来を除くセッション限定の合計」に変わる。`engine::sql::udf_call::MAX_REGISTRY_UDFS` を追加した。公開シグネチャの変更はない。

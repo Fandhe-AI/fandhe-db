@@ -520,3 +520,59 @@ fn wire_set_returning_function_in_from_returns_rows_and_columns() {
     assert_eq!(read_command_complete(&mut a), "SELECT 1");
     read_ready_for_query(&mut a);
 }
+
+/// SQL-66・WIRE-16・RECOVER-12（Issue #2882）: DDL 権限のあるユーザーの複数文メッセージで、
+/// `CREATE FUNCTION` の後続文が失敗したら、関数は同じ接続にも別の接続（DDL 権限あり・なし）にも残らない。
+/// 応答は `CREATE FUNCTION` の完了 → 失敗文のエラー → `ReadyForQuery`。
+#[test]
+fn wire_create_function_is_rolled_back_when_a_later_statement_in_the_message_fails() {
+    let (core, _guard) = new_core_with_docs();
+    let addr = spawn_server_with_ddl_user(core);
+    let mut a = authenticate_to_ready_for_query(addr, "alice", "pw-alice");
+    send_simple_query(
+        &mut a,
+        "CREATE FUNCTION dbl(x) AS x * 2; SELECT id FROM no_such_table LIMIT 1",
+    );
+    assert_eq!(read_command_complete(&mut a), "CREATE FUNCTION");
+    expect_error_response_with_sqlstate(&mut a, "42P01");
+    read_ready_for_query(&mut a);
+
+    // 同じ接続: 次のメッセージで呼べない（カタログの世代が進んでいないため再ロードもされない）。
+    send_simple_query(&mut a, CALL_DBL);
+    expect_error_response_with_sqlstate(&mut a, "42883");
+    read_ready_for_query(&mut a);
+    // 別の接続（DDL 権限あり・なし）からも呼べず、同名の作成が成功する（カタログに残っていない）。
+    let mut c = authenticate_to_ready_for_query(addr, "carol", "pw-carol");
+    send_simple_query(&mut c, CALL_DBL);
+    expect_error_response_with_sqlstate(&mut c, "42883");
+    read_ready_for_query(&mut c);
+    let mut b = authenticate_to_ready_for_query(addr, "alice", "pw-alice");
+    send_simple_query(&mut b, "CREATE FUNCTION dbl(x) AS x * 3");
+    assert_eq!(read_command_complete(&mut b), "CREATE FUNCTION");
+    read_ready_for_query(&mut b);
+}
+
+/// SQL-66・WIRE-16（Issue #2882）: 全文が成功した複数文メッセージの `CREATE FUNCTION` は作成され、
+/// 同じメッセージ内で呼べて、別の接続（DDL 権限なし）からも呼べる。
+#[test]
+fn wire_create_function_in_a_successful_multi_statement_message_is_persisted() {
+    let (core, _guard) = new_core_with_docs();
+    let addr = spawn_server_with_ddl_user(core);
+    let mut a = authenticate_to_ready_for_query(addr, "alice", "pw-alice");
+    send_simple_query(
+        &mut a,
+        &format!("CREATE FUNCTION dbl(x) AS x * 2; {CALL_DBL}"),
+    );
+    assert_eq!(read_command_complete(&mut a), "CREATE FUNCTION");
+    assert_eq!(read_row_description(&mut a), vec!["d"]);
+    let _ = read_data_row(&mut a);
+    assert_eq!(read_command_complete(&mut a), "SELECT 1");
+    read_ready_for_query(&mut a);
+
+    let mut c = authenticate_to_ready_for_query(addr, "carol", "pw-carol");
+    send_simple_query(&mut c, CALL_DBL);
+    assert_eq!(read_row_description(&mut c), vec!["d"]);
+    let _ = read_data_row(&mut c);
+    assert_eq!(read_command_complete(&mut c), "SELECT 1");
+    read_ready_for_query(&mut c);
+}

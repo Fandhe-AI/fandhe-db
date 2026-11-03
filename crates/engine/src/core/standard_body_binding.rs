@@ -250,6 +250,7 @@ impl EngineCore {
         params: &[String],
         param_types: &[Option<CastType>],
         body_source: &str,
+        txn: Option<&redb::WriteTransaction>,
     ) -> Result<Vec<FunctionDependency>, SqlSurfaceError> {
         let decls = super::function_define::param_decls(params, param_types)?;
         let limits = &self.plpgsql_limits;
@@ -288,10 +289,13 @@ impl EngineCore {
             let Stmt::Sql(q) = stmt else { continue };
             for name in call_names(&q.tokens) {
                 // カタログの照会失敗は依存を取りこぼさないよう拒否する（fail-closed）。
-                let overloads = self.storage.list_overloads(tenant_id, &name).map_err(|_| {
-                    SqlSurfaceError::Internal {
-                        detail: "function catalog operation failed".to_string(),
-                    }
+                // 共有 write txn があればその中（同一メッセージ内の未 commit の定義を含む）を引く。
+                let overloads = match txn {
+                    Some(w) => crate::catalog::function::list_overloads_in_txn(w, tenant_id, &name),
+                    None => self.storage.list_overloads(tenant_id, &name),
+                }
+                .map_err(|_| SqlSurfaceError::Internal {
+                    detail: "function catalog operation failed".to_string(),
                 })?;
                 // 新規作成では定義対象がまだカタログに無く `overloads` が空になるため、自己参照は
                 // 存在判定と独立に拾う（辺に載せ、カタログ側の write txn 内の検査が `0A000` で拒否する）。

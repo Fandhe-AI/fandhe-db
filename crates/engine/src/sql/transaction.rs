@@ -624,6 +624,11 @@ struct ActiveTxn<'e> {
     /// INSERT／TRUNCATE の 2 箇所のみ）。
     written_by_tenant: std::collections::BTreeSet<(String, String)>,
     has_writes: bool,
+    /// 暗黙トランザクション内で UDF カタログ（`CREATE [OR REPLACE] FUNCTION`。Issue #2882）へ書いた
+    /// テナント scope の集合。カタログの世代は commit 成功後にだけ進める必要があるため、書いた時点
+    /// ではなく [`commit_active`] が永続側の commit 成功の直後にこの集合へ対して bump する
+    /// （失敗・abort では bump せず、他セッションから途中の状態を見せない）。
+    function_scopes: std::collections::BTreeSet<String>,
     session_at_begin: SessionState,
     /// `DECLARE`/`FETCH`/`CLOSE`（WIRE-15・TASK-218）が開いたカーソルの集合。
     /// `ActiveTxn` に埋め込まれているため、トランザクションの終了（`commit`／
@@ -1000,6 +1005,7 @@ impl<'e> SessionTransaction<'e> {
                     temp,
                     started_at,
                     has_writes,
+                    function_scopes,
                     session_at_begin,
                     written_by_tenant,
                     written_tables,
@@ -1018,6 +1024,7 @@ impl<'e> SessionTransaction<'e> {
                     has_writes,
                     &written_by_tenant,
                     &written_tables,
+                    &function_scopes,
                     session_at_begin,
                     session,
                 )
@@ -1151,6 +1158,7 @@ impl<'e> SessionTransaction<'e> {
                     written_tables: HashSet::new(),
                     written_by_tenant: std::collections::BTreeSet::new(),
                     has_writes: false,
+                    function_scopes: std::collections::BTreeSet::new(),
                     session_at_begin: session.clone(),
                     cursors: crate::sql::cursor::CursorRegistry::new(),
                     savepoints: crate::sql::savepoint::SavepointStack::new(),
@@ -1202,6 +1210,7 @@ impl<'e> SessionTransaction<'e> {
                     temp,
                     started_at,
                     has_writes,
+                    function_scopes,
                     session_at_begin,
                     written_by_tenant,
                     written_tables,
@@ -1229,6 +1238,7 @@ impl<'e> SessionTransaction<'e> {
                     has_writes,
                     &written_by_tenant,
                     &written_tables,
+                    &function_scopes,
                     session_at_begin,
                     session,
                 )
@@ -1913,6 +1923,17 @@ impl<'e> SessionTransaction<'e> {
         }
     }
 
+    /// 暗黙トランザクションの共有 write txn へ UDF カタログを書いたこと（`CREATE [OR REPLACE]
+    /// FUNCTION`。Issue #2882）を記録する。`has_writes` を立て（立てないと COMMIT が書き込み txn を
+    /// 破棄してカタログの書き込みが落ちる）、commit 成功後に世代を進める scope を覚える。表は書かない
+    /// ため `written_tables`・`written_by_tenant` には入れない（遅延 FK 検査の対象は増えない）。
+    pub(crate) fn mark_function_written(&mut self, tenant_id: &str) {
+        if let TxnState::Active(active) = &mut self.state {
+            active.has_writes = true;
+            active.function_scopes.insert(tenant_id.to_string());
+        }
+    }
+
     /// 対象テーブルへの書き込みを記録する（読み取りの `written_tables` 判定用に
     /// 加え、`tenant_id` を伴う `written_by_tenant` へも記録する。TABLE-17・
     /// TASK-205、Issue #1077。COMMIT 時の遅延 `FOREIGN KEY` 検査の走査範囲は
@@ -2510,6 +2531,7 @@ fn commit_active(
     has_writes: bool,
     written_by_tenant: &std::collections::BTreeSet<(String, String)>,
     written_tables: &HashSet<String>,
+    function_scopes: &std::collections::BTreeSet<String>,
     session_at_begin: SessionState,
     session: &mut SessionState,
 ) -> Result<(), SqlSurfaceError> {
@@ -2575,6 +2597,11 @@ fn commit_active(
             _ => internal_error(),
         }
     })?;
+    // 永続側の commit 成功後にだけ UDF カタログの世代を進める（Issue #2882。他セッションの refresh が
+    // 確定済みの定義を読み直す。ここへ来るのは commit 成功時だけで、失敗・ROLLBACK では bump しない）。
+    for scope in function_scopes {
+        storage.bump_function_generation(scope);
+    }
     // 永続側の commit 成功後にだけ、一時側を確定し、続けて一時表の `ON COMMIT` 動作を適用する
     // （TABLE-44・Issue #1683・#1684。ROLLBACK・永続側の commit 失敗では `temp` を drop（abort）
     // するだけで呼ばない）。順序は「永続 commit → 一時 commit → ON COMMIT」で、一時 DB の単一ライタを
