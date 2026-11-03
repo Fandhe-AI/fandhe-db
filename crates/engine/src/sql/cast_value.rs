@@ -621,11 +621,50 @@ fn extract_src<'a>(from: CastSrc, v: ExprValue<'a>) -> Result<SrcValue<'a>, SqlS
                 Err(internal("integer cast argument is not an exact integer"))
             }
         }
+        // Issue #2881: 定数式の整数モードは 2^53 以上の整数を scale 0 の Numeric の運び手で運ぶ。
+        // CASE／COALESCE の暗黙変換が挿入する整数起点の変換はその運び手も受け付け、i64 の範囲外は 22003。
+        (CastSrc::Int2 | CastSrc::Int4 | CastSrc::Int8, ExprValue::Numeric(d)) => {
+            let r = if d.scale() == 0 {
+                numeric::round_to_integer(&d)
+            } else {
+                None
+            };
+            match r.and_then(|r| i64::try_from(r).ok()) {
+                Some(i) => Ok(SrcValue::Int(i)),
+                None => Err(out_of_range("bigint out of range")),
+            }
+        }
         (CastSrc::Float4 | CastSrc::Float8, ExprValue::Scalar(x)) => Ok(SrcValue::Float(x)),
         (CastSrc::Numeric, ExprValue::Numeric(d)) => Ok(SrcValue::Dec(d)),
         (CastSrc::Bool, ExprValue::Bool(b)) => Ok(SrcValue::Bool(b)),
         (CastSrc::Text, ExprValue::Text(s)) => Ok(SrcValue::Text(s)),
         _ => Err(mismatch()),
+    }
+}
+
+/// Issue #2881: 整数の運び手を float4／float8 へ変換するとき、丸めで値が変わるなら `22003`。
+/// 定数畳み込みは運び手由来の結果を厳密な整数として扱うため、丸めた値を黙って通さず fail-closed にする。
+fn reject_lossy_int_carrier_to_float(
+    src: &SrcValue<'_>,
+    carrier: bool,
+    to: CastDst,
+) -> Result<(), SqlSurfaceError> {
+    let SrcValue::Int(i) = src else {
+        return Ok(());
+    };
+    if !carrier {
+        return Ok(());
+    }
+    let i = i128::from(*i);
+    let exact = match to {
+        CastDst::Float4 => (i as f32) as i128 == i,
+        CastDst::Float8 => (i as f64) as i128 == i,
+        _ => true,
+    };
+    if exact {
+        Ok(())
+    } else {
+        Err(out_of_range("constant expression loses integer precision"))
     }
 }
 
@@ -641,7 +680,10 @@ pub(crate) fn apply_cast<'a>(
     if !(f.from.is_basic() && f.to.is_basic()) {
         return apply_cast_ext(f, v);
     }
+    // 整数の運び手（scale 0 の Numeric）かどうかを、`v` が消費される前に控える。
+    let carrier = matches!(v, ExprValue::Numeric(_));
     let src = extract_src(f.from, v)?;
+    reject_lossy_int_carrier_to_float(&src, carrier, f.to)?;
     convert_basic(src, f.from == CastSrc::Float4, f.to)
 }
 
@@ -1707,6 +1749,51 @@ mod tests {
             )),
             "7   "
         );
+    }
+
+    #[test]
+    fn int_source_accepts_exact_int_carrier() {
+        let d = Decimal::from_parts(1_i128 << 60, 0).unwrap();
+        let f = |to| {
+            apply_cast(
+                CastFn {
+                    from: CastSrc::Int8,
+                    to,
+                },
+                ExprValue::Numeric(d),
+            )
+        };
+        match f(CastDst::Float4).unwrap() {
+            ExprValue::Scalar(x) => assert_eq!(x, (1_i64 << 60) as f64),
+            _ => panic!("scalar expected"),
+        }
+        assert!(matches!(
+            f(CastDst::Numeric(None)).unwrap(),
+            ExprValue::Numeric(_)
+        ));
+        // 丸めで値が変わる運び手は float への変換を 22003 で拒否する（INSERT/DEFAULT で別の値を保存しない）。
+        let lossy = Decimal::from_parts((1_i128 << 53) + 1, 0).unwrap();
+        for to in [CastDst::Float4, CastDst::Float8] {
+            let e = apply_cast(
+                CastFn {
+                    from: CastSrc::Int8,
+                    to,
+                },
+                ExprValue::Numeric(lossy),
+            )
+            .unwrap_err();
+            assert_eq!(e.wire_code(), "22003");
+        }
+        let big = Decimal::from_parts(i128::from(i64::MAX) + 1, 0).unwrap();
+        let e = apply_cast(
+            CastFn {
+                from: CastSrc::Int8,
+                to: CastDst::Float4,
+            },
+            ExprValue::Numeric(big),
+        )
+        .unwrap_err();
+        assert_eq!(e.wire_code(), "22003");
     }
 
     #[test]

@@ -646,7 +646,7 @@ pub(super) fn source_cast_kind(
                     _ => SourceKind::UnknownNumeric,
                 },
                 BoundExpr::Builtin {
-                    f: BuiltinFn::TypedArith(_, kind),
+                    f: BuiltinFn::TypedArith(_, kind) | BuiltinFn::ExactIntArith(_, kind),
                     ..
                 } => SourceKind::Known(match kind {
                     NumericKind::Int2 => CastKind::Int2,

@@ -2259,7 +2259,8 @@ fn integer_digits_beyond_fold_range(digits: &str) -> bool {
 
 /// 型付き位置（[`TypedPositions`]）の `$n` を、`ty` の型付き値のトークン列にする（Issue #2797）。
 /// 値の文法検証は実効型で行う（`22P02`）。畳み込みの精度境界（|v| >= 2^53）以上の値は、従来経路と
-/// 同じ結果になるよう裸の数値のままにする。
+/// 同じ結果になるよう裸の数値のままにする（整数は整数モードが裸のままでも丸めず畳み込む。
+/// 浮動小数は Issue #2881 で範囲に依らず型付き値にする）。
 fn typed_numeric_tokens(
     n: u16,
     value: &str,
@@ -2272,9 +2273,9 @@ fn typed_numeric_tokens(
     };
     let beyond = match bare.last() {
         Some(Token::Number(raw)) if ty.is_integer() => integer_digits_beyond_fold_range(raw),
-        Some(Token::Number(raw)) => raw
-            .parse::<f64>()
-            .is_ok_and(crate::sql::const_expr::float_beyond_fold_range),
+        // Issue #2881: 浮動小数は 2^53 以上でも型付き値で置換する（畳み込みの整数モードは
+        // `$typed:float8`／`float4` の値を f64 のまま有限性だけ検査して束縛する）。
+        Some(Token::Number(_)) => false,
         _ => true,
     };
     if beyond {
@@ -4023,6 +4024,12 @@ mod typed_value_tests {
         assert!(!out
             .iter()
             .any(|t| matches!(t, Token::Ident(w) if w.starts_with("$typed:"))));
+    }
+
+    #[test]
+    fn beyond_fold_range_float_is_typed() {
+        let out = bind(INSERT_EXPR, TypedNumeric::Float8, "1e300");
+        assert!(out.contains(&typed_ident("float8")));
     }
 
     #[test]

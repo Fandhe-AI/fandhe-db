@@ -1819,6 +1819,15 @@ pub enum BuiltinFn {
     /// と checked オーバーフロー（`22003`）をノード単位で行うため、f64 一括計算では
     /// なく専用の演算ノードにしている（`(7/2)*2` が PostgreSQL と同じく 6 になる）。
     TypedArith(BinOp, NumericKind),
+    /// 定数式の畳み込み（`sql::const_expr`）専用の整数算術（`+ - * /`。Issue #2881・SQL-45 ポインタ）。
+    /// [`BuiltinFn::TypedArith`] と同じ意味論だが、被演算子を f64 でなく i128 で読み、2^53 を超える
+    /// 整数（`Scalar` は 2^53 以内、超える値は scale 0 の `Numeric` の運び手）を丸めずに計算する。
+    /// 結果は種別ごとの範囲（int2／int4／int8）で検査し、範囲外は `22003`。[`BindEnv::exact_int`]
+    /// のときだけ束縛段が挿入する（投影・`WHERE`・`CHECK` 等の経路には現れない）。
+    ExactIntArith(BinOp, NumericKind),
+    /// 定数式の畳み込み専用の整数比較（`> < >= <= =`。Issue #2881）。[`BuiltinFn::ExactIntArith`]
+    /// と同じ被演算子の運び手を i128 で比較して `Bool` を返す。[`BindEnv::exact_int`] のときだけ挿入する。
+    ExactIntCompare(BinOp),
     /// 集計式項目の NUMERIC 算術（`+ - * /`。Issue #1812・SQL-42 ポインタ）を表す内部専用関数。
     /// 引数 2 個は NUMERIC 値か 2^53 以内の整数（`Scalar`）で、`numeric::decimal_arith` が
     /// 近似なしで計算する（桁あふれは `22003`、0 除算は `22012`）。`bind_expr_any` の
@@ -1892,6 +1901,20 @@ pub(crate) fn typed_value_expr(ident: &str, raw: String) -> Expr {
         name: ident.to_string(),
         args: vec![Expr::Number(raw)],
     }
+}
+
+/// 内部専用の型付き値（整数・浮動小数。NUMERIC は含まない）の呼び出し名か（Issue #2881）。
+pub(crate) fn is_typed_value_name(name: &str) -> bool {
+    typed_value_cast_type(name).is_some()
+}
+
+/// 内部専用の型付き浮動小数（`$typed:float8`／`$typed:float4`）の呼び出し名か（Issue #2881）。
+pub(crate) fn is_typed_float_name(name: &str) -> bool {
+    use crate::sql::cast::CastType;
+    matches!(
+        typed_value_cast_type(name),
+        Some(CastType::Float4 | CastType::Float8)
+    )
 }
 
 /// 内部専用の型付き NUMERIC 値（`$typed:numeric <数値>`。Issue #2799）の呼び出し名か。
@@ -2261,7 +2284,10 @@ pub(crate) fn builtin_signature(f: BuiltinFn) -> (&'static [ExprType], ExprType)
         BuiltinFn::DateTrunc(_) => (&[ExprType::Timestamp], ExprType::Timestamp),
         BuiltinFn::DateToTimestamp => (&[ExprType::Date], ExprType::Timestamp),
         BuiltinFn::BpcharToText => (&[ExprType::Text], ExprType::Text),
-        BuiltinFn::TypedArith(_, _) => (&[ExprType::Scalar, ExprType::Scalar], ExprType::Scalar),
+        BuiltinFn::TypedArith(_, _) | BuiltinFn::ExactIntArith(_, _) => {
+            (&[ExprType::Scalar, ExprType::Scalar], ExprType::Scalar)
+        }
+        BuiltinFn::ExactIntCompare(_) => (&[ExprType::Scalar, ExprType::Scalar], ExprType::Bool),
         BuiltinFn::NumericArith(_) => (&[ExprType::Numeric, ExprType::Numeric], ExprType::Numeric),
         // 戻り値型は TIMESTAMP（D8 の暫定。TIMESTAMPTZ 型の実装時に切り替える）。
         BuiltinFn::ClockTimestamp => (&[], ExprType::Timestamp),
@@ -2400,6 +2426,8 @@ pub(crate) fn is_foldable_builtin(f: BuiltinFn) -> bool {
         // Issue #1539・SQL-42: 型付き算術は `Binary` と同じく `Scalar` を返す純関数で、
         // 0 除算・オーバーフローは defer-on-error（畳み込み失敗時は実行時に評価）。
         BuiltinFn::TypedArith(_, _) => true,
+        // Issue #2881: 運び手（`Numeric`）を返しうるため `FoldedConst`（`Scalar`／`Bool` のみ）で表せない。
+        BuiltinFn::ExactIntArith(_, _) | BuiltinFn::ExactIntCompare(_) => false,
         // NUMERIC を `FoldedConst`（`Scalar`／`Bool` のみ）で表せないため畳み込まない。
         BuiltinFn::NumericArith(_) => false,
     }
@@ -3214,6 +3242,7 @@ fn check_function_return_type(
         clock: time_fn::current_clock(),
         collation_leaf: false,
         numeric_arith: false,
+        exact_int: false,
     };
     let mut node_budget = MAX_EXPR_NODES;
     bind_udf_return(&prepared.body, ret, &mut env, &mut node_budget).map(|_| ())
@@ -3969,6 +3998,12 @@ pub(super) struct BindEnv<'a> {
     /// `CASE`／`COALESCE` の分岐に使え、結果は [`BuiltinFn::NumericArith`] で正確に計算する
     /// （f64 へ近似しない）。集計式項目の入口（[`bind_aggregate_projection_expr_top`]）だけが立てる。
     numeric_arith: bool,
+    /// 定数式の畳み込みの整数モード（Issue #2881・SQL-45 ポインタ）。`true` のとき、2^53 を超える
+    /// 整数（|v| <= 2^63）を scale 0 の `Numeric` の運び手で束縛し、整数どうしの `+ - * /` と比較を
+    /// [`BuiltinFn::ExactIntArith`]／[`BuiltinFn::ExactIntCompare`] で丸めなく評価する。
+    /// `sql::const_expr` の畳み込み（`bind_const_expr_mode` の `numeric = false`）だけが立て、
+    /// 投影・`WHERE`・`CHECK`・UDF 本体・`FROM` なし SELECT の束縛経路は `false` のまま不変。
+    exact_int: bool,
 }
 
 impl BindEnv<'_> {
@@ -4729,6 +4764,7 @@ pub fn bind_expr(
         clock: time_fn::current_clock(),
         collation_leaf: false,
         numeric_arith: false,
+        exact_int: false,
     };
     bind_expr_in(expr, &mut env, node_budget)
 }
@@ -4752,6 +4788,7 @@ pub(crate) fn bind_array_agg_element(
         clock: time_fn::current_clock(),
         collation_leaf: false,
         numeric_arith: false,
+        exact_int: false,
     };
     crate::sql::array_expr::bind_single_array_element(expr, &mut env, node_budget)
 }
@@ -4857,6 +4894,7 @@ fn bind_projection_expr_inner(
         clock: time_fn::current_clock(),
         collation_leaf: false,
         numeric_arith,
+        exact_int: false,
     };
     let (bound, ty) = bind_expr_any(expr, &mut env, node_budget)?;
     let col = expr_result_column_type(expr, &bound, ty, Some(schema), registry);
@@ -4924,6 +4962,7 @@ pub(crate) fn bind_array_assignment_source(
         clock: time_fn::current_clock(),
         collation_leaf: false,
         numeric_arith: false,
+        exact_int: false,
     };
     let (bound, ty) = crate::sql::cast::bind_operand(expr, &mut env, node_budget)?;
     let col = expr_result_column_type(expr, &bound, ty, Some(schema), registry);
@@ -4978,6 +5017,7 @@ pub(crate) fn bind_order_expr(
         clock: time_fn::current_clock(),
         collation_leaf: false,
         numeric_arith: false,
+        exact_int: false,
     };
     bind_expr_any(expr, &mut env, node_budget)
 }
@@ -5031,7 +5071,7 @@ pub(crate) fn expr_result_column_type(
         NumericKind::Float4 => ColumnType::Real,
     };
     if let BoundExpr::Builtin {
-        f: BuiltinFn::TypedArith(_, kind),
+        f: BuiltinFn::TypedArith(_, kind) | BuiltinFn::ExactIntArith(_, kind),
         ..
     } = bound
     {
@@ -5113,6 +5153,7 @@ pub(crate) fn bind_const_projection_expr(
         clock: time_fn::current_clock(),
         collation_leaf: false,
         numeric_arith: false,
+        exact_int: false,
     };
     let (bound, ty) = bind_expr_any(expr, &mut env, node_budget)?;
     let col = expr_result_column_type(expr, &bound, ty, None, registry);
@@ -5169,6 +5210,50 @@ fn classify_projection_integer_literal(raw: &str) -> Option<(i64, NumericKind)> 
     (v.unsigned_abs() <= TYPED_INT_EXACT_MAX as u64).then_some((v, kind))
 }
 
+/// 整数モード（[`BindEnv::exact_int`]）の整数リテラル分類。先頭 `-` 任意＋桁のみで |v| <= 2^63 のものを i128 と最小の整数型
+/// （i32 に収まれば `Int4`、そうでなければ `Int8`）へ分類する。2^63 は `0 - 9223372036854775808` で i64::MIN を作るために許す葉の上限で、
+/// 単独で残る値は呼び出し元が i64 範囲で検査する。範囲外・整数形でない場合は `None`（従来の経路）。
+pub(crate) fn classify_exact_int_literal(raw: &str) -> Option<(i128, NumericKind)> {
+    // パーサは負の整数リテラルを `Expr::Number("-n")` の 1 ノードへ畳むため、先頭 `-` を受理する
+    // （負側は -2^63 = i64::MIN まで。大きさの上限は正負で同じ 2^63）。
+    let (negative, digits) = match raw.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, raw),
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let mag = digits.parse::<u64>().ok()?;
+    if mag > EXACT_INT_LEAF_MAX {
+        return None;
+    }
+    let v = if negative {
+        -i128::from(mag)
+    } else {
+        i128::from(mag)
+    };
+    let kind = if i32::try_from(v).is_ok() {
+        NumericKind::Int4
+    } else {
+        NumericKind::Int8
+    };
+    Some((v, kind))
+}
+
+/// 整数モードで葉として許す整数の大きさの上限（2^63）。
+const EXACT_INT_LEAF_MAX: u64 = 1 << 63;
+
+/// 整数モードの整数値を束縛式にする。|v| <= 2^53 は従来どおり `Number`、超える値は scale 0 の
+/// `Numeric`（運び手。整数算術・整数比較・畳み込み結果だけが受け取る）。
+fn exact_int_bound(v: i128) -> Result<BoundExpr, SqlSurfaceError> {
+    if v.unsigned_abs() <= TYPED_INT_EXACT_MAX as u128 {
+        return Ok(BoundExpr::Number(v as f64));
+    }
+    crate::numeric::Decimal::from_parts(v, 0)
+        .map(BoundExpr::Numeric)
+        .map_err(|_| SqlSurfaceError::numeric_out_of_range("integer out of range"))
+}
+
 /// 列参照を持たない文脈（`FROM` なし定数式 SELECT。SQL-43・Issue #1531）で式を束縛する。
 /// スキーマなしの [`BindEnv`] で [`bind_expr_in`] を呼ぶ薄いラッパーで、`sql::const_select`
 /// から呼ばれる。列参照は呼び出し元が事前に拒否する前提だが、万一残っても
@@ -5178,7 +5263,7 @@ pub(crate) fn bind_const_expr(
     registry: &UdfRegistry,
     node_budget: &mut usize,
 ) -> Result<(BoundExpr, ExprType, Option<ColumnType>), SqlSurfaceError> {
-    bind_const_expr_mode(expr, registry, node_budget, false)
+    bind_const_expr_inner(expr, registry, node_budget, false, false)
 }
 
 /// [`bind_const_expr`] に NUMERIC 算術モード（[`BindEnv::numeric_arith`]）の指定を足した版
@@ -5188,6 +5273,18 @@ pub(crate) fn bind_const_expr_mode(
     registry: &UdfRegistry,
     node_budget: &mut usize,
     numeric: bool,
+) -> Result<(BoundExpr, ExprType, Option<ColumnType>), SqlSurfaceError> {
+    // `numeric = false` は定数式の畳み込みの整数モード（Issue #2881。`exact_int`）。
+    // 既定モードで束縛する `FROM` なし SELECT は [`bind_const_expr`] を使う。
+    bind_const_expr_inner(expr, registry, node_budget, numeric, !numeric)
+}
+
+fn bind_const_expr_inner(
+    expr: &Expr,
+    registry: &UdfRegistry,
+    node_budget: &mut usize,
+    numeric: bool,
+    exact_int: bool,
 ) -> Result<(BoundExpr, ExprType, Option<ColumnType>), SqlSurfaceError> {
     // Issue #1539・SQL-42: `FROM` なし SELECT も投影と同じ型規則（整数算術は int4／int8）。
     let mut env = BindEnv {
@@ -5200,6 +5297,7 @@ pub(crate) fn bind_const_expr_mode(
         clock: time_fn::current_clock(),
         collation_leaf: false,
         numeric_arith: numeric,
+        exact_int,
     };
     let (bound, ty) = if numeric {
         // Issue #2799: NUMERIC 算術モードの最上位 NUMERIC 値は受理する（NULL 候補の探索・
@@ -5226,6 +5324,7 @@ pub(crate) fn bind_const_expr_array_top_mode(
     node_budget: &mut usize,
     numeric: bool,
 ) -> Result<(BoundExpr, ExprType, Option<ColumnType>), SqlSurfaceError> {
+    let exact_int = !numeric;
     let mut env = BindEnv {
         schema: None,
         params: std::collections::HashMap::new(),
@@ -5236,6 +5335,7 @@ pub(crate) fn bind_const_expr_array_top_mode(
         clock: time_fn::current_clock(),
         collation_leaf: false,
         numeric_arith: numeric,
+        exact_int,
     };
     let (bound, ty) = bind_expr_any(expr, &mut env, node_budget)?;
     // Issue #2799: NUMERIC 算術モードの最上位 NUMERIC 値は呼び出し元（`const_expr`）が数値リテラルへ
@@ -5912,6 +6012,12 @@ pub(super) fn bind_expr_any(
             Ok((bound, ty))
         }
         Expr::Number(raw) => {
+            // Issue #2881: 整数モードは 2^53 を超える整数（|v| <= 2^63）を丸めず運び手で束縛する。
+            if env.exact_int {
+                if let Some((v, _)) = classify_exact_int_literal(raw) {
+                    return Ok((exact_int_bound(v)?, ExprType::Scalar));
+                }
+            }
             let v = parse_number_literal(raw)?;
             Ok((BoundExpr::Number(v), ExprType::Scalar))
         }
@@ -6287,6 +6393,24 @@ pub(super) fn bind_expr_any(
             }
             // Issue #1539・SQL-42: 投影モードの `Scalar` 同士の算術は、オペランドの数値
             // 種別（整数／単精度／倍精度）から結果型を PostgreSQL に揃える。
+            // Issue #2881: 整数モードの整数どうしの比較は i128 で丸めなく比較する。
+            if env.exact_int && is_comparison && lt == ExprType::Scalar && rt == ExprType::Scalar {
+                let is_int = |k: Option<NumericKind>| {
+                    matches!(
+                        k,
+                        Some(NumericKind::Int2 | NumericKind::Int4 | NumericKind::Int8)
+                    )
+                };
+                if is_int(numeric_kind(lhs, &l, env)) && is_int(numeric_kind(rhs, &r, env)) {
+                    return Ok((
+                        BoundExpr::Builtin {
+                            f: BuiltinFn::ExactIntCompare(*op),
+                            args: vec![l, r],
+                        },
+                        ExprType::Bool,
+                    ));
+                }
+            }
             if env.typed_arith
                 && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div)
                 && lt == ExprType::Scalar
@@ -6295,9 +6419,18 @@ pub(super) fn bind_expr_any(
                 let lk = numeric_kind(lhs, &l, env);
                 let rk = numeric_kind(rhs, &r, env);
                 if let Some(kind) = combine_numeric_kind(lk, rk) {
+                    let exact = env.exact_int
+                        && matches!(
+                            kind,
+                            NumericKind::Int2 | NumericKind::Int4 | NumericKind::Int8
+                        );
                     return Ok((
                         BoundExpr::Builtin {
-                            f: BuiltinFn::TypedArith(*op, kind),
+                            f: if exact {
+                                BuiltinFn::ExactIntArith(*op, kind)
+                            } else {
+                                BuiltinFn::TypedArith(*op, kind)
+                            },
                             args: vec![l, r],
                         },
                         ExprType::Scalar,
@@ -7242,9 +7375,54 @@ pub(super) fn numeric_kind(
     bound: &BoundExpr,
     env: &BindEnv<'_>,
 ) -> Option<NumericKind> {
-    match projection_kind(expr, bound, env.schema) {
+    // Issue #2881: 整数モードの整数リテラルは 2^53 を超えても整数種別（倍精度へ落とさない）。
+    let kind = if env.exact_int {
+        exact_mode_kind(expr, bound, env.schema)
+    } else {
+        projection_kind(expr, bound, env.schema)
+    };
+    match kind {
         ProjKind::Num(k) => Some(k),
         ProjKind::Null | ProjKind::Other => None,
+    }
+}
+
+/// 整数モード（[`BindEnv::exact_int`]）の数値種別。整数リテラルは 2^53 を超えても整数種別とし、
+/// `CASE`／`COALESCE` の分岐へも同じ分類を伝播する（投影経路の [`projection_kind`] は
+/// 2^53 超を倍精度へ落とすため、分岐内のリテラルが `Other` になるのを防ぐ。Issue #2881）。
+/// それ以外の形は [`projection_kind`] に委ねる。
+fn exact_mode_kind(expr: &Expr, bound: &BoundExpr, schema: Option<&TableSchema>) -> ProjKind {
+    match (expr, bound) {
+        (Expr::Number(raw), _) => match classify_exact_int_literal(raw) {
+            Some((_, k)) => ProjKind::Num(k),
+            None => ProjKind::Other,
+        },
+        (
+            Expr::Case { whens, else_result },
+            BoundExpr::Case {
+                whens: bound_whens,
+                else_result: bound_else,
+            },
+        ) if whens.len() == bound_whens.len() => {
+            let mut acc = ProjKind::Null;
+            for ((_, r), (_, br)) in whens.iter().zip(bound_whens.iter()) {
+                acc = common_proj_kind(acc, exact_mode_kind(r, br, schema));
+            }
+            if let Some(e) = else_result {
+                acc = common_proj_kind(acc, exact_mode_kind(e, bound_else, schema));
+            }
+            acc
+        }
+        (Expr::Coalesce(args), BoundExpr::Coalesce(bound_args))
+            if args.len() == bound_args.len() =>
+        {
+            let mut acc = ProjKind::Null;
+            for (a, b) in args.iter().zip(bound_args.iter()) {
+                acc = common_proj_kind(acc, exact_mode_kind(a, b, schema));
+            }
+            acc
+        }
+        _ => projection_kind(expr, bound, schema),
     }
 }
 
@@ -7389,7 +7567,7 @@ fn scalar_numeric_kind(
             }
         }
         BoundExpr::Builtin {
-            f: BuiltinFn::TypedArith(_, k),
+            f: BuiltinFn::TypedArith(_, k) | BuiltinFn::ExactIntArith(_, k),
             ..
         } => Some(*k),
         // 式の内側の相関スカラー（Issue #1848）は内側の結果列の型どおり（`count` は bigint、
@@ -8397,6 +8575,62 @@ fn bind_schema_fn(
     ))
 }
 
+/// 整数モード（[`BindEnv::exact_int`]）の内部専用の型付き値（`$typed:<型> <数値>`）の束縛
+/// （Issue #2881）。整数型は桁のみの値を型の範囲（int8 は葉の上限 2^63）で検査して丸めず束縛し、
+/// 浮動小数型は値が定義上 f64 のため 2^53 の検査を通さず有限性だけを検査して束縛する。
+/// 形が合わないときは `None`（従来の `CAST` 経由の束縛へ）。
+fn bind_exact_typed_value(
+    name: &str,
+    raw: &str,
+    node_budget: &mut usize,
+) -> Result<Option<(BoundExpr, ExprType)>, SqlSurfaceError> {
+    use crate::sql::cast::CastType;
+    let Some(ty) = typed_value_cast_type(name) else {
+        return Ok(None);
+    };
+    let out_of_range = || SqlSurfaceError::numeric_out_of_range("value out of range for its type");
+    let bound = match ty {
+        CastType::Int2 | CastType::Int4 | CastType::Int8 => {
+            // 負値は構文段が `-` を数値の前置として畳む（`-<数値>`）。
+            let (negative, digits) = match raw.strip_prefix('-') {
+                Some(rest) => (true, rest),
+                None => (false, raw),
+            };
+            let Some((mag, _)) = classify_exact_int_literal(digits) else {
+                return Ok(None);
+            };
+            let max: i128 = match ty {
+                CastType::Int2 => i128::from(i16::MAX),
+                CastType::Int4 => i128::from(i32::MAX),
+                _ => i128::from(i64::MAX),
+            };
+            if mag > if negative { max + 1 } else { max } {
+                return Err(out_of_range());
+            }
+            exact_int_bound(if negative { -mag } else { mag })?
+        }
+        CastType::Float4 | CastType::Float8 => {
+            let v: f64 = raw.parse().map_err(|_| SqlSurfaceError::Internal {
+                detail: "malformed internal typed value".to_string(),
+            })?;
+            let v = if matches!(ty, CastType::Float4) {
+                f64::from(v as f32)
+            } else {
+                v
+            };
+            if !v.is_finite() {
+                return Err(out_of_range());
+            }
+            BoundExpr::Number(v)
+        }
+        _ => return Ok(None),
+    };
+    *node_budget = node_budget
+        .checked_sub(1)
+        .ok_or_else(|| SqlSurfaceError::payload_too_large("expression is too large"))?;
+    Ok(Some((bound, ExprType::Scalar)))
+}
+
 fn bind_call(
     name: &str,
     args: &[Expr],
@@ -8422,6 +8656,13 @@ fn bind_call(
         };
     }
     if let Some(ty) = typed_value_cast_type(name) {
+        if env.exact_int {
+            if let [Expr::Number(raw)] = args {
+                if let Some(bound) = bind_exact_typed_value(name, raw, node_budget)? {
+                    return Ok(bound);
+                }
+            }
+        }
         return match args {
             [inner] => crate::sql::cast::bind_cast(inner, &ty, env, node_budget),
             _ => Err(SqlSurfaceError::Internal {
@@ -8716,6 +8957,7 @@ fn bind_call(
             clock: env.clock,
             collation_leaf: false,
             numeric_arith: false,
+            exact_int: false,
         };
         // RETURNS 付きは本体の結果を戻り値型へ変換して返す（定義時に型検査済み。Issue #1916）。
         return match &def.return_type {
@@ -11026,6 +11268,28 @@ pub(crate) fn apply_builtin<'a>(
             let b = take_scalar_arg(args, 1)?;
             typed_arith(op, kind, a, b).map(ExprValue::Scalar)
         }
+        BuiltinFn::ExactIntArith(op, kind) => {
+            let a = take_exact_int_arg(args, 0)?;
+            let b = take_exact_int_arg(args, 1)?;
+            exact_int_arith(op, kind, a, b)
+        }
+        BuiltinFn::ExactIntCompare(op) => {
+            let a = take_exact_int_arg(args, 0)?;
+            let b = take_exact_int_arg(args, 1)?;
+            let result = match op {
+                BinOp::Gt => a > b,
+                BinOp::Lt => a < b,
+                BinOp::Ge => a >= b,
+                BinOp::Le => a <= b,
+                BinOp::Eq => a == b,
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
+                    return Err(SqlSurfaceError::Internal {
+                        detail: "arithmetic operator in exact integer comparison".to_string(),
+                    });
+                }
+            };
+            Ok(ExprValue::Bool(result))
+        }
         BuiltinFn::NumericArith(op) => {
             let a = take_decimal_arg(args, 0)?;
             let b = take_decimal_arg(args, 1)?;
@@ -11074,35 +11338,10 @@ fn typed_arith(op: BinOp, kind: NumericKind, a: f64, b: f64) -> Result<f64, SqlS
     match kind {
         NumericKind::Int2 | NumericKind::Int4 | NumericKind::Int8 => {
             let (x, y) = (exact_int(a)?, exact_int(b)?);
-            let r = match op {
-                BinOp::Add => x.checked_add(y),
-                BinOp::Sub => x.checked_sub(y),
-                BinOp::Mul => x.checked_mul(y),
-                BinOp::Div => {
-                    if y == 0 {
-                        return Err(SqlSurfaceError::division_by_zero("/"));
-                    }
-                    x.checked_div(y)
-                }
-                BinOp::Gt | BinOp::Lt | BinOp::Ge | BinOp::Le | BinOp::Eq => {
-                    return Err(SqlSurfaceError::Internal {
-                        detail: "comparison operator in typed arithmetic evaluation".to_string(),
-                    });
-                }
-            };
-            let label = match kind {
-                NumericKind::Int2 => "smallint out of range",
-                NumericKind::Int4 => "integer out of range",
-                _ => "bigint out of range",
-            };
-            let r = r.ok_or_else(|| SqlSurfaceError::numeric_out_of_range(label))?;
-            let in_range = match kind {
-                NumericKind::Int2 => i16::try_from(r).is_ok(),
-                NumericKind::Int4 => i32::try_from(r).is_ok(),
-                _ => r.unsigned_abs() <= TYPED_INT_EXACT_MAX as u64,
-            };
-            if !in_range {
-                return Err(SqlSurfaceError::numeric_out_of_range(label));
+            let r = int_arith_checked(op, kind, i128::from(x), i128::from(y))?;
+            // f64 で運ぶ投影経路は 2^53 を超える結果を正確に保てないため bigint も 2^53 で打ち切る。
+            if kind == NumericKind::Int8 && r.unsigned_abs() > TYPED_INT_EXACT_MAX as u128 {
+                return Err(SqlSurfaceError::numeric_out_of_range("bigint out of range"));
             }
             Ok(r as f64)
         }
@@ -11130,6 +11369,88 @@ fn typed_arith(op: BinOp, kind: NumericKind, a: f64, b: f64) -> Result<f64, SqlS
             }
             Ok(f64::from(r32))
         }
+    }
+}
+
+/// 整数算術の共有コア（Issue #2881。[`typed_arith`] と [`exact_int_arith`] が共有し意味論を分岐させない）。
+/// 0 除算は `22012`、整数除算は 0 方向の切り捨て、結果が種別の範囲（int2／int4／int8）外なら `22003`。
+fn int_arith_checked(
+    op: BinOp,
+    kind: NumericKind,
+    x: i128,
+    y: i128,
+) -> Result<i128, SqlSurfaceError> {
+    let label = match kind {
+        NumericKind::Int2 => "smallint out of range",
+        NumericKind::Int4 => "integer out of range",
+        _ => "bigint out of range",
+    };
+    let out_of_range = || SqlSurfaceError::numeric_out_of_range(label);
+    let r = match op {
+        BinOp::Add => x.checked_add(y),
+        BinOp::Sub => x.checked_sub(y),
+        BinOp::Mul => x.checked_mul(y),
+        BinOp::Div => {
+            if y == 0 {
+                return Err(SqlSurfaceError::division_by_zero("/"));
+            }
+            x.checked_div(y)
+        }
+        BinOp::Gt | BinOp::Lt | BinOp::Ge | BinOp::Le | BinOp::Eq => {
+            return Err(SqlSurfaceError::Internal {
+                detail: "comparison operator in typed arithmetic evaluation".to_string(),
+            });
+        }
+    }
+    .ok_or_else(out_of_range)?;
+    let in_range = match kind {
+        NumericKind::Int2 => i16::try_from(r).is_ok(),
+        NumericKind::Int4 => i32::try_from(r).is_ok(),
+        _ => i64::try_from(r).is_ok(),
+    };
+    if in_range {
+        Ok(r)
+    } else {
+        Err(out_of_range())
+    }
+}
+
+/// [`BuiltinFn::ExactIntArith`] の評価本体（Issue #2881）。結果が 2^53 以内なら `Scalar`、超えれば
+/// scale 0 の `Numeric`（運び手）で返す。浮動小数の種別は束縛段が挿入しない（不変条件違反は `Internal`）。
+fn exact_int_arith(
+    op: BinOp,
+    kind: NumericKind,
+    a: i128,
+    b: i128,
+) -> Result<ExprValue<'static>, SqlSurfaceError> {
+    if kind == NumericKind::Float4 {
+        return Err(SqlSurfaceError::Internal {
+            detail: "exact integer arithmetic received a float kind".to_string(),
+        });
+    }
+    let r = int_arith_checked(op, kind, a, b)?;
+    if r.unsigned_abs() <= TYPED_INT_EXACT_MAX as u128 {
+        Ok(ExprValue::Scalar(r as f64))
+    } else {
+        crate::numeric::Decimal::from_parts(r, 0)
+            .map(ExprValue::Numeric)
+            .map_err(|_| SqlSurfaceError::numeric_out_of_range("bigint out of range"))
+    }
+}
+
+/// `args[idx]` を整数の運び手として i128 で取り出す。`Scalar` は 2^53 以内の整数、`Numeric` は
+/// scale 0 の値に限る（束縛段が整数種別の被演算子だけを通す不変条件。破れたら `Internal`）。
+fn take_exact_int_arg(
+    args: &mut [Option<ExprValue<'_>>],
+    idx: usize,
+) -> Result<i128, SqlSurfaceError> {
+    let mismatch = || SqlSurfaceError::Internal {
+        detail: "exact integer operand type mismatch at evaluation time".to_string(),
+    };
+    match args.get_mut(idx).and_then(Option::take) {
+        Some(ExprValue::Scalar(v)) => exact_int(v).map(i128::from),
+        Some(ExprValue::Numeric(d)) if d.scale() == 0 => Ok(d.unscaled()),
+        Some(_) | None => Err(mismatch()),
     }
 }
 

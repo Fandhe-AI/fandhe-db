@@ -11,12 +11,18 @@
 //! 前に走っても存在オラクルにならない）。列参照は実在の有無によらず一律 `42703`、
 //! 揮発性の値関数・組み込み以外の関数は `42601`、0 除算は `22012`、非有限値・f64 で
 //! 正確に表現できない大きさは `22003` で拒否する。
+//!
+//! Issue #2881: 2^53 以上の値は、精度を保って評価できる形だけ受理する。整数どうしの算術・比較
+//! （`udf_call` の整数モード。bigint 全域を i128 で丸めなく評価し、範囲外は `22003`）と、
+//! PG の float8／float4 型の式（内部専用の型付き値を含む `+ - * /`。有限性だけを検査する）が対象。
+//! 型なしの小数リテラルなど f64 に丸めうる形、整数の運び手が関数・`NULLIF`・配列・浮動小数の
+//! 算術へ流れる形は従来どおり `22003` で拒否する（黙った丸めを返さない）。
 
 use crate::sql::allowlist::{InsertLiteral, SqlSurfaceError};
 use crate::sql::udf_call::{
     bind_const_expr_array_top_mode, bind_const_expr_mode, contains_typed_numeric, eval,
-    first_non_builtin_call_with, BinOp, BoundExpr, Expr, ExprType, ExprValue, UdfRegistry,
-    MAX_EXPR_NODES,
+    first_non_builtin_call_with, BinOp, BoundExpr, BuiltinFn, Expr, ExprType, ExprValue,
+    UdfRegistry, MAX_EXPR_NODES,
 };
 
 /// 仮値評価で起きたエラーの遅延方針（Issue #1546）。
@@ -123,9 +129,10 @@ pub(crate) fn fold_const_literal_deferrable(
 /// f64 が整数を正確に表現できる上限（2^53）。
 const MAX_EXACT_F64: f64 = 9_007_199_254_740_992.0;
 
-/// 型付き値 1 個の単独評価（`check_node_value`）が `22003` にする大きさか（|v| >= 2^53）。
-/// `plpgsql::subst` が「畳み込みを通すと必ず `22003` になる値」を判定する際も同じ定義を使う
-/// （境界の二重定義による食い違いを防ぐ）。非有限値は対象外。
+/// f64 の経路（型なしの小数リテラル・関数の結果等）が `22003` にする大きさか（|v| >= 2^53）。
+/// `plpgsql::subst`／`sql::params` が「単独の要素を裸の数値で渡す」範囲を判定する際も同じ定義を
+/// 使う（境界の二重定義による食い違いを防ぐ）。Issue #2881 以降、整数どうしの算術・比較と
+/// float 型の式の中の同範囲の値は畳み込みが正確に扱う。非有限値は対象外。
 pub(crate) fn float_beyond_fold_range(v: f64) -> bool {
     v.is_finite() && v.abs() >= MAX_EXACT_F64
 }
@@ -248,10 +255,17 @@ fn check_intermediate_precision(expr: &Expr, numeric: bool) -> Result<(), SqlSur
         || SqlSurfaceError::numeric_out_of_range("constant expression loses integer precision");
     match expr {
         Expr::Number(n) => {
-            // 整数リテラルは f64 化で丸められる前に桁で判定する。
+            // 整数リテラルは f64 化で丸められる前に桁で判定する。整数モードは葉の上限（2^63）まで
+            // 受理する（運び手として丸めずに束縛され、値としての可否は利用側の検査が決める）。
+            let limit = if numeric {
+                MAX_EXACT_F64 as u128
+            } else {
+                EXACT_LEAF_MAX
+            };
+            // 2^63 の葉は `0 - 2^63`（i64::MIN の脱糖形）の右辺でだけ許す（下の Binary 腕）。
+            // 単独・他の演算の位置で残る 2^63 は bigint の切り捨てを招くため `22003`。
             if n.bytes().all(|b| b.is_ascii_digit())
-                && n.parse::<u128>()
-                    .map_or(true, |v| v > MAX_EXACT_F64 as u128)
+                && n.parse::<u128>().map_or(true, |v| v > limit)
             {
                 return Err(out_of_range());
             }
@@ -270,17 +284,25 @@ fn check_intermediate_precision(expr: &Expr, numeric: bool) -> Result<(), SqlSur
         // 到達しない（`prescan` が拒否済み）。
         Expr::SqlJsonQuery(_) | Expr::Cast { .. } => Ok(()),
         // 配列の要素・添字は子ごとに精度を検査する（要素値の範囲は配列の構築側が検査する）。
-        Expr::ArrayConstructor(_) | Expr::Subscript { .. } | Expr::Quantified { .. } => expr
-            .array_expr_children()
-            .into_iter()
-            .flatten()
-            .try_for_each(|c| check_intermediate_precision(c, numeric)),
+        Expr::ArrayConstructor(_) | Expr::Subscript { .. } | Expr::Quantified { .. } => {
+            expr.array_expr_children()
+                .into_iter()
+                .flatten()
+                .try_for_each(|c| check_intermediate_precision(c, numeric))?;
+            reject_carrier_children(expr.array_expr_children().into_iter().flatten(), numeric)
+        }
         // Issue #2799: 型付き NUMERIC 値の raw 数値は 2^53 を超えてよい（Decimal で正確に運ぶ）ため、
         // f64 前提の桁検査を適用しない。
         Expr::Call { name, .. } if crate::sql::udf_call::is_typed_numeric_name(name) => Ok(()),
+        // Issue #2881: 整数モードの内部専用の型付き値は、束縛段が型の範囲（整数）・有限性（浮動小数）を
+        // 検査して丸めず束縛するため、f64 前提の 2^53 検査を適用しない。
+        Expr::Call { name, .. } if !numeric && crate::sql::udf_call::is_typed_value_name(name) => {
+            Ok(())
+        }
         Expr::Call { args, .. } => {
             args.iter()
                 .try_for_each(|c| check_intermediate_precision(c, numeric))?;
+            reject_carrier_children(args.iter(), numeric)?;
             check_node_value(expr, true, numeric)
         }
         // Issue #2799: NUMERIC 算術（結果が Numeric に束縛される二項演算）は f64 を経由しないため、
@@ -289,9 +311,29 @@ fn check_intermediate_precision(expr: &Expr, numeric: bool) -> Result<(), SqlSur
             .into_iter()
             .filter(|c| !matches!(&***c, Expr::Number(_)))
             .try_for_each(|c| check_intermediate_precision(c, numeric)),
-        Expr::Binary { lhs, rhs, .. } => {
+        Expr::Binary { op, lhs, rhs } => {
             check_intermediate_precision(lhs, numeric)?;
-            check_intermediate_precision(rhs, numeric)?;
+            let is_min_desugar = !numeric
+                && matches!(op, BinOp::Sub)
+                && matches!(&**lhs, Expr::Number(l) if l == "0")
+                && matches!(&**rhs, Expr::Number(r) if r == MIN_LEAF_DIGITS);
+            if !is_min_desugar {
+                check_intermediate_precision(rhs, numeric)?;
+            }
+            if numeric {
+                return check_node_value(expr, true, numeric);
+            }
+            // Issue #2881: 整数どうしの算術・比較は丸めなく評価されるため 2^53 の値検査を外す。
+            if binds_to_exact_int(expr) {
+                return Ok(());
+            }
+            // 整数の運び手は整数算術・整数比較以外（浮動小数との混合など）へは流せない。
+            reject_carrier_children([&**lhs, &**rhs].into_iter(), numeric)?;
+            // PG の float8／float4 型の式は f64 が正しい意味論のため、有限性だけを検査する。
+            if pg_float_typed(expr) {
+                check_untyped_decimal_leaves(expr)?;
+                return check_node_finite(expr);
+            }
             check_node_value(expr, true, numeric)
         }
         // jsonb パス演算子は列参照を要し、定数式では `prescan` が列参照として拒否する。
@@ -302,7 +344,8 @@ fn check_intermediate_precision(expr: &Expr, numeric: bool) -> Result<(), SqlSur
             lhs, pattern: rhs, ..
         } => {
             check_intermediate_precision(lhs, numeric)?;
-            check_intermediate_precision(rhs, numeric)
+            check_intermediate_precision(rhs, numeric)?;
+            reject_carrier_children([&**lhs, &**rhs].into_iter(), numeric)
         }
         // COALESCE は短絡評価（`udf_call::eval` と同じ）に沿い、評価される引数
         // （最初の非 NULL まで）だけを検査する。未評価引数の巨大値で偽陽性にしない。
@@ -335,6 +378,163 @@ fn check_intermediate_precision(expr: &Expr, numeric: bool) -> Result<(), SqlSur
             }
         }
     }
+}
+
+/// 整数モードの整数の運び手の上限（葉の 2^63。`udf_call` の `EXACT_INT_LEAF_MAX` と一致させる）。
+const EXACT_LEAF_MAX: u128 = (1 << 63) - 1;
+
+/// i64::MIN の脱糖形 `0 - 9223372036854775808` の右辺の葉（2^63）の字面。
+const MIN_LEAF_DIGITS: &str = "9223372036854775808";
+
+/// 整数モードで `expr` が整数算術・整数比較（丸めなく評価される形）に束縛されるか。
+fn binds_to_exact_int(expr: &Expr) -> bool {
+    let registry = UdfRegistry::default();
+    let mut budget = MAX_EXPR_NODES;
+    matches!(
+        bind_const_expr_mode(expr, &registry, &mut budget, false),
+        Ok((
+            BoundExpr::Builtin {
+                f: BuiltinFn::ExactIntArith(..) | BuiltinFn::ExactIntCompare(..),
+                ..
+            },
+            _,
+            _
+        ))
+    )
+}
+
+/// PG の float8／float4 型の式か（Issue #2881）。内部専用の型付き浮動小数の値、または `+ - * /` の
+/// 少なくとも一方がそうである式。PG では float8 との混合算術は float8 で計算されるため、f64 の
+/// 結果が正しい意味論になる。型なしの小数リテラル（PG は numeric）・関数・`CASE` 等は偽
+/// （従来どおり 2^53 検査で fail-closed）。
+fn pg_float_typed(expr: &Expr) -> bool {
+    match expr {
+        Expr::Call { name, .. } => crate::sql::udf_call::is_typed_float_name(name),
+        Expr::Binary { op, lhs, rhs } => {
+            matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div)
+                && (pg_float_typed(lhs) || pg_float_typed(rhs))
+        }
+        _ => false,
+    }
+}
+
+/// 型付き浮動小数との混合式に含まれる型なし小数リテラル（PG では numeric）の精度検査（Issue #2881）。
+/// 型付き float 自身の範囲検査は外すが、型なしの小数リテラルを f64 へ丸めて受理しないよう、
+/// 非有限または |v| > 2^53 の小数リテラルは `22003`（fail-closed）。型付き値（`Call`）の内側は辿らない。
+/// `CASE`／`COALESCE` は `check_intermediate_precision` と同じ短絡評価の到達可能性で、評価される
+/// 分岐だけを検査する（未評価分岐の大きなリテラルで偽陽性にしない）。`NULLIF` は両引数を常に評価する。
+fn check_untyped_decimal_leaves(expr: &Expr) -> Result<(), SqlSurfaceError> {
+    let out_of_range =
+        || SqlSurfaceError::numeric_out_of_range("constant expression loses integer precision");
+    match expr {
+        Expr::Number(n) if !n.bytes().all(|b| b.is_ascii_digit()) => {
+            if decimal_literal_exact_within_f64_range(n) {
+                Ok(())
+            } else {
+                Err(out_of_range())
+            }
+        }
+        Expr::Binary { lhs, rhs, .. } | Expr::NullIf(lhs, rhs) => {
+            check_untyped_decimal_leaves(lhs)?;
+            check_untyped_decimal_leaves(rhs)
+        }
+        Expr::Coalesce(args) => {
+            for a in args {
+                if matches!(a, Expr::Null) {
+                    continue;
+                }
+                check_untyped_decimal_leaves(a)?;
+                if !matches!(eval_node(a, false), Some(ExprValue::Null)) {
+                    break;
+                }
+            }
+            Ok(())
+        }
+        Expr::Case { whens, else_result } => {
+            for (c, r) in whens {
+                check_untyped_decimal_leaves(c)?;
+                match eval_node(c, false) {
+                    Some(ExprValue::Bool(true)) => return check_untyped_decimal_leaves(r),
+                    Some(ExprValue::Bool(false) | ExprValue::Null) => {}
+                    _ => return Ok(()),
+                }
+            }
+            match else_result {
+                Some(e) => check_untyped_decimal_leaves(e),
+                None => Ok(()),
+            }
+        }
+        _ => Ok(()),
+    }
+}
+
+/// 小数リテラル（先頭 `-` 任意・指数表記可）の厳密な大きさが有限かつ 2^53 以下か。f64 への丸めに
+/// 頼らず、仮数の有効桁と指数を十進のまま比較する。解釈できない形（指数が i64 に収まらない等）は
+/// 偽（fail-closed）。
+fn decimal_literal_exact_within_f64_range(raw: &str) -> bool {
+    let body = raw.strip_prefix('-').unwrap_or(raw);
+    let (mantissa, exp) = match body.split_once(['e', 'E']) {
+        Some((m, e)) => {
+            let e = e.strip_prefix('+').unwrap_or(e);
+            let Ok(exp) = e.parse::<i64>() else {
+                return false;
+            };
+            (m, exp)
+        }
+        None => (body, 0),
+    };
+    let (int_part, frac_part) = match mantissa.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (mantissa, ""),
+    };
+    if !int_part.bytes().all(|b| b.is_ascii_digit())
+        || !frac_part.bytes().all(|b| b.is_ascii_digit())
+        || (int_part.is_empty() && frac_part.is_empty())
+    {
+        return false;
+    }
+    let all = format!("{int_part}{frac_part}");
+    let lead = all.len() - all.trim_start_matches('0').len();
+    let sig = all.trim_start_matches('0').trim_end_matches('0');
+    if sig.is_empty() {
+        return true;
+    }
+    // 小数点より左の桁数（仮数の先頭ゼロを除く）。
+    let int_digits = (int_part.len() as i64 - lead as i64).saturating_add(exp);
+    // 2^53 = 9007199254740992（16 桁）。
+    const MAX_DIGITS: &str = "9007199254740992";
+    if int_digits <= 15 {
+        return true;
+    }
+    if int_digits > 16 {
+        return false;
+    }
+    let head: String = sig.chars().chain(std::iter::repeat('0')).take(16).collect();
+    match head.as_str().cmp(MAX_DIGITS) {
+        std::cmp::Ordering::Less => true,
+        std::cmp::Ordering::Equal => sig.len() <= 16,
+        std::cmp::Ordering::Greater => false,
+    }
+}
+
+/// 整数モードで、`children` のいずれかが整数の運び手（`Numeric`）に評価されるなら `22003`。
+/// 運び手は整数算術・整数比較・畳み込み結果にだけ流せ、関数・`NULLIF`・浮動小数との混合・配列等
+/// （f64 を前提とする消費者）へ流れる形は精度を保てないため拒否する（fail-closed）。
+fn reject_carrier_children<'a>(
+    children: impl Iterator<Item = &'a Expr>,
+    numeric: bool,
+) -> Result<(), SqlSurfaceError> {
+    if numeric {
+        return Ok(());
+    }
+    for c in children {
+        if matches!(eval_node(c, false), Some(ExprValue::Numeric(_))) {
+            return Err(SqlSurfaceError::numeric_out_of_range(
+                "constant expression loses integer precision",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// NUMERIC 算術モードで `expr` が Numeric 型に束縛されるか（束縛不能は `false`）。
@@ -371,6 +571,23 @@ fn check_node_value(expr: &Expr, enabled: bool, numeric: bool) -> Result<(), Sql
         if float_beyond_fold_range(v) {
             return Err(SqlSurfaceError::numeric_out_of_range(
                 "constant expression loses integer precision",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// 1 ノードを単独評価し、スカラ結果が非有限なら `22003`（評価不能は無視。float 型の式用。Issue #2881）。
+fn check_node_finite(expr: &Expr) -> Result<(), SqlSurfaceError> {
+    let registry = UdfRegistry::default();
+    let mut budget = MAX_EXPR_NODES;
+    let Ok((bound, _ty, _)) = bind_const_expr_mode(expr, &registry, &mut budget, false) else {
+        return Ok(());
+    };
+    if let Ok(ExprValue::Scalar(v)) = eval(&bound, 0, &[]) {
+        if !v.is_finite() {
+            return Err(SqlSurfaceError::numeric_out_of_range(
+                "constant expression result is out of range",
             ));
         }
     }
@@ -736,6 +953,18 @@ pub(crate) fn fold_const_literal(expr: &Expr) -> Result<InsertLiteral, SqlSurfac
         });
     }
     match eval(&bound, 0, &[])? {
+        // Issue #2881: PG の float8／float4 型の式の結果は 2^53 以上でも有限なら受理する。
+        // 整数値は |v| < 2^63 なら整数表記（BIGINT 列へも正確に入る）、それ以上は `{v:?}` の
+        // 指数表記（`as i64` の飽和で誤値にしない）。
+        ExprValue::Scalar(v) if !numeric && v.is_finite() && pg_float_typed(expr) => {
+            if v.fract() != 0.0 {
+                Ok(InsertLiteral::Number(format!("{v}")))
+            } else if v.abs() < 9_223_372_036_854_775_808.0 {
+                Ok(InsertLiteral::Number(format!("{}", v as i64)))
+            } else {
+                Ok(InsertLiteral::Number(format!("{v:?}")))
+            }
+        }
         ExprValue::Scalar(v) => {
             if !v.is_finite() || v.abs() > MAX_EXACT_F64 {
                 return Err(SqlSurfaceError::numeric_out_of_range(
@@ -787,7 +1016,13 @@ pub(crate) fn fold_const_literal(expr: &Expr) -> Result<InsertLiteral, SqlSurfac
         // 解釈し直す（Date・Interval と同じ前例。`InsertLiteral` を増やさないため content_hash・
         // DDL・wire は不変）。整数値は整数表記へ正規化する（`4 / 2` が INTEGER 列へ入る）。
         // `numeric` モードでしか生成されない（`CAST` は `prescan` が拒否済み）。
-        ExprValue::Numeric(d) => numeric_literal_text(&d).map(InsertLiteral::Number),
+        // 整数モードの Numeric は整数の運び手（scale 0）で、bigint の範囲外は `22003`（Issue #2881）。
+        ExprValue::Numeric(d) => {
+            if !numeric && i64::try_from(d.unscaled()).is_err() {
+                return Err(SqlSurfaceError::numeric_out_of_range("bigint out of range"));
+            }
+            numeric_literal_text(&d).map(InsertLiteral::Number)
+        }
         ExprValue::Uuid(_) | ExprValue::Bytes(_) => Err(SqlSurfaceError::unsupported(
             "a value produced by CAST is not allowed in a constant expression",
         )),
@@ -959,20 +1194,20 @@ mod tests {
             fold_const_literal(&bin(BinOp::Div, num("1"), num("0"))),
             Err(SqlSurfaceError::DivisionByZero { .. })
         ));
-        assert!(matches!(
-            fold_const_literal(&bin(BinOp::Mul, num("9007199254740993"), num("2"))),
-            Err(SqlSurfaceError::NumericOutOfRange { .. })
-        ));
-        // 中間結果の丸め（2^53 + 1 → 2^53）を 22003 で検出する。
+        // Issue #2881: 2^53 を超える整数の算術は丸めずに評価する（bigint 全域）。
+        assert_eq!(
+            fold_text(&bin(BinOp::Mul, num("9007199254740993"), num("2"))),
+            "18014398509481986"
+        );
         let big = bin(BinOp::Add, num("9007199254740992"), num("1"));
-        assert!(matches!(
-            fold_const_literal(&bin(BinOp::Sub, big, num("9007199254740992"))),
-            Err(SqlSurfaceError::NumericOutOfRange { .. })
-        ));
-        assert!(matches!(
-            fold_const_literal(&bin(BinOp::Add, num("9007199254740993"), num("0"))),
-            Err(SqlSurfaceError::NumericOutOfRange { .. })
-        ));
+        assert_eq!(
+            fold_text(&bin(BinOp::Sub, big, num("9007199254740992"))),
+            "1"
+        );
+        assert_eq!(
+            fold_text(&bin(BinOp::Add, num("9007199254740993"), num("0"))),
+            "9007199254740993"
+        );
         assert!(fold_const_literal(&bin(BinOp::Add, Expr::String("a".into()), num("1"))).is_err());
     }
 
@@ -1013,11 +1248,7 @@ mod tests {
 
     #[test]
     fn coalesce_with_null_first_arg_still_checks_later_precision() {
-        let big = bin(
-            BinOp::Sub,
-            bin(BinOp::Add, num("9007199254740992"), num("1")),
-            num("9007199254740992"),
-        );
+        let big = call("power", vec![num("2"), num("54")]);
         let e = Expr::Coalesce(vec![bin(BinOp::Add, Expr::Null, num("1")), big]);
         assert!(matches!(
             fold_const_literal(&e),
@@ -1244,6 +1475,222 @@ mod tests {
         assert_eq!(
             fold_text(&bin(BinOp::Add, num("0.1"), num("0.2"))),
             "0.30000000000000004"
+        );
+    }
+
+    fn code(e: &Expr) -> &'static str {
+        fold_code(e)
+    }
+
+    fn typed(ty: &str, raw: &str) -> Expr {
+        crate::sql::udf_call::typed_value_expr(&format!("$typed:{ty}"), raw.to_string())
+    }
+
+    #[test]
+    fn exact_int_arith_covers_bigint_range() {
+        let i64max = "9223372036854775807";
+        assert_eq!(
+            fold_text(&bin(BinOp::Mul, num("4000000000000000"), num("4"))),
+            "16000000000000000"
+        );
+        assert_eq!(
+            fold_text(&bin(BinOp::Div, num("9007199254740993"), num("2"))),
+            "4503599627370496"
+        );
+        assert_eq!(
+            fold_text(&bin(BinOp::Sub, num(i64max), num("1"))),
+            "9223372036854775806"
+        );
+        assert_eq!(code(&bin(BinOp::Add, num(i64max), num("1"))), "22003");
+        let min = || bin(BinOp::Sub, num("0"), num("9223372036854775808"));
+        assert_eq!(fold_text(&min()), "-9223372036854775808");
+        assert_eq!(code(&bin(BinOp::Sub, min(), num("1"))), "22003");
+        assert_eq!(
+            code(&bin(BinOp::Div, min(), bin(BinOp::Sub, num("0"), num("1")))),
+            "22003"
+        );
+        // 2^63 の葉が単独で残る形・2^63 を超える葉は範囲外。
+        assert_eq!(
+            code(&bin(BinOp::Add, num("9223372036854775809"), num("0"))),
+            "22003"
+        );
+        assert_eq!(code(&num("9223372036854775808")), "22003");
+        // 2^63 の葉は i64::MIN の脱糖形の右辺以外では拒否する（bigint の切り捨てで別の整数にしない）。
+        for e in [
+            bin(BinOp::Div, num("9223372036854775808"), num("3")),
+            bin(BinOp::Sub, num("1"), num("9223372036854775808")),
+            bin(
+                BinOp::Sub,
+                num("0"),
+                bin(BinOp::Div, num("9223372036854775808"), num("3")),
+            ),
+        ] {
+            assert_eq!(code(&e), "22003");
+        }
+        // 従来どおり int4 の溢れ・0 除算。
+        assert_eq!(code(&bin(BinOp::Add, num("2147483647"), num("1"))), "22003");
+        assert_eq!(
+            code(&bin(BinOp::Div, num("9007199254740993"), num("0"))),
+            "22012"
+        );
+        assert_eq!(fold_text(&bin(BinOp::Div, num("7"), num("2"))), "3");
+    }
+
+    #[test]
+    fn exact_int_comparison_is_exact() {
+        let cmp = |op, l: &str, r: &str| fold_const_literal(&bin(op, num(l), num(r))).unwrap();
+        assert_eq!(
+            cmp(BinOp::Eq, "9007199254740993", "9007199254740992"),
+            InsertLiteral::Bool(false)
+        );
+        assert_eq!(
+            cmp(BinOp::Gt, "9007199254740993", "9007199254740992"),
+            InsertLiteral::Bool(true)
+        );
+        assert_eq!(
+            cmp(BinOp::Le, "9007199254740993", "9007199254740993"),
+            InsertLiteral::Bool(true)
+        );
+    }
+
+    #[test]
+    fn exact_int_carrier_does_not_flow_into_f64_consumers() {
+        let big = || num("9007199254740993");
+        for e in [
+            call("abs", vec![big()]),
+            call(
+                "abs",
+                vec![bin(BinOp::Mul, num("4000000000000000"), num("4"))],
+            ),
+            bin(BinOp::Add, big(), num("1.5")),
+            Expr::NullIf(Box::new(big()), Box::new(num("1"))),
+            bin(
+                BinOp::Add,
+                Expr::Case {
+                    whens: vec![(bin(BinOp::Gt, num("1"), num("0")), big())],
+                    else_result: Some(Box::new(num("1"))),
+                },
+                num("1.5"),
+            ),
+        ] {
+            assert_eq!(code(&e), "22003", "{e:?}");
+        }
+        // 値としてそのまま返る形は正確に畳み込む。
+        let coalesce = Expr::Coalesce(vec![Expr::Null, big()]);
+        assert_eq!(fold_text(&coalesce), "9007199254740993");
+    }
+
+    #[test]
+    fn exact_typed_values_and_float_expressions() {
+        assert_eq!(
+            fold_text(&bin(
+                BinOp::Add,
+                typed("int8", "9007199254740992"),
+                num("1")
+            )),
+            "9007199254740993"
+        );
+        assert_eq!(
+            fold_text(&bin(BinOp::Add, typed("float8", "1e300"), num("0"))),
+            "1e300"
+        );
+        assert_eq!(
+            fold_text(&bin(
+                BinOp::Add,
+                typed("float8", "9007199254740994.0"),
+                num("0")
+            )),
+            "9007199254740994"
+        );
+        assert_eq!(
+            code(&bin(
+                BinOp::Mul,
+                typed("float8", "1e300"),
+                typed("float8", "1e300")
+            )),
+            "22003"
+        );
+        assert_eq!(
+            code(&bin(BinOp::Add, typed("float4", "1e300"), num("0"))),
+            "22003"
+        );
+        // 型なしの小数リテラルは PG では numeric。f64 へ丸めて返さない。
+        assert_eq!(
+            code(&bin(BinOp::Add, num("9007199254740993.5"), num("0"))),
+            "22003"
+        );
+        // 型付き float との混合でも、型なしの小数リテラルの精度検査は維持する。
+        assert_eq!(
+            code(&bin(
+                BinOp::Add,
+                typed("float8", "0"),
+                num("9007199254740993.5")
+            )),
+            "22003"
+        );
+        // 整数の運び手を float 型の算術へ流す形は拒否する。
+        assert_eq!(
+            code(&bin(
+                BinOp::Add,
+                typed("float8", "1.5"),
+                num("9007199254740993")
+            )),
+            "22003"
+        );
+    }
+
+    /// Issue #2881 のレビュー指摘: 型なし小数リテラルの精度検査は評価される分岐だけに適用し、
+    /// 指数表記は十進のまま厳密に判定し、NULLIF の引数も検査する。
+    #[test]
+    fn untyped_decimal_leaf_check_respects_reachability_exponent_and_nullif() {
+        let big = || num("9007199254740993.5");
+        let f0 = || typed("float8", "0");
+        // COALESCE の未評価引数（先頭が非 NULL）の大きな小数は検査しない。
+        assert!(fold_const_literal(&bin(
+            BinOp::Add,
+            f0(),
+            Expr::Coalesce(vec![num("1.0"), big()])
+        ))
+        .is_ok());
+        // 評価される引数は検査する。
+        assert_eq!(
+            code(&bin(
+                BinOp::Add,
+                f0(),
+                Expr::Coalesce(vec![Expr::Null, big()])
+            )),
+            "22003"
+        );
+        // CASE の未選択結果は検査せず、選択される分岐は検査する。
+        let case = |cond_true: bool| Expr::Case {
+            whens: vec![(
+                bin(BinOp::Eq, num("1"), num(if cond_true { "1" } else { "2" })),
+                big(),
+            )],
+            else_result: Some(Box::new(num("1.0"))),
+        };
+        assert!(fold_const_literal(&bin(BinOp::Add, f0(), case(false))).is_ok());
+        assert_eq!(code(&bin(BinOp::Add, f0(), case(true))), "22003");
+        // 指数表記は f64 丸め前に厳密判定する（2^53 をわずかに超える値も拒否）。
+        assert_eq!(
+            code(&bin(BinOp::Add, f0(), num("9007199254740992.5e0"))),
+            "22003"
+        );
+        assert_eq!(
+            code(&bin(BinOp::Add, f0(), num("90071992547409925e-1"))),
+            "22003"
+        );
+        assert_eq!(code(&bin(BinOp::Add, f0(), num("1e400"))), "22003");
+        assert!(fold_const_literal(&bin(BinOp::Add, f0(), num("9007199254740992.0e0"))).is_ok());
+        assert!(fold_const_literal(&bin(BinOp::Add, f0(), num("1.5e3"))).is_ok());
+        // NULLIF 内の大きな型なし小数も 22003（丸めて保存しない）。
+        assert_eq!(
+            code(&bin(
+                BinOp::Add,
+                f0(),
+                Expr::NullIf(Box::new(big()), Box::new(num("1.0")))
+            )),
+            "22003"
         );
     }
 }
