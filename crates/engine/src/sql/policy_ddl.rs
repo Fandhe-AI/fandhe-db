@@ -253,7 +253,7 @@ pub(crate) fn map_policy_error(e: PolicyDdlError, policy_name: &str) -> SqlSurfa
             name: user_facing_relation_name(&name),
         },
         CatalogError::ColumnNotFound(name) => SqlSurfaceError::undefined_column(name),
-        CatalogError::WriteLockTimeout => SqlSurfaceError::LockNotAvailable,
+        CatalogError::WriteLockTimeout => crate::interrupt::lock_wait_error(),
         _ => SqlSurfaceError::Internal {
             detail: "policy catalog operation failed".to_string(),
         },
