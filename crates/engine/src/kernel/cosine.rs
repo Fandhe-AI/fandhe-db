@@ -63,7 +63,7 @@ pub fn cosine_distance(a: &[f32], b: &[f32]) -> f64 {
 /// 各行のノルム² を `dot(x, x)` で求める（C2 の入力）。確保は `try_reserve_exact`。
 pub fn row_norms_sq(vectors: &[f32], dim: u32) -> Result<Vec<f32>, TryReserveError> {
     let dim = dim as usize;
-    let rows = if dim == 0 { 0 } else { vectors.len() / dim };
+    let rows = vectors.len().checked_div(dim).unwrap_or(0);
     let mut out = Vec::new();
     out.try_reserve_exact(rows)?;
     if dim > 0 {
