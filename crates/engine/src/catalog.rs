@@ -8645,6 +8645,16 @@ fn validate_column(column: &ColumnDef) -> Result<()> {
     if let ColumnType::Varchar(Some(n)) | ColumnType::Bpchar(n) = &column.ty {
         validate_char_type_length(*n)?;
     }
+    // BIT(n) の宣言長は読み出し側（`parse_bit_length_param`）と同じ `1..=MAX_BIT_LENGTH`。
+    // ここで拒否しないと Rust API 経由の作成後にスキーマが読み込み不能になる。
+    if let ColumnType::Bit(n) = &column.ty {
+        if *n == 0 || *n > crate::bit_string::MAX_BIT_LENGTH {
+            return Err(CatalogError::Invalid(format!(
+                "column {:?} has an invalid BIT length",
+                column.name
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -17704,6 +17714,7 @@ fn column_default_compatible_with_tag(default: &ColumnDefault, tag: &str) -> boo
                 | "time"
                 | "uuid"
                 | "enum"
+                | "bit"
                 | "json"
                 | "jsonb"
                 | "bytea"
@@ -17993,6 +18004,25 @@ pub(crate) fn table_expression_decls_in_source<R: crate::storage::read_source::R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// BIT(n) の宣言長は `1..=MAX_BIT_LENGTH` のみ受理する（Rust API 経由でも永続化前に拒否）。
+    #[test]
+    fn validate_column_rejects_out_of_range_bit_length() {
+        let max = crate::bit_string::MAX_BIT_LENGTH;
+        assert!(validate_column(&ColumnDef::new("b", ColumnType::Bit(1), true)).is_ok());
+        assert!(validate_column(&ColumnDef::new("b", ColumnType::Bit(max), true)).is_ok());
+        assert!(validate_column(&ColumnDef::new("b", ColumnType::Bit(0), true)).is_err());
+        assert!(validate_column(&ColumnDef::new("b", ColumnType::Bit(max + 1), true)).is_err());
+    }
+
+    /// BIT の Text DEFAULT は ENUM 依存検査のタグ判定でも適合扱いにする。
+    #[test]
+    fn default_tag_compat_accepts_bit_text_default() {
+        assert!(column_default_compatible_with_tag(
+            &ColumnDefault::Text("101".to_string()),
+            "bit"
+        ));
+    }
 
     // 一時 DB パス払い出し（`unique_db_path` / `CleanupGuard`）は Issue #173 で
     // `crate::test_util::temp_db` へ一本化した（旧: このモジュール内の複製）。
