@@ -314,7 +314,7 @@ opt-in CLI 引数です。`--search-engine` が `hnsw`／`hnsw_f16`／`hnsw_i8` 
 `full_scan_ratio`／`acorn_max_visible_ratio` はテナント存在情報に繋がるため
 `EXPLAIN` の `hnsw_params:` 行へは出しません（Issue #411 の非露出方針を維持。
 `sparse_visited_max=` は Issue #497 で既に露出済みのため現状どおり出力され
-ます）。閾値の既定値の見直し・実測は Issue #659 の担当です。
+ます。行末の `metric=` は Issue #1978 で追加した HNSW 宣言の距離種別です）。閾値の既定値の見直し・実測は Issue #659 の担当です。
 
 `--durability`（Issue #850）は書き込みトランザクションの durability
 （`engine::storage::WriteDurability`。Issue #849 が公開した構築時オプション）
