@@ -1866,7 +1866,11 @@ fn decode_tier_for_window(schema: &TableSchema, bound: &BoundScan) -> (DecodeTie
                 AggregateInput::StringAgg(_)
                 | AggregateInput::ArrayAgg(_)
                 | AggregateInput::BoolExpr { .. }
-                | AggregateInput::GroupingKeys(_),
+                | AggregateInput::GroupingKeys(_)
+                // `sum(<VECTOR>) OVER` は束縛段（`bind_window_item`）が `0A000` で拒否する
+                // （Issue #2038）。到達しても列参照扱いにとどめ、実行器側で fail-closed にする。
+                | AggregateInput::VectorColumn { .. }
+                | AggregateInput::VectorExpr { .. },
             ) => {
                 has_scalar_reference = true;
             }
@@ -2088,6 +2092,12 @@ fn extract_window_input(
         AggregateInput::IntervalColumn(_) => {
             return Err(window_bug(
                 "INTERVAL window aggregate input must be rejected at bind time",
+            ))
+        }
+        // `sum(<VECTOR>) OVER` も束縛段が `0A000` で拒否済み（Issue #2038。fail-closed）。
+        AggregateInput::VectorColumn { .. } | AggregateInput::VectorExpr { .. } => {
+            return Err(window_bug(
+                "VECTOR window aggregate input must be rejected at bind time",
             ))
         }
         AggregateInput::TimeColumn(index) => {

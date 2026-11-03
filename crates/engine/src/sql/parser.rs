@@ -172,6 +172,26 @@ pub struct BoundStatement {
     /// [`Ranking::Distance`] 以外のときは常に `Cosine`（[`check_distance_kind`] が束縛時に保証）。
     /// 非 Cosine の文は束縛を通るが、実行は `sql::exec` の入口が `0A000` で止める（仮置き）。
     pub(crate) distance_kind: crate::sql::lexer::DistanceKind,
+    /// 距離順 `ORDER BY` の `LIMIT` 省略時の暗黙の結果行数上限（Issue #2242・SQL-34 (2)(3)(4)）。
+    /// `Some(cap)` のとき `limit` は `cap + 1`（超過検出用の 1 件余分）で、実行段は ANN を
+    /// 使わない厳密全走査で返し、RLS 安全網と `OFFSET` の後に `cap` 件を超えたら `54000` で
+    /// 文全体を拒否する。束縛段だけが立てる（`pub(crate)`。公開の setter・`new` は常に `None`）。
+    pub(crate) result_cap: Option<usize>,
+}
+
+/// `LIMIT` 省略（暗黙上限）の距離順 SELECT と取得モードの整合を検査する（Issue #2242）。
+/// `precision` の確信度ゲートを全件順位付けに当てた意味が定まらないため、`DESC` と同じく
+/// `0A000` で拒否する（fail-closed。Execute と Describe で同じ判定にする）。
+fn check_limit_omission(
+    limit_implicit: bool,
+    mode: Option<SearchMode>,
+) -> Result<(), SqlSurfaceError> {
+    if limit_implicit && mode == Some(SearchMode::Precision) {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "omitting LIMIT on distance ORDER BY cannot be combined with precision mode",
+        ));
+    }
+    Ok(())
 }
 
 /// 距離種別と順位付け形の整合を検査する（Issue #1977）。`Distance` 以外の `ORDER BY` に
@@ -248,7 +268,13 @@ impl BoundStatement {
             evaluation_order,
             distance_descending: false,
             distance_kind: crate::sql::lexer::DistanceKind::Cosine,
+            result_cap: None,
         }
+    }
+
+    /// `LIMIT` 省略時の暗黙の結果行数上限（Issue #2242）。`Some` のとき `limit` は `cap + 1`。
+    pub(crate) fn result_cap(&self) -> Option<usize> {
+        self.result_cap
     }
 
     /// 距離演算子の種別を設定した crate 内ビルダー（Issue #1977。テスト専用）。
@@ -3108,15 +3134,18 @@ pub(crate) fn bind_in_session_with_limits(
     )?;
     check_distance_kind(stmt.distance_kind, &stmt.order_by)?;
 
-    let (limit, offset) =
-        validate_search_limit_offset_with(stmt.limit, stmt.offset, result_limits)?;
+    check_limit_omission(stmt.limit_implicit, Some(resolved_mode.mode()))?;
+    let (limit, offset, result_cap) = bind_limit_and_offset(stmt, result_limits)?;
 
     // SQL-74 (2)・Issue #2036: 距離述語を含む文は `HINT ORDER` が DISTANCE を先にしても SCALAR を
     // 先（事前フィルタ）に倒す。距離述語を DISTANCE 段の後の事後フィルタにすると、上位 k 件が
     // 述語で間引かれて `LIMIT` に満たない取りこぼしが起きるため、述語を満たす行だけを候補にして
     // から検索する（結果は厳密に評価した場合と一致する）。実行（`exec`）・EXPLAIN とも
     // `bound.evaluation_order` だけを見るので、ここで 1 回だけ決めれば両者が一致する。
-    let evaluation_order = if has_distance_predicate {
+    // Issue #2242: `LIMIT` 省略（厳密全走査）でも同様に SCALAR 先へ倒す。DISTANCE 先行だと
+    // 「近い順 cap+1 件 → 事後フィルタ」になり、WHERE に合う行が上限を超えていても黙って
+    // 少なく返す（fail-open）ため。結果は厳密全走査なので評価順で意味は変わらない。
+    let evaluation_order = if has_distance_predicate || result_cap.is_some() {
         EvaluationOrder::DEFAULT
     } else {
         stmt.evaluation_order
@@ -3145,7 +3174,31 @@ pub(crate) fn bind_in_session_with_limits(
         evaluation_order,
         distance_descending: stmt.distance_descending,
         distance_kind: stmt.distance_kind,
+        result_cap,
     })
+}
+
+/// 距離順 SELECT の `LIMIT`／`OFFSET` を束縛し `(limit, offset, result_cap)` を返す
+/// （Issue #2242）。`LIMIT` 省略（[`ValidatedStatement::limit_implicit`]）は範囲検証せず、
+/// 取得上限を `offset + cap + 1` に置いて実行段が超過を `54000` にする。`offset + cap + 1` は
+/// `checked_add` で計算し、溢れたら `Internal`（fail-closed）。明示 `LIMIT` は従来契約のまま。
+fn bind_limit_and_offset(
+    stmt: &ValidatedStatement,
+    result_limits: &crate::result_limits::ResultLimits,
+) -> Result<(usize, usize, Option<usize>), SqlSurfaceError> {
+    if !stmt.limit_implicit {
+        let (limit, offset) =
+            validate_search_limit_offset_with(stmt.limit, stmt.offset, result_limits)?;
+        return Ok((limit, offset, None));
+    }
+    let offset = validate_search_offset(stmt.offset)?;
+    let cap = result_limits.max_result_rows();
+    let overflow = || SqlSurfaceError::Internal {
+        detail: "result row limit overflows the fetch bound".to_string(),
+    };
+    let limit = cap.checked_add(1).ok_or_else(overflow)?;
+    offset.checked_add(limit).ok_or_else(overflow)?;
+    Ok((limit, offset, Some(cap)))
 }
 
 /// Describe（拡張クエリプロトコルの 'D' 種別 S。値未確定でも呼べる契約。
@@ -3209,7 +3262,8 @@ pub(crate) fn bind_projection_for_describe(
         Some(resolved_mode.mode()),
     )?;
     check_distance_kind(stmt.distance_kind, &stmt.order_by)?;
-    let _limits = validate_search_limit_offset_with(stmt.limit, stmt.offset, result_limits)?;
+    check_limit_omission(stmt.limit_implicit, Some(resolved_mode.mode()))?;
+    let _limits = bind_limit_and_offset(stmt, result_limits)?;
 
     Ok(projection)
 }
@@ -6510,6 +6564,20 @@ pub(crate) enum AggregateInput {
     /// （`row.embedding` が空 = 未設定という [`crate::storage::Row`] の既存契約に
     /// 従う。PR #229 codex-review 指摘対応）。
     VectorColumnPresence,
+    /// `VECTOR` 列の裸の列参照への `sum`（SQL-72 (3)・Issue #2038）。埋め込みは
+    /// `RowVector.values` から届くため列の添字は持たない。NULL（`dim == 0`）の行は飛ばし、
+    /// 累積は要素ごとに f64、確定時に f32 へ丸める（[`crate::sql::aggregate::Accumulator::VectorSum`]）。
+    /// `avg` 等が同じ入力を再利用できるよう関数名には依存させない。
+    VectorColumn { dim: u32 },
+    /// `ExprType::Vector` に束縛された式への `sum`（SQL-72 (3)・Issue #2038。
+    /// `sum(vec_div(embedding, 2))` 等）。`program` を行ごとに評価し、NULL は飛ばす。
+    VectorExpr {
+        source: crate::sql::udf_call::BoundExpr,
+        program: crate::sql::expr_program::ExprProgram,
+        /// 結果ベクトルの次元（テーブルの VECTOR 列の宣言次元。要素ごとの式は次元を保つ）。
+        /// 集計結果列を `Vector(dim)` と公告し、集合演算の型ゲート（22000）で検出するために持つ。
+        dim: u32,
+    },
     /// `string_agg(<値>, <区切り> [ORDER BY ...])`（SQL-57・Issue #1800）。区切り・内側の
     /// `ORDER BY` のプログラムを `input` の内側へ閉じ込め、`Accumulator::observe` が
     /// この 1 variant だけで評価できる自己完結な形にする（`BoundAggregateItem` の
@@ -6797,6 +6865,16 @@ impl BoundAggregateItem {
         let udfs = crate::sql::udf_call::UdfRegistry::default();
         let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
         let input = resolve_aggregate_input(func, &arg, schema, &udfs, &mut node_budget)?;
+        // `sum(<VECTOR 列>)` は SQL 表層のみ（SQL-72。NoSQL・JOIN はこの入口を使う）。従来どおり
+        // `42883` で拒否する（Issue #2038）。
+        if matches!(
+            input,
+            AggregateInput::VectorColumn { .. } | AggregateInput::VectorExpr { .. }
+        ) {
+            return Err(SqlSurfaceError::undefined_function(
+                "SUM cannot be applied to a VECTOR column by this interface",
+            ));
+        }
         let name = func.default_alias().to_string();
 
         Ok(BoundAggregateItem {
@@ -7402,7 +7480,8 @@ impl BoundAggregate {
 /// - `DATE`/`TIMESTAMP` 列 → `COUNT`・`MIN`/`MAX` を受理、`SUM`/`AVG` は
 ///   `42883`（Issue #1186。式でも同じ）
 /// - `VECTOR` 列（裸の列参照）→ `COUNT` は [`AggregateInput::VectorColumnPresence`]
-///   （非 NULL 行のみ数える）、それ以外は `42883`（Issue #1349）
+///   （非 NULL 行のみ数える）、`SUM` は [`AggregateInput::VectorColumn`]（SQL-72 (3)・
+///   Issue #2038）、それ以外は `42883`（Issue #1349）
 /// - `TEXT`・`BOOLEAN`・`ARRAY`・`BYTEA`・`JSON`／`JSONB`・`ENUM`・`UUID` 列 →
 ///   `COUNT` は受理、`SUM`/`AVG`（`TEXT` 以外は `MIN`/`MAX` も）は `42883`
 ///   （Issue #1349。該当シグネチャの関数が無い）
@@ -7517,6 +7596,11 @@ fn resolve_aggregate_input(
                     )),
                     (ColumnType::Vector(_), AggregateFunc::Count) => {
                         Ok(AggregateInput::VectorColumnPresence)
+                    }
+                    // SQL-72 (3)・Issue #2038: `sum(<VECTOR 列>)` は要素ごとの和（vector）。
+                    // MIN/MAX/AVG は従来どおり下の腕で `42883`。
+                    (ColumnType::Vector(dim), AggregateFunc::Sum) => {
+                        Ok(AggregateInput::VectorColumn { dim: *dim })
                     }
                     (ColumnType::Vector(_), _) => {
                         Err(SqlSurfaceError::undefined_function(format!(
@@ -7680,6 +7764,15 @@ fn resolve_aggregate_input(
                 // Issue #1349: 列参照と同じ型・同じ関数には同じコードを返す（ERR-2）。
                 // `TEXT`／`BOOLEAN`／`VECTOR` 式への `SUM`／`AVG`、`BOOLEAN`／`VECTOR`
                 // 式への `MIN`／`MAX` は該当シグネチャの関数が無いため `42883`。
+                // SQL-72 (3)・Issue #2038: `VECTOR` 式への `SUM` は要素ごとの和を受理する。
+                ExprType::Vector if func == AggregateFunc::Sum => {
+                    let program = crate::sql::expr_program::ExprProgram::compile(&bound);
+                    Ok(AggregateInput::VectorExpr {
+                        source: bound,
+                        program,
+                        dim: schema.vector_dim().unwrap_or(0),
+                    })
+                }
                 ExprType::Text | ExprType::Bool | ExprType::Vector
                     if matches!(func, AggregateFunc::Sum | AggregateFunc::Avg) =>
                 {
@@ -8950,12 +9043,10 @@ fn bind_aggregate_projection_expr(
             })?;
             // Issue #1811: `array_agg` の結果は式の被演算子にできない（`HAVING`／`ORDER BY` と同じく
             // 配列結果の行ビュー列を持たないため、成功させず fail-closed で拒否する）。
-            if items
-                .get(idx)
-                .is_some_and(|it| it.func == crate::sql::allowlist::AggregateFunc::ArrayAgg)
-            {
+            if items.get(idx).is_some_and(is_unorderable_aggregate) {
                 return Err(SqlSurfaceError::FeatureNotSupported {
-                    detail: "array_agg result cannot be used inside an expression".to_string(),
+                    detail: "array or vector aggregate result cannot be used inside an expression"
+                        .to_string(),
                 });
             }
             return Ok(OrderTarget::Aggregate(idx));
@@ -10634,6 +10725,16 @@ fn bind_window_item(
                     detail: "this collation is not supported in this expression".to_string(),
                 });
             }
+            // `sum(<VECTOR>) OVER (...)` は未対応（Issue #2038。ウィンドウ実行器が所有値の
+            // ベクトル入力を持たないため fail-closed。SQL-64 との組み合わせは別課題）。
+            if matches!(
+                resolved,
+                AggregateInput::VectorColumn { .. } | AggregateInput::VectorExpr { .. }
+            ) {
+                return Err(SqlSurfaceError::FeatureNotSupported {
+                    detail: "VECTOR aggregates are not supported in window functions".to_string(),
+                });
+            }
             // INTERVAL 列のウィンドウ集計は未対応（Issue #1580。担当 Issue 未定の fail-closed）。
             if matches!(resolved, AggregateInput::IntervalColumn(_)) {
                 return Err(SqlSurfaceError::FeatureNotSupported {
@@ -11417,6 +11518,9 @@ pub(crate) fn check_having_target_is_numeric(
                     | AggregateInput::TimestampTzColumn(_)
                     | AggregateInput::IntervalColumn(_)
                     | AggregateInput::ArrayAgg(_)
+                    // SQL-72 (4) 対象外: ベクトルの集計結果は数値比較できない（Issue #2038）。
+                    | AggregateInput::VectorColumn { .. }
+                    | AggregateInput::VectorExpr { .. }
             );
     if is_unsupported {
         return Err(SqlSurfaceError::invalid_input(format!(
@@ -11461,13 +11565,11 @@ fn resolve_group_reference<S: AsRef<str>>(
         ([], [idx]) => {
             // 配列値には文レベルの比較規約が無い（`group_by::cmp_cell_values` は未定義の組を
             // 等値として扱うため、通すと並びが黙って崩れる）。束縛時に拒否する（SQL-57）。
-            if items
-                .get(*idx)
-                .is_some_and(|it| it.func == crate::sql::allowlist::AggregateFunc::ArrayAgg)
-            {
+            if items.get(*idx).is_some_and(is_unorderable_aggregate) {
                 return Err(SqlSurfaceError::FeatureNotSupported {
-                    detail: "ORDER BY or HAVING on an array_agg result is not supported"
-                        .to_string(),
+                    detail:
+                        "ORDER BY or HAVING on an array or vector aggregate result is not supported"
+                            .to_string(),
                 });
             }
             Ok(OrderTarget::Aggregate(*idx))
@@ -11569,13 +11671,11 @@ fn bind_group_by_clause(
             let idx = having_hidden.get(j).copied().ok_or_else(|| {
                 crate::sql::aggregate::accumulator_bug("HAVING aggregate placeholder out of range")
             })?;
-            if items
-                .get(idx)
-                .is_some_and(|it| it.func == crate::sql::allowlist::AggregateFunc::ArrayAgg)
-            {
+            if items.get(idx).is_some_and(is_unorderable_aggregate) {
                 return Err(SqlSurfaceError::FeatureNotSupported {
-                    detail: "ORDER BY or HAVING on an array_agg result is not supported"
-                        .to_string(),
+                    detail:
+                        "ORDER BY or HAVING on an array or vector aggregate result is not supported"
+                            .to_string(),
                 });
             }
             return Ok(OrderTarget::Aggregate(idx));
@@ -11746,12 +11846,9 @@ fn bind_group_by_clause(
                 if let OrderTarget::Aggregate(idx) = target {
                     // 位置指定（`ORDER BY 2`）は名前解決を経ないため、配列値の拒否はここでも行う
                     // （`resolve_group_reference` と同じ理由。SQL-57）。
-                    if items
-                        .get(idx)
-                        .is_some_and(|it| it.func == crate::sql::allowlist::AggregateFunc::ArrayAgg)
-                    {
+                    if items.get(idx).is_some_and(is_unorderable_aggregate) {
                         return Err(SqlSurfaceError::FeatureNotSupported {
-                            detail: "ORDER BY or HAVING on an array_agg result is not supported"
+                            detail: "ORDER BY or HAVING on an array or vector aggregate result is not supported"
                                 .to_string(),
                         });
                     }
@@ -11926,9 +12023,24 @@ fn aggregate_result_column_type(item: &BoundAggregateItem) -> ColumnType {
                 crate::sql::aggregate::typed_expr_column_type(*ty)
                     .unwrap_or(EXPR_UNSUPPORTED_COLUMN_TYPE)
             }
+            // Issue #2038: `sum(vector)` の結果は式内で扱えない列（ベクトル演算は SQL-72 (4) 対象外）。
+            AggregateInput::VectorColumn { .. } | AggregateInput::VectorExpr { .. } => {
+                EXPR_UNSUPPORTED_COLUMN_TYPE
+            }
             _ => EXPR_UNSUPPORTED_COLUMN_TYPE,
         },
     }
+}
+
+/// 配列・ベクトル値を返す集計項目か（`ORDER BY`／`HAVING`／式の被演算子にできない結果。
+/// SQL-57・SQL-72 (4) の範囲外。`group_by::cmp_cell_values` は未定義の組を等値として扱うため、
+/// 通すと並びが黙って崩れる。束縛時に拒否する。Issue #2038）。
+fn is_unorderable_aggregate(item: &BoundAggregateItem) -> bool {
+    item.func == crate::sql::allowlist::AggregateFunc::ArrayAgg
+        || matches!(
+            item.input,
+            AggregateInput::VectorColumn { .. } | AggregateInput::VectorExpr { .. }
+        )
 }
 
 /// 投影式（Issue #1541）が参照する行ビューの集計列型。実セルの型と 1 対 1 の
@@ -11947,6 +12059,9 @@ fn projection_row_column_type(item: &BoundAggregateItem) -> ColumnType {
             ColumnType::Bytea
         }
         Some(ty @ ColumnType::Numeric { .. }) => ty,
+        // Issue #2038: `sum(vector)` の結果列を VECTOR 型のまま行ビューへ渡すと、式側が行の
+        // 埋め込み（`VectorRef`）へ束縛してしまうため、番兵（`BYTEA`）にして `22000` で拒否する。
+        Some(ColumnType::Vector(_)) => ColumnType::Bytea,
         None => ColumnType::Bytea,
         Some(ty) => ty,
     }
@@ -14127,6 +14242,56 @@ mod tests {
         assert_eq!(bound.mode.source, mode::ModeSource::Default);
     }
 
+    // --- 距離順 `LIMIT` 省略の束縛（Issue #2242・SQL-34） ------------------------------
+
+    #[test]
+    fn bind_limit_omitted_sets_cap_and_fetches_cap_plus_one_after_offset() {
+        let default_cap = crate::result_limits::ResultLimits::default().max_result_rows();
+        let bound = bind_sql_with_session(
+            "SELECT * FROM documents ORDER BY embedding <=> '[0.1,0.2,0.3]' OFFSET 7",
+            None,
+        )
+        .expect("bind should succeed");
+        assert_eq!(bound.result_cap(), Some(default_cap));
+        assert_eq!(bound.limit, default_cap + 1);
+        assert_eq!(bound.offset, 7);
+        assert_eq!(bound.fetch_count(), default_cap + 1 + 7);
+
+        let explicit = bind_sql_with_session(SELECT_NO_MODE, None).expect("bind");
+        assert_eq!(explicit.result_cap(), None);
+    }
+
+    #[test]
+    fn bind_limit_omitted_rejects_precision_in_clause_and_session() {
+        let omitted = "SELECT * FROM documents ORDER BY embedding <=> '[0.1,0.2,0.3]'";
+        let err = bind_sql_with_session(omitted, Some(SearchMode::Precision)).unwrap_err();
+        assert_eq!(err.wire_code(), "0A000");
+        let err =
+            bind_sql_with_session(&format!("{omitted} USING MODE 'precision'"), None).unwrap_err();
+        assert_eq!(err.wire_code(), "0A000");
+    }
+
+    #[test]
+    fn bind_limit_omitted_rejects_offset_over_search_limit() {
+        let err = bind_sql_with_session(
+            "SELECT * FROM documents ORDER BY embedding <=> '[0.1,0.2,0.3]' OFFSET 4294967295",
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn bind_limit_omitted_forces_default_evaluation_order() {
+        let bound = bind_sql_with_session(
+            "SELECT * FROM documents WHERE lang = 'ja' ORDER BY embedding <=> '[0.1,0.2,0.3]' \
+             HINT ORDER(DISTANCE, SCALAR, RLS)",
+            None,
+        )
+        .expect("bind should succeed");
+        assert_eq!(bound.evaluation_order, EvaluationOrder::DEFAULT);
+    }
+
     // --- bind_aggregate（TASK-166・SQL-13） -------------------------------------
 
     fn bind_aggregate_sql(sql: &str) -> Result<BoundAggregate, SqlSurfaceError> {
@@ -14146,8 +14311,8 @@ mod tests {
     }
 
     #[test]
-    fn binds_sum_avg_min_max_on_vector_column_as_type_mismatch() {
-        for func in ["SUM", "AVG", "MIN", "MAX"] {
+    fn binds_avg_min_max_on_vector_column_as_type_mismatch() {
+        for func in ["AVG", "MIN", "MAX"] {
             let sql = format!("SELECT {func}(embedding) FROM documents");
             let err = bind_aggregate_sql(&sql).unwrap_err();
             assert_eq!(
@@ -14156,6 +14321,21 @@ mod tests {
                 "{func}(embedding) should be 42883"
             );
         }
+    }
+
+    /// Issue #2038・SQL-72 (3): `SUM(<VECTOR 列>)` は束縛できる（結果列は `vector(dim)`）。
+    #[test]
+    fn binds_sum_on_vector_column_and_expression() {
+        let bound = bind_aggregate_sql("SELECT SUM(embedding) FROM documents").unwrap();
+        assert!(matches!(
+            bound.items[0].input,
+            AggregateInput::VectorColumn { .. }
+        ));
+        let bound = bind_aggregate_sql("SELECT SUM(vec_div(embedding, 2)) FROM documents").unwrap();
+        assert!(matches!(
+            bound.items[0].input,
+            AggregateInput::VectorExpr { .. }
+        ));
     }
 
     #[test]
@@ -14216,9 +14396,9 @@ mod tests {
     }
 
     #[test]
-    fn binds_sum_on_vector_typed_expression_as_type_mismatch() {
+    fn binds_avg_on_vector_typed_expression_as_type_mismatch() {
         let err =
-            bind_aggregate_sql("SELECT SUM(vec_div(embedding, 2)) FROM documents").unwrap_err();
+            bind_aggregate_sql("SELECT AVG(vec_div(embedding, 2)) FROM documents").unwrap_err();
         assert_eq!(err.wire_code(), "42883");
     }
 

@@ -607,7 +607,7 @@ fn sql13_sum_id_overflow_is_rejected() {
     assert_eq!(as_integer(&single_row(&max_ok)[0]), u64::MAX);
 }
 
-// --- 型不整合: VECTOR 列への SUM/AVG/MIN/MAX は 22000、COUNT は受理 ----------------
+// --- 型不整合: VECTOR 列への AVG/MIN/MAX は 42883、COUNT・SUM は受理（SUM は SQL-72 (3)・Issue #2038）----
 
 #[test]
 fn sql13_vector_column_type_mismatch_and_count_acceptance() {
@@ -618,13 +618,16 @@ fn sql13_vector_column_type_mismatch_and_count_acceptance() {
     let core = new_core(storage);
     let ctx = ctx_for("tenant-a", true);
 
-    for func in ["SUM", "AVG", "MIN", "MAX"] {
+    for func in ["AVG", "MIN", "MAX"] {
         let sql = format!("SELECT {func}(embedding) FROM docs");
         let err = core
             .execute_sql(&ctx, &sql)
             .expect_err("aggregate over VECTOR column must be rejected");
         assert_eq!(err.wire_code(), "42883", "{func}(embedding)");
     }
+
+    core.execute_sql(&ctx, "SELECT SUM(embedding) FROM docs")
+        .expect("SUM(embedding) should be accepted");
 
     let ok = core
         .execute_sql(&ctx, "SELECT COUNT(embedding) FROM docs")
@@ -754,7 +757,7 @@ fn sql13_rejection_is_deterministic_across_repeated_calls() {
     let core = new_core(storage);
     let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
 
-    let sql = "SELECT SUM(embedding) FROM docs";
+    let sql = "SELECT MIN(embedding) FROM docs";
     let first = core
         .execute_sql(&ctx, sql)
         .expect_err("first call should fail");
@@ -780,7 +783,6 @@ fn non_numeric_aggregates_are_rejected_with_42883() {
     for sql in [
         "SELECT SUM(lang) FROM docs",
         "SELECT AVG(lang) FROM docs",
-        "SELECT SUM(embedding) FROM docs",
         "SELECT MIN(embedding) FROM docs",
         "SELECT SUM(lower(lang)) FROM docs",
         "SELECT AVG(vec_div(embedding, 2)) FROM docs",
@@ -798,6 +800,7 @@ fn non_numeric_aggregates_are_rejected_with_42883() {
         "SELECT MAX(lang) FROM docs",
         "SELECT COUNT(lang) FROM docs",
         "SELECT COUNT(embedding) FROM docs",
+        "SELECT SUM(embedding) FROM docs",
         "SELECT SUM(id) FROM docs",
         "SELECT AVG(vec_norm(embedding)) FROM docs",
     ] {

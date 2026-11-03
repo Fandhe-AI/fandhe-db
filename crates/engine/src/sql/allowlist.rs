@@ -3135,6 +3135,11 @@ pub struct ValidatedStatement {
     /// [`lexer::DistanceKind::Cosine`]（`<=>`）。`order_by` が [`OrderByForm::Distance`] でないのに
     /// 非 Cosine の組は束縛が `42601` で拒否する。非 Cosine の実行は各カーネル接続 Issue まで `0A000`。
     pub(crate) distance_kind: lexer::DistanceKind,
+    /// 距離順 `ORDER BY` で `LIMIT` を省略（または `LIMIT ALL`）した印（Issue #2242・
+    /// SQL-34 (2)(3)(4)）。`true` のとき `limit` は番兵 `u32::MAX` で、束縛段が結果行数上限
+    /// （`--max-result-rows`）由来の暗黙上限へ差し替える。検証経路（構文段）だけが立てる
+    /// （`pub(crate)`。外部の構築子では立てられず、NoSQL 表層・`USING PLAN` も常に `false`）。
+    pub(crate) limit_implicit: bool,
 }
 
 impl ValidatedStatement {
@@ -3163,6 +3168,7 @@ impl ValidatedStatement {
             using_plan: None,
             distance_descending: false,
             distance_kind: lexer::DistanceKind::Cosine,
+            limit_implicit: false,
         }
     }
 
@@ -21144,6 +21150,8 @@ struct ParsedShape {
     distance_descending: bool,
     /// 距離演算子の種別（Issue #1977）。`Distance` 形以外では `Cosine`。
     distance_kind: lexer::DistanceKind,
+    /// 距離順 `ORDER BY` の `LIMIT` 省略（Issue #2242）。`Distance` 形のみ `true` になり得る。
+    limit_implicit: bool,
 }
 
 /// 構文木（[`ValidatedScan`] の元）。カタログ存在確認前の中間結果（Issue #454。
@@ -23309,6 +23317,7 @@ fn parse_select_shape(
             using_plan: Some(using_plan),
             distance_descending: false,
             distance_kind: lexer::DistanceKind::Cosine,
+            limit_implicit: false,
         }));
     }
 
@@ -23473,11 +23482,21 @@ fn parse_select_shape(
         }
     }
 
-    p.expect_keyword(Keyword::Limit)?;
-    let limit_str = p.expect_number()?;
-    let limit: u32 = limit_str
-        .parse()
-        .map_err(|_| SqlSurfaceError::unsupported(format!("malformed LIMIT value: {limit_str}")))?;
+    // Issue #2242・SQL-34 (2)(3)(4): 距離順 `ORDER BY` に限り `LIMIT` 省略・`LIMIT ALL`・
+    // `OFFSET` 単独を受理する（番兵 `u32::MAX` と印）。hybrid 関数形は従来どおり `LIMIT n` 必須。
+    let (limit, limit_implicit) = if matches!(order_by, OrderByForm::Distance { .. }) {
+        match p.parse_optional_limit()? {
+            Some(n) => (n, false),
+            None => (u32::MAX, true),
+        }
+    } else {
+        p.expect_keyword(Keyword::Limit)?;
+        let limit_str = p.expect_number()?;
+        let n: u32 = limit_str.parse().map_err(|_| {
+            SqlSurfaceError::unsupported(format!("malformed LIMIT value: {limit_str}"))
+        })?;
+        (n, false)
+    };
 
     // Issue #2008・SQL-33 (8): ベクトル順位付け（距離 ORDER BY・HYBRID）は `LIMIT n` の直後に
     // 任意の `OFFSET m` を受理する（`fetch_clause` の正規形 `LIMIT n OFFSET m` と同じ位置）。
@@ -23501,6 +23520,7 @@ fn parse_select_shape(
         using_plan: None,
         distance_descending,
         distance_kind,
+        limit_implicit,
     }))
 }
 
@@ -27896,6 +27916,7 @@ fn validate_select_statement(
                 using_plan: shape.using_plan,
                 distance_descending: shape.distance_descending,
                 distance_kind: shape.distance_kind,
+                limit_implicit: shape.limit_implicit,
             }))
         }
         // Issue #454: `ORDER BY`・`USING PLAN` のいずれも伴わない
@@ -38644,14 +38665,55 @@ mod tests {
 
     #[test]
     fn rejects_ranked_select_missing_limit() {
-        // Issue #1796・SQL-34: ベクトル順位付け・`USING PLAN` の `LIMIT` 省略・`LIMIT ALL` は
-        // 従来どおり `42601`（距離 ORDER BY の省略は #2242 の範囲）。
-        assert_rejected_as_syntax_error("SELECT * FROM documents ORDER BY embedding <=> '[1,0]'");
-        assert_rejected_as_syntax_error(
-            "SELECT * FROM documents ORDER BY embedding <=> '[1,0]' LIMIT ALL",
-        );
+        // Issue #1796・SQL-34: `USING PLAN` と hybrid 関数形の `LIMIT` 省略・`LIMIT ALL` は
+        // 従来どおり `42601`（距離 ORDER BY の省略は Issue #2242 で受理。下のテスト参照）。
         assert_rejected_as_syntax_error("SELECT * FROM documents USING PLAN('q')");
         assert_rejected_as_syntax_error("SELECT * FROM documents USING PLAN('q') LIMIT ALL");
+        assert_rejected_as_syntax_error(
+            "SELECT * FROM documents ORDER BY HYBRID(embedding, '[1,0]', 'q')",
+        );
+        assert_rejected_as_syntax_error(
+            "SELECT * FROM documents ORDER BY HYBRID(embedding, '[1,0]', 'q') LIMIT ALL",
+        );
+    }
+
+    #[test]
+    fn accepts_distance_order_by_without_limit() {
+        // Issue #2242・SQL-34 (2)(3)(4): 距離順 `ORDER BY` の `LIMIT` 省略・`LIMIT ALL`・
+        // `OFFSET` 単独は暗黙上限の印（番兵 `u32::MAX`）付きで受理する。
+        let lookup = catalog_with(&["documents"]);
+        for op in ["<=>", "<->", "<#>", "<+>"] {
+            for tail in [
+                "",
+                " DESC",
+                " ASC",
+                " LIMIT ALL",
+                " OFFSET 2",
+                " LIMIT ALL OFFSET 2",
+                " DESC OFFSET 2",
+            ] {
+                let sql = format!("SELECT * FROM documents ORDER BY embedding {op} '[1,0]'{tail}");
+                let Statement::Select(v) = validate_sql(&sql, &lookup).expect(&sql) else {
+                    panic!("expected Select: {sql}");
+                };
+                assert!(v.limit_implicit, "{sql}");
+                assert_eq!(v.limit, u32::MAX, "{sql}");
+                assert_eq!(
+                    v.offset,
+                    if tail.contains("OFFSET") { 2 } else { 0 },
+                    "{sql}"
+                );
+            }
+        }
+        let Statement::Select(v) = validate_sql(
+            "SELECT * FROM documents ORDER BY embedding <=> '[1,0]' LIMIT 5",
+            &lookup,
+        )
+        .expect("explicit LIMIT") else {
+            panic!("expected Select");
+        };
+        assert!(!v.limit_implicit);
+        assert_eq!(v.limit, 5);
     }
 
     #[test]
@@ -42241,17 +42303,23 @@ mod tests {
     }
 
     #[test]
-    fn distance_desc_rejects_nulls_duplicates_and_missing_limit() {
+    fn distance_desc_rejects_nulls_duplicates_but_accepts_missing_limit() {
         let lookup = catalog_with(&["documents"]);
         for sql in [
             "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' DESC NULLS FIRST LIMIT 5",
             "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' DESC DESC LIMIT 5",
             "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' ASC DESC LIMIT 5",
-            "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' DESC",
         ] {
             let e = validate_statement(sql, &lookup).expect_err(sql);
             assert_eq!(e.wire_code(), "42601", "{sql}");
         }
+        // `DESC` の `LIMIT` 省略は Issue #2242 で受理（暗黙上限の印が立つ）。
+        let omitted = validate_statement(
+            "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' DESC",
+            &lookup,
+        )
+        .expect("DESC without LIMIT");
+        assert!(omitted.distance_descending());
         // OFFSET は #2008 で受理されたため DESC とも併用できる。
         let stmt = validate_statement(
             "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' DESC LIMIT 5 OFFSET 1",
