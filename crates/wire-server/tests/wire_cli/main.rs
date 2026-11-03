@@ -11,6 +11,7 @@ use http_common::temp_db;
 mod tls_client;
 
 mod batch_max_files_parity;
+mod persist4_second_server_same_db;
 mod recover12_explicit_txn_resend;
 mod transaction_limits_parity;
 mod wire7_bind_guard;
