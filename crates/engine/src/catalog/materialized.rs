@@ -659,7 +659,7 @@ pub(crate) fn create_matview_index_in_txn(
 ) -> Result<()> {
     let mv = load_def_in_txn(write_txn, &def.table)?
         .ok_or_else(|| CatalogError::ViewNotFound(def.table.clone()))?;
-    if matches!(def.kind, IndexKind::Hnsw) {
+    if matches!(def.kind, IndexKind::Hnsw(_)) {
         return Err(CatalogError::IndexKindMismatch(
             "USING hnsw is not supported on materialized views".to_string(),
         ));

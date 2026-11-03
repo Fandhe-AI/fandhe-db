@@ -13216,13 +13216,21 @@ impl EngineCore {
             _ => Vec::new(),
         };
 
+        // Issue #1978: `hnsw_params:` の `metric=` は HNSW 宣言の opclass。宣言を読むのは
+        // 上記ゲートと同じキャッシュ済み要約だけ（opt-in なしではカタログに触れない）。
+        let ann_metric = if declarations_enabled {
+            crate::catalog::hnsw_metric_in_txn(read_txn, &self.index_catalog_gate_cache, table)
+        } else {
+            crate::catalog::VectorOpClass::Cosine
+        };
         (
             crate::sql::explain::ExplainEngine::new(
                 self.search_engine_kind(),
                 ann_plan,
                 scalar_plan,
             )
-            .with_scalar_fallback(scalar_fallback),
+            .with_scalar_fallback(scalar_fallback)
+            .with_ann_metric(ann_metric),
             crate::sql::explain::ExplainIndexNames::new(ann_names, scalar_names),
         )
     }
