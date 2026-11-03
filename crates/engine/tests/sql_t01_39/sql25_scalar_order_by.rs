@@ -513,7 +513,7 @@ fn using_mode_and_hint_order_are_rejected_after_scalar_order_by() {
     );
 }
 
-/// `NULLS` の後ろが FIRST/LAST でない形・定数式は許可リスト外（`NULLS FIRST/LAST` の受理は SQL-56・Issue #1791）。`LIMIT` を伴わない形も拒否する。
+/// `NULLS` の後ろが FIRST/LAST でない形・定数式は許可リスト外（`NULLS FIRST/LAST` の受理は SQL-56・Issue #1791）。`LIMIT` 省略は受理する（下記）。
 #[test]
 fn unsupported_order_by_forms_are_rejected_with_42601() {
     let path = unique_db_path("order-reject-forms");
@@ -536,12 +536,16 @@ fn unsupported_order_by_forms_are_rejected_with_42601() {
         "42601",
     );
     // Issue #1796・SQL-34: `LIMIT` 省略はスカラー `ORDER BY` でも受理する（暗黙の結果行数上限。
-    // 受理側は sql34_limit_omitted.rs）。ベクトル順位付けの省略は従来どおり `42601`。
+    // 受理側は sql34_limit_omitted.rs）。
+    // Issue #2242: ベクトル順位付けの `LIMIT` 省略も厳密全走査として受理する（もはや 42601 ではない）。
+    // 表の次元（2）に合わないリテラルは構文ではなく入力検証で 22000 になる。
+    core.execute_sql(&ctx, "SELECT id FROM docs ORDER BY embedding <=> '[1,0]'")
+        .expect("LIMIT-omitted vector ORDER BY should be accepted as exact scan");
     expect_sqlstate(
         &core,
         &ctx,
         "SELECT id FROM docs ORDER BY embedding <=> '[1,0,0]'",
-        "42601",
+        "22000",
     );
 }
 
