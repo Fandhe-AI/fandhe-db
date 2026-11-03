@@ -1579,6 +1579,20 @@ Issue #1405（fix(engine)!: CREATE TYPE の型名の重複を 42710 で返す。
 
 **Issue #1986（docs(design): コサイン距離の実装方式を比較し ADR に記録する。SQL-33・TASK-237／238 ポインタ。詳細は [cosine-distance-method.md](cosine-distance-method.md)）**: 正規化帰着（A）・保存時正規化（B／B′）・ノルム併用（C1：1 パス融合、C2：arena 常駐の行ノルム²）を、精度・メモリ・書き込みコスト・検索コストで比較した。実 pgvector 0.8.7 との照合で、A は未正規化入力で値が一致せず不採用、C1／C2 は最大差 3.8e-8（ほぼ重複行で 1.9e-7）。推奨は C2（追加 4 B/行・永続形式は不変）で、ステータスは Proposed（オーナー確認待ち）。計測は `crates/engine/benches/cosine_method_bench.rs`（`make bench-cosine-method`。手動専用・CI 非配線）。production のカーネルは変更しない（#1987 が実装）。
 
+**Issue #1994（crossdb ベンチハーネスと bench／examples の距離演算子。SQL-33 ポインタ。`<#>` への切替は延期）**
+
+親 #1989 で `<=>` がコサイン距離へ変わるのに備えた切替だが、`<#>` の実行経路（#1977・#1991）が
+main に無く現行の `parse_order_by` は `<=>` のみ受理するため、実行 SQL の `<#>` 切替は延期した
+（実行系 bench・example・crossdb の自作 DB 側が実行時に失敗するのを避ける）。
+
+- 現状: `scripts/crossdb_bench/`、`crates/engine/benches/`、`crates/engine/examples/feature_bench.rs`、
+  関連 engine テストの SQL・docstring は `<=>` のまま（変更なし）
+- 静的検査: `scripts/tests/test_distance_operator_parity.py`（`make scripts-test` で CI が実行）。
+  自作 DB 側が `<=>`、pgvector 側が `<#>`・`vector_ip_ops` であることを固定する
+- 切替条件: #1977・#1991 のマージ後に、自作 DB 側の SQL を `<#>` へ統一し検査の期待値を同時に更新する
+  （`c1_bench_accept` の e2e オラクル照合・`scan_stage_profile_accept`・HNSW への到達・
+  `self_db.py` の `explain`／`udf_call` が `unsupported` に丸められないことを確認する）。#1991 の完了条件として追跡する
+
 **Issue #2009（feat(engine): kNN の `DESC` を全 metric で受理し索引不使用の全走査で返す。親 #2006・SQL-33 (2)・SQL-75 (4) ポインタ）**: 距離順 `ORDER BY <列> <距離演算子> <ベクトル>` の直後に `ASC`／`DESC`（文脈語・大文字小文字非区別）を受理する。`ParsedShape`・`ValidatedStatement`・`BoundStatement` に `distance_descending`（既定 `false`）を足し、公開 enum（`OrderByForm`・`Ranking`）と `AnnShapeInput` は変えていない（`ValidatedStatement::{distance_descending, with_distance_descending}` を追加）。`DESC` は `sql::exec` の DISTANCE 段で provider・ANN を通さず `exact_farthest_scan`（昇順経路と同じ候補・同じ内積・同じ除外規約で全走査し、`kernel::select_farthest_k` で「スコア低い順・同点は行番号昇順・NaN は先頭」に選出）へ分岐する。`SearchProvider` の公開契約は変えない。走査量はアリーナの既存上限で閉じ、長い走査は文の期限を確認する。`USING MODE 'precision'` との併用は確信度ゲートが遠い順で意味を持たないため `0A000`（自動運転の安全側判断）。NULLS 句・重複した方向語・`LIMIT` 省略・hybrid 関数形は従来どおり `42601`。`DESC` 後の `LIMIT`・`OFFSET` は受理し、実行段の `fetch_count()`／`skip_front()` で処理する（#2008）。`AnnPlan::PlainScanDescending`（`#[non_exhaustive]` enum への追加）を足し、`EXPLAIN` の `ann_plan:` 行は `plain_scan_descending`（索引名注記なし）。結合テストは `tests/sql_named/sql33_knn_desc.rs`（パラメータ化した `Metric` で、実行可能な種別ごとに全走査モデルと一致を確認）。`<->`・`<#>`・`<+>` の SQL 受理（#1977）と各カーネルの接続、`<=>` の意味切替（#1991）、NaN 行の順位付け（#2240）、`LIMIT` 省略（#2242）は対象外で、各 Issue のマージ時に種別ごとの SQL レベル一致テストを足す。
 
 **Issue #2035（feat(engine): WHERE 内の距離比較を許可。SQL-74 (1) ポインタ。子 Issue #2036 が評価を担当）**: `WHERE <VECTOR 列> <距離演算子> <ベクトルリテラル> <比較演算子> <数値>`（`<` `<=` `>` `>=` `=` `<>` `!=`・`[NOT] BETWEEN`・前置 `NOT`・括弧・逆向き）を構文と束縛で受理した。`Expr::VectorDistance { kind, lhs, rhs }` を追加し（`Expr` の網羅 match を持つ外部コードへの破壊的変更）、値式の「その他の演算子」の段（加減算より弱く比較より強い・左結合）で WHERE の葉の解析中だけ生成する（`distance_expr_allowed`。投影・SET・VALUES・UDF 本体・ORDER BY・JOIN・CHECK 本体は従来どおり拒否）。4 種別（`<=>` `<->` `<#>` `<+>`）をすべて構文で受理し `kind` を保持する。束縛（`udf_call::bind_vector_distance_operands`）は列とリテラルの組を検証し（未知の列 `42703`・VECTOR 以外 `42883`・次元不一致や不正 `22000`・長さ超過 `54000`・列×列／NULL／リテラル同士は `0A000`）、通った文も**評価が未結線のため fail-closed の `0A000`** で止める（行は返さず DML は書き換えない。ゲートは `bind_expr_any` の 1 か所）。operation_id 台帳用に content hash へ専用タグ 22 を追加（既存タグは不変）。申し送り: (1) #2036 は `BoundExpr` に距離ノードを足し、上記ゲートを構築に置き換える。(2) `order_by_distance_literal_is_param` は位置を問わず `<=> $n` を見るため、WHERE 側が `$n` のとき Describe で ORDER BY のリテラル検証が省かれうる（現状は束縛で `0A000`）。(3) 比較の反対側の型エラー（`< 'abc'`）は距離側の `0A000` が先に返る。(4) `<->` 等の `$n`・ORDER BY の種別付き演算子は #1977、投影位置の距離値は #2006 の担当。しきい値側の `$n`（`< $2`）は従来どおり `42601`。
