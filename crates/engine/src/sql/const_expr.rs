@@ -421,6 +421,8 @@ fn pg_float_typed(expr: &Expr) -> bool {
 /// 型付き浮動小数との混合式に含まれる型なし小数リテラル（PG では numeric）の精度検査（Issue #2881）。
 /// 型付き float 自身の範囲検査は外すが、型なしの小数リテラルを f64 へ丸めて受理しないよう、
 /// 非有限または |v| > 2^53 の小数リテラルは `22003`（fail-closed）。型付き値（`Call`）の内側は辿らない。
+/// `CASE`／`COALESCE` は `check_intermediate_precision` と同じ短絡評価の到達可能性で、評価される
+/// 分岐だけを検査する（未評価分岐の大きなリテラルで偽陽性にしない）。`NULLIF` は両引数を常に評価する。
 fn check_untyped_decimal_leaves(expr: &Expr) -> Result<(), SqlSurfaceError> {
     let out_of_range =
         || SqlSurfaceError::numeric_out_of_range("constant expression loses integer precision");
@@ -432,15 +434,30 @@ fn check_untyped_decimal_leaves(expr: &Expr) -> Result<(), SqlSurfaceError> {
                 Err(out_of_range())
             }
         }
-        Expr::Binary { lhs, rhs, .. } => {
+        Expr::Binary { lhs, rhs, .. } | Expr::NullIf(lhs, rhs) => {
             check_untyped_decimal_leaves(lhs)?;
             check_untyped_decimal_leaves(rhs)
         }
-        Expr::Coalesce(args) => args.iter().try_for_each(check_untyped_decimal_leaves),
+        Expr::Coalesce(args) => {
+            for a in args {
+                if matches!(a, Expr::Null) {
+                    continue;
+                }
+                check_untyped_decimal_leaves(a)?;
+                if !matches!(eval_node(a, false), Some(ExprValue::Null)) {
+                    break;
+                }
+            }
+            Ok(())
+        }
         Expr::Case { whens, else_result } => {
             for (c, r) in whens {
                 check_untyped_decimal_leaves(c)?;
-                check_untyped_decimal_leaves(r)?;
+                match eval_node(c, false) {
+                    Some(ExprValue::Bool(true)) => return check_untyped_decimal_leaves(r),
+                    Some(ExprValue::Bool(false) | ExprValue::Null) => {}
+                    _ => return Ok(()),
+                }
             }
             match else_result {
                 Some(e) => check_untyped_decimal_leaves(e),
@@ -451,20 +468,24 @@ fn check_untyped_decimal_leaves(expr: &Expr) -> Result<(), SqlSurfaceError> {
     }
 }
 
-/// 小数リテラル（先頭 `-` 任意）の厳密な大きさが有限かつ 2^53 以下か。f64 への丸めに頼らず、
-/// 整数部の桁（先頭の 0 を除く）と、整数部がちょうど 2^53 のときの小数部の非零で判定する。
-/// 解釈できない形は偽（fail-closed）。
+/// 小数リテラル（先頭 `-` 任意・指数表記可）の厳密な大きさが有限かつ 2^53 以下か。f64 への丸めに
+/// 頼らず、仮数の有効桁と指数を十進のまま比較する。解釈できない形（指数が i64 に収まらない等）は
+/// 偽（fail-closed）。
 fn decimal_literal_exact_within_f64_range(raw: &str) -> bool {
-    // 指数表記は厳密な十進展開を持たないため、従来どおり f64 の大きさで判定する。
-    if raw.bytes().any(|b| b == b'e' || b == b'E') {
-        return raw
-            .parse::<f64>()
-            .is_ok_and(|v| v.is_finite() && v.abs() <= MAX_EXACT_F64);
-    }
     let body = raw.strip_prefix('-').unwrap_or(raw);
-    let (int_part, frac_part) = match body.split_once('.') {
+    let (mantissa, exp) = match body.split_once(['e', 'E']) {
+        Some((m, e)) => {
+            let e = e.strip_prefix('+').unwrap_or(e);
+            let Ok(exp) = e.parse::<i64>() else {
+                return false;
+            };
+            (m, exp)
+        }
+        None => (body, 0),
+    };
+    let (int_part, frac_part) = match mantissa.split_once('.') {
         Some((i, f)) => (i, f),
-        None => (body, ""),
+        None => (mantissa, ""),
     };
     if !int_part.bytes().all(|b| b.is_ascii_digit())
         || !frac_part.bytes().all(|b| b.is_ascii_digit())
@@ -472,21 +493,28 @@ fn decimal_literal_exact_within_f64_range(raw: &str) -> bool {
     {
         return false;
     }
-    let int_trim = int_part.trim_start_matches('0');
-    // 2^53 = 9007199254740992（16 桁）。17 桁以上は確実に超過。
-    if int_trim.len() > 16 {
+    let all = format!("{int_part}{frac_part}");
+    let lead = all.len() - all.trim_start_matches('0').len();
+    let sig = all.trim_start_matches('0').trim_end_matches('0');
+    if sig.is_empty() {
+        return true;
+    }
+    // 小数点より左の桁数（仮数の先頭ゼロを除く）。
+    let int_digits = (int_part.len() as i64 - lead as i64).saturating_add(exp);
+    // 2^53 = 9007199254740992（16 桁）。
+    const MAX_DIGITS: &str = "9007199254740992";
+    if int_digits <= 15 {
+        return true;
+    }
+    if int_digits > 16 {
         return false;
     }
-    let int_val: u64 = if int_trim.is_empty() {
-        0
-    } else {
-        match int_trim.parse() {
-            Ok(v) => v,
-            Err(_) => return false,
-        }
-    };
-    let max = MAX_EXACT_F64 as u64;
-    int_val < max || (int_val == max && frac_part.bytes().all(|b| b == b'0'))
+    let head: String = sig.chars().chain(std::iter::repeat('0')).take(16).collect();
+    match head.as_str().cmp(MAX_DIGITS) {
+        std::cmp::Ordering::Less => true,
+        std::cmp::Ordering::Equal => sig.len() <= 16,
+        std::cmp::Ordering::Greater => false,
+    }
 }
 
 /// 整数モードで、`children` のいずれかが整数の運び手（`Numeric`）に評価されるなら `22003`。
@@ -1606,6 +1634,61 @@ mod tests {
                 BinOp::Add,
                 typed("float8", "1.5"),
                 num("9007199254740993")
+            )),
+            "22003"
+        );
+    }
+
+    /// Issue #2881 のレビュー指摘: 型なし小数リテラルの精度検査は評価される分岐だけに適用し、
+    /// 指数表記は十進のまま厳密に判定し、NULLIF の引数も検査する。
+    #[test]
+    fn untyped_decimal_leaf_check_respects_reachability_exponent_and_nullif() {
+        let big = || num("9007199254740993.5");
+        let f0 = || typed("float8", "0");
+        // COALESCE の未評価引数（先頭が非 NULL）の大きな小数は検査しない。
+        assert!(fold_const_literal(&bin(
+            BinOp::Add,
+            f0(),
+            Expr::Coalesce(vec![num("1.0"), big()])
+        ))
+        .is_ok());
+        // 評価される引数は検査する。
+        assert_eq!(
+            code(&bin(
+                BinOp::Add,
+                f0(),
+                Expr::Coalesce(vec![Expr::Null, big()])
+            )),
+            "22003"
+        );
+        // CASE の未選択結果は検査せず、選択される分岐は検査する。
+        let case = |cond_true: bool| Expr::Case {
+            whens: vec![(
+                bin(BinOp::Eq, num("1"), num(if cond_true { "1" } else { "2" })),
+                big(),
+            )],
+            else_result: Some(Box::new(num("1.0"))),
+        };
+        assert!(fold_const_literal(&bin(BinOp::Add, f0(), case(false))).is_ok());
+        assert_eq!(code(&bin(BinOp::Add, f0(), case(true))), "22003");
+        // 指数表記は f64 丸め前に厳密判定する（2^53 をわずかに超える値も拒否）。
+        assert_eq!(
+            code(&bin(BinOp::Add, f0(), num("9007199254740992.5e0"))),
+            "22003"
+        );
+        assert_eq!(
+            code(&bin(BinOp::Add, f0(), num("90071992547409925e-1"))),
+            "22003"
+        );
+        assert_eq!(code(&bin(BinOp::Add, f0(), num("1e400"))), "22003");
+        assert!(fold_const_literal(&bin(BinOp::Add, f0(), num("9007199254740992.0e0"))).is_ok());
+        assert!(fold_const_literal(&bin(BinOp::Add, f0(), num("1.5e3"))).is_ok());
+        // NULLIF 内の大きな型なし小数も 22003（丸めて保存しない）。
+        assert_eq!(
+            code(&bin(
+                BinOp::Add,
+                f0(),
+                Expr::NullIf(Box::new(big()), Box::new(num("1.0")))
             )),
             "22003"
         );
