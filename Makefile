@@ -314,6 +314,11 @@ bench-knn-wire-profile: ## vector_knn の wire／SQL 表層／距離カーネル
 bench-dot-kernel: ## dot カーネルのマイクロベンチ（Issue #365）
 	cargo bench --bench dot_kernel_bench -p fandhe-db-engine
 
+# Issue #1986（コサイン距離の実装方式比較。ADR は docs/design/cosine-distance-method.md）の計測ベンチを実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用。BENCH_COSINE_METHOD_EMIT_SQL=1 で fixture を pgvector リテラルの SQL として stdout に出力して終了する〔実 pgvector との照合用・fail-closed env・既定 Off〕）
+.PHONY: bench-cosine-method
+bench-cosine-method: ## コサイン距離の実装方式比較ベンチ（Issue #1986）
+	cargo bench --bench cosine_method_bench -p fandhe-db-engine
+
 # Issue #468（macOS 上の is_aarch64_feature_detected! 実効性検証）の feature 検出結果表を出力する（時間非依存・spec 閾値なしの情報提供専用のため ci には含めない。手動実行専用。出力は docs/design/chip-kernel-guidelines.md へ転記する運用）
 .PHONY: detect-features
 detect-features: ## macOS 上の aarch64 feature 検出結果表を出力する（Issue #468）
