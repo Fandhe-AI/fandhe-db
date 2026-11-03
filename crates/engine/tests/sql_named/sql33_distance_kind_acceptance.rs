@@ -2,8 +2,8 @@
 //! WIRE-12・SQL-74・SQL-75 (4)。ポインタ: `docs/spec/04-behavior/sql-surface.md`）。
 //!
 //! 固定する契約:
-//! - `<=>` の kNN は従来どおり行を返す（回帰）。
-//! - `<->`／`<#>`／`<+>` は構文・束縛を通り、実行段で `0A000`（カーネル未接続の fail-closed）。
+//! - `<=>`（コサイン距離）と `<#>`（負の内積）の kNN は行を返す（Issue #1991 で接続済み）。
+//! - `<->`／`<+>` は構文・束縛を通り、実行段で `0A000`（カーネル未接続の fail-closed）。
 //! - バインド時の型エラーの判定順序・コードは `EXPLAIN` の有無で変わらない。
 //! - `0A000` の応答は固定文言で、他テナントの情報を含まない。
 
@@ -18,7 +18,10 @@ use engine::storage::{Storage, Visibility};
 use crate::temp_db;
 use temp_db::{unique_db_path, CleanupGuard};
 
-const OPS: [&str; 3] = ["<->", "<#>", "<+>"];
+/// SQL 実行経路に未接続の演算子（Issue #1991 時点で L2／L1）。
+const OPS: [&str; 2] = ["<->", "<+>"];
+/// バインド時の検査が 4 種で同じであることを確かめる全演算子。
+const ALL_OPS: [&str; 4] = ["<=>", "<->", "<#>", "<+>"];
 
 fn ctx(tenant: &str) -> PolicyContext {
     PolicyContext::with_visibilities(tenant, [Visibility::Public, Visibility::Private])
@@ -87,7 +90,18 @@ fn sql33_cosine_knn_is_unchanged() {
 }
 
 #[test]
-fn sql33_non_cosine_knn_binds_but_execution_is_0a000() {
+fn sql33_negative_inner_product_knn_runs() {
+    let path = unique_db_path("sql33-kind-negip");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core(&path);
+    for tail in ["LIMIT 3", "DESC LIMIT 3", "LIMIT 3 OFFSET 1", "LIMIT 5"] {
+        let sql = format!("SELECT id FROM documents ORDER BY embedding <#> '[1,0,0]' {tail}");
+        assert!(outcome(&core, "tenant-a", &sql).is_ok(), "{sql}");
+    }
+}
+
+#[test]
+fn sql33_unconnected_knn_binds_but_execution_is_0a000() {
     let path = unique_db_path("sql33-kind-exec");
     let _guard = CleanupGuard(path.clone());
     let core = new_core(&path);
@@ -110,7 +124,7 @@ fn sql33_bind_errors_are_identical_with_and_without_explain() {
     let path = unique_db_path("sql33-kind-explain");
     let _guard = CleanupGuard(path.clone());
     let core = new_core(&path);
-    for op in OPS {
+    for op in ALL_OPS {
         for tail in [
             "ORDER BY embedding {op} '[1,0]' LIMIT 3",
             "ORDER BY nope {op} '[1,0,0]' LIMIT 3",
@@ -124,12 +138,16 @@ fn sql33_bind_errors_are_identical_with_and_without_explain() {
             assert_eq!(plain, explain, "{op} {tail}");
             assert_ne!(plain, "42601", "{op} {tail}");
         }
-        // 正しい文: EXPLAIN は成功し、実行は 0A000。
+        // 正しい文: EXPLAIN は成功し、実行は未接続の演算子だけ 0A000。
         let ok = format!("SELECT id FROM documents ORDER BY embedding {op} '[1,0,0]' LIMIT 3");
         assert!(
             outcome(&core, "tenant-a", &format!("EXPLAIN {ok}")).is_ok(),
             "{op}"
         );
-        assert_eq!(code(&core, &ok), "0A000", "{op}");
+        if OPS.contains(&op) {
+            assert_eq!(code(&core, &ok), "0A000", "{op}");
+        } else {
+            assert!(outcome(&core, "tenant-a", &ok).is_ok(), "{op}");
+        }
     }
 }

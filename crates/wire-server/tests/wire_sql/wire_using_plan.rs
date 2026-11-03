@@ -152,7 +152,9 @@ fn seeded_storage() -> (Storage, temp_db::CleanupGuard) {
         "tenant-a",
         2,
         Visibility::Public,
-        vec![0.4, 0.3, 0.2, 0.1],
+        // 行 1 と同一のベクトル。コサイン距離（Issue #1991）でも密側が厳密に同点になるようにして、
+        // 行 1・2 の融合スコアが完全に揃う（確信度ゲートのマージン 0 で空集合）決定的な構成を保つ。
+        vec![0.1, 0.2, 0.3, 0.4],
         "docs/b.md",
         "beta content in english",
     );

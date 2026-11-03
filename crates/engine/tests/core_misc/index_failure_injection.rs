@@ -219,6 +219,21 @@ impl SearchProvider for FailFirstSearchProvider {
         }
         self.inner.search(input)
     }
+
+    /// `<=>`（コサイン距離。Issue #1991）の検索も同じ注入経路で最初の 1 回だけ失敗させる。
+    fn search_cosine(
+        &self,
+        input: engine::kernel::CosineSearchInput<'_>,
+    ) -> Result<Vec<engine::kernel::DistanceHit>, KernelError> {
+        if self
+            .failed_once
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            return Err(KernelError::WorkerPanicked);
+        }
+        self.inner.search_cosine(input)
+    }
 }
 
 /// `core` を drop し、同一パスで `EngineCore` を再構築する（プロセス再起動相当。

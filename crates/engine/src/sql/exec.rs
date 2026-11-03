@@ -667,19 +667,27 @@ const FULL_SCAN_DEADLINE_STRIDE: usize = 4096;
 /// 厳密さを保つため）。`farthest_first` が `true` なら遠い順（`DESC`）、`false` なら近い順。
 ///
 /// `slots` は通常経路と同じ候補（アリーナの行番号。スカラー索引の候補マスクがあればその行番号）。
-/// スコアは通常経路（`CpuScalarProvider`）と同じ内積で計算する（距離種別の切り替えはこの 1 か所）。
-/// 範囲外の行と非有限スコアの行を除く規約も同じ。近い順の選出は [`crate::kernel::TopKSelector`]
-/// （スコアの高い順・同点は順序キー昇順）、遠い順は [`crate::kernel::select_farthest_k`]
-/// （スコアの低い順・同点は順序キー昇順）。返す `score` は通常経路と同じ値。走査量はアリーナの
-/// 既存上限（`MAX_ARENA_ROWS`／総バイト数）で閉じており、新しい打ち切りは持たない。保持件数は
-/// 高々 `k` 件で、事前確保は `k` に依存させない。長い走査は期限を確認する。
+/// 返す `(slot, 距離値)` は演算子の距離値そのもの（Issue #1991。DISTANCE 段の出力は距離昇順の規約）。
+/// - `DistanceKind::Cosine`（`<=>`）: `1 - cos`（f64）。ゼロノルム等の NaN 行は除外せず、近い順では
+///   末尾・遠い順では先頭に置き、`k` の枠も消費する（SQL-33 (3)）。通常経路の
+///   `SearchProvider::search_cosine` と同じ式（`cosine_distance_from_parts`）で求める。
+/// - `DistanceKind::NegativeInnerProduct`（`<#>`）: 内積スコアの符号反転（`-dot`）。非有限スコアの
+///   行は通常経路（`CpuScalarProvider`）と同じく除く。
+///
+/// 範囲外の行を除く規約は通常経路と同じ。選出は近い順が `AscDistanceTopK`／`TopKSelector`、
+/// 遠い順が `select_farthest_distance_k`／`select_farthest_k`（同点は順序キー昇順）。走査量は
+/// アリーナの既存上限（`MAX_ARENA_ROWS`／総バイト数）で閉じており、新しい打ち切りは持たない。
+/// 保持件数は高々 `k` 件で、事前確保は `k` に依存させない。長い走査は期限を確認する。
+/// L2／L1 は実行入口が拒否済みで到達しない（到達したら `Internal` で fail-closed）。
 fn exact_full_scan(
     arena: &crate::arena::VectorArena,
     slots: &[u64],
     query: &[f32],
     k: usize,
     farthest_first: bool,
-) -> Result<Vec<crate::kernel::CandidateHit>, SqlSurfaceError> {
+    kind: crate::sql::lexer::DistanceKind,
+) -> Result<Vec<(u64, f64)>, SqlSurfaceError> {
+    use crate::sql::lexer::DistanceKind;
     let dim = arena.dim() as usize;
     if query.len() != dim {
         return Err(map_kernel_error(KernelError::DimMismatch {
@@ -693,6 +701,14 @@ fn exact_full_scan(
     if k == 0 || slots.is_empty() {
         return Ok(Vec::new());
     }
+    if !matches!(
+        kind,
+        DistanceKind::Cosine | DistanceKind::NegativeInnerProduct
+    ) {
+        return Err(SqlSurfaceError::Internal {
+            detail: "exact scan reached with an unconnected distance kind".to_string(),
+        });
+    }
     let vectors = arena.vectors();
     let deadline = crate::interrupt::current_deadline();
     deadline.check()?;
@@ -700,7 +716,7 @@ fn exact_full_scan(
     // 結果は返さない）。
     let mut failure: Option<SqlSurfaceError> = None;
     let mut visited: usize = 0;
-    let candidates = slots
+    let rows = slots
         .iter()
         .map_while(|&slot| {
             visited = visited.saturating_add(1);
@@ -715,26 +731,149 @@ fn exact_full_scan(
         .filter_map(|slot| {
             let start = usize::try_from(slot).ok()?.checked_mul(dim)?;
             let end = start.checked_add(dim)?;
-            let vector = vectors.get(start..end)?;
-            let score = crate::kernel::dot(vector, query);
-            score
-                .is_finite()
-                .then_some(crate::kernel::CandidateHit { id: slot, score })
+            Some((slot, vectors.get(start..end)?))
         });
-    let out = if farthest_first {
-        crate::kernel::select_farthest_k(candidates, k)
-    } else {
-        let mut selector = crate::kernel::TopKSelector::new(k);
-        for hit in candidates {
-            selector.push(hit);
+    let out: Vec<(u64, f64)> = match kind {
+        DistanceKind::Cosine => {
+            let q_norm_sq = crate::kernel::dot(query, query);
+            let candidates = rows.map(|(slot, v)| crate::kernel::DistanceHit {
+                id: slot,
+                distance: crate::kernel::cosine_distance_from_parts(
+                    crate::kernel::dot(v, query),
+                    crate::kernel::dot(v, v),
+                    q_norm_sq,
+                ),
+            });
+            let hits = if farthest_first {
+                crate::kernel::select_farthest_distance_k(candidates, k)
+            } else {
+                let mut selector = crate::kernel::AscDistanceTopK::new(k);
+                for hit in candidates {
+                    selector.push(hit);
+                }
+                selector.into_sorted_vec()
+            };
+            hits.into_iter().map(|h| (h.id, h.distance)).collect()
         }
-        selector.into_sorted_vec()
+        _ => {
+            let candidates = rows.filter_map(|(slot, v)| {
+                let score = crate::kernel::dot(v, query);
+                score
+                    .is_finite()
+                    .then_some(crate::kernel::CandidateHit { id: slot, score })
+            });
+            let hits = if farthest_first {
+                crate::kernel::select_farthest_k(candidates, k)
+            } else {
+                let mut selector = crate::kernel::TopKSelector::new(k);
+                for hit in candidates {
+                    selector.push(hit);
+                }
+                selector.into_sorted_vec()
+            };
+            hits.into_iter()
+                .map(|h| (h.id, -(f64::from(h.score))))
+                .collect()
+        }
     };
     if let Some(e) = failure {
         return Err(e);
     }
     deadline.check()?;
     Ok(out)
+}
+
+/// HNSW（内積グラフ。正規化済み入力の契約。`docs/design/hnsw-search.md`）が返した `<=>` の候補を、
+/// 厳密なコサイン距離（`1 - cos`）で再採点して距離昇順（同点は順序キー昇順・NaN は末尾）に並べ直す
+/// （Issue #1991・SQL-33 (1)(3)(5)）。`hits` の `id` はアリーナのスロット番号。範囲外のスロットは
+/// 索引・マージの不整合を意味するので黙って落とさず `Internal` で fail-closed に拒否する。
+/// 再採点は高々 `k` 件 × 次元で、候補集合は呼び出し元が `provider_result_is_valid` で検証済み。
+/// 近似経路の取りこぼし（内積順で上位に入らなかった行）は補わない。HNSW のコサイン正確化は
+/// 別 Issue（#1998）の担当で、ここでは返した候補の距離値と並びだけを `<=>` の意味に揃える。
+fn rescore_cosine(
+    arena: &crate::arena::VectorArena,
+    hits: &[crate::kernel::CandidateHit],
+    query: &[f32],
+) -> Result<Vec<(u64, f64)>, SqlSurfaceError> {
+    let q_norm_sq = crate::kernel::dot(query, query);
+    let mut scored: Vec<crate::kernel::DistanceHit> = Vec::new();
+    scored
+        .try_reserve_exact(hits.len())
+        .map_err(|e| SqlSurfaceError::Internal {
+            detail: format!("failed to reserve rescored hits: {e}"),
+        })?;
+    for hit in hits {
+        let vector = usize::try_from(hit.id)
+            .ok()
+            .and_then(|slot| arena.vector(slot))
+            .ok_or_else(|| SqlSurfaceError::Internal {
+                detail: "rescored candidate slot out of range".to_string(),
+            })?;
+        scored.push(crate::kernel::DistanceHit {
+            id: hit.id,
+            distance: crate::kernel::cosine_distance_from_parts(
+                crate::kernel::dot(vector, query),
+                crate::kernel::dot(vector, vector),
+                q_norm_sq,
+            ),
+        });
+    }
+    scored.sort_by(|a, b| {
+        crate::search_order::cmp_distance_asc_then_tie(
+            a.distance,
+            crate::search_order::tie_key_for_response_id(a.id),
+            b.distance,
+            crate::search_order::tie_key_for_response_id(b.id),
+        )
+    });
+    Ok(scored.into_iter().map(|h| (h.id, h.distance)).collect())
+}
+
+/// HYBRID の密側を `<=>`（コサイン距離）で順位付けするための [`SearchProvider`] アダプタ
+/// （Issue #1991・SQL-33。`hybrid::hybrid_search`／`rrf_fuse` は「スコア降順」の `CandidateHit` を
+/// 前提にするため、距離昇順の結果をその形へ写す）。
+///
+/// `search` は内側 provider の `search_cosine` を呼び、NaN 距離（ゼロノルム行。末尾にしか来ない）を
+/// 除いたうえで `score = (1 - distance) as f32` に写し、`cmp_score_desc_then_tie` で再整列する
+/// （f32 への丸めで同点が増えても `rrf_fuse` の順序検証を通すため）。NaN を除くのは `rrf_fuse` が
+/// 非有限スコアを拒否し、ゼロノルム行が 1 件あるだけで hybrid 全体が失敗するのを避けるため
+/// （RRF は順位ベースで、末尾の NaN 行を除いた影響は小さい）。`sql::exec` の `Ranking::Hybrid`
+/// 分岐だけが使う crate 内部の型で、行の可視性は呼び出し元が絞り込み済みの入力に従う。
+struct CosineDenseAdapter<'a> {
+    inner: &'a dyn SearchProvider,
+}
+
+impl SearchProvider for CosineDenseAdapter<'_> {
+    fn search(
+        &self,
+        input: SearchInput<'_>,
+    ) -> Result<Vec<crate::kernel::CandidateHit>, KernelError> {
+        let hits = self.inner.search_cosine(crate::kernel::CosineSearchInput {
+            ids: input.ids,
+            vectors: input.vectors,
+            row_norms_sq: None,
+            dim: input.dim,
+            query: input.query,
+            k: input.k,
+        })?;
+        let mut out: Vec<crate::kernel::CandidateHit> = hits
+            .into_iter()
+            .filter(|h| !h.distance.is_nan())
+            .map(|h| crate::kernel::CandidateHit {
+                id: h.id,
+                score: (1.0 - h.distance) as f32,
+            })
+            .collect();
+        out.sort_by(|a, b| {
+            crate::search_order::cmp_score_desc_then_tie(
+                a.score,
+                crate::search_order::tie_key_for_response_id(a.id),
+                b.score,
+                crate::search_order::tie_key_for_response_id(b.id),
+            )
+        });
+        Ok(out)
+    }
 }
 
 fn map_kernel_error(_e: KernelError) -> SqlSurfaceError {
@@ -803,23 +942,25 @@ fn map_hybrid_error(e: HybridError) -> SqlSurfaceError {
     }
 }
 
-/// 非 Cosine の距離演算子（`<->`／`<#>`／`<+>`）の文を実行入口で `0A000` に倒す仮置きの関門
-/// （Issue #1977・SQL-33 (2)(4)）。構文と `$n` 束縛は 4 種とも通るが、`<=>` 以外の距離カーネルは
-/// まだ SQL 実行経路に接続されていない（接続は #1981／#1987／#1988／#1991 の担当）。内積しか
-/// 計算できない現状の経路で別種別が黙って内積順として返る fail-open を防ぐため、SQL テキスト・
-/// 明示トランザクション・NoSQL 束縛済み計画・`USING PLAN` のすべてが通る
-/// [`execute_statement_with_cache`] の先頭で、行ポリシー解決やストレージ読み取りより前に拒否する。
-/// 文言は固定の英語で、テナント・表・行の情報を含めない。後続 Issue は本関数を各カーネルの分岐へ
-/// 置き換える。
+/// SQL 実行経路にまだ接続していない距離演算子（`<->`／`<+>`）の文を実行入口で `0A000` に倒す関門
+/// （Issue #1977・SQL-33 (2)(4)。Issue #1991 で `<=>`〔コサイン距離〕と `<#>`〔負の内積〕を接続し、
+/// 対象を L2／L1 に狭めた）。構文と `$n` 束縛は 4 種とも通るが、L2／L1 の距離カーネルは SQL 実行経路に
+/// 未接続（カーネル自体は #1981／#1988 で実装済み。接続は別 Issue）。別種別が黙って内積順として
+/// 返る fail-open を防ぐため、SQL テキスト・明示トランザクション・NoSQL 束縛済み計画・`USING PLAN` の
+/// すべてが通る [`execute_statement_with_cache`] の先頭で、行ポリシー解決やストレージ読み取りより前に
+/// 拒否する。文言は固定の英語で、テナント・表・行の情報を含めない。分岐は 1 種別 1 アームにしてあり、
+/// 後続 Issue は該当アームを外して DISTANCE 段の分岐を足す。
 fn ensure_distance_kind_executable(bound: &BoundStatement) -> Result<(), SqlSurfaceError> {
-    let kind = bound.distance_kind;
-    if kind == crate::sql::lexer::DistanceKind::Cosine {
-        return Ok(());
+    use crate::sql::lexer::DistanceKind;
+    match bound.distance_kind {
+        DistanceKind::Cosine | DistanceKind::NegativeInnerProduct => Ok(()),
+        kind @ (DistanceKind::L2 | DistanceKind::L1) => {
+            Err(SqlSurfaceError::feature_not_supported(format!(
+                "distance operator {} is not supported yet",
+                kind.operator()
+            )))
+        }
     }
-    Err(SqlSurfaceError::feature_not_supported(format!(
-        "distance operator {} is not supported yet",
-        kind.operator()
-    )))
 }
 
 /// [`BoundStatement`] を実行する（TASK-75 の公開 API）。`read_txn`・`schema` は
@@ -888,8 +1029,8 @@ pub(crate) fn execute_statement_with_cache(
     hnsw_cache: Option<crate::sql::hnsw_cache::HnswCacheAccess<'_>>,
     scalar_cache: Option<crate::sql::scalar_index::ScalarCacheAccess<'_>>,
 ) -> Result<QueryResult, SqlSurfaceError> {
-    // 非 Cosine の距離演算子はカーネル未接続のため、行ポリシー解決・ストレージ読み取りより前に
-    // fail-closed で止める（Issue #1977）。
+    // SQL 実行経路に未接続の距離演算子（L2／L1）は、行ポリシー解決・ストレージ読み取りより前に
+    // fail-closed で止める（Issue #1977・#1991）。
     ensure_distance_kind_executable(bound)?;
     // RLS-13（Issue #2279）: 利用者ポリシーは、アリーナ構築と同じ read txn から 1 回だけ解決し、下の
     // `on_visible_row`（RLS 段の直後・利用者の `WHERE` より前）で各行へ適用する。キャッシュ
@@ -2305,14 +2446,62 @@ pub(crate) fn execute_statement_with_cache(
             Ranking::Distance { query }
                 if bound.distance_descending || bound.result_cap.is_some() =>
             {
-                let raw =
-                    exact_full_scan(arena, &slot_ids, query, k_eff, bound.distance_descending)?;
-                if raw.len() > k_eff || raw.iter().any(|h| !visible_id_counts.contains_key(&h.id)) {
+                let raw = exact_full_scan(
+                    arena,
+                    &slot_ids,
+                    query,
+                    k_eff,
+                    bound.distance_descending,
+                    bound.distance_kind,
+                )?;
+                if raw.len() > k_eff || raw.iter().any(|h| !visible_id_counts.contains_key(&h.0)) {
                     return Err(SqlSurfaceError::Internal {
                         detail: "exact scan returned a result violating its contract".to_string(),
                     });
                 }
-                raw.into_iter().map(|h| (h.id, h.score as f64)).collect()
+                raw
+            }
+            // Issue #1991・SQL-33 (1)(3): `<=>` の昇順は本物のコサイン距離（`1 - cos`）で返す。HNSW を
+            // 使わない経路（索引なし・opt-in なし・opclass 不一致の全走査・カスタム provider）は
+            // `SearchProvider::search_cosine`（候補マスクがあれば `search_cosine_subset`）を通し、
+            // 契約検証（`distance_result_is_valid`）で provider を untrusted として扱う。
+            // HNSW を使う経路は次の汎用アームで内積の候補を取り、厳密なコサイン距離で再採点する。
+            Ranking::Distance { query }
+                if bound.distance_kind == crate::sql::lexer::DistanceKind::Cosine
+                    && !hnsw_full_visible_eligible
+                    && !hnsw_subset_eligible =>
+            {
+                let raw = if let Some(kept) = mask_kept_slots.as_ref() {
+                    // スロット番号を位置ベースの `CosineSearchInput` へ渡さない（Issue #654 の
+                    // 注意と同じ。行番号は明示的な候補マスクとして渡す）。
+                    provider
+                        .search_cosine_subset(crate::kernel::SubsetSearchInput {
+                            slots: kept,
+                            vectors: arena.vectors(),
+                            dim: arena.dim(),
+                            query,
+                            k: k_eff,
+                        })
+                        .map_err(map_kernel_error)?
+                } else {
+                    provider
+                        .search_cosine(crate::kernel::CosineSearchInput {
+                            ids: &slot_ids,
+                            vectors: arena.vectors(),
+                            row_norms_sq: None,
+                            dim: arena.dim(),
+                            query,
+                            k: k_eff,
+                        })
+                        .map_err(map_kernel_error)?
+                };
+                if !core::distance_result_is_valid(&raw, k_eff, &visible_id_counts) {
+                    return Err(SqlSurfaceError::Internal {
+                        detail: "search provider returned a result violating the top-k contract"
+                            .to_string(),
+                    });
+                }
+                raw.into_iter().map(|h| (h.id, h.distance)).collect()
             }
             Ranking::Distance { query } => {
                 // Issue #408・#409: `hnsw_cache`（`None` の場合は `execute_statement`
@@ -2502,7 +2691,16 @@ pub(crate) fn execute_statement_with_cache(
                             .to_string(),
                     });
                 }
-                raw.into_iter().map(|h| (h.id, h.score as f64)).collect()
+                match bound.distance_kind {
+                    // HNSW（内積グラフ）の候補を厳密なコサイン距離で再採点・再整列する
+                    // （`rescore_cosine` 参照）。
+                    crate::sql::lexer::DistanceKind::Cosine => rescore_cosine(arena, &raw, query)?,
+                    // `<#>`: 内積スコアの符号を反転した距離値（昇順）。順位は内積降順のまま。
+                    _ => raw
+                        .into_iter()
+                        .map(|h| (h.id, -(f64::from(h.score))))
+                        .collect(),
+                }
             }
             Ranking::Hybrid {
                 query,
@@ -2571,9 +2769,13 @@ pub(crate) fn execute_statement_with_cache(
                 // 索引経路が適用条件を満たさない・`hnsw_cache` が `None`（
                 // `SearchEngineKind::Hnsw` opt-in 構築時以外）のいずれの場合も
                 // `provider`（従来どおり全件 brute-force）へフォールバックする。
+                // Issue #1991: HNSW を使わない密側は `<=>` の意味（コサイン）で順位付けする。
+                // `HnswDenseProvider`（内積グラフ）は従来の内積順のまま残る（HNSW のコサイン正確化は
+                // #1998。非対称は `docs/design/cosine-operator-migration.md` に記録）。
+                let cosine_dense = CosineDenseAdapter { inner: provider };
                 let dense_provider: &dyn SearchProvider = match &hnsw_dense_provider {
                     Some(adapter) => adapter,
-                    None => provider,
+                    None => &cosine_dense,
                 };
                 // Issue #357: キャッシュヒット済みの索引があればそれをそのまま使う。
                 // ミスの場合のみ `sparse_docs`（このクエリのスナップショットから
@@ -6275,9 +6477,10 @@ pub(crate) fn map_batch_incremental_error(
 mod tests {
     use super::*;
 
-    /// Issue #1977: 非 Cosine の距離種別は実行入口の関門が `0A000` の固定文言で止め、Cosine は通す。
+    /// Issue #1977・#1991: 未接続の距離種別（L2／L1）は実行入口の関門が `0A000` の固定文言で止め、
+    /// 接続済みの Cosine（`<=>`）と NegativeInnerProduct（`<#>`）は通す。
     #[test]
-    fn non_cosine_distance_kind_is_rejected_at_execution_entry() {
+    fn unconnected_distance_kind_is_rejected_at_execution_entry() {
         use crate::sql::lexer::DistanceKind;
         let bound = BoundStatement::new(
             "documents".to_string(),
@@ -6291,17 +6494,142 @@ mod tests {
             crate::sql::plan::EvaluationOrder::DEFAULT,
         );
         assert!(ensure_distance_kind_executable(&bound).is_ok());
-        for kind in [
-            DistanceKind::L2,
-            DistanceKind::NegativeInnerProduct,
-            DistanceKind::L1,
-        ] {
+        assert!(ensure_distance_kind_executable(
+            &bound
+                .clone()
+                .with_distance_kind(DistanceKind::NegativeInnerProduct)
+        )
+        .is_ok());
+        for kind in [DistanceKind::L2, DistanceKind::L1] {
             let err = ensure_distance_kind_executable(&bound.clone().with_distance_kind(kind))
                 .expect_err("must be rejected");
             assert_eq!(err.wire_code(), "0A000");
             assert!(err.to_string().contains(kind.operator()), "{err}");
             assert!(!err.to_string().contains("documents"), "{err}");
         }
+    }
+
+    fn dh(id: u64, distance: f64) -> crate::kernel::DistanceHit {
+        crate::kernel::DistanceHit { id, distance }
+    }
+
+    /// Issue #1991: コサイン距離経路の契約検証は、順序違反・NaN が途中にある並び・不可視 id・
+    /// 件数超過・同一行の重複返却を拒否し、正常な並び（NaN が末尾）を受理する。
+    #[test]
+    fn distance_result_is_valid_enforces_contract() {
+        let counts = core::visible_id_counts(&[0, 1, 2, 3]);
+        let ok = [dh(1, 0.1), dh(0, 0.5), dh(2, 0.5), dh(3, f64::NAN)];
+        assert!(core::distance_result_is_valid(&ok, 4, &counts));
+        // 件数超過
+        assert!(!core::distance_result_is_valid(&ok, 3, &counts));
+        // 距離の順序違反
+        assert!(!core::distance_result_is_valid(
+            &[dh(1, 0.5), dh(0, 0.1)],
+            4,
+            &counts
+        ));
+        // 同点の識別子順違反
+        assert!(!core::distance_result_is_valid(
+            &[dh(2, 0.5), dh(0, 0.5)],
+            4,
+            &counts
+        ));
+        // NaN が途中にある
+        assert!(!core::distance_result_is_valid(
+            &[dh(0, f64::NAN), dh(1, 0.2)],
+            4,
+            &counts
+        ));
+        // 不可視 id
+        assert!(!core::distance_result_is_valid(&[dh(9, 0.1)], 4, &counts));
+        // 同一行の重複返却
+        assert!(!core::distance_result_is_valid(
+            &[dh(1, 0.1), dh(1, 0.1)],
+            4,
+            &counts
+        ));
+    }
+
+    struct CosineOnly(Vec<crate::kernel::DistanceHit>);
+    impl SearchProvider for CosineOnly {
+        fn search(
+            &self,
+            _input: SearchInput<'_>,
+        ) -> Result<Vec<crate::kernel::CandidateHit>, KernelError> {
+            Err(KernelError::NonFiniteQuery)
+        }
+        fn search_cosine(
+            &self,
+            _input: crate::kernel::CosineSearchInput<'_>,
+        ) -> Result<Vec<crate::kernel::DistanceHit>, KernelError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    /// Issue #1991: HYBRID 密側アダプタは NaN 行を除き、`1 - d` のスコア降順・同点は id 昇順で返す。
+    #[test]
+    fn cosine_dense_adapter_returns_finite_hits_in_score_order() {
+        let inner = CosineOnly(vec![
+            dh(4, 0.0),
+            dh(2, 0.5),
+            dh(7, 0.5),
+            dh(1, 1.5),
+            dh(9, f64::NAN),
+        ]);
+        let adapter = CosineDenseAdapter { inner: &inner };
+        let ids = [0_u64];
+        let hits = adapter
+            .search(SearchInput {
+                ids: &ids,
+                vectors: &[0.0],
+                dim: 1,
+                query: &[1.0],
+                k: 5,
+            })
+            .expect("adapter search");
+        assert_eq!(
+            hits.iter().map(|h| h.id).collect::<Vec<_>>(),
+            vec![4, 2, 7, 1]
+        );
+        assert_eq!(hits[0].score, 1.0);
+        assert_eq!(hits[3].score, -0.5);
+    }
+
+    /// Issue #1991: `SearchProvider` の既定 `search_cosine`／`search_cosine_subset` は参照カーネル
+    /// （`cosine_top_k`）と一致する。
+    #[test]
+    fn default_search_cosine_methods_match_reference_kernel() {
+        let provider = crate::kernel::CpuScalarProvider;
+        let vectors = [10.0_f32, 10.0, 1.0, 0.0, 0.0, 5.0, 0.0, 0.0];
+        let ids = [0_u64, 1, 2, 3];
+        let query = [1.0_f32, 0.0];
+        let got = provider
+            .search_cosine(crate::kernel::CosineSearchInput {
+                ids: &ids,
+                vectors: &vectors,
+                row_norms_sq: None,
+                dim: 2,
+                query: &query,
+                k: 4,
+            })
+            .expect("search_cosine");
+        // 行 1（[1,0]）が距離 0、行 0（[10,10]）が 1 - 1/√2、行 2（[0,5]）が 1、行 3（ゼロ）が NaN。
+        assert_eq!(
+            got.iter().map(|h| h.id).collect::<Vec<_>>(),
+            vec![1, 0, 2, 3]
+        );
+        assert!(got[3].distance.is_nan());
+        let slots = [1_u32, 2, 3];
+        let sub = provider
+            .search_cosine_subset(crate::kernel::SubsetSearchInput {
+                slots: &slots,
+                vectors: &vectors,
+                dim: 2,
+                query: &query,
+                k: 2,
+            })
+            .expect("search_cosine_subset");
+        assert_eq!(sub.iter().map(|h| h.id).collect::<Vec<_>>(), vec![1, 2]);
     }
 
     /// Issue #1953（SQL-71）: `57014` は `expr_eval_error_to_arena` ↔ `map_arena_error` の往復で

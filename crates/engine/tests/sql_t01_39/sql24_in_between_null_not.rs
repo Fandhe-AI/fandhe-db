@@ -467,12 +467,13 @@ fn distance_first_or_group_expr_branch_error_on_non_topk_row_does_not_fail_query
         )
         .expect("insert should succeed");
     };
-    // クエリベクトル `[0.1,0.2]` との内積が僅かに異なる行（Top-k に入る）。
-    // 内積: id1=0.05・id2=0.051・id3=0.052（降順ランキングで id3, id2 が上位）。
+    // クエリベクトル `[0.1,0.2]` とのコサイン距離が僅かに異なる行（Top-k に入る）。
+    // `<=>` はコサイン距離（Issue #1991）なので、id1 は同方向（距離 0）、id2・id3 は
+    // 向きがわずかにずれる（距離は id1 < id2 < id3 の順。昇順ランキングで id1, id2 が上位）。
     insert(1, "[0.1,0.2]");
     insert(2, "[0.11,0.2]");
     insert(3, "[0.12,0.2]");
-    // クエリベクトルとの内積が明確に小さい（負の）「危険な」行。`1 / (id - 4)` は
+    // クエリベクトルとのコサイン距離が明確に大きい（逆向き）「危険な」行。`1 / (id - 4)` は
     // id=4 でゼロ除算になるが、DISTANCE ランキングでは最下位
     // （`LIMIT 2` の Top-k 外）になる。
     insert(4, "[-10.0,-10.0]");
@@ -497,7 +498,7 @@ fn distance_first_or_group_expr_branch_error_on_non_topk_row_does_not_fail_query
         .collect::<Vec<_>>());
     assert_eq!(
         result_ids,
-        vec![2, 3],
+        vec![1, 2],
         "expected exactly the 2 highest-ranked rows (LIMIT 2, no under-fetch expected \
          here); id=4 (the division-by-zero row) must not appear"
     );

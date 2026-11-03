@@ -134,6 +134,15 @@ pub trait SearchProvider: Send + Sync {
             k: input.k,
         })
     }
+    fn search_cosine(&self, input: CosineSearchInput<'_>) -> Result<Vec<DistanceHit>, KernelError> {
+        cosine_top_k(input)
+    }
+    fn search_cosine_subset(
+        &self,
+        input: SubsetSearchInput<'_>,
+    ) -> Result<Vec<DistanceHit>, KernelError> {
+        cosine_top_k_slots(input)
+    }
 }
 
 # source: crates/engine/src/core.rs :: CoreError

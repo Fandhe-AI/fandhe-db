@@ -42,11 +42,11 @@ fn schema() -> TableSchema {
     )
 }
 
-/// 決定的な通常行ベクトル（成分は `[0.25, 1.0]`。plan で確認済みの毒行注入前提を
+/// 決定的な通常行ベクトル（正規化前の成分は `[0.25, 1.0]`。plan で確認済みの毒行注入前提を
 /// 満たす: 通常行どうしの内積でもオーバーフローしない範囲）。
 fn normal_vector(seed: u64) -> Vec<f32> {
     let mut state = seed.max(1);
-    (0..DIM)
+    let raw: Vec<f32> = (0..DIM)
         .map(|_| {
             state ^= state << 13;
             state ^= state >> 7;
@@ -54,7 +54,11 @@ fn normal_vector(seed: u64) -> Vec<f32> {
             let bits = (state >> 40) as u32;
             0.25 + (bits as f32 / (1u32 << 24) as f32) * 0.75
         })
-        .collect()
+        .collect();
+    // L2 正規化する。`<=>` はコサイン距離（Issue #1991）で、HNSW のグラフは内積のため、縮退時の
+    // brute-force 結果と既定エンジンの結果が一致するには正規化済み入力が契約（D5）。
+    let norm = raw.iter().map(|x| x * x).sum::<f32>().sqrt();
+    raw.into_iter().map(|x| x / norm).collect()
 }
 
 fn poison_vector() -> Vec<f32> {

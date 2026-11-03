@@ -81,6 +81,25 @@ pub(crate) fn cmp_far_first_then_tie(
     }
 }
 
+/// 「距離の降順（`DESC`・遠い順）→ 同点は順序キー昇順」の全順序（Issue #1991・SQL-33 (2)(3)）。
+///
+/// [`cmp_distance_asc_then_tie`] の距離部だけを反転した並びで、NaN（ゼロノルム等）は全数値より
+/// 遠いものとして先頭に置き、NaN 同士と同点は順序キー昇順にする。コサイン距離の厳密全走査
+/// （`sql::exec::exact_full_scan` の `DESC`）が使う。
+pub(crate) fn cmp_distance_desc_then_tie(
+    a_dist: f64,
+    a_tie: TieKey,
+    b_dist: f64,
+    b_tie: TieKey,
+) -> Ordering {
+    match (a_dist.is_nan(), b_dist.is_nan()) {
+        (true, true) => a_tie.cmp(&b_tie),
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+        (false, false) => b_dist.total_cmp(&a_dist).then(a_tie.cmp(&b_tie)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,6 +196,37 @@ mod tests {
         );
         assert_eq!(
             cmp_far_first_then_tie(f32::NAN, k1, f32::NAN, k2),
+            Ordering::Less
+        );
+    }
+
+    #[test]
+    fn distance_desc_puts_nan_first_and_reverses_numbers() {
+        let k1 = tie_key_for_response_id(1);
+        let k2 = tie_key_for_response_id(2);
+        // 大きい距離（遠い）が先。
+        assert_eq!(cmp_distance_desc_then_tie(0.9, k2, 0.1, k1), Ordering::Less);
+        // 同点は順序キー昇順。
+        assert_eq!(cmp_distance_desc_then_tie(0.5, k1, 0.5, k2), Ordering::Less);
+        // NaN は符号に依らず先頭、NaN 同士は順序キー昇順。
+        let neg_nan = f64::from_bits(0xFFF8_0000_0000_0000);
+        for nan in [f64::NAN, neg_nan] {
+            assert_eq!(
+                cmp_distance_desc_then_tie(nan, k2, f64::INFINITY, k1),
+                Ordering::Less
+            );
+            assert_eq!(
+                cmp_distance_desc_then_tie(f64::NEG_INFINITY, k1, nan, k2),
+                Ordering::Greater
+            );
+        }
+        assert_eq!(
+            cmp_distance_desc_then_tie(f64::NAN, k1, neg_nan, k2),
+            Ordering::Less
+        );
+        // 距離部は昇順の厳密な逆（-0.0 は +0.0 より近い側＝DESC では後ろ）。
+        assert_eq!(
+            cmp_distance_desc_then_tie(0.0, k2, -0.0, k1),
             Ordering::Less
         );
     }

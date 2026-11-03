@@ -11,7 +11,9 @@
 //!
 //! コサイン距離の brute-force 経路（Issue #1987）は子モジュール `cosine` にあり、
 //! 内積経路とは規約が異なる（距離は昇順・f64、同点は id 昇順）。内積の
-//! [`SearchProvider`] は変更せず、`<=>` の実行切り替えは #1991 で行う。
+//! [`SearchProvider::search`]／`search_subset` は変更せず（`<#>` の実行と Rust API の内積検索が使う）、
+//! `<=>` の実行は既定実装付きの [`SearchProvider::search_cosine`]／`search_cosine_subset` 経由で
+//! このカーネルへ切り替わった（Issue #1991）。
 //!
 //! L2 距離の brute-force 経路（Issue #1981）は [`search_l2`]。二乗距離のまま昇順選出し、
 //! 平方根は最終出力用の [`l2_distance_from_sq`] だけで取る。SQL 接続は別 Issue。
@@ -27,9 +29,10 @@ use crate::search_order;
 
 mod cosine;
 pub use cosine::{
-    cosine_distance, cosine_distance_from_parts, cosine_top_k, row_norms_sq, CosineSearchInput,
-    DistanceHit,
+    cosine_distance, cosine_distance_from_parts, cosine_top_k, cosine_top_k_slots, row_norms_sq,
+    CosineSearchInput, DistanceHit,
 };
+pub(crate) use cosine::{select_farthest_distance_k, AscDistanceTopK};
 
 /// **候補**検索結果 1 件（候補識別子とスコア）。[`SearchProvider`] の戻り値型。
 ///
@@ -254,6 +257,29 @@ pub trait SearchProvider: Send + Sync {
             query: input.query,
             k: input.k,
         })
+    }
+
+    /// コサイン距離（`<=>`。`1 - cos`）の総当たり Top-k（Issue #1991・SQL-33 (1)(3)）。
+    ///
+    /// 契約: 距離昇順、同点は候補識別子（`input.ids`）の昇順、ゼロノルム等の NaN 行は末尾に置き
+    /// `k` の枠を消費する。返す件数は `k` 以下で、`id` は `input.ids` の値をそのまま返す。
+    /// 入力は呼び出し元が可視行だけへ絞り込み済みであること（テナント境界は呼び出し元で完結する）。
+    /// 既定実装は [`cosine_top_k`]（単一スレッド・ノルム²をその場で計算する C1）。内積用
+    /// [`Self::search`] とは別メソッドなので、既存のカスタム provider は無変更で動き、`<=>` は
+    /// 参照カーネルで評価される。差し替えたい実装はこのメソッドを上書きする。
+    fn search_cosine(&self, input: CosineSearchInput<'_>) -> Result<Vec<DistanceHit>, KernelError> {
+        cosine_top_k(input)
+    }
+
+    /// [`Self::search_cosine`] のスロット指定版（スカラー索引の候補マスク経路。Issue #654 の
+    /// `search_subset` と同型）。行列全体を借用したまま `input.slots` の行だけを走査し、返る
+    /// [`DistanceHit::id`] は `slots[i] as u64`（呼び出し元がスロット番号として解釈する）。
+    /// 既定実装は [`cosine_top_k_slots`]。
+    fn search_cosine_subset(
+        &self,
+        input: SubsetSearchInput<'_>,
+    ) -> Result<Vec<DistanceHit>, KernelError> {
+        cosine_top_k_slots(input)
     }
 }
 

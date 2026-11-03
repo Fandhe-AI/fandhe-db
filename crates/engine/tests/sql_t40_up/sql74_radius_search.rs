@@ -287,7 +287,8 @@ fn brute_force_matches_reference() {
 }
 
 /// kNN と併用した `ORDER BY ... LIMIT k [OFFSET m]` は、参照実装の「距離で絞り込み → 内積の降順
-/// （同点は id 昇順）で上位」と順序まで一致する。
+/// （同点は id 昇順）で上位」と順序まで一致する。順位付けは `<#>`（負の内積の昇順＝内積の降順。
+/// Issue #1991 で接続。`<=>` はコサイン距離に変わったため、内積の参照実装とは `<#>` で照合する）。
 #[test]
 fn knn_with_distance_filter_matches_reference() {
     let rows = 200;
@@ -315,7 +316,7 @@ fn knn_with_distance_filter_matches_reference() {
     let sql = |lim: usize, off: usize| {
         format!(
             "SELECT id FROM d WHERE embedding <-> '{qlit}' < {r:e} \
-             ORDER BY embedding <=> '{qlit}' LIMIT {lim} OFFSET {off}"
+             ORDER BY embedding <#> '{qlit}' LIMIT {lim} OFFSET {off}"
         )
     };
     assert_eq!(ids_ordered(&core, &mut s, &sql(10, 0)), want[..10].to_vec());
@@ -360,16 +361,17 @@ fn no_limit_is_exact_and_order_by_without_limit_is_accepted() {
     );
     assert_eq!(got, want);
     // LIMIT 省略の ORDER BY は受理され、半径内の全行が距離昇順で返る（厳密全走査）。
+    // 順位付けは `<#>`（負の内積の昇順＝内積の降順。Issue #1991 で接続）。
     let ordered = ids_ordered(
         &core,
         &mut s,
         "SELECT id FROM d WHERE embedding <+> '[1,-0.5,0.25,2]' <= 6 \
-         ORDER BY embedding <=> '[1,-0.5,0.25,2]'",
+         ORDER BY embedding <#> '[1,-0.5,0.25,2]'",
     );
     let mut sorted_ids = ordered.clone();
     sorted_ids.sort_unstable();
     assert_eq!(sorted_ids, want);
-    // 順序は既存の kNN と同じ内積の降順（同点は id 昇順）。
+    // 順序は内積の降順（同点は id 昇順）。
     let dots: Vec<f32> = ordered
         .iter()
         .map(|i| {

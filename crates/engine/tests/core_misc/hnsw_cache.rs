@@ -1753,6 +1753,10 @@ fn i8_scale_underflow_dimension_falls_back_to_f32_residency_without_leaking_or_l
     // 唯一の到達経路）。
     for v in a_vectors.iter_mut() {
         v[0] = 1e-44;
+        // 次元 0 を潰すとノルムが 1 未満になる。HNSW のグラフは内積で、`<=>`（コサイン距離。
+        // Issue #1991）の対照と一致させるには L2 正規化済みの入力が契約なので、正規化し直す
+        // （縮小は 1 以下の除算なので次元 0 は subnormal のままスケール 0.0 へアンダーフローする）。
+        normalize(v);
     }
     seed_rows(&storage, "tenant-a", 1, &a_vectors, "i8-fallback-a");
     // tenant-b の private 行（不可視）。可視外混入がないことの検証対象。

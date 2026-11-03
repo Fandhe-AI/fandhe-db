@@ -3,9 +3,9 @@
 //!
 //! 責務境界: 正規化していない入力でも `1 - cos` を返す距離計算と、距離昇順の総当たり
 //! Top-k を提供する。内積経路（`kernel.rs::CpuScalarProvider`、スコア降順・f32）とは
-//! 別系統で、距離は昇順・f64 で扱う。`<=>` の実行切り替えは #1991、HNSW／GPU の
-//! metric 対応は #1996〜#2005 の担当で、本モジュールは現時点で SQL 経路から呼ばれない
-//! （#1991 が呼び出し元になる）。
+//! 別系統で、距離は昇順・f64 で扱う。`<=>` の実行は #1991 でこのカーネルへ切り替わり、
+//! `SearchProvider::search_cosine`／`search_cosine_subset` の既定実装経由で `sql::exec` の
+//! DISTANCE 段が呼ぶ。HNSW／GPU の metric 対応は #1996〜#2005 の担当。
 //!
 //! 計算式は [`cosine_distance_from_parts`] に一本化する。内積と各ノルム² は
 //! `kernel::dot`（ISA 別 SIMD）で f32 累積し、除算以降を f64 で行う。行ノルム²は
@@ -20,7 +20,7 @@
 
 use std::collections::{BinaryHeap, TryReserveError};
 
-use super::{dot, dot_block4, KernelError};
+use super::{dot, dot_block4, KernelError, SubsetSearchInput};
 use crate::search_order::{self, TieKey};
 
 /// 距離付きの検索結果 1 件。`id` は [`CosineSearchInput::ids`] の値がそのまま返る。
@@ -230,6 +230,115 @@ pub fn cosine_top_k(input: CosineSearchInput<'_>) -> Result<Vec<DistanceHit>, Ke
         base += ids4.len();
     }
     Ok(selector.into_sorted_vec())
+}
+
+/// 行列全体を借用したまま `input.slots` の行だけを候補にするコサイン距離 Top-k（Issue #1991。
+/// マスク経路〔スカラー索引の候補削減〕用）。返る [`DistanceHit::id`] は `slots[i] as u64`。
+///
+/// 行ごとの距離は [`cosine_top_k`] と同じ式（[`cosine_distance_from_parts`]）・同じ `dot` で
+/// 求める。`dot_block4` は 1 行版の `dot` とビット同一の契約なので、同じ行集合を
+/// [`cosine_top_k`] に渡した結果とビット一致する。範囲外の行は skip する（検証順も同じ）。
+pub fn cosine_top_k_slots(input: SubsetSearchInput<'_>) -> Result<Vec<DistanceHit>, KernelError> {
+    let dim = input.dim as usize;
+    if input.query.len() != dim {
+        return Err(KernelError::DimMismatch {
+            expected: input.dim,
+            found: input.query.len(),
+        });
+    }
+    if input.query.iter().any(|v| !v.is_finite()) {
+        return Err(KernelError::NonFiniteQuery);
+    }
+    if input.k == 0 || input.slots.is_empty() {
+        return Ok(Vec::new());
+    }
+    let q_norm_sq = dot(input.query, input.query);
+    let mut selector = AscDistanceTopK::new(input.k);
+    for &slot in input.slots {
+        let Some(start) = (slot as usize).checked_mul(dim) else {
+            continue;
+        };
+        let Some(v) = start
+            .checked_add(dim)
+            .and_then(|end| input.vectors.get(start..end))
+        else {
+            continue;
+        };
+        let d = cosine_distance_from_parts(dot(v, input.query), dot(v, v), q_norm_sq);
+        selector.push(DistanceHit {
+            id: u64::from(slot),
+            distance: d,
+        });
+    }
+    Ok(selector.into_sorted_vec())
+}
+
+/// 最大ヒープ用の要素（遠い順の選出で、距離が小さいほど「劣る」＝ヒープ頂点）。
+struct FarHeapItem(DistanceHit);
+impl FarHeapItem {
+    fn tie(&self) -> TieKey {
+        search_order::tie_key_for_response_id(self.0.id)
+    }
+}
+impl PartialEq for FarHeapItem {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+impl Eq for FarHeapItem {}
+impl PartialOrd for FarHeapItem {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for FarHeapItem {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        search_order::cmp_distance_desc_then_tie(
+            self.0.distance,
+            self.tie(),
+            other.0.distance,
+            other.tie(),
+        )
+    }
+}
+
+/// 距離の降順（遠い順・`ORDER BY <=> DESC`。Issue #1991・SQL-33 (2)(3)）の Top-k 選出。
+///
+/// NaN（ゼロノルム）は最も遠いものとして先頭に置き、`k` の枠を消費する。同点は順序キー昇順。
+/// 最大ヒープで `O(n log k)`・保持は高々 `k` 件。事前確保は `k` に依存させない
+/// （[`AscDistanceTopK`] と同じ理由）。NaN は ISA 依存の符号を持ち込まないよう正規の NaN へ揃える。
+pub(crate) fn select_farthest_distance_k(
+    candidates: impl Iterator<Item = DistanceHit>,
+    k: usize,
+) -> Vec<DistanceHit> {
+    if k == 0 {
+        return Vec::new();
+    }
+    let mut heap: BinaryHeap<FarHeapItem> = BinaryHeap::new();
+    for mut hit in candidates {
+        if hit.distance.is_nan() {
+            hit.distance = f64::NAN;
+        }
+        let item = FarHeapItem(hit);
+        if heap.len() < k {
+            heap.push(item);
+        } else if let Some(worst) = heap.peek() {
+            if item < *worst {
+                heap.pop();
+                heap.push(item);
+            }
+        }
+    }
+    let mut out: Vec<DistanceHit> = heap.into_iter().map(|i| i.0).collect();
+    out.sort_by(|a, b| {
+        search_order::cmp_distance_desc_then_tie(
+            a.distance,
+            search_order::tie_key_for_response_id(a.id),
+            b.distance,
+            search_order::tie_key_for_response_id(b.id),
+        )
+    });
+    out
 }
 
 #[cfg(test)]
@@ -462,5 +571,81 @@ mod tests {
                 assert_eq!(a.distance.to_bits(), b.distance.to_bits());
             }
         }
+    }
+
+    #[test]
+    fn slots_variant_matches_gathered_cosine_top_k_bitwise() {
+        let dim = 3_u32;
+        let vectors: Vec<f32> = (0..7 * 3).map(|i| ((i * 7 % 11) as f32) - 4.0).collect();
+        let slots = [0_u32, 2, 3, 5, 6, 99];
+        let query = [0.5_f32, -1.0, 2.0];
+        let got = cosine_top_k_slots(SubsetSearchInput {
+            slots: &slots,
+            vectors: &vectors,
+            dim,
+            query: &query,
+            k: 4,
+        })
+        .unwrap();
+        let mut gathered = Vec::new();
+        let mut ids = Vec::new();
+        for &s in &slots[..5] {
+            gathered.extend_from_slice(&vectors[s as usize * 3..s as usize * 3 + 3]);
+            ids.push(u64::from(s));
+        }
+        let want = cosine_top_k(input(&ids, &gathered, dim, &query, 4)).unwrap();
+        assert_eq!(got.len(), want.len());
+        for (g, w) in got.iter().zip(&want) {
+            assert_eq!(g.id, w.id);
+            assert_eq!(g.distance.to_bits(), w.distance.to_bits());
+        }
+        // 検証順: 次元不一致・非有限クエリ・k=0。
+        let bad = SubsetSearchInput {
+            slots: &slots,
+            vectors: &vectors,
+            dim,
+            query: &[1.0],
+            k: 1,
+        };
+        assert!(matches!(
+            cosine_top_k_slots(bad),
+            Err(KernelError::DimMismatch { .. })
+        ));
+        let nf = SubsetSearchInput {
+            slots: &slots,
+            vectors: &vectors,
+            dim,
+            query: &[1.0, f32::NAN, 0.0],
+            k: 1,
+        };
+        assert!(matches!(
+            cosine_top_k_slots(nf),
+            Err(KernelError::NonFiniteQuery)
+        ));
+        let zero_k = SubsetSearchInput {
+            slots: &slots,
+            vectors: &vectors,
+            dim,
+            query: &query,
+            k: 0,
+        };
+        assert!(cosine_top_k_slots(zero_k).unwrap().is_empty());
+    }
+
+    #[test]
+    fn farthest_selector_puts_nan_first_with_tie_ascending() {
+        let hits = [(5, 0.5), (3, 0.5), (9, 0.1), (1, f64::NAN), (2, 0.9)]
+            .map(|(id, distance)| DistanceHit { id, distance });
+        let out = select_farthest_distance_k(hits.into_iter(), 4);
+        assert_eq!(
+            out.iter().map(|h| h.id).collect::<Vec<_>>(),
+            vec![1, 2, 3, 5]
+        );
+        assert!(select_farthest_distance_k(hits.into_iter(), 0).is_empty());
+        let all = select_farthest_distance_k(hits.into_iter(), 10);
+        assert_eq!(
+            all.iter().map(|h| h.id).collect::<Vec<_>>(),
+            vec![1, 2, 3, 5, 9]
+        );
     }
 }
