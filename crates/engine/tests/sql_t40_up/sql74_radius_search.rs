@@ -76,13 +76,6 @@ fn ids_ordered(core: &EngineCore, session: &mut SessionState, sql: &str) -> Vec<
     }
 }
 
-fn code(core: &EngineCore, session: &mut SessionState, sql: &str) -> String {
-    match core.execute_sql_in_session(&ctx(), session, sql) {
-        Ok(_) => "ok".to_string(),
-        Err(e) => e.wire_code().to_string(),
-    }
-}
-
 /// 境界テスト用の小さな表（値はすべて f32 で厳密）。
 fn boundary_table(label: &str) -> (EngineCore, SessionState, CleanupGuard) {
     let (core, mut session, g) = setup(
