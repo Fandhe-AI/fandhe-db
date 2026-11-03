@@ -768,23 +768,23 @@ fn bound_and_sql_paths_share_error_classification_for_same_invalid_input() {
     let core = open_engine_core(&path);
     let ctx_a = ctx_public("tenant-a");
 
-    // VECTOR 列への直接集計は `42883`（undefined_function。Issue #1349）で拒否される
+    // VECTOR 列への MIN 集計は `42883`（undefined_function。Issue #1349）で拒否される
     // （`tests/sql_aggregate.rs` の既存契約と同一）。
-    let sql_vector_sum = "SELECT SUM(embedding) FROM docs";
+    let sql_vector_min = "SELECT MIN(embedding) FROM docs";
     let mut session = SessionState::default();
     let sql_err = core
-        .execute_sql_in_session(&ctx_a, &mut session, sql_vector_sum)
-        .expect_err("SUM(embedding) should be rejected on the SQL path");
+        .execute_sql_in_session(&ctx_a, &mut session, sql_vector_min)
+        .expect_err("MIN(embedding) should be rejected on the SQL path");
     let bound_session = SessionState::default();
     let bound_err = core
         .execute_bound_aggregate_in_session(&ctx_a, &bound_session, TABLE, |schema, udfs| {
-            let validated = validate_sql(sql_vector_sum, &FixedTableLookup)?;
+            let validated = validate_sql(sql_vector_min, &FixedTableLookup)?;
             let Statement::Aggregate(validated_aggregate) = validated else {
                 panic!("expected Statement::Aggregate");
             };
             bind_aggregate(&validated_aggregate, schema, udfs)
         })
-        .expect_err("SUM(embedding) should be rejected on the bound path");
+        .expect_err("MIN(embedding) should be rejected on the bound path");
     // 両経路の `wire_code` が一致するだけでなく、その一致先が実際に契約どおりの
     // `42883`（undefined_function）であることを固定オラクルとして検査する。一致検査
     // のみでは両経路が「同じ間違ったコード」で一致する vacuous pass を防げない
@@ -794,7 +794,7 @@ fn bound_and_sql_paths_share_error_classification_for_same_invalid_input() {
     assert_eq!(
         sql_err.wire_code(),
         bound_err.wire_code(),
-        "SUM(embedding) wire_code mismatch: sql={sql_err:?} bound={bound_err:?}"
+        "MIN(embedding) wire_code mismatch: sql={sql_err:?} bound={bound_err:?}"
     );
 
     // `GROUP BY` キー列を HAVING で直接比較する形は `22000`（invalid input）

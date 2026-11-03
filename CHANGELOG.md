@@ -13,6 +13,7 @@
 
 ### Added
 
+- `sum(<VECTOR 列>)` と VECTOR 型の式（`sum(vec_div(embedding, 2))` 等）の `sum` を受け付けるようにした（Issue #2038・SQL-72 (3) ポインタ）。要素ごとに f64 で累積して f32 へ丸め、NULL 行は飛ばし、対象 0 行なら NULL、次元不一致は `22000`、f32 範囲超過は `22003`。`GROUP BY`・`FILTER`・他の集計への `HAVING` と併用できる。結果列は `vector`（wire の型 OID は 25）。挙動変更: `SUM(<VECTOR 列>)` は `42883` から受理に変わる。`MIN`／`MAX`／`AVG`、NoSQL、JOIN、FROM なしの SELECT、ウィンドウ（`0A000`）、集計結果の `HAVING`／`ORDER BY`／演算（`0A000`／`42601`）は従来どおり拒否。公開 API の変更はない。
 - kNN の `ORDER BY` と `$n` のベクトル位置が距離演算子 4 種（`<=>`／`<->`／`<#>`／`<+>`）を受け付けるようにした（Issue #1977・SQL-33・WIRE-12 ポインタ）。`ValidatedStatement::{distance_kind, with_distance_kind}` と `BoundStatement::distance_kind` を追加。`<->`／`<#>`／`<+>` は従来の `42601` から、構文・束縛を通って実行時 `0A000`（カーネル接続は後続 Issue）に変わる。`<=>` の挙動は不変。
 - `WHERE` 内の距離比較（`<VECTOR 列> <距離演算子> <ベクトルリテラル> <比較> <数値>`、`[NOT] BETWEEN`、`NOT`、逆向き）を評価するようにした（Issue #2036・SQL-74。#2035 の束縛までを受けた評価）。述語は RLS 後の可視行だけに適用し、厳密に評価した場合と一致する。ゼロノルムのコサイン距離は NaN で、比較は PG の float8 順序（NaN 同士は等しく最大）。`HINT ORDER` で DISTANCE を先にしても距離述語を含む文は事前フィルタに倒し、取りこぼしを防ぐ。詳細は `docs/design/radius-search.md`。
   BREAKING CHANGE: 公開 enum `BoundExpr` に `VectorDistance { kind, query }` を追加した（網羅的 `match` の下流は追随が必要）。従来 `0A000` だった距離比較は受理に変わる。

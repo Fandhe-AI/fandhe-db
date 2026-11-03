@@ -427,6 +427,17 @@ impl ReferencedColumns {
                     }
                 }
                 AggregateInput::VectorColumnPresence => needs_vector_presence = true,
+                // SQL-72 (3)・Issue #2038: 埋め込みの値が必要（dim 判定だけでは足りない）。
+                AggregateInput::VectorColumn { .. } => needs_embedding = true,
+                // 式は `ScalarExpr` と同じ導出（漏れると全クエリが `accumulator_bug` になる）。
+                AggregateInput::VectorExpr { source, .. } => {
+                    if udf_call::references_embedding(source) {
+                        needs_embedding = true;
+                    }
+                    if udf_call::mark_referenced_scalar_columns(source, &mut scalar_mask) {
+                        has_scalar_reference = true;
+                    }
+                }
                 // SQL-57: 値・区切り・内側 ORDER BY の参照列をすべて反映する（漏れると
                 // 列を縮小デコードした行で式が NULL と取り違えられる／内部エラーになる）。
                 AggregateInput::StringAgg(inp) => {
@@ -843,6 +854,11 @@ pub(crate) enum Accumulator {
     /// ため、累積は走査順（索引経路と全走査で異なりうる）による丸め差を避けて
     /// `f64` で行い、`finish` で `f32` へ丸める（範囲超過は `22003`）。
     RealSum(Option<f64>),
+    /// `SUM(<VECTOR>)`（SQL-72 (3)・Issue #2038）。要素ごとに `f64` で累積し、`finish` で
+    /// `f32` へ丸める（`RealSum` と同じ理由: 走査順による丸め差を避ける）。`None` は
+    /// 非 NULL 行が 0 件（結果 NULL）。最初の観測で次元ぶんを確保し、以降は長さ不一致を
+    /// `22000` とする。状態バイト数は [`Accumulator::text_len`] で予算に計上される。
+    VectorSum(Option<Vec<f64>>),
     FloatAvg {
         sum: Option<f64>,
         count: u64,
@@ -1113,6 +1129,9 @@ impl Accumulator {
             // `Cell::Float`）。
             (Sum, AggregateInput::RealColumn(_)) => Accumulator::RealSum(None),
             (Sum, AggregateInput::DoubleColumn(_)) => Accumulator::FloatSum(None),
+            (Sum, AggregateInput::VectorColumn { .. } | AggregateInput::VectorExpr { .. }) => {
+                Accumulator::VectorSum(None)
+            }
             (Avg, AggregateInput::RealColumn(_) | AggregateInput::DoubleColumn(_)) => {
                 Accumulator::FloatAvg {
                     sum: None,
@@ -1288,6 +1307,7 @@ impl Accumulator {
             AggregateRowValue::Int32(v) => self.observe_int(Some(i64::from(v))),
             AggregateRowValue::Int64(v) => self.observe_int(Some(v)),
             AggregateRowValue::Float(v) => self.observe_float(v),
+            AggregateRowValue::Vector(v) => self.observe_vector(v.as_ref()),
             AggregateRowValue::Numeric(v) => self.observe_numeric(Some(v)),
             AggregateRowValue::Date(v) => self.observe_date(Some(v)),
             AggregateRowValue::Timestamp(v) => self.observe_timestamp(Some(v)),
@@ -1319,6 +1339,8 @@ impl Accumulator {
             input,
             AggregateInput::AllVisible
                 | AggregateInput::VectorColumnPresence
+                | AggregateInput::VectorColumn { .. }
+                | AggregateInput::VectorExpr { .. }
                 | AggregateInput::ArrayColumn(_)
                 | AggregateInput::JsonColumn(_)
                 | AggregateInput::StringAgg(_)
@@ -1345,6 +1367,44 @@ impl Accumulator {
                     accumulator_bug("COUNT(DISTINCT) accumulated byte count overflowed")
                 })?;
             }
+        }
+        Ok(())
+    }
+
+    /// `VECTOR` 値 1 件を観測する（`SUM(<VECTOR>)` 専用。SQL-72 (3)・Issue #2038）。
+    /// 最初の観測で次元ぶんの `f64` を確保する（長さは格納済み次元＝`MAX_EMBEDDING_DIM` 以下に
+    /// 縛られ、確保失敗は panic にせず `54000`）。以降は長さ不一致を `22000`、要素和が
+    /// 非有限になれば `22003` で fail-closed に拒否する。エラー文言に値・行 id は含めない。
+    fn observe_vector(&mut self, v: &[f32]) -> Result<(), SqlSurfaceError> {
+        let Accumulator::VectorSum(state) = self else {
+            return Err(accumulator_bug(
+                "observe_vector on a non-VectorSum accumulator",
+            ));
+        };
+        let acc = match state {
+            Some(acc) => acc,
+            None => {
+                let mut fresh: Vec<f64> = Vec::new();
+                fresh.try_reserve_exact(v.len()).map_err(|_| {
+                    SqlSurfaceError::payload_too_large("SUM(VECTOR) state allocation failed")
+                })?;
+                fresh.resize(v.len(), 0.0);
+                state.insert(fresh)
+            }
+        };
+        if acc.len() != v.len() {
+            return Err(SqlSurfaceError::invalid_input(
+                "SUM(VECTOR) operands have different dimensions",
+            ));
+        }
+        for (a, x) in acc.iter_mut().zip(v.iter()) {
+            let next = *a + f64::from(*x);
+            if !next.is_finite() {
+                return Err(SqlSurfaceError::numeric_out_of_range(
+                    "SUM(VECTOR) overflowed to a non-finite value",
+                ));
+            }
+            *a = next;
         }
         Ok(())
     }
@@ -1910,6 +1970,11 @@ impl Accumulator {
             }
             Accumulator::StringAgg(state) => state.text_len(),
             Accumulator::ArrayAgg(state) => state.text_len(),
+            // `SUM(<VECTOR>)` の状態バイト数（次元 × 8）。最初の観測で一度だけ増える
+            // （SQL-72 (3)・Issue #2038。TEXT に限らない集計状態の予算計上に流用する）。
+            Accumulator::VectorSum(Some(acc)) => {
+                acc.len().saturating_mul(std::mem::size_of::<f64>())
+            }
             _ => 0,
         }
     }
@@ -1945,6 +2010,26 @@ impl Accumulator {
                         ));
                     }
                     Cell::Float(f64::from(narrowed))
+                }
+            },
+            // SQL-72 (3)・Issue #2038: 要素ごとに `f32` へ丸める。範囲超過は fail-closed。
+            Accumulator::VectorSum(s) => match s {
+                None => Cell::Null,
+                Some(sum) => {
+                    let mut out: Vec<f32> = Vec::new();
+                    out.try_reserve_exact(sum.len()).map_err(|_| {
+                        SqlSurfaceError::payload_too_large("SUM(VECTOR) result allocation failed")
+                    })?;
+                    for x in sum {
+                        let narrowed = x as f32;
+                        if !narrowed.is_finite() {
+                            return Err(SqlSurfaceError::numeric_out_of_range(
+                                "SUM(VECTOR) exceeds REAL range",
+                            ));
+                        }
+                        out.push(narrowed);
+                    }
+                    Cell::Vector(out)
                 }
             },
             Accumulator::FloatAvg { sum, count } => match sum {
@@ -2844,6 +2929,8 @@ pub(crate) fn aggregate_result_type(
         // `SUM(REAL)` は PostgreSQL と同じく real（`Accumulator::RealSum`）。
         (Sum | Min | Max, AggregateInput::RealColumn(_)) => ColumnType::Real,
         (Avg, AggregateInput::RealColumn(_)) => ColumnType::Double,
+        // SQL-72 (3)・Issue #2038: 列は次元つき vector、式は静的な次元が無いので `None`（text 公告）。
+        (Sum, AggregateInput::VectorColumn { dim }) => ColumnType::Vector(*dim),
         (Sum | Avg | Min | Max, AggregateInput::DoubleColumn(_)) => ColumnType::Double,
         (Sum | Avg | Min | Max, AggregateInput::ScalarExpr { .. }) => ColumnType::Double,
         (
@@ -4179,6 +4266,56 @@ mod tests {
         assert_eq!(acc.finish().unwrap_err().wire_code(), "22003");
 
         assert_eq!(Accumulator::RealSum(None).finish().unwrap(), Cell::Null);
+    }
+
+    /// Issue #2038・SQL-72 (3): `sum(<VECTOR>)` は要素ごとに `f64` で累積し、確定時に `f32` へ丸める。
+    /// `f32` 累積なら `16777216 + 1 + 1` は `16777216` に潰れるが、`f64` 累積では `16777218`。
+    #[test]
+    fn vector_sum_accumulates_in_f64_and_rounds_at_finish() {
+        let mut acc = Accumulator::VectorSum(None);
+        for v in [[16_777_216.0f32, 0.5], [1.0, 0.5], [1.0, 0.5]] {
+            acc.observe_vector(&v).unwrap();
+        }
+        assert_eq!(acc.text_len(), 2 * std::mem::size_of::<f64>());
+        // `clone().finish()` は元の状態を壊さない（ウィンドウのスナップショット用途と同じ契約）。
+        assert_eq!(
+            acc.clone().finish().unwrap(),
+            Cell::Vector(vec![16_777_218.0, 1.5])
+        );
+        acc.observe_vector(&[2.0, 1.0]).unwrap();
+        assert_eq!(acc.finish().unwrap(), Cell::Vector(vec![16_777_220.0, 2.5]));
+    }
+
+    #[test]
+    fn vector_sum_empty_is_null_and_text_len_is_zero() {
+        let acc = Accumulator::VectorSum(None);
+        assert_eq!(acc.text_len(), 0);
+        assert_eq!(acc.finish().unwrap(), Cell::Null);
+    }
+
+    /// 次元の異なる行が混ざると `22000`（SQL からは作れないため単体で固定する）。
+    #[test]
+    fn vector_sum_dimension_mismatch_is_22000() {
+        let mut acc = Accumulator::VectorSum(None);
+        acc.observe_vector(&[1.0, 2.0]).unwrap();
+        let err = acc.observe_vector(&[1.0, 2.0, 3.0]).unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    /// 丸めた要素が `f32` 範囲を超えれば `22003`（f64 では有限のため `finish` で検出する）。
+    #[test]
+    fn vector_sum_overflow_is_22003() {
+        let mut acc = Accumulator::VectorSum(None);
+        acc.observe_vector(&[3.0e38, 0.0]).unwrap();
+        acc.observe_vector(&[3.0e38, 0.0]).unwrap();
+        assert_eq!(acc.finish().unwrap_err().wire_code(), "22003");
+    }
+
+    /// `VectorSum` 以外へのベクトル観測は束縛層のバグとして fail-closed（`XX000`）。
+    #[test]
+    fn observe_vector_on_other_accumulators_is_an_internal_error() {
+        let mut acc = Accumulator::Count(0);
+        assert_eq!(acc.observe_vector(&[1.0]).unwrap_err().wire_code(), "XX000");
     }
 
     /// Issue #1803: 分散系の variant を足しても `Accumulator` は大きくならない（GROUP BY のグループごとに
