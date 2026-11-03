@@ -13,6 +13,8 @@
 
 ### Added
 
+- `WHERE` 内の距離比較（`<VECTOR 列> <距離演算子> <ベクトルリテラル> <比較> <数値>`、`[NOT] BETWEEN`、`NOT`、逆向き）を評価するようにした（Issue #2036・SQL-74。#2035 の束縛までを受けた評価）。述語は RLS 後の可視行だけに適用し、厳密に評価した場合と一致する。ゼロノルムのコサイン距離は NaN で、比較は PG の float8 順序（NaN 同士は等しく最大）。`HINT ORDER` で DISTANCE を先にしても距離述語を含む文は事前フィルタに倒し、取りこぼしを防ぐ。詳細は `docs/design/radius-search.md`。
+  BREAKING CHANGE: 公開 enum `BoundExpr` に `VectorDistance { kind, query }` を追加した（網羅的 `match` の下流は追随が必要）。従来 `0A000` だった距離比較は受理に変わる。
 - セッションの UDF 数の上限をカタログ由来（`catalog::function::MAX_FUNCTIONS`）とセッション限定（`MAX_SESSION_UDFS`）で分離した（Issue #2883・SQL-66 (5)）。カタログが満杯でも公開 API の `define_function*`・`register_wasm_udf*` が通り、セッション限定が満杯でも永続 `CREATE FUNCTION`・ロードが通る。各上限の超過は `54000`。`MAX_SESSION_UDFS` の値は 64 のままで、意味が「カタログ由来を除くセッション限定の合計」に変わる。`engine::sql::udf_call::MAX_REGISTRY_UDFS` を追加した。公開シグネチャの変更はない。
 - 明示トランザクションの書き込み後に作った `SAVEPOINT` への `ROLLBACK TO` と、一時表を使ったトランザクションの `ROLLBACK TO` を実装した（Issue #2879・SQL-69）。基底 savepoint への復元と内容差分の再適用で巻き戻す。差分を取れない場合（未知の型のテーブル・上限超過）は従来どおり固定文言の `0A000`。PL/pgSQL の `EXCEPTION` 節の内部 savepoint は従来のまま。
 - 文単位のデッドライン（`engine::interrupt::DeadlineScope`。Issue #1951）を、書き込み・COPY・分割実行 DML・ベクトル検索・GPU バッチの経路へ結線した（Issue #1953・SQL-71・SQL-32 ポインタ）。期限切れは `57014`（固定文言）で、autocommit は副作用ゼロ・明示 Tx は `25P02`（savepoint があれば `ROLLBACK TO` で復帰）・台帳にも残らない。分割実行は実行中のチャンクだけを破棄し、最初の commit 前は `57014`・後は `VD001`（原因 `57014`）で、同じ `operation_id` の再送で再開できる。書き込みロック（writer gate）の待機は文の期限で短縮され、期限が先に来たときは `55P03` ではなく `57014` を返す。期限が無効なら従来と挙動・性能は変わらない（導入口の wire 結線は #1954）。
