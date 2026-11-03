@@ -262,6 +262,8 @@ fn check_intermediate_precision(expr: &Expr, numeric: bool) -> Result<(), SqlSur
             } else {
                 EXACT_LEAF_MAX
             };
+            // 2^63 の葉は `0 - 2^63`（i64::MIN の脱糖形）の右辺でだけ許す（下の Binary 腕）。
+            // 単独・他の演算の位置で残る 2^63 は bigint の切り捨てを招くため `22003`。
             if n.bytes().all(|b| b.is_ascii_digit())
                 && n.parse::<u128>().map_or(true, |v| v > limit)
             {
@@ -309,9 +311,15 @@ fn check_intermediate_precision(expr: &Expr, numeric: bool) -> Result<(), SqlSur
             .into_iter()
             .filter(|c| !matches!(&***c, Expr::Number(_)))
             .try_for_each(|c| check_intermediate_precision(c, numeric)),
-        Expr::Binary { lhs, rhs, .. } => {
+        Expr::Binary { op, lhs, rhs } => {
             check_intermediate_precision(lhs, numeric)?;
-            check_intermediate_precision(rhs, numeric)?;
+            let is_min_desugar = !numeric
+                && matches!(op, BinOp::Sub)
+                && matches!(&**lhs, Expr::Number(l) if l == "0")
+                && matches!(&**rhs, Expr::Number(r) if r == MIN_LEAF_DIGITS);
+            if !is_min_desugar {
+                check_intermediate_precision(rhs, numeric)?;
+            }
             if numeric {
                 return check_node_value(expr, true, numeric);
             }
@@ -323,6 +331,7 @@ fn check_intermediate_precision(expr: &Expr, numeric: bool) -> Result<(), SqlSur
             reject_carrier_children([&**lhs, &**rhs].into_iter(), numeric)?;
             // PG の float8／float4 型の式は f64 が正しい意味論のため、有限性だけを検査する。
             if pg_float_typed(expr) {
+                check_untyped_decimal_leaves(expr)?;
                 return check_node_finite(expr);
             }
             check_node_value(expr, true, numeric)
@@ -372,7 +381,10 @@ fn check_intermediate_precision(expr: &Expr, numeric: bool) -> Result<(), SqlSur
 }
 
 /// 整数モードの整数の運び手の上限（葉の 2^63。`udf_call` の `EXACT_INT_LEAF_MAX` と一致させる）。
-const EXACT_LEAF_MAX: u128 = 1 << 63;
+const EXACT_LEAF_MAX: u128 = (1 << 63) - 1;
+
+/// i64::MIN の脱糖形 `0 - 9223372036854775808` の右辺の葉（2^63）の字面。
+const MIN_LEAF_DIGITS: &str = "9223372036854775808";
 
 /// 整数モードで `expr` が整数算術・整数比較（丸めなく評価される形）に束縛されるか。
 fn binds_to_exact_int(expr: &Expr) -> bool {
@@ -403,6 +415,25 @@ fn pg_float_typed(expr: &Expr) -> bool {
                 && (pg_float_typed(lhs) || pg_float_typed(rhs))
         }
         _ => false,
+    }
+}
+
+/// 型付き浮動小数との混合式に含まれる型なし小数リテラル（PG では numeric）の精度検査（Issue #2881）。
+/// 型付き float 自身の範囲検査は外すが、型なしの小数リテラルを f64 へ丸めて受理しないよう、
+/// 非有限または |v| > 2^53 の小数リテラルは `22003`（fail-closed）。型付き値（`Call`）の内側は辿らない。
+fn check_untyped_decimal_leaves(expr: &Expr) -> Result<(), SqlSurfaceError> {
+    match expr {
+        Expr::Number(n) if !n.bytes().all(|b| b.is_ascii_digit()) => match n.parse::<f64>() {
+            Ok(v) if v.is_finite() && v.abs() <= MAX_EXACT_F64 => Ok(()),
+            _ => Err(SqlSurfaceError::numeric_out_of_range(
+                "constant expression loses integer precision",
+            )),
+        },
+        Expr::Binary { lhs, rhs, .. } => {
+            check_untyped_decimal_leaves(lhs)?;
+            check_untyped_decimal_leaves(rhs)
+        }
+        _ => Ok(()),
     }
 }
 
@@ -1404,6 +1435,18 @@ mod tests {
             "22003"
         );
         assert_eq!(code(&num("9223372036854775808")), "22003");
+        // 2^63 の葉は i64::MIN の脱糖形の右辺以外では拒否する（bigint の切り捨てで別の整数にしない）。
+        for e in [
+            bin(BinOp::Div, num("9223372036854775808"), num("3")),
+            bin(BinOp::Sub, num("1"), num("9223372036854775808")),
+            bin(
+                BinOp::Sub,
+                num("0"),
+                bin(BinOp::Div, num("9223372036854775808"), num("3")),
+            ),
+        ] {
+            assert_eq!(code(&e), "22003");
+        }
         // 従来どおり int4 の溢れ・0 除算。
         assert_eq!(code(&bin(BinOp::Add, num("2147483647"), num("1"))), "22003");
         assert_eq!(
@@ -1494,6 +1537,15 @@ mod tests {
         // 型なしの小数リテラルは PG では numeric。f64 へ丸めて返さない。
         assert_eq!(
             code(&bin(BinOp::Add, num("9007199254740993.5"), num("0"))),
+            "22003"
+        );
+        // 型付き float との混合でも、型なしの小数リテラルの精度検査は維持する。
+        assert_eq!(
+            code(&bin(
+                BinOp::Add,
+                typed("float8", "0"),
+                num("9007199254740993.5")
+            )),
             "22003"
         );
         // 整数の運び手を float 型の算術へ流す形は拒否する。
