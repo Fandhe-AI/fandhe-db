@@ -90,42 +90,9 @@ pub trait SearchProvider: Send + Sync {
         &self,
         input: SubsetSearchInput<'_>,
     ) -> Result<Vec<CandidateHit>, KernelError> {
-        let dim = input.dim as usize;
-        if input.query.len() != dim {
-            return Err(KernelError::DimMismatch {
-                expected: input.dim,
-                found: input.query.len(),
-            });
-        }
-        if input.query.iter().any(|v| !v.is_finite()) {
-            return Err(KernelError::NonFiniteQuery);
-        }
-        if input.k == 0 || input.slots.is_empty() {
+        let Some((ids, gathered)) = gather_subset_rows(&input)? else {
             return Ok(Vec::new());
-        }
-        let gather_len = input.slots.len().saturating_mul(dim);
-        let mut gathered: Vec<f32> = Vec::new();
-        gathered
-            .try_reserve_exact(gather_len)
-            .map_err(|_| KernelError::DimMismatch {
-                expected: input.dim,
-                found: gather_len,
-            })?;
-        let mut ids: Vec<u64> = Vec::new();
-        ids.try_reserve_exact(input.slots.len())
-            .map_err(|_| KernelError::DimMismatch {
-                expected: input.dim,
-                found: input.slots.len(),
-            })?;
-        for &slot in input.slots {
-            let start = (slot as usize).saturating_mul(dim);
-            let end = start.saturating_add(dim);
-            let Some(row) = input.vectors.get(start..end) else {
-                continue;
-            };
-            gathered.extend_from_slice(row);
-            ids.push(slot as u64);
-        }
+        };
         self.search(SearchInput {
             ids: &ids,
             vectors: &gathered,
@@ -141,7 +108,17 @@ pub trait SearchProvider: Send + Sync {
         &self,
         input: SubsetSearchInput<'_>,
     ) -> Result<Vec<DistanceHit>, KernelError> {
-        cosine_top_k_slots(input)
+        let Some((ids, gathered)) = gather_subset_rows(&input)? else {
+            return Ok(Vec::new());
+        };
+        self.search_cosine(CosineSearchInput {
+            ids: &ids,
+            vectors: &gathered,
+            row_norms_sq: None,
+            dim: input.dim,
+            query: input.query,
+            k: input.k,
+        })
     }
 }
 
