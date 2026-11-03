@@ -478,8 +478,8 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // 実行器側（`tenant/partitioned_dml.rs::finalize_cancel`）と `CANCEL PARTITIONED DML`
     // 文（`sql/partitioned.rs::execute_cancel`）の 2 箇所。
     // Issue #1544（`Kind::Update` への `set_exprs` 追加）で行が移動したための追随（旧: 254）。
-    ("tenant/partitioned_dml.rs", 284),
-    ("sql/partitioned.rs", 335),
+    ("tenant/partitioned_dml.rs", 291),
+    ("sql/partitioned.rs", 340),
     // `tenant::WriteTarget::with_txn`（SQL-31・TASK-221。`insert_row_unchecked`・
     // `insert_rows_unchecked`・`insert_typed_row_unchecked`・
     // `truncate_tables_unchecked` が autocommit／明示トランザクションの本体を
@@ -516,7 +516,8 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // `tenant.rs`・`catalog.rs` の各エントリを現行行へ追随（commit 対象は変わらない）。
     // Issue #1723（`TenantWriteError::TriggerFailed` の追加）で現行行へ追随（commit 対象は変わらない）。
     // Issue #2277 の追加と Issue #2276 の追随で現行行へ更新（commit 対象は変わらない）。
-    ("tenant.rs", 639),
+    // Issue #1953（書き込み経路のデッドライン確認結線）の行追加で追随（旧: 659。commit 対象は変わらない）。
+    ("tenant.rs", 671),
     // Issue #1688（SEQUENCE のカタログ）: `catalog/sequence.rs` の `create_sequence`／`drop_sequence` は
     // SEQUENCE の定義表・状態表・ID カウンタだけを書く。表の行スキーマ（`user_rows/{table}`）も
     // 表のスキーマ世代も変えないため、`bump_table_generation_in_txn` を伴わない。Issue #1690 の
@@ -560,11 +561,16 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #2233（ログイン名対応表の追随・`sync_login_names` の追加で行番号が移動。同じ理由で対象外）。
     // PR #2867 レビュー対応で role.rs の行番号が +1 行移動したための追随（同じ理由で対象外）。
     // Issue #2232 の取り込み・メンバーシップ blob の版 3 追加で role.rs の行番号が +92 行移動（同じ理由で対象外）。
-    ("catalog/role.rs", 1259),
-    ("catalog/role.rs", 1291),
-    ("catalog/role.rs", 1310),
-    ("catalog/role.rs", 1329),
-    ("catalog/role.rs", 1382),
+    ("catalog/role.rs", 1281),
+    ("catalog/role.rs", 1313),
+    ("catalog/role.rs", 1332),
+    ("catalog/role.rs", 1351),
+    ("catalog/role.rs", 1404),
+    // Issue #2238（users ファイルのブートストラップ `Storage::bootstrap_users_file`）と、それに伴う role.rs の
+    // 行番号の移動への追随。ロール・マーカー・初期権限の専用表だけを書き、表の行・スキーマ・世代に影響しない
+    // （同じ理由で対象外）。
+    ("catalog/role/bootstrap.rs", 598),
+    ("catalog/role/bootstrap/tests.rs", 42),
     // Issue #2232: メンバーシップの付与・取り消し（`apply_membership_changes`）とロール作成＋付与
     // （`create_role_with_memberships`）。メンバーシップ表だけを書き、表の計画・世代に影響しない（同じ理由）。
     ("catalog/role/membership_apply.rs", 314),

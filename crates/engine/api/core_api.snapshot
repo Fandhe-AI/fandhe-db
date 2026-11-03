@@ -346,4 +346,5 @@ pub enum ArenaError {
     SubstringError(String),
     InvalidArgumentForLogarithm(String),
     NumericOutOfRange(String),
+    Interrupted(crate::interrupt::InterruptReason),
 }

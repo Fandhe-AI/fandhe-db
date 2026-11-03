@@ -918,12 +918,25 @@ struct RecordSink {
     /// `COPY` 開始時点のセッション TimeZone（TABLE-33・Issue #1575）。スレッドローカルのスコープが
     /// メッセージ間で届かないため開始時に確定した値を保持し、束縛のたびにスコープへ入れる。
     time_zone: Box<crate::datetime::SessionTimeZone>,
+    /// COPY 開始時点の文の期限（Issue #1953。SQL-71 のポインタ）。COPY は複数の wire メッセージに
+    /// またがり RAII のスレッドローカルスコープが届かないため、`clock` と同じく開始時に値（`Copy`）を
+    /// 保持し、各 `feed`／行の取り込みと commit 経路（`CopyInBatch` 経由）で評価する。
+    deadline: crate::interrupt::StatementDeadline,
 }
 
 impl RecordSink {
     /// 1 レコード分のフィールドを取り込む。判定順序は ヘッダ処理 → フィールド数照合 →
     /// ①（行数）→ ④（チャンク数）→ 列型照合・束縛 → ②（行あたりのバイト量）。
     fn push_record(&mut self, fields: Vec<Option<String>>) -> Result<(), SqlSurfaceError> {
+        // 協調キャンセルポイント（Issue #1953）。時計の読み出しは 1024 行に 1 回に間引く
+        // （`bounds` が空の最初の行では必ず評価する）。
+        if self
+            .bounds
+            .len()
+            .is_multiple_of(crate::interrupt::CHECK_STRIDE as usize)
+        {
+            self.deadline.check()?;
+        }
         // 最初に確定したレコードはヘッダ行。破棄（または照合）するだけで、
         // 行数①・チャンク数④・束縛の対象に含めない。
         if std::mem::take(&mut self.header_pending) {
@@ -1053,6 +1066,8 @@ impl CopyInSession {
                 clock,
                 clock_used: false,
                 time_zone: Box::new(time_zone),
+                // `begin_copy*` が呼ぶ区間のスレッドの期限（無効なら無効のまま）。
+                deadline: crate::interrupt::current_deadline(),
             }),
             format,
             running_bytes: 0,
@@ -1152,6 +1167,8 @@ impl CopyInSession {
     ///    フィールド分割・エスケープ解決・列型照合（`22000`）→②（当該行の
     ///    デコード後バイト量）の順に判定する。
     pub fn feed(&mut self, chunk: &[u8]) -> Result<(), SqlSurfaceError> {
+        // メッセージ単位の粗い確認点（Issue #1953）。
+        self.sink.deadline.check()?;
         self.account_raw_bytes(chunk.len())?;
         let splitter = &mut self.splitter;
         self.sink
@@ -1162,6 +1179,7 @@ impl CopyInSession {
     /// text/csv の [`Self::feed`] と同じ束縛経路（①→④→束縛→②）を共有する（第 2 の書き込み経路を
     /// 作らない。WIRE-23・Issue #1769）。呼び出しは `wire-server::copy::run_copy_from` から。
     pub fn feed_fields(&mut self, fields: Vec<Option<String>>) -> Result<(), SqlSurfaceError> {
+        self.sink.deadline.check()?;
         self.sink.with_scopes(|sink| sink.push_record(fields))
     }
 
@@ -1177,6 +1195,7 @@ impl CopyInSession {
             privilege_recheck,
             ..
         } = self;
+        sink.deadline.check()?;
         if let Some(fields) = splitter.finish()? {
             sink.with_scopes(|sink| sink.push_record(fields))?;
         }
@@ -1198,6 +1217,7 @@ impl CopyInSession {
             temp,
             row_security,
             privilege_recheck,
+            deadline: sink.deadline,
         })
     }
 }
@@ -1219,6 +1239,9 @@ pub struct CopyInBatch {
     /// commit 時の権限再判定値（[`CopyInSession`] から引き継ぐ。Issue #1969）。
     pub(crate) privilege_recheck:
         Option<crate::sql::privilege_gate::write::RelationPrivilegeRecheck>,
+    /// COPY 開始時点の文の期限（[`CopyInSession`] から引き継ぐ。Issue #1953）。commit 経路は
+    /// これを `DeadlineScope` に入れて INSERT 行ループと書き込みロック待ちへ効かせる。
+    pub(crate) deadline: crate::interrupt::StatementDeadline,
 }
 
 impl CopyInBatch {

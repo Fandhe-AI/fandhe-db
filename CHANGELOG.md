@@ -13,6 +13,8 @@
 
 ### Added
 
+- 文単位のデッドライン（`engine::interrupt::DeadlineScope`。Issue #1951）を、書き込み・COPY・分割実行 DML・ベクトル検索・GPU バッチの経路へ結線した（Issue #1953・SQL-71・SQL-32 ポインタ）。期限切れは `57014`（固定文言）で、autocommit は副作用ゼロ・明示 Tx は `25P02`（savepoint があれば `ROLLBACK TO` で復帰）・台帳にも残らない。分割実行は実行中のチャンクだけを破棄し、最初の commit 前は `57014`・後は `VD001`（原因 `57014`）で、同じ `operation_id` の再送で再開できる。書き込みロック（writer gate）の待機は文の期限で短縮され、期限が先に来たときは `55P03` ではなく `57014` を返す。期限が無効なら従来と挙動・性能は変わらない（導入口の wire 結線は #1954）。
+  BREAKING CHANGE: 公開 enum `ArenaError` に `Interrupted(InterruptReason)`、`BatchSearchError` に `QueryCanceled { reason }` を追加した（網羅的 `match` の下流は追随が必要）。
 - PL/pgSQL の条件式（`IF`・`ELSIF`・`WHILE`・`EXIT/CONTINUE WHEN`・検索形 `CASE`）と値として使う論理式で `AND`・`OR`・`NOT`・`BETWEEN`・`IN (リスト)` を受理するようにした（Issue #2880・SQL-68）。従来の `0A000` から受理に変わる。NULL は 3 値論理で扱い、数値は値のまま比較する。
 - PL/pgSQL の `RAISE`（全水準・書式・`USING`・条件名・`SQLSTATE`・再送出）と `EXCEPTION WHEN` ブロックを追加した（Issue #2227・SQL-70）。捕捉はブロック開始時の内部 savepoint まで巻き戻し、変数は巻き戻さない。巻き戻せない場合（書き込み後に入ったブロック・一時表を使った Tx）は固定文言の `0A000` で失敗する。`RAISE NOTICE/INFO/WARNING` は `NoticeResponse` で応答の前に届き（`DEBUG`／`LOG` は送らない）、`RAISE EXCEPTION` は利用者指定の SQLSTATE を `C` に出して `W` を付ける（本 DB 自身のエラーは 3 フィールドのまま）。`engine::notice`（`RaisedError`・`Notice`・`StatementNotices`）と `SqlSurfaceError::{raised, effective_sqlstate}` を公開した。
   BREAKING CHANGE: 公開 enum `ErrorClass` に `RaisedException`（`P0001`）、`SqlSurfaceError` に `RaisedException` を追加した。`RAISE`・`EXCEPTION` は `0A000` から受理に変わった。

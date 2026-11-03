@@ -3967,6 +3967,8 @@ fn propagate_referential_actions(
     depth: u32,
     state: &mut ActionState,
 ) -> Result<(), TenantWriteError> {
+    // 協調キャンセルポイント（Issue #1953）。連鎖の段ごとに確認する（commit 前の `Err` のみ）。
+    crate::tenant::check_interrupt()?;
     let referencing = crate::catalog::referencing_foreign_keys_in_txn(write_txn, table_name)?;
 
     // Pass 1（対象特定。codex-review 指摘・PR #1138）: このテーブルを参照する
@@ -4710,6 +4712,8 @@ fn apply_referential_action(
     tenant_id: &str,
     is_delete: bool,
 ) -> Result<(PropagatedChange, Option<UpdatedKeyPreImages>), TenantWriteError> {
+    // 協調キャンセルポイント（Issue #1953）。対象テーブルへの書き込み前に確認する。
+    crate::tenant::check_interrupt()?;
     if is_delete && matches!(action, ReferentialAction::Cascade) {
         // `ON DELETE CASCADE`: 子行そのものを削除する。孫段の再帰
         // （`propagate_referential_actions`）が「今回の文で実際に削除された行」

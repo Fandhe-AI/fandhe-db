@@ -555,3 +555,25 @@ fn set_role_does_not_widen_ddl_permission() {
     assert!(!session.ddl_allowed());
     assert_eq!(session.session_role_id(), Some(a));
 }
+/// `ALTER ROLE ... PASSWORD`（`PASSWORD NULL` を含む）は旧形式ハッシュを空にする（Issue #2238。
+/// 残すと旧パスワードが cleartext 認証で通り続ける）。パスワード以外の変更では保つ。
+#[test]
+fn alter_password_clears_legacy_phc_but_other_options_keep_it() {
+    let (_g, s) = open("role-ddl-legacy-phc");
+    create(&s, "t1", "CREATE ROLE r LOGIN").expect("create");
+    s.alter_role("t1", "r", |d| d.legacy_phc = b"$argon2id$old".to_vec())
+        .expect("seed");
+    let session = SessionState::default();
+    alter(&s, "t1", &session, "ALTER ROLE r CONNECTION LIMIT 3").expect("limit");
+    assert_eq!(role(&s, "t1", "r").legacy_phc, b"$argon2id$old");
+    alter(&s, "t1", &session, "ALTER ROLE r PASSWORD 'new secret'").expect("password");
+    let def = role(&s, "t1", "r");
+    assert!(def.legacy_phc.is_empty());
+    assert!(!def.scram_verifier.is_empty());
+    s.alter_role("t1", "r", |d| d.legacy_phc = b"$argon2id$old".to_vec())
+        .expect("seed again");
+    alter(&s, "t1", &session, "ALTER ROLE r PASSWORD NULL").expect("null");
+    let def = role(&s, "t1", "r");
+    assert!(def.legacy_phc.is_empty());
+    assert!(def.scram_verifier.is_empty());
+}

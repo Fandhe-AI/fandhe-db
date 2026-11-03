@@ -97,6 +97,11 @@ pub(crate) enum PartitionedStopCause<E> {
     /// 第 1 チャンクではジョブ記録・台帳より前（commit 前）に止まり副作用はゼロ。途中で `REVOKE` された
     /// 場合は commit 済みチャンクを残して止まる（`VD001`。同じ `operation_id` の再送で再開できる）。
     InsufficientPrivilege,
+    /// 文の期限（Issue #1953。SQL-71 のポインタ）を超過した。実行中のチャンクは commit せず破棄して
+    /// 止める。`committed_total == 0` なら `57014`（副作用ゼロ）、commit 済みチャンクがあれば `VD001`
+    /// （原因 `57014`。同じ `operation_id` の再送で再開できる）。`suppressed` 区間では共有の確認点が
+    /// 評価されないため、期限は注入時計（`Hooks::clock`）で明示評価する。
+    DeadlineExceeded,
 }
 
 /// 述語形 `DELETE` の分割実行入口（`core.rs` の分割実行 form から呼ばれる）。
@@ -116,7 +121,8 @@ pub(crate) fn delete_rows_where_partitioned_unchecked<E>(
     predicate: impl FnMut(&DmlCandidate<'_>) -> Result<bool, E>,
 ) -> Result<PartitionedDmlOutcome, PartitionedDmlFailure<E>> {
     // Issue #1798: チャンク commit 後に 57014 を返すと SQL-32／SQL-71 (4) の契約（commit 済みなら
-    // `VD001`）とずれるため、ジョブ全体を協調的中断の対象外にする（statement_timeout は #1950）。
+    // `VD001`）とずれるため、ジョブ全体を協調的中断（切断）の対象外にする。文の期限は Issue #1953 で
+    // `chunk_loop` が注入時計により明示評価する（`PartitionedStopCause::DeadlineExceeded`）。
     crate::interrupt::suppressed(|| {
         run_partitioned(
             storage,
@@ -159,7 +165,8 @@ pub(crate) fn update_rows_where_partitioned_unchecked<E>(
     predicate: impl FnMut(&DmlCandidate<'_>) -> Result<bool, E>,
 ) -> Result<PartitionedDmlOutcome, PartitionedDmlFailure<E>> {
     // Issue #1798: チャンク commit 後に 57014 を返すと SQL-32／SQL-71 (4) の契約（commit 済みなら
-    // `VD001`）とずれるため、ジョブ全体を協調的中断の対象外にする（statement_timeout は #1950）。
+    // `VD001`）とずれるため、ジョブ全体を協調的中断（切断）の対象外にする。文の期限は Issue #1953 で
+    // `chunk_loop` が注入時計により明示評価する（`PartitionedStopCause::DeadlineExceeded`）。
     crate::interrupt::suppressed(|| {
         run_partitioned(
             storage,
@@ -374,6 +381,9 @@ fn chunk_loop<E>(
         )
         .map_err(map_job_err)?;
     let clock = hooks.clock;
+    // 文の期限（Issue #1953）。`suppressed` 区間では `interrupt::check` が期限を評価しないため、
+    // ジョブ開始時に値（`Copy`）を読み、注入時計で各確認点を明示評価する。
+    let deadline = crate::interrupt::current_deadline();
     let mut chunk_index: usize = 0;
 
     // 再開時の commit 済み累計を、取り消し・gate 待機・スキーマ検査など最初のチャンクの
@@ -404,10 +414,25 @@ fn chunk_loop<E>(
         if guard.cancel_requested() {
             return Err(cancel_stop(storage, &key));
         }
-        // 通常の書き込みが待機している間は取得されない（ADR §8.2）。失敗は `55P03`。
-        let write_txn = storage
-            .begin_partitioned_chunk_txn()
-            .map_err(|e| w(convert_write_txn_err(e)))?;
+        // 期限の確認点 (a): チャンク開始前（write txn を取る前。副作用なし）。
+        if deadline.is_expired_at(clock()) {
+            return Err(PartitionedStopCause::DeadlineExceeded);
+        }
+        // 通常の書き込みが待機している間は取得されない（ADR §8.2）。失敗は `55P03`。待機は文の期限で
+        // 短縮され（`Storage` 側）、期限が先に来たなら `55P03` ではなく期限超過として止める。
+        let write_txn = match storage.begin_partitioned_chunk_txn() {
+            Ok(t) => t,
+            Err(e) => {
+                if matches!(
+                    e,
+                    StorageError::WriteLockTimeout | StorageError::WriteTxnHeldByCurrentSession
+                ) && deadline.is_expired_at(clock())
+                {
+                    return Err(PartitionedStopCause::DeadlineExceeded);
+                }
+                return Err(w(convert_write_txn_err(e)));
+            }
+        };
         // SQL-40・Issue #1968: 再開時とチャンクの途中で権限を剥奪された後に続行させない。ジョブ記録・台帳
         // 照合・走査・適用より前に、この txn から ACL を読んで判定する（拒否は commit 前なので副作用なし）。
         if let Some(recheck) = &hooks.privilege {
@@ -563,6 +588,7 @@ fn chunk_loop<E>(
             limits.max_writer_hold,
             start,
             clock,
+            deadline,
             &mut predicate,
         )?;
         let ScanResult {
@@ -587,8 +613,17 @@ fn chunk_loop<E>(
         // 長さはチャンク幅以下で有界（走査段が候補をチャンク幅で締める）。
         let candidate_ids: Vec<u64> = candidates.iter().map(|r| r.legacy_id()).collect();
         // 適用（原子経路と共有する適用段）。保持時間を超えたら残りを次チャンクへ回す。
-        let mut stop_by_hold =
-            || clock().saturating_duration_since(start) >= limits.max_writer_hold;
+        // 期限の確認点 (c): 適用段の打ち切り判定（保持時間と同じ呼び出し点）。期限による停止は
+        // 部分 commit にせず、適用後にチャンクごと破棄する。
+        let deadline_hit = std::cell::Cell::new(false);
+        let mut stop_by_hold = || {
+            let now = clock();
+            if deadline.is_expired_at(now) {
+                deadline_hit.set(true);
+                return true;
+            }
+            now.saturating_duration_since(start) >= limits.max_writer_hold
+        };
         let fk_mode = crate::constraint::FkCheckMode::All;
         let applied = match kind {
             Kind::Delete => apply_predicate_delete_in_txn::<E>(
@@ -619,6 +654,10 @@ fn chunk_loop<E>(
             ),
         }
         .map_err(from_predicate_err)?;
+        if deadline_hit.get() {
+            drop(write_txn);
+            return Err(PartitionedStopCause::DeadlineExceeded);
+        }
 
         // 打ち切った場合のカーソルは「最後に適用した候補の rowid」（それ以降の行は次の
         // チャンクで再走査・再評価される）。
@@ -688,6 +727,11 @@ fn chunk_loop<E>(
             drop(write_txn);
             return Err(cancel_stop(storage, &key));
         }
+        // 期限の確認点 (d): commit 直前。commit の後（記録・台帳・recovery）には置かない。
+        if deadline.is_expired_at(clock()) {
+            drop(write_txn);
+            return Err(PartitionedStopCause::DeadlineExceeded);
+        }
 
         crate::recovery::commit_boundary::commit(write_txn)
             .map_err(|e| w(TenantWriteError::from(e)))?;
@@ -734,6 +778,7 @@ fn scan_chunk<E>(
     max_hold: Duration,
     start: Instant,
     clock: &dyn Fn() -> Instant,
+    deadline: crate::interrupt::StatementDeadline,
     predicate: &mut impl FnMut(&DmlCandidate<'_>) -> Result<bool, E>,
 ) -> Result<ScanResult, PartitionedStopCause<E>> {
     let tenant = ctx.tenant_id();
@@ -834,9 +879,14 @@ fn scan_chunk<E>(
             candidates.push(rowid);
         }
 
+        // 期限の確認点 (b): 行ごと（保持時間判定と同じ時計値を使う）。
+        let now = clock();
+        if deadline.is_expired_at(now) {
+            return Err(PartitionedStopCause::DeadlineExceeded);
+        }
         let close = candidates.len() >= width
             || scanned >= scan_budget
-            || clock().saturating_duration_since(start) >= max_hold;
+            || now.saturating_duration_since(start) >= max_hold;
         if close {
             // 最大 rowid まで走査した場合のみ、その先に行は存在しない。
             exhausted = rowid == RowId::MAX;

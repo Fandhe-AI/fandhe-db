@@ -521,6 +521,9 @@ fn map_arena_error(table: &str, e: ArenaError) -> SqlSurfaceError {
             SqlSurfaceError::invalid_argument_for_logarithm(detail)
         }
         ArenaError::NumericOutOfRange(detail) => SqlSurfaceError::numeric_out_of_range(detail),
+        // Issue #1953: 構築中の協調キャンセルポイントが検出した中断は `57014` のまま返す（`XX000`
+        // へ丸めない）。`expr_eval_error_to_arena` の `QueryCanceled` 腕との往復。
+        ArenaError::Interrupted(reason) => SqlSurfaceError::QueryCanceled { reason },
         ArenaError::Storage(_)
         | ArenaError::Catalog(_)
         | ArenaError::InvalidDim
@@ -549,6 +552,8 @@ fn expr_eval_error_to_arena(e: SqlSurfaceError) -> ArenaError {
             ArenaError::InvalidArgumentForLogarithm(detail)
         }
         SqlSurfaceError::NumericOutOfRange { detail } => ArenaError::NumericOutOfRange(detail),
+        // Issue #1953: `WHERE` 内の副問い合わせ・関数評価が検出した中断（`57014`）を `XX000` に丸めない。
+        SqlSurfaceError::QueryCanceled { reason } => ArenaError::Interrupted(reason),
         other => ArenaError::Storage(StorageError::Codec(other.to_string())),
     }
 }
@@ -2163,7 +2168,11 @@ pub(crate) fn execute_statement_with_cache(
     let completeness_unbounded =
         precision_completeness_unbounded(is_precision, plan.scalar_prefilter, arena.ids().len());
 
-    // DISTANCE 段。
+    // DISTANCE 段。カーネル・HNSW・hybrid の内部には確認点を置けない（`KernelError`／`SearchProvider` の
+    // 公開 API 変更と `search_or_fallback` の縮退吸収の整理が要るため。Issue #1953 の対象外）。代わりに
+    // 呼び出しの直前と直後で文の期限を即時に確認する（中断遅れの上限は探索 1 回分。
+    // `docs/design/statement-interrupt.md`）。無効なら時計を読まない。
+    crate::interrupt::current_deadline().check()?;
     let hits: Vec<(u64, f64)> = if completeness_unbounded {
         Vec::new()
     } else {
@@ -2523,6 +2532,9 @@ pub(crate) fn execute_statement_with_cache(
             }
         }
     };
+
+    // DISTANCE 段の直後の確認点（Issue #1953。上の直前確認と対）。
+    crate::interrupt::current_deadline().check()?;
 
     // SCALAR 事後フィルタ（DISTANCE 先行時のみ。TASK-76・SQL-7）。`on_visible_row` は
     // `plan.scalar_prefilter == false` の間、等価条件を判定せず可視行を通過させて
@@ -4503,7 +4515,7 @@ pub(crate) fn map_write_error(
         // した（`55P03`）。`_` 節（`XX000`）へ丸めると、クライアントがリトライ可能な
         // ロック競合とサーバー内部エラーを判別できなくなる。`catalog::table_lookup_error`・
         // `tenant::ClassifiedError` と同じ写像先（codex-review 指摘）。
-        TenantWriteError::WriteLockTimeout => SqlSurfaceError::LockNotAvailable,
+        TenantWriteError::WriteLockTimeout => crate::interrupt::lock_wait_error(),
         // ビュー経由の INSERT（TABLE-43・Issue #1671）で、書き換え後にビュー連鎖・基表スキーマが変わった
         // （通常は core の再試行が吸収する。上限到達時は `CREATE OR REPLACE VIEW` と同じ `55P03`）。
         TenantWriteError::Catalog(CatalogError::ViewDefinitionChanged(_)) => {
@@ -6110,6 +6122,24 @@ pub(crate) fn map_batch_incremental_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #1953（SQL-71）: `57014` は `expr_eval_error_to_arena` ↔ `map_arena_error` の往復で
+    /// 理由ごと保たれ、`XX000` に丸められない。
+    #[test]
+    fn query_canceled_round_trips_through_arena_error() {
+        for reason in [
+            crate::interrupt::InterruptReason::StatementTimeout,
+            crate::interrupt::InterruptReason::ClientGone,
+            crate::interrupt::InterruptReason::UserCancel,
+        ] {
+            let arena_err = expr_eval_error_to_arena(SqlSurfaceError::QueryCanceled { reason });
+            assert!(matches!(arena_err, ArenaError::Interrupted(r) if r == reason));
+            assert_eq!(arena_err.to_string(), "arena build interrupted");
+            let back = map_arena_error("t", arena_err);
+            assert!(matches!(back, SqlSurfaceError::QueryCanceled { reason: r } if r == reason));
+            assert_eq!(back.wire_code(), "57014");
+        }
+    }
 
     // Issue #56 レビュー指摘対応・codex P1 の 2 件（`decode_scalar_columns` の
     // 無制限保持・`embedding.to_vec()` の abort し得る確保）に対する境界値テスト。

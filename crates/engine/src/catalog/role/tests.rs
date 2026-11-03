@@ -775,24 +775,32 @@ fn resolve_tenant_role_three_states() {
     let bob = s.create_role("t1", &rdef("bob")).expect("bob");
     assert_eq!(
         s.resolve_tenant_role("t1", "alice").expect("missing"),
-        TenantRoleLookup::Missing
+        TenantRoleLookup::Missing {
+            bootstrapped: false
+        }
     );
     // 大文字小文字は畳み込まない。
     assert_eq!(
         s.resolve_tenant_role("t1", "Bob").expect("case"),
-        TenantRoleLookup::Missing
+        TenantRoleLookup::Missing {
+            bootstrapped: false
+        }
     );
     // 不正な識別子は不在に畳む。
     assert_eq!(
         s.resolve_tenant_role("t1", "").expect("empty"),
-        TenantRoleLookup::Missing
+        TenantRoleLookup::Missing {
+            bootstrapped: false
+        }
     );
     assert_eq!(
         s.resolve_tenant_role("t1", "b\0b").expect("nul"),
-        TenantRoleLookup::Missing
+        TenantRoleLookup::Missing {
+            bootstrapped: false
+        }
     );
     match s.resolve_tenant_role("t1", "bob").expect("found") {
-        TenantRoleLookup::Found(def) => {
+        TenantRoleLookup::Found { def, .. } => {
             assert_eq!(def.id, bob);
             assert_eq!(def.name, "bob");
             assert!(def.attributes.login);
