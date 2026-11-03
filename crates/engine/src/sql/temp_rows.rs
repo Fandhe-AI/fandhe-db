@@ -259,6 +259,14 @@ impl TempRowStore {
             .map_err(|_| SqlSurfaceError::LockNotAvailable)
     }
 
+    /// 一時ストアの確定済み状態の読み取りトランザクション。明示 Tx の `SAVEPOINT` が、一時の
+    /// 書き込みトランザクションとの差分を取る基準に使う（Issue #2879。単一ライタのため、
+    /// 書き込みトランザクションの保持中は確定済み状態が変わらない）。
+    pub(crate) fn committed_read(&self) -> Result<redb::ReadTransaction, SqlSurfaceError> {
+        use redb::ReadableDatabase;
+        self.storage()?.db().begin_read().map_err(|_| internal())
+    }
+
     /// 書き込みトランザクションを確定する。
     pub(crate) fn commit(&self, txn: GatedWriteTxn) -> Result<(), SqlSurfaceError> {
         crate::recovery::commit_boundary::commit(txn).map_err(|_| internal())

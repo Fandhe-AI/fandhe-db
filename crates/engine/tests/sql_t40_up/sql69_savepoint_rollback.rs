@@ -5,7 +5,8 @@
 //! 結線（writer 取得前に作った savepoint への巻き戻し）を固定する。受け入れ条件は
 //! (a) `ROLLBACK TO` の後にその savepoint 以降の書き込みが見えないこと、(b) `COMMIT` の後も
 //! 巻き戻した書き込みが永続化されないこと。writer が dirty になった後に作った savepoint は
-//! redb では戻せないため `0A000` で fail-closed になることと、`ROLLBACK TO` の後も writer を
+//! redb の API だけでは戻せないため、基底への復元 + 内容差分の再適用で戻すこと（Issue #2879。詳細は
+//! `sql69_savepoint_post_write`）と、`ROLLBACK TO` の後も writer を
 //! Tx の終了まで保持すること（SQL-69 (3)）も合わせて固定する。時間計測には依存しない
 //! （`55P03` は待機上限で判定する）。
 
@@ -163,8 +164,9 @@ fn nested_savepoints_before_writes_restore_and_drop_newer_ones() {
     assert_eq!(err.wire_code(), "3B001");
 }
 
+/// Issue #2879: 書き込み後に作った savepoint へも戻せる。savepoint 前の行は残り、後の行は消える。
 #[test]
-fn savepoint_established_after_writes_is_0a000_and_rollback_leaves_no_rows() {
+fn savepoint_established_after_writes_restores_to_that_state() {
     let (core, _g) = new_core("sql69-rb-after-writes");
     let caller = ctx("tenant-a");
     let mut s = SessionState::default();
@@ -172,15 +174,17 @@ fn savepoint_established_after_writes_is_0a000_and_rollback_leaves_no_rows() {
     run(&core, &caller, &mut s, &mut txn, "BEGIN").unwrap();
     run(&core, &caller, &mut s, &mut txn, &insert_sql(1, "op-1")).unwrap();
     run(&core, &caller, &mut s, &mut txn, "SAVEPOINT c").unwrap();
-    let err = run(&core, &caller, &mut s, &mut txn, "ROLLBACK TO c").unwrap_err();
-    assert_eq!(err.wire_code(), "0A000");
-    assert_eq!(txn.status(), TransactionStatus::Failed);
-    run(&core, &caller, &mut s, &mut txn, "ROLLBACK").unwrap();
-    assert_eq!(committed_rows(&core, &caller), 0);
+    run(&core, &caller, &mut s, &mut txn, &insert_sql(2, "op-2")).unwrap();
+    assert_eq!(rows_in_txn(&core, &caller, &mut s, &mut txn), 2);
+    run(&core, &caller, &mut s, &mut txn, "ROLLBACK TO c").unwrap();
+    assert_eq!(txn.status(), TransactionStatus::InTransaction);
+    assert_eq!(rows_in_txn(&core, &caller, &mut s, &mut txn), 1);
+    run(&core, &caller, &mut s, &mut txn, "COMMIT").unwrap();
+    assert_eq!(committed_rows(&core, &caller), 1);
 }
 
 #[test]
-fn mixed_restorable_and_unrestorable_savepoints() {
+fn mixed_restorable_and_imaged_savepoints() {
     let (core, _g) = new_core("sql69-rb-mixed");
     let caller = ctx("tenant-a");
     let mut s = SessionState::default();
@@ -189,8 +193,12 @@ fn mixed_restorable_and_unrestorable_savepoints() {
     run(&core, &caller, &mut s, &mut txn, "SAVEPOINT a").unwrap();
     run(&core, &caller, &mut s, &mut txn, &insert_sql(1, "op-1")).unwrap();
     run(&core, &caller, &mut s, &mut txn, "SAVEPOINT b").unwrap();
-    let err = run(&core, &caller, &mut s, &mut txn, "ROLLBACK TO b").unwrap_err();
-    assert_eq!(err.wire_code(), "0A000");
+    // b（書き込み後）へ戻しても、b より前の行は残る。
+    run(&core, &caller, &mut s, &mut txn, "ROLLBACK TO b").unwrap();
+    assert_eq!(rows_in_txn(&core, &caller, &mut s, &mut txn), 1);
+    // さらに a（書き込み前）へ戻せば行は消える。
+    run(&core, &caller, &mut s, &mut txn, "ROLLBACK TO a").unwrap();
+    assert_eq!(rows_in_txn(&core, &caller, &mut s, &mut txn), 0);
     run(&core, &caller, &mut s, &mut txn, "ROLLBACK").unwrap();
 
     // 別の Tx では a へ戻せる。
@@ -198,7 +206,7 @@ fn mixed_restorable_and_unrestorable_savepoints() {
     run(&core, &caller, &mut s, &mut txn, "SAVEPOINT a").unwrap();
     run(&core, &caller, &mut s, &mut txn, &insert_sql(1, "op-2")).unwrap();
     run(&core, &caller, &mut s, &mut txn, "SAVEPOINT b").unwrap();
-    // b は Unrestorable。a へ直接戻すのは可能（b は除かれる）。
+    // b は書き込み後の savepoint。a へ直接戻すのも可能（b は除かれる）。
     run(&core, &caller, &mut s, &mut txn, "ROLLBACK TO a").unwrap();
     assert_eq!(rows_in_txn(&core, &caller, &mut s, &mut txn), 0);
     run(&core, &caller, &mut s, &mut txn, "COMMIT").unwrap();
@@ -226,10 +234,10 @@ fn writer_is_held_until_transaction_end_after_rollback_to() {
         .expect("writer released after commit");
 }
 
-/// writer をテーブル操作で先に取った場合、redb 上は dirty になるため probe が `Unrestorable` と
-/// 判定し、`ROLLBACK TO` は `0A000` で fail-closed になる（engine の記録に頼らない判定の確認）。
+/// writer をテーブル操作で先に取った場合（redb 上は dirty）でも、差分から戻せる（Issue #2879）。
+/// engine の記録に頼らず redb の実内容から判定する。
 #[test]
-fn savepoint_taken_after_lock_table_is_unrestorable_and_fails_closed() {
+fn savepoint_taken_after_lock_table_restores() {
     let (core, _g) = new_core("sql69-rb-lock-first");
     let caller = ctx("tenant-a");
     let mut s = SessionState::default();
@@ -245,10 +253,10 @@ fn savepoint_taken_after_lock_table_is_unrestorable_and_fails_closed() {
     .unwrap();
     run(&core, &caller, &mut s, &mut txn, "SAVEPOINT a").unwrap();
     run(&core, &caller, &mut s, &mut txn, &insert_sql(1, "op-1")).unwrap();
-    let err = run(&core, &caller, &mut s, &mut txn, "ROLLBACK TO a").unwrap_err();
-    assert_eq!(err.wire_code(), "0A000");
-    assert_eq!(txn.status(), TransactionStatus::Failed);
-    run(&core, &caller, &mut s, &mut txn, "ROLLBACK").unwrap();
+    run(&core, &caller, &mut s, &mut txn, "ROLLBACK TO a").unwrap();
+    assert_eq!(txn.status(), TransactionStatus::InTransaction);
+    assert_eq!(rows_in_txn(&core, &caller, &mut s, &mut txn), 0);
+    run(&core, &caller, &mut s, &mut txn, "COMMIT").unwrap();
     assert_eq!(committed_rows(&core, &caller), 0);
 }
 

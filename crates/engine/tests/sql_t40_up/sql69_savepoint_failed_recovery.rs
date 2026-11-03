@@ -293,25 +293,28 @@ fn writer_is_held_while_recoverable_and_released_after_commit() {
 }
 
 #[test]
-fn rollback_to_unknown_or_unrestorable_name_keeps_failed_state_recoverable() {
+fn rollback_to_unknown_name_keeps_failed_state_recoverable() {
     let (core, _g) = new_core("sql69-fr-names");
     let caller = ctx("tenant-a");
     let mut s = SessionState::default();
     let mut txn = begin_sp(&core, &caller, &mut s);
     run(&core, &caller, &mut s, &mut txn, &insert_sql(1, "op-1")).unwrap();
-    // writer が dirty になった後の savepoint は Unrestorable。
+    // writer が dirty になった後の savepoint は差分つき（Issue #2879）。
     run(&core, &caller, &mut s, &mut txn, "SAVEPOINT b").unwrap();
     assert!(run(&core, &caller, &mut s, &mut txn, BAD_SYNTAX).is_err());
-    assert_eq!(
-        code(run(&core, &caller, &mut s, &mut txn, "ROLLBACK TO b")),
-        "0A000"
-    );
-    assert_eq!(txn.status(), TransactionStatus::Failed);
     assert_eq!(
         code(run(&core, &caller, &mut s, &mut txn, "ROLLBACK TO zz")),
         "3B001"
     );
     assert_eq!(txn.status(), TransactionStatus::Failed);
+    // 書き込み後の b へ戻って復帰できる。b より前の行は残る。
+    run(&core, &caller, &mut s, &mut txn, "ROLLBACK TO b").unwrap();
+    assert_eq!(txn.status(), TransactionStatus::InTransaction);
+    assert_eq!(
+        rows_of(run(&core, &caller, &mut s, &mut txn, SELECT).unwrap()),
+        1
+    );
+    assert!(run(&core, &caller, &mut s, &mut txn, BAD_SYNTAX).is_err());
     run(&core, &caller, &mut s, &mut txn, "ROLLBACK TO a").unwrap();
     assert_eq!(txn.status(), TransactionStatus::InTransaction);
     run(&core, &caller, &mut s, &mut txn, "COMMIT").unwrap();
