@@ -1,14 +1,14 @@
 """自作 DB 側と pgvector 側が同じ距離演算子（`<#>`）を使うことの静的検査。
 
 SQL-33（`<=>` のコサイン距離化）の後も、crossdb ハーネスは両 DB を負の内積・
-昇順で揃えて比較する（Issue #1994）。ソースを走査するだけで psycopg は不要。
+昇順で揃えて比較する（Issue #1994）。ソースを走査するだけで psycopg は不要。`make scripts-test` で CI（scripts-test ジョブ）が実行する。
 """
 
 import re
 import unittest
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parent.parent / "crossdb_bench"
 PATTERN = re.compile(r"ORDER BY\s+(?:embedding|\{[^}]+\})\s+(<[=#+\-]>)")
 
 

@@ -1588,9 +1588,10 @@ Issue #1405（fix(engine)!: CREATE TYPE の型名の重複を 42710 で返す。
 - 対象: `scripts/crossdb_bench/`、`crates/engine/benches/`、`crates/engine/examples/feature_bench.rs`、
   ハーネス出力を検査する engine テスト（`c1_bench_accept`・`hybrid_profile_accept`・`scan_stage_profile_accept`）
 - 変更しない: `cosine_method_bench.rs` の pgvector 向け SQL（既にコサインの意味）
-- 静的検査: `scripts/crossdb_bench/tests/test_distance_operator_parity.py`（手動実行）
+- 静的検査: `scripts/tests/test_distance_operator_parity.py`（`make scripts-test` で CI が実行）
 - 暫定対処: `<#>` の実行経路（#1991）が main に無いため、実行系の `c1_bench_accept` の e2e と
-  `scan_stage_profile_accept` の `profile_arm_contract_*` だけは `<=>`（L2）へ置換して実行する。#1991 のマージ後に外す
+  `scan_stage_profile_accept` の `profile_arm_contract_*` だけは `<=>`（L2）へ置換して実行する。#1991 のマージ後に外す（復元は #1991 の完了条件として追跡する）
+- マージ順序の注意: `<#>` の SQL 実行経路が main に入るまで、`bench.yml` の週次／dispatch や `make bench-c1` など SQL を実行する bench・example・crossdb の自作 DB 側は実行時に失敗する（文字列検査のテストでは検知されない）。#1977・#1991 のマージ後に実行確認する
 - 未検証: `<#>` の実行は #1977・#1991 のマージ後に確認する。具体的には `c1_bench_accept` の
   e2e オラクル照合、`scan_stage_profile_accept`、HNSW への到達（`EXPLAIN` の `engine: hnsw`）、
   `self_db.py` の `explain`・`udf_call` が `unsupported` に丸められていないこと
