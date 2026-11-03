@@ -11,6 +11,10 @@
 
 use super::EngineCore;
 use crate::catalog::role;
+pub use crate::catalog::role::bootstrap::{
+    BootstrapEntry, BootstrapEntryKind, BootstrapError, BootstrapPrivileges, BootstrapReport,
+    BootstrapUser,
+};
 
 /// ログイン識別子の解決に失敗した（破損・読み取り失敗・不正な入力）。内容は持たない（固定文言）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +45,14 @@ pub struct LoginRoleCredentials {
     pub valid_until: Option<i64>,
     /// `CONNECTION LIMIT`（-1 は無制限）。
     pub connection_limit: i32,
+    /// users ファイルの旧形式ハッシュ（Argon2id の PHC。空は未設定。ブートストラップで取り込んだ値で、
+    /// `ALTER ROLE ... PASSWORD` で空になる。Issue #2238・ADR D3）。
+    pub legacy_phc: String,
+    /// テナントのブートストラップ済みマーカーがあるか（users ファイル経路で引いたときだけ意味を持つ。
+    /// ログイン識別子の経路では常に `false`）。真なら資格情報の照合元はカタログだけになる。
+    pub bootstrapped: bool,
+    /// ロールの初期権限（ブートストラップ由来。無ければ権限なし）。
+    pub initial_privileges: BootstrapPrivileges,
 }
 
 impl std::fmt::Debug for LoginRoleCredentials {
@@ -96,10 +108,15 @@ impl EngineCore {
             role::TenantRoleLookup::NotAuthoritative => {
                 Ok(UsersFileRoleBinding::CatalogNotAuthoritative)
             }
-            role::TenantRoleLookup::Missing => Ok(UsersFileRoleBinding::Missing),
-            role::TenantRoleLookup::Found(def) => {
+            role::TenantRoleLookup::Missing { .. } => Ok(UsersFileRoleBinding::Missing),
+            role::TenantRoleLookup::Found {
+                def,
+                bootstrapped,
+                privileges,
+            } => {
                 let scram_verifier =
                     String::from_utf8(def.scram_verifier).map_err(|_| LoginLookupError)?;
+                let legacy_phc = String::from_utf8(def.legacy_phc).map_err(|_| LoginLookupError)?;
                 Ok(UsersFileRoleBinding::Role(LoginRoleCredentials {
                     tenant_id: tenant_id.to_string(),
                     role_id: def.id,
@@ -108,9 +125,22 @@ impl EngineCore {
                     login: def.attributes.login,
                     valid_until: def.valid_until,
                     connection_limit: def.connection_limit,
+                    legacy_phc,
+                    bootstrapped,
+                    initial_privileges: privileges,
                 }))
             }
         }
+    }
+
+    /// users ファイルの行を、テナントごとの状態表に従ってカタログへ反映する（起動時に 1 回。冪等。
+    /// SQL-39 (3)(5)・Issue #2238）。呼び出し元は wire-server の `auth::bootstrap`。失敗したら何も書かない
+    /// ので、呼び出し側は起動を拒否する（fail-closed）。
+    pub fn bootstrap_users_file(
+        &self,
+        users: &[BootstrapUser],
+    ) -> Result<BootstrapReport, BootstrapError> {
+        self.storage.bootstrap_users_file(users)
     }
 
     /// `identifier` がカタログのログイン識別子の正規形か（形だけの判定。存在は調べない）。認証経路の
@@ -150,6 +180,9 @@ impl EngineCore {
             login: resolved.role.attributes.login,
             valid_until: resolved.role.valid_until,
             connection_limit: resolved.role.connection_limit,
+            legacy_phc: String::new(),
+            bootstrapped: false,
+            initial_privileges: resolved.privileges,
         }))
     }
 

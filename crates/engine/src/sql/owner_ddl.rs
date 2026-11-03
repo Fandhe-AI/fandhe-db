@@ -40,7 +40,8 @@ pub(crate) fn execute_alter_owner(
 ) -> Result<AlterOwnerOutcome, SqlSurfaceError> {
     // 現在ロールの束縛（カタログ照会・名前解決より前。運用者権限があっても束縛が要る）。
     let actor = crate::sql::privilege_gate::bound_principal(session)?;
-    let operator = crate::sql::privilege_gate::is_owner_equivalent(session);
+    // ALTER OWNER の運用者判定は DDL 権限（`ddl_allowed`）のまま（初期ロールの全権限では所有権を奪えない。Issue #2238）。
+    let operator = crate::sql::privilege_gate::require_server_ddl(session).is_ok();
     let new_owner = match &stmt.new_owner {
         RoleSpec::Name(n) => NewOwnerRef::Name(n),
         RoleSpec::CurrentRole => NewOwnerRef::Id(actor),

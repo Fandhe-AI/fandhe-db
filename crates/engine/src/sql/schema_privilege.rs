@@ -22,7 +22,7 @@ use crate::sql::mode::SessionState;
 
 /// ACL で判定すべき主体（束縛ロールの ID）。判定を飛ばす主体（未束縛・所有者相当）は `None`。
 pub(crate) fn acl_checked_principal(session: &SessionState) -> Option<u64> {
-    if session.ddl_allowed() {
+    if session.owner_equivalent() {
         return None;
     }
     match session.current_role_id() {

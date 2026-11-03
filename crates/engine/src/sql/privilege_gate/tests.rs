@@ -120,6 +120,27 @@ fn owner_equivalent_follows_ddl_allowed_only() {
 }
 
 #[test]
+fn bootstrap_all_privileges_is_owner_equivalent_for_session_role_only() {
+    // 未束縛では効かない（フラグだけでは所有者相当にならない）。
+    let mut unbound = SessionState::default();
+    unbound.grant_bootstrap_all_privileges();
+    assert!(!is_owner_equivalent(&unbound));
+    // 束縛済みで現在ロール＝セッションのロールなら所有者相当（ACL の照会は不要）で、DDL は通さない。
+    let mut s = SessionState::default();
+    s.bind_role_ids(7, 7);
+    s.grant_bootstrap_all_privileges();
+    assert!(is_owner_equivalent(&s));
+    assert!(!Principal::from_session(&s).needs_acl_lookup());
+    assert!(is_denied(require_server_ddl(&s)));
+    // SET ROLE 相当で現在ロールが変わると外れ、ACL の照会が要る。
+    s.set_current_role_id(9);
+    assert!(!is_owner_equivalent(&s));
+    assert!(Principal::from_session(&s).needs_acl_lookup());
+    s.reset_current_role();
+    assert!(is_owner_equivalent(&s));
+}
+
+#[test]
 fn denial_message_is_fixed_and_has_no_detail() {
     let mut s = SessionState::default();
     s.bind_role_ids(4242, 4242);

@@ -32,6 +32,8 @@ use crate::sql::mode::SessionState;
 pub(crate) struct Principal {
     /// `--ddl-allowed-users` 由来の運用者権限（認証層が `allow_ddl` で 1 回だけ立てる）。
     ddl_allowed: bool,
+    /// オブジェクト権限で ACL を飛ばす所有者相当（運用者権限、または初期ロールの全権限。DDL 可否とは別。Issue #2238）。
+    owner_equivalent: bool,
     /// 現在ロール ID（未束縛は `None`。`0` は PUBLIC の予約値で未束縛と同一視する）。
     current_role_id: Option<u64>,
 }
@@ -40,7 +42,7 @@ impl Principal {
     /// オブジェクト権限の判定に ACL の照会が要るか（束縛済みで運用者権限を持たない主体）。
     /// 偽なら [`check`] は ACL の中身に関係なく結果が決まるので、呼び出し元は照会を省略できる。
     pub(crate) fn needs_acl_lookup(&self) -> bool {
-        self.current_role_id.is_some() && !self.ddl_allowed
+        self.current_role_id.is_some() && !self.owner_equivalent
     }
 
     /// ACL の照会に使う付与先ロール ID（束縛済みのときだけ `Some`）。
@@ -52,6 +54,7 @@ impl Principal {
     pub(crate) fn from_session(session: &SessionState) -> Self {
         Self {
             ddl_allowed: session.ddl_allowed(),
+            owner_equivalent: session.owner_equivalent(),
             current_role_id: session.current_role_id(),
         }
     }
@@ -244,7 +247,7 @@ fn check_required(
             // PUBLIC の予約 ID は主体になれない（`bound_principal` と同じく拒否）。
             Some(0) => Err(SqlSurfaceError::RelationPermissionDenied),
             Some(_) => {
-                if principal.ddl_allowed || (bits != 0 && granted_bits & bits == bits) {
+                if principal.owner_equivalent || (bits != 0 && granted_bits & bits == bits) {
                     Ok(GateDecision::Allowed)
                 } else {
                     Err(SqlSurfaceError::RelationPermissionDenied)
@@ -314,10 +317,11 @@ pub(crate) fn bound_principal(session: &SessionState) -> Result<u64, SqlSurfaceE
     }
 }
 
-/// 運用者権限による「所有者相当」の判定（運用者権限の有無と一致し、ロールの束縛に影響されない）。
-/// 実際のオブジェクト所有者（#2236）は、これとは別に所有者行で判定して加算する（縮めない。ADR O1）。
+/// 運用者権限、または初期ロールの全権限（現在ロール＝セッションのロールのとき）による「所有者相当」の判定
+/// （Issue #2238。DDL の可否とは別軸）。実際のオブジェクト所有者（#2236）は、これとは別に所有者行で判定して
+/// 加算する（縮めない。ADR O1）。
 pub(crate) fn is_owner_equivalent(session: &SessionState) -> bool {
-    require_server_ddl(session).is_ok()
+    session.owner_equivalent()
 }
 
 pub(crate) mod copy;

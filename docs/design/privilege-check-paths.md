@@ -34,6 +34,10 @@ Phase 6 の共通ゲートへ移行する前に結線漏れと README の再陳�
 `GRANT`／`REVOKE` は対象・ロールの有無を問わず `42501` になる（後述）。所有者の概念は #2236 で追加済み（`object_owners`。`ddl_allowed` の所有者相当に加算）。
 DDL 権限は全テナント共有のカタログを変更する操作の運用者権限であり、軸 1 とは独立に評価される。
 
+Issue #2238 以降、オブジェクト権限の「所有者相当」は運用者権限（`ddl_allowed`）に加えて、ブートストラップで作られた初期ロールの全権限
+（`SessionState::owner_equivalent`。現在ロール＝セッションのロールのときだけ）で成立する。判定点は増やさず、DDL の可否は従来どおり `ddl_allowed` だけで決まる。
+HTTP の `SessionPrincipal::session_state()` も同名ロールがあれば現在ロールを束縛する（ADR §19）。
+
 ## 権限ビットの注入点（本番コード）
 
 権限ビットは認証成功後に 1 回だけ `SessionState::allow_ddl()`（`crates/engine/src/sql/mode.rs`）で立てる。
@@ -268,7 +272,8 @@ SQL 表層・HTTP 表層の主体付き入口だけがゲートを通る。
 | `git grep -n 'privilege_gate::write::' -- crates/engine/src` | `core.rs`（`parse_tokens_gated`・分割実行・TRUNCATE）、`core/temp_route.rs`（拡張クエリ・TRUNCATE）、`sql/exec.rs`・`tenant.rs`（再判定の受け渡し）。#1968 の記録時点 |
 | `git grep -n 'privilege_gate::copy::' -- crates/engine/src` | `core.rs`（`begin_copy_unscrubbed`・`begin_copy_active_inner`）と `core/temp_route.rs`（拡張クエリ）。#1969 の記録時点 |
 | `git grep -n 'SessionState::default()' -- crates/wire-server/src/http` | `http/query/` の本番コードには無い（`session/middleware.rs` の `session_state()` のみ。残りは `#[cfg(test)]`）。#1969 の記録時点 |
-| `git grep -n 'ddl_allowed()' -- crates/engine/src` | `sql/privilege_gate.rs`（`Principal::from_session`）と `sql/mode.rs`（定義）、テストのみ |
+| `git grep -n 'ddl_allowed()' -- crates/engine/src` | `sql/privilege_gate.rs`（`Principal::from_session`）と `sql/mode.rs`（定義・`owner_equivalent`）、`sql/grant_ddl.rs`・`sql/role_ddl.rs`（メンバーシップの root 判定。#2238 後も DDL 権限のまま）、テストのみ |
+| `git grep -n 'owner_equivalent()' -- crates/engine/src` | `sql/privilege_gate.rs`（`Principal::from_session`・`is_owner_equivalent`）と `sql/schema_privilege.rs`。初期ロールの全権限（#2238）はここだけに作用し、DDL の判定（`ddl_allowed`）には混ぜない |
 | `git grep -n 'allow_ddl()' -- crates/wire-server/src` | 本番注入点は `handshake.rs` と `http/query/ddl.rs`。`extended_query.rs` は `#[cfg(test)]` |
 | `git grep -n '42501' -- crates/engine/src crates/wire-server/src` | 権限ゲート以外の発生源は上表のとおり |
 

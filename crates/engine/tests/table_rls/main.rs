@@ -65,6 +65,7 @@ mod row_id_tenant_scope;
 mod sql39_alter_set_role;
 mod sql39_role_ddl;
 mod sql39_role_login;
+mod sql39_users_file_bootstrap;
 mod sql39_users_file_role;
 mod sql40_default_privileges;
 mod sql40_grant_revoke;
