@@ -2331,6 +2331,17 @@ impl<'a> AdaptiveShaderSelector<'a> {
     }
 }
 
+/// tile／chunk 境界の協調キャンセルポイント（Issue #1953。SQL-71 のポインタ）。中断は必ず
+/// [`BatchExecError::Input`] で返す: `Backend` にすると `batch_fallback.rs::FallbackBatchEngine` が
+/// CPU 縮退（とラッチ）へ切り替えてしまい、中断した文を黙って再実行する fail-open になるため。
+fn check_batch_interrupt() -> Result<(), BatchExecError> {
+    crate::interrupt::check_reason()
+        .and_then(|()| crate::interrupt::check_now_reason())
+        .map_err(|reason| {
+            BatchExecError::Input(crate::batch_search::BatchSearchError::QueryCanceled { reason })
+        })
+}
+
 fn run_tiled_batch_search(
     ctx: &GpuContext,
     matrix: &crate::batch_search::ResidentMatrix,
@@ -2354,6 +2365,7 @@ fn run_tiled_batch_search(
     results.resize_with(queries.len(), || None);
 
     for group in &groups {
+        check_batch_interrupt()?;
         let Some(&first_idx) = group.first() else {
             continue;
         };
@@ -2377,6 +2389,7 @@ fn run_tiled_batch_search(
         let plan = plan_query_tile(group.len(), budget_bytes, ctx.max_workgroups_per_dimension);
 
         for tile in group.chunks(plan.width.max(1)) {
+            check_batch_interrupt()?;
             let width = tile.len();
 
             // タイル内の各クエリを `query_stride` へパディングして連結する
@@ -2434,6 +2447,7 @@ fn run_tiled_batch_search(
             match mode {
                 GpuReadbackMode::FullScores => {
                     for chunk in reachable.chunks(plan.chunk_rows.max(1)) {
+                        check_batch_interrupt()?;
                         let scores = dispatch_dot_products(
                             ctx,
                             target,
@@ -2499,6 +2513,7 @@ fn run_tiled_batch_search(
                     )
                     .max(1);
                     for chunk in reachable.chunks(chunk_rows) {
+                        check_batch_interrupt()?;
                         let num_workgroups =
                             chunk.len().div_ceil(GPU_WORKGROUP_SIZE as usize).max(1);
                         let readback = dispatch_partial_topk(
@@ -2573,6 +2588,11 @@ fn run_tiled_batch_search(
             }
         }
     }
+
+    // 最終 dispatch・readback の後にも期限を即時確認する（group/tile/chunk 開始前だけでは、
+    // 1 group・1 tile・1 chunk のバッチが期限超過のまま成功を返す。Issue #1953）。
+    // PartialTopK 経路も同じ合流点を通る。
+    check_batch_interrupt()?;
 
     Ok(hits)
 }

@@ -696,7 +696,7 @@ fn map_function_error(e: CatalogError) -> SqlSurfaceError {
         CatalogError::TableNotFound(_) => {
             SqlSurfaceError::undefined_function("function schema does not exist")
         }
-        CatalogError::WriteLockTimeout => SqlSurfaceError::LockNotAvailable,
+        CatalogError::WriteLockTimeout => crate::interrupt::lock_wait_error(),
         // 所有者でない主体の DROP（Issue #2236）。対象名・所有者を含めない固定の `42501`。
         CatalogError::NotObjectOwner => SqlSurfaceError::InsufficientPrivilege,
         _ => SqlSurfaceError::Internal {

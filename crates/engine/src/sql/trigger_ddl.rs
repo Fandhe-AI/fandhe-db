@@ -112,7 +112,7 @@ fn map_trigger_error(e: CatalogError, trigger_name: &str) -> SqlSurfaceError {
         CatalogError::TableNotFound(name) => SqlSurfaceError::UndefinedTable { name },
         CatalogError::WrongObjectKind(name) => SqlSurfaceError::WrongObjectType { name },
         CatalogError::ColumnNotFound(name) => SqlSurfaceError::undefined_column(name),
-        CatalogError::WriteLockTimeout => SqlSurfaceError::LockNotAvailable,
+        CatalogError::WriteLockTimeout => crate::interrupt::lock_wait_error(),
         _ => SqlSurfaceError::Internal {
             detail: "trigger catalog operation failed".to_string(),
         },

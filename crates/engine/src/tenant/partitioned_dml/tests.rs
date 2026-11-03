@@ -1269,3 +1269,239 @@ fn cancel_before_first_chunk_of_resumed_job_writes_cancelled_record() {
         Some(JobRecord::Cancelled { committed: 3, .. })
     ));
 }
+// --- 文の期限（Issue #1953。SQL-71 (4)・SQL-32 のポインタ） ---
+//
+// 分割実行は `interrupt::suppressed` の下で動くため、期限は `chunk_loop` が注入時計で明示評価する。
+// 実時間の期限は 1 時間先に置いて実時間の確認点（共有の適用段の `check`）を発火させず、疑似時計だけで
+// 超過を作る。
+
+/// 疑似時計: `jump_after` 回目以降の読み出しは `base + 2h`（実期限 `base + 1h` を超える）を返す。
+struct JumpClock {
+    base: Instant,
+    reads: Cell<u32>,
+    jump_after: Cell<u32>,
+}
+
+impl JumpClock {
+    fn new(jump_after: u32) -> Self {
+        Self {
+            base: Instant::now(),
+            reads: Cell::new(0),
+            jump_after: Cell::new(jump_after),
+        }
+    }
+    fn now(&self) -> Instant {
+        let n = self.reads.get();
+        self.reads.set(n + 1);
+        if n >= self.jump_after.get() {
+            self.base + Duration::from_secs(7200)
+        } else {
+            self.base
+        }
+    }
+    fn deadline(&self) -> crate::interrupt::StatementDeadline {
+        crate::interrupt::StatementDeadline::at(self.base + Duration::from_secs(3600))
+    }
+}
+
+#[test]
+fn deadline_before_first_chunk_leaves_no_trace() {
+    let (storage, _g) = setup("pdml-deadline-first");
+    let rows: Vec<(u64, &str)> = (1..=9).map(|i| (i, "x")).collect();
+    seed(&storage, "t-a", &rows);
+    let o = op("op-dl-first");
+    let clock = JumpClock::new(0);
+    let now = || clock.now();
+    let _scope = crate::interrupt::DeadlineScope::install(clock.deadline());
+    let mut hooks = Hooks {
+        clock: &now,
+        after_chunk: None,
+        privilege: None,
+    };
+    let err = run_delete(
+        &storage,
+        "t-a",
+        &o,
+        &hash(b"h-dl1"),
+        &limits(3, 1000, 1000),
+        None,
+        match_x as Pred,
+        &mut hooks,
+    )
+    .expect_err("deadline");
+    assert!(matches!(err.cause, PartitionedStopCause::DeadlineExceeded));
+    assert_eq!(err.committed_total, 0);
+    assert_eq!(rows_of(&storage, "t-a").len(), 9);
+    assert!(job_record(&storage, "t-a", &o).is_none());
+    assert!(!ledger_has(&storage, "t-a", &o));
+}
+
+#[test]
+fn deadline_after_first_chunk_keeps_committed_chunk_and_resend_resumes() {
+    let (storage, _g) = setup("pdml-deadline-resume");
+    let rows: Vec<(u64, &str)> = (1..=9).map(|i| (i, "x")).collect();
+    seed(&storage, "t-a", &rows);
+    let o = op("op-dl-resume");
+    let h = hash(b"h-dl2");
+    let clock = JumpClock::new(u32::MAX);
+    let now = || clock.now();
+    {
+        let _scope = crate::interrupt::DeadlineScope::install(clock.deadline());
+        // 第 1 チャンクの commit 後（after_chunk）に時計を期限の先へ進める。
+        let mut hook = |n: usize| {
+            if n == 1 {
+                clock.jump_after.set(0);
+            }
+        };
+        let mut hooks = Hooks {
+            clock: &now,
+            after_chunk: Some(&mut hook),
+            privilege: None,
+        };
+        let err = run_delete(
+            &storage,
+            "t-a",
+            &o,
+            &h,
+            &limits(3, 1000, 1000),
+            None,
+            match_x as Pred,
+            &mut hooks,
+        )
+        .expect_err("deadline");
+        assert!(matches!(err.cause, PartitionedStopCause::DeadlineExceeded));
+        // commit 済みのチャンクは残り、実行中だったチャンクは巻き戻る。
+        assert_eq!(err.committed_total, 3);
+        assert_eq!(rows_of(&storage, "t-a").len(), 6);
+        assert!(matches!(
+            job_record(&storage, "t-a", &o),
+            Some(JobRecord::Running { processed: 3, .. })
+        ));
+    }
+    // 同じ operation_id を期限なしで再送すると続きから完走し、累計が正しい。
+    let outcome = run_delete(
+        &storage,
+        "t-a",
+        &o,
+        &h,
+        &limits(3, 1000, 1000),
+        None,
+        match_x as Pred,
+        &mut real_hooks(None),
+    )
+    .expect("resume completes");
+    assert_eq!(outcome, PartitionedDmlOutcome::Completed { total_rows: 9 });
+    assert!(rows_of(&storage, "t-a").is_empty());
+}
+
+#[test]
+fn deadline_during_scan_discards_the_running_chunk() {
+    let (storage, _g) = setup("pdml-deadline-scan");
+    let rows: Vec<(u64, &str)> = (1..=6).map(|i| (i, "x")).collect();
+    seed(&storage, "t-a", &rows);
+    let o = op("op-dl-scan");
+    let clock = JumpClock::new(u32::MAX);
+    let now = || clock.now();
+    let _scope = crate::interrupt::DeadlineScope::install(clock.deadline());
+    // 3 行目の評価で時計を期限の先へ進める（走査の行ごとの確認点で検出される）。
+    let pred = |c: &DmlCandidate<'_>| -> Result<bool, Infallible> {
+        if c.id == 3 {
+            clock.jump_after.set(0);
+        }
+        Ok(true)
+    };
+    let mut hooks = Hooks {
+        clock: &now,
+        after_chunk: None,
+        privilege: None,
+    };
+    let err = run_delete(
+        &storage,
+        "t-a",
+        &o,
+        &hash(b"h-dl3"),
+        &limits(1000, 1000, 1000),
+        None,
+        pred,
+        &mut hooks,
+    )
+    .expect_err("deadline");
+    assert!(matches!(err.cause, PartitionedStopCause::DeadlineExceeded));
+    assert_eq!(err.committed_total, 0);
+    assert_eq!(rows_of(&storage, "t-a").len(), 6);
+    assert!(job_record(&storage, "t-a", &o).is_none());
+    assert!(!ledger_has(&storage, "t-a", &o));
+}
+
+#[test]
+fn deadline_during_apply_discards_the_running_chunk_instead_of_committing_partially() {
+    let (storage, _g) = setup("pdml-deadline-apply");
+    let rows: Vec<(u64, &str)> = (1..=6).map(|i| (i, "x")).collect();
+    seed(&storage, "t-a", &rows);
+    let o = op("op-dl-apply");
+    let clock = JumpClock::new(u32::MAX);
+    let now = || clock.now();
+    let _scope = crate::interrupt::DeadlineScope::install(clock.deadline());
+    // 走査の最後の行を評価した時点では期限内のままにし、走査を終えた直後（適用段の最初の時計読み出し）
+    // から期限超過にする。走査の行ごとの確認は「評価の後」に 1 回時計を読むため、最後の行の読み出しは
+    // 適用段より前に済んでいる。
+    let evaluated = Cell::new(0u32);
+    let pred = |_: &DmlCandidate<'_>| -> Result<bool, Infallible> {
+        evaluated.set(evaluated.get() + 1);
+        if evaluated.get() == 6 {
+            // この行の確認（1 回）の後から超過させる。
+            clock.jump_after.set(clock.reads.get() + 1);
+        }
+        Ok(true)
+    };
+    let mut hooks = Hooks {
+        clock: &now,
+        after_chunk: None,
+        privilege: None,
+    };
+    let err = run_delete(
+        &storage,
+        "t-a",
+        &o,
+        &hash(b"h-dl4"),
+        &limits(1000, 1000, 1000),
+        None,
+        pred,
+        &mut hooks,
+    )
+    .expect_err("deadline");
+    assert!(matches!(err.cause, PartitionedStopCause::DeadlineExceeded));
+    assert_eq!(evaluated.get(), 6, "the scan stage must have completed");
+    // 1 件目の適用後に期限を検出しても、そのチャンクは commit されない（部分 commit にしない）。
+    assert_eq!(err.committed_total, 0);
+    assert_eq!(rows_of(&storage, "t-a").len(), 6);
+    assert!(job_record(&storage, "t-a", &o).is_none());
+    assert!(!ledger_has(&storage, "t-a", &o));
+}
+
+#[test]
+fn disabled_deadline_does_not_affect_the_job() {
+    let (storage, _g) = setup("pdml-deadline-disabled");
+    let rows: Vec<(u64, &str)> = (1..=9).map(|i| (i, "x")).collect();
+    seed(&storage, "t-a", &rows);
+    let clock = JumpClock::new(0);
+    let now = || clock.now();
+    // 期限を入れなければ、時計がどれだけ進んでも期限超過では止まらない。
+    let mut hooks = Hooks {
+        clock: &now,
+        after_chunk: None,
+        privilege: None,
+    };
+    let outcome = run_delete(
+        &storage,
+        "t-a",
+        &op("op-dl-off"),
+        &hash(b"h-dl5"),
+        &limits(3, 1000, 1_000_000_000),
+        None,
+        match_x as Pred,
+        &mut hooks,
+    )
+    .expect("completes");
+    assert_eq!(outcome, PartitionedDmlOutcome::Completed { total_rows: 9 });
+}

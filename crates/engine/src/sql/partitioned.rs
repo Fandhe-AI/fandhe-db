@@ -177,6 +177,11 @@ pub(crate) fn map_partitioned_failure<E>(
         PartitionedStopCause::InterruptedRecordLimitReached => {
             SqlSurfaceError::payload_too_large(MSG_INTERRUPTED_LIMIT)
         }
+        // Issue #1953（SQL-71 (4)）: 文の期限超過。最初の commit 前は `57014`、commit 済みなら下で
+        // `VD001`（原因クラス `57014`）になる。
+        PartitionedStopCause::DeadlineExceeded => SqlSurfaceError::QueryCanceled {
+            reason: crate::interrupt::InterruptReason::StatementTimeout,
+        },
         // 上で返却済み（網羅性のための到達不能腕。fail-closed に内部エラー）。
         _ => SqlSurfaceError::Internal {
             detail: format!("{op} failed"),
@@ -315,7 +320,7 @@ pub(crate) fn execute_cancel(
         let txn = storage.begin_write_txn().map_err(|e| match e {
             crate::storage::StorageError::WriteLockTimeout
             | crate::storage::StorageError::WriteTxnHeldByCurrentSession => {
-                SqlSurfaceError::LockNotAvailable
+                crate::interrupt::lock_wait_error()
             }
             _ => SqlSurfaceError::Internal {
                 detail: "cancel failed".to_string(),
@@ -449,6 +454,24 @@ mod tests {
             0,
         );
         assert_eq!(e.wire_code(), "23505");
+    }
+
+    /// Issue #1953（SQL-71 (4)）: 文の期限超過は、最初の commit 前なら `57014`、commit 済みなら
+    /// `VD001`（原因 `57014`。件数と operation_id を含む固定文言）。
+    #[test]
+    fn deadline_exceeded_maps_to_57014_before_commit_and_vd001_after() {
+        let e = map(PartitionedStopCause::DeadlineExceeded, 0);
+        assert_eq!(e.wire_code(), "57014");
+        assert_eq!(
+            e.to_string(),
+            "canceling statement due to statement timeout"
+        );
+        let e = map(PartitionedStopCause::DeadlineExceeded, 4);
+        assert_eq!(e.wire_code(), "VD001");
+        let msg = e.client_message();
+        assert!(msg.contains("committed 4 rows"), "{msg}");
+        assert!(msg.contains("cause 57014"), "{msg}");
+        assert!(msg.contains("operation_id 'op-1'"), "{msg}");
     }
 
     #[test]

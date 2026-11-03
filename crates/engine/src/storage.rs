@@ -1056,7 +1056,7 @@ impl Storage {
     pub(crate) fn begin_partitioned_chunk_txn(&self) -> Result<GatedWriteTxn> {
         let permit = self
             .writer_gate
-            .acquire_yielding(self.write_lock_wait)
+            .acquire_yielding(crate::interrupt::effective_lock_wait(self.write_lock_wait))
             .map_err(|e| match e {
                 writer_gate::GateError::Timeout => StorageError::WriteLockTimeout,
                 writer_gate::GateError::HeldByCurrentThread => {
@@ -1067,12 +1067,12 @@ impl Storage {
         self.wrap_gated(txn, permit)
     }
 
-    /// ゲートを待機上限（[`Self::write_lock_wait`]）つきで取得する。超過は
+    /// ゲートを待機上限（[`Self::write_lock_wait`]。文の期限があれば残り時間で短縮。#1953）つきで取得する。超過は
     /// `WriteLockTimeout`、同一スレッドからの再入は `WriteTxnHeldByCurrentSession`
     /// （いずれも `55P03`）。
     fn acquire_writer_permit(&self) -> Result<writer_gate::WriterPermit> {
         self.writer_gate
-            .acquire(self.write_lock_wait)
+            .acquire(crate::interrupt::effective_lock_wait(self.write_lock_wait))
             .map_err(|e| match e {
                 writer_gate::GateError::Timeout => StorageError::WriteLockTimeout,
                 writer_gate::GateError::HeldByCurrentThread => {
