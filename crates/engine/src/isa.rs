@@ -1572,6 +1572,286 @@ pub fn dot_i8_scalar(a: &[i8], b: &[i8]) -> i32 {
         acc.wrapping_add(i32::from(x).wrapping_mul(i32::from(y)))
     })
 }
+// ---------------------------------------------------------------------------
+// popcount カーネル（Issue #2022・親 #2020・TABLE-48 ポインタ）
+//
+// 二値ベクトル（MSB 先頭のバイト詰めビット列）の Hamming／Jaccard 距離の素となる
+// 整数カウントを求める。intrinsics は使わず `count_ones` の自動ベクトル化に任せる
+// （ADR `docs/design/simd-intrinsics-adoption.md` 決定 1 のポインタ load 禁止には触れない）。
+// 呼び出し元は `kernel/bit.rs`（長さ検証・パディングのマスク・距離値化・Top-k）。
+// 整数演算なので全 ISA 版は scalar と完全一致する（許容差なし）。
+//
+// 8 バイト未満の末尾はバイト単位ではなく零埋め `[u8; 8]` の 1 語として数える。
+// バイト単位の端数ループは x86 で `vpinsrb` を生み、生成コード検査の禁止命令に当たる。
+// AVX-512F 単独版は AVX2 版と同一コード（ymm の vpshufb／vpsadbw）になり検査が
+// 空振りするため採用せず、`avx512vpopcntdq` を確認したトークンの経路だけを置く。
+// ---------------------------------------------------------------------------
+
+/// x86_64 AVX-512 VPOPCNTDQ（`avx512f,avx512vpopcntdq`）対応の実行時確認済み
+/// トークン（sealed。[`NeonToken`] と同じ方針で外部上書き経路は作らない）。
+#[cfg(target_arch = "x86_64")]
+#[derive(Debug, Clone, Copy)]
+pub struct Avx512VpopcntdqToken(());
+
+#[cfg(target_arch = "x86_64")]
+impl Avx512VpopcntdqToken {
+    /// crate 内からのみ呼べる（[`NeonToken::try_new`] と同じ sealed 方針）。
+    pub(crate) fn try_new() -> Option<Self> {
+        if std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512vpopcntdq")
+        {
+            Some(Avx512VpopcntdqToken(()))
+        } else {
+            None
+        }
+    }
+}
+
+/// [`PopcountKernel`] が使う ISA を表す判別子。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetectedPopcountIsa {
+    /// スカラー（全 arch のフォールバック）。
+    Scalar,
+    /// aarch64 NEON（`cnt`）。
+    Neon,
+    /// x86_64 AVX2（ニブル LUT の `vpshufb`／`vpsadbw`）。
+    Avx2,
+    /// x86_64 AVX-512 VPOPCNTDQ（`vpopcntq`）。
+    Avx512Vpopcntdq,
+}
+
+/// Jaccard 距離の素となる 2 つの整数カウント。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JaccardCounts {
+    /// `popcount(a & b)`。
+    pub intersection: u64,
+    /// `popcount(a | b)`。
+    pub union: u64,
+}
+
+/// popcount カーネルのディスパッチ（機能トークン形。ADR 決定 3）。
+///
+/// `SimdKernel`・[`F16Kernel`]・[`I8Kernel`] とは独立の `OnceLock` を持つ。
+/// 優先順: x86_64 は Avx512Vpopcntdq → Avx2 → Scalar、aarch64 は Neon → Scalar、
+/// それ以外は Scalar（[`detect_popcount`]）。
+#[derive(Debug, Clone, Copy)]
+pub enum PopcountKernel {
+    /// スカラー。
+    Scalar,
+    /// aarch64 NEON。
+    #[cfg(target_arch = "aarch64")]
+    Neon(NeonToken),
+    /// x86_64 AVX2（既存の [`Avx2FmaToken`] を再利用する。`avx2,fma` は証明範囲内）。
+    #[cfg(target_arch = "x86_64")]
+    Avx2(Avx2FmaToken),
+    /// x86_64 AVX-512 VPOPCNTDQ。
+    #[cfg(target_arch = "x86_64")]
+    Avx512Vpopcntdq(Avx512VpopcntdqToken),
+}
+
+impl PopcountKernel {
+    /// このカーネルが使う ISA。
+    pub fn isa(self) -> DetectedPopcountIsa {
+        match self {
+            PopcountKernel::Scalar => DetectedPopcountIsa::Scalar,
+            #[cfg(target_arch = "aarch64")]
+            PopcountKernel::Neon(_) => DetectedPopcountIsa::Neon,
+            #[cfg(target_arch = "x86_64")]
+            PopcountKernel::Avx2(_) => DetectedPopcountIsa::Avx2,
+            #[cfg(target_arch = "x86_64")]
+            PopcountKernel::Avx512Vpopcntdq(_) => DetectedPopcountIsa::Avx512Vpopcntdq,
+        }
+    }
+
+    /// `popcount(a ^ b)`（Hamming 距離）。長さが異なる場合は [`hamming_scalar`] と
+    /// 同じく短い方へ切り詰める（長さの検証は `kernel/bit.rs` の責務）。
+    pub fn hamming(self, a: &[u8], b: &[u8]) -> u64 {
+        match self {
+            PopcountKernel::Scalar => hamming_scalar(a, b),
+            #[cfg(target_arch = "aarch64")]
+            PopcountKernel::Neon(_) => {
+                // SAFETY: この variant は `NeonToken::try_new` が実行時確認できた場合
+                // にのみ構築される sealed トークンを保持する。値の存在が CPU 対応の
+                // 証明であり、`hamming_neon` の `#[target_feature]` 契約を満たす。
+                unsafe { hamming_neon(a, b) }
+            }
+            #[cfg(target_arch = "x86_64")]
+            PopcountKernel::Avx2(_) => {
+                // SAFETY: この variant は `Avx2FmaToken::try_new` が avx2 と fma を
+                // 実行時確認できた場合にのみ構築される sealed トークンを保持する。
+                // `hamming_avx2` の `#[target_feature]` 契約を満たす。
+                unsafe { hamming_avx2(a, b) }
+            }
+            #[cfg(target_arch = "x86_64")]
+            PopcountKernel::Avx512Vpopcntdq(_) => {
+                // SAFETY: この variant は `Avx512VpopcntdqToken::try_new` が avx512f と
+                // avx512vpopcntdq を実行時確認できた場合にのみ構築される sealed
+                // トークンを保持する。`hamming_avx512_vpopcntdq` の契約を満たす。
+                unsafe { hamming_avx512_vpopcntdq(a, b) }
+            }
+        }
+    }
+
+    /// `popcount(a & b)` と `popcount(a | b)`（Jaccard 距離の素）。長さの扱いは
+    /// [`PopcountKernel::hamming`] と同じ。
+    pub fn jaccard_counts(self, a: &[u8], b: &[u8]) -> JaccardCounts {
+        match self {
+            PopcountKernel::Scalar => jaccard_counts_scalar(a, b),
+            #[cfg(target_arch = "aarch64")]
+            PopcountKernel::Neon(_) => {
+                // SAFETY: この variant は `NeonToken::try_new` が実行時確認できた場合
+                // にのみ構築される sealed トークンを保持する。
+                // `jaccard_counts_neon` の `#[target_feature]` 契約を満たす。
+                unsafe { jaccard_counts_neon(a, b) }
+            }
+            #[cfg(target_arch = "x86_64")]
+            PopcountKernel::Avx2(_) => {
+                // SAFETY: この variant は `Avx2FmaToken::try_new` が avx2 と fma を
+                // 実行時確認できた場合にのみ構築される sealed トークンを保持する。
+                // `jaccard_counts_avx2` の `#[target_feature]` 契約を満たす。
+                unsafe { jaccard_counts_avx2(a, b) }
+            }
+            #[cfg(target_arch = "x86_64")]
+            PopcountKernel::Avx512Vpopcntdq(_) => {
+                // SAFETY: この variant は `Avx512VpopcntdqToken::try_new` が avx512f と
+                // avx512vpopcntdq を実行時確認できた場合にのみ構築される sealed
+                // トークンを保持する。`jaccard_counts_avx512_vpopcntdq` の契約を満たす。
+                unsafe { jaccard_counts_avx512_vpopcntdq(a, b) }
+            }
+        }
+    }
+}
+
+/// このホストで使う [`PopcountKernel`] を実行時に選ぶ。外部からの上書き経路は
+/// 持たない（CORE-12）。
+pub fn detect_popcount() -> PopcountKernel {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if let Some(token) = Avx512VpopcntdqToken::try_new() {
+            return PopcountKernel::Avx512Vpopcntdq(token);
+        }
+        if let Some(token) = Avx2FmaToken::try_new() {
+            return PopcountKernel::Avx2(token);
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if let Some(token) = NeonToken::try_new() {
+            return PopcountKernel::Neon(token);
+        }
+    }
+    PopcountKernel::Scalar
+}
+
+/// プロセス内で 1 回だけ [`detect_popcount`] を実行する（独立の `OnceLock`）。
+pub fn current_popcount() -> PopcountKernel {
+    static CURRENT_POPCOUNT: OnceLock<PopcountKernel> = OnceLock::new();
+    *CURRENT_POPCOUNT.get_or_init(detect_popcount)
+}
+
+/// Hamming 距離（`popcount(a ^ b)`）のスカラー実装。長さが異なる場合は短い方へ
+/// 切り詰める。
+pub fn hamming_scalar(a: &[u8], b: &[u8]) -> u64 {
+    hamming_words(a, b)
+}
+
+/// Jaccard の交差・和集合カウントのスカラー実装。長さの扱いは [`hamming_scalar`] と同じ。
+pub fn jaccard_counts_scalar(a: &[u8], b: &[u8]) -> JaccardCounts {
+    jaccard_words(a, b)
+}
+
+/// 8 バイト未満の端数を零埋めの 1 語にする（バイト単位ループの `vpinsrb` 回避）。
+#[inline(always)]
+fn tail_word(rem: &[u8]) -> u64 {
+    let mut buf = [0u8; 8];
+    if let Some(dst) = buf.get_mut(..rem.len()) {
+        dst.copy_from_slice(rem);
+    }
+    u64::from_ne_bytes(buf)
+}
+
+/// Hamming の共通本体。短い方の長さに揃え、8 バイト語ごとに `count_ones` する
+/// （popcount はバイト順に依存しないため `from_ne_bytes` で足りる）。
+#[inline(always)]
+fn hamming_words(a: &[u8], b: &[u8]) -> u64 {
+    let len = a.len().min(b.len());
+    let a = a.get(..len).unwrap_or_default();
+    let b = b.get(..len).unwrap_or_default();
+    let (ac, ar) = a.as_chunks::<8>();
+    let (bc, br) = b.as_chunks::<8>();
+    let mut acc = 0u64;
+    for (x, y) in ac.iter().zip(bc) {
+        acc += u64::from((u64::from_ne_bytes(*x) ^ u64::from_ne_bytes(*y)).count_ones());
+    }
+    acc + u64::from((tail_word(ar) ^ tail_word(br)).count_ones())
+}
+
+/// [`hamming_words`] の Jaccard 版（交差と和集合の 2 アキュムレータ）。
+#[inline(always)]
+fn jaccard_words(a: &[u8], b: &[u8]) -> JaccardCounts {
+    let len = a.len().min(b.len());
+    let a = a.get(..len).unwrap_or_default();
+    let b = b.get(..len).unwrap_or_default();
+    let (ac, ar) = a.as_chunks::<8>();
+    let (bc, br) = b.as_chunks::<8>();
+    let (mut inter, mut uni) = (0u64, 0u64);
+    for (x, y) in ac.iter().zip(bc) {
+        let (x, y) = (u64::from_ne_bytes(*x), u64::from_ne_bytes(*y));
+        inter += u64::from((x & y).count_ones());
+        uni += u64::from((x | y).count_ones());
+    }
+    let (x, y) = (tail_word(ar), tail_word(br));
+    JaccardCounts {
+        intersection: inter + u64::from((x & y).count_ones()),
+        union: uni + u64::from((x | y).count_ones()),
+    }
+}
+
+/// aarch64 NEON 向け Hamming カーネル（`cnt`）。呼び出しには `unsafe` が必要
+/// （[`PopcountKernel::hamming`] の SAFETY 参照）。NEON は baseline のため
+/// インライン化でシンボルが消えないよう `#[inline(never)]`（`l1_neon` と同じ理由）。
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[inline(never)]
+fn hamming_neon(a: &[u8], b: &[u8]) -> u64 {
+    hamming_words(a, b)
+}
+
+/// aarch64 NEON 向け Jaccard カウントカーネル。
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[inline(never)]
+fn jaccard_counts_neon(a: &[u8], b: &[u8]) -> JaccardCounts {
+    jaccard_words(a, b)
+}
+
+/// x86_64 AVX2 向け Hamming カーネル。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+fn hamming_avx2(a: &[u8], b: &[u8]) -> u64 {
+    hamming_words(a, b)
+}
+
+/// x86_64 AVX2 向け Jaccard カウントカーネル。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+fn jaccard_counts_avx2(a: &[u8], b: &[u8]) -> JaccardCounts {
+    jaccard_words(a, b)
+}
+
+/// x86_64 AVX-512 VPOPCNTDQ 向け Hamming カーネル（`vpopcntq`）。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512vpopcntdq")]
+fn hamming_avx512_vpopcntdq(a: &[u8], b: &[u8]) -> u64 {
+    hamming_words(a, b)
+}
+
+/// x86_64 AVX-512 VPOPCNTDQ 向け Jaccard カウントカーネル。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512vpopcntdq")]
+fn jaccard_counts_avx512_vpopcntdq(a: &[u8], b: &[u8]) -> JaccardCounts {
+    jaccard_words(a, b)
+}
 
 #[cfg(test)]
 mod i8_kernel_tests {

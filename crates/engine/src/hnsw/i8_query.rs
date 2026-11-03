@@ -20,7 +20,8 @@ use std::sync::Arc;
 use crate::isa::{self, I8QueryOperands};
 use crate::sq8::{self, Sq8DimParams, Sq8QueryCodes};
 
-use super::{node_vector_i8, HnswError, NodeSource};
+use super::metric::finite_score;
+use super::{node_vector_i8, HnswError, HnswMetric, NodeSource};
 
 /// [`PreparedI8Source`] が使うスコア計算方式。
 enum I8QueryPlan {
@@ -74,7 +75,13 @@ impl<'a> PreparedI8Source<'a> {
 }
 
 impl NodeSource for PreparedI8Source<'_> {
-    fn score(&self, dim: usize, node: u32, query: &[f32]) -> Result<f32, HnswError> {
+    fn score(
+        &self,
+        metric: HnswMetric,
+        dim: usize,
+        node: u32,
+        query: &[f32],
+    ) -> Result<f32, HnswError> {
         // `search_masked_with_hop` は本ソースを構築した直後の 1 回の呼び出し
         // 内でのみ使い、そのすべての `score` 呼び出しに同一の `query`
         // スライス（同一アドレス・同一長）を渡す契約（`greedy_descend_masked`・
@@ -104,15 +111,18 @@ impl NodeSource for PreparedI8Source<'_> {
                         signed: &qc.signed,
                         shifted: &qc.shifted,
                     };
-                    let int_dot = self.kernel.dot_i8(row, row_sum, operands);
-                    sq8::score_from_int_dot(int_dot, qc.scale_q)
+                    // 整数オペランドの準備は内積専用。他 metric での SQ8 の扱い
+                    // （縮退か拒否か）は親 #1996 で決めるため、現状は腕 1 つ。
+                    match metric {
+                        HnswMetric::InnerProduct => {
+                            let int_dot = self.kernel.dot_i8(row, row_sum, operands);
+                            sq8::score_from_int_dot(int_dot, qc.scale_q)
+                        }
+                    }
                 }
-                I8QueryPlan::Dequant => sq8::dot_i8_f32(row, self.params.scales(), query),
+                I8QueryPlan::Dequant => metric.score_sq8_dequant(row, self.params.scales(), query),
             };
-        if !score.is_finite() {
-            return Err(HnswError::NonFiniteScore { node });
-        }
-        Ok(score)
+        finite_score(score, node)
     }
 
     fn touch_prefetch(&self, dim: usize, node: u32) {

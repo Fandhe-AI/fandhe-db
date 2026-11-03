@@ -40,12 +40,14 @@
 //!
 //! # 距離カーネル
 //!
-//! `kernel::dot`（`isa.rs` の実行時検出 SIMD カーネルへの唯一の委譲経路）を使う。
-//! スコアは内積で「大きいほど近い」（`kernel.rs::CandidateHit` と同じ規約。cosine
+//! 距離（類似度）計算はすべて `hnsw/metric.rs` の [`HnswMetric`]（Issue #1997）
+//! 経由で呼ぶ。現状の variant は内積のみで、`kernel::dot`（`isa.rs` の実行時検出
+//! SIMD カーネルへの委譲経路）と同一の結果を返す。
+//! スコアは「大きいほど近い」（`kernel.rs::CandidateHit` と同じ規約。cosine
 //! 距離は呼び出し元が正規化済みベクトルを渡すことで内積に一致させる既存契約を
-//! 踏襲する）。
-//! ヒューリスティックの `d(e, q) < d(e, r)` は本モジュール内では
-//! `dot(e, q) > dot(e, r)` と読み替える。
+//! 踏襲する）。将来の距離系 metric は距離の符号反転値を返し、この規約を保つ。
+//! ヒューリスティックの `d(e, q) < d(e, r)` は本モジュール内では metric の
+//! スコアで `score(e, q) > score(e, r)` と読み替える（内積なら `dot` の比較）。
 //!
 //! brute-force 側のコサイン距離は `kernel::cosine_top_k`（Issue #1987）にある。
 //! HNSW は引き続き正規化済み内積の契約で、metric 対応は #1996〜#1999 の担当。
@@ -84,7 +86,7 @@ use std::collections::{BinaryHeap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::Arc;
 
-use crate::kernel::dot;
+use self::metric::{finite_score, HnswMetric};
 
 /// 凍結済みグラフの CSR（Compressed Sparse Row）表現（Issue #494）。
 /// [`HnswIndex`] は構築完了後、可変長ビルダー表現（[`GraphBuilder`]）を
@@ -93,6 +95,8 @@ mod csr;
 /// [`NodeVectors::I8`] 専用の per-search `NodeSource` 実装（Issue #522）。
 /// `pub(super)` 限定で本モジュール外へは公開しない（[`prefetch`] と同じ方針）。
 mod i8_query;
+/// 距離（類似度）計算の metric 抽象（Issue #1997）。
+mod metric;
 mod parallel_build;
 /// `search_layer` の隣接ループへ挿入する受理判定後 prefetch（Issue #490）。
 /// `pub(super)` 限定で本モジュール外へは公開しない。
@@ -867,6 +871,8 @@ pub(crate) trait Adjacency {
 /// 既存の呼び出し規約どおり `vectors: &[f32]` を引数で受け取る（`build` の
 /// ループが所有権を持つ借用元バッファをそのまま渡す）。
 pub(crate) struct GraphBuilder {
+    /// 距離（類似度）種別（Issue #1997。現状は内積のみ）。
+    metric: HnswMetric,
     params: HnswParams,
     nodes: Vec<Node>,
     entry_point: Option<u32>,
@@ -896,6 +902,8 @@ impl Adjacency for GraphBuilder {
 /// 内容が食い違うバッファが渡されるという事故のクラス自体が存在しない。
 #[derive(Debug)]
 pub struct HnswIndex {
+    /// 距離（類似度）種別（Issue #1997。現状は内積のみ。`GraphBuilder` から引き継ぐ）。
+    metric: HnswMetric,
     params: HnswParams,
     dim: u32,
     /// 凍結済みグラフ（Issue #494。[`csr::CsrGraph`]）。構築中の可変長
@@ -964,13 +972,25 @@ impl NodeVectors {
 /// [`prefetch::PrefetchPolicy`] がこの境界を通じて常駐精度に依存せず動作する。
 /// `?Sized` は `[f32]`（unsized）を実装対象に含めるため。
 pub(crate) trait NodeSource {
-    fn score(&self, dim: usize, node: u32, query: &[f32]) -> Result<f32, HnswError>;
+    fn score(
+        &self,
+        metric: HnswMetric,
+        dim: usize,
+        node: u32,
+        query: &[f32],
+    ) -> Result<f32, HnswError>;
     fn touch_prefetch(&self, dim: usize, node: u32);
 }
 
 impl NodeSource for [f32] {
-    fn score(&self, dim: usize, node: u32, query: &[f32]) -> Result<f32, HnswError> {
-        score_of(self, dim, node, query)
+    fn score(
+        &self,
+        metric: HnswMetric,
+        dim: usize,
+        node: u32,
+        query: &[f32],
+    ) -> Result<f32, HnswError> {
+        score_of(metric, self, dim, node, query)
     }
     fn touch_prefetch(&self, dim: usize, node: u32) {
         prefetch::touch_node_vector(self, dim, node);
@@ -978,24 +998,22 @@ impl NodeSource for [f32] {
 }
 
 impl NodeSource for NodeVectors {
-    fn score(&self, dim: usize, node: u32, query: &[f32]) -> Result<f32, HnswError> {
+    fn score(
+        &self,
+        metric: HnswMetric,
+        dim: usize,
+        node: u32,
+        query: &[f32],
+    ) -> Result<f32, HnswError> {
         match self {
-            NodeVectors::F32(v) => score_of(v, dim, node, query),
+            NodeVectors::F32(v) => score_of(metric, v, dim, node, query),
             NodeVectors::F16(v) => {
                 let row = node_vector_u16(v, dim, node)?;
-                let score = crate::isa::current_f16().dot_f16(row, query);
-                if !score.is_finite() {
-                    return Err(HnswError::NonFiniteScore { node });
-                }
-                Ok(score)
+                finite_score(metric.score_f16(row, query), node)
             }
             NodeVectors::I8 { codes, params, .. } => {
                 let row = node_vector_i8(codes, dim, node)?;
-                let score = crate::sq8::dot_i8_f32(row, params.scales(), query);
-                if !score.is_finite() {
-                    return Err(HnswError::NonFiniteScore { node });
-                }
-                Ok(score)
+                finite_score(metric.score_sq8_dequant(row, params.scales(), query), node)
             }
         }
     }
@@ -1704,7 +1722,7 @@ impl GraphBuilder {
                 // 並列化対象。`&mut self` を要する結線はこの下の `if let
                 // Some` 内でのみ行う）。
                 let workers = repair_workers_for(reachable.len(), threads);
-                let best = nearest_reachable(vectors, dim, node, &reachable, workers)?;
+                let best = nearest_reachable(self.metric, vectors, dim, node, &reachable, workers)?;
                 // `reachable` は entry 自身を含むため必ず 1 件以上存在し、`best`
                 // は常に `Some` になる（entry 自身が候補になり得る）。`None` は
                 // `reachable` が空という到達不能な状態であり、fail-closed で
@@ -1908,8 +1926,13 @@ impl GraphBuilder {
             // 層 0 は次数上限が最大 2*m まで許容される（`shrink_links` が参照する
             // `max_degree_for` 側で扱う）が、新規ノード自身の選択本数は Algorithm 1
             // の記法どおり層を問わず常に `m` 本にする。
-            let selected =
-                select_neighbors_heuristic_free(&candidates, self.params.m, dim, vectors)?;
+            let selected = select_neighbors_heuristic_free(
+                self.metric,
+                &candidates,
+                self.params.m,
+                dim,
+                vectors,
+            )?;
 
             for &neighbor in &selected {
                 self.connect(node_id, neighbor, l);
@@ -2032,7 +2055,15 @@ impl GraphBuilder {
         // 行うことで同じ計算を共有する（`docs/design/hnsw-parallel-build.md`
         // 参照）。逐次経路（本メソッド）はロック不要のため読み→計算→書き込みを
         // そのまま `self.nodes` への 2 回のアクセスとして行う。
-        if let Some(shrunk) = compute_shrink(&current_links, node, dim, vectors, limit, protect)? {
+        if let Some(shrunk) = compute_shrink(
+            self.metric,
+            &current_links,
+            node,
+            dim,
+            vectors,
+            limit,
+            protect,
+        )? {
             if let Some(n) = self.nodes.get_mut(node as usize) {
                 if let Some(links) = n.links.get_mut(level) {
                     *links = shrunk;
@@ -2042,7 +2073,7 @@ impl GraphBuilder {
         Ok(())
     }
 
-    /// `dot(node, query)`。[`HnswIndex::score`] と同じ委譲（`GraphBuilder`
+    /// metric の類似度スコア（現状は `dot(node, query)`）。[`HnswIndex::score`] と同じ委譲（`GraphBuilder`
     /// は `vectors` を保持しないため、呼び出し元から渡された `vectors` を
     /// そのまま [`score_of`] へ渡す）。
     fn score(
@@ -2052,7 +2083,7 @@ impl GraphBuilder {
         dim: usize,
         vectors: &[f32],
     ) -> Result<f32, HnswError> {
-        score_of(vectors, dim, node, query)
+        score_of(self.metric, vectors, dim, node, query)
     }
 
     /// 構築経路の `search_layer`（[`HnswIndex::search_layer`] と同型。
@@ -2075,6 +2106,7 @@ impl GraphBuilder {
         // マスク付き探索限定。§ `HopMode` ドキュメンテーションコメント参照）。
         let mut acorn_expansions = 0u64;
         search_layer_in(
+            self.metric,
             self,
             entry_points,
             query,
@@ -2181,6 +2213,7 @@ impl HnswIndex {
         // この Arc の中身は変化しない）。
         let owned_vectors: Arc<[f32]> = Arc::from(vectors);
         let mut builder = GraphBuilder {
+            metric: HnswMetric::default(),
             params,
             nodes: Vec::with_capacity(n),
             entry_point: None,
@@ -2229,6 +2262,7 @@ impl HnswIndex {
         precision: ResidentPrecision,
     ) -> Result<Self, HnswError> {
         let GraphBuilder {
+            metric,
             params,
             nodes,
             entry_point,
@@ -2276,6 +2310,7 @@ impl HnswIndex {
             },
         };
         Ok(HnswIndex {
+            metric,
             params,
             dim,
             graph,
@@ -2895,6 +2930,7 @@ impl HnswIndex {
         // 呼び出し元を変更しないことで R1 のビット同一性を構造的に保つ）。
         let mut acorn_expansions = 0u64;
         search_layer_in(
+            self.metric,
             &self.graph,
             entry_points,
             query,
@@ -2931,6 +2967,7 @@ impl HnswIndex {
         acorn_expansions: &mut u64,
     ) -> Result<Vec<ScoredNode>, HnswError> {
         search_layer_in(
+            self.metric,
             &self.graph,
             entry_points,
             query,
@@ -2969,10 +3006,10 @@ impl HnswIndex {
         // 本体は `self` を一切参照しない純粋関数（`select_neighbors_heuristic_free`）
         // へ切り出し済み。並列構築（`parallel_build`。Issue #406）の
         // `BuildGraph` からも同じ実装を共有する。
-        select_neighbors_heuristic_free(candidates, m, dim, vectors)
+        select_neighbors_heuristic_free(self.metric, candidates, m, dim, vectors)
     }
 
-    /// `dot(node, query)`。ノード id が範囲外／`vectors` が短すぎる場合は
+    /// metric の類似度スコア（現状は `dot(node, query)`）。ノード id が範囲外／`vectors` が短すぎる場合は
     /// `NonFiniteVector` 相当ではなく、境界検証は [`node_vector`] が担う
     /// （呼び出し元は構築時に検証済みの id しか渡さない内部専用パス）。結果が
     /// 非有限（オーバーフロー・`NaN`）なら `NonFiniteScore` として拒否する
@@ -2988,7 +3025,7 @@ impl HnswIndex {
         // へ委譲する（Issue #522 で `vectors` を [`NodeVectors`] 固定から
         // `&dyn NodeSource` へ一般化し、`search_masked_with_hop` が
         // `hnsw::i8_query::PreparedI8Source` を渡せるようにした）。
-        vectors.score(dim, node, query)
+        vectors.score(self.metric, dim, node, query)
     }
 
     /// 構築済みパラメータを返す。
@@ -3964,7 +4001,7 @@ impl HnswIndex {
         if !is_accepted {
             return Ok(());
         }
-        let score = vectors.score(dim, node, query)?;
+        let score = vectors.score(self.metric, dim, node, query)?;
         let scored = ScoredNode { node, score };
         state.candidates.push(scored);
         state.in_candidates.mark_visited(node as usize);
@@ -4026,7 +4063,7 @@ impl HnswIndex {
                     // コメント参照。呼び出し元が `hop == TwoHop` を拒否する）。
                     continue;
                 }
-                let neighbor_score = vectors.score(dim, neighbor, query)?;
+                let neighbor_score = vectors.score(self.metric, dim, neighbor, query)?;
                 let scored = ScoredNode {
                     node: neighbor,
                     score: neighbor_score,
@@ -4240,6 +4277,7 @@ fn search_layer_in<
     A: Adjacency,
     S: NodeSource + ?Sized,
 >(
+    metric: HnswMetric,
     graph: &A,
     entry_points: Vec<u32>,
     query: &[f32],
@@ -4271,7 +4309,7 @@ fn search_layer_in<
             // 付けてスコア計算・以降の探索を行わない）。
             continue;
         }
-        let score = vectors.score(dim, ep, query)?;
+        let score = vectors.score(metric, dim, ep, query)?;
         let scored = ScoredNode { node: ep, score };
         candidates.push(scored);
         results.push(std::cmp::Reverse(scored));
@@ -4340,7 +4378,7 @@ fn search_layer_in<
                         if let Some(mask) = accept {
                             let expanded =
                                 bridge_expand(graph, level, neighbor, mask, visited, |two_hop| {
-                                    let score = vectors.score(dim, two_hop, query)?;
+                                    let score = vectors.score(metric, dim, two_hop, query)?;
                                     let scored = ScoredNode {
                                         node: two_hop,
                                         score,
@@ -4367,7 +4405,7 @@ fn search_layer_in<
                     }
                     continue;
                 }
-                let neighbor_score = vectors.score(dim, neighbor, query)?;
+                let neighbor_score = vectors.score(metric, dim, neighbor, query)?;
                 let scored = ScoredNode {
                     node: neighbor,
                     score: neighbor_score,
@@ -4453,6 +4491,7 @@ fn better_repair_candidate(
 /// `HnswError::NonFiniteScore` として拒否する（`repair_reachability_inner` の
 /// 既存契約と同一。モジュール冒頭「距離カーネル」節参照）。
 fn nearest_reachable_scan(
+    metric: HnswMetric,
     vectors: &[f32],
     dim: usize,
     query: &[f32],
@@ -4461,10 +4500,7 @@ fn nearest_reachable_scan(
     let mut best: Option<(u32, f32)> = None;
     for &candidate in candidates {
         let cand_vec = node_vector(vectors, dim, candidate)?;
-        let score = dot(query, cand_vec);
-        if !score.is_finite() {
-            return Err(HnswError::NonFiniteScore { node: candidate });
-        }
+        let score = finite_score(metric.score_f32(query, cand_vec), candidate)?;
         best = better_repair_candidate(best, (candidate, score));
     }
     Ok(best)
@@ -4488,6 +4524,7 @@ fn nearest_reachable_scan(
 /// `first_error`／`any_panicked` パターンと同型の fail-closed 契約。部分的に
 /// 探索したまま `Ok` を返さない）。
 fn nearest_reachable(
+    metric: HnswMetric,
     vectors: &[f32],
     dim: usize,
     node: u32,
@@ -4496,7 +4533,7 @@ fn nearest_reachable(
 ) -> Result<Option<(u32, f32)>, HnswError> {
     let query = node_vector(vectors, dim, node)?;
     if workers <= 1 || reachable.len() <= 1 {
-        return nearest_reachable_scan(vectors, dim, query, reachable);
+        return nearest_reachable_scan(metric, vectors, dim, query, reachable);
     }
     #[cfg(test)]
     REPAIR_PARALLEL_LAUNCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -4508,7 +4545,7 @@ fn nearest_reachable(
         for chunk in reachable.chunks(chunk_len) {
             let first_error_ref = &first_error;
             handles.push(scope.spawn(move || -> Option<(u32, f32)> {
-                match nearest_reachable_scan(vectors, dim, query, chunk) {
+                match nearest_reachable_scan(metric, vectors, dim, query, chunk) {
                     Ok(best) => best,
                     Err(e) => {
                         let mut fe = first_error_ref
@@ -4602,18 +4639,20 @@ fn validate_build_input(
     Ok(n)
 }
 
-/// `dot(node, query)`。[`HnswIndex::score`] と並列構築（`parallel_build`。
+/// metric の類似度スコア（現状は `dot(node, query)`）。[`HnswIndex::score`] と並列構築（`parallel_build`。
 /// Issue #406）の `BuildGraph` の双方から共有される純粋関数（`self` を
 /// 参照しないため元々自然にジェネリック化できた）。境界検証は
 /// [`node_vector`] が担う。結果が非有限なら `NonFiniteScore` として拒否する
 /// （モジュール冒頭「順序規約」節参照）。
-fn score_of(vectors: &[f32], dim: usize, node: u32, query: &[f32]) -> Result<f32, HnswError> {
+fn score_of(
+    metric: HnswMetric,
+    vectors: &[f32],
+    dim: usize,
+    node: u32,
+    query: &[f32],
+) -> Result<f32, HnswError> {
     let v = node_vector(vectors, dim, node)?;
-    let d = dot(v, query);
-    if !d.is_finite() {
-        return Err(HnswError::NonFiniteScore { node });
-    }
-    Ok(d)
+    finite_score(metric.score_f32(v, query), node)
 }
 
 /// 近傍選択ヒューリスティック（Algorithm 4）の本体。[`HnswIndex::
@@ -4622,6 +4661,7 @@ fn score_of(vectors: &[f32], dim: usize, node: u32, query: &[f32]) -> Result<f32
 /// （余った枠を枝刈り済み候補で埋め、次数を確保する）。この既定の採用理由は
 /// `docs/design/hnsw-graph-construction.md` に記録する。
 fn select_neighbors_heuristic_free(
+    metric: HnswMetric,
     candidates: &[ScoredNode],
     m: usize,
     dim: usize,
@@ -4647,10 +4687,7 @@ fn select_neighbors_heuristic_free(
         let mut keep = true;
         for &sel in &selected {
             let sel_vec = node_vector(vectors, dim, sel.node)?;
-            let d_to_selected = dot(cand_vec, sel_vec);
-            if !d_to_selected.is_finite() {
-                return Err(HnswError::NonFiniteScore { node: cand.node });
-            }
+            let d_to_selected = finite_score(metric.score_f32(cand_vec, sel_vec), cand.node)?;
             if d_to_selected > cand.score {
                 keep = false;
                 break;
@@ -4704,6 +4741,7 @@ fn select_neighbors_heuristic_free(
 /// （`all_scored`）で再フィルタすることで、`protect` が最終的な
 /// 結果集合（`limit` 件以内）に必ず残ることを保証する。
 fn compute_shrink(
+    metric: HnswMetric,
     current_links: &[u32],
     node: u32,
     dim: usize,
@@ -4720,15 +4758,12 @@ fn compute_shrink(
     let mut scored: Vec<ScoredNode> = Vec::with_capacity(current_links.len());
     for &id in current_links {
         let v = node_vector(vectors, dim, id)?;
-        let d = dot(node_vec, v);
-        if !d.is_finite() {
-            return Err(HnswError::NonFiniteScore { node: id });
-        }
+        let d = finite_score(metric.score_f32(node_vec, v), id)?;
         scored.push(ScoredNode { node: id, score: d });
     }
     scored.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.node.cmp(&b.node)));
 
-    let mut shrunk = select_neighbors_heuristic_free(&scored, limit, dim, vectors)?;
+    let mut shrunk = select_neighbors_heuristic_free(metric, &scored, limit, dim, vectors)?;
     // `node == protect`（自己ループ）は `connect` が張らないため起こらないが、
     // 呼び出し契約が壊れても panic せず何もしない防御的分岐にしておく。
     if node != protect && !shrunk.contains(&protect) {
@@ -4749,10 +4784,7 @@ fn compute_shrink(
         let mut all_scored = scored.clone();
         if !all_scored.iter().any(|s| s.node == protect) {
             let protect_vec = node_vector(vectors, dim, protect)?;
-            let protect_score = dot(node_vec, protect_vec);
-            if !protect_score.is_finite() {
-                return Err(HnswError::NonFiniteScore { node: protect });
-            }
+            let protect_score = finite_score(metric.score_f32(node_vec, protect_vec), protect)?;
             all_scored.push(ScoredNode {
                 node: protect,
                 score: protect_score,
@@ -4771,6 +4803,7 @@ fn compute_shrink(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kernel::dot;
 
     fn gen_corpus(seed: u64, dim: usize, rows: usize) -> Vec<f32> {
         let mut rng = DeterministicRng::new(seed);
@@ -4801,6 +4834,7 @@ mod tests {
         vectors: Arc<[f32]>,
     ) -> HnswIndex {
         let builder = GraphBuilder {
+            metric: HnswMetric::default(),
             params,
             nodes,
             entry_point,
@@ -5653,9 +5687,15 @@ mod tests {
     }
 
     impl NodeSource for RecordingNodeSource<'_> {
-        fn score(&self, dim: usize, node: u32, query: &[f32]) -> Result<f32, HnswError> {
+        fn score(
+            &self,
+            metric: HnswMetric,
+            dim: usize,
+            node: u32,
+            query: &[f32],
+        ) -> Result<f32, HnswError> {
             self.scored.borrow_mut().push(node);
-            self.inner.score(dim, node, query)
+            self.inner.score(metric, dim, node, query)
         }
         fn touch_prefetch(&self, dim: usize, node: u32) {
             self.inner.touch_prefetch(dim, node);
@@ -5713,6 +5753,7 @@ mod tests {
         let mut visited = VisitedBitmap::default();
         let mut expansions = 0u64;
         let result = search_layer_in(
+            HnswMetric::default(),
             &index.graph,
             vec![0],
             &query,
@@ -6092,6 +6133,7 @@ mod tests {
         let mut visited = VisitedBitmap::default();
         let mut expansions = 0u64;
         let _ = search_layer_in(
+            HnswMetric::default(),
             &counting,
             vec![0],
             &query,
@@ -7061,9 +7103,17 @@ mod tests {
         let limit = 3usize;
         let protect = 6u32;
 
-        let shrunk = compute_shrink(&current_links, 0, dim, &vectors, limit, protect)
-            .expect("finite 1-d vectors must not overflow")
-            .expect("current_links.len() > limit must trigger a shrink");
+        let shrunk = compute_shrink(
+            HnswMetric::default(),
+            &current_links,
+            0,
+            dim,
+            &vectors,
+            limit,
+            protect,
+        )
+        .expect("finite 1-d vectors must not overflow")
+        .expect("current_links.len() > limit must trigger a shrink");
 
         assert!(
             shrunk.contains(&protect),
@@ -7087,9 +7137,17 @@ mod tests {
         let limit = 3usize;
         let protect = 3u32;
 
-        let shrunk = compute_shrink(&current_links, 0, dim, &vectors, limit, protect)
-            .expect("finite 1-d vectors must not overflow")
-            .expect("protect missing from current_links must not short-circuit to Ok(None)");
+        let shrunk = compute_shrink(
+            HnswMetric::default(),
+            &current_links,
+            0,
+            dim,
+            &vectors,
+            limit,
+            protect,
+        )
+        .expect("finite 1-d vectors must not overflow")
+        .expect("protect missing from current_links must not short-circuit to Ok(None)");
 
         assert!(
             shrunk.contains(&protect),
@@ -7656,8 +7714,9 @@ mod tests {
         let node = 0u32;
 
         let before = REPAIR_PARALLEL_LAUNCHES.load(std::sync::atomic::Ordering::Relaxed);
-        let sequential = nearest_reachable(&vectors, dim, node, &reachable, 1)
-            .expect("sequential nearest_reachable must succeed");
+        let sequential =
+            nearest_reachable(HnswMetric::default(), &vectors, dim, node, &reachable, 1)
+                .expect("sequential nearest_reachable must succeed");
         let after_sequential = REPAIR_PARALLEL_LAUNCHES.load(std::sync::atomic::Ordering::Relaxed);
         assert_eq!(
             before, after_sequential,
@@ -7665,8 +7724,15 @@ mod tests {
         );
 
         for workers in [2usize, 4, 8] {
-            let parallel = nearest_reachable(&vectors, dim, node, &reachable, workers)
-                .expect("parallel nearest_reachable must succeed");
+            let parallel = nearest_reachable(
+                HnswMetric::default(),
+                &vectors,
+                dim,
+                node,
+                &reachable,
+                workers,
+            )
+            .expect("parallel nearest_reachable must succeed");
             assert_eq!(
                 sequential, parallel,
                 "workers={workers} の結果が逐次経路とビット一致しない"
@@ -7692,6 +7758,7 @@ mod tests {
     ) -> GraphBuilder {
         let n = vectors.len() / dim;
         let mut builder = GraphBuilder {
+            metric: HnswMetric::default(),
             params,
             nodes: Vec::with_capacity(n),
             entry_point: None,

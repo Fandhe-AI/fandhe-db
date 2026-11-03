@@ -48,7 +48,8 @@ use std::time::Instant;
 use super::{
     assign_level, compute_shrink, max_degree_for, node_vector, score_of,
     select_neighbors_heuristic_free, DeterministicRng, GraphBuilder, HnswBuildProfile, HnswError,
-    HnswIndex, HnswParams, HnswWorkerStats, Node, ResidentPrecision, ScoredNode, VisitedScratch,
+    HnswIndex, HnswMetric, HnswParams, HnswWorkerStats, Node, ResidentPrecision, ScoredNode,
+    VisitedScratch,
 };
 
 thread_local! {
@@ -179,6 +180,8 @@ fn reset_observation_tls() {
 /// エントリポイントのみ別ロックで排他する（モジュール冒頭「ロック
 /// 不変条件」）。`levels` は並列フェーズ開始前に確定し以後不変（ロック不要）。
 struct BuildGraph {
+    /// 距離（類似度）種別（Issue #1997。現状は内積のみ。凍結時に `GraphBuilder` へ引き継ぐ）。
+    metric: HnswMetric,
     dim: usize,
     params: HnswParams,
     vectors: Arc<[f32]>,
@@ -208,6 +211,7 @@ impl BuildGraph {
             .map(|&level| RwLock::new(vec![Vec::new(); level + 1]))
             .collect();
         Self {
+            metric: HnswMetric::default(),
             dim,
             params,
             vectors,
@@ -330,9 +334,15 @@ impl BuildGraph {
         let limit = max_degree_for(&self.params, level);
         let mut guard = self.write_links(node)?;
         let current: Vec<u32> = guard.get(level).cloned().unwrap_or_default();
-        if let Some(shrunk) =
-            compute_shrink(&current, node, self.dim, &self.vectors, limit, protect)?
-        {
+        if let Some(shrunk) = compute_shrink(
+            self.metric,
+            &current,
+            node,
+            self.dim,
+            &self.vectors,
+            limit,
+            protect,
+        )? {
             if let Some(links) = guard.get_mut(level) {
                 *links = shrunk;
             }
@@ -376,7 +386,7 @@ fn greedy_descend_locked(
     let mut current = start;
     let mut current_best = ScoredNode {
         node: current,
-        score: score_of(&graph.vectors, graph.dim, current, query)?,
+        score: score_of(graph.metric, &graph.vectors, graph.dim, current, query)?,
     };
     loop {
         let mut improved = false;
@@ -384,7 +394,7 @@ fn greedy_descend_locked(
         for cand in neighbors {
             let cand_scored = ScoredNode {
                 node: cand,
-                score: score_of(&graph.vectors, graph.dim, cand, query)?,
+                score: score_of(graph.metric, &graph.vectors, graph.dim, cand, query)?,
             };
             if cand_scored > current_best {
                 current = cand;
@@ -423,7 +433,7 @@ fn search_layer_locked(
             Some(false) => {}
             None => continue,
         }
-        let score = score_of(&graph.vectors, graph.dim, ep, query)?;
+        let score = score_of(graph.metric, &graph.vectors, graph.dim, ep, query)?;
         let scored = ScoredNode { node: ep, score };
         candidates.push(scored);
         results.push(std::cmp::Reverse(scored));
@@ -447,7 +457,8 @@ fn search_layer_locked(
             if already {
                 continue;
             }
-            let neighbor_score = score_of(&graph.vectors, graph.dim, neighbor, query)?;
+            let neighbor_score =
+                score_of(graph.metric, &graph.vectors, graph.dim, neighbor, query)?;
             let scored = ScoredNode {
                 node: neighbor,
                 score: neighbor_score,
@@ -545,8 +556,13 @@ fn plan_links(
         {
             record_degenerate_layer_search();
         }
-        let selected =
-            select_neighbors_heuristic_free(&candidates, graph.params.m, dim, &graph.vectors)?;
+        let selected = select_neighbors_heuristic_free(
+            graph.metric,
+            &candidates,
+            graph.params.m,
+            dim,
+            &graph.vectors,
+        )?;
 
         for &neighbor in &selected {
             graph.connect(node_id, neighbor, l)?;
@@ -991,6 +1007,7 @@ fn assemble_graph(graph: BuildGraph, params: HnswParams) -> Result<GraphBuilder,
     }
 
     Ok(GraphBuilder {
+        metric: graph.metric,
         params,
         nodes,
         entry_point,
