@@ -41,8 +41,8 @@
 //! # 距離カーネル
 //!
 //! 距離（類似度）計算はすべて `hnsw/metric.rs` の [`HnswMetric`]（Issue #1997）
-//! 経由で呼ぶ。現状の variant は内積のみで、`kernel::dot`（`isa.rs` の実行時検出
-//! SIMD カーネルへの委譲経路）と同一の結果を返す。
+//! 経由で呼ぶ。variant は内積・L2・Cosine で、内積は `kernel::dot`（`isa.rs` の実行時検出
+//! SIMD カーネルへの委譲経路）と同一の結果を返す。L2 は `-l2_sq`、Cosine は構築時に正規化したコピーとの内積。
 //! スコアは「大きいほど近い」（`kernel.rs::CandidateHit` と同じ規約。cosine
 //! 距離は呼び出し元が正規化済みベクトルを渡すことで内積に一致させる既存契約を
 //! 踏襲する）。将来の距離系 metric は距離の符号反転値を返し、この規約を保つ。
@@ -50,7 +50,7 @@
 //! スコアで `score(e, q) > score(e, r)` と読み替える（内積なら `dot` の比較）。
 //!
 //! brute-force 側のコサイン距離は `kernel::cosine_top_k`（Issue #1987）にある。
-//! HNSW は引き続き正規化済み内積の契約で、metric 対応は #1996〜#1999 の担当。
+//! HNSW は Issue #1998 で内積・L2・Cosine に対応した（親 #1996）。
 //!
 //! # 順序規約
 //!
@@ -886,7 +886,7 @@ pub(crate) trait Adjacency {
 /// 既存の呼び出し規約どおり `vectors: &[f32]` を引数で受け取る（`build` の
 /// ループが所有権を持つ借用元バッファをそのまま渡す）。
 pub(crate) struct GraphBuilder {
-    /// 距離（類似度）種別（Issue #1997。現状は内積のみ）。
+    /// 距離（類似度）種別（Issue #1997。内積・L2・Cosine）。
     metric: HnswMetric,
     params: HnswParams,
     nodes: Vec<Node>,
@@ -917,7 +917,7 @@ impl Adjacency for GraphBuilder {
 /// 内容が食い違うバッファが渡されるという事故のクラス自体が存在しない。
 #[derive(Debug)]
 pub struct HnswIndex {
-    /// 距離（類似度）種別（Issue #1997。現状は内積のみ。`GraphBuilder` から引き継ぐ）。
+    /// 距離（類似度）種別（Issue #1997。内積・L2・Cosine。`GraphBuilder` から引き継ぐ）。
     metric: HnswMetric,
     params: HnswParams,
     dim: u32,
@@ -2088,7 +2088,7 @@ impl GraphBuilder {
         Ok(())
     }
 
-    /// metric の類似度スコア（現状は `dot(node, query)`）。[`HnswIndex::score`] と同じ委譲（`GraphBuilder`
+    /// metric の類似度スコア（内積は `dot(node, query)`、L2 は `-l2_sq`、Cosine は正規化コピーとの内積）。[`HnswIndex::score`] と同じ委譲（`GraphBuilder`
     /// は `vectors` を保持しないため、呼び出し元から渡された `vectors` を
     /// そのまま [`score_of`] へ渡す）。
     fn score(
@@ -3116,7 +3116,7 @@ impl HnswIndex {
         select_neighbors_heuristic_free(self.metric, candidates, m, dim, vectors)
     }
 
-    /// metric の類似度スコア（現状は `dot(node, query)`）。ノード id が範囲外／`vectors` が短すぎる場合は
+    /// metric の類似度スコア（内積は `dot(node, query)`、L2 は `-l2_sq`、Cosine は正規化コピーとの内積）。ノード id が範囲外／`vectors` が短すぎる場合は
     /// `NonFiniteVector` 相当ではなく、境界検証は [`node_vector`] が担う
     /// （呼び出し元は構築時に検証済みの id しか渡さない内部専用パス）。結果が
     /// 非有限（オーバーフロー・`NaN`）なら `NonFiniteScore` として拒否する
@@ -4783,7 +4783,7 @@ fn validate_build_input(
     Ok(n)
 }
 
-/// metric の類似度スコア（現状は `dot(node, query)`）。[`HnswIndex::score`] と並列構築（`parallel_build`。
+/// metric の類似度スコア（内積は `dot(node, query)`、L2 は `-l2_sq`、Cosine は正規化コピーとの内積）。[`HnswIndex::score`] と並列構築（`parallel_build`。
 /// Issue #406）の `BuildGraph` の双方から共有される純粋関数（`self` を
 /// 参照しないため元々自然にジェネリック化できた）。境界検証は
 /// [`node_vector`] が担う。結果が非有限なら `NonFiniteScore` として拒否する

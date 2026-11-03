@@ -180,7 +180,7 @@ fn reset_observation_tls() {
 /// エントリポイントのみ別ロックで排他する（モジュール冒頭「ロック
 /// 不変条件」）。`levels` は並列フェーズ開始前に確定し以後不変（ロック不要）。
 struct BuildGraph {
-    /// 距離（類似度）種別（Issue #1997。現状は内積のみ。凍結時に `GraphBuilder` へ引き継ぐ）。
+    /// 距離（類似度）種別（Issue #1997。内積・L2・Cosine。凍結時に `GraphBuilder` へ引き継ぐ）。
     metric: HnswMetric,
     dim: usize,
     params: HnswParams,
