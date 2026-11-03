@@ -47,6 +47,7 @@
 //! `EXPLAIN` が検索本体を実行しない契約（本ファイル冒頭「責務境界」参照）は
 //! 呼び出し元にも求められる。
 
+use crate::catalog::VectorOpClass;
 use crate::declarative_filter::MetadataFilter;
 use crate::query_planner::PlannedQuery;
 use crate::search_engine::SearchEngineKind;
@@ -90,6 +91,9 @@ pub struct ExplainEngine {
     /// `scalar_plan:` 行へ ` reason=<語彙>` として付ける、索引を使えない理由（Issue #2191。
     /// 照合の不一致で全走査へ縮退したときだけ `Some`）。
     pub(crate) scalar_fallback: Option<ScalarFallbackReason>,
+    /// `hnsw_params:` 行末尾の `metric=` に出す HNSW 宣言の距離種別（Issue #1978・INDEX-7）。
+    /// 既定は `Cosine`。`core.rs` の EXPLAIN 経路が索引カタログの宣言から設定する。
+    pub(crate) ann_metric: VectorOpClass,
 }
 
 impl ExplainEngine {
@@ -107,7 +111,20 @@ impl ExplainEngine {
             ann_plan,
             scalar_plan,
             scalar_fallback: None,
+            ann_metric: VectorOpClass::Cosine,
         }
+    }
+
+    /// `hnsw_params:` 行の `metric=` に出す距離種別を設定する（Issue #1978。SQL の `EXPLAIN` と
+    /// 外部から `ExplainEngine::new` で組み立てる経路を一致させるための公開口）。
+    pub fn with_ann_metric(mut self, metric: VectorOpClass) -> Self {
+        self.ann_metric = metric;
+        self
+    }
+
+    /// `hnsw_params:` 行の `metric=` に出す距離種別（Issue #1978）。
+    pub fn ann_metric(&self) -> VectorOpClass {
+        self.ann_metric
     }
 
     /// `scalar_plan:` 行へ付ける縮退理由を設定する（Issue #2191。`core.rs` の EXPLAIN 経路が
@@ -694,6 +711,8 @@ fn ann_plan_token(plan: AnnPlan) -> &'static str {
         // かを `EngineCore` 側から判別できない旨を明示し、`plain_scan_engine`
         // （厳密 brute-force と確定）と区別する。
         AnnPlan::UnknownCustomProvider => "unknown_custom_provider",
+        // Issue #2009・SQL-75 (4): 距離順 `DESC` は索引を使わない厳密全走査。
+        AnnPlan::PlainScanDescending => "plain_scan_descending",
     }
 }
 
@@ -788,12 +807,13 @@ fn push_engine_tail_rows(
         // exposure.md`「露出しない値」節参照）。
         let p = params.get();
         lines.push(format!(
-            "hnsw_params: m={},ef_construction={},ef_search={},resident={},sparse_visited_max={}",
+            "hnsw_params: m={},ef_construction={},ef_search={},resident={},sparse_visited_max={},metric={}",
             p.m,
             p.ef_construction,
             p.ef_search,
             params.resident_precision(),
-            params.sparse_visited_max()
+            params.sparse_visited_max(),
+            engine.ann_metric.metric_token()
         ));
     }
     let mut ann_line = format!("ann_plan: {}", ann_plan_token(engine.ann_plan));
@@ -988,6 +1008,7 @@ mod tests {
             ann_plan: AnnPlan::PlainScanEngine,
             scalar_plan: ScalarPlan::PlainScan,
             scalar_fallback: None,
+            ann_metric: VectorOpClass::Cosine,
         }
     }
 
@@ -1100,6 +1121,7 @@ mod tests {
             ann_plan: AnnPlan::UnknownCustomProvider,
             scalar_plan: ScalarPlan::PlainScan,
             scalar_fallback: None,
+            ann_metric: VectorOpClass::Cosine,
         };
 
         let result = build_explain_result(&planned, &engine);
@@ -1126,6 +1148,7 @@ mod tests {
             ann_plan: AnnPlan::HnswFullVisible,
             scalar_plan: ScalarPlan::PlainScan,
             scalar_fallback: None,
+            ann_metric: VectorOpClass::Cosine,
         };
 
         let result = build_explain_result(&planned, &engine);
@@ -1137,20 +1160,21 @@ mod tests {
         assert_eq!(cell_text(&result, 4), "engine: hnsw");
         assert_eq!(
             cell_text(&result, 5),
-            "hnsw_params: m=16,ef_construction=100,ef_search=64,resident=f32,sparse_visited_max=0"
+            "hnsw_params: m=16,ef_construction=100,ef_search=64,resident=f32,sparse_visited_max=0,metric=cosine"
         );
         assert_eq!(cell_text(&result, 6), "ann_plan: hnsw_full_visible");
         assert_eq!(cell_text(&result, 7), "scalar_plan: plain_scan");
     }
 
     #[test]
-    fn build_explain_result_reports_all_five_ann_plan_tokens() {
+    fn build_explain_result_reports_all_six_ann_plan_tokens() {
         for (plan, expected) in [
             (AnnPlan::PlainScanEngine, "plain_scan_engine"),
             (AnnPlan::PlainScanPrecision, "plain_scan_precision"),
             (AnnPlan::HnswFullVisible, "hnsw_full_visible"),
             (AnnPlan::HnswSubset, "hnsw_subset"),
             (AnnPlan::UnknownCustomProvider, "unknown_custom_provider"),
+            (AnnPlan::PlainScanDescending, "plain_scan_descending"),
         ] {
             let planned = PlannedQuery::new(
                 QueryExpansion::default(),
@@ -1161,6 +1185,7 @@ mod tests {
                 ann_plan: plan,
                 scalar_plan: ScalarPlan::PlainScan,
                 scalar_fallback: None,
+                ann_metric: VectorOpClass::Cosine,
             };
             let result = build_explain_result(&planned, &engine);
             // `ann_plan` は末尾から 2 番目（末尾行は Issue #474 の
@@ -1233,6 +1258,7 @@ mod tests {
                 ann_plan,
                 scalar_plan: ScalarPlan::PlainScan,
                 scalar_fallback: None,
+                ann_metric: VectorOpClass::Cosine,
             };
             let result = build_explain_result(&planned, &engine);
 
@@ -1253,12 +1279,13 @@ mod tests {
             if let Some(SearchEngineKind::Hnsw(params)) = kind {
                 let p = params.get();
                 let expected = format!(
-                    "hnsw_params: m={},ef_construction={},ef_search={},resident={},sparse_visited_max={}",
+                    "hnsw_params: m={},ef_construction={},ef_search={},resident={},sparse_visited_max={},metric={}",
                     p.m,
                     p.ef_construction,
                     p.ef_search,
                     params.resident_precision(),
-                    params.sparse_visited_max()
+                    params.sparse_visited_max(),
+                    "cosine"
                 );
                 assert!(
                     result
@@ -1331,6 +1358,7 @@ mod tests {
             ann_plan: AnnPlan::HnswFullVisible,
             scalar_plan: ScalarPlan::IndexConjunction,
             scalar_fallback: None,
+            ann_metric: VectorOpClass::Cosine,
         };
         let names = ExplainIndexNames::new(
             vec!["idx_vec".to_string()],

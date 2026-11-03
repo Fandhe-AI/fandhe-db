@@ -244,6 +244,14 @@ pub(crate) fn render_expr(expr: &Expr) -> String {
             op.as_sql(),
             render_expr(rhs)
         ),
+        // 距離式（SQL-74・Issue #2035）。CHECK 本体はフラグが立たず構文段で拒否されるため通常は
+        // 到達しないが、`Expr` の全 variant を網羅するため、往復できる丸括弧付きで出す。
+        Expr::VectorDistance { kind, lhs, rhs } => format!(
+            "({} {} {})",
+            render_expr(lhs),
+            kind.operator(),
+            render_expr(rhs)
+        ),
         // codex-review（Cursor Bugbot）P1 指摘対応: `POSITION` は組み込み関数の
         // 中で唯一カンマ区切りではない SQL 標準特殊構文（`POSITION(needle IN
         // haystack)`）を持つ（`sql::allowlist::Parser::parse_function_call_expr`
@@ -407,7 +415,9 @@ fn normalize_session_local_expr(expr: &mut Expr) {
         Expr::Call { args, .. } | Expr::Coalesce(args) => {
             args.iter_mut().for_each(normalize_session_local_expr);
         }
-        Expr::Binary { lhs, rhs, .. } | Expr::JsonAccess { lhs, rhs, .. } => {
+        Expr::Binary { lhs, rhs, .. }
+        | Expr::JsonAccess { lhs, rhs, .. }
+        | Expr::VectorDistance { lhs, rhs, .. } => {
             normalize_session_local_expr(lhs);
             normalize_session_local_expr(rhs);
         }
@@ -682,7 +692,9 @@ fn referenced_column_names(
                     collect_idents(arg, acc);
                 }
             }
-            Expr::Binary { lhs, rhs, .. } | Expr::JsonAccess { lhs, rhs, .. } => {
+            Expr::Binary { lhs, rhs, .. }
+            | Expr::JsonAccess { lhs, rhs, .. }
+            | Expr::VectorDistance { lhs, rhs, .. } => {
                 collect_idents(lhs, acc);
                 collect_idents(rhs, acc);
             }
@@ -1112,6 +1124,11 @@ pub(crate) fn map_expr_idents(expr: &Expr, f: &dyn Fn(&str) -> String) -> Expr {
         },
         Expr::JsonAccess { op, lhs, rhs } => Expr::JsonAccess {
             op: *op,
+            lhs: Box::new(rec(lhs)),
+            rhs: Box::new(rec(rhs)),
+        },
+        Expr::VectorDistance { kind, lhs, rhs } => Expr::VectorDistance {
+            kind: *kind,
             lhs: Box::new(rec(lhs)),
             rhs: Box::new(rec(rhs)),
         },

@@ -348,6 +348,20 @@ pub enum Expr {
         lhs: Box<Expr>,
         rhs: Box<Expr>,
     },
+    /// ベクトルの距離式 `<lhs> <距離演算子> <rhs>`（対象ビヘイビア: SQL-74 (1)・Issue #2035）。
+    /// WHERE の比較・`BETWEEN` の被演算子としてだけ構文段が生成する
+    /// （`allowlist::Parser::parse_json_access_rest`。優先順位は JSON 演算子と同じ
+    /// 「その他の演算子」の段で左結合）。算術・比較の網羅 match へ流れ込まないよう
+    /// [`Expr::JsonAccess`] と同じく [`BinOp`] とは別 variant にしている。
+    /// 束縛段（`bind_vector_distance_operands`）が被演算子を検証し、評価が結線されるまで
+    /// （Issue #2036）は fail-closed の `0A000` で止める。
+    ///
+    /// 変更履歴: 本 variant の追加は `Expr` の網羅的 match を持つ外部コードへの破壊的変更。
+    VectorDistance {
+        kind: crate::sql::lexer::DistanceKind,
+        lhs: Box<Expr>,
+        rhs: Box<Expr>,
+    },
     /// 括弧なしの SQL 値関数（`CURRENT_TIMESTAMP`・`CURRENT_DATE`・`LOCALTIMESTAMP` 等。
     /// 対象ビヘイビア: SQL-37・Issue #1586）。構文段（`allowlist::Parser::parse_primary_expr`）が
     /// **引用されていない**識別子の予約語一致でだけ生成する（引用識別子は列参照のまま）。
@@ -903,6 +917,15 @@ pub enum BoundExpr {
     /// 参照先がスキーマ中最初の VECTOR 列と一致することを重ねて検査し、
     /// この不変条件が崩れた場合に誤った列の値で黙って評価しないようにする）。
     VectorRef,
+    /// 距離式 `<VECTOR 列> <距離演算子> <ベクトルリテラル>`（SQL-74 (1)・Issue #2036）。
+    /// 評価は行の embedding とクエリの距離を float8 相当の `Scalar` で返す（embedding が空
+    /// ＝ VECTOR 列が NULL の行は NULL）。embedding を参照するので [`references_embedding`] は真。
+    ///
+    /// 変更履歴: 公開 enum への variant 追加（外部の網羅 match への破壊的変更。#2035 の `Expr` と同様）。
+    VectorDistance {
+        kind: crate::sql::lexer::DistanceKind,
+        query: std::sync::Arc<[f32]>,
+    },
     Builtin {
         f: BuiltinFn,
         args: Vec<BoundExpr>,
@@ -1438,6 +1461,23 @@ impl PartialEq for BoundExpr {
             (BoundExpr::CorrelatedExists(a), BoundExpr::CorrelatedExists(b)) => a == b,
             (BoundExpr::CorrelatedScalar(a), BoundExpr::CorrelatedScalar(b)) => a == b,
             (BoundExpr::VectorRef, BoundExpr::VectorRef) => true,
+            (
+                BoundExpr::VectorDistance {
+                    kind: ka,
+                    query: qa,
+                },
+                BoundExpr::VectorDistance {
+                    kind: kb,
+                    query: qb,
+                },
+            ) => {
+                ka == kb
+                    && qa.len() == qb.len()
+                    && qa
+                        .iter()
+                        .zip(qb.iter())
+                        .all(|(a, b)| a.to_bits() == b.to_bits())
+            }
             (BoundExpr::Null, BoundExpr::Null) => true,
             (BoundExpr::Builtin { f: fa, args: aa }, BoundExpr::Builtin { f: fb, args: ab }) => {
                 fa == fb && aa == ab
@@ -1939,7 +1979,8 @@ pub(crate) fn contains_typed_numeric(expr: &Expr) -> bool {
         | Expr::RegexMatch {
             lhs, pattern: rhs, ..
         }
-        | Expr::JsonAccess { lhs, rhs, .. } => {
+        | Expr::JsonAccess { lhs, rhs, .. }
+        | Expr::VectorDistance { lhs, rhs, .. } => {
             contains_typed_numeric(lhs) || contains_typed_numeric(rhs)
         }
         Expr::Case { whens, else_result } => {
@@ -2072,7 +2113,8 @@ pub(crate) fn first_non_builtin_call_with(
         | Expr::RegexMatch {
             lhs, pattern: rhs, ..
         }
-        | Expr::JsonAccess { lhs, rhs, .. } => {
+        | Expr::JsonAccess { lhs, rhs, .. }
+        | Expr::VectorDistance { lhs, rhs, .. } => {
             first_non_builtin_call_with(lhs, allow_current_time, allow_json_fns)
                 .or_else(|| first_non_builtin_call_with(rhs, allow_current_time, allow_json_fns))
         }
@@ -3092,7 +3134,8 @@ fn expr_reaches_function(
         | Expr::RegexMatch {
             lhs, pattern: rhs, ..
         }
-        | Expr::JsonAccess { lhs, rhs, .. } => {
+        | Expr::JsonAccess { lhs, rhs, .. }
+        | Expr::VectorDistance { lhs, rhs, .. } => {
             expr_reaches_function(lhs, target, registry, visited)
                 || expr_reaches_function(rhs, target, registry, visited)
         }
@@ -3176,7 +3219,8 @@ fn collect_call_names(expr: &Expr, out: &mut Vec<String>) {
         | Expr::RegexMatch {
             lhs, pattern: rhs, ..
         }
-        | Expr::JsonAccess { lhs, rhs, .. } => {
+        | Expr::JsonAccess { lhs, rhs, .. }
+        | Expr::VectorDistance { lhs, rhs, .. } => {
             collect_call_names(lhs, out);
             collect_call_names(rhs, out);
         }
@@ -3767,6 +3811,9 @@ fn validate_closed_expr(
         Expr::JsonAccess { .. } => Err(SqlSurfaceError::FeatureNotSupported {
             detail: "JSON operators are not supported in a function body".to_string(),
         }),
+        Expr::VectorDistance { .. } => Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "distance operators are not supported in a function body".to_string(),
+        }),
         Expr::Ident(name) => {
             // `params` は `define_function` で正規化済み（小文字）。本体側の参照は
             // 引用なし識別子として書かれた原文字列のままなので、比較のたびに同じ
@@ -3962,6 +4009,55 @@ fn validate_closed_expr(
     }
 }
 
+/// 距離式の被演算子を検証した結果（SQL-74 (1)・Issue #2035）。[`bind_expr_any`] が
+/// `BoundExpr::VectorDistance` の構築に使う（Issue #2036）。
+pub(super) struct BoundVectorDistance {
+    pub(crate) kind: crate::sql::lexer::DistanceKind,
+    pub(crate) query: Vec<f32>,
+}
+
+/// 距離式 `<VECTOR 列> <距離演算子> <ベクトルリテラル>` の被演算子を検証する
+/// （SQL-74 (1)・Issue #2035。[`bind_expr_any`] の `Expr::VectorDistance` 腕から呼ばれる）。
+///
+/// 距離は 4 種別とも対称なので `'[..]' <-> embedding` も受理し、(列, リテラル) に正規化する。
+/// 検証順序（fail-closed）: (1) 列側を通常の識別子束縛で解決（未知の列は `42703`、2 本目以降の
+/// VECTOR 列は `22000`）、(2) VECTOR 型でなければ `42883`、(3) リテラルを
+/// [`crate::sql::parser::parse_vector_literal`] で解析（長さ超過 `54000`・不正／次元不一致 `22000`）。
+/// 列×列・NULL・ベクトルを返す式・リテラル同士は `0A000`。エラーにリテラルの値を含めない。
+pub(super) fn bind_vector_distance_operands(
+    kind: crate::sql::lexer::DistanceKind,
+    lhs: &Expr,
+    rhs: &Expr,
+    env: &mut BindEnv<'_>,
+    node_budget: &mut usize,
+) -> Result<BoundVectorDistance, SqlSurfaceError> {
+    let unsupported = || SqlSurfaceError::FeatureNotSupported {
+        detail: "distance operands must be a VECTOR column and a vector literal".to_string(),
+    };
+    let (column, literal) = match (lhs, rhs) {
+        (Expr::Ident(_), Expr::String(s)) => (lhs, s),
+        (Expr::String(s), Expr::Ident(_)) => (rhs, s),
+        _ => return Err(unsupported()),
+    };
+    let (_, ty) = bind_expr_any(column, env, node_budget)?;
+    if ty != ExprType::Vector {
+        return Err(SqlSurfaceError::undefined_function(
+            "operator does not exist for the given operand types",
+        ));
+    }
+    let dim = env
+        .schema
+        .and_then(|sc| {
+            sc.columns.iter().find_map(|c| match c.ty {
+                ColumnType::Vector(d) => Some(d),
+                _ => None,
+            })
+        })
+        .ok_or_else(unsupported)?;
+    let query = crate::sql::parser::parse_vector_literal(literal, dim)?;
+    Ok(BoundVectorDistance { kind, query })
+}
+
 /// 束縛環境: 列参照の解決元（`SELECT`/`WHERE` の式では `Some(schema)`、UDF 本体の
 /// 展開中は `None` に切り替わりパラメータ参照だけを解決する）と、パラメータ名 →
 /// 既に束縛済みの実引数式（インライン展開用）の対応表。
@@ -4076,6 +4172,7 @@ fn count_bound_nodes(expr: &BoundExpr) -> usize {
         | BoundExpr::CorrelatedExists(_)
         | BoundExpr::CorrelatedScalar(_)
         | BoundExpr::VectorRef
+        | BoundExpr::VectorDistance { .. }
         | BoundExpr::JsonbColumnRef { .. }
         | BoundExpr::JsonColumnRef { .. }
         | BoundExpr::Numeric(_)
@@ -4184,6 +4281,7 @@ fn max_bound_case_nesting(expr: &BoundExpr) -> usize {
         | BoundExpr::CorrelatedExists(_)
         | BoundExpr::CorrelatedScalar(_)
         | BoundExpr::VectorRef
+        | BoundExpr::VectorDistance { .. }
         | BoundExpr::JsonbColumnRef { .. }
         | BoundExpr::JsonColumnRef { .. }
         | BoundExpr::Numeric(_)
@@ -4271,7 +4369,7 @@ fn max_bound_case_nesting(expr: &BoundExpr) -> usize {
 /// ことを意図して非網羅を許さない。
 pub(crate) fn references_embedding(expr: &BoundExpr) -> bool {
     match expr {
-        BoundExpr::VectorRef => true,
+        BoundExpr::VectorRef | BoundExpr::VectorDistance { .. } => true,
         BoundExpr::Number(_)
         | BoundExpr::Text(_)
         | BoundExpr::TextColumnRef { .. }
@@ -4425,6 +4523,7 @@ pub(crate) fn visit_referenced_scalar_columns(expr: &BoundExpr, visit: &mut dyn 
         | BoundExpr::IdRef
         | BoundExpr::IdCompare { .. }
         | BoundExpr::VectorRef
+        | BoundExpr::VectorDistance { .. }
         | BoundExpr::Numeric(_)
         | BoundExpr::JsonbLiteral(_)
         | BoundExpr::Null => {}
@@ -4543,6 +4642,7 @@ pub(crate) fn mark_referenced_scalar_columns(expr: &BoundExpr, mask: &mut [bool]
         | BoundExpr::IdRef
         | BoundExpr::IdCompare { .. }
         | BoundExpr::VectorRef
+        | BoundExpr::VectorDistance { .. }
         | BoundExpr::Numeric(_)
         | BoundExpr::JsonbLiteral(_)
         | BoundExpr::Null => false,
@@ -4680,6 +4780,19 @@ pub(crate) fn mark_referenced_scalar_columns(expr: &BoundExpr, mask: &mut [bool]
             l || r
         }
     }
+}
+
+thread_local! {
+    /// 距離式（[`BoundExpr::VectorDistance`]）を束縛した累計回数（SQL-74・Issue #2036）。
+    /// `sql::parser::bind_in_session_with_limits` が WHERE の束縛の前後で差を取り、距離述語を
+    /// 含む文かどうかを判定する（束縛 API の署名を変えずに、`BoundExpr` の全 variant を辿る
+    /// 走査を増やさないための経路。束縛は同期で同一スレッド内に完結する）。
+    static DISTANCE_BINDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// 距離式の累計束縛回数を返す（差分の取得専用。折り返しは `wrapping_sub` で扱う）。
+pub(crate) fn distance_bind_count() -> u64 {
+    DISTANCE_BINDS.with(std::cell::Cell::get)
 }
 
 thread_local! {
@@ -6492,6 +6605,20 @@ pub(super) fn bind_expr_any(
             }
         }
         Expr::JsonAccess { op, lhs, rhs } => bind_json_access(*op, lhs, rhs, env, node_budget),
+        // 距離式（SQL-74 (1)・Issue #2035 で構文と束縛、Issue #2036 で評価）。被演算子の検証後に
+        // `BoundExpr::VectorDistance`（float8 相当の Scalar）を返す。すべての束縛経路
+        // （投影の CASE・ビュー・DML の WHERE 等）がここを通る。
+        Expr::VectorDistance { kind, lhs, rhs } => {
+            let b = bind_vector_distance_operands(*kind, lhs, rhs, env, node_budget)?;
+            DISTANCE_BINDS.with(|c| c.set(c.get().wrapping_add(1)));
+            Ok((
+                BoundExpr::VectorDistance {
+                    kind: b.kind,
+                    query: std::sync::Arc::from(b.query),
+                },
+                ExprType::Scalar,
+            ))
+        }
         Expr::ValueFunction { kind, precision } => bind_value_function(*kind, *precision, env),
         Expr::SqlJsonQuery(q) => crate::sql::jsonpath_fn::bind_sql_json_query(q, env, node_budget),
         // `CAST`／`<type> '<literal>'`（SQL-47・Issue #1590）。規則表の判定と束縛は `sql::cast`。
@@ -10546,6 +10673,15 @@ pub(crate) fn eval_with_scalars<'a>(
                 Ok(ExprValue::Vector(Cow::Borrowed(embedding)))
             }
         }
+        // 距離式（SQL-74 (1)・Issue #2036）。VECTOR 列が NULL の行（embedding が空）は NULL。
+        BoundExpr::VectorDistance { kind, query } => {
+            if embedding.is_empty() {
+                Ok(ExprValue::Null)
+            } else {
+                crate::sql::vector_distance::distance(*kind, embedding, query)
+                    .map(ExprValue::Scalar)
+            }
+        }
         BoundExpr::Builtin { f, args } => eval_builtin(*f, args, id, embedding, row_scalars),
         BoundExpr::Binary { op, lhs, rhs } => {
             let l = eval_with_scalars(lhs, id, embedding, row_scalars)?;
@@ -11810,13 +11946,28 @@ pub(crate) fn eval_binary<'a>(
         },
         BinOp::Gt | BinOp::Lt | BinOp::Ge | BinOp::Le | BinOp::Eq => match (l, r) {
             (ExprValue::Scalar(a), ExprValue::Scalar(b)) => {
-                let result = match op {
-                    BinOp::Gt => a > b,
-                    BinOp::Lt => a < b,
-                    BinOp::Ge => a >= b,
-                    BinOp::Le => a <= b,
-                    BinOp::Eq => a == b,
-                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
+                // 距離式（SQL-74 (1)・Issue #2036）はゼロノルムのコサインで NaN を返しうるため、
+                // 片方でも NaN なら PG の float8 順序（NaN 同士は等しく、NaN はどの数より大きい）で
+                // 比べる。それ以外は従来の IEEE 比較のまま（`-0.0 == 0.0` を保つ）。列由来の値は
+                // 格納時に非有限値を拒否しているので、既存の結果は変わらない。
+                let (a_nan, b_nan) = (a.is_nan(), b.is_nan());
+                let nan_ord = if a_nan || b_nan {
+                    Some(a_nan.cmp(&b_nan))
+                } else {
+                    None
+                };
+                let result = match (op, nan_ord) {
+                    (BinOp::Gt, Some(o)) => o.is_gt(),
+                    (BinOp::Lt, Some(o)) => o.is_lt(),
+                    (BinOp::Ge, Some(o)) => o.is_ge(),
+                    (BinOp::Le, Some(o)) => o.is_le(),
+                    (BinOp::Eq, Some(o)) => o.is_eq(),
+                    (BinOp::Gt, None) => a > b,
+                    (BinOp::Lt, None) => a < b,
+                    (BinOp::Ge, None) => a >= b,
+                    (BinOp::Le, None) => a <= b,
+                    (BinOp::Eq, None) => a == b,
+                    (BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div, _) => {
                         return Err(SqlSurfaceError::Internal {
                             detail: "non-comparison operator in comparison evaluation".to_string(),
                         });
@@ -14193,5 +14344,69 @@ mod wasm_define_tests {
         };
         assert_eq!(err.wire_code(), expected);
         assert_eq!(registry.len(), 1);
+    }
+
+    // --- 距離式（SQL-74・Issue #2036） ---------------------------------------------
+
+    fn dist_expr(kind: crate::sql::lexer::DistanceKind, q: &[f32]) -> BoundExpr {
+        BoundExpr::VectorDistance {
+            kind,
+            query: std::sync::Arc::from(q),
+        }
+    }
+
+    #[test]
+    fn vector_distance_evaluates_and_null_for_empty_embedding() {
+        let e = dist_expr(crate::sql::lexer::DistanceKind::L2, &[3.0, 4.0]);
+        assert!(references_embedding(&e));
+        assert_eq!(eval(&e, 0, &[0.0, 0.0]).unwrap(), ExprValue::Scalar(5.0));
+        // VECTOR 列が NULL の行（embedding が空）は NULL（`VectorRef` と同じ契約）。
+        assert_eq!(eval(&e, 0, &[]).unwrap(), ExprValue::Null);
+    }
+
+    #[test]
+    fn scalar_comparison_follows_float8_nan_order() {
+        let nan = f64::NAN;
+        let cmp = |op: BinOp, a: f64, b: f64| -> bool {
+            match eval_binary(op, ExprValue::Scalar(a), ExprValue::Scalar(b)).unwrap() {
+                ExprValue::Bool(v) => v,
+                other => panic!("unexpected {other:?}"),
+            }
+        };
+        // NaN 同士は等しく、NaN はどの数より大きい。
+        assert!(cmp(BinOp::Eq, nan, nan));
+        assert!(cmp(BinOp::Ge, nan, nan) && cmp(BinOp::Le, nan, nan));
+        assert!(!cmp(BinOp::Lt, nan, nan) && !cmp(BinOp::Gt, nan, nan));
+        assert!(cmp(BinOp::Gt, nan, 1.0) && !cmp(BinOp::Lt, nan, 1.0));
+        assert!(cmp(BinOp::Lt, 1.0, nan) && !cmp(BinOp::Eq, 1.0, nan));
+        assert!(cmp(BinOp::Ge, nan, f64::INFINITY));
+        // 通常値は従来どおり（-0.0 == 0.0 を保つ）。
+        assert!(cmp(BinOp::Eq, -0.0, 0.0));
+        assert!(cmp(BinOp::Lt, 1.0, 2.0) && !cmp(BinOp::Gt, 1.0, 2.0));
+    }
+
+    #[test]
+    fn vector_distance_partial_eq_compares_bits() {
+        use crate::sql::lexer::DistanceKind::{Cosine, L2};
+        assert_eq!(dist_expr(L2, &[1.0, 2.0]), dist_expr(L2, &[1.0, 2.0]));
+        assert_ne!(dist_expr(L2, &[1.0, 2.0]), dist_expr(Cosine, &[1.0, 2.0]));
+        assert_ne!(dist_expr(L2, &[1.0, 2.0]), dist_expr(L2, &[1.0]));
+        assert_ne!(dist_expr(L2, &[0.0]), dist_expr(L2, &[-0.0]));
+    }
+
+    #[test]
+    fn compiled_program_matches_recursive_eval_for_distance() {
+        use crate::sql::expr_program::ExprProgram;
+        let expr = BoundExpr::Binary {
+            op: BinOp::Lt,
+            lhs: Box::new(dist_expr(crate::sql::lexer::DistanceKind::L1, &[1.0, 1.0])),
+            rhs: Box::new(BoundExpr::Number(3.0)),
+        };
+        let program = ExprProgram::compile(&expr);
+        for emb in [&[0.0f32, 0.0][..], &[5.0, 5.0], &[]] {
+            let a = eval(&expr, 0, emb).unwrap();
+            let b = program.eval(0, emb, &[], &mut Vec::new()).unwrap();
+            assert_eq!(a, b, "{emb:?}");
+        }
     }
 }

@@ -145,5 +145,7 @@ mod sql69_savepoint_syntax;
 mod sql69_savepoint_write_marks;
 mod sql69_txn_aliases;
 mod sql70_raise_exception;
+mod sql74_radius_search;
+mod sql74_where_distance_compare;
 mod sql78_predicate_dml_noneq_between_params;
 mod sql78_where_noneq_between_params;

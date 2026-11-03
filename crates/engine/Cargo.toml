@@ -365,6 +365,16 @@ harness = false
 test = false
 
 [[bench]]
+# Issue #1986（コサイン距離の実装方式比較。ADR は docs/design/cosine-distance-method.md）の
+# 実測入口。方式 A／B′／C1／C2 の試作を精度・検索コスト・書き込みコストで比べる。
+# spec 由来の pass/fail 閾値を持たない情報提供専用ベンチのため `.github/workflows/*`
+# へは配線しない。harness = false / test = false は上記ベンチと同一方針。
+# `make bench-cosine-method`（Makefile）から実行する。
+name = "cosine_method_bench"
+harness = false
+test = false
+
+[[bench]]
 # Issue #396（ingest 経路〔`engine::tenant::insert_rows` → `insert_rows_unchecked`〕
 # の段別内訳プロファイル。所有権検査・id 重複検出・`begin_write`・content_hash・
 # 台帳記録・encode・redb insert・世代更新・commit の各段を分解して測る）の実測入口。

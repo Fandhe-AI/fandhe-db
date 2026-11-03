@@ -9,7 +9,7 @@
 //! （プランナー未注入・スキーマ不備・LIMIT/モードリテラル不正）が LLM 呼び出し
 //! 前に完結することも確認する（`sql_using_plan.rs` と同じ判別テストの流儀）。
 
-use engine::catalog::{ColumnDef, ColumnType, TableSchema};
+use engine::catalog::{ColumnDef, ColumnType, IndexDef, IndexKind, TableSchema, VectorOpClass};
 use engine::core::EngineCore;
 use engine::kernel::CpuScalarProvider;
 use engine::policy::PolicyContext;
@@ -729,7 +729,7 @@ fn explain_reports_hnsw_engine_params_and_full_visible_ann_plan_without_filter()
     assert_eq!(lines[lines.len() - 4], "engine: hnsw");
     assert_eq!(
         lines[lines.len() - 3],
-        "hnsw_params: m=16,ef_construction=100,ef_search=64,resident=f32,sparse_visited_max=0"
+        "hnsw_params: m=16,ef_construction=100,ef_search=64,resident=f32,sparse_visited_max=0,metric=cosine"
     );
     assert_eq!(lines[lines.len() - 2], "ann_plan: hnsw_full_visible");
     assert_eq!(lines[lines.len() - 1], "scalar_plan: plain_scan");
@@ -955,7 +955,7 @@ fn explain_new_rows_use_closed_vocabulary_and_default_hnsw_params() {
     assert_eq!(
         hnsw_params_line,
         Some(
-            &"hnsw_params: m=16,ef_construction=100,ef_search=64,resident=f32,sparse_visited_max=0"
+            &"hnsw_params: m=16,ef_construction=100,ef_search=64,resident=f32,sparse_visited_max=0,metric=cosine"
                 .to_string()
         ),
         "default HnswParams must round-trip exactly through EXPLAIN"
@@ -975,4 +975,50 @@ fn explain_new_rows_use_closed_vocabulary_and_default_hnsw_params() {
         Some("scalar_plan: plain_scan"),
         "scalar_plan is the last EXPLAIN row (no WHERE clause in this query)"
     );
+}
+
+/// Issue #1978（INDEX-7・SQL-33 (5)）: `HnswScope::Declared` で opclass 付き宣言を持つ表への
+/// `EXPLAIN` は `hnsw_params:` 行の末尾に宣言の距離種別を出す。宣言のない表は `metric=cosine`。
+#[test]
+fn explain_reports_declared_hnsw_opclass_as_metric() {
+    for (opclass, token) in [
+        (VectorOpClass::L2, "l2"),
+        (VectorOpClass::Ip, "ip"),
+        (VectorOpClass::L1, "l1"),
+        (VectorOpClass::Cosine, "cosine"),
+    ] {
+        let path = unique_db_path("sql-explain-hnsw-opclass-metric");
+        let _guard = CleanupGuard(path.clone());
+        let storage = seeded_storage(&path);
+        storage
+            .create_index(&IndexDef::new(
+                "idx_vec".to_string(),
+                TABLE.to_string(),
+                IndexKind::Hnsw(opclass),
+                vec!["embedding".to_string()],
+            ))
+            .expect("create hnsw index");
+        let kind = search_engine::hnsw_kind(engine::hnsw::HnswParams::default())
+            .expect("valid hnsw params");
+        let core = EngineCore::from_storage_with_engine(storage, kind)
+            .with_hnsw_scope(search_engine::HnswScope::Declared)
+            .with_query_planner(Box::new(StubLlmClient {
+                response: EXPANSION_RESPONSE_NO_HINTS,
+            }));
+        let mut session = SessionState::default();
+        let outcome = core
+            .execute_sql_in_session(
+                &ctx("tenant-a"),
+                &mut session,
+                "EXPLAIN SELECT id FROM docs USING PLAN('find content') LIMIT 10",
+            )
+            .expect("EXPLAIN should succeed");
+        let lines = explain_result_lines(outcome);
+        assert_eq!(
+            lines[lines.len() - 3],
+            format!(
+                "hnsw_params: m=16,ef_construction=100,ef_search=64,resident=f32,sparse_visited_max=0,metric={token}"
+            )
+        );
+    }
 }

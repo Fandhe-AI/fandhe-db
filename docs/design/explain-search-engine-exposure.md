@@ -72,8 +72,8 @@ exec.rs`（`ORDER BY` 経路の `HINT ORDER` を受理する）からは到達�
 | 行 | 常時／条件 | 値の語彙（snake_case・英語・閉じた集合） |
 | -- | -- | -- |
 | `engine: <token>` | 常時 | `parallel_brute_force` / `cpu_scalar_brute_force` / `hnsw` / `(custom_provider)`（`search_engine_kind() == None`。`with_provider`／`from_storage` 経由） |
-| `hnsw_params: m=<m>,ef_construction=<ef_c>,ef_search=<ef_s>,resident=<f32\|f16\|i8>,sparse_visited_max=<n>` | `engine: hnsw` のときのみ | 構築時の静的設定値のみ（`full_scan_ratio` は含まない）。`resident=`（Issue #514 追記）は要求精度の静的値で、実行時の自動縮退結果は含まない。`sparse_visited_max=`（Issue #497 追記）は visited 集合切替閾値の静的設定値（`ValidatedHnswParams::sparse_visited_max`。既定 0）で、実行時にどちらの visited 実装が選ばれたか・可視候補数・索引ノード数は含まない |
-| `ann_plan: <token>` | 常時 | `plain_scan_engine` / `plain_scan_precision` / `hnsw_full_visible` / `hnsw_subset` / `unknown_custom_provider`（`engine: (custom_provider)` のときのみ。PR #437 追記） |
+| `hnsw_params: m=<m>,ef_construction=<ef_c>,ef_search=<ef_s>,resident=<f32\|f16\|i8>,sparse_visited_max=<n>,metric=<cosine\|l2\|ip\|l1>` | `engine: hnsw` のときのみ | 構築時の静的設定値のみ（`full_scan_ratio` は含まない）。末尾の `metric=`（Issue #1978・INDEX-7 追記）は対象表の HNSW 宣言の距離種別（opclass）で、宣言なしは `cosine`（宣言が複数種類あるときは `cosine` を含めば `cosine`、含まなければ種別の順序で最小のもの。列・演算子単位の選択は #1979）。`resident=`（Issue #514 追記）は要求精度の静的値で、実行時の自動縮退結果は含まない。`sparse_visited_max=`（Issue #497 追記）は visited 集合切替閾値の静的設定値（`ValidatedHnswParams::sparse_visited_max`。既定 0）で、実行時にどちらの visited 実装が選ばれたか・可視候補数・索引ノード数は含まない |
+| `ann_plan: <token>` | 常時 | `plain_scan_engine` / `plain_scan_precision` / `hnsw_full_visible` / `hnsw_subset` / `unknown_custom_provider`（`engine: (custom_provider)` のときのみ。PR #437 追記）/ `plain_scan_descending`（距離順 `ORDER BY` に `DESC` が付いたとき。Issue #2009・SQL-33 (2)・SQL-75 (4) 追記） |
 | `scalar_plan: <token>` | 常時（Issue #474 追記） | `plain_scan` / `index_equality` / `index_prefix` / `index_id_range` / `index_conjunction`（`sql::scalar_plan::classify_scalar_plan` の静的判定。部分索引を選択した場合は `index_partial index=<名前>`〔Issue #1656。`docs/design/partial-index.md`〕。件数・閾値・実行時縮退結果は非露出。詳細は `docs/design/scalar-index-prune.md` 参照） |
 
 `engine` の文字列化は `SearchEngineKind` の既存 `Display`（`full_scan_ratio` を
@@ -345,3 +345,14 @@ EXPLAIN は索引の物理テーブルを開かず、テナント単位のマー
 出現順で追記する（新しい語彙。関数名は `WindowFunc::default_alias` の閉じた語彙）。静的な構文情報だけを出し、
 列名・フレーム・行数・パーティション数は露出しない。窓なしの文の出力は不変。語彙の追加は SQL-27 の確定時に
 spec 側とすり合わせる事項（spec リポ側でオーナーが判断する）。
+
+## `plain_scan_descending`（Issue #2009）
+
+距離順 `ORDER BY` に `DESC`（遠い順）が付いた検索は、エンジン種別・HNSW の有効無効・モードに関係なく
+ANN 索引を使わず、可視行を全走査して返す。`ann_plan:` 行は常に `plain_scan_descending` になり、
+`index=` の索引名注記は付かない。実行側（`sql::exec`）と `EXPLAIN`（`core.rs::explain_engine_for`）は
+同じ `sql::hnsw_cache::ann_plan_for_direction` を通して判断元を 1 つにしている。
+
+厳密走査に倒す理由が増える場合（演算子クラスの不一致・`LIMIT` 省略）も、この関数へ理由を足す。
+優先順位は「`DESC` → 種別の不一致 → `LIMIT` の省略 → 既存の分類（`classify_ann_plan`）」とする。
+既存の昇順の文の `EXPLAIN` 出力は変えない。

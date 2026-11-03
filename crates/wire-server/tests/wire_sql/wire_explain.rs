@@ -260,7 +260,7 @@ fn explain_reports_hnsw_engine_and_full_visible_ann_plan() {
     assert_eq!(rows[4], "engine: hnsw");
     assert_eq!(
         rows[5],
-        "hnsw_params: m=16,ef_construction=100,ef_search=64,resident=f32,sparse_visited_max=0"
+        "hnsw_params: m=16,ef_construction=100,ef_search=64,resident=f32,sparse_visited_max=0,metric=cosine"
     );
     assert_eq!(rows[6], "ann_plan: hnsw_full_visible");
     assert_eq!(rows[7], "scalar_plan: plain_scan");
