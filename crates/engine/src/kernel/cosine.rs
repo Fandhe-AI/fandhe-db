@@ -48,8 +48,12 @@ pub struct CosineSearchInput<'a> {
 /// 内積と各ノルム²からコサイン距離を求める唯一の実装。
 ///
 /// 類似度を f64 で計算して [-1, 1] にクランプし `1 - s` を返す。NaN（ゼロノルム・
-/// 次元 0・非有限入力）は NaN のまま返る。
+/// 次元 0・非有限入力）は NaN のまま返る。f32 でのオーバーフロー（ノルム² や内積が
+/// inf）も fail-closed で NaN とし、選出器に除外させる（距離 1.0 への誤収束を防ぐ）。
 pub fn cosine_distance_from_parts(dot: f32, a_norm_sq: f32, b_norm_sq: f32) -> f64 {
+    if !dot.is_finite() || !a_norm_sq.is_finite() || !b_norm_sq.is_finite() {
+        return f64::NAN;
+    }
     let denom = (f64::from(a_norm_sq) * f64::from(b_norm_sq)).sqrt();
     let s = f64::from(dot) / denom;
     1.0 - s.clamp(-1.0, 1.0)
@@ -234,6 +238,18 @@ mod tests {
             query,
             k,
         }
+    }
+
+    #[test]
+    fn overflowing_norm_yields_nan() {
+        // 成分 2e19 の二乗は f32 で inf になる。
+        let big = [2.0e19_f32, 0.0];
+        assert!(cosine_distance(&big, &[1.0, 0.0]).is_nan());
+        assert!(cosine_distance(&[1.0, 0.0], &big).is_nan());
+        let ids = [1_u64, 2];
+        let vectors = [2.0e19_f32, 0.0, 1.0, 0.0];
+        let r = cosine_top_k(input(&ids, &vectors, 2, &[1.0, 0.0], 2)).unwrap();
+        assert!(r.iter().all(|h| h.id != 1));
     }
 
     #[test]
