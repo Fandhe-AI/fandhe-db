@@ -18,8 +18,12 @@
 //! 入力値・テナント・表の情報を反射しない固定の英語文字列だけを返す（untrusted 入力の
 //! エコーバック防止）。長さの検証はアロケーションより先に行う。
 
-/// `bit(n)` の `n` の上限（PostgreSQL と同じ。`catalog` の型宣言検証と共有する）。
-pub const MAX_BIT_LENGTH: u32 = 83_886_080;
+/// `bit(n)` の `n` の上限（`catalog` の型宣言検証と共有する）。
+///
+/// 行 codec のスカラーペイロード上限（`row_codec::MAX_SCALAR_PAYLOAD_LEN`）に、フレーミング
+/// （presence 1 + ビット長 4 バイト）込みの 1 値が収まる最大ビット数。宣言できる最大長の列に
+/// 実際に INSERT／UPDATE／COPY できることを保証する（PostgreSQL の上限より小さい）。
+pub const MAX_BIT_LENGTH: u32 = (crate::row_codec::MAX_SCALAR_PAYLOAD_LEN - 5) * 8;
 
 /// `n` ビットを収めるバイト数（`ceil(n / 8)`）。`n` が `usize` に収まらない場合のみ `None`。
 pub fn byte_len_for_bits(len: u32) -> Option<usize> {

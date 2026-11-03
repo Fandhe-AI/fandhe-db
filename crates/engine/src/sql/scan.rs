@@ -215,6 +215,12 @@ fn try_alloc_bit_for_budget(
     budget: &mut usize,
     cap: usize,
 ) -> Result<crate::bit_string::BitString, SqlSurfaceError> {
+    // テキスト展開（n 文字）後の大きさで課金するため、packed 分は下の委譲先が計上し、
+    // 展開による増分（ビット数 − packed バイト数）をここで先に計上する。
+    let expansion = usize::try_from(r.bit_len())
+        .unwrap_or(usize::MAX)
+        .saturating_sub(r.as_bytes().len());
+    *budget = try_accumulate_budget(*budget, expansion, cap)?;
     let bytes = try_alloc_bytes_for_budget(r.as_bytes(), budget, cap)?;
     crate::bit_string::BitString::from_parts(r.bit_len(), bytes).map_err(|e| {
         SqlSurfaceError::Internal {

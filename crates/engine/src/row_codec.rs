@@ -1422,7 +1422,7 @@ fn bit_entry_len(
         )));
     }
     // 内部表現の不変条件（バイト数・詰め物ビット 0）を最後の砦として再検証する。
-    crate::bit_string::BitString::from_parts(v.bit_len(), v.as_bytes().to_vec())
+    crate::bit_string::BitRef::new(v.bit_len(), v.as_bytes())
         .map_err(|e| RowCodecError::Invalid(e.message().to_string()))?;
     let body = u32::try_from(v.as_bytes().len())
         .map_err(|_| RowCodecError::Invalid("bit field too long".to_string()))?;

@@ -296,7 +296,11 @@ pub(crate) fn estimate_cell_bytes(cell: &Cell) -> usize {
         | Cell::TimestampTz(_) => 8,
         Cell::Date(_) => 4,
         Cell::Interval(_) => 16,
-        Cell::Bit(v) => v.as_bytes().len().saturating_add(8),
+        // テキスト整形（projection・wire text・COPY・JSON）は n 文字の `0`／`1` へ展開されるため、
+        // packed バイト数ではなくビット数で課金する。
+        Cell::Bit(v) => usize::try_from(v.bit_len())
+            .unwrap_or(usize::MAX)
+            .saturating_add(8),
         Cell::Text(s) => s.len().saturating_add(8),
         Cell::Bytes(b) => b.len().saturating_add(8),
         Cell::Json(s) => s.len().saturating_add(8),

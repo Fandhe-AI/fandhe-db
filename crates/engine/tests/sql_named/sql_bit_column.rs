@@ -475,7 +475,7 @@ fn type_declaration_boundaries() {
     }
     ok(
         &core,
-        "CREATE TABLE ok_max (id BIGINT PRIMARY KEY, v BIT(83886080))",
+        "CREATE TABLE ok_max (id BIGINT PRIMARY KEY, v BIT(33554392))",
     );
     ok(&core, "CREATE TABLE b (id BIGINT PRIMARY KEY, v INTEGER)");
     assert_eq!(code(&core, "ALTER TABLE b ADD COLUMN w BIT(0)"), "22023");

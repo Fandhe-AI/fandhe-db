@@ -8708,6 +8708,16 @@ fn validate_default_value(column: &ColumnDef, default: &ColumnDefault) -> Result
             column.name
         )));
     }
+    // BIT(n) の 0/1 原文も宣言長で検証する（永続化後に INSERT／ADD COLUMN 補完で適用不能に
+    // なるのを防ぐ。Issue #2021）。
+    if matches!(column.ty, ColumnType::Bit(_))
+        && crate::row_codec::validate_default(&column.ty, default).is_err()
+    {
+        return Err(CatalogError::Invalid(format!(
+            "column {:?} has a malformed BIT DEFAULT",
+            column.name
+        )));
+    }
     // 配列の `{..}` 原文も同様に検証する（Issue #1374）。ENUM 要素の配列は
     // 呼び出し元の語彙が未解決の場合があり（スカラー ENUM の DEFAULT と同じ扱い）、
     // ここでは照合しない。write txn 内の再検証（`create_table`・

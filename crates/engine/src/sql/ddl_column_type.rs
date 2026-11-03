@@ -596,7 +596,7 @@ fn parse_optional_bit_length(
     }
     if n > crate::bit_string::MAX_BIT_LENGTH {
         return Err(SqlSurfaceError::InvalidParameterValue {
-            detail: "length for type bit cannot exceed 83886080",
+            detail: "length for type bit cannot exceed 33554392",
         });
     }
     Ok(Some(n))

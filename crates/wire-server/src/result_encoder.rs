@@ -3610,7 +3610,7 @@ mod tests {
         assert_eq!(m(&scalar(ColumnType::Text)), Some(-1));
         // BIT(n) の typmod は n そのもの（VARHDRSZ を加えない。Issue #2021）。
         assert_eq!(m(&scalar(ColumnType::Bit(1))), Some(1));
-        assert_eq!(m(&scalar(ColumnType::Bit(83_886_080))), Some(83_886_080));
+        assert_eq!(m(&scalar(ColumnType::Bit(33_554_392))), Some(33_554_392));
         assert!(column_type_modifier(&scalar(ColumnType::Bit(u32::MAX))).is_err());
         assert_eq!(m(&ColumnMeta::Id), Some(-1));
         let computed = |ty| ColumnMeta::Computed {
