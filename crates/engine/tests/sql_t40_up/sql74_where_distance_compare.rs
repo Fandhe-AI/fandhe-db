@@ -117,17 +117,25 @@ fn operand_violations_use_existing_classification() {
     assert_eq!(code(&core, &mut session, &sql), "54000");
 }
 
-/// 比較の無い距離式や WHERE 以外の位置は従来どおり `42601`。
+/// 比較の無い距離式や投影位置は従来どおり `42601`（kNN の ORDER BY は #1977 で受理し実行段 `0A000`）。
 #[test]
 fn other_positions_stay_rejected() {
     let (core, mut session, _g) = setup("sql74-other");
     for sql in [
         "SELECT id FROM docs WHERE embedding <-> '[1,0,0]'",
         "SELECT embedding <-> '[1,0,0]' FROM docs",
-        "SELECT id FROM docs ORDER BY embedding <-> '[1,0,0]' LIMIT 1",
     ] {
         assert_eq!(code(&core, &mut session, sql), "42601", "{sql}");
     }
+    // Issue #1977: kNN の ORDER BY は 4 種とも構文を通り、カーネル未接続の間は実行段で 0A000。
+    assert_eq!(
+        code(
+            &core,
+            &mut session,
+            "SELECT id FROM docs ORDER BY embedding <-> '[1,0,0]' LIMIT 1"
+        ),
+        "0A000"
+    );
 }
 
 /// DML の WHERE でも距離比較が受理され、該当行だけを書き換える（値の網羅は `sql74_radius_search.rs`）。

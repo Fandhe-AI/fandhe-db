@@ -134,9 +134,9 @@ pub enum Token {
     TypeCast,
     /// `||`（SQL-42・Issue #1520）。
     Concat,
-    /// pgvector の距離演算子 4 種（種別付き。SQL-33・Issue #1976 のポインタ）。構文段が
-    /// 受理するのは現状 [`DistanceKind::Cosine`]（`<=>`）だけで、他の種別は従来どおり
-    /// 42601 で拒否される（受理範囲の拡張は Issue #1977）。
+    /// pgvector の距離演算子 4 種（種別付き。SQL-33・Issue #1976 のポインタ）。kNN の
+    /// `ORDER BY`・`$n` のベクトル位置は 4 種とも受理する（Issue #1977）。実行は種別ごとの
+    /// カーネル接続 Issue まで `0A000`（`sql::exec` の入口で fail-closed）。
     DistanceOp(DistanceKind),
     /// `<=`（TASK-79・SQL-9: 式述語の比較演算子）。
     Le,
