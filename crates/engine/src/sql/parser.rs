@@ -211,6 +211,53 @@ fn check_distance_kind(
     Ok(())
 }
 
+/// 投影の距離列（SQL-33 (7)・Issue #2007）と距離 `ORDER BY` の整合を検査する。
+/// 構文段（`parse_select_shape`）が列・種別の一致を保証するが、`ValidatedStatement::new` を直接
+/// 使う呼び出し元も迂回できないよう束縛段でも守る（多層防御）。距離列があるのに順位付けが
+/// 距離でない・種別が違う組は `42601`。`compare_query(列の添字)` が真（実リテラル）でクエリベクトルが
+/// ビット単位で一致しない組は `0A000`（未対応の形。ベクトル値はエラーに含めない）。
+fn check_projected_distance(
+    projection: &[ProjectedColumn],
+    ranking: &Ranking,
+    kind: crate::sql::lexer::DistanceKind,
+    compare_query: &dyn Fn(usize) -> bool,
+) -> Result<(), SqlSurfaceError> {
+    for (index, col) in projection.iter().enumerate() {
+        let ProjectedColumn::Computed {
+            expr:
+                crate::sql::udf_call::BoundExpr::VectorDistance {
+                    kind: item_kind,
+                    query: item_query,
+                },
+            ..
+        } = col
+        else {
+            continue;
+        };
+        let Ranking::Distance { query } = ranking else {
+            return Err(SqlSurfaceError::unsupported(
+                "a projected distance requires a distance ORDER BY",
+            ));
+        };
+        if *item_kind != kind {
+            return Err(SqlSurfaceError::unsupported(
+                "a projected distance must use the same operator as the distance ORDER BY",
+            ));
+        }
+        let same = item_query.len() == query.len()
+            && item_query
+                .iter()
+                .zip(query.iter())
+                .all(|(a, b)| a.to_bits() == b.to_bits());
+        if compare_query(index) && !same {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "a projected distance must use the same query vector as the distance ORDER BY",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// 距離方向（`DESC`）と順位付け形・実効モードの整合を検査する（Issue #2009・SQL-33 (2)）。
 /// `Distance` 以外の `ORDER BY` に方向が付く組は公開ビルダーの誤用でしか作れないため
 /// `42601` で拒否する。`precision` モードの確信度ゲートは最近傍側のマージンを前提とし、
@@ -1830,6 +1877,30 @@ fn cast_operand_name(expr: &Expr) -> Option<String> {
 /// 別名・既定名を持たない式項目の列名（PostgreSQL 互換。`sql::const_select` と共有）。
 pub(crate) const ANONYMOUS_COLUMN_NAME: &str = "?column?";
 
+/// Prepared Describe がベクトルリテラルの実パースを省いてよい位置（Issue #2007・PR #2927 指摘対応）。
+/// `$n` 由来のダミー値の位置だけを印にし、同じ文中の実リテラルは Describe でも必ず検証する
+/// （fail-closed）。`EngineCore` の Parse が元トークン列から導出し、Describe の束縛へ渡す。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LiteralSkip {
+    /// `ORDER BY` 距離形のリテラルが `$n` 由来か。
+    pub(crate) order_by: bool,
+    /// 投影項目（`Projection::Items` の添字）ごとの「距離列のリテラルが `$n` 由来か」の可変長
+    /// フラグ列。範囲外の添字は印なし（常に検証する側）。
+    pub(crate) projection_mask: Vec<bool>,
+}
+
+impl LiteralSkip {
+    /// 何も省かない（実リテラルを持つ通常の Describe・Execute 前検査）。
+    pub(crate) const NONE: Self = Self {
+        order_by: false,
+        projection_mask: Vec::new(),
+    };
+
+    fn skips_projection_item(&self, index: usize) -> bool {
+        self.projection_mask.get(index).copied().unwrap_or(false)
+    }
+}
+
 /// SELECT リストの許可形状（[`Projection`]）を束縛する共通ヘルパー（TASK-77・
 /// SQL-5 で `bind_in_session` から切り出した。`USING PLAN` 経路（`sql::using_plan`）も
 /// 同一の投影列解決規則（実カラム優先・疑似列 `id`・`AS` エイリアス付き式項目）を
@@ -1844,6 +1915,31 @@ pub fn bind_projection(
     schema: &TableSchema,
     udfs: &crate::sql::udf_call::UdfRegistry,
     node_budget: &mut usize,
+) -> Result<Vec<ProjectedColumn>, SqlSurfaceError> {
+    bind_projection_with_literals(projection, schema, udfs, node_budget, &LiteralSkip::NONE)
+}
+
+/// 投影トップレベルの距離列（SQL-33 (7)・Issue #2007）で、ベクトルリテラル側が文字列リテラルの
+/// 形（`<列> <距離演算子> <文字列>`）か。Prepared Describe が `$n` 由来のダミー値（ベクトルとして
+/// 不正）で列メタだけを導出する縮退経路の対象判定で、真の項目は束縛時にリテラルの文字列化・解析を
+/// 行わず（外部入力向けの 64 KiB 上限を内部ダミー値へ適用しない）、列・型の検証だけを通常経路と
+/// 同じ束縛（[`crate::sql::udf_call::bind_projection_expr_json_ok`]）で行う。
+fn is_placeholder_distance_expr(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::VectorDistance { lhs, rhs, .. }
+            if matches!((lhs.as_ref(), rhs.as_ref()), (Expr::Ident(_), Expr::String(_)))
+    )
+}
+
+/// [`bind_projection`] の本体。`skip.projection_mask` の印が立った投影項目に限り、距離列の
+/// ベクトルリテラルを実解析せずダミーで置き換える（Prepared Describe 専用。Issue #2007）。
+pub(crate) fn bind_projection_with_literals(
+    projection: &Projection,
+    schema: &TableSchema,
+    udfs: &crate::sql::udf_call::UdfRegistry,
+    node_budget: &mut usize,
+    skip: &LiteralSkip,
 ) -> Result<Vec<ProjectedColumn>, SqlSurfaceError> {
     match projection {
         Projection::All => {
@@ -1870,7 +1966,7 @@ pub fn bind_projection(
         }
         Projection::Items(items) => {
             let mut cols = Vec::with_capacity(items.len());
-            for item in items {
+            for (item_index, item) in items.iter().enumerate() {
                 match item {
                     crate::sql::allowlist::SelectItem::Column(name) => {
                         cols.push(resolve_projected_column(name, name, schema)?);
@@ -1885,6 +1981,10 @@ pub fn bind_projection(
                         cols.push(resolve_projected_column(name, alias, schema)?);
                     }
                     crate::sql::allowlist::SelectItem::Expr { expr, alias } => {
+                        let skip_literal = skip.skips_projection_item(item_index)
+                            && is_placeholder_distance_expr(expr);
+                        let _placeholder_guard = skip_literal
+                            .then(crate::sql::udf_call::DistancePlaceholderGuard::enter);
                         let (bound, ty, result_ty) =
                             crate::sql::udf_call::bind_projection_expr_json_ok(
                                 expr,
@@ -3133,6 +3233,7 @@ pub(crate) fn bind_in_session_with_limits(
         Some(resolved_mode.mode()),
     )?;
     check_distance_kind(stmt.distance_kind, &stmt.order_by)?;
+    check_projected_distance(&projection, &ranking, stmt.distance_kind, &|_| true)?;
 
     check_limit_omission(stmt.limit_implicit, Some(resolved_mode.mode()))?;
     let (limit, offset, result_cap) = bind_limit_and_offset(stmt, result_limits)?;
@@ -3208,7 +3309,7 @@ fn bind_limit_and_offset(
 /// の実値には依存しないため、`ORDER BY` のベクトルリテラルの実パース有無は
 /// Describe が返す列を変えない。
 ///
-/// `validate_vector_literal` が `true`（実リテラルを持つ通常の Describe
+/// `skip` が [`LiteralSkip::NONE`]（実リテラルを持つ通常の Describe
 /// 呼び出し）の場合は [`bind_in_session`] と同じくベクトルリテラル文字列の
 /// 実パース（[`parse_vector_literal`] による形式・次元・非有限値・64 KiB
 /// 上限検証）を行う。`false`（`EngineCore::describe_prepared_in_session` 専用。
@@ -3231,7 +3332,7 @@ pub(crate) fn bind_projection_for_describe(
     schema: &TableSchema,
     udfs: &crate::sql::udf_call::UdfRegistry,
     session_mode: Option<SearchMode>,
-    validate_vector_literal: bool,
+    skip: &LiteralSkip,
     dummy_equality_flags: &[bool],
     result_limits: &crate::result_limits::ResultLimits,
 ) -> Result<Vec<ProjectedColumn>, SqlSurfaceError> {
@@ -3244,7 +3345,8 @@ pub(crate) fn bind_projection_for_describe(
     let resolved_mode = mode::resolve_mode(query_mode, session_mode);
 
     let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
-    let projection = bind_projection(&stmt.projection, schema, udfs, &mut node_budget)?;
+    let projection =
+        bind_projection_with_literals(&stmt.projection, schema, udfs, &mut node_budget, skip)?;
 
     let (_metadata_filters, _expr_filters, _rls_predicate_present, _or_filters) =
         bind_where_predicates(
@@ -3255,13 +3357,20 @@ pub(crate) fn bind_projection_for_describe(
             dummy_equality_flags,
         )?;
 
-    let _ranking = bind_ranking(&stmt.order_by, schema, validate_vector_literal)?;
+    let ranking = bind_ranking(&stmt.order_by, schema, !skip.order_by)?;
     check_distance_direction(
         stmt.distance_descending,
         &stmt.order_by,
         Some(resolved_mode.mode()),
     )?;
     check_distance_kind(stmt.distance_kind, &stmt.order_by)?;
+    check_projected_distance(
+        &projection,
+        &ranking,
+        stmt.distance_kind,
+        // 投影項目ごとに判定する: `$n` 由来の項目だけ比較を省き、実リテラルの項目は常に検証する。
+        &|index| !skip.order_by && !skip.skips_projection_item(index),
+    )?;
     check_limit_omission(stmt.limit_implicit, Some(resolved_mode.mode()))?;
     let _limits = bind_limit_and_offset(stmt, result_limits)?;
 
@@ -15440,7 +15549,15 @@ mod tests {
         let limits = crate::result_limits::ResultLimits::default();
         let describe = |sql: &str, session: Option<SearchMode>| {
             let stmt = validate_statement(sql, &lookup).expect("allowlist");
-            bind_projection_for_describe(&stmt, &docs_schema(), &udfs, session, true, &[], &limits)
+            bind_projection_for_describe(
+                &stmt,
+                &docs_schema(),
+                &udfs,
+                session,
+                &LiteralSkip::NONE,
+                &[],
+                &limits,
+            )
         };
         let desc = "SELECT * FROM documents ORDER BY embedding <=> '[0.1,0.2,0.3]' DESC LIMIT 5";
         let err = describe(&format!("{desc} USING MODE 'precision'"), None)

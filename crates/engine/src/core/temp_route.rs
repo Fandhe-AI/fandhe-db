@@ -1274,7 +1274,7 @@ impl EngineCore {
         &self,
         session: &SessionState,
         routed: &SessionRoutedSql,
-        skip_vector_literal_validation: bool,
+        skip_vector_literal_validation: &crate::sql::parser::LiteralSkip,
         dummy_equality_flags: &[bool],
         limits: &crate::result_limits::ResultLimits,
     ) -> Result<Option<Vec<crate::sql::exec::ColumnMeta>>, SqlSurfaceError> {

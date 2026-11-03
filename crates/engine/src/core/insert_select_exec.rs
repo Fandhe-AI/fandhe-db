@@ -85,7 +85,12 @@ impl EngineCore {
     ) -> Result<SqlOutcome, SqlSurfaceError> {
         // 列リスト省略（Issue #2613）は束縛が展開した列名を実行側へ渡す。実行側は実行時のスキーマで
         // 同じ名前を解決し直す（明示形と同じ TOCTOU 特性）。
-        let bound = self.bind_insert_select(session, stmt, &self.result_limits)?;
+        let bound = self.bind_insert_select(
+            session,
+            stmt,
+            &crate::sql::parser::LiteralSkip::NONE,
+            &self.result_limits,
+        )?;
         self.execute_insert_select(
             mode,
             ctx,

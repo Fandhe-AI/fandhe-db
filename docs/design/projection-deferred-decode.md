@@ -75,6 +75,14 @@ metadata バイト列を 2 通りの経路で取得する:
 - `crates/engine/src/sql/exec.rs` 内 `#[cfg(test)]` 単体テスト
   （`deferred_projection_corruption`）: 上記の fail-closed 契約。
 
+## 距離列（Issue #2007）
+
+投影位置の距離列（`embedding <=> q AS d`。SQL-33 (7) ポインタ）は `ProjectedColumn::Computed`
+として `project_rows` が評価する。評価入力の埋め込みは Top-k 確定後にアリーナ
+（`arena.vector(slot)`）から取るため、metadata の再取得・遅延デコードの適格条件
+（`defer_projection`・キャッシュ高速経路）には影響しない。距離項目はスカラー列を参照しない
+ので `needed_column_indices` にも列を足さない。
+
 ## スコープ外・申し送り
 
 - hybrid（`Ranking::Hybrid`）で `SparseIndexCache` ヒット時の遅延投影化。

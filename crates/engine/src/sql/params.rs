@@ -2131,6 +2131,46 @@ pub fn order_by_distance_literal_is_param(tokens: &[Token]) -> bool {
     })
 }
 
+/// `tokens`（`$n` 置換前の元トークン列）の SELECT リスト（括弧深度 0 の `SELECT` から同深度の
+/// `FROM` まで）で、投影項目（カンマ区切り）ごとに、投影位置の距離列 `<列> <距離演算子> $n`
+/// （SQL-33 (7)・Issue #2007）の `$n` を持つ項目の添字を可変長フラグ列（添字 i が真なら項目 i が印付き）で返す。
+/// [`order_by_distance_literal_is_param`] と同じ用途（Prepared Describe がダミー値のベクトル
+/// リテラル実パースを省いてよい位置の判定）で、ORDER BY 側とは別の印として項目ごとに持つ
+/// （片側・片項目に `$n` があるだけで他の実リテラルの検証を省かない）。括弧内（関数引数・
+/// ウィンドウ・副問い合わせ）・角括弧内は対象外。
+pub fn select_list_distance_param_mask(tokens: &[Token]) -> Vec<bool> {
+    let mut depth: usize = 0;
+    let mut prev_is_distance_op = false;
+    let mut item: usize = 0;
+    let mut mask: Vec<bool> = Vec::new();
+    for t in tokens {
+        match t {
+            // 配列リテラル `ARRAY[1,2]` 内のカンマを項目区切りに数えないよう角括弧も深度に含める。
+            Token::Punct('(') | Token::Punct('[') => depth = depth.saturating_add(1),
+            Token::Punct(')') | Token::Punct(']') => depth = depth.saturating_sub(1),
+            // CTE 本文の後ろの外側 SELECT から数え直す。
+            Token::Keyword(lexer::Keyword::Select) if depth == 0 => {
+                item = 0;
+                mask.clear();
+            }
+            Token::Keyword(lexer::Keyword::From) if depth == 0 => return mask,
+            Token::Punct(',') if depth == 0 => item = item.saturating_add(1),
+            Token::Param(_) if depth == 0 && prev_is_distance_op => {
+                // 項目数に上限は無いため可変長で持つ（添字 64 以降も印を失わない）。
+                if mask.len() <= item {
+                    mask.resize(item.saturating_add(1), false);
+                }
+                if let Some(slot) = mask.get_mut(item) {
+                    *slot = true;
+                }
+            }
+            _ => {}
+        }
+        prev_is_distance_op = matches!(t, Token::DistanceOp(_));
+    }
+    Vec::new()
+}
+
 /// 型付き値の負値（`-` + `$typed:<型>` + 数値）か。
 fn is_typed_negative(produced: &[Token]) -> bool {
     matches!(
@@ -2757,6 +2797,54 @@ mod tests {
         )
         .expect("tokenize_with_params should succeed");
         assert!(order_by_distance_literal_is_param(&tokens));
+    }
+
+    #[test]
+    fn select_list_distance_literal_is_param_detects_projection_param_only() {
+        // 投影位置の `$n`（SQL-33 (7)・Issue #2007）だけを検出し、WHERE・ORDER BY の `$n` と
+        // 括弧内（関数引数）は対象外。
+        let t = |sql: &str| tokenize_with_params(sql).expect("tokenize");
+        assert_eq!(
+            select_list_distance_param_mask(&t(
+                "SELECT id, embedding <=> $1 AS d FROM documents ORDER BY embedding <=> $1 LIMIT 3"
+            )),
+            vec![false, true]
+        );
+        assert_eq!(
+            select_list_distance_param_mask(&t(
+                "SELECT id FROM documents ORDER BY embedding <=> $1 LIMIT 3"
+            )),
+            Vec::<bool>::new()
+        );
+        assert_eq!(
+            select_list_distance_param_mask(&t(
+                "SELECT id, embedding <=> '[1,0,0]' AS d FROM documents WHERE embedding <=> $1 < 1 ORDER BY embedding <=> '[1,0,0]' LIMIT 3"
+            )),
+            Vec::<bool>::new()
+        );
+        // 配列リテラル内のカンマは項目区切りではない（距離項目は添字 1）。
+        assert_eq!(
+            select_list_distance_param_mask(&t(
+                "SELECT ARRAY[1,2] AS a, embedding <=> $1 AS d FROM documents ORDER BY embedding <=> $1 LIMIT 3"
+            )),
+            vec![false, true]
+        );
+        // 65 項目以上でも添字 64 以降の印を失わない。
+        let many = format!(
+            "SELECT {}, embedding <=> $1 AS d FROM documents ORDER BY embedding <=> $1 LIMIT 3",
+            vec!["id"; 64].join(", ")
+        );
+        let mask = select_list_distance_param_mask(&t(&many));
+        assert_eq!(mask.len(), 65);
+        assert_eq!(mask.iter().filter(|b| **b).count(), 1);
+        assert_eq!(mask.get(64), Some(&true));
+        // 項目ごとの印: 実リテラルの項目と `$n` の項目が混在しても `$n` の項目だけが立つ。
+        assert_eq!(
+            select_list_distance_param_mask(&t(
+                "SELECT embedding <=> 'x' AS a, embedding <=> $1 AS b FROM documents ORDER BY embedding <=> $1"
+            )),
+            vec![false, true]
+        );
     }
 
     #[test]

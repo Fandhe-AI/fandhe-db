@@ -158,12 +158,13 @@ impl EngineCore {
         &self,
         session: &SessionState,
         stmt: &ValidatedDataModifyingCte,
+        skip: &crate::sql::parser::LiteralSkip,
         limits: &crate::result_limits::ResultLimits,
     ) -> Result<Vec<ColumnMeta>, SqlSurfaceError> {
         if let DmMain::Read(read) = &stmt.main {
             let parsed = super::ParsedSql::Statement((**read).clone());
             return self
-                .describe_parsed_in_session_impl(session, &parsed, false, &[], limits)?
+                .describe_parsed_in_session_impl(session, &parsed, skip, &[], limits)?
                 .ok_or_else(|| SqlSurfaceError::Internal {
                     detail: "internal error".to_string(),
                 });
