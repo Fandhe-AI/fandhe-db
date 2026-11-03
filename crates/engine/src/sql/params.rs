@@ -2103,10 +2103,31 @@ pub(crate) fn infer_param_positions(tokens: &[Token], param_count: u16) -> Vec<V
 /// `$n` はスコープ外として `42601` で拒否するため、この形のベクトルリテラルは
 /// 常に元の SQL テキストの実リテラルのまま——本関数の対象外で構わない）。
 pub fn order_by_distance_literal_is_param(tokens: &[Token]) -> bool {
-    tokens.iter().enumerate().any(|(i, token)| {
+    // Issue #2036（#2035 からの申し送り）: WHERE 内の距離式 `embedding <=> $1 < r` も同じ字句形
+    // （`<=>` の直後の `$n`）になるため、最初の `ORDER` キーワード以降だけを見る。WHERE 側の
+    // `$n` を ORDER BY の位置と取り違えると、Prepared Describe が ORDER BY 側の実リテラルの
+    // 検証を省いてしまう。
+    // 文レベルの `ORDER` は括弧深度 0 のものだけを採る（`OVER (... ORDER BY ...)` や集約内の
+    // `ORDER BY` は深度 1 以上で、これらを文の ORDER BY と取り違えると後続 WHERE の `<=> $n` を
+    // ranking リテラルと誤認して Prepared Describe の検査を省いてしまう）。
+    let mut depth: usize = 0;
+    let mut start = tokens.len();
+    for (i, t) in tokens.iter().enumerate() {
+        match t {
+            Token::Punct('(') => depth = depth.saturating_add(1),
+            Token::Punct(')') => depth = depth.saturating_sub(1),
+            Token::Keyword(lexer::Keyword::Order) if depth == 0 => {
+                start = i;
+                break;
+            }
+            _ => {}
+        }
+    }
+    let tail = tokens.get(start..).unwrap_or(&[]);
+    tail.iter().enumerate().any(|(i, token)| {
         matches!(token, Token::Param(_))
             && matches!(
-                tokens.get(i.wrapping_sub(1)),
+                tail.get(i.wrapping_sub(1)),
                 Some(Token::DistanceOp(lexer::DistanceKind::Cosine))
             )
     })
@@ -2680,6 +2701,40 @@ mod tests {
         let tokens =
             tokenize_with_params("SELECT * FROM documents ORDER BY embedding <=> $1 LIMIT 5")
                 .expect("tokenize_with_params should succeed");
+        assert!(order_by_distance_literal_is_param(&tokens));
+    }
+
+    #[test]
+    fn order_by_distance_literal_is_param_ignores_where_distance_param() {
+        // WHERE 内の距離式の `$1` は ORDER BY の位置ではない（Issue #2036）。
+        let tokens = tokenize_with_params(
+            "SELECT * FROM documents WHERE embedding <=> $1 < 0.5 \
+             ORDER BY embedding <=> '[0.1,0.2,0.3]' LIMIT 5",
+        )
+        .expect("tokenize_with_params should succeed");
+        assert!(!order_by_distance_literal_is_param(&tokens));
+        let tokens = tokenize_with_params(
+            "SELECT * FROM documents WHERE embedding <=> $1 < 0.5 \
+             ORDER BY embedding <=> $2 LIMIT 5",
+        )
+        .expect("tokenize_with_params should succeed");
+        assert!(order_by_distance_literal_is_param(&tokens));
+    }
+
+    #[test]
+    fn order_by_distance_literal_is_param_ignores_window_order_by() {
+        // ウィンドウ関数内の ORDER BY は文の ORDER BY ではない（PR #2917 Bugbot 指摘）。
+        let tokens = tokenize_with_params(
+            "SELECT row_number() OVER (ORDER BY id) FROM documents \
+             WHERE embedding <=> $1 < 0.5 ORDER BY embedding <=> '[0.1,0.2,0.3]' LIMIT 5",
+        )
+        .expect("tokenize_with_params should succeed");
+        assert!(!order_by_distance_literal_is_param(&tokens));
+        let tokens = tokenize_with_params(
+            "SELECT row_number() OVER (ORDER BY id) FROM documents \
+             WHERE embedding <=> $1 < 0.5 ORDER BY embedding <=> $2 LIMIT 5",
+        )
+        .expect("tokenize_with_params should succeed");
         assert!(order_by_distance_literal_is_param(&tokens));
     }
 

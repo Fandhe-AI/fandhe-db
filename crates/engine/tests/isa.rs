@@ -498,6 +498,49 @@ fn isa_source_has_no_external_override_entry_points() {
     }
 }
 
+/// `isa::current().l1` がスカラー参照実装 [`isa::l1_scalar`] と許容差内で一致すること
+/// （Issue #1988・SQL-33）。全項が非負なので和そのものを magnitude とする。
+#[test]
+fn dispatched_l1_matches_scalar_reference_within_tolerance() {
+    let dims = [
+        0usize, 1, 3, 4, 7, 8, 15, 16, 17, 33, 767, 768, 769, 1000, 1536, 1537,
+    ];
+    let mut rng = XorShift64Star::new(0x0bad_cafe_1988_0001);
+    for &dim in &dims {
+        let a = random_vec(&mut rng, dim);
+        let b = random_vec(&mut rng, dim);
+        let expected = isa::l1_scalar(&a, &b);
+        let actual = isa::current().l1(&a, &b);
+        let tolerance = 1e-5 * expected + 1e-6;
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "dim={dim} actual={actual} expected={expected} tolerance={tolerance}"
+        );
+        // 同一プロセス内の決定性（同じ入力はビット同一）。
+        assert_eq!(actual.to_bits(), isa::current().l1(&a, &b).to_bits());
+    }
+}
+
+/// 整数値ベクトルでは丸め誤差が生じないため `l1` が scalar とビット完全一致し、
+/// 長さ不一致では短い方へ切り詰める意味論も一致すること（Issue #1988・SQL-33）。
+#[test]
+fn dispatched_l1_exact_on_integers_and_truncates_mismatched_lengths() {
+    for dim in [0usize, 1, 5, 8, 16, 17, 64, 129, 1000] {
+        let a: Vec<f32> = (0..dim).map(|i| (i % 7) as f32 - 3.0).collect();
+        let b: Vec<f32> = (0..dim).map(|i| (i % 5) as f32).collect();
+        assert_eq!(
+            isa::current().l1(&a, &b),
+            isa::l1_scalar(&a, &b),
+            "dim={dim}"
+        );
+    }
+    assert_eq!(isa::l1_scalar(&[1.0, 2.0, 3.0], &[4.0, 0.0, 3.0]), 5.0);
+    let a: Vec<f32> = (0..50).map(|i| i as f32).collect();
+    let b: Vec<f32> = (0..37).map(|i| (i * 2) as f32).collect();
+    assert_eq!(isa::current().l1(&a, &b), isa::l1_scalar(&a, &b));
+    assert_eq!(isa::current().l1(&b, &a), isa::l1_scalar(&b, &a));
+}
+
 /// `unsafe` が `isa.rs` 以外の `crates/engine/src/**/*.rs` に存在しないこと、
 /// `isa.rs` 内の各 `unsafe {` 直前数行に `SAFETY:` があることをソース走査で確認する
 /// （AGENTS.md P1「`unsafe` の立証」。sealed トークン所持を根拠とする 2 箇所
@@ -563,10 +606,11 @@ fn unsafe_is_confined_to_isa_module_with_safety_comments() {
     // （TASK-156・CORE-14）で追加した `dot_i8` の NeonDotprod ディスパッチ 1 箇所の
     // 計 12 箇所の `unsafe {` が現れる（実際のビルドで有効になるのは対象 arch の
     // 分岐のみだが、`cfg` 行はソース上に残ったまま走査されるため、arch に
-    // 依存せず常に 12 を期待できる）。
+    // 依存せず常に 12 を期待できる）。Issue #1988（SQL-33）で追加した `l1` の
+    // Neon・Avx2Fma・Avx512 ディスパッチ 3 箇所を加えて計 15 箇所となる。
     assert_eq!(
-        unsafe_block_count, 12,
-        "expected exactly 12 `unsafe {{` blocks in isa.rs (Neon/Avx2Fma/Avx512 dot dispatch \
+        unsafe_block_count, 15,
+        "expected exactly 15 `unsafe {{` blocks in isa.rs (Issue #1988 l1 dispatch x3 + Neon/Avx2Fma/Avx512 dot dispatch \
          + Avx2Fma/Avx512 dot_block4 dispatch + F16c/NeonFp16 dot_f16 dispatch added by \
          Issue #514 + Neon dot_block4 dispatch added by Issue #511 + Avx2Widen/AvxVnni/ \
          Avx512Vnni dot_i8 dispatch added by Issue #522 + NeonDotprod dot_i8 dispatch added \

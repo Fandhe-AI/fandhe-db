@@ -2583,7 +2583,9 @@ fn collect_referenced_udfs(
             }
             Ok(())
         }
-        Expr::Binary { lhs, rhs, .. } | Expr::JsonAccess { lhs, rhs, .. } => {
+        Expr::Binary { lhs, rhs, .. }
+        | Expr::JsonAccess { lhs, rhs, .. }
+        | Expr::VectorDistance { lhs, rhs, .. } => {
             collect_referenced_udfs(lhs, udf_registry, out)?;
             collect_referenced_udfs(rhs, udf_registry, out)
         }
@@ -2760,7 +2762,8 @@ fn push_set_expr(
             | Expr::RegexMatch {
                 lhs, pattern: rhs, ..
             }
-            | Expr::JsonAccess { lhs, rhs, .. } => {
+            | Expr::JsonAccess { lhs, rhs, .. }
+            | Expr::VectorDistance { lhs, rhs, .. } => {
                 walk(b, lhs);
                 walk(b, rhs);
             }
@@ -3053,6 +3056,22 @@ fn push_dml_expr(
             push_dml_expr(b, lhs, params)?;
             push_dml_expr(b, rhs, params)?;
         }
+        // タグ 22（対象ビヘイビア: SQL-74。Issue #2035。ADR §4.4 タグ表に追記）。距離演算子の
+        // 種別（`<=>`=1・`<->`=2・`<#>`=3・`<+>`=4）を 1 バイトで区別してから左辺・右辺を前置順に
+        // 直列化する。束縛段は評価が結線されるまで 0A000 で拒否するため台帳に載る経路は無いが、
+        // 網羅 match と D3 の契約（既存タグ 1〜21 は不変）のため固定する。
+        Expr::VectorDistance { kind, lhs, rhs } => {
+            use crate::sql::lexer::DistanceKind;
+            b.push_u8(22);
+            b.push_u8(match kind {
+                DistanceKind::Cosine => 1,
+                DistanceKind::L2 => 2,
+                DistanceKind::NegativeInnerProduct => 3,
+                DistanceKind::L1 => 4,
+            });
+            push_dml_expr(b, lhs, params)?;
+            push_dml_expr(b, rhs, params)?;
+        }
         // タグ 13（対象ビヘイビア: SQL-37。Issue #1586。`multi-row-dml-operation-id.md` で
         // 予約済み）。括弧なし SQL 値関数を「種別 1 バイト・精度の有無 1 バイト・精度 1 バイト
         // （無ければ 0）」で直列化する。#1586 の時点では書き込み文が時刻関数を受理しないため
@@ -3196,6 +3215,29 @@ fn dml_binop_tag(op: crate::sql::udf_call::BinOp) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 距離式（SQL-74・Issue #2035）は専用タグ 22 で直列化される。種別・左右の入れ替えで
+    /// 衝突せず、既存のタグ（`Binary` 等）とも区別される。
+    #[test]
+    fn vector_distance_expr_hash_is_distinct() {
+        use crate::sql::lexer::DistanceKind;
+        use crate::sql::udf_call::Expr;
+        let hash_of = |e: &Expr| {
+            let mut b = HashInputBuilder::new(OpTag::Insert);
+            push_dml_expr(&mut b, e, None).expect("hashable");
+            b.finish()
+        };
+        let col = || Box::new(Expr::Ident("embedding".to_string()));
+        let lit = || Box::new(Expr::String("[1,0]".to_string()));
+        let mk = |kind, swap: bool| {
+            let (lhs, rhs) = if swap { (lit(), col()) } else { (col(), lit()) };
+            Expr::VectorDistance { kind, lhs, rhs }
+        };
+        let base = hash_of(&mk(DistanceKind::L2, false));
+        assert_eq!(base, hash_of(&mk(DistanceKind::L2, false)));
+        assert_ne!(base, hash_of(&mk(DistanceKind::L1, false)));
+        assert_ne!(base, hash_of(&mk(DistanceKind::L2, true)));
+    }
 
     /// ビュー経由の書き込みのハッシュ（TABLE-43・Issue #1671）は決定的で、基表への直接の文・
     /// 別のビュー・別の内容と衝突しない。

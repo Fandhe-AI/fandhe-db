@@ -33,7 +33,8 @@
 | -- | ---- |
 | 広域取得 `SELECT <投影> FROM t [WHERE ...] LIMIT n OFFSET m` | 受理 |
 | 集計 `SELECT ... GROUP BY c [HAVING ...] [ORDER BY ...] LIMIT n OFFSET m` | 受理（グループ単位でスキップ） |
-| 検索 SELECT（`ORDER BY <距離>`／`HYBRID`／`USING PLAN`。SQL-1〜4） | 引き続き `42601`（本 ADR の対象外。spec 上の改訂注記なし） |
+| 検索 SELECT の距離 `ORDER BY`／`HYBRID`／`HYBRID_RRF` | Issue #2008 で受理（下の「kNN の OFFSET」節。SQL-33 (8)） |
+| 検索 SELECT の `USING PLAN` | 引き続き `42601` |
 | 単一行集計（`GROUP BY` なし） | 従来どおり `42601`（`LIMIT` 自体を受理しない形） |
 | `LIMIT` を伴わない `OFFSET` 単独・逆順（`OFFSET m LIMIT n`）・`OFFSET m ROWS`・`FETCH FIRST ...`・負値・小数 | `42601` |
 | `OFFSET` の後の余剰トークン | `42601` |
@@ -136,7 +137,27 @@ O(可視行数 + `G log G`)（`G` はグループ数）のまま変わらない�
 
 ## スコープ外（Issue 起票はせず記録のみ）
 
-- 検索 SELECT（SQL-1〜4）への `OFFSET`: spec 上の改訂注記が無く `42601` を維持。
+- 検索 SELECT への `OFFSET`: 距離 `ORDER BY`・HYBRID は Issue #2008 で対応（下の節）。`USING PLAN` は `42601` を維持。
 - NoSQL `scan`/`aggregate` の `offset`: #947（NOSQL-15・TASK-224）。本 Issue は
   `validate_search_offset`・`BoundScan::with_offset` を再利用可能な形で用意する
   のみ。
+
+## kNN の OFFSET（Issue #2008・SQL-33 (8)）
+
+距離 `ORDER BY`／`HYBRID`／`HYBRID_RRF` の検索 SELECT は `LIMIT k OFFSET m` を受理する。
+位置は `LIMIT` の直後で、`HINT ORDER`・`USING MODE` はその後ろ。`OFFSET m ROWS FETCH FIRST k ROWS ONLY` は
+`fetch_clause` が同じ形へ正規化する。逆順・負値・小数・余剰トークン・`OFFSET $n`・`USING PLAN` は `42601`。
+
+- **意味論**: 結果は「同じ経路の `LIMIT m+k` の結果から先頭 m 件を除いたもの」と一致する。実行段は
+  `BoundStatement::fetch_count()`（`limit + offset`）件を取得し、先頭 m 件を捨てる。HNSW・厳密走査・
+  hybrid はいずれも取得件数 `k_eff` を受けるため、探索件数も m+k になる（SQL-73 (3)）。
+- **除去位置**: 先頭 m 件の除去は RLS 安全網の後（`RlsVerifiedHits::skip_front`）に行う。前に行うと
+  不可視行が OFFSET の計数に入り、算術から存在を推測できるため。
+- **検証**: `m` は `validate_search_offset`（`0..=MAX_SEARCH_K`、`22000`）を再利用する。`k + m` は
+  `checked_add` で求め、結果行数上限（`--max-result-rows`）を超えると固定文言の `54000` で拒否する
+  （SQL-33 (8)）。Execute と Describe は `validate_search_limit_offset_with` を共有し、エラー分類をそろえる。
+  実行入口（`check_bound_search`）も多層防御として合計を再検査する。
+- **precision**: 「`LIMIT m+k` の precision 結果から先頭 m 件を除いたもの」と定義する。ゲートが m 件以下に
+  絞った場合は空集合になる。
+- **対象外**: `USING PLAN` との併用、NoSQL `search` の `offset` 写像、負の OFFSET の SQLSTATE 見直し（SQL-34 (1)
+  との整合は広域取得と一括で扱う）。

@@ -3109,6 +3109,10 @@ pub struct ValidatedStatement {
     /// WHERE 句に含まれる述語（AND 結合順）。空なら WHERE 句なし。
     pub(crate) where_predicates: Vec<WherePredicate>,
     pub(crate) limit: u32,
+    /// `LIMIT` 直後の任意 `OFFSET m`（Issue #2008・SQL-33 (8)。省略時 0）。距離 ORDER BY・
+    /// HYBRID 経路のみ非 0 になり得る（`USING PLAN` は `42601`）。範囲・合計の検証は
+    /// `sql::parser` の束縛段が行う。
+    pub(crate) offset: u32,
     /// `LIMIT` 直後の文末専用句 `USING MODE '<literal>'`（TASK-161・SQL-12）の生
     /// リテラル値。省略時は `None`。値の意味論的妥当性（`recall`／`precision` の
     /// 2 値のみ有効）は本モジュールの管轄外で、`sql::mode::SearchMode::parse_literal`
@@ -3123,6 +3127,10 @@ pub struct ValidatedStatement {
     /// プランニング、TASK-110・PLAN-1）・ハイブリッド実行形への束縛は
     /// `sql::using_plan` の管轄で、本モジュールは構文構造の受理までを担う。
     pub(crate) using_plan: Option<String>,
+    /// 距離順 `ORDER BY` に付いた `DESC`（遠い順。Issue #2009・SQL-33 (2)）。既定は `false`
+    /// （昇順）。`true` の文は ANN 索引を使わず可視行を全走査して返す（実行は `sql::exec`）。
+    /// `order_by` が [`OrderByForm::Distance`] でないのに `true` の組は束縛が `42601` で拒否する。
+    pub(crate) distance_descending: bool,
 }
 
 impl ValidatedStatement {
@@ -3145,10 +3153,38 @@ impl ValidatedStatement {
             order_by,
             where_predicates,
             limit,
+            offset: 0,
             search_mode: None,
             evaluation_order,
             using_plan: None,
+            distance_descending: false,
         }
+    }
+
+    /// 距離順 `ORDER BY` の方向（`true` で `DESC`＝遠い順。Issue #2009・SQL-33 (2)）を設定した
+    /// コピーを返すビルダー的メソッド。[`Self::new`] と組み合わせて外部から構築する。
+    #[must_use]
+    pub fn with_distance_descending(mut self, descending: bool) -> Self {
+        self.distance_descending = descending;
+        self
+    }
+
+    /// 距離順 `ORDER BY` に `DESC` が付いているか（Issue #2009・SQL-33 (2)）。
+    pub fn distance_descending(&self) -> bool {
+        self.distance_descending
+    }
+
+    /// `OFFSET`（Issue #2008・SQL-33 (8)）を設定したコピーを返すビルダー的メソッド。
+    #[must_use]
+    pub fn with_offset(mut self, offset: u32) -> Self {
+        self.offset = offset;
+        self
+    }
+
+    /// `OFFSET` 句の値（構造検証済みの生値。既定 0。範囲・`LIMIT` との合計は
+    /// `sql::parser::validate_search_limit_offset_with` が束縛時に検証する）。
+    pub fn offset(&self) -> u32 {
+        self.offset
     }
 
     /// `search_mode`（TASK-161・SQL-12）を設定したコピーを返すビルダー的メソッド。
@@ -6650,6 +6686,11 @@ struct Parser<'a> {
     /// `42601` にする（脱糖後の形が `check_constraint` の許可形と区別できず、
     /// CHECK の受理範囲が黙って広がるのを防ぐ）。
     in_check_body: bool,
+    /// 距離式（`<列> <距離演算子> <ベクトル>`。SQL-74 (1)・Issue #2035）を値式の「その他の演算子」の
+    /// 段で受理してよいか。WHERE の葉（[`Parser::parse_where_leaf`]）を解析している間だけ真で、
+    /// 投影・SET・VALUES・UDF 本体・ORDER BY・JOIN など他の文脈は従来どおり `42601` のままにする。
+    /// CHECK 本体は真にしない（従来の拒否を維持）。
+    distance_expr_allowed: bool,
     /// 複数行 `VALUES` が持てる行数の上限（[`Self::parse_insert`] が判定に使う）。
     /// 既定値は `None`＝上限なし（Issue #997・オーナー判断の改訂
     /// 〔2026-09-27、汎用 RDB との整合〕）。`Some(limit)` は `wire-server` の
@@ -6792,6 +6833,7 @@ impl<'a> Parser<'a> {
             allow_plus_number: false,
             allow_plus_param: false,
             in_check_body: false,
+            distance_expr_allowed: false,
             max_insert_rows: None,
             from_ref: None,
             reject_from_alias: false,
@@ -9512,6 +9554,22 @@ impl<'a> Parser<'a> {
         set_operators: bool,
         leaf_count: &mut usize,
     ) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
+        // WHERE の葉の中だけ距離式を受理する（SQL-74 (1)・Issue #2035）。`in_check_body` と同じ
+        // 保存・復元の流儀で、エラー経路でも元の値へ戻す。
+        let prev = self.distance_expr_allowed;
+        self.distance_expr_allowed = !self.in_check_body;
+        let result = self.parse_where_leaf_inner(extra_close_paren, set_operators, leaf_count);
+        self.distance_expr_allowed = prev;
+        result
+    }
+
+    /// [`Self::parse_where_leaf`] の本体（距離式の受理フラグを設定済みの状態で呼ばれる）。
+    fn parse_where_leaf_inner(
+        &mut self,
+        extra_close_paren: bool,
+        set_operators: bool,
+        leaf_count: &mut usize,
+    ) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
         // Issue #1534・SQL-44 ポインタ: 単一テーブル FROM の公開名（別名があれば別名）に
         // 一致しない修飾子は `42P01`。通常 SELECT 系は #1535 の `sql::qualified_column`
         // 正規化がパース前に修飾子を解消するため、本フックは正規化を適用しない経路
@@ -11186,6 +11244,20 @@ impl<'a> Parser<'a> {
                 Some(Token::JsonExistsAny) => JsonAccessOp::ExistsAny,
                 Some(Token::JsonExistsAll) => JsonAccessOp::ExistsAll,
                 Some(Token::ArrayOverlap) => JsonAccessOp::Overlap,
+                // 距離式（SQL-74 (1)・Issue #2035）。WHERE の葉の中だけで受理し、同じ段・左結合で
+                // 構築する。右辺は加減算の段まで（比較・BETWEEN より強く結合）。
+                Some(Token::DistanceOp(kind)) if self.distance_expr_allowed => {
+                    let kind = *kind;
+                    self.advance();
+                    let rhs = self.parse_add_expr(depth + 1)?;
+                    self.consume_expr_node()?;
+                    lhs = Expr::VectorDistance {
+                        kind,
+                        lhs: Box::new(lhs),
+                        rhs: Box::new(rhs),
+                    };
+                    continue;
+                }
                 _ => break,
             };
             if self.in_check_body {
@@ -21035,11 +21107,16 @@ struct ParsedShape {
     where_predicates: Vec<WherePredicate>,
     order_by: OrderByForm,
     limit: u32,
+    /// `LIMIT n` 直後の任意 `OFFSET m`（Issue #2008・SQL-33 (8)。省略時 0）。
+    /// `USING PLAN` 経路は受理せず常に 0。
+    offset: u32,
     search_mode: Option<String>,
     evaluation_order: EvaluationOrder,
     /// `USING PLAN('<query>')`（TASK-77・SQL-5）。`Some` のとき `order_by` は必ず
     /// [`OrderByForm::UsingPlan`]。
     using_plan: Option<String>,
+    /// 距離順 `ORDER BY` 直後の `DESC`（Issue #2009・SQL-33 (2)）。`Distance` 形以外では常に `false`。
+    distance_descending: bool,
 }
 
 /// 構文木（[`ValidatedScan`] の元）。カタログ存在確認前の中間結果（Issue #454。
@@ -23199,9 +23276,11 @@ fn parse_select_shape(
             where_predicates,
             order_by: OrderByForm::UsingPlan,
             limit,
+            offset: 0,
             search_mode,
             evaluation_order: EvaluationOrder::DEFAULT,
             using_plan: Some(using_plan),
+            distance_descending: false,
         }));
     }
 
@@ -23217,8 +23296,8 @@ fn parse_select_shape(
         let limit = p.parse_optional_limit()?;
 
         // Issue #916・SQL-25 (b)・TASK-209: `LIMIT n` の直後に任意で `OFFSET m` を
-        // 受理する（広域取得のみ。検索 SELECT の `ORDER BY`／`USING PLAN` 経路は
-        // 対象外のまま `expect_end_of_statement` が `42601` に落とす）。
+        // 受理する（広域取得）。距離 ORDER BY・HYBRID は Issue #2008 で別分岐が受理し、
+        // `USING PLAN` 経路は対象外のまま `expect_end_of_statement` が `42601` に落とす。
         let offset = p.parse_optional_offset()?.unwrap_or(0);
 
         p.expect_end_of_statement()?;
@@ -23353,12 +23432,29 @@ fn parse_select_shape(
         ));
     }
     let order_by = p.parse_order_by()?;
+    // Issue #2009・SQL-33 (2): 距離順 `ORDER BY` に限り方向語 `ASC`／`DESC` を 1 つ受理する
+    // （文脈語のため大文字小文字非区別）。`NULLS` 句・重複・hybrid 関数形への付与は
+    // ここで読まず、後続の `expect_keyword(Limit)` が従来どおり `42601` に落とす。
+    let mut distance_descending = false;
+    if matches!(order_by, OrderByForm::Distance { .. }) {
+        if p.peek_ident_matches("DESC") {
+            p.advance();
+            distance_descending = true;
+        } else if p.peek_ident_matches("ASC") {
+            p.advance();
+        }
+    }
 
     p.expect_keyword(Keyword::Limit)?;
     let limit_str = p.expect_number()?;
     let limit: u32 = limit_str
         .parse()
         .map_err(|_| SqlSurfaceError::unsupported(format!("malformed LIMIT value: {limit_str}")))?;
+
+    // Issue #2008・SQL-33 (8): ベクトル順位付け（距離 ORDER BY・HYBRID）は `LIMIT n` の直後に
+    // 任意の `OFFSET m` を受理する（`fetch_clause` の正規形 `LIMIT n OFFSET m` と同じ位置）。
+    // 値の範囲・`LIMIT + OFFSET` の合計検証は束縛段（`sql::parser`）が行う。
+    let offset = p.parse_optional_offset()?.unwrap_or(0);
 
     let evaluation_order = p.parse_hint_order()?.unwrap_or(EvaluationOrder::DEFAULT);
     let search_mode = p.parse_using_clause()?;
@@ -23371,9 +23467,11 @@ fn parse_select_shape(
         where_predicates,
         order_by,
         limit,
+        offset,
         search_mode,
         evaluation_order,
         using_plan: None,
+        distance_descending,
     }))
 }
 
@@ -23434,7 +23532,9 @@ fn expr_contains_scalar_function(expr: &Expr) -> bool {
         Expr::IsDistinctFrom { .. } => true,
         // 正規表現マッチ（SQL-55）も従来形では書けない式述語。
         Expr::RegexMatch { .. } => true,
-        Expr::Binary { lhs, rhs, .. } | Expr::JsonAccess { lhs, rhs, .. } => {
+        Expr::Binary { lhs, rhs, .. }
+        | Expr::JsonAccess { lhs, rhs, .. }
+        | Expr::VectorDistance { lhs, rhs, .. } => {
             expr_contains_scalar_function(lhs) || expr_contains_scalar_function(rhs)
         }
         // 照合指定（TABLE-28・Issue #1609）は従来形では書けない式。SQL/JSON 問い合わせ関数
@@ -27761,9 +27861,11 @@ fn validate_select_statement(
                 order_by: shape.order_by,
                 where_predicates: shape.where_predicates,
                 limit: shape.limit,
+                offset: shape.offset,
                 search_mode: shape.search_mode,
                 evaluation_order: shape.evaluation_order,
                 using_plan: shape.using_plan,
+                distance_descending: shape.distance_descending,
             }))
         }
         // Issue #454: `ORDER BY`・`USING PLAN` のいずれも伴わない
@@ -31986,6 +32088,69 @@ mod tests {
         assert!(matches!(rhs.as_ref(), Expr::Binary { op: BinOp::Add, .. }));
     }
 
+    /// SQL-74 (1)・Issue #2035: WHERE 内の距離式は「その他の演算子」の段（加減算より弱く比較より強い）で
+    /// 構文として受理し、6 つの比較・`BETWEEN`・前置 `NOT`・括弧・逆向きと組み合わせられる。
+    /// 4 種別の `kind` を AST に保持し、比較の無い裸の距離式や WHERE 以外の位置は従来どおり拒否する。
+    #[test]
+    fn where_distance_expression_parses() {
+        use crate::sql::lexer::DistanceKind;
+        use crate::sql::udf_call::BinOp;
+        let tail = "ORDER BY embedding <=> '[0.1]' LIMIT 5";
+        for (sql, want) in [
+            ("<=>", DistanceKind::Cosine),
+            ("<->", DistanceKind::L2),
+            ("<#>", DistanceKind::NegativeInnerProduct),
+            ("<+>", DistanceKind::L1),
+        ] {
+            let preds = where_predicates_for(&format!(
+                "SELECT * FROM documents WHERE embedding {sql} '[0.1]' < 0.5 {tail}"
+            ));
+            let [WherePredicate::Expression(Expr::Binary {
+                op: BinOp::Lt, lhs, ..
+            })] = preds.as_slice()
+            else {
+                panic!("expected a comparison, got {preds:?}");
+            };
+            assert!(
+                matches!(lhs.as_ref(), Expr::VectorDistance { kind, .. } if *kind == want),
+                "{sql}"
+            );
+        }
+        // 逆向き・括弧・前置 NOT（演算子が反転する）。
+        for sql in [
+            "0.5 > embedding <-> '[0.1]'",
+            "(embedding <-> '[0.1]') < 0.5",
+            "NOT embedding <-> '[0.1]' >= 0.5",
+        ] {
+            where_predicates_for(&format!("SELECT * FROM documents WHERE {sql} {tail}"));
+        }
+        // BETWEEN は `>= AND <=` の 2 述語、NOT BETWEEN は OR、`<>` も OR へ脱糖される。
+        let preds = where_predicates_for(&format!(
+            "SELECT * FROM documents WHERE embedding <-> '[0.1]' BETWEEN 0.1 AND 0.5 {tail}"
+        ));
+        assert_eq!(preds.len(), 2, "{preds:?}");
+        let preds = where_predicates_for(&format!(
+            "SELECT * FROM documents WHERE embedding <-> '[0.1]' <> 0.5 {tail}"
+        ));
+        assert!(matches!(preds.as_slice(), [WherePredicate::Or(b)] if b.len() == 2));
+        // 優先順位: 右辺は加算まで取り込み、比較より強く結合する。
+        let preds = where_predicates_for(&format!(
+            "SELECT * FROM documents WHERE embedding <-> '[0.1]' < 0.5 + 0.1 {tail}"
+        ));
+        let [WherePredicate::Expression(Expr::Binary { rhs, .. })] = preds.as_slice() else {
+            panic!("expected a comparison, got {preds:?}");
+        };
+        assert!(matches!(rhs.as_ref(), Expr::Binary { op: BinOp::Add, .. }));
+        // 従来どおり拒否する位置（比較の無い裸の距離式・投影・SET 右辺）。
+        let lookup = catalog_with(&["documents"]);
+        for sql in [
+            "SELECT * FROM documents WHERE embedding <-> '[0.1]' LIMIT 5",
+            "SELECT embedding <-> '[0.1]' FROM documents LIMIT 5",
+        ] {
+            assert!(validate_statement(sql, &lookup).is_err(), "{sql}");
+        }
+    }
+
     /// Issue #1603（TABLE-35）: 量化比較 `ANY`／`SOME`／`ALL` と `&&` の構文。`SOME` は `ANY` に正規化し、
     /// `<>`／`!=` は `NOT =` と同じ `Or([<],[>])` へ脱糖し、サブクエリ形は `0A000`。
     #[test]
@@ -32329,11 +32494,45 @@ mod tests {
         );
     }
 
+    fn knn_offset_of(sql: &str) -> u32 {
+        let lookup = catalog_with(&["documents"]);
+        validate_statement(sql, &lookup)
+            .expect("kNN offset shape should be accepted")
+            .offset()
+    }
+
     #[test]
-    fn rejects_offset() {
-        assert_rejected_as_syntax_error(
-            "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' LIMIT 5 OFFSET 10",
+    fn accepts_knn_offset() {
+        // Issue #2008・SQL-33 (8): 距離 ORDER BY の `LIMIT n OFFSET m` を受理する。
+        assert_eq!(
+            knn_offset_of(
+                "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' LIMIT 5 OFFSET 10"
+            ),
+            10
         );
+        assert_eq!(
+            knn_offset_of("SELECT * FROM documents ORDER BY embedding <=> '[0.1]' LIMIT 5"),
+            0
+        );
+        assert_eq!(
+            knn_offset_of(
+                "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' LIMIT 5 OFFSET 1 USING MODE 'recall'"
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn rejects_knn_offset_malformed() {
+        for sql in [
+            "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' OFFSET 1 LIMIT 5",
+            "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' LIMIT 5 OFFSET -1",
+            "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' LIMIT 5 OFFSET 1.5",
+            "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' LIMIT 5 OFFSET 1 x",
+            "SELECT * FROM documents USING PLAN('q') LIMIT 5 OFFSET 1",
+        ] {
+            assert_rejected_as_syntax_error(sql);
+        }
     }
 
     #[test]
@@ -41931,6 +42130,98 @@ mod tests {
         assert_eq!(f.exclusion, WindowFrameExclusion::CurrentRow);
         let f = frame_of("ORDER BY score ROWS UNBOUNDED PRECEDING EXCLUDE GROUP");
         assert_eq!(f.exclusion, WindowFrameExclusion::Group);
+    }
+
+    // --- 距離順 ORDER BY の方向語 ASC／DESC（Issue #2009・SQL-33 (2)） ---------
+
+    #[test]
+    fn distance_order_by_accepts_desc_and_asc_case_insensitively() {
+        let lookup = catalog_with(&["documents"]);
+        for (dir, expected) in [
+            ("", false),
+            (" ASC", false),
+            (" asc", false),
+            (" DESC", true),
+            (" desc", true),
+            (" DeSc", true),
+        ] {
+            let sql =
+                format!("SELECT * FROM documents ORDER BY embedding <=> '[0.1]'{dir} LIMIT 5");
+            let stmt = validate_statement(&sql, &lookup)
+                .unwrap_or_else(|e| panic!("{sql} must be accepted, got {e:?}"));
+            assert_eq!(stmt.distance_descending(), expected, "{sql}");
+        }
+    }
+
+    #[test]
+    fn distance_desc_combines_with_where_mode_and_hint() {
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_statement(
+            "SELECT * FROM documents WHERE id = 1 ORDER BY embedding <=> '[0.1]' DESC LIMIT 5 HINT ORDER(DISTANCE, RLS, SCALAR) USING MODE 'recall'",
+            &lookup,
+        )
+        .expect("DESC with WHERE/HINT/MODE");
+        assert!(stmt.distance_descending());
+        assert_eq!(stmt.search_mode(), Some("recall"));
+    }
+
+    #[test]
+    fn distance_desc_rejects_nulls_duplicates_and_missing_limit() {
+        let lookup = catalog_with(&["documents"]);
+        for sql in [
+            "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' DESC NULLS FIRST LIMIT 5",
+            "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' DESC DESC LIMIT 5",
+            "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' ASC DESC LIMIT 5",
+            "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' DESC",
+        ] {
+            let e = validate_statement(sql, &lookup).expect_err(sql);
+            assert_eq!(e.wire_code(), "42601", "{sql}");
+        }
+        // OFFSET は #2008 で受理されたため DESC とも併用できる。
+        let stmt = validate_statement(
+            "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' DESC LIMIT 5 OFFSET 1",
+            &lookup,
+        )
+        .expect("DESC with OFFSET");
+        assert!(stmt.distance_descending());
+    }
+
+    #[test]
+    fn distance_desc_on_unsupported_operator_keeps_asc_error_code() {
+        let lookup = catalog_with(&["documents"]);
+        for op in ["<->", "<#>", "<+>"] {
+            let asc = validate_statement(
+                &format!("SELECT * FROM documents ORDER BY embedding {op} '[0.1]' LIMIT 5"),
+                &lookup,
+            );
+            let desc = validate_statement(
+                &format!("SELECT * FROM documents ORDER BY embedding {op} '[0.1]' DESC LIMIT 5"),
+                &lookup,
+            );
+            // 受理状況は演算子ごとに変わりうる（#1977）。DESC を付けても ASC と結果の種別が一致する。
+            assert_eq!(
+                asc.as_ref().err().map(|e| e.wire_code()),
+                desc.as_ref().err().map(|e| e.wire_code()),
+                "{op}"
+            );
+        }
+    }
+
+    #[test]
+    fn distance_descending_builder_defaults_false_and_roundtrips() {
+        let stmt = ValidatedStatement::new(
+            "documents".to_string(),
+            Projection::All,
+            OrderByForm::Distance {
+                column: "embedding".to_string(),
+                literal: "[0.1]".to_string(),
+            },
+            Vec::new(),
+            5,
+            EvaluationOrder::DEFAULT,
+        );
+        assert!(!stmt.distance_descending());
+        assert!(stmt.with_distance_descending(true).distance_descending());
     }
 }
 

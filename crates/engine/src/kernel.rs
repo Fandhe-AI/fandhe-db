@@ -353,6 +353,121 @@ pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
     crate::isa::current().dot(a, b)
 }
 
+/// L1（マンハッタン）距離。実体は `isa.rs::current().l1`（Issue #1988・SQL-33）へ
+/// 委譲し、[`dot`] と同じく単一のカーネル・単一の加算順序を全呼び出し元で共有する。
+pub(crate) fn l1(a: &[f32], b: &[f32]) -> f32 {
+    crate::isa::current().l1(a, b)
+}
+
+/// L1 距離による総当たり Top-k（距離の昇順・同距離は id 昇順。Issue #1988・SQL-33）。
+///
+/// [`SearchProvider`] trait には載せない独立関数で、SQL 表層（`ORDER BY v <+> q`）への
+/// 接続は距離種別付き演算子の受理と昇順経路（別 Issue）の役割。検証順・除外規約は
+/// [`CpuScalarProvider::search`] と同じ（次元不一致 → 非有限クエリ → `k == 0`／空入力 →
+/// 範囲外行 skip）。
+///
+/// 返す [`CandidateHit::score`] は「負の L1 距離」（`-l1`）である。有限 f32 の符号反転は
+/// 正確なので、既存 [`TopKSelector`] の「スコア降順・同点 id 昇順」がそのまま
+/// 「距離昇順・同距離 id 昇順」になる（`CandidateHit` の「大きいほど上位」契約を保つ）。
+/// 距離が +Inf に溢れた行は既存契約（非有限スコアは除外・fail-closed）に従い除外する。
+#[allow(dead_code)] // SQL 接続（別 Issue）までは単体テストのみが呼び出し元
+pub(crate) fn search_l1(input: SearchInput<'_>) -> Result<Vec<CandidateHit>, KernelError> {
+    let dim = input.dim as usize;
+    if input.query.len() != dim {
+        return Err(KernelError::DimMismatch {
+            expected: input.dim,
+            found: input.query.len(),
+        });
+    }
+    if input.query.iter().any(|v| !v.is_finite()) {
+        return Err(KernelError::NonFiniteQuery);
+    }
+    if input.k == 0 || input.ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut selector = TopKSelector::new(input.k);
+    for (idx, &id) in input.ids.iter().enumerate() {
+        let start = idx.saturating_mul(dim);
+        let end = start.saturating_add(dim);
+        let Some(vector) = input.vectors.get(start..end) else {
+            continue;
+        };
+        let distance = l1(vector, input.query);
+        if !distance.is_finite() {
+            continue;
+        }
+        selector.push(CandidateHit {
+            id,
+            score: -distance,
+        });
+    }
+    Ok(selector.into_sorted_vec())
+}
+
+/// 遠い順（`DESC`）選出ヒープの要素。`Ord` は「遠い順に並べたとき後ろ（＝より劣る）ほど大きい」。
+struct FarHeapItem(CandidateHit);
+impl PartialEq for FarHeapItem {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+impl Eq for FarHeapItem {}
+impl PartialOrd for FarHeapItem {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for FarHeapItem {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        search_order::cmp_far_first_then_tie(
+            self.0.score,
+            search_order::tie_key_for_response_id(self.0.id),
+            other.0.score,
+            search_order::tie_key_for_response_id(other.0.id),
+        )
+    }
+}
+
+/// 距離の降順（遠い順）の Top-k 選出（Issue #2009・SQL-33 (2)。`ORDER BY <距離演算子> DESC`）。
+///
+/// 距離種別に依存しない汎用選出器で、候補の [`CandidateHit::score`] は昇順経路と同じ向き
+/// （大きいほど近い。L2 なら負の距離など）で受け取り、スコアの低い順に `k` 件を返す。
+/// 同点は候補識別子（順序キー）の昇順、NaN は最も遠いものとして先頭に置く
+/// （[`search_order::cmp_far_first_then_tie`]）。`sql::exec` の `DESC` 分岐が呼ぶ。
+/// 非有限値の除外は昇順経路と同じく呼び出し側の責務で、ここでは行わない。
+/// 最大ヒープで `O(n log k)`・保持は高々 `k` 件。事前確保は `k` に依存させない
+/// （[`TopKSelector::new`] と同じ理由）。
+pub(crate) fn select_farthest_k(
+    candidates: impl Iterator<Item = CandidateHit>,
+    k: usize,
+) -> Vec<CandidateHit> {
+    if k == 0 {
+        return Vec::new();
+    }
+    let mut heap: std::collections::BinaryHeap<FarHeapItem> = std::collections::BinaryHeap::new();
+    for hit in candidates {
+        let item = FarHeapItem(hit);
+        if heap.len() < k {
+            heap.push(item);
+        } else if let Some(worst) = heap.peek() {
+            if item < *worst {
+                heap.pop();
+                heap.push(item);
+            }
+        }
+    }
+    let mut out: Vec<CandidateHit> = heap.into_iter().map(|i| i.0).collect();
+    out.sort_by(|a, b| {
+        search_order::cmp_far_first_then_tie(
+            a.score,
+            search_order::tie_key_for_response_id(a.id),
+            b.score,
+            search_order::tie_key_for_response_id(b.id),
+        )
+    });
+    out
+}
+
 /// 4 行 × 1 クエリの内積（`dot` の行ブロック版。Issue #510・TASK-156・CORE-14。
 /// ポインタ: `docs/design/dot-kernel-row-block.md`）。
 ///
@@ -821,5 +936,180 @@ mod tests {
             })
             .unwrap_err();
         assert_eq!(err, KernelError::NonFiniteQuery);
+    }
+
+    // ---- L1 距離 Top-k（Issue #1988・SQL-33） ----
+
+    fn l1_input<'a>(
+        ids: &'a [u64],
+        vectors: &'a [f32],
+        dim: u32,
+        query: &'a [f32],
+        k: usize,
+    ) -> SearchInput<'a> {
+        SearchInput {
+            ids,
+            vectors,
+            dim,
+            query,
+            k,
+        }
+    }
+
+    #[test]
+    fn search_l1_orders_by_distance_ascending_then_id() {
+        // dim=2、クエリ [0,0]。距離は id=1:3, 2:1, 3:1, 4:5, 5:0。
+        let ids = [1u64, 2, 3, 4, 5];
+        let vectors = [3.0, 0.0, 0.0, 1.0, -1.0, 0.0, 2.0, -3.0, 0.0, 0.0];
+        let query = [0.0, 0.0];
+        let hits = search_l1(l1_input(&ids, &vectors, 2, &query, 10)).unwrap();
+        let got: Vec<u64> = hits.iter().map(|h| h.id).collect();
+        assert_eq!(got, vec![5, 2, 3, 1, 4]);
+        assert_eq!(hits[0].score, 0.0);
+        assert_eq!(hits[1].score, -1.0);
+    }
+
+    #[test]
+    fn search_l1_tie_at_k_boundary_keeps_smaller_id() {
+        let ids = [7u64, 3, 9];
+        let vectors = [1.0, 1.0, 1.0];
+        let query = [0.0];
+        let hits = search_l1(l1_input(&ids, &vectors, 1, &query, 2)).unwrap();
+        let got: Vec<u64> = hits.iter().map(|h| h.id).collect();
+        assert_eq!(got, vec![3, 7]);
+    }
+
+    #[test]
+    fn search_l1_edge_cases_fail_closed() {
+        let ids = [1u64];
+        let vectors = [1.0, 2.0];
+        assert!(search_l1(l1_input(&ids, &vectors, 2, &[0.0, 0.0], 0))
+            .unwrap()
+            .is_empty());
+        assert!(search_l1(l1_input(&[], &[], 2, &[0.0, 0.0], 3))
+            .unwrap()
+            .is_empty());
+        let err = search_l1(l1_input(&ids, &vectors, 2, &[0.0], 3)).unwrap_err();
+        assert!(matches!(err, KernelError::DimMismatch { .. }));
+        let err = search_l1(l1_input(&ids, &vectors, 2, &[f32::NAN, 0.0], 3)).unwrap_err();
+        assert_eq!(err, KernelError::NonFiniteQuery);
+        // 非有限の格納値を持つ行は除外される。
+        let ids = [1u64, 2];
+        let vectors = [f32::NAN, 0.0, 1.0, 1.0];
+        let hits = search_l1(l1_input(&ids, &vectors, 2, &[0.0, 0.0], 5)).unwrap();
+        assert_eq!(hits.iter().map(|h| h.id).collect::<Vec<_>>(), vec![2]);
+    }
+
+    #[test]
+    fn search_l1_matches_bruteforce_scalar_reference() {
+        // 整数値ベクトルなら SIMD と scalar の丸め差が生じず id 列が完全一致する。
+        for dim in [1usize, 7, 16, 100, 768] {
+            let rows = 200usize;
+            let mut x = 0x9e37_79b9_7f4a_7c15u64 ^ dim as u64;
+            let mut next = || {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x % 9) as f32 - 4.0
+            };
+            let vectors: Vec<f32> = (0..rows * dim).map(|_| next()).collect();
+            let query: Vec<f32> = (0..dim).map(|_| next()).collect();
+            let ids: Vec<u64> = (0..rows as u64).map(|i| i * 3 + 1).collect();
+            let k = 25;
+
+            let mut expected: Vec<(f32, u64)> = ids
+                .iter()
+                .zip(vectors.chunks(dim))
+                .map(|(&id, v)| (crate::isa::l1_scalar(v, &query), id))
+                .collect();
+            expected.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+            let expected_ids: Vec<u64> = expected.iter().take(k).map(|e| e.1).collect();
+
+            let hits = search_l1(l1_input(&ids, &vectors, dim as u32, &query, k)).unwrap();
+            let got: Vec<u64> = hits.iter().map(|h| h.id).collect();
+            assert_eq!(got, expected_ids, "dim={dim}");
+        }
+    }
+
+    /// 参照用の距離関数（大きいほど近いスコアへ正規化）。選出器が距離種別に依存しないことの確認用
+    /// （Issue #2009・SQL-33 (2)。L2・コサイン・負の内積・L1）。
+    fn reference_scores(metric: usize, rows: &[[f32; 2]], q: [f32; 2]) -> Vec<CandidateHit> {
+        rows.iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let dist = match metric {
+                    0 => ((r[0] - q[0]).powi(2) + (r[1] - q[1]).powi(2)).sqrt(),
+                    1 => {
+                        let n =
+                            (r[0] * r[0] + r[1] * r[1]).sqrt() * (q[0] * q[0] + q[1] * q[1]).sqrt();
+                        1.0 - (r[0] * q[0] + r[1] * q[1]) / n
+                    }
+                    2 => -(r[0] * q[0] + r[1] * q[1]),
+                    _ => (r[0] - q[0]).abs() + (r[1] - q[1]).abs(),
+                };
+                CandidateHit {
+                    id: i as u64,
+                    score: -dist,
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn select_farthest_k_matches_full_stable_sort_for_every_metric() {
+        // 同点（行 4 と行 5 が同一）を含む。
+        let rows = [
+            [1.0f32, 0.0],
+            [0.0, 1.0],
+            [-1.0, 0.5],
+            [2.0, 2.0],
+            [0.5, 0.5],
+            [0.5, 0.5],
+            [-2.0, -1.0],
+        ];
+        let q = [1.0f32, 1.0];
+        for metric in 0..4 {
+            let all = reference_scores(metric, &rows, q);
+            let mut expected = all.clone();
+            expected.sort_by(|a, b| {
+                search_order::cmp_far_first_then_tie(
+                    a.score,
+                    search_order::tie_key_for_response_id(a.id),
+                    b.score,
+                    search_order::tie_key_for_response_id(b.id),
+                )
+            });
+            for k in [0usize, 1, 3, rows.len(), rows.len() + 5] {
+                let got = select_farthest_k(all.iter().copied(), k);
+                let want: Vec<_> = expected.iter().copied().take(k).collect();
+                assert_eq!(got, want, "metric={metric} k={k}");
+            }
+        }
+    }
+
+    #[test]
+    fn select_farthest_k_ties_ascending_and_empty_input() {
+        let hits = [
+            CandidateHit { id: 3, score: 0.5 },
+            CandidateHit { id: 1, score: 0.5 },
+            CandidateHit { id: 2, score: 0.9 },
+        ];
+        let got = select_farthest_k(hits.iter().copied(), 2);
+        assert_eq!(got.iter().map(|h| h.id).collect::<Vec<_>>(), vec![1, 3]);
+        assert!(select_farthest_k(std::iter::empty(), 4).is_empty());
+    }
+
+    #[test]
+    fn select_farthest_k_puts_nan_first() {
+        let hits = [
+            CandidateHit { id: 1, score: -5.0 },
+            CandidateHit {
+                id: 2,
+                score: f32::NAN,
+            },
+        ];
+        let got = select_farthest_k(hits.iter().copied(), 2);
+        assert_eq!(got[0].id, 2);
+        assert_eq!(got[1].id, 1);
     }
 }

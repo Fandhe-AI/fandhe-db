@@ -711,6 +711,8 @@ fn ann_plan_token(plan: AnnPlan) -> &'static str {
         // かを `EngineCore` 側から判別できない旨を明示し、`plain_scan_engine`
         // （厳密 brute-force と確定）と区別する。
         AnnPlan::UnknownCustomProvider => "unknown_custom_provider",
+        // Issue #2009・SQL-75 (4): 距離順 `DESC` は索引を使わない厳密全走査。
+        AnnPlan::PlainScanDescending => "plain_scan_descending",
     }
 }
 
@@ -1165,13 +1167,14 @@ mod tests {
     }
 
     #[test]
-    fn build_explain_result_reports_all_five_ann_plan_tokens() {
+    fn build_explain_result_reports_all_six_ann_plan_tokens() {
         for (plan, expected) in [
             (AnnPlan::PlainScanEngine, "plain_scan_engine"),
             (AnnPlan::PlainScanPrecision, "plain_scan_precision"),
             (AnnPlan::HnswFullVisible, "hnsw_full_visible"),
             (AnnPlan::HnswSubset, "hnsw_subset"),
             (AnnPlan::UnknownCustomProvider, "unknown_custom_provider"),
+            (AnnPlan::PlainScanDescending, "plain_scan_descending"),
         ] {
             let planned = PlannedQuery::new(
                 QueryExpansion::default(),

@@ -148,6 +148,9 @@ pub struct BoundStatement {
     pub(crate) or_filters: Vec<crate::sql::where_tree::BoundOrGroup>,
     pub(crate) ranking: Ranking,
     pub(crate) limit: usize,
+    /// `OFFSET` 句の値（Issue #2008・SQL-33 (8)。既定 0）。実行段は `limit + offset` 件を
+    /// 取得し、RLS 安全網の後で先頭 `offset` 件を捨てる（[`Self::fetch_count`]）。
+    pub(crate) offset: usize,
     /// 取得モードの優先順位解決結果（TASK-161・SQL-12）。クエリ句 `USING MODE`
     /// （[`ValidatedStatement::search_mode`](crate::sql::allowlist::ValidatedStatement)）
     /// とセッション変数（呼び出し元 `core.rs::EngineCore::execute_sql_in_session` が
@@ -160,6 +163,36 @@ pub struct BoundStatement {
     /// 検証済みの [`EvaluationOrder`] をそのまま素通しする（意味論的な束縛の必要は
     /// ない。実行意味論の解釈は [`crate::sql::plan::ExecutionPlan`] の管轄）。
     pub(crate) evaluation_order: EvaluationOrder,
+    /// 距離順 `ORDER BY` が `DESC`（遠い順）か（Issue #2009・SQL-33 (2)）。`true` の文は
+    /// `sql::exec` が ANN を使わない厳密全走査で返す。`ranking` が [`Ranking::Distance`] の
+    /// ときだけ `true` になりうる（[`check_distance_direction`] が束縛時に保証する）。
+    /// NoSQL 表層・`USING PLAN` 経路など直接組み立てる箇所は常に `false`（昇順）。
+    pub(crate) distance_descending: bool,
+}
+
+/// 距離方向（`DESC`）と順位付け形・実効モードの整合を検査する（Issue #2009・SQL-33 (2)）。
+/// `Distance` 以外の `ORDER BY` に方向が付く組は公開ビルダーの誤用でしか作れないため
+/// `42601` で拒否する。`precision` モードの確信度ゲートは最近傍側のマージンを前提とし、
+/// 遠い順では意味が定まらないため `DESC` との併用は `0A000` で拒否する（fail-closed）。
+fn check_distance_direction(
+    descending: bool,
+    order_by: &OrderByForm,
+    mode: Option<SearchMode>,
+) -> Result<(), SqlSurfaceError> {
+    if !descending {
+        return Ok(());
+    }
+    if !matches!(order_by, OrderByForm::Distance { .. }) {
+        return Err(SqlSurfaceError::unsupported(
+            "DESC is only supported on distance ORDER BY",
+        ));
+    }
+    if mode == Some(SearchMode::Precision) {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "DESC on distance ORDER BY cannot be combined with precision mode",
+        ));
+    }
+    Ok(())
 }
 
 impl BoundStatement {
@@ -189,9 +222,33 @@ impl BoundStatement {
             or_filters: Vec::new(),
             ranking,
             limit,
+            offset: 0,
             mode: crate::sql::mode::resolve_mode(None, None),
             evaluation_order,
+            distance_descending: false,
         }
+    }
+
+    /// 距離順 `ORDER BY` の方向（`true` で `DESC`）を設定した crate 内ビルダー（Issue #2009）。
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_distance_descending(mut self, descending: bool) -> Self {
+        self.distance_descending = descending;
+        self
+    }
+
+    /// 距離順 `ORDER BY` が `DESC`（遠い順）か（Issue #2009・SQL-33 (2)）。
+    pub fn distance_descending(&self) -> bool {
+        self.distance_descending
+    }
+
+    /// `OFFSET`（Issue #2008・SQL-33 (8)）を設定したコピーを返すビルダー的メソッド。
+    /// 範囲・`LIMIT` との合計の検証は呼び出し元の責務（SQL 表層は
+    /// [`validate_search_limit_offset_with`]。実行段が `core::check_bound_limit` でも再検査する）。
+    #[must_use]
+    pub fn with_offset(mut self, offset: usize) -> Self {
+        self.offset = offset;
+        self
     }
 
     /// `mode`（TASK-161・SQL-12）を設定したコピーを返すビルダー的メソッド。
@@ -272,6 +329,18 @@ impl BoundStatement {
     /// `LIMIT` 句の値。
     pub fn limit(&self) -> usize {
         self.limit
+    }
+
+    /// `OFFSET` 句の値（Issue #2008。既定 0）。
+    pub fn offset(&self) -> usize {
+        self.offset
+    }
+
+    /// 検索で取得する件数 `limit + offset`（Issue #2008・SQL-33 (8)・SQL-73 (3)）。
+    /// 束縛段が合計を結果行数上限以下に検証済みのため飽和は起きないが、防御として
+    /// `saturating_add` を使う。
+    pub(crate) fn fetch_count(&self) -> usize {
+        self.limit.saturating_add(self.offset)
     }
 
     /// 取得モードの優先順位解決結果（TASK-161・SQL-12）。
@@ -2902,6 +2971,29 @@ pub fn validate_search_offset(raw: u32) -> Result<usize, SqlSurfaceError> {
     Ok(offset)
 }
 
+/// ベクトル順位付け検索の `LIMIT` と `OFFSET` を併せて検証し `(limit, offset)` を返す
+/// （Issue #2008・SQL-33 (8)）。Execute（[`bind_in_session_with_limits`]）と Describe
+/// （[`bind_projection_for_describe`]）が共有する単一実装で、エラー分類をそろえる。
+///
+/// 検証順は `LIMIT`（`22000`）、`OFFSET` の範囲（`22000`）、合計（`54000`）。合計
+/// `limit + offset` は検索の取得件数になるため、`checked_add` で溢れを検出し結果行数上限
+/// （`--max-result-rows`）を超えたら fail-closed で `54000` にする。判定は入力と設定値だけで
+/// 決まり、可視件数には依存しない。
+pub(crate) fn validate_search_limit_offset_with(
+    limit_raw: u32,
+    offset_raw: u32,
+    limits: &crate::result_limits::ResultLimits,
+) -> Result<(usize, usize), SqlSurfaceError> {
+    let limit = validate_search_limit_with(limit_raw, limits)?;
+    let offset = validate_search_offset(offset_raw)?;
+    match limit.checked_add(offset) {
+        Some(total) if total <= limits.max_result_rows() => Ok((limit, offset)),
+        _ => Err(SqlSurfaceError::payload_too_large(
+            "LIMIT plus OFFSET exceeds the result row limit",
+        )),
+    }
+}
+
 /// [`ValidatedStatement`] を `schema` と `session_mode`（呼び出し元の
 /// [`crate::sql::mode::SessionState::search_mode`]）と照合して [`BoundStatement`] へ
 /// 束縛する（TASK-161 の公開 API）。UDF レジストリを持たないエントリポイント向けの
@@ -2967,12 +3059,32 @@ pub(crate) fn bind_in_session_with_limits(
 
     let projection = bind_projection(&stmt.projection, schema, udfs, &mut node_budget)?;
 
+    let distance_binds_before = crate::sql::udf_call::distance_bind_count();
     let (metadata_filters, expr_filters, rls_predicate_present, or_filters) =
         bind_where_predicates(&stmt.where_predicates, schema, udfs, &mut node_budget, &[])?;
+    let has_distance_predicate =
+        crate::sql::udf_call::distance_bind_count() != distance_binds_before;
 
     let ranking = bind_ranking(&stmt.order_by, schema, true)?;
+    check_distance_direction(
+        stmt.distance_descending,
+        &stmt.order_by,
+        Some(resolved_mode.mode()),
+    )?;
 
-    let limit = validate_search_limit_with(stmt.limit, result_limits)?;
+    let (limit, offset) =
+        validate_search_limit_offset_with(stmt.limit, stmt.offset, result_limits)?;
+
+    // SQL-74 (2)・Issue #2036: 距離述語を含む文は `HINT ORDER` が DISTANCE を先にしても SCALAR を
+    // 先（事前フィルタ）に倒す。距離述語を DISTANCE 段の後の事後フィルタにすると、上位 k 件が
+    // 述語で間引かれて `LIMIT` に満たない取りこぼしが起きるため、述語を満たす行だけを候補にして
+    // から検索する（結果は厳密に評価した場合と一致する）。実行（`exec`）・EXPLAIN とも
+    // `bound.evaluation_order` だけを見るので、ここで 1 回だけ決めれば両者が一致する。
+    let evaluation_order = if has_distance_predicate {
+        EvaluationOrder::DEFAULT
+    } else {
+        stmt.evaluation_order
+    };
 
     // Issue #353: `expr_filters` を束縛時に 1 回だけステップ列コンパイルする
     // （行ループでの再帰評価をなくす）。`expr_filters` と要素数・評価順が
@@ -2992,8 +3104,10 @@ pub(crate) fn bind_in_session_with_limits(
         or_filters,
         ranking,
         limit,
+        offset,
         mode: resolved_mode,
-        evaluation_order: stmt.evaluation_order,
+        evaluation_order,
+        distance_descending: stmt.distance_descending,
     })
 }
 
@@ -3026,13 +3140,18 @@ pub(crate) fn bind_projection_for_describe(
     stmt: &ValidatedStatement,
     schema: &TableSchema,
     udfs: &crate::sql::udf_call::UdfRegistry,
+    session_mode: Option<SearchMode>,
     validate_vector_literal: bool,
     dummy_equality_flags: &[bool],
     result_limits: &crate::result_limits::ResultLimits,
 ) -> Result<Vec<ProjectedColumn>, SqlSurfaceError> {
-    if let Some(literal) = &stmt.search_mode {
-        SearchMode::parse_literal(literal)?;
-    }
+    let query_mode = match &stmt.search_mode {
+        Some(literal) => Some(SearchMode::parse_literal(literal)?),
+        None => None,
+    };
+    // Bind と同じ実効モード（クエリ句 > セッション変数）で DESC との整合を検査し、
+    // Describe 成功・Bind 失敗の食い違いを防ぐ。
+    let resolved_mode = mode::resolve_mode(query_mode, session_mode);
 
     let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
     let projection = bind_projection(&stmt.projection, schema, udfs, &mut node_budget)?;
@@ -3047,7 +3166,12 @@ pub(crate) fn bind_projection_for_describe(
         )?;
 
     let _ranking = bind_ranking(&stmt.order_by, schema, validate_vector_literal)?;
-    let _limit = validate_search_limit_with(stmt.limit, result_limits)?;
+    check_distance_direction(
+        stmt.distance_descending,
+        &stmt.order_by,
+        Some(resolved_mode.mode()),
+    )?;
+    let _limits = validate_search_limit_offset_with(stmt.limit, stmt.offset, result_limits)?;
 
     Ok(projection)
 }
@@ -8655,6 +8779,11 @@ fn map_expr_children(expr: &Expr, f: &mut dyn FnMut(&Expr) -> Expr) -> Expr {
             lhs: Box::new(f(lhs)),
             rhs: Box::new(f(rhs)),
         },
+        Expr::VectorDistance { kind, lhs, rhs } => Expr::VectorDistance {
+            kind: *kind,
+            lhs: Box::new(f(lhs)),
+            rhs: Box::new(f(rhs)),
+        },
         Expr::ArrayConstructor(_) | Expr::Subscript { .. } | Expr::Quantified { .. } => {
             match expr.try_map_array_children(&mut |e| Ok::<Expr, Infallible>(f(e))) {
                 Some(Ok(mapped)) => mapped,
@@ -10885,7 +11014,9 @@ pub(crate) fn collect_expr_idents(expr: &Expr, out: &mut std::collections::HashS
                 collect_expr_idents(arg, out);
             }
         }
-        Expr::Binary { lhs, rhs, .. } | Expr::JsonAccess { lhs, rhs, .. } => {
+        Expr::Binary { lhs, rhs, .. }
+        | Expr::JsonAccess { lhs, rhs, .. }
+        | Expr::VectorDistance { lhs, rhs, .. } => {
             collect_expr_idents(lhs, out);
             collect_expr_idents(rhs, out);
         }
@@ -11914,6 +12045,11 @@ fn rewrite_group_row_idents(
             lhs: Box::new(rec(lhs)?),
             rhs: Box::new(rec(rhs)?),
         },
+        Expr::VectorDistance { kind, lhs, rhs } => Expr::VectorDistance {
+            kind: *kind,
+            lhs: Box::new(rec(lhs)?),
+            rhs: Box::new(rec(rhs)?),
+        },
         Expr::ArrayConstructor(_) | Expr::Subscript { .. } | Expr::Quantified { .. } => {
             match expr.try_map_array_children(&mut |e| rec(e)) {
                 Some(r) => r?,
@@ -12502,6 +12638,31 @@ mod tests {
     fn validate_search_offset_rejects_over_max() {
         let err = validate_search_offset(crate::core::MAX_SEARCH_K as u32 + 1).unwrap_err();
         assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn validate_search_limit_offset_boundaries() {
+        // Issue #2008・SQL-33 (8): 合計が上限ちょうどは受理、+1 は 54000、OFFSET 範囲外は 22000。
+        let lim = crate::result_limits::ResultLimits::new(100);
+        assert_eq!(
+            validate_search_limit_offset_with(50, 50, &lim).unwrap(),
+            (50, 50)
+        );
+        assert_eq!(
+            validate_search_limit_offset_with(1, 0, &lim).unwrap(),
+            (1, 0)
+        );
+        let over = validate_search_limit_offset_with(50, 51, &lim).unwrap_err();
+        assert_eq!(over.wire_code(), "54000");
+        let bad_offset =
+            validate_search_limit_offset_with(1, crate::core::MAX_SEARCH_K as u32 + 1, &lim)
+                .unwrap_err();
+        assert_eq!(bad_offset.wire_code(), "22000");
+        let bad_limit = validate_search_limit_offset_with(0, 0, &lim).unwrap_err();
+        assert_eq!(bad_limit.wire_code(), "22000");
+        // u32 の端でも溢れず fail-closed。
+        let huge = validate_search_limit_offset_with(u32::MAX, u32::MAX, &lim).unwrap_err();
+        assert_eq!(huge.wire_code(), "22000");
     }
 
     // --- bind: C2（スカラー条件付き） ----------------------------------------------
@@ -15012,6 +15173,77 @@ mod tests {
         ))];
         let agg = Expr::Ident(crate::sql::allowlist::aggregate_placeholder(0));
         assert_eq!(substitute_group_key_exprs(&agg, &keys), agg);
+    }
+
+    // --- 距離方向 DESC の束縛（Issue #2009・SQL-33 (2)） -------------------------
+
+    #[test]
+    fn bind_carries_distance_descending_into_bound_statement() {
+        let asc =
+            bind_sql("SELECT * FROM documents ORDER BY embedding <=> '[0.1,0.2,0.3]' LIMIT 5")
+                .expect("asc");
+        assert!(!asc.distance_descending());
+        let desc =
+            bind_sql("SELECT * FROM documents ORDER BY embedding <=> '[0.1,0.2,0.3]' DESC LIMIT 5")
+                .expect("desc");
+        assert!(desc.distance_descending());
+        assert!(!desc.with_distance_descending(false).distance_descending());
+    }
+
+    #[test]
+    fn bind_rejects_desc_with_precision_mode_as_feature_not_supported() {
+        let lookup = FakeCatalog {
+            tables: ["documents"].into_iter().collect(),
+        };
+        let stmt = validate_statement(
+            "SELECT * FROM documents ORDER BY embedding <=> '[0.1,0.2,0.3]' DESC LIMIT 5 USING MODE 'precision'",
+            &lookup,
+        )
+        .expect("allowlist");
+        let err = bind(&stmt, &docs_schema()).expect_err("precision + DESC");
+        assert_eq!(err.wire_code(), "0A000");
+        // セッション変数由来の precision でも同じ。
+        let stmt = validate_statement(
+            "SELECT * FROM documents ORDER BY embedding <=> '[0.1,0.2,0.3]' DESC LIMIT 5",
+            &lookup,
+        )
+        .expect("allowlist");
+        let err = bind_with_session(&stmt, &docs_schema(), Some(SearchMode::Precision))
+            .expect_err("session precision + DESC");
+        assert_eq!(err.wire_code(), "0A000");
+    }
+
+    #[test]
+    fn describe_rejects_desc_with_precision_mode_like_bind() {
+        let lookup = FakeCatalog {
+            tables: ["documents"].into_iter().collect(),
+        };
+        let udfs = crate::sql::udf_call::UdfRegistry::default();
+        let limits = crate::result_limits::ResultLimits::default();
+        let describe = |sql: &str, session: Option<SearchMode>| {
+            let stmt = validate_statement(sql, &lookup).expect("allowlist");
+            bind_projection_for_describe(&stmt, &docs_schema(), &udfs, session, true, &[], &limits)
+        };
+        let desc = "SELECT * FROM documents ORDER BY embedding <=> '[0.1,0.2,0.3]' DESC LIMIT 5";
+        let err = describe(&format!("{desc} USING MODE 'precision'"), None)
+            .expect_err("query precision + DESC");
+        assert_eq!(err.wire_code(), "0A000");
+        let err =
+            describe(desc, Some(SearchMode::Precision)).expect_err("session precision + DESC");
+        assert_eq!(err.wire_code(), "0A000");
+        assert!(describe(desc, None).is_ok());
+    }
+
+    #[test]
+    fn check_distance_direction_rejects_descending_on_non_distance_order_by() {
+        let order_by = OrderByForm::FunctionCall {
+            name: "HYBRID".to_string(),
+            args: Vec::new(),
+        };
+        let err = check_distance_direction(true, &order_by, Some(SearchMode::Recall))
+            .expect_err("non-distance");
+        assert_eq!(err.wire_code(), "42601");
+        assert!(check_distance_direction(false, &order_by, None).is_ok());
     }
 }
 

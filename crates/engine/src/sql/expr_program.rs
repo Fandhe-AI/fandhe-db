@@ -567,6 +567,7 @@ fn try_fold_scalar(expr: &BoundExpr) -> Option<FoldedConst> {
         | BoundExpr::CorrelatedExists(_)
         | BoundExpr::CorrelatedScalar(_)
         | BoundExpr::VectorRef
+        | BoundExpr::VectorDistance { .. }
         | BoundExpr::WasmCall { .. }
         | BoundExpr::Null
         | BoundExpr::Case { .. }
@@ -753,7 +754,9 @@ fn compile_node(
         | BoundExpr::Like { .. }
         // `GREATEST`／`LEAST`（SQL-65。Issue #1909）は可変長引数を畳み込む専用評価
         // （`udf_call::fold_min_max`）を 1 箇所に保つため木評価へ委ねる。
-        | BoundExpr::MinMax { .. } => {
+        | BoundExpr::MinMax { .. }
+        // 距離式（SQL-74 (1)・Issue #2036）は行の embedding を直接読む専用評価のため木評価へ委ねる。
+        | BoundExpr::VectorDistance { .. } => {
             steps.push(ExprStep::JsonSubtree(Box::new(expr.clone())));
             *current_depth += 1;
             *max_stack = (*max_stack).max(*current_depth);
