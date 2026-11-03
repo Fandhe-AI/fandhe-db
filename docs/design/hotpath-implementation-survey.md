@@ -97,6 +97,8 @@ pgvector／lance／DiskANN／tantivy）のホットパスを手法単位で比�
 | cosine を dot・‖a‖²・‖b‖² の 1 パス同時計算 | simsimd／usearch／pgvector／DiskANN | 3 アキュムレータ並行 | 参照のみ。本リポは正規化済み契約のため契約変更を伴う。変更を推奨する材料なし | 各種 |
 | クエリ側のみ事前ノルム・候補側は選択可能な折衷 | lance `cosine_fast`／`cosine_with_norms` | — | 条件付き（優先度低）。本リポは既に両側正規化契約 | Apache-2.0 |
 
+> 追記（Issue #1986）: 「cosine を事前正規化して内積に帰着」の行の「既採用」は、SQL-33 の改訂（`<=>` が pgvector と同じコサイン距離の昇順になった）により上書きされる。実装方式は [cosine-distance-method.md](cosine-distance-method.md)（Proposed）で比較している。上の表の記述は調査時点のまま残す。
+
 出典: simsimd `6de303b` — `include/numkong/dot.h`, `spatial/{haswell,skylake,icelake,genoa,neon,sve}.h`, `neonsdot.h` ／ usearch `f91fe5b` — `include/usearch/index_plugins.hpp` ／ hnswlib `d9b3608` — `hnswlib/space_l2.h`, `space_ip.h` ／ faiss `2ed4c10` — `faiss/utils/distances_fused/{avx512.cpp,simdlib_based.cpp}` ／ pgvector `e48241b` — `src/vector.c`, `halfutils.c`, `bitutils.c` ／ lance `7d53161` — `rust/lance-linalg/src/distance/{dot.rs,cosine.rs,dot_u8.rs,hamming.rs}`, `simd.rs` ／ qdrant `74f3e85` — `lib/segment/src/spaces/{simple.rs,simple_avx.rs,simple_sse.rs,simple_neon.rs,metric_f16/,metric_uint/}` ／ DiskANN `600c2b9` — `diskann-vector/src/distance/simd.rs`, `diskann-wide/src/arch/`
 
 ## 2. Top-k 選出
