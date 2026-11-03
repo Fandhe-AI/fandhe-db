@@ -20,10 +20,7 @@
 use crate::catalog::function::{FunctionDef, FunctionLanguage, ReturnShape, MAX_FUNCTIONS};
 use crate::sql::allowlist::{parse_stored_function_body, SqlSurfaceError};
 use crate::sql::cast::CastType;
-use crate::sql::udf_call::{
-    commit_function_definition, prepare_function_with_signature,
-    prepare_function_with_signature_ignoring_capacity, MAX_SESSION_UDFS,
-};
+use crate::sql::udf_call::{commit_function_definition, prepare_function_for_catalog_load};
 use crate::sql::udf_call::{Expr, RoutineDefinition, RoutineReturn, UdfRegistry};
 use crate::sql::udf_ddl::udf_cast_from_function_type;
 use crate::storage::Storage;
@@ -219,7 +216,7 @@ fn load_into(
         let mut progressed = false;
         let mut retry = Vec::new();
         for p in pending {
-            match prepare_function_with_signature(
+            match prepare_function_for_catalog_load(
                 registry,
                 &p.key,
                 &p.params,
@@ -254,8 +251,9 @@ fn load_into(
             routine_blocked = true;
             continue;
         }
-        if registry.len() >= MAX_SESSION_UDFS {
-            routine_blocked |= registry.len() > registry.catalog_entry_count();
+        // カタログバケットの防御的な上限判定（カタログ件数は MAX_FUNCTIONS 以下のため通常は到達しない）。
+        // セッション限定の登録は別バケットで枠を占めないので、再試行の理由にしない。
+        if registry.catalog_entry_count() >= MAX_FUNCTIONS {
             continue;
         }
         registry.insert_routine(&key, def);
@@ -266,28 +264,13 @@ fn load_into(
     // カタログ定義が見えない状態を残さない）。
     // 恒久的にロード不能な定義（呼び出し先の消失・予約名など）は世代が変わらない限り結果も変わらないため
     // 再試行の対象にしない（残留すると Query／Parse ごとに全カタログを再ロードして世代 fast path を迂回する）。
-    // 再試行が意味を持つのは、非カタログ由来の登録（セッションローカル宣言的関数・WASM 関数）に阻まれている
-    // 定義だけ: (1) 同名の非カタログ登録との衝突（WASM 含む）、(2) 非カタログ登録が枠を占めて
-    // MAX_SESSION_UDFS に達している場合。いずれもその登録の DROP で解消しうる。
-    let has_non_catalog_entries = registry.len() > registry.catalog_entry_count();
-    let at_capacity = registry.len() >= MAX_SESSION_UDFS;
+    // 再試行が意味を持つのは、同名の非カタログ登録（セッションローカル宣言的関数・WASM 関数）に阻まれている
+    // 定義だけで、その登録の DROP で解消しうる。上限はカタログとセッション限定で別バケットのため、
+    // 容量による阻害は起きない（Issue #2883）。
     let blocked_by_local = routine_blocked
         || pending.iter().any(|p| {
             let lower = p.key.to_ascii_lowercase();
-            (registry.is_name_taken(&lower) && !registry.is_catalog_origin(&lower))
-            // 容量だけが阻害要因の定義（容量を無視すれば登録できる）に限る。欠落 callee・予約名など
-            // 恒久的にロード不能な定義は容量が空いても登録できないため再試行対象にしない。
-            || (at_capacity
-                && has_non_catalog_entries
-                && prepare_function_with_signature_ignoring_capacity(
-                    registry,
-                    &p.key,
-                    &p.params,
-                    &p.param_types,
-                    p.return_type.as_ref(),
-                    &p.body,
-                )
-                .is_ok())
+            registry.is_name_taken(&lower) && !registry.is_catalog_origin(&lower)
         });
     let recorded = if blocked_by_local {
         STALE_GENERATION
@@ -305,7 +288,7 @@ mod tests {
         FunctionAttributes, FunctionParam, FunctionType, FUNCTIONS_TABLE,
     };
     use crate::catalog::ColumnType;
-    use crate::sql::udf_call::prepare_function_definition;
+    use crate::sql::udf_call::{prepare_function_definition, MAX_SESSION_UDFS};
 
     fn tmp_storage(label: &str) -> (Storage, crate::test_util::temp_db::CleanupGuard) {
         let path = crate::test_util::temp_db::unique_db_path(label);
@@ -452,9 +435,9 @@ mod tests {
         assert!(reg.is_catalog_origin("f"));
     }
 
-    /// 上限到達で登録できなかった定義は、ローカル関数の DROP 後の refresh で見える。
+    /// セッション限定バケットが満杯でも、カタログ定義は即座にロードされる（上限は別バケット。Issue #2883）。
     #[test]
-    fn capacity_blocked_definition_is_retried_after_local_drop() {
+    fn catalog_definition_loads_despite_full_session_local_bucket() {
         let (s, _g) = tmp_storage("udf-load-cap");
         let mut reg = UdfRegistry::default();
         let body = {
@@ -470,13 +453,38 @@ mod tests {
         s.create_function("t", &decl("f", &["x"], "x + 1"))
             .expect("f");
         load(&s, "t", &mut reg).expect("load");
-        assert!(reg.get("f").is_none());
-        assert!(reg.remove("loc0"));
-        refresh(&s, "t", &mut reg);
         assert!(reg.is_catalog_origin("f"));
+        assert_eq!(reg.catalog_generation(), s.function_generation("t"));
     }
 
-    /// 容量満杯でも、恒久的にロード不能な定義（呼び出し先の消失）だけなら世代は完了扱いで記録する。
+    /// カタログが満杯（MAX_FUNCTIONS 件）でロードされても、セッション限定の登録は MAX_SESSION_UDFS 件まで通り、
+    /// 超過は拒否される（Issue #2883）。
+    #[test]
+    fn session_local_registration_works_with_full_catalog() {
+        let (s, _g) = tmp_storage("udf-load-full-cat");
+        for i in 0..MAX_FUNCTIONS {
+            s.create_function("t", &decl(&format!("cat{i}"), &["x"], "x"))
+                .expect("create");
+        }
+        let mut reg = UdfRegistry::default();
+        load(&s, "t", &mut reg).expect("load");
+        assert_eq!(reg.catalog_entry_count(), MAX_FUNCTIONS);
+        assert_eq!(reg.session_local_count(), 0);
+        let body = {
+            let toks = crate::sql::lexer::tokenize_rendered("x").expect("tok");
+            parse_stored_function_body(&toks).expect("body")
+        };
+        for i in 0..MAX_SESSION_UDFS {
+            let name = format!("loc{i}");
+            let prepared =
+                prepare_function_definition(&reg, &name, &["x".to_string()], &body).expect("prep");
+            commit_function_definition(&mut reg, prepared);
+        }
+        assert!(prepare_function_definition(&reg, "extra", &["x".to_string()], &body).is_err());
+        assert_eq!(reg.catalog_entry_count(), MAX_FUNCTIONS);
+    }
+
+    /// セッション限定が満杯でも、恒久的にロード不能な定義（呼び出し先の消失）だけなら世代は完了扱いで記録する。
     #[test]
     fn permanent_skip_at_capacity_does_not_mark_stale() {
         let (s, _g) = tmp_storage("udf-load-cap-perm");

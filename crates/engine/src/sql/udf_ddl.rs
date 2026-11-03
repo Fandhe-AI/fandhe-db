@@ -523,11 +523,11 @@ pub(crate) fn execute_create_routine_persistent(
         drop(owner_guard);
     }
     // commit 後に同じセッションへ登録する（すぐ呼べるようにする。他セッションは世代で refresh）。
-    // 非カタログ登録・WASM・容量で入れられない場合は登録せず、次の refresh のロードに任せる。
+    // カタログバケットが満杯で入れられない場合は登録せず、次の refresh のロードに任せる。
     if let Some(def) = routine_from_spec(spec) {
         let session_udfs = session.udfs_mut();
         session_udfs.remove(name);
-        if session_udfs.len() < crate::sql::udf_call::MAX_SESSION_UDFS {
+        if session_udfs.catalog_entry_count() < crate::catalog::function::MAX_FUNCTIONS {
             session_udfs.insert_routine(name, def);
             session_udfs.mark_catalog_origin(name);
         }

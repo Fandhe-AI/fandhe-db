@@ -625,9 +625,10 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // `#[cfg(test)]` 内で壊れた定義 blob を直接書くテスト補助（関数カタログ表だけを書き、世代の対象外）。
     // Issue #2798（型付き永続化の単体テスト追加）・#2218（ルーチンのロード追加）で行番号が移動したための
     // 追随（旧: 230・272）。Issue #2219（`FunctionDef::standard_body` と依存辺の追加）でも行が移動した。
-    ("sql/udf_load.rs", 349),
+    // Issue #2883（UDF 数上限の分離）でも行が移動した。
+    ("sql/udf_load.rs", 332),
     // 同上（#2798 で追加した未知バージョン blob を直接書く単体テスト補助。関数カタログ表だけを書く）。
-    ("sql/udf_load.rs", 551),
+    ("sql/udf_load.rs", 559),
     // Issue #1920: 上の `#[cfg(test)]` 内のテスト補助（多重定義・SCHEMA 接頭辞削除の状態を直接作る）。
     ("catalog/function.rs", 2109),
     ("catalog/function.rs", 2321),

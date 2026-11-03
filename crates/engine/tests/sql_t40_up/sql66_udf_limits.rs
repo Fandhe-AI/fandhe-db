@@ -7,6 +7,7 @@
 //! カタログにもセッション内レジストリにも触れず `42501`（保存先の振り分けより前に拒否）。権限ありの
 //! 型付き引数・RETURNS 付きも同じカタログ経路で永続化され、上限・判定順が効く（Issue #2798）。永続定義が
 //! セッション限定の関数（カタログに載らない宣言的 UDF・WASM UDF）へ依存する形は `0A000`。
+//! Issue #2883: カタログ由来とセッション限定は別バケットで数える（それぞれの上限超過は `54000`）。
 
 use engine::core::EngineCore;
 use engine::function_limits::FunctionLimits;
@@ -531,4 +532,84 @@ fn persistent_function_ddl_in_explicit_transaction_is_rejected() {
     for n in ["t1", "t3", "t4", "t5"] {
         assert!(s.udfs().get(n).is_none(), "{n}");
     }
+}
+
+fn define_local(s: &mut SessionState, name: &str) -> Result<(), String> {
+    define_function(
+        s.udfs_mut(),
+        name,
+        &["x".to_string()],
+        &Expr::Ident("x".to_string()),
+    )
+    .map_err(|e| e.wire_code().to_string())
+}
+
+/// Issue #2883: カタログが満杯でもセッション限定の関数を上限（64）まで登録でき、超過は `54000`。
+/// カタログ側の上限超過も独立に `54000`。
+#[test]
+fn catalog_and_session_local_limits_are_separate_buckets() {
+    let path = unique_db_path("sql66-limit-buckets");
+    let _g = CleanupGuard(path.clone());
+    let core = open(&path, 64);
+    let mut s = session(true);
+    for n in 0..64 {
+        ok(&core, "alice", &mut s, &create(n));
+    }
+    assert_eq!(code(&core, "alice", &mut s, &create(64)), "54000");
+    for n in 0..64 {
+        define_local(&mut s, &format!("loc{n}")).expect("session-local within limit");
+    }
+    assert_eq!(define_local(&mut s, "loc_over").unwrap_err(), "54000");
+    // どちらのバケットも満杯でも、既存の関数は呼べる。
+    ok(&core, "alice", &mut s, "SELECT f3(1), loc3(1)");
+    // 他テナントの ctx ではカタログ由来が見えない。
+    let mut other = session(false);
+    core.load_session_udfs(&ctx("bob"), &mut other)
+        .expect("load");
+    assert_eq!(code(&core, "bob", &mut other, "SELECT f3(1)"), "42883");
+}
+
+/// Issue #2883: セッション限定が 64 件でもカタログの永続 CREATE は通り、再オープン後のロードでも
+/// カタログ 64 件がセッション限定 64 件と共存する。`--max-functions` はセッション限定に効かない。
+#[test]
+fn session_local_full_does_not_block_catalog_create_or_load() {
+    let path = unique_db_path("sql66-limit-local-full");
+    let _g = CleanupGuard(path.clone());
+    {
+        let core = open(&path, 64);
+        let mut s = session(true);
+        for n in 0..64 {
+            define_local(&mut s, &format!("loc{n}")).expect("local");
+        }
+        for n in 0..64 {
+            ok(&core, "alice", &mut s, &create(n));
+        }
+        assert_eq!(code(&core, "alice", &mut s, &create(64)), "54000");
+    }
+    let core = open(&path, 64);
+    let mut s = session(false);
+    core.load_session_udfs(&ctx("alice"), &mut s).expect("load");
+    for n in 0..64 {
+        define_local(&mut s, &format!("loc{n}")).expect("local after load");
+    }
+    assert_eq!(define_local(&mut s, "loc_over").unwrap_err(), "54000");
+    for n in 0..64 {
+        ok(&core, "alice", &mut s, &format!("SELECT f{n}(1)"));
+    }
+}
+
+/// Issue #2883: 下げた `--max-functions`（2）でカタログが `54000` になっても、セッション限定は 64 件まで通る。
+#[test]
+fn lowered_catalog_limit_does_not_affect_session_local_bucket() {
+    let path = unique_db_path("sql66-limit-lowered-local");
+    let _g = CleanupGuard(path.clone());
+    let core = open(&path, 2);
+    let mut s = session(true);
+    ok(&core, "alice", &mut s, &create(1));
+    ok(&core, "alice", &mut s, &create(2));
+    assert_eq!(code(&core, "alice", &mut s, &create(3)), "54000");
+    for n in 0..64 {
+        define_local(&mut s, &format!("loc{n}")).expect("local");
+    }
+    assert_eq!(define_local(&mut s, "loc_over").unwrap_err(), "54000");
 }

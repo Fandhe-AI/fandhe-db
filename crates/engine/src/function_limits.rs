@@ -9,15 +9,16 @@
 //!
 //! 設計上の不変条件:
 //!
-//! - **ハード上限は既定値のまま**（`catalog::function::MAX_FUNCTIONS`・
-//!   `sql::udf_call::MAX_SESSION_UDFS`〔レジストリ全体の上限〕。両者は等しい）。設定できるのは「下げる方向」だけ。
+//! - **ハード上限は既定値のまま**（カタログ側 `catalog::function::MAX_FUNCTIONS`＝`MAX_FUNCTIONS_PER_SCOPE`）。
+//!   セッション限定の関数は別バケット（`sql::udf_call::MAX_SESSION_UDFS`）で数え、本設定の対象外
+//!   （Issue #2883）。設定できるのは「下げる方向」だけ。
 //!   カタログの読み取り側はハード上限超過を `CorruptSchema` として fail-closed に扱うため、
 //!   上げる方向を許すと正常な DB が破損扱いになる。
 //! - 上限は書き込み（`CREATE FUNCTION`）にだけ適用する。起動時・セッション開始時のロードは
 //!   ハード上限で判定し、上限を下げて再起動しても既存の関数は読める・呼べる（SQL-46 (5)）。
 //! - 値は全テナントで同じ。件数はテナント scope ごとに数える。
 
-/// 1 テナント（またはセッション）が持てる関数数のハード上限（かつ既定値）。
+/// 1 テナントのカタログが持てる関数数のハード上限（かつ既定値）。
 pub const MAX_FUNCTIONS_PER_SCOPE: usize = 64;
 
 /// 設定できる最小値。
@@ -92,11 +93,11 @@ mod tests {
         );
         assert_eq!(
             MAX_FUNCTIONS_PER_SCOPE,
-            crate::sql::udf_call::MAX_SESSION_UDFS
+            crate::catalog::function::MAX_FUNCTIONS
         );
         assert_eq!(
-            MAX_FUNCTIONS_PER_SCOPE,
-            crate::catalog::function::MAX_FUNCTIONS
+            crate::sql::udf_call::MAX_REGISTRY_UDFS,
+            crate::sql::udf_call::MAX_SESSION_UDFS + crate::catalog::function::MAX_FUNCTIONS
         );
     }
 
