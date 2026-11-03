@@ -1,5 +1,6 @@
-//! aarch64 NEON（Apple M／Graviton）向け 4 行ブロック内積カーネル本体
-//! （Issue #511・TASK-156・CORE-14。ポインタ: `docs/design/dot-kernel-row-block.md`）。
+//! aarch64 NEON（Apple M／Graviton）向け 4 行ブロック内積・L2 二乗距離カーネル本体
+//! （内積: Issue #511・TASK-156・CORE-14。L2: Issue #1983・SQL-33 のポインタ。
+//! ポインタ: `docs/design/dot-kernel-row-block.md`）。
 //!
 //! 呼び出し文脈: 親モジュール [`super`]（`isa.rs`）の
 //! `SimdKernel::dot_block4_impl` が、sealed トークン（[`super::NeonToken`]）の
@@ -26,6 +27,16 @@
 //!
 //! `crates/engine/tests/isa.rs` の `dot_block4_matches_single_row_dot_bit_exact_*`
 //! がこれを機械検証する（aarch64 実機は `detect-apple` ジョブが唯一の実行時証跡）。
+//!
+//! # L2 二乗距離カーネル（Issue #1983・SQL-33）
+//!
+//! [`l2_sq_neon`]（単一行）と [`l2_sq_block4_neon`]（4 行）は、いずれも
+//! `d = vsubq_f32(行, クエリ)` → `acc = vfmaq_f32(acc, d, d)` → [`lane_sum4`] →
+//! 共通の端数和 [`l2_tail_sum`] という同一の演算列を持つ。このため
+//! `SimdKernel::l2_sq_block4` と `SimdKernel::l2_sq` は全入力でビット同一になる
+//! （呼び出し元は `isa.rs`）。scalar 参照 `isa::l2_sq_scalar` との差は、FMA の単一丸め
+//! （scalar は `d * d` と加算の二重丸め）と加算順序のみで、相対許容差内に収まる。
+//! 各項の二乗和が 2^24 未満の整数値ベクトルでは丸めが生じず scalar とビット一致する。
 //!
 //! # レーン和を `vaddvq_f32` にしなかった理由
 //!
@@ -143,4 +154,89 @@ pub(super) fn dot_block4_neon<const PADDED_TAIL: bool>(
     *out1 = lane_sum4(a1) + super::tail_sum::<4, PADDED_TAIL>(t1, qr);
     *out2 = lane_sum4(a2) + super::tail_sum::<4, PADDED_TAIL>(t2, qr);
     *out3 = lane_sum4(a3) + super::tail_sum::<4, PADDED_TAIL>(t3, qr);
+}
+
+/// L2 二乗距離の端数和（`as_chunks::<4>` で割り切れない末尾要素の逐次和）。
+///
+/// 単一行版 [`l2_sq_neon`] と 4 行版 [`l2_sq_block4_neon`] が同一関数を共有し、
+/// 両者のビット同一性を構造で担保する。`d * d` は FMA 化せず（Rust は暗黙に融合しない）、
+/// 加算の単位元 `-0.0` 起点の左畳み込み（`iter().sum()`）で縮約する。
+#[inline(always)]
+fn l2_tail_sum(a_rem: &[f32], b_rem: &[f32]) -> f32 {
+    a_rem
+        .iter()
+        .zip(b_rem.iter())
+        .map(|(x, y)| {
+            let d = x - y;
+            d * d
+        })
+        .sum()
+}
+
+/// NEON（128 bit・4 レーン）の単一行 L2 二乗距離本体（Issue #1983・SQL-33）。
+///
+/// 呼び出し元は `isa.rs::SimdKernel::l2_sq`（Neon 分岐の `unsafe` 1 箇所）。長さが
+/// 異なる場合は短い方へ切り詰める（`isa::l2_sq_scalar` と同じ意味論。panic しない）。
+/// `#[inline(never)]` は [`dot_block4_neon`] と同じ理由（baseline NEON のため付けないと
+/// インライン化され、`check_simd_codegen.sh` の必須シンボル検査が対象を見失う）。
+#[target_feature(enable = "neon")]
+#[inline(never)]
+pub(super) fn l2_sq_neon(a: &[f32], b: &[f32]) -> f32 {
+    let len = a.len().min(b.len());
+    let (ac, at) = a.split_at(len).0.as_chunks::<4>();
+    let (bc, bt) = b.split_at(len).0.as_chunks::<4>();
+
+    let mut acc = vdupq_n_f32(0.0);
+    for (x, q) in ac.iter().zip(bc) {
+        let d = vsubq_f32(load4(x), load4(q));
+        acc = vfmaq_f32(acc, d, d);
+    }
+    lane_sum4(acc) + l2_tail_sum(at, bt)
+}
+
+/// NEON の 4 行ブロック L2 二乗距離本体（Issue #1983・SQL-33）。
+///
+/// 呼び出し元（`isa.rs::SimdKernel::l2_sq_block4`）が 4 行と `query` の長さが
+/// すべて等しいことを保証済みの前提で呼ぶ。クエリチャンクは 1 回だけロードして
+/// 4 本のアキュムレータで共有し、各行の演算列は [`l2_sq_neon`] と同一
+/// （ビット同一）。結果は `&mut f32` 出力引数 4 個へ書く（理由はモジュール doc
+/// 「`[f32; 4]` 戻り値ではなく `&mut f32` 出力引数にした理由」と同じ）。
+#[target_feature(enable = "neon")]
+#[inline(never)]
+pub(super) fn l2_sq_block4_neon(
+    rows: [&[f32]; 4],
+    query: &[f32],
+    out0: &mut f32,
+    out1: &mut f32,
+    out2: &mut f32,
+    out3: &mut f32,
+) {
+    let [r0, r1, r2, r3] = rows;
+    let (qc, qr) = query.as_chunks::<4>();
+    let (c0, t0) = r0.as_chunks::<4>();
+    let (c1, t1) = r1.as_chunks::<4>();
+    let (c2, t2) = r2.as_chunks::<4>();
+    let (c3, t3) = r3.as_chunks::<4>();
+
+    let mut a0 = vdupq_n_f32(0.0);
+    let mut a1 = vdupq_n_f32(0.0);
+    let mut a2 = vdupq_n_f32(0.0);
+    let mut a3 = vdupq_n_f32(0.0);
+
+    for ((((qk, x0), x1), x2), x3) in qc.iter().zip(c0).zip(c1).zip(c2).zip(c3) {
+        let vq = load4(qk);
+        let d0 = vsubq_f32(load4(x0), vq);
+        let d1 = vsubq_f32(load4(x1), vq);
+        let d2 = vsubq_f32(load4(x2), vq);
+        let d3 = vsubq_f32(load4(x3), vq);
+        a0 = vfmaq_f32(a0, d0, d0);
+        a1 = vfmaq_f32(a1, d1, d1);
+        a2 = vfmaq_f32(a2, d2, d2);
+        a3 = vfmaq_f32(a3, d3, d3);
+    }
+
+    *out0 = lane_sum4(a0) + l2_tail_sum(t0, qr);
+    *out1 = lane_sum4(a1) + l2_tail_sum(t1, qr);
+    *out2 = lane_sum4(a2) + l2_tail_sum(t2, qr);
+    *out3 = lane_sum4(a3) + l2_tail_sum(t3, qr);
 }

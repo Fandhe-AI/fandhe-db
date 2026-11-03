@@ -96,6 +96,13 @@
 //! `dot_block4_impl` の Neon 分岐（1 箇所）から `unsafe` 呼び出しする
 //! （Issue #511・TASK-156・CORE-14）。x86_64 の 2 箇所と合わせて、行ブロック
 //! カーネルのディスパッチによる `unsafe` は計 3 箇所になる。
+//!
+//! # L2 二乗距離カーネル（Issue #1983・SQL-33）
+//!
+//! [`SimdKernel::l2_sq`]／[`SimdKernel::l2_sq_block4`] の aarch64 NEON 本体は
+//! [`neon_block4`] に置き、ディスパッチの `unsafe` を Neon 分岐に各 1 箇所（計 2 箇所）
+//! 加える。`unsafe` ブロックの総数は 15 → 17（`tests/isa.rs` が検査）。x86_64 の
+//! アームは SIMD 本体が未実装（Issue #1982）のため `unsafe` を持たない scalar 委譲。
 
 use std::sync::OnceLock;
 
@@ -370,6 +377,90 @@ impl SimdKernel {
         }
     }
 
+    /// L2 二乗距離 `sum (a_i - b_i)^2`（Issue #1983・SQL-33。ポインタ:
+    /// `docs/spec/04-behavior/`）。
+    ///
+    /// 長さが異なる場合は [`l2_sq_scalar`] と同じく短い方へ切り詰める。aarch64 は
+    /// NEON intrinsics 本体（`neon_block4::l2_sq_neon`）で、FMA の単一丸めと加算順序の
+    /// 違いにより scalar と丸め誤差の範囲で異なり得る（同一プロセス内では常に同一 ISA
+    /// なので決定的）。x86_64 の SIMD 本体は Issue #1982 の担当で、現状は scalar へ
+    /// 委譲する（偽の結果は返さない）。
+    pub fn l2_sq(self, a: &[f32], b: &[f32]) -> f32 {
+        match self {
+            SimdKernel::Scalar => l2_sq_scalar(a, b),
+            #[cfg(target_arch = "aarch64")]
+            SimdKernel::Neon(_) => {
+                // SAFETY: この variant は `NeonToken::try_new` が実行時確認できた場合
+                // にのみ構築される sealed トークンを保持する（`dot_impl` の Neon 分岐と
+                // 同じ根拠）。値の存在が CPU 対応の証明であり、`l2_sq_neon` の
+                // `#[target_feature]` 契約を満たす。
+                unsafe { neon_block4::l2_sq_neon(a, b) }
+            }
+            // x86_64 の SIMD 本体は Issue #1982 で置換する（`unsafe` を持たない scalar 委譲）。
+            #[cfg(target_arch = "x86_64")]
+            SimdKernel::Avx2Fma(_) | SimdKernel::Avx512(_) => l2_sq_scalar(a, b),
+        }
+    }
+
+    /// 4 行 × 1 クエリの L2 二乗距離（`l2_sq` の行ブロック版。Issue #1983・SQL-33）。
+    ///
+    /// 契約: 全入力で `l2_sq_block4(rows, query)[i].to_bits() ==
+    /// self.l2_sq(rows[i], query).to_bits()`。高速経路は 4 行すべてと `query` の長さが
+    /// 等しい場合に限り、それ以外は `l2_sq` を 4 回呼ぶ縮退経路へ合流する。L2 は
+    /// 多アキュムレータ分岐（`DOT_MULTI_ACC_MIN_DIM`）を持たないため dim による縮退は不要
+    /// （将来 L2 に多アキュムレータを入れる場合は `dot_block4_impl` と同じ縮退が必要）。
+    pub fn l2_sq_block4(self, rows: [&[f32]; 4], query: &[f32]) -> [f32; 4] {
+        let [r0, r1, r2, r3] = rows;
+        let uniform_len = r0.len() == query.len()
+            && r1.len() == query.len()
+            && r2.len() == query.len()
+            && r3.len() == query.len();
+        if !uniform_len {
+            return [
+                self.l2_sq(r0, query),
+                self.l2_sq(r1, query),
+                self.l2_sq(r2, query),
+                self.l2_sq(r3, query),
+            ];
+        }
+        match self {
+            SimdKernel::Scalar => [
+                l2_sq_scalar(r0, query),
+                l2_sq_scalar(r1, query),
+                l2_sq_scalar(r2, query),
+                l2_sq_scalar(r3, query),
+            ],
+            #[cfg(target_arch = "aarch64")]
+            SimdKernel::Neon(_) => {
+                // 出力引数形の理由は `dot_block4_impl` の Neon 分岐と同じ（再パック回避）。
+                let (mut s0, mut s1, mut s2, mut s3) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+                // SAFETY: この variant は `NeonToken::try_new` が実行時確認できた場合
+                // にのみ構築される sealed トークンを保持する（`dot_block4_impl` の Neon
+                // 分岐と同じ根拠）。値の存在が CPU 対応の証明であり、
+                // `neon_block4::l2_sq_block4_neon` の `#[target_feature]` 契約を満たす。
+                unsafe {
+                    neon_block4::l2_sq_block4_neon(
+                        [r0, r1, r2, r3],
+                        query,
+                        &mut s0,
+                        &mut s1,
+                        &mut s2,
+                        &mut s3,
+                    )
+                }
+                [s0, s1, s2, s3]
+            }
+            // x86_64 の SIMD 本体は Issue #1982 で置換する（`unsafe` を持たない scalar 委譲）。
+            #[cfg(target_arch = "x86_64")]
+            SimdKernel::Avx2Fma(_) | SimdKernel::Avx512(_) => [
+                l2_sq_scalar(r0, query),
+                l2_sq_scalar(r1, query),
+                l2_sq_scalar(r2, query),
+                l2_sq_scalar(r3, query),
+            ],
+        }
+    }
+
     /// 4 行 × 1 クエリの内積（`dot` の行ブロック版。Issue #510・TASK-156・CORE-14。
     /// ポインタ: `docs/design/dot-kernel-row-block.md`）。
     ///
@@ -572,6 +663,22 @@ pub fn dot_scalar(a: &[f32], b: &[f32]) -> f32 {
 /// 長さが異なる場合は `zip` により短い方へ切り詰める（[`dot_scalar`] と同じ）。
 pub fn l1_scalar(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).sum()
+}
+
+/// L2 二乗距離のスカラー参照実装（左から右への逐次和。Issue #1981・SQL-33）。
+///
+/// `kernel.rs::l2_sq` の実体、およびテストの参照実装として公開する。長さが異なる場合は
+/// `zip` により短い方へ切り詰める（[`l1_scalar`] と同じ）。ISA 別版は #1982／#1983 の担当。
+pub fn l2_sq_scalar(a: &[f32], b: &[f32]) -> f32 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| {
+            let d = x - y;
+            d * d
+        })
+        // `Iterator::sum` は空入力で -0.0 を返すため、+0.0 起点の fold で SIMD 経路（+0.0）と
+        // 空ベクトルの符号まで揃える（非空では全項非負なので結果は不変）。
+        .fold(0.0_f32, |acc, v| acc + v)
 }
 
 /// Arm Neon（4 レーン）向け L1 距離カーネル（Issue #1988）。intrinsics を使わない

@@ -541,6 +541,150 @@ fn dispatched_l1_exact_on_integers_and_truncates_mismatched_lengths() {
     assert_eq!(isa::current().l1(&b, &a), isa::l1_scalar(&b, &a));
 }
 
+/// `isa::current().l2_sq` が scalar 参照 [`isa::l2_sq_scalar`] と相対許容差内で一致すること
+/// （Issue #1983・SQL-33）。FMA の単一丸めと scalar の二重丸めの差を `1e-5 * expected + 1e-6`
+/// で許容する（全項非負なので和そのものを magnitude とする）。
+#[test]
+fn dispatched_l2_sq_matches_scalar_reference_within_tolerance() {
+    let dims = [
+        0usize, 1, 3, 4, 7, 8, 15, 16, 17, 33, 767, 768, 769, 1000, 1536, 1537,
+    ];
+    let mut rng = XorShift64Star::new(0x0bad_cafe_1983_0001);
+    for &dim in &dims {
+        let a = random_vec(&mut rng, dim);
+        let b = random_vec(&mut rng, dim);
+        let expected = isa::l2_sq_scalar(&a, &b);
+        let actual = isa::current().l2_sq(&a, &b);
+        let tolerance = 1e-5 * expected + 1e-6;
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "dim={dim} actual={actual} expected={expected} tolerance={tolerance}"
+        );
+        assert_eq!(actual.to_bits(), isa::current().l2_sq(&a, &b).to_bits());
+    }
+}
+
+/// 整数値ベクトル（各項の二乗和が 2^24 未満）では丸めが生じないため `l2_sq` が scalar と
+/// ビット一致し、長さ不一致では短い方へ切り詰める意味論も一致すること（Issue #1983）。
+#[test]
+fn dispatched_l2_sq_exact_on_integers_and_truncates_mismatched_lengths() {
+    for dim in [0usize, 1, 5, 8, 16, 17, 64, 129, 1000] {
+        let a: Vec<f32> = (0..dim).map(|i| (i % 7) as f32 - 3.0).collect();
+        let b: Vec<f32> = (0..dim).map(|i| (i % 5) as f32).collect();
+        assert_eq!(
+            isa::current().l2_sq(&a, &b).to_bits(),
+            isa::l2_sq_scalar(&a, &b).to_bits(),
+            "dim={dim}"
+        );
+    }
+    assert_eq!(isa::l2_sq_scalar(&[1.0, 2.0, 3.0], &[4.0, 0.0, 3.0]), 13.0);
+    let a: Vec<f32> = (0..50).map(|i| i as f32).collect();
+    let b: Vec<f32> = (0..37).map(|i| (i * 2) as f32).collect();
+    assert_eq!(isa::current().l2_sq(&a, &b), isa::l2_sq_scalar(&a, &b));
+    assert_eq!(isa::current().l2_sq(&b, &a), isa::l2_sq_scalar(&b, &a));
+}
+
+/// `l2_sq_block4` が 1 行版 `l2_sq` と全次元でビット同一であること（符号付きゼロ・
+/// 微小値を含む。Issue #1983・SQL-33）。
+#[test]
+fn l2_sq_block4_matches_single_row_bit_exact_across_dims() {
+    let current_isa = isa::current().isa();
+    let mut rng = XorShift64Star::new(0x1983_abcd_ef01_2345);
+    let dims: Vec<usize> = (0..=129usize).chain([768, 1000, 1536]).collect();
+    for &dim in &dims {
+        let query = random_vec(&mut rng, dim);
+        let mut rows: Vec<Vec<f32>> = (0..4).map(|_| random_vec(&mut rng, dim)).collect();
+        // 境界値: 符号付きゼロ・微小値・クエリと完全一致する行。
+        if let Some(x) = rows[1].first_mut() {
+            *x = -0.0;
+        }
+        if let Some(x) = rows[2].last_mut() {
+            *x = 1e-30;
+        }
+        rows[3] = query.clone();
+        let expected: Vec<f32> = rows
+            .iter()
+            .map(|r| isa::current().l2_sq(r, &query))
+            .collect();
+        let actual = isa::current().l2_sq_block4([&rows[0], &rows[1], &rows[2], &rows[3]], &query);
+        for i in 0..4 {
+            assert_eq!(
+                actual[i].to_bits(),
+                expected[i].to_bits(),
+                "isa={current_isa:?} dim={dim} i={i}"
+            );
+        }
+    }
+}
+
+/// 4 行の長さが不揃いでも `l2_sq_block4` は 1 行版 4 回と一致する（縮退経路。Issue #1983）。
+#[test]
+fn l2_sq_block4_falls_back_when_lengths_are_not_uniform() {
+    let mut rng = XorShift64Star::new(0x1983_0000_0000_0042);
+    let query = random_vec(&mut rng, 37);
+    let r0 = random_vec(&mut rng, 37);
+    let r1 = random_vec(&mut rng, 20);
+    let r2 = random_vec(&mut rng, 50);
+    let r3 = random_vec(&mut rng, 0);
+    let actual = isa::current().l2_sq_block4([&r0, &r1, &r2, &r3], &query);
+    for (i, r) in [&r0, &r1, &r2, &r3].into_iter().enumerate() {
+        assert_eq!(
+            actual[i].to_bits(),
+            isa::current().l2_sq(r, &query).to_bits(),
+            "i={i}"
+        );
+    }
+}
+
+/// 整数値 fixture の L2 Top-k（距離昇順・同点 id 昇順）が、ISA 実装（`l2_sq`＋`l2_sq_block4`）
+/// と scalar 参照で id 列・距離ビットとも完全一致すること（Issue #1983・SQL-33。
+/// 「ISA 間で同一の Top-k」を同一プロセスで検証できる形に落とした証跡。x86 側の SIMD 実装
+/// 〔Issue #1982〕も同じテストを通る）。値域が小さく同点が頻出する fixture にしている。
+#[test]
+fn l2_top_k_matches_scalar_on_integer_fixture() {
+    let mut rng = XorShift64Star::new(0x1983_7007_c0de_0001);
+    let mut int_vec = |dim: usize| -> Vec<f32> {
+        (0..dim)
+            .map(|_| ((rng.next_u64() >> 33) % 17) as f32 - 8.0)
+            .collect()
+    };
+    for dim in [1usize, 17, 128, 1536] {
+        let rows: Vec<Vec<f32>> = (0..4 * 25 + 3).map(|_| int_vec(dim)).collect();
+        let query = int_vec(dim);
+
+        let scalar: Vec<(f32, usize)> = rows
+            .iter()
+            .enumerate()
+            .map(|(id, r)| (isa::l2_sq_scalar(r, &query), id))
+            .collect();
+
+        let kernel = isa::current();
+        let mut simd: Vec<(f32, usize)> = Vec::with_capacity(rows.len());
+        let (blocks, remainder) = rows.as_chunks::<4>();
+        let mut id = 0usize;
+        for [r0, r1, r2, r3] in blocks {
+            let d = kernel.l2_sq_block4([r0, r1, r2, r3], &query);
+            for v in d {
+                simd.push((v, id));
+                id += 1;
+            }
+        }
+        for r in remainder {
+            simd.push((kernel.l2_sq(r, &query), id));
+            id += 1;
+        }
+
+        let top_k = |mut v: Vec<(f32, usize)>| -> Vec<(u32, usize)> {
+            v.sort_by(|x, y| x.0.total_cmp(&y.0).then(x.1.cmp(&y.1)));
+            v.into_iter()
+                .take(10)
+                .map(|(d, i)| (d.to_bits(), i))
+                .collect()
+        };
+        assert_eq!(top_k(simd), top_k(scalar), "dim={dim}");
+    }
+}
+
 /// `unsafe` が `isa.rs` 以外の `crates/engine/src/**/*.rs` に存在しないこと、
 /// `isa.rs` 内の各 `unsafe {` 直前数行に `SAFETY:` があることをソース走査で確認する
 /// （AGENTS.md P1「`unsafe` の立証」。sealed トークン所持を根拠とする 2 箇所
@@ -607,10 +751,12 @@ fn unsafe_is_confined_to_isa_module_with_safety_comments() {
     // 計 12 箇所の `unsafe {` が現れる（実際のビルドで有効になるのは対象 arch の
     // 分岐のみだが、`cfg` 行はソース上に残ったまま走査されるため、arch に
     // 依存せず常に 12 を期待できる）。Issue #1988（SQL-33）で追加した `l1` の
-    // Neon・Avx2Fma・Avx512 ディスパッチ 3 箇所を加えて計 15 箇所となる。
+    // Neon・Avx2Fma・Avx512 ディスパッチ 3 箇所を加えて計 15 箇所、Issue #1983（SQL-33）で
+    // 追加した `l2_sq`／`l2_sq_block4` の Neon ディスパッチ 2 箇所を加えて計 17 箇所となる
+    // （x86_64 アームは SIMD 本体が未実装〔Issue #1982〕で `unsafe` を持たない scalar 委譲）。
     assert_eq!(
-        unsafe_block_count, 15,
-        "expected exactly 15 `unsafe {{` blocks in isa.rs (Issue #1988 l1 dispatch x3 + Neon/Avx2Fma/Avx512 dot dispatch \
+        unsafe_block_count, 17,
+        "expected exactly 17 `unsafe {{` blocks in isa.rs (Issue #1983 l2_sq/l2_sq_block4 Neon dispatch x2 + Issue #1988 l1 dispatch x3 + Neon/Avx2Fma/Avx512 dot dispatch \
          + Avx2Fma/Avx512 dot_block4 dispatch + F16c/NeonFp16 dot_f16 dispatch added by \
          Issue #514 + Neon dot_block4 dispatch added by Issue #511 + Avx2Widen/AvxVnni/ \
          Avx512Vnni dot_i8 dispatch added by Issue #522 + NeonDotprod dot_i8 dispatch added \

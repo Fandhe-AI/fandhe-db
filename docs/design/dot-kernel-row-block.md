@@ -122,6 +122,19 @@ x86_64 版（`isa/x86_block4.rs`）と同型の構成で、新設サブモジュ
   `lane_sum4` を新設した。
 - 端数和: `dot_lanes`・x86 版行ブロックカーネルと同一の `tail_sum` を共有する。
 
+### 2.4 L2 二乗距離版（Issue #1983・SQL-33 ポインタ）
+
+- 契約: `SimdKernel::l2_sq_block4(rows, q)[i].to_bits() == SimdKernel::l2_sq(rows[i], q).to_bits()`。
+  4 行の長さが不揃いなら `l2_sq` を 4 回呼ぶ縮退経路へ合流する。L2 は多アキュムレータ分岐を
+  持たないため dim による縮退は不要（将来入れる場合は `dot_block4_impl` と同じ縮退が必要）。
+- 本体: `neon_block4::{l2_sq_neon, l2_sq_block4_neon}`。`vsubq_f32` → `vfmaq_f32(acc, d, d)` →
+  `lane_sum4` → 共有の端数和 `l2_tail_sum`。単一行・4 行で演算列が同一のためビット同一になる。
+- scalar 参照 `l2_sq_scalar` との差は FMA の単一丸めのみ（相対許容差内）。各項の二乗和が 2^24
+  未満の整数値では丸めが生じず ISA を問わず scalar とビット一致し、Top-k（同点 id 昇順を含む）が
+  完全一致する（`tests/isa.rs::l2_top_k_matches_scalar_on_integer_fixture`）。
+- 生成コード検査: `fsub v.4s`・`fmla v.4s` の出現を必須化（`scripts/check_simd_codegen.sh`）。
+- x86 の SIMD 本体は Issue #1982。現状 x86 アームは scalar 委譲（`unsafe` なし）。
+
 ## 3. 生成コード検査で発覚した問題と対処（実装時の主要な設計変更点）
 
 計画段階のプロトタイプ確認（rustc 1.96・`-C target-cpu=native`）では

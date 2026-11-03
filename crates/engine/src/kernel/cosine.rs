@@ -12,8 +12,11 @@
 //! 外から渡された値（C2）でも、その場の `dot(x, x)`（C1）でも同じ関数・同じ加算順序
 //! なので、両経路の結果はビット一致する。
 //!
-//! 暫定挙動（#2240 で変わる）: ゼロノルムの行・クエリの距離は NaN になり、
-//! fail-closed の既存規約に従って Top-k から除外する。クエリがゼロノルムなら結果は空。
+//! ゼロノルム（Issue #2240。ポインタ: SQL-33 (3)）: ゼロノルムの行・クエリの距離は NaN
+//! になり、エラーにも除外にもせず昇順の末尾（全数値より後ろ）に並べる。NaN 同士は
+//! 順序キー昇順で、NaN 行も `k` の枠を消費する（pgvector の `LIMIT k` と同じ）。
+//! クエリがゼロノルムなら全行 NaN で、順序キー昇順の先頭 `k` 行が返る。一方クエリの
+//! 非有限成分は入力不正として従来どおり `NonFiniteQuery` で拒否する（fail-closed）。
 
 use std::collections::{BinaryHeap, TryReserveError};
 
@@ -49,7 +52,7 @@ pub struct CosineSearchInput<'a> {
 ///
 /// 類似度を f64 で計算して [-1, 1] にクランプし `1 - s` を返す。NaN（ゼロノルム・
 /// 次元 0・非有限入力）は NaN のまま返る。f32 でのオーバーフロー（ノルム² や内積が
-/// inf）も fail-closed で NaN とし、選出器に除外させる（距離 1.0 への誤収束を防ぐ）。
+/// inf）も fail-closed で NaN とし、昇順の末尾へ回す（距離 1.0 への誤収束を防ぐ）。
 pub fn cosine_distance_from_parts(dot: f32, a_norm_sq: f32, b_norm_sq: f32) -> f64 {
     if !dot.is_finite() || !a_norm_sq.is_finite() || !b_norm_sq.is_finite() {
         return f64::NAN;
@@ -111,7 +114,8 @@ impl Ord for HeapItem {
 }
 
 /// 距離昇順（同点は順序キー昇順）の Top-k 選出器。仕組みは `TopKSelector` と同じで、
-/// `k` による事前確保はしない。有限でない距離は除外する（暫定挙動。#2240 で変わる）。
+/// `k` による事前確保はしない。NaN は受理して比較器に任せ（末尾に並ぶ）、
+/// ISA 依存の符号ビットを持ち込まないよう push 時に正規の NaN へ揃える（Issue #2240）。
 pub(crate) struct AscDistanceTopK {
     k: usize,
     heap: BinaryHeap<HeapItem>,
@@ -125,9 +129,12 @@ impl AscDistanceTopK {
         }
     }
 
-    pub(crate) fn push(&mut self, hit: DistanceHit) {
-        if self.k == 0 || !hit.distance.is_finite() {
+    pub(crate) fn push(&mut self, mut hit: DistanceHit) {
+        if self.k == 0 {
             return;
+        }
+        if hit.distance.is_nan() {
+            hit.distance = f64::NAN;
         }
         let item = HeapItem(hit);
         if self.heap.len() < self.k {
@@ -159,7 +166,7 @@ impl AscDistanceTopK {
 ///
 /// 検証順は `CpuScalarProvider::search` と同じ: 次元不一致は `DimMismatch`、
 /// クエリの非有限値は `NonFiniteQuery`、`k == 0` か行 0 件なら空。範囲外の行は
-/// skip し、距離が非有限の行（ゼロノルム等）は除外する。
+/// skip する。距離が NaN の行（ゼロノルム等）は除外せず末尾に並べる。
 pub fn cosine_top_k(input: CosineSearchInput<'_>) -> Result<Vec<DistanceHit>, KernelError> {
     let dim = input.dim as usize;
     if input.query.len() != dim {
@@ -255,7 +262,8 @@ mod tests {
         let ids = [1_u64, 2];
         let vectors = [2.0e19_f32, 0.0, 1.0, 0.0];
         let r = cosine_top_k(input(&ids, &vectors, 2, &[1.0, 0.0], 2)).unwrap();
-        assert!(r.iter().all(|h| h.id != 1));
+        assert_eq!(r.iter().map(|h| h.id).collect::<Vec<_>>(), vec![2, 1]);
+        assert!(r[1].distance.is_nan());
     }
 
     #[test]
@@ -266,7 +274,8 @@ mod tests {
         let ids = [1_u64, 2];
         let vectors = [1e-30_f32, 1e-30, 1.0, 0.0];
         let r = cosine_top_k(input(&ids, &vectors, 2, &[1.0, 0.0], 2)).unwrap();
-        assert!(r.iter().all(|h| h.id != 1));
+        assert_eq!(r.iter().map(|h| h.id).collect::<Vec<_>>(), vec![2, 1]);
+        assert!(r[1].distance.is_nan());
     }
 
     #[test]
@@ -310,6 +319,76 @@ mod tests {
             distance: 0.0,
         });
         assert!(z.into_sorted_vec().is_empty());
+
+        // k=5 なら NaN の id 1 も末尾に残る。
+        let mut s = AscDistanceTopK::new(5);
+        for (id, d) in [(5, 0.5), (3, 0.5), (9, 0.1), (1, f64::NAN), (2, 0.9)] {
+            s.push(DistanceHit { id, distance: d });
+        }
+        let out = s.into_sorted_vec();
+        assert_eq!(
+            out.iter().map(|h| h.id).collect::<Vec<_>>(),
+            vec![9, 3, 5, 2, 1]
+        );
+    }
+
+    #[test]
+    fn selector_nan_consumes_k_and_normalizes_sign() {
+        let neg_nan = f64::from_bits(0xFFF8_0000_0000_0000);
+        let mut s = AscDistanceTopK::new(4);
+        for (id, d) in [
+            (7, neg_nan),
+            (3, 0.2),
+            (5, f64::NAN),
+            (1, neg_nan),
+            (4, 0.1),
+        ] {
+            s.push(DistanceHit { id, distance: d });
+        }
+        let out = s.into_sorted_vec();
+        assert_eq!(
+            out.iter().map(|h| h.id).collect::<Vec<_>>(),
+            vec![4, 3, 1, 5]
+        );
+        for h in &out[2..] {
+            assert_eq!(h.distance.to_bits(), f64::NAN.to_bits());
+        }
+        // 有限行が k 以上なら NaN 行は出ない。
+        let mut s = AscDistanceTopK::new(2);
+        for (id, d) in [(1, f64::NAN), (2, 0.3), (3, 0.4)] {
+            s.push(DistanceHit { id, distance: d });
+        }
+        assert_eq!(
+            s.into_sorted_vec().iter().map(|h| h.id).collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+    }
+
+    #[test]
+    fn zero_rows_in_block_and_tail_paths_sort_last() {
+        // 9 行（4 行ブロック 2 つ＋端数 1）。id 2 はブロック内、id 7 は 2 つ目のブロック内。
+        let dim = 2usize;
+        let ids: Vec<u64> = (1..=9).collect();
+        let mut vectors = Vec::new();
+        for id in &ids {
+            if *id == 2 || *id == 7 {
+                vectors.extend_from_slice(&[0.0f32, 0.0]);
+            } else {
+                vectors.extend_from_slice(&[1.0f32, *id as f32 * 0.1]);
+            }
+        }
+        let out = cosine_top_k(input(&ids, &vectors, dim as u32, &[1.0, 0.0], 9)).unwrap();
+        let order: Vec<u64> = out.iter().map(|h| h.id).collect();
+        assert_eq!(order, vec![1, 3, 4, 5, 6, 8, 9, 2, 7]);
+        assert!(out[7..]
+            .iter()
+            .all(|h| h.distance.to_bits() == f64::NAN.to_bits()));
+        // C2（行ノルム²を外から渡す）でも同じ。
+        let norms = row_norms_sq(&vectors, dim as u32).unwrap();
+        let mut inp = input(&ids, &vectors, dim as u32, &[1.0, 0.0], 9);
+        inp.row_norms_sq = Some(&norms);
+        let c2 = cosine_top_k(inp).unwrap();
+        assert_eq!(c2.iter().map(|h| h.id).collect::<Vec<_>>(), order);
     }
 
     #[test]
@@ -339,19 +418,25 @@ mod tests {
             .unwrap()
             .is_empty());
         assert!(cosine_top_k(input(&[], &[], 2, &q, 3)).unwrap().is_empty());
-        // ゼロノルムのクエリは全行 NaN になり空（暫定挙動。#2240 で変わる）。
-        assert!(cosine_top_k(input(&ids, &vectors, 2, &[0.0, 0.0], 3))
-            .unwrap()
-            .is_empty());
+        // ゼロノルムのクエリは全行 NaN になり、順序キー昇順（id 昇順）で k 件返る。
+        let z = cosine_top_k(input(&ids, &vectors, 2, &[0.0, 0.0], 3)).unwrap();
+        assert_eq!(z.iter().map(|h| h.id).collect::<Vec<_>>(), vec![10, 11, 12]);
+        assert!(z.iter().all(|h| h.distance.is_nan()));
+        let z2 = cosine_top_k(input(&ids, &vectors, 2, &[0.0, 0.0], 2)).unwrap();
+        assert_eq!(z2.iter().map(|h| h.id).collect::<Vec<_>>(), vec![10, 11]);
     }
 
     #[test]
-    fn skips_out_of_range_rows_and_zero_norm_rows() {
+    fn skips_out_of_range_rows_and_sorts_zero_norm_rows_last() {
         // 5 行分の id に対し 4 行分しかベクトルが無い（id 5 は範囲外）。id 2 はゼロノルム。
         let vectors = [1.0f32, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0];
         let ids = [1u64, 2, 3, 4, 5];
         let out = cosine_top_k(input(&ids, &vectors, 2, &[1.0, 0.0], 10)).unwrap();
-        assert_eq!(out.iter().map(|h| h.id).collect::<Vec<_>>(), vec![1, 4, 3]);
+        assert_eq!(
+            out.iter().map(|h| h.id).collect::<Vec<_>>(),
+            vec![1, 4, 3, 2]
+        );
+        assert!(out[3].distance.is_nan());
     }
 
     #[test]
