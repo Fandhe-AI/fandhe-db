@@ -216,6 +216,9 @@ cat <<'EOF'
   bench-dot-kernel
       dot カーネルのマイクロベンチ（Issue #365）
       $ cargo bench --bench dot_kernel_bench -p fandhe-db-engine
+  bench-cosine-method
+      コサイン距離の実装方式比較ベンチ（Issue #1986）
+      $ cargo bench --bench cosine_method_bench -p fandhe-db-engine
   detect-features
       macOS 上の aarch64 feature 検出結果表を出力する（Issue #468）
       $ cargo run -p fandhe-db-engine --release --example detect_features
