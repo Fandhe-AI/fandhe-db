@@ -9225,17 +9225,33 @@ impl EngineCore {
                 | Statement::ShowStatementTimeout),
             ) => self.execute_validated_in_session(ctx, session, stmt.clone()),
             // SQL-66（Issue #1920・#1922）: `CREATE [OR REPLACE] FUNCTION` は DDL 権限が無ければ `42501` で
-            // 拒否する（fail-closed）。権限のあるセッションでも UDF カタログへ書く永続 DDL は独立した
-            // write txn で commit され ROLLBACK で取り消せないため、型注釈・RETURNS の有無によらず
-            // 明示トランザクションの中では行わない（他の DDL と同じ `0A000`）。
-            ParsedSql::Statement(Statement::CreateFunction { .. }) => {
+            // 拒否する（fail-closed）。権限のあるセッションでも、明示トランザクションの中では UDF カタログへ
+            // 書く永続 DDL が独立した write txn で commit され ROLLBACK で取り消せないため行わない（`0A000`。
+            // SAVEPOINT との整理が済むまで据え置き）。一方、複数文メッセージの暗黙トランザクション
+            // （WIRE-16・RECOVER-12。Issue #2882）では共有 write txn へ書く。commit するのはメッセージ末尾の
+            // 1 回だけで、後続文が失敗すればカタログごと巻き戻る。世代は commit 成功後に進める（遷移側）。
+            ParsedSql::Statement(stmt @ Statement::CreateFunction { .. }) => {
                 crate::sql::privilege_gate::require_ddl(
                     session,
                     crate::sql::privilege_gate::DdlStatementKind::CreateFunction,
                 )?;
-                Err(SqlSurfaceError::feature_not_supported(
-                    "CREATE [OR REPLACE] FUNCTION is not supported inside a transaction block",
-                ))
+                if !txn.is_implicit_active() {
+                    return Err(SqlSurfaceError::feature_not_supported(
+                        "CREATE [OR REPLACE] FUNCTION is not supported inside a transaction block",
+                    ));
+                }
+                let write_txn = txn.write_txn().ok_or_else(|| SqlSurfaceError::Internal {
+                    detail: "internal error".to_string(),
+                })?;
+                let outcome = self.execute_create_function_stmt(
+                    ctx,
+                    session,
+                    stmt.clone(),
+                    crate::sql::udf_ddl::CatalogWrite::InTxn(write_txn),
+                )?;
+                // 全 scope に印を付ける（漏れると commit 後の世代 bump が落ち、他セッションが新定義を読めない）。
+                txn.mark_function_written(ctx.tenant_id());
+                Ok(outcome)
             }
             ParsedSql::DropFunction(_) => {
                 // 所有者（束縛ロール）も `0A000` まで進める（Issue #2236。未束縛は `42501`）。
@@ -10919,6 +10935,139 @@ impl EngineCore {
         self.execute_validated_with_dict(ctx, session, stmt, None)
     }
 
+    /// `CREATE [OR REPLACE] FUNCTION` の実行本体。`target` で UDF カタログの書き込み先を選ぶ
+    /// （Issue #2882）。自動コミットの文は [`crate::sql::udf_ddl::CatalogWrite::Autocommit`]、複数文
+    /// メッセージの暗黙トランザクション内の文は共有 write txn への `InTxn` で呼ばれる。権限ゲート
+    /// （`42501`）・本体検証・件数上限・セッションへの登録は両経路で同一にし、Tx 内の経路で検査を
+    /// 迂回させない。`stmt` が `CreateFunction` 以外なら内部エラー（呼び出し元の不変条件違反）。
+    fn execute_create_function_stmt(
+        &self,
+        ctx: &PolicyContext,
+        session: &mut crate::sql::mode::SessionState,
+        stmt: crate::sql::allowlist::Statement,
+        target: crate::sql::udf_ddl::CatalogWrite<'_>,
+    ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        let crate::sql::allowlist::Statement::CreateFunction {
+            or_replace,
+            name,
+            params,
+            param_types,
+            return_type,
+            return_set,
+            returns_trigger,
+            language,
+            attributes,
+            body,
+            body_source,
+        } = stmt
+        else {
+            return Err(crate::sql::allowlist::SqlSurfaceError::Internal {
+                detail: "internal error".to_string(),
+            });
+        };
+        crate::sql::privilege_gate::require_ddl(
+            session,
+            crate::sql::privilege_gate::DdlStatementKind::CreateFunction,
+        )?;
+        let attrs = crate::sql::udf_ddl::function_attributes_from_clauses(&attributes);
+        // Issue #2217（SQL-67 (3)）: `LANGUAGE sql|plpgsql` は本体を原文のまま保存する経路へ。
+        // 呼び出しの実行は #2218（`core::routine_call`）。sql・plpgsql とも保存前に定義時検証。
+        let is_standard_body =
+            matches!(body, crate::sql::allowlist::CreateFunctionBody::SqlStandard);
+        let body = match (language, body) {
+            (
+                crate::sql::allowlist::FunctionLanguageClause::Declarative,
+                crate::sql::allowlist::CreateFunctionBody::Expression(body),
+            ) => body,
+            (language, _) => {
+                let spec = crate::sql::udf_ddl::RoutineSpec {
+                    name: &name,
+                    params: &params,
+                    param_types: &param_types,
+                    return_type: return_type.as_ref(),
+                    return_set: return_set.as_deref(),
+                    returns_trigger,
+                    language,
+                    attrs,
+                    body_source: &body_source,
+                    // Issue #2219（SQL-67 (2)）: `RETURN`・`BEGIN ATOMIC` の標準形は定義時に名前を
+                    // 解決し、依存辺を記録する（`validate_sql_standard_function_definition`）。
+                    standard_body: is_standard_body,
+                };
+                let is_plpgsql = language == crate::sql::allowlist::FunctionLanguageClause::Plpgsql;
+                crate::sql::udf_ddl::execute_create_routine_persistent(
+                    &self.storage,
+                    ctx.tenant_id(),
+                    session,
+                    &spec,
+                    or_replace,
+                    self.function_limits.max_functions(),
+                    &|w| {
+                        if is_plpgsql {
+                            self.validate_plpgsql_definition(
+                                &params,
+                                &param_types,
+                                returns_trigger,
+                                &body_source,
+                            )
+                            .map(|()| Vec::new())
+                        } else if spec.standard_body {
+                            self.validate_sql_standard_function_definition(
+                                ctx.tenant_id(),
+                                &name,
+                                &params,
+                                &param_types,
+                                &body_source,
+                                w,
+                            )
+                        } else {
+                            self.validate_sql_function_definition(
+                                &params,
+                                &param_types,
+                                &body_source,
+                            )
+                            .map(|()| Vec::new())
+                        }
+                    },
+                    target,
+                )?;
+                return Ok(crate::sql::SqlOutcome::CreateFunction { name });
+            }
+        };
+        if or_replace {
+            crate::sql::udf_ddl::execute_create_or_replace_function_persistent(
+                &self.storage,
+                ctx.tenant_id(),
+                session,
+                &name,
+                &params,
+                &param_types,
+                return_type.as_ref(),
+                &body,
+                &body_source,
+                self.function_limits.max_functions(),
+                &attrs,
+                target,
+            )?;
+        } else {
+            crate::sql::udf_ddl::execute_create_function_persistent(
+                &self.storage,
+                ctx.tenant_id(),
+                session,
+                &name,
+                &params,
+                &param_types,
+                return_type.as_ref(),
+                &body,
+                &body_source,
+                self.function_limits.max_functions(),
+                &attrs,
+                target,
+            )?;
+        }
+        Ok(crate::sql::SqlOutcome::CreateFunction { name })
+    }
+
     /// [`Self::execute_validated_in_session`] の本体。`dict_txn`（Issue #1353）が `Some` の
     /// とき、`USING PLAN` を伴う SELECT・`EXPLAIN ... USING PLAN` だけが辞書構築（と SELECT の
     /// 検索本体の行の読み）を共有 write トランザクションへ切り替える（明示トランザクション内で
@@ -11069,118 +11218,13 @@ impl EngineCore {
             // `42501`（fail-closed。セッション限定の登録経路は無い。docs/design/udf-catalog.md）。
             // 件数上限は起動時設定 `--max-functions`（下げる方向のみ）で、永続化経路がテナントのカタログ件数で
             // 判定する（置換は件数を増やさないため判定しない）。
-            crate::sql::allowlist::Statement::CreateFunction {
-                or_replace,
-                name,
-                params,
-                param_types,
-                return_type,
-                return_set,
-                returns_trigger,
-                language,
-                attributes,
-                body,
-                body_source,
-            } => {
-                crate::sql::privilege_gate::require_ddl(
+            stmt @ crate::sql::allowlist::Statement::CreateFunction { .. } => self
+                .execute_create_function_stmt(
+                    ctx,
                     session,
-                    crate::sql::privilege_gate::DdlStatementKind::CreateFunction,
-                )?;
-                let attrs = crate::sql::udf_ddl::function_attributes_from_clauses(&attributes);
-                // Issue #2217（SQL-67 (3)）: `LANGUAGE sql|plpgsql` は本体を原文のまま保存する経路へ。
-                // 呼び出しの実行は #2218（`core::routine_call`）。sql・plpgsql とも保存前に定義時検証。
-                let is_standard_body =
-                    matches!(body, crate::sql::allowlist::CreateFunctionBody::SqlStandard);
-                let body = match (language, body) {
-                    (
-                        crate::sql::allowlist::FunctionLanguageClause::Declarative,
-                        crate::sql::allowlist::CreateFunctionBody::Expression(body),
-                    ) => body,
-                    (language, _) => {
-                        let spec = crate::sql::udf_ddl::RoutineSpec {
-                            name: &name,
-                            params: &params,
-                            param_types: &param_types,
-                            return_type: return_type.as_ref(),
-                            return_set: return_set.as_deref(),
-                            returns_trigger,
-                            language,
-                            attrs,
-                            body_source: &body_source,
-                            // Issue #2219（SQL-67 (2)）: `RETURN`・`BEGIN ATOMIC` の標準形は定義時に名前を
-                            // 解決し、依存辺を記録する（`validate_sql_standard_function_definition`）。
-                            standard_body: is_standard_body,
-                        };
-                        let is_plpgsql =
-                            language == crate::sql::allowlist::FunctionLanguageClause::Plpgsql;
-                        crate::sql::udf_ddl::execute_create_routine_persistent(
-                            &self.storage,
-                            ctx.tenant_id(),
-                            session,
-                            &spec,
-                            or_replace,
-                            self.function_limits.max_functions(),
-                            &|| {
-                                if is_plpgsql {
-                                    self.validate_plpgsql_definition(
-                                        &params,
-                                        &param_types,
-                                        returns_trigger,
-                                        &body_source,
-                                    )
-                                    .map(|()| Vec::new())
-                                } else if spec.standard_body {
-                                    self.validate_sql_standard_function_definition(
-                                        ctx.tenant_id(),
-                                        &name,
-                                        &params,
-                                        &param_types,
-                                        &body_source,
-                                    )
-                                } else {
-                                    self.validate_sql_function_definition(
-                                        &params,
-                                        &param_types,
-                                        &body_source,
-                                    )
-                                    .map(|()| Vec::new())
-                                }
-                            },
-                        )?;
-                        return Ok(crate::sql::SqlOutcome::CreateFunction { name });
-                    }
-                };
-                if or_replace {
-                    crate::sql::udf_ddl::execute_create_or_replace_function_persistent(
-                        &self.storage,
-                        ctx.tenant_id(),
-                        session,
-                        &name,
-                        &params,
-                        &param_types,
-                        return_type.as_ref(),
-                        &body,
-                        &body_source,
-                        self.function_limits.max_functions(),
-                        &attrs,
-                    )?;
-                } else {
-                    crate::sql::udf_ddl::execute_create_function_persistent(
-                        &self.storage,
-                        ctx.tenant_id(),
-                        session,
-                        &name,
-                        &params,
-                        &param_types,
-                        return_type.as_ref(),
-                        &body,
-                        &body_source,
-                        self.function_limits.max_functions(),
-                        &attrs,
-                    )?;
-                }
-                Ok(crate::sql::SqlOutcome::CreateFunction { name })
-            }
+                    stmt,
+                    crate::sql::udf_ddl::CatalogWrite::Autocommit,
+                ),
             crate::sql::allowlist::Statement::Select(validated) => {
                 // TASK-77（SQL-5）: `USING PLAN('<query>')` は `ORDER BY` の代替
                 // （相互排他）のため、`validated.using_plan()` の有無で束縛経路を

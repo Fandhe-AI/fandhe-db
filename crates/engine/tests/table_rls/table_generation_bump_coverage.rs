@@ -463,8 +463,8 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1945（savepoint 巻き戻しでの書き込み記録の保存・復元）の行追加でさらに移動（旧: 1978）。書き込み内容・commit の意味は不変。
     // Issue #1944（savepoint 巻き戻しでの冪等台帳の整合）の行追加でさらに移動（旧: 1978）。書き込み内容・commit の意味は不変。
     // Issue #1947（失敗状態からの ROLLBACK TO 復帰）の行追加でさらに移動（旧: 2060）。書き込み内容・commit の意味は不変。
-    // Issue #2231（`SKIP LOCKED` の取得入口 `try_ensure_writer`・`try_begin_implicit` と取得方針 `WriterAcquire` の追加）の行追加でさらに移動（旧: 2230）。書き込み内容・commit の意味は不変。 Issue #2879（ROLLBACK TO の savepoint 差分復元の追加）の行追加でさらに移動（旧: 2409）。
-    ("sql/transaction.rs", 2558),
+    // Issue #2231（`SKIP LOCKED` の取得入口 `try_ensure_writer`・`try_begin_implicit` と取得方針 `WriterAcquire` の追加）の行追加でさらに移動（旧: 2230）。書き込み内容・commit の意味は不変。
+    ("sql/transaction.rs", 2580),
     // TABLE-44・Issue #1684: 一時表ストア（セッション専用のインメモリ DB。永続 DB とは別インスタンス）の
     // 書き込みトランザクションの確定口（`TempRowStore::commit`）。確定するのは、一時コアの書き込み本体
     // （`tenant::*`・`catalog::*`。いずれも自分の DB の表世代を `bump_table_generation_in_txn` で進める）が
@@ -616,11 +616,11 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // 存在せずバンプ対象がない）。
     // Issue #1917: `replace_function`（862）の追加と行移動の追随（同じ表だけを書く）。
     // Issue #2236: 所有者の保存を作成と同じ txn へ移した（`record_function_owner` を廃止）ための行移動の追随。
-    ("catalog/function.rs", 1203),
-    ("catalog/function.rs", 1287),
-    ("catalog/function.rs", 1378),
-    ("catalog/function.rs", 1428),
-    ("catalog/function.rs", 1479),
+    ("catalog/function.rs", 1291),
+    ("catalog/function.rs", 1332),
+    ("catalog/function.rs", 1423),
+    ("catalog/function.rs", 1473),
+    ("catalog/function.rs", 1524),
     // Issue #1921: commit 後の世代（UDF カタログ）追加による行移動の追随。`sql/udf_load.rs` の 1 件は
     // `#[cfg(test)]` 内で壊れた定義 blob を直接書くテスト補助（関数カタログ表だけを書き、世代の対象外）。
     // Issue #2798（型付き永続化の単体テスト追加）・#2218（ルーチンのロード追加）で行番号が移動したための
@@ -630,8 +630,10 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // 同上（#2798 で追加した未知バージョン blob を直接書く単体テスト補助。関数カタログ表だけを書く）。
     ("sql/udf_load.rs", 559),
     // Issue #1920: 上の `#[cfg(test)]` 内のテスト補助（多重定義・SCHEMA 接頭辞削除の状態を直接作る）。
-    ("catalog/function.rs", 2044),
-    ("catalog/function.rs", 2256),
+    ("catalog/function.rs", 2109),
+    ("catalog/function.rs", 2321),
+    // Issue #2882: `_in_txn` 書き込みの abort／commit を確かめる単体テスト（関数カタログ表だけを書く）。
+    ("catalog/function.rs", 1588),
     // Issue #1689（ALTER SEQUENCE）: `alter_sequence`／`rename_sequence`（803・842）も同じ表だけを書く
     // （定義 blob の上書き・キーの付け替え・状態行の削除）ため同じ理由で対象外。
     // Issue #1733（INSERT ... SELECT）: `core/insert_select_exec.rs` の 1007・1139 行（Issue #2613・#2614・#2615・#2212・#1726 で追随）は `#[cfg(test)]` 内の
