@@ -1072,6 +1072,15 @@ impl RlsVerifiedHits {
         self.hits
     }
 
+    /// 先頭 `n` 件を捨てた検証済み hits を返す（Issue #2008・SQL-33 (8) の kNN `OFFSET`）。
+    /// 安全網を通過済みの hits から捨てるだけなので witness の性質は保たれる（不可視行は
+    /// 既に除去済みで、OFFSET の計数に入らない）。`dropped` は変えない。`n` が件数以上なら空。
+    pub(crate) fn skip_front(mut self, n: usize) -> Self {
+        let cut = n.min(self.hits.len());
+        self.hits.drain(..cut);
+        self
+    }
+
     /// 検証済み hits の件数。
     pub fn len(&self) -> usize {
         self.hits.len()
@@ -1098,6 +1107,21 @@ mod tests {
     use crate::catalog::{ColumnDef, ColumnType, TableSchema};
     use crate::kernel::CpuScalarProvider;
     use crate::storage::{RowInput, Visibility};
+
+    #[test]
+    fn skip_front_drops_leading_hits_and_keeps_dropped() {
+        // Issue #2008・SQL-33 (8): kNN `OFFSET` の先頭除去（witness を保つ）。
+        let make = || RlsVerifiedHits {
+            hits: vec![(1, 0.1), (2, 0.2), (3, 0.3)],
+            dropped: 4,
+        };
+        assert_eq!(make().skip_front(0).hits(), &[(1, 0.1), (2, 0.2), (3, 0.3)]);
+        let two = make().skip_front(2);
+        assert_eq!(two.hits(), &[(3, 0.3)]);
+        assert_eq!(two.dropped(), 4);
+        assert!(make().skip_front(3).is_empty());
+        assert!(make().skip_front(usize::MAX).is_empty());
+    }
 
     fn schema_for(table_name: &str, dim: u32) -> TableSchema {
         TableSchema::new(

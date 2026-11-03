@@ -44,6 +44,7 @@ mod sql31_snapshot_switch;
 mod sql31_transaction;
 mod sql31_txn_dml;
 mod sql31_txn_file_insert_using_plan;
+mod sql33_knn_offset;
 mod sql34_limit_omitted;
 mod sql34_result_rows_raised_cap;
 mod sql34_subquery_limit_omitted;

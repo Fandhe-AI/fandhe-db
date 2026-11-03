@@ -3109,6 +3109,10 @@ pub struct ValidatedStatement {
     /// WHERE 句に含まれる述語（AND 結合順）。空なら WHERE 句なし。
     pub(crate) where_predicates: Vec<WherePredicate>,
     pub(crate) limit: u32,
+    /// `LIMIT` 直後の任意 `OFFSET m`（Issue #2008・SQL-33 (8)。省略時 0）。距離 ORDER BY・
+    /// HYBRID 経路のみ非 0 になり得る（`USING PLAN` は `42601`）。範囲・合計の検証は
+    /// `sql::parser` の束縛段が行う。
+    pub(crate) offset: u32,
     /// `LIMIT` 直後の文末専用句 `USING MODE '<literal>'`（TASK-161・SQL-12）の生
     /// リテラル値。省略時は `None`。値の意味論的妥当性（`recall`／`precision` の
     /// 2 値のみ有効）は本モジュールの管轄外で、`sql::mode::SearchMode::parse_literal`
@@ -3149,6 +3153,7 @@ impl ValidatedStatement {
             order_by,
             where_predicates,
             limit,
+            offset: 0,
             search_mode: None,
             evaluation_order,
             using_plan: None,
@@ -3167,6 +3172,19 @@ impl ValidatedStatement {
     /// 距離順 `ORDER BY` に `DESC` が付いているか（Issue #2009・SQL-33 (2)）。
     pub fn distance_descending(&self) -> bool {
         self.distance_descending
+    }
+
+    /// `OFFSET`（Issue #2008・SQL-33 (8)）を設定したコピーを返すビルダー的メソッド。
+    #[must_use]
+    pub fn with_offset(mut self, offset: u32) -> Self {
+        self.offset = offset;
+        self
+    }
+
+    /// `OFFSET` 句の値（構造検証済みの生値。既定 0。範囲・`LIMIT` との合計は
+    /// `sql::parser::validate_search_limit_offset_with` が束縛時に検証する）。
+    pub fn offset(&self) -> u32 {
+        self.offset
     }
 
     /// `search_mode`（TASK-161・SQL-12）を設定したコピーを返すビルダー的メソッド。
@@ -21053,6 +21071,9 @@ struct ParsedShape {
     where_predicates: Vec<WherePredicate>,
     order_by: OrderByForm,
     limit: u32,
+    /// `LIMIT n` 直後の任意 `OFFSET m`（Issue #2008・SQL-33 (8)。省略時 0）。
+    /// `USING PLAN` 経路は受理せず常に 0。
+    offset: u32,
     search_mode: Option<String>,
     evaluation_order: EvaluationOrder,
     /// `USING PLAN('<query>')`（TASK-77・SQL-5）。`Some` のとき `order_by` は必ず
@@ -23219,6 +23240,7 @@ fn parse_select_shape(
             where_predicates,
             order_by: OrderByForm::UsingPlan,
             limit,
+            offset: 0,
             search_mode,
             evaluation_order: EvaluationOrder::DEFAULT,
             using_plan: Some(using_plan),
@@ -23238,8 +23260,8 @@ fn parse_select_shape(
         let limit = p.parse_optional_limit()?;
 
         // Issue #916・SQL-25 (b)・TASK-209: `LIMIT n` の直後に任意で `OFFSET m` を
-        // 受理する（広域取得のみ。検索 SELECT の `ORDER BY`／`USING PLAN` 経路は
-        // 対象外のまま `expect_end_of_statement` が `42601` に落とす）。
+        // 受理する（広域取得）。距離 ORDER BY・HYBRID は Issue #2008 で別分岐が受理し、
+        // `USING PLAN` 経路は対象外のまま `expect_end_of_statement` が `42601` に落とす。
         let offset = p.parse_optional_offset()?.unwrap_or(0);
 
         p.expect_end_of_statement()?;
@@ -23393,6 +23415,11 @@ fn parse_select_shape(
         .parse()
         .map_err(|_| SqlSurfaceError::unsupported(format!("malformed LIMIT value: {limit_str}")))?;
 
+    // Issue #2008・SQL-33 (8): ベクトル順位付け（距離 ORDER BY・HYBRID）は `LIMIT n` の直後に
+    // 任意の `OFFSET m` を受理する（`fetch_clause` の正規形 `LIMIT n OFFSET m` と同じ位置）。
+    // 値の範囲・`LIMIT + OFFSET` の合計検証は束縛段（`sql::parser`）が行う。
+    let offset = p.parse_optional_offset()?.unwrap_or(0);
+
     let evaluation_order = p.parse_hint_order()?.unwrap_or(EvaluationOrder::DEFAULT);
     let search_mode = p.parse_using_clause()?;
 
@@ -23404,6 +23431,7 @@ fn parse_select_shape(
         where_predicates,
         order_by,
         limit,
+        offset,
         search_mode,
         evaluation_order,
         using_plan: None,
@@ -27795,6 +27823,7 @@ fn validate_select_statement(
                 order_by: shape.order_by,
                 where_predicates: shape.where_predicates,
                 limit: shape.limit,
+                offset: shape.offset,
                 search_mode: shape.search_mode,
                 evaluation_order: shape.evaluation_order,
                 using_plan: shape.using_plan,
@@ -32364,11 +32393,45 @@ mod tests {
         );
     }
 
+    fn knn_offset_of(sql: &str) -> u32 {
+        let lookup = catalog_with(&["documents"]);
+        validate_statement(sql, &lookup)
+            .expect("kNN offset shape should be accepted")
+            .offset()
+    }
+
     #[test]
-    fn rejects_offset() {
-        assert_rejected_as_syntax_error(
-            "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' LIMIT 5 OFFSET 10",
+    fn accepts_knn_offset() {
+        // Issue #2008・SQL-33 (8): 距離 ORDER BY の `LIMIT n OFFSET m` を受理する。
+        assert_eq!(
+            knn_offset_of(
+                "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' LIMIT 5 OFFSET 10"
+            ),
+            10
         );
+        assert_eq!(
+            knn_offset_of("SELECT * FROM documents ORDER BY embedding <=> '[0.1]' LIMIT 5"),
+            0
+        );
+        assert_eq!(
+            knn_offset_of(
+                "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' LIMIT 5 OFFSET 1 USING MODE 'recall'"
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn rejects_knn_offset_malformed() {
+        for sql in [
+            "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' OFFSET 1 LIMIT 5",
+            "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' LIMIT 5 OFFSET -1",
+            "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' LIMIT 5 OFFSET 1.5",
+            "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' LIMIT 5 OFFSET 1 x",
+            "SELECT * FROM documents USING PLAN('q') LIMIT 5 OFFSET 1",
+        ] {
+            assert_rejected_as_syntax_error(sql);
+        }
     }
 
     #[test]
@@ -42002,18 +42065,24 @@ mod tests {
     }
 
     #[test]
-    fn distance_desc_rejects_nulls_duplicates_missing_limit_and_offset() {
+    fn distance_desc_rejects_nulls_duplicates_and_missing_limit() {
         let lookup = catalog_with(&["documents"]);
         for sql in [
             "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' DESC NULLS FIRST LIMIT 5",
             "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' DESC DESC LIMIT 5",
             "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' ASC DESC LIMIT 5",
             "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' DESC",
-            "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' DESC LIMIT 5 OFFSET 1",
         ] {
             let e = validate_statement(sql, &lookup).expect_err(sql);
             assert_eq!(e.wire_code(), "42601", "{sql}");
         }
+        // OFFSET は #2008 で受理されたため DESC とも併用できる。
+        let stmt = validate_statement(
+            "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' DESC LIMIT 5 OFFSET 1",
+            &lookup,
+        )
+        .expect("DESC with OFFSET");
+        assert!(stmt.distance_descending());
     }
 
     #[test]

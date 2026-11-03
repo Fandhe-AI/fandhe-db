@@ -119,19 +119,35 @@ fn scan_rejects_offset_over_max_search_k_with_22000() {
     read_ready_for_query(&mut stream);
 }
 
-/// Issue #916: 検索 SELECT（`ORDER BY` 経路）は wire 越しでも `OFFSET` を
-/// 構造上受理しない（`42601`。広域取得のみが対象という契約の wire 越し確認）。
+/// Issue #2008・SQL-33 (8): 検索 SELECT（距離 `ORDER BY` 経路）の `LIMIT k OFFSET m` が
+/// wire 越しでも受理され、同じ接続の `LIMIT m+k` の結果から先頭 m 件を除いたものと一致する。
 #[test]
-fn search_select_with_offset_still_rejected_with_42601_over_wire() {
+fn search_select_with_offset_matches_tail_of_larger_limit_over_wire() {
     let (core, _guard) = new_core_scan_docs_for_offset();
     let (mut stream, _users_path) = spawn_with_alice(core);
 
-    send_simple_query(
-        &mut stream,
-        "SELECT id FROM docs ORDER BY embedding <=> '[0,0]' LIMIT 5 OFFSET 1",
+    let mut fetch = |sql: &str, n: usize| -> Vec<String> {
+        send_simple_query(&mut stream, sql);
+        let _columns = read_row_description(&mut stream);
+        let mut ids: Vec<String> = Vec::new();
+        for _ in 0..n {
+            let row = read_data_row(&mut stream);
+            ids.push(row[0].clone().expect("id must not be NULL"));
+        }
+        assert_eq!(read_command_complete(&mut stream), format!("SELECT {n}"));
+        read_ready_for_query(&mut stream);
+        ids
+    };
+
+    let full = fetch(
+        "SELECT id FROM docs ORDER BY embedding <=> '[0,0]' LIMIT 4",
+        4,
     );
-    expect_error_response_with_sqlstate(&mut stream, "42601");
-    read_ready_for_query(&mut stream);
+    let paged = fetch(
+        "SELECT id FROM docs ORDER BY embedding <=> '[0,0]' LIMIT 2 OFFSET 2",
+        2,
+    );
+    assert_eq!(paged, full[2..].to_vec());
 }
 
 /// Issue #916: `OFFSET` の後ろに余剰トークン（`USING MODE`）が続く形は許可

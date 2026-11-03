@@ -3629,6 +3629,22 @@ impl EngineCore {
         Ok(())
     }
 
+    /// 束縛済み検索計画の `LIMIT` と取得件数 `limit + offset` を設定値で再検査する
+    /// （Issue #2008・SQL-33 (8) の多層防御。NoSQL 表層の直接構築も同じ検査を通す）。
+    /// `LIMIT` 超過は `22000`、合計超過は束縛段と同じ `54000`（固定文言）。
+    fn check_bound_search(
+        &self,
+        bound: &crate::sql::parser::BoundStatement,
+    ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+        self.check_bound_limit(bound.limit())?;
+        if bound.fetch_count() > self.result_limits.max_result_rows() {
+            return Err(crate::sql::allowlist::SqlSurfaceError::payload_too_large(
+                "LIMIT plus OFFSET exceeds the result row limit",
+            ));
+        }
+        Ok(())
+    }
+
     /// `LIMIT` 省略・`LIMIT ALL` の結果が結果行数上限 `cap` を超えたら `54000` で文全体を拒否する
     /// （Issue #1796・SQL-34）。黙って切り詰めない。文言は固定の英語で、件数・テナント・行の
     /// 内容を含めない。JOIN・GROUP BY・集合演算・評価後射影形ビューの外側が共有する。
@@ -10891,6 +10907,7 @@ impl EngineCore {
                         validated,
                         &schema,
                         session.udfs(),
+                        session.search_mode(),
                         !skip_vector_literal_validation,
                         dummy_equality_flags,
                         limits,
@@ -12462,7 +12479,7 @@ impl EngineCore {
                 "bound search plan targets a different table than requested",
             ));
         }
-        self.check_bound_limit(bound.limit())?;
+        self.check_bound_search(&bound)?;
         self.run_select_plan(&read_txn, ctx, &schema, &bound)
     }
 
@@ -12580,6 +12597,7 @@ impl EngineCore {
                         query_text,
                     },
                     limit: validated_limit,
+                    offset: 0,
                     mode: planned.resolved_mode,
                     evaluation_order: crate::sql::plan::EvaluationOrder::DEFAULT,
                     distance_descending: false,
@@ -13851,7 +13869,7 @@ impl EngineCore {
                 "bound search plan targets a different table than requested",
             ));
         }
-        self.check_bound_limit(bound.limit())?;
+        self.check_bound_search(&bound)?;
         self.search_explain_from_bound(ctx, &read_txn, &schema, &bound)
     }
 
