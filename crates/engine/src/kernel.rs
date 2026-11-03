@@ -404,6 +404,70 @@ pub(crate) fn search_l1(input: SearchInput<'_>) -> Result<Vec<CandidateHit>, Ker
     Ok(selector.into_sorted_vec())
 }
 
+/// 遠い順（`DESC`）選出ヒープの要素。`Ord` は「遠い順に並べたとき後ろ（＝より劣る）ほど大きい」。
+struct FarHeapItem(CandidateHit);
+impl PartialEq for FarHeapItem {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+impl Eq for FarHeapItem {}
+impl PartialOrd for FarHeapItem {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for FarHeapItem {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        search_order::cmp_far_first_then_tie(
+            self.0.score,
+            search_order::tie_key_for_response_id(self.0.id),
+            other.0.score,
+            search_order::tie_key_for_response_id(other.0.id),
+        )
+    }
+}
+
+/// 距離の降順（遠い順）の Top-k 選出（Issue #2009・SQL-33 (2)。`ORDER BY <距離演算子> DESC`）。
+///
+/// 距離種別に依存しない汎用選出器で、候補の [`CandidateHit::score`] は昇順経路と同じ向き
+/// （大きいほど近い。L2 なら負の距離など）で受け取り、スコアの低い順に `k` 件を返す。
+/// 同点は候補識別子（順序キー）の昇順、NaN は最も遠いものとして先頭に置く
+/// （[`search_order::cmp_far_first_then_tie`]）。`sql::exec` の `DESC` 分岐が呼ぶ。
+/// 非有限値の除外は昇順経路と同じく呼び出し側の責務で、ここでは行わない。
+/// 最大ヒープで `O(n log k)`・保持は高々 `k` 件。事前確保は `k` に依存させない
+/// （[`TopKSelector::new`] と同じ理由）。
+pub(crate) fn select_farthest_k(
+    candidates: impl Iterator<Item = CandidateHit>,
+    k: usize,
+) -> Vec<CandidateHit> {
+    if k == 0 {
+        return Vec::new();
+    }
+    let mut heap: std::collections::BinaryHeap<FarHeapItem> = std::collections::BinaryHeap::new();
+    for hit in candidates {
+        let item = FarHeapItem(hit);
+        if heap.len() < k {
+            heap.push(item);
+        } else if let Some(worst) = heap.peek() {
+            if item < *worst {
+                heap.pop();
+                heap.push(item);
+            }
+        }
+    }
+    let mut out: Vec<CandidateHit> = heap.into_iter().map(|i| i.0).collect();
+    out.sort_by(|a, b| {
+        search_order::cmp_far_first_then_tie(
+            a.score,
+            search_order::tie_key_for_response_id(a.id),
+            b.score,
+            search_order::tie_key_for_response_id(b.id),
+        )
+    });
+    out
+}
+
 /// 4 行 × 1 クエリの内積（`dot` の行ブロック版。Issue #510・TASK-156・CORE-14。
 /// ポインタ: `docs/design/dot-kernel-row-block.md`）。
 ///
@@ -965,5 +1029,87 @@ mod tests {
             let got: Vec<u64> = hits.iter().map(|h| h.id).collect();
             assert_eq!(got, expected_ids, "dim={dim}");
         }
+    }
+
+    /// 参照用の距離関数（大きいほど近いスコアへ正規化）。選出器が距離種別に依存しないことの確認用
+    /// （Issue #2009・SQL-33 (2)。L2・コサイン・負の内積・L1）。
+    fn reference_scores(metric: usize, rows: &[[f32; 2]], q: [f32; 2]) -> Vec<CandidateHit> {
+        rows.iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let dist = match metric {
+                    0 => ((r[0] - q[0]).powi(2) + (r[1] - q[1]).powi(2)).sqrt(),
+                    1 => {
+                        let n =
+                            (r[0] * r[0] + r[1] * r[1]).sqrt() * (q[0] * q[0] + q[1] * q[1]).sqrt();
+                        1.0 - (r[0] * q[0] + r[1] * q[1]) / n
+                    }
+                    2 => -(r[0] * q[0] + r[1] * q[1]),
+                    _ => (r[0] - q[0]).abs() + (r[1] - q[1]).abs(),
+                };
+                CandidateHit {
+                    id: i as u64,
+                    score: -dist,
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn select_farthest_k_matches_full_stable_sort_for_every_metric() {
+        // 同点（行 4 と行 5 が同一）を含む。
+        let rows = [
+            [1.0f32, 0.0],
+            [0.0, 1.0],
+            [-1.0, 0.5],
+            [2.0, 2.0],
+            [0.5, 0.5],
+            [0.5, 0.5],
+            [-2.0, -1.0],
+        ];
+        let q = [1.0f32, 1.0];
+        for metric in 0..4 {
+            let all = reference_scores(metric, &rows, q);
+            let mut expected = all.clone();
+            expected.sort_by(|a, b| {
+                search_order::cmp_far_first_then_tie(
+                    a.score,
+                    search_order::tie_key_for_response_id(a.id),
+                    b.score,
+                    search_order::tie_key_for_response_id(b.id),
+                )
+            });
+            for k in [0usize, 1, 3, rows.len(), rows.len() + 5] {
+                let got = select_farthest_k(all.iter().copied(), k);
+                let want: Vec<_> = expected.iter().copied().take(k).collect();
+                assert_eq!(got, want, "metric={metric} k={k}");
+            }
+        }
+    }
+
+    #[test]
+    fn select_farthest_k_ties_ascending_and_empty_input() {
+        let hits = [
+            CandidateHit { id: 3, score: 0.5 },
+            CandidateHit { id: 1, score: 0.5 },
+            CandidateHit { id: 2, score: 0.9 },
+        ];
+        let got = select_farthest_k(hits.iter().copied(), 2);
+        assert_eq!(got.iter().map(|h| h.id).collect::<Vec<_>>(), vec![1, 3]);
+        assert!(select_farthest_k(std::iter::empty(), 4).is_empty());
+    }
+
+    #[test]
+    fn select_farthest_k_puts_nan_first() {
+        let hits = [
+            CandidateHit { id: 1, score: -5.0 },
+            CandidateHit {
+                id: 2,
+                score: f32::NAN,
+            },
+        ];
+        let got = select_farthest_k(hits.iter().copied(), 2);
+        assert_eq!(got[0].id, 2);
+        assert_eq!(got[1].id, 1);
     }
 }

@@ -2413,6 +2413,10 @@ pub enum AnnPlan {
     /// カスタム provider が内部で ANN 相当の近似探索を行っていても `EXPLAIN`
     /// が plain scan と誤断定する）。
     UnknownCustomProvider,
+    /// 距離順 `ORDER BY` に `DESC`（遠い順）が付いているため、エンジン種別・HNSW の有効無効・
+    /// モードに関係なく ANN 索引を使わず可視行を全走査する（Issue #2009・SQL-33 (2)・
+    /// SQL-75 (4)）。分類関数ではなく [`ann_plan_for_direction`] が上書きして与える。
+    PlainScanDescending,
 }
 
 /// [`classify_ann_plan`] の入力（`sql::exec::execute_statement_with_cache` と
@@ -2471,6 +2475,22 @@ pub fn classify_ann_plan(input: AnnShapeInput) -> AnnPlan {
         AnnPlan::HnswFullVisible
     } else {
         AnnPlan::HnswSubset
+    }
+}
+
+/// 距離方向（`DESC`）による ANN 判定の上書き（Issue #2009・SQL-33 (2)・SQL-75 (4)）。
+///
+/// `descending` なら分類結果にかかわらず常に [`AnnPlan::PlainScanDescending`] を返し、`false` なら
+/// 入力をそのまま返す。実行側（`sql::exec`）と `EXPLAIN`（`core.rs::explain_engine_for`）が
+/// 同じ関数を通すことで、表示と実際の経路の判断元を 1 つにする。厳密走査に倒す理由が増える
+/// 場合（演算子クラスの不一致・`LIMIT` 省略）も、この関数へ理由を足す。優先順位は
+/// 方向（`DESC`）→ 既存の分類（`classify_ann_plan`）。公開の [`AnnShapeInput`] へフィールドを
+/// 足さない（外部からの構造体リテラルを壊さない）ための crate 内部関数。
+pub(crate) fn ann_plan_for_direction(plan: AnnPlan, descending: bool) -> AnnPlan {
+    if descending {
+        AnnPlan::PlainScanDescending
+    } else {
+        plan
     }
 }
 
@@ -4413,6 +4433,35 @@ mod tests {
         assert_eq!(
             classify_ann_plan(ann_shape_with_row_policy(precision, true)),
             AnnPlan::PlainScanPrecision
+        );
+    }
+
+    #[test]
+    fn ann_plan_for_direction_overrides_only_when_descending() {
+        for hnsw_enabled in [false, true] {
+            for is_precision in [false, true] {
+                for filters_empty in [false, true] {
+                    for scalar_prefilter in [false, true] {
+                        let plan = classify_ann_plan(AnnShapeInput {
+                            hnsw_enabled,
+                            engine_kind_unknown: false,
+                            is_hybrid: false,
+                            is_precision,
+                            filters_empty,
+                            scalar_prefilter,
+                        });
+                        assert_eq!(ann_plan_for_direction(plan, false), plan);
+                        assert_eq!(
+                            ann_plan_for_direction(plan, true),
+                            AnnPlan::PlainScanDescending
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            ann_plan_for_direction(AnnPlan::UnknownCustomProvider, true),
+            AnnPlan::PlainScanDescending
         );
     }
 }

@@ -279,6 +279,7 @@ pub(crate) fn bind_expansion(
         offset: 0,
         mode: resolved_mode,
         evaluation_order: stmt.evaluation_order(),
+        distance_descending: false,
     })
 }
 
