@@ -12743,7 +12743,7 @@ impl<'a> Parser<'a> {
         let name_at = self.pos;
         let name = self.expect_ident()?;
         match self.peek() {
-            Some(Token::DistanceOp) => {
+            Some(Token::DistanceOp(lexer::DistanceKind::Cosine)) => {
                 self.sink_mark(name_at, super::colref_sink::Role::OrderKey);
                 self.advance();
                 let literal = self.expect_string_literal()?;
@@ -12810,7 +12810,7 @@ impl<'a> Parser<'a> {
             };
             if matches!(
                 self.peek(),
-                Some(Token::DistanceOp) | Some(Token::Punct('('))
+                Some(Token::DistanceOp(lexer::DistanceKind::Cosine)) | Some(Token::Punct('('))
             ) {
                 return Err(SqlSurfaceError::unsupported(
                     "ORDER BY cannot mix scalar columns with vector ranking expressions",
@@ -22287,7 +22287,10 @@ fn parse_join_order_by(p: &mut Parser<'_>) -> Result<Vec<JoinOrderKey>, SqlSurfa
                 None,
             )
         };
-        if matches!(p.peek(), Some(Token::DistanceOp) | Some(Token::Punct('('))) {
+        if matches!(
+            p.peek(),
+            Some(Token::DistanceOp(lexer::DistanceKind::Cosine)) | Some(Token::Punct('('))
+        ) {
             return Err(SqlSurfaceError::unsupported(
                 "ORDER BY with vector ranking cannot be combined with JOIN",
             ));
@@ -23254,7 +23257,7 @@ fn parse_select_shape(
     // スカラー経路へ回す。未知の関数名は束縛段が拒否する。
     let is_vector_ranking = match p.peek() {
         Some(Token::Ident(name)) => match p.tokens.get(p.pos + 1) {
-            Some(Token::DistanceOp) => true,
+            Some(Token::DistanceOp(lexer::DistanceKind::Cosine)) => true,
             Some(Token::Punct('(')) => is_allowed_order_by_function_name(name),
             _ => false,
         },
@@ -30774,6 +30777,19 @@ mod tests {
     }
 
     // --- 受理系（許可した SQL 表層の構造判定通過） -------------------------
+
+    /// Issue #1976（SQL-33 ポインタ）: lexer が `<->`・`<#>`・`<+>` を種別付き距離トークンに
+    /// しても、構文段の受理点は `<=>`（Cosine）のみ。他の種別がコサイン距離として実行される
+    /// fail-open を防ぎ、従来どおり 42601 で拒否する（受理範囲の拡張は Issue #1977）。
+    #[test]
+    fn rejects_non_cosine_distance_operators_with_42601() {
+        let lookup = catalog_with(&["documents"]);
+        for op in ["<->", "<#>", "<+>"] {
+            let sql = format!("SELECT * FROM documents ORDER BY embedding {op} '[0.1]' LIMIT 5");
+            let err = validate_statement(&sql, &lookup).expect_err("must be rejected");
+            assert_eq!(err.wire_code(), "42601", "{op}");
+        }
+    }
 
     #[test]
     fn accepts_basic_select_with_order_by_distance() {
