@@ -137,6 +137,7 @@ mod sql68_do_limits_ledger;
 mod sql69_savepoint_cursor;
 mod sql69_savepoint_failed_recovery;
 mod sql69_savepoint_ledger;
+mod sql69_savepoint_post_write;
 mod sql69_savepoint_rollback;
 mod sql69_savepoint_syntax;
 mod sql69_savepoint_write_marks;
