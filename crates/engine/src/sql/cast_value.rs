@@ -621,6 +621,19 @@ fn extract_src<'a>(from: CastSrc, v: ExprValue<'a>) -> Result<SrcValue<'a>, SqlS
                 Err(internal("integer cast argument is not an exact integer"))
             }
         }
+        // Issue #2881: 定数式の整数モードは 2^53 以上の整数を scale 0 の Numeric の運び手で運ぶ。
+        // CASE／COALESCE の暗黙変換が挿入する整数起点の変換はその運び手も受け付け、i64 の範囲外は 22003。
+        (CastSrc::Int2 | CastSrc::Int4 | CastSrc::Int8, ExprValue::Numeric(d)) => {
+            let r = if d.scale() == 0 {
+                numeric::round_to_integer(&d)
+            } else {
+                None
+            };
+            match r.and_then(|r| i64::try_from(r).ok()) {
+                Some(i) => Ok(SrcValue::Int(i)),
+                None => Err(out_of_range("bigint out of range")),
+            }
+        }
         (CastSrc::Float4 | CastSrc::Float8, ExprValue::Scalar(x)) => Ok(SrcValue::Float(x)),
         (CastSrc::Numeric, ExprValue::Numeric(d)) => Ok(SrcValue::Dec(d)),
         (CastSrc::Bool, ExprValue::Bool(b)) => Ok(SrcValue::Bool(b)),
@@ -1707,6 +1720,38 @@ mod tests {
             )),
             "7   "
         );
+    }
+
+    #[test]
+    fn int_source_accepts_exact_int_carrier() {
+        let d = Decimal::from_parts(16_000_000_000_000_000, 0).unwrap();
+        let f = |to| {
+            apply_cast(
+                CastFn {
+                    from: CastSrc::Int8,
+                    to,
+                },
+                ExprValue::Numeric(d),
+            )
+        };
+        match f(CastDst::Float4).unwrap() {
+            ExprValue::Scalar(x) => assert_eq!(x, f64::from(16_000_000_000_000_000_i64 as f32)),
+            _ => panic!("scalar expected"),
+        }
+        assert!(matches!(
+            f(CastDst::Numeric(None)).unwrap(),
+            ExprValue::Numeric(_)
+        ));
+        let big = Decimal::from_parts(i128::from(i64::MAX) + 1, 0).unwrap();
+        let e = apply_cast(
+            CastFn {
+                from: CastSrc::Int8,
+                to: CastDst::Float4,
+            },
+            ExprValue::Numeric(big),
+        )
+        .unwrap_err();
+        assert_eq!(e.wire_code(), "22003");
     }
 
     #[test]
