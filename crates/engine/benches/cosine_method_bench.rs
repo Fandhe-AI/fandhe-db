@@ -113,6 +113,8 @@ struct Arms {
     a: Vec<f64>,
     b_prime: Vec<f64>,
     c1: Vec<f64>,
+    /// C2 を production の `isa::dot` で計算したもの（8 レーン試作とはビット一致しない）。
+    c2_isa: Vec<f64>,
 }
 
 fn compute_arms(f: &Fixture) -> Arms {
@@ -137,12 +139,19 @@ fn compute_arms(f: &Fixture) -> Arms {
         .iter_rows()
         .map(|r| c1_fused_distance(r, &f.query))
         .collect();
+    let kernel = isa::current();
+    let q_norm_sq = norm_sq_lanes(&f.query);
+    let c2_isa = f
+        .iter_rows()
+        .map(|r| c2_distance(kernel.dot(r, &f.query), norm_sq_lanes(r), q_norm_sq))
+        .collect();
     Arms {
         emu,
         exact,
         a,
         b_prime,
         c1,
+        c2_isa,
     }
 }
 
@@ -159,7 +168,8 @@ fn report_accuracy(kind: FixtureKind, f: &Fixture) {
         ("emu(f32 seq)", &arms.emu),
         ("A", &arms.a),
         ("B'", &arms.b_prime),
-        ("C1/C2", &arms.c1),
+        ("C1/C2(lanes)", &arms.c1),
+        ("C2(isa dot)", &arms.c2_isa),
     ];
     println!(
         "fixture={} dim={} min_d(emu)={:.3e}",
@@ -305,10 +315,12 @@ fn report_write_cost(f: &Fixture) {
 fn emit_sql_fixtures() -> Result<(), Box<dyn std::error::Error>> {
     const EMIT_DIM: usize = 128;
     const EMIT_ROWS: usize = 200;
+    let kernel = isa::current();
     println!("CREATE EXTENSION IF NOT EXISTS vector;");
     for kind in FixtureKind::ALL {
         let f = generate_fixture(kind, SEED ^ EMIT_DIM as u64, EMIT_DIM, EMIT_ROWS)?;
         let t = format!("t_{}", kind.name());
+        let q_norm_sq = norm_sq_lanes(&f.query);
         println!("DROP TABLE IF EXISTS {t};");
         println!("CREATE TABLE {t} (id int PRIMARY KEY, v vector({EMIT_DIM}));");
         for (i, r) in f.iter_rows().enumerate() {
@@ -320,11 +332,12 @@ fn emit_sql_fixtures() -> Result<(), Box<dyn std::error::Error>> {
         );
         for (i, r) in f.iter_rows().enumerate() {
             eprintln!(
-                "EXPECT\t{t}\t{i}\t{:e}\t{:e}\t{:e}\t{:e}",
+                "EXPECT\t{t}\t{i}\t{:e}\t{:e}\t{:e}\t{:e}\t{:e}",
                 pgvector_cosine_distance(r, &f.query),
                 exact_cosine_distance(r, &f.query),
                 c1_fused_distance(r, &f.query),
-                method_a_distance(r, &f.query)
+                method_a_distance(r, &f.query),
+                c2_distance(kernel.dot(r, &f.query), norm_sq_lanes(r), q_norm_sq)
             );
         }
     }
