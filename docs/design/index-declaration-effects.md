@@ -329,4 +329,3 @@ HNSW 経路の適格性ゲートは宣言の有無に加え、索引の距離種
   `sql::hnsw_cache::query_metric_of_bound` に集約済みで、#1977 で差し替える。
 - `hnsw_params:` の `metric=` は同じゲート結果から決める（`Targeted` は問い合わせ側、`MetricMismatch` は宣言側）。
 - 縮退先は既存の厳密経路で、RLS の可視集合には触れない（`tests/sql_named/sql33_opclass_mismatch.rs` で固定）。
-
