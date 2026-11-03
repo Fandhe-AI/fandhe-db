@@ -298,6 +298,10 @@ required_segments_for() {
     echo "18dot_i8_avx512_vnni"
     echo "15dot_i8_avx_vnni"
     echo "17dot_i8_avx2_widen"
+    # Issue #1988（SQL-33）: L1 距離カーネル `isa::l1_avx2_fma`／`l1_avx512`
+    # （`#[target_feature]` fn のため独立シンボルとして生成される）。
+    echo "11l1_avx2_fma"
+    echo "9l1_avx512"
   else
     echo "10SimdKernel20dot_with_scalar_tail"
     echo "10SimdKernel20dot_with_padded_tail"
@@ -316,6 +320,9 @@ required_segments_for() {
     # のため `#[inline(never)]` を付与しており（`dot_f16_neon_fp16`／
     # `dot_block4_neon` と同じ理由）独立シンボルとして必ず現れる。
     echo "19dot_i8_neon_dotprod"
+    # Issue #1988（SQL-33）: L1 距離カーネル `isa::l1_neon`。NEON は baseline の
+    # ため `#[inline(never)]` を付与しており独立シンボルとして必ず現れる。
+    echo "7l1_neon"
   fi
 }
 
@@ -359,6 +366,24 @@ expected_rules_for() {
       "dot_i8_avx2_widen" \
       '^[[:space:]]*vpmovsxbw[[:space:]]+[^,]*\(' \
       "i8->i16 sign-extend widen (vpmovsxbw) with a memory operand"
+    # Issue #1988: L1 距離カーネルが実際に SIMD の差分（vsubps）と絶対値
+    # （符号ビット除去 vandps／vpandd）へコンパイルされた証跡を要求する。
+    printf '%s\t%s\t%s\n' \
+      "l1_avx2_fma" \
+      '^[[:space:]]*vsubps[[:space:]].*%ymm' \
+      "f32x8 subtract (vsubps on %ymm) actually emitted (not scalarized)"
+    printf '%s\t%s\t%s\n' \
+      "l1_avx2_fma" \
+      '^[[:space:]]*vandps[[:space:]].*%ymm' \
+      "f32x8 abs via sign-mask (vandps on %ymm) actually emitted"
+    printf '%s\t%s\t%s\n' \
+      "l1_avx512" \
+      '^[[:space:]]*vsubps[[:space:]].*%zmm' \
+      "f32x16 subtract (vsubps on %zmm) actually emitted (not scalarized)"
+    printf '%s\t%s\t%s\n' \
+      "l1_avx512" \
+      '^[[:space:]]*(vpandd|vandps)[[:space:]].*%zmm' \
+      "f32x16 abs via sign-mask (vpandd/vandps on %zmm) actually emitted"
   else
     printf '%s\t%s\t%s\n' \
       "dot_f16_neon_fp16" \
@@ -377,6 +402,12 @@ expected_rules_for() {
       "dot_i8_neon_dotprod" \
       '^[[:space:]]*sdot[[:space:]]+v[0-9]+\.4s' \
       "s8x16->i32 dot-product-accumulate (sdot v.4s) actually emitted"
+    # Issue #1988: `|x - y|` が `fabd v.4s`（絶対差）または `fabs v.4s` へ
+    # ベクトル化された証跡を要求する。
+    printf '%s\t%s\t%s\n' \
+      "l1_neon" \
+      '^[[:space:]]*(fabd|fabs)[[:space:]]+v[0-9]+\.4s' \
+      "f32x4 abs-difference (fabd/fabs v.4s) actually emitted"
   fi
 }
 
@@ -862,6 +893,22 @@ pub mod isa_probe {
     }
 }
 RUST
+
+  # fail (Issue #1988): 関数名は `l1_avx2_fma` だが実体は SIMD 化されない
+  # スカラー逐次和（%ymm 上の `vsubps`／`vandps` を出さない）。L1 の非 vacuous 検査が
+  # 縮退を実際に検出できることを確認する。
+  cat > "${dir}/fx_fail_l1_missing_instruction.rs" <<'RUST'
+pub mod isa_probe {
+    #[inline(never)]
+    pub fn l1_avx2_fma(a: &[f32], b: &[f32]) -> f32 {
+        let mut acc = 0.0f32;
+        for (x, y) in a.iter().zip(b.iter()) {
+            acc = core::hint::black_box(acc + (x - y).abs());
+        }
+        acc
+    }
+}
+RUST
 }
 
 write_aarch64_fixtures() {
@@ -1277,6 +1324,16 @@ self_test() {
         overall=1
       else
         echo "self-test ok: fail_i8_missing_instruction correctly rejected"
+      fi
+    fi
+
+    asm="$(compile_fixture "${scratch}/fail_l1_missing_instruction" "${scratch}/fx_fail_l1_missing_instruction.rs" "${TARGET}")" || { overall=1; asm=""; }
+    if [ -n "${asm}" ]; then
+      if run_scan "${asm}" x86_64 "isa_probe" "11l1_avx2_fma" >/dev/null 2>&1; then
+        echo "self-test FAILED: expected fail_l1_missing_instruction to be rejected (no ymm vsubps)" >&2
+        overall=1
+      else
+        echo "self-test ok: fail_l1_missing_instruction correctly rejected"
       fi
     fi
   else
