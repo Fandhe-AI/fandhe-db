@@ -1777,6 +1777,9 @@ fn cached_hnsw_catalog_summary_in_txn(
 /// `gate_cache`（[`IndexCatalogGateCache`]）を経由して索引カタログ専用世代単位で
 /// 再利用する（codex-review P2 対応・PR #1124。Issue #1154 でストレージ全体
 /// 世代から専用世代へキーを切り替えた）。
+/// 本番の呼び出し元は Issue #1979 で [`hnsw_gate_in_txn`] へ移行済み。宣言の有無だけを見る旧判定は
+/// 単体テストの比較基準として残す。
+#[cfg(test)]
 pub(crate) fn hnsw_targeted_in_txn(
     read_txn: &redb::ReadTransaction,
     gate_cache: &IndexCatalogGateCache,
@@ -1798,6 +1801,86 @@ pub(crate) fn hnsw_targeted_in_txn(
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             false
         }
+    }
+}
+
+/// HNSW 経路の適格性ゲートの 3 状態判定結果（Issue #1979・INDEX-7・SQL-33・SQL-75）。
+/// `sql::exec`・`core.rs`（Rust API 検索・`EXPLAIN`）が [`hnsw_gate_in_txn`] から受け取り、
+/// 実行経路と `EXPLAIN` 表示の判断元を 1 つにする。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HnswGate {
+    /// opt-in なし・`Declared` で宣言なし・カタログ読み取り失敗（fail-closed）。厳密 brute-force。
+    NotTargeted,
+    /// 問い合わせ距離種別に合う HNSW を使える。`metric` は問い合わせ側の距離種別。
+    Targeted { metric: VectorOpClass },
+    /// 索引の距離種別が問い合わせの距離種別と合わない（または物理グラフが未対応）。
+    /// 近似を誤った距離で返さないよう厳密全走査へ縮退する。`index_metric` は表示用の宣言側 metric。
+    MetricMismatch { index_metric: VectorOpClass },
+}
+
+/// 物理 HNSW グラフが対応する距離種別か。現状のグラフはコサインだけ。
+/// opclass 別カーネル（Issue #1996・#1999）が入った時点でここを広げる。
+pub(crate) fn hnsw_supported_metric(metric: VectorOpClass) -> bool {
+    matches!(metric, VectorOpClass::Cosine)
+}
+
+/// 宣言された opclass 集合から表示用の索引 metric を決める（Issue #1978 の決定規則）。
+fn declared_index_metric(set: &std::collections::BTreeSet<VectorOpClass>) -> VectorOpClass {
+    if set.contains(&VectorOpClass::Cosine) {
+        VectorOpClass::Cosine
+    } else {
+        set.iter().next().copied().unwrap_or_default()
+    }
+}
+
+/// [`hnsw_targeted_in_txn`] に索引の距離種別（opclass）と問い合わせの距離種別の照合を加えた
+/// 3 状態ゲート（Issue #1979・INDEX-7・SQL-33・SQL-75）。
+///
+/// 実効の索引 metric 集合 E は、`HnswScope::All` では `{Cosine} ∪ 宣言`（All の暗黙のコサイン
+/// HNSW は宣言で変わらない）、`Declared` では宣言のみ。`query_metric ∈ E` かつ
+/// [`hnsw_supported_metric`] なら `Targeted`、それ以外は `MetricMismatch`。opt-in なし・`Declared`
+/// で宣言なし・カタログ読み取り失敗は `NotTargeted`（読み取り失敗は不一致へ写さず、
+/// `gate_read_failures` に計上して fail-closed）。要約は [`IndexCatalogGateCache`] を共有する。
+pub(crate) fn hnsw_gate_in_txn(
+    read_txn: &redb::ReadTransaction,
+    gate_cache: &IndexCatalogGateCache,
+    table: &str,
+    scope: crate::search_engine::HnswScope,
+    hnsw_available: bool,
+    query_metric: VectorOpClass,
+) -> HnswGate {
+    if !hnsw_available {
+        return HnswGate::NotTargeted;
+    }
+    let summary = match cached_hnsw_catalog_summary_in_txn(read_txn, gate_cache) {
+        Ok(summary) => summary,
+        Err(_) => {
+            gate_cache
+                .gate_read_failures
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return HnswGate::NotTargeted;
+        }
+    };
+    let declared = summary.hnsw_tables.get(table);
+    let (in_effective_set, index_metric) = match (scope, declared) {
+        (crate::search_engine::HnswScope::Declared, None) => return HnswGate::NotTargeted,
+        (crate::search_engine::HnswScope::Declared, Some(set)) => {
+            (set.contains(&query_metric), declared_index_metric(set))
+        }
+        (crate::search_engine::HnswScope::All, None) => {
+            (query_metric == VectorOpClass::Cosine, VectorOpClass::Cosine)
+        }
+        (crate::search_engine::HnswScope::All, Some(set)) => (
+            query_metric == VectorOpClass::Cosine || set.contains(&query_metric),
+            declared_index_metric(set),
+        ),
+    };
+    if in_effective_set && hnsw_supported_metric(query_metric) {
+        HnswGate::Targeted {
+            metric: query_metric,
+        }
+    } else {
+        HnswGate::MetricMismatch { index_metric }
     }
 }
 
@@ -26493,6 +26576,48 @@ mod tests {
             .create_index(&hnsw_def("idx_cos", "docs"))
             .expect("create cosine index");
         assert_eq!(metric("docs"), VectorOpClass::Cosine);
+    }
+
+    /// 3 状態ゲート `hnsw_gate_in_txn` の真理表（Issue #1979・INDEX-7）。scope × 宣言集合 ×
+    /// 問い合わせ metric × opt-in の有無を固定する。
+    #[test]
+    fn hnsw_gate_in_txn_truth_table_over_scope_declarations_and_query_metric() {
+        let (storage, _guard) = index_fixture_storage("index-hnsw-gate-truth-table");
+        let gate_cache = IndexCatalogGateCache::new();
+        let gate = |scope, available, q| {
+            let txn = storage.db().begin_read().expect("begin read");
+            hnsw_gate_in_txn(&txn, &gate_cache, "docs", scope, available, q)
+        };
+        let cos = VectorOpClass::Cosine;
+        let l2 = VectorOpClass::L2;
+        let mismatch = |m| HnswGate::MetricMismatch { index_metric: m };
+        let targeted = HnswGate::Targeted { metric: cos };
+
+        // 宣言なし。
+        assert_eq!(gate(HnswScope::All, true, cos), targeted);
+        assert_eq!(gate(HnswScope::All, true, l2), mismatch(cos));
+        assert_eq!(gate(HnswScope::Declared, true, cos), HnswGate::NotTargeted);
+        assert_eq!(gate(HnswScope::Declared, true, l2), HnswGate::NotTargeted);
+        // opt-in なしはカタログに触れず常に NotTargeted。
+        assert_eq!(gate(HnswScope::All, false, cos), HnswGate::NotTargeted);
+
+        // L2 だけを宣言。
+        let mut def = hnsw_def("idx_l2", "docs");
+        def.kind = IndexKind::Hnsw(l2);
+        storage.create_index(&def).expect("create l2 index");
+        // All は暗黙のコサインがあるので `<=>` の経路は変わらない。
+        assert_eq!(gate(HnswScope::All, true, cos), targeted);
+        assert_eq!(gate(HnswScope::Declared, true, cos), mismatch(l2));
+        // 宣言と一致しても物理グラフが未対応の距離種別は厳密へ倒す。
+        assert_eq!(gate(HnswScope::Declared, true, l2), mismatch(l2));
+        assert_eq!(gate(HnswScope::All, true, l2), mismatch(l2));
+
+        // コサインも宣言すると Declared でも Targeted。
+        storage
+            .create_index(&hnsw_def("idx_cos", "docs"))
+            .expect("create cosine index");
+        assert_eq!(gate(HnswScope::Declared, true, cos), targeted);
+        assert_eq!(gate(HnswScope::Declared, true, l2), mismatch(cos));
     }
 
     /// 対象列の検査: JSONB だけが受理され、JSON・TEXT・VECTOR・疑似列 `id`・不在列は拒否する。
