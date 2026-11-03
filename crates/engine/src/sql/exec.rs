@@ -170,7 +170,8 @@ fn try_alloc_bytes_for_budget(
     Ok(owned)
 }
 
-// `pool_depth = bound.limit.max(DEFAULT_HYBRID_POOL_DEPTH)` が常に
+// `pool_depth = bound.fetch_count().max(DEFAULT_HYBRID_POOL_DEPTH)`（取得件数 = `limit + offset`。
+// 束縛段が合計を設定値以下に検証済み。Issue #2008）が常に
 // `hybrid::RrfConfig::new` の検証（`1..=hybrid::MAX_POOL_DEPTH`）を通過するのは、
 // `bound.limit` の上限（設定可能なハード上限 `MAX_RESULT_ROWS_HARD_CAP`。`sql::parser::bind` が
 // 設定値 `<=` ハード上限で検証済み。Issue #1555）が
@@ -2144,12 +2145,15 @@ pub(crate) fn execute_statement_with_cache(
 
     let k_eff = if is_precision {
         if plan.scalar_prefilter {
-            bound.limit.max(2)
+            bound.fetch_count().max(2)
         } else {
             arena.ids().len().clamp(2, core::MAX_SEARCH_K)
         }
     } else {
-        bound.limit
+        // Issue #2008・SQL-33 (8)・SQL-73 (3): 取得件数は `LIMIT + OFFSET`。先頭 `OFFSET` 件は
+        // RLS 安全網の後で捨てる（下の `skip_front`）。HNSW・厳密走査・hybrid はいずれも
+        // この `k_eff` を探索件数として受けるため、経路間の恒等式が構造的に成り立つ。
+        bound.fetch_count()
     };
 
     // `!plan.scalar_prefilter`（DISTANCE 先行・SCALAR 事後フィルタ）の precision
@@ -2675,7 +2679,7 @@ pub(crate) fn execute_statement_with_cache(
             Ranking::Hybrid { .. } => precision_policy.hybrid(),
         };
         let want = bound
-            .limit
+            .fetch_count()
             .min(precision_policy.max_results())
             .saturating_add(1);
         let take_n = want.min(hits.len());
@@ -2715,7 +2719,7 @@ pub(crate) fn execute_statement_with_cache(
         let n = crate::precision::apply_gate(
             &conf,
             &thresholds,
-            bound.limit,
+            bound.fetch_count(),
             precision_policy.max_results(),
         )
         .map_err(|e| SqlSurfaceError::Internal {
@@ -2747,6 +2751,12 @@ pub(crate) fn execute_statement_with_cache(
         let visibility = arena.visibility(slot)?;
         Some((tenant, visibility))
     });
+    // Issue #2008・SQL-33 (8): 先頭 `OFFSET` 件の除去は必ず安全網の「後」に行う。安全網より前で
+    // 除去すると、後で除去される不可視行まで OFFSET の計数に入り、OFFSET の算術から不可視行の
+    // 存在が推測できる経路になる（RLS-7/8。広域取得 OFFSET の「可視行のみ計数」契約と同じ）。
+    // `offset == 0` は no-op。precision モードは「`LIMIT + OFFSET` の precision 結果から先頭
+    // `OFFSET` 件を除いたもの」と定義する（ゲートが `OFFSET` 件以下に絞れば空集合）。
+    let verified = verified.skip_front(bound.offset);
 
     // Issue #453: `defer_projection` が真のとき、`candidate_columns` は
     // 全スロットぶん空 `Vec` が積まれているだけ（`on_visible_row` の早期リターン・
