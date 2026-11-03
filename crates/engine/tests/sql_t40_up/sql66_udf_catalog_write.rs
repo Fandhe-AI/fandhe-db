@@ -271,3 +271,237 @@ fn drop_schema_cascade_removes_functions_in_the_schema() {
         "42723"
     );
 }
+// ---- Issue #2882: 複数文メッセージ（暗黙トランザクション）内の CREATE [OR REPLACE] FUNCTION ----
+// ポインタ: SQL-66（UDF カタログ）・WIRE-16（複数文メッセージ）・RECOVER-12（複数文単位の Tx）。
+// wire 層（`run_implicit_transaction`）が行う手順を engine API だけで再現する: 先頭で暗黙 Tx を開始し、
+// 文の失敗時は受信前のセッションスナップショットへ戻す。
+
+/// 暗黙 Tx で `stmts` を順に実行する。途中で失敗したらセッションを受信前へ戻して wire_code を返す。
+/// 全文成功なら commit して `Ok`（commit の失敗も wire_code）。
+fn run_message(
+    core: &EngineCore,
+    tenant: &str,
+    s: &mut SessionState,
+    stmts: &[&str],
+) -> Result<Vec<SqlOutcome>, String> {
+    let before = s.clone();
+    let mut txn = core.new_session_transaction();
+    core.begin_implicit_transaction(&mut txn, s)
+        .map_err(|e| e.wire_code().to_string())?;
+    let mut outs = Vec::new();
+    for sql in stmts {
+        match core.execute_sql_in_txn(&ctx(tenant), s, &mut txn, sql) {
+            Ok(o) => outs.push(o),
+            Err(e) => {
+                txn.abort_implicit();
+                *s = before;
+                return Err(e.wire_code().to_string());
+            }
+        }
+    }
+    match txn.commit_implicit(s) {
+        Ok(()) => Ok(outs),
+        Err(e) => {
+            txn.abort_implicit();
+            *s = before;
+            Err(e.wire_code().to_string())
+        }
+    }
+}
+
+/// 別接続（新しいセッション）を想定し、カタログを読み直した DDL セッションを返す。
+fn fresh_loaded(core: &EngineCore, tenant: &str) -> SessionState {
+    let mut s = ddl_session();
+    core.load_session_udfs(&ctx(tenant), &mut s)
+        .expect("load session udfs");
+    s
+}
+
+/// 後続文が失敗したメッセージでは、CREATE FUNCTION はカタログにもセッションにも残らない。
+#[test]
+fn failed_message_rolls_back_create_function_from_catalog_and_session() {
+    let path = unique_db_path("sql66-implicit-create-fail");
+    let _g = CleanupGuard(path.clone());
+    let core = open(&path);
+    let mut s = ddl_session();
+    setup_table(&core, "alice", &mut s);
+    core.load_session_udfs(&ctx("alice"), &mut s).expect("load");
+    let err = run_message(
+        &core,
+        "alice",
+        &mut s,
+        &[
+            "CREATE FUNCTION dbl(x) AS x * 2",
+            "SELECT id FROM no_such_table LIMIT 1",
+        ],
+    )
+    .expect_err("later statement fails");
+    assert_eq!(err, "42P01");
+    // 同じセッション: 次のメッセージでもロードし直されず呼べない（世代が進んでいない）。
+    core.refresh_session_udfs(&ctx("alice"), &mut s);
+    assert_eq!(code(&core, "alice", &mut s, CALL_DBL), "42883");
+    // 別接続からも見えない。同名の CREATE が成功する（カタログに残っていない）。
+    let mut other = fresh_loaded(&core, "alice");
+    assert_eq!(code(&core, "alice", &mut other, CALL_DBL), "42883");
+    ok(
+        &core,
+        "alice",
+        &mut other,
+        "CREATE FUNCTION dbl(x) AS x * 3",
+    );
+}
+
+/// 全文成功なら作成され、同じメッセージ内で呼べる。別接続・再オープン後も呼べる。
+#[test]
+fn successful_message_creates_function_visible_to_other_sessions_and_after_reopen() {
+    let path = unique_db_path("sql66-implicit-create-ok");
+    let _g = CleanupGuard(path.clone());
+    {
+        let core = open(&path);
+        let mut s = ddl_session();
+        setup_table(&core, "alice", &mut s);
+        let outs = run_message(
+            &core,
+            "alice",
+            &mut s,
+            &["CREATE FUNCTION dbl(x) AS x * 2", CALL_DBL],
+        )
+        .expect("message succeeds");
+        assert!(matches!(outs[0], SqlOutcome::CreateFunction { .. }));
+        assert!(matches!(outs[1], SqlOutcome::Query(_)));
+        let mut other = fresh_loaded(&core, "alice");
+        assert!(matches!(
+            ok(&core, "alice", &mut other, CALL_DBL),
+            SqlOutcome::Query(_)
+        ));
+    }
+    let core = open(&path);
+    let mut again = fresh_loaded(&core, "alice");
+    assert!(matches!(
+        ok(&core, "alice", &mut again, CALL_DBL),
+        SqlOutcome::Query(_)
+    ));
+}
+
+/// 他セッションは commit 前の途中状態を見ない。commit 後に再ロードすると見える。
+#[test]
+fn other_session_does_not_observe_uncommitted_create_function() {
+    let path = unique_db_path("sql66-implicit-create-invisible");
+    let _g = CleanupGuard(path.clone());
+    let core = open(&path);
+    let mut s = ddl_session();
+    setup_table(&core, "alice", &mut s);
+    let mut txn = core.new_session_transaction();
+    core.begin_implicit_transaction(&mut txn, &s)
+        .expect("begin");
+    core.execute_sql_in_txn(
+        &ctx("alice"),
+        &mut s,
+        &mut txn,
+        "CREATE FUNCTION dbl(x) AS x * 2",
+    )
+    .expect("create in txn");
+    let mut other = fresh_loaded(&core, "alice");
+    assert_eq!(code(&core, "alice", &mut other, CALL_DBL), "42883");
+    txn.commit_implicit(&mut s).expect("commit");
+    core.refresh_session_udfs(&ctx("alice"), &mut other);
+    assert!(matches!(
+        ok(&core, "alice", &mut other, CALL_DBL),
+        SqlOutcome::Query(_)
+    ));
+}
+
+/// CREATE OR REPLACE が後続文の失敗で巻き戻ると旧い本体のまま。成功すると新しい本体になる。
+#[test]
+fn failed_message_keeps_old_body_on_create_or_replace() {
+    let path = unique_db_path("sql66-implicit-replace");
+    let _g = CleanupGuard(path.clone());
+    let core = open(&path);
+    let mut s = ddl_session();
+    setup_table(&core, "alice", &mut s);
+    ok(&core, "alice", &mut s, "CREATE FUNCTION dbl(x) AS x * 2");
+    let value = |core: &EngineCore| {
+        let mut o = fresh_loaded(core, "alice");
+        format!("{:?}", ok(core, "alice", &mut o, CALL_DBL))
+    };
+    let before = value(&core);
+    run_message(
+        &core,
+        "alice",
+        &mut s,
+        &[
+            "CREATE OR REPLACE FUNCTION dbl(x) AS x * 3",
+            "SELECT id FROM no_such_table LIMIT 1",
+        ],
+    )
+    .expect_err("later statement fails");
+    assert_eq!(value(&core), before);
+    run_message(
+        &core,
+        "alice",
+        &mut s,
+        &["CREATE OR REPLACE FUNCTION dbl(x) AS x * 3", "SELECT 1"],
+    )
+    .expect("message succeeds");
+    assert_ne!(value(&core), before);
+}
+
+/// 明示トランザクション内の DDL セッションの CREATE FUNCTION は従来どおり 0A000。暗黙 Tx 内の
+/// DROP FUNCTION も 0A000 で、同じメッセージの先行する CREATE FUNCTION も残らない（fail-closed）。
+#[test]
+fn explicit_txn_create_and_implicit_txn_drop_stay_unsupported() {
+    let path = unique_db_path("sql66-implicit-unsupported");
+    let _g = CleanupGuard(path.clone());
+    let core = open(&path);
+    let mut s = ddl_session();
+    setup_table(&core, "alice", &mut s);
+    let mut txn = core.new_session_transaction();
+    core.execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, "BEGIN")
+        .expect("begin");
+    let e = core
+        .execute_sql_in_txn(
+            &ctx("alice"),
+            &mut s,
+            &mut txn,
+            "CREATE FUNCTION dbl(x) AS x * 2",
+        )
+        .expect_err("explicit txn");
+    assert_eq!(e.wire_code(), "0A000");
+    let mut s = ddl_session();
+    ok(&core, "alice", &mut s, "CREATE FUNCTION keep(x) AS x");
+    let err = run_message(
+        &core,
+        "alice",
+        &mut s,
+        &["CREATE FUNCTION dbl(x) AS x * 2", "DROP FUNCTION keep"],
+    )
+    .expect_err("drop in implicit txn");
+    assert_eq!(err, "0A000");
+    let mut other = fresh_loaded(&core, "alice");
+    assert_eq!(code(&core, "alice", &mut other, CALL_DBL), "42883");
+    ok(&core, "alice", &mut other, "CREATE FUNCTION dbl(x) AS x");
+    assert_eq!(
+        code(&core, "alice", &mut other, "CREATE FUNCTION keep(x) AS x"),
+        "42723"
+    );
+}
+
+/// テナント境界（P0）: alice の成功したメッセージの定義は bob から見えず、bob は同名を独立に作れる。
+#[test]
+fn implicit_create_function_does_not_cross_tenants() {
+    let path = unique_db_path("sql66-implicit-tenant");
+    let _g = CleanupGuard(path.clone());
+    let core = open(&path);
+    let mut a = ddl_session();
+    setup_table(&core, "alice", &mut a);
+    run_message(
+        &core,
+        "alice",
+        &mut a,
+        &["CREATE FUNCTION dbl(x) AS x * 2", "SELECT 1"],
+    )
+    .expect("alice message");
+    let mut b2 = fresh_loaded(&core, "bob");
+    assert_eq!(code(&core, "bob", &mut b2, CALL_DBL), "42883");
+    ok(&core, "bob", &mut b2, "CREATE FUNCTION dbl(x) AS x * 5");
+}

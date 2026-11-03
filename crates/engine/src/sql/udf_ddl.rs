@@ -190,6 +190,20 @@ fn precheck_catalog_capacity(
         .map_err(map_function_error)
 }
 
+/// UDF カタログへの書き込み先（Issue #2882）。`core.rs` の `CREATE [OR REPLACE] FUNCTION` の実行が選ぶ。
+///
+/// - `Autocommit`: 文ごとに独立した write txn・1 回の commit で確定し、commit 後に世代を進める（従来経路）。
+/// - `InTxn`: 複数文メッセージの暗黙トランザクションが保持する共有 write txn に書く。commit はしない。
+///   世代の bump は暗黙トランザクションの commit 成功後に `sql::transaction` が行う（失敗時は
+///   カタログごと巻き戻り、他セッションからは途中の状態が見えない）。
+#[derive(Clone, Copy)]
+pub(crate) enum CatalogWrite<'a> {
+    /// 独立した write txn で確定する。
+    Autocommit,
+    /// 呼び出し元が保持する共有 write txn に書く。
+    InTxn(&'a redb::WriteTransaction),
+}
+
 /// `CREATE FUNCTION` をカタログへ永続化してセッションへ登録する（DDL 権限のあるセッション用）。
 ///
 /// `max_functions` は起動時設定の件数上限（Issue #1922。ハード上限で飽和される）。
@@ -210,6 +224,7 @@ pub(crate) fn execute_create_function_persistent(
     body_source: &str,
     max_functions: usize,
     attrs: &FunctionAttributes,
+    target: CatalogWrite<'_>,
 ) -> Result<(), SqlSurfaceError> {
     // 判定順（設計文書）は 重複 → 件数 → 引数数 → 本体。カタログ側の重複・件数は本体検証より前に
     // 先行判定し、書き込み時の排他的な再検査（`create_function_with_limit`）は権威として残す。
@@ -225,9 +240,16 @@ pub(crate) fn execute_create_function_persistent(
     reject_session_local_dependency(session, &prepared.body)?;
     let def = catalog_def_from_prepared(&prepared, body_source, attrs)?;
     let owner_guard = arm_creator_as_owner(tenant_id, session, &def.function_key);
-    storage
-        .create_function_with_limit(tenant_id, &def, max_functions)
-        .map_err(map_function_error)?;
+    match target {
+        CatalogWrite::Autocommit => storage
+            .create_function_with_limit(tenant_id, &def, max_functions)
+            .map(|_| ()),
+        CatalogWrite::InTxn(w) => {
+            crate::catalog::function::create_function_in_txn(w, tenant_id, &def, max_functions, &[])
+                .map(|_| ())
+        }
+    }
+    .map_err(map_function_error)?;
     drop(owner_guard);
     let key = prepared.key.clone();
     commit_function_definition(session.udfs_mut(), prepared);
@@ -255,6 +277,7 @@ pub(crate) fn execute_create_or_replace_function_persistent(
     body_source: &str,
     max_functions: usize,
     attrs: &FunctionAttributes,
+    target: CatalogWrite<'_>,
 ) -> Result<(), SqlSurfaceError> {
     // 置換（カタログに同名の定義がある）は件数を増やさないため先行の件数判定を省く。新規作成になる
     // ときだけ本体検証より前に件数を判定する（write txn 内の再検査は権威として残す）。
@@ -271,33 +294,46 @@ pub(crate) fn execute_create_or_replace_function_persistent(
     let def = catalog_def_from_prepared(&prepared, body_source, attrs)?;
     // 循環検査はセッションのレジストリ（古い可能性がある）ではなく、write txn 内の最新カタログで
     // 再度行う（並行する別セッションの置換との合成で循環が残るのを防ぐ）。
-    let target = prepared.key.to_ascii_lowercase();
+    let target_key = prepared.key.to_ascii_lowercase();
     let new_body = &prepared.body;
     let owner_guard = arm_creator_as_owner(tenant_id, session, &def.function_key);
-    storage
-        .replace_function_checked(tenant_id, &def, max_functions, &|latest| {
-            let mut bodies = std::collections::BTreeMap::new();
-            for d in latest {
-                let lower = d.function_key.to_ascii_lowercase();
-                if lower == target || d.language != FunctionLanguage::Declarative {
-                    continue;
-                }
-                let Ok(tokens) = crate::sql::lexer::tokenize_rendered(&d.body_source) else {
-                    continue;
-                };
-                let Ok(body) = crate::sql::allowlist::parse_stored_function_body(&tokens) else {
-                    continue;
-                };
-                bodies.insert(lower, body);
+    let check = |latest: &[FunctionDef]| -> Result<(), CatalogError> {
+        let mut bodies = std::collections::BTreeMap::new();
+        for d in latest {
+            let lower = d.function_key.to_ascii_lowercase();
+            if lower == target_key || d.language != FunctionLanguage::Declarative {
+                continue;
             }
-            if body_reaches_function(new_body, &target, &bodies) {
-                return Err(CatalogError::Invalid(
-                    FUNCTION_RECURSIVE_MESSAGE.to_string(),
-                ));
-            }
-            Ok(())
-        })
-        .map_err(map_function_error)?;
+            let Ok(tokens) = crate::sql::lexer::tokenize_rendered(&d.body_source) else {
+                continue;
+            };
+            let Ok(body) = crate::sql::allowlist::parse_stored_function_body(&tokens) else {
+                continue;
+            };
+            bodies.insert(lower, body);
+        }
+        if body_reaches_function(new_body, &target_key, &bodies) {
+            return Err(CatalogError::Invalid(
+                FUNCTION_RECURSIVE_MESSAGE.to_string(),
+            ));
+        }
+        Ok(())
+    };
+    match target {
+        CatalogWrite::Autocommit => {
+            storage.replace_function_checked(tenant_id, &def, max_functions, &check)
+        }
+        CatalogWrite::InTxn(w) => crate::catalog::function::replace_function_in_txn(
+            w,
+            tenant_id,
+            &def,
+            max_functions,
+            &check,
+            &[],
+        ),
+    }
+    .map(|_| ())
+    .map_err(map_function_error)?;
     // 置換は既存の所有者を変えない（新規に作った場合だけ、catalog が同じ txn で作成者を所有者にする。#2236）。
     drop(owner_guard);
     let key = prepared.key.clone();
@@ -335,6 +371,7 @@ pub(crate) struct RoutineSpec<'a> {
 /// OR REPLACE が宣言的 UDF を置き換えた場合は、commit 後にセッションの旧本体の展開を取り除く。
 ///
 /// [`UdfRegistry`]: crate::sql::udf_call::UdfRegistry
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_create_routine_persistent(
     storage: &Storage,
     tenant_id: &str,
@@ -343,6 +380,7 @@ pub(crate) fn execute_create_routine_persistent(
     or_replace: bool,
     max_functions: usize,
     validate: &dyn Fn() -> Result<Vec<FunctionDependency>, SqlSurfaceError>,
+    target: CatalogWrite<'_>,
 ) -> Result<(), SqlSurfaceError> {
     let name = spec.name;
     crate::catalog::validate_relation_key(name)
@@ -434,18 +472,45 @@ pub(crate) fn execute_create_routine_persistent(
         // 関数間の循環は、標準形の依存辺について write txn 内で検査される（`replace_function_with_deps`）。
         // 辺を持たない新定義は別の定義を呼ばないため、置換で辺だけが消える。
         let owner_guard = arm_creator_as_owner(tenant_id, session, &def.function_key);
-        storage
-            .replace_function_with_deps(tenant_id, &def, max_functions, &|_| Ok(()), &dependencies)
-            .map_err(map_function_error)?;
+        match target {
+            CatalogWrite::Autocommit => storage.replace_function_with_deps(
+                tenant_id,
+                &def,
+                max_functions,
+                &|_| Ok(()),
+                &dependencies,
+            ),
+            CatalogWrite::InTxn(w) => crate::catalog::function::replace_function_in_txn(
+                w,
+                tenant_id,
+                &def,
+                max_functions,
+                &|_| Ok(()),
+                &dependencies,
+            ),
+        }
+        .map(|_| ())
+        .map_err(map_function_error)?;
         // 置換は既存の所有者を変えない（新規に作った場合だけ、catalog が同じ txn で作成者を所有者にする。#2236）。
         drop(owner_guard);
         // 宣言的 UDF を置き換えた場合、セッションに旧本体の展開が残らないよう取り除く。
         session.udfs_mut().remove(name);
     } else {
         let owner_guard = arm_creator_as_owner(tenant_id, session, &def.function_key);
-        storage
-            .create_function_with_deps(tenant_id, &def, max_functions, &dependencies)
-            .map_err(map_function_error)?;
+        match target {
+            CatalogWrite::Autocommit => {
+                storage.create_function_with_deps(tenant_id, &def, max_functions, &dependencies)
+            }
+            CatalogWrite::InTxn(w) => crate::catalog::function::create_function_in_txn(
+                w,
+                tenant_id,
+                &def,
+                max_functions,
+                &dependencies,
+            ),
+        }
+        .map(|_| ())
+        .map_err(map_function_error)?;
         drop(owner_guard);
     }
     // commit 後に同じセッションへ登録する（すぐ呼べるようにする。他セッションは世代で refresh）。
@@ -770,6 +835,7 @@ mod tests {
             "g ( x )",
             crate::catalog::function::MAX_FUNCTIONS,
             &FunctionAttributes::default(),
+            CatalogWrite::Autocommit,
         )
         .expect("f -> g");
         // b のレジストリは f を単純な本体だと思っているため、レジストリ上の検査は通る。
@@ -785,6 +851,7 @@ mod tests {
             "f ( x )",
             crate::catalog::function::MAX_FUNCTIONS,
             &FunctionAttributes::default(),
+            CatalogWrite::Autocommit,
         )
         .expect_err("g -> f must be rejected by the catalog-level check");
         assert_eq!(err.wire_code(), "0A000");
@@ -812,6 +879,7 @@ mod tests {
                 body,
                 1,
                 &FunctionAttributes::default(),
+                CatalogWrite::Autocommit,
             )
         };
         let replace = |s: &mut SessionState, name: &str, body: &str| {
@@ -827,6 +895,7 @@ mod tests {
                 body,
                 1,
                 &FunctionAttributes::default(),
+                CatalogWrite::Autocommit,
             )
         };
         create(&mut s, "f", &p, "x").expect("first function");

@@ -77,13 +77,13 @@ wire 層（`crates/wire-server/src/simple_query.rs`）は SQL の字句知識を
   `SHOW`（`SHOW PARTITIONED DML`。Issue #1129）・`DECLARE`／`FETCH`／`CLOSE`
   （カーソル。WIRE-15）・`WITH`（非再帰 CTE。主クエリは広域取得に限る）・
   `COPY ... TO STDOUT`（Issue #1175）。
-- `StatementEffect::SessionLocal`: `SET ...`・`CREATE FUNCTION ...`。
+- `StatementEffect::SessionLocal`: `SET ...`・`RESET ROLE`（`CREATE FUNCTION` は UDF カタログへ書くため
+  `Write`。Issue #2882）。
 - `StatementEffect::TransactionControl(TxnControl)`: `BEGIN`／`COMMIT`／
   `ROLLBACK`（SQL-31・TASK-221）。`check_write_placement` がトランザクション
   状態を模擬する際の遷移点になる。
 - `StatementEffect::Write`: `INSERT`（UPSERT 含む）・`UPDATE`・`DELETE`・
-  `TRUNCATE`・`COPY ... FROM STDIN`（方向語なしを含む）・DDL 系（`FUNCTION` 以外が
-  続く `CREATE`・`DROP`・`ALTER`）・`CANCEL`、および読み取り専用・セッション局所・
+  `TRUNCATE`・`COPY ... FROM STDIN`（方向語なしを含む）・`CREATE FUNCTION`（Issue #2882）・DDL 系（`CREATE`・`DROP`・`ALTER`）・`CANCEL`、および読み取り専用・セッション局所・
   トランザクション制御のいずれとも判定できない未知の先頭語（fail-closed の既定。将来 engine に
   書き込み系構文が追加された場合に誤って許可しないための安全側の既定）。
 - `StatementEffect::Rejected`: 字句解析に失敗する文、および字句解析には
@@ -159,8 +159,8 @@ commit は高々 1 回という既存の不変条件を維持するため）。
 
 ### セッション状態の巻き戻し
 
-複数文メッセージの途中でエラーが発生した場合、`SET search_mode`・
-`CREATE FUNCTION` によるセッション局所の変更もメッセージ受信前の値へ巻き戻す
+複数文メッセージの途中でエラーが発生した場合、`SET search_mode` によるセッション局所の変更と、
+`CREATE FUNCTION` のセッションへの登録もメッセージ受信前の値へ巻き戻す
 （PostgreSQL の暗黙トランザクション内で `SET` が巻き戻るのと同じ意味論）。
 `execute_and_respond` が複数文モードへ入る際に `SessionState`（`Clone`
 導出済み）のスナップショットを取得しておき、いずれかの文が失敗した時点で
@@ -218,7 +218,7 @@ SQL-31（`BEGIN`/`COMMIT`/`ROLLBACK`）・RECOVER-12（複数文単位の
   対象外であり、HTTP への射影変更もない。
 - 3 クライアント e2e（`three_client_e2e.rs` 等）への追加は opt-in の任意
   追加に留め、本 Issue では必須にしない。
-- 暗黙トランザクション内での DDL（COPY は Issue #1773 で対応済み。ファイル形 `INSERT` と書き込み済みテーブルの読み取りは
+- 暗黙トランザクション内での DDL（`CREATE [OR REPLACE] FUNCTION` は Issue #2882 で対応済み。`udf-catalog.md`。COPY は Issue #1773 で対応済み。ファイル形 `INSERT` と書き込み済みテーブルの読み取りは
   #1179・#1353 の成果を自動的に引き継いで受理済み）。`BEGIN` より前の書き込みを明示ブロックへ昇格させる PostgreSQL の
   意味論（`INSERT; BEGIN; ...`）、lexer でのコメント・二重引用符識別子・ドル引用・
   E 文字列の受理、拡張クエリプロトコルでの暗黙トランザクション（Sync 単位）も対象外。

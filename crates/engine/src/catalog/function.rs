@@ -1074,6 +1074,150 @@ pub(crate) enum ReplaceOutcome {
     Replaced,
 }
 
+/// `CREATE FUNCTION` の本体を、呼び出し元が持つ write txn の中で行う（begin・commit・世代の bump を
+/// 含まない）。単独実行は [`Storage::create_function_with_deps`]、複数文メッセージの暗黙トランザクションは
+/// 共有 write txn を渡して使う（Issue #2882。世代は呼び出し元が commit 成功後に進める）。
+pub(crate) fn create_function_in_txn(
+    write_txn: &redb::WriteTransaction,
+    scope: &str,
+    def: &FunctionDef,
+    max_functions: usize,
+    deps: &[super::function_dependency::FunctionDependency],
+) -> Result<u64> {
+    validate_scope(scope)?;
+    // 設定値でハード上限（読み取り側の上限でもある）を超えさせない（fail-closed）。
+    let max_functions = max_functions.min(MAX_FUNCTIONS);
+    let mut stored = def.clone();
+    stored.function_key = normalize_key(&def.function_key)?;
+    stored.id = 1;
+    // 形状・上限の検証。
+    encode_function_def(&stored)?;
+    let signature = arg_signature(&stored.params)?;
+    // SCHEMA 配下形のキーは、挿入と同じ write txn で当該テナントの SCHEMA の現存を確認する
+    // （名前解決後の `DROP SCHEMA` との競合で孤児定義を作らない。Issue #1920）。
+    super::namespace::ensure_tenant_key_schema_alive_in_txn(
+        write_txn,
+        scope,
+        &stored.function_key,
+    )?;
+    // 同じ名前の定義が 1 件でもあれば、シグネチャが違っても既存扱いにする（`UdfRegistry` は
+    // 名前単位で多重定義を持てず、書けても読めない永続状態を作らないため。設計記録 §書き込み経路）。
+    if !list_in_txn(write_txn, scope, Some(&stored.function_key))?.is_empty() {
+        return Err(CatalogError::Invalid(
+            FUNCTION_ALREADY_EXISTS_MESSAGE.to_string(),
+        ));
+    }
+    if count_functions_capped(write_txn, scope, max_functions)? >= max_functions {
+        return Err(CatalogError::ViewLimitExceeded(
+            "too many functions".to_string(),
+        ));
+    }
+    verify_dependencies_in_txn(write_txn, scope, &stored.function_key, deps)?;
+    stored.id = allocate_function_id_in_txn(write_txn)?;
+    insert_function_in_txn(write_txn, scope, &stored, &signature)?;
+    // 予約された作成者を所有者として同じ txn に書く（Issue #2236。別 txn だと DROP・同名再作成と競合する）。
+    super::privilege::owner::apply_pending_function_owner_in_txn(
+        write_txn,
+        scope,
+        &stored.function_key,
+        stored.id,
+    )?;
+    super::function_dependency::replace_edges_in_txn(
+        write_txn,
+        scope,
+        &stored.function_key,
+        &signature,
+        deps,
+    )?;
+    Ok(stored.id)
+}
+
+/// `CREATE OR REPLACE FUNCTION` の本体を、呼び出し元が持つ write txn の中で行う（begin・commit・世代の
+/// bump を含まない）。単独実行は [`Storage::replace_function_with_limit`]、複数文メッセージの暗黙
+/// トランザクションは共有 write txn を渡して使う（Issue #2882。世代は呼び出し元が commit 成功後に進める）。
+pub(crate) fn replace_function_in_txn(
+    write_txn: &redb::WriteTransaction,
+    scope: &str,
+    def: &FunctionDef,
+    max_functions: usize,
+    check: &dyn Fn(&[FunctionDef]) -> Result<()>,
+    deps: &[super::function_dependency::FunctionDependency],
+) -> Result<ReplaceOutcome> {
+    validate_scope(scope)?;
+    // 設定値でハード上限を超えさせない（fail-closed。Issue #1922）。
+    let max_functions = max_functions.min(MAX_FUNCTIONS);
+    let mut stored = def.clone();
+    stored.function_key = normalize_key(&def.function_key)?;
+    stored.id = 1;
+    encode_function_def(&stored)?;
+    let signature = arg_signature(&stored.params)?;
+    super::namespace::ensure_tenant_key_schema_alive_in_txn(
+        write_txn,
+        scope,
+        &stored.function_key,
+    )?;
+    let existing = list_in_txn(write_txn, scope, Some(&stored.function_key))?;
+    let outcome = match existing.as_slice() {
+        [] => {
+            if count_functions_capped(write_txn, scope, max_functions)? >= max_functions {
+                return Err(CatalogError::ViewLimitExceeded(
+                    "too many functions".to_string(),
+                ));
+            }
+            stored.id = allocate_function_id_in_txn(write_txn)?;
+            ReplaceOutcome::Created
+        }
+        [old] if arg_signature(&old.params)? == signature => {
+            let same_names = old.params.len() == stored.params.len()
+                && old
+                    .params
+                    .iter()
+                    .zip(&stored.params)
+                    .all(|(a, b)| a.name == b.name);
+            if !same_names {
+                return Err(CatalogError::Invalid(
+                    FUNCTION_CANNOT_CHANGE_PARAM_NAME_MESSAGE.to_string(),
+                ));
+            }
+            if old.return_type != stored.return_type || old.return_shape != stored.return_shape {
+                return Err(CatalogError::Invalid(
+                    FUNCTION_CANNOT_CHANGE_RETURN_TYPE_MESSAGE.to_string(),
+                ));
+            }
+            stored.id = old.id;
+            ReplaceOutcome::Replaced
+        }
+        _ => {
+            return Err(CatalogError::Invalid(
+                FUNCTION_ALREADY_EXISTS_MESSAGE.to_string(),
+            ));
+        }
+    };
+    // 最新カタログ（この txn が見ている全定義）に対する検査。失敗なら commit せず破棄する。
+    let latest = list_in_txn(write_txn, scope, None)?;
+    check(&latest)?;
+    verify_dependencies_in_txn(write_txn, scope, &stored.function_key, deps)?;
+    insert_function_in_txn(write_txn, scope, &stored, &signature)?;
+    // 新規に作った（既存定義なし）ときだけ、予約された作成者を所有者として同じ txn に書く
+    // （置換は既存の所有者を変えない。Issue #2236）。
+    if outcome == ReplaceOutcome::Created {
+        super::privilege::owner::apply_pending_function_owner_in_txn(
+            write_txn,
+            scope,
+            &stored.function_key,
+            stored.id,
+        )?;
+    }
+    super::function_dependency::replace_edges_in_txn(
+        write_txn,
+        scope,
+        &stored.function_key,
+        &signature,
+        deps,
+    )?;
+    Ok(outcome)
+}
+
 impl Storage {
     /// `CREATE OR REPLACE FUNCTION` の永続化（SQL-66 (2)・Issue #1917）。単一 write txn・1 回の
     /// commit で、同名の定義を数える。0 件なら [`Self::create_function`] と同じ経路で作る。1 件で引数
@@ -1118,6 +1262,7 @@ impl Storage {
     }
 
     /// [`Self::replace_function`] の本体（件数上限を引数にしてテストで小さい値を注入する）。
+    /// 自前の write txn を開いて [`replace_function_in_txn`] を呼び、commit 成功後にだけ世代を進める。
     fn replace_function_with_limit(
         &self,
         scope: &str,
@@ -1127,79 +1272,10 @@ impl Storage {
         deps: &[super::function_dependency::FunctionDependency],
     ) -> Result<ReplaceOutcome> {
         validate_scope(scope)?;
-        let mut stored = def.clone();
-        stored.function_key = normalize_key(&def.function_key)?;
-        stored.id = 1;
-        encode_function_def(&stored)?;
-        let signature = arg_signature(&stored.params)?;
         let write_txn = self
             .begin_write_txn()
             .map_err(super::convert_storage_error)?;
-        super::namespace::ensure_tenant_key_schema_alive_in_txn(
-            &*write_txn,
-            scope,
-            &stored.function_key,
-        )?;
-        let existing = list_in_txn(&*write_txn, scope, Some(&stored.function_key))?;
-        let outcome = match existing.as_slice() {
-            [] => {
-                if count_functions_capped(&*write_txn, scope, max_functions)? >= max_functions {
-                    return Err(CatalogError::ViewLimitExceeded(
-                        "too many functions".to_string(),
-                    ));
-                }
-                stored.id = allocate_function_id_in_txn(&write_txn)?;
-                ReplaceOutcome::Created
-            }
-            [old] if arg_signature(&old.params)? == signature => {
-                let same_names = old.params.len() == stored.params.len()
-                    && old
-                        .params
-                        .iter()
-                        .zip(&stored.params)
-                        .all(|(a, b)| a.name == b.name);
-                if !same_names {
-                    return Err(CatalogError::Invalid(
-                        FUNCTION_CANNOT_CHANGE_PARAM_NAME_MESSAGE.to_string(),
-                    ));
-                }
-                if old.return_type != stored.return_type || old.return_shape != stored.return_shape
-                {
-                    return Err(CatalogError::Invalid(
-                        FUNCTION_CANNOT_CHANGE_RETURN_TYPE_MESSAGE.to_string(),
-                    ));
-                }
-                stored.id = old.id;
-                ReplaceOutcome::Replaced
-            }
-            _ => {
-                return Err(CatalogError::Invalid(
-                    FUNCTION_ALREADY_EXISTS_MESSAGE.to_string(),
-                ));
-            }
-        };
-        // 最新カタログ（この txn が見ている全定義）に対する検査。失敗なら commit せず破棄する。
-        let latest = list_in_txn(&*write_txn, scope, None)?;
-        check(&latest)?;
-        verify_dependencies_in_txn(&write_txn, scope, &stored.function_key, deps)?;
-        insert_function_in_txn(&write_txn, scope, &stored, &signature)?;
-        // 新規に作った（既存定義なし）ときだけ、予約された作成者を所有者として同じ txn に書く
-        // （置換は既存の所有者を変えない。Issue #2236）。
-        if outcome == ReplaceOutcome::Created {
-            super::privilege::owner::apply_pending_function_owner_in_txn(
-                &write_txn,
-                scope,
-                &stored.function_key,
-                stored.id,
-            )?;
-        }
-        super::function_dependency::replace_edges_in_txn(
-            &write_txn,
-            scope,
-            &stored.function_key,
-            &signature,
-            deps,
-        )?;
+        let outcome = replace_function_in_txn(&write_txn, scope, def, max_functions, check, deps)?;
         crate::recovery::commit_boundary::commit(write_txn)
             .map_err(super::convert_storage_error)?;
         // commit 成功後にだけ世代を進める（他セッションの refresh が置換後の本体を読み直す）。
@@ -1237,58 +1313,15 @@ impl Storage {
         deps: &[super::function_dependency::FunctionDependency],
     ) -> Result<u64> {
         validate_scope(scope)?;
-        // 設定値でハード上限（読み取り側の上限でもある）を超えさせない（fail-closed）。
-        let max_functions = max_functions.min(MAX_FUNCTIONS);
-        let mut stored = def.clone();
-        stored.function_key = normalize_key(&def.function_key)?;
-        stored.id = 1;
-        // 形状・上限の検証（write txn に入る前に拒否する）。
-        encode_function_def(&stored)?;
-        let signature = arg_signature(&stored.params)?;
         let write_txn = self
             .begin_write_txn()
             .map_err(super::convert_storage_error)?;
-        // SCHEMA 配下形のキーは、挿入と同じ write txn で当該テナントの SCHEMA の現存を確認する
-        // （名前解決後の `DROP SCHEMA` との競合で孤児定義を作らない。Issue #1920）。
-        super::namespace::ensure_tenant_key_schema_alive_in_txn(
-            &*write_txn,
-            scope,
-            &stored.function_key,
-        )?;
-        // 同じ名前の定義が 1 件でもあれば、シグネチャが違っても既存扱いにする（`UdfRegistry` は
-        // 名前単位で多重定義を持てず、書けても読めない永続状態を作らないため。設計記録 §書き込み経路）。
-        if !list_in_txn(&*write_txn, scope, Some(&stored.function_key))?.is_empty() {
-            return Err(CatalogError::Invalid(
-                FUNCTION_ALREADY_EXISTS_MESSAGE.to_string(),
-            ));
-        }
-        if count_functions_capped(&*write_txn, scope, max_functions)? >= max_functions {
-            return Err(CatalogError::ViewLimitExceeded(
-                "too many functions".to_string(),
-            ));
-        }
-        verify_dependencies_in_txn(&write_txn, scope, &stored.function_key, deps)?;
-        stored.id = allocate_function_id_in_txn(&write_txn)?;
-        insert_function_in_txn(&write_txn, scope, &stored, &signature)?;
-        // 予約された作成者を所有者として同じ txn に書く（Issue #2236。別 txn だと DROP・同名再作成と競合する）。
-        super::privilege::owner::apply_pending_function_owner_in_txn(
-            &write_txn,
-            scope,
-            &stored.function_key,
-            stored.id,
-        )?;
-        super::function_dependency::replace_edges_in_txn(
-            &write_txn,
-            scope,
-            &stored.function_key,
-            &signature,
-            deps,
-        )?;
+        let id = create_function_in_txn(&write_txn, scope, def, max_functions, deps)?;
         crate::recovery::commit_boundary::commit(write_txn)
             .map_err(super::convert_storage_error)?;
         // commit 成功後にだけ世代を進める（他セッションの refresh が検知する。SQL-66・#1921）。
         self.bump_function_generation(scope);
-        Ok(stored.id)
+        Ok(id)
     }
 
     /// 本体検証より前に行う、カタログ側の重複・件数の先行判定（読み取り専用。Issue #1922）。
@@ -1523,6 +1556,26 @@ mod tests {
             attrs: FunctionAttributes::default(),
             standard_body: false,
         }
+    }
+
+    /// Issue #2882: 共有 write txn への `_in_txn` 書き込みは、txn を破棄（abort）するとカタログに残らず、
+    /// 世代も進まない。commit した場合も、世代の bump は呼び出し元の責務なので `_in_txn` 自体は進めない。
+    #[test]
+    fn in_txn_create_is_rolled_back_by_abort_and_never_bumps_generation() {
+        let (storage, _g) = tmp_storage("fn-in-txn-abort");
+        let d = def("f", vec![param(Some("x"), None)]);
+        let txn = storage.begin_write_txn().expect("begin");
+        create_function_in_txn(&txn, "t", &d, MAX_FUNCTIONS, &[]).expect("create in txn");
+        replace_function_in_txn(&txn, "t", &d, MAX_FUNCTIONS, &|_| Ok(()), &[]).expect("replace");
+        drop(txn);
+        assert!(storage.list_functions("t").expect("list").is_empty());
+        assert_eq!(storage.function_generation("t"), 0);
+
+        let txn = storage.begin_write_txn().expect("begin");
+        create_function_in_txn(&txn, "t", &d, MAX_FUNCTIONS, &[]).expect("create in txn");
+        crate::recovery::commit_boundary::commit(txn).expect("commit");
+        assert_eq!(storage.list_functions("t").expect("list").len(), 1);
+        assert_eq!(storage.function_generation("t"), 0);
     }
 
     /// Issue #2219: 標準形の目印ビットが往復し、目印の無い blob（既存の形）の decode は変わらない。

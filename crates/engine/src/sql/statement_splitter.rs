@@ -134,8 +134,8 @@ impl ClassifiedError for MultiStatementError {
 pub enum StatementEffect {
     /// 検索 SELECT・`EXPLAIN`（読み取り専用。commit を伴わない）。
     ReadOnly,
-    /// `SET ...`・`CREATE FUNCTION ...`（接続セッション内で完結し、redb commit を
-    /// 伴わない）。
+    /// `SET ...`・`RESET ROLE`（接続セッション内で完結し、redb commit を伴わない）。
+    /// `CREATE FUNCTION` は UDF カタログへ永続化するため含まない（[`Self::Write`]。Issue #2882）。
     SessionLocal,
     /// `INSERT`（UPSERT 含む）・`UPDATE`・`DELETE`・`TRUNCATE`、および読み取り専用・
     /// セッション局所のいずれとも判定できない未知の先頭語（fail-closed の既定。
@@ -498,14 +498,10 @@ pub fn classify_statement(stmt: &str) -> StatementEffect {
                 crate::sql::transaction::TxnControl::ReleaseSavepoint,
             )
         }
-        Token::Ident(name) if name.eq_ignore_ascii_case("CREATE") => match tokens.get(1) {
-            Some(Token::Ident(next)) if next.eq_ignore_ascii_case("FUNCTION") => {
-                StatementEffect::SessionLocal
-            }
-            // `CREATE` の直後が `FUNCTION` でない未知の形（将来 `CREATE TABLE` 等が
-            // 追加された場合を含む）は fail-closed に書き込み扱いとする。
-            _ => StatementEffect::Write,
-        },
+        // `CREATE FUNCTION` は UDF カタログ（redb）へ書くため `Write` 扱いにする（Issue #2882）。複数文
+        // メッセージでは暗黙トランザクションに入り、後続文の失敗でカタログごと巻き戻る。`CREATE` の他の
+        // 形（将来 `CREATE TABLE` 等が追加された場合を含む）も下の未知の先頭語の既定（`Write`）に落ちる。
+        Token::Ident(name) if name.eq_ignore_ascii_case("CREATE") => StatementEffect::Write,
         // Issue #1175: `COPY ... TO STDOUT` は読み取り専用（commit を伴わない）、
         // `COPY ... FROM STDIN` は書き込み。カタログを引けないため、括弧の深さ 0 で
         // 最初に現れる `FROM`／`TO` で判定し、どちらも見つからなければ書き込み扱い
@@ -1483,6 +1479,22 @@ mod tests {
             plan_multi_statement(&[ins, "SELECT 1"], false),
             Ok(MultiStatementPlan::ImplicitTransaction)
         );
+        // Issue #2882: `CREATE FUNCTION` はカタログへ書く Write 扱い。最後以外にあれば暗黙トランザクション
+        // （後続文の失敗でカタログごと巻き戻す）。最後の 1 文なら従来どおり Sequential。
+        let create_fn = "CREATE FUNCTION f(x) AS x * 2";
+        assert_eq!(
+            plan_multi_statement(&[create_fn, "SELECT 1"], false),
+            Ok(MultiStatementPlan::ImplicitTransaction)
+        );
+        assert_eq!(
+            plan_multi_statement(&["SELECT 1", create_fn], false),
+            Ok(MultiStatementPlan::Sequential)
+        );
+        // 制御文を含むメッセージでは CREATE FUNCTION が最後以外なら 0A000（1 文も実行しない）。
+        assert_eq!(
+            plan_multi_statement(&[create_fn, "BEGIN", "COMMIT"], false),
+            Err(MultiStatementError::WriteNotLast)
+        );
         // 未知の先頭語は Write 扱いなので暗黙トランザクションへ振り分けられる。
         assert_eq!(
             plan_multi_statement(&["VACUUM t", "SELECT 1"], false),
@@ -1700,9 +1712,14 @@ mod tests {
             classify_statement("SET search_mode = 'recall'"),
             StatementEffect::SessionLocal
         );
+        // Issue #2882: UDF カタログへ書くため `Write`（暗黙トランザクションで巻き戻せる）。
         assert_eq!(
             classify_statement("CREATE FUNCTION f(x) AS x"),
-            StatementEffect::SessionLocal
+            StatementEffect::Write
+        );
+        assert_eq!(
+            classify_statement("CREATE OR REPLACE FUNCTION f(x) AS x"),
+            StatementEffect::Write
         );
         // Issue #1963: `RESET ROLE` はセッション限定。他の `RESET` は書き込み扱い（fail-closed）。
         assert_eq!(

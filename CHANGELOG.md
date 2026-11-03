@@ -7,6 +7,10 @@
 
 ## 0.2.0
 
+### Fixed
+
+- 複数文メッセージで `CREATE [OR REPLACE] FUNCTION` の後続文が失敗したとき、関数がカタログに残る不具合を直した（Issue #2882・SQL-66・WIRE-16・RECOVER-12 ポインタ）。`CREATE FUNCTION` を書き込み扱いにして暗黙トランザクションの共有 write txn へ書き、後続文の失敗でカタログ・セッションごと巻き戻す。世代は commit 成功後にだけ進める。挙動の変化: `CREATE FUNCTION f ...; <後続文>` は暗黙トランザクションに入り（後続が未対応の DDL・`DROP FUNCTION` なら `0A000` で全体をロールバック）、`CREATE FUNCTION f ...; BEGIN; ...` は `0A000`。明示トランザクション内と暗黙トランザクション内の `DROP FUNCTION` は従来どおり `0A000`。公開 API の変更はない。
+
 ### Added
 
 - PL/pgSQL の条件式（`IF`・`ELSIF`・`WHILE`・`EXIT/CONTINUE WHEN`・検索形 `CASE`）と値として使う論理式で `AND`・`OR`・`NOT`・`BETWEEN`・`IN (リスト)` を受理するようにした（Issue #2880・SQL-68）。従来の `0A000` から受理に変わる。NULL は 3 値論理で扱い、数値は値のまま比較する。

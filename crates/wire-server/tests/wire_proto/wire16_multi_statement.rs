@@ -421,8 +421,8 @@ fn set_search_mode_persists_when_the_whole_message_succeeds() {
 }
 
 /// DDL 権限の無いユーザーの `CREATE FUNCTION` を含む複数文メッセージは、その文の `42501` で止まり、
-/// 後続の文は実行されず、関数も登録されない（SQL-66・Issue #1922。旧: セッション内登録が後続の失敗で
-/// 巻き戻ることの確認。DDL 権限ありの永続定義は暗黙トランザクションでも巻き戻らないため対象外）。
+/// 後続の文は実行されず、関数も登録されない（SQL-66・Issue #1922。DDL 権限ありの永続定義が後続の失敗で
+/// 巻き戻ることは `wire_sql/wire_udf_call.rs`（Issue #2882）が確認する）。
 #[test]
 fn create_function_without_ddl_permission_aborts_the_multi_statement_message() {
     let (core, _guard) = new_core_three_tenant_docs();

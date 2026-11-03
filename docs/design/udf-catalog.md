@@ -102,6 +102,7 @@ blob の断片・tenant_id・本体の原文はエラー文言へ出さない。
   単位でしか持てず、書けても読めない状態を作らないため。名前だけの DROP が常に一意に解決できる。
 - **明示トランザクション**: DDL 権限ありのセッションの `CREATE`／`DROP FUNCTION` は `0A000`（ROLLBACK で
   取り消せない書き込みを txn 内で行わない）。権限なしのセッションは `42501`（権限検査が先。#1922）。
+  複数文メッセージの暗黙トランザクションの扱いは下記「複数文メッセージ（Issue #2882）」。
 - **DROP SCHEMA との連動**: `RESTRICT` は配下に関数があれば `2BP01`。`CASCADE` は同じ write txn で配下の
   関数行（自テナント・自 SCHEMA の接頭辞）も消す。残すと内部キーを書けない利用者が DROP できない孤児になる。
 - **crash 耐性**: 新しい crash-test ジョブは足さない。CREATE／DROP はいずれも単一 write txn の 1 回の
@@ -119,6 +120,31 @@ blob の断片・tenant_id・本体の原文はエラー文言へ出さない。
     照合するため一致する。
   - `DROP FUNCTION f(<型>)` のセッション内定義の照合もカタログ側と同じ規則（型注釈のある引数は識別
     トークンで比べる）にする。不一致は不在と同じ扱い（`42883`／`IF EXISTS` は `skipped`）で、存在情報を出さない。
+
+## 複数文メッセージ（Issue #2882）
+
+対象ビヘイビア: SQL-66・WIRE-16・RECOVER-12（ポインタ）。1 メッセージに `CREATE FUNCTION a; <後続文>` を
+送って後続文が失敗すると、従来は `a` だけがカタログに残った（`CREATE FUNCTION` を「セッション内で完結する
+文」に分類していたため、文ごとの autocommit で確定していた）。
+
+- **方式**: `CREATE [OR REPLACE] FUNCTION` を書き込み扱い（`statement_splitter::StatementEffect::Write`）に
+  分類し、最後以外にあれば暗黙トランザクションへ入れる。カタログへの書き込みは暗黙トランザクションが保持する
+  共有 write txn の中で行い（`catalog::function::{create,replace}_function_in_txn`・`udf_ddl::CatalogWrite::InTxn`）、
+  commit はメッセージ末尾の 1 回だけ。行・`operation_id` 台帳・UDF カタログが全か無かになる。
+- **世代の bump**: commit 成功の直後にだけ進める（`SessionTransaction::mark_function_written` が scope を記録し、
+  `commit_active` が bump する）。失敗・期限超過・abort では進めない。commit まで redb の分離により他セッションから
+  見えず、世代も動かないため、他セッションの refresh が途中の状態を拾わない。
+- **セッションのレジストリ**: 文の実行時点で更新する（同じメッセージの後続の `SELECT f(1)` が解決できる）。失敗時は
+  既存の暗黙トランザクションの後始末が受信前のスナップショットへ戻す。
+- **直列化**: 暗黙トランザクションはメッセージ先頭から単一ライタのゲートを握るため、並行する別セッションの
+  `CREATE`／`DROP FUNCTION` は待たされる（上限超過は `55P03`）。保持は `max_duration` と文数上限で有界。
+- **挙動の変化**: `CREATE FUNCTION a; SELECT ...` は暗黙トランザクションに入る。`CREATE FUNCTION a; BEGIN; ...` は
+  書き込みが最後以外にあるため `0A000`（1 文も実行しない）。`SELECT ...; CREATE FUNCTION a`（最後の 1 文）は従来
+  どおり文ごとの autocommit。ドル引用を含むメッセージは分割器が `Single` に倒す既存仕様のまま（全文 `42601`）。
+- **対象外（fail-closed のまま）**: 明示トランザクション内の DDL セッションの `CREATE`／`DROP FUNCTION` は
+  `0A000`。暗黙トランザクション内の DDL セッションの `DROP FUNCTION` も `0A000` で、同じメッセージの先行する
+  `CREATE FUNCTION` ごと巻き戻る（原子性は保たれる）。`CASCADE` の依存トリガ削除と同じ Tx 内の書き込みのトリガ
+  発火との整合が未検証のため、範囲を広げていない。権限のないセッションは従来どおり `42501`。
 
 ## ロード経路（Issue #1921）
 
@@ -170,6 +196,9 @@ blob の断片・tenant_id・本体の原文はエラー文言へ出さない。
 - #2798: 型付き引数・`RETURNS` の永続化・ロードは実装済み。残り: ENUM 型の解禁、numeric 引数の呼び出し時の値変換
   （現状 `0A000`）、`LANGUAGE sql`／`plpgsql` の UDF の永続化。
 - 引数上限（100 個・`54023`）は #1917 または別 Issue。#1922 では扱っていない。
+- #2882: 暗黙トランザクション内の `CREATE [OR REPLACE] FUNCTION` は実装済み。残り: 明示トランザクション内の
+  `CREATE`／`DROP FUNCTION`（SAVEPOINT・`ROLLBACK TO` でのレジストリの巻き戻しの整理が要る）と、暗黙
+  トランザクション内の `DROP FUNCTION`（`CASCADE` の依存トリガ削除の整合）。
 
 ## 上限の設定と権限（Issue #1922）
 
