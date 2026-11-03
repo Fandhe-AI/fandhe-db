@@ -12601,6 +12601,7 @@ impl EngineCore {
                     mode: planned.resolved_mode,
                     evaluation_order: crate::sql::plan::EvaluationOrder::DEFAULT,
                     distance_descending: false,
+                    distance_kind: crate::sql::lexer::DistanceKind::Cosine,
                 })
             },
         )

@@ -10,6 +10,7 @@ mod legacy_table;
 #[path = "../../src/test_util/temp_db.rs"]
 mod temp_db;
 
+mod sql33_distance_kind_acceptance;
 mod sql33_knn_desc;
 mod sql_aggregate;
 mod sql_aggregate_public_api;

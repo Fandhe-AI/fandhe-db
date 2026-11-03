@@ -280,6 +280,7 @@ pub(crate) fn bind_expansion(
         mode: resolved_mode,
         evaluation_order: stmt.evaluation_order(),
         distance_descending: false,
+        distance_kind: crate::sql::lexer::DistanceKind::Cosine,
     })
 }
 
