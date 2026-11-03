@@ -127,7 +127,7 @@
 - #1987: 第 6 節の式でカーネルを実装する。`hnsw.rs` の冒頭コメントと `kernel.rs` の doc comment を、新しい契約に合わせて更新する。ノルム² のキャッシュは arena の可視行の派生値として持ち、他テナントの行の情報を provider へ渡さない（`kernel.rs::SearchInput` の既存契約を維持する）
 - GPU バッチ: ノルムバッファを渡す形と融合計算のどちらを採るかを決める。WGSL はこの Issue では変更しない
 - #1996／#1999: C2′ の採否と、HNSW の cosine opclass の fixture（[hnsw-search.md](hnsw-search.md) の正規化前提）の扱い
-- #2240: ゼロノルムが NaN になる行の並び順
+- #2240: ゼロノルムが NaN になる行の並び順（実装済み。`docs/design/implementation-status.md` 参照）
 - 許容差（第 5 節）を spec 側で規範化するかどうかは、spec リポ側の課題としてオーナーへ報告する
 
 ## 11. 再現手順

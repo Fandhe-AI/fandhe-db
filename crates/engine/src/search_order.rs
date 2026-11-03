@@ -42,15 +42,23 @@ pub(crate) fn cmp_score_desc_then_tie(
 }
 
 /// 「距離昇順 → 同点は順序キー昇順」の全順序（コサイン距離カーネル `kernel/cosine.rs` の
-/// Top-k 選出が使う。Issue #1987）。距離は f64 のまま `total_cmp` で比較する。
-/// NaN の並び順は #2240 の範囲で、現状の選出器は NaN を事前に除外するため到達しない。
+/// Top-k 選出が使う。Issue #1987・#2240）。距離は f64 のまま比較する。
+///
+/// NaN（ゼロノルム等）は符号・ペイロードに依らず全数値より後ろ（遠い側）に置き、
+/// NaN 同士は順序キー昇順で並べる（pgvector の float8 順序と同じ。ポインタ: SQL-33 (3)）。
+/// `total_cmp` は負の NaN を -inf より前に置くため、NaN は明示分岐で扱う。
 pub(crate) fn cmp_distance_asc_then_tie(
     a_dist: f64,
     a_tie: TieKey,
     b_dist: f64,
     b_tie: TieKey,
 ) -> Ordering {
-    a_dist.total_cmp(&b_dist).then(a_tie.cmp(&b_tie))
+    match (a_dist.is_nan(), b_dist.is_nan()) {
+        (true, true) => a_tie.cmp(&b_tie),
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => a_dist.total_cmp(&b_dist).then(a_tie.cmp(&b_tie)),
+    }
 }
 
 /// 「遠い順（`DESC`）→ 同点は順序キー昇順」の全順序（Issue #2009・SQL-33 (2)）。
@@ -88,6 +96,37 @@ mod tests {
             Ordering::Greater
         );
         assert_eq!(cmp_distance_asc_then_tie(0.5, k1, 0.5, k1), Ordering::Equal);
+    }
+
+    #[test]
+    fn distance_asc_puts_nan_last_regardless_of_sign() {
+        let k1 = tie_key_for_response_id(1);
+        let k2 = tie_key_for_response_id(2);
+        let neg_nan = f64::from_bits(0xFFF8_0000_0000_0000);
+        assert!(neg_nan.is_nan());
+        for nan in [f64::NAN, neg_nan] {
+            for num in [0.0, 2.0, f64::INFINITY, f64::NEG_INFINITY] {
+                // NaN 側の順序キーが小さくても数値より後ろ。
+                assert_eq!(
+                    cmp_distance_asc_then_tie(nan, k1, num, k2),
+                    Ordering::Greater
+                );
+                assert_eq!(cmp_distance_asc_then_tie(num, k2, nan, k1), Ordering::Less);
+            }
+        }
+        // NaN 同士は符号に依らず順序キーで決まる。
+        assert_eq!(
+            cmp_distance_asc_then_tie(f64::NAN, k2, neg_nan, k1),
+            Ordering::Greater
+        );
+        assert_eq!(
+            cmp_distance_asc_then_tie(neg_nan, k1, f64::NAN, k2),
+            Ordering::Less
+        );
+        assert_eq!(
+            cmp_distance_asc_then_tie(neg_nan, k1, f64::NAN, k1),
+            Ordering::Equal
+        );
     }
 
     #[test]
