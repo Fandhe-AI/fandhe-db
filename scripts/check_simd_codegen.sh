@@ -332,6 +332,11 @@ required_segments_for() {
     # Issue #2022（TABLE-48）: popcount カーネル。`#[inline(never)]` で独立シンボル。
     echo "12hamming_neon"
     echo "19jaccard_counts_neon"
+    # Issue #1983（SQL-33）: L2 二乗距離カーネル `isa::neon_block4::l2_sq_neon`／
+    # `l2_sq_block4_neon`。`#[inline(never)]` を付与しており（`dot_block4_neon` と同じ
+    # 理由）独立シンボルとして必ず現れる。
+    echo "10l2_sq_neon"
+    echo "17l2_sq_block4_neon"
   fi
 }
 
@@ -442,6 +447,24 @@ expected_rules_for() {
         '^[[:space:]]*cnt[[:space:]]+v[0-9]+\.16b' \
         "byte popcount (cnt v.16b) actually emitted (not scalarized)"
     done
+    # Issue #1983: L2 二乗距離は `vsubq_f32`→`vfmaq_f32(acc, d, d)` が実際に
+    # `fsub v.4s`／`fmla v.4s` へ落ちた証跡を要求する。
+    printf '%s\t%s\t%s\n' \
+      "l2_sq_neon" \
+      '^[[:space:]]*fsub[[:space:]]+v[0-9]+\.4s' \
+      "f32x4 subtract (fsub v.4s) actually emitted (not scalarized)"
+    printf '%s\t%s\t%s\n' \
+      "l2_sq_neon" \
+      '^[[:space:]]*fmla[[:space:]]+v[0-9]+\.4s' \
+      "f32x4 squared-difference FMA (fmla v.4s) actually emitted"
+    printf '%s\t%s\t%s\n' \
+      "l2_sq_block4_neon" \
+      '^[[:space:]]*fsub[[:space:]]+v[0-9]+\.4s' \
+      "f32x4 subtract (fsub v.4s) actually emitted (not scalarized)"
+    printf '%s\t%s\t%s\n' \
+      "l2_sq_block4_neon" \
+      '^[[:space:]]*fmla[[:space:]]+v[0-9]+\.4s' \
+      "f32x4 squared-difference FMA (fmla v.4s) actually emitted"
   fi
 }
 
@@ -1190,6 +1213,115 @@ pub mod isa_probe {
 }
 RUST
 
+  # pass (Issue #1983): `isa/neon_block4.rs::l2_sq_block4_neon` と同型の実装
+  # （`load4`＋`vsubq_f32`＋`vfmaq_f32(acc, d, d)`＋`lane_sum4`＋端数和＋`&mut f32` 出力）。
+  cat > "${dir}/fx_pass_l2_neon.rs" <<'RUST'
+use std::arch::aarch64::*;
+
+pub mod isa_probe {
+    use super::*;
+
+    #[target_feature(enable = "neon")]
+    #[inline]
+    fn load4(c: &[f32; 4]) -> float32x4_t {
+        let [c0, c1, c2, c3] = *c;
+        let v = vdupq_n_f32(0.0);
+        let v = vsetq_lane_f32::<0>(c0, v);
+        let v = vsetq_lane_f32::<1>(c1, v);
+        let v = vsetq_lane_f32::<2>(c2, v);
+        vsetq_lane_f32::<3>(c3, v)
+    }
+
+    #[target_feature(enable = "neon")]
+    #[inline]
+    fn lane_sum4(v: float32x4_t) -> f32 {
+        let mut sum = -0.0f32;
+        sum += vgetq_lane_f32::<0>(v);
+        sum += vgetq_lane_f32::<1>(v);
+        sum += vgetq_lane_f32::<2>(v);
+        sum += vgetq_lane_f32::<3>(v);
+        sum
+    }
+
+    #[inline(always)]
+    fn l2_tail_sum(a_rem: &[f32], b_rem: &[f32]) -> f32 {
+        a_rem
+            .iter()
+            .zip(b_rem.iter())
+            .map(|(x, y)| {
+                let d = x - y;
+                d * d
+            })
+            .sum()
+    }
+
+    #[target_feature(enable = "neon")]
+    #[inline(never)]
+    pub unsafe fn l2_sq_block4_neon(
+        rows: [&[f32]; 4],
+        query: &[f32],
+        out0: &mut f32,
+        out1: &mut f32,
+        out2: &mut f32,
+        out3: &mut f32,
+    ) {
+        let [r0, r1, r2, r3] = rows;
+        let (qc, qr) = query.as_chunks::<4>();
+        let (c0, t0) = r0.as_chunks::<4>();
+        let (c1, t1) = r1.as_chunks::<4>();
+        let (c2, t2) = r2.as_chunks::<4>();
+        let (c3, t3) = r3.as_chunks::<4>();
+
+        let mut a0 = vdupq_n_f32(0.0);
+        let mut a1 = vdupq_n_f32(0.0);
+        let mut a2 = vdupq_n_f32(0.0);
+        let mut a3 = vdupq_n_f32(0.0);
+
+        for ((((qk, x0), x1), x2), x3) in qc.iter().zip(c0).zip(c1).zip(c2).zip(c3) {
+            let vq = load4(qk);
+            let d0 = vsubq_f32(load4(x0), vq);
+            let d1 = vsubq_f32(load4(x1), vq);
+            let d2 = vsubq_f32(load4(x2), vq);
+            let d3 = vsubq_f32(load4(x3), vq);
+            a0 = vfmaq_f32(a0, d0, d0);
+            a1 = vfmaq_f32(a1, d1, d1);
+            a2 = vfmaq_f32(a2, d2, d2);
+            a3 = vfmaq_f32(a3, d3, d3);
+        }
+
+        *out0 = lane_sum4(a0) + l2_tail_sum(t0, qr);
+        *out1 = lane_sum4(a1) + l2_tail_sum(t1, qr);
+        *out2 = lane_sum4(a2) + l2_tail_sum(t2, qr);
+        *out3 = lane_sum4(a3) + l2_tail_sum(t3, qr);
+    }
+}
+RUST
+
+  # fail (Issue #1983): 関数名は `l2_sq_block4_neon` だが実体はスカラー逐次和
+  # （`fsub`／`fmla` の v.4s を出さない）。
+  cat > "${dir}/fx_fail_l2_neon_scalarized.rs" <<'RUST'
+pub mod isa_probe {
+    #[inline(never)]
+    pub fn l2_sq_block4_neon(
+        rows: [&[f32]; 4],
+        query: &[f32],
+        out0: &mut f32,
+        out1: &mut f32,
+        out2: &mut f32,
+        out3: &mut f32,
+    ) {
+        let [r0, r1, r2, r3] = rows;
+        let f = |r: &[f32]| -> f32 {
+            r.iter().zip(query.iter()).map(|(x, y)| (x - y) * (x - y)).sum()
+        };
+        *out0 = f(r0);
+        *out1 = f(r1);
+        *out2 = f(r2);
+        *out3 = f(r3);
+    }
+}
+RUST
+
   # pass (Issue #525): `isa::neon_i8::dot_i8_neon_dotprod` と同型の実装
   # （`vsetq_lane_s8` 連鎖構築＋`vdotq_s32`）。禁止 0 件かつ `sdot v.4s` が
   # 実際に emit されることを確認する。
@@ -1459,6 +1591,27 @@ self_test() {
         overall=1
       else
         echo "self-test ok: fail_block4_neon_scalarized correctly rejected"
+      fi
+    fi
+
+    # Issue #1983: L2 二乗距離の非 vacuous 検査（`fsub v.4s`＋`fmla v.4s`）。
+    asm="$(compile_fixture "${scratch}/pass_l2_neon" "${scratch}/fx_pass_l2_neon.rs" "${TARGET}")" || { overall=1; asm=""; }
+    if [ -n "${asm}" ]; then
+      if run_scan "${asm}" aarch64 "isa_probe" "17l2_sq_block4_neon" >/dev/null; then
+        echo "self-test ok: pass_l2_neon (fsub/fmla v.4s present)"
+      else
+        echo "self-test FAILED: expected pass_l2_neon to pass" >&2
+        overall=1
+      fi
+    fi
+
+    asm="$(compile_fixture "${scratch}/fail_l2_neon_scalarized" "${scratch}/fx_fail_l2_neon_scalarized.rs" "${TARGET}")" || { overall=1; asm=""; }
+    if [ -n "${asm}" ]; then
+      if run_scan "${asm}" aarch64 "isa_probe" "17l2_sq_block4_neon" >/dev/null 2>&1; then
+        echo "self-test FAILED: expected fail_l2_neon_scalarized to be rejected (no fsub/fmla)" >&2
+        overall=1
+      else
+        echo "self-test ok: fail_l2_neon_scalarized correctly rejected"
       fi
     fi
 

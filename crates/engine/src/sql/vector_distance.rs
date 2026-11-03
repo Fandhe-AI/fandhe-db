@@ -38,9 +38,20 @@ pub(crate) fn distance(
             let dot = f64::from(crate::kernel::dot(row, query));
             let na = f64::from(crate::kernel::dot(row, row));
             let nb = f64::from(crate::kernel::dot(query, query));
+            // ゼロノルム（行・クエリ）は距離 NaN。0/0 の NaN は符号ビットが ISA 依存
+            // （x86 は負、aarch64 は正）なので、正規の NaN へ揃えて投影時のバイナリ表現を
+            // 環境非依存にする（Issue #2240・SQL-33 (3)(7)）。
+            if na * nb == 0.0 {
+                return Ok(f64::NAN);
+            }
             let s = dot / (na * nb).sqrt();
-            // `f64::clamp` は NaN をそのまま返す（ゼロノルムは NaN のまま比較側へ渡る）。
-            1.0 - s.clamp(-1.0, 1.0)
+            let d = 1.0 - s.clamp(-1.0, 1.0);
+            // `f64::clamp` は NaN をそのまま返すので、非有限入力由来の NaN もここで正規化する。
+            if d.is_nan() {
+                f64::NAN
+            } else {
+                d
+            }
         }
     })
 }
@@ -71,9 +82,15 @@ mod tests {
 
     #[test]
     fn zero_norm_cosine_is_nan() {
-        assert!(distance(DistanceKind::Cosine, &[0.0, 0.0], &[1.0, 0.0])
-            .unwrap()
-            .is_nan());
+        for (r, q) in [
+            ([0.0f32, 0.0], [1.0f32, 0.0]),
+            ([1.0, 0.0], [0.0, 0.0]),
+            ([0.0, 0.0], [0.0, 0.0]),
+        ] {
+            let d = distance(DistanceKind::Cosine, &r, &q).unwrap();
+            assert!(d.is_nan());
+            assert_eq!(d.to_bits(), f64::NAN.to_bits());
+        }
     }
 
     #[test]

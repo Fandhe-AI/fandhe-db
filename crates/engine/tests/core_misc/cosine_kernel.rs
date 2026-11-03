@@ -62,7 +62,14 @@ fn reference(ids: &[u64], m: &[f32], dim: usize, q: &[f32]) -> Vec<(u64, f64)> {
         .zip(m.chunks_exact(dim))
         .map(|(&id, row)| (id, ref_dist(row, q)))
         .collect();
-    v.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+    // pgvector（float8 順序）と同じく NaN は全数値の後ろ、NaN 同士は id 昇順。
+    // `search_order` を参照しない独立実装として保つ。
+    v.sort_by(|a, b| match (a.1.is_nan(), b.1.is_nan()) {
+        (true, true) => a.0.cmp(&b.0),
+        (true, false) => std::cmp::Ordering::Greater,
+        (false, true) => std::cmp::Ordering::Less,
+        (false, false) => a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)),
+    });
     v
 }
 
@@ -156,4 +163,60 @@ fn distance_order_differs_from_inner_product_order_for_unnormalized_rows() {
     let got = run(&ids, &m, 2, &q, 1, None);
     assert_eq!(got[0].0, 2);
     assert!(dot_scalar(&m[..2], &q) > dot_scalar(&m[2..], &q));
+}
+
+#[test]
+fn zero_norm_rows_sort_last_like_pgvector() {
+    for dim in [3usize, 8, 17] {
+        let rows = 23usize;
+        let mut m = fixture(dim, rows, 0, 77 + dim as u64);
+        let zero_idx = [0usize, 5, 6, 22];
+        for &i in &zero_idx {
+            m[i * dim..(i + 1) * dim].fill(0.0);
+        }
+        let ids: Vec<u64> = (100..100 + rows as u64).collect();
+        let q: Vec<f32> = (0..dim).map(|i| 0.3 + i as f32 * 0.1).collect();
+        let finite = rows - zero_idx.len();
+
+        let got = run(&ids, &m, dim, &q, rows, None);
+        let full = got.clone();
+        let want = reference(&ids, &m, dim, &q);
+        assert_eq!(got.len(), rows);
+        for (g, w) in got.iter().zip(&want).take(finite) {
+            assert_eq!(g.0, w.0, "dim={dim}");
+            assert!((g.1 - w.1).abs() < TOL);
+        }
+        let tail: Vec<u64> = got[finite..].iter().map(|h| h.0).collect();
+        let expect_tail: Vec<u64> = zero_idx.iter().map(|&i| ids[i]).collect();
+        assert_eq!(tail, expect_tail, "dim={dim}");
+        assert!(got[finite..].iter().all(|h| h.1.is_nan()));
+
+        // 有限行 + 1 件を要求すると NaN 行は id 最小の 1 件だけ入る。
+        let got = run(&ids, &m, dim, &q, finite + 1, None);
+        assert_eq!(got.len(), finite + 1);
+        assert_eq!(got[finite].0, ids[zero_idx[0]]);
+        assert!(got[finite].1.is_nan());
+
+        // C2（行ノルム²を外から渡す）でも同じ。
+        let norms = row_norms_sq(&m, dim as u32).unwrap();
+        let c2 = run(&ids, &m, dim, &q, rows, Some(&norms));
+        let ids_of = |v: &[(u64, f64)]| v.iter().map(|h| h.0).collect::<Vec<_>>();
+        assert_eq!(ids_of(&c2), ids_of(&full), "dim={dim}");
+    }
+}
+
+#[test]
+fn zero_norm_query_returns_rows_in_id_order() {
+    let dim = 4usize;
+    let rows = 9usize;
+    let m = fixture(dim, rows, 0, 5);
+    let ids: Vec<u64> = (1..=rows as u64).collect();
+    let q = vec![0.0f32; dim];
+    for k in [1usize, 4, 9, 20] {
+        let got = run(&ids, &m, dim, &q, k, None);
+        assert_eq!(got.len(), k.min(rows));
+        let want: Vec<u64> = (1..=got.len() as u64).collect();
+        assert_eq!(got.iter().map(|h| h.0).collect::<Vec<_>>(), want);
+        assert!(got.iter().all(|h| h.1.is_nan()));
+    }
 }
