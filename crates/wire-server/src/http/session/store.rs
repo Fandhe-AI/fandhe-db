@@ -92,6 +92,9 @@ impl IssueError {
 /// ―― 枠解放を明示的な減算経路として複製しない設計）。
 struct Entry {
     ctx: engine::policy::PolicyContext,
+    /// 認証済みユーザーに対応するカタログのロール（HTTP-4・Issue #2238。同名ロールが無い・カタログが正
+    /// でないテナントは `None`＝未束縛）。発行時に 1 回だけ確定し、以後は変化しない。
+    role: Option<SessionRole>,
     /// DDL 実行権限（`--ddl-allowed-users`。NOSQL-13・TASK-207、Issue #910）。
     /// `issue.rs` が `auth::verify` 成功直後に `UserStore::is_ddl_allowed` から
     /// 1 回だけ確定させる値で、以後このセッションの寿命中は変化しない
@@ -104,6 +107,21 @@ struct Entry {
     _permit: SessionPermit,
 }
 
+/// セッションが束縛するカタログのロール（認証層が発行時に確定した値の写し。`Debug` は伏せ字）。
+#[derive(Clone, PartialEq, Eq)]
+pub struct SessionRole {
+    pub role_id: u64,
+    pub role_name: String,
+    /// 初期ロールの全権限（オブジェクト権限の所有者相当。DDL は含まない）。
+    pub all_object_privileges: bool,
+}
+
+impl fmt::Debug for SessionRole {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SessionRole(<redacted>)")
+    }
+}
+
 /// [`SessionStore::lookup_grant`] が返す、テナント境界と DDL 実行権限の対
 /// （HTTP セッション認証ミドルウェアが両方を 1 回の照会で読む入口。
 /// NOSQL-13・TASK-207、Issue #910）。
@@ -111,6 +129,8 @@ struct Entry {
 pub struct SessionGrant {
     pub ctx: engine::policy::PolicyContext,
     pub ddl_allowed: bool,
+    /// 束縛するカタログのロール（未束縛は `None`）。
+    pub role: Option<SessionRole>,
 }
 
 /// TTL 固定・同時有効数上限付きのメモリ内セッションストア（TASK-174・
@@ -199,6 +219,18 @@ impl SessionStore {
         ddl_allowed: bool,
         now: Instant,
     ) -> Result<SessionToken, IssueError> {
+        self.issue_with_grant(ctx, ddl_allowed, None, now)
+    }
+
+    /// [`SessionStore::issue_with_ddl`] のロール束縛つき版（HTTP-4・Issue #2238）。`issue.rs` が認証成功後に
+    /// 1 回だけ呼ぶ。`role` は認証済みユーザーに対応づけたカタログのロール（未束縛は `None`）。
+    pub fn issue_with_grant(
+        &self,
+        ctx: engine::policy::PolicyContext,
+        ddl_allowed: bool,
+        role: Option<SessionRole>,
+        now: Instant,
+    ) -> Result<SessionToken, IssueError> {
         let permit = match self.limiter.try_acquire() {
             Some(permit) => permit,
             None => {
@@ -225,6 +257,7 @@ impl SessionStore {
             token.clone(),
             Entry {
                 ctx,
+                role,
                 ddl_allowed,
                 issued_at: now,
                 _permit: permit,
@@ -264,6 +297,7 @@ impl SessionStore {
             table.get(token).map(|entry| SessionGrant {
                 ctx: entry.ctx.clone(),
                 ddl_allowed: entry.ddl_allowed,
+                role: entry.role.clone(),
             })
         } else {
             table.remove(token);

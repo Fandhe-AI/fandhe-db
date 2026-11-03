@@ -104,7 +104,22 @@ pub fn handle(
     now_mono: impl Fn() -> Instant,
     now_wall: SystemTime,
 ) -> Vec<u8> {
-    match handle_inner(users, sessions, body, now_mono) {
+    handle_with_engine(users, None, sessions, body, now_mono, now_wall)
+}
+
+/// [`handle`] の engine つき版（HTTP-4・Issue #2238）。`engine` があるときは、認証済みユーザーに対応する
+/// カタログのロールへセッションを束縛し、ブートストラップ済みテナントでは資格情報の照合元もカタログに
+/// なる（pg wire の cleartext 経路と同じ [`crate::auth::users_file_role::verify_and_bind`] を使う）。
+/// `engine` が `None`（`Router::new`）のときは従来どおり users ファイルだけで照合し、未束縛のままにする。
+pub fn handle_with_engine(
+    users: &UserStore,
+    engine: Option<&engine::core::EngineCore>,
+    sessions: &SessionStore,
+    body: &[u8],
+    now_mono: impl Fn() -> Instant,
+    now_wall: SystemTime,
+) -> Vec<u8> {
+    match handle_inner(users, engine, sessions, body, now_mono) {
         Ok(token_encoded) => {
             response::encode_ok(&success_body(&token_encoded, sessions.ttl()), now_wall)
         }
@@ -118,6 +133,7 @@ pub fn handle(
 /// ための分離）。
 fn handle_inner(
     users: &UserStore,
+    engine: Option<&engine::core::EngineCore>,
     sessions: &SessionStore,
     raw_body: &[u8],
     now_mono: impl Fn() -> Instant,
@@ -147,8 +163,23 @@ fn handle_inner(
 
     // 認証（固定遅延・ダミー KDF による対称性は `auth::verify` 内部が担う。
     // ここでは早期 return・別 sleep を追加しない）。
-    let ctx = auth::verify(users, user, password.as_bytes())
-        .map_err(|_| HandleError::new(ErrorClass::AuthInvalid, auth::AuthFailure::MESSAGE))?;
+    let (ctx, binding) =
+        auth::users_file_role::verify_and_bind(users, engine, user, password.as_bytes())
+            .map_err(|_| HandleError::new(ErrorClass::AuthInvalid, auth::AuthFailure::MESSAGE))?;
+    // 同名ロールへ束縛した場合の判定（検証の後。パスワードを知らない相手には他の失敗と区別できない）。
+    // `NOLOGIN` は pg wire と同じ `28000`（固定文言）。HTTP では `CONNECTION LIMIT` を適用しない。
+    let bound = match binding {
+        auth::users_file_role::UsersFileBinding::Bound(b) => {
+            if !b.login {
+                return Err(HandleError::new(
+                    ErrorClass::AuthRequired,
+                    "role is not permitted to log in",
+                ));
+            }
+            Some(b)
+        }
+        _ => None,
+    };
 
     // DDL 実行権限（NOSQL-13・TASK-207、Issue #910）: `auth::verify` 成功
     // *後*にのみ `UserStore::is_ddl_allowed` を読み、セッションへ 1 回だけ
@@ -156,14 +187,25 @@ fn handle_inner(
     // `handshake.rs` の `session.allow_ddl()` 呼び出しと同じ「認証成功後」の
     // 順序）。値はセッション発行後に変化しない——DDL 実行権限ゲート自体は
     // 引き続き `engine::sql::ddl::require_ddl_permission` 一箇所が担う。
-    let ddl_allowed = users.is_ddl_allowed(user);
+    // ブートストラップ済みテナントでは、`--ddl-allowed-users` の列挙と永続の DDL フラグの積にする
+    // （pg wire の `handshake.rs` と同じ。Issue #2238）。
+    let ddl_allowed = users.is_ddl_allowed(user)
+        && match &bound {
+            Some(b) if b.bootstrapped => b.ddl_flag,
+            _ => true,
+        };
+    let role = bound.map(|b| session::store::SessionRole {
+        role_id: b.role_id,
+        role_name: b.role_name,
+        all_object_privileges: b.all_object_privileges,
+    });
 
     // セッション上限の判定は認証成功後にのみ行う（未認証クライアントへ
     // KDF を経ない高速経路・セッション数のオラクルを与えないための順序）。
     // `now_mono()` の呼び出し自体もここまで遅延させ、Argon2id 照合・セマフォ
     // 待機の時間が TTL 起点に含まれてしまわないようにする（本関数 doc 参照）。
     let token = sessions
-        .issue_with_ddl(ctx, ddl_allowed, now_mono())
+        .issue_with_grant(ctx, ddl_allowed, role, now_mono())
         .map_err(|e| HandleError::new(e.error_class(), issue_error_message(&e)))?;
 
     Ok(token.encoded())
@@ -358,6 +400,7 @@ mod tests {
 
         let alice_token_encoded = handle_inner(
             &store,
+            None,
             &sessions,
             br#"{"user":"alice","password":"pw-alice"}"#,
             move || now,
@@ -366,6 +409,7 @@ mod tests {
         .expect("alice login succeeds");
         let bob_token_encoded = handle_inner(
             &store,
+            None,
             &sessions,
             br#"{"user":"bob","password":"pw-bob"}"#,
             move || now,

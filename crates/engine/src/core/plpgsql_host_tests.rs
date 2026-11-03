@@ -684,7 +684,7 @@ fn variable_named_like_a_column_is_ambiguous() {
 // ---- 条件式 ----
 
 #[test]
-fn conditions_work_for_single_comparisons_and_reject_compound_forms() {
+fn conditions_work_for_single_comparisons_and_compound_forms() {
     let (core, _g) = new_core(LedgerMode::Optional);
     let c = ctx("t1");
     let out = call("BEGIN IF p > 0 THEN RETURN 1; END IF; RETURN 0; END")
@@ -703,11 +703,222 @@ fn conditions_work_for_single_comparisons_and_reject_compound_forms() {
     .autocommit(&core, &c)
     .expect("exit when");
     assert_eq!(as_i64(&out), 2);
-    let e = call("BEGIN IF p > 0 AND p < 10 THEN RETURN 1; END IF; RETURN 0; END")
+    // 複合条件は受理する（Issue #2880・SQL-68。従来は 0A000）。
+    let out = call("BEGIN IF p > 0 AND p < 10 THEN RETURN 1; END IF; RETURN 0; END")
         .param("p", SqlColumnTypeName::Integer, int(3))
         .autocommit(&core, &c)
-        .expect_err("compound");
-    assert_eq!(e.wire_code(), "0A000");
+        .expect("compound");
+    assert_eq!(as_i64(&out), 1);
+}
+
+// ---- 複合条件（Issue #2880・SQL-68） ----
+
+fn flag(b: bool) -> PlScalar {
+    PlScalar::new(Cell::Bool(b), ColumnType::Boolean)
+}
+
+/// `IF <cond> THEN 1 ELSE 0`（`p` は int 引数）の分岐結果。
+fn branch(cond: &str, p: PlScalar) -> Result<i64, SqlSurfaceError> {
+    let (core, _g) = new_core(LedgerMode::Optional);
+    let c = ctx("t1");
+    let src = format!("BEGIN IF {cond} THEN RETURN 1; ELSE RETURN 0; END IF; END");
+    call(&src)
+        .param("p", SqlColumnTypeName::Integer, p)
+        .autocommit(&core, &c)
+        .map(|o| as_i64(&o))
+}
+
+#[test]
+fn compound_conditions_follow_three_valued_logic() {
+    let cases: &[(&str, Option<i64>, i64)] = &[
+        ("p > 0 AND p < 10", Some(3), 1),
+        ("p > 0 AND p < 10", Some(30), 0),
+        ("p > 0 AND p < 10", None, 0),
+        ("p < 0 AND p > 0", None, 0),
+        ("p IS NULL OR p > 5", None, 1),
+        ("p > 5 OR p < 1", None, 0),
+        ("p > 5 OR p < 1", Some(0), 1),
+        ("NOT (p > 0)", None, 0),
+        ("NOT (p > 0)", Some(-1), 1),
+        ("NOT NOT (p > 0)", Some(1), 1),
+        ("NOT p > 0", Some(1), 0),
+        ("NOT (p IS NULL)", Some(1), 1),
+        ("p IN (1, 2)", Some(2), 1),
+        ("p IN (1, 2)", Some(3), 0),
+        ("p NOT IN (1, 2)", Some(3), 1),
+        ("p IN (1, 2)", None, 0),
+        ("p NOT IN (1, 2)", None, 0),
+        ("p BETWEEN 1 AND 5", Some(5), 1),
+        ("p BETWEEN 1 AND 5", Some(6), 0),
+        ("p NOT BETWEEN 1 AND 5", Some(6), 1),
+        ("p NOT BETWEEN 1 AND 5", None, 0),
+        ("p BETWEEN 1 AND 5 AND p <> 3", Some(3), 0),
+        ("p BETWEEN 1 AND 5 AND p <> 3", Some(4), 1),
+        ("(p > 0 OR p < -5) AND (p <> 2)", Some(2), 0),
+        // 短絡評価（PG の評価順）。右辺の 0 除算は評価されない。
+        ("p <> 0 AND 10 / p > 1", Some(0), 0),
+        ("p = 0 OR 10 / p > 1", Some(0), 1),
+    ];
+    for (cond, p, want) in cases {
+        let arg = p.map_or_else(null_int, int);
+        let got = branch(cond, arg).unwrap_or_else(|e| panic!("{cond} p={p:?}: {e}"));
+        assert_eq!(got, *want, "{cond} with p={p:?}");
+    }
+    // 評価される右辺の 0 除算は本物のエラーのまま。
+    let e = branch("p >= 0 AND 10 / p > 1", int(0)).expect_err("div by zero");
+    assert_eq!(e.wire_code(), "22012");
+}
+
+#[test]
+fn compound_conditions_keep_exact_numbers_and_booleans() {
+    let (core, _g) = new_core(LedgerMode::Optional);
+    let c = ctx("t1");
+    let b = |cond: &str| {
+        let src = format!("BEGIN IF {cond} THEN RETURN 1; ELSE RETURN 0; END IF; END");
+        call(&src)
+            .param("p", SqlColumnTypeName::BigInt, big(9_007_199_254_740_993))
+            .param("f", SqlColumnTypeName::Boolean, flag(true))
+            .param("s", SqlColumnTypeName::Text, text("b"))
+            .autocommit(&core, &c)
+            .map(|o| as_i64(&o))
+    };
+    assert_eq!(
+        b("p > 9007199254740992 AND p < 9007199254740994").expect("range"),
+        1
+    );
+    assert_eq!(b("p IN (9007199254740993)").expect("in"), 1);
+    assert_eq!(b("p IN (9007199254740992)").expect("in"), 0);
+    assert_eq!(
+        b("p BETWEEN 9007199254740993 AND 9007199254740993").expect("between"),
+        1
+    );
+    assert_eq!(b("f AND p > 0").expect("bool var"), 1);
+    assert_eq!(b("NOT f").expect("not bool var"), 0);
+    assert_eq!(
+        b("s IN ('a', 'b') OR s BETWEEN 'x' AND 'z'").expect("text"),
+        1
+    );
+    assert_eq!(b("s NOT IN ('a', 'b') AND p > 0").expect("text"), 0);
+}
+
+#[test]
+fn compound_conditions_work_in_every_control_construct() {
+    let (core, _g) = new_core(LedgerMode::Optional);
+    let c = ctx("t1");
+    let run = |src: &str, p: PlScalar| {
+        call(src)
+            .param("p", SqlColumnTypeName::Integer, p)
+            .autocommit(&core, &c)
+            .map(|o| as_i64(&o))
+            .expect("run")
+    };
+    assert_eq!(
+        run(
+            "BEGIN IF p < 0 THEN RETURN 9; ELSIF p = 1 OR p = 2 THEN RETURN 2; END IF; RETURN 0; END",
+            int(2)
+        ),
+        2
+    );
+    assert_eq!(
+        run(
+            "DECLARE i int := 0; BEGIN WHILE i < 5 AND i <> p LOOP i := i + 1; END LOOP; RETURN i; END",
+            int(3)
+        ),
+        3
+    );
+    assert_eq!(
+        run(
+            "DECLARE i int := 0; BEGIN LOOP i := i + 1; EXIT WHEN i >= 4 OR p IS NULL; END LOOP; RETURN i; END",
+            null_int()
+        ),
+        1
+    );
+    assert_eq!(
+        run(
+            "DECLARE i int := 0; BEGIN LOOP i := i + 1; CONTINUE WHEN i < 3 AND p IS NOT NULL; EXIT; END LOOP; RETURN i; END",
+            int(1)
+        ),
+        3
+    );
+    assert_eq!(
+        run(
+            "BEGIN CASE WHEN p BETWEEN 1 AND 3 THEN RETURN 1; ELSE RETURN 2; END CASE; END",
+            int(2)
+        ),
+        1
+    );
+    // 値として使う形。NULL を含めば NULL。
+    assert_eq!(
+        run(
+            "DECLARE b boolean; BEGIN b := p > 0 AND p < 10; IF b IS NULL THEN RETURN 7; END IF; RETURN 1; END",
+            null_int()
+        ),
+        7
+    );
+    assert_eq!(
+        run(
+            "DECLARE b boolean; BEGIN b := p BETWEEN 1 AND 10; IF b THEN RETURN 1; END IF; RETURN 0; END",
+            int(4)
+        ),
+        1
+    );
+}
+
+#[test]
+fn unsupported_compound_leaves_stay_fail_closed() {
+    for cond in [
+        "p > 0 AND (p IS DISTINCT FROM 3)",
+        "p IN (3, 2) AND p LIKE 'a%'",
+    ] {
+        let e = branch(cond, int(3)).expect_err(cond);
+        assert_eq!(e.wire_code(), "0A000", "{cond}");
+        assert!(!e.to_string().contains("docs"), "{cond}");
+    }
+}
+
+#[test]
+fn compound_conditions_with_null_list_elements_and_bounds() {
+    let (core, _g) = new_core(LedgerMode::Optional);
+    let c = ctx("t1");
+    let run = |cond: &str, p: i64| {
+        let src = format!(
+            "DECLARE q int; BEGIN IF {cond} THEN RETURN 1; ELSIF NOT ({cond}) THEN RETURN 2; END IF; RETURN 3; END"
+        );
+        call(&src)
+            .param("p", SqlColumnTypeName::Integer, int(p))
+            .autocommit(&core, &c)
+            .map(|o| as_i64(&o))
+    };
+    // 一致なし + NULL 要素は NULL（IF も NOT も偽 → 3）。一致があれば真。
+    assert_eq!(run("p IN (1, q)", 2).expect("in"), 3);
+    assert_eq!(run("p NOT IN (1, q)", 2).expect("not in"), 3);
+    assert_eq!(run("p IN (1, q)", 1).expect("in match"), 1);
+    assert_eq!(run("p NOT IN (1, q)", 1).expect("not in match"), 2);
+    // BETWEEN は片側が偽なら NULL 境界があっても偽、そうでなければ NULL。
+    assert_eq!(run("p BETWEEN q AND 5", 7).expect("between"), 2);
+    assert_eq!(run("p BETWEEN q AND 5", 3).expect("between"), 3);
+}
+
+#[test]
+fn compound_condition_operands_respect_the_tenant_boundary() {
+    let (core, _g) = new_core(LedgerMode::Optional);
+    let (c1, c2) = (ctx("t1"), ctx("t2"));
+    seed(&core, &c1, &[1, 2], "en");
+    let src = "BEGIN IF (SELECT count(*) FROM docs) > 0 AND p > 0 THEN RETURN 1; ELSE RETURN 0; END IF; END";
+    let run = |c: &PolicyContext| {
+        call(src)
+            .param("p", SqlColumnTypeName::Integer, int(1))
+            .autocommit(&core, c)
+    };
+    // 条件の中の副問い合わせも呼び出しテナントの RLS で評価する（t2 からは t1 の行が見えない）。
+    match run(&c1) {
+        Ok(o) => assert_eq!(as_i64(&o), 1),
+        Err(e) => assert_eq!(e.wire_code(), "0A000"),
+    }
+    match run(&c2) {
+        Ok(o) => assert_eq!(as_i64(&o), 0),
+        Err(e) => assert_eq!(e.wire_code(), "0A000"),
+    }
 }
 
 // ---- 値の型ごとの置換（NULL・文字列・真偽値） ----

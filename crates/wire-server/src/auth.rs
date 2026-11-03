@@ -9,6 +9,7 @@
 pub mod argon2id;
 pub use engine::crypto::base64_std;
 pub mod blake2b;
+pub mod bootstrap;
 pub use engine::crypto::hmac_sha256;
 pub mod role_connections;
 pub mod scram;
@@ -75,6 +76,8 @@ pub enum AuthMethod {
 
 /// ユーザーストア 1 行分のレコード（`username:tenant_id:phc[:scram_verifier]` 形式）。
 struct UserRecord {
+    /// ファイル上の行番号（1 起算。ブートストラップの起動ログ用。Issue #2238）。
+    line: usize,
     tenant_id: String,
     phc: String,
     scram_verifier: Option<scram::ScramVerifier>,
@@ -315,6 +318,7 @@ impl UserStore {
                 .insert(
                     username.to_string(),
                     UserRecord {
+                        line: line_no,
                         tenant_id: tenant_id.to_string(),
                         phc: phc.to_string(),
                         scram_verifier,
@@ -348,7 +352,7 @@ impl UserStore {
     /// 読んだファイルの生バイト列をそのまま渡す契約。運用者が同じ秘密
     /// ファイルを使い続ける限り、ユーザーストアの追加・削除・並べ替えや
     /// 検証子更新の前後でモック salt は変化しない（存在オラクル対策）。
-    pub fn require_scram(mut self, mock_key_secret: &[u8]) -> Result<Self, LoadError> {
+    pub fn require_scram(self, mock_key_secret: &[u8]) -> Result<Self, LoadError> {
         let mut usernames: Vec<&String> = self.users.keys().collect();
         usernames.sort();
         for username in usernames {
@@ -363,9 +367,65 @@ impl UserStore {
                 });
             }
         }
+        Ok(self.enable_scram(mock_key_secret))
+    }
+
+    /// [`UserStore::require_scram`] の検証子の必須検査を後ろへ回す版（Issue #2238）。ブートストラップ後は
+    /// 資格情報の正がカタログのため、ファイルに検証子が無い行でも、カタログのロールが検証子を持てば
+    /// SCRAM でログインできる。呼び出し元（`main.rs`）はブートストラップの後に
+    /// [`UserStore::ensure_scram_ready`] を必ず呼ぶこと（呼ばないと検証子の欠落を起動時に検出できない）。
+    pub fn require_scram_deferred(self, mock_key_secret: &[u8]) -> Self {
+        self.enable_scram(mock_key_secret)
+    }
+
+    fn enable_scram(mut self, mock_key_secret: &[u8]) -> Self {
         self.auth_method = AuthMethod::ScramSha256;
         self.scram_mock_key = Some(derive_scram_mock_key(mock_key_secret));
-        Ok(self)
+        self
+    }
+
+    /// ブートストラップ後の SCRAM 必須検査。ファイルに検証子の無い行のうち、カタログが正のテナント
+    /// （同名ロールがある・テナントにロールはあるが同名が無い）の行は、起動条件にせず警告文字列で返す
+    /// （カタログの同名ロールが検証子を持てばそれでログインでき、持たなければそのユーザーだけが
+    /// 認証失敗で拒否される。`DROP ROLE`・`ALTER ROLE ... PASSWORD NULL` 後の再起動や、マーカー済み
+    /// テナントへの未登録ユーザー行の追加で、他の有効ユーザーまで起動不能にしないため）。
+    /// カタログが正でないテナント・カタログ読み取り失敗の行は起動失敗（fail-closed。恒久的に
+    /// ログイン不能な行・タイミング対称性の崩れを未然に防ぐ）。
+    pub fn ensure_scram_ready(
+        &self,
+        engine: &engine::core::EngineCore,
+    ) -> Result<Vec<String>, LoadError> {
+        let mut warnings = Vec::new();
+        let mut usernames: Vec<&String> = self.users.keys().collect();
+        usernames.sort();
+        for username in usernames {
+            let Some(r) = self.users.get(username) else {
+                continue;
+            };
+            if r.scram_verifier.is_some() {
+                continue;
+            }
+            match engine.resolve_users_file_role(&r.tenant_id, username) {
+                Ok(engine::core::UsersFileRoleBinding::Role(c)) => {
+                    if c.scram_verifier.is_empty() {
+                        warnings.push(format!(
+                            "wire-server: users file entry has no SCRAM verifier in the file or the catalog; the user cannot log in (user: {username})"
+                        ));
+                    }
+                }
+                Ok(engine::core::UsersFileRoleBinding::Missing) => {
+                    warnings.push(format!(
+                        "wire-server: users file entry has no SCRAM verifier and no catalog role; the user cannot log in (user: {username})"
+                    ));
+                }
+                Ok(engine::core::UsersFileRoleBinding::CatalogNotAuthoritative) | Err(_) => {
+                    return Err(LoadError::MissingScramVerifier {
+                        username: username.clone(),
+                    });
+                }
+            }
+        }
+        Ok(warnings)
     }
 
     /// このストアが選択している認証方式。`handshake.rs` が `Authentication*`
@@ -388,6 +448,31 @@ impl UserStore {
         let record = self.users.get(username)?;
         let verifier = record.scram_verifier.as_ref()?;
         Some((record.tenant_id.as_str(), verifier))
+    }
+
+    /// 素の username が属するテナント（users ファイルの行。無ければ `None`）。ブートストラップ後は
+    /// 「素の username からテナントへの経路振り分け」だけがファイルの役割になる（Issue #2238）。
+    pub(crate) fn tenant_of(&self, username: &str) -> Option<&str> {
+        self.users.get(username).map(|r| r.tenant_id.as_str())
+    }
+
+    /// ブートストラップへ渡す行（PHC・SCRAM 検証子・`--ddl-allowed-users` の列挙の有無・行番号）。
+    /// `--ddl-allowed-users` の適用後に呼ぶこと。行番号の昇順で返す（Issue #2238）。
+    pub(crate) fn bootstrap_users(&self) -> Vec<engine::core::BootstrapUser> {
+        let mut rows: Vec<engine::core::BootstrapUser> = self
+            .users
+            .iter()
+            .map(|(username, r)| engine::core::BootstrapUser {
+                line: r.line,
+                username: username.clone(),
+                tenant_id: r.tenant_id.clone(),
+                phc: r.phc.clone(),
+                scram_verifier: r.scram_verifier.as_ref().map(|v| v.to_verifier_string()),
+                ddl_listed: self.ddl_allowed.contains(username),
+            })
+            .collect();
+        rows.sort_by_key(|u| u.line);
+        rows
     }
 
     /// カタログのロールの同時接続数の台帳（`handshake` が認証成功の後に確保する。Issue #2233）。
@@ -465,6 +550,7 @@ impl UserStore {
             users.insert(
                 username.to_string(),
                 UserRecord {
+                    line: 0,
                     tenant_id: tenant_id.to_string(),
                     phc: phc.to_string(),
                     scram_verifier: None,
@@ -552,8 +638,19 @@ pub fn verify(
     username: &str,
     password: &[u8],
 ) -> Result<engine::policy::PolicyContext, AuthFailure> {
-    let start = Instant::now();
+    verify_from(store, username, password, Instant::now())
+}
 
+/// [`verify`] の固定遅延の起点を呼び出し側が指定する版（Issue #2238）。照合の前に別の KDF を
+/// 消費する経路（`users_file_role::verify_and_bind`）が、その KDF 分も [`AUTH_FAILURE_DELAY`] の
+/// 内側に含めて失敗経路ごとの所要時間を揃えるために使う（遅延の二重計時で未知ユーザーだけが
+/// 長くなる存在オラクルを作らない）。
+pub(crate) fn verify_from(
+    store: &UserStore,
+    username: &str,
+    password: &[u8],
+    start: Instant,
+) -> Result<engine::policy::PolicyContext, AuthFailure> {
     let record = store.users.get(username);
     let phc_to_check: &str = match record {
         Some(r) => &r.phc,

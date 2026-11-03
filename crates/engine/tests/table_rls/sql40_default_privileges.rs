@@ -341,6 +341,22 @@ fn for_role_requires_a_set_path_unless_operator() {
     f.ok("t1", &mut bob, "INSERT INTO a1 (a) VALUES ('x')");
 }
 
+/// 初期ロールの全権限（DDL 権限なし）は `FOR ROLE` の SET 経路検査を免除しない（Issue #2238）。
+#[test]
+fn bootstrap_role_cannot_bypass_for_role_set_path() {
+    let f = fx("sql40_dp_bootstrap");
+    let mut alice = bound(ALICE, false);
+    alice.grant_bootstrap_all_privileges();
+    assert_eq!(
+        f.code(
+            "t1",
+            &mut alice,
+            "ALTER DEFAULT PRIVILEGES FOR ROLE bob GRANT SELECT ON TABLES TO alice"
+        ),
+        "42501"
+    );
+}
+
 /// テナント境界（RLS-12）: 他テナントのロール・SCHEMA は不在と同じ応答、未束縛はカタログ照会より前に `42501`、
 /// 明示 Tx 内は `0A000`。
 #[test]
