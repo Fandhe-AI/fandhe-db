@@ -168,25 +168,47 @@ fn atomicity_case(
     }
     let before = snapshot(&path);
 
-    let (alice_rows, bob_rows) = {
-        let core = open_core(&path, 30_000);
-        let alice_rows = rows_of(&core, OWNER_ALICE);
-        let bob_rows = rows_of(&core, OWNER_BOB);
-        let err = run(&core, who, fail_sql).expect_err(fail_sql);
-        assert_eq!(err.wire_code(), expected, "{label}: {err}");
-        let msg = err.to_string();
-        for leak in [OWNER_ALICE, OWNER_BOB, "'zz'"] {
-            assert!(!msg.contains(leak), "{label}: leaked {leak}: {msg}");
-        }
-        no_trace(&core);
-        assert_eq!(
-            rows_of(&core, OWNER_ALICE),
-            alice_rows,
-            "{label}: alice rows"
-        );
-        assert_eq!(rows_of(&core, OWNER_BOB), bob_rows, "{label}: bob rows");
-        (alice_rows, bob_rows)
-    };
+    let (alice_rows, bob_rows) =
+        {
+            // 待機上限は短くする（writer が残っていれば 55P03 で素早く失敗させるため）。
+            let core = open_core(&path, 2_000);
+            let alice_rows = rows_of(&core, OWNER_ALICE);
+            let bob_rows = rows_of(&core, OWNER_BOB);
+            let err = run(&core, who, fail_sql).expect_err(fail_sql);
+            assert_eq!(err.wire_code(), expected, "{label}: {err}");
+            let msg = err.to_string();
+            for leak in [OWNER_ALICE, OWNER_BOB, "'zz'"] {
+                assert!(!msg.contains(leak), "{label}: leaked {leak}: {msg}");
+            }
+            no_trace(&core);
+            assert_eq!(
+                rows_of(&core, OWNER_ALICE),
+                alice_rows,
+                "{label}: alice rows"
+            );
+            assert_eq!(rows_of(&core, OWNER_BOB), bob_rows, "{label}: bob rows");
+            // 失敗した DDL を実行した core が生存したまま、writer が解放されていること。
+            // 明示 Tx の書き込み（writer を取る）が 55P03 にならず通る。ROLLBACK で永続状態を汚さない。
+            {
+                let caller = ctx("tenant-carol-private");
+                let mut session = SessionState::default();
+                let mut txn = core.new_session_transaction();
+                core.execute_sql_in_txn(&caller, &mut session, &mut txn, "BEGIN")
+                    .expect("begin");
+                core.execute_sql_in_txn(
+                &caller,
+                &mut session,
+                &mut txn,
+                "INSERT INTO src (id, a, t) VALUES (901, 1, '1') USING OPERATION_ID 'probe-live'",
+            )
+            .unwrap_or_else(|e| {
+                panic!("{label}: writer must be free on the live core, got {}", e.wire_code())
+            });
+                core.execute_sql_in_txn(&caller, &mut session, &mut txn, "ROLLBACK")
+                    .expect("rollback");
+            }
+            (alice_rows, bob_rows)
+        };
     let after = snapshot(&path);
     assert_eq!(before, after, "{label}: persisted state must be unchanged");
 
