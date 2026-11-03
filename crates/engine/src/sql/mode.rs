@@ -204,6 +204,11 @@ pub struct SessionState {
     /// 構造的に存在しない（[`Self::allow_ddl`] 以外に本フィールドを変更する
     /// 公開手段を持たない）。`sql::privilege_gate` が唯一の判定点（`require_ddl_permission` はそのファサード）。
     ddl_allowed: bool,
+    /// ブートストラップで作られた初期ロールの「テナントのオブジェクトへの全権限」（SQL-39 (5)、Issue #2238）。
+    /// 既定 `false`。認証層（wire-server）が、永続化された初期権限を見て認証成功後に 1 回だけ立てる契約で、
+    /// SQL 文経由の経路は持たない。作用するのはオブジェクト権限（ACL）の判定だけで、DDL・テナント境界・
+    /// RLS には作用しない。`SET ROLE` で別ロールへ切り替えると効かなくなる（[`Self::owner_equivalent`]）。
+    bootstrap_all_privileges: bool,
     /// TASK-79（SQL-9）: `CREATE FUNCTION` で登録した宣言的 UDF のセッション単位
     /// レジストリ。`SessionState` 自体が接続（＝認証済みテナント）単位の値型であるため、
     /// UDF 定義が他接続・他テナントへ漏れる経路は構造上存在しない。永続化しない
@@ -589,6 +594,22 @@ impl SessionState {
     /// [`crate::sql::privilege_gate`] が唯一の判定点として参照する。
     pub fn ddl_allowed(&self) -> bool {
         self.ddl_allowed
+    }
+
+    /// オブジェクト権限の判定で「所有者相当」として ACL を飛ばす主体か。運用者権限（`ddl_allowed`）、または
+    /// 初期ロールの全権限で、現在のロールがセッションのロール本人のとき（`SET ROLE` 後は外れる。
+    /// PostgreSQL のスーパーユーザー相当の位置づけで、fail-closed）。DDL の可否は含まない（`ddl_allowed` のみ）。
+    pub fn owner_equivalent(&self) -> bool {
+        self.ddl_allowed
+            || (self.bootstrap_all_privileges
+                && self.current_role_id.is_some()
+                && self.current_role_id == self.session_role_id)
+    }
+
+    /// 初期ロールの全権限を付与する。認証層が認証成功後（ロールの束縛〔`bind_role_ids`〕と併せて）に 1 回だけ
+    /// 呼ぶ契約とし、SQL 文経由の経路は持たない。DDL 権限は与えない。
+    pub fn grant_bootstrap_all_privileges(&mut self) {
+        self.bootstrap_all_privileges = true;
     }
 
     /// オブジェクト権限（ACL）の検査がこのセッションに適用されるか（現在ロールが束縛済みか）。

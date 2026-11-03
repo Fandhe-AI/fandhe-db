@@ -57,7 +57,8 @@ pub(crate) fn execute_alter_default_privileges(
     let req = DefaultAclRequest {
         is_grant: stmt.is_grant,
         actor_id,
-        operator: crate::sql::privilege_gate::is_owner_equivalent(session),
+        // 運用者判定は DDL 権限のみ（初期ロールの全権限では FOR ROLE の SET 経路検査を免除しない。Issue #2238）。
+        operator: session.ddl_allowed(),
         for_roles: &stmt.roles,
         schemas: &stmt.schemas,
         kind: match stmt.target {

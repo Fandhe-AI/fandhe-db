@@ -204,8 +204,9 @@ impl RequestHandler for Router {
         let Method::Post = req.line.method;
 
         match resolve_target(req.line.target) {
-            Route::Endpoint(Endpoint::Session) => session_issue::handle(
+            Route::Endpoint(Endpoint::Session) => session_issue::handle_with_engine(
                 &self.users,
+                self.engine.as_deref(),
                 &self.sessions,
                 req.body,
                 Instant::now,

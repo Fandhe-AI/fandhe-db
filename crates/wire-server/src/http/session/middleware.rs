@@ -61,6 +61,8 @@ pub struct SessionPrincipal {
     /// （`http/query/ddl.rs` のみがこのフラグを読んで
     /// `SessionState::allow_ddl` を呼ぶ）。
     ddl_allowed: bool,
+    /// 認証済みユーザーに対応づけたカタログのロール（HTTP-4・Issue #2238。未束縛は `None`）。
+    role: Option<crate::http::session::store::SessionRole>,
 }
 
 impl SessionPrincipal {
@@ -74,12 +76,20 @@ impl SessionPrincipal {
     /// ここから受け取った値を engine の bound API へ渡す（engine の権限ゲートが SQL 表層と同じ判定を行う）。
     ///
     /// 契約: `ddl_allowed` は認証層（セッション発行）が確定した値の写しで、JSON 本文・パスから主体を
-    /// 変える経路は持たない。HTTP の現在ロールの束縛は認証済みユーザーとロールの紐付け（Issue #2238）がこの関数へ
-    /// 足す拡張点で、現状は未束縛（オブジェクト権限を判定しない移行期の主体。本番の挙動は従来と同一）。
+    /// 変える経路は持たない。認証済みユーザーに同名のカタログのロールが対応づいていれば、ここでロールを束縛する
+    /// （Issue #2238。pg wire の `handshake.rs` と同じ。初期ロールの全権限は経路を問わずここで写す）。
+    /// 対応づくロールが無い（カタログが正でないテナント）ときは未束縛のまま（従来と同一）。
     pub fn session_state(&self) -> engine::sql::mode::SessionState {
         let mut session = engine::sql::mode::SessionState::default();
         if self.ddl_allowed {
             session.allow_ddl();
+        }
+        if let Some(role) = &self.role {
+            session.set_session_user(&role.role_name);
+            session.bind_role_ids(role.role_id, role.role_id);
+            if role.all_object_privileges {
+                session.grant_bootstrap_all_privileges();
+            }
         }
         session
     }
@@ -142,6 +152,7 @@ pub fn authenticate(
         Some(grant) => Ok(SessionPrincipal {
             ctx: grant.ctx,
             ddl_allowed: grant.ddl_allowed,
+            role: grant.role,
         }),
         None => Err(MiddlewareError::Unknown),
     }
