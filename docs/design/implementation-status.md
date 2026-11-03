@@ -1579,22 +1579,19 @@ Issue #1405（fix(engine)!: CREATE TYPE の型名の重複を 42710 で返す。
 
 **Issue #1986（docs(design): コサイン距離の実装方式を比較し ADR に記録する。SQL-33・TASK-237／238 ポインタ。詳細は [cosine-distance-method.md](cosine-distance-method.md)）**: 正規化帰着（A）・保存時正規化（B／B′）・ノルム併用（C1：1 パス融合、C2：arena 常駐の行ノルム²）を、精度・メモリ・書き込みコスト・検索コストで比較した。実 pgvector 0.8.7 との照合で、A は未正規化入力で値が一致せず不採用、C1／C2 は最大差 3.8e-8（ほぼ重複行で 1.9e-7）。推奨は C2（追加 4 B/行・永続形式は不変）で、ステータスは Proposed（オーナー確認待ち）。計測は `crates/engine/benches/cosine_method_bench.rs`（`make bench-cosine-method`。手動専用・CI 非配線）。production のカーネルは変更しない（#1987 が実装）。
 
-**Issue #1994（crossdb ベンチハーネスと bench／examples を `<#>` へ統一）**
+**Issue #1994（crossdb ベンチハーネスと bench／examples の距離演算子。SQL-33 ポインタ。`<#>` への切替は延期）**
 
-親 #1989（SQL-33 のポインタ）で `<=>` がコサイン距離へ変わるのに備え、自作 DB 側の
-ハーネス・bench・example の SQL を `<#>`（負の内積・昇順）へ統一した。pgvector 側と
-同じ演算子・同じ意味（HNSW は `vector_ip_ops`）で比較できる。
+親 #1989 で `<=>` がコサイン距離へ変わるのに備えた切替だが、`<#>` の実行経路（#1977・#1991）が
+main に無く現行の `parse_order_by` は `<=>` のみ受理するため、実行 SQL の `<#>` 切替は延期した
+（実行系 bench・example・crossdb の自作 DB 側が実行時に失敗するのを避ける）。
 
-- 対象: `scripts/crossdb_bench/`、`crates/engine/benches/`、`crates/engine/examples/feature_bench.rs`、
-  ハーネス出力を検査する engine テスト（`c1_bench_accept`・`hybrid_profile_accept`・`scan_stage_profile_accept`）
-- 変更しない: `cosine_method_bench.rs` の pgvector 向け SQL（既にコサインの意味）
-- 静的検査: `scripts/tests/test_distance_operator_parity.py`（`make scripts-test` で CI が実行）
-- 暫定対処: `<#>` の実行経路（#1991）が main に無いため、実行系の `c1_bench_accept` の e2e と
-  `scan_stage_profile_accept` の `profile_arm_contract_*` だけは `<=>`（L2）へ置換して実行する。#1991 のマージ後に外す（復元は #1991 の完了条件として追跡する）
-- マージ順序の注意: `<#>` の SQL 実行経路が main に入るまで、`bench.yml` の週次／dispatch や `make bench-c1` など SQL を実行する bench・example・crossdb の自作 DB 側は実行時に失敗する（文字列検査のテストでは検知されない）。#1977・#1991 のマージ後に実行確認する
-- 未検証: `<#>` の実行は #1977・#1991 のマージ後に確認する。具体的には `c1_bench_accept` の
-  e2e オラクル照合、`scan_stage_profile_accept`、HNSW への到達（`EXPLAIN` の `engine: hnsw`）、
-  `self_db.py` の `explain`・`udf_call` が `unsupported` に丸められていないこと
+- 現状: `scripts/crossdb_bench/`、`crates/engine/benches/`、`crates/engine/examples/feature_bench.rs`、
+  関連 engine テストの SQL・docstring は `<=>` のまま（変更なし）
+- 静的検査: `scripts/tests/test_distance_operator_parity.py`（`make scripts-test` で CI が実行）。
+  自作 DB 側が `<=>`、pgvector 側が `<#>`・`vector_ip_ops` であることを固定する
+- 切替条件: #1977・#1991 のマージ後に、自作 DB 側の SQL を `<#>` へ統一し検査の期待値を同時に更新する
+  （`c1_bench_accept` の e2e オラクル照合・`scan_stage_profile_accept`・HNSW への到達・
+  `self_db.py` の `explain`／`udf_call` が `unsupported` に丸められないことを確認する）。#1991 の完了条件として追跡する
 
 **Issue #2009（feat(engine): kNN の `DESC` を全 metric で受理し索引不使用の全走査で返す。親 #2006・SQL-33 (2)・SQL-75 (4) ポインタ）**: 距離順 `ORDER BY <列> <距離演算子> <ベクトル>` の直後に `ASC`／`DESC`（文脈語・大文字小文字非区別）を受理する。`ParsedShape`・`ValidatedStatement`・`BoundStatement` に `distance_descending`（既定 `false`）を足し、公開 enum（`OrderByForm`・`Ranking`）と `AnnShapeInput` は変えていない（`ValidatedStatement::{distance_descending, with_distance_descending}` を追加）。`DESC` は `sql::exec` の DISTANCE 段で provider・ANN を通さず `exact_farthest_scan`（昇順経路と同じ候補・同じ内積・同じ除外規約で全走査し、`kernel::select_farthest_k` で「スコア低い順・同点は行番号昇順・NaN は先頭」に選出）へ分岐する。`SearchProvider` の公開契約は変えない。走査量はアリーナの既存上限で閉じ、長い走査は文の期限を確認する。`USING MODE 'precision'` との併用は確信度ゲートが遠い順で意味を持たないため `0A000`（自動運転の安全側判断）。NULLS 句・重複した方向語・`LIMIT` 省略・hybrid 関数形は従来どおり `42601`。`DESC` 後の `LIMIT`・`OFFSET` は受理し、実行段の `fetch_count()`／`skip_front()` で処理する（#2008）。`AnnPlan::PlainScanDescending`（`#[non_exhaustive]` enum への追加）を足し、`EXPLAIN` の `ann_plan:` 行は `plain_scan_descending`（索引名注記なし）。結合テストは `tests/sql_named/sql33_knn_desc.rs`（パラメータ化した `Metric` で、実行可能な種別ごとに全走査モデルと一致を確認）。`<->`・`<#>`・`<+>` の SQL 受理（#1977）と各カーネルの接続、`<=>` の意味切替（#1991）、NaN 行の順位付け（#2240）、`LIMIT` 省略（#2242）は対象外で、各 Issue のマージ時に種別ごとの SQL レベル一致テストを足す。
 

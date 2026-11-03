@@ -228,7 +228,7 @@ fn sql_hybrid_statement_embeds_vector_and_text() {
 fn sql_dense_statement_embeds_vector_literal() {
     let sql =
         sql_dense_statement("docs", "embedding", &[0.5, -0.5], 5).expect("well-formed statement");
-    assert!(sql.contains("embedding <#> '[0.5,-0.5]'"));
+    assert!(sql.contains("embedding <=> '[0.5,-0.5]'"));
     assert!(sql.contains("LIMIT 5"));
 }
 

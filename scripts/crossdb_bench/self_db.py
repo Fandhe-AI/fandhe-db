@@ -489,13 +489,13 @@ def _run_phases(
         # 構成にはこのフェーズを持たせない）。
         if is_hnsw and query_vecs:
             t0 = time.perf_counter()
-            _exec_ids(conn_a, f"SELECT id FROM docs ORDER BY embedding <#> '{query_vecs[0]}' LIMIT 10")
+            _exec_ids(conn_a, f"SELECT id FROM docs ORDER BY embedding <=> '{query_vecs[0]}' LIMIT 10")
             t1 = time.perf_counter()
             phases["hnsw_index_warm"] = {"first_query_us": (t1 - t0) * 1_000_000.0}
 
         # --- vector_knn ---
         def knn(qv):
-            sql = f"SELECT id FROM docs ORDER BY embedding <#> '{qv}' LIMIT 10"
+            sql = f"SELECT id FROM docs ORDER BY embedding <=> '{qv}' LIMIT 10"
             return _exec_ids(conn_a, sql)
 
         stats, _ = measure(knn, query_vecs)
@@ -507,7 +507,7 @@ def _run_phases(
         def knn_where(qv):
             sql = (
                 f"SELECT id FROM docs WHERE lang = 'ja' "
-                f"ORDER BY embedding <#> '{qv}' LIMIT 10"
+                f"ORDER BY embedding <=> '{qv}' LIMIT 10"
             )
             return _exec_ids(conn_a, sql)
 
@@ -576,7 +576,7 @@ def _run_phases(
         def mode_query(mode):
             def _run(qv):
                 sql = (
-                    f"SELECT id FROM docs ORDER BY embedding <#> '{qv}' "
+                    f"SELECT id FROM docs ORDER BY embedding <=> '{qv}' "
                     f"LIMIT 10 USING MODE '{mode}'"
                 )
                 return _exec_ids(conn_a, sql)
@@ -613,7 +613,7 @@ def _run_phases(
         def bulk_knn(k: int):
             def _run(qv):
                 return _exec_rows(
-                    f"SELECT id, body FROM docs ORDER BY embedding <#> '{qv}' LIMIT {k}"
+                    f"SELECT id, body FROM docs ORDER BY embedding <=> '{qv}' LIMIT {k}"
                 )
 
             return _run
@@ -630,7 +630,7 @@ def _run_phases(
         def bulk_knn_where(qv):
             return _exec_rows(
                 f"SELECT id, body FROM docs WHERE lang = 'ja' "
-                f"ORDER BY embedding <#> '{qv}' LIMIT 200"
+                f"ORDER BY embedding <=> '{qv}' LIMIT 200"
             )
 
         stats, last = measure(bulk_knn_where, query_vecs)
@@ -730,7 +730,7 @@ def _run_phases(
             qv0 = query_vecs[0]
             udf_sql = (
                 f"SELECT id, norm_scale(embedding, 2.0) AS score FROM docs "
-                f"ORDER BY embedding <#> '{qv0}' LIMIT 10"
+                f"ORDER BY embedding <=> '{qv0}' LIMIT 10"
             )
 
             def udf_call(_):
@@ -751,14 +751,14 @@ def _run_phases(
             )
 
         # --- explain ---
-        # 素の `ORDER BY embedding <#> '...'` に対する `EXPLAIN`（USING PLAN を伴わない
+        # 素の `ORDER BY embedding <=> '...'` に対する `EXPLAIN`（USING PLAN を伴わない
         # 検索 SELECT）は engine の `sql::explain` で受理される。pgvector と同じく
         # 計測し、出力の先頭行を記録する。許可リストで拒否される版（`42601`）のみ
         # unsupported とし、接続断・タイムアウト等の実行障害は再送出して計測全体を
         # 失敗させる（unsupported へ丸めると仕様変更に気づけない。codex-review P1）。
         def explain(qv):
             with conn_a.cursor() as cur:
-                cur.execute(f"EXPLAIN SELECT id FROM docs ORDER BY embedding <#> '{qv}' LIMIT 10")
+                cur.execute(f"EXPLAIN SELECT id FROM docs ORDER BY embedding <=> '{qv}' LIMIT 10")
                 return [r[0] for r in cur.fetchall()]
 
         try:

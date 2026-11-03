@@ -552,7 +552,7 @@ fn run_udf_phase(core: &EngineCore, ctx: &PolicyContext, query_vec_literal: &str
     .expect("CREATE FUNCTION should succeed");
     let sql = format!(
         "SELECT id, norm_scale(embedding, 2.0) AS score FROM docs \
-         ORDER BY embedding <#> '{query_vec_literal}' LIMIT 10"
+         ORDER BY embedding <=> '{query_vec_literal}' LIMIT 10"
     );
     let probe = core.execute_sql_in_session(ctx, &mut session, &sql);
     let extra = match &probe {
@@ -854,7 +854,7 @@ fn main() {
     let index_warm_start = Instant::now();
     let index_warm_probe = probe_core.execute_sql(
         &ctx_a_full,
-        &format!("SELECT * FROM docs ORDER BY embedding <#> '{qv0}' LIMIT 10"),
+        &format!("SELECT * FROM docs ORDER BY embedding <=> '{qv0}' LIMIT 10"),
     );
     let index_warm_us = index_warm_start.elapsed().as_micros() as u64;
     if let Err(e) = index_warm_probe {
@@ -899,13 +899,13 @@ fn main() {
 
     // 許可リスト構文（`sql::allowlist`）は非集計 `SELECT` に `ORDER BY` を必須と
     // するため（`LIMIT` 単体では受理されない）、`WHERE` フィルタの効果を見るために
-    // `ORDER BY embedding <#> '<vec>'` を併記する（`tests/sql_surface.rs` の
+    // `ORDER BY embedding <=> '<vec>'` を併記する（`tests/sql_surface.rs` の
     // `WHERE lang = 'ja' ORDER BY ... LIMIT ...` と同じ形）。
     phases.push(run_select_phase(
         "point_where",
         &core,
         &ctx_a_full,
-        &format!("SELECT * FROM docs WHERE lang = 'ja' ORDER BY embedding <#> '{qv0}' LIMIT 10"),
+        &format!("SELECT * FROM docs WHERE lang = 'ja' ORDER BY embedding <=> '{qv0}' LIMIT 10"),
     ));
     phases.push(run_select_phase(
         "where_compound",
@@ -935,13 +935,13 @@ fn main() {
         "vector_knn",
         &core,
         &ctx_a_full,
-        &format!("SELECT * FROM docs ORDER BY embedding <#> '{qv0}' LIMIT 10"),
+        &format!("SELECT * FROM docs ORDER BY embedding <=> '{qv0}' LIMIT 10"),
     ));
     phases.push(run_select_phase(
         "vector_knn_where",
         &core,
         &ctx_a_full,
-        &format!("SELECT * FROM docs WHERE lang = 'ja' ORDER BY embedding <#> '{qv1}' LIMIT 10"),
+        &format!("SELECT * FROM docs WHERE lang = 'ja' ORDER BY embedding <=> '{qv1}' LIMIT 10"),
     ));
     phases.push(run_select_phase(
         "hybrid_rrf",
@@ -956,14 +956,14 @@ fn main() {
         "mode_recall",
         &core,
         &ctx_a_full,
-        &format!("SELECT * FROM docs ORDER BY embedding <#> '{qv0}' LIMIT 10 USING MODE 'recall'"),
+        &format!("SELECT * FROM docs ORDER BY embedding <=> '{qv0}' LIMIT 10 USING MODE 'recall'"),
     ));
     phases.push(run_mode_phase(
         "mode_precision",
         &core,
         &ctx_a_full,
         &format!(
-            "SELECT * FROM docs ORDER BY embedding <#> '{qv0}' LIMIT 10 USING MODE 'precision'"
+            "SELECT * FROM docs ORDER BY embedding <=> '{qv0}' LIMIT 10 USING MODE 'precision'"
         ),
     ));
     phases.push(run_rls_isolation_phase(

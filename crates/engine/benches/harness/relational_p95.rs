@@ -220,7 +220,7 @@ pub fn predicate_statements(
     literal: &VectorLiteral,
 ) -> Result<Vec<(&'static str, String)>, RelationalP95Error> {
     check_identifier("table", table)?;
-    let tail = format!("ORDER BY embedding <#> '{literal}' LIMIT {PRED_LIMIT}");
+    let tail = format!("ORDER BY embedding <=> '{literal}' LIMIT {PRED_LIMIT}");
     let in_list = (0..8)
         .map(|i| format!("'{}'", lang_token(i)))
         .collect::<Vec<_>>()
@@ -403,7 +403,7 @@ pub fn is_exact_id_set(ids: &[u64], expected_sorted: &[u64]) -> bool {
 }
 
 /// 検索カーネルのスコア（内積。大きいほど近い。`kernel.rs` の `dot`）に対応する距離 `-dot(a, b)`。
-/// `ORDER BY embedding <#> q` は正規化なしの内積で並ぶため、期待順序を fixture から独立に求める
+/// `ORDER BY embedding <=> q` は正規化なしの内積で並ぶため、期待順序を fixture から独立に求める
 /// 参照実装は f64 の負の内積とする（コサイン距離だと順位が入れ替わる）。
 pub fn inner_product_distance(a: &[f32], b: &[f32]) -> f64 {
     -a.iter()
@@ -432,7 +432,7 @@ pub fn sentinel_dominates(sentinel_dot: f64, max_fixture_dot: f64) -> bool {
 /// 距離の同値境界を許容する幅（エンジンの f32 内積と f64 参照実装の累積誤差を吸収する）。
 pub const DISTANCE_EPS: f64 = 1e-3;
 
-/// 述語 arm（`ORDER BY embedding <#> q LIMIT k`）の返却 id 列が期待どおりかを照合する。
+/// 述語 arm（`ORDER BY embedding <=> q LIMIT k`）の返却 id 列が期待どおりかを照合する。
 /// `ranked` は述語を満たす全自テナント行の `(id, 距離)` を距離昇順に並べたもの。
 /// 件数が `min(k, ranked.len())`・id が重複しない・返却行が上位 k の距離内（境界は `DISTANCE_EPS`）・
 /// 境界より明確に近い行の取りこぼしが無い・返却順が距離の昇順、をすべて満たすときだけ true。

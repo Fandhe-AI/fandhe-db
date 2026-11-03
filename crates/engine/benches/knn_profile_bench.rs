@@ -1,7 +1,7 @@
 //! KNN 経路の段別内訳プロファイル（Issue #362。親 Issue #361「ベクトル検索・
 //! ストレージレイアウト最適化」Phase 5 の起点タスク）。
 //!
-//! SQL 表層経由の KNN（`SELECT id FROM docs ORDER BY embedding <#> '<vec>' LIMIT 10`。
+//! SQL 表層経由の KNN（`SELECT id FROM docs ORDER BY embedding <=> '<vec>' LIMIT 10`。
 //! 25,000 行・dim128）のレイテンシについて、どの段が支配的かを段別に実測する。
 //! `sql_c1_bench.rs`（TASK-83）は SQL 表層全体の p95 を単一の数値として測るのに対し、
 //! 本ベンチは redb 走査・ヘッダデコード・f32 デコード・arena 構築・距離計算・Top-k
@@ -1780,7 +1780,7 @@ fn run_hot_only(
         // `EXPLAIN` は `USING PLAN(...)` 文にのみ対応する契約
         // （`sql/allowlist.rs`「EXPLAIN is only supported for SELECT ... USING
         // PLAN(...) statements」）で、本モードが使う `c1_statement`（`ORDER BY
-        // embedding <#> '<vec>' LIMIT k`。`USING PLAN` を伴わない）には使えない。
+        // embedding <=> '<vec>' LIMIT k`。`USING PLAN` を伴わない）には使えない。
         // 代わりに `EngineCore::search_engine_kind()`（pub API）の `Display` 出力
         // （`search_engine.rs`: `"hnsw(...,resident=<value>)"`）で要求精度が実際に
         // 構築へ到達したことを確認する（`tests/fixtures/recall_engine.rs::

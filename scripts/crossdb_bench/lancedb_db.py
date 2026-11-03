@@ -1,6 +1,6 @@
 """LanceDB 0.38.0（in-process）の機能別ベンチマーク実装。
 
-距離指標は自作 DB の `<#>`（負の内積）に合わせ `metric="dot"` を使う。
+距離指標は自作 DB の `<=>`（内積）に合わせ `metric="dot"` を使う。
 `--config hnsw` は `index_type="IVF_HNSW_FLAT"`（量子化なし・m=16・
 ef_construction=100）、`exact` は索引を作らず brute-force。
 

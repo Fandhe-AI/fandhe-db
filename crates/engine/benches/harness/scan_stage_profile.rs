@@ -21,7 +21,7 @@
 //!   （tenant-b 接続）は同一の `COUNT(*)`＝23,000 を返す同一走査であり、差は
 //!   `PolicyContext` のテナント文字列のみ。
 //! - `vector_knn_where`（`SELECT id FROM docs WHERE lang = 'ja' ORDER BY embedding
-//!   <#> '<vec>' LIMIT 10`）は `sql/exec.rs::execute_statement_with_cache` を通り、
+//!   <=> '<vec>' LIMIT 10`）は `sql/exec.rs::execute_statement_with_cache` を通り、
 //!   `WHERE` があるため `cache_fast_path_eligible = false`。`SqlArenaCache`
 //!   ヒット時は全可視行に対し `on_visible_row`（`row_codec::scan_scalar_columns`
 //!   で全列を借用スキャン → `matches_all`）を呼び、一致行の embedding のみを

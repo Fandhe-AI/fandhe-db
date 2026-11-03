@@ -597,7 +597,7 @@ fn profile_arm_contract_matches_scalar_index_cache_stats() {
         .map(|id| {
             let lang = lang_for_id(id, 3);
             // `+ 1.0` でゼロベクトル（`id=0`）を避ける。ゼロノルムのベクトルは
-            // `<#>` の距離計算・`vec_norm(embedding) > 0` 述語のいずれでも
+            // `<=>` の距離計算・`vec_norm(embedding) > 0` 述語のいずれでも
             // 特別扱いになりうり、本テストの意図（index/plain 両アームの id
             // 集合一致）とは無関係な差異を生むため。
             (id, vec![id as f32 + 1.0, 0.0, 0.0, 0.0], lang)
@@ -642,8 +642,6 @@ fn profile_arm_contract_matches_scalar_index_cache_stats() {
 
     let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
 
-    // Issue #1994: `<#>` の実行経路（Issue #1991）が main に入るまで、実行系の本テストだけは
-    // 現行で実行可能な `<=>`（L2）を使う。#1991 のマージ後に `<#>` へ戻す（追跡: #1991 の完了条件）。
     let sql_index = format!(
         // `LIMIT` を一致件数（10）以上に取り、Top-k がタイブレーク順序に依存
         // せず一致行集合の全体（部分集合ではなく）になるようにする（クエリ

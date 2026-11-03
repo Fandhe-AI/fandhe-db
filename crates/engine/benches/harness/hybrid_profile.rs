@@ -580,7 +580,7 @@ pub fn sql_hybrid_statement_with_projection(
 }
 
 /// 密 KNN のみの対照クエリ文字列を組み立てる: `SELECT * FROM <table> ORDER BY
-/// <vector_column> <#> '<literal>' LIMIT <k>`（`sql_c1.rs::c1_statement` と同型だが
+/// <vector_column> <=> '<literal>' LIMIT <k>`（`sql_c1.rs::c1_statement` と同型だが
 /// `SELECT *` にして hybrid 側と投影コストを揃える）。
 pub fn sql_dense_statement(
     table: &str,
@@ -598,7 +598,7 @@ pub fn sql_dense_statement(
 }
 
 /// 密 KNN のみのクエリ文字列を投影種別付きで組み立てる（Issue #465）:
-/// `SELECT <id|*> FROM <table> ORDER BY <vector_column> <#> '<literal>' LIMIT
+/// `SELECT <id|*> FROM <table> ORDER BY <vector_column> <=> '<literal>' LIMIT
 /// <k>`。[`sql_dense_statement`]（`HybridProjection::Star` 固定）はこの関数の
 /// ラッパ。
 pub fn sql_dense_statement_with_projection(
@@ -617,7 +617,7 @@ pub fn sql_dense_statement_with_projection(
     let literal = vector_literal(query_vector)?;
     let select_list = projection.select_list();
     Ok(format!(
-        "SELECT {select_list} FROM {table} ORDER BY {vector_column} <#> '{literal}' LIMIT {k}"
+        "SELECT {select_list} FROM {table} ORDER BY {vector_column} <=> '{literal}' LIMIT {k}"
     ))
 }
 
