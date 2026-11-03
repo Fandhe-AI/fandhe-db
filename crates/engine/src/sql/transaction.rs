@@ -648,13 +648,19 @@ struct ActiveTxn<'e> {
 /// フィールドの宣言順が drop 順で、トランザクションをストアより先に破棄する。
 pub(crate) struct TempTxn {
     txn: crate::storage::GatedWriteTxn,
+    /// 一時側の巻き戻し先となる redb の ephemeral savepoint（Issue #2879）。一時の書き込み
+    /// トランザクションを開いた直後（テーブルを開く前）に明示 Tx でだけ取る。`txn` の後に宣言して
+    /// いるため、abort 時は `txn` が先に drop される。commit では確定処理の前に破棄する。
+    base: Option<redb::Savepoint>,
     store: std::sync::Arc<crate::sql::temp_rows::TempRowStore>,
 }
 
 impl TempTxn {
     /// 一時側を確定する。永続側の commit 成功後にだけ呼ぶ。
     fn commit(self) -> Result<(), SqlSurfaceError> {
-        let Self { txn, store } = self;
+        let Self { txn, base, store } = self;
+        // COMMIT が始まった後は巻き戻さない。redb のページ解放を妨げないよう先に破棄する。
+        drop(base);
         store.commit(txn)
     }
 }
@@ -1285,45 +1291,133 @@ impl<'e> SessionTransaction<'e> {
         }
     }
 
-    /// `SAVEPOINT name`（SQL-69・Issue #1942・#1943）。明示 Tx の `Active` でだけ受理して push する。
+    /// `SAVEPOINT name`（SQL-69・Issue #1942・#1943・#2879）。明示 Tx の `Active` でだけ受理して push する。
     /// `Idle` は `25P01`（状態不変）、暗黙 Tx は abort して `25P01`、`Failed` は `25P02`。
     /// 文数・持続時間の上限に計上する（スタック長を文数上限で有界にする）。
     ///
-    /// writer 取得済みなら redb の `ephemeral_savepoint` を probe にして巻き戻せるかを決める。
-    /// 成功すれば `Restorable`（最初の成功を基底 savepoint として保持）、dirty なら
-    /// `Unrestorable`。engine 側の書き込み記録には頼らない（記録漏れで巻き戻し過ぎないため）。
+    /// 巻き戻し方は [`Self::plan_savepoint`] が決める。writer が未取得・未書き込み（redb の
+    /// `ephemeral_savepoint` が成功）なら `Restorable`、書き込み済みなら確定済み状態との行単位差分を
+    /// 保存した `Imaged`、差分を取れない（未知の型のテーブル・上限超過）なら `Unrestorable`。
+    /// engine 側の書き込み記録には頼らない（記録漏れで巻き戻し過ぎ・過少にならない）。
+    /// `SAVEPOINT` 文自体は `Unrestorable` でも成功する（PostgreSQL と同じ）。
     pub fn savepoint(&mut self, name: &str, session: &SessionState) -> Result<(), SqlSurfaceError> {
         self.check_savepoint_state()?;
         self.check_and_register_statement(None)?;
-        let kind = match &mut self.state {
-            TxnState::Active(active) => Self::probe_savepoint_kind(active),
+        let max_duration = self.limits.max_duration;
+        let plan = match &mut self.state {
+            TxnState::Active(active) => Self::plan_savepoint(active, max_duration),
             _ => Err(internal_error()),
         };
-        match kind {
-            Ok(kind) => {
+        match plan {
+            Ok(plan) => {
                 if let TxnState::Active(active) = &mut self.state {
+                    use crate::sql::savepoint::SavepointKind;
                     let wm = active.cursors.next_id();
-                    // 巻き戻せる savepoint だけ書き込み記録を複製する（ROLLBACK TO で復元。Issue #1945）。
-                    let marks =
-                        (kind == crate::sql::savepoint::SavepointKind::Restorable).then(|| {
-                            crate::sql::savepoint::WriteMarks {
-                                has_writes: active.has_writes,
-                                written_tables: active.written_tables.clone(),
-                                written_by_tenant: active.written_by_tenant.clone(),
-                            }
-                        });
                     let op_wm = active.seen_operation_ids.len();
-                    active
-                        .savepoints
-                        .push(name, kind, session, wm, op_wm, marks);
+                    // 巻き戻せる savepoint だけ書き込み記録を複製する（ROLLBACK TO で復元。Issue #1945）。
+                    let marks = crate::sql::savepoint::WriteMarks {
+                        has_writes: active.has_writes,
+                        written_tables: active.written_tables.clone(),
+                        written_by_tenant: active.written_by_tenant.clone(),
+                    };
+                    match plan {
+                        SavepointPlan::Restorable => active.savepoints.push(
+                            name,
+                            SavepointKind::Restorable,
+                            session,
+                            wm,
+                            op_wm,
+                            Some(marks),
+                        ),
+                        SavepointPlan::Imaged(image) => active
+                            .savepoints
+                            .push_imaged(name, session, wm, op_wm, marks, *image),
+                        SavepointPlan::Unrestorable => active.savepoints.push(
+                            name,
+                            SavepointKind::Unrestorable,
+                            session,
+                            wm,
+                            op_wm,
+                            None,
+                        ),
+                    }
                 }
                 Ok(())
             }
             Err(e) => {
-                // 基底の取得失敗は不変条件違反。復帰の余地を残さない（Issue #1947）。
+                // 基底の取得失敗・差分の読み取り失敗は不変条件違反。復帰の余地を残さない（Issue #1947）。
                 self.fail_unrecoverable();
                 Err(e)
             }
+        }
+    }
+
+    /// `SAVEPOINT` 時点の巻き戻し方を決める（Issue #2879）。永続側（writer）と一時側（TABLE-44）の
+    /// 両方を調べ、どちらかが書き込み済みなら確定済み状態との差分を [`StateImage`] に保存する。
+    /// 差分は redb の実内容から取る（`storage::table_image`）。上限（savepoint 1 個・Tx 全体）と
+    /// Tx の持続時間の期限を超える・未知の型のテーブルがある場合は `Unrestorable`
+    /// （`ROLLBACK TO` が `0A000` で fail-closed）。redb の読み取り失敗は固定文言の `XX000`。
+    fn plan_savepoint(
+        active: &mut ActiveTxn<'_>,
+        max_duration: Duration,
+    ) -> Result<SavepointPlan, SqlSurfaceError> {
+        use crate::storage::table_image::{
+            capture, Capture, Meter, MAX_IMAGE_BYTES_PER_SAVEPOINT, MAX_IMAGE_BYTES_PER_TXN,
+        };
+        let limit = MAX_IMAGE_BYTES_PER_SAVEPOINT
+            .min(MAX_IMAGE_BYTES_PER_TXN.saturating_sub(active.savepoints.image_bytes_total()));
+        let mut meter = Meter::new(limit, active.started_at.checked_add(max_duration));
+        let mut image = crate::sql::savepoint::StateImage::default();
+        let mut needs_image = false;
+        if let Some(writer) = active.writer.as_deref() {
+            match writer.ephemeral_savepoint() {
+                Ok(sp) => {
+                    // permit を持つ間は確定状態が変わらないため、後続の probe は同じ root を指す。
+                    // 基底が既にあれば新しい方は捨てる（drop）。
+                    if active.savepoint_base.is_none() {
+                        active.savepoint_base = Some(sp);
+                    }
+                }
+                Err(redb::SavepointError::InvalidSavepoint) => {
+                    // 書き込み済み（dirty）。基底が無ければ戻し先が無い。
+                    if active.savepoint_base.is_none() {
+                        return Ok(SavepointPlan::Unrestorable);
+                    }
+                    let committed = open_read_snapshot(active.storage)?;
+                    match capture(writer, &committed, &mut meter).map_err(|_| internal_error())? {
+                        Capture::Gate => return Ok(SavepointPlan::Unrestorable),
+                        Capture::Image(img) => {
+                            if !img.is_empty() {
+                                image.dirty_tables =
+                                    collect_dirty_tables(active.storage, writer, &HashSet::new())?;
+                                image.persistent = Some(img);
+                                needs_image = true;
+                            }
+                        }
+                    }
+                }
+                Err(_) => return Err(internal_error()),
+            }
+        }
+        if let Some(t) = active.temp.as_ref() {
+            if t.base.is_none() {
+                return Ok(SavepointPlan::Unrestorable);
+            }
+            let committed = t.store.committed_read()?;
+            match capture(&t.txn, &committed, &mut meter).map_err(|_| internal_error())? {
+                Capture::Gate => return Ok(SavepointPlan::Unrestorable),
+                Capture::Image(img) => {
+                    if !img.is_empty() {
+                        image.temp = Some(img);
+                        needs_image = true;
+                    }
+                }
+            }
+        }
+        if needs_image {
+            Ok(SavepointPlan::Imaged(Box::new(image)))
+        } else {
+            Ok(SavepointPlan::Restorable)
         }
     }
 
@@ -1358,7 +1452,12 @@ impl<'e> SessionTransaction<'e> {
         let result = match &mut self.state {
             TxnState::Active(active) => {
                 let r = active.savepoints.release(name);
-                if r.is_ok() && !active.savepoints.has_restorable() {
+                // 明示 Tx の基底は COMMIT／ROLLBACK まで保持する（Issue #2879。後の SAVEPOINT が
+                // 書き込み済みの状態を基底 + 差分で巻き戻すため）。
+                if r.is_ok()
+                    && active.origin != TxnOrigin::Explicit
+                    && !active.savepoints.has_rollbackable()
+                {
                     active.savepoint_base = None;
                 }
                 r
@@ -1376,10 +1475,11 @@ impl<'e> SessionTransaction<'e> {
     /// 残す。writer・登録・読み取りスナップショットには触れず、writer は Tx の終了まで保持する
     /// （SQL-69 (3) のポインタ）。
     ///
-    /// fail-closed（いずれも Tx を `Failed` へ倒す）: 無い名前は `3B001`、書き込み後に作った
-    /// （`Unrestorable`）savepoint と一時表の書き込みトランザクションが開いている場合は
-    /// `0A000`、基底欠落・redb エラーは `XX000`。取り消したつもりの書き込みが後続の `COMMIT`
-    /// で確定する fail-open を作らない。
+    /// fail-closed（いずれも Tx を `Failed` へ倒す）: 無い名前は `3B001`、差分を取れなかった
+    /// （`Unrestorable`。未知の型のテーブル・上限超過）savepoint は `0A000`、基底欠落・redb
+    /// エラー・再適用後の世代の不一致は `XX000`。取り消したつもりの書き込みが後続の `COMMIT`
+    /// で確定する fail-open を作らない。書き込み後の savepoint と一時表を使った Tx は、基底へ
+    /// 復元した後に `SAVEPOINT` 時に保存した差分を再適用して戻す（Issue #2879）。
     ///
     /// 不変条件: `restore_savepoint` は開いているテーブルのハンドルがあると panic する。本関数は
     /// 文の境界（`core.rs` の `ParsedSql::Transaction` 分岐）でだけ呼ばれ、その時点でハンドルは
@@ -1494,34 +1594,65 @@ impl<'e> SessionTransaction<'e> {
     ) -> Result<(), SqlSurfaceError> {
         use crate::sql::savepoint::SavepointKind;
         match active.savepoints.kind_at(pos) {
-            Some(SavepointKind::Restorable) => {}
+            Some(SavepointKind::Restorable | SavepointKind::Imaged) => {}
             Some(SavepointKind::Unrestorable) => {
                 return Err(SqlSurfaceError::feature_not_supported(
-                    "ROLLBACK TO SAVEPOINT is not supported for a savepoint established after \
-                     writes in the transaction",
+                    "ROLLBACK TO SAVEPOINT is not supported for this savepoint because its \
+                     state could not be captured after writes in the transaction",
                 ));
             }
             None => return Err(internal_error()),
         }
-        // 一時表は別の in-memory ストアにあり、本経路では巻き戻せない。片側だけ巻き戻る
-        // fail-open を避けるため拒否する。
-        if active.temp.is_some() {
-            return Err(SqlSurfaceError::feature_not_supported(
-                "ROLLBACK TO SAVEPOINT is not supported in a transaction that used temporary tables",
-            ));
+        // 変更前に、永続側・一時側の戻し先がそろっていることを全部検査する（片側だけ巻き戻る
+        // fail-open を作らない）。
+        if active.writer.is_some() && active.savepoint_base.is_none() {
+            return Err(internal_error());
         }
-        if let Some(writer) = active.writer.as_deref_mut() {
-            let Some(base) = active.savepoint_base.as_ref() else {
+        if active.temp.as_ref().is_some_and(|t| t.base.is_none()) {
+            return Err(internal_error());
+        }
+        let ActiveTxn {
+            writer,
+            temp,
+            savepoint_base,
+            savepoints,
+            storage,
+            ..
+        } = &mut *active;
+        let image = savepoints.image_at(pos);
+        if let Some(writer) = writer.as_deref_mut() {
+            let Some(base) = savepoint_base.as_ref() else {
                 return Err(internal_error());
             };
             writer
                 .restore_savepoint(base)
                 .map_err(|_| internal_error())?;
-            // 突き合わせ（fail-closed）: 復元後の表世代は確定状態と一致するはず。差分が残る・
-            // 世代の読み取りに失敗する場合は不変条件違反なので、記録を縮める前に拒否する。
-            let residual = collect_dirty_tables(active.storage, writer, &HashSet::new())?;
-            if !residual.is_empty() {
+            // 書き込み後の savepoint は、基底へ戻した後に保存した差分を再適用する（Issue #2879）。
+            if let Some(img) = image.and_then(|i| i.persistent.as_ref()) {
+                crate::storage::table_image::apply(writer, img).map_err(|_| internal_error())?;
+            }
+            // 突き合わせ（fail-closed）: 復元後の表世代は savepoint 時点（`Restorable` は確定状態）と
+            // 一致するはず。差分が残る・世代の読み取りに失敗する場合は不変条件違反なので、記録を
+            // 縮める前に拒否する。
+            let residual = collect_dirty_tables(storage, writer, &HashSet::new())?;
+            let expected_empty = HashSet::new();
+            let expected = image.map_or(&expected_empty, |i| &i.dirty_tables);
+            if &residual != expected {
                 return Err(internal_error());
+            }
+        }
+        // 一時側（TABLE-44）も基底へ戻して差分を再適用する。savepoint より後に初めて一時表を使った
+        // 場合は、差分なし = 基底（空）へ戻す。永続側の適用後に失敗しても `XX000` は復帰不可の
+        // `Failed` になり、COMMIT できない。
+        if let Some(t) = temp.as_mut() {
+            let Some(base) = t.base.as_ref() else {
+                return Err(internal_error());
+            };
+            t.txn
+                .restore_savepoint(base)
+                .map_err(|_| internal_error())?;
+            if let Some(img) = image.and_then(|i| i.temp.as_ref()) {
+                crate::storage::table_image::apply(&t.txn, img).map_err(|_| internal_error())?;
             }
         }
         // セッション状態（TimeZone・search_path・セッション UDF 等）も savepoint 時点へ戻す。
@@ -1643,7 +1774,7 @@ impl<'e> SessionTransaction<'e> {
             _ => return,
         };
         active.savepoints.truncate_from(pos);
-        if !active.savepoints.has_restorable() {
+        if active.origin != TxnOrigin::Explicit && !active.savepoints.has_rollbackable() {
             active.savepoint_base = None;
         }
     }
@@ -1845,8 +1976,18 @@ impl<'e> SessionTransaction<'e> {
             return Err(internal_error());
         };
         if active.temp.is_none() {
+            let txn = store.begin_write()?;
+            // 明示 Tx では巻き戻し先の基底 savepoint を、テーブルを開く前のここで取る
+            // （Issue #2879。redb は dirty な writer からは作れない）。暗黙 Tx は `SAVEPOINT` を
+            // 受理しないため取らない（一時ストアのページ解放を遅らせない）。
+            let base = if active.origin == TxnOrigin::Explicit {
+                Some(txn.ephemeral_savepoint().map_err(|_| internal_error())?)
+            } else {
+                None
+            };
             active.temp = Some(TempTxn {
-                txn: store.begin_write()?,
+                txn,
+                base,
                 store: std::sync::Arc::clone(store),
             });
         }
@@ -1954,9 +2095,10 @@ impl<'e> SessionTransaction<'e> {
                 };
                 active.writer = Some(w);
                 // 巻き戻し先の基底 savepoint を、writer がまだテーブルを開く前のここで取る
-                // （Issue #1943。redb は dirty な writer からは作れない）。`Restorable` が無ければ
-                // 取らない（通常の Tx に追跡の負担を足さない）。
-                if active.savepoints.has_restorable() {
+                // （Issue #1943。redb は dirty な writer からは作れない）。明示 Tx では、後の
+                // `SAVEPOINT` が書き込み済みの状態を基底 + 差分で巻き戻せるよう（Issue #2879）、
+                // 常に取る。暗黙 Tx は巻き戻せる savepoint があるときだけ取る。
+                if active.origin == TxnOrigin::Explicit || active.savepoints.has_rollbackable() {
                     match active.writer.as_deref().map(|w| w.ephemeral_savepoint()) {
                         Some(Ok(sp)) => active.savepoint_base = Some(sp),
                         _ => base_failed = true,
@@ -2177,14 +2319,14 @@ impl<'e> SessionTransaction<'e> {
     }
 
     /// 失敗した `Active` を `ROLLBACK TO` 復帰用に保持してよいか（Issue #1947）。明示 Tx で、
-    /// 巻き戻せる savepoint があり、一時表を使っておらず（`ROLLBACK TO` は `0A000` 確定）、
-    /// 巻き戻し先（writer 未取得、または基底 savepoint）が存在するときだけ真。それ以外は
+    /// 巻き戻せる savepoint があり、巻き戻し先（writer 未取得、または基底 savepoint。一時側も
+    /// 同様。Issue #2879）が存在するときだけ真。それ以外は
     /// 従来どおり即時に writer を解放する。
     fn is_recoverable(active: &ActiveTxn<'_>) -> bool {
         active.origin == TxnOrigin::Explicit
-            && active.savepoints.has_restorable()
-            && active.temp.is_none()
+            && active.savepoints.has_rollbackable()
             && (active.writer.is_none() || active.savepoint_base.is_some())
+            && active.temp.as_ref().is_none_or(|t| t.base.is_some())
     }
 
     /// 復帰させてはならない失敗（内部エラー・直列化失敗）か。
@@ -2334,6 +2476,13 @@ fn open_read_snapshot(
 ) -> Result<redb::ReadTransaction, SqlSurfaceError> {
     use redb::ReadableDatabase;
     storage.db().begin_read().map_err(|_| internal_error())
+}
+
+/// [`SessionTransaction::plan_savepoint`] の結果（`SAVEPOINT` 時点の巻き戻し方）。
+enum SavepointPlan {
+    Restorable,
+    Imaged(Box<crate::sql::savepoint::StateImage>),
+    Unrestorable,
 }
 
 /// 内部エラー（`XX000`）。他テナントの情報を含まない固定文言。
@@ -2806,6 +2955,59 @@ mod tests {
         txn.rollback_to_savepoint("a", &mut SessionState::default())
             .unwrap();
         assert_eq!(txn.release_savepoint("b").unwrap_err().wire_code(), "3B001");
+    }
+
+    /// Issue #2879: 差分を取れない（未知の型のテーブルがある）書き込み後の savepoint は
+    /// `Unrestorable` に落ち、`ROLLBACK TO` は `0A000` で Tx を `Failed` にする（fail-closed）。
+    /// `SAVEPOINT` 文自体は成功する。失敗後の `COMMIT` は何も確定させない。
+    #[test]
+    fn post_write_savepoint_with_unknown_table_shape_fails_closed() {
+        const UNKNOWN: redb::TableDefinition<u8, u8> = redb::TableDefinition::new("gate_probe");
+        let (storage, _guard) = open_test_storage("savepoint-unknown-shape");
+        let (mut txn, mut session) = explicit_txn(&storage);
+        txn.ensure_writer(&test_ctx()).unwrap();
+        {
+            let w = txn.write_txn().expect("writer");
+            w.open_table(UNKNOWN).unwrap().insert(1, 1).unwrap();
+        }
+        txn.savepoint("a", &session).unwrap();
+        let err = txn.rollback_to_savepoint("a", &mut session).unwrap_err();
+        assert_eq!(err.wire_code(), "0A000");
+        assert_eq!(txn.status(), TransactionStatus::Failed);
+        assert_eq!(txn.commit(&mut session).unwrap_err().wire_code(), "25P02");
+        txn.rollback(&mut session).unwrap();
+        // 何も確定していない。
+        use redb::ReadableDatabase;
+        let r = storage.db().begin_read().unwrap();
+        assert!(r.open_table(UNKNOWN).is_err());
+    }
+
+    /// Issue #2879: 書き込み済みの writer の savepoint は差分を保存し、`ROLLBACK TO` で戻る。
+    #[test]
+    fn post_write_savepoint_restores_via_image() {
+        const PROBE: redb::TableDefinition<&str, u64> =
+            redb::TableDefinition::new("table_generation");
+        let (storage, _guard) = open_test_storage("savepoint-image");
+        let (mut txn, mut session) = explicit_txn(&storage);
+        txn.ensure_writer(&test_ctx()).unwrap();
+        {
+            let w = txn.write_txn().expect("writer");
+            w.open_table(PROBE).unwrap().insert("x", 1).unwrap();
+        }
+        txn.savepoint("a", &session).unwrap();
+        {
+            let w = txn.write_txn().expect("writer");
+            let mut t = w.open_table(PROBE).unwrap();
+            t.insert("x", 2).unwrap();
+            t.insert("y", 3).unwrap();
+        }
+        txn.rollback_to_savepoint("a", &mut session).unwrap();
+        assert_eq!(txn.status(), TransactionStatus::InTransaction);
+        let w = txn.write_txn().expect("writer");
+        use redb::ReadableTable;
+        let t = w.open_table(PROBE).unwrap();
+        assert_eq!(t.get("x").unwrap().unwrap().value(), 1);
+        assert!(t.get("y").unwrap().is_none());
     }
 
     /// 無い名前は `3B001` で Tx を `Failed` にする。

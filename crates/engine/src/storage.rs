@@ -34,6 +34,7 @@ pub(crate) mod commit_log;
 mod power_loss_model;
 pub(crate) mod read_source;
 pub(crate) mod rowid;
+pub(crate) mod table_image;
 pub(crate) mod writer_gate;
 
 /// 行ストアの物理キー型（対象ビヘイビア: TABLE-12。ポインタ:

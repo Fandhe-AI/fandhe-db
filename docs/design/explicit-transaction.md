@@ -877,8 +877,7 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
   は `42601`（fail-closed）。引用識別子 `"READ"` も受理される（既存の `"WORK"` と同じ性質）。
 - savepoint（`SAVEPOINT`／`RELEASE`／`ROLLBACK TO`）は親 #1941 配下で実装済み（#1942〜#1947）。詳細は「SAVEPOINT 構文と savepoint スタック」「savepoint の redb 結線」「savepoint 巻き戻しと冪等台帳」「savepoint 巻き戻しと Tx 内の書き込み記録・世代」「savepoint 巻き戻しとカーソル」「失敗状態からの savepoint 復帰」の各節。受理構文・エラー契約は SQL-69 のポインタ先に従う。残る対象外・申し送りは次のとおり。
   - savepoint のクラッシュ耐性テストは #1948（作業中）。
-  - 書き込み後に作った savepoint（`Unrestorable`）の巻き戻しは `0A000` で fail-closed。engine 層の undo 記録など別方式の要否はオーナー判断（#1943 節）。
-  - 一時表を使った Tx の `ROLLBACK TO` は `0A000`（#1943 節）。
+  - 書き込み後に作った savepoint と一時表を使った Tx の `ROLLBACK TO` は Issue #2879 で実装済み（「書き込み後の savepoint の巻き戻し」節）。残る `0A000` は差分を取れない場合（未知の型のテーブル・上限超過）と PL/pgSQL の内部 savepoint（同節の「残る制約」）。
   - commit 記録の足跡（`commit_log::Frame`）と採番状態は戻さない（#1945 節）。
   - カーソルに束縛しない portal の破棄は扱わない（#1946 節）。
   - savepoint 名の照合は大文字小文字を区別する（PostgreSQL の畳み込みとの既知の差。#1942 節）。
@@ -955,9 +954,9 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
   - 復元すると、それより後に作った savepoint は無効になる。同じ savepoint へは何度でも復元できる。
   - 復元時にテーブルのハンドルが開いていると panic する（assert）。
   - 生存中は作成後に不要になったページの解放が遅れる。
-- 帰結: 巻き戻せるのは「writer が最初にテーブルを開く前の状態」だけである。
-  書き込み後に作った savepoint の巻き戻しは redb の API だけでは実現できない
-  （engine 層の undo 記録などの別方式が要る。要否はオーナー判断）。
+- 帰結: redb の API だけで巻き戻せるのは「writer が最初にテーブルを開く前の状態」だけである。
+  書き込み後に作った savepoint は Issue #2879 で、基底への復元 + 内容差分の再適用により巻き戻せる
+  ようにした（「書き込み後の savepoint の巻き戻し」節。以下は #1943 時点の結線の記録）。
 - 本 DB での結線:
   - 各 savepoint に種別を持たせる（`sql::savepoint::SavepointKind`）。`Restorable` は作成時に
     writer 未取得、または writer 取得済みで redb の probe（`ephemeral_savepoint`）が成功した
@@ -1046,6 +1045,57 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
 - テスト: engine `sql69_savepoint_cursor`・`sql69_savepoint_rollback`・`sql::cursor`、
   wire-server `wire15_cursor_portal_binding`。
 
+## 書き込み後の savepoint の巻き戻し（Issue #2879・SQL-69 ポインタ）
+
+本節はポインタ表記と実装上の判断のみ（spec 本文は転記しない）。ポインタ:
+`docs/spec/04-behavior/sql-surface.md` SQL-69（失敗状態からの復帰は SQL-31、台帳は RECOVER-1）。
+
+`BEGIN; INSERT; SAVEPOINT s; INSERT; ROLLBACK TO s; COMMIT` が PostgreSQL と同じ結果になる。一時表を使った Tx
+でも `ROLLBACK TO` が通る。
+
+- **方式**: 基底への復元 + 内容差分の再適用。明示 Tx は writer 取得直後（テーブルを開く前）に基底 savepoint を
+  **常に**取り、COMMIT／ROLLBACK まで保持する（`RELEASE` でも解放しない）。writer が書き込み済みの時点の
+  `SAVEPOINT` は、確定済み状態（writer は排他のため基底の状態と一致）と writer の内容を全テーブルで突き合わせ、
+  行単位の差分（追加・更新・削除、作成・削除されたテーブル）を `StateImage` として savepoint に保存する
+  （`storage::table_image`）。`ROLLBACK TO` は `restore_savepoint(基底)` の後に差分を再適用して savepoint 時点の
+  状態を再構成し、既存の付随状態の復元（セッション・カーソル・書き込み記録・`operation_id` 水位）へ進む。
+- **完全性（fail-open を作らない根拠）**: 差分は engine の書き込み記録ではなく redb の実内容から計算する。書き込み
+  経路（`open_table` 等の呼び出し箇所）を 1 つも計装しないため、記録漏れによる巻き戻し不足は構造上起きない。
+  基底へ戻してから足す順序のため、差分計算の誤りは「savepoint 前の書き込みが失われる」側に倒れ、取り消した
+  はずの書き込みが残る側には倒れない。再適用後は表世代の差分集合を SAVEPOINT 時の記録と突き合わせ、不一致は
+  `XX000`（復帰不可）。
+- **型の扱い**: `WriteTransaction` には型なしでテーブルを開く API が無いため、engine が使う `(K, V)` の型の組を
+  `table_image` の `SHAPES` に列挙し、テーブルごとに順に試す（不一致は `TableTypeMismatch`）。全て不一致の
+  テーブル・multimap テーブルがあれば差分を取れない扱い。新しい型のテーブルを足したら `SHAPES` へ足す
+  （取りこぼしは `0A000` に倒れるだけで fail-closed。網羅は `sql69_savepoint_post_write` の多機能 DB の試験が見る）。
+- **種別**: `SavepointKind` は `Restorable`（基底へ戻すだけ）・`Imaged`（差分つき）・`Unrestorable`（差分を取れない）。
+  `SAVEPOINT` 文自体は常に成功する（PostgreSQL と同じ）。差分を取れないのは、未知の型のテーブル、差分のバイト数の
+  上限超過、Tx の持続時間の期限超過のとき。`ROLLBACK TO` は従来どおり `0A000` の固定文言で Tx を `Failed` にする。
+- **上限（実装既定値。spec 由来の数値ではない）**: 差分の合計は savepoint 1 個あたり 16 MiB、Tx 全体で 64 MiB
+  （`MAX_IMAGE_BYTES_PER_SAVEPOINT`・`MAX_IMAGE_BYTES_PER_TXN`）。割り当て前に計上する。走査は排他 writer を保持した
+  まま全テーブルを読むため、Tx の持続時間の期限で打ち切る。基底の常時保持は redb のページ解放を Tx 終了まで
+  遅らせるが、持続時間の上限で有界。
+- **一時表**: 一時ストア（別インスタンスのインメモリ redb）にも同じ仕組みを適用する。`ensure_temp_txn` が一時 writer を
+  開いた直後（明示 Tx のみ）に一時側の基底を取り、`SAVEPOINT` 時に一時 writer が開いていれば一時側の差分も保存する。
+  `ROLLBACK TO` は永続側・一時側の戻し先がそろっていることを変更前に全部検査してから、永続側 → 一時側の順で適用する
+  （永続側の後に一時側が失敗しても `XX000` は復帰不可で COMMIT できない）。savepoint の後に初めて一時表を使った
+  場合は、一時側を基底（空）へ戻す。失敗状態の保持条件から「一時表を使っていない」を外した。
+- **テナント境界**: 差分は writer 全体を対象とするが、writer は単一セッションの排他所有で、確定済み状態との差分は
+  自 Tx の書き込みだけである。RLS 判定は変えない。エラーは固定文言（表名・キー・値を含まない）。
+- **残る制約・申し送り**:
+  - PL/pgSQL の `EXCEPTION` 節の内部 savepoint は差分方式の対象外（書き込み後は `0A000`、一時表使用中も `0A000`）。
+  - 差分の走査は DB 全体に比例する（書き込み後の `SAVEPOINT` ごと）。世代でテーブル単位に絞る最適化は、世代の
+    不変条件が全テーブル（カタログ・台帳を含む）に及ぶことを示せるまで行わない。
+  - commit 記録の足跡と採番状態は従来どおり戻さない（#1945 節）。
+- **退けた案**: 書き込みごとの undo log（呼び出し箇所が数百あり漏れの検出手段が無く、漏れは fail-open）、Tx 途中の
+  `Durability::None` commit（#1943 節で退けた）、文の再実行（`random()`・採番・台帳の非決定性で再現できない）、
+  redb の fork／パッチ（依存の変更でオーナー承認が要る）。
+- **テスト**: `crates/engine/tests/sql_t40_up/sql69_savepoint_post_write.rs`（基本形・UPDATE／DELETE・一意索引・入れ子・
+  台帳・書き込み記録・失敗状態からの復帰・カーソル・テナント境界・一時表・多機能 DB・採番）、
+  `sql69_savepoint_rollback.rs`・`sql69_savepoint_failed_recovery.rs`・`sql69_savepoint_syntax.rs`、
+  `crates/wire-server/tests/wire_proto/sql69_savepoint_syntax.rs`、単体は `storage::table_image`・`sql::savepoint`・
+  `sql::transaction`（未知の型の fail-closed）。
+
 ## 失敗状態からの savepoint 復帰（Issue #1947・SQL-31・SQL-69 ポインタ）
 
 文エラーで `Failed`（`25P02`）になった明示 Tx を、`ROLLBACK TO` で `InTransaction` に戻せる。
@@ -1054,9 +1104,9 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
   （ReadyForQuery `'E'`）のままで、`Active` だけを照合する既存のアクセサ（writer・読み取り源・
   カーソル）は失敗した Tx に何も渡さない（fail-closed）。`ActiveTxn` に失敗フラグを足す案は、
   直し漏れた 1 箇所が fail-open になるため退けた。
-- 保持条件（`SessionTransaction::fail`）: 明示 Tx・巻き戻せる savepoint がある・一時表を使っていない
-  （一時表の Tx は `ROLLBACK TO` が `0A000` 確定）・巻き戻し先（writer 未取得、または基底 savepoint）
-  がある。満たさなければ従来どおり即時に writer を解放する（savepoint 作成前の失敗は復帰できない）。
+- 保持条件（`SessionTransaction::fail`）: 明示 Tx・巻き戻せる（`Unrestorable` でない）savepoint がある・
+  巻き戻し先（writer 未取得、または基底 savepoint。一時側を開いていればその基底も。Issue #2879 で
+  「一時表を使っていない」条件を外した）がある。満たさなければ従来どおり即時に writer を解放する（savepoint 作成前の失敗は復帰できない）。
 - 復帰させない失敗（`fail_unrecoverable`）: 文数・持続時間の上限超過（`54000`）、`40001`（保持した
   writer が衝突判定を素通りするため）、`XX000`（不変条件違反・redb エラー）。
 - 受理する文: `ROLLBACK` と `ROLLBACK [WORK|TRANSACTION] TO ...`（parse 前の判定は
@@ -1123,8 +1173,9 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
 - **決定的 kill 段**: `write-savepoint-pause` が `ROLLBACK TO` 直後・`RELEASE` 直後・COMMIT 直後で停止し、
   SIGKILL 後の適用済み個数が `PAUSED` 行の期待値と完全に一致することを確かめる。
 - **finish**: 同一文の再送は `23505`、巻き戻した内容での再送は `22023`（台帳は commit した内容を保持）。
-- **対象外**: 書き込み後に作った savepoint（`Unrestorable`）、wire-server 経由の試験、
-  `WriteDurability::None` 構成。
+- **対象外**: 書き込み後に作った savepoint（Issue #2879 で巻き戻せるようになったが、crash 段は
+  追加していない。復元・再適用は COMMIT 前の未確定状態への操作で、確定は従来の単一 commit だけのため）、
+  wire-server 経由の試験、`WriteDurability::None` 構成。
 
 ## PL/pgSQL の内部 savepoint（Issue #2227・SQL-70）
 
@@ -1133,7 +1184,9 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
 不変条件 `[Restorable…, Unrestorable…]` を保つ。名前は NUL を含み利用者が書けないため `RELEASE`／`ROLLBACK TO` から
 見えず、文数に計上せず、暗黙 Tx でも積める。巻き戻せない（`Unrestorable`・一時表を使った Tx）ときは捕捉せず `0A000`
 で Tx を失敗させる（`FailedRecoverable` でも内部エントリは `pl_release` で必ず除去する）。詳細は
-[plpgsql-subset.md](plpgsql-subset.md)「Issue #2227 追記」節。書き込み後の `ROLLBACK TO` の対応は #2879。
+[plpgsql-subset.md](plpgsql-subset.md)「Issue #2227 追記」節。Issue #2879 の差分方式は利用者の `SAVEPOINT`
+だけに適用し、内部 savepoint は従来のまま（書き込み後・一時表使用中は `0A000`）にした。ブロックごとに全テーブル
+走査が走る性能リスクを避けるため。不変条件は `Imaged` を含め「巻き戻せる種別と `Unrestorable` の混在」。
 
 ## 明示トランザクション複数文のクラッシュ耐性（Issue #2415・SQL-31・TABLE-10 ポインタ）
 
