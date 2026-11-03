@@ -144,7 +144,7 @@ fn is_comparison_operator(token: Option<&Token>) -> bool {
         Some(Token::Punct('=') | Token::Punct('>') | Token::Punct('<'))
             | Some(Token::Le)
             | Some(Token::Ge)
-            | Some(Token::DistanceOp)
+            | Some(Token::DistanceOp(_))
     )
 }
 
@@ -1408,7 +1408,7 @@ pub fn validate_param_positions(tokens: &[Token]) -> Result<u16, SqlSurfaceError
         let next1 = tokens.get(i + 1);
 
         // パターン 1: `<col> <=> $n`。
-        let is_distance = matches!(prev1, Some(Token::DistanceOp));
+        let is_distance = matches!(prev1, Some(Token::DistanceOp(lexer::DistanceKind::Cosine)));
 
         // パターン 2: `USING PLAN($n)`。
         let is_using_plan = ident_eq_ignore_case(prev3, "USING")
@@ -2035,7 +2035,7 @@ pub(crate) fn infer_param_positions(tokens: &[Token], param_count: u16) -> Vec<V
         };
         let prev1 = i.checked_sub(1).and_then(|j| tokens.get(j));
         let prev2 = i.checked_sub(2).and_then(|j| tokens.get(j));
-        if matches!(prev1, Some(Token::DistanceOp)) {
+        if matches!(prev1, Some(Token::DistanceOp(lexer::DistanceKind::Cosine))) {
             slot.push(ParamPosition::Vector);
             continue;
         }
@@ -2105,7 +2105,10 @@ pub(crate) fn infer_param_positions(tokens: &[Token], param_count: u16) -> Vec<V
 pub fn order_by_distance_literal_is_param(tokens: &[Token]) -> bool {
     tokens.iter().enumerate().any(|(i, token)| {
         matches!(token, Token::Param(_))
-            && matches!(tokens.get(i.wrapping_sub(1)), Some(Token::DistanceOp))
+            && matches!(
+                tokens.get(i.wrapping_sub(1)),
+                Some(Token::DistanceOp(lexer::DistanceKind::Cosine))
+            )
     })
 }
 
@@ -2480,7 +2483,7 @@ pub(crate) fn decode_bind_values_nullable_typed(
             }
             Token::Keyword(_)
             | Token::Punct(_)
-            | Token::DistanceOp
+            | Token::DistanceOp(_)
             | Token::Le
             | Token::Ge
             | Token::Arrow
@@ -3670,7 +3673,7 @@ mod tests {
             dummy,
             vec![
                 Token::Ident("embedding".to_string()),
-                Token::DistanceOp,
+                Token::DistanceOp(lexer::DistanceKind::Cosine),
                 Token::StringLiteral("0".to_string()),
             ]
         );
