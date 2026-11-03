@@ -168,6 +168,27 @@ pub struct BoundStatement {
     /// ときだけ `true` になりうる（[`check_distance_direction`] が束縛時に保証する）。
     /// NoSQL 表層・`USING PLAN` 経路など直接組み立てる箇所は常に `false`（昇順）。
     pub(crate) distance_descending: bool,
+    /// 距離順 `ORDER BY` の距離演算子の種別（Issue #1977・SQL-33 (2)(4)）。`ranking` が
+    /// [`Ranking::Distance`] 以外のときは常に `Cosine`（[`check_distance_kind`] が束縛時に保証）。
+    /// 非 Cosine の文は束縛を通るが、実行は `sql::exec` の入口が `0A000` で止める（仮置き）。
+    pub(crate) distance_kind: crate::sql::lexer::DistanceKind,
+}
+
+/// 距離種別と順位付け形の整合を検査する（Issue #1977）。`Distance` 以外の `ORDER BY` に
+/// 非 Cosine の種別が付く組は公開ビルダーの誤用でしか作れないため `42601` で拒否する
+/// （`bind_in_session_with_limits` と Describe 用束縛の両方が呼び、判定を食い違わせない）。
+fn check_distance_kind(
+    kind: crate::sql::lexer::DistanceKind,
+    order_by: &OrderByForm,
+) -> Result<(), SqlSurfaceError> {
+    if kind != crate::sql::lexer::DistanceKind::Cosine
+        && !matches!(order_by, OrderByForm::Distance { .. })
+    {
+        return Err(SqlSurfaceError::unsupported(
+            "distance operator kind requires a distance ORDER BY",
+        ));
+    }
+    Ok(())
 }
 
 /// 距離方向（`DESC`）と順位付け形・実効モードの整合を検査する（Issue #2009・SQL-33 (2)）。
@@ -226,7 +247,21 @@ impl BoundStatement {
             mode: crate::sql::mode::resolve_mode(None, None),
             evaluation_order,
             distance_descending: false,
+            distance_kind: crate::sql::lexer::DistanceKind::Cosine,
         }
+    }
+
+    /// 距離演算子の種別を設定した crate 内ビルダー（Issue #1977。テスト専用）。
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_distance_kind(mut self, kind: crate::sql::lexer::DistanceKind) -> Self {
+        self.distance_kind = kind;
+        self
+    }
+
+    /// 距離順 `ORDER BY` の距離演算子の種別（Issue #1977・SQL-33 (2)(4)）。
+    pub fn distance_kind(&self) -> crate::sql::lexer::DistanceKind {
+        self.distance_kind
     }
 
     /// 距離順 `ORDER BY` の方向（`true` で `DESC`）を設定した crate 内ビルダー（Issue #2009）。
@@ -3071,6 +3106,7 @@ pub(crate) fn bind_in_session_with_limits(
         &stmt.order_by,
         Some(resolved_mode.mode()),
     )?;
+    check_distance_kind(stmt.distance_kind, &stmt.order_by)?;
 
     let (limit, offset) =
         validate_search_limit_offset_with(stmt.limit, stmt.offset, result_limits)?;
@@ -3108,6 +3144,7 @@ pub(crate) fn bind_in_session_with_limits(
         mode: resolved_mode,
         evaluation_order,
         distance_descending: stmt.distance_descending,
+        distance_kind: stmt.distance_kind,
     })
 }
 
@@ -3171,6 +3208,7 @@ pub(crate) fn bind_projection_for_describe(
         &stmt.order_by,
         Some(resolved_mode.mode()),
     )?;
+    check_distance_kind(stmt.distance_kind, &stmt.order_by)?;
     let _limits = validate_search_limit_offset_with(stmt.limit, stmt.offset, result_limits)?;
 
     Ok(projection)
@@ -15232,6 +15270,41 @@ mod tests {
             describe(desc, Some(SearchMode::Precision)).expect_err("session precision + DESC");
         assert_eq!(err.wire_code(), "0A000");
         assert!(describe(desc, None).is_ok());
+    }
+
+    /// Issue #1977・SQL-33 (4): 4 種の距離演算子が同じ束縛規則（次元・リテラル検証）を通り、種別が伝わる。
+    #[test]
+    fn bind_carries_distance_kind_and_validates_identically_for_all_operators() {
+        use crate::sql::lexer::DistanceKind;
+        for (op, kind) in [
+            ("<=>", DistanceKind::Cosine),
+            ("<->", DistanceKind::L2),
+            ("<#>", DistanceKind::NegativeInnerProduct),
+            ("<+>", DistanceKind::L1),
+        ] {
+            let ok = bind_sql(&format!(
+                "SELECT * FROM documents ORDER BY embedding {op} '[0.1,0.2,0.3]' LIMIT 5"
+            ))
+            .expect(op);
+            assert_eq!(ok.distance_kind(), kind, "{op}");
+            let dim = bind_sql(&format!(
+                "SELECT * FROM documents ORDER BY embedding {op} '[0.1,0.2]' LIMIT 5"
+            ))
+            .expect_err(op);
+            assert_eq!(dim.wire_code(), "22000", "{op}");
+        }
+    }
+
+    #[test]
+    fn check_distance_kind_rejects_non_cosine_on_non_distance_order_by() {
+        use crate::sql::lexer::DistanceKind;
+        let order_by = OrderByForm::FunctionCall {
+            name: "HYBRID".to_string(),
+            args: Vec::new(),
+        };
+        let err = check_distance_kind(DistanceKind::L2, &order_by).expect_err("non-distance");
+        assert_eq!(err.wire_code(), "42601");
+        assert!(check_distance_kind(DistanceKind::Cosine, &order_by).is_ok());
     }
 
     #[test]

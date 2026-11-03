@@ -345,7 +345,7 @@ fn sql33_desc_unsupported_shapes_stay_syntax_errors() {
     }
 }
 
-// まだ SQL から実行できない距離演算子は、DESC を付けても ASC と同じコードで拒否される。
+// まだ SQL から実行できない距離演算子は、DESC を付けても ASC と同じコード（実行段の 0A000）で拒否される。
 #[test]
 fn sql33_desc_on_not_yet_runnable_operators_fails_like_asc() {
     let path = unique_db_path("sql33-desc-unrunnable");
@@ -374,6 +374,7 @@ fn sql33_desc_on_not_yet_runnable_operators_fails_like_asc() {
             .map(|e| e.wire_code().to_string())
         };
         assert_eq!(asc, desc, "{op}");
+        assert_eq!(asc.as_deref(), Some("0A000"), "{op}");
     }
 }
 

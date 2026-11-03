@@ -20,7 +20,8 @@
 //!
 //! ## 受理するプレースホルダ位置（WIRE-12 の規範形。これ以外は `42601`）
 //!
-//! 1. `ORDER BY <vec列> <=> $n`（ベクトル位置。直前トークンが [`Token::DistanceOp`]）
+//! 1. `ORDER BY <vec列> <距離演算子> $n`（ベクトル位置。直前トークンが [`Token::DistanceOp`]。
+//!    `<=>`／`<->`／`<#>`／`<+>` の 4 種とも同じ扱いで型推論は text。SQL-33 (4)・WIRE-12・Issue #1977）
 //! 2. `USING PLAN($n)`（`Ident("USING") Ident("PLAN") '(' $n ')'`）
 //! 3. `USING OPERATION_ID $n`（INSERT／TRUNCATE／DELETE／UPDATE 共通の文末句。
 //!    `Ident("USING") Ident("OPERATION_ID") $n`）
@@ -1408,7 +1409,7 @@ pub fn validate_param_positions(tokens: &[Token]) -> Result<u16, SqlSurfaceError
         let next1 = tokens.get(i + 1);
 
         // パターン 1: `<col> <=> $n`。
-        let is_distance = matches!(prev1, Some(Token::DistanceOp(lexer::DistanceKind::Cosine)));
+        let is_distance = matches!(prev1, Some(Token::DistanceOp(_)));
 
         // パターン 2: `USING PLAN($n)`。
         let is_using_plan = ident_eq_ignore_case(prev3, "USING")
@@ -2035,7 +2036,7 @@ pub(crate) fn infer_param_positions(tokens: &[Token], param_count: u16) -> Vec<V
         };
         let prev1 = i.checked_sub(1).and_then(|j| tokens.get(j));
         let prev2 = i.checked_sub(2).and_then(|j| tokens.get(j));
-        if matches!(prev1, Some(Token::DistanceOp(lexer::DistanceKind::Cosine))) {
+        if matches!(prev1, Some(Token::DistanceOp(_))) {
             slot.push(ParamPosition::Vector);
             continue;
         }
@@ -2126,10 +2127,7 @@ pub fn order_by_distance_literal_is_param(tokens: &[Token]) -> bool {
     let tail = tokens.get(start..).unwrap_or(&[]);
     tail.iter().enumerate().any(|(i, token)| {
         matches!(token, Token::Param(_))
-            && matches!(
-                tail.get(i.wrapping_sub(1)),
-                Some(Token::DistanceOp(lexer::DistanceKind::Cosine))
-            )
+            && matches!(tail.get(i.wrapping_sub(1)), Some(Token::DistanceOp(_)))
     })
 }
 
@@ -2694,6 +2692,29 @@ mod tests {
             positions("SELECT * FROM documents ORDER BY embedding <=> $1 LIMIT 5").unwrap(),
             1
         );
+    }
+
+    /// Issue #1977・SQL-33 (4)・WIRE-12: 距離演算子 4 種で `$n` のベクトル位置判定が同じになる。
+    #[test]
+    fn all_distance_operators_share_vector_param_position() {
+        for op in ["<=>", "<->", "<#>", "<+>"] {
+            let sql = format!("SELECT * FROM documents ORDER BY embedding {op} $1 LIMIT 5");
+            assert_eq!(positions(&sql).expect(&sql), 1, "{op}");
+            assert_eq!(
+                positions_of(&sql),
+                vec![vec![ParamPosition::Vector]],
+                "{op}"
+            );
+            let tokens = tokenize_with_params(&sql).expect("tokenize");
+            assert!(order_by_distance_literal_is_param(&tokens), "{op}");
+            // WHERE 側だけの `$n` は ORDER BY のベクトル位置ではない。
+            let where_only = format!(
+                "SELECT * FROM documents WHERE embedding {op} $1 < 0.5 \
+                 ORDER BY embedding <=> '[0.1]' LIMIT 5"
+            );
+            let tokens = tokenize_with_params(&where_only).expect("tokenize");
+            assert!(!order_by_distance_literal_is_param(&tokens), "{op}");
+        }
     }
 
     #[test]

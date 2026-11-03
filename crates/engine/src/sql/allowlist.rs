@@ -3131,6 +3131,10 @@ pub struct ValidatedStatement {
     /// （昇順）。`true` の文は ANN 索引を使わず可視行を全走査して返す（実行は `sql::exec`）。
     /// `order_by` が [`OrderByForm::Distance`] でないのに `true` の組は束縛が `42601` で拒否する。
     pub(crate) distance_descending: bool,
+    /// 距離順 `ORDER BY` の距離演算子の種別（Issue #1977・SQL-33 (2)(4)）。既定は
+    /// [`lexer::DistanceKind::Cosine`]（`<=>`）。`order_by` が [`OrderByForm::Distance`] でないのに
+    /// 非 Cosine の組は束縛が `42601` で拒否する。非 Cosine の実行は各カーネル接続 Issue まで `0A000`。
+    pub(crate) distance_kind: lexer::DistanceKind,
 }
 
 impl ValidatedStatement {
@@ -3158,7 +3162,20 @@ impl ValidatedStatement {
             evaluation_order,
             using_plan: None,
             distance_descending: false,
+            distance_kind: lexer::DistanceKind::Cosine,
         }
+    }
+
+    /// 距離順 `ORDER BY` の距離演算子の種別（Issue #1977）を設定したコピーを返すビルダー的メソッド。
+    #[must_use]
+    pub fn with_distance_kind(mut self, kind: lexer::DistanceKind) -> Self {
+        self.distance_kind = kind;
+        self
+    }
+
+    /// 距離順 `ORDER BY` の距離演算子の種別（Issue #1977・SQL-33 (2)(4)）。
+    pub fn distance_kind(&self) -> lexer::DistanceKind {
+        self.distance_kind
     }
 
     /// 距離順 `ORDER BY` の方向（`true` で `DESC`＝遠い順。Issue #2009・SQL-33 (2)）を設定した
@@ -3215,6 +3232,7 @@ impl ValidatedStatement {
     pub fn with_using_plan(mut self, using_plan: Option<String>) -> Self {
         if using_plan.is_some() {
             self.order_by = OrderByForm::UsingPlan;
+            self.distance_kind = lexer::DistanceKind::Cosine;
         }
         self.using_plan = using_plan;
         self
@@ -12811,18 +12829,22 @@ impl<'a> Parser<'a> {
     /// ORDER BY 式の許可形状（距離演算子形または関数呼び出し形）。関数呼び出し形は
     /// 許可された名前（[`is_allowed_order_by_function_name`]）のみを受理し、
     /// 未知の名前は拒否する。
-    fn parse_order_by(&mut self) -> Result<OrderByForm, SqlSurfaceError> {
+    fn parse_order_by(&mut self) -> Result<(OrderByForm, lexer::DistanceKind), SqlSurfaceError> {
         let name_at = self.pos;
         let name = self.expect_ident()?;
         match self.peek() {
-            Some(Token::DistanceOp(lexer::DistanceKind::Cosine)) => {
+            Some(Token::DistanceOp(kind)) => {
+                let kind = *kind;
                 self.sink_mark(name_at, super::colref_sink::Role::OrderKey);
                 self.advance();
                 let literal = self.expect_string_literal()?;
-                Ok(OrderByForm::Distance {
-                    column: name,
-                    literal,
-                })
+                Ok((
+                    OrderByForm::Distance {
+                        column: name,
+                        literal,
+                    },
+                    kind,
+                ))
             }
             Some(Token::Punct('(')) => {
                 if !is_allowed_order_by_function_name(&name) {
@@ -12833,7 +12855,10 @@ impl<'a> Parser<'a> {
                 self.advance();
                 let args = self.parse_order_by_function_args(&name)?;
                 self.expect_punct(')')?;
-                Ok(OrderByForm::FunctionCall { name, args })
+                Ok((
+                    OrderByForm::FunctionCall { name, args },
+                    lexer::DistanceKind::Cosine,
+                ))
             }
             other => Err(SqlSurfaceError::unsupported(format!(
                 "unsupported ORDER BY expression near {other:?}"
@@ -12882,7 +12907,7 @@ impl<'a> Parser<'a> {
             };
             if matches!(
                 self.peek(),
-                Some(Token::DistanceOp(lexer::DistanceKind::Cosine)) | Some(Token::Punct('('))
+                Some(Token::DistanceOp(_)) | Some(Token::Punct('('))
             ) {
                 return Err(SqlSurfaceError::unsupported(
                     "ORDER BY cannot mix scalar columns with vector ranking expressions",
@@ -21117,6 +21142,8 @@ struct ParsedShape {
     using_plan: Option<String>,
     /// 距離順 `ORDER BY` 直後の `DESC`（Issue #2009・SQL-33 (2)）。`Distance` 形以外では常に `false`。
     distance_descending: bool,
+    /// 距離演算子の種別（Issue #1977）。`Distance` 形以外では `Cosine`。
+    distance_kind: lexer::DistanceKind,
 }
 
 /// 構文木（[`ValidatedScan`] の元）。カタログ存在確認前の中間結果（Issue #454。
@@ -22366,7 +22393,7 @@ fn parse_join_order_by(p: &mut Parser<'_>) -> Result<Vec<JoinOrderKey>, SqlSurfa
         };
         if matches!(
             p.peek(),
-            Some(Token::DistanceOp(lexer::DistanceKind::Cosine)) | Some(Token::Punct('('))
+            Some(Token::DistanceOp(_)) | Some(Token::Punct('('))
         ) {
             return Err(SqlSurfaceError::unsupported(
                 "ORDER BY with vector ranking cannot be combined with JOIN",
@@ -23281,6 +23308,7 @@ fn parse_select_shape(
             evaluation_order: EvaluationOrder::DEFAULT,
             using_plan: Some(using_plan),
             distance_descending: false,
+            distance_kind: lexer::DistanceKind::Cosine,
         }));
     }
 
@@ -23336,7 +23364,7 @@ fn parse_select_shape(
     // スカラー経路へ回す。未知の関数名は束縛段が拒否する。
     let is_vector_ranking = match p.peek() {
         Some(Token::Ident(name)) => match p.tokens.get(p.pos + 1) {
-            Some(Token::DistanceOp(lexer::DistanceKind::Cosine)) => true,
+            Some(Token::DistanceOp(_)) => true,
             Some(Token::Punct('(')) => is_allowed_order_by_function_name(name),
             _ => false,
         },
@@ -23431,7 +23459,7 @@ fn parse_select_shape(
             "scalar subqueries inside expressions cannot be combined with vector ORDER BY",
         ));
     }
-    let order_by = p.parse_order_by()?;
+    let (order_by, distance_kind) = p.parse_order_by()?;
     // Issue #2009・SQL-33 (2): 距離順 `ORDER BY` に限り方向語 `ASC`／`DESC` を 1 つ受理する
     // （文脈語のため大文字小文字非区別）。`NULLS` 句・重複・hybrid 関数形への付与は
     // ここで読まず、後続の `expect_keyword(Limit)` が従来どおり `42601` に落とす。
@@ -23472,6 +23500,7 @@ fn parse_select_shape(
         evaluation_order,
         using_plan: None,
         distance_descending,
+        distance_kind,
     }))
 }
 
@@ -27866,6 +27895,7 @@ fn validate_select_statement(
                 evaluation_order: shape.evaluation_order,
                 using_plan: shape.using_plan,
                 distance_descending: shape.distance_descending,
+                distance_kind: shape.distance_kind,
             }))
         }
         // Issue #454: `ORDER BY`・`USING PLAN` のいずれも伴わない
@@ -30884,13 +30914,58 @@ mod tests {
     /// しても、構文段の受理点は `<=>`（Cosine）のみ。他の種別がコサイン距離として実行される
     /// fail-open を防ぎ、従来どおり 42601 で拒否する（受理範囲の拡張は Issue #1977）。
     #[test]
-    fn rejects_non_cosine_distance_operators_with_42601() {
+    fn accepts_all_distance_operators_with_kind() {
         let lookup = catalog_with(&["documents"]);
-        for op in ["<->", "<#>", "<+>"] {
+        for (op, kind) in [
+            ("<=>", lexer::DistanceKind::Cosine),
+            ("<->", lexer::DistanceKind::L2),
+            ("<#>", lexer::DistanceKind::NegativeInnerProduct),
+            ("<+>", lexer::DistanceKind::L1),
+        ] {
             let sql = format!("SELECT * FROM documents ORDER BY embedding {op} '[0.1]' LIMIT 5");
-            let err = validate_statement(&sql, &lookup).expect_err("must be rejected");
-            assert_eq!(err.wire_code(), "42601", "{op}");
+            let stmt = validate_statement(&sql, &lookup).expect("accepted");
+            assert!(
+                matches!(stmt.order_by, OrderByForm::Distance { .. }),
+                "{op}"
+            );
+            assert_eq!(stmt.distance_kind(), kind, "{op}");
+            for tail in ["DESC LIMIT 5", "ASC LIMIT 5", "LIMIT 5 OFFSET 2"] {
+                let sql = format!("SELECT * FROM documents ORDER BY embedding {op} '[0.1]' {tail}");
+                assert!(validate_statement(&sql, &lookup).is_ok(), "{sql}");
+            }
+            for bad in [
+                format!("SELECT * FROM documents ORDER BY lang, embedding {op} '[0.1]' LIMIT 5"),
+                format!(
+                    "SELECT * FROM documents ORDER BY embedding {op} '[0.1]' NULLS FIRST LIMIT 5"
+                ),
+                format!(
+                    "SELECT * FROM documents ORDER BY embedding {op} '[0.1]' DESC DESC LIMIT 5"
+                ),
+            ] {
+                let err = validate_statement(&bad, &lookup).expect_err("rejected");
+                assert_eq!(err.wire_code(), "42601", "{bad}");
+            }
         }
+    }
+
+    #[test]
+    fn with_distance_kind_roundtrips_and_using_plan_resets_to_cosine() {
+        let stmt = ValidatedStatement::new(
+            "documents".to_string(),
+            Projection::All,
+            OrderByForm::Distance {
+                column: "embedding".to_string(),
+                literal: "[0.1]".to_string(),
+            },
+            Vec::new(),
+            5,
+            EvaluationOrder::DEFAULT,
+        );
+        assert_eq!(stmt.distance_kind(), lexer::DistanceKind::Cosine);
+        let l2 = stmt.with_distance_kind(lexer::DistanceKind::L2);
+        assert_eq!(l2.distance_kind(), lexer::DistanceKind::L2);
+        let plan = l2.with_using_plan(Some("q".to_string()));
+        assert_eq!(plan.distance_kind(), lexer::DistanceKind::Cosine);
     }
 
     #[test]

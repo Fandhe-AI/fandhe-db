@@ -791,6 +791,25 @@ fn map_hybrid_error(e: HybridError) -> SqlSurfaceError {
     }
 }
 
+/// 非 Cosine の距離演算子（`<->`／`<#>`／`<+>`）の文を実行入口で `0A000` に倒す仮置きの関門
+/// （Issue #1977・SQL-33 (2)(4)）。構文と `$n` 束縛は 4 種とも通るが、`<=>` 以外の距離カーネルは
+/// まだ SQL 実行経路に接続されていない（接続は #1981／#1987／#1988／#1991 の担当）。内積しか
+/// 計算できない現状の経路で別種別が黙って内積順として返る fail-open を防ぐため、SQL テキスト・
+/// 明示トランザクション・NoSQL 束縛済み計画・`USING PLAN` のすべてが通る
+/// [`execute_statement_with_cache`] の先頭で、行ポリシー解決やストレージ読み取りより前に拒否する。
+/// 文言は固定の英語で、テナント・表・行の情報を含めない。後続 Issue は本関数を各カーネルの分岐へ
+/// 置き換える。
+fn ensure_distance_kind_executable(bound: &BoundStatement) -> Result<(), SqlSurfaceError> {
+    let kind = bound.distance_kind;
+    if kind == crate::sql::lexer::DistanceKind::Cosine {
+        return Ok(());
+    }
+    Err(SqlSurfaceError::feature_not_supported(format!(
+        "distance operator {} is not supported yet",
+        kind.operator()
+    )))
+}
+
 /// [`BoundStatement`] を実行する（TASK-75 の公開 API）。`read_txn`・`schema` は
 /// 呼び出し元（`core.rs::EngineCore::execute_sql`）が単一の read トランザクション上で
 /// `catalog::get_table_schema_in_txn` により取得し、`sql::parser::bind` へ渡したのと
@@ -857,6 +876,9 @@ pub(crate) fn execute_statement_with_cache(
     hnsw_cache: Option<crate::sql::hnsw_cache::HnswCacheAccess<'_>>,
     scalar_cache: Option<crate::sql::scalar_index::ScalarCacheAccess<'_>>,
 ) -> Result<QueryResult, SqlSurfaceError> {
+    // 非 Cosine の距離演算子はカーネル未接続のため、行ポリシー解決・ストレージ読み取りより前に
+    // fail-closed で止める（Issue #1977）。
+    ensure_distance_kind_executable(bound)?;
     // RLS-13（Issue #2279）: 利用者ポリシーは、アリーナ構築と同じ read txn から 1 回だけ解決し、下の
     // `on_visible_row`（RLS 段の直後・利用者の `WHERE` より前）で各行へ適用する。キャッシュ
     // （アリーナ・HNSW・疎索引・スカラー索引）はテナント境界だけの内容のまま保ち（`rls_capture` は
@@ -6225,6 +6247,35 @@ pub(crate) fn map_batch_incremental_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #1977: 非 Cosine の距離種別は実行入口の関門が `0A000` の固定文言で止め、Cosine は通す。
+    #[test]
+    fn non_cosine_distance_kind_is_rejected_at_execution_entry() {
+        use crate::sql::lexer::DistanceKind;
+        let bound = BoundStatement::new(
+            "documents".to_string(),
+            Vec::new(),
+            Vec::new(),
+            false,
+            Ranking::Distance {
+                query: vec![1.0, 0.0],
+            },
+            3,
+            crate::sql::plan::EvaluationOrder::DEFAULT,
+        );
+        assert!(ensure_distance_kind_executable(&bound).is_ok());
+        for kind in [
+            DistanceKind::L2,
+            DistanceKind::NegativeInnerProduct,
+            DistanceKind::L1,
+        ] {
+            let err = ensure_distance_kind_executable(&bound.clone().with_distance_kind(kind))
+                .expect_err("must be rejected");
+            assert_eq!(err.wire_code(), "0A000");
+            assert!(err.to_string().contains(kind.operator()), "{err}");
+            assert!(!err.to_string().contains("documents"), "{err}");
+        }
+    }
 
     /// Issue #1953（SQL-71）: `57014` は `expr_eval_error_to_arena` ↔ `map_arena_error` の往復で
     /// 理由ごと保たれ、`XX000` に丸められない。
