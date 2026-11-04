@@ -87,6 +87,16 @@ fn open_storage() -> (Storage, temp_db::CleanupGuard) {
             ],
         ))
         .expect("create table");
+    // Issue #2025（TABLE-47）: SPARSEVEC(N) 列の text 束縛用（VECTOR 列を持たない表）。
+    storage
+        .create_table(&TableSchema::new(
+            "sparses",
+            vec![
+                ColumnDef::new("h", ColumnType::SparseVec(5), true),
+                ColumnDef::new("note", ColumnType::Text, true),
+            ],
+        ))
+        .expect("create table");
     // Issue #2018（TABLE-49）: INT8VEC(N) 列の text 束縛用（VECTOR 列を持たない表）。
     storage
         .create_table(&TableSchema::new(
@@ -1341,4 +1351,52 @@ fn int8vec_knn_accepts_placeholder_in_describe_and_execute() {
     }
     let sql = "SELECT id FROM int8s ORDER BY h <+> $1 LIMIT 3";
     send_pbes_expect_error(&mut ext, sql, &[], &[], &[Some(b"[1,1]")], "0A000");
+}
+
+/// SPARSEVEC(N) 列への `$n` text 束縛（TABLE-47・Issue #2025）: 往復一致（入力順は昇順へ正規化）と、
+/// 形式不正 `22P02`・位置範囲外／次元不一致 `22000`・次元上限超過 `54000` の写像。
+/// 拒否された束縛は行を書かない。
+#[test]
+fn sparsevec_column_accepts_text_binding_and_maps_errors() {
+    let (core, _g) = new_core();
+    let addr = spawn(core);
+    let mut ext = connect(addr, "alice");
+    let mut simple = connect(addr, "alice");
+
+    let sql = "INSERT INTO sparses (id, h) VALUES (1, $1) USING OPERATION_ID $2";
+    let (_, tag) = run_extended(
+        &mut ext,
+        sql,
+        &[],
+        &[Some(b"{3:2,1:1}/5"), Some(b"sv-op-1")],
+    );
+    assert!(tag.starts_with("INSERT"), "tag: {tag}");
+    let (rows, _) = run_simple(&mut simple, "SELECT id, h FROM sparses LIMIT 10");
+    assert_eq!(rows.len(), 1);
+    let text = String::from_utf8_lossy(rows.first().expect("row")).to_string();
+    assert!(text.contains("{1:1,3:2}/5"), "row: {text}");
+
+    for (i, (lit, code)) in [
+        (&b"{1:1}/4"[..], "22000"),
+        (&b"{6:1}/5"[..], "22000"),
+        (&b"{1:1,1:2}/5"[..], "22000"),
+        (&b"{1:x}/5"[..], "22P02"),
+        (&b"[1,2]"[..], "22P02"),
+        (&b"{}/1000000001"[..], "54000"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let op = format!("sv-op-rej-{i}");
+        send_pbes_expect_error(
+            &mut ext,
+            sql,
+            &[],
+            &[],
+            &[Some(lit), Some(op.as_bytes())],
+            code,
+        );
+    }
+    let (rows, _) = run_simple(&mut simple, "SELECT id, h FROM sparses LIMIT 10");
+    assert_eq!(rows.len(), 1, "rejected binds must not write rows");
 }

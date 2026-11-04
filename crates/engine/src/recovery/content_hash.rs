@@ -429,6 +429,18 @@ fn push_value(b: &mut HashInputBuilder, v: &Value) -> Result<(), StorageError> {
                 b.push_u8(e.to_le_bytes()[0]);
             }
         }
+        // SPARSEVEC(N) 値（Issue #2025・TABLE-47）。タグ 22（同ファイル内の `= 22` は別 enum の
+        // 操作種別で名前空間が異なる）。次元・非ゼロ数・各 (位置, 値ビット) を積む。値は位置昇順で
+        // 保持されているため、入力の並び順が違っても同じ値なら同じハッシュ入力になる。
+        Value::SparseVec(v) => {
+            b.push_u8(22);
+            b.push_u64(u64::from(v.dim()));
+            b.push_u64(v.nnz() as u64);
+            for (idx, val) in v.indices().iter().zip(v.values().iter()) {
+                b.push_raw(&idx.to_le_bytes());
+                b.push_raw(&val.to_bits().to_le_bytes());
+            }
+        }
         // 配列列（TABLE-14・Issue #888）は 10 とする。要素型タグ・要素数・各要素を
         // 積むことで、`{ab}`（1 要素）と `{a,b}`（2 要素）のような表記ゆれが
         // 衝突しない単射なハッシュ入力にする。
@@ -4849,6 +4861,27 @@ mod tests {
             to_hex(for_update_columns(3, &vec_cols).expect("hash").as_bytes()),
             "f7b2ee1f790be8849a79364620b1da02a77a81fb331760966ba579f9deca62ab"
         );
+    }
+
+    /// SPARSEVEC 値（Issue #2025・TABLE-47）のハッシュ入力は、構築時の要素の並び順・ゼロ要素の
+    /// 有無に依らず同じ値なら同一で、値・次元が違えば別になる。
+    #[test]
+    fn sparsevec_hash_is_independent_of_input_order() {
+        use crate::sparse_vector::{SparseVector, DEFAULT_MAX_SPARSEVEC_NNZ as MAX};
+        let build = |dim: u32, pairs: Vec<(u32, f32)>| {
+            Value::SparseVec(SparseVector::try_from_pairs(dim, pairs, MAX).expect("valid"))
+        };
+        let a = build(5, vec![(2, 2.0), (0, 1.0)]);
+        let b = build(5, vec![(0, 1.0), (1, 0.0), (2, 2.0)]);
+        let c = build(5, vec![(0, 1.0), (2, 2.5)]);
+        let d = build(6, vec![(0, 1.0), (2, 2.0)]);
+        let hash = |v: &Value| {
+            let cols: [(&str, &Value); 1] = [("v", v)];
+            *for_update_columns(1, &cols).expect("hash").as_bytes()
+        };
+        assert_eq!(hash(&a), hash(&b));
+        assert_ne!(hash(&a), hash(&c));
+        assert_ne!(hash(&a), hash(&d));
     }
 
     /// golden 固定（Issue #2196・TABLE-23 (4)・RECOVER-10・RECOVER-11・RECOVER-12 のポインタ）:

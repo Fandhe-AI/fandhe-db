@@ -740,6 +740,7 @@ fn declare_between(
         // HALFVEC も filter の対象外（Issue #2014）。engine の非対応列判定へ委譲して拒否する。
         | ColumnType::HalfVec(_)
         | ColumnType::Int8Vec(_)
+        | ColumnType::SparseVec(_)
         | ColumnType::Array(_)
         | ColumnType::Json
         | ColumnType::Jsonb => Ok(leaf(String::new(), String::new())),
@@ -906,7 +907,8 @@ fn declare_eq(
         ColumnType::Vector(_)
         | ColumnType::Bit(_)
         | ColumnType::HalfVec(_)
-        | ColumnType::Int8Vec(_) => Ok(DeclarativePredicate::Leaf(
+        | ColumnType::Int8Vec(_)
+        | ColumnType::SparseVec(_) => Ok(DeclarativePredicate::Leaf(
             DeclarativeFilter::equals(column, ""),
         )),
         // 配列列の等価（Issue #1193・NOSQL-17）。JSON 配列を SQL 表層と同じ配列
@@ -1028,6 +1030,7 @@ fn declare_range(
         | ColumnType::Bit(_)
         | ColumnType::HalfVec(_)
         | ColumnType::Int8Vec(_)
+        | ColumnType::SparseVec(_)
         | ColumnType::Array(_)
         | ColumnType::Json
         | ColumnType::Jsonb => Ok(DeclarativePredicate::Leaf(DeclarativeFilter::compare(
@@ -1230,7 +1233,8 @@ fn declare_in(
         | ColumnType::Vector(_)
         | ColumnType::Bit(_)
         | ColumnType::HalfVec(_)
-        | ColumnType::Int8Vec(_) => Ok(
+        | ColumnType::Int8Vec(_)
+        | ColumnType::SparseVec(_) => Ok(
             DeclarativePredicate::Leaf(DeclarativeFilter::in_list(column, Vec::new())),
         ),
     }

@@ -101,6 +101,7 @@ mod sql_set_default_insert_resend;
 mod sql_smallint_column;
 mod sql_smallint_query;
 mod sql_smallint_widening;
+mod sql_sparsevec_column;
 mod sql_surface;
 mod sql_time_column;
 mod sql_time_query;

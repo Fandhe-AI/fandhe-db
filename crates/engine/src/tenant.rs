@@ -4826,6 +4826,40 @@ fn validate_set_assignments(
                 }
             }
             (
+                crate::catalog::ColumnType::SparseVec(declared),
+                crate::row_codec::Value::SparseVec(value),
+            ) => {
+                // SPARSEVEC の SET 値は宣言次元と一致し、行 codec 上の長さ（presence(1) + dim(4) +
+                // nnz(4) + nnz × 8）が累計上限を超えないことを、対象行の探索より前に検証する（Issue #2025）。
+                if value.dim() != *declared {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(
+                        "SET value dimension does not match SPARSEVEC column".to_string(),
+                    )));
+                }
+                let entry_len = value
+                    .encoded_len()
+                    .and_then(|n| u32::try_from(n).ok())
+                    .ok_or_else(|| {
+                        TenantWriteError::Catalog(CatalogError::Invalid(
+                            "scalar payload length overflow".to_string(),
+                        ))
+                    })?;
+                set_text_payload_total =
+                    set_text_payload_total
+                        .checked_add(entry_len)
+                        .ok_or_else(|| {
+                            TenantWriteError::Catalog(CatalogError::Invalid(
+                                "scalar payload length overflow".to_string(),
+                            ))
+                        })?;
+                if set_text_payload_total > crate::row_codec::MAX_SCALAR_PAYLOAD_LEN {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(format!(
+                        "scalar payload length {set_text_payload_total} exceeds limit {}",
+                        crate::row_codec::MAX_SCALAR_PAYLOAD_LEN
+                    ))));
+                }
+            }
+            (
                 crate::catalog::ColumnType::HalfVec(declared),
                 crate::row_codec::Value::HalfVec(bits),
             ) => {
@@ -4924,6 +4958,7 @@ fn validate_set_assignments(
                 | crate::catalog::ColumnType::Numeric { .. }
                 | crate::catalog::ColumnType::HalfVec(_)
                 | crate::catalog::ColumnType::Int8Vec(_)
+                | crate::catalog::ColumnType::SparseVec(_)
                 | crate::catalog::ColumnType::Uuid,
                 crate::row_codec::Value::Null,
             ) if column.nullable => {}
@@ -4963,6 +4998,7 @@ fn validate_set_assignments(
             | (crate::catalog::ColumnType::Bit(_), _)
             | (crate::catalog::ColumnType::HalfVec(_), _)
             | (crate::catalog::ColumnType::Int8Vec(_), _)
+            | (crate::catalog::ColumnType::SparseVec(_), _)
             | (crate::catalog::ColumnType::Array(_), _)
             | (crate::catalog::ColumnType::Bytea, _)
             | (crate::catalog::ColumnType::Json, _)

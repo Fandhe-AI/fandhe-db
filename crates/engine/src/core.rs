@@ -12789,7 +12789,8 @@ impl EngineCore {
     /// fail-closed の `0A000` で拒否する（Issue #2014・TABLE-46）。COPY FROM 側の拒否
     /// （`sql::copy` の `bind_copy_record`）と対で、HALFVEC のテキスト出力は未対応のため。
     ///
-    /// INT8VEC 列（Issue #2018・TABLE-49）も同じ理由で同じ経路で拒否する。
+    /// INT8VEC 列（Issue #2018・TABLE-49）・SPARSEVEC 列（Issue #2025・TABLE-47）も同じ理由で
+    /// 同じ経路で拒否する。
     fn reject_halfvec_copy_projection(
         schema: &crate::catalog::TableSchema,
         bound: &crate::sql::parser::BoundScan,
@@ -12799,6 +12800,7 @@ impl EngineCore {
         let rejected = |ty: Option<&ColumnType>| match ty {
             Some(ColumnType::HalfVec(_)) => Some("COPY does not support HALFVEC columns"),
             Some(ColumnType::Int8Vec(_)) => Some("COPY does not support INT8VEC columns"),
+            Some(ColumnType::SparseVec(_)) => Some("COPY does not support SPARSEVEC columns"),
             _ => None,
         };
         let hit = bound.projection.iter().find_map(|p| match p {
@@ -15471,6 +15473,8 @@ impl EngineCore {
                     }
                     // INT8VEC 値は presence(1) + 次元(4) + 次元 × 1 バイト（Issue #2018）。
                     crate::row_codec::Value::Int8Vec(v) => 5usize.saturating_add(v.len()),
+                    // SPARSEVEC 値は presence(1) + dim(4) + nnz(4) + nnz × 8 バイト（Issue #2025）。
+                    crate::row_codec::Value::SparseVec(v) => v.encoded_len().unwrap_or(usize::MAX),
                     // 配列値（Issue #888）は実際の行コーデック（`row_codec::
                     // scalar_array_entry_len`）が書き込むフレーム込みの全
                     // エンコード長をそのまま使う（presence(1)・flags(1)・

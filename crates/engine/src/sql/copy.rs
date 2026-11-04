@@ -668,6 +668,12 @@ fn bind_copy_record(
                 "COPY does not support INT8VEC columns",
             ));
         }
+        // SPARSEVEC の COPY も同じ理由で未対応（fail-closed。Issue #2025・TABLE-47）。
+        if matches!(column.ty, ColumnType::SparseVec(_)) {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "COPY does not support SPARSEVEC columns",
+            ));
+        }
         let value = match field {
             None => {
                 // 明示的な `\N`（COPY テキスト形式の NULL マーカー）は
@@ -706,6 +712,12 @@ fn bind_copy_record(
                 ColumnType::Int8Vec(_) => {
                     return Err(SqlSurfaceError::feature_not_supported(
                         "COPY does not support INT8VEC columns",
+                    ))
+                }
+                // SPARSEVEC の COPY は担当 Issue 未定まで未対応（fail-closed。Issue #2025・TABLE-47）。
+                ColumnType::SparseVec(_) => {
+                    return Err(SqlSurfaceError::feature_not_supported(
+                        "COPY does not support SPARSEVEC columns",
                     ))
                 }
                 // BIT(n) は INSERT／UPDATE／UPSERT／DEFAULT と同じ束縛を共有する（Issue #2021）。
@@ -837,6 +849,8 @@ fn bound_insert_byte_len(bound: &BoundInsert) -> Result<usize, SqlSurfaceError> 
             Value::HalfVec(v) => 5usize.saturating_add(v.len().saturating_mul(2)),
             // INT8VEC 値は presence(1) + 次元(4) + 次元 × 1（Issue #2018）。
             Value::Int8Vec(v) => 5usize.saturating_add(v.len()),
+            // SPARSEVEC 値は presence(1) + dim(4) + nnz(4) + nnz × 8（Issue #2025）。
+            Value::SparseVec(v) => v.encoded_len().unwrap_or(usize::MAX),
             // NUMERIC／UUID 値は行コーデック上いずれも 16 バイト固定
             // （`core.rs::validate_insert_batch_byte_and_chunk_limits` と
             // 同一の判定対象量定義。Issue #885・#887）。

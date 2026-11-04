@@ -291,6 +291,7 @@ fn decode_tier_for(schema: &TableSchema, bound: &BoundScan) -> (DecodeTier, Vec<
                         | ColumnType::Bit(_)
                         | ColumnType::HalfVec(_)
                         | ColumnType::Int8Vec(_)
+                        | ColumnType::SparseVec(_)
                         | ColumnType::Array(_)
                         | ColumnType::Bytea
                         | ColumnType::Json
@@ -909,6 +910,23 @@ pub(crate) fn push_scalar_column_cell(
             Some(Some(_)) => {
                 return Err(scan_bug(
                     "INT8VEC column scan yielded a non-Int8Vec scalar value",
+                ))
+            }
+            Some(None) | None => cells.push(Cell::Null),
+        },
+        // SPARSEVEC は専用の `Cell::SparseVec` で返す（Issue #2025・TABLE-47）。
+        ColumnType::SparseVec(_) => match scanned.get(*index) {
+            Some(Some(row_codec::ScalarRef::SparseVec(body))) => {
+                let nnz = body.len().saturating_sub(8) / 8;
+                *byte_budget =
+                    try_accumulate_budget(*byte_budget, nnz.saturating_mul(32), max_result_bytes)?;
+                let value = row_codec::sparsevec_bytes_to_value(body)
+                    .map_err(|_| scan_bug("SPARSEVEC column scan yielded a malformed frame"))?;
+                cells.push(Cell::SparseVec(value));
+            }
+            Some(Some(_)) => {
+                return Err(scan_bug(
+                    "SPARSEVEC column scan yielded a non-SparseVec scalar value",
                 ))
             }
             Some(None) | None => cells.push(Cell::Null),
