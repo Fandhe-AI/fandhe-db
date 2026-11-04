@@ -626,7 +626,9 @@ fn binary_param_kind(ty: &PreparedParamType, declared_oid: i32, effective_oid: i
                 // `bit` のバイナリ形式は対象外（Issue #2021）。text 形式のみ受理する。
                 | ColumnType::Bit(_)
                 // `halfvec` のバイナリ形式（`halfvec_recv`）も対象外（Issue #2014）。
-                | ColumnType::HalfVec(_) => BinaryParam::Unsupported,
+                | ColumnType::HalfVec(_)
+                // `int8vec` のバイナリ形式も対象外（Issue #2018）。
+                | ColumnType::Int8Vec(_) => BinaryParam::Unsupported,
             },
         },
     }

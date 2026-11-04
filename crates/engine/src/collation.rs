@@ -250,6 +250,7 @@ pub fn is_collatable(ty: &ColumnType) -> bool {
         | ColumnType::Interval
         | ColumnType::Bit(_)
         | ColumnType::HalfVec(_)
+        | ColumnType::Int8Vec(_)
         | ColumnType::Array(_)
         | ColumnType::Bytea
         | ColumnType::Json

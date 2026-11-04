@@ -1716,6 +1716,7 @@ impl ScalarIndex {
                 ColumnType::Vector(_)
                 | ColumnType::Bit(_)
                 | ColumnType::HalfVec(_)
+                | ColumnType::Int8Vec(_)
                 | ColumnType::Boolean
                 | ColumnType::Array(_)
                 | ColumnType::Json
