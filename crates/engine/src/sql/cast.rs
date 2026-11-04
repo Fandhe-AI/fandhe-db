@@ -295,6 +295,13 @@ impl CastType {
                     detail: "cast to or from type int8vec is not supported".to_string(),
                 })
             }
+            // SPARSEVEC の CAST（`::sparsevec`・vector との相互変換）は兄弟 Issue #2026 まで
+            // 未対応（fail-closed。Issue #2025）。
+            SqlColumnTypeName::SparseVec(_) => {
+                return Err(SqlSurfaceError::FeatureNotSupported {
+                    detail: "cast to or from type sparsevec is not supported".to_string(),
+                })
+            }
             // BIT(n) の CAST は後続 Issue まで未対応（fail-closed。Issue #2021）。
             SqlColumnTypeName::Bit(_) => {
                 return Err(SqlSurfaceError::FeatureNotSupported {
@@ -554,6 +561,7 @@ pub(crate) fn kind_of_column(ty: &ColumnType) -> Option<CastKind> {
         ColumnType::Vector(_)
         | ColumnType::HalfVec(_)
         | ColumnType::Int8Vec(_)
+        | ColumnType::SparseVec(_)
         | ColumnType::Enum(_)
         | ColumnType::Bit(_) => None,
     }
@@ -595,6 +603,7 @@ pub(crate) fn cast_type_of_column(ty: &ColumnType) -> Option<CastType> {
         ColumnType::Vector(_)
         | ColumnType::HalfVec(_)
         | ColumnType::Int8Vec(_)
+        | ColumnType::SparseVec(_)
         | ColumnType::Enum(_)
         | ColumnType::Bit(_) => return None,
     })

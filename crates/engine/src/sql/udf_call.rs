@@ -6570,6 +6570,10 @@ pub(super) fn bind_expr_any(
                     ColumnType::Int8Vec(_) => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} cannot be used in an expression (INT8VEC columns are not supported)"
                     ))),
+                    // SPARSEVEC 列も式内参照を持たない（距離計算は兄弟 Issue #2026。Issue #2025）。
+                    ColumnType::SparseVec(_) => Err(SqlSurfaceError::invalid_input(format!(
+                        "column {name:?} cannot be used in an expression (SPARSEVEC columns are not supported)"
+                    ))),
                     ColumnType::Bit(_) => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} cannot be used in an expression (BIT columns are not supported)"
                     ))),
@@ -8228,6 +8232,7 @@ fn column_type_label(ty: &ColumnType) -> &'static str {
         ColumnType::Bit(_) => "bit",
         ColumnType::HalfVec(_) => "halfvec",
         ColumnType::Int8Vec(_) => "int8vec",
+        ColumnType::SparseVec(_) => "sparsevec",
         ColumnType::Array(_) => "array",
         ColumnType::Bytea => "bytea",
         ColumnType::Json => "json",

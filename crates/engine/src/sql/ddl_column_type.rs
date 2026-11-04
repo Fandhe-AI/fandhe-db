@@ -97,6 +97,7 @@ pub(crate) fn to_static_column_type_with_array_default(
         SqlColumnTypeName::Vector(dim) => ColumnType::Vector(*dim),
         SqlColumnTypeName::HalfVec(dim) => ColumnType::HalfVec(*dim),
         SqlColumnTypeName::Int8Vec(dim) => ColumnType::Int8Vec(*dim),
+        SqlColumnTypeName::SparseVec(dim) => ColumnType::SparseVec(*dim),
         SqlColumnTypeName::Alias { target, .. } => {
             return to_static_column_type_with_array_default(target, default_max_len)
         }
@@ -179,6 +180,11 @@ pub(crate) fn to_static_column_type_with_array_default(
                 ColumnType::Int8Vec(_) => {
                     return Err(SqlSurfaceError::unsupported(
                         "INT8VEC cannot be an array element type",
+                    ))
+                }
+                ColumnType::SparseVec(_) => {
+                    return Err(SqlSurfaceError::unsupported(
+                        "SPARSEVEC cannot be an array element type",
                     ))
                 }
                 ColumnType::Vector(_) => {
@@ -329,6 +335,10 @@ pub enum SqlColumnTypeName {
     /// ままで、別語として扱う。次元の範囲検証はカタログ検証に委譲する。`ADD COLUMN` は実行段で
     /// `0A000`、配列要素は `42601`。
     Int8Vec(u32),
+    /// `SPARSEVEC(N)`（TABLE-47・Issue #2025）。括弧と正の整数が必須。次元の範囲検証
+    /// （1〜1,000,000,000）はカタログ検証（`validate_sparsevec_dim`）に委譲する。`ADD COLUMN` は
+    /// 実行段で `0A000`、配列要素は `42601`。
+    SparseVec(u32),
     /// `NUMERIC(precision, scale)`／`DECIMAL(precision, scale)`。範囲検証は
     /// 実行段（`catalog::alter_table_add_column`）に委譲する（モジュール
     /// ドキュメント参照）。
@@ -476,6 +486,8 @@ enum TypeNameKind {
     HalfVec,
     /// `INT8VEC(N)`（Issue #2018）。
     Int8Vec,
+    /// `SPARSEVEC(N)`（Issue #2025）。
+    SparseVec,
     /// `NUMERIC(p,s)`／`DECIMAL(p,s)`。
     Numeric,
     /// `VARCHAR`／`VARCHAR(n)`（Issue #2305・#1563）。綴りを保持する別名として返す
@@ -543,6 +555,7 @@ const TYPE_NAME_TABLE: &[(&str, TypeNameKind)] = &[
     ("VECTOR", TypeNameKind::Vector),
     ("HALFVEC", TypeNameKind::HalfVec),
     ("INT8VEC", TypeNameKind::Int8Vec),
+    ("SPARSEVEC", TypeNameKind::SparseVec),
     ("NUMERIC", TypeNameKind::Numeric),
     ("DECIMAL", TypeNameKind::Numeric),
     ("INT2", TypeNameKind::Alias(|| SqlColumnTypeName::SmallInt)),
@@ -795,6 +808,12 @@ fn parse_base_type_name(
             let dim = expect_strict_u32(tokens, pos)?;
             expect_punct(tokens, pos, ')')?;
             Ok(SqlColumnTypeName::Int8Vec(dim))
+        }
+        TypeNameKind::SparseVec => {
+            expect_punct(tokens, pos, '(')?;
+            let dim = expect_strict_u32(tokens, pos)?;
+            expect_punct(tokens, pos, ')')?;
+            Ok(SqlColumnTypeName::SparseVec(dim))
         }
         TypeNameKind::Numeric => {
             expect_punct(tokens, pos, '(')?;
@@ -1296,6 +1315,16 @@ mod tests {
     }
 
     /// TABLE-49: `INT8VEC(N)` は大小文字を区別せず受理し、括弧と次元が必須。`INT8` は別語。
+    #[test]
+    fn sparsevec_requires_dimension_and_is_case_insensitive() {
+        let (ty, consumed) = parse_type("sparsevec(30000)").expect("valid");
+        assert_eq!(ty, SqlColumnTypeName::SparseVec(30_000));
+        assert!(consumed > 0);
+        for raw in ["SPARSEVEC", "SPARSEVEC()", "SPARSEVEC(3", "SPARSEVEC(-1)"] {
+            assert!(parse_type(raw).is_err(), "{raw}");
+        }
+    }
+
     #[test]
     fn int8vec_requires_dimension_and_is_case_insensitive() {
         let (ty, consumed) = parse_type("int8vec(3)").expect("valid");

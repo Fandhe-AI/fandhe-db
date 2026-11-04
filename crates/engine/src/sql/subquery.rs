@@ -1499,7 +1499,8 @@ fn family_of_type(ty: &ColumnType) -> Option<SubqueryValueFamily> {
         | ColumnType::Interval
         | ColumnType::Bit(_)
         | ColumnType::HalfVec(_)
-        | ColumnType::Int8Vec(_) => None,
+        | ColumnType::Int8Vec(_)
+        | ColumnType::SparseVec(_) => None,
     }
 }
 

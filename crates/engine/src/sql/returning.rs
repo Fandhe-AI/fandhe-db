@@ -247,6 +247,13 @@ pub(crate) fn project_row(
                     *budget = try_accumulate_budget(*budget, bytes, MAX_RETURNING_RESULT_BYTES)?;
                     Cell::Vector(crate::sql::exec::expand_int8vec(v)?)
                 }
+                // SPARSEVEC は専用の `Cell::SparseVec` で返す（Issue #2025）。整形後のおおよその
+                // 大きさ（非ゼロ 1 要素あたり 32 バイト）で課金する。
+                Some(Value::SparseVec(v)) => {
+                    let bytes = v.nnz().saturating_mul(32);
+                    *budget = try_accumulate_budget(*budget, bytes, MAX_RETURNING_RESULT_BYTES)?;
+                    Cell::SparseVec(v.clone())
+                }
                 Some(Value::Bit(v)) => Cell::Bit(try_alloc_bit_for_budget(
                     v,
                     budget,

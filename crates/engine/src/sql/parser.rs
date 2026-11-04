@@ -915,6 +915,29 @@ pub(crate) fn parse_int8vec_literal(
     Ok(values)
 }
 
+/// `SPARSEVEC(N)` 列（TABLE-47・Issue #2025）向けのテキスト入力 `{idx:val,...}/N` の解析。
+/// 検証本体は [`crate::sparse_vector::SparseVector::parse_text`] に一本化し、ここでは
+/// SQLSTATE への写像（形式不正 `22P02`・値不正 `22000`・上限超過 `54000`）だけを行う。
+/// INSERT／UPDATE SET／UPSERT／`$n` テキスト束縛が共有する単一情報源。書き込み経路の非ゼロ数上限は
+/// ここ（[`crate::sparse_vector::DEFAULT_MAX_SPARSEVEC_NNZ`]）で決まり、Issue #2027 が
+/// 設定値へ差し替える唯一の点になる。エラー文言に入力値は含めない。
+pub(crate) fn parse_sparsevec_literal(
+    literal: &str,
+    expected_dim: u32,
+) -> Result<crate::sparse_vector::SparseVector, SqlSurfaceError> {
+    use crate::sparse_vector::SparseVectorErrorKind as Kind;
+    crate::sparse_vector::SparseVector::parse_text(
+        literal,
+        expected_dim,
+        crate::sparse_vector::DEFAULT_MAX_SPARSEVEC_NNZ,
+    )
+    .map_err(|e| match e.kind {
+        Kind::InvalidText => SqlSurfaceError::invalid_text_representation(e.detail),
+        Kind::InvalidValue => SqlSurfaceError::invalid_input(e.detail),
+        Kind::TooLarge => SqlSurfaceError::payload_too_large(e.detail),
+    })
+}
+
 /// `INT8VEC(N)` 列（TABLE-49・Issue #2018）向けの束縛。NoSQL 表層が JSON 整数配列から作る
 /// [`InsertLiteral::Vector`] の `f32` 列を受け、次元一致（`22000`）・各要素が有限かつ整数
 /// （違反は `22P02`）・i8 範囲内（違反は `22003`）を engine 側で改めて検証する（wire-server
@@ -1047,6 +1070,7 @@ pub(crate) fn bind_integer_literal(
         | ColumnType::Bit(_)
         | ColumnType::HalfVec(_)
         | ColumnType::Int8Vec(_)
+        | ColumnType::SparseVec(_)
         | ColumnType::Array(_)
         | ColumnType::Bytea
         | ColumnType::Json
@@ -1230,6 +1254,7 @@ pub(crate) fn bind_datetime_literal(
         | ColumnType::Bit(_)
         | ColumnType::HalfVec(_)
         | ColumnType::Int8Vec(_)
+        | ColumnType::SparseVec(_)
         | ColumnType::Array(_)
         | ColumnType::Bytea
         | ColumnType::Json
@@ -1701,6 +1726,7 @@ pub(crate) fn vector_column(schema: &TableSchema) -> Result<(usize, u32), SqlSur
             | ColumnType::Bit(_)
             | ColumnType::HalfVec(_)
             | ColumnType::Int8Vec(_)
+            | ColumnType::SparseVec(_)
             | ColumnType::Array(_)
             | ColumnType::Bytea
             | ColumnType::Json
@@ -1728,6 +1754,15 @@ pub(crate) fn vector_column(schema: &TableSchema) -> Result<(usize, u32), SqlSur
                 // INT8VEC の距離計算・kNN は兄弟 Issue #2019 まで未対応（fail-closed。Issue #2018）。
                 SqlSurfaceError::feature_not_supported(
                     "vector search over INT8VEC columns is not supported",
+                )
+            } else if schema
+                .columns
+                .iter()
+                .any(|c| matches!(c.ty, ColumnType::SparseVec(_)))
+            {
+                // SPARSEVEC の距離計算・kNN は兄弟 Issue #2026 まで未対応（fail-closed。Issue #2025）。
+                SqlSurfaceError::feature_not_supported(
+                    "vector search over SPARSEVEC columns is not supported",
                 )
             } else {
                 SqlSurfaceError::invalid_input("table has no VECTOR column")
@@ -1781,6 +1816,7 @@ pub(crate) fn text_column_index(
                 | ColumnType::Bit(_)
                 | ColumnType::HalfVec(_)
                 | ColumnType::Int8Vec(_)
+                | ColumnType::SparseVec(_)
                 | ColumnType::Array(_)
                 | ColumnType::Bytea
                 | ColumnType::Json
@@ -4321,6 +4357,17 @@ fn bind_insert_row(
                     "column {name:?} expects a vector literal, got a non-vector literal"
                 )))
             }
+            (ColumnType::SparseVec(dim), InsertLiteral::String(s)) => {
+                crate::row_codec::Value::SparseVec(parse_sparsevec_literal(s, *dim)?)
+            }
+            (
+                ColumnType::SparseVec(_),
+                InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_),
+            ) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects a sparsevec literal, got a non-sparsevec literal"
+                )))
+            }
             (ColumnType::Int8Vec(dim), InsertLiteral::String(s)) => {
                 crate::row_codec::Value::Int8Vec(parse_int8vec_literal(s, *dim)?)
             }
@@ -4523,6 +4570,7 @@ pub(crate) fn bind_json_literal(
         | ColumnType::Bit(_)
         | ColumnType::HalfVec(_)
         | ColumnType::Int8Vec(_)
+        | ColumnType::SparseVec(_)
         | ColumnType::Array(_)
         | ColumnType::Bytea
         | ColumnType::Enum(_)
@@ -4894,6 +4942,17 @@ pub(crate) fn bind_set_assignments(
             (ColumnType::HalfVec(_), InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects a vector literal, got a non-vector literal"
+                )))
+            }
+            (ColumnType::SparseVec(dim), InsertLiteral::String(s)) => {
+                crate::row_codec::Value::SparseVec(parse_sparsevec_literal(s, *dim)?)
+            }
+            (
+                ColumnType::SparseVec(_),
+                InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_),
+            ) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects a sparsevec literal, got a non-sparsevec literal"
                 )))
             }
             (ColumnType::Int8Vec(dim), InsertLiteral::String(s)) => {
@@ -6500,6 +6559,17 @@ fn bind_upsert_assignments(
                             "column {name:?} expects a vector literal, got a non-vector literal"
                         )))
                     }
+                    (ColumnType::SparseVec(dim), InsertLiteral::String(s)) => {
+                        crate::row_codec::Value::SparseVec(parse_sparsevec_literal(s, *dim)?)
+                    }
+                    (
+                        ColumnType::SparseVec(_),
+                        InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_),
+                    ) => {
+                        return Err(SqlSurfaceError::invalid_input(format!(
+                            "column {name:?} expects a sparsevec literal, got a non-sparsevec literal"
+                        )))
+                    }
                     (ColumnType::Int8Vec(dim), InsertLiteral::String(s)) => {
                         crate::row_codec::Value::Int8Vec(parse_int8vec_literal(s, *dim)?)
                     }
@@ -6777,6 +6847,11 @@ fn bind_file_insert(
             (ColumnType::Int8Vec(_), _) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?}: INT8VEC column is not supported for file-form INSERT"
+                )))
+            }
+            (ColumnType::SparseVec(_), _) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?}: SPARSEVEC column is not supported for file-form INSERT"
                 )))
             }
             // 配列列（TABLE-14・Issue #888）も BOOLEAN と同じく対象外として拒否する。
@@ -8061,6 +8136,11 @@ fn resolve_aggregate_input(
                         "column {name:?} is INT8VEC and cannot be used with aggregate functions"
                     )))
                     }
+                    (ColumnType::SparseVec(_), _) => {
+                        Err(SqlSurfaceError::undefined_function(format!(
+                        "column {name:?} is SPARSEVEC and cannot be used with aggregate functions"
+                    )))
+                    }
                     (ColumnType::Vector(_), AggregateFunc::Count) => {
                         Ok(AggregateInput::VectorColumnPresence)
                     }
@@ -8673,6 +8753,7 @@ fn bind_array_agg_value(
             | ColumnType::Bit(_)
             | ColumnType::HalfVec(_)
             | ColumnType::Int8Vec(_)
+            | ColumnType::SparseVec(_)
             | ColumnType::Vector(_)
             | ColumnType::Array(_)
             | ColumnType::Enum(_) => {
@@ -8925,6 +9006,9 @@ fn resolve_count_distinct_input(
                     ))),
                     ColumnType::Int8Vec(_) => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} is INT8VEC and cannot be used with COUNT(DISTINCT ...)"
+                    ))),
+                    ColumnType::SparseVec(_) => Err(SqlSurfaceError::invalid_input(format!(
+                        "column {name:?} is SPARSEVEC and cannot be used with COUNT(DISTINCT ...)"
                     ))),
                     ColumnType::SmallInt => Ok(AggregateInput::SmallIntColumn(index)),
                     ColumnType::Integer => Ok(AggregateInput::IntegerColumn(index)),
@@ -9716,6 +9800,7 @@ fn resolve_order_kind(ty: &ColumnType) -> Option<OrderKind> {
         | ColumnType::Bit(_)
         | ColumnType::HalfVec(_)
         | ColumnType::Int8Vec(_)
+        | ColumnType::SparseVec(_)
         | ColumnType::Array(_)
         | ColumnType::Bytea
         | ColumnType::Json
@@ -11146,6 +11231,7 @@ fn resolve_window_key(name: &str, schema: &TableSchema) -> Result<WindowKeyRef, 
             | ColumnType::Bit(_)
             | ColumnType::HalfVec(_)
             | ColumnType::Int8Vec(_)
+            | ColumnType::SparseVec(_)
             | ColumnType::Enum(_) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} cannot be used as a window PARTITION BY/ORDER BY key"

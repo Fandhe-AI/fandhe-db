@@ -303,6 +303,8 @@ pub(crate) fn estimate_cell_bytes(cell: &Cell) -> usize {
         Cell::Bit(v) => usize::try_from(v.bit_len())
             .unwrap_or(usize::MAX)
             .saturating_add(8),
+        // SPARSEVEC はテキスト整形後のおおよその大きさ（非ゼロ 1 要素あたり 32 バイト）で課金する。
+        Cell::SparseVec(v) => v.nnz().saturating_mul(32).saturating_add(16),
         Cell::Text(s) => s.len().saturating_add(8),
         Cell::Bytes(b) => b.len().saturating_add(8),
         Cell::Json(s) => s.len().saturating_add(8),

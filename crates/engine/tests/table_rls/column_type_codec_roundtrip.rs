@@ -71,6 +71,7 @@ fn type_label(ty: &ColumnType) -> &'static str {
         ColumnType::Bit(_) => "bit",
         ColumnType::HalfVec(_) => "halfvec",
         ColumnType::Int8Vec(_) => "int8vec",
+        ColumnType::SparseVec(_) => "sparsevec",
         ColumnType::Array(_) => "array",
         ColumnType::Bytea => "bytea",
         ColumnType::Json => "json",
@@ -121,6 +122,7 @@ fn all_type_labels() -> BTreeSet<&'static str> {
         "bit",
         "halfvec",
         "int8vec",
+        "sparsevec",
         "array",
         "bytea",
         "json",
@@ -286,6 +288,8 @@ fn all_column_type_variants_are_covered_by_case_table() {
     covered.insert(type_label(&ColumnType::HalfVec(4)));
     // INT8VEC も同じ制約（Issue #2018）で、`int8vec_roundtrips_and_rejects_malformed_layouts` が担う。
     covered.insert(type_label(&ColumnType::Int8Vec(4)));
+    // SPARSEVEC も同じ制約（Issue #2025）で、`sparsevec_roundtrips_and_rejects_malformed_layouts` が担う。
+    covered.insert(type_label(&ColumnType::SparseVec(4)));
     assert_eq!(
         covered,
         all_type_labels(),
@@ -2139,6 +2143,92 @@ fn halfvec_roundtrips_and_rejects_malformed_layouts() {
         decode_row(&schema, &narrow_bytes),
         Err(RowCodecError::Invalid(_))
     ));
+}
+
+/// SPARSEVEC(N) は (位置, 値) 列で往復し、宣言次元との不一致・他型との取り違え・切り詰め・
+/// nnz 過大・非昇順・範囲外位置・ゼロ値・非有限値の行バイト列を拒否する（Issue #2025・TABLE-47 ポインタ）。
+#[test]
+fn sparsevec_roundtrips_and_rejects_malformed_layouts() {
+    use engine::sparse_vector::{SparseVector, DEFAULT_MAX_SPARSEVEC_NNZ};
+    let sv = |dim: u32, pairs: &[(u32, f32)]| {
+        Value::SparseVec(
+            SparseVector::try_from_pairs(dim, pairs.to_vec(), DEFAULT_MAX_SPARSEVEC_NNZ)
+                .expect("valid sparsevec"),
+        )
+    };
+    roundtrip_single(ColumnType::SparseVec(5), sv(5, &[(0, 1.0), (4, -2.5)]));
+    roundtrip_single(ColumnType::SparseVec(5), sv(5, &[]));
+    roundtrip_single(
+        ColumnType::SparseVec(1_000_000_000),
+        sv(1_000_000_000, &[(999_999_999, 3.0)]),
+    );
+    let schema = single_col_schema(ColumnType::SparseVec(5));
+    let enc = |v: Value| encode_row(&schema, "tenant-a", Visibility::Public, &[v]);
+    // 宣言次元と異なる値は encode が拒否する。
+    assert!(matches!(
+        enc(sv(4, &[(0, 1.0)])),
+        Err(RowCodecError::Invalid(_))
+    ));
+    // 他型の値の取り違えも拒否する。
+    assert!(matches!(
+        enc(Value::Vector(vec![1.0; 5])),
+        Err(RowCodecError::Invalid(_))
+    ));
+    assert!(matches!(
+        enc(Value::Int8Vec(vec![1; 5])),
+        Err(RowCodecError::Invalid(_))
+    ));
+    let vec_schema = single_col_schema(ColumnType::Vector(5));
+    assert!(matches!(
+        encode_row(
+            &vec_schema,
+            "tenant-a",
+            Visibility::Public,
+            &[sv(5, &[(0, 1.0)])]
+        ),
+        Err(RowCodecError::Invalid(_))
+    ));
+    // 切り詰めたバイト列は拒否する。
+    let good = enc(sv(5, &[(1, 1.0), (3, 2.0)])).expect("encode sparsevec");
+    let cut = good.get(..good.len() - 1).expect("slice");
+    assert!(decode_row(&schema, cut).is_err());
+    // フレーム本体（presence の直後）を差し替えて不正なレイアウトを作る。
+    let head = good.len() - (1 + 8 + 2 * 8);
+    let prefix = good.get(..head).expect("prefix").to_vec();
+    let frame = |dim: u32, nnz: u32, idx: &[u32], vals: &[f32]| {
+        let mut b = prefix.clone();
+        b.push(1);
+        b.extend_from_slice(&dim.to_le_bytes());
+        b.extend_from_slice(&nnz.to_le_bytes());
+        for i in idx {
+            b.extend_from_slice(&i.to_le_bytes());
+        }
+        for v in vals {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        b
+    };
+    // 正しいフレームは復号できる（組み立て方の検証）。
+    assert!(decode_row(&schema, &frame(5, 2, &[1, 3], &[1.0, 2.0])).is_ok());
+    let bad: Vec<(&str, Vec<u8>)> = vec![
+        ("dim mismatch", frame(4, 2, &[1, 3], &[1.0, 2.0])),
+        ("nnz exceeds dim", frame(5, 6, &[0; 6], &[1.0; 6])),
+        ("nnz exceeds buffer", frame(5, 3, &[1, 3], &[1.0, 2.0])),
+        ("nnz over hard limit", frame(5, u32::MAX, &[], &[])),
+        ("non ascending", frame(5, 2, &[3, 1], &[1.0, 2.0])),
+        ("duplicate index", frame(5, 2, &[1, 1], &[1.0, 2.0])),
+        ("index out of range", frame(5, 2, &[1, 5], &[1.0, 2.0])),
+        ("zero value", frame(5, 2, &[1, 3], &[1.0, 0.0])),
+        ("negative zero", frame(5, 2, &[1, 3], &[1.0, -0.0])),
+        ("nan value", frame(5, 2, &[1, 3], &[1.0, f32::NAN])),
+        ("inf value", frame(5, 2, &[1, 3], &[f32::INFINITY, 2.0])),
+    ];
+    for (label, bytes) in &bad {
+        assert!(
+            matches!(decode_row(&schema, bytes), Err(RowCodecError::Invalid(_))),
+            "{label}"
+        );
+    }
 }
 
 /// INT8VEC(N) は i8 列で往復し（境界 −128・127・0 を含む）、宣言次元との不一致・他型との取り違え・
