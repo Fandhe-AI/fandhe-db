@@ -107,6 +107,52 @@ pub(crate) fn halfvec_select_as_scan(
     }))
 }
 
+/// `HALFVEC` 列への距離演算子形 kNN が HNSW（ANN）経路の対象になる静的な形か（Issue #2016・TABLE-46）。
+///
+/// 真になる条件は、`HALFVEC` 列への `OrderByForm::Distance`・`<=>`（物理グラフが対応する距離種別）・
+/// 昇順・明示 `LIMIT`・`USING PLAN`／`USING MODE`／`HINT ORDER` なし・セッションが `precision` でない。
+/// それ以外（`<->`／`<+>` の `0A000`・`<#>`・`DESC`・暗黙 `LIMIT`・`precision` 等）は偽を返し、従来の
+/// scan 経路（[`halfvec_select_as_scan`]）が現状どおりの結果・エラーを返す。形が合う場合だけ、
+/// scan 経路と同じ `LIMIT + OFFSET` 合計上限（`54000`）と投影距離列の照合を先に適用する
+/// （ANN でも同じ契約で拒否するため）。`core.rs::EngineCore::halfvec_ann_route` が、HNSW 宣言のゲートと
+/// 合わせて Execute／EXPLAIN の経路を決める。
+pub(crate) fn halfvec_ann_shape(
+    v: &ValidatedStatement,
+    schema: &TableSchema,
+    session_mode: Option<SearchMode>,
+    skip: &LiteralSkip,
+    limits: &crate::result_limits::ResultLimits,
+) -> Result<bool, SqlSurfaceError> {
+    if v.using_plan().is_some() {
+        return Ok(false);
+    }
+    let OrderByForm::Distance { column, literal } = v.order_by() else {
+        return Ok(false);
+    };
+    if !schema
+        .columns
+        .iter()
+        .any(|c| &c.name == column && matches!(c.ty, ColumnType::HalfVec(_)))
+    {
+        return Ok(false);
+    }
+    let kind = v.distance_kind();
+    if kind != DistanceKind::Cosine
+        || v.distance_descending()
+        || v.limit_implicit
+        || v.search_mode().is_some()
+        || v.evaluation_order() != EvaluationOrder::DEFAULT
+        || session_mode == Some(SearchMode::Precision)
+    {
+        return Ok(false);
+    }
+    crate::sql::parser::validate_search_limit_offset_with(v.limit(), v.offset(), limits)?;
+    if !skip.order_by {
+        check_projected_query_matches(v, kind, literal, skip)?;
+    }
+    Ok(true)
+}
+
 /// 投影の距離列のクエリベクトルが `ORDER BY` のものと（f16 丸め後に）一致することを検査する。
 /// 通常の kNN 経路の `check_projected_distance` は scan 変換後は呼ばれないため、同じ契約をここで守る。
 /// リテラルがベクトルとして解釈できない場合は比較せず、後段の束縛が既存のエラーで拒否する。

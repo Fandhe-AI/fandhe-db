@@ -48,7 +48,7 @@
 //! `sql::hnsw_cache` を経由せず、本 provider の全件フォールバックのまま
 //! （詳細・段階化の理由は `docs/design/hnsw-generation-cache.md` 参照）。
 
-use crate::hnsw::{HnswParams, ValidatedHnswParams, MAX_EF};
+use crate::hnsw::{HnswParams, ResidentPrecision, ValidatedHnswParams, MAX_EF};
 use crate::kernel::{CandidateHit, KernelError, SearchInput, SearchProvider, SubsetSearchInput};
 use crate::parallel_search::ParallelSearchProvider;
 
@@ -150,6 +150,14 @@ impl HnswSearchProvider {
         self.session_ef_search = s.ef_search;
         self.session_iterative_scan = s.iterative_scan;
         self.session_max_scan_tuples = s.max_scan_tuples;
+        self
+    }
+
+    /// 索引ノードの常駐精度だけを差し替えた複製を返す（Issue #2016）。`HALFVEC` 列の kNN は列が f16 で
+    /// 保存されているため、エンジン設定にかかわらず `F16` 常駐を要求する（値は f16 で厳密に表せるので
+    /// 無損失。`core.rs` の検索実行と `EXPLAIN` が同じ上書きを通す）。
+    pub(crate) fn with_resident_precision(mut self, precision: ResidentPrecision) -> Self {
+        self.params = self.params.with_resident_precision(precision);
         self
     }
 

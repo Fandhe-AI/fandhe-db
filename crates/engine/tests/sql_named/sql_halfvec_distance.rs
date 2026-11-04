@@ -462,8 +462,7 @@ fn unsupported_forms_fail_closed() {
         ("SELECT n::halfvec FROM t", "0A000"),
         ("SELECT '[1,2]'::halfvec[]", "0A000"),
         ("SELECT '[1,2]'::vector", "42601"),
-        // 索引・hybrid・USING PLAN。
-        ("CREATE INDEX i ON t USING hnsw (h)", "0A000"),
+        // hybrid・USING PLAN（`USING hnsw` は #2016 で解禁した。`sql_halfvec_hnsw.rs` で固定）。
         ("SELECT id FROM t USING PLAN('x') LIMIT 1", "0A000"),
         (
             "SELECT id FROM t ORDER BY hybrid_rrf(h, '[1,2]', n, 'b') LIMIT 1",

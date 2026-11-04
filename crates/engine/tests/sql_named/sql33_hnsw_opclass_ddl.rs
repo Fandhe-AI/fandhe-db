@@ -240,8 +240,10 @@ fn legacy_syntax_still_works_and_bad_forms_are_rejected() {
     }
     for (sql, code) in [
         (
+            // halfvec_*_ops は HALFVEC 用の演算子クラスなので VECTOR 列には 42804
+            // （PostgreSQL と同じ。Issue #2016・TABLE-46 (3) のポインタ）。
             "CREATE INDEX x ON docs USING hnsw (embedding halfvec_l2_ops)",
-            "42704",
+            "42804",
         ),
         (
             "CREATE INDEX x ON docs USING hnsw (embedding jsonb_ops)",

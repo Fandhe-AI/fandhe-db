@@ -177,6 +177,10 @@ pub struct BoundStatement {
     /// 使わない厳密全走査で返し、RLS 安全網と `OFFSET` の後に `cap` 件を超えたら `54000` で
     /// 文全体を拒否する。束縛段だけが立てる（`pub(crate)`。公開の setter・`new` は常に `None`）。
     pub(crate) result_cap: Option<usize>,
+    /// dense ベクトルの取り出し元（Issue #2016・TABLE-46）。既定は行の embedding スロット
+    /// （`VECTOR` 列）で、`HALFVEC` 列への距離演算子形 kNN の Ann 経路
+    /// （[`bind_halfvec_ann`]）だけが `HalfVecColumn` を立てる。`sql::exec` が arena 構築へ渡す。
+    pub(crate) dense_source: crate::arena::DenseSource,
 }
 
 /// `LIMIT` 省略（暗黙上限）の距離順 SELECT と取得モードの整合を検査する（Issue #2242）。
@@ -332,6 +336,7 @@ impl BoundStatement {
             distance_descending: false,
             distance_kind: crate::sql::lexer::DistanceKind::Cosine,
             result_cap: None,
+            dense_source: crate::arena::DenseSource::EmbeddingSlot,
         }
     }
 
@@ -1969,7 +1974,39 @@ fn bind_ranking(
     order_by: &OrderByForm,
     schema: &TableSchema,
     validate_literal: bool,
+    policy: DenseColumnPolicy,
 ) -> Result<Ranking, SqlSurfaceError> {
+    // `HALFVEC` の dense 列は ANN 経路（`HalfVecForAnn`）の距離形だけが認める。ハイブリッド形・
+    // `USING PLAN` は下の `vector_column` 経路（`HALFVEC` 表は `0A000`）へ落ちる（fail-closed）。
+    if policy == DenseColumnPolicy::HalfVecForAnn {
+        if let OrderByForm::Distance { column, literal } = order_by {
+            let (half_idx, half_dim) =
+                crate::arena::halfvec_column_of(schema).ok_or_else(|| {
+                    SqlSurfaceError::feature_not_supported(
+                        "vector search over HALFVEC columns is not supported",
+                    )
+                })?;
+            let column_idx = schema
+                .columns
+                .iter()
+                .position(|c| &c.name == column)
+                .ok_or_else(|| SqlSurfaceError::undefined_column(column))?;
+            if column_idx != half_idx {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {column:?} is not the table's HALFVEC column"
+                )));
+            }
+            // クエリは scan 経路と同じく f16 へ丸める（範囲外は `22003`）。ANN の結果を厳密走査と
+            // 一致させるため。
+            let query = if validate_literal {
+                let raw = parse_vector_literal(literal, half_dim)?;
+                crate::sql::exec::round_to_halfvec_f32(&raw)?
+            } else {
+                Vec::new()
+            };
+            return Ok(Ranking::Distance { query });
+        }
+    }
     let (vec_idx, vec_dim) = vector_column(schema)?;
     match order_by {
         OrderByForm::Distance { column, literal } => {
@@ -3437,6 +3474,56 @@ pub(crate) fn bind_in_session_with_limits(
     udfs: &crate::sql::udf_call::UdfRegistry,
     result_limits: &crate::result_limits::ResultLimits,
 ) -> Result<BoundStatement, SqlSurfaceError> {
+    bind_in_session_with_policy(
+        stmt,
+        schema,
+        session_mode,
+        udfs,
+        result_limits,
+        DenseColumnPolicy::VectorOnly,
+    )
+}
+
+/// `HALFVEC` 列への距離演算子形 kNN を ANN 経路（HNSW）向けに束縛する（Issue #2016・TABLE-46）。
+/// `core.rs` の経路判定（`halfvec_knn::halfvec_route`）が `Ann` と決めた文だけが呼ぶ。dense 列として
+/// `HALFVEC` を認めるのは距離形 `ORDER BY` だけで、ハイブリッド形は従来どおり `0A000` のまま。
+pub(crate) fn bind_halfvec_ann(
+    stmt: &ValidatedStatement,
+    schema: &TableSchema,
+    session_mode: Option<SearchMode>,
+    udfs: &crate::sql::udf_call::UdfRegistry,
+    result_limits: &crate::result_limits::ResultLimits,
+) -> Result<BoundStatement, SqlSurfaceError> {
+    bind_in_session_with_policy(
+        stmt,
+        schema,
+        session_mode,
+        udfs,
+        result_limits,
+        DenseColumnPolicy::HalfVecForAnn,
+    )
+}
+
+/// 距離形 `ORDER BY` の dense 列として認める列型（Issue #2016）。既定の `VectorOnly` は従来どおり
+/// `VECTOR` 列だけで、`HalfVecForAnn` は ANN 経路の束縛（[`bind_halfvec_ann`]）だけが明示的に渡す。
+/// 全体を `HALFVEC` 対応にするとハイブリッド・`USING PLAN` 等が黙って開く（fail-open）ため、
+/// 方針は引数で運ぶ。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DenseColumnPolicy {
+    /// `VECTOR` 列のみ（従来）。
+    VectorOnly,
+    /// `HALFVEC` 列を距離形 `ORDER BY` の dense 列として認める（ANN 経路専用）。
+    HalfVecForAnn,
+}
+
+fn bind_in_session_with_policy(
+    stmt: &ValidatedStatement,
+    schema: &TableSchema,
+    session_mode: Option<SearchMode>,
+    udfs: &crate::sql::udf_call::UdfRegistry,
+    result_limits: &crate::result_limits::ResultLimits,
+    policy: DenseColumnPolicy,
+) -> Result<BoundStatement, SqlSurfaceError> {
     let query_mode = match &stmt.search_mode {
         Some(literal) => Some(SearchMode::parse_literal(literal)?),
         None => None,
@@ -3457,7 +3544,7 @@ pub(crate) fn bind_in_session_with_limits(
     let has_distance_predicate =
         crate::sql::udf_call::distance_bind_count() != distance_binds_before;
 
-    let ranking = bind_ranking(&stmt.order_by, schema, true)?;
+    let ranking = bind_ranking(&stmt.order_by, schema, true, policy)?;
     check_distance_direction(
         stmt.distance_descending,
         &stmt.order_by,
@@ -3508,6 +3595,10 @@ pub(crate) fn bind_in_session_with_limits(
         distance_descending: stmt.distance_descending,
         distance_kind: stmt.distance_kind,
         result_cap,
+        dense_source: match policy {
+            DenseColumnPolicy::VectorOnly => crate::arena::DenseSource::EmbeddingSlot,
+            DenseColumnPolicy::HalfVecForAnn => crate::arena::DenseSource::HalfVecColumn,
+        },
     })
 }
 
@@ -3589,7 +3680,12 @@ pub(crate) fn bind_projection_for_describe(
             dummy_equality_flags,
         )?;
 
-    let ranking = bind_ranking(&stmt.order_by, schema, !skip.order_by)?;
+    let ranking = bind_ranking(
+        &stmt.order_by,
+        schema,
+        !skip.order_by,
+        DenseColumnPolicy::VectorOnly,
+    )?;
     check_distance_direction(
         stmt.distance_descending,
         &stmt.order_by,

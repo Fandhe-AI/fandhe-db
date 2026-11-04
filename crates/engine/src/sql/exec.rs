@@ -1344,7 +1344,9 @@ pub(crate) fn execute_statement_with_cache(
                 snapshot,
                 access.index_gate_cache,
                 &bound.table,
-                access.hnsw_scope,
+                // `HALFVEC` 表は暗黙の HNSW を作らないため、エンジンの scope にかかわらず宣言必須
+                // （Issue #2016・fail-closed。`core.rs` の経路判定と同じ規則）。
+                crate::sql::hnsw_cache::hnsw_scope_for_dense(access.hnsw_scope, bound.dense_source),
                 true,
                 crate::sql::hnsw_cache::query_metric_of_bound(bound),
             ),
@@ -2107,9 +2109,10 @@ pub(crate) fn execute_statement_with_cache(
     let mut mask_trusted_defer = false;
     let arena: &VectorArena = match arena_cache {
         None => owned_arena.insert(
-            VectorArena::build_filtered_with_rows_in_txn(
+            VectorArena::build_filtered_with_rows_from_source_in_txn(
                 read_txn,
                 &bound.table,
+                bound.dense_source,
                 rls_hook.predicate(),
                 on_visible_row,
             )
@@ -2202,9 +2205,7 @@ pub(crate) fn execute_statement_with_cache(
                     // 責務境界・クエリ結果はいずれの経路でも不変。索引は
                     // 候補行を「絞る」ことしかできず「通す」ことはできない
                     // ため、`on_visible_row` を省略しない）。
-                    let expected_dim = schema
-                        .vector_dim()
-                        .ok_or(ArenaError::InvalidDim)
+                    let expected_dim = crate::arena::dense_dim_of(schema, bound.dense_source)
                         .map_err(|e| map_arena_error(&bound.table, e))?;
                     scalar_snapshot_for_index = Some(std::sync::Arc::clone(&snapshot));
 
@@ -2407,9 +2408,7 @@ pub(crate) fn execute_statement_with_cache(
                 // 登録する（`SqlArenaCaptureBuilder` のドキュメント参照。容量超過等で
                 // 採取を断念した場合はキャッシュへ反映しないだけで、このクエリ自体の
                 // 応答には影響しない）。
-                let expected_dim = schema
-                    .vector_dim()
-                    .ok_or(ArenaError::InvalidDim)
+                let expected_dim = crate::arena::dense_dim_of(schema, bound.dense_source)
                     .map_err(|e| map_arena_error(&bound.table, e))?;
                 // `max_bytes`（第 3 引数）・`metadata_byte_cap`（第 4 引数）はいずれも
                 // `MAX_ARENA_TOTAL_BYTES` を渡すが、クエリ本体（応答用アリーナ）と
@@ -2443,9 +2442,10 @@ pub(crate) fn execute_statement_with_cache(
                     );
                     Ok(())
                 };
-                let built = VectorArena::build_filtered_with_rows_in_txn_capturing(
+                let built = VectorArena::build_filtered_with_rows_from_source_in_txn_capturing(
                     read_txn,
                     &bound.table,
+                    bound.dense_source,
                     rls_hook.predicate(),
                     on_visible_row,
                     &mut rls_capture,

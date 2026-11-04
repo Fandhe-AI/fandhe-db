@@ -671,6 +671,51 @@ impl SqlArenaCaptureBuilder {
     }
 }
 
+/// アリーナの dense ベクトルの取り出し元（Issue #2016・TABLE-46）。既定の `EmbeddingSlot` は行の
+/// embedding スロット（`VECTOR` 列。従来の全経路）で、`HalfVecColumn` は行のスカラーペイロードに
+/// f16 で保存された `HALFVEC` 列を f32 へ広げて載せる。`HalfVecColumn` を渡すのは `HALFVEC` 列への
+/// 距離演算子形 kNN（`sql::halfvec_knn` の Ann 経路）だけで、ハイブリッド・`USING PLAN`・Rust API の
+/// 検索・incremental・`rls::SearchTimeFilter` は `EmbeddingSlot` 固定のまま（`HALFVEC` 表は従来どおり
+/// `InvalidDim` で拒否される。fail-closed）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum DenseSource {
+    /// 行の embedding スロット（`VECTOR` 列）。
+    #[default]
+    EmbeddingSlot,
+    /// スカラーペイロード内の `HALFVEC` 列（表あたり高々 1 本）。
+    HalfVecColumn,
+}
+
+/// `HALFVEC` 列の `(論理列インデックス, 宣言次元)` を返す。スキーマに無い・次元が範囲外なら `None`。
+pub(crate) fn halfvec_column_of(schema: &catalog::TableSchema) -> Option<(usize, u32)> {
+    schema
+        .columns
+        .iter()
+        .enumerate()
+        .find_map(|(i, c)| match c.ty {
+            catalog::ColumnType::HalfVec(d) if d > 0 && d <= crate::storage::MAX_EMBEDDING_DIM => {
+                Some((i, d))
+            }
+            _ => None,
+        })
+}
+
+/// `source` に対応するアリーナの次元（f32 に広げた後の次元）を返す。
+pub(crate) fn dense_dim_of(schema: &catalog::TableSchema, source: DenseSource) -> Result<u32> {
+    match source {
+        DenseSource::EmbeddingSlot => {
+            let dim = schema.vector_dim().ok_or(ArenaError::InvalidDim)?;
+            if dim == 0 || dim > crate::storage::MAX_EMBEDDING_DIM {
+                return Err(ArenaError::InvalidDim);
+            }
+            Ok(dim)
+        }
+        DenseSource::HalfVecColumn => halfvec_column_of(schema)
+            .map(|(_, d)| d)
+            .ok_or(ArenaError::InvalidDim),
+    }
+}
+
 /// テーブルスキーマから埋め込み次元を取得し検証する（`0 < dim <= MAX_EMBEDDING_DIM`）。
 /// `pub(crate)`: [`VectorArena::build_filtered_with_limits`]・
 /// `rls.rs::SearchTimeFilter::build`（TASK-134）が共有する（同じ検証ロジックの重複実装を
@@ -908,6 +953,7 @@ impl VectorArena {
         Self::build_filtered_with_rows_and_limits_in_txn(
             &read_txn,
             table_name,
+            DenseSource::EmbeddingSlot,
             predicate,
             on_visible_row,
             max_rows,
@@ -926,6 +972,7 @@ impl VectorArena {
     /// 別経路で取得するミスを、シグネチャ上で構造的に防ぐ）。[`Self::build_filtered_with_rows`]
     /// （`Storage` から新規に `read_txn` を開く版）と異なり、本関数はトランザクションを
     /// 開始しない。
+    #[cfg(test)]
     pub(crate) fn build_filtered_with_rows_in_txn<F, G>(
         read_txn: &impl crate::storage::read_source::ReadSource,
         table_name: &str,
@@ -936,9 +983,32 @@ impl VectorArena {
         F: FnMut(&str, Visibility) -> bool,
         G: FnMut(usize, u64, &[f32], &[u8]) -> std::result::Result<bool, ArenaError>,
     {
+        Self::build_filtered_with_rows_from_source_in_txn(
+            read_txn,
+            table_name,
+            DenseSource::EmbeddingSlot,
+            predicate,
+            on_visible_row,
+        )
+    }
+
+    /// [`Self::build_filtered_with_rows_in_txn`] の dense 取り出し元指定版（Issue #2016）。
+    /// `sql::exec` が束縛済みの [`DenseSource`] を渡す。
+    pub(crate) fn build_filtered_with_rows_from_source_in_txn<F, G>(
+        read_txn: &impl crate::storage::read_source::ReadSource,
+        table_name: &str,
+        source: DenseSource,
+        predicate: F,
+        on_visible_row: G,
+    ) -> Result<Self>
+    where
+        F: FnMut(&str, Visibility) -> bool,
+        G: FnMut(usize, u64, &[f32], &[u8]) -> std::result::Result<bool, ArenaError>,
+    {
         Self::build_filtered_with_rows_and_limits_in_txn(
             read_txn,
             table_name,
+            source,
             predicate,
             on_visible_row,
             MAX_ARENA_ROWS,
@@ -952,6 +1022,7 @@ impl VectorArena {
     /// `rls_capture` は `on_visible_row`（SCALAR 段）の判定結果に関係なく、RLS 段を
     /// 通過した行ごとに必ず 1 回呼ばれる（[`Self::build_filtered_with_rows_and_limits_in_txn_capturing`]
     /// のドキュメント参照）。
+    #[cfg(test)]
     pub(crate) fn build_filtered_with_rows_in_txn_capturing<F, G>(
         read_txn: &impl crate::storage::read_source::ReadSource,
         table_name: &str,
@@ -963,9 +1034,33 @@ impl VectorArena {
         F: FnMut(&str, Visibility) -> bool,
         G: FnMut(usize, u64, &[f32], &[u8]) -> std::result::Result<bool, ArenaError>,
     {
+        Self::build_filtered_with_rows_from_source_in_txn_capturing(
+            read_txn,
+            table_name,
+            DenseSource::EmbeddingSlot,
+            predicate,
+            on_visible_row,
+            rls_capture,
+        )
+    }
+
+    /// [`Self::build_filtered_with_rows_in_txn_capturing`] の dense 取り出し元指定版（Issue #2016）。
+    pub(crate) fn build_filtered_with_rows_from_source_in_txn_capturing<F, G>(
+        read_txn: &impl crate::storage::read_source::ReadSource,
+        table_name: &str,
+        source: DenseSource,
+        predicate: F,
+        on_visible_row: G,
+        rls_capture: &mut RlsCaptureFn<'_>,
+    ) -> Result<Self>
+    where
+        F: FnMut(&str, Visibility) -> bool,
+        G: FnMut(usize, u64, &[f32], &[u8]) -> std::result::Result<bool, ArenaError>,
+    {
         Self::build_filtered_with_rows_and_limits_in_txn_capturing(
             read_txn,
             table_name,
+            source,
             predicate,
             on_visible_row,
             MAX_ARENA_ROWS,
@@ -1238,6 +1333,7 @@ impl VectorArena {
     fn build_filtered_with_rows_and_limits_in_txn<F, G>(
         read_txn: &impl crate::storage::read_source::ReadSource,
         table_name: &str,
+        source: DenseSource,
         predicate: F,
         on_visible_row: G,
         max_rows: usize,
@@ -1250,6 +1346,7 @@ impl VectorArena {
         Self::build_filtered_with_rows_and_limits_in_txn_capturing(
             read_txn,
             table_name,
+            source,
             predicate,
             on_visible_row,
             max_rows,
@@ -1271,9 +1368,11 @@ impl VectorArena {
     /// RLS 判定・redb 走査はそれぞれ 1 回で済み、キャッシュ採取のための追加走査は
     /// 発生しない。`rls_capture` が `Err` を返した場合はアリーナ構築全体を
     /// fail-closed に拒否する（`on_visible_row` と同じ契約）。
+    #[allow(clippy::too_many_arguments)] // dense 取り出し元（Issue #2016）の追加で 8 引数。
     fn build_filtered_with_rows_and_limits_in_txn_capturing<F, G>(
         read_txn: &impl crate::storage::read_source::ReadSource,
         table_name: &str,
+        source: DenseSource,
         mut predicate: F,
         mut on_visible_row: G,
         max_rows: usize,
@@ -1284,7 +1383,24 @@ impl VectorArena {
         F: FnMut(&str, Visibility) -> bool,
         G: FnMut(usize, u64, &[f32], &[u8]) -> std::result::Result<bool, ArenaError>,
     {
-        let expected_dim = validated_vector_dim_in_txn(read_txn, table_name)?;
+        // `HalfVecColumn` では、同一 `read_txn` のスキーマから `HALFVEC` 列の位置と次元を求める。
+        // 表あたりの vector 系列は高々 1 本なので `VECTOR` と `HALFVEC` が同居することはない。
+        let schema = catalog::get_table_schema_in_txn(read_txn, table_name)?;
+        let expected_dim = dense_dim_of(&schema, source)?;
+        let halfvec_mask: Option<Vec<bool>> = match source {
+            DenseSource::EmbeddingSlot => None,
+            DenseSource::HalfVecColumn => {
+                let (index, _) = halfvec_column_of(&schema).ok_or(ArenaError::InvalidDim)?;
+                let mut mask = vec![false; schema.columns.len()];
+                if let Some(slot) = mask.get_mut(index) {
+                    *slot = true;
+                }
+                Some(mask)
+            }
+        };
+        let halfvec_index = halfvec_mask
+            .as_ref()
+            .and_then(|m| m.iter().position(|&b| b));
 
         // 対象テーブル専用の行テーブル（`user_rows/{table_name}`）だけを開く。
         // `catalog::user_rows_table_name` は識別子検証を行わないが、直前の
@@ -1387,12 +1503,56 @@ impl VectorArena {
             // `found_dim == 0` は NULL の VECTOR（Issue #2043・TABLE-26）。可視性判定と
             // `verify_row_key_tenant` を通った後でだけ到達するため、他テナント・不可視行の
             // 状態で挙動は変わらない。0 以外の不一致は従来どおり破損として拒否する。
-            if found_dim != 0 && found_dim != expected_dim {
-                return Err(ArenaError::DimMismatch {
-                    id,
-                    expected: expected_dim,
-                    found: found_dim,
-                });
+            match source {
+                DenseSource::EmbeddingSlot => {
+                    if found_dim != 0 && found_dim != expected_dim {
+                        return Err(ArenaError::DimMismatch {
+                            id,
+                            expected: expected_dim,
+                            found: found_dim,
+                        });
+                    }
+                }
+                DenseSource::HalfVecColumn => {
+                    // `HALFVEC` 表の行は embedding スロットを持たない（次元 0）。0 以外は破損として拒否する。
+                    if found_dim != 0 {
+                        return Err(ArenaError::DimMismatch {
+                            id,
+                            expected: 0,
+                            found: found_dim,
+                        });
+                    }
+                    // スカラーペイロードの `HALFVEC` 列だけを借用で読み、f16 → f32 へ広げて
+                    // スクラッチへ載せる（NULL は空 = `null_slots` 行。TABLE-26 と同じ）。
+                    let values = crate::row_codec::scan_scalar_columns_masked(
+                        &schema,
+                        metadata,
+                        halfvec_mask.as_deref(),
+                    )
+                    .map_err(|e| ArenaError::Storage(StorageError::Codec(e.to_string())))?;
+                    embedding_scratch.clear();
+                    let cell = halfvec_index.and_then(|i| values.get(i)).and_then(|v| *v);
+                    if let Some(crate::row_codec::ScalarRef::HalfVec(body)) = cell {
+                        if body.len() != dim.saturating_mul(2) {
+                            return Err(ArenaError::DimMismatch {
+                                id,
+                                expected: expected_dim,
+                                found: u32::try_from(body.len() / 2).unwrap_or(u32::MAX),
+                            });
+                        }
+                        embedding_scratch.try_reserve_exact(dim).map_err(|e| {
+                            ArenaError::AllocationFailed(format!(
+                                "failed to reserve halfvec expansion buffer: {e}"
+                            ))
+                        })?;
+                        embedding_scratch.extend(
+                            body.as_chunks::<2>()
+                                .0
+                                .iter()
+                                .map(|c| crate::f16::f16_bits_to_f32(u16::from_le_bytes(*c))),
+                        );
+                    }
+                }
             }
 
             // `rls_capture`（Issue #363・`SqlArenaCache` ミス時のみ `Some`）: RLS 段を

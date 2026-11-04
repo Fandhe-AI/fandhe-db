@@ -286,6 +286,7 @@ pub(crate) fn bind_expansion(
         distance_descending: false,
         distance_kind: crate::sql::lexer::DistanceKind::Cosine,
         result_cap: None,
+        dense_source: crate::arena::DenseSource::EmbeddingSlot,
     })
 }
 

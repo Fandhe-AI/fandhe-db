@@ -25,6 +25,7 @@ spec 本文はここへ転記しない（`.claude/rules/spec-confidentiality.md`
 CREATE INDEX <name> ON <table> ( <col> [COLLATE <名前>][, ...] )   -- スカラー宣言（COLLATE は Issue #2191）
 CREATE INDEX <name> ON <table> USING hnsw ( <col> )     -- HNSW 宣言（VECTOR 列 1 本。vector_cosine_ops の別名）
 CREATE INDEX <name> ON <table> USING hnsw ( <col> { vector_cosine_ops | vector_l2_ops | vector_ip_ops | vector_l1_ops } )  -- 正規構文（Issue #2239）
+CREATE INDEX <name> ON <table> USING hnsw ( <halfvec col> { halfvec_cosine_ops | halfvec_l2_ops | halfvec_ip_ops | halfvec_l1_ops } )  -- HALFVEC 列（Issue #2016。4,000 次元まで）
 CREATE INDEX <name> ON <table> USING hnsw ( <col> ) WITH ( m = <n>, ef_construction = <n> )  -- 構築パラメータ付き（Issue #2029）
 DROP INDEX <name>
 ```
@@ -288,8 +289,19 @@ HNSW 宣言に任意の `WITH (m = n, ef_construction = n)` を付けられる�
   `IndexKind::Hnsw(VectorOpClass)` へ対応づける。`WITH (m, ef_construction)` と併用できる。
 - 別名: 演算子クラス省略の既存構文は `vector_cosine_ops` の別名で、同じ `IndexDef`・同じ永続形
   （cosine かつ `WITH` 無しは v1、非 cosine は v9、`WITH` 付きは v10）になる。区別はできない。
-- エラー: 未知の演算子クラス（`halfvec_*_ops`・`jsonb_ops` 等）は `42704`、`COLLATE` の後ろや
+- エラー: 未知の演算子クラス（`jsonb_ops` 等。`halfvec_*_ops` は #2016 で HALFVEC 用に受理）は `42704`、`COLLATE` の後ろや
   重複など語順の違反は `42601`（GIN と同じ既知の差分）。複数列・式・`UNIQUE`・部分索引は従来どおり `0A000`。
 - 探索: 物理グラフは cosine のみ。非 cosine の宣言は `Declared` で厳密全走査へ縮退する
   （カーネルは別 Issue）。`--hnsw-scope all` で宣言の無いテーブルの暗黙の HNSW は cosine。
 - EXPLAIN の `hnsw_params:` の `metric=` は別名と正規構文で同一。論理ダンプの正規構文出力は #2159 の担当。
+
+## Issue #2016 追記（HALFVEC 用の演算子クラス）
+
+- 構文: `USING hnsw ( <HALFVEC 列> [ halfvec_cosine_ops | halfvec_l2_ops | halfvec_ip_ops | halfvec_l1_ops ] )`
+  （大文字小文字不問。INDEX-7・TABLE-46 (3) ポインタ）。省略は `halfvec_cosine_ops` の別名で、永続形は
+  `vector_*_ops` と同じ（`IndexKind::Hnsw(VectorOpClass)`。系列は列型から導く）。
+- 照合: `vector_*_ops` を HALFVEC 列に、`halfvec_*_ops` を VECTOR 列に指定すると `42804`
+  （PostgreSQL と同じ）。#2239 の「未知の演算子クラスは `42704`」のうち `halfvec_*_ops` は未知ではなくなった。
+- 次元: HALFVEC 列の HNSW 宣言は 4,000 次元まで（超過は `54000`）。
+- 探索: 物理グラフは cosine のみ。`halfvec_cosine_ops` の宣言に対する `<=>` だけが HNSW を使い、
+  他の組は厳密全走査（#2015 の経路）。

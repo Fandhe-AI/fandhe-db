@@ -253,6 +253,43 @@ pub enum VectorOpClass {
     L1,
 }
 
+/// `USING hnsw` の演算子クラスの系列（Issue #2016・INDEX-7・TABLE-46）。pgvector と同じく
+/// `vector_*_ops` は `VECTOR` 列、`halfvec_*_ops` は `HALFVEC` 列に対応する。系列は索引列の列型から
+/// 一意に決まるため永続化せず（[`IndexKind::Hnsw`] は距離種別だけを持つ）、DDL 時の照合と表示名の
+/// 導出にだけ使う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HnswOpClassFamily {
+    /// `vector_*_ops`（`VECTOR` 列）。
+    Vector,
+    /// `halfvec_*_ops`（`HALFVEC` 列）。
+    HalfVec,
+}
+
+impl HnswOpClassFamily {
+    /// 系列と距離種別から pgvector 互換の opclass 名を返す。
+    pub fn opclass_name(self, metric: VectorOpClass) -> &'static str {
+        match (self, metric) {
+            (HnswOpClassFamily::Vector, m) => m.as_str(),
+            (HnswOpClassFamily::HalfVec, VectorOpClass::Cosine) => "halfvec_cosine_ops",
+            (HnswOpClassFamily::HalfVec, VectorOpClass::L2) => "halfvec_l2_ops",
+            (HnswOpClassFamily::HalfVec, VectorOpClass::Ip) => "halfvec_ip_ops",
+            (HnswOpClassFamily::HalfVec, VectorOpClass::L1) => "halfvec_l1_ops",
+        }
+    }
+
+    /// 索引列の列型に対応する系列（`VECTOR`／`HALFVEC` 以外は `None`）。
+    pub fn of_column_type(ty: &ColumnType) -> Option<Self> {
+        match ty {
+            ColumnType::Vector(_) => Some(HnswOpClassFamily::Vector),
+            ColumnType::HalfVec(_) => Some(HnswOpClassFamily::HalfVec),
+            _ => None,
+        }
+    }
+}
+
+/// `HALFVEC` 列の HNSW 宣言が許す最大次元（pgvector の `halfvec` HNSW と同じ 4,000。Issue #2016）。
+pub const MAX_HALFVEC_HNSW_DIM: u32 = 4_000;
+
 impl VectorOpClass {
     /// カタログ永続形・診断に使う opclass 名（pgvector と同じ綴り）。
     pub fn as_str(self) -> &'static str {
@@ -270,6 +307,20 @@ impl VectorOpClass {
         [Self::Cosine, Self::L2, Self::Ip, Self::L1]
             .into_iter()
             .find(|c| name.eq_ignore_ascii_case(c.as_str()))
+    }
+
+    /// opclass 名（大文字小文字を区別しない）を `(系列, 距離種別)` へ解決する（Issue #2016・TABLE-46）。
+    /// `vector_*_ops` は [`HnswOpClassFamily::Vector`]、`halfvec_*_ops` は
+    /// [`HnswOpClassFamily::HalfVec`]。未知の名前は `None`（構文段が `42704` で拒否する）。
+    pub fn resolve_family_name(name: &str) -> Option<(HnswOpClassFamily, Self)> {
+        [HnswOpClassFamily::Vector, HnswOpClassFamily::HalfVec]
+            .into_iter()
+            .find_map(|family| {
+                [Self::Cosine, Self::L2, Self::Ip, Self::L1]
+                    .into_iter()
+                    .find(|c| name.eq_ignore_ascii_case(family.opclass_name(*c)))
+                    .map(|c| (family, c))
+            })
     }
 
     /// 永続形のトークン（正準な小文字）から復元する。非正準形は `None`（fail-closed）。
@@ -1217,7 +1268,8 @@ fn validate_index_columns(def: &IndexDef, schema: &TableSchema) -> Result<()> {
                 // `id` は暗黙の行キーで常に「存在する列」だが `VECTOR` 型ではないため、
                 // 列不在（`ColumnNotFound`）ではなく種別・列型の不整合へ倒す。
                 return Err(CatalogError::IndexKindMismatch(
-                    "USING hnsw requires a VECTOR column, column id is not VECTOR".to_string(),
+                    "USING hnsw requires a VECTOR or HALFVEC column, column id is neither"
+                        .to_string(),
                 ));
             }
             let column = schema
@@ -1225,10 +1277,17 @@ fn validate_index_columns(def: &IndexDef, schema: &TableSchema) -> Result<()> {
                 .iter()
                 .find(|c| &c.name == col)
                 .ok_or_else(|| CatalogError::ColumnNotFound(col.clone()))?;
-            if !column.ty.is_vector() {
+            // `VECTOR` または `HALFVEC` だけを明示列挙する（Issue #2016。`is_vector_family` は
+            // INT8VEC・SPARSEVEC も含むため使わない）。
+            if !matches!(column.ty, ColumnType::Vector(_) | ColumnType::HalfVec(_)) {
                 return Err(CatalogError::IndexKindMismatch(format!(
-                    "USING hnsw requires a VECTOR column, column {col} is not VECTOR"
+                    "USING hnsw requires a VECTOR or HALFVEC column, column {col} is neither"
                 )));
+            }
+            if matches!(column.ty, ColumnType::HalfVec(d) if d > MAX_HALFVEC_HNSW_DIM) {
+                return Err(CatalogError::IndexLimitExceeded(
+                    "USING hnsw on a HALFVEC column supports at most 4000 dimensions".to_string(),
+                ));
             }
         }
         IndexKind::Gin(_) => {
@@ -15931,7 +15990,7 @@ impl Storage {
                 "partial indexes can only be created through the SQL surface".to_string(),
             ));
         }
-        self.create_index_bound(def, &[], None)
+        self.create_index_bound(def, &[], None, None)
             .map_err(|e| match e {
                 CreateIndexError::Catalog(c) => c,
                 CreateIndexError::Sql(_) => {
@@ -15954,6 +16013,7 @@ impl Storage {
         def: &IndexDef,
         exprs: &[Option<Expr>],
         predicate: Option<&[WherePredicate]>,
+        hnsw_family: Option<HnswOpClassFamily>,
     ) -> std::result::Result<(), CreateIndexError> {
         validate_relation_key(&def.name)?;
         validate_relation_key(&def.table)?;
@@ -16106,6 +16166,20 @@ impl Storage {
             }
             let schema = require_table_schema_write_any_identity(&write_txn, &def.table)?;
             validate_index_columns(def, &schema)?;
+            // 演算子クラスの系列と索引列の列型の照合（Issue #2016・TABLE-46 (3)。PostgreSQL と同じ
+            // `42804`）。同一 write txn で読んだスキーマと照合するため TOCTOU が無い。
+            if let (IndexKind::Hnsw(_), Some(family)) = (&def.kind, hnsw_family) {
+                let column_family = def
+                    .columns
+                    .first()
+                    .and_then(|c| schema.columns.iter().find(|x| &x.name == c))
+                    .and_then(|c| HnswOpClassFamily::of_column_type(&c.ty));
+                if column_family != Some(family) {
+                    return Err(CreateIndexError::Sql(SqlSurfaceError::datatype_mismatch(
+                        "operator class does not accept the indexed column type",
+                    )));
+                }
+            }
             // 式要素の束縛（INDEX-10、Issue #1648）。保存するのは束縛が描画した正規化テキストと
             // 抽出した参照列だけ。
             let mut stored = def.clone();
@@ -27090,6 +27164,37 @@ mod tests {
     }
 
     /// 非既定 opclass の `v9` 往復と固定バイト列（INDEX-7・SQL-33 (5)、Issue #1978）。
+    #[test]
+    fn halfvec_opclass_names_resolve_to_family_and_metric() {
+        for (family, prefix) in [
+            (HnswOpClassFamily::Vector, "vector"),
+            (HnswOpClassFamily::HalfVec, "halfvec"),
+        ] {
+            for (metric, suffix) in [
+                (VectorOpClass::Cosine, "cosine"),
+                (VectorOpClass::L2, "l2"),
+                (VectorOpClass::Ip, "ip"),
+                (VectorOpClass::L1, "l1"),
+            ] {
+                let name = format!("{prefix}_{suffix}_ops");
+                assert_eq!(family.opclass_name(metric), name);
+                assert_eq!(
+                    VectorOpClass::resolve_family_name(&name.to_uppercase()),
+                    Some((family, metric))
+                );
+            }
+        }
+        assert_eq!(VectorOpClass::resolve_family_name("sparsevec_l2_ops"), None);
+        assert_eq!(
+            HnswOpClassFamily::of_column_type(&ColumnType::HalfVec(3)),
+            Some(HnswOpClassFamily::HalfVec)
+        );
+        assert_eq!(
+            HnswOpClassFamily::of_column_type(&ColumnType::Int8Vec(3)),
+            None
+        );
+    }
+
     #[test]
     fn hnsw_opclass_def_round_trips_as_v9() {
         for opclass in [VectorOpClass::L2, VectorOpClass::Ip, VectorOpClass::L1] {

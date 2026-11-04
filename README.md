@@ -292,6 +292,8 @@ SQL 構文との対応表は `crates/wire-server/docs/nosql-api.md`（Issue #780
 `USING hnsw (col)` は `vector_cosine_ops` の別名で、`vector_cosine_ops`／
 `vector_l2_ops`／`vector_ip_ops`／`vector_l1_ops` を列の後ろに書けます（Issue #2239）。
 `all` で宣言の無いテーブルに使う暗黙の HNSW の距離種別は cosine です。
+HALFVEC 列には `halfvec_cosine_ops`／`halfvec_l2_ops`／`halfvec_ip_ops`／`halfvec_l1_ops` を使い（Issue #2016）、
+`<=>` の kNN が HNSW を使います。HALFVEC 表は `all` でも宣言が無ければ厳密全走査です（暗黙の HNSW を作りません）。
 
 未指定（`all`）は宣言導入前の opt-in 挙動とビット同一です。いずれの値でも
 判定はテーブル単位で、あるテーブルへの宣言が他テーブルの経路・検索結果を

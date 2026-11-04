@@ -258,3 +258,7 @@ per-run 生データは
 - 既定常駐精度を F16 へ反転するかどうかの最終判断はオーナー判断
   （#515・本節の実測を踏まえた申し送り。メモリ削減の恩恵に対しレイテンシ
   面での明確な劣化は観測されていない）。
+
+## Issue #2016 追記: HALFVEC 列の HNSW は F16 常駐に固定
+
+`HALFVEC` 列の HNSW（`sql::halfvec_knn` の ANN 経路）は、エンジン設定の常駐精度（`hnsw`／`hnsw_f16`／`hnsw_i8`）と独立に F16 常駐を要求する。列が f16 で保存されているため f32 へ広げた値は f16 で厳密に表せ、F16 常駐は無損失。要求は `HnswSearchProvider::with_resident_precision` で載せ、EXPLAIN の `resident=` も同じ値を示す。詳細は [column-type-extension.md](column-type-extension.md) の Issue #2016 追記を参照。

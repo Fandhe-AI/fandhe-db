@@ -3227,7 +3227,12 @@ pub(crate) fn execute_create_index(
     // 判定し commit・世代 bump の前に返るため、同名があれば定義を比較せず副作用なしで成功にする。
     // 式要素（INDEX-10、Issue #1648）の束縛エラーは `Sql` としてそのまま透過し、カタログ側の
     // 失敗だけを `map_create_index_error` で写像する。
-    match storage.create_index_bound(&def, validated.expression_keys(), validated.predicate()) {
+    match storage.create_index_bound(
+        &def,
+        validated.expression_keys(),
+        validated.predicate(),
+        validated.hnsw_family(),
+    ) {
         Ok(()) => {}
         Err(CreateIndexError::Catalog(CatalogError::IndexAlreadyExists(_)))
             if validated.if_not_exists() => {}
@@ -4092,6 +4097,7 @@ mod tests {
             predicate: None,
             pending_user_function: None,
             hnsw_options: None,
+            hnsw_family: None,
         };
         execute_create_index(&storage, &index).expect("create index");
         let snapshot = |storage: &Storage| {

@@ -326,7 +326,7 @@ fn unsupported_features_fail_closed() {
         ("SELECT v FROM t UNION SELECT v FROM t", "0A000"),
         ("SELECT v || 'x' FROM t", "22000"),
         ("CREATE INDEX i ON t (v)", "0A000"),
-        ("CREATE INDEX i ON t USING hnsw (v)", "0A000"),
+        // `USING hnsw` は #2016 で解禁した（`sql_halfvec_hnsw.rs` で固定）。
         ("CREATE INDEX i ON t USING gin (v)", "0A000"),
         ("CREATE TABLE c AS SELECT * FROM t", "0A000"),
         ("CREATE TABLE p (v HALFVEC(2) PRIMARY KEY)", "42601"),

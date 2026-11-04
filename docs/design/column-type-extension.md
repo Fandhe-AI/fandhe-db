@@ -846,3 +846,18 @@ NoSQL 表層の JSON 束縛（`insert`／`update`／`filter`）の型別対応�
 - **上限の引き継ぎ（#2027）**: 書き込み経路（パーサ）は `DEFAULT_MAX_SPARSEVEC_NNZ`（設定上限の差し替え点は `sql::parser::parse_sparsevec_literal` の 1 か所）、decode 経路は `HARD_MAX_SPARSEVEC_NNZ` だけで検査する。上限を下げても既存行を読める。
 - **投影**: 専用 `Cell::SparseVec` を `{1:1,3:2}/5` で整形して返す（wire の型 OID は 25〔text〕、バイナリ形式は対象外、NoSQL の型名は `"sparsevec"`）。結果予算は整形後のおおよその大きさ（非ゼロ 1 要素あたり 32 バイト）で計上する。
 - **fail-closed（対象外）**: kNN・距離（`vector_column` は `0A000`）、`vector↔sparsevec` の CAST、`ALTER TABLE ADD COLUMN`（`0A000`）、`DROP COLUMN`（`42601`）、`ALTER COLUMN TYPE`（`42804`）、PK・UNIQUE・FK・索引・CHECK・DEFAULT、HNSW（TABLE-47 (4) により恒久的に `0A000`）、比較・ORDER BY・GROUP BY・DISTINCT・集計・集合演算、COPY、CTAS・マテリアライズドビュー・`INSERT ... SELECT`・`SET col = 式`、`sparsevec[]`。距離計算・CAST は兄弟 #2026、上限の CLI 設定は #2027 の担当。
+
+## Issue #2016 追記: HALFVEC の HNSW 索引（TABLE-46 (3)(4)(6)・INDEX-7 ポインタ。SQL-33 (5)・SQL-75 を併記）
+
+- **宣言**: `USING hnsw (h [halfvec_cosine_ops | halfvec_l2_ops | halfvec_ip_ops | halfvec_l1_ops])` を HALFVEC 列に宣言できる。省略は `halfvec_cosine_ops` の別名。系列（vector／halfvec）は索引列の列型から一意に決まるため永続化せず、`IndexKind::Hnsw(VectorOpClass)` と永続形は不変（`catalog::HnswOpClassFamily` は DDL 時の照合と表示名の導出だけに使う）。系列と列型の食い違い（`vector_*_ops` を HALFVEC 列に、`halfvec_*_ops` を VECTOR 列に）は PostgreSQL と同じ `42804`、未知の名前は従来どおり `42704`。照合は `create_index_bound` が書き込み txn 内のスキーマで行う（TOCTOU なし）。HALFVEC の宣言は 4,000 次元までで、超過は `54000`（VECTOR 側の上限は変えない）。SPARSEVEC・INT8VEC・BIT 列は列型を明示列挙して従来どおり拒否する（`is_vector_family` は使わない）。
+- **経路**: 物理グラフが対応する距離は `<=>`（コサイン）だけ。`<=>` かつ昇順・明示 `LIMIT`・`USING PLAN`／`USING MODE`／`HINT ORDER` なし・セッションが `precision` でない文が、宣言済み（ゲート `Targeted`）の表で ANN 経路へ進む（`core.rs::halfvec_ann_route`。Execute と EXPLAIN が共有）。それ以外（`<#>`・`DESC`・暗黙 `LIMIT`・opclass 不一致・宣言なし）は #2015 の全走査ソート経路のまま、`<->`／`<+>` は `0A000`。HALFVEC 表のゲートはエンジンの `--hnsw-scope` にかかわらず `Declared` で評価し、`all` でも宣言の無い HALFVEC 表には暗黙の HNSW を作らない（VECTOR の `all` と意図して異なる fail-closed 側の挙動）。
+- **データの通り道**: arena の構築に `arena::DenseSource`（`EmbeddingSlot`／`HalfVecColumn`）を足した。`HalfVecColumn` は可視判定の後に、スカラーペイロードの HALFVEC 列だけを借用でデコードして f16 → f32 へ広げ、embedding のスクラッチへ載せる（NULL は空 = `null_slots`）。`vector_dim()`／`vector_column()`／`validated_vector_dim_in_txn` は HALFVEC 対応にしない。HALFVEC を dense 列と認めるのは `parser::bind_halfvec_ann`（`DenseColumnPolicy::HalfVecForAnn`、距離形 `ORDER BY` のみ）だけで、ハイブリッド・`USING PLAN`・Rust API の検索は従来どおり `0A000`／`InvalidDim`。容量見積もりは f32 に広げた後の次元で行う。クエリのリテラルは scan 経路と同じ f16 丸めを通す。
+- **常駐精度**: 列が f16 なので、エンジン設定（F32／F16／I8）にかかわらず HALFVEC 表の HNSW は F16 常駐（値は f16 で厳密に表せるため無損失）。`HnswSearchProvider::with_resident_precision(F16)` を `run_select_plan` が載せ、EXPLAIN の `hnsw_params:` は `resident=f16` を示す。自動縮退（`f16_residency_fallbacks`）は起きない。
+- **Recall の実測**（`sql_halfvec_hnsw.rs`。1,100 行 × 16 次元の 12 クラスタ正規化コーパス、問い合わせ 10 本、k = 10、`ef_search` = 400、宣言前の厳密走査を参照）:
+
+  | 条件 | recall@10 最小 | recall@10 平均 |
+  | ---- | -------------- | -------------- |
+  | HALFVEC・`halfvec_cosine_ops`・F16 常駐 | 0.900 | 0.990 |
+
+  一様乱数の fixture では VECTOR 表と HALFVEC 表で Recall が同一（8 次元で最小 0.5、32 次元で最小 0.6）になるため、HNSW の既存回帰（`tests/core_misc/hnsw_cache.rs`）と同じクラスタ構造のコーパスを使う。基準は同テストの F16 と同じ 0.9。
+- **既知の差**: ANN 経路は VECTOR の索引経路と同じく NULL 行・ゼロノルム行を結果に出さない（全走査では NaN／NULL が末尾に並ぶ）。投影の距離列は ORDER BY と同じ f16 丸め後のクエリに限る（#2015 と同じ照合を先に適用する）。
