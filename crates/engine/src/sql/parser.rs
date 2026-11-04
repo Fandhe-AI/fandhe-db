@@ -728,6 +728,26 @@ pub(crate) fn bind_numeric_literal(
 /// 有限であること。(4) 要素数が `expected_dim` と一致すること。(2)〜(4) の違反は
 /// [`SqlSurfaceError::InvalidInput`]。
 pub fn parse_vector_literal(literal: &str, expected_dim: u32) -> Result<Vec<f32>, SqlSurfaceError> {
+    let values = parse_vector_literal_any_dim(literal)?;
+    let dim = u32::try_from(values.len()).map_err(|_| {
+        SqlSurfaceError::payload_too_large(format!(
+            "vector literal element count {} exceeds representable range",
+            values.len()
+        ))
+    })?;
+    if dim != expected_dim {
+        return Err(SqlSurfaceError::invalid_input(format!(
+            "vector literal dimension mismatch: expected {expected_dim}, got {dim}"
+        )));
+    }
+    Ok(values)
+}
+
+/// [`parse_vector_literal`] の次元照合を除いた共通部（長さ上限・形式・有限性の検証）。
+///
+/// 距離関数の引数リテラル（SQL-72 (1)・Issue #2011。相手の次元が式の評価時まで定まらない）が
+/// 次元を指定せずに使う。呼び出し側が次元を照合する。
+pub(crate) fn parse_vector_literal_any_dim(literal: &str) -> Result<Vec<f32>, SqlSurfaceError> {
     if literal.len() > MAX_VECTOR_LITERAL_BYTES {
         return Err(SqlSurfaceError::payload_too_large(format!(
             "vector literal length {} exceeds limit {MAX_VECTOR_LITERAL_BYTES}",
@@ -764,18 +784,6 @@ pub fn parse_vector_literal(literal: &str, expected_dim: u32) -> Result<Vec<f32>
             }
             values.push(v);
         }
-    }
-
-    let dim = u32::try_from(values.len()).map_err(|_| {
-        SqlSurfaceError::payload_too_large(format!(
-            "vector literal element count {} exceeds representable range",
-            values.len()
-        ))
-    })?;
-    if dim != expected_dim {
-        return Err(SqlSurfaceError::invalid_input(format!(
-            "vector literal dimension mismatch: expected {expected_dim}, got {dim}"
-        )));
     }
 
     Ok(values)
