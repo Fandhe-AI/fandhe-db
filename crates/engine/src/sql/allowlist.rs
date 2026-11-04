@@ -6734,6 +6734,11 @@ struct Parser<'a> {
     /// 投影・SET・VALUES・UDF 本体・ORDER BY・JOIN など他の文脈は従来どおり `42601` のままにする。
     /// CHECK 本体は真にしない（従来の拒否を維持）。
     distance_expr_allowed: bool,
+    /// 投影トップレベルの距離列 `<VECTOR 列> <距離演算子> <ベクトルリテラル> [AS 別名]`
+    /// （SQL-33 (7)・Issue #2007）を受理してよいか。`parse_select_shape` が最上位の SELECT リスト
+    /// （`subquery_ctx == None`）を読む間だけ真にする。実際に使える形（距離 `ORDER BY` と列・種別が
+    /// 一致する検索 SELECT）かどうかは `parse_select_shape` の各出口が検査する（fail-closed）。
+    projection_distance_allowed: bool,
     /// 複数行 `VALUES` が持てる行数の上限（[`Self::parse_insert`] が判定に使う）。
     /// 既定値は `None`＝上限なし（Issue #997・オーナー判断の改訂
     /// 〔2026-09-27、汎用 RDB との整合〕）。`Some(limit)` は `wire-server` の
@@ -6877,6 +6882,7 @@ impl<'a> Parser<'a> {
             allow_plus_param: false,
             in_check_body: false,
             distance_expr_allowed: false,
+            projection_distance_allowed: false,
             max_insert_rows: None,
             from_ref: None,
             reject_from_alias: false,
@@ -7454,6 +7460,10 @@ impl<'a> Parser<'a> {
                     } else {
                         head
                     }
+                } else if self.projection_distance_allowed
+                    && matches!(self.tokens.get(self.pos + 1), Some(Token::DistanceOp(_)))
+                {
+                    return self.parse_projection_distance_item();
                 } else if next_is_op {
                     self.parse_projection_infix(0)?
                 } else {
@@ -7522,6 +7532,38 @@ impl<'a> Parser<'a> {
             None
         };
         Ok(SelectItem::Expr { expr, alias })
+    }
+
+    /// 投影トップレベルの距離列 1 項目 `<列> <距離演算子> <文字列リテラル> [AS <別名>]` を読む
+    /// （SQL-33 (7)・Issue #2007）。呼び出し元（[`Self::parse_select_item`]）が
+    /// [`Self::projection_distance_allowed`] と「識別子の直後が距離演算子」を確認済みの前提で呼ぶ。
+    /// 左辺は列識別子・右辺はベクトルリテラル（`$n` は Bind 時点で文字列リテラル）に限り、
+    /// 入れ子・逆向き・算術との合成は後続トークンの期待外れで従来どおり `42601` に落ちる。
+    /// ORDER BY との一致検査は [`parse_select_shape`] の各出口と束縛段が行う。
+    fn parse_projection_distance_item(&mut self) -> Result<SelectItem, SqlSurfaceError> {
+        self.sink_mark(self.pos, super::colref_sink::Role::Value);
+        let column = self.expect_ident()?;
+        let kind = match self.peek() {
+            Some(Token::DistanceOp(kind)) => *kind,
+            _ => return Err(SqlSurfaceError::unsupported("expected a distance operator")),
+        };
+        self.advance();
+        let literal = self.expect_string_literal()?;
+        self.consume_expr_node()?;
+        let alias = if self.peek_ident_matches("AS") {
+            self.advance();
+            Some(self.expect_ident()?)
+        } else {
+            None
+        };
+        Ok(SelectItem::Expr {
+            expr: Expr::VectorDistance {
+                kind,
+                lhs: Box::new(Expr::Ident(column)),
+                rhs: Box::new(Expr::String(literal)),
+            },
+            alias,
+        })
     }
 
     /// 投影項目の式モード解析。[`Self::allow_unary_minus`] を解析中だけ立て、エラー時も
@@ -23268,7 +23310,13 @@ fn parse_select_shape(
     // 通常項目と混在しうるため、`ORDER BY`／`USING PLAN` を伴う検索 SELECT 経路か
     // ランキング段を持たない広域取得かを判定する**前**にリストを読み終える必要が
     // ある（既存の `parse_select_list` 呼び出しをそのまま置き換える）。
-    let (projection, window_items, scalar_subquery_items) = p.parse_select_list_with_windows()?;
+    p.projection_distance_allowed = subquery_ctx.is_none_or(|d| d == 0);
+    let select_list = p.parse_select_list_with_windows();
+    p.projection_distance_allowed = false;
+    let (projection, window_items, scalar_subquery_items) = select_list?;
+    // SQL-33 (7)・Issue #2007: 投影の距離列は距離 `ORDER BY` を持つ検索 SELECT だけが使える。
+    // 他の出口（広域取得・`USING PLAN`・HYBRID・関数呼び出し形）は下で一括して `42601` にする。
+    let projected_distances = projection_distance_items(&projection);
     // Issue #1352: 投影位置のスカラーサブクエリとウィンドウ項目の併用は非対応
     // （ウィンドウ実行は結果列を独自に組み立てるため、合流位置の整合を持たない）。
     if !window_items.is_empty() && !scalar_subquery_items.is_empty() {
@@ -23296,6 +23344,7 @@ fn parse_select_shape(
     // `ORDER BY` 経路は必ずキーワード `ORDER` から始まるため、この位置で文脈的
     // 識別子 `USING` が現れるかどうかだけで両者を衝突なく判定できる。
     if p.peek_ident_matches("USING") {
+        reject_projected_distance(&projected_distances)?;
         // SQL-30・TASK-214: `USING PLAN` はランキング段を持つ検索 SELECT 専用の
         // 経路で、ウィンドウ項目とは構造上両立しない（§計画 2「対象外」）。
         if !window_items.is_empty() {
@@ -23349,6 +23398,7 @@ fn parse_select_shape(
     // Issue #1796・SQL-34: `LIMIT` 省略・`LIMIT ALL`・`OFFSET` 単独・文末も同じ広域取得
     // として受理する（`ORDER` 以外の余剰トークンは `expect_end_of_statement` が `42601`）。
     if !matches!(p.peek(), Some(Token::Keyword(Keyword::Order))) {
+        reject_projected_distance(&projected_distances)?;
         let limit = p.parse_optional_limit()?;
 
         // Issue #916・SQL-25 (b)・TASK-209: `LIMIT n` の直後に任意で `OFFSET m` を
@@ -23411,6 +23461,7 @@ fn parse_select_shape(
     }
 
     if !is_vector_ranking {
+        reject_projected_distance(&projected_distances)?;
         let scan_keys = p.with_embedded_scalars(|p| p.parse_scalar_order_by())?;
         let (order_by, order_keys) = split_scan_order_keys(scan_keys);
         // Issue #1188: 式キーの `ORDER BY` とウィンドウ関数の併用は非対応（Issue #1189 で
@@ -23488,6 +23539,7 @@ fn parse_select_shape(
         ));
     }
     let (order_by, distance_kind) = p.parse_order_by()?;
+    check_projected_distance_shape(&projected_distances, &order_by, distance_kind)?;
     // Issue #2009・SQL-33 (2): 距離順 `ORDER BY` に限り方向語 `ASC`／`DESC` を 1 つ受理する
     // （文脈語のため大文字小文字非区別）。`NULLS` 句・重複・hybrid 関数形への付与は
     // ここで読まず、後続の `expect_keyword(Limit)` が従来どおり `42601` に落とす。
@@ -23541,6 +23593,61 @@ fn parse_select_shape(
         distance_kind,
         limit_implicit,
     }))
+}
+
+/// 投影トップレベルの距離列（[`Parser::parse_projection_distance_item`]）の `(種別, 列名)` を集める。
+fn projection_distance_items(projection: &Projection) -> Vec<(lexer::DistanceKind, String)> {
+    let Projection::Items(items) = projection else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| match item {
+            SelectItem::Expr {
+                expr: Expr::VectorDistance { kind, lhs, .. },
+                ..
+            } => match lhs.as_ref() {
+                Expr::Ident(col) => Some((*kind, col.clone())),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+/// 距離 `ORDER BY` を持たない形（広域取得・`USING PLAN`・スカラー `ORDER BY`）に投影の距離列が
+/// あれば `42601` で拒否する（SQL-33 (7)・Issue #2007。一般の投影距離は SQL-74 の範囲）。
+fn reject_projected_distance(
+    items: &[(lexer::DistanceKind, String)],
+) -> Result<(), SqlSurfaceError> {
+    if items.is_empty() {
+        return Ok(());
+    }
+    Err(SqlSurfaceError::unsupported(
+        "a projected distance requires a distance ORDER BY on the same column and operator",
+    ))
+}
+
+/// 距離 `ORDER BY` と投影の距離列の整合（演算子種別・列名の同一）を検査する。HYBRID などの
+/// 関数呼び出し形に距離列があれば拒否する。クエリベクトルの同一性は束縛段が検査する。
+fn check_projected_distance_shape(
+    items: &[(lexer::DistanceKind, String)],
+    order_by: &OrderByForm,
+    order_kind: lexer::DistanceKind,
+) -> Result<(), SqlSurfaceError> {
+    if items.is_empty() {
+        return Ok(());
+    }
+    match order_by {
+        OrderByForm::Distance { column, .. }
+            if items
+                .iter()
+                .all(|(kind, col)| *kind == order_kind && col == column) =>
+        {
+            Ok(())
+        }
+        _ => reject_projected_distance(items),
+    }
 }
 
 /// 式の内側のスカラーサブクエリ（Issue #1848）の併用制限を検査する。ウィンドウ項目とは併用できず
@@ -32201,6 +32308,36 @@ mod tests {
             panic!("expected -> below, got {inner:?}");
         };
         assert!(matches!(rhs.as_ref(), Expr::Binary { op: BinOp::Add, .. }));
+    }
+
+    /// SQL-33 (7)・Issue #2007: 投影トップレベルの距離列は、同じ列・同じ演算子種別の距離
+    /// `ORDER BY` を持つ検索 SELECT でだけ構文として受理する。4 種別の受理、別名の有無、
+    /// それ以外の形（種別・列の不一致、広域取得、HYBRID、入れ子・逆向き・算術合成）の拒否を固定する。
+    #[test]
+    fn projected_distance_item_parses_only_with_matching_distance_order_by() {
+        let lookup = catalog_with(&["documents"]);
+        for op in ["<=>", "<->", "<#>", "<+>"] {
+            for alias in ["", " AS d"] {
+                let sql = format!(
+                    "SELECT id, embedding {op} '[0.1]'{alias} FROM documents ORDER BY embedding {op} '[0.1]' LIMIT 5"
+                );
+                validate_statement(&sql, &lookup)
+                    .unwrap_or_else(|e| panic!("expected acceptance, got {e:?} for {sql:?}"));
+            }
+        }
+        for sql in [
+            "SELECT embedding <-> '[0.1]' FROM documents ORDER BY embedding <=> '[0.1]' LIMIT 5",
+            "SELECT embedding <=> '[0.1]' FROM documents LIMIT 5",
+            "SELECT embedding <=> '[0.1]' FROM documents ORDER BY lang LIMIT 5",
+            "SELECT lang <=> '[0.1]' FROM documents ORDER BY embedding <=> '[0.1]' LIMIT 5",
+            "SELECT 1 - (embedding <=> '[0.1]') FROM documents ORDER BY embedding <=> '[0.1]' LIMIT 5",
+            "SELECT '[0.1]' <=> embedding FROM documents ORDER BY embedding <=> '[0.1]' LIMIT 5",
+            "SELECT embedding <=> '[0.1]' * 2 FROM documents ORDER BY embedding <=> '[0.1]' LIMIT 5",
+            "SELECT embedding <=> '[0.1]' FROM documents ORDER BY HYBRID_RRF(embedding, '[0.1]', body, 'q') LIMIT 5",
+        ] {
+            let err = validate_statement(sql, &lookup).expect_err(sql);
+            assert_eq!(err.wire_code(), "42601", "{sql}");
+        }
     }
 
     /// SQL-74 (1)・Issue #2035: WHERE 内の距離式は「その他の演算子」の段（加減算より弱く比較より強い）で

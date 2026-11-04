@@ -2608,7 +2608,10 @@ pub struct PreparedSql {
     /// このリテラルの実パースを省略してよい（PR #1012 レビュー指摘対応:
     /// `$n` を含まない文では `false` のままとなり、`dummy_parsed` に残る実
     /// リテラルは通常の Describe と同じく必ず検証される）。
-    order_by_distance_literal_is_param: bool,
+    ///
+    /// 投影位置の距離列（SQL-33 (7)・Issue #2007）の `$n` は投影項目ごとに別々に持つ
+    /// （ORDER BY 側・各投影項目のどれか 1 つが `$n` でも、他方の実リテラルの検証は省かない）。
+    literal_skip: crate::sql::parser::LiteralSkip,
     /// `dummy_parsed` の `WHERE` 等価述語（[`crate::sql::allowlist::
     /// WherePredicate::Equality`]）を出現順に並べ、各々の値が元の SQL
     /// テキストの `$n`（[`crate::sql::params::where_equality_literal_is_param`]）
@@ -6821,6 +6824,7 @@ impl EngineCore {
         &self,
         session: &crate::sql::mode::SessionState,
         stmt: &crate::sql::allowlist::ValidatedInsertSelect,
+        skip: &crate::sql::parser::LiteralSkip,
         limits: &crate::result_limits::ResultLimits,
     ) -> Result<
         crate::sql::insert_select::BoundInsertSelectTarget,
@@ -6837,7 +6841,7 @@ impl EngineCore {
             .describe_parsed_in_session_impl(
                 session,
                 &ParsedSql::Statement((*stmt.query).clone()),
-                false,
+                skip,
                 &[],
                 limits,
             )?
@@ -7127,7 +7131,7 @@ impl EngineCore {
                     stmt,
                     sql.to_string(),
                 )),
-                order_by_distance_literal_is_param: false,
+                literal_skip: crate::sql::parser::LiteralSkip::NONE,
                 where_equality_dummy_flags: Vec::new(),
                 param_types: Vec::new(),
                 declared: Vec::new(),
@@ -7164,8 +7168,13 @@ impl EngineCore {
         }
         // ダミー置換前の元トークン列から判定する（置換後は `$n` 自体が
         // 消えるため、置換後トークン列からは判定できない）。
-        let order_by_distance_literal_is_param =
-            crate::sql::params::order_by_distance_literal_is_param(&tokens);
+        // SQL-33 (7)・Issue #2007: 投影位置の距離列の `$n` も同じ「ベクトルリテラル検証の省略」
+        // 対象だが、ORDER BY 側と投影項目ごとに別の印として持つ。`$n` 由来のダミー値の位置に限って
+        // 検証を省き、同じ文中の実リテラルは Describe でも必ず検証する（fail-closed）。
+        let literal_skip = crate::sql::parser::LiteralSkip {
+            order_by: crate::sql::params::order_by_distance_literal_is_param(&tokens),
+            projection_mask: crate::sql::params::select_list_distance_param_mask(&tokens),
+        };
         // Issue #1342・#1546: 型推論（カタログとトークン列だけで決まる）を先に行い、
         // 確定した置換リテラル種別の型付きダミーで 1 回だけ構造検証 parse する。
         // 式内 `$n`（`1 + $1` 等）は文字列ダミーでは定数畳み込み／束縛の型検査に落ちるため、
@@ -7245,7 +7254,7 @@ impl EngineCore {
             tokens,
             param_count,
             dummy_parsed,
-            order_by_distance_literal_is_param,
+            literal_skip,
             where_equality_dummy_flags,
             param_types,
             declared: (0..usize::from(param_count))
@@ -7697,7 +7706,7 @@ impl EngineCore {
         // 全 `$n` を固定ダミー値へ置換した `ParsedSql` である。`ORDER BY`
         // ベクトルリテラルの実パースを省略してよいのは、そのリテラルが
         // 実際に `$n` に由来するダミー値である場合（`prepared.
-        // order_by_distance_literal_is_param == true`）に限る。`$n` を含まない
+        // literal_skip.order_by == true` または投影項目の印）に限る。`$n` を含まない
         // 文では `substitute_dummy` が当該位置を変更しないため `dummy_parsed`
         // にも元の実リテラルがそのまま残っており、この場合は通常の
         // `describe_parsed_in_session` と同じく必ず検証する（PR #1012
@@ -7717,7 +7726,7 @@ impl EngineCore {
         self.describe_parsed_in_session_impl(
             session,
             &prepared.dummy_parsed,
-            prepared.order_by_distance_literal_is_param,
+            &prepared.literal_skip,
             &prepared.where_equality_dummy_flags,
             &self.result_limits,
         )
@@ -9843,7 +9852,13 @@ impl EngineCore {
         // `describe_prepared_in_session` のみが使う（PR #1012 レビュー指摘
         // 対応。詳細は同メソッドのコメント参照）。
         Self::coarse_temp_gate(session, parsed)?;
-        self.describe_parsed_in_session_impl(session, parsed, false, &[], &self.result_limits)
+        self.describe_parsed_in_session_impl(
+            session,
+            parsed,
+            &crate::sql::parser::LiteralSkip::NONE,
+            &[],
+            &self.result_limits,
+        )
     }
 
     /// `describe_parsed_in_session_unscrubbed` の公開入口。判定順序・エラー契約・結果は同関数と同一で、出口でだけ
@@ -9917,7 +9932,14 @@ impl EngineCore {
         // 結果列を決める（Issue #2403。最新カタログで決めると Execute の列比較と食い違う）。
         let snap = Self::describe_snapshot(txn)?;
         Self::coarse_temp_gate(session, parsed)?;
-        self.describe_parsed_in_session_snap(session, parsed, false, &[], &self.result_limits, snap)
+        self.describe_parsed_in_session_snap(
+            session,
+            parsed,
+            &crate::sql::parser::LiteralSkip::NONE,
+            &[],
+            &self.result_limits,
+            snap,
+        )
     }
 
     /// [`PreparedSql::dummy_parsed`] の構築（Parse 時のダミー値置換 → 構造検証 parse）を、`BEGIN` 時点の
@@ -10008,7 +10030,7 @@ impl EngineCore {
             self.describe_parsed_in_session_snap(
                 session,
                 parsed,
-                prepared.order_by_distance_literal_is_param,
+                &prepared.literal_skip,
                 &prepared.where_equality_dummy_flags,
                 &self.result_limits,
                 snap,
@@ -10155,7 +10177,7 @@ impl EngineCore {
             .describe_parsed_in_session_impl(
                 session,
                 &ParsedSql::Statement(statement),
-                false,
+                &crate::sql::parser::LiteralSkip::NONE,
                 &[],
                 &crate::result_limits::ResultLimits::default(),
             )?
@@ -10229,7 +10251,7 @@ impl EngineCore {
                     .describe_parsed_in_session_impl(
                         session,
                         &ParsedSql::Statement(*body),
-                        false,
+                        &crate::sql::parser::LiteralSkip::NONE,
                         &[],
                         &crate::result_limits::ResultLimits::default(),
                     )?
@@ -10274,7 +10296,7 @@ impl EngineCore {
         &self,
         session: &crate::sql::mode::SessionState,
         validated: &crate::sql::allowlist::ValidatedRecursiveCte,
-        skip_vector_literal_validation: bool,
+        skip_vector_literal_validation: &crate::sql::parser::LiteralSkip,
         limits: &crate::result_limits::ResultLimits,
         snap: Option<&redb::ReadTransaction>,
     ) -> Result<Vec<crate::sql::exec::ColumnMeta>, crate::sql::allowlist::SqlSurfaceError> {
@@ -10355,7 +10377,7 @@ impl EngineCore {
         &self,
         session: &crate::sql::mode::SessionState,
         parsed: &ParsedSql,
-        skip_vector_literal_validation: bool,
+        skip_vector_literal_validation: &crate::sql::parser::LiteralSkip,
         dummy_equality_flags: &[bool],
         limits: &crate::result_limits::ResultLimits,
     ) -> Result<Option<Vec<crate::sql::exec::ColumnMeta>>, crate::sql::allowlist::SqlSurfaceError>
@@ -10390,7 +10412,7 @@ impl EngineCore {
         &self,
         session: &crate::sql::mode::SessionState,
         parsed: &ParsedSql,
-        skip_vector_literal_validation: bool,
+        skip_vector_literal_validation: &crate::sql::parser::LiteralSkip,
         dummy_equality_flags: &[bool],
         limits: &crate::result_limits::ResultLimits,
         snap: Option<&redb::ReadTransaction>,
@@ -10453,11 +10475,12 @@ impl EngineCore {
             // SQL-63・Issue #1876: 書き込みは行わず、参照される副文の `RETURNING` 列に主クエリの外側処理を
             // 適用した列メタを返す（Execute と同じ `plan_outer_parts` を通るため列名・型・束縛エラーが一致）。
             ParsedSql::DataModifyingCte(stmt) => self
-                .describe_data_modifying_cte(session, stmt, limits)
+                .describe_data_modifying_cte(session, stmt, skip_vector_literal_validation, limits)
                 .map(Some),
             // SQL-51・Issue #1732: 束縛（列数・型）を通した上で、`RETURNING` の列メタだけを返す。
             ParsedSql::InsertSelect(stmt) => {
-                let bound = self.bind_insert_select(session, stmt, limits)?;
+                let bound =
+                    self.bind_insert_select(session, stmt, skip_vector_literal_validation, limits)?;
                 match bound.returning {
                     Some(projection) => {
                         let (_read_txn, schema) = self.read_txn_with_schema(&stmt.table_name)?;
@@ -10923,7 +10946,7 @@ impl EngineCore {
                         &schema,
                         session.udfs(),
                         session.search_mode(),
-                        !skip_vector_literal_validation,
+                        skip_vector_literal_validation,
                         dummy_equality_flags,
                         limits,
                     )?;
@@ -11913,7 +11936,7 @@ impl EngineCore {
                 self.describe_recursive_cte(
                     &*session,
                     &validated,
-                    false,
+                    &crate::sql::parser::LiteralSkip::NONE,
                     &limits,
                     read_txn.snapshot(),
                 )?;
@@ -12198,7 +12221,7 @@ impl EngineCore {
         session: &crate::sql::mode::SessionState,
         cte: &crate::sql::allowlist::JoinCteInputs,
         k: usize,
-        skip_vector_literal_validation: bool,
+        skip_vector_literal_validation: &crate::sql::parser::LiteralSkip,
         limits: &crate::result_limits::ResultLimits,
         snap: Option<&redb::ReadTransaction>,
     ) -> Result<Vec<crate::sql::exec::ColumnMeta>, crate::sql::allowlist::SqlSurfaceError> {

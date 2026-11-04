@@ -46,7 +46,7 @@ impl EngineCore {
             .describe_parsed_in_session_impl(
                 session,
                 &ParsedSql::Statement(statement.clone()),
-                false,
+                &crate::sql::parser::LiteralSkip::NONE,
                 &[],
                 &self.result_limits,
             )?

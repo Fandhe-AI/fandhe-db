@@ -617,3 +617,20 @@ fn describe_policy_ddl_reports_no_columns() {
         assert!(described.is_none(), "{sql}");
     }
 }
+
+/// SQL-33 (7)・Issue #2007: 投影位置の距離列（float8）の Describe 列は実行結果の列と一致する。
+#[test]
+fn describe_projected_distance_column_matches_execute() {
+    let path = unique_db_path("describe-projected-distance");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core_with_documents_table(&path);
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    seed_row(&core, &ctx, 1, "op-seed-0001");
+
+    assert_describe_matches_execute(
+        &core,
+        &ctx,
+        "SELECT id, embedding <=> '[0.1,0.2,0.3]' AS d FROM documents \
+         ORDER BY embedding <=> '[0.1,0.2,0.3]' LIMIT 5",
+    );
+}
