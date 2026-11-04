@@ -40,6 +40,8 @@
 //!   呼べる。`ExplainIndexNames`・`build_explain_result_with_indexes`（Issue
 //!   #1066・TASK-206・INDEX-7）は `ann_plan:`／`scalar_plan:` 行への使用索引名
 //!   注記用に追加した公開 API（`build_explain_result` は非破壊のまま維持）
+//! - [`explain_tree`][]: `EXPLAIN` の段の木（Issue #2045・SQL-75 (2)。単一表は
+//!   ルート 1 節で出力不変。結合・集合演算・CTE の入れ子描画の土台）
 //! - [`mode`][]: 取得モード（`recall`／`precision`）の優先順位解決・セッション状態
 //!   （TASK-161・SQL-12）
 //! - [`using_operation_id`][]: `USING OPERATION_ID '<id>'` 文末句の値型・検証（TASK-80）
@@ -238,6 +240,7 @@ pub(crate) mod distinct;
 pub(crate) mod dml_from_returning;
 pub mod exec;
 pub mod explain;
+pub(crate) mod explain_tree;
 pub(crate) mod expr_program;
 pub(crate) mod expression_key_index;
 pub(crate) mod fetch_clause;
