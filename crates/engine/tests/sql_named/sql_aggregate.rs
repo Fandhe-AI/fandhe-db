@@ -607,7 +607,7 @@ fn sql13_sum_id_overflow_is_rejected() {
     assert_eq!(as_integer(&single_row(&max_ok)[0]), u64::MAX);
 }
 
-// --- 型不整合: VECTOR 列への AVG/MIN/MAX は 42883、COUNT・SUM は受理（SUM は SQL-72 (3)・Issue #2038）----
+// --- 型不整合: VECTOR 列への MIN/MAX は 42883、COUNT・SUM・AVG は受理（SUM／AVG は SQL-72 (3)・Issue #2038・#2039）----
 
 #[test]
 fn sql13_vector_column_type_mismatch_and_count_acceptance() {
@@ -618,7 +618,7 @@ fn sql13_vector_column_type_mismatch_and_count_acceptance() {
     let core = new_core(storage);
     let ctx = ctx_for("tenant-a", true);
 
-    for func in ["AVG", "MIN", "MAX"] {
+    for func in ["MIN", "MAX"] {
         let sql = format!("SELECT {func}(embedding) FROM docs");
         let err = core
             .execute_sql(&ctx, &sql)
@@ -628,6 +628,8 @@ fn sql13_vector_column_type_mismatch_and_count_acceptance() {
 
     core.execute_sql(&ctx, "SELECT SUM(embedding) FROM docs")
         .expect("SUM(embedding) should be accepted");
+    core.execute_sql(&ctx, "SELECT AVG(embedding) FROM docs")
+        .expect("AVG(embedding) should be accepted");
 
     let ok = core
         .execute_sql(&ctx, "SELECT COUNT(embedding) FROM docs")
@@ -785,7 +787,6 @@ fn non_numeric_aggregates_are_rejected_with_42883() {
         "SELECT AVG(lang) FROM docs",
         "SELECT MIN(embedding) FROM docs",
         "SELECT SUM(lower(lang)) FROM docs",
-        "SELECT AVG(vec_div(embedding, 2)) FROM docs",
         "SELECT MAX(vec_div(embedding, 2)) FROM docs",
     ] {
         let err = core.execute_sql(&ctx, sql).expect_err(sql);
@@ -801,6 +802,7 @@ fn non_numeric_aggregates_are_rejected_with_42883() {
         "SELECT COUNT(lang) FROM docs",
         "SELECT COUNT(embedding) FROM docs",
         "SELECT SUM(embedding) FROM docs",
+        "SELECT AVG(vec_div(embedding, 2)) FROM docs",
         "SELECT SUM(id) FROM docs",
         "SELECT AVG(vec_norm(embedding)) FROM docs",
     ] {
