@@ -55,6 +55,7 @@ pub mod scoring_boost;
 pub mod search_engine;
 pub mod sparse;
 pub mod sparse_vector;
+pub mod sparsevec_limits;
 pub mod sql;
 pub mod storage;
 pub mod temp_table_limits;
