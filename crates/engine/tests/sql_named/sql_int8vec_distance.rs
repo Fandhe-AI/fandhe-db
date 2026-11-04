@@ -975,6 +975,13 @@ fn describe_accepts_placeholder_in_between_and_in() {
         // PR #2956 指摘: 異なる `$n` の距離式が並んでも 1 つの塊にまとめない。
         "SELECT id FROM t WHERE v <-> $1 BETWEEN 0 AND 5 AND v <-> $2 < 10 ORDER BY id LIMIT 3",
         "SELECT id FROM t WHERE v <-> $1 < 10 AND v <-> $2 IN (1, 2) ORDER BY id LIMIT 3",
+        // 括弧付き距離式・算術式の境界／要素（PR #2956 再指摘）。
+        "SELECT id FROM t WHERE (v <-> $1) BETWEEN 0 AND 5 ORDER BY id LIMIT 3",
+        "SELECT id FROM t WHERE (v <-> $1) NOT BETWEEN 0 AND 5 ORDER BY id LIMIT 3",
+        "SELECT id FROM t WHERE (v <-> $1) IN (1, 2) ORDER BY id LIMIT 3",
+        "SELECT id FROM t WHERE v <-> $1 BETWEEN 1 + 2 AND 10 - 1 ORDER BY id LIMIT 3",
+        "SELECT id FROM t WHERE v <-> $1 IN (1 + 1, 2 * 3, 4) ORDER BY id LIMIT 3",
+        "SELECT id FROM t WHERE ((v <-> $1) + 1) BETWEEN 0 AND 5 ORDER BY id LIMIT 3",
     ] {
         describe(sql).unwrap_or_else(|e| panic!("{sql}: {}", e.wire_code()));
     }

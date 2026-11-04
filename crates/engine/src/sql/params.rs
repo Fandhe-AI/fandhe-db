@@ -2192,8 +2192,8 @@ pub fn where_distance_param_mask(tokens: &[Token]) -> Vec<bool> {
 /// [`where_distance_param_mask`] と同じ区間・同じ出現順で、距離演算子ごとに「構文段の脱糖で AST 上に
 /// 何個の距離式へ複製されるか」を返す（Issue #2953・PR #2956 指摘）。`<距離式> [NOT] BETWEEN a AND b`
 /// は 2 個、`<距離式> [NOT] IN (e1, ..., en)` は n 個へ左辺が複製される。それ以外は 1 個。
-/// 境界・要素が単一トークン（任意で前置 `-`）でない形は複製数を確定できないため `0`（不明）とし、
-/// 呼び出し側は置換を断念する（fail-closed）。構造一致からの推定はせず、トークン位置だけで決める。
+/// 左辺を包む括弧・算術式の境界／要素も数える（[`distance_copy_count`]）。複製数を確定できない形は `0`
+/// （不明）とし、呼び出し側は置換を断念する（fail-closed）。構造一致からの推定はせず、トークンだけで決める。
 pub fn where_distance_copy_counts(tokens: &[Token]) -> Vec<usize> {
     let mut depth: usize = 0;
     let mut start: Option<usize> = None;
@@ -2216,65 +2216,136 @@ pub fn where_distance_copy_counts(tokens: &[Token]) -> Vec<usize> {
         return Vec::new();
     };
     let region = tokens.get(start..end).unwrap_or(&[]);
-    let is_word = |i: usize, k: &str| matches!(region.get(i), Some(Token::Ident(w)) if w.eq_ignore_ascii_case(k));
-    // `at` から単一の値（任意で前置 `-`）を読み、次の位置を返す。
-    let value_end = |at: usize| -> Option<usize> {
-        let at = if matches!(region.get(at), Some(Token::Punct('-'))) {
-            at.checked_add(1)?
-        } else {
-            at
-        };
-        match region.get(at)? {
-            Token::Punct(_) | Token::Keyword(_) | Token::DistanceOp(_) => None,
-            _ => at.checked_add(1),
-        }
-    };
     region
         .iter()
         .enumerate()
         .filter(|(_, token)| matches!(token, Token::DistanceOp(_)))
-        .map(|(i, _)| {
-            // 被演算子は距離演算子の隣の 1 トークン（`v <-> $1`／`$1 <-> v`）。後置語はその直後。
-            let Some(mut k) = i.checked_add(2) else {
-                return 1;
-            };
-            if is_word(k, "NOT") {
-                let Some(next) = k.checked_add(1) else {
-                    return 1;
-                };
-                k = next;
-            }
-            if is_word(k, "BETWEEN") {
-                let counted = k
-                    .checked_add(1)
-                    .and_then(value_end)
-                    .filter(|a| matches!(region.get(*a), Some(Token::Keyword(lexer::Keyword::And))))
-                    .and_then(|a| a.checked_add(1))
-                    .and_then(value_end)
-                    // 上限の直後が演算子の続き（`+` 等）なら単一トークンではない。
-                    .filter(|b| !matches!(region.get(*b), Some(Token::Punct(c)) if *c != ')'));
-                return if counted.is_some() { 2 } else { 0 };
-            }
-            if is_word(k, "IN")
-                && matches!(region.get(k.saturating_add(1)), Some(Token::Punct('(')))
-            {
-                let mut n: usize = 0;
-                let mut at = k.saturating_add(2);
-                loop {
-                    let Some(after) = value_end(at) else {
-                        return 0;
-                    };
-                    n = n.saturating_add(1);
-                    match region.get(after) {
-                        Some(Token::Punct(',')) => at = after.saturating_add(1),
-                        Some(Token::Punct(')')) => return n,
-                        _ => return 0,
-                    }
-                }
-            }
-            1
-        })
+        .map(|(i, _)| distance_copy_count(region, i))
         .collect()
+}
+
+/// `region[i]`（距離演算子）の距離式が、構文段の脱糖で何個に複製されるかをトークンから求める
+/// （[`where_distance_copy_counts`] の 1 要素分）。右被演算子（`i + 1` の 1 トークン）の直後から前方へ
+/// 走査し、算術演算子でつながる左辺式と、それを包む閉じ括弧（`(v <-> $1) BETWEEN ...`）を読み飛ばして
+/// 後置語（`[NOT] BETWEEN` は 2・`[NOT] IN (...)` は要素数）を探す。比較演算子・キーワード・
+/// 被演算子の連続など左辺の終端に当たれば 1。複製数を確定できない形（副問い合わせ・空リスト・
+/// 境界や要素に別の距離式を含む・右被演算子が単一トークンでない）は `0`（呼び出し側が置換を断念する）。
+fn distance_copy_count(region: &[Token], i: usize) -> usize {
+    let is_word = |t: Option<&Token>, k: &str| matches!(t, Some(Token::Ident(w)) if w.eq_ignore_ascii_case(k));
+    // 右被演算子が単一トークンでない形は位置を追えない。
+    match i.checked_add(1).and_then(|n| region.get(n)) {
+        Some(Token::Param(_) | Token::Ident(_) | Token::StringLiteral(_)) => {}
+        _ => return 0,
+    }
+    let mut k = i.saturating_add(2);
+    // 距離式を含む左辺式の末尾を探す。`d` は走査中に開いた括弧の深さ（0 の `)` は外側の括弧を閉じる）。
+    let mut d: usize = 0;
+    let mut expect_operand = false;
+    while let Some(t) = region.get(k) {
+        if d > 0 {
+            match t {
+                Token::Punct('(') => d = d.saturating_add(1),
+                Token::Punct(')') => d = d.saturating_sub(1),
+                Token::DistanceOp(_) => return 0,
+                _ => {}
+            }
+            if d == 0 {
+                expect_operand = false;
+            }
+            k = k.saturating_add(1);
+            continue;
+        }
+        match t {
+            Token::Punct(')') if !expect_operand => {}
+            Token::Punct('(') if expect_operand => d = 1,
+            Token::Punct('+' | '-' | '*' | '/' | '%') => expect_operand = true,
+            Token::DistanceOp(_) => return 0,
+            Token::Ident(_) if !expect_operand => {
+                // 後置語。`NOT` の後は `BETWEEN`／`IN` のときだけ複製が起きる。
+                let mut w = k;
+                if is_word(Some(t), "NOT") {
+                    w = w.saturating_add(1);
+                }
+                let word = region.get(w);
+                if is_word(word, "BETWEEN") {
+                    return between_copies(region, w.saturating_add(1));
+                }
+                if is_word(word, "IN") {
+                    return in_list_copies(region, w.saturating_add(1));
+                }
+                return 1;
+            }
+            Token::Number(_) | Token::Param(_) | Token::StringLiteral(_) | Token::Ident(_)
+                if expect_operand =>
+            {
+                expect_operand = false;
+            }
+            _ => return 1,
+        }
+        k = k.saturating_add(1);
+    }
+    1
+}
+
+/// `BETWEEN` の直後（`from`）から `<下限> AND <上限>` を読み、複製数 2 を返す。`AND` が無い・境界に
+/// 別の距離式を含む（AST の出現順がトークン順とずれる）形は `0`。上限は括弧深度 0 の `AND`／`OR` 等の
+/// キーワード・`,`・閉じ括弧・式末尾までを走査する。
+fn between_copies(region: &[Token], from: usize) -> usize {
+    let mut d: usize = 0;
+    let mut seen_and = false;
+    for t in region.get(from..).unwrap_or(&[]) {
+        match t {
+            Token::DistanceOp(_) => return 0,
+            Token::Punct('(') => d = d.saturating_add(1),
+            Token::Punct(')') => {
+                if d == 0 {
+                    break;
+                }
+                d -= 1;
+            }
+            Token::Punct(',') if d == 0 => break,
+            Token::Keyword(lexer::Keyword::And) if d == 0 && !seen_and => seen_and = true,
+            Token::Keyword(_) if d == 0 => break,
+            _ => {}
+        }
+    }
+    if seen_and {
+        2
+    } else {
+        0
+    }
+}
+
+/// `IN` の直後（`from`）の `( e1, ..., en )` の要素数 n を返す。副問い合わせ・空リスト・閉じ括弧が無い・
+/// 要素に別の距離式を含む形は `0`。
+fn in_list_copies(region: &[Token], from: usize) -> usize {
+    if !matches!(region.get(from), Some(Token::Punct('('))) {
+        return 0;
+    }
+    let first = from.saturating_add(1);
+    if matches!(
+        region.get(first),
+        Some(Token::Punct(')') | Token::Keyword(lexer::Keyword::Select))
+    ) {
+        return 0;
+    }
+    let mut d: usize = 0;
+    let mut n: usize = 1;
+    for t in region.get(first..).unwrap_or(&[]) {
+        match t {
+            Token::DistanceOp(_) => return 0,
+            Token::Punct('(') => d = d.saturating_add(1),
+            Token::Punct(')') => {
+                if d == 0 {
+                    return n;
+                }
+                d -= 1;
+            }
+            Token::Punct(',') if d == 0 => n = n.saturating_add(1),
+            _ => {}
+        }
+    }
+    0
 }
 
 /// `tokens`（`$n` 置換前の元トークン列）の SELECT リスト（括弧深度 0 の `SELECT` から同深度の
