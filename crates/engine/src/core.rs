@@ -10966,6 +10966,12 @@ impl EngineCore {
             }
             ParsedSql::Statement(Statement::Aggregate(validated)) => {
                 let schema = self.describe_table_schema(snap, validated.table_name())?;
+                // Issue #2953: INT8VEC の半径述語（`WHERE v <-> $1 < r`）の `$n` 由来仮値だけを置換する。
+                let validated = &crate::sql::int8vec_knn::int8vec_aggregate_placeholders(
+                    validated,
+                    &schema,
+                    skip_vector_literal_validation,
+                );
                 let bound = crate::sql::parser::bind_aggregate_with_dummy_flags(
                     validated,
                     &schema,

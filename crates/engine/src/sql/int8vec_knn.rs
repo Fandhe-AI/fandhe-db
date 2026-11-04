@@ -18,8 +18,8 @@
 
 use crate::catalog::{ColumnType, TableSchema};
 use crate::sql::allowlist::{
-    OrderByForm, Projection, ScanOrderKey, SelectItem, SqlSurfaceError, ValidatedScan,
-    ValidatedStatement, WherePredicate,
+    OrderByForm, Projection, ScanOrderKey, SelectItem, SqlSurfaceError, ValidatedAggregate,
+    ValidatedScan, ValidatedStatement, WherePredicate,
 };
 use crate::sql::lexer::DistanceKind;
 use crate::sql::mode::SearchMode;
@@ -198,8 +198,26 @@ fn placeholder_predicates(
     schema: &TableSchema,
     skip: &LiteralSkip,
 ) -> Vec<WherePredicate> {
-    if !skip.where_distance_mask.iter().any(|f| *f) {
-        return preds.to_vec();
+    replace_by_mask(
+        schema,
+        &skip.where_distance_mask,
+        &skip.where_distance_copies,
+        preds,
+        |w, p| w.pred(p),
+    )
+}
+
+/// 印（`mask`）と複製数（`copies`）に従い、`items` 内の距離式のうち `$n` 由来のものだけを置換する共通本体。
+/// 距離式の個数が印の個数と（複製数による展開後も）合わない形は何も置換しない（fail-closed）。
+fn replace_by_mask<T: Clone>(
+    schema: &TableSchema,
+    mask: &[bool],
+    copies: &[usize],
+    items: &[T],
+    mut walk: impl FnMut(&mut PlaceholderWalker<'_>, &T) -> T,
+) -> Vec<T> {
+    if !mask.iter().any(|f| *f) {
+        return items.to_vec();
     }
     let mut counter = PlaceholderWalker {
         schema,
@@ -208,21 +226,17 @@ fn placeholder_predicates(
         replace: false,
         seen: Vec::new(),
     };
-    for p in preds {
-        counter.pred(p);
+    for it in items {
+        walk(&mut counter, it);
     }
     let expanded;
-    let mask: &[bool] = if counter.ordinal == skip.where_distance_mask.len() {
-        &skip.where_distance_mask
-    } else if let Some(m) = expand_mask_by_copies(
-        counter.seen.len(),
-        &skip.where_distance_mask,
-        &skip.where_distance_copies,
-    ) {
+    let mask: &[bool] = if counter.ordinal == mask.len() {
+        mask
+    } else if let Some(m) = expand_mask_by_copies(counter.seen.len(), mask, copies) {
         expanded = m;
         &expanded
     } else {
-        return preds.to_vec();
+        return items.to_vec();
     };
     let mut walker = PlaceholderWalker {
         schema,
@@ -231,7 +245,25 @@ fn placeholder_predicates(
         replace: true,
         seen: Vec::new(),
     };
-    preds.iter().map(|p| walker.pred(p)).collect()
+    items.iter().map(|it| walk(&mut walker, it)).collect()
+}
+
+/// Prepared Describe の Aggregate 形（`SELECT count(*) FROM t WHERE v <-> $1 < r`）の束縛前に、
+/// WHERE 内の `$n` 由来の距離オペランドを置換する（Issue #2953・PR #2956 指摘）。
+pub(crate) fn int8vec_aggregate_placeholders(
+    agg: &ValidatedAggregate,
+    schema: &TableSchema,
+    skip: &LiteralSkip,
+) -> ValidatedAggregate {
+    let mut out = agg.clone();
+    if schema
+        .columns
+        .iter()
+        .any(|c| matches!(c.ty, ColumnType::Int8Vec(_)))
+    {
+        out.where_predicates = placeholder_predicates(&agg.where_predicates, schema, skip);
+    }
+    out
 }
 
 /// [`placeholder_predicates`] の走査器。`replace` が偽のときは距離式を数えるだけで木を変えない。

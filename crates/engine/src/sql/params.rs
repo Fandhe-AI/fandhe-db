@@ -2293,7 +2293,28 @@ fn distance_copy_count(region: &[Token], i: usize) -> usize {
 fn between_copies(region: &[Token], from: usize) -> usize {
     let mut d: usize = 0;
     let mut seen_and = false;
+    // 上限値側の走査状態。上限値は「被演算子（算術演算子で連結）」の連なりで、被演算子の後に
+    // 来た被演算子以外（`OR` 等の Ident・比較演算子・Keyword）で終端とする。後続の述語の距離式を
+    // 境界の距離式と取り違えないため（このレキサーでは `OR` が Ident）。
+    let mut expect_operand = true;
     for t in region.get(from..).unwrap_or(&[]) {
+        if seen_and && d == 0 {
+            match t {
+                Token::Punct('+' | '-' | '*' | '/' | '%') => {
+                    expect_operand = true;
+                    continue;
+                }
+                Token::Number(_) | Token::Param(_) | Token::StringLiteral(_) | Token::Ident(_)
+                    if expect_operand =>
+                {
+                    expect_operand = false;
+                    continue;
+                }
+                Token::Punct('(') if expect_operand => {}
+                Token::Punct(')') => {}
+                _ => break,
+            }
+        }
         match t {
             Token::DistanceOp(_) => return 0,
             Token::Punct('(') => d = d.saturating_add(1),
@@ -2302,6 +2323,9 @@ fn between_copies(region: &[Token], from: usize) -> usize {
                     break;
                 }
                 d -= 1;
+                if seen_and && d == 0 {
+                    expect_operand = false;
+                }
             }
             Token::Punct(',') if d == 0 => break,
             Token::Keyword(lexer::Keyword::And) if d == 0 && !seen_and => seen_and = true,
