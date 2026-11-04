@@ -2,6 +2,14 @@
 //! TASK-130・対象ビヘイビア CORE-6, CORE-7〔動的窓〕, CORE-16〔f16 常駐〕。
 //! `docs/spec/04-behavior/core-engine.md` ポインタ参照）。
 //!
+//! Issue #2005（親 #2002）: `BENCH_BATCH_METRIC`（`inner_product`〔既定〕・`l2`・
+//! `cosine`。`l1` を含む allowlist 外は fail-closed）で CORE-6/CORE-16 の GPU 経路と
+//! CPU 対照を同じ metric で構築する（CORE-7 の CPU 動的窓は metric と無関係）。
+//! 閾値は metric によらず既存の `BENCH_CORE6_MIN_IMPROVEMENT_PCT`/
+//! `BENCH_CORE16_MIN_IMPROVEMENT_PCT`（spec SSOT）を使う。起動時に
+//! `batch_metric: metric=<name>` を 1 行出し、内積以外のときだけゲート行末に
+//! ` metric=<name>` を付ける（既定の出力は不変）。
+//!
 //! `simd_bench.rs`（TASK-127）と同じ設計方針を踏襲する: `make ci` には含めず
 //! `.github/workflows/bench.yml`（workflow_dispatch）から実行する時間依存ベンチであり、
 //! 閾値は環境変数（Actions secrets）から注入・未設定は fail-closed で非ゼロ終了する。
@@ -123,6 +131,7 @@ use harness::accept::{
     check_degradation_pct_within_limit, check_improvement_at_least, degradation_pct,
     median_degradation_pct, p95_from_samples,
 };
+use harness::gpu_scaling::{parse_metric, read_env_var, BenchMetric};
 use harness::protocol::MeasurementConfig;
 use harness::rng::DeterministicRng;
 
@@ -162,6 +171,25 @@ const GPU_GATE_TOP_K: usize = 10;
 /// 転送・同期の固定コストが支配的になり経路差が現れない）。CORE-6/CORE-16 のみが
 /// 使う（CORE-7 は単発クエリの p95 を測るため 1 本固定）。
 const GPU_GATE_BATCH_SIZE: usize = 8;
+
+/// `BENCH_BATCH_METRIC`（Issue #2005。`inner_product`〔既定〕・`l2`・`cosine`）を
+/// 解決する。CORE-6/CORE-16 の GPU 経路と CPU 対照の構築にだけ使い、CORE-7（CPU の
+/// 動的窓。metric と無関係）には影響しない。allowlist 外（`l1` 含む）は fail-closed。
+fn metric_from_env() -> Result<BenchMetric, String> {
+    let raw = read_env_var("BENCH_BATCH_METRIC").map_err(|e| e.to_string())?;
+    parse_metric(raw.as_deref()).map_err(|e| format!("BENCH_BATCH_METRIC: {e}"))
+}
+
+/// ゲート行の末尾に付ける metric 表記。既定（内積）では空文字にして従来の出力を
+/// 1 文字も変えず、それ以外のときだけ ` metric=<name>` を付ける（非数値のため
+/// `BENCH_VERBOSE` 未指定でも public ログへ出して問題ない）。
+fn metric_suffix(metric: BenchMetric) -> String {
+    if metric == BenchMetric::InnerProduct {
+        String::new()
+    } else {
+        format!(" metric={}", metric.as_str())
+    }
+}
 
 /// CORE-7 ゲートの計測に使うテナント ID（本ベンチ専用の合成データ。実データではない）。
 const BENCH_TENANT: &str = "task-130-bench-tenant";
@@ -521,6 +549,7 @@ fn run_core7_gate(
 fn run_core6_gate(
     dataset: &GateDataset,
     ctx: &PolicyContext,
+    metric: BenchMetric,
     verbose: bool,
 ) -> Result<bool, String> {
     const LABEL: &str = "gpu_vs_cpu_simd_p95";
@@ -534,12 +563,13 @@ fn run_core6_gate(
     let min_improvement_pct = min_improvement_pct_from_env("BENCH_CORE6_MIN_IMPROVEMENT_PCT")?;
 
     let fallback_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let gpu_engine = engine::batch_fallback::FallbackBatchEngine::build_with_gpu(
+    let gpu_engine = engine::batch_fallback::FallbackBatchEngine::build_with_gpu_metric(
         &dataset.ids,
         &dataset.tenant_ids,
         &dataset.visibilities,
         GPU_GATE_DIM,
         &dataset.vectors,
+        metric.to_batch_metric(),
         Box::new(CountingObserver(std::sync::Arc::clone(&fallback_count))),
     )
     .map_err(|err| format!("{LABEL}: gpu-backed engine build failed: {err}"))?;
@@ -551,12 +581,13 @@ fn run_core6_gate(
         return Ok(false);
     }
 
-    let cpu_matrix = ResidentMatrix::build(
+    let cpu_matrix = ResidentMatrix::build_with_metric(
         &dataset.ids,
         &dataset.tenant_ids,
         &dataset.visibilities,
         GPU_GATE_DIM,
         &dataset.vectors,
+        metric.to_batch_metric(),
     )
     .map_err(|err| format!("{LABEL}: resident matrix build failed: {err}"))?;
     let cpu_engine = BatchEngine::new(cpu_matrix);
@@ -588,7 +619,8 @@ fn run_core6_gate(
         .map_err(|err| format!("{LABEL}: improvement check failed: {err}"))?;
     println!(
         "{LABEL}: rows={GPU_GATE_ROW_COUNT} dim={GPU_GATE_DIM} batch={GPU_GATE_BATCH_SIZE} \
-         requested=true pass={pass}"
+         requested=true pass={pass}{}",
+        metric_suffix(metric)
     );
     if verbose {
         println!("verbose({LABEL}): cpu_simd_p95={p95_a:?} gpu_p95={p95_b:?}");
@@ -612,6 +644,7 @@ fn run_core6_gate(
 fn run_core16_gate(
     dataset: &GateDataset,
     ctx: &PolicyContext,
+    metric: BenchMetric,
     verbose: bool,
 ) -> Result<bool, String> {
     const LABEL: &str = "f16_resident_vs_f32_resident_p95";
@@ -625,11 +658,13 @@ fn run_core16_gate(
     let min_improvement_pct = min_improvement_pct_from_env("BENCH_CORE16_MIN_IMPROVEMENT_PCT")?;
 
     let (p95_a, p95_b, f16_arith_stats) =
-        match measure_core16_resident_p95(dataset, ctx, GPU_GATE_DIM, LABEL) {
+        match measure_core16_resident_p95(dataset, ctx, GPU_GATE_DIM, metric, LABEL) {
             Ok(triple) => triple,
             Err(msg) => {
                 println!(
-                    "{LABEL}: not measurable in this environment ({msg}) requested=true pass=false"
+                    "{LABEL}: not measurable in this environment ({msg}) requested=true \
+                     pass=false{}",
+                    metric_suffix(metric)
                 );
                 return Ok(false);
             }
@@ -639,7 +674,8 @@ fn run_core16_gate(
         .map_err(|err| format!("{LABEL}: improvement check failed: {err}"))?;
     println!(
         "{LABEL}: rows={GPU_GATE_ROW_COUNT} dim={GPU_GATE_DIM} batch={GPU_GATE_BATCH_SIZE} \
-         requested=true pass={pass}"
+         requested=true pass={pass}{}",
+        metric_suffix(metric)
     );
     if verbose {
         println!("verbose({LABEL}): f32_resident_p95={p95_a:?} f16_resident_p95={p95_b:?}");
@@ -683,6 +719,7 @@ fn measure_core16_resident_p95(
     dataset: &GateDataset,
     ctx: &PolicyContext,
     dim: usize,
+    metric: BenchMetric,
     label: &str,
 ) -> Result<
     (
@@ -692,20 +729,22 @@ fn measure_core16_resident_p95(
     ),
     String,
 > {
-    let f32_backend = engine::gpu_batch::GpuF32ContrastBackend::try_new(
+    let f32_backend = engine::gpu_batch::GpuF32ContrastBackend::try_new_with_metric(
         &dataset.ids,
         &dataset.tenant_ids,
         &dataset.visibilities,
         dim,
         &dataset.vectors,
+        metric.to_batch_metric(),
     )
     .map_err(|e| format!("f32-resident gpu contrast backend unavailable: {e}"))?;
-    let f16_matrix = ResidentMatrix::build(
+    let f16_matrix = ResidentMatrix::build_with_metric(
         &dataset.ids,
         &dataset.tenant_ids,
         &dataset.visibilities,
         dim,
         &dataset.vectors,
+        metric.to_batch_metric(),
     )
     .map_err(|err| format!("resident matrix build failed: {err}"))?;
     let f16_backend = engine::gpu_batch::GpuBatchBackend::try_new(f16_matrix)
@@ -842,6 +881,7 @@ fn core16_diag_scale_index_from_env() -> Result<usize, String> {
 fn run_core16_scaling_diagnostic(
     rng: &mut DeterministicRng,
     ctx: &PolicyContext,
+    metric: BenchMetric,
     verbose: bool,
 ) -> Result<(), String> {
     const LABEL: &str = "core16_diag";
@@ -860,11 +900,12 @@ fn run_core16_scaling_diagnostic(
     let (rows, dim) = CORE16_DIAG_SCALE_POINTS[index];
 
     let dataset = build_scaled_gate_dataset(rng, rows, dim);
-    match measure_core16_resident_p95(&dataset, ctx, dim, LABEL) {
+    match measure_core16_resident_p95(&dataset, ctx, dim, metric, LABEL) {
         Ok((p95_a, p95_b, f16_arith_stats)) => {
             println!(
                 "verbose({LABEL}): scale_index={index} rows={rows} dim={dim} \
-                 f32_resident_p95={p95_a:?} f16_resident_p95={p95_b:?}"
+                 f32_resident_p95={p95_a:?} f16_resident_p95={p95_b:?}{}",
+                metric_suffix(metric)
             );
             // Issue #540: 規模点診断でも f16 算術版のカウンタを併記する
             // （構造的に unpack 縮退であることの規模非依存性を確認するため）。
@@ -1011,6 +1052,16 @@ fn main() {
         }
     };
 
+    // Issue #2005: CORE-6/CORE-16 の構築 metric。不正値は計測前に fail-closed で拒否する。
+    let metric = match metric_from_env() {
+        Ok(m) => m,
+        Err(msg) => {
+            eprintln!("batch_bench: {msg}");
+            std::process::exit(1);
+        }
+    };
+    println!("batch_metric: metric={}", metric.as_str());
+
     // CORE-16 規模点診断（Issue #313）が opt-in されている場合は、CORE-7/CORE-6/
     // CORE-16 ゲートを一切測定せず、選択規模点の診断のみを直ちに実行して終了する
     // （PR #326 codex-review 指摘対応: 診断を他ゲートの後に呼ぶと、先行するゲートの
@@ -1023,7 +1074,7 @@ fn main() {
     if opt_in_requested_from_env("BENCH_CORE16_DIAG") {
         let mut diag_rng = DeterministicRng::new(1);
         let diag_ctx = PolicyContext::new(BENCH_TENANT).expect("valid tenant");
-        if let Err(msg) = run_core16_scaling_diagnostic(&mut diag_rng, &diag_ctx, verbose) {
+        if let Err(msg) = run_core16_scaling_diagnostic(&mut diag_rng, &diag_ctx, metric, verbose) {
             eprintln!("batch_bench: {msg}");
             std::process::exit(1);
         }
@@ -1063,14 +1114,14 @@ fn main() {
 
     // --- CORE-6 / CORE-16: opt-in の実測ゲート（Issue #178 で実 GPU バックエンドへ
     // 接続済み。未 opt-in なら「対象外」を出力するだけで合否に数えない）---
-    let core6_ok = match run_core6_gate(&gate_dataset, &gate_ctx, verbose) {
+    let core6_ok = match run_core6_gate(&gate_dataset, &gate_ctx, metric, verbose) {
         Ok(ok) => ok,
         Err(msg) => {
             eprintln!("batch_bench: {msg}");
             std::process::exit(1);
         }
     };
-    let core16_ok = match run_core16_gate(&gate_dataset, &gate_ctx, verbose) {
+    let core16_ok = match run_core16_gate(&gate_dataset, &gate_ctx, metric, verbose) {
         Ok(ok) => ok,
         Err(msg) => {
             eprintln!("batch_bench: {msg}");
