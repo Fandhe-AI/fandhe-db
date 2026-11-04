@@ -392,13 +392,10 @@ fn inherited_join_input_restrictions_stay_fail_closed() {
             "0A000",
         ),
         ("SELECT * FROM docs d, (SELECT lang FROM docs)", "0A000"),
-        // EXPLAIN は対象外（CTE の EXPLAIN 非対応と同じ扱い）。
+        // JOIN の入力になる派生表の EXPLAIN は対象外（Issue #2048 の OUT 区分。単一の派生表・入れ子は
+        // 受理に変わった。`sql75_explain_cte_subquery.rs`）。
         (
             "EXPLAIN SELECT * FROM docs d JOIN (SELECT lang FROM docs) t ON d.lang = t.lang",
-            "42601",
-        ),
-        (
-            "EXPLAIN SELECT * FROM (SELECT lang FROM (SELECT lang FROM docs) x) t",
             "42601",
         ),
         // LATERAL は対象外。
