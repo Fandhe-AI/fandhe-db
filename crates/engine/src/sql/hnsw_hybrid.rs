@@ -235,6 +235,7 @@ mod tests {
             index_gate_cache: &gate_cache,
             hnsw_scope: crate::search_engine::HnswScope::All,
             graph_metric: Some(crate::hnsw::HnswMetric::InnerProduct),
+            build_options: None,
         };
         let read_txn = storage.db().begin_read().expect("begin read");
         let prepared = prepare_full_visible(&access, &read_txn, table, &c, &arena);
@@ -286,6 +287,7 @@ mod tests {
             index_gate_cache: &gate_cache,
             hnsw_scope: crate::search_engine::HnswScope::All,
             graph_metric: Some(crate::hnsw::HnswMetric::InnerProduct),
+            build_options: None,
         };
         let read_txn = storage.db().begin_read().expect("begin read");
         let prepared = prepare_full_visible(&access, &read_txn, table, &c, &arena);
@@ -338,6 +340,7 @@ mod tests {
             index_gate_cache: &gate_cache,
             hnsw_scope: crate::search_engine::HnswScope::All,
             graph_metric: Some(crate::hnsw::HnswMetric::InnerProduct),
+            build_options: None,
         };
         let read_txn = storage.db().begin_read().expect("begin read");
         let prepared = prepare_full_visible(&access, &read_txn, table, &c, &arena);
@@ -389,6 +392,7 @@ mod tests {
             index_gate_cache: &gate_cache,
             hnsw_scope: crate::search_engine::HnswScope::All,
             graph_metric: Some(crate::hnsw::HnswMetric::InnerProduct),
+            build_options: None,
         };
         let read_txn = storage.db().begin_read().expect("begin read");
         let prepared = prepare_full_visible(&access, &read_txn, table, &c, &arena);
@@ -441,6 +445,7 @@ mod tests {
             index_gate_cache: &gate_cache,
             hnsw_scope: crate::search_engine::HnswScope::All,
             graph_metric: Some(crate::hnsw::HnswMetric::InnerProduct),
+            build_options: None,
         };
         let read_txn = storage.db().begin_read().expect("begin read");
         let prepared = prepare_full_visible(&access, &read_txn, table, &c, &arena);

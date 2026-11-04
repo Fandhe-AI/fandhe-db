@@ -360,6 +360,64 @@ pub struct IndexDef {
     /// SQL 表層（`sql::ddl::execute_create_index`）だけが書き込みトランザクション内の束縛を通して
     /// 正規化テキストと参照列を確定する（呼び出し元の生テキストを保存しない）。
     pub predicate: Option<IndexPredicateDef>,
+    /// `USING hnsw` 宣言の構築パラメータ（`WITH (m = n, ef_construction = n)`。SQL-33 (5)、
+    /// Issue #2029）。`None` は `WITH` 省略で、構築は provider（CLI・内部既定）の値に従う。
+    /// HNSW 以外の宣言への付与は [`Storage::create_index`] が [`CatalogError::Invalid`] で拒否する。
+    pub hnsw_options: Option<HnswIndexOptions>,
+}
+
+/// `CREATE INDEX ... USING hnsw ... WITH (m, ef_construction)` の検証済み構築パラメータ
+/// （SQL-33 (5)、Issue #2029）。フィールドは private で、範囲（`m` は 2〜100・
+/// `ef_construction` は 4〜1000 かつ `2 * m` 以上）を満たす値だけを [`HnswIndexOptions::new`] が
+/// 通す。SQL 構文段（`sql::allowlist`）とカタログ復元（[`decode_index_def`]）が同じ検証を共有し、
+/// 実行側（`sql::hnsw_cache`）は検証済みの値だけを HNSW 構築へ渡す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HnswIndexOptions {
+    m: usize,
+    ef_construction: usize,
+}
+
+/// `m` の下限・上限（SQL-33 (5)）。
+pub const HNSW_WITH_M_MIN: usize = 2;
+/// `m` の上限。
+pub const HNSW_WITH_M_MAX: usize = 100;
+/// `ef_construction` の下限。
+pub const HNSW_WITH_EF_CONSTRUCTION_MIN: usize = 4;
+/// `ef_construction` の上限。
+pub const HNSW_WITH_EF_CONSTRUCTION_MAX: usize = 1000;
+/// `WITH` で `m` を省略したときの補完値（pgvector の既定）。
+pub const HNSW_WITH_DEFAULT_M: usize = 16;
+/// `WITH` で `ef_construction` を省略したときの補完値（pgvector の既定）。
+pub const HNSW_WITH_DEFAULT_EF_CONSTRUCTION: usize = 64;
+
+impl HnswIndexOptions {
+    /// 範囲を検証して作る。違反は入力値を含まない固定文言で返す（`22023` への写像は呼び出し元）。
+    pub fn new(m: usize, ef_construction: usize) -> std::result::Result<Self, &'static str> {
+        if !(HNSW_WITH_M_MIN..=HNSW_WITH_M_MAX).contains(&m) {
+            return Err("value out of bounds for option \"m\"");
+        }
+        if !(HNSW_WITH_EF_CONSTRUCTION_MIN..=HNSW_WITH_EF_CONSTRUCTION_MAX)
+            .contains(&ef_construction)
+        {
+            return Err("value out of bounds for option \"ef_construction\"");
+        }
+        // `m <= 100` なので乗算は溢れないが、checked で書いて不変条件を局所化する。
+        match m.checked_mul(2) {
+            Some(twice) if ef_construction >= twice => {}
+            _ => return Err("ef_construction must be greater than or equal to 2 * m"),
+        }
+        Ok(Self { m, ef_construction })
+    }
+
+    /// 近傍数 `m`。
+    pub fn m(&self) -> usize {
+        self.m
+    }
+
+    /// 構築時の候補幅 `ef_construction`。
+    pub fn ef_construction(&self) -> usize {
+        self.ef_construction
+    }
 }
 
 /// 部分索引の述語の永続形（INDEX-11、Issue #1654）。`sql` は
@@ -409,6 +467,11 @@ const INDEX_DEF_GIN_VERSION: &str = "v8";
 /// `v1` で書き（バイト列不変）、`v1` の `hnsw` 行は cosine として読む。`v9` に `vector_cosine_ops`
 /// を入れるのは非正準形で拒否する。旧バイナリは `v9` を未知の版として拒否する（前方互換はない）。
 const INDEX_DEF_HNSW_OPCLASS_VERSION: &str = "v9";
+/// 構築パラメータ付き HNSW 索引の永続形の版（Issue #2029・SQL-33 (5)）。行構成は
+/// `v10／テーブル／hnsw／列（ちょうど 1 個）／opclass トークン／m／ef_construction`。cosine も
+/// この版に入れる（`WITH` 付き cosine の正準形）。`WITH` 省略の宣言は従来の `v1`／`v9` のまま
+/// （バイト列不変）。旧バイナリは `v10` を未知の版として拒否する（前方互換はない）。
+const INDEX_DEF_HNSW_OPTIONS_VERSION: &str = "v10";
 
 impl IndexDef {
     /// 照合指定なしの索引宣言を作る（`collations` はすべて `None`・式要素なし）。
@@ -424,7 +487,15 @@ impl IndexDef {
             unique: false,
             expressions,
             predicate: None,
+            hnsw_options: None,
         }
+    }
+
+    /// HNSW の構築パラメータを与える（SQL-33 (5)、Issue #2029）。HNSW 以外の宣言に `Some` を
+    /// 与えると [`Storage::create_index`] が `Invalid` で拒否する。
+    pub fn with_hnsw_options(mut self, options: Option<HnswIndexOptions>) -> Self {
+        self.hnsw_options = options;
+        self
     }
 
     /// 部分索引の述語を与える（`sql` は束縛が描画した正規化テキスト。INDEX-11、Issue #1654）。
@@ -513,7 +584,36 @@ fn encode_index_def(def: &IndexDef) -> Result<Vec<u8>> {
         IndexKind::Hnsw(opclass) if opclass != VectorOpClass::Cosine => Some(opclass),
         _ => None,
     };
-    let text = if let Some(opclass) = non_default_hnsw {
+    let text = if let Some(options) = def.hnsw_options {
+        // 構築パラメータ付き HNSW 宣言（`v10`）。`v9` と同じ多層防御を課す。
+        let opclass = match def.kind {
+            IndexKind::Hnsw(opclass) => opclass,
+            _ => {
+                return Err(CatalogError::Invalid(
+                    "hnsw options require a hnsw index".to_string(),
+                ))
+            }
+        };
+        if def.unique
+            || def.has_predicate()
+            || def.has_expressions()
+            || def.collations.iter().any(Option::is_some)
+            || def.columns.len() != 1
+            || def.columns.iter().any(String::is_empty)
+        {
+            return Err(CatalogError::Invalid(
+                "hnsw index must be a single plain column without options".to_string(),
+            ));
+        }
+        format!(
+            "{INDEX_DEF_HNSW_OPTIONS_VERSION}\n{}\nhnsw\n{}\n{}\n{}\n{}",
+            def.table,
+            columns_csv,
+            opclass.as_str(),
+            options.m(),
+            options.ef_construction()
+        )
+    } else if let Some(opclass) = non_default_hnsw {
         // 非既定 opclass の HNSW 宣言（`v9`）。GIN と同じく単一の素の列に限る（多層防御）。
         if def.unique
             || def.has_predicate()
@@ -816,6 +916,7 @@ fn decode_index_def(name: &str, bytes: &[u8]) -> Result<IndexDef> {
         && version != INDEX_DEF_PARTIAL_UNIQUE_VERSION
         && version != INDEX_DEF_GIN_VERSION
         && version != INDEX_DEF_HNSW_OPCLASS_VERSION
+        && version != INDEX_DEF_HNSW_OPTIONS_VERSION
     {
         return Err(CatalogError::CorruptSchema(format!(
             "unknown index catalog format version for index {name}"
@@ -823,6 +924,7 @@ fn decode_index_def(name: &str, bytes: &[u8]) -> Result<IndexDef> {
     }
     let is_v8 = version == INDEX_DEF_GIN_VERSION;
     let is_v9 = version == INDEX_DEF_HNSW_OPCLASS_VERSION;
+    let is_v10 = version == INDEX_DEF_HNSW_OPTIONS_VERSION;
     let is_v2 = version == "v2";
     let is_v3 = version == "v3";
     let is_v5 = version == INDEX_DEF_EXPRESSION_UNIQUE_VERSION;
@@ -857,7 +959,7 @@ fn decode_index_def(name: &str, bytes: &[u8]) -> Result<IndexDef> {
             "invalid gin index record for index {name}"
         )));
     }
-    if is_v9 && !matches!(kind, IndexKind::Hnsw(_)) {
+    if (is_v9 || is_v10) && !matches!(kind, IndexKind::Hnsw(_)) {
         return Err(CatalogError::CorruptSchema(format!(
             "invalid hnsw index record for index {name}"
         )));
@@ -903,6 +1005,34 @@ fn decode_index_def(name: &str, bytes: &[u8]) -> Result<IndexDef> {
                 "hnsw index must have exactly one column for index {name}"
             )));
         }
+        kind = IndexKind::Hnsw(opclass);
+    }
+    let mut hnsw_options = None;
+    if is_v10 {
+        // `v10` は構築パラメータ付き HNSW 専用: 列はちょうど 1 個、5 行目は opclass（cosine も可）、
+        // 6・7 行目は正準な 10 進の m・ef_construction、以降の行は無い。
+        let opclass = lines
+            .next()
+            .and_then(VectorOpClass::from_catalog_token)
+            .ok_or_else(|| {
+                CatalogError::CorruptSchema(format!("invalid hnsw operator class for index {name}"))
+            })?;
+        if columns_csv.is_empty() || columns_csv.contains(',') {
+            return Err(CatalogError::CorruptSchema(format!(
+                "hnsw index must have exactly one column for index {name}"
+            )));
+        }
+        let corrupt =
+            || CatalogError::CorruptSchema(format!("invalid hnsw index options for index {name}"));
+        let m = lines
+            .next()
+            .and_then(parse_canonical_usize)
+            .ok_or_else(corrupt)?;
+        let ef = lines
+            .next()
+            .and_then(parse_canonical_usize)
+            .ok_or_else(corrupt)?;
+        hnsw_options = Some(HnswIndexOptions::new(m, ef).map_err(|_| corrupt())?);
         kind = IndexKind::Hnsw(opclass);
     }
     if is_v3 {
@@ -963,7 +1093,22 @@ fn decode_index_def(name: &str, bytes: &[u8]) -> Result<IndexDef> {
         unique: is_v3 || is_v5 || is_v7,
         expressions,
         predicate,
+        hnsw_options,
     })
+}
+
+/// 正準な 10 進（符号なし・先頭ゼロなし・最大 4 桁）だけを `usize` として解釈する。`v10` の
+/// m・ef_construction の復元用で、非正準形は手で書き換えられた永続データとして呼び出し元が
+/// 破損扱いにする。
+fn parse_canonical_usize(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    if bytes.is_empty() || bytes.len() > 4 || !bytes.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    if bytes.len() > 1 && bytes.first() == Some(&b'0') {
+        return None;
+    }
+    text.parse().ok()
 }
 
 /// `v2` の照合トークン行を復元する。未知トークン・要素数の不一致・すべて `-`（`v1` で書くべき
@@ -1019,6 +1164,12 @@ fn first_duplicate_column(columns: &[String]) -> Option<&str> {
 /// - `Scalar`: 各列は索引化対応済みの型（[`is_declarable_scalar_index_type`]）で
 ///   なければならない。
 fn validate_index_columns(def: &IndexDef, schema: &TableSchema) -> Result<()> {
+    // 構築パラメータ（`WITH (m, ef_construction)`）は HNSW 宣言だけが持てる（Issue #2029）。
+    if def.hnsw_options.is_some() && !matches!(def.kind, IndexKind::Hnsw(_)) {
+        return Err(CatalogError::Invalid(
+            "hnsw options require a hnsw index".to_string(),
+        ));
+    }
     // 照合（Issue #2191・TABLE-28）は、照合を持てる型（`TEXT`・`VARCHAR`・`CHAR`）のスカラー
     // 宣言の列にだけ付けられる。`id`（暗黙の行キー）・数値・`VECTOR` 等の型・`USING hnsw` は
     // 種別・列型の検査より前に `IndexCollationNotSupported`（`42804`）で拒否する。
@@ -1615,6 +1766,9 @@ pub(crate) fn explain_index_names_in_txn(
 struct HnswCatalogSummary {
     /// `IndexKind::Hnsw` 宣言を持つテーブル名と、宣言された opclass の集合（最大 4 種で有界）。
     hnsw_tables: std::collections::HashMap<String, std::collections::BTreeSet<VectorOpClass>>,
+    /// (テーブル, opclass) ごとの構築パラメータ（Issue #2029）。同じ組に複数の宣言があるときは
+    /// 索引カタログの走査順（索引名の昇順）で最初の宣言の値を採る（物理グラフは組ごとに 1 本のため）。
+    hnsw_options: std::collections::HashMap<(String, VectorOpClass), Option<HnswIndexOptions>>,
 }
 
 /// [`HnswCatalogSummary`] を索引カタログ全件走査で構築する（[`hnsw_targeted_in_txn`]
@@ -1637,6 +1791,10 @@ fn hnsw_catalog_summary_in_txn(read_txn: &redb::ReadTransaction) -> Result<HnswC
         let (key, value) = entry?;
         let def = decode_index_def(key.value(), value.value())?;
         if let IndexKind::Hnsw(opclass) = def.kind {
+            summary
+                .hnsw_options
+                .entry((def.table.clone(), opclass))
+                .or_insert(def.hnsw_options);
             summary
                 .hnsw_tables
                 .entry(def.table)
@@ -1812,7 +1970,12 @@ pub(crate) enum HnswGate {
     /// opt-in なし・`Declared` で宣言なし・カタログ読み取り失敗（fail-closed）。厳密 brute-force。
     NotTargeted,
     /// 問い合わせ距離種別に合う HNSW を使える。`metric` は問い合わせ側の距離種別。
-    Targeted { metric: VectorOpClass },
+    /// `options` は問い合わせ側 metric の宣言が持つ構築パラメータ（`WITH` 省略・宣言なしは `None`。
+    /// Issue #2029）。
+    Targeted {
+        metric: VectorOpClass,
+        options: Option<HnswIndexOptions>,
+    },
     /// 索引の距離種別が問い合わせの距離種別と合わない（または物理グラフが未対応）。
     /// 近似を誤った距離で返さないよう厳密全走査へ縮退する。`index_metric` は表示用の宣言側 metric。
     MetricMismatch { index_metric: VectorOpClass },
@@ -1878,6 +2041,11 @@ pub(crate) fn hnsw_gate_in_txn(
     if in_effective_set && hnsw_supported_metric(query_metric) {
         HnswGate::Targeted {
             metric: query_metric,
+            options: summary
+                .hnsw_options
+                .get(&(table.to_string(), query_metric))
+                .copied()
+                .flatten(),
         }
     } else {
         HnswGate::MetricMismatch { index_metric }
@@ -26922,6 +27090,108 @@ mod tests {
         }
     }
 
+    fn hnsw_options_def(opclass: VectorOpClass, m: usize, efc: usize) -> IndexDef {
+        hnsw_opclass_def(opclass)
+            .with_hnsw_options(Some(HnswIndexOptions::new(m, efc).expect("valid options")))
+    }
+
+    /// 構築パラメータ付き HNSW は cosine も含めて `v10` で往復し、固定バイト列になる
+    /// （SQL-33 (5)、Issue #2029）。`WITH` 省略の宣言は従来の `v1`／`v9` のままバイト列不変。
+    #[test]
+    fn hnsw_options_def_round_trips_as_v10_and_plain_defs_keep_old_bytes() {
+        for opclass in [VectorOpClass::Cosine, VectorOpClass::L2, VectorOpClass::Ip] {
+            let def = hnsw_options_def(opclass, 8, 40);
+            let bytes = encode_index_def(&def).expect("encode");
+            assert_eq!(
+                std::str::from_utf8(&bytes).expect("utf8"),
+                format!("v10\ndocs\nhnsw\nembedding\n{}\n8\n40", opclass.as_str())
+            );
+            assert_eq!(decode_index_def("h", &bytes).expect("decode"), def);
+        }
+        assert_eq!(
+            encode_index_def(&hnsw_opclass_def(VectorOpClass::Cosine)).unwrap(),
+            b"v1\ndocs\nhnsw\nembedding"
+        );
+        assert_eq!(
+            encode_index_def(&hnsw_opclass_def(VectorOpClass::L2)).unwrap(),
+            b"v9\ndocs\nhnsw\nembedding\nvector_l2_ops"
+        );
+    }
+
+    /// `HnswIndexOptions::new` の境界（m は 2〜100、ef_construction は 4〜1000 かつ 2m 以上）。
+    #[test]
+    fn hnsw_index_options_enforce_documented_bounds() {
+        assert!(HnswIndexOptions::new(2, 4).is_ok());
+        assert!(HnswIndexOptions::new(100, 200).is_ok());
+        assert!(HnswIndexOptions::new(16, 1000).is_ok());
+        assert!(HnswIndexOptions::new(16, 32).is_ok());
+        for (m, efc) in [
+            (1, 64),
+            (101, 1000),
+            (16, 3),
+            (16, 1001),
+            (16, 31),
+            (40, 64),
+        ] {
+            assert!(HnswIndexOptions::new(m, efc).is_err(), "{m} {efc}");
+        }
+    }
+
+    /// 破損・非正準な `v10` は `CorruptSchema` で fail-closed に拒否する。
+    #[test]
+    fn hnsw_options_def_rejects_corruption() {
+        for corrupt in [
+            &b"v10\ndocs\nhnsw\nembedding\nvector_l2_ops"[..],
+            b"v10\ndocs\nhnsw\nembedding\nvector_l2_ops\n8",
+            b"v10\ndocs\nhnsw\nembedding\nvector_l2_ops\n08\n40",
+            b"v10\ndocs\nhnsw\nembedding\nvector_l2_ops\n+8\n40",
+            b"v10\ndocs\nhnsw\nembedding\nvector_l2_ops\n-8\n40",
+            b"v10\ndocs\nhnsw\nembedding\nvector_l2_ops\n1\n40",
+            b"v10\ndocs\nhnsw\nembedding\nvector_l2_ops\n101\n1000",
+            b"v10\ndocs\nhnsw\nembedding\nvector_l2_ops\n8\n3",
+            b"v10\ndocs\nhnsw\nembedding\nvector_l2_ops\n8\n15",
+            b"v10\ndocs\nhnsw\nembedding\nvector_l2_ops\n8\n1001",
+            b"v10\ndocs\nhnsw\nembedding\nvector_l2_ops\n8\n40\nextra",
+            b"v10\ndocs\nhnsw\nembedding\nvector_foo_ops\n8\n40",
+            b"v10\ndocs\nhnsw\nembedding\nvector_l2_ops\n99999999999999999999\n40",
+            b"v10\ndocs\nscalar\nembedding\nvector_l2_ops\n8\n40",
+            b"v10\ndocs\ngin\nembedding\nvector_l2_ops\n8\n40",
+            b"v10\ndocs\nhnsw\na,b\nvector_l2_ops\n8\n40",
+            b"v10\ndocs\nhnsw\n\nvector_l2_ops\n8\n40",
+        ] {
+            assert!(
+                matches!(
+                    decode_index_def("h", corrupt),
+                    Err(CatalogError::CorruptSchema(_))
+                ),
+                "corrupt value must be rejected: {corrupt:?}"
+            );
+        }
+    }
+
+    /// 保存前の多層防御と、HNSW 以外への付与の拒否。
+    #[test]
+    fn hnsw_options_encode_and_create_reject_unsupported_combinations() {
+        let ok = hnsw_options_def(VectorOpClass::Cosine, 8, 40);
+        assert!(encode_index_def(&ok).is_ok());
+        let mut multi = ok.clone();
+        multi.columns.push("other".to_string());
+        multi.collations.push(None);
+        multi.expressions.push(None);
+        let mut uniq = ok.clone();
+        uniq.unique = true;
+        let mut collated = ok.clone();
+        collated.collations = vec![Some(crate::collation::Collation::C)];
+        let mut scalar = ok.clone();
+        scalar.kind = IndexKind::Scalar;
+        for bad in [multi, uniq, collated, scalar] {
+            assert!(matches!(
+                encode_index_def(&bad),
+                Err(CatalogError::Invalid(_))
+            ));
+        }
+    }
+
     /// opclass 名の解決・永続トークン・EXPLAIN トークンの対応。
     #[test]
     fn vector_opclass_names() {
@@ -26998,7 +27268,10 @@ mod tests {
         let cos = VectorOpClass::Cosine;
         let l2 = VectorOpClass::L2;
         let mismatch = |m| HnswGate::MetricMismatch { index_metric: m };
-        let targeted = HnswGate::Targeted { metric: cos };
+        let targeted = HnswGate::Targeted {
+            metric: cos,
+            options: None,
+        };
 
         // 宣言なし。
         assert_eq!(gate(HnswScope::All, true, cos), targeted);
@@ -27025,6 +27298,52 @@ mod tests {
             .expect("create cosine index");
         assert_eq!(gate(HnswScope::Declared, true, cos), targeted);
         assert_eq!(gate(HnswScope::Declared, true, l2), mismatch(cos));
+    }
+
+    /// 構築パラメータの伝搬（SQL-33 (5)、Issue #2029）: ゲートは問い合わせ metric の宣言の `WITH` を
+    /// 返し、同じ (表, opclass) に複数の宣言があるときは索引名の昇順で最初の宣言を採る。
+    /// `WITH` 省略の宣言は `None`。HNSW 以外への付与は `create_index` が拒否する。
+    #[test]
+    fn hnsw_gate_propagates_declared_build_options() {
+        let (storage, _guard) = index_fixture_storage("index-hnsw-gate-build-options");
+        let gate_cache = IndexCatalogGateCache::new();
+        let cos = VectorOpClass::Cosine;
+        let options_of = |gate_cache: &IndexCatalogGateCache| {
+            let txn = storage.db().begin_read().expect("begin read");
+            match hnsw_gate_in_txn(&txn, gate_cache, "docs", HnswScope::Declared, true, cos) {
+                HnswGate::Targeted { options, .. } => options,
+                other => panic!("expected Targeted, got {other:?}"),
+            }
+        };
+        storage
+            .create_index(&hnsw_def("idx_plain", "docs"))
+            .expect("create plain");
+        assert_eq!(options_of(&gate_cache), None);
+        let b = HnswIndexOptions::new(8, 40).unwrap();
+        storage
+            .create_index(&hnsw_def("idx_b", "docs").with_hnsw_options(Some(b)))
+            .expect("create b");
+        // 走査順（索引名の昇順）で最初は `idx_b`（`idx_plain` より前）。
+        assert_eq!(options_of(&gate_cache), Some(b));
+        let a = HnswIndexOptions::new(12, 48).unwrap();
+        storage
+            .create_index(&hnsw_def("idx_a", "docs").with_hnsw_options(Some(a)))
+            .expect("create a");
+        assert_eq!(options_of(&gate_cache), Some(a));
+        // 再オープン後も永続化されている。
+        let defs = storage.list_indexes().expect("list");
+        assert_eq!(
+            defs.iter()
+                .find(|d| d.name == "idx_b")
+                .and_then(|d| d.hnsw_options),
+            Some(b)
+        );
+        // HNSW 以外への付与は拒否する。
+        let scalar = scalar_def("idx_s", "docs", &["lang"]).with_hnsw_options(Some(a));
+        assert!(matches!(
+            storage.create_index(&scalar),
+            Err(CatalogError::Invalid(_))
+        ));
     }
 
     /// 対象列の検査: JSONB だけが受理され、JSON・TEXT・VECTOR・疑似列 `id`・不在列は拒否する。
