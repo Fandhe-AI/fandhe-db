@@ -484,11 +484,12 @@ pub(crate) fn search_l1(input: SearchInput<'_>) -> Result<Vec<CandidateHit>, Ker
     Ok(selector.into_sorted_vec())
 }
 
-/// L2 二乗距離（Issue #1981・SQL-33）。現状は [`crate::isa::l2_sq_scalar`] を直接呼ぶ。
-/// #1982／#1983 が ISA 別カーネルを足した時点で `isa::current()` 経由へ切り替える。
+/// L2 二乗距離（Issue #1981・SQL-33）。`dot`／`l1` と同じく [`crate::isa::current`] の ISA 別
+/// カーネル（Issue #1982 x86・#1983 aarch64）を呼び、単一カーネル・単一加算順序を全呼び出し元
+/// （`search_l2`・HNSW・バッチ検索）で共有する。scalar 参照は [`crate::isa::l2_sq_scalar`]。
 #[allow(dead_code)] // SQL 接続（別 Issue）までは単体テストのみが呼び出し元
 pub(crate) fn l2_sq(a: &[f32], b: &[f32]) -> f32 {
-    crate::isa::l2_sq_scalar(a, b)
+    crate::isa::current().l2_sq(a, b)
 }
 
 /// 二乗距離から最終出力用の L2 距離（f64）を得る（Issue #1981。距離値の SQL 出力は #2006）。
