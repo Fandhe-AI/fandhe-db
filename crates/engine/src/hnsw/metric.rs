@@ -122,30 +122,7 @@ impl HnswMetric {
     }
 }
 
-/// `row` を単位長へ正規化して `out` へ書く（Cosine の C2′。行とクエリで同じ関数を使う）。
-///
-/// 可否の判定は brute-force 側と同じく `kernel::dot(row, row)` が有限かつ正であること。
-/// 値の計算は ISA に依存しない f64 の逐次和（ノルム² → `1/sqrt` → 各成分へ乗算 → f32 丸め）
-/// で、同じ入力から常に同じビット列になる。`out` の長さが `row` と違う場合も拒否する。
-/// 呼び出し元: 構築（`HnswIndex::build_with_metric` 系の `normalize_rows`）と探索入口。
-pub(crate) fn normalize_into(row: &[f32], out: &mut [f32]) -> Result<(), ()> {
-    if row.len() != out.len() {
-        return Err(());
-    }
-    let n2_f32 = dot(row, row);
-    if !(n2_f32.is_finite() && n2_f32 > 0.0) {
-        return Err(());
-    }
-    let n2: f64 = row.iter().map(|&v| f64::from(v) * f64::from(v)).sum();
-    if !(n2.is_finite() && n2 > 0.0) {
-        return Err(());
-    }
-    let inv = 1.0 / n2.sqrt();
-    for (o, &v) in out.iter_mut().zip(row.iter()) {
-        *o = (f64::from(v) * inv) as f32;
-    }
-    Ok(())
-}
+pub(crate) use crate::kernel::normalize_into;
 
 /// 全行を [`normalize_into`] で正規化したバッファを返す。正規化できない最初の行は
 /// `NonNormalizableVector { node }`（索引全体を拒否。fail-closed）。確保は
