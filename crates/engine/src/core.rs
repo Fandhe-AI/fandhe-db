@@ -416,6 +416,39 @@ pub(crate) fn slot_ids_for(arena: &VectorArena) -> Result<Vec<u64>, ArenaError> 
     Ok(slot_ids)
 }
 
+/// アリーナ全体に対する Top-k 検索を provider へ委譲する共通口（Issue #2043・TABLE-26）。
+///
+/// `dense`（[`VectorArena::dense_slots`] の戻り値）が `Some` のとき、アリーナは NULL の VECTOR 行
+/// （0 埋めの区間）を含むので、NULL 行を除いたスロット列だけを `search_subset` で走査する
+/// （返る識別子はスロット番号で、`slot_ids`〔恒等列〕と同じ空間）。`None`（NULL 行が無い）の
+/// ときは従来どおり `search` へ全体を渡し、挙動はビット単位で変わらない。
+/// `EngineCore::search`・`rls::PrefilterSnapshot` の検索から呼ばれる。
+pub(crate) fn search_arena_dense(
+    provider: &dyn SearchProvider,
+    arena: &VectorArena,
+    slot_ids: &[u64],
+    dense: Option<&[u32]>,
+    query: &[f32],
+    k: usize,
+) -> Result<Vec<CandidateHit>, KernelError> {
+    match dense {
+        None => provider.search(SearchInput {
+            ids: slot_ids,
+            vectors: arena.vectors(),
+            dim: arena.dim(),
+            query,
+            k,
+        }),
+        Some(slots) => provider.search_subset(crate::kernel::SubsetSearchInput {
+            slots,
+            vectors: arena.vectors(),
+            dim: arena.dim(),
+            query,
+            k,
+        }),
+    }
+}
+
 /// provider が返した候補ヒット（識別子はスロット番号）を、テナント修飾済みの
 /// 公開ヒット [`CandidateHit`] → [`crate::kernel::SearchHit`] へ解決する
 /// （対象ビヘイビア: TABLE-12・RLS-9。codex-review P1 指摘・PR #194）。
@@ -438,6 +471,23 @@ pub(crate) fn resolve_slot_hits(
         out.push(SearchHit::new(tenant, id, hit.score));
     }
     Some(out)
+}
+
+/// 密側検証用の id 多重集合を作る（Issue #2043）。`dense` が `Some` のとき、provider へ実際に渡した
+/// 候補（NULL 行を除いたスロット列）だけを許可し、範囲外（NULL 行など）の id の返却を fail-closed に
+/// 拒否できるようにする。`None` のときは `all_ids`（恒等スロット列）全体の多重集合を返す。
+pub(crate) fn searched_id_counts(all_ids: &[u64], dense: Option<&[u32]>) -> HashMap<u64, usize> {
+    match dense {
+        None => visible_id_counts(all_ids),
+        Some(slots) => {
+            let mut counts: HashMap<u64, usize> = HashMap::with_capacity(slots.len());
+            for &s in slots {
+                let entry = counts.entry(u64::from(s)).or_insert(0);
+                *entry = entry.saturating_add(1);
+            }
+            counts
+        }
+    }
 }
 
 pub(crate) fn visible_id_counts(ids: &[u64]) -> HashMap<u64, usize> {
@@ -16252,14 +16302,15 @@ impl EngineCore {
         // provider へ渡す識別子はスロット番号（[`slot_ids_for`] のドキュメント参照。
         // 行 `id` は 1 つの可視集合内で一意とは限らないため識別子に使えない。TABLE-12）。
         let slot_ids = slot_ids_for(&arena)?;
-        let input = SearchInput {
-            ids: &slot_ids,
-            vectors: arena.vectors(),
-            dim: arena.dim(),
+        let dense = arena.dense_slots()?;
+        let hits = search_arena_dense(
+            self.provider.as_ref(),
+            &arena,
+            &slot_ids,
+            dense.as_deref(),
             query,
             k,
-        };
-        let hits = self.provider.search(input)?;
+        )?;
 
         // provider が返した結果が Top-k の契約を満たすことをコア側で検証する
         // （codex P1・Issue #137 対応）。可視集合所属だけでは「他テナントの行は
@@ -16269,7 +16320,7 @@ impl EngineCore {
         // 一切返さず fail-closed に拒否する（部分的なフィルタリング・並べ替えはしない）。
         //
         // 検証対象はスロット識別子の集合（スロットは重複しないため各件数は 1）。
-        let visible_id_counts = visible_id_counts(&slot_ids);
+        let visible_id_counts = searched_id_counts(&slot_ids, dense.as_deref());
         if !provider_result_is_valid(&hits, k, &visible_id_counts) {
             return Err(CoreError::ProviderResultRejected);
         }

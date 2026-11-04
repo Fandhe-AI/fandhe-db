@@ -854,7 +854,7 @@ fn observe_group_slots(
             values: if referenced.needs_embedding() {
                 Some(
                     arena
-                        .vector(slot_idx)
+                        .vector_or_null(slot_idx)
                         .ok_or_else(|| accumulator_bug("candidate slot out of bounds (vector)"))?,
                 )
             } else {
@@ -991,7 +991,7 @@ fn observe_candidate_slots_grouped_inner(
         for (expr, program) in bound.expr_filters.iter().zip(&bound.expr_filter_programs) {
             let embedding: &[f32] = if udf_call::references_embedding(expr) {
                 arena
-                    .vector(slot_idx)
+                    .vector_or_null(slot_idx)
                     .ok_or_else(|| accumulator_bug("candidate slot out of bounds (vector)"))?
             } else {
                 &[]
@@ -1014,7 +1014,7 @@ fn observe_candidate_slots_grouped_inner(
         for group in &bound.or_filters {
             let group_embedding: &[f32] = if group.references_embedding() {
                 arena
-                    .vector(slot_idx)
+                    .vector_or_null(slot_idx)
                     .ok_or_else(|| accumulator_bug("candidate slot out of bounds (vector)"))?
             } else {
                 &[]
@@ -1043,7 +1043,7 @@ fn observe_candidate_slots_grouped_inner(
             values: if referenced.needs_embedding() {
                 Some(
                     arena
-                        .vector(slot_idx)
+                        .vector_or_null(slot_idx)
                         .ok_or_else(|| accumulator_bug("candidate slot out of bounds (vector)"))?,
                 )
             } else {

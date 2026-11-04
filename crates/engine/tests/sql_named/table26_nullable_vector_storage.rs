@@ -4,7 +4,7 @@
 //! `EngineCore::execute_sql_in_session` の production 経路で、nullable な VECTOR 列への
 //! 省略・明示 NULL・`UPDATE SET v = NULL`、NOT NULL 列の `23502`、再オープン後の属性の往復一致、
 //! `ADD COLUMN`・`DROP NOT NULL`・CTAS、他テナントの NULL 行が結果へ影響しないことを固定する。
-//! kNN からの NULL 行除外は #2043 の担当で、ここでは対象外。
+//! kNN・hybrid からの NULL 行除外は `table26_nullable_vector_search.rs`（Issue #2043）が担当し、ここでは対象外。
 
 use engine::core::EngineCore;
 use engine::kernel::CpuScalarProvider;
@@ -295,34 +295,6 @@ fn ctas_copies_null_vector_rows() {
     ok(&core, "alice", "CREATE TABLE dst AS SELECT id, v FROM src");
     let rows = vec![(); null_vector_rows(&core, "alice", "dst")];
     assert_eq!(rows.len(), 1);
-}
-
-/// #2043 までの過渡期: 自テナントの NULL 行を含む表の kNN は `0A000`（`XX000` にしない）。
-/// 他テナントの NULL 行は自テナントの kNN に影響しない（`other_tenant_null_rows_do_not_leak`）。
-#[test]
-fn transitional_knn_over_own_null_row_code() {
-    let (core, _g) = new_core("t26-knn");
-    ok(
-        &core,
-        "sys",
-        "CREATE TABLE t (id BIGINT PRIMARY KEY, v VECTOR(3))",
-    );
-    ok(
-        &core,
-        "alice",
-        "INSERT INTO t (id, v) VALUES (1, NULL) USING OPERATION_ID 'o1'",
-    );
-    ok(
-        &core,
-        "alice",
-        "INSERT INTO t (id, v) VALUES (2, '[1,2,3]') USING OPERATION_ID 'o2'",
-    );
-    let r = run(
-        &core,
-        "alice",
-        "SELECT id FROM t ORDER BY v <=> '[1,2,3]' LIMIT 10",
-    );
-    assert_eq!(r.unwrap_err().wire_code(), "0A000");
 }
 
 /// INSERT トリガー（BEFORE／AFTER ROW）のある表でも nullable VECTOR の省略・明示 NULL を

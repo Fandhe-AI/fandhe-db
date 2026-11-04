@@ -67,3 +67,42 @@
 - 担当未定: 宣言的フィルタの `IS [NOT] NULL`（VECTOR 列）
 
 関連文書: [hnsw-rls-cardinality-switch.md](hnsw-rls-cardinality-switch.md)、[visible-bitmap-cache.md](visible-bitmap-cache.md)、[sql-arena-generation-cache.md](sql-arena-generation-cache.md)、[cosine-operator-migration.md](cosine-operator-migration.md)（文書形式の参照元）。
+
+## #2043 の決定
+
+- 対応: Issue #2043（親 #2040）。ポインタ: TABLE-26 (2)(3)・SQL-33・SQL-74・CORE-10。
+
+### hybrid のスロット契約は (A)
+
+NULL 行は arena にスロットを持ち、密側だけでマスクする。疎側の `DocId` が arena のスロット番号と
+1 対 1 に対応する契約（`arena.rs` `push_visible_row`・`sql/sparse_cache.rs`）を変えずに済み、
+NULL 行を疎側の候補に残せる。容量判定（`check_capacity` の行数・バイト量）は従来どおり可視行数が分母で、
+NULL 行も 1 行として数える。
+
+### 不変条件
+
+1. NULL の判定は `found_dim == 0` だけ。0 以外の不一致は `DimMismatch` で拒否する（fail-closed）。
+2. 判定は可視性の判定と `verify_row_key_tenant` の後。他テナント・不可視行の状態で結果は変わらない。
+3. NULL 行の `vectors` の区間は 0 埋めだが、NULL かどうかは arena の NULL スロット列だけで表す。
+   零ベクトルは正当な非 NULL 値であり、0 埋めから推定しない。
+4. `vector(slot)` は NULL で `None`。`vector_or_null(slot)` は NULL で空スライス（範囲外のみ `None`）。
+   WHERE の式・集約・投影はこれで NULL として評価する。
+5. NULL が 0 件の arena では全経路が従来とビット単位で同じ（`dense_slots` は `None`）。
+
+### 経路ごとの対応
+
+| 経路 | 対応 |
+| ---- | ---- |
+| SQL DISTANCE（厳密走査・cosine・`<#>`・DESC・LIMIT 省略） | 候補を `dense_slots`（スカラー索引のマスクがあれば `dense_subset`）に絞り `search_subset`／`search_cosine_subset`／`exact_full_scan` |
+| `EngineCore::search`・`PrefilterSnapshot` | `core::search_arena_dense`（NULL 行があれば `search_subset`） |
+| RLS ストリーミング `SearchTimeFilter` | 可視性判定の後で `dim == 0` を読み飛ばす（容量カウントにも入れない） |
+| HNSW | NULL 行を含む arena では HNSW の適用条件を偽にし、同じ候補集合の厳密走査へ倒す。索引に NULL 行は入らない |
+| hybrid | 疎側の `visible_ids` は全スロット。密側の provider（`CosineDenseAdapter`）だけを `dense_slots` でマスクし、入力が当該 arena のバッファでなければ拒否する |
+| 投影 | 疎側だけでヒットした NULL 行の VECTOR 列は NULL、距離式も NULL |
+| GPU バッチ | 契約の文書化のみ。呼び出し元が NULL 行を除いた密な行列を渡す |
+
+### 残課題
+
+- NULL 行を含む表で HNSW を使うには、索引ノードとスロットの写像（`slot_of_node` の恒等性）を一般化する必要がある。
+- NULL 行を含むスナップショットの `dense_slots` を毎クエリ計算している（キャッシュ化は必要が分かれば別 Issue）。
+- VECTOR 列への `IS [NOT] NULL`（`declarative_filter`）は担当未定のまま。

@@ -123,4 +123,5 @@ mod sql_varchar_column;
 mod sql_visible_cache;
 mod sql_where_or;
 mod sql_where_or_in_rewrite;
+mod table26_nullable_vector_search;
 mod table26_nullable_vector_storage;

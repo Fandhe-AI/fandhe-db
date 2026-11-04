@@ -265,6 +265,10 @@ fn per_row_aux_bytes() -> Option<usize> {
         .checked_add(std::mem::size_of::<String>())
         .and_then(|v| v.checked_add(crate::storage::MAX_TENANT_ID_LEN as usize))
         .and_then(|v| v.checked_add(std::mem::size_of::<Visibility>()))
+        // `null_slots: Vec<u32>` は最悪ケース（全行 NULL）の 1 行 1 要素分を予算へ含める
+        // （Issue #2043。NULL スロット配列が予算外で独立成長しないよう、capacity を
+        // `ensure_capacity` で行 capacity と同数だけ事前確保する前提）。
+        .and_then(|v| v.checked_add(std::mem::size_of::<u32>()))
 }
 
 /// `Vec::try_reserve_exact` の失敗を [`ArenaError::AllocationFailed`] へ変換する共通
@@ -305,6 +309,8 @@ struct GrowableArenaBuffers {
     ids: Vec<u64>,
     tenant_ids: Vec<String>,
     visibilities: Vec<Visibility>,
+    /// NULL 行のスロット番号（[`VectorArena::null_slots`] の蓄積先。行数以下で有界）。
+    null_slots: Vec<u32>,
     /// 4 本のバッファが共通して確保済みの行数（capacity 換算。実際の `Vec::capacity()`
     /// と一致するよう、成長は必ず [`Self::ensure_capacity`] 経由でのみ行う）。
     row_capacity: usize,
@@ -317,6 +323,7 @@ impl GrowableArenaBuffers {
             ids: Vec::new(),
             tenant_ids: Vec::new(),
             visibilities: Vec::new(),
+            null_slots: Vec::new(),
             row_capacity: 0,
         }
     }
@@ -374,6 +381,10 @@ impl GrowableArenaBuffers {
         try_reserve_exact(&mut self.ids, additional_rows, "ids")?;
         try_reserve_exact(&mut self.tenant_ids, additional_rows, "tenant_ids")?;
         try_reserve_exact(&mut self.visibilities, additional_rows, "visibilities")?;
+        // NULL スロット配列も行 capacity 分だけ予算内で事前確保する（push_row 側で
+        // 予算外の再確保が起きない）。
+        let null_additional = new_row_capacity.saturating_sub(self.null_slots.len());
+        try_reserve_exact(&mut self.null_slots, null_additional, "null_slots")?;
         self.row_capacity = new_row_capacity;
         Ok(())
     }
@@ -381,17 +392,35 @@ impl GrowableArenaBuffers {
     /// 1 行分を 4 本のバッファへ追加する。呼び出し元が直前に
     /// [`Self::ensure_capacity`] を呼び、十分な capacity を確保済みであること
     /// （＝ここでの追加が再確保を発生させないこと）が前提。
+    ///
+    /// `embedding` が空スライスの行は NULL の VECTOR（Issue #2043・TABLE-26）として、
+    /// `vectors` を `dim` 個の 0.0 で埋めスロット番号を `null_slots` へ記録する
+    /// （次元は検証済みで常に 1 以上のため、空スライスは NULL と曖昧にならない）。
+    /// 非空で `dim` と異なる長さは呼び出し元が `DimMismatch` で拒否済みの前提。
     fn push_row(
         &mut self,
         rowid: RowId,
         embedding: &[f32],
         tenant_id: String,
         visibility: Visibility,
-    ) {
-        self.vectors.extend_from_slice(embedding);
+        dim: usize,
+    ) -> Result<()> {
+        if embedding.is_empty() {
+            let slot = u32::try_from(self.ids.len()).map_err(|_| ArenaError::CapacityExceeded)?;
+            // capacity は `ensure_capacity` が予算内で確保済み（ここで再確保しない）。
+            if self.null_slots.len() >= self.null_slots.capacity() {
+                return Err(ArenaError::CapacityExceeded);
+            }
+            self.vectors
+                .resize(self.vectors.len().saturating_add(dim), 0.0);
+            self.null_slots.push(slot);
+        } else {
+            self.vectors.extend_from_slice(embedding);
+        }
         self.ids.push(rowid.raw_for_arena());
         self.tenant_ids.push(tenant_id);
         self.visibilities.push(visibility);
+        Ok(())
     }
 }
 
@@ -436,12 +465,22 @@ where
         .ok_or(ArenaError::CapacityExceeded)?;
     check_capacity(*visible_row_count, expected_dim, max_rows, max_bytes)?;
     buffers.ensure_capacity(*visible_row_count, dim, expected_dim, max_rows, max_bytes)?;
+    // 空スライスは NULL の VECTOR（Issue #2043）。それ以外の長さ不一致は破損なので、
+    // バッファのレイアウト（`vectors.len() == ids.len() * dim`）を壊す前に fail-closed で拒否する。
+    if !embedding.is_empty() && embedding.len() != dim {
+        return Err(ArenaError::DimMismatch {
+            id,
+            expected: expected_dim,
+            found: u32::try_from(embedding.len()).unwrap_or(u32::MAX),
+        });
+    }
     buffers.push_row(
         RowId::from_arena_raw(id),
         embedding,
         tenant_id.to_string(),
         visibility,
-    );
+        dim,
+    )?;
     Ok(())
 }
 
@@ -591,12 +630,21 @@ impl SqlArenaCaptureBuilder {
             self.failed = true;
             return;
         }
-        self.buffers.push_row(
-            RowId::from_arena_raw(id),
-            embedding,
-            owned_tenant_id,
-            visibility,
-        );
+        if (!embedding.is_empty() && embedding.len() != self.dim)
+            || self
+                .buffers
+                .push_row(
+                    RowId::from_arena_raw(id),
+                    embedding,
+                    owned_tenant_id,
+                    visibility,
+                    self.dim,
+                )
+                .is_err()
+        {
+            self.failed = true;
+            return;
+        }
         self.metadata.push(owned_metadata);
         self.row_count = next_count;
         self.metadata_bytes = next_metadata_bytes;
@@ -616,6 +664,7 @@ impl SqlArenaCaptureBuilder {
                 ids: self.buffers.ids,
                 tenant_ids: self.buffers.tenant_ids,
                 visibilities: self.buffers.visibilities,
+                null_slots: self.buffers.null_slots,
             },
             self.metadata,
         ))
@@ -660,6 +709,11 @@ pub struct VectorArena {
     /// よう同居保持する（ポリシー評価自体は行わない。モジュールドキュメント参照）。
     tenant_ids: Vec<String>,
     visibilities: Vec<Visibility>,
+    /// NULL の VECTOR 行（空 embedding。Issue #2043・TABLE-26）が占めるスロット番号の
+    /// 狭義昇順列。`vectors` のその区間は `dim` 個の 0.0 で埋めるが、**NULL かどうかは
+    /// この列だけで表す**（零ベクトルは正当な非 NULL 値なので、0 埋めから推定しない）。
+    /// NULL 行が無いアリーナでは空で、全経路が従来どおりのビット同一の挙動になる。
+    null_slots: Vec<u32>,
 }
 
 impl VectorArena {
@@ -965,7 +1019,7 @@ impl VectorArena {
             let id = *source_arena.ids().get(i).ok_or_else(out_of_bounds)?;
             let tenant_id = source_arena.tenant_id(i).ok_or_else(out_of_bounds)?;
             let visibility = source_arena.visibility(i).ok_or_else(out_of_bounds)?;
-            let embedding = source_arena.vector(i).ok_or_else(out_of_bounds)?;
+            let embedding = source_arena.vector_or_null(i).ok_or_else(out_of_bounds)?;
             push_visible_row(
                 &mut buffers,
                 &mut visible_row_count,
@@ -988,6 +1042,7 @@ impl VectorArena {
             ids: buffers.ids,
             tenant_ids: buffers.tenant_ids,
             visibilities: buffers.visibilities,
+            null_slots: buffers.null_slots,
         })
     }
 
@@ -1051,7 +1106,7 @@ impl VectorArena {
             let id = *source_arena.ids().get(i).ok_or_else(out_of_bounds)?;
             let tenant_id = source_arena.tenant_id(i).ok_or_else(out_of_bounds)?;
             let visibility = source_arena.visibility(i).ok_or_else(out_of_bounds)?;
-            let embedding = source_arena.vector(i).ok_or_else(out_of_bounds)?;
+            let embedding = source_arena.vector_or_null(i).ok_or_else(out_of_bounds)?;
             push_visible_row(
                 &mut buffers,
                 &mut visible_row_count,
@@ -1074,6 +1129,7 @@ impl VectorArena {
             ids: buffers.ids,
             tenant_ids: buffers.tenant_ids,
             visibilities: buffers.visibilities,
+            null_slots: buffers.null_slots,
         })
     }
 
@@ -1137,7 +1193,7 @@ impl VectorArena {
             let i = usize::try_from(slot).map_err(|_| out_of_bounds())?;
             let meta = metadata.get(i).ok_or_else(out_of_bounds)?;
             let id = *source_arena.ids().get(i).ok_or_else(out_of_bounds)?;
-            let embedding = source_arena.vector(i).ok_or_else(out_of_bounds)?;
+            let embedding = source_arena.vector_or_null(i).ok_or_else(out_of_bounds)?;
             if !on_visible_row(visible_row_count, id, embedding, meta)? {
                 continue;
             }
@@ -1249,6 +1305,7 @@ impl VectorArena {
                     ids: Vec::new(),
                     tenant_ids: Vec::new(),
                     visibilities: Vec::new(),
+                    null_slots: Vec::new(),
                 });
             }
             // 旧フォーマット（キーが `id` のみ）の DB は
@@ -1327,7 +1384,10 @@ impl VectorArena {
             let (found_dim, metadata) =
                 crate::storage::decode_row_embedding_and_metadata_into(buf, &mut embedding_scratch)
                     .map_err(ArenaError::from)?;
-            if found_dim != expected_dim {
+            // `found_dim == 0` は NULL の VECTOR（Issue #2043・TABLE-26）。可視性判定と
+            // `verify_row_key_tenant` を通った後でだけ到達するため、他テナント・不可視行の
+            // 状態で挙動は変わらない。0 以外の不一致は従来どおり破損として拒否する。
+            if found_dim != 0 && found_dim != expected_dim {
                 return Err(ArenaError::DimMismatch {
                     id,
                     expected: expected_dim,
@@ -1400,6 +1460,7 @@ impl VectorArena {
             ids: buffers.ids,
             tenant_ids: buffers.tenant_ids,
             visibilities: buffers.visibilities,
+            null_slots: buffers.null_slots,
         })
     }
 
@@ -1450,11 +1511,80 @@ impl VectorArena {
 
     /// `index` 番目の行の埋め込みスライスを返す。範囲外は `None`
     /// （`.claude/rules/coding-rust.md`: 添字アクセス `[]` を production コードで使わない）。
+    ///
+    /// NULL の VECTOR 行（Issue #2043）では `None` を返す（0 埋めの区間は公開しない）。
     pub fn vector(&self, index: usize) -> Option<&[f32]> {
+        if self.is_null_slot(index) {
+            return None;
+        }
         let dim = self.dim as usize;
         let start = index.checked_mul(dim)?;
         let end = start.checked_add(dim)?;
         self.vectors.get(start..end)
+    }
+
+    /// `index` 番目の行が NULL の VECTOR（空 embedding）か。
+    pub fn is_null_slot(&self, index: usize) -> bool {
+        u32::try_from(index)
+            .map(|i| self.null_slots.binary_search(&i).is_ok())
+            .unwrap_or(false)
+    }
+
+    /// NULL の VECTOR 行の数（Issue #2043）。0 の場合、全経路は従来と同一に動く。
+    pub fn null_row_count(&self) -> usize {
+        self.null_slots.len()
+    }
+
+    /// NULL でない（密側の kNN 対象となる）行数。
+    pub fn dense_len(&self) -> usize {
+        self.ids.len().saturating_sub(self.null_slots.len())
+    }
+
+    /// 密側の候補スロット（NULL でない行の昇順列）。NULL 行が 0 件なら `None`
+    /// （呼び出し元は従来の全走査経路をそのまま使う）。`Vec` は行数以下で `try_reserve` 確保。
+    pub fn dense_slots(&self) -> Result<Option<Vec<u32>>> {
+        if self.null_slots.is_empty() {
+            return Ok(None);
+        }
+        let n = u32::try_from(self.ids.len()).map_err(|_| ArenaError::CapacityExceeded)?;
+        let mut out: Vec<u32> = Vec::new();
+        out.try_reserve_exact(self.dense_len()).map_err(|e| {
+            ArenaError::AllocationFailed(format!("failed to reserve dense slots: {e}"))
+        })?;
+        let mut nulls = self.null_slots.iter().copied().peekable();
+        for slot in 0..n {
+            if nulls.peek() == Some(&slot) {
+                nulls.next();
+            } else {
+                out.push(slot);
+            }
+        }
+        Ok(Some(out))
+    }
+
+    /// `kept`（狭義昇順のスロット列）から NULL 行を除いた列を返す。NULL 行が 0 件なら `None`。
+    pub fn dense_subset(&self, kept: &[u32]) -> Result<Option<Vec<u32>>> {
+        if self.null_slots.is_empty() {
+            return Ok(None);
+        }
+        let mut out: Vec<u32> = Vec::new();
+        out.try_reserve_exact(kept.len()).map_err(|e| {
+            ArenaError::AllocationFailed(format!("failed to reserve dense slots: {e}"))
+        })?;
+        out.extend(
+            kept.iter()
+                .copied()
+                .filter(|s| self.null_slots.binary_search(s).is_err()),
+        );
+        Ok(Some(out))
+    }
+
+    /// キャッシュからの組み直し用: NULL 行には空スライス、それ以外には埋め込みを返す。
+    pub(crate) fn vector_or_null(&self, index: usize) -> Option<&[f32]> {
+        if self.is_null_slot(index) {
+            return (index < self.ids.len()).then_some(&[][..]);
+        }
+        self.vector(index)
     }
 
     /// `index` 番目の行のテナント識別子。範囲外は `None`。
@@ -1507,7 +1637,12 @@ impl VectorArena {
             .capacity()
             .saturating_mul(std::mem::size_of::<String>());
         let tenant_ids_bytes = tenant_strings_bytes.saturating_add(tenant_vec_bytes);
+        let null_slots_bytes = self
+            .null_slots
+            .capacity()
+            .saturating_mul(std::mem::size_of::<u32>());
         vectors_bytes
+            .saturating_add(null_slots_bytes)
             .saturating_add(ids_bytes)
             .saturating_add(visibilities_bytes)
             .saturating_add(tenant_ids_bytes)
@@ -1922,6 +2057,7 @@ mod tests {
             ids,
             tenant_ids,
             visibilities,
+            null_slots: Vec::new(),
         };
 
         // len ベースだった旧実装が返していたはずの値（要素数のみ）。
@@ -2549,6 +2685,167 @@ mod tests {
         assert!(arena.is_empty());
     }
 
+    /// 任意の埋め込みで行を直接書く（`embedding` が空なら NULL の VECTOR。Issue #2043）。
+    fn seed_row_raw(storage: &Storage, id: u64, tenant_id: &str, embedding: &[f32]) {
+        let write_txn = storage.db().begin_write().expect("begin_write");
+        {
+            let row_table_name = catalog::user_rows_table_name("docs");
+            let mut row_table = write_txn
+                .open_table(catalog::user_rows_table_def(&row_table_name))
+                .expect("open row table");
+            let encoded = crate::storage::encode_row(&RowInput {
+                tenant_id,
+                visibility: Visibility::Public,
+                embedding,
+                metadata: b"m",
+            })
+            .expect("encode row");
+            row_table
+                .insert((tenant_id, id), encoded.as_slice())
+                .expect("insert row");
+        }
+        write_txn.commit().expect("commit row");
+    }
+
+    // 対象ビヘイビア: TABLE-26 (2)（Issue #2043）。NULL の行は arena にスロットを持ち、
+    // `vector()` は `None`、`vectors()` は 0 埋めでレイアウトが保たれる。零ベクトルの非 NULL 行は
+    // NULL とみなされない。`dense_slots` は NULL を除いた昇順列で、NULL が無ければ `None`。
+    #[test]
+    fn null_rows_get_slots_and_are_excluded_from_dense_slots() {
+        let path = unique_db_path("arena-null-slots");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&schema_for("docs", 2))
+            .expect("create_table");
+        seed_row_raw(&storage, 1, "t", &[1.0, 2.0]);
+        seed_row_raw(&storage, 2, "t", &[]);
+        seed_row_raw(&storage, 3, "t", &[0.0, 0.0]);
+        seed_row_raw(&storage, 4, "t", &[]);
+        seed_row_raw(&storage, 5, "other", &[]);
+
+        let arena = VectorArena::build_filtered(&storage, "docs", |tenant, _| tenant == "t")
+            .expect("NULL rows must be accepted");
+        assert_eq!(arena.len(), 4, "invisible NULL row must not take a slot");
+        assert_eq!(arena.vectors().len(), 4 * 2);
+        assert_eq!(arena.null_row_count(), 2);
+        assert_eq!(arena.dense_len(), 2);
+        assert_eq!(arena.vector(0), Some([1.0, 2.0].as_slice()));
+        assert_eq!(arena.vector(1), None);
+        assert!(arena.is_null_slot(1) && arena.is_null_slot(3));
+        // 零ベクトルは正当な非 NULL 値。
+        assert_eq!(arena.vector(2), Some([0.0, 0.0].as_slice()));
+        assert!(!arena.is_null_slot(2));
+        assert_eq!(arena.vector_or_null(1), Some([].as_slice()));
+        assert_eq!(arena.dense_slots().expect("dense"), Some(vec![0, 2]));
+        assert_eq!(
+            arena.dense_subset(&[1, 2, 3]).expect("subset"),
+            Some(vec![2])
+        );
+    }
+
+    // fail-closed: 0 以外の次元不一致は NULL 扱いにせず従来どおり拒否する。
+    #[test]
+    fn non_zero_dimension_mismatch_is_still_rejected_next_to_null_rows() {
+        let path = unique_db_path("arena-null-vs-mismatch");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&schema_for("docs", 4))
+            .expect("create_table");
+        seed_row_raw(&storage, 1, "t", &[]);
+        seed_row_raw(&storage, 2, "t", &[1.0, 2.0]);
+        let err = VectorArena::build_filtered(&storage, "docs", |_, _| true)
+            .expect_err("non-zero mismatch must be rejected");
+        assert!(matches!(
+            err,
+            ArenaError::DimMismatch {
+                found: 2,
+                expected: 4,
+                ..
+            }
+        ));
+    }
+
+    // NULL 行が無い arena では `dense_slots` は `None`（従来経路のまま）。
+    #[test]
+    fn dense_slots_is_none_without_null_rows() {
+        let path = unique_db_path("arena-no-null");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&schema_for("docs", 2))
+            .expect("create_table");
+        seed_row_raw(&storage, 1, "t", &[1.0, 2.0]);
+        let arena = VectorArena::build_filtered(&storage, "docs", |_, _| true).expect("build");
+        assert_eq!(arena.null_row_count(), 0);
+        assert_eq!(arena.dense_slots().expect("dense"), None);
+        assert_eq!(arena.dense_subset(&[0]).expect("subset"), None);
+    }
+
+    // キャッシュ済み行からの組み直し（全件・部分集合）が NULL の集合を引き継ぎ、スロットを振り直す。
+    #[test]
+    fn cached_rebuild_preserves_null_flags_and_renumbers_subset() {
+        let path = unique_db_path("arena-null-cached");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&schema_for("docs", 2))
+            .expect("create_table");
+        seed_row_raw(&storage, 1, "t", &[1.0, 1.0]);
+        seed_row_raw(&storage, 2, "t", &[]);
+        seed_row_raw(&storage, 3, "t", &[]);
+        seed_row_raw(&storage, 4, "t", &[0.0, 0.0]);
+        let source = VectorArena::build_filtered(&storage, "docs", |_, _| true).expect("build");
+        let metadata: Vec<Vec<u8>> = (0..source.len()).map(|_| b"m".to_vec()).collect();
+
+        let full = VectorArena::build_from_cached_rls_rows(
+            "docs",
+            2,
+            &source,
+            &metadata,
+            |_, _, _, _| Ok(true),
+            MAX_ARENA_ROWS,
+            MAX_ARENA_TOTAL_BYTES,
+        )
+        .expect("full rebuild");
+        assert_eq!(full.dense_slots().expect("dense"), Some(vec![0, 3]));
+
+        let sub = VectorArena::build_from_cached_rls_rows_subset(
+            "docs",
+            2,
+            &source,
+            &metadata,
+            &[1, 3],
+            |_, _, _, _| Ok(true),
+            MAX_ARENA_ROWS,
+            MAX_ARENA_TOTAL_BYTES,
+        )
+        .expect("subset rebuild");
+        assert_eq!(sub.len(), 2);
+        assert!(sub.is_null_slot(0) && !sub.is_null_slot(1));
+        assert_eq!(sub.vector(1), Some([0.0, 0.0].as_slice()));
+
+        // NULL 行はコールバックへ空 embedding として渡る。
+        let mut seen_empty = 0;
+        VectorArena::filter_cached_rls_rows_subset(
+            2,
+            &source,
+            &metadata,
+            &[0, 1, 2, 3],
+            |_, _, emb, _| {
+                if emb.is_empty() {
+                    seen_empty += 1;
+                }
+                Ok(true)
+            },
+            MAX_ARENA_ROWS,
+            MAX_ARENA_TOTAL_BYTES,
+        )
+        .expect("filter");
+        assert_eq!(seen_empty, 2);
+    }
+
     // 対象ビヘイビア: TABLE-8（codex P0 対応・Issue #137）。他テナント（不可視）の破損行
     // （次元不一致）が存在していても、対象テナントの可視行が正常であれば検索
     // （`build_filtered`）が成功し、可視行だけを返すことを検証する。他テナントの
@@ -2913,12 +3210,15 @@ mod tests {
             // 直前に 1 行分を実際に push している」という不変条件（本番コードの
             // `build_filtered_with_limits` のループと同じ形）に依存するため、テストでも
             // 同じ順序（ensure_capacity → push_row）を守る。
-            buffers.push_row(
-                RowId::from_arena_raw(target_row_count as u64),
-                &vec![0.0f32; dim_usize],
-                "tenant-a".to_string(),
-                Visibility::Public,
-            );
+            buffers
+                .push_row(
+                    RowId::from_arena_raw(target_row_count as u64),
+                    &vec![0.0f32; dim_usize],
+                    "tenant-a".to_string(),
+                    Visibility::Public,
+                    dim_usize,
+                )
+                .expect("push_row");
 
             // 実際に記録された capacity（＝実際に `try_reserve_exact` で確保した量）が、
             // その時点でなお `max_bytes` の範囲内であることを、行った成長のたびに
