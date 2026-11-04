@@ -568,6 +568,15 @@ fail-closed で起動エラーです。環境変数は設けません（詳細: 
 
 HNSW（opt-in）の探索幅は、各セッションが `SET hnsw.ef_search = 200`（範囲 `1`〜`1000`、未設定時はエンジン構築時の値で既定 64）で変更でき（Issue #2030・SQL-73）、
 `RESET hnsw.ef_search` で戻り、`SHOW hnsw.ef_search` で確認できます。値は HNSW 探索にだけ効き、厳密走査・ハイブリッド検索の結果と `USING MODE` は変わりません。
+
+選択率の低い `WHERE` で DISTANCE 先行（`HINT ORDER(DISTANCE, ...)`）の kNN が `LIMIT` に届かない取りこぼしは、
+`SET hnsw.iterative_scan = strict_order`（`off`／`relaxed_order`／`strict_order`。既定 `strict_order`）と
+`SET hnsw.max_scan_tuples = 20000`（範囲 `1`〜`2147483647`。既定 20000）で制御できます（Issue #2033・SQL-73）。
+`strict_order`／`relaxed_order` は事後フィルタ後の件数が目標に届くまで取得件数を倍々に増やして再探索し、
+`max_scan_tuples`（SQL-46 の走査行数上限と `MAX_SEARCH_K`＝10,000 も超えない）に達するとエラーにせずそれまでの結果を返します。
+`off` は反復せず `ef_search` 件で打ち切ります。`relaxed_order` は現状 `strict_order` と同じ動作です。
+範囲外・不正値は `22023`、`SET LOCAL` は `0A000`。効くのは HNSW を使える kNN の DISTANCE 先行だけで、
+厳密走査・ハイブリッドの結果と `USING MODE` は変わらず、NoSQL（HTTP）表層は既定値で動きます。
 範囲外・不正値は `22023`、`SET LOCAL` は `0A000` です。NoSQL（HTTP）表層には SET の手段がなく既定値で動きます。
 
 `--read-timeout-secs <N>`（既定 30・範囲 `1`〜`600` 秒）・`--max-connections <N>`（既定 64・範囲 `1`〜`256`）・

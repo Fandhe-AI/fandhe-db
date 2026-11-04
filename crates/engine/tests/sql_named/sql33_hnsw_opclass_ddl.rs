@@ -304,7 +304,8 @@ fn alias_and_canonical_explain_match_and_l2_declaration_degrades_safely() {
         "{a:?}"
     );
     assert!(
-        line(&a, "hnsw_params: ").ends_with("metric=cosine"),
+        line(&a, "hnsw_params: ")
+            .ends_with("metric=cosine,iterative_scan=strict_order,max_scan_tuples=20000"),
         "{a:?}"
     );
 
@@ -314,7 +315,8 @@ fn alias_and_canonical_explain_match_and_l2_declaration_degrades_safely() {
         "ann_plan: plain_scan_opclass_mismatch"
     );
     assert!(
-        line(&lines, "hnsw_params: ").ends_with("metric=l2"),
+        line(&lines, "hnsw_params: ")
+            .ends_with("metric=l2,iterative_scan=strict_order,max_scan_tuples=20000"),
         "{lines:?}"
     );
     let degraded = l2.execute_sql(&ctx("tenant-b"), &sql).expect("query");
@@ -335,7 +337,8 @@ fn scope_all_implicit_hnsw_is_cosine() {
         "{cos:?}"
     );
     assert!(
-        line(&cos, "hnsw_params: ").ends_with("metric=cosine"),
+        line(&cos, "hnsw_params: ")
+            .ends_with("metric=cosine,iterative_scan=strict_order,max_scan_tuples=20000"),
         "{cos:?}"
     );
     let l2 = explain_lines(&core, "tenant-b", &knn_sql("<->", &vb[0]));

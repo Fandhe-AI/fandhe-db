@@ -18,6 +18,8 @@ mod sql1953_deadline_vector;
 mod sql1953_deadline_writes;
 mod sql1954_statement_timeout_setting;
 mod sql2030_hnsw_ef_search_setting;
+mod sql2033_hnsw_iterative_scan_behavior;
+mod sql2033_hnsw_iterative_scan_setting;
 mod sql24_expr_lhs_null_between_in;
 mod sql41_bool_literal_where;
 mod sql42_aggregate_arith_projection;

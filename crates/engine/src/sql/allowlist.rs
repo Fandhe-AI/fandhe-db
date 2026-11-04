@@ -3447,6 +3447,16 @@ pub enum Statement {
     /// `SHOW hnsw.ef_search`（SQL-73・Issue #2030）。列名 `hnsw.ef_search` の text 1 行。
     /// **#2030 で追加した破壊的変更（BREAKING CHANGE）**: variant 追加。
     ShowHnswEfSearch,
+    /// `SET [SESSION] hnsw.iterative_scan|hnsw.max_scan_tuples {TO|=} <値|DEFAULT>`／`RESET ...`
+    /// （SQL-73・Issue #2033）。値は構文段で検証済み（不正値は `22023`）。`reset` は `RESET` 由来か。
+    /// **#2033 で追加した破壊的変更（BREAKING CHANGE）**: variant 追加。
+    SetHnswScanSetting {
+        value: HnswScanSetting,
+        reset: bool,
+    },
+    /// `SHOW hnsw.iterative_scan`／`SHOW hnsw.max_scan_tuples`（SQL-73・Issue #2033）。列名は
+    /// 設定名と同じ text 1 行。**#2033 で追加した破壊的変更（BREAKING CHANGE）**: variant 追加。
+    ShowHnswScanSetting(HnswScanParam),
     /// `CREATE FUNCTION <name>(<param>[, <param>...]) AS <expr>`（TASK-79・SQL-9）。
     /// カタログ照会を必要としない（セッションのみに影響するため FROM テーブルの
     /// 存在確認は行わない）。パラメータ名重複・登録済み名との衝突・列参照の禁止
@@ -19384,6 +19394,8 @@ pub(crate) fn require_row_query_statement(
         | Statement::ShowStatementTimeout
         | Statement::SetHnswEfSearch { .. }
         | Statement::ShowHnswEfSearch
+        | Statement::SetHnswScanSetting { .. }
+        | Statement::ShowHnswScanSetting(_)
         | Statement::CreateFunction { .. } => Err(SqlSurfaceError::unsupported(format!(
             "{what} requires a SELECT query"
         ))),
@@ -24502,6 +24514,171 @@ fn is_reset_hnsw_ef_search(tokens: &[Token]) -> bool {
     }
 }
 
+/// `SET hnsw.iterative_scan` の値（SQL-73・Issue #2033）。`Default` は「セッション上書きなし」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HnswIterativeScanSetting {
+    Value(crate::hnsw::HnswIterativeScan),
+    Default,
+}
+
+/// `SET hnsw.max_scan_tuples` の値（SQL-73・Issue #2033）。`Default` は「セッション上書きなし」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HnswMaxScanTuplesSetting {
+    Value(u32),
+    Default,
+}
+
+/// 反復スキャン系セッション設定の名前（`SHOW`・Describe の対象指定。SQL-73・Issue #2033）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HnswScanParam {
+    IterativeScan,
+    MaxScanTuples,
+}
+
+impl HnswScanParam {
+    /// 設定名（`SHOW` の結果列名）。
+    pub fn name(self) -> &'static str {
+        match self {
+            HnswScanParam::IterativeScan => "hnsw.iterative_scan",
+            HnswScanParam::MaxScanTuples => "hnsw.max_scan_tuples",
+        }
+    }
+}
+
+/// `SET` で受理した反復スキャン系設定の値（SQL-73・Issue #2033）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HnswScanSetting {
+    IterativeScan(HnswIterativeScanSetting),
+    MaxScanTuples(HnswMaxScanTuplesSetting),
+}
+
+/// `SET hnsw.max_scan_tuples` の受理下限（pgvector と同じ範囲。SQL-73）。
+const HNSW_MAX_SCAN_TUPLES_MIN: u32 = 1;
+/// `SET hnsw.max_scan_tuples` の受理上限（pgvector と同じ範囲 = `i32::MAX`。SQL-73）。
+const HNSW_MAX_SCAN_TUPLES_MAX: u32 = 2_147_483_647;
+
+/// 位置 `i` が修飾識別子 `hnsw.iterative_scan`／`hnsw.max_scan_tuples` ならその種別を返す。
+fn hnsw_scan_param_at(tokens: &[Token], i: usize) -> Option<HnswScanParam> {
+    match tokens.get(i) {
+        Some(Token::QualifiedIdent { qualifier, name })
+            if qualifier.eq_ignore_ascii_case("hnsw") =>
+        {
+            if name.eq_ignore_ascii_case("iterative_scan") {
+                Some(HnswScanParam::IterativeScan)
+            } else if name.eq_ignore_ascii_case("max_scan_tuples") {
+                Some(HnswScanParam::MaxScanTuples)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// 文が `SHOW hnsw.iterative_scan`／`SHOW hnsw.max_scan_tuples`（末尾 `;` 可）ならその種別。
+pub(crate) fn show_hnsw_scan_param(tokens: &[Token]) -> Option<HnswScanParam> {
+    let param = hnsw_scan_param_at(tokens, 1)?;
+    let mut p = Parser::new(tokens);
+    p.expect_ident_matching("SHOW").ok()?;
+    p.advance();
+    p.expect_end_of_statement().ok()?;
+    Some(param)
+}
+
+/// 文が `SET [SESSION|LOCAL] hnsw.iterative_scan|hnsw.max_scan_tuples ...` の頭ならその種別。
+/// `SET LOCAL` も真にして [`parse_set_hnsw_scan`] が `0A000` で拒否する。
+fn set_hnsw_scan_head(tokens: &[Token]) -> Option<HnswScanParam> {
+    let modifier_at_1 = matches!(tokens.get(1), Some(Token::Ident(w))
+        if w.eq_ignore_ascii_case("SESSION") || w.eq_ignore_ascii_case("LOCAL"));
+    hnsw_scan_param_at(tokens, 1).or_else(|| {
+        if modifier_at_1 {
+            hnsw_scan_param_at(tokens, 2)
+        } else {
+            None
+        }
+    })
+}
+
+/// `SET [SESSION] hnsw.iterative_scan|hnsw.max_scan_tuples {TO|=} {値|'値'|DEFAULT}`
+/// （SQL-73・Issue #2033）。`SET LOCAL` は `0A000`、範囲外・不正値は `22023`（入力値を応答に
+/// 含めない）、値の欠落は `42601`。
+fn parse_set_hnsw_scan(
+    tokens: &[Token],
+    param: HnswScanParam,
+) -> Result<HnswScanSetting, SqlSurfaceError> {
+    let invalid = || SqlSurfaceError::InvalidParameterValue {
+        detail: match param {
+            HnswScanParam::IterativeScan => "invalid value for parameter \"hnsw.iterative_scan\"",
+            HnswScanParam::MaxScanTuples => "invalid value for parameter \"hnsw.max_scan_tuples\"",
+        },
+    };
+    let mut p = Parser::new(tokens);
+    p.expect_ident_matching("SET")?;
+    if p.peek_ident_matches("LOCAL") {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "SET LOCAL is not supported".to_string(),
+        });
+    }
+    if p.peek_ident_matches("SESSION") {
+        p.advance();
+    }
+    // 呼び出し元の頭判定で設定名の存在は確認済み。ここでは 1 トークン読み進めるだけ。
+    p.advance();
+    if p.peek_ident_matches("TO") {
+        p.advance();
+    } else {
+        p.expect_punct('=')?;
+    }
+    let setting = match p.advance() {
+        Some(Token::Ident(w)) if w.eq_ignore_ascii_case("DEFAULT") => match param {
+            HnswScanParam::IterativeScan => {
+                HnswScanSetting::IterativeScan(HnswIterativeScanSetting::Default)
+            }
+            HnswScanParam::MaxScanTuples => {
+                HnswScanSetting::MaxScanTuples(HnswMaxScanTuplesSetting::Default)
+            }
+        },
+        Some(Token::Ident(w)) | Some(Token::StringLiteral(w)) | Some(Token::Number(w)) => {
+            match param {
+                HnswScanParam::IterativeScan => {
+                    let v = match w.trim().to_ascii_lowercase().as_str() {
+                        "off" => crate::hnsw::HnswIterativeScan::Off,
+                        "relaxed_order" => crate::hnsw::HnswIterativeScan::RelaxedOrder,
+                        "strict_order" => crate::hnsw::HnswIterativeScan::StrictOrder,
+                        _ => return Err(invalid()),
+                    };
+                    HnswScanSetting::IterativeScan(HnswIterativeScanSetting::Value(v))
+                }
+                HnswScanParam::MaxScanTuples => {
+                    let n: u32 = w.trim().parse().map_err(|_| invalid())?;
+                    if !(HNSW_MAX_SCAN_TUPLES_MIN..=HNSW_MAX_SCAN_TUPLES_MAX).contains(&n) {
+                        return Err(invalid());
+                    }
+                    HnswScanSetting::MaxScanTuples(HnswMaxScanTuplesSetting::Value(n))
+                }
+            }
+        }
+        Some(_) => return Err(invalid()),
+        None => {
+            return Err(SqlSurfaceError::unsupported(
+                "expected hnsw scan setting value".to_string(),
+            ))
+        }
+    };
+    p.expect_end_of_statement()?;
+    Ok(setting)
+}
+
+/// 文が `RESET hnsw.iterative_scan|hnsw.max_scan_tuples`（末尾 `;` 可）ならその種別。
+fn reset_hnsw_scan_param(tokens: &[Token]) -> Option<HnswScanParam> {
+    let param = hnsw_scan_param_at(tokens, 1)?;
+    let mut p = Parser::new(tokens);
+    p.expect_ident_matching("RESET").ok()?;
+    p.advance();
+    p.expect_end_of_statement().ok()?;
+    Some(param)
+}
+
 /// 文が `SHOW row_security`（末尾 `;` 可）か。厳密一致のみ真。
 pub(crate) fn is_show_row_security(tokens: &[Token]) -> bool {
     let mut p = Parser::new(tokens);
@@ -28007,6 +28184,28 @@ fn validate_sql_tokens_impl(
             value: HnswEfSearchSetting::Default,
             reset: true,
         }),
+        // SQL-73・Issue #2033: `hnsw.iterative_scan`／`hnsw.max_scan_tuples` も同じ理由で先に判定する。
+        _ if is_set_statement && set_hnsw_scan_head(tokens).is_some() => {
+            let param = set_hnsw_scan_head(tokens).ok_or(SqlSurfaceError::Internal {
+                detail: "hnsw scan setting head vanished".to_string(),
+            })?;
+            let value = parse_set_hnsw_scan(tokens, param)?;
+            Ok(Statement::SetHnswScanSetting {
+                value,
+                reset: false,
+            })
+        }
+        _ if reset_hnsw_scan_param(tokens).is_some() => {
+            let value = match reset_hnsw_scan_param(tokens) {
+                Some(HnswScanParam::IterativeScan) | None => {
+                    HnswScanSetting::IterativeScan(HnswIterativeScanSetting::Default)
+                }
+                Some(HnswScanParam::MaxScanTuples) => {
+                    HnswScanSetting::MaxScanTuples(HnswMaxScanTuplesSetting::Default)
+                }
+            };
+            Ok(Statement::SetHnswScanSetting { value, reset: true })
+        }
         _ if is_set_statement && is_set_search_path_head(tokens) => {
             let value = parse_set_search_path(tokens)?;
             Ok(Statement::SetSearchPath {
@@ -28107,6 +28306,8 @@ fn validate_sql_tokens_impl(
                 | Statement::ShowStatementTimeout
                 | Statement::SetHnswEfSearch { .. }
                 | Statement::ShowHnswEfSearch
+                | Statement::SetHnswScanSetting { .. }
+                | Statement::ShowHnswScanSetting(_)
                 | Statement::CreateFunction { .. }
                 | Statement::Explain(_)
                 // Issue #929（SQL-29 (c)）: `validate_select_statement` は集合演算
@@ -28431,14 +28632,16 @@ pub fn validate_statement(
         | Statement::SetSearchPath { .. }
         | Statement::SetRowSecurity { .. }
         | Statement::SetStatementTimeout { .. }
-        | Statement::SetHnswEfSearch { .. } => Err(SqlSurfaceError::unsupported(
+        | Statement::SetHnswEfSearch { .. }
+        | Statement::SetHnswScanSetting { .. } => Err(SqlSurfaceError::unsupported(
             "SET is not a query statement (use a session-aware entry point)",
         )),
         Statement::ShowTimeZone
         | Statement::ShowSearchPath
         | Statement::ShowRowSecurity
         | Statement::ShowStatementTimeout
-        | Statement::ShowHnswEfSearch => Err(SqlSurfaceError::unsupported(
+        | Statement::ShowHnswEfSearch
+        | Statement::ShowHnswScanSetting(_) => Err(SqlSurfaceError::unsupported(
             "SHOW is not a query statement (use a session-aware entry point)",
         )),
         Statement::CreateFunction { .. } => Err(SqlSurfaceError::unsupported(

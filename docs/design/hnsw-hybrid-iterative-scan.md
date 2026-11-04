@@ -1084,3 +1084,37 @@ terminates_and_is_deterministic`（F32／F16 共有本体）へ
 - 親 Issue #503 への採否判断（`masked_short` は解消済み・レイテンシは
   条件依存で改善/悪化が両方観測されているため、単純な Accept/Reject では
   なく条件別の適用方針の検討を推奨する、というのが本実測からの示唆）
+
+## Issue #2033: 反復スキャン設定（`hnsw.iterative_scan`・`hnsw.max_scan_tuples`）の SQL 公開
+
+親 #2031・SQL-73 のポインタ。設定の構文・範囲・既定値は README「HNSW の探索幅」節の公開済みの範囲に従う。
+
+### 判断
+
+| 論点 | 判断 |
+| ---- | ---- |
+| 取りこぼしの発生範囲 | 既定の評価順（RLS → SCALAR → DISTANCE）はもともと `min(k, 一致行数)` 件を返す。取りこぼすのは `HINT ORDER(DISTANCE, ...)`（SCALAR 事後フィルタ）の場合だけ。反復の対象はこの経路（HNSW を使える `Ranking::Distance` かつ WHERE あり）に限る |
+| ハイブリッド | Issue 本文は `hnsw_hybrid.rs` への伝播を挙げるが、SQL-73 (4) は「ハイブリッドの結果を変えない」と定める。SSOT に従い、ハイブリッドにはセッション値を渡さず（`core.rs` が既定値へ置き換える。`ef_search` と同じ扱い）、`hnsw_hybrid.rs` の挙動は変えない |
+| 厳密走査 | 厳密走査（HNSW 不適格・opt-in なし・opclass 不一致・`DESC`・`LIMIT` 省略・precision）の DISTANCE 先行は設定の対象外で、件数不足のまま |
+| `off` | 反復せず、HNSW を使える経路の DISTANCE 段の取得件数を実効 `ef_search` で打ち切る（経路内部の縮退によらず件数を揃える。#2030 で #2031 側に残した「k > ef の打ち切り」の担当） |
+| `relaxed_order` | 受理するが `strict_order` と同じ動作（出力は常に距離順。「順序の小さな入れ替わりを許す」契約の範囲内） |
+| 走査数の定義 | 反復の各回で DISTANCE 段へ要求した候補数。上限は `min(max_scan_tuples, SQL-46 の走査行数上限, MAX_SEARCH_K, 可視行数)`。provider の `k` の契約上限が 10,000 のため、既定 20,000 の実効上限は 10,000 になる |
+| 反復 | 取得件数 `k_round` を倍々（`saturating_mul(2)`）に増やし、毎回 SCALAR 事後フィルタをかける。終了条件は「通過件数 ≥ `OFFSET + LIMIT`」「可視集合を使い切った」「上限到達」。回数は高々 ⌈log2(上限 / 目標件数)⌉ + 1。各回の前に文の期限を確認する。上限到達はエラーにしない |
+| 実装 | `sql::exec` の DISTANCE 段と事後フィルタをクロージャへ切り出し、反復で再利用した（各回は既存の `search_or_fallback` 等＝キャッシュ済み索引を引く） |
+| `SET LOCAL` | `hnsw.ef_search` と同じく `0A000`。spec は受理側のため、3 設定をまとめて対応する別 Issue が必要 |
+| 事後フィルタの評価エラー | 反復で評価する行が増えるため、以前は評価されなかった行の式エラー（ゼロ除算等）が表に出うる。PG と同じ動作 |
+| テナント境界 | 反復は RLS 適用後のアリーナ・`slot_ids` の中だけで行い、各回の結果を既存の可視 ID 検証と安全網に通す。応答に走査数・回数は出さない（統計は集計値でテナント・行 ID を含まない）。tenant-b の行数（0 / 1,000）を変えても tenant-a の結果が変わらないことをテストで固定 |
+
+### 計測（`tests/sql_t40_up/sql2033_hnsw_iterative_scan_behavior.rs`）
+
+tenant-a 4,000 行・tenant-b 1,000 行・次元 16・HNSW opt-in・`HINT ORDER(DISTANCE, SCALAR, RLS)`。
+
+| 選択率 | k | `strict_order`／`relaxed_order` の返却件数 | `off`（k=10・1%） |
+| ------ | - | ------------------------------------------ | ------------------ |
+| 1%・5%・10%・50% | 10・100 | 全クエリで `min(k, 一致行数)`（充足率 1.000） | 件数不足（k=10 に届かないクエリがある） |
+
+`max_scan_tuples = 20` では 0.3% の述語で部分結果を返し（エラーなし）、`iterative_scan_cap_hits` が増える。
+
+### 対象外
+
+`SET LOCAL hnsw.*`、`EXPLAIN ANALYZE` での反復回数・上限到達の表示（SQL-76）、`relaxed_order` 固有の最適化、`RESET ALL`／`DISCARD ALL`、NoSQL（HTTP）表層からの設定（既定値で動く）、選択率しきい値による厳密走査への自動切替の EXPLAIN での動的表示。

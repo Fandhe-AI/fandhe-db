@@ -213,7 +213,8 @@ fn l2_only_declaration_falls_back_to_exact_scan_and_recovers_with_cosine() {
         "ann_plan: plain_scan_opclass_mismatch"
     );
     assert!(
-        line(&lines, "hnsw_params: ").ends_with("metric=l2"),
+        line(&lines, "hnsw_params: ")
+            .ends_with("metric=l2,iterative_scan=strict_order,max_scan_tuples=20000"),
         "{lines:?}"
     );
     let lines = explain_lines(&core, "tenant-b", &subset_sql);
