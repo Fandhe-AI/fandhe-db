@@ -126,6 +126,8 @@ fn search_select_with_offset_matches_tail_of_larger_limit_over_wire() {
     let (core, _guard) = new_core_scan_docs_for_offset();
     let (mut stream, _users_path) = spawn_with_alice(core);
 
+    // クエリは非ゼロノルムにする。`<=>` はコサイン距離（SQL-33）で、ゼロノルムの
+    // クエリは全行の距離が NaN になる縮退形のため、OFFSET の切り出し検証には使わない。
     let mut fetch = |sql: &str, n: usize| -> Vec<String> {
         send_simple_query(&mut stream, sql);
         let _columns = read_row_description(&mut stream);
@@ -140,11 +142,11 @@ fn search_select_with_offset_matches_tail_of_larger_limit_over_wire() {
     };
 
     let full = fetch(
-        "SELECT id FROM docs ORDER BY embedding <=> '[0,0]' LIMIT 4",
+        "SELECT id FROM docs ORDER BY embedding <=> '[1,0]' LIMIT 4",
         4,
     );
     let paged = fetch(
-        "SELECT id FROM docs ORDER BY embedding <=> '[0,0]' LIMIT 2 OFFSET 2",
+        "SELECT id FROM docs ORDER BY embedding <=> '[1,0]' LIMIT 2 OFFSET 2",
         2,
     );
     assert_eq!(paged, full[2..].to_vec());

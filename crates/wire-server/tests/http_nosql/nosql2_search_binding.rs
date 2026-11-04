@@ -6,7 +6,7 @@
 //! `search.rs` 内 `mod tests`（単体）は各分岐を個別に検証するが、本ファイルは
 //! wire-server クレート外から見える公開関数・型のみを経由し、さらに SQL 表層
 //! （`sql::allowlist::validate_sql` → `sql::parser::bind`）が同じクエリ意味
-//! （`vector`／`ORDER BY <=>`、`filter`／`WHERE`、`columns`／`SELECT` リスト、
+//! （`vector`／`ORDER BY <=>`＝コサイン距離 `1 - cos` の昇順〔SQL-33〕、`filter`／`WHERE`、`columns`／`SELECT` リスト、
 //! `mode`／`USING MODE`、`hybrid`／`ORDER BY HYBRID(...)`）から得る
 //! `BoundStatement` と**完全一致**することを固定する（NoSQL 表層への
 //! `search` 写像が SQL 表層と第 2 の実行器を作らずに委譲している契約の検証）。
@@ -14,6 +14,7 @@
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::json::parse_json;
 use engine::sql::allowlist::{validate_sql, SqlSurfaceError, Statement, TableLookup};
+use engine::sql::lexer::DistanceKind;
 use engine::sql::mode::ModeSource;
 use engine::sql::parser::{bind, BoundStatement};
 use engine::sql::udf_call::UdfRegistry;
@@ -81,6 +82,22 @@ fn c1_vector_only_matches_sql_order_by_distance() {
     let sql =
         sql_side_bound("SELECT * FROM docs ORDER BY embedding <=> '[0.1,0.2,0.3,0.4]' LIMIT 10");
     assert_eq!(nosql, sql);
+    // `vector` 検索の距離は SQL `<=>` と同じコサイン距離（`1 - cos`）の昇順（SQL-33・NOSQL-2）。
+    assert_eq!(nosql.distance_kind(), DistanceKind::Cosine);
+    assert!(!nosql.distance_descending());
+}
+
+/// NoSQL `vector` 検索の束縛結果は SQL `<#>`（負の内積）の束縛結果とは一致しない。
+/// 「NoSQL search が内積のまま」という退行を束縛レベルで検出する（Issue #1993）。
+#[test]
+fn vector_search_does_not_match_sql_inner_product_binding() {
+    let nosql = expect_vector(nosql_side_bound(
+        r#"{"op":"search","table":"docs","vector":[0.1,0.2,0.3,0.4],"limit":10}"#,
+    ));
+    let sql =
+        sql_side_bound("SELECT * FROM docs ORDER BY embedding <#> '[0.1,0.2,0.3,0.4]' LIMIT 10");
+    assert_ne!(nosql.distance_kind(), sql.distance_kind());
+    assert_ne!(nosql, sql);
 }
 
 #[test]
