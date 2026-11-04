@@ -301,7 +301,15 @@ impl SparseVector {
                 out.push(',');
             }
             // 位置は 0 始まりから 1 始まりへ（u64 で加算し overflow を避ける）。
-            let _ = write!(out, "{}:{}", u64::from(*idx) + 1, val);
+            let pos = u64::from(*idx) + 1;
+            // 極小・極大の有限値は Display だと数十桁へ展開され入力上限を超えうるため、
+            // 往復可能な指数表記へ切り替える（f32 の `LowerExp` は最短往復表現）。
+            let mag = val.abs();
+            if mag != 0.0 && !(1e-4..1e16).contains(&mag) {
+                let _ = write!(out, "{pos}:{val:e}");
+            } else {
+                let _ = write!(out, "{pos}:{val}");
+            }
         }
         let _ = write!(out, "}}/{}", self.dim);
         out
@@ -366,6 +374,30 @@ mod tests {
         SparseVector::parse_text(literal, dim, D)
             .expect_err(literal)
             .kind
+    }
+
+    /// 極小値を上限いっぱい並べても出力が入力上限内に収まり、往復で一致する。
+    #[test]
+    fn format_text_tiny_values_stay_within_literal_limit() {
+        let dim = 16_000u32;
+        let mut lit = String::from("{");
+        for i in 1..=dim {
+            if i > 1 {
+                lit.push(',');
+            }
+            lit.push_str(&format!("{i}:1e-40"));
+        }
+        lit.push_str("}/16000");
+        let v = SparseVector::parse_text(&lit, dim, D).unwrap();
+        let out = v.format_text();
+        assert!(out.len() <= MAX_SPARSEVEC_LITERAL_BYTES);
+        let again = SparseVector::parse_text(&out, dim, D).unwrap();
+        assert_eq!(v, again);
+        let big = SparseVector::parse_text("{1:3e38}/2", 2, D).unwrap();
+        assert_eq!(
+            SparseVector::parse_text(&big.format_text(), 2, D).unwrap(),
+            big
+        );
     }
 
     /// TABLE-47 (1): 入力順が違っても昇順で保存され、テキストが往復で一致する。
