@@ -612,7 +612,10 @@ pub static SORT_ITEM_SCHEMA: ObjectSchema = ObjectSchema {
 /// 検査するため両方同時に指定した入力も通過し得る）。`sort`（スカラー列
 /// `ORDER BY` 相当。NOSQL-15・SQL-25 (a)・Issue #946）は本スキーマに宣言
 /// しないため未知キー `42601` で拒否される——ベクトル順位付け（距離・
-/// `hybrid`）との相互排他をスキーマの一般則だけで成立させる判断。
+/// `hybrid`）との相互排他をスキーマの一般則だけで成立させる判断。`metric`
+/// （距離種別。Issue #2243・NOSQL-2・SQL-33 (7)）は形（文字列）のみ検査し、語彙検査
+/// （`"cosine"`｜`"l2"`｜`"ip"`｜`"l1"`）と `plan`／`hybrid` との併用拒否は
+/// [`super::search`] が担う。
 pub static SEARCH_SCHEMA: ObjectSchema = ObjectSchema {
     name: "search",
     fields: &[
@@ -674,6 +677,12 @@ pub static SEARCH_SCHEMA: ObjectSchema = ObjectSchema {
             key: "explain",
             presence: Presence::Optional,
             ty: FieldType::Bool,
+            nullable: false,
+        },
+        FieldSpec {
+            key: "metric",
+            presence: Presence::Optional,
+            ty: FieldType::String,
             nullable: false,
         },
     ],
@@ -1475,7 +1484,7 @@ mod tests {
             r#"{"op":"search","table":"docs","limit":10,"vector":[0.1,0.2],
                "plan":"find x","columns":["id","body"],
                "filter":[{"column":"lang","op":"eq","value":"ja"}],
-               "hybrid":{"text":"x"},"mode":"precision","explain":true}"#,
+               "hybrid":{"text":"x"},"mode":"precision","explain":true,"metric":"ip"}"#,
         );
         assert!(SEARCH_SCHEMA.validate(&v).is_ok());
     }
@@ -1928,6 +1937,10 @@ mod tests {
                 r#"{"op":"search","table":"docs","limit":1,"vector":["a"]}"#,
                 "vector",
             ),
+            (
+                r#"{"op":"search","table":"docs","limit":1,"metric":1}"#,
+                "metric",
+            ),
         ];
         for (json, key) in cases {
             let v = obj(json);
@@ -1950,6 +1963,17 @@ mod tests {
         assert_eq!(
             SEARCH_SCHEMA.validate(&v2).unwrap_err(),
             SchemaError::TypeMismatch { key: "op" }
+        );
+        let v3 = obj(r#"{"op":"search","table":"docs","limit":1,"metric":null}"#);
+        assert_eq!(
+            SEARCH_SCHEMA.validate(&v3).unwrap_err(),
+            SchemaError::TypeMismatch { key: "metric" }
+        );
+        // `metric` は search 専用。scan などでは未知キー。
+        let v4 = obj(r#"{"op":"scan","table":"docs","limit":1,"metric":"ip"}"#);
+        assert_eq!(
+            SCAN_SCHEMA.validate(&v4).unwrap_err(),
+            SchemaError::UnknownKey
         );
     }
 

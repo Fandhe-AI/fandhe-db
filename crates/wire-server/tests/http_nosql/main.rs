@@ -39,6 +39,7 @@ mod nosql1_endpoint_routing;
 mod nosql1_op_vocabulary;
 mod nosql2_search;
 mod nosql2_search_binding;
+mod nosql2_search_metric;
 mod nosql3_scan_mapping;
 mod nosql3_scan_wire_parity;
 mod nosql4_5_aggregate_wire_parity;

@@ -14,11 +14,13 @@
 //! `mode` 解決は `engine::sql::parser`／`engine::sql::mode` の既存公開関数へ
 //! 委譲し、束縛規則を wire-server 側に複製しない。
 //!
-//! `vector` 検索の距離意味: SQL `ORDER BY <列> <=> q` と同じコサイン距離
-//! （`1 - cos`）の昇順・同点 id 昇順で、ゼロノルム行は NaN として末尾に並ぶ
-//! （SQL-33・NOSQL-2）。`BoundStatement::new` の既定（`DistanceKind::Cosine`・
-//! 昇順）をそのまま使うため本モジュールに距離分岐は無い。距離種別を選ぶ
-//! `metric` キーは未提供（Issue #2243 の担当）。
+//! `vector` 検索の距離意味: `metric`（Issue #2243・NOSQL-2・SQL-33 (7)）は
+//! `"cosine"`｜`"l2"`｜`"ip"`｜`"l1"` を SQL の `<=>`／`<->`／`<#>`／`<+>` と同じ距離
+//! （昇順・同点 id 昇順。ゼロノルム行の NaN は末尾）へ写す。省略時は対象表の HNSW 宣言の
+//! opclass に従い（宣言なし・opt-in なしは cosine。解決は engine の
+//! `IndexMetricDefault`）、索引の opclass と合わないときの厳密全走査への縮退は engine の
+//! ゲートが SQL と同じ規則で行う。L2／L1 の実行は SQL 表層と同じ入口の `0A000` ゲートを通る
+//! （現時点で SQL と同じく未対応）。`metric` は `plan`・`hybrid` と併用できない（`42601`）。
 //!
 //! `vector`／`plan` は排他（SQL の `ORDER BY`／`USING PLAN` が構文上
 //! 相互排他なのと対応）。`plan` 指定は LLM 展開（`EngineCore` の private
@@ -49,11 +51,12 @@
 use std::time::SystemTime;
 
 use engine::catalog::TableSchema;
-use engine::core::{EngineCore, PlanSearchBinding};
+use engine::core::{EngineCore, IndexMetricDefault, PlanSearchBinding};
 use engine::declarative_filter::MetadataFilter;
 use engine::error_format::{ClassifiedError, ErrorClass};
 use engine::json::JsonValue;
 use engine::sql::allowlist::{validate_using_plan_question, SqlSurfaceError};
+use engine::sql::lexer::DistanceKind;
 use engine::sql::mode::{self, SearchMode};
 use engine::sql::parser::{
     bind_body_text_column, bind_column_projection, bind_vector_values, require_vector_column,
@@ -162,6 +165,13 @@ pub enum SearchError {
     /// `ORDER BY` と相互排他であり、`hybrid` は `ORDER BY HYBRID(...)` 形の
     /// 一部のため両立しない。`42601`）。
     PlanWithHybrid,
+    /// `metric` の語彙が `"cosine"`｜`"l2"`｜`"ip"`｜`"l1"` の完全一致でない（`22023`。Issue #2243）。
+    /// 文言は固定で、入力値を埋め込まない。
+    InvalidMetric,
+    /// `metric` と `plan` の併用（`USING PLAN` は距離種別を持たない。`42601`。Issue #2243）。
+    MetricWithPlan,
+    /// `metric` と `hybrid` の併用（SQL に等価形が無い。`42601`。Issue #2243）。
+    MetricWithHybrid,
     /// `columns: []`（空配列）。SQL 表層に等価形（空の SELECT リスト）が
     /// 存在しないため fail-closed に拒否する（`42601`）。
     EmptyColumns,
@@ -217,9 +227,12 @@ impl ClassifiedError for SearchError {
     fn error_class(&self) -> ErrorClass {
         match self {
             SearchError::Shape(err) => err.error_class(),
+            SearchError::InvalidMetric => ErrorClass::InvalidParameterValue,
             SearchError::VectorAndPlanBothPresent
             | SearchError::VectorAndPlanBothMissing
             | SearchError::PlanWithHybrid
+            | SearchError::MetricWithPlan
+            | SearchError::MetricWithHybrid
             | SearchError::EmptyColumns
             | SearchError::InvalidIdentifier
             | SearchError::ExplainRequiresPlan => ErrorClass::UnsupportedSqlSyntax,
@@ -241,6 +254,13 @@ impl ClassifiedError for SearchError {
             SearchError::PlanWithHybrid => {
                 "search request must not combine \"plan\" with \"hybrid\"".to_string()
             }
+            SearchError::InvalidMetric => INVALID_METRIC_MESSAGE.to_string(),
+            SearchError::MetricWithPlan => {
+                "search request must not combine \"metric\" with \"plan\"".to_string()
+            }
+            SearchError::MetricWithHybrid => {
+                "search request must not combine \"metric\" with \"hybrid\"".to_string()
+            }
             SearchError::EmptyColumns => {
                 "search request \"columns\" must not be an empty array".to_string()
             }
@@ -252,6 +272,22 @@ impl ClassifiedError for SearchError {
             SearchError::Filter(err) => err.client_message(),
             SearchError::Bind(err) => err.client_message(),
         }
+    }
+}
+
+/// `metric` の語彙違反の固定文言（入力値を埋め込まない。NUL・巨大文字列がエラー応答本文へ
+/// 混入して `error_response::encode` が `XX000` へ縮退する経路を作らない）。
+const INVALID_METRIC_MESSAGE: &str =
+    "search request \"metric\" must be one of \"cosine\", \"l2\", \"ip\", \"l1\"";
+
+/// `metric` の語彙（小文字の完全一致 4 値）を距離種別へ写す（Issue #2243）。
+fn parse_metric(literal: &str) -> Result<DistanceKind, SearchError> {
+    match literal {
+        "cosine" => Ok(DistanceKind::Cosine),
+        "l2" => Ok(DistanceKind::L2),
+        "ip" => Ok(DistanceKind::NegativeInnerProduct),
+        "l1" => Ok(DistanceKind::L1),
+        _ => Err(SearchError::InvalidMetric),
     }
 }
 
@@ -348,16 +384,21 @@ pub fn bind_search(
         schema,
         udfs,
         &engine::result_limits::ResultLimits::default(),
+        &|| Ok(DistanceKind::Cosine),
     )
 }
 
 /// [`bind_search`] の `limit` 範囲設定付き版（Issue #1555・SQL-34）。`limits` は
 /// `EngineCore::result_limits()`（起動時 CLI `--max-result-rows`）を渡す。
+/// `index_default` は `metric` 省略時の距離種別の解決器（Issue #2243。engine の
+/// `IndexMetricDefault::distance_kind`）で、`vector` かつ非 `hybrid` で `metric` が
+/// 省略されたときだけ呼ぶ（明示指定の要求はカタログ読み取りの影響を受けない）。
 pub fn bind_search_with_limits(
     validated: &Validated<'_>,
     schema: &TableSchema,
     udfs: &engine::sql::udf_call::UdfRegistry,
     limits: &engine::result_limits::ResultLimits,
+    index_default: &dyn Fn() -> Result<DistanceKind, SqlSurfaceError>,
 ) -> Result<BoundSearch, SearchError> {
     let table = validated.required_str("table")?;
     ident::check_identifier(table)?;
@@ -380,6 +421,16 @@ pub fn bind_search_with_limits(
     };
     if plan.is_some() && hybrid.is_some() {
         return Err(SearchError::PlanWithHybrid);
+    }
+    // `metric` の併用拒否は値の検査より前（構造の違反を先に確定させる。Issue #2243）。
+    let metric = validated.optional_str("metric")?;
+    if metric.is_some() {
+        if plan.is_some() {
+            return Err(SearchError::MetricWithPlan);
+        }
+        if hybrid.is_some() {
+            return Err(SearchError::MetricWithHybrid);
+        }
     }
 
     let columns = match validated.optional_array("columns")? {
@@ -408,6 +459,8 @@ pub fn bind_search_with_limits(
         None => None,
     };
 
+    let explicit_metric = metric.map(parse_metric).transpose()?;
+
     if let VectorOrPlan::Vector(vector_items) = vector_or_plan {
         let values = vector_as_f32(vector_items)?;
         let query = bind_vector_values(&values, schema)?;
@@ -434,8 +487,15 @@ pub fn bind_search_with_limits(
             None => Ranking::Distance { query },
         };
         let resolved_mode = mode::resolve_mode(query_mode, None);
+        // 距離種別は `Distance` 順位付けのときだけ設定する。`Hybrid` は Cosine のまま
+        // （`metric` 併用は上で拒否済み。索引による解決もしない）。
+        let distance_kind = match (&ranking, explicit_metric) {
+            (Ranking::Distance { .. }, Some(kind)) => Some(kind),
+            (Ranking::Distance { .. }, None) => Some(index_default()?),
+            _ => None,
+        };
         let (metadata_filters, expr_filters, or_filters) = filters.into_parts();
-        let bound = BoundStatement::new(
+        let mut bound = BoundStatement::new(
             table.to_string(),
             projection,
             metadata_filters,
@@ -446,6 +506,9 @@ pub fn bind_search_with_limits(
         )
         .with_mode(resolved_mode)
         .with_where_filters(expr_filters, or_filters);
+        if let Some(kind) = distance_kind {
+            bound = bound.with_distance_kind(kind);
+        }
         return Ok(BoundSearch::Vector(bound));
     }
 
@@ -500,6 +563,10 @@ fn to_sql_surface_error(err: SearchError) -> SqlSurfaceError {
     match err {
         SearchError::Bind(inner) => inner,
         SearchError::Filter(filter_err) => filter_err.into_sql_surface_error(),
+        // `22023` を既定アームの `42601` へ化けさせない（Issue #2243）。
+        SearchError::InvalidMetric => SqlSurfaceError::InvalidParameterValue {
+            detail: INVALID_METRIC_MESSAGE,
+        },
         other => SqlSurfaceError::UnsupportedSyntax {
             detail: other.client_message(),
         },
@@ -520,8 +587,13 @@ pub(crate) fn bind_vector_statement(
     schema: &TableSchema,
     udfs: &engine::sql::udf_call::UdfRegistry,
     limits: &engine::result_limits::ResultLimits,
+    index_metric: &IndexMetricDefault<'_>,
 ) -> Result<BoundStatement, SqlSurfaceError> {
-    match bind_search_with_limits(validated, schema, udfs, limits).map_err(to_sql_surface_error)? {
+    match bind_search_with_limits(validated, schema, udfs, limits, &|| {
+        index_metric.distance_kind()
+    })
+    .map_err(to_sql_surface_error)?
+    {
         BoundSearch::Vector(stmt) => Ok(stmt),
         // `execute`（通常実行）側の対称コメント参照: `explain::execute` は
         // `vector` 指定であることを呼び出し前に確定させているため、この
@@ -639,7 +711,10 @@ pub fn execute(
             |schema, udfs| match {
                 // 採番方式の表は拒否する（実行と同一スナップショットのスキーマで判定。Issue #2199）。
                 super::gate::reject_allocated_schema(schema)?;
-                bind_search_with_limits(validated, schema, udfs, &engine.result_limits())
+                // `plan` 指定は距離種別を持たない（`metric` 併用は束縛段で `42601`）。
+                bind_search_with_limits(validated, schema, udfs, &engine.result_limits(), &|| {
+                    Ok(DistanceKind::Cosine)
+                })
             }
             .map_err(to_sql_surface_error)?
             {
@@ -663,11 +738,21 @@ pub fn execute(
         )?;
         Ok(result)
     } else {
-        let result =
-            engine.execute_bound_search_in_session(ctx, &session, table, |schema, udfs| {
+        let result = engine.execute_bound_search_with_index_metric_in_session(
+            ctx,
+            &session,
+            table,
+            |schema, udfs, index_metric| {
                 super::gate::reject_allocated_schema(schema)?;
-                bind_vector_statement(validated, schema, udfs, &engine.result_limits())
-            })?;
+                bind_vector_statement(
+                    validated,
+                    schema,
+                    udfs,
+                    &engine.result_limits(),
+                    index_metric,
+                )
+            },
+        )?;
         Ok(result)
     }
 }
@@ -1146,5 +1231,100 @@ mod tests {
             panic!("expected BoundSearch::Plan");
         };
         assert!(plan.explain());
+    }
+
+    // --- metric（Issue #2243・NOSQL-2・SQL-33 (7)）---------------------------------
+
+    fn bind_with_default(text: &str, default: DistanceKind) -> Result<BoundSearch, SearchError> {
+        let value = validate(text);
+        let validated = SEARCH_SCHEMA.validate(&value).expect("must validate shape");
+        bind_search_with_limits(
+            &validated,
+            &schema(),
+            &udfs(),
+            &engine::result_limits::ResultLimits::default(),
+            &|| Ok(default),
+        )
+    }
+
+    fn metric_request(metric: &str) -> String {
+        format!(
+            r#"{{"op":"search","table":"docs","vector":[0.1,0.2,0.3,0.4],"limit":5,"metric":{metric}}}"#
+        )
+    }
+
+    fn vector_kind(bound: BoundSearch) -> DistanceKind {
+        let BoundSearch::Vector(stmt) = bound else {
+            panic!("expected BoundSearch::Vector");
+        };
+        stmt.distance_kind()
+    }
+
+    #[test]
+    fn metric_vocabulary_maps_to_distance_kinds() {
+        for (literal, want) in [
+            ("cosine", DistanceKind::Cosine),
+            ("l2", DistanceKind::L2),
+            ("ip", DistanceKind::NegativeInnerProduct),
+            ("l1", DistanceKind::L1),
+        ] {
+            // 明示指定は索引既定より優先する。
+            let bound = bind_with_default(&metric_request(&format!("\"{literal}\"")), {
+                DistanceKind::L1
+            })
+            .expect("bind ok");
+            assert_eq!(vector_kind(bound), want, "{literal}");
+        }
+    }
+
+    #[test]
+    fn omitted_metric_uses_index_default() {
+        let text = r#"{"op":"search","table":"docs","vector":[0.1,0.2,0.3,0.4],"limit":5}"#;
+        let bound = bind_with_default(text, DistanceKind::NegativeInnerProduct).expect("bind ok");
+        assert_eq!(vector_kind(bound), DistanceKind::NegativeInnerProduct);
+        // `bind_search`（テスト用の薄い入口）は常に Cosine。
+        let bound = bind(text).expect("bind ok");
+        assert_eq!(vector_kind(bound), DistanceKind::Cosine);
+    }
+
+    #[test]
+    fn hybrid_ignores_index_default_and_rejects_metric() {
+        let hybrid = r#"{"op":"search","table":"docs","vector":[0.1,0.2,0.3,0.4],"limit":5,"hybrid":{"text":"x"}}"#;
+        let bound = bind_with_default(hybrid, DistanceKind::L2).expect("bind ok");
+        assert_eq!(vector_kind(bound), DistanceKind::Cosine);
+
+        for metric in [r#""cosine""#, r#""ip""#, r#""bogus""#] {
+            let text = format!(
+                r#"{{"op":"search","table":"docs","vector":[0.1,0.2,0.3,0.4],"limit":5,"hybrid":{{"text":"x"}},"metric":{metric}}}"#
+            );
+            let err = bind(&text).expect_err("must reject");
+            assert_eq!(err.error_class().wire_code(), "42601", "{metric}");
+        }
+    }
+
+    #[test]
+    fn metric_with_plan_is_rejected_regardless_of_value() {
+        for metric in [r#""cosine""#, r#""ip""#, r#""bogus""#] {
+            let text = format!(
+                r#"{{"op":"search","table":"docs","plan":"x","limit":5,"metric":{metric}}}"#
+            );
+            let err = bind(&text).expect_err("must reject");
+            assert!(matches!(err, SearchError::MetricWithPlan), "{metric}");
+            assert_eq!(err.error_class().wire_code(), "42601");
+        }
+    }
+
+    #[test]
+    fn invalid_metric_is_22023_without_echoing_input() {
+        for metric in [r#""COSINE""#, r#""""#, r#""euclid""#, r#""a\u0000b""#] {
+            let err = bind(&metric_request(metric)).expect_err("must reject");
+            assert!(matches!(err, SearchError::InvalidMetric), "{metric}");
+            assert_eq!(err.error_class().wire_code(), "22023");
+            assert_eq!(err.client_message(), INVALID_METRIC_MESSAGE);
+            assert!(!err.client_message().contains("euclid"));
+            // binder closure 境界を通っても 22023 のまま残る。
+            let surface = to_sql_surface_error(err);
+            assert_eq!(surface.wire_code(), "22023");
+        }
     }
 }
