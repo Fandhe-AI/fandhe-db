@@ -106,6 +106,7 @@ use super::allowlist::{
 };
 use super::correlated_exists::{self, CorrelatedCtx};
 use super::correlation;
+use super::cte_explain::SubqueryKind;
 use super::exec::{Cell, ColumnMeta};
 use super::lexer::Token;
 use super::udf_call::{BinOp, Expr, UdfRegistry};
@@ -1078,25 +1079,33 @@ fn static_validate_subquery_predicates(
                 WherePredicate::Exists {
                     inner_tokens,
                     depth,
-                } => static_validate_exists(
-                    inner_tokens,
-                    *depth,
-                    chain,
-                    read_txn,
-                    lookup,
-                    udfs,
-                    nesting_limits,
-                    result_limits,
-                )?,
-                other => static_validate_subquery_predicates(
-                    std::slice::from_ref(other),
-                    chain,
-                    read_txn,
-                    lookup,
-                    udfs,
-                    nesting_limits,
-                    result_limits,
-                )?,
+                } => {
+                    explain_sink::set_kind(SubqueryKind::NotExists);
+                    static_validate_exists(
+                        inner_tokens,
+                        *depth,
+                        chain,
+                        read_txn,
+                        lookup,
+                        udfs,
+                        nesting_limits,
+                        result_limits,
+                    )?
+                }
+                other => {
+                    if matches!(other, WherePredicate::InSubquery { .. }) {
+                        explain_sink::negate_next();
+                    }
+                    static_validate_subquery_predicates(
+                        std::slice::from_ref(other),
+                        chain,
+                        read_txn,
+                        lookup,
+                        udfs,
+                        nesting_limits,
+                        result_limits,
+                    )?
+                }
             },
             WherePredicate::InSubquery {
                 column,
@@ -1105,6 +1114,7 @@ fn static_validate_subquery_predicates(
             } => {
                 // 相関 `IN`（Issue #1844）は実行経路と同じ準備（静的検査・分解・残余の束縛）と
                 // 内側だけの連言の静的検証・束縛まで行う（実行はしない）。
+                explain_sink::set_in_kind();
                 if static_validate_correlated_in(
                     column,
                     inner_tokens,
@@ -1116,6 +1126,7 @@ fn static_validate_subquery_predicates(
                     nesting_limits,
                     result_limits,
                 )? {
+                    explain_sink::mark_correlated();
                     continue;
                 }
                 // [`resolve_in_subquery`] と同じ順序（内側 → 投影列数 → 対象列 → 値族）で検証する。
@@ -1144,6 +1155,7 @@ fn static_validate_subquery_predicates(
                 inner_tokens,
                 depth,
             } => {
+                explain_sink::set_kind(SubqueryKind::Exists);
                 static_validate_exists(
                     inner_tokens,
                     *depth,
@@ -1163,6 +1175,7 @@ fn static_validate_subquery_predicates(
             } => {
                 // 集計形の相関スカラー（Issue #1846）は実行経路と同じ準備・静的検証・対象列と値族の
                 // 検査まで行う（実行はしない）。
+                explain_sink::set_kind(SubqueryKind::Scalar);
                 if static_validate_correlated_scalar(
                     column,
                     inner_tokens,
@@ -1174,6 +1187,7 @@ fn static_validate_subquery_predicates(
                     nesting_limits,
                     result_limits,
                 )? {
+                    explain_sink::mark_correlated();
                     continue;
                 }
                 // [`resolve_scalar_compare`] と同じ順序（内側 → 投影列数 → 対象列 → 値族）。
@@ -1204,6 +1218,10 @@ fn static_validate_subquery_predicates(
                 depth,
             } => {
                 // [`resolve_quantified_compare`] と同じ順序（内側 → 投影列数 → 対象列 → 値族）。
+                explain_sink::set_kind(match quantifier {
+                    crate::sql::udf_call::Quantifier::Any => SubqueryKind::Any,
+                    crate::sql::udf_call::Quantifier::All => SubqueryKind::All,
+                });
                 let meta = static_validate_inner_query(
                     inner_tokens,
                     *depth,
@@ -1252,6 +1270,36 @@ fn static_validate_inner_query(
     nesting_limits: crate::nesting_limits::NestingLimits,
     result_limits: crate::result_limits::ResultLimits,
 ) -> Result<Vec<ColumnMeta>, SqlSurfaceError> {
+    // EXPLAIN の収集中だけ、直前の述語が宣言した種別でフレームを開き、内側の WHERE にある入れ子の
+    // 部分クエリをそのフレームへ集める（収集していないときは何もしない）。
+    explain_sink::enter();
+    let (meta, inner) = static_validate_inner_query_impl(
+        inner_tokens,
+        depth,
+        intent,
+        outer_scopes,
+        read_txn,
+        lookup,
+        udfs,
+        nesting_limits,
+        result_limits,
+    )?;
+    explain_sink::leave(inner);
+    Ok(meta)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn static_validate_inner_query_impl(
+    inner_tokens: &[Token],
+    depth: usize,
+    intent: InnerScanIntent,
+    outer_scopes: &[&TableSchema],
+    read_txn: &impl crate::storage::read_source::ReadSource,
+    lookup: &impl TableLookup,
+    udfs: &UdfRegistry,
+    nesting_limits: crate::nesting_limits::NestingLimits,
+    result_limits: crate::result_limits::ResultLimits,
+) -> Result<(Vec<ColumnMeta>, Option<explain_sink::ExplainInner>), SqlSurfaceError> {
     let stmt = super::allowlist::validate_sql_tokens_with_subquery_ctx_limits(
         inner_tokens,
         lookup,
@@ -1306,7 +1354,12 @@ fn static_validate_inner_query(
                 &[],
                 &scalar_bind_limits,
             )?;
-            super::describe::scan_columns(&bound, &inner_schema)
+            let meta = super::describe::scan_columns(&bound, &inner_schema)?;
+            let inner = explain_sink::is_active().then(|| explain_sink::ExplainInner::Scan {
+                schema: inner_schema.clone(),
+                bound: bound.clone(),
+            });
+            Ok((meta, inner))
         }
         (
             Statement::Aggregate(mut validated),
@@ -1327,7 +1380,11 @@ fn static_validate_inner_query(
             )?;
             validated.where_predicates = static_validation_predicates(&validated.where_predicates);
             let bound = super::parser::bind_aggregate(&validated, &inner_schema, udfs)?;
-            super::describe::aggregate_columns(&bound, &inner_schema)
+            let meta = super::describe::aggregate_columns(&bound, &inner_schema)?;
+            let inner = explain_sink::is_active().then(|| explain_sink::ExplainInner::Aggregate {
+                shape: super::set_op::aggregate_shape(&bound),
+            });
+            Ok((meta, inner))
         }
         _ => Err(unsupported_inner_statement()),
     }
@@ -4079,6 +4136,7 @@ fn static_validate_exists(
         lookup,
         nesting_limits,
     )? {
+        explain_sink::mark_correlated();
         let mut prepared = prepare_correlated_exists(
             validated,
             &inner_schema,
@@ -5313,6 +5371,236 @@ impl CorrelatedScalarValues {
                     .cloned()
                     .unwrap_or(Cell::Null))
             }
+        }
+    }
+}
+
+// ===== EXPLAIN 用の静的収集（Issue #2048・SQL-75 (2) ポインタ） =====
+//
+// `EXPLAIN` は WHERE の部分クエリを実行せず、失敗時の静的検証（[`static_validate_subquery_predicates`]）と
+// 同じ経路で内側を検証して、内側の束縛結果（走査分類の入力）を集める。検証ロジックを二重化しないため、
+// 収集は述語の種別宣言と内側クエリの出入りの 2 点だけを `explain_sink` へ通知する形にし、収集していない
+// 通常経路（実行時エラー後の静的検証）では全通知が何もしない。
+
+/// 部分クエリ述語（`IN`／`EXISTS`／スカラー比較／`ANY`・`ALL`）を含む最上位の述語の一覧を、実行せずに
+/// 静的検証して集める。内側の未知表・未知列・投影列数・値族の不一致などは実行時の同じ文と同じ
+/// `wire_code` で返る（内側が先、外側の束縛が後の判定順も実行経路と同じ）。相関部分クエリは描画する
+/// 段を持たないため `42601` で拒否する（黙って受理しない。fail-closed）。内側は実行しないので
+/// 予算を消費せず、行数に依存する検査（`21000` 等）は対象外。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn explain_subquery_predicates(
+    preds: &[WherePredicate],
+    outer: &TableSchema,
+    read_txn: &impl crate::storage::read_source::ReadSource,
+    lookup: &impl TableLookup,
+    udfs: &UdfRegistry,
+    nesting_limits: crate::nesting_limits::NestingLimits,
+    result_limits: crate::result_limits::ResultLimits,
+) -> Result<Vec<explain_sink::SubqueryExplain>, SqlSurfaceError> {
+    let guard = explain_sink::install();
+    static_validate_subquery_predicates(
+        preds,
+        &[outer],
+        read_txn,
+        lookup,
+        udfs,
+        nesting_limits,
+        result_limits,
+    )?;
+    guard.finish()
+}
+
+/// `EXPLAIN` の外側の束縛・走査分類に渡す述語を作る。部分クエリを含む最上位の述語（`OR`・`NOT` の
+/// 内側に含む場合は述語全体）は、実行時に内側の結果から書き換わる形がデータ依存で静的には決まらないため、
+/// 「WHERE フィルタとして数えられ、PK 点検索・GIN・スカラー索引・可視ビットマップのいずれにも使えない」
+/// 定数偽の述語（`Or([])`。実行時の空集合の `IN`・定数偽の `EXISTS` の書き換え結果と同じ形）へ置き換える。
+/// 外側の分類は部分クエリ述語を索引に使えないフィルタとみなす保守側の静的分類になる。
+/// 部分クエリを含まない述語はそのまま写す。
+pub(crate) fn explain_outer_predicates(preds: &[WherePredicate]) -> Vec<WherePredicate> {
+    preds
+        .iter()
+        .map(|p| {
+            if predicate_contains_subquery(p) {
+                WherePredicate::Or(Vec::new())
+            } else {
+                p.clone()
+            }
+        })
+        .collect()
+}
+
+/// 集計項目の `FILTER (WHERE ...)`・`HAVING` 内の集計呼び出しの `FILTER` に部分クエリを含むか。
+/// `EXPLAIN` は描画する段を持たないため、含む文を `42601` で拒否する判定に使う。
+pub(crate) fn aggregate_has_filter_subquery(v: &ValidatedAggregate) -> bool {
+    use crate::sql::allowlist::AggregateSelectItem;
+    let has = |agg: &crate::sql::allowlist::AggregateItem| {
+        agg.filter.iter().any(predicate_contains_subquery)
+    };
+    v.items.iter().any(|item| match item {
+        AggregateSelectItem::GroupKey { .. } => false,
+        AggregateSelectItem::Aggregate(agg) => has(agg),
+        AggregateSelectItem::Expr { aggregates, .. } => aggregates.iter().any(has),
+    }) || v
+        .group_by
+        .as_ref()
+        .is_some_and(|g| g.having_aggregates.iter().any(has))
+}
+
+/// `EXPLAIN` 用の収集先（スレッドローカル）。静的検証は同期・単一スレッドで完結するため、
+/// 引数を通さずに述語の種別宣言と内側クエリの出入りだけを通知する。
+pub(crate) mod explain_sink {
+    use super::{SqlSurfaceError, SubqueryKind, TableSchema};
+    use crate::sql::parser::BoundScan;
+    use crate::sql::set_op::AggregateShape;
+    use std::cell::RefCell;
+
+    /// 内側クエリの束縛結果（収集直後に `core.rs` が行へ変換して捨てる短命の値なので、variant の
+    /// 大きさの差は許容する）。走査分類の行は `core.rs` が作る（GIN 宣言の読み取りに具体の
+    /// 読み取りトランザクションが要るため）。
+    #[allow(clippy::large_enum_variant)]
+    pub(crate) enum ExplainInner {
+        Scan {
+            schema: TableSchema,
+            bound: BoundScan,
+        },
+        Aggregate {
+            shape: AggregateShape,
+        },
+    }
+
+    /// 部分クエリ 1 件分の収集結果。`children` は内側の WHERE にある入れ子の部分クエリ。
+    pub(crate) struct SubqueryExplain {
+        pub(crate) kind: SubqueryKind,
+        pub(crate) inner: ExplainInner,
+        pub(crate) children: Vec<SubqueryExplain>,
+    }
+
+    struct Frame {
+        kind: Option<SubqueryKind>,
+        items: Vec<SubqueryExplain>,
+    }
+
+    struct State {
+        frames: Vec<Frame>,
+        pending: Option<SubqueryKind>,
+        negate_in: bool,
+        correlated: bool,
+    }
+
+    thread_local! {
+        static SINK: RefCell<Option<State>> = const { RefCell::new(None) };
+    }
+
+    fn with_state<R>(f: impl FnOnce(&mut State) -> R) -> Option<R> {
+        SINK.with(|c| c.borrow_mut().as_mut().map(f))
+    }
+
+    /// 収集中か。
+    pub(crate) fn is_active() -> bool {
+        SINK.with(|c| c.borrow().is_some())
+    }
+
+    /// 次に検証される内側クエリの種別を宣言する。
+    pub(crate) fn set_kind(kind: SubqueryKind) {
+        with_state(|s| s.pending = Some(kind));
+    }
+
+    /// 次の `IN` 述語が `NOT IN` であることを宣言する（`Not` が包む `IN` の検証の直前）。
+    pub(crate) fn negate_next() {
+        with_state(|s| s.negate_in = true);
+    }
+
+    /// `IN`／`NOT IN` の種別を宣言する（`negate_next` の宣言を消費する）。
+    pub(crate) fn set_in_kind() {
+        with_state(|s| {
+            let kind = if std::mem::take(&mut s.negate_in) {
+                SubqueryKind::NotIn
+            } else {
+                SubqueryKind::In
+            };
+            s.pending = Some(kind);
+        });
+    }
+
+    /// 相関部分クエリに到達したことを記録する（収集の終了時に `42601` にする）。
+    pub(crate) fn mark_correlated() {
+        with_state(|s| s.correlated = true);
+    }
+
+    /// 内側クエリの検証開始。宣言済みの種別でフレームを開く。
+    pub(crate) fn enter() {
+        with_state(|s| {
+            let kind = s.pending.take();
+            s.frames.push(Frame {
+                kind,
+                items: Vec::new(),
+            });
+        });
+    }
+
+    /// 内側クエリの検証成功。フレームを閉じ、種別が宣言されていれば親のフレームへ登録する。
+    pub(crate) fn leave(inner: Option<ExplainInner>) {
+        with_state(|s| {
+            let Some(frame) = s.frames.pop() else {
+                return;
+            };
+            if let (Some(kind), Some(inner), Some(parent)) =
+                (frame.kind, inner, s.frames.last_mut())
+            {
+                parent.items.push(SubqueryExplain {
+                    kind,
+                    inner,
+                    children: frame.items,
+                });
+            }
+        });
+    }
+
+    /// 収集の開始から終了までを括る。Drop で必ず収集先を空に戻す（エラー経路・panic 展開でも
+    /// 次の文へ状態を持ち越さない）。
+    pub(crate) struct Guard;
+
+    pub(crate) fn install() -> Guard {
+        SINK.with(|c| {
+            *c.borrow_mut() = Some(State {
+                frames: vec![Frame {
+                    kind: None,
+                    items: Vec::new(),
+                }],
+                pending: None,
+                negate_in: false,
+                correlated: false,
+            });
+        });
+        Guard
+    }
+
+    impl Guard {
+        /// 収集結果を取り出す。相関部分クエリに到達していた場合は `42601`（固定文）。
+        pub(crate) fn finish(self) -> Result<Vec<SubqueryExplain>, SqlSurfaceError> {
+            let state = SINK.with(|c| c.borrow_mut().take());
+            let Some(mut state) = state else {
+                return Err(SqlSurfaceError::Internal {
+                    detail: "EXPLAIN subquery collection state missing".to_string(),
+                });
+            };
+            if state.correlated {
+                return Err(SqlSurfaceError::unsupported(
+                    "EXPLAIN is not supported for correlated subqueries",
+                ));
+            }
+            match (state.frames.pop(), state.frames.is_empty()) {
+                (Some(root), true) => Ok(root.items),
+                _ => Err(SqlSurfaceError::Internal {
+                    detail: "EXPLAIN subquery collection state unbalanced".to_string(),
+                }),
+            }
+        }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            SINK.with(|c| *c.borrow_mut() = None);
         }
     }
 }

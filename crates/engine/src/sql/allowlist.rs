@@ -4336,6 +4336,37 @@ pub enum ExplainTarget {
     /// Issue #2047・SQL-75 (2) ポインタ）。演算子・入れ子・各枝の走査分類を段の木で報告し、
     /// 走査は行わない。構文は非 EXPLAIN と同じ [`parse_set_operation`] で受理する。
     SetOperation(ValidatedSetOperation),
+    /// 非再帰 CTE（`WITH`）または FROM 直後の派生表を、インライン展開で単一表の広域取得・集計へ
+    /// 畳み込んだ形（Issue #2048・SQL-75 (2) ポインタ）。`cte` 段の下に畳み込み後の段を並べて
+    /// 報告し、走査は行わない。具体化経路（`MATERIALIZED`・本文に `ORDER BY`／`LIMIT` を持つ CTE）、
+    /// `WITH RECURSIVE`、JOIN・集合演算の入力になる CTE・派生表は `42601` で拒否する。
+    Cte(ValidatedCteExplain),
+}
+
+/// [`ExplainTarget::Cte`] の入口の種別（Issue #2048）。出力の `cte_source` 行の閉じた語彙に写る。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CteExplainSource {
+    /// `WITH` 句の CTE。
+    With,
+    /// FROM 直後の派生表（合成 CTE）。
+    DerivedTable,
+}
+
+/// [`ExplainTarget::Cte`] の畳み込み後の主クエリ（Issue #2048）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum CteExplainMain {
+    /// 単一表の広域取得（`ORDER BY`・`LIMIT`・`OFFSET`・窓を含む）。
+    Scan(ValidatedScan),
+    /// 単一表の集計。
+    Aggregate(ValidatedAggregate),
+}
+
+/// CTE・派生表の `EXPLAIN` の検証済み対象（Issue #2048）。フィールドは crate 内専用で、
+/// `core.rs` の `Statement::Explain` アームが読む。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedCteExplain {
+    pub(crate) source: CteExplainSource,
+    pub(crate) main: CteExplainMain,
 }
 
 impl ExplainTarget {
@@ -4349,6 +4380,10 @@ impl ExplainTarget {
             ExplainTarget::Scan(v) => v.table_name(),
             ExplainTarget::Join(v) => v.relations.first().map_or("", |r| r.table()),
             ExplainTarget::SetOperation(v) => crate::sql::set_op::leftmost_table(&v.tree),
+            ExplainTarget::Cte(v) => match &v.main {
+                CteExplainMain::Scan(s) => s.table_name(),
+                CteExplainMain::Aggregate(a) => a.table_name(),
+            },
         }
     }
 }
@@ -27769,6 +27804,85 @@ fn validate_with_statement(
     inline.map(WithOutcome::Read)
 }
 
+/// `EXPLAIN WITH ...` の検証（Issue #2048・SQL-75 (2) ポインタ）。`validate_sql_tokens_impl` の
+/// `EXPLAIN` アームだけが呼ぶ。`WITH RECURSIVE` は反復評価の作業表スキーマを実行せずに得る手段が無いため
+/// `42601`。それ以外は非 EXPLAIN と同じ [`validate_with_statement`] を通すので、構文・名前・列の
+/// エラー（`wire_code` と判定順）は EXPLAIN の有無で変わらない。データ変更 CTE は検証後に既存の
+/// 固定 `0A000` で止まる（書き込みは発生しない）。
+fn explain_with_statement(
+    rest: &[Token],
+    lookup: &impl TableLookup,
+    limits: crate::nesting_limits::NestingLimits,
+    cte_evaluation: CteEvaluation,
+) -> Result<Statement, SqlSurfaceError> {
+    if matches!(rest.get(1), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("RECURSIVE")) {
+        return Err(SqlSurfaceError::unsupported(
+            "EXPLAIN is not supported for WITH RECURSIVE",
+        ));
+    }
+    match validate_with_statement(
+        rest,
+        lookup,
+        limits,
+        cte_evaluation,
+        DmWith::RejectAsUnsupported,
+        LedgerMode::default(),
+    )? {
+        WithOutcome::Read(stmt) => explain_cte_target(stmt, CteExplainSource::With),
+        WithOutcome::DataModifying(_) => Err(super::cte::data_modifying_cte_unsupported()),
+    }
+}
+
+/// CTE・派生表の検証結果を `EXPLAIN` の対象にする（Issue #2048）。インライン展開で単一表の広域取得・
+/// 集計に畳み込まれた形だけを受理し、具体化経路（`BufferedView`）・JOIN・集合演算などの入力になる形は
+/// 描画する段を持たないため `42601` で拒否する（fail-closed。`Internal` に落とさない）。
+fn explain_cte_target(
+    stmt: Statement,
+    source: CteExplainSource,
+) -> Result<Statement, SqlSurfaceError> {
+    let main = match stmt {
+        Statement::Scan(v) if v.has_value_subqueries() => {
+            return Err(SqlSurfaceError::unsupported(
+                "EXPLAIN is not supported for queries with value subqueries",
+            ));
+        }
+        Statement::Scan(v)
+            if v.where_predicates
+                .iter()
+                .any(super::subquery::predicate_contains_subquery) =>
+        {
+            return Err(SqlSurfaceError::unsupported(
+                "EXPLAIN is not supported for a CTE or derived table with subqueries",
+            ));
+        }
+        Statement::Scan(v) => CteExplainMain::Scan(v),
+        Statement::Aggregate(v)
+            if v.where_predicates
+                .iter()
+                .any(super::subquery::predicate_contains_subquery)
+                || super::subquery::aggregate_has_filter_subquery(&v) =>
+        {
+            return Err(SqlSurfaceError::unsupported(
+                "EXPLAIN is not supported for a CTE or derived table with subqueries",
+            ));
+        }
+        Statement::Aggregate(v) => CteExplainMain::Aggregate(v),
+        Statement::BufferedView(_) => {
+            return Err(SqlSurfaceError::unsupported(
+                "EXPLAIN is not supported for a CTE that is evaluated once (materialized)",
+            ));
+        }
+        _ => {
+            return Err(SqlSurfaceError::unsupported(
+                "EXPLAIN is not supported for CTEs or derived tables used as join or set operation inputs",
+            ));
+        }
+    };
+    Ok(Statement::Explain(ExplainTarget::Cte(
+        ValidatedCteExplain { source, main },
+    )))
+}
+
 /// セッションの最上位の文の入口（Issue #1876・SQL-63）。先頭が `WITH`（`RECURSIVE` でない）で CTE 定義に
 /// データ変更 CTE を含む場合だけ、実行計画 [`ValidatedDataModifyingCte`] を返す。それ以外は
 /// [`validate_session_sql_tokens`] と同じ結果（[`SessionWith::Statement`]）。`EngineCore` の
@@ -28282,6 +28396,22 @@ fn validate_sql_tokens_impl(
         // `get` でスライスする（`.claude/rules/coding-rust.md`）。
         _ if is_explain_statement => {
             let rest = tokens.get(1..).unwrap_or(&[]);
+            // Issue #2048（SQL-75 (2) ポインタ）: 非再帰 CTE は非 EXPLAIN と同じ検証本体
+            // （`validate_with_statement`）へ渡し、インライン展開で単一表の広域取得・集計へ畳み込まれた
+            // 形だけ `ExplainTarget::Cte` にする。第 2 の WITH パーサーを持たない。
+            if matches!(rest.first(), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("WITH")) {
+                return explain_with_statement(rest, lookup, limits, cte_evaluation);
+            }
+            // FROM 直後の派生表（合成 CTE）。非 EXPLAIN の入口と同じく、括弧の深さを追わない
+            // 他の検出器（JOIN・集合演算）より前に判定する。JOIN・集合演算の入力になる派生表は
+            // `explain_cte_target` が `42601` にする。
+            if cte_evaluation == CteEvaluation::AllowMaterialize
+                && matches!(rest.first(), Some(Token::Keyword(Keyword::Select)))
+            {
+                if let Some(stmt) = super::derived_table::gate(rest, lookup, limits)? {
+                    return explain_cte_target(stmt, CteExplainSource::DerivedTable);
+                }
+            }
             // Issue #2047（SQL-75 (2) ポインタ）: 集合演算は非 EXPLAIN 経路と同じ判定順（JOIN の後）
             // と同じパーサー（`parse_set_operation`）で `ExplainTarget::SetOperation` にする。第 2 の
             // パーサーを持たないので、派生表・窓・順位付きの枝・`INTERSECT ALL` 等の未対応形は
@@ -28318,12 +28448,27 @@ fn validate_sql_tokens_impl(
                 let validated = parse_join_statement(rest, lookup)?;
                 return Ok(Statement::Explain(ExplainTarget::Join(validated)));
             }
-            // Issue #927・SQL-29 (a)・TASK-213: `EXPLAIN` はサブクエリを許可する
-            // 文脈に含めない（`docs/design/sql-subquery.md` 参照。`subquery_ctx`
-            // に `None` を渡し、`IN (SELECT ...)`／`EXISTS (SELECT ...)` は
-            // 通常どおり `Parser::require_subquery_depth` が `42601` で拒否する）。
-            let target = match validate_select_statement(rest, lookup, None, limits)? {
+            // Issue #2048（SQL-75 (2) ポインタ）: WHERE の部分クエリ（`IN`／`EXISTS`／スカラー／
+            // `ANY`・`ALL`）は非 EXPLAIN と同じ `subquery_ctx` で構文受理する。内側の静的検証と
+            // 段の組み立ては `core.rs` の `Statement::Explain` アームが行い、内側は実行しない。
+            // 値としての部分クエリ・FILTER／HAVING の部分クエリ・ランキング検索の部分クエリは
+            // 描画する段を持たないため下で明示的に `42601` にする（fail-closed）。
+            let target = match validate_select_statement(rest, lookup, subquery_ctx, limits)? {
+                Statement::Select(v)
+                    if v.where_predicates()
+                        .iter()
+                        .any(super::subquery::predicate_contains_subquery) =>
+                {
+                    return Err(SqlSurfaceError::unsupported(
+                        "EXPLAIN is not supported for ranked searches with subqueries",
+                    ));
+                }
                 Statement::Select(v) => ExplainTarget::Search(v),
+                Statement::Aggregate(v) if super::subquery::aggregate_has_filter_subquery(&v) => {
+                    return Err(SqlSurfaceError::unsupported(
+                        "EXPLAIN is not supported for aggregates with subqueries in FILTER or HAVING",
+                    ));
+                }
                 Statement::Aggregate(v) => ExplainTarget::Aggregate(v),
                 // Issue #1896・SQL-64 (6): ウィンドウ関数付きの `Scan` は `EXPLAIN` の
                 // 対象にする（窓の評価段は `sql::explain` が静的な行として追記する）。

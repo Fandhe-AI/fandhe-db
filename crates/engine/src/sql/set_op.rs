@@ -735,14 +735,7 @@ fn validate_tree_types(
                         sort_keys: grouped.map_or(0, |g| g.order_by.len()),
                         has_limit: grouped.is_some_and(|g| g.limit.is_some()),
                         has_offset: grouped.is_some_and(|g| g.offset != 0),
-                        aggregate: Some(AggregateShape {
-                            group_keys: grouped.map_or(0, |g| g.keys.len()),
-                            aggregates: bound.items.len(),
-                            having: bound.ungrouped_having.is_some()
-                                || grouped.is_some_and(|g| {
-                                    !g.having.is_empty() || !g.having_exprs.is_empty()
-                                }),
-                        }),
+                        aggregate: Some(aggregate_shape(&bound)),
                     },
                     scan: None,
                 });
@@ -829,6 +822,18 @@ pub(crate) struct AggregateShape {
     pub(crate) group_keys: usize,
     pub(crate) aggregates: usize,
     pub(crate) having: bool,
+}
+
+/// 束縛済み集計から集計段の情報（キー数・集計数・HAVING の有無）を取る。集合演算の集計枝と
+/// CTE・部分クエリの `EXPLAIN`（Issue #2048。`sql::cte_explain`）が共有する。
+pub(crate) fn aggregate_shape(bound: &crate::sql::parser::BoundAggregate) -> AggregateShape {
+    let grouped = bound.group_by.as_ref();
+    AggregateShape {
+        group_keys: grouped.map_or(0, |g| g.keys.len()),
+        aggregates: bound.items.len(),
+        having: bound.ungrouped_having.is_some()
+            || grouped.is_some_and(|g| !g.having.is_empty() || !g.having_exprs.is_empty()),
+    }
 }
 
 /// 集計枝の走査分類の行。[`eval_aggregate_branch`] は可視ビットマップのキャッシュ・arena・

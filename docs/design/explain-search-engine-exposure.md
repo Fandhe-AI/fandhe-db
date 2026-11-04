@@ -440,3 +440,41 @@ JOIN を含む `SELECT` の `EXPLAIN` を受理する（従来は単一表の文
   `42601`（SQL-75 (6)）。`$n` を含む `EXPLAIN` 前置の集合演算は `42601`（後続での受理に譲る）。
 - **対象外**: 派生表・CTE・部分クエリは従来どおり `42601`（#2048）、DML は #2049〜#2051、`EXPLAIN ANALYZE`／
   オプションは SQL-76。NoSQL 表層は変えない。
+
+## 追記（Issue #2048・SQL-75 (2)）: CTE・部分クエリの段
+
+非再帰 CTE（`WITH`）・FROM 直後の派生表・WHERE の部分クエリ（`IN`／`NOT IN`／`EXISTS`／`NOT EXISTS`／スカラー比較／
+`ANY`・`ALL`）を含む `SELECT` の `EXPLAIN` を受理する（従来は `EXPLAIN` 直後が `SELECT` でない文、または
+部分クエリの構文で `42601`）。文は実行せず、内側も実行しない。
+
+- **CTE・派生表（`ExplainTarget::Cte`）**: 構文段は非 EXPLAIN と同じ検証本体（`validate_with_statement`、派生表は
+  `derived_table::gate`）を通し、インライン展開で単一表の広域取得・集計に畳み込まれた形だけを受理する
+  （第 2 の WITH パーサーを持たない）。派生表は合成 CTE として同じ写像にする。判定は検証結果の形で行い、
+  `Scan`／`Aggregate` なら inline。`cte`（`cte_source: with|derived_table`・`cte_mode: inline`）の下に、外側から
+  `limit`（`LIMIT`／`OFFSET` があるときだけ）→ `sort`（並べ替えキーがあるときだけ）→ `aggregate`（集計のときだけ）→
+  `scan` を並べる。CTE の定義ごとの段は作らない（連鎖・参照されない定義も展開後は 1 段）。`scan` の行は単一表の
+  `EXPLAIN` と共有の分類関数が作る。
+- **WHERE の部分クエリ**: 外側（単一表の広域取得・集計）の出力は見出しなしの葉のままで、その子に `subquery` 段
+  （`subquery_kind: in|not_in|exists|not_exists|scalar|any|all`・`correlated: false`）を出現順に並べる。
+  `subquery` の下に内側の `scan`（集計形のスカラーは `aggregate` → `scan`）を置き、内側 WHERE の入れ子の部分クエリは
+  内側 `scan` の子に再帰的に並べる。部分クエリが無い文の出力はバイト単位で不変。
+- **内側の静的検証**: 失敗時の静的検証（`static_validate_subquery_predicates`）と同じ経路を収集モードで通し、
+  検証ロジックを二重化しない。内側が先・外側の束縛が後の判定順は実行経路と同じなので、内側・外側・CTE 本文の
+  束縛エラーの `wire_code` は非 EXPLAIN と一致する。行数に依存する検査（`21000`・結果行数上限・`IN` 値予算）は
+  対象外（実行しないため）。
+- **外側の保守側の分類**: 実行時、部分クエリ述語は内側の結果から書き換わり、どの形になるかはデータ依存で静的には
+  決まらない。そこで部分クエリを含む最上位の述語（`OR`・`NOT` の内側を含む場合は述語全体）を、定数偽の述語
+  （`Or([])`。WHERE フィルタとして数えられ、PK 点検索・GIN・スカラー索引・可視ビットマップのいずれにも使えない）へ
+  置き換えてから外側を束縛・分類する。外側の分類は「部分クエリ述語を索引に使えないフィルタとみなす保守側の静的分類」で、
+  `id = 1 AND x IN (...)` は PK 点検索のまま、`id = 1 OR x IN (...)` は全走査になる（実際の経路を超えて索引を主張しない）。
+- **内側の分類**: 内側の広域取得は外側と同じ `sql::scan::execute_scan` を通るため単一表の分類を共有する。内側の集計形は
+  実行器 `execute_inner_aggregate_statement` がキャッシュ・索引を渡さないため `plain_scan`／`full_scan` に固定する
+  （**実行器を変えるときは分類も一緒に変えること**）。
+- **エラー写像**: 次はすべて `42601`（`Internal` に落とさない）。`WITH RECURSIVE`・具体化経路（`MATERIALIZED`・本文に
+  `ORDER BY`／`LIMIT` を持つ CTE）・JOIN／集合演算の入力になる CTE・派生表・相関部分クエリ（収集中に到達したら拒否し、
+  黙って受理しない）・投影位置／式に埋め込まれた値の部分クエリ・集計の `FILTER`／`HAVING` の部分クエリ・ランキング検索の
+  部分クエリ。データ変更 CTE は既存の `0A000` で書き込みは発生しない。木の上限超過は `54001`、セッションの無い入口は
+  従来どおり `42601`（SQL-75 (6)）。`$n` を含む `EXPLAIN` 前置の `WITH`・派生表・部分クエリは `42601`（後続での受理に譲る）。
+- **出さない値と理由**: CTE 名・別名・表名、`LIMIT`／`OFFSET` の値、行数・可視件数・カーディナリティ・予算（SQL-75 (5)）。
+- **対象外（後続候補）**: 具体化 CTE（`cte_mode: materialized`）、相関部分クエリ（`correlated: true`）、再帰 CTE、
+  JOIN／集合演算の入力になる CTE・派生表、DML（#2049〜#2051）、`EXPLAIN ANALYZE`／オプション（SQL-76）。NoSQL 表層は変えない。
