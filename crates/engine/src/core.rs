@@ -11818,6 +11818,12 @@ impl EngineCore {
                 crate::sql::allowlist::ExplainTarget::Scan(validated) => {
                     self.run_relational_explain_scan(&validated, session)
                 }
+                // Issue #2046（SQL-75 (2) ポインタ）: JOIN。行を読まず、束縛結果だけから
+                // 結合の方式・順・各入力の走査分類を段の木で報告する
+                // （[`Self::run_join_explain`] 参照）。
+                crate::sql::allowlist::ExplainTarget::Join(validated) => {
+                    self.run_join_explain(&validated, session)
+                }
             },
             // Issue #929（SQL-29 (c)・RLS-10 (b)・TASK-213）: 集合演算は複数枝
             // （各枝は独立した単一テーブル広域取得）を単一スナップショット上で
@@ -14077,6 +14083,61 @@ impl EngineCore {
         )))
     }
 
+    /// JOIN の `EXPLAIN`（Issue #2046・SQL-75 (2)(5)(6) ポインタ）。`Statement::Explain` アームから
+    /// 呼ばれ、非 EXPLAIN の JOIN 実行と同じ [`crate::sql::join::prepare_join`]（行を読まずに
+    /// 束縛・LIMIT／OFFSET 範囲・relation 数と GROUP BY 列数の上限まで確定する）を通すため、
+    /// 束縛エラーの `wire_code` と順序が一致する。各側の走査分類は単一表の広域取得 `EXPLAIN` と
+    /// 共有の [`Self::scan_explain_lines`]。走査・キャッシュ・台帳・世代・書き込みロックには
+    /// 触れず、行数等のテナント存在情報も出さない。木の上限超過は `54001`（固定文）。
+    fn run_join_explain(
+        &self,
+        validated: &crate::sql::allowlist::ValidatedJoin,
+        session: &crate::sql::mode::SessionState,
+    ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        use crate::sql::allowlist::SqlSurfaceError;
+        use crate::sql::explain_tree::ExplainTreeError;
+        // EXPLAIN の構文段は CTE 入力を作らない（`EXPLAIN WITH` は `42601`）。到達は契約違反のみ。
+        if validated.cte_inputs.is_some() {
+            return Err(SqlSurfaceError::Internal {
+                detail: "EXPLAIN for a JOIN with CTE inputs is not supported".to_string(),
+            });
+        }
+        let names = crate::sql::join::collect_join_tables(validated);
+        let (read_txn, schemas) = self.read_txn_with_schemas(&names)?;
+        let limits = crate::sql::join::JoinLimits::from_settings(
+            self.group_by_limits,
+            self.join_limits,
+            self.result_limits,
+        );
+        let prepared = crate::sql::join::prepare_join(
+            &schemas,
+            &crate::sql::join::CteIdColumns::new(),
+            validated,
+            session.udfs(),
+            &limits,
+        )?;
+        let mut side_lines = Vec::with_capacity(prepared.side_count());
+        for side in 0..prepared.side_count() {
+            let (schema, bound) =
+                prepared
+                    .side_scan(side)
+                    .ok_or_else(|| SqlSurfaceError::Internal {
+                        detail: "JOIN side index out of range".to_string(),
+                    })?;
+            let gins = Self::gin_decls_for_explain(&read_txn, bound)?;
+            side_lines.push(Self::scan_explain_lines(schema, bound, &gins));
+        }
+        let node = crate::sql::join::explain_tree(&prepared, side_lines).map_err(|e| match e {
+            ExplainTreeError::InvalidLine => SqlSurfaceError::Internal {
+                detail: e.message().to_string(),
+            },
+            _ => SqlSurfaceError::StatementTooComplex {
+                detail: e.message(),
+            },
+        })?;
+        Ok(crate::sql::SqlOutcome::Explain(node.into_query_result()))
+    }
+
     /// 広域取得（scan）の `EXPLAIN` が GIN 相当索引の分類に使う宣言を読む（INDEX-8、Issue #2208）。
     /// 索引カタログは GIN の対象になりうる形の述語がある文でだけ読む
     /// （[`crate::sql::gin_scan::may_use_gin`]。それ以外の文でカタログ読み取りを増やさない）。
@@ -14116,6 +14177,18 @@ impl EngineCore {
         bound: &crate::sql::parser::BoundScan,
         gins: &[crate::catalog::DeclaredGinIndex],
     ) -> crate::sql::exec::QueryResult {
+        crate::sql::explain_tree::ExplainNode::leaf(Self::scan_explain_lines(schema, bound, gins))
+            .into_query_result()
+    }
+
+    /// [`Self::scan_explain_result`] の行生成部（PK → GIN → 全走査の静的分類）。JOIN の `EXPLAIN`
+    /// （Issue #2046。[`Self::run_join_explain`]）が各側の `scan` 節に載せる行も、この関数が作る
+    /// （第 2 の分類実装を持たない）。
+    fn scan_explain_lines(
+        schema: &crate::catalog::TableSchema,
+        bound: &crate::sql::parser::BoundScan,
+        gins: &[crate::catalog::DeclaredGinIndex],
+    ) -> Vec<String> {
         use crate::sql::explain::{AccessPath, ExplainIndexNames};
         use crate::sql::scalar_plan::ScalarPlan;
         let gin_plan = crate::sql::gin_scan::classify_gin_scan(schema, bound, gins);
@@ -14152,7 +14225,7 @@ impl EngineCore {
                 order_keys: w.order_by.len(),
             })
             .collect();
-        crate::sql::explain::build_relational_explain_result_with_windows(
+        crate::sql::explain::relational_explain_lines(
             scalar_plan,
             None,
             access_path,

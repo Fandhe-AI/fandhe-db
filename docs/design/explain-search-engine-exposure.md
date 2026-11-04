@@ -388,3 +388,31 @@ SQL-27 の確定時に spec 側とすり合わせる事項（spec リポ側で�
   可視件数・カーディナリティ等は載せない。SQL-75 (5)）。`EXPLAIN` は本体を実行しない。
 - **対象外**: 許可リスト（42601）の拡張と各段の語彙は #2046〜#2048、`EXPLAIN ANALYZE`／`FORMAT JSON` は SQL-76。
   NoSQL 表層は SQL-75 (6) のとおり変えない。
+
+## 追記（Issue #2046・SQL-75 (2)）: JOIN の段
+
+JOIN を含む `SELECT` の `EXPLAIN` を受理する（従来は単一表の文法で解析して `42601`）。文は実行せず、
+上記の段の木で結合の方式・順・各入力を返す。構文段は非 EXPLAIN と同じ判定（`looks_like_join` →
+`parse_join_statement`）で `ExplainTarget::Join` にし、束縛は `sql::join::prepare_join`（行を読まない）を共有する。
+束縛エラー・`LIMIT`／`OFFSET` の範囲・relation 数と `GROUP BY` 列数の上限の `wire_code` と判定順は
+非 EXPLAIN と一致する。
+
+- **段の重ね方（外側から。該当しない段は出さない）**: 非集計形は `limit` → `sort` → `filter` → `join` の
+  連鎖 → `scan`、集計形は `limit` → `sort` → `aggregate` → `filter` → `join` の連鎖 → `scan`。実行順
+  （結合 → WHERE 残余 → 集計／並べ替え → OFFSET／LIMIT）の逆。`join` は left-deep で、段 k の子は
+  [段 k-1 の `join`（k = 0 なら relation 1 の `scan`）, relation k+2 の `scan`] の順。
+- **語彙（閉じている・安定契約）**:
+  - `join`: `join_method: hash|nested_loop|cross`（実行器と同じ判定 `StepPlan::method` を共有）、
+    `join_type: inner|left|right|full`（外部結合の簡約後の実効値）、`join_keys: <n>`、
+    `join_filter: present|none`（ON 残余の有無）。
+  - `scan`: `relation: <n>`（FROM での 1 始まりの序数）に続けて、単一表の広域取得と同一の
+    `scalar_plan:`／`access_path:`（PK 点検索 → GIN → 全走査。`scan_explain_lines` を共有）。
+  - `filter`: `residual_predicates: <n>`。`aggregate`: `group_keys`・`aggregates`・`having: present|none`。
+    `sort`: `sort_keys: <n>`。`limit`: `limit: present|none`・`offset: present|none`。
+- **出さない値と理由**: 表名・別名（スキーマ解決後の内部名や一時表の名前など、利用者が書いた綴りと異なる名前の
+  露出と、区切り文字の混入経路を避けるため。出すかどうかは将来の判断として未決）、`LIMIT`／`OFFSET` の値
+  （利用者リテラル）、行数・可視件数・カーディナリティ・予算・推定値（SQL-75 (5)）。
+- **エラー写像**: 木の上限超過は `54001`（固定文）、契約違反は `Internal`。セッションの無い入口は
+  従来どおり `42601`（SQL-75 (6)）。`$n` を含む `EXPLAIN` 前置の JOIN は非 EXPLAIN と同じく `42601`。
+- **対象外**: 派生表・CTE（`EXPLAIN WITH`）・部分クエリを含む JOIN は従来どおり `42601`（#2048）、集合演算は #2047、
+  DML は #2049〜#2051、`EXPLAIN ANALYZE`／オプションは SQL-76。NoSQL 表層は変えない。

@@ -108,6 +108,37 @@ pub(super) struct StepPlan {
     pub(super) on_mixed: Vec<ResNode>,
 }
 
+/// 1 段の結合方式（`exec::join_step` の振り分け結果。Issue #2046・SQL-75 (2) ポインタ）。
+/// 実行（`exec`）と `EXPLAIN`（`explain`）が同じ [`StepPlan::method`] を共有し、表示と
+/// 実経路の食い違いを作らない。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum JoinMethod {
+    /// 等価結合キーが 1 個以上: ハッシュ結合。
+    Hash,
+    /// キー無し・ON 残余あり: ネステッドループ結合。
+    NestedLoop,
+    /// キー無し・ON 残余も無し: 直積。
+    Cross,
+}
+
+impl StepPlan {
+    /// ON 残余（左のみ・右のみ・両側跨ぎのいずれか）を持つか。
+    pub(super) fn has_on_residual(&self) -> bool {
+        !(self.on_acc.is_empty() && self.on_new.is_empty() && self.on_mixed.is_empty())
+    }
+
+    /// この段の結合方式。`exec::join_step` の分岐と `EXPLAIN` が共有する。
+    pub(super) fn method(&self) -> JoinMethod {
+        if !self.keys.is_empty() {
+            JoinMethod::Hash
+        } else if self.has_on_residual() {
+            JoinMethod::NestedLoop
+        } else {
+            JoinMethod::Cross
+        }
+    }
+}
+
 /// 結合後に行単位で評価する WHERE の残余ノード。
 pub(super) enum ResNode {
     And(Vec<ResNode>),
