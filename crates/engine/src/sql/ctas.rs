@@ -52,7 +52,7 @@ pub(crate) fn output_columns_from_metas(metas: Vec<ColumnMeta>) -> Vec<ViewColum
 /// 判定順序: 出力 0 本は `0A000` → 列数がハード上限超過は `54000` → 列名リストが長ければ `42601`
 /// → 列ごとに（名前が識別子として不正は `42601`・重複は `42701`・型なしは `0A000`）
 /// → VECTOR が 2 本以上なら `42601`。型の修飾（精度・長さ・次元・配列・ENUM）はそのまま保つ。
-/// 制約・DEFAULT・照合は持たず、VECTOR 列だけ `nullable = false`（エンジンの不変条件）、他は nullable。
+/// 制約・DEFAULT・照合は持たず、全列 nullable（VECTOR 列も同じ。Issue #2042・TABLE-26 (1)）。
 pub(crate) fn derive_ctas_column_defs(
     outputs: &[ViewColumn],
     column_names: &[String],
@@ -105,7 +105,7 @@ pub(crate) fn derive_ctas_column_defs(
         out.push(ColumnDef {
             name: name.clone(),
             ty: ty.clone(),
-            nullable: !is_vector,
+            nullable: true,
             default_expr: None,
             fill_value: None,
             collation: None,
@@ -191,7 +191,7 @@ mod tests {
         assert_eq!(defs[2].ty, ColumnType::Varchar(Some(8)));
         assert_eq!(defs[3].ty, ColumnType::Vector(3));
         assert!(defs[0].nullable && defs[1].nullable && defs[2].nullable);
-        assert!(!defs[3].nullable);
+        assert!(defs[3].nullable);
         assert!(defs
             .iter()
             .all(|d| d.default_expr.is_none() && d.collation.is_none() && d.fill_value.is_none()));

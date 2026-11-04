@@ -413,13 +413,12 @@ OFFSET ...` と同じ対象名解決・実行器を共有。第 2 の実行器�
 `operation_id` を省略した場合（既定構成）の成功応答は `operation_id` キーを含まない `{"inserted": 1}`。
 再送の検出は行わないため、冪等な再送保護が必要な運用は `--require-operation-id` で必須化する。
 
-- `VECTOR` 列は数値配列。`nullable` の宣言値に関わらず常に必須。省略・`null`
-  はいずれも拒否されるが、`wire_code` は列の `nullable` 宣言で分岐する
-  （TABLE-16・TASK-204、Issue #904）: `nullable = false` の `VECTOR` 列は
-  SQL 表層（`fill_omitted_columns`）と同じ `23502`
-  （`NOT_NULL_VIOLATION`）、`nullable = true` の `VECTOR` 列は従来どおり
-  `22000`（NOT NULL 違反ではなく「VECTOR は nullable でも常に必須」という
-  NoSQL 表層固有の制約のため）
+- `VECTOR` 列は数値配列。`nullable` が true（`create_table` の既定。`NOT NULL` 相当は
+  `"nullable": false`）の列は、省略・`null` のどちらも NULL として保存される
+  （TABLE-26 (1)〜(3)、Issue #2042。検索対象からの除外は #2043）。`nullable = false` の
+  列は省略・`null` とも SQL 表層と同じ `23502`（`NOT_NULL_VIOLATION`）で拒否される
+  （従来 `nullable = true` の列で返していた `22000` は廃止）。`update` op の `set` の `null` は
+  従来どおり列型を問わず拒否する
 - 列型ごとの JSON 表現（Issue #896・NOSQL-17。`docs/design/
   nosql-typed-json-binding.md` 参照）: `INTEGER`／`BIGINT` は JSON 整数
   （小数・指数表記は `22P02`、非数値は `42601`。範囲外は `22003`）、`REAL`／`DOUBLE PRECISION`

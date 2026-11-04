@@ -1427,6 +1427,33 @@ pub(crate) fn insert_rows_unchecked(
 /// を渡す。内容照合ハッシュは該当列を評価値ではなく DEFAULT の構文形でハッシュする（設計 D1・D2）。
 pub(crate) type VolatileDefaultColumns<'a> = &'a [&'a [VolatileColumn]];
 
+/// 行の `VECTOR` 列の値から embedding スライスを取り出す（Issue #2042・TABLE-26 (2)(3) のポインタ）。
+/// INSERT 系の全経路（単発・バッチ・UPSERT・ポリシー検査）が共有する。`Value::Vector` はそのまま、
+/// `Value::Null` は列が nullable なら空スライス（読み取り側の `dim == 0` モデルで NULL）、
+/// NOT NULL 列なら `NotNullConstraintViolation`（`23502`）。それ以外（欠落・型違い）は
+/// 従来どおり `Invalid` で拒否する（fail-closed）。
+fn vector_embedding_slice<'a>(
+    schema: &crate::catalog::TableSchema,
+    idx: usize,
+    values: &'a [crate::row_codec::Value],
+) -> std::result::Result<&'a [f32], TenantWriteError> {
+    match values.get(idx) {
+        Some(crate::row_codec::Value::Vector(v)) => Ok(v.as_slice()),
+        Some(crate::row_codec::Value::Null) => match schema.columns.get(idx) {
+            Some(column) if column.nullable => Ok(&[]),
+            Some(column) => Err(TenantWriteError::Catalog(
+                CatalogError::NotNullConstraintViolation(column.name.clone()),
+            )),
+            None => Err(TenantWriteError::Catalog(CatalogError::Invalid(
+                "VECTOR column value missing or not a Vector".to_string(),
+            ))),
+        },
+        _ => Err(TenantWriteError::Catalog(CatalogError::Invalid(
+            "VECTOR column value missing or not a Vector".to_string(),
+        ))),
+    }
+}
+
 /// `volatile` のいずれかの行が `VALUES` 内の単独時刻関数（[`VolatileColumn::Values`]）または
 /// 単独の `nextval`／`currval`（[`VolatileColumn::Sequence`]。TABLE-24・Issue #1690）を持つか。
 /// 持つ行がある文だけ `*Expr` ドメインでハッシュする。省略列への DEFAULT 適用
@@ -2132,14 +2159,7 @@ fn insert_typed_row_impl(
         // `content_hash::for_typed_insert` はいずれも `&[f32]` で受けられる
         // ため、この関数の生存期間内で借用を保持するだけで足りる）。
         let embedding: &[f32] = match vector_idx {
-            Some(idx) => match values.get(idx) {
-                Some(crate::row_codec::Value::Vector(v)) => v.as_slice(),
-                _ => {
-                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(
-                        "VECTOR column value missing or not a Vector".to_string(),
-                    )))
-                }
-            },
+            Some(idx) => vector_embedding_slice(&schema, idx, values)?,
             None => &[],
         };
         schema.validate_row_embedding_dim(embedding.len())?;
@@ -2682,14 +2702,7 @@ pub(crate) fn insert_typed_rows_unchecked(
             for (row_idx, (id, values)) in rows.iter().enumerate() {
                 let hash_id = if allocated { row_idx as u64 } else { *id };
                 let embedding: &[f32] = match vector_idx {
-                    Some(idx) => match values.get(idx) {
-                        Some(crate::row_codec::Value::Vector(v)) => v.as_slice(),
-                        _ => {
-                            return Err(TenantWriteError::Catalog(CatalogError::Invalid(
-                                "VECTOR column value missing or not a Vector".to_string(),
-                            )))
-                        }
-                    },
+                    Some(idx) => vector_embedding_slice(&schema, idx, values)?,
                     None => &[],
                 };
                 schema.validate_row_embedding_dim(embedding.len())?;
@@ -2861,14 +2874,7 @@ pub(crate) fn insert_typed_rows_unchecked(
                     None => orig_values,
                 };
                 let embedding: &[f32] = match vector_idx {
-                    Some(idx) => match values.get(idx) {
-                        Some(crate::row_codec::Value::Vector(v)) => v.as_slice(),
-                        _ => {
-                            return Err(TenantWriteError::Catalog(CatalogError::Invalid(
-                                "VECTOR column value missing or not a Vector".to_string(),
-                            )))
-                        }
-                    },
+                    Some(idx) => vector_embedding_slice(&schema, idx, values)?,
                     None => &[],
                 };
                 let metadata = crate::row_codec::encode_scalar_columns(&schema, values)
@@ -3303,14 +3309,7 @@ fn upsert_typed_rows_impl(
             for (row_idx, (id, values)) in rows.iter().enumerate() {
                 let hash_id = if allocated { row_idx as u64 } else { *id };
                 let embedding: &[f32] = match vector_idx {
-                    Some(idx) => match values.get(idx) {
-                        Some(crate::row_codec::Value::Vector(v)) => v.as_slice(),
-                        _ => {
-                            return Err(TenantWriteError::Catalog(CatalogError::Invalid(
-                                "VECTOR column value missing or not a Vector".to_string(),
-                            )))
-                        }
-                    },
+                    Some(idx) => vector_embedding_slice(&schema, idx, values)?,
                     None => &[],
                 };
                 schema.validate_row_embedding_dim(embedding.len())?;
@@ -3576,14 +3575,7 @@ fn upsert_typed_rows_impl(
                 // 提案行への INSERT 側ポリシー検査（RLS-13・Issue #2277）。衝突判定より前。
                 if let Some(checks) = policy_proposed.as_ref() {
                     let proposed_embedding: &[f32] = match vector_idx {
-                        Some(idx) => match values.get(idx) {
-                            Some(crate::row_codec::Value::Vector(v)) => v.as_slice(),
-                            _ => {
-                                return Err(TenantWriteError::Catalog(CatalogError::Invalid(
-                                    "VECTOR column value missing or not a Vector".to_string(),
-                                )))
-                            }
-                        },
+                        Some(idx) => vector_embedding_slice(&schema, idx, values)?,
                         None => &[],
                     };
                     let proposed_metadata =
@@ -3627,14 +3619,7 @@ fn upsert_typed_rows_impl(
                     // 対象省略（SQL-49、Issue #1736）: 挿入しようとする行の物理バイト列から、
                     // 書き込み後の一意性検査と同じ鍵で衝突を判定する。衝突なら本体を読まず飛ばす。
                     let embedding: &[f32] = match vector_idx {
-                        Some(idx) => match values.get(idx) {
-                            Some(crate::row_codec::Value::Vector(v)) => v.as_slice(),
-                            _ => {
-                                return Err(TenantWriteError::Catalog(CatalogError::Invalid(
-                                    "VECTOR column value missing or not a Vector".to_string(),
-                                )))
-                            }
-                        },
+                        Some(idx) => vector_embedding_slice(&schema, idx, values)?,
                         None => &[],
                     };
                     let metadata = crate::row_codec::encode_scalar_columns(&schema, values)
@@ -3914,6 +3899,12 @@ fn upsert_typed_rows_impl(
                                 if Some(*col_idx) == vector_idx {
                                     match new_value {
                                         crate::row_codec::Value::Vector(v) => embedding_value = v,
+                                        // nullable な VECTOR 列への NULL は空 embedding（NOT NULL は
+                                        // `validate_set_assignments` が先に `23502` で拒否済み。
+                                        // Issue #2042・TABLE-26 (3)）。
+                                        crate::row_codec::Value::Null => {
+                                            embedding_value = Vec::new()
+                                        }
                                         _ => {
                                             return Err(TenantWriteError::Catalog(
                                                 CatalogError::Invalid(
@@ -3990,14 +3981,7 @@ fn upsert_typed_rows_impl(
                     // （Issue #995: `VECTOR` 列なしスキーマは embedding 空）。
                     let key = row_key(ctx.tenant_id(), RowId::from_legacy_id(insert_id));
                     let embedding: &[f32] = match vector_idx {
-                        Some(idx) => match values.get(idx) {
-                            Some(crate::row_codec::Value::Vector(v)) => v.as_slice(),
-                            _ => {
-                                return Err(TenantWriteError::Catalog(CatalogError::Invalid(
-                                    "VECTOR column value missing or not a Vector".to_string(),
-                                )))
-                            }
-                        },
+                        Some(idx) => vector_embedding_slice(&schema, idx, values)?,
                         None => &[],
                     };
                     let metadata = crate::row_codec::encode_scalar_columns(&schema, values)
@@ -4930,8 +4914,8 @@ fn validate_set_assignments(
             }
             // 明示的な SQL `NULL`（`bind_set_assignments`〔SQL-17・SQL-19〕が
             // nullable 列向けに構築する。PR #1014 レビュー指摘対応・Issue #889。
-            // `VECTOR` 列は nullable の値に関わらず常に必須として扱うため対象外
-            // ——下の catch-all で従来どおり拒否する）。呼び出し元
+            // `VECTOR` 列も nullable なら受理し、空 embedding として書き戻す
+            // （Issue #2042・TABLE-26 (3)。NOT NULL は下で `23502`）。呼び出し元
             // （`bind_set_assignments`）は既に `column.nullable` を検査済みだが、
             // write トランザクション内で再取得したスキーマとの多層防御として
             // ここでも再検査する（`schema.columns` の型検証と同じ設計）。
@@ -4959,9 +4943,16 @@ fn validate_set_assignments(
                 | crate::catalog::ColumnType::HalfVec(_)
                 | crate::catalog::ColumnType::Int8Vec(_)
                 | crate::catalog::ColumnType::SparseVec(_)
+                | crate::catalog::ColumnType::Vector(_)
                 | crate::catalog::ColumnType::Uuid,
                 crate::row_codec::Value::Null,
             ) if column.nullable => {}
+            // NOT NULL の VECTOR 列への明示 NULL は `23502`（Issue #2042・TABLE-26 (3)）。
+            (crate::catalog::ColumnType::Vector(_), crate::row_codec::Value::Null) => {
+                return Err(TenantWriteError::Catalog(
+                    CatalogError::NotNullConstraintViolation(column.name.clone()),
+                ))
+            }
             (crate::catalog::ColumnType::Uuid, crate::row_codec::Value::Uuid(_)) => {
                 // UUID 値は行コーデック上 presence(1) + 16 バイト固定
                 // （`row_codec::SCALAR_UUID_ENTRY_LEN`）のため、TEXT のような
@@ -5075,13 +5066,28 @@ pub(crate) fn merge_row_for_update(
                 embedding = v.clone();
                 vector_assigned = true;
             }
+            // VECTOR 列への NULL は embedding スロットを空にする（Issue #2042・TABLE-26 (3)）。
+            // NOT NULL 列は `validate_set_assignments` が先に拒否済みだが、ここでも多層防御として
+            // `23502` で拒否する（fail-closed）。
+            crate::row_codec::Value::Null
+                if schema.columns.get(*idx).is_some_and(|c| c.ty.is_vector()) =>
+            {
+                if !schema.columns.get(*idx).is_some_and(|c| c.nullable) {
+                    let name = schema.columns.get(*idx).map(|c| c.name.clone());
+                    return Err(CatalogError::NotNullConstraintViolation(
+                        name.unwrap_or_default(),
+                    ));
+                }
+                embedding = Vec::new();
+                vector_assigned = true;
+            }
             other => {
                 overrides.push((*idx, other));
             }
         }
     }
     if vector_assigned {
-        schema.validate_embedding_dim(embedding.len())?;
+        schema.validate_row_embedding_dim(embedding.len())?;
     }
     let metadata = crate::row_codec::merge_encode_scalar_columns(schema, &scanned, &overrides)
         .map_err(|e| CatalogError::Invalid(e.to_string()))?;
@@ -8542,15 +8548,8 @@ pub(crate) fn replace_typed_rows_by_text_key(
             let mut first_id: Option<u64> = None;
             let mut inserted = 0usize;
             for values in rows {
-                let embedding = match values.get(vector_idx) {
-                    Some(crate::row_codec::Value::Vector(v)) => v.clone(),
-                    _ => {
-                        return Err(TenantWriteError::Catalog(CatalogError::Invalid(
-                            "VECTOR column value missing or not a Vector".to_string(),
-                        )))
-                    }
-                };
-                schema.validate_embedding_dim(embedding.len())?;
+                let embedding = vector_embedding_slice(&schema, vector_idx, values)?.to_vec();
+                schema.validate_row_embedding_dim(embedding.len())?;
                 let metadata = crate::row_codec::encode_scalar_columns(&schema, values)
                     .map_err(|e| CatalogError::Invalid(e.to_string()))?;
                 let row = RowInput {

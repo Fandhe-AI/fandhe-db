@@ -703,7 +703,6 @@ fn create_table_unknown_type_and_invalid_vector_shape_are_42601() {
         r#"{"op":"create_table","table":"docs","columns":[{"name":"a","type":"bogus"}]}"#,
         r#"{"op":"create_table","table":"docs","columns":[{"name":"a","type":"vector"}]}"#,
         r#"{"op":"create_table","table":"docs","columns":[{"name":"a","type":"text","dim":3}]}"#,
-        r#"{"op":"create_table","table":"docs","columns":[{"name":"a","type":"vector","dim":3,"nullable":true}]}"#,
         r#"{"op":"create_table","table":"docs","columns":[{"name":"a","type":"text","default":true}]}"#,
         r#"{"op":"create_table","table":"docs","columns":[{"name":"a","type":"text","default":null}]}"#,
     ];
@@ -712,6 +711,51 @@ fn create_table_unknown_type_and_invalid_vector_shape_are_42601() {
         assert_eq!(
             http_common::wire_code_of(&resp),
             "42601",
+            "body={body} got: {resp:?}"
+        );
+    }
+}
+
+/// Issue #2042（TABLE-26 (1)〜(3)）: `vector` 列は `nullable` が true・省略なら NULL を保存でき
+/// （`insert` の `null`・省略とも受理）、`nullable: false` なら `null`・省略は `23502`。
+#[test]
+fn create_table_vector_nullable_accepts_null_and_not_null_rejects_with_23502() {
+    let (core, _guard) = new_core();
+    let session = ddl_session(core);
+    let created = query(
+        &session,
+        br#"{"op":"create_table","table":"nv","columns":[
+        {"name":"embedding","type":"vector","dim":2,"nullable":true},
+        {"name":"n","type":"text","nullable":true}
+    ]}"#,
+    );
+    assert_eq!(created.status, 200, "got: {created:?}");
+    let by_null = query(
+        &session,
+        br#"{"op":"insert","table":"nv","rows":[{"id":1,"embedding":null,"n":"a"}],"operation_id":"nv-1"}"#,
+    );
+    assert_eq!(by_null.status, 200, "got: {by_null:?}");
+    let by_omission = query(
+        &session,
+        br#"{"op":"insert","table":"nv","rows":[{"id":2,"n":"b"}],"operation_id":"nv-2"}"#,
+    );
+    assert_eq!(by_omission.status, 200, "got: {by_omission:?}");
+
+    let created = query(
+        &session,
+        br#"{"op":"create_table","table":"nn","columns":[
+        {"name":"embedding","type":"vector","dim":2,"nullable":false}
+    ]}"#,
+    );
+    assert_eq!(created.status, 200, "got: {created:?}");
+    for body in [
+        r#"{"op":"insert","table":"nn","rows":[{"id":1,"embedding":null}],"operation_id":"nn-1"}"#,
+        r#"{"op":"insert","table":"nn","rows":[{"id":2}],"operation_id":"nn-2"}"#,
+    ] {
+        let resp = query(&session, body.as_bytes());
+        assert_eq!(
+            http_common::wire_code_of(&resp),
+            "23502",
             "body={body} got: {resp:?}"
         );
     }

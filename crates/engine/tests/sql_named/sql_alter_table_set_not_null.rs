@@ -147,7 +147,7 @@ fn empty_table_and_already_not_null_succeed() {
     ok(
         &core,
         &mut session,
-        "CREATE TABLE keyed (id BIGINT NOT NULL UNIQUE, code TEXT PRIMARY KEY, v VECTOR(3))",
+        "CREATE TABLE keyed (id BIGINT NOT NULL UNIQUE, code TEXT PRIMARY KEY, v VECTOR(3) NOT NULL)",
     );
     ok(
         &core,

@@ -278,11 +278,9 @@ pub(crate) fn identity_type_bounds(ty: &ColumnType) -> Option<(i64, i64)> {
 /// 共有する前提。`docs/design/sql-alter-table-add-column.md` 参照）が受理する
 /// 型名の閉じた集合＋ ENUM 型名候補。
 ///
-/// `VECTOR` は構文としては受理するが、実行段（`sql::ddl::
-/// execute_alter_table_add_column`）が常に `0A000`（`SqlSurfaceError::
-/// FeatureNotSupported`）で拒否する（既存行が埋め込みバイトを持たない
-/// テーブルへの `VECTOR` 列追加は、arena 構築・KNN・HNSW 各経路の安全性が
-/// 未検証のため。詳細は `docs/design/sql-alter-table-add-column.md` 参照）。
+/// `VECTOR` は nullable な列としてのみ追加できる（Issue #2042・TABLE-26 (4)。既存行は
+/// 空 embedding = NULL。`NOT NULL` 付きは `42601`、2 本目の VECTOR 列は TABLE-1 の既存エラー。
+/// 詳細は `docs/design/sql-alter-table-add-column.md` の Issue #2042 追記参照）。
 ///
 /// 配列型（`<型>[]`・`<型>[N]`。TABLE-14・Issue #1348）は [`Self::Array`] で表す。
 /// 多次元（`<型>[][]`。Issue #1605・TABLE-35 (2)）は `[]` の連続で表し、次元数は

@@ -70,13 +70,14 @@ fn create_table_succeeds_with_vector_and_text_columns() {
         .execute_sql_in_session_legacy(
             &alice,
             &mut session,
-            "CREATE TABLE docs (embedding VECTOR(4), body TEXT)",
+            "CREATE TABLE docs (embedding VECTOR(4) NOT NULL, body TEXT)",
         )
         .expect("CREATE TABLE should succeed");
     assert!(matches!(outcome, SqlOutcome::CreateTable(_)));
 
     // `EngineCore` はカタログを直接公開しないため、列の型・nullable 既定を
-    // 機能的に確認する（2.2「`VECTOR` 列は常に non-null・`TEXT` 列は nullable」）。
+    // 機能的に確認する（`NOT NULL` 付き `VECTOR` 列は non-null・`TEXT` 列は nullable。VECTOR 列の既定が nullable になった
+    // 点は Issue #2042 の `table26_nullable_vector_storage.rs` が担う）。
     // `body`（nullable）を省略した INSERT は成功する。
     core.execute_insert_sql(
         &alice,

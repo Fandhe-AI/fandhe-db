@@ -271,12 +271,12 @@ fn wire_timestamp_default_errors_are_mapped_to_sqlstate() {
 }
 
 #[test]
-fn wire_vector_column_is_rejected_with_0a000() {
+fn wire_second_vector_column_is_rejected_with_42601() {
     let (core, _guard) = new_core_with_docs_table();
     let mut stream = spawn_with_alice_as_ddl_principal(core);
 
     send_simple_query(&mut stream, "ALTER TABLE docs ADD COLUMN v VECTOR(4)");
-    expect_error_response_with_sqlstate(&mut stream, "0A000");
+    expect_error_response_with_sqlstate(&mut stream, "42601");
     read_ready_for_query(&mut stream);
 }
 

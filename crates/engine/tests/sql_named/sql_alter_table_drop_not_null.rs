@@ -233,27 +233,24 @@ fn existence_and_reserved_column_errors() {
     }
 }
 
-/// VECTOR 列は NULL 許容 VECTOR が未実装のため `42601`。カタログは不変。
+/// VECTOR 列も NOT NULL を外せる（Issue #2042・TABLE-26）。カタログの nullable が反転する。
 #[test]
-fn rejects_vector_column() {
+fn drops_not_null_on_vector_column() {
     let (core, path, mut session) = setup("drop-nn-vector");
     let _guard = CleanupGuard(path.clone());
     ok(
         &core,
         &mut session,
-        "CREATE TABLE vt (id BIGINT PRIMARY KEY, embedding VECTOR(3))",
+        "CREATE TABLE vt (id BIGINT PRIMARY KEY, embedding VECTOR(3) NOT NULL)",
     );
-    assert_eq!(
-        code(
-            &core,
-            &mut session,
-            "ALTER TABLE vt ALTER COLUMN embedding DROP NOT NULL"
-        ),
-        "42601"
+    ok(
+        &core,
+        &mut session,
+        "ALTER TABLE vt ALTER COLUMN embedding DROP NOT NULL",
     );
     drop(session);
     drop(core);
-    assert!(!nullable(&path, "vt", "embedding"));
+    assert!(nullable(&path, "vt", "embedding"));
 }
 
 /// 既に nullable な列は冪等に成功する。
