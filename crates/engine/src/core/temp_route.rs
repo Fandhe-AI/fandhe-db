@@ -222,6 +222,8 @@ pub(crate) fn is_search_path_exempt(parsed: &ParsedSql) -> bool {
                     | Statement::ShowStatementTimeout
                     | Statement::SetHnswEfSearch { .. }
                     | Statement::ShowHnswEfSearch
+                    | Statement::SetHnswScanSetting { .. }
+                    | Statement::ShowHnswScanSetting(_)
                     | Statement::CreateFunction { .. }
                     | Statement::ConstSelect(_)
             )

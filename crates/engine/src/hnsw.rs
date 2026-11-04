@@ -108,7 +108,9 @@ mod prefetch;
 /// SearchEngineKind::Hnsw` の構築先）。本タスク時点は全件 brute-force
 /// フォールバック（詳細は `provider` モジュールドキュメント参照）。
 pub mod provider;
-pub use provider::HnswSearchProvider;
+pub use provider::{
+    HnswIterativeScan, HnswSearchProvider, HnswSessionSearch, DEFAULT_MAX_SCAN_TUPLES,
+};
 
 /// 次数上限の安全上限（DoS 防止。`HnswParams::validate` が `m` をこの値以下に
 /// 制限する）。

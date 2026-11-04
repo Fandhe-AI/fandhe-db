@@ -729,7 +729,7 @@ fn explain_reports_hnsw_engine_params_and_full_visible_ann_plan_without_filter()
     assert_eq!(lines[lines.len() - 4], "engine: hnsw");
     assert_eq!(
         lines[lines.len() - 3],
-        "hnsw_params: m=16,ef_construction=100,ef_search=64,resident=f32,sparse_visited_max=0,metric=cosine"
+        "hnsw_params: m=16,ef_construction=100,ef_search=64,resident=f32,sparse_visited_max=0,metric=cosine,iterative_scan=strict_order,max_scan_tuples=20000"
     );
     assert_eq!(lines[lines.len() - 2], "ann_plan: hnsw_full_visible");
     assert_eq!(lines[lines.len() - 1], "scalar_plan: plain_scan");
@@ -955,7 +955,7 @@ fn explain_new_rows_use_closed_vocabulary_and_default_hnsw_params() {
     assert_eq!(
         hnsw_params_line,
         Some(
-            &"hnsw_params: m=16,ef_construction=100,ef_search=64,resident=f32,sparse_visited_max=0,metric=cosine"
+            &"hnsw_params: m=16,ef_construction=100,ef_search=64,resident=f32,sparse_visited_max=0,metric=cosine,iterative_scan=strict_order,max_scan_tuples=20000"
                 .to_string()
         ),
         "default HnswParams must round-trip exactly through EXPLAIN"
@@ -1017,7 +1017,7 @@ fn explain_reports_declared_hnsw_opclass_as_metric() {
         assert_eq!(
             lines[lines.len() - 3],
             format!(
-                "hnsw_params: m=16,ef_construction=100,ef_search=64,resident=f32,sparse_visited_max=0,metric={token}"
+                "hnsw_params: m=16,ef_construction=100,ef_search=64,resident=f32,sparse_visited_max=0,metric={token},iterative_scan=strict_order,max_scan_tuples=20000"
             )
         );
     }
