@@ -661,3 +661,183 @@ fn build_with_gpu_constructs_successfully_regardless_of_gpu_availability() {
         .expect("batch_search should succeed via gpu primary or cpu fallback");
     assert_eq!(hits.len(), 1);
 }
+// ---------------------------------------------------------------------
+// Issue #2003: metric（L2・コサイン）の縮退経路。ポインタ: CORE-6・CORE-16・SQL-33
+//
+// 必ず `InitFailed` を返す factory を渡すため、GPU の有無に依らず CPU 縮退経路を通る。
+// 受け入れ条件「アダプタ無し CI で skip ではなくフォールバック経路のテストが通る」の担保。
+// ---------------------------------------------------------------------
+
+use engine::batch_search::BatchMetric;
+
+/// metric 別のオラクル（可視行を「大きいほど近い」で降順、同点は id 昇順）。
+#[allow(clippy::too_many_arguments)]
+fn metric_oracle(
+    ids: &[u64],
+    tenant_ids: &[String],
+    visibilities: &[Visibility],
+    dim: usize,
+    vectors: &[f32],
+    ctx: &PolicyContext,
+    query: &[f32],
+    k: usize,
+    metric: BatchMetric,
+) -> Vec<(u64, f64)> {
+    let mut scored = Vec::new();
+    for (((id, tenant), vis), row) in ids
+        .iter()
+        .zip(tenant_ids)
+        .zip(visibilities)
+        .zip(vectors.chunks(dim))
+    {
+        if !ctx.is_visible(tenant, *vis) {
+            continue;
+        }
+        let dot: f64 = row
+            .iter()
+            .zip(query)
+            .map(|(&r, &q)| f64::from(r) * f64::from(q))
+            .sum();
+        let score = match metric {
+            BatchMetric::L2 => -row
+                .iter()
+                .zip(query)
+                .map(|(&r, &q)| (f64::from(r) - f64::from(q)).powi(2))
+                .sum::<f64>(),
+            BatchMetric::Cosine => {
+                let nr = row
+                    .iter()
+                    .map(|&r| f64::from(r).powi(2))
+                    .sum::<f64>()
+                    .sqrt();
+                let nq = query
+                    .iter()
+                    .map(|&q| f64::from(q).powi(2))
+                    .sum::<f64>()
+                    .sqrt();
+                dot / (nr * nq)
+            }
+            BatchMetric::InnerProduct => dot,
+        };
+        scored.push((*id, score));
+    }
+    scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    scored.truncate(k);
+    scored
+}
+
+fn failing_factory(_m: ResidentMatrix) -> Result<Box<dyn BatchBackend>, BatchBackendError> {
+    Err(BatchBackendError::InitFailed("no gpu adapter".to_string()))
+}
+
+/// 2 テナント・Private 行・奇数次元（5）のフィクスチャ。
+fn metric_two_tenant_fixture() -> (Vec<u64>, Vec<String>, Vec<Visibility>, usize, Vec<f32>) {
+    let dim = 5;
+    let rows = 12usize;
+    let ids: Vec<u64> = (1..=rows as u64).collect();
+    let tenants: Vec<String> = (0..rows)
+        .map(|i| if i % 2 == 0 { "tenant-a" } else { "tenant-b" }.to_string())
+        .collect();
+    let vis = vec![Visibility::Private; rows];
+    let mut vectors = Vec::new();
+    for i in 0..rows {
+        for d in 0..dim {
+            // 同点を作らない決定的な値（f16 でほぼ厳密に往復できる 1/8 刻み）。
+            let v = ((i * 7 + d * 3 + 1) % 19) as f32 / 8.0 - 1.0 + (i as f32) / 64.0;
+            vectors.push(v);
+        }
+    }
+    (ids, tenants, vis, dim, vectors)
+}
+
+#[test]
+fn metric_fallback_matches_oracle_without_cross_tenant_leak_for_l2_and_cosine() {
+    for metric in [BatchMetric::L2, BatchMetric::Cosine] {
+        let (ids, tenants, vis, dim, vectors) = metric_two_tenant_fixture();
+        let observer = RecordingObserver::default();
+        let engine = FallbackBatchEngine::build_with_metric(
+            &ids,
+            &tenants,
+            &vis,
+            dim,
+            &vectors,
+            metric,
+            failing_factory,
+            Box::new(observer.clone()),
+        )
+        .expect("build_with_metric must succeed in cpu-only mode");
+        let events = observer.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].reason, FallbackReason::Init);
+        assert_eq!(events[0].target, "cpu-simd");
+
+        let ctx_a = PolicyContext::with_visibilities("tenant-a", [Visibility::Private])
+            .expect("valid tenant");
+        let ctx_b = PolicyContext::with_visibilities("tenant-b", [Visibility::Private])
+            .expect("valid tenant");
+        let q1 = [0.5f32, -0.25, 1.0, 0.75, 0.125];
+        let q2 = [-1.0f32, 0.5, 0.25, 0.0, 1.5];
+        let queries = [
+            BatchQuery {
+                vector: &q1,
+                k: 4,
+                ctx: &ctx_a,
+            },
+            BatchQuery {
+                vector: &q2,
+                k: 4,
+                ctx: &ctx_b,
+            },
+        ];
+        let results = engine.batch_search(&queries).expect("cpu fallback search");
+        for (res, (q, c, tenant)) in results
+            .iter()
+            .zip([(&q1, &ctx_a, "tenant-a"), (&q2, &ctx_b, "tenant-b")])
+        {
+            assert!(!res.hits.is_empty());
+            for h in &res.hits {
+                assert_eq!(h.tenant_id, tenant, "{metric:?}: cross-tenant leak");
+            }
+            let want = metric_oracle(&ids, &tenants, &vis, dim, &vectors, c, q, 4, metric);
+            let got: Vec<u64> = res.hits.iter().map(|h| h.id).collect();
+            let want_ids: Vec<u64> = want.iter().map(|w| w.0).collect();
+            assert_eq!(got, want_ids, "{metric:?}");
+            for (h, w) in res.hits.iter().zip(&want) {
+                assert!(
+                    (f64::from(h.score) - w.1).abs() < 1e-4 * (1.0 + w.1.abs()),
+                    "{metric:?}: score {} vs {}",
+                    h.score,
+                    w.1
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn metric_fallback_cosine_rejects_zero_norm_query_and_never_latches() {
+    let (ids, tenants, vis, dim, vectors) = metric_two_tenant_fixture();
+    let observer = RecordingObserver::default();
+    let engine = FallbackBatchEngine::build_with_metric(
+        &ids,
+        &tenants,
+        &vis,
+        dim,
+        &vectors,
+        BatchMetric::Cosine,
+        failing_factory,
+        Box::new(observer.clone()),
+    )
+    .unwrap();
+    let c = PolicyContext::with_visibilities("tenant-a", [Visibility::Private]).unwrap();
+    let zero = [0.0f32; 5];
+    let bq = BatchQuery {
+        vector: &zero,
+        k: 3,
+        ctx: &c,
+    };
+    let err = engine.batch_search(std::slice::from_ref(&bq)).unwrap_err();
+    assert_eq!(err, BatchSearchError::ZeroNormQuery { query_index: 0 });
+    // 追加の縮退イベントは起きない（構築時の 1 件のみ）。
+    assert_eq!(observer.events().len(), 1);
+}

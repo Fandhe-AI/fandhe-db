@@ -38,8 +38,9 @@ use std::sync::{Mutex, OnceLock};
 
 use crate::batch_fallback::{BatchBackend, BatchBackendError, BatchExecError};
 use crate::batch_search::{
-    compute_tenant_work, resolve_batch_slot, try_owned_str, try_reserve_exact,
-    validate_batch_queries, BatchHit, BatchQuery, BatchRowSource, BatchSearchError, MAX_BATCH_WORK,
+    compute_tenant_work, normalize_query_store, queries_over_store, resolve_batch_slot,
+    try_owned_str, try_reserve_exact, validate_batch_queries, validate_batch_queries_for_metric,
+    BatchHit, BatchMetric, BatchQuery, BatchRowSource, BatchSearchError, MAX_BATCH_WORK,
 };
 use crate::kernel::SearchHit;
 use crate::kernel::{CandidateHit, TopKSelector};
@@ -181,12 +182,18 @@ const MAX_WORKGROUPS_PER_DIMENSION_FALLBACK: u32 = 65535;
 /// （本シェーダでは「u32 パック要素数」、f32 版では「f32 要素数 = dim」）。
 const DOT_SHADER_WGSL: &str = r#"
 const QUERY_TILE_MAX: u32 = 16u;
+const METRIC_DOT: u32 = 0u;
+const METRIC_L2: u32 = 1u;
 
 struct Params {
     row_stride: u32,
     row_count: u32,
     query_count: u32,
     query_stride: u32,
+    metric: u32,
+    pad0: u32,
+    pad1: u32,
+    pad2: u32,
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -215,6 +222,37 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         qi = qi + 1u;
     }
 
+    if (params.metric == METRIC_L2) {
+        // L2: -sum((row - query)^2)。奇数次元の端数は行・クエリとも 0.0 パディングで差が 0。
+        var jl: u32 = 0u;
+        loop {
+            if (jl >= params.row_stride) {
+                break;
+            }
+            let packed_l = packed_rows[row_base + jl];
+            let unpacked_l = unpack2x16float(packed_l);
+            var ql: u32 = 0u;
+            loop {
+                if (ql >= query_count) {
+                    break;
+                }
+                let qbase_l = ql * params.query_stride + jl * 2u;
+                let d0 = unpacked_l.x - query[qbase_l];
+                let d1 = unpacked_l.y - query[qbase_l + 1u];
+                acc[ql] = acc[ql] + d0 * d0 + d1 * d1;
+                ql = ql + 1u;
+            }
+            jl = jl + 1u;
+        }
+        var qn: u32 = 0u;
+        loop {
+            if (qn >= query_count) {
+                break;
+            }
+            acc[qn] = -acc[qn];
+            qn = qn + 1u;
+        }
+    } else {
     var j: u32 = 0u;
     loop {
         if (j >= params.row_stride) {
@@ -232,6 +270,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             q = q + 1u;
         }
         j = j + 1u;
+    }
     }
 
     var qo: u32 = 0u;
@@ -259,12 +298,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 /// 揃えている（行データの読み方だけが異なる）。
 const DOT_SHADER_F32_WGSL: &str = r#"
 const QUERY_TILE_MAX: u32 = 16u;
+const METRIC_DOT: u32 = 0u;
+const METRIC_L2: u32 = 1u;
 
 struct Params {
     row_stride: u32,
     row_count: u32,
     query_count: u32,
     query_stride: u32,
+    metric: u32,
+    pad0: u32,
+    pad1: u32,
+    pad2: u32,
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -293,6 +338,34 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         qi = qi + 1u;
     }
 
+    if (params.metric == METRIC_L2) {
+        // L2: -sum((row - query)^2)。
+        var jl: u32 = 0u;
+        loop {
+            if (jl >= params.row_stride) {
+                break;
+            }
+            let v_l = rows[row_base + jl];
+            var ql: u32 = 0u;
+            loop {
+                if (ql >= query_count) {
+                    break;
+                }
+                let d = v_l - query[ql * params.query_stride + jl];
+                acc[ql] = acc[ql] + d * d;
+                ql = ql + 1u;
+            }
+            jl = jl + 1u;
+        }
+        var qn: u32 = 0u;
+        loop {
+            if (qn >= query_count) {
+                break;
+            }
+            acc[qn] = -acc[qn];
+            qn = qn + 1u;
+        }
+    } else {
     var j: u32 = 0u;
     loop {
         if (j >= params.row_stride) {
@@ -308,6 +381,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             q = q + 1u;
         }
         j = j + 1u;
+    }
     }
 
     var qo: u32 = 0u;
@@ -456,6 +530,8 @@ macro_rules! topk_dot_shader {
 const WORKGROUP_SIZE: u32 = 256u;
 const TOPK_OUT_MAX: u32 = 256u;
 const QUERY_TILE_MAX: u32 = 16u;
+const METRIC_DOT: u32 = 0u;
+const METRIC_L2: u32 = 1u;
 
 struct TopKParams {
     row_stride: u32,
@@ -463,7 +539,7 @@ struct TopKParams {
     query_count: u32,
     query_stride: u32,
     k_out: u32,
-    pad0: u32,
+    metric: u32,
     pad1: u32,
     pad2: u32,
 };
@@ -608,6 +684,37 @@ const DOT_SHADER_TOPK_WGSL: &str = topk_dot_shader!(
     "\n@group(0) @binding(1) var<storage, read> packed_rows: array<u32>;\n",
     "array<f32>",
     r#"
+    if (params.metric == METRIC_L2) {
+        // L2: -sum((row - query)^2)。奇数次元の端数は行・クエリとも 0.0 パディングで差が 0。
+        var jl: u32 = 0u;
+        loop {
+            if (jl >= params.row_stride) {
+                break;
+            }
+            let packed_l = packed_rows[row_base + jl];
+            let unpacked_l = unpack2x16float(packed_l);
+            var ql: u32 = 0u;
+            loop {
+                if (ql >= query_count) {
+                    break;
+                }
+                let qbase_l = ql * params.query_stride + jl * 2u;
+                let d0 = unpacked_l.x - query[qbase_l];
+                let d1 = unpacked_l.y - query[qbase_l + 1u];
+                acc[ql] = acc[ql] + d0 * d0 + d1 * d1;
+                ql = ql + 1u;
+            }
+            jl = jl + 1u;
+        }
+        var qn: u32 = 0u;
+        loop {
+            if (qn >= query_count) {
+                break;
+            }
+            acc[qn] = -acc[qn];
+            qn = qn + 1u;
+        }
+    } else {
     var j: u32 = 0u;
     loop {
         if (j >= params.row_stride) {
@@ -626,6 +733,7 @@ const DOT_SHADER_TOPK_WGSL: &str = topk_dot_shader!(
         }
         j = j + 1u;
     }
+    }
 "#
 );
 
@@ -637,6 +745,34 @@ const DOT_SHADER_TOPK_F32_WGSL: &str = topk_dot_shader!(
     "\n@group(0) @binding(1) var<storage, read> rows: array<f32>;\n",
     "array<f32>",
     r#"
+    if (params.metric == METRIC_L2) {
+        // L2: -sum((row - query)^2)。
+        var jl: u32 = 0u;
+        loop {
+            if (jl >= params.row_stride) {
+                break;
+            }
+            let v_l = rows[row_base + jl];
+            var ql: u32 = 0u;
+            loop {
+                if (ql >= query_count) {
+                    break;
+                }
+                let d = v_l - query[ql * params.query_stride + jl];
+                acc[ql] = acc[ql] + d * d;
+                ql = ql + 1u;
+            }
+            jl = jl + 1u;
+        }
+        var qn: u32 = 0u;
+        loop {
+            if (qn >= query_count) {
+                break;
+            }
+            acc[qn] = -acc[qn];
+            qn = qn + 1u;
+        }
+    } else {
     var j: u32 = 0u;
     loop {
         if (j >= params.row_stride) {
@@ -652,6 +788,7 @@ const DOT_SHADER_TOPK_F32_WGSL: &str = topk_dot_shader!(
             q = q + 1u;
         }
         j = j + 1u;
+    }
     }
 "#
 );
@@ -703,6 +840,12 @@ struct GpuParams {
     /// 1 クエリあたりの `query` 配列要素数（f16 経路: `row_stride * 2`、
     /// f32 対照経路: `row_stride` と同値の `dim`）。旧 `_pad1` を転用。
     query_stride: u32,
+    /// スコア規約の uniform コード（[`shader_metric_code`]。Issue #2003）。
+    /// WGSL `Params`（[`DOT_SHADER_WGSL`]・[`DOT_SHADER_F32_WGSL`]）はオフセット 16 に
+    /// `metric` を持つ 32 バイト構造。f16 算術版と packed i8 版の WGSL `Params` は
+    /// 16 バイトのままで、uniform の `min_binding_size` が `None` のため 32 バイトの
+    /// バッファの先頭 16 バイトだけを読む形で互換になる（metric は内積のみ）。
+    metric: u32,
 }
 
 impl GpuParams {
@@ -712,11 +855,15 @@ impl GpuParams {
     /// （native GPU バックエンドはホストと同一エンディアンで動作する前提）。
     fn to_ne_bytes_vec(self) -> Result<Vec<u8>, BatchBackendError> {
         let mut out = Vec::new();
-        try_reserve_bytes(&mut out, 16)?;
+        try_reserve_bytes(&mut out, 32)?;
         out.extend_from_slice(&self.row_stride.to_ne_bytes());
         out.extend_from_slice(&self.row_count.to_ne_bytes());
         out.extend_from_slice(&self.query_count.to_ne_bytes());
         out.extend_from_slice(&self.query_stride.to_ne_bytes());
+        out.extend_from_slice(&self.metric.to_ne_bytes());
+        out.extend_from_slice(&0u32.to_ne_bytes());
+        out.extend_from_slice(&0u32.to_ne_bytes());
+        out.extend_from_slice(&0u32.to_ne_bytes());
         Ok(out)
     }
 }
@@ -734,6 +881,9 @@ struct GpuTopKParams {
     /// 1 ワークグループが出力する候補数（`<= GPU_TOPK_OUT_MAX`。シェーダ側も
     /// `min` でクランプする二重防御）。
     k_out: u32,
+    /// スコア規約の uniform コード（[`shader_metric_code`]。オフセット 20。Issue #2003）。
+    /// 旧 `pad0` を転用（バイト長 32 は不変）。
+    metric: u32,
 }
 
 impl GpuTopKParams {
@@ -747,7 +897,7 @@ impl GpuTopKParams {
         out.extend_from_slice(&self.query_count.to_ne_bytes());
         out.extend_from_slice(&self.query_stride.to_ne_bytes());
         out.extend_from_slice(&self.k_out.to_ne_bytes());
-        out.extend_from_slice(&0u32.to_ne_bytes());
+        out.extend_from_slice(&self.metric.to_ne_bytes());
         out.extend_from_slice(&0u32.to_ne_bytes());
         out.extend_from_slice(&0u32.to_ne_bytes());
         Ok(out)
@@ -1022,6 +1172,41 @@ fn select_dot_shader(
         return GpuDotShaderKind::Unpack;
     }
     GpuDotShaderKind::F16Arith
+}
+
+/// WGSL の `METRIC_*` 定数に対応する uniform コード（Issue #2003）。Cosine は
+/// 行・クエリを正規化済みの内積として走査するため内積と同じコード。enum から機械的に
+/// 作るので、シェーダへ未知のコードが渡ることはない。
+fn shader_metric_code(metric: crate::batch_search::BatchMetric) -> u32 {
+    match metric {
+        crate::batch_search::BatchMetric::InnerProduct
+        | crate::batch_search::BatchMetric::Cosine => 0,
+        crate::batch_search::BatchMetric::L2 => 1,
+    }
+}
+
+/// [`select_dot_shader`] に metric 制約を足したもの（Issue #2003）。L2 では常に
+/// [`GpuDotShaderKind::Unpack`]: f16 算術版のオーバーフローガードは積の上界から導いて
+/// おり `(r - q)^2` には当てはまらず、f16 算術版の WGSL にも L2 分岐が無いため。
+/// Cosine は正規化後の内積なので既存ガードがそのまま成り立つ。
+fn select_dot_shader_for_metric(
+    metric: crate::batch_search::BatchMetric,
+    f16_arith_available: bool,
+    row_max_abs: f32,
+    query_max_abs: f32,
+    query_has_subnormal_underflow: bool,
+    query_has_precision_loss: bool,
+) -> GpuDotShaderKind {
+    if metric == crate::batch_search::BatchMetric::L2 {
+        return GpuDotShaderKind::Unpack;
+    }
+    select_dot_shader(
+        f16_arith_available,
+        row_max_abs,
+        query_max_abs,
+        query_has_subnormal_underflow,
+        query_has_precision_loss,
+    )
 }
 
 /// クエリバッファをホスト側で `encoding` に従いバイト列化する
@@ -1941,6 +2126,11 @@ impl GpuBatchBackend {
         })
     }
 
+    /// この backend の常駐行列の metric（Issue #2003）。
+    pub fn metric(&self) -> BatchMetric {
+        self.matrix.metric()
+    }
+
     /// `SHADER_F16` 対応アダプタでこのプロセスの GPU 経路が f16 算術版
     /// シェーダを使えるかどうか（Issue #539）。テナント・行数などの情報は
     /// 含まない、GPU 初期化結果のみに依存する情報提供専用の問い合わせ。
@@ -2076,7 +2266,24 @@ impl GpuBatchBackend {
         // の `BatchBackend` trait doc 参照）、本バックエンドは独自の走査
         // パイプラインを持つため（`run_batch_search` を経由しない）防御的に
         // 再検証する（TASK-128 設計方針 §3.2 ポインタ）。
-        validate_batch_queries(self.matrix.dim(), queries).map_err(BatchExecError::Input)?;
+        let metric = self.matrix.metric();
+        validate_batch_queries_for_metric(self.matrix.dim(), metric, queries)
+            .map_err(BatchExecError::Input)?;
+        // Cosine（Issue #2003）: クエリを入口で 1 回だけ正規化し、以降のシェーダ選択の
+        // 統計・タイル化・dispatch はすべて正規化済みクエリを使う（行は構築時に正規化済み）。
+        let norm_store: Vec<f32> = if metric == BatchMetric::Cosine {
+            normalize_query_store(self.matrix.dim(), queries).map_err(BatchExecError::Input)?
+        } else {
+            Vec::new()
+        };
+        let normalized_queries: Vec<BatchQuery<'_>>;
+        let queries: &[BatchQuery<'_>] = if metric == BatchMetric::Cosine {
+            normalized_queries = queries_over_store(queries, &norm_store, self.matrix.dim())
+                .map_err(BatchExecError::Input)?;
+            &normalized_queries
+        } else {
+            queries
+        };
 
         // dispatch 前の総量ガード（Issue #178 レビュー指摘対応: GPU 経路が
         // `queries.len()` を乗じていなかった DoS 増幅の修正と、その後の
@@ -2127,6 +2334,7 @@ impl GpuBatchBackend {
             row_max_abs: &self.row_max_abs,
             forced_dot_shader,
             stats: &self.stats,
+            metric,
         });
 
         run_tiled_batch_search(
@@ -2207,6 +2415,10 @@ impl BatchBackend for GpuBatchBackend {
     fn batch_search(&self, queries: &[BatchQuery<'_>]) -> Result<Vec<BatchHit>, BatchExecError> {
         self.batch_search_with_budget(queries, GPU_SCORE_BUFFER_BUDGET_BYTES)
     }
+
+    fn metric(&self) -> BatchMetric {
+        self.matrix.metric()
+    }
 }
 
 /// [`GpuBatchBackend::batch_search`]/[`GpuF32ContrastBackend::batch_search`]
@@ -2265,6 +2477,8 @@ struct AdaptiveShaderSelector<'a> {
     row_max_abs: &'a [f32],
     forced_dot_shader: Option<GpuDotShaderKind>,
     stats: &'a GpuBatchStats,
+    /// 常駐行列の metric（Issue #2003）。シェーダ選択の制約と uniform コードに使う。
+    metric: BatchMetric,
 }
 
 impl<'a> AdaptiveShaderSelector<'a> {
@@ -2281,7 +2495,8 @@ impl<'a> AdaptiveShaderSelector<'a> {
         let f16_available = self.gpu_ctx.f16_arith_pipelines.is_some();
         let row_max_abs = max_abs_finite_from_precomputed_rows(self.row_max_abs, reachable);
         let query_stats = max_abs_finite_from_queries_subset(queries, group);
-        let natural_shader_kind = select_dot_shader(
+        let natural_shader_kind = select_dot_shader_for_metric(
+            self.metric,
             f16_available,
             row_max_abs,
             query_stats.max_abs,
@@ -2346,6 +2561,7 @@ impl<'a> AdaptiveShaderSelector<'a> {
             bind_group_layout: self.bind_group_layout,
             row_stride: self.row_stride,
             query_encoding,
+            metric: shader_metric_code(self.metric),
         })
     }
 }
@@ -2699,11 +2915,36 @@ impl GpuF32ContrastBackend {
         dim: usize,
         vectors: &[f32],
     ) -> Result<Self, BatchBackendError> {
-        let matrix =
-            crate::batch_search::ResidentMatrix::build(ids, tenant_ids, visibilities, dim, vectors)
-                .map_err(|e| {
-                    BatchBackendError::InitFailed(format!("resident matrix build failed: {e}"))
-                })?;
+        Self::try_new_with_metric(
+            ids,
+            tenant_ids,
+            visibilities,
+            dim,
+            vectors,
+            BatchMetric::InnerProduct,
+        )
+    }
+
+    /// [`Self::try_new`] の metric 指定版（Issue #2003。f16/f32 の A/B を metric ごとに
+    /// 測るため）。Cosine では GPU へ上げる f32 列も `ResidentMatrix` と同じ関数で正規化する
+    /// （正規化できない行は NaN 行になり走査時に除外される）。
+    pub fn try_new_with_metric(
+        ids: &[u64],
+        tenant_ids: &[String],
+        visibilities: &[crate::storage::Visibility],
+        dim: usize,
+        vectors: &[f32],
+        metric: BatchMetric,
+    ) -> Result<Self, BatchBackendError> {
+        let matrix = crate::batch_search::ResidentMatrix::build_with_metric(
+            ids,
+            tenant_ids,
+            visibilities,
+            dim,
+            vectors,
+            metric,
+        )
+        .map_err(|e| BatchBackendError::InitFailed(format!("resident matrix build failed: {e}")))?;
 
         let ctx = match global_context() {
             Ok(ctx) => ctx,
@@ -2735,7 +2976,25 @@ impl GpuF32ContrastBackend {
         let _guard = gpu_dispatch_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let vectors_staging = bytes_of_f32_slice(vectors)?;
+        let normalized_vectors: Vec<f32>;
+        let upload_vectors: &[f32] = if metric == BatchMetric::Cosine {
+            let mut buf: Vec<f32> = Vec::new();
+            try_reserve_f32(&mut buf, vectors.len())?;
+            buf.extend_from_slice(vectors);
+            // `ResidentMatrix::build_with_metric` が dim > 0 を検証済み。
+            let mut src: Vec<f32> = Vec::new();
+            try_reserve_f32(&mut src, dim)?;
+            for row in buf.chunks_mut(dim.max(1)) {
+                src.clear();
+                src.extend_from_slice(row);
+                crate::batch_search::normalize_row_or_nan(&src, row);
+            }
+            normalized_vectors = buf;
+            &normalized_vectors
+        } else {
+            vectors
+        };
+        let vectors_staging = bytes_of_f32_slice(upload_vectors)?;
         let validation_scope = ctx.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let oom_scope = ctx.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
         let row_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
@@ -2810,7 +3069,22 @@ impl GpuF32ContrastBackend {
             ));
         }
 
-        validate_batch_queries(self.matrix.dim(), queries).map_err(BatchExecError::Input)?;
+        let metric = self.matrix.metric();
+        validate_batch_queries_for_metric(self.matrix.dim(), metric, queries)
+            .map_err(BatchExecError::Input)?;
+        let norm_store: Vec<f32> = if metric == BatchMetric::Cosine {
+            normalize_query_store(self.matrix.dim(), queries).map_err(BatchExecError::Input)?
+        } else {
+            Vec::new()
+        };
+        let normalized_queries: Vec<BatchQuery<'_>>;
+        let queries: &[BatchQuery<'_>] = if metric == BatchMetric::Cosine {
+            normalized_queries = queries_over_store(queries, &norm_store, self.matrix.dim())
+                .map_err(BatchExecError::Input)?;
+            &normalized_queries
+        } else {
+            queries
+        };
         check_reachable_batch_work(&self.matrix, queries).map_err(BatchExecError::Input)?;
 
         let ctx = match global_context() {
@@ -2844,6 +3118,7 @@ impl GpuF32ContrastBackend {
             // CORE-16 対照経路は Issue #539（f16 算術版）の対象外。常に f32
             // 常駐のまま比較する契約を保つため `QueryEncoding::F32` 固定。
             query_encoding: QueryEncoding::F32,
+            metric: shader_metric_code(metric),
         };
         let strategy = TargetStrategy::Fixed(target);
 
@@ -2884,6 +3159,10 @@ impl GpuF32ContrastBackend {
 impl BatchBackend for GpuF32ContrastBackend {
     fn batch_search(&self, queries: &[BatchQuery<'_>]) -> Result<Vec<BatchHit>, BatchExecError> {
         self.batch_search_with_budget_and_mode(queries, GPU_SCORE_BUFFER_BUDGET_BYTES, false)
+    }
+
+    fn metric(&self) -> BatchMetric {
+        self.matrix.metric()
     }
 }
 
@@ -3029,7 +3308,10 @@ fn gather_reachable_rows(
         .zip(matrix.visibilities().iter())
         .enumerate()
     {
-        if ctx.is_visible(tenant, *visibility) {
+        // Cosine で正規化不可の行は NaN 行として常駐しているが、WGSL は非有限値の
+        // 伝播を保証せず不定の有限スコアが Top-k に入りうるため、GPU へ渡さず除外する
+        // （CPU 側は NaN スコアを非有限除外で落とすので結果が揃う）。
+        if !matrix.is_unscorable(idx) && ctx.is_visible(tenant, *visibility) {
             // `idx` は `ResidentMatrix::build` が `MAX_BATCH_ROWS`
             // （1,000,000）以下に制限済みのため `u32` で表現できる。
             if let Ok(idx_u32) = u32::try_from(idx) {
@@ -3094,6 +3376,8 @@ struct DotDispatchTarget<'a> {
     /// この値に従って `queries_concat`（常に f32 論理値）を
     /// [`encode_query_bytes`] でバイト列化する。
     query_encoding: QueryEncoding,
+    /// uniform の metric コード（[`shader_metric_code`]。Issue #2003）。
+    metric: u32,
 }
 
 /// 1 クエリ × `row_indices` 分の内積を GPU で計算し、readback した `f32` 列を返す。
@@ -3143,6 +3427,7 @@ fn dispatch_dot_products(
         row_count,
         query_count: query_count_u32,
         query_stride: query_stride as u32,
+        metric: target.metric,
     };
 
     // ステージング用バイト列（ホスト側の確保）は error scope を push する**前**に
@@ -3163,7 +3448,7 @@ fn dispatch_dot_products(
 
     let params_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("batch dot product params"),
-        size: 16,
+        size: 32,
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
@@ -3438,6 +3723,7 @@ fn dispatch_partial_topk(
         query_count: query_count_u32,
         query_stride: query_stride as u32,
         k_out: k_out_u32,
+        metric: target.metric,
     };
 
     let params_bytes = params.to_ne_bytes_vec()?;
@@ -4752,6 +5038,33 @@ mod tests {
         );
     }
 
+    // Cosine で正規化不可（ゼロノルム）の行が GPU 候補（可視行収集）から除外されること。
+    #[test]
+    fn gather_reachable_rows_excludes_unnormalizable_cosine_rows() {
+        let dim = 2usize;
+        let ids = vec![1u64, 2, 3];
+        let tenant_ids = vec!["a".to_string(); 3];
+        let visibilities = vec![Visibility::Private; 3];
+        let vectors = vec![1.0f32, 0.0, 0.0, 0.0, 0.0, 2.0];
+        let matrix = crate::batch_search::ResidentMatrix::build_with_metric(
+            &ids,
+            &tenant_ids,
+            &visibilities,
+            dim,
+            &vectors,
+            BatchMetric::Cosine,
+        )
+        .expect("cosine matrix should build");
+        let ctx = PolicyContext::with_visibilities("a", [Visibility::Private])
+            .expect("policy context should build");
+        let reachable = gather_reachable_rows(&matrix, &ctx).expect("rows should gather");
+        assert_eq!(
+            reachable,
+            vec![0, 2],
+            "zero-norm row must not reach the shader"
+        );
+    }
+
     // GPU デバイスが利用可能な実行環境でのみ実走する end-to-end 正しさの検証。
     // 利用不能な環境（CI の GitHub ホステッド runner 等）では `try_new` が
     // `InitFailed` を返すため、テスト自体は「初期化失敗を確認して終了」に
@@ -4916,6 +5229,7 @@ mod tests {
             query_count: 3,
             query_stride: 4,
             k_out: 5,
+            metric: 1,
         };
         let bytes = params
             .to_ne_bytes_vec()
@@ -4926,7 +5240,8 @@ mod tests {
         assert_eq!(&bytes[8..12], &3u32.to_ne_bytes());
         assert_eq!(&bytes[12..16], &4u32.to_ne_bytes());
         assert_eq!(&bytes[16..20], &5u32.to_ne_bytes());
-        assert_eq!(&bytes[20..32], &[0u8; 12]);
+        assert_eq!(&bytes[20..24], &1u32.to_ne_bytes());
+        assert_eq!(&bytes[24..32], &[0u8; 8]);
     }
 
     #[test]
@@ -5045,5 +5360,95 @@ mod tests {
             assert_eq!(a.id, b.id);
             assert_eq!(a.score.to_bits(), b.score.to_bits());
         }
+    }
+    // ---------------------------------------------------------------
+    // Issue #2003: metric 対応（ポインタ: CORE-6・CORE-16・SQL-33）。GPU 不要の単体テスト。
+    // ---------------------------------------------------------------
+
+    /// WGSL 側の `METRIC_*` 定数がホストの `shader_metric_code` と一致し、4 本の
+    /// 本番／対照シェーダすべてが宣言していること。
+    #[test]
+    fn wgsl_metric_constants_match_host_codes_in_all_four_shaders() {
+        use crate::batch_search::BatchMetric;
+        assert_eq!(shader_metric_code(BatchMetric::InnerProduct), 0);
+        assert_eq!(shader_metric_code(BatchMetric::Cosine), 0);
+        assert_eq!(shader_metric_code(BatchMetric::L2), 1);
+        for (name, src) in [
+            ("unpack", DOT_SHADER_WGSL),
+            ("f32", DOT_SHADER_F32_WGSL),
+            ("topk unpack", DOT_SHADER_TOPK_WGSL),
+            ("topk f32", DOT_SHADER_TOPK_F32_WGSL),
+        ] {
+            assert!(src.contains("const METRIC_DOT: u32 = 0u;"), "{name}");
+            assert!(src.contains("const METRIC_L2: u32 = 1u;"), "{name}");
+            assert!(src.contains("params.metric == METRIC_L2"), "{name}");
+        }
+    }
+
+    /// 全量 readback シェーダと部分 Top-k シェーダの L2 分岐（ループと符号反転）が文字列として
+    /// 同一であること（ビット同一契約の前提。`topk_dot_shader!` と全量版を別々に編集して
+    /// 食い違うのを防ぐ）。
+    #[test]
+    fn l2_branch_text_is_identical_between_full_and_topk_shaders() {
+        fn l2_branch(src: &str) -> &str {
+            let start = src
+                .find("if (params.metric == METRIC_L2) {")
+                .expect("L2 branch");
+            let end = src[start..].find("} else {").expect("else") + start;
+            &src[start..end]
+        }
+        assert_eq!(l2_branch(DOT_SHADER_WGSL), l2_branch(DOT_SHADER_TOPK_WGSL));
+        assert_eq!(
+            l2_branch(DOT_SHADER_F32_WGSL),
+            l2_branch(DOT_SHADER_TOPK_F32_WGSL)
+        );
+        assert!(l2_branch(DOT_SHADER_WGSL).contains("acc[qn] = -acc[qn];"));
+    }
+
+    /// f16 算術版の WGSL `Params` は 16 バイトのまま（metric を持たない）。32 バイトの
+    /// uniform バッファの先頭 16 バイトを読む互換前提を固定する。
+    #[test]
+    fn f16_arith_shader_params_stay_16_bytes_without_metric() {
+        let start = DOT_SHADER_F16_ARITH_WGSL
+            .find("struct Params {")
+            .expect("Params");
+        let end = DOT_SHADER_F16_ARITH_WGSL[start..].find("};").unwrap() + start;
+        let body = &DOT_SHADER_F16_ARITH_WGSL[start..end];
+        assert!(!body.contains("metric"));
+        assert_eq!(body.matches(": u32").count(), 4);
+    }
+
+    #[test]
+    fn gpu_params_to_ne_bytes_vec_is_32_bytes_with_metric_at_offset_16() {
+        let bytes = GpuParams {
+            row_stride: 1,
+            row_count: 2,
+            query_count: 3,
+            query_stride: 4,
+            metric: 1,
+        }
+        .to_ne_bytes_vec()
+        .unwrap();
+        assert_eq!(bytes.len(), 32);
+        assert_eq!(&bytes[12..16], &4u32.to_ne_bytes());
+        assert_eq!(&bytes[16..20], &1u32.to_ne_bytes());
+        assert_eq!(&bytes[20..32], &[0u8; 12]);
+    }
+
+    #[test]
+    fn select_dot_shader_for_metric_pins_l2_to_unpack_and_keeps_cosine_guards() {
+        use crate::batch_search::BatchMetric;
+        // 内積なら f16 算術版が選ばれる条件。
+        let ip =
+            select_dot_shader_for_metric(BatchMetric::InnerProduct, true, 1.0, 1.0, false, false);
+        assert_eq!(ip, GpuDotShaderKind::F16Arith);
+        let cos = select_dot_shader_for_metric(BatchMetric::Cosine, true, 1.0, 1.0, false, false);
+        assert_eq!(cos, GpuDotShaderKind::F16Arith);
+        let l2 = select_dot_shader_for_metric(BatchMetric::L2, true, 1.0, 1.0, false, false);
+        assert_eq!(l2, GpuDotShaderKind::Unpack);
+        // Cosine でも既存ガードはそのまま効く。
+        let guarded =
+            select_dot_shader_for_metric(BatchMetric::Cosine, true, 1.0, 1.0, false, true);
+        assert_eq!(guarded, GpuDotShaderKind::Unpack);
     }
 }

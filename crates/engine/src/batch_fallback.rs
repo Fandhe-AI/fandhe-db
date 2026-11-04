@@ -63,8 +63,9 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use crate::batch_search::{
-    run_batch_search, BatchEngine, BatchHit, BatchQuery, BatchRowSource, BatchSearchError,
-    ResidentMatrix, MAX_BATCH_TOTAL_BYTES,
+    normalize_row_or_nan, run_batch_search, validate_batch_queries_for_metric, BatchEngine,
+    BatchHit, BatchMetric, BatchQuery, BatchRowSource, BatchSearchError, ResidentMatrix,
+    MAX_BATCH_TOTAL_BYTES,
 };
 use crate::dispatch::{self, DispatchInput, ExecutionPath, GpuCapability};
 use crate::storage::Visibility;
@@ -187,6 +188,14 @@ impl std::error::Error for BatchExecError {}
 /// バックエンド実行障害（デバイスロスト等）専用に使うこと。
 pub trait BatchBackend: Send + Sync {
     fn batch_search(&self, queries: &[BatchQuery<'_>]) -> Result<Vec<BatchHit>, BatchExecError>;
+
+    /// この backend が採点に使う metric（Issue #2003。ポインタ: CORE-6・CORE-16）。
+    /// 既定は内積（従来の実装との互換）。`FallbackBatchEngine::build_with_metric` は
+    /// factory が返した backend の値が engine の metric と違えば、順位を誤る経路を作らない
+    /// ために初期化失敗として CPU 縮退へ倒す。
+    fn metric(&self) -> BatchMetric {
+        BatchMetric::InnerProduct
+    }
 }
 
 /// 既存 `BatchEngine`（f16 パック常駐行列を走査する GPU 経路の CPU 参照実装。
@@ -198,12 +207,15 @@ pub trait BatchBackend: Send + Sync {
 /// 残す（`Self::build_with_gpu_reference`）。
 pub struct GpuReferenceBackend {
     engine: BatchEngine,
+    metric: BatchMetric,
 }
 
 impl GpuReferenceBackend {
     pub fn new(matrix: ResidentMatrix) -> Self {
+        let metric = matrix.metric();
         Self {
             engine: BatchEngine::new(matrix),
+            metric,
         }
     }
 }
@@ -213,6 +225,10 @@ impl BatchBackend for GpuReferenceBackend {
         self.engine
             .batch_search(queries)
             .map_err(BatchExecError::Input)
+    }
+
+    fn metric(&self) -> BatchMetric {
+        self.metric
     }
 }
 
@@ -286,7 +302,9 @@ struct CpuFallbackMatrix {
     tenant_ids: Vec<String>,
     visibilities: Vec<Visibility>,
     dim: usize,
+    /// Cosine のときは構築時に行単位で正規化済み（正規化できない行は NaN 行）。
     vectors: Vec<f32>,
+    metric: BatchMetric,
 }
 
 impl BatchRowSource for CpuFallbackMatrix {
@@ -308,6 +326,10 @@ impl BatchRowSource for CpuFallbackMatrix {
 
     fn visibilities(&self) -> &[Visibility] {
         &self.visibilities
+    }
+
+    fn metric(&self) -> BatchMetric {
+        self.metric
     }
 
     fn row_f32_into(&self, idx: usize, out: &mut Vec<f32>) -> Option<()> {
@@ -377,6 +399,34 @@ impl FallbackBatchEngine {
         backend_factory: impl FnOnce(ResidentMatrix) -> Result<Box<dyn BatchBackend>, BatchBackendError>,
         observer: Box<dyn FallbackObserver>,
     ) -> Result<Self, BatchSearchError> {
+        Self::build_with_metric(
+            ids,
+            tenant_ids,
+            visibilities,
+            dim,
+            vectors,
+            BatchMetric::InnerProduct,
+            backend_factory,
+            observer,
+        )
+    }
+
+    /// [`Self::build`] の metric 指定版（Issue #2003。ポインタ: CORE-6・CORE-16・SQL-33）。
+    /// primary 用の f16 常駐行列と CPU 縮退用の f32 行列は、同じ元データから同じ関数で
+    /// 正規化する（Cosine）。`backend_factory` が返した backend の [`BatchBackend::metric`]
+    /// が `metric` と違う場合は、誤った順位を返す経路を作らないため初期化失敗
+    /// （[`FallbackReason::Init`]）として CPU 専用モードにする。
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_with_metric(
+        ids: &[u64],
+        tenant_ids: &[String],
+        visibilities: &[Visibility],
+        dim: usize,
+        vectors: &[f32],
+        metric: BatchMetric,
+        backend_factory: impl FnOnce(ResidentMatrix) -> Result<Box<dyn BatchBackend>, BatchBackendError>,
+        observer: Box<dyn FallbackObserver>,
+    ) -> Result<Self, BatchSearchError> {
         // CPU 縮退用 f32 行列の容量検証（本モジュール冒頭コメント「データ
         // 所有権・二重常駐について」参照）。`ResidentMatrix::build`（f16 パック、
         // f32 のおよそ半分のバイト数）より先に本チェックを置く: f32 原本は
@@ -438,7 +488,8 @@ impl FallbackBatchEngine {
         // 重複 id・tenant_id 長の検証はここで一元的に行われ
         // （`ResidentMatrix::build`）、CPU 縮退用の f32 行列はこの検証を通過した
         // 後に同じ元データから独立に構築する（検証ロジックの二重管理を避ける）。
-        let resident = ResidentMatrix::build(ids, tenant_ids, visibilities, dim, vectors)?;
+        let resident =
+            ResidentMatrix::build_with_metric(ids, tenant_ids, visibilities, dim, vectors, metric)?;
 
         // 以降のフォールブル確保は `ResidentMatrix::build` と同方針
         // （`Vec::with_capacity`・`to_vec()`・`String::clone` は abort-on-OOM
@@ -452,6 +503,21 @@ impl FallbackBatchEngine {
                 ))
             })?;
         owned_vectors.extend_from_slice(vectors);
+        if metric == BatchMetric::Cosine {
+            // `ResidentMatrix::build_with_metric` と同じ関数・同じ入力で行ごとに正規化する
+            // （両系統が同じ f32 から出発するため、縮退後の順位が一致しやすい）。
+            let mut scratch: Vec<f32> = Vec::new();
+            scratch.try_reserve_exact(dim).map_err(|e| {
+                BatchSearchError::AllocationFailed(format!(
+                    "failed to reserve fallback normalize scratch: {e}"
+                ))
+            })?;
+            scratch.resize(dim, 0.0);
+            for row in owned_vectors.chunks_mut(dim) {
+                normalize_row_or_nan(row, &mut scratch);
+                row.copy_from_slice(&scratch);
+            }
+        }
 
         let mut owned_ids: Vec<u64> = Vec::new();
         owned_ids.try_reserve_exact(ids.len()).map_err(|e| {
@@ -494,9 +560,18 @@ impl FallbackBatchEngine {
             visibilities: owned_visibilities,
             dim,
             vectors: owned_vectors,
+            metric,
         };
 
         let primary = match backend_factory(resident) {
+            // metric を無視する／取り違える外部実装が誤った順位を返す経路を作らない。
+            Ok(backend) if backend.metric() != metric => {
+                observer.on_fallback(FallbackEvent {
+                    reason: FallbackReason::Init,
+                    target: "cpu-simd",
+                });
+                PrimarySlot::Unavailable
+            }
             Ok(backend) => PrimarySlot::Available(backend),
             Err(init_err) => {
                 // `backend_factory` の戻り値型は `BatchBackendError` 全種別を
@@ -533,12 +608,34 @@ impl FallbackBatchEngine {
         vectors: &[f32],
         observer: Box<dyn FallbackObserver>,
     ) -> Result<Self, BatchSearchError> {
-        Self::build(
+        Self::build_with_gpu_reference_metric(
             ids,
             tenant_ids,
             visibilities,
             dim,
             vectors,
+            BatchMetric::InnerProduct,
+            observer,
+        )
+    }
+
+    /// [`Self::build_with_gpu_reference`] の metric 指定版（Issue #2003。テスト・ベンチ用）。
+    pub fn build_with_gpu_reference_metric(
+        ids: &[u64],
+        tenant_ids: &[String],
+        visibilities: &[Visibility],
+        dim: usize,
+        vectors: &[f32],
+        metric: BatchMetric,
+        observer: Box<dyn FallbackObserver>,
+    ) -> Result<Self, BatchSearchError> {
+        Self::build_with_metric(
+            ids,
+            tenant_ids,
+            visibilities,
+            dim,
+            vectors,
+            metric,
             |matrix| Ok(Box::new(GpuReferenceBackend::new(matrix)) as Box<dyn BatchBackend>),
             observer,
         )
@@ -558,12 +655,35 @@ impl FallbackBatchEngine {
         vectors: &[f32],
         observer: Box<dyn FallbackObserver>,
     ) -> Result<Self, BatchSearchError> {
-        Self::build(
+        Self::build_with_gpu_metric(
             ids,
             tenant_ids,
             visibilities,
             dim,
             vectors,
+            BatchMetric::InnerProduct,
+            observer,
+        )
+    }
+
+    /// [`Self::build_with_gpu`] の metric 指定版（Issue #2003。ポインタ: CORE-6・CORE-16・
+    /// SQL-33）。GPU の初期化に失敗した環境でも CPU 縮退で同じ metric の結果を返す。
+    pub fn build_with_gpu_metric(
+        ids: &[u64],
+        tenant_ids: &[String],
+        visibilities: &[Visibility],
+        dim: usize,
+        vectors: &[f32],
+        metric: BatchMetric,
+        observer: Box<dyn FallbackObserver>,
+    ) -> Result<Self, BatchSearchError> {
+        Self::build_with_metric(
+            ids,
+            tenant_ids,
+            visibilities,
+            dim,
+            vectors,
+            metric,
             |matrix| {
                 crate::gpu_batch::GpuBatchBackend::try_new(matrix)
                     .map(|backend| Box::new(backend) as Box<dyn BatchBackend>)
@@ -804,7 +924,7 @@ impl FallbackBatchEngine {
         // primary を構築した場合、本チェックはその primary にとって正しい
         // 検証にならない（現状の唯一の実装 [`GpuReferenceBackend::new`] は
         // 渡された `ResidentMatrix` をそのまま使うためこの契約を満たす）。
-        crate::batch_search::validate_batch_queries(self.cpu.dim, queries)?;
+        validate_batch_queries_for_metric(self.cpu.dim, self.cpu.metric, queries)?;
 
         // 空バッチ（`queries.is_empty()`）を先行検証直後に確定的に扱う（Cursor Bugbot
         // Medium 指摘対応・PR #158）。`validate_batch_queries` は件数 0 を有効な入力
@@ -2257,5 +2377,190 @@ mod tests {
         // 期限が外れれば primary のまま通常どおり動く（ラッチされていない）。
         assert_eq!(engine.batch_search(&queries).expect("search ok").len(), 1);
         assert!(observer.events().is_empty());
+    }
+    // ---------------------------------------------------------------
+    // Issue #2003: metric 対応（ポインタ: CORE-6・CORE-16・SQL-33）
+    // ---------------------------------------------------------------
+
+    /// 縮退イベントを共有ハンドル越しに読めるオブザーバ（Issue #2003 のテスト用）。
+    #[derive(Clone, Default)]
+    struct MetricObserver(std::sync::Arc<std::sync::Mutex<Vec<FallbackEvent>>>);
+
+    impl MetricObserver {
+        fn events(&self) -> Vec<FallbackEvent> {
+            self.0.lock().expect("lock").clone()
+        }
+    }
+
+    impl FallbackObserver for MetricObserver {
+        fn on_fallback(&self, event: FallbackEvent) {
+            self.0.lock().expect("lock").push(event);
+        }
+    }
+
+    fn metric_fixture_rows() -> (Vec<u64>, Vec<String>, Vec<Visibility>, usize, Vec<f32>) {
+        let ids = vec![1u64, 2, 3, 4, 5];
+        let tenants = vec!["t".to_string(); 5];
+        let vis = vec![Visibility::Public; 5];
+        #[rustfmt::skip]
+        let vectors = vec![
+            1.0, 2.0, 3.0,
+            2.0, 2.0, 3.0,
+            5.0, 2.0, 3.0,
+            -1.0, 0.5, 0.25,
+            0.0, 0.0, 0.0,
+        ];
+        (ids, tenants, vis, 3, vectors)
+    }
+
+    /// 呼ばれたら失敗する metric 不一致の primary（既定実装の `metric()` = 内積）。
+    struct InnerProductOnlyBackend;
+
+    impl BatchBackend for InnerProductOnlyBackend {
+        fn batch_search(
+            &self,
+            _queries: &[BatchQuery<'_>],
+        ) -> Result<Vec<BatchHit>, BatchExecError> {
+            Err(BatchExecError::Backend(
+                BatchBackendError::KernelLaunchFailed("must not be called".to_string()),
+            ))
+        }
+    }
+
+    fn metric_search_ids(engine: &FallbackBatchEngine, q: &[f32], k: usize) -> Vec<(u64, f32)> {
+        let c = ctx("t");
+        let bq = BatchQuery {
+            vector: q,
+            k,
+            ctx: &c,
+        };
+        let hits = engine
+            .batch_search(std::slice::from_ref(&bq))
+            .expect("batch_search");
+        hits[0].hits.iter().map(|h| (h.id, h.score)).collect()
+    }
+
+    #[test]
+    fn build_with_metric_init_failure_falls_back_with_one_event_for_l2_and_cosine() {
+        for metric in [BatchMetric::L2, BatchMetric::Cosine] {
+            let (ids, tenants, vis, dim, vectors) = metric_fixture_rows();
+            let observer = MetricObserver::default();
+            let engine = FallbackBatchEngine::build_with_metric(
+                &ids,
+                &tenants,
+                &vis,
+                dim,
+                &vectors,
+                metric,
+                |_m| Err(BatchBackendError::InitFailed("no gpu".to_string())),
+                Box::new(observer.clone()),
+            )
+            .unwrap();
+            assert_eq!(observer.events().len(), 1);
+            let got = metric_search_ids(&engine, &[1.0, 2.0, 3.0], 3);
+            match metric {
+                BatchMetric::L2 => {
+                    assert_eq!(got, vec![(1, 0.0), (2, -1.0), (4, -13.8125)]);
+                }
+                _ => {
+                    // コサイン: 行 1 が完全一致（類似度 1）で先頭。ゼロノルム行 5 は除外。
+                    assert_eq!(got[0].0, 1);
+                    assert!((got[0].1 - 1.0).abs() < 1e-6);
+                    assert!(got.iter().all(|(id, _)| *id != 5));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn build_with_metric_rejects_backend_with_mismatched_metric_as_init_failure() {
+        let (ids, tenants, vis, dim, vectors) = metric_fixture_rows();
+        let observer = MetricObserver::default();
+        let engine = FallbackBatchEngine::build_with_metric(
+            &ids,
+            &tenants,
+            &vis,
+            dim,
+            &vectors,
+            BatchMetric::L2,
+            |_m| Ok(Box::new(InnerProductOnlyBackend) as Box<dyn BatchBackend>),
+            Box::new(observer.clone()),
+        )
+        .unwrap();
+        let events = observer.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].reason.to_string(), "init");
+        // 内積を返す primary は使われず、CPU 縮退が L2 の正しい順位を返す。
+        let got = metric_search_ids(&engine, &[1.0, 2.0, 3.0], 2);
+        assert_eq!(got, vec![(1, 0.0), (2, -1.0)]);
+    }
+
+    #[test]
+    fn cosine_zero_norm_query_is_rejected_before_primary_without_latch_or_event() {
+        let (ids, tenants, vis, dim, vectors) = metric_fixture_rows();
+        let observer = MetricObserver::default();
+        let engine = FallbackBatchEngine::build_with_gpu_reference_metric(
+            &ids,
+            &tenants,
+            &vis,
+            dim,
+            &vectors,
+            BatchMetric::Cosine,
+            Box::new(observer.clone()),
+        )
+        .unwrap();
+        let c = ctx("t");
+        let zero = [0.0f32; 3];
+        let bq = BatchQuery {
+            vector: &zero,
+            k: 2,
+            ctx: &c,
+        };
+        let err = engine.batch_search(std::slice::from_ref(&bq)).unwrap_err();
+        assert_eq!(err, BatchSearchError::ZeroNormQuery { query_index: 0 });
+        assert!(observer.events().is_empty());
+        // ラッチされていないので、続く正常クエリは primary で成功する。
+        let got = metric_search_ids(&engine, &[1.0, 2.0, 3.0], 2);
+        assert_eq!(got[0].0, 1);
+        assert!(observer.events().is_empty());
+    }
+
+    #[test]
+    fn gpu_reference_primary_and_cpu_fallback_agree_for_l2_and_cosine() {
+        for metric in [BatchMetric::L2, BatchMetric::Cosine] {
+            let (ids, tenants, vis, dim, vectors) = metric_fixture_rows();
+            let observer = MetricObserver::default();
+            let primary = FallbackBatchEngine::build_with_gpu_reference_metric(
+                &ids,
+                &tenants,
+                &vis,
+                dim,
+                &vectors,
+                metric,
+                Box::new(observer.clone()),
+            )
+            .unwrap();
+            let cpu_only = FallbackBatchEngine::build_with_metric(
+                &ids,
+                &tenants,
+                &vis,
+                dim,
+                &vectors,
+                metric,
+                |_m| Err(BatchBackendError::InitFailed("forced".to_string())),
+                Box::new(MetricObserver::default()),
+            )
+            .unwrap();
+            let q = [1.5f32, 2.0, 2.5];
+            let a = metric_search_ids(&primary, &q, 4);
+            let b = metric_search_ids(&cpu_only, &q, 4);
+            let ids_a: Vec<u64> = a.iter().map(|x| x.0).collect();
+            let ids_b: Vec<u64> = b.iter().map(|x| x.0).collect();
+            assert_eq!(ids_a, ids_b, "{metric:?}");
+            for (x, y) in a.iter().zip(b.iter()) {
+                assert!((x.1 - y.1).abs() < 1e-2, "{metric:?}: {x:?} vs {y:?}");
+            }
+            assert!(observer.events().is_empty());
+        }
     }
 }

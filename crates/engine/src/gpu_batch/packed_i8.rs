@@ -54,7 +54,7 @@ use std::sync::OnceLock;
 
 use crate::batch_fallback::{BatchBackend, BatchBackendError, BatchExecError};
 use crate::batch_search::{
-    try_reserve_exact, BatchHit, BatchQuery, BatchSearchError, ResidentMatrix,
+    try_reserve_exact, BatchHit, BatchMetric, BatchQuery, BatchSearchError, ResidentMatrix,
 };
 use crate::kernel::{
     cosine_distance_from_parts, dot, l2_sq, row_norms_sq, CandidateHit, TopKSelector,
@@ -630,6 +630,13 @@ impl GpuI8BatchBackend {
                 "i8 oversample out of range".to_string(),
             ));
         }
+        // 常駐行列は生の行（内積）で持つ。コサイン用の正規化済み行列（Issue #2003）は i8 側の
+        // metric 処理と二重になるため拒否する。GPU コンテキスト取得より前に判定し fail-closed にする。
+        if matrix.metric() != crate::batch_search::BatchMetric::InnerProduct {
+            return Err(BatchBackendError::InitFailed(
+                "metric not supported by i8 backend".to_string(),
+            ));
+        }
         if !i8_supports_metric(metric) {
             return Err(BatchBackendError::InitFailed(
                 "i8 path does not support this metric".to_string(),
@@ -1039,6 +1046,18 @@ fn shrink_to_len(buf: Vec<(u32, i32)>) -> Result<Vec<(u32, i32)>, BatchSearchErr
 }
 
 impl BatchBackend for GpuI8BatchBackend {
+    /// 構築時に固定した採点 metric を返す（Issue #2003）。`FallbackBatchEngine::build_with_metric`
+    /// が engine の metric との一致を検査し、不一致の backend を primary にしないための申告。
+    /// L1 は `try_new_with_metric` が構築前に拒否するため到達しない（`BatchMetric` に対応が
+    /// 無く、到達しても内積とは不一致になりうる申告に倒すより構築不能が保証されている）。
+    fn metric(&self) -> BatchMetric {
+        match self.metric {
+            GpuBatchMetric::InnerProduct | GpuBatchMetric::L1 => BatchMetric::InnerProduct,
+            GpuBatchMetric::L2 => BatchMetric::L2,
+            GpuBatchMetric::Cosine => BatchMetric::Cosine,
+        }
+    }
+
     fn batch_search(&self, queries: &[BatchQuery<'_>]) -> Result<Vec<BatchHit>, BatchExecError> {
         let raw = self.raw_i32_scores(queries)?;
 
@@ -1142,6 +1161,8 @@ fn dispatch_i8_dot_products(
         row_count,
         query_count: 1,
         query_stride: row_stride as u32,
+        // i8 版の WGSL `Params`（16 バイト）は metric を持たない。内積専用（Issue #2003）。
+        metric: 0,
     };
     let params_bytes = params.to_ne_bytes_vec().map_err(BatchExecError::Backend)?;
     let row_ids_bytes = bytes_of_u32_slice(row_indices).map_err(BatchExecError::Backend)?;
@@ -1152,7 +1173,7 @@ fn dispatch_i8_dot_products(
 
     let params_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("i8 batch dot product params"),
-        size: 16,
+        size: 32,
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
@@ -1592,5 +1613,85 @@ mod tests {
         // 検証は GPU デバイスへ触れる前に走る）だけを固定する。
         const _: () = assert!(DEFAULT_I8_OVERSAMPLE >= 1);
         const _: () = assert!(DEFAULT_I8_OVERSAMPLE <= MAX_I8_OVERSAMPLE);
+    }
+
+    /// 内積以外の metric の常駐行列では、GPU コンテキストへ触れる前に fail-closed で拒否する
+    /// （Issue #2003。L2・Cosine の i8 対応は #2004）。
+    #[test]
+    fn try_new_rejects_non_inner_product_metric_before_touching_gpu() {
+        for metric in [
+            crate::batch_search::BatchMetric::L2,
+            crate::batch_search::BatchMetric::Cosine,
+        ] {
+            let matrix = ResidentMatrix::build_with_metric(
+                &[1],
+                &["t".to_string()],
+                &[crate::storage::Visibility::Public],
+                2,
+                &[1.0, 0.5],
+                metric,
+            )
+            .unwrap();
+            match GpuI8BatchBackend::try_new(matrix, GpuI8Options::default()) {
+                Err(BatchBackendError::InitFailed(msg)) => {
+                    assert_eq!(msg, "metric not supported by i8 backend", "{metric:?}");
+                }
+                other => panic!("expected InitFailed, got {:?}", other.map(|_| ())),
+            }
+        }
+    }
+
+    /// L2・Cosine の i8 backend は自分の metric を申告し、内積 engine の primary としては
+    /// 受理されず初期化縮退になる（Issue #2003 レビュー指摘）。GPU 非搭載環境では skip。
+    #[test]
+    fn i8_backend_reports_its_metric_and_is_rejected_by_mismatched_engine() {
+        use crate::batch_fallback::{FallbackBatchEngine, FallbackEvent, FallbackObserver};
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct Obs(Arc<Mutex<Vec<FallbackEvent>>>);
+        impl FallbackObserver for Obs {
+            fn on_fallback(&self, event: FallbackEvent) {
+                self.0.lock().expect("lock").push(event);
+            }
+        }
+
+        let ids = [1u64, 2];
+        let tenants = vec!["t".to_string(); 2];
+        let vis = vec![crate::storage::Visibility::Public; 2];
+        let vectors = [1.0f32, 0.5, 0.25, 2.0];
+        for (gm, bm) in [
+            (GpuBatchMetric::L2, BatchMetric::L2),
+            (GpuBatchMetric::Cosine, BatchMetric::Cosine),
+        ] {
+            let obs = Obs::default();
+            let mut reported = None;
+            let result = FallbackBatchEngine::build_with_metric(
+                &ids,
+                &tenants,
+                &vis,
+                2,
+                &vectors,
+                BatchMetric::InnerProduct,
+                |matrix| {
+                    let backend = GpuI8BatchBackend::try_new_with_metric(
+                        matrix,
+                        GpuI8Options::default(),
+                        gm,
+                    )?;
+                    reported = Some(backend.metric());
+                    Ok(Box::new(backend) as Box<dyn BatchBackend>)
+                },
+                Box::new(obs.clone()),
+            );
+            assert!(result.is_ok());
+            let Some(m) = reported else {
+                // GPU 非搭載: 構築できないため検証対象外。
+                return;
+            };
+            assert_eq!(m, bm);
+            // 内積 engine に metric 違いの backend は受理されず Init 縮退が通知される。
+            assert_eq!(obs.0.lock().expect("lock").len(), 1, "{gm:?}");
+        }
     }
 }
