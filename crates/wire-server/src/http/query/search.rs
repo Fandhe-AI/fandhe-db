@@ -379,7 +379,7 @@ pub fn bind_search(
     schema: &TableSchema,
     udfs: &engine::sql::udf_call::UdfRegistry,
 ) -> Result<BoundSearch, SearchError> {
-    bind_search_with_limits(
+    bind_search_with_metric_resolver(
         validated,
         schema,
         udfs,
@@ -389,11 +389,25 @@ pub fn bind_search(
 }
 
 /// [`bind_search`] の `limit` 範囲設定付き版（Issue #1555・SQL-34）。`limits` は
-/// `EngineCore::result_limits()`（起動時 CLI `--max-result-rows`）を渡す。
+/// `EngineCore::result_limits()`（起動時 CLI `--max-result-rows`）を渡す。`metric` 省略時は
+/// 従来どおり cosine（公開 API の互換維持。索引既定の距離種別を使う版は
+/// [`bind_search_with_metric_resolver`]）。
+pub fn bind_search_with_limits(
+    validated: &Validated<'_>,
+    schema: &TableSchema,
+    udfs: &engine::sql::udf_call::UdfRegistry,
+    limits: &engine::result_limits::ResultLimits,
+) -> Result<BoundSearch, SearchError> {
+    bind_search_with_metric_resolver(validated, schema, udfs, limits, &|| {
+        Ok(DistanceKind::Cosine)
+    })
+}
+
+/// [`bind_search_with_limits`] に `metric` 省略時の解決器を足した版（Issue #2243）。
 /// `index_default` は `metric` 省略時の距離種別の解決器（Issue #2243。engine の
 /// `IndexMetricDefault::distance_kind`）で、`vector` かつ非 `hybrid` で `metric` が
 /// 省略されたときだけ呼ぶ（明示指定の要求はカタログ読み取りの影響を受けない）。
-pub fn bind_search_with_limits(
+pub fn bind_search_with_metric_resolver(
     validated: &Validated<'_>,
     schema: &TableSchema,
     udfs: &engine::sql::udf_call::UdfRegistry,
@@ -589,7 +603,7 @@ pub(crate) fn bind_vector_statement(
     limits: &engine::result_limits::ResultLimits,
     index_metric: &IndexMetricDefault<'_>,
 ) -> Result<BoundStatement, SqlSurfaceError> {
-    match bind_search_with_limits(validated, schema, udfs, limits, &|| {
+    match bind_search_with_metric_resolver(validated, schema, udfs, limits, &|| {
         index_metric.distance_kind()
     })
     .map_err(to_sql_surface_error)?
@@ -712,9 +726,13 @@ pub fn execute(
                 // 採番方式の表は拒否する（実行と同一スナップショットのスキーマで判定。Issue #2199）。
                 super::gate::reject_allocated_schema(schema)?;
                 // `plan` 指定は距離種別を持たない（`metric` 併用は束縛段で `42601`）。
-                bind_search_with_limits(validated, schema, udfs, &engine.result_limits(), &|| {
-                    Ok(DistanceKind::Cosine)
-                })
+                bind_search_with_metric_resolver(
+                    validated,
+                    schema,
+                    udfs,
+                    &engine.result_limits(),
+                    &|| Ok(DistanceKind::Cosine),
+                )
             }
             .map_err(to_sql_surface_error)?
             {
@@ -1238,7 +1256,7 @@ mod tests {
     fn bind_with_default(text: &str, default: DistanceKind) -> Result<BoundSearch, SearchError> {
         let value = validate(text);
         let validated = SEARCH_SCHEMA.validate(&value).expect("must validate shape");
-        bind_search_with_limits(
+        bind_search_with_metric_resolver(
             &validated,
             &schema(),
             &udfs(),
