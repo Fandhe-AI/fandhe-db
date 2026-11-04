@@ -20,6 +20,7 @@
 
 ### Added
 
+- ベクトル関数 `vector_dims`・`vector_norm`・`l2_normalize`・`subvector` を追加した（Issue #2012・SQL-72 (1)(2)(5)(6) ポインタ）。`vector_norm` は `vec_norm` の別名、`subvector` は 1 始まりで範囲外・非整数・`i32` 範囲外を `22000`／`22003` で拒否する。4 名は予約名になり、同名の `CREATE FUNCTION` は `42723`、既存の同名 UDF は組み込みが優先される。ベクトルリテラルと `$n` の引数は未対応（従来どおり `42804`）。
 - GPU バッチ検索の距離種別 `engine::gpu_batch::GpuBatchMetric` と `GpuI8BatchBackend::try_new_with_metric` を追加した（Issue #2004・親 #2002・CORE-8・CORE-16・SQL-33 ポインタ）。i8 経路は InnerProduct・Cosine・L2 に対応し、L1 は `InitFailed` で拒否する（非破壊。`try_new` と `GpuI8Options` は不変）。
 - 距離順 `ORDER BY` を持つ検索 SELECT の投影位置に距離列 `<VECTOR 列> <距離演算子> <リテラル|$n> [AS 別名]` を受理し、float8 で返すようにした（Issue #2007・SQL-33 (7) ポインタ）。列・演算子種別・クエリベクトルが `ORDER BY` と同一の形だけを受理する（種別・列の不一致や距離 `ORDER BY` のない文は `42601`、クエリベクトルの不一致は `0A000`）。値は RLS 後の行から計算し、ゼロノルムのコサインは NaN。`<->`／`<#>`／`<+>` の実行はカーネル接続（#1981・#1991）まで `0A000` のまま。従来 `42601` だった入力は受理に変わる。公開 API の変更はない。
 - `sum(<VECTOR 列>)` と VECTOR 型の式（`sum(vec_div(embedding, 2))` 等）の `sum` を受け付けるようにした（Issue #2038・SQL-72 (3) ポインタ）。要素ごとに f64 で累積して f32 へ丸め、NULL 行は飛ばし、対象 0 行なら NULL、次元不一致は `22000`、f32 範囲超過は `22003`。`GROUP BY`・`FILTER`・他の集計への `HAVING` と併用できる。結果列は `vector`（wire の型 OID は 25）。挙動変更: `SUM(<VECTOR 列>)` は `42883` から受理に変わる。`MIN`／`MAX`／`AVG`、NoSQL、JOIN、FROM なしの SELECT、ウィンドウ（`0A000`）、集計結果の `HAVING`／`ORDER BY`／演算（`0A000`／`42601`）は従来どおり拒否。公開 API の変更はない。
@@ -285,6 +286,8 @@
 
 ### Breaking Changes
 
+- `sql::udf_call::BuiltinFn`（Issue #2012・SQL-72）に variant `VectorDims`／`L2Normalize`／`Subvector` を追加した。
+  BREAKING CHANGE: 網羅 `match` する外部コードは腕を足す。
 - 明示トランザクションが writer を取る時点を `BEGIN` から最初の書き込み文へ移した（Issue #2396・#2400・#2405・#2408・TASK-333・TASK-335・SQL-31・SQL-19・ERR-7・WIRE-15・WIRE-16・WIRE-19）。
   BREAKING CHANGE: `BEGIN`／`START TRANSACTION` は writer を取らず、その時点の読み取りスナップショットだけを開く。書き込み文（DML・`COPY FROM`・`LOCK TABLE`）で初めて writer を取る。行ロック句の取得は #2230 で未完。
   読み取りだけの Tx は他セッションを待たせず自分も待たない。`55P03` は `BEGIN` ではなく最初の書き込み文で返り Tx は `Failed`（以降 `25P02`）になる。`--write-lock-wait-ms` の待機は最初の書き込み文から効く。

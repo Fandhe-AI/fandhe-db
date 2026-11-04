@@ -227,6 +227,7 @@ pub(crate) mod upsert_expr;
 pub(crate) mod upsert_where;
 pub(crate) mod variance;
 pub(crate) mod vector_distance;
+pub(crate) mod vector_shape_fn;
 #[cfg(test)]
 mod write_time_ledger_tests;
 // `SELECT DISTINCT`・`COUNT(DISTINCT <expr>)`（SQL-25 (c)・TASK-209）が共有する

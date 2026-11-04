@@ -145,6 +145,7 @@ mod sql69_savepoint_syntax;
 mod sql69_savepoint_write_marks;
 mod sql69_txn_aliases;
 mod sql70_raise_exception;
+mod sql72_vector_functions;
 mod sql72_vector_sum;
 mod sql74_radius_search;
 mod sql74_where_distance_compare;

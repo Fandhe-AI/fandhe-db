@@ -1725,6 +1725,13 @@ pub enum BuiltinFn {
     VecSum,
     /// `vec_div(v: Vector, s: Scalar) -> Vector`（成分ごとの除算）。
     VecDiv,
+    /// `vector_dims(v: Vector) -> Scalar`（要素数。Issue #2012・SQL-72）。
+    VectorDims,
+    /// `l2_normalize(v: Vector) -> Vector`（L2 正規化。Issue #2012・SQL-72）。
+    L2Normalize,
+    /// `subvector(v: Vector, start: Scalar, count: Scalar) -> Vector`（1 始まりの部分ベクトル。
+    /// Issue #2012・SQL-72）。
+    Subvector,
     /// `lower(s: Text) -> Text`（Issue #919・SQL-26）。
     Lower,
     /// `upper(s: Text) -> Text`。
@@ -2171,7 +2178,11 @@ pub(crate) fn first_non_builtin_call_with(
 /// 別に `substr`／`concat` を明示的に含める。
 fn builtin_from_name(name: &str) -> Option<BuiltinFn> {
     match name.to_ascii_lowercase().as_str() {
-        "vec_norm" => Some(BuiltinFn::VecNorm),
+        // `vector_norm` は pgvector 互換名（計算は `vec_norm` と同一。Issue #2012・SQL-72）。
+        "vec_norm" | "vector_norm" => Some(BuiltinFn::VecNorm),
+        "vector_dims" => Some(BuiltinFn::VectorDims),
+        "l2_normalize" => Some(BuiltinFn::L2Normalize),
+        "subvector" => Some(BuiltinFn::Subvector),
         "vec_sum" => Some(BuiltinFn::VecSum),
         "vec_div" => Some(BuiltinFn::VecDiv),
         "lower" => Some(BuiltinFn::Lower),
@@ -2249,6 +2260,12 @@ pub(crate) fn builtin_signature(f: BuiltinFn) -> (&'static [ExprType], ExprType)
         BuiltinFn::VecNorm => (&[ExprType::Vector], ExprType::Scalar),
         BuiltinFn::VecSum => (&[ExprType::Vector], ExprType::Scalar),
         BuiltinFn::VecDiv => (&[ExprType::Vector, ExprType::Scalar], ExprType::Vector),
+        BuiltinFn::VectorDims => (&[ExprType::Vector], ExprType::Scalar),
+        BuiltinFn::L2Normalize => (&[ExprType::Vector], ExprType::Vector),
+        BuiltinFn::Subvector => (
+            &[ExprType::Vector, ExprType::Scalar, ExprType::Scalar],
+            ExprType::Vector,
+        ),
         BuiltinFn::Lower => (&[ExprType::Text], ExprType::Text),
         BuiltinFn::Upper => (&[ExprType::Text], ExprType::Text),
         BuiltinFn::Md5 => (&[ExprType::Text], ExprType::Text),
@@ -2392,7 +2409,12 @@ pub(crate) fn is_foldable_builtin(f: BuiltinFn) -> bool {
         // Vector を引数に取る組み込みは、実引数が定数（`Number`）になることが
         // 実務上ない（`vec_norm` 等は常に `VectorRef` を受け取る）ため、
         // 畳み込み対象に含める意味がない。
-        BuiltinFn::VecNorm | BuiltinFn::VecSum | BuiltinFn::VecDiv => false,
+        BuiltinFn::VecNorm
+        | BuiltinFn::VecSum
+        | BuiltinFn::VecDiv
+        | BuiltinFn::VectorDims
+        | BuiltinFn::L2Normalize
+        | BuiltinFn::Subvector => false,
         BuiltinFn::Abs
         | BuiltinFn::Round1
         | BuiltinFn::Round2
@@ -7750,6 +7772,11 @@ fn scalar_numeric_kind(
             crate::sql::cast_value::CastDst::Float4 => Some(NumericKind::Float4),
             _ => None,
         },
+        // `vector_dims` は int4（Issue #2012・SQL-72）。
+        BoundExpr::Builtin {
+            f: BuiltinFn::VectorDims,
+            ..
+        } => Some(NumericKind::Int4),
         // `json_array_length` は int4（Issue #2180）。整数除算・添字の型解決に反映する。
         BoundExpr::JsonTextFn(f) if f.result_is_int4() => Some(NumericKind::Int4),
         // 配列関数の長さ・位置は int4（TABLE-35・Issue #1604）。
@@ -9016,7 +9043,15 @@ fn bind_call(
                 args.len()
             )));
         }
-        if matches!(builtin, BuiltinFn::SplitPart) {
+        // `vector_dims`／`l2_normalize`／`subvector`（Issue #2012・SQL-72）も strict:
+        // 裸の `NULL` 引数は評価時の NULL 伝播に委ねる（`vec_norm` 系の既存挙動は変えない）。
+        if matches!(
+            builtin,
+            BuiltinFn::SplitPart
+                | BuiltinFn::VectorDims
+                | BuiltinFn::L2Normalize
+                | BuiltinFn::Subvector
+        ) {
             return bind_strict_text_fn(name, builtin, args, param_types, ret, env, node_budget);
         }
         // `justify_*`（Issue #1582）は strict 関数: 裸の `NULL` 引数は型検査で
@@ -11061,6 +11096,24 @@ pub(crate) fn apply_builtin<'a>(
             let norm = sum_sq.sqrt();
             finite_scalar(norm, "vec_norm")
         }
+        BuiltinFn::VectorDims => {
+            let v = take_vector_arg(args, 0)?;
+            Ok(ExprValue::Scalar(crate::sql::vector_shape_fn::dims(&v)))
+        }
+        BuiltinFn::L2Normalize => {
+            let v = take_vector_arg(args, 0)?;
+            Ok(ExprValue::Vector(Cow::Owned(
+                crate::sql::vector_shape_fn::l2_normalize(&v)?,
+            )))
+        }
+        BuiltinFn::Subvector => {
+            let v = take_vector_arg(args, 0)?;
+            let start = take_scalar_arg(args, 1)?;
+            let count = take_scalar_arg(args, 2)?;
+            Ok(ExprValue::Vector(Cow::Owned(
+                crate::sql::vector_shape_fn::subvector(&v, start, count)?,
+            )))
+        }
         BuiltinFn::VecSum => {
             let v = take_vector_arg(args, 0)?;
             let sum: f64 = v.iter().map(|&x| x as f64).sum();
@@ -12886,6 +12939,23 @@ mod tests {
 
     /// Issue #1910・SQL-65 (3): arity 表の名前はすべて組み込み関数名として予約され、
     /// 固定引数の関数は `builtin_signature` の個数と一致する。
+    /// `vector_dims`／`l2_normalize`／`subvector` は strict（Issue #2012・SQL-72 (2)）:
+    /// いずれかの引数が NULL なら評価結果は NULL。
+    #[test]
+    fn vector_shape_builtins_propagate_null() {
+        for (f, n) in [
+            (BuiltinFn::VectorDims, 1),
+            (BuiltinFn::L2Normalize, 1),
+            (BuiltinFn::Subvector, 3),
+        ] {
+            let mut args: Vec<Option<ExprValue<'_>>> = vec![Some(ExprValue::Null); n];
+            assert!(matches!(
+                apply_builtin(f, &mut args[..]),
+                Ok(ExprValue::Null)
+            ));
+        }
+    }
+
     #[test]
     fn builtin_call_arity_table_is_consistent() {
         for name in [
@@ -12909,6 +12979,10 @@ mod tests {
             "clock_timestamp",
             "lower",
             "vec_norm",
+            "vector_norm",
+            "vector_dims",
+            "l2_normalize",
+            "subvector",
             "justify_days",
             "greatest",
             "least",
@@ -12993,6 +13067,9 @@ mod tests {
             BuiltinFn::VecNorm,
             BuiltinFn::VecSum,
             BuiltinFn::VecDiv,
+            BuiltinFn::VectorDims,
+            BuiltinFn::L2Normalize,
+            BuiltinFn::Subvector,
             BuiltinFn::Lower,
             BuiltinFn::Upper,
             BuiltinFn::Md5,
