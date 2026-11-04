@@ -105,6 +105,7 @@ impl EngineCore {
                 )?,
                 crate::sql::jsonpath_fn::JsonPathLimitsScope::enter(self.jsonpath_limits),
                 crate::sql::regex_op::RegexLimitsScope::enter(self.regex_limits),
+                self.sparsevec_limits_scope(),
                 super::session_time_zone_scope(session),
             )),
         };

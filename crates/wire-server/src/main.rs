@@ -180,6 +180,12 @@
 //! `EngineCore::with_regex_limits` へ 1 回だけ注入する（`docs/design/regex-limits-cli.md`。
 //! SQL 表層からの利用は Issue #1787 以降）。
 //!
+//! `--max-sparsevec-nnz`（Issue #2027。TABLE-47 (2)・SQL-46）: `SPARSEVEC(N)` 列へ書き込む値の
+//! 非ゼロ要素数の上限（`1`〜`16000`）を、プロセス全体に対して起動時に**下げる方向だけ**設定できる
+//! opt-in 注入点（未指定はハード上限と同値）。超過は `54000`。範囲外・非数値・値欠落・重複指定は
+//! fail-closed で起動エラー。値の解決は `wire_server::sparsevec_limits_opt::resolve` に一本化し、
+//! `EngineCore::with_sparsevec_limits` へ 1 回だけ注入する（`docs/design/sparsevec-limits-cli.md`）。
+//!
 //! `--max-subquery-depth`／`--max-subquery-executions`／`--max-cte-definitions`／
 //! `--max-cte-nesting-depth`（Issue #1552。SQL-46）: サブクエリの入れ子深さ（`1`〜`4`）・
 //! 1 文あたりの内側サブクエリ実行回数（`1`〜`16`）・CTE 定義数（`1`〜`16`）・CTE 連鎖深さ
@@ -533,6 +539,7 @@ fn run_server(args: &[String]) -> ExitCode {
     let mut max_regex_pattern_len_raw: Option<String> = None;
     let mut max_regex_input_len_raw: Option<String> = None;
     let mut max_regex_compiled_size_raw: Option<String> = None;
+    let mut max_sparsevec_nnz_raw: Option<String> = None;
     let mut max_subquery_depth_raw: Option<String> = None;
     let mut max_subquery_executions_raw: Option<String> = None;
     let mut max_cte_definitions_raw: Option<String> = None;
@@ -1136,6 +1143,26 @@ fn run_server(args: &[String]) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
                 max_regex_compiled_size_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::sparsevec_limits_opt::MAX_SPARSEVEC_NNZ_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::sparsevec_limits_opt::MAX_SPARSEVEC_NNZ_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #2027: 他の起動時構成フラグと同じく 2 回目以降の指定を
+                // fail-closed に拒否する（last-wins にしない）。
+                if max_sparsevec_nnz_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::sparsevec_limits_opt::MAX_SPARSEVEC_NNZ_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                max_sparsevec_nnz_raw = Some(v.clone());
                 i += 2;
             }
             wire_server::nesting_limits_opt::MAX_SUBQUERY_DEPTH_FLAG => {
@@ -2105,6 +2132,21 @@ fn run_server(args: &[String]) -> ExitCode {
         }
     };
 
+    // Issue #2027: SPARSEVEC の非ゼロ数上限を bind・ユーザーストア読込より前に解決する
+    // （fail-closed。範囲外・非数値は listen へ進まず起動エラー）。未指定は
+    // `SparseVecLimits::default()`＝ハード上限。
+    let sparsevec_limits = match wire_server::sparsevec_limits_opt::resolve(
+        wire_server::sparsevec_limits_opt::SparseVecLimitsRawFlags {
+            max_nnz: max_sparsevec_nnz_raw.as_deref(),
+        },
+    ) {
+        Ok(limits) => limits,
+        Err(e) => {
+            engine::log_stderr!("wire-server: invalid sparsevec limit configuration: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     // Issue #1552: サブクエリ深さ・実行回数・CTE 定義数・CTE 連鎖深さの上限を bind・
     // ユーザーストア読込より前に解決する（fail-closed。範囲外・非数値は listen へ進まず
     // 起動エラー）。未指定は `NestingLimits::default()`＝ハード上限＝現行挙動。
@@ -2749,6 +2791,9 @@ fn run_server(args: &[String]) -> ExitCode {
     // Issue #1786: 未指定でも常に呼ぶ（`regex_limits` は既定まで解決済み。既定は
     // ハード上限と同値）。SQL 表層からの利用は Issue #1787 以降。
     core = core.with_regex_limits(regex_limits);
+    // Issue #2027: 未指定でも常に呼ぶ（`sparsevec_limits` は既定まで解決済み。既定は
+    // ハード上限と同値で、未注入と挙動が同一）。
+    core = core.with_sparsevec_limits(sparsevec_limits);
     // Issue #1552: 未指定でも常に呼ぶ（`nesting_limits` は既定まで解決済み。既定は
     // ハード上限と同値で、未注入と挙動が同一）。
     core = core.with_nesting_limits(nesting_limits);
