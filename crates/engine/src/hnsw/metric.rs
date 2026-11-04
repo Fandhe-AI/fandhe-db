@@ -6,7 +6,7 @@
 //! 構築（`GraphBuilder`）・探索（`HnswIndex`）・近傍選択ヒューリスティック・
 //! 修復パス・並列構築（`parallel_build`）・SQ8 探索ソース（`i8_query`）は、
 //! 距離計算をすべて本モジュールの [`HnswMetric`] 経由で呼ぶ。後続 Issue
-//! （#1998: L2・コサイン、#1999: 負の内積・L1）は variant と match の腕を足すだけで
+//! （#1998: L2・コサイン、#1999: 負の内積・L1。後者は本 Issue で完了）は variant と match の腕を足すだけで
 //! 済む。キャッシュキー・永続化・EXPLAIN への反映は #2000 の担当。
 //!
 //! # スコア規約
@@ -29,11 +29,18 @@
 //!   凍結のすべてで使い、探索側ではクエリを 1 回だけ同じ関数で正規化する。スコア関数自体は
 //!   内積の腕と同一。ゼロノルム（アンダー／オーバーフロー含む）の行は構築を、クエリは探索を
 //!   fail-closed に拒否する（行の除外は #2241 の担当）。
+//! - [`HnswMetric::L1`]: スコアは `-kernel::l1(a, b)`（`kernel::search_l1` と同じ符号反転）。
+//!   f16・SQ8 用の L1 カーネルは無いので L2 と同様に常駐精度を F32 へ縮退させる。距離の公理を
+//!   満たすため近傍選択ヒューリスティックは変更なしで使える。
+//! - 負の内積（`<#>`）は新しい variant を持たず [`HnswMetric::InnerProduct`] を再利用する。
+//!   距離 `-dot` の昇順とスコア `dot` の降順は、有限な f32 の符号反転が厳密なため同じ全順序
+//!   （同点は id 昇順）で、構築グラフも探索結果も内積と同一になる。距離値への変換（`-score`）
+//!   は SQL 側（#2000）の役割。
 //!
 //! 新しい `unsafe` は持たない。
 
 use super::HnswError;
-use crate::kernel::{dot, l2_sq};
+use crate::kernel::{dot, l1, l2_sq};
 
 /// HNSW が使う距離（類似度）種別。`Copy` の fieldless enum で、`GraphBuilder`・
 /// `HnswIndex`・`BuildGraph` が保持し、距離計算の free 関数へ引数で渡す。
@@ -48,6 +55,9 @@ pub(crate) enum HnswMetric {
     /// コサイン（正規化済み内積への帰着。C2′）。行・クエリは [`normalize_into`] 済みが前提。
     #[allow(dead_code)] // 同上
     Cosine,
+    /// L1（マンハッタン距離の符号反転。大きいほど近い）。`<+>` 用。
+    #[allow(dead_code)] // 同上
+    L1,
 }
 
 impl HnswMetric {
@@ -58,6 +68,7 @@ impl HnswMetric {
         match self {
             HnswMetric::InnerProduct | HnswMetric::Cosine => dot(a, b),
             HnswMetric::L2 => -l2_sq(a, b),
+            HnswMetric::L1 => -l1(a, b),
         }
     }
 
@@ -70,7 +81,7 @@ impl HnswMetric {
                 crate::isa::current_f16().dot_f16(row, query)
             }
             // 到達不能の防御（L2 は凍結時に F32 へ縮退）。NaN で fail-closed に拒否させる。
-            HnswMetric::L2 => f32::NAN,
+            HnswMetric::L2 | HnswMetric::L1 => f32::NAN,
         }
     }
 
@@ -83,11 +94,11 @@ impl HnswMetric {
                 crate::sq8::dot_i8_f32(row, scales, query)
             }
             // 到達不能の防御（L2 は凍結時に F32 へ縮退）。NaN で fail-closed に拒否させる。
-            HnswMetric::L2 => f32::NAN,
+            HnswMetric::L2 | HnswMetric::L1 => f32::NAN,
         }
     }
 
-    /// 要求された常駐精度のうち、この metric で実際に使えるもの。L2 は f16・SQ8 用の
+    /// 要求された常駐精度のうち、この metric で実際に使えるもの。L2・L1 は f16・SQ8 用の
     /// カーネルが無いため常に F32 へ縮退する（D6 と同じ考え方。`resident_precision()` が
     /// 実効値を返す）。組み合わせ表の確定は親 #1996 の担当。
     pub(crate) fn effective_precision(
@@ -95,7 +106,7 @@ impl HnswMetric {
         requested: super::ResidentPrecision,
     ) -> super::ResidentPrecision {
         match self {
-            HnswMetric::L2 => super::ResidentPrecision::F32,
+            HnswMetric::L2 | HnswMetric::L1 => super::ResidentPrecision::F32,
             HnswMetric::InnerProduct | HnswMetric::Cosine => requested,
         }
     }
@@ -239,6 +250,35 @@ mod tests {
                 crate::sq8::dot_i8_f32(&row, &scales, &q).to_bits(),
                 "dim={d}"
             );
+        }
+    }
+
+    /// INDEX-7・SQL-33: L1 metric は `-kernel::l1` とビット同一。
+    #[test]
+    fn l1_f32_is_bit_identical_to_negated_kernel_l1() {
+        for &d in &DIMS {
+            let a = fill(21 + d as u64, d);
+            let b = fill(55 + d as u64, d);
+            assert_eq!(
+                HnswMetric::L1.score_f32(&a, &b).to_bits(),
+                (-l1(&a, &b)).to_bits(),
+                "dim={d}"
+            );
+        }
+    }
+
+    /// L1 の f16・SQ8 の腕は到達不能の防御で NaN を返し、`finite_score` が拒否する。
+    #[test]
+    fn l1_f16_and_sq8_arms_are_rejected_fail_closed() {
+        let q = [0.5f32, -0.25, 1.0, 2.0];
+        let s16 = HnswMetric::L1.score_f16(&[0u16; 4], &q);
+        let s8 = HnswMetric::L1.score_sq8_dequant(&[1i8; 4], &[1.0; 4], &q);
+        for s in [s16, s8] {
+            assert!(s.is_nan());
+            assert!(matches!(
+                finite_score(s, 3),
+                Err(HnswError::NonFiniteScore { node: 3 })
+            ));
         }
     }
 

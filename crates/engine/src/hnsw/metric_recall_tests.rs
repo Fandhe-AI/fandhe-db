@@ -1,4 +1,4 @@
-//! L2・Cosine metric の HNSW 構築・探索の受入テスト（Issue #1998。親 #1996。
+//! L2・Cosine・L1・負の内積 metric の HNSW 構築・探索の受入テスト（Issue #1998・#1999。親 #1996。
 //! ビヘイビア INDEX-7・SQL-33 のポインタ）。`hnsw.rs` の `mod tests` が約 8000 行あるため
 //! 分けている。対照は本ファイル内の f64 brute-force（L2 は二乗距離昇順、Cosine は
 //! 生の行同士のコサイン類似度降順）。フィクスチャは **正規化しない**（行ごとに長さを
@@ -60,6 +60,20 @@ fn l2_sq64(a: &[f32], b: &[f32]) -> f64 {
         .sum()
 }
 
+fn l1_64(a: &[f32], b: &[f32]) -> f64 {
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (f64::from(*x) - f64::from(*y)).abs())
+        .sum()
+}
+
+fn dot64(a: &[f32], b: &[f32]) -> f64 {
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| f64::from(*x) * f64::from(*y))
+        .sum()
+}
+
 fn cos64(a: &[f32], b: &[f32]) -> f64 {
     let dot: f64 = a
         .iter()
@@ -96,7 +110,9 @@ fn recall(index: &HnswIndex, rows: &[f32], queries: &[f32], ef: usize, metric: H
     for q in queries.chunks_exact(DIM) {
         let truth = match metric {
             HnswMetric::L2 => brute(rows, q, l2_sq64),
-            _ => brute(rows, q, |a, b| -cos64(a, b)),
+            HnswMetric::Cosine => brute(rows, q, |a, b| -cos64(a, b)),
+            HnswMetric::L1 => brute(rows, q, l1_64),
+            HnswMetric::InnerProduct => brute(rows, q, |a, b| -dot64(a, b)),
         };
         let got = index.search(q, K, ef, &mut scratch).unwrap();
         hit += got
@@ -156,7 +172,7 @@ fn cosine_recall_meets_thresholds() {
 fn parallel_build_matches_sequential_recall() {
     let (rows, queries) = fixture();
     const { assert!(ROWS > SEQUENTIAL_PREFIX_NODES) };
-    for metric in [HnswMetric::L2, HnswMetric::Cosine] {
+    for metric in [HnswMetric::L2, HnswMetric::Cosine, HnswMetric::L1] {
         let seq = build(metric, ResidentPrecision::F32, &rows, 1);
         let par = build(metric, ResidentPrecision::F32, &rows, 4);
         let rs = recall(&seq, &rows, &queries, 64, metric);
@@ -329,5 +345,167 @@ fn cosine_node_matches_uses_normalized_comparison() {
         }
         // 正規化できない行は「変更あり」。
         assert_eq!(index.node_matches(0, &[0.0; DIM]), Some(false));
+    }
+}
+
+/// f32 カーネルのスコア降順（同点は id 昇順）で全行を並べた先頭 K 件（完全一致の対照）。
+fn exact_top_k(rows: &[f32], q: &[f32], score: impl Fn(&[f32], &[f32]) -> f32) -> Vec<(u64, f32)> {
+    let mut v: Vec<(u64, f32)> = rows
+        .chunks_exact(DIM)
+        .enumerate()
+        .map(|(i, r)| (i as u64, score(r, q)))
+        .collect();
+    v.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    v.truncate(K);
+    v
+}
+
+fn assert_exact_match(metric: HnswMetric, score: impl Fn(&[f32], &[f32]) -> f32 + Copy) {
+    let (rows, queries) = fixture();
+    let index = build(metric, ResidentPrecision::F32, &rows, 1);
+    let mut scratch = HnswSearchScratch::default();
+    for q in queries.chunks_exact(DIM).take(30) {
+        let truth = exact_top_k(&rows, q, score);
+        let got = index.search(q, K, ROWS, &mut scratch).unwrap();
+        let got: Vec<(u64, u32)> = got.iter().map(|h| (h.id, h.score.to_bits())).collect();
+        let want: Vec<(u64, u32)> = truth.iter().map(|&(i, s)| (i, s.to_bits())).collect();
+        assert_eq!(got, want, "{metric:?}");
+    }
+}
+
+/// INDEX-7・SQL-33: L1 の探索結果（ef=ROWS）は brute-force と id・順序・スコアが一致する。
+#[test]
+fn l1_search_matches_brute_force_exactly() {
+    assert_exact_match(HnswMetric::L1, |a, b| -crate::kernel::l1(a, b));
+}
+
+/// INDEX-7・SQL-33: 負の内積（`<#>`）は内積グラフを再利用でき、`-dot` 昇順の全探索と
+/// id・順序・スコア（符号反転）が一致する。
+#[test]
+fn negative_inner_product_reuses_inner_product_graph() {
+    assert_exact_match(HnswMetric::InnerProduct, crate::kernel::dot);
+    let (rows, queries) = fixture();
+    let index = build(HnswMetric::InnerProduct, ResidentPrecision::F32, &rows, 1);
+    let mut scratch = HnswSearchScratch::default();
+    for q in queries.chunks_exact(DIM).take(30) {
+        let got = index.search(q, K, ROWS, &mut scratch).unwrap();
+        // 距離 -dot の昇順（同点は id 昇順）に並べ替えても出力順と変わらない。
+        let mut by_dist: Vec<(u64, f32)> = got.iter().map(|h| (h.id, -h.score)).collect();
+        by_dist.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+        let ids: Vec<u64> = got.iter().map(|h| h.id).collect();
+        assert_eq!(by_dist.iter().map(|x| x.0).collect::<Vec<_>>(), ids);
+    }
+}
+
+/// INDEX-7・SQL-33: L1 の Recall@10（ef=64 で 0.95 以上、ef=256 で 0.99 以上）。
+#[test]
+fn l1_recall_meets_thresholds() {
+    let (rows, queries) = fixture();
+    let index = build(HnswMetric::L1, ResidentPrecision::F32, &rows, 1);
+    assert_eq!(index.metric(), HnswMetric::L1);
+    let r64 = recall(&index, &rows, &queries, 64, HnswMetric::L1);
+    let r256 = recall(&index, &rows, &queries, 256, HnswMetric::L1);
+    eprintln!("l1 recall ef64={r64} ef256={r256}");
+    assert!(r64 >= 0.95, "ef=64 recall={r64}");
+    assert!(r256 >= 0.99, "ef=256 recall={r256}");
+}
+
+/// 内積（負の内積）の Recall@10。非正規化コーパスでの値を測定して記録する。
+#[test]
+fn inner_product_recall_measured() {
+    let (rows, queries) = fixture();
+    let index = build(HnswMetric::InnerProduct, ResidentPrecision::F32, &rows, 1);
+    let r64 = recall(&index, &rows, &queries, 64, HnswMetric::InnerProduct);
+    let r256 = recall(&index, &rows, &queries, 256, HnswMetric::InnerProduct);
+    eprintln!("ip recall ef64={r64} ef256={r256}");
+    assert!(r64 >= 0.95, "ef=64 recall={r64}");
+    assert!(r256 >= 0.99, "ef=256 recall={r256}");
+}
+
+/// L1 は f16・SQ8 を要求しても F32 へ縮退し、結果は F32 の L1 と同一。
+#[test]
+fn l1_degrades_to_f32_resident() {
+    let (rows, queries) = fixture();
+    let base = build(HnswMetric::L1, ResidentPrecision::F32, &rows, 1);
+    let mut s0 = HnswSearchScratch::default();
+    let mut s1 = HnswSearchScratch::default();
+    for p in [ResidentPrecision::F16, ResidentPrecision::I8] {
+        let index = build(HnswMetric::L1, p, &rows, 1);
+        assert_eq!(index.resident_precision(), ResidentPrecision::F32);
+        for q in queries.chunks_exact(DIM).take(20) {
+            let a = base.search(q, K, 64, &mut s0).unwrap();
+            let b = index.search(q, K, 64, &mut s1).unwrap();
+            assert_eq!(a, b);
+        }
+    }
+}
+
+/// L1 の近傍選択ヒューリスティック: 近接して冗長な候補は刈られ、遠い候補が残る。
+#[test]
+fn l1_heuristic_prunes_redundant_and_keeps_far() {
+    let dim = 2usize;
+    let a = [1.0f32, 0.0];
+    let b = [1.1f32, 0.1];
+    let c = [-5.0f32, 0.0];
+    let vectors: Vec<f32> = [a, b, c].concat();
+    let q = [0.0f32, 0.0];
+    let score = |v: &[f32; 2]| -crate::kernel::l1(v, &q);
+    let mut cands: Vec<ScoredNode> = [&a, &b, &c]
+        .iter()
+        .enumerate()
+        .map(|(i, v)| ScoredNode {
+            node: i as u32,
+            score: score(v),
+        })
+        .collect();
+    cands.sort_by(|x, y| y.score.total_cmp(&x.score));
+    let selected =
+        select_neighbors_heuristic_free(HnswMetric::L1, &cands, 2, dim, &vectors).unwrap();
+    assert!(selected.contains(&0));
+    assert!(selected.contains(&2));
+    assert!(!selected.contains(&1));
+}
+
+/// L1 の fail-closed: 絶対差の総和が f32 を超えると構築拒否、非有限クエリは探索拒否、
+/// ゼロクエリは（正規化不要なので）受理する。
+#[test]
+fn l1_fail_closed_and_zero_query_ok() {
+    let big = vec![3.0e38f32, 0.0, -3.0e38, 0.0];
+    let r = HnswIndex::build_with_metric(
+        HnswParams::default(),
+        HnswMetric::L1,
+        ResidentPrecision::F32,
+        2,
+        &big,
+        1,
+        1,
+    );
+    assert!(matches!(r, Err(HnswError::NonFiniteScore { .. })), "{r:?}");
+    let (rows, _) = fixture();
+    let index = build(HnswMetric::L1, ResidentPrecision::F32, &rows, 1);
+    let mut scratch = HnswSearchScratch::default();
+    assert!(matches!(
+        index.search(&[f32::NAN; DIM], K, 64, &mut scratch),
+        Err(HnswError::NonFiniteQuery)
+    ));
+    assert!(matches!(
+        index.search(&[f32::INFINITY; DIM], K, 64, &mut scratch),
+        Err(HnswError::NonFiniteQuery)
+    ));
+    let hits = index.search(&[0.0f32; DIM], K, 64, &mut scratch).unwrap();
+    assert_eq!(hits.len(), K);
+}
+
+/// L1 の `node_matches`: 正規化せず生の行をビット比較する。
+#[test]
+fn l1_node_matches_compares_raw_rows() {
+    let (rows, _) = fixture();
+    let index = build(HnswMetric::L1, ResidentPrecision::F32, &rows, 1);
+    for node in [0usize, 5, 1999] {
+        let raw = &rows[node * DIM..(node + 1) * DIM];
+        assert_eq!(index.node_matches(node as u32, raw), Some(true));
+        let o = (node + 1) % ROWS;
+        let other = &rows[o * DIM..(o + 1) * DIM];
+        assert_eq!(index.node_matches(node as u32, other), Some(false));
     }
 }
