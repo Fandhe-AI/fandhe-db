@@ -22,6 +22,8 @@
 //! モジュール構成（責務ごとに分割）:
 //! - `plan`: 束縛（列解決・型検証・外部結合の簡約・WHERE のプッシュダウン／残余の
 //!   分離・側スキャン投影の確定・集計／並べ替えの束縛）。Describe も同じ計画を使う。
+//! - `explain`: `EXPLAIN` 用の段の木の組み立て（Issue #2046・SQL-75 (2) ポインタ。結合方式は
+//!   `plan::StepPlan::method` を実行器と共有）。
 //! - `exec`: N 方向ハッシュ結合（段ごとのカーディナリティ上限・決定的順序）。
 //! - `nlj`: 等価キーの無い ON 残余のある段のネステッドループ結合（INNER／LEFT／RIGHT。比較回数
 //!   上限。Issue #1837・#1838。SQL からは #1839 で到達し、段ごとにハッシュ結合と自動で選ぶ。
@@ -54,6 +56,7 @@ mod aggregate;
 // `UPDATE ... FROM`/`DELETE ... USING` の結合実行（Issue #1755・SQL-53）。
 pub(crate) mod dml;
 mod exec;
+mod explain;
 mod nlj;
 mod on_split;
 mod plan;
@@ -75,6 +78,7 @@ use crate::sql::allowlist::{SqlSurfaceError, ValidatedJoin};
 use crate::sql::exec::{Cell, ColumnMeta, QueryResult, ResultRow};
 use crate::sql::udf_call::UdfRegistry;
 
+pub(crate) use explain::explain_tree;
 pub(crate) use plan::CteIdColumns;
 use plan::{build_plan, JoinPlan, Shape};
 

@@ -1376,7 +1376,15 @@ pub fn validate_param_positions(tokens: &[Token]) -> Result<u16, SqlSurfaceError
     // WHERE 述語が束縛時に左右いずれかの `ValidatedScan::where_predicates` へ
     // 分かれてプッシュダウンされるため、トークン列上のフラグ位置と束縛後の
     // 述語列の対応付けが保証できない（Issue #925 §2.7・対象外事項）。
-    if crate::sql::allowlist::looks_like_join(tokens)
+    // Issue #2046: `EXPLAIN` 前置の JOIN も同じ理由で拒否する（`looks_like_join` は先頭 `SELECT` を
+    // 要求するため、先頭の `EXPLAIN` を 1 トークン剥がして判定する。fail-closed）。
+    let join_tokens = match tokens.first() {
+        Some(Token::Ident(w)) if w.eq_ignore_ascii_case("EXPLAIN") => {
+            tokens.get(1..).unwrap_or(&[])
+        }
+        _ => tokens,
+    };
+    if crate::sql::allowlist::looks_like_join(join_tokens)
         && tokens.iter().any(|t| matches!(t, Token::Param(_)))
     {
         return Err(SqlSurfaceError::unsupported(
@@ -2628,6 +2636,23 @@ mod tests {
                 where_equality_literal_is_param_typed(&tokens, &[]),
                 vec![true],
                 "{op}"
+            );
+        }
+    }
+
+    /// Issue #2046: `EXPLAIN` 前置の JOIN に `$n` を含む文は、非 EXPLAIN の JOIN と同じく `42601`
+    /// （WHERE 等価の許可位置にすり抜けさせない）。
+    #[test]
+    fn explain_join_with_param_is_rejected() {
+        for sql in [
+            "EXPLAIN SELECT a.id FROM a JOIN b ON a.k = b.k WHERE a.k = $1",
+            "EXPLAIN SELECT a.id FROM a, b WHERE a.k = $1",
+        ] {
+            let tokens = crate::sql::lexer::tokenize_with_params(sql).expect("tokenize");
+            assert_eq!(
+                validate_param_positions(&tokens).unwrap_err().wire_code(),
+                "42601",
+                "{sql}"
             );
         }
     }

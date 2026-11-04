@@ -43,7 +43,9 @@ fn try_run_as(
     let mut session = SessionState::default();
     match core.execute_sql_in_session(&ctx(tenant), &mut session, sql)? {
         SqlOutcome::Query(result) => Ok(result),
-        other => panic!("expected SqlOutcome::Query, got {other:?}"),
+        // Issue #2046: JOIN の `EXPLAIN` は `QUERY PLAN` 列の結果として返る。
+        SqlOutcome::Explain(result) => Ok(result),
+        other => panic!("expected SqlOutcome::Query or Explain, got {other:?}"),
     }
 }
 
@@ -288,8 +290,16 @@ fn comma_join_context_parity_with_cross_join() {
             "CREATE VIEW v_cross AS SELECT a.k FROM a CROSS JOIN b",
         ),
     ] {
-        let l = try_run_as(&core, "tenant-a", comma).map(|r| r.rows.len());
-        let r = try_run_as(&core, "tenant-a", cross).map(|r| r.rows.len());
+        // `EXPLAIN` は行数ではなく計画の行テキストの完全一致で比べる（Issue #2046）。
+        let summarize = |r: QueryResult| {
+            if comma.starts_with("EXPLAIN") {
+                rows_of(&r)
+            } else {
+                vec![vec![r.rows.len().to_string()]]
+            }
+        };
+        let l = try_run_as(&core, "tenant-a", comma).map(summarize);
+        let r = try_run_as(&core, "tenant-a", cross).map(summarize);
         match (l, r) {
             (Ok(a), Ok(b)) => assert_eq!(a, b, "sql={comma:?}"),
             (Err(a), Err(b)) => assert_eq!(a.wire_code(), b.wire_code(), "sql={comma:?}"),

@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::exec::{Cell, ResultRow};
 
-use super::plan::{StepKey, StepPlan};
+use super::plan::{JoinMethod, StepKey, StepPlan};
 use super::residual::eval_all;
 use super::values::encode_key_component;
 use super::{JoinBudget, JoinLimits};
@@ -206,11 +206,11 @@ fn join_step(
 ) -> Result<Tuples, SqlSurfaceError> {
     let n = acc.n;
     // ON 残余（Issue #1830）の評価用。タプルの組み立て領域（長さ n）は確保前に計上する。
-    let has_on_residual =
-        !(step.on_acc.is_empty() && step.on_new.is_empty() && step.on_mixed.is_empty());
+    let has_on_residual = step.has_on_residual();
     // Issue #1837: キー無し・ON 残余ありの段はネステッドループ結合へ振り分ける（D1。ハッシュ表を
     // 作る前）。SQL からの到達（束縛段の `42601` 解除）は #1839 で実装済み。キー無し・残余無しは下の直積経路。
-    if step.keys.is_empty() && has_on_residual {
+    let method = step.method();
+    if method == JoinMethod::NestedLoop {
         return super::nlj::nlj_step(
             sides,
             step,
@@ -226,7 +226,7 @@ fn join_step(
     // 件数は左 × 右で確定する。ハッシュ表・ペア列を確保する前に出力上限・暗黙の結果行数上限を
     // 判定する（`checked_mul` のオーバーフローも `54000`）。逐次判定は後段の安全網として残す。
     // 判定に使うのは可視行（RLS・WHERE 適用後）の件数だけで、`LIMIT`／`OFFSET` の値には依存しない。
-    if step.keys.is_empty() && !has_on_residual {
+    if method == JoinMethod::Cross {
         match acc.len().checked_mul(new_rows.len()) {
             Some(product) if product <= limits.max_output_rows => {
                 if matches!(stop_after_pairs, Some(t) if product > t) {

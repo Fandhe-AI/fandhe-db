@@ -1023,6 +1023,26 @@ pub(crate) fn build_relational_explain_result_with_windows(
     names: &ExplainIndexNames,
     windows: &[ExplainWindowStage],
 ) -> QueryResult {
+    ExplainNode::leaf(relational_explain_lines(
+        scalar_plan,
+        scalar_fallback,
+        access_path,
+        names,
+        windows,
+    ))
+    .into_query_result()
+}
+
+/// [`build_relational_explain_result_with_windows`] の行生成部。JOIN の `EXPLAIN`
+/// （Issue #2046）が各側の `scan` 節へ同じ 2 行（`scalar_plan`・`access_path`）を載せるために
+/// 共有する（第 2 の行生成を持たない）。
+pub(crate) fn relational_explain_lines(
+    scalar_plan: ScalarPlan,
+    scalar_fallback: Option<ScalarFallbackReason>,
+    access_path: AccessPath,
+    names: &ExplainIndexNames,
+    windows: &[ExplainWindowStage],
+) -> Vec<String> {
     let mut scalar_line = format!("scalar_plan: {}", scalar_plan_token(scalar_plan));
     append_index_suffix(&mut scalar_line, names.scalar());
     append_reason_suffix(&mut scalar_line, scalar_fallback);
@@ -1036,7 +1056,7 @@ pub(crate) fn build_relational_explain_result_with_windows(
             w.func, w.partition_keys, w.order_keys
         )
     }));
-    ExplainNode::leaf(lines).into_query_result()
+    lines
 }
 
 #[cfg(test)]

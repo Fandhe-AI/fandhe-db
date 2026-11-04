@@ -49,7 +49,6 @@ pub(crate) enum ExplainTreeError {
 
 impl ExplainTreeError {
     /// 固定の英語メッセージ（入力の値は含めない）。
-    #[allow(dead_code)] // #2046〜#2048 の呼び出し元がエラー応答に使うまでテストのみ
     pub(crate) fn message(self) -> &'static str {
         match self {
             Self::TooDeep => "EXPLAIN plan is nested too deeply",
@@ -94,7 +93,6 @@ impl ExplainNode {
 
     /// 見出し付きの節（兄弟 Issue が結合・集合演算・CTE の段を足すときに使う）。
     /// 改行を含む入力と行数の超過を拒否する。
-    #[allow(dead_code)] // #2046〜#2048 が使うまでの間はテストのみから呼ばれる
     pub(crate) fn try_stage(stage: String, lines: Vec<String>) -> Result<Self, ExplainTreeError> {
         if has_break(&stage) || lines.iter().any(|l| has_break(l)) {
             return Err(ExplainTreeError::InvalidLine);
@@ -115,7 +113,6 @@ impl ExplainNode {
     }
 
     /// 子を末尾へ足す。上限を超えるときは木を変えずに `Err` を返す。
-    #[allow(dead_code)] // #2046〜#2048 が使うまでの間はテストのみから呼ばれる
     pub(crate) fn push_child(&mut self, child: ExplainNode) -> Result<(), ExplainTreeError> {
         let height = child
             .height

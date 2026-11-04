@@ -4328,15 +4328,21 @@ pub enum ExplainTarget {
     /// 広域取得（ソートなしのフィルタ取得。ビュー展開後の形・`OFFSET` を含む。
     /// Issue #922・SQL-27）。
     Scan(ValidatedScan),
+    /// JOIN（`[INNER|LEFT|RIGHT|FULL [OUTER]] JOIN`・`CROSS JOIN`・カンマ区切り・`USING`・
+    /// `NATURAL`・集計形。Issue #2046・SQL-75 (2) ポインタ）。結合の方式・順・各入力を段の木で
+    /// 報告し、走査は行わない。
+    Join(ValidatedJoin),
 }
 
 impl ExplainTarget {
-    /// FROM に指定され、カタログ存在確認を通過したテーブル名。
+    /// FROM に指定され、カタログ存在確認を通過したテーブル名。`Join` は FROM 先頭の relation の
+    /// 表名（複数表の一覧が要る呼び出し元は `sql::join::collect_join_tables` を使う）。
     pub fn table_name(&self) -> &str {
         match self {
             ExplainTarget::Search(v) => v.table_name(),
             ExplainTarget::Aggregate(v) => v.table_name(),
             ExplainTarget::Scan(v) => v.table_name(),
+            ExplainTarget::Join(v) => v.relations.first().map_or("", |r| r.table()),
         }
     }
 }
@@ -28262,6 +28268,19 @@ fn validate_sql_tokens_impl(
                 return Err(SqlSurfaceError::unsupported(
                     "EXPLAIN requires a SELECT statement",
                 ));
+            }
+            // Issue #2046（SQL-75 (2) ポインタ）: JOIN は非 EXPLAIN 経路と同じ判定
+            // （`looks_like_join` → `parse_join_statement`）で `ExplainTarget::Join` にする。派生表を
+            // 含む形は従来どおり `42601`（#2048 の担当）。JOIN の WHERE の部分クエリは構文段で
+            // 拒否されるため、ここで追加のガードは要らない。
+            if looks_like_join(rest) {
+                if super::derived_table::contains_derived_table(rest) {
+                    return Err(SqlSurfaceError::unsupported(
+                        "EXPLAIN is not supported for queries with derived tables",
+                    ));
+                }
+                let validated = parse_join_statement(rest, lookup)?;
+                return Ok(Statement::Explain(ExplainTarget::Join(validated)));
             }
             // Issue #927・SQL-29 (a)・TASK-213: `EXPLAIN` はサブクエリを許可する
             // 文脈に含めない（`docs/design/sql-subquery.md` 参照。`subquery_ctx`
