@@ -181,7 +181,7 @@ mod e2e {
     use super::*;
     use engine::catalog::{ColumnDef, ColumnType, TableSchema};
     use engine::core::EngineCore;
-    use engine::kernel::{CpuScalarProvider, SearchInput, SearchProvider};
+    use engine::kernel::{cosine_top_k, CosineSearchInput, CpuScalarProvider};
     use engine::policy::PolicyContext;
     use engine::row_codec::Value;
     use engine::storage::{Storage, Visibility};
@@ -239,18 +239,20 @@ mod e2e {
 
         let ids: Vec<u64> = corpus.iter().map(|(id, _)| *id).collect();
         let flat: Vec<f32> = corpus.iter().flat_map(|(_, e)| e.iter().copied()).collect();
-        let expected: Vec<u64> = CpuScalarProvider
-            .search(SearchInput {
-                ids: &ids,
-                vectors: &flat,
-                dim: 3,
-                query: &query,
-                k: 3,
-            })
-            .expect("reference search succeeds")
-            .into_iter()
-            .map(|hit| hit.id)
-            .collect();
+        // 参照オラクルは `<=>` のコサイン距離（SQL-33・Issue #1991）と同じ規約の
+        // `kernel::cosine_top_k`（距離昇順・同点 id 昇順）を直接呼ぶ。
+        let expected: Vec<u64> = cosine_top_k(CosineSearchInput {
+            ids: &ids,
+            vectors: &flat,
+            row_norms_sq: None,
+            dim: 3,
+            query: &query,
+            k: 3,
+        })
+        .expect("reference search succeeds")
+        .into_iter()
+        .map(|hit| hit.id)
+        .collect();
 
         // 集合ではなく順序込みで比較する。C1 テンプレートは `ORDER BY <=> ... LIMIT k` の
         // 距離昇順を契約しており、集合比較では順序の退行を検知できないため。上記 corpus は

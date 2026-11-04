@@ -469,7 +469,7 @@ GPU の整数結果は `dot_i8_packed_ref` とビット一致する契約のた�
 
 ### GPU 実機の確認
 
-結合テスト `tests/gpu_batch_i8.rs` に、Cosine・L2 の GPU Recall・テナント分離・決定性の検査（GPU 搭載環境のみ動作）と、非対応 metric の拒否（GPU 不要）を追加した。本実装の作業環境では GPU 実機が使えず、GPU 搭載環境での実行は**未検証**（CPU 実測は GPU の整数結果とビット一致する契約に基づく）。
+結合テスト `tests/gpu_batch_i8.rs` に、Cosine・L2 の GPU Recall・テナント分離・決定性の検査（GPU 搭載環境のみ動作）と、非対応 metric の拒否（GPU 不要）を追加した。#2004 時点では GPU 実機が使えず未検証だったが、Issue #2005 で RTX 3060（Vulkan）上にて実行し、`tests/gpu_batch_i8.rs` 9 件が pass、`gpu_scaling_bench` の metric 別計測（内積・L2・コサイン、oversample=4、全 24 点）で i8 の Recall@10 = 1.0000・`i8_mismatch` = 0 を確認した。metric 別のレイテンシ表は `gpu-batch-metric.md`「metric 別実測（Issue #2005）」節を参照（i8 は CPU-SIMD・GPU f16 より遅い）。oversample 1・2 の GPU 実機計測は未実施。
 
 ### CPU フォールバックの境界
 
@@ -478,5 +478,5 @@ GPU の整数結果は `dot_i8_packed_ref` とビット一致する契約のた�
 ### スコープ外
 
 - CPU 縮退経路・`run_batch_search` の metric 対応と f32/f16 経路の WGSL の metric 化（#2003／#2002）
-- metric 別の性能ベンチと GPU 実機での Recall 再計測（#2005）
+- ~~metric 別の性能ベンチと GPU 実機での Recall 再計測~~（#2005 で実施済み。`gpu-batch-metric.md` 参照）
 - バッチ層と SQL `<=>` のゼロノルムの扱いの統一（#2002 の判断事項）

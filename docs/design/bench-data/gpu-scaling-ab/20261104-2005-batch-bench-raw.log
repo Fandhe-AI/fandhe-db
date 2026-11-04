@@ -1,0 +1,30 @@
+batch_metric: metric=inner_product
+dynamic_window_degradation: rows=20000 dim=256 k=10 trials=9 pass=true
+verbose(dynamic_window_degradation): trial_degradation_pct=[0.7140103067694531, -1.6299234884089329, -0.11078045288088857, -0.35992252059002816, -1.4019067445061755, -0.40890243549626715, 0.002178570359432683, 0.6006901500261526, 0.4862902826712488] median_pct=-0.11078045288088857
+diagnostic_dynamic_window_push_drain: batch_size=256 dim=768 measured=true (not counted toward pass/fail)
+verbose(diagnostic_dynamic_window_push_drain): direct_median=500ns direct_p95=1.077µs windowed_median=903ns windowed_p95=1.534µs
+gpu_vs_cpu_simd_p95: rows=20000 dim=256 batch=8 requested=true pass=true
+verbose(gpu_vs_cpu_simd_p95): cpu_simd_p95=8.783427ms gpu_p95=1.924182ms
+f16_resident_vs_f32_resident_p95: rows=20000 dim=256 batch=8 requested=true pass=true
+verbose(f16_resident_vs_f32_resident_p95): f32_resident_p95=1.09567ms f16_resident_p95=856.876µs
+verbose(f16_resident_vs_f32_resident_p95): f16_arith_available=true f16_arith_dispatches=0 f16_arith_guard_fallbacks=40
+batch_metric: metric=l2
+dynamic_window_degradation: rows=20000 dim=256 k=10 trials=9 pass=true
+verbose(dynamic_window_degradation): trial_degradation_pct=[0.17158136806368227, 0.08670261960030674, 0.46925030882245844, 0.4637311965217411, -13.363478943825688, 0.15687354205051904, 0.28576727046492445, -34.375260915894366, -0.03147039597994221] median_pct=0.15687354205051904
+diagnostic_dynamic_window_push_drain: batch_size=256 dim=768 measured=true (not counted toward pass/fail)
+verbose(diagnostic_dynamic_window_push_drain): direct_median=601ns direct_p95=1.39µs windowed_median=988ns windowed_p95=1.62µs
+gpu_vs_cpu_simd_p95: rows=20000 dim=256 batch=8 requested=true pass=true metric=l2
+verbose(gpu_vs_cpu_simd_p95): cpu_simd_p95=28.504236ms gpu_p95=4.254456ms
+f16_resident_vs_f32_resident_p95: rows=20000 dim=256 batch=8 requested=true pass=true metric=l2
+verbose(f16_resident_vs_f32_resident_p95): f32_resident_p95=1.253877ms f16_resident_p95=957.821µs
+verbose(f16_resident_vs_f32_resident_p95): f16_arith_available=true f16_arith_dispatches=0 f16_arith_guard_fallbacks=40
+batch_metric: metric=cosine
+dynamic_window_degradation: rows=20000 dim=256 k=10 trials=9 pass=true
+verbose(dynamic_window_degradation): trial_degradation_pct=[-13.485907777567574, -40.99817493189925, 1.294109478328437, -0.06912285755261734, 50.74736464808299, 0.9691366172104103, 0.35704102799577925, 30.898753825051482, 56.477828327638605] median_pct=0.9691366172104103
+diagnostic_dynamic_window_push_drain: batch_size=256 dim=768 measured=true (not counted toward pass/fail)
+verbose(diagnostic_dynamic_window_push_drain): direct_median=610ns direct_p95=1.236µs windowed_median=1.069µs windowed_p95=1.548µs
+gpu_vs_cpu_simd_p95: rows=20000 dim=256 batch=8 requested=true pass=true metric=cosine
+verbose(gpu_vs_cpu_simd_p95): cpu_simd_p95=9.020974ms gpu_p95=1.945592ms
+f16_resident_vs_f32_resident_p95: rows=20000 dim=256 batch=8 requested=true pass=true metric=cosine
+verbose(f16_resident_vs_f32_resident_p95): f32_resident_p95=1.093698ms f16_resident_p95=876.583µs
+verbose(f16_resident_vs_f32_resident_p95): f16_arith_available=true f16_arith_dispatches=0 f16_arith_guard_fallbacks=40

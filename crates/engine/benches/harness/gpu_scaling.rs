@@ -668,3 +668,93 @@ impl fmt::Display for GpuScalingI8StatsLine {
         )
     }
 }
+// ---------------------------------------------------------------------
+// metric 別計測（Issue #2005。ポインタ: CORE-6・CORE-16・SQL-33）。
+// `BENCH_GPU_SCALING_METRIC`（`gpu_scaling_bench`）・`BENCH_BATCH_METRIC`
+// （`batch_bench`）の値解決と、metric を示す追加行の整形を担う。既存行
+// （`gpu_scaling:` 等）は 1 文字も変えず、metric は独立した接頭辞の行で出す。
+// ---------------------------------------------------------------------
+
+/// ベンチが計測対象にできる距離 metric（allowlist）。`engine::batch_search::
+/// BatchMetric` と同じ 3 値で、L1 はバッチ経路の対象外のため持たない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BenchMetric {
+    /// 内積（既定。従来の計測構成）。
+    InnerProduct,
+    /// L2（二乗距離の符号反転）。
+    L2,
+    /// コサイン（正規化済み内積への帰着）。
+    Cosine,
+}
+
+impl BenchMetric {
+    /// 出力行・env で使うトークン。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BenchMetric::InnerProduct => "inner_product",
+            BenchMetric::L2 => "l2",
+            BenchMetric::Cosine => "cosine",
+        }
+    }
+
+    /// `engine::batch_search::BatchMetric` への写像（CPU・f16・f32 経路の行列構築用）。
+    pub fn to_batch_metric(self) -> engine::batch_search::BatchMetric {
+        match self {
+            BenchMetric::InnerProduct => engine::batch_search::BatchMetric::InnerProduct,
+            BenchMetric::L2 => engine::batch_search::BatchMetric::L2,
+            BenchMetric::Cosine => engine::batch_search::BatchMetric::Cosine,
+        }
+    }
+}
+
+/// metric 指定 env の値を解決する。未設定・空白のみは内積。許可するのは
+/// `inner_product`・`l2`・`cosine` の完全一致（前後空白は trim）のみで、
+/// `l1`（バッチ経路の対象外）を含むそれ以外はすべて拒否する（fail-closed）。
+pub fn parse_metric(raw: Option<&str>) -> Result<BenchMetric, GpuScalingError> {
+    match raw.map(str::trim) {
+        None | Some("") | Some("inner_product") => Ok(BenchMetric::InnerProduct),
+        Some("l2") => Ok(BenchMetric::L2),
+        Some("cosine") => Ok(BenchMetric::Cosine),
+        Some("l1") => Err(err(
+            "metric l1 is not supported by the batch path (allowed: inner_product, l2, cosine)",
+        )),
+        Some(other) => Err(err(format!(
+            "unknown metric {other:?} (allowed: inner_product, l2, cosine)"
+        ))),
+    }
+}
+
+/// 起動直後に 1 回出す metric 宣言行（`gpu_scaling_metric:`）。
+pub fn format_metric_line(metric: BenchMetric) -> String {
+    format!("gpu_scaling_metric: metric={}", metric.as_str())
+}
+
+/// 規模点ごとの f16・f32 経路の Recall@k 行（`gpu_scaling_recall:`）。基準は
+/// 「同じ metric の CPU-SIMD（f16 常駐）経路」の Top-k の id 集合。
+#[derive(Debug, Clone, Copy)]
+pub struct GpuScalingRecallLine {
+    pub rows: usize,
+    pub dim: usize,
+    pub batch: usize,
+    pub k: usize,
+    pub metric: BenchMetric,
+    pub f16_recall: f64,
+    pub f32_recall: f64,
+}
+
+impl fmt::Display for GpuScalingRecallLine {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "gpu_scaling_recall: rows={} dim={} batch={} k={} metric={} \
+             f16_recall={:.6} f32_recall={:.6}",
+            self.rows,
+            self.dim,
+            self.batch,
+            self.k,
+            self.metric.as_str(),
+            self.f16_recall,
+            self.f32_recall,
+        )
+    }
+}

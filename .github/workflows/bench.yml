@@ -208,8 +208,12 @@ jobs:
         # ワークフローの env へは意図的に追加しない（bench 側も `GITHUB_ACTIONS` 下
         # では拒否する二重化。実測値が必要な場合は承認済み計測環境で
         # `BENCH_VERBOSE=1 make bench-batch` を直接実行する）。
+        # Issue #2005: `BENCH_BATCH_METRIC`（非機密の 3 択 inner_product/l2/cosine。
+        # 未設定・空は内積）で CORE-6/CORE-16 の構築 metric を切り替える。allowlist 外は
+        # `batch_bench.rs` が fail-closed で拒否する。閾値は metric によらず既存の secrets。
         env:
           BENCH_BATCH_MAX_DEGRADATION_PCT: ${{ secrets.BENCH_BATCH_MAX_DEGRADATION_PCT }}
+          BENCH_BATCH_METRIC: ${{ vars.BENCH_BATCH_METRIC }}
           BENCH_CORE6: ${{ vars.BENCH_CORE6 }}
           BENCH_CORE16: ${{ vars.BENCH_CORE16 }}
           BENCH_CORE6_MIN_IMPROVEMENT_PCT: ${{ secrets.BENCH_CORE6_MIN_IMPROVEMENT_PCT }}

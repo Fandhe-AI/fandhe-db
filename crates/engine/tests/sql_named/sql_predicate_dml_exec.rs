@@ -506,8 +506,8 @@ fn predicate_delete_default_has_no_affected_rows_cap() {
 
 /// 指定 `id` の行が持つ `embedding`（`VECTOR` 列）の現在値を直接読み取る
 /// ヘルパー（広域取得 `SELECT embedding FROM {table} WHERE id = {id} LIMIT 1`。
-/// SQL-15・Issue #454）。`ORDER BY <=> ...` の近傍探索（ランキングが未正規化
-/// 内積によるため、大きさの異なるベクトル間では「値が完全一致する行」が
+/// SQL-15・Issue #454）。`ORDER BY <=> ...` の近傍探索（ランキングがコサイン距離
+/// のため、向きが同じで大きさの違うベクトルは距離が同じ（0）になり、「値が完全一致する行」が
 /// Top-1 に来るとは限らない）を経由せず、値そのものを比較する。
 fn embedding_of(core: &EngineCore, ctx: &PolicyContext, table: &str, id: u64) -> Vec<f32> {
     let result = core

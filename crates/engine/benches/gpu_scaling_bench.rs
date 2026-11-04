@@ -51,6 +51,23 @@
 //! `packed_i8::DEFAULT_I8_OVERSAMPLE`）で 1 プロセス = 1 oversample を計測する。
 //! oversample のスイープは `scripts/bench_gpu_scaling_ab.sh` 側でプロセスを
 //! 複数回起動して行う。
+//!
+//! # metric 別計測（Issue #2005・親 #2002。ポインタ: CORE-6・CORE-16・SQL-33）
+//!
+//! `BENCH_GPU_SCALING_METRIC`（`inner_product`〔既定〕・`l2`・`cosine` の
+//! allowlist。`l1` を含むそれ以外は fail-closed で起動拒否）で、A/B/C/D の全経路を
+//! 同じ metric で構築し直す。1 プロセス = 1 metric（同一プロセス内の連続計測は
+//! ノイズが乗るため、metric 間の比較はプロセスを分けて行う）。既存行
+//! （`gpu_scaling:`・`gpu_scaling_stats:`・`gpu_scaling_i8:`・`gpu_scaling_i8_stats:`）の
+//! 書式は 1 文字も変えず、次の追加行だけを出す:
+//! - 起動直後に 1 回: `gpu_scaling_metric: metric=<name>`
+//! - 規模点ごと: `gpu_scaling_recall: ... f16_recall=.. f32_recall=..`
+//!   （基準は同じ metric の CPU-SIMD 経路の Top-k の id 集合）
+//!
+//! packed i8 は常駐行列を生の行（内積）で持ち、metric は別引数で渡す。i8 の
+//! コサインの最終スコアは `-(1 - cos)` で CPU 基準（cos 類似度）と 1.0 ずれるため、
+//! 不一致件数の算出時だけ +1.0 して尺度を揃える（丸めの影響で参考値。主指標は
+//! id ベースの Recall@k）。
 
 #[allow(dead_code)]
 mod harness;
@@ -58,11 +75,12 @@ mod harness;
 use harness::accept::{p95_from_samples, recall_at_k};
 use harness::env_report::EnvReport;
 use harness::gpu_scaling::{
-    count_boundary_tolerant_mismatches, format_i8_unavailable_line, format_skip_line,
-    format_unavailable_line, mean_recall_at_k, parse_batches, parse_dims, parse_i8_oversample,
-    parse_measured_iterations, parse_query_f16_exact, parse_rows, parse_shader_ab, parse_top_k,
-    read_env_var, readback_bytes_per_call, rescored_candidates_per_call, round_to_f16_exact,
-    speedup_ratio, GpuScalingI8Result, GpuScalingI8StatsLine, GpuScalingResult,
+    count_boundary_tolerant_mismatches, format_i8_unavailable_line, format_metric_line,
+    format_skip_line, format_unavailable_line, mean_recall_at_k, parse_batches, parse_dims,
+    parse_i8_oversample, parse_measured_iterations, parse_metric, parse_query_f16_exact,
+    parse_rows, parse_shader_ab, parse_top_k, read_env_var, readback_bytes_per_call,
+    rescored_candidates_per_call, round_to_f16_exact, speedup_ratio, BenchMetric,
+    GpuScalingI8Result, GpuScalingI8StatsLine, GpuScalingRecallLine, GpuScalingResult,
     GpuScalingStatsLine,
 };
 use harness::protocol::{run_fallible, MeasurementConfig, TrialFailure};
@@ -76,7 +94,7 @@ use engine::batch_search::{
 use engine::gpu_batch::packed_i8::{
     GpuI8BatchBackend, GpuI8Options, DEFAULT_I8_OVERSAMPLE, MAX_I8_OVERSAMPLE,
 };
-use engine::gpu_batch::{GpuBatchBackend, GpuF32ContrastBackend};
+use engine::gpu_batch::{GpuBatchBackend, GpuBatchMetric, GpuF32ContrastBackend};
 #[cfg(feature = "bench-internals")]
 use engine::gpu_batch::{GpuDotShaderKind, GpuSearchTestOptions};
 use engine::kernel::SearchHit;
@@ -215,6 +233,8 @@ struct ScalingConfig {
     /// 存在しないため `#[allow(dead_code)]`（`mod harness;` と同方針）。
     #[allow(dead_code)]
     shader_ab: bool,
+    /// `BENCH_GPU_SCALING_METRIC`（Issue #2005。1 プロセス = 1 metric）。
+    metric: BenchMetric,
 }
 
 fn load_config() -> Result<ScalingConfig, String> {
@@ -228,6 +248,7 @@ fn load_config() -> Result<ScalingConfig, String> {
     let query_f16_exact_raw =
         read_env_var("BENCH_GPU_SCALING_QUERY_F16_EXACT").map_err(|e| e.to_string())?;
     let shader_ab_raw = read_env_var("BENCH_GPU_SCALING_SHADER_AB").map_err(|e| e.to_string())?;
+    let metric_raw = read_env_var("BENCH_GPU_SCALING_METRIC").map_err(|e| e.to_string())?;
 
     let rows = parse_rows(rows_raw.as_deref(), &DEFAULT_ROWS).map_err(|e| e.to_string())?;
     let dims = parse_dims(dims_raw.as_deref(), &DEFAULT_DIMS).map_err(|e| e.to_string())?;
@@ -245,6 +266,8 @@ fn load_config() -> Result<ScalingConfig, String> {
     let query_f16_exact =
         parse_query_f16_exact(query_f16_exact_raw.as_deref()).map_err(|e| e.to_string())?;
     let shader_ab = parse_shader_ab(shader_ab_raw.as_deref()).map_err(|e| e.to_string())?;
+    let metric = parse_metric(metric_raw.as_deref())
+        .map_err(|e| format!("BENCH_GPU_SCALING_METRIC: {e}"))?;
     if shader_ab {
         // fail-closed（Issue #540 追記）: シェーダ強制 `F16Arith` は
         // `select_dot_shader` の条件 5（クエリが f16 厳密往復不能なら拒否）を
@@ -277,7 +300,35 @@ fn load_config() -> Result<ScalingConfig, String> {
         i8_oversample,
         query_f16_exact,
         shader_ab,
+        metric,
     })
+}
+
+/// `BenchMetric` を i8 経路の `GpuBatchMetric` へ写す（production に
+/// `From<BatchMetric> for GpuBatchMetric` が無いためベンチ内で持つ）。
+fn to_gpu_batch_metric(metric: BenchMetric) -> GpuBatchMetric {
+    match metric {
+        BenchMetric::InnerProduct => GpuBatchMetric::InnerProduct,
+        BenchMetric::L2 => GpuBatchMetric::L2,
+        BenchMetric::Cosine => GpuBatchMetric::Cosine,
+    }
+}
+
+/// `baseline`（CPU-SIMD 基準）に対する `other` のクエリ平均 Recall@k（id 集合比較）。
+/// 計測区間外で 1 回だけ呼ぶ。算出不能（クエリ数不一致・基準が空）は `Err`。
+fn mean_recall_against(baseline: &[BatchHit], other: &[BatchHit]) -> Result<f64, String> {
+    if baseline.len() != other.len() {
+        return Err("query count mismatch".to_string());
+    }
+    let mut per_query: Vec<f64> = Vec::with_capacity(baseline.len());
+    for (b, o) in baseline.iter().zip(other.iter()) {
+        let expected: Vec<u64> = b.hits.iter().map(|h| h.id).collect();
+        let actual: Vec<u64> = o.hits.iter().map(|h| h.id).collect();
+        if let Ok(r) = recall_at_k(&expected, &actual) {
+            per_query.push(r);
+        }
+    }
+    mean_recall_at_k(&per_query).map_err(|e| e.to_string())
 }
 
 /// 起動直後の GPU 疎通確認。1 行だけの最小データセットで
@@ -342,7 +393,13 @@ fn measure_i8_scaling_point(
     };
 
     let build_started = std::time::Instant::now();
-    let gpu_i8 = match GpuI8BatchBackend::try_new(i8_matrix, GpuI8Options { oversample }) {
+    // 常駐行列は生の行（内積）のまま。metric は別引数で渡す（`GpuI8BatchBackend::
+    // try_new_with_metric` は内積以外の行列を拒否する）。
+    let gpu_i8 = match GpuI8BatchBackend::try_new_with_metric(
+        i8_matrix,
+        GpuI8Options { oversample },
+        to_gpu_batch_metric(config.metric),
+    ) {
         Ok(b) => b,
         Err(e) => {
             println!(
@@ -397,7 +454,13 @@ fn measure_i8_scaling_point(
     let mut per_query_recall: Vec<f64> = Vec::with_capacity(cpu_hits.len());
     for i in 0..cpu_hits.len() {
         let baseline = hit_pairs(&cpu_hits[i].hits);
-        let candidate = hit_pairs(&i8_hits[i].hits);
+        let mut candidate = hit_pairs(&i8_hits[i].hits);
+        if config.metric == BenchMetric::Cosine {
+            // i8 のコサインは `-(1 - cos)` を返す。CPU 基準（cos 類似度）の尺度へ戻す。
+            for (_, score) in candidate.iter_mut() {
+                *score += 1.0;
+            }
+        }
         i8_mismatch += count_boundary_tolerant_mismatches(&baseline, &candidate);
 
         let expected_ids: Vec<u64> = cpu_hits[i].hits.iter().map(|h| h.id).collect();
@@ -677,6 +740,7 @@ fn main() {
 
     let detected_isa = format!("{:?}", engine::isa::current().isa());
     println!("{}", EnvReport::capture(detected_isa));
+    println!("{}", format_metric_line(config.metric));
 
     let mut rng = DeterministicRng::new(1);
 
@@ -795,12 +859,14 @@ fn main() {
                     }
                 }
 
-                let cpu_matrix = match ResidentMatrix::build(
+                let batch_metric = config.metric.to_batch_metric();
+                let cpu_matrix = match ResidentMatrix::build_with_metric(
                     &dataset.ids,
                     &dataset.tenant_ids,
                     &dataset.visibilities,
                     dim,
                     &dataset.vectors,
+                    batch_metric,
                 ) {
                     Ok(m) => m,
                     Err(e) => {
@@ -816,12 +882,13 @@ fn main() {
                 };
                 let cpu_engine = BatchEngine::new(cpu_matrix);
 
-                let f16_matrix = match ResidentMatrix::build(
+                let f16_matrix = match ResidentMatrix::build_with_metric(
                     &dataset.ids,
                     &dataset.tenant_ids,
                     &dataset.visibilities,
                     dim,
                     &dataset.vectors,
+                    batch_metric,
                 ) {
                     Ok(m) => m,
                     Err(e) => {
@@ -846,12 +913,13 @@ fn main() {
                     }
                 };
 
-                let gpu_f32 = match GpuF32ContrastBackend::try_new(
+                let gpu_f32 = match GpuF32ContrastBackend::try_new_with_metric(
                     &dataset.ids,
                     &dataset.tenant_ids,
                     &dataset.visibilities,
                     dim,
                     &dataset.vectors,
+                    batch_metric,
                 ) {
                     Ok(b) => b,
                     Err(e) => {
@@ -1067,6 +1135,31 @@ fn main() {
                     mismatch,
                 };
                 println!("{result}");
+
+                // Issue #2005: f16・f32 経路の Recall@k（同じ metric の CPU-SIMD 経路
+                // の id 集合が基準。計測区間外・確定的指標）。算出不能でも
+                // 結果行は出力済みのため、警告のみで継続する。
+                match (
+                    mean_recall_against(&cpu_hits, &f16_hits),
+                    mean_recall_against(&cpu_hits, &f32_hits),
+                ) {
+                    (Ok(f16_recall), Ok(f32_recall)) => println!(
+                        "{}",
+                        GpuScalingRecallLine {
+                            rows,
+                            dim,
+                            batch,
+                            k,
+                            metric: config.metric,
+                            f16_recall,
+                            f32_recall,
+                        }
+                    ),
+                    (a, b) => eprintln!(
+                        "gpu_scaling_bench: recall unavailable rows={rows} dim={dim} \
+                         batch={batch} k={k}: f16={a:?} f32={b:?}"
+                    ),
+                }
 
                 // Issue #540 追記（codex-review P2 指摘対応・PR #611）:
                 // 同一クエリでの S0 シェーダ単体比較（交絡排除）。
