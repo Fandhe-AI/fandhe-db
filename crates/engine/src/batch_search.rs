@@ -202,6 +202,13 @@ pub enum BatchSearchError {
     QueryCanceled {
         reason: crate::interrupt::InterruptReason,
     },
+    /// コサイン metric のバッチで、ゼロノルム（アンダーフロー・オーバーフロー含む）の
+    /// クエリが渡された（Issue #2003。ポインタ: SQL-33・CORE-6）。正規化できないため
+    /// 入力エラーとして拒否する（fail-closed。HNSW の探索入口と同じ方針）。バッチ経路の
+    /// スコア契約は「有限値のみ」のため、SQL 表層の「NaN を末尾に並べる」挙動は採らない。
+    /// **BREAKING CHANGE**（Issue #2003）: variant を追加した（網羅的 `match` の下流は
+    /// 追随が必要）。
+    ZeroNormQuery { query_index: usize },
 }
 
 impl fmt::Display for BatchSearchError {
@@ -265,6 +272,10 @@ impl fmt::Display for BatchSearchError {
             BatchSearchError::QueryCanceled { .. } => {
                 write!(f, "batch_search: canceling statement")
             }
+            BatchSearchError::ZeroNormQuery { query_index } => write!(
+                f,
+                "batch_search: query {query_index} has zero norm under cosine metric"
+            ),
         }
     }
 }
@@ -402,6 +413,90 @@ fn compute_batch_work(
     Ok(total)
 }
 
+/// バッチ経路の距離 metric（Issue #2003。親 #2002・ポインタ: CORE-6・CORE-16・SQL-33）。
+///
+/// 常駐行列（[`ResidentMatrix`]）単位で決まり、クエリ単位では持たない（HNSW の
+/// metric と同じ考え方。`BatchQuery` の公開構造を壊さないためでもある）。スコアは
+/// 全 metric で「大きいほど近い」に揃える:
+///
+/// - `InnerProduct`: 内積そのもの（既定。従来挙動）
+/// - `L2`: `-Σ(r - q)²`（二乗距離の符号反転。`kernel::search_l2` と同じ規約）
+/// - `Cosine`: 行・クエリを単位長に正規化してから内積を取る（C2′。方式は
+///   `docs/design/cosine-distance-method.md`）。スコアは cos 類似度
+///
+/// L1 はバッチ経路の対象外（親 #2002 の範囲）。GPU の f16 算術版・packed i8 版は
+/// 内積専用で、他の metric では選ばれない／構築できない（fail-closed）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BatchMetric {
+    /// 内積（既定）。
+    #[default]
+    InnerProduct,
+    /// L2（二乗距離の符号反転）。
+    L2,
+    /// コサイン（正規化済み内積への帰着）。
+    Cosine,
+}
+
+/// `row` を Cosine 用に正規化して `out` へ書く。正規化できない行（ゼロ・非有限・
+/// アンダーフロー／オーバーフロー）は全成分を NaN にする。NaN 行は走査時のスコアが
+/// 非有限になり、既存の非有限除外で候補から外れる（スロット番号は保たれるため
+/// テナント解決には影響しない）。`out.len() == row.len()` が前提。
+pub(crate) fn normalize_row_or_nan(row: &[f32], out: &mut [f32]) {
+    if crate::kernel::normalize_into(row, out).is_err() {
+        out.fill(f32::NAN);
+    }
+}
+
+/// Cosine 用に全クエリを正規化したフラット buffer（`queries.len() * dim` 要素）を作る。
+/// ゼロノルムのクエリは [`BatchSearchError::ZeroNormQuery`]。確保はフォールブル
+/// （サイズは `MAX_BATCH_QUERIES`・`MAX_BATCH_DIM` で検証済みの範囲）。
+/// 呼び出し元: [`run_batch_search`]、`gpu_batch.rs` の GPU バッチ入口。
+pub(crate) fn normalize_query_store(
+    dim: usize,
+    queries: &[BatchQuery<'_>],
+) -> Result<Vec<f32>, BatchSearchError> {
+    let total = queries
+        .len()
+        .checked_mul(dim)
+        .ok_or(BatchSearchError::CapacityExceeded {
+            total_bytes: usize::MAX,
+            max: MAX_BATCH_TOTAL_BYTES,
+        })?;
+    let mut store: Vec<f32> = Vec::new();
+    try_reserve_exact(&mut store, total, "normalized queries")?;
+    store.resize(total, 0.0);
+    if dim == 0 {
+        return Ok(store);
+    }
+    for ((query_index, q), out) in queries.iter().enumerate().zip(store.chunks_mut(dim)) {
+        if crate::kernel::normalize_into(q.vector, out).is_err() {
+            return Err(BatchSearchError::ZeroNormQuery { query_index });
+        }
+    }
+    Ok(store)
+}
+
+/// [`normalize_query_store`] の buffer を指す `BatchQuery` 列を作る（`k`・`ctx` は元のまま）。
+pub(crate) fn queries_over_store<'s>(
+    queries: &[BatchQuery<'s>],
+    store: &'s [f32],
+    dim: usize,
+) -> Result<Vec<BatchQuery<'s>>, BatchSearchError> {
+    let mut out: Vec<BatchQuery<'s>> = Vec::new();
+    try_reserve_exact(&mut out, queries.len(), "normalized batch queries")?;
+    if dim == 0 {
+        return Ok(out);
+    }
+    for (q, chunk) in queries.iter().zip(store.chunks(dim)) {
+        out.push(BatchQuery {
+            vector: chunk,
+            k: q.k,
+            ctx: q.ctx,
+        });
+    }
+    Ok(out)
+}
+
 /// 一括インデクシングで構築する常駐ベース行列。可視性フィルタ済みの全行を
 /// f16 2 要素/u32 パックで保持する。呼び出し元（`core.rs` 相当）は元の f32
 /// アリーナを別途保持し続け、本構造体はバッチ検索専用の副次表現として扱う。
@@ -409,6 +504,8 @@ fn compute_batch_work(
 /// 実行は行わない（モジュール冒頭コメント参照）。
 #[derive(Debug)]
 pub struct ResidentMatrix {
+    /// この常駐行列のスコア規約（Issue #2003）。1 つの行列は 1 つの metric に対応する。
+    metric: BatchMetric,
     ids: Vec<u64>,
     /// テナント境界判定用: 行 `i` の所属テナント ID（`PolicyContext::is_visible` の
     /// 単一照合パスに渡すため、呼び出し元が構築時に確定させる）。
@@ -470,6 +567,28 @@ impl ResidentMatrix {
         visibilities: &[Visibility],
         dim: usize,
         vectors: &[f32],
+    ) -> Result<Self, BatchSearchError> {
+        Self::build_with_metric(
+            ids,
+            tenant_ids,
+            visibilities,
+            dim,
+            vectors,
+            BatchMetric::InnerProduct,
+        )
+    }
+
+    /// [`Self::build`] の metric 指定版（Issue #2003）。`Cosine` では各行を 1 回だけ
+    /// 単位長へ正規化してから f16 パックする（正規化できない行は NaN 行になり、走査時に
+    /// 候補から外れる。スロットは保たれる）。それ以外の事前条件・信頼境界は
+    /// [`Self::build`] と同じ。
+    pub fn build_with_metric(
+        ids: &[u64],
+        tenant_ids: &[String],
+        visibilities: &[Visibility],
+        dim: usize,
+        vectors: &[f32],
+        metric: BatchMetric,
     ) -> Result<Self, BatchSearchError> {
         if dim == 0 || dim > MAX_BATCH_DIM {
             return Err(BatchSearchError::InvalidDim {
@@ -596,7 +715,19 @@ impl ResidentMatrix {
         // 同方針）。
         let mut packed: Vec<u32> = Vec::new();
         try_reserve_exact(&mut packed, packed_len, "packed")?;
-        for row in vectors.chunks(dim) {
+        // Cosine のときだけ 1 行分の正規化 scratch を使う（容量は検証済みの `dim` 分）。
+        let mut scratch: Vec<f32> = Vec::new();
+        if metric == BatchMetric::Cosine {
+            try_reserve_exact(&mut scratch, dim, "normalize scratch")?;
+            scratch.resize(dim, 0.0);
+        }
+        for raw_row in vectors.chunks(dim) {
+            let row: &[f32] = if metric == BatchMetric::Cosine {
+                normalize_row_or_nan(raw_row, &mut scratch);
+                &scratch
+            } else {
+                raw_row
+            };
             for pair in row.chunks(2) {
                 let a = pair.first().copied().unwrap_or(0.0);
                 let b = pair.get(1).copied().unwrap_or(0.0);
@@ -634,6 +765,7 @@ impl ResidentMatrix {
         owned_visibilities.extend_from_slice(visibilities);
 
         Ok(Self {
+            metric,
             ids: owned_ids,
             tenant_ids: owned_tenant_ids,
             visibilities: owned_visibilities,
@@ -648,6 +780,11 @@ impl ResidentMatrix {
 
     pub fn dim(&self) -> usize {
         self.dim
+    }
+
+    /// この常駐行列のスコア規約（Issue #2003）。
+    pub fn metric(&self) -> BatchMetric {
+        self.metric
     }
 
     /// パック済み行列（行優先・`row_count() * dim().div_ceil(2)` 要素）への
@@ -880,6 +1017,9 @@ pub(crate) trait BatchRowSource {
     fn ids(&self) -> &[u64];
     fn tenant_ids(&self) -> &[String];
     fn visibilities(&self) -> &[Visibility];
+    /// この行ソースのスコア規約（Issue #2003）。Cosine の行は構築時に正規化済みの前提で、
+    /// 走査側はクエリだけを正規化して内積を取る。
+    fn metric(&self) -> BatchMetric;
     /// 行 `idx` を f32 として解決し `out` へ書き込む（積和計算専用）。
     /// [`ResidentMatrix`] は f16 往復デコード、CPU 縮退経路は f32 原本の
     /// スライス参照というように、表現方式の差分だけがここに現れる。
@@ -905,6 +1045,10 @@ impl BatchRowSource for ResidentMatrix {
 
     fn visibilities(&self) -> &[Visibility] {
         &self.visibilities
+    }
+
+    fn metric(&self) -> BatchMetric {
+        self.metric
     }
 
     fn row_f32_into(&self, idx: usize, out: &mut Vec<f32>) -> Option<()> {
@@ -1058,6 +1202,30 @@ pub(crate) fn validate_batch_queries(
     Ok(())
 }
 
+/// [`validate_batch_queries`] に metric 固有の検証を足したもの（Issue #2003）。Cosine では
+/// 正規化できない（ゼロノルム等の）クエリを [`BatchSearchError::ZeroNormQuery`] で拒否する。
+/// primary へ不正入力を渡さず `Backend` エラーによる誤ラッチ（CPU への恒久縮退）を
+/// 起こさないため、`FallbackBatchEngine::batch_search`・GPU バッチ入口・
+/// [`run_batch_search`] が共通で使う。
+pub(crate) fn validate_batch_queries_for_metric(
+    dim: usize,
+    metric: BatchMetric,
+    queries: &[BatchQuery<'_>],
+) -> Result<(), BatchSearchError> {
+    validate_batch_queries(dim, queries)?;
+    if metric == BatchMetric::Cosine {
+        let mut scratch: Vec<f32> = Vec::new();
+        try_reserve_exact(&mut scratch, dim, "normalize check scratch")?;
+        scratch.resize(dim, 0.0);
+        for (query_index, q) in queries.iter().enumerate() {
+            if crate::kernel::normalize_into(q.vector, &mut scratch).is_err() {
+                return Err(BatchSearchError::ZeroNormQuery { query_index });
+            }
+        }
+    }
+    Ok(())
+}
+
 /// [`BatchEngine::batch_search`] の走査パイプライン本体（TASK-129・CORE-8
 /// ポインタで [`BatchRowSource`] 越しに共有化。挙動はリファクタ前と不変）。
 /// `batch_fallback.rs::FallbackBatchEngine` の CPU 縮退経路もこの関数を直接
@@ -1072,7 +1240,23 @@ pub(crate) fn run_batch_search<S: BatchRowSource>(
     // 縮退経路の `run_batch_search` 直接呼び出し）の検証は従来どおり保たれる
     // （`FallbackBatchEngine::batch_search` からの先行呼び出しと合わせて
     // 二重に実行されるが、入力に対する冪等な検証であり結果は変わらない）。
+    let metric = source.metric();
     validate_batch_queries(source.dim(), queries)?;
+
+    // Cosine（Issue #2003）: 行は構築時に正規化済みなので、クエリだけを 1 回正規化して
+    // 以降は内積として走査する。ゼロノルムのクエリはここで `ZeroNormQuery`。
+    let norm_store: Vec<f32> = if metric == BatchMetric::Cosine {
+        normalize_query_store(source.dim(), queries)?
+    } else {
+        Vec::new()
+    };
+    let normalized_queries: Vec<BatchQuery<'_>>;
+    let queries: &[BatchQuery<'_>] = if metric == BatchMetric::Cosine {
+        normalized_queries = queries_over_store(queries, &norm_store, source.dim())?;
+        &normalized_queries
+    } else {
+        queries
+    };
 
     // このバッチに登場するテナント集合（`HashSet` にして行外側ループから
     // O(1) で参照できるようにする。バッチのクエリ件数は [`MAX_BATCH_QUERIES`]
@@ -1433,7 +1617,12 @@ pub(crate) fn run_batch_search<S: BatchRowSource>(
             if !q.ctx.is_visible(row_tenant, row_visibility) {
                 continue;
             }
-            let score = crate::kernel::dot(&row_buf.buf, q.vector);
+            let score = match metric {
+                BatchMetric::InnerProduct | BatchMetric::Cosine => {
+                    crate::kernel::dot(&row_buf.buf, q.vector)
+                }
+                BatchMetric::L2 => -crate::kernel::l2_sq(&row_buf.buf, q.vector),
+            };
             if !score.is_finite() {
                 continue;
             }
@@ -2917,5 +3106,199 @@ mod tests {
             retained_before_rejection,
             "a rejected request must not allocate or retain any additional buffer"
         );
+    }
+    // ---------------------------------------------------------------
+    // Issue #2003: metric（L2・コサイン）。ポインタ: CORE-6・CORE-16・SQL-33
+    // ---------------------------------------------------------------
+
+    fn metric_matrix(metric: BatchMetric, vectors: &[f32], dim: usize) -> ResidentMatrix {
+        let rows = vectors.len() / dim;
+        let ids: Vec<u64> = (1..=rows as u64).collect();
+        let tenants = vec!["t".to_string(); rows];
+        let vis = vec![Visibility::Public; rows];
+        ResidentMatrix::build_with_metric(&ids, &tenants, &vis, dim, vectors, metric)
+            .expect("build_with_metric")
+    }
+
+    fn run_one(
+        matrix: ResidentMatrix,
+        q: &[f32],
+        k: usize,
+    ) -> Result<Vec<SearchHit>, BatchSearchError> {
+        let c = ctx("t");
+        let engine = BatchEngine::new(matrix);
+        let bq = BatchQuery {
+            vector: q,
+            k,
+            ctx: &c,
+        };
+        engine
+            .batch_search(std::slice::from_ref(&bq))
+            .map(|mut v| v.remove(0).hits)
+    }
+
+    #[test]
+    fn build_defaults_to_inner_product_and_matches_explicit_metric_bit_for_bit() {
+        let vectors = [1.0f32, 2.0, 3.0, 0.5, -1.0, 4.0];
+        let a = ResidentMatrix::build(
+            &[1, 2],
+            &["t".to_string(), "t".to_string()],
+            &[Visibility::Public, Visibility::Public],
+            3,
+            &vectors,
+        )
+        .unwrap();
+        assert_eq!(a.metric(), BatchMetric::InnerProduct);
+        let b = metric_matrix(BatchMetric::InnerProduct, &vectors, 3);
+        assert_eq!(a.packed(), b.packed());
+        let q = [1.0f32, 1.0, 1.0];
+        let ra = run_one(a, &q, 2).unwrap();
+        let rb = run_one(b, &q, 2).unwrap();
+        for (x, y) in ra.iter().zip(rb.iter()) {
+            assert_eq!(x.id, y.id);
+            assert_eq!(x.score.to_bits(), y.score.to_bits());
+        }
+    }
+
+    #[test]
+    fn l2_scores_are_negated_squared_distance_in_ascending_distance_order() {
+        // f16 で厳密往復できる値のみ。行 1 は q=(1,2,3) と完全一致（距離 0）。
+        let vectors = [1.0f32, 2.0, 3.0, 2.0, 2.0, 3.0, 5.0, 2.0, 3.0];
+        let hits = run_one(
+            metric_matrix(BatchMetric::L2, &vectors, 3),
+            &[1.0, 2.0, 3.0],
+            3,
+        )
+        .unwrap();
+        let got: Vec<(u64, f32)> = hits.iter().map(|h| (h.id, h.score)).collect();
+        assert_eq!(got, vec![(1, 0.0), (2, -1.0), (3, -16.0)]);
+    }
+
+    #[test]
+    fn l2_odd_dimension_padding_does_not_affect_scores() {
+        let vectors = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let hits = run_one(
+            metric_matrix(BatchMetric::L2, &vectors, 3),
+            &[1.0, 2.0, 3.0],
+            2,
+        )
+        .unwrap();
+        assert_eq!(hits[0].id, 1);
+        assert_eq!(hits[0].score, 0.0);
+        assert_eq!(hits[1].score, -27.0);
+    }
+
+    #[test]
+    fn cosine_ranks_by_direction_and_ignores_row_norm() {
+        // 行 1・2 は同じ方向でノルムだけ違う。行 3 は直交、行 4 は逆向き。
+        let vectors = [1.0f32, 1.0, 4.0, 4.0, 1.0, -1.0, -1.0, -1.0];
+        let hits = run_one(
+            metric_matrix(BatchMetric::Cosine, &vectors, 2),
+            &[2.0, 2.0],
+            4,
+        )
+        .unwrap();
+        let ids: Vec<u64> = hits.iter().map(|h| h.id).collect();
+        assert_eq!(ids, vec![1, 2, 3, 4]);
+        assert!((hits[0].score - 1.0).abs() < 1e-3);
+        assert!((hits[1].score - 1.0).abs() < 1e-3);
+        assert!(hits[2].score.abs() < 1e-3);
+        assert!((hits[3].score + 1.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn cosine_matches_kernel_cosine_distance_ordering() {
+        let vectors = [
+            0.5f32, 1.0, 2.0, 1.5, -0.5, 3.0, 2.0, 0.25, 1.0, 1.0, 1.0, 1.0,
+        ];
+        let dim = 4;
+        let q = [1.0f32, 0.5, 2.0, 1.0];
+        let hits = run_one(metric_matrix(BatchMetric::Cosine, &vectors, dim), &q, 3).unwrap();
+        let mut by_distance: Vec<(u64, f64)> = vectors
+            .chunks(dim)
+            .enumerate()
+            .map(|(i, r)| (i as u64 + 1, crate::kernel::cosine_distance(r, &q)))
+            .collect();
+        by_distance.sort_by(|a, b| a.1.total_cmp(&b.1));
+        let want: Vec<u64> = by_distance.iter().map(|(id, _)| *id).collect();
+        let got: Vec<u64> = hits.iter().map(|h| h.id).collect();
+        assert_eq!(got, want);
+        for h in &hits {
+            let d = by_distance.iter().find(|(id, _)| *id == h.id).unwrap().1;
+            assert!((f64::from(h.score) - (1.0 - d)).abs() < 2e-3);
+        }
+    }
+
+    #[test]
+    fn cosine_zero_norm_row_is_excluded_but_keeps_its_slot() {
+        let vectors = [0.0f32, 0.0, 1.0, 0.0, 0.0, 1.0];
+        let hits = run_one(
+            metric_matrix(BatchMetric::Cosine, &vectors, 2),
+            &[1.0, 0.0],
+            3,
+        )
+        .unwrap();
+        let ids: Vec<u64> = hits.iter().map(|h| h.id).collect();
+        assert_eq!(ids, vec![2, 3], "zero-norm row (id 1) must be skipped");
+    }
+
+    #[test]
+    fn cosine_zero_norm_query_is_rejected_with_query_index_and_fixed_message() {
+        let matrix = metric_matrix(BatchMetric::Cosine, &[1.0f32, 0.0, 0.0, 1.0], 2);
+        let c = ctx("t");
+        let engine = BatchEngine::new(matrix);
+        let good = [1.0f32, 0.0];
+        let zero = [0.0f32, 0.0];
+        let qs = [
+            BatchQuery {
+                vector: &good,
+                k: 1,
+                ctx: &c,
+            },
+            BatchQuery {
+                vector: &zero,
+                k: 1,
+                ctx: &c,
+            },
+        ];
+        let err = engine.batch_search(&qs).unwrap_err();
+        assert_eq!(err, BatchSearchError::ZeroNormQuery { query_index: 1 });
+        assert_eq!(
+            err.to_string(),
+            "batch_search: query 1 has zero norm under cosine metric"
+        );
+    }
+
+    #[test]
+    fn zero_norm_query_is_accepted_for_inner_product_and_l2() {
+        for metric in [BatchMetric::InnerProduct, BatchMetric::L2] {
+            let matrix = metric_matrix(metric, &[1.0f32, 0.0, 0.0, 1.0], 2);
+            assert!(run_one(matrix, &[0.0, 0.0], 2).is_ok(), "{metric:?}");
+        }
+    }
+
+    #[test]
+    fn metric_search_never_mixes_other_tenant_private_rows() {
+        for metric in [BatchMetric::L2, BatchMetric::Cosine] {
+            let ids = [1u64, 2, 3, 4];
+            let tenants = ["a", "b", "a", "b"].map(String::from);
+            let vis = [Visibility::Private; 4];
+            let vectors = [1.0f32, 0.0, 1.0, 0.0, 0.5, 0.5, 0.5, 0.5];
+            let m = ResidentMatrix::build_with_metric(&ids, &tenants, &vis, 2, &vectors, metric)
+                .unwrap();
+            let c = private_ctx("a");
+            let engine = BatchEngine::new(m);
+            let q = [1.0f32, 0.0];
+            let bq = BatchQuery {
+                vector: &q,
+                k: 4,
+                ctx: &c,
+            };
+            let hits = engine.batch_search(std::slice::from_ref(&bq)).unwrap();
+            assert!(!hits[0].hits.is_empty());
+            for h in &hits[0].hits {
+                assert_eq!(h.tenant_id, "a", "{metric:?}");
+            }
+        }
     }
 }

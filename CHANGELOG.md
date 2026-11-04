@@ -9,6 +9,8 @@
 
 ### Changed
 
+- `BatchSearchError` に `ZeroNormQuery { query_index }` を追加した（Issue #2003・CORE-6・CORE-16・SQL-33 ポインタ）。コサイン metric のバッチにゼロノルム（アンダーフロー・オーバーフロー含む）のクエリが含まれると、primary へ渡す前に入力エラーで拒否する（縮退イベント・ラッチは起きない）。内積・L2 では従来どおり受理する。
+  BREAKING CHANGE: 公開 enum `BatchSearchError` に variant `ZeroNormQuery` を追加した（網羅的 `match` の下流は追随が必要）。
 - `<=>` の実行をコサイン距離（`1 - cos`）の昇順へ切り替え、`<#>` を負の内積の昇順として実行経路へ接続した（Issue #1991・SQL-33 ポインタ）。ゼロノルムの行は距離 NaN で昇順の末尾（`DESC` では先頭）に並び、同点は行の順序キー昇順。従来の `<=>` の順位（内積の降順）は `<#>` で得られる。`ResultRow.score` は演算子の距離値（`<=>` は `1 - cos`、`<#>` は `-dot`）に変わる。`<->`／`<+>` は従来どおり `0A000`。`USING MODE 'precision'` と `<#>` の併用は `0A000`。HNSW の opt-in は内積グラフのまま返った候補を厳密なコサイン距離で再採点する（入力は L2 正規化済みが契約）。詳しい移行ガイドは #1995。
   BREAKING CHANGE: `<=>` の結果の順位と `ResultRow.score` の値が変わる。公開 trait `SearchProvider` に既定実装付きのメソッド `search_cosine`／`search_cosine_subset` を追加した。
 - `engine::kernel::cosine_top_k` がゼロノルム（行・クエリ）の距離 NaN を除外せず、昇順の末尾に返すようにした（Issue #2240・SQL-33 (3) ポインタ）。NaN 同士は順序キー昇順で、NaN 行も `k` を消費する。挙動の変化: ゼロノルムのクエリは空ではなく先頭 `k` 行（距離 NaN）を返す。クエリの非有限成分は従来どおり `NonFiniteQuery`。公開シグネチャの変更はない。
@@ -19,6 +21,7 @@
 
 ### Added
 
+- GPU バッチ検索の f32 算術経路に L2 とコサインを追加した（Issue #2003・親 #2002・CORE-6・CORE-16・SQL-33 ポインタ）。`batch_search::BatchMetric`（`InnerProduct`〔既定〕・`L2`・`Cosine`）、`ResidentMatrix::{build_with_metric, metric}`、`BatchBackend::metric`（既定実装は内積）、`FallbackBatchEngine::{build_with_metric, build_with_gpu_metric, build_with_gpu_reference_metric}`、`GpuBatchBackend::metric`、`GpuF32ContrastBackend::try_new_with_metric` を追加した。スコアは全 metric で「大きいほど近い」（L2 は `-Σ(r-q)²`、コサインは行・クエリを正規化した内積）。既存の `build`・`try_new` は内積のまま挙動不変。GPU の f16 算術版と packed i8 版は内積専用で、L2 では選ばれず、i8 版は内積以外の行列の構築を `InitFailed` で拒否する。詳細は `docs/design/gpu-batch-metric.md`。
 - 距離順 `ORDER BY` を持つ検索 SELECT の投影位置に距離列 `<VECTOR 列> <距離演算子> <リテラル|$n> [AS 別名]` を受理し、float8 で返すようにした（Issue #2007・SQL-33 (7) ポインタ）。列・演算子種別・クエリベクトルが `ORDER BY` と同一の形だけを受理する（種別・列の不一致や距離 `ORDER BY` のない文は `42601`、クエリベクトルの不一致は `0A000`）。値は RLS 後の行から計算し、ゼロノルムのコサインは NaN。`<->`／`<#>`／`<+>` の実行はカーネル接続（#1981・#1991）まで `0A000` のまま。従来 `42601` だった入力は受理に変わる。公開 API の変更はない。
 - `sum(<VECTOR 列>)` と VECTOR 型の式（`sum(vec_div(embedding, 2))` 等）の `sum` を受け付けるようにした（Issue #2038・SQL-72 (3) ポインタ）。要素ごとに f64 で累積して f32 へ丸め、NULL 行は飛ばし、対象 0 行なら NULL、次元不一致は `22000`、f32 範囲超過は `22003`。`GROUP BY`・`FILTER`・他の集計への `HAVING` と併用できる。結果列は `vector`（wire の型 OID は 25）。挙動変更: `SUM(<VECTOR 列>)` は `42883` から受理に変わる。`MIN`／`MAX`／`AVG`、NoSQL、JOIN、FROM なしの SELECT、ウィンドウ（`0A000`）、集計結果の `HAVING`／`ORDER BY`／演算（`0A000`／`42601`）は従来どおり拒否。公開 API の変更はない。
 - 距離順 `ORDER BY` で `LIMIT` を省略（`LIMIT ALL`・`OFFSET` 単独を含む）できるようにした（Issue #2242・SQL-33・SQL-34・SQL-75 ポインタ）。ANN 索引を使わず可視行を厳密全走査して距離順にすべて返す。可視件数（`OFFSET` 適用後）が `--max-result-rows` を超えたら行を返さず `54000`。`USING MODE 'precision'` との併用は `0A000`。hybrid 関数形・`USING PLAN` の省略は従来どおり `42601`。`EXPLAIN` の `ann_plan:` に `plain_scan_limit_omitted` を追加した（`AnnPlan::PlainScanLimitOmitted` の追加は `#[non_exhaustive]` のため非破壊）。従来 `42601` だった入力は受理に変わる。

@@ -1660,3 +1660,447 @@ mod f16_arith_dot_shader {
         );
     }
 }
+// ---------------------------------------------------------------------
+// Issue #2003: metric（L2・コサイン）対応（親 #2002。ポインタ: CORE-6・CORE-16・SQL-33）
+//
+// 受け入れ条件: GPU アダプタの無い環境でも skip 扱いにせず、フォールバック経路（CPU）で
+// L2・コサインの結果が検証される。`build_with_gpu_metric` 系テストは GPU 初期化の成否で
+// 分岐しつつ、どちらの分岐でも必ず assert する（早期 return で空振りさせない）。
+// ---------------------------------------------------------------------
+
+use engine::batch_search::{BatchMetric, BatchSearchError, ResidentMatrix};
+
+/// metric ごとのオラクル。可視行の `(id, score)` を「大きいほど近い」で降順（同点は id 昇順）に
+/// 返す。L2 は `-Σ(r-q)²`、コサインは cos 類似度（f64 で計算）。
+fn metric_oracle(
+    fx: &Fixture,
+    query: &[f32],
+    k: usize,
+    ctx: &PolicyContext,
+    metric: BatchMetric,
+) -> Vec<(u64, f64)> {
+    let mut scored: Vec<(u64, f64)> = Vec::new();
+    for (((id, tenant), vis), row) in fx
+        .ids
+        .iter()
+        .zip(fx.tenant_ids.iter())
+        .zip(fx.visibilities.iter())
+        .zip(fx.vectors.chunks(fx.dim))
+    {
+        if !ctx.is_visible(tenant, *vis) {
+            continue;
+        }
+        let dot: f64 = row
+            .iter()
+            .zip(query)
+            .map(|(&r, &q)| f64::from(r) * f64::from(q))
+            .sum();
+        let score = match metric {
+            BatchMetric::L2 => -row
+                .iter()
+                .zip(query)
+                .map(|(&r, &q)| (f64::from(r) - f64::from(q)).powi(2))
+                .sum::<f64>(),
+            BatchMetric::Cosine => {
+                let nr: f64 = row
+                    .iter()
+                    .map(|&r| f64::from(r).powi(2))
+                    .sum::<f64>()
+                    .sqrt();
+                let nq: f64 = query
+                    .iter()
+                    .map(|&q| f64::from(q).powi(2))
+                    .sum::<f64>()
+                    .sqrt();
+                dot / (nr * nq)
+            }
+            BatchMetric::InnerProduct => dot,
+        };
+        scored.push((*id, score));
+    }
+    scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    scored.truncate(k);
+    scored
+}
+
+/// 結果がオラクルと一致すること（id 集合一致・スコア許容差内。f16 常駐と f32 原本の丸め差を許容）。
+fn assert_matches_metric_oracle(
+    hits: &[engine::kernel::SearchHit],
+    expected: &[(u64, f64)],
+    label: &str,
+) {
+    assert_eq!(hits.len(), expected.len(), "{label}: hit count");
+    let mut actual: Vec<(u64, f64)> = hits.iter().map(|h| (h.id, f64::from(h.score))).collect();
+    let mut want: Vec<(u64, f64)> = expected.to_vec();
+    actual.sort_by_key(|(id, _)| *id);
+    want.sort_by_key(|(id, _)| *id);
+    for ((aid, ascore), (eid, escore)) in actual.iter().zip(want.iter()) {
+        assert_eq!(aid, eid, "{label}: id set mismatch");
+        let tolerance = 5e-3 * (1.0 + escore.abs());
+        assert!(
+            (ascore - escore).abs() < tolerance,
+            "{label}: score mismatch for id {aid}: got={ascore} want={escore}"
+        );
+    }
+}
+
+fn metric_fixture(
+    row_count: usize,
+    dim: usize,
+    seed: u32,
+    private_two_tenants: bool,
+) -> (Fixture, Vec<Vec<f32>>) {
+    let m = multi_query_fixture(row_count, dim, 3, seed);
+    let mut tenant_ids = m.tenant_ids.clone();
+    let mut visibilities = m.visibilities.clone();
+    if private_two_tenants {
+        for (i, (t, v)) in tenant_ids
+            .iter_mut()
+            .zip(visibilities.iter_mut())
+            .enumerate()
+        {
+            if i % 2 == 1 {
+                *t = "tenant-b".to_string();
+            }
+            *v = Visibility::Private;
+        }
+    }
+    (
+        Fixture {
+            ids: m.ids,
+            tenant_ids,
+            visibilities,
+            dim: m.dim,
+            vectors: m.vectors,
+        },
+        m.queries,
+    )
+}
+
+fn check_build_with_gpu_metric(metric: BatchMetric, seed: u32) {
+    let (fx, queries) = metric_fixture(23, 17, seed, false);
+    let observer = RecordingObserver::default();
+    let engine = FallbackBatchEngine::build_with_gpu_metric(
+        &fx.ids,
+        &fx.tenant_ids,
+        &fx.visibilities,
+        fx.dim,
+        &fx.vectors,
+        metric,
+        Box::new(observer.clone()),
+    )
+    .expect("build_with_gpu_metric should not fail on a well-formed fixture");
+
+    let events = observer.events();
+    if events.is_empty() {
+        eprintln!("gpu available: {metric:?} verified against the oracle on the gpu path");
+    } else {
+        // GPU 初期化に失敗した環境: 縮退イベントはちょうど 1 件（init → cpu-simd）。
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].reason.to_string(), "init");
+        assert_eq!(events[0].target, "cpu-simd");
+    }
+
+    // どちらの分岐でも結果はオラクルと一致する（CPU 縮退 or GPU）。
+    let c = ctx("tenant-a");
+    for (qi, query) in queries.iter().enumerate() {
+        let bq = BatchQuery {
+            vector: query,
+            k: 6,
+            ctx: &c,
+        };
+        let hits = engine
+            .batch_search(std::slice::from_ref(&bq))
+            .expect("batch_search should succeed");
+        let expected = metric_oracle(&fx, query, 6, &c, metric);
+        assert_matches_metric_oracle(&hits[0].hits, &expected, &format!("{metric:?} query {qi}"));
+    }
+}
+
+/// CORE-6・CORE-16: L2 の GPU 構築。GPU の有無に依らず結果がオラクルと一致する。
+#[test]
+fn build_with_gpu_metric_falls_back_or_matches_oracle_l2() {
+    check_build_with_gpu_metric(BatchMetric::L2, 0x2003_0012);
+}
+
+/// CORE-6・CORE-16・SQL-33: コサインの GPU 構築。GPU の有無に依らず結果がオラクルと一致する。
+#[test]
+fn build_with_gpu_metric_falls_back_or_matches_oracle_cosine() {
+    check_build_with_gpu_metric(BatchMetric::Cosine, 0x2003_0c05);
+}
+
+/// コサインのゼロノルムクエリは、GPU の有無に依らず primary に渡る前に `ZeroNormQuery`
+/// で拒否され、縮退イベントも起きない（誤ラッチ防止）。
+#[test]
+fn build_with_gpu_metric_cosine_rejects_zero_norm_query_without_fallback_event() {
+    let (fx, _queries) = metric_fixture(8, 4, 0x2003_0707, false);
+    let observer = RecordingObserver::default();
+    let engine = FallbackBatchEngine::build_with_gpu_metric(
+        &fx.ids,
+        &fx.tenant_ids,
+        &fx.visibilities,
+        fx.dim,
+        &fx.vectors,
+        BatchMetric::Cosine,
+        Box::new(observer.clone()),
+    )
+    .expect("build");
+    let events_after_build = observer.events().len();
+    let c = ctx("tenant-a");
+    let good = [1.0f32, 0.5, 0.25, 0.125];
+    let zero = [0.0f32; 4];
+    let queries = [
+        BatchQuery {
+            vector: &good,
+            k: 3,
+            ctx: &c,
+        },
+        BatchQuery {
+            vector: &zero,
+            k: 3,
+            ctx: &c,
+        },
+    ];
+    let err = engine
+        .batch_search(&queries)
+        .expect_err("zero norm query must be rejected");
+    assert_eq!(err, BatchSearchError::ZeroNormQuery { query_index: 1 });
+    assert_eq!(
+        observer.events().len(),
+        events_after_build,
+        "no extra fallback event"
+    );
+}
+
+fn gpu_backend_for(fx: &Fixture, metric: BatchMetric) -> Option<GpuBatchBackend> {
+    let matrix = ResidentMatrix::build_with_metric(
+        &fx.ids,
+        &fx.tenant_ids,
+        &fx.visibilities,
+        fx.dim,
+        &fx.vectors,
+        metric,
+    )
+    .expect("resident matrix build");
+    match GpuBatchBackend::try_new(matrix) {
+        Ok(b) => Some(b),
+        Err(e) => {
+            eprintln!("gpu unavailable in this environment, skipping gpu branch: {e}");
+            None
+        }
+    }
+}
+
+fn check_gpu_backend_metric(metric: BatchMetric, seed: u32) {
+    // 奇数次元・複数タイル（GPU_QUERY_TILE_MAX = 16 を超える 20 本）。
+    let many = multi_query_fixture(37, 17, 20, seed ^ 0x55);
+    let fx = Fixture {
+        ids: many.ids.clone(),
+        tenant_ids: many.tenant_ids.clone(),
+        visibilities: many.visibilities.clone(),
+        dim: many.dim,
+        vectors: many.vectors.clone(),
+    };
+    let Some(backend) = gpu_backend_for(&fx, metric) else {
+        return;
+    };
+    assert_eq!(backend.metric(), metric);
+    let c = ctx("tenant-a");
+    let batch_queries: Vec<BatchQuery<'_>> = many
+        .queries
+        .iter()
+        .map(|v| BatchQuery {
+            vector: v,
+            k: 5,
+            ctx: &c,
+        })
+        .collect();
+    let hits = backend
+        .batch_search(&batch_queries)
+        .expect("gpu batch_search");
+    for (qi, query) in many.queries.iter().enumerate() {
+        let expected = metric_oracle(&fx, query, 5, &c, metric);
+        assert_matches_metric_oracle(
+            &hits[qi].hits,
+            &expected,
+            &format!("{metric:?} tile query {qi}"),
+        );
+    }
+    let stats = backend.stats();
+    assert!(
+        stats.partial_topk_dispatches + stats.full_readback_dispatches > 0,
+        "gpu dispatch must actually have happened"
+    );
+}
+
+#[test]
+fn gpu_backend_l2_matches_oracle_when_gpu_available() {
+    check_gpu_backend_metric(BatchMetric::L2, 0x2003_a001);
+}
+
+#[test]
+fn gpu_backend_cosine_matches_oracle_when_gpu_available() {
+    check_gpu_backend_metric(BatchMetric::Cosine, 0x2003_a002);
+}
+
+/// 複数テナント混在（Private）でも L2・コサインで他テナントの行が混ざらない。
+#[test]
+fn gpu_backend_metric_mixed_tenants_have_no_cross_tenant_leak_when_gpu_available() {
+    for (metric, seed) in [
+        (BatchMetric::L2, 0x2003_b001),
+        (BatchMetric::Cosine, 0x2003_b002),
+    ] {
+        let (fx, queries) = metric_fixture(30, 8, seed, true);
+        let Some(backend) = gpu_backend_for(&fx, metric) else {
+            return;
+        };
+        let ctx_a = ctx_with_private("tenant-a");
+        let ctx_b = ctx_with_private("tenant-b");
+        let bq = [
+            BatchQuery {
+                vector: &queries[0],
+                k: 30,
+                ctx: &ctx_a,
+            },
+            BatchQuery {
+                vector: &queries[1],
+                k: 30,
+                ctx: &ctx_b,
+            },
+        ];
+        let hits = backend.batch_search(&bq).expect("gpu batch_search");
+        for (hit_set, tenant) in hits.iter().zip(["tenant-a", "tenant-b"]) {
+            assert!(!hit_set.hits.is_empty());
+            for h in &hit_set.hits {
+                assert_eq!(h.tenant_id, tenant, "{metric:?}: cross-tenant leak");
+            }
+        }
+        let expected = metric_oracle(&fx, &queries[0], 30, &ctx_a, metric);
+        assert_matches_metric_oracle(&hits[0].hits, &expected, &format!("{metric:?} tenant-a"));
+    }
+}
+
+/// L2 で f16 算術版を強制すると、黙って縮退せず拒否される（fail-closed）。GPU が無い環境では
+/// 構築自体が `InitFailed` のため GPU 分岐のみ検証する。
+#[cfg(feature = "bench-internals")]
+#[test]
+fn gpu_backend_l2_rejects_forced_f16_arith_when_gpu_available() {
+    let (fx, queries) = metric_fixture(10, 4, 0x2003_c001, false);
+    let Some(backend) = gpu_backend_for(&fx, BatchMetric::L2) else {
+        return;
+    };
+    let c = ctx("tenant-a");
+    let bq = [BatchQuery {
+        vector: &queries[0][..4],
+        k: 3,
+        ctx: &c,
+    }];
+    let res = backend.batch_search_with_options_for_tests(
+        &bq,
+        engine::gpu_batch::GpuSearchTestOptions {
+            budget_bytes: 32 * 1024 * 1024,
+            force_full_readback: false,
+            dot_shader: Some(engine::gpu_batch::GpuDotShaderKind::F16Arith),
+        },
+    );
+    assert!(res.is_err(), "forced f16 arith must be rejected for L2");
+}
+
+/// 部分 Top-k（既定）と強制全量 readback が L2・コサインでビット同一（シェーダ内の符号反転・
+/// 正規化済み内積が両経路で同じ演算順であることの回帰）。
+#[cfg(feature = "bench-internals")]
+#[test]
+fn gpu_backend_metric_partial_topk_matches_forced_full_readback_when_gpu_available() {
+    for (metric, seed) in [
+        (BatchMetric::L2, 0x2003_d001),
+        (BatchMetric::Cosine, 0x2003_d002),
+    ] {
+        let (fx, queries) = metric_fixture(300, 17, seed, false);
+        let Some(backend) = gpu_backend_for(&fx, metric) else {
+            return;
+        };
+        let c = ctx("tenant-a");
+        let bq: Vec<BatchQuery<'_>> = queries
+            .iter()
+            .map(|v| BatchQuery {
+                vector: v,
+                k: 8,
+                ctx: &c,
+            })
+            .collect();
+        let run = |force_full: bool, budget: usize| {
+            backend
+                .batch_search_with_options_for_tests(
+                    &bq,
+                    engine::gpu_batch::GpuSearchTestOptions {
+                        budget_bytes: budget,
+                        force_full_readback: force_full,
+                        dot_shader: None,
+                    },
+                )
+                .expect("gpu search")
+        };
+        let partial = run(false, 32 * 1024 * 1024);
+        let full = run(true, 32 * 1024 * 1024);
+        // 行チャンク分割（端数を含む）でも同じ結果になる。
+        let chunked = run(true, 2_000);
+        for other in [&full, &chunked] {
+            for (a, b) in partial.iter().zip(other.iter()) {
+                assert_eq!(a.hits.len(), b.hits.len());
+                for (x, y) in a.hits.iter().zip(b.hits.iter()) {
+                    assert_eq!(x.id, y.id, "{metric:?}");
+                    assert_eq!(x.score.to_bits(), y.score.to_bits(), "{metric:?}");
+                }
+            }
+        }
+    }
+}
+
+/// f32 常駐対照経路の metric 指定版。GPU が無い環境では fail-closed で `Err`、ある環境では
+/// オラクルと一致する。
+#[test]
+fn f32_contrast_backend_metric_matches_oracle_or_fails_closed() {
+    for (metric, seed) in [
+        (BatchMetric::L2, 0x2003_e001),
+        (BatchMetric::Cosine, 0x2003_e002),
+    ] {
+        let (fx, queries) = metric_fixture(25, 7, seed, false);
+        let built = GpuF32ContrastBackend::try_new_with_metric(
+            &fx.ids,
+            &fx.tenant_ids,
+            &fx.visibilities,
+            fx.dim,
+            &fx.vectors,
+            metric,
+        );
+        let backend = match built {
+            Ok(b) => b,
+            Err(e) => {
+                // GPU 非搭載環境: 構築が InitFailed で fail-closed に止まる。
+                assert!(
+                    matches!(e, engine::batch_fallback::BatchBackendError::InitFailed(_)),
+                    "unexpected error: {e}"
+                );
+                continue;
+            }
+        };
+        assert_eq!(BatchBackend::metric(&backend), metric);
+        let c = ctx("tenant-a");
+        for (qi, q) in queries.iter().enumerate() {
+            let bq = BatchQuery {
+                vector: q,
+                k: 5,
+                ctx: &c,
+            };
+            let hits = backend
+                .batch_search(std::slice::from_ref(&bq))
+                .expect("f32 search");
+            let expected = metric_oracle(&fx, q, 5, &c, metric);
+            assert_matches_metric_oracle(
+                &hits[0].hits,
+                &expected,
+                &format!("f32 {metric:?} q{qi}"),
+            );
+        }
+    }
+}

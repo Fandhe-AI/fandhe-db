@@ -518,6 +518,13 @@ impl GpuI8BatchBackend {
                 "i8 oversample out of range".to_string(),
             ));
         }
+        // 内積専用（Issue #2003。L2・Cosine の i8 対応は #2004）。GPU コンテキスト取得より前に
+        // 判定し、環境に依らず fail-closed にする。
+        if matrix.metric() != crate::batch_search::BatchMetric::InnerProduct {
+            return Err(BatchBackendError::InitFailed(
+                "metric not supported by i8 backend".to_string(),
+            ));
+        }
 
         let ctx = match global_context() {
             Ok(ctx) => ctx,
@@ -1011,6 +1018,8 @@ fn dispatch_i8_dot_products(
         row_count,
         query_count: 1,
         query_stride: row_stride as u32,
+        // i8 版の WGSL `Params`（16 バイト）は metric を持たない。内積専用（Issue #2003）。
+        metric: 0,
     };
     let params_bytes = params.to_ne_bytes_vec().map_err(BatchExecError::Backend)?;
     let row_ids_bytes = bytes_of_u32_slice(row_indices).map_err(BatchExecError::Backend)?;
@@ -1021,7 +1030,7 @@ fn dispatch_i8_dot_products(
 
     let params_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("i8 batch dot product params"),
-        size: 16,
+        size: 32,
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
@@ -1358,5 +1367,31 @@ mod tests {
         // 検証は GPU デバイスへ触れる前に走る）だけを固定する。
         const _: () = assert!(DEFAULT_I8_OVERSAMPLE >= 1);
         const _: () = assert!(DEFAULT_I8_OVERSAMPLE <= MAX_I8_OVERSAMPLE);
+    }
+
+    /// 内積以外の metric の常駐行列では、GPU コンテキストへ触れる前に fail-closed で拒否する
+    /// （Issue #2003。L2・Cosine の i8 対応は #2004）。
+    #[test]
+    fn try_new_rejects_non_inner_product_metric_before_touching_gpu() {
+        for metric in [
+            crate::batch_search::BatchMetric::L2,
+            crate::batch_search::BatchMetric::Cosine,
+        ] {
+            let matrix = ResidentMatrix::build_with_metric(
+                &[1],
+                &["t".to_string()],
+                &[crate::storage::Visibility::Public],
+                2,
+                &[1.0, 0.5],
+                metric,
+            )
+            .unwrap();
+            match GpuI8BatchBackend::try_new(matrix, GpuI8Options::default()) {
+                Err(BatchBackendError::InitFailed(msg)) => {
+                    assert_eq!(msg, "metric not supported by i8 backend", "{metric:?}");
+                }
+                other => panic!("expected InitFailed, got {:?}", other.map(|_| ())),
+            }
+        }
     }
 }
