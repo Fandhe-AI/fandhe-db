@@ -3631,6 +3631,8 @@ const CREATE_ONLY_RESERVED_TYPE_NAMES: &[&str] = &[
     // Issue #2021（TABLE-48）。`BIT`・`VARBIT` は型名解決表の語。
     "bit",
     "varbit",
+    // Issue #2014（TABLE-46）。`HALFVEC` は型名解決表の語（括弧付きでのみ列型になる）。
+    "halfvec",
 ];
 
 /// カタログ層の公開エラー型。`redb` 操作由来のエラーは `Backend` に一本化し、

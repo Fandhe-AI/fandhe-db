@@ -655,6 +655,13 @@ fn bind_copy_record(
             .columns
             .get(col_idx)
             .ok_or_else(|| SqlSurfaceError::undefined_column(name))?;
+        // HALFVEC の COPY は担当 Issue 未定まで未対応（fail-closed。Issue #2014・TABLE-46）。
+        // NULL マーカー・空欄でも素通りしないよう、値の有無を見る前に列型で拒否する。
+        if matches!(column.ty, ColumnType::HalfVec(_)) {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "COPY does not support HALFVEC columns",
+            ));
+        }
         let value = match field {
             None => {
                 // 明示的な `\N`（COPY テキスト形式の NULL マーカー）は

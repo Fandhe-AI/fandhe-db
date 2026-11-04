@@ -450,3 +450,50 @@ fn halfvec_is_rejected_in_materialized_view_regardless_of_rows() {
     ok(&core, "UPDATE t SET h = '[1,2]' WHERE id = 1");
     assert_eq!(code(&core, q), "0A000");
 }
+
+/// `halfvec` は新規 ENUM 型名として予約され（大文字小文字不問）、列型として使えない型を作らせない。
+#[test]
+fn halfvec_type_name_is_reserved_against_new_enum_names() {
+    let (_p, _g, core) = open("hv-enum");
+    for name in ["halfvec", "HALFVEC"] {
+        assert!(
+            exec(&core, &format!("CREATE TYPE {name} AS ENUM ('a')")).is_err(),
+            "{name} must be reserved"
+        );
+    }
+}
+
+/// `COPY FROM` は値の有無（`\N`・空欄・値あり）によらず HALFVEC 列を 0A000 で拒否し、行を書かない。
+#[test]
+fn copy_from_rejects_halfvec_even_for_null_and_empty() {
+    use engine::core::CopyPlan;
+    let (_p, _g, core) = open("hv-copy");
+    ok(
+        &core,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, v HALFVEC(2))",
+    );
+    for (i, data) in [&b"1\t\\N\n"[..], b"2\t\n", b"3\t[1,2]\n"]
+        .iter()
+        .enumerate()
+    {
+        let policy = ctx_for("alice");
+        let session = SessionState::default();
+        let plan = core
+            .begin_copy(
+                &policy,
+                &session,
+                &format!("COPY t (id, v) FROM STDIN USING OPERATION_ID 'c{i}'"),
+            )
+            .and_then(|plan| {
+                let mut cs = match plan {
+                    CopyPlan::From(s) => s,
+                    CopyPlan::To(..) => panic!("expected COPY FROM plan"),
+                };
+                cs.feed(data)?;
+                cs.finish()
+            });
+        let err = plan.err().expect("COPY into HALFVEC must fail");
+        assert_eq!(err.wire_code(), "0A000", "input {data:?}");
+    }
+    assert!(rows(&core, "SELECT id, v FROM t").is_empty());
+}
