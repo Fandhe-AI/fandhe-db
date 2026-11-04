@@ -46,12 +46,17 @@
 //! `pub(crate)` のまま。対象外）。[`ExplainEngine`] は `Self::new` で構築し、
 //! `EXPLAIN` が検索本体を実行しない契約（本ファイル冒頭「責務境界」参照）は
 //! 呼び出し元にも求められる。
+//!
+//! Issue #2045（SQL-75 (2) ポインタ）: 単一表の 3 builder は `sql::explain_tree::ExplainNode`
+//! の「見出しなし・子なしのルート 1 節」として組み立てて描画する（出力はバイト不変）。
+//! 入れ子の字下げ契約と上限は `explain_tree.rs` と設計ドキュメントを参照。
 
 use crate::catalog::VectorOpClass;
 use crate::declarative_filter::MetadataFilter;
 use crate::query_planner::PlannedQuery;
 use crate::search_engine::SearchEngineKind;
 use crate::sql::exec::{Cell, ColumnMeta, QueryResult, ResultRow};
+use crate::sql::explain_tree::ExplainNode;
 use crate::sql::hnsw_cache::AnnPlan;
 use crate::sql::mode::ResolvedMode;
 use crate::sql::scalar_index::{ScalarFallbackReason, TextPredicateUse};
@@ -956,7 +961,7 @@ pub fn build_explain_result_with_indexes(
     ));
     push_engine_tail_rows(&mut lines, resolved, engine, names);
 
-    lines_to_query_result(lines)
+    ExplainNode::leaf(lines).into_query_result()
 }
 
 /// `EXPLAIN SELECT ...`（`USING PLAN` を伴わない検索 SELECT。`ORDER BY <=>`・
@@ -972,7 +977,7 @@ pub(crate) fn build_search_explain_result(
 ) -> QueryResult {
     let mut lines: Vec<String> = Vec::with_capacity(6);
     push_engine_tail_rows(&mut lines, mode, engine, names);
-    lines_to_query_result(lines)
+    ExplainNode::leaf(lines).into_query_result()
 }
 
 /// `EXPLAIN SELECT <集計>`・`EXPLAIN SELECT ... LIMIT n`（集計・広域取得。
@@ -1031,7 +1036,7 @@ pub(crate) fn build_relational_explain_result_with_windows(
             w.func, w.partition_keys, w.order_keys
         )
     }));
-    lines_to_query_result(lines)
+    ExplainNode::leaf(lines).into_query_result()
 }
 
 #[cfg(test)]
