@@ -280,6 +280,27 @@ impl IndexedBase {
             arena.vectors(),
             HNSW_BUILD_SEED,
         )?;
+        Ok(Self::from_index(
+            index,
+            metric,
+            arena,
+            precision,
+            built_ctx,
+            built_table_generation,
+        ))
+    }
+
+    /// 構築済みの `index`（ノード番号 = `arena` のスロット番号）からキー写像を組み立てる
+    /// [`Self::build`] の後半。Cosine 索引を渡せるのは単体テストだけ（SQL 経路の metric 結線は
+    /// #2000 の担当。Issue #2241 の Overlay 規則は索引が除外を持つときだけ有効になる）。
+    fn from_index(
+        index: HnswIndex,
+        metric: HnswMetric,
+        arena: &VectorArena,
+        precision: crate::hnsw::ResidentPrecision,
+        built_ctx: PolicyContext,
+        built_table_generation: u64,
+    ) -> (Self, bool, bool) {
         // 自動縮退の判定は「metric が許す実効精度」と比べる。L2・L1 は設計上 F32 固定
         // （`HnswMetric::effective_precision`）で、これを f16／i8 の縮退として誤計上しない。
         let effective = metric.effective_precision(precision);
@@ -303,7 +324,7 @@ impl IndexedBase {
             key_to_node.insert(key.clone(), node);
             node_keys.push(key);
         }
-        Ok((
+        (
             IndexedBase {
                 index: Arc::new(index),
                 node_keys,
@@ -313,7 +334,7 @@ impl IndexedBase {
             },
             f16_fallback,
             i8_fallback,
-        ))
+        )
     }
 
     /// キャッシュ容量判定用の概算バイト量。
@@ -428,7 +449,8 @@ pub(crate) struct Overlay {
     /// `base.index` のノード番号 → 現世代でのスロット番号。存在しない
     /// （削除・不可視化・キー変更）場合は [`STALE_SLOT`]。
     slot_of_node: Vec<u32>,
-    /// `slot_of_node` が [`STALE_SLOT`] のノード数。
+    /// `slot_of_node` が [`STALE_SLOT`] の **member** ノード数（churn の分子）。索引に入って
+    /// いない除外ノード（Issue #2241）は失効の意味を持たないので数えない。
     stale_nodes: usize,
     /// 未索引の行（新規・内容変更）のスロット番号。
     delta_slots: Vec<u64>,
@@ -522,6 +544,9 @@ impl Overlay {
     ) -> Self {
         let dim = arena.dim() as usize;
         let mut slot_of_node = vec![STALE_SLOT; base.index.len()];
+        // 索引が「正規化できない行の除外」規則を持つ（Cosine）ときだけ、下の規則を適用する
+        // （Issue #2241。内積グラフが本番の間は常に偽で、従来の挙動と同一）。
+        let excludes = base.index.excludes_non_normalizable();
         let mut delta_slots: Vec<u64> = Vec::new();
         let mut delta_vectors: Vec<f32> = Vec::new();
         let arena_len = slots.len();
@@ -533,8 +558,12 @@ impl Overlay {
             let id = rowid.raw_for_arena();
             let key: RowKey = (tenant.to_string(), id);
             let Some(&node) = base.key_to_node.get(&key) else {
-                // 新規行（索引構築時点では存在しなかった）。
+                // 新規行（索引構築時点では存在しなかった）。正規化できない行は、全走査では
+                // どのクエリでも NaN になる行なので delta（索引経由の候補）に入れない。
                 if let Some(v) = arena.vector(actual_slot) {
+                    if excludes && !crate::hnsw::is_cosine_indexable(v) {
+                        continue;
+                    }
                     delta_slots.push(ordinal as u64);
                     delta_vectors.extend_from_slice(v);
                 }
@@ -558,24 +587,37 @@ impl Overlay {
                 }
             } else if let Some(v) = arena.vector(actual_slot) {
                 // 内容変更: 索引側ノードは失効させたまま（slot_of_node は STALE_SLOT
-                // のまま）、現在の内容を未索引分として扱う。
+                // のまま）、現在の内容を未索引分として扱う。ただしゼロ化など正規化できなく
+                // なった行は delta にも入れない（索引からも全走査の候補からも外れる行）。
+                if excludes && !crate::hnsw::is_cosine_indexable(v) {
+                    continue;
+                }
                 delta_slots.push(ordinal as u64);
                 delta_vectors.extend_from_slice(v);
             }
         }
-        let stale_nodes = slot_of_node.iter().filter(|&&s| s == STALE_SLOT).count();
+        // 除外ノード（非 member）は、行が残っていても消えていても「失効」ではない。
+        let stale_nodes = slot_of_node
+            .iter()
+            .enumerate()
+            .filter(|&(node, &s)| {
+                s == STALE_SLOT && u32::try_from(node).is_ok_and(|n| base.index.is_member(n))
+            })
+            .count();
         let _ = dim; // 将来の整合検証用に保持（現状は arena.vector の長さで既に保証済み）。
         let mut visible_mask = crate::hnsw::NodeMask::new(base.index.len());
         for (node, &slot) in slot_of_node.iter().enumerate() {
             if slot != STALE_SLOT {
                 // `base.index.len() <= MAX_HNSW_NODES <= u32::MAX` 前提（`IndexedBase::build`
-                // のノード番号割当と同じ不変条件）。
+                // のノード番号割当と同じ不変条件）。除外ノード（Issue #2241）は可視にしない。
                 if let Ok(node_u32) = u32::try_from(node) {
-                    visible_mask.set(node_u32);
+                    if base.index.is_member(node_u32) {
+                        visible_mask.set(node_u32);
+                    }
                 }
             }
         }
-        let visible_in_index = base.index.len().saturating_sub(stale_nodes);
+        let visible_in_index = base.index.member_count().saturating_sub(stale_nodes);
         // 世代（マスク）が変わるたび高々 1 回だけの分断検査（§`mask_splits_graph`
         // ドキュメンテーションコメント参照）。可視カーディナリティ比が
         // `full_scan_ratio` 未満（[`below_full_scan_ratio`]）なら
@@ -585,7 +627,7 @@ impl Overlay {
         // `is_mask_fully_reachable` が自明に `true` を返す旧来の性質は維持される）。
         let regime = traversal_regime_for(
             visible_in_index,
-            base.index.len(),
+            base.index.member_count(),
             full_scan_ratio,
             acorn_max_visible_ratio,
         );
@@ -1325,8 +1367,11 @@ pub(crate) fn prepare_full_visible(
                 let new_base = access.cache.record_base(access.storage, table, built);
                 let mut identity_mask = crate::hnsw::NodeMask::new(new_base.index.len());
                 for node in 0..new_base.index.len() {
+                    // 除外ノード（Issue #2241。Cosine で正規化できない行）は可視にしない。
                     if let Ok(node_u32) = u32::try_from(node) {
-                        identity_mask.set(node_u32);
+                        if new_base.index.is_member(node_u32) {
+                            identity_mask.set(node_u32);
+                        }
                     }
                 }
                 // 恒等マスク（全ノード受理）でも分断検査は省略しない
@@ -1338,8 +1383,8 @@ pub(crate) fn prepare_full_visible(
                 // 導出し、分断検査は regime が要求する hop で行う（`Overlay::
                 // compute` と同じ単一情報源）。
                 let identity_regime = traversal_regime_for(
-                    new_base.index.len(),
-                    new_base.index.len(),
+                    new_base.index.member_count(),
+                    new_base.index.member_count(),
                     access.provider.full_scan_ratio(),
                     access.provider.acorn_max_visible_ratio(),
                 );
@@ -1357,7 +1402,7 @@ pub(crate) fn prepare_full_visible(
                     delta_slots: Vec::new(),
                     delta_vectors: Vec::new(),
                     visible_mask: identity_mask,
-                    visible_in_index: new_base.index.len(),
+                    visible_in_index: new_base.index.member_count(),
                     mask_splits_graph: identity_splits_graph,
                     regime: identity_regime,
                 });
@@ -1735,7 +1780,7 @@ pub(crate) fn prepare_subset(
     // 場合と完全に同一（`search_with_overlay` が選ぶ分岐が同じ）。
     if below_full_scan_ratio(
         arena.len(),
-        base.index.len(),
+        base.index.member_count(),
         access.provider.full_scan_ratio(),
     ) {
         // 統計（`fallbacks`／`plain_scans`）は解決時ではなく `search_prepared`
@@ -1877,7 +1922,7 @@ pub(crate) fn prepare_subset_from_slots(
     // `arena.len()`」と異なり上界ではなく正確な値）。
     if below_full_scan_ratio(
         kept.len(),
-        base.index.len(),
+        base.index.member_count(),
         access.provider.full_scan_ratio(),
     ) {
         access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
@@ -3192,6 +3237,173 @@ mod tests {
         // このミニチュアフィクスチャでは再構築閾値を超える（`needs_rebuild` の
         // 挙動自体は `search_or_fallback` の rebuild 分岐で結合テストする）。
         assert!(overlay.needs_rebuild(arena1.len()));
+    }
+
+    /// 4 次元のテスト表へ `rows`（id, embedding）を投入し、Cosine（`cosine == true`）または
+    /// 内積の索引済みベースと、その時点の世代を返す（Issue #2241 の Overlay 規則の検証用。
+    /// 本番の `IndexedBase::build` は内積グラフのため、Cosine 索引は `from_index` で組む）。
+    fn seed_and_build_base(
+        storage: &Storage,
+        c: &PolicyContext,
+        rows: &[(u64, [f32; 4])],
+        cosine: bool,
+    ) -> (IndexedBase, u64) {
+        create_table(storage, "docs", 4);
+        for (id, v) in rows {
+            seed_row(storage, "docs", *id, "tenant-a", v);
+        }
+        let read_txn = storage.db().begin_read().unwrap();
+        let gen0 = crate::catalog::table_generation_in_txn(&read_txn, "docs").unwrap();
+        let arena = build_arena(&read_txn, "docs", c);
+        let params = crate::hnsw::HnswParams::default();
+        let precision = crate::hnsw::ResidentPrecision::F32;
+        if !cosine {
+            let built = IndexedBase::build(
+                &arena,
+                params,
+                precision,
+                crate::hnsw::HnswMetric::InnerProduct,
+                c.clone(),
+                gen0,
+            )
+            .expect("build")
+            .0;
+            return (built, gen0);
+        }
+        let index = HnswIndex::build_with_metric(
+            params,
+            crate::hnsw::HnswMetric::Cosine,
+            precision,
+            arena.dim(),
+            arena.vectors(),
+            HNSW_BUILD_SEED,
+            1,
+        )
+        .expect("build cosine index");
+        let built = IndexedBase::from_index(
+            index,
+            crate::hnsw::HnswMetric::Cosine,
+            &arena,
+            precision,
+            c.clone(),
+            gen0,
+        )
+        .0;
+        (built, gen0)
+    }
+
+    fn update_embedding(storage: &Storage, c: &PolicyContext, id: u64, v: &[f32; 4], op: &str) {
+        let op_id = crate::recovery::required_op_id::OperationId::parse(op).unwrap();
+        crate::tenant::update_row(
+            storage,
+            "docs",
+            c,
+            id,
+            &RowInput {
+                tenant_id: "tenant-a",
+                visibility: Visibility::Public,
+                embedding: v,
+                metadata: &[],
+            },
+            &op_id,
+        )
+        .expect("update row");
+    }
+
+    fn overlay_now(storage: &Storage, c: &PolicyContext, base: &IndexedBase) -> Overlay {
+        let read_txn = storage.db().begin_read().unwrap();
+        let generation = crate::catalog::table_generation_in_txn(&read_txn, "docs").unwrap();
+        let arena = build_arena(&read_txn, "docs", c);
+        Overlay::compute(
+            base,
+            &arena,
+            generation,
+            Ratio {
+                numerator: 1,
+                denominator: 10,
+            },
+            None,
+        )
+    }
+
+    /// Issue #2241（INDEX-7・SQL-33 のポインタ）: Cosine 索引（除外ノードを持つ）の Overlay は、
+    /// 正規化できない行を delta に入れず、ゼロ化した member は失効（delta なし）、除外のまま
+    /// 変わらない行は churn に数えず、可視カーディナリティは member 数を基準にする。
+    #[test]
+    fn overlay_follows_cosine_exclusion_rules() {
+        let path = unique_db_path("hnsw-cache-overlay-cosine-exclusion");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let c = ctx("tenant-a");
+        let (base, _) = seed_and_build_base(
+            &storage,
+            &c,
+            &[
+                (1, [1.0, 0.0, 0.0, 0.0]),
+                (2, [0.0, 1.0, 0.0, 0.0]),
+                (3, [0.0, 0.0, 0.0, 0.0]), // 構築時に除外される
+                (4, [0.0, 0.0, 1.0, 0.0]),
+            ],
+            true,
+        );
+        assert_eq!(base.index.member_count(), 3);
+        assert!(base.index.excludes_non_normalizable());
+
+        // 変更なし: 除外ノードは失効でも delta でもない。
+        let o = overlay_now(&storage, &c, &base);
+        assert_eq!(o.stale_nodes, 0);
+        assert!(o.delta_slots.is_empty());
+        assert_eq!(o.visible_in_index, 3);
+        assert!(!o.needs_rebuild(4));
+
+        // id=1 をゼロ化（member → 正規化不可）、id=5 を新規ゼロ行、id=6 を新規の通常行、
+        // id=2 を別の向きへ更新する。
+        update_embedding(&storage, &c, 1, &[0.0; 4], "ovl-cosine-zero-1");
+        seed_row(&storage, "docs", 5, "tenant-a", &[0.0; 4]);
+        seed_row(&storage, "docs", 6, "tenant-a", &[0.0, 0.0, 0.0, 1.0]);
+        update_embedding(&storage, &c, 2, &[0.0, 0.0, 1.0, 1.0], "ovl-cosine-upd-2");
+        let o = overlay_now(&storage, &c, &base);
+        // 失効は id=1・id=2。delta は id=2（内容変更）と id=6（新規）だけ。
+        assert_eq!(o.stale_nodes, 2);
+        assert_eq!(o.delta_slots.len(), 2);
+        assert_eq!(o.visible_in_index, 1);
+        assert_eq!(o.visible_mask.count_ones(), 1);
+
+        // 除外ノード（id=3）が非ゼロ化したら delta で拾う（失効ではない）。
+        update_embedding(
+            &storage,
+            &c,
+            3,
+            &[1.0, 1.0, 0.0, 0.0],
+            "ovl-cosine-nonzero-3",
+        );
+        let o = overlay_now(&storage, &c, &base);
+        assert_eq!(o.stale_nodes, 2);
+        assert_eq!(o.delta_slots.len(), 3);
+        assert_eq!(o.visible_in_index, 1);
+    }
+
+    /// Issue #2241 の回帰: 内積グラフ（本番の既定）では規則のゲートが偽で、ゼロ行も従来どおり
+    /// delta に入り、ゼロ化した行は失効＋delta になる。
+    #[test]
+    fn overlay_keeps_inner_product_behaviour_for_zero_rows() {
+        let path = unique_db_path("hnsw-cache-overlay-ip-zero");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let c = ctx("tenant-a");
+        let (base, _) = seed_and_build_base(
+            &storage,
+            &c,
+            &[(1, [1.0, 0.0, 0.0, 0.0]), (2, [0.0, 1.0, 0.0, 0.0])],
+            false,
+        );
+        assert!(!base.index.excludes_non_normalizable());
+        update_embedding(&storage, &c, 1, &[0.0; 4], "ovl-ip-zero-1");
+        seed_row(&storage, "docs", 3, "tenant-a", &[0.0; 4]);
+        let o = overlay_now(&storage, &c, &base);
+        assert_eq!(o.stale_nodes, 1);
+        assert_eq!(o.delta_slots.len(), 2);
+        assert_eq!(o.visible_in_index, 1);
     }
 
     /// `arena` 内で `id` を持つ行のスロット番号を線形探索する（テスト専用。

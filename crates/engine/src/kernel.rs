@@ -38,7 +38,9 @@ pub use cosine::{
     cosine_distance, cosine_distance_from_parts, cosine_top_k, cosine_top_k_slots, row_norms_sq,
     CosineSearchInput, DistanceHit,
 };
-pub(crate) use cosine::{normalize_into, select_farthest_distance_k, AscDistanceTopK};
+pub(crate) use cosine::{
+    inverse_norm, normalize_into, select_farthest_distance_k, AscDistanceTopK,
+};
 
 /// **候補**検索結果 1 件（候補識別子とスコア）。[`SearchProvider`] の戻り値型。
 ///

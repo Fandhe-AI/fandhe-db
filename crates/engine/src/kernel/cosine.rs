@@ -341,6 +341,21 @@ pub(crate) fn select_farthest_distance_k(
     out
 }
 
+/// 行のノルムの逆数（正規化の係数）。可否の判定は [`normalize_into`] と
+/// `hnsw::is_cosine_indexable` で共有する単一の実装（両者の判定が食い違うと、索引から除く行の
+/// 集合と全走査で NaN になる行の集合がずれるため）。
+pub(crate) fn inverse_norm(row: &[f32]) -> Option<f64> {
+    let n2_f32 = dot(row, row);
+    if !(n2_f32.is_finite() && n2_f32 > 0.0) {
+        return None;
+    }
+    let n2: f64 = row.iter().map(|&v| f64::from(v) * f64::from(v)).sum();
+    if !(n2.is_finite() && n2 > 0.0) {
+        return None;
+    }
+    Some(1.0 / n2.sqrt())
+}
+
 /// `row` を単位長へ正規化して `out` へ書く（Cosine の C2′。行とクエリで同じ関数を使う）。
 ///
 /// 可否の判定は brute-force 側と同じく `kernel::dot(row, row)` が有限かつ正であること。
@@ -352,15 +367,7 @@ pub(crate) fn normalize_into(row: &[f32], out: &mut [f32]) -> Result<(), ()> {
     if row.len() != out.len() {
         return Err(());
     }
-    let n2_f32 = dot(row, row);
-    if !(n2_f32.is_finite() && n2_f32 > 0.0) {
-        return Err(());
-    }
-    let n2: f64 = row.iter().map(|&v| f64::from(v) * f64::from(v)).sum();
-    if !(n2.is_finite() && n2 > 0.0) {
-        return Err(());
-    }
-    let inv = 1.0 / n2.sqrt();
+    let inv = inverse_norm(row).ok_or(())?;
     for (o, &v) in out.iter_mut().zip(row.iter()) {
         *o = (f64::from(v) * inv) as f32;
     }
