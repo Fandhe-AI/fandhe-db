@@ -265,6 +265,10 @@ fn per_row_aux_bytes() -> Option<usize> {
         .checked_add(std::mem::size_of::<String>())
         .and_then(|v| v.checked_add(crate::storage::MAX_TENANT_ID_LEN as usize))
         .and_then(|v| v.checked_add(std::mem::size_of::<Visibility>()))
+        // `null_slots: Vec<u32>` は最悪ケース（全行 NULL）の 1 行 1 要素分を予算へ含める
+        // （Issue #2043。NULL スロット配列が予算外で独立成長しないよう、capacity を
+        // `ensure_capacity` で行 capacity と同数だけ事前確保する前提）。
+        .and_then(|v| v.checked_add(std::mem::size_of::<u32>()))
 }
 
 /// `Vec::try_reserve_exact` の失敗を [`ArenaError::AllocationFailed`] へ変換する共通
@@ -377,6 +381,10 @@ impl GrowableArenaBuffers {
         try_reserve_exact(&mut self.ids, additional_rows, "ids")?;
         try_reserve_exact(&mut self.tenant_ids, additional_rows, "tenant_ids")?;
         try_reserve_exact(&mut self.visibilities, additional_rows, "visibilities")?;
+        // NULL スロット配列も行 capacity 分だけ予算内で事前確保する（push_row 側で
+        // 予算外の再確保が起きない）。
+        let null_additional = new_row_capacity.saturating_sub(self.null_slots.len());
+        try_reserve_exact(&mut self.null_slots, null_additional, "null_slots")?;
         self.row_capacity = new_row_capacity;
         Ok(())
     }
@@ -399,9 +407,10 @@ impl GrowableArenaBuffers {
     ) -> Result<()> {
         if embedding.is_empty() {
             let slot = u32::try_from(self.ids.len()).map_err(|_| ArenaError::CapacityExceeded)?;
-            self.null_slots.try_reserve(1).map_err(|e| {
-                ArenaError::AllocationFailed(format!("failed to reserve null_slots: {e}"))
-            })?;
+            // capacity は `ensure_capacity` が予算内で確保済み（ここで再確保しない）。
+            if self.null_slots.len() >= self.null_slots.capacity() {
+                return Err(ArenaError::CapacityExceeded);
+            }
             self.vectors
                 .resize(self.vectors.len().saturating_add(dim), 0.0);
             self.null_slots.push(slot);
