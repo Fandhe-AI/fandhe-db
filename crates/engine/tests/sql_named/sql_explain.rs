@@ -1022,3 +1022,93 @@ fn explain_reports_declared_hnsw_opclass_as_metric() {
         );
     }
 }
+
+/// `hnsw_params:` 行の `ef_search=` の値だけを取り出す（SQL-73・Issue #2030 のテスト用）。
+fn explain_ef_search(core: &EngineCore, session: &mut SessionState, sql: &str) -> String {
+    let outcome = core
+        .execute_sql_in_session(&ctx("tenant-a"), session, sql)
+        .expect("EXPLAIN should succeed");
+    let lines = explain_result_lines(outcome);
+    let line = lines
+        .iter()
+        .find(|l| l.starts_with("hnsw_params:"))
+        .expect("hnsw_params row")
+        .clone();
+    line.split(',')
+        .find_map(|f| f.strip_prefix("ef_search=").map(str::to_string))
+        .expect("ef_search field")
+}
+
+const KNN_EXPLAIN: &str =
+    "EXPLAIN SELECT id FROM docs ORDER BY embedding <=> '[0.1,0.2,0.3,0.4]' LIMIT 10";
+
+#[test]
+fn explain_reflects_session_hnsw_ef_search_and_reset() {
+    // SQL-73・Issue #2030: SET した値が非ハイブリッド kNN の EXPLAIN に出て、RESET で構築時の値へ戻る。
+    let path = unique_db_path("sql-explain-session-ef-search");
+    let _guard = CleanupGuard(path.clone());
+    let core = seeded_hnsw_core(&path);
+    let mut session = SessionState::default();
+    let c = ctx("tenant-a");
+    assert_eq!(explain_ef_search(&core, &mut session, KNN_EXPLAIN), "64");
+    core.execute_sql_in_session(&c, &mut session, "SET hnsw.ef_search = 200")
+        .expect("set");
+    assert_eq!(explain_ef_search(&core, &mut session, KNN_EXPLAIN), "200");
+    // 取得モードとは独立（モードは値を変えない）。
+    let with_mode = format!("{KNN_EXPLAIN} USING MODE 'precision'");
+    assert_eq!(explain_ef_search(&core, &mut session, &with_mode), "200");
+    core.execute_sql_in_session(&c, &mut session, "SET search_mode = 'precision'")
+        .expect("set mode");
+    assert_eq!(explain_ef_search(&core, &mut session, KNN_EXPLAIN), "200");
+    core.execute_sql_in_session(&c, &mut session, "RESET hnsw.ef_search")
+        .expect("reset");
+    assert_eq!(explain_ef_search(&core, &mut session, KNN_EXPLAIN), "64");
+}
+
+#[test]
+fn explain_hybrid_ignores_session_hnsw_ef_search() {
+    // SQL-73・Issue #2030: ハイブリッド（USING PLAN）は構築時の値のまま。
+    let path = unique_db_path("sql-explain-session-ef-search-hybrid");
+    let _guard = CleanupGuard(path.clone());
+    let core = seeded_hnsw_core(&path).with_query_planner(Box::new(StubLlmClient {
+        response: EXPANSION_RESPONSE_NO_HINTS,
+    }));
+    let mut session = SessionState::default();
+    core.execute_sql_in_session(&ctx("tenant-a"), &mut session, "SET hnsw.ef_search = 200")
+        .expect("set");
+    assert_eq!(
+        explain_ef_search(
+            &core,
+            &mut session,
+            "EXPLAIN SELECT id FROM docs USING PLAN('find content') LIMIT 10"
+        ),
+        "64"
+    );
+}
+
+#[test]
+fn session_hnsw_ef_search_does_not_change_search_results() {
+    // SQL-73・Issue #2030: ef の大小で結果は矛盾しない（小さなコーパスで ef=1 / 1000 とも完走）。
+    let path = unique_db_path("sql-session-ef-search-results");
+    let _guard = CleanupGuard(path.clone());
+    let core = seeded_hnsw_core(&path);
+    let mut session = SessionState::default();
+    let sql = "SELECT id FROM docs ORDER BY embedding <=> '[0.1,0.2,0.3,0.4]' LIMIT 3";
+    let rows = |core: &EngineCore, session: &mut SessionState| match core
+        .execute_sql_in_session(&ctx("tenant-a"), session, sql)
+        .expect("select")
+    {
+        SqlOutcome::Query(r) => r.rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+        other => panic!("expected Query, got {other:?}"),
+    };
+    let base = rows(&core, &mut session);
+    for ef in ["1", "1000"] {
+        core.execute_sql_in_session(
+            &ctx("tenant-a"),
+            &mut session,
+            &format!("SET hnsw.ef_search = {ef}"),
+        )
+        .expect("set");
+        assert_eq!(rows(&core, &mut session), base, "ef={ef}");
+    }
+}

@@ -94,6 +94,9 @@ pub struct ExplainEngine {
     /// `hnsw_params:` 行末尾の `metric=` に出す HNSW 宣言の距離種別（Issue #1978・INDEX-7）。
     /// 既定は `Cosine`。`core.rs` の EXPLAIN 経路が索引カタログの宣言から設定する。
     pub(crate) ann_metric: VectorOpClass,
+    /// `hnsw_params:` 行の `ef_search=` へ出すセッションの `hnsw.ef_search` 上書き値（SQL-73・
+    /// Issue #2030）。`None` は構築時の値。非ハイブリッドの kNN の EXPLAIN にだけ `core.rs` が載せる。
+    pub(crate) ef_search_override: Option<usize>,
     /// 問い合わせ対象の `USING hnsw ... WITH (m, ef_construction)` 宣言（SQL-33 (5)、Issue #2029）。
     /// `Some` のとき `hnsw_params:` 行の `m=`／`ef_construction=` は実行時の構築と同じく宣言の値を
     /// 出す（`ef_search=` は provider のまま）。ゲートが `Targeted` のときだけ `core.rs` が設定する。
@@ -116,6 +119,7 @@ impl ExplainEngine {
             scalar_plan,
             scalar_fallback: None,
             ann_metric: VectorOpClass::Cosine,
+            ef_search_override: None,
             ann_build_options: None,
         }
     }
@@ -134,6 +138,13 @@ impl ExplainEngine {
     /// 外部から `ExplainEngine::new` で組み立てる経路を一致させるための公開口）。
     pub fn with_ann_metric(mut self, metric: VectorOpClass) -> Self {
         self.ann_metric = metric;
+        self
+    }
+
+    /// `hnsw_params:` 行の `ef_search=` に出すセッション上書き値を設定する（SQL-73・Issue #2030）。
+    /// 値はテナントに依存しない設定値で、露出の契約（`explain-search-engine-exposure.md`）に反しない。
+    pub(crate) fn with_effective_ef_search(mut self, ef: Option<usize>) -> Self {
+        self.ef_search_override = ef;
         self
     }
 
@@ -834,7 +845,7 @@ fn push_engine_tail_rows(
             "hnsw_params: m={},ef_construction={},ef_search={},resident={},sparse_visited_max={},metric={}",
             p.m,
             p.ef_construction,
-            p.ef_search,
+            engine.ef_search_override.unwrap_or(p.ef_search),
             params.resident_precision(),
             params.sparse_visited_max(),
             engine.ann_metric.metric_token()
@@ -1033,6 +1044,7 @@ mod tests {
             scalar_plan: ScalarPlan::PlainScan,
             scalar_fallback: None,
             ann_metric: VectorOpClass::Cosine,
+            ef_search_override: None,
             ann_build_options: None,
         }
     }
@@ -1147,6 +1159,7 @@ mod tests {
             scalar_plan: ScalarPlan::PlainScan,
             scalar_fallback: None,
             ann_metric: VectorOpClass::Cosine,
+            ef_search_override: None,
             ann_build_options: None,
         };
 
@@ -1175,6 +1188,7 @@ mod tests {
             scalar_plan: ScalarPlan::PlainScan,
             scalar_fallback: None,
             ann_metric: VectorOpClass::Cosine,
+            ef_search_override: None,
             ann_build_options: None,
         };
 
@@ -1218,6 +1232,7 @@ mod tests {
                 scalar_plan: ScalarPlan::PlainScan,
                 scalar_fallback: None,
                 ann_metric: VectorOpClass::Cosine,
+                ef_search_override: None,
                 ann_build_options: None,
             };
             let result = build_explain_result(&planned, &engine);
@@ -1295,6 +1310,7 @@ mod tests {
                 scalar_plan: ScalarPlan::PlainScan,
                 scalar_fallback: None,
                 ann_metric: VectorOpClass::Cosine,
+                ef_search_override: None,
                 ann_build_options: None,
             };
             let result = build_explain_result(&planned, &engine);
@@ -1396,6 +1412,7 @@ mod tests {
             scalar_plan: ScalarPlan::IndexConjunction,
             scalar_fallback: None,
             ann_metric: VectorOpClass::Cosine,
+            ef_search_override: None,
             ann_build_options: None,
         };
         let names = ExplainIndexNames::new(

@@ -562,6 +562,10 @@ fail-closed で起動エラーです。環境変数は設けません（詳細: 
 2 回目以降の重複指定は fail-closed で起動エラーです。`SET LOCAL`・小数・`us` 単位は未対応で、NoSQL（HTTP）表層には適用されません
 （詳細: [docs/design/statement-interrupt.md](docs/design/statement-interrupt.md)）。
 
+HNSW（opt-in）の探索幅は、各セッションが `SET hnsw.ef_search = 200`（範囲 `1`〜`1000`、未設定時はエンジン構築時の値で既定 64）で変更でき（Issue #2030・SQL-73）、
+`RESET hnsw.ef_search` で戻り、`SHOW hnsw.ef_search` で確認できます。値は HNSW 探索にだけ効き、厳密走査・ハイブリッド検索の結果と `USING MODE` は変わりません。
+範囲外・不正値は `22023`、`SET LOCAL` は `0A000` です。NoSQL（HTTP）表層には SET の手段がなく既定値で動きます。
+
 `--read-timeout-secs <N>`（既定 30・範囲 `1`〜`600` 秒）・`--max-connections <N>`（既定 64・範囲 `1`〜`256`）・
 `--max-prepared-statements <N>`（既定 64・範囲 `1`〜`1,024`。名前付きのみ数え、無名は数えない）（Issue #2454・WIRE-25）は、
 読み取りタイムアウト・同時接続数上限・接続あたりの prepared statement 保持件数上限を、プロセス全体に対して起動時に設定します

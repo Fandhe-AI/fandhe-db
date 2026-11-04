@@ -22,6 +22,8 @@
 
 ### Added
 
+- セッション変数 `hnsw.ef_search` の `SET`／`SHOW`／`RESET` を追加した（Issue #2030・SQL-73 ポインタ）。範囲は 1〜1000（範囲外は `22023`、`SET LOCAL` は `0A000`）、未設定時は構築時の値（既定 64）。非ハイブリッドの HNSW 探索と EXPLAIN の `hnsw_params:` 行にだけ効き、厳密走査・ハイブリッドの結果と `USING MODE` は変えない。
+  BREAKING CHANGE: 公開 enum `Statement` に `SetHnswEfSearch`・`ShowHnswEfSearch`、`SqlOutcome` に `SetHnswEfSearch` を追加し、公開 enum `HnswEfSearchSetting` を新設した（網羅的 `match` の下流は追随が必要）。
 - `CREATE INDEX ... USING hnsw (col) WITH (m = n, ef_construction = n)` を追加した（Issue #2029・SQL-33 (5) ポインタ）。`m` は 2〜100、`ef_construction` は 4〜1000 かつ `2 * m` 以上（省略したキーは pgvector の既定 16／64 で補う）。範囲外・未知/重複キー・整数でない値は `22023`、btree／gin への `WITH` と引用符付きの値は `0A000`、構文の不整合は `42601`。値はカタログ版 `v10` に永続化し、宣言した値で HNSW グラフを構築する（`ef_search` は従来どおり provider の値）。`EXPLAIN` の `hnsw_params:` も宣言の値を出す。`WITH` 省略の宣言は従来の `v1`／`v9` のままで挙動もバイト列も変わらない。挙動の変化: HNSW 宣言の `WITH (...)` は従来 `42601` だったが受理に変わる。旧バイナリは `v10` を未知の版として拒否する（前方互換なし）。
   BREAKING CHANGE: 公開構造体 `IndexDef` にフィールド `hnsw_options: Option<HnswIndexOptions>` を追加した（構造体リテラルで構築する下流は追随が必要。`IndexDef::new` と `with_hnsw_options` を使う）。
 - ベクトル関数 `binary_quantize(vector)` を追加した（Issue #2023・TABLE-48 (3) ポインタ）。正の成分を 1、それ以外を 0 とする `bit(d)` を返す（pgvector と同じ規則。NULL は NULL）。引数は表の VECTOR 列に限り、加工したベクトル式は `0A000`、VECTOR 以外は `42804`。結果は投影の最上位と BIT 列への `UPDATE ... SET`（長さ不一致は `22026`）・`INSERT ... SELECT`・`CREATE TABLE AS` で使え、比較・並べ替え・グループ化・関数引数・`CAST` などは `0A000`。名前は予約され、同名の `CREATE FUNCTION` は `42723`。

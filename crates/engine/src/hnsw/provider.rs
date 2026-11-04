@@ -65,6 +65,10 @@ use crate::parallel_search::ParallelSearchProvider;
 pub struct HnswSearchProvider {
     params: ValidatedHnswParams,
     fallback: ParallelSearchProvider,
+    /// セッションの `hnsw.ef_search` 上書き値（SQL-73・Issue #2030）。`None` は構築時の
+    /// `params.ef_search` を使う。値は SQL 構文段で 1..=1000 を検証済みで、
+    /// [`Self::effective_ef`] の `.min(MAX_EF)` が最後の上限になる。
+    session_ef_search: Option<usize>,
 }
 
 impl HnswSearchProvider {
@@ -74,7 +78,15 @@ impl HnswSearchProvider {
         HnswSearchProvider {
             params,
             fallback: ParallelSearchProvider,
+            session_ef_search: None,
         }
+    }
+
+    /// セッションの `hnsw.ef_search` 上書きを載せた複製を返す（`None` は上書きなし）。
+    /// `core.rs` の検索実行が、非ハイブリッドの kNN にだけ接続のセッション値を渡すために呼ぶ。
+    pub(crate) fn with_session_ef_search(mut self, ef: Option<usize>) -> Self {
+        self.session_ef_search = ef;
+        self
     }
 
     /// 保持している構築パラメータを返す（テスト・診断用）。
@@ -138,8 +150,9 @@ impl HnswSearchProvider {
     /// `HnswIndex::search` 自身も内部で同じ `ef.max(k)` を計算するため
     /// （`hnsw.rs::HnswIndex::search` の実装）、本メソッドの戻り値をそのまま
     /// `ef` として渡しても渡さなくても実効 `ef` は同じ値に揃う。本メソッドの
-    /// 主な役割は構築時パラメータ `ef_search`（untrusted 入力ではない
-    /// `HnswParams::validate` 済みの構成値）を [`MAX_EF`] 内へ収めることにある。
+    /// 主な役割は `ef_search`（構築時パラメータ、またはセッションの `hnsw.ef_search`
+    /// 上書き。後者は利用者が指定するが SQL 構文段で 1..=1000 を検証済み）を
+    /// [`MAX_EF`] 内へ収めることにある。`.min(MAX_EF)` が最後の上限。
     ///
     /// untrusted な `k`（wire 経由で到達しうる `SearchInput::k`）に対する実際の
     /// 上限保証は本メソッドではなく、`HnswIndex::search` 自身の検証が担う
@@ -147,7 +160,10 @@ impl HnswSearchProvider {
     /// `Err(HnswError::InvalidParams)` として拒否する。#408 がこのメソッドを
     /// 呼ぶ契約。モジュールドキュメント「seam」節 2. 参照）。
     pub fn effective_ef(&self, k: usize) -> usize {
-        self.params.ef_search.max(k).min(MAX_EF)
+        self.session_ef_search
+            .unwrap_or(self.params.ef_search)
+            .max(k)
+            .min(MAX_EF)
     }
 }
 
@@ -407,6 +423,32 @@ mod tests {
         );
         // untrusted な k が MAX_EF を超えても MAX_EF でクランプする。
         assert_eq!(large_ef.effective_ef(MAX_EF + 10_000), MAX_EF);
+    }
+
+    #[test]
+    fn session_ef_search_overrides_built_value() {
+        let base = HnswSearchProvider::new(
+            ValidatedHnswParams::new(HnswParams {
+                m: 16,
+                ef_construction: 100,
+                ef_search: 10,
+            })
+            .unwrap(),
+        );
+        // 上書きなしは従来値。
+        assert_eq!(base.with_session_ef_search(None).effective_ef(1), 10);
+        // 上書きありはその値（k との max）。
+        let over = base.with_session_ef_search(Some(200));
+        assert_eq!(over.effective_ef(1), 200);
+        assert_eq!(over.effective_ef(500), 500);
+        // MAX_EF での上限。
+        assert_eq!(
+            base.with_session_ef_search(Some(MAX_EF + 5))
+                .effective_ef(1),
+            MAX_EF
+        );
+        // 構築時パラメータ自体は変わらない。
+        assert_eq!(over.params().ef_search, 10);
     }
 
     #[test]

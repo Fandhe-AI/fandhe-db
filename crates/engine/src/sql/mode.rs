@@ -265,6 +265,11 @@ pub struct SessionState {
     statement_timeout_ms: u32,
     /// `RESET statement_timeout`／`SET ... TO DEFAULT` の戻り先（起動時 CLI の既定値）。
     statement_timeout_reset_ms: u32,
+    /// セッションの `hnsw.ef_search` 上書き値（1..=1000。SQL-73・Issue #2030）。`None` は上書きなしで、
+    /// エンジン構築時の `ef_search` を使う。HNSW 探索の候補幅だけに作用し、取得モード
+    /// （`USING MODE`／`SET search_mode`）とは独立。`SessionState` に置くため `BEGIN`／`SAVEPOINT` 時の
+    /// 複製と `ROLLBACK`／`ROLLBACK TO` で巻き戻る。
+    hnsw_ef_search: Option<u16>,
     /// 現在のロール ID（#1971 以降で認証層が認証成功後に 1 回だけ束縛する契約。以後 SQL 文から変えられる
     /// のは認可済みの `SET ROLE`／`RESET ROLE`〔`sql::role_ddl`〕だけで、`session_role_id` に戻る側へも
     /// 到達できる範囲にしか動かない）。`None`（現状の全セッション）は「BYPASSRLS なし・非所有者」として
@@ -424,6 +429,21 @@ impl SessionState {
     /// `RESET statement_timeout`／`SET statement_timeout TO DEFAULT` の実体。現在値を reset 値へ戻す。
     pub(crate) fn reset_statement_timeout(&mut self) {
         self.statement_timeout_ms = self.statement_timeout_reset_ms;
+    }
+
+    /// セッションの `hnsw.ef_search` 上書き値（`None` は上書きなし。`core.rs` が HNSW 探索へ渡す）。
+    pub fn hnsw_ef_search(&self) -> Option<usize> {
+        self.hnsw_ef_search.map(usize::from)
+    }
+
+    /// 検証済みの `hnsw.ef_search` を現在値にする（`core.rs` の `SetHnswEfSearch` 実行腕のみ）。
+    pub(crate) fn set_hnsw_ef_search(&mut self, v: u16) {
+        self.hnsw_ef_search = Some(v);
+    }
+
+    /// `RESET hnsw.ef_search`／`SET hnsw.ef_search TO DEFAULT` の実体。上書きを外す。
+    pub(crate) fn reset_hnsw_ef_search(&mut self) {
+        self.hnsw_ef_search = None;
     }
 
     /// 起動時 CLI の既定値を現在値と reset 値の両方へ設定する。wire-server の handshake が認証成功後に

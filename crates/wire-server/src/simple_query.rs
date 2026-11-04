@@ -853,6 +853,10 @@ pub(crate) fn map_outcome(outcome: SqlOutcome) -> OutcomeResponse {
         SqlOutcome::SetStatementTimeout { reset } => OutcomeResponse::Command {
             tag: if reset { "RESET" } else { "SET" }.to_string(),
         },
+        // SQL-73・Issue #2030: `SET hnsw.ef_search`／`RESET hnsw.ef_search` も `SET`／`RESET` タグ。
+        SqlOutcome::SetHnswEfSearch { reset } => OutcomeResponse::Command {
+            tag: if reset { "RESET" } else { "SET" }.to_string(),
+        },
         SqlOutcome::Show(result) => OutcomeResponse::Rows {
             result,
             shape: TagShape::Fixed("SHOW".to_string()),

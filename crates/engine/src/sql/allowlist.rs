@@ -3436,6 +3436,17 @@ pub enum Statement {
     },
     /// `SHOW statement_timeout`（SQL-71・Issue #1954）。列名 `statement_timeout` の text 1 行。
     ShowStatementTimeout,
+    /// `SET [SESSION] hnsw.ef_search {TO|=} <n|'<n>'|DEFAULT>`／`RESET hnsw.ef_search`
+    /// （SQL-73・Issue #2030）。値は構文段で 1..=1000 を検証済み（不正値は `22023`）。
+    /// `reset` は `RESET` 由来か。
+    /// **#2030 で追加した破壊的変更（BREAKING CHANGE）**: variant 追加。
+    SetHnswEfSearch {
+        value: HnswEfSearchSetting,
+        reset: bool,
+    },
+    /// `SHOW hnsw.ef_search`（SQL-73・Issue #2030）。列名 `hnsw.ef_search` の text 1 行。
+    /// **#2030 で追加した破壊的変更（BREAKING CHANGE）**: variant 追加。
+    ShowHnswEfSearch,
     /// `CREATE FUNCTION <name>(<param>[, <param>...]) AS <expr>`（TASK-79・SQL-9）。
     /// カタログ照会を必要としない（セッションのみに影響するため FROM テーブルの
     /// 存在確認は行わない）。パラメータ名重複・登録済み名との衝突・列参照の禁止
@@ -19371,6 +19382,8 @@ pub(crate) fn require_row_query_statement(
         | Statement::ShowRowSecurity
         | Statement::SetStatementTimeout { .. }
         | Statement::ShowStatementTimeout
+        | Statement::SetHnswEfSearch { .. }
+        | Statement::ShowHnswEfSearch
         | Statement::CreateFunction { .. } => Err(SqlSurfaceError::unsupported(format!(
             "{what} requires a SELECT query"
         ))),
@@ -24371,6 +24384,95 @@ fn is_reset_statement_timeout(tokens: &[Token]) -> bool {
         && p.expect_end_of_statement().is_ok()
 }
 
+/// `SET hnsw.ef_search` の値（SQL-73・Issue #2030）。`Default` は「セッション上書きなし」
+/// （エンジン構築時の `ef_search` に戻る）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HnswEfSearchSetting {
+    Value(u16),
+    Default,
+}
+
+/// `SET hnsw.ef_search` の受理下限（pgvector と同じ範囲。SQL-73）。
+const HNSW_EF_SEARCH_MIN: u16 = 1;
+/// `SET hnsw.ef_search` の受理上限（pgvector と同じ範囲。SQL-73）。
+const HNSW_EF_SEARCH_MAX: u16 = 1000;
+
+/// 位置 `i` が修飾識別子 `hnsw.ef_search`（字句解析で 1 トークンの `QualifiedIdent` になる）か。
+fn is_hnsw_ef_search_at(tokens: &[Token], i: usize) -> bool {
+    matches!(tokens.get(i), Some(Token::QualifiedIdent { qualifier, name })
+        if qualifier.eq_ignore_ascii_case("hnsw") && name.eq_ignore_ascii_case("ef_search"))
+}
+
+/// 文が `SHOW hnsw.ef_search`（末尾 `;` 可）か。厳密一致のみ真。
+pub(crate) fn is_show_hnsw_ef_search(tokens: &[Token]) -> bool {
+    let mut p = Parser::new(tokens);
+    p.expect_ident_matching("SHOW").is_ok() && is_hnsw_ef_search_at(tokens, 1) && {
+        p.advance();
+        p.expect_end_of_statement().is_ok()
+    }
+}
+
+/// 文が `SET [SESSION|LOCAL] hnsw.ef_search ...` の頭か。`SET LOCAL` も真にして
+/// [`parse_set_hnsw_ef_search`] が `0A000` で拒否する。TimeZone 系の頭判定より前に評価する。
+fn is_set_hnsw_ef_search_head(tokens: &[Token]) -> bool {
+    let modifier_at_1 = matches!(tokens.get(1), Some(Token::Ident(w))
+        if w.eq_ignore_ascii_case("SESSION") || w.eq_ignore_ascii_case("LOCAL"));
+    is_hnsw_ef_search_at(tokens, 1) || (modifier_at_1 && is_hnsw_ef_search_at(tokens, 2))
+}
+
+/// `SET [SESSION] hnsw.ef_search {TO|=} {<整数>|'<整数>'|DEFAULT}`（SQL-73・Issue #2030）。
+/// `SET LOCAL` は `0A000`、範囲外・不正値は `22023`（入力値を応答に含めない）、値の欠落は `42601`。
+fn parse_set_hnsw_ef_search(tokens: &[Token]) -> Result<HnswEfSearchSetting, SqlSurfaceError> {
+    let invalid = || SqlSurfaceError::InvalidParameterValue {
+        detail: "invalid value for parameter \"hnsw.ef_search\"",
+    };
+    let mut p = Parser::new(tokens);
+    p.expect_ident_matching("SET")?;
+    if p.peek_ident_matches("LOCAL") {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "SET LOCAL is not supported".to_string(),
+        });
+    }
+    if p.peek_ident_matches("SESSION") {
+        p.advance();
+    }
+    // 呼び出し元の頭判定で `hnsw.ef_search` の存在は確認済み。ここでは 1 トークン読み進めるだけ。
+    p.advance();
+    if p.peek_ident_matches("TO") {
+        p.advance();
+    } else {
+        p.expect_punct('=')?;
+    }
+    let to_value = |text: &str| -> Result<HnswEfSearchSetting, SqlSurfaceError> {
+        let n: u16 = text.trim().parse().map_err(|_| invalid())?;
+        if !(HNSW_EF_SEARCH_MIN..=HNSW_EF_SEARCH_MAX).contains(&n) {
+            return Err(invalid());
+        }
+        Ok(HnswEfSearchSetting::Value(n))
+    };
+    let value = match p.advance() {
+        Some(Token::Ident(w)) if w.eq_ignore_ascii_case("DEFAULT") => HnswEfSearchSetting::Default,
+        Some(Token::StringLiteral(w)) | Some(Token::Number(w)) => to_value(w)?,
+        Some(_) => return Err(invalid()),
+        None => {
+            return Err(SqlSurfaceError::unsupported(
+                "expected hnsw.ef_search value".to_string(),
+            ))
+        }
+    };
+    p.expect_end_of_statement()?;
+    Ok(value)
+}
+
+/// 文が `RESET hnsw.ef_search`（末尾 `;` 可）か。
+fn is_reset_hnsw_ef_search(tokens: &[Token]) -> bool {
+    let mut p = Parser::new(tokens);
+    p.expect_ident_matching("RESET").is_ok() && is_hnsw_ef_search_at(tokens, 1) && {
+        p.advance();
+        p.expect_end_of_statement().is_ok()
+    }
+}
+
 /// 文が `SHOW row_security`（末尾 `;` 可）か。厳密一致のみ真。
 pub(crate) fn is_show_row_security(tokens: &[Token]) -> bool {
     let mut p = Parser::new(tokens);
@@ -27864,6 +27966,18 @@ fn validate_sql_tokens_impl(
             value: StatementTimeoutSetting::Default,
             reset: true,
         }),
+        // SQL-73・Issue #2030: `hnsw.ef_search` も TimeZone 系より先に判定する（同じ理由）。
+        _ if is_set_statement && is_set_hnsw_ef_search_head(tokens) => {
+            let value = parse_set_hnsw_ef_search(tokens)?;
+            Ok(Statement::SetHnswEfSearch {
+                value,
+                reset: false,
+            })
+        }
+        _ if is_reset_hnsw_ef_search(tokens) => Ok(Statement::SetHnswEfSearch {
+            value: HnswEfSearchSetting::Default,
+            reset: true,
+        }),
         _ if is_set_statement && is_set_search_path_head(tokens) => {
             let value = parse_set_search_path(tokens)?;
             Ok(Statement::SetSearchPath {
@@ -27962,6 +28076,8 @@ fn validate_sql_tokens_impl(
                 | Statement::ShowRowSecurity
                 | Statement::SetStatementTimeout { .. }
                 | Statement::ShowStatementTimeout
+                | Statement::SetHnswEfSearch { .. }
+                | Statement::ShowHnswEfSearch
                 | Statement::CreateFunction { .. }
                 | Statement::Explain(_)
                 // Issue #929（SQL-29 (c)）: `validate_select_statement` は集合演算
@@ -28285,13 +28401,15 @@ pub fn validate_statement(
         | Statement::SetTimeZone { .. }
         | Statement::SetSearchPath { .. }
         | Statement::SetRowSecurity { .. }
-        | Statement::SetStatementTimeout { .. } => Err(SqlSurfaceError::unsupported(
+        | Statement::SetStatementTimeout { .. }
+        | Statement::SetHnswEfSearch { .. } => Err(SqlSurfaceError::unsupported(
             "SET is not a query statement (use a session-aware entry point)",
         )),
         Statement::ShowTimeZone
         | Statement::ShowSearchPath
         | Statement::ShowRowSecurity
-        | Statement::ShowStatementTimeout => Err(SqlSurfaceError::unsupported(
+        | Statement::ShowStatementTimeout
+        | Statement::ShowHnswEfSearch => Err(SqlSurfaceError::unsupported(
             "SHOW is not a query statement (use a session-aware entry point)",
         )),
         Statement::CreateFunction { .. } => Err(SqlSurfaceError::unsupported(

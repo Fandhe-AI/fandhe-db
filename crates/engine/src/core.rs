@@ -2107,6 +2107,15 @@ fn show_statement_timeout_columns() -> Vec<crate::sql::exec::ColumnMeta> {
     }]
 }
 
+/// `SHOW hnsw.ef_search` の結果列（列名 `hnsw.ef_search`・text の 1 列。実行と Describe が共有する。
+/// SQL-73・Issue #2030）。
+fn show_hnsw_ef_search_columns() -> Vec<crate::sql::exec::ColumnMeta> {
+    vec![crate::sql::exec::ColumnMeta::Computed {
+        name: "hnsw.ef_search".to_string(),
+        ty: Some(crate::catalog::ColumnType::Text),
+    }]
+}
+
 /// `SHOW search_path` の結果列（列名 `search_path`・text の 1 列。実行と Describe が共有する。
 /// TABLE-27・Issue #1715）。
 fn show_search_path_columns() -> Vec<crate::sql::exec::ColumnMeta> {
@@ -2612,6 +2621,8 @@ fn read_only_permits(parsed: &ParsedSql) -> bool {
                 | Statement::ShowRowSecurity
                 | Statement::SetStatementTimeout { .. }
                 | Statement::ShowStatementTimeout
+                | Statement::SetHnswEfSearch { .. }
+                | Statement::ShowHnswEfSearch
         ),
         // SQL-39・Issue #1963: `SET ROLE`／`RESET ROLE` はセッション変数だけを変える（READ ONLY Tx でも可）。
         ParsedSql::Cursor(_) | ParsedSql::Do(_) | ParsedSql::SetRole(_) => true,
@@ -4566,6 +4577,13 @@ impl EngineCore {
                     "SET/SHOW statement_timeout requires a session-aware entry point",
                 ))
             }
+            // SQL-73・Issue #2030: `hnsw.ef_search` もセッション変数（同じ決定的な契約）。
+            crate::sql::allowlist::Statement::SetHnswEfSearch { .. }
+            | crate::sql::allowlist::Statement::ShowHnswEfSearch => {
+                Err(crate::sql::allowlist::SqlSurfaceError::unsupported(
+                    "SET/SHOW hnsw.ef_search requires a session-aware entry point",
+                ))
+            }
             // TASK-79（SQL-9）: UDF 定義はセッションへ登録する statement のため、
             // セッションを持たないこのエントリポイントでは受理しない（`SET` と同じ
             // 「値の妥当性に関わらず一律 `42601`」の決定的な契約を踏襲する）。
@@ -4590,6 +4608,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::SetSearchPath { .. }
                     | crate::sql::SqlOutcome::SetRowSecurity { .. }
                     | crate::sql::SqlOutcome::SetStatementTimeout { .. }
+                    | crate::sql::SqlOutcome::SetHnswEfSearch { .. }
                     | crate::sql::SqlOutcome::Show(_)
                     | crate::sql::SqlOutcome::CreateFunction { .. }
                     | crate::sql::SqlOutcome::Explain(_)
@@ -4666,6 +4685,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::SetSearchPath { .. }
                     | crate::sql::SqlOutcome::SetRowSecurity { .. }
                     | crate::sql::SqlOutcome::SetStatementTimeout { .. }
+                    | crate::sql::SqlOutcome::SetHnswEfSearch { .. }
                     | crate::sql::SqlOutcome::Show(_)
                     | crate::sql::SqlOutcome::CreateFunction { .. }
                     | crate::sql::SqlOutcome::Explain(_)
@@ -4739,6 +4759,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::SetSearchPath { .. }
                     | crate::sql::SqlOutcome::SetRowSecurity { .. }
                     | crate::sql::SqlOutcome::SetStatementTimeout { .. }
+                    | crate::sql::SqlOutcome::SetHnswEfSearch { .. }
                     | crate::sql::SqlOutcome::Show(_)
                     | crate::sql::SqlOutcome::CreateFunction { .. }
                     | crate::sql::SqlOutcome::Explain(_)
@@ -4819,6 +4840,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::SetSearchPath { .. }
                     | crate::sql::SqlOutcome::SetRowSecurity { .. }
                     | crate::sql::SqlOutcome::SetStatementTimeout { .. }
+                    | crate::sql::SqlOutcome::SetHnswEfSearch { .. }
                     | crate::sql::SqlOutcome::Show(_)
                     | crate::sql::SqlOutcome::CreateFunction { .. }
                     | crate::sql::SqlOutcome::Explain(_)
@@ -4918,6 +4940,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::SetSearchPath { .. }
                     | crate::sql::SqlOutcome::SetRowSecurity { .. }
                     | crate::sql::SqlOutcome::SetStatementTimeout { .. }
+                    | crate::sql::SqlOutcome::SetHnswEfSearch { .. }
                     | crate::sql::SqlOutcome::Show(_)
                     | crate::sql::SqlOutcome::CreateFunction { .. }
                     | crate::sql::SqlOutcome::Explain(_)
@@ -6125,6 +6148,13 @@ impl EngineCore {
         if crate::sql::allowlist::is_show_statement_timeout(&tokens) {
             return Ok(ParsedSql::Statement(
                 crate::sql::allowlist::Statement::ShowStatementTimeout,
+            ));
+        }
+
+        // SQL-73・Issue #2030: `SHOW hnsw.ef_search` も厳密一致のみ先に取り出す。
+        if crate::sql::allowlist::is_show_hnsw_ef_search(&tokens) {
+            return Ok(ParsedSql::Statement(
+                crate::sql::allowlist::Statement::ShowHnswEfSearch,
             ));
         }
 
@@ -9310,7 +9340,9 @@ impl EngineCore {
                 | Statement::SetRowSecurity { .. }
                 | Statement::ShowRowSecurity
                 | Statement::SetStatementTimeout { .. }
-                | Statement::ShowStatementTimeout),
+                | Statement::ShowStatementTimeout
+                | Statement::SetHnswEfSearch { .. }
+                | Statement::ShowHnswEfSearch),
             ) => self.execute_validated_in_session(ctx, session, stmt.clone()),
             // SQL-66（Issue #1920・#1922）: `CREATE [OR REPLACE] FUNCTION` は DDL 権限が無ければ `42501` で
             // 拒否する（fail-closed）。権限のあるセッションでも、明示トランザクションの中では UDF カタログへ
@@ -9867,6 +9899,8 @@ impl EngineCore {
             | Statement::ShowRowSecurity
             | Statement::SetStatementTimeout { .. }
             | Statement::ShowStatementTimeout
+            | Statement::SetHnswEfSearch { .. }
+            | Statement::ShowHnswEfSearch
             | Statement::CreateFunction { .. }
             | Statement::MaterializedView(_)
             | Statement::RecursiveCte(_)
@@ -10775,6 +10809,11 @@ impl EngineCore {
             ParsedSql::Statement(Statement::ShowStatementTimeout) => {
                 Ok(Some(show_statement_timeout_columns()))
             }
+            // SQL-73・Issue #2030: `SET`／`RESET hnsw.ef_search` は結果列なし、`SHOW` は 1 列固定。
+            ParsedSql::Statement(Statement::SetHnswEfSearch { .. }) => Ok(None),
+            ParsedSql::Statement(Statement::ShowHnswEfSearch) => {
+                Ok(Some(show_hnsw_ef_search_columns()))
+            }
             ParsedSql::Statement(Statement::CreateFunction { .. }) => Ok(None),
             // `EXPLAIN` は常に単一の `Computed` 列（`QUERY PLAN`）を返す
             // （`sql::explain::build_explain_result` と同一の列。中身の生成には
@@ -11278,6 +11317,38 @@ impl EngineCore {
                 }
                 Ok(crate::sql::SqlOutcome::SetStatementTimeout { reset })
             }
+            // SQL-73・Issue #2030: 構文段で 1..=1000 を検証済みの値をセッションへ代入する
+            // （失敗した SET は値を変えない）。`DEFAULT`・`RESET` は上書きなし（構築時の値）へ戻す。
+            crate::sql::allowlist::Statement::SetHnswEfSearch { value, reset } => {
+                match value {
+                    crate::sql::allowlist::HnswEfSearchSetting::Value(n) => {
+                        session.set_hnsw_ef_search(n)
+                    }
+                    crate::sql::allowlist::HnswEfSearchSetting::Default => {
+                        session.reset_hnsw_ef_search()
+                    }
+                }
+                Ok(crate::sql::SqlOutcome::SetHnswEfSearch { reset })
+            }
+            // 実効値は セッション上書き > エンジン構築時の `ef_search` > 既定値 の順。
+            crate::sql::allowlist::Statement::ShowHnswEfSearch => {
+                let effective = session.hnsw_ef_search().unwrap_or_else(|| {
+                    self.hnsw_state
+                        .as_ref()
+                        .map(|s| s.provider.params().ef_search)
+                        .unwrap_or_else(|| crate::hnsw::HnswParams::default().ef_search)
+                });
+                Ok(crate::sql::SqlOutcome::Show(
+                    crate::sql::exec::QueryResult {
+                        columns: show_hnsw_ef_search_columns(),
+                        rows: vec![crate::sql::exec::ResultRow {
+                            id: 0,
+                            score: 0.0,
+                            cells: vec![crate::sql::exec::Cell::Text(effective.to_string())],
+                        }],
+                    },
+                ))
+            }
             crate::sql::allowlist::Statement::ShowStatementTimeout => Ok(
                 crate::sql::SqlOutcome::Show(crate::sql::exec::QueryResult {
                     columns: show_statement_timeout_columns(),
@@ -11732,7 +11803,8 @@ impl EngineCore {
                     session.udfs(),
                     &limits,
                 )?;
-                let result = self.run_select_plan(read_txn, ctx, &schema, &bound)?;
+                let result =
+                    self.run_select_plan(read_txn, ctx, &schema, &bound, session.hnsw_ef_search())?;
                 Ok(crate::sql::SqlOutcome::Query(result))
             }
             crate::sql::allowlist::Statement::Aggregate(mut validated) => {
@@ -12371,7 +12443,16 @@ impl EngineCore {
         ctx: &PolicyContext,
         schema: &crate::catalog::TableSchema,
         bound: &crate::sql::parser::BoundStatement,
+        ef_search_override: Option<usize>,
     ) -> Result<crate::sql::exec::QueryResult, crate::sql::allowlist::SqlSurfaceError> {
+        // SQL-73・Issue #2030: セッションの `hnsw.ef_search` は非ハイブリッドの kNN にだけ効かせる
+        // （ハイブリッド検索の結果は変えない）。
+        let ef_search_override =
+            if matches!(bound.ranking(), crate::sql::parser::Ranking::Hybrid { .. }) {
+                None
+            } else {
+                ef_search_override
+            };
         crate::sql::exec::execute_statement_with_cache(
             read_txn,
             self.provider.as_ref(),
@@ -12396,7 +12477,7 @@ impl EngineCore {
                 .map(|s| crate::sql::hnsw_cache::HnswCacheAccess {
                     storage: &self.storage,
                     cache: &s.cache,
-                    provider: s.provider,
+                    provider: s.provider.with_session_ef_search(ef_search_override),
                     index_gate_cache: &self.index_catalog_gate_cache,
                     hnsw_scope: self.hnsw_scope,
                     // ゲート評価後に `sql::exec` が写像結果を載せ直す（Issue #2000）。
@@ -12550,8 +12631,10 @@ impl EngineCore {
             // 明示トランザクション内（Issue #1353）: 検索本体の行の読みだけを共有 write
             // トランザクションへ切り替える。`snapshot()` が `None` のためキャッシュ
             // （sparse・arena・hnsw・scalar）は構造的に使われない。
-            Some(write_txn) => self.run_select_plan(write_txn, ctx, &schema, &bound),
-            None => self.run_select_plan(&read_txn, ctx, &schema, &bound),
+            Some(write_txn) => {
+                self.run_select_plan(write_txn, ctx, &schema, &bound, session.hnsw_ef_search())
+            }
+            None => self.run_select_plan(&read_txn, ctx, &schema, &bound, session.hnsw_ef_search()),
         }
     }
 
@@ -12603,7 +12686,7 @@ impl EngineCore {
             ));
         }
         self.check_bound_search(&bound)?;
-        self.run_select_plan(&read_txn, ctx, &schema, &bound)
+        self.run_select_plan(&read_txn, ctx, &schema, &bound, session.hnsw_ef_search())
     }
 
     /// 束縛済み `plan` 検索（NoSQL 表層 `search` op の `plan` 指定。TASK-175・
@@ -13475,7 +13558,13 @@ impl EngineCore {
             &self.result_limits,
         )?;
         Ok(crate::sql::SqlOutcome::Explain(
-            self.search_explain_from_bound(ctx, &read_txn, &schema, &bound)?,
+            self.search_explain_from_bound(
+                ctx,
+                &read_txn,
+                &schema,
+                &bound,
+                session.hnsw_ef_search(),
+            )?,
         ))
     }
 
@@ -13510,6 +13599,7 @@ impl EngineCore {
         read_txn: &redb::ReadTransaction,
         schema: &crate::catalog::TableSchema,
         bound: &crate::sql::parser::BoundStatement,
+        ef_search_override: Option<usize>,
     ) -> Result<crate::sql::exec::QueryResult, crate::sql::allowlist::SqlSurfaceError> {
         // RLS-13（Issue #2279）: 実行側と同じ ANN 形状補正のため、同じ `read_txn` からポリシーの適用可否を求める。
         let row_policy_present =
@@ -13637,6 +13727,9 @@ impl EngineCore {
             crate::sql::hnsw_cache::query_metric_of_bound(bound),
             bound.result_cap().is_some(),
         );
+        // SQL-73・Issue #2030: ハイブリッドは実行側もセッション値を使わないため、構築時の値のまま出す。
+        let engine =
+            engine.with_effective_ef_search(if is_hybrid { None } else { ef_search_override });
         Ok(crate::sql::explain::build_search_explain_result(
             bound.mode(),
             &engine,
@@ -14063,7 +14156,7 @@ impl EngineCore {
             ));
         }
         self.check_bound_search(&bound)?;
-        self.search_explain_from_bound(ctx, &read_txn, &schema, &bound)
+        self.search_explain_from_bound(ctx, &read_txn, &schema, &bound, session.hnsw_ef_search())
     }
 
     /// 束縛済み広域取得計画（[`crate::sql::parser::BoundScan`]）の

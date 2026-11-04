@@ -417,6 +417,13 @@ pub enum SqlOutcome {
     SetStatementTimeout {
         reset: bool,
     },
+    /// `SET [SESSION] hnsw.ef_search ...`／`RESET hnsw.ef_search` の成功応答（タグは `SET`・`RESET`。
+    /// SQL-73・Issue #2030）。新しい値は `SessionState::hnsw_ef_search` が保持する。
+    ///
+    /// **Issue #2030 で追加した破壊的変更（BREAKING CHANGE）**: variant を追加した。
+    SetHnswEfSearch {
+        reset: bool,
+    },
     /// `SHOW timezone`／`SHOW TIME ZONE` の応答（列名 `TimeZone`・text の 1 行。CommandComplete
     /// タグは PG と同じ `SHOW`。TABLE-33・Issue #1575）。行の形は通常の検索 SELECT と同じで、
     /// タグだけが異なるため `Query` とは別 variant にしている。
