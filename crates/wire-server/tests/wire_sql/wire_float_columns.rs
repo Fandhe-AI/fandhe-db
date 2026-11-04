@@ -361,3 +361,31 @@ fn wire_projected_distance_column_is_float8() {
     assert_eq!(tag, "SELECT 1");
     read_ready_for_query(&mut stream);
 }
+
+/// SQL-72 (1)・Issue #2011: 関数形の距離列（`l2_distance(embedding, q) AS d`）も float8（OID 701）で
+/// 公告され、DataRow は距離のテキスト表現（同一ベクトルは 0）になる。
+#[test]
+fn wire_distance_function_column_is_float8() {
+    let (core, _guard) = new_core_with_metrics_table();
+    let mut stream = spawn_with_alice(core);
+
+    send_simple_query(
+        &mut stream,
+        "INSERT INTO metrics (id, embedding, score) VALUES (1, '[1,0]', 1.0) \
+         USING OPERATION_ID 'wire-op-distfn-1'",
+    );
+    read_command_complete(&mut stream);
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(
+        &mut stream,
+        "SELECT id, l2_distance(embedding, '[1,0]') AS d FROM metrics LIMIT 3",
+    );
+    let columns = read_row_description_with_oids(&mut stream);
+    assert_eq!(columns.get(1), Some(&("d".to_string(), 701)));
+    let cells = read_data_row(&mut stream);
+    assert_eq!(cells.get(1), Some(&Some("0".to_string())));
+    let tag = read_command_complete(&mut stream);
+    assert_eq!(tag, "SELECT 1");
+    read_ready_for_query(&mut stream);
+}

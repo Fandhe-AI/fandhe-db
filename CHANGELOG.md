@@ -20,6 +20,8 @@
 
 ### Added
 
+- 距離関数 `l2_distance`／`cosine_distance`／`inner_product`／`l1_distance` をスカラー関数として追加した（Issue #2011・SQL-72 (1)(2)・SQL-33 (3)(4) ポインタ）。引数は VECTOR 型の式とベクトルリテラル（文字列）で、投影・WHERE・ORDER BY・集計の引数で使える。戻り値は float8 で、演算子 `<->`／`<=>`／`<+>` と同じ値、`inner_product` は `<#>` の符号を反転した正の内積。引数に NULL があれば NULL、次元不一致は `22000`、ゼロノルムのコサインは NaN。非 VECTOR の引数は `42883`、VECTOR の式を含まない形（リテラル同士・NULL とリテラル）は `0A000`。式索引・CHECK・宣言的 UDF の本体では `0A000`。`ORDER BY` の関数形は全走査ソートで評価し ANN 索引は使わない。4 つの名前は組み込み関数名として予約され、同名の `CREATE FUNCTION` は拒否される（互換性変更）
+  BREAKING CHANGE: 公開 enum `BoundExpr` に `VectorLiteral(Arc<[f32]>)`、公開 enum `BuiltinFn` に `L2Distance`／`CosineDistance`／`InnerProduct`／`L1Distance` を追加した（網羅的 `match` の下流は追随が必要）。
 - GPU バッチ検索の距離種別 `engine::gpu_batch::GpuBatchMetric` と `GpuI8BatchBackend::try_new_with_metric` を追加した（Issue #2004・親 #2002・CORE-8・CORE-16・SQL-33 ポインタ）。i8 経路は InnerProduct・Cosine・L2 に対応し、L1 は `InitFailed` で拒否する（非破壊。`try_new` と `GpuI8Options` は不変）。
 - 距離順 `ORDER BY` を持つ検索 SELECT の投影位置に距離列 `<VECTOR 列> <距離演算子> <リテラル|$n> [AS 別名]` を受理し、float8 で返すようにした（Issue #2007・SQL-33 (7) ポインタ）。列・演算子種別・クエリベクトルが `ORDER BY` と同一の形だけを受理する（種別・列の不一致や距離 `ORDER BY` のない文は `42601`、クエリベクトルの不一致は `0A000`）。値は RLS 後の行から計算し、ゼロノルムのコサインは NaN。`<->`／`<#>`／`<+>` の実行はカーネル接続（#1981・#1991）まで `0A000` のまま。従来 `42601` だった入力は受理に変わる。公開 API の変更はない。
 - `sum(<VECTOR 列>)` と VECTOR 型の式（`sum(vec_div(embedding, 2))` 等）の `sum` を受け付けるようにした（Issue #2038・SQL-72 (3) ポインタ）。要素ごとに f64 で累積して f32 へ丸め、NULL 行は飛ばし、対象 0 行なら NULL、次元不一致は `22000`、f32 範囲超過は `22003`。`GROUP BY`・`FILTER`・他の集計への `HAVING` と併用できる。結果列は `vector`（wire の型 OID は 25）。挙動変更: `SUM(<VECTOR 列>)` は `42883` から受理に変わる。`MIN`／`MAX`／`AVG`、NoSQL、JOIN、FROM なしの SELECT、ウィンドウ（`0A000`）、集計結果の `HAVING`／`ORDER BY`／演算（`0A000`／`42601`）は従来どおり拒否。公開 API の変更はない。
