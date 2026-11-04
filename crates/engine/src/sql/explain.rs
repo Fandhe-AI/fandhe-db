@@ -986,6 +986,7 @@ pub(crate) fn build_search_explain_result(
 /// （広域取得は `search_mode` を参照せず、どちらの文にもランキング段が無い
 /// ため `mode:` を出すと誤情報になる。SQL-27 確定時に spec 側と擦り合わせる
 /// 事項）。
+#[cfg(test)]
 pub(crate) fn build_relational_explain_result(
     scalar_plan: ScalarPlan,
     scalar_fallback: Option<ScalarFallbackReason>,
@@ -1016,6 +1017,7 @@ pub(crate) struct ExplainWindowStage {
 /// [`build_relational_explain_result`] に窓の評価段の行（`window[i]: <func>
 /// partition_keys=<n> order_keys=<m>`）を `access_path:` 行の後ろへ追記する版。
 /// `windows` が空なら既存関数と出力が同一（追記のみの安定契約）。
+#[cfg(test)]
 pub(crate) fn build_relational_explain_result_with_windows(
     scalar_plan: ScalarPlan,
     scalar_fallback: Option<ScalarFallbackReason>,
