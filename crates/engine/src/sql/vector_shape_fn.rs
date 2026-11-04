@@ -1,5 +1,6 @@
-//! ベクトルの「形」を扱うスカラー関数（`vector_dims`・`l2_normalize`・`subvector`）の
-//! 値レベルの純関数群（対象ビヘイビア: SQL-72 (1)(2)。Issue #2012）。
+//! ベクトルの「形」を扱うスカラー関数（`vector_dims`・`l2_normalize`・`subvector`・
+//! `binary_quantize`）の値レベルの純関数群（対象ビヘイビア: SQL-72 (1)(2)・TABLE-48 (3)。
+//! Issue #2012・#2023）。
 //!
 //! 呼び出し元は `sql::udf_call::apply_builtin`（束縛済み式木の評価）のみ。NULL の伝播
 //! （strict）は呼び出し側の一律ガードが担うため、ここへは非 NULL の値だけが届く。
@@ -46,6 +47,35 @@ pub(crate) fn l2_normalize(v: &[f32]) -> Result<Vec<f32>, SqlSurfaceError> {
         out.resize(v.len(), 0.0);
     }
     Ok(out)
+}
+
+/// 二値量子化（`binary_quantize`。TABLE-48 (3)・Issue #2023）。正の成分を 1、それ以外
+/// （0・`-0.0`・負値・NaN）を 0 とする（pgvector と同じ `x > 0`）。ビットは MSB 先頭で並べ、
+/// 詰め物ビットは 0。結果長は入力の次元数で、空ベクトルは到達しない（`22000`）。確保失敗は `54000`。
+/// 呼び出し元は `udf_call::apply_builtin` のみ（結果は `ExprValue::Bit` として投影・代入へ流れる）。
+pub(crate) fn binary_quantize(v: &[f32]) -> Result<crate::bit_string::BitString, SqlSurfaceError> {
+    let too_large = || SqlSurfaceError::payload_too_large("binary_quantize result is too large");
+    let len = u32::try_from(v.len()).map_err(|_| too_large())?;
+    if len == 0 {
+        return Err(SqlSurfaceError::invalid_input(
+            "vector must have at least 1 dimension",
+        ));
+    }
+    let n = crate::bit_string::byte_len_for_bits(len).ok_or_else(too_large)?;
+    let mut bytes: Vec<u8> = Vec::new();
+    bytes.try_reserve_exact(n).map_err(|_| too_large())?;
+    for chunk in v.chunks(8) {
+        let mut b = 0u8;
+        for (i, &x) in chunk.iter().enumerate() {
+            if x > 0.0 {
+                b |= 0x80 >> i;
+            }
+        }
+        bytes.push(b);
+    }
+    crate::bit_string::BitString::from_parts(len, bytes).map_err(|_| SqlSurfaceError::Internal {
+        detail: "binary_quantize produced an invalid bit string".to_string(),
+    })
 }
 
 /// 位置引数（`start`／`count`）を検証して `i64` にする。非有限・非整数は `22000`、
@@ -150,6 +180,31 @@ mod tests {
             .sum::<f64>()
             .sqrt();
         assert!((norm - 1.0).abs() < 1e-6);
+    }
+
+    fn bq(v: &[f32]) -> String {
+        binary_quantize(v).unwrap().format_text()
+    }
+
+    #[test]
+    fn binary_quantize_matches_pgvector_rule() {
+        assert_eq!(bq(&[1.0, 0.0, -1.0]), "100");
+        assert_eq!(
+            bq(&[0.0, 0.1, -0.2, -0.3, 0.4, 0.5, 0.6, -0.7, 0.8, -0.9, 1.0]),
+            "01001110101"
+        );
+        assert_eq!(bq(&[-0.0, 0.0, f32::NAN, f32::NEG_INFINITY]), "0000");
+        assert_eq!(bq(&[f32::INFINITY]), "1");
+    }
+
+    #[test]
+    fn binary_quantize_byte_boundaries() {
+        let eight = binary_quantize(&[1.0; 8]).unwrap();
+        assert_eq!(eight.as_bytes(), &[0xFF]);
+        let nine = binary_quantize(&[1.0; 9]).unwrap();
+        assert_eq!(nine.as_bytes(), &[0xFF, 0x80]);
+        assert_eq!(nine.bit_len(), 9);
+        assert_eq!(binary_quantize(&[]).unwrap_err().wire_code(), "22000");
     }
 
     #[test]

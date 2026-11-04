@@ -619,7 +619,7 @@ fn typed_null(ty: ExprType) -> Result<Expr, SqlSurfaceError> {
         }
         // numeric 値は CAST の結果としてのみ生じ、INSERT VALUES の定数式では CAST 自体を拒否する
         // ため到達しない（fail-closed）。
-        ExprType::Numeric | ExprType::Uuid | ExprType::Bytea | ExprType::Array => {
+        ExprType::Numeric | ExprType::Uuid | ExprType::Bytea | ExprType::Array | ExprType::Bit => {
             return Err(SqlSurfaceError::unsupported(
                 "a value produced by CAST is not allowed in a constant expression",
             ))
@@ -1026,9 +1026,11 @@ pub(crate) fn fold_const_literal(expr: &Expr) -> Result<InsertLiteral, SqlSurfac
             }
             numeric_literal_text(&d).map(InsertLiteral::Number)
         }
-        ExprValue::Uuid(_) | ExprValue::Bytes(_) => Err(SqlSurfaceError::unsupported(
-            "a value produced by CAST is not allowed in a constant expression",
-        )),
+        ExprValue::Uuid(_) | ExprValue::Bytes(_) | ExprValue::Bit(_) => {
+            Err(SqlSurfaceError::unsupported(
+                "a value produced by CAST is not allowed in a constant expression",
+            ))
+        }
     }
 }
 

@@ -4365,6 +4365,9 @@ fn project_rows(
                         udf_call::ExprValue::Uuid(u) => cells.push(Cell::Uuid(u)),
                         udf_call::ExprValue::Bytes(b) => cells.push(Cell::Bytes(b.into_owned())),
                         udf_call::ExprValue::Array(a) => cells.push(Cell::Array(a)),
+                        // `binary_quantize` の結果（Issue #2023）。バイト予算は上の
+                        // `estimated_cell_bytes` が計上済み。
+                        udf_call::ExprValue::Bit(b) => cells.push(Cell::Bit(b)),
                     }
                 }
             }

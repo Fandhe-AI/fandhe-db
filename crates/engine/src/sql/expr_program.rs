@@ -279,6 +279,8 @@ pub(crate) enum StackValue {
     Bytes(Vec<u8>),
     /// 配列値（Issue #1592。[`StackValue::Uuid`] と同じ経路）。
     Array(crate::row_codec::ArrayValue),
+    /// `BIT(n)` 値（Issue #2023。`binary_quantize` の結果。[`StackValue::Uuid`] と同じ経路）。
+    Bit(crate::bit_string::BitString),
 }
 
 /// [`StackValue`] を、eval 呼び出しスコープに閉じたライフタイム `'a` を持つ
@@ -383,6 +385,7 @@ fn stack_to_expr_value<'a>(
         StackValue::Uuid(u) => Ok(ExprValue::Uuid(u)),
         StackValue::Bytes(b) => Ok(ExprValue::Bytes(Cow::Owned(b))),
         StackValue::Array(a) => Ok(ExprValue::Array(a)),
+        StackValue::Bit(b) => Ok(ExprValue::Bit(b)),
         StackValue::NumericColumnRef(index) => match row_scalars.get(index) {
             None => Err(SqlSurfaceError::Internal {
                 detail: "NUMERIC column reference is outside the decoded row scalar view"
@@ -427,6 +430,7 @@ fn expr_value_to_stack(v: ExprValue<'_>) -> StackValue {
         ExprValue::Uuid(u) => StackValue::Uuid(u),
         ExprValue::Bytes(b) => StackValue::Bytes(b.into_owned()),
         ExprValue::Array(a) => StackValue::Array(a),
+        ExprValue::Bit(b) => StackValue::Bit(b),
     }
 }
 
@@ -498,6 +502,7 @@ fn try_fold_scalar(expr: &BoundExpr) -> Option<FoldedConst> {
                 | ExprValue::Uuid(_)
                 | ExprValue::Bytes(_)
                 | ExprValue::Array(_)
+                | ExprValue::Bit(_)
                 | ExprValue::Null => None,
             }
         }
@@ -1234,6 +1239,7 @@ impl ExprProgram {
                             | ExprValue::Uuid(_)
                             | ExprValue::Bytes(_)
                             | ExprValue::Array(_)
+                            | ExprValue::Bit(_)
                             | ExprValue::Timestamp(_) => return Err(type_mismatch()),
                         };
                         let s = match scalar_ev {
@@ -1252,6 +1258,7 @@ impl ExprProgram {
                             | ExprValue::Uuid(_)
                             | ExprValue::Bytes(_)
                             | ExprValue::Array(_)
+                            | ExprValue::Bit(_)
                             | ExprValue::Timestamp(_) => return Err(type_mismatch()),
                         };
                         // バックエンドの失敗は `map_wasm_call_error` で写像する

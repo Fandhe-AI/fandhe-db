@@ -166,7 +166,7 @@ fn bind_value_arg(
         ExprType::Json => JsonArgKind::Jsonb,
         ExprType::JsonText => JsonArgKind::Json,
         // numeric 式（CAST の結果）の json 化は未対応（Issue #1591）。fail-closed で拒否する。
-        ExprType::Numeric | ExprType::Uuid | ExprType::Bytea | ExprType::Array => {
+        ExprType::Numeric | ExprType::Uuid | ExprType::Bytea | ExprType::Array | ExprType::Bit => {
             return Err(SqlSurfaceError::FeatureNotSupported {
                 detail: "a value produced by CAST cannot be converted to json yet".to_string(),
             })

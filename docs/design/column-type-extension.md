@@ -790,6 +790,16 @@ NoSQL 表層の JSON 束縛（`insert`／`update`／`filter`）の型別対応�
 - **エラー分類**: 文字種違反 `22P02`、ビット数不一致 `22026`（`ErrorClass::StringDataLengthMismatch` を新設）、`BIT(0)`・上限超過 `22023`、未対応の型綴り `0A000`。
 - **対象外**: `B'1010'` ビット列定数、`'1010'::bit(4)`／CAST、`hamming_distance`・`jaccard_distance`、比較述語・ORDER BY・GROUP BY、wire のバイナリ形式（`bit_send`／`bit_recv`）と宣言 OID 1560 の Parse、COPY BINARY、`bit[]`（OID 1561）、`BIT VARYING`。距離カーネルの SQL 接続と `binary_quantize` は兄弟 Issue の担当。
 
+## Issue #2023 追記: binary_quantize(vector)（TABLE-48 (3) ポインタ）
+
+- **規則**: 正の成分を 1、それ以外（0・`-0.0`・負値・NaN）を 0 とする（pgvector と同じ `x > 0`）。ビット順は #2021 の `BitString`（MSB 先頭・詰め物 0）。引数が NULL なら NULL（strict）。純関数は `sql::vector_shape_fn::binary_quantize`。
+- **型の追加**: bit を返す式を運ぶため `ExprType::Bit`・`ExprValue::Bit`・`StackValue::Bit` を追加した。長さ `n` は `ExprType`（`Copy`）に持たせず、結果列の型は `expr_result_column_type` が引数の VECTOR 列の次元から `ColumnType::Bit(d)` として公告する（wire の OID は 1560）。
+- **消費規則**: Uuid／Bytea／配列と同じ cast-only 型（`is_cast_only_type`）。消費できるのは投影の最上位と、BIT 列への `UPDATE ... SET` 右辺（`bind_bit_assignment_source`）だけで、比較・算術・関数引数・`CASE` 等・集計・並べ替え・グループ化・`CAST`・式索引は `0A000`。専用の固定文言を使う（「CAST が作った値」の文言は bit には誤解を招くため）。`INSERT ... SELECT` と `CREATE TABLE AS` は列型に従って bit を往復できる。
+- **引数の制限（fail-closed）**: 引数は表の VECTOR 列そのもの（`BoundExpr::VectorRef`）に限る。`l2_normalize(embedding)` など加工したベクトル式は結果長を静的に決められず公告型を偽るため `0A000`。VECTOR 以外の型は `42804`、ベクトルリテラルと `$n` は #2012 と同じく従来どおり未対応。
+- **代入時の長さ**: 束縛時の静的長と BIT 列の宣言長の不一致は、行ごとの評価結果に対して `expr_value_to_column_value` が `22026` で拒否する（PostgreSQL の代入時の長さ不一致と同じ）。
+- **PostgreSQL との既知の差**: (1) PostgreSQL の `binary_quantize` の結果 typmod は -1、本実装は `bit(d)` の d を公告する（値の文字列表現は同一）。(2) 裸の `NULL` 引数は PostgreSQL では多重定義が曖昧で `42725` だが、本実装は strict として NULL を返す（結果列の型は長さ不明のため text）。
+- **対象外**: `<~>`／`<%>` の SQL・NoSQL 実行への接続と `hamming_distance`／`jaccard_distance` の SQL 関数、「二値で粗選別して元ベクトルで再ランク」の運用例の文書化（`<~>` の接続後）、`binary_quantize(halfvec)`、bit の比較・ORDER BY・CAST・集計、式索引（`CREATE INDEX ... ((binary_quantize(embedding)::bit(n)) bit_hamming_ops)`）、NoSQL 表層。
+
 ## Issue #2014 追記: HALFVEC(N) 列（TABLE-46 (1)(4)(5) ポインタ）
 
 - **保存先**: スカラーペイロード（行 codec のスカラー列）に f16 で保存し、embedding スロットは使わない。容量が次元 × 2 バイトになり、`storage` の行フォーマットを変えずに済む。HALFVEC のみの表は VECTOR 列を持たない表と同じ扱い（embedding は空）。

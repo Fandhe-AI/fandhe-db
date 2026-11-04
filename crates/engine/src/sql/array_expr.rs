@@ -92,7 +92,7 @@ pub(super) fn classify_item(
         SourceKind::Array(_) => Err(unsupported(
             "multidimensional arrays are not supported in an ARRAY constructor",
         )),
-        SourceKind::UnknownNumeric | SourceKind::Outside => Err(unsupported(
+        SourceKind::UnknownNumeric | SourceKind::Outside | SourceKind::Bit => Err(unsupported(
             "an ARRAY element whose type cannot be determined statically is not supported yet",
         )),
     }
@@ -373,7 +373,7 @@ pub(super) fn bind_subscript(
                 kind.label()
             )))
         }
-        SourceKind::UnknownNumeric | SourceKind::Outside => {
+        SourceKind::UnknownNumeric | SourceKind::Outside | SourceKind::Bit => {
             return Err(SqlSurfaceError::datatype_mismatch(
                 "cannot subscript a value that is not an array",
             ))
@@ -443,6 +443,7 @@ pub(super) fn own(v: ExprValue<'_>) -> Result<ExprValue<'static>, SqlSurfaceErro
         | ExprValue::Time(_)
         | ExprValue::TimestampTz(_)
         | ExprValue::Interval(_)
+        | ExprValue::Bit(_)
         | ExprValue::Array(_) => {
             return Err(SqlSurfaceError::Internal {
                 detail: "array element evaluated to a type that cannot be stored".to_string(),
