@@ -8195,6 +8195,20 @@ impl<'a> Parser<'a> {
         &mut self,
         name: &str,
     ) -> Result<AggregateItem, SqlSurfaceError> {
+        // bit 距離式（TABLE-48・Issue #2970）は射影項目の最上位式でのみ受理する。集計の引数は
+        // 入れ子の呼び出しなので、外側が許可中でも無効へ戻して `42601` を保つ（エラー時も復元）。
+        let prev_bit = self.bit_distance_expr_allowed;
+        self.bit_distance_expr_allowed = false;
+        let result = self.parse_aggregate_call_after_name_inner(name);
+        self.bit_distance_expr_allowed = prev_bit;
+        result
+    }
+
+    /// [`Self::parse_aggregate_call_after_name`] の本体（bit 距離式の受理フラグを無効化済みで呼ばれる）。
+    fn parse_aggregate_call_after_name_inner(
+        &mut self,
+        name: &str,
+    ) -> Result<AggregateItem, SqlSurfaceError> {
         let func = AggregateFunc::from_name(name).ok_or_else(|| {
             SqlSurfaceError::unsupported(format!("unsupported aggregate function: {name}"))
         })?;

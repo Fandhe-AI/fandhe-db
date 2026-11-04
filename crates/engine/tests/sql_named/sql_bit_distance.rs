@@ -547,6 +547,28 @@ fn unsupported_contexts_are_rejected() {
     assert_eq!(ids(&core, "SELECT id FROM t ORDER BY id LIMIT 5"), vec![1]);
 }
 
+/// 集約関数の引数（入れ子の呼び出し）では `<~>`・`<%>` を構文解析せず、従来どおり `42601` で拒否する。
+#[test]
+fn aggregate_argument_rejects_bit_distance_operator() {
+    let (_g, core) = open("bitd-aggarg");
+    ok(&core, "CREATE TABLE t (id BIGINT PRIMARY KEY, v BIT(4))");
+    ok(&core, "INSERT INTO t (id, v) VALUES (1,'1010')");
+    for sql in [
+        "SELECT max(v <~> '1010') FROM t",
+        "SELECT min(v <%> '1010') FROM t",
+        "SELECT count(v <~> '1010') FROM t",
+        "SELECT id, max(v <~> '1010') FROM t GROUP BY id",
+        "SELECT max(v <~> '1010') + 1 FROM t",
+        "SELECT 1 + max(v <~> '1010') FROM t",
+        "SELECT max(v <~> '1010') OVER () FROM t",
+        "SELECT avg(v <%> '1010') FROM t",
+        "SELECT id FROM t GROUP BY id HAVING max(v <~> '1010') > 0",
+        "SELECT id FROM t ORDER BY max(v <~> '1010')",
+    ] {
+        assert_eq!(code(&core, sql), "42601", "{sql}");
+    }
+}
+
 /// (8) EXPLAIN は scan の計画を返す。
 #[test]
 fn explain_returns_a_scan_plan() {
