@@ -12401,6 +12401,7 @@ impl EngineCore {
                     hnsw_scope: self.hnsw_scope,
                     // ゲート評価後に `sql::exec` が写像結果を載せ直す（Issue #2000）。
                     graph_metric: None,
+                    build_options: None,
                 }),
             // Issue #473: スカラー列二次索引の gated 構築（応答には未使用。
             // 詳細は `sql::scalar_index` のドキュメント参照）。
@@ -13415,7 +13416,7 @@ impl EngineCore {
         // （`Targeted` は問い合わせ側、`MetricMismatch` は不一致の理由が分かる宣言側、
         // `NotTargeted` は Issue #1978 の決定規則）。
         let ann_metric = match hnsw_gate {
-            crate::catalog::HnswGate::Targeted { metric } => metric,
+            crate::catalog::HnswGate::Targeted { metric, .. } => metric,
             crate::catalog::HnswGate::MetricMismatch { index_metric } => index_metric,
             crate::catalog::HnswGate::NotTargeted if declarations_enabled => {
                 crate::catalog::hnsw_metric_in_txn(read_txn, &self.index_catalog_gate_cache, table)
@@ -13429,7 +13430,11 @@ impl EngineCore {
                 scalar_plan,
             )
             .with_scalar_fallback(scalar_fallback)
-            .with_ann_metric(ann_metric),
+            .with_ann_metric(ann_metric)
+            .with_ann_build_options(match hnsw_gate {
+                crate::catalog::HnswGate::Targeted { options, .. } => options,
+                _ => None,
+            }),
             crate::sql::explain::ExplainIndexNames::new(ann_names, scalar_names),
         )
     }
@@ -15890,29 +15895,31 @@ impl EngineCore {
         // この read txn 自体を開かない――HNSW opt-in が無効な限り
         // `search_with_hnsw` 経路には絶対に進まないため、判定用の読み取りは
         // 無駄なホットパスコストにしかならない（既定デプロイの回帰防止）。
-        let (hnsw_targeted, gate_generation) = if self.hnsw_state.is_none() {
-            (false, None)
+        let (hnsw_targeted, gate_generation, hnsw_build_options) = if self.hnsw_state.is_none() {
+            (false, None, None)
         } else {
             match self.storage.db().begin_read() {
                 Ok(read_txn) => {
                     // Issue #1979: 距離種別の不一致（`MetricMismatch`）は `Targeted` でないため
                     // 既存の厳密経路（`snapshot.search_with`）へ縮退する。Rust API の問い合わせ
                     // 距離はコサイン系。
-                    let targeted = matches!(
-                        crate::catalog::hnsw_gate_in_txn(
-                            &read_txn,
-                            &self.index_catalog_gate_cache,
-                            table,
-                            self.hnsw_scope,
-                            true,
-                            crate::sql::hnsw_cache::cosine_query_metric(),
-                        ),
-                        crate::catalog::HnswGate::Targeted { .. }
-                    );
+                    // SQL-33 (5)（Issue #2029）: 宣言の `WITH (m, ef_construction)` も同じゲート結果
+                    // から受け取り、SQL 経路と同じ構築パラメータで物理グラフを引く。
+                    let (targeted, options) = match crate::catalog::hnsw_gate_in_txn(
+                        &read_txn,
+                        &self.index_catalog_gate_cache,
+                        table,
+                        self.hnsw_scope,
+                        true,
+                        crate::sql::hnsw_cache::cosine_query_metric(),
+                    ) {
+                        crate::catalog::HnswGate::Targeted { options, .. } => (true, options),
+                        _ => (false, None),
+                    };
                     let generation = crate::storage::current_generation_in_txn(&read_txn).ok();
-                    (targeted, generation)
+                    (targeted, generation, options)
                 }
-                Err(_) => (false, None),
+                Err(_) => (false, None, None),
             }
         };
         // 上記ゲート用 read txn はここで既に閉じている。判定〜`search_with_hnsw`
@@ -15951,6 +15958,7 @@ impl EngineCore {
                     graph_metric: crate::sql::hnsw_cache::hnsw_graph_metric_for(
                         crate::sql::hnsw_cache::cosine_query_metric(),
                     ),
+                    build_options: hnsw_build_options,
                 };
                 snapshot.search_with_hnsw(
                     &self.storage,

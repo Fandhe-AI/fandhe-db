@@ -3190,6 +3190,13 @@ pub(crate) fn execute_create_index(
             detail: "USING gin does not support this index definition".to_string(),
         });
     }
+    // 防御ゲート（SQL-33 (5)、Issue #2029）: `WITH (m, ef_construction)` は HNSW だけが持てる。
+    // 構文段で拒否済みだが、将来の経路変更で届いても黙って落とさない（fail-closed）。
+    if validated.hnsw_options().is_some() && !validated.is_hnsw() {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "storage parameters are only supported for USING hnsw".to_string(),
+        });
+    }
     let kind = match validated.method() {
         crate::sql::allowlist::IndexMethod::Hnsw => {
             IndexKind::Hnsw(crate::catalog::VectorOpClass::Cosine)
@@ -3210,7 +3217,9 @@ pub(crate) fn execute_create_index(
     .with_column_collations(validated.column_collations().to_vec())
     // `CREATE UNIQUE INDEX`（Issue #1616・INDEX-9）。UNIQUE 制約への展開と既存行の重複検査は
     // `Storage::create_index` が同一 write txn で行う。
-    .with_unique(validated.is_unique());
+    .with_unique(validated.is_unique())
+    // HNSW の構築パラメータ（SQL-33 (5)、Issue #2029）。`WITH` 省略は `None`（従来の永続形）。
+    .with_hnsw_options(validated.hnsw_options());
     // `IF NOT EXISTS`（TABLE-36、Issue #1613）。`create_index` の write txn は名前衝突を最初に
     // 判定し commit・世代 bump の前に返るため、同名があれば定義を比較せず副作用なしで成功にする。
     // 式要素（INDEX-10、Issue #1648）の束縛エラーは `Sql` としてそのまま透過し、カタログ側の
@@ -4079,6 +4088,7 @@ mod tests {
             unique: false,
             predicate: None,
             pending_user_function: None,
+            hnsw_options: None,
         };
         execute_create_index(&storage, &index).expect("create index");
         let snapshot = |storage: &Storage| {

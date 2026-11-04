@@ -1309,13 +1309,15 @@ pub(crate) fn execute_statement_with_cache(
     // 写してキャッシュアクセスへ載せる（キャッシュキーの一部）。それ以外・未対応 metric は
     // `None` のままで、prepare 系が全件走査へ倒す（fail-closed）。
     let hnsw_cache = hnsw_cache.map(|access| {
-        let graph_metric = match hnsw_gate {
-            crate::catalog::HnswGate::Targeted { metric } => {
-                crate::sql::hnsw_cache::hnsw_graph_metric_for(metric)
-            }
-            _ => None,
+        // SQL-33 (5)（Issue #2029）: 宣言の `WITH (m, ef_construction)` も同じゲート結果から載せる。
+        let (graph_metric, build_options) = match hnsw_gate {
+            crate::catalog::HnswGate::Targeted { metric, options } => (
+                crate::sql::hnsw_cache::hnsw_graph_metric_for(metric),
+                options,
+            ),
+            _ => (None, None),
         };
-        access.with_graph_metric(graph_metric)
+        access.with_graph(graph_metric, build_options)
     });
     let hnsw_enabled = matches!(hnsw_gate, crate::catalog::HnswGate::Targeted { .. });
     let metric_mismatch = matches!(hnsw_gate, crate::catalog::HnswGate::MetricMismatch { .. });
