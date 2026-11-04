@@ -2447,7 +2447,8 @@ impl HnswIndex {
     /// 同一経路）。`vectors` は生の行で、Cosine では検証後にここで 1 回だけ正規化し、そのコピーを
     /// 挿入・修復・凍結のすべてで使う（C2′）。正規化できない行は索引から除外する
     /// （Issue #2241。構築は成功し、除外行は入辺を持たず結果に現れない）。
-    /// 呼び出し元は #2000（SQL 経路の結線）で追加予定。それまでは単体テストのみ。
+    /// SQL 経路は `build_parallel_with_metric` 経由で結線する（Issue #2000）。本入口は
+    /// 単体テスト専用のため本番ビルドでは未使用。
     #[allow(dead_code, clippy::too_many_arguments)]
     pub(crate) fn build_with_metric(
         params: HnswParams,
@@ -2461,8 +2462,8 @@ impl HnswIndex {
         Self::build_with_threads_impl(metric, params, precision, dim, vectors, seed, threads)
     }
 
-    /// この索引の距離種別（#2000 が cache キー・EXPLAIN へ反映する）。
-    #[allow(dead_code)]
+    /// この索引の距離種別。`sql::hnsw_cache` が世代整合キャッシュの照合キーと
+    /// 再採点の score 関数の選択に使う（Issue #2000）。
     pub(crate) fn metric(&self) -> HnswMetric {
         self.metric
     }
@@ -2618,7 +2619,14 @@ impl HnswIndex {
         vectors: &[f32],
         seed: u64,
     ) -> Result<Self, HnswError> {
-        Self::build_parallel_impl(params, ResidentPrecision::F32, dim, vectors, seed)
+        Self::build_parallel_impl(
+            HnswMetric::InnerProduct,
+            params,
+            ResidentPrecision::F32,
+            dim,
+            vectors,
+            seed,
+        )
     }
 
     /// [`Self::build_parallel`] の常駐精度 opt-in 版（Issue #514）。
@@ -2631,12 +2639,35 @@ impl HnswIndex {
         vectors: &[f32],
         seed: u64,
     ) -> Result<Self, HnswError> {
-        Self::build_parallel_impl(params, precision, dim, vectors, seed)
+        Self::build_parallel_impl(
+            HnswMetric::InnerProduct,
+            params,
+            precision,
+            dim,
+            vectors,
+            seed,
+        )
     }
 
-    /// [`Self::build_parallel`]／[`Self::build_parallel_with_precision`] が
-    /// 共有する構築本体。
+    /// metric 指定の並列構築入口（Issue #2000・親 #1996。crate 内専用）。
+    /// `sql::hnsw_cache::IndexedBase::build` が、キャッシュキーの物理グラフ metric を
+    /// そのまま渡して構築するために使う。公開の [`Self::build_parallel`]／
+    /// [`Self::build_parallel_with_precision`] は `InnerProduct` 固定のまま変えない。
+    pub(crate) fn build_parallel_with_metric(
+        params: HnswParams,
+        metric: HnswMetric,
+        precision: ResidentPrecision,
+        dim: u32,
+        vectors: &[f32],
+        seed: u64,
+    ) -> Result<Self, HnswError> {
+        Self::build_parallel_impl(metric, params, precision, dim, vectors, seed)
+    }
+
+    /// [`Self::build_parallel`]／[`Self::build_parallel_with_precision`]／
+    /// [`Self::build_parallel_with_metric`] が共有する構築本体。
     fn build_parallel_impl(
+        metric: HnswMetric,
         params: HnswParams,
         precision: ResidentPrecision,
         dim: u32,
@@ -2646,39 +2677,16 @@ impl HnswIndex {
         let n = validate_build_input(&params, dim, vectors)?;
         let desired = crate::parallel_search::thread_count_for(n).min(MAX_BUILD_THREADS);
         if desired <= 1 || n <= SEQUENTIAL_PREFIX_NODES {
-            return Self::build_impl(
-                HnswMetric::InnerProduct,
-                params,
-                precision,
-                dim,
-                vectors,
-                seed,
-                None,
-            );
+            return Self::build_impl(metric, params, precision, dim, vectors, seed, None);
         }
         let guard = crate::parallel_search::WorkerBudgetGuard::acquire(desired);
         let granted = guard.granted();
         if granted <= 1 {
             drop(guard);
-            return Self::build_impl(
-                HnswMetric::InnerProduct,
-                params,
-                precision,
-                dim,
-                vectors,
-                seed,
-                None,
-            );
+            return Self::build_impl(metric, params, precision, dim, vectors, seed, None);
         }
-        let result = Self::build_with_threads_impl(
-            HnswMetric::InnerProduct,
-            params,
-            precision,
-            dim,
-            vectors,
-            seed,
-            granted,
-        );
+        let result =
+            Self::build_with_threads_impl(metric, params, precision, dim, vectors, seed, granted);
         drop(guard);
         result
     }

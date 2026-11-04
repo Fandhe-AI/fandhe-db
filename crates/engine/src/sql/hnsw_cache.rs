@@ -49,7 +49,12 @@
 //!   `record_build_failed` の場合、記録できなくても呼び出し元は既に brute-force へ
 //!   縮退済みのため実害はない）。
 //!
-//! **索引済みノードの探索結果は必ず `kernel::dot` で再計算**する（`HnswIndex::search`
+//! キャッシュのキーは `(table, ctx, 物理グラフ metric)`（Issue #2000）。metric 違いの
+//! グラフは必ず別エントリになり取り違えない。metric は `HnswCacheAccess::graph_metric` が
+//! 運び、`None` なら全走査へ縮退する（fail-closed）。
+//!
+//! **索引済みノードの探索結果は索引の metric の score 関数（現状は内積のみ。`kernel::dot`
+//! とビット同一）で再計算**する（`HnswIndex::search`
 //! 自身のスコアは索引構築時点のベクトルに対するものであり、`Overlay` が写像した
 //! 現在のスロット・ベクトルに対するスコアと数式上は同一だが、写像の正しさ自体を
 //! 二重検証する意味も兼ねる。写像先が範囲外・キー不一致の場合は当該クエリのみ
@@ -67,6 +72,7 @@ use redb::ReadableDatabase;
 
 use crate::arena::VectorArena;
 use crate::hnsw::provider::HnswSearchProvider;
+use crate::hnsw::HnswMetric;
 use crate::hnsw::{HnswError, HnswIndex, HnswSearchScratch, Ratio};
 use crate::kernel::{CandidateHit, KernelError, SearchInput, SearchProvider};
 use crate::policy::PolicyContext;
@@ -251,6 +257,7 @@ impl IndexedBase {
     /// [`crate::hnsw::HnswIndex::build_parallel`] で構築する。索引ノード番号は
     /// `arena` のスロット番号と一致する（構築直後の世代においては
     /// `slot_of_node[node] == node` が常に成立する）。
+    /// `metric` は物理グラフの距離種別（Issue #2000。キャッシュキーの一部）。
     /// `precision` は Issue #514（F16）・Issue #521（I8）で追加した常駐精度
     /// opt-in（既定 `F32`）。戻り値の `bool` 2 つはそれぞれ「要求 `F16`／`I8`
     /// が範囲外成分・非有限成分等により `F32` へ自動縮退したか」（D6。呼び出し元が
@@ -261,11 +268,13 @@ impl IndexedBase {
         arena: &VectorArena,
         params: crate::hnsw::HnswParams,
         precision: crate::hnsw::ResidentPrecision,
+        metric: HnswMetric,
         built_ctx: PolicyContext,
         built_table_generation: u64,
     ) -> Result<(Self, bool, bool), HnswError> {
-        let index = HnswIndex::build_parallel_with_precision(
+        let index = HnswIndex::build_parallel_with_metric(
             params,
+            metric,
             precision,
             arena.dim(),
             arena.vectors(),
@@ -273,6 +282,7 @@ impl IndexedBase {
         )?;
         Ok(Self::from_index(
             index,
+            metric,
             arena,
             precision,
             built_ctx,
@@ -281,19 +291,22 @@ impl IndexedBase {
     }
 
     /// 構築済みの `index`（ノード番号 = `arena` のスロット番号）からキー写像を組み立てる
-    /// [`Self::build`] の後半。本番の `build` は内積グラフを渡す。Cosine 索引を渡せるのは
-    /// 単体テストだけ（SQL 経路の metric 結線は #2000 の担当。Issue #2241 の Overlay 規則は
-    /// 索引が除外を持つときだけ有効になるため、本番の挙動は変わらない）。
+    /// [`Self::build`] の後半。Cosine 索引を渡せるのは単体テストだけ（SQL 経路の metric 結線は
+    /// #2000 の担当。Issue #2241 の Overlay 規則は索引が除外を持つときだけ有効になる）。
     fn from_index(
         index: HnswIndex,
+        metric: HnswMetric,
         arena: &VectorArena,
         precision: crate::hnsw::ResidentPrecision,
         built_ctx: PolicyContext,
         built_table_generation: u64,
     ) -> (Self, bool, bool) {
-        let f16_fallback = precision == crate::hnsw::ResidentPrecision::F16
+        // 自動縮退の判定は「metric が許す実効精度」と比べる。L2・L1 は設計上 F32 固定
+        // （`HnswMetric::effective_precision`）で、これを f16／i8 の縮退として誤計上しない。
+        let effective = metric.effective_precision(precision);
+        let f16_fallback = effective == crate::hnsw::ResidentPrecision::F16
             && index.resident_precision() == crate::hnsw::ResidentPrecision::F32;
-        let i8_fallback = precision == crate::hnsw::ResidentPrecision::I8
+        let i8_fallback = effective == crate::hnsw::ResidentPrecision::I8
             && index.resident_precision() == crate::hnsw::ResidentPrecision::F32;
         let mut node_keys: Vec<RowKey> = Vec::with_capacity(arena.len());
         let mut key_to_node: HashMap<RowKey, u32> = HashMap::with_capacity(arena.len());
@@ -674,6 +687,9 @@ impl Overlay {
 struct HnswCacheEntry {
     table: String,
     built_ctx: PolicyContext,
+    /// 物理グラフの metric（キャッシュキーの 3 つ目。Issue #2000）。`base` が `None` の
+    /// 負のキャッシュ専用エントリでも、どの metric の構築失敗かを区別するために持つ。
+    metric: HnswMetric,
     /// 索引済みベース。`None` は「このテーブル・ctx では一度も構築に成功して
     /// いない」状態（初回構築が失敗した直後。`build_failed_generation` の負の
     /// キャッシュを保持する場所として本エントリ自体は必要なため、ベースなしでも
@@ -845,6 +861,7 @@ impl HnswIndexCache {
         read_txn: &redb::ReadTransaction,
         table: &str,
         ctx: &PolicyContext,
+        metric: HnswMetric,
     ) -> Lookup {
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
         let Ok(mut guard) = self.state.write() else {
@@ -863,9 +880,9 @@ impl HnswIndexCache {
         let Some(position) = guard
             .entries
             .iter()
-            .position(|e| e.table == table && e.built_ctx == *ctx)
+            .position(|e| e.table == table && e.built_ctx == *ctx && e.metric == metric)
         else {
-            // 対象 `(table, ctx)` のエントリが一度も登録されていない、最も一般的な
+            // 対象 `(table, ctx, metric)` のエントリが一度も登録されていない、最も一般的な
             // 初回ミス（codex-review P2 指摘対応）。
             drop(guard);
             self.misses.fetch_add(1, Ordering::Relaxed);
@@ -953,14 +970,19 @@ impl HnswIndexCache {
             // 〔HNSW グラフ全体の構築。brute-force より遥かに高価〕をやり直して
             // しまう。世代が進めばテーブル規模の変化次第で再度キャッシュ可能に
             // なりうるため、失敗記録と同じく世代限定の一時的な縮退として扱う）。
-            mark_uncacheable_in_guard(self, &mut guard, table, &base.built_ctx, current_generation);
+            mark_uncacheable_in_guard(
+                self,
+                &mut guard,
+                table,
+                &base.built_ctx,
+                base.index.metric(),
+                current_generation,
+            );
             return base;
         }
-        if let Some(pos) = guard
-            .entries
-            .iter()
-            .position(|e| e.table == table && e.built_ctx == base.built_ctx)
-        {
+        if let Some(pos) = guard.entries.iter().position(|e| {
+            e.table == table && e.built_ctx == base.built_ctx && e.metric == base.index.metric()
+        }) {
             guard.entries.remove(pos);
         }
         self.evict_for_capacity(&mut guard, own_bytes);
@@ -968,6 +990,7 @@ impl HnswIndexCache {
         guard.entries.push(HnswCacheEntry {
             table: table.to_string(),
             built_ctx: base.built_ctx.clone(),
+            metric: base.index.metric(),
             base: Some(Arc::clone(&base)),
             overlay: None,
             build_failed_generation: None,
@@ -1030,7 +1053,9 @@ impl HnswIndexCache {
         }
     }
 
-    /// 指定 `(table, ctx)` のエントリのみを破棄する（当該テナントから見た
+    /// 指定 `(table, ctx)` のエントリのみを破棄する。metric は問わず全 metric のエントリが
+    /// 対象（Issue #2000。可視行数は metric に依存せず、破棄しても次回に再構築されるだけで
+    /// 安全側。他テナント・他テーブルへは波及しない）。（当該テナントから見た
     /// `arena.len()`〔RLS 可視行数〕が `MIN_INDEXED_ROWS` 未満へ縮小した場合の
     /// 後始末）。Cursor Bugbot 指摘対応: 以前は `table` 一致のみで全 `ctx` 分を
     /// まとめて破棄しており、可視行数が少ない/0 件のテナントのクエリが同一
@@ -1149,6 +1174,26 @@ pub(crate) struct HnswCacheAccess<'a> {
     /// HNSW を使うテーブルの範囲（`EngineCore::with_hnsw_scope` の設定値。
     /// `catalog::hnsw_targeted_in_txn` へそのまま渡す。Issue #1065）。
     pub(crate) hnsw_scope: crate::search_engine::HnswScope,
+    /// 本問い合わせが引く物理グラフの metric（キャッシュキーの一部。Issue #2000）。
+    /// ゲートが `Targeted` で [`hnsw_graph_metric_for`] が `Some` を返したときだけ
+    /// `Some`。`None`（結線漏れ・未対応 metric）では prepare 系が `FullScan` を返し、
+    /// 誤ったグラフを引かない（fail-closed）。
+    pub(crate) graph_metric: Option<HnswMetric>,
+}
+
+impl HnswCacheAccess<'_> {
+    /// `graph_metric` を差し替えた複製を返す。`sql::exec` がゲート評価後に写像結果を
+    /// 載せ直すために使う（全フィールドが参照または `Copy`）。
+    pub(crate) fn with_graph_metric(&self, graph_metric: Option<HnswMetric>) -> Self {
+        HnswCacheAccess {
+            storage: self.storage,
+            cache: self.cache,
+            provider: self.provider,
+            index_gate_cache: self.index_gate_cache,
+            hnsw_scope: self.hnsw_scope,
+            graph_metric,
+        }
+    }
 }
 
 /// [`search_or_fallback`]／[`search_subset_or_fallback`] の「索引・オーバーレイの
@@ -1203,6 +1248,10 @@ pub(crate) fn prepare_full_visible(
     ctx: &PolicyContext,
     arena: &VectorArena,
 ) -> PreparedHnswSearch {
+    let Some(metric) = access.graph_metric else {
+        // metric が未解決（結線漏れ・未対応 metric）。誤ったグラフを引かないよう全件へ倒す。
+        return PreparedHnswSearch::FullScan;
+    };
     let n = arena.len();
     if n < MIN_INDEXED_ROWS {
         // 現在のクエリが見ている世代より新しいエントリは巻き添えにしない
@@ -1216,7 +1265,10 @@ pub(crate) fn prepare_full_visible(
         return PreparedHnswSearch::FullScan;
     }
 
-    let base = match access.cache.lookup(access.storage, read_txn, table, ctx) {
+    let base = match access
+        .cache
+        .lookup(access.storage, read_txn, table, ctx, metric)
+    {
         Lookup::BuildFailedThisGeneration => return PreparedHnswSearch::FullScan,
         Lookup::Ready(base, overlay) => {
             return PreparedHnswSearch::Indexed {
@@ -1236,6 +1288,7 @@ pub(crate) fn prepare_full_visible(
                 arena,
                 access.provider.params(),
                 access.provider.resident_precision(),
+                metric,
                 ctx.clone(),
                 current_generation,
             ) {
@@ -1256,7 +1309,7 @@ pub(crate) fn prepare_full_visible(
                 }
                 Err(_) => {
                     access.cache.build_failures.fetch_add(1, Ordering::Relaxed);
-                    record_build_failed(access, table, ctx, current_generation);
+                    record_build_failed(access, table, ctx, metric, current_generation);
                     return PreparedHnswSearch::FullScan;
                 }
             }
@@ -1268,7 +1321,7 @@ pub(crate) fn prepare_full_visible(
     let Ok(current_generation) = crate::catalog::table_generation_in_txn(read_txn, table) else {
         return PreparedHnswSearch::FullScan;
     };
-    if base.arena_identity_mismatch_guard(arena, ctx) {
+    if base.arena_identity_mismatch_guard(arena, ctx, metric) {
         // 呼び出し元の適用条件（フィルタなし DISTANCE）が正しく守られていれば
         // 起こらないはずの不整合。fail-closed に全件へ縮退するだけでなく、
         // 不整合な `base` を保持するエントリ自体をキャッシュから退避する
@@ -1293,6 +1346,7 @@ pub(crate) fn prepare_full_visible(
             arena,
             access.provider.params(),
             access.provider.resident_precision(),
+            metric,
             ctx.clone(),
             current_generation,
         ) {
@@ -1361,7 +1415,7 @@ pub(crate) fn prepare_full_visible(
             }
             Err(_) => {
                 access.cache.build_failures.fetch_add(1, Ordering::Relaxed);
-                record_build_failed(access, table, ctx, current_generation);
+                record_build_failed(access, table, ctx, metric, current_generation);
                 PreparedHnswSearch::FullScan
             }
         }
@@ -1694,13 +1748,19 @@ pub(crate) fn prepare_subset(
     ctx: &PolicyContext,
     arena: &VectorArena,
 ) -> PreparedHnswSearch {
-    let base = match access.cache.lookup(access.storage, read_txn, table, ctx) {
+    let Some(metric) = access.graph_metric else {
+        return PreparedHnswSearch::FullScan;
+    };
+    let base = match access
+        .cache
+        .lookup(access.storage, read_txn, table, ctx, metric)
+    {
         Lookup::BuildFailedThisGeneration | Lookup::Miss => return PreparedHnswSearch::FullScan,
         Lookup::Ready(base, _full_arena_overlay) => base,
         Lookup::NeedOverlay(base) => base,
     };
 
-    if base.arena_identity_mismatch_guard(arena, ctx) {
+    if base.arena_identity_mismatch_guard(arena, ctx, metric) {
         // `FullVisible` 経路（`prepare_full_visible`）と異なり、ここでは巻き添えを
         // 避けるためエントリを退避しない（この不整合は通常発生しない防御的
         // 経路であり、`FullVisible` クエリが正しく参照し続けられる余地を
@@ -1834,7 +1894,14 @@ pub(crate) fn prepare_subset_from_slots(
         SubsetSlotPlan::MaskScan
     };
 
-    let base = match access.cache.lookup(access.storage, read_txn, table, ctx) {
+    let Some(metric) = access.graph_metric else {
+        access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+        return mask_scan(access);
+    };
+    let base = match access
+        .cache
+        .lookup(access.storage, read_txn, table, ctx, metric)
+    {
         Lookup::BuildFailedThisGeneration | Lookup::Miss => {
             access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
             return mask_scan(access);
@@ -1843,7 +1910,7 @@ pub(crate) fn prepare_subset_from_slots(
         Lookup::NeedOverlay(base) => base,
     };
 
-    if base.arena_identity_mismatch_guard(snapshot_arena, ctx) {
+    if base.arena_identity_mismatch_guard(snapshot_arena, ctx, metric) {
         access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
         return mask_scan(access);
     }
@@ -1925,8 +1992,16 @@ impl IndexedBase {
     ///
     /// 一致していれば `false`（検証通過）、いずれか不一致なら `true`
     /// （呼び出し元は全件 brute-force へ縮退する）を返す。
-    fn arena_identity_mismatch_guard(&self, arena: &VectorArena, ctx: &PolicyContext) -> bool {
-        self.index.dim() != arena.dim() || self.built_ctx != *ctx
+    ///
+    /// 3 つ目として、本ベースの物理グラフ metric が要求 `metric` と一致することも確認する
+    /// （Issue #2000。metric 違いのグラフで別の距離の問い合わせに答えない最終防御）。
+    fn arena_identity_mismatch_guard(
+        &self,
+        arena: &VectorArena,
+        ctx: &PolicyContext,
+        metric: HnswMetric,
+    ) -> bool {
+        self.index.dim() != arena.dim() || self.built_ctx != *ctx || self.index.metric() != metric
     }
 }
 
@@ -1934,6 +2009,7 @@ fn record_build_failed(
     access: &HnswCacheAccess<'_>,
     table: &str,
     ctx: &PolicyContext,
+    metric: HnswMetric,
     generation: u64,
 ) {
     let Ok(mut guard) = access.cache.state.write() else {
@@ -1948,7 +2024,7 @@ fn record_build_failed(
     if current_generation != generation {
         return;
     }
-    mark_uncacheable_in_guard(access.cache, &mut guard, table, ctx, generation);
+    mark_uncacheable_in_guard(access.cache, &mut guard, table, ctx, metric, generation);
 }
 
 /// `(table, ctx)` の指定世代 `generation` を「この世代は brute-force へ縮退中」の
@@ -1964,12 +2040,13 @@ fn mark_uncacheable_in_guard(
     guard: &mut std::sync::RwLockWriteGuard<'_, HnswCacheState>,
     table: &str,
     ctx: &PolicyContext,
+    metric: HnswMetric,
     generation: u64,
 ) {
     if let Some(entry) = guard
         .entries
         .iter_mut()
-        .find(|e| e.table == table && e.built_ctx == *ctx)
+        .find(|e| e.table == table && e.built_ctx == *ctx && e.metric == metric)
     {
         entry.build_failed_generation = Some(generation);
         return;
@@ -1985,6 +2062,7 @@ fn mark_uncacheable_in_guard(
     guard.entries.push(HnswCacheEntry {
         table: table.to_string(),
         built_ctx: ctx.clone(),
+        metric,
         base: None,
         overlay: None,
         build_failed_generation: Some(generation),
@@ -2033,6 +2111,7 @@ fn record_overlay_for(
             &mut guard,
             table,
             &base.built_ctx,
+            base.index.metric(),
             current_generation,
         );
         return;
@@ -2057,6 +2136,7 @@ fn record_overlay_for(
         .find(|e| {
             e.table == table
                 && e.built_ctx == base.built_ctx
+                && e.metric == base.index.metric()
                 && e.base.as_ref().is_some_and(|b| Arc::ptr_eq(b, base))
         })
         .and_then(|e| e.overlay.as_ref())
@@ -2067,6 +2147,7 @@ fn record_overlay_for(
     if let Some(entry) = guard.entries.iter_mut().find(|e| {
         e.table == table
             && e.built_ctx == base.built_ctx
+            && e.metric == base.index.metric()
             && e.base.as_ref().is_some_and(|b| Arc::ptr_eq(b, base))
     }) {
         entry.overlay = Some(overlay);
@@ -2333,7 +2414,12 @@ fn finish_indexed_search(
             fell_back.set(true);
             return full_scan_with_arena(provider, arena, query, k);
         };
-        let score = crate::kernel::dot(vec_at_slot, query);
+        let Some(score) = rescore_indexed_hit(base.index.metric(), vec_at_slot, query) else {
+            // 再採点が未対応の metric（delta・全走査の score 定義と揃えられない）。
+            access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+            fell_back.set(true);
+            return full_scan_with_arena(provider, arena, query, k);
+        };
         mapped.push(CandidateHit {
             id: slot as u64,
             score,
@@ -2555,6 +2641,38 @@ pub(crate) fn ann_plan_for_direction(
         AnnPlan::PlainScanLimitOmitted
     } else {
         plan
+    }
+}
+
+/// 索引ヒットを現在のスロットのベクトルで再採点する score 関数（Issue #2000）。
+///
+/// 未索引分（delta）と縮退時の全走査は provider の内積 `search` だけで採点するため、再採点も
+/// それと同じ定義でなければ候補の score が混ざる。よって現状は `InnerProduct` のみ
+/// `kernel::dot` とビット同一の `score_f32` を返し、それ以外は `None`（呼び出し元は全走査へ
+/// 縮退する。fail-closed）。`Cosine` へ `score_f32` をそのまま使うと正規化していない生
+/// ベクトルの内積になって誤るため、Cosine を写像へ足すときは delta・全走査も含めて
+/// コサインの score 定義に揃えること。
+fn rescore_indexed_hit(metric: HnswMetric, row: &[f32], query: &[f32]) -> Option<f32> {
+    match metric {
+        HnswMetric::InnerProduct => Some(metric.score_f32(row, query)),
+        HnswMetric::L2 | HnswMetric::Cosine | HnswMetric::L1 => None,
+    }
+}
+
+/// 問い合わせ側 opclass が引く物理 HNSW グラフの metric（世代整合キャッシュのキー。
+/// Issue #2000・親 #1996。ビヘイビア INDEX-7・SQL-33・SQL-75 のポインタ）。
+///
+/// 写像は暫定値: `<=>` はコサイン距離で実行されるが、HNSW は内積グラフの候補を後段で
+/// 厳密なコサインへ再採点する方式のため `Cosine -> InnerProduct`。`Ip`・`L2`・`L1` は SQL 実行側が未接続のため `None`
+/// （ゲートは `MetricMismatch` となり厳密全走査）。`catalog::hnsw_supported_metric` と
+/// `is_some()` が一致することを単体テストで固定する（catalog は sql に依存しない）。
+/// Cosine を `HnswMetric::Cosine` へ切り替えるのは #2241（ゼロノルム行の除外）と
+/// `<=>` のコサイン距離化の後の follow-up。
+pub(crate) fn hnsw_graph_metric_for(query: crate::catalog::VectorOpClass) -> Option<HnswMetric> {
+    use crate::catalog::VectorOpClass;
+    match query {
+        VectorOpClass::Cosine => Some(HnswMetric::InnerProduct),
+        VectorOpClass::Ip | VectorOpClass::L2 | VectorOpClass::L1 => None,
     }
 }
 
@@ -2866,6 +2984,7 @@ mod tests {
             &arena,
             crate::hnsw::HnswParams::default(),
             crate::hnsw::ResidentPrecision::F32,
+            HnswMetric::InnerProduct,
             c.clone(),
             stale_gen,
         )
@@ -2877,7 +2996,7 @@ mod tests {
         // キャッシュへは反映されていない。
         let read_txn2 = storage.db().begin_read().unwrap();
         assert!(matches!(
-            cache.lookup(&storage, &read_txn2, "docs", &c),
+            cache.lookup(&storage, &read_txn2, "docs", &c, HnswMetric::InnerProduct),
             Lookup::Miss
         ));
         assert_eq!(cache.stats().entries, 0);
@@ -2900,6 +3019,7 @@ mod tests {
             &arena,
             crate::hnsw::HnswParams::default(),
             crate::hnsw::ResidentPrecision::F32,
+            HnswMetric::InnerProduct,
             owner.clone(),
             gen,
         )
@@ -2909,7 +3029,13 @@ mod tests {
 
         let read_txn2 = storage.db().begin_read().unwrap();
         assert!(matches!(
-            cache.lookup(&storage, &read_txn2, "docs", &other),
+            cache.lookup(
+                &storage,
+                &read_txn2,
+                "docs",
+                &other,
+                HnswMetric::InnerProduct
+            ),
             Lookup::Miss
         ));
     }
@@ -2933,6 +3059,7 @@ mod tests {
             &arena_a,
             crate::hnsw::HnswParams::default(),
             crate::hnsw::ResidentPrecision::F32,
+            HnswMetric::InnerProduct,
             c.clone(),
             gen_a,
         )
@@ -2947,6 +3074,7 @@ mod tests {
             &arena_b,
             crate::hnsw::HnswParams::default(),
             crate::hnsw::ResidentPrecision::F32,
+            HnswMetric::InnerProduct,
             c.clone(),
             gen_b,
         )
@@ -2980,6 +3108,7 @@ mod tests {
                 &arena,
                 crate::hnsw::HnswParams::default(),
                 crate::hnsw::ResidentPrecision::F32,
+                HnswMetric::InnerProduct,
                 c.clone(),
                 gen,
             )
@@ -3015,6 +3144,7 @@ mod tests {
             &arena,
             crate::hnsw::HnswParams::default(),
             crate::hnsw::ResidentPrecision::F32,
+            HnswMetric::InnerProduct,
             c.clone(),
             old_generation,
         )
@@ -3056,6 +3186,7 @@ mod tests {
             &arena0,
             crate::hnsw::HnswParams::default(),
             crate::hnsw::ResidentPrecision::F32,
+            HnswMetric::InnerProduct,
             c.clone(),
             gen0,
         )
@@ -3127,9 +3258,16 @@ mod tests {
         let params = crate::hnsw::HnswParams::default();
         let precision = crate::hnsw::ResidentPrecision::F32;
         if !cosine {
-            let built = IndexedBase::build(&arena, params, precision, c.clone(), gen0)
-                .expect("build")
-                .0;
+            let built = IndexedBase::build(
+                &arena,
+                params,
+                precision,
+                crate::hnsw::HnswMetric::InnerProduct,
+                c.clone(),
+                gen0,
+            )
+            .expect("build")
+            .0;
             return (built, gen0);
         }
         let index = HnswIndex::build_with_metric(
@@ -3142,7 +3280,15 @@ mod tests {
             1,
         )
         .expect("build cosine index");
-        let built = IndexedBase::from_index(index, &arena, precision, c.clone(), gen0).0;
+        let built = IndexedBase::from_index(
+            index,
+            crate::hnsw::HnswMetric::Cosine,
+            &arena,
+            precision,
+            c.clone(),
+            gen0,
+        )
+        .0;
         (built, gen0)
     }
 
@@ -3320,6 +3466,7 @@ mod tests {
             &arena,
             crate::hnsw::HnswParams::default(),
             crate::hnsw::ResidentPrecision::F32,
+            HnswMetric::InnerProduct,
             c.clone(),
             gen,
         )
@@ -3360,6 +3507,7 @@ mod tests {
             &arena0,
             crate::hnsw::HnswParams::default(),
             crate::hnsw::ResidentPrecision::F32,
+            HnswMetric::InnerProduct,
             c.clone(),
             gen0,
         )
@@ -3447,7 +3595,7 @@ mod tests {
 
         let read_txn = storage.db().begin_read().unwrap();
         assert!(matches!(
-            cache.lookup(&storage, &read_txn, "docs", &c),
+            cache.lookup(&storage, &read_txn, "docs", &c, HnswMetric::InnerProduct),
             Lookup::Miss
         ));
         assert_eq!(cache.stats().misses, 1);
@@ -3476,6 +3624,7 @@ mod tests {
             &arena,
             crate::hnsw::HnswParams::default(),
             crate::hnsw::ResidentPrecision::F32,
+            HnswMetric::InnerProduct,
             c.clone(),
             gen,
         )
@@ -3504,6 +3653,7 @@ mod tests {
             provider: HnswSearchProvider::new(crate::hnsw::ValidatedHnswParams::default()),
             index_gate_cache: &gate_cache,
             hnsw_scope: crate::search_engine::HnswScope::All,
+            graph_metric: Some(HnswMetric::InnerProduct),
         };
         let provider = crate::kernel::CpuScalarProvider;
         let query = [1.0, 0.0, 0.0, 0.0];
@@ -3553,6 +3703,7 @@ mod tests {
                 &arena,
                 crate::hnsw::HnswParams::default(),
                 crate::hnsw::ResidentPrecision::F32,
+                HnswMetric::InnerProduct,
                 c.clone(),
                 gen,
             )
@@ -3587,6 +3738,7 @@ mod tests {
             provider: HnswSearchProvider::new(crate::hnsw::ValidatedHnswParams::default()),
             index_gate_cache: &gate_cache,
             hnsw_scope: crate::search_engine::HnswScope::All,
+            graph_metric: Some(HnswMetric::InnerProduct),
         };
         record_overlay_for(&access, table0, base0, overlay);
 
@@ -3624,12 +3776,19 @@ mod tests {
         // ケース、または一度も構築成功していないテーブルでの初回失敗ケースに対応）。
         {
             let mut guard = cache.state.write().unwrap();
-            mark_uncacheable_in_guard(&cache, &mut guard, "docs", &c, gen);
+            mark_uncacheable_in_guard(
+                &cache,
+                &mut guard,
+                "docs",
+                &c,
+                HnswMetric::InnerProduct,
+                gen,
+            );
         }
         assert_eq!(cache.stats().entries, 1);
 
         let read_txn2 = storage.db().begin_read().unwrap();
-        match cache.lookup(&storage, &read_txn2, "docs", &c) {
+        match cache.lookup(&storage, &read_txn2, "docs", &c, HnswMetric::InnerProduct) {
             Lookup::BuildFailedThisGeneration => {}
             _ => panic!(
                 "同一世代内の lookup は BuildFailedThisGeneration を返し、\
@@ -3643,7 +3802,7 @@ mod tests {
         crate::catalog::bump_table_generation_in_txn(&write_txn, "docs").unwrap();
         crate::recovery::commit_boundary::commit(write_txn).unwrap();
         let read_txn3 = storage.db().begin_read().unwrap();
-        match cache.lookup(&storage, &read_txn3, "docs", &c) {
+        match cache.lookup(&storage, &read_txn3, "docs", &c, HnswMetric::InnerProduct) {
             Lookup::Miss => {}
             _ => panic!("世代が進んだ後は再構築を試みられるよう Miss を返すべき"),
         }
@@ -3671,6 +3830,7 @@ mod tests {
             &arena4,
             crate::hnsw::HnswParams::default(),
             crate::hnsw::ResidentPrecision::F32,
+            HnswMetric::InnerProduct,
             c_a.clone(),
             gen4,
         )
@@ -3678,14 +3838,14 @@ mod tests {
         .0;
 
         // dim・ctx とも本ベースの構築時と一致: 検証通過（fail-closed 分岐に入らない）。
-        assert!(!base.arena_identity_mismatch_guard(&arena4, &c_a));
+        assert!(!base.arena_identity_mismatch_guard(&arena4, &c_a, HnswMetric::InnerProduct));
 
         // dim 不一致（別テーブル由来のアリーナ取り違え）。
         let arena8 = build_arena(&read_txn, "docs8", &c_a);
-        assert!(base.arena_identity_mismatch_guard(&arena8, &c_a));
+        assert!(base.arena_identity_mismatch_guard(&arena8, &c_a, HnswMetric::InnerProduct));
 
         // ctx 不一致（別テナント取り違え）。
-        assert!(base.arena_identity_mismatch_guard(&arena4, &c_b));
+        assert!(base.arena_identity_mismatch_guard(&arena4, &c_b, HnswMetric::InnerProduct));
     }
 
     #[test]
@@ -3745,6 +3905,7 @@ mod tests {
             provider: HnswSearchProvider::new(crate::hnsw::ValidatedHnswParams::default()),
             index_gate_cache: &gate_cache,
             hnsw_scope: crate::search_engine::HnswScope::All,
+            graph_metric: Some(HnswMetric::InnerProduct),
         };
         let provider = crate::kernel::CpuScalarProvider;
         let query = [1.0, 0.0, 0.0, 0.0];
@@ -3831,6 +3992,7 @@ mod tests {
             provider: HnswSearchProvider::new(crate::hnsw::ValidatedHnswParams::default()),
             index_gate_cache: &gate_cache,
             hnsw_scope: crate::search_engine::HnswScope::All,
+            graph_metric: Some(HnswMetric::InnerProduct),
         };
         let provider = crate::kernel::CpuScalarProvider;
         let query = [0.5, 0.25, 0.1, 0.9];
@@ -3927,6 +4089,7 @@ mod tests {
             provider: HnswSearchProvider::new(f16_params),
             index_gate_cache: &gate_cache,
             hnsw_scope: crate::search_engine::HnswScope::All,
+            graph_metric: Some(HnswMetric::InnerProduct),
         };
         let ann_provider = crate::kernel::CpuScalarProvider;
         let default_provider = crate::kernel::CpuScalarProvider;
@@ -4060,6 +4223,7 @@ mod tests {
             provider: HnswSearchProvider::new(i8_params),
             index_gate_cache: &gate_cache,
             hnsw_scope: crate::search_engine::HnswScope::All,
+            graph_metric: Some(HnswMetric::InnerProduct),
         };
         let ann_provider = crate::kernel::CpuScalarProvider;
         let default_provider = crate::kernel::CpuScalarProvider;
@@ -4167,6 +4331,7 @@ mod tests {
             &arena,
             crate::hnsw::HnswParams::default(),
             crate::hnsw::ResidentPrecision::F32,
+            HnswMetric::InnerProduct,
             c.clone(),
             gen,
         )
@@ -4203,6 +4368,7 @@ mod tests {
             provider: HnswSearchProvider::new(crate::hnsw::ValidatedHnswParams::default()),
             index_gate_cache: &gate_cache,
             hnsw_scope: crate::search_engine::HnswScope::All,
+            graph_metric: Some(HnswMetric::InnerProduct),
         };
         record_overlay_for(&access, "docs", &base, overlay);
 
@@ -4212,7 +4378,7 @@ mod tests {
         assert_eq!(cache.stats().entries, 1);
 
         let read_txn2 = storage.db().begin_read().unwrap();
-        match cache.lookup(&storage, &read_txn2, "docs", &c) {
+        match cache.lookup(&storage, &read_txn2, "docs", &c, HnswMetric::InnerProduct) {
             Lookup::BuildFailedThisGeneration => {}
             _ => panic!(
                 "oversized overlay を破棄した世代は BuildFailedThisGeneration を返し、\
@@ -4275,6 +4441,7 @@ mod tests {
             &aux_arena,
             crate::hnsw::HnswParams::default(),
             crate::hnsw::ResidentPrecision::F32,
+            HnswMetric::InnerProduct,
             c.clone(),
             docs_gen,
         )
@@ -4303,6 +4470,7 @@ mod tests {
             provider: HnswSearchProvider::new(crate::hnsw::ValidatedHnswParams::default()),
             index_gate_cache: &gate_cache,
             hnsw_scope: crate::search_engine::HnswScope::All,
+            graph_metric: Some(HnswMetric::InnerProduct),
         };
         let provider = crate::kernel::CpuScalarProvider;
         let query = [1.0, 0.0, 0.0, 0.0];
@@ -4448,6 +4616,7 @@ mod tests {
             &full_arena,
             crate::hnsw::HnswParams::default(),
             crate::hnsw::ResidentPrecision::F32,
+            HnswMetric::InnerProduct,
             c.clone(),
             gen,
         )
@@ -4475,6 +4644,7 @@ mod tests {
             provider: HnswSearchProvider::new(params),
             index_gate_cache: &gate_cache,
             hnsw_scope: crate::search_engine::HnswScope::All,
+            graph_metric: Some(HnswMetric::InnerProduct),
         };
 
         // 5/20 = 0.25 < 0.6: 早期打ち切り分岐を踏むはずの部分集合アリーナ
@@ -4544,6 +4714,7 @@ mod tests {
             provider: HnswSearchProvider::new(crate::hnsw::ValidatedHnswParams::default()),
             index_gate_cache: &gate_cache,
             hnsw_scope: crate::search_engine::HnswScope::All,
+            graph_metric: Some(HnswMetric::InnerProduct),
         };
         let read_txn = storage.db().begin_read().unwrap();
         let arena = build_arena(&read_txn, "docs", &c);
@@ -4618,6 +4789,7 @@ mod tests {
             provider: HnswSearchProvider::new(crate::hnsw::ValidatedHnswParams::default()),
             index_gate_cache: &gate_cache,
             hnsw_scope: crate::search_engine::HnswScope::All,
+            graph_metric: Some(HnswMetric::InnerProduct),
         };
         let read_txn = storage.db().begin_read().unwrap();
         let arena = build_arena(&read_txn, "docs", &c);
@@ -4754,5 +4926,188 @@ mod tests {
             ann_plan_for_direction(AnnPlan::UnknownCustomProvider, true, false, false),
             AnnPlan::PlainScanDescending
         );
+    }
+
+    /// metric 違いのベースを登録する共通ヘルパ（Issue #2000 の単体テスト用）。
+    fn record_base_with_metric(
+        storage: &Storage,
+        cache: &HnswIndexCache,
+        c: &PolicyContext,
+        metric: HnswMetric,
+    ) -> Arc<IndexedBase> {
+        let read_txn = storage.db().begin_read().unwrap();
+        let gen = crate::catalog::table_generation_in_txn(&read_txn, "docs").unwrap();
+        let arena = build_arena(&read_txn, "docs", c);
+        let built = IndexedBase::build(
+            &arena,
+            crate::hnsw::HnswParams::default(),
+            crate::hnsw::ResidentPrecision::F32,
+            metric,
+            c.clone(),
+            gen,
+        )
+        .expect("build")
+        .0;
+        cache.record_base(storage, "docs", built)
+    }
+
+    #[test]
+    fn metric_distinguishes_cache_entries_for_the_same_table_and_ctx() {
+        // (T1) 同じ (table, ctx) でも metric が違えば別エントリとして共存し、取り違えない。
+        let path = unique_db_path("hnsw-cache-metric-coexist");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        create_table(&storage, "docs", 4);
+        let cache = HnswIndexCache::new();
+        let c = ctx("tenant-a");
+        record_base_with_metric(&storage, &cache, &c, HnswMetric::InnerProduct);
+        record_base_with_metric(&storage, &cache, &c, HnswMetric::L2);
+        assert_eq!(cache.stats().entries, 2);
+
+        for want in [HnswMetric::InnerProduct, HnswMetric::L2] {
+            let read_txn = storage.db().begin_read().unwrap();
+            match cache.lookup(&storage, &read_txn, "docs", &c, want) {
+                Lookup::NeedOverlay(base) | Lookup::Ready(base, _) => {
+                    assert_eq!(base.index.metric(), want);
+                }
+                _ => panic!("登録済み metric の lookup は自分のベースを返すこと"),
+            }
+        }
+    }
+
+    #[test]
+    fn lookup_misses_for_a_metric_that_was_never_registered() {
+        // (T2) 片方の metric だけを登録した状態で、もう片方の lookup は Miss になる。
+        let path = unique_db_path("hnsw-cache-metric-miss");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        create_table(&storage, "docs", 4);
+        let cache = HnswIndexCache::new();
+        let c = ctx("tenant-a");
+        record_base_with_metric(&storage, &cache, &c, HnswMetric::InnerProduct);
+        let read_txn = storage.db().begin_read().unwrap();
+        assert!(matches!(
+            cache.lookup(&storage, &read_txn, "docs", &c, HnswMetric::L2),
+            Lookup::Miss
+        ));
+    }
+
+    #[test]
+    fn negative_cache_is_scoped_to_the_metric_and_evict_entry_covers_all_metrics() {
+        // (T3) ある metric の構築失敗の負のキャッシュは別 metric を汚さない。
+        // evict_entry は世代ガードを守りつつ全 metric のエントリを破棄する。
+        let path = unique_db_path("hnsw-cache-metric-negative");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        create_table(&storage, "docs", 4);
+        let cache = HnswIndexCache::new();
+        let c = ctx("tenant-a");
+        let read_txn = storage.db().begin_read().unwrap();
+        let gen = crate::catalog::table_generation_in_txn(&read_txn, "docs").unwrap();
+        {
+            let mut guard = cache.state.write().unwrap();
+            mark_uncacheable_in_guard(&cache, &mut guard, "docs", &c, HnswMetric::L2, gen);
+        }
+        let read_txn2 = storage.db().begin_read().unwrap();
+        assert!(matches!(
+            cache.lookup(&storage, &read_txn2, "docs", &c, HnswMetric::L2),
+            Lookup::BuildFailedThisGeneration
+        ));
+        assert!(matches!(
+            cache.lookup(&storage, &read_txn2, "docs", &c, HnswMetric::InnerProduct),
+            Lookup::Miss
+        ));
+
+        record_base_with_metric(&storage, &cache, &c, HnswMetric::InnerProduct);
+        assert_eq!(cache.stats().entries, 2);
+        // より新しい世代のエントリは破棄しない（世代ガード維持）。
+        cache.evict_entry("docs", &c, gen.saturating_sub(1));
+        assert_eq!(cache.stats().entries, 2);
+        cache.evict_entry("docs", &c, gen);
+        assert_eq!(cache.stats().entries, 0);
+    }
+
+    #[test]
+    fn unresolved_graph_metric_falls_back_to_full_scan_without_touching_the_cache() {
+        // (T4) graph_metric が None（結線漏れ・未対応 metric）なら FullScan（fail-closed）。
+        let path = unique_db_path("hnsw-cache-metric-none");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        create_table(&storage, "docs", 4);
+        let cache = HnswIndexCache::new();
+        let c = ctx("tenant-a");
+        record_base_with_metric(&storage, &cache, &c, HnswMetric::InnerProduct);
+        let gate_cache = crate::catalog::IndexCatalogGateCache::new();
+        let mut access = HnswCacheAccess {
+            storage: &storage,
+            cache: &cache,
+            provider: HnswSearchProvider::new(crate::hnsw::ValidatedHnswParams::default()),
+            index_gate_cache: &gate_cache,
+            hnsw_scope: crate::search_engine::HnswScope::All,
+            graph_metric: None,
+        };
+        let read_txn = storage.db().begin_read().unwrap();
+        let arena = build_arena(&read_txn, "docs", &c);
+        assert!(matches!(
+            prepare_full_visible(&access, &read_txn, "docs", &c, &arena),
+            PreparedHnswSearch::FullScan
+        ));
+        assert!(matches!(
+            prepare_subset(&access, &read_txn, "docs", &c, &arena),
+            PreparedHnswSearch::FullScan
+        ));
+        let plan = prepare_subset_from_slots(&access, &read_txn, "docs", &c, &arena, &[], 1);
+        assert!(matches!(plan, SubsetSlotPlan::MaskScan));
+        assert_eq!(
+            cache.stats().entries,
+            1,
+            "None ではエントリを作らず壊さない"
+        );
+
+        // 対照: 解決済みなら同じ入力で FullScan にならない（キャッシュ済みベースを引く）。
+        access.graph_metric = Some(HnswMetric::InnerProduct);
+        assert!(!matches!(
+            prepare_subset(&access, &read_txn, "docs", &c, &arena),
+            PreparedHnswSearch::FullScan
+        ));
+        // 別 metric の解決ではキャッシュ済み IP ベースを引かない。
+        access.graph_metric = Some(HnswMetric::L2);
+        assert!(matches!(
+            prepare_subset(&access, &read_txn, "docs", &c, &arena),
+            PreparedHnswSearch::FullScan
+        ));
+    }
+
+    #[test]
+    fn graph_metric_mapping_agrees_with_catalog_gate_support() {
+        // (T5) 写像と catalog の対応 metric 判定が一致し、Cosine は暫定で内積グラフ。
+        use crate::catalog::VectorOpClass;
+        for m in [
+            VectorOpClass::Cosine,
+            VectorOpClass::Ip,
+            VectorOpClass::L2,
+            VectorOpClass::L1,
+        ] {
+            assert_eq!(
+                hnsw_graph_metric_for(m).is_some(),
+                crate::catalog::hnsw_supported_metric(m),
+                "{m:?}"
+            );
+        }
+        assert_eq!(
+            hnsw_graph_metric_for(VectorOpClass::Cosine),
+            Some(HnswMetric::InnerProduct)
+        );
+    }
+
+    #[test]
+    fn rescore_indexed_hit_is_bit_identical_to_dot_for_inner_product_only() {
+        let a = [0.25f32, -1.5, 3.0, 0.125];
+        let b = [1.0f32, 0.5, -2.0, 4.0];
+        let got = rescore_indexed_hit(HnswMetric::InnerProduct, &a, &b).expect("ip");
+        assert_eq!(got.to_bits(), crate::kernel::dot(&a, &b).to_bits());
+        for m in [HnswMetric::L2, HnswMetric::Cosine, HnswMetric::L1] {
+            assert!(rescore_indexed_hit(m, &a, &b).is_none());
+        }
     }
 }

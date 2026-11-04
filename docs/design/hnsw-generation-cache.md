@@ -61,7 +61,7 @@ Rust API（`VectorCore::search`）は本キャッシュを経由しない（`sql
 - `Overlay`: 世代 `generation` の現行アリーナに対する `IndexedBase` の差分。
   `slot_of_node`（ノード → 現スロット。失効は番兵値 `STALE_SLOT`）・
   `stale_nodes`・`delta_slots`／`delta_vectors`（未索引分の複製）を持つ
-- `HnswCacheEntry`: `(table, ctx)` 単位のエントリ。`base: Option<Arc<IndexedBase>>`
+- `HnswCacheEntry`: `(table, ctx, 物理グラフ metric)` 単位のエントリ（metric は Issue #2000）。`base: Option<Arc<IndexedBase>>`
   （`None` は「一度も構築成功していない」負のキャッシュ専用状態）・
   `overlay: Option<Arc<Overlay>>`・`build_failed_generation: Option<u64>`
 - `HnswIndexCache`: `Vec<HnswCacheEntry>` を `RwLock` で保護する本体。統計
@@ -202,6 +202,26 @@ embedding 変更は「未変更」と判定されうる。最終スコアは常�
 - 除外ノードの行が変わらず正規化できないままなら、失効にも churn にも数えない。正規化できるようになったら delta に入れる（`node_matches` が `Some(false)`）
 - 可視マスクと可視カーディナリティ比の分母は member だけで数える（`member_count`）
 - 申し送り（#2000）: キャッシュ内部の全走査縮退（`full_scan_with_arena`）でゼロノルム行を NaN として返すかどうかは、metric の結線時に決める
+
+## 物理グラフの metric とキー（Issue #2000・親 #1996。INDEX-7・SQL-33・SQL-75 ポインタ）
+
+- キーは `(table, ctx, HnswMetric)`。`lookup`・`record_base`・`record_overlay_for`・負のキャッシュ
+  （`mark_uncacheable_in_guard`）は metric まで一致したエントリだけを対象にし、metric 違いのグラフは
+  別エントリとして共存する。ある metric の構築失敗は別 metric を汚さない。
+  `evict_entry`（可視行が `MIN_INDEXED_ROWS` 未満へ縮んだ後始末）は可視行数が metric に依存しないため
+  `(table, ctx)` 一致の全 metric を対象にし、世代ガードは維持する。
+- `HnswCacheAccess::graph_metric` が問い合わせの引く metric を運ぶ。ゲートが `Targeted` で、
+  `hnsw_graph_metric_for`（問い合わせ opclass → `HnswMetric` の唯一の写像）が `Some` を返したときだけ
+  `Some`。`None` の prepare 系は `FullScan` を返す（結線漏れでも誤ったグラフを引かない）。
+  写像は暫定値で（`<=>` はコサイン距離で実行され、内積グラフの候補を後段でコサイン再採点する）、`Cosine -> InnerProduct`、`Ip`・`L2`・`L1` は未対応（`None`）。
+  `catalog::hnsw_supported_metric` との一致は単体テストで固定している。
+- 索引ヒットの再採点は索引の metric の score 関数で行う。現状は内積のみ（`kernel::dot` とビット同一）で、
+  それ以外は全走査へ縮退する（delta・全走査が provider の内積 `search` のため）。
+- 永続化: HNSW グラフ自体にディスク形式は無くメモリ上だけ。永続化されるのはカタログの宣言 opclass
+  （固定トークン）だけで、再起動後は カタログ → ゲート → 写像 → キャッシュキーの順で metric が決まる。
+  EXPLAIN の `hnsw_params: ... metric=` も同じゲート結果から導くため、キャッシュと判断元は 1 つ。
+- 申し送り: `Cosine` を `HnswMetric::Cosine` へ切り替える作業は #2241（ゼロノルム行の除外）と `<=>` の
+  コサイン距離化の後。その際は delta と全走査もコサインの score 定義に揃える。
 
 ## スコープ外・申し送り
 

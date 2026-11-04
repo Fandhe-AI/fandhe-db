@@ -7,7 +7,10 @@
 //! 修復パス・並列構築（`parallel_build`）・SQ8 探索ソース（`i8_query`）は、
 //! 距離計算をすべて本モジュールの [`HnswMetric`] 経由で呼ぶ。後続 Issue
 //! （#1998: L2・コサイン、#1999: 負の内積・L1。後者は本 Issue で完了）は variant と match の腕を足すだけで
-//! 済む。キャッシュキー・永続化・EXPLAIN への反映は #2000 の担当。
+//! 済む。キャッシュキーへの反映は #2000 で `sql::hnsw_cache` が担う（物理グラフの metric を
+//! `HnswIndex::metric` から読み、世代整合キャッシュの照合キーに含める）。永続化するのは
+//! カタログの宣言 opclass だけで、グラフ自体はメモリ上のみ。EXPLAIN の `metric=` もゲート結果
+//! から決まり、キャッシュと同じ判断元を共有する。
 //!
 //! # スコア規約
 //!
@@ -52,13 +55,14 @@ pub(crate) enum HnswMetric {
     #[default]
     InnerProduct,
     /// L2（二乗距離の符号反転。大きいほど近い）。
-    #[allow(dead_code)] // SQL 経路の結線（#2000）までは単体テストのみが構築する
+    // 本番経路の写像（`hnsw_graph_metric_for`）は暫定で InnerProduct のみ。他は単体テストが構築する（#2000）
+    #[allow(dead_code)]
     L2,
     /// コサイン（正規化済み内積への帰着。C2′）。行・クエリは [`normalize_into`] 済みが前提。
-    #[allow(dead_code)] // 同上
+    #[allow(dead_code)] // L2 と同様に単体テストのみが構築する
     Cosine,
     /// L1（マンハッタン距離の符号反転。大きいほど近い）。`<+>` 用。
-    #[allow(dead_code)] // 同上
+    #[allow(dead_code)] // L2 と同様に単体テストのみが構築する
     L1,
 }
 
