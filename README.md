@@ -575,11 +575,11 @@ HNSW（opt-in）の探索幅は、各セッションが `SET hnsw.ef_search = 20
 `strict_order`／`relaxed_order` は事後フィルタ後の件数が目標に届くまで取得件数を倍々に増やして再探索し、
 `max_scan_tuples`（SQL-46 の走査行数上限と `MAX_SEARCH_K`＝10,000 も超えない）に達するとエラーにせずそれまでの結果を返します。
 `off` は反復せず `ef_search` 件で打ち切ります。`relaxed_order` は現状 `strict_order` と同じ動作です。
-範囲外・不正値は `22023`、`SET LOCAL` は `0A000`。反復して再探索するのは HNSW を使える kNN の DISTANCE 先行で WHERE があるときだけです。
+範囲外・不正値は `22023`、`SET LOCAL` は明示トランザクション内で適用され COMMIT 時に復元されます（`hnsw.ef_search` の `SET LOCAL` は未対応で `0A000`）。反復して再探索するのは HNSW を使える kNN の DISTANCE 先行で WHERE があるときだけです。
 一方 `off` の `ef_search` 打ち切りは、HINT なしの通常 kNN や WHERE なしを含め、HNSW を使える kNN 全般に効きます
 （例: `hnsw.ef_search = 5` かつ `off` なら `LIMIT 20` も最大 5 件）。
 厳密走査・ハイブリッドの結果と `USING MODE` は変わらず、NoSQL（HTTP）表層は既定値で動きます。
-範囲外・不正値は `22023`、`SET LOCAL` は `0A000` です。NoSQL（HTTP）表層には SET の手段がなく既定値で動きます。
+範囲外・不正値は `22023`、`SET LOCAL` は明示トランザクション内で適用され COMMIT 時に復元されます（`hnsw.ef_search` の `SET LOCAL` は未対応で `0A000`）。NoSQL（HTTP）表層には SET の手段がなく既定値で動きます。
 
 `--read-timeout-secs <N>`（既定 30・範囲 `1`〜`600` 秒）・`--max-connections <N>`（既定 64・範囲 `1`〜`256`）・
 `--max-prepared-statements <N>`（既定 64・範囲 `1`〜`1,024`。名前付きのみ数え、無名は数えない）（Issue #2454・WIRE-25）は、
