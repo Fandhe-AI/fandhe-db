@@ -129,19 +129,24 @@ fn check_projected_query_matches(
             expr:
                 Expr::VectorDistance {
                     kind: item_kind,
+                    lhs,
                     rhs,
-                    ..
                 },
             ..
         } = item
         else {
             continue;
         };
-        let Expr::String(item_literal) = rhs.as_ref() else {
+        // リテラルは左右どちらにも置ける（`'[..]'::halfvec <=> h` 等）。キャストは外して中の文字列を見る。
+        let Some(item_literal) =
+            distance_operand_literal(rhs).or_else(|| distance_operand_literal(lhs))
+        else {
             continue;
         };
         if *item_kind != kind {
-            continue;
+            return Err(SqlSurfaceError::feature_not_supported(
+                "a projected distance must use the same operator as the distance ORDER BY",
+            ));
         }
         if let (Some(a), Some(b)) = (&order_bits, rounded(item_literal)) {
             if *a != b {
@@ -152,4 +157,13 @@ fn check_projected_query_matches(
         }
     }
     Ok(())
+}
+
+/// 距離式の被演算子が（キャストで包まれていてもよい）文字列リテラルなら、その文字列を返す。
+fn distance_operand_literal(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::String(s) => Some(s.as_str()),
+        Expr::Cast { expr, .. } => distance_operand_literal(expr),
+        _ => None,
+    }
 }

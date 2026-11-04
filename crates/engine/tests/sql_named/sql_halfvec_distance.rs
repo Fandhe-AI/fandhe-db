@@ -512,6 +512,17 @@ fn projected_query_mismatch_and_precision_fail_closed() {
         ),
         "0A000"
     );
+    // 演算子違い・左辺リテラルの投影距離は、構文段か本検査のどちらかで必ず拒否される（fail-closed）。
+    for sql in [
+        "SELECT h <#> '[1,0]' FROM t ORDER BY h <=> '[1,0]' LIMIT 1",
+        "SELECT '[0,1]' <=> h FROM t ORDER BY h <=> '[1,0]' LIMIT 1",
+        "SELECT '[0,1]'::halfvec <=> h FROM t ORDER BY h <=> '[1,0]' LIMIT 1",
+    ] {
+        assert!(
+            ["42601", "0A000"].contains(&code(&core, sql).as_str()),
+            "{sql}"
+        );
+    }
     // precision（セッション変数）は確信度ゲートを持たない scan 経路へ写さず拒否する。
     let mut s = SessionState::default();
     s.set_search_mode(engine::sql::mode::SearchMode::Precision);
