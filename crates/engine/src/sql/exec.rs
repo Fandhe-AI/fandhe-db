@@ -208,6 +208,20 @@ fn try_alloc_int8vec_for_budget(
     Ok(owned)
 }
 
+/// [`try_alloc_bytes_for_budget`] の `SPARSEVEC(N)` 版（Issue #2025）。検証済みフレーム本体から
+/// 値を複製する。出力時にテキストへ整形されるため、整形後のおおよその大きさ（非ゼロ 1 要素あたり
+/// 32 バイト）で予算へ計上する。
+fn try_alloc_sparsevec_for_budget(
+    body: &[u8],
+    budget: &mut usize,
+    cap: usize,
+) -> Result<crate::sparse_vector::SparseVector, ArenaError> {
+    let nnz = body.len().saturating_sub(8) / 8;
+    *budget = try_accumulate_budget(*budget, nnz.saturating_mul(32), cap)?;
+    row_codec::sparsevec_bytes_to_value(body)
+        .map_err(|e| ArenaError::AllocationFailed(format!("failed to copy sparsevec field: {e:?}")))
+}
+
 /// [`try_alloc_text_for_budget`] の `BYTEA` 版（Issue #886）。UTF-8 検証が
 /// 無い点のみ異なり、累計バイト量の予算管理・確保失敗時の扱いは共有する。
 fn try_alloc_bytes_for_budget(
@@ -290,6 +304,10 @@ pub enum Cell {
     /// `BIT(n)` 列の投影結果（TABLE-48・Issue #2021）。テキスト整形は
     /// [`crate::bit_string::BitString::format_text`]（`0`／`1` の並び）に委譲する。
     Bit(crate::bit_string::BitString),
+    /// `SPARSEVEC(N)` 列の値（TABLE-47・Issue #2025）。テキスト出力は
+    /// [`crate::sparse_vector::SparseVector::format_text`]（`{1:1,3:2}/5`）。`Text` や `Vector` を
+    /// 流用しない（式・集合演算・サブクエリの値族判定で比較を通してしまうのを防ぐ fail-closed）。
+    SparseVec(crate::sparse_vector::SparseVector),
     /// 配列列（TABLE-14・TASK-198、Issue #888）の投影結果。
     Array(row_codec::ArrayValue),
     /// `BYTEA` 列の投影結果（Issue #886）。
@@ -663,6 +681,8 @@ fn candidate_value_to_scalar_ref<'a>(
         Value::HalfVec(_) => Some(ScalarRef::Bytes(&[])),
         // INT8VEC も同じ理由で型不一致の `Bytes(&[])` を返して fail-closed にする（Issue #2018）。
         Value::Int8Vec(_) => Some(ScalarRef::Bytes(&[])),
+        // SPARSEVEC も同じ理由で型不一致の `Bytes(&[])` を返して fail-closed にする（Issue #2025）。
+        Value::SparseVec(_) => Some(ScalarRef::Bytes(&[])),
         Value::Bytes(b) => Some(ScalarRef::Bytes(b.as_slice())),
         Value::Json(t) => Some(ScalarRef::Json(t.as_str())),
         Value::Enum(label) => Some(ScalarRef::Enum(label.as_str())),
@@ -1844,6 +1864,14 @@ pub(crate) fn execute_statement_with_cache(
                             MAX_CANDIDATE_SCALAR_BYTES,
                         )?;
                         kept.push(Value::Int8Vec(owned));
+                    }
+                    Some(row_codec::ScalarRef::SparseVec(body)) => {
+                        let owned = try_alloc_sparsevec_for_budget(
+                            body,
+                            &mut candidate_scalar_bytes,
+                            MAX_CANDIDATE_SCALAR_BYTES,
+                        )?;
+                        kept.push(Value::SparseVec(owned));
                     }
                     Some(row_codec::ScalarRef::Array(array_ref)) => {
                         let value = try_alloc_array_for_budget(
@@ -3532,6 +3560,16 @@ fn decode_deferred_scalars(
                     })?;
                 out.push(Value::Int8Vec(owned));
             }
+            Some(row_codec::ScalarRef::SparseVec(body)) => {
+                let owned =
+                    try_alloc_sparsevec_for_budget(body, budget, MAX_CANDIDATE_SCALAR_BYTES)
+                        .map_err(|_| {
+                            SqlSurfaceError::payload_too_large(
+                                "deferred scalar projection exceeds candidate budget",
+                            )
+                        })?;
+                out.push(Value::SparseVec(owned));
+            }
             Some(row_codec::ScalarRef::Array(array_ref)) => {
                 let value =
                     try_alloc_array_for_budget(array_ref, budget, MAX_CANDIDATE_SCALAR_BYTES)
@@ -3819,6 +3857,7 @@ fn project_rows(
                                 | Some(Value::Bit(_))
                                 | Some(Value::HalfVec(_))
                                 | Some(Value::Int8Vec(_))
+                                | Some(Value::SparseVec(_))
                                 | Some(Value::Array(_))
                                 | Some(Value::Bytes(_))
                                 | Some(Value::Json(_))
@@ -3850,6 +3889,7 @@ fn project_rows(
                             | Some(Value::Bit(_))
                             | Some(Value::HalfVec(_))
                             | Some(Value::Int8Vec(_))
+                            | Some(Value::SparseVec(_))
                             | Some(Value::Array(_))
                             | Some(Value::Bytes(_))
                             | Some(Value::Json(_))
@@ -3878,6 +3918,7 @@ fn project_rows(
                             | Some(Value::Bit(_))
                             | Some(Value::HalfVec(_))
                             | Some(Value::Int8Vec(_))
+                            | Some(Value::SparseVec(_))
                             | Some(Value::Array(_))
                             | Some(Value::Bytes(_))
                             | Some(Value::Json(_))
@@ -3933,6 +3974,7 @@ fn project_rows(
                             | Some(Value::Bit(_))
                             | Some(Value::HalfVec(_))
                             | Some(Value::Int8Vec(_))
+                            | Some(Value::SparseVec(_))
                             | Some(Value::Array(_))
                             | Some(Value::Bytes(_))
                             | Some(Value::Json(_))
@@ -3961,6 +4003,7 @@ fn project_rows(
                             | Some(Value::Bit(_))
                             | Some(Value::HalfVec(_))
                             | Some(Value::Int8Vec(_))
+                            | Some(Value::SparseVec(_))
                             | Some(Value::Array(_))
                             | Some(Value::Bytes(_))
                             | Some(Value::Json(_))
@@ -3989,6 +4032,7 @@ fn project_rows(
                             | Some(Value::Bit(_))
                             | Some(Value::HalfVec(_))
                             | Some(Value::Int8Vec(_))
+                            | Some(Value::SparseVec(_))
                             | Some(Value::Array(_))
                             | Some(Value::Bytes(_))
                             | Some(Value::Json(_))
@@ -4017,6 +4061,7 @@ fn project_rows(
                             | Some(Value::Bit(_))
                             | Some(Value::HalfVec(_))
                             | Some(Value::Int8Vec(_))
+                            | Some(Value::SparseVec(_))
                             | Some(Value::Array(_))
                             | Some(Value::Bytes(_))
                             | Some(Value::Json(_))
@@ -4045,6 +4090,7 @@ fn project_rows(
                             | Some(Value::Bit(_))
                             | Some(Value::HalfVec(_))
                             | Some(Value::Int8Vec(_))
+                            | Some(Value::SparseVec(_))
                             | Some(Value::Array(_))
                             | Some(Value::Bytes(_))
                             | Some(Value::Json(_))
@@ -4073,6 +4119,7 @@ fn project_rows(
                             | Some(Value::Bit(_))
                             | Some(Value::HalfVec(_))
                             | Some(Value::Int8Vec(_))
+                            | Some(Value::SparseVec(_))
                             | Some(Value::Array(_))
                             | Some(Value::Bytes(_))
                             | Some(Value::Json(_))
@@ -4090,6 +4137,7 @@ fn project_rows(
                             Some(Value::Bit(_))
                             | Some(Value::HalfVec(_))
                             | Some(Value::Int8Vec(_))
+                            | Some(Value::SparseVec(_))
                             | Some(Value::Integer(_))
                             | Some(Value::BigInt(_))
                             | Some(Value::Vector(_))
@@ -4133,6 +4181,16 @@ fn project_rows(
                                 })
                             }
                         },
+                        // SPARSEVEC は専用の `Cell::SparseVec` で返す（Issue #2025・TABLE-47）。
+                        ColumnType::SparseVec(_) => match decoded.get(*index) {
+                            Some(Value::SparseVec(v)) => cells.push(Cell::SparseVec(v.clone())),
+                            Some(Value::Null) | None => cells.push(Cell::Null),
+                            Some(_) => {
+                                return Err(SqlSurfaceError::Internal {
+                                    detail: "scalar payload type mismatch".to_string(),
+                                })
+                            }
+                        },
                         ColumnType::Bit(_) => match decoded.get(*index) {
                             Some(Value::Bit(v)) => cells.push(Cell::Bit(v.clone())),
                             Some(Value::Null) | None => cells.push(Cell::Null),
@@ -4163,6 +4221,7 @@ fn project_rows(
                             | Some(Value::Bit(_))
                             | Some(Value::HalfVec(_))
                             | Some(Value::Int8Vec(_))
+                            | Some(Value::SparseVec(_))
                             | Some(Value::Bytes(_))
                             | Some(Value::Json(_))
                             | Some(Value::Enum(_))
@@ -4201,6 +4260,7 @@ fn project_rows(
                             | Some(Value::Bit(_))
                             | Some(Value::HalfVec(_))
                             | Some(Value::Int8Vec(_))
+                            | Some(Value::SparseVec(_))
                             | Some(Value::Array(_))
                             | Some(Value::Json(_))
                             | Some(Value::Enum(_))
@@ -4229,6 +4289,7 @@ fn project_rows(
                             | Some(Value::Bit(_))
                             | Some(Value::HalfVec(_))
                             | Some(Value::Int8Vec(_))
+                            | Some(Value::SparseVec(_))
                             | Some(Value::Array(_))
                             | Some(Value::Bytes(_))
                             | Some(Value::Enum(_))
@@ -4257,6 +4318,7 @@ fn project_rows(
                             | Some(Value::Bit(_))
                             | Some(Value::HalfVec(_))
                             | Some(Value::Int8Vec(_))
+                            | Some(Value::SparseVec(_))
                             | Some(Value::Array(_))
                             | Some(Value::Bytes(_))
                             | Some(Value::Json(_))
@@ -4285,6 +4347,7 @@ fn project_rows(
                             | Some(Value::Bit(_))
                             | Some(Value::HalfVec(_))
                             | Some(Value::Int8Vec(_))
+                            | Some(Value::SparseVec(_))
                             | Some(Value::Array(_))
                             | Some(Value::Bytes(_))
                             | Some(Value::Json(_))

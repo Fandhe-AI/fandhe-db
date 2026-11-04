@@ -287,6 +287,8 @@ pub(crate) fn cell_payload_bytes(cell: &Cell) -> usize {
         Cell::Bytes(b) => b.len(),
         // wire／HTTP 応答のテキスト展開（ビット数と同じ文字数）後の大きさで課金する。
         Cell::Bit(v) => usize::try_from(v.bit_len()).unwrap_or(usize::MAX),
+        // SPARSEVEC はテキスト整形後のおおよその大きさ（非ゼロ 1 要素あたり 32 バイト）で課金する。
+        Cell::SparseVec(v) => v.nnz().saturating_mul(32),
         Cell::Json(s) => s.len(),
         Cell::Numeric(d) => d.to_string().len(),
         Cell::Vector(v) => v.len().saturating_mul(std::mem::size_of::<f32>()),

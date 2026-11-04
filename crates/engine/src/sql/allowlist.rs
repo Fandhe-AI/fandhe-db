@@ -108,6 +108,7 @@ const CREATE_TABLE_COLUMN_TYPE_KEYWORDS: &[&str] = &[
     "VECTOR",
     "HALFVEC",
     "INT8VEC",
+    "SPARSEVEC",
     "INTEGER",
     "INT",
     "INT4",
@@ -31071,7 +31072,7 @@ mod tests {
             assert!(is_column_type_keyword(kw), "{kw}");
             assert!(is_column_type_keyword(&kw.to_ascii_lowercase()), "{kw}");
         }
-        assert_eq!(CREATE_TABLE_COLUMN_TYPE_KEYWORDS.len(), 41);
+        assert_eq!(CREATE_TABLE_COLUMN_TYPE_KEYWORDS.len(), 42);
         for ok in ["Int4", "iNt8", "float4", "FLOAT8", "int", "int2", "varchar"] {
             assert!(is_column_type_keyword(ok), "{ok}");
         }

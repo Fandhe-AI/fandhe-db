@@ -3803,6 +3803,8 @@ const CREATE_ONLY_RESERVED_TYPE_NAMES: &[&str] = &[
     "halfvec",
     // Issue #2018（TABLE-49）。`INT8VEC` は型名解決表の語（括弧付きでのみ列型になる）。
     "int8vec",
+    // Issue #2025（TABLE-47）。`SPARSEVEC` は型名解決表の語（括弧付きでのみ列型になる）。
+    "sparsevec",
 ];
 
 /// カタログ層の公開エラー型。`redb` 操作由来のエラーは `Backend` に一本化し、
@@ -4388,6 +4390,16 @@ pub enum ColumnType {
     /// 兄弟 Issue（#2019）、PK・UNIQUE・索引・述語・並べ替え・集計・式・CAST・型変更は
     /// fail-closed（ワイルドカード腕を置かない）。
     Int8Vec(u32),
+    /// 疎ベクトル列（`SPARSEVEC(N)`、TABLE-47・Issue #2025）。`N` は宣言次元
+    /// （`1..=`[`crate::sparse_vector::MAX_SPARSEVEC_DIM`]。疎表現なので密に展開しない）。値は
+    /// 非ゼロ要素（位置・値）を位置昇順で持つ [`crate::sparse_vector::SparseVector`]
+    /// （[`crate::row_codec::Value::SparseVec`]）としてスカラーペイロードへ保存する
+    /// （embedding スロットは使わない）。カタログタグは `sparsevec`・param は `N` の 10 進。
+    /// [`Self::is_vector`] は `false` のまま（HNSW・embedding・DROP 保護へ流入させない）。
+    /// VECTOR・HALFVEC・INT8VEC とは合わせて表に 0〜1 本（[`Self::is_vector_family`]）。距離計算・
+    /// kNN は兄弟 Issue（#2026）、PK・UNIQUE・索引・述語・並べ替え・集計・式・CAST・型変更は
+    /// fail-closed（ワイルドカード腕を置かない）。
+    SparseVec(u32),
     /// 符号付き 16 ビット整数列（`SMALLINT`／`INT2`、TABLE-30・Issue #1558）。
     /// 値表現（[`crate::row_codec::Value::Integer`]・行ペイロードの `i32 LE` 5 バイト）は
     /// [`ColumnType::Integer`] と共有し、違いはカタログタグ（`smallint`）と値の範囲
@@ -4492,12 +4504,16 @@ impl ColumnType {
         matches!(self, ColumnType::Vector(_))
     }
 
-    /// `VECTOR`・`HALFVEC`・`INT8VEC` 列かどうか（表あたりの本数制約用。Issue #2014・#2018）。
+    /// `VECTOR`・`HALFVEC`・`INT8VEC`・`SPARSEVEC` 列かどうか（表あたりの本数制約用。
+    /// Issue #2014・#2018・#2025）。
     /// embedding スロット・HNSW・DROP 保護の判定には [`Self::is_vector`] を使う。
     pub fn is_vector_family(&self) -> bool {
         matches!(
             self,
-            ColumnType::Vector(_) | ColumnType::HalfVec(_) | ColumnType::Int8Vec(_)
+            ColumnType::Vector(_)
+                | ColumnType::HalfVec(_)
+                | ColumnType::Int8Vec(_)
+                | ColumnType::SparseVec(_)
         )
     }
 
@@ -4663,6 +4679,8 @@ impl ColumnType {
             ColumnType::HalfVec(_) => 0,
             // `Int8Vec` も PK／UNIQUE 非許可（Issue #2018。fail-closed）。
             ColumnType::Int8Vec(_) => 0,
+            // `SparseVec` も PK／UNIQUE 非許可（Issue #2025。fail-closed）。
+            ColumnType::SparseVec(_) => 0,
             ColumnType::Bytea => 7,
             ColumnType::Uuid => 8,
             ColumnType::Enum(_) => 9,
@@ -4694,6 +4712,7 @@ impl ColumnType {
             ColumnType::Vector(dim) => ("vector", dim.to_string()),
             ColumnType::HalfVec(dim) => ("halfvec", dim.to_string()),
             ColumnType::Int8Vec(dim) => ("int8vec", dim.to_string()),
+            ColumnType::SparseVec(dim) => ("sparsevec", dim.to_string()),
             ColumnType::SmallInt => ("smallint", "-".to_string()),
             ColumnType::Integer => ("integer", "-".to_string()),
             ColumnType::BigInt => ("bigint", "-".to_string()),
@@ -4786,6 +4805,24 @@ impl ColumnType {
                     )));
                 }
                 Ok(ColumnType::Int8Vec(dim))
+            }
+            "sparsevec" => {
+                // 正準 10 進のみ受理する（Issue #2025）。次元上限は VECTOR と別（疎表現）。
+                let dim: u32 = if !param.is_empty() && param.bytes().all(|b| b.is_ascii_digit()) {
+                    param.parse().ok()
+                } else {
+                    None
+                }
+                .ok_or_else(|| {
+                    CatalogError::Invalid(format!("malformed sparsevec dimension: {param:?}"))
+                })?;
+                validate_sparsevec_dim(dim)?;
+                if dim.to_string() != param {
+                    return Err(CatalogError::Invalid(format!(
+                        "non-canonical sparsevec dimension: {param:?}"
+                    )));
+                }
+                Ok(ColumnType::SparseVec(dim))
             }
             "smallint" => {
                 if param != "-" {
@@ -7700,6 +7737,7 @@ fn is_non_frame_equivalent_type(ty: &ColumnType) -> bool {
         ColumnType::Vector(_)
         | ColumnType::HalfVec(_)
         | ColumnType::Int8Vec(_)
+        | ColumnType::SparseVec(_)
         | ColumnType::Enum(_)
         | ColumnType::Json
         | ColumnType::Jsonb => true,
@@ -8653,6 +8691,7 @@ impl TableSchema {
             | ColumnType::Bit(_)
             | ColumnType::HalfVec(_)
             | ColumnType::Int8Vec(_)
+            | ColumnType::SparseVec(_)
             | ColumnType::Bytea
             | ColumnType::Json
             | ColumnType::Jsonb
@@ -8828,6 +8867,22 @@ fn validate_vector_dim(dim: u32) -> Result<()> {
     Ok(())
 }
 
+/// `SPARSEVEC(N)` の次元数検証（TABLE-47・Issue #2025）。疎表現なので VECTOR の上限
+/// （`MAX_VECTOR_DIM`）ではなく [`crate::sparse_vector::MAX_SPARSEVEC_DIM`] を上限にする。
+fn validate_sparsevec_dim(dim: u32) -> Result<()> {
+    if dim == 0 {
+        return Err(CatalogError::Invalid(
+            "SPARSEVEC dimension must not be zero".to_string(),
+        ));
+    }
+    if dim > crate::sparse_vector::MAX_SPARSEVEC_DIM {
+        return Err(CatalogError::Invalid(format!(
+            "SPARSEVEC dimension too large: {dim}"
+        )));
+    }
+    Ok(())
+}
+
 /// `NUMERIC(precision, scale)` の宣言制約検証（TABLE-13〔検討中〕・TASK-197、
 /// Issue #885・D1）。`1 <= precision <= MAX_PRECISION`・`0 <= scale <= precision`
 /// を満たさない宣言は encode・decode 両側で fail-closed に拒否する。
@@ -8888,6 +8943,9 @@ fn validate_column(column: &ColumnDef) -> Result<()> {
         &column.ty
     {
         validate_vector_dim(*dim)?;
+    }
+    if let ColumnType::SparseVec(dim) = &column.ty {
+        validate_sparsevec_dim(*dim)?;
     }
     if let ColumnType::Numeric { precision, scale } = column.ty {
         validate_numeric_precision_scale(precision, scale)?;
@@ -19734,6 +19792,67 @@ mod tests {
         assert!(validate_identifier("a\nb").is_err());
         assert!(validate_identifier("héllo").is_err());
         assert!(validate_identifier(&"a".repeat(MAX_IDENTIFIER_LEN + 1)).is_err());
+    }
+
+    /// SPARSEVEC は VECTOR・HALFVEC・INT8VEC と合わせて表に高々 1 本（TABLE-47・Issue #2025）。
+    #[test]
+    fn validate_schema_counts_sparsevec_toward_the_vector_family_limit() {
+        let build = |a: ColumnType, b: ColumnType| {
+            TableSchema::new(
+                "docs",
+                vec![ColumnDef::new("a", a, true), ColumnDef::new("b", b, true)],
+            )
+        };
+        assert!(validate_schema(&build(ColumnType::Vector(4), ColumnType::SparseVec(4))).is_err());
+        assert!(validate_schema(&build(ColumnType::HalfVec(4), ColumnType::SparseVec(4))).is_err());
+        assert!(validate_schema(&build(ColumnType::Int8Vec(4), ColumnType::SparseVec(4))).is_err());
+        assert!(
+            validate_schema(&build(ColumnType::SparseVec(4), ColumnType::SparseVec(4))).is_err()
+        );
+        assert!(validate_schema(&build(ColumnType::SparseVec(4), ColumnType::Text)).is_ok());
+        assert!(!ColumnType::SparseVec(4).is_vector());
+        assert!(ColumnType::SparseVec(4).is_vector_family());
+    }
+
+    /// SPARSEVEC はカタログタグ `sparsevec` で往復し、非正準・範囲外 param は拒否する。
+    #[test]
+    fn sparsevec_catalog_tag_roundtrips_and_rejects_invalid_params() {
+        let mut no_enum = |_: &str| -> Result<Arc<EnumTypeDef>> {
+            Err(CatalogError::Invalid("no enum".to_string()))
+        };
+        let ty = ColumnType::SparseVec(30_000);
+        let (tag, param) = ty.catalog_fields();
+        assert_eq!((tag, param.as_str()), ("sparsevec", "30000"));
+        assert_eq!(
+            ColumnType::from_catalog_fields(tag, &param, &mut no_enum).unwrap(),
+            ty
+        );
+        for bad in ["0", "-", "+4", "04", "", "1000000001", "x"] {
+            assert!(
+                ColumnType::from_catalog_fields("sparsevec", bad, &mut no_enum).is_err(),
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            ColumnType::from_catalog_fields("sparsevec", "1000000000", &mut no_enum).unwrap(),
+            ColumnType::SparseVec(1_000_000_000)
+        );
+        assert!(validate_column(&ColumnDef::new("h", ColumnType::SparseVec(0), true)).is_err());
+        assert!(validate_column(&ColumnDef::new(
+            "h",
+            ColumnType::SparseVec(1_000_000_001),
+            true
+        ))
+        .is_err());
+        assert!(validate_column(&ColumnDef::new(
+            "h",
+            ColumnType::SparseVec(1_000_000_000),
+            true
+        ))
+        .is_ok());
+        assert!(is_non_frame_equivalent_type(&ColumnType::SparseVec(4)));
+        assert!(!ColumnType::SparseVec(4).is_primary_key_allowed());
+        assert!(!ColumnType::SparseVec(4).is_unique_constraint_allowed());
     }
 
     #[test]

@@ -175,6 +175,14 @@ fn write_cell(out: &mut String, cell: &Cell) -> Result<(), ResponseEncodeError> 
             out.push('"');
             Ok(())
         }
+        // SPARSEVEC(N) は `{idx:val,...}/N` の JSON 文字列（型の公告は `"sparsevec"`。
+        // TABLE-47・Issue #2025）。
+        Cell::SparseVec(v) => {
+            out.push('"');
+            escape_json_string_into(out, &v.format_text());
+            out.push('"');
+            Ok(())
+        }
         // TIME は `HH:MM:SS[.ffffff]` の JSON 文字列（Issue #1569）。
         Cell::Time(micros) => {
             out.push('"');
@@ -463,6 +471,7 @@ fn nosql_type_name(meta: &ColumnMeta) -> &'static str {
             ColumnType::Bit(_) => "bit",
             ColumnType::HalfVec(_) => "halfvec",
             ColumnType::Int8Vec(_) => "int8vec",
+            ColumnType::SparseVec(_) => "sparsevec",
             ColumnType::Numeric { .. } => "numeric",
             ColumnType::Uuid => "uuid",
             ColumnType::Bytea => "bytea",

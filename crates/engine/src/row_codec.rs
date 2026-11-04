@@ -202,6 +202,10 @@ pub enum Value {
     /// （UPDATE の embedding 取り込みへ紛れ込むのを防ぐ）。行バイト表現は
     /// presence + `u32` LE 次元 + 次元 × 1 バイト（i8 の 2 の補数）。
     Int8Vec(Vec<i8>),
+    /// `SPARSEVEC(N)` 列の値（TABLE-47・Issue #2025）。非ゼロ要素のみを位置昇順で持つ検証済み値
+    /// （[`crate::sparse_vector::SparseVector`]）。`Vector` 等を流用しない。行バイト表現は
+    /// presence + dim `u32` LE + nnz `u32` LE + nnz × idx `u32` LE + nnz × val `f32` LE。
+    SparseVec(crate::sparse_vector::SparseVector),
     /// 配列列の値（TABLE-14・TASK-198、Issue #888）。要素型ごとに variant を
     /// 分けることで、同一列の要素がすべて同じ型であることを型で保証する
     /// （`ColumnType::Array` の `ArrayElemType` と対応させる）。
@@ -972,6 +976,9 @@ pub enum ScalarRef<'a> {
     /// `INT8VEC(N)` 列の借用結果（TABLE-49・Issue #2018）。次元バイトの検証済み列
     /// （1 バイト = 1 要素の i8）。値化は [`int8vec_bytes_to_values`]。
     Int8Vec(&'a [u8]),
+    /// `SPARSEVEC(N)` 列の借用結果（TABLE-47・Issue #2025）。presence を除くフレーム本体
+    /// （dim・nnz・idx 列・val 列）の検証済みバイト列。値化は [`sparsevec_bytes_to_value`]。
+    SparseVec(&'a [u8]),
     /// 配列列の借用結果（Issue #888）。構造・UTF-8・要素上限はすべて走査時に
     /// 検証済みで、[`ArrayRef::to_value`] は追加のエラー処理なしに複製できる。
     Array(ArrayRef<'a>),
@@ -1023,6 +1030,7 @@ impl<'a> ScalarRef<'a> {
             | ScalarRef::Bit(_)
             | ScalarRef::HalfVec(_)
             | ScalarRef::Int8Vec(_)
+            | ScalarRef::SparseVec(_)
             | ScalarRef::Array(_)
             | ScalarRef::Bytes(_)
             | ScalarRef::Json(_)
@@ -1048,6 +1056,7 @@ impl<'a> ScalarRef<'a> {
             | ScalarRef::Bit(_)
             | ScalarRef::HalfVec(_)
             | ScalarRef::Int8Vec(_)
+            | ScalarRef::SparseVec(_)
             | ScalarRef::Array(_)
             | ScalarRef::Bytes(_)
             | ScalarRef::Json(_)
@@ -1075,6 +1084,7 @@ impl<'a> ScalarRef<'a> {
             | ScalarRef::Bit(_)
             | ScalarRef::HalfVec(_)
             | ScalarRef::Int8Vec(_)
+            | ScalarRef::SparseVec(_)
             | ScalarRef::Array(_)
             | ScalarRef::Bytes(_)
             | ScalarRef::Json(_)
@@ -1102,6 +1112,7 @@ impl<'a> ScalarRef<'a> {
             | ScalarRef::Bit(_)
             | ScalarRef::HalfVec(_)
             | ScalarRef::Int8Vec(_)
+            | ScalarRef::SparseVec(_)
             | ScalarRef::Array(_)
             | ScalarRef::Bytes(_)
             | ScalarRef::Json(_)
@@ -1139,6 +1150,7 @@ impl<'a> ScalarRef<'a> {
             | ScalarRef::Bit(_)
             | ScalarRef::HalfVec(_)
             | ScalarRef::Int8Vec(_)
+            | ScalarRef::SparseVec(_)
             | ScalarRef::Text(_)
             | ScalarRef::Integer(_)
             | ScalarRef::BigInt(_)
@@ -1177,6 +1189,7 @@ impl<'a> ScalarRef<'a> {
             | ScalarRef::Bit(_)
             | ScalarRef::HalfVec(_)
             | ScalarRef::Int8Vec(_)
+            | ScalarRef::SparseVec(_)
             | ScalarRef::Array(_)
             | ScalarRef::Bytes(_)
             | ScalarRef::Json(_)
@@ -1208,6 +1221,7 @@ impl<'a> ScalarRef<'a> {
             | ScalarRef::Bit(_)
             | ScalarRef::HalfVec(_)
             | ScalarRef::Int8Vec(_)
+            | ScalarRef::SparseVec(_)
             | ScalarRef::Array(_)
             | ScalarRef::Bytes(_)
             | ScalarRef::Json(_)
@@ -1241,6 +1255,7 @@ impl<'a> ScalarRef<'a> {
             | ScalarRef::Bit(_)
             | ScalarRef::HalfVec(_)
             | ScalarRef::Int8Vec(_)
+            | ScalarRef::SparseVec(_)
             | ScalarRef::Array(_)
             | ScalarRef::Json(_)
             | ScalarRef::Enum(_)
@@ -1270,6 +1285,7 @@ impl<'a> ScalarRef<'a> {
             | ScalarRef::Bit(_)
             | ScalarRef::HalfVec(_)
             | ScalarRef::Int8Vec(_)
+            | ScalarRef::SparseVec(_)
             | ScalarRef::Array(_)
             | ScalarRef::Bytes(_)
             | ScalarRef::Json(_)
@@ -1641,6 +1657,178 @@ fn read_int8vec_payload(
         RowCodecError::Invalid("row buffer truncated at int8vec field".to_string())
     })?;
     Ok((body, end))
+}
+
+/// `SPARSEVEC(N)` 値 1 個をスカラーペイロードへ書き込んだ場合のフレーム込みバイト数
+/// （presence(1) + dim(4) + nnz(4) + nnz × 8。Issue #2025・TABLE-47）。列型が `SparseVec` で
+/// ない・次元が宣言と不一致・非ゼロ数が `HARD_MAX_SPARSEVEC_NNZ` 超過の場合は `Invalid`
+/// （fail-closed）。値そのものの不変条件は [`crate::sparse_vector::SparseVector`] の構築時に保証済み。
+fn sparsevec_entry_len(
+    column: &crate::catalog::ColumnDef,
+    v: &crate::sparse_vector::SparseVector,
+) -> std::result::Result<u32, RowCodecError> {
+    let ColumnType::SparseVec(declared) = column.ty else {
+        return Err(RowCodecError::Invalid(format!(
+            "column {:?} expects a non-SparseVec value, got SparseVec",
+            column.name
+        )));
+    };
+    if v.dim() != declared {
+        return Err(RowCodecError::Invalid(format!(
+            "sparsevec dim mismatch for column {:?}: expected {declared}, got {}",
+            column.name,
+            v.dim()
+        )));
+    }
+    if v.nnz() > crate::sparse_vector::HARD_MAX_SPARSEVEC_NNZ {
+        return Err(RowCodecError::Invalid(
+            "sparsevec non-zero element count exceeds limit".to_string(),
+        ));
+    }
+    v.encoded_len()
+        .and_then(|n| u32::try_from(n).ok())
+        .ok_or_else(|| RowCodecError::Invalid("sparsevec field length overflow".to_string()))
+}
+
+/// `SPARSEVEC(N)` の値部（dim・nnz・idx 列・val 列）を書き込む。呼び出し側が presence の
+/// 書き込みと [`sparsevec_entry_len`] による検証を済ませている前提（Issue #2025）。
+fn write_sparsevec_payload(buf: &mut Vec<u8>, v: &crate::sparse_vector::SparseVector) {
+    let nnz = u32::try_from(v.nnz()).unwrap_or(u32::MAX);
+    buf.extend_from_slice(&v.dim().to_le_bytes());
+    buf.extend_from_slice(&nnz.to_le_bytes());
+    for idx in v.indices() {
+        buf.extend_from_slice(&idx.to_le_bytes());
+    }
+    for val in v.values() {
+        buf.extend_from_slice(&val.to_le_bytes());
+    }
+}
+
+/// `SPARSEVEC(N)` の値部を `offset` から読み、dim が宣言 `declared` と一致すること・nnz が
+/// ハード上限かつ dim 以下であること・残りバイト数が足りることを**確保より前に**検証し、続けて
+/// 位置の厳密昇順（`< dim`）と値の有限・非ゼロを確認して、フレーム本体の借用と次の offset を返す。
+/// いずれかに反する行バイト列は `Invalid`（fail-closed）。decode 経路はハード上限だけで検査する
+/// （書き込み側の設定上限を下げても既存行を読めるように。Issue #2027 への引き継ぎ点）。
+fn read_sparsevec_payload(
+    buf: &[u8],
+    offset: usize,
+    declared: u32,
+) -> std::result::Result<(&[u8], usize), RowCodecError> {
+    let head_end = offset.checked_add(8).ok_or_else(|| {
+        RowCodecError::Invalid("offset overflow before sparsevec head".to_string())
+    })?;
+    let head = buf.get(offset..head_end).ok_or_else(|| {
+        RowCodecError::Invalid("row buffer truncated at sparsevec head".to_string())
+    })?;
+    let (dim_bytes, nnz_bytes) = head.split_at(4);
+    let dim =
+        u32::from_le_bytes(dim_bytes.try_into().map_err(|_| {
+            RowCodecError::Invalid("sparsevec dim field is not 4 bytes".to_string())
+        })?);
+    let nnz =
+        u32::from_le_bytes(nnz_bytes.try_into().map_err(|_| {
+            RowCodecError::Invalid("sparsevec nnz field is not 4 bytes".to_string())
+        })?);
+    if dim != declared || dim > crate::sparse_vector::MAX_SPARSEVEC_DIM {
+        return Err(RowCodecError::Invalid(
+            "sparsevec dim does not match the declared column type".to_string(),
+        ));
+    }
+    let nnz_usize = usize::try_from(nnz)
+        .map_err(|_| RowCodecError::Invalid("sparsevec nnz overflow".to_string()))?;
+    if nnz_usize > crate::sparse_vector::HARD_MAX_SPARSEVEC_NNZ || nnz > dim {
+        return Err(RowCodecError::Invalid(
+            "sparsevec nnz exceeds limit".to_string(),
+        ));
+    }
+    let body_len = nnz_usize
+        .checked_mul(8)
+        .ok_or_else(|| RowCodecError::Invalid("sparsevec field length overflow".to_string()))?;
+    let end = head_end.checked_add(body_len).ok_or_else(|| {
+        RowCodecError::Invalid("offset overflow after sparsevec field".to_string())
+    })?;
+    let body_all = buf.get(offset..end).ok_or_else(|| {
+        RowCodecError::Invalid("row buffer truncated at sparsevec field".to_string())
+    })?;
+    let payload = body_all.get(8..).unwrap_or(&[]);
+    let idx_len = nnz_usize
+        .checked_mul(4)
+        .ok_or_else(|| RowCodecError::Invalid("sparsevec field length overflow".to_string()))?;
+    let (idx_bytes, val_bytes) = payload.split_at_checked(idx_len).ok_or_else(|| {
+        RowCodecError::Invalid("row buffer truncated at sparsevec field".to_string())
+    })?;
+    let mut prev: Option<u32> = None;
+    for (ib, vb) in idx_bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(val_bytes.as_chunks::<4>().0.iter())
+    {
+        let idx = u32::from_le_bytes(*ib);
+        let val = f32::from_le_bytes(*vb);
+        if idx >= dim || prev.is_some_and(|p| p >= idx) {
+            return Err(RowCodecError::Invalid(
+                "sparsevec indices must be strictly ascending and within the dim".to_string(),
+            ));
+        }
+        if !val.is_finite() || val == 0.0 {
+            return Err(RowCodecError::Invalid(
+                "sparsevec stored value must be finite and non-zero".to_string(),
+            ));
+        }
+        prev = Some(idx);
+    }
+    Ok((body_all, end))
+}
+
+/// 検証済み `SPARSEVEC` フレーム本体（[`read_sparsevec_payload`] が返す借用）を値へ戻す。
+/// 検証済みのため通常は失敗しないが、不整合は panic でなく `Invalid`（fail-closed）にする。
+pub(crate) fn sparsevec_bytes_to_value(
+    body: &[u8],
+) -> std::result::Result<crate::sparse_vector::SparseVector, RowCodecError> {
+    let invalid = || RowCodecError::Invalid("malformed sparsevec frame".to_string());
+    let dim_bytes: [u8; 4] = body
+        .get(..4)
+        .ok_or_else(invalid)?
+        .try_into()
+        .map_err(|_| invalid())?;
+    let nnz_bytes: [u8; 4] = body
+        .get(4..8)
+        .ok_or_else(invalid)?
+        .try_into()
+        .map_err(|_| invalid())?;
+    let dim = u32::from_le_bytes(dim_bytes);
+    let nnz = usize::try_from(u32::from_le_bytes(nnz_bytes)).map_err(|_| invalid())?;
+    if nnz > crate::sparse_vector::HARD_MAX_SPARSEVEC_NNZ {
+        return Err(invalid());
+    }
+    let idx_end = nnz
+        .checked_mul(4)
+        .and_then(|n| n.checked_add(8))
+        .ok_or_else(invalid)?;
+    let val_end = nnz
+        .checked_mul(4)
+        .and_then(|n| n.checked_add(idx_end))
+        .ok_or_else(invalid)?;
+    let idx_bytes = body.get(8..idx_end).ok_or_else(invalid)?;
+    let val_bytes = body.get(idx_end..val_end).ok_or_else(invalid)?;
+    let mut indices = Vec::new();
+    let mut values = Vec::new();
+    indices.try_reserve_exact(nnz).map_err(|_| invalid())?;
+    values.try_reserve_exact(nnz).map_err(|_| invalid())?;
+    for c in idx_bytes.as_chunks::<4>().0 {
+        indices.push(u32::from_le_bytes(*c));
+    }
+    for c in val_bytes.as_chunks::<4>().0 {
+        values.push(f32::from_le_bytes(*c));
+    }
+    crate::sparse_vector::SparseVector::from_sorted_parts(
+        dim,
+        indices,
+        values,
+        crate::sparse_vector::HARD_MAX_SPARSEVEC_NNZ,
+    )
+    .map_err(|_| invalid())
 }
 
 /// 検証済み `INT8VEC` 要素バイト列（1 バイト = 1 要素）を i8 列へ戻す。
@@ -2703,6 +2891,7 @@ pub fn encode_row(
                     | ColumnType::Bit(_)
                     | ColumnType::HalfVec(_)
                     | ColumnType::Int8Vec(_)
+                    | ColumnType::SparseVec(_)
                     | ColumnType::Array(_)
                     | ColumnType::Bytea
                     | ColumnType::Json
@@ -2753,6 +2942,7 @@ pub fn encode_row(
                     | ColumnType::Bit(_)
                     | ColumnType::HalfVec(_)
                     | ColumnType::Int8Vec(_)
+                    | ColumnType::SparseVec(_)
                     | ColumnType::Array(_)
                     | ColumnType::Bytea
                     | ColumnType::Json
@@ -2911,6 +3101,11 @@ pub fn encode_row(
                 buf.push(PRESENCE_VALUE);
                 write_int8vec_payload(&mut buf, v);
             }
+            Value::SparseVec(v) => {
+                sparsevec_entry_len(column, v)?;
+                buf.push(PRESENCE_VALUE);
+                write_sparsevec_payload(&mut buf, v);
+            }
             Value::Array(array_value) => {
                 let array_ty = match &column.ty {
                     ColumnType::Array(array_ty) => array_ty,
@@ -2932,6 +3127,7 @@ pub fn encode_row(
                     | ColumnType::Bit(_)
                     | ColumnType::HalfVec(_)
                     | ColumnType::Int8Vec(_)
+                    | ColumnType::SparseVec(_)
                     | ColumnType::Bytea
                     | ColumnType::Json
                     | ColumnType::Jsonb
@@ -2999,6 +3195,7 @@ pub fn encode_row(
                     | ColumnType::Bit(_)
                     | ColumnType::HalfVec(_)
                     | ColumnType::Int8Vec(_)
+                    | ColumnType::SparseVec(_)
                     | ColumnType::Array(_)
                     | ColumnType::Bytea
                     | ColumnType::Json
@@ -3585,6 +3782,11 @@ pub fn decode_row(schema: &TableSchema, buf: &[u8]) -> Result<DecodedRow> {
                     offset = new_offset;
                     values.push(Value::Int8Vec(int8vec_bytes_to_values(body)));
                 }
+                ColumnType::SparseVec(declared) => {
+                    let (body, new_offset) = read_sparsevec_payload(buf, offset, *declared)?;
+                    offset = new_offset;
+                    values.push(Value::SparseVec(sparsevec_bytes_to_value(body)?));
+                }
                 ColumnType::Array(array_ty) => {
                     let (array_ref, new_offset) =
                         parse_array_frame(buf, offset, array_ty.elem(), array_ty.max_len())?;
@@ -3923,6 +4125,7 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                     | ColumnType::Bit(_)
                     | ColumnType::HalfVec(_)
                     | ColumnType::Int8Vec(_)
+                    | ColumnType::SparseVec(_)
                     | ColumnType::Array(_)
                     | ColumnType::Bytea
                     | ColumnType::Json
@@ -4097,6 +4300,12 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                 buf.push(PRESENCE_VALUE);
                 write_int8vec_payload(&mut buf, v);
             }
+            Value::SparseVec(v) => {
+                let entry_len = sparsevec_entry_len(column, v)?;
+                reserve(&mut buf, entry_len)?;
+                buf.push(PRESENCE_VALUE);
+                write_sparsevec_payload(&mut buf, v);
+            }
             Value::Array(array_value) => {
                 let array_ty = match &column.ty {
                     ColumnType::Array(array_ty) => array_ty,
@@ -4118,6 +4327,7 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                     | ColumnType::Bit(_)
                     | ColumnType::HalfVec(_)
                     | ColumnType::Int8Vec(_)
+                    | ColumnType::SparseVec(_)
                     | ColumnType::Bytea
                     | ColumnType::Json
                     | ColumnType::Jsonb
@@ -4202,6 +4412,7 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                     | ColumnType::Bit(_)
                     | ColumnType::HalfVec(_)
                     | ColumnType::Int8Vec(_)
+                    | ColumnType::SparseVec(_)
                     | ColumnType::Array(_)
                     | ColumnType::Bytea
                     | ColumnType::Json
@@ -4476,6 +4687,7 @@ fn validate_json_column_value(column: &crate::catalog::ColumnDef, text: &str) ->
         | ColumnType::Bit(_)
         | ColumnType::HalfVec(_)
         | ColumnType::Int8Vec(_)
+        | ColumnType::SparseVec(_)
         | ColumnType::Array(_)
         | ColumnType::Bytea
         | ColumnType::Enum(_)
@@ -4710,6 +4922,7 @@ pub(crate) fn merge_encode_scalar_columns(
                         | ColumnType::Bit(_)
                         | ColumnType::HalfVec(_)
                         | ColumnType::Int8Vec(_)
+                        | ColumnType::SparseVec(_)
                         | ColumnType::Array(_)
                         | ColumnType::Bytea
                         | ColumnType::Json
@@ -4873,6 +5086,12 @@ pub(crate) fn merge_encode_scalar_columns(
                     buf.push(PRESENCE_VALUE);
                     write_int8vec_payload(&mut buf, v);
                 }
+                Value::SparseVec(v) => {
+                    let entry_len = sparsevec_entry_len(column, v)?;
+                    reserve(&mut buf, entry_len)?;
+                    buf.push(PRESENCE_VALUE);
+                    write_sparsevec_payload(&mut buf, v);
+                }
                 Value::Array(array_value) => {
                     let array_ty = match &column.ty {
                         ColumnType::Array(array_ty) => array_ty,
@@ -4894,6 +5113,7 @@ pub(crate) fn merge_encode_scalar_columns(
                         | ColumnType::Bit(_)
                         | ColumnType::HalfVec(_)
                         | ColumnType::Int8Vec(_)
+                        | ColumnType::SparseVec(_)
                         | ColumnType::Bytea
                         | ColumnType::Json
                         | ColumnType::Jsonb
@@ -4941,6 +5161,7 @@ pub(crate) fn merge_encode_scalar_columns(
                         | ColumnType::Bit(_)
                         | ColumnType::HalfVec(_)
                         | ColumnType::Int8Vec(_)
+                        | ColumnType::SparseVec(_)
                         | ColumnType::Array(_)
                         | ColumnType::Bytea
                         | ColumnType::Json
@@ -5114,6 +5335,13 @@ pub(crate) fn merge_encode_scalar_columns(
                     reserve(&mut buf, entry_len)?;
                     buf.push(PRESENCE_VALUE);
                     write_int8vec_payload(&mut buf, &owned);
+                }
+                Some(ScalarRef::SparseVec(body)) => {
+                    let owned = sparsevec_bytes_to_value(body)?;
+                    let entry_len = sparsevec_entry_len(column, &owned)?;
+                    reserve(&mut buf, entry_len)?;
+                    buf.push(PRESENCE_VALUE);
+                    write_sparsevec_payload(&mut buf, &owned);
                 }
                 Some(ScalarRef::Array(array_ref)) => {
                     let payload_len = u32::try_from(array_ref.bytes.len()).map_err(|_| {
@@ -6246,6 +6474,16 @@ fn scan_scalar_columns_validated<'a>(
                         sink(col_index, None)?;
                     }
                 }
+                ColumnType::SparseVec(declared) => {
+                    // 宣言 dim との一致・nnz 上限・バッファ長・昇順を確保前に検証する（Issue #2025）。
+                    let (body, new_offset) = read_sparsevec_payload(buf, offset, *declared)?;
+                    offset = new_offset;
+                    if wanted {
+                        sink(col_index, Some(ScalarRef::SparseVec(body)))?;
+                    } else {
+                        sink(col_index, None)?;
+                    }
+                }
                 ColumnType::Json | ColumnType::Jsonb => {
                     // フレーミング・UTF-8 検証は TEXT と共有する（Issue #889 D2）。
                     // 格納時（encode 経路）に構文検証・正規化済みのため、ここでは
@@ -6342,6 +6580,7 @@ pub fn scalar_refs_as_text<'a>(scanned: &[Option<ScalarRef<'a>>]) -> Vec<Option<
             | Some(ScalarRef::Bit(_))
             | Some(ScalarRef::HalfVec(_))
             | Some(ScalarRef::Int8Vec(_))
+            | Some(ScalarRef::SparseVec(_))
             | Some(ScalarRef::Array(_))
             | Some(ScalarRef::Bytes(_))
             | Some(ScalarRef::Json(_))
@@ -6408,6 +6647,9 @@ pub fn decode_scalar_columns(schema: &TableSchema, buf: &[u8]) -> Result<Vec<Val
             }
             Some(ScalarRef::Int8Vec(body)) => {
                 values.push(Value::Int8Vec(int8vec_bytes_to_values(body)));
+            }
+            Some(ScalarRef::SparseVec(body)) => {
+                values.push(Value::SparseVec(sparsevec_bytes_to_value(body)?));
             }
             Some(ScalarRef::Array(array_ref)) => {
                 values.push(Value::Array(array_ref.to_value()?));

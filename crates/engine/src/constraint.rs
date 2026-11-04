@@ -2165,6 +2165,8 @@ pub(crate) fn push_canonical_component(
         ScalarRef::HalfVec(_) => return Err("unique key column does not support HALFVEC"),
         // INT8VEC(N) も PK／UNIQUE 非許可（Issue #2018・TABLE-49。fail-closed）。
         ScalarRef::Int8Vec(_) => return Err("unique key column does not support INT8VEC"),
+        // SPARSEVEC(N) も PK／UNIQUE 非許可（Issue #2025・TABLE-47。fail-closed）。
+        ScalarRef::SparseVec(_) => return Err("unique key column does not support SPARSEVEC"),
         ScalarRef::Bytes(b) => push_len_prefixed(out, ColumnType::Bytea.unique_key_tag(), b),
         ScalarRef::Uuid(u) => {
             push_len_prefixed(out, ColumnType::Uuid.unique_key_tag(), u.as_bytes())
@@ -2314,7 +2316,11 @@ pub(crate) fn unique_key_from_values(
                     &array_payload,
                 ))
             }
-            Value::Null | Value::Vector(_) | Value::HalfVec(_) | Value::Int8Vec(_) => {
+            Value::Null
+            | Value::Vector(_)
+            | Value::HalfVec(_)
+            | Value::Int8Vec(_)
+            | Value::SparseVec(_) => {
                 // `ColumnType::is_unique_constraint_allowed` が事前に拒否する
                 // 型であり、UNIQUE 制約の構成列としては `validate_schema` を
                 // 通過したスキーマから到達しないはずの内部矛盾
@@ -3170,6 +3176,7 @@ fn value_as_scalar_ref(value: &crate::row_codec::Value) -> Option<ScalarRef<'_>>
         | Value::Bit(_)
         | Value::HalfVec(_)
         | Value::Int8Vec(_)
+        | Value::SparseVec(_)
         | Value::Numeric(_) => None,
     }
 }
