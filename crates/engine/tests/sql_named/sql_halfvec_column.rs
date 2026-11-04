@@ -3,9 +3,9 @@
 //! production 経路（`EngineCore::execute_sql_in_session`）で、(1) 型がカタログへ永続化され再オープン後も
 //! 値ごと復元されること、(2) INSERT／UPDATE SET／UPSERT の往復が「f16 へ丸めた値」で一致し VECTOR は
 //! 丸まらないこと、(3) 次元不一致・非有限は `22000`、f16 範囲外は `22003` で副作用なく拒否されること、
-//! (4) 列本数の制約（VECTOR と合わせて 0〜1 本）、(5) 未解禁の機能（距離計算・索引・制約・DDL 変更・
+//! (4) 列本数の制約（VECTOR と合わせて 0〜1 本）、(5) 未解禁の機能（列の CAST・索引・制約・DDL 変更・
 //! COPY・CAST・並べ替え・集計）が fail-closed に拒否されること、(6) テナント境界が不変であることを固定する。
-//! 距離計算と HNSW は兄弟 Issue（#2015・#2016）の担当。
+//! 距離計算とテキスト入出力は #2015（`sql_halfvec_distance.rs`）、HNSW は #2016 の担当。
 
 use engine::catalog::ColumnType;
 use engine::core::EngineCore;
@@ -320,8 +320,9 @@ fn unsupported_features_fail_closed() {
         ("SELECT max(v) FROM t", "42883"),
         ("SELECT count(v) FROM t", "42883"),
         ("SELECT v::text FROM t", "22000"),
-        ("SELECT '[1,2]'::halfvec(2)", "0A000"),
-        ("SELECT l2_distance(v, '[1,2]') FROM t", "22000"),
+        // `'[..]'::halfvec` と距離関数は #2015 で解禁した（`sql_halfvec_distance.rs` で値まで固定）。
+        // 列そのものの CAST と HALFVEC 列の型変換は未対応のまま。
+        ("SELECT v::halfvec FROM t", "0A000"),
         ("SELECT v FROM t UNION SELECT v FROM t", "0A000"),
         ("SELECT v || 'x' FROM t", "22000"),
         ("CREATE INDEX i ON t (v)", "0A000"),

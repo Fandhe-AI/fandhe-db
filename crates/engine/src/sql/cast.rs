@@ -283,7 +283,8 @@ impl CastType {
                     detail: "cast to or from type vector is not supported".to_string(),
                 })
             }
-            // HALFVEC の CAST（`::halfvec` 等）は兄弟 Issue #2015 まで未対応（fail-closed。Issue #2014）。
+            // HALFVEC は `CastType` に載せない: 式の `::halfvec` は構文段が文字列リテラルだけ畳み込む（Issue #2015。
+            // `parse_halfvec_cast_type`）。UDF の型・列の CAST などここへ来る形は fail-closed。
             SqlColumnTypeName::HalfVec(_) => {
                 return Err(SqlSurfaceError::FeatureNotSupported {
                     detail: "cast to or from type halfvec is not supported".to_string(),
@@ -782,6 +783,92 @@ fn strict_u32_token(t: Option<&crate::sql::lexer::Token>) -> Option<u32> {
         }
         _ => None,
     }
+}
+
+/// `halfvec` または `halfvec(N)` の型名を読む（Issue #2015・TABLE-46）。先頭が `halfvec` でなければ
+/// `Ok(None)`（位置は動かさない）。`Ok(Some(dim))` の `dim` は修飾子（`None` は修飾子なし）。
+///
+/// `CastType` は UDF の引数型・戻り値型・PL/pgSQL でも共有されるため HALFVEC を足さず、
+/// `sql::allowlist::Parser` が式の `CAST`／`::`／`<type> '<literal>'` の入口でだけ本関数を先に呼ぶ。
+/// 修飾子 `N` は `0` を `22000`（構文は `42601`）で拒否する。括弧の後に `[` が続く配列型は読まない。
+pub(crate) fn parse_halfvec_cast_type(
+    tokens: &[crate::sql::lexer::Token],
+    pos: &mut usize,
+) -> Result<Option<Option<u32>>, SqlSurfaceError> {
+    use crate::sql::lexer::Token;
+    if !matches!(
+        tokens.get(*pos),
+        Some(Token::Ident(w)) if w.eq_ignore_ascii_case("halfvec")
+    ) {
+        return Ok(None);
+    }
+    let is_punct = |p: usize, c: char| matches!(tokens.get(p), Some(Token::Punct(x)) if *x == c);
+    let (dim, next) = if is_punct(*pos + 1, '(') {
+        let Some(n) = strict_u32_token(tokens.get(*pos + 2)) else {
+            return Err(SqlSurfaceError::unsupported(
+                "invalid type modifier for halfvec",
+            ));
+        };
+        if !is_punct(*pos + 3, ')') {
+            return Err(SqlSurfaceError::unsupported(
+                "invalid type modifier for halfvec",
+            ));
+        }
+        if n == 0 {
+            return Err(SqlSurfaceError::invalid_input(
+                "halfvec type modifier must be at least 1",
+            ));
+        }
+        (Some(n), *pos + 4)
+    } else {
+        (None, *pos + 1)
+    };
+    if is_punct(next, '[') {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "halfvec arrays are not supported".to_string(),
+        });
+    }
+    *pos = next;
+    Ok(Some(dim))
+}
+
+/// `'<ベクトルリテラル>'::halfvec[(N)]` を畳み込む（Issue #2015・TABLE-46）。被演算子が文字列リテラルの
+/// ときだけ受理し、検証（形式・有限性・長さ上限・修飾子との次元照合）→ f16 への丸め → f32 へ戻した
+/// 最短表記のテキスト `[a,b,...]` を文字列リテラルとして返す。丸め済みの表記は再解析しても同じ値に
+/// なる（冪等）ため、距離関数・距離演算子のリテラル引数としてそのまま使え、投影すれば
+/// `halfvec_out` 相当のテキストで返る。列の参照・式・NULL の被演算子は `0A000`（fail-closed）。
+/// エラーに入力値は含めない。
+pub(crate) fn fold_halfvec_literal(
+    operand: Expr,
+    dim: Option<u32>,
+) -> Result<Expr, SqlSurfaceError> {
+    let Expr::String(literal) = operand else {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "cast to type halfvec is only supported for string literals".to_string(),
+        });
+    };
+    let values = match dim {
+        Some(d) => crate::sql::parser::parse_vector_literal(&literal, d)?,
+        None => crate::sql::parser::parse_vector_literal_any_dim(&literal)?,
+    };
+    if values.is_empty() {
+        return Err(SqlSurfaceError::invalid_input(
+            "halfvec must have at least 1 dimension",
+        ));
+    }
+    let rounded = crate::sql::exec::round_to_halfvec_f32(&values)?;
+    let mut text = String::new();
+    text.try_reserve(rounded.len().saturating_mul(12).saturating_add(2))
+        .map_err(|_| SqlSurfaceError::payload_too_large("halfvec literal exceeds memory"))?;
+    text.push('[');
+    for (i, v) in rounded.iter().enumerate() {
+        if i > 0 {
+            text.push(',');
+        }
+        text.push_str(&v.to_string());
+    }
+    text.push(']');
+    Ok(Expr::String(text))
 }
 
 /// `CAST`／`<type> '<literal>'` の型名を読む（`sql::allowlist::Parser` の
@@ -1751,5 +1838,43 @@ mod tests {
         }
         assert_eq!(column_assignment_convertible(&C::Vector(2), &C::Text), None);
         assert_eq!(column_assignment_convertible(&C::Text, &C::Vector(2)), None);
+    }
+
+    /// `halfvec[(N)]` の型名解析（Issue #2015・TABLE-46）。他の型名は読まず位置も動かさない。
+    #[test]
+    fn halfvec_type_name_parsing() {
+        let parse = |sql: &str| {
+            let tokens = crate::sql::lexer::tokenize(sql).unwrap();
+            let mut pos = 0;
+            let r = parse_halfvec_cast_type(&tokens, &mut pos);
+            (r, pos)
+        };
+        assert_eq!(parse("halfvec").0.unwrap(), Some(None));
+        assert_eq!(parse("HALFVEC(3)").0.unwrap(), Some(Some(3)));
+        assert_eq!(parse("HALFVEC(3)").1, 4);
+        assert_eq!(parse("integer").0.unwrap(), None);
+        assert_eq!(parse("integer").1, 0);
+        assert!(parse("halfvec(0)").0.is_err());
+        assert!(parse("halfvec(x)").0.is_err());
+        assert!(parse("halfvec[]").0.is_err());
+    }
+
+    /// 文字列リテラルの畳み込み: f16 へ丸めた最短表記になり、再度畳み込んでも変わらない（冪等）。
+    #[test]
+    fn halfvec_literal_folding_is_rounded_and_idempotent() {
+        let fold = |s: &str, d: Option<u32>| fold_halfvec_literal(Expr::String(s.to_string()), d);
+        let Expr::String(once) = fold("[0.1, 1, -2.5]", None).unwrap() else {
+            panic!("string expected");
+        };
+        assert_eq!(once, "[0.099975586,1,-2.5]");
+        let Expr::String(twice) = fold(&once, Some(3)).unwrap() else {
+            panic!("string expected");
+        };
+        assert_eq!(once, twice);
+        assert_eq!(fold("[1,2]", Some(3)).unwrap_err().wire_code(), "22000");
+        assert_eq!(fold("[70000]", None).unwrap_err().wire_code(), "22003");
+        assert_eq!(fold("[]", None).unwrap_err().wire_code(), "22000");
+        let col = fold_halfvec_literal(Expr::Ident("c".to_string()), None).unwrap_err();
+        assert_eq!(col.wire_code(), "0A000");
     }
 }

@@ -561,5 +561,36 @@ fn halfvec_column_is_announced_as_text_oid() {
     );
     let _tag = read_command_complete(&mut stream);
     read_ready_for_query(&mut stream);
+
+    // 距離計算とリテラル（Issue #2015・TABLE-46）: kNN は id 列だけを返し、`'[..]'::halfvec` は
+    // 列の取り出しと同じ text（OID 25）・同じ表記で返る。距離関数の結果は float8（OID 701）。
+    send_simple_query(
+        &mut stream,
+        "SELECT id FROM halfs ORDER BY h <=> '[1,0.1]' LIMIT 1",
+    );
+    let columns = read_row_description_with_types(&mut stream);
+    assert_eq!(columns, vec![("id".to_string(), 1700, -1)]);
+    let row = read_data_row(&mut stream);
+    assert_eq!(row.first().cloned().flatten().as_deref(), Some("1"));
+    let _tag = read_command_complete(&mut stream);
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(
+        &mut stream,
+        "SELECT '[0.1]'::halfvec, l2_distance(h, '[1,0.1]') FROM halfs",
+    );
+    let columns = read_row_description_with_types(&mut stream);
+    assert_eq!(
+        columns.iter().map(|c| c.1).collect::<Vec<_>>(),
+        vec![25, 701]
+    );
+    let row = read_data_row(&mut stream);
+    assert_eq!(
+        row.first().cloned().flatten().as_deref(),
+        Some("[0.099975586]")
+    );
+    assert_eq!(row.get(1).cloned().flatten().as_deref(), Some("0"));
+    let _tag = read_command_complete(&mut stream);
+    read_ready_for_query(&mut stream);
     drop(guard);
 }

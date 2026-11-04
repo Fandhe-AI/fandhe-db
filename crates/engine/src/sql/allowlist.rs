@@ -12013,6 +12013,22 @@ impl<'a> Parser<'a> {
             // 残す）に当たらなかった型名が対象で、型名の直後が文字列リテラルのときだけ
             // `Expr::Cast` にする（先読みで確かめるため、同名の列参照・`numeric(1,2)` の関数呼び出し形は
             // 従来の分岐のまま）。配列型の直後の文字列は PostgreSQL と同じく構文エラー。
+            Some(Token::Ident(_)) if self.peek_halfvec_typed_literal().is_some() => {
+                if self.in_check_body {
+                    return Err(SqlSurfaceError::FeatureNotSupported {
+                        detail: "typed literals are not supported in a CHECK constraint"
+                            .to_string(),
+                    });
+                }
+                let Some((lit_pos, literal)) = self.peek_halfvec_typed_literal() else {
+                    return Err(SqlSurfaceError::unsupported("unsupported expression term"));
+                };
+                let dim = self.parse_halfvec_target_type()?.flatten();
+                self.pos = lit_pos.saturating_add(1);
+                self.consume_expr_node()?;
+                self.consume_expr_node()?;
+                crate::sql::cast::fold_halfvec_literal(Expr::String(literal), dim)
+            }
             Some(Token::Ident(_)) if self.peek_typed_string_literal().is_some() => {
                 if self.in_check_body {
                     return Err(SqlSurfaceError::FeatureNotSupported {
@@ -12340,6 +12356,12 @@ impl<'a> Parser<'a> {
             self.parse_value_expr_with_null_context(depth + 1, false)?
         };
         self.expect_contextual_keyword("AS")?;
+        // `halfvec[(N)]` は文字列リテラルの畳み込みで受ける（Issue #2015・TABLE-46）。
+        if let Some(dim) = self.parse_halfvec_target_type()? {
+            self.expect_punct(')')?;
+            self.consume_expr_node()?;
+            return crate::sql::cast::fold_halfvec_literal(operand, dim);
+        }
         let ty = self.parse_cast_target_type()?;
         self.expect_punct(')')?;
         self.consume_expr_node()?;
@@ -12349,12 +12371,39 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// 現在位置が `halfvec[(N)]` なら読み進めて修飾子を返す（Issue #2015。[`crate::sql::cast::parse_halfvec_cast_type`]）。
+    fn parse_halfvec_target_type(&mut self) -> Result<Option<Option<u32>>, SqlSurfaceError> {
+        let mut pos = self.pos;
+        let r = crate::sql::cast::parse_halfvec_cast_type(&self.tokens, &mut pos)?;
+        if r.is_some() {
+            self.pos = pos;
+        }
+        Ok(r)
+    }
+
     /// 現在位置から型名 1 個を読み、CAST の変換先の型へ写す（[`Self::parse_cast_expr`] の下請け）。
     fn parse_cast_target_type(&mut self) -> Result<crate::sql::cast::CastType, SqlSurfaceError> {
         let mut pos = self.pos;
         let ty = crate::sql::cast::parse_cast_type(&self.tokens, &mut pos)?;
         self.pos = pos;
         Ok(ty)
+    }
+
+    /// `halfvec[(N)] '<literal>'` の先読み（Issue #2015）。型名の直後が文字列リテラルなら
+    /// `(文字列リテラルの位置, 本文)` を返す（位置は消費しない）。修飾子が不正な形は `None`
+    /// （従来の分岐へ回す）。
+    fn peek_halfvec_typed_literal(&self) -> Option<(usize, String)> {
+        if self.quoted_null.contains(&self.pos) {
+            return None;
+        }
+        let mut pos = self.pos;
+        crate::sql::cast::parse_halfvec_cast_type(&self.tokens, &mut pos)
+            .ok()
+            .flatten()?;
+        match self.tokens.get(pos) {
+            Some(Token::StringLiteral(s)) => Some((pos, s.clone())),
+            _ => None,
+        }
     }
 
     /// `<type> '<literal>'` の型名部分の先読み。現在位置が引用なしの型名の先頭語で、型名の直後が
@@ -16865,6 +16914,13 @@ impl<'a> Parser<'a> {
                 });
             }
             self.advance();
+            if let Some(dim) = self.parse_halfvec_target_type()? {
+                self.consume_expr_node()?;
+                links = links.saturating_add(1);
+                self.check_expr_depth(depth.saturating_add(links))?;
+                lhs = crate::sql::cast::fold_halfvec_literal(lhs, dim)?;
+                continue;
+            }
             let ty = self.parse_cast_target_type()?;
             self.consume_expr_node()?;
             links = links.saturating_add(1);

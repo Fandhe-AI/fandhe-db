@@ -971,6 +971,48 @@ pub(crate) fn expand_halfvec(bits: &[u16]) -> Result<Vec<f32>, SqlSurfaceError> 
     Ok(out)
 }
 
+/// 行スカラーの `HALFVEC` ペイロード（f16 の LE バイト列）を f32 へ広げる（確保失敗は `54000`）。
+/// 距離式・距離関数の評価（`udf_call::eval_with_scalars`）が行ごとに呼ぶ。長さが 2 の倍数でない
+/// ペイロードは破損として `Internal`（fail-closed）。f16 → f32 は誤差なしの変換。
+pub(crate) fn expand_halfvec_bytes(body: &[u8]) -> Result<Vec<f32>, SqlSurfaceError> {
+    if !body.len().is_multiple_of(2) {
+        return Err(SqlSurfaceError::Internal {
+            detail: "HALFVEC payload length is not a multiple of 2".to_string(),
+        });
+    }
+    let mut out: Vec<f32> = Vec::new();
+    out.try_reserve_exact(body.len() / 2).map_err(|_| {
+        SqlSurfaceError::payload_too_large("halfvec payload exceeds available memory")
+    })?;
+    out.extend(
+        body.as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| crate::f16::f16_bits_to_f32(u16::from_le_bytes(*c))),
+    );
+    Ok(out)
+}
+
+/// 問い合わせ側のベクトルを f16 に丸めて f32 へ戻す（Issue #2015・TABLE-46。pgvector は型なしリテラルを
+/// halfvec 列の相手として halfvec に解決する）。有限値が f16 の範囲外で ±Inf に飽和する場合は `22003`
+/// （`bind_halfvec_values` と同じ判定）。エラーに値は含めない。
+pub(crate) fn round_to_halfvec_f32(values: &[f32]) -> Result<Vec<f32>, SqlSurfaceError> {
+    let mut out: Vec<f32> = Vec::new();
+    out.try_reserve_exact(values.len()).map_err(|_| {
+        SqlSurfaceError::payload_too_large("halfvec payload exceeds available memory")
+    })?;
+    for v in values {
+        let widened = crate::f16::f16_bits_to_f32(crate::f16::f32_to_f16_bits(*v));
+        if !widened.is_finite() {
+            return Err(SqlSurfaceError::numeric_out_of_range(
+                "value out of range for type halfvec",
+            ));
+        }
+        out.push(widened);
+    }
+    Ok(out)
+}
+
 /// 投影段で `Text` 列を応答行用に複製する。`candidate_columns`（`on_visible_row`）
 /// 側は [`MAX_CANDIDATE_SCALAR_BYTES`] で累計バイト量を検証済みだが、`String::clone`
 /// （内部で `String::with_capacity` 相当を使い、確保失敗時に abort する）を素朴に

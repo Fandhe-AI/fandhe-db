@@ -798,3 +798,22 @@ NoSQL 表層の JSON 束縛（`insert`／`update`／`filter`）の型別対応�
 - **丸めと SQLSTATE**: 入力は VECTOR と同じ検証（次元不一致・非有限は `22000`）の後に f16 へ丸める。有限の入力が ±Inf に飽和する場合は `22003`。判定は `fits_f16`（`|x| <= 65504`）ではなく変換結果で行い pgvector と揃える（65504 超〜65520 未満は 65504 へ丸めて受理、65520 以上は `22003`）。文字列 → f32 → f16 の 2 段丸めも pgvector と同順。
 - **投影**: f16 を f32 へ広げた既存の `Cell::Vector` を再利用する（公開 enum `Cell` は増やさない）。結果予算は展開後（次元 × 4）で計上する。wire の型 OID は 25（text）で、バイナリ形式は対象外。
 - **fail-closed（対象外）**: `ALTER TABLE ADD COLUMN`（`0A000`）、`DROP COLUMN`（`42601`）、`ALTER COLUMN TYPE`（`42804`）、PK・UNIQUE・FK・索引・CHECK・DEFAULT、距離演算子・距離関数・CAST（`::halfvec`）・比較・ORDER BY・GROUP BY・DISTINCT・集計・集合演算、COPY、CTAS・マテリアライズドビュー・`INSERT ... SELECT`、`halfvec[]`。距離計算・テキスト入出力・CAST は兄弟 #2015、HNSW は #2016 の担当。それ以外は担当 Issue 未定。
+
+## Issue #2015 追記: HALFVEC の距離計算とテキスト入出力（TABLE-46 ポインタ。SQL-72・SQL-33・SQL-74 を併記）
+
+- **計算方式**: 行の f16 を f32 へ広げ（誤差なし）、VECTOR と同じ f32 カーネル（`sql::vector_distance::distance`／`distance_fn`）で計算する。pgvector の halfvec 距離と同じ方式で、f16 のまま演算する系統（`gpu-batch-f16-arith.md`）は採らない（精度がさらに落ち、CPU の stable に f16 算術が無く、pgvector との値一致が崩れるため）。f16 の有限値は `|x| <= 65504` なので次元上限内では f32 の累積が溢れず、非有限になるのはゼロノルムのコサイン（NaN）だけ。
+- **問い合わせ側も f16 へ丸める**: 型なしリテラルは halfvec 列の相手として halfvec に解決される（pgvector 同様）。束縛時に f16 へ丸めて f32 へ戻す（`sql::exec::round_to_halfvec_f32`）。次元不一致・非有限は `22000`、範囲外は `22003`。
+- **式の束縛**: `BoundExpr::HalfVecColumnRef`（距離関数の引数の位置でだけ、識別子を直接見たときに生成）と `BoundExpr::HalfVecDistance`（距離演算子の式）を追加した。汎用の列参照の腕は HALFVEC を従来どおり拒否する（`VectorRef` を流用すると embedding が空になり黙って NULL が返るため）。裸の HALFVEC 列を算術・比較・`vector_norm`・ORDER BY・GROUP BY・CAST に使う形は従来どおり拒否。リテラル同士は `0A000`。
+- **kNN（演算子形 `ORDER BY h <=> '..' LIMIT k`）**: 通常の kNN は arena の embedding スロット（VECTOR 専用・NULL 不可の前提）を読むため、HALFVEC 表の `Select` は束縛の直前に `sql::halfvec_knn::halfvec_select_as_scan` で全走査ソートの scan 経路（関数形 `ORDER BY l2_distance(..)` と同じ実行器）へ写す。RLS・WHERE・LIMIT／OFFSET・DESC は scan 経路が担い、NULL は ASC で末尾・DESC で先頭、ゼロノルムの NaN は NULL を除いた末尾、同点は id 昇順（`tests/sql_named/sql_halfvec_distance.rs` で固定）。変換の付け忘れは従来の `0A000` に戻るだけで開かない。演算子の範囲は VECTOR と同じ `<=>`・`<#>` のみで、`<->`／`<+>` は `0A000`（L2／L1 は関数形 `ORDER BY l2_distance(..)`／`l1_distance(..)` で Top-k を得る）。hybrid・`USING PLAN`・`USING MODE`・`HINT ORDER`・索引・GPU バッチは対象外。
+- **テキスト入出力**: `'[..]'::halfvec[(N)]`・`CAST('[..]' AS halfvec[(N)])`・`halfvec '[..]'` は、被演算子が文字列リテラルの場合に限り構文段で畳み込む（`sql::cast::fold_halfvec_literal`）。検証（形式・有限性・長さ上限・修飾子との次元照合）→ f16 丸め → f32 へ戻した最短表記 `[a,b,..]` の文字列リテラルへ置換する。丸め済みの表記は再解析しても同じ値になる（冪等）ので、距離関数・距離演算子のリテラル引数にそのまま使え、投影すれば列の取り出しと同じ表記（`[0.099975586]`）で返る。結果は text（OID 25）。`CastType` は UDF の型・PL/pgSQL でも共有されるため HALFVEC を足していない。列・式の CAST（`h::text`・`h::halfvec`・`vector` との相互変換）・`halfvec[]`・バイナリ形式は `0A000`（または従来の拒否）のまま。
+- **既知の差（pgvector）**: (a) VECTOR 列と `'..'::halfvec` の距離は暗黙変換を持たず、リテラル側が文字列になるため VECTOR の距離として動く（エラーにはならない）。(b) 投影の距離列は ORDER BY と同じ形に限る制約（#2007）が残り、ORDER BY の無い `SELECT h <-> '..' FROM t` は従来どおり `42601`（関数形 `l2_distance(h, ..)` は投影できる）。(c) `$n` を使う HALFVEC の距離は未確認（対象外）。
+- **精度の実測**（`random_fixture_top_k_matches_f32_reference_within_tolerance`。200 行 × 32 次元、値は `[-1,1]` の線形合同法、問い合わせ 8 本、k = 10。VECTOR 表の f32 を参照とする）:
+
+  | metric | recall@10 | 距離の最大絶対誤差 | 距離の最大相対誤差（参照の絶対値 > 1e-3 の行） |
+  | ------ | --------- | ------------------ | ------------------------------------------- |
+  | L2 | 1.00（8 本とも） | 5.6e-4 | 1.4e-4 |
+  | コサイン | 1.00 | 1.4e-4 | 1.8e-4 |
+  | 内積 | 1.00 | 1.5e-3 | 参照が 0 に近い行で最大 1.9e-1（打ち消しによる。絶対誤差で見る） |
+  | L1 | 1.00 | 2.8e-3 | 1.4e-4 |
+
+  一致の定義: HALFVEC の Top-k の各行について、f32 参照での距離が `d_k + 2δ` 以下であること。`δ` は要素ごとの f16 丸め誤差の上限（相対 2^-11、サブノーマルで絶対 2^-25）から metric ごとに導く（L2 は `2·√n·ε`、L1 は `2·n·ε`、内積は `n·(2ε+ε²)`、コサインは `2·(√n·ε/最小ノルム + √n·ε/クエリのノルム)`。いずれも実測は上限の内側）。f16 で厳密に表せる値（0.5 刻み）の fixture では、4 metric の関数形・演算子形の距離と Top-k が VECTOR 表とビット一致する。
