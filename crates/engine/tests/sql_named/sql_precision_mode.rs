@@ -466,9 +466,12 @@ fn precision_gate_fail_closed_when_postfilter_survivors_exceed_limit_based_k_eff
             ],
         ))
         .expect("create table");
-    // id1: dense Top-1（内積 1.0）だが lang != 'ja' → SCALAR 事後フィルタで除去。
-    // id2: dense Top-2（内積 0.99）・lang = 'ja'。
-    // id3: dense Top-3（内積 0.97）・lang = 'ja'。id2 との cosine 類似度差が
+    // 密側は `<=>`（コサイン距離。SQL-33・Issue #1991）。距離は id1 = 0、
+    // id2 = 1 - 0.99/|(0.99,0.1,0)| ≈ 0.005、id3 = 1 - 0.97/|(0.97,0.2,0)| ≈ 0.021 で
+    // 順位は id1 > id2 > id3 のまま。
+    // id1: dense Top-1（距離 0）だが lang != 'ja' → SCALAR 事後フィルタで除去。
+    // id2: dense Top-2・lang = 'ja'。
+    // id3: dense Top-3・lang = 'ja'。id2 との cosine 類似度差が
     // 既定マージン閾値（0.05）未満になるよう選んだベクトル。
     let rows: [(u64, [f32; 3], &str); 3] = [
         (1, [1.0, 0.0, 0.0], "en"),
