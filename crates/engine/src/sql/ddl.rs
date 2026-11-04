@@ -3205,9 +3205,9 @@ pub(crate) fn execute_create_index(
         });
     }
     let kind = match validated.method() {
-        crate::sql::allowlist::IndexMethod::Hnsw => {
-            IndexKind::Hnsw(crate::catalog::VectorOpClass::Cosine)
-        }
+        // 演算子クラス省略は `vector_cosine_ops` の別名で、明示の cosine と同じ `IndexDef`
+        // （永続形 v1）になる（Issue #2239）。
+        crate::sql::allowlist::IndexMethod::Hnsw(opclass) => IndexKind::Hnsw(opclass),
         crate::sql::allowlist::IndexMethod::Gin(opclass) => IndexKind::Gin(opclass),
         crate::sql::allowlist::IndexMethod::Btree => IndexKind::Scalar,
     };

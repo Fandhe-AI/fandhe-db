@@ -23,7 +23,8 @@ spec 本文はここへ転記しない（`.claude/rules/spec-confidentiality.md`
 
 ```text
 CREATE INDEX <name> ON <table> ( <col> [COLLATE <名前>][, ...] )   -- スカラー宣言（COLLATE は Issue #2191）
-CREATE INDEX <name> ON <table> USING hnsw ( <col> )     -- HNSW 宣言（VECTOR 列 1 本）
+CREATE INDEX <name> ON <table> USING hnsw ( <col> )     -- HNSW 宣言（VECTOR 列 1 本。vector_cosine_ops の別名）
+CREATE INDEX <name> ON <table> USING hnsw ( <col> { vector_cosine_ops | vector_l2_ops | vector_ip_ops | vector_l1_ops } )  -- 正規構文（Issue #2239）
 CREATE INDEX <name> ON <table> USING hnsw ( <col> ) WITH ( m = <n>, ef_construction = <n> )  -- 構築パラメータ付き（Issue #2029）
 DROP INDEX <name>
 ```
@@ -77,7 +78,7 @@ DROP INDEX <name>
 | 参照列が存在しない（`id` は暗黙列として常に有効） | `42703`（`UNDEFINED_COLUMN`。新設） | 400 |
 | `CREATE INDEX` の対象がビュー・既存索引、`DROP INDEX` にテーブル・ビュー名、`DROP TABLE`／`DROP VIEW`／`ALTER TABLE ADD COLUMN`／書き込み系 DML（`INSERT`・UPSERT・`UPDATE`・`DELETE`・`TRUNCATE`）に索引名 | `42809` | 400 |
 | 対象テーブルが存在しない | `42P01` | 404 |
-| 索引列の `COLLATE` の名前が許可リストに無い（構文段。カタログを参照しない。Issue #2191） | `42704` | 400 |
+| 索引列の `COLLATE` の名前が許可リストに無い（構文段。カタログを参照しない。Issue #2191）／`USING hnsw` の演算子クラスが 4 種以外（Issue #2239） | `42704` | 400 |
 | 照合を持てない列（`id`・数値・`VECTOR` 等）・`USING hnsw` への `COLLATE`（カタログ段。Issue #2191） | `42804` | 400 |
 | `USING` が `hnsw`・`gin`・`btree` 以外（`bm25`・`hash` 等。`gin` の受理範囲は [gin-jsonb-index.md](gin-jsonb-index.md) の「Issue #2206 実装記録」）／`USING hnsw` の複数列・非 `VECTOR` 列（`id` を含む）／スカラー宣言が `VECTOR` 列・索引化非対応の型／`USING hnsw`・`COLLATE` を伴う部分索引（`WHERE`。決定的な述語の部分索引は Issue #1654、部分 UNIQUE は Issue #1657 で受理。非決定は `42P17`・集計 `42803`・ウィンドウ `42P20` は [partial-index.md](partial-index.md)）／リテラルの列指定／式要素と `UNIQUE`・`USING hnsw`・`COLLATE` の組み合わせ／索引化できない式の結果型（Issue #1648） | `0A000` | 501 |
 | 名前の無い `CREATE [UNIQUE] INDEX`／`ASC`・`DESC`／列の重複指定／`DROP` の複数名・`DROP INDEX ... CASCADE`／`(col + 1)` 等の余分なトークン | `42601` | 400 |
@@ -279,3 +280,16 @@ HNSW 宣言に任意の `WITH (m = n, ef_construction = n)` を付けられる�
 永続形は新しい版 `v10`（`v10／テーブル／hnsw／列／opclass トークン／m／ef_construction`。cosine も `v10`）で、
 旧バイナリは `v10` を未知の版として拒否する（前方互換なし）。復元は正準な 10 進と範囲を検査し、違反は
 `CorruptSchema` で fail-closed にする。NoSQL `create_index` の `with` は対象外（NOSQL-19）。opclass 構文は #2239。
+
+## Issue #2239 追記（pgvector 形の演算子クラス 4 種）
+
+- 構文: `USING hnsw ( <col> [ vector_cosine_ops | vector_l2_ops | vector_ip_ops | vector_l1_ops ] )`
+  （大文字小文字不問。INDEX-7・SQL-33 (5) ポインタ）。構文段が列の直後の識別子 1 個だけを読み、
+  `IndexKind::Hnsw(VectorOpClass)` へ対応づける。`WITH (m, ef_construction)` と併用できる。
+- 別名: 演算子クラス省略の既存構文は `vector_cosine_ops` の別名で、同じ `IndexDef`・同じ永続形
+  （cosine かつ `WITH` 無しは v1、非 cosine は v9、`WITH` 付きは v10）になる。区別はできない。
+- エラー: 未知の演算子クラス（`halfvec_*_ops`・`jsonb_ops` 等）は `42704`、`COLLATE` の後ろや
+  重複など語順の違反は `42601`（GIN と同じ既知の差分）。複数列・式・`UNIQUE`・部分索引は従来どおり `0A000`。
+- 探索: 物理グラフは cosine のみ。非 cosine の宣言は `Declared` で厳密全走査へ縮退する
+  （カーネルは別 Issue）。`--hnsw-scope all` で宣言の無いテーブルの暗黙の HNSW は cosine。
+- EXPLAIN の `hnsw_params:` の `metric=` は別名と正規構文で同一。論理ダンプの正規構文出力は #2159 の担当。
