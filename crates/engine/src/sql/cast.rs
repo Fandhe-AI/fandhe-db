@@ -833,9 +833,9 @@ pub(crate) fn parse_halfvec_cast_type(
 }
 
 /// f32 列を f16 へ丸め、f32 へ戻した最短表記の正規テキスト `[a,b,...]` を作る（空白なし）。
-/// [`fold_halfvec_literal`] の出力と、`sql::parser` の長さ上限の例外判定（正規形かどうかの照合）が
-/// 共有する単一実装。丸め後の表記は入力より長くなりうる（例: `0.1` -> `0.099975586`）ため、
-/// 再解析側（`parse_vector_literal_any_dim`）は 64 KiB 超でもこの正規形に限り上限を緩める。
+/// [`fold_halfvec_literal`] の出力生成。丸め後の表記は入力より長くなりうる（例: `0.1` ->
+/// `0.099975586`）ため、結果が `VECTOR` リテラルと同じ 64 KiB 上限を超える場合は拒否する
+/// （畳み込み結果は文字列として再解析されるため、外部入力と同じ上限を例外なく適用する）。
 pub(crate) fn canonical_halfvec_text(values: &[f32]) -> Result<String, SqlSurfaceError> {
     let rounded = crate::sql::exec::round_to_halfvec_f32(values)?;
     let mut text = String::new();
@@ -849,6 +849,13 @@ pub(crate) fn canonical_halfvec_text(values: &[f32]) -> Result<String, SqlSurfac
         text.push_str(&v.to_string());
     }
     text.push(']');
+    if text.len() > crate::sql::parser::MAX_VECTOR_LITERAL_BYTES {
+        return Err(SqlSurfaceError::payload_too_large(format!(
+            "halfvec literal length {} exceeds limit {}",
+            text.len(),
+            crate::sql::parser::MAX_VECTOR_LITERAL_BYTES
+        )));
+    }
     Ok(text)
 }
 
@@ -1887,25 +1894,14 @@ mod tests {
         assert_eq!(col.wire_code(), "0A000");
     }
 
-    /// 丸め後に 64 KiB を超える畳み込み結果も、距離関数・INSERT 側の再解析で拒否されない。
+    /// 丸め後に 64 KiB を超える畳み込み結果は、外部入力と同じ上限で 54000 として拒否する。
     #[test]
-    fn halfvec_folded_text_over_64kib_is_reparsable() {
+    fn halfvec_folded_text_over_64kib_is_rejected() {
         let n = 6000;
         let input = format!("[{}]", vec!["0.1"; n].join(","));
         assert!(input.len() < 64 * 1024);
-        let Expr::String(once) = fold_halfvec_literal(Expr::String(input), None).unwrap() else {
-            panic!("string expected");
-        };
-        assert!(once.len() > 64 * 1024);
-        let values = crate::sql::parser::parse_vector_literal(&once, n as u32).unwrap();
-        assert_eq!(values.len(), n);
-        let Expr::String(twice) =
-            fold_halfvec_literal(Expr::String(once.clone()), Some(n as u32)).unwrap()
-        else {
-            panic!("string expected");
-        };
-        assert_eq!(once, twice);
-        // 正規形でない 64 KiB 超の入力は従来どおり拒否する。
+        let err = fold_halfvec_literal(Expr::String(input), None).unwrap_err();
+        assert_eq!(err.wire_code(), "54000");
         let big = format!("[{}]", vec!["0.1"; 20000].join(","));
         assert_eq!(
             crate::sql::parser::parse_vector_literal_any_dim(&big)

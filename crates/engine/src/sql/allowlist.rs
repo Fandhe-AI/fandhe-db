@@ -12013,14 +12013,14 @@ impl<'a> Parser<'a> {
             // 残す）に当たらなかった型名が対象で、型名の直後が文字列リテラルのときだけ
             // `Expr::Cast` にする（先読みで確かめるため、同名の列参照・`numeric(1,2)` の関数呼び出し形は
             // 従来の分岐のまま）。配列型の直後の文字列は PostgreSQL と同じく構文エラー。
-            Some(Token::Ident(_)) if self.peek_halfvec_typed_literal().is_some() => {
+            Some(Token::Ident(_)) if !matches!(self.peek_halfvec_typed_literal(), Ok(None)) => {
                 if self.in_check_body {
                     return Err(SqlSurfaceError::FeatureNotSupported {
                         detail: "typed literals are not supported in a CHECK constraint"
                             .to_string(),
                     });
                 }
-                let Some((lit_pos, literal)) = self.peek_halfvec_typed_literal() else {
+                let Some((lit_pos, literal)) = self.peek_halfvec_typed_literal()? else {
                     return Err(SqlSurfaceError::unsupported("unsupported expression term"));
                 };
                 let dim = self.parse_halfvec_target_type()?.flatten();
@@ -12390,20 +12390,34 @@ impl<'a> Parser<'a> {
     }
 
     /// `halfvec[(N)] '<literal>'` の先読み（Issue #2015）。型名の直後が文字列リテラルなら
-    /// `(文字列リテラルの位置, 本文)` を返す（位置は消費しない）。修飾子が不正な形は `None`
-    /// （従来の分岐へ回す）。
-    fn peek_halfvec_typed_literal(&self) -> Option<(usize, String)> {
+    /// `Ok(Some((文字列リテラルの位置, 本文)))` を返す（位置は消費しない）。修飾子が不正な形は
+    /// `Ok(None)`（従来の分岐へ回す）。ただし `halfvec(0) '...'` は `::halfvec(0)`／`CAST` と同じく
+    /// `22000` を `Err` で返す。
+    fn peek_halfvec_typed_literal(&self) -> Result<Option<(usize, String)>, SqlSurfaceError> {
         if self.quoted_null.contains(&self.pos) {
-            return None;
+            return Ok(None);
         }
         let mut pos = self.pos;
-        crate::sql::cast::parse_halfvec_cast_type(&self.tokens, &mut pos)
-            .ok()
-            .flatten()?;
-        match self.tokens.get(pos) {
+        match crate::sql::cast::parse_halfvec_cast_type(&self.tokens, &mut pos) {
+            Ok(Some(_)) => {}
+            Ok(None) => return Ok(None),
+            Err(e) => {
+                // 修飾子 0 の直後が文字列リテラルのときだけ 22000 を伝播する（それ以外は従来の分岐）。
+                let after_zero = matches!(
+                    self.tokens.get(self.pos.saturating_add(4)),
+                    Some(Token::StringLiteral(_))
+                );
+                return if e.wire_code() == "22000" && after_zero {
+                    Err(e)
+                } else {
+                    Ok(None)
+                };
+            }
+        }
+        Ok(match self.tokens.get(pos) {
             Some(Token::StringLiteral(s)) => Some((pos, s.clone())),
             _ => None,
-        }
+        })
     }
 
     /// `<type> '<literal>'` の型名部分の先読み。現在位置が引用なしの型名の先頭語で、型名の直後が

@@ -391,6 +391,7 @@ fn text_input_and_output() {
     assert_eq!(code(&core, "SELECT '[1,2'::halfvec"), "22000");
     assert_eq!(code(&core, "SELECT '[]'::halfvec"), "22000");
     assert_eq!(code(&core, "SELECT '[1,2]'::halfvec(0)"), "22000");
+    assert_eq!(code(&core, "SELECT halfvec(0) '[1,2]'"), "22000");
     // 列値の取り出しと同じ表記になる。
     ok(
         &core,

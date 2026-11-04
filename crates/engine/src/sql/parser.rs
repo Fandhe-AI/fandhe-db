@@ -28,11 +28,7 @@ use crate::sql::using_operation_id::OperationId;
 
 /// ベクトルリテラルの生バイト長上限（SQL-1）。アロケーション（`Vec<f32>` の確保・
 /// カンマ分割）に入る前にこの長さで拒否する。
-const MAX_VECTOR_LITERAL_BYTES: usize = 64 * 1024;
-/// `::halfvec` の畳み込み結果（f16 丸め後の正規テキスト。入力より最大 9 倍強長くなりうる）を
-/// 再解析するときの絶対上限。正規形（`cast::canonical_halfvec_text` と一致）に限り適用する。
-const MAX_CANONICAL_HALFVEC_LITERAL_BYTES: usize = MAX_VECTOR_LITERAL_BYTES * 16;
-
+pub(crate) const MAX_VECTOR_LITERAL_BYTES: usize = 64 * 1024;
 /// 配列リテラルの生バイト長上限（TABLE-14・TASK-198、Issue #888・D-A5）。
 /// 列 1 個分のペイロード上限（`row_codec::MAX_TEXT_FIELD_LEN` と同値の
 /// 実装既定値）と揃え、走査（`Vec<String>` の確保・要素切り出し）に入る前に
@@ -751,29 +747,11 @@ pub fn parse_vector_literal(literal: &str, expected_dim: u32) -> Result<Vec<f32>
 /// 距離関数の引数リテラル（SQL-72 (1)・Issue #2011。相手の次元が式の評価時まで定まらない）が
 /// 次元を指定せずに使う。呼び出し側が次元を照合する。
 pub(crate) fn parse_vector_literal_any_dim(literal: &str) -> Result<Vec<f32>, SqlSurfaceError> {
-    let too_large = || {
-        SqlSurfaceError::payload_too_large(format!(
+    if literal.len() > MAX_VECTOR_LITERAL_BYTES {
+        return Err(SqlSurfaceError::payload_too_large(format!(
             "vector literal length {} exceeds limit {MAX_VECTOR_LITERAL_BYTES}",
             literal.len()
-        ))
-    };
-    if literal.len() > MAX_CANONICAL_HALFVEC_LITERAL_BYTES {
-        return Err(too_large());
-    }
-    if literal.len() > MAX_VECTOR_LITERAL_BYTES {
-        // 64 KiB 超は `::halfvec` の畳み込み結果（正規形）だけ許す。外部入力の上限は緩めず、
-        // 正規形でなければ（形式不正を含め）従来どおり上限超過として拒否する。
-        return match parse_vector_literal_body(literal) {
-            Ok(values)
-                if crate::sql::cast::canonical_halfvec_text(&values)
-                    .ok()
-                    .as_deref()
-                    == Some(literal.trim()) =>
-            {
-                Ok(values)
-            }
-            _ => Err(too_large()),
-        };
+        )));
     }
     parse_vector_literal_body(literal)
 }
