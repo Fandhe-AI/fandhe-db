@@ -1768,6 +1768,16 @@ pub(crate) fn vector_column(schema: &TableSchema) -> Result<(usize, u32), SqlSur
                 SqlSurfaceError::feature_not_supported(
                     "vector search over SPARSEVEC columns is not supported",
                 )
+            } else if schema
+                .columns
+                .iter()
+                .any(|c| matches!(c.ty, ColumnType::Bit(_)))
+            {
+                // BIT 列は SQL の `<~>`／`<%>`（scan 経路）でだけ距離を扱い、NoSQL の `search`・
+                // `USING PLAN`・hybrid の対象にできない（TABLE-48 (5)・Issue #2970。fail-closed）。
+                SqlSurfaceError::feature_not_supported(
+                    "vector search over BIT columns is not supported",
+                )
             } else {
                 SqlSurfaceError::invalid_input("table has no VECTOR column")
             }

@@ -895,3 +895,27 @@ fn vector_search_zero_norm_row_sorts_last_and_is_cut_by_limit() {
         body_utf8(&resp)
     );
 }
+
+/// Issue #2970・TABLE-48 (5): VECTOR 列を持たず BIT 列だけを持つ表への NoSQL `search` は、
+/// 「VECTOR 列が無い」(`22000`) ではなく `0A000`（BIT 列のベクトル検索は未対応）で拒否される。
+/// bit 距離は SQL の `<~>`／`<%>`（scan 経路）でだけ扱い、NoSQL からは開かない（fail-closed）。
+#[test]
+fn search_over_a_bit_only_table_is_rejected_with_0a000() {
+    let path = temp_db::unique_db_path("nosql2-search-bit-only");
+    let _guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "bits",
+            vec![ColumnDef::new("code", ColumnType::Bit(4), true)],
+        ))
+        .expect("create bit table");
+    let core = Arc::new(EngineCore::from_storage(
+        storage,
+        Box::new(CpuScalarProvider),
+    ));
+    let addr = spawn(Arc::clone(&core));
+    let body = br#"{"op":"search","table":"bits","vector":[1.0,0.0],"limit":3,"columns":["id"]}"#;
+    let resp = query_as_alice(addr, body);
+    assert_eq!(http_common::wire_code_of(&resp), "0A000", "resp={resp:?}");
+}

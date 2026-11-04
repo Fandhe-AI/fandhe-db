@@ -575,6 +575,8 @@ fn try_fold_scalar(expr: &BoundExpr) -> Option<FoldedConst> {
         | BoundExpr::VectorDistance { .. }
         | BoundExpr::HalfVecColumnRef { .. }
         | BoundExpr::HalfVecDistance { .. }
+        | BoundExpr::BitColumnRef { .. }
+        | BoundExpr::BitLiteral(_)
         | BoundExpr::VectorLiteral(_)
         | BoundExpr::WasmCall { .. }
         | BoundExpr::Null
@@ -737,6 +739,8 @@ fn compile_node(
         | BoundExpr::DecimalColumnRef { .. }
         | BoundExpr::HalfVecColumnRef { .. }
         | BoundExpr::HalfVecDistance { .. }
+        | BoundExpr::BitColumnRef { .. }
+        | BoundExpr::BitLiteral(_)
         | BoundExpr::BoolColumnRef { .. }
         | BoundExpr::UuidColumnRef { .. }
         | BoundExpr::ByteaColumnRef { .. }

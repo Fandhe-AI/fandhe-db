@@ -218,10 +218,9 @@ fn unsupported_positions_and_arguments_stay_fail_closed() {
             "SELECT binary_quantize(l2_normalize(embedding)) FROM t",
             "0A000",
         ),
-        (
-            "SELECT id FROM t ORDER BY binary_quantize(embedding) <~> '10101010101' LIMIT 3",
-            "42601",
-        ),
+        // `<~>`／`<%>` の被演算子としては受理する（Issue #2970。結果の検証は sql_bit_distance）。
+        // 距離式の外では従来どおり bit 値を消費できない。
+        ("SELECT binary_quantize(embedding) + 1 FROM t", "0A000"),
         ("SELECT binary_quantize(k) FROM t", "42804"),
         ("SELECT binary_quantize(g) FROM t", "42804"),
         ("SELECT binary_quantize(embedding, 1) FROM t", "42883"),
