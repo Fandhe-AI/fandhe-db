@@ -98,10 +98,13 @@ fn default_mode_recall_matches_pre_existing_sql1_behavior() {
         .expect("default recall execution should succeed");
     match outcome {
         SqlOutcome::Query(result) => {
-            // 独立オラクル: f64 で総当たり内積を計算し、スコア降順・同点 id 昇順で
-            // Top-3 を選ぶ（`tests/sql_surface.rs` の SQL-1 と同一オラクル。既定
-            // モード `recall` の挙動が SQL-1 から不変であることを確認する）。
+            // 独立オラクル: f64 で総当たりのコサイン距離（`1 - dot / (|a||q|)`）を計算し、
+            // 距離昇順・同点 id 昇順で並べる（`sql_surface.rs` の SQL-1 と同一方式。`<=>` は
+            // コサイン距離。SQL-33・Issue #1991）。コーパスにゼロベクトルは無く、距離は
+            // id1=0 < id2≈0.006 < id3=1 で同点が無い。既定モード `recall` の挙動が
+            // SQL-1 から不変であることを確認する。
             let query = [1.0f64, 0.0, 0.0];
+            let q_norm: f64 = query.iter().map(|b| b * b).sum::<f64>().sqrt();
             let corpus: Vec<(u64, [f64; 3])> = vec![
                 (1, [1.0, 0.0, 0.0]),
                 (2, [0.9, 0.1, 0.0]),
@@ -111,10 +114,11 @@ fn default_mode_recall_matches_pre_existing_sql1_behavior() {
                 .iter()
                 .map(|(id, emb)| {
                     let dot: f64 = emb.iter().zip(query.iter()).map(|(a, b)| a * b).sum();
-                    (*id, dot)
+                    let norm: f64 = emb.iter().map(|a| a * a).sum::<f64>().sqrt();
+                    (*id, 1.0 - dot / (norm * q_norm))
                 })
                 .collect();
-            scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+            scored.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
             let expected: Vec<u64> = scored.into_iter().map(|(id, _)| id).collect();
             let actual: Vec<u64> = result.rows.iter().map(|r| r.id).collect();
             assert_eq!(actual, expected);
