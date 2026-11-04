@@ -1404,6 +1404,30 @@ pub fn validate_param_positions(tokens: &[Token]) -> Result<u16, SqlSurfaceError
         ));
     }
 
+    // Issue #2048: `EXPLAIN` 前置の `WITH`・FROM の派生表・部分クエリ（`( SELECT`／`( WITH`）に `$n` を
+    // 含む文も拒否する（fail-closed）。上の `WITH`・派生表の拒否は先頭語が `EXPLAIN` だと効かず、
+    // EXPLAIN 経路では畳み込み・内側の述語と `$n` の対応を検証できていないため、受理は後続に譲る
+    // （非 EXPLAIN の同じ文の挙動は変えない）。
+    if matches!(tokens.first(), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("EXPLAIN"))
+        && tokens.iter().any(|t| matches!(t, Token::Param(_)))
+    {
+        let with_head =
+            matches!(join_tokens.first(), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("WITH"));
+        let has_subquery_paren = join_tokens.windows(2).any(|w| {
+            matches!(w[0], Token::Punct('('))
+                && (matches!(w[1], Token::Keyword(Keyword::Select))
+                    || matches!(&w[1], Token::Ident(n) if n.eq_ignore_ascii_case("WITH")))
+        });
+        if with_head
+            || has_subquery_paren
+            || crate::sql::derived_table::contains_derived_table(join_tokens)
+        {
+            return Err(SqlSurfaceError::unsupported(
+                "parameter placeholders are not supported in EXPLAIN of statements with CTEs or subqueries",
+            ));
+        }
+    }
+
     // パターン 4（WHERE 等価）の受理範囲は [`where_region`] が単一情報源として
     // 判定する（[`where_equality_literal_is_param`] も同じ境界判定を再利用し、
     // 両関数間で境界判定がずれる余地をなくす）。`SET`（statement 全体）である
@@ -2687,6 +2711,29 @@ mod tests {
             "SELECT k FROM a WHERE k = $1 UNION SELECT k FROM b",
         )
         .expect("tokenize");
+        assert!(validate_param_positions(&tokens).is_ok());
+    }
+
+    /// Issue #2048: `EXPLAIN` 前置の `WITH`・派生表・部分クエリに `$n` を含む文は `42601`。
+    /// 部分クエリも CTE も無い `EXPLAIN` の `$n` は従来どおり受理する。
+    #[test]
+    fn explain_cte_and_subquery_with_param_is_rejected() {
+        for sql in [
+            "EXPLAIN WITH c AS (SELECT id FROM t) SELECT id FROM c WHERE id = $1",
+            "EXPLAIN SELECT id FROM (SELECT id FROM t) x WHERE id = $1",
+            "EXPLAIN SELECT id FROM t WHERE k IN (SELECT k FROM u) AND id = $1",
+            "EXPLAIN SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u) AND id = $1",
+        ] {
+            let tokens = crate::sql::lexer::tokenize_with_params(sql).expect("tokenize");
+            assert_eq!(
+                validate_param_positions(&tokens).unwrap_err().wire_code(),
+                "42601",
+                "{sql}"
+            );
+        }
+        let tokens =
+            crate::sql::lexer::tokenize_with_params("EXPLAIN SELECT id FROM t WHERE id = $1")
+                .expect("tokenize");
         assert!(validate_param_positions(&tokens).is_ok());
     }
 
