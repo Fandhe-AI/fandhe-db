@@ -77,6 +77,16 @@ fn open_storage() -> (Storage, temp_db::CleanupGuard) {
             ],
         ))
         .expect("create table");
+    // Issue #2021（TABLE-48）: BIT(n) 列の text 束縛用。
+    storage
+        .create_table(&TableSchema::new(
+            "bits",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(3), false),
+                ColumnDef::new("b", ColumnType::Bit(4), true),
+            ],
+        ))
+        .expect("create table");
     (storage, guard)
 }
 
@@ -463,6 +473,42 @@ fn insert_with_bound_values_and_operation_id() {
         &[Some(b"[0.1,0.2,0.3]"), Some(b"inserted"), Some(b"op-1")],
         "23505",
     );
+}
+
+/// BIT(n) 列への `$n` text 束縛（TABLE-48・Issue #2021）: リテラル形と同じ値の往復と、
+/// 文字種違反 `22P02`・ビット数不一致 `22026` の写像。バイナリ形式は `0A000`。
+#[test]
+fn bit_column_accepts_text_binding_and_maps_errors() {
+    let (core, _g) = new_core();
+    let addr = spawn(core);
+    let mut ext = connect(addr, "alice");
+    let mut simple = connect(addr, "alice");
+
+    let sql =
+        "INSERT INTO bits (id, embedding, b) VALUES (1, '[0.1,0.2,0.3]', $1) USING OPERATION_ID $2";
+    let (_, tag) = run_extended(&mut ext, sql, &[], &[Some(b"1010"), Some(b"bit-op-1")]);
+    assert!(tag.starts_with("INSERT"), "tag: {tag}");
+    let (rows, _) = run_simple(&mut simple, "SELECT id, b FROM bits LIMIT 10");
+    assert_eq!(rows.len(), 1);
+
+    send_pbes_expect_error(
+        &mut ext,
+        sql,
+        &[],
+        &[],
+        &[Some(b"101"), Some(b"bit-op-2")],
+        "22026",
+    );
+    send_pbes_expect_error(
+        &mut ext,
+        sql,
+        &[],
+        &[],
+        &[Some(b"10x1"), Some(b"bit-op-3")],
+        "22P02",
+    );
+    let (rows, _) = run_simple(&mut simple, "SELECT id, b FROM bits LIMIT 10");
+    assert_eq!(rows.len(), 1, "rejected binds must not write rows");
 }
 
 #[test]

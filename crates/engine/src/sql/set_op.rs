@@ -108,6 +108,8 @@ fn cell_payload_bytes(cell: &Cell) -> usize {
     match cell {
         Cell::Text(s) => s.len(),
         Cell::Bytes(b) => b.len(),
+        // wire／HTTP 応答のテキスト展開（ビット数と同じ文字数）後の大きさで課金する。
+        Cell::Bit(v) => usize::try_from(v.bit_len()).unwrap_or(usize::MAX),
         Cell::Json(s) => s.len(),
         // 正確な内部表現サイズではなく十進文字列表現による近似（予算計上の
         // 目的では十分。実際の確保量を下回らない側に倒す）。
@@ -266,7 +268,7 @@ pub(crate) fn check_branch_type_compatibility(
     // Issue #1579）。UNION ALL も含め、重複除去の行キー化に到達させない。
     if columns_have_interval(l_columns) || columns_have_interval(r_columns) {
         return Err(SqlSurfaceError::FeatureNotSupported {
-            detail: "INTERVAL columns cannot be used in set operations yet".to_string(),
+            detail: "INTERVAL and BIT columns cannot be used in set operations yet".to_string(),
         });
     }
     if l_columns.len() != r_columns.len() {
@@ -292,16 +294,17 @@ pub(crate) fn check_branch_type_compatibility(
     Ok(())
 }
 
-/// 列メタデータに `INTERVAL` 列が含まれるか（集合演算の fail-closed 判定。Issue #1579）。
+/// 列メタデータに `INTERVAL`／`BIT(n)` 列が含まれるか（集合演算の fail-closed 判定。
+/// Issue #1579・#2021）。
 fn columns_have_interval(columns: &[ColumnMeta]) -> bool {
     columns.iter().any(|c| {
         matches!(
             c,
             ColumnMeta::Scalar {
-                ty: ColumnType::Interval,
+                ty: ColumnType::Interval | ColumnType::Bit(_),
                 ..
             } | ColumnMeta::Computed {
-                ty: Some(ColumnType::Interval),
+                ty: Some(ColumnType::Interval | ColumnType::Bit(_)),
                 ..
             }
         )
@@ -453,6 +456,13 @@ pub(crate) fn row_key(row: &ResultRow) -> Result<Vec<u8>, SqlSurfaceError> {
                     detail: "INTERVAL column reached set operation row key encoding".to_string(),
                 });
             }
+            // `BIT(n)` は集合演算の型検証で事前に拒否される想定のため到達しない。破損状態を
+            // 防御的に拒否する（fail-closed。Issue #2021）。
+            Cell::Bit(_) => {
+                return Err(SqlSurfaceError::Internal {
+                    detail: "BIT column reached set operation row key encoding".to_string(),
+                });
+            }
             // §2.2 の型検証（重複除去を伴う演算からの `VECTOR` 列排除）で本来
             // 到達しない。破損状態を防御的に拒否する（fail-closed。XX000）。
             Cell::Vector(_) => {
@@ -530,7 +540,7 @@ pub(crate) fn row_key_len(row: &ResultRow) -> Result<usize, SqlSurfaceError> {
             // 型タグ 1 byte ＋ `i64` の 8 byte（`row_key` の `Cell::TimestampTz`。Issue #1576）。
             Cell::TimestampTz(_) => 1 + 8,
             // `row_key` が拒否する（到達しない）ため寸法は 0。
-            Cell::Interval(_) => 0,
+            Cell::Interval(_) | Cell::Bit(_) => 0,
             // §2.2 の型検証で本来到達しない（`row_key` と同じ防御的拒否）。
             Cell::Vector(_) => {
                 return Err(SqlSurfaceError::Internal {

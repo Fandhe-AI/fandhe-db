@@ -326,6 +326,9 @@ pub(crate) fn redact_row_conversion_error(e: SqlSurfaceError) -> SqlSurfaceError
         E::IntervalFieldOverflow { .. } => E::IntervalFieldOverflow {
             detail: "interval field overflow during column type conversion".to_string(),
         },
+        E::StringDataLengthMismatch { .. } => E::StringDataLengthMismatch {
+            detail: "string data length mismatch during column type conversion".to_string(),
+        },
         E::DivisionByZero { .. } => E::DivisionByZero {
             detail: "division by zero during column type conversion".to_string(),
         },
@@ -495,6 +498,9 @@ mod tests {
                 detail: secret.to_string(),
             },
             SqlSurfaceError::IntervalFieldOverflow {
+                detail: secret.to_string(),
+            },
+            SqlSurfaceError::StringDataLengthMismatch {
                 detail: secret.to_string(),
             },
             SqlSurfaceError::DivisionByZero {

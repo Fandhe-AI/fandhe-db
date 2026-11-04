@@ -154,6 +154,24 @@ fn try_alloc_array_for_budget(
     Ok(Value::Array(array_value))
 }
 
+/// [`try_alloc_bytes_for_budget`] の `BIT(n)` 版（Issue #2021）。本体バイト数を予算へ計上してから
+/// 複製する。借用形は行 codec が検証済みだが、不変条件は所有形への変換で再検証する。
+fn try_alloc_bit_for_budget(
+    r: crate::bit_string::BitRef<'_>,
+    budget: &mut usize,
+    cap: usize,
+) -> Result<crate::bit_string::BitString, ArenaError> {
+    // テキスト展開（n 文字）後の大きさで課金するため、packed 分は下の委譲先が計上し、
+    // 展開による増分（ビット数 − packed バイト数）をここで先に計上する。
+    let expansion = usize::try_from(r.bit_len())
+        .unwrap_or(usize::MAX)
+        .saturating_sub(r.as_bytes().len());
+    *budget = try_accumulate_budget(*budget, expansion, cap)?;
+    let bytes = try_alloc_bytes_for_budget(r.as_bytes(), budget, cap)?;
+    crate::bit_string::BitString::from_parts(r.bit_len(), bytes)
+        .map_err(|e| ArenaError::AllocationFailed(e.message().to_string()))
+}
+
 /// [`try_alloc_text_for_budget`] の `BYTEA` 版（Issue #886）。UTF-8 検証が
 /// 無い点のみ異なり、累計バイト量の予算管理・確保失敗時の扱いは共有する。
 fn try_alloc_bytes_for_budget(
@@ -233,6 +251,9 @@ pub enum Cell {
     /// `INTERVAL` 列の投影結果（TABLE-34・Issue #1579）。月・日・マイクロ秒の三要素。
     /// テキスト整形は [`crate::datetime::format_interval`] に委譲する。
     Interval(crate::datetime::Interval),
+    /// `BIT(n)` 列の投影結果（TABLE-48・Issue #2021）。テキスト整形は
+    /// [`crate::bit_string::BitString::format_text`]（`0`／`1` の並び）に委譲する。
+    Bit(crate::bit_string::BitString),
     /// 配列列（TABLE-14・TASK-198、Issue #888）の投影結果。
     Array(row_codec::ArrayValue),
     /// `BYTEA` 列の投影結果（Issue #886）。
@@ -600,6 +621,7 @@ fn candidate_value_to_scalar_ref<'a>(
         Value::Time(v) => Some(ScalarRef::Time(*v)),
         Value::TimestampTz(v) => Some(ScalarRef::TimestampTz(*v)),
         Value::Interval(v) => Some(ScalarRef::Interval(*v)),
+        Value::Bit(v) => Some(ScalarRef::Bit(v.as_bit_ref())),
         Value::Bytes(b) => Some(ScalarRef::Bytes(b.as_slice())),
         Value::Json(t) => Some(ScalarRef::Json(t.as_str())),
         Value::Enum(label) => Some(ScalarRef::Enum(label.as_str())),
@@ -1526,6 +1548,14 @@ pub(crate) fn execute_statement_with_cache(
                     }
                     Some(row_codec::ScalarRef::Interval(v)) => {
                         kept.push(Value::Interval(v));
+                    }
+                    Some(row_codec::ScalarRef::Bit(r)) => {
+                        let owned = try_alloc_bit_for_budget(
+                            r,
+                            &mut candidate_scalar_bytes,
+                            MAX_CANDIDATE_SCALAR_BYTES,
+                        )?;
+                        kept.push(Value::Bit(owned));
                     }
                     Some(row_codec::ScalarRef::Array(array_ref)) => {
                         let value = try_alloc_array_for_budget(
@@ -3126,6 +3156,15 @@ fn decode_deferred_scalars(
             Some(row_codec::ScalarRef::Time(t)) => out.push(Value::Time(t)),
             Some(row_codec::ScalarRef::TimestampTz(t)) => out.push(Value::TimestampTz(t)),
             Some(row_codec::ScalarRef::Interval(v)) => out.push(Value::Interval(v)),
+            Some(row_codec::ScalarRef::Bit(r)) => {
+                let owned = try_alloc_bit_for_budget(r, budget, MAX_CANDIDATE_SCALAR_BYTES)
+                    .map_err(|_| {
+                        SqlSurfaceError::payload_too_large(
+                            "deferred scalar projection exceeds candidate budget",
+                        )
+                    })?;
+                out.push(Value::Bit(owned));
+            }
             Some(row_codec::ScalarRef::Array(array_ref)) => {
                 let value =
                     try_alloc_array_for_budget(array_ref, budget, MAX_CANDIDATE_SCALAR_BYTES)
@@ -3410,6 +3449,7 @@ fn project_rows(
                                 | Some(Value::Time(_))
                                 | Some(Value::TimestampTz(_))
                                 | Some(Value::Interval(_))
+                                | Some(Value::Bit(_))
                                 | Some(Value::Array(_))
                                 | Some(Value::Bytes(_))
                                 | Some(Value::Json(_))
@@ -3438,6 +3478,7 @@ fn project_rows(
                             | Some(Value::Time(_))
                             | Some(Value::TimestampTz(_))
                             | Some(Value::Interval(_))
+                            | Some(Value::Bit(_))
                             | Some(Value::Array(_))
                             | Some(Value::Bytes(_))
                             | Some(Value::Json(_))
@@ -3463,6 +3504,7 @@ fn project_rows(
                             | Some(Value::Time(_))
                             | Some(Value::TimestampTz(_))
                             | Some(Value::Interval(_))
+                            | Some(Value::Bit(_))
                             | Some(Value::Array(_))
                             | Some(Value::Bytes(_))
                             | Some(Value::Json(_))
@@ -3515,6 +3557,7 @@ fn project_rows(
                             | Some(Value::Time(_))
                             | Some(Value::TimestampTz(_))
                             | Some(Value::Interval(_))
+                            | Some(Value::Bit(_))
                             | Some(Value::Array(_))
                             | Some(Value::Bytes(_))
                             | Some(Value::Json(_))
@@ -3540,6 +3583,7 @@ fn project_rows(
                             | Some(Value::Time(_))
                             | Some(Value::TimestampTz(_))
                             | Some(Value::Interval(_))
+                            | Some(Value::Bit(_))
                             | Some(Value::Array(_))
                             | Some(Value::Bytes(_))
                             | Some(Value::Json(_))
@@ -3565,6 +3609,7 @@ fn project_rows(
                             | Some(Value::Time(_))
                             | Some(Value::TimestampTz(_))
                             | Some(Value::Interval(_))
+                            | Some(Value::Bit(_))
                             | Some(Value::Array(_))
                             | Some(Value::Bytes(_))
                             | Some(Value::Json(_))
@@ -3590,6 +3635,7 @@ fn project_rows(
                             | Some(Value::Time(_))
                             | Some(Value::TimestampTz(_))
                             | Some(Value::Interval(_))
+                            | Some(Value::Bit(_))
                             | Some(Value::Array(_))
                             | Some(Value::Bytes(_))
                             | Some(Value::Json(_))
@@ -3615,6 +3661,7 @@ fn project_rows(
                             | Some(Value::Timestamp(_))
                             | Some(Value::TimestampTz(_))
                             | Some(Value::Interval(_))
+                            | Some(Value::Bit(_))
                             | Some(Value::Array(_))
                             | Some(Value::Bytes(_))
                             | Some(Value::Json(_))
@@ -3640,6 +3687,7 @@ fn project_rows(
                             | Some(Value::Timestamp(_))
                             | Some(Value::Time(_))
                             | Some(Value::Interval(_))
+                            | Some(Value::Bit(_))
                             | Some(Value::Array(_))
                             | Some(Value::Bytes(_))
                             | Some(Value::Json(_))
@@ -3654,7 +3702,8 @@ fn project_rows(
                         ColumnType::Interval => match decoded.get(*index) {
                             Some(Value::Interval(v)) => cells.push(Cell::Interval(*v)),
                             Some(Value::Null) | None => cells.push(Cell::Null),
-                            Some(Value::Integer(_))
+                            Some(Value::Bit(_))
+                            | Some(Value::Integer(_))
                             | Some(Value::BigInt(_))
                             | Some(Value::Vector(_))
                             | Some(Value::Real(_))
@@ -3671,6 +3720,16 @@ fn project_rows(
                             | Some(Value::Enum(_))
                             | Some(Value::Numeric(_))
                             | Some(Value::Uuid(_)) => {
+                                return Err(SqlSurfaceError::Internal {
+                                    detail: "scalar payload type mismatch".to_string(),
+                                })
+                            }
+                        },
+                        ColumnType::Bit(_) => match decoded.get(*index) {
+                            Some(Value::Bit(v)) => cells.push(Cell::Bit(v.clone())),
+                            Some(Value::Null) | None => cells.push(Cell::Null),
+                            // 列型と値の不一致は内部不整合（fail-closed）。
+                            Some(_) => {
                                 return Err(SqlSurfaceError::Internal {
                                     detail: "scalar payload type mismatch".to_string(),
                                 })
@@ -3693,6 +3752,7 @@ fn project_rows(
                             | Some(Value::Time(_))
                             | Some(Value::TimestampTz(_))
                             | Some(Value::Interval(_))
+                            | Some(Value::Bit(_))
                             | Some(Value::Bytes(_))
                             | Some(Value::Json(_))
                             | Some(Value::Enum(_))
@@ -3728,6 +3788,7 @@ fn project_rows(
                             | Some(Value::Time(_))
                             | Some(Value::TimestampTz(_))
                             | Some(Value::Interval(_))
+                            | Some(Value::Bit(_))
                             | Some(Value::Array(_))
                             | Some(Value::Json(_))
                             | Some(Value::Enum(_))
@@ -3753,6 +3814,7 @@ fn project_rows(
                             | Some(Value::Time(_))
                             | Some(Value::TimestampTz(_))
                             | Some(Value::Interval(_))
+                            | Some(Value::Bit(_))
                             | Some(Value::Array(_))
                             | Some(Value::Bytes(_))
                             | Some(Value::Enum(_))
@@ -3778,6 +3840,7 @@ fn project_rows(
                             | Some(Value::Time(_))
                             | Some(Value::TimestampTz(_))
                             | Some(Value::Interval(_))
+                            | Some(Value::Bit(_))
                             | Some(Value::Array(_))
                             | Some(Value::Bytes(_))
                             | Some(Value::Json(_))
@@ -3803,6 +3866,7 @@ fn project_rows(
                             | Some(Value::Time(_))
                             | Some(Value::TimestampTz(_))
                             | Some(Value::Interval(_))
+                            | Some(Value::Bit(_))
                             | Some(Value::Array(_))
                             | Some(Value::Bytes(_))
                             | Some(Value::Json(_))

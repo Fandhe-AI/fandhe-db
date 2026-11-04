@@ -1714,6 +1714,7 @@ impl ScalarIndex {
                 // `docs/design/scalar-index-prune.md`「Issue #893」節参照）。
                 // `VECTOR` 列も従来どおり索引対象外。
                 ColumnType::Vector(_)
+                | ColumnType::Bit(_)
                 | ColumnType::Boolean
                 | ColumnType::Array(_)
                 | ColumnType::Json

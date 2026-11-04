@@ -61,6 +61,8 @@ fn expected_types() -> Vec<(&'static str, i32, i16)> {
         ("tz", 1184, 8),
         // INTERVAL は interval（OID 1186・typlen 16。TABLE-34・Issue #1583）。
         ("iv", 1186, 16),
+        // BIT(n)（TABLE-48・Issue #2021）。typmod は n。
+        ("bt", 1560, -1),
     ]
 }
 
@@ -115,6 +117,7 @@ fn new_core_typed_probe() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
                 ColumnDef::new("tm", ColumnType::Time, false),
                 ColumnDef::new("tz", ColumnType::TimestampTz, false),
                 ColumnDef::new("iv", ColumnType::Interval, false),
+                ColumnDef::new("bt", ColumnType::Bit(10), false),
             ],
         ))
         .expect("create table");
@@ -159,6 +162,9 @@ fn new_core_typed_probe() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
                 days: -1,
                 micros: 7_200_000_000,
             }),
+            Value::Bit(
+                engine::bit_string::BitString::parse_text("1010101011", 10).expect("bit literal"),
+            ),
         ],
         &op_id,
     )
@@ -168,7 +174,7 @@ fn new_core_typed_probe() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
     (Arc::new(core), guard)
 }
 
-const SELECT_ALL: &str = "SELECT id, embedding, flag, n, b, r, d, day, ts, blob, uid, doc, docb, price, tags, mood, vc, sm, tm, tz, iv FROM typed_probe LIMIT 10";
+const SELECT_ALL: &str = "SELECT id, embedding, flag, n, b, r, d, day, ts, blob, uid, doc, docb, price, tags, mood, vc, sm, tm, tz, iv, bt FROM typed_probe LIMIT 10";
 
 /// 受入基準 1〜3: 新規スカラー型が PostgreSQL 組み込み OID・typlen で公告され、
 /// 既存の `id`（`numeric`）・`VECTOR`（`text`）の公告は不変であることを、
@@ -232,6 +238,7 @@ fn data_row_text_values_are_unchanged_by_new_oid_announcements() {
         "tm",
         "tz",
         "iv",
+        "bt",
     ];
     assert_eq!(row.len(), names.len());
     let by_name = |name: &str| -> Option<String> {
@@ -267,6 +274,7 @@ fn data_row_text_values_are_unchanged_by_new_oid_announcements() {
         by_name("iv").as_deref(),
         Some("1 year 2 mons -1 days +02:00:00")
     );
+    assert_eq!(by_name("bt").as_deref(), Some("1010101011"));
 
     let _tag = read_command_complete(&mut stream);
     read_ready_for_query(&mut stream);

@@ -15277,6 +15277,8 @@ impl EngineCore {
                     crate::row_codec::Value::TimestampTz(_) => 8,
                     // INTERVAL 値は行コーデック上 16 バイト固定（Issue #1579）。
                     crate::row_codec::Value::Interval(_) => 16,
+                    // BIT 値は presence(1) + ビット長(4) + ceil(len/8) バイト（Issue #2021）。
+                    crate::row_codec::Value::Bit(v) => 5usize.saturating_add(v.as_bytes().len()),
                     // 配列値（Issue #888）は実際の行コーデック（`row_codec::
                     // scalar_array_entry_len`）が書き込むフレーム込みの全
                     // エンコード長をそのまま使う（presence(1)・flags(1)・

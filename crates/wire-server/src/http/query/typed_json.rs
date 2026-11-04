@@ -421,6 +421,14 @@ pub fn map_json_to_literal(
                 "INTERVAL column value must be a JSON string",
             )),
         },
+        // BIT(n) は JSON 文字列を文字列リテラルとして束縛し、文字種（`22P02`）・ビット数
+        // （`22026`）の検査は engine の `bind_bit_literal` に委ねる（TABLE-48・Issue #2021）。
+        ColumnType::Bit(_) => match raw {
+            JsonValue::String(s) => Ok(InsertLiteral::String(s.clone())),
+            _ => Err(TypedJsonError::TypeMismatch(
+                "BIT column value must be a JSON string",
+            )),
+        },
         // SMALLINT は INTEGER／BIGINT と同じ規則で束縛し、範囲検査は engine の
         // `bind_integer_literal` に一本化する（TABLE-30・NOSQL-17・Issue #1561）。
         ColumnType::SmallInt | ColumnType::Integer | ColumnType::BigInt => match raw {

@@ -43,6 +43,31 @@ impl DistanceKind {
     }
 }
 
+/// 二値ベクトル（`bit(n)`）用の距離演算子の種別（Issue #2021・TABLE-48 ポインタ）。
+///
+/// f32 ベクトル用の [`DistanceKind`] とは別の型にしている。`DistanceKind` は opclass 写像・
+/// f32 カーネル・content_hash のタグへ網羅的に接続されており、bit 用の種別を足すと偽の
+/// 写像か到達不能な腕が要る（fail-open の温床）ため。lexer が [`Token::BitDistanceOp`] に
+/// 載せる。`sql::allowlist` はどの文法位置でもこのトークンを受理せず構文段で 42601 にする
+/// （ORDER BY・式への接続は距離カーネル側の Issue の担当）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BitDistanceKind {
+    /// `<~>`（ハミング距離）
+    Hamming,
+    /// `<%>`（ジャッカード距離）
+    Jaccard,
+}
+
+impl BitDistanceKind {
+    /// 元の演算子文字列（`render_tokens` の再描画用。固定文字列のみ）。
+    pub const fn operator(self) -> &'static str {
+        match self {
+            BitDistanceKind::Hamming => "<~>",
+            BitDistanceKind::Jaccard => "<%>",
+        }
+    }
+}
+
 /// トークナイザが認識する字句の種類。
 ///
 /// キーワードは大文字小文字を区別せず ASCII 大文字へ正規化した上で、
@@ -138,6 +163,9 @@ pub enum Token {
     /// `ORDER BY`・`$n` のベクトル位置は 4 種とも受理する（Issue #1977）。実行は種別ごとの
     /// カーネル接続 Issue まで `0A000`（`sql::exec` の入口で fail-closed）。
     DistanceOp(DistanceKind),
+    /// 二値ベクトルの距離演算子 `<~>`・`<%>`（Issue #2021・TABLE-48 ポインタ）。allowlist は
+    /// どの位置でも受理しない（構文段 42601 で fail-closed）。
+    BitDistanceOp(BitDistanceKind),
     /// `<=`（TASK-79・SQL-9: 式述語の比較演算子）。
     Le,
     /// `>=`（TASK-79・SQL-9: 式述語の比較演算子）。
@@ -268,6 +296,7 @@ pub(crate) fn render_tokens(tokens: &[Token]) -> Option<String> {
             }
             Token::Punct(c) => out.push(*c),
             Token::DistanceOp(kind) => out.push_str(kind.operator()),
+            Token::BitDistanceOp(kind) => out.push_str(kind.operator()),
             Token::Le => out.push_str("<="),
             Token::Ge => out.push_str(">="),
             Token::Arrow => out.push_str("->"),
@@ -873,6 +902,24 @@ fn tokenize_impl(
                 if matches!(third.peek(), Some(&(_, '>'))) {
                     third.next();
                     tokens.push(Token::DistanceOp(kind));
+                    chars = third;
+                    continue;
+                }
+            }
+            // `<~>`（ハミング）・`<%>`（ジャッカード）（Issue #2021）。3 文字目の `>` を確認
+            // できたときだけ確定する。`<~`・`<~*`・`<%` は従来どおり `<` だけを出して
+            // `~`・`~*`・`%` を既存分岐へ戻す（正規表現マッチ・剰余の字句は変えない）。
+            let bit_kind = match lookahead.peek() {
+                Some(&(_, '~')) => Some(BitDistanceKind::Hamming),
+                Some(&(_, '%')) => Some(BitDistanceKind::Jaccard),
+                _ => None,
+            };
+            if let Some(kind) = bit_kind {
+                let mut third = lookahead.clone();
+                third.next();
+                if matches!(third.peek(), Some(&(_, '>'))) {
+                    third.next();
+                    tokens.push(Token::BitDistanceOp(kind));
                     chars = third;
                     continue;
                 }
@@ -2849,5 +2896,69 @@ mod quoted_bool_word_tests {
         // 描画は引用付きで往復する。
         let rendered = render_tokens(&toks).expect("render");
         assert_eq!(tokenize(&rendered).expect("retokenize"), toks);
+    }
+}
+/// Issue #2021（TABLE-48 ポインタ）: `<~>`・`<%>` の字句化と既存字句の不変性。
+#[cfg(test)]
+mod bit_distance_op_tests {
+    use super::*;
+
+    fn toks(sql: &str) -> Vec<Token> {
+        tokenize(sql).expect("tokenize should succeed")
+    }
+
+    fn id(s: &str) -> Token {
+        Token::Ident(s.to_string())
+    }
+
+    #[test]
+    fn bit_distance_ops_are_single_tokens() {
+        let ham = Token::BitDistanceOp(BitDistanceKind::Hamming);
+        let jac = Token::BitDistanceOp(BitDistanceKind::Jaccard);
+        assert_eq!(toks("a <~> b"), vec![id("a"), ham.clone(), id("b")]);
+        assert_eq!(toks("a<~>b"), vec![id("a"), ham, id("b")]);
+        assert_eq!(toks("a <%> b"), vec![id("a"), jac.clone(), id("b")]);
+        assert_eq!(toks("a<%>b"), vec![id("a"), jac.clone(), id("b")]);
+        assert_eq!(
+            toks("5<%>3"),
+            vec![Token::Number("5".into()), jac, Token::Number("3".into())]
+        );
+    }
+
+    #[test]
+    fn partial_matches_keep_legacy_tokens() {
+        let p = Token::Punct;
+        assert_eq!(
+            toks("a <~ b"),
+            vec![id("a"), p('<'), Token::RegexMatch, id("b")]
+        );
+        assert_eq!(
+            toks("a<~*b"),
+            vec![id("a"), p('<'), Token::RegexMatchCi, id("b")]
+        );
+        assert_eq!(toks("a <% b"), vec![id("a"), p('<'), p('%'), id("b")]);
+        assert_eq!(toks("a % b"), vec![id("a"), p('%'), id("b")]);
+        assert_eq!(toks("a%b"), vec![id("a"), p('%'), id("b")]);
+        assert_eq!(toks("%%"), vec![p('%'), p('%')]);
+        // `--` は行コメントとして読み飛ばす。
+        assert_eq!(toks("a <%-- x"), vec![id("a"), p('<'), p('%')]);
+        assert_eq!(toks("a <-> b")[1], Token::DistanceOp(DistanceKind::L2));
+        assert_eq!(toks("a <=> b")[1], Token::DistanceOp(DistanceKind::Cosine));
+        assert_eq!(toks("a <= b")[1], Token::Le);
+        assert_eq!(toks("a <@ b")[1], Token::JsonContainedBy);
+        assert_eq!(toks("a < b")[1], p('<'));
+        assert_eq!(toks("a ~ 'x'")[1], Token::RegexMatch);
+        assert_eq!(toks("a !~ 'x'")[1], Token::RegexNotMatch);
+    }
+
+    #[test]
+    fn render_round_trips_bit_distance_ops() {
+        for sql in [
+            "a <~> b", "a <%> b", "a < ~ b", "a < % b", "a <~ b", "a <% b",
+        ] {
+            let tokens = toks(sql);
+            let rendered = render_tokens(&tokens).expect("render");
+            assert_eq!(toks(&rendered), tokens, "{sql}");
+        }
     }
 }

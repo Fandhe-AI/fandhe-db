@@ -2449,6 +2449,9 @@ fn column_default_from_literal(
         // INTERVAL の既定値も文字列リテラルの原文を保持し、解釈は束縛時
         // （`parser::bind_column_default`）に行う（Issue #1579）。
         ColumnType::Interval => "interval",
+        // BIT(n) の既定値は文字列リテラルの原文を保持し、解釈は束縛時
+        // （`parser::bind_column_default`）に行う（Issue #2021）。
+        ColumnType::Bit(_) => "bit",
         ColumnType::Json => "json",
         ColumnType::Jsonb => "jsonb",
         ColumnType::Bytea => "bytea",
@@ -2540,6 +2543,7 @@ fn column_default_from_literal(
                 || kind == "time"
                 || kind == "timestamptz"
                 || kind == "interval"
+                || kind == "bit"
                 || kind == "uuid"
                 || kind == "enum"
                 || kind == "json" =>

@@ -5,6 +5,7 @@ pub mod arena;
 pub mod batch_fallback;
 pub mod batch_limits;
 pub mod batch_search;
+pub mod bit_string;
 pub mod buffer_pool;
 pub mod bytea;
 pub mod catalog;

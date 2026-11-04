@@ -780,3 +780,12 @@ NoSQL 表層の JSON 束縛（`insert`／`update`／`filter`）の型別対応�
 ## Issue #1566 追記: CHAR(n) の空白詰めと bpchar 比較
 
 - 保存形は n 文字へ半角空白で詰めた値、比較・GROUP BY・ORDER BY・索引キーは末尾の半角空白を除いた値（TABLE-31）。`is_text_like`／`same_value_domain` は広げず、各 match 腕で Bpchar を個別に扱う（FK・ALTER・PK・UNIQUE は #1567 で解禁。正準キーはタグ 1 を TEXT と共有し FK の型照合は `fk_types_compatible` に集約）。詳細は `docs/design/implementation-status.md` の Issue #1566・#1567 の項を参照。
+
+## Issue #2021 追記: BIT(n) 列と `<~>`・`<%>` の字句（TABLE-48 (1)(4)(5) ポインタ）
+
+- **距離トークンは別型**: `lexer::BitDistanceKind { Hamming, Jaccard }` と `Token::BitDistanceOp` を新設し、f32 専用の `DistanceKind`（opclass 写像・f32 カーネル・`content_hash` のタグへ網羅的に接続済み）は拡張しない。拡張すると偽の写像か到達不能な腕が要り、ワイルドカード禁止方針が防ぐ fail-open の温床になるため。`allowlist` は新トークンを受理せず、ORDER BY・式への接続は距離カーネル側の Issue で扱う。
+- **値表現**: `bit_string::BitString`（所有）・`BitRef`（借用）。`Value::Bytes` を流用しない（bytea として比較・整形される取り違えを防ぐ）。ビット順は MSB 先頭、末尾の詰め物ビットは 0。後続の popcount と `binary_quantize` も同じ順序を共有する前提。
+- **カタログ**: タグ `bit`・param は `n` の 10 進（先頭ゼロ・符号・`-`・範囲外は復号で拒否）。`bit`・`varbit` は ENUM 名として予約する。`BIT(N)` は VECTOR 列の本数に数えない。
+- **行 codec**: 自己記述型（presence ＋ `u32` LE ビット長 ＋ `ceil(len/8)` バイト）。encode でも宣言長との一致を再検証する。`ALTER TABLE ADD COLUMN` の DEFAULT は `TableSchema::bit_default_ref`（遅延キャッシュ）から借用で補完する。
+- **エラー分類**: 文字種違反 `22P02`、ビット数不一致 `22026`（`ErrorClass::StringDataLengthMismatch` を新設）、`BIT(0)`・上限超過 `22023`、未対応の型綴り `0A000`。
+- **対象外**: `B'1010'` ビット列定数、`'1010'::bit(4)`／CAST、`hamming_distance`・`jaccard_distance`、比較述語・ORDER BY・GROUP BY、wire のバイナリ形式（`bit_send`／`bit_recv`）と宣言 OID 1560 の Parse、COPY BINARY、`bit[]`（OID 1561）、`BIT VARYING`。距離カーネルの SQL 接続と `binary_quantize` は兄弟 Issue の担当。

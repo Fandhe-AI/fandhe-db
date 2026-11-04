@@ -3628,6 +3628,9 @@ const CREATE_ONLY_RESERVED_TYPE_NAMES: &[&str] = &[
     "timestamptz",
     // Issue #1579（TABLE-34）。`INTERVAL` は型名解決表の語。
     "interval",
+    // Issue #2021（TABLE-48）。`BIT`・`VARBIT` は型名解決表の語。
+    "bit",
+    "varbit",
 ];
 
 /// カタログ層の公開エラー型。`redb` 操作由来のエラーは `Backend` に一本化し、
@@ -4238,6 +4241,11 @@ pub enum ColumnType {
     /// `interval`・param は `-` 固定。値の解析・整形は [`crate::datetime`] へ委譲する。
     /// PK・UNIQUE・索引・述語・集計・式は #1580・#1581 まで fail-closed。
     Interval,
+    /// 固定長ビット列（`BIT(n)`、TABLE-48・Issue #2021）。`n` は `1..=`[`crate::bit_string::MAX_BIT_LENGTH`]
+    /// （長さ省略の `BIT` は `BIT(1)`）。値は [`crate::bit_string::BitString`]（MSB 先頭・詰め物ビット 0）。
+    /// カタログタグは `bit`・param は `n` の 10 進。VECTOR 列の本数には数えない。PK・UNIQUE・索引・
+    /// 述語・並べ替え・集計・式・CAST・型変更は後続 Issue まで fail-closed（ワイルドカード腕を置かない）。
+    Bit(u32),
     /// 可変長の同型スカラー配列列（`<スカラー型>[]`、TABLE-14・TASK-198、Issue #888）。
     /// 要素型・要素数上限は [`ArrayType`] が保持する。検索経路（KNN・hybrid・ANN・
     /// 二次索引・`EXPLAIN`）からは一貫して非対象として除外する（`VECTOR` 列との
@@ -4450,6 +4458,8 @@ impl ColumnType {
             ColumnType::TimestampTz => 0,
             // `Interval` も PK／UNIQUE 非許可（Issue #1579。担当 Issue 未定の fail-closed）。
             ColumnType::Interval => 0,
+            // `Bit` も PK／UNIQUE 非許可（Issue #2021。fail-closed）。
+            ColumnType::Bit(_) => 0,
             ColumnType::Bytea => 7,
             ColumnType::Uuid => 8,
             ColumnType::Enum(_) => 9,
@@ -4490,6 +4500,7 @@ impl ColumnType {
             ColumnType::Time => ("time", "-".to_string()),
             ColumnType::TimestampTz => ("timestamptz", "-".to_string()),
             ColumnType::Interval => ("interval", "-".to_string()),
+            ColumnType::Bit(n) => ("bit", n.to_string()),
             ColumnType::Array(array_ty) => ("array", array_ty.catalog_param()),
             ColumnType::Bytea => ("bytea", "-".to_string()),
             ColumnType::Json => ("json", "-".to_string()),
@@ -4635,6 +4646,7 @@ impl ColumnType {
                 }
                 Ok(ColumnType::Interval)
             }
+            "bit" => Ok(ColumnType::Bit(parse_bit_length_param(param)?)),
             "array" => Ok(ColumnType::Array(parse_array_param(param, resolve_enum)?)),
             "bytea" => {
                 if param != "-" {
@@ -7089,6 +7101,7 @@ impl ColumnDefault {
                     | ColumnType::Time
                     | ColumnType::TimestampTz
                     | ColumnType::Interval
+                    | ColumnType::Bit(_)
                     | ColumnType::Uuid
                     | ColumnType::Enum(_)
                     | ColumnType::Json
@@ -7873,6 +7886,9 @@ pub(crate) fn is_row_identity_unsupported(e: &CatalogError) -> bool {
 enum MaterializedDefault {
     /// BYTEA のデコード済みバイト列。
     Bytes(Box<[u8]>),
+    /// BIT(n) の実体化済み値（ビット長 `len` と MSB 先頭のバイト列。Issue #2021）。
+    /// 登録時の宣言長を持ち、参照時に現在の列型と照合する。
+    Bit { len: u32, bytes: Box<[u8]> },
     /// 配列の要素列ペイロード（フレームヘッダなし。`ArrayRef::from_owned` が借用する形）。
     /// 登録時の列型 `ty` を持ち、参照時に現在の列型と照合する。
     Array {
@@ -7947,6 +7963,19 @@ impl TableSchema {
                             });
                         }
                     }
+                    ColumnType::Bit(n) => {
+                        // 失敗した列は登録しない（参照すると `None`＝invalid DEFAULT）。
+                        if let Ok(v) = crate::bit_string::BitString::parse_text(text, *n) {
+                            out.push(MaterializedDefaultEntry {
+                                logical_index: i,
+                                source: text.clone(),
+                                value: MaterializedDefault::Bit {
+                                    len: v.bit_len(),
+                                    bytes: v.as_bytes().to_vec().into_boxed_slice(),
+                                },
+                            });
+                        }
+                    }
                     ColumnType::Array(at) => {
                         // 失敗した列は登録しない（参照すると `None`＝invalid DEFAULT）。
                         let Ok(value) = crate::row_codec::parse_array_default(at, text) else {
@@ -7996,7 +8025,25 @@ impl TableSchema {
         }
         match &self.materialized_default(logical_index)?.value {
             MaterializedDefault::Bytes(b) => Some(b),
-            MaterializedDefault::Array { .. } => None,
+            MaterializedDefault::Bit { .. } | MaterializedDefault::Array { .. } => None,
+        }
+    }
+
+    /// 論理列 `logical_index` の BIT(n) `DEFAULT` を実体化済みバイト列への借用で返す
+    /// （Issue #2021）。用途・fail-closed 規則は [`Self::bytea_default_bytes`] と同じで、加えて
+    /// 登録時の宣言長が現在の列型の宣言長と一致することを照合し、食い違えば `None`。
+    pub(crate) fn bit_default_ref(
+        &self,
+        logical_index: usize,
+    ) -> Option<crate::bit_string::BitRef<'_>> {
+        let ColumnType::Bit(current) = &self.columns.get(logical_index)?.ty else {
+            return None;
+        };
+        match &self.materialized_default(logical_index)?.value {
+            MaterializedDefault::Bit { len, bytes } if len == current => {
+                crate::bit_string::BitRef::new(*len, bytes).ok()
+            }
+            _ => None,
         }
     }
 
@@ -8357,6 +8404,7 @@ impl TableSchema {
             | ColumnType::Time
             | ColumnType::TimestampTz
             | ColumnType::Interval
+            | ColumnType::Bit(_)
             | ColumnType::Bytea
             | ColumnType::Json
             | ColumnType::Jsonb
@@ -8495,6 +8543,28 @@ fn parse_char_length_param(tag: &str, param: &str) -> Result<u32> {
     Ok(n)
 }
 
+/// `bit(n)` のカタログ param を厳密に解釈する（Issue #2021）。`1..=MAX_BIT_LENGTH` の
+/// 正準 10 進（符号・先頭ゼロ・空文字列・`-` は拒否。TABLE-6 の「未知の形は拒否」方針）。
+fn parse_bit_length_param(param: &str) -> Result<u32> {
+    let n: u32 = if !param.is_empty() && param.bytes().all(|b| b.is_ascii_digit()) {
+        param.parse().ok()
+    } else {
+        None
+    }
+    .ok_or_else(|| CatalogError::Invalid("malformed bit length parameter".to_string()))?;
+    if n == 0 || n > crate::bit_string::MAX_BIT_LENGTH {
+        return Err(CatalogError::Invalid(
+            "bit length parameter out of range".to_string(),
+        ));
+    }
+    if n.to_string() != param {
+        return Err(CatalogError::Invalid(
+            "non-canonical bit length parameter".to_string(),
+        ));
+    }
+    Ok(n)
+}
+
 /// `VECTOR(N)` の次元数検証（TABLE-6）。0 と `MAX_VECTOR_DIM` 超過を拒否する。
 fn validate_vector_dim(dim: u32) -> Result<()> {
     if dim == 0 {
@@ -8575,6 +8645,16 @@ fn validate_column(column: &ColumnDef) -> Result<()> {
     if let ColumnType::Varchar(Some(n)) | ColumnType::Bpchar(n) = &column.ty {
         validate_char_type_length(*n)?;
     }
+    // BIT(n) の宣言長は読み出し側（`parse_bit_length_param`）と同じ `1..=MAX_BIT_LENGTH`。
+    // ここで拒否しないと Rust API 経由の作成後にスキーマが読み込み不能になる。
+    if let ColumnType::Bit(n) = &column.ty {
+        if *n == 0 || *n > crate::bit_string::MAX_BIT_LENGTH {
+            return Err(CatalogError::Invalid(format!(
+                "column {:?} has an invalid BIT length",
+                column.name
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -8625,6 +8705,16 @@ fn validate_default_value(column: &ColumnDef, default: &ColumnDefault) -> Result
     {
         return Err(CatalogError::Invalid(format!(
             "column {:?} has a malformed BYTEA DEFAULT",
+            column.name
+        )));
+    }
+    // BIT(n) の 0/1 原文も宣言長で検証する（永続化後に INSERT／ADD COLUMN 補完で適用不能に
+    // なるのを防ぐ。Issue #2021）。
+    if matches!(column.ty, ColumnType::Bit(_))
+        && crate::row_codec::validate_default(&column.ty, default).is_err()
+    {
+        return Err(CatalogError::Invalid(format!(
+            "column {:?} has a malformed BIT DEFAULT",
             column.name
         )));
     }
@@ -17634,6 +17724,7 @@ fn column_default_compatible_with_tag(default: &ColumnDefault, tag: &str) -> boo
                 | "time"
                 | "uuid"
                 | "enum"
+                | "bit"
                 | "json"
                 | "jsonb"
                 | "bytea"
@@ -17923,6 +18014,25 @@ pub(crate) fn table_expression_decls_in_source<R: crate::storage::read_source::R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// BIT(n) の宣言長は `1..=MAX_BIT_LENGTH` のみ受理する（Rust API 経由でも永続化前に拒否）。
+    #[test]
+    fn validate_column_rejects_out_of_range_bit_length() {
+        let max = crate::bit_string::MAX_BIT_LENGTH;
+        assert!(validate_column(&ColumnDef::new("b", ColumnType::Bit(1), true)).is_ok());
+        assert!(validate_column(&ColumnDef::new("b", ColumnType::Bit(max), true)).is_ok());
+        assert!(validate_column(&ColumnDef::new("b", ColumnType::Bit(0), true)).is_err());
+        assert!(validate_column(&ColumnDef::new("b", ColumnType::Bit(max + 1), true)).is_err());
+    }
+
+    /// BIT の Text DEFAULT は ENUM 依存検査のタグ判定でも適合扱いにする。
+    #[test]
+    fn default_tag_compat_accepts_bit_text_default() {
+        assert!(column_default_compatible_with_tag(
+            &ColumnDefault::Text("101".to_string()),
+            "bit"
+        ));
+    }
 
     // 一時 DB パス払い出し（`unique_db_path` / `CleanupGuard`）は Issue #173 で
     // `crate::test_util::temp_db` へ一本化した（旧: このモジュール内の複製）。

@@ -1238,6 +1238,7 @@ pub(crate) fn having_matches(cell: &Cell, op: BinOp, literal: f64) -> bool {
         | Cell::Time(_)
         | Cell::TimestampTz(_)
         | Cell::Interval(_)
+        | Cell::Bit(_)
         | Cell::Array(_)
         | Cell::Bytes(_)
         | Cell::Json(_)
@@ -3253,6 +3254,7 @@ pub(crate) fn cell_to_scalar_ref(
         Cell::TimestampTz(t) => Some(row_codec::ScalarRef::TimestampTz(*t)),
         Cell::Interval(v) => Some(row_codec::ScalarRef::Interval(*v)),
         Cell::Vector(_)
+        | Cell::Bit(_)
         | Cell::Array(_)
         | Cell::Bytes(_)
         | Cell::Json(_)

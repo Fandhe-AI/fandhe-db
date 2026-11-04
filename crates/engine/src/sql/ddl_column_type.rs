@@ -85,6 +85,7 @@ pub(crate) fn to_static_column_type_with_array_default(
         SqlColumnTypeName::Time => ColumnType::Time,
         SqlColumnTypeName::TimestampTz => ColumnType::TimestampTz,
         SqlColumnTypeName::Interval => ColumnType::Interval,
+        SqlColumnTypeName::Bit(n) => ColumnType::Bit(*n),
         SqlColumnTypeName::Bytea => ColumnType::Bytea,
         SqlColumnTypeName::Json => ColumnType::Json,
         SqlColumnTypeName::Jsonb => ColumnType::Jsonb,
@@ -152,7 +153,11 @@ pub(crate) fn to_static_column_type_with_array_default(
                 // `time[]` は別 OID（1183）のため拒否する（Issue #1569。`smallint[]` と同じ理由）。
                 // `timestamptz[]` も別 OID（1185）のため拒否する（Issue #1574）。
                 // `interval[]` も別 OID（1187）のため拒否する（Issue #1579）。
-                ColumnType::Time | ColumnType::TimestampTz | ColumnType::Interval => {
+                // `bit[]` も別 OID（1561）のため拒否する（Issue #2021）。
+                ColumnType::Time
+                | ColumnType::TimestampTz
+                | ColumnType::Interval
+                | ColumnType::Bit(_) => {
                     return Err(SqlSurfaceError::FeatureNotSupported {
                         detail: "this array element type is not supported yet".to_string(),
                     })
@@ -293,6 +298,9 @@ pub enum SqlColumnTypeName {
     /// `INTERVAL`（TABLE-34・Issue #1579）。`INTERVAL(p)`・フィールド制限付き
     /// （`INTERVAL YEAR TO MONTH` 等）・配列は構文段で `0A000` のため修飾付きには到達しない。
     Interval,
+    /// `BIT(n)`（TABLE-48・Issue #2021）。長さ省略の `BIT` は `BIT(1)`（構文段で確定）。
+    /// `BIT VARYING`・`VARBIT` は構文段で `0A000`、配列は要素型の段で `0A000`。
+    Bit(u32),
     Bytea,
     Json,
     Jsonb,
@@ -439,6 +447,9 @@ enum TypeNameKind {
     /// `DAY`・`HOUR`・`MINUTE`・`SECOND` が続く形）は `0A000`。綴りを保持する別名として返す
     /// （`interval` は既存 ENUM 名と衝突し得るため、実行段が検出する）。
     Interval,
+    /// `BIT`／`BIT(n)`（Issue #2021。TABLE-48）。`BIT VARYING` は `0A000`。綴りを保持する別名として
+    /// 返す（`bit` は既存 ENUM 名と衝突し得るため、実行段が検出する）。
+    Bit,
     /// `VECTOR(N)`。
     Vector,
     /// `NUMERIC(p,s)`／`DECIMAL(p,s)`。
@@ -486,6 +497,14 @@ const TYPE_NAME_TABLE: &[(&str, TypeNameKind)] = &[
     ("TIME", TypeNameKind::Time),
     ("TIMESTAMPTZ", TypeNameKind::TimestampTz),
     ("INTERVAL", TypeNameKind::Interval),
+    ("BIT", TypeNameKind::Bit),
+    // `VARBIT`（`BIT VARYING` の別綴り）は列型として未対応（Issue #2021）。
+    (
+        "VARBIT",
+        TypeNameKind::Unsettled {
+            canonical: "bit varying",
+        },
+    ),
     // `TIMETZ`（`TIME WITH TIME ZONE` の別綴り）は列型として未対応（Issue #1569）。
     (
         "TIMETZ",
@@ -538,6 +557,49 @@ fn bare_char_error() -> SqlSurfaceError {
     SqlSurfaceError::FeatureNotSupported {
         detail: "type character without a length is not supported yet".to_string(),
     }
+}
+
+/// `BIT(n)` の `(n)` を解析する（Issue #2021・TABLE-48）。直後が `(` でなければ `None`。
+///
+/// n は untrusted な SQL トークン。u32 をあふれる数字列も上限超過として扱い、0・上限
+/// （[`crate::bit_string::MAX_BIT_LENGTH`]）超過はともに `22023`。先頭ゼロ・小数・符号・空・
+/// 閉じ括弧の欠落は `42601`。原文の数字列はエラーに反射しない。n からアロケーションしない。
+fn parse_optional_bit_length(
+    tokens: &[Token],
+    pos: &mut usize,
+) -> Result<Option<u32>, SqlSurfaceError> {
+    if !matches!(tokens.get(*pos), Some(Token::Punct('('))) {
+        return Ok(None);
+    }
+    *pos += 1;
+    let n = match tokens.get(*pos) {
+        Some(Token::Number(s)) => {
+            if !s.bytes().all(|b| b.is_ascii_digit()) || (s.len() > 1 && s.starts_with('0')) {
+                return Err(SqlSurfaceError::unsupported(
+                    "malformed length for bit type".to_string(),
+                ));
+            }
+            s.parse::<u32>().unwrap_or(u32::MAX)
+        }
+        _ => {
+            return Err(SqlSurfaceError::unsupported(
+                "expected a numeric literal for bit type length".to_string(),
+            ));
+        }
+    };
+    *pos += 1;
+    expect_punct(tokens, pos, ')')?;
+    if n == 0 {
+        return Err(SqlSurfaceError::InvalidParameterValue {
+            detail: "length for type bit must be at least 1",
+        });
+    }
+    if n > crate::bit_string::MAX_BIT_LENGTH {
+        return Err(SqlSurfaceError::InvalidParameterValue {
+            detail: "length for type bit cannot exceed 33554392",
+        });
+    }
+    Ok(Some(n))
 }
 
 /// 直後が `(` なら `(n)` を解析して `Some(n)`、なければ `None`（Issue #1563）。
@@ -662,6 +724,17 @@ fn parse_base_type_name(
                 _ => {}
             }
             Ok(alias_type(name, SqlColumnTypeName::Interval))
+        }
+        TypeNameKind::Bit => {
+            // `BIT VARYING` は可変長ビット列（別 OID 1562）のため未対応（fail-closed）。
+            if matches!(
+                tokens.get(*pos),
+                Some(Token::Ident(s)) if s.eq_ignore_ascii_case("VARYING")
+            ) {
+                return Err(unsettled_type_error("bit varying"));
+            }
+            let len = parse_optional_bit_length(tokens, pos)?.unwrap_or(1);
+            Ok(alias_type(name, SqlColumnTypeName::Bit(len)))
         }
         TypeNameKind::Time => {
             match tokens.get(*pos) {
