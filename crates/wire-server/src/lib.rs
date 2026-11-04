@@ -169,6 +169,7 @@ pub mod schema_limits_opt;
 pub mod search_engine_opt;
 pub mod server;
 pub mod simple_query;
+pub mod sparsevec_limits_opt;
 pub mod statement_timeout_opt;
 pub mod surface;
 pub mod temp_table_limits_opt;
