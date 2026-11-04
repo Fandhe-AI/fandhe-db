@@ -768,6 +768,15 @@ pub(crate) fn check_bound_index_expression_determinism(
         | Expr::IntervalLiteral(_)
         | Expr::ValueFunction { .. } => Ok(()),
         Expr::Call { name, args } => {
+            // 距離関数（SQL-72 (1)・Issue #2011）も距離演算子と同じく式索引・部分索引には置けない。
+            if crate::sql::vector_distance::distance_fn_from_name(&name.to_ascii_lowercase())
+                .is_some()
+            {
+                return Err(SqlSurfaceError::FeatureNotSupported {
+                    detail: "distance expressions are not supported in an index expression"
+                        .to_string(),
+                });
+            }
             let two_arg_timezone = name.eq_ignore_ascii_case("timezone") && args.len() == 2;
             if !two_arg_timezone && args.iter().any(|a| ty_of(a) == Some(ExprType::TimestampTz)) {
                 return Err(not_immutable());

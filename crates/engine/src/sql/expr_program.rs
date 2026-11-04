@@ -568,6 +568,7 @@ fn try_fold_scalar(expr: &BoundExpr) -> Option<FoldedConst> {
         | BoundExpr::CorrelatedScalar(_)
         | BoundExpr::VectorRef
         | BoundExpr::VectorDistance { .. }
+        | BoundExpr::VectorLiteral(_)
         | BoundExpr::WasmCall { .. }
         | BoundExpr::Null
         | BoundExpr::Case { .. }
@@ -756,7 +757,9 @@ fn compile_node(
         // （`udf_call::fold_min_max`）を 1 箇所に保つため木評価へ委ねる。
         | BoundExpr::MinMax { .. }
         // 距離式（SQL-74 (1)・Issue #2036）は行の embedding を直接読む専用評価のため木評価へ委ねる。
-        | BoundExpr::VectorDistance { .. } => {
+        | BoundExpr::VectorDistance { .. }
+        // ベクトルリテラル（SQL-72 (1)・Issue #2011）も木評価に委ねる（距離関数の引数）。
+        | BoundExpr::VectorLiteral(_) => {
             steps.push(ExprStep::JsonSubtree(Box::new(expr.clone())));
             *current_depth += 1;
             *max_stack = (*max_stack).max(*current_depth);

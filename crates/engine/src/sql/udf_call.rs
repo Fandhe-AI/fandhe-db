@@ -926,6 +926,11 @@ pub enum BoundExpr {
         kind: crate::sql::lexer::DistanceKind,
         query: std::sync::Arc<[f32]>,
     },
+    /// ベクトルリテラル（距離関数の引数。SQL-72 (1)・Issue #2011）。評価結果は `ExprValue::Vector`。
+    /// 行の embedding を参照しない。
+    ///
+    /// 変更履歴: 公開 enum への variant 追加（外部の網羅 match への破壊的変更）。
+    VectorLiteral(std::sync::Arc<[f32]>),
     Builtin {
         f: BuiltinFn,
         args: Vec<BoundExpr>,
@@ -1461,6 +1466,12 @@ impl PartialEq for BoundExpr {
             (BoundExpr::CorrelatedExists(a), BoundExpr::CorrelatedExists(b)) => a == b,
             (BoundExpr::CorrelatedScalar(a), BoundExpr::CorrelatedScalar(b)) => a == b,
             (BoundExpr::VectorRef, BoundExpr::VectorRef) => true,
+            (BoundExpr::VectorLiteral(a), BoundExpr::VectorLiteral(b)) => {
+                a.len() == b.len()
+                    && a.iter()
+                        .zip(b.iter())
+                        .all(|(x, y)| x.to_bits() == y.to_bits())
+            }
             (
                 BoundExpr::VectorDistance {
                     kind: ka,
@@ -1719,6 +1730,14 @@ pub fn into_owned_vector(v: Cow<'_, [f32]>) -> Result<Vec<f32>, SqlSurfaceError>
 /// 算術）は本 Issue の対象外（後続課題。Issue #920 実装ノート参照）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuiltinFn {
+    /// `l2_distance(a: Vector, b: Vector) -> Scalar`（SQL-72 (1)・Issue #2011。`<->` と同値）。
+    L2Distance,
+    /// `cosine_distance(a: Vector, b: Vector) -> Scalar`（`<=>` と同値。ゼロノルムは NaN）。
+    CosineDistance,
+    /// `inner_product(a: Vector, b: Vector) -> Scalar`（`<#>` の符号を反転した正の内積）。
+    InnerProduct,
+    /// `l1_distance(a: Vector, b: Vector) -> Scalar`（`<+>` と同値）。
+    L1Distance,
     /// `vec_norm(v: Vector) -> Scalar`（L2 ノルム）。
     VecNorm,
     /// `vec_sum(v: Vector) -> Scalar`（成分和）。
@@ -2171,6 +2190,10 @@ pub(crate) fn first_non_builtin_call_with(
 /// 別に `substr`／`concat` を明示的に含める。
 fn builtin_from_name(name: &str) -> Option<BuiltinFn> {
     match name.to_ascii_lowercase().as_str() {
+        "l2_distance" => Some(BuiltinFn::L2Distance),
+        "cosine_distance" => Some(BuiltinFn::CosineDistance),
+        "inner_product" => Some(BuiltinFn::InnerProduct),
+        "l1_distance" => Some(BuiltinFn::L1Distance),
         "vec_norm" => Some(BuiltinFn::VecNorm),
         "vec_sum" => Some(BuiltinFn::VecSum),
         "vec_div" => Some(BuiltinFn::VecDiv),
@@ -2246,6 +2269,10 @@ fn is_variadic_or_overloaded_builtin_name(name: &str) -> bool {
 /// （Issue #353・式評価のステップ列コンパイル化）。
 pub(crate) fn builtin_signature(f: BuiltinFn) -> (&'static [ExprType], ExprType) {
     match f {
+        BuiltinFn::L2Distance
+        | BuiltinFn::CosineDistance
+        | BuiltinFn::InnerProduct
+        | BuiltinFn::L1Distance => (&[ExprType::Vector, ExprType::Vector], ExprType::Scalar),
         BuiltinFn::VecNorm => (&[ExprType::Vector], ExprType::Scalar),
         BuiltinFn::VecSum => (&[ExprType::Vector], ExprType::Scalar),
         BuiltinFn::VecDiv => (&[ExprType::Vector, ExprType::Scalar], ExprType::Vector),
@@ -2393,6 +2420,10 @@ pub(crate) fn is_foldable_builtin(f: BuiltinFn) -> bool {
         // 実務上ない（`vec_norm` 等は常に `VectorRef` を受け取る）ため、
         // 畳み込み対象に含める意味がない。
         BuiltinFn::VecNorm | BuiltinFn::VecSum | BuiltinFn::VecDiv => false,
+        BuiltinFn::L2Distance
+        | BuiltinFn::CosineDistance
+        | BuiltinFn::InnerProduct
+        | BuiltinFn::L1Distance => false,
         BuiltinFn::Abs
         | BuiltinFn::Round1
         | BuiltinFn::Round2
@@ -3930,6 +3961,14 @@ fn validate_closed_expr(
                 return Err(SqlSurfaceError::FeatureNotSupported {
                     detail: "jsonb functions are not supported in a function body".to_string(),
                 });
+            } else if crate::sql::vector_distance::distance_fn_from_name(&name.to_ascii_lowercase())
+                .is_some()
+            {
+                // 距離関数（SQL-72 (1)・Issue #2011）は VECTOR 型の引数を要する。関数本体は列参照も
+                // VECTOR 型のパラメータも持てないため、距離演算子と同じく定義時に `0A000` で拒否する。
+                return Err(SqlSurfaceError::FeatureNotSupported {
+                    detail: "distance functions are not supported in a function body".to_string(),
+                });
             } else if let Some(builtin) = builtin_from_name(name) {
                 let (param_types, _ret) = builtin_signature(builtin);
                 if args.len() != param_types.len() {
@@ -4087,6 +4126,95 @@ pub(super) fn bind_vector_distance_operands(
     Ok(BoundVectorDistance { kind, query })
 }
 
+/// 距離関数 `l2_distance`／`cosine_distance`／`inner_product`／`l1_distance` の呼び出しを束縛する
+/// （SQL-72 (1)・Issue #2011。[`bind_call`] が名前で振り分ける）。
+///
+/// 引数 2 個はそれぞれ (1) `NULL`（型未確定のまま受理し、評価時の strict ガードで NULL）、
+/// (2) 文字列リテラル（ベクトルリテラルとして次元任意で解析し [`BoundExpr::VectorLiteral`]）、
+/// (3) それ以外の式（束縛して VECTOR 型でなければ `42883`）。VECTOR 型の引数が 1 つも無い形
+/// （リテラル同士・NULL とリテラル・NULL 同士）は演算子形と揃えて `0A000`。もう一方が VECTOR 列
+/// の参照なら宣言次元とリテラルの次元を束縛時に照合し（不一致 `22000`）、式の引数は評価時に
+/// `distance_fn` が照合する。エラーにリテラルの値は含めない。距離の計算自体は
+/// [`crate::sql::vector_distance::distance_fn`]（演算子と同じカーネル）が担う。
+fn bind_vector_distance_fn(
+    f: BuiltinFn,
+    args: &[Expr],
+    env: &mut BindEnv<'_>,
+    node_budget: &mut usize,
+) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
+    let unsupported = || SqlSurfaceError::FeatureNotSupported {
+        detail: "distance function requires at least one VECTOR argument".to_string(),
+    };
+    let [a0, a1] = args else {
+        return Err(SqlSurfaceError::undefined_function(
+            "distance function expects 2 argument(s)",
+        ));
+    };
+    // 引数ごとに (束縛済み, VECTOR 型の式か) を求める。
+    let mut bound: Vec<(BoundExpr, bool)> = Vec::with_capacity(2);
+    for a in [a0, a1] {
+        match a {
+            Expr::Null => {
+                let (b, _) = bind_null_aware(a, env, node_budget)?;
+                bound.push((b, false));
+            }
+            Expr::String(lit) => {
+                *node_budget = node_budget
+                    .checked_sub(1)
+                    .ok_or_else(|| SqlSurfaceError::payload_too_large("expression is too large"))?;
+                let v = crate::sql::parser::parse_vector_literal_any_dim(lit)?;
+                if v.is_empty() {
+                    return Err(SqlSurfaceError::invalid_input(
+                        "vector literal must have at least 1 dimension",
+                    ));
+                }
+                bound.push((BoundExpr::VectorLiteral(std::sync::Arc::from(v)), false));
+            }
+            _ => {
+                let (b, ty) = bind_expr_in(a, env, node_budget)?;
+                if ty != ExprType::Vector {
+                    return Err(SqlSurfaceError::undefined_function(
+                        "function does not exist for the given argument types",
+                    ));
+                }
+                bound.push((b, true));
+            }
+        }
+    }
+    if !bound.iter().any(|(_, is_vec)| *is_vec) {
+        return Err(unsupported());
+    }
+    // 列参照 × リテラルは束縛時に次元を照合する（演算子の束縛と同じタイミング。SQL-33 (4)）。
+    let column_dim = env.schema.and_then(|sc| {
+        sc.columns.iter().find_map(|c| match c.ty {
+            ColumnType::Vector(d) => Some(d),
+            _ => None,
+        })
+    });
+    for (i, other) in [(0usize, 1usize), (1, 0)] {
+        if let (Some((BoundExpr::VectorRef, _)), Some((BoundExpr::VectorLiteral(lit), _))) =
+            (bound.get(i), bound.get(other))
+        {
+            if let Some(d) = column_dim {
+                if u32::try_from(lit.len()).ok() != Some(d) {
+                    return Err(SqlSurfaceError::invalid_input(format!(
+                        "vector literal dimension mismatch: expected {d}, got {}",
+                        lit.len()
+                    )));
+                }
+            }
+        }
+    }
+    DISTANCE_BINDS.with(|c| c.set(c.get().wrapping_add(1)));
+    Ok((
+        BoundExpr::Builtin {
+            f,
+            args: bound.into_iter().map(|(b, _)| b).collect(),
+        },
+        ExprType::Scalar,
+    ))
+}
+
 /// 束縛環境: 列参照の解決元（`SELECT`/`WHERE` の式では `Some(schema)`、UDF 本体の
 /// 展開中は `None` に切り替わりパラメータ参照だけを解決する）と、パラメータ名 →
 /// 既に束縛済みの実引数式（インライン展開用）の対応表。
@@ -4202,6 +4330,7 @@ fn count_bound_nodes(expr: &BoundExpr) -> usize {
         | BoundExpr::CorrelatedScalar(_)
         | BoundExpr::VectorRef
         | BoundExpr::VectorDistance { .. }
+        | BoundExpr::VectorLiteral(_)
         | BoundExpr::JsonbColumnRef { .. }
         | BoundExpr::JsonColumnRef { .. }
         | BoundExpr::Numeric(_)
@@ -4311,6 +4440,7 @@ fn max_bound_case_nesting(expr: &BoundExpr) -> usize {
         | BoundExpr::CorrelatedScalar(_)
         | BoundExpr::VectorRef
         | BoundExpr::VectorDistance { .. }
+        | BoundExpr::VectorLiteral(_)
         | BoundExpr::JsonbColumnRef { .. }
         | BoundExpr::JsonColumnRef { .. }
         | BoundExpr::Numeric(_)
@@ -4399,6 +4529,7 @@ fn max_bound_case_nesting(expr: &BoundExpr) -> usize {
 pub(crate) fn references_embedding(expr: &BoundExpr) -> bool {
     match expr {
         BoundExpr::VectorRef | BoundExpr::VectorDistance { .. } => true,
+        BoundExpr::VectorLiteral(_) => false,
         BoundExpr::Number(_)
         | BoundExpr::Text(_)
         | BoundExpr::TextColumnRef { .. }
@@ -4553,6 +4684,7 @@ pub(crate) fn visit_referenced_scalar_columns(expr: &BoundExpr, visit: &mut dyn 
         | BoundExpr::IdCompare { .. }
         | BoundExpr::VectorRef
         | BoundExpr::VectorDistance { .. }
+        | BoundExpr::VectorLiteral(_)
         | BoundExpr::Numeric(_)
         | BoundExpr::JsonbLiteral(_)
         | BoundExpr::Null => {}
@@ -4672,6 +4804,7 @@ pub(crate) fn mark_referenced_scalar_columns(expr: &BoundExpr, mask: &mut [bool]
         | BoundExpr::IdCompare { .. }
         | BoundExpr::VectorRef
         | BoundExpr::VectorDistance { .. }
+        | BoundExpr::VectorLiteral(_)
         | BoundExpr::Numeric(_)
         | BoundExpr::JsonbLiteral(_)
         | BoundExpr::Null => false,
@@ -8847,6 +8980,9 @@ fn bind_call(
     }
     check_builtin_arity(name, args.len())?;
     let lower_name = name.to_ascii_lowercase();
+    if let Some(f) = crate::sql::vector_distance::distance_fn_from_name(&lower_name) {
+        return bind_vector_distance_fn(f, args, env, node_budget);
+    }
     // `nextval`／`currval` は INSERT の VALUES 要素・列 DEFAULT の単独形でだけ使える
     // （TABLE-24・Issue #1690）。SELECT 投影・WHERE・UPDATE SET・ビュー本文などの式位置は
     // 書き込み txn を伴う評価経路が無いため、`42883` へ落とさず `0A000` で拒否する（固定文言）。
@@ -10680,6 +10816,8 @@ pub(crate) fn eval_with_scalars<'a>(
         }
         // 式の内側の相関スカラー（Issue #1848）。値は所有（プローブ内のセルからの複製）で返す。
         BoundExpr::CorrelatedScalar(leaf) => leaf.eval(row_scalars, id),
+        // ベクトルリテラル（SQL-72 (1)・Issue #2011）。束縛時に検証済みの値（長さ上限 64 KiB 以内）を複製して返す。
+        BoundExpr::VectorLiteral(v) => Ok(ExprValue::Vector(Cow::Owned(v.to_vec()))),
         BoundExpr::VectorRef => {
             // Issue #352: 行の embedding をそのまま借用する。テーブル `VECTOR` 列の
             // 素通し参照（`WHERE vec_norm(embedding) > x` 等の読み取り経路）では
@@ -11055,6 +11193,15 @@ pub(crate) fn apply_builtin<'a>(
         return Ok(ExprValue::Null);
     }
     match f {
+        // 距離関数（SQL-72 (1)・Issue #2011）。NULL は上の strict ガードで返済み。
+        BuiltinFn::L2Distance
+        | BuiltinFn::CosineDistance
+        | BuiltinFn::InnerProduct
+        | BuiltinFn::L1Distance => {
+            let a = take_vector_arg(args, 0)?;
+            let b = take_vector_arg(args, 1)?;
+            crate::sql::vector_distance::distance_fn(f, &a, &b).map(ExprValue::Scalar)
+        }
         BuiltinFn::VecNorm => {
             let v = take_vector_arg(args, 0)?;
             let sum_sq: f64 = v.iter().map(|&x| (x as f64) * (x as f64)).sum();
@@ -12909,6 +13056,10 @@ mod tests {
             "clock_timestamp",
             "lower",
             "vec_norm",
+            "l2_distance",
+            "cosine_distance",
+            "inner_product",
+            "l1_distance",
             "justify_days",
             "greatest",
             "least",
