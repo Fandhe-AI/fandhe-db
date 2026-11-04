@@ -1656,3 +1656,35 @@ fn hybrid_recall_large_scale_threshold_gate() {
         "large-scale Recall@20/Recall@100 below configured HYBRID_RECALL_MIN_* threshold"
     );
 }
+/// Issue #2001（親 #1996。SEARCH-1・SQL-33 のポインタ）: 小規模段を SQL 既定エンジン経路
+/// （`SqlHybridFixture` + `RecallEngine::BruteForce`）で測る層 A。この経路の密側は
+/// `CosineDenseAdapter` 経由のコサインで、本番の `<=>` の意味に一致する。`hybrid_recall_small_scale_regression`
+/// の in-memory 経路（密側は内積）との hits20 の差が、密側 metric 差の回帰保護になる。
+/// 400 行は `MIN_INDEXED_ROWS` 未満のため、`measure_recall_via_hnsw` 内の
+/// `assert_ann_non_vacuous(false)` により索引が一度も構築されないこと（構造的 brute-force）も
+/// 同時に固定される（関数名の `hnsw` は経路名の名残で、この呼び出しでは HNSW を通らない）。
+/// HYBRID には metric を選ぶ手段が無く、HNSW の密側は内積のまま（#2931 の記録）。
+#[test]
+fn hybrid_recall_small_scale_cosine_dense_sql_regression() {
+    let (docs, qa) = generate_corpus(
+        SMALL_SEED,
+        SMALL_NUM_DOCS,
+        SMALL_NUM_QUERIES,
+        SMALL_VOCAB_SIZE,
+    );
+    assert_corpus_within_limits(&docs);
+    assert_eq!(qa.len(), 60, "重複除外後の QA 件数が変化した");
+
+    let (r, stats) =
+        measure_recall_via_hnsw(&docs, &qa, QuerySource::Baseline, RecallEngine::BruteForce);
+    assert_eq!(
+        stats.builds, 0,
+        "400 行は索引を構築しない（構造的 brute-force）"
+    );
+    assert_eq!(r.total_correct, 202, "正解集合の総数が変化した");
+    assert_eq!(r.ceil20, 202, "Recall@20 の理論上限が変化した");
+    assert_eq!(
+        r.hits20, 179,
+        "密側コサイン（SQL 既定エンジン）の Recall@20 hit 数が変化した"
+    );
+}
