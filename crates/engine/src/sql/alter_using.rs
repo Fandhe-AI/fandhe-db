@@ -147,7 +147,7 @@ pub(crate) fn bind_alter_conversion(
         SourceKind::UnknownNumeric => NUMERIC_KINDS
             .iter()
             .all(|k| is_assignment_rule(cast_rule(*k, target_cast.kind()))),
-        SourceKind::Array(None) | SourceKind::Outside => {
+        SourceKind::Array(None) | SourceKind::Outside | SourceKind::Bit => {
             return Err(not_supported(
                 "the result type of this USING expression cannot be determined",
             ))

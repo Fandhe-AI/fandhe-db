@@ -8057,6 +8057,7 @@ fn resolve_aggregate_input(
                 | ExprType::Interval
                 | ExprType::Uuid
                 | ExprType::Bytea
+                | ExprType::Bit
                 | ExprType::Array
                     if func.is_variance_family() =>
                 {
@@ -8124,7 +8125,7 @@ fn resolve_aggregate_input(
                         .to_string(),
                 }),
                 // numeric 式（CAST の結果）の集計は未対応（Issue #1591）。fail-closed で拒否する。
-                ExprType::Numeric | ExprType::Uuid | ExprType::Bytea | ExprType::Array => {
+                ExprType::Numeric | ExprType::Uuid | ExprType::Bytea | ExprType::Array | ExprType::Bit => {
                     Err(SqlSurfaceError::FeatureNotSupported {
                         detail: "aggregates over CAST result expressions are not supported yet"
                             .to_string(),
@@ -8841,12 +8842,14 @@ fn resolve_count_distinct_input(
                         .to_string(),
                 }),
                 // numeric 式（CAST の結果）の集計は未対応（Issue #1591）。fail-closed で拒否する。
-                ExprType::Numeric | ExprType::Uuid | ExprType::Bytea | ExprType::Array => {
-                    Err(SqlSurfaceError::FeatureNotSupported {
-                        detail: "aggregates over CAST result expressions are not supported yet"
-                            .to_string(),
-                    })
-                }
+                ExprType::Numeric
+                | ExprType::Uuid
+                | ExprType::Bytea
+                | ExprType::Array
+                | ExprType::Bit => Err(SqlSurfaceError::FeatureNotSupported {
+                    detail: "aggregates over CAST result expressions are not supported yet"
+                        .to_string(),
+                }),
             }
         }
     }
@@ -9645,7 +9648,7 @@ fn order_kind_for_expr_type(
             "could not identify an ordering operator for type json",
         )),
         // numeric 式の並べ替えは未対応（Issue #1591。消費できるのは投影と CAST の被演算子だけ）。
-        ExprType::Numeric | ExprType::Uuid | ExprType::Bytea | ExprType::Array => {
+        ExprType::Numeric | ExprType::Uuid | ExprType::Bytea | ExprType::Array | ExprType::Bit => {
             Err(SqlSurfaceError::FeatureNotSupported {
                 detail: "ORDER BY a CAST result expression is not supported yet".to_string(),
             })
@@ -9680,6 +9683,7 @@ fn group_key_kind_for_expr_type(
         | ExprType::Numeric
         | ExprType::Uuid
         | ExprType::Bytea
+        | ExprType::Bit
         | ExprType::Array => Err(SqlSurfaceError::FeatureNotSupported {
             detail: "GROUP BY on an expression of this type is not supported yet".to_string(),
         }),

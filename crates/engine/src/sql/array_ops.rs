@@ -559,7 +559,9 @@ fn bind_quantified_lhs(
         SourceKind::Known(k) => k,
         // 種別を静的に決められない数値は float8 と同じ比較（整数・浮動小数の要素どうし）。
         SourceKind::UnknownNumeric => CastKind::Float8,
-        SourceKind::Array(_) | SourceKind::Outside => return Err(operator_missing("ANY/ALL")),
+        SourceKind::Array(_) | SourceKind::Outside | SourceKind::Bit => {
+            return Err(operator_missing("ANY/ALL"))
+        }
     };
     if let Some(e) = elem {
         check_lhs_compatible(kind, e)?;

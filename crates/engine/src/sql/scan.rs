@@ -1056,6 +1056,13 @@ pub(crate) fn computed_value_to_cell(
                 try_accumulate_budget(*byte_budget, a.approx_heap_bytes(), max_result_bytes)?;
             Cell::Array(a)
         }
+        // `binary_quantize` の結果（Issue #2023）。展開テキスト長を累計バイト予算に計上する
+        // （`cursor::estimate_cell_bytes` と同じ規約）。
+        ExprValue::Bit(b) => {
+            let n = usize::try_from(b.bit_len()).unwrap_or(usize::MAX);
+            *byte_budget = try_accumulate_budget(*byte_budget, n, max_result_bytes)?;
+            Cell::Bit(b)
+        }
     })
 }
 

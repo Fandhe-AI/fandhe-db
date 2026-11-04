@@ -498,6 +498,8 @@ pub(super) enum SourceKind {
     Array(Option<CastType>),
     /// 規則表の外（`vector`）。
     Outside,
+    /// 規則表の外（`bit`。`binary_quantize` の結果。Issue #2023）。CAST は未対応で `0A000`。
+    Bit,
 }
 
 /// 配列の要素型を CAST の型へ写す（ENUM は `None`）。
@@ -719,6 +721,8 @@ pub(super) fn source_cast_kind(
             _ => SourceKind::Array(None),
         },
         ExprType::Vector => SourceKind::Outside,
+        // bit 値は CAST の被演算子にできない（Issue #2023）。
+        ExprType::Bit => SourceKind::Bit,
     }
 }
 
@@ -1120,6 +1124,7 @@ pub(super) fn bind_scalar_assignment(
             CastKind::Array
         }
         SourceKind::Outside => return Err(not_implemented("unknown", &target_cast)),
+        SourceKind::Bit => return Err(not_implemented("bit", &target_cast)),
     };
     if !is_assignment_rule(cast_rule(from_kind, target_cast.kind())) {
         return Err(SqlSurfaceError::CannotCoerce {
@@ -1285,6 +1290,7 @@ pub(super) fn cast_bound_from(
             CastKind::Array
         }
         SourceKind::Outside => return Err(not_implemented("vector", target)),
+        SourceKind::Bit => return Err(not_implemented("bit", target)),
         SourceKind::UnknownNumeric => {
             // 数値の行どうしは変換先によって規則が異なる（numeric と float で丸め・表記が異なる）。
             // 数値 6 型・bool・文字列 3 型では誤った値・`42846`・恒等を作らないよう未実装とする。

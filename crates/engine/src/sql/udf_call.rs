@@ -1620,6 +1620,11 @@ pub enum ExprType {
     /// 配列値（Issue #1592・SQL-47。[`ExprType::Uuid`] と同じ消費規則）。要素型は式の型では持たず、
     /// `CAST` の変換先・列のスキーマから導く（`ExprType` を `Copy` に保つため）。
     Array,
+    /// `BIT(n)` 値（Issue #2023・TABLE-48 (3)。`binary_quantize` の結果だけが生成する）。長さ `n` は
+    /// 式の型では持たず（`ExprType` を `Copy` に保つため）、結果列の型は `expr_result_column_type`
+    /// が引数の `VECTOR` 列の次元から決める。消費できるのは投影と BIT 列への `UPDATE ... SET`
+    /// 代入だけで、比較・算術・関数引数・`CASE` 等・集計・並べ替え・`CAST` は `0A000` で拒否する。
+    Bit,
 }
 
 /// 評価結果の値。
@@ -1664,6 +1669,8 @@ pub enum ExprValue<'a> {
     Bytes(Cow<'a, [u8]>),
     /// 配列値（Issue #1592・SQL-47。[`ExprType::Array`] 参照）。
     Array(crate::row_codec::ArrayValue),
+    /// `BIT(n)` 値（Issue #2023。[`ExprType::Bit`] 参照）。
+    Bit(crate::bit_string::BitString),
     /// SQL の NULL（Issue #919・SQL-26、AC2 と Issue #921・SQL-26 の共有
     /// variant）。nullable TEXT 列参照・strict な関数への NULL 入力、および
     /// `CASE`／`COALESCE`／`NULLIF` の評価結果から生じる。呼び出し元
@@ -1685,6 +1692,8 @@ impl ExprValue<'_> {
             ExprValue::Bytes(b) => b.len(),
             ExprValue::Vector(v) => v.len().saturating_mul(4),
             ExprValue::Array(a) => a.approx_heap_bytes(),
+            // 出力テキスト（`0`/`1` の並び）の長さ。`cursor::estimate_cell_bytes` と同じ規約。
+            ExprValue::Bit(b) => usize::try_from(b.bit_len()).unwrap_or(usize::MAX),
             ExprValue::Numeric(_) => 32,
             ExprValue::Scalar(_)
             | ExprValue::Bool(_)
@@ -1746,6 +1755,9 @@ pub enum BuiltinFn {
     VecDiv,
     /// `vector_dims(v: Vector) -> Scalar`（要素数。Issue #2012・SQL-72）。
     VectorDims,
+    /// `binary_quantize(v: Vector) -> Bit`（正の成分を 1・それ以外を 0 とするビット列。
+    /// Issue #2023・TABLE-48 (3)。引数は表の `VECTOR` 列そのものに限る）。
+    BinaryQuantize,
     /// `l2_normalize(v: Vector) -> Vector`（L2 正規化。Issue #2012・SQL-72）。
     L2Normalize,
     /// `subvector(v: Vector, start: Scalar, count: Scalar) -> Vector`（1 始まりの部分ベクトル。
@@ -2204,6 +2216,7 @@ fn builtin_from_name(name: &str) -> Option<BuiltinFn> {
         // `vector_norm` は pgvector 互換名（計算は `vec_norm` と同一。Issue #2012・SQL-72）。
         "vec_norm" | "vector_norm" => Some(BuiltinFn::VecNorm),
         "vector_dims" => Some(BuiltinFn::VectorDims),
+        "binary_quantize" => Some(BuiltinFn::BinaryQuantize),
         "l2_normalize" => Some(BuiltinFn::L2Normalize),
         "subvector" => Some(BuiltinFn::Subvector),
         "vec_sum" => Some(BuiltinFn::VecSum),
@@ -2289,6 +2302,7 @@ pub(crate) fn builtin_signature(f: BuiltinFn) -> (&'static [ExprType], ExprType)
         BuiltinFn::VecDiv => (&[ExprType::Vector, ExprType::Scalar], ExprType::Vector),
         BuiltinFn::VectorDims => (&[ExprType::Vector], ExprType::Scalar),
         BuiltinFn::L2Normalize => (&[ExprType::Vector], ExprType::Vector),
+        BuiltinFn::BinaryQuantize => (&[ExprType::Vector], ExprType::Bit),
         BuiltinFn::Subvector => (
             &[ExprType::Vector, ExprType::Scalar, ExprType::Scalar],
             ExprType::Vector,
@@ -2440,6 +2454,7 @@ pub(crate) fn is_foldable_builtin(f: BuiltinFn) -> bool {
         | BuiltinFn::VecSum
         | BuiltinFn::VecDiv
         | BuiltinFn::VectorDims
+        | BuiltinFn::BinaryQuantize
         | BuiltinFn::L2Normalize
         | BuiltinFn::Subvector
         | BuiltinFn::L2Distance
@@ -3446,7 +3461,7 @@ fn bind_udf_return(
             }
             _ => return Err(mismatch()),
         },
-        SourceKind::Outside => return Err(mismatch()),
+        SourceKind::Outside | SourceKind::Bit => return Err(mismatch()),
     };
     cast::cast_bound_from(source, body, bound, ty, ret, node_budget)
 }
@@ -3688,7 +3703,10 @@ fn bind_typed_udf_arg(
                     }
                 }
                 // 種別を決められない数値・要素型不明の配列・vector は `cast_bound` が判定する。
-                SourceKind::Array(None) | SourceKind::UnknownNumeric | SourceKind::Outside => {}
+                SourceKind::Array(None)
+                | SourceKind::UnknownNumeric
+                | SourceKind::Outside
+                | SourceKind::Bit => {}
             }
             cast::cast_bound_from(source, arg, bound, ty, declared, node_budget)
         }
@@ -5239,6 +5257,23 @@ pub(crate) fn bind_value_with_default(
     }
 }
 
+/// BIT 列への `UPDATE ... SET` 右辺を束縛する（TABLE-48 (3)・Issue #2023。`sql::set_expr` から呼ばれる）。
+///
+/// 通常の投影束縛と同じだが、式の最上位が bit 値（`binary_quantize` の結果）であることを許す。
+/// それ以外の cast-only 型・jsonb は投影束縛と同じく `0A000` で拒否する。
+pub(crate) fn bind_bit_assignment_source(
+    expr: &Expr,
+    schema: &TableSchema,
+    registry: &UdfRegistry,
+    node_budget: &mut usize,
+) -> Result<(BoundExpr, ExprType, Option<ColumnType>), SqlSurfaceError> {
+    let r = bind_projection_expr_inner(expr, schema, registry, node_budget, false)?;
+    if r.1 != ExprType::Bit {
+        reject_json_operand(r.1)?;
+    }
+    Ok(r)
+}
+
 /// 配列列への `UPDATE ... SET` 右辺を束縛する（TABLE-35・Issue #1602。`sql::set_expr` から呼ばれる）。
 ///
 /// 通常の投影束縛と同じだが、右辺が裸の列名のときは CAST の被演算子と同じ規則（配列列を
@@ -5341,6 +5376,21 @@ pub(crate) fn expr_result_column_type(
     // `CAST(i4 + 1 AS bigint)` が integer として公告される。
     if let Expr::Cast { ty, .. } = expr {
         return ty.result_column_type();
+    }
+    // `binary_quantize(<VECTOR 列>)` は引数の列の次元をそのまま長さにした `bit(n)`（Issue #2023）。
+    if matches!(
+        bound,
+        BoundExpr::Builtin {
+            f: BuiltinFn::BinaryQuantize,
+            ..
+        }
+    ) {
+        return schema.and_then(|s| {
+            s.columns.iter().find_map(|c| match c.ty {
+                ColumnType::Vector(d) => Some(ColumnType::Bit(d)),
+                _ => None,
+            })
+        });
     }
     // `current_schemas(..)` は NULL でも `text[]` を公告する（TABLE-27 (7)・Issue #1718）。
     if matches!(expr, Expr::Call { name, .. } if name.eq_ignore_ascii_case("current_schemas")) {
@@ -5476,6 +5526,8 @@ pub(crate) fn column_type_for_expr_type(ty: ExprType) -> Option<ColumnType> {
         // 配列の要素型は式の型から分からない。`CAST` の結果は `expr_result_column_type` が
         // 変換先の型から決める。
         ExprType::Array => None,
+        // 長さ `n` は引数の `VECTOR` 列の次元から `expr_result_column_type` が決める。
+        ExprType::Bit => None,
         ExprType::Vector => None,
     }
 }
@@ -6234,7 +6286,7 @@ pub(super) fn in_check_binding() -> bool {
 pub(super) fn is_cast_only_type(ty: ExprType) -> bool {
     matches!(
         ty,
-        ExprType::Numeric | ExprType::Uuid | ExprType::Bytea | ExprType::Array
+        ExprType::Numeric | ExprType::Uuid | ExprType::Bytea | ExprType::Array | ExprType::Bit
     )
 }
 
@@ -6246,13 +6298,24 @@ pub(super) fn numeric_operand_unsupported() -> SqlSurfaceError {
     }
 }
 
+/// [`is_cast_only_type`] の型 `ty` を消費できない位置へ流れた場合の `0A000`。bit 値（Issue #2023）は
+/// `CAST` の被演算子にもなれないため、「CAST が作った値」の文言を使わず専用の固定文言にする。
+pub(super) fn cast_only_unsupported(ty: ExprType) -> SqlSurfaceError {
+    if ty == ExprType::Bit {
+        return SqlSurfaceError::FeatureNotSupported {
+            detail: "a bit value can only be projected or assigned to a BIT column".to_string(),
+        };
+    }
+    numeric_operand_unsupported()
+}
+
 /// jsonb 値（[`ExprType::Json`]）を消費できない位置（算術・関数引数・`CASE`／
 /// `COALESCE`／`NULLIF`・集計・代入）へ流れた場合の `0A000`（Issue #1596。比較・ORDER BY・
 /// 投影・パス演算子の左辺は Issue #1597 までに対応済みで、それ以外は fail-closed に拒否する）。
 fn reject_json_operand(ty: ExprType) -> Result<(), SqlSurfaceError> {
     // numeric 値（Issue #1591）は投影と CAST の被演算子だけが消費できる。
     if is_cast_only_type(ty) {
-        return Err(numeric_operand_unsupported());
+        return Err(cast_only_unsupported(ty));
     }
     if ty == ExprType::Json {
         return Err(SqlSurfaceError::FeatureNotSupported {
@@ -8312,7 +8375,7 @@ fn bind_unknown_literal_against(
         .checked_sub(1)
         .ok_or_else(|| SqlSurfaceError::payload_too_large("expression is too large"))?;
     if is_cast_only_type(other_ty) {
-        return Err(numeric_operand_unsupported());
+        return Err(cast_only_unsupported(other_ty));
     }
     if s.len() > crate::row_codec::MAX_TEXT_FIELD_LEN as usize {
         return Err(SqlSurfaceError::payload_too_large(
@@ -8624,7 +8687,11 @@ fn bind_binary(
     // numeric 式（CAST の結果。Issue #1591）は比較・算術の演算子を持たない。型の取り違え
     // （42804）ではなく、未対応であることを `0A000` で fail-closed に示す。
     if is_cast_only_type(lt) || is_cast_only_type(rt) {
-        return Err(numeric_operand_unsupported());
+        return Err(cast_only_unsupported(if is_cast_only_type(lt) {
+            lt
+        } else {
+            rt
+        }));
     }
     let mk = |op, l, r| BoundExpr::Binary {
         op,
@@ -9194,6 +9261,22 @@ fn bind_call(
                 | BuiltinFn::Subvector
         ) {
             return bind_strict_text_fn(name, builtin, args, param_types, ret, env, node_budget);
+        }
+        // `binary_quantize`（Issue #2023・TABLE-48 (3)）も strict。結果の長さ `n` を静的に公告する
+        // ため、引数は表の `VECTOR` 列そのもの（または裸の `NULL`）に限り、加工したベクトル式は
+        // 結果長を決められないので `0A000` で拒否する（公告型を偽らない fail-closed）。
+        if builtin == BuiltinFn::BinaryQuantize {
+            let (node, ty) =
+                bind_strict_text_fn(name, builtin, args, param_types, ret, env, node_budget)?;
+            if let BoundExpr::Builtin { args: bound, .. } = &node {
+                if !matches!(bound.first(), Some(BoundExpr::VectorRef | BoundExpr::Null)) {
+                    return Err(SqlSurfaceError::FeatureNotSupported {
+                        detail: "binary_quantize accepts only a VECTOR column as its argument"
+                            .to_string(),
+                    });
+                }
+            }
+            return Ok((node, ty));
         }
         // `justify_*`（Issue #1582）は strict 関数: 裸の `NULL` 引数は型検査で
         // 弾かず、結果型 `Interval` の `NULL` として伝播させる（`date_part` 等と同方針）。
@@ -10381,7 +10464,11 @@ pub(crate) fn json_value_from_expr_value(
         }
         // numeric／uuid／bytea／配列の値は束縛段が jsonb 関数の引数から弾く（0A000）ため到達しない
         // （Issue #1591・#1592）。
-        ExprValue::Numeric(_) | ExprValue::Uuid(_) | ExprValue::Bytes(_) | ExprValue::Array(_) => {
+        ExprValue::Numeric(_)
+        | ExprValue::Uuid(_)
+        | ExprValue::Bytes(_)
+        | ExprValue::Array(_)
+        | ExprValue::Bit(_) => {
             return Err(SqlSurfaceError::FeatureNotSupported {
                 detail: "a value produced by CAST cannot be converted to json yet".to_string(),
             })
@@ -10408,11 +10495,13 @@ fn json_object_key(v: &ExprValue<'_>) -> Result<String, SqlSurfaceError> {
         ExprValue::Interval(_) => Err(SqlSurfaceError::FeatureNotSupported {
             detail: "an interval value cannot be converted to json yet".to_string(),
         }),
-        ExprValue::Numeric(_) | ExprValue::Uuid(_) | ExprValue::Bytes(_) | ExprValue::Array(_) => {
-            Err(SqlSurfaceError::FeatureNotSupported {
-                detail: "a value produced by CAST cannot be converted to json yet".to_string(),
-            })
-        }
+        ExprValue::Numeric(_)
+        | ExprValue::Uuid(_)
+        | ExprValue::Bytes(_)
+        | ExprValue::Array(_)
+        | ExprValue::Bit(_) => Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "a value produced by CAST cannot be converted to json yet".to_string(),
+        }),
         ExprValue::Json(_) | ExprValue::JsonText(_) | ExprValue::Vector(_) => {
             Err(SqlSurfaceError::InvalidParameterValue {
                 detail: "key value must be scalar, not array, composite, or json",
@@ -11251,6 +11340,10 @@ pub(crate) fn apply_builtin<'a>(
         BuiltinFn::VectorDims => {
             let v = take_vector_arg(args, 0)?;
             Ok(ExprValue::Scalar(crate::sql::vector_shape_fn::dims(&v)))
+        }
+        BuiltinFn::BinaryQuantize => {
+            let v = take_vector_arg(args, 0)?;
+            crate::sql::vector_shape_fn::binary_quantize(&v).map(ExprValue::Bit)
         }
         BuiltinFn::L2Normalize => {
             let v = take_vector_arg(args, 0)?;
@@ -13095,6 +13188,7 @@ mod tests {
     fn vector_shape_builtins_propagate_null() {
         for (f, n) in [
             (BuiltinFn::VectorDims, 1),
+            (BuiltinFn::BinaryQuantize, 1),
             (BuiltinFn::L2Normalize, 1),
             (BuiltinFn::Subvector, 3),
         ] {
@@ -13133,6 +13227,7 @@ mod tests {
             "vec_norm",
             "vector_norm",
             "vector_dims",
+            "binary_quantize",
             "l2_normalize",
             "subvector",
             "l2_distance",
@@ -13224,6 +13319,7 @@ mod tests {
             BuiltinFn::VecSum,
             BuiltinFn::VecDiv,
             BuiltinFn::VectorDims,
+            BuiltinFn::BinaryQuantize,
             BuiltinFn::L2Normalize,
             BuiltinFn::Subvector,
             BuiltinFn::Lower,
