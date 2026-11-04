@@ -616,6 +616,13 @@ pub static SORT_ITEM_SCHEMA: ObjectSchema = ObjectSchema {
 /// （距離種別。Issue #2243・NOSQL-2・SQL-33 (7)）は形（文字列）のみ検査し、語彙検査
 /// （`"cosine"`｜`"l2"`｜`"ip"`｜`"l1"`）と `plan`／`hybrid` との併用拒否は
 /// [`super::search`] が担う。
+///
+/// スコープ境界の根拠: AGENTS.md が対象外とする「Web API」は別プロダクトの汎用
+/// REST/GraphQL 等を指す。`POST /v1/query` は spec で本リポの実装対象と定義済みの
+/// NoSQL（HTTP）表層（NOSQL-1〜NOSQL-10・TASK-175 ポインタ。CLAUDE.md の
+/// ステータス欄と `docs/design/implementation-status.md` に実装記録あり）であり、
+/// `metric` は SQL 表層と同じ engine の距離種別 API へ束縛するだけの既存表層の
+/// 入力拡張に留まる。新たな Web API・依存は持ち込まない。
 pub static SEARCH_SCHEMA: ObjectSchema = ObjectSchema {
     name: "search",
     fields: &[
