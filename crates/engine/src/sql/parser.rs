@@ -1976,7 +1976,7 @@ impl LiteralSkip {
         projection_mask: Vec::new(),
     };
 
-    fn skips_projection_item(&self, index: usize) -> bool {
+    pub(crate) fn skips_projection_item(&self, index: usize) -> bool {
         self.projection_mask.get(index).copied().unwrap_or(false)
     }
 }

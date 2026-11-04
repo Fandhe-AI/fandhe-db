@@ -12,9 +12,12 @@
 
 use crate::catalog::{ColumnType, TableSchema};
 use crate::sql::allowlist::{
-    OrderByForm, ScanOrderKey, SqlSurfaceError, ValidatedScan, ValidatedStatement,
+    OrderByForm, Projection, ScanOrderKey, SelectItem, SqlSurfaceError, ValidatedScan,
+    ValidatedStatement,
 };
 use crate::sql::lexer::DistanceKind;
+use crate::sql::mode::SearchMode;
+use crate::sql::parser::LiteralSkip;
 use crate::sql::plan::EvaluationOrder;
 use crate::sql::udf_call::Expr;
 
@@ -22,9 +25,16 @@ use crate::sql::udf_call::Expr;
 ///
 /// 演算子の範囲は VECTOR の kNN と同じ `<=>`（コサイン）・`<#>`（負の内積）だけで、`<->`／`<+>` は
 /// `sql::exec::ensure_distance_kind_executable` と同じ `0A000` で変換の前に拒否する。
+///
+/// `session_mode` は `SET search_mode` の値。文中の `USING MODE` が無く実効モードが `precision` の
+/// 組は、確信度ゲートを scan 経路が持たないため `0A000` で拒否する（Execute／Describe 共通。fail-closed）。
+/// `skip` は Prepared Describe の `$n` 由来ダミー値を比較から外すための印で、実リテラルの投影距離列は
+/// `ORDER BY` と HALFVEC 丸め後のクエリベクトルが一致しない組を `0A000` で拒否する（SQL-33 (7)）。
 pub(crate) fn halfvec_select_as_scan(
     v: &ValidatedStatement,
     schema: &TableSchema,
+    session_mode: Option<SearchMode>,
+    skip: &LiteralSkip,
 ) -> Result<Option<ValidatedScan>, SqlSurfaceError> {
     if !schema
         .columns
@@ -56,6 +66,14 @@ pub(crate) fn halfvec_select_as_scan(
     if v.search_mode().is_some() || v.evaluation_order() != EvaluationOrder::DEFAULT {
         return Ok(None);
     }
+    if session_mode == Some(SearchMode::Precision) {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "precision mode is not supported on halfvec columns",
+        ));
+    }
+    if !skip.order_by {
+        check_projected_query_matches(v, kind, literal, skip)?;
+    }
     Ok(Some(ValidatedScan {
         table_name: v.table_name().to_string(),
         projection: v.projection().clone(),
@@ -79,4 +97,59 @@ pub(crate) fn halfvec_select_as_scan(
         embedded_scalar_subqueries: Vec::new(),
         with_ties: false,
     }))
+}
+
+/// 投影の距離列のクエリベクトルが `ORDER BY` のものと（f16 丸め後に）一致することを検査する。
+/// 通常の kNN 経路の `check_projected_distance` は scan 変換後は呼ばれないため、同じ契約をここで守る。
+/// リテラルがベクトルとして解釈できない場合は比較せず、後段の束縛が既存のエラーで拒否する。
+fn check_projected_query_matches(
+    v: &ValidatedStatement,
+    kind: DistanceKind,
+    order_literal: &str,
+    skip: &LiteralSkip,
+) -> Result<(), SqlSurfaceError> {
+    let Projection::Items(items) = v.projection() else {
+        return Ok(());
+    };
+    let rounded = |lit: &str| -> Option<Vec<u16>> {
+        let values = crate::sql::parser::parse_vector_literal_any_dim(lit).ok()?;
+        Some(
+            values
+                .iter()
+                .map(|x| crate::f16::f32_to_f16_bits(*x))
+                .collect(),
+        )
+    };
+    let order_bits = rounded(order_literal);
+    for (index, item) in items.iter().enumerate() {
+        if skip.skips_projection_item(index) {
+            continue;
+        }
+        let SelectItem::Expr {
+            expr:
+                Expr::VectorDistance {
+                    kind: item_kind,
+                    rhs,
+                    ..
+                },
+            ..
+        } = item
+        else {
+            continue;
+        };
+        let Expr::String(item_literal) = rhs.as_ref() else {
+            continue;
+        };
+        if *item_kind != kind {
+            continue;
+        }
+        if let (Some(a), Some(b)) = (&order_bits, rounded(item_literal)) {
+            if *a != b {
+                return Err(SqlSurfaceError::feature_not_supported(
+                    "a projected distance must use the same query vector as the distance ORDER BY",
+                ));
+            }
+        }
+    }
+    Ok(())
 }

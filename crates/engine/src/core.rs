@@ -10956,9 +10956,12 @@ impl EngineCore {
                 };
                 let schema = self.describe_table_schema(snap, &validated.table_name)?;
                 // HALFVEC 列の表の kNN は実行時と同じ scan 経路の列メタを返す（Issue #2015・TABLE-46）。
-                if let Some(scan) =
-                    crate::sql::halfvec_knn::halfvec_select_as_scan(validated, &schema)?
-                {
+                if let Some(scan) = crate::sql::halfvec_knn::halfvec_select_as_scan(
+                    validated,
+                    &schema,
+                    session.search_mode(),
+                    skip_vector_literal_validation,
+                )? {
                     let bound = crate::sql::parser::bind_scan_with_dummy_flags(
                         &scan,
                         &schema,
@@ -11706,9 +11709,12 @@ impl EngineCore {
                 let schema = table_schema_in(read_txn, &validated.table_name)?;
                 // HALFVEC 列の表への距離演算子形 kNN は全走査ソートの scan 経路へ写す
                 // （Issue #2015・TABLE-46。arena は VECTOR 専用のため）。
-                if let Some(scan) =
-                    crate::sql::halfvec_knn::halfvec_select_as_scan(&validated, &schema)?
-                {
+                if let Some(scan) = crate::sql::halfvec_knn::halfvec_select_as_scan(
+                    &validated,
+                    &schema,
+                    session.search_mode(),
+                    &crate::sql::parser::LiteralSkip::NONE,
+                )? {
                     return self.execute_read_statement_with_limits(
                         ctx,
                         session,

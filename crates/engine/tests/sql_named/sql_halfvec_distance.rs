@@ -489,6 +489,43 @@ fn unsupported_forms_fail_closed() {
     assert_eq!(ids(&core, "SELECT id FROM t"), vec![1]);
 }
 
+/// (6b) 投影距離と ORDER BY のクエリベクトル不一致、および `SET search_mode = precision` は
+/// scan 変換後も `0A000` で拒否する（fail-closed。Execute 経路）。
+#[test]
+fn projected_query_mismatch_and_precision_fail_closed() {
+    let (_g, core) = open("hvd-closed2");
+    ok(
+        &core,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, h HALFVEC(2))",
+    );
+    ok(&core, "INSERT INTO t (id, h) VALUES (1, '[1,0]')");
+    // 同一形は成功し、不一致は 0A000。
+    ok(
+        &core,
+        "SELECT h <=> '[1,0]' FROM t ORDER BY h <=> '[1,0]' LIMIT 1",
+    );
+    assert_eq!(
+        code(
+            &core,
+            "SELECT h <=> '[1,0]' FROM t ORDER BY h <=> '[0,1]' LIMIT 1"
+        ),
+        "0A000"
+    );
+    // precision（セッション変数）は確信度ゲートを持たない scan 経路へ写さず拒否する。
+    let mut s = SessionState::default();
+    s.set_search_mode(engine::sql::mode::SearchMode::Precision);
+    for sql in [
+        "SELECT id FROM t ORDER BY h <=> '[1,0]' LIMIT 1",
+        "SELECT id FROM t ORDER BY h <=> '[1,0]'",
+        "SELECT id FROM t ORDER BY h <#> '[1,0]' LIMIT 1",
+    ] {
+        let err = core
+            .execute_sql_in_session(&ctx_for("alice"), &mut s, sql)
+            .expect_err(&format!("{sql} must fail"));
+        assert_eq!(err.wire_code(), "0A000", "{sql}");
+    }
+}
+
 /// (7) テナント境界。他テナントの行は投影・WHERE・kNN・関数形 ORDER BY・集計に現れない。
 #[test]
 fn tenant_boundary_holds_for_distances() {
