@@ -54,7 +54,7 @@ use std::sync::OnceLock;
 
 use crate::batch_fallback::{BatchBackend, BatchBackendError, BatchExecError};
 use crate::batch_search::{
-    try_reserve_exact, BatchHit, BatchQuery, BatchSearchError, ResidentMatrix,
+    try_reserve_exact, BatchHit, BatchMetric, BatchQuery, BatchSearchError, ResidentMatrix,
 };
 use crate::kernel::{
     cosine_distance_from_parts, dot, l2_sq, row_norms_sq, CandidateHit, TopKSelector,
@@ -1046,6 +1046,18 @@ fn shrink_to_len(buf: Vec<(u32, i32)>) -> Result<Vec<(u32, i32)>, BatchSearchErr
 }
 
 impl BatchBackend for GpuI8BatchBackend {
+    /// 構築時に固定した採点 metric を返す（Issue #2003）。`FallbackBatchEngine::build_with_metric`
+    /// が engine の metric との一致を検査し、不一致の backend を primary にしないための申告。
+    /// L1 は `try_new_with_metric` が構築前に拒否するため到達しない（`BatchMetric` に対応が
+    /// 無く、到達しても内積とは不一致になりうる申告に倒すより構築不能が保証されている）。
+    fn metric(&self) -> BatchMetric {
+        match self.metric {
+            GpuBatchMetric::InnerProduct | GpuBatchMetric::L1 => BatchMetric::InnerProduct,
+            GpuBatchMetric::L2 => BatchMetric::L2,
+            GpuBatchMetric::Cosine => BatchMetric::Cosine,
+        }
+    }
+
     fn batch_search(&self, queries: &[BatchQuery<'_>]) -> Result<Vec<BatchHit>, BatchExecError> {
         let raw = self.raw_i32_scores(queries)?;
 
@@ -1626,6 +1638,60 @@ mod tests {
                 }
                 other => panic!("expected InitFailed, got {:?}", other.map(|_| ())),
             }
+        }
+    }
+
+    /// L2・Cosine の i8 backend は自分の metric を申告し、内積 engine の primary としては
+    /// 受理されず初期化縮退になる（Issue #2003 レビュー指摘）。GPU 非搭載環境では skip。
+    #[test]
+    fn i8_backend_reports_its_metric_and_is_rejected_by_mismatched_engine() {
+        use crate::batch_fallback::{FallbackBatchEngine, FallbackEvent, FallbackObserver};
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct Obs(Arc<Mutex<Vec<FallbackEvent>>>);
+        impl FallbackObserver for Obs {
+            fn on_fallback(&self, event: FallbackEvent) {
+                self.0.lock().expect("lock").push(event);
+            }
+        }
+
+        let ids = [1u64, 2];
+        let tenants = vec!["t".to_string(); 2];
+        let vis = vec![crate::storage::Visibility::Public; 2];
+        let vectors = [1.0f32, 0.5, 0.25, 2.0];
+        for (gm, bm) in [
+            (GpuBatchMetric::L2, BatchMetric::L2),
+            (GpuBatchMetric::Cosine, BatchMetric::Cosine),
+        ] {
+            let obs = Obs::default();
+            let mut reported = None;
+            let result = FallbackBatchEngine::build_with_metric(
+                &ids,
+                &tenants,
+                &vis,
+                2,
+                &vectors,
+                BatchMetric::InnerProduct,
+                |matrix| {
+                    let backend = GpuI8BatchBackend::try_new_with_metric(
+                        matrix,
+                        GpuI8Options::default(),
+                        gm,
+                    )?;
+                    reported = Some(backend.metric());
+                    Ok(Box::new(backend) as Box<dyn BatchBackend>)
+                },
+                Box::new(obs.clone()),
+            );
+            assert!(result.is_ok());
+            let Some(m) = reported else {
+                // GPU 非搭載: 構築できないため検証対象外。
+                return;
+            };
+            assert_eq!(m, bm);
+            // 内積 engine に metric 違いの backend は受理されず Init 縮退が通知される。
+            assert_eq!(obs.0.lock().expect("lock").len(), 1, "{gm:?}");
         }
     }
 }
