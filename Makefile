@@ -309,7 +309,7 @@ bench-knn-precision-resident: ## i8／f16／f32 経路の前後比較（Issue #5
 bench-knn-wire-profile: ## vector_knn の wire／SQL 表層／距離カーネル内訳（Issue #463）
 	cargo bench --bench knn_wire_profile_bench -p fandhe-db-wire-server
 
-# Issue #365（isa.rs dot カーネルの複数アキュムレータ化）のマイクロベンチを実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用。BENCH_DOT_KERNEL_BLOCK_AB=1 で Issue #512 の行ブロックカーネル block4 A/B〔既定 Off・fail-closed パース〕、BENCH_DOT_KERNEL_TAIL_AB=1 で Issue #529 の dim 100／129／768 分岐なし tail A/B〔fail-closed env・既定 Off〕をそれぞれ追加計測する）
+# Issue #365（isa.rs dot カーネルの複数アキュムレータ化）のマイクロベンチを実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用。BENCH_DOT_KERNEL_BLOCK_AB=1 で Issue #512 の行ブロックカーネル block4 A/B〔既定 Off・fail-closed パース〕、BENCH_DOT_KERNEL_TAIL_AB=1 で Issue #529 の dim 100／129／768 分岐なし tail A/B〔fail-closed env・既定 Off〕、BENCH_DOT_KERNEL_L2_AB=1 で Issue #1984 の L2 対内積 A/B〔fail-closed env・既定 Off〕を、それぞれ追加計測する）
 .PHONY: bench-dot-kernel
 bench-dot-kernel: ## dot カーネルのマイクロベンチ（Issue #365）
 	cargo bench --bench dot_kernel_bench -p fandhe-db-engine

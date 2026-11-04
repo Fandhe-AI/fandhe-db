@@ -59,6 +59,8 @@ pub enum DotKernelError {
     NonFiniteResult,
     /// スカラー参照実装との数値差が許容差を超えた。
     ToleranceExceeded { actual: f32, expected: f32 },
+    /// L2 二乗距離のスカラー参照実装との数値差が許容差を超えた（Issue #1984）。
+    L2ToleranceExceeded { actual: f32, expected: f32 },
     /// tail A/B の分岐なし（padded）実装と現行スカラー実装の `to_bits()` が
     /// 一致しなかった（Issue #529。両方式はビット同一である契約
     /// 〔`docs/design/dot-kernel-branchless-tail.md`〕のため、この不一致は
@@ -103,6 +105,10 @@ impl fmt::Display for DotKernelError {
             DotKernelError::ToleranceExceeded { actual, expected } => write!(
                 f,
                 "dot result outside tolerance: actual={actual} expected={expected}"
+            ),
+            DotKernelError::L2ToleranceExceeded { actual, expected } => write!(
+                f,
+                "l2 result outside tolerance: actual={actual} expected={expected}"
             ),
             DotKernelError::BitMismatch {
                 dim,
@@ -415,5 +421,92 @@ pub fn render_tail_ab_reference_line(
         "dot_kernel: tail_ab_ref dim={dim} rows={rows} min_us={:.3} median_us={:.3}",
         min.as_secs_f64() * 1e6,
         median.as_secs_f64() * 1e6,
+    )
+}
+
+/// L2 A/B セクション（`BENCH_DOT_KERNEL_L2_AB`。Issue #1984・SQL-33 ポインタ）の
+/// 有効・無効状態。`dot_kernel_bench.rs` の `main` が解釈結果で分岐する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum L2AbMode {
+    /// 従来の出力のみ。
+    Off,
+    /// L2 二乗距離カーネルと内積カーネルの交互計測を追加実行する。
+    On,
+}
+
+/// `BENCH_DOT_KERNEL_L2_AB` env の生値を解釈する純関数。未設定・`"0"` は `Off`、
+/// `"1"` は `On`、それ以外（空文字含む）は fail-closed に拒否する。
+pub fn parse_l2_ab_env(raw: Option<&str>) -> Result<L2AbMode, DotKernelError> {
+    match raw {
+        None | Some("0") => Ok(L2AbMode::Off),
+        Some("1") => Ok(L2AbMode::On),
+        Some(_) => Err(DotKernelError::InvalidEnv {
+            name: "BENCH_DOT_KERNEL_L2_AB",
+            reason: "expected unset, \"0\", or \"1\"",
+        }),
+    }
+}
+
+/// `actual`（`current().l2_sq`）が `expected`（`l2_sq_scalar`）と許容差内で一致するか
+/// 検証する。許容差式は `tests/isa.rs` のディスパッチ照合と同じ
+/// `1e-5 * expected + 1e-6`。非有限値は fail-closed に拒否する。
+pub fn check_l2_matches_scalar_reference(actual: f32, expected: f32) -> Result<(), DotKernelError> {
+    if !actual.is_finite() || !expected.is_finite() {
+        return Err(DotKernelError::NonFiniteResult);
+    }
+    let tolerance = 1e-5 * expected.abs() + 1e-6;
+    if (actual - expected).abs() > tolerance {
+        return Err(DotKernelError::L2ToleranceExceeded { actual, expected });
+    }
+    Ok(())
+}
+
+/// L2 A/B の 1 区間分の実測値（[`render_l2_ab_line`] の入力）。
+#[derive(Debug, Clone, Copy)]
+pub struct L2AbRow {
+    pub working_set: WorkingSet,
+    pub dim: usize,
+    pub rows: usize,
+    pub dot_min: Duration,
+    pub dot_median: Duration,
+    pub l2_min: Duration,
+    pub l2_median: Duration,
+    pub ratio_min: f64,
+    pub ratio_median: f64,
+}
+
+/// L2 A/B の 1 行分を整形する。プレフィックス `dot_kernel: l2_ab ` は
+/// `chip.rs::parse_dot_kernel_line`（`label=current`）・`parse_dot_kernel_diag_line`
+/// （`diagnostic_ab`）と衝突しない。
+pub fn render_l2_ab_line(r: &L2AbRow) -> String {
+    let ws = match r.working_set {
+        WorkingSet::CacheResident => "cache_resident",
+        WorkingSet::ArenaScale => "arena_scale",
+    };
+    format!(
+        "dot_kernel: l2_ab working_set={ws} dim={} rows={} dot_min_ms={:.3} dot_median_ms={:.3} \
+         l2_min_ms={:.3} l2_median_ms={:.3} ratio_min={:.4} ratio_median={:.4}",
+        r.dim,
+        r.rows,
+        r.dot_min.as_secs_f64() * 1e3,
+        r.dot_median.as_secs_f64() * 1e3,
+        r.l2_min.as_secs_f64() * 1e3,
+        r.l2_median.as_secs_f64() * 1e3,
+        r.ratio_min,
+        r.ratio_median,
+    )
+}
+
+/// L2 診断 A/B（`l2_sq_scalar` に対する `current().l2_sq` の比。情報提供・合否に
+/// 数えない）1 行分を整形する。
+pub fn render_l2_diagnostic_line(
+    dim: usize,
+    rows: usize,
+    simd_vs_scalar_ratio: f64,
+    class: ChangeClass,
+) -> String {
+    format!(
+        "dot_kernel: l2_diagnostic_ab dim={dim} rows={rows} \
+         simd_vs_scalar_ratio={simd_vs_scalar_ratio:.3} class={class:?}"
     )
 }

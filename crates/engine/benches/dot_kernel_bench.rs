@@ -48,6 +48,18 @@
 //! 契約によりビット同一のはずであり、`check_bit_identical` で全行検証してから
 //! 計測に入る（不一致は実測値を出さず fail-closed で拒否）。
 //!
+//! # L2 A/B（Issue #1984・opt-in）
+//!
+//! `BENCH_DOT_KERNEL_L2_AB=1` を設定すると、(working_set × `DIMS`) ごとに
+//! `isa::current().dot`（A）と `isa::current().l2_sq`（B）を `run_ab` で交互計測し、
+//! `dot_kernel: l2_ab ...` 行（ratio = L2 / dot）を出力する。計測前に全行で
+//! `l2_sq_scalar` との許容差照合を行い、不一致は fail-closed で非ゼロ終了する。
+//! 代表点（dim 768・cache 常駐）の `l2_sq_scalar` 対比は情報提供行
+//! `dot_kernel: l2_diagnostic_ab` として出す。x86_64 では #1982 未着地のため
+//! `SimdKernel::l2_sq` は scalar へ委譲しており、記録値は目標状態ではない。
+//! 記録先は `docs/design/dot-kernel-multi-accumulator.md`「Issue #1984 追記」節
+//! （SQL-33 ポインタ）。未設定・`0` では既定経路の出力・所要時間は不変。
+//!
 //! 採否判断は `docs/design/benchmark-judgement-policy.md` の交互 N≥5・
 //! per-run 生データ・min-of-N＋median 併記・固定 ±5% と参照区間実測の
 //! 2 種ノイズ帯に従う（本ベンチ 1 プロセスの実行＝1 run。N≥5 は呼び出し側が
@@ -64,10 +76,11 @@ use harness::dot_block::{
     render_block_ab_reference_line, BlockAbMode, BLOCK_AB_DIMS,
 };
 use harness::dot_kernel::{
-    check_bit_identical, check_matches_scalar_reference, classify_change, generate_corpus,
-    generate_query, min_of_samples, ns_per_dot, parse_tail_ab_env, refuse_under_github_actions,
+    check_bit_identical, check_l2_matches_scalar_reference, check_matches_scalar_reference,
+    classify_change, generate_corpus, generate_query, min_of_samples, ns_per_dot, parse_l2_ab_env,
+    parse_tail_ab_env, refuse_under_github_actions, render_l2_ab_line, render_l2_diagnostic_line,
     render_line, render_tail_ab_line, render_tail_ab_reference_line, rows_for, speedup_ratio,
-    TailAbMode, WorkingSet, TAIL_AB_DIMS,
+    L2AbMode, L2AbRow, TailAbMode, WorkingSet, TAIL_AB_DIMS,
 };
 use harness::env_report::EnvReport;
 use harness::protocol::{run, MeasurementConfig};
@@ -153,6 +166,18 @@ fn dot_wrapper(a: &[f32], b: &[f32]) -> f32 {
 #[inline(never)]
 fn dot_scalar_wrapper(a: &[f32], b: &[f32]) -> f32 {
     isa::dot_scalar(a, b)
+}
+
+/// L2 A/B の B 側（`current().l2_sq`）入口。
+#[inline(never)]
+fn l2_wrapper(a: &[f32], b: &[f32]) -> f32 {
+    isa::current().l2_sq(a, b)
+}
+
+/// L2 診断 A/B の B 側（`l2_sq_scalar`）入口。
+#[inline(never)]
+fn l2_scalar_wrapper(a: &[f32], b: &[f32]) -> f32 {
+    isa::l2_sq_scalar(a, b)
 }
 
 /// tail A/B の A 側（現行スカラー tail）入口。`objdump` の逆アセンブル確認
@@ -485,6 +510,110 @@ fn run_diagnostic_ab() -> Result<(), String> {
     Ok(())
 }
 
+/// L2 A/B の 1 区間（Issue #1984）。全行を `l2_sq_scalar` と照合（fail-closed）して
+/// から `dot`（A）と `l2_sq`（B）を交互計測し、`l2_ab` 行を出力する。
+fn measure_l2_ab_stage(working_set: WorkingSet, dim: usize) -> Result<(), String> {
+    let rows = rows_for(working_set, dim).map_err(|e| e.to_string())?;
+    let seed = 0x12AB_0000 ^ dim as u64;
+    let corpus = generate_corpus(seed, dim, rows).map_err(|e| e.to_string())?;
+    let query = generate_query(seed, dim);
+    let repeat = match working_set {
+        WorkingSet::CacheResident => CACHE_RESIDENT_REPEAT,
+        WorkingSet::ArenaScale => 1,
+    };
+
+    for (row_idx, chunk) in corpus.chunks_exact(dim).enumerate() {
+        let dot_expected = isa::dot_scalar(chunk, &query);
+        check_matches_scalar_reference(dot_wrapper(chunk, &query), dot_expected, dot_expected)
+            .map_err(|e| format!("l2_ab dot dim={dim} row={row_idx}: {e}"))?;
+        let l2_expected = isa::l2_sq_scalar(chunk, &query);
+        check_l2_matches_scalar_reference(l2_wrapper(chunk, &query), l2_expected)
+            .map_err(|e| format!("l2_ab dim={dim} row={row_idx}: {e}"))?;
+    }
+
+    let config =
+        MeasurementConfig::new(20, 50, seed).map_err(|e| format!("l2_ab dim={dim}: {e}"))?;
+    let ab = run_ab(
+        &config,
+        || {
+            let mut sum = 0f32;
+            for _ in 0..repeat {
+                for chunk in corpus.chunks_exact(dim) {
+                    sum += dot_wrapper(chunk, &query);
+                }
+            }
+            sum
+        },
+        || {
+            let mut sum = 0f32;
+            for _ in 0..repeat {
+                for chunk in corpus.chunks_exact(dim) {
+                    sum += l2_wrapper(chunk, &query);
+                }
+            }
+            sum
+        },
+    )
+    .map_err(|e| format!("l2_ab dim={dim}: {e}"))?;
+
+    let dot_min = min_of_samples(&ab.a.samples).map_err(|e| e.to_string())?;
+    let l2_min = min_of_samples(&ab.b.samples).map_err(|e| e.to_string())?;
+    println!(
+        "{}",
+        render_l2_ab_line(&L2AbRow {
+            working_set,
+            dim,
+            rows,
+            dot_min,
+            dot_median: ab.a.summary.median,
+            l2_min,
+            l2_median: ab.b.summary.median,
+            ratio_min: speedup_ratio(dot_min.as_secs_f64(), l2_min.as_secs_f64()),
+            ratio_median: speedup_ratio(
+                ab.a.summary.median.as_secs_f64(),
+                ab.b.summary.median.as_secs_f64()
+            ),
+        })
+    );
+    Ok(())
+}
+
+/// L2 診断 A/B（`current().l2_sq` vs `l2_sq_scalar`。情報提供・合否に数えない）。
+fn run_l2_diagnostic_ab() -> Result<(), String> {
+    let dim = 768usize;
+    let rows = rows_for(WorkingSet::CacheResident, dim).map_err(|e| e.to_string())?;
+    let corpus = generate_corpus(0x12AB_BEEF, dim, rows).map_err(|e| e.to_string())?;
+    let query = generate_query(0x12AB_BEEF, dim);
+    let config = MeasurementConfig::new(20, 20, 0x12AB_BEEF).map_err(|e| e.to_string())?;
+    let ab = run_ab(
+        &config,
+        || {
+            let mut sum = 0f32;
+            for chunk in corpus.chunks_exact(dim) {
+                sum += l2_wrapper(chunk, &query);
+            }
+            sum
+        },
+        || {
+            let mut sum = 0f32;
+            for chunk in corpus.chunks_exact(dim) {
+                sum += l2_scalar_wrapper(chunk, &query);
+            }
+            sum
+        },
+    )
+    .map_err(|e| format!("l2 diagnostic ab failed: {e}"))?;
+    let ratio = speedup_ratio(
+        ab.b.summary.median.as_secs_f64(),
+        ab.a.summary.median.as_secs_f64(),
+    );
+    println!(
+        "{}",
+        render_l2_diagnostic_line(dim, rows, ratio, classify_change(ratio, 0.05))
+    );
+    Ok(())
+}
+
 fn main() {
     if let Err(e) = refuse_under_github_actions(running_under_github_actions()) {
         eprintln!("dot_kernel_bench: {e}");
@@ -591,6 +720,43 @@ fn main() {
             }
         }
         if had_tail_ab_error {
+            std::process::exit(1);
+        }
+    }
+
+    // L2 A/B（Issue #1984・opt-in）。不正値（非 UTF-8 含む）は fail-closed。
+    let l2_ab_env = std::env::var_os("BENCH_DOT_KERNEL_L2_AB");
+    let l2_ab_raw = match &l2_ab_env {
+        None => None,
+        Some(v) => match v.to_str() {
+            Some(s) => Some(s),
+            None => {
+                eprintln!("dot_kernel_bench: BENCH_DOT_KERNEL_L2_AB value is not valid UTF-8");
+                std::process::exit(1);
+            }
+        },
+    };
+    let l2_ab_mode = match parse_l2_ab_env(l2_ab_raw) {
+        Ok(mode) => mode,
+        Err(e) => {
+            eprintln!("dot_kernel_bench: {e}");
+            std::process::exit(1);
+        }
+    };
+    if l2_ab_mode == L2AbMode::On {
+        let mut had_l2_error = false;
+        for &working_set in &WORKING_SETS {
+            for &dim in &DIMS {
+                if let Err(e) = measure_l2_ab_stage(working_set, dim) {
+                    eprintln!("dot_kernel_bench: {e}");
+                    had_l2_error = true;
+                }
+            }
+        }
+        if let Err(e) = run_l2_diagnostic_ab() {
+            eprintln!("dot_kernel_bench: l2 diagnostic ab skipped: {e}");
+        }
+        if had_l2_error {
             std::process::exit(1);
         }
     }
