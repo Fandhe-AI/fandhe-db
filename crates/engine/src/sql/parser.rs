@@ -922,8 +922,9 @@ pub(crate) fn parse_int8vec_literal(
 /// 検証本体は [`crate::sparse_vector::SparseVector::parse_text`] に一本化し、ここでは
 /// SQLSTATE への写像（形式不正 `22P02`・値不正 `22000`・上限超過 `54000`）だけを行う。
 /// INSERT／UPDATE SET／UPSERT／`$n` テキスト束縛が共有する単一情報源。書き込み経路の非ゼロ数上限は
-/// ここ（[`crate::sparse_vector::DEFAULT_MAX_SPARSEVEC_NNZ`]）で決まり、Issue #2027 が
-/// 設定値へ差し替える唯一の点になる。エラー文言に入力値は含めない。
+/// ここで文の束縛スコープ（[`crate::sparsevec_limits::SparseVecLimitsScope`]。起動時 CLI
+/// `--max-sparsevec-nnz` の値を `core.rs` が張る。Issue #2027）から読む。スコープが無い経路は
+/// ハード上限（＝既定値）。エラー文言に入力値は含めない。
 pub(crate) fn parse_sparsevec_literal(
     literal: &str,
     expected_dim: u32,
@@ -932,7 +933,7 @@ pub(crate) fn parse_sparsevec_literal(
     crate::sparse_vector::SparseVector::parse_text(
         literal,
         expected_dim,
-        crate::sparse_vector::DEFAULT_MAX_SPARSEVEC_NNZ,
+        crate::sparsevec_limits::current_sparsevec_limits().max_nnz(),
     )
     .map_err(|e| match e.kind {
         Kind::InvalidText => SqlSurfaceError::invalid_text_representation(e.detail),
