@@ -23,6 +23,7 @@
 ### Added
 
 - GPU バッチ検索の f32 算術経路に L2 とコサインを追加した（Issue #2003・親 #2002・CORE-6・CORE-16・SQL-33 ポインタ）。`batch_search::BatchMetric`（`InnerProduct`〔既定〕・`L2`・`Cosine`）、`ResidentMatrix::{build_with_metric, metric}`、`BatchBackend::metric`（既定実装は内積）、`FallbackBatchEngine::{build_with_metric, build_with_gpu_metric, build_with_gpu_reference_metric}`、`GpuBatchBackend::metric`、`GpuF32ContrastBackend::try_new_with_metric` を追加した。スコアは全 metric で「大きいほど近い」（L2 は `-Σ(r-q)²`、コサインは行・クエリを正規化した内積）。既存の `build`・`try_new` は内積のまま挙動不変。GPU の f16 算術版と packed i8 版は内積専用で、L2 では選ばれず、i8 版は内積以外の行列の構築を `InitFailed` で拒否する。詳細は `docs/design/gpu-batch-metric.md`。
+- ベクトル関数 `vector_dims`・`vector_norm`・`l2_normalize`・`subvector` を追加した（Issue #2012・SQL-72 (1)(2)(5)(6) ポインタ）。`vector_norm` は `vec_norm` の別名、`subvector` は 1 始まりで範囲外・非整数・`i32` 範囲外を `22000`／`22003` で拒否する。4 名は予約名になり、同名の `CREATE FUNCTION` は `42723`、既存の同名 UDF は組み込みが優先される。ベクトルリテラルと `$n` の引数は未対応（従来どおり `42804`）。
 - 距離関数 `l2_distance`／`cosine_distance`／`inner_product`／`l1_distance` をスカラー関数として追加した（Issue #2011・SQL-72 (1)(2)・SQL-33 (3)(4) ポインタ）。引数は VECTOR 型の式とベクトルリテラル（文字列）で、投影・WHERE・ORDER BY・集計の引数で使える。戻り値は float8 で、演算子 `<->`／`<=>`／`<+>` と同じ値、`inner_product` は `<#>` の符号を反転した正の内積。引数に NULL があれば NULL、次元不一致は `22000`、ゼロノルムのコサインは NaN。非 VECTOR の引数は `42883`、VECTOR の式を含まない形（リテラル同士・NULL とリテラル）は `0A000`。式索引・CHECK・宣言的 UDF の本体では `0A000`。`ORDER BY` の関数形は全走査ソートで評価し ANN 索引は使わない。4 つの名前は組み込み関数名として予約され、同名の `CREATE FUNCTION` は拒否される（互換性変更）
   BREAKING CHANGE: 公開 enum `BoundExpr` に `VectorLiteral(Arc<[f32]>)`、公開 enum `BuiltinFn` に `L2Distance`／`CosineDistance`／`InnerProduct`／`L1Distance` を追加した（網羅的 `match` の下流は追随が必要）。
 - GPU バッチ検索の距離種別 `engine::gpu_batch::GpuBatchMetric` と `GpuI8BatchBackend::try_new_with_metric` を追加した（Issue #2004・親 #2002・CORE-8・CORE-16・SQL-33 ポインタ）。i8 経路は InnerProduct・Cosine・L2 に対応し、L1 は `InitFailed` で拒否する（非破壊。`try_new` と `GpuI8Options` は不変）。
@@ -290,6 +291,8 @@
 
 ### Breaking Changes
 
+- `sql::udf_call::BuiltinFn`（Issue #2012・SQL-72）に variant `VectorDims`／`L2Normalize`／`Subvector` を追加した。
+  BREAKING CHANGE: 網羅 `match` する外部コードは腕を足す。
 - 明示トランザクションが writer を取る時点を `BEGIN` から最初の書き込み文へ移した（Issue #2396・#2400・#2405・#2408・TASK-333・TASK-335・SQL-31・SQL-19・ERR-7・WIRE-15・WIRE-16・WIRE-19）。
   BREAKING CHANGE: `BEGIN`／`START TRANSACTION` は writer を取らず、その時点の読み取りスナップショットだけを開く。書き込み文（DML・`COPY FROM`・`LOCK TABLE`）で初めて writer を取る。行ロック句の取得は #2230 で未完。
   読み取りだけの Tx は他セッションを待たせず自分も待たない。`55P03` は `BEGIN` ではなく最初の書き込み文で返り Tx は `Failed`（以降 `25P02`）になる。`--write-lock-wait-ms` の待機は最初の書き込み文から効く。
