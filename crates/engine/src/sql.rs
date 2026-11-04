@@ -214,6 +214,7 @@ pub mod udf_ddl;
 // TRIGGER DDL（TABLE-45・Issue #1722）。
 pub mod default_privileges_ddl;
 pub mod grant_ddl;
+pub(crate) mod halfvec_knn;
 pub mod owner_ddl;
 pub mod policy_applicability;
 pub mod policy_ddl;

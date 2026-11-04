@@ -28,8 +28,7 @@ use crate::sql::using_operation_id::OperationId;
 
 /// ベクトルリテラルの生バイト長上限（SQL-1）。アロケーション（`Vec<f32>` の確保・
 /// カンマ分割）に入る前にこの長さで拒否する。
-const MAX_VECTOR_LITERAL_BYTES: usize = 64 * 1024;
-
+pub(crate) const MAX_VECTOR_LITERAL_BYTES: usize = 64 * 1024;
 /// 配列リテラルの生バイト長上限（TABLE-14・TASK-198、Issue #888・D-A5）。
 /// 列 1 個分のペイロード上限（`row_codec::MAX_TEXT_FIELD_LEN` と同値の
 /// 実装既定値）と揃え、走査（`Vec<String>` の確保・要素切り出し）に入る前に
@@ -754,7 +753,11 @@ pub(crate) fn parse_vector_literal_any_dim(literal: &str) -> Result<Vec<f32>, Sq
             literal.len()
         )));
     }
+    parse_vector_literal_body(literal)
+}
 
+/// [`parse_vector_literal_any_dim`] の長さ上限を除いた形式・有限性の検証本体。
+fn parse_vector_literal_body(literal: &str) -> Result<Vec<f32>, SqlSurfaceError> {
     let trimmed = literal.trim();
     let inner = trimmed
         .strip_prefix('[')
@@ -2124,7 +2127,7 @@ impl LiteralSkip {
         projection_mask: Vec::new(),
     };
 
-    fn skips_projection_item(&self, index: usize) -> bool {
+    pub(crate) fn skips_projection_item(&self, index: usize) -> bool {
         self.projection_mask.get(index).copied().unwrap_or(false)
     }
 }
