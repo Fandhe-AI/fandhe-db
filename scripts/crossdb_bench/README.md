@@ -151,7 +151,8 @@ python scripts/crossdb_bench/run.py --db self --config hnsw \
 | キー | 内容 |
 | --- | --- |
 | `phases.ann_probe` | 上記 3. の `EXPLAIN` 検証結果（`engine`/`hnsw_params`/`ann_plan`/生の行） |
-| `phases.hnsw_index_warm` | 索引構築を含む初回 `vector_knn` 相当クエリの単発計時（`first_query_us`。informational） |
+| `phases.ann_probe.knn_operator_plan` | 実際の kNN 形（`<#>`）の `EXPLAIN` から抜いた `engine`/`ann_plan`。`<#>` は現行 HNSW の対応 metric 外で厳密全走査になり（`plain_scan_opclass_mismatch`）、`USING PLAN` の `ann_probe` とは経路が違う。到達しないとき `hnsw_index_warm` は unsupported・`ef_search` は `null` |
+| `phases.hnsw_index_warm` | 索引構築を含む初回 `vector_knn` 相当クエリの単発計時（`first_query_us`。informational。kNN が HNSW に到達しない構成では unsupported） |
 | `phases.bulk_knn_k*`/`bulk_knn_where_k200` | `ef_search`/`ef_effective`（`ef.max(k)`。`hnsw.rs::search_masked_with` の契約からの導出値） |
 | `phases.bulk_hybrid_k200` | `ef_search`/`dense_fetch_k_initial`/`dense_fetch_k_may_expand`（直後の段落参照。`ef_effective` は常に `null`） |
 | `meta.index` | `hnsw(m=16,ef_construction=100,ef_search=64,resident=f32)` または `exact (no index)` |
@@ -443,8 +444,11 @@ tenant-a=public・tenant-b=private が連続した区間にまとまっている
 - **fsync 等の永続化設定は未変更**: 公平性のためではなく、単に「素の Docker
   イメージ・デフォルト設定」を比較対象にする方針のため。本番運用のチューニング
   差は本ベンチの対象外。
-- **距離指標**: 自作 DB の `<=>` は内積（`crates/engine/src/kernel.rs`
-  「スコアは内積」参照）。pgvector は `<#>`（負の内積）、Qdrant は
+- **距離指標**: 自作 DB は `<#>`（負の内積の昇順＝内積の降順。
+  `crates/engine/src/kernel.rs`「スコアは内積」参照。Issue #2952・SQL-33）。
+  `<=>` はコサイン距離なので DB 間比較には使わない。`mode_precision` だけは
+  `<#>` との併用が engine で `0A000` となるため `<=>` のまま（self 専用フェーズ）。
+  pgvector は `<#>`（負の内積）、Qdrant は
   `Distance.DOT`、LanceDB は `metric="dot"` に揃えている。sqlite-vec の
   vec0 は内積相当の `distance_metric` を持たない（実機確認: `l2`/`l1`/`cosine`
   のみ受理）ため、コサイン距離で近似し `meta` に注記する。

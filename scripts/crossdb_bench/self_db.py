@@ -4,6 +4,9 @@
 プロトコルのみ・`autocommit=True`・パラメータなし `execute(sql)`）で接続する。
 クエリ形は `crates/engine/examples/feature_bench.rs` に合わせてある（比較可能性
 のため独自方言を作らない）。
+距離演算子は他 DB・recall 正解（内積）に合わせ `<#>`（負の内積の昇順。Issue #2952・
+SQL-33）。`feature_bench.rs` とは演算子だけ違う。`mode_precision` のみ `<#>` 併用が
+engine で `0A000` となるため `<=>` のまま（self 専用フェーズ）。
 
 RLS 相当のテナント境界は wire 接続ユーザーのテナントで自動適用される
 （`bench` = tenant-a、`bench_b` = tenant-b の 2 ユーザーを users.txt に登録する）。
@@ -476,26 +479,45 @@ def _run_phases(
         # 検出できない（`docs/design/crossdb-bench.md` 参照。実行時カウンタでの
         # 確認は Issue #659 の担当）。probe テーブルは `crossdb_plan_probe`
         # example が `run()` で事前投入済み。
+        knn_reaches_hnsw = False
         if run_ann_probe:
             with conn_a.cursor() as cur:
                 cur.execute("EXPLAIN SELECT id FROM plan_probe USING PLAN('probe') LIMIT 10")
                 explain_rows = [r[0] for r in cur.fetchall()]
             verified = self_hnsw.verify_explain_rows(explain_rows, expect_hnsw=is_hnsw)
             phases["ann_probe"] = verified
+            # 実際の kNN 形（`<#>`）が HNSW に到達するかを記録する（assert しない）。
+            # `<#>`（Ip）は現行 HNSW の対応 metric 外で厳密全走査に倒れるが、上の
+            # `USING PLAN('probe')` はコサイン既定のため engine: hnsw を返す。
+            # ここで観測しないと ANN 計測値が偽陽性になる（Issue #2952）。
+            if query_vecs:
+                with conn_a.cursor() as cur:
+                    cur.execute(
+                        f"EXPLAIN SELECT id FROM docs ORDER BY embedding <#> '{query_vecs[0]}' LIMIT 10"
+                    )
+                    knn_plan = self_hnsw.parse_explain_rows([r[0] for r in cur.fetchall()])
+                phases["ann_probe"] = {**verified, "knn_operator_plan": knn_plan}
+                knn_reaches_hnsw = self_hnsw.knn_reaches_hnsw(knn_plan)
 
         # --- hnsw_index_warm（Issue #658）: 索引構築を含む初回クエリの単発計時 ---
         # `sql::hnsw_cache` は同一世代内で索引を再利用する同期構築のため、初回
         # クエリの所要時間が構築コストの実行証跡になる（informational。exact
         # 構成にはこのフェーズを持たせない）。
-        if is_hnsw and query_vecs:
+        if is_hnsw and query_vecs and not knn_reaches_hnsw:
+            # kNN 本体（`<#>`）が厳密全走査になる構成では索引構築を伴わないため、
+            # 初回クエリ時間を ANN 構築コストとして記録しない（偽の計測を残さない）。
+            phases["hnsw_index_warm"] = unsupported(
+                "<#> は現行 HNSW の対応 metric 外で厳密全走査になるため索引構築を伴わない"
+            )
+        elif is_hnsw and query_vecs:
             t0 = time.perf_counter()
-            _exec_ids(conn_a, f"SELECT id FROM docs ORDER BY embedding <=> '{query_vecs[0]}' LIMIT 10")
+            _exec_ids(conn_a, f"SELECT id FROM docs ORDER BY embedding <#> '{query_vecs[0]}' LIMIT 10")
             t1 = time.perf_counter()
             phases["hnsw_index_warm"] = {"first_query_us": (t1 - t0) * 1_000_000.0}
 
         # --- vector_knn ---
         def knn(qv):
-            sql = f"SELECT id FROM docs ORDER BY embedding <=> '{qv}' LIMIT 10"
+            sql = f"SELECT id FROM docs ORDER BY embedding <#> '{qv}' LIMIT 10"
             return _exec_ids(conn_a, sql)
 
         stats, _ = measure(knn, query_vecs)
@@ -507,7 +529,7 @@ def _run_phases(
         def knn_where(qv):
             sql = (
                 f"SELECT id FROM docs WHERE lang = 'ja' "
-                f"ORDER BY embedding <=> '{qv}' LIMIT 10"
+                f"ORDER BY embedding <#> '{qv}' LIMIT 10"
             )
             return _exec_ids(conn_a, sql)
 
@@ -573,19 +595,21 @@ def _run_phases(
         phases["hybrid_rrf"] = stats
 
         # --- mode_recall / mode_precision ---
-        def mode_query(mode):
-            def _run(qv):
-                sql = (
-                    f"SELECT id FROM docs ORDER BY embedding <=> '{qv}' "
-                    f"LIMIT 10 USING MODE '{mode}'"
-                )
-                return _exec_ids(conn_a, sql)
+        def mode_recall_query(qv):
+            sql = f"SELECT id FROM docs ORDER BY embedding <#> '{qv}' LIMIT 10 USING MODE 'recall'"
+            return _exec_ids(conn_a, sql)
 
-            return _run
+        # `<#>` と `USING MODE 'precision'` の併用は engine が `0A000` で拒否する
+        # （確信度を cosine 類似度で判定する設計）ため、このフェーズだけ `<=>`
+        # （コサイン距離）のまま残す。他 DB はすべて precision を unsupported とする
+        # self 専用フェーズで、DB 間比較・recall 評価の対象外。
+        def mode_precision_query(qv):
+            sql = f"SELECT id FROM docs ORDER BY embedding <=> '{qv}' LIMIT 10 USING MODE 'precision'"
+            return _exec_ids(conn_a, sql)
 
-        stats, _ = measure(mode_query("recall"), query_vecs)
+        stats, _ = measure(mode_recall_query, query_vecs)
         phases["mode_recall"] = stats
-        stats, _ = measure(mode_query("precision"), query_vecs)
+        stats, _ = measure(mode_precision_query, query_vecs)
         phases["mode_precision"] = stats
 
         # --- 広域取得（bulk fetch）: id と body を Top-N でまとめて返す ---
@@ -603,7 +627,7 @@ def _run_phases(
             # `docs/design/crossdb-bench.md` 記録用）。exact 構成は索引を持たない
             # ため `None` のまま記録する（pgvector 等の `ef_search` フィールドと
             # 同じ書式に揃える）。
-            if not is_hnsw:
+            if not knn_reaches_hnsw:
                 return {"ef_search": None, "ef_effective": None}
             return {
                 "ef_search": self_hnsw.DEFAULT_EF_SEARCH,
@@ -613,7 +637,7 @@ def _run_phases(
         def bulk_knn(k: int):
             def _run(qv):
                 return _exec_rows(
-                    f"SELECT id, body FROM docs ORDER BY embedding <=> '{qv}' LIMIT {k}"
+                    f"SELECT id, body FROM docs ORDER BY embedding <#> '{qv}' LIMIT {k}"
                 )
 
             return _run
@@ -630,7 +654,7 @@ def _run_phases(
         def bulk_knn_where(qv):
             return _exec_rows(
                 f"SELECT id, body FROM docs WHERE lang = 'ja' "
-                f"ORDER BY embedding <=> '{qv}' LIMIT 200"
+                f"ORDER BY embedding <#> '{qv}' LIMIT 200"
             )
 
         stats, last = measure(bulk_knn_where, query_vecs)
@@ -730,7 +754,7 @@ def _run_phases(
             qv0 = query_vecs[0]
             udf_sql = (
                 f"SELECT id, norm_scale(embedding, 2.0) AS score FROM docs "
-                f"ORDER BY embedding <=> '{qv0}' LIMIT 10"
+                f"ORDER BY embedding <#> '{qv0}' LIMIT 10"
             )
 
             def udf_call(_):
@@ -751,14 +775,14 @@ def _run_phases(
             )
 
         # --- explain ---
-        # 素の `ORDER BY embedding <=> '...'` に対する `EXPLAIN`（USING PLAN を伴わない
+        # 素の `ORDER BY embedding <#> '...'` に対する `EXPLAIN`（USING PLAN を伴わない
         # 検索 SELECT）は engine の `sql::explain` で受理される。pgvector と同じく
         # 計測し、出力の先頭行を記録する。許可リストで拒否される版（`42601`）のみ
         # unsupported とし、接続断・タイムアウト等の実行障害は再送出して計測全体を
         # 失敗させる（unsupported へ丸めると仕様変更に気づけない。codex-review P1）。
         def explain(qv):
             with conn_a.cursor() as cur:
-                cur.execute(f"EXPLAIN SELECT id FROM docs ORDER BY embedding <=> '{qv}' LIMIT 10")
+                cur.execute(f"EXPLAIN SELECT id FROM docs ORDER BY embedding <#> '{qv}' LIMIT 10")
                 return [r[0] for r in cur.fetchall()]
 
         try:
@@ -861,6 +885,10 @@ def _run_phases(
                 ),
                 "search_engine": self_hnsw.SEARCH_ENGINE_TOKEN if is_hnsw else "default",
                 "hnsw_args": hnsw_args,
+                # kNN 本体が実際に HNSW へ到達したか（ann_probe の EXPLAIN 観測）。
+                # `--config hnsw` でも False なら厳密全走査であり、上記 index /
+                # search_engine は「構成指定」であって実効経路ではない。
+                "knn_reaches_hnsw": knn_reaches_hnsw,
                 "planner": "loopback stub (fixed expansion)" if run_ann_probe else None,
                 # durability A/B（Issue #851）。`verify_arm_identity` が run() で
                 # 既に一致を確認済みのため、ここでは記録のみ（再計算しない）。

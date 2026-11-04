@@ -1,8 +1,8 @@
 """Recall@10 の正解集合（ground truth）を作る配線検算ユーティリティ。
 
 `docs25k.jsonl` から RLS 相当で可視な行の embedding を numpy に乗せ、内積
-（自作 DB の `<=>` と同じ指標。`crates/engine/src/kernel.rs` の「スコアは
-内積」に合わせる）で 200 クエリそれぞれの正解を計算する。
+（自作 DB の `<#>` と同じ順位＝内積の降順。`crates/engine/src/kernel.rs` の
+「スコアは内積」に合わせる）で 200 クエリそれぞれの正解を計算する。
 
 可視性モデル（実機確認済みの現行契約）: 自作 DB はどのテナントの wire
 セッションからも `visibility = 'public'` の行のみが可視であり、private 行は
