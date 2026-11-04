@@ -5378,13 +5378,15 @@ pub(crate) fn expr_result_column_type(
         return ty.result_column_type();
     }
     // `binary_quantize(<VECTOR 列>)` は引数の列の次元をそのまま長さにした `bit(n)`（Issue #2023）。
-    if matches!(
-        bound,
-        BoundExpr::Builtin {
-            f: BuiltinFn::BinaryQuantize,
-            ..
+    // 引数が裸の `NULL` の場合は長さ不明のため、無関係な VECTOR 列の次元を採らず公告しない（text 扱い）。
+    if let BoundExpr::Builtin {
+        f: BuiltinFn::BinaryQuantize,
+        args,
+    } = bound
+    {
+        if !matches!(args.first(), Some(BoundExpr::VectorRef)) {
+            return None;
         }
-    ) {
         return schema.and_then(|s| {
             s.columns.iter().find_map(|c| match c.ty {
                 ColumnType::Vector(d) => Some(ColumnType::Bit(d)),

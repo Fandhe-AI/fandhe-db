@@ -119,6 +119,25 @@ fn projection_matches_pgvector_and_advertises_bit_type() {
     }
 }
 
+/// 裸の `NULL` 引数は長さ不明のため、無関係な VECTOR 列（VECTOR(11)）の次元を採って `bit(11)` を
+/// 公告してはならない（公告するか拒否するかのどちらかで、`bit(11)` にだけはならない）。
+#[test]
+fn null_argument_does_not_borrow_unrelated_vector_dimension() {
+    let (core, _g) = build_core("bq-null");
+    let r = core.execute_sql(
+        &ctx("tenant-a"),
+        "SELECT binary_quantize(NULL) FROM t ORDER BY id LIMIT 10",
+    );
+    if let Ok(r) = r {
+        match &r.columns[0] {
+            ColumnMeta::Computed { ty, .. } => {
+                assert!(!matches!(ty, Some(ColumnType::Bit(_))), "ty = {ty:?}")
+            }
+            other => panic!("unexpected column meta: {other:?}"),
+        }
+    }
+}
+
 #[test]
 fn only_visible_rows_are_returned() {
     let (core, _g) = build_core("bq-rls");
