@@ -824,6 +824,39 @@ fn bind_vector_literal_values(
     Ok(crate::row_codec::Value::Vector(values.to_vec()))
 }
 
+/// `HALFVEC(N)` 列（TABLE-46・Issue #2014）向けの束縛。入力は VECTOR と同じ検証
+/// （次元一致・有限性。違反は `22000`）を通した `f32` 列を IEEE 754 binary16 へ丸めて保存する
+/// （丸めは最近接偶数。pgvector と同じく 文字列 → f32 → f16 の順）。有限の入力が f16 の範囲外で
+/// ±Inf に飽和する場合は `22003`（65504 超〜65520 未満は 65504 へ丸まり受理される）。
+/// INSERT／UPDATE SET／UPSERT／NoSQL insert が共有する単一情報源。エラー文言に入力値は含めない。
+pub(crate) fn bind_halfvec_values(
+    values: &[f32],
+    expected_dim: u32,
+    name: &str,
+) -> Result<crate::row_codec::Value, SqlSurfaceError> {
+    // 次元・有限性の検証は VECTOR の束縛と共有する（検証点を 1 つに保つ）。
+    let validated = bind_vector_literal_values(values, expected_dim, name)?;
+    let crate::row_codec::Value::Vector(floats) = validated else {
+        return Err(SqlSurfaceError::Internal {
+            detail: "vector binder returned a non-vector value".to_string(),
+        });
+    };
+    let mut bits: Vec<u16> = Vec::new();
+    bits.try_reserve_exact(floats.len()).map_err(|_| {
+        SqlSurfaceError::payload_too_large("halfvec payload exceeds available memory")
+    })?;
+    for v in &floats {
+        let b = crate::f16::f32_to_f16_bits(*v);
+        if !crate::f16::f16_bits_to_f32(b).is_finite() {
+            return Err(SqlSurfaceError::numeric_out_of_range(format!(
+                "column {name:?}: value out of range for type halfvec"
+            )));
+        }
+        bits.push(b);
+    }
+    Ok(crate::row_codec::Value::HalfVec(bits))
+}
+
 /// `SMALLINT`／`INTEGER`／`BIGINT` 列（Issue #881・#1558・TABLE-13・TASK-196）向けの数値リテラル
 /// 束縛。`literal` は `InsertLiteral::Number`（`allowlist::expect_literal` が
 /// 単項マイナスを正規化済み）のみを受理し、`InsertLiteral::String` は
@@ -913,6 +946,7 @@ pub(crate) fn bind_integer_literal(
         | ColumnType::TimestampTz
         | ColumnType::Interval
         | ColumnType::Bit(_)
+        | ColumnType::HalfVec(_)
         | ColumnType::Array(_)
         | ColumnType::Bytea
         | ColumnType::Json
@@ -1094,6 +1128,7 @@ pub(crate) fn bind_datetime_literal(
         | ColumnType::BigInt
         | ColumnType::Boolean
         | ColumnType::Bit(_)
+        | ColumnType::HalfVec(_)
         | ColumnType::Array(_)
         | ColumnType::Bytea
         | ColumnType::Json
@@ -1563,6 +1598,7 @@ pub(crate) fn vector_column(schema: &TableSchema) -> Result<(usize, u32), SqlSur
             | ColumnType::TimestampTz
             | ColumnType::Interval
             | ColumnType::Bit(_)
+            | ColumnType::HalfVec(_)
             | ColumnType::Array(_)
             | ColumnType::Bytea
             | ColumnType::Json
@@ -1571,7 +1607,21 @@ pub(crate) fn vector_column(schema: &TableSchema) -> Result<(usize, u32), SqlSur
             | ColumnType::Numeric { .. }
             | ColumnType::Uuid => None,
         })
-        .ok_or_else(|| SqlSurfaceError::invalid_input("table has no VECTOR column"))
+        .ok_or_else(|| {
+            // HALFVEC のみの表は距離計算・kNN が兄弟 Issue（#2015・#2016）まで未対応（fail-closed。
+            // Issue #2014）。「VECTOR 列が無い」誤案内（22000）にしない。
+            if schema
+                .columns
+                .iter()
+                .any(|c| matches!(c.ty, ColumnType::HalfVec(_)))
+            {
+                SqlSurfaceError::feature_not_supported(
+                    "vector search over HALFVEC columns is not supported",
+                )
+            } else {
+                SqlSurfaceError::invalid_input("table has no VECTOR column")
+            }
+        })
 }
 
 /// NoSQL 表層（Issue #763・TASK-175・NOSQL-2）の `search.plan` 経路向け。`VECTOR`
@@ -1618,6 +1668,7 @@ pub(crate) fn text_column_index(
                 | ColumnType::TimestampTz
                 | ColumnType::Interval
                 | ColumnType::Bit(_)
+                | ColumnType::HalfVec(_)
                 | ColumnType::Array(_)
                 | ColumnType::Bytea
                 | ColumnType::Json
@@ -4147,6 +4198,17 @@ fn bind_insert_row(
             (ColumnType::Interval, InsertLiteral::String(s)) => {
                 bind_datetime_literal(name, ColumnType::Interval, s)?
             }
+            (ColumnType::HalfVec(dim), InsertLiteral::String(s)) => {
+                bind_halfvec_values(&parse_vector_literal(s, *dim)?, *dim, name)?
+            }
+            (ColumnType::HalfVec(dim), InsertLiteral::Vector(values)) => {
+                bind_halfvec_values(values, *dim, name)?
+            }
+            (ColumnType::HalfVec(_), InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects a vector literal, got a non-vector literal"
+                )))
+            }
             (ColumnType::Bit(bit_len), InsertLiteral::String(s)) => {
                 bind_bit_literal(name, *bit_len, s)?
             }
@@ -4336,6 +4398,7 @@ pub(crate) fn bind_json_literal(
         | ColumnType::TimestampTz
         | ColumnType::Interval
         | ColumnType::Bit(_)
+        | ColumnType::HalfVec(_)
         | ColumnType::Array(_)
         | ColumnType::Bytea
         | ColumnType::Enum(_)
@@ -4697,6 +4760,17 @@ pub(crate) fn bind_set_assignments(
             }
             (ColumnType::Interval, InsertLiteral::String(s)) => {
                 bind_datetime_literal(name, ColumnType::Interval, s)?
+            }
+            (ColumnType::HalfVec(dim), InsertLiteral::String(s)) => {
+                bind_halfvec_values(&parse_vector_literal(s, *dim)?, *dim, name)?
+            }
+            (ColumnType::HalfVec(dim), InsertLiteral::Vector(values)) => {
+                bind_halfvec_values(values, *dim, name)?
+            }
+            (ColumnType::HalfVec(_), InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects a vector literal, got a non-vector literal"
+                )))
             }
             (ColumnType::Bit(bit_len), InsertLiteral::String(s)) => {
                 bind_bit_literal(name, *bit_len, s)?
@@ -6280,6 +6354,17 @@ fn bind_upsert_assignments(
                     (ColumnType::Interval, InsertLiteral::String(s)) => {
                         bind_datetime_literal(name, ColumnType::Interval, s)?
                     }
+                    (ColumnType::HalfVec(dim), InsertLiteral::String(s)) => {
+                        bind_halfvec_values(&parse_vector_literal(s, *dim)?, *dim, name)?
+                    }
+                    (ColumnType::HalfVec(dim), InsertLiteral::Vector(values)) => {
+                        bind_halfvec_values(values, *dim, name)?
+                    }
+                    (ColumnType::HalfVec(_), InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+                        return Err(SqlSurfaceError::invalid_input(format!(
+                            "column {name:?} expects a vector literal, got a non-vector literal"
+                        )))
+                    }
                     (ColumnType::Bit(bit_len), InsertLiteral::String(s)) => {
                         bind_bit_literal(name, *bit_len, s)?
                     }
@@ -6536,6 +6621,11 @@ fn bind_file_insert(
             (ColumnType::Bit(_), _) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?}: BIT column is not supported for file-form INSERT"
+                )))
+            }
+            (ColumnType::HalfVec(_), _) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?}: HALFVEC column is not supported for file-form INSERT"
                 )))
             }
             // 配列列（TABLE-14・Issue #888）も BOOLEAN と同じく対象外として拒否する。
@@ -7810,6 +7900,11 @@ fn resolve_aggregate_input(
                     (ColumnType::Bit(_), _) => Err(SqlSurfaceError::undefined_function(format!(
                         "column {name:?} is BIT and cannot be used with aggregate functions"
                     ))),
+                    (ColumnType::HalfVec(_), _) => {
+                        Err(SqlSurfaceError::undefined_function(format!(
+                        "column {name:?} is HALFVEC and cannot be used with aggregate functions"
+                    )))
+                    }
                     (ColumnType::Vector(_), AggregateFunc::Count) => {
                         Ok(AggregateInput::VectorColumnPresence)
                     }
@@ -8419,6 +8514,7 @@ fn bind_array_agg_value(
             | ColumnType::TimestampTz
             | ColumnType::Interval
             | ColumnType::Bit(_)
+            | ColumnType::HalfVec(_)
             | ColumnType::Vector(_)
             | ColumnType::Array(_)
             | ColumnType::Enum(_) => {
@@ -8665,6 +8761,9 @@ fn resolve_count_distinct_input(
                     ))),
                     ColumnType::Bit(_) => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} is BIT and cannot be used with COUNT(DISTINCT ...)"
+                    ))),
+                    ColumnType::HalfVec(_) => Err(SqlSurfaceError::invalid_input(format!(
+                        "column {name:?} is HALFVEC and cannot be used with COUNT(DISTINCT ...)"
                     ))),
                     ColumnType::SmallInt => Ok(AggregateInput::SmallIntColumn(index)),
                     ColumnType::Integer => Ok(AggregateInput::IntegerColumn(index)),
@@ -9452,6 +9551,7 @@ fn resolve_order_kind(ty: &ColumnType) -> Option<OrderKind> {
         ColumnType::Interval => Some(OrderKind::Interval),
         ColumnType::Vector(_)
         | ColumnType::Bit(_)
+        | ColumnType::HalfVec(_)
         | ColumnType::Array(_)
         | ColumnType::Bytea
         | ColumnType::Json
@@ -10879,6 +10979,7 @@ fn resolve_window_key(name: &str, schema: &TableSchema) -> Result<WindowKeyRef, 
             | ColumnType::Bpchar(_)
             | ColumnType::Interval
             | ColumnType::Bit(_)
+            | ColumnType::HalfVec(_)
             | ColumnType::Enum(_) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} cannot be used as a window PARTITION BY/ORDER BY key"

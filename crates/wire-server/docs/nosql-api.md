@@ -422,6 +422,11 @@ OFFSET ...` と同じ対象名解決・実行器を共有。第 2 の実行器�
   並び）を束縛する。`0`・`1` 以外の文字は `22P02`、ビット数が宣言長 `n` と異なる値は `22026`
   （`STRING_DATA_LENGTH_MISMATCH`、HTTP `400`）で文全体を拒否し副作用を残さない。応答の列型名は
   `"bit"`。`filter` に BIT 列を使うことは対象外で engine の非対応列判定により拒否される
+- `HALFVEC(N)` 列（SQL DDL で作成。TABLE-46・Issue #2014）への `insert`／`update` は `VECTOR` と同じ JSON 数値配列を
+  束縛し、engine が IEEE 754 binary16 へ丸めて保存する（`scan` では丸めた値が返る）。次元不一致・非数値要素・
+  非有限は `22000`、f16 の範囲外は `22003`（HTTP `400`）で文全体を拒否し副作用を残さない。応答の列型名は
+  `"halfvec"`。`VECTOR` と異なり NULL・省略を許す列（`nullable`）として扱える。`filter` に HALFVEC 列を使う
+  ことは対象外で engine の非対応列判定により拒否される
 - 全型共通（`VECTOR` 列を除く。上記参照）: 「省略」（キー自体を持たない）と
   「明示的な JSON `null`」を区別する（TABLE-16・TASK-204、Issue #904。
   `DEFAULT` は省略にのみ適用し、明示 `null` には適用しない）。省略時は

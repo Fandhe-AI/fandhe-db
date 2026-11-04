@@ -235,6 +235,12 @@ pub(crate) fn project_row(
                 Some(Value::Time(t)) => Cell::Time(*t),
                 Some(Value::TimestampTz(t)) => Cell::TimestampTz(*t),
                 Some(Value::Interval(v)) => Cell::Interval(*v),
+                // HALFVEC は f32 へ広げた `Cell::Vector` で返す（Issue #2014）。展開後の大きさで課金する。
+                Some(Value::HalfVec(v)) => {
+                    let bytes = v.len().saturating_mul(std::mem::size_of::<f32>());
+                    *budget = try_accumulate_budget(*budget, bytes, MAX_RETURNING_RESULT_BYTES)?;
+                    Cell::Vector(crate::sql::exec::expand_halfvec(v)?)
+                }
                 Some(Value::Bit(v)) => Cell::Bit(try_alloc_bit_for_budget(
                     v,
                     budget,

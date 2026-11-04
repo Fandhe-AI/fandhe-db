@@ -15329,6 +15329,10 @@ impl EngineCore {
                     crate::row_codec::Value::Interval(_) => 16,
                     // BIT 値は presence(1) + ビット長(4) + ceil(len/8) バイト（Issue #2021）。
                     crate::row_codec::Value::Bit(v) => 5usize.saturating_add(v.as_bytes().len()),
+                    // HALFVEC 値は presence(1) + 次元(4) + 次元 × 2 バイト（Issue #2014）。
+                    crate::row_codec::Value::HalfVec(v) => {
+                        5usize.saturating_add(v.len().saturating_mul(2))
+                    }
                     // 配列値（Issue #888）は実際の行コーデック（`row_codec::
                     // scalar_array_entry_len`）が書き込むフレーム込みの全
                     // エンコード長をそのまま使う（presence(1)・flags(1)・

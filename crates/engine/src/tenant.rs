@@ -4791,6 +4791,41 @@ fn validate_set_assignments(
                     ))));
                 }
             }
+            (
+                crate::catalog::ColumnType::HalfVec(declared),
+                crate::row_codec::Value::HalfVec(bits),
+            ) => {
+                // HALFVEC の SET 値は宣言次元と一致し、行 codec 上の長さ（presence(1) + 次元(4) +
+                // 次元 × 2）が累計上限を超えないことを、対象行の探索より前に検証する（Issue #2014）。
+                if u32::try_from(bits.len()).ok() != Some(*declared) {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(
+                        "SET value dimension does not match HALFVEC column".to_string(),
+                    )));
+                }
+                let entry_len = u32::try_from(bits.len())
+                    .ok()
+                    .and_then(|n| n.checked_mul(2))
+                    .and_then(|n| n.checked_add(5))
+                    .ok_or_else(|| {
+                        TenantWriteError::Catalog(CatalogError::Invalid(
+                            "scalar payload length overflow".to_string(),
+                        ))
+                    })?;
+                set_text_payload_total =
+                    set_text_payload_total
+                        .checked_add(entry_len)
+                        .ok_or_else(|| {
+                            TenantWriteError::Catalog(CatalogError::Invalid(
+                                "scalar payload length overflow".to_string(),
+                            ))
+                        })?;
+                if set_text_payload_total > crate::row_codec::MAX_SCALAR_PAYLOAD_LEN {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(format!(
+                        "scalar payload length {set_text_payload_total} exceeds limit {}",
+                        crate::row_codec::MAX_SCALAR_PAYLOAD_LEN
+                    ))));
+                }
+            }
             (crate::catalog::ColumnType::Enum(def), crate::row_codec::Value::Enum(label)) => {
                 // SET 値の語彙検証（対象行の探索より前に行う。多層防御。
                 // 束縛層〔`sql::parser::bind_enum_literal`〕で既に検査済みだが、
@@ -4890,6 +4925,7 @@ fn validate_set_assignments(
             | (crate::catalog::ColumnType::TimestampTz, _)
             | (crate::catalog::ColumnType::Interval, _)
             | (crate::catalog::ColumnType::Bit(_), _)
+            | (crate::catalog::ColumnType::HalfVec(_), _)
             | (crate::catalog::ColumnType::Array(_), _)
             | (crate::catalog::ColumnType::Bytea, _)
             | (crate::catalog::ColumnType::Json, _)

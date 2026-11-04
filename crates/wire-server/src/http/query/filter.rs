@@ -737,6 +737,8 @@ fn declare_between(
         | ColumnType::Vector(_)
         // BIT(n) は filter の対象外（Issue #2021）。engine の非対応列判定へ委譲して拒否する。
         | ColumnType::Bit(_)
+        // HALFVEC も filter の対象外（Issue #2014）。engine の非対応列判定へ委譲して拒否する。
+        | ColumnType::HalfVec(_)
         | ColumnType::Array(_)
         | ColumnType::Json
         | ColumnType::Jsonb => Ok(leaf(String::new(), String::new())),
@@ -900,7 +902,7 @@ fn declare_eq(
         // SQL 表層にも eq レーンが無い列型は、従来どおり engine 側の
         // 「`TEXT` 列でない」判定（`22000`）へ委譲する（legacy 互換）。
         // BIT(n) も同様に engine 側の非対応列判定へ委譲して拒否する（Issue #2021）。
-        ColumnType::Vector(_) | ColumnType::Bit(_) => Ok(DeclarativePredicate::Leaf(
+        ColumnType::Vector(_) | ColumnType::Bit(_) | ColumnType::HalfVec(_) => Ok(DeclarativePredicate::Leaf(
             DeclarativeFilter::equals(column, ""),
         )),
         // 配列列の等価（Issue #1193・NOSQL-17）。JSON 配列を SQL 表層と同じ配列
@@ -1020,6 +1022,7 @@ fn declare_range(
         | ColumnType::Boolean
         | ColumnType::Vector(_)
         | ColumnType::Bit(_)
+        | ColumnType::HalfVec(_)
         | ColumnType::Array(_)
         | ColumnType::Json
         | ColumnType::Jsonb => Ok(DeclarativePredicate::Leaf(DeclarativeFilter::compare(
@@ -1218,7 +1221,10 @@ fn declare_in(
         }
         // BOOLEAN・VECTOR は engine 側の「IN 非対応列」判定（`22000`）へ委譲する
         // （SQL の `col IN ('..')` を真偽列へ書いた場合と同じ結果になる）。
-        ColumnType::Boolean | ColumnType::Vector(_) | ColumnType::Bit(_) => Ok(
+        ColumnType::Boolean
+        | ColumnType::Vector(_)
+        | ColumnType::Bit(_)
+        | ColumnType::HalfVec(_) => Ok(
             DeclarativePredicate::Leaf(DeclarativeFilter::in_list(column, Vec::new())),
         ),
     }

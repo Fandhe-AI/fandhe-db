@@ -461,6 +461,7 @@ fn nosql_type_name(meta: &ColumnMeta) -> &'static str {
             ColumnType::TimestampTz => "timestamptz",
             ColumnType::Interval => "interval",
             ColumnType::Bit(_) => "bit",
+            ColumnType::HalfVec(_) => "halfvec",
             ColumnType::Numeric { .. } => "numeric",
             ColumnType::Uuid => "uuid",
             ColumnType::Bytea => "bytea",

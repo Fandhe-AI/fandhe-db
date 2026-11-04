@@ -909,6 +909,8 @@ fn scalar_type_binary_support(ty: &engine::catalog::ColumnType) -> bool {
         | ColumnType::Jsonb
         | ColumnType::Date
         | ColumnType::Timestamp
+        // `halfvec` も公告 OID は `text` だが、バイナリ形式（`halfvec_send`）は対象外（Issue #2014）。
+        | ColumnType::HalfVec(_)
         // `bit` のバイナリ形式は対象外（Issue #2021）。
         | ColumnType::Bit(_) => false,
     }
@@ -953,6 +955,8 @@ fn scalar_type_modifier(ty: &engine::catalog::ColumnType) -> Result<i32, EncodeE
         | ColumnType::Bytea
         | ColumnType::Uuid
         | ColumnType::Vector(_)
+        // `HALFVEC` も `VECTOR` と同じく typmod を持たない（text 公告。Issue #2014）。
+        | ColumnType::HalfVec(_)
         | ColumnType::Enum(_)
         | ColumnType::Array(_)
         | ColumnType::Json
@@ -1012,6 +1016,9 @@ fn scalar_wire_type(ty: &engine::catalog::ColumnType) -> WireType {
         // CHAR(n) は bpchar（OID 1042）。長さは typmod で伝える（TABLE-31・Issue #1565）。
         engine::catalog::ColumnType::Bpchar(_) => WireType::Bpchar,
         engine::catalog::ColumnType::Vector(_) => WireType::Text,
+        // HALFVEC は `VECTOR` と同じく専用 OID を持たず text（OID 25）で公告する
+        // （TABLE-46 (5)・Issue #2014）。値は `Cell::Vector`（f32 に広げた `[a,b,...]`）。
+        engine::catalog::ColumnType::HalfVec(_) => WireType::Text,
         engine::catalog::ColumnType::Boolean => WireType::Bool,
         // SMALLINT は int2（OID 21・typlen 2。TABLE-30・Issue #1561）。値は
         // `Cell::SignedInteger`（text／バイナリとも i16 範囲内）。

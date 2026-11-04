@@ -135,6 +135,7 @@ pub(crate) fn expr_type_for(ty: &ColumnType) -> Result<ExprType, SqlSurfaceError
         ColumnType::Bytea => ExprType::Bytea,
         ColumnType::Bpchar(_)
         | ColumnType::Bit(_)
+        | ColumnType::HalfVec(_)
         | ColumnType::Vector(_)
         | ColumnType::Array(_)
         | ColumnType::Json

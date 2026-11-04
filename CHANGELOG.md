@@ -21,6 +21,8 @@
 ### Added
 
 - ベクトル関数 `vector_dims`・`vector_norm`・`l2_normalize`・`subvector` を追加した（Issue #2012・SQL-72 (1)(2)(5)(6) ポインタ）。`vector_norm` は `vec_norm` の別名、`subvector` は 1 始まりで範囲外・非整数・`i32` 範囲外を `22000`／`22003` で拒否する。4 名は予約名になり、同名の `CREATE FUNCTION` は `42723`、既存の同名 UDF は組み込みが優先される。ベクトルリテラルと `$n` の引数は未対応（従来どおり `42804`）。
+- `HALFVEC(N)` 列型を追加した（Issue #2014・TABLE-46 (1)(4)(5) ポインタ）。`CREATE TABLE` で宣言でき、値は IEEE 754 binary16 でスカラーペイロードに保存する。INSERT／UPDATE SET／UPSERT／NoSQL insert の入力は VECTOR と同じ検証の後に f16 へ丸め（次元不一致・非有限は `22000`、f16 範囲外は `22003`）、SELECT は f32 へ広げて返す。VECTOR と合わせて表に 0〜1 本。距離計算・CAST・HNSW・ADD COLUMN・PK/UNIQUE・索引・COPY などは fail-closed（兄弟 Issue #2015・#2016 ほかの担当）。
+  BREAKING CHANGE: 公開 enum `ColumnType`・`row_codec::Value`・`row_codec::ScalarRef`・`sql::ddl_column_type::SqlColumnTypeName` に `HalfVec` を追加した（網羅的 `match` の下流は追随が必要）。
 - 距離関数 `l2_distance`／`cosine_distance`／`inner_product`／`l1_distance` をスカラー関数として追加した（Issue #2011・SQL-72 (1)(2)・SQL-33 (3)(4) ポインタ）。引数は VECTOR 型の式とベクトルリテラル（文字列）で、投影・WHERE・ORDER BY・集計の引数で使える。戻り値は float8 で、演算子 `<->`／`<=>`／`<+>` と同じ値、`inner_product` は `<#>` の符号を反転した正の内積。引数に NULL があれば NULL、次元不一致は `22000`、ゼロノルムのコサインは NaN。非 VECTOR の引数は `42883`、VECTOR の式を含まない形（リテラル同士・NULL とリテラル）は `0A000`。式索引・CHECK・宣言的 UDF の本体では `0A000`。`ORDER BY` の関数形は全走査ソートで評価し ANN 索引は使わない。4 つの名前は組み込み関数名として予約され、同名の `CREATE FUNCTION` は拒否される（互換性変更）
   BREAKING CHANGE: 公開 enum `BoundExpr` に `VectorLiteral(Arc<[f32]>)`、公開 enum `BuiltinFn` に `L2Distance`／`CosineDistance`／`InnerProduct`／`L1Distance` を追加した（網羅的 `match` の下流は追随が必要）。
 - GPU バッチ検索の距離種別 `engine::gpu_batch::GpuBatchMetric` と `GpuI8BatchBackend::try_new_with_metric` を追加した（Issue #2004・親 #2002・CORE-8・CORE-16・SQL-33 ポインタ）。i8 経路は InnerProduct・Cosine・L2 に対応し、L1 は `InitFailed` で拒否する（非破壊。`try_new` と `GpuI8Options` は不変）。

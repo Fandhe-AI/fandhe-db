@@ -508,6 +508,17 @@ pub fn map_json_to_literal(
                 "VECTOR column value must be a JSON array of numbers",
             )),
         },
+        // HALFVEC(N) は VECTOR と同じ JSON 数値配列を `InsertLiteral::Vector` として束縛し、
+        // f16 への丸めと範囲外（`22003`）・非有限・次元の検査は engine の `bind_halfvec_values` に
+        // 一本化する（TABLE-46・Issue #2014）。
+        ColumnType::HalfVec(dim) => match raw {
+            JsonValue::Array(items) => {
+                Ok(InsertLiteral::Vector(vector_literal_values(items, *dim)?))
+            }
+            _ => Err(TypedJsonError::LegacyMismatch(
+                "HALFVEC column value must be a JSON array of numbers",
+            )),
+        },
         ColumnType::Array(array_ty) => match raw {
             JsonValue::Array(items) => {
                 Ok(InsertLiteral::String(array_literal_text(items, array_ty)?))

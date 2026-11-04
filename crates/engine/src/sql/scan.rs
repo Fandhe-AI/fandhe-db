@@ -289,6 +289,7 @@ fn decode_tier_for(schema: &TableSchema, bound: &BoundScan) -> (DecodeTier, Vec<
                         | ColumnType::TimestampTz
                         | ColumnType::Interval
                         | ColumnType::Bit(_)
+                        | ColumnType::HalfVec(_)
                         | ColumnType::Array(_)
                         | ColumnType::Bytea
                         | ColumnType::Json
@@ -877,6 +878,21 @@ pub(crate) fn push_scalar_column_cell(
             Some(Some(_)) => {
                 return Err(scan_bug(
                     "INTERVAL column scan yielded a non-Interval scalar value",
+                ))
+            }
+            Some(None) | None => cells.push(Cell::Null),
+        },
+        // HALFVEC は f16 を f32 へ広げた `Cell::Vector` で返す（Issue #2014・TABLE-46）。
+        ColumnType::HalfVec(_) => match scanned.get(*index) {
+            Some(Some(row_codec::ScalarRef::HalfVec(body))) => {
+                let expanded = (body.len() / 2).saturating_mul(std::mem::size_of::<f32>());
+                *byte_budget = try_accumulate_budget(*byte_budget, expanded, max_result_bytes)?;
+                let bits = row_codec::halfvec_bytes_to_bits(body);
+                cells.push(Cell::Vector(crate::sql::exec::expand_halfvec(&bits)?));
+            }
+            Some(Some(_)) => {
+                return Err(scan_bug(
+                    "HALFVEC column scan yielded a non-HalfVec scalar value",
                 ))
             }
             Some(None) | None => cells.push(Cell::Null),

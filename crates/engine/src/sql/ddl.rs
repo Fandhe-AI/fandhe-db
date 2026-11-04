@@ -1995,6 +1995,7 @@ fn resolve_alter_target_type(
 ) -> Result<ColumnType, SqlSurfaceError> {
     match ty {
         SqlColumnTypeName::Vector(dim) => Ok(ColumnType::Vector(*dim)),
+        SqlColumnTypeName::HalfVec(dim) => Ok(ColumnType::HalfVec(*dim)),
         other => resolve_column_type(storage, other, limits),
     }
 }
@@ -2132,6 +2133,13 @@ fn resolve_column_type(
     if matches!(ty, SqlColumnTypeName::Vector(_)) {
         return Err(SqlSurfaceError::FeatureNotSupported {
             detail: "ALTER TABLE ADD COLUMN does not support VECTOR columns yet".to_string(),
+        });
+    }
+    // HALFVEC 列の追加も同じ理由で拒否する（既存行に値が無く、補完値も持てない。
+    // 担当 Issue 未定の fail-closed。TABLE-46・Issue #2014）。
+    if matches!(ty, SqlColumnTypeName::HalfVec(_)) {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "ALTER TABLE ADD COLUMN does not support HALFVEC columns yet".to_string(),
         });
     }
     if let Some(alias) = alias_spelling(ty) {

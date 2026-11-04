@@ -6497,6 +6497,10 @@ pub(super) fn bind_expr_any(
                         ExprType::Interval,
                     )),
                     // BIT(n) 列は式内参照を持たない（ビット列の演算子・関数は後続 Issue。Issue #2021）。
+                    // HALFVEC 列も式内参照を持たない（距離計算・`::halfvec` は兄弟 Issue #2015。Issue #2014）。
+                    ColumnType::HalfVec(_) => Err(SqlSurfaceError::invalid_input(format!(
+                        "column {name:?} cannot be used in an expression (HALFVEC columns are not supported)"
+                    ))),
                     ColumnType::Bit(_) => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} cannot be used in an expression (BIT columns are not supported)"
                     ))),
@@ -8153,6 +8157,7 @@ fn column_type_label(ty: &ColumnType) -> &'static str {
         ColumnType::TimestampTz => "timestamp with time zone",
         ColumnType::Interval => "interval",
         ColumnType::Bit(_) => "bit",
+        ColumnType::HalfVec(_) => "halfvec",
         ColumnType::Array(_) => "array",
         ColumnType::Bytea => "bytea",
         ColumnType::Json => "json",

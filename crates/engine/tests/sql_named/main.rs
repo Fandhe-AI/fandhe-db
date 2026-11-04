@@ -67,6 +67,7 @@ mod sql_expression_index;
 mod sql_gin_index_ddl;
 mod sql_gin_index_dml;
 mod sql_group_by;
+mod sql_halfvec_column;
 mod sql_index_ddl;
 mod sql_insert_batch_public_api;
 mod sql_insert_explain_public_api;

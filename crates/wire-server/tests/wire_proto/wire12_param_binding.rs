@@ -87,6 +87,16 @@ fn open_storage() -> (Storage, temp_db::CleanupGuard) {
             ],
         ))
         .expect("create table");
+    // Issue #2014（TABLE-46）: HALFVEC(N) 列の text 束縛用（VECTOR 列を持たない表）。
+    storage
+        .create_table(&TableSchema::new(
+            "halfs",
+            vec![
+                ColumnDef::new("h", ColumnType::HalfVec(2), true),
+                ColumnDef::new("note", ColumnType::Text, true),
+            ],
+        ))
+        .expect("create table");
     (storage, guard)
 }
 
@@ -1174,4 +1184,41 @@ fn seven_type_malformed_values_and_binary_per_wire14() {
     for col in ["dt", "ts"] {
         send_pbes_expect_error(&mut s, &sel(col), &[], &[1], &[Some(b"1")], "0A000");
     }
+}
+
+/// HALFVEC(N) 列への `$n` text 束縛（TABLE-46・Issue #2014）: リテラル形と同じ f16 丸めの往復と、
+/// 次元不一致 `22000`・範囲外 `22003` の写像。バイナリ形式の結果は `0A000`（対象外）。
+#[test]
+fn halfvec_column_accepts_text_binding_and_maps_errors() {
+    let (core, _g) = new_core();
+    let addr = spawn(core);
+    let mut ext = connect(addr, "alice");
+    let mut simple = connect(addr, "alice");
+
+    let sql = "INSERT INTO halfs (id, h) VALUES (1, $1) USING OPERATION_ID $2";
+    let (_, tag) = run_extended(&mut ext, sql, &[], &[Some(b"[0.1,1]"), Some(b"half-op-1")]);
+    assert!(tag.starts_with("INSERT"), "tag: {tag}");
+    let (rows, _) = run_simple(&mut simple, "SELECT id, h FROM halfs LIMIT 10");
+    assert_eq!(rows.len(), 1);
+    let text = String::from_utf8_lossy(rows.first().expect("row")).to_string();
+    assert!(text.contains("[0.099975586,1]"), "row: {text}");
+
+    send_pbes_expect_error(
+        &mut ext,
+        sql,
+        &[],
+        &[],
+        &[Some(b"[1,2,3]"), Some(b"half-op-2")],
+        "22000",
+    );
+    send_pbes_expect_error(
+        &mut ext,
+        sql,
+        &[],
+        &[],
+        &[Some(b"[70000,1]"), Some(b"half-op-3")],
+        "22003",
+    );
+    let (rows, _) = run_simple(&mut simple, "SELECT id, h FROM halfs LIMIT 10");
+    assert_eq!(rows.len(), 1, "rejected binds must not write rows");
 }
