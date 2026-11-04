@@ -18,6 +18,10 @@
 //! 二値（bit）ベクトルの Hamming・Jaccard 距離と Top-k（Issue #2022・TABLE-48 ポインタ）は
 //! 子モジュール `bit` にあり、popcount は `isa.rs` の `PopcountKernel` に委ねる。
 //!
+//! 疎ベクトル（非ゼロ要素のみ）の L2・負の内積・コサイン距離と Top-k（Issue #2026・
+//! TABLE-47 ポインタ）は子モジュール `sparsevec` にあり、index 昇順のマージ走査で計算する。
+//! SQL 接続は別 Issue。
+//!
 //! L2 距離の brute-force 経路（Issue #1981）は [`search_l2`]。二乗距離のまま昇順選出し、
 //! 平方根は最終出力用の [`l2_distance_from_sq`] だけで取る。SQL 接続は別 Issue。
 //!
@@ -34,6 +38,13 @@ mod int8;
 pub use int8::{
     int8_cosine_distance, int8_dot, int8_l2_distance, int8_l2_sq, int8_negative_inner_product,
     int8_top_k, Int8Metric, Int8SearchInput,
+};
+
+mod sparsevec;
+pub use sparsevec::{
+    sparsevec_cosine_distance, sparsevec_dot, sparsevec_l2_distance, sparsevec_l2_sq,
+    sparsevec_negative_inner_product, sparsevec_top_k, SparseVecMetric, SparseVecRef,
+    SparseVecSearchInput,
 };
 
 mod bit;
