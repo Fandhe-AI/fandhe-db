@@ -61,6 +61,9 @@ pub enum TypedJsonError {
     /// `INT8VEC` 列の要素が整数表記でない（`1.0`・`1e2` 等の `JsonNumber::Float`。`22P02`。
     /// TABLE-49・Issue #2018）。範囲外（`22003`）・次元不一致は engine の束縛に一本化する。
     InvalidInt8VecText(&'static str),
+    /// `INT8VEC` 列の要素が整数表記だが `i64`／`u64` に収まらない（`22003`。SQL テキスト入力の
+    /// 範囲外分類と一致させる。Issue #2018 レビュー指摘）。
+    Int8VecOutOfRange(&'static str),
 }
 
 impl ClassifiedError for TypedJsonError {
@@ -75,6 +78,7 @@ impl ClassifiedError for TypedJsonError {
             TypedJsonError::ArrayTooLarge => ErrorClass::PayloadTooLarge,
             TypedJsonError::InvalidEnumLabel(_) => ErrorClass::InvalidTextRepresentation,
             TypedJsonError::InvalidInt8VecText(_) => ErrorClass::InvalidTextRepresentation,
+            TypedJsonError::Int8VecOutOfRange(_) => ErrorClass::NumericOutOfRange,
         }
     }
 
@@ -91,6 +95,7 @@ impl ClassifiedError for TypedJsonError {
             }
             TypedJsonError::InvalidEnumLabel(detail) => detail.clone(),
             TypedJsonError::InvalidInt8VecText(detail) => detail.to_string(),
+            TypedJsonError::Int8VecOutOfRange(detail) => detail.to_string(),
         }
     }
 }
@@ -109,6 +114,7 @@ impl TypedJsonError {
                 SqlSurfaceError::InvalidTextRepresentation { detail }
             }
             ErrorClass::InvalidInput => SqlSurfaceError::InvalidInput { detail },
+            ErrorClass::NumericOutOfRange => SqlSurfaceError::NumericOutOfRange { detail },
             // `UnsupportedSqlSyntax`（`TypeMismatch`／
             // `InvalidJson`）以外の分類はここには到達しない
             // （[`TypedJsonError::error_class`] の網羅から明らか）が、
@@ -187,7 +193,15 @@ pub fn int8vec_literal_values(items: &[JsonValue], dim: u32) -> Result<Vec<f32>,
                 "INT8VEC column element must be a JSON number",
             ));
         };
-        if matches!(n, JsonNumber::Float { .. }) {
+        if let JsonNumber::Float { text, .. } = n {
+            // 符号に続く数字のみ（小数点・指数部なし）の整数表記は i64/u64 超過のオーバーフロー
+            // （`22003`）。小数点・指数部を含む表記は整数でない（`22P02`）。
+            let digits = text.strip_prefix('-').unwrap_or(text);
+            if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(TypedJsonError::Int8VecOutOfRange(
+                    "INT8VEC element is out of range for int8",
+                ));
+            }
             return Err(TypedJsonError::InvalidInt8VecText(
                 "INT8VEC column element must be an integer",
             ));
@@ -603,6 +617,32 @@ mod tests {
 
     fn num(json: &str) -> JsonValue {
         parse_json(json).expect("valid json")
+    }
+
+    #[test]
+    fn int8vec_huge_integer_is_out_of_range_and_fraction_is_invalid_text() {
+        for raw in [
+            "[18446744073709551616,1]",
+            "[99999999999999999999,1]",
+            "[-99999999999999999999,1]",
+        ] {
+            let JsonValue::Array(items) = num(raw) else {
+                panic!("array")
+            };
+            let e = int8vec_literal_values(&items, 2).expect_err(raw);
+            assert_eq!(e.error_class(), ErrorClass::NumericOutOfRange, "{raw}");
+        }
+        for raw in ["[1.5,1]", "[1e3,1]"] {
+            let JsonValue::Array(items) = num(raw) else {
+                panic!("array")
+            };
+            let e = int8vec_literal_values(&items, 2).expect_err(raw);
+            assert_eq!(
+                e.error_class(),
+                ErrorClass::InvalidTextRepresentation,
+                "{raw}"
+            );
+        }
     }
 
     #[test]
