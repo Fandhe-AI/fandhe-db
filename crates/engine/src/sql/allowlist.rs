@@ -19537,7 +19537,7 @@ impl ValidatedCreateIndex {
     }
 
     pub fn is_hnsw(&self) -> bool {
-        matches!(self.method, IndexMethod::Hnsw)
+        matches!(self.method, IndexMethod::Hnsw(_))
     }
 
     /// `USING` の方式。
@@ -19549,6 +19549,15 @@ impl ValidatedCreateIndex {
     pub fn gin_opclass(&self) -> Option<crate::catalog::GinOpClass> {
         match self.method {
             IndexMethod::Gin(opclass) => Some(opclass),
+            _ => None,
+        }
+    }
+
+    /// `USING hnsw` の演算子クラス（`hnsw` 以外は `None`）。省略は `vector_cosine_ops` の別名
+    /// （Issue #2239・INDEX-7・SQL-33 (5)）。実行段は `IndexKind::Hnsw` へそのまま渡す。
+    pub fn hnsw_opclass(&self) -> Option<crate::catalog::VectorOpClass> {
+        match self.method {
+            IndexMethod::Hnsw(opclass) => Some(opclass),
             _ => None,
         }
     }
@@ -19574,8 +19583,8 @@ impl ValidatedCreateIndex {
 pub enum IndexMethod {
     /// 省略時・`USING btree`（スカラー宣言）。
     Btree,
-    /// `USING hnsw`。
-    Hnsw,
+    /// `USING hnsw (<列> [<opclass>])`。省略は `vector_cosine_ops` の別名（Issue #2239・INDEX-7）。
+    Hnsw(crate::catalog::VectorOpClass),
     /// `USING gin`（JSONB 向け。演算子クラスは省略時 `jsonb_ops`。INDEX-8）。
     Gin(crate::catalog::GinOpClass),
 }
@@ -19669,7 +19678,8 @@ pub(crate) fn validate_create_index_tokens(
         p.advance();
         let method = p.expect_ident()?;
         if method.eq_ignore_ascii_case("hnsw") {
-            IndexMethod::Hnsw
+            // 演算子クラスは列リスト解析後に確定する（省略は `vector_cosine_ops` の別名。Issue #2239）。
+            IndexMethod::Hnsw(crate::catalog::VectorOpClass::Cosine)
         } else if method.eq_ignore_ascii_case("gin") {
             // 演算子クラスは列リスト解析後に確定する（既定は `jsonb_ops`）。
             IndexMethod::Gin(crate::catalog::GinOpClass::JsonbOps)
@@ -19685,7 +19695,7 @@ pub(crate) fn validate_create_index_tokens(
     } else {
         IndexMethod::Btree
     };
-    let hnsw = matches!(method, IndexMethod::Hnsw);
+    let hnsw = matches!(method, IndexMethod::Hnsw(_));
     let is_gin = matches!(method, IndexMethod::Gin(_));
     let mut method = method;
     p.expect_punct('(')?;
@@ -19713,6 +19723,23 @@ pub(crate) fn validate_create_index_tokens(
                     }
                 })?;
             method = IndexMethod::Gin(opclass);
+        }
+        // `USING hnsw` の演算子クラス 4 種（Issue #2239・INDEX-7・SQL-33 (5)）。GIN と同じく
+        // 素の列要素の直後の識別子 1 個だけを読む（語順の違いは `42601`）。未知の名前は
+        // fail-closed で `42704`（カタログ非参照のため表・列の存在情報は漏れない）。
+        if hnsw
+            && expression.is_none()
+            && collation.is_none()
+            && matches!(p.peek(), Some(Token::Ident(_)))
+        {
+            let opclass_name = p.expect_ident()?;
+            let opclass =
+                crate::catalog::VectorOpClass::from_name(&opclass_name).ok_or_else(|| {
+                    SqlSurfaceError::UndefinedObject {
+                        name: truncate_for_error(&opclass_name),
+                    }
+                })?;
+            method = IndexMethod::Hnsw(opclass);
         }
         columns.push(column);
         expressions.push(expression);
@@ -19854,7 +19881,7 @@ fn parse_index_with_options(
         return Ok(None);
     }
     p.advance();
-    if !matches!(method, IndexMethod::Hnsw) {
+    if !matches!(method, IndexMethod::Hnsw(_)) {
         return Err(SqlSurfaceError::FeatureNotSupported {
             detail: "storage parameters are only supported for USING hnsw".to_string(),
         });
@@ -19962,7 +19989,7 @@ fn reject_unimplemented_expression_keys(
         return Ok(());
     }
     match method {
-        IndexMethod::Hnsw => {
+        IndexMethod::Hnsw(_) => {
             return Err(SqlSurfaceError::FeatureNotSupported {
                 detail: "USING hnsw does not support expression indexes".to_string(),
             });
@@ -30650,6 +30677,74 @@ mod tests {
         }
     }
 
+    /// `USING hnsw` の演算子クラス 4 種（Issue #2239・INDEX-7・SQL-33 (5)）: 受理・省略時は
+    /// cosine の別名・未知は `42704`・語順/方式違いは `42601`・既存の未対応組み合わせは `0A000`。
+    #[test]
+    fn create_index_using_hnsw_accepts_opclasses_and_rejects_unsupported_forms() {
+        use super::*;
+        use crate::catalog::VectorOpClass;
+        let parse = |sql: &str| {
+            let tokens = crate::sql::lexer::tokenize(sql).expect("tokenize");
+            validate_create_index_tokens(&tokens)
+        };
+        for (sql, expected) in [
+            ("CREATE INDEX i ON t USING hnsw (a)", VectorOpClass::Cosine),
+            (
+                "CREATE INDEX i ON t USING hnsw (a vector_cosine_ops)",
+                VectorOpClass::Cosine,
+            ),
+            (
+                "CREATE INDEX i ON t USING hnsw (a vector_l2_ops)",
+                VectorOpClass::L2,
+            ),
+            (
+                "CREATE INDEX i ON t USING HNSW (a VECTOR_IP_OPS)",
+                VectorOpClass::Ip,
+            ),
+            (
+                "CREATE INDEX i ON t USING hnsw (a vector_l1_ops) WITH (m = 8)",
+                VectorOpClass::L1,
+            ),
+        ] {
+            let v = parse(sql).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+            assert_eq!(v.hnsw_opclass(), Some(expected), "{sql}");
+            assert!(v.is_hnsw(), "{sql}");
+        }
+        for (sql, code) in [
+            ("CREATE INDEX i ON t USING hnsw (a halfvec_l2_ops)", "42704"),
+            (
+                "CREATE INDEX i ON t USING hnsw (a sparsevec_l2_ops)",
+                "42704",
+            ),
+            ("CREATE INDEX i ON t USING hnsw (a foo)", "42704"),
+            (
+                "CREATE INDEX i ON t USING hnsw (a vector_l2_ops COLLATE \"C\")",
+                "42601",
+            ),
+            (
+                "CREATE INDEX i ON t USING hnsw (a vector_l2_ops vector_l2_ops)",
+                "42601",
+            ),
+            ("CREATE INDEX i ON t USING btree (a vector_l2_ops)", "42601"),
+            ("CREATE INDEX i ON t (a vector_l2_ops)", "42601"),
+            (
+                "CREATE INDEX i ON t USING hnsw (a vector_l2_ops, b)",
+                "0A000",
+            ),
+            (
+                "CREATE UNIQUE INDEX i ON t USING hnsw (a vector_l2_ops)",
+                "0A000",
+            ),
+        ] {
+            let err = parse(sql).expect_err(sql);
+            assert_eq!(err.wire_code(), code, "{sql}");
+        }
+        assert!(parse("CREATE INDEX i ON t USING btree (a)")
+            .expect("btree")
+            .hnsw_opclass()
+            .is_none());
+    }
+
     /// `USING gin` の構文段（Issue #2206・INDEX-8）: 演算子クラスの解決（省略時 `jsonb_ops`・
     /// 大文字小文字不問）と、未知の演算子クラス `42704`・未対応の組み合わせ `0A000`・
     /// 非 gin 方式の演算子クラス風識別子 `42601`。
@@ -30699,7 +30794,8 @@ mod tests {
                 "42601",
             ),
             ("CREATE INDEX i ON t USING btree (a jsonb_ops)", "42601"),
-            ("CREATE INDEX i ON t USING hnsw (a jsonb_ops)", "42601"),
+            // Issue #2239 以降、hnsw は演算子クラスを読むため未知の名前は `42704`（旧: `42601`）。
+            ("CREATE INDEX i ON t USING hnsw (a jsonb_ops)", "42704"),
             ("CREATE INDEX i ON t (a jsonb_ops)", "42601"),
         ] {
             let err = parse(sql).expect_err(sql);
