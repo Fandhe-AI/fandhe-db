@@ -7549,7 +7549,10 @@ impl<'a> Parser<'a> {
             }
             // Issue #1593: `'1'::int` のように文字列リテラルへ `::` が続く形だけ式項目として扱う。
             Some(Token::StringLiteral(_))
-                if matches!(self.tokens.get(self.pos + 1), Some(Token::TypeCast)) =>
+                if matches!(
+                    self.tokens.get(self.pos + 1),
+                    Some(Token::TypeCast | Token::BitDistanceOp(_))
+                ) =>
             {
                 self.parse_projection_infix(0)?
             }

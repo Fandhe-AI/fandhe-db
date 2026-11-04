@@ -307,6 +307,20 @@ fn ordering_boundaries() {
         ids(&core, "SELECT id FROM t ORDER BY '1100' <~> v LIMIT 10"),
         vec![1, 2, 3, 5, 6, 4]
     );
+    // 投影でもリテラルが左の `'..' <~> v`・`'..' <%> v` が受理され、右リテラル形と同じ値になる。
+    for op in ["<~>", "<%>"] {
+        assert_eq!(
+            dists(
+                &core,
+                &format!("SELECT id, '1100' {op} v FROM t ORDER BY id LIMIT 10")
+            ),
+            dists(
+                &core,
+                &format!("SELECT id, v {op} '1100' FROM t ORDER BY id LIMIT 10")
+            ),
+            "{op}"
+        );
+    }
     // 列×列は自分自身との距離 0（NULL 行は NULL）。
     assert_eq!(
         dists(&core, "SELECT id, v <~> v FROM t ORDER BY id LIMIT 10"),
