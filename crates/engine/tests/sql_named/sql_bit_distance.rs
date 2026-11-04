@@ -528,7 +528,7 @@ fn unsupported_contexts_are_rejected() {
         "SELECT max(v <~> '1010') FROM t",
     ] {
         // 一部は従来から別の理由で拒否される。ここでは「成功しない」ことと副作用のなさを固定する。
-        let _ = exec_as(&core, "alice", sql);
+        assert!(exec_as(&core, "alice", sql).is_err(), "{sql}");
     }
     assert!(exec_as(
         &core,
