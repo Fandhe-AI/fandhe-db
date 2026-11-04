@@ -53,6 +53,25 @@ use crate::policy::PolicyContext;
 /// と整合）。詳細設計は `docs/design/gpu-batch-i8-packed.md` 参照。
 pub mod packed_i8;
 
+/// GPU バッチ検索が扱う距離種別（Issue #2004・親 #2002・CORE-8・CORE-16・SQL-33）。
+///
+/// 現状の利用者は [`packed_i8::GpuI8BatchBackend::try_new_with_metric`] のみ。f32/f16
+/// 経路の metric 化（#2003）は同じ型を再利用する想定で、親モジュールに置いている。
+/// `<#>`（負の内積）は順序が内積と一致するため [`GpuBatchMetric::InnerProduct`] で扱う
+/// （`HnswMetric` の前例と同じ）。スコアは「大きいほど近い」に統一する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GpuBatchMetric {
+    /// 内積（既定。従来の GPU バッチ経路の唯一の意味論）。
+    #[default]
+    InnerProduct,
+    /// L2 二乗距離（スコアは `-l2_sq`）。
+    L2,
+    /// コサイン距離（スコアは `-(1 - cos)`）。
+    Cosine,
+    /// L1（マンハッタン）距離。内積へ分解できないため i8 経路は非対応。
+    L1,
+}
+
 /// 1 回の GPU dispatch で読み戻すスコアバッファの予算（バイト）。adapter の
 /// `max_storage_buffer_binding_size` に依らず、compute の 1 次元 dispatch が
 /// `max_compute_workgroups_per_dimension`（実測値: 65535。§0 実測記録
