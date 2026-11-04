@@ -150,6 +150,7 @@ mod sql72_distance_functions;
 mod sql72_vector_avg;
 mod sql72_vector_functions;
 mod sql72_vector_sum;
+mod sql73_where_knn_shortfall;
 mod sql74_radius_search;
 mod sql74_where_distance_compare;
 mod sql78_predicate_dml_noneq_between_params;

@@ -1084,3 +1084,139 @@ terminates_and_is_deterministic`（F32／F16 共有本体）へ
 - 親 Issue #503 への採否判断（`masked_short` は解消済み・レイテンシは
   条件依存で改善/悪化が両方観測されているため、単純な Accept/Reject では
   なく条件別の適用方針の検討を推奨する、というのが本実測からの示唆）
+
+## 素の WHERE 付き kNN の取りこぼし条件の実測（Issue #2032）
+
+親 Issue #2031（SQL-73 のポインタ）の前段として、**hybrid ではない**
+`SELECT .. WHERE <述語> ORDER BY emb <=> q LIMIT k` が、どの条件で k 件に届かないかを
+選択率別に実測して現状を記録する。production コードは無変更で、計測は結合テスト
+`crates/engine/tests/sql_t40_up/sql73_where_knn_shortfall.rs` が担う（決定的。
+同一 commit で 3 回流して HNSW 側の値も一致した）。hybrid 密側の再取得ループは前節の
+「hybrid 密側再取得ループへの結線」が扱うため対象外。
+
+### 計測条件
+
+| 項目 | 内容 |
+| ---- | ---- |
+| fixture | tenant-a 4,000 行（`MIN_INDEXED_ROWS` 超）・tenant-b 1,000 行（越境検査用）。16 次元の単位ベクトル（10 クラスタ）。`bucket`（INTEGER。各値 4 行ずつ一様に散布）と `cluster`（TEXT） |
+| 問い合わせ | 20 本の平均。距離は `<=>`（HNSW 経路は `<=>` のみ。他演算子は厳密全走査） |
+| 述語 | `bucket < X`（選択率 100%・50%・20%・10%・9.9%・5%・1%・0.3%〔12 行〕・0.2%〔8 行〕・0%）と `cluster` 一致（10%・20%・50%） |
+| k | 10・100 |
+| 評価順 | 既定（RLS → SCALAR → DISTANCE）と `HINT ORDER(DISTANCE, SCALAR, RLS)` |
+| エンジン | 既定（brute-force）と HNSW opt-in（`CREATE INDEX ... USING hnsw`・既定パラメータ・`ef_search` 64） |
+| HNSW のウォームアップ | `Subset` 経路は索引ベース未構築だと plain scan へ縮退するため、フィルタなし kNN を 1 回流してベースを構築してから計測する |
+| 経路の分類 | `hnsw_index_cache_stats()` の差分（`hnsw_crossdb_selectivity.rs::observed_arm_label` と同一の優先順位。全 20 問い合わせの経路を併記） |
+| 計測環境 | commit `379ecd276` ベース・x86_64（i7-13700K）・テストプロファイル。件数と recall のみで性能は扱わない |
+| 再現 | `cargo test -p fandhe-db-engine --test sql_t40_up sql73_where_knn_shortfall:: -- --nocapture` |
+
+指標の定義: 件数は 1 問い合わせあたりの返却行数。充足率は返却総数 ÷ `min(k, 一致行数)` の総数。
+recall@k は「一致行の中の真の top-k」に対する再現率。
+
+### 実測表 1: 選択率 × k × 評価順 × エンジン
+
+右端列は DISTANCE 先行の件数（平均 / 最小 / 充足率）。brute-force と HNSW は
+ほぼ同値になる（k が小さく、HNSW の近似 top-k が厳密 top-k とほぼ一致するため）。
+HNSW の経路列の `ann_masked` は索引探索に到達した点、`plain_scan_*` は厳密な全件走査へ縮退した点。
+
+| 述語（選択率） | k | 既定順 brute-force 件数 | 既定順 HNSW 件数 / recall@k / 経路 | DISTANCE 先行 件数 平均 / 最小 / 充足率 |
+| --- | --- | --- | --- | --- |
+| none (100%) | 10 | 10.0 | 10.0 / 1.000 / ann_full_visible | 10.0 / 10（want 10）/ 1.000、HNSW: 10.0 / 10 / 1.000 |
+| none (100%) | 100 | 100.0 | 100.0 / 0.999 / ann_full_visible | 100.0 / 100（want 100）/ 1.000、HNSW: 100.0 / 100 / 1.000 |
+| bucket<500 (50%) | 10 | 10.0 | 10.0 / 1.000 / ann_masked | 5.0 / 3（want 10）/ 0.500、HNSW: 5.0 / 3 / 0.500 |
+| bucket<500 (50%) | 100 | 100.0 | 100.0 / 0.980 / ann_masked | 50.1 / 42（want 100）/ 0.501、HNSW: 50.1 / 42 / 0.501 |
+| bucket<200 (20%) | 10 | 10.0 | 10.0 / 1.000 / plain_scan_mask_split | 2.1 / 0（want 10）/ 0.215、HNSW: 2.1 / 0 / 0.215 |
+| bucket<200 (20%) | 100 | 100.0 | 100.0 / 1.000 / plain_scan_mask_split | 20.2 / 14（want 100）/ 0.202、HNSW: 20.2 / 14 / 0.202 |
+| bucket<100 (10%) | 10 | 10.0 | 10.0 / 1.000 / plain_scan_mask_split | 1.1 / 0（want 10）/ 0.115、HNSW: 1.1 / 0 / 0.115 |
+| bucket<100 (10%) | 100 | 100.0 | 100.0 / 1.000 / plain_scan_mask_split | 9.6 / 5（want 100）/ 0.096、HNSW: 9.6 / 5 / 0.096 |
+| bucket<99 (9.9%) | 10 | 10.0 | 10.0 / 1.000 / plain_scan_ratio | 1.1 / 0（want 10）/ 0.115、HNSW: 1.1 / 0 / 0.115 |
+| bucket<99 (9.9%) | 100 | 100.0 | 100.0 / 1.000 / plain_scan_ratio | 9.4 / 5（want 100）/ 0.095、HNSW: 9.4 / 5 / 0.095 |
+| bucket<50 (5%) | 10 | 10.0 | 10.0 / 1.000 / plain_scan_ratio | 0.6 / 0（want 10）/ 0.060、HNSW: 0.6 / 0 / 0.060 |
+| bucket<50 (5%) | 100 | 100.0 | 100.0 / 1.000 / plain_scan_ratio | 4.3 / 2（want 100）/ 0.043、HNSW: 4.3 / 2 / 0.043 |
+| bucket<10 (1%) | 10 | 10.0 | 10.0 / 1.000 / plain_scan_ratio | 0.1 / 0（want 10）/ 0.010、HNSW: 0.1 / 0 / 0.010 |
+| bucket<10 (1%) | 100 | 40.0 | 40.0 / 1.000 / plain_scan_ratio | 0.7 / 0（want 40）/ 0.016、HNSW: 0.7 / 0 / 0.016 |
+| bucket<3 (0.3%, 12 rows) | 10 | 10.0 | 10.0 / 1.000 / plain_scan_ratio | 0.1 / 0（want 10）/ 0.010、HNSW: 0.1 / 0 / 0.010 |
+| bucket<3 (0.3%, 12 rows) | 100 | 12.0 | 12.0 / 1.000 / plain_scan_ratio | 0.2 / 0（want 12）/ 0.021、HNSW: 0.2 / 0 / 0.021 |
+| bucket<2 (0.2%, 8 rows) | 10 | 8.0 | 8.0 / 1.000 / plain_scan_ratio | 0.1 / 0（want 8）/ 0.013、HNSW: 0.1 / 0 / 0.013 |
+| bucket<2 (0.2%, 8 rows) | 100 | 8.0 | 8.0 / 1.000 / plain_scan_ratio | 0.2 / 0（want 8）/ 0.025、HNSW: 0.2 / 0 / 0.025 |
+| bucket<0 (0%) | 10 | 0.0 | 0.0 / 1.000 / plain_scan_ratio | 0.0 / 0（want 0）/ 1.000、HNSW: 0.0 / 0 / 1.000 |
+| bucket<0 (0%) | 100 | 0.0 | 0.0 / 1.000 / plain_scan_ratio | 0.0 / 0（want 0）/ 1.000、HNSW: 0.0 / 0 / 1.000 |
+| cluster=c0 (10%) | 10 | 10.0 | 10.0 / 1.000 / ann_masked | 1.1 / 0（want 10）/ 0.115、HNSW: 1.1 / 0 / 0.115 |
+| cluster=c0 (10%) | 100 | 100.0 | 100.0 / 0.986 / ann_masked | 10.1 / 0（want 100）/ 0.101、HNSW: 10.0 / 0 / 0.100 |
+| cluster IN c0,c1 (20%) | 10 | 10.0 | 10.0 / 1.000 / plain_scan_mask_split | 1.9 / 0（want 10）/ 0.190、HNSW: 1.9 / 0 / 0.190 |
+| cluster IN c0,c1 (20%) | 100 | 100.0 | 100.0 / 1.000 / plain_scan_mask_split | 17.7 / 0（want 100）/ 0.177、HNSW: 17.7 / 0 / 0.177 |
+| cluster IN c0..c4 (50%) | 10 | 10.0 | 10.0 / 1.000 / ann_masked | 4.7 / 0（want 10）/ 0.465、HNSW: 4.7 / 0 / 0.465 |
+| cluster IN c0..c4 (50%) | 100 | 100.0 | 100.0 / 0.978 / ann_masked | 45.2 / 8（want 100）/ 0.453、HNSW: 45.3 / 8 / 0.453 |
+
+### 実測表 2: `hnsw.ef_search` 別の recall@10（既定順・HNSW）
+
+`SET hnsw.ef_search`（Issue #2030）の値別。`ann_masked` / `ann_full_visible` に到達した点だけ
+値で変わり、plain scan 縮退点は常に厳密（1.000）。
+
+| 述語 | ef_search | recall@k（k=10・既定順 HNSW） | 経路 |
+| --- | --- | --- | --- |
+| none (100%) | 10 | 0.955 | ann_full_visible |
+| none (100%) | default | 1.000 | ann_full_visible |
+| none (100%) | 200 | 1.000 | ann_full_visible |
+| bucket<500 (50%) | 10 | 0.860 | ann_masked |
+| bucket<500 (50%) | default | 1.000 | ann_masked |
+| bucket<500 (50%) | 200 | 1.000 | ann_masked |
+| bucket<200 (20%) | 10 | 1.000 | plain_scan_mask_split |
+| bucket<200 (20%) | default | 1.000 | plain_scan_mask_split |
+| bucket<200 (20%) | 200 | 1.000 | plain_scan_mask_split |
+| bucket<100 (10%) | 10 | 1.000 | plain_scan_mask_split |
+| bucket<100 (10%) | default | 1.000 | plain_scan_mask_split |
+| bucket<100 (10%) | 200 | 1.000 | plain_scan_mask_split |
+| bucket<99 (9.9%) | 10 | 1.000 | plain_scan_ratio |
+| bucket<99 (9.9%) | default | 1.000 | plain_scan_ratio |
+| bucket<99 (9.9%) | 200 | 1.000 | plain_scan_ratio |
+| bucket<50 (5%) | 10 | 1.000 | plain_scan_ratio |
+| bucket<50 (5%) | default | 1.000 | plain_scan_ratio |
+| bucket<50 (5%) | 200 | 1.000 | plain_scan_ratio |
+| bucket<10 (1%) | 10 | 1.000 | plain_scan_ratio |
+| bucket<10 (1%) | default | 1.000 | plain_scan_ratio |
+| bucket<10 (1%) | 200 | 1.000 | plain_scan_ratio |
+| bucket<3 (0.3%, 12 rows) | 10 | 1.000 | plain_scan_ratio |
+| bucket<3 (0.3%, 12 rows) | default | 1.000 | plain_scan_ratio |
+| bucket<3 (0.3%, 12 rows) | 200 | 1.000 | plain_scan_ratio |
+| bucket<2 (0.2%, 8 rows) | 10 | 1.000 | plain_scan_ratio |
+| bucket<2 (0.2%, 8 rows) | default | 1.000 | plain_scan_ratio |
+| bucket<2 (0.2%, 8 rows) | 200 | 1.000 | plain_scan_ratio |
+| bucket<0 (0%) | 10 | 1.000 | plain_scan_ratio |
+| bucket<0 (0%) | default | 1.000 | plain_scan_ratio |
+| bucket<0 (0%) | 200 | 1.000 | plain_scan_ratio |
+| cluster=c0 (10%) | 10 | 0.775 | ann_masked |
+| cluster=c0 (10%) | default | 1.000 | ann_masked |
+| cluster=c0 (10%) | 200 | 1.000 | ann_masked |
+| cluster IN c0,c1 (20%) | 10 | 1.000 | plain_scan_mask_split |
+| cluster IN c0,c1 (20%) | default | 1.000 | plain_scan_mask_split |
+| cluster IN c0,c1 (20%) | 200 | 1.000 | plain_scan_mask_split |
+| cluster IN c0..c4 (50%) | 10 | 0.860 | ann_masked |
+| cluster IN c0..c4 (50%) | default | 1.000 | ann_masked |
+| cluster IN c0..c4 (50%) | 200 | 1.000 | ann_masked |
+
+### 所見
+
+- **取りこぼす条件は DISTANCE 先行の評価順（SCALAR 事後フィルタ）だけ**。可視全集合の top-k を
+  先に取ってから WHERE を適用するため、返却件数はおおむね k × 選択率になる
+  （選択率 10% の k=10 で平均 1.1 件・最小 0 件、1% で 0.1 件）。一致行が k 件以上あっても
+  0 件になりうる。選択率 100%（WHERE なし）と一致なし（0%）だけが k 件・0 件で一致する。
+- **既定の評価順は全選択率・両エンジンで `min(k, 一致行数)` 件を返す**（充足率 1.000）。
+  アリーナを WHERE 適用後に構築するため、brute-force は厳密（recall 1.000）。
+  HNSW でも `masked_short` は構造的に到達しない（前掲「DISTANCE 経路の `masked_short`
+  到達不能性（証明）」節）ため、件数は不足しない。
+- **HNSW の既定順が実質厳密になる条件**: 可視比率が `full_scan_ratio`（既定 1/10）未満
+  （`plain_scan_ratio`。9.9% 以下の全点）、マスクがグラフを分断する（`plain_scan_mask_split`。
+  本 fixture では 10%・20% の `bucket` 述語）、索引ベース未構築、可視行数が `MIN_INDEXED_ROWS`
+  未満、`<=>` 以外の距離演算子、precision モード。ANN（`ann_masked`）に到達した点だけ
+  recall が 1.0 を下回りうる（k=100 で 0.978〜0.986。`ef_search` を 10 に下げると
+  k=10 で 0.775〜0.860、200 で 1.000）。
+- tenant-b の行は全計測点で返らない（越境なし）。
+
+### #2033（反復スキャン設定の SQL 公開）への申し送り
+
+- `hnsw.iterative_scan` / `hnsw.max_scan_tuples` 相当の設定が実際に結果を変えうるのは、
+  **DISTANCE 先行の事後フィルタで件数が不足する点**と、**既定順で ANN に到達した点の recall**
+  である。既定順の件数は既存の縮退で既に満たされているため、設定の効果として期待しない。
+- DISTANCE 先行の挙動を変える場合は、結合テストの該当アサーション
+  （`distance_first_postfilter_falls_short_by_selectivity`）と本節の表を同じ PR で更新する。
+- 対象外: hybrid 密側、NoSQL（HTTP）表層、`<=>` 以外の HNSW 化、専有環境での性能計測。
