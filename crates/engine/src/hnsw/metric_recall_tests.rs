@@ -509,3 +509,134 @@ fn l1_node_matches_compares_raw_rows() {
         assert_eq!(index.node_matches(node as u32, other), Some(false));
     }
 }
+// ---------------------------------------------------------------------------
+// 層 B（Issue #2001。親 #1996。INDEX-7・SQL-33 のポインタ）: metric × 常駐精度 × ef の掃引表。
+//
+// 役割: `tests/hnsw_i8_recall.rs`（内積専用の層 B）は `HnswMetric` が `pub(crate)` のため
+// L2・L1・Cosine を作れない。そこで crate 内で、既存 `hnsw_i8_recall` 層 B と同規模
+// （N=10,000・dim=128・クエリ 200・クラスタ 80）の非正規化コーパスに対し metric 別の
+// Recall@10 を ef ∈ {64,128,256} で実測する。`make hnsw-metric-recall`（release 専用・手動）。
+// 所要時間の目安は release 逐次構築で 8 索引 × 10k × 128（数分）。CI の `make ci` には含めない。
+//
+// 対象外: L2・L1 の F16/I8 は `effective_precision` で F32 へ縮退する（縮退は層 A
+// `l2_degrades_to_f32_resident`・`l1_degrades_to_f32_resident` が固定済み）ため表に入れない。
+// 負の内積（`<#>`）は InnerProduct のグラフを再利用し全順序が同一（層 A
+// `negative_inner_product_reuses_inner_product_graph` が固定済み）ため InnerProduct の行と同一。
+// ---------------------------------------------------------------------------
+
+const B_DIM: usize = 128;
+const B_ROWS: usize = 10_000;
+const B_QUERIES: usize = 200;
+const B_CLUSTERS: usize = 80;
+
+/// 層 B 用の大規模非正規化フィクスチャ。行長は [0.25, 4] なのでゼロノルム行は構造的に生じない
+/// （ゼロノルム行の索引除外は別 Issue #2241 の担当）。
+fn fixture_b() -> (Vec<f32>, Vec<f32>) {
+    let mut rng = Rng(0x2001_0001);
+    let centers: Vec<Vec<f32>> = (0..B_CLUSTERS)
+        .map(|_| (0..B_DIM).map(|_| rng.sym()).collect())
+        .collect();
+    let gen = |rng: &mut Rng, n: usize| {
+        let mut out = Vec::with_capacity(n * B_DIM);
+        for i in 0..n {
+            let c = &centers[i % B_CLUSTERS];
+            let len = 0.25 + rng.next() * 3.75;
+            out.extend(c.iter().map(|&x| (x + rng.sym() * 0.3) * len));
+        }
+        out
+    };
+    let rows = gen(&mut rng, B_ROWS);
+    let queries = gen(&mut rng, B_QUERIES);
+    (rows, queries)
+}
+
+/// 層 B の Recall@10。真値 `truths` はクエリごとの f64 brute-force（metric 別）。
+fn recall_b(index: &HnswIndex, queries: &[f32], truths: &[Vec<u32>], ef: usize) -> f64 {
+    let mut scratch = HnswSearchScratch::default();
+    let mut hit = 0usize;
+    for (q, truth) in queries.chunks_exact(B_DIM).zip(truths) {
+        let got = index.search(q, K, ef, &mut scratch).unwrap();
+        hit += got
+            .iter()
+            .filter(|h| truth.contains(&(h.id as u32)))
+            .count();
+    }
+    hit as f64 / (B_QUERIES * K) as f64
+}
+
+fn brute_b(rows: &[f32], q: &[f32], key: impl Fn(&[f32], &[f32]) -> f64) -> Vec<u32> {
+    let mut v: Vec<(f64, u32)> = rows
+        .chunks_exact(B_DIM)
+        .enumerate()
+        .map(|(i, r)| (key(r, q), i as u32))
+        .collect();
+    v.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    v.into_iter().take(K).map(|(_, i)| i).collect()
+}
+
+/// metric × 常駐精度 × ef の Recall@10 掃引表を標準出力へ出す。下限はコード定数のみ
+/// （F32: ef=64 で 0.95・ef=256 で 0.99、F16/I8: 同 metric の F32 − 0.15）。
+#[test]
+#[ignore = "層 B: release 実行専用（make hnsw-metric-recall）"]
+fn layer_b_metric_ef_sweep_report() {
+    let (rows, queries) = fixture_b();
+    let efs = [64usize, 128, 256];
+    let all = [
+        ResidentPrecision::F32,
+        ResidentPrecision::F16,
+        ResidentPrecision::I8,
+    ];
+    let f32_only = [ResidentPrecision::F32];
+    let combos: [(HnswMetric, &[ResidentPrecision]); 4] = [
+        (HnswMetric::L2, &f32_only),
+        (HnswMetric::L1, &f32_only),
+        (HnswMetric::Cosine, &all),
+        (HnswMetric::InnerProduct, &all),
+    ];
+    println!("metric precision ef recall@10 (N={B_ROWS} dim={B_DIM} queries={B_QUERIES})");
+    for (metric, precisions) in combos {
+        let truths: Vec<Vec<u32>> = queries
+            .chunks_exact(B_DIM)
+            .map(|q| match metric {
+                HnswMetric::L2 => brute_b(&rows, q, l2_sq64),
+                HnswMetric::Cosine => brute_b(&rows, q, |a, b| -cos64(a, b)),
+                HnswMetric::L1 => brute_b(&rows, q, l1_64),
+                HnswMetric::InnerProduct => brute_b(&rows, q, |a, b| -dot64(a, b)),
+            })
+            .collect();
+        let mut f32_recalls: Vec<f64> = Vec::new();
+        for &p in precisions {
+            let index = HnswIndex::build_with_metric(
+                HnswParams::default(),
+                metric,
+                p,
+                B_DIM as u32,
+                &rows,
+                42,
+                1,
+            )
+            .unwrap();
+            assert_eq!(index.metric(), metric);
+            assert_eq!(index.resident_precision(), p);
+            for (i, &ef) in efs.iter().enumerate() {
+                let r = recall_b(&index, &queries, &truths, ef);
+                println!("{metric:?} {p:?} ef={ef} recall@10={r:.4}");
+                if p == ResidentPrecision::F32 {
+                    f32_recalls.push(r);
+                    if ef == 64 {
+                        assert!(r >= 0.95, "{metric:?} F32 ef=64 recall={r}");
+                    }
+                    if ef == 256 {
+                        assert!(r >= 0.99, "{metric:?} F32 ef=256 recall={r}");
+                    }
+                } else {
+                    let base = f32_recalls[i];
+                    assert!(
+                        r >= base - 0.15,
+                        "{metric:?} {p:?} ef={ef} recall={r} < F32 {base} - 0.15"
+                    );
+                }
+            }
+        }
+    }
+}
