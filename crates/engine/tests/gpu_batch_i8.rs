@@ -16,7 +16,7 @@ use engine::batch_search::{BatchQuery, ResidentMatrix};
 #[cfg(feature = "bench-internals")]
 use engine::gpu_batch::packed_i8::{dot_i8_packed_ref, encode_rows, quantize_query};
 use engine::gpu_batch::packed_i8::{GpuI8BatchBackend, GpuI8Options};
-use engine::gpu_batch::GpuBatchBackend;
+use engine::gpu_batch::{GpuBatchBackend, GpuBatchMetric};
 use engine::policy::PolicyContext;
 use engine::storage::Visibility;
 
@@ -491,5 +491,95 @@ fn i8_backend_recall_is_monotone_non_decreasing_in_oversample_when_gpu_available
             next >= prev - 1e-9,
             "recall should be non-decreasing as oversample grows: {recalls:?}"
         );
+    }
+}
+
+/// 非対応 metric（L1）は GPU の有無に関わらず `InitFailed` で拒否される（GPU に
+/// 触れる前の検証。skip しない。Issue #2004）。エラー文言に行数・テナントを含めない。
+#[test]
+fn i8_backend_rejects_unsupported_metric_without_gpu() {
+    let fx = fixture();
+    let err = GpuI8BatchBackend::try_new_with_metric(
+        build_matrix(&fx),
+        GpuI8Options::default(),
+        GpuBatchMetric::L1,
+    )
+    .err()
+    .expect("L1 must be rejected");
+    let msg = format!("{err}");
+    assert!(msg.contains("does not support this metric"), "{msg}");
+    assert!(!msg.contains("tenant"), "{msg}");
+}
+
+/// 対応 metric（Cosine・L2）で、GPU 実機の結果が CPU 厳密解に対して Recall@10 >= 0.9
+/// を満たし、テナント混在でも他テナントの行が混入せず、2 回実行で決定的であること。
+/// GPU 無し環境では何も主張しない（既存テストと同じ `GpuBatchBackend` 初期化ゲート）。
+#[test]
+fn i8_backend_cosine_and_l2_meet_recall_and_isolate_tenants_when_gpu_available() {
+    const DIM: usize = 64;
+    const ROWS: usize = 1_000;
+    let corpus = gen_clustered_corpus_i8(0xC0DE_0000_2004_0001, DIM, ROWS, 10);
+    let ids: Vec<u64> = (0..ROWS as u64).collect();
+    // 偶数行 tenant-a、奇数行 tenant-b。tenant-a のクエリには偶数 id だけが返る。
+    let tenant_ids: Vec<String> = (0..ROWS)
+        .map(|i| if i % 2 == 0 { "tenant-a" } else { "tenant-b" }.to_string())
+        .collect();
+    let visibilities = vec![Visibility::Private; ROWS];
+    let build = || {
+        ResidentMatrix::build(&ids, &tenant_ids, &visibilities, DIM, &corpus).expect("matrix build")
+    };
+    if GpuBatchBackend::try_new(build()).is_err() {
+        eprintln!("gpu unavailable in this environment, skipping i8 metric test");
+        return;
+    }
+    let ctx = ctx_with_private("tenant-a");
+    let mut rng = RecallTestRng::new(0xABCD_2004_0000_0001);
+    let queries: Vec<Vec<f32>> = (0..16)
+        .map(|_| (0..DIM).map(|_| rng.next_unit()).collect())
+        .collect();
+    let batch: Vec<BatchQuery<'_>> = queries
+        .iter()
+        .map(|q| BatchQuery {
+            vector: q.as_slice(),
+            k: 10,
+            ctx: &ctx,
+        })
+        .collect();
+    for metric in [GpuBatchMetric::Cosine, GpuBatchMetric::L2] {
+        let backend =
+            GpuI8BatchBackend::try_new_with_metric(build(), GpuI8Options { oversample: 4 }, metric)
+                .expect("i8 backend must build once gpu availability is confirmed");
+        let first = backend.batch_search(&batch).expect("batch_search");
+        let second = backend.batch_search(&batch).expect("batch_search");
+        let mut recall_sum = 0.0f64;
+        for (qi, (hit, again)) in first.iter().zip(second.iter()).enumerate() {
+            let a: Vec<u64> = hit.hits.iter().map(|h| h.id).collect();
+            let b: Vec<u64> = again.hits.iter().map(|h| h.id).collect();
+            assert_eq!(a, b, "{metric:?} must be deterministic");
+            assert!(a.iter().all(|id| id % 2 == 0), "{metric:?} leaked tenant-b");
+            // CPU 厳密解（tenant-a の行のみ）。
+            let q = &queries[qi];
+            let mut scored: Vec<(f64, u64)> = (0..ROWS)
+                .filter(|i| i % 2 == 0)
+                .map(|i| {
+                    let row = &corpus[i * DIM..(i + 1) * DIM];
+                    let dot: f64 = q.iter().zip(row).map(|(x, y)| f64::from(*x * *y)).sum();
+                    let qn: f64 = q.iter().map(|x| f64::from(*x * *x)).sum();
+                    let rn: f64 = row.iter().map(|x| f64::from(*x * *x)).sum();
+                    let score = match metric {
+                        GpuBatchMetric::Cosine => dot / (qn * rn).sqrt(),
+                        _ => -(qn + rn - 2.0 * dot),
+                    };
+                    (score, i as u64)
+                })
+                .collect();
+            scored.sort_by(|x, y| y.0.total_cmp(&x.0).then(x.1.cmp(&y.1)));
+            let expected: std::collections::HashSet<u64> =
+                scored.iter().take(10).map(|(_, id)| *id).collect();
+            let matched = a.iter().filter(|id| expected.contains(id)).count();
+            recall_sum += matched as f64 / 10.0;
+        }
+        let recall = recall_sum / queries.len() as f64;
+        assert!(recall >= 0.9, "{metric:?} i8 recall@10 too low: {recall}");
     }
 }
