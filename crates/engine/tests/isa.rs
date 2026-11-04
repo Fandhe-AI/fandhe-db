@@ -639,7 +639,7 @@ fn l2_sq_block4_falls_back_when_lengths_are_not_uniform() {
 /// 整数値 fixture の L2 Top-k（距離昇順・同点 id 昇順）が、ISA 実装（`l2_sq`＋`l2_sq_block4`）
 /// と scalar 参照で id 列・距離ビットとも完全一致すること（Issue #1983・SQL-33。
 /// 「ISA 間で同一の Top-k」を同一プロセスで検証できる形に落とした証跡。x86 側の SIMD 実装
-/// 〔Issue #1982〕も同じテストを通る）。値域が小さく同点が頻出する fixture にしている。
+/// 〔Issue #1982〕も同じテストで SIMD 経路を検証する）。値域が小さく同点が頻出する fixture にしている。
 #[test]
 fn l2_top_k_matches_scalar_on_integer_fixture() {
     let mut rng = XorShift64Star::new(0x1983_7007_c0de_0001);
@@ -754,10 +754,11 @@ fn unsafe_is_confined_to_isa_module_with_safety_comments() {
     // Neon・Avx2Fma・Avx512 ディスパッチ 3 箇所を加えて 15 箇所、Issue #1983（SQL-33）で
     // 追加した `l2_sq`／`l2_sq_block4` の Neon ディスパッチ 2 箇所、Issue #2022（TABLE-48）で
     // 追加した popcount の hamming／jaccard_counts × Neon・Avx2・Avx512Vpopcntdq
-    // ディスパッチ 6 箇所を加えて計 23 箇所となる。
+    // ディスパッチ 6 箇所、Issue #1982（SQL-33）で追加した `l2_sq`/`l2_sq_block4` の
+    // Avx2Fma/Avx512 ディスパッチ 4 箇所を加えて計 27 箇所となる。
     assert_eq!(
-        unsafe_block_count, 23,
-        "expected exactly 23 `unsafe {{` blocks in isa.rs (Issue #2022 popcount dispatch x6 + Issue #1983 l2_sq/l2_sq_block4 Neon dispatch x2 + Issue #1988 l1 dispatch x3 + Neon/Avx2Fma/Avx512 dot dispatch \
+        unsafe_block_count, 27,
+        "expected exactly 27 `unsafe {{` blocks in isa.rs (Issue #1982 l2_sq/l2_sq_block4 Avx2Fma/Avx512 dispatch x4 + Issue #2022 popcount dispatch x6 + Issue #1983 l2_sq/l2_sq_block4 Neon dispatch x2 + Issue #1988 l1 dispatch x3 + Neon/Avx2Fma/Avx512 dot dispatch \
          + Avx2Fma/Avx512 dot_block4 dispatch + F16c/NeonFp16 dot_f16 dispatch added by \
          Issue #514 + Neon dot_block4 dispatch added by Issue #511 + Avx2Widen/AvxVnni/ \
          Avx512Vnni dot_i8 dispatch added by Issue #522 + NeonDotprod dot_i8 dispatch added \
