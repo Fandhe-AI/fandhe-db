@@ -252,27 +252,17 @@ fn l2_heuristic_prunes_redundant_and_keeps_far() {
     assert!(!selected.contains(&1));
 }
 
-/// fail-closed: ゼロノルム行は構築を、ゼロノルムのクエリは探索を拒否する。L2 の二乗和
-/// オーバーフローは `NonFiniteScore`。
+/// fail-closed: ゼロノルムのクエリは探索を拒否する。ゼロノルム行は構築を拒否せず索引から
+/// 除外する（Issue #2241）。L2 の二乗和オーバーフローは `NonFiniteScore`。
 #[test]
 fn fail_closed_on_non_normalizable_and_overflow() {
     let (mut rows, _) = fixture();
     let node = 7usize;
     rows[node * DIM..(node + 1) * DIM].fill(0.0);
     for threads in [1usize, 4] {
-        let r = HnswIndex::build_with_metric(
-            HnswParams::default(),
-            HnswMetric::Cosine,
-            ResidentPrecision::F32,
-            DIM as u32,
-            &rows,
-            1,
-            threads,
-        );
-        assert!(
-            matches!(r, Err(HnswError::NonNormalizableVector { node: 7 })),
-            "threads={threads}"
-        );
+        let index = build(HnswMetric::Cosine, ResidentPrecision::F32, &rows, threads);
+        assert!(!index.is_member(7), "threads={threads}");
+        assert_eq!(index.member_count(), ROWS - 1, "threads={threads}");
     }
     let (rows, _) = fixture();
     let index = build(HnswMetric::Cosine, ResidentPrecision::F32, &rows, 1);
@@ -343,9 +333,330 @@ fn cosine_node_matches_uses_normalized_comparison() {
             let other = &rows[o * DIM..(o + 1) * DIM];
             assert_eq!(index.node_matches(node as u32, other), Some(false), "{p:?}");
         }
-        // 正規化できない行は「変更あり」。
+        // member が正規化できない行になった（ゼロ化）場合は「変更あり」。
         assert_eq!(index.node_matches(0, &[0.0; DIM]), Some(false));
     }
+}
+
+/// Issue #2241: 除外ノードの `node_matches` は、正規化不可のままなら一致（`Some(true)`。
+/// false だと毎世代 delta／churn に積まれ続ける）、正規化可になったら不一致（delta で拾う）。
+/// member のゼロ化は不一致。F32・F16・I8 で同じ規則。
+#[test]
+fn cosine_node_matches_for_excluded_nodes() {
+    let (mut rows, _) = fixture();
+    let bad = 11usize;
+    rows[bad * DIM..(bad + 1) * DIM].fill(0.0);
+    let good: Vec<f32> = (0..DIM).map(|i| i as f32 + 1.0).collect();
+    for p in [
+        ResidentPrecision::F32,
+        ResidentPrecision::F16,
+        ResidentPrecision::I8,
+    ] {
+        let index = build(HnswMetric::Cosine, p, &rows, 1);
+        assert!(!index.is_member(bad as u32), "{p:?}");
+        assert_eq!(
+            index.node_matches(bad as u32, &[0.0; DIM]),
+            Some(true),
+            "{p:?}"
+        );
+        assert_eq!(
+            index.node_matches(bad as u32, &[1e-30; DIM]),
+            Some(true),
+            "{p:?}"
+        );
+        assert_eq!(index.node_matches(bad as u32, &good), Some(false), "{p:?}");
+        assert_eq!(index.node_matches(12, &[0.0; DIM]), Some(false), "{p:?}");
+        // 範囲外・次元不一致は従来どおり None。
+        assert_eq!(index.node_matches(ROWS as u32, &good), None, "{p:?}");
+        assert_eq!(index.node_matches(0, &good[..DIM - 1]), None, "{p:?}");
+    }
+}
+
+/// 正規化できない行の 3 種（ゼロ・ノルム²アンダーフロー・ノルム²オーバーフロー）。
+fn bad_row(kind: usize) -> Vec<f32> {
+    match kind % 3 {
+        0 => vec![0.0; DIM],
+        1 => vec![1e-30; DIM],
+        _ => vec![1e30; DIM],
+    }
+}
+
+/// `rows` の `stride` 行おき（node % stride == 3）を正規化できない行に置き換える。除外した
+/// ノード番号の昇順リストも返す。
+fn scatter_bad_rows(rows: &[f32], stride: usize) -> (Vec<f32>, Vec<u32>) {
+    let mut out = rows.to_vec();
+    let mut bad = Vec::new();
+    for node in (3..ROWS).step_by(stride) {
+        out[node * DIM..(node + 1) * DIM].copy_from_slice(&bad_row(node / stride));
+        bad.push(node as u32);
+    }
+    (out, bad)
+}
+
+/// brute-force の Cosine top-k（除外行 `bad` を候補から外した対照）。
+fn brute_cosine_excluding(rows: &[f32], q: &[f32], bad: &[u32]) -> Vec<u32> {
+    let mut v: Vec<(f64, u32)> = rows
+        .chunks_exact(DIM)
+        .enumerate()
+        .filter(|(i, _)| !bad.contains(&(*i as u32)))
+        .map(|(i, r)| (-cos64(r, q), i as u32))
+        .collect();
+    v.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    v.into_iter().take(K).map(|(_, i)| i).collect()
+}
+
+/// INDEX-7・SQL-33（Issue #2241 AC1）: 正規化できない行を散在させても構築は成功し、F32・F16・
+/// I8 常駐 × 逐次・並列のどれでも、探索結果（マスクなし・除外ノードを含むマスク）に除外行が
+/// 現れない。除外ノードは全層で隣接が空で、全 member が entry から到達できる。
+#[test]
+fn excluded_rows_never_appear_in_results() {
+    let (rows, queries) = fixture();
+    let (rows, bad) = scatter_bad_rows(&rows, 20);
+    assert!(bad.len() >= 90);
+    for p in [
+        ResidentPrecision::F32,
+        ResidentPrecision::F16,
+        ResidentPrecision::I8,
+    ] {
+        for threads in [1usize, 4] {
+            let index = build(HnswMetric::Cosine, p, &rows, threads);
+            let tag = format!("{p:?} threads={threads}");
+            assert_eq!(index.len(), ROWS, "{tag}");
+            assert_eq!(index.member_count(), ROWS - bad.len(), "{tag}");
+            assert!(index.excludes_non_normalizable(), "{tag}");
+            let entry = index.entry_point().expect("entry");
+            assert!(index.is_member(entry), "{tag}: entry must be a member");
+            for &b in &bad {
+                assert!(!index.is_member(b), "{tag}");
+                assert_eq!(index.level_of(b), Some(0), "{tag} node={b}");
+                assert!(
+                    index.neighbors(0, b).is_none_or(<[u32]>::is_empty),
+                    "{tag} node={b}"
+                );
+            }
+            // 入辺が無い: どの member の隣接にも除外ノードは現れない。
+            for node in 0..ROWS as u32 {
+                if !index.is_member(node) {
+                    continue;
+                }
+                for level in 0..=index.level_of(node).unwrap_or(0) {
+                    for nb in index.neighbors(level, node).unwrap_or(&[]) {
+                        assert!(index.is_member(*nb), "{tag} node={node} -> {nb}");
+                    }
+                }
+            }
+            let mut all = NodeMask::new(ROWS);
+            for n in 0..ROWS as u32 {
+                all.set(n);
+            }
+            assert!(
+                index.is_mask_fully_reachable_with(&all, HopMode::OneHop),
+                "{tag}: identity mask including excluded nodes must be reachable"
+            );
+            let mut scratch = HnswSearchScratch::default();
+            for q in queries.chunks_exact(DIM) {
+                let plain = index.search(q, K, 64, &mut scratch).unwrap();
+                assert_eq!(plain.len(), K, "{tag}");
+                let masked = index
+                    .search_masked(q, K, 64, Some(&all), &mut scratch)
+                    .unwrap();
+                for h in plain.iter().chain(masked.iter()) {
+                    assert!(!bad.contains(&(h.id as u32)), "{tag} id={}", h.id);
+                }
+            }
+        }
+    }
+}
+
+/// INDEX-7・SQL-33（Issue #2241 AC2）: 除外行を散在させても、除外行を除いた対照に対する
+/// Recall@10 は除外なしの既存閾値（ef=64 で 0.95、ef=256 で 0.99。F16・SQ8 は既存の常駐精度
+/// テストの床）を下回らない。
+#[test]
+fn recall_with_excluded_rows_meets_thresholds() {
+    let (rows, queries) = fixture();
+    let (rows, bad) = scatter_bad_rows(&rows, 20);
+    let measure = |index: &HnswIndex, ef: usize| {
+        let mut scratch = HnswSearchScratch::default();
+        let mut hit = 0usize;
+        for q in queries.chunks_exact(DIM) {
+            let truth = brute_cosine_excluding(&rows, q, &bad);
+            let got = index.search(q, K, ef, &mut scratch).unwrap();
+            hit += got
+                .iter()
+                .filter(|h| truth.contains(&(h.id as u32)))
+                .count();
+        }
+        hit as f64 / (QUERIES * K) as f64
+    };
+    for threads in [1usize, 4] {
+        let index = build(HnswMetric::Cosine, ResidentPrecision::F32, &rows, threads);
+        let r64 = measure(&index, 64);
+        let r256 = measure(&index, 256);
+        eprintln!("cosine excluded threads={threads} recall ef64={r64} ef256={r256}");
+        assert!(r64 >= 0.95, "threads={threads} ef=64 recall={r64}");
+        assert!(r256 >= 0.99, "threads={threads} ef=256 recall={r256}");
+    }
+    for (p, floor) in [(ResidentPrecision::F16, 0.7), (ResidentPrecision::I8, 0.5)] {
+        let index = build(HnswMetric::Cosine, p, &rows, 1);
+        let r = measure(&index, 64);
+        eprintln!("cosine excluded {p:?} recall={r}");
+        assert!(r >= floor, "{p:?} recall={r}");
+    }
+}
+
+/// INDEX-7・SQL-33（Issue #2241 AC2 の強い検証）: 除外行を末尾に足した入力の逐次構築は、除外行
+/// が無い入力の逐次構築と member 部分のグラフがビット同一で、全クエリの探索結果（id と
+/// スコアのビット）が一致する（レベル割当の乱数は全行ぶん順に引くため）。
+#[test]
+fn appending_excluded_rows_does_not_change_member_graph() {
+    let (rows, queries) = fixture();
+    let mut extended = rows.clone();
+    for i in 0..60 {
+        extended.extend(bad_row(i));
+    }
+    for p in [
+        ResidentPrecision::F32,
+        ResidentPrecision::F16,
+        ResidentPrecision::I8,
+    ] {
+        let plain = build(HnswMetric::Cosine, p, &rows, 1);
+        let with_bad = build(HnswMetric::Cosine, p, &extended, 1);
+        assert_eq!(with_bad.len(), ROWS + 60);
+        assert_eq!(with_bad.member_count(), ROWS);
+        assert_eq!(plain.entry_point(), with_bad.entry_point(), "{p:?}");
+        for node in 0..ROWS as u32 {
+            assert_eq!(plain.level_of(node), with_bad.level_of(node), "{p:?}");
+            for level in 0..=plain.level_of(node).unwrap_or(0) {
+                assert_eq!(
+                    plain.neighbors(level, node),
+                    with_bad.neighbors(level, node),
+                    "{p:?} node={node} level={level}"
+                );
+            }
+        }
+        let mut s0 = HnswSearchScratch::default();
+        let mut s1 = HnswSearchScratch::default();
+        for q in queries.chunks_exact(DIM) {
+            let a = plain.search(q, K, 64, &mut s0).unwrap();
+            let b = with_bad.search(q, K, 64, &mut s1).unwrap();
+            assert_eq!(a.len(), b.len());
+            for (x, y) in a.iter().zip(b.iter()) {
+                assert_eq!(x.id, y.id, "{p:?}");
+                assert_eq!(x.score.to_bits(), y.score.to_bits(), "{p:?}");
+            }
+        }
+    }
+}
+
+/// Issue #2241 の境界: 全行除外・member が 1 行だけ・先頭が除外、のいずれも構築が成功し、
+/// entry は最初の member になる。全行除外の探索は空の結果。
+#[test]
+fn excluded_row_boundaries() {
+    let params = HnswParams::default();
+    let good =
+        |i: usize| -> Vec<f32> { (0..DIM).map(|d| ((i * 7 + d) % 11) as f32 + 1.0).collect() };
+    for threads in [1usize, 4] {
+        // 全行除外。
+        let mut all_bad = Vec::new();
+        for i in 0..5 {
+            all_bad.extend(bad_row(i));
+        }
+        let index = HnswIndex::build_with_metric(
+            params,
+            HnswMetric::Cosine,
+            ResidentPrecision::F32,
+            DIM as u32,
+            &all_bad,
+            1,
+            threads,
+        )
+        .unwrap();
+        assert_eq!(index.entry_point(), None);
+        assert_eq!(index.member_count(), 0);
+        let mut scratch = HnswSearchScratch::default();
+        assert!(index
+            .search(&good(0), K, 64, &mut scratch)
+            .unwrap()
+            .is_empty());
+
+        // 行 0・1 が除外、member は行 2 の 1 行だけ。
+        let mut rows = Vec::new();
+        rows.extend(bad_row(0));
+        rows.extend(bad_row(1));
+        rows.extend(good(2));
+        rows.extend(bad_row(2));
+        let index = HnswIndex::build_with_metric(
+            params,
+            HnswMetric::Cosine,
+            ResidentPrecision::F32,
+            DIM as u32,
+            &rows,
+            1,
+            threads,
+        )
+        .unwrap();
+        assert_eq!(index.entry_point(), Some(2));
+        let hits = index.search(&good(2), K, 64, &mut scratch).unwrap();
+        assert_eq!(hits.iter().map(|h| h.id).collect::<Vec<_>>(), vec![2]);
+    }
+    // 先頭が除外で、並列経路（n > SEQUENTIAL_PREFIX_NODES）でも entry が member になる。
+    let (mut rows, _) = fixture();
+    for node in 0..40 {
+        rows[node * DIM..(node + 1) * DIM].copy_from_slice(&bad_row(node));
+    }
+    let index = build(HnswMetric::Cosine, ResidentPrecision::F32, &rows, 4);
+    assert_eq!(index.member_count(), ROWS - 40);
+    assert!(index.entry_point().is_some_and(|e| index.is_member(e)));
+}
+
+/// Issue #2241（codex P1・Bugbot）: `build_parallel_with_metric` の逐次縮退（行数が
+/// `SEQUENTIAL_PREFIX_NODES` 以下）でも、Cosine のゼロノルム行は正規化・除外の共通経路を通り
+/// member から外れる。
+#[test]
+fn parallel_entry_sequential_fallback_excludes_zero_norm_rows() {
+    let (rows, _) = fixture();
+    let n = 40usize;
+    assert!(n <= SEQUENTIAL_PREFIX_NODES);
+    let mut small = rows[..n * DIM].to_vec();
+    for c in 0..DIM {
+        small[3 * DIM + c] = 0.0;
+        small[n * DIM - DIM + c] = 0.0;
+    }
+    let index = HnswIndex::build_parallel_with_metric(
+        HnswParams::default(),
+        HnswMetric::Cosine,
+        ResidentPrecision::F32,
+        DIM as u32,
+        &small,
+        42,
+    )
+    .unwrap();
+    assert_eq!(index.len(), n);
+    assert_eq!(index.member_count(), n - 2);
+    assert!(!index.is_member(3));
+    assert!(!index.is_member(n as u32 - 1));
+    let entry = index.entry_point().expect("entry");
+    assert!(index.is_member(entry));
+    let mut scratch = HnswSearchScratch::default();
+    let q = &small[5 * DIM..6 * DIM];
+    for h in index.search(q, K, 64, &mut scratch).unwrap() {
+        assert!(index.is_member(h.id as u32), "id={}", h.id);
+    }
+}
+
+/// 非 Cosine の metric は除外規則を持たない（`members == None`。既存経路と同一）。
+/// 除外のない Cosine は `members` を持たないが、規則（`node_matches`・Overlay のゲート）は有効。
+#[test]
+fn non_cosine_metrics_have_no_exclusion() {
+    let (rows, _) = fixture();
+    for metric in [HnswMetric::InnerProduct, HnswMetric::L2, HnswMetric::L1] {
+        let index = build(metric, ResidentPrecision::F32, &rows, 1);
+        assert!(!index.excludes_non_normalizable(), "{metric:?}");
+        assert_eq!(index.member_count(), ROWS, "{metric:?}");
+    }
+    let index = build(HnswMetric::Cosine, ResidentPrecision::F32, &rows, 1);
+    assert!(index.excludes_non_normalizable());
+    assert_eq!(index.member_count(), ROWS);
 }
 
 /// f32 カーネルのスコア降順（同点は id 昇順）で全行を並べた先頭 K 件（完全一致の対照）。
