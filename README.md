@@ -289,6 +289,10 @@ SQL 構文との対応表は `crates/wire-server/docs/nosql-api.md`（Issue #780
 | `all`（既定） | 全テーブル | カタログへ記録するのみ（経路・結果を変えない） |
 | `declared` | `CREATE INDEX ... USING hnsw` を宣言したテーブルのみ | 宣言テーブルを HNSW（近似）へ、`DROP INDEX` で厳密へ戻す |
 
+`USING hnsw (col)` は `vector_cosine_ops` の別名で、`vector_cosine_ops`／
+`vector_l2_ops`／`vector_ip_ops`／`vector_l1_ops` を列の後ろに書けます（Issue #2239）。
+`all` で宣言の無いテーブルに使う暗黙の HNSW の距離種別は cosine です。
+
 未指定（`all`）は宣言導入前の opt-in 挙動とビット同一です。いずれの値でも
 判定はテーブル単位で、あるテーブルへの宣言が他テーブルの経路・検索結果を
 変えることはありません（`declared` では宣言したテーブル自身の探索方式だけが

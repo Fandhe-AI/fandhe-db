@@ -1,8 +1,8 @@
 //! 索引の距離種別（opclass）と距離演算子が合わないときの厳密全走査への縮退の結合テスト
 //! （Issue #1979。ポインタ: INDEX-7・SQL-33・SQL-75、`docs/design/index-declaration-effects.md`）。
 //!
-//! 現状で不一致が起きるのは `HnswScope::Declared` で非 Cosine の HNSW 宣言（Rust API の
-//! `Storage::create_index` で作る）しかない表へ `<=>` を問い合わせる場合。固定する内容:
+//! 現状で不一致が起きるのは `HnswScope::Declared` で非 Cosine の HNSW 宣言（Rust API または
+//! `USING hnsw (col vector_l2_ops)`〔Issue #2239〕で作る）しかない表へ `<=>` を問い合わせる場合。固定する内容:
 //!
 //! - 不一致では HNSW キャッシュへ一切照会せず、結果は宣言前の厳密結果と一致する
 //! - `EXPLAIN` は `ann_plan: plain_scan_opclass_mismatch`（`index=` 注記なし）で、`metric=` は宣言側
