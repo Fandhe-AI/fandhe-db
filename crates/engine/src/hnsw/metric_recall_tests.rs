@@ -609,6 +609,41 @@ fn excluded_row_boundaries() {
     assert!(index.entry_point().is_some_and(|e| index.is_member(e)));
 }
 
+/// Issue #2241（codex P1・Bugbot）: `build_parallel_with_metric` の逐次縮退（行数が
+/// `SEQUENTIAL_PREFIX_NODES` 以下）でも、Cosine のゼロノルム行は正規化・除外の共通経路を通り
+/// member から外れる。
+#[test]
+fn parallel_entry_sequential_fallback_excludes_zero_norm_rows() {
+    let (rows, _) = fixture();
+    let n = 40usize;
+    assert!(n <= SEQUENTIAL_PREFIX_NODES);
+    let mut small = rows[..n * DIM].to_vec();
+    for c in 0..DIM {
+        small[3 * DIM + c] = 0.0;
+        small[n * DIM - DIM + c] = 0.0;
+    }
+    let index = HnswIndex::build_parallel_with_metric(
+        HnswParams::default(),
+        HnswMetric::Cosine,
+        ResidentPrecision::F32,
+        DIM as u32,
+        &small,
+        42,
+    )
+    .unwrap();
+    assert_eq!(index.len(), n);
+    assert_eq!(index.member_count(), n - 2);
+    assert!(!index.is_member(3));
+    assert!(!index.is_member(n as u32 - 1));
+    let entry = index.entry_point().expect("entry");
+    assert!(index.is_member(entry));
+    let mut scratch = HnswSearchScratch::default();
+    let q = &small[5 * DIM..6 * DIM];
+    for h in index.search(q, K, 64, &mut scratch).unwrap() {
+        assert!(index.is_member(h.id as u32), "id={}", h.id);
+    }
+}
+
 /// 非 Cosine の metric は除外規則を持たない（`members == None`。既存経路と同一）。
 /// 除外のない Cosine は `members` を持たないが、規則（`node_matches`・Overlay のゲート）は有効。
 #[test]

@@ -2677,13 +2677,13 @@ impl HnswIndex {
         let n = validate_build_input(&params, dim, vectors)?;
         let desired = crate::parallel_search::thread_count_for(n).min(MAX_BUILD_THREADS);
         if desired <= 1 || n <= SEQUENTIAL_PREFIX_NODES {
-            return Self::build_impl(metric, params, precision, dim, vectors, seed, None);
+            return Self::build_with_threads_impl(metric, params, precision, dim, vectors, seed, 1);
         }
         let guard = crate::parallel_search::WorkerBudgetGuard::acquire(desired);
         let granted = guard.granted();
         if granted <= 1 {
             drop(guard);
-            return Self::build_impl(metric, params, precision, dim, vectors, seed, None);
+            return Self::build_with_threads_impl(metric, params, precision, dim, vectors, seed, 1);
         }
         let result =
             Self::build_with_threads_impl(metric, params, precision, dim, vectors, seed, granted);
