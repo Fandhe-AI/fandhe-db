@@ -912,6 +912,7 @@ fn scalar_type_binary_support(ty: &engine::catalog::ColumnType) -> bool {
         // `halfvec` も公告 OID は `text` だが、バイナリ形式（`halfvec_send`）は対象外（Issue #2014）。
         | ColumnType::HalfVec(_)
         | ColumnType::Int8Vec(_)
+        | ColumnType::SparseVec(_)
         // `bit` のバイナリ形式は対象外（Issue #2021）。
         | ColumnType::Bit(_) => false,
     }
@@ -959,6 +960,7 @@ fn scalar_type_modifier(ty: &engine::catalog::ColumnType) -> Result<i32, EncodeE
         // `HALFVEC` も `VECTOR` と同じく typmod を持たない（text 公告。Issue #2014）。
         | ColumnType::HalfVec(_)
         | ColumnType::Int8Vec(_)
+        | ColumnType::SparseVec(_)
         | ColumnType::Enum(_)
         | ColumnType::Array(_)
         | ColumnType::Json
@@ -1024,6 +1026,9 @@ fn scalar_wire_type(ty: &engine::catalog::ColumnType) -> WireType {
         // INT8VEC も専用 OID を持たず text（OID 25）で公告する（TABLE-49・Issue #2018）。
         // 値は `Cell::Vector`（f32 に広げた `[1,-2,3]`）。
         engine::catalog::ColumnType::Int8Vec(_) => WireType::Text,
+        // SPARSEVEC も専用 OID を持たず text（OID 25）で公告する（TABLE-47 (5)・Issue #2025）。
+        // 値は `Cell::SparseVec`（`{1:1,3:2}/5`）。
+        engine::catalog::ColumnType::SparseVec(_) => WireType::Text,
         engine::catalog::ColumnType::Boolean => WireType::Bool,
         // SMALLINT は int2（OID 21・typlen 2。TABLE-30・Issue #1561）。値は
         // `Cell::SignedInteger`（text／バイナリとも i16 範囲内）。
@@ -1288,6 +1293,8 @@ fn cell_to_text(
         Cell::Interval(v) => Ok(Some(engine::datetime::format_interval(v))),
         // BIT(n) は `0`／`1` の文字列（OID 1560。TABLE-48・Issue #2021）。
         Cell::Bit(v) => Ok(Some(v.format_text())),
+        // SPARSEVEC(N) は `{idx:val,...}/N`（位置は 1 始まり。OID 25。TABLE-47・Issue #2025）。
+        Cell::SparseVec(v) => Ok(Some(v.format_text())),
         // 配列の描画は engine の `ArrayValue::to_pg_text` に集約（`CAST(.. AS text)` と共有。
         // 空配列は `{}`、NULL 要素は引用なしの `NULL`、TEXT 要素の引用規則も同所。
         // RowDescription の OID は他の非 VECTOR スカラー列と同じ text（25）のまま。WIRE-13）。

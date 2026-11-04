@@ -842,6 +842,7 @@ fn bind_filter_op(
                 | ColumnType::Bit(_)
                 | ColumnType::HalfVec(_)
                 | ColumnType::Int8Vec(_)
+                | ColumnType::SparseVec(_)
                 | ColumnType::Array(_)
                 | ColumnType::Bytea
                 | ColumnType::Json

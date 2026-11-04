@@ -290,6 +290,7 @@ pub mod scoring_boost;
 pub mod search_engine;
 pub(crate) mod search_order;
 pub mod sparse;
+pub mod sparse_vector;
 pub(crate) mod sq8;
 pub mod sql;
 pub mod storage;

@@ -1776,3 +1776,83 @@ fn int8vec_binding_matches_sql() {
     // 拒否された insert は副作用を残さない。
     assert_eq!(body_utf8(&alice(addr, scan)), a);
 }
+
+/// SPARSEVEC(N) 列（TABLE-47・Issue #2025）: NoSQL `insert`／`update` の JSON 文字列（`{idx:val,...}/N`）が
+/// 保存され、`scan` の応答が SQL の SELECT と一致する（型名は `"sparsevec"`）。形式不正は `22P02`、
+/// 位置範囲外・次元不一致は `22000`、配列など文字列でない値は `22000`、次元上限超過は `54000`。
+#[test]
+fn sparsevec_binding_matches_sql() {
+    let path = temp_db::unique_db_path("nosql17-sparsevec");
+    let _guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "docs_sv",
+            vec![
+                ColumnDef::new("h", ColumnType::SparseVec(5), true),
+                ColumnDef::new("lang", ColumnType::Text, true),
+            ],
+        ))
+        .expect("create sparsevec table");
+    let core = Arc::new(EngineCore::from_storage(
+        storage,
+        Box::new(CpuScalarProvider),
+    ));
+    let addr = spawn(Arc::clone(&core));
+
+    let resp = alice(
+        addr,
+        r#"{"op":"insert","table":"docs_sv","rows":[{"id":1,"h":"{3:2,1:1}/5","lang":"ja"}],"operation_id":"sv-ins-1"}"#,
+    );
+    assert_eq!(resp.status, 200, "{resp:?}");
+    let resp = alice(
+        addr,
+        r#"{"op":"update","table":"docs_sv","set":{"h":"{5:0.5}/5"},"where":{"id":1},"operation_id":"sv-upd-1"}"#,
+    );
+    assert_eq!(resp.status, 200, "{resp:?}");
+
+    let scan = r#"{"op":"scan","table":"docs_sv","columns":["id","h"],"sort":[{"column":"id","dir":"asc"}],"limit":100}"#;
+    let a = body_utf8(&alice(addr, scan));
+    assert_eq!(
+        a,
+        sql_oracle_body(
+            &core,
+            "tenant-a",
+            "SELECT id, h FROM docs_sv ORDER BY id ASC LIMIT 100"
+        )
+    );
+    assert!(a.contains(r#""type":"sparsevec""#), "{a}");
+    assert!(a.contains("{5:0.5}/5"), "{a}");
+
+    for (i, (json, want)) in [
+        (r#""{1:x}/5""#, "22P02"),
+        (r#""1:1""#, "22P02"),
+        (r#""{6:1}/5""#, "22000"),
+        (r#""{1:1}/4""#, "22000"),
+        (r#""{1:1,1:2}/5""#, "22000"),
+        (r#""{}/1000000001""#, "54000"),
+        ("[1,2]", "22000"),
+        ("5", "22000"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let resp = alice(
+            addr,
+            &format!(
+                r#"{{"op":"insert","table":"docs_sv","rows":[{{"id":{},"h":{json}}}],"operation_id":"sv-rej-{i}"}}"#,
+                50 + i
+            ),
+        );
+        assert_eq!(http_common::wire_code_of(&resp), want, "{json}: {resp:?}");
+    }
+    // 拒否された insert は副作用を残さない。
+    assert_eq!(body_utf8(&alice(addr, scan)), a);
+
+    // SPARSEVEC 列だけの表への `search` は kNN 未対応（#2026）で 0A000 になる。
+    let resp = alice(
+        addr,
+        r#"{"op":"search","table":"docs_sv","vector":[0.1,0.2],"limit":5}"#,
+    );
+    assert_eq!(http_common::wire_code_of(&resp), "0A000", "{resp:?}");
+}

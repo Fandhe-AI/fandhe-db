@@ -251,6 +251,7 @@ pub fn is_collatable(ty: &ColumnType) -> bool {
         | ColumnType::Bit(_)
         | ColumnType::HalfVec(_)
         | ColumnType::Int8Vec(_)
+        | ColumnType::SparseVec(_)
         | ColumnType::Array(_)
         | ColumnType::Bytea
         | ColumnType::Json

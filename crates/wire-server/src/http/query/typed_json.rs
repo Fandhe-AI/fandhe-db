@@ -580,6 +580,15 @@ pub fn map_json_to_literal(
                 "INT8VEC column value must be a JSON array of integers",
             )),
         },
+        // SPARSEVEC(N) は `{idx:val,...}/N` 形式の JSON 文字列を `InsertLiteral::String` として束縛し、
+        // 形式・位置範囲・次元・非ゼロ数上限の検査は engine の `parse_sparsevec_literal` に一本化する
+        // （TABLE-47・Issue #2025。多層防御）。配列などその他の JSON は `22000`。
+        ColumnType::SparseVec(_) => match raw {
+            JsonValue::String(s) => Ok(InsertLiteral::String(s.clone())),
+            _ => Err(TypedJsonError::LegacyMismatch(
+                "SPARSEVEC column value must be a JSON string",
+            )),
+        },
         ColumnType::Array(array_ty) => match raw {
             JsonValue::Array(items) => {
                 Ok(InsertLiteral::String(array_literal_text(items, array_ty)?))

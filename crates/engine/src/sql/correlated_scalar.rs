@@ -137,6 +137,7 @@ pub(crate) fn expr_type_for(ty: &ColumnType) -> Result<ExprType, SqlSurfaceError
         | ColumnType::Bit(_)
         | ColumnType::HalfVec(_)
         | ColumnType::Int8Vec(_)
+        | ColumnType::SparseVec(_)
         | ColumnType::Vector(_)
         | ColumnType::Array(_)
         | ColumnType::Json
