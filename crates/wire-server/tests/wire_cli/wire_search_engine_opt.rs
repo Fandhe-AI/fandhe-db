@@ -264,7 +264,7 @@ fn explain_hnsw_params_reflects_sparse_visited_max_only_not_ratios() {
         assert_eq!(
             rows[5],
             format!(
-                "hnsw_params: m=16,ef_construction=100,ef_search=64,resident={expected_resident},sparse_visited_max=8,metric=cosine"
+                "hnsw_params: m=16,ef_construction=100,ef_search=64,resident={expected_resident},sparse_visited_max=8,metric=cosine,iterative_scan=strict_order,max_scan_tuples=20000"
             ),
             "token={token}"
         );

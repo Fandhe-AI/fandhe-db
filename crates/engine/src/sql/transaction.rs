@@ -2602,6 +2602,8 @@ fn commit_active(
     for scope in function_scopes {
         storage.bump_function_generation(scope);
     }
+    // COMMIT 成功: `SET LOCAL hnsw.*` を LOCAL 直前の値へ戻す。
+    session.leave_txn_block_on_commit();
     // 永続側の commit 成功後にだけ、一時側を確定し、続けて一時表の `ON COMMIT` 動作を適用する
     // （TABLE-44・Issue #1683・#1684。ROLLBACK・永続側の commit 失敗では `temp` を drop（abort）
     // するだけで呼ばない）。順序は「永続 commit → 一時 commit → ON COMMIT」で、一時 DB の単一ライタを

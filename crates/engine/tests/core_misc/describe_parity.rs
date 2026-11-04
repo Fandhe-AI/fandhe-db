@@ -66,6 +66,7 @@ fn assert_describe_matches_execute(core: &EngineCore, ctx: &PolicyContext, sql: 
         | SqlOutcome::SetRowSecurity { .. }
         | SqlOutcome::SetStatementTimeout { .. }
         | SqlOutcome::SetHnswEfSearch { .. }
+        | SqlOutcome::SetHnswScanSetting { .. }
         | SqlOutcome::Show(_)
         | SqlOutcome::CreateFunction { .. }
         | SqlOutcome::DropFunction(_)
@@ -205,6 +206,32 @@ fn describe_show_hnsw_ef_search_matches_execute() {
     {
         SqlOutcome::Show(result) => assert_eq!(result.columns, described),
         other => panic!("expected Show, got {other:?}"),
+    }
+}
+
+/// SQL-73・Issue #2033: `SHOW hnsw.iterative_scan`／`SHOW hnsw.max_scan_tuples` の Describe 列は
+/// 実行結果の列（設定名・text）と一致する。
+#[test]
+fn describe_show_hnsw_scan_settings_matches_execute() {
+    let path = unique_db_path("describe-show-hnsw-scan");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core_with_documents_table(&path);
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    for sql in ["SHOW hnsw.iterative_scan", "SHOW hnsw.max_scan_tuples"] {
+        let parsed = core.parse_sql(sql).expect("parse should succeed");
+        let described = core
+            .describe_parsed_in_session(&SessionState::default(), &parsed)
+            .expect("describe should succeed")
+            .expect("SHOW has result columns");
+        assert_eq!(described.len(), 1);
+        let mut session = SessionState::default();
+        match core
+            .execute_sql_in_session(&ctx, &mut session, sql)
+            .expect("execute should succeed")
+        {
+            SqlOutcome::Show(result) => assert_eq!(result.columns, described),
+            other => panic!("expected Show, got {other:?}"),
+        }
     }
 }
 

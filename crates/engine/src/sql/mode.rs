@@ -270,6 +270,20 @@ pub struct SessionState {
     /// （`USING MODE`／`SET search_mode`）とは独立。`SessionState` に置くため `BEGIN`／`SAVEPOINT` 時の
     /// 複製と `ROLLBACK`／`ROLLBACK TO` で巻き戻る。
     hnsw_ef_search: Option<u16>,
+    /// セッションの `hnsw.iterative_scan` 上書き値（SQL-73・Issue #2033）。`None` は既定
+    /// （`strict_order`）。HNSW を使える kNN の DISTANCE 先行（SCALAR 事後フィルタ）だけに作用し、
+    /// `hnsw_ef_search` と同様に `ROLLBACK` で巻き戻る。
+    hnsw_iterative_scan: Option<crate::hnsw::HnswIterativeScan>,
+    /// セッションの `hnsw.max_scan_tuples` 上書き値（1..=2,147,483,647。SQL-73・Issue #2033）。
+    /// `None` は既定（20,000）。
+    hnsw_max_scan_tuples: Option<u32>,
+    /// 明示トランザクションブロック内か（`BEGIN` 後に立ち、`COMMIT` で下ろす。`ROLLBACK` は
+    /// `BEGIN` 時点の複製の復元で false に戻る）。`SET LOCAL hnsw.*` はこの間だけ効く。
+    in_txn_block: bool,
+    /// `SET LOCAL hnsw.iterative_scan` の復元値（最初の LOCAL 直前の値。`COMMIT` で戻す）。
+    hnsw_iterative_scan_local_restore: Option<Option<crate::hnsw::HnswIterativeScan>>,
+    /// `SET LOCAL hnsw.max_scan_tuples` の復元値（同上）。
+    hnsw_max_scan_tuples_local_restore: Option<Option<u32>>,
     /// 現在のロール ID（#1971 以降で認証層が認証成功後に 1 回だけ束縛する契約。以後 SQL 文から変えられる
     /// のは認可済みの `SET ROLE`／`RESET ROLE`〔`sql::role_ddl`〕だけで、`session_role_id` に戻る側へも
     /// 到達できる範囲にしか動かない）。`None`（現状の全セッション）は「BYPASSRLS なし・非所有者」として
@@ -444,6 +458,95 @@ impl SessionState {
     /// `RESET hnsw.ef_search`／`SET hnsw.ef_search TO DEFAULT` の実体。上書きを外す。
     pub(crate) fn reset_hnsw_ef_search(&mut self) {
         self.hnsw_ef_search = None;
+    }
+
+    /// セッションの `hnsw.iterative_scan` 上書き値（`None` は上書きなし＝`strict_order`）。
+    pub fn hnsw_iterative_scan(&self) -> Option<crate::hnsw::HnswIterativeScan> {
+        self.hnsw_iterative_scan
+    }
+
+    /// セッションの `hnsw.max_scan_tuples` 上書き値（`None` は上書きなし＝20,000）。
+    pub fn hnsw_max_scan_tuples(&self) -> Option<usize> {
+        self.hnsw_max_scan_tuples
+            .and_then(|v| usize::try_from(v).ok())
+    }
+
+    /// 検証済みの `hnsw.iterative_scan` を現在値にする（`core.rs` の `SetHnswScan` 実行腕のみ）。
+    pub(crate) fn set_hnsw_iterative_scan(&mut self, v: crate::hnsw::HnswIterativeScan) {
+        self.hnsw_iterative_scan = Some(v);
+        self.hnsw_iterative_scan_local_restore = None;
+    }
+
+    /// 検証済みの `hnsw.max_scan_tuples` を現在値にする（`core.rs` の `SetHnswScan` 実行腕のみ）。
+    pub(crate) fn set_hnsw_max_scan_tuples(&mut self, v: u32) {
+        self.hnsw_max_scan_tuples = Some(v);
+        self.hnsw_max_scan_tuples_local_restore = None;
+    }
+
+    /// `RESET hnsw.iterative_scan`／`SET ... TO DEFAULT` の実体。上書きを外す。
+    pub(crate) fn reset_hnsw_iterative_scan(&mut self) {
+        self.hnsw_iterative_scan = None;
+        // セッション値の SET は先行する LOCAL を上書きして COMMIT 後も残る（PostgreSQL 同様）。
+        self.hnsw_iterative_scan_local_restore = None;
+    }
+
+    /// `RESET hnsw.max_scan_tuples`／`SET ... TO DEFAULT` の実体。上書きを外す。
+    pub(crate) fn reset_hnsw_max_scan_tuples(&mut self) {
+        self.hnsw_max_scan_tuples = None;
+        self.hnsw_max_scan_tuples_local_restore = None;
+    }
+
+    /// 明示 `BEGIN` の成功後に呼ぶ（`core.rs` の Begin 腕のみ）。`SET LOCAL` を有効にする。
+    pub(crate) fn enter_txn_block(&mut self) {
+        self.in_txn_block = true;
+    }
+
+    /// `COMMIT` 成功時に呼ぶ（`transaction.rs` の `commit_active` のみ）。`SET LOCAL` した
+    /// `hnsw.*` を LOCAL 直前の値へ戻し、トランザクションブロックを抜ける。`ROLLBACK` は
+    /// `BEGIN` 時点の複製の復元で同じ状態になるため、この関数を通らない。
+    pub(crate) fn leave_txn_block_on_commit(&mut self) {
+        if let Some(prev) = self.hnsw_iterative_scan_local_restore.take() {
+            self.hnsw_iterative_scan = prev;
+        }
+        if let Some(prev) = self.hnsw_max_scan_tuples_local_restore.take() {
+            self.hnsw_max_scan_tuples = prev;
+        }
+        self.in_txn_block = false;
+    }
+
+    /// `SET LOCAL hnsw.iterative_scan`（`None` は `DEFAULT`）。明示トランザクション外では
+    /// 何もしない（PostgreSQL と同じく単独文の LOCAL は効果を持たない）。
+    pub(crate) fn set_hnsw_iterative_scan_local(
+        &mut self,
+        v: Option<crate::hnsw::HnswIterativeScan>,
+    ) {
+        if !self.in_txn_block {
+            return;
+        }
+        if self.hnsw_iterative_scan_local_restore.is_none() {
+            self.hnsw_iterative_scan_local_restore = Some(self.hnsw_iterative_scan);
+        }
+        self.hnsw_iterative_scan = v;
+    }
+
+    /// `SET LOCAL hnsw.max_scan_tuples`（`None` は `DEFAULT`）。トランザクション外は何もしない。
+    pub(crate) fn set_hnsw_max_scan_tuples_local(&mut self, v: Option<u32>) {
+        if !self.in_txn_block {
+            return;
+        }
+        if self.hnsw_max_scan_tuples_local_restore.is_none() {
+            self.hnsw_max_scan_tuples_local_restore = Some(self.hnsw_max_scan_tuples);
+        }
+        self.hnsw_max_scan_tuples = v;
+    }
+
+    /// セッションの `hnsw.*` 検索設定 3 種を束ねて返す（`core.rs` が検索実行・EXPLAIN へ渡す）。
+    pub(crate) fn hnsw_search_settings(&self) -> crate::hnsw::HnswSessionSearch {
+        crate::hnsw::HnswSessionSearch {
+            ef_search: self.hnsw_ef_search(),
+            iterative_scan: self.hnsw_iterative_scan,
+            max_scan_tuples: self.hnsw_max_scan_tuples(),
+        }
     }
 
     /// 起動時 CLI の既定値を現在値と reset 値の両方へ設定する。wire-server の handshake が認証成功後に

@@ -166,6 +166,13 @@ pub struct HnswIndexCacheStats {
     /// hybrid 密側アダプタが `prepare_*` を実行したクエリ数（Issue #410。
     /// `hybrid_dense_searches / hybrid_queries` が 1 クエリあたりの平均ラウンド数）。
     pub hybrid_queries: u64,
+    /// 反復スキャン（`hnsw.iterative_scan`。SQL-73・Issue #2033）に入ったクエリ数。
+    pub iterative_scan_queries: u64,
+    /// 反復スキャンで DISTANCE 段を呼んだ延べ回数（`iterative_scan_queries` 以上）。
+    pub iterative_scan_rounds: u64,
+    /// 反復が `hnsw.max_scan_tuples`（または SQL-46 の走査上限・`MAX_SEARCH_K`）で打ち切られ、
+    /// 目標件数に届かないまま終えたクエリ数。
+    pub iterative_scan_cap_hits: u64,
     /// 1 クエリ内で観測された hybrid 密側再取得ラウンド数の最大値（Issue #410。
     /// `hybrid.rs::hybrid_search_boosted` の `dense_cap`／`MAX_FETCH_K` により
     /// 高々 `⌈log2(dense_cap / (2·pool_depth))⌉ + 1` に有界。停止性の観測用）。
@@ -750,6 +757,9 @@ pub(crate) struct HnswIndexCache {
     ef_cap_fallbacks: AtomicU64,
     hybrid_dense_searches: AtomicU64,
     hybrid_queries: AtomicU64,
+    iterative_scan_queries: AtomicU64,
+    iterative_scan_rounds: AtomicU64,
+    iterative_scan_cap_hits: AtomicU64,
     hybrid_rounds_max: AtomicU64,
     f16_residency_fallbacks: AtomicU64,
     i8_residency_fallbacks: AtomicU64,
@@ -795,6 +805,9 @@ impl HnswIndexCache {
             ef_cap_fallbacks: AtomicU64::new(0),
             hybrid_dense_searches: AtomicU64::new(0),
             hybrid_queries: AtomicU64::new(0),
+            iterative_scan_queries: AtomicU64::new(0),
+            iterative_scan_rounds: AtomicU64::new(0),
+            iterative_scan_cap_hits: AtomicU64::new(0),
             hybrid_rounds_max: AtomicU64::new(0),
             f16_residency_fallbacks: AtomicU64::new(0),
             i8_residency_fallbacks: AtomicU64::new(0),
@@ -821,6 +834,17 @@ impl HnswIndexCache {
     /// 選び `build_from_cached_rls_rows_subset` を呼んだ直後に呼ぶ）。
     pub(crate) fn record_subset_arena_copy(&self) {
         self.subset_arena_copies.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 反復スキャン 1 クエリ分の結果を記録する（SQL-73・Issue #2033。`sql::exec` の DISTANCE 段から
+    /// 呼ばれる。統計はテナント ID・行 ID を含まない best-effort カウンタ）。
+    pub(crate) fn record_iterative_scan(&self, rounds: u64, cap_hit: bool) {
+        self.iterative_scan_queries.fetch_add(1, Ordering::Relaxed);
+        self.iterative_scan_rounds
+            .fetch_add(rounds, Ordering::Relaxed);
+        if cap_hit {
+            self.iterative_scan_cap_hits.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// hybrid 密側再取得ループの 1 ラウンドとして本キャッシュへ探索を委ねた
@@ -1134,6 +1158,9 @@ impl HnswIndexCache {
             ef_cap_fallbacks: self.ef_cap_fallbacks.load(Ordering::Relaxed),
             hybrid_dense_searches: self.hybrid_dense_searches.load(Ordering::Relaxed),
             hybrid_queries: self.hybrid_queries.load(Ordering::Relaxed),
+            iterative_scan_queries: self.iterative_scan_queries.load(Ordering::Relaxed),
+            iterative_scan_rounds: self.iterative_scan_rounds.load(Ordering::Relaxed),
+            iterative_scan_cap_hits: self.iterative_scan_cap_hits.load(Ordering::Relaxed),
             hybrid_rounds_max: self.hybrid_rounds_max.load(Ordering::Relaxed),
             f16_residency_fallbacks: self.f16_residency_fallbacks.load(Ordering::Relaxed),
             i8_residency_fallbacks: self.i8_residency_fallbacks.load(Ordering::Relaxed),
