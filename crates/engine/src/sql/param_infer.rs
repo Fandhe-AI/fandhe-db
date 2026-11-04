@@ -181,6 +181,9 @@ fn builtin_return_type(name: &str) -> Ty {
         | "right" | "reverse" | "initcap" | "lpad" | "rpad" | "split_part" | "md5" => {
             Ty::Known(PreparedParamType::Text)
         }
+        // ベクトル形状関数（Issue #2012）。ベクトルを返すものは `$n` の型付け対象外。
+        "vector_dims" => Ty::Known(scalar("?column?", ColumnType::Integer)),
+        "l2_normalize" | "subvector" => Ty::Untyped,
         "length" | "position" => Ty::Known(scalar("?column?", ColumnType::Integer)),
         // 配列関数（Issue #1604）。配列を返すものは `$n` の型付け対象外（Double と誤推論しない）。
         "array_length" | "cardinality" | "array_position" => {
