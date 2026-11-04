@@ -12937,8 +12937,6 @@ mod tests {
         assert_eq!(owned, vec![1.0, 2.0, 3.0]);
     }
 
-    /// Issue #1910・SQL-65 (3): arity 表の名前はすべて組み込み関数名として予約され、
-    /// 固定引数の関数は `builtin_signature` の個数と一致する。
     /// `vector_dims`／`l2_normalize`／`subvector` は strict（Issue #2012・SQL-72 (2)）:
     /// いずれかの引数が NULL なら評価結果は NULL。
     #[test]
@@ -12956,6 +12954,8 @@ mod tests {
         }
     }
 
+    /// Issue #1910・SQL-65 (3): arity 表の名前はすべて組み込み関数名として予約され、
+    /// 固定引数の関数は `builtin_signature` の個数と一致する。
     #[test]
     fn builtin_call_arity_table_is_consistent() {
         for name in [
