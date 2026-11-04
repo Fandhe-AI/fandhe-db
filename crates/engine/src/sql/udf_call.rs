@@ -946,6 +946,25 @@ pub enum BoundExpr {
     ///
     /// 変更履歴: 公開 enum への variant 追加（外部の網羅 match への破壊的変更）。
     VectorLiteral(std::sync::Arc<[f32]>),
+    /// nullable `HALFVEC` 列の参照（Issue #2015・TABLE-46）。距離関数の引数の位置でだけ
+    /// （[`bind_vector_distance_fn`] が識別子を直接見たときに）生成する。評価は行スカラーの f16 を
+    /// f32 へ広げた `ExprValue::Vector`（NULL は `Null`）。`VectorRef`（embedding スロットを読む契約）
+    /// とは別物で、汎用の列参照の腕は HALFVEC を従来どおり拒否する。
+    ///
+    /// 変更履歴: 公開 enum への variant 追加（外部の網羅 match への破壊的変更）。
+    HalfVecColumnRef {
+        index: usize,
+    },
+    /// 距離式 `<HALFVEC 列> <距離演算子> <ベクトルリテラル>`（Issue #2015・TABLE-46。SQL-74 のポインタ）。
+    /// `query` は束縛時に f16 へ丸めた値（pgvector と同じく問い合わせ側も halfvec に解決される）。
+    /// 評価は行の f16 を f32 へ広げて [`crate::sql::vector_distance::distance`] で求める（NULL は NULL）。
+    ///
+    /// 変更履歴: 公開 enum への variant 追加（外部の網羅 match への破壊的変更）。
+    HalfVecDistance {
+        kind: crate::sql::lexer::DistanceKind,
+        index: usize,
+        query: std::sync::Arc<[f32]>,
+    },
     Builtin {
         f: BuiltinFn,
         args: Vec<BoundExpr>,
@@ -1516,6 +1535,30 @@ impl PartialEq for BoundExpr {
                     query: qb,
                 },
             ) => ka == kb && ia == ib && qa == qb,
+            (
+                BoundExpr::HalfVecColumnRef { index: a },
+                BoundExpr::HalfVecColumnRef { index: b },
+            ) => a == b,
+            (
+                BoundExpr::HalfVecDistance {
+                    kind: ka,
+                    index: ia,
+                    query: qa,
+                },
+                BoundExpr::HalfVecDistance {
+                    kind: kb,
+                    index: ib,
+                    query: qb,
+                },
+            ) => {
+                ka == kb
+                    && ia == ib
+                    && qa.len() == qb.len()
+                    && qa
+                        .iter()
+                        .zip(qb.iter())
+                        .all(|(a, b)| a.to_bits() == b.to_bits())
+            }
             (BoundExpr::Null, BoundExpr::Null) => true,
             (BoundExpr::Builtin { f: fa, args: aa }, BoundExpr::Builtin { f: fb, args: ab }) => {
                 fa == fb && aa == ab
@@ -4166,6 +4209,30 @@ impl Drop for DistancePlaceholderGuard {
 pub(super) struct BoundVectorDistance {
     pub(crate) kind: crate::sql::lexer::DistanceKind,
     pub(crate) query: Vec<f32>,
+    /// 列側が `HALFVEC` 列のときの列インデックス（Issue #2015）。`query` は f16 へ丸め済み。
+    pub(crate) halfvec_index: Option<usize>,
+}
+
+/// 識別子が `HALFVEC` 列を指すなら `(列インデックス, 宣言次元)` を返す（Issue #2015・TABLE-46）。
+/// 距離関数の引数と距離演算子の被演算子の位置でだけ呼ぶ（汎用の列参照の腕は HALFVEC を拒否したまま）。
+/// UDF の仮引数名は列より優先されるため `None`（通常の束縛順序と同じ）。
+fn halfvec_column_operand(expr: &Expr, env: &BindEnv<'_>) -> Option<(usize, u32)> {
+    let Expr::Ident(name) = expr else {
+        return None;
+    };
+    if env.params.contains_key(name) {
+        return None;
+    }
+    let schema = env.schema?;
+    schema
+        .columns
+        .iter()
+        .enumerate()
+        .find(|(_, c)| &c.name == name)
+        .and_then(|(i, c)| match c.ty {
+            ColumnType::HalfVec(d) => Some((i, d)),
+            _ => None,
+        })
 }
 
 /// 距離式 `<VECTOR 列> <距離演算子> <ベクトルリテラル>` の被演算子を検証する
@@ -4196,6 +4263,23 @@ pub(super) fn bind_vector_distance_operands(
     if let Some((index, dim)) = int8vec_column_operand(column, env) {
         return bind_int8vec_distance_operands(kind, index, dim, literal, node_budget);
     }
+    // HALFVEC 列（Issue #2015・TABLE-46）: リテラルを検証して f16 へ丸め、行側は評価時に広げる。
+    if let Some((index, dim)) = halfvec_column_operand(column, env) {
+        *node_budget = node_budget
+            .checked_sub(1)
+            .ok_or_else(|| SqlSurfaceError::payload_too_large("expression is too large"))?;
+        let query = if DISTANCE_PLACEHOLDER.with(std::cell::Cell::get) {
+            Vec::new()
+        } else {
+            let raw = crate::sql::parser::parse_vector_literal(literal, dim)?;
+            crate::sql::exec::round_to_halfvec_f32(&raw)?
+        };
+        return Ok(BoundDistanceOperands::Vector(BoundVectorDistance {
+            kind,
+            query,
+            halfvec_index: Some(index),
+        }));
+    }
     let (_, ty) = bind_expr_any(column, env, node_budget)?;
     if ty != ExprType::Vector {
         return Err(SqlSurfaceError::undefined_function(
@@ -4217,12 +4301,14 @@ pub(super) fn bind_vector_distance_operands(
         return Ok(BoundDistanceOperands::Vector(BoundVectorDistance {
             kind,
             query: Vec::new(),
+            halfvec_index: None,
         }));
     }
     let query = crate::sql::parser::parse_vector_literal(literal, dim)?;
     Ok(BoundDistanceOperands::Vector(BoundVectorDistance {
         kind,
         query,
+        halfvec_index: None,
     }))
 }
 
@@ -4312,6 +4398,7 @@ fn bind_vector_distance_fn(
     };
     // 引数ごとに (束縛済み, VECTOR 型の式か) を求める。
     let mut bound: Vec<(BoundExpr, bool)> = Vec::with_capacity(2);
+    let mut half_dim: Option<u32> = None;
     for a in [a0, a1] {
         match a {
             Expr::Null => {
@@ -4331,6 +4418,15 @@ fn bind_vector_distance_fn(
                 bound.push((BoundExpr::VectorLiteral(std::sync::Arc::from(v)), false));
             }
             _ => {
+                // HALFVEC 列（Issue #2015・TABLE-46）は識別子を直接見たときだけ解決する。
+                if let Some((index, dim)) = halfvec_column_operand(a, env) {
+                    *node_budget = node_budget.checked_sub(1).ok_or_else(|| {
+                        SqlSurfaceError::payload_too_large("expression is too large")
+                    })?;
+                    half_dim = Some(dim);
+                    bound.push((BoundExpr::HalfVecColumnRef { index }, true));
+                    continue;
+                }
                 let (b, ty) = bind_expr_in(a, env, node_budget)?;
                 if ty != ExprType::Vector {
                     return Err(SqlSurfaceError::undefined_function(
@@ -4343,6 +4439,27 @@ fn bind_vector_distance_fn(
     }
     if !bound.iter().any(|(_, is_vec)| *is_vec) {
         return Err(unsupported());
+    }
+    if let Some(dim) = half_dim {
+        // VECTOR 列との混在は暗黙変換を持たないため拒否する（pgvector との既知の差）。
+        if bound.iter().any(|(b, _)| matches!(b, BoundExpr::VectorRef)) {
+            return Err(SqlSurfaceError::undefined_function(
+                "function does not exist for the given argument types",
+            ));
+        }
+        // 相手のリテラルは halfvec に解決される: 次元を照合して f16 へ丸める。
+        for (b, _) in &mut bound {
+            if let BoundExpr::VectorLiteral(lit) = b {
+                if u32::try_from(lit.len()).ok() != Some(dim) {
+                    return Err(SqlSurfaceError::invalid_input(format!(
+                        "vector literal dimension mismatch: expected {dim}, got {}",
+                        lit.len()
+                    )));
+                }
+                let rounded = crate::sql::exec::round_to_halfvec_f32(lit)?;
+                *lit = std::sync::Arc::from(rounded);
+            }
+        }
     }
     // 列参照 × リテラルは束縛時に次元を照合する（演算子の束縛と同じタイミング。SQL-33 (4)）。
     let column_dim = env.schema.and_then(|sc| {
@@ -4492,6 +4609,8 @@ fn count_bound_nodes(expr: &BoundExpr) -> usize {
         | BoundExpr::VectorDistance { .. }
         | BoundExpr::Int8VecDistance { .. }
         | BoundExpr::VectorLiteral(_)
+        | BoundExpr::HalfVecColumnRef { .. }
+        | BoundExpr::HalfVecDistance { .. }
         | BoundExpr::JsonbColumnRef { .. }
         | BoundExpr::JsonColumnRef { .. }
         | BoundExpr::Numeric(_)
@@ -4603,6 +4722,8 @@ fn max_bound_case_nesting(expr: &BoundExpr) -> usize {
         | BoundExpr::VectorDistance { .. }
         | BoundExpr::Int8VecDistance { .. }
         | BoundExpr::VectorLiteral(_)
+        | BoundExpr::HalfVecColumnRef { .. }
+        | BoundExpr::HalfVecDistance { .. }
         | BoundExpr::JsonbColumnRef { .. }
         | BoundExpr::JsonColumnRef { .. }
         | BoundExpr::Numeric(_)
@@ -4691,7 +4812,10 @@ fn max_bound_case_nesting(expr: &BoundExpr) -> usize {
 pub(crate) fn references_embedding(expr: &BoundExpr) -> bool {
     match expr {
         BoundExpr::VectorRef | BoundExpr::VectorDistance { .. } => true,
-        BoundExpr::VectorLiteral(_) | BoundExpr::Int8VecDistance { .. } => false,
+        BoundExpr::VectorLiteral(_)
+        | BoundExpr::Int8VecDistance { .. }
+        | BoundExpr::HalfVecColumnRef { .. }
+        | BoundExpr::HalfVecDistance { .. } => false,
         BoundExpr::Number(_)
         | BoundExpr::Text(_)
         | BoundExpr::TextColumnRef { .. }
@@ -4794,6 +4918,8 @@ pub(crate) fn visit_referenced_scalar_columns(expr: &BoundExpr, visit: &mut dyn 
         | BoundExpr::ArrayColumnRef { index }
         | BoundExpr::BoolColumnRef { index }
         | BoundExpr::Int8VecDistance { index, .. }
+        | BoundExpr::HalfVecColumnRef { index }
+        | BoundExpr::HalfVecDistance { index, .. }
         | BoundExpr::ColumnRef { index } => visit(*index),
         BoundExpr::ArrayConstructor { .. }
         | BoundExpr::ArrayIndex { .. }
@@ -4935,6 +5061,8 @@ pub(crate) fn mark_referenced_scalar_columns(expr: &BoundExpr, mask: &mut [bool]
         | BoundExpr::ArrayColumnRef { index }
         | BoundExpr::BoolColumnRef { index }
         | BoundExpr::Int8VecDistance { index, .. }
+        | BoundExpr::HalfVecColumnRef { index }
+        | BoundExpr::HalfVecDistance { index, .. }
         | BoundExpr::ColumnRef { index } => {
             if let Some(slot) = mask.get_mut(*index) {
                 *slot = true;
@@ -6997,10 +7125,20 @@ pub(super) fn bind_expr_any(
             let b = bind_vector_distance_operands(*kind, lhs, rhs, env, node_budget)?;
             DISTANCE_BINDS.with(|c| c.set(c.get().wrapping_add(1)));
             let bound = match b {
-                BoundDistanceOperands::Vector(v) => BoundExpr::VectorDistance {
-                    kind: v.kind,
-                    query: std::sync::Arc::from(v.query),
-                },
+                BoundDistanceOperands::Vector(v) => {
+                    let query: std::sync::Arc<[f32]> = std::sync::Arc::from(v.query);
+                    match v.halfvec_index {
+                        Some(index) => BoundExpr::HalfVecDistance {
+                            kind: v.kind,
+                            index,
+                            query,
+                        },
+                        None => BoundExpr::VectorDistance {
+                            kind: v.kind,
+                            query,
+                        },
+                    }
+                }
                 BoundDistanceOperands::Int8Vec { kind, index, query } => {
                     BoundExpr::Int8VecDistance {
                         kind,
@@ -10967,6 +11105,36 @@ pub(crate) fn eval_with_scalars<'a>(
             Some(Some(ScalarRef::Numeric(d))) => Ok(ExprValue::Numeric(*d)),
             Some(Some(_)) => Err(SqlSurfaceError::Internal {
                 detail: "NUMERIC column reference resolved to a non-NUMERIC row scalar value"
+                    .to_string(),
+            }),
+        },
+        // HALFVEC 列の参照（Issue #2015・TABLE-46）。f16 を f32 へ広げて運ぶ。型の食い違いは fail-closed。
+        BoundExpr::HalfVecColumnRef { index } => match row_scalars.get(*index) {
+            None => Err(SqlSurfaceError::Internal {
+                detail: "HALFVEC column reference is outside the decoded row scalar view"
+                    .to_string(),
+            }),
+            Some(None) => Ok(ExprValue::Null),
+            Some(Some(ScalarRef::HalfVec(body))) => Ok(ExprValue::Vector(Cow::Owned(
+                crate::sql::exec::expand_halfvec_bytes(body)?,
+            ))),
+            Some(Some(_)) => Err(SqlSurfaceError::Internal {
+                detail: "HALFVEC column reference resolved to a non-HALFVEC row scalar value"
+                    .to_string(),
+            }),
+        },
+        BoundExpr::HalfVecDistance { kind, index, query } => match row_scalars.get(*index) {
+            None => Err(SqlSurfaceError::Internal {
+                detail: "HALFVEC column reference is outside the decoded row scalar view"
+                    .to_string(),
+            }),
+            Some(None) => Ok(ExprValue::Null),
+            Some(Some(ScalarRef::HalfVec(body))) => {
+                let row = crate::sql::exec::expand_halfvec_bytes(body)?;
+                crate::sql::vector_distance::distance(*kind, &row, query).map(ExprValue::Scalar)
+            }
+            Some(Some(_)) => Err(SqlSurfaceError::Internal {
+                detail: "HALFVEC column reference resolved to a non-HALFVEC row scalar value"
                     .to_string(),
             }),
         },
@@ -14977,5 +15145,48 @@ mod wasm_define_tests {
             let b = program.eval(0, emb, &[], &mut Vec::new()).unwrap();
             assert_eq!(a, b, "{emb:?}");
         }
+    }
+
+    /// `HALFVEC` 列の参照と距離式の評価（Issue #2015・TABLE-46）。f16 を f32 へ広げ、NULL は NULL、
+    /// 型の食い違い・範囲外の列は `Internal`（fail-closed）。
+    #[test]
+    fn halfvec_refs_evaluate_and_fail_closed() {
+        use crate::sql::lexer::DistanceKind;
+        let half = |vals: &[f32]| -> Vec<u8> {
+            vals.iter()
+                .flat_map(|v| crate::f16::f32_to_f16_bits(*v).to_le_bytes())
+                .collect()
+        };
+        let body = half(&[3.0, 4.0]);
+        let scalars = [Some(ScalarRef::HalfVec(&body))];
+        let col = BoundExpr::HalfVecColumnRef { index: 0 };
+        match eval_with_scalars(&col, 1, &[], &scalars).unwrap() {
+            ExprValue::Vector(v) => assert_eq!(v.as_ref(), &[3.0, 4.0]),
+            other => panic!("unexpected {other:?}"),
+        }
+        let dist = BoundExpr::HalfVecDistance {
+            kind: DistanceKind::L2,
+            index: 0,
+            query: std::sync::Arc::from(vec![0.0f32, 0.0]),
+        };
+        assert!(matches!(
+            eval_with_scalars(&dist, 1, &[], &scalars).unwrap(),
+            ExprValue::Scalar(d) if d == 5.0
+        ));
+        let nulls: [Option<ScalarRef>; 1] = [None];
+        assert!(matches!(
+            eval_with_scalars(&col, 1, &[], &nulls).unwrap(),
+            ExprValue::Null
+        ));
+        assert!(matches!(
+            eval_with_scalars(&dist, 1, &[], &nulls).unwrap(),
+            ExprValue::Null
+        ));
+        let wrong = [Some(ScalarRef::Integer(1))];
+        assert!(eval_with_scalars(&col, 1, &[], &wrong).is_err());
+        assert!(eval_with_scalars(&dist, 1, &[], &wrong).is_err());
+        assert!(eval_with_scalars(&col, 1, &[], &[]).is_err());
+        let odd = [Some(ScalarRef::HalfVec(&[1u8, 2, 3]))];
+        assert!(eval_with_scalars(&col, 1, &[], &odd).is_err());
     }
 }

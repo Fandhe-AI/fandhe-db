@@ -10979,6 +10979,23 @@ impl EngineCore {
                     )?;
                     return Ok(Some(crate::sql::describe::scan_columns(&bound, &schema)?));
                 }
+                // HALFVEC 列の表の kNN は実行時と同じ scan 経路の列メタを返す（Issue #2015・TABLE-46）。
+                if let Some(scan) = crate::sql::halfvec_knn::halfvec_select_as_scan(
+                    validated,
+                    &schema,
+                    session.search_mode(),
+                    skip_vector_literal_validation,
+                    limits,
+                )? {
+                    let bound = crate::sql::parser::bind_scan_with_dummy_flags(
+                        &scan,
+                        &schema,
+                        session.udfs(),
+                        dummy_equality_flags,
+                        limits,
+                    )?;
+                    return Ok(Some(crate::sql::describe::scan_columns(&bound, &schema)?));
+                }
                 if validated.using_plan().is_some() {
                     // `USING PLAN`: LLM 展開・再埋め込み（`plan_query`・
                     // `Embedder::embed_batch`）は行わず、投影列の束縛のみを行う
@@ -11724,6 +11741,23 @@ impl EngineCore {
                     &schema,
                     session.search_mode(),
                     &crate::sql::parser::LiteralSkip::NONE,
+                )? {
+                    return self.execute_read_statement_with_limits(
+                        ctx,
+                        session,
+                        crate::sql::allowlist::Statement::Scan(scan),
+                        read_txn,
+                        limits,
+                    );
+                }
+                // HALFVEC 列の表への距離演算子形 kNN は全走査ソートの scan 経路へ写す
+                // （Issue #2015・TABLE-46。arena は VECTOR 専用のため）。
+                if let Some(scan) = crate::sql::halfvec_knn::halfvec_select_as_scan(
+                    &validated,
+                    &schema,
+                    session.search_mode(),
+                    &crate::sql::parser::LiteralSkip::NONE,
+                    &limits,
                 )? {
                     return self.execute_read_statement_with_limits(
                         ctx,
@@ -13476,6 +13510,17 @@ impl EngineCore {
             return Ok(crate::sql::SqlOutcome::Explain(Self::scan_explain_result(
                 &schema, &bound, &gins,
             )));
+        }
+        // HALFVEC 列の kNN は実行時と同じ全走査ソートの scan 経路へ写し、EXPLAIN も同じ計画を返す
+        // （通常文との束縛・エラー契約の共有。Issue #2015・TABLE-46）。
+        if let Some(scan) = crate::sql::halfvec_knn::halfvec_select_as_scan(
+            validated,
+            &schema,
+            session.search_mode(),
+            &crate::sql::parser::LiteralSkip::NONE,
+            &self.result_limits,
+        )? {
+            return self.run_relational_explain_scan(&scan, session);
         }
         let bound = crate::sql::parser::bind_in_session_with_limits(
             validated,
