@@ -1433,8 +1433,8 @@ fn run_session_search_close_scenario(client: HttpClient) {
     };
 
     // 2. search（alice は tenant-a・全行 Public のため RLS 暗黙適用でも
-    //    3 行とも可視。クエリ [1,0] に対する cosine は id1=1.0／id2=0.0／
-    //    id3=-1.0 のため id 昇順で [1,2,3] が返る想定。オラクルは engine 側
+    //    3 行とも可視。クエリ [1,0] に対する cosine 距離は id1=0／id2=1／
+    //    id3=2 のため距離昇順で [1,2,3] が返る想定。オラクルは engine 側
     //    テストが既に固定済みのため、本テストは「実バイナリ経由でも同じ
     //    行数・行集合が返る」非 vacuous な証跡に限定する）。
     let search_body =
