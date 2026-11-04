@@ -62,6 +62,7 @@ mod wire_sql25_distinct;
 mod wire_sql26_explain_expression_order_having;
 mod wire_sql26_extract_order_having;
 mod wire_sql29_scalar_subquery;
+mod wire_sql33_cosine_order;
 mod wire_sql42_aggregate_arith_types;
 mod wire_sql42_projection_alias;
 mod wire_sql42_projection_expr_types;

@@ -66,7 +66,7 @@ fn wire_scoped_ctx(tenant: &str) -> PolicyContext {
 }
 
 /// 3 テナント × Public 行 1 件（`wire_search_mode.rs` と同じクエリベクトル
-/// `[1,0]` に対する cosine: id1=1.0／id2=0.0／id3=-1.0）＋ tenant-b の
+/// `[1,0]` に対する cosine 距離: id1=0／id2=1／id3=2）＋ tenant-b の
 /// `Private` 行（id=12。クエリベクトルと完全一致で RLS 境界の対照に使う）。
 fn new_core_seed() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
     let path = temp_db::unique_db_path("nosql2-search-docs");
@@ -797,4 +797,101 @@ fn responses_do_not_leak_tenant_username_or_token() {
     assert!(!err_text.contains("alice"));
     assert!(!err_text.contains("tenant-a"));
     assert!(!err_text.contains(&token));
+}
+/// 内積とコサインで順位が分かれる非正規化フィクスチャ（tenant-a の Public 行 4 件）。
+/// クエリ `[1,0]` に対し、コサイン距離は id3=0／id2≈0.005／id1≈0.293／id4=NaN
+/// （ゼロノルム。昇順の末尾）で `[3,2,1,4]`、負の内積は id1=-10／id2=-1／
+/// id3=-0.5／id4=0 で `[1,2,3,4]`。単位ベクトルだけの `new_core_seed` では
+/// 両者の順位が一致して「NoSQL search が内積のまま」という退行を検出できない
+/// ため、その穴を埋める（Issue #1993・SQL-33・NOSQL-2）。
+fn new_core_seed_unnormalized() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
+    let path = temp_db::unique_db_path("nosql2-search-unnormalized");
+    let guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema()).expect("create table");
+    let ctx =
+        PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+            .expect("valid tenant");
+    let rows: [(u64, [f32; 2]); 4] = [
+        (1, [10.0, 10.0]),
+        (2, [1.0, 0.1]),
+        (3, [0.5, 0.0]),
+        (4, [0.0, 0.0]),
+    ];
+    for (id, emb) in rows {
+        engine::tenant::insert_typed_row(
+            &storage,
+            TABLE,
+            &ctx,
+            id,
+            Visibility::Public,
+            &[
+                Value::Vector(emb.to_vec()),
+                Value::Text("ja".to_string()),
+                Value::Text(format!("docs/u{id}.md")),
+                Value::Text(format!("unnormalized {id}")),
+            ],
+            &engine::recovery::required_op_id::OperationId::parse(&format!("nosql2-un-op-{id}"))
+                .expect("valid operation_id"),
+        )
+        .expect("insert public row");
+    }
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    (Arc::new(core), guard)
+}
+
+/// Issue #1993・SQL-33: `vector` 検索は SQL `<=>`（コサイン距離の昇順）と
+/// バイト一致し、`<#>`（負の内積）の順位とは一致しない。ゼロノルム行は末尾。
+#[test]
+fn vector_search_follows_cosine_distance_not_inner_product() {
+    let (core, _guard) = new_core_seed_unnormalized();
+    let addr = spawn(Arc::clone(&core));
+
+    let body = br#"{"op":"search","table":"docs","vector":[1.0,0.0],"limit":4,"columns":["id"]}"#;
+    let resp = query_as_alice(addr, body);
+    assert_eq!(resp.status, 200, "resp={resp:?}");
+    let cosine_oracle = sql_oracle_body(
+        &core,
+        "tenant-a",
+        "SELECT id FROM docs ORDER BY embedding <=> '[1.0,0.0]' LIMIT 4",
+    );
+    let inner_product_oracle = sql_oracle_body(
+        &core,
+        "tenant-a",
+        "SELECT id FROM docs ORDER BY embedding <#> '[1.0,0.0]' LIMIT 4",
+    );
+    assert_ne!(
+        cosine_oracle, inner_product_oracle,
+        "fixture must distinguish cosine from inner product"
+    );
+    assert_eq!(body_utf8(&resp), cosine_oracle);
+    assert_ne!(body_utf8(&resp), inner_product_oracle);
+    assert!(
+        body_utf8(&resp).contains(r#""rows":[[3],[2],[1],[4]]"#),
+        "expected id order [3,2,1,4], body={}",
+        body_utf8(&resp)
+    );
+}
+
+/// Issue #1993: ゼロノルム行（距離 NaN）は昇順の末尾に並び、`limit` が 3 の
+/// ときは枠から外れる。SQL `<=>` とバイト一致する。
+#[test]
+fn vector_search_zero_norm_row_sorts_last_and_is_cut_by_limit() {
+    let (core, _guard) = new_core_seed_unnormalized();
+    let addr = spawn(Arc::clone(&core));
+
+    let body = br#"{"op":"search","table":"docs","vector":[1.0,0.0],"limit":3,"columns":["id"]}"#;
+    let resp = query_as_alice(addr, body);
+    assert_eq!(resp.status, 200, "resp={resp:?}");
+    let oracle = sql_oracle_body(
+        &core,
+        "tenant-a",
+        "SELECT id FROM docs ORDER BY embedding <=> '[1.0,0.0]' LIMIT 3",
+    );
+    assert_eq!(body_utf8(&resp), oracle);
+    assert!(
+        body_utf8(&resp).contains(r#""rows":[[3],[2],[1]]"#),
+        "{}",
+        body_utf8(&resp)
+    );
 }

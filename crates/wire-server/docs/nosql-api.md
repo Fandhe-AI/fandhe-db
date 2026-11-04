@@ -224,6 +224,17 @@ JSON 本文の構文受理規則は `engine::json`（NOSQL-8）に従う: ネス
 
 応答例は [応答スキーマ](#応答スキーマ)を参照。
 
+#### 距離の意味（`vector` 検索。SQL-33・NOSQL-2）
+
+- `vector` 検索の順位は SQL の `ORDER BY <列> <=> q` と同じ**コサイン距離**
+  （`1 - cos`）の昇順で、同点は id 昇順で決まる。内積スコアの降順ではない
+- ゼロノルムの行（またはクエリ）は距離が NaN になり、昇順の末尾に並ぶ。
+  末尾に並ぶ行も `limit` の枠を消費する（枠が足りなければ返らない）
+- 応答に距離値の列は含まれず、観測できるのは順位だけである
+- 距離種別を選ぶ `metric` キーは未提供で、指定すると未知キーとして `42601`
+  になる（後続 Issue #2243 の担当）
+- `hybrid` の密側も同じコサイン距離に従う（HNSW opt-in の密側を除く）
+
 主な `wire_code`:
 
 - `vector`／`plan` 両方指定・両方欠落・`plan`＋`hybrid` 併用・`columns: []`・
@@ -1382,7 +1393,9 @@ curl -s -X POST http://127.0.0.1:5432/v1/session/close \
 - ルーティング・op 許可リスト・スキーマ: `nosql1_endpoint_routing.rs`・
   `nosql1_op_vocabulary.rs`・`nosql9_op_allowlist.rs`・`nosql8_schema_validation.rs`
 - `search`: `nosql2_search.rs`・`nosql2_search_binding.rs`・`nosql10_explain.rs`・
-  `wire_using_plan.rs`・`wire_explain.rs`
+  `wire_using_plan.rs`・`wire_explain.rs`。距離の意味（コサイン距離の昇順）は
+  `nosql2_search.rs`（`vector_search_follows_cosine_distance_not_inner_product`）・
+  `nosql2_search_binding.rs`・`wire_sql33_cosine_order.rs`（pg wire 側）で固定
 - `scan`: `nosql3_scan_mapping.rs`・`nosql3_scan_wire_parity.rs`・
   `nosql15_scan_sort.rs`（`sort`。Issue #946・NOSQL-15）・
   `nosql15_offset.rs`（`offset`。Issue #947・NOSQL-15）
