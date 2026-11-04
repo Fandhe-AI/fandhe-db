@@ -101,8 +101,9 @@
 //!
 //! [`SimdKernel::l2_sq`]／[`SimdKernel::l2_sq_block4`] の aarch64 NEON 本体は
 //! [`neon_block4`] に置き、ディスパッチの `unsafe` を Neon 分岐に各 1 箇所（計 2 箇所）
-//! 加える。`unsafe` ブロックの総数は 15 → 17（`tests/isa.rs` が検査）。x86_64 の
-//! アームは SIMD 本体が未実装（Issue #1982）のため `unsafe` を持たない scalar 委譲。
+//! 加える。x86_64（Issue #1982）は AVX2+FMA・AVX-512F 本体を [`x86_block4`] に置き、
+//! 両 ISA × 2 関数の計 4 箇所に `unsafe` ディスパッチを加える。`unsafe` ブロックの
+//! 総数は x86_64 で 23 → 27 になる（`tests/isa.rs` が検査）。
 
 use std::sync::OnceLock;
 
@@ -381,10 +382,10 @@ impl SimdKernel {
     /// `docs/spec/04-behavior/`）。
     ///
     /// 長さが異なる場合は [`l2_sq_scalar`] と同じく短い方へ切り詰める。aarch64 は
-    /// NEON intrinsics 本体（`neon_block4::l2_sq_neon`）で、FMA の単一丸めと加算順序の
-    /// 違いにより scalar と丸め誤差の範囲で異なり得る（同一プロセス内では常に同一 ISA
-    /// なので決定的）。x86_64 の SIMD 本体は Issue #1982 の担当で、現状は scalar へ
-    /// 委譲する（偽の結果は返さない）。
+    /// NEON intrinsics 本体（`neon_block4::l2_sq_neon`）、x86_64 は AVX2+FMA／AVX-512F 本体
+    /// （`x86_block4::l2_sq_avx2_fma`／`l2_sq_avx512`。Issue #1982）で、FMA の単一丸めと
+    /// 加算順序の違いにより scalar と丸め誤差の範囲で異なり得る（同一プロセス内では常に
+    /// 同一 ISA なので決定的）。
     pub fn l2_sq(self, a: &[f32], b: &[f32]) -> f32 {
         match self {
             SimdKernel::Scalar => l2_sq_scalar(a, b),
@@ -396,9 +397,22 @@ impl SimdKernel {
                 // `#[target_feature]` 契約を満たす。
                 unsafe { neon_block4::l2_sq_neon(a, b) }
             }
-            // x86_64 の SIMD 本体は Issue #1982 で置換する（`unsafe` を持たない scalar 委譲）。
             #[cfg(target_arch = "x86_64")]
-            SimdKernel::Avx2Fma(_) | SimdKernel::Avx512(_) => l2_sq_scalar(a, b),
+            SimdKernel::Avx2Fma(_) => {
+                // SAFETY: `Avx2Fma` variant は `Avx2FmaToken::try_new` が avx2・fma を
+                // 実行時確認できた場合にのみ構築される sealed トークンを保持する
+                // （`dot_impl` の Avx2Fma 分岐と同じ根拠）。値の存在が CPU 対応の証明であり、
+                // `x86_block4::l2_sq_avx2_fma` の `#[target_feature]` 契約を満たす。
+                unsafe { x86_block4::l2_sq_avx2_fma(a, b) }
+            }
+            #[cfg(target_arch = "x86_64")]
+            SimdKernel::Avx512(_) => {
+                // SAFETY: `Avx512` variant は `Avx512Token::try_new` が avx512f を
+                // 実行時確認できた場合にのみ構築される sealed トークンを保持する
+                // （`dot_impl` の Avx512 分岐と同じ根拠）。値の存在が CPU 対応の証明であり、
+                // `x86_block4::l2_sq_avx512` の `#[target_feature]` 契約を満たす。
+                unsafe { x86_block4::l2_sq_avx512(a, b) }
+            }
         }
     }
 
@@ -450,14 +464,47 @@ impl SimdKernel {
                 }
                 [s0, s1, s2, s3]
             }
-            // x86_64 の SIMD 本体は Issue #1982 で置換する（`unsafe` を持たない scalar 委譲）。
             #[cfg(target_arch = "x86_64")]
-            SimdKernel::Avx2Fma(_) | SimdKernel::Avx512(_) => [
-                l2_sq_scalar(r0, query),
-                l2_sq_scalar(r1, query),
-                l2_sq_scalar(r2, query),
-                l2_sq_scalar(r3, query),
-            ],
+            SimdKernel::Avx2Fma(_) => {
+                // 出力引数形の理由は `dot_block4_impl` の x86 分岐と同じ（再パック回避）。
+                let (mut s0, mut s1, mut s2, mut s3) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+                // SAFETY: `Avx2Fma` variant は `Avx2FmaToken::try_new` が avx2・fma を
+                // 実行時確認できた場合にのみ構築される sealed トークンを保持する
+                // （`dot_block4_impl` の Avx2Fma 分岐と同じ根拠）。値の存在が CPU 対応の
+                // 証明であり、`x86_block4::l2_sq_block4_avx2_fma` の
+                // `#[target_feature]` 契約を満たす。
+                unsafe {
+                    x86_block4::l2_sq_block4_avx2_fma(
+                        [r0, r1, r2, r3],
+                        query,
+                        &mut s0,
+                        &mut s1,
+                        &mut s2,
+                        &mut s3,
+                    )
+                }
+                [s0, s1, s2, s3]
+            }
+            #[cfg(target_arch = "x86_64")]
+            SimdKernel::Avx512(_) => {
+                let (mut s0, mut s1, mut s2, mut s3) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+                // SAFETY: `Avx512` variant は `Avx512Token::try_new` が avx512f を
+                // 実行時確認できた場合にのみ構築される sealed トークンを保持する
+                // （`dot_block4_impl` の Avx512 分岐と同じ根拠）。値の存在が CPU 対応の
+                // 証明であり、`x86_block4::l2_sq_block4_avx512` の
+                // `#[target_feature]` 契約を満たす。
+                unsafe {
+                    x86_block4::l2_sq_block4_avx512(
+                        [r0, r1, r2, r3],
+                        query,
+                        &mut s0,
+                        &mut s1,
+                        &mut s2,
+                        &mut s3,
+                    )
+                }
+                [s0, s1, s2, s3]
+            }
         }
     }
 

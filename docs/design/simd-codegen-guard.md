@@ -329,3 +329,5 @@ PR と無関係に失敗しうる（Issue #1475）。次の 2 点で原因特定
 期待どおりか、検査側の追随修正が要るかを判断する。検査パターンを弱めて通すことはしない（§4）。
 ローカル再現: `RUSTUP_TOOLCHAIN=beta make simd-codegen-check`（要 `rustup toolchain install beta`。
 aarch64 は `make simd-codegen-check-cross`）。§7 の CI 時間・キャッシュの件とは独立。
+
+**Issue #1982（SQL-33 ポインタ）の追記（L2 二乗距離カーネルの x86 必須シンボル）**: x86_64 の必須シンボルに `l2_sq_avx2_fma`・`l2_sq_avx512`・`l2_sq_block4_avx2_fma`・`l2_sq_block4_avx512`（`isa::x86_block4`）を追加した。期待命令は AVX2 版で `vsubps`・`vfmadd*ps` の `%ymm` 出現、AVX-512 版で同 `%zmm` 出現。自己テストに pass fixture（`fx_pass_l2_avx2.rs`）と、スカラー逐次和で期待命令を出さない fail fixture（`fx_fail_l2_avx2_scalarized.rs`）を加えた。禁止命令（`vinsertps` 等）0 件の検査は新シンボルにも適用され、実測で違反なし。
