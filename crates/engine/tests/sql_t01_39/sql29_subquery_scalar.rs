@@ -13,6 +13,7 @@ use engine::kernel::CpuScalarProvider;
 use engine::policy::PolicyContext;
 use engine::sql::allowlist::SqlSurfaceError;
 use engine::sql::mode::SessionState;
+use engine::sql::SqlOutcome;
 use engine::storage::{Storage, Visibility};
 use std::sync::Arc;
 
@@ -753,21 +754,26 @@ fn scalar_subquery_stays_rejected_in_non_subquery_contexts() {
     let ctx = ctx_for("tenant-a");
     ins(&core, &ctx, ITEMS, 1, &[("qty", "1")]);
     ins(&core, &ctx, REFS, 1, &[("qty", "1")]);
-    for sql in [
-        format!(
-            "EXPLAIN SELECT id FROM {ITEMS} WHERE qty = (SELECT qty FROM {REFS} LIMIT 1) LIMIT 10"
-        ),
-        // `LIMIT` の無い広域取得は評価後射影形ビューの本文にできない（`LIMIT` 付きの
-        // サブクエリ本文は受理される。`table18_view.rs` の Issue #1360 のテスト参照）。
-        format!(
-            "CREATE VIEW v1 AS SELECT id FROM {ITEMS} WHERE qty = (SELECT qty FROM {REFS} LIMIT 1)"
-        ),
-    ] {
-        let err = core
-            .execute_sql_in_session(&ctx, &mut SessionState::default(), &sql)
-            .expect_err("must be rejected");
-        assert_eq!(err.wire_code(), "42601", "sql={sql} err={err:?}");
-    }
+    // Issue #2048: WHERE のスカラー部分クエリは EXPLAIN で受理する（内側は実行しない）。
+    let explained = core
+        .execute_sql_in_session(
+            &ctx,
+            &mut SessionState::default(),
+            &format!(
+                "EXPLAIN SELECT id FROM {ITEMS} WHERE qty = (SELECT qty FROM {REFS} LIMIT 1) LIMIT 10"
+            ),
+        )
+        .expect("EXPLAIN of a WHERE scalar subquery is accepted");
+    assert!(matches!(explained, SqlOutcome::Explain(_)));
+    // `LIMIT` の無い広域取得は評価後射影形ビューの本文にできない（`LIMIT` 付きの
+    // サブクエリ本文は受理される。`table18_view.rs` の Issue #1360 のテスト参照）。
+    let sql = format!(
+        "CREATE VIEW v1 AS SELECT id FROM {ITEMS} WHERE qty = (SELECT qty FROM {REFS} LIMIT 1)"
+    );
+    let err = core
+        .execute_sql_in_session(&ctx, &mut SessionState::default(), &sql)
+        .expect_err("must be rejected");
+    assert_eq!(err.wire_code(), "42601", "sql={sql} err={err:?}");
     // 拡張クエリプロトコル: `$n` 併用は 42601、`$n` なしは受理。
     let err = core
         .parse_sql_prepared(&format!(

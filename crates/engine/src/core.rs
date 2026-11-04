@@ -11860,6 +11860,11 @@ impl EngineCore {
                 crate::sql::allowlist::ExplainTarget::SetOperation(validated) => {
                     self.run_set_operation_explain(&validated, session)
                 }
+                // Issue #2048（SQL-75 (2) ポインタ）: インライン展開の CTE・派生表。畳み込み後の文の
+                // 束縛結果だけから `cte` 段の木を報告する（[`Self::run_cte_explain`] 参照）。
+                crate::sql::allowlist::ExplainTarget::Cte(validated) => {
+                    self.run_cte_explain(&validated, session)
+                }
             },
             // Issue #929（SQL-29 (c)・RLS-10 (b)・TASK-213）: 集合演算は複数枝
             // （各枝は独立した単一テーブル広域取得）を単一スナップショット上で
@@ -13977,10 +13982,135 @@ impl EngineCore {
         session: &crate::sql::mode::SessionState,
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
         let (read_txn, schema) = self.read_txn_with_schema(validated.table_name())?;
-        let bound = crate::sql::parser::bind_aggregate(validated, &schema, session.udfs())?;
-        Ok(crate::sql::SqlOutcome::Explain(
-            self.aggregate_explain_from_bound(&read_txn, &schema, &bound),
-        ))
+        // Issue #2048: WHERE に部分クエリがあれば、内側を実行せず静的検証して `subquery` 段を子に足す。
+        // 外側は部分クエリ述語を索引に使えないフィルタとみなして束縛・分類する（部分クエリが無い文の
+        // 出力は従来とバイト単位で同一）。
+        let has_subqueries = validated
+            .where_predicates()
+            .iter()
+            .any(crate::sql::subquery::predicate_contains_subquery);
+        let mut specs = Vec::new();
+        let mut owned;
+        let outer = if has_subqueries {
+            let items = crate::sql::subquery::explain_subquery_predicates(
+                validated.where_predicates(),
+                &schema,
+                &read_txn,
+                &self.storage,
+                session.udfs(),
+                self.nesting_limits,
+                self.result_limits,
+            )?;
+            specs = Self::subquery_specs(&read_txn, items)?;
+            // 部分クエリを含む `OR` の通常述語は表示用の置換で落ちるため、別に束縛だけ検証する
+            // （未知列等の `42703` を非 EXPLAIN の文と揃える。結果は捨てる）。
+            let mut check = validated.clone();
+            check.where_predicates =
+                crate::sql::subquery::static_validation_predicates(validated.where_predicates());
+            crate::sql::parser::bind_aggregate(&check, &schema, session.udfs())?;
+            owned = validated.clone();
+            owned.where_predicates =
+                crate::sql::subquery::explain_outer_predicates(validated.where_predicates());
+            &owned
+        } else {
+            validated
+        };
+        let bound = crate::sql::parser::bind_aggregate(outer, &schema, session.udfs())?;
+        let lines = self.aggregate_explain_lines_from_bound(&read_txn, &schema, &bound);
+        let node = crate::sql::cte_explain::with_subqueries(lines, specs)
+            .map_err(Self::explain_tree_error)?;
+        Ok(crate::sql::SqlOutcome::Explain(node.into_query_result()))
+    }
+
+    /// WHERE の部分クエリの収集結果（[`crate::sql::subquery::explain_sink::SubqueryExplain`]）を、
+    /// 走査分類の行つきの段の記述へ変換する（Issue #2048）。内側の広域取得は単一表の広域取得
+    /// `EXPLAIN` と共有の [`Self::scan_explain_lines`]（内側の実行器 `execute_inner_scan_statement`
+    /// も同じ `sql::scan::execute_scan` を通る）。内側の集計形は実行器
+    /// `execute_inner_aggregate_statement` がキャッシュ・索引を渡さない事実に合わせて全走査に固定する
+    /// （集合演算の集計枝と同じ分類。**実行器が変わるときはこの分類も一緒に変えること**）。
+    fn subquery_specs(
+        read_txn: &redb::ReadTransaction,
+        items: Vec<crate::sql::subquery::explain_sink::SubqueryExplain>,
+    ) -> Result<
+        Vec<crate::sql::cte_explain::SubqueryStageSpec>,
+        crate::sql::allowlist::SqlSurfaceError,
+    > {
+        use crate::sql::cte_explain::{InnerStageSpec, SubqueryStageSpec};
+        use crate::sql::subquery::explain_sink::ExplainInner;
+        items
+            .into_iter()
+            .map(|item| {
+                let inner = match item.inner {
+                    ExplainInner::Scan { schema, bound } => {
+                        let gins = Self::gin_decls_for_explain(read_txn, &bound)?;
+                        InnerStageSpec::Scan {
+                            lines: Self::scan_explain_lines(&schema, &bound, &gins),
+                        }
+                    }
+                    ExplainInner::Aggregate { shape } => InnerStageSpec::Aggregate {
+                        shape,
+                        lines: crate::sql::set_op::aggregate_branch_explain_lines(),
+                    },
+                };
+                Ok(SubqueryStageSpec {
+                    kind: item.kind,
+                    inner,
+                    children: Self::subquery_specs(read_txn, item.children)?,
+                })
+            })
+            .collect()
+    }
+
+    /// CTE・派生表（インライン展開で畳み込まれた形）の `EXPLAIN`（Issue #2048・SQL-75 (2)(5)(6)
+    /// ポインタ）。`Statement::Explain` アームから呼ばれ、非 EXPLAIN と同じ畳み込み後の文を単一表の
+    /// 広域取得・集計と同じ束縛（`bind_scan_with_dummy_flags`／`bind_aggregate`）と走査分類で報告する
+    /// ので、束縛エラーの `wire_code` と順序が一致する。走査・キャッシュ・台帳・世代・書き込みロック
+    /// には触れず、CTE 名・行数等のテナント存在情報も出さない。
+    fn run_cte_explain(
+        &self,
+        validated: &crate::sql::allowlist::ValidatedCteExplain,
+        session: &crate::sql::mode::SessionState,
+    ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        use crate::sql::allowlist::CteExplainMain;
+        use crate::sql::cte_explain::CteMainShape;
+        let (lines, shape) = match &validated.main {
+            CteExplainMain::Scan(v) => {
+                let (read_txn, schema) = self.read_txn_with_schema(v.table_name())?;
+                let bound = crate::sql::parser::bind_scan_with_dummy_flags(
+                    v,
+                    &schema,
+                    session.udfs(),
+                    &[],
+                    &self.result_limits,
+                )?;
+                let gins = Self::gin_decls_for_explain(&read_txn, &bound)?;
+                let shape = CteMainShape {
+                    has_limit: !v.limit_implicit,
+                    has_offset: bound.offset != 0,
+                    sort_keys: bound.order_by.len(),
+                    aggregate: None,
+                };
+                (Self::scan_explain_lines(&schema, &bound, &gins), shape)
+            }
+            CteExplainMain::Aggregate(v) => {
+                let (read_txn, schema) = self.read_txn_with_schema(v.table_name())?;
+                let bound = crate::sql::parser::bind_aggregate(v, &schema, session.udfs())?;
+                let grouped = bound.group_by.as_ref();
+                let shape = CteMainShape {
+                    has_limit: grouped.is_some_and(|g| g.limit.is_some()),
+                    has_offset: grouped.is_some_and(|g| g.offset != 0),
+                    sort_keys: grouped.map_or(0, |g| g.order_by.len()),
+                    aggregate: Some(crate::sql::set_op::aggregate_shape(&bound)),
+                };
+                (
+                    self.aggregate_explain_lines_from_bound(&read_txn, &schema, &bound),
+                    shape,
+                )
+            }
+        };
+        let node = crate::sql::cte_explain::cte_inline_tree(validated.source, &shape, lines)
+            .map_err(Self::explain_tree_error)?;
+        Ok(crate::sql::SqlOutcome::Explain(node.into_query_result()))
     }
 
     /// 束縛済み集計計画（[`crate::sql::parser::BoundAggregate`]）から
@@ -14023,6 +14153,20 @@ impl EngineCore {
         schema: &crate::catalog::TableSchema,
         bound: &crate::sql::parser::BoundAggregate,
     ) -> crate::sql::exec::QueryResult {
+        crate::sql::explain_tree::ExplainNode::leaf(
+            self.aggregate_explain_lines_from_bound(read_txn, schema, bound),
+        )
+        .into_query_result()
+    }
+
+    /// [`Self::aggregate_explain_from_bound`] の行生成部（Issue #2048）。CTE・部分クエリの
+    /// `EXPLAIN` が `scan` 節に載せる行も、この関数が作る（第 2 の分類実装を持たない）。
+    fn aggregate_explain_lines_from_bound(
+        &self,
+        read_txn: &redb::ReadTransaction,
+        schema: &crate::catalog::TableSchema,
+        bound: &crate::sql::parser::BoundAggregate,
+    ) -> Vec<String> {
         let target = crate::sql::scalar_index::resolve_scalar_index_target_in_txn(
             read_txn,
             &schema.name,
@@ -14085,11 +14229,12 @@ impl EngineCore {
         } else {
             crate::sql::explain::ExplainIndexNames::default()
         };
-        crate::sql::explain::build_relational_explain_result(
+        crate::sql::explain::relational_explain_lines(
             scalar_plan,
             scalar_fallback,
             access_path,
             &index_names,
+            &[],
         )
     }
 
@@ -14106,17 +14251,57 @@ impl EngineCore {
         session: &crate::sql::mode::SessionState,
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
         let (read_txn, schema) = self.read_txn_with_schema(validated.table_name())?;
+        // Issue #2048: WHERE に部分クエリがあれば、内側を実行せず静的検証して `subquery` 段を子に足す。
+        // 外側は部分クエリ述語を索引に使えないフィルタとみなして束縛・分類する（部分クエリが無い文の
+        // 出力は従来とバイト単位で同一）。
+        let has_subqueries = validated
+            .where_predicates()
+            .iter()
+            .any(crate::sql::subquery::predicate_contains_subquery);
+        let mut specs = Vec::new();
+        let mut owned;
+        let outer = if has_subqueries {
+            let items = crate::sql::subquery::explain_subquery_predicates(
+                validated.where_predicates(),
+                &schema,
+                &read_txn,
+                &self.storage,
+                session.udfs(),
+                self.nesting_limits,
+                self.result_limits,
+            )?;
+            specs = Self::subquery_specs(&read_txn, items)?;
+            // 部分クエリを含む `OR` の通常述語は表示用の置換で落ちるため、別に束縛だけ検証する
+            // （未知列等の `42703` を非 EXPLAIN の文と揃える。結果は捨てる）。
+            let mut check = validated.clone();
+            check.where_predicates =
+                crate::sql::subquery::static_validation_predicates(validated.where_predicates());
+            crate::sql::parser::bind_scan_with_dummy_flags(
+                &check,
+                &schema,
+                session.udfs(),
+                &[],
+                &self.result_limits,
+            )?;
+            owned = validated.clone();
+            owned.where_predicates =
+                crate::sql::subquery::explain_outer_predicates(validated.where_predicates());
+            &owned
+        } else {
+            validated
+        };
         let bound = crate::sql::parser::bind_scan_with_dummy_flags(
-            validated,
+            outer,
             &schema,
             session.udfs(),
             &[],
             &self.result_limits,
         )?;
         let gins = Self::gin_decls_for_explain(&read_txn, &bound)?;
-        Ok(crate::sql::SqlOutcome::Explain(Self::scan_explain_result(
-            &schema, &bound, &gins,
-        )))
+        let lines = Self::scan_explain_lines(&schema, &bound, &gins);
+        let node = crate::sql::cte_explain::with_subqueries(lines, specs)
+            .map_err(Self::explain_tree_error)?;
+        Ok(crate::sql::SqlOutcome::Explain(node.into_query_result()))
     }
 
     /// JOIN の `EXPLAIN`（Issue #2046・SQL-75 (2)(5)(6) ポインタ）。`Statement::Explain` アームから
@@ -14131,11 +14316,12 @@ impl EngineCore {
         session: &crate::sql::mode::SessionState,
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
         use crate::sql::allowlist::SqlSurfaceError;
-        // EXPLAIN の構文段は CTE 入力を作らない（`EXPLAIN WITH` は `42601`）。到達は契約違反のみ。
+        // Issue #2048: CTE・派生表を入力にする JOIN は構文段（`explain_cte_target`）が `42601` で
+        // 拒否するため通常は到達しない。到達しても `Internal` ではなく固定文の `42601` で拒否する。
         if validated.cte_inputs.is_some() {
-            return Err(SqlSurfaceError::Internal {
-                detail: "EXPLAIN for a JOIN with CTE inputs is not supported".to_string(),
-            });
+            return Err(SqlSurfaceError::unsupported(
+                "EXPLAIN is not supported for a JOIN with CTE or derived table inputs",
+            ));
         }
         let names = crate::sql::join::collect_join_tables(validated);
         let (read_txn, schemas) = self.read_txn_with_schemas(&names)?;

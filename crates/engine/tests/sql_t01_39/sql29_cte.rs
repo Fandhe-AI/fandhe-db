@@ -499,14 +499,38 @@ fn cte_main_query_scalar_order_by_is_supported() {
 }
 
 #[test]
-fn cte_main_query_still_rejects_subquery_and_explain_forms() {
+fn cte_main_query_still_rejects_subquery_forms() {
     let (core, _guard) = open_seeded();
     for sql in [
         "WITH a AS (SELECT id, lang FROM docs) SELECT COUNT(*) FROM a WHERE lang IN (SELECT lang FROM docs LIMIT 10)",
         "WITH a AS (SELECT id, lang FROM docs) SELECT id FROM a WHERE lang = (SELECT lang FROM docs LIMIT 1) LIMIT 10",
-        "EXPLAIN WITH a AS (SELECT id FROM docs) SELECT COUNT(*) FROM a",
+        // CTE の主クエリの部分クエリは EXPLAIN でも同じ（Issue #2048）。
+        "EXPLAIN WITH a AS (SELECT id, lang FROM docs) SELECT COUNT(*) FROM a WHERE lang IN (SELECT lang FROM docs LIMIT 10)",
     ] {
         let err = query_err(&core, "alice", sql);
         assert_eq!(err.wire_code(), "42601", "sql={sql} err={err:?}");
     }
+}
+
+/// Issue #2048（SQL-75 (2) ポインタ）: インライン展開の CTE の集計主クエリは EXPLAIN を受理し、
+/// `cte` 段の下に畳み込み後の集計を示す（従来は 42601）。
+#[test]
+fn explain_of_inline_cte_aggregate_is_accepted() {
+    let (core, _guard) = open_seeded();
+    let mut session = SessionState::default();
+    let out = core
+        .execute_sql_in_session(
+            &ctx("alice"),
+            &mut session,
+            "EXPLAIN WITH a AS (SELECT id FROM docs) SELECT COUNT(*) FROM a",
+        )
+        .expect("explain");
+    let SqlOutcome::Explain(r) = out else {
+        panic!("expected Explain outcome");
+    };
+    let first = match r.rows.first().and_then(|row| row.cells.first()) {
+        Some(engine::sql::exec::Cell::Text(s)) => s.as_str(),
+        other => panic!("unexpected first cell {other:?}"),
+    };
+    assert_eq!(first, "cte");
 }
