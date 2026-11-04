@@ -92,6 +92,11 @@ repo variables（`vars.*`）のまま維持する（`.github/workflows/bench.yml
 規模スイープ診断の opt-in フラグ。`docs/design/core16-f16-resident-gate.md`
 参照）も同様に非機密であり、`bench.yml` へは注入しない（`BENCH_VERBOSE` と
 同じく手動実行〔`make bench-batch`〕専用の opt-in とし CI では設定しない）。
+`BENCH_BATCH_METRIC`（Issue #2005。CORE-6／CORE-16 の GPU 経路と CPU 対照の構築
+metric。`inner_product`〔既定〕・`l2`・`cosine` の 3 択で数値基準を含まない）も
+同様に非機密のため secrets 化せず repo variable（`vars.BENCH_BATCH_METRIC`）として
+`bench.yml` の `bench-batch` へ注入する。未設定・空は内積で、allowlist 外（`l1` 含む）は
+`batch_bench` が fail-closed で拒否する。閾値は metric によらず既存の secrets を使う。
 
 `RECALL_ENGINE`（Issue #412・ADR `docs/design/ann-index-adoption.md` B 案の
 受け入れ条件 3。`crates/engine/tests/fixtures/recall_engine.rs::RecallEngine`）

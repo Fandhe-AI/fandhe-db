@@ -93,9 +93,16 @@ fn sql1_pure_topk_matches_independent_exact_oracle() {
         )
         .expect("SQL-1 execution should succeed");
 
-    // 独立オラクル: f64 で総当たり内積を計算し、スコア降順・同点 id 昇順で Top-3 を選ぶ
-    // （production の kernel::CpuScalarProvider とは別経路の再計算。SQL-1 の
-    // Recall@20=1.0 相当を、厳密探索との完全一致で確認する）。
+    // 独立オラクル: f64 で総当たりのコサイン距離（`1 - dot / (|a||q|)`）を計算し、距離昇順・
+    // 同点 id 昇順で Top-3 を選ぶ（`<=>` はコサイン距離。SQL-33・Issue #1991。production の
+    // kernel とは別経路の再計算で、厳密探索との完全一致を確認する）。コーパスにゼロベクトルは
+    // 無く（ゼロノルムは NaN で末尾になる規則の対象外）、各行の距離は
+    // id1=0 < id2≈0.006 < id5≈0.293 < id3=id4=1 < id6=2 で Top-3 の境界に同点は無い。
+    let q_norm: f64 = query
+        .iter()
+        .map(|&b| (b as f64) * (b as f64))
+        .sum::<f64>()
+        .sqrt();
     let mut scored: Vec<(u64, f64)> = corpus
         .iter()
         .map(|(id, emb)| {
@@ -104,10 +111,15 @@ fn sql1_pure_topk_matches_independent_exact_oracle() {
                 .zip(query.iter())
                 .map(|(&a, &b)| a as f64 * b as f64)
                 .sum();
-            (*id, dot)
+            let norm: f64 = emb
+                .iter()
+                .map(|&a| (a as f64) * (a as f64))
+                .sum::<f64>()
+                .sqrt();
+            (*id, 1.0 - dot / (norm * q_norm))
         })
         .collect();
-    scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    scored.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
     let expected: Vec<u64> = scored.into_iter().take(3).map(|(id, _)| id).collect();
 
     assert_eq!(result_ids(&result), expected);
@@ -437,12 +449,12 @@ fn sql4_hybrid_tie_group_across_limit_boundary_is_deterministic() {
         ))
         .expect("create table");
 
-    // id=1（行 A）: 密ランク 0（内積最大）・疎ランク 1（tf=1、文書長 3 語）。
-    // id=2（行 B）: 密ランク 1（内積 2 位）・疎ランク 0（tf=3、文書長 3 語で
+    // id=1（行 A）: 密ランク 0（コサイン距離最小）・疎ランク 1（tf=1、文書長 3 語）。
+    // id=2（行 B）: 密ランク 1（コサイン距離 2 位）・疎ランク 0（tf=3、文書長 3 語で
     // id=1 と揃えているため BM25 は tf のみで単調に順位付けされる）。
     // 密・疎のランクの組が入れ替わっているため融合スコアは常に完全一致する
-    // （上記コメント参照）。id=90〜92 は `anchor` を含まない埋め草行で、密内積を
-    // 行 A・B より小さくして密ランク 2 以降に押し出す（タイ組の構成に影響しない）。
+    // （上記コメント参照）。id=90〜92 は `anchor` を含まない埋め草行で、密側の順位を
+    // 行 A・B より下げて密ランク 2 以降に押し出す（タイ組の構成に影響しない）。
     let rows: [(u64, [f32; 2], Option<&str>); 5] = [
         // 密側は `<=>`（コサイン距離。Issue #1991）で順位付けされるため、向きの近さで
         // 行 A（問い合わせ [1,0] と同方向）> 行 B > 埋め草の順になるよう角度を変えてある。

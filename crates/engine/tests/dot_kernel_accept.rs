@@ -11,13 +11,100 @@
 mod harness;
 
 use harness::dot_kernel::{
-    check_bit_identical, check_matches_scalar_reference, classify_change, generate_corpus,
-    generate_query, min_of_samples, ns_per_dot, parse_tail_ab_env, refuse_under_github_actions,
-    relative_band, render_line, render_tail_ab_line, render_tail_ab_reference_line, rows_for,
-    speedup_ratio, ChangeClass, DotKernelError, TailAbMode, WorkingSet, ARENA_SCALE_ROWS,
-    MAX_CORPUS_ROWS_GUARD, MAX_DIM_GUARD, TAIL_AB_DIMS,
+    check_bit_identical, check_l2_matches_scalar_reference, check_matches_scalar_reference,
+    classify_change, generate_corpus, generate_query, min_of_samples, ns_per_dot, parse_l2_ab_env,
+    parse_tail_ab_env, refuse_under_github_actions, relative_band, render_l2_ab_line,
+    render_l2_diagnostic_line, render_line, render_tail_ab_line, render_tail_ab_reference_line,
+    rows_for, speedup_ratio, ChangeClass, DotKernelError, L2AbMode, L2AbRow, TailAbMode,
+    WorkingSet, ARENA_SCALE_ROWS, MAX_CORPUS_ROWS_GUARD, MAX_DIM_GUARD, TAIL_AB_DIMS,
 };
 use std::time::Duration;
+
+// --- L2 A/B（Issue #1984・SQL-33 ポインタ） ---
+
+#[test]
+fn parse_l2_ab_env_accepts_fixed_vocabulary() {
+    assert_eq!(parse_l2_ab_env(None).unwrap(), L2AbMode::Off);
+    assert_eq!(parse_l2_ab_env(Some("0")).unwrap(), L2AbMode::Off);
+    assert_eq!(parse_l2_ab_env(Some("1")).unwrap(), L2AbMode::On);
+}
+
+#[test]
+fn parse_l2_ab_env_rejects_other_values() {
+    for bogus in ["", "true", "yes", "2", " 1"] {
+        let err = parse_l2_ab_env(Some(bogus)).unwrap_err();
+        assert!(
+            matches!(err, DotKernelError::InvalidEnv { .. }),
+            "expected InvalidEnv for {bogus:?}, got {err:?}"
+        );
+    }
+}
+
+#[test]
+fn check_l2_matches_scalar_reference_accepts_within_tolerance() {
+    check_l2_matches_scalar_reference(1000.0, 1000.0).unwrap();
+    check_l2_matches_scalar_reference(1000.009, 1000.0).unwrap();
+}
+
+#[test]
+fn check_l2_matches_scalar_reference_rejects_out_of_tolerance() {
+    let err = check_l2_matches_scalar_reference(1000.5, 1000.0).unwrap_err();
+    assert!(matches!(err, DotKernelError::L2ToleranceExceeded { .. }));
+    assert!(err.to_string().contains("l2 result outside tolerance"));
+    assert!(err.to_string().contains("1000.5"));
+}
+
+#[test]
+fn check_l2_matches_scalar_reference_rejects_non_finite() {
+    for (a, e) in [
+        (f32::NAN, 1.0),
+        (f32::INFINITY, 1.0),
+        (1.0, f32::NAN),
+        (1.0, f32::INFINITY),
+    ] {
+        assert_eq!(
+            check_l2_matches_scalar_reference(a, e).unwrap_err(),
+            DotKernelError::NonFiniteResult
+        );
+    }
+}
+
+#[test]
+fn l2_ab_lines_carry_fields_and_do_not_collide_with_chip_parsers() {
+    let line = render_l2_ab_line(&L2AbRow {
+        working_set: WorkingSet::CacheResident,
+        dim: 768,
+        rows: 21,
+        dot_min: Duration::from_micros(1500),
+        dot_median: Duration::from_micros(1600),
+        l2_min: Duration::from_micros(3000),
+        l2_median: Duration::from_micros(3200),
+        ratio_min: 2.0,
+        ratio_median: 2.0,
+    });
+    for needle in [
+        "dot_kernel: l2_ab ",
+        "working_set=cache_resident",
+        "dim=768",
+        "rows=21",
+        "dot_min_ms=1.500",
+        "l2_median_ms=3.200",
+        "ratio_min=2.0000",
+        "ratio_median=2.0000",
+    ] {
+        assert!(line.contains(needle), "missing {needle:?} in {line}");
+    }
+    let diag = render_l2_diagnostic_line(768, 21, 1.0, ChangeClass::Neutral);
+    assert!(diag.starts_with("dot_kernel: l2_diagnostic_ab dim=768 rows=21 "));
+    assert!(diag.contains("simd_vs_scalar_ratio=1.000"));
+    for l in [&line, &diag] {
+        assert!(!l.starts_with("dot_kernel: label=current "));
+        assert!(!l.starts_with("dot_kernel: diagnostic_ab "));
+        assert!(!l.starts_with("dot_kernel: block4_ab"));
+        assert!(harness::chip::parse_dot_kernel_line(l).is_none());
+        assert!(harness::chip::parse_dot_kernel_diag_line(l).is_none());
+    }
+}
 
 // --- refuse_under_github_actions ---
 

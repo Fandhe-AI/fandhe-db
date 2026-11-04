@@ -201,17 +201,31 @@ fn radius_with_knn_never_returns_out_of_radius_rows() {
         );
         assert_eq!(hinted, got);
 
-        // 参照: 半径内を内積の降順で上位 K（同点は id 昇順）。
-        let mut cand: Vec<(u64, f32)> = (0..ROWS)
+        // 参照: 半径内をコサイン距離（`<=>`。SQL-33・Issue #1991）の昇順で上位 K（同点は
+        // id 昇順）。コーパスは L2 正規化済みでコサイン距離の順位は内積降順と一致するが、
+        // oracle は `<=>` の意味（コサイン距離）で書く。ゼロベクトルは無い前提。
+        let q_norm: f64 = q
+            .iter()
+            .map(|&b| (b as f64) * (b as f64))
+            .sum::<f64>()
+            .sqrt();
+        let mut cand: Vec<(u64, f64)> = (0..ROWS)
             .filter(|i| l2(&vectors[*i], q) < r)
             .map(|i| {
-                (
-                    i as u64 + 1,
-                    vectors[i].iter().zip(q).map(|(a, b)| a * b).sum::<f32>(),
-                )
+                let dot: f64 = vectors[i]
+                    .iter()
+                    .zip(q)
+                    .map(|(&a, &b)| a as f64 * b as f64)
+                    .sum();
+                let norm: f64 = vectors[i]
+                    .iter()
+                    .map(|&a| (a as f64) * (a as f64))
+                    .sum::<f64>()
+                    .sqrt();
+                (i as u64 + 1, 1.0 - dot / (norm * q_norm))
             })
             .collect();
-        cand.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        cand.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
         let want: std::collections::HashSet<u64> = cand.iter().take(K).map(|x| x.0).collect();
         total += K;
         hit += got.iter().filter(|id| want.contains(id)).count();
