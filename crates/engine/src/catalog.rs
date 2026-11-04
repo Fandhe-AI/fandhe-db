@@ -2076,6 +2076,32 @@ pub(crate) fn hnsw_metric_in_txn(
     }
 }
 
+/// NoSQL 表層 `search` の `metric` 省略時に使う既定の距離種別（opclass）を解決する
+/// （Issue #2243・NOSQL-2・SQL-33 (7)）。規則は [`hnsw_metric_in_txn`] と同じ（宣言なし・宣言集合に
+/// `Cosine` を含む場合は `Cosine`、それ以外は集合の最小要素）だが、`EXPLAIN` 表示用の同関数と違い
+/// 要約の読み取り失敗を `Err` で返す（`gate_read_failures` に計上）。黙って `Cosine` に倒すと、宣言が
+/// L2 などの表で結果の意味が反転するため fail-closed にする。呼び出し元（`core.rs` の
+/// `IndexMetricDefault`）は opt-in なし・`HnswScope::All` ではこの関数を呼ばない。
+pub(crate) fn hnsw_default_metric_in_txn(
+    read_txn: &redb::ReadTransaction,
+    gate_cache: &IndexCatalogGateCache,
+    table: &str,
+) -> Result<VectorOpClass> {
+    let summary = match cached_hnsw_catalog_summary_in_txn(read_txn, gate_cache) {
+        Ok(summary) => summary,
+        Err(e) => {
+            gate_cache
+                .gate_read_failures
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Err(e);
+        }
+    };
+    Ok(match summary.hnsw_tables.get(table) {
+        Some(set) => declared_index_metric(set),
+        None => VectorOpClass::Cosine,
+    })
+}
+
 /// `name` が `table` に対する一意索引（`CREATE UNIQUE INDEX`。Issue #1616・INDEX-9）として
 /// [`INDEX_CATALOG_TABLE`] に登録済みかを write txn 内で判定する。`ALTER TABLE ... DROP
 /// CONSTRAINT` が索引由来の UNIQUE 制約を制約として扱わないための判定に使う。索引カタログ未作成は
@@ -27330,6 +27356,34 @@ mod tests {
             .create_index(&hnsw_def("idx_cos", "docs"))
             .expect("create cosine index");
         assert_eq!(metric("docs"), VectorOpClass::Cosine);
+    }
+
+    /// Issue #2243: `hnsw_default_metric_in_txn` が `hnsw_metric_in_txn` と同じ規則で解決し、
+    /// 破損カタログでは `Err` と `gate_read_failures` の加算で fail-closed になること。
+    #[test]
+    fn hnsw_default_metric_follows_rule_and_fails_closed_on_corrupt_catalog() {
+        let (storage, _guard) = index_fixture_storage("index-hnsw-default-metric");
+        let gate_cache = IndexCatalogGateCache::new();
+        let metric = |table: &str| {
+            let txn = storage.db().begin_read().expect("begin read");
+            hnsw_default_metric_in_txn(&txn, &gate_cache, table).expect("resolve")
+        };
+        assert_eq!(metric("docs"), VectorOpClass::Cosine);
+        let mut l2 = hnsw_def("idx_l2", "docs");
+        l2.kind = IndexKind::Hnsw(VectorOpClass::L2);
+        storage.create_index(&l2).expect("create l2 index");
+        assert_eq!(metric("docs"), VectorOpClass::L2);
+        assert_eq!(metric("other"), VectorOpClass::Cosine);
+        storage
+            .create_index(&hnsw_def("idx_cos", "docs"))
+            .expect("create cosine index");
+        assert_eq!(metric("docs"), VectorOpClass::Cosine);
+
+        assert_eq!(gate_cache.stats().gate_read_failures, 0);
+        insert_corrupt_index_entry(&storage);
+        let txn = storage.db().begin_read().expect("begin read");
+        assert!(hnsw_default_metric_in_txn(&txn, &gate_cache, "docs").is_err());
+        assert_eq!(gate_cache.stats().gate_read_failures, 1);
     }
 
     /// 3 状態ゲート `hnsw_gate_in_txn` の真理表（Issue #1979・INDEX-7）。scope × 宣言集合 ×
