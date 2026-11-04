@@ -324,8 +324,11 @@ HNSW 経路の適格性ゲートは宣言の有無に加え、索引の距離種
   経路を変えない。上記「HNSW（テーブル単位）」節・Issue #1065 の受入条件 4 と同じ）、`Declared` では宣言のみ。
 - 物理グラフが対応する距離種別は `catalog::hnsw_supported_metric`（現状コサインだけ）。opclass 別カーネル
   （Issue #1996・#1999）で広げる。近似を誤った距離で返さないため、宣言と一致していても未対応なら厳密に倒す。
-- 不一致になるのは、`Declared` で非コサインの宣言しかない表への `<=>` と、`<->`／`<#>`／`<+>` の問い合わせ
-  （Issue #1977 で受理済み。物理グラフがコサインにしか対応しないため `MetricMismatch` で厳密全走査へ倒れる）。
+- 不一致になるのは、`Declared` で非コサインの宣言しかない表への `<=>` と、`<#>` の問い合わせ
+  （物理グラフがコサインにしか対応しないため `MetricMismatch` で厳密全走査へ倒れる）。
+  `<->`／`<+>` は構文・`$n` 束縛までは受理される（Issue #1977）が、L2／L1 の距離カーネルが SQL 実行経路に
+  未接続のため、実行入口（`sql::exec::ensure_distance_kind_executable`）で `0A000` として拒否され、
+  索引ゲートや全走査には到達しない。`<#>` の全走査縮退とは区別する。
   問い合わせ側の metric は `sql::hnsw_cache::query_metric_of_bound` に集約済みで、距離演算子から決まる。
 - `hnsw_params:` の `metric=` は同じゲート結果から決める（`Targeted` は問い合わせ側、`MetricMismatch` は宣言側）。
 - 縮退先は既存の厳密経路で、RLS の可視集合には触れない（`tests/sql_named/sql33_opclass_mismatch.rs` で固定）。
