@@ -3289,7 +3289,10 @@ fn gather_reachable_rows(
         .zip(matrix.visibilities().iter())
         .enumerate()
     {
-        if ctx.is_visible(tenant, *visibility) {
+        // Cosine で正規化不可の行は NaN 行として常駐しているが、WGSL は非有限値の
+        // 伝播を保証せず不定の有限スコアが Top-k に入りうるため、GPU へ渡さず除外する
+        // （CPU 側は NaN スコアを非有限除外で落とすので結果が揃う）。
+        if !matrix.is_unscorable(idx) && ctx.is_visible(tenant, *visibility) {
             // `idx` は `ResidentMatrix::build` が `MAX_BATCH_ROWS`
             // （1,000,000）以下に制限済みのため `u32` で表現できる。
             if let Ok(idx_u32) = u32::try_from(idx) {
@@ -5013,6 +5016,33 @@ mod tests {
             reachable,
             vec![0],
             "only tenant a's private row is visible; other tenants' private rows must not be scanned"
+        );
+    }
+
+    // Cosine で正規化不可（ゼロノルム）の行が GPU 候補（可視行収集）から除外されること。
+    #[test]
+    fn gather_reachable_rows_excludes_unnormalizable_cosine_rows() {
+        let dim = 2usize;
+        let ids = vec![1u64, 2, 3];
+        let tenant_ids = vec!["a".to_string(); 3];
+        let visibilities = vec![Visibility::Private; 3];
+        let vectors = vec![1.0f32, 0.0, 0.0, 0.0, 0.0, 2.0];
+        let matrix = crate::batch_search::ResidentMatrix::build_with_metric(
+            &ids,
+            &tenant_ids,
+            &visibilities,
+            dim,
+            &vectors,
+            BatchMetric::Cosine,
+        )
+        .expect("cosine matrix should build");
+        let ctx = PolicyContext::with_visibilities("a", [Visibility::Private])
+            .expect("policy context should build");
+        let reachable = gather_reachable_rows(&matrix, &ctx).expect("rows should gather");
+        assert_eq!(
+            reachable,
+            vec![0, 2],
+            "zero-norm row must not reach the shader"
         );
     }
 

@@ -518,6 +518,11 @@ pub struct ResidentMatrix {
     dim: usize,
     /// `ids.len() * dim.div_ceil(2)` 要素のパック済み行列（行優先）。
     packed: Vec<u32>,
+    /// Cosine で正規化できなかった行（ゼロ・非有限・アンダーフロー等）の印。行 `i` が
+    /// 真なら候補から除外する。GPU は NaN 伝播を保証しないため、シェーダへ渡す前に
+    /// [`Self::is_unscorable`] で行ごと落とす（CPU との結果整合のため）。
+    /// Cosine 以外では空（全行 false 扱い）。
+    unscorable: Vec<bool>,
 }
 
 impl ResidentMatrix {
@@ -721,9 +726,14 @@ impl ResidentMatrix {
             try_reserve_exact(&mut scratch, dim, "normalize scratch")?;
             scratch.resize(dim, 0.0);
         }
+        let mut unscorable: Vec<bool> = Vec::new();
+        if metric == BatchMetric::Cosine {
+            try_reserve_exact(&mut unscorable, ids.len(), "unscorable flags")?;
+        }
         for raw_row in vectors.chunks(dim) {
             let row: &[f32] = if metric == BatchMetric::Cosine {
                 normalize_row_or_nan(raw_row, &mut scratch);
+                unscorable.push(scratch.first().is_some_and(|v| v.is_nan()));
                 &scratch
             } else {
                 raw_row
@@ -771,7 +781,14 @@ impl ResidentMatrix {
             visibilities: owned_visibilities,
             dim,
             packed,
+            unscorable,
         })
+    }
+
+    /// 行 `idx` が Cosine で正規化不可（スコア対象外）か。範囲外・Cosine 以外は false。
+    /// 呼び出し元: `gpu_batch.rs` の `gather_reachable_rows`（GPU 候補からの除外）。
+    pub fn is_unscorable(&self, idx: usize) -> bool {
+        self.unscorable.get(idx).copied().unwrap_or(false)
     }
 
     pub fn row_count(&self) -> usize {
