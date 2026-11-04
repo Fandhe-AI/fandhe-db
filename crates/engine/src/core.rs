@@ -13447,6 +13447,16 @@ impl EngineCore {
         session: &crate::sql::mode::SessionState,
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
         let (read_txn, schema) = self.read_txn_with_schema(validated.table_name())?;
+        // HALFVEC 列の kNN は実行時と同じ全走査ソートの scan 経路へ写し、EXPLAIN も同じ計画を返す
+        // （通常文との束縛・エラー契約の共有。Issue #2015・TABLE-46）。
+        if let Some(scan) = crate::sql::halfvec_knn::halfvec_select_as_scan(
+            validated,
+            &schema,
+            session.search_mode(),
+            &crate::sql::parser::LiteralSkip::NONE,
+        )? {
+            return self.run_relational_explain_scan(&scan, session);
+        }
         let bound = crate::sql::parser::bind_in_session_with_limits(
             validated,
             &schema,

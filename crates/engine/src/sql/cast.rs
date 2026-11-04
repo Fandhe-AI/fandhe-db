@@ -832,6 +832,26 @@ pub(crate) fn parse_halfvec_cast_type(
     Ok(Some(dim))
 }
 
+/// f32 列を f16 へ丸め、f32 へ戻した最短表記の正規テキスト `[a,b,...]` を作る（空白なし）。
+/// [`fold_halfvec_literal`] の出力と、`sql::parser` の長さ上限の例外判定（正規形かどうかの照合）が
+/// 共有する単一実装。丸め後の表記は入力より長くなりうる（例: `0.1` -> `0.099975586`）ため、
+/// 再解析側（`parse_vector_literal_any_dim`）は 64 KiB 超でもこの正規形に限り上限を緩める。
+pub(crate) fn canonical_halfvec_text(values: &[f32]) -> Result<String, SqlSurfaceError> {
+    let rounded = crate::sql::exec::round_to_halfvec_f32(values)?;
+    let mut text = String::new();
+    text.try_reserve(rounded.len().saturating_mul(12).saturating_add(2))
+        .map_err(|_| SqlSurfaceError::payload_too_large("halfvec literal exceeds memory"))?;
+    text.push('[');
+    for (i, v) in rounded.iter().enumerate() {
+        if i > 0 {
+            text.push(',');
+        }
+        text.push_str(&v.to_string());
+    }
+    text.push(']');
+    Ok(text)
+}
+
 /// `'<ベクトルリテラル>'::halfvec[(N)]` を畳み込む（Issue #2015・TABLE-46）。被演算子が文字列リテラルの
 /// ときだけ受理し、検証（形式・有限性・長さ上限・修飾子との次元照合）→ f16 への丸め → f32 へ戻した
 /// 最短表記のテキスト `[a,b,...]` を文字列リテラルとして返す。丸め済みの表記は再解析しても同じ値に
@@ -856,18 +876,7 @@ pub(crate) fn fold_halfvec_literal(
             "halfvec must have at least 1 dimension",
         ));
     }
-    let rounded = crate::sql::exec::round_to_halfvec_f32(&values)?;
-    let mut text = String::new();
-    text.try_reserve(rounded.len().saturating_mul(12).saturating_add(2))
-        .map_err(|_| SqlSurfaceError::payload_too_large("halfvec literal exceeds memory"))?;
-    text.push('[');
-    for (i, v) in rounded.iter().enumerate() {
-        if i > 0 {
-            text.push(',');
-        }
-        text.push_str(&v.to_string());
-    }
-    text.push(']');
+    let text = canonical_halfvec_text(&values)?;
     Ok(Expr::String(text))
 }
 
@@ -1876,5 +1885,33 @@ mod tests {
         assert_eq!(fold("[]", None).unwrap_err().wire_code(), "22000");
         let col = fold_halfvec_literal(Expr::Ident("c".to_string()), None).unwrap_err();
         assert_eq!(col.wire_code(), "0A000");
+    }
+
+    /// 丸め後に 64 KiB を超える畳み込み結果も、距離関数・INSERT 側の再解析で拒否されない。
+    #[test]
+    fn halfvec_folded_text_over_64kib_is_reparsable() {
+        let n = 6000;
+        let input = format!("[{}]", vec!["0.1"; n].join(","));
+        assert!(input.len() < 64 * 1024);
+        let Expr::String(once) = fold_halfvec_literal(Expr::String(input), None).unwrap() else {
+            panic!("string expected");
+        };
+        assert!(once.len() > 64 * 1024);
+        let values = crate::sql::parser::parse_vector_literal(&once, n as u32).unwrap();
+        assert_eq!(values.len(), n);
+        let Expr::String(twice) =
+            fold_halfvec_literal(Expr::String(once.clone()), Some(n as u32)).unwrap()
+        else {
+            panic!("string expected");
+        };
+        assert_eq!(once, twice);
+        // 正規形でない 64 KiB 超の入力は従来どおり拒否する。
+        let big = format!("[{}]", vec!["0.1"; 20000].join(","));
+        assert_eq!(
+            crate::sql::parser::parse_vector_literal_any_dim(&big)
+                .unwrap_err()
+                .wire_code(),
+            "54000"
+        );
     }
 }
