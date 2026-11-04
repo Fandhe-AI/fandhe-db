@@ -30,6 +30,12 @@ use std::fmt;
 
 use crate::search_order;
 
+mod int8;
+pub use int8::{
+    int8_cosine_distance, int8_dot, int8_l2_distance, int8_l2_sq, int8_negative_inner_product,
+    int8_top_k, Int8Metric, Int8SearchInput,
+};
+
 mod bit;
 pub use bit::{bit_top_k, hamming_distance, jaccard_distance, BitMetric, BitSearchInput};
 
