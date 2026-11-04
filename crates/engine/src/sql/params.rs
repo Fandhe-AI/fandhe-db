@@ -2255,17 +2255,37 @@ pub fn where_distance_ast_order(tokens: &[Token]) -> Vec<usize> {
         if consumed.get(ord).copied().unwrap_or(false) {
             continue;
         }
-        let Some(parts) = distance_parts(region, pos) else {
+        let Some((parts, lhs_end)) = distance_parts(region, pos) else {
             return Vec::new();
         };
+        // 左辺式に含まれる距離式（`(v <-> $1) + (v <-> '[0,0]')` のように複数ありうる）。複製の
+        // たびに全件がトークン順のまま AST に現れる。
+        let lhs_ops: Vec<usize> = ops
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| **p >= pos && **p < lhs_end)
+            .map(|(o, _)| o)
+            .collect();
+        for &o in &lhs_ops {
+            // 左辺内の距離式は右被演算子が単一トークンであること（位置を追える形）。
+            let Some(&p) = ops.get(o) else {
+                return Vec::new();
+            };
+            if !operand_is_single(region, p) {
+                return Vec::new();
+            }
+            if let Some(slot) = consumed.get_mut(o) {
+                *slot = true;
+            }
+        }
         for (lo, hi) in parts {
-            order.push(ord);
+            order.extend(lhs_ops.iter().copied());
             for (inner_ord, &inner_pos) in ops.iter().enumerate() {
                 if inner_pos < lo || inner_pos >= hi {
                     continue;
                 }
                 // 境界・要素内の距離式自身が更に複製される形は追えない。
-                if distance_parts(region, inner_pos).is_none_or(|p| p.len() != 1) {
+                if distance_parts(region, inner_pos).is_none_or(|(p, _)| p.len() != 1) {
                     return Vec::new();
                 }
                 if let Some(slot) = consumed.get_mut(inner_ord) {
@@ -2284,14 +2304,12 @@ pub fn where_distance_ast_order(tokens: &[Token]) -> Vec<usize> {
 /// つながる左辺式と、それを包む閉じ括弧（`(v <-> $1) BETWEEN ...`）を読み飛ばして後置語
 /// （`[NOT] BETWEEN` は 2・`[NOT] IN (...)` は要素数）を探す。比較演算子・キーワード・被演算子の連続など
 /// 左辺の終端に当たれば 1 個。確定できない形（副問い合わせ・空リスト・右被演算子が単一トークンでない）は `None`。
-fn distance_parts(region: &[Token], i: usize) -> Option<Vec<(usize, usize)>> {
+fn distance_parts(region: &[Token], i: usize) -> Option<(Vec<(usize, usize)>, usize)> {
     let is_word = |t: Option<&Token>, k: &str| matches!(t, Some(Token::Ident(w)) if w.eq_ignore_ascii_case(k));
     // 右被演算子が単一トークンでない形は位置を追えない。
-    match i.checked_add(1).and_then(|n| region.get(n)) {
-        Some(Token::Param(_) | Token::Ident(_) | Token::StringLiteral(_)) => {}
-        _ => return None,
+    if !operand_is_single(region, i) {
+        return None;
     }
-    let single = || Some(vec![(0, 0)]);
     let mut k = i.saturating_add(2);
     // 距離式を含む左辺式の末尾を探す。`d` は走査中に開いた括弧の深さ（0 の `)` は外側の括弧を閉じる）。
     let mut d: usize = 0;
@@ -2301,7 +2319,7 @@ fn distance_parts(region: &[Token], i: usize) -> Option<Vec<(usize, usize)>> {
             match t {
                 Token::Punct('(') => d = d.saturating_add(1),
                 Token::Punct(')') => d = d.saturating_sub(1),
-                Token::DistanceOp(_) => return None,
+                // 括弧内の別の距離式も左辺式の一部（呼び出し側が左辺内の全距離式を追う）。
                 _ => {}
             }
             if d == 0 {
@@ -2323,23 +2341,31 @@ fn distance_parts(region: &[Token], i: usize) -> Option<Vec<(usize, usize)>> {
                 }
                 let word = region.get(w);
                 if is_word(word, "BETWEEN") {
-                    return between_parts(region, w.saturating_add(1));
+                    return between_parts(region, w.saturating_add(1)).map(|p| (p, k));
                 }
                 if is_word(word, "IN") {
-                    return in_list_parts(region, w.saturating_add(1));
+                    return in_list_parts(region, w.saturating_add(1)).map(|p| (p, k));
                 }
-                return single();
+                return Some((vec![(0, 0)], k));
             }
             Token::Number(_) | Token::Param(_) | Token::StringLiteral(_) | Token::Ident(_)
                 if expect_operand =>
             {
                 expect_operand = false;
             }
-            _ => return single(),
+            _ => return Some((vec![(0, 0)], k)),
         }
         k = k.saturating_add(1);
     }
-    single()
+    Some((vec![(0, 0)], k))
+}
+
+/// `region[i]`（距離演算子）の右被演算子が単一トークン（`$n`・識別子・文字列）か。
+fn operand_is_single(region: &[Token], i: usize) -> bool {
+    matches!(
+        i.checked_add(1).and_then(|n| region.get(n)),
+        Some(Token::Param(_) | Token::Ident(_) | Token::StringLiteral(_))
+    )
 }
 
 /// `BETWEEN` の直後（`from`）から `<下限> AND <上限>` を読み、部分 2 個を返す。第 1 部分は下限の範囲

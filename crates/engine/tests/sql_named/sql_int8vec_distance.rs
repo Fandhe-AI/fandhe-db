@@ -994,6 +994,11 @@ fn describe_accepts_placeholder_in_between_and_in() {
         "SELECT id FROM t WHERE v <-> $1 IN (v <-> '[0,0]', 2) ORDER BY id LIMIT 3",
         "SELECT id FROM t WHERE v <-> $1 IN (1, v <-> '[0,0]') ORDER BY id LIMIT 3",
         "SELECT id FROM t WHERE v <-> '[0,0]' BETWEEN (v <-> $1) AND 10 ORDER BY id LIMIT 3",
+        // PR #2956 指摘: 複製される左辺式に複数の距離式があっても全距離式の仮値を置換する。
+        "SELECT id FROM t WHERE ((v <-> $1) + (v <-> '[0,0]')) BETWEEN 0 AND 10 ORDER BY id",
+        "SELECT id FROM t WHERE ((v <-> '[0,0]') + (v <-> $1)) NOT BETWEEN 0 AND 10 ORDER BY id",
+        "SELECT id FROM t WHERE ((v <-> $1) + (v <-> $2)) IN (1, 2) ORDER BY id",
+        "SELECT id FROM t WHERE ((v <-> $1) + (v <-> '[0,0]')) BETWEEN (v <-> $2) AND 10 ORDER BY id",
         // PR #2956 指摘: Aggregate の WHERE の `$n` 仮値。
         "SELECT count(*) FROM t WHERE v <-> $1 < 5",
     ] {
