@@ -4841,13 +4841,13 @@ pub(crate) fn bind_set_assignments(
                     "column {name:?} expects a vector literal, got a non-vector literal"
                 )))
             }
-            // `VECTOR` 列は `nullable` の値に関わらず常に必須として扱う
-            // （`wire-server::http::query::insert::bind_row` の既存契約と同じ
-            // 判断。Issue #889 レビュー指摘対応・PR #1014）。
+            // 明示 NULL（Issue #2042・TABLE-26 (2)(3)）: nullable な VECTOR 列は `Value::Null`
+            // （書き込み層が空 embedding として保存する）、NOT NULL は `23502`。
+            (ColumnType::Vector(_), InsertLiteral::Null) if column.nullable => {
+                crate::row_codec::Value::Null
+            }
             (ColumnType::Vector(_), InsertLiteral::Null) => {
-                return Err(SqlSurfaceError::invalid_input(format!(
-                    "column {name:?} is a VECTOR column and cannot be set to NULL"
-                )))
+                return Err(SqlSurfaceError::not_null_violation(name.clone()))
             }
             (
                 ColumnType::Text | ColumnType::Varchar(_) | ColumnType::Bpchar(_),
@@ -6646,7 +6646,7 @@ fn bind_upsert_assignments(
                     // `InsertLiteral::Null` は `ON CONFLICT ... DO UPDATE SET col = NULL`
                     // （Issue #1524・SQL-41）から到達する。明示 NULL の確定契約
                     // （TABLE-16）に従い、nullable 列は `Value::Null`、それ以外は
-                    // `23502`（VECTOR 列も現状 non-nullable のためここで `23502`）。
+                    // `23502`（VECTOR 列も同じ規則。Issue #2042）。
                     (_, InsertLiteral::Null) if column.nullable => crate::row_codec::Value::Null,
                     (_, InsertLiteral::Null) => {
                         return Err(SqlSurfaceError::not_null_violation(name.clone()))
@@ -14066,7 +14066,7 @@ mod tests {
     }
 
     /// `SET <col> = NULL`（Issue #1524・SQL-41）: nullable 列は `Value::Null`、
-    /// 非 nullable 列は `23502`、VECTOR 列は現行どおり `22000`（TABLE-26 の対象外）。
+    /// 非 nullable 列（VECTOR を含む）は `23502`、nullable な VECTOR 列は `Value::Null`（Issue #2042）。
     #[test]
     fn binds_update_set_null_by_column_nullability() {
         let bound = bind_update_sql(
@@ -14083,7 +14083,7 @@ mod tests {
             "UPDATE documents SET embedding = NULL WHERE id = 1 USING OPERATION_ID 'op-0001'",
         )
         .unwrap_err();
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "23502");
     }
 
     /// 述語形・分割実行が共有する束縛でも同じ検査が効く（Issue #1524）。

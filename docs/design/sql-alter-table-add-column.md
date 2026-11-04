@@ -136,7 +136,7 @@ execute_alter_table_add_column`）が権限ゲート通過後に行う。
 ### `VECTOR` 列を保留した理由
 
 `VECTOR(N)` は構文としては受理するが、実行段で常に `0A000`
-（`SqlSurfaceError::FeatureNotSupported`）として拒否する。既存行が埋め込みバイトを
+（`SqlSurfaceError::FeatureNotSupported`）として拒否していた（**Issue #2042 で解禁**。下の追記参照）。既存行が埋め込みバイトを
 持たないテーブルへ `VECTOR` 列を追加した場合の挙動——`VectorArena` の構築・KNN・
 HNSW 各経路が「埋め込み列を持つがバイトを一切持たない既存行」を安全に扱えるか——を
 本 Issue の実装時点では検証していない。受け入れ基準の「既存行が NULL として読める」
@@ -271,8 +271,16 @@ wire 応答は pg 互換の `CommandComplete` タグ `ALTER TABLE`（件数を�
 - 制約（`PRIMARY KEY`・`UNIQUE`・`CHECK`・`REFERENCES` 等）: #903・#905〜#907
 - NoSQL 表層の DDL op: #910
 - 配列型の DDL 表記: Issue #1348 で対応済み
-- `VECTOR` 列の `ADD COLUMN` 解禁: 検証を伴う後続作業（本ドキュメント「`VECTOR` 列を
-  保留した理由」参照）
+- `VECTOR` 列の `ADD COLUMN` 解禁: Issue #2042 で対応済み（下の追記参照）
+
+## Issue #2042 追記（TABLE-26 (4)）: nullable な VECTOR 列の ADD COLUMN
+
+NULL 許容 VECTOR 列の導入に合わせ、`ALTER TABLE ... ADD COLUMN v VECTOR(n)` を受理する。
+列は nullable として追加し、既存行の embedding スロットは空（`dim == 0`）のまま NULL として読む
+（カタログだけを書き換える O(1) の操作）。`NOT NULL` 付きは `DEFAULT` を持てないため既存の
+`NOT NULL` ADD COLUMN と同じ規則で `42601`、表が既に VECTOR 列を持つ場合（2 本目）は TABLE-1 の
+既存エラー（`42601`）のまま。NULL 行を含む表の kNN は #2043 までの過渡措置として `0A000` で
+拒否する（「保留した理由」の安全性懸念は、この過渡措置と #2043 の除外で解消する）。
 
 ## Issue #1633 追記（TABLE-36）: IF NOT EXISTS
 

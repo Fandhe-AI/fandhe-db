@@ -22,6 +22,8 @@
 
 ### Added
 
+- `VECTOR` 列の NULL を保存できるようにした（Issue #2042・TABLE-26 (1)〜(4) ポインタ）。`CREATE TABLE` の `VECTOR(n)` は `NOT NULL` を付けなければ nullable（従来は常に非 nullable）、CTAS の VECTOR 列も nullable になる。nullable な列は INSERT の省略・明示 `NULL`・`UPDATE SET v = NULL` を受理し、空 embedding として保存して NULL として読む。`NOT NULL` の列は同じ操作が `23502`（従来の `22000` から変更）。`ALTER TABLE ADD COLUMN v VECTOR(n)`（表に VECTOR 列が無い場合。`NOT NULL` 付きは `42601`）と `ALTER COLUMN DROP NOT NULL`（VECTOR 列）を受理する。`SET NOT NULL`（VECTOR 列）は従来どおり拒否。NoSQL の `create_table` は VECTOR 列の `nullable: true` を受理し、`insert` の `null`・省略は nullable 列で NULL になる。カタログの列行は VECTOR 列の nullable を `2` で書く（版は上げない）。改訂前の表の VECTOR 列（`1`）は NOT NULL として読むため既存表の挙動は変わらない。旧バイナリは `2` を拒否する（前方互換なし）。NULL 行を含む表の kNN は #2043 まで `0A000` で拒否する。
+  BREAKING CHANGE: 新規作成する表の VECTOR 列が既定で nullable になり、VECTOR 列への NULL の拒否コードが `22000` から `23502` に変わる。
 - セッション変数 `hnsw.ef_search` の `SET`／`SHOW`／`RESET` を追加した（Issue #2030・SQL-73 ポインタ）。範囲は 1〜1000（範囲外は `22023`、`SET LOCAL` は `0A000`）、未設定時は構築時の値（既定 64）。非ハイブリッドの HNSW 探索と EXPLAIN の `hnsw_params:` 行にだけ効き、厳密走査・ハイブリッドの結果と `USING MODE` は変えない。
   BREAKING CHANGE: 公開 enum `Statement` に `SetHnswEfSearch`・`ShowHnswEfSearch`、`SqlOutcome` に `SetHnswEfSearch` を追加し、公開 enum `HnswEfSearchSetting` を新設した（網羅的 `match` の下流は追随が必要）。
 - `CREATE INDEX ... USING hnsw (col) WITH (m = n, ef_construction = n)` を追加した（Issue #2029・SQL-33 (5) ポインタ）。`m` は 2〜100、`ef_construction` は 4〜1000 かつ `2 * m` 以上（省略したキーは pgvector の既定 16／64 で補う）。範囲外・未知/重複キー・整数でない値は `22023`、btree／gin への `WITH` と引用符付きの値は `0A000`、構文の不整合は `42601`。値はカタログ版 `v10` に永続化し、宣言した値で HNSW グラフを構築する（`ef_search` は従来どおり provider の値）。`EXPLAIN` の `hnsw_params:` も宣言の値を出す。`WITH` 省略の宣言は従来の `v1`／`v9` のままで挙動もバイト列も変わらない。挙動の変化: HNSW 宣言の `WITH (...)` は従来 `42601` だったが受理に変わる。旧バイナリは `v10` を未知の版として拒否する（前方互換なし）。

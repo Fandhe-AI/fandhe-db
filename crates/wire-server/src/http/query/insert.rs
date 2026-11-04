@@ -52,7 +52,7 @@
 
 use std::fmt::Write as _;
 
-use engine::catalog::{ColumnType, TableSchema};
+use engine::catalog::TableSchema;
 use engine::core::EngineCore;
 use engine::error_format::{ClassifiedError, ErrorClass};
 use engine::json::JsonValue;
@@ -146,10 +146,9 @@ impl ClassifiedError for InsertError {
 /// `InsertError::Shape`）から `schema` の列順に対応する `Vec<Value>` と行キー
 /// `id` を取り出す。`sql::parser::bind_insert` の束縛規則を JSON 入力向けに
 /// 焼き直したもので、束縛結果の意味（未知列・型不一致は `22000`、非 nullable
-/// 列欠落は `23502`。`VECTOR` 列のみ `nullable` の値に関わらず必須という
-/// NoSQL 表層固有の制約が上乗せされ、`nullable = false` なら `23502`・
-/// `nullable = true` なら `22000` に分岐する。TABLE-16・TASK-204、
-/// Issue #904 レビュー指摘）は SQL 表層と同一に保つ。
+/// 列欠落は `23502`。`VECTOR` 列も同じで、nullable なら省略・`null`
+/// ともに NULL として受理する。TABLE-16・TASK-204、Issue #904、Issue #2042）は
+/// SQL 表層と同一に保つ。
 ///
 /// untrusted な列名・値をエラー文言へ埋め込まない（JSON 文字列はバックスラッシュ
 /// `\u0000` エスケープ経由で NUL を含み得るため、`error_response::encode` の NUL
@@ -240,23 +239,11 @@ fn bind_row(
                 "INSERT row references an unknown column",
             )));
         };
-        // JSON `null` の扱い（TABLE-16・TASK-204、Issue #904 D5）: `VECTOR` 列は
-        // 引き続き列を省略する契約のまま維持する（`VECTOR` は
-        // `tenant::insert_typed_rows_unchecked` の既存契約により `nullable` の
-        // 値に関わらず常に必須で、下の「VECTOR 列は常に必須」ループが
-        // `nullable = false` なら `23502`・`nullable = true` なら `22000` で
-        // 拒否する〔レビュー指摘・Issue #904: SQL 表層〔`fill_omitted_columns`〕
-        // との `wire_code` パリティのため非 nullable 側のみ `23502` へ分岐〕。
-        // TABLE-16 の `DEFAULT`／`NOT NULL` は `VECTOR` に適用できないため
-        // 対象外）。それ以外の列は `InsertLiteral::Null` を
-        // そのまま `bind_insert` へ渡し、「省略」（`DEFAULT` 適用対象）と
-        // 「明示 NULL」（`DEFAULT` を適用せず nullable なら NULL・非 nullable
-        // なら `23502`）を区別する（TABLE-16 の確定契約。NOSQL-17 束縛表
-        // 「null の扱い」節参照）。
+        // JSON `null` の扱い（TABLE-16・TASK-204、Issue #904 D5。VECTOR 列も同じ。Issue #2042・
+        // TABLE-26 (2)(3)）: `InsertLiteral::Null` をそのまま `bind_insert` へ渡し、「省略」
+        // （`DEFAULT` 適用対象）と「明示 NULL」（`DEFAULT` を適用せず nullable なら NULL・
+        // 非 nullable なら `23502`）を区別する（NOSQL-17 束縛表「null の扱い」節参照）。
         if matches!(raw, JsonValue::Null) {
-            if matches!(column.ty, ColumnType::Vector(_)) {
-                continue;
-            }
             columns.push(key.clone());
             literals.push(engine::sql::allowlist::InsertLiteral::Null);
             continue;
@@ -266,34 +253,8 @@ fn bind_row(
         literals.push(literal);
     }
 
-    // `VECTOR` 列は `nullable` の値に関わらず常に必須として扱う
-    // （`tenant::insert_typed_rows_unchecked` の既存契約。上の JSON `null` 省略
-    // 経路と合流させることで、明示 `null`・値の丸ごと省略のいずれも同じ
-    // 「値が提供されていない」拒否になる。PR #823 レビュー指摘の非対称解消を
-    // 引き続き維持する）。
-    //
-    // `wire_code` の分岐（TABLE-16・TASK-204、Issue #904 レビュー指摘）: 対象列が
-    // `nullable == false` の場合、SQL 表層の同一操作（`fill_omitted_columns`
-    // 経由。`ColumnType::Vector` に `DEFAULT` は付けられないため常に
-    // `column.default_expr.is_none()`）は `23502`（`NotNullViolation`）を返す。
-    // NoSQL 表層だけが `22000` のまま据え置くと表層間で `wire_code` が食い違う
-    // ため、非 nullable な VECTOR 列に限り SQL 表層と同じ `NotNullViolation`
-    // へ写像する。`nullable == true` な VECTOR 列の省略拒否（PR #823 が導入した
-    // 「VECTOR は nullable でも常に必須」という NoSQL 表層固有の制約。NOT NULL
-    // 違反ではない）は従来どおり `22000` のまま変更しない。
-    for column in &schema.columns {
-        if matches!(column.ty, ColumnType::Vector(_)) && !columns.iter().any(|c| c == &column.name)
-        {
-            if !column.nullable {
-                return Err(InsertError::Bind(SqlSurfaceError::NotNullViolation {
-                    column: column.name.clone(),
-                }));
-            }
-            return Err(InsertError::Bind(invalid_input_error(
-                "INSERT row is missing a value for a required column",
-            )));
-        }
-    }
+    // 省略された列（VECTOR 列を含む）の補完は `bind_insert_identity` が SQL 表層と同じ規則で行う
+    // （nullable なら NULL、非 nullable で既定値なしなら `23502`。Issue #2042・TABLE-26 (2)）。
 
     let validated = ValidatedInsert {
         table_name: table.to_string(),
@@ -482,7 +443,7 @@ pub fn handle(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use engine::catalog::{ColumnDef, TableSchema};
+    use engine::catalog::{ColumnDef, ColumnType, TableSchema};
     use engine::json::parse_json;
     use engine::kernel::CpuScalarProvider;
     use engine::policy::PolicyContext;
@@ -686,10 +647,8 @@ mod tests {
         assert_eq!(err.wire_code(), "22000");
     }
 
-    // P2（nullable VECTOR 列省略時の bind/exec 非対称。PR #823 レビュー指摘対応）:
-    // 明示 `null` は既存の `match` で拒否されるが、省略時も同じく `22000` で
-    // 拒否されることを固定する（`tenant::insert_typed_rows_unchecked` が
-    // VECTOR 列を無条件必須として扱う実行層の契約に bind 層を合わせる）。
+    // nullable な VECTOR 列は省略・明示 `null` ともに NULL として受理する
+    // （Issue #2042・TABLE-26 (2)。旧契約「VECTOR は nullable でも常に必須」〔PR #823〕の置換）。
     fn schema_with_nullable_vector() -> TableSchema {
         TableSchema::new(
             "docs_nullable_vec",
@@ -701,29 +660,29 @@ mod tests {
     }
 
     #[test]
-    fn bind_rows_rejects_omitted_nullable_vector_column() {
+    fn bind_rows_accepts_omitted_nullable_vector_column_as_null() {
         let items = rows_from(r#"[{"id":1,"lang":"ja"}]"#);
-        let err = bind_rows(
+        let bounds = bind_rows(
             &items,
             "docs_nullable_vec",
             None,
             &schema_with_nullable_vector(),
         )
-        .expect_err("must reject");
-        assert_eq!(err.wire_code(), "22000");
+        .expect("nullable VECTOR omission must bind");
+        assert!(matches!(bounds[0].values[0], Value::Null));
     }
 
     #[test]
-    fn bind_rows_rejects_explicit_null_vector_column() {
+    fn bind_rows_accepts_explicit_null_on_nullable_vector_column() {
         let items = rows_from(r#"[{"id":1,"embedding":null,"lang":"ja"}]"#);
-        let err = bind_rows(
+        let bounds = bind_rows(
             &items,
             "docs_nullable_vec",
             None,
             &schema_with_nullable_vector(),
         )
-        .expect_err("must reject");
-        assert_eq!(err.wire_code(), "22000");
+        .expect("nullable VECTOR null must bind");
+        assert!(matches!(bounds[0].values[0], Value::Null));
     }
 
     #[test]

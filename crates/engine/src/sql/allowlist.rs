@@ -16287,8 +16287,8 @@ impl<'a> Parser<'a> {
         let unique = constraints.unique;
         let unique_name = constraints.unique_name.clone();
         let column = if let ColumnType::Vector(_) = ty {
-            // `VECTOR` は常に非 nullable。`NOT NULL` の明示指定は冗長だが受理する
-            // （`constraints.not_null` の値に関わらず `nullable = false` のまま）。
+            // `VECTOR` も他の型と同じく、`NOT NULL` を指定しなければ nullable
+            // （Issue #2042・TABLE-26 (1)）。NULL は空 embedding として保存される。
             if constraints.default.is_some() || constraints.time_default.is_some() {
                 return Err(SqlSurfaceError::unsupported(format!(
                     "column {name:?}: VECTOR columns do not support DEFAULT"
@@ -16299,7 +16299,7 @@ impl<'a> Parser<'a> {
                     "column {name:?}: VECTOR columns do not support UNIQUE"
                 )));
             }
-            let mut column = ColumnDef::new(name, ty, false);
+            let mut column = ColumnDef::new(name, ty, !constraints.not_null);
             // 照合は付与だけ行い、型への適用可否は実行段（`sql::ddl`）が `42804` で判定する。
             column.collation = constraints.collation;
             column

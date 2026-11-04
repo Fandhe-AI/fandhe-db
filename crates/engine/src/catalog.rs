@@ -8747,6 +8747,11 @@ impl TableSchema {
                 "table has no VECTOR column".to_string(),
             ));
         }
+        // nullable な `VECTOR` 列の NULL は空 embedding（`dim == 0`）で保存する
+        // （Issue #2042・TABLE-26）。`dim != 0` の不一致は従来どおり拒否する。
+        if dim == 0 && self.columns.iter().any(|c| c.ty.is_vector() && c.nullable) {
+            return Ok(());
+        }
         self.validate_embedding_dim(dim)
     }
 }
@@ -10224,6 +10229,35 @@ fn validate_primary_key(schema: &TableSchema, pk_cols: &[String]) -> Result<()> 
     Ok(())
 }
 
+/// 列行の nullable フィールドの文字列（Issue #2042・TABLE-26 (1) のポインタ）。
+/// 通常列は `0`（NOT NULL）／`1`（nullable）。VECTOR 列だけ nullable を `2` で書く。
+/// 改訂前の VECTOR 列は nullable フラグが `1` でも書き込み層が必須として扱っていたため、
+/// decode 側は VECTOR の `1` を NOT NULL と読み（[`decode_nullable_field`]）、
+/// 新たに NULL を許す VECTOR 列だけを `2` で区別する（カタログ版は上げない）。
+fn nullable_field_for(type_name: &str, nullable: bool) -> &'static str {
+    match (type_name == "vector", nullable) {
+        (true, true) => "2",
+        (_, true) => "1",
+        (_, false) => "0",
+    }
+}
+
+/// 列行の nullable フィールドを読む（[`nullable_field_for`] の逆）。VECTOR 列の `1` は
+/// 旧表の印として NOT NULL に読み、`2` は nullable。VECTOR 以外の `2` や未知の値は
+/// fail-closed に拒否する（旧バイナリが `2` を拒否するのも同じ方針）。
+fn decode_nullable_field(ty: &ColumnType, field: &str) -> Result<bool> {
+    let is_vector = matches!(ty, ColumnType::Vector(_));
+    match (field, is_vector) {
+        ("0", _) => Ok(false),
+        ("1", false) => Ok(true),
+        ("1", true) => Ok(false),
+        ("2", true) => Ok(true),
+        (other, _) => Err(CatalogError::Invalid(format!(
+            "malformed nullable field: {other:?}"
+        ))),
+    }
+}
+
 /// 1 列ぶんのカタログ行（`name:tag:param:nullable\n`）を組み立てる。`param` は
 /// [`validate_catalog_param`] を通してから連結する（encode 側の fail-closed。
 /// TABLE-6・codex-review 指摘 PR #999。`catalog_fields` はここまで型定義側の
@@ -10240,7 +10274,7 @@ fn encode_column_line(
     nullable: bool,
 ) -> Result<String> {
     validate_catalog_param(param_field)?;
-    let nullable_field = if nullable { "1" } else { "0" };
+    let nullable_field = nullable_field_for(type_name, nullable);
     Ok(format!(
         "{name}:{type_name}:{param_field}:{nullable_field}\n"
     ))
@@ -10256,7 +10290,7 @@ fn encode_column_line_v3(
     state: char,
 ) -> Result<String> {
     validate_catalog_param(param_field)?;
-    let nullable_field = if nullable { "1" } else { "0" };
+    let nullable_field = nullable_field_for(type_name, nullable);
     Ok(format!(
         "{name}:{type_name}:{param_field}:{nullable_field}:{state}\n"
     ))
@@ -10274,7 +10308,7 @@ fn encode_column_line_v5(
     default: Option<&ColumnDefault>,
 ) -> Result<String> {
     validate_catalog_param(param_field)?;
-    let nullable_field = if nullable { "1" } else { "0" };
+    let nullable_field = nullable_field_for(type_name, nullable);
     let default_field = match default {
         None => "-".to_string(),
         Some(d) => d.encode_catalog_field()?,
@@ -11745,15 +11779,7 @@ fn decode_schema_body(
         let (base_param, collation) = split_collation_param(type_name, param_field)?;
         let ty = ColumnType::from_catalog_fields(type_name, base_param, resolve_enum)?;
 
-        let nullable = match nullable_field {
-            "0" => false,
-            "1" => true,
-            other => {
-                return Err(CatalogError::Invalid(format!(
-                    "malformed nullable field: {other:?}"
-                )))
-            }
-        };
+        let nullable = decode_nullable_field(&ty, nullable_field)?;
 
         match state_field {
             None | Some("L") => {
@@ -14266,8 +14292,8 @@ impl Storage {
             }
             if matches!(column.ty, ColumnType::Vector(_)) {
                 // 行コーデックのスカラー走査は VECTOR 列を常に `None` として返すため NULL 検査が
-                // 全行偽陽性になる。NULL 許容 VECTOR は現状作れないが、到達した場合は
-                // fail-closed で拒否する（TABLE-26 の後続 Issue で埋め込み有無の検査へ置換）。
+                // 全行偽陽性になる。既存行の embedding が空かを走査する手段が無いため、
+                // fail-closed で拒否する（Issue #2042 の対象外。TABLE-26 のポインタ）。
                 return Err(CatalogError::Invalid(
                     "SET NOT NULL on a VECTOR column is not supported".to_string(),
                 ));
@@ -14377,11 +14403,6 @@ impl Storage {
             if column.nullable {
                 // 既に nullable。冪等な no-op。
                 return Ok(AlterApply::Unchanged);
-            }
-            if matches!(column.ty, ColumnType::Vector(_)) {
-                return Err(CatalogError::Invalid(
-                    "DROP NOT NULL on a VECTOR column is not supported".to_string(),
-                ));
             }
             // IDENTITY 列の NOT NULL は外せない（PostgreSQL と同じ。TABLE-24・Issue #1695）。
             if column
@@ -20616,6 +20637,62 @@ mod tests {
             encoded,
             b"v2\ncols:3\nembedding:vector:3:0\nbody:text:-:0\ntag:text:-:1\n".to_vec()
         );
+    }
+
+    /// nullable な VECTOR 列は nullable フィールド `2` で往復し、NOT NULL の VECTOR 列と
+    /// 非 VECTOR 列のバイト列は従来のまま（Issue #2042・TABLE-26 (1)）。
+    #[test]
+    fn nullable_vector_column_roundtrips_with_field_two() {
+        let schema = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(3), true),
+                ColumnDef::new("tag", ColumnType::Text, true),
+                ColumnDef::new("body", ColumnType::Text, false),
+            ],
+        );
+        let encoded = encode_schema(&schema).expect("encode should succeed");
+        assert_eq!(
+            encoded,
+            b"v2\ncols:3\nembedding:vector:3:2\ntag:text:-:1\nbody:text:-:0\n".to_vec()
+        );
+        let decoded = decode_schema("docs", &encoded).expect("decode should succeed");
+        assert_eq!(decoded, schema);
+    }
+
+    /// 改訂前の表の VECTOR 列（nullable フィールド `1`）は NOT NULL として読む（挙動を変えない）。
+    /// 再 encode すると正準形 `0` になる。
+    #[test]
+    fn legacy_vector_nullable_one_decodes_as_not_null() {
+        let legacy = b"v2\ncols:2\nembedding:vector:3:1\ntag:text:-:1\n";
+        let decoded = decode_schema("docs", legacy).expect("decode should succeed");
+        let embedding = decoded
+            .columns
+            .iter()
+            .find(|c| c.name == "embedding")
+            .expect("embedding column");
+        assert!(!embedding.nullable);
+        assert!(decoded
+            .columns
+            .iter()
+            .any(|c| c.name == "tag" && c.nullable));
+        let reencoded = encode_schema(&decoded).expect("encode should succeed");
+        assert_eq!(
+            reencoded,
+            b"v2\ncols:2\nembedding:vector:3:0\ntag:text:-:1\n".to_vec()
+        );
+    }
+
+    /// 非 VECTOR 列の nullable フィールド `2` と未知の値は fail-closed に拒否する。
+    #[test]
+    fn non_vector_nullable_field_two_is_rejected() {
+        for bad in ["2", "3", "x", ""] {
+            let bytes = format!("v2\ncols:2\nembedding:vector:3:0\ntag:text:-:{bad}\n");
+            assert!(
+                decode_schema("docs", bytes.as_bytes()).is_err(),
+                "nullable field {bad:?} on a non-VECTOR column must be rejected"
+            );
+        }
     }
 
     /// `VARCHAR(n)`／`CHAR(n)`（TABLE-31・Issue #1563）のカタログ param の往復と golden。

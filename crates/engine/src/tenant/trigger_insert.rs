@@ -101,14 +101,7 @@ pub(super) fn write_rows_with_triggers(
             }
         }
         let embedding: &[f32] = match vector_idx {
-            Some(idx) => match final_row.get(idx) {
-                Some(Value::Vector(v)) => v.as_slice(),
-                _ => {
-                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(
-                        "VECTOR column value missing or not a Vector".to_string(),
-                    )))
-                }
-            },
+            Some(idx) => super::vector_embedding_slice(schema, idx, &final_row)?,
             None => &[],
         };
         schema.validate_row_embedding_dim(embedding.len())?;
