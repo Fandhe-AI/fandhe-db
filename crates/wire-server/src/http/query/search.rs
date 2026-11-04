@@ -14,6 +14,12 @@
 //! `mode` 解決は `engine::sql::parser`／`engine::sql::mode` の既存公開関数へ
 //! 委譲し、束縛規則を wire-server 側に複製しない。
 //!
+//! `vector` 検索の距離意味: SQL `ORDER BY <列> <=> q` と同じコサイン距離
+//! （`1 - cos`）の昇順・同点 id 昇順で、ゼロノルム行は NaN として末尾に並ぶ
+//! （SQL-33・NOSQL-2）。`BoundStatement::new` の既定（`DistanceKind::Cosine`・
+//! 昇順）をそのまま使うため本モジュールに距離分岐は無い。距離種別を選ぶ
+//! `metric` キーは未提供（Issue #2243 の担当）。
+//!
 //! `vector`／`plan` は排他（SQL の `ORDER BY`／`USING PLAN` が構文上
 //! 相互排他なのと対応）。`plan` 指定は LLM 展開（`EngineCore` の private
 //! フィールド `embedder`／`query_planner` 経由の I/O）が必要なため、本
@@ -730,6 +736,12 @@ mod tests {
             panic!("expected BoundSearch::Vector");
         };
         assert!(matches!(stmt.ranking(), Ranking::Distance { .. }));
+        // SQL `<=>` と同じコサイン距離の昇順（SQL-33）。内積（降順）へ退行しない固定。
+        assert_eq!(
+            stmt.distance_kind(),
+            engine::sql::lexer::DistanceKind::Cosine
+        );
+        assert!(!stmt.distance_descending());
         assert_eq!(stmt.limit(), 10);
         assert!(!stmt.rls_predicate_present());
         assert_eq!(stmt.evaluation_order(), EvaluationOrder::DEFAULT);
