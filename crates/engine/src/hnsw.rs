@@ -86,7 +86,8 @@ use std::collections::{BinaryHeap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::Arc;
 
-use self::metric::{finite_score, HnswMetric};
+use self::metric::finite_score;
+pub(crate) use self::metric::{is_cosine_indexable, HnswMetric};
 
 /// 凍結済みグラフの CSR（Compressed Sparse Row）表現（Issue #494）。
 /// [`HnswIndex`] は構築完了後、可変長ビルダー表現（[`GraphBuilder`]）を
@@ -713,9 +714,10 @@ pub enum HnswError {
     /// join したうえで fail-closed に拒否し、部分的に結線された索引を
     /// `Ok` で返さない（モジュール冒頭「失敗契約」参照）。
     WorkerPanicked,
-    /// Cosine metric の構築で、正規化できない行（ゼロノルム・ノルム²のアンダー／
-    /// オーバーフロー）があった（Issue #1998。索引全体を拒否する fail-closed。行の除外は
-    /// #2241 の担当）。ベクトル値は含めない。
+    /// 旧仕様の Cosine 構築で、正規化できない行（ゼロノルム・ノルム²のアンダー／
+    /// オーバーフロー）があった（Issue #1998）。Issue #2241 以降、構築経路はこの variant を
+    /// 返さず、該当行を索引から除外して構築を成功させる（公開 enum のため互換のため残置）。
+    /// ベクトル値は含めない。
     NonNormalizableVector { node: usize },
     /// Cosine metric の探索クエリが正規化できない（ゼロノルム等）。呼び出し元は
     /// brute-force へ縮退する（全行 NaN の結果になる）。
@@ -891,6 +893,17 @@ pub(crate) struct GraphBuilder {
     params: HnswParams,
     nodes: Vec<Node>,
     entry_point: Option<u32>,
+    /// 索引に入れる行（member）の集合。`None` は全行が member（非 Cosine と、除外 0 件の
+    /// Cosine）。`Some` のとき非 member の行は「番号はあるが索引に入っていないノード」で、
+    /// 挿入されず（入辺なし）、entry にならず、修復の対象にもならない（Issue #2241）。
+    members: Option<NodeMask>,
+}
+
+impl GraphBuilder {
+    /// `node` が索引に入る行か（`members == None` なら常に真）。
+    fn is_member(&self, node: u32) -> bool {
+        self.members.as_ref().is_none_or(|m| m.get(node))
+    }
 }
 
 impl Adjacency for GraphBuilder {
@@ -934,6 +947,10 @@ pub struct HnswIndex {
     /// f16 の有限範囲を超える成分により `F32` へ自動縮退した場合、この値は
     /// 要求値と異なる（[`Self::resident_precision`] が返すのは常にこの実効値）。
     resident_precision: ResidentPrecision,
+    /// 索引に入れる行（member）の集合（Issue #2241）。`None` は全行が member。`Some` のとき
+    /// 非 member の行は入辺を持たず、entry にならず、常駐ベクトルは 0 埋めで、どの探索結果にも
+    /// 現れない（Cosine で正規化できない行）。ノード番号は入力行番号のまま詰めない。
+    members: Option<NodeMask>,
 }
 
 /// HNSW 索引ノードの常駐ベクトル本体（Issue #514）。`F32` は既存経路と
@@ -1689,8 +1706,12 @@ impl GraphBuilder {
             // （Issue #449: 毎反復・フェーズ 2 の `(0..len).filter(level_of
             // >= level)` 全走査を層ごとに 1 回へ削減。集合としての内容は
             // 従来の毎回フィルタと同一）。
+            // 非 member（Issue #2241。層 0 でも level 0 を持つ）は修復対象から除く。
+            // 含めると id 昇順チェーンや最近傍候補を通じてグラフへ結線されてしまう。
             let members: Vec<u32> = (0..self.nodes.len() as u32)
-                .filter(|&n| self.level_of(n).map(|l| l >= level).unwrap_or(false))
+                .filter(|&n| {
+                    self.is_member(n) && self.level_of(n).map(|l| l >= level).unwrap_or(false)
+                })
                 .collect();
 
             // フェーズ 1: 全体 BFS ＋ 到達済み全ノードとの `dot` 計算を伴う
@@ -2159,6 +2180,7 @@ impl HnswIndex {
             dim,
             vectors,
             seed,
+            None,
         )
         .map(|(index, _)| index)
     }
@@ -2184,6 +2206,7 @@ impl HnswIndex {
             dim,
             vectors,
             seed,
+            None,
         )
     }
 
@@ -2197,8 +2220,9 @@ impl HnswIndex {
         dim: u32,
         vectors: &[f32],
         seed: u64,
+        members: Option<NodeMask>,
     ) -> Result<Self, HnswError> {
-        Self::build_inner::<false>(metric, params, precision, dim, vectors, seed)
+        Self::build_inner::<false>(metric, params, precision, dim, vectors, seed, members)
             .map(|(index, _)| index)
     }
 
@@ -2223,6 +2247,7 @@ impl HnswIndex {
             dim,
             vectors,
             seed,
+            None,
         )
     }
 
@@ -2235,6 +2260,10 @@ impl HnswIndex {
     /// 併せて返す。`precision` は凍結時（[`Self::freeze_from`]）の索引ノード
     /// 常駐表現にのみ影響し（Issue #514）、グラフ構築（挿入・修復）は精度に
     /// よらず常に f32 で行う。
+    ///
+    /// `members` は索引に入れる行の集合（Issue #2241。`None` は全行）。非 member の行は
+    /// 挿入せず（プレースホルダのノードだけ push する）、レベル割当の乱数だけは全行ぶん
+    /// 順に引く（除外行を末尾に足した入力でも member 部分のグラフがビット同一になる）。
     fn build_inner<const OBSERVE: bool>(
         metric: HnswMetric,
         params: HnswParams,
@@ -2242,6 +2271,7 @@ impl HnswIndex {
         dim: u32,
         vectors: &[f32],
         seed: u64,
+        members: Option<NodeMask>,
     ) -> Result<(Self, HnswRepairStats), HnswError> {
         let dim_usize = dim as usize;
         let n = validate_build_input(&params, dim, vectors)?;
@@ -2256,6 +2286,7 @@ impl HnswIndex {
             params,
             nodes: Vec::with_capacity(n),
             entry_point: None,
+            members,
         };
         if n == 0 {
             let index = Self::freeze_from(builder, dim, owned_vectors, precision)?;
@@ -2272,6 +2303,14 @@ impl HnswIndex {
         for node_idx in 0..n {
             let level = assign_level(&mut rng, params.m);
             let node_id = node_idx as u32; // n <= MAX_HNSW_NODES であることを上で検証済み
+            if !builder.is_member(node_id) {
+                // 除外行: リンクなしのプレースホルダ（番号を詰めないため push は必須）。
+                builder.nodes.push(Node {
+                    level: 0,
+                    links: vec![Vec::new()],
+                });
+                continue;
+            }
             builder.insert_node(node_id, level, dim_usize, vectors, &mut visited)?;
         }
 
@@ -2305,6 +2344,7 @@ impl HnswIndex {
             params,
             nodes,
             entry_point,
+            members,
         } = builder;
         let graph = csr::CsrGraph::from_nodes(&nodes)?;
         // L2・L1 は f16・SQ8 用カーネルが無いので F32 へ縮退する（Issue #1998）。
@@ -2358,6 +2398,7 @@ impl HnswIndex {
             entry_point,
             vectors: node_vectors,
             resident_precision,
+            members,
         })
     }
 
@@ -2404,7 +2445,8 @@ impl HnswIndex {
 
     /// metric 指定の構築入口（Issue #1998・親 #1996。crate 内専用。`threads == 1` は逐次と
     /// 同一経路）。`vectors` は生の行で、Cosine では検証後にここで 1 回だけ正規化し、そのコピーを
-    /// 挿入・修復・凍結のすべてで使う（C2′）。正規化できない行は `NonNormalizableVector`。
+    /// 挿入・修復・凍結のすべてで使う（C2′）。正規化できない行は索引から除外する
+    /// （Issue #2241。構築は成功し、除外行は入辺を持たず結果に現れない）。
     /// 呼び出し元は #2000（SQL 経路の結線）で追加予定。それまでは単体テストのみ。
     #[allow(dead_code, clippy::too_many_arguments)]
     pub(crate) fn build_with_metric(
@@ -2444,18 +2486,22 @@ impl HnswIndex {
         let n = validate_build_input(&params, dim, vectors)?;
         // Cosine は検証後に 1 回だけ正規化し、以降（逐次・並列・修復・凍結）はすべて
         // 正規化済みコピーを使う。
+        // 正規化できない行は構築を拒否せず member から外す（Issue #2241）。
         let normalized;
+        let mut members: Option<NodeMask> = None;
         let vectors = if metric.needs_normalization() {
-            normalized = metric::normalize_rows(vectors, dim as usize)?;
+            let (buf, m) = metric::normalize_rows(vectors, dim as usize)?;
+            normalized = buf;
+            members = m;
             &normalized[..]
         } else {
             vectors
         };
         if threads == 1 || n <= SEQUENTIAL_PREFIX_NODES {
-            return Self::build_impl(metric, params, precision, dim, vectors, seed);
+            return Self::build_impl(metric, params, precision, dim, vectors, seed, members);
         }
         parallel_build::build_parallel_graph(
-            metric, params, precision, dim, vectors, seed, threads, n,
+            metric, params, precision, dim, vectors, seed, threads, n, members,
         )
     }
 
@@ -2607,6 +2653,7 @@ impl HnswIndex {
                 dim,
                 vectors,
                 seed,
+                None,
             );
         }
         let guard = crate::parallel_search::WorkerBudgetGuard::acquire(desired);
@@ -2620,6 +2667,7 @@ impl HnswIndex {
                 dim,
                 vectors,
                 seed,
+                None,
             );
         }
         let result = Self::build_with_threads_impl(
@@ -2763,7 +2811,7 @@ impl HnswIndex {
             let Ok(id) = u32::try_from(idx) else {
                 continue;
             };
-            if !mask.get(id) {
+            if !mask.get(id) || !self.is_member(id) {
                 continue;
             }
             // `idx < node_count()` の範囲であることは上のループ条件が保証する
@@ -2847,7 +2895,14 @@ impl HnswIndex {
     /// のどちらかを招く（`docs/design/hnsw-rls-cardinality-switch.md`
     /// 「Issue #501」節「同期」参照）。
     pub(crate) fn is_mask_fully_reachable_with(&self, mask: &NodeMask, hop: HopMode) -> bool {
-        let target = mask.count_ones();
+        // 非 member（Issue #2241）は入辺が無く到達不能なのが正常なので、数える対象から除く。
+        // 呼び出し元のマスクが非 member を含んでいても「分断」と誤判定しない。
+        let target = match &self.members {
+            None => mask.count_ones(),
+            Some(members) => (0..self.graph.node_count())
+                .filter(|&i| u32::try_from(i).is_ok_and(|id| mask.get(id) && members.get(id)))
+                .count(),
+        };
         if target == 0 {
             return true;
         }
@@ -3211,6 +3266,29 @@ impl HnswIndex {
         Ok(Some(out))
     }
 
+    /// `node` が索引に入っている行か（Issue #2241。`members == None` なら範囲内の全ノード）。
+    /// 範囲外は `false`。`sql::hnsw_cache` の Overlay が除外行を可視マスクから外すのに使う。
+    pub(crate) fn is_member(&self, node: u32) -> bool {
+        match &self.members {
+            None => (node as usize) < self.graph.node_count(),
+            Some(m) => m.get(node),
+        }
+    }
+
+    /// 索引に入っている行数。除外行がなければ [`Self::len`] と同じ。
+    pub(crate) fn member_count(&self) -> usize {
+        match &self.members {
+            None => self.len(),
+            Some(m) => m.count_ones(),
+        }
+    }
+
+    /// この索引が「正規化できない行の除外」規則を持つか（Cosine、または実際に除外行がある）。
+    /// 真のとき、呼び出し元は現在の行が正規化できるかで Overlay を判定する（Issue #2241）。
+    pub(crate) fn excludes_non_normalizable(&self) -> bool {
+        self.metric.needs_normalization() || self.members.is_some()
+    }
+
     /// 索引済みノード `node` の格納ベクトルが `candidate`（呼び出し元のクエリ
     /// スナップショットから取り出した現在の行）と「一致するとみなせるか」を
     /// 判定する（Issue #514・D4）。`sql::hnsw_cache::Overlay::compute` の
@@ -3231,12 +3309,20 @@ impl HnswIndex {
             return None;
         }
         // Cosine の常駐行は正規化済みなので、比較側も同じ関数で正規化する。正規化できない
-        // 行は「変更あり」（保守側）として扱う。
+        // 行（Issue #2241）は索引の除外状態との組で判定する: 除外ノードのまま正規化不可なら
+        // 「変更なし」、member がゼロ化した／除外ノードが非ゼロ化した場合は「変更あり」。
+        // 除外のまま変わらない行を false にすると毎世代 delta／churn に積まれ続ける。
         let normalized_candidate;
         let candidate: &[f32] = if self.metric.needs_normalization() {
             let mut out = vec![0.0_f32; dim];
-            if metric::normalize_into(candidate, &mut out).is_err() {
-                return Some(false);
+            let candidate_ok = metric::normalize_into(candidate, &mut out).is_ok();
+            if (node as usize) >= self.graph.node_count() {
+                return None;
+            }
+            match (self.is_member(node), candidate_ok) {
+                (true, true) => {}
+                (true, false) | (false, true) => return Some(false),
+                (false, false) => return Some(true),
             }
             normalized_candidate = out;
             &normalized_candidate
@@ -4982,6 +5068,7 @@ mod tests {
             params,
             nodes,
             entry_point,
+            members: None,
         };
         HnswIndex::freeze_from(builder, dim, vectors, ResidentPrecision::F32)
             .expect("test fixture nodes must be valid for CSR flattening")
@@ -7906,6 +7993,7 @@ mod tests {
             params,
             nodes: Vec::with_capacity(n),
             entry_point: None,
+            members: None,
         };
         let mut rng = DeterministicRng::new(seed);
         let mut visited = VisitedScratch::default();

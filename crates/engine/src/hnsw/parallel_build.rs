@@ -48,8 +48,8 @@ use std::time::Instant;
 use super::{
     assign_level, compute_shrink, max_degree_for, node_vector, score_of,
     select_neighbors_heuristic_free, DeterministicRng, GraphBuilder, HnswBuildProfile, HnswError,
-    HnswIndex, HnswMetric, HnswParams, HnswWorkerStats, Node, ResidentPrecision, ScoredNode,
-    VisitedScratch,
+    HnswIndex, HnswMetric, HnswParams, HnswWorkerStats, Node, NodeMask, ResidentPrecision,
+    ScoredNode, VisitedScratch,
 };
 
 thread_local! {
@@ -188,6 +188,9 @@ struct BuildGraph {
     levels: Vec<usize>,
     links: Vec<RwLock<Vec<Vec<u32>>>>,
     entry: RwLock<Option<u32>>,
+    /// 索引に入れる行の集合（Issue #2241。`None` は全行）。非 member は挿入せず、entry にも
+    /// しない。`BuildGraph::new` は `None` で作り、構築入口が必要なら構築直後に差し替える。
+    members: Option<NodeMask>,
     /// `true` のとき [`Self::read_links`]／[`Self::write_links`]／
     /// [`Self::try_promote_entry`] が計装（`try_read`/`try_write` → block の
     /// 二段取得・TLS への統計記録）を行う（[`build_parallel_graph_observed`]
@@ -219,8 +222,14 @@ impl BuildGraph {
             levels,
             links,
             entry: RwLock::new(None),
+            members: None,
             observe,
         }
+    }
+
+    /// `node` が索引に入る行か（`members == None` なら常に真）。
+    fn is_member(&self, node: u32) -> bool {
+        self.members.as_ref().is_none_or(|m| m.get(node))
     }
 
     fn node_count(&self) -> usize {
@@ -708,14 +717,29 @@ pub(crate) fn build_parallel_graph(
     seed: u64,
     threads: usize,
     n: usize,
+    members: Option<NodeMask>,
 ) -> Result<HnswIndex, HnswError> {
     let dim_usize = dim as usize;
 
+    // レベルは非 member の行も含めて全行ぶん順に引く（逐次構築と乱数系列を揃える）。
+    // 非 member の行のレベルだけ 0 にする（リンクなしのプレースホルダ。Issue #2241）。
     let mut rng = DeterministicRng::new(seed);
-    let levels: Vec<usize> = (0..n).map(|_| assign_level(&mut rng, params.m)).collect();
+    let levels: Vec<usize> = (0..n)
+        .map(|i| {
+            let level = assign_level(&mut rng, params.m);
+            let member = members
+                .as_ref()
+                .is_none_or(|m| u32::try_from(i).is_ok_and(|id| m.get(id)));
+            if member {
+                level
+            } else {
+                0
+            }
+        })
+        .collect();
 
     let owned_vectors: Arc<[f32]> = Arc::from(vectors);
-    let graph = BuildGraph::new(
+    let mut graph = BuildGraph::new(
         metric,
         params,
         dim_usize,
@@ -723,16 +747,31 @@ pub(crate) fn build_parallel_graph(
         levels,
         false,
     );
+    graph.members = members;
 
-    let prefix_end = super::SEQUENTIAL_PREFIX_NODES.min(n);
+    // 逐次プレフィックスは先頭から `SEQUENTIAL_PREFIX_NODES` 件の member を挿入するまで
+    // 伸ばす（非 member を数えない。entry が必ず member になり、並列フェーズの開始時点で
+    // entry が `None` にならない）。除外が無ければ従来どおり先頭 `min(256, n)` 行。
+    let mut prefix_end = 0usize;
+    let mut prefix_members = 0usize;
+    while prefix_end < n && prefix_members < super::SEQUENTIAL_PREFIX_NODES {
+        if u32::try_from(prefix_end).is_ok_and(|id| graph.is_member(id)) {
+            prefix_members += 1;
+        }
+        prefix_end += 1;
+    }
     let mut seq_visited = VisitedScratch::default();
     for node_idx in 0..prefix_end {
         let node_id = node_idx as u32;
-        if node_idx == 0 {
-            // 最初のノードは近傍探索なしで直ちにエントリポイントになる
+        if !graph.is_member(node_id) {
+            continue;
+        }
+        if graph.entry_snapshot()?.is_none() {
+            // 最初の member は近傍探索なしで直ちにエントリポイントになる
             // （`super::HnswIndex::insert_node` の `entry_point.is_none()`
             // 分岐と同じ挙動）。
-            graph.try_promote_entry(node_id, graph.levels[0])?;
+            let level = graph.levels.get(node_idx).copied().unwrap_or(0);
+            graph.try_promote_entry(node_id, level)?;
             continue;
         }
         insert_node_locked(&graph, node_id, &mut seq_visited)?;
@@ -762,6 +801,9 @@ pub(crate) fn build_parallel_graph(
                         break;
                     }
                     let node_id = i as u32;
+                    if !graph_ref.is_member(node_id) {
+                        continue;
+                    }
                     if let Err(e) = insert_node_locked(graph_ref, node_id, &mut visited) {
                         let mut fe = first_error_ref
                             .lock()
@@ -1018,6 +1060,7 @@ fn assemble_graph(graph: BuildGraph, params: HnswParams) -> Result<GraphBuilder,
         .into_inner()
         .map_err(|_| HnswError::WorkerPanicked)?;
     let levels = graph.levels;
+    let members = graph.members;
     let mut nodes: Vec<Node> = Vec::with_capacity(graph.links.len());
     for (idx, lock) in graph.links.into_iter().enumerate() {
         let links = lock.into_inner().map_err(|_| HnswError::WorkerPanicked)?;
@@ -1030,6 +1073,7 @@ fn assemble_graph(graph: BuildGraph, params: HnswParams) -> Result<GraphBuilder,
         params,
         nodes,
         entry_point,
+        members,
     })
 }
 
