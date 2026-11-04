@@ -203,7 +203,7 @@ embedding 変更は「未変更」と判定されうる。最終スコアは常�
 - `HnswCacheAccess::graph_metric` が問い合わせの引く metric を運ぶ。ゲートが `Targeted` で、
   `hnsw_graph_metric_for`（問い合わせ opclass → `HnswMetric` の唯一の写像）が `Some` を返したときだけ
   `Some`。`None` の prepare 系は `FullScan` を返す（結線漏れでも誤ったグラフを引かない）。
-  写像は挙動を変えない暫定値で、`Cosine -> InnerProduct`、`Ip`・`L2`・`L1` は未対応（`None`）。
+  写像は暫定値で（`<=>` はコサイン距離で実行され、内積グラフの候補を後段でコサイン再採点する）、`Cosine -> InnerProduct`、`Ip`・`L2`・`L1` は未対応（`None`）。
   `catalog::hnsw_supported_metric` との一致は単体テストで固定している。
 - 索引ヒットの再採点は索引の metric の score 関数で行う。現状は内積のみ（`kernel::dot` とビット同一）で、
   それ以外は全走査へ縮退する（delta・全走査が provider の内積 `search` のため）。

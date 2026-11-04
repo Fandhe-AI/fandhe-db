@@ -53,14 +53,14 @@ pub(crate) enum HnswMetric {
     #[default]
     InnerProduct,
     /// L2（二乗距離の符号反転。大きいほど近い）。
-    #[allow(dead_code)]
     // 本番経路の写像（`hnsw_graph_metric_for`）は暫定で InnerProduct のみ。他は単体テストが構築する（#2000）
+    #[allow(dead_code)]
     L2,
     /// コサイン（正規化済み内積への帰着。C2′）。行・クエリは [`normalize_into`] 済みが前提。
-    #[allow(dead_code)] // 同上
+    #[allow(dead_code)] // L2 と同様に単体テストのみが構築する
     Cosine,
     /// L1（マンハッタン距離の符号反転。大きいほど近い）。`<+>` 用。
-    #[allow(dead_code)] // 同上
+    #[allow(dead_code)] // L2 と同様に単体テストのみが構築する
     L1,
 }
 

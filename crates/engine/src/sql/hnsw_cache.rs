@@ -2617,8 +2617,8 @@ fn rescore_indexed_hit(metric: HnswMetric, row: &[f32], query: &[f32]) -> Option
 /// 問い合わせ側 opclass が引く物理 HNSW グラフの metric（世代整合キャッシュのキー。
 /// Issue #2000・親 #1996。ビヘイビア INDEX-7・SQL-33・SQL-75 のポインタ）。
 ///
-/// 写像は挙動を変えない暫定値: 現 main の `<=>` は内積順で実行され、HNSW も内積グラフを
-/// 引くため `Cosine -> InnerProduct`。`Ip`・`L2`・`L1` は SQL 実行側が未接続のため `None`
+/// 写像は暫定値: `<=>` はコサイン距離で実行されるが、HNSW は内積グラフの候補を後段で
+/// 厳密なコサインへ再採点する方式のため `Cosine -> InnerProduct`。`Ip`・`L2`・`L1` は SQL 実行側が未接続のため `None`
 /// （ゲートは `MetricMismatch` となり厳密全走査）。`catalog::hnsw_supported_metric` と
 /// `is_some()` が一致することを単体テストで固定する（catalog は sql に依存しない）。
 /// Cosine を `HnswMetric::Cosine` へ切り替えるのは #2241（ゼロノルム行の除外）と
