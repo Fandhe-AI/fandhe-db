@@ -52,6 +52,52 @@ use crate::hnsw::{HnswParams, ValidatedHnswParams, MAX_EF};
 use crate::kernel::{CandidateHit, KernelError, SearchInput, SearchProvider, SubsetSearchInput};
 use crate::parallel_search::ParallelSearchProvider;
 
+/// `hnsw.iterative_scan` の値（SQL-73・Issue #2033）。pgvector と同じトークン名
+/// （`off`／`relaxed_order`／`strict_order`）で SQL 表層へ公開する。既定は `StrictOrder`
+/// （取りこぼしを避ける側。pgvector の既定 `off` とは異なる）。
+///
+/// `RelaxedOrder` は実装上 `StrictOrder` と同じ動作（出力は常に距離順）で、「順序の小さな
+/// 入れ替わりを許す」契約の範囲に収まる。設定は HNSW を使える kNN の探索経路だけに効き、
+/// 厳密走査とハイブリッドの結果は変えない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HnswIterativeScan {
+    /// 反復しない（k が `ef_search` を超える分は打ち切る）。
+    Off,
+    /// 反復する（順序の入れ替わりを許す契約。現状は `StrictOrder` と同動作）。
+    RelaxedOrder,
+    /// 反復する（距離順を保つ）。
+    #[default]
+    StrictOrder,
+}
+
+impl HnswIterativeScan {
+    /// SQL 表層（`SHOW`・EXPLAIN）に出すトークン名。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HnswIterativeScan::Off => "off",
+            HnswIterativeScan::RelaxedOrder => "relaxed_order",
+            HnswIterativeScan::StrictOrder => "strict_order",
+        }
+    }
+}
+
+/// `hnsw.max_scan_tuples` の既定値（SQL-73・Issue #2033。pgvector と同じ 20,000）。
+pub const DEFAULT_MAX_SCAN_TUPLES: usize = 20_000;
+
+/// セッションの `hnsw.*` 検索設定の束（SQL-73・Issue #2030・#2033）。`None` は「上書きなし」
+/// （構築時の値、または既定値）。`sql::mode::SessionState` が保持し、`core.rs` が検索実行・
+/// EXPLAIN へ渡す。全フィールドが `Copy` のため [`HnswSearchProvider`] に乗せられる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HnswSessionSearch {
+    /// `hnsw.ef_search`（1..=1000 を構文段で検証済み）。
+    pub ef_search: Option<usize>,
+    /// `hnsw.iterative_scan`。
+    pub iterative_scan: Option<HnswIterativeScan>,
+    /// `hnsw.max_scan_tuples`（1..=2,147,483,647 を構文段で検証済み。`core.rs` が SQL-46 の
+    /// 走査行数上限との min を取ってから載せる）。
+    pub max_scan_tuples: Option<usize>,
+}
+
 /// [`crate::search_engine::SearchEngineKind::Hnsw`] が構築する provider。
 ///
 /// [`Self::new`] は [`ValidatedHnswParams`] のみを受け取る。`ValidatedHnswParams` は
@@ -69,6 +115,12 @@ pub struct HnswSearchProvider {
     /// `params.ef_search` を使う。値は SQL 構文段で 1..=1000 を検証済みで、
     /// [`Self::effective_ef`] の `.min(MAX_EF)` が最後の上限になる。
     session_ef_search: Option<usize>,
+    /// セッションの `hnsw.iterative_scan` 上書き値（SQL-73・Issue #2033）。`None` は既定
+    /// （[`HnswIterativeScan::StrictOrder`]）。
+    session_iterative_scan: Option<HnswIterativeScan>,
+    /// セッションの `hnsw.max_scan_tuples`（SQL-73・Issue #2033）。`None` は
+    /// [`DEFAULT_MAX_SCAN_TUPLES`]。
+    session_max_scan_tuples: Option<usize>,
 }
 
 impl HnswSearchProvider {
@@ -79,14 +131,45 @@ impl HnswSearchProvider {
             params,
             fallback: ParallelSearchProvider,
             session_ef_search: None,
+            session_iterative_scan: None,
+            session_max_scan_tuples: None,
         }
     }
 
     /// セッションの `hnsw.ef_search` 上書きを載せた複製を返す（`None` は上書きなし）。
     /// `core.rs` の検索実行が、非ハイブリッドの kNN にだけ接続のセッション値を渡すために呼ぶ。
+    #[cfg(test)]
     pub(crate) fn with_session_ef_search(mut self, ef: Option<usize>) -> Self {
         self.session_ef_search = ef;
         self
+    }
+
+    /// セッションの `hnsw.*` 検索設定（ef_search・iterative_scan・max_scan_tuples）を載せた複製を
+    /// 返す。`core.rs` の検索実行が、非ハイブリッドの kNN にだけ接続のセッション値を渡すために呼ぶ。
+    pub(crate) fn with_session_search(mut self, s: HnswSessionSearch) -> Self {
+        self.session_ef_search = s.ef_search;
+        self.session_iterative_scan = s.iterative_scan;
+        self.session_max_scan_tuples = s.max_scan_tuples;
+        self
+    }
+
+    /// 実効の `hnsw.iterative_scan`（上書きなしは `strict_order`）。`sql::exec` の DISTANCE 段が
+    /// 反復走査・`off` の打ち切りを選ぶために読む。
+    pub(crate) fn iterative_scan(&self) -> HnswIterativeScan {
+        self.session_iterative_scan.unwrap_or_default()
+    }
+
+    /// 実効の `hnsw.max_scan_tuples`（上書きなしは [`DEFAULT_MAX_SCAN_TUPLES`]）。
+    pub(crate) fn max_scan_tuples(&self) -> usize {
+        self.session_max_scan_tuples
+            .unwrap_or(DEFAULT_MAX_SCAN_TUPLES)
+    }
+
+    /// 実効の `ef_search`（`k` を考慮しない値。`iterative_scan = off` の打ち切り上限）。
+    pub(crate) fn effective_ef_search(&self) -> usize {
+        self.session_ef_search
+            .unwrap_or(self.params.ef_search)
+            .min(MAX_EF)
     }
 
     /// 保持している構築パラメータを返す（テスト・診断用）。
@@ -449,6 +532,23 @@ mod tests {
         );
         // 構築時パラメータ自体は変わらない。
         assert_eq!(over.params().ef_search, 10);
+    }
+
+    #[test]
+    fn session_iterative_scan_defaults_and_overrides() {
+        let base =
+            HnswSearchProvider::new(ValidatedHnswParams::new(HnswParams::default()).unwrap());
+        assert_eq!(base.iterative_scan(), HnswIterativeScan::StrictOrder);
+        assert_eq!(base.max_scan_tuples(), DEFAULT_MAX_SCAN_TUPLES);
+        let over = base.with_session_search(HnswSessionSearch {
+            ef_search: Some(7),
+            iterative_scan: Some(HnswIterativeScan::Off),
+            max_scan_tuples: Some(50),
+        });
+        assert_eq!(over.iterative_scan(), HnswIterativeScan::Off);
+        assert_eq!(over.max_scan_tuples(), 50);
+        assert_eq!(over.effective_ef_search(), 7);
+        assert_eq!(HnswIterativeScan::RelaxedOrder.as_str(), "relaxed_order");
     }
 
     #[test]

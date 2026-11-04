@@ -542,7 +542,7 @@ fn distance_first_postfilter_falls_short_by_selectivity() {
 }
 
 /// SQL-73: HNSW でも不変条件（越境なし・述語充足・件数上限）を保ち、`EXPLAIN` の `ann_plan`
-/// が評価順どおりになる。件数の不足は DISTANCE 先行でのみ起き、値（recall）は固定しない。
+/// が評価順どおりになる。DISTANCE 先行の件数不足は反復スキャン（#2033）で解消される。値（recall）は固定しない。
 #[test]
 fn hnsw_routes_match_explain_and_distance_first_only_falls_short() {
     let fx = Fixture::new("sql73-hnsw-routes", true);
@@ -562,9 +562,10 @@ fn hnsw_routes_match_explain_and_distance_first_only_falls_short() {
         }
     }
     assert!(!default_short, "default order must never fall short");
+    // #2033 以降は既定の反復スキャン（strict_order）が DISTANCE 先行の件数不足を解消する。
     assert!(
-        distance_short,
-        "hnsw distance-first must fall short somewhere (non-vacuous)"
+        !distance_short,
+        "hnsw distance-first must be filled by iterative scan (#2033)"
     );
 }
 

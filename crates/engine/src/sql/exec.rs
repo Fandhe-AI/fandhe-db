@@ -2614,7 +2614,7 @@ pub(crate) fn execute_statement_with_cache(
     };
     // Issue #2043: 密側（NULL 行除外後）の返却 id 検証用の多重集合。provider へ実際に渡した候補
     // （`dense_slots`、無ければ全スロット）に限定する。疎側・hybrid の可視集合は
-    // `visible_id_counts`（全スロット）のまま保持する。
+    // 全スロット（`slot_ids`）のまま保持する。
     let dense_id_counts = core::searched_id_counts(&slot_ids, dense_slots.as_deref());
     let has_null_rows = arena.null_row_count() != 0;
     let hnsw_full_visible_eligible = hnsw_full_visible_eligible && !has_null_rows;
@@ -2660,7 +2660,7 @@ pub(crate) fn execute_statement_with_cache(
         if plan.scalar_prefilter {
             bound.fetch_count().max(2)
         } else {
-            arena.ids().len().clamp(2, core::MAX_SEARCH_K)
+            arena.dense_len().clamp(2, core::MAX_SEARCH_K)
         }
     } else {
         // Issue #2008・SQL-33 (8)・SQL-73 (3): 取得件数は `LIMIT + OFFSET`。先頭 `OFFSET` 件は
@@ -2689,471 +2689,10 @@ pub(crate) fn execute_statement_with_cache(
     // 公開 API 変更と `search_or_fallback` の縮退吸収の整理が要るため。Issue #1953 の対象外）。代わりに
     // 呼び出しの直前と直後で文の期限を即時に確認する（中断遅れの上限は探索 1 回分。
     // `docs/design/statement-interrupt.md`）。無効なら時計を読まない。
-    crate::interrupt::current_deadline().check()?;
-    let hits: Vec<(u64, f64)> = if completeness_unbounded {
-        Vec::new()
-    } else {
-        match &bound.ranking {
-            // Issue #2009・SQL-33 (2): 距離順 `DESC`（遠い順）。ANN も provider も通さず、昇順経路と
-            // 同じ候補（`slot_ids`）・同じスコア関数で可視行を全走査して返す。precision との併用は
-            // 束縛が `0A000` で拒否済みのため `completeness_unbounded` は到達しない。
-            //
-            // Issue #2242・SQL-34: `LIMIT` 省略（`result_cap`）も同じ厳密全走査で返す（方向は
-            // `distance_descending` に従う）。取得件数 `k_eff` は `OFFSET + cap + 1`。
-            Ranking::Distance { query }
-                if bound.distance_descending || bound.result_cap.is_some() =>
-            {
-                let exact_slots: Vec<u64> = match dense_slots.as_ref() {
-                    Some(d) => d.iter().map(|&s| u64::from(s)).collect(),
-                    None => Vec::new(),
-                };
-                let raw = exact_full_scan(
-                    arena,
-                    if dense_slots.is_some() {
-                        &exact_slots
-                    } else {
-                        &slot_ids
-                    },
-                    query,
-                    k_eff,
-                    bound.distance_descending,
-                    bound.distance_kind,
-                )?;
-                if raw.len() > k_eff || raw.iter().any(|h| !dense_id_counts.contains_key(&h.0)) {
-                    return Err(SqlSurfaceError::Internal {
-                        detail: "exact scan returned a result violating its contract".to_string(),
-                    });
-                }
-                raw
-            }
-            // Issue #1991・SQL-33 (1)(3): `<=>` の昇順は本物のコサイン距離（`1 - cos`）で返す。HNSW を
-            // 使わない経路（索引なし・opt-in なし・opclass 不一致の全走査・カスタム provider）は
-            // `SearchProvider::search_cosine`（候補マスクがあれば `search_cosine_subset`）を通し、
-            // 契約検証（`distance_result_is_valid`）で provider を untrusted として扱う。
-            // HNSW を使う経路は次の汎用アームで内積の候補を取り、厳密なコサイン距離で再採点する。
-            Ranking::Distance { query }
-                if bound.distance_kind == crate::sql::lexer::DistanceKind::Cosine
-                    && !hnsw_full_visible_eligible
-                    && !hnsw_subset_eligible =>
-            {
-                let raw = if let Some(kept) = dense_slots.as_ref().or(mask_kept_slots.as_ref()) {
-                    // スロット番号を位置ベースの `CosineSearchInput` へ渡さない（Issue #654 の
-                    // 注意と同じ。行番号は明示的な候補マスクとして渡す）。
-                    provider
-                        .search_cosine_subset(crate::kernel::SubsetSearchInput {
-                            slots: kept,
-                            vectors: arena.vectors(),
-                            dim: arena.dim(),
-                            query,
-                            k: k_eff,
-                        })
-                        .map_err(map_kernel_error)?
-                } else {
-                    provider
-                        .search_cosine(crate::kernel::CosineSearchInput {
-                            ids: &slot_ids,
-                            vectors: arena.vectors(),
-                            row_norms_sq: None,
-                            dim: arena.dim(),
-                            query,
-                            k: k_eff,
-                        })
-                        .map_err(map_kernel_error)?
-                };
-                if !core::distance_result_is_valid(&raw, k_eff, &dense_id_counts) {
-                    return Err(SqlSurfaceError::Internal {
-                        detail: "search provider returned a result violating the top-k contract"
-                            .to_string(),
-                    });
-                }
-                raw.into_iter().map(|h| (h.id, h.distance)).collect()
-            }
-            Ranking::Distance { query } => {
-                // Issue #408・#409: `hnsw_cache`（`None` の場合は `execute_statement`
-                // 経由。従来どおり全件 brute-force のみ）が `Some` の場合、適用条件
-                // （`hnsw_full_visible_eligible`／`hnsw_subset_eligible` 参照）に応じて
-                // `FullVisible`（索引済みノード＋未索引分 brute-force の併用。#408）
-                // または `Subset`（per-query 写像・キャッシュ非登録。#409）の経路を
-                // 試みる。
-                let raw = if hnsw_full_visible_eligible {
-                    match hnsw_cache.as_ref() {
-                        Some(access) => crate::sql::hnsw_cache::search_or_fallback(
-                            access,
-                            crate::storage::read_source::require_snapshot(read_txn)?,
-                            &bound.table,
-                            ctx,
-                            arena,
-                            &slot_ids,
-                            provider,
-                            query,
-                            k_eff,
-                        )
-                        .map_err(map_kernel_error)?,
-                        None => {
-                            let input = SearchInput {
-                                ids: &slot_ids,
-                                vectors: arena.vectors(),
-                                dim: arena.dim(),
-                                query,
-                                k: k_eff,
-                            };
-                            provider.search(input).map_err(map_kernel_error)?
-                        }
-                    }
-                } else if hnsw_subset_eligible {
-                    // Issue #676: SCALAR 段の候補削減（Issue #654）が `VectorArena`
-                    // を複製せず借用したまま候補スロットだけを絞り込めていた場合
-                    // （`mask_kept_slots`／`cache_hit_snapshot` が揃っている場合）、
-                    // まず `sql::hnsw_cache::prepare_subset_from_slots` で
-                    // 複製する**前**に plain scan／ANN を判定する。plain scan なら
-                    // 複製せず候補 id マスク経路（`search_subset`）へ委譲し、ANN へ
-                    // 進む場合のみこの時点で初めて `build_from_cached_rls_rows_subset`
-                    // を呼んで複製する（従来どおりの経路）。索引が候補削減を発火
-                    // できなかった場合（`mask_kept_slots` が `None`）は、従来どおり
-                    // `search_subset_or_fallback`（`arena` は行フィルタ済みの複製
-                    // アリーナ）を使う。
-                    match (
-                        hnsw_cache.as_ref(),
-                        mask_kept_slots.as_ref(),
-                        cache_hit_snapshot.as_ref(),
-                    ) {
-                        (Some(access), Some(kept), Some(snapshot)) => {
-                            match crate::sql::hnsw_cache::prepare_subset_from_slots(
-                                access,
-                                crate::storage::read_source::require_snapshot(read_txn)?,
-                                &bound.table,
-                                ctx,
-                                snapshot.arena(),
-                                kept,
-                                k_eff,
-                            ) {
-                                crate::sql::hnsw_cache::SubsetSlotPlan::MaskScan => provider
-                                    .search_subset(crate::kernel::SubsetSearchInput {
-                                        slots: kept,
-                                        vectors: snapshot.arena().vectors(),
-                                        dim: snapshot.arena().dim(),
-                                        query,
-                                        k: k_eff,
-                                    })
-                                    .map_err(map_kernel_error)?,
-                                crate::sql::hnsw_cache::SubsetSlotPlan::Ann(prepared) => {
-                                    // ANN 探索へ進む場合のみ、ここで初めて `kept` から
-                                    // subset アリーナを複製する（従来の HNSW `Subset`
-                                    // 経路と同じ複製。`sql/exec.rs` モジュールドキュメント
-                                    // 「Issue #654」節・`docs/design/
-                                    // scalar-index-mask-search.md`「Issue #676」節参照）。
-                                    let built = VectorArena::build_from_cached_rls_rows_subset(
-                                        &bound.table,
-                                        snapshot.arena().dim(),
-                                        snapshot.arena(),
-                                        snapshot.metadata(),
-                                        kept,
-                                        |_, _, _, _| Ok(true),
-                                        crate::arena::MAX_ARENA_ROWS,
-                                        crate::arena::MAX_ARENA_TOTAL_BYTES,
-                                    )
-                                    .map_err(|e| map_arena_error(&bound.table, e))?;
-                                    access.cache.record_subset_arena_copy();
-                                    let subset_slot_ids: Vec<u64> =
-                                        (0..built.ids().len() as u64).collect();
-                                    let raw_ann = crate::sql::hnsw_cache::search_prepared(
-                                        access,
-                                        &prepared,
-                                        provider,
-                                        &built,
-                                        &subset_slot_ids,
-                                        query,
-                                        k_eff,
-                                    )
-                                    .map_err(map_kernel_error)?;
-                                    // `search_prepared` が返す `id` は subset アリーナ
-                                    // 内の連番（ordinal）——`Overlay::compute_over_slots`
-                                    // が `kept` の列挙順で座標系を作った（§`Overlay::
-                                    // compute_over_slots` ドキュメンテーションコメント
-                                    // 参照）ため、`kept.get(ordinal)` で元スロット番号
-                                    // （`snapshot.arena()` に対する添字）へ写像し戻す。
-                                    // 範囲外は索引・マージロジックの不整合を意味するため
-                                    // 黙って落とさず fail-closed に拒否する。
-                                    let mut mapped = Vec::with_capacity(raw_ann.len());
-                                    for hit in raw_ann {
-                                        let ordinal = usize::try_from(hit.id).map_err(|_| {
-                                            SqlSurfaceError::Internal {
-                                                detail: "hnsw subset ordinal does not fit in usize"
-                                                    .to_string(),
-                                            }
-                                        })?;
-                                        let orig_slot = kept.get(ordinal).copied().ok_or(
-                                            SqlSurfaceError::Internal {
-                                                detail:
-                                                    "hnsw subset ordinal out of range of candidate slots"
-                                                        .to_string(),
-                                            },
-                                        )?;
-                                        mapped.push(crate::kernel::CandidateHit {
-                                            id: orig_slot as u64,
-                                            score: hit.score,
-                                        });
-                                    }
-                                    mapped
-                                }
-                            }
-                        }
-                        _ => match hnsw_cache.as_ref() {
-                            Some(access) => crate::sql::hnsw_cache::search_subset_or_fallback(
-                                access,
-                                crate::storage::read_source::require_snapshot(read_txn)?,
-                                &bound.table,
-                                ctx,
-                                arena,
-                                &slot_ids,
-                                provider,
-                                query,
-                                k_eff,
-                            )
-                            .map_err(map_kernel_error)?,
-                            None => {
-                                let input = SearchInput {
-                                    ids: &slot_ids,
-                                    vectors: arena.vectors(),
-                                    dim: arena.dim(),
-                                    query,
-                                    k: k_eff,
-                                };
-                                provider.search(input).map_err(map_kernel_error)?
-                            }
-                        },
-                    }
-                } else if let Some(kept) = dense_slots.as_ref().or(mask_kept_slots.as_ref()) {
-                    // Issue #2043: NULL 行を含む arena では `dense_slots`（NULL 行を除いた候補）を
-                    // 優先する。`mask_kept_slots` のみのときは従来どおり。
-                    // Issue #654: `arena` はキャッシュ済みスナップショットの
-                    // `VectorArena` を丸ごと借用したまま（複製していない）。`slot_ids`
-                    // （＝`kept`）は `arena.vectors()` に対する行番号そのものであり、
-                    // 位置ベースの `SearchInput`（`ids[idx]` ではなく配列中の位置
-                    // `idx` で `vectors` の行を決める契約。`kernel.rs::CpuScalarProvider`
-                    // 参照）へそのまま渡すと誤った行を候補にしてしまう。行番号を
-                    // 明示的な候補マスクとして扱う `search_subset` を使う。
-                    provider
-                        .search_subset(crate::kernel::SubsetSearchInput {
-                            slots: kept,
-                            vectors: arena.vectors(),
-                            dim: arena.dim(),
-                            query,
-                            k: k_eff,
-                        })
-                        .map_err(map_kernel_error)?
-                } else {
-                    let input = SearchInput {
-                        ids: &slot_ids,
-                        vectors: arena.vectors(),
-                        dim: arena.dim(),
-                        query,
-                        k: k_eff,
-                    };
-                    provider.search(input).map_err(map_kernel_error)?
-                };
-                if !core::provider_result_is_valid(&raw, k_eff, &dense_id_counts) {
-                    return Err(SqlSurfaceError::Internal {
-                        detail: "search provider returned a result violating the top-k contract"
-                            .to_string(),
-                    });
-                }
-                match bound.distance_kind {
-                    // HNSW（内積グラフ）の候補を厳密なコサイン距離で再採点・再整列する
-                    // （`rescore_cosine` 参照）。
-                    crate::sql::lexer::DistanceKind::Cosine => rescore_cosine(arena, &raw, query)?,
-                    // `<#>`: 内積スコアの符号を反転した距離値（昇順）。順位は内積降順のまま。
-                    _ => raw
-                        .into_iter()
-                        .map(|h| (h.id, -(f64::from(h.score))))
-                        .collect(),
-                }
-            }
-            Ranking::Hybrid {
-                query,
-                query_text,
-                text_column_index: hybrid_text_column_index,
-                ..
-            } => {
-                let pool_depth = k_eff.max(DEFAULT_HYBRID_POOL_DEPTH);
-                let cfg = RrfConfig::new(60.0, 1.0, 1.0, pool_depth).map_err(|_| {
-                    SqlSurfaceError::Internal {
-                        detail: "invalid hybrid RRF config".to_string(),
-                    }
-                })?;
-                let input = SearchInput {
-                    ids: &slot_ids,
-                    vectors: arena.vectors(),
-                    dim: arena.dim(),
-                    query,
-                    k: k_eff,
-                };
-                // Issue #410: hybrid 密側の再取得ループ（下記の密のみ縮退経路・
-                // `hybrid::hybrid_search` の両方）へ HNSW を結線するアダプタ。
-                // `hnsw_hybrid_full_visible_eligible`／`hnsw_hybrid_subset_eligible`
-                // のいずれかが真かつ `hnsw_cache` が `Some` の場合のみ構築する。
-                // `prepare_full_visible`／`prepare_subset`（`Overlay::compute`／
-                // `IndexedBase::build` を伴う重い解決）はここで 1 回だけ呼び、
-                // 複数ラウンドにわたる `k` 依存の探索は `HnswDenseProvider::search`
-                // が都度 `search_prepared` で担う（`sql::hnsw_hybrid` モジュール
-                // ドキュメント参照）。`hybrid.rs`・`SearchProvider` trait は無変更。
-                let hnsw_dense_provider: Option<crate::sql::hnsw_hybrid::HnswDenseProvider<'_>> =
-                    if hnsw_hybrid_full_visible_eligible {
-                        match hnsw_cache.as_ref() {
-                            Some(access) => {
-                                let prepared = crate::sql::hnsw_cache::prepare_full_visible(
-                                    access,
-                                    crate::storage::read_source::require_snapshot(read_txn)?,
-                                    &bound.table,
-                                    ctx,
-                                    arena,
-                                );
-                                Some(crate::sql::hnsw_hybrid::HnswDenseProvider::new(
-                                    access, arena, &slot_ids, provider, prepared,
-                                ))
-                            }
-                            None => None,
-                        }
-                    } else if hnsw_hybrid_subset_eligible {
-                        match hnsw_cache.as_ref() {
-                            Some(access) => {
-                                let prepared = crate::sql::hnsw_cache::prepare_subset(
-                                    access,
-                                    crate::storage::read_source::require_snapshot(read_txn)?,
-                                    &bound.table,
-                                    ctx,
-                                    arena,
-                                );
-                                Some(crate::sql::hnsw_hybrid::HnswDenseProvider::new(
-                                    access, arena, &slot_ids, provider, prepared,
-                                ))
-                            }
-                            None => None,
-                        }
-                    } else {
-                        None
-                    };
-                // 索引経路が適用条件を満たさない・`hnsw_cache` が `None`（
-                // `SearchEngineKind::Hnsw` opt-in 構築時以外）のいずれの場合も
-                // `provider`（従来どおり全件 brute-force）へフォールバックする。
-                // Issue #1991: HNSW を使わない密側は `<=>` の意味（コサイン）で順位付けする。
-                // `HnswDenseProvider`（内積グラフ）は従来の内積順のまま残る（HNSW のコサイン正確化は
-                // #1998。非対称は `docs/design/cosine-operator-migration.md` に記録）。
-                let cosine_dense = CosineDenseAdapter {
-                    inner: provider,
-                    dense_slots: dense_slots.as_deref(),
-                };
-                let dense_provider: &dyn SearchProvider = match &hnsw_dense_provider {
-                    Some(adapter) => adapter,
-                    None => &cosine_dense,
-                };
-                // Issue #357: キャッシュヒット済みの索引があればそれをそのまま使う。
-                // ミスの場合のみ `sparse_docs`（このクエリのスナップショットから
-                // 蓄積した本文）から新規構築し、`sparse_cache_eligible` なら
-                // キャッシュへの挿入を試みる（`SparseIndexCache::insert` は挿入の
-                // 成否に関わらず構築済みの索引そのものを返す契約。
-                // `sql/sparse_cache.rs` モジュールドキュメント参照）。
-                let sparse_index_for_fusion: Option<Arc<SparseIndex>> = if let Some(idx) =
-                    &cached_sparse_index
-                {
-                    Some(Arc::clone(idx))
-                } else if sparse_docs.is_empty() {
-                    // 疎文書が 0 件（可視行に本文を持つ行が 1 件もない）の場合は
-                    // `SparseIndex::build` が空コーパスを拒否する
-                    // （`SparseError::EmptyCorpus`）ため、密のみへ縮退させる
-                    // （下の `None` 分岐）。空コーパスはキャッシュへも積まない
-                    // （`SparseIndex::build` 自体が拒否するため構築できない）。
-                    None
-                } else {
-                    let doc_refs: Vec<(DocId, &str)> = sparse_docs
-                        .iter()
-                        .map(|(id, text)| (*id, text.as_str()))
-                        .collect();
-                    let built = SparseIndex::build(&doc_refs)
-                        .map_err(HybridError::Sparse)
-                        .map_err(map_hybrid_error)?;
-                    match (sparse_cache_eligible, sparse_cache.as_ref()) {
-                        (true, Some(access)) => {
-                            // `built_generation` はこのクエリの `read_txn`
-                            // スナップショットにおけるテーブル世代
-                            // （`SparseIndexCache::insert` の契約。読み取れない
-                            // 場合はキャッシュへ積まず、この場で構築した索引を
-                            // そのまま使う）。
-                            match crate::catalog::table_generation_in_txn(read_txn, &bound.table) {
-                                Ok(built_generation) => Some(access.cache.insert(
-                                    access.storage,
-                                    &bound.table,
-                                    ctx,
-                                    *hybrid_text_column_index,
-                                    built,
-                                    built_generation,
-                                )),
-                                Err(_) => Some(Arc::new(built)),
-                            }
-                        }
-                        _ => Some(Arc::new(built)),
-                    }
-                };
-                let fused: Vec<HybridHit> = match &sparse_index_for_fusion {
-                    None => {
-                        // 疎側の寄与を 0 件として扱い、密側のみを `rrf_fuse` に通して
-                        // 密のみの順序契約へ縮退させる（密側の可視性検証は
-                        // `hybrid::hybrid_search` と同じ理由でここでも行う）。
-                        let dense_input = SearchInput {
-                            ids: &slot_ids,
-                            vectors: arena.vectors(),
-                            dim: arena.dim(),
-                            query,
-                            k: cfg.pool_depth(),
-                        };
-                        let dense_hits = dense_provider
-                            .search(dense_input)
-                            .map_err(map_kernel_error)?;
-                        // 可視集合への包含判定（件数ではなく所属のみを見るため多重集合の
-                        // キー存在で判定する。TABLE-12 の重複 id については
-                        // `core::provider_result_is_valid` のドキュメント参照）。
-                        if dense_hits
-                            .iter()
-                            .any(|h| !dense_id_counts.contains_key(&h.id))
-                        {
-                            return Err(SqlSurfaceError::Internal {
-                                detail: "search provider returned a hit outside the visible id set"
-                                    .to_string(),
-                            });
-                        }
-                        let mut fused =
-                            hybrid::rrf_fuse(&dense_hits, &[], &cfg).map_err(map_hybrid_error)?;
-                        fused.truncate(k_eff);
-                        fused
-                    }
-                    Some(idx) => {
-                        hybrid::hybrid_search(dense_provider, input, idx, query_text, k_eff, &cfg)
-                            .map_err(map_hybrid_error)?
-                    }
-                };
-                // このクエリで観測された密側再取得ラウンド数を `HnswIndexCache` の
-                // 統計へ反映する（索引経路が一度も使われなかった場合は no-op。
-                // §`HnswDenseProvider::finish` ドキュメンテーションコメント参照）。
-                if let Some(adapter) = &hnsw_dense_provider {
-                    adapter.finish();
-                }
-                fused.into_iter().map(|h| (h.id, h.score)).collect()
-            }
-        }
-    };
-
-    // DISTANCE 段の直後の確認点（Issue #1953。上の直前確認と対）。
-    crate::interrupt::current_deadline().check()?;
-
-    // SCALAR 事後フィルタ（DISTANCE 先行時のみ。TASK-76・SQL-7）。`on_visible_row` は
-    // `plan.scalar_prefilter == false` の間、等価条件を判定せず可視行を通過させて
-    // いるため、ここで `postfilter_verdicts`（`on_visible_row` が生の
-    // `row_codec::ScalarRef` に対して判定済みの真偽値。宣言箇所のコメント参照）を
-    // 引く。値の取得不能（データ不整合。fail-closed）は除去する。返却件数が
-    // `limit` 未満になり得る（under-fetch。オーバーサンプルによる救済は行わない）。
-    let hits: Vec<(u64, f64)> = if plan.scalar_prefilter {
-        hits
-    } else {
+    // SCALAR 事後フィルタの本体（DISTANCE 先行時のみ。TASK-76・SQL-7）。反復スキャン
+    // （SQL-73・Issue #2033）が DISTANCE 段の回ごとに呼べるよう、クロージャとして切り出している。
+    // 通過した hit だけを順序を保って返す。評価エラーはクエリ全体の失敗として伝播する。
+    let apply_postfilter = |hits: Vec<(u64, f64)>| -> Result<Vec<(u64, f64)>, SqlSurfaceError> {
         // TASK-79（SQL-9）: `WHERE` の式述語も既存のメタデータフィルタ（TASK-147・
         // EXT-3）と同じ SCALAR 事後フィルタの一部として扱う（DISTANCE 先行時。
         // §モジュールドキュメント参照）。評価に使う embedding は候補選択と同一
@@ -3259,7 +2798,559 @@ pub(crate) fn execute_statement_with_cache(
             }
             filtered.push((slot_id, score));
         }
-        filtered
+        Ok(filtered)
+    };
+
+    let compute_hits = |k_eff: usize| -> Result<Vec<(u64, f64)>, SqlSurfaceError> {
+        Ok(if completeness_unbounded {
+            Vec::new()
+        } else {
+            match &bound.ranking {
+                // Issue #2009・SQL-33 (2): 距離順 `DESC`（遠い順）。ANN も provider も通さず、昇順経路と
+                // 同じ候補（`slot_ids`）・同じスコア関数で可視行を全走査して返す。precision との併用は
+                // 束縛が `0A000` で拒否済みのため `completeness_unbounded` は到達しない。
+                //
+                // Issue #2242・SQL-34: `LIMIT` 省略（`result_cap`）も同じ厳密全走査で返す（方向は
+                // `distance_descending` に従う）。取得件数 `k_eff` は `OFFSET + cap + 1`。
+                Ranking::Distance { query }
+                    if bound.distance_descending || bound.result_cap.is_some() =>
+                {
+                    let exact_slots: Vec<u64> = match dense_slots.as_ref() {
+                        Some(d) => d.iter().map(|&s| u64::from(s)).collect(),
+                        None => Vec::new(),
+                    };
+                    let raw = exact_full_scan(
+                        arena,
+                        if dense_slots.is_some() {
+                            &exact_slots
+                        } else {
+                            &slot_ids
+                        },
+                        query,
+                        k_eff,
+                        bound.distance_descending,
+                        bound.distance_kind,
+                    )?;
+                    if raw.len() > k_eff || raw.iter().any(|h| !dense_id_counts.contains_key(&h.0))
+                    {
+                        return Err(SqlSurfaceError::Internal {
+                            detail: "exact scan returned a result violating its contract"
+                                .to_string(),
+                        });
+                    }
+                    raw
+                }
+                // Issue #1991・SQL-33 (1)(3): `<=>` の昇順は本物のコサイン距離（`1 - cos`）で返す。HNSW を
+                // 使わない経路（索引なし・opt-in なし・opclass 不一致の全走査・カスタム provider）は
+                // `SearchProvider::search_cosine`（候補マスクがあれば `search_cosine_subset`）を通し、
+                // 契約検証（`distance_result_is_valid`）で provider を untrusted として扱う。
+                // HNSW を使う経路は次の汎用アームで内積の候補を取り、厳密なコサイン距離で再採点する。
+                Ranking::Distance { query }
+                    if bound.distance_kind == crate::sql::lexer::DistanceKind::Cosine
+                        && !hnsw_full_visible_eligible
+                        && !hnsw_subset_eligible =>
+                {
+                    let raw = if let Some(kept) = dense_slots.as_ref().or(mask_kept_slots.as_ref())
+                    {
+                        // スロット番号を位置ベースの `CosineSearchInput` へ渡さない（Issue #654 の
+                        // 注意と同じ。行番号は明示的な候補マスクとして渡す）。
+                        provider
+                            .search_cosine_subset(crate::kernel::SubsetSearchInput {
+                                slots: kept,
+                                vectors: arena.vectors(),
+                                dim: arena.dim(),
+                                query,
+                                k: k_eff,
+                            })
+                            .map_err(map_kernel_error)?
+                    } else {
+                        provider
+                            .search_cosine(crate::kernel::CosineSearchInput {
+                                ids: &slot_ids,
+                                vectors: arena.vectors(),
+                                row_norms_sq: None,
+                                dim: arena.dim(),
+                                query,
+                                k: k_eff,
+                            })
+                            .map_err(map_kernel_error)?
+                    };
+                    if !core::distance_result_is_valid(&raw, k_eff, &dense_id_counts) {
+                        return Err(SqlSurfaceError::Internal {
+                            detail:
+                                "search provider returned a result violating the top-k contract"
+                                    .to_string(),
+                        });
+                    }
+                    raw.into_iter().map(|h| (h.id, h.distance)).collect()
+                }
+                Ranking::Distance { query } => {
+                    // Issue #408・#409: `hnsw_cache`（`None` の場合は `execute_statement`
+                    // 経由。従来どおり全件 brute-force のみ）が `Some` の場合、適用条件
+                    // （`hnsw_full_visible_eligible`／`hnsw_subset_eligible` 参照）に応じて
+                    // `FullVisible`（索引済みノード＋未索引分 brute-force の併用。#408）
+                    // または `Subset`（per-query 写像・キャッシュ非登録。#409）の経路を
+                    // 試みる。
+                    let raw = if hnsw_full_visible_eligible {
+                        match hnsw_cache.as_ref() {
+                            Some(access) => crate::sql::hnsw_cache::search_or_fallback(
+                                access,
+                                crate::storage::read_source::require_snapshot(read_txn)?,
+                                &bound.table,
+                                ctx,
+                                arena,
+                                &slot_ids,
+                                provider,
+                                query,
+                                k_eff,
+                            )
+                            .map_err(map_kernel_error)?,
+                            None => {
+                                let input = SearchInput {
+                                    ids: &slot_ids,
+                                    vectors: arena.vectors(),
+                                    dim: arena.dim(),
+                                    query,
+                                    k: k_eff,
+                                };
+                                provider.search(input).map_err(map_kernel_error)?
+                            }
+                        }
+                    } else if hnsw_subset_eligible {
+                        // Issue #676: SCALAR 段の候補削減（Issue #654）が `VectorArena`
+                        // を複製せず借用したまま候補スロットだけを絞り込めていた場合
+                        // （`mask_kept_slots`／`cache_hit_snapshot` が揃っている場合）、
+                        // まず `sql::hnsw_cache::prepare_subset_from_slots` で
+                        // 複製する**前**に plain scan／ANN を判定する。plain scan なら
+                        // 複製せず候補 id マスク経路（`search_subset`）へ委譲し、ANN へ
+                        // 進む場合のみこの時点で初めて `build_from_cached_rls_rows_subset`
+                        // を呼んで複製する（従来どおりの経路）。索引が候補削減を発火
+                        // できなかった場合（`mask_kept_slots` が `None`）は、従来どおり
+                        // `search_subset_or_fallback`（`arena` は行フィルタ済みの複製
+                        // アリーナ）を使う。
+                        match (
+                            hnsw_cache.as_ref(),
+                            mask_kept_slots.as_ref(),
+                            cache_hit_snapshot.as_ref(),
+                        ) {
+                            (Some(access), Some(kept), Some(snapshot)) => {
+                                match crate::sql::hnsw_cache::prepare_subset_from_slots(
+                                    access,
+                                    crate::storage::read_source::require_snapshot(read_txn)?,
+                                    &bound.table,
+                                    ctx,
+                                    snapshot.arena(),
+                                    kept,
+                                    k_eff,
+                                ) {
+                                    crate::sql::hnsw_cache::SubsetSlotPlan::MaskScan => provider
+                                        .search_subset(crate::kernel::SubsetSearchInput {
+                                            slots: kept,
+                                            vectors: snapshot.arena().vectors(),
+                                            dim: snapshot.arena().dim(),
+                                            query,
+                                            k: k_eff,
+                                        })
+                                        .map_err(map_kernel_error)?,
+                                    crate::sql::hnsw_cache::SubsetSlotPlan::Ann(prepared) => {
+                                        // ANN 探索へ進む場合のみ、ここで初めて `kept` から
+                                        // subset アリーナを複製する（従来の HNSW `Subset`
+                                        // 経路と同じ複製。`sql/exec.rs` モジュールドキュメント
+                                        // 「Issue #654」節・`docs/design/
+                                        // scalar-index-mask-search.md`「Issue #676」節参照）。
+                                        let built = VectorArena::build_from_cached_rls_rows_subset(
+                                            &bound.table,
+                                            snapshot.arena().dim(),
+                                            snapshot.arena(),
+                                            snapshot.metadata(),
+                                            kept,
+                                            |_, _, _, _| Ok(true),
+                                            crate::arena::MAX_ARENA_ROWS,
+                                            crate::arena::MAX_ARENA_TOTAL_BYTES,
+                                        )
+                                        .map_err(|e| map_arena_error(&bound.table, e))?;
+                                        access.cache.record_subset_arena_copy();
+                                        let subset_slot_ids: Vec<u64> =
+                                            (0..built.ids().len() as u64).collect();
+                                        let raw_ann = crate::sql::hnsw_cache::search_prepared(
+                                            access,
+                                            &prepared,
+                                            provider,
+                                            &built,
+                                            &subset_slot_ids,
+                                            query,
+                                            k_eff,
+                                        )
+                                        .map_err(map_kernel_error)?;
+                                        // `search_prepared` が返す `id` は subset アリーナ
+                                        // 内の連番（ordinal）——`Overlay::compute_over_slots`
+                                        // が `kept` の列挙順で座標系を作った（§`Overlay::
+                                        // compute_over_slots` ドキュメンテーションコメント
+                                        // 参照）ため、`kept.get(ordinal)` で元スロット番号
+                                        // （`snapshot.arena()` に対する添字）へ写像し戻す。
+                                        // 範囲外は索引・マージロジックの不整合を意味するため
+                                        // 黙って落とさず fail-closed に拒否する。
+                                        let mut mapped = Vec::with_capacity(raw_ann.len());
+                                        for hit in raw_ann {
+                                            let ordinal =
+                                                usize::try_from(hit.id).map_err(|_| {
+                                                    SqlSurfaceError::Internal {
+                                                detail: "hnsw subset ordinal does not fit in usize"
+                                                    .to_string(),
+                                            }
+                                                })?;
+                                            let orig_slot = kept.get(ordinal).copied().ok_or(
+                                            SqlSurfaceError::Internal {
+                                                detail:
+                                                    "hnsw subset ordinal out of range of candidate slots"
+                                                        .to_string(),
+                                            },
+                                        )?;
+                                            mapped.push(crate::kernel::CandidateHit {
+                                                id: orig_slot as u64,
+                                                score: hit.score,
+                                            });
+                                        }
+                                        mapped
+                                    }
+                                }
+                            }
+                            _ => match hnsw_cache.as_ref() {
+                                Some(access) => crate::sql::hnsw_cache::search_subset_or_fallback(
+                                    access,
+                                    crate::storage::read_source::require_snapshot(read_txn)?,
+                                    &bound.table,
+                                    ctx,
+                                    arena,
+                                    &slot_ids,
+                                    provider,
+                                    query,
+                                    k_eff,
+                                )
+                                .map_err(map_kernel_error)?,
+                                None => {
+                                    let input = SearchInput {
+                                        ids: &slot_ids,
+                                        vectors: arena.vectors(),
+                                        dim: arena.dim(),
+                                        query,
+                                        k: k_eff,
+                                    };
+                                    provider.search(input).map_err(map_kernel_error)?
+                                }
+                            },
+                        }
+                    } else if let Some(kept) = dense_slots.as_ref().or(mask_kept_slots.as_ref()) {
+                        // Issue #2043: NULL 行を含む arena では `dense_slots`（NULL 行を除いた候補）を
+                        // 優先する。`mask_kept_slots` のみのときは従来どおり。
+                        // Issue #654: `arena` はキャッシュ済みスナップショットの
+                        // `VectorArena` を丸ごと借用したまま（複製していない）。`slot_ids`
+                        // （＝`kept`）は `arena.vectors()` に対する行番号そのものであり、
+                        // 位置ベースの `SearchInput`（`ids[idx]` ではなく配列中の位置
+                        // `idx` で `vectors` の行を決める契約。`kernel.rs::CpuScalarProvider`
+                        // 参照）へそのまま渡すと誤った行を候補にしてしまう。行番号を
+                        // 明示的な候補マスクとして扱う `search_subset` を使う。
+                        provider
+                            .search_subset(crate::kernel::SubsetSearchInput {
+                                slots: kept,
+                                vectors: arena.vectors(),
+                                dim: arena.dim(),
+                                query,
+                                k: k_eff,
+                            })
+                            .map_err(map_kernel_error)?
+                    } else {
+                        let input = SearchInput {
+                            ids: &slot_ids,
+                            vectors: arena.vectors(),
+                            dim: arena.dim(),
+                            query,
+                            k: k_eff,
+                        };
+                        provider.search(input).map_err(map_kernel_error)?
+                    };
+                    if !core::provider_result_is_valid(&raw, k_eff, &dense_id_counts) {
+                        return Err(SqlSurfaceError::Internal {
+                            detail:
+                                "search provider returned a result violating the top-k contract"
+                                    .to_string(),
+                        });
+                    }
+                    match bound.distance_kind {
+                        // HNSW（内積グラフ）の候補を厳密なコサイン距離で再採点・再整列する
+                        // （`rescore_cosine` 参照）。
+                        crate::sql::lexer::DistanceKind::Cosine => {
+                            rescore_cosine(arena, &raw, query)?
+                        }
+                        // `<#>`: 内積スコアの符号を反転した距離値（昇順）。順位は内積降順のまま。
+                        _ => raw
+                            .into_iter()
+                            .map(|h| (h.id, -(f64::from(h.score))))
+                            .collect(),
+                    }
+                }
+                Ranking::Hybrid {
+                    query,
+                    query_text,
+                    text_column_index: hybrid_text_column_index,
+                    ..
+                } => {
+                    let pool_depth = k_eff.max(DEFAULT_HYBRID_POOL_DEPTH);
+                    let cfg = RrfConfig::new(60.0, 1.0, 1.0, pool_depth).map_err(|_| {
+                        SqlSurfaceError::Internal {
+                            detail: "invalid hybrid RRF config".to_string(),
+                        }
+                    })?;
+                    let input = SearchInput {
+                        ids: &slot_ids,
+                        vectors: arena.vectors(),
+                        dim: arena.dim(),
+                        query,
+                        k: k_eff,
+                    };
+                    // Issue #410: hybrid 密側の再取得ループ（下記の密のみ縮退経路・
+                    // `hybrid::hybrid_search` の両方）へ HNSW を結線するアダプタ。
+                    // `hnsw_hybrid_full_visible_eligible`／`hnsw_hybrid_subset_eligible`
+                    // のいずれかが真かつ `hnsw_cache` が `Some` の場合のみ構築する。
+                    // `prepare_full_visible`／`prepare_subset`（`Overlay::compute`／
+                    // `IndexedBase::build` を伴う重い解決）はここで 1 回だけ呼び、
+                    // 複数ラウンドにわたる `k` 依存の探索は `HnswDenseProvider::search`
+                    // が都度 `search_prepared` で担う（`sql::hnsw_hybrid` モジュール
+                    // ドキュメント参照）。`hybrid.rs`・`SearchProvider` trait は無変更。
+                    let hnsw_dense_provider: Option<
+                        crate::sql::hnsw_hybrid::HnswDenseProvider<'_>,
+                    > = if hnsw_hybrid_full_visible_eligible {
+                        match hnsw_cache.as_ref() {
+                            Some(access) => {
+                                let prepared = crate::sql::hnsw_cache::prepare_full_visible(
+                                    access,
+                                    crate::storage::read_source::require_snapshot(read_txn)?,
+                                    &bound.table,
+                                    ctx,
+                                    arena,
+                                );
+                                Some(crate::sql::hnsw_hybrid::HnswDenseProvider::new(
+                                    access, arena, &slot_ids, provider, prepared,
+                                ))
+                            }
+                            None => None,
+                        }
+                    } else if hnsw_hybrid_subset_eligible {
+                        match hnsw_cache.as_ref() {
+                            Some(access) => {
+                                let prepared = crate::sql::hnsw_cache::prepare_subset(
+                                    access,
+                                    crate::storage::read_source::require_snapshot(read_txn)?,
+                                    &bound.table,
+                                    ctx,
+                                    arena,
+                                );
+                                Some(crate::sql::hnsw_hybrid::HnswDenseProvider::new(
+                                    access, arena, &slot_ids, provider, prepared,
+                                ))
+                            }
+                            None => None,
+                        }
+                    } else {
+                        None
+                    };
+                    // 索引経路が適用条件を満たさない・`hnsw_cache` が `None`（
+                    // `SearchEngineKind::Hnsw` opt-in 構築時以外）のいずれの場合も
+                    // `provider`（従来どおり全件 brute-force）へフォールバックする。
+                    // Issue #1991: HNSW を使わない密側は `<=>` の意味（コサイン）で順位付けする。
+                    // `HnswDenseProvider`（内積グラフ）は従来の内積順のまま残る（HNSW のコサイン正確化は
+                    // #1998。非対称は `docs/design/cosine-operator-migration.md` に記録）。
+                    let cosine_dense = CosineDenseAdapter {
+                        inner: provider,
+                        dense_slots: dense_slots.as_deref(),
+                    };
+                    let dense_provider: &dyn SearchProvider = match &hnsw_dense_provider {
+                        Some(adapter) => adapter,
+                        None => &cosine_dense,
+                    };
+                    // Issue #357: キャッシュヒット済みの索引があればそれをそのまま使う。
+                    // ミスの場合のみ `sparse_docs`（このクエリのスナップショットから
+                    // 蓄積した本文）から新規構築し、`sparse_cache_eligible` なら
+                    // キャッシュへの挿入を試みる（`SparseIndexCache::insert` は挿入の
+                    // 成否に関わらず構築済みの索引そのものを返す契約。
+                    // `sql/sparse_cache.rs` モジュールドキュメント参照）。
+                    let sparse_index_for_fusion: Option<Arc<SparseIndex>> =
+                        if let Some(idx) = &cached_sparse_index {
+                            Some(Arc::clone(idx))
+                        } else if sparse_docs.is_empty() {
+                            // 疎文書が 0 件（可視行に本文を持つ行が 1 件もない）の場合は
+                            // `SparseIndex::build` が空コーパスを拒否する
+                            // （`SparseError::EmptyCorpus`）ため、密のみへ縮退させる
+                            // （下の `None` 分岐）。空コーパスはキャッシュへも積まない
+                            // （`SparseIndex::build` 自体が拒否するため構築できない）。
+                            None
+                        } else {
+                            let doc_refs: Vec<(DocId, &str)> = sparse_docs
+                                .iter()
+                                .map(|(id, text)| (*id, text.as_str()))
+                                .collect();
+                            let built = SparseIndex::build(&doc_refs)
+                                .map_err(HybridError::Sparse)
+                                .map_err(map_hybrid_error)?;
+                            match (sparse_cache_eligible, sparse_cache.as_ref()) {
+                                (true, Some(access)) => {
+                                    // `built_generation` はこのクエリの `read_txn`
+                                    // スナップショットにおけるテーブル世代
+                                    // （`SparseIndexCache::insert` の契約。読み取れない
+                                    // 場合はキャッシュへ積まず、この場で構築した索引を
+                                    // そのまま使う）。
+                                    match crate::catalog::table_generation_in_txn(
+                                        read_txn,
+                                        &bound.table,
+                                    ) {
+                                        Ok(built_generation) => Some(access.cache.insert(
+                                            access.storage,
+                                            &bound.table,
+                                            ctx,
+                                            *hybrid_text_column_index,
+                                            built,
+                                            built_generation,
+                                        )),
+                                        Err(_) => Some(Arc::new(built)),
+                                    }
+                                }
+                                _ => Some(Arc::new(built)),
+                            }
+                        };
+                    let fused: Vec<HybridHit> = match &sparse_index_for_fusion {
+                        None => {
+                            // 疎側の寄与を 0 件として扱い、密側のみを `rrf_fuse` に通して
+                            // 密のみの順序契約へ縮退させる（密側の可視性検証は
+                            // `hybrid::hybrid_search` と同じ理由でここでも行う）。
+                            let dense_input = SearchInput {
+                                ids: &slot_ids,
+                                vectors: arena.vectors(),
+                                dim: arena.dim(),
+                                query,
+                                k: cfg.pool_depth(),
+                            };
+                            let dense_hits = dense_provider
+                                .search(dense_input)
+                                .map_err(map_kernel_error)?;
+                            // 可視集合への包含判定（件数ではなく所属のみを見るため多重集合の
+                            // キー存在で判定する。TABLE-12 の重複 id については
+                            // `core::provider_result_is_valid` のドキュメント参照）。
+                            if dense_hits
+                                .iter()
+                                .any(|h| !dense_id_counts.contains_key(&h.id))
+                            {
+                                return Err(SqlSurfaceError::Internal {
+                                    detail:
+                                        "search provider returned a hit outside the visible id set"
+                                            .to_string(),
+                                });
+                            }
+                            let mut fused = hybrid::rrf_fuse(&dense_hits, &[], &cfg)
+                                .map_err(map_hybrid_error)?;
+                            fused.truncate(k_eff);
+                            fused
+                        }
+                        Some(idx) => hybrid::hybrid_search(
+                            dense_provider,
+                            input,
+                            idx,
+                            query_text,
+                            k_eff,
+                            &cfg,
+                        )
+                        .map_err(map_hybrid_error)?,
+                    };
+                    // このクエリで観測された密側再取得ラウンド数を `HnswIndexCache` の
+                    // 統計へ反映する（索引経路が一度も使われなかった場合は no-op。
+                    // §`HnswDenseProvider::finish` ドキュメンテーションコメント参照）。
+                    if let Some(adapter) = &hnsw_dense_provider {
+                        adapter.finish();
+                    }
+                    fused.into_iter().map(|h| (h.id, h.score)).collect()
+                }
+            }
+        })
+    };
+
+    // 反復スキャン・`off` 打ち切りの対象は、HNSW を使える `Ranking::Distance` の経路
+    // （`hnsw_full_visible_eligible`／`hnsw_subset_eligible`。DESC・LIMIT 省略・precision・hybrid・
+    // opclass 不一致・opt-in なしは構造的に偽）に限る。厳密走査とハイブリッドの結果は変えない
+    // （SQL-73 (4)）。
+    let hnsw_knn_path =
+        (hnsw_full_visible_eligible || hnsw_subset_eligible) && !completeness_unbounded;
+    let iter_cfg = match (&hnsw_cache, hnsw_knn_path) {
+        (Some(access), true) => Some((
+            access.provider.iterative_scan(),
+            access.provider.max_scan_tuples(),
+            access.provider.effective_ef_search(),
+        )),
+        _ => None,
+    };
+    let mut postfilter_done = false;
+    crate::interrupt::current_deadline().check()?;
+    let hits: Vec<(u64, f64)> = match iter_cfg {
+        // DISTANCE 先行（SCALAR 事後フィルタ）で WHERE があるときだけ、事後フィルタ後の件数が
+        // 目標（`OFFSET + LIMIT`）に届くまで取得件数を倍々に増やして再探索する。上限は
+        // `max_scan_tuples`（core.rs が SQL-46 の走査行数上限との min 済み）・`MAX_SEARCH_K`・
+        // 可視行数。上限到達はエラーにせずそれまでの結果を返す。
+        Some((mode, max_scan, _))
+            if mode != crate::hnsw::HnswIterativeScan::Off
+                && !plan.scalar_prefilter
+                && bound.has_where_filters() =>
+        {
+            let visible = slot_ids.len();
+            let cap = max_scan.min(core::MAX_SEARCH_K).min(visible).max(1);
+            let mut k_round = k_eff.min(cap).max(1);
+            let mut rounds: u64 = 0;
+            let (filtered, cap_hit) = loop {
+                crate::interrupt::current_deadline().check()?;
+                let raw = compute_hits(k_round)?;
+                rounds += 1;
+                let raw_len = raw.len();
+                let mut kept = apply_postfilter(raw)?;
+                if kept.len() >= k_eff {
+                    kept.truncate(k_eff);
+                    break (kept, false);
+                }
+                // 可視集合を使い切った（取得件数が要求に満たない、または全行を要求済み）。
+                if raw_len < k_round || k_round >= visible {
+                    break (kept, false);
+                }
+                if k_round >= cap {
+                    break (kept, true);
+                }
+                k_round = k_round.saturating_mul(2).min(cap);
+            };
+            if let Some(access) = hnsw_cache.as_ref() {
+                access.cache.record_iterative_scan(rounds, cap_hit);
+            }
+            postfilter_done = true;
+            filtered
+        }
+        // `off`: 反復せず、取得件数を実効 `ef_search` で打ち切る（pgvector の `off` 相当。
+        // 経路内部で索引探索か厳密走査へ縮退したかによらず件数を揃える）。
+        Some((crate::hnsw::HnswIterativeScan::Off, _, ef)) => {
+            let mut h = compute_hits(k_eff.min(ef).max(1))?;
+            h.truncate(ef);
+            h
+        }
+        _ => compute_hits(k_eff)?,
+    };
+
+    // DISTANCE 段の直後の確認点（Issue #1953。上の直前確認と対）。
+    crate::interrupt::current_deadline().check()?;
+
+    // SCALAR 事後フィルタ（DISTANCE 先行時のみ。TASK-76・SQL-7）。`on_visible_row` は
+    // `plan.scalar_prefilter == false` の間、等価条件を判定せず可視行を通過させて
+    // いるため、ここで `postfilter_verdicts`（`on_visible_row` が生の
+    // `row_codec::ScalarRef` に対して判定済みの真偽値。宣言箇所のコメント参照）を
+    // 引く。値の取得不能（データ不整合。fail-closed）は除去する。返却件数が
+    // `limit` 未満になり得る（under-fetch。オーバーサンプルによる救済は行わない）。
+    // 反復スキャン（SQL-73・Issue #2033）で事後フィルタを済ませた場合は二重にかけない。
+    let hits: Vec<(u64, f64)> = if plan.scalar_prefilter || postfilter_done {
+        hits
+    } else {
+        apply_postfilter(hits)?
     };
 
     // PRECISION ゲート段（TASK-162・SEARCH-9）。SCALAR 事後フィルタの**後**・

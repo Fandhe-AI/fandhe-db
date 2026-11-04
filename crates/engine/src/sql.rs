@@ -424,6 +424,13 @@ pub enum SqlOutcome {
     SetHnswEfSearch {
         reset: bool,
     },
+    /// `SET [SESSION] hnsw.iterative_scan|hnsw.max_scan_tuples ...`／`RESET ...` の成功応答
+    /// （タグは `SET`・`RESET`。SQL-73・Issue #2033）。新しい値は `SessionState` が保持する。
+    ///
+    /// **Issue #2033 で追加した破壊的変更（BREAKING CHANGE）**: variant を追加した。
+    SetHnswScanSetting {
+        reset: bool,
+    },
     /// `SHOW timezone`／`SHOW TIME ZONE` の応答（列名 `TimeZone`・text の 1 行。CommandComplete
     /// タグは PG と同じ `SHOW`。TABLE-33・Issue #1575）。行の形は通常の検索 SELECT と同じで、
     /// タグだけが異なるため `Query` とは別 variant にしている。

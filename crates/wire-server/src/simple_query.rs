@@ -857,6 +857,10 @@ pub(crate) fn map_outcome(outcome: SqlOutcome) -> OutcomeResponse {
         SqlOutcome::SetHnswEfSearch { reset } => OutcomeResponse::Command {
             tag: if reset { "RESET" } else { "SET" }.to_string(),
         },
+        // SQL-73・Issue #2033: `hnsw.iterative_scan`／`hnsw.max_scan_tuples` も `SET`／`RESET` タグ。
+        SqlOutcome::SetHnswScanSetting { reset } => OutcomeResponse::Command {
+            tag: if reset { "RESET" } else { "SET" }.to_string(),
+        },
         SqlOutcome::Show(result) => OutcomeResponse::Rows {
             result,
             shape: TagShape::Fixed("SHOW".to_string()),

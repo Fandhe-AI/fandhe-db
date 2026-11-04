@@ -108,7 +108,7 @@ fn invalid_values_are_rejected_without_changing_state() {
     assert_eq!(e.wire_code(), "0A000");
     let e = run(&core, &mut s, "SET hnsw.ef_search =").expect_err("missing value");
     assert_eq!(e.wire_code(), "42601");
-    let e = run(&core, &mut s, "SET hnsw.iterative_scan = 'off'").expect_err("unsupported name");
+    let e = run(&core, &mut s, "SET hnsw.no_such_setting = 1").expect_err("unsupported name");
     assert_eq!(e.wire_code(), "42601");
     assert_eq!(show(&core, &mut s), "42");
 }
