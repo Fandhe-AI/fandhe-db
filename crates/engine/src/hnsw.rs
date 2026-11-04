@@ -41,7 +41,7 @@
 //! # 距離カーネル
 //!
 //! 距離（類似度）計算はすべて `hnsw/metric.rs` の [`HnswMetric`]（Issue #1997）
-//! 経由で呼ぶ。variant は内積・L2・Cosine で、内積は `kernel::dot`（`isa.rs` の実行時検出
+//! 経由で呼ぶ。variant は内積（負の内積 <#> も再利用）・L2・Cosine・L1 で、内積は `kernel::dot`（`isa.rs` の実行時検出
 //! SIMD カーネルへの委譲経路）と同一の結果を返す。L2 は `-l2_sq`、Cosine は構築時に正規化したコピーとの内積。
 //! スコアは「大きいほど近い」（`kernel.rs::CandidateHit` と同じ規約。cosine
 //! 距離は呼び出し元が正規化済みベクトルを渡すことで内積に一致させる既存契約を
@@ -50,7 +50,7 @@
 //! スコアで `score(e, q) > score(e, r)` と読み替える（内積なら `dot` の比較）。
 //!
 //! brute-force 側のコサイン距離は `kernel::cosine_top_k`（Issue #1987）にある。
-//! HNSW は Issue #1998 で内積・L2・Cosine に対応した（親 #1996）。
+//! HNSW は Issue #1998 で内積・L2・Cosine に、Issue #1999 で L1 と負の内積（内積グラフの再利用）に対応した（親 #1996）。
 //!
 //! # 順序規約
 //!
@@ -2307,7 +2307,7 @@ impl HnswIndex {
             entry_point,
         } = builder;
         let graph = csr::CsrGraph::from_nodes(&nodes)?;
-        // L2 は f16・SQ8 用カーネルが無いので F32 へ縮退する（Issue #1998）。
+        // L2・L1 は f16・SQ8 用カーネルが無いので F32 へ縮退する（Issue #1998）。
         let precision = metric.effective_precision(precision);
         let (node_vectors, resident_precision) = match precision {
             ResidentPrecision::F32 => (NodeVectors::F32(vectors), ResidentPrecision::F32),
