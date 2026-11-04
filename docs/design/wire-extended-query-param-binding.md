@@ -15,7 +15,7 @@ wire 側（`crates/wire-server/src/extended_query.rs`）の Parse／Describe(S)�
 - 宣言 OID は Issue #2436（WIRE-24 ポインタ）以降、値の検証にも用いる（後述「Parse の型 OID
   指定時の判定規則」。値は常にリテラル置換経路を通る点は不変）。0 以外は
   `ParameterDescription` へ echo し、0・未宣言は engine の型推論
-  （`PreparedSql::param_types`。`ORDER BY <vec> <=> $n` は text 公告だがバイナリ不可の
+  （`PreparedSql::param_types`。`ORDER BY <vec> <距離演算子> $n` は text 公告だがバイナリ不可の
   `VectorText`、`USING PLAN($n)`／`USING OPERATION_ID $n` は `Text`、`WHERE <列> = $n`
   ・`INSERT` の行内 ordinal は当該列の型、未参照番号は `Text`）で補う。
   pgjdbc が文字列に varchar（1043）を宣言する点を踏まえ、宣言 OID の不一致は拒否しない。
@@ -108,7 +108,7 @@ node pg（`values` 付き `query`）・psql `\bind`・JDBC 等、パラメータ
   リテラル位置が `$n` 由来のダミー値かを示す 2 種のフラグを渡す。
   - `order_by_distance_literal_is_param`（`sql::params::
     order_by_distance_literal_is_param` が Parse 時点の元トークン列から判定）:
-    `ORDER BY <vec列> <=> $n` のベクトル位置が `$n` 由来の場合に限り、
+    `ORDER BY <vec列> <距離演算子> $n` のベクトル位置が `$n` 由来の場合に限り、
     ダミー値 `"0"` のベクトルリテラルとしての実パースを省略する。
   - `where_equality_dummy_flags`（`sql::params::
     where_equality_literal_is_param` が `WHERE` 等価述語ごとに判定）:
@@ -141,7 +141,7 @@ node pg（`values` 付き `query`）・psql `\bind`・JDBC 等、パラメータ
 
 ## 受理するプレースホルダ位置（規範形。これ以外は `42601`）
 
-1. `ORDER BY <vec列> <=> $n`（ベクトル位置。直前トークンが `DistanceOp`）
+1. `ORDER BY <vec列> <距離演算子> $n`（ベクトル位置。直前トークンが `DistanceOp`）
 2. `USING PLAN($n)`
 3. `USING OPERATION_ID $n`（INSERT／TRUNCATE／DELETE／UPDATE 共通の文末句）
 4. `WHERE <列> = $n`（トップレベル `WHERE` 節内側の等価条件のみ。`LIKE`・式
