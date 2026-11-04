@@ -1014,6 +1014,14 @@ ann_plan: hnsw_full_visible
 を in-process ハーネスのカウンタで確認済み（`docs/design/
 hnsw-rls-cardinality-switch.md`「Issue #659」節参照）。
 
+**Issue #2952 以降の注記**: self の kNN は `<#>`（負の内積）で投げるが、`<#>` は
+現行 HNSW の対応 metric 外であり厳密全走査になる（`ann_plan:
+plain_scan_opclass_mismatch`）。上記の `ann_probe` はコサイン既定の
+`USING PLAN` で到達を確認しているだけで、kNN 本体の ANN 到達は意味しない。
+実際の kNN 形の `EXPLAIN` は `ann_probe.knn_operator_plan` に記録し、到達しない
+ときは `hnsw_index_warm` を unsupported・`ef_search` を `null` とする。本節と
+下記の過去の hnsw 計測値は `<=>` 時点のもので、書き換えていない。
+
 ### `hnsw_index_warm`（索引構築の実行証跡）
 
 `sql::hnsw_cache` は同一世代内で索引を再利用する同期構築のため、初回クエリの

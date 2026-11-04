@@ -18,7 +18,7 @@ wheel が無いため、コンテナ内でのみ実行する）のコンテナ�
   (b) GPU f32: `faiss.index_cpu_to_gpu` で転送した f32 常駐 `GpuIndexFlatIP`
   (c) GPU f16: `GpuIndexFlatConfig.useFloat16=True`（ビルドに無ければ N/A を記録）
 
-距離指標は自作 DB の `<=>`（内積）に合わせ内積（`IndexFlatIP`）を使う。
+距離指標は自作 DB の `<#>`（負の内積の昇順＝内積の降順）に合わせ内積（`IndexFlatIP`）を使う。
 決定的合成データ（seed 固定・一様乱数 f32）で `rows × dim × batch` の格子を
 総当たりし、各構成 warmup 5 回・計測 20 回の `search` 所要時間（マイクロ秒）を
 集めて min/p50/p95/mean、および 1 クエリあたり p50（p50_us / batch）を出す。
