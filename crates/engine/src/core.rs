@@ -342,6 +342,54 @@ pub(crate) fn provider_result_is_valid(
     true
 }
 
+/// コサイン距離経路（[`crate::kernel::SearchProvider::search_cosine`] 系・HNSW 再採点後）の
+/// Top-k 契約検証（Issue #1991・SQL-33 (1)(3)。[`provider_result_is_valid`] の距離版）。
+///
+/// 検査内容: (1) 件数が `k` 以下、(2) `id` が可視行の多重集合に属し出現回数が上限内
+/// （不可視 id・捏造 id・同一行の重複返却の拒否。TABLE-12 のため集合ではなく多重集合で判定する）、
+/// (3) [`crate::search_order::cmp_distance_asc_then_tie`] で広義単調（距離昇順・同点は識別子昇順）、
+/// (4) NaN は末尾の連続区間にだけ現れる（この比較器が保証する並びそのもの）。`-inf` と `+inf` は
+/// 正常な距離として許す。fail-closed: 1 件でも違反すれば `false` で、呼び出し元は `Internal` で拒否する。
+pub(crate) fn distance_result_is_valid(
+    hits: &[crate::kernel::DistanceHit],
+    k: usize,
+    visible_id_counts: &HashMap<u64, usize>,
+) -> bool {
+    if hits.len() > k {
+        return false;
+    }
+    let mut seen_ids: HashMap<u64, usize> = HashMap::with_capacity(hits.len());
+    let mut prev: Option<&crate::kernel::DistanceHit> = None;
+    for hit in hits {
+        let Some(available) = visible_id_counts.get(&hit.id) else {
+            return false;
+        };
+        let seen = seen_ids.entry(hit.id).or_insert(0);
+        *seen = match seen.checked_add(1) {
+            Some(next) => next,
+            None => return false,
+        };
+        if *seen > *available {
+            return false;
+        }
+        if let Some(p) = prev {
+            // `cmp_distance_asc_then_tie` は NaN を全数値より後ろに置くため、NaN の後に数値が来る
+            // 並び（NaN が途中にある）もここで `Greater` として違反になる。
+            let ord = crate::search_order::cmp_distance_asc_then_tie(
+                p.distance,
+                crate::search_order::tie_key_for_response_id(p.id),
+                hit.distance,
+                crate::search_order::tie_key_for_response_id(hit.id),
+            );
+            if ord == std::cmp::Ordering::Greater {
+                return false;
+            }
+        }
+        prev = Some(hit);
+    }
+    true
+}
+
 /// 可視行の id 列（`arena.ids()` 等）から [`provider_result_is_valid`] の第 3 引数
 /// （id → 可視行件数の多重集合）を構築する共通ヘルパ。`core.rs`・`rls.rs`・
 /// `sql/exec.rs` の 3 経路が同一の構築方法を共有し、片側だけが集合へ退化するのを防ぐ
@@ -15279,6 +15327,8 @@ impl EngineCore {
                     crate::row_codec::Value::TimestampTz(_) => 8,
                     // INTERVAL 値は行コーデック上 16 バイト固定（Issue #1579）。
                     crate::row_codec::Value::Interval(_) => 16,
+                    // BIT 値は presence(1) + ビット長(4) + ceil(len/8) バイト（Issue #2021）。
+                    crate::row_codec::Value::Bit(v) => 5usize.saturating_add(v.as_bytes().len()),
                     // 配列値（Issue #888）は実際の行コーデック（`row_codec::
                     // scalar_array_entry_len`）が書き込むフレーム込みの全
                     // エンコード長をそのまま使う（presence(1)・flags(1)・

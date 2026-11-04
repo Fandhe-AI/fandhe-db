@@ -168,6 +168,13 @@ fn write_cell(out: &mut String, cell: &Cell) -> Result<(), ResponseEncodeError> 
             out.push('"');
             Ok(())
         }
+        // BIT(n) は `0`／`1` の JSON 文字列（型の公告は `"bit"`。TABLE-48・Issue #2021）。
+        Cell::Bit(v) => {
+            out.push('"');
+            escape_json_string_into(out, &v.format_text());
+            out.push('"');
+            Ok(())
+        }
         // TIME は `HH:MM:SS[.ffffff]` の JSON 文字列（Issue #1569）。
         Cell::Time(micros) => {
             out.push('"');
@@ -453,6 +460,7 @@ fn nosql_type_name(meta: &ColumnMeta) -> &'static str {
             ColumnType::Time => "time",
             ColumnType::TimestampTz => "timestamptz",
             ColumnType::Interval => "interval",
+            ColumnType::Bit(_) => "bit",
             ColumnType::Numeric { .. } => "numeric",
             ColumnType::Uuid => "uuid",
             ColumnType::Bytea => "bytea",

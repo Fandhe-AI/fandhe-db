@@ -70,6 +70,8 @@ struct SeedRow {
     lang: &'static str,
 }
 
+// `<=>` はコサイン距離（Issue #1991）なので、問い合わせ [1,0] との角度が id の昇順に広がる向きで
+// 構成する（大きさではなく向きで近さが決まる）。
 const SEED_ROWS: [SeedRow; 5] = [
     SeedRow {
         id: 1,
@@ -78,17 +80,17 @@ const SEED_ROWS: [SeedRow; 5] = [
     },
     SeedRow {
         id: 2,
-        embedding: [0.99, 0.0],
+        embedding: [1.0, 0.1],
         lang: "en",
     },
     SeedRow {
         id: 3,
-        embedding: [0.9, 0.0],
+        embedding: [1.0, 0.3],
         lang: "ja",
     },
     SeedRow {
         id: 4,
-        embedding: [0.8, 0.0],
+        embedding: [1.0, 0.5],
         lang: "ja",
     },
     SeedRow {
@@ -164,8 +166,8 @@ fn arbitrary_table_c1_pure_topk_matches_documents_and_independent_oracle() {
         .execute_sql(&ctx, &sql("kb_articles"))
         .expect("kb_articles C1 should succeed");
 
-    // 独立オラクル: f64 で総当たり内積を計算し、スコア降順・同点 id 昇順で Top-3 を選ぶ
-    // （`sql_surface.rs::sql1_pure_topk_matches_independent_exact_oracle` と同じ方式）。
+    // 独立オラクル: f64 で総当たりのコサイン距離（1 - cos）を計算し、距離昇順・同点 id 昇順で
+    // Top-3 を選ぶ（`sql_surface.rs::sql1_pure_topk_matches_independent_exact_oracle` と同じ方式）。
     let query = [1.0f64, 0.0];
     let mut scored: Vec<(u64, f64)> = SEED_ROWS
         .iter()
@@ -176,10 +178,16 @@ fn arbitrary_table_c1_pure_topk_matches_documents_and_independent_oracle() {
                 .zip(query.iter())
                 .map(|(&a, &b)| a as f64 * b)
                 .sum();
-            (row.id, dot)
+            let norm: f64 = row
+                .embedding
+                .iter()
+                .map(|&a| (a as f64) * (a as f64))
+                .sum::<f64>()
+                .sqrt();
+            (row.id, 1.0 - dot / norm)
         })
         .collect();
-    scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    scored.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
     let expected: Vec<u64> = scored.into_iter().take(3).map(|(id, _)| id).collect();
 
     assert_eq!(result_ids(&documents), expected);

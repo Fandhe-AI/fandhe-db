@@ -173,6 +173,8 @@ pub const fn http_status(class: ErrorClass) -> u16 {
         | ErrorClass::InvalidDatetimeFormat
         // Issue #1579: INTERVAL リテラルのフィールド値の範囲外（`22015`）も入力起因で 400。
         | ErrorClass::IntervalFieldOverflow
+        // Issue #2021: BIT(n) 列への文字列のビット数が宣言長と異なる（`22026`）も入力起因で 400。
+        | ErrorClass::StringDataLengthMismatch
         | ErrorClass::InvalidTextRepresentation
         // `DuplicateColumn`（`42701`。Issue #899）は `CREATE TABLE` の列リスト
         // 自体が不正という構文的な分類のため、他の 42xxx 系と同じ 400 とする。
@@ -262,7 +264,7 @@ mod tests {
 
     /// 期待表を明示的に列挙し、`ErrorClass::ALL` との突き合わせで非 vacuous に検証する。
     /// `match` にアームを足したが期待表の更新を忘れた、という乖離を (a)(b) が検出する。
-    const EXPECTED: [(ErrorClass, u16); 102] = [
+    const EXPECTED: [(ErrorClass, u16); 103] = [
         (ErrorClass::InvalidInput, 400),
         (ErrorClass::StringDataRightTruncation, 400),
         (ErrorClass::AuthInvalid, 401),
@@ -292,6 +294,7 @@ mod tests {
         (ErrorClass::DatetimeFieldOverflow, 400),
         (ErrorClass::InvalidDatetimeFormat, 400),
         (ErrorClass::IntervalFieldOverflow, 400),
+        (ErrorClass::StringDataLengthMismatch, 400),
         (ErrorClass::InvalidTextRepresentation, 400),
         (ErrorClass::LockNotAvailable, 503),
         (ErrorClass::SerializationFailure, 409),

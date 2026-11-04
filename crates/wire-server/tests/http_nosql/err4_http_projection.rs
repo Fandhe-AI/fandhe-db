@@ -86,6 +86,7 @@ fn schema() -> TableSchema {
             ColumnDef::new("body", ColumnType::Text, false),
             // INTERVAL の NoSQL 型束縛から `22015` へ到達する経路の検証用（Issue #1583）。
             ColumnDef::new("iv", ColumnType::Interval, true),
+            ColumnDef::new("bt", ColumnType::Bit(4), true),
         ],
     )
 }
@@ -307,7 +308,7 @@ fn query_as_alice(addr: SocketAddr, body: &[u8]) -> HttpResponse {
 /// `status.rs::EXPECTED`（`#[cfg(test)]` 内で外部から参照不可）と同値の
 /// 期待表。両者の乖離は [`err4_projection_table_is_closed_over_all_error_classes`]
 /// が `http_status` 経由で検出する。
-const EXPECTED_STATUS: [(&str, u16); 98] = [
+const EXPECTED_STATUS: [(&str, u16); 99] = [
     ("22000", 400),
     ("22001", 400),
     ("22012", 400),
@@ -455,6 +456,8 @@ const EXPECTED_STATUS: [(&str, u16); 98] = [
     ("2201B", 400),
     // `IntervalFieldOverflow`（`22015`。Issue #1579）: INTERVAL リテラルのフィールド値の範囲外。400。
     ("22015", 400),
+    // `StringDataLengthMismatch`（`22026`。Issue #2021）: BIT(n) 列へのビット数不一致。400。
+    ("22026", 400),
     // `DuplicateObject`（`42710`。TABLE-22、Issue #1195）: ERR-6 の新設行。400
     // （`42P07` の 409 とは揃えない）。
     ("42710", 400),
@@ -553,7 +556,7 @@ fn assert_projected_as(resp: &HttpResponse, expected_class: ErrorClass) {
 
 // --- R7: 射影表が ErrorClass::ALL 全体を閉じて覆うことの機械検証 -----------
 
-const _: () = assert!(ErrorClass::ALL.len() == 102);
+const _: () = assert!(ErrorClass::ALL.len() == 103);
 
 /// `wire_code` を共有する分類と、逆引き（`from_wire_code`）が返す分類の組
 /// （ERR-6。`23502`: TABLE-16・TASK-204・Issue #904、`23505`: Issue #1180）。
@@ -1149,6 +1152,27 @@ fn err4_f_interval_field_overflow_reachable_via_nosql_insert() {
         br#"{"op":"insert","table":"docs","rows":[{"id":1,"embedding":[0.1,0.2],"lang":"ja","path":"docs/1.md","body":"alpha","iv":"2147483648 days"}],"operation_id":"err4-op-iv-overflow"}"#,
     );
     assert_projected_as(&resp, ErrorClass::IntervalFieldOverflow);
+    assert_eq!(resp.status, 400, "{resp:?}");
+}
+
+/// `StringDataLengthMismatch`（`22026`。Issue #2021・TABLE-48）は NoSQL 表層の BIT(n) 列への
+/// `insert` でビット数が宣言長と異なる文字列を束縛したときに到達し、HTTP 400 へ射影される。
+/// 文字種の不正は `22P02`（400）になる。
+#[test]
+fn err4_f_string_data_length_mismatch_reachable_via_nosql_insert() {
+    let (core, _guard) = new_core();
+    let addr = spawn(core);
+    let resp = query_as_alice(
+        addr,
+        br#"{"op":"insert","table":"docs","rows":[{"id":1,"embedding":[0.1,0.2],"lang":"ja","path":"docs/1.md","body":"alpha","bt":"101"}],"operation_id":"err4-op-bt-len"}"#,
+    );
+    assert_projected_as(&resp, ErrorClass::StringDataLengthMismatch);
+    assert_eq!(resp.status, 400, "{resp:?}");
+    let resp = query_as_alice(
+        addr,
+        br#"{"op":"insert","table":"docs","rows":[{"id":2,"embedding":[0.1,0.2],"lang":"ja","path":"docs/2.md","body":"alpha","bt":"10x1"}],"operation_id":"err4-op-bt-digit"}"#,
+    );
+    assert_projected_as(&resp, ErrorClass::InvalidTextRepresentation);
     assert_eq!(resp.status, 400, "{resp:?}");
 }
 

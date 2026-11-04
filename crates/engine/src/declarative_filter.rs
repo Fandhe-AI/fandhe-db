@@ -839,6 +839,7 @@ fn bind_filter_op(
                 | ColumnType::Time
                 | ColumnType::TimestampTz
                 | ColumnType::Interval
+                | ColumnType::Bit(_)
                 | ColumnType::Array(_)
                 | ColumnType::Bytea
                 | ColumnType::Json

@@ -154,6 +154,8 @@ pub(crate) fn cell_to_value(cell: Cell, ty: &ColumnType) -> Result<Value, SqlSur
         (ColumnType::Time, Cell::Time(t)) => Ok(Value::Time(t)),
         (ColumnType::TimestampTz, Cell::TimestampTz(t)) => Ok(Value::TimestampTz(t)),
         (ColumnType::Interval, Cell::Interval(i)) => Ok(Value::Interval(i)),
+        // BIT(n) は値をそのまま運ぶ。宣言長と違う値は束縛の不整合として拒否する（Issue #2021）。
+        (ColumnType::Bit(n), Cell::Bit(b)) if b.bit_len() == *n => Ok(Value::Bit(b)),
         (ColumnType::Array(_), Cell::Array(a)) => Ok(Value::Array(a)),
         (ColumnType::Bytea, Cell::Bytes(b)) => Ok(Value::Bytes(b)),
         (ColumnType::Json | ColumnType::Jsonb, Cell::Json(j)) => Ok(Value::Json(j)),
@@ -217,6 +219,7 @@ pub(crate) fn value_to_cell(value: Value, ty: &ColumnType) -> Result<Cell, SqlSu
         (ColumnType::Time, Value::Time(t)) => Ok(Cell::Time(t)),
         (ColumnType::TimestampTz, Value::TimestampTz(t)) => Ok(Cell::TimestampTz(t)),
         (ColumnType::Interval, Value::Interval(i)) => Ok(Cell::Interval(i)),
+        (ColumnType::Bit(n), Value::Bit(b)) if b.bit_len() == *n => Ok(Cell::Bit(b)),
         (ColumnType::Array(_), Value::Array(a)) => Ok(Cell::Array(a)),
         (ColumnType::Bytea, Value::Bytes(b)) => Ok(Cell::Bytes(b)),
         (ColumnType::Json | ColumnType::Jsonb, Value::Json(j)) => Ok(Cell::Json(j)),

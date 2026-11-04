@@ -11,7 +11,9 @@
 //!
 //! コサイン距離の brute-force 経路（Issue #1987）は子モジュール `cosine` にあり、
 //! 内積経路とは規約が異なる（距離は昇順・f64、同点は id 昇順）。内積の
-//! [`SearchProvider`] は変更せず、`<=>` の実行切り替えは #1991 で行う。
+//! [`SearchProvider::search`]／`search_subset` は変更せず（`<#>` の実行と Rust API の内積検索が使う）、
+//! `<=>` の実行は既定実装付きの [`SearchProvider::search_cosine`]／`search_cosine_subset` 経由で
+//! このカーネルへ切り替わった（Issue #1991）。
 //!
 //! 二値（bit）ベクトルの Hamming・Jaccard 距離と Top-k（Issue #2022・TABLE-48 ポインタ）は
 //! 子モジュール `bit` にあり、popcount は `isa.rs` の `PopcountKernel` に委ねる。
@@ -33,9 +35,10 @@ pub use bit::{bit_top_k, hamming_distance, jaccard_distance, BitMetric, BitSearc
 
 mod cosine;
 pub use cosine::{
-    cosine_distance, cosine_distance_from_parts, cosine_top_k, row_norms_sq, CosineSearchInput,
-    DistanceHit,
+    cosine_distance, cosine_distance_from_parts, cosine_top_k, cosine_top_k_slots, row_norms_sq,
+    CosineSearchInput, DistanceHit,
 };
+pub(crate) use cosine::{select_farthest_distance_k, AscDistanceTopK};
 
 /// **候補**検索結果 1 件（候補識別子とスコア）。[`SearchProvider`] の戻り値型。
 ///
@@ -210,49 +213,9 @@ pub trait SearchProvider: Send + Sync {
         &self,
         input: SubsetSearchInput<'_>,
     ) -> Result<Vec<CandidateHit>, KernelError> {
-        let dim = input.dim as usize;
-        if input.query.len() != dim {
-            return Err(KernelError::DimMismatch {
-                expected: input.dim,
-                found: input.query.len(),
-            });
-        }
-        if input.query.iter().any(|v| !v.is_finite()) {
-            return Err(KernelError::NonFiniteQuery);
-        }
-        if input.k == 0 || input.slots.is_empty() {
+        let Some((ids, gathered)) = gather_subset_rows(&input)? else {
             return Ok(Vec::new());
-        }
-        // untrusted 経路由来ではない（`slots.len()` は呼び出し元〔`sql::exec`〕が
-        // 候補削減で決める値だが、`MAX_ARENA_ROWS` で上限が掛かっている）が、
-        // 無制限確保を避けるため `try_reserve_exact` で明示的に処理する
-        // （.claude/rules/coding-rust.md「untrusted 入力の扱い」と同じ流儀を
-        // ここでも踏襲する）。
-        let gather_len = input.slots.len().saturating_mul(dim);
-        let mut gathered: Vec<f32> = Vec::new();
-        gathered
-            .try_reserve_exact(gather_len)
-            .map_err(|_| KernelError::DimMismatch {
-                expected: input.dim,
-                found: gather_len,
-            })?;
-        let mut ids: Vec<u64> = Vec::new();
-        ids.try_reserve_exact(input.slots.len())
-            .map_err(|_| KernelError::DimMismatch {
-                expected: input.dim,
-                found: input.slots.len(),
-            })?;
-        for &slot in input.slots {
-            let start = (slot as usize).saturating_mul(dim);
-            let end = start.saturating_add(dim);
-            let Some(row) = input.vectors.get(start..end) else {
-                // `SearchInput` の行単位 skip 規約（`CpuScalarProvider::search`
-                // ドキュメント参照）と同じ理由で、範囲外の行だけを候補から外す。
-                continue;
-            };
-            gathered.extend_from_slice(row);
-            ids.push(slot as u64);
-        }
+        };
         self.search(SearchInput {
             ids: &ids,
             vectors: &gathered,
@@ -261,6 +224,94 @@ pub trait SearchProvider: Send + Sync {
             k: input.k,
         })
     }
+
+    /// コサイン距離（`<=>`。`1 - cos`）の総当たり Top-k（Issue #1991・SQL-33 (1)(3)）。
+    ///
+    /// 契約: 距離昇順、同点は候補識別子（`input.ids`）の昇順、ゼロノルム等の NaN 行は末尾に置き
+    /// `k` の枠を消費する。返す件数は `k` 以下で、`id` は `input.ids` の値をそのまま返す。
+    /// 入力は呼び出し元が可視行だけへ絞り込み済みであること（テナント境界は呼び出し元で完結する）。
+    /// 既定実装は [`cosine_top_k`]（単一スレッド・ノルム²をその場で計算する C1）。内積用
+    /// [`Self::search`] とは別メソッドなので、既存のカスタム provider は無変更で動き、`<=>` は
+    /// 参照カーネルで評価される。差し替えたい実装はこのメソッドを上書きする。
+    fn search_cosine(&self, input: CosineSearchInput<'_>) -> Result<Vec<DistanceHit>, KernelError> {
+        cosine_top_k(input)
+    }
+
+    /// [`Self::search_cosine`] のスロット指定版（スカラー索引の候補マスク経路。Issue #654 の
+    /// `search_subset` と同型）。行列全体を借用したまま `input.slots` の行だけを走査し、返る
+    /// [`DistanceHit::id`] は `slots[i] as u64`（呼び出し元がスロット番号として解釈する）。
+    /// 既定実装は `slots` の行を gather してから [`Self::search_cosine`] へ委譲する（`search_subset` が
+    /// `search` へ委譲するのと同型。`search_cosine` だけを上書きした provider もマスク経路で効く）。
+    /// 複製を避ける最適化は [`CpuScalarProvider`] が [`cosine_top_k_slots`] で提供する。
+    fn search_cosine_subset(
+        &self,
+        input: SubsetSearchInput<'_>,
+    ) -> Result<Vec<DistanceHit>, KernelError> {
+        let Some((ids, gathered)) = gather_subset_rows(&input)? else {
+            return Ok(Vec::new());
+        };
+        self.search_cosine(CosineSearchInput {
+            ids: &ids,
+            vectors: &gathered,
+            row_norms_sq: None,
+            dim: input.dim,
+            query: input.query,
+            k: input.k,
+        })
+    }
+}
+
+/// gather 結果（候補 id 列と行列を連結したバッファ）。
+type GatheredRows = (Vec<u64>, Vec<f32>);
+
+/// `SubsetSearchInput` の `slots` が指す行を一時バッファへ gather し、`(ids, vectors)` を返す
+/// （`SearchProvider::search_subset`／`search_cosine_subset` の既定実装が共有する。Issue #654・#1991）。
+/// `k == 0` または候補が空なら `None`（呼び出し側は空結果を返す）。範囲外の行だけを候補から外す。
+fn gather_subset_rows(input: &SubsetSearchInput<'_>) -> Result<Option<GatheredRows>, KernelError> {
+    let dim = input.dim as usize;
+    if input.query.len() != dim {
+        return Err(KernelError::DimMismatch {
+            expected: input.dim,
+            found: input.query.len(),
+        });
+    }
+    if input.query.iter().any(|v| !v.is_finite()) {
+        return Err(KernelError::NonFiniteQuery);
+    }
+    if input.k == 0 || input.slots.is_empty() {
+        return Ok(None);
+    }
+    // untrusted 経路由来ではない（`slots.len()` は呼び出し元〔`sql::exec`〕が
+    // 候補削減で決める値だが、`MAX_ARENA_ROWS` で上限が掛かっている）が、
+    // 無制限確保を避けるため `try_reserve_exact` で明示的に処理する
+    // （.claude/rules/coding-rust.md「untrusted 入力の扱い」と同じ流儀を
+    // ここでも踏襲する）。
+    let gather_len = input.slots.len().saturating_mul(dim);
+    let mut gathered: Vec<f32> = Vec::new();
+    gathered
+        .try_reserve_exact(gather_len)
+        .map_err(|_| KernelError::DimMismatch {
+            expected: input.dim,
+            found: gather_len,
+        })?;
+    let mut ids: Vec<u64> = Vec::new();
+    ids.try_reserve_exact(input.slots.len())
+        .map_err(|_| KernelError::DimMismatch {
+            expected: input.dim,
+            found: input.slots.len(),
+        })?;
+    for &slot in input.slots {
+        let start = (slot as usize).saturating_mul(dim);
+        let end = start.saturating_add(dim);
+        let Some(row) = input.vectors.get(start..end) else {
+            // `SearchInput` の行単位 skip 規約（`CpuScalarProvider::search`
+            // ドキュメント参照）と同じ理由で、範囲外の行だけを候補から外す。
+            continue;
+        };
+        gathered.extend_from_slice(row);
+        ids.push(slot as u64);
+    }
+    Ok(Some((ids, gathered)))
 }
 
 /// 既定の CPU-only 参照実装。内積スコアでの総当たり Top-k（`O(n log k)`、`BinaryHeap`
@@ -272,6 +323,14 @@ pub trait SearchProvider: Send + Sync {
 pub struct CpuScalarProvider;
 
 impl SearchProvider for CpuScalarProvider {
+    /// 行列を複製せず直接走査する（既定の gather 経由と同一結果。Issue #1991）。
+    fn search_cosine_subset(
+        &self,
+        input: SubsetSearchInput<'_>,
+    ) -> Result<Vec<DistanceHit>, KernelError> {
+        cosine_top_k_slots(input)
+    }
+
     fn search(&self, input: SearchInput<'_>) -> Result<Vec<CandidateHit>, KernelError> {
         let dim = input.dim as usize;
         if input.query.len() != dim {
@@ -951,6 +1010,31 @@ mod tests {
             .expect("overridden search_subset ok");
 
         assert_eq!(via_default, via_override);
+    }
+
+    /// Issue #1991 レビュー指摘: 既定 `search_cosine_subset` は `search_cosine` の上書きへ委譲する。
+    #[test]
+    fn default_search_cosine_subset_delegates_to_search_cosine() {
+        struct Failing;
+        impl SearchProvider for Failing {
+            fn search(&self, _: SearchInput<'_>) -> Result<Vec<CandidateHit>, KernelError> {
+                Ok(Vec::new())
+            }
+            fn search_cosine(
+                &self,
+                _: CosineSearchInput<'_>,
+            ) -> Result<Vec<DistanceHit>, KernelError> {
+                Err(KernelError::WorkerPanicked)
+            }
+        }
+        let r = Failing.search_cosine_subset(SubsetSearchInput {
+            slots: &[0, 1],
+            vectors: &[1.0, 0.0, 0.0, 1.0],
+            dim: 2,
+            query: &[1.0, 0.0],
+            k: 2,
+        });
+        assert_eq!(r, Err(KernelError::WorkerPanicked));
     }
 
     #[test]

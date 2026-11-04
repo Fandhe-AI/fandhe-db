@@ -4658,6 +4658,37 @@ fn validate_set_assignments(
                     ))));
                 }
             }
+            (crate::catalog::ColumnType::Bit(declared), crate::row_codec::Value::Bit(bits)) => {
+                // BIT(n) の SET 値は宣言長と一致し、行 codec 上の長さ（presence(1) + ビット長(4) +
+                // 本体）が累計上限を超えないことを、対象行の探索より前に検証する（Issue #2021）。
+                if bits.bit_len() != *declared {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(
+                        "SET value length does not match BIT column".to_string(),
+                    )));
+                }
+                let entry_len = u32::try_from(bits.as_bytes().len())
+                    .ok()
+                    .and_then(|n| n.checked_add(5))
+                    .ok_or_else(|| {
+                        TenantWriteError::Catalog(CatalogError::Invalid(
+                            "scalar payload length overflow".to_string(),
+                        ))
+                    })?;
+                set_text_payload_total =
+                    set_text_payload_total
+                        .checked_add(entry_len)
+                        .ok_or_else(|| {
+                            TenantWriteError::Catalog(CatalogError::Invalid(
+                                "scalar payload length overflow".to_string(),
+                            ))
+                        })?;
+                if set_text_payload_total > crate::row_codec::MAX_SCALAR_PAYLOAD_LEN {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(format!(
+                        "scalar payload length {set_text_payload_total} exceeds limit {}",
+                        crate::row_codec::MAX_SCALAR_PAYLOAD_LEN
+                    ))));
+                }
+            }
             (crate::catalog::ColumnType::Array(array_ty), crate::row_codec::Value::Array(av)) => {
                 // 配列 SET 値のフレーム長検証（対象行の探索より前に行う。
                 // Issue #888・D-A3。`row_codec::scalar_array_entry_len` を
@@ -4858,6 +4889,7 @@ fn validate_set_assignments(
             | (crate::catalog::ColumnType::Time, _)
             | (crate::catalog::ColumnType::TimestampTz, _)
             | (crate::catalog::ColumnType::Interval, _)
+            | (crate::catalog::ColumnType::Bit(_), _)
             | (crate::catalog::ColumnType::Array(_), _)
             | (crate::catalog::ColumnType::Bytea, _)
             | (crate::catalog::ColumnType::Json, _)

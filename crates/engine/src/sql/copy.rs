@@ -683,6 +683,8 @@ fn bind_copy_record(
                 | ColumnType::TimestampTz
                 | ColumnType::Interval => bind_datetime_literal(name, column.ty.clone(), s)?,
                 ColumnType::Uuid => bind_uuid_literal(s, name)?,
+                // BIT(n) は INSERT／UPDATE／UPSERT／DEFAULT と同じ束縛を共有する（Issue #2021）。
+                ColumnType::Bit(n) => crate::sql::parser::bind_bit_literal(name, *n, s)?,
                 // COPY のフィールドは常に文字列のためリテラル種別を持たず、
                 // `InsertLiteral::String` として包んでから INSERT／UPDATE／
                 // UPSERT と共有する `bind_numeric_literal` へ渡す（Issue
@@ -804,6 +806,8 @@ fn bound_insert_byte_len(bound: &BoundInsert) -> Result<usize, SqlSurfaceError> 
             Value::TimestampTz(_) => 8,
             // INTERVAL 値は行コーデック上 16 バイト固定（Issue #1579）。
             Value::Interval(_) => 16,
+            // BIT 値は presence(1) + ビット長(4) + ceil(len/8)（Issue #2021）。
+            Value::Bit(v) => 5usize.saturating_add(v.as_bytes().len()),
             // NUMERIC／UUID 値は行コーデック上いずれも 16 バイト固定
             // （`core.rs::validate_insert_batch_byte_and_chunk_limits` と
             // 同一の判定対象量定義。Issue #885・#887）。

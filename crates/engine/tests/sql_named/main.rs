@@ -10,6 +10,7 @@ mod legacy_table;
 #[path = "../../src/test_util/temp_db.rs"]
 mod temp_db;
 
+mod sql33_cosine_negip_execution;
 mod sql33_distance_kind_acceptance;
 mod sql33_knn_desc;
 mod sql33_knn_limit_omitted;
@@ -34,6 +35,7 @@ mod sql_alter_table_unique_constraint;
 mod sql_arena_cache;
 mod sql_array_fn;
 mod sql_array_predicates;
+mod sql_bit_column;
 mod sql_cast_datetime_json_misc;
 mod sql_cast_numeric_text_bool;
 mod sql_cast_syntax;

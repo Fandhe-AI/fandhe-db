@@ -6341,6 +6341,10 @@ pub(super) fn bind_expr_any(
                         BoundExpr::IntervalColumnRef { index },
                         ExprType::Interval,
                     )),
+                    // BIT(n) 列は式内参照を持たない（ビット列の演算子・関数は後続 Issue。Issue #2021）。
+                    ColumnType::Bit(_) => Err(SqlSurfaceError::invalid_input(format!(
+                        "column {name:?} cannot be used in an expression (BIT columns are not supported)"
+                    ))),
                     ColumnType::Array(_) => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} cannot be used in an expression (ARRAY columns are not supported)"
                     ))),
@@ -7988,6 +7992,7 @@ fn column_type_label(ty: &ColumnType) -> &'static str {
         ColumnType::Time => "time",
         ColumnType::TimestampTz => "timestamp with time zone",
         ColumnType::Interval => "interval",
+        ColumnType::Bit(_) => "bit",
         ColumnType::Array(_) => "array",
         ColumnType::Bytea => "bytea",
         ColumnType::Json => "json",

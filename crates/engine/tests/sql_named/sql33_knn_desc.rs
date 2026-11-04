@@ -8,9 +8,10 @@
 //! - 他テナントの行は結果に入らない。`precision` モードとの併用は `0A000`。
 //! - `EXPLAIN` は `ann_plan: plain_scan_descending` を出し、`index=` 注記を付けない。
 //!
-//! 距離種別の追加（#1977 ほか）に備え、一致検査は [`Metric`]（演算子とスコア関数の組）で
-//! パラメータ化している。まだ SQL から実行できない種別は、`DESC` を付けても `ASC` と同じ
-//! エラーコードで拒否されること（fail-closed）だけを確かめる。
+//! 距離種別の追加（#1977 ほか）に備え、一致検査は [`Metric`]（演算子と距離関数の組）で
+//! パラメータ化している。`<=>`（コサイン距離）と `<#>`（負の内積）は Issue #1991 で接続済み。
+//! まだ SQL から実行できない種別は、`DESC` を付けても `ASC` と同じエラーコードで拒否されること
+//! （fail-closed）だけを確かめる。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
@@ -27,22 +28,52 @@ use temp_db::{unique_db_path, CleanupGuard};
 
 const DIM: usize = 3;
 
-/// 距離演算子と、その昇順経路が使うスコア（大きいほど近い）の組。
+/// 距離演算子と、その昇順経路が使う距離値（小さいほど近い。NaN は最も遠い）の組。
 struct Metric {
     op: &'static str,
-    score: fn(&[f32], &[f32]) -> f32,
+    distance: fn(&[f32], &[f32]) -> f64,
 }
 
 fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
+/// `<=>`: `1 - cos`（f64。ゼロノルムは NaN）。成分は 0.5 の倍数で、f32 の内積・ノルム²は厳密。
+fn cosine_distance(a: &[f32], b: &[f32]) -> f64 {
+    let (na, nb) = (f64::from(dot(a, a)), f64::from(dot(b, b)));
+    if na * nb == 0.0 {
+        return f64::NAN;
+    }
+    1.0 - (f64::from(dot(a, b)) / (na * nb).sqrt()).clamp(-1.0, 1.0)
+}
+
+/// `<#>`: 負の内積。
+fn neg_inner_product(a: &[f32], b: &[f32]) -> f64 {
+    -f64::from(dot(a, b))
+}
+
 /// 現時点で SQL から実行できる距離種別。後続 Issue が種別を足すときはここへ追記する。
 fn runnable_metrics() -> Vec<Metric> {
-    vec![Metric {
-        op: "<=>",
-        score: dot,
-    }]
+    vec![
+        Metric {
+            op: "<=>",
+            distance: cosine_distance,
+        },
+        Metric {
+            op: "<#>",
+            distance: neg_inner_product,
+        },
+    ]
+}
+
+/// 遠い順の比較（距離の降順。NaN は先頭。同点は id 昇順）。
+fn far_first(a: &(u64, f64), b: &(u64, f64)) -> std::cmp::Ordering {
+    match (a.1.is_nan(), b.1.is_nan()) {
+        (true, true) => a.0.cmp(&b.0),
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        (false, false) => b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)),
+    }
 }
 
 /// (id, embedding, lang)。成分は 0.5 の倍数で、どの加算順序でも内積が厳密になる。
@@ -136,15 +167,15 @@ fn query_literal(q: &[f32; DIM]) -> String {
     format!("[{},{},{}]", q[0], q[1], q[2])
 }
 
-/// テスト側の全走査モデル: 全行を同じスコア関数で計算し、遠い順（スコア昇順）・同点は id 昇順に
+/// テスト側の全走査モデル: 全行を同じ距離関数で計算し、遠い順（距離降順・NaN 先頭）・同点は id 昇順に
 /// 安定ソートして先頭 `k` 件の id を返す。
 fn model_desc(metric: &Metric, q: &[f32; DIM], keep: impl Fn(&str) -> bool, k: usize) -> Vec<u64> {
-    let mut all: Vec<(u64, f32)> = rows()
+    let mut all: Vec<(u64, f64)> = rows()
         .into_iter()
         .filter(|(_, _, lang)| keep(lang))
-        .map(|(id, v, _)| (id, (metric.score)(&v, q)))
+        .map(|(id, v, _)| (id, (metric.distance)(&v, q)))
         .collect();
-    all.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+    all.sort_by(far_first);
     all.into_iter().take(k).map(|(id, _)| id).collect()
 }
 
@@ -222,7 +253,7 @@ fn sql33_desc_matches_exact_full_scan_on_hnsw_engine() {
     }
 }
 
-// SQL-33 (2): LIMIT が行数以上なら全行が返り、DESC は ASC の厳密な逆順（同点は id 昇順のまま）。
+// SQL-33 (2)(3): LIMIT が行数以上なら全行が返り、DESC は距離降順（ゼロノルム行は NaN で先頭）。
 #[test]
 fn sql33_desc_with_large_limit_returns_every_row_and_reverses_scores() {
     let path = unique_db_path("sql33-desc-all-rows");
@@ -242,18 +273,26 @@ fn sql33_desc_with_large_limit_returns_every_row_and_reverses_scores() {
     assert_eq!(desc.rows.len(), rows().len());
     assert_eq!(asc.rows.len(), rows().len());
     // 同じ行のスコアは昇順と等しい（並びだけが逆になる）。
+    // `ResultRow.score` は演算子の距離値（Issue #1991。`<=>` は `1 - cos`）。NaN も含めビットで比べる。
     for row in &desc.rows {
         let same = asc
             .rows
             .iter()
             .find(|r| r.id == row.id)
             .expect("row in asc");
-        assert_eq!(row.score, same.score, "id={}", row.id);
+        assert_eq!(row.score.to_bits(), same.score.to_bits(), "id={}", row.id);
     }
-    let desc_scores: Vec<f64> = desc.rows.iter().map(|r| r.score).collect();
-    let mut sorted = desc_scores.clone();
-    sorted.sort_by(|a, b| a.total_cmp(b));
-    assert_eq!(desc_scores, sorted, "DESC must be farthest first");
+    // 先頭は NaN（id 5 のゼロノルム行）で、残りは距離の降順。
+    let pairs: Vec<(u64, f64)> = desc.rows.iter().map(|r| (r.id, r.score)).collect();
+    assert_eq!(pairs[0].0, 5);
+    assert!(pairs[0].1.is_nan());
+    let mut sorted = pairs.clone();
+    sorted.sort_by(far_first);
+    assert_eq!(
+        pairs.iter().map(|p| p.0).collect::<Vec<_>>(),
+        sorted.iter().map(|p| p.0).collect::<Vec<_>>(),
+        "DESC must be farthest first"
+    );
 }
 
 // SQL-33 (2): 明示の ASC は方向省略と同じ結果。
@@ -285,7 +324,7 @@ fn sql33_desc_never_returns_other_tenants_rows() {
     let _guard = CleanupGuard(path.clone());
     let core = new_core(&path);
     seed(&core);
-    // 他テナントの行は問い合わせから最も遠い値（DESC の先頭になりうる）にする。
+    // 他テナントの行は問い合わせから最も遠い値（コサイン距離 2。DESC の先頭になりうる）にする。
     seed_tenant(
         &core,
         "tenant-b",
@@ -306,7 +345,8 @@ fn sql33_desc_never_returns_other_tenants_rows() {
         "tenant-b",
         "SELECT id FROM documents ORDER BY embedding <=> '[1,0,0]' DESC LIMIT 100",
     );
-    assert_eq!(ids(&b), vec![102, 101]);
+    // どちらもコサイン距離 2 の同点なので、順序キー昇順（Issue #1991。内積順では 102 が先だった）。
+    assert_eq!(ids(&b), vec![101, 102]);
 }
 
 // precision の確信度ゲートは遠い順では意味が定まらないため、併用は 0A000（fail-closed）。
@@ -352,7 +392,7 @@ fn sql33_desc_on_not_yet_runnable_operators_fails_like_asc() {
     let _guard = CleanupGuard(path.clone());
     let core = new_core(&path);
     seed(&core);
-    for op in ["<->", "<#>", "<+>"] {
+    for op in ["<->", "<+>"] {
         let asc = {
             let mut session = SessionState::default();
             core.execute_sql_in_session(

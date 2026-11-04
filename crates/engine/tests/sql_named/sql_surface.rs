@@ -444,11 +444,13 @@ fn sql4_hybrid_tie_group_across_limit_boundary_is_deterministic() {
     // （上記コメント参照）。id=90〜92 は `anchor` を含まない埋め草行で、密内積を
     // 行 A・B より小さくして密ランク 2 以降に押し出す（タイ組の構成に影響しない）。
     let rows: [(u64, [f32; 2], Option<&str>); 5] = [
+        // 密側は `<=>`（コサイン距離。Issue #1991）で順位付けされるため、向きの近さで
+        // 行 A（問い合わせ [1,0] と同方向）> 行 B > 埋め草の順になるよう角度を変えてある。
         (1, [1.0, 0.0], Some("anchor filler filler")),
-        (2, [0.9, 0.0], Some("anchor anchor anchor")),
-        (90, [0.1, 0.0], None),
-        (91, [0.05, 0.0], None),
-        (92, [0.01, 0.0], None),
+        (2, [0.9, 0.3], Some("anchor anchor anchor")),
+        (90, [0.5, 1.0], None),
+        (91, [0.2, 1.0], None),
+        (92, [0.0, 1.0], None),
     ];
     for (id, emb, body) in rows {
         let value = match body {

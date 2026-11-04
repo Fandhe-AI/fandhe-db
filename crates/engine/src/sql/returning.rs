@@ -105,6 +105,26 @@ fn try_clone_array_for_budget(
     Ok(array_value.clone())
 }
 
+/// `BIT(n)` セルの選択的複製（累計バイト量を確保前に検証。BYTEA 版と同方針。Issue #2021）。
+fn try_alloc_bit_for_budget(
+    v: &crate::bit_string::BitString,
+    budget: &mut usize,
+    cap: usize,
+) -> Result<crate::bit_string::BitString, SqlSurfaceError> {
+    // wire／HTTP 応答ではテキスト展開（ビット数と同じ文字数）されるため、packed 分は委譲先が、
+    // 展開による増分（ビット数 − packed バイト数）をここで先に計上する（`sql::scan` と同方針）。
+    let expansion = usize::try_from(v.bit_len())
+        .unwrap_or(usize::MAX)
+        .saturating_sub(v.as_bytes().len());
+    *budget = try_accumulate_budget(*budget, expansion, cap)?;
+    let bytes = try_alloc_bytes_for_budget(v.as_bytes(), budget, cap)?;
+    crate::bit_string::BitString::from_parts(v.bit_len(), bytes).map_err(|e| {
+        SqlSurfaceError::Internal {
+            detail: e.message().to_string(),
+        }
+    })
+}
+
 /// BYTEA セルの選択的複製（累計バイト量を確保前に検証。上記テキスト版と同方針。
 /// UTF-8 検証を行わない点のみ異なる。Issue #886）。
 fn try_alloc_bytes_for_budget(
@@ -215,6 +235,11 @@ pub(crate) fn project_row(
                 Some(Value::Time(t)) => Cell::Time(*t),
                 Some(Value::TimestampTz(t)) => Cell::TimestampTz(*t),
                 Some(Value::Interval(v)) => Cell::Interval(*v),
+                Some(Value::Bit(v)) => Cell::Bit(try_alloc_bit_for_budget(
+                    v,
+                    budget,
+                    MAX_RETURNING_RESULT_BYTES,
+                )?),
                 Some(Value::Array(array_value)) => Cell::Array(try_clone_array_for_budget(
                     array_value,
                     budget,
@@ -257,6 +282,19 @@ pub(crate) fn project_row(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// BIT は packed バイト数ではなくテキスト展開後（ビット数）で課金する。
+    #[test]
+    fn try_alloc_bit_for_budget_charges_text_expanded_length() {
+        let v = crate::bit_string::BitString::parse_text(&"1".repeat(64), 64).expect("parse");
+        // packed は 8 バイトだが展開後は 64 文字。cap=63 は拒否、64 は許容。
+        let mut b = 0usize;
+        let err = try_alloc_bit_for_budget(&v, &mut b, 63).expect_err("must exceed cap");
+        assert_eq!(err.wire_code(), "54000");
+        let mut b = 0usize;
+        try_alloc_bit_for_budget(&v, &mut b, 64).expect("fits exactly");
+        assert_eq!(b, 64);
+    }
 
     /// 累計が上限を超える場合は確保前に `54000`（`PayloadTooLarge`）で拒否する
     /// （`try_accumulate_budget` は private のため本モジュール内でのみ検証可能）。

@@ -187,6 +187,30 @@ impl SearchProvider for RecordingProvider {
             .push((input.slots.len(), input.vectors.len()));
         engine::kernel::CpuScalarProvider.search_subset(input)
     }
+
+    // `<=>` はコサイン距離（Issue #1991）の経路を通るため、同じ記録先へ対応づける
+    // （`search_cosine` が複製前提の従来経路、`search_cosine_subset` がマスク経路）。
+    fn search_cosine(
+        &self,
+        input: engine::kernel::CosineSearchInput<'_>,
+    ) -> Result<Vec<engine::kernel::DistanceHit>, KernelError> {
+        self.search_calls
+            .lock()
+            .expect("lock")
+            .push((input.ids.len(), input.vectors.len()));
+        engine::kernel::CpuScalarProvider.search_cosine(input)
+    }
+
+    fn search_cosine_subset(
+        &self,
+        input: SubsetSearchInput<'_>,
+    ) -> Result<Vec<engine::kernel::DistanceHit>, KernelError> {
+        self.search_subset_calls
+            .lock()
+            .expect("lock")
+            .push((input.slots.len(), input.vectors.len()));
+        engine::kernel::CpuScalarProvider.search_cosine_subset(input)
+    }
 }
 
 fn new_core_with_recording(storage: Storage) -> (EngineCore, std::sync::Arc<RecordingProvider>) {
@@ -204,6 +228,18 @@ fn new_core_with_recording(storage: Storage) -> (EngineCore, std::sync::Arc<Reco
             input: SubsetSearchInput<'_>,
         ) -> Result<Vec<CandidateHit>, KernelError> {
             self.0.search_subset(input)
+        }
+        fn search_cosine(
+            &self,
+            input: engine::kernel::CosineSearchInput<'_>,
+        ) -> Result<Vec<engine::kernel::DistanceHit>, KernelError> {
+            self.0.search_cosine(input)
+        }
+        fn search_cosine_subset(
+            &self,
+            input: SubsetSearchInput<'_>,
+        ) -> Result<Vec<engine::kernel::DistanceHit>, KernelError> {
+            self.0.search_cosine_subset(input)
         }
     }
     let core = EngineCore::from_storage(storage, Box::new(ArcProvider(provider.clone())));
