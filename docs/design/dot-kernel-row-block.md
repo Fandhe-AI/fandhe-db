@@ -134,6 +134,7 @@ x86_64 版（`isa/x86_block4.rs`）と同型の構成で、新設サブモジュ
   完全一致する（`tests/isa.rs::l2_top_k_matches_scalar_on_integer_fixture`）。
 - 生成コード検査: `fsub v.4s`・`fmla v.4s` の出現を必須化（`scripts/check_simd_codegen.sh`）。
 - x86 の SIMD 本体は Issue #1982。現状 x86 アームは scalar 委譲（`unsafe` なし）。
+- 内積比の実測は `dot-kernel-multi-accumulator.md`「Issue #1984 追記」節。
 
 ## 3. 生成コード検査で発覚した問題と対処（実装時の主要な設計変更点）
 
