@@ -30,8 +30,10 @@
 //! - [`HnswMetric::Cosine`]: ADR `docs/design/cosine-distance-method.md` の C2′（正規化済み
 //!   内積への帰着）。構築時に行を 1 回だけ [`normalize_into`] で正規化したコピーを挿入・修復・
 //!   凍結のすべてで使い、探索側ではクエリを 1 回だけ同じ関数で正規化する。スコア関数自体は
-//!   内積の腕と同一。ゼロノルム（アンダー／オーバーフロー含む）の行は構築を、クエリは探索を
-//!   fail-closed に拒否する（行の除外は #2241 の担当）。
+//!   内積の腕と同一。ゼロノルム（アンダー／オーバーフロー含む）のクエリは探索を fail-closed に
+//!   拒否する。正規化できない**行**は構築を拒否せず索引から除外する（Issue #2241。
+//!   [`is_cosine_indexable`]・[`normalize_rows`]。除外行は入辺を持たず結果にも現れない。
+//!   全走査では距離 NaN で昇順の末尾に並ぶ点が異なる）。
 //! - [`HnswMetric::L1`]: スコアは `-kernel::l1(a, b)`（`kernel::search_l1` と同じ符号反転）。
 //!   f16・SQ8 用の L1 カーネルは無いので L2 と同様に常駐精度を F32 へ縮退させる。距離の公理を
 //!   満たすため近傍選択ヒューリスティックは変更なしで使える。
@@ -42,7 +44,7 @@
 //!
 //! 新しい `unsafe` は持たない。
 
-use super::HnswError;
+use super::{HnswError, NodeMask};
 use crate::kernel::{dot, l1, l2_sq};
 
 /// HNSW が使う距離（類似度）種別。`Copy` の fieldless enum で、`GraphBuilder`・
@@ -132,26 +134,45 @@ pub(crate) fn normalize_into(row: &[f32], out: &mut [f32]) -> Result<(), ()> {
     if row.len() != out.len() {
         return Err(());
     }
-    let n2_f32 = dot(row, row);
-    if !(n2_f32.is_finite() && n2_f32 > 0.0) {
-        return Err(());
-    }
-    let n2: f64 = row.iter().map(|&v| f64::from(v) * f64::from(v)).sum();
-    if !(n2.is_finite() && n2 > 0.0) {
-        return Err(());
-    }
-    let inv = 1.0 / n2.sqrt();
+    let inv = inverse_norm(row).ok_or(())?;
     for (o, &v) in out.iter_mut().zip(row.iter()) {
         *o = (f64::from(v) * inv) as f32;
     }
     Ok(())
 }
 
-/// 全行を [`normalize_into`] で正規化したバッファを返す。正規化できない最初の行は
-/// `NonNormalizableVector { node }`（索引全体を拒否。fail-closed）。確保は
-/// `try_reserve_exact` で行う。`vectors` は `validate_build_input` 済み（`dim > 0`・
+/// 行のノルムの逆数（正規化の係数）。可否の判定は [`normalize_into`] と
+/// [`is_cosine_indexable`] で共有する単一の実装（両者の判定が食い違うと、索引から除く行の
+/// 集合と全走査で NaN になる行の集合がずれるため）。
+fn inverse_norm(row: &[f32]) -> Option<f64> {
+    let n2_f32 = dot(row, row);
+    if !(n2_f32.is_finite() && n2_f32 > 0.0) {
+        return None;
+    }
+    let n2: f64 = row.iter().map(|&v| f64::from(v) * f64::from(v)).sum();
+    if !(n2.is_finite() && n2 > 0.0) {
+        return None;
+    }
+    Some(1.0 / n2.sqrt())
+}
+
+/// 行がコサイン用 HNSW に入れられるか（正規化できるか）。`false` の行はどのクエリに対しても
+/// 全走査の距離が NaN になる行（ゼロノルム・ノルム²のアンダー／オーバーフロー）で、
+/// 構築では索引から除外される（Issue #2241。ビヘイビア INDEX-7・SQL-33 のポインタ）。
+/// 呼び出し元: `HnswIndex::node_matches`・`sql::hnsw_cache` の Overlay 計算。
+pub(crate) fn is_cosine_indexable(row: &[f32]) -> bool {
+    inverse_norm(row).is_some()
+}
+
+/// 全行を [`normalize_into`] で正規化したバッファと、索引に入れる行（member）の集合を返す。
+/// 正規化できない行は構築を拒否せず、バッファ上を 0 埋めにして member から外す
+/// （Issue #2241）。除外が 0 件なら集合は `None`（全行が member。非 Cosine と同じ表現）。
+/// 確保は `try_reserve_exact` で行う。`vectors` は `validate_build_input` 済み（`dim > 0`・
 /// 長さが `dim` の倍数）が前提で、満たさなければ `DimMismatch`。
-pub(crate) fn normalize_rows(vectors: &[f32], dim: usize) -> Result<Vec<f32>, HnswError> {
+pub(crate) fn normalize_rows(
+    vectors: &[f32],
+    dim: usize,
+) -> Result<(Vec<f32>, Option<NodeMask>), HnswError> {
     if dim == 0 || !vectors.len().is_multiple_of(dim) {
         return Err(HnswError::DimMismatch {
             dim: dim as u32,
@@ -162,14 +183,25 @@ pub(crate) fn normalize_rows(vectors: &[f32], dim: usize) -> Result<Vec<f32>, Hn
     out.try_reserve_exact(vectors.len())
         .map_err(|_| HnswError::CapacityOverflow)?;
     out.resize(vectors.len(), 0.0);
+    let rows = vectors.len() / dim;
+    let mut members = NodeMask::new(rows);
+    let mut excluded = false;
     for (node, (src, dst)) in vectors
         .chunks_exact(dim)
         .zip(out.chunks_exact_mut(dim))
         .enumerate()
     {
-        normalize_into(src, dst).map_err(|()| HnswError::NonNormalizableVector { node })?;
+        if normalize_into(src, dst).is_ok() {
+            // `rows <= MAX_HNSW_NODES`（呼び出し元の検証済み）なので u32 に収まる。
+            if let Ok(id) = u32::try_from(node) {
+                members.set(id);
+            }
+        } else {
+            // 失敗時 `dst` は未書き込みの 0 のまま（0 埋めの常駐行）。
+            excluded = true;
+        }
     }
-    Ok(out)
+    Ok((out, excluded.then_some(members)))
 }
 
 /// 非有限スコア（`Inf`・`NaN`）を `NonFiniteScore { node }` として拒否する共通

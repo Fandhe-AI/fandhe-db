@@ -193,6 +193,16 @@ embedding 変更は「未変更」と判定されうる。最終スコアは常�
 しないが、影響範囲はグラフ近傍構造の再利用判定（＝再インデックス要否の
 粒度）に限られる。詳細は `docs/design/hnsw-f16-resident.md` 参照。
 
+## 除外ノードと Overlay（Issue #2241）
+
+コサイン用の索引は正規化できない行を持たない（`HnswIndex::is_member` が偽のノード。番号はあるが索引に入っていない）。索引が除外規則を持つとき（`excludes_non_normalizable`）に限り、Overlay は次の規則を追加で適用する。内積グラフが本番の間はこの条件が偽で、挙動は変わらない。
+
+- 現在の行が正規化できない新規行は delta に入れない
+- 索引済み member の行が正規化できなくなったら失効にし、delta には入れない
+- 除外ノードの行が変わらず正規化できないままなら、失効にも churn にも数えない。正規化できるようになったら delta に入れる（`node_matches` が `Some(false)`）
+- 可視マスクと可視カーディナリティ比の分母は member だけで数える（`member_count`）
+- 申し送り（#2000）: キャッシュ内部の全走査縮退（`full_scan_with_arena`）でゼロノルム行を NaN として返すかどうかは、metric の結線時に決める
+
 ## 物理グラフの metric とキー（Issue #2000・親 #1996。INDEX-7・SQL-33・SQL-75 ポインタ）
 
 - キーは `(table, ctx, HnswMetric)`。`lookup`・`record_base`・`record_overlay_for`・負のキャッシュ
