@@ -926,6 +926,21 @@ pub enum BoundExpr {
         kind: crate::sql::lexer::DistanceKind,
         query: std::sync::Arc<[f32]>,
     },
+    /// 距離式 `<INT8VEC 列> <距離演算子> <整数ベクトルリテラル>`（TABLE-49 (1)(4)・Issue #2953）。
+    /// 行の INT8VEC 値（`index` 列の行スカラー）とクエリの距離を、整数のまま厳密に計算する
+    /// `kernel::int8_*` で求めて float8 相当の `Scalar` で返す（列が NULL の行は NULL）。
+    /// VECTOR 用の [`BoundExpr::VectorDistance`] と違い embedding を参照しない
+    /// （[`references_embedding`] は偽）。代わりに列 `index` を行スカラービューから読むので、
+    /// 走査段が当該列をデコードするよう [`mark_referenced_scalar_columns`] が `index` を報告する。
+    /// `kind` は `L1` を取らない（束縛段が `0A000` で拒否する。int8 の L1 カーネルは無い）。
+    ///
+    /// 変更履歴: 公開 enum への variant 追加（外部の網羅 match への破壊的変更。#2036 の
+    /// [`BoundExpr::VectorDistance`] と同様）。
+    Int8VecDistance {
+        kind: crate::sql::lexer::DistanceKind,
+        index: usize,
+        query: std::sync::Arc<[i8]>,
+    },
     /// ベクトルリテラル（距離関数の引数。SQL-72 (1)・Issue #2011）。評価結果は `ExprValue::Vector`。
     /// 行の embedding を参照しない。
     ///
@@ -1489,6 +1504,18 @@ impl PartialEq for BoundExpr {
                         .zip(qb.iter())
                         .all(|(a, b)| a.to_bits() == b.to_bits())
             }
+            (
+                BoundExpr::Int8VecDistance {
+                    kind: ka,
+                    index: ia,
+                    query: qa,
+                },
+                BoundExpr::Int8VecDistance {
+                    kind: kb,
+                    index: ib,
+                    query: qb,
+                },
+            ) => ka == kb && ia == ib && qa == qb,
             (BoundExpr::Null, BoundExpr::Null) => true,
             (BoundExpr::Builtin { f: fa, args: aa }, BoundExpr::Builtin { f: fb, args: ab }) => {
                 fa == fb && aa == ab
@@ -4088,6 +4115,31 @@ fn validate_closed_expr(
     }
 }
 
+/// INT8VEC 行とクエリの距離（TABLE-49 (1)(4)・Issue #2953）。[`eval_with_scalars`] の
+/// `BoundExpr::Int8VecDistance` 腕から行ごとに呼ばれ、整数のまま厳密に計算する
+/// `kernel::int8_*` を距離種別で振り分ける（ISA によらず同じ結果）。`L1` は int8 のカーネルが
+/// 無く束縛段が拒否済みなので、届いた場合は不変条件違反として `Internal`（fail-closed）。
+fn int8vec_distance(
+    kind: crate::sql::lexer::DistanceKind,
+    row: &[i8],
+    query: &[i8],
+) -> Result<f64, SqlSurfaceError> {
+    use crate::sql::lexer::DistanceKind;
+    let internal = || SqlSurfaceError::Internal {
+        detail: "int8vec distance evaluation failed".to_string(),
+    };
+    match kind {
+        DistanceKind::L2 => crate::kernel::int8_l2_distance(row, query).map_err(|_| internal()),
+        DistanceKind::NegativeInnerProduct => {
+            crate::kernel::int8_negative_inner_product(row, query).map_err(|_| internal())
+        }
+        DistanceKind::Cosine => {
+            crate::kernel::int8_cosine_distance(row, query).map_err(|_| internal())
+        }
+        DistanceKind::L1 => Err(internal()),
+    }
+}
+
 thread_local! {
     /// Prepared Describe が `$n` 由来のダミーリテラルの解析を省く区間でだけ真（[`DistancePlaceholderGuard`]）。
     static DISTANCE_PLACEHOLDER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -4130,7 +4182,7 @@ pub(super) fn bind_vector_distance_operands(
     rhs: &Expr,
     env: &mut BindEnv<'_>,
     node_budget: &mut usize,
-) -> Result<BoundVectorDistance, SqlSurfaceError> {
+) -> Result<BoundDistanceOperands, SqlSurfaceError> {
     let unsupported = || SqlSurfaceError::FeatureNotSupported {
         detail: "distance operands must be a VECTOR column and a vector literal".to_string(),
     };
@@ -4139,6 +4191,11 @@ pub(super) fn bind_vector_distance_operands(
         (Expr::String(s), Expr::Ident(_)) => (rhs, s),
         _ => return Err(unsupported()),
     };
+    // INT8VEC 列（TABLE-49・Issue #2953）は通常の識別子束縛（式内参照を持たない列型として
+    // `22000` で拒否する）より前に列として解決する。UDF 仮引数名が優先する点は識別子束縛と同じ。
+    if let Some((index, dim)) = int8vec_column_operand(column, env) {
+        return bind_int8vec_distance_operands(kind, index, dim, literal, node_budget);
+    }
     let (_, ty) = bind_expr_any(column, env, node_budget)?;
     if ty != ExprType::Vector {
         return Err(SqlSurfaceError::undefined_function(
@@ -4157,13 +4214,76 @@ pub(super) fn bind_vector_distance_operands(
     // Prepared Describe の `$n` 由来ダミー（Issue #2007）はリテラルの解析・上限検査を省く。
     // 結果列メタしか使わないため問い合わせベクトルは空でよい（実行経路ではこの印は立たない）。
     if DISTANCE_PLACEHOLDER.with(std::cell::Cell::get) {
-        return Ok(BoundVectorDistance {
+        return Ok(BoundDistanceOperands::Vector(BoundVectorDistance {
             kind,
             query: Vec::new(),
-        });
+        }));
     }
     let query = crate::sql::parser::parse_vector_literal(literal, dim)?;
-    Ok(BoundVectorDistance { kind, query })
+    Ok(BoundDistanceOperands::Vector(BoundVectorDistance {
+        kind,
+        query,
+    }))
+}
+
+/// 距離式の被演算子の検証結果（[`bind_vector_distance_operands`] の戻り値）。VECTOR 列は従来の
+/// f32 クエリ、INT8VEC 列（Issue #2953）は列の添字と i8 クエリを運ぶ。
+pub(super) enum BoundDistanceOperands {
+    Vector(BoundVectorDistance),
+    Int8Vec {
+        kind: crate::sql::lexer::DistanceKind,
+        index: usize,
+        query: Vec<i8>,
+    },
+}
+
+/// 距離式の列側 `column`（識別子）が INT8VEC 列なら `(列の添字, 宣言次元)` を返す
+/// （TABLE-49・Issue #2953）。UDF 仮引数名は列より優先して解決されるため（識別子束縛と同じ）、
+/// 仮引数と同名の識別子は列として扱わない。
+fn int8vec_column_operand(column: &Expr, env: &BindEnv<'_>) -> Option<(usize, u32)> {
+    let Expr::Ident(name) = column else {
+        return None;
+    };
+    if env.has_param(name) {
+        return None;
+    }
+    env.schema()?
+        .columns
+        .iter()
+        .enumerate()
+        .find(|(_, c)| &c.name == name)
+        .and_then(|(i, c)| match c.ty {
+            ColumnType::Int8Vec(dim) => Some((i, dim)),
+            _ => None,
+        })
+}
+
+/// INT8VEC 列の距離式の被演算子を検証する（TABLE-49 (1)(4)・Issue #2953）。`<+>`（L1）は
+/// int8 の L1 カーネルが無いため `0A000`。リテラルは [`crate::sql::parser::parse_int8vec_literal`]
+/// で検証する（整数でなければ `22P02`・範囲外 `22003`・次元不一致 `22000`・長さ超過 `54000`）。
+/// Prepared Describe の `$n` 由来ダミー（[`DISTANCE_PLACEHOLDER`]）はリテラルの解析を省く。
+/// エラーにリテラルの値を含めない。
+fn bind_int8vec_distance_operands(
+    kind: crate::sql::lexer::DistanceKind,
+    index: usize,
+    dim: u32,
+    literal: &str,
+    node_budget: &mut usize,
+) -> Result<BoundDistanceOperands, SqlSurfaceError> {
+    *node_budget = node_budget
+        .checked_sub(1)
+        .ok_or_else(|| SqlSurfaceError::payload_too_large("expression is too large"))?;
+    if kind == crate::sql::lexer::DistanceKind::L1 {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "distance operator <+> is not supported on int8vec columns",
+        ));
+    }
+    let query = if DISTANCE_PLACEHOLDER.with(std::cell::Cell::get) {
+        Vec::new()
+    } else {
+        crate::sql::parser::parse_int8vec_literal(literal, dim)?
+    };
+    Ok(BoundDistanceOperands::Int8Vec { kind, index, query })
 }
 
 /// 距離関数 `l2_distance`／`cosine_distance`／`inner_product`／`l1_distance` の呼び出しを束縛する
@@ -4370,6 +4490,7 @@ fn count_bound_nodes(expr: &BoundExpr) -> usize {
         | BoundExpr::CorrelatedScalar(_)
         | BoundExpr::VectorRef
         | BoundExpr::VectorDistance { .. }
+        | BoundExpr::Int8VecDistance { .. }
         | BoundExpr::VectorLiteral(_)
         | BoundExpr::JsonbColumnRef { .. }
         | BoundExpr::JsonColumnRef { .. }
@@ -4480,6 +4601,7 @@ fn max_bound_case_nesting(expr: &BoundExpr) -> usize {
         | BoundExpr::CorrelatedScalar(_)
         | BoundExpr::VectorRef
         | BoundExpr::VectorDistance { .. }
+        | BoundExpr::Int8VecDistance { .. }
         | BoundExpr::VectorLiteral(_)
         | BoundExpr::JsonbColumnRef { .. }
         | BoundExpr::JsonColumnRef { .. }
@@ -4569,7 +4691,7 @@ fn max_bound_case_nesting(expr: &BoundExpr) -> usize {
 pub(crate) fn references_embedding(expr: &BoundExpr) -> bool {
     match expr {
         BoundExpr::VectorRef | BoundExpr::VectorDistance { .. } => true,
-        BoundExpr::VectorLiteral(_) => false,
+        BoundExpr::VectorLiteral(_) | BoundExpr::Int8VecDistance { .. } => false,
         BoundExpr::Number(_)
         | BoundExpr::Text(_)
         | BoundExpr::TextColumnRef { .. }
@@ -4671,6 +4793,7 @@ pub(crate) fn visit_referenced_scalar_columns(expr: &BoundExpr, visit: &mut dyn 
         | BoundExpr::ByteaColumnRef { index }
         | BoundExpr::ArrayColumnRef { index }
         | BoundExpr::BoolColumnRef { index }
+        | BoundExpr::Int8VecDistance { index, .. }
         | BoundExpr::ColumnRef { index } => visit(*index),
         BoundExpr::ArrayConstructor { .. }
         | BoundExpr::ArrayIndex { .. }
@@ -4811,6 +4934,7 @@ pub(crate) fn mark_referenced_scalar_columns(expr: &BoundExpr, mask: &mut [bool]
         | BoundExpr::ByteaColumnRef { index }
         | BoundExpr::ArrayColumnRef { index }
         | BoundExpr::BoolColumnRef { index }
+        | BoundExpr::Int8VecDistance { index, .. }
         | BoundExpr::ColumnRef { index } => {
             if let Some(slot) = mask.get_mut(*index) {
                 *slot = true;
@@ -6566,7 +6690,7 @@ pub(super) fn bind_expr_any(
                     ColumnType::HalfVec(_) => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} cannot be used in an expression (HALFVEC columns are not supported)"
                     ))),
-                    // INT8VEC 列も式内参照を持たない（距離計算は兄弟 Issue #2019。Issue #2018）。
+                    // INT8VEC 列の裸の参照は式内で持たない（距離式の被演算子だけが列として解決する。Issue #2953）。
                     ColumnType::Int8Vec(_) => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} cannot be used in an expression (INT8VEC columns are not supported)"
                     ))),
@@ -6872,13 +6996,20 @@ pub(super) fn bind_expr_any(
         Expr::VectorDistance { kind, lhs, rhs } => {
             let b = bind_vector_distance_operands(*kind, lhs, rhs, env, node_budget)?;
             DISTANCE_BINDS.with(|c| c.set(c.get().wrapping_add(1)));
-            Ok((
-                BoundExpr::VectorDistance {
-                    kind: b.kind,
-                    query: std::sync::Arc::from(b.query),
+            let bound = match b {
+                BoundDistanceOperands::Vector(v) => BoundExpr::VectorDistance {
+                    kind: v.kind,
+                    query: std::sync::Arc::from(v.query),
                 },
-                ExprType::Scalar,
-            ))
+                BoundDistanceOperands::Int8Vec { kind, index, query } => {
+                    BoundExpr::Int8VecDistance {
+                        kind,
+                        index,
+                        query: std::sync::Arc::from(query),
+                    }
+                }
+            };
+            Ok((bound, ExprType::Scalar))
         }
         Expr::ValueFunction { kind, precision } => bind_value_function(*kind, *precision, env),
         Expr::SqlJsonQuery(q) => crate::sql::jsonpath_fn::bind_sql_json_query(q, env, node_budget),
@@ -10990,6 +11121,24 @@ pub(crate) fn eval_with_scalars<'a>(
                     .map(ExprValue::Scalar)
             }
         }
+        // INT8VEC 距離式（TABLE-49 (1)(4)・Issue #2953）。行スカラービューの INT8VEC 列を i8 へ戻し、
+        // 整数のまま厳密な `kernel::int8_*` で距離を求める。NULL 列は NULL。型の食い違い・範囲外の
+        // 列・カーネルエラーは束縛と評価の不変条件違反として `Internal`（値は含めない。fail-closed）。
+        BoundExpr::Int8VecDistance { kind, index, query } => match row_scalars.get(*index) {
+            None => Err(SqlSurfaceError::Internal {
+                detail: "INT8VEC column reference is outside the decoded row scalar view"
+                    .to_string(),
+            }),
+            Some(None) => Ok(ExprValue::Null),
+            Some(Some(ScalarRef::Int8Vec(body))) => {
+                let row = crate::row_codec::int8vec_bytes_to_values(body);
+                int8vec_distance(*kind, &row, query).map(ExprValue::Scalar)
+            }
+            Some(Some(_)) => Err(SqlSurfaceError::Internal {
+                detail: "INT8VEC column reference resolved to a non-INT8VEC row scalar value"
+                    .to_string(),
+            }),
+        },
         BoundExpr::Builtin { f, args } => eval_builtin(*f, args, id, embedding, row_scalars),
         BoundExpr::Binary { op, lhs, rhs } => {
             let l = eval_with_scalars(lhs, id, embedding, row_scalars)?;
@@ -14732,6 +14881,56 @@ mod wasm_define_tests {
         assert_eq!(eval(&e, 0, &[0.0, 0.0]).unwrap(), ExprValue::Scalar(5.0));
         // VECTOR 列が NULL の行（embedding が空）は NULL（`VectorRef` と同じ契約）。
         assert_eq!(eval(&e, 0, &[]).unwrap(), ExprValue::Null);
+    }
+
+    fn int8_dist_expr(kind: crate::sql::lexer::DistanceKind, index: usize, q: &[i8]) -> BoundExpr {
+        BoundExpr::Int8VecDistance {
+            kind,
+            index,
+            query: std::sync::Arc::from(q),
+        }
+    }
+
+    /// INT8VEC 距離式（TABLE-49・Issue #2953）: 3 種の距離を整数のまま厳密に返し、NULL 列は NULL、
+    /// 型の食い違い・範囲外の列・`L1` は `Internal`（fail-closed）。embedding は参照しない。
+    #[test]
+    fn int8vec_distance_evaluates_exactly_and_fails_closed() {
+        use crate::sql::lexer::DistanceKind;
+        let body: Vec<u8> = [3i8, 4].iter().map(|v| v.to_le_bytes()[0]).collect();
+        let scalars = [Some(ScalarRef::Int8Vec(&body))];
+        fn ev<'a>(
+            e: &'a BoundExpr,
+            s: &'a [Option<ScalarRef<'a>>],
+        ) -> Result<ExprValue<'a>, SqlSurfaceError> {
+            eval_with_scalars(e, 0, &[], s)
+        }
+        let l2 = int8_dist_expr(DistanceKind::L2, 0, &[0, 0]);
+        assert!(!references_embedding(&l2));
+        assert_eq!(ev(&l2, &scalars).unwrap(), ExprValue::Scalar(5.0));
+        let ip = int8_dist_expr(DistanceKind::NegativeInnerProduct, 0, &[1, 1]);
+        assert_eq!(ev(&ip, &scalars).unwrap(), ExprValue::Scalar(-7.0));
+        let cos = int8_dist_expr(DistanceKind::Cosine, 0, &[3, 4]);
+        assert_eq!(ev(&cos, &scalars).unwrap(), ExprValue::Scalar(0.0));
+        // ゼロノルムのクエリは NaN。
+        let zero = int8_dist_expr(DistanceKind::Cosine, 0, &[0, 0]);
+        assert!(matches!(ev(&zero, &scalars).unwrap(), ExprValue::Scalar(d) if d.is_nan()));
+        // NULL 列は NULL。
+        assert_eq!(ev(&l2, &[None]).unwrap(), ExprValue::Null);
+        // 範囲外の列・型の食い違い・L1・次元の食い違いは Internal。
+        for (e, s) in [
+            (int8_dist_expr(DistanceKind::L2, 1, &[0, 0]), &scalars[..]),
+            (int8_dist_expr(DistanceKind::L1, 0, &[0, 0]), &scalars[..]),
+            (int8_dist_expr(DistanceKind::L2, 0, &[0]), &scalars[..]),
+            (l2.clone(), &[Some(ScalarRef::Integer(1))][..]),
+        ] {
+            assert_eq!(ev(&e, s).unwrap_err().wire_code(), "XX000");
+        }
+        // 走査段が当該列をデコードするよう添字を報告する。
+        let mut seen = Vec::new();
+        visit_referenced_scalar_columns(&int8_dist_expr(DistanceKind::L2, 2, &[0]), &mut |i| {
+            seen.push(i)
+        });
+        assert_eq!(seen, vec![2]);
     }
 
     #[test]

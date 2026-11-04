@@ -1725,7 +1725,9 @@ pub(crate) fn vector_column(schema: &TableSchema) -> Result<(usize, u32), SqlSur
                 .iter()
                 .any(|c| matches!(c.ty, ColumnType::Int8Vec(_)))
             {
-                // INT8VEC の距離計算・kNN は兄弟 Issue #2019 まで未対応（fail-closed。Issue #2018）。
+                // INT8VEC の kNN は `sql::int8vec_knn`（広域取得への書き換え。Issue #2953）経由でのみ
+                // 動く。この関数へ届くのは書き換え対象外の形（hybrid・`USING PLAN`・NoSQL・GPU バッチ・
+                // HNSW 等）で、fail-closed に `0A000` で拒否する。
                 SqlSurfaceError::feature_not_supported(
                     "vector search over INT8VEC columns is not supported",
                 )
@@ -2088,7 +2090,7 @@ impl LiteralSkip {
         projection_mask: Vec::new(),
     };
 
-    fn skips_projection_item(&self, index: usize) -> bool {
+    pub(crate) fn skips_projection_item(&self, index: usize) -> bool {
         self.projection_mask.get(index).copied().unwrap_or(false)
     }
 }

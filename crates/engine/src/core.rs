@@ -10955,6 +10955,30 @@ impl EngineCore {
                     snap
                 };
                 let schema = self.describe_table_schema(snap, &validated.table_name)?;
+                // TABLE-49・Issue #2953: 実行と同じく INT8VEC 列の kNN は広域取得へ書き換えて列メタを導出する
+                // （Describe 成功・Execute 失敗の食い違いを作らない）。`$n` 由来のダミーリテラルは距離式の
+                // 束縛で解析を省く（`DistancePlaceholderGuard`。区間は束縛の間だけ）。
+                if let Some(scan) = crate::sql::int8vec_knn::int8vec_select_as_scan(
+                    validated,
+                    &schema,
+                    session.search_mode(),
+                    skip_vector_literal_validation,
+                )? {
+                    let _placeholder = (skip_vector_literal_validation.order_by
+                        || skip_vector_literal_validation
+                            .projection_mask
+                            .iter()
+                            .any(|masked| *masked))
+                    .then(crate::sql::udf_call::DistancePlaceholderGuard::enter);
+                    let bound = crate::sql::parser::bind_scan_with_dummy_flags(
+                        &scan,
+                        &schema,
+                        session.udfs(),
+                        dummy_equality_flags,
+                        limits,
+                    )?;
+                    return Ok(Some(crate::sql::describe::scan_columns(&bound, &schema)?));
+                }
                 if validated.using_plan().is_some() {
                     // `USING PLAN`: LLM 展開・再埋め込み（`plan_query`・
                     // `Embedder::embed_batch`）は行わず、投影列の束縛のみを行う
@@ -11691,6 +11715,24 @@ impl EngineCore {
         match stmt {
             crate::sql::allowlist::Statement::Select(validated) => {
                 let schema = table_schema_in(read_txn, &validated.table_name)?;
+                // TABLE-49・Issue #2953: INT8VEC 列への距離順 SELECT は f32 の DISTANCE 段を通さず、
+                // 式キー `ORDER BY` の広域取得へ書き換えて既存の scan 経路（RLS・行ポリシー・
+                // WHERE・LIMIT/OFFSET を担う）で実行する。対象外の形は `None` で従来経路へ進み、
+                // `parser::vector_column` が `0A000` で拒否する。
+                if let Some(scan) = crate::sql::int8vec_knn::int8vec_select_as_scan(
+                    &validated,
+                    &schema,
+                    session.search_mode(),
+                    &crate::sql::parser::LiteralSkip::NONE,
+                )? {
+                    return self.execute_read_statement_with_limits(
+                        ctx,
+                        session,
+                        crate::sql::allowlist::Statement::Scan(scan),
+                        read_txn,
+                        limits,
+                    );
+                }
                 let bound = crate::sql::parser::bind_in_session_with_limits(
                     &validated,
                     &schema,
@@ -13415,6 +13457,26 @@ impl EngineCore {
         session: &crate::sql::mode::SessionState,
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
         let (read_txn, schema) = self.read_txn_with_schema(validated.table_name())?;
+        // TABLE-49・Issue #2953: INT8VEC 列の kNN は実行と同じく広域取得へ書き換わるため、EXPLAIN も
+        // scan の計画（`plain_scan`／`full_scan`）を報告する（実経路と矛盾する ANN 注記を出さない）。
+        if let Some(scan) = crate::sql::int8vec_knn::int8vec_select_as_scan(
+            validated,
+            &schema,
+            session.search_mode(),
+            &crate::sql::parser::LiteralSkip::NONE,
+        )? {
+            let bound = crate::sql::parser::bind_scan_with_dummy_flags(
+                &scan,
+                &schema,
+                session.udfs(),
+                &[],
+                &self.result_limits,
+            )?;
+            let gins = Self::gin_decls_for_explain(&read_txn, &bound)?;
+            return Ok(crate::sql::SqlOutcome::Explain(Self::scan_explain_result(
+                &schema, &bound, &gins,
+            )));
+        }
         let bound = crate::sql::parser::bind_in_session_with_limits(
             validated,
             &schema,

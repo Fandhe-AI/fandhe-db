@@ -22,6 +22,8 @@
 
 ### Added
 
+- `INT8VEC(N)` 列で距離演算子 `<->`・`<#>`・`<=>` の kNN・WHERE の距離比較・投影の距離列が動くようにした（Issue #2953・TABLE-49 (1)(4)(5) ポインタ）。整数のまま厳密に計算し、距離列は float8。`<+>`・hybrid・`USING PLAN`・`USING MODE`・`HINT ORDER`・precision は `0A000`。NoSQL `search` は対象外（`0A000`）のまま。`vector` との差と量子化誤差の実測は `docs/design/column-type-extension.md` に記録。
+  BREAKING CHANGE: 公開 enum `BoundExpr` に variant `Int8VecDistance { kind, index, query }` を追加した（網羅的 `match` の下流は追随が必要）。
 - ベクトル関数 `binary_quantize(vector)` を追加した（Issue #2023・TABLE-48 (3) ポインタ）。正の成分を 1、それ以外を 0 とする `bit(d)` を返す（pgvector と同じ規則。NULL は NULL）。引数は表の VECTOR 列に限り、加工したベクトル式は `0A000`、VECTOR 以外は `42804`。結果は投影の最上位と BIT 列への `UPDATE ... SET`（長さ不一致は `22026`）・`INSERT ... SELECT`・`CREATE TABLE AS` で使え、比較・並べ替え・グループ化・関数引数・`CAST` などは `0A000`。名前は予約され、同名の `CREATE FUNCTION` は `42723`。
   BREAKING CHANGE: 公開 enum `BuiltinFn` に `BinaryQuantize`、`ExprType` に `Bit`、`ExprValue` に `Bit(BitString)` を追加した（網羅的 `match` の下流は追随が必要）。
 - GPU バッチ検索の f32 算術経路に L2 とコサインを追加した（Issue #2003・親 #2002・CORE-6・CORE-16・SQL-33 ポインタ）。`batch_search::BatchMetric`（`InnerProduct`〔既定〕・`L2`・`Cosine`）、`ResidentMatrix::{build_with_metric, metric}`、`BatchBackend::metric`（既定実装は内積）、`FallbackBatchEngine::{build_with_metric, build_with_gpu_metric, build_with_gpu_reference_metric}`、`GpuBatchBackend::metric`、`GpuF32ContrastBackend::try_new_with_metric` を追加した。スコアは全 metric で「大きいほど近い」（L2 は `-Σ(r-q)²`、コサインは行・クエリを正規化した内積）。既存の `build`・`try_new` は内積のまま挙動不変。GPU の f16 算術版と packed i8 版は内積専用で、L2 では選ばれず、i8 版は内積以外の行列の構築を `InitFailed` で拒否する。詳細は `docs/design/gpu-batch-metric.md`。

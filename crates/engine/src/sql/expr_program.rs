@@ -573,6 +573,7 @@ fn try_fold_scalar(expr: &BoundExpr) -> Option<FoldedConst> {
         | BoundExpr::CorrelatedScalar(_)
         | BoundExpr::VectorRef
         | BoundExpr::VectorDistance { .. }
+        | BoundExpr::Int8VecDistance { .. }
         | BoundExpr::VectorLiteral(_)
         | BoundExpr::WasmCall { .. }
         | BoundExpr::Null
@@ -763,6 +764,7 @@ fn compile_node(
         | BoundExpr::MinMax { .. }
         // 距離式（SQL-74 (1)・Issue #2036）は行の embedding を直接読む専用評価のため木評価へ委ねる。
         | BoundExpr::VectorDistance { .. }
+        | BoundExpr::Int8VecDistance { .. }
         // ベクトルリテラル（SQL-72 (1)・Issue #2011）も木評価に委ねる（距離関数の引数）。
         | BoundExpr::VectorLiteral(_) => {
             steps.push(ExprStep::JsonSubtree(Box::new(expr.clone())));

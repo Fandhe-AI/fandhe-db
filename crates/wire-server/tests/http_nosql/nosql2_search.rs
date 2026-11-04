@@ -328,6 +328,53 @@ fn vector_only_matches_sql_order_by_distance() {
     );
 }
 
+/// INT8VEC 表への `search.vector` は `0A000` のまま（TABLE-49 (4)・Issue #2953）。SQL の距離演算子は
+/// INT8VEC 列で動くが、NoSQL `search` は対象外（`metric` キーの導入と合わせた別 Issue）。SQL 側が動く
+/// ことで NoSQL の拒否が緩まないこと（GPU バッチ・ANN 経路へ INT8VEC が流れないこと）を固定する。
+#[test]
+fn int8vec_table_search_vector_stays_unsupported() {
+    let path = temp_db::unique_db_path("nosql2-search-int8vec");
+    let _guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "docs_iv",
+            vec![ColumnDef::new("h", ColumnType::Int8Vec(2), true)],
+        ))
+        .expect("create int8vec table");
+    let core = Arc::new(EngineCore::from_storage(
+        storage,
+        Box::new(CpuScalarProvider),
+    ));
+    let addr = spawn(Arc::clone(&core));
+    let resp = query_as_alice(
+        addr,
+        br#"{"op":"insert","table":"docs_iv","rows":[{"id":1,"h":[1,2]}],"operation_id":"iv-search-1"}"#,
+    );
+    assert_eq!(resp.status, 200, "resp={resp:?}");
+
+    let body =
+        br#"{"op":"search","table":"docs_iv","vector":[1.0,2.0],"limit":3,"columns":["id"]}"#;
+    let resp = query_as_alice(addr, body);
+    assert_eq!(http_common::wire_code_of(&resp), "0A000", "resp={resp:?}");
+    // SQL 側は動く（同じ表・同じクエリ。NoSQL の insert は Private 行のため両可視性の ctx で読む）。
+    let ctx =
+        PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+            .expect("valid tenant ctx");
+    let mut session = SessionState::default();
+    let SqlOutcome::Query(result) = core
+        .execute_sql_in_session(
+            &ctx,
+            &mut session,
+            "SELECT id FROM docs_iv ORDER BY h <=> '[1,2]' LIMIT 3",
+        )
+        .expect("SQL kNN over INT8VEC must work")
+    else {
+        panic!("expected SqlOutcome::Query");
+    };
+    assert_eq!(result.rows.len(), 1);
+}
+
 /// `filter`（`eq`）が SQL `WHERE` と一致する。
 #[test]
 fn filter_eq_matches_sql_where() {
