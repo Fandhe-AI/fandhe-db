@@ -411,6 +411,15 @@ fn push_value(b: &mut HashInputBuilder, v: &Value) -> Result<(), StorageError> {
             b.push_u64(u64::from(v.bit_len()));
             b.push_bytes(v.as_bytes())?;
         }
+        // HALFVEC(N) 値（Issue #2014・TABLE-46）。タグ 20 は `push_value` で未使用。次元を先に積み、
+        // 各要素の f16 ビット列を LE で連結する（再送判定を決定的にする）。
+        Value::HalfVec(v) => {
+            b.push_u8(20);
+            b.push_u64(v.len() as u64);
+            for bits in v {
+                b.push_raw(&bits.to_le_bytes());
+            }
+        }
         // 配列列（TABLE-14・Issue #888）は 10 とする。要素型タグ・要素数・各要素を
         // 積むことで、`{ab}`（1 要素）と `{a,b}`（2 要素）のような表記ゆれが
         // 衝突しない単射なハッシュ入力にする。

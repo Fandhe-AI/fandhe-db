@@ -284,3 +284,41 @@ fn quoted_null_and_bool_word_table_names_are_accepted() {
         }
     }
 }
+
+/// Issue #2014・TABLE-46: HALFVEC 列を射影する `COPY ... TO` はテーブル形・括弧形とも
+/// fail-closed の 0A000 で拒否する（テキストで `[a,b,...]` を書き出さない）。
+#[test]
+fn halfvec_projection_is_rejected_with_0a000() {
+    let path = unique_db_path("copy-to-halfvec");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "hv",
+            vec![
+                ColumnDef::new("embedding", ColumnType::HalfVec(2), false),
+                ColumnDef::new("lang", ColumnType::Text, false),
+            ],
+        ))
+        .expect("create table");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_ledger_mode(LedgerMode::CompareOnlyWithoutLedger);
+    let mut session = SessionState::default();
+    core.execute_sql_in_session(
+        &ctx("acme"),
+        &mut session,
+        "INSERT INTO hv (id, embedding, lang) VALUES (1, '[1.0,0.5]', 'ja')",
+    )
+    .expect("insert");
+    for sql in [
+        "COPY hv TO STDOUT",
+        "COPY hv (embedding) TO STDOUT",
+        "COPY (SELECT embedding FROM hv) TO STDOUT",
+        "COPY (SELECT * FROM hv) TO STDOUT",
+    ] {
+        let err = copy_to(&core, "acme", sql).expect_err(sql);
+        assert!(err.starts_with("0A000"), "{sql}: {err}");
+    }
+    // HALFVEC 列を射影しない COPY TO は従来どおり成功する。
+    copy_to(&core, "acme", "COPY hv (lang) TO STDOUT").expect("non-halfvec projection");
+}

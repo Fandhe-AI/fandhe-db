@@ -69,6 +69,7 @@ fn type_label(ty: &ColumnType) -> &'static str {
         ColumnType::TimestampTz => "timestamptz",
         ColumnType::Interval => "interval",
         ColumnType::Bit(_) => "bit",
+        ColumnType::HalfVec(_) => "halfvec",
         ColumnType::Array(_) => "array",
         ColumnType::Bytea => "bytea",
         ColumnType::Json => "json",
@@ -117,6 +118,7 @@ fn all_type_labels() -> BTreeSet<&'static str> {
         "timestamptz",
         "interval",
         "bit",
+        "halfvec",
         "array",
         "bytea",
         "json",
@@ -275,8 +277,11 @@ fn all_column_type_variants_are_covered_by_case_table() {
     let (_storage, _path, def) = open_with_enum();
     let _guard = CleanupGuard(_path.clone());
     let schema = full_row_schema(def);
-    let covered: BTreeSet<&'static str> =
+    let mut covered: BTreeSet<&'static str> =
         schema.columns.iter().map(|c| type_label(&c.ty)).collect();
+    // HALFVEC は VECTOR と合わせて表に高々 1 本の制約（Issue #2014）で全型スキーマへ同居できないため、
+    // 単独スキーマで検証する `halfvec_roundtrips_and_rejects_malformed_layouts` が担う。
+    covered.insert(type_label(&ColumnType::HalfVec(4)));
     assert_eq!(
         covered,
         all_type_labels(),
@@ -2061,6 +2066,73 @@ fn interval_roundtrips_extremes_and_rejects_sentinels_and_mixups() {
     let cut = good.get(..good.len() - 3).expect("slice");
     assert!(matches!(
         decode_row(&schema, cut),
+        Err(RowCodecError::Invalid(_))
+    ));
+}
+
+/// HALFVEC(N) は f16 ビット列で往復し、宣言次元との不一致・非有限ビット・他型との取り違え・
+/// 切り詰め・宣言次元と異なる次元の行バイト列を拒否する（Issue #2014・TABLE-46 ポインタ）。
+#[test]
+fn halfvec_roundtrips_and_rejects_malformed_layouts() {
+    // 1.0 = 0x3C00、-2.0 = 0xC000、65504 = 0x7BFF（f16 の最大有限値）、最小サブノーマル = 0x0001。
+    let hv = |bits: &[u16]| Value::HalfVec(bits.to_vec());
+    roundtrip_single(
+        ColumnType::HalfVec(4),
+        hv(&[0x3C00, 0xC000, 0x7BFF, 0x0001]),
+    );
+    roundtrip_single(ColumnType::HalfVec(1), hv(&[0x0000]));
+    let schema = single_col_schema(ColumnType::HalfVec(3));
+    let enc = |v: Value| encode_row(&schema, "tenant-a", Visibility::Public, &[v]);
+    // 宣言次元と異なる値・非有限（Inf 0x7C00・NaN 0x7E00・-Inf 0xFC00）は encode が拒否する。
+    assert!(matches!(
+        enc(hv(&[0x3C00, 0x3C00])),
+        Err(RowCodecError::Invalid(_))
+    ));
+    for bad in [0x7C00u16, 0x7E00, 0xFC00] {
+        assert!(matches!(
+            enc(hv(&[0x3C00, bad, 0x3C00])),
+            Err(RowCodecError::Invalid(_))
+        ));
+    }
+    // 他型の値（VECTOR の f32 列）の取り違えも拒否する。
+    assert!(matches!(
+        enc(Value::Vector(vec![1.0, 2.0, 3.0])),
+        Err(RowCodecError::Invalid(_))
+    ));
+    let vec_schema = single_col_schema(ColumnType::Vector(3));
+    assert!(matches!(
+        encode_row(
+            &vec_schema,
+            "tenant-a",
+            Visibility::Public,
+            &[hv(&[0x3C00, 0x3C00, 0x3C00])]
+        ),
+        Err(RowCodecError::Invalid(_))
+    ));
+    // 非有限ビットを含む破損バイト列は decode が拒否する（末尾 2 バイトを +Inf に書き換える）。
+    let good = enc(hv(&[0x3C00, 0x3C00, 0x3C00])).expect("encode halfvec");
+    let mut bad = good.clone();
+    let n = bad.len();
+    bad[n - 2] = 0x00;
+    bad[n - 1] = 0x7C;
+    assert!(matches!(
+        decode_row(&schema, &bad),
+        Err(RowCodecError::Invalid(_))
+    ));
+    // 切り詰めたバイト列も拒否する。
+    let cut = good.get(..good.len() - 1).expect("slice");
+    assert!(decode_row(&schema, cut).is_err());
+    // カタログの宣言次元と異なる次元の行バイト列は拒否する（次元 2 で書いた行を 3 で読む）。
+    let narrow = single_col_schema(ColumnType::HalfVec(2));
+    let narrow_bytes = encode_row(
+        &narrow,
+        "tenant-a",
+        Visibility::Public,
+        &[hv(&[0x3C00, 0x3C00])],
+    )
+    .expect("encode narrow");
+    assert!(matches!(
+        decode_row(&schema, &narrow_bytes),
         Err(RowCodecError::Invalid(_))
     ));
 }

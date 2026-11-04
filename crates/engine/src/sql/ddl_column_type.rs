@@ -95,6 +95,7 @@ pub(crate) fn to_static_column_type_with_array_default(
             scale: *scale,
         },
         SqlColumnTypeName::Vector(dim) => ColumnType::Vector(*dim),
+        SqlColumnTypeName::HalfVec(dim) => ColumnType::HalfVec(*dim),
         SqlColumnTypeName::Alias { target, .. } => {
             return to_static_column_type_with_array_default(target, default_max_len)
         }
@@ -169,6 +170,11 @@ pub(crate) fn to_static_column_type_with_array_default(
                 ColumnType::Bytea => ArrayElemType::Bytea,
                 ColumnType::Json => ArrayElemType::Json,
                 ColumnType::Jsonb => ArrayElemType::Jsonb,
+                ColumnType::HalfVec(_) => {
+                    return Err(SqlSurfaceError::unsupported(
+                        "HALFVEC cannot be an array element type",
+                    ))
+                }
                 ColumnType::Vector(_) => {
                     return Err(SqlSurfaceError::unsupported(
                         "VECTOR cannot be an array element type",
@@ -309,6 +315,10 @@ pub enum SqlColumnTypeName {
     /// 意味検証は行わない（本 variant 自体が実行段で常に `0A000` 拒否される
     /// ため到達しない）。
     Vector(u32),
+    /// `HALFVEC(N)`（TABLE-46・Issue #2014）。括弧と正の整数が必須。次元の範囲検証は
+    /// カタログ検証（`validate_vector_dim`）に委譲する。`ADD COLUMN` は実行段で `0A000`、
+    /// 配列要素は `42601`。
+    HalfVec(u32),
     /// `NUMERIC(precision, scale)`／`DECIMAL(precision, scale)`。範囲検証は
     /// 実行段（`catalog::alter_table_add_column`）に委譲する（モジュール
     /// ドキュメント参照）。
@@ -452,6 +462,8 @@ enum TypeNameKind {
     Bit,
     /// `VECTOR(N)`。
     Vector,
+    /// `HALFVEC(N)`（Issue #2014）。
+    HalfVec,
     /// `NUMERIC(p,s)`／`DECIMAL(p,s)`。
     Numeric,
     /// `VARCHAR`／`VARCHAR(n)`（Issue #2305・#1563）。綴りを保持する別名として返す
@@ -517,6 +529,7 @@ const TYPE_NAME_TABLE: &[(&str, TypeNameKind)] = &[
     ("JSONB", TypeNameKind::Direct(|| SqlColumnTypeName::Jsonb)),
     ("UUID", TypeNameKind::Direct(|| SqlColumnTypeName::Uuid)),
     ("VECTOR", TypeNameKind::Vector),
+    ("HALFVEC", TypeNameKind::HalfVec),
     ("NUMERIC", TypeNameKind::Numeric),
     ("DECIMAL", TypeNameKind::Numeric),
     ("INT2", TypeNameKind::Alias(|| SqlColumnTypeName::SmallInt)),
@@ -757,6 +770,12 @@ fn parse_base_type_name(
             let dim = expect_strict_u32(tokens, pos)?;
             expect_punct(tokens, pos, ')')?;
             Ok(SqlColumnTypeName::Vector(dim))
+        }
+        TypeNameKind::HalfVec => {
+            expect_punct(tokens, pos, '(')?;
+            let dim = expect_strict_u32(tokens, pos)?;
+            expect_punct(tokens, pos, ')')?;
+            Ok(SqlColumnTypeName::HalfVec(dim))
         }
         TypeNameKind::Numeric => {
             expect_punct(tokens, pos, '(')?;
@@ -1242,6 +1261,17 @@ mod tests {
     #[test]
     fn rejects_vector_without_arguments() {
         for raw in ["VECTOR", "VECTOR()", "VECTOR(384", "VECTOR 384)"] {
+            assert!(parse_type(raw).is_err(), "expected {raw:?} to be rejected");
+        }
+    }
+
+    /// TABLE-46: `HALFVEC(N)` は大小文字を区別せず受理し、括弧と次元が必須（`42601` 系）。
+    #[test]
+    fn halfvec_requires_dimension_and_is_case_insensitive() {
+        let (ty, consumed) = parse_type("halfvec(3)").expect("valid");
+        assert_eq!(ty, SqlColumnTypeName::HalfVec(3));
+        assert_eq!(consumed, 4);
+        for raw in ["HALFVEC", "HALFVEC()", "HALFVEC(3", "HALFVEC(-1)"] {
             assert!(parse_type(raw).is_err(), "expected {raw:?} to be rejected");
         }
     }

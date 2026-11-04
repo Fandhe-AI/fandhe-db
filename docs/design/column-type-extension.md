@@ -789,3 +789,12 @@ NoSQL 表層の JSON 束縛（`insert`／`update`／`filter`）の型別対応�
 - **行 codec**: 自己記述型（presence ＋ `u32` LE ビット長 ＋ `ceil(len/8)` バイト）。encode でも宣言長との一致を再検証する。`ALTER TABLE ADD COLUMN` の DEFAULT は `TableSchema::bit_default_ref`（遅延キャッシュ）から借用で補完する。
 - **エラー分類**: 文字種違反 `22P02`、ビット数不一致 `22026`（`ErrorClass::StringDataLengthMismatch` を新設）、`BIT(0)`・上限超過 `22023`、未対応の型綴り `0A000`。
 - **対象外**: `B'1010'` ビット列定数、`'1010'::bit(4)`／CAST、`hamming_distance`・`jaccard_distance`、比較述語・ORDER BY・GROUP BY、wire のバイナリ形式（`bit_send`／`bit_recv`）と宣言 OID 1560 の Parse、COPY BINARY、`bit[]`（OID 1561）、`BIT VARYING`。距離カーネルの SQL 接続と `binary_quantize` は兄弟 Issue の担当。
+
+## Issue #2014 追記: HALFVEC(N) 列（TABLE-46 (1)(4)(5) ポインタ）
+
+- **保存先**: スカラーペイロード（行 codec のスカラー列）に f16 で保存し、embedding スロットは使わない。容量が次元 × 2 バイトになり、`storage` の行フォーマットを変えずに済む。HALFVEC のみの表は VECTOR 列を持たない表と同じ扱い（embedding は空）。
+- **別 variant**: `ColumnType::HalfVec(u32)`・`row_codec::Value::HalfVec(Vec<u16>)`・`ScalarRef::HalfVec`・`SqlColumnTypeName::HalfVec`。`Value::Vector` を流用しないのは、UPDATE の割り当てが列型を見ずに `Value::Vector` を embedding として取り込むため。`ColumnType::is_vector()` は VECTOR 限定のまま（HNSW 宣言・DROP 保護・embedding 選択へ流入させない）。本数制約は `is_vector_family()`（VECTOR または HALFVEC）で数え、合わせて 0〜1 本。
+- **フレーム**: presence ＋ 次元 `u32` LE ＋ 次元 × `u16` LE（f16 ビット）。encode は次元の一致・上限・有限性、decode は次元の上限と宣言次元の照合を確保前に行い、切り詰め・非有限ビットを `Invalid` で拒否する。カタログタグは `halfvec`（param は正準 10 進）。`content_hash` の値タグは 20。
+- **丸めと SQLSTATE**: 入力は VECTOR と同じ検証（次元不一致・非有限は `22000`）の後に f16 へ丸める。有限の入力が ±Inf に飽和する場合は `22003`。判定は `fits_f16`（`|x| <= 65504`）ではなく変換結果で行い pgvector と揃える（65504 超〜65520 未満は 65504 へ丸めて受理、65520 以上は `22003`）。文字列 → f32 → f16 の 2 段丸めも pgvector と同順。
+- **投影**: f16 を f32 へ広げた既存の `Cell::Vector` を再利用する（公開 enum `Cell` は増やさない）。結果予算は展開後（次元 × 4）で計上する。wire の型 OID は 25（text）で、バイナリ形式は対象外。
+- **fail-closed（対象外）**: `ALTER TABLE ADD COLUMN`（`0A000`）、`DROP COLUMN`（`42601`）、`ALTER COLUMN TYPE`（`42804`）、PK・UNIQUE・FK・索引・CHECK・DEFAULT、距離演算子・距離関数・CAST（`::halfvec`）・比較・ORDER BY・GROUP BY・DISTINCT・集計・集合演算、COPY、CTAS・マテリアライズドビュー・`INSERT ... SELECT`、`halfvec[]`。距離計算・テキスト入出力・CAST は兄弟 #2015、HNSW は #2016 の担当。それ以外は担当 Issue 未定。

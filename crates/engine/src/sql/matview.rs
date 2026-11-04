@@ -80,6 +80,13 @@ pub(crate) fn column_defs_from_view_columns(
                 "ENUM columns are not supported in materialized views",
             ));
         }
+        if matches!(ty, ColumnType::HalfVec(_)) {
+            // cell_to_value / value_to_cell に HALFVEC の変換が無いため、行の内容によらず
+            // 作成時に拒否する（fail-closed。0A000）。
+            return Err(SqlSurfaceError::feature_not_supported(
+                "HALFVEC columns are not supported in materialized views",
+            ));
+        }
         out.push(ColumnDef {
             name: col.name.clone(),
             ty: ty.clone(),

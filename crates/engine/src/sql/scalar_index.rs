@@ -1715,6 +1715,7 @@ impl ScalarIndex {
                 // `VECTOR` 列も従来どおり索引対象外。
                 ColumnType::Vector(_)
                 | ColumnType::Bit(_)
+                | ColumnType::HalfVec(_)
                 | ColumnType::Boolean
                 | ColumnType::Array(_)
                 | ColumnType::Json

@@ -1497,7 +1497,8 @@ fn family_of_type(ty: &ColumnType) -> Option<SubqueryValueFamily> {
         // `INTERVAL` の値族は未対応（fail-closed。正規化等価の代表値の規則が未確定で担当 Issue 未定。
         // Issue #1579・#1580）。
         | ColumnType::Interval
-        | ColumnType::Bit(_) => None,
+        | ColumnType::Bit(_)
+        | ColumnType::HalfVec(_) => None,
     }
 }
 

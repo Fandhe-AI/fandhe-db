@@ -268,7 +268,8 @@ pub(crate) fn check_branch_type_compatibility(
     // Issue #1579）。UNION ALL も含め、重複除去の行キー化に到達させない。
     if columns_have_interval(l_columns) || columns_have_interval(r_columns) {
         return Err(SqlSurfaceError::FeatureNotSupported {
-            detail: "INTERVAL and BIT columns cannot be used in set operations yet".to_string(),
+            detail: "INTERVAL, BIT and HALFVEC columns cannot be used in set operations yet"
+                .to_string(),
         });
     }
     if l_columns.len() != r_columns.len() {
@@ -294,17 +295,17 @@ pub(crate) fn check_branch_type_compatibility(
     Ok(())
 }
 
-/// 列メタデータに `INTERVAL`／`BIT(n)` 列が含まれるか（集合演算の fail-closed 判定。
-/// Issue #1579・#2021）。
+/// 列メタデータに `INTERVAL`／`BIT(n)`／`HALFVEC(N)` 列が含まれるか（集合演算の fail-closed 判定。
+/// Issue #1579・#2021・#2014）。
 fn columns_have_interval(columns: &[ColumnMeta]) -> bool {
     columns.iter().any(|c| {
         matches!(
             c,
             ColumnMeta::Scalar {
-                ty: ColumnType::Interval | ColumnType::Bit(_),
+                ty: ColumnType::Interval | ColumnType::Bit(_) | ColumnType::HalfVec(_),
                 ..
             } | ColumnMeta::Computed {
-                ty: Some(ColumnType::Interval | ColumnType::Bit(_)),
+                ty: Some(ColumnType::Interval | ColumnType::Bit(_) | ColumnType::HalfVec(_)),
                 ..
             }
         )

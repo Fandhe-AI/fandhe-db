@@ -12712,6 +12712,35 @@ impl EngineCore {
         crate::sql::scan::execute_scan(read_txn, ctx, schema, bound)
     }
 
+    /// `COPY ... TO` の射影に HALFVEC 列（または HALFVEC 値を返す式）が含まれる場合に
+    /// fail-closed の `0A000` で拒否する（Issue #2014・TABLE-46）。COPY FROM 側の拒否
+    /// （`sql::copy` の `bind_copy_record`）と対で、HALFVEC のテキスト出力は未対応のため。
+    fn reject_halfvec_copy_projection(
+        schema: &crate::catalog::TableSchema,
+        bound: &crate::sql::parser::BoundScan,
+    ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+        use crate::catalog::ColumnType;
+        use crate::sql::parser::ProjectedColumn;
+        let hit = bound.projection.iter().any(|p| match p {
+            ProjectedColumn::Column { index, .. } => matches!(
+                schema.columns.get(*index).map(|c| &c.ty),
+                Some(ColumnType::HalfVec(_))
+            ),
+            ProjectedColumn::Computed { result_ty, .. } => {
+                matches!(result_ty, Some(ColumnType::HalfVec(_)))
+            }
+            ProjectedColumn::Id | ProjectedColumn::AliasedId { .. } => false,
+        });
+        if hit {
+            return Err(
+                crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
+                    "COPY does not support HALFVEC columns",
+                ),
+            );
+        }
+        Ok(())
+    }
+
     /// `COPY ... TO STDOUT` の読み取り（束縛 → 走査）を担う単一の入口（Issue #1771・WIRE-22 (5)・
     /// SQL-34 のポインタ）。`begin_copy_validated`・`begin_copy_active`（明示 txn の dirty 分岐）・
     /// `core/temp_route.rs::begin_copy_temp` の 3 経路がここを通る（行数上限の判定を 1 か所に
@@ -12738,6 +12767,7 @@ impl EngineCore {
                 &[],
                 &self.result_limits,
             )?;
+            Self::reject_halfvec_copy_projection(schema, &bound)?;
             return self.run_scan_plan(source, ctx, schema, &bound);
         }
         let internal = || SqlSurfaceError::Internal {
@@ -12759,6 +12789,7 @@ impl EngineCore {
         // 束縛は上限 `cap` までしか LIMIT を受理しない（ハード上限での飽和）ため、超過検出用の
         // `+1` 行は束縛後に差し替える（束縛済み値の差し替えなので検証は迂回しない）。
         bound.limit = fetch;
+        Self::reject_halfvec_copy_projection(schema, &bound)?;
         let result = self.run_scan_plan(source, ctx, schema, &bound)?;
         if result.rows.len() > cap {
             return Err(SqlSurfaceError::payload_too_large(
@@ -15329,6 +15360,10 @@ impl EngineCore {
                     crate::row_codec::Value::Interval(_) => 16,
                     // BIT 値は presence(1) + ビット長(4) + ceil(len/8) バイト（Issue #2021）。
                     crate::row_codec::Value::Bit(v) => 5usize.saturating_add(v.as_bytes().len()),
+                    // HALFVEC 値は presence(1) + 次元(4) + 次元 × 2 バイト（Issue #2014）。
+                    crate::row_codec::Value::HalfVec(v) => {
+                        5usize.saturating_add(v.len().saturating_mul(2))
+                    }
                     // 配列値（Issue #888）は実際の行コーデック（`row_codec::
                     // scalar_array_entry_len`）が書き込むフレーム込みの全
                     // エンコード長をそのまま使う（presence(1)・flags(1)・

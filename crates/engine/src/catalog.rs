@@ -3631,6 +3631,8 @@ const CREATE_ONLY_RESERVED_TYPE_NAMES: &[&str] = &[
     // Issue #2021（TABLE-48）。`BIT`・`VARBIT` は型名解決表の語。
     "bit",
     "varbit",
+    // Issue #2014（TABLE-46）。`HALFVEC` は型名解決表の語（括弧付きでのみ列型になる）。
+    "halfvec",
 ];
 
 /// カタログ層の公開エラー型。`redb` 操作由来のエラーは `Backend` に一本化し、
@@ -4198,6 +4200,15 @@ pub enum ColumnType {
     /// 固定次元の埋め込み列（`VECTOR(N)`、TABLE-1）。0 と `MAX_VECTOR_DIM` 超過は
     /// encode・decode 両側で拒否する。
     Vector(u32),
+    /// 半精度ベクトル列（`HALFVEC(N)`、TABLE-46・Issue #2014）。`N` は VECTOR と同じ
+    /// `1..=MAX_VECTOR_DIM`。値は IEEE 754 binary16 のビット列
+    /// （[`crate::row_codec::Value::HalfVec`]）としてスカラーペイロードへ保存する
+    /// （embedding スロットは使わない）。カタログタグは `halfvec`・param は `N` の 10 進。
+    /// [`Self::is_vector`] は `false` のまま（HNSW・embedding・DROP 保護へ流入させない）。
+    /// VECTOR とは合わせて表に 0〜1 本（[`Self::is_vector_family`]）。距離計算・HNSW は兄弟
+    /// Issue（#2015・#2016）、PK・UNIQUE・索引・述語・並べ替え・集計・式・CAST・型変更は
+    /// fail-closed（ワイルドカード腕を置かない）。
+    HalfVec(u32),
     /// 符号付き 16 ビット整数列（`SMALLINT`／`INT2`、TABLE-30・Issue #1558）。
     /// 値表現（[`crate::row_codec::Value::Integer`]・行ペイロードの `i32 LE` 5 バイト）は
     /// [`ColumnType::Integer`] と共有し、違いはカタログタグ（`smallint`）と値の範囲
@@ -4300,6 +4311,12 @@ impl ColumnType {
     /// Issue #880 D9）。
     pub fn is_vector(&self) -> bool {
         matches!(self, ColumnType::Vector(_))
+    }
+
+    /// `VECTOR` または `HALFVEC` 列かどうか（表あたりの本数制約用。Issue #2014）。
+    /// embedding スロット・HNSW・DROP 保護の判定には [`Self::is_vector`] を使う。
+    pub fn is_vector_family(&self) -> bool {
+        matches!(self, ColumnType::Vector(_) | ColumnType::HalfVec(_))
     }
 
     /// `PRIMARY KEY`（Issue #903）の構成列・`FOREIGN KEY`（Issue #907）の参照元列
@@ -4460,6 +4477,8 @@ impl ColumnType {
             ColumnType::Interval => 0,
             // `Bit` も PK／UNIQUE 非許可（Issue #2021。fail-closed）。
             ColumnType::Bit(_) => 0,
+            // `HalfVec` も PK／UNIQUE 非許可（Issue #2014。fail-closed）。
+            ColumnType::HalfVec(_) => 0,
             ColumnType::Bytea => 7,
             ColumnType::Uuid => 8,
             ColumnType::Enum(_) => 9,
@@ -4489,6 +4508,7 @@ impl ColumnType {
             ColumnType::Varchar(Some(n)) => ("varchar", n.to_string()),
             ColumnType::Bpchar(n) => ("bpchar", n.to_string()),
             ColumnType::Vector(dim) => ("vector", dim.to_string()),
+            ColumnType::HalfVec(dim) => ("halfvec", dim.to_string()),
             ColumnType::SmallInt => ("smallint", "-".to_string()),
             ColumnType::Integer => ("integer", "-".to_string()),
             ColumnType::BigInt => ("bigint", "-".to_string()),
@@ -4545,6 +4565,24 @@ impl ColumnType {
                 })?;
                 validate_vector_dim(dim)?;
                 Ok(ColumnType::Vector(dim))
+            }
+            "halfvec" => {
+                // 正準 10 進のみ受理する（符号・先頭ゼロ・空文字列は拒否。Issue #2014）。
+                let dim: u32 = if !param.is_empty() && param.bytes().all(|b| b.is_ascii_digit()) {
+                    param.parse().ok()
+                } else {
+                    None
+                }
+                .ok_or_else(|| {
+                    CatalogError::Invalid(format!("malformed halfvec dimension: {param:?}"))
+                })?;
+                validate_vector_dim(dim)?;
+                if dim.to_string() != param {
+                    return Err(CatalogError::Invalid(format!(
+                        "non-canonical halfvec dimension: {param:?}"
+                    )));
+                }
+                Ok(ColumnType::HalfVec(dim))
             }
             "smallint" => {
                 if param != "-" {
@@ -7456,7 +7494,11 @@ fn is_text_framed_array_elem(elem: ArrayElemType) -> bool {
 /// 墓標（削除済み列）に残してはならない、フレーム等価でない型か（TABLE-19 D1・D2）。
 fn is_non_frame_equivalent_type(ty: &ColumnType) -> bool {
     match ty {
-        ColumnType::Vector(_) | ColumnType::Enum(_) | ColumnType::Json | ColumnType::Jsonb => true,
+        ColumnType::Vector(_)
+        | ColumnType::HalfVec(_)
+        | ColumnType::Enum(_)
+        | ColumnType::Json
+        | ColumnType::Jsonb => true,
         ColumnType::Array(array_ty) => is_text_framed_array_elem(array_ty.elem()),
         _ => false,
     }
@@ -8405,6 +8447,7 @@ impl TableSchema {
             | ColumnType::TimestampTz
             | ColumnType::Interval
             | ColumnType::Bit(_)
+            | ColumnType::HalfVec(_)
             | ColumnType::Bytea
             | ColumnType::Json
             | ColumnType::Jsonb
@@ -8636,7 +8679,7 @@ fn parse_numeric_param(param: &str) -> Result<(u8, u8)> {
 
 fn validate_column(column: &ColumnDef) -> Result<()> {
     validate_identifier(&column.name)?;
-    if let ColumnType::Vector(dim) = &column.ty {
+    if let ColumnType::Vector(dim) | ColumnType::HalfVec(dim) = &column.ty {
         validate_vector_dim(*dim)?;
     }
     if let ColumnType::Numeric { precision, scale } = column.ty {
@@ -8777,7 +8820,7 @@ fn validate_schema_impl(schema: &TableSchema, require_live: bool) -> Result<()> 
             )));
         }
         seen.push(column.name.as_str());
-        if column.ty.is_vector() {
+        if column.ty.is_vector_family() {
             vector_column_count += 1;
         }
         // `DEFAULT`（TABLE-16・TASK-204、Issue #904）は列型の大分類と整合する
@@ -8802,7 +8845,7 @@ fn validate_schema_impl(schema: &TableSchema, require_live: bool) -> Result<()> 
     }
     if vector_column_count > 1 {
         return Err(CatalogError::Invalid(format!(
-            "table must declare at most one VECTOR column, got {vector_column_count}"
+            "table must declare at most one vector-type column, got {vector_column_count}"
         )));
     }
     // 墓標側の不変条件（TABLE-19 D1・D2、Issue #901）: 削除前の物理位置が
@@ -13101,7 +13144,7 @@ impl Storage {
                 });
             let (logical_index, physical_index, ty) =
                 target.ok_or_else(|| CatalogError::ColumnNotFound(column_name.to_string()))?;
-            if ty.is_vector() {
+            if ty.is_vector_family() {
                 return Err(CatalogError::ProtectedColumn(column_name.to_string()));
             }
             // 標準形の関数本体が参照する表の列は、列単位の依存を持たないため削除を拒否する
@@ -19368,6 +19411,58 @@ mod tests {
             validate_schema(&schema),
             Err(CatalogError::Invalid(_))
         ));
+    }
+
+    /// HALFVEC は VECTOR と合わせて表に高々 1 本（TABLE-46・Issue #2014）。
+    #[test]
+    fn validate_schema_counts_halfvec_toward_the_vector_family_limit() {
+        let build = |a: ColumnType, b: ColumnType| {
+            TableSchema::new(
+                "docs",
+                vec![ColumnDef::new("a", a, true), ColumnDef::new("b", b, true)],
+            )
+        };
+        assert!(validate_schema(&build(ColumnType::Vector(4), ColumnType::HalfVec(4))).is_err());
+        assert!(validate_schema(&build(ColumnType::HalfVec(4), ColumnType::HalfVec(4))).is_err());
+        assert!(validate_schema(&build(ColumnType::HalfVec(4), ColumnType::Text)).is_ok());
+        // `is_vector` は VECTOR だけ（embedding・HNSW・DROP 保護へ流入させない）。
+        assert!(!ColumnType::HalfVec(4).is_vector());
+        assert!(ColumnType::HalfVec(4).is_vector_family());
+    }
+
+    /// HALFVEC 列はカタログタグ `halfvec` で往復し、次元 0・上限超過・非正準 param は拒否する。
+    #[test]
+    fn halfvec_catalog_tag_roundtrips_and_rejects_invalid_params() {
+        let mut no_enum = |_: &str| -> Result<Arc<EnumTypeDef>> {
+            Err(CatalogError::Invalid("no enum".to_string()))
+        };
+        let ty = ColumnType::HalfVec(384);
+        let (tag, param) = ty.catalog_fields();
+        assert_eq!((tag, param.as_str()), ("halfvec", "384"));
+        assert_eq!(
+            ColumnType::from_catalog_fields(tag, &param, &mut no_enum).unwrap(),
+            ty
+        );
+        for bad in ["0", "-", "", "+4", "04", "4.0", "99999999999"] {
+            assert!(
+                ColumnType::from_catalog_fields("halfvec", bad, &mut no_enum).is_err(),
+                "{bad:?}"
+            );
+        }
+        let over = (MAX_VECTOR_DIM + 1).to_string();
+        assert!(ColumnType::from_catalog_fields("halfvec", &over, &mut no_enum).is_err());
+        assert!(validate_column(&ColumnDef::new("h", ColumnType::HalfVec(0), true)).is_err());
+        assert!(validate_column(&ColumnDef::new(
+            "h",
+            ColumnType::HalfVec(MAX_VECTOR_DIM + 1),
+            true
+        ))
+        .is_err());
+        // 手書きの墓標が HALFVEC を持ち込むのも拒否する対象（フレーム非等価型）。
+        assert!(is_non_frame_equivalent_type(&ColumnType::HalfVec(4)));
+        // PK／UNIQUE は非許可。
+        assert!(!ColumnType::HalfVec(4).is_primary_key_allowed());
+        assert!(!ColumnType::HalfVec(4).is_unique_constraint_allowed());
     }
 
     #[test]
