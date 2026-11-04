@@ -170,7 +170,8 @@ pub struct BoundStatement {
     pub(crate) distance_descending: bool,
     /// 距離順 `ORDER BY` の距離演算子の種別（Issue #1977・SQL-33 (2)(4)）。`ranking` が
     /// [`Ranking::Distance`] 以外のときは常に `Cosine`（[`check_distance_kind`] が束縛時に保証）。
-    /// 非 Cosine の文は束縛を通るが、実行は `sql::exec` の入口が `0A000` で止める（仮置き）。
+    /// `Cosine`（`<=>`）と `NegativeInnerProduct`（`<#>`）は `sql::exec` が実行する（Issue #1991）。
+    /// `L2`／`L1` は束縛を通るが、実行は `sql::exec` の入口が `0A000` で止める（接続は別 Issue）。
     pub(crate) distance_kind: crate::sql::lexer::DistanceKind,
     /// 距離順 `ORDER BY` の `LIMIT` 省略時の暗黙の結果行数上限（Issue #2242・SQL-34 (2)(3)(4)）。
     /// `Some(cap)` のとき `limit` は `cap + 1`（超過検出用の 1 件余分）で、実行段は ANN を
@@ -206,6 +207,22 @@ fn check_distance_kind(
     {
         return Err(SqlSurfaceError::unsupported(
             "distance operator kind requires a distance ORDER BY",
+        ));
+    }
+    Ok(())
+}
+
+/// 距離種別と `precision` モードの整合を検査する（Issue #1991・SQL-33）。確信度ゲートは
+/// クエリと候補の cosine 類似度で判定するため、`<=>` 以外（内積などで順位付けした結果）と
+/// 併用すると順位と確信度の意味がずれる。安全側で `0A000` に倒す（fail-closed。Execute と
+/// Describe で同じ判定にする）。`<=>` と `recall`（既定）は影響を受けない。
+fn check_precision_distance_kind(
+    kind: crate::sql::lexer::DistanceKind,
+    mode: Option<SearchMode>,
+) -> Result<(), SqlSurfaceError> {
+    if kind != crate::sql::lexer::DistanceKind::Cosine && mode == Some(SearchMode::Precision) {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "non-cosine distance operator cannot be combined with precision mode",
         ));
     }
     Ok(())
@@ -3237,6 +3254,7 @@ pub(crate) fn bind_in_session_with_limits(
         Some(resolved_mode.mode()),
     )?;
     check_distance_kind(stmt.distance_kind, &stmt.order_by)?;
+    check_precision_distance_kind(stmt.distance_kind, Some(resolved_mode.mode()))?;
     check_projected_distance(&projection, &ranking, stmt.distance_kind, &|_| true)?;
 
     check_limit_omission(stmt.limit_implicit, Some(resolved_mode.mode()))?;
@@ -3368,6 +3386,7 @@ pub(crate) fn bind_projection_for_describe(
         Some(resolved_mode.mode()),
     )?;
     check_distance_kind(stmt.distance_kind, &stmt.order_by)?;
+    check_precision_distance_kind(stmt.distance_kind, Some(resolved_mode.mode()))?;
     check_projected_distance(
         &projection,
         &ranking,

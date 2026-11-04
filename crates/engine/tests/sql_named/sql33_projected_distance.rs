@@ -255,7 +255,8 @@ fn sql33_projected_distance_excludes_other_tenant_rows() {
 #[test]
 fn sql33_projected_distance_non_cosine_execution_stays_fail_closed() {
     let (core, _g) = setup("sql33-proj-dist-l2");
-    for op in ["<->", "<#>", "<+>"] {
+    // `<#>` は Issue #1991 で負の内積として実行へ接続済みのため、未接続の種別のみ検査する。
+    for op in ["<->", "<+>"] {
         let sql = format!(
             "SELECT id, embedding {op} '[1,0,0]' AS d FROM documents ORDER BY embedding {op} '[1,0,0]' LIMIT 3"
         );

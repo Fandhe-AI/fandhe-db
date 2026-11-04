@@ -28,7 +28,10 @@ use engine::dictionary::{DictionaryBuilder, DictionaryConfig};
 use engine::embedding::HashingEmbedder;
 use engine::hybrid::{hybrid_search, RrfConfig};
 use engine::incremental::IncrementalConfig;
-use engine::kernel::{CpuScalarProvider, SearchInput, SearchProvider};
+use engine::kernel::{
+    cosine_top_k, CandidateHit, CosineSearchInput, CpuScalarProvider, KernelError, SearchInput,
+    SearchProvider,
+};
 use engine::policy::PolicyContext;
 use engine::query_planner::{LlmClient, PlanError};
 use engine::row_codec::Value;
@@ -42,6 +45,34 @@ use crate::temp_db;
 use temp_db::{unique_db_path, CleanupGuard};
 
 const TENANT_ID: &str = "tenant-a";
+
+/// ライブラリレベルの比較側で使う、コサイン距離（`<=>`。Issue #1991）の密側 provider。
+/// SQL の HYBRID 密側（`sql::exec` 内部のアダプタ）と同じ規約で、`cosine_top_k` の結果から
+/// NaN 行を除き、`score = 1 - distance` の降順（同点は id 昇順）に写す。
+struct CosineDenseProvider;
+
+impl SearchProvider for CosineDenseProvider {
+    fn search(&self, input: SearchInput<'_>) -> Result<Vec<CandidateHit>, KernelError> {
+        let hits = cosine_top_k(CosineSearchInput {
+            ids: input.ids,
+            vectors: input.vectors,
+            row_norms_sq: None,
+            dim: input.dim,
+            query: input.query,
+            k: input.k,
+        })?;
+        let mut out: Vec<CandidateHit> = hits
+            .into_iter()
+            .filter(|h| !h.distance.is_nan())
+            .map(|h| CandidateHit {
+                id: h.id,
+                score: (1.0 - h.distance) as f32,
+            })
+            .collect();
+        out.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.id.cmp(&b.id)));
+        Ok(out)
+    }
+}
 
 fn tenant_ctx(tenant: &str) -> PolicyContext {
     PolicyContext::with_visibilities(tenant, [Visibility::Public, Visibility::Private])
@@ -86,7 +117,7 @@ fn hybrid_table_schema() -> TableSchema {
 /// 既定構成で両チャネルが融合へ寄与していることを確認できるようにする。
 ///
 /// - id=1: キーワード「rust」を含み、かつ密ベクトルもクエリに近い（疎・密ともに当たる）
-/// - id=2: キーワードのみ一致（密ベクトルはクエリから明確に遠い＝負の内積。
+/// - id=2: キーワードのみ一致（密ベクトルはクエリから明確に遠い＝約 120 度離れた向き。
 ///   「疎のみが当てられる文書」）
 /// - id=3: 密ベクトルのみクエリに近い（テキストに一致語なし。「密のみが当てられる文書」）
 /// - id=4, 100..105: どちらにも当たらないノイズ文書。`LIMIT 4` に対しコーパス総数を
@@ -98,10 +129,10 @@ fn hybrid_table_schema() -> TableSchema {
 ///   `sparse_docs.is_empty()` フォールバック（密のみ経路）ではなく本来比較したい
 ///   `hybrid::hybrid_search` 経路を通す。
 ///
-///   id=2 の密ベクトルはクエリ `[1.0, 0.0]` との内積が `-0.5`（ノイズ文書群の内積
-///   `-0.1..=-0.6` の範囲内・かつノイズ上位 2 件より低い）になるよう選んである。
-///   これにより「密のみ」で Top-4 を取ると id=1・id=3・ノイズ上位 2 件が並び、id=2 は
-///   落選する（`dense_only_top_k` で実測して固定する。下記テストの
+///   `<=>` はコサイン距離（Issue #1991）なので、近さはベクトルの向きで決まる。id=2 の密
+///   ベクトルはクエリ `[1.0, 0.0]` から約 120 度離れ、ノイズ文書群（クエリから 11〜56 度の
+///   向き）より遠くなるよう選んである。これにより「密のみ」で Top-4 を取ると id=1・id=3・
+///   ノイズ上位 2 件が並び、id=2 は落選する（`dense_only_top_k` で実測して固定する。下記テストの
 ///   `assert!(!dense_only_top_k(..).contains(&2), ..)` 参照）。この保証がないと
 ///   `sql_ids.contains(&2)` は「密のみの Top-4 に元々含まれていた」ケースと区別が
 ///   つかず、hybrid fusion（sparse チャンネルの寄与）が壊れていても検出できない
@@ -111,7 +142,7 @@ fn hybrid_corpus() -> Vec<(u64, [f32; 2], &'static str)> {
         (1u64, [1.0f32, 0.0], "rust vector database search"),
         (2, [-0.5, 0.85], "rust programming language guide"),
         (3, [0.9, 0.1], "completely unrelated topic about gardening"),
-        (4, [-1.0, 0.0], "another unrelated topic about cooking"),
+        (4, [0.7, 0.7], "another unrelated topic about cooking"),
     ];
     let noise_texts: [&str; 6] = [
         "noise document about weather",
@@ -124,15 +155,15 @@ fn hybrid_corpus() -> Vec<(u64, [f32; 2], &'static str)> {
     for (offset, text) in noise_texts.iter().enumerate() {
         docs.push((
             100 + offset as u64,
-            [-0.1 * (offset as f32 + 1.0), 0.0],
+            [0.5, -0.1 * (offset as f32 + 1.0)],
             text,
         ));
     }
     docs
 }
 
-/// `hybrid_corpus()` に対する「密のみ」Top-k ランキングの id 列を、`CpuScalarProvider`
-/// （`kernel.rs` の厳密な総当たり参照実装）で直接計算する。sparse 側を一切経由しない
+/// `hybrid_corpus()` に対する「密のみ」Top-k ランキングの id 列を、`CosineDenseProvider`
+/// （`kernel.rs` の厳密なコサイン総当たり参照実装）で直接計算する。sparse 側を一切経由しない
 /// ため、この結果に id=2 が含まれていれば「id=2 が Top-k に現れる」ことは sparse 融合の
 /// 証拠にならない（Bugbot 指摘対応）。両テストで「id=2 の出現が sparse 融合の証拠として
 /// 有効である」ことをハンドウェーブではなく実測で固定するために使う。
@@ -146,7 +177,7 @@ fn dense_only_top_k(corpus: &[(u64, [f32; 2], &str)], query: &[f32; 2], k: usize
         query,
         k,
     };
-    let hits = CpuScalarProvider
+    let hits = CosineDenseProvider
         .search(input)
         .expect("dense-only baseline search should succeed");
     hits.iter().map(|h| h.id).collect()
@@ -210,7 +241,7 @@ fn sql_hybrid_query_with_no_additional_config_matches_default_library_level_hybr
         k: 4,
     };
     let cfg = RrfConfig::default();
-    let lib_hits = hybrid_search(&CpuScalarProvider, input, &sparse_index, "rust", 4, &cfg)
+    let lib_hits = hybrid_search(&CosineDenseProvider, input, &sparse_index, "rust", 4, &cfg)
         .expect("library-level hybrid_search with RrfConfig::default() should succeed");
     let lib_ids: Vec<u64> = lib_hits.iter().map(|h| h.id).collect();
 

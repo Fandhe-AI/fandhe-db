@@ -317,7 +317,8 @@ const VEC_SQL_LIT: &str =
 const VEC_SQL_PARAM: &str = "SELECT id, body FROM documents ORDER BY embedding <=> $1 LIMIT 5";
 
 /// Issue #1977・SQL-33 (4)・WIRE-12: 距離演算子 4 種で `$n` のベクトル位置が同じ扱いになる。
-/// `<=>` は行を返し、他の 3 種は Parse・Describe・Bind を通って Execute で `0A000`（カーネル未接続）。
+/// `<=>`（コサイン距離）と `<#>`（負の内積）は行を返し（Issue #1991）、他の 2 種は
+/// Parse・Describe・Bind を通って Execute で `0A000`（カーネル未接続）。
 /// 次元不一致はバインド時の型エラー `22000` が仮置きの `0A000` より先に出る。
 #[test]
 fn all_distance_operators_accept_vector_placeholder() {
@@ -328,7 +329,7 @@ fn all_distance_operators_accept_vector_placeholder() {
     for op in ["<=>", "<->", "<#>", "<+>"] {
         let sql = format!("SELECT id, body FROM documents ORDER BY embedding {op} $1 LIMIT 3");
         assert_eq!(describe_statement_oids(&mut s, &sql, &[]), vec![25], "{op}");
-        if op == "<=>" {
+        if op == "<=>" || op == "<#>" {
             let (rows, _) = run_extended(&mut s, &sql, &[], &[Some(b"[0.1,0.2,0.3]")]);
             assert!(!rows.is_empty());
         } else {

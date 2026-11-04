@@ -9,8 +9,9 @@
 //! - `USING MODE 'precision'` との併用は `0A000`。hybrid 関数形・`USING PLAN` の省略は `42601`のまま。
 //! - `EXPLAIN` は `ann_plan: plain_scan_limit_omitted` を出し、`index=` 注記を付けない。
 //!
-//! 距離種別の追加（#1981・#1991）に備え、一致検査は [`Metric`]（演算子とスコア関数の組）で
-//! パラメータ化している。まだ SQL から実行できない種別は、省略しても明示 `LIMIT` と同じ
+//! 距離種別の追加（#1981・#1991）に備え、一致検査は [`Metric`]（演算子と距離関数の組）で
+//! パラメータ化している（`<=>` と `<#>` は Issue #1991 で接続済み）。
+//! まだ SQL から実行できない種別は、省略しても明示 `LIMIT` と同じ
 //! エラーコードで拒否されること（fail-closed）だけを確かめる。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
@@ -29,22 +30,62 @@ use temp_db::{unique_db_path, CleanupGuard};
 
 const DIM: usize = 3;
 
-/// 距離演算子と、その昇順経路が使うスコア（大きいほど近い）の組。
+/// 距離演算子と、その昇順経路が使う距離値（小さいほど近い。NaN は最も遠い）の組。
 struct Metric {
     op: &'static str,
-    score: fn(&[f32], &[f32]) -> f32,
+    distance: fn(&[f32], &[f32]) -> f64,
 }
 
 fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
+/// `<=>`: `1 - cos`（f64。ゼロノルムは NaN）。成分は 0.5 の倍数で、f32 の内積・ノルム²は厳密。
+fn cosine_distance(a: &[f32], b: &[f32]) -> f64 {
+    let (na, nb) = (f64::from(dot(a, a)), f64::from(dot(b, b)));
+    if na * nb == 0.0 {
+        return f64::NAN;
+    }
+    1.0 - (f64::from(dot(a, b)) / (na * nb).sqrt()).clamp(-1.0, 1.0)
+}
+
+/// `<#>`: 負の内積。
+fn neg_inner_product(a: &[f32], b: &[f32]) -> f64 {
+    -f64::from(dot(a, b))
+}
+
 /// 現時点で SQL から実行できる距離種別。後続 Issue が種別を足すときはここへ追記する。
 fn runnable_metrics() -> Vec<Metric> {
-    vec![Metric {
-        op: "<=>",
-        score: dot,
-    }]
+    vec![
+        Metric {
+            op: "<=>",
+            distance: cosine_distance,
+        },
+        Metric {
+            op: "<#>",
+            distance: neg_inner_product,
+        },
+    ]
+}
+
+/// 近い順の比較（距離昇順。NaN は末尾。同点は id 昇順）。
+fn nearest_first(a: &(u64, f64), b: &(u64, f64)) -> std::cmp::Ordering {
+    match (a.1.is_nan(), b.1.is_nan()) {
+        (true, true) => a.0.cmp(&b.0),
+        (true, false) => std::cmp::Ordering::Greater,
+        (false, true) => std::cmp::Ordering::Less,
+        (false, false) => a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)),
+    }
+}
+
+/// 遠い順の比較（距離降順。NaN は先頭。同点は id 昇順）。
+fn farthest_first(a: &(u64, f64), b: &(u64, f64)) -> std::cmp::Ordering {
+    match (a.1.is_nan(), b.1.is_nan()) {
+        (true, true) => a.0.cmp(&b.0),
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        (false, false) => b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)),
+    }
 }
 
 /// (id, embedding, lang)。成分は 0.5 の倍数で、どの加算順序でも内積が厳密になる。
@@ -139,8 +180,9 @@ fn ids(result: &QueryResult) -> Vec<u64> {
     result.rows.iter().map(|r| r.id).collect()
 }
 
-/// テスト側の全走査モデル: 全行を同じスコア関数で計算し、近い順（スコア降順）または遠い順
-/// （スコア昇順）、同点は id 昇順に安定ソートして先頭 `offset` 件を捨てた id 列を返す。
+/// テスト側の全走査モデル: 全行を同じ距離関数で計算し、近い順（距離昇順）または遠い順
+/// （距離降順）、同点は id 昇順（NaN は近い順で末尾・遠い順で先頭）に安定ソートして先頭 `offset`
+/// 件を捨てた id 列を返す。
 fn model(
     metric: &Metric,
     q: &[f32; DIM],
@@ -148,18 +190,15 @@ fn model(
     keep: impl Fn(&str) -> bool,
     offset: usize,
 ) -> Vec<u64> {
-    let mut all: Vec<(u64, f32)> = rows()
+    let mut all: Vec<(u64, f64)> = rows()
         .into_iter()
         .filter(|(_, _, lang)| keep(lang))
-        .map(|(id, v, _)| (id, (metric.score)(&v, q)))
+        .map(|(id, v, _)| (id, (metric.distance)(&v, q)))
         .collect();
-    all.sort_by(|a, b| {
-        let by_score = if descending {
-            a.1.total_cmp(&b.1)
-        } else {
-            b.1.total_cmp(&a.1)
-        };
-        by_score.then(a.0.cmp(&b.0))
+    all.sort_by(if descending {
+        farthest_first
+    } else {
+        nearest_first
     });
     all.into_iter().skip(offset).map(|(id, _)| id).collect()
 }
@@ -415,7 +454,7 @@ fn sql33_limit_omitted_on_not_yet_runnable_operators_fails_like_explicit_limit()
     let _guard = CleanupGuard(path.clone());
     let core = new_core(&path, N);
     seed(&core);
-    for op in ["<->", "<#>", "<+>"] {
+    for op in ["<->", "<+>"] {
         let explicit = run_err_code(
             &core,
             "tenant-a",

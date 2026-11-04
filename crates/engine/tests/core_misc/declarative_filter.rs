@@ -129,9 +129,10 @@ fn ext3_prefix_filter_excludes_non_matching_without_under_fetch() {
             // 距離順位が高いが不一致（先頭）の行を混ぜて、事前フィルタ（既定順）が
             // `limit` を正確に満たすことを確認する（SQL-2 の同構造テストに倣う）。
             (1, [1.0, 0.0], "other/x.rs", "code", "ja"),
-            (2, [0.99, 0.0], "src/a.rs", "code", "ja"),
-            (3, [0.98, 0.0], "src/b.rs", "code", "ja"),
-            (4, [0.97, 0.0], "src/c.rs", "code", "ja"),
+            // `<=>` はコサイン距離（Issue #1991）なので、角度が 2 < 3 < 4 の順に広がる向きにする。
+            (2, [1.0, 0.1], "src/a.rs", "code", "ja"),
+            (3, [1.0, 0.2], "src/b.rs", "code", "ja"),
+            (4, [1.0, 0.3], "src/c.rs", "code", "ja"),
             (5, [0.5, 0.5], "src/d.rs", "code", "ja"),
         ],
     );

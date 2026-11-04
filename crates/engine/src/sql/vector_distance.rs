@@ -4,7 +4,9 @@
 //! `udf_call::eval_with_scalars` の `BoundExpr::VectorDistance` 腕から行ごとに呼ばれ、float8
 //! 相当の `f64` を返す。pgvector と同じく f32 で累積し f64 で返す。コサインは ADR
 //! `docs/design/cosine-distance-method.md` 第 6 節の手順（arena を経由しない経路）に従う。
-//! ORDER BY 側のスコアとの統合は #1987・#1991 の担当で、本モジュールは WHERE の評価専用。
+//! ORDER BY 側（`<=>` は #1991 で `kernel::cosine_distance` に接続）とは、有限・通常範囲の入力で
+//! ビット一致する式を使う（下の単体テストで固定）。f32 の溢れ・アンダーフロー時の inf と NaN の
+//! 扱いの統一は #2006 の担当で、本モジュールは WHERE の評価専用。
 
 use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::lexer::DistanceKind;
@@ -97,5 +99,27 @@ mod tests {
     fn dimension_mismatch_is_internal() {
         let e = distance(DistanceKind::L2, &[1.0], &[1.0, 2.0]).unwrap_err();
         assert!(matches!(e, SqlSurfaceError::Internal { .. }));
+    }
+
+    /// Issue #1991: ORDER BY 側（`kernel::cosine_distance`）と WHERE 側で、通常範囲の入力の
+    /// コサイン距離がビット一致する（順位と投影・比較の値が食い違わない）。
+    #[test]
+    fn cosine_matches_kernel_cosine_distance_bitwise() {
+        let rows: [[f32; 3]; 4] = [
+            [1.0, 2.0, 3.0],
+            [-0.5, 0.25, 8.0],
+            [10.0, 10.0, 0.0],
+            [0.0, 0.0, 0.0],
+        ];
+        let q = [0.3_f32, -1.0, 2.5];
+        for r in &rows {
+            let a = distance(DistanceKind::Cosine, r, &q).unwrap();
+            let b = crate::kernel::cosine_distance(r, &q);
+            if a.is_nan() {
+                assert!(b.is_nan());
+            } else {
+                assert_eq!(a.to_bits(), b.to_bits(), "{r:?}");
+            }
+        }
     }
 }

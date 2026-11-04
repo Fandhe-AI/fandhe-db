@@ -548,7 +548,9 @@ fn plan_mode_hint_precision_returns_zero_rows_then_explicit_recall_overrides() {
         ),
         (
             2u64,
-            [0.4f32, 0.3, 0.2, 0.1],
+            // 行 1 と同一のベクトル。コサイン距離（Issue #1991）でも密側が厳密に同点になるように
+            // して、融合スコアが完全に揃う（確信度ゲートのマージン 0 で空集合）構成を保つ。
+            [0.1f32, 0.2, 0.3, 0.4],
             "docs/b.md",
             "beta content in english",
         ),

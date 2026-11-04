@@ -381,11 +381,13 @@ fn cold_and_hot_hybrid_tie_group_across_limit_boundary_match() {
     // と同一の同点誘発コーパス（密ランク・疎ランクを入れ替えた 2 行が完全同点になる
     // 構成。同ファイルのコメント参照）。
     let rows: [(u64, [f32; 2], Option<&str>); 5] = [
+        // 密側は `<=>`（コサイン距離。Issue #1991）で順位付けされるため、向きの近さで
+        // 行 A（問い合わせ [1,0] と同方向）> 行 B > 埋め草の順になるよう角度を変えてある。
         (1, [1.0, 0.0], Some("anchor filler filler")),
-        (2, [0.9, 0.0], Some("anchor anchor anchor")),
-        (90, [0.1, 0.0], None),
-        (91, [0.05, 0.0], None),
-        (92, [0.01, 0.0], None),
+        (2, [0.9, 0.3], Some("anchor anchor anchor")),
+        (90, [0.5, 1.0], None),
+        (91, [0.2, 1.0], None),
+        (92, [0.0, 1.0], None),
     ];
     let ctx_seed =
         PolicyContext::with_visibilities("tenant-tie", [Visibility::Public, Visibility::Private])
