@@ -9033,6 +9033,7 @@ impl EngineCore {
             return match ctrl.control {
                 TxnControl::Begin | TxnControl::StartTransaction => {
                     txn.begin_with_modes(&self.storage, session, access_mode, isolation_level)?;
+                    session.enter_txn_block();
                     Ok(if ctrl.control == TxnControl::Begin {
                         crate::sql::SqlOutcome::Begin
                     } else {
@@ -11407,16 +11408,33 @@ impl EngineCore {
             }
             // SQL-73・Issue #2033: 構文段で範囲検証済みの値をセッションへ代入する（失敗した SET は
             // 値を変えない）。`DEFAULT`・`RESET` は上書きなし（既定値）へ戻す。
-            crate::sql::allowlist::Statement::SetHnswScanSetting { value, reset } => {
+            crate::sql::allowlist::Statement::SetHnswScanSetting {
+                value,
+                reset,
+                local,
+            } => {
                 use crate::sql::allowlist::{
                     HnswIterativeScanSetting as Is, HnswMaxScanTuplesSetting as Ms,
                     HnswScanSetting as S,
                 };
-                match value {
-                    S::IterativeScan(Is::Value(v)) => session.set_hnsw_iterative_scan(v),
-                    S::IterativeScan(Is::Default) => session.reset_hnsw_iterative_scan(),
-                    S::MaxScanTuples(Ms::Value(n)) => session.set_hnsw_max_scan_tuples(n),
-                    S::MaxScanTuples(Ms::Default) => session.reset_hnsw_max_scan_tuples(),
+                match (value, local) {
+                    (S::IterativeScan(Is::Value(v)), false) => session.set_hnsw_iterative_scan(v),
+                    (S::IterativeScan(Is::Default), false) => session.reset_hnsw_iterative_scan(),
+                    (S::MaxScanTuples(Ms::Value(n)), false) => session.set_hnsw_max_scan_tuples(n),
+                    (S::MaxScanTuples(Ms::Default), false) => session.reset_hnsw_max_scan_tuples(),
+                    // `SET LOCAL`: 明示トランザクション内だけ効き、COMMIT で LOCAL 直前の値へ戻る。
+                    (S::IterativeScan(Is::Value(v)), true) => {
+                        session.set_hnsw_iterative_scan_local(Some(v))
+                    }
+                    (S::IterativeScan(Is::Default), true) => {
+                        session.set_hnsw_iterative_scan_local(None)
+                    }
+                    (S::MaxScanTuples(Ms::Value(n)), true) => {
+                        session.set_hnsw_max_scan_tuples_local(Some(n))
+                    }
+                    (S::MaxScanTuples(Ms::Default), true) => {
+                        session.set_hnsw_max_scan_tuples_local(None)
+                    }
                 }
                 Ok(crate::sql::SqlOutcome::SetHnswScanSetting { reset })
             }

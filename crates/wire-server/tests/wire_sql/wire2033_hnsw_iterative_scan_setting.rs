@@ -1,6 +1,6 @@
 //! セッション変数 `hnsw.iterative_scan`・`hnsw.max_scan_tuples`（Issue #2033。ポインタ: SQL-73）の pg wire 結合テスト。
 //!
-//! `SET`／`RESET` のタグ（`SET`／`RESET`）と `SHOW` の行、不正値の `22023`・`SET LOCAL` の `0A000`
+//! `SET`／`RESET` のタグ（`SET`／`RESET`）と `SHOW` の行、不正値の `22023`・`SET LOCAL` の不正値 `22023`
 //! （入力値を反射しない）、Tx の `ROLLBACK` での巻き戻しを固定する。
 //! 時間に依存しない。
 
@@ -64,14 +64,14 @@ fn simple_query_set_show_reset_roundtrip() {
 }
 
 #[test]
-fn invalid_values_and_set_local_are_rejected() {
+fn invalid_values_are_rejected() {
     let (mut s, _g) = setup("wire-scan-setting-invalid");
     set_ok(&mut s, "SET hnsw.max_scan_tuples = 42", "SET");
     for (sql, code) in [
         ("SET hnsw.iterative_scan = abcdef", "22023"),
         ("SET hnsw.max_scan_tuples = 0", "22023"),
         ("SET hnsw.max_scan_tuples = 2147483648", "22023"),
-        ("SET LOCAL hnsw.iterative_scan = off", "0A000"),
+        ("SET LOCAL hnsw.iterative_scan = abcdef", "22023"),
     ] {
         send_simple_query(&mut s, sql);
         let (t, body) = read_message(&mut s);
@@ -94,5 +94,15 @@ fn set_is_rolled_back_with_transaction() {
     set_ok(&mut s, "SET hnsw.iterative_scan = off", "SET");
     assert_eq!(show(&mut s, "hnsw.iterative_scan"), "off");
     set_ok(&mut s, "ROLLBACK", "ROLLBACK");
+    assert_eq!(show(&mut s, "hnsw.iterative_scan"), "strict_order");
+}
+
+#[test]
+fn set_local_is_restored_at_commit() {
+    let (mut s, _g) = setup("wire-scan-setting-local");
+    set_ok(&mut s, "BEGIN", "BEGIN");
+    set_ok(&mut s, "SET LOCAL hnsw.iterative_scan = off", "SET");
+    assert_eq!(show(&mut s, "hnsw.iterative_scan"), "off");
+    set_ok(&mut s, "COMMIT", "COMMIT");
     assert_eq!(show(&mut s, "hnsw.iterative_scan"), "strict_order");
 }

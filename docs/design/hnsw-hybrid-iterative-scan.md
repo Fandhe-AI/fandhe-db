@@ -1101,7 +1101,7 @@ terminates_and_is_deterministic`（F32／F16 共有本体）へ
 | 走査数の定義 | 反復の各回で DISTANCE 段へ要求した候補数。上限は `min(max_scan_tuples, SQL-46 の走査行数上限, MAX_SEARCH_K, 可視行数)`。provider の `k` の契約上限が 10,000 のため、既定 20,000 の実効上限は 10,000 になる |
 | 反復 | 取得件数 `k_round` を倍々（`saturating_mul(2)`）に増やし、毎回 SCALAR 事後フィルタをかける。終了条件は「通過件数 ≥ `OFFSET + LIMIT`」「可視集合を使い切った」「上限到達」。回数は高々 ⌈log2(上限 / 目標件数)⌉ + 1。各回の前に文の期限を確認する。上限到達はエラーにしない |
 | 実装 | `sql::exec` の DISTANCE 段と事後フィルタをクロージャへ切り出し、反復で再利用した（各回は既存の `search_or_fallback` 等＝キャッシュ済み索引を引く） |
-| `SET LOCAL` | `hnsw.ef_search` と同じく `0A000`。spec は受理側のため、3 設定をまとめて対応する別 Issue が必要 |
+| `SET LOCAL` | `hnsw.iterative_scan`／`hnsw.max_scan_tuples` は受理する。明示 `BEGIN` 後の LOCAL は最初の LOCAL 直前の値を `SessionState` に保持し、`COMMIT` で戻す（`ROLLBACK`／`ROLLBACK TO` は `BEGIN`／`SAVEPOINT` 時点の複製の復元で戻る）。LOCAL 後のセッション値 `SET`／`RESET` は復元予約を破棄し COMMIT 後も残る。明示トランザクション外（単独文・暗黙トランザクション）の LOCAL は効果を持たない（PostgreSQL の単独文と同じ）。`hnsw.ef_search` の `SET LOCAL` は従来どおり `0A000`（3 設定をまとめて対応する別 Issue が必要） |
 | 事後フィルタの評価エラー | 反復で評価する行が増えるため、以前は評価されなかった行の式エラー（ゼロ除算等）が表に出うる。PG と同じ動作 |
 | テナント境界 | 反復は RLS 適用後のアリーナ・`slot_ids` の中だけで行い、各回の結果を既存の可視 ID 検証と安全網に通す。応答に走査数・回数は出さない（統計は集計値でテナント・行 ID を含まない）。tenant-b の行数（0 / 1,000）を変えても tenant-a の結果が変わらないことをテストで固定 |
 
@@ -1117,7 +1117,7 @@ tenant-a 4,000 行・tenant-b 1,000 行・次元 16・HNSW opt-in・`HINT ORDER(
 
 ### 対象外
 
-`SET LOCAL hnsw.*`、`EXPLAIN ANALYZE` での反復回数・上限到達の表示（SQL-76）、`relaxed_order` 固有の最適化、`RESET ALL`／`DISCARD ALL`、NoSQL（HTTP）表層からの設定（既定値で動く）、選択率しきい値による厳密走査への自動切替の EXPLAIN での動的表示。
+`SET LOCAL hnsw.ef_search`、`EXPLAIN ANALYZE` での反復回数・上限到達の表示（SQL-76）、`relaxed_order` 固有の最適化、`RESET ALL`／`DISCARD ALL`、NoSQL（HTTP）表層からの設定（既定値で動く）、選択率しきい値による厳密走査への自動切替の EXPLAIN での動的表示。
 
 ## 素の WHERE 付き kNN の取りこぼし条件の実測（Issue #2032）
 

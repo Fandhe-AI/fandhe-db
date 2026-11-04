@@ -3453,6 +3453,8 @@ pub enum Statement {
     SetHnswScanSetting {
         value: HnswScanSetting,
         reset: bool,
+        /// `SET LOCAL` 由来か（明示トランザクションの終了で SET 前の値へ戻る。`RESET` は常に false）。
+        local: bool,
     },
     /// `SHOW hnsw.iterative_scan`／`SHOW hnsw.max_scan_tuples`（SQL-73・Issue #2033）。列名は
     /// 設定名と同じ text 1 行。**#2033 で追加した破壊的変更（BREAKING CHANGE）**: variant 追加。
@@ -24586,7 +24588,7 @@ pub(crate) fn show_hnsw_scan_param(tokens: &[Token]) -> Option<HnswScanParam> {
 }
 
 /// 文が `SET [SESSION|LOCAL] hnsw.iterative_scan|hnsw.max_scan_tuples ...` の頭ならその種別。
-/// `SET LOCAL` も真にして [`parse_set_hnsw_scan`] が `0A000` で拒否する。
+/// `SET LOCAL` も真にし、[`parse_set_hnsw_scan`] が LOCAL 指定として受理する。
 fn set_hnsw_scan_head(tokens: &[Token]) -> Option<HnswScanParam> {
     let modifier_at_1 = matches!(tokens.get(1), Some(Token::Ident(w))
         if w.eq_ignore_ascii_case("SESSION") || w.eq_ignore_ascii_case("LOCAL"));
@@ -24600,12 +24602,12 @@ fn set_hnsw_scan_head(tokens: &[Token]) -> Option<HnswScanParam> {
 }
 
 /// `SET [SESSION] hnsw.iterative_scan|hnsw.max_scan_tuples {TO|=} {値|'値'|DEFAULT}`
-/// （SQL-73・Issue #2033）。`SET LOCAL` は `0A000`、範囲外・不正値は `22023`（入力値を応答に
-/// 含めない）、値の欠落は `42601`。
+/// （SQL-73・Issue #2033）。`SET LOCAL` も受理し、LOCAL 指定かを返す（トランザクション終了時の
+/// 復元は `SessionState` が担う）。範囲外・不正値は `22023`（入力値を応答に含めない）、値の欠落は `42601`。
 fn parse_set_hnsw_scan(
     tokens: &[Token],
     param: HnswScanParam,
-) -> Result<HnswScanSetting, SqlSurfaceError> {
+) -> Result<(HnswScanSetting, bool), SqlSurfaceError> {
     let invalid = || SqlSurfaceError::InvalidParameterValue {
         detail: match param {
             HnswScanParam::IterativeScan => "invalid value for parameter \"hnsw.iterative_scan\"",
@@ -24614,12 +24616,8 @@ fn parse_set_hnsw_scan(
     };
     let mut p = Parser::new(tokens);
     p.expect_ident_matching("SET")?;
-    if p.peek_ident_matches("LOCAL") {
-        return Err(SqlSurfaceError::FeatureNotSupported {
-            detail: "SET LOCAL is not supported".to_string(),
-        });
-    }
-    if p.peek_ident_matches("SESSION") {
+    let local = p.peek_ident_matches("LOCAL");
+    if local || p.peek_ident_matches("SESSION") {
         p.advance();
     }
     // 呼び出し元の頭判定で設定名の存在は確認済み。ここでは 1 トークン読み進めるだけ。
@@ -24666,7 +24664,7 @@ fn parse_set_hnsw_scan(
         }
     };
     p.expect_end_of_statement()?;
-    Ok(setting)
+    Ok((setting, local))
 }
 
 /// 文が `RESET hnsw.iterative_scan|hnsw.max_scan_tuples`（末尾 `;` 可）ならその種別。
@@ -28189,10 +28187,11 @@ fn validate_sql_tokens_impl(
             let param = set_hnsw_scan_head(tokens).ok_or(SqlSurfaceError::Internal {
                 detail: "hnsw scan setting head vanished".to_string(),
             })?;
-            let value = parse_set_hnsw_scan(tokens, param)?;
+            let (value, local) = parse_set_hnsw_scan(tokens, param)?;
             Ok(Statement::SetHnswScanSetting {
                 value,
                 reset: false,
+                local,
             })
         }
         _ if reset_hnsw_scan_param(tokens).is_some() => {
@@ -28204,7 +28203,11 @@ fn validate_sql_tokens_impl(
                     HnswScanSetting::MaxScanTuples(HnswMaxScanTuplesSetting::Default)
                 }
             };
-            Ok(Statement::SetHnswScanSetting { value, reset: true })
+            Ok(Statement::SetHnswScanSetting {
+                value,
+                reset: true,
+                local: false,
+            })
         }
         _ if is_set_statement && is_set_search_path_head(tokens) => {
             let value = parse_set_search_path(tokens)?;

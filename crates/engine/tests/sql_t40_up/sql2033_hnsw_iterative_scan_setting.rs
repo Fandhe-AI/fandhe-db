@@ -120,7 +120,7 @@ fn set_show_reset_roundtrip() {
 }
 
 /// SQL-73: 範囲外・不正値は 22023（直前の値は変わらない・入力値を応答に含めない）、
-/// `SET LOCAL` は 0A000、値の欠落は 42601。
+/// `SET LOCAL` の不正値も 22023、値の欠落は 42601。
 #[test]
 fn invalid_values_are_rejected_without_changing_state() {
     let (core, _g) = open("sql2033-invalid");
@@ -150,10 +150,10 @@ fn invalid_values_are_rejected_without_changing_state() {
         assert_eq!(show(&core, &mut s, "hnsw.max_scan_tuples"), "42");
     }
     for sql in [
-        "SET LOCAL hnsw.iterative_scan = off",
-        "SET LOCAL hnsw.max_scan_tuples = 1",
+        "SET LOCAL hnsw.iterative_scan = abc",
+        "SET LOCAL hnsw.max_scan_tuples = 0",
     ] {
-        assert_eq!(run(&core, &mut s, sql).expect_err(sql).wire_code(), "0A000");
+        assert_eq!(run(&core, &mut s, sql).expect_err(sql).wire_code(), "22023");
     }
     for sql in ["SET hnsw.iterative_scan =", "SET hnsw.max_scan_tuples ="] {
         assert_eq!(run(&core, &mut s, sql).expect_err(sql).wire_code(), "42601");
@@ -200,5 +200,63 @@ fn session_less_entry_rejects() {
     ] {
         let e = core.execute_sql(&ctx(), sql).expect_err(sql);
         assert_eq!(e.wire_code(), "42601", "{sql}");
+    }
+}
+
+/// SQL-73: `SET LOCAL` は明示トランザクション内だけ効き、COMMIT／ROLLBACK で LOCAL 直前の値へ戻る。
+/// トランザクション外の `SET LOCAL` は効果を持たず、LOCAL 後のセッション値 `SET` は COMMIT 後も残る。
+#[test]
+fn set_local_is_restored_at_transaction_end() {
+    let (core, _g) = open("sql2033-local");
+    let mut s = SessionState::default();
+    let mut txn = SessionTransaction::new(TransactionLimits::default());
+    let c = ctx();
+    let mut exec = |s: &mut SessionState, sql: &str| {
+        core.execute_sql_in_txn(&c, s, &mut txn, sql)
+            .unwrap_or_else(|e| panic!("{sql}: {e:?}"))
+    };
+    // 単独文の LOCAL は効果なし。
+    exec(&mut s, "SET LOCAL hnsw.max_scan_tuples = 5");
+    assert_eq!(get(&mut exec, &mut s, "hnsw.max_scan_tuples"), "20000");
+    // COMMIT で LOCAL 直前（セッション値）へ戻る。
+    exec(&mut s, "SET hnsw.max_scan_tuples = 42");
+    exec(&mut s, "BEGIN");
+    exec(&mut s, "SET LOCAL hnsw.max_scan_tuples = 7");
+    exec(&mut s, "SET LOCAL hnsw.iterative_scan = off");
+    exec(&mut s, "SET LOCAL hnsw.max_scan_tuples = 8");
+    assert_eq!(get(&mut exec, &mut s, "hnsw.max_scan_tuples"), "8");
+    assert_eq!(get(&mut exec, &mut s, "hnsw.iterative_scan"), "off");
+    exec(&mut s, "COMMIT");
+    assert_eq!(get(&mut exec, &mut s, "hnsw.max_scan_tuples"), "42");
+    assert_eq!(
+        get(&mut exec, &mut s, "hnsw.iterative_scan"),
+        "strict_order"
+    );
+    // ROLLBACK でも戻り、LOCAL は以後のトランザクション外へ漏れない。
+    exec(&mut s, "BEGIN");
+    exec(&mut s, "SET LOCAL hnsw.max_scan_tuples = 9");
+    exec(&mut s, "ROLLBACK");
+    assert_eq!(get(&mut exec, &mut s, "hnsw.max_scan_tuples"), "42");
+    exec(&mut s, "SET LOCAL hnsw.max_scan_tuples = 11");
+    assert_eq!(get(&mut exec, &mut s, "hnsw.max_scan_tuples"), "42");
+    // LOCAL の後のセッション値 SET は COMMIT 後も残る。
+    exec(&mut s, "BEGIN");
+    exec(&mut s, "SET LOCAL hnsw.max_scan_tuples = 3");
+    exec(&mut s, "SET hnsw.max_scan_tuples = 99");
+    exec(&mut s, "COMMIT");
+    assert_eq!(get(&mut exec, &mut s, "hnsw.max_scan_tuples"), "99");
+}
+
+fn get(
+    exec: &mut impl FnMut(&mut SessionState, &str) -> SqlOutcome,
+    s: &mut SessionState,
+    name: &str,
+) -> String {
+    match exec(s, &format!("SHOW {name}")) {
+        SqlOutcome::Show(r) => match &r.rows[0].cells[0] {
+            Cell::Text(t) => t.clone(),
+            other => panic!("expected text, got {other:?}"),
+        },
+        other => panic!("expected Show, got {other:?}"),
     }
 }
