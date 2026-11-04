@@ -27,6 +27,23 @@
 //! f16 復号 f32 dot であり、i8 量子化誤差は順位の粗い絞り込みにしか影響
 //! しない。
 //!
+//! # metric 対応（Issue #2004・親 #2002・CORE-8・CORE-16・SQL-33）
+//!
+//! 本経路は候補生成専用のため、metric ごとに変わるのは**ホスト側の候補選出キー**
+//! と**最終 f32 再スコア**だけで、シェーダ（整数内積）は変えない。
+//!
+//! | metric | 候補選出キー（大きいほど近い） | 最終スコア | 対応 |
+//! | ---- | ---- | ---- | ---- |
+//! | InnerProduct | `Σ·s_i` | `dot` | 対応 |
+//! | Cosine | `Σ·s_i / ‖x_i‖` | `-(1 - cos)` | 対応（実測ゲート済み） |
+//! | L2 | `2·s_i·s_q·Σ - ‖x_i‖²` | `-l2_sq` | 対応可否は [`i8_supports_metric`] |
+//! | L1 | 内積へ分解できない | - | 非対応（`InitFailed`） |
+//!
+//! 非対応 metric は GPU に触れる前に [`GpuI8BatchBackend::try_new_with_metric`] が
+//! `InitFailed` で拒否する（fail-closed。黙って内積で計算しない）。縮退先 CPU 経路の
+//! metric 対応は #2003／#2002 の範囲で、本経路は `FallbackBatchEngine` の primary に
+//! 接続しない。実測値は `docs/design/gpu-batch-i8-packed.md` §10 参照。
+//!
 //! # panic を作らない設計
 //!
 //! `unwrap`/`expect`/添字アクセスは使わない（[`super`] モジュール冒頭コメント
@@ -39,13 +56,15 @@ use crate::batch_fallback::{BatchBackend, BatchBackendError, BatchExecError};
 use crate::batch_search::{
     try_reserve_exact, BatchHit, BatchQuery, BatchSearchError, ResidentMatrix,
 };
-use crate::kernel::{dot, CandidateHit, TopKSelector};
+use crate::kernel::{
+    cosine_distance_from_parts, dot, l2_sq, row_norms_sq, CandidateHit, TopKSelector,
+};
 
 use super::{
     block_on_with_device_poll, bytes_of_u32_slice, check_reachable_batch_work,
     create_topk_pipeline, finalize_gpu_hits, gather_reachable_rows, global_context,
     gpu_dispatch_lock, group_queries_by_ctx, validate_batch_queries, wait_and_read_buffer,
-    GpuContext, GpuParams,
+    GpuBatchMetric, GpuContext, GpuParams,
 };
 
 /// クランプ後の量子化値の絶対値上限（D3: `-128` は使わない。対称範囲で
@@ -397,6 +416,86 @@ fn unpack_i8x4_i32(packed: u32) -> [i32; 4] {
     out
 }
 
+/// i8 経路が `metric` に対応するか（対応表の単一の判定箇所。`match` は網羅で書き、
+/// 新しい metric が増えたらコンパイルエラーで判断を強制する）。
+pub(crate) fn i8_supports_metric(metric: GpuBatchMetric) -> bool {
+    match metric {
+        GpuBatchMetric::InnerProduct => true,
+        GpuBatchMetric::Cosine => true,
+        GpuBatchMetric::L2 => true,
+        GpuBatchMetric::L1 => false,
+    }
+}
+
+/// 候補選出キーの計算文脈（クエリごとに作る。行側の値は行自身だけから決まり、
+/// 他行・他テナントの値には依存しない）。
+pub(crate) struct RankingCtx<'a> {
+    pub(crate) metric: GpuBatchMetric,
+    pub(crate) row_scales: &'a Sq8RowScales,
+    /// 行ごとのノルム²。Cosine／L2 のときだけ使う（InnerProduct では空）。
+    pub(crate) row_norms_sq: &'a [f32],
+    /// [`quantize_query`] が返すクエリのスケール（L2 の加法項と組むため省けない）。
+    pub(crate) query_scale: f32,
+}
+
+/// `(slot, raw i32 score)` の候補選出キー（大きいほど近い。f64 で返す）。
+/// InnerProduct は従来どおり `(score as f32) * scale` を f64 へ広げただけで順序は不変。
+/// Cosine はノルムが不正（None・非正・非有限）なら除算せず `-inf`（最下位）にする。
+fn ranking_key(slot: u32, score: i32, ctx: &RankingCtx<'_>) -> f64 {
+    let scale = ctx.row_scales.scale(slot as usize).unwrap_or(0.0);
+    match ctx.metric {
+        GpuBatchMetric::InnerProduct => f64::from((score as f32) * scale),
+        GpuBatchMetric::Cosine => {
+            let norm_sq = ctx.row_norms_sq.get(slot as usize).copied().unwrap_or(0.0);
+            if !norm_sq.is_finite() || norm_sq <= 0.0 {
+                return f64::NEG_INFINITY;
+            }
+            let key = f64::from(score) * f64::from(scale) / f64::from(norm_sq).sqrt();
+            if key.is_finite() {
+                key
+            } else {
+                f64::NEG_INFINITY
+            }
+        }
+        GpuBatchMetric::L2 => {
+            let norm_sq = ctx
+                .row_norms_sq
+                .get(slot as usize)
+                .copied()
+                .unwrap_or(f32::NAN);
+            let key = 2.0 * f64::from(scale) * f64::from(ctx.query_scale) * f64::from(score)
+                - f64::from(norm_sq);
+            if key.is_finite() {
+                key
+            } else {
+                f64::NEG_INFINITY
+            }
+        }
+        // 非対応（構築時に拒否済み）。到達しても最下位へ沈める fail-closed。
+        GpuBatchMetric::L1 => f64::NEG_INFINITY,
+    }
+}
+
+/// 最終 f32 再スコア（大きいほど近い）。非有限（ゼロノルム等）は呼び出し側が除外する。
+/// InnerProduct は従来どおり `dot` のまま。
+pub(crate) fn final_score(
+    metric: GpuBatchMetric,
+    query: &[f32],
+    row: &[f32],
+    query_norm_sq: f32,
+) -> f32 {
+    match metric {
+        GpuBatchMetric::InnerProduct => dot(query, row),
+        GpuBatchMetric::Cosine => {
+            let d = cosine_distance_from_parts(dot(query, row), query_norm_sq, dot(row, row));
+            -(d as f32)
+        }
+        GpuBatchMetric::L2 => -l2_sq(query, row),
+        // 非対応: NaN を返し呼び出し側の非有限除外に落とす（fail-closed）。
+        GpuBatchMetric::L1 => f32::NAN,
+    }
+}
+
 /// [`GpuI8BatchBackend::try_new`] のオプション（D9・CORE-12: 環境変数では
 /// 読まず、コンストラクタ引数のみで受ける）。
 #[derive(Debug, Clone, Copy)]
@@ -491,6 +590,8 @@ fn i8_pipeline() -> Result<&'static wgpu::ComputePipeline, String> {
 pub struct GpuI8BatchBackend {
     matrix: ResidentMatrix,
     row_scales: Sq8RowScales,
+    metric: GpuBatchMetric,
+    row_norms_sq: Vec<f32>,
     row_buffer: wgpu::Buffer,
     row_stride: usize,
     options: GpuI8Options,
@@ -513,9 +614,25 @@ impl GpuI8BatchBackend {
         matrix: ResidentMatrix,
         options: GpuI8Options,
     ) -> Result<Self, BatchBackendError> {
+        Self::try_new_with_metric(matrix, options, GpuBatchMetric::InnerProduct)
+    }
+
+    /// [`Self::try_new`] の metric 指定版（Issue #2004）。metric は構築時に固定する
+    /// （CORE-12: 環境変数では読まない）。非対応 metric（[`i8_supports_metric`]）は
+    /// GPU に触れる前に `InitFailed` で拒否する。
+    pub fn try_new_with_metric(
+        matrix: ResidentMatrix,
+        options: GpuI8Options,
+        metric: GpuBatchMetric,
+    ) -> Result<Self, BatchBackendError> {
         if options.oversample == 0 || options.oversample > MAX_I8_OVERSAMPLE {
             return Err(BatchBackendError::InitFailed(
                 "i8 oversample out of range".to_string(),
+            ));
+        }
+        if !i8_supports_metric(metric) {
+            return Err(BatchBackendError::InitFailed(
+                "i8 path does not support this metric".to_string(),
             ));
         }
 
@@ -562,6 +679,20 @@ impl GpuI8BatchBackend {
         let (row_scales, packed) = encode_rows(dim, row_count, &decoded)
             .map_err(|e| BatchBackendError::InitFailed(format!("i8 encode failed: {e}")))?;
         let row_stride = row_stride_for_dim(dim);
+
+        // Cosine／L2 の候補選出キー用に、再スコアと同じ真値（f16 往復デコード行）から
+        // 行ごとのノルム²を求める（行自身だけから決まる。他行・他テナントに非依存）。
+        let row_norms: Vec<f32> = match metric {
+            GpuBatchMetric::InnerProduct | GpuBatchMetric::L1 => Vec::new(),
+            GpuBatchMetric::Cosine | GpuBatchMetric::L2 => {
+                let dim_u32 = u32::try_from(dim).map_err(|_| {
+                    BatchBackendError::InitFailed("i8 dimension out of range".to_string())
+                })?;
+                row_norms_sq(&decoded, dim_u32).map_err(|_| {
+                    BatchBackendError::InitFailed("i8 row norm allocation failed".to_string())
+                })?
+            }
+        };
 
         let packed_bytes = packed
             .len()
@@ -618,6 +749,8 @@ impl GpuI8BatchBackend {
         Ok(Self {
             matrix,
             row_scales,
+            metric,
+            row_norms_sq: row_norms,
             row_buffer,
             row_stride,
             options,
@@ -703,7 +836,7 @@ impl GpuI8BatchBackend {
                         "i8 query index out of range".to_string(),
                     ))
                 })?;
-                let (_s_q, qq) = quantize_query(query.vector).map_err(|e| {
+                let (s_q, qq) = quantize_query(query.vector).map_err(|e| {
                     BatchExecError::Backend(BatchBackendError::KernelLaunchFailed(format!(
                         "i8 query quantize failed: {e}"
                     )))
@@ -723,6 +856,12 @@ impl GpuI8BatchBackend {
                 // = 1,000,000 * 32 = 32,000,000 要素で、`validate_batch_queries`
                 // の `sum(k)` 上限と [`GpuI8BatchBackend::try_new`] の
                 // oversample 範囲検証から導かれる）。
+                let rank_ctx = RankingCtx {
+                    metric: self.metric,
+                    row_scales: &self.row_scales,
+                    row_norms_sq: &self.row_norms_sq,
+                    query_scale: s_q,
+                };
                 let k_prime = query
                     .k
                     .saturating_mul(self.options.oversample)
@@ -756,7 +895,7 @@ impl GpuI8BatchBackend {
                     for (&slot, &score) in chunk.iter().zip(scores.iter()) {
                         per_query.push((slot, score));
                     }
-                    reduce_top_k_prime(&mut per_query, k_prime, &self.row_scales)
+                    reduce_top_k_prime(&mut per_query, k_prime, &rank_ctx)
                         .map_err(BatchExecError::Input)?;
                 }
                 // 最後のチャンク追加がちょうど `k_prime` 件に収まり
@@ -765,7 +904,7 @@ impl GpuI8BatchBackend {
                 // 確定させる（[`reduce_top_k_prime`] は保持量が `k_prime` を
                 // 超えたときのみ並べ替えるため、size が最初から `k_prime`
                 // 以下だった場合は挿入順のまま残る）。
-                sort_by_ranking_key(&mut per_query, &self.row_scales);
+                sort_by_ranking_key(&mut per_query, &rank_ctx);
                 // ループ内で一度も [`reduce_top_k_prime`] の縮約が発火しなかった
                 // 経路（size が最初から `k_prime` 以下）でも、直前のチャンク
                 // push に備えた `try_reserve_exact` の予約量がそのまま容量に
@@ -823,16 +962,6 @@ fn i8_chunk_rows(max_workgroups_per_dimension: u32) -> usize {
     (max_workgroups_per_dimension as usize).saturating_mul(256)
 }
 
-/// `(slot, raw i32 score)` の候補選出キー: 行 `slot` のスケール
-/// （[`Sq8RowScales`]）を掛けた近似内積（降順に並べる基準。P0 修正で
-/// 量子化スケールが行単位になったため、行をまたぐ生の i32 スコアはそのまま
-/// 比較できない——行スケールを掛けてはじめて比較可能になる。範囲外の
-/// `slot`（本来到達しないはずの防御的分岐）は最下位として扱う）。
-fn ranking_key(slot: u32, score: i32, row_scales: &Sq8RowScales) -> f32 {
-    let scale = row_scales.scale(slot as usize).unwrap_or(0.0);
-    (score as f32) * scale
-}
-
 /// `buf` を [`ranking_key`] 降順（同点は `slot` 昇順）へ確定させる
 /// （in-place・追加確保なし）。
 ///
@@ -845,10 +974,10 @@ fn ranking_key(slot: u32, score: i32, row_scales: &Sq8RowScales) -> f32 {
 /// P1）。比較子は `slot` 昇順の完全なタイブレークを持つ全順序であり、
 /// 安定/不安定のどちらでも出力は同じ（sort-determinism-check
 /// （`docs/design/rrf-tie-break-determinism.md`）の許可マーカー参照）。
-fn sort_by_ranking_key(buf: &mut [(u32, i32)], row_scales: &Sq8RowScales) {
+pub(crate) fn sort_by_ranking_key(buf: &mut [(u32, i32)], ctx: &RankingCtx<'_>) {
     let cmp = |&(slot_a, score_a): &(u32, i32), &(slot_b, score_b): &(u32, i32)| {
-        let key_a = ranking_key(slot_a, score_a, row_scales);
-        let key_b = ranking_key(slot_b, score_b, row_scales);
+        let key_a = ranking_key(slot_a, score_a, ctx);
+        let key_b = ranking_key(slot_b, score_b, ctx);
         key_b.total_cmp(&key_a).then(slot_a.cmp(&slot_b))
     };
     buf.sort_unstable_by(cmp); // sort-determinism: allow 比較子は slot 昇順の明示的タイブレークを含む全順序（フォールブル確保契約のため sort_by からの意図的な切り替え）
@@ -863,15 +992,15 @@ fn sort_by_ranking_key(buf: &mut [(u32, i32)], row_scales: &Sq8RowScales) {
 /// 一括保持してから 1 回だけ選出した場合」と一致する（超過しなかった
 /// チャンクでは何も破棄しないため、より弱く「まだ何も捨てる必要が無い」
 /// ケースになるだけで、この性質は崩れない）。
-fn reduce_top_k_prime(
+pub(crate) fn reduce_top_k_prime(
     buf: &mut Vec<(u32, i32)>,
     k_prime: usize,
-    row_scales: &Sq8RowScales,
+    ctx: &RankingCtx<'_>,
 ) -> Result<(), BatchSearchError> {
     if buf.len() <= k_prime {
         return Ok(());
     }
-    sort_by_ranking_key(buf, row_scales);
+    sort_by_ranking_key(buf, ctx);
     buf.truncate(k_prime);
     // `Vec::truncate` は長さのみ減らし確保済み容量を解放しない。この関数は
     // チャンク（最大 `i8_chunk_rows` 行）を丸ごと push した直後に呼ばれるため、
@@ -957,6 +1086,8 @@ impl BatchBackend for GpuI8BatchBackend {
                     "failed to reserve i8 selector heap: {e}"
                 )))
             })?;
+            // Cosine の最終スコア用。クエリごとに 1 回だけ計算する。
+            let query_norm_sq = dot(query.vector, query.vector);
             for (slot, _int_score) in per_query {
                 if self
                     .matrix
@@ -965,7 +1096,7 @@ impl BatchBackend for GpuI8BatchBackend {
                 {
                     continue;
                 }
-                let score = dot(query.vector, &row_buf);
+                let score = final_score(self.metric, query.vector, &row_buf, query_norm_sq);
                 if !score.is_finite() {
                     continue;
                 }
@@ -1140,6 +1271,9 @@ fn dispatch_i8_dot_products(
 }
 
 #[cfg(test)]
+mod precision_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1301,6 +1435,12 @@ mod tests {
         let row_scales = Sq8RowScales {
             scales: vec![1.0f32; 8],
         };
+        let rank_ctx = RankingCtx {
+            metric: GpuBatchMetric::InnerProduct,
+            row_scales: &row_scales,
+            row_norms_sq: &[],
+            query_scale: 1.0,
+        };
         let mut buf: Vec<(u32, i32)> = Vec::new();
         buf.try_reserve_exact(100_000)
             .expect("reserve should succeed");
@@ -1309,7 +1449,7 @@ mod tests {
             buf.push((i, 1));
         }
 
-        reduce_top_k_prime(&mut buf, 4, &row_scales).expect("reserve should succeed");
+        reduce_top_k_prime(&mut buf, 4, &rank_ctx).expect("reserve should succeed");
 
         assert_eq!(buf.len(), 4);
         assert!(
@@ -1350,6 +1490,100 @@ mod tests {
     #[test]
     fn dot_shader_i8_wgsl_uses_dot4_i8_packed_builtin() {
         assert!(DOT_SHADER_I8_WGSL.contains("dot4I8Packed"));
+    }
+
+    #[test]
+    fn i8_supports_metric_table_matches_decision() {
+        assert!(i8_supports_metric(GpuBatchMetric::InnerProduct));
+        assert!(i8_supports_metric(GpuBatchMetric::Cosine));
+        assert!(i8_supports_metric(GpuBatchMetric::L2));
+        assert!(!i8_supports_metric(GpuBatchMetric::L1));
+    }
+
+    #[test]
+    fn try_new_with_metric_rejects_l1_before_touching_gpu() {
+        use crate::storage::Visibility;
+        let matrix = ResidentMatrix::build(
+            &[1],
+            &["t".to_string()],
+            &[Visibility::Public],
+            2,
+            &[1.0, 2.0],
+        )
+        .expect("matrix build");
+        let err = GpuI8BatchBackend::try_new_with_metric(
+            matrix,
+            GpuI8Options::default(),
+            GpuBatchMetric::L1,
+        )
+        .err()
+        .expect("L1 must be rejected");
+        match err {
+            BatchBackendError::InitFailed(msg) => {
+                assert_eq!(msg, "i8 path does not support this metric")
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn encode_rows_is_invariant_to_row_scaling_so_cosine_needs_no_normalized_copy() {
+        let base = [0.3f32, -1.2, 2.5, 0.7];
+        let scaled: Vec<f32> = base.iter().map(|v| v * 8.0).collect();
+        let (_, a) = encode_rows(4, 1, &base).expect("encode");
+        let (_, b) = encode_rows(4, 1, &scaled).expect("encode");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn cosine_key_sinks_zero_norm_rows_without_dividing() {
+        let scales = Sq8RowScales {
+            scales: vec![1.0, 1.0],
+        };
+        let norms = [0.0f32, 4.0];
+        let ctx = RankingCtx {
+            metric: GpuBatchMetric::Cosine,
+            row_scales: &scales,
+            row_norms_sq: &norms,
+            query_scale: 1.0,
+        };
+        assert_eq!(ranking_key(0, 100, &ctx), f64::NEG_INFINITY);
+        assert_eq!(ranking_key(1, 100, &ctx), 50.0);
+        // 範囲外 slot も最下位へ沈める（fail-closed）。
+        assert_eq!(ranking_key(9, 100, &ctx), f64::NEG_INFINITY);
+    }
+
+    #[test]
+    fn l2_key_depends_on_query_scale_and_orders_by_true_distance() {
+        // 行 0 はノルムが小さく内積が小さい、行 1 は内積が大きいがノルムも大きい。
+        let scales = Sq8RowScales {
+            scales: vec![1.0, 1.0],
+        };
+        let norms = [1.0f32, 100.0];
+        let mk = |query_scale| RankingCtx {
+            metric: GpuBatchMetric::L2,
+            row_scales: &scales,
+            row_norms_sq: &norms,
+            query_scale,
+        };
+        let c1 = mk(1.0);
+        // query_scale=1: 行0 = 2*1*1*10-1 = 19、行1 = 2*60-100 = 20 -> 行1が近い。
+        assert!(ranking_key(1, 60, &c1) > ranking_key(0, 10, &c1));
+        // query_scale=0.5 で順位が反転する（s_q を省けない反例）。
+        let c2 = mk(0.5);
+        assert!(ranking_key(1, 60, &c2) < ranking_key(0, 10, &c2));
+    }
+
+    #[test]
+    fn inner_product_key_is_unchanged_from_scaled_integer_score() {
+        let scales = Sq8RowScales { scales: vec![0.25] };
+        let ctx = RankingCtx {
+            metric: GpuBatchMetric::InnerProduct,
+            row_scales: &scales,
+            row_norms_sq: &[],
+            query_scale: 3.0,
+        };
+        assert_eq!(ranking_key(0, 40, &ctx), 10.0);
     }
 
     #[test]
