@@ -2120,9 +2120,10 @@ pub(crate) struct LiteralSkip {
     /// 投影項目（`Projection::Items` の添字）ごとの「距離列のリテラルが `$n` 由来か」の可変長
     /// フラグ列。範囲外の添字は印なし（常に検証する側）。
     pub(crate) projection_mask: Vec<bool>,
-    /// `WHERE` の距離式（半径述語）に `$n` 由来のダミー値があるか（Issue #2953。INT8VEC kNN の
-    /// 書き換えだけが参照し、ダミー値を有効なゼロベクトルへ置き換えて束縛する）。
-    pub(crate) where_distance: bool,
+    /// `WHERE` 内の距離式（半径述語）ごとの「被演算子が `$n` 由来か」のトークン出現順フラグ列
+    /// （Issue #2953。INT8VEC の書き換えだけが参照し、`$n` 由来の距離式のダミー値だけを有効な
+    /// ゼロベクトルへ置き換えて束縛する。実リテラルは置換せず検証する）。
+    pub(crate) where_distance_mask: Vec<bool>,
 }
 
 impl LiteralSkip {
@@ -2130,7 +2131,7 @@ impl LiteralSkip {
     pub(crate) const NONE: Self = Self {
         order_by: false,
         projection_mask: Vec::new(),
-        where_distance: false,
+        where_distance_mask: Vec::new(),
     };
 
     pub(crate) fn skips_projection_item(&self, index: usize) -> bool {

@@ -954,3 +954,60 @@ fn describe_accepts_where_radius_placeholder() {
     .expect_err("real literal");
     assert_eq!(err.wire_code(), "22003");
 }
+/// Issue #2953 PR #2956 指摘: 実リテラル `'0'` を `$n` の仮値と取り違えて置換しない。`$n` 由来の距離式が
+/// 同じ文にあっても、`'0'` は Describe で `22P02` になる（Execute と同じ契約）。
+#[test]
+fn describe_rejects_real_zero_literal_next_to_placeholder() {
+    let (_g, core) = open("ivd-describe-real-zero");
+    ok(
+        &core,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, v INT8VEC(2))",
+    );
+    let describe = |sql: &str| {
+        let session = SessionState::default();
+        let prepared = core.parse_sql_prepared(sql).expect("prepare");
+        core.describe_prepared_in_session(&session, &prepared)
+    };
+    for sql in [
+        "SELECT id FROM t WHERE v <-> $1 < 5 AND v <-> '0' < 5 ORDER BY v <=> '[1,2]' LIMIT 3",
+        "SELECT id FROM t WHERE v <-> '0' < 5 AND v <-> $1 < 5 ORDER BY v <=> '[1,2]' LIMIT 3",
+        "SELECT id FROM t WHERE v <-> $1 < 5 AND v <-> '0' < 5 ORDER BY id LIMIT 3",
+    ] {
+        let err = describe(sql).expect_err(sql);
+        assert_eq!(err.wire_code(), "22P02", "{sql}");
+    }
+}
+
+/// Issue #2953 PR #2956 指摘: ORDER BY が距離でない Scan 形の半径検索も、Describe が `$n` 由来の距離式を
+/// 通し、有効な値を Bind して Execute できる。同じ文の実リテラルは Describe で検証される。
+#[test]
+fn scan_form_radius_placeholder_describes_and_executes() {
+    let (_g, core) = open("ivd-scan-radius-param");
+    ok(
+        &core,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, v INT8VEC(2))",
+    );
+    ok(&core, "INSERT INTO t (id, v) VALUES (1, '[1,2]')");
+    ok(&core, "INSERT INTO t (id, v) VALUES (2, '[100,100]')");
+    let session = SessionState::default();
+    let sql = "SELECT id FROM t WHERE v <-> $1 < 5 ORDER BY id LIMIT 3";
+    let prepared = core.parse_sql_prepared(sql).expect("prepare");
+    core.describe_prepared_in_session(&session, &prepared)
+        .expect("scan-form describe");
+    let parsed = core
+        .bind_prepared(&prepared, &[Some(b"[1,2]".to_vec())])
+        .expect("bind");
+    let mut session = SessionState::default();
+    let out = core
+        .execute_parsed_in_session(&ctx_for("alice"), &mut session, &parsed)
+        .expect("execute");
+    let SqlOutcome::Query(q) = out else {
+        panic!("expected query outcome");
+    };
+    assert_eq!(q.rows.len(), 1);
+    let err = core
+        .parse_sql_prepared("SELECT id FROM t WHERE v <-> $1 < 5 AND v <-> '0' < 5 ORDER BY id")
+        .and_then(|p| core.describe_prepared_in_session(&session, &p))
+        .expect_err("real literal");
+    assert_eq!(err.wire_code(), "22P02");
+}

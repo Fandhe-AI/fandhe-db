@@ -115,14 +115,7 @@ pub(crate) fn int8vec_select_as_scan(
     Ok(Some(ValidatedScan {
         table_name: v.table_name.clone(),
         projection,
-        where_predicates: if skip.where_distance {
-            v.where_predicates
-                .iter()
-                .map(|p| placeholder_where(p, schema))
-                .collect()
-        } else {
-            v.where_predicates.clone()
-        },
+        where_predicates: placeholder_predicates(&v.where_predicates, schema, skip),
         limit: v.limit,
         limit_implicit: v.limit_implicit,
         order_by: Vec::new(),
@@ -157,60 +150,139 @@ fn zero_vector_literal(dim: u32) -> String {
     out
 }
 
-/// WHERE 述語内の `$n` 由来ダミー値（Prepared Describe の仮値 `'0'`）の距離オペランドを、INT8VEC 列の
-/// 次元に合うゼロベクトルへ置き換える（Issue #2953。半径述語 `v <-> $1 < r` の Describe 用）。
-/// 置換するのは INT8VEC 列との距離式で、リテラルが仮値 `'0'` と一致するものだけ（その他の実リテラルは
-/// 通常どおり束縛で検証する。`'0'` はベクトルとして元から不正で、Execute では従来どおり拒否される）。
-fn placeholder_where(pred: &WherePredicate, schema: &TableSchema) -> WherePredicate {
-    match pred {
-        WherePredicate::Expression(e) => WherePredicate::Expression(placeholder_expr(e, schema)),
-        WherePredicate::Not(inner) => {
-            WherePredicate::Not(Box::new(placeholder_where(inner, schema)))
-        }
-        WherePredicate::Or(branches) => WherePredicate::Or(
-            branches
-                .iter()
-                .map(|b| b.iter().map(|p| placeholder_where(p, schema)).collect())
-                .collect(),
-        ),
-        other => other.clone(),
+/// Prepared Describe の Scan 形（`ORDER BY` が距離でない半径検索 `WHERE v <-> $1 < r ORDER BY id` 等）の
+/// 束縛前に、`$n` 由来の距離オペランド（WHERE・投影）だけを INT8VEC 列の次元に合うゼロベクトルへ置き換える
+/// （Issue #2953。`core.rs` の Describe の `Statement::Scan` 分岐が呼ぶ）。実リテラルは置換せず、束縛で
+/// 通常どおり検証する。INT8VEC 列が無い表・印が無い文では入力をそのまま複製して返す。
+pub(crate) fn int8vec_scan_placeholders(
+    scan: &ValidatedScan,
+    schema: &TableSchema,
+    skip: &LiteralSkip,
+) -> ValidatedScan {
+    if !schema
+        .columns
+        .iter()
+        .any(|c| matches!(c.ty, ColumnType::Int8Vec(_)))
+    {
+        return scan.clone();
     }
+    let mut out = scan.clone();
+    out.where_predicates = placeholder_predicates(&scan.where_predicates, schema, skip);
+    if let Projection::Items(items) = &scan.projection {
+        out.projection = Projection::Items(
+            items
+                .iter()
+                .enumerate()
+                .map(|(index, item)| {
+                    if skip.skips_projection_item(index) {
+                        placeholder_item(item, schema)
+                    } else {
+                        item.clone()
+                    }
+                })
+                .collect(),
+        );
+    }
+    out
 }
 
-/// [`placeholder_where`] の式側。距離式以外は子式を再帰的に写す。
-fn placeholder_expr(expr: &Expr, schema: &TableSchema) -> Expr {
-    if let Expr::VectorDistance { kind, lhs, rhs } = expr {
-        let operands = match (lhs.as_ref(), rhs.as_ref()) {
-            (Expr::Ident(n), Expr::String(s)) if s == "0" => Some((n, true)),
-            (Expr::String(s), Expr::Ident(n)) if s == "0" => Some((n, false)),
-            _ => None,
-        };
-        let dim = operands.and_then(|(name, _)| {
-            schema
-                .columns
-                .iter()
-                .find(|c| &c.name == name)
-                .and_then(|c| match c.ty {
-                    ColumnType::Int8Vec(d) => Some(d),
-                    _ => None,
-                })
-        });
-        if let (Some((name, lhs_is_col)), Some(dim)) = (operands, dim) {
-            let column = Box::new(Expr::Ident(name.clone()));
-            let zero = Box::new(Expr::String(zero_vector_literal(dim)));
-            let (lhs, rhs) = if lhs_is_col {
-                (column, zero)
-            } else {
-                (zero, column)
-            };
-            return Expr::VectorDistance {
-                kind: *kind,
-                lhs,
-                rhs,
-            };
+/// WHERE 述語内の `$n` 由来の距離オペランド（Prepared Describe の仮値）を、INT8VEC 列の次元に合う
+/// ゼロベクトルへ置き換える（Issue #2953。半径述語 `v <-> $1 < r` の Describe 用）。
+///
+/// 置換対象は値ではなく位置で決める: [`LiteralSkip::where_distance_mask`] は元トークン列の距離演算子の
+/// 出現順に「被演算子が `$n` か」を持ち、述語木の `Expr::VectorDistance` を同じ出現順に走査して対応づける。
+/// 実リテラルは値が `'0'` でも置換しない（束縛で検証し 22P02 等を返す）。距離式の個数が印の個数と
+/// 合わない形（対応づけ不能）は何も置換しない（fail-closed。仮値のまま束縛され拒否される）。
+fn placeholder_predicates(
+    preds: &[WherePredicate],
+    schema: &TableSchema,
+    skip: &LiteralSkip,
+) -> Vec<WherePredicate> {
+    if !skip.where_distance_mask.iter().any(|f| *f) {
+        return preds.to_vec();
+    }
+    let mut counter = PlaceholderWalker {
+        schema,
+        mask: &[],
+        ordinal: 0,
+        replace: false,
+    };
+    for p in preds {
+        counter.pred(p);
+    }
+    if counter.ordinal != skip.where_distance_mask.len() {
+        return preds.to_vec();
+    }
+    let mut walker = PlaceholderWalker {
+        schema,
+        mask: &skip.where_distance_mask,
+        ordinal: 0,
+        replace: true,
+    };
+    preds.iter().map(|p| walker.pred(p)).collect()
+}
+
+/// [`placeholder_predicates`] の走査器。`replace` が偽のときは距離式を数えるだけで木を変えない。
+struct PlaceholderWalker<'a> {
+    schema: &'a TableSchema,
+    mask: &'a [bool],
+    ordinal: usize,
+    replace: bool,
+}
+
+impl PlaceholderWalker<'_> {
+    fn pred(&mut self, pred: &WherePredicate) -> WherePredicate {
+        match pred {
+            WherePredicate::Expression(e) => WherePredicate::Expression(self.expr(e)),
+            WherePredicate::Not(inner) => WherePredicate::Not(Box::new(self.pred(inner))),
+            WherePredicate::Or(branches) => WherePredicate::Or(
+                branches
+                    .iter()
+                    .map(|b| b.iter().map(|p| self.pred(p)).collect())
+                    .collect(),
+            ),
+            other => other.clone(),
         }
     }
-    crate::sql::parser::map_expr_children(expr, &mut |e| placeholder_expr(e, schema))
+
+    fn expr(&mut self, expr: &Expr) -> Expr {
+        if let Expr::VectorDistance { kind, lhs, rhs } = expr {
+            let flagged = self.mask.get(self.ordinal).copied().unwrap_or(false);
+            self.ordinal = self.ordinal.saturating_add(1);
+            if self.replace && flagged {
+                let operands = match (lhs.as_ref(), rhs.as_ref()) {
+                    (Expr::Ident(n), Expr::String(_)) => Some((n, true)),
+                    (Expr::String(_), Expr::Ident(n)) => Some((n, false)),
+                    _ => None,
+                };
+                let dim = operands.and_then(|(name, _)| {
+                    self.schema
+                        .columns
+                        .iter()
+                        .find(|c| &c.name == name)
+                        .and_then(|c| match c.ty {
+                            ColumnType::Int8Vec(d) => Some(d),
+                            _ => None,
+                        })
+                });
+                if let (Some((name, lhs_is_col)), Some(dim)) = (operands, dim) {
+                    let column = Box::new(Expr::Ident(name.clone()));
+                    let zero = Box::new(Expr::String(zero_vector_literal(dim)));
+                    let (lhs, rhs) = if lhs_is_col {
+                        (column, zero)
+                    } else {
+                        (zero, column)
+                    };
+                    return Expr::VectorDistance {
+                        kind: *kind,
+                        lhs,
+                        rhs,
+                    };
+                }
+            }
+        }
+        crate::sql::parser::map_expr_children(expr, &mut |e| self.expr(e))
+    }
 }
 
 /// `$n` 由来の投影距離列 `<列> <距離演算子> <ダミー>` のリテラルを、その列の型に合うゼロベクトルへ

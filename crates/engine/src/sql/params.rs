@@ -2132,11 +2132,11 @@ pub fn order_by_distance_literal_is_param(tokens: &[Token]) -> bool {
 }
 
 /// `tokens`（`$n` 置換前の元トークン列）の `WHERE` 区間（括弧深度 0 の `FROM` から同深度の `ORDER`
-/// まで）に、距離式の `$n`（`<距離演算子> $n` または `$n <距離演算子>`。半径述語 `v <-> $1 < r` 等）が
-/// あるか（Issue #2953）。INT8VEC kNN の Prepared Describe が、WHERE 内のダミー値（ベクトルとして
-/// 不正）だけを有効なゼロベクトルへ置き換える対象判定に使う。ORDER BY・投影側の `$n` は別の印で
-/// 扱うため含めない。
-pub fn where_distance_literal_is_param(tokens: &[Token]) -> bool {
+/// まで）にある距離演算子ごとに、被演算子が `$n` か（`v <-> $1`・`$1 <-> v`）をトークン出現順の
+/// フラグ列で返す（Issue #2953）。INT8VEC の Prepared Describe が、`$n` 由来のダミー値の距離式
+/// だけを有効なゼロベクトルへ置き換える対象判定に使う（値の一致では判定しない。実リテラルの
+/// `'0'` を誤って置換しないため）。ORDER BY・投影側の `$n` は別の印で扱うため含めない。
+pub fn where_distance_param_mask(tokens: &[Token]) -> Vec<bool> {
     let mut depth: usize = 0;
     let mut start: Option<usize> = None;
     let mut end = tokens.len();
@@ -2155,14 +2155,18 @@ pub fn where_distance_literal_is_param(tokens: &[Token]) -> bool {
         }
     }
     let Some(start) = start else {
-        return false;
+        return Vec::new();
     };
     let region = tokens.get(start..end).unwrap_or(&[]);
-    region.iter().enumerate().any(|(i, token)| {
-        matches!(token, Token::Param(_))
-            && (matches!(region.get(i.wrapping_sub(1)), Some(Token::DistanceOp(_)))
-                || matches!(region.get(i.saturating_add(1)), Some(Token::DistanceOp(_))))
-    })
+    region
+        .iter()
+        .enumerate()
+        .filter(|(_, token)| matches!(token, Token::DistanceOp(_)))
+        .map(|(i, _)| {
+            matches!(region.get(i.saturating_add(1)), Some(Token::Param(_)))
+                || (i > 0 && matches!(region.get(i - 1), Some(Token::Param(_))))
+        })
+        .collect()
 }
 
 /// `tokens`（`$n` 置換前の元トークン列）の SELECT リスト（括弧深度 0 の `SELECT` から同深度の
