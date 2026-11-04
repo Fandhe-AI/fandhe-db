@@ -94,6 +94,10 @@ pub struct ExplainEngine {
     /// `hnsw_params:` 行末尾の `metric=` に出す HNSW 宣言の距離種別（Issue #1978・INDEX-7）。
     /// 既定は `Cosine`。`core.rs` の EXPLAIN 経路が索引カタログの宣言から設定する。
     pub(crate) ann_metric: VectorOpClass,
+    /// 問い合わせ対象の `USING hnsw ... WITH (m, ef_construction)` 宣言（SQL-33 (5)、Issue #2029）。
+    /// `Some` のとき `hnsw_params:` 行の `m=`／`ef_construction=` は実行時の構築と同じく宣言の値を
+    /// 出す（`ef_search=` は provider のまま）。ゲートが `Targeted` のときだけ `core.rs` が設定する。
+    pub(crate) ann_build_options: Option<crate::catalog::HnswIndexOptions>,
 }
 
 impl ExplainEngine {
@@ -112,7 +116,18 @@ impl ExplainEngine {
             scalar_plan,
             scalar_fallback: None,
             ann_metric: VectorOpClass::Cosine,
+            ann_build_options: None,
         }
+    }
+
+    /// `hnsw_params:` 行の `m=`／`ef_construction=` に出す宣言の構築パラメータを設定する
+    /// （SQL-33 (5)、Issue #2029。`core.rs` の EXPLAIN 経路がゲート結果から渡す）。
+    pub(crate) fn with_ann_build_options(
+        mut self,
+        options: Option<crate::catalog::HnswIndexOptions>,
+    ) -> Self {
+        self.ann_build_options = options;
+        self
     }
 
     /// `hnsw_params:` 行の `metric=` に出す距離種別を設定する（Issue #1978。SQL の `EXPLAIN` と
@@ -808,7 +823,13 @@ fn push_engine_tail_rows(
         // 露出しない（実行時のレジーム選択・`acorn_searches`／
         // `acorn_expansions` も同様。§`docs/design/explain-search-engine-
         // exposure.md`「露出しない値」節参照）。
-        let p = params.get();
+        let mut p = params.get();
+        // 宣言の `WITH (m, ef_construction)` は実行時の構築パラメータと同じ値を出す（Issue #2029）。
+        if let Some(options) = engine.ann_build_options {
+            p = p
+                .with_m(options.m())
+                .with_ef_construction(options.ef_construction());
+        }
         lines.push(format!(
             "hnsw_params: m={},ef_construction={},ef_search={},resident={},sparse_visited_max={},metric={}",
             p.m,
@@ -1012,6 +1033,7 @@ mod tests {
             scalar_plan: ScalarPlan::PlainScan,
             scalar_fallback: None,
             ann_metric: VectorOpClass::Cosine,
+            ann_build_options: None,
         }
     }
 
@@ -1125,6 +1147,7 @@ mod tests {
             scalar_plan: ScalarPlan::PlainScan,
             scalar_fallback: None,
             ann_metric: VectorOpClass::Cosine,
+            ann_build_options: None,
         };
 
         let result = build_explain_result(&planned, &engine);
@@ -1152,6 +1175,7 @@ mod tests {
             scalar_plan: ScalarPlan::PlainScan,
             scalar_fallback: None,
             ann_metric: VectorOpClass::Cosine,
+            ann_build_options: None,
         };
 
         let result = build_explain_result(&planned, &engine);
@@ -1194,6 +1218,7 @@ mod tests {
                 scalar_plan: ScalarPlan::PlainScan,
                 scalar_fallback: None,
                 ann_metric: VectorOpClass::Cosine,
+                ann_build_options: None,
             };
             let result = build_explain_result(&planned, &engine);
             // `ann_plan` は末尾から 2 番目（末尾行は Issue #474 の
@@ -1270,6 +1295,7 @@ mod tests {
                 scalar_plan: ScalarPlan::PlainScan,
                 scalar_fallback: None,
                 ann_metric: VectorOpClass::Cosine,
+                ann_build_options: None,
             };
             let result = build_explain_result(&planned, &engine);
 
@@ -1370,6 +1396,7 @@ mod tests {
             scalar_plan: ScalarPlan::IndexConjunction,
             scalar_fallback: None,
             ann_metric: VectorOpClass::Cosine,
+            ann_build_options: None,
         };
         let names = ExplainIndexNames::new(
             vec!["idx_vec".to_string()],
