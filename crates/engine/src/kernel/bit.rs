@@ -6,8 +6,8 @@
 //! [`PopcountKernel`]（ISA 別。整数なので scalar と完全一致）が担う。Top-k の選出器は
 //! コサイン経路の [`AscDistanceTopK`]（距離昇順・同点は id 昇順）を共用する。
 //!
-//! 現時点では SQL 経路から呼ばれない（`<~>`／`<%>` の実行接続は別 Issue。`bit(n)` 列の
-//! 保存は #2021）。行データは MSB 先頭のバイト詰め（PostgreSQL の bit と同じ）で、
+//! 距離関数は SQL の `<~>`／`<%>`・`hamming_distance`・`jaccard_distance`（scan 経路の行ごとの評価。
+//! `sql::bit_distance`。Issue #2970）から呼ばれる。行データは MSB 先頭のバイト詰め（PostgreSQL の bit と同じ）で、
 //! `nbits` が 8 の倍数でないとき最終バイトの下位ビットはパディング。保存側が 0 に
 //! 正規化していなくても、本モジュールが両オペランドをマスクして数える。
 //!
@@ -115,7 +115,7 @@ pub fn jaccard_distance(a: &[u8], b: &[u8], nbits: u32) -> Result<f64, KernelErr
 ///
 /// 検証順は [`super::cosine_top_k`] と同じ: クエリ長不一致は `DimMismatch`、
 /// `k == 0` か行 0 件なら空、範囲外・長さ不正の行は skip。
-#[allow(dead_code)] // SQL 接続（別 Issue）までは単体テストのみが呼び出し元
+#[allow(dead_code)] // scan 経路は行ごとの距離評価を使う。Top-k の統合は性能が必要になった時点の別 Issue
 pub fn bit_top_k(
     input: BitSearchInput<'_>,
     metric: BitMetric,

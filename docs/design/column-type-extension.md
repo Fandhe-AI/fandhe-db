@@ -800,6 +800,43 @@ NoSQL 表層の JSON 束縛（`insert`／`update`／`filter`）の型別対応�
 - **PostgreSQL との既知の差**: (1) PostgreSQL の `binary_quantize` の結果 typmod は -1、本実装は `bit(d)` の d を公告する（値の文字列表現は同一）。(2) 裸の `NULL` 引数は PostgreSQL では多重定義が曖昧で `42725` だが、本実装は strict として NULL を返す（結果列の型は長さ不明のため text）。
 - **対象外**: `<~>`／`<%>` の SQL・NoSQL 実行への接続と `hamming_distance`／`jaccard_distance` の SQL 関数、「二値で粗選別して元ベクトルで再ランク」の運用例の文書化（`<~>` の接続後）、`binary_quantize(halfvec)`、bit の比較・ORDER BY・CAST・集計、式索引（`CREATE INDEX ... ((binary_quantize(embedding)::bit(n)) bit_hamming_ops)`）、NoSQL 表層。
 
+## Issue #2970 追記: bit 列の距離 `<~>`・`<%>` と `hamming_distance`・`jaccard_distance`（TABLE-48 (2)(4)(5) ポインタ。SQL-33・SQL-34・SQL-26 を併記）
+
+- **方式**: 構文段は `<~>`（Hamming）・`<%>`（Jaccard）を `hamming_distance(a, b)`・`jaccard_distance(a, b)` の関数呼び出しへ脱糖する（新しい `Expr` variant は作らない）。演算子形と関数形は同じ束縛（`udf_call::bind_bit_distance_fn`）・評価（`sql::bit_distance`）を通り、計算は `kernel::{hamming_distance, jaccard_distance}`。受理するのは広域取得（scan 経路）の ORDER BY 式キー・投影項目・WHERE の比較の被演算子だけで、CHECK 本体・UDF 本体・式索引・DEFAULT などは従来どおり `42601`／`0A000`。
+- **scan 経路に乗せる理由**: RLS・行ポリシー・WHERE・LIMIT／OFFSET・LIMIT 省略時の暗黙上限・NULL の並び（ASC で末尾、DESC で先頭）・同点の id 昇順・Describe・EXPLAIN は既存の scan 経路がそのまま受け持つ。距離は可視行だけに対して行ごとに評価する。`kernel::bit_top_k` は使わない（Top-k の統合は性能が必要になった時点の別 Issue）。
+- **被演算子**: BIT 列・`binary_quantize(<VECTOR 列>)`・文字列リテラル（長さ任意）・列どうし（`v <~> v`）。bit 型の被演算子が無い組（リテラル同士）は `0A000`、bit 以外の型は `42883`、引数個数違いは `42883`。結果は float8（wire の OID 701）。NULL 行は NULL。リテラルは確保前に文字数を `MAX_BIT_LENGTH` で検査し（`54000`）、`0`・`1` 以外は `22P02`。エラー文言にリテラルを含めない。
+- **長さの不一致は `22000`**（`22026` ではない。pgvector と同じ分類）。列の宣言長・`binary_quantize` の引数の次元とリテラルの長さは束縛時に照合し、静的に分からない組は評価時に `bit_len` の一致を検査してからカーネルを呼ぶ（9 と 10 ビットのように同じバイト長で長さが違う組を見逃さないため）。
+- **値**: Hamming は異なるビットの数、Jaccard は `1 - |a&b| / |a|b|`（交差が 0 なら 1.0。全ビット 0 どうしを含む）。pgvector の公開回帰テストと同じ入力で値・順序が一致する（結合テスト `sql_bit_distance`）。
+- **予約名**: `hamming_distance`・`jaccard_distance` は組み込みの予約名で、同名の `CREATE FUNCTION` は `42723`。
+- **NoSQL**: spec の TABLE-48 (5) に従い、NoSQL の `search` は BIT 列を対象にできない。VECTOR 列を持たず BIT 列だけを持つ表への `search`・`USING PLAN`・hybrid は、従来の `22000`（VECTOR 列が無い）から `0A000` に変わる。Issue #2970 の本文は NoSQL への接続も挙げているが、spec を優先した（要オーナー確認）。
+- **公開型の変更（BREAKING）**: `BoundExpr` に `BitColumnRef`・`BitLiteral`、`BuiltinFn` に `HammingDistance`・`JaccardDistance` を追加した。
+- **既知の差・対象外**: `ORDER BY v <~> $1`（`$n`。WIRE-12）は従来どおり `42601`。派生表・CTE・`IN (SELECT ...)` を粗選別に使い外側で `<=>` などの kNN を行う 1 文の形は、kNN の SELECT が部分クエリを受理しないため使えない（後続 Issue 候補）。HNSW の `bit_hamming_ops`／`bit_jaccard_ops`、`binary_quantize('[..]')`（リテラル引数）・`binary_quantize(halfvec)`、`B'1010'`・`::bit(n)`、bit の比較・ORDER BY（裸）・集計、JOIN の ORDER BY、GPU バッチ、`BIT VARYING` も対象外。
+
+### 運用例: `binary_quantize` で粗く選び、元のベクトルで並べ直す
+
+二値化した列で候補を絞ってから、元のベクトルの距離で厳密に並べ直す。下の SQL は結合テスト `sql_bit_distance::rerank_example_matches_exact_scan` がそのまま実行し、並べ直した Top-k が元ベクトルの厳密走査の Top-k と一致することを確かめている（粗選別の件数が十分なとき）。
+
+```sql
+-- 前処理: 二値化した列を持たせる（列を持たない形は後述）。
+CREATE TABLE items (id BIGINT PRIMARY KEY, embedding VECTOR(8), code BIT(8));
+UPDATE items SET code = binary_quantize(embedding);
+
+-- (b) 1 文の半径形: Hamming 距離が r 以下の行だけを、元のベクトルで並べ直す。
+SELECT id FROM items WHERE code <~> '01110001' <= 6
+ORDER BY embedding <=> '[-4.31,1.15,5.95,0.84,-7.94,-9.32,-9.94,1.54]' LIMIT 5;
+
+-- (c) 2 文の形: 1 文目で粗選別の id を得て、2 文目で元のベクトルで並べ直す。
+SELECT id FROM items ORDER BY code <~> '01110001' LIMIT 60;
+SELECT id FROM items WHERE id IN (<1 文目の id 列>)
+ORDER BY embedding <=> '[-4.31,1.15,5.95,0.84,-7.94,-9.32,-9.94,1.54]' LIMIT 5;
+
+-- 列を持たない形: 行ごとに二値化して粗選別する（索引は使えないため全件を走査する）。
+SELECT id FROM items ORDER BY binary_quantize(embedding) <~> '01110001' LIMIT 60;
+```
+
+- 問い合わせ側の bit 列は、クライアントで「正の成分を 1、それ以外を 0」として作る（`binary_quantize` と同じ規則）。`binary_quantize('[..]')`（リテラル引数）は未対応のため、同じ表の行から `SELECT binary_quantize(embedding) ...` で得る方法もある。
+- spec が想定する「部分クエリの結果を `<=>` で並べ直す」1 文の形（`WHERE id IN (SELECT ... ORDER BY code <~> ... LIMIT n)` を外側の kNN に付ける形）は、現状 `42601` になる。上記 (b)・(c) が代替で、1 文化は後続 Issue 候補。
+
 ## Issue #2014 追記: HALFVEC(N) 列（TABLE-46 (1)(4)(5) ポインタ）
 
 - **保存先**: スカラーペイロード（行 codec のスカラー列）に f16 で保存し、embedding スロットは使わない。容量が次元 × 2 バイトになり、`storage` の行フォーマットを変えずに済む。HALFVEC のみの表は VECTOR 列を持たない表と同じ扱い（embedding は空）。

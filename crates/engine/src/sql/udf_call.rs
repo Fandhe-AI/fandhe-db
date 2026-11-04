@@ -940,6 +940,20 @@ pub enum BoundExpr {
     HalfVecColumnRef {
         index: usize,
     },
+    /// nullable `BIT(n)` 列の参照（Issue #2970・TABLE-48）。`hamming_distance`／`jaccard_distance`
+    /// （と `<~>`／`<%>`）の引数の位置でだけ（[`bind_bit_distance_fn`] が識別子を直接見たときに）
+    /// 生成する。評価は行スカラーの bit 列を所有形へ複製した `ExprValue::Bit`（NULL は `Null`）。
+    /// 汎用の列参照の腕は BIT 列を従来どおり拒否する。
+    ///
+    /// 変更履歴: 公開 enum への variant 追加（外部の網羅 match への破壊的変更）。
+    BitColumnRef {
+        index: usize,
+    },
+    /// bit 文字列リテラル（Issue #2970・TABLE-48）。bit 距離関数の引数の位置でだけ生成し、
+    /// 長さは任意（もう一方の被演算子との長さ照合は束縛時または評価時に `22000`）。
+    ///
+    /// 変更履歴: 公開 enum への variant 追加（外部の網羅 match への破壊的変更）。
+    BitLiteral(crate::bit_string::BitString),
     /// 距離式 `<HALFVEC 列> <距離演算子> <ベクトルリテラル>`（Issue #2015・TABLE-46。SQL-74 のポインタ）。
     /// `query` は束縛時に f16 へ丸めた値（pgvector と同じく問い合わせ側も halfvec に解決される）。
     /// 評価は行の f16 を f32 へ広げて [`crate::sql::vector_distance::distance`] で求める（NULL は NULL）。
@@ -1532,6 +1546,8 @@ impl PartialEq for BoundExpr {
                         .zip(qb.iter())
                         .all(|(a, b)| a.to_bits() == b.to_bits())
             }
+            (BoundExpr::BitColumnRef { index: a }, BoundExpr::BitColumnRef { index: b }) => a == b,
+            (BoundExpr::BitLiteral(a), BoundExpr::BitLiteral(b)) => a == b,
             (BoundExpr::Null, BoundExpr::Null) => true,
             (BoundExpr::Builtin { f: fa, args: aa }, BoundExpr::Builtin { f: fb, args: ab }) => {
                 fa == fb && aa == ab
@@ -1803,6 +1819,11 @@ pub enum BuiltinFn {
     BinaryQuantize,
     /// `l2_normalize(v: Vector) -> Vector`（L2 正規化。Issue #2012・SQL-72）。
     L2Normalize,
+    /// `hamming_distance(a: Bit, b: Bit) -> Scalar`（差のあるビット数。`<~>` の脱糖先。
+    /// Issue #2970・TABLE-48）。
+    HammingDistance,
+    /// `jaccard_distance(a: Bit, b: Bit) -> Scalar`（`<%>` の脱糖先。Issue #2970・TABLE-48）。
+    JaccardDistance,
     /// `subvector(v: Vector, start: Scalar, count: Scalar) -> Vector`（1 始まりの部分ベクトル。
     /// Issue #2012・SQL-72）。
     Subvector,
@@ -2260,6 +2281,8 @@ fn builtin_from_name(name: &str) -> Option<BuiltinFn> {
         "vec_norm" | "vector_norm" => Some(BuiltinFn::VecNorm),
         "vector_dims" => Some(BuiltinFn::VectorDims),
         "binary_quantize" => Some(BuiltinFn::BinaryQuantize),
+        "hamming_distance" => Some(BuiltinFn::HammingDistance),
+        "jaccard_distance" => Some(BuiltinFn::JaccardDistance),
         "l2_normalize" => Some(BuiltinFn::L2Normalize),
         "subvector" => Some(BuiltinFn::Subvector),
         "vec_sum" => Some(BuiltinFn::VecSum),
@@ -2346,6 +2369,9 @@ pub(crate) fn builtin_signature(f: BuiltinFn) -> (&'static [ExprType], ExprType)
         BuiltinFn::VectorDims => (&[ExprType::Vector], ExprType::Scalar),
         BuiltinFn::L2Normalize => (&[ExprType::Vector], ExprType::Vector),
         BuiltinFn::BinaryQuantize => (&[ExprType::Vector], ExprType::Bit),
+        BuiltinFn::HammingDistance | BuiltinFn::JaccardDistance => {
+            (&[ExprType::Bit, ExprType::Bit], ExprType::Scalar)
+        }
         BuiltinFn::Subvector => (
             &[ExprType::Vector, ExprType::Scalar, ExprType::Scalar],
             ExprType::Vector,
@@ -2498,6 +2524,8 @@ pub(crate) fn is_foldable_builtin(f: BuiltinFn) -> bool {
         | BuiltinFn::VecDiv
         | BuiltinFn::VectorDims
         | BuiltinFn::BinaryQuantize
+        | BuiltinFn::HammingDistance
+        | BuiltinFn::JaccardDistance
         | BuiltinFn::L2Normalize
         | BuiltinFn::Subvector
         | BuiltinFn::L2Distance
@@ -4375,6 +4403,122 @@ fn bind_vector_distance_fn(
     ))
 }
 
+/// 識別子が `BIT(n)` 列を指すなら `(列インデックス, 宣言長)` を返す（Issue #2970・TABLE-48）。
+/// bit 距離関数の引数の位置でだけ呼ぶ（汎用の列参照の腕は BIT 列を拒否したまま）。
+/// UDF の仮引数名は列より優先されるため `None`（[`halfvec_column_operand`] と同じ順序）。
+fn bit_column_operand(expr: &Expr, env: &BindEnv<'_>) -> Option<(usize, u32)> {
+    let Expr::Ident(name) = expr else {
+        return None;
+    };
+    if env.params.contains_key(name) {
+        return None;
+    }
+    let schema = env.schema?;
+    schema
+        .columns
+        .iter()
+        .enumerate()
+        .find(|(_, c)| &c.name == name)
+        .and_then(|(i, c)| match c.ty {
+            ColumnType::Bit(d) => Some((i, d)),
+            _ => None,
+        })
+}
+
+/// bit 距離関数 `hamming_distance`／`jaccard_distance`（と脱糖された `<~>`／`<%>`）の呼び出しを束縛する
+/// （Issue #2970・TABLE-48 (2)。[`bind_call`] が名前で振り分ける）。
+///
+/// 引数 2 個はそれぞれ (1) 裸の `NULL`（評価時の strict ガードで NULL）、(2) 文字列リテラル
+/// （長さ任意の bit 値として解析。長さ上限 `54000`・文字種 `22P02`）、(3) BIT 列の参照、
+/// (4) `ExprType::Bit` を返す式（`binary_quantize(<VECTOR 列>)`）。bit 型の引数が 1 つも無い形
+/// （リテラル同士・NULL とリテラル・NULL 同士）は `0A000`、bit 以外の型の式は `42883`。
+/// 長さが静的に分かる側（列の宣言長・`binary_quantize` の引数の次元）とリテラルの長さが違えば束縛時に
+/// `22000`。静的に分からない組は評価時に [`crate::sql::bit_distance::bit_distance_fn`] が照合する。
+/// エラー文言にリテラルの値は含めない。
+fn bind_bit_distance_fn(
+    f: BuiltinFn,
+    args: &[Expr],
+    env: &mut BindEnv<'_>,
+    node_budget: &mut usize,
+) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
+    let [a0, a1] = args else {
+        return Err(SqlSurfaceError::undefined_function(
+            "bit distance function expects 2 argument(s)",
+        ));
+    };
+    // 引数ごとに (束縛済み, bit 型の式か, 静的に分かる長さ, リテラルの長さ)。
+    let mut bound: Vec<(BoundExpr, bool, Option<u32>, Option<u32>)> = Vec::with_capacity(2);
+    for a in [a0, a1] {
+        match a {
+            Expr::Null => {
+                let (b, _) = bind_null_aware(a, env, node_budget)?;
+                bound.push((b, false, None, None));
+            }
+            Expr::String(lit) => {
+                *node_budget = node_budget
+                    .checked_sub(1)
+                    .ok_or_else(|| SqlSurfaceError::payload_too_large("expression is too large"))?;
+                let v = crate::sql::bit_distance::parse_bit_operand_literal(lit)?;
+                let len = v.bit_len();
+                bound.push((BoundExpr::BitLiteral(v), false, None, Some(len)));
+            }
+            _ => {
+                if let Some((index, len)) = bit_column_operand(a, env) {
+                    *node_budget = node_budget.checked_sub(1).ok_or_else(|| {
+                        SqlSurfaceError::payload_too_large("expression is too large")
+                    })?;
+                    bound.push((BoundExpr::BitColumnRef { index }, true, Some(len), None));
+                    continue;
+                }
+                let (b, ty) = bind_expr_any(a, env, node_budget)?;
+                if ty != ExprType::Bit {
+                    return Err(SqlSurfaceError::undefined_function(
+                        "function does not exist for the given argument types",
+                    ));
+                }
+                // `binary_quantize(<VECTOR 列>)` の結果長は引数の列の次元（束縛段が列そのものに限定済み）。
+                let static_len = match &b {
+                    BoundExpr::Builtin {
+                        f: BuiltinFn::BinaryQuantize,
+                        args,
+                    } if matches!(args.first(), Some(BoundExpr::VectorRef)) => {
+                        env.schema.and_then(|sc| {
+                            sc.columns.iter().find_map(|c| match c.ty {
+                                ColumnType::Vector(d) => Some(d),
+                                _ => None,
+                            })
+                        })
+                    }
+                    _ => None,
+                };
+                bound.push((b, true, static_len, None));
+            }
+        }
+    }
+    if !bound.iter().any(|(_, is_bit, _, _)| *is_bit) {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "bit distance function requires at least one BIT argument".to_string(),
+        });
+    }
+    // 静的に長さが分かる組は束縛時に照合する（VECTOR 列とリテラルの次元不一致と同じタイミング）。
+    let static_lens: Vec<u32> = bound
+        .iter()
+        .filter_map(|(_, _, st, lit)| st.or(*lit))
+        .collect();
+    if let [x, y] = static_lens.as_slice() {
+        if x != y {
+            return Err(crate::sql::bit_distance::length_mismatch_error());
+        }
+    }
+    Ok((
+        BoundExpr::Builtin {
+            f,
+            args: bound.into_iter().map(|(b, _, _, _)| b).collect(),
+        },
+        ExprType::Scalar,
+    ))
+}
+
 /// 束縛環境: 列参照の解決元（`SELECT`/`WHERE` の式では `Some(schema)`、UDF 本体の
 /// 展開中は `None` に切り替わりパラメータ参照だけを解決する）と、パラメータ名 →
 /// 既に束縛済みの実引数式（インライン展開用）の対応表。
@@ -4493,6 +4637,8 @@ fn count_bound_nodes(expr: &BoundExpr) -> usize {
         | BoundExpr::VectorLiteral(_)
         | BoundExpr::HalfVecColumnRef { .. }
         | BoundExpr::HalfVecDistance { .. }
+        | BoundExpr::BitColumnRef { .. }
+        | BoundExpr::BitLiteral(_)
         | BoundExpr::JsonbColumnRef { .. }
         | BoundExpr::JsonColumnRef { .. }
         | BoundExpr::Numeric(_)
@@ -4605,6 +4751,8 @@ fn max_bound_case_nesting(expr: &BoundExpr) -> usize {
         | BoundExpr::VectorLiteral(_)
         | BoundExpr::HalfVecColumnRef { .. }
         | BoundExpr::HalfVecDistance { .. }
+        | BoundExpr::BitColumnRef { .. }
+        | BoundExpr::BitLiteral(_)
         | BoundExpr::JsonbColumnRef { .. }
         | BoundExpr::JsonColumnRef { .. }
         | BoundExpr::Numeric(_)
@@ -4695,7 +4843,9 @@ pub(crate) fn references_embedding(expr: &BoundExpr) -> bool {
         BoundExpr::VectorRef | BoundExpr::VectorDistance { .. } => true,
         BoundExpr::VectorLiteral(_)
         | BoundExpr::HalfVecColumnRef { .. }
-        | BoundExpr::HalfVecDistance { .. } => false,
+        | BoundExpr::HalfVecDistance { .. }
+        | BoundExpr::BitColumnRef { .. }
+        | BoundExpr::BitLiteral(_) => false,
         BoundExpr::Number(_)
         | BoundExpr::Text(_)
         | BoundExpr::TextColumnRef { .. }
@@ -4799,6 +4949,7 @@ pub(crate) fn visit_referenced_scalar_columns(expr: &BoundExpr, visit: &mut dyn 
         | BoundExpr::BoolColumnRef { index }
         | BoundExpr::HalfVecColumnRef { index }
         | BoundExpr::HalfVecDistance { index, .. }
+        | BoundExpr::BitColumnRef { index }
         | BoundExpr::ColumnRef { index } => visit(*index),
         BoundExpr::ArrayConstructor { .. }
         | BoundExpr::ArrayIndex { .. }
@@ -4853,6 +5004,7 @@ pub(crate) fn visit_referenced_scalar_columns(expr: &BoundExpr, visit: &mut dyn 
         | BoundExpr::VectorRef
         | BoundExpr::VectorDistance { .. }
         | BoundExpr::VectorLiteral(_)
+        | BoundExpr::BitLiteral(_)
         | BoundExpr::Numeric(_)
         | BoundExpr::JsonbLiteral(_)
         | BoundExpr::Null => {}
@@ -4941,6 +5093,7 @@ pub(crate) fn mark_referenced_scalar_columns(expr: &BoundExpr, mask: &mut [bool]
         | BoundExpr::BoolColumnRef { index }
         | BoundExpr::HalfVecColumnRef { index }
         | BoundExpr::HalfVecDistance { index, .. }
+        | BoundExpr::BitColumnRef { index }
         | BoundExpr::ColumnRef { index } => {
             if let Some(slot) = mask.get_mut(*index) {
                 *slot = true;
@@ -4975,6 +5128,7 @@ pub(crate) fn mark_referenced_scalar_columns(expr: &BoundExpr, mask: &mut [bool]
         | BoundExpr::VectorRef
         | BoundExpr::VectorDistance { .. }
         | BoundExpr::VectorLiteral(_)
+        | BoundExpr::BitLiteral(_)
         | BoundExpr::Numeric(_)
         | BoundExpr::JsonbLiteral(_)
         | BoundExpr::Null => false,
@@ -9232,6 +9386,16 @@ fn bind_call(
     if let Some(f) = crate::sql::vector_distance::distance_fn_from_name(&lower_name) {
         return bind_vector_distance_fn(f, args, env, node_budget);
     }
+    // bit 列の距離関数（Issue #2970・TABLE-48）。演算子形 `<~>`／`<%>` も構文段でこの 2 関数へ脱糖される。
+    match lower_name.as_str() {
+        "hamming_distance" => {
+            return bind_bit_distance_fn(BuiltinFn::HammingDistance, args, env, node_budget)
+        }
+        "jaccard_distance" => {
+            return bind_bit_distance_fn(BuiltinFn::JaccardDistance, args, env, node_budget)
+        }
+        _ => {}
+    }
     // `nextval`／`currval` は INSERT の VALUES 要素・列 DEFAULT の単独形でだけ使える
     // （TABLE-24・Issue #1690）。SELECT 投影・WHERE・UPDATE SET・ビュー本文などの式位置は
     // 書き込み txn を伴う評価経路が無いため、`42883` へ落とさず `0A000` で拒否する（固定文言）。
@@ -10982,6 +11146,24 @@ pub(crate) fn eval_with_scalars<'a>(
                     .to_string(),
             }),
         },
+        BoundExpr::BitLiteral(v) => Ok(ExprValue::Bit(v.clone())),
+        // BIT 列の参照（Issue #2970・TABLE-48）。所有形へ複製して運ぶ。型の食い違いは fail-closed。
+        BoundExpr::BitColumnRef { index } => match row_scalars.get(*index) {
+            None => Err(SqlSurfaceError::Internal {
+                detail: "BIT column reference is outside the decoded row scalar view".to_string(),
+            }),
+            Some(None) => Ok(ExprValue::Null),
+            Some(Some(ScalarRef::Bit(r))) => {
+                r.to_owned_value()
+                    .map(ExprValue::Bit)
+                    .map_err(|_| SqlSurfaceError::Internal {
+                        detail: "BIT column value has an invalid representation".to_string(),
+                    })
+            }
+            Some(Some(_)) => Err(SqlSurfaceError::Internal {
+                detail: "BIT column reference resolved to a non-BIT row scalar value".to_string(),
+            }),
+        },
         // HALFVEC 列の参照（Issue #2015・TABLE-46）。f16 を f32 へ広げて運ぶ。型の食い違いは fail-closed。
         BoundExpr::HalfVecColumnRef { index } => match row_scalars.get(*index) {
             None => Err(SqlSurfaceError::Internal {
@@ -11524,6 +11706,9 @@ pub(crate) fn apply_builtin<'a>(
         BuiltinFn::BinaryQuantize => {
             let v = take_vector_arg(args, 0)?;
             crate::sql::vector_shape_fn::binary_quantize(&v).map(ExprValue::Bit)
+        }
+        BuiltinFn::HammingDistance | BuiltinFn::JaccardDistance => {
+            crate::sql::bit_distance::bit_distance_fn(f, args).map(ExprValue::Scalar)
         }
         BuiltinFn::L2Normalize => {
             let v = take_vector_arg(args, 0)?;
