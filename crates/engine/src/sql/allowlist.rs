@@ -12617,6 +12617,15 @@ impl<'a> Parser<'a> {
                 detail: "array functions are not supported in a CHECK constraint".to_string(),
             });
         }
+        // 距離関数（SQL-72 (1)・Issue #2011）は距離演算子と同じく CHECK 本体では未対応（`0A000`）。
+        let is_distance_fn_call =
+            crate::sql::vector_distance::distance_fn_from_name(&name.to_ascii_lowercase())
+                .is_some();
+        if is_distance_fn_call && self.in_check_body {
+            return Err(SqlSurfaceError::FeatureNotSupported {
+                detail: "distance functions are not supported in a CHECK constraint".to_string(),
+            });
+        }
         if is_json_fn_call && self.in_check_body {
             return Err(SqlSurfaceError::FeatureNotSupported {
                 detail: "jsonb functions are not supported in a CHECK constraint".to_string(),
@@ -12639,6 +12648,8 @@ impl<'a> Parser<'a> {
             || self.const_expr_null_args
             || is_json_fn_call
             || is_array_fn_call
+            // 距離関数の引数の裸の `NULL` はリテラルとして受理し、評価時に NULL 伝播させる。
+            || is_distance_fn_call
             || crate::sql::json_fn::is_json_fn_name(&name.to_ascii_lowercase());
         let mut args = Vec::new();
         if !matches!(self.peek(), Some(Token::Punct(')'))) {

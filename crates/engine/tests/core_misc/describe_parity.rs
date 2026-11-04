@@ -251,6 +251,8 @@ fn describe_typed_aggregate_and_expression_columns_match_execute() {
         "SELECT COUNT(*), MIN(body), MAX(lang), SUM(id), AVG(id) FROM documents",
         "SELECT lang, COUNT(*), MIN(body) FROM documents GROUP BY lang",
         "SELECT id, vec_norm(embedding) AS n FROM documents LIMIT 5",
+        // Issue #2011（SQL-72 (1)）: 距離関数の投影列も Describe と実行で列メタが一致する
+        "SELECT id, l2_distance(embedding, '[0.1,0.2,0.3]') FROM documents LIMIT 5",
         // Issue #1540（SQL-42）: 疑似列 id・列・式への AS 別名
         "SELECT id AS i, body AS b, length(body) AS l FROM documents LIMIT 5",
         "SELECT id AS i, body AS b FROM documents ORDER BY b LIMIT 5",
