@@ -27163,7 +27163,7 @@ mod tests {
         )
     }
 
-    /// 非既定 opclass の `v9` 往復と固定バイト列（INDEX-7・SQL-33 (5)、Issue #1978）。
+    /// HALFVEC 系 opclass 名が (列型系列, 距離種別) へ解決される（Issue #2016）。
     #[test]
     fn halfvec_opclass_names_resolve_to_family_and_metric() {
         for (family, prefix) in [
@@ -27195,6 +27195,7 @@ mod tests {
         );
     }
 
+    /// 非既定 opclass の `v9` 往復と固定バイト列（INDEX-7・SQL-33 (5)、Issue #1978）。
     #[test]
     fn hnsw_opclass_def_round_trips_as_v9() {
         for opclass in [VectorOpClass::L2, VectorOpClass::Ip, VectorOpClass::L1] {

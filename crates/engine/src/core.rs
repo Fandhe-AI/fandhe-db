@@ -12631,16 +12631,6 @@ impl EngineCore {
         }
     }
 
-    /// [`Self::execute_validated_in_session`] の `Statement::Select` アーム
-    /// （`USING PLAN` 経由を含む）・[`Self::execute_bound_search_in_session`]・
-    /// [`Self::run_using_plan_select`] が共有する実行本体（TASK-186・
-    /// NOSQL-2。Issue #764）。`read_txn`・`schema` は呼び出し元が同一
-    /// スナップショットから取得済みのものをそのまま渡す。SQL 経路専用の
-    /// キャッシュ（`SparseIndexCache`〔Issue #357〕・`SqlArenaCache`
-    /// 〔Issue #363〕・`HnswIndexCache`〔Issue #408〕・`ScalarIndexCache`
-    /// 〔Issue #473〕）を配線した `execute_statement_with_cache` を経由する
-    /// ことで、束縛済み計画エントリも SQL テキスト経由と同一のキャッシュ
-    /// 最適化・ANN opt-in・precision fail-closed 契約（SEARCH-9）を受ける。
     /// `HALFVEC` 列への距離演算子形 kNN を HNSW（ANN）経路で実行するか（Issue #2016・TABLE-46）。
     /// Execute と `EXPLAIN` が同じ判定を共有し、実行と表示を食い違わせない。真になる条件は、静的な
     /// 形（`sql::halfvec_knn::halfvec_ann_shape`）に加えて (1) HNSW が有効なエンジン、(2) 読み取りが
@@ -12680,6 +12670,17 @@ impl EngineCore {
         );
         Ok(matches!(gate, crate::catalog::HnswGate::Targeted { .. }))
     }
+
+    /// [`Self::execute_validated_in_session`] の `Statement::Select` アーム
+    /// （`USING PLAN` 経由を含む）・[`Self::execute_bound_search_in_session`]・
+    /// [`Self::run_using_plan_select`] が共有する実行本体（TASK-186・
+    /// NOSQL-2。Issue #764）。`read_txn`・`schema` は呼び出し元が同一
+    /// スナップショットから取得済みのものをそのまま渡す。SQL 経路専用の
+    /// キャッシュ（`SparseIndexCache`〔Issue #357〕・`SqlArenaCache`
+    /// 〔Issue #363〕・`HnswIndexCache`〔Issue #408〕・`ScalarIndexCache`
+    /// 〔Issue #473〕）を配線した `execute_statement_with_cache` を経由する
+    /// ことで、束縛済み計画エントリも SQL テキスト経由と同一のキャッシュ
+    /// 最適化・ANN opt-in・precision fail-closed 契約（SEARCH-9）を受ける。
 
     fn run_select_plan(
         &self,

@@ -3485,7 +3485,8 @@ pub(crate) fn bind_in_session_with_limits(
 }
 
 /// `HALFVEC` 列への距離演算子形 kNN を ANN 経路（HNSW）向けに束縛する（Issue #2016・TABLE-46）。
-/// `core.rs` の経路判定（`halfvec_knn::halfvec_route`）が `Ann` と決めた文だけが呼ぶ。dense 列として
+/// `core.rs::halfvec_ann_route`（形の判定は `halfvec_knn::halfvec_ann_shape`）が真と決めた文だけが
+/// 呼ぶ。dense 列として
 /// `HALFVEC` を認めるのは距離形 `ORDER BY` だけで、ハイブリッド形は従来どおり `0A000` のまま。
 pub(crate) fn bind_halfvec_ann(
     stmt: &ValidatedStatement,
