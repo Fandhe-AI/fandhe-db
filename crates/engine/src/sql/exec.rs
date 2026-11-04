@@ -1025,6 +1025,18 @@ pub(crate) fn execute_statement_with_cache(
         },
         None => crate::catalog::HnswGate::NotTargeted,
     };
+    // Issue #2000: ゲートが `Targeted` のときだけ、問い合わせ側 metric を物理グラフの metric へ
+    // 写してキャッシュアクセスへ載せる（キャッシュキーの一部）。それ以外・未対応 metric は
+    // `None` のままで、prepare 系が全件走査へ倒す（fail-closed）。
+    let hnsw_cache = hnsw_cache.map(|access| {
+        let graph_metric = match hnsw_gate {
+            crate::catalog::HnswGate::Targeted { metric } => {
+                crate::sql::hnsw_cache::hnsw_graph_metric_for(metric)
+            }
+            _ => None,
+        };
+        access.with_graph_metric(graph_metric)
+    });
     let hnsw_enabled = matches!(hnsw_gate, crate::catalog::HnswGate::Targeted { .. });
     let metric_mismatch = matches!(hnsw_gate, crate::catalog::HnswGate::MetricMismatch { .. });
     // Issue #2009・SQL-33 (2)・SQL-75 (4): 距離順 `DESC` は分類結果を `PlainScanDescending` へ

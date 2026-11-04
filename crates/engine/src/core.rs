@@ -12317,6 +12317,8 @@ impl EngineCore {
                     provider: s.provider,
                     index_gate_cache: &self.index_catalog_gate_cache,
                     hnsw_scope: self.hnsw_scope,
+                    // ゲート評価後に `sql::exec` が写像結果を載せ直す（Issue #2000）。
+                    graph_metric: None,
                 }),
             // Issue #473: スカラー列二次索引の gated 構築（応答には未使用。
             // 詳細は `sql::scalar_index` のドキュメント参照）。
@@ -15813,6 +15815,10 @@ impl EngineCore {
                     provider: state.provider,
                     index_gate_cache: &self.index_catalog_gate_cache,
                     hnsw_scope: self.hnsw_scope,
+                    // この経路はゲートが `Targeted`（コサイン系）のときだけ到達する（Issue #2000）。
+                    graph_metric: crate::sql::hnsw_cache::hnsw_graph_metric_for(
+                        crate::sql::hnsw_cache::cosine_query_metric(),
+                    ),
                 };
                 snapshot.search_with_hnsw(
                     &self.storage,
