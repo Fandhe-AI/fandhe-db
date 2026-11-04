@@ -9,6 +9,8 @@
 
 ### Changed
 
+- `BatchSearchError` に `ZeroNormQuery { query_index }` を追加した（Issue #2003・CORE-6・CORE-16・SQL-33 ポインタ）。コサイン metric のバッチにゼロノルム（アンダーフロー・オーバーフロー含む）のクエリが含まれると、primary へ渡す前に入力エラーで拒否する（縮退イベント・ラッチは起きない）。内積・L2 では従来どおり受理する。
+  BREAKING CHANGE: 公開 enum `BatchSearchError` に variant `ZeroNormQuery` を追加した（網羅的 `match` の下流は追随が必要）。
 - `<=>` の実行をコサイン距離（`1 - cos`）の昇順へ切り替え、`<#>` を負の内積の昇順として実行経路へ接続した（Issue #1991・SQL-33 ポインタ）。ゼロノルムの行は距離 NaN で昇順の末尾（`DESC` では先頭）に並び、同点は行の順序キー昇順。従来の `<=>` の順位（内積の降順）は `<#>` で得られる。`ResultRow.score` は演算子の距離値（`<=>` は `1 - cos`、`<#>` は `-dot`）に変わる。`<->`／`<+>` は従来どおり `0A000`。`USING MODE 'precision'` と `<#>` の併用は `0A000`。HNSW の opt-in は内積グラフのまま返った候補を厳密なコサイン距離で再採点する（入力は L2 正規化済みが契約）。詳しい移行ガイドは #1995。
   BREAKING CHANGE: `<=>` の結果の順位と `ResultRow.score` の値が変わる。公開 trait `SearchProvider` に既定実装付きのメソッド `search_cosine`／`search_cosine_subset` を追加した。
 - `engine::kernel::cosine_top_k` がゼロノルム（行・クエリ）の距離 NaN を除外せず、昇順の末尾に返すようにした（Issue #2240・SQL-33 (3) ポインタ）。NaN 同士は順序キー昇順で、NaN 行も `k` を消費する。挙動の変化: ゼロノルムのクエリは空ではなく先頭 `k` 行（距離 NaN）を返す。クエリの非有限成分は従来どおり `NonFiniteQuery`。公開シグネチャの変更はない。
@@ -20,6 +22,7 @@
 
 ### Added
 
+- GPU バッチ検索の f32 算術経路に L2 とコサインを追加した（Issue #2003・親 #2002・CORE-6・CORE-16・SQL-33 ポインタ）。`batch_search::BatchMetric`（`InnerProduct`〔既定〕・`L2`・`Cosine`）、`ResidentMatrix::{build_with_metric, metric}`、`BatchBackend::metric`（既定実装は内積）、`FallbackBatchEngine::{build_with_metric, build_with_gpu_metric, build_with_gpu_reference_metric}`、`GpuBatchBackend::metric`、`GpuF32ContrastBackend::try_new_with_metric` を追加した。スコアは全 metric で「大きいほど近い」（L2 は `-Σ(r-q)²`、コサインは行・クエリを正規化した内積）。既存の `build`・`try_new` は内積のまま挙動不変。GPU の f16 算術版と packed i8 版は内積専用で、L2 では選ばれず、i8 版は内積以外の行列の構築を `InitFailed` で拒否する。詳細は `docs/design/gpu-batch-metric.md`。
 - ベクトル関数 `vector_dims`・`vector_norm`・`l2_normalize`・`subvector` を追加した（Issue #2012・SQL-72 (1)(2)(5)(6) ポインタ）。`vector_norm` は `vec_norm` の別名、`subvector` は 1 始まりで範囲外・非整数・`i32` 範囲外を `22000`／`22003` で拒否する。4 名は予約名になり、同名の `CREATE FUNCTION` は `42723`、既存の同名 UDF は組み込みが優先される。ベクトルリテラルと `$n` の引数は未対応（従来どおり `42804`）。
 - `HALFVEC(N)` 列型を追加した（Issue #2014・TABLE-46 (1)(4)(5) ポインタ）。`CREATE TABLE` で宣言でき、値は IEEE 754 binary16 でスカラーペイロードに保存する。INSERT／UPDATE SET／UPSERT／NoSQL insert の入力は VECTOR と同じ検証の後に f16 へ丸め（次元不一致・非有限は `22000`、f16 範囲外は `22003`）、SELECT は f32 へ広げて返す。VECTOR と合わせて表に 0〜1 本。距離計算・CAST・HNSW・ADD COLUMN・PK/UNIQUE・索引・COPY などは fail-closed（兄弟 Issue #2015・#2016 ほかの担当）。
   BREAKING CHANGE: 公開 enum `ColumnType`・`row_codec::Value`・`row_codec::ScalarRef`・`sql::ddl_column_type::SqlColumnTypeName` に `HalfVec` を追加した（網羅的 `match` の下流は追随が必要）。
