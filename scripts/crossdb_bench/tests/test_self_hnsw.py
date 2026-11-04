@@ -211,5 +211,25 @@ class ProbeBinaryPathTests(unittest.TestCase):
                 os.environ["CROSSDB_PLAN_PROBE_BINARY"] = old
 
 
+class ParseExplainRowsTests(unittest.TestCase):
+    def test_engine_and_ann_plan_present(self) -> None:
+        rows = ["engine: brute_force", "ann_plan: plain_scan_opclass_mismatch"]
+        self.assertEqual(
+            self_hnsw.parse_explain_rows(rows),
+            {"engine": "brute_force", "ann_plan": "plain_scan_opclass_mismatch"},
+        )
+
+    def test_missing_lines_yield_none(self) -> None:
+        self.assertEqual(self_hnsw.parse_explain_rows([]), {"engine": None, "ann_plan": None})
+        self.assertEqual(
+            self_hnsw.parse_explain_rows(["engine: hnsw"]),
+            {"engine": "hnsw", "ann_plan": None},
+        )
+        self.assertEqual(
+            self_hnsw.parse_explain_rows(["ann_plan: x"]),
+            {"engine": None, "ann_plan": "x"},
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

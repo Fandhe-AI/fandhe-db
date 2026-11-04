@@ -2,8 +2,8 @@
 `CROSSDB_QDRANT_HTTP_PORT`／`CROSSDB_QDRANT_GRPC_PORT` で上書き可。
 `containers.sh` と同じ変数を読む）の機能別ベンチマーク実装。
 
-gRPC 経由（`prefer_grpc=True`）で接続する。距離指標は自作 DB の `<=>`
-（内積）に合わせ `Distance.DOT` を使う。RLS 相当は、自作 DB の現行契約
+gRPC 経由（`prefer_grpc=True`）で接続する。距離指標は自作 DB の `<#>`
+（負の内積の昇順＝内積の降順）に合わせ `Distance.DOT` を使う。RLS 相当は、自作 DB の現行契約
 （実機確認: どのテナントの wire セッションからも `visibility = 'public'` の
 行のみが可視。private 行は所有テナント自身からも不可視）に合わせ、payload
 の `visibility` フィールドへの `Filter` で模する（`tenant` では絞り込まず、

@@ -275,3 +275,16 @@ def verify_explain_rows(rows: list[str], expect_hnsw: bool) -> dict:
         "ann_plan": ann_plan_value,
         "rows": rows,
     }
+
+
+def parse_explain_rows(rows: list[str]) -> dict:
+    """`EXPLAIN` の返却行から `engine`／`ann_plan` を例外なしで取り出す。
+
+    `verify_explain_rows` と違い検証しない（欠けた項目は `None`）。実際の kNN 形
+    SQL（`ORDER BY embedding <#> ...`）が HNSW に到達するかを記録するための
+    観測用で、`self_db.py` の `ann_probe.knn_operator_plan` と
+    `knn_reaches_hnsw` 判定に使う（Issue #2952）。
+    """
+    engine = next((r[len("engine: ") :] for r in rows if r.startswith("engine: ")), None)
+    ann_plan = next((r[len("ann_plan: ") :] for r in rows if r.startswith("ann_plan: ")), None)
+    return {"engine": engine, "ann_plan": ann_plan}
