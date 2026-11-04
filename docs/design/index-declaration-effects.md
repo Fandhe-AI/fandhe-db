@@ -332,3 +332,20 @@ HNSW 経路の適格性ゲートは宣言の有無に加え、索引の距離種
   問い合わせ側の metric は `sql::hnsw_cache::query_metric_of_bound` に集約済みで、距離演算子から決まる。
 - `hnsw_params:` の `metric=` は同じゲート結果から決める（`Targeted` は問い合わせ側、`MetricMismatch` は宣言側）。
 - 縮退先は既存の厳密経路で、RLS の可視集合には触れない（`tests/sql_named/sql33_opclass_mismatch.rs` で固定）。
+
+## 追記（Issue #2029・SQL-33 (5)）: 宣言の構築パラメータ
+
+`CREATE INDEX ... USING hnsw (col) WITH (m, ef_construction)` の値は、HNSW グラフの構築に次の優先順位で効く。
+
+| 優先 | 源泉 | 範囲 |
+| --- | --- | --- |
+| 1 | 宣言の `WITH`（検証済み） | `m`・`ef_construction` のみ |
+| 2 | CLI 設定（`--search-engine hnsw*` 系） | 全パラメータ |
+| 3 | 内部既定（`HnswParams::default`: 16／100／64） | 全パラメータ |
+
+- `ef_search` は常に provider の値のまま（セッションの `ef_search` は #2030 の担当）。
+- 宣言は `catalog::hnsw_gate_in_txn` の `HnswGate::Targeted { options }` で SQL・Rust API・`EXPLAIN` が同じ判定元から受け取る。実行と `hnsw_params:` 表示が食い違わない（`m=`・`ef_construction=` は宣言があれば宣言の値）。
+- 同じ表・同じ opclass の複数宣言は、索引名の昇順で最初の宣言の値を採る（決定的）。
+- **キャッシュ**: `create_index`／`drop_index` は索引カタログの世代だけを進め表の世代は進めないため、キー `(表, ctx, metric)` と表の世代だけでは `DROP INDEX` → 別の値で `CREATE INDEX` の後も古いグラフを使い続ける。`lookup` の結果が実効の構築パラメータと食い違うベースを指すときは `Miss` に読み替えて再構築し、`record_base` が同キーの古いエントリを置き換える。構築失敗の負のキャッシュは表の世代が進むまで残る（この間は厳密全走査で安全側）。
+- 実効パラメータが `HnswParams::validate` を通らない場合は構築せず全件走査へ縮退する（fail-closed）。
+- 観測事項（本 Issue では変えない）: `WITH` 省略時の内部既定 `ef_construction = 100` と、`WITH` で `ef_construction` だけ省略したときの補完値（pgvector の既定 64）は食い違う。既存のベンチ・Recall ゲートへの影響を避けるため既定は据え置いた。

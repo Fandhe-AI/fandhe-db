@@ -1179,12 +1179,21 @@ pub(crate) struct HnswCacheAccess<'a> {
     /// `Some`。`None`（結線漏れ・未対応 metric）では prepare 系が `FullScan` を返し、
     /// 誤ったグラフを引かない（fail-closed）。
     pub(crate) graph_metric: Option<HnswMetric>,
+    /// 問い合わせ対象の `USING hnsw ... WITH (m, ef_construction)` 宣言（SQL-33 (5)、Issue #2029）。
+    /// ゲートが `Targeted` のときにだけ `catalog::hnsw_gate_in_txn` が返した値を載せる。
+    /// `Some` なら構築パラメータの `m`／`ef_construction` を provider の値より優先する
+    /// （[`effective_build_params`]。`ef_search` は常に provider のまま）。`None` は `WITH` 省略。
+    pub(crate) build_options: Option<crate::catalog::HnswIndexOptions>,
 }
 
 impl HnswCacheAccess<'_> {
-    /// `graph_metric` を差し替えた複製を返す。`sql::exec` がゲート評価後に写像結果を
-    /// 載せ直すために使う（全フィールドが参照または `Copy`）。
-    pub(crate) fn with_graph_metric(&self, graph_metric: Option<HnswMetric>) -> Self {
+    /// `graph_metric`・`build_options` を差し替えた複製を返す。`sql::exec` がゲート評価後に
+    /// 写像結果と宣言の構築パラメータを載せ直すために使う（全フィールドが参照または `Copy`）。
+    pub(crate) fn with_graph(
+        &self,
+        graph_metric: Option<HnswMetric>,
+        build_options: Option<crate::catalog::HnswIndexOptions>,
+    ) -> Self {
         HnswCacheAccess {
             storage: self.storage,
             cache: self.cache,
@@ -1192,7 +1201,42 @@ impl HnswCacheAccess<'_> {
             index_gate_cache: self.index_gate_cache,
             hnsw_scope: self.hnsw_scope,
             graph_metric,
+            build_options,
         }
+    }
+}
+
+/// HNSW グラフ構築に使う実効パラメータを解決する（SQL-33 (5)、Issue #2029）。宣言の
+/// `WITH (m, ef_construction)` があればそれを provider（CLI・内部既定）の値より優先し、
+/// `ef_search` は provider のまま使う。`validate` を通らない場合は `Err`（呼び出し元は
+/// 構築せず全件走査へ縮退する。fail-closed）。`sql::exec` と `core.rs` の Rust API 検索は
+/// 同じ `HnswCacheAccess` を経由するため、経路によって構築パラメータが変わらない。
+pub(crate) fn effective_build_params(
+    access: &HnswCacheAccess<'_>,
+) -> Result<crate::hnsw::HnswParams, crate::hnsw::HnswError> {
+    let mut params = access.provider.params();
+    if let Some(options) = access.build_options {
+        params = params
+            .with_m(options.m())
+            .with_ef_construction(options.ef_construction());
+    }
+    params.validate()?;
+    Ok(params)
+}
+
+/// [`HnswIndexCache::lookup`] の結果が実効の構築パラメータと食い違うベースを指す場合は `Miss`
+/// へ読み替える（Issue #2029）。`create_index`／`drop_index` は索引カタログの世代だけを進め表の
+/// 世代は進めないため、`DROP INDEX` → 別の `WITH` で `CREATE INDEX` した後も、キー
+/// `(table, ctx, metric)` と表の世代だけでは古いグラフを使い続けてしまう。`Miss` になれば
+/// 呼び出し元が再構築し、`record_base` が同キーの古いエントリを置き換える。
+fn require_build_params(found: Lookup, params: &crate::hnsw::HnswParams) -> Lookup {
+    let stale = |base: &IndexedBase| {
+        let built = base.index.params();
+        built.m != params.m || built.ef_construction != params.ef_construction
+    };
+    match found {
+        Lookup::Ready(base, _) | Lookup::NeedOverlay(base) if stale(&base) => Lookup::Miss,
+        other => other,
     }
 }
 
@@ -1265,10 +1309,15 @@ pub(crate) fn prepare_full_visible(
         return PreparedHnswSearch::FullScan;
     }
 
-    let base = match access
-        .cache
-        .lookup(access.storage, read_txn, table, ctx, metric)
-    {
+    let Ok(build_params) = effective_build_params(access) else {
+        return PreparedHnswSearch::FullScan;
+    };
+    let base = match require_build_params(
+        access
+            .cache
+            .lookup(access.storage, read_txn, table, ctx, metric),
+        &build_params,
+    ) {
         Lookup::BuildFailedThisGeneration => return PreparedHnswSearch::FullScan,
         Lookup::Ready(base, overlay) => {
             return PreparedHnswSearch::Indexed {
@@ -1286,7 +1335,7 @@ pub(crate) fn prepare_full_visible(
             access.cache.builds.fetch_add(1, Ordering::Relaxed);
             match IndexedBase::build(
                 arena,
-                access.provider.params(),
+                build_params,
                 access.provider.resident_precision(),
                 metric,
                 ctx.clone(),
@@ -1344,7 +1393,7 @@ pub(crate) fn prepare_full_visible(
         access.cache.builds.fetch_add(1, Ordering::Relaxed);
         match IndexedBase::build(
             arena,
-            access.provider.params(),
+            build_params,
             access.provider.resident_precision(),
             metric,
             ctx.clone(),
@@ -1751,10 +1800,15 @@ pub(crate) fn prepare_subset(
     let Some(metric) = access.graph_metric else {
         return PreparedHnswSearch::FullScan;
     };
-    let base = match access
-        .cache
-        .lookup(access.storage, read_txn, table, ctx, metric)
-    {
+    let Ok(build_params) = effective_build_params(access) else {
+        return PreparedHnswSearch::FullScan;
+    };
+    let base = match require_build_params(
+        access
+            .cache
+            .lookup(access.storage, read_txn, table, ctx, metric),
+        &build_params,
+    ) {
         Lookup::BuildFailedThisGeneration | Lookup::Miss => return PreparedHnswSearch::FullScan,
         Lookup::Ready(base, _full_arena_overlay) => base,
         Lookup::NeedOverlay(base) => base,
@@ -1898,10 +1952,16 @@ pub(crate) fn prepare_subset_from_slots(
         access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
         return mask_scan(access);
     };
-    let base = match access
-        .cache
-        .lookup(access.storage, read_txn, table, ctx, metric)
-    {
+    let Ok(build_params) = effective_build_params(access) else {
+        access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+        return mask_scan(access);
+    };
+    let base = match require_build_params(
+        access
+            .cache
+            .lookup(access.storage, read_txn, table, ctx, metric),
+        &build_params,
+    ) {
         Lookup::BuildFailedThisGeneration | Lookup::Miss => {
             access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
             return mask_scan(access);
@@ -3654,6 +3714,7 @@ mod tests {
             index_gate_cache: &gate_cache,
             hnsw_scope: crate::search_engine::HnswScope::All,
             graph_metric: Some(HnswMetric::InnerProduct),
+            build_options: None,
         };
         let provider = crate::kernel::CpuScalarProvider;
         let query = [1.0, 0.0, 0.0, 0.0];
@@ -3739,6 +3800,7 @@ mod tests {
             index_gate_cache: &gate_cache,
             hnsw_scope: crate::search_engine::HnswScope::All,
             graph_metric: Some(HnswMetric::InnerProduct),
+            build_options: None,
         };
         record_overlay_for(&access, table0, base0, overlay);
 
@@ -3906,6 +3968,7 @@ mod tests {
             index_gate_cache: &gate_cache,
             hnsw_scope: crate::search_engine::HnswScope::All,
             graph_metric: Some(HnswMetric::InnerProduct),
+            build_options: None,
         };
         let provider = crate::kernel::CpuScalarProvider;
         let query = [1.0, 0.0, 0.0, 0.0];
@@ -3993,6 +4056,7 @@ mod tests {
             index_gate_cache: &gate_cache,
             hnsw_scope: crate::search_engine::HnswScope::All,
             graph_metric: Some(HnswMetric::InnerProduct),
+            build_options: None,
         };
         let provider = crate::kernel::CpuScalarProvider;
         let query = [0.5, 0.25, 0.1, 0.9];
@@ -4090,6 +4154,7 @@ mod tests {
             index_gate_cache: &gate_cache,
             hnsw_scope: crate::search_engine::HnswScope::All,
             graph_metric: Some(HnswMetric::InnerProduct),
+            build_options: None,
         };
         let ann_provider = crate::kernel::CpuScalarProvider;
         let default_provider = crate::kernel::CpuScalarProvider;
@@ -4224,6 +4289,7 @@ mod tests {
             index_gate_cache: &gate_cache,
             hnsw_scope: crate::search_engine::HnswScope::All,
             graph_metric: Some(HnswMetric::InnerProduct),
+            build_options: None,
         };
         let ann_provider = crate::kernel::CpuScalarProvider;
         let default_provider = crate::kernel::CpuScalarProvider;
@@ -4369,6 +4435,7 @@ mod tests {
             index_gate_cache: &gate_cache,
             hnsw_scope: crate::search_engine::HnswScope::All,
             graph_metric: Some(HnswMetric::InnerProduct),
+            build_options: None,
         };
         record_overlay_for(&access, "docs", &base, overlay);
 
@@ -4471,6 +4538,7 @@ mod tests {
             index_gate_cache: &gate_cache,
             hnsw_scope: crate::search_engine::HnswScope::All,
             graph_metric: Some(HnswMetric::InnerProduct),
+            build_options: None,
         };
         let provider = crate::kernel::CpuScalarProvider;
         let query = [1.0, 0.0, 0.0, 0.0];
@@ -4645,6 +4713,7 @@ mod tests {
             index_gate_cache: &gate_cache,
             hnsw_scope: crate::search_engine::HnswScope::All,
             graph_metric: Some(HnswMetric::InnerProduct),
+            build_options: None,
         };
 
         // 5/20 = 0.25 < 0.6: 早期打ち切り分岐を踏むはずの部分集合アリーナ
@@ -4715,6 +4784,7 @@ mod tests {
             index_gate_cache: &gate_cache,
             hnsw_scope: crate::search_engine::HnswScope::All,
             graph_metric: Some(HnswMetric::InnerProduct),
+            build_options: None,
         };
         let read_txn = storage.db().begin_read().unwrap();
         let arena = build_arena(&read_txn, "docs", &c);
@@ -4790,6 +4860,7 @@ mod tests {
             index_gate_cache: &gate_cache,
             hnsw_scope: crate::search_engine::HnswScope::All,
             graph_metric: Some(HnswMetric::InnerProduct),
+            build_options: None,
         };
         let read_txn = storage.db().begin_read().unwrap();
         let arena = build_arena(&read_txn, "docs", &c);
@@ -5045,6 +5116,7 @@ mod tests {
             index_gate_cache: &gate_cache,
             hnsw_scope: crate::search_engine::HnswScope::All,
             graph_metric: None,
+            build_options: None,
         };
         let read_txn = storage.db().begin_read().unwrap();
         let arena = build_arena(&read_txn, "docs", &c);
@@ -5076,6 +5148,80 @@ mod tests {
             prepare_subset(&access, &read_txn, "docs", &c, &arena),
             PreparedHnswSearch::FullScan
         ));
+    }
+
+    /// SQL-33 (5)（Issue #2029）: 宣言の `WITH (m, ef_construction)` が実際の構築パラメータになり、
+    /// 宣言を差し替えると（索引カタログの世代だけが進み表の世代は進まない状況でも）キャッシュ済み
+    /// グラフが破棄されて新しい値で再構築される。`ef_search` は provider のまま。
+    #[test]
+    fn declared_build_options_drive_graph_construction_and_invalidate_stale_graphs() {
+        let path = unique_db_path("hnsw-cache-build-options");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        create_table(&storage, "docs", 4);
+        let c = ctx("tenant-a");
+        let embeddings: Vec<[f32; 4]> = (0..MIN_INDEXED_ROWS)
+            .map(|i| [i as f32, (i * 7 % 13) as f32, (i * 3 % 11) as f32, 1.0])
+            .collect();
+        let rows: Vec<(u64, RowInput<'_>)> = embeddings
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                (
+                    i as u64,
+                    RowInput {
+                        tenant_id: "tenant-a",
+                        visibility: Visibility::Public,
+                        embedding: e.as_slice(),
+                        metadata: &[],
+                    },
+                )
+            })
+            .collect();
+        let op_id = crate::recovery::required_op_id::OperationId::parse("hnsw-cache-build-opts")
+            .expect("valid operation_id");
+        crate::tenant::insert_rows(&storage, "docs", &c, &rows, &op_id).expect("bulk insert");
+
+        let cache = HnswIndexCache::new();
+        let gate_cache = crate::catalog::IndexCatalogGateCache::new();
+        let mut access = HnswCacheAccess {
+            storage: &storage,
+            cache: &cache,
+            provider: HnswSearchProvider::new(crate::hnsw::ValidatedHnswParams::default()),
+            index_gate_cache: &gate_cache,
+            hnsw_scope: crate::search_engine::HnswScope::All,
+            graph_metric: Some(HnswMetric::InnerProduct),
+            build_options: None,
+        };
+        let default_params = crate::hnsw::HnswParams::default();
+        let read_txn = storage.db().begin_read().unwrap();
+        let arena = build_arena(&read_txn, "docs", &c);
+        let built_params = |access: &HnswCacheAccess<'_>| match prepare_full_visible(
+            access, &read_txn, "docs", &c, &arena,
+        ) {
+            PreparedHnswSearch::Indexed { base, .. } => *base.index.params(),
+            _ => panic!("expected an indexed plan"),
+        };
+
+        // 宣言なし: provider（内部既定）の値で構築する。
+        assert_eq!(built_params(&access), default_params);
+        // 宣言あり: キャッシュ済みの既定グラフを使い回さず、宣言の値で再構築する。
+        access.build_options = Some(crate::catalog::HnswIndexOptions::new(8, 40).unwrap());
+        let p = built_params(&access);
+        assert_eq!((p.m, p.ef_construction), (8, 40));
+        assert_eq!(p.ef_search, default_params.ef_search);
+        // 同じ宣言ならキャッシュを再利用する（再構築しない）。
+        let builds_before = cache.stats().builds;
+        assert_eq!(built_params(&access), p);
+        assert_eq!(cache.stats().builds, builds_before);
+        // 宣言を差し替えると新しい値で再構築される。
+        access.build_options = Some(crate::catalog::HnswIndexOptions::new(12, 48).unwrap());
+        let p = built_params(&access);
+        assert_eq!((p.m, p.ef_construction), (12, 48));
+        assert_eq!(cache.stats().entries, 1, "同キーの古いエントリは置き換わる");
+        // 宣言を外すと内部既定へ戻る。
+        access.build_options = None;
+        assert_eq!(built_params(&access), default_params);
     }
 
     #[test]

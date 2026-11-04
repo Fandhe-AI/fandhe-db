@@ -19515,9 +19515,17 @@ pub struct ValidatedCreateIndex {
     /// エラーへ解決する。実行段 `execute_create_index` も多重防御で `0A000`）。保留した位置より後ろの
     /// 構文・最終ゲートの検査は行っていない（従来は同じ位置で `0A000` を返していたため判定順は不変）。
     pub(crate) pending_user_function: Option<crate::sql::index_expr::IndexUserFunctionRef>,
+    /// `USING hnsw ... WITH (m = n, ef_construction = n)` の検証済み構築パラメータ（SQL-33 (5)、
+    /// Issue #2029）。`WITH` 省略は `None`。HNSW 以外への `WITH` は構文段で `0A000` 拒否済み。
+    pub(crate) hnsw_options: Option<crate::catalog::HnswIndexOptions>,
 }
 
 impl ValidatedCreateIndex {
+    /// HNSW の構築パラメータ（`WITH` 省略は `None`）。実行段は `IndexDef::with_hnsw_options` へ渡す。
+    pub fn hnsw_options(&self) -> Option<crate::catalog::HnswIndexOptions> {
+        self.hnsw_options
+    }
+
     /// 部分索引の述語（`None` は全行対象）。
     pub fn predicate(&self) -> Option<&[WherePredicate]> {
         self.predicate.as_deref()
@@ -19640,7 +19648,10 @@ pub(crate) fn is_drop_index_statement(tokens: &[Token]) -> bool {
 /// - `UNIQUE` は `CREATE` 直後のみ受理（Issue #1616・INDEX-9）。`UNIQUE` かつ `USING hnsw`／
 ///   `COLLATE` → `0A000`。
 ///
-/// `CONCURRENTLY`／`INCLUDE`／`WITH (...)`／
+/// - `USING hnsw` の `WITH (m = n, ef_construction = n)` は [`parse_index_with_options`] が読む
+///   （SQL-33 (5)、Issue #2029。範囲外・未知・重複は `22023`、HNSW 以外は `0A000`）。
+///
+/// `CONCURRENTLY`／`INCLUDE`／
 /// `ASC|DESC`／opclass・スキーマ修飾名・`$n` 等は、いずれも期待するトークン列と
 /// 一致しないため `expect_*` ヘルパー経由で構造的に `42601` へ落ちる。
 pub(crate) fn validate_create_index_tokens(
@@ -19768,6 +19779,8 @@ pub(crate) fn validate_create_index_tokens(
             detail: "USING gin does not support COLLATE".to_string(),
         });
     }
+    // 索引の `WITH (...)`（列リストの `)` の直後・`WHERE` の前。SQL-33 (5)、Issue #2029）。
+    let hnsw_options = parse_index_with_options(&mut p, method)?;
     // 式要素の決定性（`42P17`／組み込み以外の関数は `0A000`。INDEX-10、Issue #1647）。判定順は
     // 要素の構文・集計/ウィンドウ/部分クエリ → 上の構造検査 → 決定性 → `WHERE` → 最終ゲート。
     let pending_result = |pending| ValidatedCreateIndex {
@@ -19781,6 +19794,7 @@ pub(crate) fn validate_create_index_tokens(
         unique,
         predicate: None,
         pending_user_function: Some(pending),
+        hnsw_options,
     };
     for expr in expressions.iter().flatten() {
         if let Some(pending) =
@@ -19832,7 +19846,87 @@ pub(crate) fn validate_create_index_tokens(
         unique,
         predicate,
         pending_user_function: None,
+        hnsw_options,
     })
+}
+
+/// 索引宣言の任意の `WITH (m = n, ef_construction = n)` を読む（SQL-33 (5)、Issue #2029）。
+/// `validate_create_index_tokens` が列リストの `)` の直後で呼ぶ。`WITH` が無ければ `Ok(None)`。
+///
+/// - 方式が HNSW 以外 → `0A000`（fillfactor 等の storage parameter は実装しない）。
+/// - 構文（`(`・`key = <値>`・`,` 区切り・`)`）の不一致、`WITH ()`、`$n` → `42601`。
+/// - 未知のキー・重複キー・符号なし整数でない値（小数・識別子・負値）・範囲外 → `22023`
+///   （固定文言。入力値は反映しない）。引用符付きの値（文字列リテラル）は `0A000`。
+/// - 省略されたキーは pgvector の既定（`m = 16`・`ef_construction = 64`）で補い、補完後の値で
+///   範囲と `ef_construction >= 2 * m` を検査する（`catalog::HnswIndexOptions::new` と共有）。
+fn parse_index_with_options(
+    p: &mut Parser<'_>,
+    method: IndexMethod,
+) -> Result<Option<crate::catalog::HnswIndexOptions>, SqlSurfaceError> {
+    if !p.peek_ident_matches("WITH") {
+        return Ok(None);
+    }
+    p.advance();
+    if !matches!(method, IndexMethod::Hnsw) {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "storage parameters are only supported for USING hnsw".to_string(),
+        });
+    }
+    let invalid = |detail: &'static str| SqlSurfaceError::InvalidParameterValue { detail };
+    p.expect_punct('(')?;
+    let mut m: Option<usize> = None;
+    let mut ef_construction: Option<usize> = None;
+    // キーは 2 種類しか受け付けないため、3 要素目は必ず重複か未知のキーで失敗する（有界）。
+    loop {
+        let key = p.expect_ident()?;
+        p.expect_punct('=')?;
+        let negative = matches!(p.peek(), Some(Token::Punct('-')));
+        if negative {
+            p.advance();
+        }
+        let value = match p.advance() {
+            Some(Token::Number(text)) => {
+                if negative || text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err(invalid("invalid value for hnsw index parameter"));
+                }
+                // 桁あふれは範囲外として扱う（`HnswIndexOptions::new` が拒否する）。
+                text.parse::<usize>().unwrap_or(usize::MAX)
+            }
+            Some(Token::Ident(_)) => return Err(invalid("invalid value for hnsw index parameter")),
+            Some(Token::StringLiteral(_)) => {
+                return Err(SqlSurfaceError::FeatureNotSupported {
+                    detail: "quoted hnsw index parameter values are not supported".to_string(),
+                })
+            }
+            other => {
+                return Err(SqlSurfaceError::unsupported(format!(
+                    "expected integer, got {other:?}"
+                )))
+            }
+        };
+        let slot = if key.eq_ignore_ascii_case("m") {
+            &mut m
+        } else if key.eq_ignore_ascii_case("ef_construction") {
+            &mut ef_construction
+        } else {
+            return Err(invalid("unrecognized hnsw index parameter"));
+        };
+        if slot.replace(value).is_some() {
+            return Err(invalid("hnsw index parameter specified more than once"));
+        }
+        if matches!(p.peek(), Some(Token::Punct(','))) {
+            p.advance();
+        } else {
+            break;
+        }
+    }
+    p.expect_punct(')')?;
+    crate::catalog::HnswIndexOptions::new(
+        m.unwrap_or(crate::catalog::HNSW_WITH_DEFAULT_M),
+        ef_construction.unwrap_or(crate::catalog::HNSW_WITH_DEFAULT_EF_CONSTRUCTION),
+    )
+    .map(Some)
+    .map_err(invalid)
 }
 
 /// 部分索引の最終ゲート（INDEX-11、Issue #1654）。カタログ非参照の構文段で `0A000` に倒す組み合わせ:

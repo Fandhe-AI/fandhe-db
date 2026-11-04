@@ -24,6 +24,7 @@ spec 本文はここへ転記しない（`.claude/rules/spec-confidentiality.md`
 ```text
 CREATE INDEX <name> ON <table> ( <col> [COLLATE <名前>][, ...] )   -- スカラー宣言（COLLATE は Issue #2191）
 CREATE INDEX <name> ON <table> USING hnsw ( <col> )     -- HNSW 宣言（VECTOR 列 1 本）
+CREATE INDEX <name> ON <table> USING hnsw ( <col> ) WITH ( m = <n>, ef_construction = <n> )  -- 構築パラメータ付き（Issue #2029）
 DROP INDEX <name>
 ```
 
@@ -254,3 +255,27 @@ Issue #1647 時点では式索引を作成できなかった（宣言を永続�
 連鎖削除し、`RENAME COLUMN`／`ALTER COLUMN TYPE` は `0A000` で拒否する。式キーは起動時 opt-in が有効なとき
 `ScalarIndex` の構築時に作られるが、現時点ではクエリから消費されない（プランナ選択は #1650）。詳細は
 [expression-index.md](expression-index.md) の「Issue #1648」節。
+
+## Issue #2029 追記（SQL-33 (5): `USING hnsw ... WITH (m, ef_construction)`）
+
+HNSW 宣言に任意の `WITH (m = n, ef_construction = n)` を付けられる（列リストの `)` の直後、`WHERE` の前）。
+値は検証してカタログへ永続化し、グラフ構築に反映する（反映の優先順位とキャッシュは
+[index-declaration-effects.md](index-declaration-effects.md) の「Issue #2029 追記」参照）。
+
+| 項目 | 規則 |
+| --- | --- |
+| キー | `m`・`ef_construction`（大文字小文字を区別しない）。省略したキーは pgvector の既定（`m = 16`・`ef_construction = 64`）で補い、補完後の両値を永続化する |
+| 範囲 | `m` は 2〜100、`ef_construction` は 4〜1000 かつ `2 * m` 以上（補完後の値で検査）。型 `catalog::HnswIndexOptions::new` が構文段とカタログ復元で共有する |
+| 値の形 | 符号なしの整数リテラルのみ。桁あふれは範囲外 |
+| `WITH` 省略 | 従来どおり（オプションは永続化せず、カタログのバイト列も `v1`／`v9` のまま）。構築は provider（CLI・内部既定）の値 |
+| 複数宣言 | 同じ表・同じ opclass に複数の宣言があるときは拒否せず、索引カタログの走査順（索引名の昇順）で最初の宣言の値を採る（物理グラフが (表, ctx, metric) ごとに 1 本のため） |
+
+| ケース | wire_code |
+| --- | --- |
+| 範囲外・`ef_construction < 2 * m`・未知のキー・キーの重複・整数でない値（小数・負値・識別子） | `22023`（固定文言。入力値は反映しない） |
+| btree／gin への `WITH`・引用符付きの値（`m = '16'`） | `0A000` |
+| `WITH ()`・`=` の欠落・括弧の不整合・`$n`・`WHERE` の後の `WITH` | `42601` |
+
+永続形は新しい版 `v10`（`v10／テーブル／hnsw／列／opclass トークン／m／ef_construction`。cosine も `v10`）で、
+旧バイナリは `v10` を未知の版として拒否する（前方互換なし）。復元は正準な 10 進と範囲を検査し、違反は
+`CorruptSchema` で fail-closed にする。NoSQL `create_index` の `with` は対象外（NOSQL-19）。opclass 構文は #2239。
