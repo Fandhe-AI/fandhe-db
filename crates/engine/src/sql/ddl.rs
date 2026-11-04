@@ -2129,14 +2129,10 @@ fn resolve_column_type(
     ty: &SqlColumnTypeName,
     limits: &SchemaLimits,
 ) -> Result<ColumnType, SqlSurfaceError> {
-    // 既存行が埋め込みバイトを持たないテーブルへの VECTOR 列追加は、
-    // arena 構築・KNN・HNSW 各経路の安全性が未検証のため常に拒否する
-    // （`sql::ddl_column_type` モジュールドキュメント参照）。
-    if matches!(ty, SqlColumnTypeName::Vector(_)) {
-        return Err(SqlSurfaceError::FeatureNotSupported {
-            detail: "ALTER TABLE ADD COLUMN does not support VECTOR columns yet".to_string(),
-        });
-    }
+    // VECTOR 列の追加は nullable な列としてのみ成立する（Issue #2042・TABLE-26 (4)）。
+    // 既存行は embedding を持たない（空 = NULL）ため、`NOT NULL` 付き（DEFAULT を持てない）は
+    // 既存の NOT NULL ADD COLUMN と同じ規則で拒否され、2 本目の VECTOR 列は TABLE-1 の
+    // 既存エラーのまま。
     // HALFVEC 列の追加も同じ理由で拒否する（既存行に値が無く、補完値も持てない。
     // 担当 Issue 未定の fail-closed。TABLE-46・Issue #2014）。
     if matches!(ty, SqlColumnTypeName::HalfVec(_)) {

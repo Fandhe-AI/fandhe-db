@@ -283,13 +283,14 @@ fn scalar_index_hit_drops_row_updated_to_null() {
     assert_eq!(null_ids(&core, "alice", "lang"), 1);
 }
 
-/// VECTOR 列の NULL は現行コードを固定するだけで、揃える作業は TABLE-26 の範囲。
+/// NOT NULL の VECTOR 列への NULL は `23502`（Issue #2042・TABLE-26 (3)。nullable な列は
+/// `table26_nullable_vector_storage.rs` が担う）。
 #[test]
-fn vector_column_null_keeps_current_codes() {
+fn not_null_vector_column_null_is_23502() {
     let (core, _g) = new_core("upd-null-vector");
     ddl(
         &core,
-        "CREATE TABLE v (id BIGINT PRIMARY KEY, embedding VECTOR(2), note TEXT)",
+        "CREATE TABLE v (id BIGINT PRIMARY KEY, embedding VECTOR(2) NOT NULL, note TEXT)",
     );
     ok(
         &core,
@@ -303,7 +304,7 @@ fn vector_column_null_keeps_current_codes() {
             "alice",
             "UPDATE v SET embedding = NULL WHERE id = 1 USING OPERATION_ID 'u1'"
         ),
-        "22000"
+        "23502"
     );
     assert_eq!(
         code(

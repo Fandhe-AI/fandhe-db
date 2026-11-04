@@ -600,6 +600,13 @@ fn map_arena_error(table: &str, e: ArenaError) -> SqlSurfaceError {
         // Issue #1953: 構築中の協調キャンセルポイントが検出した中断は `57014` のまま返す（`XX000`
         // へ丸めない）。`expr_eval_error_to_arena` の `QueryCanceled` 腕との往復。
         ArenaError::Interrupted(reason) => SqlSurfaceError::QueryCanceled { reason },
+        // 自テナントの可視行に NULL の VECTOR（空 embedding）がある表の検索は、kNN からの NULL
+        // 行除外（Issue #2043）が入るまで `0A000` で拒否する過渡措置（Issue #2042・TABLE-26。
+        // #2043 でこの腕は除外ロジックに置き換える。可視性判定は decode より前なので他テナントの
+        // NULL 行はここへ到達しない）。
+        ArenaError::DimMismatch { found: 0, .. } => SqlSurfaceError::FeatureNotSupported {
+            detail: "search over a table with NULL vector rows is not supported yet".to_string(),
+        },
         ArenaError::Storage(_)
         | ArenaError::Catalog(_)
         | ArenaError::InvalidDim
