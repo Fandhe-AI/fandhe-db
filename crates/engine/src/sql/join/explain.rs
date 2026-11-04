@@ -12,15 +12,7 @@
 
 use super::plan::{JoinMethod, Shape};
 use super::PreparedJoin;
-use crate::sql::explain_tree::{ExplainNode, ExplainTreeError};
-
-fn present(b: bool) -> &'static str {
-    if b {
-        "present"
-    } else {
-        "none"
-    }
-}
+use crate::sql::explain_tree::{present, ExplainNode, ExplainTreeError};
 
 /// 結合の段の木を組み立てる。外側から `limit` → `sort` → `aggregate` → `filter` → `join` 連鎖 →
 /// `scan`（実行順の逆）。`side_lines.len()` が relation 数と違うときは fail-closed

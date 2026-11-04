@@ -1392,6 +1392,18 @@ pub fn validate_param_positions(tokens: &[Token]) -> Result<u16, SqlSurfaceError
         ));
     }
 
+    // Issue #2047: `EXPLAIN` 前置の集合演算も `$n` を拒否する（fail-closed）。EXPLAIN 経路では
+    // 枝ごとの WHERE 等価フラグ・型推論・置換の対応を検証できていないため、受理は後続に譲る
+    // （非 EXPLAIN の集合演算は従来どおり枝ごとのフラグで受理する）。
+    if matches!(tokens.first(), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("EXPLAIN"))
+        && tokens.iter().any(|t| matches!(t, Token::Param(_)))
+        && has_set_operator_branch(join_tokens)
+    {
+        return Err(SqlSurfaceError::unsupported(
+            "parameter placeholders are not supported in EXPLAIN of set operations",
+        ));
+    }
+
     // パターン 4（WHERE 等価）の受理範囲は [`where_region`] が単一情報源として
     // 判定する（[`where_equality_literal_is_param`] も同じ境界判定を再利用し、
     // 両関数間で境界判定がずれる余地をなくす）。`SET`（statement 全体）である
@@ -2655,6 +2667,27 @@ mod tests {
                 "{sql}"
             );
         }
+    }
+
+    /// Issue #2047: `EXPLAIN` 前置の集合演算に `$n` を含む文は `42601`。非 EXPLAIN の同じ文は受理する。
+    #[test]
+    fn explain_set_operation_with_param_is_rejected() {
+        for sql in [
+            "EXPLAIN SELECT k FROM a WHERE k = $1 UNION SELECT k FROM b",
+            "EXPLAIN (SELECT k FROM a) INTERSECT SELECT k FROM b WHERE k = $1",
+        ] {
+            let tokens = crate::sql::lexer::tokenize_with_params(sql).expect("tokenize");
+            assert_eq!(
+                validate_param_positions(&tokens).unwrap_err().wire_code(),
+                "42601",
+                "{sql}"
+            );
+        }
+        let tokens = crate::sql::lexer::tokenize_with_params(
+            "SELECT k FROM a WHERE k = $1 UNION SELECT k FROM b",
+        )
+        .expect("tokenize");
+        assert!(validate_param_positions(&tokens).is_ok());
     }
 
     /// Issue #1593: 許可位置 1〜4 の `$n` に `::` が続く形は 42601。負値の置換は括弧で包む。

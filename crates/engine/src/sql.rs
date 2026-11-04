@@ -297,6 +297,7 @@ pub mod search_path;
 pub(crate) mod sequence_fn;
 pub(crate) mod sequence_scope;
 pub(crate) mod set_op;
+pub(crate) mod set_op_explain;
 pub(crate) mod sparse_cache;
 pub mod statement_splitter;
 pub(crate) mod string_fn;

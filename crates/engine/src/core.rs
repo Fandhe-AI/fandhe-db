@@ -11824,6 +11824,11 @@ impl EngineCore {
                 crate::sql::allowlist::ExplainTarget::Join(validated) => {
                     self.run_join_explain(&validated, session)
                 }
+                // Issue #2047（SQL-75 (2) ポインタ）: 集合演算。行を読まず、演算子・入れ子・各枝の
+                // 走査分類を段の木で報告する（[`Self::run_set_operation_explain`] 参照）。
+                crate::sql::allowlist::ExplainTarget::SetOperation(validated) => {
+                    self.run_set_operation_explain(&validated, session)
+                }
             },
             // Issue #929（SQL-29 (c)・RLS-10 (b)・TASK-213）: 集合演算は複数枝
             // （各枝は独立した単一テーブル広域取得）を単一スナップショット上で
@@ -14095,7 +14100,6 @@ impl EngineCore {
         session: &crate::sql::mode::SessionState,
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
         use crate::sql::allowlist::SqlSurfaceError;
-        use crate::sql::explain_tree::ExplainTreeError;
         // EXPLAIN の構文段は CTE 入力を作らない（`EXPLAIN WITH` は `42601`）。到達は契約違反のみ。
         if validated.cte_inputs.is_some() {
             return Err(SqlSurfaceError::Internal {
@@ -14127,14 +14131,71 @@ impl EngineCore {
             let gins = Self::gin_decls_for_explain(&read_txn, bound)?;
             side_lines.push(Self::scan_explain_lines(schema, bound, &gins));
         }
-        let node = crate::sql::join::explain_tree(&prepared, side_lines).map_err(|e| match e {
+        let node = crate::sql::join::explain_tree(&prepared, side_lines)
+            .map_err(Self::explain_tree_error)?;
+        Ok(crate::sql::SqlOutcome::Explain(node.into_query_result()))
+    }
+
+    /// 段の木の構築エラーを `wire_code` へ写す（JOIN・集合演算の `EXPLAIN` が共有）。
+    /// `InvalidLine`（契約違反）は Internal、上限超過は `54001`（固定文）で fail-closed。
+    fn explain_tree_error(
+        e: crate::sql::explain_tree::ExplainTreeError,
+    ) -> crate::sql::allowlist::SqlSurfaceError {
+        use crate::sql::allowlist::SqlSurfaceError;
+        use crate::sql::explain_tree::ExplainTreeError;
+        match e {
             ExplainTreeError::InvalidLine => SqlSurfaceError::Internal {
                 detail: e.message().to_string(),
             },
             _ => SqlSurfaceError::StatementTooComplex {
                 detail: e.message(),
             },
-        })?;
+        }
+    }
+
+    /// 集合演算の `EXPLAIN`（Issue #2047・SQL-75 (2)(5)(6) ポインタ）。`Statement::Explain` アームから
+    /// 呼ばれ、非 EXPLAIN の集合演算と同じ [`crate::sql::set_op::prepare`]（全体 LIMIT／OFFSET の範囲 →
+    /// 全枝の束縛と型整合。行は読まない）を通すため、束縛エラーの `wire_code` と順序が一致する。
+    /// スキャン枝の走査分類は単一表の広域取得 `EXPLAIN` と共有の [`Self::scan_explain_lines`]、
+    /// 集計枝は実行器と同じ全走査に固定（[`crate::sql::set_op::aggregate_branch_explain_lines`]）。
+    /// 走査・キャッシュ・台帳・世代・書き込みロックには触れず、行数等のテナント存在情報も出さない。
+    fn run_set_operation_explain(
+        &self,
+        validated: &crate::sql::allowlist::ValidatedSetOperation,
+        session: &crate::sql::mode::SessionState,
+    ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        use crate::sql::allowlist::SqlSurfaceError;
+        let mut names = Vec::new();
+        crate::sql::set_op::collect_branch_tables(&validated.tree, &mut names);
+        let (read_txn, schemas) = self.read_txn_with_schemas(&names)?;
+        let mut leaves = Vec::new();
+        crate::sql::set_op::prepare(
+            &schemas,
+            &validated.tree,
+            session.udfs(),
+            validated.limit,
+            validated.offset,
+            &self.result_limits,
+            Some(&mut leaves),
+        )?;
+        let mut leaf_lines = Vec::with_capacity(leaves.len());
+        for leaf in &leaves {
+            match &leaf.scan {
+                Some(bound) => {
+                    let schema =
+                        schemas
+                            .get(&leaf.table)
+                            .ok_or_else(|| SqlSurfaceError::Internal {
+                                detail: "schema missing for set operation branch table".to_string(),
+                            })?;
+                    let gins = Self::gin_decls_for_explain(&read_txn, bound)?;
+                    leaf_lines.push(Self::scan_explain_lines(schema, bound, &gins));
+                }
+                None => leaf_lines.push(crate::sql::set_op::aggregate_branch_explain_lines()),
+            }
+        }
+        let node = crate::sql::set_op_explain::explain_tree(validated, &leaves, leaf_lines)
+            .map_err(Self::explain_tree_error)?;
         Ok(crate::sql::SqlOutcome::Explain(node.into_query_result()))
     }
 
