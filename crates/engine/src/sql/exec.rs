@@ -973,12 +973,9 @@ impl SearchProvider for CosineDenseAdapter<'_> {
         };
         // provider は untrusted: NaN 除去・スコア変換・再整列の前に生の結果全体で契約
         // （件数・可視 id の多重集合・距離昇順・NaN 末尾）を検証し、違反は fail-closed に拒否する。
-        let mut visible_id_counts: std::collections::HashMap<u64, usize> =
-            std::collections::HashMap::with_capacity(input.ids.len());
-        for &id in input.ids {
-            let c = visible_id_counts.entry(id).or_insert(0);
-            *c = c.saturating_add(1);
-        }
+        // Issue #2043: 実際に渡した候補（`dense_slots`。NULL 行を除く）の集合で検証し、範囲外の
+        // id（NULL 行など）の返却を fail-closed に拒否する。
+        let visible_id_counts = crate::core::searched_id_counts(input.ids, self.dense_slots);
         if !crate::core::distance_result_is_valid(&hits, input.k, &visible_id_counts) {
             return Err(KernelError::WorkerPanicked);
         }
@@ -2600,7 +2597,6 @@ pub(crate) fn execute_statement_with_cache(
     }
     // スロット番号は重複しないため、多重集合の各件数は必ず 1 になる
     // （`core::provider_result_is_valid` の (3)(4) 検証はそのまま使える）。
-    let visible_id_counts = core::visible_id_counts(&slot_ids);
 
     // Issue #2043・TABLE-26: NULL の VECTOR 行（空 embedding）は arena にスロットを持つ（疎側の
     // DocId・投影が同じスロット番号を使うため）が、密側の kNN 候補には入れない。NULL 行が 1 件も
@@ -2616,6 +2612,10 @@ pub(crate) fn execute_statement_with_cache(
         }
         .map_err(|e| map_arena_error(&bound.table, e))?
     };
+    // Issue #2043: 密側（NULL 行除外後）の返却 id 検証用の多重集合。provider へ実際に渡した候補
+    // （`dense_slots`、無ければ全スロット）に限定する。疎側・hybrid の可視集合は
+    // `visible_id_counts`（全スロット）のまま保持する。
+    let dense_id_counts = core::searched_id_counts(&slot_ids, dense_slots.as_deref());
     let has_null_rows = arena.null_row_count() != 0;
     let hnsw_full_visible_eligible = hnsw_full_visible_eligible && !has_null_rows;
     let hnsw_subset_eligible = hnsw_subset_eligible && !has_null_rows;
@@ -2719,7 +2719,7 @@ pub(crate) fn execute_statement_with_cache(
                     bound.distance_descending,
                     bound.distance_kind,
                 )?;
-                if raw.len() > k_eff || raw.iter().any(|h| !visible_id_counts.contains_key(&h.0)) {
+                if raw.len() > k_eff || raw.iter().any(|h| !dense_id_counts.contains_key(&h.0)) {
                     return Err(SqlSurfaceError::Internal {
                         detail: "exact scan returned a result violating its contract".to_string(),
                     });
@@ -2760,7 +2760,7 @@ pub(crate) fn execute_statement_with_cache(
                         })
                         .map_err(map_kernel_error)?
                 };
-                if !core::distance_result_is_valid(&raw, k_eff, &visible_id_counts) {
+                if !core::distance_result_is_valid(&raw, k_eff, &dense_id_counts) {
                     return Err(SqlSurfaceError::Internal {
                         detail: "search provider returned a result violating the top-k contract"
                             .to_string(),
@@ -2952,7 +2952,7 @@ pub(crate) fn execute_statement_with_cache(
                     };
                     provider.search(input).map_err(map_kernel_error)?
                 };
-                if !core::provider_result_is_valid(&raw, k_eff, &visible_id_counts) {
+                if !core::provider_result_is_valid(&raw, k_eff, &dense_id_counts) {
                     return Err(SqlSurfaceError::Internal {
                         detail: "search provider returned a result violating the top-k contract"
                             .to_string(),
@@ -3114,7 +3114,7 @@ pub(crate) fn execute_statement_with_cache(
                         // `core::provider_result_is_valid` のドキュメント参照）。
                         if dense_hits
                             .iter()
-                            .any(|h| !visible_id_counts.contains_key(&h.id))
+                            .any(|h| !dense_id_counts.contains_key(&h.id))
                         {
                             return Err(SqlSurfaceError::Internal {
                                 detail: "search provider returned a hit outside the visible id set"
@@ -7001,6 +7001,45 @@ mod tests {
         assert!(run(vec![dh(1, 0.1), dh(2, f64::NAN), dh(2, f64::NAN)], 2).is_err());
         assert!(run(vec![dh(1, 0.9), dh(2, 0.1)], 2).is_err());
         assert!(run(vec![dh(1, 0.1), dh(2, f64::NAN)], 2).is_ok());
+    }
+
+    struct CosineSubsetOnly(Vec<crate::kernel::DistanceHit>);
+    impl SearchProvider for CosineSubsetOnly {
+        fn search(
+            &self,
+            _input: SearchInput<'_>,
+        ) -> Result<Vec<crate::kernel::CandidateHit>, KernelError> {
+            Err(KernelError::NonFiniteQuery)
+        }
+        fn search_cosine_subset(
+            &self,
+            _input: crate::kernel::SubsetSearchInput<'_>,
+        ) -> Result<Vec<crate::kernel::DistanceHit>, KernelError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    /// Issue #2043 レビュー指摘: 密側アダプタは実際に渡した `dense_slots` の集合で返却 id を検証する。
+    /// NULL 行（slot 0）を候補から外したのに provider が slot 0 を返したら fail-closed に拒否する。
+    #[test]
+    fn cosine_dense_adapter_rejects_hit_outside_dense_slots() {
+        let run = |hits: Vec<crate::kernel::DistanceHit>| {
+            let inner = CosineSubsetOnly(hits);
+            let adapter = CosineDenseAdapter {
+                inner: &inner,
+                dense_slots: Some(&[1_u32]),
+            };
+            adapter.search(SearchInput {
+                ids: &[0_u64, 1],
+                vectors: &[0.0, 1.0],
+                dim: 1,
+                query: &[1.0],
+                k: 2,
+            })
+        };
+        assert!(run(vec![dh(0, 0.1)]).is_err());
+        assert!(run(vec![dh(0, 0.1), dh(1, 0.2)]).is_err());
+        assert!(run(vec![dh(1, 0.2)]).is_ok());
     }
 
     /// Issue #1991: HYBRID 密側アダプタは NaN 行を除き、`1 - d` のスコア降順・同点は id 昇順で返す。

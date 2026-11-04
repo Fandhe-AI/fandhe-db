@@ -473,6 +473,23 @@ pub(crate) fn resolve_slot_hits(
     Some(out)
 }
 
+/// 密側検証用の id 多重集合を作る（Issue #2043）。`dense` が `Some` のとき、provider へ実際に渡した
+/// 候補（NULL 行を除いたスロット列）だけを許可し、範囲外（NULL 行など）の id の返却を fail-closed に
+/// 拒否できるようにする。`None` のときは `all_ids`（恒等スロット列）全体の多重集合を返す。
+pub(crate) fn searched_id_counts(all_ids: &[u64], dense: Option<&[u32]>) -> HashMap<u64, usize> {
+    match dense {
+        None => visible_id_counts(all_ids),
+        Some(slots) => {
+            let mut counts: HashMap<u64, usize> = HashMap::with_capacity(slots.len());
+            for &s in slots {
+                let entry = counts.entry(u64::from(s)).or_insert(0);
+                *entry = entry.saturating_add(1);
+            }
+            counts
+        }
+    }
+}
+
 pub(crate) fn visible_id_counts(ids: &[u64]) -> HashMap<u64, usize> {
     let mut counts: HashMap<u64, usize> = HashMap::with_capacity(ids.len());
     for id in ids {
@@ -16164,7 +16181,7 @@ impl EngineCore {
         // 一切返さず fail-closed に拒否する（部分的なフィルタリング・並べ替えはしない）。
         //
         // 検証対象はスロット識別子の集合（スロットは重複しないため各件数は 1）。
-        let visible_id_counts = visible_id_counts(&slot_ids);
+        let visible_id_counts = searched_id_counts(&slot_ids, dense.as_deref());
         if !provider_result_is_valid(&hits, k, &visible_id_counts) {
             return Err(CoreError::ProviderResultRejected);
         }

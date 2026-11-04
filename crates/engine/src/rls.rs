@@ -391,6 +391,7 @@ impl PrefilterSnapshot {
         }
 
         let dense = self.arena.dense_slots()?;
+        let searched_counts = crate::core::searched_id_counts(&self.slot_ids, dense.as_deref());
         let hits = crate::core::search_arena_dense(
             provider,
             &self.arena,
@@ -400,7 +401,7 @@ impl PrefilterSnapshot {
             k,
         )?;
 
-        if !provider_result_is_valid(&hits, k, &self.visible_id_counts) {
+        if !provider_result_is_valid(&hits, k, &searched_counts) {
             return Err(RlsError::ProviderResultRejected);
         }
         // 検証済みの候補（識別子はスロット番号）をテナント修飾済みヒットへ解決する
@@ -500,6 +501,7 @@ impl PrefilterSnapshot {
             crate::catalog::table_generation_in_txn(&read_txn, self.arena.table_name());
         // NULL の VECTOR 行を含むスナップショットでは HNSW の索引を使わず、NULL 行を除いた
         // 厳密走査へ倒す（Issue #2043・TABLE-26。索引は NULL 行を含められない）。
+        let mut searched_counts: Option<HashMap<u64, usize>> = None;
         let raw = if self.arena.null_row_count() == 0
             && read_txn_table_generation.ok() == Some(self.built_table_generation)
         {
@@ -517,6 +519,11 @@ impl PrefilterSnapshot {
             .map_err(RlsError::Kernel)?
         } else {
             let dense = self.arena.dense_slots()?;
+            // Issue #2043: 実際に渡した候補（NULL 行を除く）の集合で返却 id を検証する。
+            searched_counts = Some(crate::core::searched_id_counts(
+                &self.slot_ids,
+                dense.as_deref(),
+            ));
             crate::core::search_arena_dense(
                 provider,
                 &self.arena,
@@ -527,7 +534,8 @@ impl PrefilterSnapshot {
             )?
         };
 
-        if !provider_result_is_valid(&raw, k, &self.visible_id_counts) {
+        let counts_ref = searched_counts.as_ref().unwrap_or(&self.visible_id_counts);
+        if !provider_result_is_valid(&raw, k, counts_ref) {
             return Err(RlsError::ProviderResultRejected);
         }
         let hits = crate::core::resolve_slot_hits(&self.arena, &raw)
