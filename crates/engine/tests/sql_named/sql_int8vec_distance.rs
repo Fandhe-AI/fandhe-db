@@ -954,6 +954,29 @@ fn describe_accepts_where_radius_placeholder() {
     .expect_err("real literal");
     assert_eq!(err.wire_code(), "22003");
 }
+/// Issue #2953 PR #2956 指摘: BETWEEN／IN の脱糖で左辺の距離式が複製されても、`$n` 由来の仮値を
+/// すべての複製で置換し、Describe が通る。
+#[test]
+fn describe_accepts_placeholder_in_between_and_in() {
+    let (_g, core) = open("ivd-describe-between-in");
+    ok(
+        &core,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, v INT8VEC(2))",
+    );
+    let describe = |sql: &str| {
+        let session = SessionState::default();
+        let prepared = core.parse_sql_prepared(sql).expect("prepare");
+        core.describe_prepared_in_session(&session, &prepared)
+    };
+    for sql in [
+        "SELECT id FROM t WHERE v <-> $1 BETWEEN 0 AND 5 ORDER BY id LIMIT 3",
+        "SELECT id FROM t WHERE v <-> $1 NOT BETWEEN 0 AND 5 ORDER BY id LIMIT 3",
+        "SELECT id FROM t WHERE v <-> $1 IN (1, 2, 3) ORDER BY id LIMIT 3",
+    ] {
+        describe(sql).unwrap_or_else(|e| panic!("{sql}: {}", e.wire_code()));
+    }
+}
+
 /// Issue #2953 PR #2956 指摘: 実リテラル `'0'` を `$n` の仮値と取り違えて置換しない。`$n` 由来の距離式が
 /// 同じ文にあっても、`'0'` は Describe で `22P02` になる（Execute と同じ契約）。
 #[test]

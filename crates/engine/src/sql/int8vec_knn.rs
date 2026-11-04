@@ -206,18 +206,26 @@ fn placeholder_predicates(
         mask: &[],
         ordinal: 0,
         replace: false,
+        seen: Vec::new(),
     };
     for p in preds {
         counter.pred(p);
     }
-    if counter.ordinal != skip.where_distance_mask.len() {
+    let expanded;
+    let mask: &[bool] = if counter.ordinal == skip.where_distance_mask.len() {
+        &skip.where_distance_mask
+    } else if let Some(m) = expand_mask_over_desugared(&counter.seen, &skip.where_distance_mask) {
+        expanded = m;
+        &expanded
+    } else {
         return preds.to_vec();
-    }
+    };
     let mut walker = PlaceholderWalker {
         schema,
-        mask: &skip.where_distance_mask,
+        mask,
         ordinal: 0,
         replace: true,
+        seen: Vec::new(),
     };
     preds.iter().map(|p| walker.pred(p)).collect()
 }
@@ -228,6 +236,30 @@ struct PlaceholderWalker<'a> {
     mask: &'a [bool],
     ordinal: usize,
     replace: bool,
+    /// 走査で出会った距離式（出現順）。脱糖で複製された式の対応づけ用。
+    seen: Vec<Expr>,
+}
+
+/// BETWEEN／IN の脱糖で左辺の距離式が隣接して複製され、AST 上の距離式数がトークン上の距離演算子数
+/// （`mask.len()`）を超える場合に、トークン単位の印を AST の距離式の出現順へ展開する（PR #2956 指摘）。
+/// 隣接して構造が等しい距離式を 1 つの塊とみなし、塊数がトークン数と一致するときだけ、各塊の全複製へ
+/// 同じ印を引き継ぐ。一致しない・曖昧な形は `None`（fail-closed。何も置換しない）。
+fn expand_mask_over_desugared(seen: &[Expr], mask: &[bool]) -> Option<Vec<bool>> {
+    if seen.len() <= mask.len() {
+        return None;
+    }
+    let mut out: Vec<bool> = Vec::with_capacity(seen.len());
+    let mut group: usize = 0;
+    for (i, e) in seen.iter().enumerate() {
+        let same_as_prev = i > 0 && seen.get(i - 1) == Some(e);
+        if same_as_prev {
+            out.push(*out.last()?);
+        } else {
+            out.push(*mask.get(group)?);
+            group = group.checked_add(1)?;
+        }
+    }
+    (group == mask.len()).then_some(out)
 }
 
 impl PlaceholderWalker<'_> {
@@ -248,6 +280,9 @@ impl PlaceholderWalker<'_> {
     fn expr(&mut self, expr: &Expr) -> Expr {
         if let Expr::VectorDistance { kind, lhs, rhs } = expr {
             let flagged = self.mask.get(self.ordinal).copied().unwrap_or(false);
+            if !self.replace {
+                self.seen.push(expr.clone());
+            }
             self.ordinal = self.ordinal.saturating_add(1);
             if self.replace && flagged {
                 let operands = match (lhs.as_ref(), rhs.as_ref()) {
