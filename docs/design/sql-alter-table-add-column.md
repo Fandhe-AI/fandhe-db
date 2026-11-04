@@ -279,8 +279,8 @@ NULL 許容 VECTOR 列の導入に合わせ、`ALTER TABLE ... ADD COLUMN v VECT
 列は nullable として追加し、既存行の embedding スロットは空（`dim == 0`）のまま NULL として読む
 （カタログだけを書き換える O(1) の操作）。`NOT NULL` 付きは `DEFAULT` を持てないため既存の
 `NOT NULL` ADD COLUMN と同じ規則で `42601`、表が既に VECTOR 列を持つ場合（2 本目）は TABLE-1 の
-既存エラー（`42601`）のまま。NULL 行を含む表の kNN は #2043 までの過渡措置として `0A000` で
-拒否する（「保留した理由」の安全性懸念は、この過渡措置と #2043 の除外で解消する）。
+既存エラー（`42601`）のまま。NULL 行を含む表の kNN・hybrid は Issue #2043 で NULL 行を密側の候補から除外する実装になり、
+過渡措置の `0A000` は撤去した（「保留した理由」の安全性懸念は #2043 の除外で解消した）。
 
 ## Issue #1633 追記（TABLE-36）: IF NOT EXISTS
 
