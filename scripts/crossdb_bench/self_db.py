@@ -600,7 +600,7 @@ def _run_phases(
             return _exec_ids(conn_a, sql)
 
         # `<#>` と `USING MODE 'precision'` の併用は engine が `0A000` で拒否する
-        # （確信度を cosine 類似度で判定する設計）ため、このフェーズだけ `<#>`
+        # （確信度を cosine 類似度で判定する設計）ため、このフェーズだけ `<=>`
         # （コサイン距離）のまま残す。他 DB はすべて precision を unsupported とする
         # self 専用フェーズで、DB 間比較・recall 評価の対象外。
         def mode_precision_query(qv):
