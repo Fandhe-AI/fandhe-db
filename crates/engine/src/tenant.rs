@@ -4888,6 +4888,7 @@ fn validate_set_assignments(
                 | crate::catalog::ColumnType::Jsonb
                 | crate::catalog::ColumnType::Enum(_)
                 | crate::catalog::ColumnType::Numeric { .. }
+                | crate::catalog::ColumnType::HalfVec(_)
                 | crate::catalog::ColumnType::Uuid,
                 crate::row_codec::Value::Null,
             ) if column.nullable => {}

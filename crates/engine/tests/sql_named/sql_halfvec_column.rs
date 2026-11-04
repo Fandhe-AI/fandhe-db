@@ -403,3 +403,50 @@ fn tenant_boundary_is_unchanged() {
         vec![(2, Some(vec![3.0, 4.0]))]
     );
 }
+
+/// nullable HALFVEC 列への `SET v = NULL`（UPDATE／UPSERT）は成功し、NOT NULL 列では 23502 で拒否される。
+#[test]
+fn set_null_on_nullable_halfvec_column() {
+    let (_p, _g, core) = open("hv-setnull");
+    ok(
+        &core,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, v HALFVEC(2))",
+    );
+    ok(&core, "INSERT INTO t (id, v) VALUES (1, '[1,2]')");
+    ok(&core, "UPDATE t SET v = NULL WHERE id = 1");
+    assert_eq!(
+        rows(&core, "SELECT id, v FROM t WHERE id = 1"),
+        vec![(1, None)]
+    );
+    ok(&core, "UPDATE t SET v = '[5,6]' WHERE id = 1");
+    ok(
+        &core,
+        "INSERT INTO t (id, v) VALUES (1, '[9,9]') ON CONFLICT (id) DO UPDATE SET v = NULL",
+    );
+    assert_eq!(
+        rows(&core, "SELECT id, v FROM t WHERE id = 1"),
+        vec![(1, None)]
+    );
+    ok(
+        &core,
+        "CREATE TABLE n (id BIGINT PRIMARY KEY, r HALFVEC(2) NOT NULL)",
+    );
+    ok(&core, "INSERT INTO n (id, r) VALUES (1, '[3,4]')");
+    assert_eq!(code(&core, "UPDATE n SET r = NULL WHERE id = 1"), "23502");
+}
+
+/// HALFVEC 列は行の内容によらず、マテリアライズドビューの出力に使えない（0A000）。
+#[test]
+fn halfvec_is_rejected_in_materialized_view_regardless_of_rows() {
+    let (_p, _g, core) = open("hv-matview");
+    ok(
+        &core,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, h HALFVEC(2))",
+    );
+    let q = "CREATE MATERIALIZED VIEW mv AS SELECT h FROM t";
+    assert_eq!(code(&core, q), "0A000");
+    ok(&core, "INSERT INTO t (id, h) VALUES (1, NULL)");
+    assert_eq!(code(&core, q), "0A000");
+    ok(&core, "UPDATE t SET h = '[1,2]' WHERE id = 1");
+    assert_eq!(code(&core, q), "0A000");
+}
