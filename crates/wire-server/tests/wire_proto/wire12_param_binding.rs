@@ -87,6 +87,16 @@ fn open_storage() -> (Storage, temp_db::CleanupGuard) {
             ],
         ))
         .expect("create table");
+    // Issue #2018（TABLE-49）: INT8VEC(N) 列の text 束縛用（VECTOR 列を持たない表）。
+    storage
+        .create_table(&TableSchema::new(
+            "int8s",
+            vec![
+                ColumnDef::new("h", ColumnType::Int8Vec(2), true),
+                ColumnDef::new("note", ColumnType::Text, true),
+            ],
+        ))
+        .expect("create table");
     // Issue #2014（TABLE-46）: HALFVEC(N) 列の text 束縛用（VECTOR 列を持たない表）。
     storage
         .create_table(&TableSchema::new(
@@ -1220,5 +1230,44 @@ fn halfvec_column_accepts_text_binding_and_maps_errors() {
         "22003",
     );
     let (rows, _) = run_simple(&mut simple, "SELECT id, h FROM halfs LIMIT 10");
+    assert_eq!(rows.len(), 1, "rejected binds must not write rows");
+}
+
+/// INT8VEC(N) 列への `$n` text 束縛（TABLE-49・Issue #2018）: 往復一致と、次元不一致 `22000`・
+/// 範囲外 `22003`・整数でない表記 `22P02` の写像。拒否された束縛は行を書かない。
+#[test]
+fn int8vec_column_accepts_text_binding_and_maps_errors() {
+    let (core, _g) = new_core();
+    let addr = spawn(core);
+    let mut ext = connect(addr, "alice");
+    let mut simple = connect(addr, "alice");
+
+    let sql = "INSERT INTO int8s (id, h) VALUES (1, $1) USING OPERATION_ID $2";
+    let (_, tag) = run_extended(&mut ext, sql, &[], &[Some(b"[-128,127]"), Some(b"i8-op-1")]);
+    assert!(tag.starts_with("INSERT"), "tag: {tag}");
+    let (rows, _) = run_simple(&mut simple, "SELECT id, h FROM int8s LIMIT 10");
+    assert_eq!(rows.len(), 1);
+    let text = String::from_utf8_lossy(rows.first().expect("row")).to_string();
+    assert!(text.contains("[-128,127]"), "row: {text}");
+
+    for (i, (lit, code)) in [
+        (&b"[1,2,3]"[..], "22000"),
+        (&b"[1,128]"[..], "22003"),
+        (&b"[1,1.5]"[..], "22P02"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let op = format!("i8-op-rej-{i}");
+        send_pbes_expect_error(
+            &mut ext,
+            sql,
+            &[],
+            &[],
+            &[Some(lit), Some(op.as_bytes())],
+            code,
+        );
+    }
+    let (rows, _) = run_simple(&mut simple, "SELECT id, h FROM int8s LIMIT 10");
     assert_eq!(rows.len(), 1, "rejected binds must not write rows");
 }

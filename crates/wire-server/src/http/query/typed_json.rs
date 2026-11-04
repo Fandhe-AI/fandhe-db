@@ -58,6 +58,12 @@ pub enum TypedJsonError {
     ArrayTooLarge,
     /// `ENUM` 列の値が語彙外のラベル（`22P02`）。
     InvalidEnumLabel(String),
+    /// `INT8VEC` 列の要素が整数表記でない（`1.0`・`1e2` 等の `JsonNumber::Float`。`22P02`。
+    /// TABLE-49・Issue #2018）。範囲外（`22003`）・次元不一致は engine の束縛に一本化する。
+    InvalidInt8VecText(&'static str),
+    /// `INT8VEC` 列の要素が整数表記だが `i64`／`u64` に収まらない（`22003`。SQL テキスト入力の
+    /// 範囲外分類と一致させる。Issue #2018 レビュー指摘）。
+    Int8VecOutOfRange(&'static str),
 }
 
 impl ClassifiedError for TypedJsonError {
@@ -71,6 +77,8 @@ impl ClassifiedError for TypedJsonError {
             TypedJsonError::JsonTooLarge => ErrorClass::PayloadTooLarge,
             TypedJsonError::ArrayTooLarge => ErrorClass::PayloadTooLarge,
             TypedJsonError::InvalidEnumLabel(_) => ErrorClass::InvalidTextRepresentation,
+            TypedJsonError::InvalidInt8VecText(_) => ErrorClass::InvalidTextRepresentation,
+            TypedJsonError::Int8VecOutOfRange(_) => ErrorClass::NumericOutOfRange,
         }
     }
 
@@ -86,6 +94,8 @@ impl ClassifiedError for TypedJsonError {
                 "ARRAY value exceeds the element count limit".to_string()
             }
             TypedJsonError::InvalidEnumLabel(detail) => detail.clone(),
+            TypedJsonError::InvalidInt8VecText(detail) => detail.to_string(),
+            TypedJsonError::Int8VecOutOfRange(detail) => detail.to_string(),
         }
     }
 }
@@ -104,6 +114,7 @@ impl TypedJsonError {
                 SqlSurfaceError::InvalidTextRepresentation { detail }
             }
             ErrorClass::InvalidInput => SqlSurfaceError::InvalidInput { detail },
+            ErrorClass::NumericOutOfRange => SqlSurfaceError::NumericOutOfRange { detail },
             // `UnsupportedSqlSyntax`（`TypeMismatch`／
             // `InvalidJson`）以外の分類はここには到達しない
             // （[`TypedJsonError::error_class`] の網羅から明らか）が、
@@ -158,6 +169,46 @@ pub fn vector_literal_values(items: &[JsonValue], dim: u32) -> Result<Vec<f32>, 
         let Some(f) = n.as_f32() else {
             return Err(TypedJsonError::LegacyMismatch(
                 "VECTOR column element must be finite",
+            ));
+        };
+        values.push(f);
+    }
+    Ok(values)
+}
+
+/// `INT8VEC(N)` 列向けに JSON 整数配列を `f32` 列へ写す（TABLE-49・Issue #2018）。次元不一致・
+/// 数値でない要素は `LegacyMismatch`（`22000`）、整数表記でない数値（小数点・指数部を含む
+/// `JsonNumber::Float`）は `InvalidInt8VecText`（`22P02`）。i8 の範囲検査は engine の
+/// `bind_int8vec_values`（`22003`）に一本化する。
+pub fn int8vec_literal_values(items: &[JsonValue], dim: u32) -> Result<Vec<f32>, TypedJsonError> {
+    if items.len() != dim as usize {
+        return Err(TypedJsonError::LegacyMismatch(
+            "INT8VEC column length does not match the table dimension",
+        ));
+    }
+    let mut values: Vec<f32> = Vec::with_capacity(items.len());
+    for item in items {
+        let JsonValue::Number(n) = item else {
+            return Err(TypedJsonError::LegacyMismatch(
+                "INT8VEC column element must be a JSON number",
+            ));
+        };
+        if let JsonNumber::Float { text, .. } = n {
+            // 符号に続く数字のみ（小数点・指数部なし）の整数表記は i64/u64 超過のオーバーフロー
+            // （`22003`）。小数点・指数部を含む表記は整数でない（`22P02`）。
+            let digits = text.strip_prefix('-').unwrap_or(text);
+            if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(TypedJsonError::Int8VecOutOfRange(
+                    "INT8VEC element is out of range for int8",
+                ));
+            }
+            return Err(TypedJsonError::InvalidInt8VecText(
+                "INT8VEC column element must be an integer",
+            ));
+        }
+        let Some(f) = n.as_f32() else {
+            return Err(TypedJsonError::LegacyMismatch(
+                "INT8VEC column element must be finite",
             ));
         };
         values.push(f);
@@ -519,6 +570,16 @@ pub fn map_json_to_literal(
                 "HALFVEC column value must be a JSON array of numbers",
             )),
         },
+        // INT8VEC(N) は JSON 整数配列を `InsertLiteral::Vector` として束縛し、範囲外（`22003`）・
+        // 次元の最終検査は engine の `bind_int8vec_values` に一本化する（TABLE-49・Issue #2018）。
+        ColumnType::Int8Vec(dim) => match raw {
+            JsonValue::Array(items) => {
+                Ok(InsertLiteral::Vector(int8vec_literal_values(items, *dim)?))
+            }
+            _ => Err(TypedJsonError::LegacyMismatch(
+                "INT8VEC column value must be a JSON array of integers",
+            )),
+        },
         ColumnType::Array(array_ty) => match raw {
             JsonValue::Array(items) => {
                 Ok(InsertLiteral::String(array_literal_text(items, array_ty)?))
@@ -556,6 +617,32 @@ mod tests {
 
     fn num(json: &str) -> JsonValue {
         parse_json(json).expect("valid json")
+    }
+
+    #[test]
+    fn int8vec_huge_integer_is_out_of_range_and_fraction_is_invalid_text() {
+        for raw in [
+            "[18446744073709551616,1]",
+            "[99999999999999999999,1]",
+            "[-99999999999999999999,1]",
+        ] {
+            let JsonValue::Array(items) = num(raw) else {
+                panic!("array")
+            };
+            let e = int8vec_literal_values(&items, 2).expect_err(raw);
+            assert_eq!(e.error_class(), ErrorClass::NumericOutOfRange, "{raw}");
+        }
+        for raw in ["[1.5,1]", "[1e3,1]"] {
+            let JsonValue::Array(items) = num(raw) else {
+                panic!("array")
+            };
+            let e = int8vec_literal_values(&items, 2).expect_err(raw);
+            assert_eq!(
+                e.error_class(),
+                ErrorClass::InvalidTextRepresentation,
+                "{raw}"
+            );
+        }
     }
 
     #[test]

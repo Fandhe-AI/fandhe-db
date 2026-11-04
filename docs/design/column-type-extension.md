@@ -817,3 +817,12 @@ NoSQL 表層の JSON 束縛（`insert`／`update`／`filter`）の型別対応�
   | L1 | 1.00 | 2.8e-3 | 1.4e-4 |
 
   一致の定義: HALFVEC の Top-k の各行について、f32 参照での距離が `d_k + 2δ` 以下であること。`δ` は要素ごとの f16 丸め誤差の上限（相対 2^-11、サブノーマルで絶対 2^-25）から metric ごとに導く（L2 は `2·√n·ε`、L1 は `2·n·ε`、内積は `n·(2ε+ε²)`、コサインは `2·(√n·ε/最小ノルム + √n·ε/クエリのノルム)`。いずれも実測は上限の内側）。f16 で厳密に表せる値（0.5 刻み）の fixture では、4 metric の関数形・演算子形の距離と Top-k が VECTOR 表とビット一致する。
+
+## Issue #2018 追記: INT8VEC(N) 列（TABLE-49 (1)(3)(4) ポインタ）
+
+- **保存先**: HALFVEC と同じくスカラーペイロードに i8 で保存し、embedding スロットは使わない（容量は次元 × 1 バイト）。要素は −128〜127 の整数。
+- **別 variant**: `ColumnType::Int8Vec(u32)`・`row_codec::Value::Int8Vec(Vec<i8>)`・`ScalarRef::Int8Vec`・`SqlColumnTypeName::Int8Vec`。`Value::Vector` を流用しない理由は HALFVEC と同じ。`ColumnType::is_vector()` は VECTOR 限定のまま、本数制約は `is_vector_family()`（VECTOR・HALFVEC・INT8VEC）で数え、合わせて 0〜1 本。`INT8` は BIGINT の別名のままで、`INT8VEC` は別語。
+- **フレーム**: presence ＋ 次元 `u32` LE ＋ 次元 × 1 バイト。decode は次元の上限と宣言次元の照合・バッファ長を確保前に検証し、不一致・切り詰めを `Invalid` で拒否する。全ビットパターンが有効なため有限性検査は無い。カタログタグは `int8vec`（param は正準 10 進）。`content_hash` の値タグは 21。
+- **入力と SQLSTATE**: テキスト `[i1,i2,...]` は専用パーサ（`parse_int8vec_literal`）で要素単位に判定する。長さ超過 `54000`、括弧欠落・整数でない表記（`1.5`・`1e2`・空要素・`abc`）`22P02`、数字列として正しいが範囲外（桁数過大を含む）`22003`、次元不一致 `22000`、`-0` は 0。NoSQL は JSON 整数配列を `InsertLiteral::Vector` で渡し、小数点・指数部を含む数値は wire-server が `22P02` で拒否、範囲・整数性・次元は engine の `bind_int8vec_values` で再検証する。
+- **投影**: i8 を f32 へ広げた既存の `Cell::Vector` を再利用する（公開 enum `Cell` は増やさない）。f32 の Display が整数値を `1`・`-2` と出すため、テキスト出力は `[1,-2,3]`。結果予算は展開後（次元 × 4）で計上する。wire の型 OID は 25（text）で、バイナリ形式は対象外。
+- **fail-closed（対象外）**: `ALTER TABLE ADD COLUMN`（`0A000`）、`DROP COLUMN`（`42601`）、`ALTER COLUMN TYPE`（`42804`）、PK・UNIQUE・FK・索引・CHECK・DEFAULT、距離演算子・距離関数・CAST（`::int8vec`）・比較・ORDER BY・GROUP BY・DISTINCT・集計・集合演算、COPY、CTAS・マテリアライズドビュー・`INSERT ... SELECT`、`int8vec[]`。距離計算は兄弟 #2019 の担当。CAST・`INT8VEC '[..]'` 型付きリテラルほかは担当 Issue 未定。

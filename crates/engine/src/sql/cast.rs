@@ -290,6 +290,12 @@ impl CastType {
                     detail: "cast to or from type halfvec is not supported".to_string(),
                 })
             }
+            // INT8VEC の CAST（`::int8vec` 等）は担当 Issue 未定まで未対応（fail-closed。Issue #2018）。
+            SqlColumnTypeName::Int8Vec(_) => {
+                return Err(SqlSurfaceError::FeatureNotSupported {
+                    detail: "cast to or from type int8vec is not supported".to_string(),
+                })
+            }
             // BIT(n) の CAST は後続 Issue まで未対応（fail-closed。Issue #2021）。
             SqlColumnTypeName::Bit(_) => {
                 return Err(SqlSurfaceError::FeatureNotSupported {
@@ -546,6 +552,7 @@ pub(crate) fn kind_of_column(ty: &ColumnType) -> Option<CastKind> {
         // BIT(n) の CAST は後続 Issue まで未対応（fail-closed。Issue #2021）。
         ColumnType::Vector(_)
         | ColumnType::HalfVec(_)
+        | ColumnType::Int8Vec(_)
         | ColumnType::Enum(_)
         | ColumnType::Bit(_) => None,
     }
@@ -586,6 +593,7 @@ pub(crate) fn cast_type_of_column(ty: &ColumnType) -> Option<CastType> {
         ColumnType::Array(at) => CastType::Array(Box::new(elem_cast_type(at.elem())?)),
         ColumnType::Vector(_)
         | ColumnType::HalfVec(_)
+        | ColumnType::Int8Vec(_)
         | ColumnType::Enum(_)
         | ColumnType::Bit(_) => return None,
     })

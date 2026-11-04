@@ -322,3 +322,41 @@ fn halfvec_projection_is_rejected_with_0a000() {
     // HALFVEC 列を射影しない COPY TO は従来どおり成功する。
     copy_to(&core, "acme", "COPY hv (lang) TO STDOUT").expect("non-halfvec projection");
 }
+
+/// Issue #2018・TABLE-49: INT8VEC 列を射影する `COPY ... TO` はテーブル形・括弧形とも
+/// fail-closed の 0A000 で拒否する（テキストで `[a,b,...]` を書き出さない）。
+#[test]
+fn int8vec_projection_is_rejected_with_0a000() {
+    let path = unique_db_path("copy-to-int8vec");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "iv",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Int8Vec(2), false),
+                ColumnDef::new("lang", ColumnType::Text, false),
+            ],
+        ))
+        .expect("create table");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_ledger_mode(LedgerMode::CompareOnlyWithoutLedger);
+    let mut session = SessionState::default();
+    core.execute_sql_in_session(
+        &ctx("acme"),
+        &mut session,
+        "INSERT INTO iv (id, embedding, lang) VALUES (1, '[1,-2]', 'ja')",
+    )
+    .expect("insert");
+    for sql in [
+        "COPY iv TO STDOUT",
+        "COPY iv (embedding) TO STDOUT",
+        "COPY (SELECT embedding FROM iv) TO STDOUT",
+        "COPY (SELECT * FROM iv) TO STDOUT",
+    ] {
+        let err = copy_to(&core, "acme", sql).expect_err(sql);
+        assert!(err.starts_with("0A000"), "{sql}: {err}");
+    }
+    // INT8VEC 列を射影しない COPY TO は従来どおり成功する。
+    copy_to(&core, "acme", "COPY iv (lang) TO STDOUT").expect("non-int8vec projection");
+}

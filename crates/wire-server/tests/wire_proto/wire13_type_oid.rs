@@ -594,3 +594,51 @@ fn halfvec_column_is_announced_as_text_oid() {
     read_ready_for_query(&mut stream);
     drop(guard);
 }
+
+/// INT8VEC(N) 列は専用 OID を持たず `text`（OID 25）で公告され、値は `[1,-2]` のテキストで返る
+/// （TABLE-49・Issue #2018）。
+#[test]
+fn int8vec_column_is_announced_as_text_oid() {
+    let guard_path = temp_db::unique_db_path("wire13-int8vec");
+    let guard = temp_db::CleanupGuard(guard_path.clone());
+    let storage = Storage::open(&guard_path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "int8s",
+            vec![ColumnDef::new("h", ColumnType::Int8Vec(2), true)],
+        ))
+        .expect("create table");
+    let ctx =
+        PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+            .expect("valid tenant");
+    let op_id = OperationId::parse("op-wire13-int8vec-1").expect("valid operation_id");
+    engine::tenant::insert_typed_row(
+        &storage,
+        "int8s",
+        &ctx,
+        1,
+        Visibility::Private,
+        &[Value::Int8Vec(vec![1, -2])],
+        &op_id,
+    )
+    .expect("insert int8vec row");
+    let core = Arc::new(EngineCore::from_storage(
+        storage,
+        Box::new(CpuScalarProvider),
+    ));
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, core);
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    send_simple_query(&mut stream, "SELECT id, h FROM int8s LIMIT 10");
+    let columns = read_row_description_with_types(&mut stream);
+    assert_eq!(
+        columns,
+        vec![("id".to_string(), 1700, -1), ("h".to_string(), 25, -1)]
+    );
+    let row = read_data_row(&mut stream);
+    assert_eq!(row.get(1).cloned().flatten().as_deref(), Some("[1,-2]"));
+    let _tag = read_command_complete(&mut stream);
+    read_ready_for_query(&mut stream);
+    drop(guard);
+}

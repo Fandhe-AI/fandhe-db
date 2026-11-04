@@ -12747,28 +12747,28 @@ impl EngineCore {
     /// `COPY ... TO` の射影に HALFVEC 列（または HALFVEC 値を返す式）が含まれる場合に
     /// fail-closed の `0A000` で拒否する（Issue #2014・TABLE-46）。COPY FROM 側の拒否
     /// （`sql::copy` の `bind_copy_record`）と対で、HALFVEC のテキスト出力は未対応のため。
+    ///
+    /// INT8VEC 列（Issue #2018・TABLE-49）も同じ理由で同じ経路で拒否する。
     fn reject_halfvec_copy_projection(
         schema: &crate::catalog::TableSchema,
         bound: &crate::sql::parser::BoundScan,
     ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
         use crate::catalog::ColumnType;
         use crate::sql::parser::ProjectedColumn;
-        let hit = bound.projection.iter().any(|p| match p {
-            ProjectedColumn::Column { index, .. } => matches!(
-                schema.columns.get(*index).map(|c| &c.ty),
-                Some(ColumnType::HalfVec(_))
-            ),
-            ProjectedColumn::Computed { result_ty, .. } => {
-                matches!(result_ty, Some(ColumnType::HalfVec(_)))
+        let rejected = |ty: Option<&ColumnType>| match ty {
+            Some(ColumnType::HalfVec(_)) => Some("COPY does not support HALFVEC columns"),
+            Some(ColumnType::Int8Vec(_)) => Some("COPY does not support INT8VEC columns"),
+            _ => None,
+        };
+        let hit = bound.projection.iter().find_map(|p| match p {
+            ProjectedColumn::Column { index, .. } => {
+                rejected(schema.columns.get(*index).map(|c| &c.ty))
             }
-            ProjectedColumn::Id | ProjectedColumn::AliasedId { .. } => false,
+            ProjectedColumn::Computed { result_ty, .. } => rejected(result_ty.as_ref()),
+            ProjectedColumn::Id | ProjectedColumn::AliasedId { .. } => None,
         });
-        if hit {
-            return Err(
-                crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
-                    "COPY does not support HALFVEC columns",
-                ),
-            );
+        if let Some(message) = hit {
+            return Err(crate::sql::allowlist::SqlSurfaceError::feature_not_supported(message));
         }
         Ok(())
     }
@@ -15406,6 +15406,8 @@ impl EngineCore {
                     crate::row_codec::Value::HalfVec(v) => {
                         5usize.saturating_add(v.len().saturating_mul(2))
                     }
+                    // INT8VEC 値は presence(1) + 次元(4) + 次元 × 1 バイト（Issue #2018）。
+                    crate::row_codec::Value::Int8Vec(v) => 5usize.saturating_add(v.len()),
                     // 配列値（Issue #888）は実際の行コーデック（`row_codec::
                     // scalar_array_entry_len`）が書き込むフレーム込みの全
                     // エンコード長をそのまま使う（presence(1)・flags(1)・

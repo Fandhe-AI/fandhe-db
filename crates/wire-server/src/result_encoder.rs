@@ -911,6 +911,7 @@ fn scalar_type_binary_support(ty: &engine::catalog::ColumnType) -> bool {
         | ColumnType::Timestamp
         // `halfvec` も公告 OID は `text` だが、バイナリ形式（`halfvec_send`）は対象外（Issue #2014）。
         | ColumnType::HalfVec(_)
+        | ColumnType::Int8Vec(_)
         // `bit` のバイナリ形式は対象外（Issue #2021）。
         | ColumnType::Bit(_) => false,
     }
@@ -957,6 +958,7 @@ fn scalar_type_modifier(ty: &engine::catalog::ColumnType) -> Result<i32, EncodeE
         | ColumnType::Vector(_)
         // `HALFVEC` も `VECTOR` と同じく typmod を持たない（text 公告。Issue #2014）。
         | ColumnType::HalfVec(_)
+        | ColumnType::Int8Vec(_)
         | ColumnType::Enum(_)
         | ColumnType::Array(_)
         | ColumnType::Json
@@ -1019,6 +1021,9 @@ fn scalar_wire_type(ty: &engine::catalog::ColumnType) -> WireType {
         // HALFVEC は `VECTOR` と同じく専用 OID を持たず text（OID 25）で公告する
         // （TABLE-46 (5)・Issue #2014）。値は `Cell::Vector`（f32 に広げた `[a,b,...]`）。
         engine::catalog::ColumnType::HalfVec(_) => WireType::Text,
+        // INT8VEC も専用 OID を持たず text（OID 25）で公告する（TABLE-49・Issue #2018）。
+        // 値は `Cell::Vector`（f32 に広げた `[1,-2,3]`）。
+        engine::catalog::ColumnType::Int8Vec(_) => WireType::Text,
         engine::catalog::ColumnType::Boolean => WireType::Bool,
         // SMALLINT は int2（OID 21・typlen 2。TABLE-30・Issue #1561）。値は
         // `Cell::SignedInteger`（text／バイナリとも i16 範囲内）。
