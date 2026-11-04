@@ -416,3 +416,27 @@ JOIN を含む `SELECT` の `EXPLAIN` を受理する（従来は単一表の文
   従来どおり `42601`（SQL-75 (6)）。`$n` を含む `EXPLAIN` 前置の JOIN は非 EXPLAIN と同じく `42601`。
 - **対象外**: 派生表・CTE（`EXPLAIN WITH`）・部分クエリを含む JOIN は従来どおり `42601`（#2048）、集合演算は #2047、
   DML は #2049〜#2051、`EXPLAIN ANALYZE`／オプションは SQL-76。NoSQL 表層は変えない。
+
+## 追記（Issue #2047・SQL-75 (2)）: 集合演算の段
+
+集合演算（`UNION [ALL]`／`INTERSECT`／`EXCEPT`）を含む `SELECT` の `EXPLAIN` を受理する（従来は単一表の文法で
+解析して `UNION` の位置で `42601`）。文は実行せず、演算子・入れ子・各枝の走査分類を段の木で返す。構文段は
+非 EXPLAIN と同じ判定（JOIN の後に `looks_like_set_operation`）と同じパーサー（`parse_set_operation`）で
+`ExplainTarget::SetOperation` にする。先頭が括弧の形（`EXPLAIN (SELECT ...) UNION ...`）も受理する。
+束縛は `sql::set_op::prepare`（全体 `LIMIT`／`OFFSET` の範囲 → 全枝の束縛と型整合。行を読まない）を実行と
+共有するため、束縛エラーの `wire_code` と判定順は非 EXPLAIN と一致する。
+
+- **段の重ね方（外側から。該当しない段は出さない）**: 全体 `limit`（`LIMIT`／`OFFSET` があるときだけ）→
+  `set_operation`（入れ子は演算子の優先順位と括弧どおり。子は左、右の順）→ 葉。葉は、通常の枝が `scan`、
+  括弧付きの枝が `limit` → `sort` → `scan`、集計の枝が `limit` → `sort` → `aggregate` → `scan`。
+- **語彙（JOIN と同じ閉じた集合・安定契約）**: `set_operation` の属性は `set_operator: union|union_all|intersect|except`。
+  `scan` は `relation: <n>`（葉の左からの 1 始まりの序数）に続けて `scalar_plan:`／`access_path:`
+  （`scan_explain_lines` を共有。枝ごとに PK 点検索 → GIN → 全走査）。ほかは JOIN の段と同じ意味。
+- **集計の枝の走査分類**: 実行器は可視ビットマップのキャッシュ・arena・スカラー索引を渡さない（常に全走査）ため、
+  `plain_scan`／`full_scan` に固定する。実行器の隣（`set_op::aggregate_branch_explain_lines`）に置き、
+  実行器へキャッシュや索引を配線するときは一緒に変える（矛盾した出力を出さない）。
+- **出さない値と理由**: 表名・別名、`LIMIT`／`OFFSET` の値、行数・可視件数・カーディナリティ・予算（SQL-75 (5)）。
+- **エラー写像**: 木の上限超過は `54001`（固定文）、契約違反は `Internal`。セッションの無い入口は従来どおり
+  `42601`（SQL-75 (6)）。`$n` を含む `EXPLAIN` 前置の集合演算は `42601`（後続での受理に譲る）。
+- **対象外**: 派生表・CTE・部分クエリは従来どおり `42601`（#2048）、DML は #2049〜#2051、`EXPLAIN ANALYZE`／
+  オプションは SQL-76。NoSQL 表層は変えない。

@@ -33,6 +33,17 @@ pub(crate) const MAX_EXPLAIN_TREE_LINES: usize = 8192;
 
 const _: () = assert!(MAX_EXPLAIN_TREE_DEPTH >= 8 + 4 + 4 + 4 + 4);
 
+/// 有無を表す固定トークン（`present`／`none`）。`limit`・`offset`・`having`・`join_filter` 等の
+/// 段の属性行が値（リテラル・件数）を出さずに有無だけを示すために、JOIN（#2046）と集合演算
+/// （#2047）で共有する（SQL-75 (5)）。
+pub(crate) fn present(b: bool) -> &'static str {
+    if b {
+        "present"
+    } else {
+        "none"
+    }
+}
+
 /// 木の構築が上限・形式に反したときのエラー。メッセージは固定文で入力の値を含めない。
 /// `wire_code` への写像は呼び出し元（#2046〜#2048）が決める。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

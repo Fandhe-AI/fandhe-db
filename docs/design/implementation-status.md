@@ -1692,3 +1692,5 @@ main に無く現行の `parse_order_by` は `<=>` のみ受理するため、�
 **Issue #2045（feat(engine): EXPLAIN の出力をノードツリー表現へ拡張する。親 #2044・SQL-75 (2) ポインタ。詳細は [explain-search-engine-exposure.md](explain-search-engine-exposure.md) の #2045 追記）**: `sql::explain_tree::ExplainNode`（見出し・属性行・子の節、字下げ描画、深さ/節/行の上限と fail-closed エラー）を追加し、単一表の EXPLAIN 3 経路をルート 1 節の木で組み立て直した。出力はバイト不変で既存テストは無変更で通る。許可リスト拡張と各段の中身は #2046〜#2048、NoSQL 表層は対象外。
 
 **Issue #2046（feat(engine): EXPLAIN で JOIN を表示する。親 #2044・SQL-75 (2) ポインタ。詳細は [explain-search-engine-exposure.md](explain-search-engine-exposure.md) の #2046 追記）**: JOIN を含む `SELECT` の `EXPLAIN` を受理し、結合方式（hash／nested_loop／cross）・結合種別（簡約後）・順（left-deep の入れ子）・各入力の走査分類を段の木で返す。束縛は `prepare_join` を共有し行を読まない。結合方式の判定は `StepPlan::method` に一本化して実行器と共有。対象外は派生表・CTE・部分クエリ（#2048）、集合演算（#2047）、DML、`EXPLAIN ANALYZE`。
+
+**Issue #2047（feat(engine): EXPLAIN で集合演算を表示する。親 #2044・SQL-75 (2) ポインタ。詳細は [explain-search-engine-exposure.md](explain-search-engine-exposure.md) の #2047 追記）**: 集合演算を含む `SELECT` の `EXPLAIN` を受理し、演算子・入れ子（優先順位と括弧）・各枝の走査分類・全体／枝内の並べ替えと件数制限を段の木で返す。束縛は `set_op::prepare` を実行と共有し行を読まない。集計の枝は実行器と同じ全走査に固定。`$n` 付きは `42601`（後続）。対象外は CTE・部分クエリ（#2048）、DML、`EXPLAIN ANALYZE`。

@@ -4332,17 +4332,23 @@ pub enum ExplainTarget {
     /// `NATURAL`・集計形。Issue #2046・SQL-75 (2) ポインタ）。結合の方式・順・各入力を段の木で
     /// 報告し、走査は行わない。
     Join(ValidatedJoin),
+    /// 集合演算（`UNION [ALL]`／`INTERSECT`／`EXCEPT`・括弧・全体 `LIMIT`／`OFFSET`。
+    /// Issue #2047・SQL-75 (2) ポインタ）。演算子・入れ子・各枝の走査分類を段の木で報告し、
+    /// 走査は行わない。構文は非 EXPLAIN と同じ [`parse_set_operation`] で受理する。
+    SetOperation(ValidatedSetOperation),
 }
 
 impl ExplainTarget {
     /// FROM に指定され、カタログ存在確認を通過したテーブル名。`Join` は FROM 先頭の relation の
     /// 表名（複数表の一覧が要る呼び出し元は `sql::join::collect_join_tables` を使う）。
+    /// `SetOperation` は左端の枝の表名（全枝の一覧は `sql::set_op::collect_branch_tables`）。
     pub fn table_name(&self) -> &str {
         match self {
             ExplainTarget::Search(v) => v.table_name(),
             ExplainTarget::Aggregate(v) => v.table_name(),
             ExplainTarget::Scan(v) => v.table_name(),
             ExplainTarget::Join(v) => v.relations.first().map_or("", |r| r.table()),
+            ExplainTarget::SetOperation(v) => crate::sql::set_op::leftmost_table(&v.tree),
         }
     }
 }
@@ -22947,6 +22953,18 @@ fn check_join_relations_are_tables(
         .iter()
         .try_for_each(|r| check_join_relation_is_table(r, lookup))
 }
+/// 集合演算木の葉に値の部分クエリがあるか（`EXPLAIN` 用の防御。構文上は起きない想定で、
+/// 起きたら単一表の広域取得 `EXPLAIN` と同じく fail-closed で拒否する）。
+fn set_tree_has_value_subqueries(tree: &SetTree) -> bool {
+    match tree {
+        SetTree::Branch(scan) | SetTree::LimitedBranch(scan) => scan.has_value_subqueries(),
+        SetTree::AggregateBranch(_) => false,
+        SetTree::Op { left, right, .. } => {
+            set_tree_has_value_subqueries(left) || set_tree_has_value_subqueries(right)
+        }
+    }
+}
+
 /// 集合演算文かどうかをバックトラックせず先読みだけで判定する（Issue #929・
 /// SQL-29 (c)）。`validate_sql_tokens` の `is_aggregate_select`／
 /// `contains_group_by` による振り分けより前に呼ぶ（これらはトークン列全体を
@@ -28264,6 +28282,24 @@ fn validate_sql_tokens_impl(
         // `get` でスライスする（`.claude/rules/coding-rust.md`）。
         _ if is_explain_statement => {
             let rest = tokens.get(1..).unwrap_or(&[]);
+            // Issue #2047（SQL-75 (2) ポインタ）: 集合演算は非 EXPLAIN 経路と同じ判定順（JOIN の後）
+            // と同じパーサー（`parse_set_operation`）で `ExplainTarget::SetOperation` にする。第 2 の
+            // パーサーを持たないので、派生表・窓・順位付きの枝・`INTERSECT ALL` 等の未対応形は
+            // 非 EXPLAIN と同じ `wire_code` で拒否される。先頭が `(` の形（`EXPLAIN (SELECT ...) UNION ...`）
+            // は `starts_with_select_after_parens` が `(` の並びの後の `SELECT` を要求するので、
+            // SQL-76 の括弧付きオプションとは衝突しない。
+            if !looks_like_join(rest)
+                && starts_with_select_after_parens(rest)
+                && looks_like_set_operation(rest)
+            {
+                let validated = parse_set_operation(rest, lookup)?;
+                if set_tree_has_value_subqueries(&validated.tree) {
+                    return Err(SqlSurfaceError::unsupported(
+                        "EXPLAIN is not supported for queries with value subqueries",
+                    ));
+                }
+                return Ok(Statement::Explain(ExplainTarget::SetOperation(validated)));
+            }
             if !matches!(rest.first(), Some(Token::Keyword(Keyword::Select))) {
                 return Err(SqlSurfaceError::unsupported(
                     "EXPLAIN requires a SELECT statement",
@@ -39546,6 +39582,43 @@ mod tests {
             }
             other => panic!("expected ExplainTarget::Scan, got {other:?}"),
         }
+    }
+
+    /// Issue #2047（SQL-75 (2) ポインタ）: 集合演算の `EXPLAIN` は `ExplainTarget::SetOperation`
+    /// になる（先頭が括弧の形を含む）。集合演算子の無い `EXPLAIN (SELECT ...)` は従来どおり `42601`、
+    /// 未対応の枝形（`INTERSECT ALL`）は非 EXPLAIN と同じ拒否。
+    #[test]
+    fn explain_accepts_set_operation_shapes() {
+        let lookup = catalog_with(&["a", "b"]);
+        for sql in [
+            "EXPLAIN SELECT id FROM a UNION SELECT id FROM b",
+            "EXPLAIN (SELECT id FROM a) UNION ALL SELECT id FROM b",
+            "EXPLAIN SELECT id FROM a EXCEPT SELECT id FROM b LIMIT 3",
+        ] {
+            match validate_sql(sql, &lookup) {
+                Ok(Statement::Explain(target @ ExplainTarget::SetOperation(_))) => {
+                    assert_eq!(target.table_name(), "a", "{sql}");
+                    // 葉の数が合わない入力は段の木の組み立てが fail-closed にする。
+                    if let ExplainTarget::SetOperation(v) = &target {
+                        assert_eq!(
+                            crate::sql::set_op_explain::explain_tree(v, &[], vec![]).unwrap_err(),
+                            crate::sql::explain_tree::ExplainTreeError::InvalidLine
+                        );
+                    }
+                }
+                other => panic!("expected ExplainTarget::SetOperation for {sql}, got {other:?}"),
+            }
+        }
+        let err = validate_sql("EXPLAIN (SELECT id FROM a)", &lookup).expect_err("no operator");
+        assert_eq!(err.wire_code(), "42601");
+        let plain = validate_sql("SELECT id FROM a INTERSECT ALL SELECT id FROM b", &lookup)
+            .expect_err("plain INTERSECT ALL is rejected");
+        let explained = validate_sql(
+            "EXPLAIN SELECT id FROM a INTERSECT ALL SELECT id FROM b",
+            &lookup,
+        )
+        .expect_err("EXPLAIN INTERSECT ALL is rejected");
+        assert_eq!(plain.wire_code(), explained.wire_code());
     }
 
     #[test]

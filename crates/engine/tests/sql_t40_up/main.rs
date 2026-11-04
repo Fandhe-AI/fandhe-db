@@ -156,5 +156,6 @@ mod sql73_where_knn_shortfall;
 mod sql74_radius_search;
 mod sql74_where_distance_compare;
 mod sql75_explain_join;
+mod sql75_explain_set_operation;
 mod sql78_predicate_dml_noneq_between_params;
 mod sql78_where_noneq_between_params;
