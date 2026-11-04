@@ -133,7 +133,12 @@ x86_64 版（`isa/x86_block4.rs`）と同型の構成で、新設サブモジュ
   未満の整数値では丸めが生じず ISA を問わず scalar とビット一致し、Top-k（同点 id 昇順を含む）が
   完全一致する（`tests/isa.rs::l2_top_k_matches_scalar_on_integer_fixture`）。
 - 生成コード検査: `fsub v.4s`・`fmla v.4s` の出現を必須化（`scripts/check_simd_codegen.sh`）。
-- x86 の SIMD 本体は Issue #1982。現状 x86 アームは scalar 委譲（`unsafe` なし）。
+- x86 版（Issue #1982）: `x86_block4::{l2_sq_avx2_fma, l2_sq_block4_avx2_fma, l2_sq_avx512,
+  l2_sq_block4_avx512}`。演算列は NEON 版と同じ（`sub` → `fmadd(d, d, acc)` → 逐次レーン和
+  `lane_sum8`／`lane_sum16` → 共有の端数和）で、4 行版は `&mut f32` 出力引数 4 個（SLP 再パック回避）。
+  `unsafe` はディスパッチ 4 箇所のみ（総数 23 → 27）。生成コード検査は 4 シンボルを必須化し、
+  `vsubps`／`vfmadd*ps` が `%ymm`（AVX-512 は `%zmm`）で出ることを要求する。AVX-512 版は
+  AVX-512F 非搭載環境で実行できず、コンパイル・生成コード検査・AVX2 版との構造対称性で担保する。
 
 ## 3. 生成コード検査で発覚した問題と対処（実装時の主要な設計変更点）
 
