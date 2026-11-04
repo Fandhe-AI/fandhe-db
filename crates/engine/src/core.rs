@@ -10961,6 +10961,7 @@ impl EngineCore {
                     &schema,
                     session.search_mode(),
                     skip_vector_literal_validation,
+                    limits,
                 )? {
                     let bound = crate::sql::parser::bind_scan_with_dummy_flags(
                         &scan,
@@ -11714,6 +11715,7 @@ impl EngineCore {
                     &schema,
                     session.search_mode(),
                     &crate::sql::parser::LiteralSkip::NONE,
+                    &limits,
                 )? {
                     return self.execute_read_statement_with_limits(
                         ctx,
@@ -13454,6 +13456,7 @@ impl EngineCore {
             &schema,
             session.search_mode(),
             &crate::sql::parser::LiteralSkip::NONE,
+            &self.result_limits,
         )? {
             return self.run_relational_explain_scan(&scan, session);
         }

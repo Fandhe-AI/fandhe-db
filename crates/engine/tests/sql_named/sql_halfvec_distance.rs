@@ -577,6 +577,31 @@ fn tenant_boundary_holds_for_distances() {
     assert_eq!(cell_id(&bob[0][0]), 100);
 }
 
+/// (8) 明示 LIMIT + OFFSET が結果行数上限を超える HALFVEC kNN は Execute／Describe とも `54000` で拒否し、
+/// 上限ちょうどは受理する（通常の kNN 束縛と同じ合計上限・fail-closed）。
+#[test]
+fn limit_plus_offset_over_result_row_limit_fails_closed() {
+    let (_g, core) = open("hvd-limit-total");
+    let core = core.with_result_limits(engine::result_limits::ResultLimits::new(10));
+    ok(
+        &core,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, h HALFVEC(2))",
+    );
+    ok(&core, "INSERT INTO t (id, h) VALUES (1, '[1,2]')");
+    let over = "SELECT id FROM t ORDER BY h <=> '[1,2]' LIMIT 10 OFFSET 1";
+    assert_eq!(code(&core, over), "54000");
+    let session = SessionState::default();
+    let prepared = core.parse_sql_prepared(over).expect("prepare");
+    let err = core
+        .describe_prepared_in_session(&session, &prepared)
+        .expect_err("describe must reject");
+    assert_eq!(err.wire_code(), "54000");
+    ok(
+        &core,
+        "SELECT id FROM t ORDER BY h <=> '[1,2]' LIMIT 9 OFFSET 1",
+    );
+}
+
 /// (8) Prepared の Describe と Execute の結果列が一致する（HALFVEC kNN も scan の列メタを返す）。
 #[test]
 fn describe_matches_execute() {

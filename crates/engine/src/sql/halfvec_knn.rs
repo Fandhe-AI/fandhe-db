@@ -28,6 +28,7 @@ use crate::sql::udf_call::Expr;
 ///
 /// `session_mode` は `SET search_mode` の値。文中の `USING MODE` が無く実効モードが `precision` の
 /// 組は、確信度ゲートを scan 経路が持たないため `0A000` で拒否する（Execute／Describe 共通。fail-closed）。
+/// `limits` は明示 `LIMIT` の `LIMIT + OFFSET` 合計上限（`54000`）の検証に使う。
 /// `skip` は Prepared Describe の `$n` 由来ダミー値を比較から外すための印で、実リテラルの投影距離列は
 /// `ORDER BY` と HALFVEC 丸め後のクエリベクトルが一致しない組を `0A000` で拒否する（SQL-33 (7)）。
 pub(crate) fn halfvec_select_as_scan(
@@ -35,6 +36,7 @@ pub(crate) fn halfvec_select_as_scan(
     schema: &TableSchema,
     session_mode: Option<SearchMode>,
     skip: &LiteralSkip,
+    limits: &crate::result_limits::ResultLimits,
 ) -> Result<Option<ValidatedScan>, SqlSurfaceError> {
     if !schema
         .columns
@@ -70,6 +72,12 @@ pub(crate) fn halfvec_select_as_scan(
         return Err(SqlSurfaceError::feature_not_supported(
             "precision mode is not supported on halfvec columns",
         ));
+    }
+    // 変換先の scan 束縛は LIMIT／OFFSET を個別にしか検証しないため、通常の kNN 束縛と同じ
+    // 合計上限（`LIMIT + OFFSET` ≦ `--max-result-rows`）をここで先に適用する（fail-closed）。
+    // 暗黙 LIMIT は scan 経路の行数上限検査が担うので対象外。
+    if !v.limit_implicit {
+        crate::sql::parser::validate_search_limit_offset_with(v.limit(), v.offset(), limits)?;
     }
     if !skip.order_by {
         check_projected_query_matches(v, kind, literal, skip)?;
