@@ -249,3 +249,150 @@ pub(super) fn dot_block4_avx512<const PADDED_TAIL: bool>(
     *out2 = lane_sum16(a2) + super::tail_sum::<16, PADDED_TAIL>(t2, qr);
     *out3 = lane_sum16(a3) + super::tail_sum::<16, PADDED_TAIL>(t3, qr);
 }
+// ---------------------------------------------------------------------------
+// L2 二乗距離カーネル（Issue #1982・SQL-33。ポインタ: `docs/spec/04-behavior/`、
+// 設計: `docs/design/dot-kernel-row-block.md`）
+// ---------------------------------------------------------------------------
+//
+// 呼び出し元は `isa.rs::SimdKernel::l2_sq`／`l2_sq_block4` の `unsafe` ディスパッチ
+// （AVX2+FMA・AVX-512 各 2 箇所）。aarch64 版 `neon_block4::l2_sq_neon` と同じ演算列
+// （`d = 行 - クエリ` → `acc = fma(d, d, acc)` → 逐次レーン和 → 共有の端数和）で、
+// 単一行版と 4 行版のビット同一性を構造で担保する。
+
+/// L2 二乗距離の端数和（`as_chunks` で割り切れない末尾要素の逐次和）。
+///
+/// 単一行版と 4 行版が同一関数を共有し、両者のビット同一性を担保する。`d * d` は
+/// FMA 化せず（Rust は暗黙に融合しない）、`-0.0` 起点の左畳み込み（`iter().sum()`）で
+/// 縮約する。`isa::l2_sq_scalar` の端数と同じ演算なので、空端数でも符号が揃う。
+#[inline(always)]
+fn l2_tail_sum(a_rem: &[f32], b_rem: &[f32]) -> f32 {
+    a_rem
+        .iter()
+        .zip(b_rem.iter())
+        .map(|(x, y)| {
+            let d = x - y;
+            d * d
+        })
+        .sum()
+}
+
+/// AVX2+FMA（256 bit・8 レーン）の単一行 L2 二乗距離本体。
+///
+/// 長さが異なる場合は短い方へ切り詰める（`isa::l2_sq_scalar` と同じ意味論。
+/// `min` で境界を決めるため panic しない）。
+#[target_feature(enable = "avx2,fma")]
+pub(super) fn l2_sq_avx2_fma(a: &[f32], b: &[f32]) -> f32 {
+    let len = a.len().min(b.len());
+    let (ac, at) = a.split_at(len).0.as_chunks::<8>();
+    let (bc, bt) = b.split_at(len).0.as_chunks::<8>();
+
+    let mut acc = _mm256_setzero_ps();
+    for (x, q) in ac.iter().zip(bc) {
+        let d = _mm256_sub_ps(load8(x), load8(q));
+        acc = _mm256_fmadd_ps(d, d, acc);
+    }
+    lane_sum8(acc) + l2_tail_sum(at, bt)
+}
+
+/// AVX2+FMA の 4 行ブロック L2 二乗距離本体。
+///
+/// 呼び出し元が 4 行と `query` の長さがすべて等しいことを保証済みの前提で呼ぶ。
+/// クエリチャンクは 1 回だけロードして 4 本のアキュムレータで共有し、各行の演算列は
+/// [`l2_sq_avx2_fma`] と同一（ビット同一）。結果を `&mut f32` 出力引数にする理由は
+/// [`dot_block4_avx2_fma`] と同じ（SLP による再パック回避）。
+#[target_feature(enable = "avx2,fma")]
+pub(super) fn l2_sq_block4_avx2_fma(
+    rows: [&[f32]; 4],
+    query: &[f32],
+    out0: &mut f32,
+    out1: &mut f32,
+    out2: &mut f32,
+    out3: &mut f32,
+) {
+    let [r0, r1, r2, r3] = rows;
+    let (qc, qr) = query.as_chunks::<8>();
+    let (c0, t0) = r0.as_chunks::<8>();
+    let (c1, t1) = r1.as_chunks::<8>();
+    let (c2, t2) = r2.as_chunks::<8>();
+    let (c3, t3) = r3.as_chunks::<8>();
+
+    let mut a0 = _mm256_setzero_ps();
+    let mut a1 = _mm256_setzero_ps();
+    let mut a2 = _mm256_setzero_ps();
+    let mut a3 = _mm256_setzero_ps();
+
+    for ((((qk, x0), x1), x2), x3) in qc.iter().zip(c0).zip(c1).zip(c2).zip(c3) {
+        let vq = load8(qk);
+        let d0 = _mm256_sub_ps(load8(x0), vq);
+        let d1 = _mm256_sub_ps(load8(x1), vq);
+        let d2 = _mm256_sub_ps(load8(x2), vq);
+        let d3 = _mm256_sub_ps(load8(x3), vq);
+        a0 = _mm256_fmadd_ps(d0, d0, a0);
+        a1 = _mm256_fmadd_ps(d1, d1, a1);
+        a2 = _mm256_fmadd_ps(d2, d2, a2);
+        a3 = _mm256_fmadd_ps(d3, d3, a3);
+    }
+
+    *out0 = lane_sum8(a0) + l2_tail_sum(t0, qr);
+    *out1 = lane_sum8(a1) + l2_tail_sum(t1, qr);
+    *out2 = lane_sum8(a2) + l2_tail_sum(t2, qr);
+    *out3 = lane_sum8(a3) + l2_tail_sum(t3, qr);
+}
+
+/// AVX-512F（512 bit・16 レーン）の単一行 L2 二乗距離本体。構造は
+/// [`l2_sq_avx2_fma`] と同一。実行時検証は AVX-512F 非搭載環境では行えず、
+/// コンパイル・命令検査と AVX2 版との構造対称性で担保する。
+#[target_feature(enable = "avx512f")]
+pub(super) fn l2_sq_avx512(a: &[f32], b: &[f32]) -> f32 {
+    let len = a.len().min(b.len());
+    let (ac, at) = a.split_at(len).0.as_chunks::<16>();
+    let (bc, bt) = b.split_at(len).0.as_chunks::<16>();
+
+    let mut acc = _mm512_setzero_ps();
+    for (x, q) in ac.iter().zip(bc) {
+        let d = _mm512_sub_ps(load16(x), load16(q));
+        acc = _mm512_fmadd_ps(d, d, acc);
+    }
+    lane_sum16(acc) + l2_tail_sum(at, bt)
+}
+
+/// AVX-512F の 4 行ブロック L2 二乗距離本体。構造と前提は
+/// [`l2_sq_block4_avx2_fma`] と同一。
+#[target_feature(enable = "avx512f")]
+pub(super) fn l2_sq_block4_avx512(
+    rows: [&[f32]; 4],
+    query: &[f32],
+    out0: &mut f32,
+    out1: &mut f32,
+    out2: &mut f32,
+    out3: &mut f32,
+) {
+    let [r0, r1, r2, r3] = rows;
+    let (qc, qr) = query.as_chunks::<16>();
+    let (c0, t0) = r0.as_chunks::<16>();
+    let (c1, t1) = r1.as_chunks::<16>();
+    let (c2, t2) = r2.as_chunks::<16>();
+    let (c3, t3) = r3.as_chunks::<16>();
+
+    let mut a0 = _mm512_setzero_ps();
+    let mut a1 = _mm512_setzero_ps();
+    let mut a2 = _mm512_setzero_ps();
+    let mut a3 = _mm512_setzero_ps();
+
+    for ((((qk, x0), x1), x2), x3) in qc.iter().zip(c0).zip(c1).zip(c2).zip(c3) {
+        let vq = load16(qk);
+        let d0 = _mm512_sub_ps(load16(x0), vq);
+        let d1 = _mm512_sub_ps(load16(x1), vq);
+        let d2 = _mm512_sub_ps(load16(x2), vq);
+        let d3 = _mm512_sub_ps(load16(x3), vq);
+        a0 = _mm512_fmadd_ps(d0, d0, a0);
+        a1 = _mm512_fmadd_ps(d1, d1, a1);
+        a2 = _mm512_fmadd_ps(d2, d2, a2);
+        a3 = _mm512_fmadd_ps(d3, d3, a3);
+    }
+
+    *out0 = lane_sum16(a0) + l2_tail_sum(t0, qr);
+    *out1 = lane_sum16(a1) + l2_tail_sum(t1, qr);
+    *out2 = lane_sum16(a2) + l2_tail_sum(t2, qr);
+    *out3 = lane_sum16(a3) + l2_tail_sum(t3, qr);
+}

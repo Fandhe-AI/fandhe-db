@@ -302,6 +302,13 @@ required_segments_for() {
     # （`#[target_feature]` fn のため独立シンボルとして生成される）。
     echo "11l1_avx2_fma"
     echo "9l1_avx512"
+    # Issue #1982（SQL-33）: L2 二乗距離カーネル `isa::x86_block4::l2_sq_avx2_fma`／
+    # `l2_sq_avx512`／`l2_sq_block4_avx2_fma`／`l2_sq_block4_avx512`
+    # （`#[target_feature]` fn のため独立シンボルとして生成される）。
+    echo "14l2_sq_avx2_fma"
+    echo "12l2_sq_avx512"
+    echo "21l2_sq_block4_avx2_fma"
+    echo "19l2_sq_block4_avx512"
     # Issue #2022（TABLE-48）: popcount カーネル（Hamming・Jaccard カウント。
     # いずれも `#[target_feature]` fn のため独立シンボルとして生成される）。
     echo "12hamming_avx2"
@@ -398,6 +405,29 @@ expected_rules_for() {
       "l1_avx512" \
       '^[[:space:]]*(vpandd|vandps)[[:space:]].*%zmm' \
       "f32x16 abs via sign-mask (vpandd/vandps on %zmm) actually emitted"
+    # Issue #1982: L2 二乗距離カーネルが SIMD の差分（vsubps）と FMA（vfmadd*ps）へ
+    # コンパイルされた証跡を要求する（スカラー縮退の検出）。
+    local l2_sym
+    for l2_sym in l2_sq_avx2_fma l2_sq_block4_avx2_fma; do
+      printf '%s\t%s\t%s\n' \
+        "${l2_sym}" \
+        '^[[:space:]]*vsubps[[:space:]].*%ymm' \
+        "f32x8 subtract (vsubps on %ymm) actually emitted (not scalarized)"
+      printf '%s\t%s\t%s\n' \
+        "${l2_sym}" \
+        '^[[:space:]]*vfmadd[0-9]{3}ps[[:space:]].*%ymm' \
+        "f32x8 FMA (vfmadd*ps on %ymm) actually emitted"
+    done
+    for l2_sym in l2_sq_avx512 l2_sq_block4_avx512; do
+      printf '%s\t%s\t%s\n' \
+        "${l2_sym}" \
+        '^[[:space:]]*vsubps[[:space:]].*%zmm' \
+        "f32x16 subtract (vsubps on %zmm) actually emitted (not scalarized)"
+      printf '%s\t%s\t%s\n' \
+        "${l2_sym}" \
+        '^[[:space:]]*vfmadd[0-9]{3}ps[[:space:]].*%zmm' \
+        "f32x16 FMA (vfmadd*ps on %zmm) actually emitted"
+    done
     # Issue #2022: popcount が自動ベクトル化された証跡を要求する。AVX2 はニブル LUT
     # 方式（vpshufb＋vpsadbw、いずれも %ymm）、VPOPCNTDQ は vpopcntq（%zmm）。
     for seg in "hamming_avx2" "jaccard_counts_avx2"; do
@@ -982,6 +1012,87 @@ pub mod isa_probe {
     }
 }
 RUST
+
+  # pass (Issue #1982): `isa/x86_block4.rs::l2_sq_block4_avx2_fma` と同型
+  # （vsubps＋vfmadd*ps が %ymm で出る。非 vacuous 検査の合格側）。
+  cat > "${dir}/fx_pass_l2_avx2.rs" <<'RUST'
+use std::arch::x86_64::*;
+
+pub mod isa_probe {
+    use super::*;
+
+    #[target_feature(enable = "avx2,fma")]
+    #[inline]
+    fn load8(c: &[f32; 8]) -> __m256 {
+        let [c0, c1, c2, c3, c4, c5, c6, c7] = *c;
+        _mm256_set_ps(c7, c6, c5, c4, c3, c2, c1, c0)
+    }
+
+    #[target_feature(enable = "avx2,fma")]
+    pub fn l2_sq_block4_avx2_fma(
+        rows: [&[f32]; 4],
+        query: &[f32],
+        out0: &mut f32,
+        out1: &mut f32,
+        out2: &mut f32,
+        out3: &mut f32,
+    ) {
+        let [r0, r1, r2, r3] = rows;
+        let (qc, qr) = query.as_chunks::<8>();
+        let (c0, t0) = r0.as_chunks::<8>();
+        let (c1, _t1) = r1.as_chunks::<8>();
+        let (c2, _t2) = r2.as_chunks::<8>();
+        let (c3, _t3) = r3.as_chunks::<8>();
+        let mut a0 = _mm256_setzero_ps();
+        let mut a1 = _mm256_setzero_ps();
+        let mut a2 = _mm256_setzero_ps();
+        let mut a3 = _mm256_setzero_ps();
+        for ((((qk, x0), x1), x2), x3) in qc.iter().zip(c0).zip(c1).zip(c2).zip(c3) {
+            let vq = load8(qk);
+            let d0 = _mm256_sub_ps(load8(x0), vq);
+            let d1 = _mm256_sub_ps(load8(x1), vq);
+            let d2 = _mm256_sub_ps(load8(x2), vq);
+            let d3 = _mm256_sub_ps(load8(x3), vq);
+            a0 = _mm256_fmadd_ps(d0, d0, a0);
+            a1 = _mm256_fmadd_ps(d1, d1, a1);
+            a2 = _mm256_fmadd_ps(d2, d2, a2);
+            a3 = _mm256_fmadd_ps(d3, d3, a3);
+        }
+        let tail: f32 = t0.iter().zip(qr).map(|(x, y)| (x - y) * (x - y)).sum();
+        *out0 = _mm_cvtss_f32(_mm256_castps256_ps128(a0)) + tail;
+        *out1 = _mm_cvtss_f32(_mm256_castps256_ps128(a1));
+        *out2 = _mm_cvtss_f32(_mm256_castps256_ps128(a2));
+        *out3 = _mm_cvtss_f32(_mm256_castps256_ps128(a3));
+    }
+}
+RUST
+
+  # fail (Issue #1982): 関数名は `l2_sq_block4_avx2_fma` だが実体は black_box で
+  # 逐次化したスカラー和（%ymm の vsubps／vfmadd を出さない）。L2 の非 vacuous 検査が
+  # 縮退を実際に検出できることを確認する。
+  cat > "${dir}/fx_fail_l2_avx2_scalarized.rs" <<'RUST'
+pub mod isa_probe {
+    #[inline(never)]
+    pub fn l2_sq_block4_avx2_fma(
+        rows: [&[f32]; 4],
+        query: &[f32],
+        out0: &mut f32,
+        out1: &mut f32,
+        out2: &mut f32,
+        out3: &mut f32,
+    ) {
+        let outs = [out0, out1, out2, out3];
+        for (row, out) in rows.iter().zip(outs) {
+            let mut acc = 0.0f32;
+            for (x, y) in row.iter().zip(query.iter()) {
+                let d = x - y;
+                acc = core::hint::black_box(acc + d * d);
+            }
+            *out = acc;
+        }
+    }
+}
+RUST
 }
 
 write_aarch64_fixtures() {
@@ -1516,6 +1627,26 @@ self_test() {
         overall=1
       else
         echo "self-test ok: fail_l1_missing_instruction correctly rejected"
+      fi
+    fi
+
+    asm="$(compile_fixture "${scratch}/pass_l2_avx2" "${scratch}/fx_pass_l2_avx2.rs" "${TARGET}")" || { overall=1; asm=""; }
+    if [ -n "${asm}" ]; then
+      if run_scan "${asm}" x86_64 "isa_probe" "21l2_sq_block4_avx2_fma" >/dev/null; then
+        echo "self-test ok: pass_l2_avx2 (ymm vsubps/vfmadd present)"
+      else
+        echo "self-test FAILED: expected pass_l2_avx2 to pass" >&2
+        overall=1
+      fi
+    fi
+
+    asm="$(compile_fixture "${scratch}/fail_l2_avx2_scalarized" "${scratch}/fx_fail_l2_avx2_scalarized.rs" "${TARGET}")" || { overall=1; asm=""; }
+    if [ -n "${asm}" ]; then
+      if run_scan "${asm}" x86_64 "isa_probe" "21l2_sq_block4_avx2_fma" >/dev/null 2>&1; then
+        echo "self-test FAILED: expected fail_l2_avx2_scalarized to be rejected (no ymm vsubps/vfmadd)" >&2
+        overall=1
+      else
+        echo "self-test ok: fail_l2_avx2_scalarized correctly rejected"
       fi
     fi
 
