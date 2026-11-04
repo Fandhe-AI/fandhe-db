@@ -636,3 +636,62 @@ brute_force／hnsw／hnsw_f16／hnsw_i8 の実測値（全 8〜12 測定点で�
 専有環境での再確認が必要と判断された場合は `make recall-regression
 RECALL_ENGINE=hnsw RECALL_VERBOSE=1`（プレースホルダ閾値）等をオーナー・
 後続 Issue へ申し送る。
+
+## Issue #2001 追記: metric 別 Recall の再計測
+
+親 #1996（HNSW の距離種別対応。INDEX-7・SQL-33 のポインタ）配下の検証 Issue。L2・L1・Cosine・
+負の内積を対象に、`ef` 掃引を metric 別に実測した。
+
+### 測定経路
+
+- `HnswMetric` は `pub(crate)` のため、結合テスト（`tests/hnsw_i8_recall.rs` 等）は内積しか測れない。
+  公開 API を広げず、crate 内 `hnsw::metric_recall_tests` に層 B
+  （`layer_b_metric_ef_sweep_report`。`#[ignore]`・release 専用）を追加した。
+  実行は `make hnsw-metric-recall`（`make ci` には含めない）。
+- フィクスチャは N=10,000・dim=128・クエリ 200・クラスタ 80 の非正規化コーパス（行長 [0.25, 4]）。
+  構築は逐次・seed 固定。真値は f64 brute-force。ゼロノルム行は構造的に含まれない
+  （索引からの除外は #2241 の担当）。
+- 下限アサーションは公開済みのコード定数のみ（F32 は ef=64 で 0.95・ef=256 で 0.99、F16・I8 は
+  同 metric の F32 から 0.15 を引いた値）。spec 由来の閾値は注入しない。
+
+### 実測（release・逐次構築・Recall@10）
+
+| metric | 常駐 | ef=64 | ef=128 | ef=256 |
+| ------ | ---- | ----- | ------ | ------ |
+| L2 | F32 | 1.0000 | 1.0000 | 1.0000 |
+| L1 | F32 | 1.0000 | 1.0000 | 1.0000 |
+| Cosine | F32 | 1.0000 | 1.0000 | 1.0000 |
+| Cosine | F16 | 0.9975 | 0.9975 | 0.9975 |
+| Cosine | I8 | 0.9450 | 0.9450 | 0.9450 |
+| InnerProduct（`<#>` も同一グラフ） | F32 | 1.0000 | 1.0000 | 1.0000 |
+| InnerProduct | F16 | 1.0000 | 1.0000 | 1.0000 |
+| InnerProduct | I8 | 0.9955 | 0.9955 | 0.9955 |
+
+L2・L1 の F16・I8 は `effective_precision` で F32 へ縮退するため表に入れていない
+（縮退は層 A が固定済み）。F16・I8 の値が ef で変わらないのは、量子化誤差が候補生成の
+上限を決めているためで、ef を上げても回復しない。
+
+### 判断
+
+- 全 metric で F32 は ef=64 から 1.00 に達し、層 A の下限に対して余裕が大きい。
+- Cosine の I8 は 0.945 で、同 metric の F32 から 0.15 を引いた下限を満たす。
+  本節では下限の見直しをしない。
+
+### 層 A の追加
+
+- `tests/hybrid_recall.rs` に `hybrid_recall_small_scale_cosine_dense_sql_regression` を追加した。
+  結果は `docs/design/hybrid-recall-regression.md` の同 Issue 追記節に記録した。
+
+### スコープ外・申し送り
+
+- `tests/hnsw_acorn_recall.rs` の `<#>` 化は見送った。索引の opclass は既定で Cosine であり、
+  `<#>` で問い合わせると metric 不一致で厳密全走査に落ちるため（#2920）、ACORN・Subset 経路を通らず
+  回帰保護にならない。#2000（索引 metric のキャッシュキー・EXPLAIN 反映）の後に、
+  Ip opclass の索引を作ったうえで再計測する。
+- `<->`・`<+>` の SQL 実行接続は担当 Issue が無い（#2931 の対象外欄）。接続後に acorn と
+  `RecallEngine` へ metric 軸を足す。
+- `.github/workflows/recall.yml` の matrix には metric 軸を足していない。HYBRID に metric を選ぶ
+  手段が無く、HNSW の密側は内積のままで vacuous になるため。また strict モードでは新しい
+  `*_MIN_*` を足すと environment `recall-gate` の secrets 未登録で fail-closed に赤くなる。
+- 層 B の `recall.yml` を `workflow_dispatch` で通す確認は main マージ後に行う
+  （main 限定・environment 保護のため PR 時点では未検証）。

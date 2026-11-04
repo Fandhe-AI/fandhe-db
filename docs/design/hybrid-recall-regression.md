@@ -538,3 +538,19 @@ SEARCH-2 が前提とする「クエリ展開あり」の測定条件に層 B �
 [`ParallelSearchProvider`]: ../../crates/engine/src/parallel_search.rs
 [`strict_thresholds_required`]: ../../crates/engine/tests/hybrid_recall.rs
 [`resolve_gate_threshold`]: ../../crates/engine/tests/hybrid_recall.rs
+
+## Issue #2001 追記: 密側 metric 別の小規模段
+
+親 #1996（HNSW の距離種別対応）の検証として、小規模段（400 行・60 クエリ）を密側 metric 別に
+固定した。
+
+| 経路 | 密側 metric | hits20 / ceil20 |
+| ---- | ----------- | --------------- |
+| in-memory `hybrid_search`（`hybrid_recall_small_scale_regression`） | 内積 | 182 / 202 |
+| SQL 既定エンジン（`hybrid_recall_small_scale_cosine_dense_sql_regression`） | コサイン | 179 / 202 |
+
+- 後者は `SqlHybridFixture` + `RecallEngine::BruteForce`（400 行は `MIN_INDEXED_ROWS` 未満で
+  索引を構築しない。`builds == 0` も固定）。`total_correct`・`ceil20` は前者と同じ 202。
+- HYBRID に metric を選ぶ手段は無い。SQL の HNSW 経路（`HnswDenseProvider`）の密側は内積のまま
+  （#2931 の記録）で、brute-force 経路のコサインとは非対称。解消後に hnsw 系 matrix の実測を取り直す。
+- 層 B ゲート（`recall.yml`）と閾値は変更していない。
