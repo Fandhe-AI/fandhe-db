@@ -4848,13 +4848,13 @@ pub(crate) fn bind_set_assignments(
                     "column {name:?} expects a vector literal, got a non-vector literal"
                 )))
             }
-            // `VECTOR` 列は `nullable` の値に関わらず常に必須として扱う
-            // （`wire-server::http::query::insert::bind_row` の既存契約と同じ
-            // 判断。Issue #889 レビュー指摘対応・PR #1014）。
+            // 明示 NULL（Issue #2042・TABLE-26 (2)(3)）: nullable な VECTOR 列は `Value::Null`
+            // （書き込み層が空 embedding として保存する）、NOT NULL は `23502`。
+            (ColumnType::Vector(_), InsertLiteral::Null) if column.nullable => {
+                crate::row_codec::Value::Null
+            }
             (ColumnType::Vector(_), InsertLiteral::Null) => {
-                return Err(SqlSurfaceError::invalid_input(format!(
-                    "column {name:?} is a VECTOR column and cannot be set to NULL"
-                )))
+                return Err(SqlSurfaceError::not_null_violation(name.clone()))
             }
             (
                 ColumnType::Text | ColumnType::Varchar(_) | ColumnType::Bpchar(_),
@@ -6653,7 +6653,7 @@ fn bind_upsert_assignments(
                     // `InsertLiteral::Null` は `ON CONFLICT ... DO UPDATE SET col = NULL`
                     // （Issue #1524・SQL-41）から到達する。明示 NULL の確定契約
                     // （TABLE-16）に従い、nullable 列は `Value::Null`、それ以外は
-                    // `23502`（VECTOR 列も現状 non-nullable のためここで `23502`）。
+                    // `23502`（VECTOR 列も同じ規則。Issue #2042）。
                     (_, InsertLiteral::Null) if column.nullable => crate::row_codec::Value::Null,
                     (_, InsertLiteral::Null) => {
                         return Err(SqlSurfaceError::not_null_violation(name.clone()))
@@ -7102,12 +7102,12 @@ pub(crate) enum AggregateInput {
     /// （`row.embedding` が空 = 未設定という [`crate::storage::Row`] の既存契約に
     /// 従う。PR #229 codex-review 指摘対応）。
     VectorColumnPresence,
-    /// `VECTOR` 列の裸の列参照への `sum`（SQL-72 (3)・Issue #2038）。埋め込みは
+    /// `VECTOR` 列の裸の列参照への `sum`・`avg`（SQL-72 (3)・Issue #2038・#2039）。埋め込みは
     /// `RowVector.values` から届くため列の添字は持たない。NULL（`dim == 0`）の行は飛ばし、
     /// 累積は要素ごとに f64、確定時に f32 へ丸める（[`crate::sql::aggregate::Accumulator::VectorSum`]）。
-    /// `avg` 等が同じ入力を再利用できるよう関数名には依存させない。
+    /// `sum`・`avg` が同じ入力を再利用できるよう関数名には依存させない。
     VectorColumn { dim: u32 },
-    /// `ExprType::Vector` に束縛された式への `sum`（SQL-72 (3)・Issue #2038。
+    /// `ExprType::Vector` に束縛された式への `sum`・`avg`（SQL-72 (3)・Issue #2038・#2039。
     /// `sum(vec_div(embedding, 2))` 等）。`program` を行ごとに評価し、NULL は飛ばす。
     VectorExpr {
         source: crate::sql::udf_call::BoundExpr,
@@ -7403,14 +7403,14 @@ impl BoundAggregateItem {
         let udfs = crate::sql::udf_call::UdfRegistry::default();
         let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
         let input = resolve_aggregate_input(func, &arg, schema, &udfs, &mut node_budget)?;
-        // `sum(<VECTOR 列>)` は SQL 表層のみ（SQL-72。NoSQL・JOIN はこの入口を使う）。従来どおり
-        // `42883` で拒否する（Issue #2038）。
+        // `sum`／`avg(<VECTOR>)` は SQL 表層のみ（SQL-72。NoSQL・JOIN はこの入口を使う）。従来どおり
+        // `42883` で拒否する（Issue #2038・#2039）。
         if matches!(
             input,
             AggregateInput::VectorColumn { .. } | AggregateInput::VectorExpr { .. }
         ) {
             return Err(SqlSurfaceError::undefined_function(
-                "SUM cannot be applied to a VECTOR column by this interface",
+                "VECTOR aggregates are not supported by this interface",
             ));
         }
         let name = func.default_alias().to_string();
@@ -8026,8 +8026,9 @@ impl BoundAggregate {
 /// - 上記以外の識別子 → 未知の列（`22000`）
 /// - 複合式（`Expr::Call`・`Expr::Binary`・`Expr::Number`）→
 ///   `sql::udf_call::bind_expr` に委譲し、`Scalar` 型のみ
-///   [`AggregateInput::ScalarExpr`] として受理、`Text`/`Bool`/`Vector` 式の
+///   [`AggregateInput::ScalarExpr`] として受理、`Text`/`Bool` 式の
 ///   `SUM`/`AVG`・`Bool`/`Vector` 式の `MIN`/`MAX` は `42883`（Issue #1349）、
+///   `Vector` 式の `SUM`/`AVG` は要素ごとの集約として受理（SQL-72 (3)・Issue #2038・#2039）、
 ///   その他の非スカラー式は型不整合（`22000`）
 fn resolve_aggregate_input(
     func: crate::sql::allowlist::AggregateFunc,
@@ -8154,9 +8155,9 @@ fn resolve_aggregate_input(
                     (ColumnType::Vector(_), AggregateFunc::Count) => {
                         Ok(AggregateInput::VectorColumnPresence)
                     }
-                    // SQL-72 (3)・Issue #2038: `sum(<VECTOR 列>)` は要素ごとの和（vector）。
-                    // MIN/MAX/AVG は従来どおり下の腕で `42883`。
-                    (ColumnType::Vector(dim), AggregateFunc::Sum) => {
+                    // SQL-72 (3)・Issue #2038・#2039: `sum`／`avg(<VECTOR 列>)` は要素ごとの
+                    // 和・平均（vector）。MIN/MAX は従来どおり下の腕で `42883`。
+                    (ColumnType::Vector(dim), AggregateFunc::Sum | AggregateFunc::Avg) => {
                         Ok(AggregateInput::VectorColumn { dim: *dim })
                     }
                     (ColumnType::Vector(_), _) => {
@@ -8322,8 +8323,9 @@ fn resolve_aggregate_input(
                 // Issue #1349: 列参照と同じ型・同じ関数には同じコードを返す（ERR-2）。
                 // `TEXT`／`BOOLEAN`／`VECTOR` 式への `SUM`／`AVG`、`BOOLEAN`／`VECTOR`
                 // 式への `MIN`／`MAX` は該当シグネチャの関数が無いため `42883`。
-                // SQL-72 (3)・Issue #2038: `VECTOR` 式への `SUM` は要素ごとの和を受理する。
-                ExprType::Vector if func == AggregateFunc::Sum => {
+                // SQL-72 (3)・Issue #2038・#2039: `VECTOR` 式への `SUM`／`AVG` は要素ごとの
+                // 和・平均を受理する（下の腕で `SUM`／`AVG` が残るのは TEXT／BOOLEAN のみ）。
+                ExprType::Vector if matches!(func, AggregateFunc::Sum | AggregateFunc::Avg) => {
                     let program = crate::sql::expr_program::ExprProgram::compile(&bound);
                     Ok(AggregateInput::VectorExpr {
                         source: bound,
@@ -14071,7 +14073,7 @@ mod tests {
     }
 
     /// `SET <col> = NULL`（Issue #1524・SQL-41）: nullable 列は `Value::Null`、
-    /// 非 nullable 列は `23502`、VECTOR 列は現行どおり `22000`（TABLE-26 の対象外）。
+    /// 非 nullable 列（VECTOR を含む）は `23502`、nullable な VECTOR 列は `Value::Null`（Issue #2042）。
     #[test]
     fn binds_update_set_null_by_column_nullability() {
         let bound = bind_update_sql(
@@ -14088,7 +14090,7 @@ mod tests {
             "UPDATE documents SET embedding = NULL WHERE id = 1 USING OPERATION_ID 'op-0001'",
         )
         .unwrap_err();
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "23502");
     }
 
     /// 述語形・分割実行が共有する束縛でも同じ検査が効く（Issue #1524）。
@@ -14896,8 +14898,8 @@ mod tests {
     }
 
     #[test]
-    fn binds_avg_min_max_on_vector_column_as_type_mismatch() {
-        for func in ["AVG", "MIN", "MAX"] {
+    fn binds_min_max_on_vector_column_as_type_mismatch() {
+        for func in ["MIN", "MAX"] {
             let sql = format!("SELECT {func}(embedding) FROM documents");
             let err = bind_aggregate_sql(&sql).unwrap_err();
             assert_eq!(
@@ -14908,7 +14910,7 @@ mod tests {
         }
     }
 
-    /// Issue #2038・SQL-72 (3): `SUM(<VECTOR 列>)` は束縛できる（結果列は `vector(dim)`）。
+    /// Issue #2038・#2039・SQL-72 (3): `SUM`／`AVG(<VECTOR 列・式>)` は束縛できる（結果列は `vector(dim)`）。
     #[test]
     fn binds_sum_on_vector_column_and_expression() {
         let bound = bind_aggregate_sql("SELECT SUM(embedding) FROM documents").unwrap();
@@ -14917,6 +14919,16 @@ mod tests {
             AggregateInput::VectorColumn { .. }
         ));
         let bound = bind_aggregate_sql("SELECT SUM(vec_div(embedding, 2)) FROM documents").unwrap();
+        assert!(matches!(
+            bound.items[0].input,
+            AggregateInput::VectorExpr { .. }
+        ));
+        let bound = bind_aggregate_sql("SELECT AVG(embedding) FROM documents").unwrap();
+        assert!(matches!(
+            bound.items[0].input,
+            AggregateInput::VectorColumn { .. }
+        ));
+        let bound = bind_aggregate_sql("SELECT AVG(vec_div(embedding, 2)) FROM documents").unwrap();
         assert!(matches!(
             bound.items[0].input,
             AggregateInput::VectorExpr { .. }
@@ -14981,9 +14993,9 @@ mod tests {
     }
 
     #[test]
-    fn binds_avg_on_vector_typed_expression_as_type_mismatch() {
+    fn binds_max_on_vector_typed_expression_as_type_mismatch() {
         let err =
-            bind_aggregate_sql("SELECT AVG(vec_div(embedding, 2)) FROM documents").unwrap_err();
+            bind_aggregate_sql("SELECT MAX(vec_div(embedding, 2)) FROM documents").unwrap_err();
         assert_eq!(err.wire_code(), "42883");
     }
 

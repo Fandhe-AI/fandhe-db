@@ -151,8 +151,8 @@ pub enum DdlError {
     Shape(SchemaError),
     /// 識別子として意味を持ちうる形状を満たさない。
     InvalidIdentifier,
-    /// 形状は妥当だが意味的に受理できない要求（未知の型名・`vector` 列への
-    /// `nullable: true`／`dim` 欠落・`DEFAULT` に SQL で表現できない値
+    /// 形状は妥当だが意味的に受理できない要求（未知の型名・`vector` 列の
+    /// `dim` 欠落・`DEFAULT` に SQL で表現できない値
     /// （`bool`／`null`／配列／オブジェクト）・`references.on_delete`／
     /// `on_update` の語彙外の値〔Issue #1148〕等）。
     InvalidRequest,
@@ -304,13 +304,9 @@ fn build_column_tokens(item: &JsonValue) -> Result<Vec<Token>, DdlError> {
     let mut tokens = vec![name_token];
     tokens.extend(type_tokens);
 
-    match nullable {
-        Some(true) if is_vector => return Err(DdlError::InvalidRequest),
-        Some(false) => {
-            tokens.push(Token::Ident("NOT".to_string()));
-            tokens.push(Token::Ident("NULL".to_string()));
-        }
-        _ => {}
+    if nullable == Some(false) {
+        tokens.push(Token::Ident("NOT".to_string()));
+        tokens.push(Token::Ident("NULL".to_string()));
     }
 
     if let Some(default_value) = default {
@@ -609,7 +605,7 @@ pub fn execute_create_table(
 /// 型名（固定語彙。小文字化済み）と型パラメータから、配列でない型の
 /// トークン列を作る（`create_table.columns[*]`・`alter_table.add_column`・
 /// 配列の要素型で共用。Issue #1409）。戻り値の `bool` は `VECTOR` か
-/// （`create_table` で `UNIQUE`／`DEFAULT`／`nullable: true` が使えない）を表す。
+/// （`create_table` で `UNIQUE`／`DEFAULT` が使えない）を表す。
 /// 型と無関係なパラメータの混入は黙って無視せず [`DdlError::InvalidRequest`]
 /// （fail-closed）。`Token::Ident` は固定語彙か [`ident_token`] 経由でのみ作る。
 fn base_type_tokens(

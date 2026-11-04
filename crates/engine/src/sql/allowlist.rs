@@ -3436,6 +3436,29 @@ pub enum Statement {
     },
     /// `SHOW statement_timeout`（SQL-71・Issue #1954）。列名 `statement_timeout` の text 1 行。
     ShowStatementTimeout,
+    /// `SET [SESSION] hnsw.ef_search {TO|=} <n|'<n>'|DEFAULT>`／`RESET hnsw.ef_search`
+    /// （SQL-73・Issue #2030）。値は構文段で 1..=1000 を検証済み（不正値は `22023`）。
+    /// `reset` は `RESET` 由来か。
+    /// **#2030 で追加した破壊的変更（BREAKING CHANGE）**: variant 追加。
+    SetHnswEfSearch {
+        value: HnswEfSearchSetting,
+        reset: bool,
+    },
+    /// `SHOW hnsw.ef_search`（SQL-73・Issue #2030）。列名 `hnsw.ef_search` の text 1 行。
+    /// **#2030 で追加した破壊的変更（BREAKING CHANGE）**: variant 追加。
+    ShowHnswEfSearch,
+    /// `SET [SESSION] hnsw.iterative_scan|hnsw.max_scan_tuples {TO|=} <値|DEFAULT>`／`RESET ...`
+    /// （SQL-73・Issue #2033）。値は構文段で検証済み（不正値は `22023`）。`reset` は `RESET` 由来か。
+    /// **#2033 で追加した破壊的変更（BREAKING CHANGE）**: variant 追加。
+    SetHnswScanSetting {
+        value: HnswScanSetting,
+        reset: bool,
+        /// `SET LOCAL` 由来か（明示トランザクションの終了で SET 前の値へ戻る。`RESET` は常に false）。
+        local: bool,
+    },
+    /// `SHOW hnsw.iterative_scan`／`SHOW hnsw.max_scan_tuples`（SQL-73・Issue #2033）。列名は
+    /// 設定名と同じ text 1 行。**#2033 で追加した破壊的変更（BREAKING CHANGE）**: variant 追加。
+    ShowHnswScanSetting(HnswScanParam),
     /// `CREATE FUNCTION <name>(<param>[, <param>...]) AS <expr>`（TASK-79・SQL-9）。
     /// カタログ照会を必要としない（セッションのみに影響するため FROM テーブルの
     /// 存在確認は行わない）。パラメータ名重複・登録済み名との衝突・列参照の禁止
@@ -4305,15 +4328,27 @@ pub enum ExplainTarget {
     /// 広域取得（ソートなしのフィルタ取得。ビュー展開後の形・`OFFSET` を含む。
     /// Issue #922・SQL-27）。
     Scan(ValidatedScan),
+    /// JOIN（`[INNER|LEFT|RIGHT|FULL [OUTER]] JOIN`・`CROSS JOIN`・カンマ区切り・`USING`・
+    /// `NATURAL`・集計形。Issue #2046・SQL-75 (2) ポインタ）。結合の方式・順・各入力を段の木で
+    /// 報告し、走査は行わない。
+    Join(ValidatedJoin),
+    /// 集合演算（`UNION [ALL]`／`INTERSECT`／`EXCEPT`・括弧・全体 `LIMIT`／`OFFSET`。
+    /// Issue #2047・SQL-75 (2) ポインタ）。演算子・入れ子・各枝の走査分類を段の木で報告し、
+    /// 走査は行わない。構文は非 EXPLAIN と同じ [`parse_set_operation`] で受理する。
+    SetOperation(ValidatedSetOperation),
 }
 
 impl ExplainTarget {
-    /// FROM に指定され、カタログ存在確認を通過したテーブル名。
+    /// FROM に指定され、カタログ存在確認を通過したテーブル名。`Join` は FROM 先頭の relation の
+    /// 表名（複数表の一覧が要る呼び出し元は `sql::join::collect_join_tables` を使う）。
+    /// `SetOperation` は左端の枝の表名（全枝の一覧は `sql::set_op::collect_branch_tables`）。
     pub fn table_name(&self) -> &str {
         match self {
             ExplainTarget::Search(v) => v.table_name(),
             ExplainTarget::Aggregate(v) => v.table_name(),
             ExplainTarget::Scan(v) => v.table_name(),
+            ExplainTarget::Join(v) => v.relations.first().map_or("", |r| r.table()),
+            ExplainTarget::SetOperation(v) => crate::sql::set_op::leftmost_table(&v.tree),
         }
     }
 }
@@ -16276,8 +16311,8 @@ impl<'a> Parser<'a> {
         let unique = constraints.unique;
         let unique_name = constraints.unique_name.clone();
         let column = if let ColumnType::Vector(_) = ty {
-            // `VECTOR` は常に非 nullable。`NOT NULL` の明示指定は冗長だが受理する
-            // （`constraints.not_null` の値に関わらず `nullable = false` のまま）。
+            // `VECTOR` も他の型と同じく、`NOT NULL` を指定しなければ nullable
+            // （Issue #2042・TABLE-26 (1)）。NULL は空 embedding として保存される。
             if constraints.default.is_some() || constraints.time_default.is_some() {
                 return Err(SqlSurfaceError::unsupported(format!(
                     "column {name:?}: VECTOR columns do not support DEFAULT"
@@ -16288,7 +16323,7 @@ impl<'a> Parser<'a> {
                     "column {name:?}: VECTOR columns do not support UNIQUE"
                 )));
             }
-            let mut column = ColumnDef::new(name, ty, false);
+            let mut column = ColumnDef::new(name, ty, !constraints.not_null);
             // 照合は付与だけ行い、型への適用可否は実行段（`sql::ddl`）が `42804` で判定する。
             column.collation = constraints.collation;
             column
@@ -19371,6 +19406,10 @@ pub(crate) fn require_row_query_statement(
         | Statement::ShowRowSecurity
         | Statement::SetStatementTimeout { .. }
         | Statement::ShowStatementTimeout
+        | Statement::SetHnswEfSearch { .. }
+        | Statement::ShowHnswEfSearch
+        | Statement::SetHnswScanSetting { .. }
+        | Statement::ShowHnswScanSetting(_)
         | Statement::CreateFunction { .. } => Err(SqlSurfaceError::unsupported(format!(
             "{what} requires a SELECT query"
         ))),
@@ -19537,7 +19576,7 @@ impl ValidatedCreateIndex {
     }
 
     pub fn is_hnsw(&self) -> bool {
-        matches!(self.method, IndexMethod::Hnsw)
+        matches!(self.method, IndexMethod::Hnsw(_))
     }
 
     /// `USING` の方式。
@@ -19549,6 +19588,15 @@ impl ValidatedCreateIndex {
     pub fn gin_opclass(&self) -> Option<crate::catalog::GinOpClass> {
         match self.method {
             IndexMethod::Gin(opclass) => Some(opclass),
+            _ => None,
+        }
+    }
+
+    /// `USING hnsw` の演算子クラス（`hnsw` 以外は `None`）。省略は `vector_cosine_ops` の別名
+    /// （Issue #2239・INDEX-7・SQL-33 (5)）。実行段は `IndexKind::Hnsw` へそのまま渡す。
+    pub fn hnsw_opclass(&self) -> Option<crate::catalog::VectorOpClass> {
+        match self.method {
+            IndexMethod::Hnsw(opclass) => Some(opclass),
             _ => None,
         }
     }
@@ -19574,8 +19622,8 @@ impl ValidatedCreateIndex {
 pub enum IndexMethod {
     /// 省略時・`USING btree`（スカラー宣言）。
     Btree,
-    /// `USING hnsw`。
-    Hnsw,
+    /// `USING hnsw (<列> [<opclass>])`。省略は `vector_cosine_ops` の別名（Issue #2239・INDEX-7）。
+    Hnsw(crate::catalog::VectorOpClass),
     /// `USING gin`（JSONB 向け。演算子クラスは省略時 `jsonb_ops`。INDEX-8）。
     Gin(crate::catalog::GinOpClass),
 }
@@ -19669,7 +19717,8 @@ pub(crate) fn validate_create_index_tokens(
         p.advance();
         let method = p.expect_ident()?;
         if method.eq_ignore_ascii_case("hnsw") {
-            IndexMethod::Hnsw
+            // 演算子クラスは列リスト解析後に確定する（省略は `vector_cosine_ops` の別名。Issue #2239）。
+            IndexMethod::Hnsw(crate::catalog::VectorOpClass::Cosine)
         } else if method.eq_ignore_ascii_case("gin") {
             // 演算子クラスは列リスト解析後に確定する（既定は `jsonb_ops`）。
             IndexMethod::Gin(crate::catalog::GinOpClass::JsonbOps)
@@ -19685,7 +19734,7 @@ pub(crate) fn validate_create_index_tokens(
     } else {
         IndexMethod::Btree
     };
-    let hnsw = matches!(method, IndexMethod::Hnsw);
+    let hnsw = matches!(method, IndexMethod::Hnsw(_));
     let is_gin = matches!(method, IndexMethod::Gin(_));
     let mut method = method;
     p.expect_punct('(')?;
@@ -19713,6 +19762,25 @@ pub(crate) fn validate_create_index_tokens(
                     }
                 })?;
             method = IndexMethod::Gin(opclass);
+        }
+        // `USING hnsw` の演算子クラス 4 種（Issue #2239・INDEX-7・SQL-33 (5)）。GIN と同じく
+        // 素の列要素の直後の識別子 1 個だけを読む（語順の違いは `42601`）。未知の名前は
+        // fail-closed で `42704`（カタログ非参照のため表・列の存在情報は漏れない）。
+        // `ASC`／`DESC`／`NULLS` は opclass として読まず従来どおり `42601` に落とす。
+        if hnsw
+            && expression.is_none()
+            && collation.is_none()
+            && matches!(p.peek(), Some(Token::Ident(w))
+                if !["ASC", "DESC", "NULLS"].iter().any(|k| w.eq_ignore_ascii_case(k)))
+        {
+            let opclass_name = p.expect_ident()?;
+            let opclass =
+                crate::catalog::VectorOpClass::from_name(&opclass_name).ok_or_else(|| {
+                    SqlSurfaceError::UndefinedObject {
+                        name: truncate_for_error(&opclass_name),
+                    }
+                })?;
+            method = IndexMethod::Hnsw(opclass);
         }
         columns.push(column);
         expressions.push(expression);
@@ -19854,7 +19922,7 @@ fn parse_index_with_options(
         return Ok(None);
     }
     p.advance();
-    if !matches!(method, IndexMethod::Hnsw) {
+    if !matches!(method, IndexMethod::Hnsw(_)) {
         return Err(SqlSurfaceError::FeatureNotSupported {
             detail: "storage parameters are only supported for USING hnsw".to_string(),
         });
@@ -19962,7 +20030,7 @@ fn reject_unimplemented_expression_keys(
         return Ok(());
     }
     match method {
-        IndexMethod::Hnsw => {
+        IndexMethod::Hnsw(_) => {
             return Err(SqlSurfaceError::FeatureNotSupported {
                 detail: "USING hnsw does not support expression indexes".to_string(),
             });
@@ -22885,6 +22953,18 @@ fn check_join_relations_are_tables(
         .iter()
         .try_for_each(|r| check_join_relation_is_table(r, lookup))
 }
+/// 集合演算木の葉に値の部分クエリがあるか（`EXPLAIN` 用の防御。構文上は起きない想定で、
+/// 起きたら単一表の広域取得 `EXPLAIN` と同じく fail-closed で拒否する）。
+fn set_tree_has_value_subqueries(tree: &SetTree) -> bool {
+    match tree {
+        SetTree::Branch(scan) | SetTree::LimitedBranch(scan) => scan.has_value_subqueries(),
+        SetTree::AggregateBranch(_) => false,
+        SetTree::Op { left, right, .. } => {
+            set_tree_has_value_subqueries(left) || set_tree_has_value_subqueries(right)
+        }
+    }
+}
+
 /// 集合演算文かどうかをバックトラックせず先読みだけで判定する（Issue #929・
 /// SQL-29 (c)）。`validate_sql_tokens` の `is_aggregate_select`／
 /// `contains_group_by` による振り分けより前に呼ぶ（これらはトークン列全体を
@@ -24369,6 +24449,256 @@ fn is_reset_statement_timeout(tokens: &[Token]) -> bool {
     p.expect_ident_matching("RESET").is_ok()
         && p.expect_ident_matching("statement_timeout").is_ok()
         && p.expect_end_of_statement().is_ok()
+}
+
+/// `SET hnsw.ef_search` の値（SQL-73・Issue #2030）。`Default` は「セッション上書きなし」
+/// （エンジン構築時の `ef_search` に戻る）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HnswEfSearchSetting {
+    Value(u16),
+    Default,
+}
+
+/// `SET hnsw.ef_search` の受理下限（pgvector と同じ範囲。SQL-73）。
+const HNSW_EF_SEARCH_MIN: u16 = 1;
+/// `SET hnsw.ef_search` の受理上限（pgvector と同じ範囲。SQL-73）。
+const HNSW_EF_SEARCH_MAX: u16 = 1000;
+
+/// 位置 `i` が修飾識別子 `hnsw.ef_search`（字句解析で 1 トークンの `QualifiedIdent` になる）か。
+fn is_hnsw_ef_search_at(tokens: &[Token], i: usize) -> bool {
+    matches!(tokens.get(i), Some(Token::QualifiedIdent { qualifier, name })
+        if qualifier.eq_ignore_ascii_case("hnsw") && name.eq_ignore_ascii_case("ef_search"))
+}
+
+/// 文が `SHOW hnsw.ef_search`（末尾 `;` 可）か。厳密一致のみ真。
+pub(crate) fn is_show_hnsw_ef_search(tokens: &[Token]) -> bool {
+    let mut p = Parser::new(tokens);
+    p.expect_ident_matching("SHOW").is_ok() && is_hnsw_ef_search_at(tokens, 1) && {
+        p.advance();
+        p.expect_end_of_statement().is_ok()
+    }
+}
+
+/// 文が `SET [SESSION|LOCAL] hnsw.ef_search ...` の頭か。`SET LOCAL` も真にして
+/// [`parse_set_hnsw_ef_search`] が `0A000` で拒否する。TimeZone 系の頭判定より前に評価する。
+fn is_set_hnsw_ef_search_head(tokens: &[Token]) -> bool {
+    let modifier_at_1 = matches!(tokens.get(1), Some(Token::Ident(w))
+        if w.eq_ignore_ascii_case("SESSION") || w.eq_ignore_ascii_case("LOCAL"));
+    is_hnsw_ef_search_at(tokens, 1) || (modifier_at_1 && is_hnsw_ef_search_at(tokens, 2))
+}
+
+/// `SET [SESSION] hnsw.ef_search {TO|=} {<整数>|'<整数>'|DEFAULT}`（SQL-73・Issue #2030）。
+/// `SET LOCAL` は `0A000`、範囲外・不正値は `22023`（入力値を応答に含めない）、値の欠落は `42601`。
+fn parse_set_hnsw_ef_search(tokens: &[Token]) -> Result<HnswEfSearchSetting, SqlSurfaceError> {
+    let invalid = || SqlSurfaceError::InvalidParameterValue {
+        detail: "invalid value for parameter \"hnsw.ef_search\"",
+    };
+    let mut p = Parser::new(tokens);
+    p.expect_ident_matching("SET")?;
+    if p.peek_ident_matches("LOCAL") {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "SET LOCAL is not supported".to_string(),
+        });
+    }
+    if p.peek_ident_matches("SESSION") {
+        p.advance();
+    }
+    // 呼び出し元の頭判定で `hnsw.ef_search` の存在は確認済み。ここでは 1 トークン読み進めるだけ。
+    p.advance();
+    if p.peek_ident_matches("TO") {
+        p.advance();
+    } else {
+        p.expect_punct('=')?;
+    }
+    let to_value = |text: &str| -> Result<HnswEfSearchSetting, SqlSurfaceError> {
+        let n: u16 = text.trim().parse().map_err(|_| invalid())?;
+        if !(HNSW_EF_SEARCH_MIN..=HNSW_EF_SEARCH_MAX).contains(&n) {
+            return Err(invalid());
+        }
+        Ok(HnswEfSearchSetting::Value(n))
+    };
+    let value = match p.advance() {
+        Some(Token::Ident(w)) if w.eq_ignore_ascii_case("DEFAULT") => HnswEfSearchSetting::Default,
+        Some(Token::StringLiteral(w)) | Some(Token::Number(w)) => to_value(w)?,
+        Some(_) => return Err(invalid()),
+        None => {
+            return Err(SqlSurfaceError::unsupported(
+                "expected hnsw.ef_search value".to_string(),
+            ))
+        }
+    };
+    p.expect_end_of_statement()?;
+    Ok(value)
+}
+
+/// 文が `RESET hnsw.ef_search`（末尾 `;` 可）か。
+fn is_reset_hnsw_ef_search(tokens: &[Token]) -> bool {
+    let mut p = Parser::new(tokens);
+    p.expect_ident_matching("RESET").is_ok() && is_hnsw_ef_search_at(tokens, 1) && {
+        p.advance();
+        p.expect_end_of_statement().is_ok()
+    }
+}
+
+/// `SET hnsw.iterative_scan` の値（SQL-73・Issue #2033）。`Default` は「セッション上書きなし」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HnswIterativeScanSetting {
+    Value(crate::hnsw::HnswIterativeScan),
+    Default,
+}
+
+/// `SET hnsw.max_scan_tuples` の値（SQL-73・Issue #2033）。`Default` は「セッション上書きなし」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HnswMaxScanTuplesSetting {
+    Value(u32),
+    Default,
+}
+
+/// 反復スキャン系セッション設定の名前（`SHOW`・Describe の対象指定。SQL-73・Issue #2033）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HnswScanParam {
+    IterativeScan,
+    MaxScanTuples,
+}
+
+impl HnswScanParam {
+    /// 設定名（`SHOW` の結果列名）。
+    pub fn name(self) -> &'static str {
+        match self {
+            HnswScanParam::IterativeScan => "hnsw.iterative_scan",
+            HnswScanParam::MaxScanTuples => "hnsw.max_scan_tuples",
+        }
+    }
+}
+
+/// `SET` で受理した反復スキャン系設定の値（SQL-73・Issue #2033）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HnswScanSetting {
+    IterativeScan(HnswIterativeScanSetting),
+    MaxScanTuples(HnswMaxScanTuplesSetting),
+}
+
+/// `SET hnsw.max_scan_tuples` の受理下限（pgvector と同じ範囲。SQL-73）。
+const HNSW_MAX_SCAN_TUPLES_MIN: u32 = 1;
+/// `SET hnsw.max_scan_tuples` の受理上限（pgvector と同じ範囲 = `i32::MAX`。SQL-73）。
+const HNSW_MAX_SCAN_TUPLES_MAX: u32 = 2_147_483_647;
+
+/// 位置 `i` が修飾識別子 `hnsw.iterative_scan`／`hnsw.max_scan_tuples` ならその種別を返す。
+fn hnsw_scan_param_at(tokens: &[Token], i: usize) -> Option<HnswScanParam> {
+    match tokens.get(i) {
+        Some(Token::QualifiedIdent { qualifier, name })
+            if qualifier.eq_ignore_ascii_case("hnsw") =>
+        {
+            if name.eq_ignore_ascii_case("iterative_scan") {
+                Some(HnswScanParam::IterativeScan)
+            } else if name.eq_ignore_ascii_case("max_scan_tuples") {
+                Some(HnswScanParam::MaxScanTuples)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// 文が `SHOW hnsw.iterative_scan`／`SHOW hnsw.max_scan_tuples`（末尾 `;` 可）ならその種別。
+pub(crate) fn show_hnsw_scan_param(tokens: &[Token]) -> Option<HnswScanParam> {
+    let param = hnsw_scan_param_at(tokens, 1)?;
+    let mut p = Parser::new(tokens);
+    p.expect_ident_matching("SHOW").ok()?;
+    p.advance();
+    p.expect_end_of_statement().ok()?;
+    Some(param)
+}
+
+/// 文が `SET [SESSION|LOCAL] hnsw.iterative_scan|hnsw.max_scan_tuples ...` の頭ならその種別。
+/// `SET LOCAL` も真にし、[`parse_set_hnsw_scan`] が LOCAL 指定として受理する。
+fn set_hnsw_scan_head(tokens: &[Token]) -> Option<HnswScanParam> {
+    let modifier_at_1 = matches!(tokens.get(1), Some(Token::Ident(w))
+        if w.eq_ignore_ascii_case("SESSION") || w.eq_ignore_ascii_case("LOCAL"));
+    hnsw_scan_param_at(tokens, 1).or_else(|| {
+        if modifier_at_1 {
+            hnsw_scan_param_at(tokens, 2)
+        } else {
+            None
+        }
+    })
+}
+
+/// `SET [SESSION] hnsw.iterative_scan|hnsw.max_scan_tuples {TO|=} {値|'値'|DEFAULT}`
+/// （SQL-73・Issue #2033）。`SET LOCAL` も受理し、LOCAL 指定かを返す（トランザクション終了時の
+/// 復元は `SessionState` が担う）。範囲外・不正値は `22023`（入力値を応答に含めない）、値の欠落は `42601`。
+fn parse_set_hnsw_scan(
+    tokens: &[Token],
+    param: HnswScanParam,
+) -> Result<(HnswScanSetting, bool), SqlSurfaceError> {
+    let invalid = || SqlSurfaceError::InvalidParameterValue {
+        detail: match param {
+            HnswScanParam::IterativeScan => "invalid value for parameter \"hnsw.iterative_scan\"",
+            HnswScanParam::MaxScanTuples => "invalid value for parameter \"hnsw.max_scan_tuples\"",
+        },
+    };
+    let mut p = Parser::new(tokens);
+    p.expect_ident_matching("SET")?;
+    let local = p.peek_ident_matches("LOCAL");
+    if local || p.peek_ident_matches("SESSION") {
+        p.advance();
+    }
+    // 呼び出し元の頭判定で設定名の存在は確認済み。ここでは 1 トークン読み進めるだけ。
+    p.advance();
+    if p.peek_ident_matches("TO") {
+        p.advance();
+    } else {
+        p.expect_punct('=')?;
+    }
+    let setting = match p.advance() {
+        Some(Token::Ident(w)) if w.eq_ignore_ascii_case("DEFAULT") => match param {
+            HnswScanParam::IterativeScan => {
+                HnswScanSetting::IterativeScan(HnswIterativeScanSetting::Default)
+            }
+            HnswScanParam::MaxScanTuples => {
+                HnswScanSetting::MaxScanTuples(HnswMaxScanTuplesSetting::Default)
+            }
+        },
+        Some(Token::Ident(w)) | Some(Token::StringLiteral(w)) | Some(Token::Number(w)) => {
+            match param {
+                HnswScanParam::IterativeScan => {
+                    let v = match w.trim().to_ascii_lowercase().as_str() {
+                        "off" => crate::hnsw::HnswIterativeScan::Off,
+                        "relaxed_order" => crate::hnsw::HnswIterativeScan::RelaxedOrder,
+                        "strict_order" => crate::hnsw::HnswIterativeScan::StrictOrder,
+                        _ => return Err(invalid()),
+                    };
+                    HnswScanSetting::IterativeScan(HnswIterativeScanSetting::Value(v))
+                }
+                HnswScanParam::MaxScanTuples => {
+                    let n: u32 = w.trim().parse().map_err(|_| invalid())?;
+                    if !(HNSW_MAX_SCAN_TUPLES_MIN..=HNSW_MAX_SCAN_TUPLES_MAX).contains(&n) {
+                        return Err(invalid());
+                    }
+                    HnswScanSetting::MaxScanTuples(HnswMaxScanTuplesSetting::Value(n))
+                }
+            }
+        }
+        Some(_) => return Err(invalid()),
+        None => {
+            return Err(SqlSurfaceError::unsupported(
+                "expected hnsw scan setting value".to_string(),
+            ))
+        }
+    };
+    p.expect_end_of_statement()?;
+    Ok((setting, local))
+}
+
+/// 文が `RESET hnsw.iterative_scan|hnsw.max_scan_tuples`（末尾 `;` 可）ならその種別。
+fn reset_hnsw_scan_param(tokens: &[Token]) -> Option<HnswScanParam> {
+    let param = hnsw_scan_param_at(tokens, 1)?;
+    let mut p = Parser::new(tokens);
+    p.expect_ident_matching("RESET").ok()?;
+    p.advance();
+    p.expect_end_of_statement().ok()?;
+    Some(param)
 }
 
 /// 文が `SHOW row_security`（末尾 `;` 可）か。厳密一致のみ真。
@@ -27864,6 +28194,45 @@ fn validate_sql_tokens_impl(
             value: StatementTimeoutSetting::Default,
             reset: true,
         }),
+        // SQL-73・Issue #2030: `hnsw.ef_search` も TimeZone 系より先に判定する（同じ理由）。
+        _ if is_set_statement && is_set_hnsw_ef_search_head(tokens) => {
+            let value = parse_set_hnsw_ef_search(tokens)?;
+            Ok(Statement::SetHnswEfSearch {
+                value,
+                reset: false,
+            })
+        }
+        _ if is_reset_hnsw_ef_search(tokens) => Ok(Statement::SetHnswEfSearch {
+            value: HnswEfSearchSetting::Default,
+            reset: true,
+        }),
+        // SQL-73・Issue #2033: `hnsw.iterative_scan`／`hnsw.max_scan_tuples` も同じ理由で先に判定する。
+        _ if is_set_statement && set_hnsw_scan_head(tokens).is_some() => {
+            let param = set_hnsw_scan_head(tokens).ok_or(SqlSurfaceError::Internal {
+                detail: "hnsw scan setting head vanished".to_string(),
+            })?;
+            let (value, local) = parse_set_hnsw_scan(tokens, param)?;
+            Ok(Statement::SetHnswScanSetting {
+                value,
+                reset: false,
+                local,
+            })
+        }
+        _ if reset_hnsw_scan_param(tokens).is_some() => {
+            let value = match reset_hnsw_scan_param(tokens) {
+                Some(HnswScanParam::IterativeScan) | None => {
+                    HnswScanSetting::IterativeScan(HnswIterativeScanSetting::Default)
+                }
+                Some(HnswScanParam::MaxScanTuples) => {
+                    HnswScanSetting::MaxScanTuples(HnswMaxScanTuplesSetting::Default)
+                }
+            };
+            Ok(Statement::SetHnswScanSetting {
+                value,
+                reset: true,
+                local: false,
+            })
+        }
         _ if is_set_statement && is_set_search_path_head(tokens) => {
             let value = parse_set_search_path(tokens)?;
             Ok(Statement::SetSearchPath {
@@ -27913,10 +28282,41 @@ fn validate_sql_tokens_impl(
         // `get` でスライスする（`.claude/rules/coding-rust.md`）。
         _ if is_explain_statement => {
             let rest = tokens.get(1..).unwrap_or(&[]);
+            // Issue #2047（SQL-75 (2) ポインタ）: 集合演算は非 EXPLAIN 経路と同じ判定順（JOIN の後）
+            // と同じパーサー（`parse_set_operation`）で `ExplainTarget::SetOperation` にする。第 2 の
+            // パーサーを持たないので、派生表・窓・順位付きの枝・`INTERSECT ALL` 等の未対応形は
+            // 非 EXPLAIN と同じ `wire_code` で拒否される。先頭が `(` の形（`EXPLAIN (SELECT ...) UNION ...`）
+            // は `starts_with_select_after_parens` が `(` の並びの後の `SELECT` を要求するので、
+            // SQL-76 の括弧付きオプションとは衝突しない。
+            if !looks_like_join(rest)
+                && starts_with_select_after_parens(rest)
+                && looks_like_set_operation(rest)
+            {
+                let validated = parse_set_operation(rest, lookup)?;
+                if set_tree_has_value_subqueries(&validated.tree) {
+                    return Err(SqlSurfaceError::unsupported(
+                        "EXPLAIN is not supported for queries with value subqueries",
+                    ));
+                }
+                return Ok(Statement::Explain(ExplainTarget::SetOperation(validated)));
+            }
             if !matches!(rest.first(), Some(Token::Keyword(Keyword::Select))) {
                 return Err(SqlSurfaceError::unsupported(
                     "EXPLAIN requires a SELECT statement",
                 ));
+            }
+            // Issue #2046（SQL-75 (2) ポインタ）: JOIN は非 EXPLAIN 経路と同じ判定
+            // （`looks_like_join` → `parse_join_statement`）で `ExplainTarget::Join` にする。派生表を
+            // 含む形は従来どおり `42601`（#2048 の担当）。JOIN の WHERE の部分クエリは構文段で
+            // 拒否されるため、ここで追加のガードは要らない。
+            if looks_like_join(rest) {
+                if super::derived_table::contains_derived_table(rest) {
+                    return Err(SqlSurfaceError::unsupported(
+                        "EXPLAIN is not supported for queries with derived tables",
+                    ));
+                }
+                let validated = parse_join_statement(rest, lookup)?;
+                return Ok(Statement::Explain(ExplainTarget::Join(validated)));
             }
             // Issue #927・SQL-29 (a)・TASK-213: `EXPLAIN` はサブクエリを許可する
             // 文脈に含めない（`docs/design/sql-subquery.md` 参照。`subquery_ctx`
@@ -27962,6 +28362,10 @@ fn validate_sql_tokens_impl(
                 | Statement::ShowRowSecurity
                 | Statement::SetStatementTimeout { .. }
                 | Statement::ShowStatementTimeout
+                | Statement::SetHnswEfSearch { .. }
+                | Statement::ShowHnswEfSearch
+                | Statement::SetHnswScanSetting { .. }
+                | Statement::ShowHnswScanSetting(_)
                 | Statement::CreateFunction { .. }
                 | Statement::Explain(_)
                 // Issue #929（SQL-29 (c)）: `validate_select_statement` は集合演算
@@ -28285,13 +28689,17 @@ pub fn validate_statement(
         | Statement::SetTimeZone { .. }
         | Statement::SetSearchPath { .. }
         | Statement::SetRowSecurity { .. }
-        | Statement::SetStatementTimeout { .. } => Err(SqlSurfaceError::unsupported(
+        | Statement::SetStatementTimeout { .. }
+        | Statement::SetHnswEfSearch { .. }
+        | Statement::SetHnswScanSetting { .. } => Err(SqlSurfaceError::unsupported(
             "SET is not a query statement (use a session-aware entry point)",
         )),
         Statement::ShowTimeZone
         | Statement::ShowSearchPath
         | Statement::ShowRowSecurity
-        | Statement::ShowStatementTimeout => Err(SqlSurfaceError::unsupported(
+        | Statement::ShowStatementTimeout
+        | Statement::ShowHnswEfSearch
+        | Statement::ShowHnswScanSetting(_) => Err(SqlSurfaceError::unsupported(
             "SHOW is not a query statement (use a session-aware entry point)",
         )),
         Statement::CreateFunction { .. } => Err(SqlSurfaceError::unsupported(
@@ -30650,6 +31058,77 @@ mod tests {
         }
     }
 
+    /// `USING hnsw` の演算子クラス 4 種（Issue #2239・INDEX-7・SQL-33 (5)）: 受理・省略時は
+    /// cosine の別名・未知は `42704`・語順/方式違いは `42601`・既存の未対応組み合わせは `0A000`。
+    #[test]
+    fn create_index_using_hnsw_accepts_opclasses_and_rejects_unsupported_forms() {
+        use super::*;
+        use crate::catalog::VectorOpClass;
+        let parse = |sql: &str| {
+            let tokens = crate::sql::lexer::tokenize(sql).expect("tokenize");
+            validate_create_index_tokens(&tokens)
+        };
+        for (sql, expected) in [
+            ("CREATE INDEX i ON t USING hnsw (a)", VectorOpClass::Cosine),
+            (
+                "CREATE INDEX i ON t USING hnsw (a vector_cosine_ops)",
+                VectorOpClass::Cosine,
+            ),
+            (
+                "CREATE INDEX i ON t USING hnsw (a vector_l2_ops)",
+                VectorOpClass::L2,
+            ),
+            (
+                "CREATE INDEX i ON t USING HNSW (a VECTOR_IP_OPS)",
+                VectorOpClass::Ip,
+            ),
+            (
+                "CREATE INDEX i ON t USING hnsw (a vector_l1_ops) WITH (m = 8)",
+                VectorOpClass::L1,
+            ),
+        ] {
+            let v = parse(sql).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+            assert_eq!(v.hnsw_opclass(), Some(expected), "{sql}");
+            assert!(v.is_hnsw(), "{sql}");
+        }
+        for (sql, code) in [
+            ("CREATE INDEX i ON t USING hnsw (a halfvec_l2_ops)", "42704"),
+            (
+                "CREATE INDEX i ON t USING hnsw (a sparsevec_l2_ops)",
+                "42704",
+            ),
+            ("CREATE INDEX i ON t USING hnsw (a foo)", "42704"),
+            (
+                "CREATE INDEX i ON t USING hnsw (a vector_l2_ops COLLATE \"C\")",
+                "42601",
+            ),
+            (
+                "CREATE INDEX i ON t USING hnsw (a vector_l2_ops vector_l2_ops)",
+                "42601",
+            ),
+            ("CREATE INDEX i ON t USING hnsw (a DESC)", "42601"),
+            ("CREATE INDEX i ON t USING hnsw (a asc)", "42601"),
+            ("CREATE INDEX i ON t USING hnsw (a NULLS FIRST)", "42601"),
+            ("CREATE INDEX i ON t USING btree (a vector_l2_ops)", "42601"),
+            ("CREATE INDEX i ON t (a vector_l2_ops)", "42601"),
+            (
+                "CREATE INDEX i ON t USING hnsw (a vector_l2_ops, b)",
+                "0A000",
+            ),
+            (
+                "CREATE UNIQUE INDEX i ON t USING hnsw (a vector_l2_ops)",
+                "0A000",
+            ),
+        ] {
+            let err = parse(sql).expect_err(sql);
+            assert_eq!(err.wire_code(), code, "{sql}");
+        }
+        assert!(parse("CREATE INDEX i ON t USING btree (a)")
+            .expect("btree")
+            .hnsw_opclass()
+            .is_none());
+    }
+
     /// `USING gin` の構文段（Issue #2206・INDEX-8）: 演算子クラスの解決（省略時 `jsonb_ops`・
     /// 大文字小文字不問）と、未知の演算子クラス `42704`・未対応の組み合わせ `0A000`・
     /// 非 gin 方式の演算子クラス風識別子 `42601`。
@@ -30699,7 +31178,8 @@ mod tests {
                 "42601",
             ),
             ("CREATE INDEX i ON t USING btree (a jsonb_ops)", "42601"),
-            ("CREATE INDEX i ON t USING hnsw (a jsonb_ops)", "42601"),
+            // Issue #2239 以降、hnsw は演算子クラスを読むため未知の名前は `42704`（旧: `42601`）。
+            ("CREATE INDEX i ON t USING hnsw (a jsonb_ops)", "42704"),
             ("CREATE INDEX i ON t (a jsonb_ops)", "42601"),
         ] {
             let err = parse(sql).expect_err(sql);
@@ -39102,6 +39582,43 @@ mod tests {
             }
             other => panic!("expected ExplainTarget::Scan, got {other:?}"),
         }
+    }
+
+    /// Issue #2047（SQL-75 (2) ポインタ）: 集合演算の `EXPLAIN` は `ExplainTarget::SetOperation`
+    /// になる（先頭が括弧の形を含む）。集合演算子の無い `EXPLAIN (SELECT ...)` は従来どおり `42601`、
+    /// 未対応の枝形（`INTERSECT ALL`）は非 EXPLAIN と同じ拒否。
+    #[test]
+    fn explain_accepts_set_operation_shapes() {
+        let lookup = catalog_with(&["a", "b"]);
+        for sql in [
+            "EXPLAIN SELECT id FROM a UNION SELECT id FROM b",
+            "EXPLAIN (SELECT id FROM a) UNION ALL SELECT id FROM b",
+            "EXPLAIN SELECT id FROM a EXCEPT SELECT id FROM b LIMIT 3",
+        ] {
+            match validate_sql(sql, &lookup) {
+                Ok(Statement::Explain(target @ ExplainTarget::SetOperation(_))) => {
+                    assert_eq!(target.table_name(), "a", "{sql}");
+                    // 葉の数が合わない入力は段の木の組み立てが fail-closed にする。
+                    if let ExplainTarget::SetOperation(v) = &target {
+                        assert_eq!(
+                            crate::sql::set_op_explain::explain_tree(v, &[], vec![]).unwrap_err(),
+                            crate::sql::explain_tree::ExplainTreeError::InvalidLine
+                        );
+                    }
+                }
+                other => panic!("expected ExplainTarget::SetOperation for {sql}, got {other:?}"),
+            }
+        }
+        let err = validate_sql("EXPLAIN (SELECT id FROM a)", &lookup).expect_err("no operator");
+        assert_eq!(err.wire_code(), "42601");
+        let plain = validate_sql("SELECT id FROM a INTERSECT ALL SELECT id FROM b", &lookup)
+            .expect_err("plain INTERSECT ALL is rejected");
+        let explained = validate_sql(
+            "EXPLAIN SELECT id FROM a INTERSECT ALL SELECT id FROM b",
+            &lookup,
+        )
+        .expect_err("EXPLAIN INTERSECT ALL is rejected");
+        assert_eq!(plain.wire_code(), explained.wire_code());
     }
 
     #[test]

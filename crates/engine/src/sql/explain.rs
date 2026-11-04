@@ -46,12 +46,17 @@
 //! `pub(crate)` のまま。対象外）。[`ExplainEngine`] は `Self::new` で構築し、
 //! `EXPLAIN` が検索本体を実行しない契約（本ファイル冒頭「責務境界」参照）は
 //! 呼び出し元にも求められる。
+//!
+//! Issue #2045（SQL-75 (2) ポインタ）: 単一表の 3 builder は `sql::explain_tree::ExplainNode`
+//! の「見出しなし・子なしのルート 1 節」として組み立てて描画する（出力はバイト不変）。
+//! 入れ子の字下げ契約と上限は `explain_tree.rs` と設計ドキュメントを参照。
 
 use crate::catalog::VectorOpClass;
 use crate::declarative_filter::MetadataFilter;
 use crate::query_planner::PlannedQuery;
 use crate::search_engine::SearchEngineKind;
 use crate::sql::exec::{Cell, ColumnMeta, QueryResult, ResultRow};
+use crate::sql::explain_tree::ExplainNode;
 use crate::sql::hnsw_cache::AnnPlan;
 use crate::sql::mode::ResolvedMode;
 use crate::sql::scalar_index::{ScalarFallbackReason, TextPredicateUse};
@@ -94,6 +99,14 @@ pub struct ExplainEngine {
     /// `hnsw_params:` 行末尾の `metric=` に出す HNSW 宣言の距離種別（Issue #1978・INDEX-7）。
     /// 既定は `Cosine`。`core.rs` の EXPLAIN 経路が索引カタログの宣言から設定する。
     pub(crate) ann_metric: VectorOpClass,
+    /// `hnsw_params:` 行の `ef_search=` へ出すセッションの `hnsw.ef_search` 上書き値（SQL-73・
+    /// Issue #2030）。`None` は構築時の値。非ハイブリッドの kNN の EXPLAIN にだけ `core.rs` が載せる。
+    pub(crate) ef_search_override: Option<usize>,
+    /// `hnsw_params:` 行末尾の `iterative_scan=`／`max_scan_tuples=` に出す実効値（SQL-73・
+    /// Issue #2033）。`core.rs` が実行側と同じ置き換え（ハイブリッドは既定値、`max_scan_tuples` は
+    /// SQL-46 の走査上限との min）をした値を載せる。既定は組み込みの既定値。
+    pub(crate) iterative_scan: crate::hnsw::HnswIterativeScan,
+    pub(crate) max_scan_tuples: usize,
     /// 問い合わせ対象の `USING hnsw ... WITH (m, ef_construction)` 宣言（SQL-33 (5)、Issue #2029）。
     /// `Some` のとき `hnsw_params:` 行の `m=`／`ef_construction=` は実行時の構築と同じく宣言の値を
     /// 出す（`ef_search=` は provider のまま）。ゲートが `Targeted` のときだけ `core.rs` が設定する。
@@ -116,6 +129,9 @@ impl ExplainEngine {
             scalar_plan,
             scalar_fallback: None,
             ann_metric: VectorOpClass::Cosine,
+            ef_search_override: None,
+            iterative_scan: crate::hnsw::HnswIterativeScan::default(),
+            max_scan_tuples: crate::hnsw::DEFAULT_MAX_SCAN_TUPLES,
             ann_build_options: None,
         }
     }
@@ -134,6 +150,17 @@ impl ExplainEngine {
     /// 外部から `ExplainEngine::new` で組み立てる経路を一致させるための公開口）。
     pub fn with_ann_metric(mut self, metric: VectorOpClass) -> Self {
         self.ann_metric = metric;
+        self
+    }
+
+    /// `hnsw_params:` 行の `ef_search=` に出すセッション上書き値を設定する（SQL-73・Issue #2030）。
+    /// 値はテナントに依存しない設定値で、露出の契約（`explain-search-engine-exposure.md`）に反しない。
+    pub(crate) fn with_effective_search(mut self, s: crate::hnsw::HnswSessionSearch) -> Self {
+        self.ef_search_override = s.ef_search;
+        self.iterative_scan = s.iterative_scan.unwrap_or_default();
+        self.max_scan_tuples = s
+            .max_scan_tuples
+            .unwrap_or(crate::hnsw::DEFAULT_MAX_SCAN_TUPLES);
         self
     }
 
@@ -831,13 +858,15 @@ fn push_engine_tail_rows(
                 .with_ef_construction(options.ef_construction());
         }
         lines.push(format!(
-            "hnsw_params: m={},ef_construction={},ef_search={},resident={},sparse_visited_max={},metric={}",
+            "hnsw_params: m={},ef_construction={},ef_search={},resident={},sparse_visited_max={},metric={},iterative_scan={},max_scan_tuples={}",
             p.m,
             p.ef_construction,
-            p.ef_search,
+            engine.ef_search_override.unwrap_or(p.ef_search),
             params.resident_precision(),
             params.sparse_visited_max(),
-            engine.ann_metric.metric_token()
+            engine.ann_metric.metric_token(),
+            engine.iterative_scan.as_str(),
+            engine.max_scan_tuples
         ));
     }
     let mut ann_line = format!("ann_plan: {}", ann_plan_token(engine.ann_plan));
@@ -932,7 +961,7 @@ pub fn build_explain_result_with_indexes(
     ));
     push_engine_tail_rows(&mut lines, resolved, engine, names);
 
-    lines_to_query_result(lines)
+    ExplainNode::leaf(lines).into_query_result()
 }
 
 /// `EXPLAIN SELECT ...`（`USING PLAN` を伴わない検索 SELECT。`ORDER BY <=>`・
@@ -948,7 +977,7 @@ pub(crate) fn build_search_explain_result(
 ) -> QueryResult {
     let mut lines: Vec<String> = Vec::with_capacity(6);
     push_engine_tail_rows(&mut lines, mode, engine, names);
-    lines_to_query_result(lines)
+    ExplainNode::leaf(lines).into_query_result()
 }
 
 /// `EXPLAIN SELECT <集計>`・`EXPLAIN SELECT ... LIMIT n`（集計・広域取得。
@@ -994,6 +1023,26 @@ pub(crate) fn build_relational_explain_result_with_windows(
     names: &ExplainIndexNames,
     windows: &[ExplainWindowStage],
 ) -> QueryResult {
+    ExplainNode::leaf(relational_explain_lines(
+        scalar_plan,
+        scalar_fallback,
+        access_path,
+        names,
+        windows,
+    ))
+    .into_query_result()
+}
+
+/// [`build_relational_explain_result_with_windows`] の行生成部。JOIN の `EXPLAIN`
+/// （Issue #2046）が各側の `scan` 節へ同じ 2 行（`scalar_plan`・`access_path`）を載せるために
+/// 共有する（第 2 の行生成を持たない）。
+pub(crate) fn relational_explain_lines(
+    scalar_plan: ScalarPlan,
+    scalar_fallback: Option<ScalarFallbackReason>,
+    access_path: AccessPath,
+    names: &ExplainIndexNames,
+    windows: &[ExplainWindowStage],
+) -> Vec<String> {
     let mut scalar_line = format!("scalar_plan: {}", scalar_plan_token(scalar_plan));
     append_index_suffix(&mut scalar_line, names.scalar());
     append_reason_suffix(&mut scalar_line, scalar_fallback);
@@ -1007,7 +1056,7 @@ pub(crate) fn build_relational_explain_result_with_windows(
             w.func, w.partition_keys, w.order_keys
         )
     }));
-    lines_to_query_result(lines)
+    lines
 }
 
 #[cfg(test)]
@@ -1033,6 +1082,9 @@ mod tests {
             scalar_plan: ScalarPlan::PlainScan,
             scalar_fallback: None,
             ann_metric: VectorOpClass::Cosine,
+            ef_search_override: None,
+            iterative_scan: crate::hnsw::HnswIterativeScan::default(),
+            max_scan_tuples: crate::hnsw::DEFAULT_MAX_SCAN_TUPLES,
             ann_build_options: None,
         }
     }
@@ -1147,6 +1199,9 @@ mod tests {
             scalar_plan: ScalarPlan::PlainScan,
             scalar_fallback: None,
             ann_metric: VectorOpClass::Cosine,
+            ef_search_override: None,
+            iterative_scan: crate::hnsw::HnswIterativeScan::default(),
+            max_scan_tuples: crate::hnsw::DEFAULT_MAX_SCAN_TUPLES,
             ann_build_options: None,
         };
 
@@ -1175,6 +1230,9 @@ mod tests {
             scalar_plan: ScalarPlan::PlainScan,
             scalar_fallback: None,
             ann_metric: VectorOpClass::Cosine,
+            ef_search_override: None,
+            iterative_scan: crate::hnsw::HnswIterativeScan::default(),
+            max_scan_tuples: crate::hnsw::DEFAULT_MAX_SCAN_TUPLES,
             ann_build_options: None,
         };
 
@@ -1187,7 +1245,7 @@ mod tests {
         assert_eq!(cell_text(&result, 4), "engine: hnsw");
         assert_eq!(
             cell_text(&result, 5),
-            "hnsw_params: m=16,ef_construction=100,ef_search=64,resident=f32,sparse_visited_max=0,metric=cosine"
+            "hnsw_params: m=16,ef_construction=100,ef_search=64,resident=f32,sparse_visited_max=0,metric=cosine,iterative_scan=strict_order,max_scan_tuples=20000"
         );
         assert_eq!(cell_text(&result, 6), "ann_plan: hnsw_full_visible");
         assert_eq!(cell_text(&result, 7), "scalar_plan: plain_scan");
@@ -1218,6 +1276,9 @@ mod tests {
                 scalar_plan: ScalarPlan::PlainScan,
                 scalar_fallback: None,
                 ann_metric: VectorOpClass::Cosine,
+                ef_search_override: None,
+                iterative_scan: crate::hnsw::HnswIterativeScan::default(),
+                max_scan_tuples: crate::hnsw::DEFAULT_MAX_SCAN_TUPLES,
                 ann_build_options: None,
             };
             let result = build_explain_result(&planned, &engine);
@@ -1295,6 +1356,9 @@ mod tests {
                 scalar_plan: ScalarPlan::PlainScan,
                 scalar_fallback: None,
                 ann_metric: VectorOpClass::Cosine,
+                ef_search_override: None,
+                iterative_scan: crate::hnsw::HnswIterativeScan::default(),
+                max_scan_tuples: crate::hnsw::DEFAULT_MAX_SCAN_TUPLES,
                 ann_build_options: None,
             };
             let result = build_explain_result(&planned, &engine);
@@ -1316,13 +1380,15 @@ mod tests {
             if let Some(SearchEngineKind::Hnsw(params)) = kind {
                 let p = params.get();
                 let expected = format!(
-                    "hnsw_params: m={},ef_construction={},ef_search={},resident={},sparse_visited_max={},metric={}",
+                    "hnsw_params: m={},ef_construction={},ef_search={},resident={},sparse_visited_max={},metric={},iterative_scan={},max_scan_tuples={}",
                     p.m,
                     p.ef_construction,
                     p.ef_search,
                     params.resident_precision(),
                     params.sparse_visited_max(),
-                    "cosine"
+                    "cosine",
+                    "strict_order",
+                    20000
                 );
                 assert!(
                     result
@@ -1396,6 +1462,9 @@ mod tests {
             scalar_plan: ScalarPlan::IndexConjunction,
             scalar_fallback: None,
             ann_metric: VectorOpClass::Cosine,
+            ef_search_override: None,
+            iterative_scan: crate::hnsw::HnswIterativeScan::default(),
+            max_scan_tuples: crate::hnsw::DEFAULT_MAX_SCAN_TUPLES,
             ann_build_options: None,
         };
         let names = ExplainIndexNames::new(

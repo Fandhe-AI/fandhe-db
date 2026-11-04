@@ -122,7 +122,7 @@ pub(crate) fn bind_deferred_null(name: &str, column: &ColumnDef) -> BoundSetExpr
 
 /// `SET col = DEFAULT`（SQL-50・Issue #1746）を列 `column` への代入として束縛する。スキーマ
 /// （列定義）だけを参照し行には触れない。列 DEFAULT があればその定数値、無ければ NULL
-/// （`SET col = NULL` と同じ規則: NOT NULL 列は `23502`、VECTOR 列は `22000`）。
+/// （`SET col = NULL` と同じ規則: NOT NULL 列〔VECTOR 列を含む〕は `23502`。Issue #2042）。
 /// 時刻関数・SEQUENCE・IDENTITY の DEFAULT は評価文脈が無いため `bind_column_default` の
 /// `0A000` をそのまま返す（fail-closed。GENERATED ALWAYS 列もこの拒否になる）。
 pub(crate) fn bind_set_default(
@@ -133,11 +133,6 @@ pub(crate) fn bind_set_default(
     let value = match &column.default_expr {
         Some(default) => crate::sql::parser::bind_column_default(column, default)?,
         None => match &column.ty {
-            ColumnType::Vector(_) => {
-                return Err(SqlSurfaceError::invalid_input(format!(
-                    "column {name:?} is a VECTOR column and cannot be set to NULL"
-                )))
-            }
             _ if column.nullable => Value::Null,
             // NOT NULL 検査後回しの区間（BEFORE UPDATE トリガ対応）では NULL のまま運ぶ。
             _ if defer_not_null_bind(table) => Value::Null,

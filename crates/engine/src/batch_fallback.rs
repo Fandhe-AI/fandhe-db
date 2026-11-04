@@ -411,6 +411,9 @@ impl FallbackBatchEngine {
         )
     }
 
+    /// 入力は NULL の VECTOR 行（空 embedding。Issue #2043・TABLE-26）を含まない密な行列で、
+    /// 呼び出し元が arena の `dense_slots` で gather して渡す契約（NULL 行は行列に表現できない）。
+    ///
     /// [`Self::build`] の metric 指定版（Issue #2003。ポインタ: CORE-6・CORE-16・SQL-33）。
     /// primary 用の f16 常駐行列と CPU 縮退用の f32 行列は、同じ元データから同じ関数で
     /// 正規化する（Cosine）。`backend_factory` が返した backend の [`BatchBackend::metric`]

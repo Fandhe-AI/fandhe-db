@@ -435,17 +435,28 @@ fn column_count_limit_is_rejected_with_54000_and_has_no_side_effect() {
 }
 
 #[test]
-fn vector_column_is_rejected_with_0a000() {
+fn vector_column_add_rules_not_null_and_second_column() {
+    // Issue #2042・TABLE-26 (4): nullable な VECTOR 列の追加は受理し、`NOT NULL` 付き
+    // （既存行に値が無い）は既存の NOT NULL ADD COLUMN と同じ規則で拒否する。
     let (core, path) = new_core_with_table();
     let _guard = CleanupGuard(path);
     let mut session = ddl_session();
     let err = alter_table(
         &core,
         &mut session,
+        &format!("ALTER TABLE {TABLE} ADD COLUMN w VECTOR(4) NOT NULL"),
+    )
+    .expect_err("NOT NULL VECTOR column without DEFAULT must be rejected");
+    assert_eq!(err.wire_code(), "42601");
+    // 固定表は既に VECTOR 列を持つため、2 本目は TABLE-1 の既存エラー（受理経路の確認は
+    // `table26_nullable_vector_storage.rs` が VECTOR 列なしの表で行う）。
+    let err = alter_table(
+        &core,
+        &mut session,
         &format!("ALTER TABLE {TABLE} ADD COLUMN v VECTOR(4)"),
     )
-    .expect_err("VECTOR column must be rejected");
-    assert_eq!(err.wire_code(), "0A000");
+    .expect_err("second VECTOR column must be rejected");
+    assert_eq!(err.wire_code(), "42601");
 }
 
 #[test]

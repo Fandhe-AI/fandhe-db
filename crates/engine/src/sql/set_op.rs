@@ -156,6 +156,15 @@ pub(crate) fn collect_branch_tables(tree: &SetTree, out: &mut Vec<String>) {
     }
 }
 
+/// 集合演算木の左端の枝の表名（`ExplainTarget::table_name` 用。Issue #2047）。
+pub(crate) fn leftmost_table(tree: &SetTree) -> &str {
+    match tree {
+        SetTree::Branch(scan) | SetTree::LimitedBranch(scan) => &scan.table_name,
+        SetTree::AggregateBranch(agg) => &agg.0.table_name,
+        SetTree::Op { left, .. } => leftmost_table(left),
+    }
+}
+
 /// 1 個の評価結果（枝またはノード合成後）。`has_vector` は結果列に `VECTOR` 列を
 /// 含むかどうか（重複除去を伴う演算の可否判定に使う。§2.2 参照）。
 struct EvalOutcome {
@@ -679,6 +688,7 @@ fn validate_tree_types(
     schemas: &HashMap<String, TableSchema>,
     tree: &SetTree,
     udfs: &UdfRegistry,
+    mut leaves: Option<&mut Vec<BoundSetLeaf>>,
 ) -> Result<(Vec<ColumnMeta>, bool), SqlSurfaceError> {
     match tree {
         SetTree::Branch(validated) | SetTree::LimitedBranch(validated) => {
@@ -691,6 +701,19 @@ fn validate_tree_types(
             let bound = crate::sql::parser::bind_scan(validated, schema, udfs)?;
             let columns = crate::sql::describe::projected_columns(bound.projection(), schema);
             let has_vector = columns_have_vector(&columns);
+            if let Some(out) = leaves {
+                out.push(BoundSetLeaf {
+                    table: validated.table_name.clone(),
+                    shape: LeafShape {
+                        limited: matches!(tree, SetTree::LimitedBranch(_)),
+                        sort_keys: bound.order_by.len(),
+                        has_limit: matches!(tree, SetTree::LimitedBranch(_)),
+                        has_offset: bound.offset != 0,
+                        aggregate: None,
+                    },
+                    scan: Some(bound),
+                });
+            }
             Ok((columns, has_vector))
         }
         SetTree::AggregateBranch(branch) => {
@@ -703,11 +726,33 @@ fn validate_tree_types(
             let bound = crate::sql::parser::bind_aggregate(&branch.0, schema, udfs)?;
             let columns = crate::sql::describe::aggregate_columns(&bound, schema)?;
             let has_vector = columns_have_vector(&columns);
+            if let Some(out) = leaves {
+                let grouped = bound.group_by.as_ref();
+                out.push(BoundSetLeaf {
+                    table: branch.0.table_name.clone(),
+                    shape: LeafShape {
+                        limited: true,
+                        sort_keys: grouped.map_or(0, |g| g.order_by.len()),
+                        has_limit: grouped.is_some_and(|g| g.limit.is_some()),
+                        has_offset: grouped.is_some_and(|g| g.offset != 0),
+                        aggregate: Some(AggregateShape {
+                            group_keys: grouped.map_or(0, |g| g.keys.len()),
+                            aggregates: bound.items.len(),
+                            having: bound.ungrouped_having.is_some()
+                                || grouped.is_some_and(|g| {
+                                    !g.having.is_empty() || !g.having_exprs.is_empty()
+                                }),
+                        }),
+                    },
+                    scan: None,
+                });
+            }
             Ok((columns, has_vector))
         }
         SetTree::Op { op, left, right } => {
-            let (l_columns, l_has_vector) = validate_tree_types(schemas, left, udfs)?;
-            let (r_columns, r_has_vector) = validate_tree_types(schemas, right, udfs)?;
+            let (l_columns, l_has_vector) =
+                validate_tree_types(schemas, left, udfs, leaves.as_deref_mut())?;
+            let (r_columns, r_has_vector) = validate_tree_types(schemas, right, udfs, leaves)?;
             check_branch_type_compatibility(
                 *op,
                 &l_columns,
@@ -718,6 +763,86 @@ fn validate_tree_types(
             Ok((merge_columns(&l_columns, &r_columns), l_has_vector))
         }
     }
+}
+
+/// 行を読まない準備段（Issue #2047・SQL-75 (2)(6) ポインタ）。全体 `LIMIT`／`OFFSET` の範囲検証
+/// → 全枝の束縛と列型整合の検証、の順で行う。実行（[`execute_with_budget_and_result_limits`]）と
+/// `EXPLAIN`（`core.rs` の `run_set_operation_explain`）の双方がこの 1 関数を通るため、判定順と
+/// `wire_code` が構造的に一致する。`leaves` を渡すと束縛した葉を左から右の順に積む（`EXPLAIN` 用。
+/// 実行側は `None`）。戻り値は検証済みの全体 `LIMIT`（`Some` なら範囲内）と `OFFSET`。
+pub(crate) fn prepare(
+    schemas: &HashMap<String, TableSchema>,
+    tree: &SetTree,
+    udfs: &UdfRegistry,
+    limit: Option<u32>,
+    offset: u32,
+    result_limits: &crate::result_limits::ResultLimits,
+    leaves: Option<&mut Vec<BoundSetLeaf>>,
+) -> Result<(Option<usize>, usize), SqlSurfaceError> {
+    // PR #1105 レビュー指摘対応: 全体 `LIMIT` の範囲検証（`1..=設定値`）を全枝の走査・合成より
+    // 前に行う（[`describe_columns`] と同じ検証を共有し、Execute／Describe の受理・拒否を一致させる）。
+    let validated_limit = match limit {
+        Some(n) => Some(crate::sql::parser::validate_search_limit_with(
+            n,
+            result_limits,
+        )?),
+        None => None,
+    };
+    let validated_offset = crate::sql::parser::validate_search_offset(offset)?;
+    // PR #1105 レビュー指摘対応: 列数・列型整合（`DatatypeMismatch`・`42804`）を全枝の走査・合成より
+    // 前に確定させる（[`validate_tree_types`] のドキュメンテーションコメント参照）。
+    validate_tree_types(schemas, tree, udfs, leaves)?;
+    Ok((validated_limit, validated_offset))
+}
+
+/// `EXPLAIN` が葉（枝）ごとに必要とする束縛結果（Issue #2047）。[`prepare`] が左から右の順に積み、
+/// `core.rs` が `scan` の走査分類（単一表の広域取得 `EXPLAIN` と共有）を作り、
+/// `sql::set_op_explain::explain_tree` が `shape` から段を組む。
+#[derive(Debug)]
+pub(crate) struct BoundSetLeaf {
+    /// 枝の表名（`schemas` の参照キー。出力には載せない）。
+    pub(crate) table: String,
+    /// 段の木に必要な枝の形（項目数・有無のみ。値は持たない）。
+    pub(crate) shape: LeafShape,
+    /// スキャン枝の束縛結果（実行と同じ `bind_scan`）。集計枝は `None`。
+    pub(crate) scan: Option<crate::sql::parser::BoundScan>,
+}
+
+/// 枝の形（SQL-75 (5): 件数・有無のみで LIMIT／OFFSET の値は持たない）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LeafShape {
+    /// 括弧付きで枝内に `ORDER BY`／`LIMIT`／`OFFSET` を持てる枝か（集計枝は常に真）。
+    pub(crate) limited: bool,
+    /// 枝内の並べ替えキー数。
+    pub(crate) sort_keys: usize,
+    /// 枝内に `LIMIT` があるか。
+    pub(crate) has_limit: bool,
+    /// 枝内に `OFFSET`（非 0）があるか。
+    pub(crate) has_offset: bool,
+    /// 集計枝のときの集計段の情報。
+    pub(crate) aggregate: Option<AggregateShape>,
+}
+
+/// 集計枝の集計段の情報（`sql::join::explain` の `aggregate` 段と同じ意味）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AggregateShape {
+    pub(crate) group_keys: usize,
+    pub(crate) aggregates: usize,
+    pub(crate) having: bool,
+}
+
+/// 集計枝の走査分類の行。[`eval_aggregate_branch`] は可視ビットマップのキャッシュ・arena・
+/// スカラー索引のいずれも実行器へ渡さない（常に全走査）ため、`EXPLAIN` も `plain_scan`／`full_scan`
+/// に固定する（D5「矛盾出力の防止」）。**`eval_aggregate_branch` がキャッシュや索引を渡すよう
+/// 変わるときは、この分類も一緒に変えること。**
+pub(crate) fn aggregate_branch_explain_lines() -> Vec<String> {
+    crate::sql::explain::relational_explain_lines(
+        crate::sql::scalar_plan::ScalarPlan::PlainScan,
+        None,
+        crate::sql::explain::AccessPath::FullScan,
+        &crate::sql::explain::ExplainIndexNames::default(),
+        &[],
+    )
 }
 
 /// 構文木を後行順（postorder）で評価する。結果列名・メタデータは常に左の子
@@ -929,25 +1054,8 @@ pub(crate) fn execute_with_budget_and_result_limits(
     group_limits: crate::group_by_limits::GroupByLimits,
     result_limits: &crate::result_limits::ResultLimits,
 ) -> Result<QueryResult, SqlSurfaceError> {
-    // PR #1105 レビュー指摘対応: 全体 `LIMIT` の範囲検証（`1..=設定値`）を
-    // 全枝の走査・合成より前に行う（[`describe_columns`] と同じ検証を共有し、
-    // Execute／Describe の受理・拒否を一致させる。従来は `eval_tree` 完了後の
-    // 切り詰め直前でのみ検証しており、範囲外の `LIMIT` でも全枝を走査・合成し
-    // 終えてから拒否していた）。
-    let validated_limit = match limit {
-        Some(n) => Some(crate::sql::parser::validate_search_limit_with(
-            n,
-            result_limits,
-        )?),
-        None => None,
-    };
-    let validated_offset = crate::sql::parser::validate_search_offset(offset)?;
-    // PR #1105 レビュー指摘対応: 列数・列型整合（`DatatypeMismatch`・`42804`）を
-    // 全枝の走査・合成より前に確定させる（[`validate_tree_types`] のドキュメン
-    // テーションコメント参照）。従来は `eval_tree` が左右の枝を実際に走査して
-    // から検証していたため、型不一致の文でも全行走査・結果確保が先行し、
-    // 行数・バイト上限エラー（`54000`）が `42804` に先行し得た。
-    validate_tree_types(schemas, tree, udfs)?;
+    let (validated_limit, validated_offset) =
+        prepare(schemas, tree, udfs, limit, offset, result_limits, None)?;
     let mut budget = SetOpBudget::new(budget_cap);
     let outcome = eval_tree(
         read_txn,

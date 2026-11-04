@@ -72,7 +72,7 @@ exec.rs`（`ORDER BY` 経路の `HINT ORDER` を受理する）からは到達�
 | 行 | 常時／条件 | 値の語彙（snake_case・英語・閉じた集合） |
 | -- | -- | -- |
 | `engine: <token>` | 常時 | `parallel_brute_force` / `cpu_scalar_brute_force` / `hnsw` / `(custom_provider)`（`search_engine_kind() == None`。`with_provider`／`from_storage` 経由） |
-| `hnsw_params: m=<m>,ef_construction=<ef_c>,ef_search=<ef_s>,resident=<f32\|f16\|i8>,sparse_visited_max=<n>,metric=<cosine\|l2\|ip\|l1>` | `engine: hnsw` のときのみ | 構築時の静的設定値のみ（`full_scan_ratio` は含まない）。`m=`・`ef_construction=` は、HNSW を使える宣言が `WITH (m, ef_construction)` を持つとき宣言の値（Issue #2029・SQL-33 (5)。実行時の構築と同じ値）、それ以外は provider の値。`ef_search=` は常に provider の値（セッション値の表示は #2030）。末尾の `metric=`（Issue #1978・INDEX-7 追記）は対象表の HNSW 宣言の距離種別（opclass）で、宣言なしは `cosine`（宣言が複数種類あるときは `cosine` を含めば `cosine`、含まなければ種別の順序で最小のもの）。Issue #1979 で演算子単位になり、HNSW を使えるときは問い合わせの距離種別、距離種別の不一致で厳密走査へ縮退したときは不一致の理由が分かる宣言側の値になる（`ann_plan:` 行と同じゲート結果から決める）。`resident=`（Issue #514 追記）は要求精度の静的値で、実行時の自動縮退結果は含まない。`sparse_visited_max=`（Issue #497 追記）は visited 集合切替閾値の静的設定値（`ValidatedHnswParams::sparse_visited_max`。既定 0）で、実行時にどちらの visited 実装が選ばれたか・可視候補数・索引ノード数は含まない |
+| `hnsw_params: m=<m>,ef_construction=<ef_c>,ef_search=<ef_s>,resident=<f32\|f16\|i8>,sparse_visited_max=<n>,metric=<cosine\|l2\|ip\|l1>,iterative_scan=<off\|relaxed_order\|strict_order>,max_scan_tuples=<n>` | `engine: hnsw` のときのみ | 構築時の静的設定値のみ（`full_scan_ratio` は含まない）。`m=`・`ef_construction=` は、HNSW を使える宣言が `WITH (m, ef_construction)` を持つとき宣言の値（Issue #2029・SQL-33 (5)。実行時の構築と同じ値）、それ以外は provider の値。`ef_search=` は、非ハイブリッドの kNN ではセッションの `hnsw.ef_search` の実効値になる（Issue #2030・SQL-73 ポインタ。上書きなしは構築時の値、ハイブリッドは常に構築時の値）。接続自身が設定した値かエンジンの静的な値であり、テナントのデータ・存在には依存しないため、この露出の契約に反しない。末尾の `iterative_scan=`・`max_scan_tuples=` は、非ハイブリッドの kNN ではセッションの `hnsw.iterative_scan`・`hnsw.max_scan_tuples`（`max_scan_tuples` は SQL-46 の走査行数上限との min の実効値）、ハイブリッドは常に既定値（`strict_order`・20000 を走査上限で頭打ちにした値。Issue #2033・SQL-73 ポインタ）。`ef_search=` と同じく接続自身の設定値で、テナントのデータ・存在には依存しない。`metric=`（Issue #1978・INDEX-7 追記）は対象表の HNSW 宣言の距離種別（opclass）で、宣言なしは `cosine`（宣言が複数種類あるときは `cosine` を含めば `cosine`、含まなければ種別の順序で最小のもの）。Issue #1979 で演算子単位になり、HNSW を使えるときは問い合わせの距離種別、距離種別の不一致で厳密走査へ縮退したときは不一致の理由が分かる宣言側の値になる（`ann_plan:` 行と同じゲート結果から決める）。`resident=`（Issue #514 追記）は要求精度の静的値で、実行時の自動縮退結果は含まない。`sparse_visited_max=`（Issue #497 追記）は visited 集合切替閾値の静的設定値（`ValidatedHnswParams::sparse_visited_max`。既定 0）で、実行時にどちらの visited 実装が選ばれたか・可視候補数・索引ノード数は含まない |
 | `ann_plan: <token>` | 常時 | `plain_scan_engine` / `plain_scan_precision` / `hnsw_full_visible` / `hnsw_subset` / `unknown_custom_provider`（`engine: (custom_provider)` のときのみ。PR #437 追記）/ `plain_scan_limit_omitted`（距離順 `ORDER BY` の `LIMIT` 省略・`LIMIT ALL`・`OFFSET` 単独。Issue #2242。優先順位は `DESC`・距離種別の不一致の後ろ）/ `plain_scan_descending`（距離順 `ORDER BY` に `DESC` が付いたとき。Issue #2009・SQL-33 (2)・SQL-75 (4) 追記）/ `plain_scan_opclass_mismatch`（索引の距離種別と距離演算子が合わないとき。Issue #1979・INDEX-7・SQL-33 追記） |
 | `scalar_plan: <token>` | 常時（Issue #474 追記） | `plain_scan` / `index_equality` / `index_prefix` / `index_id_range` / `index_conjunction`（`sql::scalar_plan::classify_scalar_plan` の静的判定。部分索引を選択した場合は `index_partial index=<名前>`〔Issue #1656。`docs/design/partial-index.md`〕。件数・閾値・実行時縮退結果は非露出。詳細は `docs/design/scalar-index-prune.md` 参照） |
 
@@ -365,3 +365,78 @@ ANN 索引を使わず、可視行を全走査して返す。`ann_plan:` 行は�
 （`sql::hnsw_cache::ann_plan_for_direction`。`LIMIT` 省略は不一致の後ろで `plain_scan_limit_omitted`〔Issue #2242〕）。縮退の規則は
 [index-declaration-effects.md](index-declaration-effects.md) の追記（Issue #1979）を参照。新しい語彙は
 SQL-27 の確定時に spec 側とすり合わせる事項（spec リポ側でオーナーが判断する）。
+
+## 追記（Issue #2045・SQL-75 (2)）: 段の木の表現
+
+結合・集合演算・CTE・部分クエリの `EXPLAIN`（親 #2044 配下の #2046〜#2048）が段を入れ子にできるよう、
+`sql::explain_tree::ExplainNode`（engine 内部の `pub(crate)`）を追加した。公開 API（`lib.rs`）は変えない。
+
+- **節のモデル**: 節は「見出し（任意）・属性行・子（出現順）」を持つ。単一表の 3 経路
+  （`USING PLAN` 付き検索・なし検索・集計/広域取得〔窓の段を含む〕）は「見出しなし・子なしのルート 1 節」
+  として組み立てる。この形の描画は属性行そのものなので、出力は従来とバイト単位で同一（後方互換）。
+  分割実行 DML の `partitioned::explain_result` は深さ 0 の木と出力が同じため載せ替えていない。
+- **字下げの規則（安定契約）**: 深さ 0 は前置なし。深さ d >= 1 の見出し行は `"  " x (d-1) + "-> " + 見出し`、
+  属性行は `"  " x (d-1) + "   " + 行`。見出しなしの子は見出し行を出さず属性行のみ字下げする。
+  兄弟 Issue は見出し付きで使う。
+- **上限**: 深さ 64・節 1024・行 8192。深さは既存の構文段の上限（表参照・部分クエリ・CTE・集合演算の括弧・
+  ビューの入れ子）の合計に付帯段の余裕を見込んだ値で、コンパイル時 assert で下回らないことを保証する。
+  超過は出力を切らずに `ExplainTreeError`（`TooDeep`／`TooManyNodes`／`TooManyLines`）で fail-closed にする。
+  見出し・属性行の改行は `InvalidLine` で拒否する。メッセージは固定の英語文で入力値を含めない。
+  `wire_code` への写像は呼び出し元（#2046〜#2048）が決める（候補: 文が複雑すぎる旨の SQLSTATE 54001 相当、
+  もしくは Internal）。描画は再帰を使わず明示スタックで行う。
+- **露出しない値**: 節に載せる値は SQL-27 の契約のまま（閉じた語彙のトークンと検証済みの索引名のみ。行数・
+  可視件数・カーディナリティ等は載せない。SQL-75 (5)）。`EXPLAIN` は本体を実行しない。
+- **対象外**: 許可リスト（42601）の拡張と各段の語彙は #2046〜#2048、`EXPLAIN ANALYZE`／`FORMAT JSON` は SQL-76。
+  NoSQL 表層は SQL-75 (6) のとおり変えない。
+
+## 追記（Issue #2046・SQL-75 (2)）: JOIN の段
+
+JOIN を含む `SELECT` の `EXPLAIN` を受理する（従来は単一表の文法で解析して `42601`）。文は実行せず、
+上記の段の木で結合の方式・順・各入力を返す。構文段は非 EXPLAIN と同じ判定（`looks_like_join` →
+`parse_join_statement`）で `ExplainTarget::Join` にし、束縛は `sql::join::prepare_join`（行を読まない）を共有する。
+束縛エラー・`LIMIT`／`OFFSET` の範囲・relation 数と `GROUP BY` 列数の上限の `wire_code` と判定順は
+非 EXPLAIN と一致する。
+
+- **段の重ね方（外側から。該当しない段は出さない）**: 非集計形は `limit` → `sort` → `filter` → `join` の
+  連鎖 → `scan`、集計形は `limit` → `sort` → `aggregate` → `filter` → `join` の連鎖 → `scan`。実行順
+  （結合 → WHERE 残余 → 集計／並べ替え → OFFSET／LIMIT）の逆。`join` は left-deep で、段 k の子は
+  [段 k-1 の `join`（k = 0 なら relation 1 の `scan`）, relation k+2 の `scan`] の順。
+- **語彙（閉じている・安定契約）**:
+  - `join`: `join_method: hash|nested_loop|cross`（実行器と同じ判定 `StepPlan::method` を共有）、
+    `join_type: inner|left|right|full`（外部結合の簡約後の実効値）、`join_keys: <n>`、
+    `join_filter: present|none`（ON 残余の有無）。
+  - `scan`: `relation: <n>`（FROM での 1 始まりの序数）に続けて、単一表の広域取得と同一の
+    `scalar_plan:`／`access_path:`（PK 点検索 → GIN → 全走査。`scan_explain_lines` を共有）。
+  - `filter`: `residual_predicates: <n>`。`aggregate`: `group_keys`・`aggregates`・`having: present|none`。
+    `sort`: `sort_keys: <n>`。`limit`: `limit: present|none`・`offset: present|none`。
+- **出さない値と理由**: 表名・別名（スキーマ解決後の内部名や一時表の名前など、利用者が書いた綴りと異なる名前の
+  露出と、区切り文字の混入経路を避けるため。出すかどうかは将来の判断として未決）、`LIMIT`／`OFFSET` の値
+  （利用者リテラル）、行数・可視件数・カーディナリティ・予算・推定値（SQL-75 (5)）。
+- **エラー写像**: 木の上限超過は `54001`（固定文）、契約違反は `Internal`。セッションの無い入口は
+  従来どおり `42601`（SQL-75 (6)）。`$n` を含む `EXPLAIN` 前置の JOIN は非 EXPLAIN と同じく `42601`。
+- **対象外**: 派生表・CTE（`EXPLAIN WITH`）・部分クエリを含む JOIN は従来どおり `42601`（#2048）、集合演算は #2047、
+  DML は #2049〜#2051、`EXPLAIN ANALYZE`／オプションは SQL-76。NoSQL 表層は変えない。
+
+## 追記（Issue #2047・SQL-75 (2)）: 集合演算の段
+
+集合演算（`UNION [ALL]`／`INTERSECT`／`EXCEPT`）を含む `SELECT` の `EXPLAIN` を受理する（従来は単一表の文法で
+解析して `UNION` の位置で `42601`）。文は実行せず、演算子・入れ子・各枝の走査分類を段の木で返す。構文段は
+非 EXPLAIN と同じ判定（JOIN の後に `looks_like_set_operation`）と同じパーサー（`parse_set_operation`）で
+`ExplainTarget::SetOperation` にする。先頭が括弧の形（`EXPLAIN (SELECT ...) UNION ...`）も受理する。
+束縛は `sql::set_op::prepare`（全体 `LIMIT`／`OFFSET` の範囲 → 全枝の束縛と型整合。行を読まない）を実行と
+共有するため、束縛エラーの `wire_code` と判定順は非 EXPLAIN と一致する。
+
+- **段の重ね方（外側から。該当しない段は出さない）**: 全体 `limit`（`LIMIT`／`OFFSET` があるときだけ）→
+  `set_operation`（入れ子は演算子の優先順位と括弧どおり。子は左、右の順）→ 葉。葉は、通常の枝が `scan`、
+  括弧付きの枝が `limit` → `sort` → `scan`、集計の枝が `limit` → `sort` → `aggregate` → `scan`。
+- **語彙（JOIN と同じ閉じた集合・安定契約）**: `set_operation` の属性は `set_operator: union|union_all|intersect|except`。
+  `scan` は `relation: <n>`（葉の左からの 1 始まりの序数）に続けて `scalar_plan:`／`access_path:`
+  （`scan_explain_lines` を共有。枝ごとに PK 点検索 → GIN → 全走査）。ほかは JOIN の段と同じ意味。
+- **集計の枝の走査分類**: 実行器は可視ビットマップのキャッシュ・arena・スカラー索引を渡さない（常に全走査）ため、
+  `plain_scan`／`full_scan` に固定する。実行器の隣（`set_op::aggregate_branch_explain_lines`）に置き、
+  実行器へキャッシュや索引を配線するときは一緒に変える（矛盾した出力を出さない）。
+- **出さない値と理由**: 表名・別名、`LIMIT`／`OFFSET` の値、行数・可視件数・カーディナリティ・予算（SQL-75 (5)）。
+- **エラー写像**: 木の上限超過は `54001`（固定文）、契約違反は `Internal`。セッションの無い入口は従来どおり
+  `42601`（SQL-75 (6)）。`$n` を含む `EXPLAIN` 前置の集合演算は `42601`（後続での受理に譲る）。
+- **対象外**: 派生表・CTE・部分クエリは従来どおり `42601`（#2048）、DML は #2049〜#2051、`EXPLAIN ANALYZE`／
+  オプションは SQL-76。NoSQL 表層は変えない。

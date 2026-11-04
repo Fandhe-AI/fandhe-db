@@ -162,6 +162,10 @@ fn classify_statement(s: &Statement) -> ReadRequirement {
         | Statement::ShowRowSecurity
         | Statement::SetStatementTimeout { .. }
         | Statement::ShowStatementTimeout
+        | Statement::SetHnswEfSearch { .. }
+        | Statement::ShowHnswEfSearch
+        | Statement::SetHnswScanSetting { .. }
+        | Statement::ShowHnswScanSetting(_)
         | Statement::CreateFunction { .. } => ReadRequirement::NotApplicable,
     }
 }

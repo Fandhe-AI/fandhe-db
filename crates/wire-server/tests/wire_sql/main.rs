@@ -10,6 +10,8 @@ use http_common::temp_db;
 #[path = "../../../engine/src/test_util/legacy_table.rs"]
 mod legacy_table;
 
+mod wire2030_hnsw_ef_search_setting;
+mod wire2033_hnsw_iterative_scan_setting;
 mod wire_aggregate;
 mod wire_array_column;
 mod wire_array_multidim_output;

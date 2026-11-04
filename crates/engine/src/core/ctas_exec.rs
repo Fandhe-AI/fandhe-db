@@ -491,7 +491,7 @@ mod tests {
             assert_eq!(got.ty, want.ty, "type of {}", got.name);
         }
         let nullable: Vec<bool> = schema.columns.iter().map(|c| c.nullable).collect();
-        assert_eq!(nullable, [true, true, true, false, true, true, true]);
+        assert_eq!(nullable, [true, true, true, true, true, true, true]);
     }
 
     #[test]

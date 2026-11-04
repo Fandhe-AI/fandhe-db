@@ -1376,11 +1376,31 @@ pub fn validate_param_positions(tokens: &[Token]) -> Result<u16, SqlSurfaceError
     // WHERE 述語が束縛時に左右いずれかの `ValidatedScan::where_predicates` へ
     // 分かれてプッシュダウンされるため、トークン列上のフラグ位置と束縛後の
     // 述語列の対応付けが保証できない（Issue #925 §2.7・対象外事項）。
-    if crate::sql::allowlist::looks_like_join(tokens)
+    // Issue #2046: `EXPLAIN` 前置の JOIN も同じ理由で拒否する（`looks_like_join` は先頭 `SELECT` を
+    // 要求するため、先頭の `EXPLAIN` を 1 トークン剥がして判定する。fail-closed）。
+    let join_tokens = match tokens.first() {
+        Some(Token::Ident(w)) if w.eq_ignore_ascii_case("EXPLAIN") => {
+            tokens.get(1..).unwrap_or(&[])
+        }
+        _ => tokens,
+    };
+    if crate::sql::allowlist::looks_like_join(join_tokens)
         && tokens.iter().any(|t| matches!(t, Token::Param(_)))
     {
         return Err(SqlSurfaceError::unsupported(
             "parameter placeholders are not supported in JOIN statements",
+        ));
+    }
+
+    // Issue #2047: `EXPLAIN` 前置の集合演算も `$n` を拒否する（fail-closed）。EXPLAIN 経路では
+    // 枝ごとの WHERE 等価フラグ・型推論・置換の対応を検証できていないため、受理は後続に譲る
+    // （非 EXPLAIN の集合演算は従来どおり枝ごとのフラグで受理する）。
+    if matches!(tokens.first(), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("EXPLAIN"))
+        && tokens.iter().any(|t| matches!(t, Token::Param(_)))
+        && has_set_operator_branch(join_tokens)
+    {
+        return Err(SqlSurfaceError::unsupported(
+            "parameter placeholders are not supported in EXPLAIN of set operations",
         ));
     }
 
@@ -2668,6 +2688,44 @@ mod tests {
                 "{op}"
             );
         }
+    }
+
+    /// Issue #2046: `EXPLAIN` 前置の JOIN に `$n` を含む文は、非 EXPLAIN の JOIN と同じく `42601`
+    /// （WHERE 等価の許可位置にすり抜けさせない）。
+    #[test]
+    fn explain_join_with_param_is_rejected() {
+        for sql in [
+            "EXPLAIN SELECT a.id FROM a JOIN b ON a.k = b.k WHERE a.k = $1",
+            "EXPLAIN SELECT a.id FROM a, b WHERE a.k = $1",
+        ] {
+            let tokens = crate::sql::lexer::tokenize_with_params(sql).expect("tokenize");
+            assert_eq!(
+                validate_param_positions(&tokens).unwrap_err().wire_code(),
+                "42601",
+                "{sql}"
+            );
+        }
+    }
+
+    /// Issue #2047: `EXPLAIN` 前置の集合演算に `$n` を含む文は `42601`。非 EXPLAIN の同じ文は受理する。
+    #[test]
+    fn explain_set_operation_with_param_is_rejected() {
+        for sql in [
+            "EXPLAIN SELECT k FROM a WHERE k = $1 UNION SELECT k FROM b",
+            "EXPLAIN (SELECT k FROM a) INTERSECT SELECT k FROM b WHERE k = $1",
+        ] {
+            let tokens = crate::sql::lexer::tokenize_with_params(sql).expect("tokenize");
+            assert_eq!(
+                validate_param_positions(&tokens).unwrap_err().wire_code(),
+                "42601",
+                "{sql}"
+            );
+        }
+        let tokens = crate::sql::lexer::tokenize_with_params(
+            "SELECT k FROM a WHERE k = $1 UNION SELECT k FROM b",
+        )
+        .expect("tokenize");
+        assert!(validate_param_positions(&tokens).is_ok());
     }
 
     /// Issue #1593: 許可位置 1〜4 の `$n` に `::` が続く形は 42601。負値の置換は括弧で包む。

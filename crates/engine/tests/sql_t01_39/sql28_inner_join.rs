@@ -1048,20 +1048,25 @@ fn in_subquery_with_join_body_is_rejected() {
     );
 }
 
-/// Issue #925 §2.6・対象外事項: `EXPLAIN` は `validate_select_statement`
-/// （単一テーブル専用の文法）を直接呼ぶため（`looks_like_join` を経由しない）、
-/// JOIN 形の入力は単一テーブル文法の解析失敗として `42601` になる。
+/// Issue #2046（SQL-75 (2) ポインタ）による仕様変更: JOIN 形の `EXPLAIN` は従来 `42601` だったが、
+/// 段の木（`join`／`scan`）を返す。詳細な出力契約は `sql_t40_up/sql75_explain_join.rs`。
 #[test]
-fn explain_with_join_is_rejected() {
+fn explain_with_join_returns_plan() {
     let (storage, path) = seeded_basic();
     let _guard = CleanupGuard(path);
     let core = new_core(storage);
-    assert_rejected(
-        &core,
-        "tenant-a",
-        "EXPLAIN SELECT * FROM documents JOIN authors ON documents.author_id = authors.id LIMIT 10",
-        "42601",
-    );
+    let mut session = SessionState::default();
+    let outcome = core
+        .execute_sql_in_session(
+            &ctx("tenant-a"),
+            &mut session,
+            "EXPLAIN SELECT * FROM documents JOIN authors ON documents.author_id = authors.id LIMIT 10",
+        )
+        .expect("EXPLAIN of a JOIN must succeed");
+    match outcome {
+        SqlOutcome::Explain(r) => assert!(!r.rows.is_empty()),
+        other => panic!("expected Explain, got {other:?}"),
+    }
 }
 
 /// Issue #925 §2.6・対象外事項: 集合演算の枝パーサー（`parse_set_branch`）は

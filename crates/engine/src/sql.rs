@@ -40,6 +40,8 @@
 //!   呼べる。`ExplainIndexNames`・`build_explain_result_with_indexes`（Issue
 //!   #1066・TASK-206・INDEX-7）は `ann_plan:`／`scalar_plan:` 行への使用索引名
 //!   注記用に追加した公開 API（`build_explain_result` は非破壊のまま維持）
+//! - [`explain_tree`][]: `EXPLAIN` の段の木（Issue #2045・SQL-75 (2)。単一表は
+//!   ルート 1 節で出力不変。結合・集合演算・CTE の入れ子描画の土台）
 //! - [`mode`][]: 取得モード（`recall`／`precision`）の優先順位解決・セッション状態
 //!   （TASK-161・SQL-12）
 //! - [`using_operation_id`][]: `USING OPERATION_ID '<id>'` 文末句の値型・検証（TASK-80）
@@ -239,6 +241,7 @@ pub(crate) mod distinct;
 pub(crate) mod dml_from_returning;
 pub mod exec;
 pub mod explain;
+pub(crate) mod explain_tree;
 pub(crate) mod expr_program;
 pub(crate) mod expression_key_index;
 pub(crate) mod fetch_clause;
@@ -295,6 +298,7 @@ pub mod search_path;
 pub(crate) mod sequence_fn;
 pub(crate) mod sequence_scope;
 pub(crate) mod set_op;
+pub(crate) mod set_op_explain;
 pub(crate) mod sparse_cache;
 pub mod statement_splitter;
 pub(crate) mod string_fn;
@@ -416,6 +420,20 @@ pub enum SqlOutcome {
     ///
     /// **Issue #1954 で追加した破壊的変更（BREAKING CHANGE）**: variant を追加した。
     SetStatementTimeout {
+        reset: bool,
+    },
+    /// `SET [SESSION] hnsw.ef_search ...`／`RESET hnsw.ef_search` の成功応答（タグは `SET`・`RESET`。
+    /// SQL-73・Issue #2030）。新しい値は `SessionState::hnsw_ef_search` が保持する。
+    ///
+    /// **Issue #2030 で追加した破壊的変更（BREAKING CHANGE）**: variant を追加した。
+    SetHnswEfSearch {
+        reset: bool,
+    },
+    /// `SET [SESSION] hnsw.iterative_scan|hnsw.max_scan_tuples ...`／`RESET ...` の成功応答
+    /// （タグは `SET`・`RESET`。SQL-73・Issue #2033）。新しい値は `SessionState` が保持する。
+    ///
+    /// **Issue #2033 で追加した破壊的変更（BREAKING CHANGE）**: variant を追加した。
+    SetHnswScanSetting {
         reset: bool,
     },
     /// `SHOW timezone`／`SHOW TIME ZONE` の応答（列名 `TimeZone`・text の 1 行。CommandComplete
