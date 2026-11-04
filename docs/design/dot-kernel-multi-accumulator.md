@@ -960,3 +960,72 @@ BEFORE_BIN=/path/before AFTER_BIN=/path/after CAND_BINS="nobb=/path/nobb" \
 # 層 B: cargo +<rustc> build --release -p fandhe-db-engine --example feature_bench
 #       BENCH_FEATURE_DIM=768 target/release/examples/feature_bench を before/after 交互に 5 回以上
 ```
+
+## Issue #1984 追記: L2 二乗距離カーネルの内積比
+
+L2 二乗距離カーネル（`SimdKernel::l2_sq`。Issue #1981・#1983・SQL-33 ポインタ）の性能基準値として、
+内積カーネル（`SimdKernel::dot`）に対する相対コストを `dot_kernel_bench` の opt-in 区間で記録する。
+
+### 結論
+
+- 本環境（x86_64・`Avx2Fma`）では **L2 は内積の約 4.8〜8.9 倍（cache 常駐・ratio_min）**。次元が大きいほど
+  比が開く（dim 100 で 4.8 倍、dim 1536 で 8.9 倍）
+- **この値は目標状態ではない**。取得時点では x86_64 の `SimdKernel::l2_sq` が Issue #1982 未着地（base へ
+  #1982 を取り込み済み）のため `l2_sq_scalar` へ委譲しており、記録値は「scalar L2 対 SIMD 内積」の比である。診断行（`current().l2_sq` 対
+  `l2_sq_scalar`）が 0.997（中央値。0.991〜1.003）で、同一コードであることも確認できる
+- 共有環境（loadavg 約 15〜23／10 論理 CPU）の参考値であり、採否根拠にしない
+  （`benchmark-judgement-policy.md` §5）。#1982 着地後に同手順で再計測する
+- aarch64（NEON）の実測は本環境では取得できない。オーナー実機での再計測を申し送る
+
+### 計測方式
+
+- `BENCH_DOT_KERNEL_L2_AB=1` で有効化（未設定・`0` は Off、それ以外は fail-closed で非ゼロ終了）。
+  既定経路の出力・所要時間は不変（`chip_bench`・`scripts/bench_dot_kernel_ab.sh` への影響なし）
+- (working_set × dim 100・128・384・768・1536) ごとに `run_ab` で `isa::current().dot`（A）と
+  `isa::current().l2_sq`（B）を交互実行する。cache 常駐は作業集合を 200 回走査する
+- 計測前に全行で `l2_sq_scalar`（許容差 `1e-5 * expected + 1e-6`）・`dot_scalar` との照合を行い、
+  不一致・非有限は実測を出さず拒否する
+- 出力行: `dot_kernel: l2_ab ...`（ratio = L2 / 内積）・`dot_kernel: l2_diagnostic_ab ...`
+  （情報提供・合否に数えない）。既存の `chip.rs` パーサとは衝突しない（回帰テストで固定）
+
+### 環境
+
+x86_64・Intel Core i7-13700K（論理 10 CPU・共有環境）・rustc 1.98.1・`Avx2Fma`。
+生データと環境: `bench-data/l2-kernel-ab/20261104-1984-summary.tsv`・`20261104-1984-env.txt`。
+7 回を逐次実行（各 run の直前 loadavg は env ファイル参照）。
+
+### 実測
+
+7 run の min-of-7（ratio_min）と median-of-7（ratio_median）。最右列は dot 側 median の
+run-to-run 幅 `(max-min)/min`（変更を含まない参照区間）。
+
+| working_set | dim | rows | dot min (ms) | dot median (ms) | L2 min (ms) | L2 median (ms) | ratio_min | ratio_median | dot run-to-run 幅 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| cache_resident | 100 | 163 | 0.176 | 0.178 | 0.851 | 0.858 | 4.84 | 4.82 | 2.8% |
+| cache_resident | 128 | 128 | 0.139 | 0.140 | 0.862 | 0.867 | 6.20 | 6.19 | 7.9% |
+| cache_resident | 384 | 42 | 0.158 | 0.159 | 1.070 | 1.080 | 6.77 | 6.79 | 2.5% |
+| cache_resident | 768 | 21 | 0.146 | 0.148 | 1.147 | 1.154 | 7.86 | 7.80 | 2.0% |
+| cache_resident | 1536 | 10 | 0.128 | 0.130 | 1.138 | 1.145 | 8.89 | 8.81 | 0.8% |
+| arena_scale | 100 | 25000 | 0.164 | 0.182 | 0.652 | 0.669 | 3.98 | 3.68 | 241.5% |
+| arena_scale | 128 | 25000 | 0.225 | 0.291 | 0.850 | 0.901 | 3.78 | 3.10 | 153.4% |
+| arena_scale | 384 | 25000 | 1.514 | 1.711 | 3.770 | 3.935 | 2.49 | 2.30 | 31.2% |
+| arena_scale | 768 | 25000 | 3.719 | 4.007 | 8.197 | 8.413 | 2.20 | 2.10 | 34.7% |
+| arena_scale | 1536 | 25000 | 7.401 | 8.130 | 16.754 | 17.216 | 2.26 | 2.12 | 35.2% |
+
+診断（dim 768・cache 常駐）: `simd_vs_scalar_ratio` は 7 run で 0.991〜1.003（Neutral）。
+
+### 限界・申し送り
+
+- arena_scale は dot 側の run-to-run 幅が 31〜241% と大きく（共有環境の負荷）、比は参考程度。
+  cache_resident（幅 0.8〜7.9%）の比を基準値として扱う
+- **#1982 への申し送り（#1982 で `kernel::l2_sq` は `isa::current().l2_sq` 経由へ結線済み）**: 計測時点の production の `kernel::l2_sq` は `isa::l2_sq_scalar` を直接呼び、
+  `SimdKernel` のディスパッチを経由しない。`search_l2` は単一行で `l2_sq_block4` も未使用。
+  x86 SIMD を実装しても `kernel.rs` を結線し直さない限り production は速くならない
+- `chip_bench` への L2 ワークロード追加・`l2_sq_block4` 対 `dot_block4` の比較は対象外
+
+### 再現手順
+
+```sh
+# 5 回以上、各回の前に /proc/loadavg を記録する
+BENCH_DOT_KERNEL_L2_AB=1 cargo bench --bench dot_kernel_bench -p fandhe-db-engine
+```

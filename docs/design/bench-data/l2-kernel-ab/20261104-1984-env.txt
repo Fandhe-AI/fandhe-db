@@ -1,0 +1,9 @@
+CPU model: 13th Gen Intel(R) Core(TM) i7-13700K (logical_cpus=10, shared environment)
+rustc: 1.98.1 (48a229cea 2026-09-01)
+isa::current().isa(): Avx2Fma (x86_64)
+BENCH_DEDICATED_ENV: unset (shared environment)
+commit: cb07ba8d0 (test(engine): L2 カーネルの内積比ベンチを dot_kernel_bench に追加する)
+command: BENCH_DOT_KERNEL_L2_AB=1 target/release/deps/dot_kernel_bench-* --bench  (7 runs, sequential)
+EnvReport (run 1): env: os=linux arch=x86_64 logical_cpus=10 isa=Avx2Fma loadavg=23.11 17.50 9.52
+loadavg (1min) before runs 2-7: 19.06 18.57 18.04 16.92 15.89 14.85
+note: SimdKernel::l2_sq on x86_64 delegates to l2_sq_scalar (Issue #1982 not landed).
