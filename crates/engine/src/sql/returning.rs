@@ -241,6 +241,12 @@ pub(crate) fn project_row(
                     *budget = try_accumulate_budget(*budget, bytes, MAX_RETURNING_RESULT_BYTES)?;
                     Cell::Vector(crate::sql::exec::expand_halfvec(v)?)
                 }
+                // INT8VEC も f32 へ広げた `Cell::Vector` で返す（Issue #2018）。展開後の大きさで課金する。
+                Some(Value::Int8Vec(v)) => {
+                    let bytes = v.len().saturating_mul(std::mem::size_of::<f32>());
+                    *budget = try_accumulate_budget(*budget, bytes, MAX_RETURNING_RESULT_BYTES)?;
+                    Cell::Vector(crate::sql::exec::expand_int8vec(v)?)
+                }
                 Some(Value::Bit(v)) => Cell::Bit(try_alloc_bit_for_budget(
                     v,
                     budget,

@@ -198,6 +198,10 @@ pub enum Value {
     /// `Vector` を流用しない（UPDATE の embedding 取り込みへ紛れ込むのを防ぐ）。行バイト表現は
     /// presence + `u32` LE 次元 + 次元 × `u16` LE。
     HalfVec(Vec<u16>),
+    /// `INT8VEC(N)` 列の値（TABLE-49・Issue #2018）。`Vector`・`HalfVec` を流用しない
+    /// （UPDATE の embedding 取り込みへ紛れ込むのを防ぐ）。行バイト表現は
+    /// presence + `u32` LE 次元 + 次元 × 1 バイト（i8 の 2 の補数）。
+    Int8Vec(Vec<i8>),
     /// 配列列の値（TABLE-14・TASK-198、Issue #888）。要素型ごとに variant を
     /// 分けることで、同一列の要素がすべて同じ型であることを型で保証する
     /// （`ColumnType::Array` の `ArrayElemType` と対応させる）。
@@ -965,6 +969,9 @@ pub enum ScalarRef<'a> {
     /// `HALFVEC(N)` 列の借用結果（TABLE-46・Issue #2014）。`u16` LE × 次元の検証済みバイト列
     /// （長さは偶数・全要素有限）。値化は [`halfvec_bytes_to_bits`]。
     HalfVec(&'a [u8]),
+    /// `INT8VEC(N)` 列の借用結果（TABLE-49・Issue #2018）。次元バイトの検証済み列
+    /// （1 バイト = 1 要素の i8）。値化は [`int8vec_bytes_to_values`]。
+    Int8Vec(&'a [u8]),
     /// 配列列の借用結果（Issue #888）。構造・UTF-8・要素上限はすべて走査時に
     /// 検証済みで、[`ArrayRef::to_value`] は追加のエラー処理なしに複製できる。
     Array(ArrayRef<'a>),
@@ -1015,6 +1022,7 @@ impl<'a> ScalarRef<'a> {
             | ScalarRef::Interval(_)
             | ScalarRef::Bit(_)
             | ScalarRef::HalfVec(_)
+            | ScalarRef::Int8Vec(_)
             | ScalarRef::Array(_)
             | ScalarRef::Bytes(_)
             | ScalarRef::Json(_)
@@ -1039,6 +1047,7 @@ impl<'a> ScalarRef<'a> {
             | ScalarRef::Interval(_)
             | ScalarRef::Bit(_)
             | ScalarRef::HalfVec(_)
+            | ScalarRef::Int8Vec(_)
             | ScalarRef::Array(_)
             | ScalarRef::Bytes(_)
             | ScalarRef::Json(_)
@@ -1065,6 +1074,7 @@ impl<'a> ScalarRef<'a> {
             | ScalarRef::Interval(_)
             | ScalarRef::Bit(_)
             | ScalarRef::HalfVec(_)
+            | ScalarRef::Int8Vec(_)
             | ScalarRef::Array(_)
             | ScalarRef::Bytes(_)
             | ScalarRef::Json(_)
@@ -1091,6 +1101,7 @@ impl<'a> ScalarRef<'a> {
             | ScalarRef::Interval(_)
             | ScalarRef::Bit(_)
             | ScalarRef::HalfVec(_)
+            | ScalarRef::Int8Vec(_)
             | ScalarRef::Array(_)
             | ScalarRef::Bytes(_)
             | ScalarRef::Json(_)
@@ -1127,6 +1138,7 @@ impl<'a> ScalarRef<'a> {
             | ScalarRef::Interval(_)
             | ScalarRef::Bit(_)
             | ScalarRef::HalfVec(_)
+            | ScalarRef::Int8Vec(_)
             | ScalarRef::Text(_)
             | ScalarRef::Integer(_)
             | ScalarRef::BigInt(_)
@@ -1164,6 +1176,7 @@ impl<'a> ScalarRef<'a> {
             | ScalarRef::Interval(_)
             | ScalarRef::Bit(_)
             | ScalarRef::HalfVec(_)
+            | ScalarRef::Int8Vec(_)
             | ScalarRef::Array(_)
             | ScalarRef::Bytes(_)
             | ScalarRef::Json(_)
@@ -1194,6 +1207,7 @@ impl<'a> ScalarRef<'a> {
             | ScalarRef::Interval(_)
             | ScalarRef::Bit(_)
             | ScalarRef::HalfVec(_)
+            | ScalarRef::Int8Vec(_)
             | ScalarRef::Array(_)
             | ScalarRef::Bytes(_)
             | ScalarRef::Json(_)
@@ -1226,6 +1240,7 @@ impl<'a> ScalarRef<'a> {
             | ScalarRef::Interval(_)
             | ScalarRef::Bit(_)
             | ScalarRef::HalfVec(_)
+            | ScalarRef::Int8Vec(_)
             | ScalarRef::Array(_)
             | ScalarRef::Json(_)
             | ScalarRef::Enum(_)
@@ -1254,6 +1269,7 @@ impl<'a> ScalarRef<'a> {
             | ScalarRef::Interval(_)
             | ScalarRef::Bit(_)
             | ScalarRef::HalfVec(_)
+            | ScalarRef::Int8Vec(_)
             | ScalarRef::Array(_)
             | ScalarRef::Bytes(_)
             | ScalarRef::Json(_)
@@ -1553,6 +1569,83 @@ fn read_halfvec_payload(
         ));
     }
     Ok((body, end))
+}
+
+/// `INT8VEC(N)` 値 1 個をスカラーペイロードへ書き込んだ場合のフレーム込みバイト数
+/// （presence(1) + 次元(4, LE u32) + 次元 × 1。Issue #2018・TABLE-49）。次元が宣言と
+/// 不一致・上限超過の場合は `Invalid`（fail-closed）。i8 は全ビットパターンが有効なので
+/// 値の検査は不要。
+fn int8vec_entry_len(
+    column: &crate::catalog::ColumnDef,
+    v: &[i8],
+) -> std::result::Result<u32, RowCodecError> {
+    let ColumnType::Int8Vec(declared) = column.ty else {
+        return Err(RowCodecError::Invalid(format!(
+            "column {:?} expects a non-Int8Vec value, got Int8Vec",
+            column.name
+        )));
+    };
+    let dim = u32::try_from(v.len())
+        .map_err(|_| RowCodecError::Invalid(format!("int8vec dim too large: {}", v.len())))?;
+    if dim != declared {
+        return Err(RowCodecError::Invalid(format!(
+            "int8vec dim mismatch for column {:?}: expected {declared}, got {dim}",
+            column.name
+        )));
+    }
+    if dim > MAX_EMBEDDING_DIM {
+        return Err(RowCodecError::Invalid(format!(
+            "int8vec dim {dim} exceeds limit {MAX_EMBEDDING_DIM}"
+        )));
+    }
+    dim.checked_add(5)
+        .ok_or_else(|| RowCodecError::Invalid("int8vec field length overflow".to_string()))
+}
+
+/// `INT8VEC(N)` の値部（次元 `u32` LE + 1 バイト × 次元）を書き込む。呼び出し側が presence の
+/// 書き込みと [`int8vec_entry_len`] による検証を済ませている前提（Issue #2018）。
+fn write_int8vec_payload(buf: &mut Vec<u8>, v: &[i8]) {
+    let dim = u32::try_from(v.len()).unwrap_or(u32::MAX);
+    buf.extend_from_slice(&dim.to_le_bytes());
+    buf.extend(v.iter().map(|b| b.to_le_bytes()[0]));
+}
+
+/// `INT8VEC(N)` の値部を `offset` から読み、次元が宣言 `declared` と一致すること・上限内・
+/// 残りバイト数が足りることを確保より前に検証して、要素バイト列の借用と次の offset を返す。
+/// いずれかに反する行バイト列は `Invalid`（fail-closed）。
+fn read_int8vec_payload(
+    buf: &[u8],
+    offset: usize,
+    declared: u32,
+) -> std::result::Result<(&[u8], usize), RowCodecError> {
+    let len_end = offset
+        .checked_add(4)
+        .ok_or_else(|| RowCodecError::Invalid("offset overflow before int8vec dim".to_string()))?;
+    let dim_bytes: [u8; 4] = buf
+        .get(offset..len_end)
+        .ok_or_else(|| RowCodecError::Invalid("row buffer truncated at int8vec dim".to_string()))?
+        .try_into()
+        .map_err(|_| RowCodecError::Invalid("int8vec dim field is not 4 bytes".to_string()))?;
+    let dim = u32::from_le_bytes(dim_bytes);
+    if dim != declared || dim > MAX_EMBEDDING_DIM {
+        return Err(RowCodecError::Invalid(
+            "int8vec dim does not match the declared column type".to_string(),
+        ));
+    }
+    let body_len = usize::try_from(dim)
+        .map_err(|_| RowCodecError::Invalid("int8vec field length overflow".to_string()))?;
+    let end = len_end
+        .checked_add(body_len)
+        .ok_or_else(|| RowCodecError::Invalid("offset overflow after int8vec field".to_string()))?;
+    let body = buf.get(len_end..end).ok_or_else(|| {
+        RowCodecError::Invalid("row buffer truncated at int8vec field".to_string())
+    })?;
+    Ok((body, end))
+}
+
+/// 検証済み `INT8VEC` 要素バイト列（1 バイト = 1 要素）を i8 列へ戻す。
+pub(crate) fn int8vec_bytes_to_values(bytes: &[u8]) -> Vec<i8> {
+    bytes.iter().map(|b| i8::from_le_bytes([*b])).collect()
 }
 
 /// 検証済み `HALFVEC` 要素バイト列（`u16` LE の並び）を f16 ビット列へ戻す。
@@ -2609,6 +2702,7 @@ pub fn encode_row(
                     | ColumnType::Interval
                     | ColumnType::Bit(_)
                     | ColumnType::HalfVec(_)
+                    | ColumnType::Int8Vec(_)
                     | ColumnType::Array(_)
                     | ColumnType::Bytea
                     | ColumnType::Json
@@ -2658,6 +2752,7 @@ pub fn encode_row(
                     | ColumnType::Interval
                     | ColumnType::Bit(_)
                     | ColumnType::HalfVec(_)
+                    | ColumnType::Int8Vec(_)
                     | ColumnType::Array(_)
                     | ColumnType::Bytea
                     | ColumnType::Json
@@ -2811,6 +2906,11 @@ pub fn encode_row(
                 buf.push(PRESENCE_VALUE);
                 write_halfvec_payload(&mut buf, v);
             }
+            Value::Int8Vec(v) => {
+                int8vec_entry_len(column, v)?;
+                buf.push(PRESENCE_VALUE);
+                write_int8vec_payload(&mut buf, v);
+            }
             Value::Array(array_value) => {
                 let array_ty = match &column.ty {
                     ColumnType::Array(array_ty) => array_ty,
@@ -2831,6 +2931,7 @@ pub fn encode_row(
                     | ColumnType::Interval
                     | ColumnType::Bit(_)
                     | ColumnType::HalfVec(_)
+                    | ColumnType::Int8Vec(_)
                     | ColumnType::Bytea
                     | ColumnType::Json
                     | ColumnType::Jsonb
@@ -2897,6 +2998,7 @@ pub fn encode_row(
                     | ColumnType::Interval
                     | ColumnType::Bit(_)
                     | ColumnType::HalfVec(_)
+                    | ColumnType::Int8Vec(_)
                     | ColumnType::Array(_)
                     | ColumnType::Bytea
                     | ColumnType::Json
@@ -3478,6 +3580,11 @@ pub fn decode_row(schema: &TableSchema, buf: &[u8]) -> Result<DecodedRow> {
                     offset = new_offset;
                     values.push(Value::HalfVec(halfvec_bytes_to_bits(body)));
                 }
+                ColumnType::Int8Vec(declared) => {
+                    let (body, new_offset) = read_int8vec_payload(buf, offset, *declared)?;
+                    offset = new_offset;
+                    values.push(Value::Int8Vec(int8vec_bytes_to_values(body)));
+                }
                 ColumnType::Array(array_ty) => {
                     let (array_ref, new_offset) =
                         parse_array_frame(buf, offset, array_ty.elem(), array_ty.max_len())?;
@@ -3815,6 +3922,7 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                     | ColumnType::Interval
                     | ColumnType::Bit(_)
                     | ColumnType::HalfVec(_)
+                    | ColumnType::Int8Vec(_)
                     | ColumnType::Array(_)
                     | ColumnType::Bytea
                     | ColumnType::Json
@@ -3983,6 +4091,12 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                 buf.push(PRESENCE_VALUE);
                 write_halfvec_payload(&mut buf, v);
             }
+            Value::Int8Vec(v) => {
+                let entry_len = int8vec_entry_len(column, v)?;
+                reserve(&mut buf, entry_len)?;
+                buf.push(PRESENCE_VALUE);
+                write_int8vec_payload(&mut buf, v);
+            }
             Value::Array(array_value) => {
                 let array_ty = match &column.ty {
                     ColumnType::Array(array_ty) => array_ty,
@@ -4003,6 +4117,7 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                     | ColumnType::Interval
                     | ColumnType::Bit(_)
                     | ColumnType::HalfVec(_)
+                    | ColumnType::Int8Vec(_)
                     | ColumnType::Bytea
                     | ColumnType::Json
                     | ColumnType::Jsonb
@@ -4086,6 +4201,7 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                     | ColumnType::Interval
                     | ColumnType::Bit(_)
                     | ColumnType::HalfVec(_)
+                    | ColumnType::Int8Vec(_)
                     | ColumnType::Array(_)
                     | ColumnType::Bytea
                     | ColumnType::Json
@@ -4359,6 +4475,7 @@ fn validate_json_column_value(column: &crate::catalog::ColumnDef, text: &str) ->
         | ColumnType::Interval
         | ColumnType::Bit(_)
         | ColumnType::HalfVec(_)
+        | ColumnType::Int8Vec(_)
         | ColumnType::Array(_)
         | ColumnType::Bytea
         | ColumnType::Enum(_)
@@ -4592,6 +4709,7 @@ pub(crate) fn merge_encode_scalar_columns(
                         | ColumnType::Interval
                         | ColumnType::Bit(_)
                         | ColumnType::HalfVec(_)
+                        | ColumnType::Int8Vec(_)
                         | ColumnType::Array(_)
                         | ColumnType::Bytea
                         | ColumnType::Json
@@ -4749,6 +4867,12 @@ pub(crate) fn merge_encode_scalar_columns(
                     buf.push(PRESENCE_VALUE);
                     write_halfvec_payload(&mut buf, v);
                 }
+                Value::Int8Vec(v) => {
+                    let entry_len = int8vec_entry_len(column, v)?;
+                    reserve(&mut buf, entry_len)?;
+                    buf.push(PRESENCE_VALUE);
+                    write_int8vec_payload(&mut buf, v);
+                }
                 Value::Array(array_value) => {
                     let array_ty = match &column.ty {
                         ColumnType::Array(array_ty) => array_ty,
@@ -4769,6 +4893,7 @@ pub(crate) fn merge_encode_scalar_columns(
                         | ColumnType::Interval
                         | ColumnType::Bit(_)
                         | ColumnType::HalfVec(_)
+                        | ColumnType::Int8Vec(_)
                         | ColumnType::Bytea
                         | ColumnType::Json
                         | ColumnType::Jsonb
@@ -4815,6 +4940,7 @@ pub(crate) fn merge_encode_scalar_columns(
                         | ColumnType::Interval
                         | ColumnType::Bit(_)
                         | ColumnType::HalfVec(_)
+                        | ColumnType::Int8Vec(_)
                         | ColumnType::Array(_)
                         | ColumnType::Bytea
                         | ColumnType::Json
@@ -4981,6 +5107,13 @@ pub(crate) fn merge_encode_scalar_columns(
                     reserve(&mut buf, entry_len)?;
                     buf.push(PRESENCE_VALUE);
                     write_halfvec_payload(&mut buf, &owned);
+                }
+                Some(ScalarRef::Int8Vec(body)) => {
+                    let owned = int8vec_bytes_to_values(body);
+                    let entry_len = int8vec_entry_len(column, &owned)?;
+                    reserve(&mut buf, entry_len)?;
+                    buf.push(PRESENCE_VALUE);
+                    write_int8vec_payload(&mut buf, &owned);
                 }
                 Some(ScalarRef::Array(array_ref)) => {
                     let payload_len = u32::try_from(array_ref.bytes.len()).map_err(|_| {
@@ -6103,6 +6236,16 @@ fn scan_scalar_columns_validated<'a>(
                         sink(col_index, None)?;
                     }
                 }
+                ColumnType::Int8Vec(declared) => {
+                    // 宣言次元との一致・上限・バッファ長を確保前に検証する（Issue #2018）。
+                    let (body, new_offset) = read_int8vec_payload(buf, offset, *declared)?;
+                    offset = new_offset;
+                    if wanted {
+                        sink(col_index, Some(ScalarRef::Int8Vec(body)))?;
+                    } else {
+                        sink(col_index, None)?;
+                    }
+                }
                 ColumnType::Json | ColumnType::Jsonb => {
                     // フレーミング・UTF-8 検証は TEXT と共有する（Issue #889 D2）。
                     // 格納時（encode 経路）に構文検証・正規化済みのため、ここでは
@@ -6198,6 +6341,7 @@ pub fn scalar_refs_as_text<'a>(scanned: &[Option<ScalarRef<'a>>]) -> Vec<Option<
             | Some(ScalarRef::Interval(_))
             | Some(ScalarRef::Bit(_))
             | Some(ScalarRef::HalfVec(_))
+            | Some(ScalarRef::Int8Vec(_))
             | Some(ScalarRef::Array(_))
             | Some(ScalarRef::Bytes(_))
             | Some(ScalarRef::Json(_))
@@ -6261,6 +6405,9 @@ pub fn decode_scalar_columns(schema: &TableSchema, buf: &[u8]) -> Result<Vec<Val
                 })?)),
             Some(ScalarRef::HalfVec(body)) => {
                 values.push(Value::HalfVec(halfvec_bytes_to_bits(body)));
+            }
+            Some(ScalarRef::Int8Vec(body)) => {
+                values.push(Value::Int8Vec(int8vec_bytes_to_values(body)));
             }
             Some(ScalarRef::Array(array_ref)) => {
                 values.push(Value::Array(array_ref.to_value()?));

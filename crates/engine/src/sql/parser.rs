@@ -857,6 +857,105 @@ pub(crate) fn bind_halfvec_values(
     Ok(crate::row_codec::Value::HalfVec(bits))
 }
 
+/// `INT8VEC(N)` 列（TABLE-49・Issue #2018）向けのテキスト入力 `[i1,i2,...]` の解析。
+/// `parse_vector_literal` は形式不正を `22000` にするため流用せず、要素単位で SQLSTATE を
+/// 分ける: 長さ上限超過は `54000`、`[`…`]` 欠落・整数でない表記（`1.5`・`1e2`・空要素・`abc`・
+/// `0x10`）は `22P02`、数字列として正しいが i8（−128〜127）の範囲外（桁数過大を含む）は
+/// `22003`、要素数と宣言次元の不一致は `22000`。`-0` は 0。エラー文言に入力値は含めない。
+/// INSERT／UPDATE SET／UPSERT／`$n` テキスト束縛が共有する単一情報源。
+pub(crate) fn parse_int8vec_literal(
+    literal: &str,
+    expected_dim: u32,
+) -> Result<Vec<i8>, SqlSurfaceError> {
+    if literal.len() > MAX_VECTOR_LITERAL_BYTES {
+        return Err(SqlSurfaceError::payload_too_large(format!(
+            "int8vec literal length {} exceeds limit {MAX_VECTOR_LITERAL_BYTES}",
+            literal.len()
+        )));
+    }
+    let inner = literal
+        .trim()
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .ok_or_else(|| {
+            SqlSurfaceError::invalid_text_representation(
+                "int8vec literal must be of the form [i1,i2,...]",
+            )
+        })?;
+    let mut values: Vec<i8> = Vec::new();
+    if !inner.trim().is_empty() {
+        for part in inner.split(',') {
+            let part = part.trim();
+            let digits = part
+                .strip_prefix('-')
+                .or_else(|| part.strip_prefix('+'))
+                .unwrap_or(part);
+            if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(SqlSurfaceError::invalid_text_representation(
+                    "int8vec literal element is not an integer",
+                ));
+            }
+            // 数字列としては正しいので、parse 失敗は i8 の範囲外（桁数過大を含む）。
+            let v: i8 = part.parse().map_err(|_| {
+                SqlSurfaceError::numeric_out_of_range(
+                    "int8vec literal element is out of range for type int8vec",
+                )
+            })?;
+            values.push(v);
+        }
+    }
+    let dim = u32::try_from(values.len()).map_err(|_| {
+        SqlSurfaceError::payload_too_large("int8vec literal element count exceeds limit")
+    })?;
+    if dim != expected_dim {
+        return Err(SqlSurfaceError::invalid_input(format!(
+            "int8vec literal dimension mismatch: expected {expected_dim}, got {dim}"
+        )));
+    }
+    Ok(values)
+}
+
+/// `INT8VEC(N)` 列（TABLE-49・Issue #2018）向けの束縛。NoSQL 表層が JSON 整数配列から作る
+/// [`InsertLiteral::Vector`] の `f32` 列を受け、次元一致（`22000`）・各要素が有限かつ整数
+/// （違反は `22P02`）・i8 範囲内（違反は `22003`）を engine 側で改めて検証する（wire-server
+/// の検証結果を無条件に信頼しない多層防御）。エラー文言に入力値は含めない。
+pub(crate) fn bind_int8vec_values(
+    values: &[f32],
+    expected_dim: u32,
+    name: &str,
+) -> Result<crate::row_codec::Value, SqlSurfaceError> {
+    let dim = u32::try_from(values.len()).map_err(|_| {
+        SqlSurfaceError::payload_too_large(format!(
+            "column {name:?}: int8vec element count {} exceeds representable range",
+            values.len()
+        ))
+    })?;
+    if dim != expected_dim {
+        return Err(SqlSurfaceError::invalid_input(format!(
+            "column {name:?}: int8vec dimension mismatch: expected {expected_dim}, got {dim}"
+        )));
+    }
+    let mut out: Vec<i8> = Vec::new();
+    out.try_reserve_exact(values.len()).map_err(|_| {
+        SqlSurfaceError::payload_too_large("int8vec payload exceeds available memory")
+    })?;
+    for v in values {
+        if !v.is_finite() || v.fract() != 0.0 {
+            return Err(SqlSurfaceError::invalid_text_representation(format!(
+                "column {name:?}: int8vec element must be an integer"
+            )));
+        }
+        if !(-128.0..=127.0).contains(v) {
+            return Err(SqlSurfaceError::numeric_out_of_range(format!(
+                "column {name:?}: value out of range for type int8vec"
+            )));
+        }
+        // 範囲・整数性を検証済みのため、この変換で値は変わらない。
+        out.push(*v as i8);
+    }
+    Ok(crate::row_codec::Value::Int8Vec(out))
+}
+
 /// `SMALLINT`／`INTEGER`／`BIGINT` 列（Issue #881・#1558・TABLE-13・TASK-196）向けの数値リテラル
 /// 束縛。`literal` は `InsertLiteral::Number`（`allowlist::expect_literal` が
 /// 単項マイナスを正規化済み）のみを受理し、`InsertLiteral::String` は
@@ -947,6 +1046,7 @@ pub(crate) fn bind_integer_literal(
         | ColumnType::Interval
         | ColumnType::Bit(_)
         | ColumnType::HalfVec(_)
+        | ColumnType::Int8Vec(_)
         | ColumnType::Array(_)
         | ColumnType::Bytea
         | ColumnType::Json
@@ -1129,6 +1229,7 @@ pub(crate) fn bind_datetime_literal(
         | ColumnType::Boolean
         | ColumnType::Bit(_)
         | ColumnType::HalfVec(_)
+        | ColumnType::Int8Vec(_)
         | ColumnType::Array(_)
         | ColumnType::Bytea
         | ColumnType::Json
@@ -1599,6 +1700,7 @@ pub(crate) fn vector_column(schema: &TableSchema) -> Result<(usize, u32), SqlSur
             | ColumnType::Interval
             | ColumnType::Bit(_)
             | ColumnType::HalfVec(_)
+            | ColumnType::Int8Vec(_)
             | ColumnType::Array(_)
             | ColumnType::Bytea
             | ColumnType::Json
@@ -1617,6 +1719,15 @@ pub(crate) fn vector_column(schema: &TableSchema) -> Result<(usize, u32), SqlSur
             {
                 SqlSurfaceError::feature_not_supported(
                     "vector search over HALFVEC columns is not supported",
+                )
+            } else if schema
+                .columns
+                .iter()
+                .any(|c| matches!(c.ty, ColumnType::Int8Vec(_)))
+            {
+                // INT8VEC の距離計算・kNN は兄弟 Issue #2019 まで未対応（fail-closed。Issue #2018）。
+                SqlSurfaceError::feature_not_supported(
+                    "vector search over INT8VEC columns is not supported",
                 )
             } else {
                 SqlSurfaceError::invalid_input("table has no VECTOR column")
@@ -1669,6 +1780,7 @@ pub(crate) fn text_column_index(
                 | ColumnType::Interval
                 | ColumnType::Bit(_)
                 | ColumnType::HalfVec(_)
+                | ColumnType::Int8Vec(_)
                 | ColumnType::Array(_)
                 | ColumnType::Bytea
                 | ColumnType::Json
@@ -4209,6 +4321,17 @@ fn bind_insert_row(
                     "column {name:?} expects a vector literal, got a non-vector literal"
                 )))
             }
+            (ColumnType::Int8Vec(dim), InsertLiteral::String(s)) => {
+                crate::row_codec::Value::Int8Vec(parse_int8vec_literal(s, *dim)?)
+            }
+            (ColumnType::Int8Vec(dim), InsertLiteral::Vector(values)) => {
+                bind_int8vec_values(values, *dim, name)?
+            }
+            (ColumnType::Int8Vec(_), InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects an int8vec literal, got a non-vector literal"
+                )))
+            }
             (ColumnType::Bit(bit_len), InsertLiteral::String(s)) => {
                 bind_bit_literal(name, *bit_len, s)?
             }
@@ -4399,6 +4522,7 @@ pub(crate) fn bind_json_literal(
         | ColumnType::Interval
         | ColumnType::Bit(_)
         | ColumnType::HalfVec(_)
+        | ColumnType::Int8Vec(_)
         | ColumnType::Array(_)
         | ColumnType::Bytea
         | ColumnType::Enum(_)
@@ -4770,6 +4894,17 @@ pub(crate) fn bind_set_assignments(
             (ColumnType::HalfVec(_), InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects a vector literal, got a non-vector literal"
+                )))
+            }
+            (ColumnType::Int8Vec(dim), InsertLiteral::String(s)) => {
+                crate::row_codec::Value::Int8Vec(parse_int8vec_literal(s, *dim)?)
+            }
+            (ColumnType::Int8Vec(dim), InsertLiteral::Vector(values)) => {
+                bind_int8vec_values(values, *dim, name)?
+            }
+            (ColumnType::Int8Vec(_), InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects an int8vec literal, got a non-vector literal"
                 )))
             }
             (ColumnType::Bit(bit_len), InsertLiteral::String(s)) => {
@@ -6365,6 +6500,17 @@ fn bind_upsert_assignments(
                             "column {name:?} expects a vector literal, got a non-vector literal"
                         )))
                     }
+                    (ColumnType::Int8Vec(dim), InsertLiteral::String(s)) => {
+                        crate::row_codec::Value::Int8Vec(parse_int8vec_literal(s, *dim)?)
+                    }
+                    (ColumnType::Int8Vec(dim), InsertLiteral::Vector(values)) => {
+                        bind_int8vec_values(values, *dim, name)?
+                    }
+                    (ColumnType::Int8Vec(_), InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+                        return Err(SqlSurfaceError::invalid_input(format!(
+                            "column {name:?} expects an int8vec literal, got a non-vector literal"
+                        )))
+                    }
                     (ColumnType::Bit(bit_len), InsertLiteral::String(s)) => {
                         bind_bit_literal(name, *bit_len, s)?
                     }
@@ -6626,6 +6772,11 @@ fn bind_file_insert(
             (ColumnType::HalfVec(_), _) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?}: HALFVEC column is not supported for file-form INSERT"
+                )))
+            }
+            (ColumnType::Int8Vec(_), _) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?}: INT8VEC column is not supported for file-form INSERT"
                 )))
             }
             // 配列列（TABLE-14・Issue #888）も BOOLEAN と同じく対象外として拒否する。
@@ -7905,6 +8056,11 @@ fn resolve_aggregate_input(
                         "column {name:?} is HALFVEC and cannot be used with aggregate functions"
                     )))
                     }
+                    (ColumnType::Int8Vec(_), _) => {
+                        Err(SqlSurfaceError::undefined_function(format!(
+                        "column {name:?} is INT8VEC and cannot be used with aggregate functions"
+                    )))
+                    }
                     (ColumnType::Vector(_), AggregateFunc::Count) => {
                         Ok(AggregateInput::VectorColumnPresence)
                     }
@@ -8515,6 +8671,7 @@ fn bind_array_agg_value(
             | ColumnType::Interval
             | ColumnType::Bit(_)
             | ColumnType::HalfVec(_)
+            | ColumnType::Int8Vec(_)
             | ColumnType::Vector(_)
             | ColumnType::Array(_)
             | ColumnType::Enum(_) => {
@@ -8764,6 +8921,9 @@ fn resolve_count_distinct_input(
                     ))),
                     ColumnType::HalfVec(_) => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} is HALFVEC and cannot be used with COUNT(DISTINCT ...)"
+                    ))),
+                    ColumnType::Int8Vec(_) => Err(SqlSurfaceError::invalid_input(format!(
+                        "column {name:?} is INT8VEC and cannot be used with COUNT(DISTINCT ...)"
                     ))),
                     ColumnType::SmallInt => Ok(AggregateInput::SmallIntColumn(index)),
                     ColumnType::Integer => Ok(AggregateInput::IntegerColumn(index)),
@@ -9552,6 +9712,7 @@ fn resolve_order_kind(ty: &ColumnType) -> Option<OrderKind> {
         ColumnType::Vector(_)
         | ColumnType::Bit(_)
         | ColumnType::HalfVec(_)
+        | ColumnType::Int8Vec(_)
         | ColumnType::Array(_)
         | ColumnType::Bytea
         | ColumnType::Json
@@ -10980,6 +11141,7 @@ fn resolve_window_key(name: &str, schema: &TableSchema) -> Result<WindowKeyRef, 
             | ColumnType::Interval
             | ColumnType::Bit(_)
             | ColumnType::HalfVec(_)
+            | ColumnType::Int8Vec(_)
             | ColumnType::Enum(_) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} cannot be used as a window PARTITION BY/ORDER BY key"

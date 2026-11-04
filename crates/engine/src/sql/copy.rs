@@ -662,6 +662,12 @@ fn bind_copy_record(
                 "COPY does not support HALFVEC columns",
             ));
         }
+        // INT8VEC の COPY も同じ理由で未対応（fail-closed。Issue #2018・TABLE-49）。
+        if matches!(column.ty, ColumnType::Int8Vec(_)) {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "COPY does not support INT8VEC columns",
+            ));
+        }
         let value = match field {
             None => {
                 // 明示的な `\N`（COPY テキスト形式の NULL マーカー）は
@@ -694,6 +700,12 @@ fn bind_copy_record(
                 ColumnType::HalfVec(_) => {
                     return Err(SqlSurfaceError::feature_not_supported(
                         "COPY does not support HALFVEC columns",
+                    ))
+                }
+                // INT8VEC の COPY は担当 Issue 未定まで未対応（fail-closed。Issue #2018・TABLE-49）。
+                ColumnType::Int8Vec(_) => {
+                    return Err(SqlSurfaceError::feature_not_supported(
+                        "COPY does not support INT8VEC columns",
                     ))
                 }
                 // BIT(n) は INSERT／UPDATE／UPSERT／DEFAULT と同じ束縛を共有する（Issue #2021）。
@@ -823,6 +835,8 @@ fn bound_insert_byte_len(bound: &BoundInsert) -> Result<usize, SqlSurfaceError> 
             Value::Bit(v) => 5usize.saturating_add(v.as_bytes().len()),
             // HALFVEC 値は presence(1) + 次元(4) + 次元 × 2（Issue #2014）。
             Value::HalfVec(v) => 5usize.saturating_add(v.len().saturating_mul(2)),
+            // INT8VEC 値は presence(1) + 次元(4) + 次元 × 1（Issue #2018）。
+            Value::Int8Vec(v) => 5usize.saturating_add(v.len()),
             // NUMERIC／UUID 値は行コーデック上いずれも 16 バイト固定
             // （`core.rs::validate_insert_batch_byte_and_chunk_limits` と
             // 同一の判定対象量定義。Issue #885・#887）。
