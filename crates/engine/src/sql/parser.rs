@@ -2124,6 +2124,10 @@ pub(crate) struct LiteralSkip {
     /// （Issue #2953。INT8VEC の書き換えだけが参照し、`$n` 由来の距離式のダミー値だけを有効な
     /// ゼロベクトルへ置き換えて束縛する。実リテラルは置換せず検証する）。
     pub(crate) where_distance_mask: Vec<bool>,
+    /// `where_distance_mask` と同じ添字の「脱糖後に AST 上へ複製される距離式の個数」
+    /// （`BETWEEN` は 2・`IN` は要素数・他は 1・確定不能は 0）。PR #2956 指摘: 構造一致ではなく
+    /// トークン位置から求め、異なる `$n` の距離式を同じ塊にまとめない。
+    pub(crate) where_distance_copies: Vec<usize>,
 }
 
 impl LiteralSkip {
@@ -2132,6 +2136,7 @@ impl LiteralSkip {
         order_by: false,
         projection_mask: Vec::new(),
         where_distance_mask: Vec::new(),
+        where_distance_copies: Vec::new(),
     };
 
     pub(crate) fn skips_projection_item(&self, index: usize) -> bool {

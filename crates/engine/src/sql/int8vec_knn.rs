@@ -214,7 +214,11 @@ fn placeholder_predicates(
     let expanded;
     let mask: &[bool] = if counter.ordinal == skip.where_distance_mask.len() {
         &skip.where_distance_mask
-    } else if let Some(m) = expand_mask_over_desugared(&counter.seen, &skip.where_distance_mask) {
+    } else if let Some(m) = expand_mask_by_copies(
+        counter.seen.len(),
+        &skip.where_distance_mask,
+        &skip.where_distance_copies,
+    ) {
         expanded = m;
         &expanded
     } else {
@@ -240,26 +244,24 @@ struct PlaceholderWalker<'a> {
     seen: Vec<Expr>,
 }
 
-/// BETWEEN／IN の脱糖で左辺の距離式が隣接して複製され、AST 上の距離式数がトークン上の距離演算子数
+/// BETWEEN／IN の脱糖で左辺の距離式が複製され、AST 上の距離式数がトークン上の距離演算子数
 /// （`mask.len()`）を超える場合に、トークン単位の印を AST の距離式の出現順へ展開する（PR #2956 指摘）。
-/// 隣接して構造が等しい距離式を 1 つの塊とみなし、塊数がトークン数と一致するときだけ、各塊の全複製へ
-/// 同じ印を引き継ぐ。一致しない・曖昧な形は `None`（fail-closed。何も置換しない）。
-fn expand_mask_over_desugared(seen: &[Expr], mask: &[bool]) -> Option<Vec<bool>> {
-    if seen.len() <= mask.len() {
+/// 各トークンの複製数（`copies`。トークン位置から [`crate::sql::params::where_distance_copy_counts`]
+/// が決める）だけ印を繰り返す。構造一致での推定はしない（Describe では異なる `$n` が同じ仮値になり、
+/// 独立した距離式を 1 つの塊と取り違えるため）。複製数が不明（0）・長さ不一致・総数が AST の距離式数と
+/// 合わない形は `None`（fail-closed。何も置換しない）。
+fn expand_mask_by_copies(seen_len: usize, mask: &[bool], copies: &[usize]) -> Option<Vec<bool>> {
+    if copies.len() != mask.len() {
         return None;
     }
-    let mut out: Vec<bool> = Vec::with_capacity(seen.len());
-    let mut group: usize = 0;
-    for (i, e) in seen.iter().enumerate() {
-        let same_as_prev = i > 0 && seen.get(i - 1) == Some(e);
-        if same_as_prev {
-            out.push(*out.last()?);
-        } else {
-            out.push(*mask.get(group)?);
-            group = group.checked_add(1)?;
+    let mut out: Vec<bool> = Vec::with_capacity(seen_len);
+    for (flag, n) in mask.iter().zip(copies) {
+        if *n == 0 || out.len().checked_add(*n)? > seen_len {
+            return None;
         }
+        out.extend(std::iter::repeat_n(*flag, *n));
     }
-    (group == mask.len()).then_some(out)
+    (out.len() == seen_len).then_some(out)
 }
 
 impl PlaceholderWalker<'_> {

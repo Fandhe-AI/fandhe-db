@@ -2189,6 +2189,94 @@ pub fn where_distance_param_mask(tokens: &[Token]) -> Vec<bool> {
         .collect()
 }
 
+/// [`where_distance_param_mask`] と同じ区間・同じ出現順で、距離演算子ごとに「構文段の脱糖で AST 上に
+/// 何個の距離式へ複製されるか」を返す（Issue #2953・PR #2956 指摘）。`<距離式> [NOT] BETWEEN a AND b`
+/// は 2 個、`<距離式> [NOT] IN (e1, ..., en)` は n 個へ左辺が複製される。それ以外は 1 個。
+/// 境界・要素が単一トークン（任意で前置 `-`）でない形は複製数を確定できないため `0`（不明）とし、
+/// 呼び出し側は置換を断念する（fail-closed）。構造一致からの推定はせず、トークン位置だけで決める。
+pub fn where_distance_copy_counts(tokens: &[Token]) -> Vec<usize> {
+    let mut depth: usize = 0;
+    let mut start: Option<usize> = None;
+    let mut end = tokens.len();
+    for (i, t) in tokens.iter().enumerate() {
+        match t {
+            Token::Punct('(') => depth = depth.saturating_add(1),
+            Token::Punct(')') => depth = depth.saturating_sub(1),
+            Token::Keyword(lexer::Keyword::From) if depth == 0 && start.is_none() => {
+                start = Some(i);
+            }
+            Token::Keyword(lexer::Keyword::Order) if depth == 0 && start.is_some() => {
+                end = i;
+                break;
+            }
+            _ => {}
+        }
+    }
+    let Some(start) = start else {
+        return Vec::new();
+    };
+    let region = tokens.get(start..end).unwrap_or(&[]);
+    let is_word = |i: usize, k: &str| matches!(region.get(i), Some(Token::Ident(w)) if w.eq_ignore_ascii_case(k));
+    // `at` から単一の値（任意で前置 `-`）を読み、次の位置を返す。
+    let value_end = |at: usize| -> Option<usize> {
+        let at = if matches!(region.get(at), Some(Token::Punct('-'))) {
+            at.checked_add(1)?
+        } else {
+            at
+        };
+        match region.get(at)? {
+            Token::Punct(_) | Token::Keyword(_) | Token::DistanceOp(_) => None,
+            _ => at.checked_add(1),
+        }
+    };
+    region
+        .iter()
+        .enumerate()
+        .filter(|(_, token)| matches!(token, Token::DistanceOp(_)))
+        .map(|(i, _)| {
+            // 被演算子は距離演算子の隣の 1 トークン（`v <-> $1`／`$1 <-> v`）。後置語はその直後。
+            let Some(mut k) = i.checked_add(2) else {
+                return 1;
+            };
+            if is_word(k, "NOT") {
+                let Some(next) = k.checked_add(1) else {
+                    return 1;
+                };
+                k = next;
+            }
+            if is_word(k, "BETWEEN") {
+                let counted = k
+                    .checked_add(1)
+                    .and_then(value_end)
+                    .filter(|a| matches!(region.get(*a), Some(Token::Keyword(lexer::Keyword::And))))
+                    .and_then(|a| a.checked_add(1))
+                    .and_then(value_end)
+                    // 上限の直後が演算子の続き（`+` 等）なら単一トークンではない。
+                    .filter(|b| !matches!(region.get(*b), Some(Token::Punct(c)) if *c != ')'));
+                return if counted.is_some() { 2 } else { 0 };
+            }
+            if is_word(k, "IN")
+                && matches!(region.get(k.saturating_add(1)), Some(Token::Punct('(')))
+            {
+                let mut n: usize = 0;
+                let mut at = k.saturating_add(2);
+                loop {
+                    let Some(after) = value_end(at) else {
+                        return 0;
+                    };
+                    n = n.saturating_add(1);
+                    match region.get(after) {
+                        Some(Token::Punct(',')) => at = after.saturating_add(1),
+                        Some(Token::Punct(')')) => return n,
+                        _ => return 0,
+                    }
+                }
+            }
+            1
+        })
+        .collect()
+}
+
 /// `tokens`（`$n` 置換前の元トークン列）の SELECT リスト（括弧深度 0 の `SELECT` から同深度の
 /// `FROM` まで）で、投影項目（カンマ区切り）ごとに、投影位置の距離列 `<列> <距離演算子> $n`
 /// （SQL-33 (7)・Issue #2007）の `$n` を持つ項目の添字を可変長フラグ列（添字 i が真なら項目 i が印付き）で返す。
