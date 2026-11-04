@@ -19727,10 +19727,12 @@ pub(crate) fn validate_create_index_tokens(
         // `USING hnsw` の演算子クラス 4 種（Issue #2239・INDEX-7・SQL-33 (5)）。GIN と同じく
         // 素の列要素の直後の識別子 1 個だけを読む（語順の違いは `42601`）。未知の名前は
         // fail-closed で `42704`（カタログ非参照のため表・列の存在情報は漏れない）。
+        // `ASC`／`DESC`／`NULLS` は opclass として読まず従来どおり `42601` に落とす。
         if hnsw
             && expression.is_none()
             && collation.is_none()
-            && matches!(p.peek(), Some(Token::Ident(_)))
+            && matches!(p.peek(), Some(Token::Ident(w))
+                if !["ASC", "DESC", "NULLS"].iter().any(|k| w.eq_ignore_ascii_case(k)))
         {
             let opclass_name = p.expect_ident()?;
             let opclass =
@@ -30725,6 +30727,9 @@ mod tests {
                 "CREATE INDEX i ON t USING hnsw (a vector_l2_ops vector_l2_ops)",
                 "42601",
             ),
+            ("CREATE INDEX i ON t USING hnsw (a DESC)", "42601"),
+            ("CREATE INDEX i ON t USING hnsw (a asc)", "42601"),
+            ("CREATE INDEX i ON t USING hnsw (a NULLS FIRST)", "42601"),
             ("CREATE INDEX i ON t USING btree (a vector_l2_ops)", "42601"),
             ("CREATE INDEX i ON t (a vector_l2_ops)", "42601"),
             (
