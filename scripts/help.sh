@@ -285,6 +285,9 @@ cat <<'EOF'
   hnsw-acorn-recall
       ACORN-1 の可視比率別 Recall 回帰 層 B（Issue #502）
       $ cargo test --release -p fandhe-db-engine --test hnsw_acorn_recall -- --ignored --nocapture
+  hnsw-metric-recall
+      metric 別 HNSW Recall@10 の ef 掃引 層 B（Issue #2001）
+      $ cargo test --release -p fandhe-db-engine --lib hnsw::metric_recall_tests -- --ignored --nocapture
   hnsw-acorn-twohop-runs
       ACORN TwoHop の Recall を RUNS 回連続測定（Issue #679）
       $ HNSW_ACORN_RECALL_RUNS="${RUNS:-5}" cargo test --release -p fandhe-db-engine --test hnsw_acorn_recall -- --ignored --nocapture --exact layer_b_25k_dim128_cluster_mask_hop_mode_report

@@ -429,6 +429,11 @@ hnsw-i8-recall: ## I8 常駐の Recall@10 を ef 掃引で実測（Issue #523）
 hnsw-acorn-recall: ## ACORN-1 の可視比率別 Recall 回帰 層 B（Issue #502）
 	cargo test --release -p fandhe-db-engine --test hnsw_acorn_recall -- --ignored --nocapture
 
+# Issue #2001（HNSW の metric 別 Recall@10 を L2・L1・Cosine・内積 × 常駐精度 × ef 64/128/256 で実測し標準出力へ記録する層 B。crates/engine/src/hnsw/metric_recall_tests.rs。#[ignore]・release 実行専用。make ci には含めない）
+.PHONY: hnsw-metric-recall
+hnsw-metric-recall: ## metric 別 HNSW Recall@10 の ef 掃引 層 B（Issue #2001）
+	cargo test --release -p fandhe-db-engine --lib hnsw::metric_recall_tests -- --ignored --nocapture
+
 # Issue #679（ACORN TwoHop へ確実に到達する決定的フィクスチャ〔クラスタ丸ごと可視マスク〕で 25,000 行・dim128 の hop モード別 Recall・acorn_expansions を RUNS 回連続測定し標準出力へ記録する。既定 RUNS=5。crates/engine/tests/hnsw_acorn_recall.rs::layer_b_25k_dim128_cluster_mask_hop_mode_report。層 A は make ci 対象・層 B は #[ignore]・release 実行専用）
 .PHONY: hnsw-acorn-twohop-runs
 hnsw-acorn-twohop-runs: ## ACORN TwoHop の Recall を RUNS 回連続測定（Issue #679）

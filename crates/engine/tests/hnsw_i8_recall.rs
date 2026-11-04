@@ -13,6 +13,10 @@
 //! （`TestRng`・`gen_clustered_corpus`・`gen_queries`・`gen_uniform_corpus`・
 //! `recall_at_10`）を crate 外の公開 API のみで独立に複製する（結合テストの
 //! 既存流儀。`tests/*.rs` は個別バイナリのため `mod` で共有できない）。
+//!
+//! Issue #2001: 本ファイルの層 A・B は内積 metric 専用。`HnswMetric` が `pub(crate)` で
+//! 結合テストから L2・L1・Cosine の索引を作れないため、metric 別（Cosine の F16・I8 常駐を含む）の
+//! 再計測は crate 内 `hnsw::metric_recall_tests`（`make hnsw-metric-recall`）が担う。
 
 use std::collections::HashSet;
 
