@@ -4347,8 +4347,7 @@ fn int8vec_column_operand(column: &Expr, env: &BindEnv<'_>) -> Option<(usize, u3
 /// INT8VEC 列の距離式の被演算子を検証する（TABLE-49 (1)(4)・Issue #2953）。`<+>`（L1）は
 /// int8 の L1 カーネルが無いため `0A000`。リテラルは [`crate::sql::parser::parse_int8vec_literal`]
 /// で検証する（整数でなければ `22P02`・範囲外 `22003`・次元不一致 `22000`・長さ超過 `54000`）。
-/// Prepared Describe の `$n` 由来ダミー（[`DISTANCE_PLACEHOLDER`]）はリテラルの解析を省く。
-/// エラーにリテラルの値を含めない。
+/// エラーにリテラルの値を含めない（Describe の `$n` 由来ダミーは呼び出し側で置換済み）。
 fn bind_int8vec_distance_operands(
     kind: crate::sql::lexer::DistanceKind,
     index: usize,
@@ -4364,11 +4363,9 @@ fn bind_int8vec_distance_operands(
             "distance operator <+> is not supported on int8vec columns",
         ));
     }
-    let query = if DISTANCE_PLACEHOLDER.with(std::cell::Cell::get) {
-        Vec::new()
-    } else {
-        crate::sql::parser::parse_int8vec_literal(literal, dim)?
-    };
+    // `$n` 由来のダミー値は呼び出し側（`int8vec_select_as_scan`）が有効なゼロベクトルへ置換済みの
+    // ため、ここでは常に実リテラルとして検証する（Describe でも 22P02／22003／22000 を返す）。
+    let query = crate::sql::parser::parse_int8vec_literal(literal, dim)?;
     Ok(BoundDistanceOperands::Int8Vec { kind, index, query })
 }
 

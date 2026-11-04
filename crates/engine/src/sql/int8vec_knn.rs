@@ -40,6 +40,7 @@ pub(crate) fn int8vec_select_as_scan(
     schema: &TableSchema,
     session_mode: Option<SearchMode>,
     skip: &LiteralSkip,
+    limits: &crate::result_limits::ResultLimits,
 ) -> Result<Option<ValidatedScan>, SqlSurfaceError> {
     if !schema
         .columns
@@ -79,11 +80,41 @@ pub(crate) fn int8vec_select_as_scan(
             "precision mode is not supported on int8vec columns",
         ));
     }
+    // 変換先の scan 束縛は LIMIT／OFFSET を個別にしか検証しないため、通常の kNN 束縛と同じ
+    // 合計上限（`LIMIT + OFFSET` ≦ `--max-result-rows`）を先に適用する（fail-closed。HALFVEC と同じ）。
+    // 暗黙 LIMIT は scan 経路の行数上限検査が担うので対象外。実行・Describe・EXPLAIN で共有する。
+    if !v.limit_implicit {
+        crate::sql::parser::validate_search_limit_offset_with(v.limit, v.offset, limits)?;
+    }
     check_projected_queries(v, column, literal, dim, skip)?;
+
+    // Describe の `$n` 由来ダミー値だけを、列型に合う有効なゼロベクトルへ置き換えて束縛する。
+    // 実リテラル（WHERE・投影・ORDER BY）はここで置換せず、通常どおり束縛で検証する。
+    let order_literal = if skip.order_by {
+        zero_vector_literal(dim)
+    } else {
+        literal.clone()
+    };
+    let projection = match &v.projection {
+        Projection::Items(items) => Projection::Items(
+            items
+                .iter()
+                .enumerate()
+                .map(|(index, item)| {
+                    if skip.skips_projection_item(index) {
+                        placeholder_item(item, schema)
+                    } else {
+                        item.clone()
+                    }
+                })
+                .collect(),
+        ),
+        other => other.clone(),
+    };
 
     Ok(Some(ValidatedScan {
         table_name: v.table_name.clone(),
-        projection: v.projection.clone(),
+        projection,
         where_predicates: v.where_predicates.clone(),
         limit: v.limit,
         limit_implicit: v.limit_implicit,
@@ -94,7 +125,7 @@ pub(crate) fn int8vec_select_as_scan(
             expr: Expr::VectorDistance {
                 kind: v.distance_kind,
                 lhs: Box::new(Expr::Ident(column.clone())),
-                rhs: Box::new(Expr::String(literal.clone())),
+                rhs: Box::new(Expr::String(order_literal)),
             },
             descending: v.distance_descending,
             nulls: None,
@@ -104,6 +135,62 @@ pub(crate) fn int8vec_select_as_scan(
         embedded_scalar_subqueries: Vec::new(),
         with_ties: false,
     }))
+}
+
+/// 次元 `dim` のゼロベクトルのリテラル（Describe の `$n` 由来ダミー値の置換先）。
+fn zero_vector_literal(dim: u32) -> String {
+    let mut out = String::from("[");
+    for i in 0..dim {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('0');
+    }
+    out.push(']');
+    out
+}
+
+/// `$n` 由来の投影距離列 `<列> <距離演算子> <ダミー>` のリテラルを、その列の型に合うゼロベクトルへ
+/// 置き換える。形が合わない・列型が距離対象でない項目はそのまま返す（束縛が通常どおり判定する）。
+fn placeholder_item(item: &SelectItem, schema: &TableSchema) -> SelectItem {
+    let SelectItem::Expr {
+        expr: Expr::VectorDistance { kind, lhs, rhs },
+        alias,
+    } = item
+    else {
+        return item.clone();
+    };
+    let (name, lhs_is_col) = match (lhs.as_ref(), rhs.as_ref()) {
+        (Expr::Ident(n), Expr::String(_)) => (n, true),
+        (Expr::String(_), Expr::Ident(n)) => (n, false),
+        _ => return item.clone(),
+    };
+    let dim = schema
+        .columns
+        .iter()
+        .find(|c| &c.name == name)
+        .and_then(|c| match c.ty {
+            ColumnType::Int8Vec(d) | ColumnType::Vector(d) | ColumnType::HalfVec(d) => Some(d),
+            _ => None,
+        });
+    let Some(dim) = dim else {
+        return item.clone();
+    };
+    let column = Box::new(Expr::Ident(name.clone()));
+    let zero = Box::new(Expr::String(zero_vector_literal(dim)));
+    let (lhs, rhs) = if lhs_is_col {
+        (column, zero)
+    } else {
+        (zero, column)
+    };
+    SelectItem::Expr {
+        expr: Expr::VectorDistance {
+            kind: *kind,
+            lhs,
+            rhs,
+        },
+        alias: alias.clone(),
+    }
 }
 
 /// 投影トップレベルの距離列（SQL-33 (7)）のクエリが `ORDER BY` と同じ値かを検査する。

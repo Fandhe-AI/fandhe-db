@@ -10956,20 +10956,15 @@ impl EngineCore {
                 };
                 let schema = self.describe_table_schema(snap, &validated.table_name)?;
                 // TABLE-49・Issue #2953: 実行と同じく INT8VEC 列の kNN は広域取得へ書き換えて列メタを導出する
-                // （Describe 成功・Execute 失敗の食い違いを作らない）。`$n` 由来のダミーリテラルは距離式の
-                // 束縛で解析を省く（`DistancePlaceholderGuard`。区間は束縛の間だけ）。
+                // （Describe 成功・Execute 失敗の食い違いを作らない）。`$n` 由来のダミーリテラルだけは
+                // 変換側が有効なゼロベクトルへ置換し、実リテラルは Describe でも検証する。
                 if let Some(scan) = crate::sql::int8vec_knn::int8vec_select_as_scan(
                     validated,
                     &schema,
                     session.search_mode(),
                     skip_vector_literal_validation,
+                    limits,
                 )? {
-                    let _placeholder = (skip_vector_literal_validation.order_by
-                        || skip_vector_literal_validation
-                            .projection_mask
-                            .iter()
-                            .any(|masked| *masked))
-                    .then(crate::sql::udf_call::DistancePlaceholderGuard::enter);
                     let bound = crate::sql::parser::bind_scan_with_dummy_flags(
                         &scan,
                         &schema,
@@ -11741,6 +11736,7 @@ impl EngineCore {
                     &schema,
                     session.search_mode(),
                     &crate::sql::parser::LiteralSkip::NONE,
+                    &limits,
                 )? {
                     return self.execute_read_statement_with_limits(
                         ctx,
@@ -13498,6 +13494,7 @@ impl EngineCore {
             &schema,
             session.search_mode(),
             &crate::sql::parser::LiteralSkip::NONE,
+            &self.result_limits,
         )? {
             let bound = crate::sql::parser::bind_scan_with_dummy_flags(
                 &scan,
