@@ -394,6 +394,9 @@ fn embedding_referencing_aggregate_decodes_exactly_visible_rows() {
         // 本体デコードに到達しない。
         "SELECT SUM(embedding) FROM docs",
         "SELECT lang, SUM(embedding) FROM docs GROUP BY lang",
+        // Issue #2039・SQL-72 (3): `avg(<VECTOR>)` も同様。
+        "SELECT AVG(embedding) FROM docs",
+        "SELECT lang, AVG(embedding) FROM docs GROUP BY lang",
     ] {
         let (_result, d) = run_layer_a(&storage, &schema, &alice, sql);
         assert_eq!(

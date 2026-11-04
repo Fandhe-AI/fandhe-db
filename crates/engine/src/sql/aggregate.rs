@@ -859,6 +859,13 @@ pub(crate) enum Accumulator {
     /// 非 NULL 行が 0 件（結果 NULL）。最初の観測で次元ぶんを確保し、以降は長さ不一致を
     /// `22000` とする。状態バイト数は [`Accumulator::text_len`] で予算に計上される。
     VectorSum(Option<Vec<f64>>),
+    /// `AVG(<VECTOR>)`（SQL-72 (3)・Issue #2039）。累積は `VectorSum` と同じ要素ごとの `f64`、
+    /// `finish` で件数で割って `f32` へ丸める（非有限は `22003`）。`sum == None` は非 NULL 行が
+    /// 0 件（結果 NULL）。状態バイト数は [`Accumulator::text_len`] で予算に計上される。
+    VectorAvg {
+        sum: Option<Vec<f64>>,
+        count: u64,
+    },
     FloatAvg {
         sum: Option<f64>,
         count: u64,
@@ -1132,6 +1139,12 @@ impl Accumulator {
             (Sum, AggregateInput::VectorColumn { .. } | AggregateInput::VectorExpr { .. }) => {
                 Accumulator::VectorSum(None)
             }
+            (Avg, AggregateInput::VectorColumn { .. } | AggregateInput::VectorExpr { .. }) => {
+                Accumulator::VectorAvg {
+                    sum: None,
+                    count: 0,
+                }
+            }
             (Avg, AggregateInput::RealColumn(_) | AggregateInput::DoubleColumn(_)) => {
                 Accumulator::FloatAvg {
                     sum: None,
@@ -1371,40 +1384,49 @@ impl Accumulator {
         Ok(())
     }
 
-    /// `VECTOR` 値 1 件を観測する（`SUM(<VECTOR>)` 専用。SQL-72 (3)・Issue #2038）。
+    /// `VECTOR` 値 1 件を観測する（`SUM`／`AVG(<VECTOR>)` 専用。SQL-72 (3)・Issue #2038・#2039）。
     /// 最初の観測で次元ぶんの `f64` を確保する（長さは格納済み次元＝`MAX_EMBEDDING_DIM` 以下に
     /// 縛られ、確保失敗は panic にせず `54000`）。以降は長さ不一致を `22000`、要素和が
     /// 非有限になれば `22003` で fail-closed に拒否する。エラー文言に値・行 id は含めない。
     fn observe_vector(&mut self, v: &[f32]) -> Result<(), SqlSurfaceError> {
-        let Accumulator::VectorSum(state) = self else {
-            return Err(accumulator_bug(
-                "observe_vector on a non-VectorSum accumulator",
-            ));
+        let (state, count, label) = match self {
+            Accumulator::VectorSum(state) => (state, None, "SUM(VECTOR)"),
+            Accumulator::VectorAvg { sum, count } => (sum, Some(count), "AVG(VECTOR)"),
+            _ => {
+                return Err(accumulator_bug(
+                    "observe_vector on a non-vector accumulator",
+                ));
+            }
         };
         let acc = match state {
             Some(acc) => acc,
             None => {
                 let mut fresh: Vec<f64> = Vec::new();
                 fresh.try_reserve_exact(v.len()).map_err(|_| {
-                    SqlSurfaceError::payload_too_large("SUM(VECTOR) state allocation failed")
+                    SqlSurfaceError::payload_too_large(format!("{label} state allocation failed"))
                 })?;
                 fresh.resize(v.len(), 0.0);
                 state.insert(fresh)
             }
         };
         if acc.len() != v.len() {
-            return Err(SqlSurfaceError::invalid_input(
-                "SUM(VECTOR) operands have different dimensions",
-            ));
+            return Err(SqlSurfaceError::invalid_input(format!(
+                "{label} operands have different dimensions"
+            )));
         }
         for (a, x) in acc.iter_mut().zip(v.iter()) {
             let next = *a + f64::from(*x);
             if !next.is_finite() {
-                return Err(SqlSurfaceError::numeric_out_of_range(
-                    "SUM(VECTOR) overflowed to a non-finite value",
-                ));
+                return Err(SqlSurfaceError::numeric_out_of_range(format!(
+                    "{label} overflowed to a non-finite value"
+                )));
             }
             *a = next;
+        }
+        if let Some(count) = count {
+            *count = count.checked_add(1).ok_or_else(|| {
+                SqlSurfaceError::numeric_out_of_range("AVG(VECTOR) count exceeds u64 range")
+            })?;
         }
         Ok(())
     }
@@ -1972,7 +1994,7 @@ impl Accumulator {
             Accumulator::ArrayAgg(state) => state.text_len(),
             // `SUM(<VECTOR>)` の状態バイト数（次元 × 8）。最初の観測で一度だけ増える
             // （SQL-72 (3)・Issue #2038。TEXT に限らない集計状態の予算計上に流用する）。
-            Accumulator::VectorSum(Some(acc)) => {
+            Accumulator::VectorSum(Some(acc)) | Accumulator::VectorAvg { sum: Some(acc), .. } => {
                 acc.len().saturating_mul(std::mem::size_of::<f64>())
             }
             _ => 0,
@@ -2025,6 +2047,29 @@ impl Accumulator {
                         if !narrowed.is_finite() {
                             return Err(SqlSurfaceError::numeric_out_of_range(
                                 "SUM(VECTOR) exceeds REAL range",
+                            ));
+                        }
+                        out.push(narrowed);
+                    }
+                    Cell::Vector(out)
+                }
+            },
+            // SQL-72 (3)・Issue #2039: f64 の和を件数で割ってから `f32` へ丸める。
+            Accumulator::VectorAvg { sum, count } => match sum {
+                None => Cell::Null,
+                Some(_) if count == 0 => {
+                    return Err(accumulator_bug("AVG(VECTOR) has a sum but no rows"));
+                }
+                Some(sum) => {
+                    let mut out: Vec<f32> = Vec::new();
+                    out.try_reserve_exact(sum.len()).map_err(|_| {
+                        SqlSurfaceError::payload_too_large("AVG(VECTOR) result allocation failed")
+                    })?;
+                    for x in sum {
+                        let narrowed = (x / count as f64) as f32;
+                        if !narrowed.is_finite() {
+                            return Err(SqlSurfaceError::numeric_out_of_range(
+                                "AVG(VECTOR) exceeds REAL range",
                             ));
                         }
                         out.push(narrowed);
@@ -2929,10 +2974,11 @@ pub(crate) fn aggregate_result_type(
         // `SUM(REAL)` は PostgreSQL と同じく real（`Accumulator::RealSum`）。
         (Sum | Min | Max, AggregateInput::RealColumn(_)) => ColumnType::Real,
         (Avg, AggregateInput::RealColumn(_)) => ColumnType::Double,
-        // SQL-72 (3)・Issue #2038: 列・式とも次元つき vector で公告する（式の次元は宣言次元。集合演算の型ゲートが検出できるようにする）。
-        (Sum, AggregateInput::VectorColumn { dim } | AggregateInput::VectorExpr { dim, .. }) => {
-            ColumnType::Vector(*dim)
-        }
+        // SQL-72 (3)・Issue #2038・#2039: 列・式とも次元つき vector で公告する（式の次元は宣言次元。集合演算の型ゲートが検出できるようにする）。
+        (
+            Sum | Avg,
+            AggregateInput::VectorColumn { dim } | AggregateInput::VectorExpr { dim, .. },
+        ) => ColumnType::Vector(*dim),
         (Sum | Avg | Min | Max, AggregateInput::DoubleColumn(_)) => ColumnType::Double,
         (Sum | Avg | Min | Max, AggregateInput::ScalarExpr { .. }) => ColumnType::Double,
         (
@@ -4313,7 +4359,63 @@ mod tests {
         assert_eq!(acc.finish().unwrap_err().wire_code(), "22003");
     }
 
-    /// `VectorSum` 以外へのベクトル観測は束縛層のバグとして fail-closed（`XX000`）。
+    /// Issue #2039・SQL-72 (3): `avg(<VECTOR>)` は f64 累積し確定時に割って `f32` へ丸める。
+    /// `f32` 累積なら `16777216 + 1 + 1` が潰れて平均が `16777216/3` になる組。
+    #[test]
+    fn vector_avg_accumulates_in_f64_and_divides_at_finish() {
+        let mut acc = Accumulator::VectorAvg {
+            sum: None,
+            count: 0,
+        };
+        for v in [[16_777_216.0f32, 0.5], [1.0, 0.5], [1.0, 0.5]] {
+            acc.observe_vector(&v).unwrap();
+        }
+        assert_eq!(acc.text_len(), 2 * std::mem::size_of::<f64>());
+        assert_eq!(
+            acc.clone().finish().unwrap(),
+            Cell::Vector(vec![5_592_406.0, 0.5])
+        );
+        acc.observe_vector(&[2.0, 1.0]).unwrap();
+        assert_eq!(
+            acc.finish().unwrap(),
+            Cell::Vector(vec![4_194_305.0, 0.625])
+        );
+    }
+
+    #[test]
+    fn vector_avg_empty_is_null_and_text_len_is_zero() {
+        let acc = Accumulator::VectorAvg {
+            sum: None,
+            count: 0,
+        };
+        assert_eq!(acc.text_len(), 0);
+        assert_eq!(acc.finish().unwrap(), Cell::Null);
+    }
+
+    #[test]
+    fn vector_avg_dimension_mismatch_is_22000() {
+        let mut acc = Accumulator::VectorAvg {
+            sum: None,
+            count: 0,
+        };
+        acc.observe_vector(&[1.0, 2.0]).unwrap();
+        let err = acc.observe_vector(&[1.0, 2.0, 3.0]).unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    /// 和が f32 範囲を超える組でも f64 累積なら平均は有限（`SUM` なら `22003` になる組）。
+    #[test]
+    fn vector_avg_of_values_whose_sum_exceeds_f32_is_finite() {
+        let mut acc = Accumulator::VectorAvg {
+            sum: None,
+            count: 0,
+        };
+        acc.observe_vector(&[3.0e38, 0.0]).unwrap();
+        acc.observe_vector(&[3.0e38, 0.0]).unwrap();
+        assert_eq!(acc.finish().unwrap(), Cell::Vector(vec![3.0e38, 0.0]));
+    }
+
+    /// `VectorSum`／`VectorAvg` 以外へのベクトル観測は束縛層のバグとして fail-closed（`XX000`）。
     #[test]
     fn observe_vector_on_other_accumulators_is_an_internal_error() {
         let mut acc = Accumulator::Count(0);
