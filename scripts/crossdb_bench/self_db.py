@@ -497,7 +497,7 @@ def _run_phases(
                     )
                     knn_plan = self_hnsw.parse_explain_rows([r[0] for r in cur.fetchall()])
                 phases["ann_probe"] = {**verified, "knn_operator_plan": knn_plan}
-                knn_reaches_hnsw = knn_plan["engine"] == "hnsw"
+                knn_reaches_hnsw = self_hnsw.knn_reaches_hnsw(knn_plan)
 
         # --- hnsw_index_warm（Issue #658）: 索引構築を含む初回クエリの単発計時 ---
         # `sql::hnsw_cache` は同一世代内で索引を再利用する同期構築のため、初回

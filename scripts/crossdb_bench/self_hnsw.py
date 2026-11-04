@@ -288,3 +288,17 @@ def parse_explain_rows(rows: list[str]) -> dict:
     engine = next((r[len("engine: ") :] for r in rows if r.startswith("engine: ")), None)
     ann_plan = next((r[len("ann_plan: ") :] for r in rows if r.startswith("ann_plan: ")), None)
     return {"engine": engine, "ann_plan": ann_plan}
+
+
+HNSW_REACHED_ANN_PLANS = frozenset({"hnsw_full_visible", "hnsw_subset"})
+
+
+def knn_reaches_hnsw(plan: dict) -> bool:
+    """`parse_explain_rows` の結果から kNN が実際に HNSW 索引へ到達するかを返す。
+
+    `engine:` は構成上のエンジン種別で、`<#>` では opclass 不一致により
+    `plain_scan_opclass_mismatch` へ倒れても `hnsw` のままになる。そのため
+    `ann_plan` が `hnsw_full_visible`／`hnsw_subset` のときだけ真とし、
+    plain_scan 系・欠落は偽（fail-closed）とする（Issue #2952）。
+    """
+    return plan.get("ann_plan") in HNSW_REACHED_ANN_PLANS
