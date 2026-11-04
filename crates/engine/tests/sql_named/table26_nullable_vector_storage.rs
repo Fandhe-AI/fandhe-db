@@ -324,3 +324,41 @@ fn transitional_knn_over_own_null_row_code() {
     );
     assert_eq!(r.unwrap_err().wire_code(), "0A000");
 }
+
+/// INSERT トリガー（BEFORE／AFTER ROW）のある表でも nullable VECTOR の省略・明示 NULL を
+/// 受理する（トリガーの有無で NULL 保存契約が変わらないこと。PR #2963 レビュー指摘）。
+#[test]
+fn nullable_vector_accepted_on_insert_trigger_tables() {
+    let (core, _g) = new_core("t26-trigger");
+    ok(
+        &core,
+        "sys",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, v VECTOR(3), n TEXT)",
+    );
+    ok(
+        &core,
+        "sys",
+        "CREATE FUNCTION trg() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$",
+    );
+    ok(
+        &core,
+        "sys",
+        "CREATE TRIGGER tb BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION trg()",
+    );
+    ok(
+        &core,
+        "sys",
+        "CREATE TRIGGER ta AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION trg()",
+    );
+    ok(
+        &core,
+        "alice",
+        "INSERT INTO t (id, n) VALUES (1, 'omitted') USING OPERATION_ID 'o1'",
+    );
+    ok(
+        &core,
+        "alice",
+        "INSERT INTO t (id, v, n) VALUES (2, NULL, 'null') USING OPERATION_ID 'o2'",
+    );
+    assert_eq!(null_vector_rows(&core, "alice", "t"), 2);
+}
