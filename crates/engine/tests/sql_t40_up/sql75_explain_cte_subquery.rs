@@ -457,3 +457,32 @@ fn works_inside_explicit_transaction() {
     core.execute_sql_in_txn(&c, &mut session, &mut txn, "COMMIT")
         .expect("commit");
 }
+
+/// OR 内の通常述語は表示用の置換で落ちるが、束縛エラー（未知列 `42703`）は実行時と揃える。
+#[test]
+fn plain_predicate_inside_or_with_subquery_is_still_bound() {
+    let (core, _g) = seeded("explain_or_plain_bind");
+    assert_eq!(
+        code(
+            &core,
+            "EXPLAIN SELECT k FROM a WHERE zzz = 1 OR k IN (SELECT k FROM b)"
+        ),
+        "42703"
+    );
+}
+
+/// 内側の OR は実行時に `id = 1` 以外にも一致し得るため、PK 点検索と過大報告しない。
+#[test]
+fn inner_or_with_subquery_is_not_reported_as_pk_lookup() {
+    let (core, _g) = seeded("explain_inner_or_no_pk");
+    let out = lines(
+        &core,
+        "tenant-a",
+        "EXPLAIN SELECT k FROM a WHERE k IN \
+         (SELECT k FROM pt WHERE id = 1 OR k IN (SELECT k FROM b))",
+    );
+    assert!(
+        out.iter().all(|l| !l.contains("primary_key_lookup")),
+        "{out:?}"
+    );
+}

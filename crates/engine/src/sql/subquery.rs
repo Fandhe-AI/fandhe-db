@@ -1321,6 +1321,10 @@ fn static_validate_inner_query_impl(
                 nesting_limits,
                 result_limits,
             )?;
+            // 表示用の走査分類は、部分クエリを含む述語を保守的に索引へ使えない形へ置換した述語で
+            // 束縛する（検証専用に取り出した OR の葉を AND 扱いにすると PK 点検索等を過大報告する）。
+            let explain_preds = explain_sink::is_active()
+                .then(|| explain_outer_predicates(&validated.where_predicates));
             validated.where_predicates = static_validation_predicates(&validated.where_predicates);
             let mut scalar_bind_limits = result_limits;
             match intent {
@@ -1355,10 +1359,24 @@ fn static_validate_inner_query_impl(
                 &scalar_bind_limits,
             )?;
             let meta = super::describe::scan_columns(&bound, &inner_schema)?;
-            let inner = explain_sink::is_active().then(|| explain_sink::ExplainInner::Scan {
-                schema: inner_schema.clone(),
-                bound: bound.clone(),
-            });
+            let inner = match explain_preds {
+                Some(preds) => {
+                    let mut shown = validated.clone();
+                    shown.where_predicates = preds;
+                    let shown_bound = super::parser::bind_scan_with_dummy_flags(
+                        &shown,
+                        &inner_schema,
+                        udfs,
+                        &[],
+                        &scalar_bind_limits,
+                    )?;
+                    Some(explain_sink::ExplainInner::Scan {
+                        schema: inner_schema.clone(),
+                        bound: shown_bound,
+                    })
+                }
+                None => None,
+            };
             Ok((meta, inner))
         }
         (
@@ -1394,7 +1412,7 @@ fn static_validate_inner_query_impl(
 /// サブクエリを含む `OR` の分岐のうちサブクエリを含まない葉も個別に取り出す
 /// （`OR` 全体を落とすと、その葉の未知列等の束縛時エラーが遅延対象エラーに
 /// 隠れるため）。束縛検証専用で実行はしないため、AND 連結の意味差は影響しない。
-fn static_validation_predicates(preds: &[WherePredicate]) -> Vec<WherePredicate> {
+pub(crate) fn static_validation_predicates(preds: &[WherePredicate]) -> Vec<WherePredicate> {
     fn collect_leaves(pred: &WherePredicate, out: &mut Vec<WherePredicate>) {
         if !predicate_contains_subquery(pred) {
             out.push(pred.clone());

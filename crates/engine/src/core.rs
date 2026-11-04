@@ -14002,6 +14002,12 @@ impl EngineCore {
                 self.result_limits,
             )?;
             specs = Self::subquery_specs(&read_txn, items)?;
+            // 部分クエリを含む `OR` の通常述語は表示用の置換で落ちるため、別に束縛だけ検証する
+            // （未知列等の `42703` を非 EXPLAIN の文と揃える。結果は捨てる）。
+            let mut check = validated.clone();
+            check.where_predicates =
+                crate::sql::subquery::static_validation_predicates(validated.where_predicates());
+            crate::sql::parser::bind_aggregate(&check, &schema, session.udfs())?;
             owned = validated.clone();
             owned.where_predicates =
                 crate::sql::subquery::explain_outer_predicates(validated.where_predicates());
@@ -14265,6 +14271,18 @@ impl EngineCore {
                 self.result_limits,
             )?;
             specs = Self::subquery_specs(&read_txn, items)?;
+            // 部分クエリを含む `OR` の通常述語は表示用の置換で落ちるため、別に束縛だけ検証する
+            // （未知列等の `42703` を非 EXPLAIN の文と揃える。結果は捨てる）。
+            let mut check = validated.clone();
+            check.where_predicates =
+                crate::sql::subquery::static_validation_predicates(validated.where_predicates());
+            crate::sql::parser::bind_scan_with_dummy_flags(
+                &check,
+                &schema,
+                session.udfs(),
+                &[],
+                &self.result_limits,
+            )?;
             owned = validated.clone();
             owned.where_predicates =
                 crate::sql::subquery::explain_outer_predicates(validated.where_predicates());
