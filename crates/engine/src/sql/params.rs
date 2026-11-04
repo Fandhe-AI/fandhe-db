@@ -2189,12 +2189,15 @@ pub fn where_distance_param_mask(tokens: &[Token]) -> Vec<bool> {
         .collect()
 }
 
-/// [`where_distance_param_mask`] と同じ区間・同じ出現順で、距離演算子ごとに「構文段の脱糖で AST 上に
-/// 何個の距離式へ複製されるか」を返す（Issue #2953・PR #2956 指摘）。`<距離式> [NOT] BETWEEN a AND b`
-/// は 2 個、`<距離式> [NOT] IN (e1, ..., en)` は n 個へ左辺が複製される。それ以外は 1 個。
-/// 左辺を包む括弧・算術式の境界／要素も数える（[`distance_copy_count`]）。複製数を確定できない形は `0`
-/// （不明）とし、呼び出し側は置換を断念する（fail-closed）。構造一致からの推定はせず、トークンだけで決める。
-pub fn where_distance_copy_counts(tokens: &[Token]) -> Vec<usize> {
+/// [`where_distance_param_mask`] と同じ区間・同じ出現順（トークン順）の距離演算子について、構文段の
+/// 脱糖後の AST 上の距離式の出現順を、トークン順の添字で返す（Issue #2953・PR #2956 指摘）。
+/// `<距離式> [NOT] BETWEEN a AND b` は `x >= a AND x <= b`、`<距離式> [NOT] IN (e1, ..., en)` は
+/// `x = e1 OR ... OR x = en` へ脱糖され、左辺 `x` が複製される。AST 順は `x, (a の距離式), x, (b の距離式)`
+/// （IN は `x, (e1 の距離式), x, ...`）で、境界・要素に距離式があるとトークン順と食い違う。
+/// 返り値の k 番目は「AST の k 番目の距離式に対応する、トークン順の距離演算子の添字」。
+/// 構造一致からの推定はせずトークンだけで決める。順序を確定できない形（副問い合わせ・空リスト・
+/// 右被演算子が単一トークンでない・入れ子の複製）は空（呼び出し側は置換を断念する。fail-closed）。
+pub fn where_distance_ast_order(tokens: &[Token]) -> Vec<usize> {
     let mut depth: usize = 0;
     let mut start: Option<usize> = None;
     let mut end = tokens.len();
@@ -2216,27 +2219,55 @@ pub fn where_distance_copy_counts(tokens: &[Token]) -> Vec<usize> {
         return Vec::new();
     };
     let region = tokens.get(start..end).unwrap_or(&[]);
-    region
+    let ops: Vec<usize> = region
         .iter()
         .enumerate()
         .filter(|(_, token)| matches!(token, Token::DistanceOp(_)))
-        .map(|(i, _)| distance_copy_count(region, i))
-        .collect()
+        .map(|(i, _)| i)
+        .collect();
+    let mut consumed = vec![false; ops.len()];
+    let mut order: Vec<usize> = Vec::new();
+    for (ord, &pos) in ops.iter().enumerate() {
+        if consumed.get(ord).copied().unwrap_or(false) {
+            continue;
+        }
+        let Some(parts) = distance_parts(region, pos) else {
+            return Vec::new();
+        };
+        for (lo, hi) in parts {
+            order.push(ord);
+            for (inner_ord, &inner_pos) in ops.iter().enumerate() {
+                if inner_pos < lo || inner_pos >= hi {
+                    continue;
+                }
+                // 境界・要素内の距離式自身が更に複製される形は追えない。
+                if distance_parts(region, inner_pos).is_none_or(|p| p.len() != 1) {
+                    return Vec::new();
+                }
+                if let Some(slot) = consumed.get_mut(inner_ord) {
+                    *slot = true;
+                }
+                order.push(inner_ord);
+            }
+        }
+    }
+    order
 }
 
-/// `region[i]`（距離演算子）の距離式が、構文段の脱糖で何個に複製されるかをトークンから求める
-/// （[`where_distance_copy_counts`] の 1 要素分）。右被演算子（`i + 1` の 1 トークン）の直後から前方へ
-/// 走査し、算術演算子でつながる左辺式と、それを包む閉じ括弧（`(v <-> $1) BETWEEN ...`）を読み飛ばして
-/// 後置語（`[NOT] BETWEEN` は 2・`[NOT] IN (...)` は要素数）を探す。比較演算子・キーワード・
-/// 被演算子の連続など左辺の終端に当たれば 1。複製数を確定できない形（副問い合わせ・空リスト・
-/// 境界や要素に別の距離式を含む・右被演算子が単一トークンでない）は `0`（呼び出し側が置換を断念する）。
-fn distance_copy_count(region: &[Token], i: usize) -> usize {
+/// `region[i]`（距離演算子）の距離式の脱糖後の「部分」を返す。部分は、左辺 `x` の複製 1 個ごとの
+/// 直後に続く境界／要素のトークン範囲 `[lo, hi)`（範囲内の距離式は AST 上で当該複製の直後に現れる）。
+/// 複製されない形は空範囲 1 個。右被演算子（`i + 1` の 1 トークン）の直後から前方へ走査し、算術演算子で
+/// つながる左辺式と、それを包む閉じ括弧（`(v <-> $1) BETWEEN ...`）を読み飛ばして後置語
+/// （`[NOT] BETWEEN` は 2・`[NOT] IN (...)` は要素数）を探す。比較演算子・キーワード・被演算子の連続など
+/// 左辺の終端に当たれば 1 個。確定できない形（副問い合わせ・空リスト・右被演算子が単一トークンでない）は `None`。
+fn distance_parts(region: &[Token], i: usize) -> Option<Vec<(usize, usize)>> {
     let is_word = |t: Option<&Token>, k: &str| matches!(t, Some(Token::Ident(w)) if w.eq_ignore_ascii_case(k));
     // 右被演算子が単一トークンでない形は位置を追えない。
     match i.checked_add(1).and_then(|n| region.get(n)) {
         Some(Token::Param(_) | Token::Ident(_) | Token::StringLiteral(_)) => {}
-        _ => return 0,
+        _ => return None,
     }
+    let single = || Some(vec![(0, 0)]);
     let mut k = i.saturating_add(2);
     // 距離式を含む左辺式の末尾を探す。`d` は走査中に開いた括弧の深さ（0 の `)` は外側の括弧を閉じる）。
     let mut d: usize = 0;
@@ -2246,7 +2277,7 @@ fn distance_copy_count(region: &[Token], i: usize) -> usize {
             match t {
                 Token::Punct('(') => d = d.saturating_add(1),
                 Token::Punct(')') => d = d.saturating_sub(1),
-                Token::DistanceOp(_) => return 0,
+                Token::DistanceOp(_) => return None,
                 _ => {}
             }
             if d == 0 {
@@ -2259,7 +2290,7 @@ fn distance_copy_count(region: &[Token], i: usize) -> usize {
             Token::Punct(')') if !expect_operand => {}
             Token::Punct('(') if expect_operand => d = 1,
             Token::Punct('+' | '-' | '*' | '/' | '%') => expect_operand = true,
-            Token::DistanceOp(_) => return 0,
+            Token::DistanceOp(_) => return None,
             Token::Ident(_) if !expect_operand => {
                 // 後置語。`NOT` の後は `BETWEEN`／`IN` のときだけ複製が起きる。
                 let mut w = k;
@@ -2268,110 +2299,88 @@ fn distance_copy_count(region: &[Token], i: usize) -> usize {
                 }
                 let word = region.get(w);
                 if is_word(word, "BETWEEN") {
-                    return between_copies(region, w.saturating_add(1));
+                    return between_parts(region, w.saturating_add(1));
                 }
                 if is_word(word, "IN") {
-                    return in_list_copies(region, w.saturating_add(1));
+                    return in_list_parts(region, w.saturating_add(1));
                 }
-                return 1;
+                return single();
             }
             Token::Number(_) | Token::Param(_) | Token::StringLiteral(_) | Token::Ident(_)
                 if expect_operand =>
             {
                 expect_operand = false;
             }
-            _ => return 1,
+            _ => return single(),
         }
         k = k.saturating_add(1);
     }
-    1
+    single()
 }
 
-/// `BETWEEN` の直後（`from`）から `<下限> AND <上限>` を読み、複製数 2 を返す。`AND` が無い・境界に
-/// 別の距離式を含む（AST の出現順がトークン順とずれる）形は `0`。上限は括弧深度 0 の `AND`／`OR` 等の
-/// キーワード・`,`・閉じ括弧・式末尾までを走査する。
-fn between_copies(region: &[Token], from: usize) -> usize {
+/// `BETWEEN` の直後（`from`）から `<下限> AND <上限>` を読み、部分 2 個を返す。第 1 部分は下限の範囲
+/// （下限内の距離式は AST で 1 個目の複製の直後）。第 2 部分は空範囲（上限の距離式は AST でも
+/// 最後に現れトークン順と一致する）。`AND` が無い形は `None`。
+fn between_parts(region: &[Token], from: usize) -> Option<Vec<(usize, usize)>> {
     let mut d: usize = 0;
-    let mut seen_and = false;
-    // 上限値側の走査状態。上限値は「被演算子（算術演算子で連結）」の連なりで、被演算子の後に
-    // 来た被演算子以外（`OR` 等の Ident・比較演算子・Keyword）で終端とする。後続の述語の距離式を
-    // 境界の距離式と取り違えないため（このレキサーでは `OR` が Ident）。
-    let mut expect_operand = true;
-    for t in region.get(from..).unwrap_or(&[]) {
-        if seen_and && d == 0 {
-            match t {
-                Token::Punct('+' | '-' | '*' | '/' | '%') => {
-                    expect_operand = true;
-                    continue;
-                }
-                Token::Number(_) | Token::Param(_) | Token::StringLiteral(_) | Token::Ident(_)
-                    if expect_operand =>
-                {
-                    expect_operand = false;
-                    continue;
-                }
-                Token::Punct('(') if expect_operand => {}
-                Token::Punct(')') => {}
-                _ => break,
-            }
-        }
+    for (off, t) in region.get(from..).unwrap_or(&[]).iter().enumerate() {
         match t {
-            Token::DistanceOp(_) => return 0,
             Token::Punct('(') => d = d.saturating_add(1),
             Token::Punct(')') => {
                 if d == 0 {
-                    break;
+                    return None;
                 }
                 d -= 1;
-                if seen_and && d == 0 {
-                    expect_operand = false;
-                }
             }
-            Token::Punct(',') if d == 0 => break,
-            Token::Keyword(lexer::Keyword::And) if d == 0 && !seen_and => seen_and = true,
-            Token::Keyword(_) if d == 0 => break,
+            Token::Keyword(lexer::Keyword::And) if d == 0 => {
+                let and_at = from.saturating_add(off);
+                return Some(vec![(from, and_at), (and_at, and_at)]);
+            }
+            Token::Punct(',') if d == 0 => return None,
+            Token::Keyword(_) if d == 0 => return None,
             _ => {}
         }
     }
-    if seen_and {
-        2
-    } else {
-        0
-    }
+    None
 }
 
-/// `IN` の直後（`from`）の `( e1, ..., en )` の要素数 n を返す。副問い合わせ・空リスト・閉じ括弧が無い・
-/// 要素に別の距離式を含む形は `0`。
-fn in_list_copies(region: &[Token], from: usize) -> usize {
+/// `IN` の直後（`from`）の `( e1, ..., en )` を読み、要素ごとの部分（n 個）を返す。第 k 部分は
+/// 要素 k の範囲（最後の要素は空範囲。その距離式は AST でも最後に現れる）。副問い合わせ・空リスト・
+/// 閉じ括弧が無い形は `None`。
+fn in_list_parts(region: &[Token], from: usize) -> Option<Vec<(usize, usize)>> {
     if !matches!(region.get(from), Some(Token::Punct('('))) {
-        return 0;
+        return None;
     }
     let first = from.saturating_add(1);
     if matches!(
         region.get(first),
         Some(Token::Punct(')') | Token::Keyword(lexer::Keyword::Select))
     ) {
-        return 0;
+        return None;
     }
     let mut d: usize = 0;
-    let mut n: usize = 1;
-    for t in region.get(first..).unwrap_or(&[]) {
+    let mut elem_start = first;
+    let mut parts: Vec<(usize, usize)> = Vec::new();
+    for (off, t) in region.get(first..).unwrap_or(&[]).iter().enumerate() {
+        let at = first.saturating_add(off);
         match t {
-            Token::DistanceOp(_) => return 0,
             Token::Punct('(') => d = d.saturating_add(1),
             Token::Punct(')') => {
                 if d == 0 {
-                    return n;
+                    parts.push((at, at));
+                    return Some(parts);
                 }
                 d -= 1;
             }
-            Token::Punct(',') if d == 0 => n = n.saturating_add(1),
+            Token::Punct(',') if d == 0 => {
+                parts.push((elem_start, at));
+                elem_start = at.saturating_add(1);
+            }
             _ => {}
         }
     }
-    0
+    None
 }
-
 /// `tokens`（`$n` 置換前の元トークン列）の SELECT リスト（括弧深度 0 の `SELECT` から同深度の
 /// `FROM` まで）で、投影項目（カンマ区切り）ごとに、投影位置の距離列 `<列> <距離演算子> $n`
 /// （SQL-33 (7)・Issue #2007）の `$n` を持つ項目の添字を可変長フラグ列（添字 i が真なら項目 i が印付き）で返す。

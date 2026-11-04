@@ -987,6 +987,13 @@ fn describe_accepts_placeholder_in_between_and_in() {
         // PR #2956 指摘: BETWEEN の上限値の後に続く OR の距離述語を境界の距離式に数えない。
         "SELECT id FROM t WHERE v <-> $1 BETWEEN 0 AND 5 OR v <-> $2 < 3 ORDER BY id LIMIT 3",
         "SELECT id FROM t WHERE v <-> $1 BETWEEN 0 AND 5 AND v <-> $2 < 3 OR v <-> $3 < 1 ORDER BY id LIMIT 3",
+        // PR #2956 指摘: 境界・要素に別の距離式（実リテラル）を含んでも `$n` の仮値だけを置換する。
+        "SELECT id FROM t WHERE v <-> $1 BETWEEN (v <-> '[0,0]') AND 10 ORDER BY id LIMIT 3",
+        "SELECT id FROM t WHERE v <-> $1 BETWEEN 0 AND (v <-> '[0,0]') ORDER BY id LIMIT 3",
+        "SELECT id FROM t WHERE v <-> $1 NOT BETWEEN (v <-> '[0,0]') AND 10 ORDER BY id LIMIT 3",
+        "SELECT id FROM t WHERE v <-> $1 IN (v <-> '[0,0]', 2) ORDER BY id LIMIT 3",
+        "SELECT id FROM t WHERE v <-> $1 IN (1, v <-> '[0,0]') ORDER BY id LIMIT 3",
+        "SELECT id FROM t WHERE v <-> '[0,0]' BETWEEN (v <-> $1) AND 10 ORDER BY id LIMIT 3",
         // PR #2956 指摘: Aggregate の WHERE の `$n` 仮値。
         "SELECT count(*) FROM t WHERE v <-> $1 < 5",
     ] {
@@ -1015,6 +1022,8 @@ fn describe_rejects_real_zero_literal_next_to_placeholder() {
         "SELECT id FROM t WHERE v <-> '0' < 5 AND v <-> $1 < 5 ORDER BY v <=> '[1,2]' LIMIT 3",
         "SELECT id FROM t WHERE v <-> $1 < 5 AND v <-> '0' < 5 ORDER BY id LIMIT 3",
         "SELECT count(*) FROM t WHERE v <-> $1 < 5 AND v <-> '0' < 5",
+        "SELECT id FROM t WHERE v <-> $1 BETWEEN (v <-> '0') AND 10 ORDER BY id LIMIT 3",
+        "SELECT id FROM t WHERE v <-> $1 IN (v <-> '0', 2) ORDER BY id LIMIT 3",
     ] {
         let err = describe(sql).expect_err(sql);
         assert_eq!(err.wire_code(), "22P02", "{sql}");

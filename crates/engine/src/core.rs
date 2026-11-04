@@ -7377,7 +7377,7 @@ impl EngineCore {
             order_by: crate::sql::params::order_by_distance_literal_is_param(&tokens),
             projection_mask: crate::sql::params::select_list_distance_param_mask(&tokens),
             where_distance_mask: crate::sql::params::where_distance_param_mask(&tokens),
-            where_distance_copies: crate::sql::params::where_distance_copy_counts(&tokens),
+            where_distance_order: crate::sql::params::where_distance_ast_order(&tokens),
         };
         // Issue #1342・#1546: 型推論（カタログとトークン列だけで決まる）を先に行い、
         // 確定した置換リテラル種別の型付きダミーで 1 回だけ構造検証 parse する。

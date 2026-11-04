@@ -201,18 +201,18 @@ fn placeholder_predicates(
     replace_by_mask(
         schema,
         &skip.where_distance_mask,
-        &skip.where_distance_copies,
+        &skip.where_distance_order,
         preds,
         |w, p| w.pred(p),
     )
 }
 
-/// 印（`mask`）と複製数（`copies`）に従い、`items` 内の距離式のうち `$n` 由来のものだけを置換する共通本体。
+/// 印（`mask`）と AST 順（`order`）に従い、`items` 内の距離式のうち `$n` 由来のものだけを置換する共通本体。
 /// 距離式の個数が印の個数と（複製数による展開後も）合わない形は何も置換しない（fail-closed）。
 fn replace_by_mask<T: Clone>(
     schema: &TableSchema,
     mask: &[bool],
-    copies: &[usize],
+    order: &[usize],
     items: &[T],
     mut walk: impl FnMut(&mut PlaceholderWalker<'_>, &T) -> T,
 ) -> Vec<T> {
@@ -232,7 +232,7 @@ fn replace_by_mask<T: Clone>(
     let expanded;
     let mask: &[bool] = if counter.ordinal == mask.len() {
         mask
-    } else if let Some(m) = expand_mask_by_copies(counter.seen.len(), mask, copies) {
+    } else if let Some(m) = expand_mask_by_order(counter.seen.len(), mask, order) {
         expanded = m;
         &expanded
     } else {
@@ -278,22 +278,16 @@ struct PlaceholderWalker<'a> {
 
 /// BETWEEN／IN の脱糖で左辺の距離式が複製され、AST 上の距離式数がトークン上の距離演算子数
 /// （`mask.len()`）を超える場合に、トークン単位の印を AST の距離式の出現順へ展開する（PR #2956 指摘）。
-/// 各トークンの複製数（`copies`。トークン位置から [`crate::sql::params::where_distance_copy_counts`]
-/// が決める）だけ印を繰り返す。構造一致での推定はしない（Describe では異なる `$n` が同じ仮値になり、
-/// 独立した距離式を 1 つの塊と取り違えるため）。複製数が不明（0）・長さ不一致・総数が AST の距離式数と
-/// 合わない形は `None`（fail-closed。何も置換しない）。
-fn expand_mask_by_copies(seen_len: usize, mask: &[bool], copies: &[usize]) -> Option<Vec<bool>> {
-    if copies.len() != mask.len() {
+/// `order` は [`crate::sql::params::where_distance_ast_order`] がトークン位置から決める「AST の k 番目の
+/// 距離式に対応するトークン順の添字」で、境界・要素内の距離式（`x BETWEEN (v <-> '..') AND ..`）の
+/// 並びも反映する。構造一致での推定はしない（Describe では異なる `$n` が同じ仮値になり、独立した
+/// 距離式を 1 つの塊と取り違えるため）。順序が不明（空）・総数が AST の距離式数と合わない・添字が
+/// 範囲外の形は `None`（fail-closed。何も置換しない）。
+fn expand_mask_by_order(seen_len: usize, mask: &[bool], order: &[usize]) -> Option<Vec<bool>> {
+    if order.len() != seen_len {
         return None;
     }
-    let mut out: Vec<bool> = Vec::with_capacity(seen_len);
-    for (flag, n) in mask.iter().zip(copies) {
-        if *n == 0 || out.len().checked_add(*n)? > seen_len {
-            return None;
-        }
-        out.extend(std::iter::repeat_n(*flag, *n));
-    }
-    (out.len() == seen_len).then_some(out)
+    order.iter().map(|i| mask.get(*i).copied()).collect()
 }
 
 impl PlaceholderWalker<'_> {
