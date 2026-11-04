@@ -885,6 +885,10 @@ def _run_phases(
                 ),
                 "search_engine": self_hnsw.SEARCH_ENGINE_TOKEN if is_hnsw else "default",
                 "hnsw_args": hnsw_args,
+                # kNN 本体が実際に HNSW へ到達したか（ann_probe の EXPLAIN 観測）。
+                # `--config hnsw` でも False なら厳密全走査であり、上記 index /
+                # search_engine は「構成指定」であって実効経路ではない。
+                "knn_reaches_hnsw": knn_reaches_hnsw,
                 "planner": "loopback stub (fixed expansion)" if run_ann_probe else None,
                 # durability A/B（Issue #851）。`verify_arm_identity` が run() で
                 # 既に一致を確認済みのため、ここでは記録のみ（再計算しない）。
