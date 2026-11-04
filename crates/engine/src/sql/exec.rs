@@ -252,7 +252,7 @@ const _: () = assert!(
 );
 
 // `precision` 時の `k_eff`（SCALAR 事前フィルタ経路: `bound.limit.max(2)`。
-// SCALAR 事後フィルタ経路: `arena.ids().len().clamp(2, core::MAX_SEARCH_K)`。
+// SCALAR 事後フィルタ経路: `arena.dense_len().clamp(2, core::MAX_SEARCH_K)`。
 // いずれも「`LIMIT 1` でも Top-2 を取得する」ための下限が `2`）の事後フィルタ側が
 // `core::MAX_SEARCH_K`（内部固定の防御上限。明示 `LIMIT` の設定値とは連動しない。
 // Issue #1555）の範囲内に収まることをコンパイル時に固定する
@@ -600,13 +600,6 @@ fn map_arena_error(table: &str, e: ArenaError) -> SqlSurfaceError {
         // Issue #1953: 構築中の協調キャンセルポイントが検出した中断は `57014` のまま返す（`XX000`
         // へ丸めない）。`expr_eval_error_to_arena` の `QueryCanceled` 腕との往復。
         ArenaError::Interrupted(reason) => SqlSurfaceError::QueryCanceled { reason },
-        // 自テナントの可視行に NULL の VECTOR（空 embedding）がある表の検索は、kNN からの NULL
-        // 行除外（Issue #2043）が入るまで `0A000` で拒否する過渡措置（Issue #2042・TABLE-26。
-        // #2043 でこの腕は除外ロジックに置き換える。可視性判定は decode より前なので他テナントの
-        // NULL 行はここへ到達しない）。
-        ArenaError::DimMismatch { found: 0, .. } => SqlSurfaceError::FeatureNotSupported {
-            detail: "search over a table with NULL vector rows is not supported yet".to_string(),
-        },
         ArenaError::Storage(_)
         | ArenaError::Catalog(_)
         | ArenaError::InvalidDim
@@ -929,8 +922,14 @@ fn rescore_cosine(
 /// 非有限スコアを拒否し、ゼロノルム行が 1 件あるだけで hybrid 全体が失敗するのを避けるため
 /// （RRF は順位ベースで、末尾の NaN 行を除いた影響は小さい）。`sql::exec` の `Ranking::Hybrid`
 /// 分岐だけが使う crate 内部の型で、行の可視性は呼び出し元が絞り込み済みの入力に従う。
+///
+/// Issue #2043・TABLE-26: `dense_slots` が `Some` のとき（arena が NULL の VECTOR 行を含む）、密側は
+/// NULL 行を除いた候補スロットだけを走査する（疎側の `input.ids` は全スロットのまま呼び出し元が
+/// 持つため、NULL 行は疎側の候補に残る）。`input` が当該 arena のバッファ（`ids` が恒等スロット列で
+/// `vectors.len() == ids.len() * dim`）でなければ、黙って全体を走査せず `KernelError` で拒否する。
 struct CosineDenseAdapter<'a> {
     inner: &'a dyn SearchProvider,
+    dense_slots: Option<&'a [u32]>,
 }
 
 impl SearchProvider for CosineDenseAdapter<'_> {
@@ -938,14 +937,33 @@ impl SearchProvider for CosineDenseAdapter<'_> {
         &self,
         input: SearchInput<'_>,
     ) -> Result<Vec<crate::kernel::CandidateHit>, KernelError> {
-        let hits = self.inner.search_cosine(crate::kernel::CosineSearchInput {
-            ids: input.ids,
-            vectors: input.vectors,
-            row_norms_sq: None,
-            dim: input.dim,
-            query: input.query,
-            k: input.k,
-        })?;
+        let hits = match self.dense_slots {
+            None => self.inner.search_cosine(crate::kernel::CosineSearchInput {
+                ids: input.ids,
+                vectors: input.vectors,
+                row_norms_sq: None,
+                dim: input.dim,
+                query: input.query,
+                k: input.k,
+            })?,
+            Some(slots) => {
+                let rows = input.vectors.len().checked_div(input.dim as usize);
+                let identity = rows == Some(input.ids.len())
+                    && input.ids.iter().enumerate().all(|(i, &id)| id == i as u64)
+                    && slots.iter().all(|&s| (s as usize) < input.ids.len());
+                if !identity {
+                    return Err(KernelError::WorkerPanicked);
+                }
+                self.inner
+                    .search_cosine_subset(crate::kernel::SubsetSearchInput {
+                        slots,
+                        vectors: input.vectors,
+                        dim: input.dim,
+                        query: input.query,
+                        k: input.k,
+                    })?
+            }
+        };
         // provider は untrusted: NaN 除去・スコア変換・再整列の前に生の結果全体で契約
         // （件数・可視 id の多重集合・距離昇順・NaN 末尾）を検証し、違反は fail-closed に拒否する。
         let mut visible_id_counts: std::collections::HashMap<u64, usize> =
@@ -2577,6 +2595,26 @@ pub(crate) fn execute_statement_with_cache(
     // （`core::provider_result_is_valid` の (3)(4) 検証はそのまま使える）。
     let visible_id_counts = core::visible_id_counts(&slot_ids);
 
+    // Issue #2043・TABLE-26: NULL の VECTOR 行（空 embedding）は arena にスロットを持つ（疎側の
+    // DocId・投影が同じスロット番号を使うため）が、密側の kNN 候補には入れない。NULL 行が 1 件も
+    // 無ければ `None` で、以降の全経路は従来と同一に動く。HNSW の索引は NULL 行を含められない
+    // ため、NULL 行を含む arena では HNSW 経路を使わず（下のシャドーイング）、同じ候補集合
+    // （`dense_slots`）の厳密走査へ倒す（結果は経路間で一致する）。
+    let dense_slots: Option<Vec<u32>> = if arena.null_row_count() == 0 {
+        None
+    } else {
+        match mask_kept_slots.as_ref() {
+            Some(kept) => arena.dense_subset(kept),
+            None => arena.dense_slots(),
+        }
+        .map_err(|e| map_arena_error(&bound.table, e))?
+    };
+    let has_null_rows = arena.null_row_count() != 0;
+    let hnsw_full_visible_eligible = hnsw_full_visible_eligible && !has_null_rows;
+    let hnsw_subset_eligible = hnsw_subset_eligible && !has_null_rows;
+    let hnsw_hybrid_full_visible_eligible = hnsw_hybrid_full_visible_eligible && !has_null_rows;
+    let hnsw_hybrid_subset_eligible = hnsw_hybrid_subset_eligible && !has_null_rows;
+
     // `precision` 時は DISTANCE 段の取得件数を `bound.limit` より広く取る
     // （`LIMIT 1` でも Top-2 を取得し、`precision::apply_gate` のマージン判定を
     // 行えるようにする。`crate::precision` モジュールドキュメント参照）。`recall`
@@ -2638,7 +2676,7 @@ pub(crate) fn execute_statement_with_cache(
     // fail-closed パターンに合わせる。完全性を保証できないこと自体は仕様上の
     // fail-closed 応答であり `SqlSurfaceError` への昇格対象ではない）。
     let completeness_unbounded =
-        precision_completeness_unbounded(is_precision, plan.scalar_prefilter, arena.ids().len());
+        precision_completeness_unbounded(is_precision, plan.scalar_prefilter, arena.dense_len());
 
     // DISTANCE 段。カーネル・HNSW・hybrid の内部には確認点を置けない（`KernelError`／`SearchProvider` の
     // 公開 API 変更と `search_or_fallback` の縮退吸収の整理が要るため。Issue #1953 の対象外）。代わりに
@@ -2658,9 +2696,17 @@ pub(crate) fn execute_statement_with_cache(
             Ranking::Distance { query }
                 if bound.distance_descending || bound.result_cap.is_some() =>
             {
+                let exact_slots: Vec<u64> = match dense_slots.as_ref() {
+                    Some(d) => d.iter().map(|&s| u64::from(s)).collect(),
+                    None => Vec::new(),
+                };
                 let raw = exact_full_scan(
                     arena,
-                    &slot_ids,
+                    if dense_slots.is_some() {
+                        &exact_slots
+                    } else {
+                        &slot_ids
+                    },
                     query,
                     k_eff,
                     bound.distance_descending,
@@ -2683,7 +2729,7 @@ pub(crate) fn execute_statement_with_cache(
                     && !hnsw_full_visible_eligible
                     && !hnsw_subset_eligible =>
             {
-                let raw = if let Some(kept) = mask_kept_slots.as_ref() {
+                let raw = if let Some(kept) = dense_slots.as_ref().or(mask_kept_slots.as_ref()) {
                     // スロット番号を位置ベースの `CosineSearchInput` へ渡さない（Issue #654 の
                     // 注意と同じ。行番号は明示的な候補マスクとして渡す）。
                     provider
@@ -2870,7 +2916,9 @@ pub(crate) fn execute_statement_with_cache(
                             }
                         },
                     }
-                } else if let Some(kept) = mask_kept_slots.as_ref() {
+                } else if let Some(kept) = dense_slots.as_ref().or(mask_kept_slots.as_ref()) {
+                    // Issue #2043: NULL 行を含む arena では `dense_slots`（NULL 行を除いた候補）を
+                    // 優先する。`mask_kept_slots` のみのときは従来どおり。
                     // Issue #654: `arena` はキャッシュ済みスナップショットの
                     // `VectorArena` を丸ごと借用したまま（複製していない）。`slot_ids`
                     // （＝`kept`）は `arena.vectors()` に対する行番号そのものであり、
@@ -2984,7 +3032,10 @@ pub(crate) fn execute_statement_with_cache(
                 // Issue #1991: HNSW を使わない密側は `<=>` の意味（コサイン）で順位付けする。
                 // `HnswDenseProvider`（内積グラフ）は従来の内積順のまま残る（HNSW のコサイン正確化は
                 // #1998。非対称は `docs/design/cosine-operator-migration.md` に記録）。
-                let cosine_dense = CosineDenseAdapter { inner: provider };
+                let cosine_dense = CosineDenseAdapter {
+                    inner: provider,
+                    dense_slots: dense_slots.as_deref(),
+                };
                 let dense_provider: &dyn SearchProvider = match &hnsw_dense_provider {
                     Some(adapter) => adapter,
                     None => &cosine_dense,
@@ -3156,7 +3207,7 @@ pub(crate) fn execute_statement_with_cache(
                 let array_scratch = array_payload_scratch(columns)?;
                 let scanned_view: Vec<Option<ScalarRef<'_>>> =
                     candidate_scalar_view(columns, &array_scratch);
-                let Some(embedding) = arena.vector(slot) else {
+                let Some(embedding) = arena.vector_or_null(slot) else {
                     continue;
                 };
                 let Some(row_id) = arena.row_id(slot).map(hit_id_for_response) else {
@@ -3240,7 +3291,7 @@ pub(crate) fn execute_statement_with_cache(
                         })?;
                     let embedding =
                         arena
-                            .vector(slot)
+                            .vector_or_null(slot)
                             .ok_or_else(|| SqlSurfaceError::Internal {
                                 detail: "candidate arena index out of range".to_string(),
                             })?;
@@ -3733,7 +3784,7 @@ fn project_rows(
             detail: "candidate slot index out of range".to_string(),
         })?;
         let embedding = arena
-            .vector(slot)
+            .vector_or_null(slot)
             .ok_or_else(|| SqlSurfaceError::Internal {
                 detail: "candidate arena index out of range".to_string(),
             })?;
@@ -3843,6 +3894,9 @@ fn project_rows(
                                 detail: "projected column index out of range".to_string(),
                             })?;
                     match &column.ty {
+                        // 空 embedding は NULL の VECTOR（Issue #2043・TABLE-26）。hybrid で疎側
+                        // だけがヒットした NULL 行がここへ到達する。
+                        ColumnType::Vector(_) if embedding.is_empty() => cells.push(Cell::Null),
                         ColumnType::Vector(_) => {
                             cells.push(Cell::Vector(try_clone_embedding(embedding)?))
                         }
@@ -6924,7 +6978,10 @@ mod tests {
     fn cosine_dense_adapter_rejects_contract_violations_before_nan_removal() {
         let run = |hits: Vec<crate::kernel::DistanceHit>, k: usize| {
             let inner = CosineOnly(hits);
-            let adapter = CosineDenseAdapter { inner: &inner };
+            let adapter = CosineDenseAdapter {
+                inner: &inner,
+                dense_slots: None,
+            };
             adapter.search(SearchInput {
                 ids: &[1_u64, 2],
                 vectors: &[0.0, 0.0],
@@ -6949,7 +7006,10 @@ mod tests {
             dh(1, 1.5),
             dh(9, f64::NAN),
         ]);
-        let adapter = CosineDenseAdapter { inner: &inner };
+        let adapter = CosineDenseAdapter {
+            inner: &inner,
+            dense_slots: None,
+        };
         let ids = [4_u64, 2, 7, 1, 9];
         let hits = adapter
             .search(SearchInput {

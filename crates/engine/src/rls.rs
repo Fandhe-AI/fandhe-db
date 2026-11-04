@@ -64,7 +64,7 @@ use redb::{ReadableDatabase, ReadableTable};
 use crate::arena::{ArenaError, VectorArena};
 use crate::catalog::CatalogError;
 use crate::core::{provider_result_is_valid, validate_search_k, MAX_SEARCH_K};
-use crate::kernel::{self, CandidateHit, KernelError, SearchHit, SearchInput, SearchProvider};
+use crate::kernel::{self, CandidateHit, KernelError, SearchHit, SearchProvider};
 use crate::policy::PolicyContext;
 use crate::storage::{Storage, Visibility};
 
@@ -390,14 +390,15 @@ impl PrefilterSnapshot {
             return Err(RlsError::IndexStale);
         }
 
-        let input = SearchInput {
-            ids: &self.slot_ids,
-            vectors: self.arena.vectors(),
-            dim: self.arena.dim(),
+        let dense = self.arena.dense_slots()?;
+        let hits = crate::core::search_arena_dense(
+            provider,
+            &self.arena,
+            &self.slot_ids,
+            dense.as_deref(),
             query,
             k,
-        };
-        let hits = provider.search(input)?;
+        )?;
 
         if !provider_result_is_valid(&hits, k, &self.visible_id_counts) {
             return Err(RlsError::ProviderResultRejected);
@@ -497,7 +498,11 @@ impl PrefilterSnapshot {
         // 見込みが高いが、無駄な索引構築を避けるためここで早期に切り替える）。
         let read_txn_table_generation =
             crate::catalog::table_generation_in_txn(&read_txn, self.arena.table_name());
-        let raw = if read_txn_table_generation.ok() == Some(self.built_table_generation) {
+        // NULL の VECTOR 行を含むスナップショットでは HNSW の索引を使わず、NULL 行を除いた
+        // 厳密走査へ倒す（Issue #2043・TABLE-26。索引は NULL 行を含められない）。
+        let raw = if self.arena.null_row_count() == 0
+            && read_txn_table_generation.ok() == Some(self.built_table_generation)
+        {
             crate::sql::hnsw_cache::search_or_fallback(
                 access,
                 &read_txn,
@@ -511,14 +516,15 @@ impl PrefilterSnapshot {
             )
             .map_err(RlsError::Kernel)?
         } else {
-            let input = SearchInput {
-                ids: &self.slot_ids,
-                vectors: self.arena.vectors(),
-                dim: self.arena.dim(),
+            let dense = self.arena.dense_slots()?;
+            crate::core::search_arena_dense(
+                provider,
+                &self.arena,
+                &self.slot_ids,
+                dense.as_deref(),
                 query,
                 k,
-            };
-            provider.search(input)?
+            )?
         };
 
         if !provider_result_is_valid(&raw, k, &self.visible_id_counts) {
@@ -843,6 +849,12 @@ impl<'s> SearchTimeFilter<'s> {
                     expected: self.dim,
                     found: u32::MAX,
                 })?;
+            // `found_dim == 0` は NULL の VECTOR（Issue #2043・TABLE-26）。可視性判定の後でだけ
+            // 到達するため、他テナントの行には影響しない。kNN の候補にも容量カウントにも入れない。
+            // 0 以外の不一致は従来どおり破損として拒否する。
+            if found_dim == 0 {
+                continue;
+            }
             if found_dim != self.dim {
                 return Err(ArenaError::DimMismatch {
                     id,
@@ -1105,7 +1117,7 @@ mod tests {
 
     use super::*;
     use crate::catalog::{ColumnDef, ColumnType, TableSchema};
-    use crate::kernel::CpuScalarProvider;
+    use crate::kernel::{CpuScalarProvider, SearchInput};
     use crate::storage::{RowInput, Visibility};
 
     #[test]

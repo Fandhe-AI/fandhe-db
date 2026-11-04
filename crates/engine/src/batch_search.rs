@@ -583,6 +583,10 @@ impl ResidentMatrix {
         )
     }
 
+    /// 行列は NULL の VECTOR 行（空 embedding。Issue #2043・TABLE-26）を表現できない。
+    /// 呼び出し元は `VectorArena::dense_slots` 等で NULL 行を除いた密な行列を渡す契約で、
+    /// `vectors.len() != ids.len() * dim` の入力は従来どおり拒否する。
+    ///
     /// [`Self::build`] の metric 指定版（Issue #2003）。`Cosine` では各行を 1 回だけ
     /// 単位長へ正規化してから f16 パックする（正規化できない行は NaN 行になり、走査時に
     /// 候補から外れる。スロットは保たれる）。それ以外の事前条件・信頼境界は
