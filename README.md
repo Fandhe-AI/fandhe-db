@@ -1136,6 +1136,8 @@ scripts/bench_chip_ab.sh --summarize _/bench/chip-ab/<UTC ts>
 
 i8 パック常駐経路（`engine::gpu_batch::packed_i8::GpuI8BatchBackend`。Issue #542。opt-in・候補生成専用）の計測行 `gpu_scaling_i8:`／`gpu_scaling_i8_stats:`（Issue #543）が A/B/C 3 経路の後段に追加で出力されます。`gpu_scaling_i8:` は CPU-SIMD 厳密対照に対する同点許容つき不一致件数（`i8_mismatch`）・平均 Recall@k（`i8_recall_at_k`。確定的指標）・速度比（`speedup_i8_vs_cpu_p95`／`speedup_i8_vs_f16_p95`）を出力し、`gpu_scaling_i8_stats:` は読み戻し・再スコア候補数・GPU backend・`build_ms` を出力します。`GpuI8Options::oversample` は構築時固定のため 1 プロセス = 1 oversample しか計測できません（`BENCH_GPU_SCALING_I8_OVERSAMPLE`。未設定時は既定 `packed_i8::DEFAULT_I8_OVERSAMPLE`＝4）。oversample のスイープは `scripts/bench_gpu_scaling_ab.sh` を `I8_OVERSAMPLE=<値>` 付きで複数回起動して行います（設定時のみ両バイナリへパススルー。before バイナリ〔i8 経路実装前〕は未知の env を読まないため無害）。実測結果・oversample 推奨値は `docs/design/gpu-batch-i8-packed.md`「前後比較実測（Issue #543）」節を参照してください。
 
+metric 別の計測（Issue #2005）: `BENCH_GPU_SCALING_METRIC`（`inner_product`〔既定〕・`l2`・`cosine`。`l1` など allowlist 外は起動拒否。1 プロセス = 1 metric）で A/B/C/D 全経路を同じ metric で構築し直します。既存行の書式は変えず、起動時に `gpu_scaling_metric:` 行、規模点ごとに f16・f32 経路の CPU-SIMD 基準 Recall@k を示す `gpu_scaling_recall:` 行が追加されます。`batch_bench`（CORE-6／CORE-16）も `BENCH_BATCH_METRIC` で同様に切り替えられ（内積以外のときだけゲート行末に `metric=<name>` が追記される）、`bench.yml` へは repo variable として注入します。実測は `docs/design/gpu-batch-metric.md`「metric 別実測（Issue #2005）」節を参照してください。
+
 Phase 5（#532・#536・#539・#542）の通し前後比較・FAISS GPU 対照・Qdrant GPU 構築対照の更新・Apple UMA ゼロコピー静的確認は `docs/design/gpu-batch-phase5-before-after.md`（Issue #544）を参照してください。
 
 ### Recall 回帰ハーネスの repo secrets（TASK-104）
