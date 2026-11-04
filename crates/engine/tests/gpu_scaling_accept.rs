@@ -10,11 +10,12 @@
 mod harness;
 
 use harness::gpu_scaling::{
-    count_boundary_tolerant_mismatches, format_i8_unavailable_line, format_skip_line,
-    format_unavailable_line, full_readback_bytes_estimate, mean_recall_at_k, parse_batches,
-    parse_dims, parse_i8_oversample, parse_measured_iterations, parse_query_f16_exact, parse_rows,
-    parse_shader_ab, parse_top_k, readback_bytes_per_call, rescored_candidates_per_call,
-    round_to_f16_exact, speedup_ratio, GpuScalingI8Result, GpuScalingI8StatsLine, GpuScalingResult,
+    count_boundary_tolerant_mismatches, format_i8_unavailable_line, format_metric_line,
+    format_skip_line, format_unavailable_line, full_readback_bytes_estimate, mean_recall_at_k,
+    parse_batches, parse_dims, parse_i8_oversample, parse_measured_iterations, parse_metric,
+    parse_query_f16_exact, parse_rows, parse_shader_ab, parse_top_k, readback_bytes_per_call,
+    rescored_candidates_per_call, round_to_f16_exact, speedup_ratio, BenchMetric,
+    GpuScalingI8Result, GpuScalingI8StatsLine, GpuScalingRecallLine, GpuScalingResult,
     GpuScalingStatsLine,
 };
 use std::time::Duration;
@@ -557,4 +558,70 @@ fn gpu_scaling_i8_stats_line_prefix_does_not_collide_with_other_line_greps() {
     assert!(rendered.starts_with("gpu_scaling_i8_stats: rows="));
     assert!(!rendered.starts_with("gpu_scaling: rows="));
     assert!(!rendered.starts_with("gpu_scaling_i8: rows="));
+}
+// ---------------------------------------------------------------------
+// parse_metric / format_metric_line / GpuScalingRecallLine（Issue #2005）
+// ---------------------------------------------------------------------
+
+#[test]
+fn parse_metric_defaults_to_inner_product_when_unset_or_blank() {
+    assert_eq!(parse_metric(None), Ok(BenchMetric::InnerProduct));
+    assert_eq!(parse_metric(Some("")), Ok(BenchMetric::InnerProduct));
+    assert_eq!(parse_metric(Some("  ")), Ok(BenchMetric::InnerProduct));
+}
+
+#[test]
+fn parse_metric_accepts_the_three_allowed_tokens_with_trim() {
+    assert_eq!(
+        parse_metric(Some("inner_product")),
+        Ok(BenchMetric::InnerProduct)
+    );
+    assert_eq!(parse_metric(Some("l2")), Ok(BenchMetric::L2));
+    assert_eq!(parse_metric(Some(" cosine ")), Ok(BenchMetric::Cosine));
+}
+
+#[test]
+fn parse_metric_rejects_l1_and_unknown_values_fail_closed() {
+    for raw in ["l1", "L2", "Cosine", "foo", "ip", "l2;cosine"] {
+        assert!(parse_metric(Some(raw)).is_err(), "must reject {raw:?}");
+    }
+    let msg = parse_metric(Some("l1")).unwrap_err().to_string();
+    assert!(msg.contains("l1"));
+}
+
+#[test]
+fn bench_metric_tokens_round_trip_through_parse_metric() {
+    for m in [
+        BenchMetric::InnerProduct,
+        BenchMetric::L2,
+        BenchMetric::Cosine,
+    ] {
+        assert_eq!(parse_metric(Some(m.as_str())), Ok(m));
+    }
+}
+
+#[test]
+fn metric_line_and_recall_line_use_distinct_prefixes() {
+    assert_eq!(
+        format_metric_line(BenchMetric::L2),
+        "gpu_scaling_metric: metric=l2"
+    );
+    let rendered = GpuScalingRecallLine {
+        rows: 20_000,
+        dim: 128,
+        batch: 8,
+        k: 10,
+        metric: BenchMetric::Cosine,
+        f16_recall: 0.987_654_321,
+        f32_recall: 1.0,
+    }
+    .to_string();
+    assert_eq!(
+        rendered,
+        "gpu_scaling_recall: rows=20000 dim=128 batch=8 k=10 metric=cosine \
+         f16_recall=0.987654 f32_recall=1.000000"
+    );
+    // 既存行の grep（`gpu_scaling: rows=` 等）と接頭辞が衝突しない。
+    assert!(!rendered.starts_with("gpu_scaling: rows="));
+    assert!(!format_metric_line(BenchMetric::L2).starts_with("gpu_scaling: rows="));
 }
