@@ -3,7 +3,9 @@
 //! SEARCH-1。設計記録: `docs/design/rowid-primary-key-separation.md`）。
 //!
 //! 役割: 同一ベクトル（同点スコア）の行を意図的に含む決定的コーパスで、SQL の kNN と
-//! Rust API の `search` が「スコア降順・同点は `id` 昇順」の固定順序を返すことを検査する。
+//! Rust API の `search`（内積スコア降順）が、それぞれ「同点は `id` 昇順」の固定順序を返すことを
+//! 検査する（SQL の `<=>` はコサイン距離昇順。SQL-33・Issue #1991。同点行は同一ベクトルなので
+//! 距離も同点になる）。
 //! 採番方式の表の拒否は `src/catalog/rowid_gate_tests.rs` が持つ。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
