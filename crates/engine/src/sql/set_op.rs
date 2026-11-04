@@ -268,8 +268,9 @@ pub(crate) fn check_branch_type_compatibility(
     // Issue #1579）。UNION ALL も含め、重複除去の行キー化に到達させない。
     if columns_have_interval(l_columns) || columns_have_interval(r_columns) {
         return Err(SqlSurfaceError::FeatureNotSupported {
-            detail: "INTERVAL, BIT and HALFVEC columns cannot be used in set operations yet"
-                .to_string(),
+            detail:
+                "INTERVAL, BIT, HALFVEC and INT8VEC columns cannot be used in set operations yet"
+                    .to_string(),
         });
     }
     if l_columns.len() != r_columns.len() {
@@ -302,10 +303,18 @@ fn columns_have_interval(columns: &[ColumnMeta]) -> bool {
         matches!(
             c,
             ColumnMeta::Scalar {
-                ty: ColumnType::Interval | ColumnType::Bit(_) | ColumnType::HalfVec(_),
+                ty: ColumnType::Interval
+                    | ColumnType::Bit(_)
+                    | ColumnType::HalfVec(_)
+                    | ColumnType::Int8Vec(_),
                 ..
             } | ColumnMeta::Computed {
-                ty: Some(ColumnType::Interval | ColumnType::Bit(_) | ColumnType::HalfVec(_)),
+                ty: Some(
+                    ColumnType::Interval
+                        | ColumnType::Bit(_)
+                        | ColumnType::HalfVec(_)
+                        | ColumnType::Int8Vec(_),
+                ),
                 ..
             }
         )

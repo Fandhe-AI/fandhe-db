@@ -108,6 +108,7 @@ pub(crate) fn body_column_index(schema: &TableSchema) -> Result<usize, SqlSurfac
         | ColumnType::Interval
         | ColumnType::Bit(_)
         | ColumnType::HalfVec(_)
+        | ColumnType::Int8Vec(_)
         | ColumnType::Array(_)
         | ColumnType::Bytea
         | ColumnType::Json

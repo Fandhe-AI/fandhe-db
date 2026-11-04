@@ -1996,6 +1996,7 @@ fn resolve_alter_target_type(
     match ty {
         SqlColumnTypeName::Vector(dim) => Ok(ColumnType::Vector(*dim)),
         SqlColumnTypeName::HalfVec(dim) => Ok(ColumnType::HalfVec(*dim)),
+        SqlColumnTypeName::Int8Vec(dim) => Ok(ColumnType::Int8Vec(*dim)),
         other => resolve_column_type(storage, other, limits),
     }
 }
@@ -2140,6 +2141,12 @@ fn resolve_column_type(
     if matches!(ty, SqlColumnTypeName::HalfVec(_)) {
         return Err(SqlSurfaceError::FeatureNotSupported {
             detail: "ALTER TABLE ADD COLUMN does not support HALFVEC columns yet".to_string(),
+        });
+    }
+    // INT8VEC 列の追加も同じ理由で拒否する（担当 Issue 未定の fail-closed。TABLE-49・Issue #2018）。
+    if matches!(ty, SqlColumnTypeName::Int8Vec(_)) {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "ALTER TABLE ADD COLUMN does not support INT8VEC columns yet".to_string(),
         });
     }
     if let Some(alias) = alias_spelling(ty) {

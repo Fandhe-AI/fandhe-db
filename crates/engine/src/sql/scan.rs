@@ -290,6 +290,7 @@ fn decode_tier_for(schema: &TableSchema, bound: &BoundScan) -> (DecodeTier, Vec<
                         | ColumnType::Interval
                         | ColumnType::Bit(_)
                         | ColumnType::HalfVec(_)
+                        | ColumnType::Int8Vec(_)
                         | ColumnType::Array(_)
                         | ColumnType::Bytea
                         | ColumnType::Json
@@ -893,6 +894,21 @@ pub(crate) fn push_scalar_column_cell(
             Some(Some(_)) => {
                 return Err(scan_bug(
                     "HALFVEC column scan yielded a non-HalfVec scalar value",
+                ))
+            }
+            Some(None) | None => cells.push(Cell::Null),
+        },
+        // INT8VEC は i8 を f32 へ広げた `Cell::Vector` で返す（Issue #2018・TABLE-49）。
+        ColumnType::Int8Vec(_) => match scanned.get(*index) {
+            Some(Some(row_codec::ScalarRef::Int8Vec(body))) => {
+                let expanded = body.len().saturating_mul(std::mem::size_of::<f32>());
+                *byte_budget = try_accumulate_budget(*byte_budget, expanded, max_result_bytes)?;
+                let values = row_codec::int8vec_bytes_to_values(body);
+                cells.push(Cell::Vector(crate::sql::exec::expand_int8vec(&values)?));
+            }
+            Some(Some(_)) => {
+                return Err(scan_bug(
+                    "INT8VEC column scan yielded a non-Int8Vec scalar value",
                 ))
             }
             Some(None) | None => cells.push(Cell::Null),

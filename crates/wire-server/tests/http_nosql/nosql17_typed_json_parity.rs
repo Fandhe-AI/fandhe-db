@@ -1700,3 +1700,79 @@ fn halfvec_binding_matches_sql() {
     // 拒否された insert は副作用を残さない。
     assert_eq!(body_utf8(&alice(addr, scan)), a);
 }
+
+/// INT8VEC(N) 列（TABLE-49・Issue #2018）: NoSQL `insert`／`update` の JSON 整数配列が保存され、
+/// `scan` の応答が SQL の SELECT と一致する（型名は `"int8vec"`）。範囲外は `22003`、小数点・指数部を
+/// 含む数値は `22P02`、次元不一致・非数値要素・配列でない値は `22000`。
+#[test]
+fn int8vec_binding_matches_sql() {
+    let path = temp_db::unique_db_path("nosql17-int8vec");
+    let _guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "docs_iv",
+            vec![
+                ColumnDef::new("h", ColumnType::Int8Vec(2), true),
+                ColumnDef::new("lang", ColumnType::Text, true),
+            ],
+        ))
+        .expect("create int8vec table");
+    let core = Arc::new(EngineCore::from_storage(
+        storage,
+        Box::new(CpuScalarProvider),
+    ));
+    let addr = spawn(Arc::clone(&core));
+
+    let resp = alice(
+        addr,
+        r#"{"op":"insert","table":"docs_iv","rows":[{"id":1,"h":[-128,127],"lang":"ja"}],"operation_id":"iv-ins-1"}"#,
+    );
+    assert_eq!(resp.status, 200, "{resp:?}");
+    let resp = alice(
+        addr,
+        r#"{"op":"update","table":"docs_iv","set":{"h":[-1,2]},"where":{"id":1},"operation_id":"iv-upd-1"}"#,
+    );
+    assert_eq!(resp.status, 200, "{resp:?}");
+
+    let scan = r#"{"op":"scan","table":"docs_iv","columns":["id","h"],"sort":[{"column":"id","dir":"asc"}],"limit":100}"#;
+    let a = body_utf8(&alice(addr, scan));
+    assert_eq!(
+        a,
+        sql_oracle_body(
+            &core,
+            "tenant-a",
+            "SELECT id, h FROM docs_iv ORDER BY id ASC LIMIT 100"
+        )
+    );
+    assert!(a.contains(r#""type":"int8vec""#), "{a}");
+
+    for (i, (json, want)) in [
+        ("[128,1]", "22003"),
+        ("[1,-129]", "22003"),
+        ("[18446744073709551616,1]", "22003"),
+        ("[99999999999999999999,1]", "22003"),
+        ("[-99999999999999999999,1]", "22003"),
+        ("[1.0,1]", "22P02"),
+        ("[1e2,1]", "22P02"),
+        ("[1.5,1]", "22P02"),
+        ("[1]", "22000"),
+        ("[1,2,3]", "22000"),
+        (r#"["a",1]"#, "22000"),
+        ("5", "22000"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let resp = alice(
+            addr,
+            &format!(
+                r#"{{"op":"insert","table":"docs_iv","rows":[{{"id":{},"h":{json}}}],"operation_id":"iv-rej-{i}"}}"#,
+                50 + i
+            ),
+        );
+        assert_eq!(http_common::wire_code_of(&resp), want, "{json}: {resp:?}");
+    }
+    // 拒否された insert は副作用を残さない。
+    assert_eq!(body_utf8(&alice(addr, scan)), a);
+}

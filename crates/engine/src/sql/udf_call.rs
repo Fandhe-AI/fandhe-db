@@ -6564,6 +6564,10 @@ pub(super) fn bind_expr_any(
                     ColumnType::HalfVec(_) => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} cannot be used in an expression (HALFVEC columns are not supported)"
                     ))),
+                    // INT8VEC 列も式内参照を持たない（距離計算は兄弟 Issue #2019。Issue #2018）。
+                    ColumnType::Int8Vec(_) => Err(SqlSurfaceError::invalid_input(format!(
+                        "column {name:?} cannot be used in an expression (INT8VEC columns are not supported)"
+                    ))),
                     ColumnType::Bit(_) => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} cannot be used in an expression (BIT columns are not supported)"
                     ))),
@@ -8221,6 +8225,7 @@ fn column_type_label(ty: &ColumnType) -> &'static str {
         ColumnType::Interval => "interval",
         ColumnType::Bit(_) => "bit",
         ColumnType::HalfVec(_) => "halfvec",
+        ColumnType::Int8Vec(_) => "int8vec",
         ColumnType::Array(_) => "array",
         ColumnType::Bytea => "bytea",
         ColumnType::Json => "json",
