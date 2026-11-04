@@ -2084,6 +2084,9 @@ pub(crate) struct LiteralSkip {
     /// 投影項目（`Projection::Items` の添字）ごとの「距離列のリテラルが `$n` 由来か」の可変長
     /// フラグ列。範囲外の添字は印なし（常に検証する側）。
     pub(crate) projection_mask: Vec<bool>,
+    /// `WHERE` の距離式（半径述語）に `$n` 由来のダミー値があるか（Issue #2953。INT8VEC kNN の
+    /// 書き換えだけが参照し、ダミー値を有効なゼロベクトルへ置き換えて束縛する）。
+    pub(crate) where_distance: bool,
 }
 
 impl LiteralSkip {
@@ -2091,6 +2094,7 @@ impl LiteralSkip {
     pub(crate) const NONE: Self = Self {
         order_by: false,
         projection_mask: Vec::new(),
+        where_distance: false,
     };
 
     pub(crate) fn skips_projection_item(&self, index: usize) -> bool {
@@ -9366,7 +9370,7 @@ pub(crate) fn bind_aggregate_with_dummy_flags(
 /// 式の子式を `f` で写した複製を返す（葉・内部名はそのまま複製）。[`rewrite_group_row_idents`] と
 /// 同じ網羅的な `match` で、`Expr` に variant が増えたときにコンパイルエラーで気付けるようにする。
 /// グループキー式の構造一致（[`normalize_group_match_expr`]・[`substitute_group_key_exprs`]）が使う。
-fn map_expr_children(expr: &Expr, f: &mut dyn FnMut(&Expr) -> Expr) -> Expr {
+pub(crate) fn map_expr_children(expr: &Expr, f: &mut dyn FnMut(&Expr) -> Expr) -> Expr {
     use std::convert::Infallible;
     match expr {
         Expr::Ident(_)

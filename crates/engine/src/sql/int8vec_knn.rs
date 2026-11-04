@@ -19,7 +19,7 @@
 use crate::catalog::{ColumnType, TableSchema};
 use crate::sql::allowlist::{
     OrderByForm, Projection, ScanOrderKey, SelectItem, SqlSurfaceError, ValidatedScan,
-    ValidatedStatement,
+    ValidatedStatement, WherePredicate,
 };
 use crate::sql::lexer::DistanceKind;
 use crate::sql::mode::SearchMode;
@@ -115,7 +115,14 @@ pub(crate) fn int8vec_select_as_scan(
     Ok(Some(ValidatedScan {
         table_name: v.table_name.clone(),
         projection,
-        where_predicates: v.where_predicates.clone(),
+        where_predicates: if skip.where_distance {
+            v.where_predicates
+                .iter()
+                .map(|p| placeholder_where(p, schema))
+                .collect()
+        } else {
+            v.where_predicates.clone()
+        },
         limit: v.limit,
         limit_implicit: v.limit_implicit,
         order_by: Vec::new(),
@@ -148,6 +155,62 @@ fn zero_vector_literal(dim: u32) -> String {
     }
     out.push(']');
     out
+}
+
+/// WHERE 述語内の `$n` 由来ダミー値（Prepared Describe の仮値 `'0'`）の距離オペランドを、INT8VEC 列の
+/// 次元に合うゼロベクトルへ置き換える（Issue #2953。半径述語 `v <-> $1 < r` の Describe 用）。
+/// 置換するのは INT8VEC 列との距離式で、リテラルが仮値 `'0'` と一致するものだけ（その他の実リテラルは
+/// 通常どおり束縛で検証する。`'0'` はベクトルとして元から不正で、Execute では従来どおり拒否される）。
+fn placeholder_where(pred: &WherePredicate, schema: &TableSchema) -> WherePredicate {
+    match pred {
+        WherePredicate::Expression(e) => WherePredicate::Expression(placeholder_expr(e, schema)),
+        WherePredicate::Not(inner) => {
+            WherePredicate::Not(Box::new(placeholder_where(inner, schema)))
+        }
+        WherePredicate::Or(branches) => WherePredicate::Or(
+            branches
+                .iter()
+                .map(|b| b.iter().map(|p| placeholder_where(p, schema)).collect())
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// [`placeholder_where`] の式側。距離式以外は子式を再帰的に写す。
+fn placeholder_expr(expr: &Expr, schema: &TableSchema) -> Expr {
+    if let Expr::VectorDistance { kind, lhs, rhs } = expr {
+        let operands = match (lhs.as_ref(), rhs.as_ref()) {
+            (Expr::Ident(n), Expr::String(s)) if s == "0" => Some((n, true)),
+            (Expr::String(s), Expr::Ident(n)) if s == "0" => Some((n, false)),
+            _ => None,
+        };
+        let dim = operands.and_then(|(name, _)| {
+            schema
+                .columns
+                .iter()
+                .find(|c| &c.name == name)
+                .and_then(|c| match c.ty {
+                    ColumnType::Int8Vec(d) => Some(d),
+                    _ => None,
+                })
+        });
+        if let (Some((name, lhs_is_col)), Some(dim)) = (operands, dim) {
+            let column = Box::new(Expr::Ident(name.clone()));
+            let zero = Box::new(Expr::String(zero_vector_literal(dim)));
+            let (lhs, rhs) = if lhs_is_col {
+                (column, zero)
+            } else {
+                (zero, column)
+            };
+            return Expr::VectorDistance {
+                kind: *kind,
+                lhs,
+                rhs,
+            };
+        }
+    }
+    crate::sql::parser::map_expr_children(expr, &mut |e| placeholder_expr(e, schema))
 }
 
 /// `$n` 由来の投影距離列 `<列> <距離演算子> <ダミー>` のリテラルを、その列の型に合うゼロベクトルへ

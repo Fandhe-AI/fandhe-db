@@ -925,3 +925,32 @@ fn describe_validates_real_literals_next_to_placeholders() {
         assert_eq!(err.wire_code(), want, "{sql}");
     }
 }
+
+/// Issue #2953 Bugbot 指摘: WHERE の半径述語（`v <-> $n < r`）に `$n` を持つ INT8VEC kNN も
+/// Parse → Describe が通る（`$n` 由来のダミー値を距離リテラルとして解析しない）。
+/// 同じ文の実リテラルは従来どおり Describe で検証する。
+#[test]
+fn describe_accepts_where_radius_placeholder() {
+    let (_g, core) = open("ivd-describe-where");
+    ok(
+        &core,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, v INT8VEC(2))",
+    );
+    let describe = |sql: &str| {
+        let session = SessionState::default();
+        let prepared = core.parse_sql_prepared(sql).expect("prepare");
+        core.describe_prepared_in_session(&session, &prepared)
+    };
+    for sql in [
+        "SELECT id FROM t WHERE v <-> $1 < 5 ORDER BY v <=> '[1,2]' LIMIT 3",
+        "SELECT id FROM t WHERE v <-> $1 < 5 ORDER BY v <=> $2 LIMIT 3",
+        "SELECT id, v <-> $1 FROM t WHERE v <-> $2 < 5 ORDER BY v <-> $3 LIMIT 3",
+    ] {
+        describe(sql).unwrap_or_else(|e| panic!("{sql}: {}", e.wire_code()));
+    }
+    let err = describe(
+        "SELECT id FROM t WHERE v <-> $1 < 5 AND v <-> '[1,200]' < 5 ORDER BY v <=> $2 LIMIT 3",
+    )
+    .expect_err("real literal");
+    assert_eq!(err.wire_code(), "22003");
+}

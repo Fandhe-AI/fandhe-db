@@ -2131,6 +2131,40 @@ pub fn order_by_distance_literal_is_param(tokens: &[Token]) -> bool {
     })
 }
 
+/// `tokens`（`$n` 置換前の元トークン列）の `WHERE` 区間（括弧深度 0 の `FROM` から同深度の `ORDER`
+/// まで）に、距離式の `$n`（`<距離演算子> $n` または `$n <距離演算子>`。半径述語 `v <-> $1 < r` 等）が
+/// あるか（Issue #2953）。INT8VEC kNN の Prepared Describe が、WHERE 内のダミー値（ベクトルとして
+/// 不正）だけを有効なゼロベクトルへ置き換える対象判定に使う。ORDER BY・投影側の `$n` は別の印で
+/// 扱うため含めない。
+pub fn where_distance_literal_is_param(tokens: &[Token]) -> bool {
+    let mut depth: usize = 0;
+    let mut start: Option<usize> = None;
+    let mut end = tokens.len();
+    for (i, t) in tokens.iter().enumerate() {
+        match t {
+            Token::Punct('(') => depth = depth.saturating_add(1),
+            Token::Punct(')') => depth = depth.saturating_sub(1),
+            Token::Keyword(lexer::Keyword::From) if depth == 0 && start.is_none() => {
+                start = Some(i);
+            }
+            Token::Keyword(lexer::Keyword::Order) if depth == 0 && start.is_some() => {
+                end = i;
+                break;
+            }
+            _ => {}
+        }
+    }
+    let Some(start) = start else {
+        return false;
+    };
+    let region = tokens.get(start..end).unwrap_or(&[]);
+    region.iter().enumerate().any(|(i, token)| {
+        matches!(token, Token::Param(_))
+            && (matches!(region.get(i.wrapping_sub(1)), Some(Token::DistanceOp(_)))
+                || matches!(region.get(i.saturating_add(1)), Some(Token::DistanceOp(_))))
+    })
+}
+
 /// `tokens`（`$n` 置換前の元トークン列）の SELECT リスト（括弧深度 0 の `SELECT` から同深度の
 /// `FROM` まで）で、投影項目（カンマ区切り）ごとに、投影位置の距離列 `<列> <距離演算子> $n`
 /// （SQL-33 (7)・Issue #2007）の `$n` を持つ項目の添字を可変長フラグ列（添字 i が真なら項目 i が印付き）で返す。
