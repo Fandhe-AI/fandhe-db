@@ -763,19 +763,19 @@ fn main() {
 
     // --- e2e（EngineCore::execute_sql）: W0c/W0h/W0n・COUNT(*)（A0a/A0b）。--------
     let sql_where = format!(
-        "SELECT id FROM {TABLE} {} ORDER BY embedding <=> '{}' LIMIT {TOP_K}",
+        "SELECT id FROM {TABLE} {} ORDER BY embedding <#> '{}' LIMIT {TOP_K}",
         where_clause_for_arm(ProfileArm::Index, "lang", TARGET_LANG),
         vector_literal(&query)
     );
     // plain アーム（Issue #653）: `AND vec_norm(embedding) > 0` により `classify_scalar_plan` を
     // `PlainScan` へ縮退させ、Issue #474 以前相当の全可視行走査経路を測る。
     let sql_where_plain = format!(
-        "SELECT id FROM {TABLE} {} ORDER BY embedding <=> '{}' LIMIT {TOP_K}",
+        "SELECT id FROM {TABLE} {} ORDER BY embedding <#> '{}' LIMIT {TOP_K}",
         where_clause_for_arm(ProfileArm::Plain, "lang", TARGET_LANG),
         vector_literal(&query)
     );
     let sql_nowhere = format!(
-        "SELECT id FROM {TABLE} ORDER BY embedding <=> '{}' LIMIT {TOP_K}",
+        "SELECT id FROM {TABLE} ORDER BY embedding <#> '{}' LIMIT {TOP_K}",
         vector_literal(&query)
     );
     let count_sql = format!("SELECT COUNT(*) FROM {TABLE}");
