@@ -5,7 +5,7 @@ Atlas Vector Search をローカル実行できるイメージ。127.0.0.1:37017
 pymongo 4.18.1 で接続する（単一ノードのレプリカセットとして初期化される
 イメージのため `directConnection=true` でトポロジ探索〔コンテナ内部の
 ホスト名が呼び出し側から解決できない問題〕を回避する）。距離指標は自作 DB
-の `<=>`（内積）に合わせ `$vectorSearch` の `similarity: "dotProduct"` を使う。
+の `<#>`（負の内積の昇順＝内積の降順）に合わせ `$vectorSearch` の `similarity: "dotProduct"` を使う。
 RLS 相当は、自作 DB の現行契約（実機確認: どのテナントの wire セッションからも
 `visibility = 'public'` の行のみが可視。private 行は所有テナント自身からも
 不可視）に合わせ、`visibility` フィールドへの `$match`／`$vectorSearch.filter`

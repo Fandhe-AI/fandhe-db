@@ -4,8 +4,8 @@
 
 HASH `doc:<id>` へ列を保持し、RediSearch の `FT.CREATE`（VECTOR フィールド。
 exact 構成 = FLAT、hnsw 構成 = HNSW・M=16・EF_CONSTRUCTION=100・検索時
-EF_RUNTIME=max(64,k)）で索引を張る。距離指標は自作 DB の `<=>`（内積。値が
-大きいほど上位）に合わせ `DISTANCE_METRIC IP` を使う。RediSearch の IP
+EF_RUNTIME=max(64,k)）で索引を張る。距離指標は自作 DB の `<#>`（負の内積の昇順。
+内積が大きいほど上位）に合わせ `DISTANCE_METRIC IP` を使う。RediSearch の IP
 距離は `1 - 内積`（値が小さいほど上位）としてスコアリングされる
 （実機確認: `FT.SEARCH ... SORTBY score` の既定昇順でそのまま上位が先頭に
 来る。降順へ反転する必要はない）。

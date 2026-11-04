@@ -597,8 +597,8 @@ fn profile_arm_contract_matches_scalar_index_cache_stats() {
         .map(|id| {
             let lang = lang_for_id(id, 3);
             // `+ 1.0` でゼロベクトル（`id=0`）を避ける。ゼロノルムのベクトルは
-            // `<=>` の距離計算・`vec_norm(embedding) > 0` 述語のいずれでも
-            // 特別扱いになりうり、本テストの意図（index/plain 両アームの id
+            // `<#>` の距離計算（ゼロクエリは全行が距離 -0 の同点）・`vec_norm(embedding) > 0`
+            // 述語のいずれでも特別扱いになりうり、本テストの意図（index/plain 両アームの id
             // 集合一致）とは無関係な差異を生むため。
             (id, vec![id as f32 + 1.0, 0.0, 0.0, 0.0], lang)
         })
@@ -646,14 +646,14 @@ fn profile_arm_contract_matches_scalar_index_cache_stats() {
         // `LIMIT` を一致件数（10）以上に取り、Top-k がタイブレーク順序に依存
         // せず一致行集合の全体（部分集合ではなく）になるようにする（クエリ
         // ベクトルが原点のため候補間の距離が同点になり得る）。
-        "SELECT id FROM docs {} ORDER BY embedding <=> '[0.0,0.0,0.0,0.0]' LIMIT 20",
+        "SELECT id FROM docs {} ORDER BY embedding <#> '[0.0,0.0,0.0,0.0]' LIMIT 20",
         where_clause_for_arm(ProfileArm::Index, "lang", TARGET_LANG)
     );
     let sql_plain = format!(
         // `LIMIT` を一致件数（10）以上に取り、Top-k がタイブレーク順序に依存
         // せず一致行集合の全体（部分集合ではなく）になるようにする（クエリ
         // ベクトルが原点のため候補間の距離が同点になり得る）。
-        "SELECT id FROM docs {} ORDER BY embedding <=> '[0.0,0.0,0.0,0.0]' LIMIT 20",
+        "SELECT id FROM docs {} ORDER BY embedding <#> '[0.0,0.0,0.0,0.0]' LIMIT 20",
         where_clause_for_arm(ProfileArm::Plain, "lang", TARGET_LANG)
     );
 

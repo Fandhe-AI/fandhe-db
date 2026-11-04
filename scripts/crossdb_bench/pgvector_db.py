@@ -2,9 +2,8 @@
 `CROSSDB_PG_PORT` で上書き可。`containers.sh` と同じ変数を読む）の機能別
 ベンチマーク実装。
 
-自作 DB の `<=>` が内積（`crates/engine/src/kernel.rs` 参照。値が大きいほど
-上位）であるため、pgvector 側も同じ指標の `<#>`（負の内積。ORDER BY 昇順で
-内積の大きい順になる）に合わせる。RLS 相当は、自作 DB の現行契約（実機確認:
+自作 DB 側も `<#>`（負の内積の昇順。SQL-33）で、pgvector の `<#>`（負の内積。
+ORDER BY 昇順で内積の大きい順になる）と同じ演算子・同じ意味で比較する。RLS 相当は、自作 DB の現行契約（実機確認:
 どのテナントの wire セッションからも `visibility = 'public'` の行のみが
 可視。private 行は所有テナント自身からも不可視）に合わせ、`visibility` 列を
 追加したうえで `WHERE visibility = 'public'`（tenant 列では絞り込まない）を

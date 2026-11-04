@@ -14,11 +14,11 @@ hybrid_rrf レイテンシ」だけを単独で交互計測するための最小
 3 モード:
   - hybrid: ウォームアップなしで hybrid_rrf のみを計測する（ScalarIndex
     構築の gate が発火しない対照）。
-  - warm_where_then_hybrid: `WHERE lang = 'ja' ORDER BY <=>` を
+  - warm_where_then_hybrid: `WHERE lang = 'ja' ORDER BY <#>` を
     `--warm-where` 本（既定 50）実行して ScalarIndex を構築させてから
     hybrid_rrf を計測する（Issue #632 が実測した退行の再現条件）。
   - body_predicate: 索引対象から除外された列（`body`）への前方一致述語
-    `WHERE body LIKE '<prefix>%' ORDER BY <=> LIMIT 10` を計測する
+    `WHERE body LIKE '<prefix>%' ORDER BY <#> LIMIT 10` を計測する
     （除外列がスカラー事前フィルタ経路で plain scan へ縮退する影響の実測）。
 
 出力は 1 本の JSON（`--out` 必須。命名規約はドライバ側が決める）で、
@@ -172,14 +172,14 @@ def main() -> int:
                 qv = query_vecs[i % len(query_vecs)]
                 self_db._exec_ids(
                     conn,
-                    f"SELECT id FROM docs WHERE lang = 'ja' ORDER BY embedding <=> '{qv}' LIMIT 10",
+                    f"SELECT id FROM docs WHERE lang = 'ja' ORDER BY embedding <#> '{qv}' LIMIT 10",
                 )
         elif args.mode == "body_predicate":
             for i in range(args.warm_where):
                 self_db._exec_ids(
                     conn,
                     f"SELECT id FROM docs WHERE body LIKE '{body_prefix}%' "
-                    f"ORDER BY embedding <=> '{query_vecs[i % len(query_vecs)]}' LIMIT 10",
+                    f"ORDER BY embedding <#> '{query_vecs[i % len(query_vecs)]}' LIMIT 10",
                 )
         rss["after_warm"] = _rss_snapshot(server.proc.pid)
 
@@ -189,7 +189,7 @@ def main() -> int:
                 qv = query_vecs[i % len(query_vecs)]
                 sql = (
                     f"SELECT id FROM docs WHERE body LIKE '{body_prefix}%' "
-                    f"ORDER BY embedding <=> '{qv}' LIMIT 10"
+                    f"ORDER BY embedding <#> '{qv}' LIMIT 10"
                 )
                 t0 = time.perf_counter()
                 self_db._exec_ids(conn, sql)
