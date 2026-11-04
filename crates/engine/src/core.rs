@@ -1460,6 +1460,10 @@ pub struct EngineCore {
     /// `~` 系（Issue #1787）等が束縛時に [`Self::regex_limits`] を取り出して
     /// [`crate::regex_match::CompiledRegex::compile`] へ渡す。
     regex_limits: crate::regex_limits::RegexLimits,
+    /// `SPARSEVEC(N)` 書き込み経路の非ゼロ要素数上限（Issue #2027・TABLE-47 (2) ポインタ）。
+    /// 差し替えは [`Self::with_sparsevec_limits`] のみ（起動時 1 回）。束縛クロージャを呼ぶ区間と
+    /// 文実行入口が [`Self::sparsevec_limits_scope`] で張り、`sql::parser::parse_sparsevec_literal` が読む。
+    sparsevec_limits: crate::sparsevec_limits::SparseVecLimits,
     /// サブクエリ深さ・実行回数・CTE 定義数・CTE 連鎖深さの上限（Issue #1552）。
     /// 差し替えは [`Self::with_nesting_limits`] のみ（起動時 1 回）。構文解析段と
     /// サブクエリ解決段にだけ効き、格納済みビュー本文の再パースはハード上限のまま。
@@ -3234,6 +3238,7 @@ impl EngineCore {
             function_limits: crate::function_limits::FunctionLimits::default(),
             jsonpath_limits: crate::jsonpath_limits::JsonPathLimits::default(),
             regex_limits: crate::regex_limits::RegexLimits::default(),
+            sparsevec_limits: crate::sparsevec_limits::SparseVecLimits::default(),
             nesting_limits: crate::nesting_limits::NestingLimits::default(),
             window_limits: crate::window_limits::WindowLimits::default(),
             join_limits: crate::join_limits::JoinSizeLimits::default(),
@@ -3654,6 +3659,28 @@ impl EngineCore {
     /// 現在の正規表現マッチャ上限（Issue #1786）。
     pub fn regex_limits(&self) -> crate::regex_limits::RegexLimits {
         self.regex_limits
+    }
+
+    /// `SPARSEVEC(N)` の非ゼロ数上限（[`crate::sparsevec_limits::SparseVecLimits`]）を差し替えた
+    /// ビルダーを返す（Issue #2027）。`wire-server` の起動時 CLI フラグ `--max-sparsevec-nnz` から
+    /// のみ呼ぶ。未呼び出しならハード上限と同値の既定。
+    pub fn with_sparsevec_limits(
+        mut self,
+        limits: crate::sparsevec_limits::SparseVecLimits,
+    ) -> Self {
+        self.sparsevec_limits = limits;
+        self
+    }
+
+    /// 現在の `SPARSEVEC` 非ゼロ数上限（Issue #2027）。
+    pub fn sparsevec_limits(&self) -> crate::sparsevec_limits::SparseVecLimits {
+        self.sparsevec_limits
+    }
+
+    /// 束縛区間（`sql::parser::bind_*` 呼び出し）に張る `SPARSEVEC` 上限スコープ。スコープが無い
+    /// 経路はハード上限へ戻り、下げた設定が効かない fail-open になるため、束縛を行う入口では必ず保持する。
+    pub(crate) fn sparsevec_limits_scope(&self) -> crate::sparsevec_limits::SparseVecLimitsScope {
+        crate::sparsevec_limits::SparseVecLimitsScope::enter(self.sparsevec_limits)
     }
 
     /// サブクエリ深さ・実行回数・CTE 定義数・CTE 連鎖深さの上限
@@ -7990,6 +8017,7 @@ impl EngineCore {
             crate::sql::jsonpath_fn::JsonPathLimitsScope::enter(self.jsonpath_limits);
         // Issue #1787: `~` 系の束縛が起動時 CLI の正規表現上限を焼き込めるよう同じ区間に張る。
         let _regex_limits_scope = crate::sql::regex_op::RegexLimitsScope::enter(self.regex_limits);
+        let _sparsevec_limits_scope = self.sparsevec_limits_scope();
         // TABLE-33・Issue #1575: TZ 無しの TIMESTAMPTZ リテラル束縛・DDL 既定値の正規化が読む
         // セッション TimeZone を文ごとに張る（`SET TIME ZONE; INSERT` の後続文が新しい値を見る）。
         let _session_tz_scope = session_time_zone_scope(session);
@@ -9210,6 +9238,7 @@ impl EngineCore {
             crate::sql::jsonpath_fn::JsonPathLimitsScope::enter(self.jsonpath_limits);
         // Issue #1787: `~` 系の束縛が起動時 CLI の正規表現上限を焼き込めるよう同じ区間に張る。
         let _regex_limits_scope = crate::sql::regex_op::RegexLimitsScope::enter(self.regex_limits);
+        let _sparsevec_limits_scope = self.sparsevec_limits_scope();
         // TABLE-33・Issue #1575: TZ 無しの TIMESTAMPTZ リテラル束縛・DDL 既定値の正規化が読む
         // セッション TimeZone を文ごとに張る（`SET TIME ZONE; INSERT` の後続文が新しい値を見る）。
         let _session_tz_scope = session_time_zone_scope(session);
@@ -10612,6 +10641,7 @@ impl EngineCore {
             crate::sql::jsonpath_fn::JsonPathLimitsScope::enter(self.jsonpath_limits);
         // Issue #1787: `~` 系の束縛が起動時 CLI の正規表現上限を焼き込めるよう同じ区間に張る。
         let _regex_limits_scope = crate::sql::regex_op::RegexLimitsScope::enter(self.regex_limits);
+        let _sparsevec_limits_scope = self.sparsevec_limits_scope();
         // TABLE-33・Issue #1575: TZ 無しの TIMESTAMPTZ リテラル束縛・DDL 既定値の正規化が読む
         // セッション TimeZone を文ごとに張る（`SET TIME ZONE; INSERT` の後続文が新しい値を見る）。
         let _session_tz_scope = session_time_zone_scope(session);
@@ -11352,6 +11382,7 @@ impl EngineCore {
             crate::sql::jsonpath_fn::JsonPathLimitsScope::enter(self.jsonpath_limits);
         // Issue #1787: `~` 系の束縛が起動時 CLI の正規表現上限を焼き込めるよう同じ区間に張る。
         let _regex_limits_scope = crate::sql::regex_op::RegexLimitsScope::enter(self.regex_limits);
+        let _sparsevec_limits_scope = self.sparsevec_limits_scope();
         // TABLE-33・Issue #1575: TZ 無しの TIMESTAMPTZ リテラル束縛・DDL 既定値の正規化が読む
         // セッション TimeZone を文ごとに張る（`SET TIME ZONE; INSERT` の後続文が新しい値を見る）。
         let _session_tz_scope = session_time_zone_scope(session);
@@ -14863,6 +14894,7 @@ impl EngineCore {
                     stmt_start_micros: now,
                 },
             );
+            let _sparsevec_limits_scope = self.sparsevec_limits_scope();
             let bounds = bind(&schema)?;
             (bounds, crate::sql::time_fn::ledger_evaluated_at())
         };
@@ -15452,6 +15484,7 @@ impl EngineCore {
 
         // 判定 2・3: スキーマ取得 → 束縛（同一 read_txn 下）。
         let (read_txn, schema) = self.read_txn_with_schema(table)?;
+        let _sparsevec_limits_scope = self.sparsevec_limits_scope();
         let bound = bind(&schema)?;
         if bound.table != table || bound.operation_id.as_ref() != operation_id {
             // `bound.operation_id` は判定 1 の早期ガードと独立に `bind` closure
@@ -15630,6 +15663,7 @@ impl EngineCore {
 
         // 判定 2・3: スキーマ取得 → 束縛（同一 read_txn 下）。
         let (read_txn, schema) = self.read_txn_with_schema(table)?;
+        let _sparsevec_limits_scope = self.sparsevec_limits_scope();
         let (assignments, where_predicates) = bind(&schema)?;
         // 判定 4: wire 表層が生成しない述語形への多層防御（空列を含む）。
         reject_unsupported_predicate_dml_forms(&where_predicates)?;
@@ -15697,6 +15731,7 @@ impl EngineCore {
             .map_err(|_| crate::sql::allowlist::SqlSurfaceError::MissingOperationId)?;
 
         let (read_txn, schema) = self.read_txn_with_schema(table)?;
+        let _sparsevec_limits_scope = self.sparsevec_limits_scope();
         let where_predicates = bind(&schema)?;
         reject_unsupported_predicate_dml_forms(&where_predicates)?;
         drop(read_txn);
@@ -15767,6 +15802,7 @@ impl EngineCore {
             crate::sql::partitioned::apply_chunk_override(&clause, &self.partitioned_dml_limits)?;
 
         let (read_txn, schema) = self.read_txn_with_schema(table)?;
+        let _sparsevec_limits_scope = self.sparsevec_limits_scope();
         let (assignments, where_predicates) = bind(&schema)?;
         reject_unsupported_predicate_dml_forms(&where_predicates)?;
         drop(read_txn);
@@ -15824,6 +15860,7 @@ impl EngineCore {
             crate::sql::partitioned::apply_chunk_override(&clause, &self.partitioned_dml_limits)?;
 
         let (read_txn, schema) = self.read_txn_with_schema(table)?;
+        let _sparsevec_limits_scope = self.sparsevec_limits_scope();
         let where_predicates = bind(&schema)?;
         reject_unsupported_predicate_dml_forms(&where_predicates)?;
         drop(read_txn);
@@ -16994,6 +17031,7 @@ impl EngineCore {
                 })?,
         };
         self.reject_index_derived_conflict_constraint(&stmt.table_name, stmt.on_conflict.as_ref())?;
+        let _sparsevec_limits_scope = self.sparsevec_limits_scope();
         let bound = crate::sql::parser::bind_insert_form(stmt, &schema)?;
         match bound {
             crate::sql::parser::BoundInsertForm::Row(bound) => {
@@ -17100,6 +17138,7 @@ impl EngineCore {
                 detail: "execute_insert_returning_form called without RETURNING".to_string(),
             })?;
         self.reject_index_derived_conflict_constraint(&stmt.table_name, stmt.on_conflict.as_ref())?;
+        let _sparsevec_limits_scope = self.sparsevec_limits_scope();
         let bound = crate::sql::parser::bind_insert_form(stmt, &schema)?;
         match bound {
             crate::sql::parser::BoundInsertForm::Row(bound) => {
@@ -17579,6 +17618,7 @@ impl EngineCore {
             txn_start_micros: provisional,
             stmt_start_micros: provisional,
         });
+        let _sparsevec_limits_scope = self.sparsevec_limits_scope();
         let bound = bind()?;
         let hash = hash_fn()?;
         if !scope.was_used() {
@@ -17615,6 +17655,7 @@ impl EngineCore {
                     txn_start_micros: t,
                     stmt_start_micros: t,
                 });
+                let _sparsevec_limits_scope = self.sparsevec_limits_scope();
                 let bound = bind()?;
                 Ok((bound, hash, Some(t)))
             }
@@ -17697,6 +17738,7 @@ impl EngineCore {
                         stmt_start_micros: now,
                     },
                 );
+                let _sparsevec_limits_scope = self.sparsevec_limits_scope();
                 crate::sql::parser::bind_predicate_update(stmt, &schema, udfs)?;
                 let assignment_refs: Vec<(&str, &crate::sql::allowlist::SetValue)> = stmt
                     .assignments()
@@ -17973,6 +18015,7 @@ impl EngineCore {
         };
         let bound = {
             let set_columns: Vec<&str> = stmt.assignments.iter().map(|(n, _)| n.as_str()).collect();
+            let _sparsevec_limits_scope = self.sparsevec_limits_scope();
             let _defer = self.defer_not_null_scope_for_update(ctx, &schema.name, &set_columns);
             crate::sql::parser::bind_update(stmt, &schema)?
         };
@@ -18051,6 +18094,7 @@ impl EngineCore {
                         p.assignments().iter().map(|(n, _)| n.as_str()).collect()
                     }
                 };
+                let _sparsevec_limits_scope = self.sparsevec_limits_scope();
                 let _defer = self.defer_not_null_scope_for_update(ctx, &schema.name, &set_columns);
                 crate::sql::parser::bind_update_form(stmt, &schema, session.udfs())?
             };
@@ -18190,6 +18234,7 @@ impl EngineCore {
             })?;
         match stmt {
             ValidatedUpdateForm::Single(_) => {
+                let _sparsevec_limits_scope = self.sparsevec_limits_scope();
                 let bound = crate::sql::parser::bind_update_form(stmt, &schema, session.udfs())?;
                 let crate::sql::parser::BoundUpdateForm::Single(bound) = bound else {
                     return Err(crate::sql::allowlist::SqlSurfaceError::Internal {
@@ -18213,6 +18258,7 @@ impl EngineCore {
                         &target, ctx, session, stmt, &schema,
                     )?,
                 };
+                let _sparsevec_limits_scope = self.sparsevec_limits_scope();
                 let (bound, content_hash_value, legacy_hashes) = Self::prepare_predicate_update(
                     resolved.as_ref().unwrap_or(validated),
                     validated,
@@ -18280,6 +18326,7 @@ impl EngineCore {
                 .iter()
                 .map(|(n, _)| n.as_str())
                 .collect();
+            let _sparsevec_limits_scope = self.sparsevec_limits_scope();
             let _defer = triggers.and_then(|_| {
                 self.defer_not_null_scope_for_update(ctx, &schema.name, &set_columns)
             });
@@ -18444,6 +18491,7 @@ impl EngineCore {
                 &stmt.table_name,
                 stmt.on_conflict.as_ref(),
             )?;
+            let _sparsevec_limits_scope = self.sparsevec_limits_scope();
             let bound = crate::sql::parser::bind_insert_form(&stmt, &schema)?;
             match bound {
                 crate::sql::parser::BoundInsertForm::File(file_bound) => {
