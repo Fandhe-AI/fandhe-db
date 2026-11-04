@@ -414,6 +414,7 @@ impl ExpressionKeyIndex {
             | ExprType::Numeric
             | ExprType::Uuid
             | ExprType::Bytea
+            | ExprType::Bit
             | ExprType::Array => return Err(ScalarIndexBuildError::Unbuildable),
         };
         let mut null_slots: Vec<u32> = Vec::new();

@@ -189,7 +189,9 @@ pub(crate) fn bind_set_expr(
         | ColumnType::Interval
         | ColumnType::Time
         // 配列列（TABLE-35・Issue #1602）。右辺は配列式（コンストラクタ・スライス・CAST・配列列）。
-        | ColumnType::Array(_) => {}
+        | ColumnType::Array(_)
+        // BIT 列（TABLE-48 (3)・Issue #2023）。右辺は `binary_quantize(<VECTOR 列>)` だけが生成する bit 式。
+        | ColumnType::Bit(_) => {}
         _ => {
             return Err(SqlSurfaceError::FeatureNotSupported {
                 detail: format!("column {name:?} does not support an expression in SET"),
@@ -203,6 +205,10 @@ pub(crate) fn bind_set_expr(
     // 変えない）。配列以外の型が来たら下の `assignable` が `42804` にする。
     let (bound, ty, _) = if matches!(column.ty, ColumnType::Array(_)) {
         crate::sql::udf_call::bind_array_assignment_source(expr, schema, &registry, &mut budget)?
+    } else if matches!(column.ty, ColumnType::Bit(_)) {
+        // BIT 列への代入だけ、式の最上位が bit 値であることを許す。長さの照合は行ごとの評価結果に
+        // 対して `expr_value_to_column_value` が行う（`22026`）。
+        crate::sql::udf_call::bind_bit_assignment_source(expr, schema, &registry, &mut budget)?
     } else {
         bind_projection_expr(expr, schema, &registry, &mut budget)?
     };
@@ -232,6 +238,7 @@ pub(crate) fn bind_set_expr(
             )
             | (ColumnType::Timestamp | ColumnType::Date, ExprType::TimestampTz)
             | (ColumnType::Array(_), ExprType::Array)
+            | (ColumnType::Bit(_), ExprType::Bit)
     );
     if !assignable {
         return Err(SqlSurfaceError::datatype_mismatch(format!(
@@ -399,6 +406,15 @@ pub(crate) fn expr_value_to_column_value(
                 })?;
                 Ok(Value::Array(a))
             }
+            _ => Err(internal()),
+        },
+        // `binary_quantize` の結果（Issue #2023）。列の宣言長との一致を行ごとに再検証する
+        // （PostgreSQL の代入時の長さ不一致と同じ `22026`）。
+        ExprValue::Bit(b) => match target_ty {
+            ColumnType::Bit(n) if b.bit_len() == *n => Ok(Value::Bit(b)),
+            ColumnType::Bit(_) => Err(SqlSurfaceError::string_data_length_mismatch(
+                "bit string length does not match type bit(n)",
+            )),
             _ => Err(internal()),
         },
         ExprValue::Date(d) => match target_ty {

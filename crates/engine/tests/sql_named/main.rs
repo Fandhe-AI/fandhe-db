@@ -35,6 +35,7 @@ mod sql_alter_table_unique_constraint;
 mod sql_arena_cache;
 mod sql_array_fn;
 mod sql_array_predicates;
+mod sql_binary_quantize;
 mod sql_bit_column;
 mod sql_cast_datetime_json_misc;
 mod sql_cast_numeric_text_bool;

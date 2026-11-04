@@ -918,6 +918,7 @@ fn check_index_result_type(ty: crate::sql::udf_call::ExprType) -> Result<(), Sql
         | ExprType::Numeric
         | ExprType::Uuid
         | ExprType::Bytea
+        | ExprType::Bit
         | ExprType::Array => Err(SqlSurfaceError::FeatureNotSupported {
             detail: MSG_RESULT_TYPE.to_string(),
         }),
