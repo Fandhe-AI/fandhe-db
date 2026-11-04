@@ -970,8 +970,8 @@ L2 二乗距離カーネル（`SimdKernel::l2_sq`。Issue #1981・#1983・SQL-33
 
 - 本環境（x86_64・`Avx2Fma`）では **L2 は内積の約 4.8〜8.9 倍（cache 常駐・ratio_min）**。次元が大きいほど
   比が開く（dim 100 で 4.8 倍、dim 1536 で 8.9 倍）
-- **この値は目標状態ではない**。x86_64 の `SimdKernel::l2_sq` は Issue #1982 未着地のため `l2_sq_scalar` へ
-  委譲しており、記録値は「scalar L2 対 SIMD 内積」の比である。診断行（`current().l2_sq` 対
+- **この値は目標状態ではない**。取得時点では x86_64 の `SimdKernel::l2_sq` が Issue #1982 未着地（base へ
+  #1982 を取り込み済み）のため `l2_sq_scalar` へ委譲しており、記録値は「scalar L2 対 SIMD 内積」の比である。診断行（`current().l2_sq` 対
   `l2_sq_scalar`）が 0.997（中央値。0.991〜1.003）で、同一コードであることも確認できる
 - 共有環境（loadavg 約 15〜23／10 論理 CPU）の参考値であり、採否根拠にしない
   （`benchmark-judgement-policy.md` §5）。#1982 着地後に同手順で再計測する
@@ -1018,7 +1018,7 @@ run-to-run 幅 `(max-min)/min`（変更を含まない参照区間）。
 
 - arena_scale は dot 側の run-to-run 幅が 31〜241% と大きく（共有環境の負荷）、比は参考程度。
   cache_resident（幅 0.8〜7.9%）の比を基準値として扱う
-- **#1982 への申し送り**: production の `kernel::l2_sq` は `isa::l2_sq_scalar` を直接呼び、
+- **#1982 への申し送り（#1982 で `kernel::l2_sq` は `isa::current().l2_sq` 経由へ結線済み）**: 計測時点の production の `kernel::l2_sq` は `isa::l2_sq_scalar` を直接呼び、
   `SimdKernel` のディスパッチを経由しない。`search_l2` は単一行で `l2_sq_block4` も未使用。
   x86 SIMD を実装しても `kernel.rs` を結線し直さない限り production は速くならない
 - `chip_bench` への L2 ワークロード追加・`l2_sq_block4` 対 `dot_block4` の比較は対象外

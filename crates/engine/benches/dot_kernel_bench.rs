@@ -55,8 +55,8 @@
 //! `dot_kernel: l2_ab ...` 行（ratio = L2 / dot）を出力する。計測前に全行で
 //! `l2_sq_scalar` との許容差照合を行い、不一致は fail-closed で非ゼロ終了する。
 //! 代表点（dim 768・cache 常駐）の `l2_sq_scalar` 対比は情報提供行
-//! `dot_kernel: l2_diagnostic_ab` として出す。x86_64 では #1982 未着地のため
-//! `SimdKernel::l2_sq` は scalar へ委譲しており、記録値は目標状態ではない。
+//! `dot_kernel: l2_diagnostic_ab` として出す。x86_64 の記録値は #1982（x86 SIMD 本体）
+//! 着地前に取得した scalar 委譲時点のもので、目標状態ではない（再計測要）。
 //! 記録先は `docs/design/dot-kernel-multi-accumulator.md`「Issue #1984 追記」節
 //! （SQL-33 ポインタ）。未設定・`0` では既定経路の出力・所要時間は不変。
 //!
