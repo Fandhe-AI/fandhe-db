@@ -1731,4 +1731,6 @@ main に無く現行の `parse_order_by` は `<=>` のみ受理するため、�
 
 **Issue #2071（feat(engine): PartitionedDmlLimits にチャンク間隔を追加し実行器で待機する。親 #2070・SQL-77 ポインタ。詳細は [partitioned-dml.md](partitioned-dml.md) の「チャンク間の待機（Issue #2071）」節）**: `PartitionedDmlLimits::chunk_interval`（既定 0・`0..=60,000` ms・上限は `MAX_WRITE_LOCK_WAIT_MS`）と検証関数 `validate_partitioned_chunk_interval_ms` を追加し、分割実行器がチャンク commit 後・次チャンク開始前に待機する。待機は 10 ms 刻みで取り消し・文の期限を確認し、writer を保持しない。時計・sleep は `Hooks` から注入する。既定 0 では挙動は変わらない。CLI フラグは #2073、時間上限は #2072。
 
+**Issue #2068（test(engine): 明示トランザクション・複数文内の operation_id と失敗時の非記録を固定する。RECOVER-12・RECOVER-9・SQL-10 ポインタ。詳細は [explicit-transaction.md](explicit-transaction.md) の #2068 節）**: 明示 Tx の `ROLLBACK`・事前拒否（`23502`・`42601`）の後に台帳へ記録が残らず、新しい `BEGIN` で同じ `operation_id` を再利用できること、読み取り文に付けた `USING OPERATION_ID` が全入口で `42601` になることを `core_misc/recover12_txn_failure_no_ledger.rs` で固定した。本番コードの変更なし、依存の追加・更新なし。
+
 **Issue #2076（docs(design): 固定テナント方式の方針 ADR。RLS-6・RLS-8・RLS-10・RLS-12・RLS-13 ポインタ。詳細は [fixed-tenant-boundary.md](fixed-tenant-boundary.md)）**: テナント境界を外せない設計を方針として記録した。テナント ID はサーバーが導出し、利用者ポリシー・`BYPASSRLS`・所有者除外・`row_security` のいずれでも外れない。採用しないのは管理者バイパスだけで、利用者ポリシー（`PERMISSIVE`／`RESTRICTIVE`・コマンド別）はテナント境界の内側の追加の制限として実装済み。検索・読み取り・更新・分割 DML・HTTP・EXPLAIN の各経路が同じ単一照合パスを通ることを、symbol と根拠テストの表で示した。ドキュメントのみの変更で、コード・依存・CI は変えない。
