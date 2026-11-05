@@ -199,3 +199,38 @@ relation の列名（大文字小文字を区別しない）の照合による�
 
 通常 SQL（`parse_tokens_gated`）・拡張クエリ（Parse・Bind・Describe）・明示 Tx（`BEGIN` 時のスナップショット）・COPY（`begin_copy*`）・
 HTTP の bound 読み取り／書き込み・分割実行 DML のチャンク再判定。いずれも既存の呼び出し点のまま、ACL の照会点で列を評価する。
+
+## 9. Issue #2084 検証記録（全経路の越境マトリクス）
+
+ステータスは Proposed のまま。製品コードの変更はなく、検証コードだけを追加した（ポインタ: RLS-12・SQL-40）。
+
+### 検証コード
+
+- SQL: `crates/engine/tests/table_rls/rls12_column_privilege_paths.rs`（文の形 × 入口 × 付与状態 × 世界の行列）
+- HTTP: `crates/wire-server/tests/http_nosql/rls12_nosql_column_privilege.rs`（`scan`／`search`／`aggregate` と各 `explain`）
+
+### 軸と検査
+
+- 軸: 列を置く位置（投影・WHERE・ORDER BY・GROUP BY・HAVING・集約・窓関数・kNN・`*`・列を参照しない形・疑似列 `id`・JOIN・
+  副問い合わせ・集合演算・CTE・派生表・ビュー・書き込み文の読み側と RETURNING・COPY）、入口（通常・Tx・拡張クエリ・DECLARE・
+  EXPLAIN・COPY・PL/pgSQL の DO）、付与状態（なし・列・全実列・表単位・表単位を取り消した後）、世界（baseline・他テナントの行と
+  同名の付与を足した flooded）
+- 検査: 独立オラクル（製品の判定関数を呼ばない真理値表と、PG の意味のオラクルによる fail-open 検出）・拒否文言の全セル一致・
+  他テナントの行と付与による応答の不変性・DESCRIBE 以前の拒否・負の対照・試行総数の固定
+
+### オラクルが固定した現行の非対称
+
+- 表単位の `REVOKE` は同じ relation の列単位の付与も取り消す（PG と同じ）。
+- 単一 relation の CTE・派生表は内側が名指しする列だけを要求する（§8 の「全列」より精密。JOIN・副問い合わせ・集合演算は全列）。
+- 付与が 1 つも無いロールは、SCHEMA の名前解決（`3F000`）より後ろ、列の解決より前の段で `42501` になる。他テナントだけにある SCHEMA と
+  どこにも無い SCHEMA は応答が一致する。
+- EXPLAIN・DECLARE は参照列を問わず全列を要求する。
+- HTTP の bound 読み取りは全列を要求する。従来方式の表は表単位の付与だけが通り、採番方式の表の `scan` は全実列への列単位の付与でも通る。
+  採番方式の表への `search`／`aggregate` は権限検査より前に固定文言の `0A000` で拒否される。
+  このためパリティは一方向（HTTP が成功なら SQL も成功）で定義した。
+- 構文表層が受け付けない組（`DECLARE` の集約・結合・副問い合わせ等、拡張クエリの副問い合わせ、`UPDATE ... FROM`／`DELETE ... USING`）は
+  行列から外してある。権限とは無関係の未対応で、対応したら行列へ戻す。
+
+### 更新が要る場合
+
+BoundScan の列の精密化や疑似列 `id` の緩和を行ったら、上記の期待値（オラクル）を更新する。
