@@ -1,0 +1,835 @@
+{
+  "components": {
+    "schemas": {
+      "aggregate": {
+        "additionalProperties": false,
+        "properties": {
+          "aggregates": {
+            "items": {
+              "$ref": "#/components/schemas/aggregate_item"
+            },
+            "type": "array"
+          },
+          "explain": {
+            "type": "boolean"
+          },
+          "filter": {
+            "items": {},
+            "type": "array"
+          },
+          "group_by": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            ]
+          },
+          "having": {
+            "items": {
+              "$ref": "#/components/schemas/having_item"
+            },
+            "type": "array"
+          },
+          "offset": {
+            "type": "number"
+          },
+          "op": {
+            "const": "aggregate",
+            "type": "string"
+          },
+          "sort": {
+            "items": {
+              "$ref": "#/components/schemas/sort_item"
+            },
+            "type": "array"
+          },
+          "table": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "op",
+          "table",
+          "aggregates"
+        ],
+        "type": "object"
+      },
+      "aggregate_item": {
+        "additionalProperties": false,
+        "properties": {
+          "column": {
+            "type": "string"
+          },
+          "fn": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "fn",
+          "column"
+        ],
+        "type": "object"
+      },
+      "alter_table": {
+        "additionalProperties": false,
+        "properties": {
+          "add_column": {
+            "$ref": "#/components/schemas/ddl_add_column"
+          },
+          "drop_column": {
+            "$ref": "#/components/schemas/ddl_drop_column"
+          },
+          "op": {
+            "const": "alter_table",
+            "type": "string"
+          },
+          "table": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "op",
+          "table"
+        ],
+        "type": "object"
+      },
+      "cancel_partitioned_dml": {
+        "additionalProperties": false,
+        "properties": {
+          "op": {
+            "const": "cancel_partitioned_dml",
+            "type": "string"
+          },
+          "operation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "table": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "op",
+          "table"
+        ],
+        "type": "object"
+      },
+      "check_leaf": {
+        "additionalProperties": false,
+        "properties": {
+          "column": {
+            "type": "string"
+          },
+          "op": {
+            "type": "string"
+          },
+          "value": {
+            "type": [
+              "string",
+              "number",
+              "boolean"
+            ]
+          }
+        },
+        "required": [
+          "column",
+          "op",
+          "value"
+        ],
+        "type": "object"
+      },
+      "create_table": {
+        "additionalProperties": false,
+        "properties": {
+          "columns": {
+            "items": {
+              "$ref": "#/components/schemas/ddl_column"
+            },
+            "type": "array"
+          },
+          "constraints": {
+            "items": {
+              "$ref": "#/components/schemas/ddl_constraint"
+            },
+            "type": "array"
+          },
+          "op": {
+            "const": "create_table",
+            "type": "string"
+          },
+          "table": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "op",
+          "table",
+          "columns"
+        ],
+        "type": "object"
+      },
+      "ddl_add_column": {
+        "additionalProperties": false,
+        "properties": {
+          "default": {
+            "type": [
+              "string",
+              "number",
+              "boolean"
+            ]
+          },
+          "dim": {
+            "type": "number"
+          },
+          "element_type": {
+            "type": "string"
+          },
+          "enum_type": {
+            "type": "string"
+          },
+          "max_len": {
+            "type": "number"
+          },
+          "name": {
+            "type": "string"
+          },
+          "not_null": {
+            "type": "boolean"
+          },
+          "precision": {
+            "type": "number"
+          },
+          "scale": {
+            "type": "number"
+          },
+          "type": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "type"
+        ],
+        "type": "object"
+      },
+      "ddl_column": {
+        "additionalProperties": false,
+        "properties": {
+          "default": {
+            "type": [
+              "string",
+              "number",
+              "boolean"
+            ]
+          },
+          "dim": {
+            "type": "number"
+          },
+          "element_type": {
+            "type": "string"
+          },
+          "enum_type": {
+            "type": "string"
+          },
+          "max_len": {
+            "type": "number"
+          },
+          "name": {
+            "type": "string"
+          },
+          "nullable": {
+            "type": "boolean"
+          },
+          "precision": {
+            "type": "number"
+          },
+          "scale": {
+            "type": "number"
+          },
+          "type": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "type"
+        ],
+        "type": "object"
+      },
+      "ddl_constraint": {
+        "additionalProperties": false,
+        "properties": {
+          "columns": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "predicate": {
+            "items": {
+              "$ref": "#/components/schemas/check_leaf"
+            },
+            "type": "array"
+          },
+          "references": {
+            "$ref": "#/components/schemas/ddl_references"
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "type": "object"
+      },
+      "ddl_drop_column": {
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
+      "ddl_references": {
+        "additionalProperties": false,
+        "properties": {
+          "columns": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "on_delete": {
+            "type": "string"
+          },
+          "on_update": {
+            "type": "string"
+          },
+          "table": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "table"
+        ],
+        "type": "object"
+      },
+      "delete": {
+        "additionalProperties": false,
+        "properties": {
+          "chunk": {
+            "type": "number"
+          },
+          "filter": {
+            "items": {},
+            "type": "array"
+          },
+          "if": {
+            "items": {},
+            "type": "array"
+          },
+          "mode": {
+            "type": "string"
+          },
+          "op": {
+            "const": "delete",
+            "type": "string"
+          },
+          "operation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "returning": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            ]
+          },
+          "table": {
+            "type": "string"
+          },
+          "where": {
+            "type": "object"
+          }
+        },
+        "required": [
+          "op",
+          "table"
+        ],
+        "type": "object"
+      },
+      "drop_table": {
+        "additionalProperties": false,
+        "properties": {
+          "op": {
+            "const": "drop_table",
+            "type": "string"
+          },
+          "table": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "op",
+          "table"
+        ],
+        "type": "object"
+      },
+      "having_item": {
+        "additionalProperties": false,
+        "properties": {
+          "column": {
+            "type": "string"
+          },
+          "fn": {
+            "type": "string"
+          },
+          "op": {
+            "type": "string"
+          },
+          "value": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "fn",
+          "column",
+          "op",
+          "value"
+        ],
+        "type": "object"
+      },
+      "hybrid": {
+        "additionalProperties": false,
+        "properties": {
+          "text": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "type": "object"
+      },
+      "insert": {
+        "additionalProperties": false,
+        "properties": {
+          "op": {
+            "const": "insert",
+            "type": "string"
+          },
+          "operation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "returning": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            ]
+          },
+          "rows": {
+            "items": {},
+            "type": "array"
+          },
+          "table": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "op",
+          "table",
+          "rows"
+        ],
+        "type": "object"
+      },
+      "on_conflict": {
+        "additionalProperties": false,
+        "properties": {
+          "columns": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "do": {
+            "type": "string"
+          },
+          "set": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "columns",
+          "do"
+        ],
+        "type": "object"
+      },
+      "scan": {
+        "additionalProperties": false,
+        "properties": {
+          "columns": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "explain": {
+            "type": "boolean"
+          },
+          "filter": {
+            "items": {},
+            "type": "array"
+          },
+          "limit": {
+            "type": "number"
+          },
+          "offset": {
+            "type": "number"
+          },
+          "op": {
+            "const": "scan",
+            "type": "string"
+          },
+          "sort": {
+            "items": {
+              "$ref": "#/components/schemas/sort_item"
+            },
+            "type": "array"
+          },
+          "table": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "op",
+          "table",
+          "limit"
+        ],
+        "type": "object"
+      },
+      "search": {
+        "additionalProperties": false,
+        "properties": {
+          "columns": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "explain": {
+            "type": "boolean"
+          },
+          "filter": {
+            "items": {},
+            "type": "array"
+          },
+          "hybrid": {
+            "$ref": "#/components/schemas/hybrid"
+          },
+          "limit": {
+            "type": "number"
+          },
+          "metric": {
+            "type": "string"
+          },
+          "mode": {
+            "type": "string"
+          },
+          "op": {
+            "const": "search",
+            "type": "string"
+          },
+          "plan": {
+            "type": "string"
+          },
+          "table": {
+            "type": "string"
+          },
+          "vector": {
+            "items": {
+              "type": "number"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "op",
+          "table",
+          "limit"
+        ],
+        "type": "object"
+      },
+      "show_partitioned_dml": {
+        "additionalProperties": false,
+        "properties": {
+          "op": {
+            "const": "show_partitioned_dml",
+            "type": "string"
+          },
+          "operation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "table": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "op",
+          "table"
+        ],
+        "type": "object"
+      },
+      "sort_item": {
+        "additionalProperties": false,
+        "properties": {
+          "column": {
+            "type": "string"
+          },
+          "dir": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "column",
+          "dir"
+        ],
+        "type": "object"
+      },
+      "update": {
+        "additionalProperties": false,
+        "properties": {
+          "chunk": {
+            "type": "number"
+          },
+          "filter": {
+            "items": {},
+            "type": "array"
+          },
+          "if": {
+            "items": {},
+            "type": "array"
+          },
+          "mode": {
+            "type": "string"
+          },
+          "op": {
+            "const": "update",
+            "type": "string"
+          },
+          "operation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "returning": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            ]
+          },
+          "set": {
+            "type": "object"
+          },
+          "table": {
+            "type": "string"
+          },
+          "where": {
+            "type": "object"
+          }
+        },
+        "required": [
+          "op",
+          "table",
+          "set"
+        ],
+        "type": "object"
+      },
+      "upsert": {
+        "additionalProperties": false,
+        "properties": {
+          "on_conflict": {
+            "$ref": "#/components/schemas/on_conflict"
+          },
+          "op": {
+            "const": "upsert",
+            "type": "string"
+          },
+          "operation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "rows": {
+            "items": {},
+            "type": "array"
+          },
+          "table": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "op",
+          "table",
+          "rows",
+          "on_conflict"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "title": "fandhe-db NoSQL surface",
+    "version": "0.2.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/v1/query": {
+      "post": {
+        "operationId": "query",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "discriminator": {
+                  "mapping": {
+                    "aggregate": "#/components/schemas/aggregate",
+                    "alter_table": "#/components/schemas/alter_table",
+                    "cancel_partitioned_dml": "#/components/schemas/cancel_partitioned_dml",
+                    "create_table": "#/components/schemas/create_table",
+                    "delete": "#/components/schemas/delete",
+                    "drop_table": "#/components/schemas/drop_table",
+                    "insert": "#/components/schemas/insert",
+                    "scan": "#/components/schemas/scan",
+                    "search": "#/components/schemas/search",
+                    "show_partitioned_dml": "#/components/schemas/show_partitioned_dml",
+                    "update": "#/components/schemas/update",
+                    "upsert": "#/components/schemas/upsert"
+                  },
+                  "propertyName": "op"
+                },
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/search"
+                  },
+                  {
+                    "$ref": "#/components/schemas/scan"
+                  },
+                  {
+                    "$ref": "#/components/schemas/aggregate"
+                  },
+                  {
+                    "$ref": "#/components/schemas/insert"
+                  },
+                  {
+                    "$ref": "#/components/schemas/upsert"
+                  },
+                  {
+                    "$ref": "#/components/schemas/update"
+                  },
+                  {
+                    "$ref": "#/components/schemas/delete"
+                  },
+                  {
+                    "$ref": "#/components/schemas/create_table"
+                  },
+                  {
+                    "$ref": "#/components/schemas/alter_table"
+                  },
+                  {
+                    "$ref": "#/components/schemas/drop_table"
+                  },
+                  {
+                    "$ref": "#/components/schemas/show_partitioned_dml"
+                  },
+                  {
+                    "$ref": "#/components/schemas/cancel_partitioned_dml"
+                  }
+                ]
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "default": {
+            "description": "Response schema is not described yet"
+          }
+        }
+      }
+    }
+  }
+}
