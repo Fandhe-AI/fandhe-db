@@ -338,8 +338,11 @@
 //!
 //! `--partitioned-dml-chunk-rows <N>`／`--partitioned-dml-scan-budget <N>`／
 //! `--partitioned-dml-max-hold-ms <MS>`／`--partitioned-dml-max-jobs-per-tenant <N>`／
-//! `--partitioned-dml-max-jobs <N>`／`--partitioned-dml-max-interrupted-records <N>`
-//! （Issue #1128 で導入、Issue #1129 でフラグ名を確定。ADR `docs/design/
+//! `--partitioned-dml-max-jobs <N>`／`--partitioned-dml-max-interrupted-records <N>`／
+//! `--partitioned-dml-chunk-interval-ms <MS>`／`--partitioned-dml-max-run-ms <MS>`
+//! （Issue #2073 で後 2 つを追加。チャンク commit 後の待機は既定 0＝待たない・範囲
+//! `0..=60,000`、1 回の実行の時間上限は既定 0＝無効・範囲 `0..=86,400,000` でジョブ全体
+//! ではなく 1 回の実行にかかる。Issue #1128 で導入、Issue #1129 でフラグ名を確定。ADR `docs/design/
 //! partitioned-dml.md` §15.2）: 述語形 `UPDATE`／`DELETE ... PARTITIONED` の分割実行の
 //! 1 チャンクの適用行数（既定 1,000・範囲 `1..=1,000,000`）・走査予算（既定 100,000・
 //! 範囲 `1..=1,000,000`）・writer 保持時間の上限（既定 1,000 ms・範囲 `100..=5,000`）・
@@ -565,6 +568,8 @@ fn run_server(args: &[String]) -> ExitCode {
     let mut partitioned_chunk_rows_raw: Option<String> = None;
     let mut partitioned_scan_budget_raw: Option<String> = None;
     let mut partitioned_max_hold_ms_raw: Option<String> = None;
+    let mut partitioned_chunk_interval_ms_raw: Option<String> = None;
+    let mut partitioned_max_run_ms_raw: Option<String> = None;
     let mut partitioned_max_jobs_per_tenant_raw: Option<String> = None;
     let mut partitioned_max_jobs_raw: Option<String> = None;
     let mut partitioned_max_interrupted_raw: Option<String> = None;
@@ -1667,6 +1672,46 @@ fn run_server(args: &[String]) -> ExitCode {
                 partitioned_max_hold_ms_raw = Some(v.clone());
                 i += 2;
             }
+            wire_server::dml_limits_opt::PARTITIONED_CHUNK_INTERVAL_MS_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::dml_limits_opt::PARTITIONED_CHUNK_INTERVAL_MS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #2073: 他の起動時構成フラグと同じく 2 回目以降の指定を
+                // fail-closed に拒否する（last-wins にしない）。
+                if partitioned_chunk_interval_ms_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::dml_limits_opt::PARTITIONED_CHUNK_INTERVAL_MS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                partitioned_chunk_interval_ms_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::dml_limits_opt::PARTITIONED_MAX_RUN_MS_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::dml_limits_opt::PARTITIONED_MAX_RUN_MS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #2073: 他の起動時構成フラグと同じく 2 回目以降の指定を
+                // fail-closed に拒否する（last-wins にしない）。
+                if partitioned_max_run_ms_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::dml_limits_opt::PARTITIONED_MAX_RUN_MS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                partitioned_max_run_ms_raw = Some(v.clone());
+                i += 2;
+            }
             wire_server::dml_limits_opt::PARTITIONED_MAX_JOBS_PER_TENANT_FLAG => {
                 let Some(v) = args.get(i + 1) else {
                     engine::log_stderr!(
@@ -2336,7 +2381,7 @@ fn run_server(args: &[String]) -> ExitCode {
     };
 
     // Issue #1128・#1129: 分割実行 DML の設定（チャンク幅・走査予算・writer 保持時間・
-    // 同時実行数・中断記録数の上限）を
+    // チャンク間隔・1 回の実行の時間上限（Issue #2073）・同時実行数・中断記録数の上限）を
     // bind・ユーザーストア読込より前に解決する（fail-closed。範囲外・非数値は
     // listen へ進まず起動エラー）。環境変数は設けない（ADR §15.2）。
     let partitioned_dml_limits = match wire_server::dml_limits_opt::resolve_partitioned_dml_limits(
@@ -2345,6 +2390,8 @@ fn run_server(args: &[String]) -> ExitCode {
             chunk_rows: partitioned_chunk_rows_raw.as_deref(),
             scan_budget: partitioned_scan_budget_raw.as_deref(),
             max_hold_ms: partitioned_max_hold_ms_raw.as_deref(),
+            chunk_interval_ms: partitioned_chunk_interval_ms_raw.as_deref(),
+            max_run_ms: partitioned_max_run_ms_raw.as_deref(),
             max_jobs_per_tenant: partitioned_max_jobs_per_tenant_raw.as_deref(),
             max_jobs: partitioned_max_jobs_raw.as_deref(),
             max_interrupted_records: partitioned_max_interrupted_raw.as_deref(),
