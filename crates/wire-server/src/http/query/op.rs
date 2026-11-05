@@ -108,6 +108,22 @@ impl Op {
         matches!(self, Op::Insert | Op::Update | Op::Delete)
     }
 
+    /// 任意キー `returning` を受け付ける op か（Issue #2090・NOSQL-22。網羅 match で、
+    /// op 追加時に判断を強制する）。
+    pub const fn accepts_returning(self) -> bool {
+        match self {
+            Op::Insert | Op::Update | Op::Delete => true,
+            Op::Search
+            | Op::Scan
+            | Op::Aggregate
+            | Op::CreateTable
+            | Op::AlterTable
+            | Op::DropTable
+            | Op::ShowPartitionedDml
+            | Op::CancelPartitionedDml => false,
+        }
+    }
+
     /// JSON 上の正準名（`op` フィールドの受理値そのもの）。
     pub fn name(self) -> &'static str {
         match self {
@@ -185,6 +201,14 @@ mod tests {
         for op in Op::ALL {
             let expected = matches!(op, Op::Insert | Op::Update | Op::Delete);
             assert_eq!(op.accepts_idempotency_key(), expected, "{}", op.name());
+        }
+    }
+
+    #[test]
+    fn accepts_returning_only_for_dml_ops() {
+        for op in Op::ALL {
+            let expected = matches!(op, Op::Insert | Op::Update | Op::Delete);
+            assert_eq!(op.accepts_returning(), expected, "{}", op.name());
         }
     }
 

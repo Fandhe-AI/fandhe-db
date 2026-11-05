@@ -108,3 +108,29 @@ fn non_object_root_is_rejected_before_schema_lookup() {
     let err = extract_op(&value).unwrap_err();
     assert_eq!(err.wire_code(), "42601");
 }
+
+/// `insert`／`update`／`delete` の任意キー `returning`（Issue #2090・NOSQL-22）は
+/// 文字列または文字列配列のみ型検査を通り、それ以外は `42601`（`TypeMismatch`）になる。
+#[test]
+fn returning_key_type_check_on_dml_ops() {
+    let heads = [
+        r#""op":"insert","table":"docs","rows":[]"#,
+        r#""op":"update","table":"docs","set":{"lang":"en"}"#,
+        r#""op":"delete","table":"docs""#,
+    ];
+    for head in heads {
+        for ok in [r#""*""#, r#"["a","b"]"#] {
+            let text = format!(r#"{{{head},"returning":{ok}}}"#);
+            let value = parse_json(&text).expect("valid JSON fixture");
+            let schema = schema_for(extract_op(&value).expect("op")).expect("schema");
+            assert!(schema.validate(&value).is_ok(), "expected accept: {text}");
+        }
+        for bad in ["null", "1", "{}", "[1]"] {
+            let text = format!(r#"{{{head},"returning":{bad}}}"#);
+            let value = parse_json(&text).expect("valid JSON fixture");
+            let schema = schema_for(extract_op(&value).expect("op")).expect("schema");
+            let err = schema.validate(&value).expect_err(&text);
+            assert_eq!(err.wire_code(), "42601", "{text}");
+        }
+    }
+}

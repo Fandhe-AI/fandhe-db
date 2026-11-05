@@ -35,6 +35,10 @@
 //! `UPDATE_SCHEMA`（`set` を任意キーのオブジェクトとして型のみ検査する
 //! [`FieldType::AnyObject`]）・`DELETE_SCHEMA` の宣言に留める。
 //!
+//! `insert`／`update`／`delete` の任意キー `returning`（Issue #2090・NOSQL-22）は
+//! 型（文字列または文字列配列）のみ本モジュールが検査し、値（`"*"`／列名配列）の
+//! 意味検査・分割実行との併用拒否は [`super::returning`] が担う。
+//!
 //! 未知キーは無視せず拒否する（NOSQL-8 の一般則。クライアント自己申告の
 //! `tenant_id`（HTTP-7）・`HINT ORDER`／`SET search_mode` 相当フィールド
 //! （NOSQL-9）・`scan` への `vector`／`plan`／`mode`／`hybrid` 付与拒否
@@ -856,6 +860,14 @@ pub static INSERT_SCHEMA: ObjectSchema = ObjectSchema {
             ty: FieldType::String,
             nullable: true,
         },
+        // 返却制御（Issue #2090・NOSQL-22）。値（`"*"`／列名配列）の意味検査は
+        // `super::returning` が担い、本スキーマは型（文字列または文字列配列）のみ検査する。
+        FieldSpec {
+            key: "returning",
+            presence: Presence::Optional,
+            ty: FieldType::StringOrArray(ElementType::String),
+            nullable: false,
+        },
     ],
 };
 
@@ -918,6 +930,14 @@ pub static UPDATE_SCHEMA: ObjectSchema = ObjectSchema {
             ty: FieldType::Number,
             nullable: false,
         },
+        // 返却制御（Issue #2090・NOSQL-22）。値（`"*"`／列名配列）の意味検査は
+        // `super::returning` が担い、本スキーマは型（文字列または文字列配列）のみ検査する。
+        FieldSpec {
+            key: "returning",
+            presence: Presence::Optional,
+            ty: FieldType::StringOrArray(ElementType::String),
+            nullable: false,
+        },
     ],
 };
 
@@ -971,6 +991,14 @@ pub static DELETE_SCHEMA: ObjectSchema = ObjectSchema {
             key: "chunk",
             presence: Presence::Optional,
             ty: FieldType::Number,
+            nullable: false,
+        },
+        // 返却制御（Issue #2090・NOSQL-22）。値（`"*"`／列名配列）の意味検査は
+        // `super::returning` が担い、本スキーマは型（文字列または文字列配列）のみ検査する。
+        FieldSpec {
+            key: "returning",
+            presence: Presence::Optional,
+            ty: FieldType::StringOrArray(ElementType::String),
             nullable: false,
         },
     ],
@@ -1631,6 +1659,51 @@ mod tests {
         let delete_null =
             obj(r#"{"op":"delete","table":"docs","where":{"id":1},"operation_id":null}"#);
         assert!(DELETE_SCHEMA.validate(&delete_null).is_ok());
+    }
+
+    #[test]
+    fn dml_schemas_declare_returning_as_optional_string_or_array() {
+        for schema in [&INSERT_SCHEMA, &UPDATE_SCHEMA, &DELETE_SCHEMA] {
+            let spec = schema
+                .fields
+                .iter()
+                .find(|f| f.key == "returning")
+                .expect("returning declared");
+            assert_eq!(spec.presence, Presence::Optional, "{}", schema.name);
+            assert!(!spec.nullable, "{}", schema.name);
+            assert!(
+                matches!(spec.ty, FieldType::StringOrArray(ElementType::String)),
+                "{}",
+                schema.name
+            );
+        }
+    }
+
+    #[test]
+    fn returning_type_check_accepts_string_and_string_array_only() {
+        let base = [
+            (&INSERT_SCHEMA, r#""op":"insert","table":"docs","rows":[]"#),
+            (
+                &UPDATE_SCHEMA,
+                r#""op":"update","table":"docs","set":{"a":1}"#,
+            ),
+            (&DELETE_SCHEMA, r#""op":"delete","table":"docs""#),
+        ];
+        for (schema, head) in base {
+            for ok in [r#""*""#, r#"["a","b"]"#, "[]"] {
+                let v = obj(&format!("{{{head},\"returning\":{ok}}}"));
+                assert!(schema.validate(&v).is_ok(), "{} {ok}", schema.name);
+            }
+            for bad in ["null", "1", "{}", "true", "[1]", r#"["a",null]"#] {
+                let v = obj(&format!("{{{head},\"returning\":{bad}}}"));
+                assert_eq!(
+                    schema.validate(&v).unwrap_err(),
+                    SchemaError::TypeMismatch { key: "returning" },
+                    "{} {bad}",
+                    schema.name
+                );
+            }
+        }
     }
 
     #[test]
