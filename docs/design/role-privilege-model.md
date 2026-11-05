@@ -182,6 +182,7 @@ Phase 6（#1929）では PostgreSQL 準拠のロールと GRANT／REVOKE を段�
   呼ぶだけで、別機構を作らない。
 - 投影・述語・並べ替え・集計・RETURNING・NoSQL の filter／sort が参照する列の集合は、束縛の結果
   から一括で得て検査に渡す。
+- 列権限の意味・結線点・応答契約の詳細は [column-level-privilege.md](column-level-privilege.md)（#2082）で決める。
 
 ### D10. テナント境界と存在の秘匿（#1972・RLS-12 のポインタ）
 
@@ -241,6 +242,7 @@ Phase 6（#1929）では PostgreSQL 準拠のロールと GRANT／REVOKE を段�
 | #1972 | D10 |
 | #1973 | 経路一覧（§5） |
 | #2081 | D9 |
+| #2082 | D9（詳細は column-level-privilege.md） |
 
 ## 5. 対象外・未決事項
 

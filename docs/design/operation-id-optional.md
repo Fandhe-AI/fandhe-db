@@ -5,7 +5,7 @@
 - ステータス: 設計段階（実装は後続 Issue）。詳細な契約は公開境界の確認が済むまで本メモに記載せず、ポインタ表記に留める（[spec-confidentiality](../../.claude/rules/spec-confidentiality.md)）
 - 親: #1701（operation_id を既定で省略可能にし、従来の必須契約は opt-in の CLI フラグ `--require-operation-id` で選べる方針）
 - ビヘイビア ID: RECOVER-1（`docs/spec/04-behavior/recovery.md`）・HTTP-14（NoSQL 表層）。補助として RECOVER-2・RECOVER-7・SQL-10・ERR-2
-- 関連: [operation-id-required-guard.md](operation-id-required-guard.md)・[operation-id-ledger.md](operation-id-ledger.md)・[partitioned-dml.md](partitioned-dml.md)・[error-enum-non-exhaustive-policy.md](error-enum-non-exhaustive-policy.md)
+- 関連: [operation-id-required-guard.md](operation-id-required-guard.md)・[operation-id-ledger.md](operation-id-ledger.md)・[partitioned-dml.md](partitioned-dml.md)・[error-enum-non-exhaustive-policy.md](error-enum-non-exhaustive-policy.md)・[idempotent-resend-comparison.md](idempotent-resend-comparison.md)
 
 ## 背景
 
