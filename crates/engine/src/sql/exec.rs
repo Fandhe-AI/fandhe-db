@@ -3352,9 +3352,6 @@ pub(crate) fn execute_statement_with_cache_observed(
         _ => None,
     };
     let mut postfilter_done = false;
-    // 反復スキャンでは事後フィルタ前の候補件数を各ラウンドで積む（Distance 段の rows_out 用。
-    // Issue #2053。フィルタ後の件数にすると PostFilter 段との差が合わなくなる）。
-    let mut iter_raw_total: usize = 0;
     crate::interrupt::current_deadline().check()?;
     let distance_started = stage_start(&stats);
     let hits: Vec<(u64, f64)> = match iter_cfg {
@@ -3373,10 +3370,19 @@ pub(crate) fn execute_statement_with_cache_observed(
             let mut rounds: u64 = 0;
             let (filtered, cap_hit) = loop {
                 crate::interrupt::current_deadline().check()?;
+                // Distance 段は反復スキャンではラウンドごとに記録する（loops＝ラウンド数、
+                // rows_out＝事後フィルタ前の候補件数の合計、時間は compute_hits のみ。Issue #2053）。
+                let round_started = stage_start(&stats);
                 let raw = compute_hits(k_round)?;
                 rounds += 1;
                 let raw_len = raw.len();
-                iter_raw_total = iter_raw_total.saturating_add(raw_len);
+                stage_end(
+                    &mut stats,
+                    ExecStage::Distance,
+                    round_started,
+                    raw_len,
+                    None,
+                );
                 // 反復中の事後フィルタも PostFilter 段として記録する（ラウンドごとに loops を積む）。
                 let postfilter_started = stage_start(&stats);
                 let mut kept = apply_postfilter(raw)?;
@@ -3416,17 +3422,16 @@ pub(crate) fn execute_statement_with_cache_observed(
         _ => compute_hits(k_eff)?,
     };
 
-    stage_end(
-        &mut stats,
-        ExecStage::Distance,
-        distance_started,
-        if postfilter_done {
-            iter_raw_total
-        } else {
-            hits.len()
-        },
-        None,
-    );
+    // 反復スキャン経路は各ラウンドで Distance 段を記録済みのため、ここでは非反復経路のみ記録する。
+    if !postfilter_done {
+        stage_end(
+            &mut stats,
+            ExecStage::Distance,
+            distance_started,
+            hits.len(),
+            None,
+        );
+    }
     // DISTANCE 段の直後の確認点（Issue #1953。上の直前確認と対）。
     crate::interrupt::current_deadline().check()?;
 
