@@ -211,3 +211,9 @@ NULL 許容は NULL・DEFAULT の無い NOT NULL は `23502`）。`DEFAULT nextv
 - `--max-dml-affected-rows` は UPDATE／DELETE 系の上限で、これらの入力経路には作用しない（対象外）。
 - matview の評価後射影形（GROUP BY 等）の本文は、評価上限を「既定値 10,000 と `cap + 1` の大きい方」にした。設定値を上げれば本文の暗黙上限も上がる。
 - 残る差分: 設定がハード上限のときの注入形は 99,999 行まで。ビュー・matview 本文の明示 `LIMIT` の範囲検査は既定値のまま（ビュー本文の LIMIT を設定値と連動させない既存契約）。集合演算の `MAX_SET_OP_ROWS`（10,000）は別軸の上限として残る。本文・サブクエリ内側・集合演算の括弧付き枝の LIMIT 省略の受理拡大は #1852／#1853 の範囲。
+
+## EXPLAIN（Issue #2051）
+
+`EXPLAIN INSERT ... SELECT` は実行せず、`insert` 段の下の `select` 段に内側 SELECT の計画を子として示す。列数・型の
+不一致は `bind_insert_select`（Describe・実行と共有）が返すため `wire_code` が一致する。暗黙 `LIMIT`（#2615）は
+内側の再検証に付けるため `limit: present` と表示される。詳細は [explain-search-engine-exposure.md](explain-search-engine-exposure.md) の #2051 追記。

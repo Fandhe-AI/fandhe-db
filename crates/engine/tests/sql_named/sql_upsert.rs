@@ -557,7 +557,7 @@ fn upsert_row_count_exceeding_batch_limit_is_rejected_with_54000() {
 // --- 構文の許可形状 ---
 
 #[test]
-fn explain_upsert_is_rejected_with_42601() {
+fn explain_upsert_reports_conflict_shape_without_writing() {
     let (core, path) = open_engine("sql-upsert-explain-rejected");
     let _guard = CleanupGuard(path);
     let ctx = ctx_for("tenant-a");
@@ -567,8 +567,27 @@ fn explain_upsert_is_rejected_with_42601() {
         "EXPLAIN INSERT INTO {TABLE} (id, embedding, lang) VALUES (1, '[0.1,0.2]', 'ja') \
          ON CONFLICT (id) DO NOTHING USING OPERATION_ID 'op-upsert-17'"
     );
-    let err = run_sql(&core, &ctx, &mut session, &sql).unwrap_err();
-    assert_eq!(err.wire_code(), "42601");
+    // Issue #2051: `EXPLAIN INSERT ... ON CONFLICT` は衝突対象の種別だけを返す（実行しない）。
+    let outcome = run_sql(&core, &ctx, &mut session, &sql).expect("explain upsert");
+    let engine::sql::SqlOutcome::Explain(result) = outcome else {
+        panic!("expected Explain");
+    };
+    let text: Vec<String> = result
+        .rows
+        .iter()
+        .filter_map(|r| match r.cells.first() {
+            Some(engine::sql::exec::Cell::Text(s)) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        text.contains(&"on_conflict: do_nothing".to_string()),
+        "{text:?}"
+    );
+    assert!(
+        text.contains(&"conflict_target: row_id".to_string()),
+        "{text:?}"
+    );
 }
 
 // --- RLS-11（read-your-writes） ---

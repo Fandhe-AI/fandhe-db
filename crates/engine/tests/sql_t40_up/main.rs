@@ -159,6 +159,7 @@ mod sql75_explain_correlated_embedded;
 mod sql75_explain_cte_inputs;
 mod sql75_explain_cte_subquery;
 mod sql75_explain_dml;
+mod sql75_explain_insert;
 mod sql75_explain_join;
 mod sql75_explain_set_operation;
 mod sql76_explain_options;
