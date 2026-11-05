@@ -68,17 +68,33 @@ pub(crate) struct BoundKeyset {
 /// ページ境界の位置（出力順で 1 行を一意に決める値）。順序仕様（利用者キー ＋ 末尾キー）と同数の
 /// キー値と、最終同点に使う `tenant_id` を持つ。クレート外からフィールドを読めない
 /// （rowid・テナントを呼び出し元へ見せない）。外へ出すときは [`Self::seal`] の不透明バイト列だけ。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct KeysetPosition {
     pub(crate) keys: Vec<Option<OrderValue>>,
     pub(crate) tenant_id: String,
 }
 
+/// 診断ログ等への混入を避けるため、キー値・`tenant_id` は出さず伏字にする（`KeysetSealKey` と同方針）。
+impl std::fmt::Debug for KeysetPosition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("KeysetPosition(<redacted>)")
+    }
+}
+
 /// キーセット付き広域取得の 1 ページ分。`next` が `Some` なら続きの行が存在する。
-#[derive(Debug)]
 pub struct ScanPage {
     result: QueryResult,
     next: Option<KeysetPosition>,
+}
+
+/// `next`（位置）の内部情報を出さないよう、続きの有無だけを表示する。
+impl std::fmt::Debug for ScanPage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScanPage")
+            .field("result", &self.result)
+            .field("has_next", &self.next.is_some())
+            .finish()
+    }
 }
 
 impl ScanPage {
@@ -522,6 +538,17 @@ impl KeysetPosition {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn debug_output_redacts_position_internals() {
+        let pos = KeysetPosition {
+            keys: vec![Some(OrderValue::Id(987_654_321))],
+            tenant_id: "tenant-secret-xyz".to_string(),
+        };
+        let out = format!("{pos:?}");
+        assert!(!out.contains("987654321") && !out.contains("tenant-secret-xyz"));
+        assert!(out.contains("redacted"));
+    }
+
     use super::*;
     use crate::collation::Collation;
 
