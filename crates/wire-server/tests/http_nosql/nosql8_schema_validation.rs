@@ -76,10 +76,10 @@ fn parse_extract_schema_validate_rejects_three_violation_types_as_unsupported_sq
 fn schema_for_returns_none_for_out_of_vocabulary_op() {
     // `delete` は Issue #875（NOSQL-12）、`drop_table` は Issue #910
     // （NOSQL-13）で語彙へ加わったため、語彙外 op の fixture としては
-    // `drop_index`（NOSQL-13 の対象外・引き続き語彙外）を使う。
-    let value = parse_json(r#"{"op":"drop_index","table":"docs"}"#).expect("valid JSON fixture");
+    // `drop_view`（NOSQL-13 の対象外・引き続き語彙外）を使う。
+    let value = parse_json(r#"{"op":"drop_view","table":"docs"}"#).expect("valid JSON fixture");
     let op = extract_op(&value).expect("op must be present");
-    assert_eq!(op, "drop_index");
+    assert_eq!(op, "drop_view");
     assert!(schema_for(op).is_none());
 }
 

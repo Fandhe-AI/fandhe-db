@@ -699,8 +699,8 @@ fn err4_c_unsupported_op_projects_0a000_to_501() {
     let addr = spawn(core);
 
     // 語彙外 op（`drop_table` は Issue #910 で語彙に加わったため、
-    // NOSQL-13 対象外の index 系 DDL 相当を使う）。
-    let resp = query_as_alice(addr, br#"{"op":"drop_index","table":"docs"}"#);
+    // NOSQL-13 対象外の view 系 DDL 相当を使う）。
+    let resp = query_as_alice(addr, br#"{"op":"drop_view","table":"docs"}"#);
     assert_projected(&resp, "0A000");
 }
 

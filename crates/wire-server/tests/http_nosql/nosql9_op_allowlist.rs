@@ -183,10 +183,8 @@ fn update_and_delete_non_empty_filter_reach_the_engine_and_report_undefined_tabl
 fn vocabulary_outside_six_ops_rejects_with_0a000_and_unsupported_message() {
     let addr = spawn();
     let unsupported_ops = [
-        // NOSQL-13 対象外の DDL 相当（`create_table`／`alter_table`／
+        // NOSQL-13 対象外の view 系 DDL 相当（`create_table`／`alter_table`／
         // `drop_table` は Issue #910 で語彙へ加わったため対象から外す）
-        "create_index",
-        "drop_index",
         "create_view",
         "drop_view",
         // UDF 呼び出し相当
@@ -232,8 +230,8 @@ fn op_allowlist_check_precedes_schema_validation_over_wire() {
     // 語彙外 op に加え未知キー（`hint_order`）も同時に付与しても、
     // schema 検証由来の 42601 ではなく op 許可リスト由来の 0A000 が返る
     // （`drop_table` は Issue #910 で語彙へ加わったため、引き続き語彙外の
-    // `drop_index` を使う）。
-    let body = br#"{"op":"drop_index","table":"docs","hint_order":["path"]}"#;
+    // `drop_view` を使う）。
+    let body = br#"{"op":"drop_view","table":"docs","hint_order":["path"]}"#;
     let resp = query(addr, body);
     assert_eq!(resp.status, 501, "resp={resp:?}");
     assert_eq!(http_common::wire_code_of(&resp), "0A000");

@@ -345,7 +345,7 @@ fn create_table_foreign_key_target_is_checked_against_tables() {
 }
 // ---- Issue #2102: スコープの上書き・昇格の試行 ----
 
-const WIDE_SCOPE: &str = r#""scope":{"ops":["search","scan","aggregate","insert","upsert","update","delete","create_table","alter_table","drop_table","show_partitioned_dml","cancel_partitioned_dml"],"read_only":false}"#;
+const WIDE_SCOPE: &str = r#""scope":{"ops":["search","scan","aggregate","insert","upsert","update","delete","create_table","alter_table","drop_table","create_index","drop_index","show_partitioned_dml","cancel_partitioned_dml"],"read_only":false}"#;
 
 /// op ごとの妥当な要求本文。網羅 match のため、op 追加時にコンパイルエラーで気づける。
 fn valid_body(op: Op) -> &'static str {
@@ -372,6 +372,10 @@ fn valid_body(op: Op) -> &'static str {
             r#"{"op":"alter_table","table":"docs","add_column":{"name":"c","type":"text"}}"#
         }
         Op::DropTable => r#"{"op":"drop_table","table":"docs"}"#,
+        Op::CreateIndex => {
+            r#"{"op":"create_index","name":"i_scope","table":"docs","columns":["lang"]}"#
+        }
+        Op::DropIndex => r#"{"op":"drop_index","name":"i_scope"}"#,
         Op::ShowPartitionedDml => {
             r#"{"op":"show_partitioned_dml","table":"docs","operation_id":"none"}"#
         }

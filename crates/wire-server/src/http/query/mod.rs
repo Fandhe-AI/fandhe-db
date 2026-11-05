@@ -76,7 +76,7 @@
 //! NOSQL-13・TASK-207）を SQL 表層の DDL（SQL-23）と同一の実行器
 //! （`EngineCore::execute_parsed_in_session`）へトークン列として到達させる
 //! （`gate.rs` の `Op::CreateTable`／`Op::AlterTable`／`Op::DropTable` アーム
-//! から呼ばれる）。
+//! から呼ばれる）。`create_index`／`drop_index`（Issue #2108・NOSQL-19）も同じ [`ddl`] が担う。
 //! [`operation_id_source`] は書き込み op の `operation_id` 供給元（本文／`Idempotency-Key`
 //! ヘッダ）の解決と不一致拒否（Issue #2064・HTTP-14）を `insert`／`update`／`delete` で共有する。
 //! [`upsert`] は `upsert` op（Issue #2087・NOSQL-21）を SQL 表層の `INSERT ... ON CONFLICT` と同じ

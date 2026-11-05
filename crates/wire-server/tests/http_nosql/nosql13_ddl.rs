@@ -1482,15 +1482,13 @@ fn permission_denial_is_byte_identical_regardless_of_table_existence() {
     );
 }
 
-// --- 語彙外（NOSQL-13 対象外の DDL 相当） -------------------------------
+// --- 語彙外（NOSQL-13 対象外の view 系 DDL 相当。index 系は Issue #2108 で語彙へ加わった） -------------------------------
 
 #[test]
-fn create_index_and_view_ddl_remain_unsupported_via_nosql_surface() {
+fn view_ddl_remains_unsupported_via_nosql_surface() {
     let (core, _guard) = new_core_with_docs_table();
     let session = ddl_session(core);
     for body in [
-        &br#"{"op":"create_index","table":"docs"}"#[..],
-        &br#"{"op":"drop_index","table":"docs"}"#[..],
         &br#"{"op":"create_view","table":"docs"}"#[..],
         &br#"{"op":"drop_view","table":"docs"}"#[..],
     ] {
