@@ -40,9 +40,10 @@ USING OPERATION_ID '<id>'
   `42601`）。句の重複・`DO NOTHING` の後ろへの `WHERE` の付加はいずれも `42601`
   （`Parser::expect_end_of_statement` の余剰トークン判定に自然に落ちる）。
   `DO UPDATE SET` の後ろの `WHERE` は Issue #1740 で受理する（末尾「Issue #1740 追記」）。
-- `EXPLAIN INSERT ... ON CONFLICT ...` は既存の `EXPLAIN`（次トークンが `SELECT` で
-  あることを要求する分岐）へ流れて `42601` になる（`INSERT`・`TRUNCATE`・`DELETE` と
-  同じ経路。専用の判定は持たない）。
+- `EXPLAIN INSERT ... ON CONFLICT ...` は Issue #2051 で受理する。実行せず、`on_conflict`
+  （`do_nothing`／`do_update`）・`conflict_target`（`row_id`／`unique`／`omitted`。束縛後の種別のみで
+  列名・制約名は出さない）・`conflict_filter`（`DO UPDATE ... WHERE` の有無）を返す。詳細は
+  [explain-search-engine-exposure.md](explain-search-engine-exposure.md) の #2051 追記。
 
 ## 字句解析: `EXCLUDED.<col>` の `Token::QualifiedIdent`
 

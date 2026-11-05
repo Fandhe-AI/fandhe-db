@@ -731,7 +731,6 @@ fn explain_still_rejects_non_select_targets() {
         "EXPLAIN EXPLAIN SELECT id FROM docs LIMIT 10",
         "EXPLAIN SET search_mode = 'recall'",
         "EXPLAIN CREATE FUNCTION f(x) AS x",
-        "EXPLAIN INSERT INTO docs (embedding, lang) VALUES ('[1,0,0,0]', 'ja')",
     ] {
         let err = core
             .execute_sql_in_session(&ctx("tenant-a"), &mut session, sql)

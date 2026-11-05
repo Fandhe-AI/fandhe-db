@@ -76,6 +76,9 @@ mod row_lock_exec;
 // INSERT ... SELECT の実行本体（SQL-51・Issue #1733）。
 mod insert_select_exec;
 
+// `EXPLAIN INSERT` の実行本体（束縛までを行い書き込まない。Issue #2051）。
+mod insert_explain_exec;
+
 // データ変更 CTE（`WITH d AS (DELETE ... RETURNING ...) SELECT ...`）の実行本体（SQL-63・Issue #1876）。
 mod dm_cte_exec;
 
@@ -1995,6 +1998,14 @@ pub enum ParsedSql {
     /// **BREAKING CHANGE**（Issue #1129）: 本 variant の追加により `ParsedSql` を網羅的に
     /// マッチするクレート外コードは追随が必要。
     Partitioned(crate::sql::partitioned::PartitionedControl),
+    /// `EXPLAIN INSERT ...`（Issue #2051・SQL-75 (2)(3)(5)(6) ポインタ）。通常の `INSERT` と同じ構文・
+    /// 名前解決・台帳必須構成の検査を通過した文で、実行腕は束縛（列・型・`ON CONFLICT` の対象・行数上限）
+    /// までを行って挿入方式の段の木を返す。行の書き込み・書き込みロック・台帳・採番・トリガー・埋め込み
+    /// I/O は起こさない。`Statement::Explain` に載せないのは、書き込みゲートが INSERT 権限を課す必要が
+    /// あるため。ビュー・一時表・`$n` は実行前に拒否する（fail-closed）。
+    ///
+    /// `#[non_exhaustive]` な本 enum への追加のためクレート外に対して非破壊。
+    ExplainInsert(Box<crate::sql::insert_explain::ExplainInsertTarget>),
     /// 述語形 `UPDATE`／`DELETE` の `EXPLAIN`（Issue #2050・SQL-75。分割実行修飾なし）。実行せず
     /// 計画の木だけを返す読み取り専用の文で、行・台帳・writer・シーケンス・トリガに触れない。
     /// 構文段・実行段の本体は `core/explain_dml.rs`。
@@ -2324,9 +2335,11 @@ fn statement_clock_scope(
         | ParsedSql::Delete(_)
         | ParsedSql::Update(_)
         | ParsedSql::UpdateFrom(_)
+        | ParsedSql::DeleteUsing(_)
+        // Issue #2051: `EXPLAIN INSERT` の束縛は `DEFAULT now()` 等の評価に文の開始時刻を要する。
+        | ParsedSql::ExplainInsert(_)
         // Issue #2050: `EXPLAIN UPDATE|DELETE` も非 EXPLAIN の DML と同じく束縛段が時刻を読む。
-        | ParsedSql::ExplainDml(_)
-        | ParsedSql::DeleteUsing(_) => true,
+        | ParsedSql::ExplainDml(_) => true,
         ParsedSql::Truncate(_)
         | ParsedSql::Transaction(_)
         | ParsedSql::SetTransaction(_)
@@ -2402,6 +2415,8 @@ fn insert_sequence_scope(
             .dm_ctes
             .iter()
             .any(|d| d.command == crate::sql::returning::DmlCommand::Insert),
+        // Issue #2051: `EXPLAIN INSERT` は採番しない（シーケンスを進めない）。
+        ParsedSql::ExplainInsert(_) => false,
         ParsedSql::Statement(_)
         | ParsedSql::LockingSelect(_)
         | ParsedSql::Truncate(_)
@@ -2478,7 +2493,11 @@ fn insert_default_clock_scope(
         ParsedSql::SessionRouted(routed) => {
             return insert_default_clock_scope(routed.inner(), txn_start_micros)
         }
-        ParsedSql::Insert(_) | ParsedSql::InsertSelect(_) | ParsedSql::ViewInsert(_) => true,
+        // Issue #2051: `EXPLAIN INSERT` の束縛は `DEFAULT now()` 列の評価に文脈を要する。
+        ParsedSql::Insert(_)
+        | ParsedSql::InsertSelect(_)
+        | ParsedSql::ViewInsert(_)
+        | ParsedSql::ExplainInsert(_) => true,
         // SQL-63・Issue #1876: 副文に `INSERT` を含むときだけ採番・既定時刻の文脈を張る。
         ParsedSql::DataModifyingCte(v) => v
             .dm_ctes
@@ -2768,6 +2787,8 @@ fn read_only_permits(parsed: &ParsedSql) -> bool {
         // SQL-39・Issue #1963: `SET ROLE`／`RESET ROLE` はセッション変数だけを変える（READ ONLY Tx でも可）。
         ParsedSql::Cursor(_) | ParsedSql::Do(_) | ParsedSql::SetRole(_) => true,
         ParsedSql::Partitioned(control) => !control.writes(),
+        // Issue #2051: `EXPLAIN INSERT` は束縛だけで何も書かないため READ ONLY Tx でも許可する。
+        ParsedSql::ExplainInsert(_) => true,
         // Issue #2050: ANALYZE なしの EXPLAIN は何も書かないため READ ONLY でも可。
         ParsedSql::ExplainDml(_) => true,
         ParsedSql::SequenceFunction(stmt) => !stmt.writes(),
@@ -6265,7 +6286,8 @@ impl EngineCore {
             (
                 Some(crate::sql::lexer::Token::Ident(head)),
                 Some(crate::sql::lexer::Token::Ident(second)),
-            ) if head.eq_ignore_ascii_case("EXPLAIN") && second.eq_ignore_ascii_case("UPDATE")
+            ) if head.eq_ignore_ascii_case("EXPLAIN")
+                && (second.eq_ignore_ascii_case("UPDATE") || second.eq_ignore_ascii_case("INSERT"))
         );
         // FROM なし SELECT の `WHERE "NULL"` は NULL リテラルではなく列参照として扱う
         // 必要がある（Issue #2329）ため、引用情報をこの文種に限り保持する。
@@ -6371,6 +6393,29 @@ impl EngineCore {
                 && (second.eq_ignore_ascii_case("DELETE") || second.eq_ignore_ascii_case("UPDATE"))
             {
                 return self.parse_explain_dml(&tokens, temp, hits, ledger_mode, read_snap);
+            }
+        }
+
+        // Issue #2051: `EXPLAIN INSERT ...`。先頭の `EXPLAIN` を外した文を通常の `INSERT` と同じ解析
+        // （構文・名前解決・台帳必須構成・ビュー判定）に再帰で通し、返った形を `ExplainInsert` に包む。
+        // 第 2 の INSERT パーサーを持たないので、束縛前の拒否は非 EXPLAIN と同じ `wire_code` になる。
+        if let (
+            Some(crate::sql::lexer::Token::Ident(head)),
+            Some(crate::sql::lexer::Token::Ident(second)),
+        ) = (tokens.first(), tokens.get(1))
+        {
+            if head.eq_ignore_ascii_case("EXPLAIN") && second.eq_ignore_ascii_case("INSERT") {
+                let rest = tokens.get(1..).unwrap_or(&[]).to_vec();
+                let inner = self.parse_tokens_in_impl(
+                    rest,
+                    temp,
+                    hits,
+                    ledger_mode,
+                    resolver,
+                    read_snap,
+                    None,
+                )?;
+                return self.wrap_explain_insert(inner, &storage_lookup);
             }
         }
 
@@ -7082,6 +7127,68 @@ impl EngineCore {
             validated = validated.with_implicit_limit(fetch);
         }
         Ok(ParsedSql::InsertSelect(validated))
+    }
+
+    /// `EXPLAIN INSERT` の解析結果の包み（Issue #2051）。`inner` は先頭の `EXPLAIN` を外した文を通常の
+    /// `INSERT` として解析した結果。`VALUES` 系はそのまま、`INSERT ... SELECT` は内側 SELECT を
+    /// `EXPLAIN SELECT` と同じ検証器（`EXPLAIN` を前置したトークン列）で再検証して対象を得る。
+    /// ビューへの INSERT は `0A000`、それ以外の形は到達しない（内部エラーとして拒否）。
+    fn wrap_explain_insert(
+        &self,
+        inner: ParsedSql,
+        storage_lookup: &impl crate::sql::allowlist::TableLookup,
+    ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
+        use crate::sql::allowlist::{SqlSurfaceError, Statement};
+        use crate::sql::insert_explain::{ExplainInsertTarget, InsertSelectExplainInner};
+        match inner {
+            ParsedSql::Insert(v) => Ok(ParsedSql::ExplainInsert(Box::new(
+                ExplainInsertTarget::Values(Box::new(v)),
+            ))),
+            ParsedSql::ViewInsert(_) => Err(SqlSurfaceError::feature_not_supported(
+                "EXPLAIN is not supported for INSERT into a view",
+            )),
+            ParsedSql::InsertSelect(v) => {
+                if matches!(*v.query, Statement::ConstSelect(_)) {
+                    return Ok(ParsedSql::ExplainInsert(Box::new(
+                        ExplainInsertTarget::Select {
+                            insert: Box::new(v),
+                            inner: InsertSelectExplainInner::Constant,
+                        },
+                    )));
+                }
+                let mut tokens = vec![crate::sql::lexer::Token::Ident("EXPLAIN".to_string())];
+                tokens.extend(crate::sql::allowlist::normalize_inner_query_tokens(
+                    v.query_tokens.clone(),
+                ));
+                // 暗黙 `LIMIT`（Issue #2615）を付けて受理された内側は、同じ形で再検証する。
+                if let Some(fetch) = v.implicit_limit {
+                    tokens.push(crate::sql::lexer::Token::Keyword(
+                        crate::sql::lexer::Keyword::Limit,
+                    ));
+                    tokens.push(crate::sql::lexer::Token::Number(fetch.to_string()));
+                }
+                let target = crate::sql::allowlist::validate_sql_tokens_with_subquery_ctx_limits(
+                    &tokens,
+                    storage_lookup,
+                    0,
+                    self.nesting_limits,
+                )?;
+                match target {
+                    Statement::Explain(t) => Ok(ParsedSql::ExplainInsert(Box::new(
+                        ExplainInsertTarget::Select {
+                            insert: Box::new(v),
+                            inner: InsertSelectExplainInner::Target(Box::new(t)),
+                        },
+                    ))),
+                    _ => Err(SqlSurfaceError::Internal {
+                        detail: "internal error".to_string(),
+                    }),
+                }
+            }
+            _ => Err(SqlSurfaceError::Internal {
+                detail: "internal error".to_string(),
+            }),
+        }
     }
 
     /// `INSERT ... SELECT` の束縛（SQL-51・Issue #1732）。挿入先スキーマと内側 SELECT の結果列メタ
@@ -8260,6 +8367,8 @@ impl EngineCore {
             ParsedSql::Partitioned(control) => {
                 self.execute_partitioned_control(ctx, session, control)
             }
+            // Issue #2051: `EXPLAIN INSERT` は束縛だけを行い書き込み・台帳・採番に触れない。
+            ParsedSql::ExplainInsert(target) => self.run_insert_explain(ctx, session, target),
             // Issue #2050: 述語形 UPDATE／DELETE の EXPLAIN（書き込まない）。
             ParsedSql::ExplainDml(explain) => self.run_explain_dml(ctx, session, explain),
             // TABLE-44・Issue #1684: 一時表だけを参照する文は一時コアで実行する
@@ -9681,6 +9790,9 @@ impl EngineCore {
             ParsedSql::Partitioned(control) => {
                 self.execute_partitioned_control(ctx, session, control)
             }
+            // Issue #2051: `EXPLAIN INSERT` は writer を取らず、確定済みのカタログで束縛だけを行う
+            // （`operation_id` も登録しない。続く本物の `INSERT` が同じ ID を再利用できる）。
+            ParsedSql::ExplainInsert(target) => self.run_insert_explain(ctx, session, target),
             // Issue #2050: writer を要求せず、書き込み済みの印も付けない。
             ParsedSql::ExplainDml(explain) => self.run_explain_dml(ctx, session, explain),
             ParsedSql::Cursor(stmt) => self.execute_cursor_in_active_txn(ctx, session, txn, stmt),
@@ -11017,6 +11129,11 @@ impl EngineCore {
             ParsedSql::Partitioned(control) => {
                 Ok(Some(crate::sql::partitioned::describe_columns(control)))
             }
+            // Issue #2051: `EXPLAIN INSERT` は `QUERY PLAN` 単一列（入力文によらず固定）。
+            ParsedSql::ExplainInsert(_) => Ok(Some(vec![crate::sql::exec::ColumnMeta::Computed {
+                name: crate::sql::explain::QUERY_PLAN_COLUMN.to_string(),
+                ty: Some(crate::catalog::ColumnType::Text),
+            }])),
             // Issue #2050: `EXPLAIN UPDATE|DELETE` も `QUERY PLAN` 単一列。
             ParsedSql::ExplainDml(_) => Ok(Some(vec![crate::sql::exec::ColumnMeta::Computed {
                 name: crate::sql::explain::QUERY_PLAN_COLUMN.to_string(),
@@ -11917,7 +12034,7 @@ impl EngineCore {
 
                     crate::sql::parser::validate_search_limit_with(
                         validated.limit(),
-                        &self.result_limits,
+                        &self.explain_limits(),
                     )?;
 
                     // `USING MODE` リテラルの解析は `run_explain_plan` に委譲し、
@@ -14054,7 +14171,7 @@ impl EngineCore {
             validated,
             &schema,
             session.search_mode(),
-            &self.result_limits,
+            &self.explain_limits(),
             &read_txn,
         )? {
             let bound = crate::sql::parser::bind_halfvec_ann(
@@ -14062,7 +14179,7 @@ impl EngineCore {
                 &schema,
                 session.search_mode(),
                 session.udfs(),
-                &self.result_limits,
+                &self.explain_limits(),
             )?;
             return Ok(crate::sql::SqlOutcome::Explain(
                 self.search_explain_from_bound(
@@ -14081,7 +14198,7 @@ impl EngineCore {
             &schema,
             session.search_mode(),
             &crate::sql::parser::LiteralSkip::NONE,
-            &self.result_limits,
+            &self.explain_limits(),
         )? {
             // 未解決の `IN (SELECT ...)`／`EXISTS` を含む WHERE も実行と同じく通すため、
             // 部分クエリ対応の共通ヘルパーへ委ねる（HALFVEC と同じ経路）。
@@ -14094,7 +14211,7 @@ impl EngineCore {
             &schema,
             session.search_mode(),
             &crate::sql::parser::LiteralSkip::NONE,
-            &self.result_limits,
+            &self.explain_limits(),
         )? {
             return self.run_relational_explain_scan(&scan, session);
         }
@@ -14103,7 +14220,7 @@ impl EngineCore {
             &schema,
             session.search_mode(),
             session.udfs(),
-            &self.result_limits,
+            &self.explain_limits(),
         )?;
         Ok(crate::sql::SqlOutcome::Explain(
             self.search_explain_from_bound(
@@ -14346,7 +14463,7 @@ impl EngineCore {
             &self.storage,
             session.udfs(),
             self.nesting_limits,
-            self.result_limits,
+            self.explain_limits(),
         )?;
         let specs = Self::subquery_specs(read_txn, items)?;
         // 部分クエリを含む `OR` の通常述語は表示用の置換で落ちるため、別に束縛だけ検証する
@@ -14359,7 +14476,7 @@ impl EngineCore {
             schema,
             session.udfs(),
             &[],
-            &self.result_limits,
+            &self.explain_limits(),
         )?;
         let mut owned = validated.clone();
         owned.where_predicates =
@@ -14395,7 +14512,7 @@ impl EngineCore {
             &self.storage,
             session.udfs(),
             self.nesting_limits,
-            self.result_limits,
+            self.explain_limits(),
         )?;
         let specs = Self::subquery_specs(read_txn, items)?;
         // 部分クエリを含む `OR` の通常述語は表示用の置換で落ちるため、別に束縛だけ検証する
@@ -14473,7 +14590,7 @@ impl EngineCore {
                     &schema,
                     session.udfs(),
                     &[],
-                    &self.result_limits,
+                    &self.explain_limits(),
                 )?;
                 let gins = Self::gin_decls_for_explain(&read_txn, &bound)?;
                 let shape = CteMainShape {
@@ -14535,7 +14652,7 @@ impl EngineCore {
             &schema,
             session.udfs(),
             &[],
-            &self.result_limits,
+            &self.explain_limits(),
         )?;
         let gins = Self::gin_decls_for_explain(read_txn, &bound)?;
         let shape = crate::sql::cte_explain::CteMainShape {
@@ -14584,7 +14701,7 @@ impl EngineCore {
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
         use crate::sql::allowlist::{SqlSurfaceError, Statement};
         use crate::sql::cte_explain as ce;
-        let limits = self.result_limits;
+        let limits = self.explain_limits();
         Self::check_buffered_outer_limit(view, &limits)?;
         let read_txn = self.begin_read_txn()?;
         check_buffered_view_collations(&read_txn, view)?;
@@ -14870,7 +14987,7 @@ impl EngineCore {
             &schema,
             session.udfs(),
             &[],
-            &self.result_limits,
+            &self.explain_limits(),
         )?;
         let gins = Self::gin_decls_for_explain(&read_txn, &bound)?;
         let lines = Self::scan_explain_lines(&schema, &bound, &gins);
@@ -14913,7 +15030,7 @@ impl EngineCore {
         let limits = crate::sql::join::JoinLimits::from_settings(
             self.group_by_limits,
             self.join_limits,
-            self.result_limits,
+            self.explain_limits(),
         );
         let mut schemas = base_schemas.clone();
         let mut cte_ids = crate::sql::join::CteIdColumns::new();
@@ -14926,7 +15043,7 @@ impl EngineCore {
                     cte,
                     *k,
                     &crate::sql::parser::LiteralSkip::NONE,
-                    &self.result_limits,
+                    &self.explain_limits(),
                     Some(read_txn),
                 )?;
                 let (schema, id_columns) = crate::sql::join::cte_schema(rel.table(), &cols)?;
@@ -15061,7 +15178,7 @@ impl EngineCore {
             session.udfs(),
             validated.limit,
             validated.offset,
-            &self.result_limits,
+            &self.explain_limits(),
             Some(&mut leaves),
         )?;
         let mut leaf_lines = Vec::with_capacity(leaves.len());

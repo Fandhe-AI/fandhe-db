@@ -180,27 +180,33 @@ fn session_insert_operation_id_dollar_placeholder_is_rejected_as_syntax_error() 
     assert_eq!(err.wire_code(), "42601");
 }
 
-/// `EXPLAIN INSERT ...` は許可形状に存在しないため `42601` で拒否される
-/// （`EXPLAIN` は `USING PLAN` を伴う検索 SELECT の前置専用。TASK-78・SQL-6）。
-/// セッション経由の INSERT 検出（先頭トークン `INSERT` の覗き見）を追加した
-/// 後も、先頭トークンが `EXPLAIN` である限り既存の `validate_sql` の `EXPLAIN`
-/// 分岐へそのまま流れ、挙動が変わらないことを確認する。
+/// セッション経由の `EXPLAIN INSERT ...` は計画（`SqlOutcome::Explain`）を返し、書き込まない
+/// （Issue #2051・SQL-75 ポインタ）。同じ `operation_id` の本物の INSERT は再送ではなく新規として
+/// 書き込まれる（台帳に記録していない）。セッションの無い入口は従来どおり `42601`。
 #[test]
-fn session_explain_insert_is_rejected_as_unsupported_syntax() {
+fn session_explain_insert_returns_plan_without_writing() {
     let path = unique_db_path("session-explain-insert-rejected");
     let _guard = CleanupGuard(path.clone());
     let core = new_core_with_documents_table(&path);
     let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
     let mut session = SessionState::default();
 
-    let err = core
+    let outcome = core
         .execute_sql_in_session(
             &ctx,
             &mut session,
             "EXPLAIN INSERT INTO documents (id, embedding, body) VALUES (1, '[0.1,0.2,0.3]', 'hello') USING OPERATION_ID 'op-explain-insert'",
         )
-        .expect_err("EXPLAIN INSERT must be rejected");
-    assert_eq!(err.wire_code(), "42601");
+        .expect("EXPLAIN INSERT must return a plan");
+    assert!(matches!(outcome, engine::sql::SqlOutcome::Explain(_)));
+    let outcome = core
+        .execute_sql_in_session(
+            &ctx,
+            &mut session,
+            "INSERT INTO documents (id, embedding, body) VALUES (1, '[0.1,0.2,0.3]', 'hello') USING OPERATION_ID 'op-explain-insert'",
+        )
+        .expect("the real INSERT must not see a ledger entry from EXPLAIN");
+    assert!(matches!(outcome, engine::sql::SqlOutcome::Insert(_)));
 }
 
 /// 複数行 `VALUES`（SQL-16、TASK-190）もセッション経由（`execute_sql_in_session`
