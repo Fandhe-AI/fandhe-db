@@ -42,17 +42,22 @@ impl EngineCore {
         };
         let planning_ms = planning_start.elapsed().as_secs_f64() * 1000.0;
 
+        // 実行段だけを観測ガードで囲む（計画の生成には張らない。静的な EXPLAIN は索引を引かない契約）。
+        // エラー時もガードの Drop で前の状態へ戻る。
         let exec_start = Instant::now();
+        let observe = crate::sql::hnsw_observe::enter();
         let rows = match run(session, executable_statement(&ea.target))? {
             SqlOutcome::Query(result) => result.rows.len(),
             _ => return Err(internal()),
         };
         let execution_ms = exec_start.elapsed().as_secs_f64() * 1000.0;
+        let hnsw = observe.finish();
 
         let stats = AnalyzeStats {
             rows,
             planning_ms,
             execution_ms,
+            hnsw,
         };
         Ok(SqlOutcome::Explain(annotate(
             plan, &stats, ea.timing, ea.summary,
