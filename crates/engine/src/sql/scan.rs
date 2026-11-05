@@ -61,6 +61,7 @@ use crate::policy::PolicyContext;
 use crate::row_codec;
 use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::exec::{Cell, ColumnMeta, QueryResult, ResultRow};
+use crate::sql::exec_stats::{stage_end, stage_start, ExecStage, ExecStats};
 use crate::sql::expr_program::{ExprProgram, StackValue};
 use crate::sql::order_value::{
     compare_nullable, compare_ref_and_owned_values, compare_statement_order,
@@ -1229,7 +1230,23 @@ pub(crate) fn execute_scan_with_budget(
     bound: &BoundScan,
     max_result_bytes: usize,
 ) -> Result<QueryResult, SqlSurfaceError> {
-    let result = execute_scan_with_budget_inner(read_txn, ctx, schema, bound, max_result_bytes)?;
+    execute_scan_with_budget_observed(read_txn, ctx, schema, bound, max_result_bytes, None)
+}
+
+/// [`execute_scan_with_budget`] の計測付き本体（Issue #2053・SQL-76 (2)(3)）。`stats` が `Some` の
+/// ときだけ scan 経路を `Scan` 1 段として記録する（出力行数は LIMIT の早期終了後に返す可視行数で、
+/// 可視判定前の走査件数は持たない）。`None` では結果・エラーは計測の有無で変わらない。ウィンドウ項目を
+/// 持つ文の委譲経路（`sql::window`）は未配線で、記録しない。
+pub(crate) fn execute_scan_with_budget_observed(
+    read_txn: &impl crate::storage::read_source::ReadSource,
+    ctx: &PolicyContext,
+    schema: &TableSchema,
+    bound: &BoundScan,
+    max_result_bytes: usize,
+    stats: Option<&mut ExecStats>,
+) -> Result<QueryResult, SqlSurfaceError> {
+    let result =
+        execute_scan_with_budget_inner(read_txn, ctx, schema, bound, max_result_bytes, stats)?;
     if let Some(cap) = bound.result_cap {
         if result.rows.len() > cap {
             return Err(row_limit_exceeded());
@@ -1244,6 +1261,7 @@ fn execute_scan_with_budget_inner(
     schema: &TableSchema,
     bound: &BoundScan,
     max_result_bytes: usize,
+    mut stats: Option<&mut ExecStats>,
 ) -> Result<QueryResult, SqlSurfaceError> {
     // SQL-30・TASK-214（Issue #930）: ウィンドウ項目を持つ広域取得は専用の実行器
     // （`sql::window::execute_window_scan`）へ委譲する。本体側の変更をこの
@@ -1265,6 +1283,8 @@ fn execute_scan_with_budget_inner(
         );
     }
 
+    // SQL-76 (2)(3): window 委譲より後から Scan 段を計る。終端は 2 か所の `Ok` 返却のみ。
+    let scan_started = stage_start(&stats);
     let expected_dim = schema.vector_dim();
     // RLS-13（Issue #2276）: 利用者ポリシーを行を読むのと同じスナップショットから 1 回だけ解決する。
     // 適用表ではポリシーが参照する列・embedding を復号対象へ加える（マスク外の列を NULL と取り違えない）。
@@ -1367,6 +1387,7 @@ fn execute_scan_with_budget_inner(
     let per_row_struct_bytes = cell_struct_bytes.saturating_add(result_row_struct_bytes);
 
     let Some(table) = table else {
+        stage_end(&mut stats, ExecStage::Scan, scan_started, rows.len(), None);
         return Ok(QueryResult { columns, rows });
     };
 
@@ -2077,6 +2098,7 @@ fn execute_scan_with_budget_inner(
         }
     }
 
+    stage_end(&mut stats, ExecStage::Scan, scan_started, rows.len(), None);
     Ok(QueryResult { columns, rows })
 }
 

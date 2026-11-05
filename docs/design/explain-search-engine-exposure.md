@@ -629,3 +629,17 @@ INSERT は #2051 が担当する。`EXPLAIN ... PARTITIONED` は従来の出力�
   既知事項: LRU 退避はキャッシュ全体で共通のため、他テナントの活動量で `cached` が `built` に変わりうる。行の存在・件数ではなく
   時間と同じ区分の情報として許容する。ほか `delta_searches`・訪問ノード数・閾値は出さない。
 - **対象外**: 段ごとの帰属（#2053 の段の木への統合）、`FORMAT JSON` のキー（#2059）、`VERBOSE`（#2060）、HNSW グラフの訪問ノード数。
+
+## 追記（Issue #2053・SQL-76 (2)(3)）: 実行計測フック
+
+EXPLAIN ANALYZE（親 #2052）の「計測の土台」を実行器へ入れた。出力への配線（`QUERY PLAN` の `Actual Rows` 等・JSON キー・`ANALYZE` ゲートの解除）は #2054 以降で、本 Issue は収集型と計測点だけを持つ。
+
+- **収集型**: `sql/exec_stats.rs` の `ExecStats`（`pub(crate)`）。段は閉じた語彙 `ExecStage`（`Scan`／`Distance`／`PostFilter`／`PrecisionGate`／`Limit`／`Project`）の固定長配列で、確保量は型で決まる。各段は `rows_out`・`loops`・`elapsed`（`timing == false` では `None`）・`rows_removed_by_filter`（既存の長さの差から出せる段だけ `Some`）を持つ。同じ段が複数回記録されたら `loops` を増やし、行数と時間は飽和加算する。
+- **入口**: `exec::execute_statement_with_cache_observed`（kernel 経路）と `scan::execute_scan_with_budget_observed`（scan 経路）が末尾に `Option<&mut ExecStats>` を取る。従来の `execute_statement_with_cache`／`execute_scan_with_budget` は `None` を渡す薄いラッパーで、公開 API・`core.rs` の呼び出し元は変わらない。
+- **計測点（kernel）**: `Scan`＝候補の構築（arena のキャッシュ参照・RLS の暗黙適用・利用者ポリシー・SCALAR の事前フィルタ）から候補スロットの確定まで。`rows_out` は DISTANCE 段へ渡す候補スロット数で、arena のキャッシュ有無で同じ値になる。`Distance`＝`hits` の確定（brute-force／HNSW／hybrid／厳密全走査）。`PostFilter`＝DISTANCE 先行で事後フィルタを実際に適用したときだけ記録し、removed は前後の件数の差。`PrecisionGate`＝precision のときだけ。`Limit`＝RLS 安全網の後の OFFSET と行数上限。`Project`＝投影。途中でエラーになれば記録はそこで止まる。
+- **計測点（scan）**: ウィンドウ項目の委譲より後から `Scan` 1 段で計る（ORDER BY の直接走査と 2 パスの区別はしない）。`rows_out` は LIMIT の早期終了後に返す行数で、可視判定前の走査件数は持たない。`Project` はループと分かれていないため分けない。
+- **無効時のコスト**: `None` では段境界ごとの `is_some()` 分岐（文 1 回あたり高々 6 段）だけで、`Instant::now()` もヒープ確保もしない。行ごとのフック・カウンタ・クロージャ内の計測は置かず、行数は段境界にある既存の `Vec` の長さから取る。`hnsw.rs` の `const OBSERVE` 単相化は、2,000 行超の関数を 2 通りに複製するコスト（コード量・コンパイル時間・保守性）に見合わないため採らない。
+- **挙動不変の契約**: 計測コードは読み取りだけで `?` を持たない。計測の有無で結果の行・順序・エラー・キャッシュの効き方は変わらない（テストで同一性を固定）。
+- **テナント境界（SQL-76 (3)）**: `rows_out`／`rows_removed_by_filter` は RLS の暗黙適用の後の可視行だけから取る。他テナントを含む走査件数は型にも変数にも持たない。他テナントの行数を 0 件と多数件で変えても全段の値が変わらないことをテストで固定した。経過時間は性質上データ量で変わりうるが、不変条件は行数に関するもので、クエリの応答時間そのものが同じ情報を外へ出しており新しい漏えい路ではない。計測値をログ・notice・エラーへ出さない。
+- **未配線の経路**（同じ収集型を使って後続が足す）: aggregate・JOIN・集合演算・CTE・部分クエリ・DML は #2054／#2055、HNSW の反復走査の回数・再取得・厳密走査への切り替え・キャッシュ状態は #2056。ウィンドウ項目を持つ scan（`sql::window` への委譲）は未配線で、記録しない。
+- **オーバーヘッドのベンチ確認**: 本 Issue の実装環境では前後比較ベンチ（`make bench-c1`・`make bench-relational-p95`）を実行していない（未検証）。無効時のコストが構造上、境界の `Option` 分岐だけであることが根拠で、実測は後続で `benchmark-judgement-policy.md` の作法（N≥5 ラウンド・arm 輪番）に従って記録する。
