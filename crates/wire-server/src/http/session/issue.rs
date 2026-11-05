@@ -17,6 +17,9 @@
 //!    フィールドのみを許可する [`crate::http::query::schema::ObjectSchema`]）で
 //!    意味検証。必須欠落・未知キー・型不一致はいずれも `42601`（未知キーの拒否
 //!    により、クライアント自己申告の `tenant_id` 等も無視せず拒否する）
+//!    続けて任意キー `scope` を [`scope::parse_scope`] で検証する（形の不正は `42601`、表名件数の
+//!    超過は `54000`。HTTP-15・Issue #2100）。妥当なスコープ付きの発行は、強制（Issue #2101）が
+//!    結線されるまで `0A000` の固定文言で拒否する（認証より前。判定順は 42601→0A000→28P01）
 //! 4. [`crate::auth::verify`] で Argon2id 照合。失敗は `28P01`（HTTP 401）で、
 //!    固定遅延・ダミー KDF による対称性は `verify` 内部が担う（本モジュールは
 //!    追加の `sleep` を行わない）
@@ -40,6 +43,7 @@ use crate::auth::{self, UserStore};
 use crate::http::error_body::escape_json_string_into;
 use crate::http::query::schema::{FieldSpec, FieldType, ObjectSchema, Presence};
 use crate::http::response;
+use crate::http::session::scope::{self, SCOPE_SCHEMA};
 use crate::http::session::store::SessionStore;
 use crate::http::{body, session};
 
@@ -61,8 +65,18 @@ static SESSION_REQUEST_SCHEMA: ObjectSchema = ObjectSchema {
             ty: FieldType::String,
             nullable: false,
         },
+        FieldSpec {
+            key: "scope",
+            presence: Presence::Optional,
+            ty: FieldType::Object(&SCOPE_SCHEMA),
+            nullable: false,
+        },
     ],
 };
+
+/// スコープ付き発行を拒否する固定文言。スコープの強制（Issue #2101）が結線されるまで、効いていない
+/// スコープのトークンを成功として渡さない（権限を狭めたつもりが全権限になる成功の偽装を避ける）。
+const SESSION_SCOPE_NOT_YET_AVAILABLE_MESSAGE: &str = "session scope is not yet supported";
 
 /// [`handle`] 内部の分類済みエラー（`ErrorClass` ＋ クライアント向け文言）。
 /// `message` を `Cow<'static, str>` にするのは、[`engine::json::JsonError::
@@ -153,6 +167,20 @@ fn handle_inner(
     let validated = SESSION_REQUEST_SCHEMA.validate(&value).map_err(|_| {
         HandleError::new(ErrorClass::UnsupportedSqlSyntax, "invalid session request")
     })?;
+
+    // スコープの形の検証（42601／54000）。サーバー状態を読まず、認証より前に判定する。
+    let parsed_scope = scope::parse_scope(&validated)
+        .map_err(|e| HandleError::new(e.error_class(), e.client_message()))?;
+    // 妥当なスコープ付きの発行は、強制が未実装の間は 0A000 で拒否する（認証・セッション枠・KDF を
+    // 消費しない。判定は公開済みの語彙と識別子の形だけに依存するため情報は漏れない）。
+    // Issue #2101: この拒否を削除し（挙動変更のため破壊的変更として扱う）、`parse_scope` の結果を
+    // `issue_with_scope` へ渡し、発行から強制までの e2e テストを追加する。
+    if parsed_scope.is_some() {
+        return Err(HandleError::new(
+            ErrorClass::FeatureNotSupported,
+            SESSION_SCOPE_NOT_YET_AVAILABLE_MESSAGE,
+        ));
+    }
 
     let user = validated.required_str("user").map_err(|_| {
         HandleError::new(ErrorClass::UnsupportedSqlSyntax, "invalid session request")
@@ -443,5 +471,88 @@ mod tests {
         let first = handle(&store, &sessions, body, Instant::now, SystemTime::now());
         let second = handle(&store, &sessions, body, Instant::now, SystemTime::now());
         assert_ne!(first, second, "reissued tokens must differ");
+    }
+
+    fn status_and_body(response: &[u8]) -> (String, String) {
+        let text = String::from_utf8(response.to_vec()).expect("utf-8 response");
+        let status = text.lines().next().unwrap_or_default().to_string();
+        let body = text
+            .split("\r\n\r\n")
+            .nth(1)
+            .unwrap_or_default()
+            .to_string();
+        (status, body)
+    }
+
+    #[test]
+    fn valid_scope_is_rejected_with_0a000_before_authentication() {
+        let store = store_with(&[("alice", "tenant-a", "pw-alice")]);
+        let sessions = SessionStore::new();
+        // 正しいパスワードでも誤ったパスワードでも同一応答（認証結果を観測させない）。
+        let ok = br#"{"user":"alice","password":"pw-alice","scope":{"tables":["docs"]}}"#;
+        let bad = br#"{"user":"alice","password":"wrong","scope":{"tables":["docs"]}}"#;
+        let r1 = handle(&store, &sessions, ok, Instant::now, SystemTime::now());
+        let r2 = handle(&store, &sessions, bad, Instant::now, SystemTime::now());
+        let (s1, b1) = status_and_body(&r1);
+        let (s2, b2) = status_and_body(&r2);
+        assert!(s1.starts_with("HTTP/1.1 501 "), "got: {s1}");
+        assert!(b1.contains("0A000") && b1.contains(SESSION_SCOPE_NOT_YET_AVAILABLE_MESSAGE));
+        assert_eq!((s1, b1), (s2, b2));
+        assert_eq!(sessions.active_sessions(), 0);
+    }
+
+    #[test]
+    fn scope_response_does_not_depend_on_table_existence() {
+        let store = store_with(&[("alice", "tenant-a", "pw-alice")]);
+        let sessions = SessionStore::new();
+        let a = br#"{"user":"alice","password":"pw-alice","scope":{"tables":["exists_maybe"]}}"#;
+        let b = br#"{"user":"alice","password":"pw-alice","scope":{"tables":["other_tenant_t"]}}"#;
+        let ra = handle(&store, &sessions, a, Instant::now, SystemTime::now());
+        let rb = handle(&store, &sessions, b, Instant::now, SystemTime::now());
+        assert_eq!(status_and_body(&ra), status_and_body(&rb));
+    }
+
+    #[test]
+    fn malformed_scope_is_rejected_with_42601_without_echo() {
+        let store = store_with(&[("alice", "tenant-a", "pw-alice")]);
+        let sessions = SessionStore::new();
+        for body in [
+            &br#"{"user":"alice","password":"pw-alice","scope":{"ops":["zzz_op"]}}"#[..],
+            br#"{"user":"alice","password":"pw-alice","scope":{"tables":["bad.name"]}}"#,
+            br#"{"user":"alice","password":"pw-alice","scope":{"zzz_key":1}}"#,
+            br#"{"user":"alice","password":"pw-alice","scope":null}"#,
+        ] {
+            let r = handle(&store, &sessions, body, Instant::now, SystemTime::now());
+            let (status, text) = status_and_body(&r);
+            assert!(status.starts_with("HTTP/1.1 400 "), "got: {status}");
+            assert!(text.contains("42601"));
+            for leaked in ["zzz_op", "bad.name", "zzz_key"] {
+                assert!(!text.contains(leaked), "leaked {leaked}: {text}");
+            }
+        }
+        assert_eq!(sessions.active_sessions(), 0);
+    }
+
+    #[test]
+    fn too_many_scope_tables_is_rejected_with_54000() {
+        let store = store_with(&[("alice", "tenant-a", "pw-alice")]);
+        let sessions = SessionStore::new();
+        let names: Vec<String> = (0..=crate::limits::MAX_SCOPE_TABLES)
+            .map(|i| format!("\"t{i}\""))
+            .collect();
+        let body = format!(
+            r#"{{"user":"alice","password":"pw-alice","scope":{{"tables":[{}]}}}}"#,
+            names.join(",")
+        );
+        let r = handle(
+            &store,
+            &sessions,
+            body.as_bytes(),
+            Instant::now,
+            SystemTime::now(),
+        );
+        let (status, text) = status_and_body(&r);
+        assert!(status.starts_with("HTTP/1.1 413 "), "got: {status}");
+        assert!(text.contains("54000"));
     }
 }

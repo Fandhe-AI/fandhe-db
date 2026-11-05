@@ -516,6 +516,27 @@ impl<'a> Validated<'a> {
             _ => Err(SchemaError::TypeMismatch { key }),
         }
     }
+
+    /// [`Validated::required_nested`] の任意版（セッション発行の `scope`。Issue #2100・HTTP-15）。
+    /// キー省略は `None`。`null` は `nullable` が真のときのみ `None`、それ以外の非オブジェクトは
+    /// `TypeMismatch`。他アクセサと同じく spec 型を再検査する。
+    pub fn optional_nested(&self, key: &'static str) -> Result<Option<Validated<'a>>, SchemaError> {
+        let Some(spec) = self.field_spec(key) else {
+            return Err(SchemaError::UnknownKey);
+        };
+        let FieldType::Object(sub) = spec.ty else {
+            return Err(SchemaError::TypeMismatch { key });
+        };
+        match self.map.get(key) {
+            None => Ok(None),
+            Some(JsonValue::Null) if spec.nullable => Ok(None),
+            Some(JsonValue::Object(m)) => Ok(Some(Validated {
+                map: m,
+                schema: sub,
+            })),
+            _ => Err(SchemaError::TypeMismatch { key }),
+        }
+    }
 }
 
 /// `hybrid` フィールドのサブスキーマ（`search` op）。
@@ -2503,6 +2524,41 @@ mod tests {
         assert_eq!(
             SEARCH_SCHEMA.validate(&v).unwrap_err(),
             SchemaError::MissingRequired { key: "table" }
+        );
+    }
+
+    #[test]
+    fn optional_nested_reads_object_and_absence() {
+        use crate::http::session::scope::SCOPE_SCHEMA;
+        static ROOT: ObjectSchema = ObjectSchema {
+            name: "root",
+            fields: &[FieldSpec {
+                key: "scope",
+                presence: Presence::Optional,
+                ty: FieldType::Object(&SCOPE_SCHEMA),
+                nullable: false,
+            }],
+        };
+        let v = engine::json::parse_json("{}").expect("json");
+        assert!(ROOT
+            .validate(&v)
+            .expect("ok")
+            .optional_nested("scope")
+            .expect("ok")
+            .is_none());
+        let v = engine::json::parse_json(r#"{"scope":{"read_only":true}}"#).expect("json");
+        let nested = ROOT
+            .validate(&v)
+            .expect("ok")
+            .optional_nested("scope")
+            .expect("ok");
+        assert!(nested.is_some());
+        assert_eq!(
+            ROOT.validate(&v)
+                .expect("ok")
+                .optional_nested("nope")
+                .unwrap_err(),
+            SchemaError::UnknownKey
         );
     }
 }

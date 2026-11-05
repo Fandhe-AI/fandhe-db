@@ -46,7 +46,7 @@ use super::schema::ObjectSchema;
 /// `POST /v1/query` の `op` が取りうる閉じた語彙。
 ///
 /// この 12 値以外を表す variant を追加しない（許可リストの意味が崩れる）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Op {
     Search,
     Scan,
