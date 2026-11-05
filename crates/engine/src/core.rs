@@ -2002,6 +2002,15 @@ pub enum ParsedSql {
     /// **BREAKING CHANGE**（Issue #2050）: 本 variant の追加により `ParsedSql` を網羅的に
     /// マッチするクレート外コードは追随が必要。
     ExplainDml(crate::sql::explain_dml::ExplainDml),
+    /// `EXPLAIN (FORMAT JSON) <文>`（Issue #2059・SQL-76 (1)(6) ポインタ）。括弧付きオプション群を
+    /// 構文入口で取り除いた残りを従来どおり解析した `EXPLAIN` 系の文（`Statement::Explain`・
+    /// [`Self::ExplainDml`]・分割実行の `EXPLAIN`）を包む。実行・権限・トランザクション・時刻の扱いは
+    /// すべて中身と同じで、結果だけを計画テキストから JSON 1 セル（列型 `json`）へ変換する
+    /// （`sql::explain_json`）。`FORMAT TEXT`／オプションなしは包まず従来と同一の値になる。
+    ///
+    /// **BREAKING CHANGE**（Issue #2059）: 本 variant の追加により `ParsedSql` を網羅的に
+    /// マッチするクレート外コードは追随が必要。
+    ExplainJson(Box<ParsedSql>),
     /// `ALTER TABLE <table> ADD COLUMN <column> <type>`（SQL-23・TASK-202、
     /// Issue #900）・`ALTER TABLE <table> ADD [CONSTRAINT <name>] UNIQUE
     /// (<col>[, ...])`／`DROP CONSTRAINT <name>`（TABLE-16・TASK-204、
@@ -2312,6 +2321,8 @@ fn statement_clock_scope(
         ParsedSql::SessionRouted(routed) => {
             return statement_clock_scope(routed.inner(), txn_start_micros)
         }
+        // Issue #2059: 包んだ `EXPLAIN` は中身の文種で判定する。
+        ParsedSql::ExplainJson(inner) => return statement_clock_scope(inner, txn_start_micros),
         ParsedSql::Statement(_)
         | ParsedSql::LockingSelect(_)
         | ParsedSql::Insert(_)
@@ -2396,6 +2407,7 @@ fn insert_sequence_scope(
         ParsedSql::SessionRouted(routed) => {
             return insert_sequence_scope(storage, session, routed.inner())
         }
+        ParsedSql::ExplainJson(inner) => return insert_sequence_scope(storage, session, inner),
         ParsedSql::Insert(_) | ParsedSql::InsertSelect(_) | ParsedSql::ViewInsert(_) => true,
         // SQL-63・Issue #1876: 副文に `INSERT` を含むときだけ採番・既定時刻の文脈を張る。
         ParsedSql::DataModifyingCte(v) => v
@@ -2477,6 +2489,9 @@ fn insert_default_clock_scope(
     let is_insert = match parsed {
         ParsedSql::SessionRouted(routed) => {
             return insert_default_clock_scope(routed.inner(), txn_start_micros)
+        }
+        ParsedSql::ExplainJson(inner) => {
+            return insert_default_clock_scope(inner, txn_start_micros)
         }
         ParsedSql::Insert(_) | ParsedSql::InsertSelect(_) | ParsedSql::ViewInsert(_) => true,
         // SQL-63・Issue #1876: 副文に `INSERT` を含むときだけ採番・既定時刻の文脈を張る。
@@ -2697,7 +2712,7 @@ fn parsed_operation_id(parsed: &ParsedSql) -> Option<&str> {
         ParsedSql::UpdateFrom(_) | ParsedSql::DeleteUsing(_) => None,
         // Issue #2050: `EXPLAIN UPDATE|DELETE` は台帳に記録せず operation_id もトランザクションへ
         // 登録しない（登録すると同じ operation_id の本実行が誤って再利用扱いになる）。
-        ParsedSql::ExplainDml(_) => None,
+        ParsedSql::ExplainDml(_) | ParsedSql::ExplainJson(_) => None,
         // 永続側の文を包んだ形は中身の `operation_id` を使う（一時表の文は `operation_id` を持たない）。
         ParsedSql::SessionRouted(routed) if routed.is_persistent() => {
             parsed_operation_id(routed.inner())
@@ -2718,7 +2733,7 @@ fn is_partitioned_write(parsed: &ParsedSql) -> bool {
             v.partitioned().is_some()
         }
         ParsedSql::Partitioned(control) => control.writes(),
-        ParsedSql::ExplainDml(_) => false,
+        ParsedSql::ExplainDml(_) | ParsedSql::ExplainJson(_) => false,
         ParsedSql::SessionRouted(routed) if routed.is_persistent() => {
             is_partitioned_write(routed.inner())
         }
@@ -2770,6 +2785,7 @@ fn read_only_permits(parsed: &ParsedSql) -> bool {
         ParsedSql::Partitioned(control) => !control.writes(),
         // Issue #2050: ANALYZE なしの EXPLAIN は何も書かないため READ ONLY でも可。
         ParsedSql::ExplainDml(_) => true,
+        ParsedSql::ExplainJson(inner) => read_only_permits(inner),
         ParsedSql::SequenceFunction(stmt) => !stmt.writes(),
         ParsedSql::SessionRouted(routed) => read_only_permits(routed.inner()),
         // `COPY ... TO` は読み取りだが、拡張クエリ経路の `Copy` は in-txn で別途拒否される。
@@ -6173,6 +6189,29 @@ impl EngineCore {
         resolver: Option<crate::sql::relation_name::SchemaResolver<'_>>,
         read_snap: Option<&redb::ReadTransaction>,
     ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
+        // Issue #2059（SQL-76 (1)）: `EXPLAIN (<オプション群>) <文>` はオプション群をここで取り除き、
+        // 残りを従来と同じ入口で解析する（オプションなしと同じ解析器・エラー契約を通す）。`FORMAT JSON`
+        // のときだけ結果の変換を表す包みを付ける。`FORMAT TEXT`／繰り返し指定の後勝ちで TEXT なら包まない。
+        if crate::sql::explain_options::has_option_list(&tokens) {
+            let (format, rest) = crate::sql::explain_options::split_explain_options(&tokens)?;
+            let inner = self.parse_tokens_in(rest, temp, hits, ledger_mode, resolver, read_snap)?;
+            return match format {
+                crate::sql::explain_options::ExplainFormat::Text => Ok(inner),
+                crate::sql::explain_options::ExplainFormat::Json => match inner {
+                    ParsedSql::Statement(crate::sql::allowlist::Statement::Explain(_))
+                    | ParsedSql::ExplainDml(_)
+                    | ParsedSql::Partitioned(
+                        crate::sql::partitioned::PartitionedControl::ExplainDelete(_)
+                        | crate::sql::partitioned::PartitionedControl::ExplainUpdate(_),
+                    ) => Ok(ParsedSql::ExplainJson(Box::new(inner))),
+                    // `EXPLAIN` 以外の文がここへ来るのは契約違反（fail-closed）。
+                    _ => Err(crate::sql::allowlist::SqlSurfaceError::Internal {
+                        detail: "EXPLAIN option list attached to a non-EXPLAIN statement"
+                            .to_string(),
+                    }),
+                },
+            };
+        }
         // SELECT の行ロック句（SQL-38・Issue #1957）は、行数制限句の正規化の後・名前解決の前に
         // トークン列から取り除いて構文情報として保持し、既存の検証が文を受理した後に併用を検査する。
         // 構文誤りは `42601`、併用違反は `0A000`、`OF` の解決失敗は `42P01`。
@@ -8262,6 +8301,12 @@ impl EngineCore {
             }
             // Issue #2050: 述語形 UPDATE／DELETE の EXPLAIN（書き込まない）。
             ParsedSql::ExplainDml(explain) => self.run_explain_dml(ctx, session, explain),
+            // Issue #2059: 中身の `EXPLAIN` を実行し、内部キーを表示名へ戻した後で JSON へ変換する
+            // （JSON 化の後では置換が JSON 文字列を壊しうるため、変換の前に scrub する）。
+            ParsedSql::ExplainJson(inner) => {
+                let outcome = self.execute_parsed_statement(ctx, session, inner)?;
+                crate::sql::explain_json::outcome_to_json(self.scrub_outcome(ctx, outcome))
+            }
             // TABLE-44・Issue #1684: 一時表だけを参照する文は一時コアで実行する
             // （`core/temp_route.rs`）。永続コアの実行器へは渡さない。
             ParsedSql::SessionRouted(routed) if routed.is_persistent() => {
@@ -9683,6 +9728,11 @@ impl EngineCore {
             }
             // Issue #2050: writer を要求せず、書き込み済みの印も付けない。
             ParsedSql::ExplainDml(explain) => self.run_explain_dml(ctx, session, explain),
+            // Issue #2059: 中身を同じ経路で実行し、scrub の後で JSON へ変換する。
+            ParsedSql::ExplainJson(inner) => {
+                let outcome = self.execute_in_active_txn(ctx, session, txn, inner)?;
+                crate::sql::explain_json::outcome_to_json(self.scrub_outcome(ctx, outcome))
+            }
             ParsedSql::Cursor(stmt) => self.execute_cursor_in_active_txn(ctx, session, txn, stmt),
             // TABLE-44・Issue #1684: 一時表の文は、一時側の書き込みトランザクション（最初の一時表の
             // 文で開く）の上で一時コアが実行する。永続側の write txn・dirty 判定には触れない。
@@ -10762,6 +10812,17 @@ impl EngineCore {
                     snap,
                 )
             }
+            // Issue #2059: 中身の列を導出し、`QUERY PLAN` 列の型だけ `json` にする（実行しない）。
+            ParsedSql::ExplainJson(inner) => Ok(self
+                .describe_parsed_in_session_snap(
+                    session,
+                    inner,
+                    skip_vector_literal_validation,
+                    dummy_equality_flags,
+                    limits,
+                    snap,
+                )?
+                .map(crate::sql::explain_json::columns_to_json)),
             ParsedSql::SessionRouted(routed) => self.describe_temp_routed(
                 session,
                 routed,

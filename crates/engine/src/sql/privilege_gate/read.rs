@@ -67,6 +67,8 @@ pub(crate) fn classify(parsed: &ParsedSql) -> ReadRequirement {
     match parsed {
         ParsedSql::Statement(s) => classify_statement(s),
         ParsedSql::LockingSelect(_) => SelectForUpdate,
+        // Issue #2059: 包んだ `EXPLAIN` は中身と同じ検査を受ける（形式の違いで権限を緩めない）。
+        ParsedSql::ExplainJson(inner) => classify(inner),
         ParsedSql::Cursor(c) => match c {
             CursorStatement::Declare { .. } => Select,
             // FETCH／CLOSE は DECLARE の時点で確定した結果を読むだけで、再検査しない（`sql-cursor.md` §1）。
