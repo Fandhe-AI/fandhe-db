@@ -14,6 +14,7 @@
 use crate::sql::allowlist::CteExplainSource;
 use crate::sql::explain_tree::{present, ExplainNode, ExplainTreeError};
 use crate::sql::set_op::AggregateShape;
+use crate::sql::subquery::explain_sink::CorrelationShape;
 
 /// 部分クエリの種別。出力の `subquery_kind` 行の閉じた語彙に写る。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +59,8 @@ pub(crate) enum InnerStageSpec {
 pub(crate) struct SubqueryStageSpec {
     pub(crate) kind: SubqueryKind,
     pub(crate) inner: InnerStageSpec,
+    /// 相関部分クエリのときだけ `Some`（Issue #2977。キーの数と残余の有無だけを持つ）。
+    pub(crate) correlated: Option<CorrelationShape>,
     pub(crate) children: Vec<SubqueryStageSpec>,
 }
 
@@ -68,15 +71,21 @@ fn subquery_node(spec: SubqueryStageSpec) -> Result<ExplainNode, ExplainTreeErro
     let SubqueryStageSpec {
         kind,
         inner,
+        correlated,
         children,
     } = spec;
-    let mut node = ExplainNode::try_stage(
-        "subquery".to_string(),
-        vec![
-            format!("subquery_kind: {}", kind.token()),
-            "correlated: false".to_string(),
-        ],
-    )?;
+    // 相関のときだけ、相関キーの数と残余述語の有無（ハッシュ半結合か行ごとの再評価かの静的判定）を足す。
+    // 列名・値は出さない（SQL-75 (5)）。非相関の出力は従来とバイト単位で同一。
+    let mut head = vec![format!("subquery_kind: {}", kind.token())];
+    match correlated {
+        None => head.push("correlated: false".to_string()),
+        Some(shape) => {
+            head.push("correlated: true".to_string());
+            head.push(format!("correlation_keys: {}", shape.keys));
+            head.push(format!("correlated_residual: {}", present(shape.residual)));
+        }
+    }
+    let mut node = ExplainNode::try_stage("subquery".to_string(), head)?;
     let (aggregate, lines) = match inner {
         InnerStageSpec::Scan { lines } => (None, lines),
         InnerStageSpec::Aggregate { shape, lines } => (Some(shape), lines),
@@ -136,12 +145,17 @@ pub(crate) fn cte_inline_tree(
     source: CteExplainSource,
     shape: &CteMainShape,
     scan_lines: Vec<String>,
+    subqueries: Vec<SubqueryStageSpec>,
 ) -> Result<ExplainNode, ExplainTreeError> {
     let source_token = match source {
         CteExplainSource::With => "with",
         CteExplainSource::DerivedTable => "derived_table",
     };
     let mut current = ExplainNode::try_stage("scan".to_string(), scan_lines)?;
+    // 内側の WHERE の部分クエリ（Issue #2977）は畳み込み後の `scan` の子に出現順で並べる。
+    for spec in subqueries {
+        current.push_child(subquery_node(spec)?)?;
+    }
     if let Some(agg) = &shape.aggregate {
         let mut node = aggregate_node(agg)?;
         node.push_child(current)?;
@@ -198,6 +212,7 @@ mod tests {
             inner: InnerStageSpec::Scan {
                 lines: lines(&["a: 1"]),
             },
+            correlated: None,
             children: Vec::new(),
         };
         let outer = SubqueryStageSpec {
@@ -205,6 +220,7 @@ mod tests {
             inner: InnerStageSpec::Scan {
                 lines: lines(&["b: 2"]),
             },
+            correlated: None,
             children: vec![inner],
         };
         let out = with_subqueries(lines(&["root: 0"]), vec![outer])
@@ -229,6 +245,37 @@ mod tests {
     }
 
     #[test]
+    fn correlated_subquery_reports_key_count_and_residual() {
+        let spec = SubqueryStageSpec {
+            kind: SubqueryKind::Exists,
+            inner: InnerStageSpec::Scan {
+                lines: lines(&["a: 1"]),
+            },
+            correlated: Some(CorrelationShape {
+                keys: 2,
+                residual: true,
+            }),
+            children: Vec::new(),
+        };
+        let out = with_subqueries(lines(&["root: 0"]), vec![spec])
+            .unwrap()
+            .into_lines();
+        assert_eq!(
+            out,
+            lines(&[
+                "root: 0",
+                "-> subquery",
+                "   subquery_kind: exists",
+                "   correlated: true",
+                "   correlation_keys: 2",
+                "   correlated_residual: present",
+                "  -> scan",
+                "     a: 1",
+            ])
+        );
+    }
+
+    #[test]
     fn inline_cte_stacks_limit_sort_scan() {
         let shape = CteMainShape {
             has_limit: true,
@@ -236,7 +283,7 @@ mod tests {
             sort_keys: 2,
             aggregate: None,
         };
-        let out = cte_inline_tree(CteExplainSource::With, &shape, lines(&["x: 1"]))
+        let out = cte_inline_tree(CteExplainSource::With, &shape, lines(&["x: 1"]), Vec::new())
             .unwrap()
             .into_lines();
         assert_eq!(

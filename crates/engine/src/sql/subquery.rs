@@ -1114,9 +1114,10 @@ fn static_validate_subquery_predicates(
             } => {
                 // 相関 `IN`（Issue #1844）は実行経路と同じ準備（静的検査・分解・残余の束縛）と
                 // 内側だけの連言の静的検証・束縛まで行う（実行はしない）。
-                explain_sink::set_in_kind();
+                let negated = explain_sink::set_in_kind();
                 if static_validate_correlated_in(
                     column,
+                    negated,
                     inner_tokens,
                     *depth,
                     chain,
@@ -1126,7 +1127,6 @@ fn static_validate_subquery_predicates(
                     nesting_limits,
                     result_limits,
                 )? {
-                    explain_sink::mark_correlated();
                     continue;
                 }
                 // [`resolve_in_subquery`] と同じ順序（内側 → 投影列数 → 対象列 → 値族）で検証する。
@@ -1187,7 +1187,6 @@ fn static_validate_subquery_predicates(
                     nesting_limits,
                     result_limits,
                 )? {
-                    explain_sink::mark_correlated();
                     continue;
                 }
                 // [`resolve_scalar_compare`] と同じ順序（内側 → 投影列数 → 対象列 → 値族）。
@@ -4076,6 +4075,7 @@ fn resolve_in_predicate(
 #[allow(clippy::too_many_arguments)]
 fn static_validate_correlated_in(
     column: &str,
+    negated: bool,
     inner_tokens: &[Token],
     depth: usize,
     outer_scopes: &[&TableSchema],
@@ -4096,13 +4096,15 @@ fn static_validate_correlated_in(
     else {
         return Ok(false);
     };
+    // 相関の内側の入れ子の部分クエリが親（この相関部分クエリ）に付くよう、自分のフレームを開く。
+    explain_sink::enter();
     let mut prepared = prepare_correlated_exists(
         validated,
         &inner_schema,
         &correlation,
         &CorrelatedShape::In {
             target_column: column,
-            negated: false,
+            negated,
         },
         outer_scopes,
         udfs,
@@ -4129,6 +4131,7 @@ fn static_validate_correlated_in(
         &[],
         &result_limits,
     )?;
+    finish_correlated_scan_frame(&prepared, &inner_schema, udfs, result_limits)?;
     Ok(true)
 }
 
@@ -4154,7 +4157,7 @@ fn static_validate_exists(
         lookup,
         nesting_limits,
     )? {
-        explain_sink::mark_correlated();
+        explain_sink::enter();
         let mut prepared = prepare_correlated_exists(
             validated,
             &inner_schema,
@@ -4185,6 +4188,7 @@ fn static_validate_exists(
             &[],
             &result_limits,
         )?;
+        finish_correlated_scan_frame(&prepared, &inner_schema, udfs, result_limits)?;
         return Ok(());
     }
     static_validate_inner_query(
@@ -5175,6 +5179,7 @@ fn static_validate_correlated_scalar(
         else {
             return Ok(false);
         };
+        explain_sink::enter();
         let mut prepared = prepare_correlated_exists(
             validated,
             &inner_schema,
@@ -5213,8 +5218,10 @@ fn static_validate_correlated_scalar(
             })?;
         let (_, target_family) = scalar_target_column(column, outer_scopes)?;
         check_scalar_family_compatible(column, meta, target_family)?;
+        finish_correlated_scan_frame(&prepared, &inner_schema, udfs, result_limits)?;
         return Ok(true);
     };
+    explain_sink::enter();
     let prepared =
         prepare_correlated_scalar_aggregate(validated, &inner_schema, &correlation, outer_scopes)?;
     let mut chain: Vec<&TableSchema> = outer_scopes.to_vec();
@@ -5236,7 +5243,50 @@ fn static_validate_correlated_scalar(
     )?;
     let (_, target_family) = scalar_target_column(column, outer_scopes)?;
     check_scalar_family_compatible(column, &bound.meta, target_family)?;
+    // 表示は実行の書き換え（相関キーの `GROUP BY` 集計）の形。`group_keys` は相関キーの数になる。
+    // 実行器はキャッシュ・索引を使わない固定分類で走査するため、分類は集計の固定行を使う。
+    if explain_sink::is_active() {
+        explain_sink::leave_correlated(
+            Some(explain_sink::ExplainInner::Aggregate {
+                shape: super::set_op::aggregate_shape(&bound.grouped),
+            }),
+            explain_sink::CorrelationShape {
+                keys: prepared.keys.len(),
+                residual: false,
+            },
+        );
+    }
     Ok(true)
+}
+
+/// 相関の `EXISTS`／`IN`／非集計スカラーの静的検証の末尾で、`EXPLAIN` 用に開いたフレームを閉じる。
+/// 表示する内側は、部分クエリを含む述語を保守的に「索引に使えないフィルタ」へ置き換えて束縛した走査
+/// （非相関の内側と同じ分類。実行器の準備が内側を `execute_scan_with_budget` で走らせる形と揃える）。
+/// 相関キーと残余は件数と有無だけを持つ（SQL-75 (5): 列名・値は出さない）。収集していないときは何もしない。
+fn finish_correlated_scan_frame(
+    prepared: &PreparedCorrelated,
+    inner_schema: &TableSchema,
+    udfs: &UdfRegistry,
+    result_limits: crate::result_limits::ResultLimits,
+) -> Result<(), SqlSurfaceError> {
+    if !explain_sink::is_active() {
+        return Ok(());
+    }
+    let mut shown = prepared.validated.clone();
+    shown.where_predicates = explain_outer_predicates(&prepared.analysis.inner_only);
+    let bound =
+        super::parser::bind_scan_with_dummy_flags(&shown, inner_schema, udfs, &[], &result_limits)?;
+    explain_sink::leave_correlated(
+        Some(explain_sink::ExplainInner::Scan {
+            schema: inner_schema.clone(),
+            bound,
+        }),
+        explain_sink::CorrelationShape {
+            keys: prepared.analysis.keys.len(),
+            residual: !prepared.analysis.residual.is_empty(),
+        },
+    );
+    Ok(())
 }
 
 /// 投影位置の相関スカラー 1 項目の値表。外側の行ごとに、隠し列（疑似列 `id` は行の `id`）から
@@ -5486,10 +5536,21 @@ pub(crate) mod explain_sink {
         },
     }
 
+    /// 相関部分クエリの静的な形（件数と有無だけ。値・列名は持たない。SQL-75 (5)）。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct CorrelationShape {
+        /// 等価の相関キーの組の数。
+        pub(crate) keys: usize,
+        /// 等価で表せない残余述語があるか（行ごとの再評価が要るか）。
+        pub(crate) residual: bool,
+    }
+
     /// 部分クエリ 1 件分の収集結果。`children` は内側の WHERE にある入れ子の部分クエリ。
+    /// `correlated` は相関部分クエリのときだけ `Some`。
     pub(crate) struct SubqueryExplain {
         pub(crate) kind: SubqueryKind,
         pub(crate) inner: ExplainInner,
+        pub(crate) correlated: Option<CorrelationShape>,
         pub(crate) children: Vec<SubqueryExplain>,
     }
 
@@ -5502,7 +5563,6 @@ pub(crate) mod explain_sink {
         frames: Vec<Frame>,
         pending: Option<SubqueryKind>,
         negate_in: bool,
-        correlated: bool,
     }
 
     thread_local! {
@@ -5529,20 +5589,18 @@ pub(crate) mod explain_sink {
     }
 
     /// `IN`／`NOT IN` の種別を宣言する（`negate_next` の宣言を消費する）。
-    pub(crate) fn set_in_kind() {
+    /// `NOT IN` なら `true` を返す（収集していないときは常に `false`）。
+    pub(crate) fn set_in_kind() -> bool {
         with_state(|s| {
-            let kind = if std::mem::take(&mut s.negate_in) {
+            let negated = std::mem::take(&mut s.negate_in);
+            s.pending = Some(if negated {
                 SubqueryKind::NotIn
             } else {
                 SubqueryKind::In
-            };
-            s.pending = Some(kind);
-        });
-    }
-
-    /// 相関部分クエリに到達したことを記録する（収集の終了時に `42601` にする）。
-    pub(crate) fn mark_correlated() {
-        with_state(|s| s.correlated = true);
+            });
+            negated
+        })
+        .unwrap_or(false)
     }
 
     /// 内側クエリの検証開始。宣言済みの種別でフレームを開く。
@@ -5558,6 +5616,16 @@ pub(crate) mod explain_sink {
 
     /// 内側クエリの検証成功。フレームを閉じ、種別が宣言されていれば親のフレームへ登録する。
     pub(crate) fn leave(inner: Option<ExplainInner>) {
+        leave_with(inner, None);
+    }
+
+    /// 相関部分クエリのフレームを閉じる。相関の静的検証は `static_validate_inner_query` を通らないため、
+    /// 自分で `enter` したフレーム（内側の入れ子の部分クエリの親）をここで閉じる。
+    pub(crate) fn leave_correlated(inner: Option<ExplainInner>, shape: CorrelationShape) {
+        leave_with(inner, Some(shape));
+    }
+
+    fn leave_with(inner: Option<ExplainInner>, correlated: Option<CorrelationShape>) {
         with_state(|s| {
             let Some(frame) = s.frames.pop() else {
                 return;
@@ -5568,6 +5636,7 @@ pub(crate) mod explain_sink {
                 parent.items.push(SubqueryExplain {
                     kind,
                     inner,
+                    correlated,
                     children: frame.items,
                 });
             }
@@ -5587,14 +5656,13 @@ pub(crate) mod explain_sink {
                 }],
                 pending: None,
                 negate_in: false,
-                correlated: false,
             });
         });
         Guard
     }
 
     impl Guard {
-        /// 収集結果を取り出す。相関部分クエリに到達していた場合は `42601`（固定文）。
+        /// 収集結果を取り出す。フレームの不均衡は `Internal`。
         pub(crate) fn finish(self) -> Result<Vec<SubqueryExplain>, SqlSurfaceError> {
             let state = SINK.with(|c| c.borrow_mut().take());
             let Some(mut state) = state else {
@@ -5602,11 +5670,6 @@ pub(crate) mod explain_sink {
                     detail: "EXPLAIN subquery collection state missing".to_string(),
                 });
             };
-            if state.correlated {
-                return Err(SqlSurfaceError::unsupported(
-                    "EXPLAIN is not supported for correlated subqueries",
-                ));
-            }
             match (state.frames.pop(), state.frames.is_empty()) {
                 (Some(root), true) => Ok(root.items),
                 _ => Err(SqlSurfaceError::Internal {
