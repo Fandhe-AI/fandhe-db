@@ -3,6 +3,7 @@
 - Issue: #876（親 #861・ルート未指定。前提 #864〜#867・#869・#870・#875）
 - 対象タスク: TASK-178・TASK-186
 - 対象ビヘイビア: NOSQL-6・NOSQL-12（関連: SQL-17・SQL-18・RECOVER-1・RECOVER-10・TABLE-12・RLS-9）
+- 関連 doc: [conditional-update-existence-hiding.md](conditional-update-existence-hiding.md)（Issue #2097）
 - ステータス: Implemented（`where` 単一行形・`filter` 述語形の両方。述語形は Issue #1062 で実行結線）
 
 ## 背景
