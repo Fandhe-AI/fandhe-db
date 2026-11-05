@@ -44,13 +44,13 @@ Issue が実在するものだけに付ける（確認できなければ【持�
 | 実行計画 | 実行計画を返す仕組みは公式ドキュメントの該当ページを取得できず確認できず | 公式ドキュメントで確認できず | 公式ドキュメントで確認できず | 【持つ】`search`・`scan`・`aggregate` の `explain: true`。本体を実行せず SQL の `EXPLAIN` と同一内容の `QUERY PLAN` を返す（`nosql10_explain.rs` の `explain_true_matches_sql_explain_rows_with_filter`・`aggregate_and_scan_explain_true_match_sql_explain_rows`） |
 | 集約・GROUP BY | 集約関数 `avg`・`count`・`max`・`min`・`sum`。既定は無効で、設定 `db-aggregates-enabled` で有効化 | `_bulk` の対象外 | 公式ドキュメントで確認できず（`find` の詳細ページを取得できず） | 【持つ】`aggregate` op（`count`・`sum`・`avg`・`min`・`max`、`group_by` 1〜8 列、`having`、`sort`、`offset`）。既定で使える（`nosql4_aggregate.rs`・`nosql5_group_by.rs`・`nosql4_5_aggregate_wire_parity.rs`） |
 | 書き込みの可視化 | 公式ドキュメントで確認できず | `refresh` に `true`（影響シャードを更新）・`wait_for`・`false`（既定）を指定 | 公式ドキュメントで確認できず | 【持たない】`refresh` 相当の指定は無い。成功応答の時点で書き込みは確定済み（応答の組み立て失敗時も確定済みとして緊急応答を返す。`nosql-api.md` 参照） |
-| トランザクション | `Prefer: tx=rollback` は設定 `db-tx-end` が有効なときだけ。要求をまたぐ Tx は無い | 公式ドキュメントで確認できず | `startTransaction()`・`commitTransaction()`（例では `commit()`）・`rollbackTransaction()`（例では `rollback()`）、savepoint の節あり | 【持たない】op 語彙に明示トランザクション制御が無い。1 要求 = 1 原子実行。`25000`・`3B001` は NoSQL から到達不能（`nosql-api.md` の `wire_code` 表）。明示 Tx は SQL 表層で使う |
+| トランザクション | `Prefer: tx=rollback` は設定 `db-tx-end` が有効なときだけ。要求をまたぐ Tx は無い | 公式ドキュメントで確認できず | `startTransaction()`・`commitTransaction()`（例では `commit()`）・`rollbackTransaction()`（例では `rollback()`）、savepoint の節あり | 【持たない】op 語彙に明示トランザクション制御が無い。通常モードの書き込みは 1 要求 = 1 原子実行（`update`／`delete` の `mode: "partitioned"` は除く。後述）。`25000`・`3B001` は NoSQL から到達不能（`nosql-api.md` の `wire_code` 表）。明示 Tx は SQL 表層で使う |
 | 認証・認可 | JWT の `role` クレーム、未送信時は匿名ロール | 公式ドキュメントの該当ページで確認できず | セッション認証（接続時） | 【持つ】`POST /v1/session` で Bearer を発行。TTL は 3600 秒固定でスライドせず、`POST /v1/session/close` で失効。`scope`（`ops`・`tables`・`read_only`）で権限を狭められ、広げる手段は無い。スコープ外は `42501`（`http15_session_scope.rs` の `scope_only_narrows_and_never_widens_permissions`・`widening_scope_in_body_never_turns_42501_into_success`。HTTP-15） |
 | 冪等再送 | 公式ドキュメントで確認できず | 公式ドキュメントで確認できず | 公式ドキュメントで確認できず | 【持つ】本文の `operation_id` または `Idempotency-Key` ヘッダ。同内容の再送は `23505`、内容違いは `22023`（`http14_idempotency_key.rs` の `header_path_reaches_the_same_ledger_as_body`。HTTP-14）。詳細は [idempotent-resend-comparison.md](idempotent-resend-comparison.md) |
 | 機械可読なスキーマ | ルートパスで OpenAPI を自動配信。既定では JWT の role の権限を反映 | 公式ドキュメントで確認できず | 該当なし（HTTP ではない） | 【持つ】`GET /v1/openapi.json`（Bearer 必須）。ゴールデン `crates/wire-server/docs/openapi.json` との一致を検査（`nosql20_openapi_golden.rs` の `nosql20_openapi_golden_matches_generator`・`nosql20_openapi_endpoint.rs`。NOSQL-20） |
 | DDL | 公式ドキュメントで確認できず（表は DB 側で作る前提） | 索引作成は `_bulk` の対象外 | `createCollection` と索引の節（Indexing Collections）あり | 【持つ】`create_table`・`alter_table`・`drop_table` と `create_index`・`drop_index`。実行できるのは `--ddl-allowed-users` に列挙したユーザーのみ（`nosql13_ddl.rs`・`nosql19_index_ddl.rs`） |
 | 全件 DML の誤爆防止 | 公式ドキュメントの該当ページでは既定の挙動を確認できず（全表操作の遮断は別節の設定として参照されている） | 該当なし | 公式ドキュメントで確認できず | 【持つ】`update`・`delete` は `where` か `filter` が必須で、無ければ `42601`（`dml_target.rs`。`nosql18_conditional_dml.rs` の `condition_alone_without_target_is_rejected_with_42601`） |
-| テナント境界・エラー契約 | DB の RLS・ロールに委ねる | 該当なし | 該当なし | 【持つ】RLS 相当のテナント分離と `wire_code` を SQL 表層と共有。他テナントの存在・件数は応答に出ない（`rls13_nosql_policy_nonleak.rs`・`nosql21_upsert.rs` の `rls9_foreign_collisions_do_not_change_response_or_foreign_rows`） |
+| テナント境界・エラー契約 | DB の RLS・ロールに委ねる | 該当なし | 該当なし | 【持つ】RLS 相当のテナント分離と `wire_code` を SQL 表層と共有。不可視の他テナントの行の存在・件数は、対象操作（`search`・`scan`・書き込み・`if` の不一致応答）の応答に出ない。ただし従来方式の表では他テナントの Public 行は可視で、`scan` の `rows` とページ位置に含まれる（`nosql23_scan_keyset_rls_concurrency.rs` の `legacy_table_cross_tenant_public_rows_page_without_gaps_or_private_leak`）。Private 行は出ない（`rls13_nosql_policy_nonleak.rs`・`nosql21_upsert.rs` の `rls9_foreign_collisions_do_not_change_response_or_foreign_rows`） |
 
 ## 書き分け
 
@@ -73,7 +73,7 @@ Issue が実在するものだけに付ける（確認できなければ【持�
 
 ### bulk の項目別結果
 
-fandhe の書き込み文は 1 文 = 1 台帳エントリで、全か無かで適用する。`operation_id` の再送では、内容が一致すれば `23505`、
+fandhe の通常モードの書き込み文は 1 文 = 1 台帳エントリで、全か無かで適用する。`operation_id` の再送では、内容が一致すれば `23505`、
 内容が違えば `22023` を返す契約である。項目別の部分成功を認めると、再送時の「適用済み」の判定と、内容照合ハッシュの単位が
 崩れる。このため `rows` は 1 つの原子的な文として扱い、失敗は文全体の拒否として返す。
 根拠は [multi-row-dml-operation-id.md](multi-row-dml-operation-id.md) の実行時の順序・原子性の節と、
@@ -81,8 +81,13 @@ fandhe の書き込み文は 1 文 = 1 台帳エントリで、全か無かで�
 
 ### 要求をまたぐ明示トランザクション
 
-HTTP 表層は 1 要求 = 1 原子実行で、トークンに Tx 状態を持たせない。未対応の形は黙って受理せず、op 語彙外として
+HTTP 表層の通常モードは 1 要求 = 1 原子実行で、トークンに Tx 状態を持たせない。未対応の形は黙って受理せず、op 語彙外として
 fail-closed（`42601` 等）で拒否する。トランザクション制御が要る場合は SQL 表層を使う。
+
+例外は `update`／`delete` の `mode: "partitioned"`（分割実行）である。チャンクごとに別々に commit するため、1 チャンク以上
+commit した後に止まると、commit 済みの変更は残ったまま `409`・`VD001` を返す（全体の巻き戻しではない）。取り消し済みの
+ジョブへの再送などは `VD002` である。同じ `operation_id` での再送で再開できる。失敗応答を全件ロールバックと読まないこと。
+契約は `nosql-api.md` の分割実行の節と [partitioned-dml-comparison.md](partitioned-dml-comparison.md) を参照。
 
 ## 参照
 
