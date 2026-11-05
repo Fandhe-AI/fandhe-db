@@ -316,6 +316,36 @@ impl<'a> Validated<'a> {
         }
     }
 
+    /// キーの有無と `null` を区別する文字列アクセサ（Issue #2094。`scan` の
+    /// `after` 用）。キー省略は `None`、`null` は `Some(None)`、文字列は
+    /// `Some(Some(s))`。`nullable` でないキー・文字列型でないキーは `Err`。
+    pub fn optional_nullable_str(
+        &self,
+        key: &'static str,
+    ) -> Result<Option<Option<&'a str>>, SchemaError> {
+        let Some(spec) = self.field_spec(key) else {
+            return Err(SchemaError::UnknownKey);
+        };
+        if !matches!(spec.ty, FieldType::String) {
+            return Err(SchemaError::TypeMismatch { key });
+        }
+        match self.map.get(key) {
+            None => Ok(None),
+            Some(JsonValue::Null) if spec.nullable => Ok(Some(None)),
+            Some(JsonValue::String(s)) => Ok(Some(Some(s.as_str()))),
+            _ => Err(SchemaError::TypeMismatch { key }),
+        }
+    }
+
+    /// スキーマ宣言済みキーが要求に存在するか（値が `null` でも真）。
+    /// 宣言外のキーは `Err`（Issue #2094。`after` と `offset` の併用判定用）。
+    pub fn has_key(&self, key: &'static str) -> Result<bool, SchemaError> {
+        if self.field_spec(key).is_none() {
+            return Err(SchemaError::UnknownKey);
+        }
+        Ok(self.map.contains_key(key))
+    }
+
     pub fn required_number(&self, key: &'static str) -> Result<f64, SchemaError> {
         self.optional_number(key)?
             .ok_or(SchemaError::MissingRequired { key })
@@ -801,6 +831,15 @@ pub static SCAN_SCHEMA: ObjectSchema = ObjectSchema {
             presence: Presence::Optional,
             ty: FieldType::Array(ElementType::Object(&SORT_ITEM_SCHEMA)),
             nullable: false,
+        },
+        // キーセットページング（Issue #2094・NOSQL-23）。キーの存在がキーセット
+        // モードの opt-in で、`null` は 1 ページ目、文字列は前ページの
+        // `next_cursor`。復号・照合は [`super::cursor`]／[`super::scan`] が担う。
+        FieldSpec {
+            key: "after",
+            presence: Presence::Optional,
+            ty: FieldType::String,
+            nullable: true,
         },
     ],
 };
@@ -2614,5 +2653,47 @@ mod tests {
                 .unwrap_err(),
             SchemaError::UnknownKey
         );
+    }
+
+    // --- scan の after（Issue #2094・NOSQL-23） -------------------------
+
+    #[test]
+    fn scan_after_accepts_omitted_null_and_string() {
+        let base = r#""op":"scan","table":"t","limit":2"#;
+        let v = obj(&format!("{{{base}}}"));
+        let c = SCAN_SCHEMA.validate(&v).expect("ok");
+        assert_eq!(c.optional_nullable_str("after").expect("ok"), None);
+        assert!(!c.has_key("after").expect("ok"));
+        let v = obj(&format!("{{{base},\"after\":null}}"));
+        let c = SCAN_SCHEMA.validate(&v).expect("ok");
+        assert_eq!(c.optional_nullable_str("after").expect("ok"), Some(None));
+        assert!(c.has_key("after").expect("ok"));
+        let v = obj(&format!("{{{base},\"after\":\"abc\"}}"));
+        let c = SCAN_SCHEMA.validate(&v).expect("ok");
+        assert_eq!(
+            c.optional_nullable_str("after").expect("ok"),
+            Some(Some("abc"))
+        );
+    }
+
+    #[test]
+    fn scan_after_rejects_non_string_types() {
+        for bad in ["1", "true", "[]", "{}"] {
+            let v = obj(&format!(
+                r#"{{"op":"scan","table":"t","limit":2,"after":{bad}}}"#
+            ));
+            assert_eq!(
+                SCAN_SCHEMA.validate(&v).unwrap_err(),
+                SchemaError::TypeMismatch { key: "after" }
+            );
+        }
+    }
+
+    #[test]
+    fn after_is_unknown_key_for_search_and_aggregate() {
+        assert!(SEARCH_SCHEMA.fields.iter().all(|f| f.key != "after"));
+        assert!(AGGREGATE_SCHEMA.fields.iter().all(|f| f.key != "after"));
+        let v = obj(r#"{"op":"aggregate","table":"t","aggregates":[],"after":null}"#);
+        assert!(AGGREGATE_SCHEMA.validate(&v).is_err());
     }
 }

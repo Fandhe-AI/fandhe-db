@@ -11,6 +11,9 @@
 
 - `GET /v1/openapi.json` で OpenAPI 3.1 文書を配信するようにした（Issue #2244・NOSQL-20 (3) ポインタ）。有効な Bearer を必須とし、欠落・不正・期限切れ・close 済みは `28000`（401）。本文はビルド時に埋め込んだ静的文書で、主体・テナントによらずバイト同一。`Content-Length` は省略または `0` のみで、本文あり・このパス以外への `GET`・このパスへの `GET` 以外は認証前に `08P01`。応答に `Cache-Control: no-store` を付ける。
   BREAKING CHANGE: 公開 enum `http::request::Method` に `Get` を追加した（網羅的 `match` の下流は追随が必要）。
+- wire-server の公開関数 `http::query::gate::handle` に引数 `cursor_key: Option<&KeysetSealKey>`（`engine` の次、`now_wall` の前）を追加し、公開構造体 `http::session::store::SessionGrant` にフィールド `user: Option<String>` を追加した（Issue #2094・NOSQL-23 ポインタ）。`scan` のカーソルを認証ユーザーへ束縛するため。
+  BREAKING CHANGE: `gate::handle` の引数と `SessionGrant` のフィールドが増えた（呼び出し・構築している下流は追随が必要）。
+  BREAKING CHANGE: 公開モジュール `http::query::scan` も変わった。`execute` は引数 `cursor_key: Option<&KeysetSealKey>` が増え、戻り値が `QueryResult` から `ScanOutcome` になった（従来の結果は `outcome.result` から取る。カーソルは `outcome.next_cursor`）。`explain`・`handle`・`handle_explain` にも同じ `cursor_key` 引数が増えた（`handle` は `now_wall` の前）。公開 enum `ScanError` に variant `CursorWithOffset`・`InvalidCursor`・`CursorUnavailable` を追加した（網羅的 `match` の下流は追随が必要）。非キーセットの呼び出しは `cursor_key` に `None` を渡せば従来と同じ挙動になる。
 - セッションのスコープを `POST /v1/query` の要求ごとに強制するようにした（Issue #2101・HTTP-15・ERR-4 ポインタ）。スコープ外の op・表・`read_only` 違反は実行前に固定文言の `42501`（HTTP 403）で拒否し、副作用はない。スコープ外の表は存在の有無に依らず同一応答で、スコープ内の存在しない表はスコープなしと同じ `42P01`。`POST /v1/session` のスコープ付き発行は `0A000` ではなく 200 でトークンを返す。
   BREAKING CHANGE: スコープ付きの `POST /v1/session` が `0A000` から成功に変わり、スコープ外の `POST /v1/query` が `42501` で拒否される。
 - NoSQL の `upsert` op を実行するようにした（Issue #2087・NOSQL-21・SQL-20・SQL-49 ポインタ）。SQL 表層の `INSERT ... ON CONFLICT` と同じ束縛関数・実行器を通り、応答は `{"upserted":n}`。従来の固定文言 `0A000` は返さない。`Idempotency-Key` ヘッダを `upsert` でも受け付ける。
@@ -29,6 +32,7 @@
 
 ### Added
 
+- NoSQL の `scan` に不透明カーソル `after`／`next_cursor` を追加した（Issue #2094・NOSQL-23・TASK-253 ポインタ）。`after`（文字列または `null`）を付けた要求だけがキーセットモードで、応答の `row_count` の後ろに `next_cursor`（最後のページは `null`）が付く。`offset` との併用は `42601`、改ざん・別ユーザー・別テナント・別 `sort`・別表・別サーバー鍵のカーソルは `22000`。`after` の無い要求は不変。封緘鍵はプロセス内だけで保持し、再起動で既発行カーソルは無効になる。
 - wire-server に `http::session::scope::ScopeViolation`・`SessionScope::check`・`http::query::op::Op::allowed_in_read_only` を追加した（Issue #2101・HTTP-15 ポインタ）。
 - wire-server に公開モジュール `http::query::openapi` を追加した（Issue #2104・NOSQL-20 ポインタ）。`OP_SCHEMAS` から OpenAPI 3.1 の要求本文スキーマ文書を生成する `document`／`render_pretty` を提供する（手元確認用に `examples/openapi_dump.rs` も追加）。
 
