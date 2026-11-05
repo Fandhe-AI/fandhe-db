@@ -874,6 +874,46 @@ SELECT id FROM items ORDER BY binary_quantize(embedding) <~> '01110001' LIMIT 60
 - **投影**: i8 を f32 へ広げた既存の `Cell::Vector` を再利用する（公開 enum `Cell` は増やさない）。f32 の Display が整数値を `1`・`-2` と出すため、テキスト出力は `[1,-2,3]`。結果予算は展開後（次元 × 4）で計上する。wire の型 OID は 25（text）で、バイナリ形式は対象外。
 - **fail-closed（対象外）**: `ALTER TABLE ADD COLUMN`（`0A000`）、`DROP COLUMN`（`42601`）、`ALTER COLUMN TYPE`（`42804`）、PK・UNIQUE・FK・索引・CHECK・DEFAULT、距離演算子・距離関数・CAST（`::int8vec`）・比較・ORDER BY・GROUP BY・DISTINCT・集計・集合演算、COPY、CTAS・マテリアライズドビュー・`INSERT ... SELECT`、`int8vec[]`。距離計算は兄弟 #2019 の担当。CAST・`INT8VEC '[..]'` 型付きリテラルほかは担当 Issue 未定。
 
+## Issue #2953 追記: INT8VEC 列への距離演算子と f32 比の誤差（TABLE-49 (1)(4)(5) ポインタ）
+
+`INT8VEC(N)` 列で `<->`（L2）・`<#>`（負の内積）・`<=>`（コサイン）の kNN が動く。距離は #2019 の `kernel::int8_*` で整数のまま厳密に求める（ISA によらず同じ結果）。
+
+- **方式**: INT8VEC 表への距離順 SELECT（`ORDER BY v <op> '[..]' [DESC] [LIMIT k] [OFFSET n]`）を、束縛の直前に式キー `ORDER BY` の広域取得（`Statement::Scan`）へ書き換える（`sql::int8vec_knn`。実行・Prepared Describe・EXPLAIN の 3 経路に同じフック）。RLS・行ポリシー（RLS-13）・WHERE・`LIMIT`/`OFFSET`・`LIMIT` 省略（暗黙上限 `54000`）・NULL と NaN の並びは既存の scan 経路が担う。距離は新しい `BoundExpr::Int8VecDistance` が行の INT8VEC 列から評価する。WHERE の距離比較（半径検索）と投影の距離列も同じ束縛を共有して動く。
+- **DISTANCE 段（arena）を採らない理由**: 検索 SELECT の DISTANCE 段は f32 の `VectorArena` を前提にし、アリーナキャッシュ・HNSW・スカラー索引マスク・遅延投影・precision の全分岐が f32 バッファに依存する。ここへ i8 行列を通すと `exec.rs` の広い範囲に手が入り、テナント境界を外れる経路を作る危険が大きい。このため `kernel::int8_top_k` は本経路からも呼ばれず未使用のまま残る（性能が必要になった時点の別 Issue）。行ごとに距離計算用の準備（確保）が走る点も同じ申し送り。
+- **結果の型**: 距離列は float8（wire の OID 701）。INT8VEC 列の投影は従来どおり OID 25（text）。
+- **ゼロノルム**: コサインは NaN（SQL-33 (3) と同じく昇順の末尾、`DESC` では先頭）。NULL 列の距離は NULL。
+- **fail-closed**: `<+>`（L1）は int8 の L1 カーネルが無く `0A000`（ORDER BY・投影・WHERE とも）。hybrid の関数形・`USING PLAN`・`USING MODE`・`HINT ORDER`・セッションの precision は `0A000`。クエリリテラルは整数でなければ `22P02`、範囲外 `22003`、次元不一致 `22000`、長さ超過 `54000`。投影の距離列のクエリが ORDER BY と違えば `0A000`。距離関数の形（`l2_distance` 等）と VECTOR・HALFVEC との混在は従来どおり拒否する。HNSW（TABLE-49 (3)）・GPU バッチは対象外。
+- **NoSQL `search`**: 対象外で `0A000` のまま（TABLE-49 (4)）。SQL では動くが NoSQL は動かさず、`tests/http_nosql/nosql2_search.rs` で固定する。距離種別キー `metric` は別 Issue（#2243）。
+- **VECTOR との非対称**: INT8VEC では `<->` の演算子形 kNN が動くが、VECTOR の `<->` の演算子形 kNN は従来どおり `0A000`（関数形 `l2_distance` は動く）。
+
+### f32 比の誤差の実測（TABLE-49 (5)）
+
+固定データは決定的な xorshift。テストは `crates/engine/tests/sql_named/sql_int8vec_distance.rs`（`m1_*`・`m2_*`）。
+
+**M1: 同じ整数値を持つ `vector` 表との比較**（Top-10 の id 列は全組で一致。誤差は VECTOR 側を参照とした投影距離の差）
+
+| dim | 演算子 | 最大絶対誤差 | 最大相対誤差 |
+| --- | --- | --- | --- |
+| 8 | L2・内積・コサイン | 0 | 0 |
+| 128 | L2・内積・コサイン | 0 | 0 |
+| 1536 | L2 | 8.06e-3 | 1.88e-6 |
+| 1536 | 内積・コサイン | 0 | 0 |
+| 1536（全要素 ±127、内積が奇数で 2^24 超の行を含む） | L2 | 0 | 0 |
+| 同上 | 内積 | 1 | 4.04e-8 |
+| 同上 | コサイン | 6.05e-8 | 0.75（距離が 0 に近く、絶対誤差は小さい） |
+
+INT8VEC 側は常に整数の厳密値（テスト内の i64 参照と完全一致）。VECTOR 側の差は f32 の累積の丸めで、内積が 2^24 を超えて奇数になる行で 1 ずれる。
+
+**M2: 量子化誤差**（n=500、d=64、クエリ 20 本。f32 を表全体で 1 つの対称スケール `round(x * 127 / max|x|)` で量子化し、元の f32 の f64 厳密走査を参照にする）
+
+| 演算子 | recall@10 平均 | recall@10 最小 | スケールを戻した距離の相対誤差（平均 / 最大） |
+| --- | --- | --- | --- |
+| L2 | 0.985 | 0.90 | 3.73e-4 / 1.92e-3 |
+| 内積 | 0.995 | 0.90 | 3.96e-2 / 66.7（内積が 0 に近い対で相対誤差が発散。絶対誤差で見る） |
+| コサイン | 0.990 | 0.90 | 5.57e-4 / 2.97e-3 |
+
+テストのアサーションは recall@10 平均 0.7 以上（実測から十分な余裕を引いた下限）。
+
 ## Issue #2025 追記: SPARSEVEC(N) 列（TABLE-47 (1)(2)(5) ポインタ）
 
 - **保存先**: スカラーペイロードに非ゼロ要素（位置・値）だけを位置昇順で保存し、embedding スロットは使わない。次元 N は 1〜1,000,000,000（疎表現のため密に展開せず、メモリ確保に直結しない）。BM25 の `sparse.rs` とは独立で、値型は新モジュール `sparse_vector.rs` に置く。

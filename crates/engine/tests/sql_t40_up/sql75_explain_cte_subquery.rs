@@ -3,7 +3,8 @@
 //!
 //! 文を実行せず、段の木（`cte`／`subquery`／`scan` ほか）で計画を返す。出力は閉じた語彙と項目数だけで、
 //! テナント・可視性・行数・CTE 名に依存しない。束縛エラーは実行したときと同じ `wire_code`。
-//! 未対応の形（再帰・具体化・JOIN／集合演算の入力・相関・値位置の部分クエリ等）は `42601`。
+//! 未対応の形（再帰・具体化・JOIN／集合演算の入力・値位置の部分クエリ等）は `42601`。
+//! 相関部分クエリは Issue #2977 で対応した（`sql75_explain_correlated_embedded`）。
 
 use engine::core::EngineCore;
 use engine::kernel::CpuScalarProvider;
@@ -383,9 +384,8 @@ fn unsupported_forms_stay_rejected_with_42601() {
         "EXPLAIN WITH w AS (SELECT k FROM a) SELECT w.k FROM w JOIN b ON w.k = b.k",
         "EXPLAIN SELECT t.k FROM (SELECT k FROM a) t JOIN b ON t.k = b.k",
         "EXPLAIN WITH w AS (SELECT k FROM b) SELECT k FROM w UNION SELECT k FROM a",
-        // 相関部分クエリ（黙って受理しない）。
-        "EXPLAIN SELECT k FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k)",
-        "EXPLAIN SELECT k FROM a WHERE k IN (SELECT k FROM b WHERE b.k = a.k)",
+        // 相関 ANY（実行も拒否する形。相関 EXISTS・IN は Issue #2977 で対応）。
+        "EXPLAIN SELECT k FROM a WHERE k = ANY (SELECT k FROM b WHERE b.k = a.k)",
         // 投影位置の値の部分クエリ。
         "EXPLAIN SELECT (SELECT max(k) FROM b) FROM a",
         // 集計の FILTER の部分クエリ。

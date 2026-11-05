@@ -192,6 +192,7 @@ pub(crate) mod function_scan;
 #[cfg(test)]
 mod identity_column_tests;
 pub(crate) mod insert_select;
+pub(crate) mod int8vec_knn;
 pub(crate) mod interval_arith;
 pub(crate) mod matview;
 pub mod record_text;

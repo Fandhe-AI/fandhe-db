@@ -27928,24 +27928,10 @@ fn explain_cte_target(
                 "EXPLAIN is not supported for queries with value subqueries",
             ));
         }
-        Statement::Scan(v)
-            if v.where_predicates
-                .iter()
-                .any(super::subquery::predicate_contains_subquery) =>
-        {
-            return Err(SqlSurfaceError::unsupported(
-                "EXPLAIN is not supported for a CTE or derived table with subqueries",
-            ));
-        }
         Statement::Scan(v) => CteExplainMain::Scan(v),
-        Statement::Aggregate(v)
-            if v.where_predicates
-                .iter()
-                .any(super::subquery::predicate_contains_subquery)
-                || super::subquery::aggregate_has_filter_subquery(&v) =>
-        {
+        Statement::Aggregate(v) if super::subquery::aggregate_has_filter_subquery(&v) => {
             return Err(SqlSurfaceError::unsupported(
-                "EXPLAIN is not supported for a CTE or derived table with subqueries",
+                "EXPLAIN is not supported for a CTE or derived table with subqueries in FILTER or HAVING",
             ));
         }
         Statement::Aggregate(v) => CteExplainMain::Aggregate(v),
@@ -28536,10 +28522,15 @@ fn validate_sql_tokens_impl(
             // 値としての部分クエリ・FILTER／HAVING の部分クエリ・ランキング検索の部分クエリは
             // 描画する段を持たないため下で明示的に `42601` にする（fail-closed）。
             let target = match validate_select_statement(rest, lookup, subquery_ctx, limits)? {
+                // Issue #2977: `USING PLAN(...)` つきの順位付き検索の部分クエリは、実行も LLM I/O の前に
+                // `42601` で拒否する形なので、EXPLAIN も同じコードで先に拒否する（fail-closed）。
+                // それ以外（HALFVEC の kNN は実行が Scan へ写して部分クエリを解決する。VECTOR の kNN・
+                // HYBRID は `core.rs` の束縛段が実行と同じ `42601` を返す）は `Search` の対象にする。
                 Statement::Select(v)
-                    if v.where_predicates()
-                        .iter()
-                        .any(super::subquery::predicate_contains_subquery) =>
+                    if v.using_plan().is_some()
+                        && v.where_predicates()
+                            .iter()
+                            .any(super::subquery::predicate_contains_subquery) =>
                 {
                     return Err(SqlSurfaceError::unsupported(
                         "EXPLAIN is not supported for ranked searches with subqueries",

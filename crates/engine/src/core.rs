@@ -7409,6 +7409,8 @@ impl EngineCore {
         let literal_skip = crate::sql::parser::LiteralSkip {
             order_by: crate::sql::params::order_by_distance_literal_is_param(&tokens),
             projection_mask: crate::sql::params::select_list_distance_param_mask(&tokens),
+            where_distance_mask: crate::sql::params::where_distance_param_mask(&tokens),
+            where_distance_order: crate::sql::params::where_distance_ast_order(&tokens),
         };
         // Issue #1342・#1546: 型推論（カタログとトークン列だけで決まる）を先に行い、
         // 確定した置換リテラル種別の型付きダミーで 1 回だけ構造検証 parse する。
@@ -10997,6 +10999,12 @@ impl EngineCore {
             }
             ParsedSql::Statement(Statement::Aggregate(validated)) => {
                 let schema = self.describe_table_schema(snap, validated.table_name())?;
+                // Issue #2953: INT8VEC の半径述語（`WHERE v <-> $1 < r`）の `$n` 由来仮値だけを置換する。
+                let validated = &crate::sql::int8vec_knn::int8vec_aggregate_placeholders(
+                    validated,
+                    &schema,
+                    skip_vector_literal_validation,
+                );
                 let bound = crate::sql::parser::bind_aggregate_with_dummy_flags(
                     validated,
                     &schema,
@@ -11009,6 +11017,13 @@ impl EngineCore {
             }
             ParsedSql::Statement(Statement::Scan(validated)) => {
                 let schema = self.describe_table_schema(snap, validated.table_name())?;
+                // Issue #2953: INT8VEC 列の半径検索（`WHERE v <-> $1 < r ORDER BY id` 等）の `$n` 由来
+                // ダミー値だけを有効なゼロベクトルへ置換して束縛する（実リテラルは Describe でも検証する）。
+                let validated = &crate::sql::int8vec_knn::int8vec_scan_placeholders(
+                    validated,
+                    &schema,
+                    skip_vector_literal_validation,
+                );
                 let bound = crate::sql::parser::bind_scan_with_dummy_flags(
                     validated,
                     &schema,
@@ -11164,6 +11179,25 @@ impl EngineCore {
                     snap
                 };
                 let schema = self.describe_table_schema(snap, &validated.table_name)?;
+                // TABLE-49・Issue #2953: 実行と同じく INT8VEC 列の kNN は広域取得へ書き換えて列メタを導出する
+                // （Describe 成功・Execute 失敗の食い違いを作らない）。`$n` 由来のダミーリテラルだけは
+                // 変換側が有効なゼロベクトルへ置換し、実リテラルは Describe でも検証する。
+                if let Some(scan) = crate::sql::int8vec_knn::int8vec_select_as_scan(
+                    validated,
+                    &schema,
+                    session.search_mode(),
+                    skip_vector_literal_validation,
+                    limits,
+                )? {
+                    let bound = crate::sql::parser::bind_scan_with_dummy_flags(
+                        &scan,
+                        &schema,
+                        session.udfs(),
+                        dummy_equality_flags,
+                        limits,
+                    )?;
+                    return Ok(Some(crate::sql::describe::scan_columns(&bound, &schema)?));
+                }
                 // HALFVEC 列の表の kNN は実行時と同じ scan 経路の列メタを返す（Issue #2015・TABLE-46）。
                 if let Some(scan) = crate::sql::halfvec_knn::halfvec_select_as_scan(
                     validated,
@@ -12022,6 +12056,25 @@ impl EngineCore {
         match stmt {
             crate::sql::allowlist::Statement::Select(validated) => {
                 let schema = table_schema_in(read_txn, &validated.table_name)?;
+                // TABLE-49・Issue #2953: INT8VEC 列への距離順 SELECT は f32 の DISTANCE 段を通さず、
+                // 式キー `ORDER BY` の広域取得へ書き換えて既存の scan 経路（RLS・行ポリシー・
+                // WHERE・LIMIT/OFFSET を担う）で実行する。対象外の形は `None` で従来経路へ進み、
+                // `parser::vector_column` が `0A000` で拒否する。
+                if let Some(scan) = crate::sql::int8vec_knn::int8vec_select_as_scan(
+                    &validated,
+                    &schema,
+                    session.search_mode(),
+                    &crate::sql::parser::LiteralSkip::NONE,
+                    &limits,
+                )? {
+                    return self.execute_read_statement_with_limits(
+                        ctx,
+                        session,
+                        crate::sql::allowlist::Statement::Scan(scan),
+                        read_txn,
+                        limits,
+                    );
+                }
                 // HALFVEC 列の表への距離演算子形 kNN は全走査ソートの scan 経路へ写す
                 // （Issue #2015・TABLE-46。arena は VECTOR 専用のため）。
                 // 宣言済みの HNSW（`<=>` かつ昇順・明示 LIMIT）は ANN 経路で束縛する
@@ -13958,6 +14011,19 @@ impl EngineCore {
                 )?,
             ));
         }
+        // TABLE-49・Issue #2953: INT8VEC 列の kNN は実行と同じく広域取得へ書き換わるため、EXPLAIN も
+        // scan の計画（`plain_scan`／`full_scan`）を報告する（実経路と矛盾する ANN 注記を出さない）。
+        if let Some(scan) = crate::sql::int8vec_knn::int8vec_select_as_scan(
+            validated,
+            &schema,
+            session.search_mode(),
+            &crate::sql::parser::LiteralSkip::NONE,
+            &self.result_limits,
+        )? {
+            // 未解決の `IN (SELECT ...)`／`EXISTS` を含む WHERE も実行と同じく通すため、
+            // 部分クエリ対応の共通ヘルパーへ委ねる（HALFVEC と同じ経路）。
+            return self.run_relational_explain_scan(&scan, session);
+        }
         // HALFVEC 列の kNN は実行時と同じ全走査ソートの scan 経路へ写し、EXPLAIN も同じ計画を返す
         // （通常文との束縛・エラー契約の共有。Issue #2015・TABLE-46）。
         if let Some(scan) = crate::sql::halfvec_knn::halfvec_select_as_scan(
@@ -14176,44 +14242,109 @@ impl EngineCore {
         session: &crate::sql::mode::SessionState,
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
         let (read_txn, schema) = self.read_txn_with_schema(validated.table_name())?;
-        // Issue #2048: WHERE に部分クエリがあれば、内側を実行せず静的検証して `subquery` 段を子に足す。
-        // 外側は部分クエリ述語を索引に使えないフィルタとみなして束縛・分類する（部分クエリが無い文の
-        // 出力は従来とバイト単位で同一）。
-        let has_subqueries = validated
-            .where_predicates()
-            .iter()
-            .any(crate::sql::subquery::predicate_contains_subquery);
-        let mut specs = Vec::new();
-        let mut owned;
-        let outer = if has_subqueries {
-            let items = crate::sql::subquery::explain_subquery_predicates(
-                validated.where_predicates(),
-                &schema,
-                &read_txn,
-                &self.storage,
-                session.udfs(),
-                self.nesting_limits,
-                self.result_limits,
-            )?;
-            specs = Self::subquery_specs(&read_txn, items)?;
-            // 部分クエリを含む `OR` の通常述語は表示用の置換で落ちるため、別に束縛だけ検証する
-            // （未知列等の `42703` を非 EXPLAIN の文と揃える。結果は捨てる）。
-            let mut check = validated.clone();
-            check.where_predicates =
-                crate::sql::subquery::static_validation_predicates(validated.where_predicates());
-            crate::sql::parser::bind_aggregate(&check, &schema, session.udfs())?;
-            owned = validated.clone();
-            owned.where_predicates =
-                crate::sql::subquery::explain_outer_predicates(validated.where_predicates());
-            &owned
-        } else {
-            validated
-        };
+        let (outer, specs) =
+            self.explain_aggregate_outer(validated, &schema, &read_txn, session)?;
+        let outer = &*outer;
         let bound = crate::sql::parser::bind_aggregate(outer, &schema, session.udfs())?;
         let lines = self.aggregate_explain_lines_from_bound(&read_txn, &schema, &bound);
         let node = crate::sql::cte_explain::with_subqueries(lines, specs)
             .map_err(Self::explain_tree_error)?;
         Ok(crate::sql::SqlOutcome::Explain(node.into_query_result()))
+    }
+
+    /// 単一表の広域取得の `EXPLAIN` が外側として束縛する文と、WHERE の部分クエリの `subquery` 段を作る
+    /// （Issue #2048・#2977）。部分クエリが無ければ文をそのまま返し、あれば内側を実行せず静的検証して
+    /// 外側を「部分クエリ述語を索引に使えないフィルタ」へ置き換えた文を返す。`run_relational_explain_scan`
+    /// と `run_cte_explain` の共有部で、第 2 の検証器を持たない。
+    fn explain_scan_outer<'a>(
+        &self,
+        validated: &'a crate::sql::allowlist::ValidatedScan,
+        schema: &crate::catalog::TableSchema,
+        read_txn: &redb::ReadTransaction,
+        session: &crate::sql::mode::SessionState,
+    ) -> Result<
+        (
+            std::borrow::Cow<'a, crate::sql::allowlist::ValidatedScan>,
+            Vec<crate::sql::cte_explain::SubqueryStageSpec>,
+        ),
+        crate::sql::allowlist::SqlSurfaceError,
+    > {
+        let has_subqueries = validated
+            .where_predicates()
+            .iter()
+            .any(crate::sql::subquery::predicate_contains_subquery);
+        if !has_subqueries {
+            return Ok((std::borrow::Cow::Borrowed(validated), Vec::new()));
+        }
+        let items = crate::sql::subquery::explain_subquery_predicates(
+            validated.where_predicates(),
+            schema,
+            read_txn,
+            &self.storage,
+            session.udfs(),
+            self.nesting_limits,
+            self.result_limits,
+        )?;
+        let specs = Self::subquery_specs(read_txn, items)?;
+        // 部分クエリを含む `OR` の通常述語は表示用の置換で落ちるため、別に束縛だけ検証する
+        // （未知列等の `42703` を非 EXPLAIN の文と揃える。結果は捨てる）。
+        let mut check = validated.clone();
+        check.where_predicates =
+            crate::sql::subquery::static_validation_predicates(validated.where_predicates());
+        crate::sql::parser::bind_scan_with_dummy_flags(
+            &check,
+            schema,
+            session.udfs(),
+            &[],
+            &self.result_limits,
+        )?;
+        let mut owned = validated.clone();
+        owned.where_predicates =
+            crate::sql::subquery::explain_outer_predicates(validated.where_predicates());
+        Ok((std::borrow::Cow::Owned(owned), specs))
+    }
+
+    /// [`Self::explain_scan_outer`] の集計版（Issue #2048・#2977）。
+    fn explain_aggregate_outer<'a>(
+        &self,
+        validated: &'a crate::sql::allowlist::ValidatedAggregate,
+        schema: &crate::catalog::TableSchema,
+        read_txn: &redb::ReadTransaction,
+        session: &crate::sql::mode::SessionState,
+    ) -> Result<
+        (
+            std::borrow::Cow<'a, crate::sql::allowlist::ValidatedAggregate>,
+            Vec<crate::sql::cte_explain::SubqueryStageSpec>,
+        ),
+        crate::sql::allowlist::SqlSurfaceError,
+    > {
+        let has_subqueries = validated
+            .where_predicates()
+            .iter()
+            .any(crate::sql::subquery::predicate_contains_subquery);
+        if !has_subqueries {
+            return Ok((std::borrow::Cow::Borrowed(validated), Vec::new()));
+        }
+        let items = crate::sql::subquery::explain_subquery_predicates(
+            validated.where_predicates(),
+            schema,
+            read_txn,
+            &self.storage,
+            session.udfs(),
+            self.nesting_limits,
+            self.result_limits,
+        )?;
+        let specs = Self::subquery_specs(read_txn, items)?;
+        // 部分クエリを含む `OR` の通常述語は表示用の置換で落ちるため、別に束縛だけ検証する
+        // （未知列等の `42703` を非 EXPLAIN の文と揃える。結果は捨てる）。
+        let mut check = validated.clone();
+        check.where_predicates =
+            crate::sql::subquery::static_validation_predicates(validated.where_predicates());
+        crate::sql::parser::bind_aggregate(&check, schema, session.udfs())?;
+        let mut owned = validated.clone();
+        owned.where_predicates =
+            crate::sql::subquery::explain_outer_predicates(validated.where_predicates());
+        Ok((std::borrow::Cow::Owned(owned), specs))
     }
 
     /// WHERE の部分クエリの収集結果（[`crate::sql::subquery::explain_sink::SubqueryExplain`]）を、
@@ -14249,6 +14380,7 @@ impl EngineCore {
                 Ok(SubqueryStageSpec {
                     kind: item.kind,
                     inner,
+                    correlated: item.correlated,
                     children: Self::subquery_specs(read_txn, item.children)?,
                 })
             })
@@ -14267,11 +14399,14 @@ impl EngineCore {
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
         use crate::sql::allowlist::CteExplainMain;
         use crate::sql::cte_explain::CteMainShape;
+        let subquery_specs;
         let (lines, shape) = match &validated.main {
             CteExplainMain::Scan(v) => {
                 let (read_txn, schema) = self.read_txn_with_schema(v.table_name())?;
+                let (outer, specs) = self.explain_scan_outer(v, &schema, &read_txn, session)?;
+                subquery_specs = specs;
                 let bound = crate::sql::parser::bind_scan_with_dummy_flags(
-                    v,
+                    &outer,
                     &schema,
                     session.udfs(),
                     &[],
@@ -14288,7 +14423,10 @@ impl EngineCore {
             }
             CteExplainMain::Aggregate(v) => {
                 let (read_txn, schema) = self.read_txn_with_schema(v.table_name())?;
-                let bound = crate::sql::parser::bind_aggregate(v, &schema, session.udfs())?;
+                let (outer, specs) =
+                    self.explain_aggregate_outer(v, &schema, &read_txn, session)?;
+                subquery_specs = specs;
+                let bound = crate::sql::parser::bind_aggregate(&outer, &schema, session.udfs())?;
                 let grouped = bound.group_by.as_ref();
                 let shape = CteMainShape {
                     has_limit: grouped.is_some_and(|g| g.limit.is_some()),
@@ -14302,8 +14440,13 @@ impl EngineCore {
                 )
             }
         };
-        let node = crate::sql::cte_explain::cte_inline_tree(validated.source, &shape, lines)
-            .map_err(Self::explain_tree_error)?;
+        let node = crate::sql::cte_explain::cte_inline_tree(
+            validated.source,
+            &shape,
+            lines,
+            subquery_specs,
+        )
+        .map_err(Self::explain_tree_error)?;
         Ok(crate::sql::SqlOutcome::Explain(node.into_query_result()))
     }
 
@@ -14445,45 +14588,8 @@ impl EngineCore {
         session: &crate::sql::mode::SessionState,
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
         let (read_txn, schema) = self.read_txn_with_schema(validated.table_name())?;
-        // Issue #2048: WHERE に部分クエリがあれば、内側を実行せず静的検証して `subquery` 段を子に足す。
-        // 外側は部分クエリ述語を索引に使えないフィルタとみなして束縛・分類する（部分クエリが無い文の
-        // 出力は従来とバイト単位で同一）。
-        let has_subqueries = validated
-            .where_predicates()
-            .iter()
-            .any(crate::sql::subquery::predicate_contains_subquery);
-        let mut specs = Vec::new();
-        let mut owned;
-        let outer = if has_subqueries {
-            let items = crate::sql::subquery::explain_subquery_predicates(
-                validated.where_predicates(),
-                &schema,
-                &read_txn,
-                &self.storage,
-                session.udfs(),
-                self.nesting_limits,
-                self.result_limits,
-            )?;
-            specs = Self::subquery_specs(&read_txn, items)?;
-            // 部分クエリを含む `OR` の通常述語は表示用の置換で落ちるため、別に束縛だけ検証する
-            // （未知列等の `42703` を非 EXPLAIN の文と揃える。結果は捨てる）。
-            let mut check = validated.clone();
-            check.where_predicates =
-                crate::sql::subquery::static_validation_predicates(validated.where_predicates());
-            crate::sql::parser::bind_scan_with_dummy_flags(
-                &check,
-                &schema,
-                session.udfs(),
-                &[],
-                &self.result_limits,
-            )?;
-            owned = validated.clone();
-            owned.where_predicates =
-                crate::sql::subquery::explain_outer_predicates(validated.where_predicates());
-            &owned
-        } else {
-            validated
-        };
+        let (outer, specs) = self.explain_scan_outer(validated, &schema, &read_txn, session)?;
+        let outer = &*outer;
         let bound = crate::sql::parser::bind_scan_with_dummy_flags(
             outer,
             &schema,

@@ -1778,7 +1778,9 @@ pub(crate) fn vector_column(schema: &TableSchema) -> Result<(usize, u32), SqlSur
                 .iter()
                 .any(|c| matches!(c.ty, ColumnType::Int8Vec(_)))
             {
-                // INT8VEC の距離計算・kNN は兄弟 Issue #2019 まで未対応（fail-closed。Issue #2018）。
+                // INT8VEC の kNN は `sql::int8vec_knn`（広域取得への書き換え。Issue #2953）経由でのみ
+                // 動く。この関数へ届くのは書き換え対象外の形（hybrid・`USING PLAN`・NoSQL・GPU バッチ・
+                // HNSW 等）で、fail-closed に `0A000` で拒否する。
                 SqlSurfaceError::feature_not_supported(
                     "vector search over INT8VEC columns is not supported",
                 )
@@ -2184,6 +2186,14 @@ pub(crate) struct LiteralSkip {
     /// 投影項目（`Projection::Items` の添字）ごとの「距離列のリテラルが `$n` 由来か」の可変長
     /// フラグ列。範囲外の添字は印なし（常に検証する側）。
     pub(crate) projection_mask: Vec<bool>,
+    /// `WHERE` 内の距離式（半径述語）ごとの「被演算子が `$n` 由来か」のトークン出現順フラグ列
+    /// （Issue #2953。INT8VEC の書き換えだけが参照し、`$n` 由来の距離式のダミー値だけを有効な
+    /// ゼロベクトルへ置き換えて束縛する。実リテラルは置換せず検証する）。
+    pub(crate) where_distance_mask: Vec<bool>,
+    /// 脱糖後の AST 上の距離式の出現順を `where_distance_mask`（トークン順）の添字で表したもの
+    /// （`BETWEEN`／`IN` の左辺複製と境界・要素内の距離式の並びを含む。確定不能は空）。PR #2956 指摘:
+    /// 構造一致ではなくトークン位置から求め、異なる `$n` の距離式を同じ塊にまとめない。
+    pub(crate) where_distance_order: Vec<usize>,
 }
 
 impl LiteralSkip {
@@ -2191,6 +2201,8 @@ impl LiteralSkip {
     pub(crate) const NONE: Self = Self {
         order_by: false,
         projection_mask: Vec::new(),
+        where_distance_mask: Vec::new(),
+        where_distance_order: Vec::new(),
     };
 
     pub(crate) fn skips_projection_item(&self, index: usize) -> bool {
@@ -9576,7 +9588,7 @@ pub(crate) fn bind_aggregate_with_dummy_flags(
 /// 式の子式を `f` で写した複製を返す（葉・内部名はそのまま複製）。[`rewrite_group_row_idents`] と
 /// 同じ網羅的な `match` で、`Expr` に variant が増えたときにコンパイルエラーで気付けるようにする。
 /// グループキー式の構造一致（[`normalize_group_match_expr`]・[`substitute_group_key_exprs`]）が使う。
-fn map_expr_children(expr: &Expr, f: &mut dyn FnMut(&Expr) -> Expr) -> Expr {
+pub(crate) fn map_expr_children(expr: &Expr, f: &mut dyn FnMut(&Expr) -> Expr) -> Expr {
     use std::convert::Infallible;
     match expr {
         Expr::Ident(_)
