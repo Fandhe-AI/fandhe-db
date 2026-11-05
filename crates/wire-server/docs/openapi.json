@@ -517,6 +517,16 @@
       "scan": {
         "additionalProperties": false,
         "properties": {
+          "after": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "columns": {
             "items": {
               "type": "string"
