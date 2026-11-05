@@ -74,8 +74,9 @@
 //! と同型）。他テナント所有 id・未存在 id はいずれも `updated:0`・`200`
 //! （RLS-9。`execute_update_with_schema` のドキュメント参照）。
 //!
-//! `returning` キー（Issue #2090・NOSQL-22）は検査済みでも実行未結線（Issue #2091 で結線。
-//! 成功本文の形は `encode_success_body_with_returning`）。`filter` は `search` と同じ語彙（`or`・範囲比較・
+//! `returning` キー（Issue #2090・#2091・NOSQL-22）は `gate.rs` 手順 5b が検査した投影を
+//! [`handle`] が受け取り、各形の engine の RETURNING 付き入口（SQL 表層 `UPDATE ... RETURNING`
+//! と同一の実行器）へ委譲する。成功本文の形は `encode_success_body_with_returning`。`filter` は `search` と同じ語彙（`or`・範囲比較・
 //! `in`・数値列を含む。Issue #1356）を `filter.rs` の `bind_filter_where_predicates` が
 //! SQL の述語形 `UPDATE` と同一の構文形へ写像する（`ARRAY`／`JSON`／`JSONB` 列の
 //! `eq`／`ne`／`in` も受理する。Issue #1410）。
@@ -87,8 +88,10 @@ use engine::core::EngineCore;
 use engine::error_format::{ClassifiedError, ErrorClass};
 use engine::json::JsonValue;
 use engine::recovery::required_op_id::OperationId;
-use engine::sql::allowlist::{InsertLiteral, SetValue, SqlSurfaceError, ValidatedUpdate};
-use engine::sql::exec::{QueryResult, UpdateOutcome};
+use engine::sql::allowlist::{
+    InsertLiteral, Projection, SetValue, SqlSurfaceError, ValidatedUpdate,
+};
+use engine::sql::exec::QueryResult;
 use engine::sql::parser::bind_update;
 
 use crate::http::error_body::escape_json_string_into;
@@ -264,7 +267,7 @@ fn write_success_fields(out: &mut String, success: &UpdateSuccess) {
 /// `returning` 付きの成功応答本文（Issue #2090・NOSQL-22）。
 /// 出力形 `{"updated":<n>[,"operation_id":"..."],"columns":[...],"rows":[...]}`
 /// （`insert::encode_success_body_with_returning` と同型。`row_count` は付けない）。
-/// 呼び出し元の結線は Issue #2091 の担当。
+/// 呼び出し元は [`handle`]（Issue #2091）。
 pub fn encode_success_body_with_returning(
     success: &UpdateSuccess,
     result: &QueryResult,
@@ -315,6 +318,21 @@ pub fn execute(
     validated: &Validated<'_>,
     header_operation_id: Option<&OperationId>,
 ) -> Result<UpdateSuccess, UpdateError> {
+    execute_with(core, principal, validated, header_operation_id, None).map(|(success, _)| success)
+}
+
+/// [`execute`] の本体。`returning` が `Some` のときは各形に対応する engine の RETURNING 付き
+/// 入口（SQL 表層 `UPDATE ... RETURNING` と同一の実行器。NOSQL-22・Issue #2091）へ委譲して
+/// 更新後の `QueryResult` も返し、`None` のときは従来の件数だけの入口を呼ぶ。分割実行修飾との
+/// 併用は `gate.rs` 手順 5b が `42601` で止めるが、ここでも多層防御として同じ `42601` で拒否する
+/// （分割実行器は `RETURNING` を持たない）。
+fn execute_with(
+    core: &EngineCore,
+    principal: &SessionPrincipal,
+    validated: &Validated<'_>,
+    header_operation_id: Option<&OperationId>,
+    returning: Option<&Projection>,
+) -> Result<(UpdateSuccess, Option<QueryResult>), UpdateError> {
     let table = validated
         .required_str("table")
         .map_err(UpdateError::Shape)?;
@@ -324,6 +342,11 @@ pub fn execute(
     // 分割実行修飾（Issue #1130）。述語形（`filter`）だけが受理する。
     let modifier = partitioned::parse_modifier(validated)?;
     partitioned::check_target_form(modifier, &target)?;
+    if returning.is_some() && modifier.is_some() {
+        return Err(UpdateError::Engine(SqlSurfaceError::UnsupportedSyntax {
+            detail: "returning cannot be combined with mode partitioned".to_string(),
+        }));
+    }
 
     let set = validated
         .required_object("set")
@@ -340,7 +363,7 @@ pub fn execute(
             other => UpdateError::Engine(other.into_sql_surface_error()),
         })?;
 
-    let outcome: UpdateOutcome = match target {
+    let (updated, result): (u64, Option<QueryResult>) = match target {
         // 単一行アドレス（`where`。Issue #2201）: 疑似列 `id` を持つ表で `{"id"}` のみなら従来の
         // 単一行形、それ以外（採番方式の表・PRIMARY KEY 形）は PK の等価述語で述語形へ流す。
         // 経路は事前判定（`table_uses_allocated_row_identity`）で選び、束縛時スナップショットと
@@ -350,34 +373,50 @@ pub fn execute(
                 && !core.table_uses_allocated_row_identity(table) =>
         {
             let id = dml_target::row_id_from_address(address)?;
-            core.execute_bound_update_in_session(
-                principal.policy_context(),
-                &principal.session_state(),
-                table,
-                operation_id.as_ref(),
-                |schema| {
-                    super::gate::reject_allocated_schema(schema)?;
-                    // NoSQL 表層の SET 値は常に平易なリテラル（式は SQL 表層のみ。
-                    // Issue #1544 で `ValidatedUpdate::assignments` が `SetValue` になったため包む）。
-                    let assignments = map_set_assignments_for_engine(set, schema)?
-                        .into_iter()
-                        .map(|(name, literal)| (name, SetValue::Literal(literal)))
-                        .collect();
-                    let stmt = ValidatedUpdate {
-                        table_name: table.to_string(),
-                        assignments,
-                        id_literal: id.to_string(),
-                        operation_id: operation_id.clone(),
-                        // NoSQL 表層 `op: update` は `RETURNING` を公開しない
-                        // （Issue #876 のスコープ外。SQL 表層の `RETURNING`
-                        // 実行結線は Issue #873・SQL-21 が別途担当し、
-                        // `ValidatedUpdate::returning` を `Some` にする経路は
-                        // ここには無い）。
-                        returning: None,
-                    };
-                    bind_update(&stmt, schema)
-                },
-            )?
+            let bind = |schema: &TableSchema| {
+                super::gate::reject_allocated_schema(schema)?;
+                // NoSQL 表層の SET 値は常に平易なリテラル（式は SQL 表層のみ。
+                // Issue #1544 で `ValidatedUpdate::assignments` が `SetValue` になったため包む）。
+                let assignments = map_set_assignments_for_engine(set, schema)?
+                    .into_iter()
+                    .map(|(name, literal)| (name, SetValue::Literal(literal)))
+                    .collect();
+                let stmt = ValidatedUpdate {
+                    table_name: table.to_string(),
+                    assignments,
+                    id_literal: id.to_string(),
+                    operation_id: operation_id.clone(),
+                    // 束縛計画自体は `RETURNING` を持たない。返却列は engine の
+                    // RETURNING 付き入口の `returning` 引数で渡し、engine が
+                    // `bind_returning` で束縛する（Issue #2091）。
+                    returning: None,
+                };
+                bind_update(&stmt, schema)
+            };
+            match returning {
+                None => (
+                    core.execute_bound_update_in_session(
+                        principal.policy_context(),
+                        &principal.session_state(),
+                        table,
+                        operation_id.as_ref(),
+                        bind,
+                    )?
+                    .rows_affected,
+                    None,
+                ),
+                Some(projection) => {
+                    let o = core.execute_bound_update_returning_in_session(
+                        principal.policy_context(),
+                        &principal.session_state(),
+                        table,
+                        operation_id.as_ref(),
+                        projection,
+                        bind,
+                    )?;
+                    (o.rows_affected, Some(o.result))
+                }
+            }
         }
         TargetForm::RowAddress(address) => {
             let bind = |schema: &TableSchema| {
@@ -385,13 +424,30 @@ pub fn execute(
                 let assignments = map_set_assignments_for_engine(set, schema)?;
                 Ok((assignments, predicates))
             };
-            core.execute_bound_predicate_update_in_session(
-                principal.policy_context(),
-                &principal.session_state(),
-                table,
-                operation_id.as_ref(),
-                bind,
-            )?
+            match returning {
+                None => (
+                    core.execute_bound_predicate_update_in_session(
+                        principal.policy_context(),
+                        &principal.session_state(),
+                        table,
+                        operation_id.as_ref(),
+                        bind,
+                    )?
+                    .rows_affected,
+                    None,
+                ),
+                Some(projection) => {
+                    let o = core.execute_bound_predicate_update_returning_in_session(
+                        principal.policy_context(),
+                        &principal.session_state(),
+                        table,
+                        operation_id.as_ref(),
+                        projection,
+                        bind,
+                    )?;
+                    (o.rows_affected, Some(o.result))
+                }
+            }
         }
         // 述語形（`filter`。TASK-186・NOSQL-12、Issue #1062）: SET 束縛は
         // 単一行形と同一（`map_set_assignments_for_engine`）を共有し、
@@ -408,45 +464,90 @@ pub fn execute(
                     .map_err(filter::FilterError::into_sql_surface_error)?;
                 Ok((assignments, predicates))
             };
-            match modifier {
+            match (modifier, returning) {
                 // 分割実行（Issue #1130）: SQL 表層 `UPDATE ... PARTITIONED` と同一の
                 // 共通本体（内容照合ハッシュ・実行器・上限）へ到達する。
-                Some(m) => core.execute_bound_partitioned_update_in_session(
-                    principal.policy_context(),
-                    &principal.session_state(),
-                    table,
-                    operation_id.as_ref(),
-                    m.chunk_rows,
-                    bind,
-                )?,
-                None => core.execute_bound_predicate_update_in_session(
-                    principal.policy_context(),
-                    &principal.session_state(),
-                    table,
-                    operation_id.as_ref(),
-                    bind,
-                )?,
+                (Some(m), _) => (
+                    core.execute_bound_partitioned_update_in_session(
+                        principal.policy_context(),
+                        &principal.session_state(),
+                        table,
+                        operation_id.as_ref(),
+                        m.chunk_rows,
+                        bind,
+                    )?
+                    .rows_affected,
+                    None,
+                ),
+                (None, None) => (
+                    core.execute_bound_predicate_update_in_session(
+                        principal.policy_context(),
+                        &principal.session_state(),
+                        table,
+                        operation_id.as_ref(),
+                        bind,
+                    )?
+                    .rows_affected,
+                    None,
+                ),
+                (None, Some(projection)) => {
+                    let o = core.execute_bound_predicate_update_returning_in_session(
+                        principal.policy_context(),
+                        &principal.session_state(),
+                        table,
+                        operation_id.as_ref(),
+                        projection,
+                        bind,
+                    )?;
+                    (o.rows_affected, Some(o.result))
+                }
             }
         }
     };
 
-    Ok(UpdateSuccess {
-        updated: outcome.rows_affected,
-        operation_id,
-    })
+    Ok((
+        UpdateSuccess {
+            updated,
+            operation_id,
+        },
+        result,
+    ))
+}
+
+/// `returning` 付きの成功本文を `200` 応答へ組み立てる。本文のエンコードは commit **後**に
+/// 行われるため、失敗しても書き込みは確定済みである。成功を偽らず・失敗とも断定しない
+/// may-be-committed 応答（`data.state`）へ写像する（RECOVER-5 (3)・ERR-5 ポインタ。
+/// 固定文言のみで列名・値を含めない）。
+fn render_returning_ok(
+    success: &UpdateSuccess,
+    result: &QueryResult,
+    now_wall: std::time::SystemTime,
+) -> Vec<u8> {
+    match encode_success_body_with_returning(success, result) {
+        Ok(body) => http_response::encode_ok(&body, now_wall),
+        Err(ResponseEncodeError) => http_response::encode_error_may_be_committed(
+            ErrorClass::InternalError,
+            "internal error",
+            now_wall,
+        ),
+    }
 }
 
 /// `POST /v1/query` の `update` op を処理し応答バイト列を返す（`gate.rs` から
 /// `engine` 接続済み時のみ呼ばれる。`insert::handle` と同一シグネチャ形）。
+/// `returning`（`gate.rs` 手順 5b が検証済みの投影。NOSQL-22・Issue #2091）が `Some` のときは
+/// 本文に更新後の `columns`／`rows` を加える（`None` は従来とバイト単位で同一）。
 pub fn handle(
     core: &EngineCore,
     principal: &SessionPrincipal,
     validated: &Validated<'_>,
     header_operation_id: Option<&OperationId>,
+    returning: Option<&Projection>,
     now_wall: std::time::SystemTime,
 ) -> Vec<u8> {
-    match execute(core, principal, validated, header_operation_id) {
-        Ok(success) => http_response::encode_ok(&encode_success_body(&success), now_wall),
+    match execute_with(core, principal, validated, header_operation_id, returning) {
+        Ok((success, Some(result))) => render_returning_ok(&success, &result, now_wall),
+        Ok((success, None)) => http_response::encode_ok(&encode_success_body(&success), now_wall),
         // `VD001`／`VD002` は 409 と `data` 付きの本文（Issue #1130）。
         // 409 の `data.operation_id` はヘッダのみ指定でも解決済みの値を返す（Issue #2064）。
         Err(UpdateError::Engine(err)) => {
@@ -458,7 +559,6 @@ pub fn handle(
         Err(err) => http_response::encode_error(err.error_class(), &err.client_message(), now_wall),
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
