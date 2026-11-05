@@ -23,8 +23,14 @@
 //!   どの経路でも同じ）。余分な検査は拒否側にだけ倒れる。
 //! - 参照数の上限を ACL の照会より前に検査する（untrusted 入力）。
 //! - エラーは固定文言の `42501`。表名・ロール ID・テナントを含めない。
+//! - 列単位の付与（Issue #2083。`columns.rs`）: 表単位のビットで満たせない `SELECT` だけを列で判定する。
+//!   単一 relation の `SELECT`／集約／広域取得の形（[`ReadRequirement::SelectPrecise`]）は、文が名指しする列
+//!   （上位近似）への列単位の付与で満たせる。それ以外の読み取り（JOIN・サブクエリ・CTE・集合演算・`*` 等）は
+//!   全列、ビューは表単位、行ロック句の `UPDATE` は「いずれかの列」を要求する。
 
-use crate::catalog::privilege::{PRIV_SELECT, PRIV_UPDATE};
+use crate::catalog::privilege::{
+    relation_grants_in_txn, relation_shape_in_txn, RelationShape, PRIV_SELECT, PRIV_UPDATE,
+};
 use crate::core::ParsedSql;
 use crate::sql::allowlist::{SqlSurfaceError, Statement};
 use crate::sql::cursor::CursorStatement;
@@ -33,6 +39,7 @@ use crate::sql::mode::SessionState;
 use crate::sql::relation_name::SchemaResolver;
 use crate::storage::Storage;
 
+use super::columns::{self, ColumnSpec, Want};
 use super::{check, Principal, PrivilegeTarget};
 
 /// 1 文が参照できる relation 名の上限（重複除去後。ACL の照会より前に検査する）。
@@ -43,8 +50,11 @@ pub(crate) const MAX_READ_RELATION_REFS: usize = 256;
 pub(crate) enum ReadRequirement {
     /// 本ゲートの対象外（DML・COPY・DDL・セッション制御等。DML の権限は `write.rs`、COPY は `copy.rs`〔#1969〕）。
     NotApplicable,
-    /// 参照するすべての relation に表単位の SELECT。
+    /// 参照するすべての relation に SELECT（列単位の付与では全列を要求する）。
     Select,
+    /// [`Self::Select`] のうち、単一 relation の `SELECT`／集約／広域取得の形。名指しした列への列単位の
+    /// 付与で満たせる（`columns.rs` の上位近似。relation が複数なら全列）。
+    SelectPrecise,
     /// 行ロック句つきの SELECT。SELECT に加えて UPDATE を要求する（PostgreSQL と同じく、ロック強度に
     /// よらず UPDATE 系の権限が要る。`OF` で絞られた表だけでなく参照先の全表に要求する側へ倒す）。
     SelectForUpdate,
@@ -54,7 +64,7 @@ impl ReadRequirement {
     fn bits(self) -> Option<u16> {
         match self {
             Self::NotApplicable => None,
-            Self::Select => Some(PRIV_SELECT),
+            Self::Select | Self::SelectPrecise => Some(PRIV_SELECT),
             Self::SelectForUpdate => Some(PRIV_SELECT | PRIV_UPDATE),
         }
     }
@@ -154,10 +164,11 @@ pub(crate) fn classify(parsed: &ParsedSql) -> ReadRequirement {
 
 fn classify_statement(s: &Statement) -> ReadRequirement {
     match s {
-        Statement::Select(_)
-        | Statement::Aggregate(_)
-        | Statement::Explain(_)
-        | Statement::Scan(_)
+        // 単一 relation の基本形。列の名指しは上位近似で精密化できる（relation が複数なら全列）。
+        Statement::Select(_) | Statement::Aggregate(_) | Statement::Scan(_) => {
+            ReadRequirement::SelectPrecise
+        }
+        Statement::Explain(_)
         | Statement::SetOperation(_)
         | Statement::Join(_)
         | Statement::BufferedView(_)
@@ -212,12 +223,13 @@ pub(crate) fn require_read_privileges(
     }
     let mut resolved = tokens.to_vec();
     crate::sql::relation_name::rewrite_relation_names_full(&mut resolved, resolver)?;
-    require_relations(
+    let names = gate_relation_names(&resolved, snapshot.parsed_relations);
+    require_relations_bits(
         storage,
         tenant,
         &principal,
-        required_bits,
-        &gate_relation_names(&resolved, snapshot.parsed_relations),
+        &read_wants(requirement, &names),
+        &resolved,
         snapshot.read_snap,
         snapshot.parsed_relations,
     )
@@ -247,15 +259,37 @@ pub(crate) fn require_read_privileges_resolved(
         )
         .map(|_| ());
     }
-    require_relations(
+    let names = gate_relation_names(resolved_tokens, scope.parsed_relations);
+    require_relations_bits(
         storage,
         tenant,
         &principal,
-        required_bits,
-        &gate_relation_names(resolved_tokens, scope.parsed_relations),
+        &read_wants(requirement, &names),
+        resolved_tokens,
         scope.read_snap,
         scope.parsed_relations,
     )
+}
+
+/// 読み取りの要求を relation ごとの [`Want`] へ展開する。
+fn read_wants(requirement: ReadRequirement, names: &[String]) -> Vec<Want> {
+    let mut out = Vec::new();
+    for n in names {
+        match requirement {
+            ReadRequirement::NotApplicable => {}
+            ReadRequirement::Select => out.extend(Want::all(n, PRIV_SELECT)),
+            ReadRequirement::SelectPrecise => {
+                out.extend(Want::split(n, PRIV_SELECT, ColumnSpec::Scan))
+            }
+            ReadRequirement::SelectForUpdate => {
+                out.extend(Want::all(n, PRIV_SELECT));
+                // 行ロックは書き込み系の権限。列の指定を持たないので「いずれかの列」への UPDATE で足りる側に
+                // する（PostgreSQL と同じ。SELECT 側が全列を要求するので読める範囲は広げない）。
+                out.extend(Want::split(n, PRIV_UPDATE, ColumnSpec::Any));
+            }
+        }
+    }
+    out
 }
 
 /// 通常 SQL の構文解析の結果として権限ゲートへ渡す、参照先の確認の文脈。
@@ -285,8 +319,8 @@ pub(super) fn gate_relation_names(
     names
 }
 
-/// 解決済みの relation 名の並びに対する判定（表名を直接渡す HTTP 表層の入口と共有する）。全名に同じ
-/// `required_bits` を課す。
+/// 解決済みの relation 名の並びに対する判定（全列を要求する版。HTTP 表層の入口とテストが共有する）。
+/// 全名に同じ `required_bits` を課す。
 pub(super) fn require_relations(
     storage: &Storage,
     tenant: &str,
@@ -296,59 +330,97 @@ pub(super) fn require_relations(
     read_snap: Option<&redb::ReadTransaction>,
     parsed_relations: &[String],
 ) -> Result<(), SqlSurfaceError> {
-    let wants: Vec<(String, u16)> = candidates
+    let wants: Vec<Want> = candidates
         .iter()
-        .map(|n| (n.clone(), required_bits))
+        .flat_map(|n| Want::all(n, required_bits))
         .collect();
     require_relations_bits(
         storage,
         tenant,
         principal,
         &wants,
+        &[],
         read_snap,
         parsed_relations,
     )
 }
 
-/// relation ごとに必要ビットが異なる版の判定（#1968 の書き込み系ゲートと共有する唯一の ACL 照会点）。
-/// 同名は必要ビットを OR して 1 件にまとめ、件数の上限を ACL の照会より前に検査する（untrusted 入力）。
+/// relation ごと・権限ビットごとに列の仕様が異なる版の判定（#1968 の書き込み系・COPY ゲートと共有する
+/// 唯一の ACL 照会点）。relation 名の種類数の上限と列名の数の上限を ACL の照会より前に検査する（untrusted 入力）。
+/// `tokens` は `Scan` の列集合に使う名前解決済みの字句列（持たない入口は空）。
 pub(super) fn require_relations_bits(
     storage: &Storage,
     tenant: &str,
     principal: &Principal,
-    wants: &[(String, u16)],
+    wants: &[Want],
+    tokens: &[Token],
     read_snap: Option<&redb::ReadTransaction>,
     parsed_relations: &[String],
 ) -> Result<(), SqlSurfaceError> {
-    let mut merged: Vec<(String, u16)> = Vec::new();
-    for (name, bits) in wants {
-        match merged.iter_mut().find(|(n, _)| n == name) {
-            Some((_, b)) => *b |= *bits,
-            None => merged.push((name.clone(), *bits)),
+    let mut names: Vec<String> = Vec::new();
+    for w in wants {
+        if !names.contains(&w.relation) {
+            names.push(w.relation.clone());
         }
-        if merged.len() > MAX_READ_RELATION_REFS {
+        if names.len() > MAX_READ_RELATION_REFS {
             return Err(SqlSurfaceError::payload_too_large(
                 "too many relation references",
             ));
         }
     }
-    let names: Vec<String> = merged.iter().map(|(n, _)| n.clone()).collect();
     if names.is_empty() {
         return Ok(());
     }
-    let role_id = principal.current_role_id().unwrap_or(0);
+    columns::check_explicit_count(wants)?;
     // 明示 Tx（BEGIN 時のスナップショットで解析・実行する経路）では、ACL と relation の存在確認も同じ
     // スナップショットで引く。最新カタログで引くと、BEGIN 後に別セッションが DROP した表が `None`
     // （存在しない扱い）になり、旧スナップショットで読めてしまう認可バイパスになる。
-    let bits = match read_snap {
-        Some(snap) => {
-            crate::catalog::privilege::relation_grant_bits_in_txn(snap, tenant, &names, role_id)
+    match read_snap {
+        Some(snap) => evaluate_in_txn(
+            principal,
+            snap,
+            tenant,
+            &names,
+            wants,
+            tokens,
+            parsed_relations,
+        ),
+        None => {
+            use redb::ReadableDatabase;
+            let rt = storage
+                .db()
+                .begin_read()
+                .map_err(|e| crate::catalog::table_lookup_error(e.into()))?;
+            evaluate_in_txn(
+                principal,
+                &rt,
+                tenant,
+                &names,
+                wants,
+                tokens,
+                parsed_relations,
+            )
         }
-        None => storage.relation_grant_bits(tenant, &names, role_id),
     }
-    .map_err(crate::catalog::table_lookup_error)?;
-    for ((name, required_bits), granted) in merged.iter().zip(bits) {
-        let Some(granted) = granted else {
+}
+
+/// 同一スナップショット `src` での ACL の取得と、`wants` の判定（読み取り・書き込み・COPY・分割実行の
+/// チャンク再判定が共有する）。表単位のビットで満たせる要求は列を見ない（高速経路）。満たせない列で
+/// 満たせるビットだけ、relation の形を引いて列の仕様を解決し、列単位の付与で判定する。
+pub(super) fn evaluate_in_txn<R: crate::storage::read_source::ReadSource>(
+    principal: &Principal,
+    src: &R,
+    tenant: &str,
+    names: &[String],
+    wants: &[Want],
+    tokens: &[Token],
+    parsed_relations: &[String],
+) -> Result<(), SqlSurfaceError> {
+    let role_id = principal.current_role_id().unwrap_or(0);
+    let grants = relation_grants_in_txn(src, tenant, names, role_id)
+        .map_err(crate::catalog::table_lookup_error)?;
+    for (name, granted) in names.iter().zip(&grants) {
+        if granted.is_none() {
             // 準備済み文（Parse 済みで名前解決済みのトークン列）の参照先が消えている場合は、別セッションの
             // DROP 後に展開済みの文だけが残った状態であり、検査を省略すると SET ROLE 後のロールが
             // 権限なしで基底表を読める認可バイパスになる。fail-closed で拒否する（fail-open にしない）。
@@ -362,13 +434,41 @@ pub(super) fn require_relations_bits(
                     crate::catalog::namespace::relation_name_part(name),
                 ));
             }
+        }
+    }
+    let existing = grants.iter().filter(|g| g.is_some()).count();
+    let mut shapes: Vec<Option<RelationShape>> = vec![None; names.len()];
+    for want in wants {
+        let Some(idx) = names.iter().position(|n| *n == want.relation) else {
             continue;
         };
+        let Some(Some(g)) = grants.get(idx) else {
+            continue;
+        };
+        // 表単位で満たせない要求のうち、列単位の付与で満たせうるものだけ列を評価する。
+        let needs_columns = want.bits & columns::COLUMN_PRIVILEGES & !g.table_bits != 0
+            && !g.column_bits.is_empty();
+        let mut cover = 0u16;
+        if needs_columns {
+            if shapes.get(idx).is_some_and(|s| s.is_none()) {
+                let shape = relation_shape_in_txn(src, &want.relation)
+                    .map_err(crate::catalog::table_lookup_error)?;
+                if let Some(slot) = shapes.get_mut(idx) {
+                    *slot = Some(shape);
+                }
+            }
+            if let Some(Some(shape)) = shapes.get(idx) {
+                let demand = columns::resolve(&want.cols, shape, tokens, existing <= 1)?;
+                cover =
+                    columns::cover_bits(want.bits, g.table_bits, &g.column_bits, &demand, shape);
+            }
+        }
         check(
             principal,
-            PrivilegeTarget::Relation {
-                required_bits: *required_bits,
-                granted_bits: granted,
+            PrivilegeTarget::RelationColumns {
+                required_bits: want.bits,
+                granted_bits: g.table_bits,
+                column_cover_bits: cover,
             },
         )?;
     }
@@ -376,7 +476,8 @@ pub(super) fn require_relations_bits(
 }
 
 /// 表名を直接受け取る入口（HTTP 表層の bound 読み取り API）用。`table` は解決済みの relation キー。
-/// 現在ロール未束縛・運用者権限のセッションは何もしない。
+/// 現在ロール未束縛・運用者権限のセッションは何もしない。束縛前なので列は特定できず、全列への SELECT
+/// （表単位、または全列への列単位の付与）を要求する。
 pub(crate) fn require_table_select(
     storage: &Storage,
     tenant: &str,

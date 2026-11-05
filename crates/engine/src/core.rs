@@ -113,6 +113,9 @@ mod select_privilege_tests;
 // 書き込み系の文の権限検査（SQL-40・Issue #1968）。
 #[cfg(test)]
 mod dml_privilege_tests;
+// 列単位の権限検査（SQL-40・Issue #2083）。
+#[cfg(test)]
+mod column_privilege_tests;
 // SCHEMA 単位の GRANT／REVOKE と USAGE 検査（SQL-40・Issue #2234）。
 #[cfg(test)]
 mod schema_acl_tests;
@@ -16189,6 +16192,8 @@ impl EngineCore {
                     txn_start_micros: txn_start_micros.unwrap_or(stmt_start_micros),
                     stmt_start_micros,
                 };
+                // 開始時の判定（`require_copy_privileges`）と同じ列集合で commit 時にも再検査する。
+                let copy_cols = crate::sql::privilege_gate::copy::copy_from_columns(&v.columns);
                 Ok(CopyPlan::From(
                     crate::sql::copy::CopyInSession::new(
                         v.table_name,
@@ -16207,7 +16212,8 @@ impl EngineCore {
                             session,
                             ctx.tenant_id(),
                             crate::catalog::privilege::PRIV_INSERT,
-                        ),
+                        )
+                        .map(|r| r.with_columns(copy_cols)),
                     ),
                 ))
             }

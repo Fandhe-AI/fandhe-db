@@ -293,3 +293,19 @@ SQL 表層・HTTP 表層の主体付き入口だけがゲートを通る。
 `ParsedSql::ExplainInsert` は書き込みゲート（`privilege_gate::write::classify_write`）が通常の `INSERT`／
 `INSERT ... SELECT` と同じビットで判定する（実行しなくても権限の無い主体に計画を見せない）。読み取りゲートは
 `NotApplicable`（元表の `SELECT` は書き込みゲートの参照走査が課す）。
+
+## 列単位の判定（Issue #2083）
+
+上の各入口は、判定点（`privilege_gate::check`）と ACL の照会点（`privilege_gate::read::evaluate_in_txn`）を変えずに、
+要求へ「どの列に」を載せた（`privilege_gate::columns`）。表単位のビットで満たせる要求は列を見ない。
+
+| 入口 | 列の要求 |
+| ---- | -------- |
+| 通常 SQL・明示 Tx・拡張クエリ（読み取り） | 単一 relation の `SELECT`／集約／広域取得は名指しした列（上位近似）。それ以外は全列。ビューは表単位。行ロック句の `UPDATE` は「いずれかの列」 |
+| 通常 SQL・拡張クエリ（書き込み） | `INSERT` は列リスト（省略は全列）、`UPDATE` は `SET` 対象、読む列は `SELECT`。`DELETE`・`TRUNCATE` は表単位。精密化しない形は全列 |
+| COPY | `FROM` は列リスト、`TO` のテーブル形は列リスト（省略は全列）、問い合わせ形は単一 relation なら名指しした列 |
+| HTTP の bound 読み取り・書き込み | 束縛前の入口なので、列で満たせるビットは全列 |
+| 分割実行 DML のチャンク再判定 | 全列（入口も全列にして揃える） |
+
+従来方式の表の疑似列 `id` とビューは列単位の付与を持てないので、参照は表単位でしか満たせない。拒否は固定文言の `42501`
+（列名・列数・表名を含まない）。判断の記録は [column-level-privilege.md](column-level-privilege.md) §8。
