@@ -57,7 +57,7 @@ use engine::core::EngineCore;
 use engine::error_format::{ClassifiedError, ErrorClass};
 use engine::json::JsonValue;
 use engine::recovery::required_op_id::OperationId;
-use engine::sql::allowlist::{SqlSurfaceError, ValidatedInsert};
+use engine::sql::allowlist::{Projection, SqlSurfaceError, ValidatedInsert};
 use engine::sql::exec::{InsertOutcome, QueryResult};
 use engine::sql::parser::{bind_insert_identity, BoundInsert};
 
@@ -368,8 +368,8 @@ fn write_success_fields(out: &mut String, success: &InsertSuccess) {
 /// 出力形 `{"inserted":<n>[,"operation_id":"..."],"columns":[...],"rows":[...]}`
 /// （キー順固定・空白なし）。`row_count` は付けない（RLS 再判定で `rows.len()` が件数を
 /// 下回りうるため、件数キーと行数を別フィールドのまま保つ）。セル・型名の写像は
-/// [`super::response::write_columns_and_rows_into`] に一本化している。呼び出し元の結線は
-/// Issue #2091 の担当（commit 後のエンコード失敗は may-be-committed 系応答へ写像すること）。
+/// [`super::response::write_columns_and_rows_into`] に一本化している。呼び出し元は [`handle`]
+/// （Issue #2091。commit 後のエンコード失敗は may-be-committed 応答へ写像する）。
 pub fn encode_success_body_with_returning(
     success: &InsertSuccess,
     result: &QueryResult,
@@ -396,6 +396,21 @@ pub fn execute(
     validated: &Validated<'_>,
     header_operation_id: Option<&OperationId>,
 ) -> Result<InsertSuccess, InsertError> {
+    execute_with(core, principal, validated, header_operation_id, None).map(|(success, _)| success)
+}
+
+/// [`execute`] の本体。`returning` が `Some` のときは engine の
+/// `execute_bound_insert_returning_in_session`（SQL 表層 `INSERT ... RETURNING` と同一の
+/// 実行器。NOSQL-22・Issue #2091）へ委譲して `QueryResult` も返し、`None` のときは従来の
+/// 件数だけの入口を呼ぶ（戻りの `QueryResult` は常に `None`）。表・`operation_id` の検査と
+/// 束縛は両経路で同一。
+fn execute_with(
+    core: &EngineCore,
+    principal: &SessionPrincipal,
+    validated: &Validated<'_>,
+    header_operation_id: Option<&OperationId>,
+    returning: Option<&Projection>,
+) -> Result<(InsertSuccess, Option<QueryResult>), InsertError> {
     let table = validated
         .required_str("table")
         .map_err(InsertError::Shape)?;
@@ -411,41 +426,61 @@ pub fn execute(
             other => InsertError::Exec(other.into_sql_surface_error()),
         })?;
 
-    let outcome: InsertOutcome = core
-        .execute_bound_insert_in_session(
-            principal.policy_context(),
-            &principal.session_state(),
-            table,
-            rows.len(),
-            operation_id.as_ref(),
-            |schema| {
-                bind_rows(rows, table, operation_id.as_ref(), schema).map_err(|e| match e {
-                    InsertError::Bind(err) | InsertError::Exec(err) => err,
-                    // `bind_rows`（`bind_row` を行ごとに呼ぶ）は列キーの識別子形状検査
-                    // （`ident::check_identifier`。NUL・制御文字・63 文字上限等）を
-                    // 行うため `InsertError::InvalidIdentifier` を実際に構築しうる
-                    // （Cursor Bugbot 指摘。かつては「本関数冒頭の `table` 検査でしか
-                    // 構築されない」という誤った前提で `Internal`〔`XX000`〕へ丸めて
-                    // いたため、不正な列キーを含む insert が `42601` ではなく内部
-                    // エラー相当のコードで返っていた）。`Shape` は `schema.rs` の
-                    // 意味的検証専用で `bind_rows` からは構築されないため、`Internal`
-                    // への丸め込みを維持する。
-                    InsertError::InvalidIdentifier => SqlSurfaceError::UnsupportedSyntax {
-                        detail: "invalid identifier".to_string(),
-                    },
-                    InsertError::Shape(_) => SqlSurfaceError::Internal {
-                        detail: "unexpected shape error during INSERT row binding".to_string(),
-                    },
-                    // `TypedJsonError`（NOSQL-17。Issue #896）の分類は単一の
-                    // `into_sql_surface_error` 変換点に集約する（`update.rs` と共有）。
-                    InsertError::Set(err) => err.into_sql_surface_error(),
-                })
+    let bind = |schema: &TableSchema| {
+        bind_rows(rows, table, operation_id.as_ref(), schema).map_err(|e| match e {
+            InsertError::Bind(err) | InsertError::Exec(err) => err,
+            // `bind_rows`（`bind_row` を行ごとに呼ぶ）は列キーの識別子形状検査
+            // （`ident::check_identifier`。NUL・制御文字・63 文字上限等）を
+            // 行うため `InsertError::InvalidIdentifier` を実際に構築しうる
+            // （Cursor Bugbot 指摘。かつては「本関数冒頭の `table` 検査でしか
+            // 構築されない」という誤った前提で `Internal`〔`XX000`〕へ丸めて
+            // いたため、不正な列キーを含む insert が `42601` ではなく内部
+            // エラー相当のコードで返っていた）。`Shape` は `schema.rs` の
+            // 意味的検証専用で `bind_rows` からは構築されないため、`Internal`
+            // への丸め込みを維持する。
+            InsertError::InvalidIdentifier => SqlSurfaceError::UnsupportedSyntax {
+                detail: "invalid identifier".to_string(),
             },
-        )
-        .map_err(InsertError::Exec)?;
+            InsertError::Shape(_) => SqlSurfaceError::Internal {
+                detail: "unexpected shape error during INSERT row binding".to_string(),
+            },
+            // `TypedJsonError`（NOSQL-17。Issue #896）の分類は単一の
+            // `into_sql_surface_error` 変換点に集約する（`update.rs` と共有）。
+            InsertError::Set(err) => err.into_sql_surface_error(),
+        })
+    };
+    let (inserted, result): (u64, Option<QueryResult>) = match returning {
+        None => {
+            let outcome: InsertOutcome = core
+                .execute_bound_insert_in_session(
+                    principal.policy_context(),
+                    &principal.session_state(),
+                    table,
+                    rows.len(),
+                    operation_id.as_ref(),
+                    bind,
+                )
+                .map_err(InsertError::Exec)?;
+            (outcome.rows_affected, None)
+        }
+        Some(projection) => {
+            let outcome = core
+                .execute_bound_insert_returning_in_session(
+                    principal.policy_context(),
+                    &principal.session_state(),
+                    table,
+                    rows.len(),
+                    operation_id.as_ref(),
+                    projection,
+                    bind,
+                )
+                .map_err(InsertError::Exec)?;
+            (outcome.rows_affected, Some(outcome.result))
+        }
+    };
 
     // Issue #829（テスト専用・feature `fault-injection` 限定）: この直前の
-    // `execute_bound_insert_in_session` が commit まで成功した直後（＝
+    // engine 呼び出しが commit まで成功した直後（＝
     // `crate::http::conn::build_outcome` の `ResponseBoundaryGuard` が
     // 保護している区間の内側）にだけ検査する。これより後ろへ移動すると
     // 呼び出し元（`handle`）の応答整形（`encode_success_body`）まで通過して
@@ -455,26 +490,52 @@ pub fn execute(
     #[cfg(feature = "fault-injection")]
     crate::fault_injection::maybe_panic_after_http_insert_commit();
 
-    Ok(InsertSuccess {
-        inserted: outcome.rows_affected,
-        operation_id,
-    })
+    Ok((
+        InsertSuccess {
+            inserted,
+            operation_id,
+        },
+        result,
+    ))
+}
+
+/// `returning` 付きの成功本文を `200` 応答へ組み立てる。本文のエンコードは commit **後**に
+/// 行われるため、失敗しても書き込みは確定済みである。成功を偽らず・失敗とも断定しない
+/// may-be-committed 応答（`data.state`）へ写像する（RECOVER-5 (3)・ERR-5 ポインタ。
+/// 固定文言のみで列名・値を含めない）。
+fn render_returning_ok(
+    success: &InsertSuccess,
+    result: &QueryResult,
+    now_wall: std::time::SystemTime,
+) -> Vec<u8> {
+    match encode_success_body_with_returning(success, result) {
+        Ok(body) => http_response::encode_ok(&body, now_wall),
+        Err(ResponseEncodeError) => http_response::encode_error_may_be_committed(
+            ErrorClass::InternalError,
+            "internal error",
+            now_wall,
+        ),
+    }
 }
 
 /// `POST /v1/query` の `insert` op を処理し応答バイト列を返す
 /// （`gate.rs` 手順 5 から `engine` 接続済み時のみ呼ばれる。`scan::handle`／
 /// `aggregate::handle` と同一シグネチャ形）。成功時は [`encode_success_body`]
 /// を `200` で、失敗時は [`InsertError`] の分類を `http_response::encode_error`
-/// でそれぞれ応答へ写像する。
+/// でそれぞれ応答へ写像する。`returning`（`gate.rs` 手順 5b が検証済みの投影。NOSQL-22・
+/// Issue #2091）が `Some` のときは engine の RETURNING 入口を呼び、本文に `columns`／`rows`
+/// を加える（`None` は従来とバイト単位で同一）。
 pub fn handle(
     core: &EngineCore,
     principal: &SessionPrincipal,
     validated: &Validated<'_>,
     header_operation_id: Option<&OperationId>,
+    returning: Option<&Projection>,
     now_wall: std::time::SystemTime,
 ) -> Vec<u8> {
-    match execute(core, principal, validated, header_operation_id) {
-        Ok(success) => http_response::encode_ok(&encode_success_body(&success), now_wall),
+    match execute_with(core, principal, validated, header_operation_id, returning) {
+        Ok((success, Some(result))) => render_returning_ok(&success, &result, now_wall),
+        Ok((success, None)) => http_response::encode_ok(&encode_success_body(&success), now_wall),
         Err(err) => http_response::encode_error(err.error_class(), &err.client_message(), now_wall),
     }
 }
@@ -860,13 +921,63 @@ mod tests {
             .expect("schema ok");
 
         let now = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(0);
-        let response = handle(&core, &principal, &validated, None, now);
+        let response = handle(&core, &principal, &validated, None, None, now);
         let text = String::from_utf8(response).expect("utf-8 response");
         assert!(text.starts_with("HTTP/1.1 200 "), "got: {text}");
         assert!(
             text.ends_with(r#"{"inserted":1,"operation_id":"op-handle"}"#),
             "got: {text}"
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// commit 後の本文エンコード失敗は、成功とも失敗とも断定しない may-be-committed 応答
+    /// （`data.state`）へ写像される（RECOVER-5 (3)・ERR-5。Issue #2091）。
+    #[test]
+    fn render_returning_ok_maps_encode_failure_to_may_be_committed() {
+        use engine::sql::exec::{Cell, ColumnMeta, ResultRow};
+        let result = QueryResult {
+            columns: vec![ColumnMeta::Id],
+            rows: vec![ResultRow {
+                id: 1,
+                score: 0.0,
+                cells: vec![Cell::Float(f64::NAN)],
+            }],
+        };
+        let success = InsertSuccess {
+            inserted: 1,
+            operation_id: None,
+        };
+        let now = std::time::SystemTime::UNIX_EPOCH;
+        let text = String::from_utf8(render_returning_ok(&success, &result, now)).expect("utf-8");
+        assert!(text.starts_with("HTTP/1.1 500 "), "got: {text}");
+        assert!(text.contains("\"state\""), "got: {text}");
+        assert!(!text.contains("NaN"), "got: {text}");
+    }
+
+    /// Public のみ可視の主体では、INSERT の挿入行（Private 固定）を返却できないため engine が
+    /// 書き込み前に拒否する（SQL の `RETURNING` と同じ契約）。行は書かれない。
+    #[test]
+    fn handle_returning_for_public_only_principal_fails_closed_without_writing() {
+        let (core, path) = open_core();
+        let principal = principal("tenant-a");
+        let body = r#"{"op":"insert","table":"docs","rows":[{"id":1,"embedding":[1,0,0,0],"lang":"ja"}],"returning":"*"}"#;
+        let value = parse_json(body).expect("valid json");
+        let validated = super::super::schema::INSERT_SCHEMA
+            .validate(&value)
+            .expect("schema ok");
+        let now = std::time::SystemTime::UNIX_EPOCH;
+        let response = handle(
+            &core,
+            &principal,
+            &validated,
+            None,
+            Some(&Projection::All),
+            now,
+        );
+        let text = String::from_utf8(response).expect("utf-8");
+        assert!(text.starts_with("HTTP/1.1 500 "), "got: {text}");
+        assert!(!text.contains("\"inserted\""), "got: {text}");
         let _ = std::fs::remove_file(&path);
     }
 
@@ -883,7 +994,7 @@ mod tests {
             .expect("schema ok");
 
         let now = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(0);
-        let response = handle(&core, &principal, &validated, None, now);
+        let response = handle(&core, &principal, &validated, None, None, now);
         let text = String::from_utf8(response).expect("utf-8 response");
         assert!(text.starts_with("HTTP/1.1 400 "), "got: {text}");
         assert!(text.contains("23502"), "got: {text}");

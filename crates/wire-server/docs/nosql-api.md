@@ -553,7 +553,7 @@ OFFSET ...` と同じ対象名解決・実行器を共有。第 2 の実行器�
 | `table` | ○ | string | |
 | `rows` | ○ | object[] | 各行はスキーマ列名をキーとする値。疑似列 `id` を持つ表（従来方式・NoSQL `create_table` で作った表）は `id`（非負整数）が必須。SQL の `CREATE TABLE` で作った表（暗黙の `id` を持たない採番方式。TABLE-23・NOSQL-23。Issue #2201）は `id` を要求せず、宣言した `id` 列は通常の列として扱い、宣言のない `id` キーは `22000`。PRIMARY KEY 列の省略は `23502`（`DEFAULT` があれば適用）、PK 重複は `23505`。行の識別子（rowid）は応答に出ない |
 | `operation_id` | △ | string | 既定では省略可（欠落・`null`・空文字は台帳に記録しない通常の書き込み。成功応答に `operation_id` キーなし。`Idempotency-Key` ヘッダでも指定でき、両方あれば一致必須で不一致は `42601`）。`--require-operation-id` の構成では欠落・`null`・空文字はいずれも `23502` |
-| `returning` | △ | string `"*"` または string[] | 返す列の指定（NOSQL-22）。`"*"` か非空の列名配列のみ受理し、それ以外（`null`・数値・空配列・`"*"` を含む配列・識別子でない要素・列名 1 つの文字列形）は `42601`。現在は妥当な指定でも固定文言の `0A000`（HTTP 501、書き込みなし）で拒否する（実行は Issue #2091 で結線予定。指定を黙って無視しない） |
+| `returning` | △ | string `"*"` または string[] | 返す列の指定（NOSQL-22）。`"*"` か非空の列名配列のみ受理し、それ以外（`null`・数値・空配列・`"*"` を含む配列・識別子でない要素・列名 1 つの文字列形）は `42601`。実行は SQL の `RETURNING` と同じ実行器で、成功応答は件数キーに続けて `columns`・`rows` を返す（下記「`returning` 付きの応答」。件数キーは `inserted`）。返却には書き込み権限に加えて `SELECT` 権限が要る（SQL-40。SQL より厳しい側の全列要求） |
 
 要求例:
 
@@ -638,6 +638,33 @@ OFFSET ...` と同じ対象名解決・実行器を共有。第 2 の実行器�
   `batch_limits::validate_chunk_total`。1 行＝1 チャンク換算。既定は
   `incremental::MAX_CHUNKS_PER_FILE`、環境変数 `FANDHE_DB_BATCH_MAX_CHUNKS` で
   上書き可能）でも判定され、超過は同じく `54000`
+
+#### `returning` 付きの応答（`insert`／`update`／`delete` 共通。NOSQL-22）
+
+`returning` を指定した要求の成功応答は、件数キー（`inserted`／`updated`／`deleted`。`operation_id` は指定時のみ）に
+続けて `columns`・`rows` を返す。`rows` の内容と行数は、同じ状態に対する SQL の `... RETURNING <同じ列>` と一致する
+（`insert`／`update` は書き込み後の値、`delete` は削除前の値）。`"*"` は `VECTOR` 列を含む全列を返す。
+件数キーは実際に変更した行数で、RLS の再判定で書き込み本人にも見えない行は `rows` から除かれるため
+`rows` の行数が件数を下回ることがある。他テナントの行・可視集合の外の行は、件数にも `rows` にも現れない
+（0 件の応答は他テナントの行の有無に依存しない）。`returning` 未指定の応答は従来と同一。
+
+要求例:
+
+```json
+{"op": "insert", "table": "docs",
+ "rows": [{"id": 1, "embedding": [1, 0, 0, 0], "lang": "ja"}],
+ "operation_id": "op-ret-1", "returning": ["id", "lang"]}
+```
+
+成功時（`200`）:
+
+```json
+{"inserted": 1, "operation_id": "op-ret-1", "columns": [{"name": "id", "type": "numeric"}, {"name": "lang", "type": "text"}], "rows": [[1, "ja"]]}
+```
+
+実際の本文は空白を含まないコンパクト形で、列メタの形は `scan` の応答と同じ。応答本文の組み立て中に失敗した場合は、
+書き込みが確定済みのため `data.state` 付きの緊急応答（「緊急応答の `data`」節）を返す。
+分割実行（`mode`／`chunk`）との併用は `42601`、`upsert` は `returning` を宣言しない（未知キーとして `42601`）。
 
 検証コード: `crates/wire-server/tests/nosql2_search.rs`・
 `nosql2_search_binding.rs`・`nosql3_scan_mapping.rs`・`nosql3_scan_wire_parity.rs`・
@@ -745,7 +772,7 @@ SQL の `WHERE` 句省略とのパリティ）。
 | `operation_id` | △ | string | 既定では省略可（成功応答に `operation_id` キーなし。`Idempotency-Key` ヘッダでも指定でき、両方あれば一致必須で不一致は `42601`）。`--require-operation-id` の構成では欠落・`null`・空文字は `23502`（分割実行は構成によらず `23502`）。同一値への再送は台帳照合により内容一致 `23505`（`DUPLICATE_OPERATION_ID`）・不一致 `22023`（SQL 表層と共有） |
 | `mode` | | string | 分割実行の修飾（Issue #1130・NOSQL-12）。受理値は `"partitioned"` のみで、それ以外の文字列・非文字列は `42601`（黙って原子実行へ切り替えない）。`filter`（述語形）とだけ組み合わせられ、`where` との併用は `42601`。詳細は[分割実行](#分割実行-dml)参照 |
 | `chunk` | | number | 1 チャンクの行数（`mode` 指定時のみ有効。`mode` なしは `42601`）。`0`・小数・`usize` 超過は `22000`、負数は `42601`、サーバー設定のチャンク幅超過は `22000`（SQL の `CHUNK n` と同じ規則） |
-| `returning` | △ | string `"*"` または string[] | 返す列の指定（NOSQL-22）。`"*"` か非空の列名配列のみ受理し、それ以外（`null`・数値・空配列・`"*"` を含む配列・識別子でない要素・列名 1 つの文字列形）は `42601`。`mode`／`chunk` との併用も `42601`。現在は妥当な指定でも固定文言の `0A000`（HTTP 501、書き込みなし）で拒否する（実行は Issue #2091 で結線予定。指定を黙って無視しない） |
+| `returning` | △ | string `"*"` または string[] | 返す列の指定（NOSQL-22）。`"*"` か非空の列名配列のみ受理し、それ以外（`null`・数値・空配列・`"*"` を含む配列・識別子でない要素・列名 1 つの文字列形）は `42601`。`mode`／`chunk` との併用も `42601`。実行は SQL の `RETURNING` と同じ実行器で、成功応答は件数キーに続けて `columns`・`rows` を返す（下記「`returning` 付きの応答」。件数キーは `updated`）。返却には書き込み権限に加えて `SELECT` 権限が要る（SQL-40。SQL より厳しい側の全列要求） |
 
 成功応答: `{"updated":<n>,"operation_id":"<echo>"}`（`operation_id` を省略した場合は `{"updated":<n>}`）。`where` 形（単一行）は
 `n` が `0` または `1`（他テナント所有 id・未存在 id はいずれも `updated:0`・
@@ -825,7 +852,7 @@ execute_delete`）・同一の台帳キー空間を共有する。`filter`（述
 | `operation_id` | △ | string | 既定では省略可（成功応答に `operation_id` キーなし。`Idempotency-Key` ヘッダでも指定でき、両方あれば一致必須で不一致は `42601`）。`--require-operation-id` の構成では欠落・`null`・空文字は `23502`（分割実行は構成によらず `23502`）。同一値への再送は台帳照合により `23505`（`DUPLICATE_OPERATION_ID`。内容一致。`DELETE` は行の有無に関わらず同一内容） |
 | `mode` | | string | 分割実行の修飾（Issue #1130・NOSQL-12）。受理値は `"partitioned"` のみで、それ以外の文字列・非文字列は `42601`（黙って原子実行へ切り替えない）。`filter`（述語形）とだけ組み合わせられ、`where` との併用は `42601`。詳細は[分割実行](#分割実行-dml)参照 |
 | `chunk` | | number | 1 チャンクの行数（`mode` 指定時のみ有効。`mode` なしは `42601`）。`0`・小数・`usize` 超過は `22000`、負数は `42601`、サーバー設定のチャンク幅超過は `22000`（SQL の `CHUNK n` と同じ規則） |
-| `returning` | △ | string `"*"` または string[] | 返す列の指定（NOSQL-22）。`"*"` か非空の列名配列のみ受理し、それ以外（`null`・数値・空配列・`"*"` を含む配列・識別子でない要素・列名 1 つの文字列形）は `42601`。`mode`／`chunk` との併用も `42601`。現在は妥当な指定でも固定文言の `0A000`（HTTP 501、書き込みなし）で拒否する（実行は Issue #2091 で結線予定。指定を黙って無視しない） |
+| `returning` | △ | string `"*"` または string[] | 返す列の指定（NOSQL-22）。`"*"` か非空の列名配列のみ受理し、それ以外（`null`・数値・空配列・`"*"` を含む配列・識別子でない要素・列名 1 つの文字列形）は `42601`。`mode`／`chunk` との併用も `42601`。実行は SQL の `RETURNING` と同じ実行器で、成功応答は件数キーに続けて `columns`・`rows` を返す（下記「`returning` 付きの応答」。件数キーは `deleted`）。返却には書き込み権限に加えて `SELECT` 権限が要る（SQL-40。SQL より厳しい側の全列要求） |
 
 成功応答: `{"deleted":<n>,"operation_id":"<echo>"}`（`operation_id` を省略した場合は `{"deleted":<n>}`）。`where` 形（単一行）は
 `n` が `0` または `1`（他テナント所有 id・未存在 id はいずれも `deleted:0`・

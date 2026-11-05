@@ -151,6 +151,7 @@ HTTP の現在ロールの束縛は #2238 がこの関数へ足す拡張点で�
 | `insert`（`execute_bound_insert_in_session`） | INSERT | 名前解決・束縛の後、書き込みより前 |
 | 単一行 `update`（`execute_bound_update_in_session`） | UPDATE + SELECT | 同上 |
 | 単一行 `delete`（`execute_bound_delete_in_session`・`execute_bound_delete_checked_in_session`） | DELETE + SELECT | 同上（前者は束縛済みの主体のときだけ存在確認 `42P01` を先に行う） |
+| `returning` 付きの各入口（`execute_bound_{insert,update,delete_checked,predicate_update,predicate_delete}_returning_in_session`。NOSQL-22・Issue #2091） | 件数版のビットに SELECT を加える（`insert` は INSERT + SELECT。述語形は `partitioned_*_bits` が `returning` で SELECT を足す。単一行 `update`／`delete` はもともと SELECT を含む） | 名前解決・束縛（`bind_returning` を含む）の後、書き込みより前 |
 | 述語形 `update`／`delete`（`execute_bound_predicate_*_in_session`） | `write::partitioned_update_bits`／`partitioned_delete_bits` | 束縛・形検査の後、書き込みより前 |
 | 分割実行（`execute_bound_partitioned_*_in_session`） | 同上 | 入口と、各チャンクの write txn 内の再判定（`RelationPrivilegeRecheck`） |
 | `scan`・`search`・`aggregate`・`explain` | SELECT（#1967） | 入口 |
