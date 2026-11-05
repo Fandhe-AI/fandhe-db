@@ -683,9 +683,14 @@ fn candidate_value_to_scalar_ref<'a>(
         Value::TimestampTz(v) => Some(ScalarRef::TimestampTz(*v)),
         Value::Interval(v) => Some(ScalarRef::Interval(*v)),
         Value::Bit(v) => Some(ScalarRef::Bit(v.as_bit_ref())),
-        // HALFVEC は借用で再構成できず、述語も持たない（束縛段が拒否）。到達しない契約だが、
-        // NULL 扱い（`None`）ではなく型不一致の `Bytes(&[])` を返して fail-closed にする（Issue #2014）。
-        Value::HalfVec(_) => Some(ScalarRef::Bytes(&[])),
+        // HALFVEC は f16 ビット列を LE で並べたペイロード（`array_payload_scratch` が行ごとに組み立てた
+        // スクラッチ）の借用から本物の `ScalarRef::HalfVec` を再構成する（Issue #2016: ANN 経路の
+        // 投影・WHERE の HALFVEC 距離式が読む）。スクラッチが無い場合は NULL 扱い（`None`）にせず、
+        // 型不一致の `Bytes(&[])` を返して fail-closed にする（Issue #2014）。
+        Value::HalfVec(_) => Some(match array_payload {
+            Some(payload) => ScalarRef::HalfVec(payload),
+            None => ScalarRef::Bytes(&[]),
+        }),
         // INT8VEC も同じ理由で型不一致の `Bytes(&[])` を返して fail-closed にする（Issue #2018）。
         Value::Int8Vec(_) => Some(ScalarRef::Bytes(&[])),
         // SPARSEVEC も同じ理由で型不一致の `Bytes(&[])` を返して fail-closed にする（Issue #2025）。
@@ -714,9 +719,10 @@ fn candidate_value_to_scalar_ref<'a>(
     }
 }
 
-/// 候補行の `Value::Array` を [`candidate_value_to_scalar_ref`] が借用する正準
-/// ペイロードへエンコードしたスクラッチ（列位置ごとに `Some`／`None`）。行ごとに
-/// 高々 1 列あたり `MAX_ARRAY_PAYLOAD_LEN` バイト（Top-k 行のみが対象）。
+/// 候補行の `Value::Array`・`Value::HalfVec` を [`candidate_value_to_scalar_ref`] が借用する
+/// ペイロードへエンコードしたスクラッチ（列位置ごとに `Some`／`None`）。配列は正準ペイロード、
+/// HALFVEC は f16 ビット列の LE 並び（Issue #2016）。行ごとに高々 1 列あたり
+/// `MAX_ARRAY_PAYLOAD_LEN` バイト（配列）／宣言次元 × 2 バイト（HALFVEC。Top-k 行のみが対象）。
 pub(crate) fn array_payload_scratch(
     values: &[Value],
 ) -> Result<Vec<Option<Vec<u8>>>, SqlSurfaceError> {
@@ -730,6 +736,20 @@ pub(crate) fn array_payload_scratch(
                     .map_err(|_| SqlSurfaceError::Internal {
                         detail: "candidate array column could not be re-encoded".to_string(),
                     })
+            }
+            Value::HalfVec(bits) => {
+                let mut payload = Vec::new();
+                payload
+                    .try_reserve_exact(bits.len().saturating_mul(2))
+                    .map_err(|_| {
+                        SqlSurfaceError::payload_too_large(
+                            "halfvec payload exceeds available memory",
+                        )
+                    })?;
+                for b in bits {
+                    payload.extend_from_slice(&b.to_le_bytes());
+                }
+                Ok(Some(payload))
             }
             _ => Ok(None),
         })

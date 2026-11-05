@@ -537,3 +537,86 @@ fn subquery_where_knn_falls_back_to_scan_with_declared_index() {
     let plan = explain(&core, "tenant-a", &format!("SELECT id FROM hv {order}"));
     assert!(line(&plan, "ann_plan:").contains("hnsw"), "{plan:?}");
 }
+
+/// 結果（列メタ＋行）または SQLSTATE を比較用の文字列へ写す。索引宣言の前後で値・列型が
+/// 一致することの確認に使う。
+fn outcome_fingerprint(core: &EngineCore, sql: &str) -> String {
+    match exec_as(core, "tenant-a", sql) {
+        Ok(SqlOutcome::Query(q)) => {
+            // `ResultRow::score` は内部の順位付け値（wire へ出ない）で経路により異なるため比較しない。
+            let cells: Vec<&Vec<Cell>> = q.rows.iter().map(|r| &r.cells).collect();
+            format!("{:?}\n{cells:?}", q.columns)
+        }
+        Ok(other) => panic!("{sql} must return a query result, got {other:?}"),
+        Err(e) => format!("ERR {}", e.wire_code()),
+    }
+}
+
+/// 索引宣言済みの HNSW 表で、投影（`SELECT *`・列そのもの・距離式）と WHERE の HALFVEC 距離比較を
+/// 含む kNN が、索引宣言の前後で同じ結果（値・列型）を返す（Issue #2016・TABLE-46）。ANN で扱う形は
+/// EXPLAIN が ANN 計画になり、scan へ戻す形（WHERE に HALFVEC 距離式を含む形）はならない。
+#[test]
+fn projection_and_where_forms_match_scan_with_declared_index() {
+    let (core, _g, _path) = seeded_core("hvh-proj", HnswScope::Declared);
+    let vs = gen_vectors(77, 2);
+    let q = vec_literal(&vs[0]);
+    let q2 = vec_literal(&vs[1]);
+    let order = format!("ORDER BY h <=> '{q}' LIMIT 5");
+    // (文, 索引宣言後に ANN 計画になるか)
+    let cases: Vec<(String, bool)> = vec![
+        (format!("SELECT * FROM hv {order}"), true),
+        (format!("SELECT id, h FROM hv {order}"), true),
+        (format!("SELECT h FROM hv {order}"), true),
+        (format!("SELECT h <=> '{q}' AS d FROM hv {order}"), true),
+        (format!("SELECT id, h <=> '{q}' AS d FROM hv {order}"), true),
+        (format!("SELECT id, h <=> '{q2}' AS d FROM hv {order}"), true),
+        (
+            format!("SELECT id FROM hv WHERE h <=> '{q2}' < 0.5 {order}"),
+            true,
+        ),
+        (format!("SELECT id, h FROM hv WHERE h IS NOT NULL {order}"), true),
+        (
+            format!("SELECT id FROM hv WHERE h <=> '{q2}' < 0.05 {order}"),
+            true,
+        ),
+        (
+            format!("SELECT id FROM hv WHERE h <=> '{q}' < 0.5 AND id > 600 ORDER BY h <=> '{q}' LIMIT 20"),
+            true,
+        ),
+        (
+            format!("SELECT id, h FROM hv WHERE h <=> '{q2}' < 0.9 OR id < 3 {order}"),
+            true,
+        ),
+    ];
+    let before: Vec<String> = cases
+        .iter()
+        .map(|(s, _)| outcome_fingerprint(&core, s))
+        .collect();
+    assert_eq!(
+        code(
+            &core,
+            "CREATE INDEX hv_h ON hv USING hnsw (h halfvec_cosine_ops)"
+        ),
+        ""
+    );
+    for ((sql, ann), expected) in cases.iter().zip(&before) {
+        assert_eq!(&outcome_fingerprint(&core, sql), expected, "{sql}");
+        if expected.starts_with("ERR ") {
+            // 拒否される形（例: ORDER BY と異なるクエリの投影距離）は EXPLAIN も同じ契約で拒否する。
+            let mut s = SessionState::default();
+            let e = core
+                .execute_sql_in_session(&ctx_for("tenant-a"), &mut s, &format!("EXPLAIN {sql}"))
+                .expect_err("rejected form must also be rejected by EXPLAIN");
+            assert_eq!(format!("ERR {}", e.wire_code()), *expected, "{sql}");
+            continue;
+        }
+        let plan = explain(&core, "tenant-a", sql);
+        assert_eq!(
+            plan.iter().any(|l| l.starts_with("ann_plan:")),
+            *ann,
+            "{sql}: {plan:?}"
+        );
+    }
+    // 成功する形は ANN 経路で実行されたことを索引キャッシュで確かめる。
+    assert!(core.hnsw_index_cache_stats().hits + core.hnsw_index_cache_stats().misses > 0);
+}
