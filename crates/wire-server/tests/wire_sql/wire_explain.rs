@@ -363,3 +363,38 @@ fn explain_delete_returns_plan_tree_without_deleting() {
     assert_eq!(read_command_complete(&mut stream), "SELECT 1");
     read_ready_for_query(&mut stream);
 }
+
+/// Issue #2058（SQL-76 (1)）: 簡易クエリで `EXPLAIN (COSTS OFF) SELECT ...` はオプションなしと同じ行を返し、
+/// 未実装の `EXPLAIN (ANALYZE) ...` は `0A000`、未知のオプションは `42601` の ErrorResponse になる。
+#[test]
+fn explain_with_options_accepted_or_rejected() {
+    let (core, _guard) = new_core_with_docs_table();
+    let (mut stream, _users_path) = spawn_with_alice(core);
+
+    send_simple_query(
+        &mut stream,
+        "EXPLAIN (COSTS OFF) SELECT id FROM docs ORDER BY embedding <=> '[1.0,0.0]' LIMIT 10",
+    );
+    let columns = read_row_description(&mut stream);
+    assert_eq!(columns, vec!["QUERY PLAN".to_string()]);
+    for expected in [
+        "mode: recall",
+        "mode_source: default",
+        "engine: (custom_provider)",
+        "ann_plan: unknown_custom_provider",
+        "scalar_plan: plain_scan",
+    ] {
+        let row = read_data_row(&mut stream);
+        assert_eq!(row[0].as_deref(), Some(expected));
+    }
+    assert_eq!(read_command_complete(&mut stream), "EXPLAIN");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(&mut stream, "EXPLAIN (ANALYZE) SELECT id FROM docs");
+    expect_error_response_with_sqlstate(&mut stream, "0A000");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(&mut stream, "EXPLAIN (FOO) SELECT id FROM docs");
+    expect_error_response_with_sqlstate(&mut stream, "42601");
+    read_ready_for_query(&mut stream);
+}

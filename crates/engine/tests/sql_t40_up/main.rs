@@ -162,5 +162,6 @@ mod sql75_explain_dml;
 mod sql75_explain_insert;
 mod sql75_explain_join;
 mod sql75_explain_set_operation;
+mod sql76_explain_options;
 mod sql78_predicate_dml_noneq_between_params;
 mod sql78_where_noneq_between_params;
