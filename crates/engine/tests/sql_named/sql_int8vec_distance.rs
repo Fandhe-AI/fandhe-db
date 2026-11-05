@@ -560,7 +560,7 @@ fn explain_reports_scan_plan() {
 }
 
 /// EXPLAIN は WHERE 付きでも部分クエリ対応の共通経路（HALFVEC と同じ `run_relational_explain_scan`）で
-/// scan の計画を返す。ランキング検索の部分クエリは構文段で HALFVEC と同じ固定文の `42601` になる。
+/// scan の計画を返す（WHERE の部分クエリは段の木へ展開される）。
 #[test]
 fn explain_with_where_uses_shared_scan_path() {
     let (_g, core, _rows) = setup("ivd-explain-where", 4, 5, 7);
@@ -586,7 +586,23 @@ fn explain_with_where_uses_shared_scan_path() {
     for pred in ["id IN (SELECT id FROM t)", "EXISTS (SELECT id FROM t)"] {
         let sql =
             format!("EXPLAIN SELECT id FROM t WHERE {pred} ORDER BY v <-> '[1,2,3,4]' LIMIT 3");
-        assert_eq!(code(&core, &sql), "42601", "{pred}");
+        // 相関部分クエリの EXPLAIN 表示（Issue #2977・SQL-75 ポインタ）以降は、
+        // 部分クエリを段の木へ展開して plain_scan の計画を返す。
+        let SqlOutcome::Explain(q) = exec_as(&core, "alice", &sql).expect("explain") else {
+            panic!("EXPLAIN must return a plan: {pred}");
+        };
+        let text: String = q
+            .rows
+            .iter()
+            .flat_map(|r| r.cells.iter())
+            .filter_map(|c| match c {
+                Cell::Text(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("plain_scan"), "{pred}: {text}");
+        assert!(text.contains("subquery"), "{pred}: {text}");
     }
 }
 
