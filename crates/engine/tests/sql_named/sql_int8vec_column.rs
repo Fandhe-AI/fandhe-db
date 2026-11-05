@@ -5,7 +5,8 @@
 //! (3) 範囲外は `22003`・整数でない表記は `22P02`・次元不一致は `22000`・長さ超過は `54000` で副作用なく
 //! 拒否されること、(4) 列本数の制約（VECTOR・HALFVEC と合わせて 0〜1 本）、(5) 未解禁の機能（距離計算・
 //! 索引・制約・DDL 変更・COPY・CAST・並べ替え・集計）が fail-closed に拒否されること、
-//! (6) テナント境界が不変であることを固定する。距離計算は兄弟 Issue（#2019）の担当。
+//! (6) テナント境界が不変であることを固定する。距離演算子の kNN は Issue #2953 で接続済み
+//! （結果は `sql_int8vec_distance.rs` で固定。ここでは残る拒否の形だけを見る）。
 
 use engine::catalog::ColumnType;
 use engine::core::EngineCore;
@@ -333,7 +334,13 @@ fn unsupported_features_fail_closed() {
     );
     // 検索・式・並べ替え・集計・索引・制約・実体化は拒否する（距離計算は兄弟 Issue #2019 の担当）。
     let cases: &[(&str, &str)] = &[
-        ("SELECT id FROM t ORDER BY v <-> '[1,2]' LIMIT 1", "0A000"),
+        // kNN の距離演算子形は動く（Issue #2953。結果は sql_int8vec_distance で固定）。
+        // 残る拒否は hybrid の関数形・`<+>`・USING PLAN。
+        (
+            "SELECT id FROM t ORDER BY hybrid_rrf(v, '[1,2]', n, 'q') LIMIT 1",
+            "0A000",
+        ),
+        ("SELECT id FROM t ORDER BY v <+> '[1,2]' LIMIT 1", "0A000"),
         ("SELECT id FROM t ORDER BY v", "22000"),
         ("SELECT id FROM t WHERE v = '[1,2]'", "22000"),
         ("SELECT DISTINCT v FROM t", "22000"),

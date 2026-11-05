@@ -1291,6 +1291,77 @@ fn int8vec_column_accepts_text_binding_and_maps_errors() {
     assert_eq!(rows.len(), 1, "rejected binds must not write rows");
 }
 
+/// INT8VEC 列の kNN に `$n` を置ける（TABLE-49 (1)・Issue #2953）: 3 演算子とも Describe の
+/// 仮引数 OID が text（25）で、Execute の結果がリテラル形と一致する。`<+>` は Execute で `0A000`、
+/// 次元不一致は `22000`、整数でない表記は `22P02`、範囲外は `22003`。投影の距離列の `$n` も通る。
+#[test]
+fn int8vec_knn_accepts_placeholder_in_describe_and_execute() {
+    let (core, _g) = new_core();
+    let addr = spawn(core);
+    let mut ext = connect(addr, "alice");
+    let mut simple = connect(addr, "alice");
+
+    let ins = "INSERT INTO int8s (id, h) VALUES ($3, $1) USING OPERATION_ID $2";
+    for (i, lit) in ["[0,0]", "[3,4]", "[-5,12]", "[100,-100]"]
+        .iter()
+        .enumerate()
+    {
+        let id = (i + 1).to_string();
+        let op = format!("i8-knn-{i}");
+        let (_, tag) = run_extended(
+            &mut ext,
+            ins,
+            &[],
+            &[
+                Some(lit.as_bytes()),
+                Some(op.as_bytes()),
+                Some(id.as_bytes()),
+            ],
+        );
+        assert!(tag.starts_with("INSERT"), "tag: {tag}");
+    }
+
+    for op in ["<->", "<#>", "<=>"] {
+        let sql = format!("SELECT id FROM int8s ORDER BY h {op} $1 LIMIT 3");
+        assert_eq!(
+            describe_statement_oids(&mut ext, &sql, &[]),
+            vec![25],
+            "{op}"
+        );
+        let got = run_extended(&mut ext, &sql, &[], &[Some(b"[1,1]")]);
+        let want = run_simple(
+            &mut simple,
+            &format!("SELECT id FROM int8s ORDER BY h {op} '[1,1]' LIMIT 3"),
+        );
+        assert_eq!(got, want, "{op}");
+        assert_eq!(got.0.len(), 3, "{op}");
+        // 投影の距離列の `$n`（同じ値）も Describe・Execute を通る。
+        let sql = format!("SELECT id, h {op} $1 AS d FROM int8s ORDER BY h {op} $1 LIMIT 3");
+        assert_eq!(
+            describe_statement_oids(&mut ext, &sql, &[]),
+            vec![25],
+            "{op}"
+        );
+        let got = run_extended(&mut ext, &sql, &[], &[Some(b"[1,1]")]);
+        let want = run_simple(
+            &mut simple,
+            &format!("SELECT id, h {op} '[1,1]' AS d FROM int8s ORDER BY h {op} '[1,1]' LIMIT 3"),
+        );
+        assert_eq!(got, want, "{op}");
+        // 検証エラーの写像。
+        let sql = format!("SELECT id FROM int8s ORDER BY h {op} $1 LIMIT 3");
+        for (lit, code) in [
+            (&b"[1,2,3]"[..], "22000"),
+            (&b"[1,1.5]"[..], "22P02"),
+            (&b"[1,128]"[..], "22003"),
+        ] {
+            send_pbes_expect_error(&mut ext, &sql, &[], &[], &[Some(lit)], code);
+        }
+    }
+    let sql = "SELECT id FROM int8s ORDER BY h <+> $1 LIMIT 3";
+    send_pbes_expect_error(&mut ext, sql, &[], &[], &[Some(b"[1,1]")], "0A000");
+}
+
 /// SPARSEVEC(N) 列への `$n` text 束縛（TABLE-47・Issue #2025）: 往復一致（入力順は昇順へ正規化）と、
 /// 形式不正 `22P02`・位置範囲外／次元不一致 `22000`・次元上限超過 `54000` の写像。
 /// 拒否された束縛は行を書かない。

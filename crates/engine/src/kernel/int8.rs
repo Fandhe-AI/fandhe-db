@@ -19,9 +19,11 @@
 //! `|acc| <= 255 * 128 * 65536 < i32::MAX` で溢れない。上限超過の次元は
 //! [`KernelError::DimMismatch`] で拒否する。
 //!
-//! 現時点では SQL 経路から呼ばれない（INT8VEC 列型は #2018。`<->`／`<#>`／`<=>` の
-//! 実行接続は #2018 の後に別途行う）。呼び出し元が RLS で絞った行を渡す契約で、
-//! テナント境界の検査は本モジュールの外で完結している。
+//! SQL 経路からは `int8_*_distance` 3 種が行ごとに呼ばれる（`sql::udf_call` の
+//! `BoundExpr::Int8VecDistance`。`<->`／`<#>`／`<=>` の接続は Issue #2953）。`int8_top_k` は
+//! 呼び出し元が無いまま残る（検索 SELECT の DISTANCE 段は f32 の arena 前提で、INT8VEC は式キー
+//! `ORDER BY` の広域取得へ書き換えて実行するため。性能が必要になった時点の別 Issue）。
+//! 呼び出し元が RLS で絞った行を渡す契約で、テナント境界の検査は本モジュールの外で完結している。
 
 use super::cosine::{AscDistanceTopK, DistanceHit};
 use super::KernelError;
