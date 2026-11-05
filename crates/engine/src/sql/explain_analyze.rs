@@ -134,7 +134,7 @@ fn text_row(text: String) -> ResultRow {
 ///
 /// `sql::explain_tree` の字下げ規則（安定契約）に依存する: 深さ 0 の行には前置がなく、深さ 1 以上の行は
 /// `"-> "` か空白で始まる。したがって先頭から「どちらでも始まらない行」が続く範囲が根の段である。
-fn root_end(rows: &[ResultRow]) -> usize {
+pub(crate) fn root_end(rows: &[ResultRow]) -> usize {
     rows.iter()
         .position(|r| match r.cells.first() {
             Some(Cell::Text(t)) => t.starts_with("-> ") || t.starts_with(' '),

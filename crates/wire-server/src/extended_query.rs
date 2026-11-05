@@ -2537,6 +2537,8 @@ fn execute_portal<'e, S: WireStream>(
             ParsedSql::ExplainDml(_) => false,
             // Issue #2054: `EXPLAIN ANALYZE` は SELECT だけを実行し commit を伴わない。
             ParsedSql::ExplainAnalyze(_) => false,
+            // Issue #2060: `EXPLAIN (VERBOSE)` も読み取りのみで commit を伴わない。
+            ParsedSql::ExplainVerbose(_) => false,
             // Issue #2055: DML の `EXPLAIN ANALYZE` は実際に書き込む（autocommit では commit を伴う）ため
             // 通常の DML と同じく書き込み扱いにする（commit 後の失敗は PostCommit で包む）。
             ParsedSql::ExplainAnalyzeDml(_) => !was_active_before_execution,

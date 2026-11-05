@@ -208,6 +208,8 @@ pub(crate) fn classify_write(parsed: &ParsedSql) -> WriteRequirement {
                 .collect(),
         },
         // Issue #2050: 実行した場合と同じ DELETE／UPDATE 権限を要求する（SQL-40）。
+        // Issue #2060: 中身と同じ検査（形式の違いで権限を緩めない）。
+        ParsedSql::ExplainVerbose(inner) => classify_write(inner),
         ParsedSql::ExplainDml(e) => match e {
             ExplainDml::Delete(d) => {
                 let (t, b) = delete_form_bits(&DeleteStatement::Predicate(d.clone()));

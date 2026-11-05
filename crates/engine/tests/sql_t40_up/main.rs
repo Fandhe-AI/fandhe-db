@@ -166,5 +166,6 @@ mod sql76_explain_analyze_dml;
 mod sql76_explain_analyze_hnsw;
 mod sql76_explain_analyze_select;
 mod sql76_explain_options;
+mod sql76_explain_verbose;
 mod sql78_predicate_dml_noneq_between_params;
 mod sql78_where_noneq_between_params;

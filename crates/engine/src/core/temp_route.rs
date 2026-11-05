@@ -261,6 +261,8 @@ fn is_routable(parsed: &ParsedSql) -> bool {
         ParsedSql::CreateIndex(_) | ParsedSql::DropIndex(_) => true,
         // Issue #2054: `EXPLAIN ANALYZE` は一時表の実行に未対応。振り分け対象にせず、一時表が絡めば `0A000`。
         ParsedSql::ExplainAnalyze(_) => false,
+        // Issue #2060: `EXPLAIN (VERBOSE)` も一時表は未対応。一時表が絡めば `0A000`（黙って VERBOSE なしへ縮退しない）。
+        ParsedSql::ExplainVerbose(_) => false,
         // Issue #2055: 一時表への DML の ANALYZE は対象外（振り分けず永続側の拒否に倒す）。
         ParsedSql::ExplainAnalyzeDml(_) => false,
         // SQL-53 (b)・Issue #1754: 一時表が関与する FROM／USING 形は一時コアの結合実行に未対応（`0A000`）。

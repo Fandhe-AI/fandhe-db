@@ -570,7 +570,7 @@ INSERT は #2051 が担当する。`EXPLAIN ... PARTITIONED` は従来の出力�
   内側の文の検証が通った後に意味段（`resolve`）が出現順に評価する（PostgreSQL と同じく内側の文のエラーが先）。
   未知の名前は `42601`、PG にあって本 DB が対応しない名前と `FORMAT XML／YAML` は `0A000`、値の不正と
   `ANALYZE` を伴わない `TIMING` は `22023`。同じオプションは後の指定が勝つ。`FORMAT` の値の省略は `42601`。
-- **未実装のゲート（`0A000`・文は実行しない）**: `ANALYZE`（SELECT 以外。#2054 で SELECT は受理）・`ANALYZE` なしの `SUMMARY` の真、`VERBOSE` の真（#2060）、
+- **未実装のゲート（`0A000`・文は実行しない）**: `ANALYZE`（SELECT 以外。#2054 で SELECT は受理）・`ANALYZE` なしの `SUMMARY` の真（`VERBOSE` は #2060 で受理。`ANALYZE` との併用だけ `0A000`）、
   `FORMAT JSON`（#2059）。各 Issue がゲートを外すときに運搬用の field を `ParsedSql`／`SqlOutcome` へ足す。
   `COSTS`・`FORMAT TEXT`・明示的な偽は受理し、出力はオプションなしの `EXPLAIN` と同一（推定値を出さないため）。
 - **`$n` との併用**: `sql::params` の EXPLAIN 系ガードは先頭の次が `(` だと素通りするため、オプション付きで
@@ -663,3 +663,24 @@ EXPLAIN ANALYZE（親 #2052）の「計測の土台」を実行器へ入れた�
 - **テナント境界（SQL-76 (3)）**: `rows_out`／`rows_removed_by_filter` は RLS の暗黙適用の後の可視行だけから取る。他テナントを含む走査件数は型にも変数にも持たない。他テナントの行数を 0 件と多数件で変えても全段の値が変わらないことをテストで固定した。経過時間は性質上データ量で変わりうるが、不変条件は行数に関するもので、クエリの応答時間そのものが同じ情報を外へ出しており新しい漏えい路ではない。計測値をログ・notice・エラーへ出さない。
 - **未配線の経路**（同じ収集型を使って後続が足す）: aggregate・JOIN・集合演算・CTE・部分クエリ・DML は #2054／#2055、HNSW の反復走査の回数・再取得・厳密走査への切り替え・キャッシュ状態は #2056。ウィンドウ項目を持つ scan（`sql::window` への委譲）は未配線で、記録しない。
 - **オーバーヘッドのベンチ確認**: 本 Issue の実装環境では前後比較ベンチ（`make bench-c1`・`make bench-relational-p95`）を実行していない（未検証）。無効時のコストが構造上、境界の `Option` 分岐だけであることが根拠で、実測は後続で `benchmark-judgement-policy.md` の作法（N≥5 ラウンド・arm 輪番）に従って記録する。
+
+## 追記（Issue #2060・SQL-76 (4)(5)）: VERBOSE と COSTS
+
+- **受理する形**: `EXPLAIN (VERBOSE [ON|OFF]) <文>`・前置形 `EXPLAIN VERBOSE <文>`。後の指定が勝ち、`VERBOSE OFF` は
+  オプションなしと出力が完全に一致する。SELECT 系（検索・集計・広域取得・JOIN・集合演算・CTE・派生表）と述語形
+  `UPDATE`／`DELETE` を受理する。運搬は `ParsedSql::ExplainVerbose(Box<ParsedSql>)`（`#[non_exhaustive]` のため非破壊）。
+  権限ゲート（read／write）・読み取り専用の判定・台帳（`operation_id` なし）は中身と同じ扱いで、一時表を参照する文は
+  振り分けの段で `0A000`（黙って VERBOSE なしへ縮退しない）。
+- **出力の語彙（安定契約）**: 根の段の属性行の末尾（最初の子の段の直前。`explain_analyze::root_end` と同じ規則を共有）に
+  `output: <列>[, <列>...]`（結果の列名。Describe と同じ経路で導出し実行しない。素の識別子以外は `"` で囲み内部の `"` を
+  二重化、制御文字を含む名前は `0A000`）、距離順位付けの検索では `distance_metric: <cosine|l2|ip|l1>`（問い合わせの演算子の
+  種別。`USING PLAN` はコサイン）。`RETURNING` を持つ述語形 DML は `output:` を出し、無ければ追加行なし。
+  既存の行の文言・順序は変えない（VERBOSE の行を除くとオプションなしの出力と一致することをテストで固定）。
+- **使った索引の名前**: `scalar_plan:`／`ann_plan:` に Issue #1066 の注記として既に併記されるため、VERBOSE では重ねて出さない。
+  取得モードも検索の段の `mode:`／`mode_source:` が既にあるため重ねない。
+- **COSTS**: 推定のコスト・行数を持たないため ON／OFF とも出力を変えない（VERBOSE との併用も同じ）。
+- **出さないもの**: 表名・別名・推定値・行数・可視件数。追加行は文とカタログから決まる値だけで、他テナントの行量で変わらない。
+- **fail-closed**: `ANALYZE` との併用・`INSERT`・分割実行（PARTITIONED）は `0A000`。`$n` 付き（Prepare）とセッション無しの
+  入口は従来どおり `42601`。行数が上限（`MAX_EXPLAIN_TREE_LINES`）に追加行を足した範囲を超えたら `54001`。
+- **既知の制限**: 未解決の部分クエリ（`IN (SELECT ...)`／`EXISTS`）を含む WHERE の SELECT 系は、列の導出（Describe の束縛）が
+  受理しないため `output:` を省く（他の行は出る）。段ごとの中間の出力列は今回は根の最終出力だけ。
