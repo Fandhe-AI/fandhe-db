@@ -10,9 +10,15 @@
 //!
 //! # 責務の境界
 //!
-//! 判定基準の設定・実測値の記録・CI 配線は Issue #2080 の担当で、本ベンチは pass/fail を判定しない
-//! （情報提供専用。`.github/workflows/*` へは配線しない）。共有環境の値は採否の根拠にしない
-//! （`docs/design/benchmark-judgement-policy.md` §5）。
+//! Issue #2080 で、分位点差の判定（`harness::rls_timing::judge_rows`。基準は
+//! `docs/design/rls-timing-bench.md`）を標準出力へ記録するようにした。判定結果（pass／fail）は
+//! **終了コードに反映しない**（共有環境の値は採否の根拠にしない。
+//! `docs/design/benchmark-judgement-policy.md` §5）。一方、事前検査の失敗・2 arm の応答不一致
+//! （RLS-10 の応答面の違反）・計測中の期待外応答は従来どおり非 0 終了で、`bench.yml` の
+//! `bench-rls-timing` ジョブ（verdict 非ゲート）はこの失敗だけで red になる。
+//!
+//! 計測せず `raw.json` だけから再判定する入口として `BENCH_RLS_TIMING_REJUDGE=<raw.json のパス>`
+//! を持つ（docs の数値を生 JSON から再現するため。`GITHUB_ACTIONS` 下では拒否する）。
 //!
 //! # 安全策（fail-closed）
 //!
@@ -35,8 +41,9 @@ use harness::protocol::{run_bounded_retain, MeasurementConfig};
 use harness::relational_p95::rotate_arms;
 use harness::rls_timing::{
     build_statements, check_env_consistency, classify_matches, common_rows, flood_extra_rows,
-    parse_iters, parse_rounds, parse_shapes, render_json, render_summary_line, summarize, Arm,
-    Cell, EnvInfo, Outcome, Round, SeedCol, SeedRow, Shape, ALL_ARMS, DDL, NORMAL_ID_BASE, SEED,
+    judge_rows, parse_iters, parse_raw_rounds, parse_rounds, parse_shapes, render_json,
+    render_overall_line, render_summary_line, render_verdict_line, summarize, Arm, Cell, EnvInfo,
+    Outcome, Round, SeedCol, SeedRow, Shape, SummaryRow, ALL_ARMS, DDL, NORMAL_ID_BASE, SEED,
     TENANT_FLOODERS, TENANT_VIEWER, WARMUP,
 };
 
@@ -282,6 +289,52 @@ fn git_commit() -> Option<String> {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
 }
 
+/// 要約行（pooled・ラウンド別）と判定行を標準出力へ書く。判定は参考値で終了コードに影響しない。
+fn print_summary_and_verdicts(summary: &[SummaryRow], dedicated: bool) {
+    for row in summary {
+        println!(
+            "{}",
+            render_summary_line("pooled", row.shape, row.arm, &row.pooled)
+        );
+        for (ri, q) in &row.per_round {
+            println!(
+                "{}",
+                render_summary_line(&format!("round={ri}"), row.shape, row.arm, q)
+            );
+        }
+    }
+    let judgements = judge_rows(summary).unwrap_or_else(|e| fail_closed(e));
+    for j in &judgements {
+        for qj in &j.quantiles {
+            println!("{}", render_verdict_line(j.shape, qj));
+        }
+    }
+    println!("{}", render_overall_line(&judgements));
+    if !dedicated {
+        println!("rls_timing note=shared environment reference only; not an adoption basis");
+    }
+}
+
+/// `BENCH_RLS_TIMING_REJUDGE`: 計測せず `raw.json` を読み戻して判定だけ行う（untrusted 入力）。
+fn rejudge(path: &str) -> ! {
+    if std::env::var("GITHUB_ACTIONS").is_ok() {
+        fail_closed("BENCH_RLS_TIMING_REJUDGE is not allowed under GITHUB_ACTIONS");
+    }
+    let len = std::fs::metadata(path)
+        .unwrap_or_else(|e| fail_closed(format!("cannot stat rejudge input: {e}")))
+        .len();
+    if len > harness::chip::JSON_MAX_INPUT_BYTES as u64 {
+        fail_closed("rejudge input exceeds the size limit");
+    }
+    let text = std::fs::read_to_string(path)
+        .unwrap_or_else(|e| fail_closed(format!("cannot read rejudge input: {e}")));
+    let (shapes, rounds) = parse_raw_rounds(&text).unwrap_or_else(|e| fail_closed(e));
+    let summary = summarize(&rounds, &shapes).unwrap_or_else(|e| fail_closed(e));
+    println!("rls_timing_bench: rejudge from raw json (no measurement)");
+    print_summary_and_verdicts(&summary, false);
+    std::process::exit(0);
+}
+
 fn main() {
     let get = |k: &str| std::env::var(k).ok();
     let rounds_n =
@@ -290,6 +343,9 @@ fn main() {
         parse_iters(get("BENCH_RLS_TIMING_ITERS").as_deref()).unwrap_or_else(|e| fail_closed(e));
     let shapes =
         parse_shapes(get("BENCH_RLS_TIMING_SHAPES").as_deref()).unwrap_or_else(|e| fail_closed(e));
+    if let Some(path) = get("BENCH_RLS_TIMING_REJUDGE").filter(|s| !s.trim().is_empty()) {
+        rejudge(&path);
+    }
     let dedicated = get("BENCH_DEDICATED_ENV").as_deref() == Some("1");
     let github_actions = get("GITHUB_ACTIONS").is_some();
     check_env_consistency(github_actions, dedicated).unwrap_or_else(|e| fail_closed(e));
@@ -363,18 +419,7 @@ fn main() {
     }
 
     let summary = summarize(&rounds, &shapes).unwrap_or_else(|e| fail_closed(e));
-    for row in &summary {
-        println!(
-            "{}",
-            render_summary_line("pooled", row.shape, row.arm, &row.pooled)
-        );
-        for (ri, q) in &row.per_round {
-            println!(
-                "{}",
-                render_summary_line(&format!("round={ri}"), row.shape, row.arm, q)
-            );
-        }
-    }
+    print_summary_and_verdicts(&summary, dedicated);
 
     let info = EnvInfo {
         os: env.os.to_string(),
