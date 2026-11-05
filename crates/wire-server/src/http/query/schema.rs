@@ -986,7 +986,7 @@ pub static UPSERT_SCHEMA: ObjectSchema = ObjectSchema {
 /// `set` の禁止列（`id`／`tenant_id`／`visibility`）検査・列名解決・
 /// `where`／`filter` の排他判定・`operation_id` 欠落／`null`／空文字 →
 /// `23502`・engine への束縛・実行は [`super::update`]・[`super::dml_target`]
-/// （Issue #876）が担う（本スキーマは型のみを検査する）。
+/// （Issue #876）が担う（本スキーマは型のみを検査する）。`if`（Issue #2098）も型のみ検査する。
 pub static UPDATE_SCHEMA: ObjectSchema = ObjectSchema {
     name: "update",
     fields: &[
@@ -1019,6 +1019,15 @@ pub static UPDATE_SCHEMA: ObjectSchema = ObjectSchema {
             presence: Presence::Optional,
             // 述語形 DML の要素の形（葉・`not` グループ・値なしの `is_null` 等）は
             // `http::query::filter` へ集約している（Issue #1197。二重実装しない）。
+            ty: FieldType::Array(ElementType::Any),
+            nullable: false,
+        },
+        // 期待値の条件（楽観的並行制御。Issue #2098・NOSQL-18）。`filter` と同じ形の条件配列で、
+        // 要素の形の検査は `filter` と同様 `http::query::filter` に集約する（二重実装しない）。
+        // 空配列の拒否・`mode: "partitioned"` との併用拒否は `super::dml_target`・`super::partitioned`。
+        FieldSpec {
+            key: "if",
+            presence: Presence::Optional,
             ty: FieldType::Array(ElementType::Any),
             nullable: false,
         },
@@ -1082,6 +1091,15 @@ pub static DELETE_SCHEMA: ObjectSchema = ObjectSchema {
             presence: Presence::Optional,
             // 述語形 DML の要素の形（葉・`not` グループ・値なしの `is_null` 等）は
             // `http::query::filter` へ集約している（Issue #1197。二重実装しない）。
+            ty: FieldType::Array(ElementType::Any),
+            nullable: false,
+        },
+        // 期待値の条件（楽観的並行制御。Issue #2098・NOSQL-18）。`filter` と同じ形の条件配列で、
+        // 要素の形の検査は `filter` と同様 `http::query::filter` に集約する（二重実装しない）。
+        // 空配列の拒否・`mode: "partitioned"` との併用拒否は `super::dml_target`・`super::partitioned`。
+        FieldSpec {
+            key: "if",
+            presence: Presence::Optional,
             ty: FieldType::Array(ElementType::Any),
             nullable: false,
         },
@@ -1772,6 +1790,42 @@ mod tests {
         let delete_null =
             obj(r#"{"op":"delete","table":"docs","where":{"id":1},"operation_id":null}"#);
         assert!(DELETE_SCHEMA.validate(&delete_null).is_ok());
+    }
+
+    /// Issue #2098・NOSQL-18: `if` は update／delete だけが受理し、型（配列）のみ検査する。
+    #[test]
+    fn update_and_delete_accept_if_array_and_reject_other_types() {
+        let cond = r#"[{"column":"lang","op":"eq","value":"ja"}]"#;
+        let u = obj(&format!(
+            r#"{{"op":"update","table":"docs","set":{{"lang":"en"}},"where":{{"id":1}},"if":{cond}}}"#
+        ));
+        assert!(UPDATE_SCHEMA.validate(&u).is_ok());
+        let d = obj(&format!(
+            r#"{{"op":"delete","table":"docs","where":{{"id":1}},"if":{cond}}}"#
+        ));
+        assert!(DELETE_SCHEMA.validate(&d).is_ok());
+        for bad in [r#"{}"#, "null", "1", r#""x""#] {
+            let u = obj(&format!(
+                r#"{{"op":"update","table":"docs","set":{{"lang":"en"}},"where":{{"id":1}},"if":{bad}}}"#
+            ));
+            assert!(matches!(
+                UPDATE_SCHEMA.validate(&u),
+                Err(SchemaError::TypeMismatch { key: "if" })
+            ));
+            let d = obj(&format!(
+                r#"{{"op":"delete","table":"docs","where":{{"id":1}},"if":{bad}}}"#
+            ));
+            assert!(matches!(
+                DELETE_SCHEMA.validate(&d),
+                Err(SchemaError::TypeMismatch { key: "if" })
+            ));
+        }
+    }
+
+    #[test]
+    fn if_is_unknown_key_for_other_ops() {
+        let v = obj(r#"{"op":"search","table":"docs","limit":1,"if":[]}"#);
+        assert!(SEARCH_SCHEMA.validate(&v).is_err());
     }
 
     // --- upsert（Issue #2086） --------------------------------------------

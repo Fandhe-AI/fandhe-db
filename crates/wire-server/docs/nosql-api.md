@@ -6,7 +6,7 @@
 `alter_table`／`drop_table`／`show_partitioned_dml`／`cancel_partitioned_dml`）の JSON
 スキーマを利用者向けに整理する。
 `update`／`delete` は `where`（単一行・PRIMARY KEY 列〔複合可〕または従来方式の表の `id`）・`filter`（述語形）の
-いずれも束縛・実行結線済み（後述の各節参照）。`create_table`／`alter_table`／
+いずれも束縛・実行結線済み（後述の各節参照）で、期待値の条件 `if` を付けられる。`create_table`／`alter_table`／
 `drop_table`（DDL 3 op）は
 `--ddl-allowed-users` に列挙したユーザーのみ実行できる（後述の各節参照）。
 
@@ -645,6 +645,7 @@ SQL の `WHERE` 句省略とのパリティ）。
 | `set` | ○ | object（任意キー・非空） | 列名をキーに持つ部分更新。`id`／`tenant_id`／`visibility` は `42601`。`TEXT` 列は JSON 文字列、`VECTOR` 列は数値配列（**文字列形のベクトルリテラルは受理しない**）のみ受理。他の列型は `insert` と同じ JSON 表現（Issue #896・NOSQL-17。上記参照）。`null` は列型を問わず nullable 判定込みで `bind_update` へ委譲する（非 nullable 列への `null` は `22000`）。型不一致・未知列・次元不一致は `22000`（新型の型不一致は `42601`） |
 | `where` | △ | object | 単一行アドレス（Issue #2201・TABLE-23・NOSQL-23）。キー集合が表の PRIMARY KEY の列集合と完全一致（複合可。値は `filter` の `eq` と同じ型規則）、または疑似列 `id` を持つ表で `{"id": number}`（小数は `22000`、負数は `42601`。SQL 表層とのパリティ）。PK なし表・キーの過不足・未知列・`null` 値・空オブジェクトは `42601`（副作用なし。述語形 `filter` は使える）。`filter` との排他（両方・双方欠落はいずれも `42601`） |
 | `filter` | △ | object[] | [`filter` 配列](#filter-配列)参照。空配列は `42601`。非空は述語形 `UPDATE` として実行される（影響行数上限 `MAX_DML_AFFECTED_ROWS` 超過は `54000`。副作用ゼロ） |
+| `if` | | object[] | 期待値の条件（NOSQL-18・Issue #2098）。[`filter` 配列](#filter-配列)と同じ形・語彙で、`where`／`filter` の対象指定に AND で加わる。空配列・`null`・非配列は `42601`。`mode: "partitioned"` との併用は `42601`。詳細は[条件付き更新・削除（`if`）](#条件付き更新削除if)参照 |
 | `operation_id` | △ | string | 既定では省略可（成功応答に `operation_id` キーなし。`Idempotency-Key` ヘッダでも指定でき、両方あれば一致必須で不一致は `42601`）。`--require-operation-id` の構成では欠落・`null`・空文字は `23502`（分割実行は構成によらず `23502`）。同一値への再送は台帳照合により内容一致 `23505`（`DUPLICATE_OPERATION_ID`）・不一致 `22023`（SQL 表層と共有） |
 | `mode` | | string | 分割実行の修飾（Issue #1130・NOSQL-12）。受理値は `"partitioned"` のみで、それ以外の文字列・非文字列は `42601`（黙って原子実行へ切り替えない）。`filter`（述語形）とだけ組み合わせられ、`where` との併用は `42601`。詳細は[分割実行](#分割実行-dml)参照 |
 | `chunk` | | number | 1 チャンクの行数（`mode` 指定時のみ有効。`mode` なしは `42601`）。`0`・小数・`usize` 超過は `22000`、負数は `42601`、サーバー設定のチャンク幅超過は `22000`（SQL の `CHUNK n` と同じ規則） |
@@ -682,6 +683,31 @@ cross_surface_predicate_*`（`SET` に `VECTOR` 列を含むケースを含む�
  "operation_id": "op-1"}
 ```
 
+### 条件付き更新・削除（`if`）
+
+`update`／`delete` に `if`（期待値の条件）を付けると、対象行の指定（`where` の PRIMARY KEY 形・従来方式の
+`id` 形、または `filter`）に **AND で条件を加えた行だけ**を更新・削除する。楽観的並行制御（読んだ時点の値が
+まだ残っている場合だけ書く）に使う（NOSQL-18・Issue #2098。設計: `docs/design/conditional-update-existence-hiding.md`）。
+
+- `if` は `filter` と同じ形・語彙・型規則（未知列 `42703`、型不一致 `42601`、範囲比較できない列 `22000`、
+  予約述語名 `visible` は `42601`、葉数の上限超過は `54000`）。`filter` と `if` の葉数は合算で上限を判定する
+- `if` だけで `where`／`filter` が無い要求は `42601`（対象行の指定は必須のまま）
+- `if: []` は `42601`（`filter: []` と同じ。engine を呼ばず副作用ゼロ）
+- `mode: "partitioned"` との併用は `42601`（判定と変更を 1 トランザクションで行えないため）
+- 条件の不一致・行が存在しない・他テナントの行・RLS で不可視の行は、**すべて `200` で `n=0`**。応答本文は
+  `operation_id` の有無を含めて同じバイト列で、`if` が存在確認の手段にならない（RLS-9・RLS-10。新しい
+  `wire_code` は無い）。不一致の原因（競合か不存在か）は応答から分からないため、必要なら行を読み直して判断する
+- `n=0` でも `operation_id` は台帳に記録される。同じ `operation_id` で同じ内容を再送すると `23505`、`if` を
+  変えて再送すると `22023`。再試行するときは試行ごとに新しい `operation_id` を発行する
+- SQL 表層の `WHERE <対象> AND <条件> USING OPERATION_ID` と同じ内容照合ハッシュになる（表層を跨いだ再送判定が一致する）
+
+要求例（読んだ `lang` が `ja` のままなら `en` へ更新する）:
+
+```json
+{"op": "update", "table": "docs", "set": {"lang": "en"}, "where": {"id": 1},
+ "if": [{"column": "lang", "op": "eq", "value": "ja"}], "operation_id": "op-2"}
+```
+
 ### `delete`
 
 `where`（単一行・`id` 完全一致形）は束縛・実行結線済み（Issue #876・
@@ -699,6 +725,7 @@ execute_delete`）・同一の台帳キー空間を共有する。`filter`（述
 | `table` | ○ | string | |
 | `where` | △ | object | 単一行アドレス（Issue #2201・TABLE-23・NOSQL-23）。キー集合が表の PRIMARY KEY の列集合と完全一致（複合可。値は `filter` の `eq` と同じ型規則）、または疑似列 `id` を持つ表で `{"id": number}`（小数は `22000`、負数は `42601`。SQL 表層とのパリティ）。PK なし表・キーの過不足・未知列・`null` 値・空オブジェクトは `42601`（副作用なし。述語形 `filter` は使える）。`filter` との排他（両方・双方欠落はいずれも `42601`） |
 | `filter` | △ | object[] | [`filter` 配列](#filter-配列)参照。空配列は `42601`。非空は述語形 `DELETE` として実行される（影響行数上限 `MAX_DML_AFFECTED_ROWS` 超過は `54000`。副作用ゼロ） |
+| `if` | | object[] | 期待値の条件（NOSQL-18・Issue #2098）。[`filter` 配列](#filter-配列)と同じ形・語彙で、`where`／`filter` の対象指定に AND で加わる。空配列・`null`・非配列は `42601`。`mode: "partitioned"` との併用は `42601`。詳細は[条件付き更新・削除（`if`）](#条件付き更新削除if)参照 |
 | `operation_id` | △ | string | 既定では省略可（成功応答に `operation_id` キーなし。`Idempotency-Key` ヘッダでも指定でき、両方あれば一致必須で不一致は `42601`）。`--require-operation-id` の構成では欠落・`null`・空文字は `23502`（分割実行は構成によらず `23502`）。同一値への再送は台帳照合により `23505`（`DUPLICATE_OPERATION_ID`。内容一致。`DELETE` は行の有無に関わらず同一内容） |
 | `mode` | | string | 分割実行の修飾（Issue #1130・NOSQL-12）。受理値は `"partitioned"` のみで、それ以外の文字列・非文字列は `42601`（黙って原子実行へ切り替えない）。`filter`（述語形）とだけ組み合わせられ、`where` との併用は `42601`。詳細は[分割実行](#分割実行-dml)参照 |
 | `chunk` | | number | 1 チャンクの行数（`mode` 指定時のみ有効。`mode` なしは `42601`）。`0`・小数・`usize` 超過は `22000`、負数は `42601`、サーバー設定のチャンク幅超過は `22000`（SQL の `CHUNK n` と同じ規則） |

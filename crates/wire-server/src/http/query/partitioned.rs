@@ -68,6 +68,9 @@ pub enum PartitionedRequestError {
     NegativeChunk,
     /// `mode` と `where`（単一行形）の組合せ（`42601`）。
     WhereNotAllowed,
+    /// `mode` と `if` の組合せ（`42601`。Issue #2098）。分割実行は判定と変更を 1 トランザクションで
+    /// 行えず、条件付き更新の原子性を保てないため engine を呼ぶ前に拒否する。
+    ConditionNotAllowed,
 }
 
 impl From<SchemaError> for PartitionedRequestError {
@@ -83,6 +86,7 @@ impl ClassifiedError for PartitionedRequestError {
             PartitionedRequestError::InvalidMode
             | PartitionedRequestError::ChunkWithoutMode
             | PartitionedRequestError::NegativeChunk
+            | PartitionedRequestError::ConditionNotAllowed
             | PartitionedRequestError::WhereNotAllowed => ErrorClass::UnsupportedSqlSyntax,
             PartitionedRequestError::InvalidChunk => ErrorClass::InvalidInput,
         }
@@ -103,6 +107,9 @@ impl ClassifiedError for PartitionedRequestError {
             }
             PartitionedRequestError::WhereNotAllowed => {
                 "mode partitioned requires filter, not where".to_string()
+            }
+            PartitionedRequestError::ConditionNotAllowed => {
+                "mode partitioned cannot be combined with if".to_string()
             }
         }
     }
@@ -144,6 +151,18 @@ pub fn check_target_form(
 ) -> Result<(), PartitionedRequestError> {
     match (modifier, target) {
         (Some(_), TargetForm::RowAddress(_)) => Err(PartitionedRequestError::WhereNotAllowed),
+        _ => Ok(()),
+    }
+}
+
+/// 修飾付きの要求は条件 `if` と併用できない（`42601`。Issue #2098・NOSQL-18 ポインタ）。
+/// `update`／`delete` の `execute` が engine 呼び出し前に呼ぶ。
+pub fn check_condition(
+    modifier: Option<PartitionedModifier>,
+    has_condition: bool,
+) -> Result<(), PartitionedRequestError> {
+    match (modifier, has_condition) {
+        (Some(_), true) => Err(PartitionedRequestError::ConditionNotAllowed),
         _ => Ok(()),
     }
 }
@@ -294,6 +313,16 @@ mod tests {
         super::super::schema::UPDATE_SCHEMA
             .validate(value)
             .expect("schema")
+    }
+
+    #[test]
+    fn condition_is_rejected_with_partitioned_modifier() {
+        let m = Some(PartitionedModifier { chunk_rows: None });
+        let e = check_condition(m, true).unwrap_err();
+        assert!(matches!(e, PartitionedRequestError::ConditionNotAllowed));
+        assert_eq!(e.wire_code(), "42601");
+        assert!(check_condition(m, false).is_ok());
+        assert!(check_condition(None, true).is_ok());
     }
 
     #[test]

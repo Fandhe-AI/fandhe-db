@@ -29,6 +29,22 @@
 //!    済ませる。表のスキーマに依存する解決は呼び出し元（[`super::update`]・
 //!    [`super::delete`]）が次の規則で行う。
 //!
+//! ## 期待値の条件 `if`（Issue #2098・NOSQL-18 ポインタ。ADR
+//! `docs/design/conditional-update-existence-hiding.md`）
+//!
+//! `if` は `filter` と同じ形の条件配列で、`where`／`filter` による対象行の指定に **AND で加える**
+//! 追加条件（楽観的並行制御）。上記の排他判定の対象外で、どちらとも併用できる（`if` だけで
+//! `where`／`filter` が無い場合は従来どおり `42601`）。判定・合成は次のとおり:
+//!
+//! - `if: []` → [`DmlTargetError::EmptyCondition`]（`42601`。`filter: []` と同じ判断。
+//!   engine を呼ばず副作用ゼロ）（[`bind_condition`]）
+//! - 合成順は `[対象行の述語] ++ [if の述語]`（宣言順・AND）。SQL 表層の
+//!   `WHERE <対象> AND <if>` と同一の AST になり、`content_hash` が表層間で一致する
+//!   （[`bind_condition_predicates`]・[`bind_id_address_with_condition`]）
+//! - 条件の不一致・不存在・他テナント・RLS で不可視はいずれも `n=0` の同一応答
+//!   （新しい `ErrorClass` は作らない。実行器が可視集合を先に絞ってから述語を評価する）
+//! - `mode: "partitioned"` との併用は `42601`（[`super::partitioned::check_condition`]）
+//!
 //! ## `where` の行アドレス解決規則（Issue #2201）
 //!
 //! - キー集合がちょうど `{"id"}` で表が疑似列 `id` を持つ（従来方式・移行済み）
@@ -122,6 +138,9 @@ pub enum DmlTargetError {
     TooManyAddressKeys,
     /// `where` の列名が識別子として意味を持ちうる形状を満たさない（`42601`）。
     InvalidAddressColumn,
+    /// `if: []`（空配列。`42601`。Issue #2098）。`filter: []` と同じ判断で、engine を一切呼ばず
+    /// 副作用ゼロで拒否する。
+    EmptyCondition,
     /// `where` のキー集合が表の PRIMARY KEY の列集合と一致しない、PRIMARY KEY が無い、
     /// または値が `null`（`42601`。固定文言で列名・表名・値を含めない）。
     RowAddressMismatch,
@@ -144,6 +163,7 @@ impl ClassifiedError for DmlTargetError {
             | DmlTargetError::TooManyAddressKeys
             | DmlTargetError::InvalidAddressColumn
             | DmlTargetError::RowAddressMismatch
+            | DmlTargetError::EmptyCondition
             | DmlTargetError::EmptyFilter => ErrorClass::UnsupportedSqlSyntax,
             DmlTargetError::InvalidWhereId => ErrorClass::InvalidInput,
         }
@@ -156,6 +176,7 @@ impl ClassifiedError for DmlTargetError {
                 "exactly one of where or filter must be specified".to_string()
             }
             DmlTargetError::EmptyFilter => "filter must contain at least one predicate".to_string(),
+            DmlTargetError::EmptyCondition => "if must contain at least one predicate".to_string(),
             DmlTargetError::InvalidWhereId => "where.id must be an integer JSON number".to_string(),
             DmlTargetError::NegativeWhereId => {
                 "where.id must be a non-negative integer".to_string()
@@ -187,6 +208,47 @@ pub fn bind_target_form<'a>(validated: &Validated<'a>) -> Result<TargetForm<'a>,
             Ok(TargetForm::RowAddress(where_obj))
         }
     }
+}
+
+/// `if`（期待値の条件）を取り出す。キー欠落は `Ok(None)`、空配列は
+/// [`DmlTargetError::EmptyCondition`]（`42601`）。スキーマに依存しない検査だけを行い、要素の形・
+/// 列解決は [`bind_condition_predicates`] が `filter` と同じ束縛器で担う
+/// （[`super::update`]・[`super::delete`] の `execute` が `bind_target_form` の直後に呼ぶ。Issue #2098）。
+pub fn bind_condition<'a>(
+    validated: &Validated<'a>,
+) -> Result<Option<&'a [JsonValue]>, DmlTargetError> {
+    match validated.optional_array("if")? {
+        Some([]) => Err(DmlTargetError::EmptyCondition),
+        other => Ok(other),
+    }
+}
+
+/// `if` を `schema` に対して `WherePredicate` 列へ束縛する（`None` は空列）。
+/// 語彙・型レーン・予約述語名の拒否・葉数／深さ上限・未知列の分類はすべて `filter` と同一
+/// （[`filter::bind_filter_where_predicates`] を再利用し第 2 の検査経路を作らない。Issue #2098）。
+pub fn bind_condition_predicates(
+    condition: Option<&[JsonValue]>,
+    schema: &TableSchema,
+) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
+    match condition {
+        None => Ok(Vec::new()),
+        Some(items) => filter::bind_filter_where_predicates(items, schema)
+            .map_err(filter::FilterError::into_sql_surface_error),
+    }
+}
+
+/// 従来方式の単一行形（疑似列 `id` の `where:{"id":n}`）に `if` を足す場合の述語列
+/// `[id = n] ++ [if]` を作る。単一行の実行器には条件を渡せないため、述語形の実行入口へ流す
+/// 呼び出し元（[`super::update`]・[`super::delete`]）が使う。`id = n` は engine のパーサが出す
+/// AST と同一（`engine::sql::allowlist::id_equality_where_predicates`）。
+pub fn bind_id_address_with_condition(
+    id: u64,
+    condition: Option<&[JsonValue]>,
+    schema: &TableSchema,
+) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
+    let mut predicates = engine::sql::allowlist::id_equality_where_predicates(id)?;
+    predicates.extend(bind_condition_predicates(condition, schema)?);
+    Ok(predicates)
 }
 
 /// `where` のスキーマ非依存の検査（空・キー数上限・列名の識別子形状。すべて `42601`）。
@@ -472,6 +534,71 @@ mod tests {
             row_id_from_address(addr),
             Err(DmlTargetError::InvalidWhereId)
         ));
+    }
+
+    #[test]
+    fn condition_absent_is_none_and_binds_to_empty() {
+        let v = validated(
+            r#"{"op":"delete","table":"docs","where":{"id":1}}"#,
+            &super::super::schema::DELETE_SCHEMA,
+        );
+        assert!(bind_condition(&v).unwrap().is_none());
+        assert!(bind_condition_predicates(None, &pk_schema())
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn empty_condition_is_rejected_with_42601() {
+        let v = validated(
+            r#"{"op":"delete","table":"docs","where":{"id":1},"if":[]}"#,
+            &super::super::schema::DELETE_SCHEMA,
+        );
+        let e = bind_condition(&v).unwrap_err();
+        assert!(matches!(e, DmlTargetError::EmptyCondition));
+        assert_eq!(e.wire_code(), "42601");
+    }
+
+    #[test]
+    fn condition_binds_after_target_predicates_in_declared_order() {
+        let v = validated(
+            r#"{"op":"delete","table":"docs","where":{"id":1},
+                "if":[{"column":"v","op":"eq","value":"x"}]}"#,
+            &super::super::schema::DELETE_SCHEMA,
+        );
+        let cond = bind_condition(&v).unwrap();
+        assert_eq!(
+            bind_condition_predicates(cond, &pk_schema()).unwrap().len(),
+            1
+        );
+        let preds = bind_id_address_with_condition(7, cond, &pk_schema()).unwrap();
+        assert_eq!(preds.len(), 2);
+        assert_eq!(
+            preds[0],
+            engine::sql::allowlist::id_equality_where_predicates(7).unwrap()[0]
+        );
+    }
+
+    #[test]
+    fn condition_with_unknown_column_is_42703() {
+        let JsonValue::Array(items) =
+            parse_json(r#"[{"column":"zz","op":"eq","value":"x"}]"#).unwrap()
+        else {
+            panic!("array expected");
+        };
+        let e = bind_condition_predicates(Some(&items), &pk_schema()).unwrap_err();
+        assert_eq!(e.wire_code(), "42703");
+    }
+
+    #[test]
+    fn condition_rejects_reserved_visible_column() {
+        let JsonValue::Array(items) =
+            parse_json(r#"[{"column":"visible","op":"eq","value":true}]"#).unwrap()
+        else {
+            panic!("array expected");
+        };
+        let e = bind_condition_predicates(Some(&items), &pk_schema()).unwrap_err();
+        assert_eq!(e.wire_code(), "42601");
     }
 
     #[test]
