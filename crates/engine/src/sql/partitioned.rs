@@ -27,7 +27,7 @@ use std::num::NonZeroUsize;
 
 use redb::ReadableDatabase;
 
-use crate::error_format::ClassifiedError;
+use crate::error_format::{ClassifiedError, ErrorClass};
 use crate::policy::PolicyContext;
 use crate::recovery::partitioned_job::{self, JobKey, JobRecord, JobStatus};
 use crate::sql::allowlist::{SqlSurfaceError, ValidatedPredicateDelete, ValidatedPredicateUpdate};
@@ -41,6 +41,8 @@ use crate::tenant::partitioned_dml::{PartitionedDmlFailure, PartitionedStopCause
 /// （どちらの上限に当たったかを応答に表さない。ADR §15.4 の残余リスクは許容済み）。
 const MSG_JOB_BUSY: &str = "a partitioned DML job with the same operation_id is already running";
 const MSG_CONCURRENCY: &str = "too many concurrent partitioned DML jobs";
+/// 実行時間の上限による停止の補足文言（`VD001` の Display に付く。固定の英語）。
+const MSG_RUN_TIME_LIMIT: &str = "stopped by the partitioned DML run time limit";
 const MSG_INTERRUPTED_LIMIT: &str = "too many interrupted partitioned DML jobs for this table";
 
 /// 述語形 `UPDATE`／`DELETE` の `PARTITIONED [CHUNK n]` 修飾（SQL-19）。
@@ -131,6 +133,7 @@ pub(crate) fn apply_chunk_override(
 /// - 1 件も commit していない（`committed_total == 0`）失敗は原因のコードのまま返す。
 /// - 1 チャンク以上 commit した後の失敗は `VD001`（`PARTIAL_COMPLETION`。原因はコードだけ）。
 /// - 取り消しは `VD002`（件数入り）。
+/// - 実行時間の上限（`RunTimeLimitReached`）は件数 0 でも `VD001`（原因 `54000`・補足文言つき）。
 /// - 実行中の重複・同時実行数上限は `55P03`、中断記録数上限は `54000`、台帳なし構成は `0A000`。
 ///
 /// `op` は [`crate::sql::exec::map_write_error`] の操作名（`delete`／`update`）、
@@ -156,6 +159,17 @@ pub(crate) fn map_partitioned_failure<E>(
         }
         PartitionedStopCause::ConcurrencyLimitReached => {
             return SqlSurfaceError::partitioned_job_busy(MSG_CONCURRENCY);
+        }
+        // SQL-77 (3)・Issue #2072: 実行時間の上限による停止は、commit 済み件数が 0 でも `VD001`
+        // （再送で再開できる記録を残してある）。原因クラスは資源上限の停止と同じ `54000` で、
+        // 影響行数上限による停止と区別できるよう固定の補足文言を付ける。
+        PartitionedStopCause::RunTimeLimitReached => {
+            return SqlSurfaceError::partial_completion_with_reason(
+                committed,
+                ErrorClass::PayloadTooLarge,
+                operation_id,
+                Some(MSG_RUN_TIME_LIMIT),
+            );
         }
         PartitionedStopCause::LedgerRequired => {
             return SqlSurfaceError::FeatureNotSupported {
@@ -421,6 +435,19 @@ mod tests {
 
     fn map(cause: PartitionedStopCause<SqlSurfaceError>, committed: u64) -> SqlSurfaceError {
         map_partitioned_failure(fail(cause, committed), "op-1", "delete", |e| e)
+    }
+
+    #[test]
+    fn run_time_limit_is_partial_completion_even_with_zero_committed() {
+        for committed in [0u64, 5] {
+            let e = map(PartitionedStopCause::RunTimeLimitReached, committed);
+            assert_eq!(e.wire_code(), "VD001");
+            let msg = e.to_string();
+            assert!(msg.contains(&format!("committed {committed} rows")));
+            assert!(msg.contains("(cause 54000)"));
+            assert!(msg.ends_with("; stopped by the partitioned DML run time limit"));
+            assert!(msg.contains("operation_id 'op-1'"));
+        }
     }
 
     #[test]
