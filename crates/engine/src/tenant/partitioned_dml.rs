@@ -718,10 +718,6 @@ fn chunk_loop<E>(
         };
         let rows_changed = u64::try_from(applied).unwrap_or(u64::MAX);
 
-        if applied > 0 {
-            crate::catalog::bump_table_generation_in_txn(&write_txn, table).map_err(w)?;
-        }
-
         let completed_total = if exhausted {
             Some(
                 partitioned_job::complete_with_fixed_time_in_txn(
@@ -786,6 +782,11 @@ fn chunk_loop<E>(
             return Err(PartitionedStopCause::DeadlineExceeded);
         }
 
+        // テーブル世代のバンプは commit 直前に置く（取り消し・期限の確認で txn を破棄する
+        // 経路ではバンプも破棄される。`table_generation_bump_coverage` の近傍検査にも対応）。
+        if applied > 0 {
+            crate::catalog::bump_table_generation_in_txn(&write_txn, table).map_err(w)?;
+        }
         crate::recovery::commit_boundary::commit(write_txn)
             .map_err(|e| w(TenantWriteError::from(e)))?;
 
