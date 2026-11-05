@@ -483,10 +483,32 @@ JOIN を含む `SELECT` の `EXPLAIN` を受理する（従来は単一表の文
 
 Issue #2048 で `42601` にしていた形のうち、次の 3 つを段の木で返す。いずれも非 EXPLAIN と同じ検証本体（`validate_with_statement`・`derived_table::gate`）が返す文の形を写すだけで、第 2 のパーサー・束縛器は持たない。行・CTE 本文・再帰の反復・キャッシュ・台帳・世代・書き込みロックには触れない。
 
-- **具体化 CTE**（明示 `MATERIALIZED`・本文に `ORDER BY`／`LIMIT`／`OFFSET`／集計を持つ CTE、同じ本文の FROM 直後の派生表）: 外側の層（`limit`／`sort`／`aggregate`／`filter`）を上、`cte`（`cte_mode: materialized`）を境界、本文の段（`limit`／`sort`／`aggregate`／`scan`）を下に並べる。外側の段が無ければ `cte` が根。検証順は Describe の評価後射影形アームと同じ（外側 `LIMIT` の範囲 → 照合 → 本文の結果列の導出 → 外側の束縛）。具体化できない形（序数 `ORDER BY` 等）は検証本体がインラインへ戻すので `cte_mode: inline` のまま。外側／本文に窓関数がある形は固定文の `42601`。
+- **具体化 CTE**（明示 `MATERIALIZED`・本文に `ORDER BY`／`LIMIT`／`OFFSET`／集計を持つ CTE、同じ本文の FROM 直後の派生表）: 外側の層（`limit`／`sort`／`aggregate`／`filter`）を上、`cte`（`cte_mode: materialized`）を境界、本文の段（`limit`／`sort`／`aggregate`／`scan`）を下に並べる。外側の段が無ければ `cte` が根。検証順は Describe の評価後射影形アームと同じ（外側 `LIMIT` の範囲 → 照合 → 本文の結果列の導出 → 外側の束縛）。本文に `ORDER BY` を持つ CTE は序数指定でも `cte_mode: materialized` になる。検証本体がインラインへ戻す形（本文が具体化条件を満たさない CTE。例: 本文が `ORDER BY`／`LIMIT`／集計を持たず `MATERIALIZED` 指定もない）は `cte_mode: inline` のまま。外側／本文に窓関数がある形は固定文の `42601`。
 - **再帰 CTE**: `cte`（`cte_mode: recursive`）→ `recursive_union`（`union: all|distinct`・`search: none|depth_first|breadth_first`・`cycle: present|none`）の下にアンカー項と再帰項を並べる。アンカーは既存の各 builder（`scan`／`aggregate`／`join`／`set_operation`）を再利用し、`FROM` なし定数式は新しい葉 `result`（`source: constant`）で表す。再帰項は単一関係なら `work_table_scan`（`filter: present|none`）、JOIN なら作業表の側を `work_table_scan`（`relation: k`）に置き換えた `join` 木。反復回数・累積行数はデータ依存なので出さない。計画は `recursive_eval::with_prepared` を Describe と共有する。アンカーが未対応の形（ビュー経由・順位付き検索等）は固定文の `42601`。
 - **CTE／派生表を入力にする JOIN**: `join` 木の CTE を指す側だけを `cte`（`relation`・`cte_source: with|derived_table`・`cte_mode: materialized`・`cte_shared: true|false`）に置き換える。`derived_table` かどうかは合成名の判定で決め、名前自体は出さない。slot の本文は `scan` 系の段、`Derived` slot は層（`filter`／`sort`／`limit`）の下に親 slot の `cte` を入れ子にする。実表の側の出力は従来の JOIN `EXPLAIN` とバイト単位で同じ。CTE の側ではカタログ・索引宣言を読まない。
 - **集合演算の入力になる CTE・派生表**: 非 EXPLAIN でも未対応（`42601`）のため、EXPLAIN も同じコードで拒否する（パリティ）。集合演算の実行器に CTE の枝を足す変更は別の機能追加として扱う。
 - **出さない値**: CTE 名・別名・表名・合成名・リテラル・`LIMIT` 値・行数・反復回数（SQL-75 (5)）。出力はテナントの可視行に依存しない。木の上限超過は `54001`。
 - **公開 API の注記**: `CteExplainMain` に variant（`Buffered`）を足した。`ValidatedCteExplain` のフィールドは crate 内専用でクレート外から値を取り出せないため、実質的な互換性影響は無い。
 - **対象外（後続候補）**: 相関／`$n` 付きの WITH・派生表（#2977）、DML（#2049〜#2051）、`EXPLAIN ANALYZE`／オプション（SQL-76）、評価後射影形ビュー由来の形（#1192）。新しい段の語彙の SQL-75 への反映はオーナー判断（spec リポ側）。
+
+## 追記（Issue #2977: WHERE の相関部分クエリと HALFVEC の順位付き検索）
+
+親 #2044（SQL-75 (1)(2)(3)(5)(6) ポインタ）の継続。#2048 で拒否していた形のうち、実行が受理する範囲を
+対応した。**エラー写像は本節が #2048 の記述を上書きする**。
+
+- **相関部分クエリ**: WHERE の相関 `EXISTS`／`NOT EXISTS`／`IN`／`NOT IN`／スカラー（集計形・非集計形）は、
+  実行経路と同じ準備（`classify_correlated_*`・`prepare_*`）と内側だけの連言の静的検証・束縛までを収集モードで通す。
+  行・キャッシュ・台帳・世代・実行回数予算には触れない。相関の ANY/ALL、`ORDER BY` と `LIMIT`／`OFFSET` を伴う相関
+  スカラー、直近より外のスコープへの相関などは、実行と同じ共有の準備処理が同じ `wire_code` で拒否する。
+- **出力語彙（閉じた集合への追加）**: 相関のとき `subquery` 段は `correlated: true` に続けて
+  `correlation_keys: <n>`（等価の相関キーの組の数）と `correlated_residual: present|none`（等価で表せない残余述語の
+  有無。ハッシュ半結合か行ごとの再評価かの静的判定）を出す。非相関の出力は #2048 とバイト単位で不変。
+  列名・値・件数以外は出さない（SQL-75 (5)）。
+- **入れ子の親子**: 相関の静的検証は自分でフレームを開閉するので、相関の内側の入れ子の部分クエリは正しい親に付く。
+  相関の集計形スカラーは実行の書き換えどおり `aggregate`（`group_keys` は相関キーの数）→ `scan`（固定の全走査）で示す。
+- **順位付き検索**: `USING PLAN(...)` つきの WHERE の部分クエリは LLM I/O 前に `42601`（実行と同じ）。HALFVEC の kNN は
+  実行が Scan へ写して部分クエリを解決するため、EXPLAIN も同じ経路で `subquery` 段を返す。VECTOR の kNN・HYBRID は
+  実行の束縛段が `42601` で拒否するため EXPLAIN も同じ。
+- **対象外（後続）**: 投影位置・式に埋め込んだ部分クエリ、集計の `FILTER`／`HAVING` の部分クエリ、`$n` を含む
+  EXPLAIN 前置の WITH・派生表・部分クエリは引き続き `42601`（fail-closed）。CTE・派生表の主クエリの部分クエリは
+  実行側が拒否している間は EXPLAIN も同じコードで拒否する。

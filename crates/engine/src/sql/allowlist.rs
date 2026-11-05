@@ -23070,6 +23070,40 @@ fn check_join_relations_are_tables(
         .iter()
         .try_for_each(|r| check_join_relation_is_table(r, lookup))
 }
+/// `EXPLAIN` が段を描画できない広域取得の形（窓関数・値の部分クエリ・WHERE の部分クエリ）を持つか。
+/// 再帰 CTE のアンカー項・再帰項の fail-closed ゲートが共有する（Issue #2976）。持つ形を黙って
+/// 落とした計画を返さないため、`core.rs` の入れ子文の `EXPLAIN` が `42601` に倒す根拠になる。
+pub(crate) fn scan_has_unrendered_explain_shape(v: &ValidatedScan) -> bool {
+    !v.window_items.is_empty()
+        || v.has_value_subqueries()
+        || v.where_predicates
+            .iter()
+            .any(super::subquery::predicate_contains_subquery)
+}
+
+/// [`scan_has_unrendered_explain_shape`] の集計版（WHERE／`FILTER`／`HAVING` の部分クエリ）。
+pub(crate) fn aggregate_has_unrendered_explain_shape(v: &ValidatedAggregate) -> bool {
+    v.where_predicates
+        .iter()
+        .any(super::subquery::predicate_contains_subquery)
+        || super::subquery::aggregate_has_filter_subquery(v)
+}
+
+/// 集合演算木のいずれかの枝が [`scan_has_unrendered_explain_shape`]／
+/// [`aggregate_has_unrendered_explain_shape`] に当たるか。
+pub(crate) fn set_tree_has_unrendered_explain_shape(tree: &SetTree) -> bool {
+    match tree {
+        SetTree::Branch(scan) | SetTree::LimitedBranch(scan) => {
+            scan_has_unrendered_explain_shape(scan)
+        }
+        SetTree::AggregateBranch(agg) => aggregate_has_unrendered_explain_shape(&agg.0),
+        SetTree::Op { left, right, .. } => {
+            set_tree_has_unrendered_explain_shape(left)
+                || set_tree_has_unrendered_explain_shape(right)
+        }
+    }
+}
+
 /// 集合演算木の葉に値の部分クエリがあるか（`EXPLAIN` 用の防御。構文上は起きない想定で、
 /// 起きたら単一表の広域取得 `EXPLAIN` と同じく fail-closed で拒否する）。
 fn set_tree_has_value_subqueries(tree: &SetTree) -> bool {
@@ -27925,24 +27959,10 @@ fn explain_cte_target(
                 "EXPLAIN is not supported for queries with value subqueries",
             ));
         }
-        Statement::Scan(v)
-            if v.where_predicates
-                .iter()
-                .any(super::subquery::predicate_contains_subquery) =>
-        {
-            return Err(SqlSurfaceError::unsupported(
-                "EXPLAIN is not supported for a CTE or derived table with subqueries",
-            ));
-        }
         Statement::Scan(v) => CteExplainMain::Scan(v),
-        Statement::Aggregate(v)
-            if v.where_predicates
-                .iter()
-                .any(super::subquery::predicate_contains_subquery)
-                || super::subquery::aggregate_has_filter_subquery(&v) =>
-        {
+        Statement::Aggregate(v) if super::subquery::aggregate_has_filter_subquery(&v) => {
             return Err(SqlSurfaceError::unsupported(
-                "EXPLAIN is not supported for a CTE or derived table with subqueries",
+                "EXPLAIN is not supported for a CTE or derived table with subqueries in FILTER or HAVING",
             ));
         }
         Statement::Aggregate(v) => CteExplainMain::Aggregate(v),
@@ -27983,6 +28003,19 @@ fn explain_cte_target(
                 {
                     return Err(SqlSurfaceError::unsupported(
                         "EXPLAIN is not supported for a CTE or derived table with subqueries",
+                    ));
+                }
+            }
+            if let Statement::RecursiveCte(rec) = &*v.body {
+                // 再帰項の窓・部分クエリは `work_table_scan` に写らず段が欠落するので拒否する（fail-closed）。
+                let unrendered = match &*rec.recursive {
+                    Statement::Scan(r) => scan_has_unrendered_explain_shape(r),
+                    Statement::Aggregate(r) => aggregate_has_unrendered_explain_shape(r),
+                    _ => false,
+                };
+                if unrendered {
+                    return Err(SqlSurfaceError::unsupported(
+                        "EXPLAIN is not supported for this recursive term of WITH RECURSIVE",
                     ));
                 }
             }
@@ -28615,10 +28648,15 @@ fn validate_sql_tokens_impl(
             // 値としての部分クエリ・FILTER／HAVING の部分クエリ・ランキング検索の部分クエリは
             // 描画する段を持たないため下で明示的に `42601` にする（fail-closed）。
             let target = match validate_select_statement(rest, lookup, subquery_ctx, limits)? {
+                // Issue #2977: `USING PLAN(...)` つきの順位付き検索の部分クエリは、実行も LLM I/O の前に
+                // `42601` で拒否する形なので、EXPLAIN も同じコードで先に拒否する（fail-closed）。
+                // それ以外（HALFVEC の kNN は実行が Scan へ写して部分クエリを解決する。VECTOR の kNN・
+                // HYBRID は `core.rs` の束縛段が実行と同じ `42601` を返す）は `Search` の対象にする。
                 Statement::Select(v)
-                    if v.where_predicates()
-                        .iter()
-                        .any(super::subquery::predicate_contains_subquery) =>
+                    if v.using_plan().is_some()
+                        && v.where_predicates()
+                            .iter()
+                            .any(super::subquery::predicate_contains_subquery) =>
                 {
                     return Err(SqlSurfaceError::unsupported(
                         "EXPLAIN is not supported for ranked searches with subqueries",

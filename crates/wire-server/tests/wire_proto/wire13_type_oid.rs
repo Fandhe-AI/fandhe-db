@@ -699,6 +699,26 @@ fn int8vec_column_is_announced_as_text_oid() {
     assert_eq!(row.get(1).cloned().flatten().as_deref(), Some("[1,-2]"));
     let _tag = read_command_complete(&mut stream);
     read_ready_for_query(&mut stream);
+
+    // 距離演算子の kNN（TABLE-49 (1)・Issue #2953）: 距離列は float8（OID 701）で、INT8VEC 列は
+    // 従来どおり text（25）。値は整数のまま厳密に計算した距離（`[1,-2]` と `[1,-2]` は 0）。
+    send_simple_query(
+        &mut stream,
+        "SELECT id, h, h <-> '[1,-2]' AS d FROM int8s ORDER BY h <-> '[1,-2]' LIMIT 10",
+    );
+    let columns = read_row_description_with_types(&mut stream);
+    assert_eq!(
+        columns,
+        vec![
+            ("id".to_string(), 1700, -1),
+            ("h".to_string(), 25, -1),
+            ("d".to_string(), 701, 8)
+        ]
+    );
+    let row = read_data_row(&mut stream);
+    assert_eq!(row.get(2).cloned().flatten().as_deref(), Some("0"));
+    let _tag = read_command_complete(&mut stream);
+    read_ready_for_query(&mut stream);
     drop(guard);
 }
 

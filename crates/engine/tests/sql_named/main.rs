@@ -80,6 +80,7 @@ mod sql_insert_explain_public_api;
 mod sql_insert_null_literal;
 mod sql_insert_session_dispatch;
 mod sql_int8vec_column;
+mod sql_int8vec_distance;
 mod sql_interval_arith;
 mod sql_interval_column;
 mod sql_interval_part_trunc;

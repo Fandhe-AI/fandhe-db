@@ -216,7 +216,7 @@ fn aggregate_body_and_aggregate_outer() {
 #[test]
 fn materialized_hint_that_falls_back_to_inline_stays_inline() {
     let (core, _g) = seeded("x75i-inline");
-    // 序数 ORDER BY は具体化できず、非 EXPLAIN と同じ検証本体がインラインへ戻す。
+    // 本文に ORDER BY を持つ CTE は序数指定でも具体化される。
     let got = plan(
         &core,
         "EXPLAIN WITH w AS (SELECT k FROM a ORDER BY 1) SELECT k FROM w",
@@ -627,6 +627,29 @@ fn output_is_tenant_independent_and_names_nothing() {
         let text = a.join("\n");
         for needle in ["secret", "77", "?derived"] {
             assert!(!text.contains(needle), "{needle} leaked in {text}");
+        }
+    }
+}
+
+/// 再帰 CTE のアンカー項・再帰項に EXPLAIN が描画できない形（部分クエリ・窓）があるとき、EXPLAIN は
+/// 段を黙って落とした計画を返さず、非 EXPLAIN と同じ `wire_code` で拒否する（fail-closed のパリティ）。
+/// 受理される場合は必ず `42601`（描画できない形の固定拒否）でなければならない。
+#[test]
+fn unrendered_recursive_anchor_and_term_shapes_are_never_planned() {
+    let (core, _g) = seeded("x75i-rec-gate");
+    for body in [
+        "SELECT count(*) FROM a WHERE k IN (SELECT k FROM b) \
+         UNION ALL SELECT n FROM r WHERE n < 3",
+        "SELECT k FROM a WHERE k IN (SELECT k FROM b) UNION SELECT k FROM c \
+         UNION ALL SELECT n FROM r WHERE n < 3",
+        "SELECT k FROM a UNION ALL SELECT n FROM r WHERE n IN (SELECT k FROM b)",
+        "SELECT k FROM a UNION ALL SELECT row_number() OVER (ORDER BY n) FROM r WHERE n < 3",
+    ] {
+        let sql = format!("WITH RECURSIVE r(n) AS ({body}) SELECT n FROM r");
+        let explained = code(&core, &format!("EXPLAIN {sql}"));
+        match run(&core, "tenant-a", &sql) {
+            Err(plain) => assert_eq!(explained, plain, "{sql}"),
+            Ok(_) => assert_eq!(explained, "42601", "{sql}"),
         }
     }
 }
