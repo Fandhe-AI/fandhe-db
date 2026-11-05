@@ -9,6 +9,8 @@
 
 ### Changed
 
+- NoSQL の `upsert` op を実行するようにした（Issue #2087・NOSQL-21・SQL-20・SQL-49 ポインタ）。SQL 表層の `INSERT ... ON CONFLICT` と同じ束縛関数・実行器を通り、応答は `{"upserted":n}`。従来の固定文言 `0A000` は返さない。`Idempotency-Key` ヘッダを `upsert` でも受け付ける。
+  BREAKING CHANGE: wire-server の公開定数 `http::query::gate::UPSERT_NOT_YET_AVAILABLE_MESSAGE` を削除した。
 - `halfvec_*_ops` を VECTOR 列の `USING hnsw` に指定したときのエラーを `42704` から `42804` へ変えた（Issue #2016・TABLE-46 (3)・INDEX-7 ポインタ。PostgreSQL と同じ）。`vector_*_ops` を HALFVEC 列に指定した場合も `42804`。未知の演算子クラスは従来どおり `42704`。
 - `BatchSearchError` に `ZeroNormQuery { query_index }` を追加した（Issue #2003・CORE-6・CORE-16・SQL-33 ポインタ）。コサイン metric のバッチにゼロノルム（アンダーフロー・オーバーフロー含む）のクエリが含まれると、primary へ渡す前に入力エラーで拒否する（縮退イベント・ラッチは起きない）。内積・L2 では従来どおり受理する。
   BREAKING CHANGE: 公開 enum `BatchSearchError` に variant `ZeroNormQuery` を追加した（網羅的 `match` の下流は追随が必要）。
@@ -23,6 +25,7 @@
 
 ### Added
 
+- `EngineCore::execute_bound_upsert_in_session` を追加した（Issue #2087・NOSQL-21 ポインタ）。束縛済み UPSERT のセッション対応入口で、権限・INDEX-4 上限・台帳を SQL 表層と同じ実行器で扱う。
 - `EXPLAIN (FORMAT JSON) <文>` を追加した（Issue #2059・SQL-76 (1)(6) ポインタ）。PostgreSQL 互換の JSON を 1 行 1 列（`QUERY PLAN`・型 `json`・OID 114）で返し、JSON と TEXT は同じ情報を持つ。`FORMAT TEXT`／オプションなしは従来と同一。`FORMAT XML|YAML` と未実装の既知オプションは `0A000`、`FORMAT` の不正値は `22023`、未知の名前・構文の誤りは `42601`。
   BREAKING CHANGE: 公開 enum `ParsedSql` に variant `ExplainJson(Box<ParsedSql>)` を追加した（網羅的 `match` の下流は追随が必要）。
 - `EXPLAIN (VERBOSE)`／`EXPLAIN VERBOSE` を実装した（Issue #2060・SQL-76 (4)(5) ポインタ）。根の段へ `output:`（結果の列名）と、距離順位付けの検索では `distance_metric:` を足す。`COSTS` は出力を変えない。`ANALYZE` との併用・`INSERT`・分割実行・一時表は `0A000`。`ParsedSql` に variant `ExplainVerbose` を追加した（`#[non_exhaustive]` のためクレート外に非破壊）。

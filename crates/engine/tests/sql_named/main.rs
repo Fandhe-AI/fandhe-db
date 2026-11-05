@@ -121,6 +121,7 @@ mod sql_update_null_resend;
 mod sql_update_predicate_bind;
 mod sql_update_single_row;
 mod sql_upsert;
+mod sql_upsert_bound_in_session;
 mod sql_upsert_on_constraint;
 mod sql_using_plan;
 mod sql_varchar_column;

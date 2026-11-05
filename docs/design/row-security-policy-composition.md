@@ -74,7 +74,7 @@
 | COPY | `COPY … FROM`（`commit_copy_in`）／`COPY … TO`（`run_scan_plan`） | FROM は INSERT と同じ WITH CHECK、TO は SELECT と同じ USING | #2280 |
 | 検索 | kNN 厳密走査（`PrefilterIndex`・`SearchTimeFilter`） | 論点 5 のマスク合成 | #2279 |
 | 検索 | HNSW（`sql/hnsw_cache.rs`）・ハイブリッド（`sql/hnsw_hybrid.rs`）・二次索引（`sql/scalar_index.rs`）・`RlsSafetyNet` | 論点 5 のマスク合成 | #2279 |
-| NoSQL | `http/query/{scan,search,aggregate,insert,update,delete}.rs`（NoSQL に `upsert` は無い） | SQL と同じ実行器へ束縛済み計画で渡す既存設計を維持（経路の対応は「NoSQL・COPY への適用（#2280）」節） | #2280 |
+| NoSQL | `http/query/{scan,search,aggregate,insert,update,delete}.rs`（`upsert` は SQL と同じ束縛・実行器を通る。Issue #2087） | SQL と同じ実行器へ束縛済み計画で渡す既存設計を維持（経路の対応は「NoSQL・COPY への適用（#2280）」節） | #2280 |
 
 ## 論点 2: PERMISSIVE・RESTRICTIVE・既定拒否
 
@@ -510,7 +510,7 @@ HNSW のグラフ走査はテナント内の隠れたノードを経由しうる
 
 NoSQL の op 語彙（`Op::ALL` の 12 値）に `get` は無く、語彙は広げない（許可リストの閉包は P0 性質）。
 点取得は `scan` の主キー等値と `update`／`delete` の `where` 単一行形で表し、いずれも SQL の同じ形と同じ実行器を通る。
-`upsert` は Issue #2086 で語彙とスキーマ（`on_conflict`。NOSQL-21 ポインタ）が加わったが、実行器への結線と RLS の合成は Issue #2087 の担当で、それまでは常に `0A000` を返し engine を呼ばない。
+`upsert` は Issue #2086 で語彙とスキーマ（`on_conflict`。NOSQL-21 ポインタ）が加わり、Issue #2087 で SQL 表層と同じ束縛関数・実行器へ結線した。ON CONFLICT の規則（#2277）は NoSQL の `upsert` にも同じく適用される。
 `insert` は `on_conflict` を持たないので、`ON CONFLICT` の規則（#2277）は SQL 表層と NoSQL の `upsert`（結線後）に現れる。
 
 ### HTTP の主体

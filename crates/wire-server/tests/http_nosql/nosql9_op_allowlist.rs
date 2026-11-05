@@ -36,7 +36,7 @@ use crate::http_common;
 use std::net::SocketAddr;
 
 use http_common::{AfterWrite, HttpResponse};
-use wire_server::http::query::gate::{UNSUPPORTED_OP_MESSAGE, UPSERT_NOT_YET_AVAILABLE_MESSAGE};
+use wire_server::http::query::gate::UNSUPPORTED_OP_MESSAGE;
 use wire_server::http::session::store::SessionStore;
 
 /// `POST /v1/session` へログインしてトークン（base64url 表現）を取り出す。
@@ -129,21 +129,16 @@ fn six_allowlisted_ops_reach_the_engine_and_report_undefined_table() {
     }
 }
 
-// --- upsert: 語彙・スキーマ通過後も実行せず専用文言の 0A000（Issue #2086） ---
+// --- upsert: 語彙・スキーマ通過後は engine まで到達する（Issue #2087） ---
 
 #[test]
-fn valid_upsert_returns_dedicated_0a000_and_never_reaches_engine() {
-    // 実行器は Issue #2087 で結線する。それまでは engine 接続済みでも
-    // `42P01` には到達せず、固定文言の `0A000`／501 で止まる。
+fn valid_upsert_reaches_the_engine_and_reports_undefined_table() {
+    // 実行器へ結線済み（Issue #2087）。スローアウェイ core には `docs` が無いので、
+    // `0A000` ではなく `42P01`／404 になる。
     let addr = spawn();
     let body = br#"{"op":"upsert","table":"docs","rows":[{"id":1}],"on_conflict":{"columns":["id"],"do":"update","set":["lang"]},"operation_id":"n9-upsert-1"}"#;
     let resp = query(addr, body);
-    assert_eq!(resp.status, 501, "resp={resp:?}");
-    assert_eq!(http_common::wire_code_of(&resp), "0A000");
-    assert_eq!(
-        http_common::error_message_of(&resp),
-        UPSERT_NOT_YET_AVAILABLE_MESSAGE
-    );
+    http_common::assert_reached_query_gate(&resp);
 }
 
 // --- update／delete: `filter: []`（空配列）は engine を呼ばず 42601 ---

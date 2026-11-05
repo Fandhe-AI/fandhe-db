@@ -76,7 +76,7 @@ use super::typed_json::{self, TypedJsonError};
 /// は `pub(crate)`（engine クレート内限定）のため、wire-server からは列挙子の
 /// フィールドを直接構築する（`InvalidInput` variant は enum の可視性に従い pub）。
 /// 固定文言（`&'static str` リテラル）のみを渡す前提のため切り詰めは行わない。
-fn invalid_input_error(detail: &'static str) -> SqlSurfaceError {
+pub(super) fn invalid_input_error(detail: &'static str) -> SqlSurfaceError {
     SqlSurfaceError::InvalidInput {
         detail: detail.to_string(),
     }
@@ -162,6 +162,35 @@ fn bind_row(
     operation_id: Option<&OperationId>,
     schema: &TableSchema,
 ) -> Result<BoundInsert, InsertError> {
+    let (columns, literals) = row_literals(item, schema)?;
+
+    // 省略された列（VECTOR 列を含む）の補完は `bind_insert_identity` が SQL 表層と同じ規則で行う
+    // （nullable なら NULL、非 nullable で既定値なしなら `23502`。Issue #2042・TABLE-26 (2)）。
+
+    let validated = ValidatedInsert {
+        table_name: table.to_string(),
+        columns,
+        // NoSQL 表層は列を常に明示する（列リスト省略は SQL 表層専用。SQL-50・Issue #1730）。
+        columns_omitted: false,
+        rows: vec![literals],
+        operation_id: operation_id.cloned(),
+        // NoSQL 表層 `insert` op は `RETURNING`／`ON CONFLICT` を公開しない
+        // （Issue #896 のスコープ外）。
+        returning: None,
+        on_conflict: None,
+    };
+    // `id` 省略の受理は移行済み表だけ（`bind_insert_identity` が判定。従来方式の表は `bind_insert` と同じ）。
+    bind_insert_identity(&validated, schema).map_err(InsertError::Bind)
+}
+
+/// JSON 行 1 件を「列名の並び」と「`InsertLiteral` の並び」（宣言順に対応）へ写像する。
+/// `insert` の [`bind_row`] と `upsert`（[`super::upsert`]。Issue #2087）が共有する単一情報源で、
+/// `id` 疑似列の判定・列名の識別子形状検査・未知列・`null`・型別写像（NOSQL-17）をここに集約する。
+/// 並びは `id`（疑似列のとき）が先頭、残りは JSON オブジェクトのキー順（BTreeMap 順）で決定的。
+pub(super) fn row_literals(
+    item: &JsonValue,
+    schema: &TableSchema,
+) -> Result<(Vec<String>, Vec<engine::sql::allowlist::InsertLiteral>), InsertError> {
     let JsonValue::Object(map) = item else {
         return Err(InsertError::Bind(invalid_input_error(
             "INSERT row must be a JSON object",
@@ -255,23 +284,7 @@ fn bind_row(
         literals.push(literal);
     }
 
-    // 省略された列（VECTOR 列を含む）の補完は `bind_insert_identity` が SQL 表層と同じ規則で行う
-    // （nullable なら NULL、非 nullable で既定値なしなら `23502`。Issue #2042・TABLE-26 (2)）。
-
-    let validated = ValidatedInsert {
-        table_name: table.to_string(),
-        columns,
-        // NoSQL 表層は列を常に明示する（列リスト省略は SQL 表層専用。SQL-50・Issue #1730）。
-        columns_omitted: false,
-        rows: vec![literals],
-        operation_id: operation_id.cloned(),
-        // NoSQL 表層 `insert` op は `RETURNING`／`ON CONFLICT` を公開しない
-        // （Issue #896 のスコープ外）。
-        returning: None,
-        on_conflict: None,
-    };
-    // `id` 省略の受理は移行済み表だけ（`bind_insert_identity` が判定。従来方式の表は `bind_insert` と同じ）。
-    bind_insert_identity(&validated, schema).map_err(InsertError::Bind)
+    Ok((columns, literals))
 }
 
 /// `rows`（[`Validated::required_array`]`("rows")` が返す形。要素の型は
