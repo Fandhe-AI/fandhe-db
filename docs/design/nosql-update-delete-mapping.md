@@ -330,3 +330,21 @@ TABLE-23・NOSQL-23 のポインタ。`where` は任意キーのオブジェク�
   SQL 表層の述語形と同じ `WherePredicate` になるため `content_hash`・台帳キー空間が一致する。
 - PK なし表・キーの過不足・未知列・`null` 値 → 固定文言の `42601`（engine の書き込みへ到達しない）。
 - 事前判定と束縛時スナップショットの食い違い（並行 DDL）は fail-closed で拒否する。
+
+## Issue #2098: 期待値の条件 `if`
+
+NOSQL-18 のポインタ。応答方式は [conditional-update-existence-hiding.md](conditional-update-existence-hiding.md)。
+実装は `crates/wire-server/src/http/query/dml_target.rs`（`bind_condition`・`bind_condition_predicates`・
+`bind_id_address_with_condition`）と `update.rs`／`delete.rs`。
+
+- `if` は `filter` と同じ束縛器（`filter::bind_filter_where_predicates`）で `WherePredicate` 列にし、対象行の述語列の
+  **後ろ**へ連結する（`[対象の述語] ++ [if の述語]`）。SQL 表層の `WHERE <対象> AND <条件>` と同じ AST になり、
+  `content_hash`・台帳キー空間が表層間で一致する。
+- 従来方式の `id` 形（`where:{"id":n}`）に `if` が付くときは、単一行の実行器が条件を持てないため、述語形の入口へ
+  `id = n` の述語（`engine::sql::allowlist::id_equality_where_predicates`。パーサが出す AST と同一）と `if` を
+  AND で渡す。束縛 closure で `reject_allocated_schema` を通し、並行 DDL で採番方式へ変わっていた場合は拒否する。
+  `if` が無い要求は従来どおり単一行の実行器を使う（経路・バイト列・`content_hash` は変えない）。
+- `if: []` は `EmptyCondition`（`42601`）、`mode: "partitioned"` との併用は `ConditionNotAllowed`（`42601`）。
+  どちらも engine 呼び出し前に拒否する。
+- 葉数の上限（256）は束縛呼び出しごとの検査に加え、`filter` と `if` の合算を engine 側の再検査が拒否する
+  （`54000`）。第 3 のカウンタは作らない。

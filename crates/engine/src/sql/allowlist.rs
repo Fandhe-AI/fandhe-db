@@ -5797,6 +5797,15 @@ pub(crate) fn id_equality_predicates(
     Ok(predicates)
 }
 
+/// 疑似列 `id` の等価述語列 `id = <n>` を、SQL 表層の述語形 `WHERE id = <n>` と同一の AST で返す
+/// （Issue #2098・NOSQL-18 ポインタ）。wire-server の NoSQL `update`／`delete` が、従来方式の
+/// 単一行形 `where:{"id":n}` に条件 `if` を AND 合成して述語形の実行入口へ流すときに使う。
+/// wire 側で `WherePredicate` を手組みせず、パーサが出す AST と一致させて `content_hash` を
+/// 表層間で揃える（RECOVER-10／11）。SQL 文字列は組み立てない。
+pub fn id_equality_where_predicates(id: u64) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
+    id_equality_predicates(&id.to_string())
+}
+
 impl ValidatedDelete {
     /// 単一行形 `WHERE id = <n>` を、利用者が述語形で書いたときと同じ AST へ戻す
     /// （TABLE-23・Issue #2199）。採番方式の表（`id` を予約しない表）では `id` は通常の列であり、
@@ -40427,6 +40436,25 @@ mod tests {
             }
             ValidatedUpdateForm::Single(_) => panic!("expected Predicate variant"),
         }
+    }
+
+    /// Issue #2098: 公開ラッパーが SQL 述語形 `WHERE id = <n> AND ..` の先頭述語と同一の AST を返す。
+    #[test]
+    fn id_equality_where_predicates_matches_parser_output() {
+        let lookup = catalog_with(&["documents"]);
+        let form = validate_update_form(
+            "UPDATE documents SET body = 'x' WHERE id = 5 AND lang = 'ja' USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect("predicate form");
+        let ValidatedUpdateForm::Predicate(p) = form else {
+            panic!("expected Predicate variant");
+        };
+        let preds = id_equality_where_predicates(5).expect("bind id");
+        assert_eq!(preds.len(), 1);
+        assert_eq!(preds[0], p.where_predicates[0]);
+        assert!(id_equality_where_predicates(u64::MAX).is_ok());
     }
 
     #[test]
