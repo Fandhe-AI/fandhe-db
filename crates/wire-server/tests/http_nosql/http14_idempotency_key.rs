@@ -13,7 +13,7 @@
 //! - 応答はヘッダを返さず、解決した `operation_id` を本文（成功本文・409 の `data`）で返す
 //!
 //! ヘッダ値の取り出し・検証自体は `idempotency_key.rs` の単体テストが担い、SQL との相互再送と
-//! テナント境界は Issue #2065 の範囲である。
+//! テナント境界は `http14_idempotency_key_cross_surface.rs`（Issue #2065）が担う。
 
 use crate::common;
 use crate::http_common;

@@ -143,3 +143,59 @@
 | 不安全な設計（DoS） | 列集合の件数の上限を ACL 照会の前に検査する（C3） |
 | インジェクション | ACL のキーには束縛済みの識別子だけを使い、未検証の文字列連結でキーを作らない |
 | セキュリティ設定ミス | 未束縛セッションの素通し条件を変えない。暫定規則の置き換えで fail-open にしない（C3） |
+
+## 8. Issue #2083 実装記録（列許可の判定を共通ゲートへ統合）
+
+ステータスは Proposed のまま（オーナー承認は未取得）。以下は ADR の C1〜C5 を実装した結果の記録で、承認済みを意味しない。
+
+### 実装した範囲
+
+| 決定 | 実装 |
+| ---- | ---- |
+| C1 | `privilege_gate::columns`。`ColumnSpec`（`TableOnly`／`All`／`Any`／`Names`／`Scan`）を `ColumnDemand` へ解決し、`cover_bits` が列単位の付与で満たせるビットを返す。列で満たせるのは `SELECT`／`INSERT`／`UPDATE`／`REFERENCES` だけ。`DELETE`・`TRUNCATE` は常に表単位 |
+| C3 | 判定点は `check` の 1 本のまま。`PrivilegeTarget::RelationColumns { required_bits, granted_bits, column_cover_bits }` を足した。ACL の照会点は `read::evaluate_in_txn` に一本化（読み取り・書き込み・COPY・分割実行のチャンク再判定が共有） |
+| C3（ACL） | `catalog::privilege::relation_grants_in_txn` が表単位のビットと列単位のビット（relation ごとに 1 回の範囲走査）を同じスナップショット・同じ INHERIT 閉包・同じ PUBLIC 規則で返す。形（`RelationShape`）は列単位の判定が要るときだけ引く |
+| C5 | 付与が 1 つも無いロールは列の解決結果によらず `42501`。付与を持つロールの存在しない列は従来どおり束縛段の `42703`。`42501` は既存の固定文言の variant だけを使う |
+| 暫定規則の置き換え | 「列単位の付与だけでは表単位の要求を満たさない」を廃止。置き換えたテスト: `column_level_grant_satisfies_only_the_granted_columns`（select）・`column_level_grant_satisfies_only_the_listed_columns_of_copy`（copy） |
+
+### 列集合の求め方（C3 からの逸脱）
+
+ゲートは束縛の前に走るため、束縛の結果そのものは使えない。ADR は「トークン走査ではなく束縛の結果」としたが、これは精度
+（列と別名を区別できない）が理由であり、上位近似として使う限り安全である。そこで、列集合は名前解決済みトークン列の識別子と
+relation の列名（大文字小文字を区別しない）の照合による上位近似とした。同名の別名・関数名・他表の列まで要求に入ることは
+あっても、取りこぼし（fail-open）は起きない。
+
+- 精密化するのは、単一 relation の `SELECT`／集約／広域取得（`ReadRequirement::SelectPrecise`）と、`INSERT ... VALUES`・述語形／`id` 指定形の
+  `UPDATE`・`DELETE`・`COPY` の列リストだけ。
+- 実在の relation が複数になる文は、`Scan` を精密化せず `All` にする。JOIN・サブクエリ・CTE・集合演算・EXPLAIN・DECLARE・
+  行ロック句・`INSERT ... SELECT`・`UPDATE ... FROM`・`DELETE ... USING`・データ変更 CTE・`ON CONFLICT` の `UPDATE`・`PARTITIONED` は全列。
+- `*`・`t.*`（`count(*)` を除く）・`NATURAL`・`USING PLAN` は全列。列を参照しない形（`count(*)`・`SELECT 1 FROM t`）は「いずれかの列」。
+- `UPDATE` の `SET` 左辺と `INSERT` の列リストは、書き込みの列として `UPDATE`／`INSERT` で判定し、読みの走査からは除く。
+  右辺・`WHERE`・`RETURNING` が名指しする列は `SELECT` で判定する。位置を確定できない形は除かない（厳しい側）。
+
+### 上限値
+
+| 名前 | 値 | 導出 |
+| ---- | -- | ---- |
+| `MAX_COLUMN_DEMANDS` | 2048 | `relation::MAX_TABLE_REFS`（8）× `catalog::MAX_COLUMN_COUNT`（256）。1 文の列名の数（重複除去後） |
+
+構文木が確定した列名（`INSERT` の列リスト等）の数は ACL の照会より前に検査し、`Scan` の集計は集計の途中で検査する。
+超過は `54000`（固定文言 `too many column references`）。`All`／`Any`／`TableOnly` は列を数え上げないので数えない。
+
+### PG より厳しい箇所
+
+- 疑似列 `id`（従来方式の表の行キー）の参照は表単位でしか満たせない（`GRANT ... (id)` は `42703` で作れない）。
+  `SELECT *`・`COPY ... FROM` の列リスト（`id` を必ず含む）も従来方式の表では表単位が要る。緩めるか（「いずれかの列」にする等）は
+  オーナー判断の後続とする。
+- ビュー・matview は relation 自身の表単位の権限だけで判定する（C2・J10。列付与は `0A000` のまま）。
+- HTTP 表層の bound 読み取り・書き込みは、束縛前の入口で列を特定できないため、列で満たせるビットを全列への要求として判定する。
+  束縛済み計画（`BoundScan` 等）から参照列を集める精密化は後続とする。
+- 分割実行（`PARTITIONED`）は入口もチャンクごとの再判定も全列を要求する（途中の剥奪を含め同じ結論にする）。
+- 自動コミットでは、ゲートの読み取りスナップショットと実行のスナップショットが別になる。ゲートと実行の間の同時
+  `ALTER TABLE ADD COLUMN` で `*` の展開が変わりうる。既存の表単位ゲートの `REVOKE` 競合と同じ種類の制約で、明示 Tx は
+  `BEGIN` 時のスナップショットを共有するので起きない。
+
+### 結線した経路（#2084 の越境マトリクスが狙う対象）
+
+通常 SQL（`parse_tokens_gated`）・拡張クエリ（Parse・Bind・Describe）・明示 Tx（`BEGIN` 時のスナップショット）・COPY（`begin_copy*`）・
+HTTP の bound 読み取り／書き込み・分割実行 DML のチャンク再判定。いずれも既存の呼び出し点のまま、ACL の照会点で列を評価する。

@@ -27,6 +27,10 @@
 //!    `42601`。`insert`／`update`／`delete` 以外の op に付いていれば `42601` で拒否する。
 //!    engine 呼び出しより前に返るため副作用は無い）。書き込み op へは検証済みの値を渡し、
 //!    本文の `operation_id` との一致検査は [`super::operation_id_source`] が行う
+//!    **5b.** `returning` の検査（Issue #2090・NOSQL-22。[`super::returning`]）。値の不正と
+//!    分割実行（`mode`／`chunk`）との併用は `42601`、妥当な指定も実行結線（Issue #2091）まで
+//!    固定文言の `0A000` で拒否する（黙って無視しない）。`42601` が常に `0A000` より先に決まり、
+//!    engine 未接続でも同じ順序。engine は呼ばないため副作用は無い
 //! 6. `op` と `engine`（接続済み `EngineCore`。`Router::new` 経由では
 //!    `None`・`Router::with_engine` 経由でのみ `Some`）の組でディスパッチ
 //!    する。`(Op::Search, Some(engine))` かつ `explain: true` は
@@ -59,6 +63,9 @@
 //!    内部で engine の分割実行入口へ、`(Op::ShowPartitionedDml, Some(engine))`・
 //!    `(Op::CancelPartitionedDml, Some(engine))` が [`super::partitioned::handle_show`]・
 //!    [`super::partitioned::handle_cancel`] へ委譲する
+//!    `upsert`（Issue #2086・NOSQL-1・NOSQL-21）は語彙とスキーマ検証のみ結線済みで、
+//!    通過後は engine 接続の有無にかかわらず [`UPSERT_NOT_YET_AVAILABLE_MESSAGE`]
+//!    の `0A000` を返す（実行器への結線は Issue #2087）
 //!
 //! 手順 3（op 許可リスト）は手順 4（スキーマ検証）より前に行う。語彙外の
 //! `op` にスキーマ検証由来の情報（未知キー等）が先に返ることはない
@@ -76,6 +83,7 @@ use engine::json::parse_json;
 
 use crate::http::idempotency_key::extract_idempotency_key;
 use crate::http::query::op::{classify_op, Op};
+use crate::http::query::returning::{self, ReturningRequestError};
 use crate::http::query::schema::Validated;
 use crate::http::query::{ddl, delete, insert, partitioned, scan, update};
 use crate::http::session::middleware::{self, SessionPrincipal};
@@ -109,12 +117,28 @@ pub(super) fn reject_allocated_schema(
 const IDEMPOTENCY_KEY_NOT_ALLOWED_MESSAGE: &str =
     "idempotency-key header is not allowed for this op";
 
+/// 手順 5b の本体。キー無しは `Ok`、不正値・分割実行との併用は `42601`、妥当な指定は
+/// 実行結線（Issue #2091）まで `0A000`（fail-closed）。
+fn check_returning(validated: &Validated<'_>) -> Result<(), ReturningRequestError> {
+    let projection = returning::parse_returning(validated)?;
+    returning::check_not_partitioned(validated, &projection)?;
+    if projection.is_some() {
+        return Err(ReturningRequestError::NotYetAvailable);
+    }
+    Ok(())
+}
+
 /// 検証を通過したが実行結線が未接続の要求に返す暫定応答の文言。
 /// `scan`・`aggregate`・`insert`・`search`（`explain: true` の `search` を
 /// 含む）・`update`・`delete`（`where` 形・`filter` 形の両方。Issue #876・
 /// #1062）は実行結線済み（Issue #766・#768・#772・#764・#765・#876・#1062）
 /// のため `Router::new` 経由（`engine` 未接続）の場合にのみこの応答へ落ちる。
 pub const PLACEHOLDER_MESSAGE: &str = "query execution not yet available";
+
+/// 語彙・スキーマ検証を通過した `upsert` に返す固定文言（Issue #2086。
+/// 実行器は Issue #2087）。`PLACEHOLDER_MESSAGE`（engine 未接続の意味）とは
+/// 区別する。表名・値を含めない。
+pub const UPSERT_NOT_YET_AVAILABLE_MESSAGE: &str = "upsert execution not yet available";
 
 /// `POST /v1/query` を処理し応答バイト列を返す（認証済み要求のみ）。
 ///
@@ -175,6 +199,14 @@ pub fn handle(
     }
     let header_operation_id = header_operation_id.as_ref();
 
+    // 手順 5b: `returning` の検査（Issue #2090・NOSQL-22）。engine 接続有無に依らず、
+    // ディスパッチより前に決める（`42601` → 未結線 `0A000` の順）。
+    if op.accepts_returning() {
+        if let Err(e) = check_returning(&validated) {
+            return response::encode_error(e.error_class(), &e.client_message(), now_wall);
+        }
+    }
+
     // 手順 6: op と engine 接続有無の組でディスパッチする（Issue #766・
     // #768・#772・#764・#876）。各アームは対応するモジュールへの 1 行委譲に
     // 留める。全 6 op が実行結線済みのため `(_, _)` は `engine` 未接続時
@@ -197,6 +229,13 @@ pub fn handle(
     }
 
     match (op, engine) {
+        // `upsert`（Issue #2086）は実行器が無いため engine 接続の有無によらず
+        // `0A000` で止める。Issue #2087 で `super::upsert::handle` へ結線する。
+        (Op::Upsert, _) => response::encode_error(
+            ErrorClass::FeatureNotSupported,
+            UPSERT_NOT_YET_AVAILABLE_MESSAGE,
+            now_wall,
+        ),
         // `explain: true` は各 op の通常実行より必ず先に判定する
         // （`search` は Issue #765・TASK-186・NOSQL-10、`scan`／`aggregate` は
         // Issue #948・NOSQL-16・SQL-27 で対象拡大）。`explain: true` が
@@ -650,12 +689,13 @@ mod tests {
     }
 
     #[test]
-    fn tenant_id_in_json_is_rejected_for_all_eleven_ops() {
-        let cases: [&[u8]; 11] = [
+    fn tenant_id_in_json_is_rejected_for_all_twelve_ops() {
+        let cases: [&[u8]; 12] = [
             br#"{"op":"search","table":"docs","limit":1,"tenant_id":"evil"}"#,
             br#"{"op":"scan","table":"docs","limit":1,"tenant_id":"evil"}"#,
             br#"{"op":"aggregate","table":"docs","aggregates":[],"tenant_id":"evil"}"#,
             br#"{"op":"insert","table":"docs","rows":[],"tenant_id":"evil"}"#,
+            br#"{"op":"upsert","table":"docs","rows":[],"on_conflict":{"columns":["id"],"do":"nothing"},"tenant_id":"evil"}"#,
             br#"{"op":"update","table":"docs","set":{"lang":"en"},"tenant_id":"evil"}"#,
             br#"{"op":"delete","table":"docs","where":{"id":1},"tenant_id":"evil"}"#,
             br#"{"op":"create_table","table":"docs","columns":[{"name":"a","type":"text"}],"tenant_id":"evil"}"#,
@@ -669,6 +709,45 @@ mod tests {
             let text = String::from_utf8(response).expect("utf-8 response");
             assert!(text.starts_with("HTTP/1.1 400 "), "got: {text}");
             assert!(text.contains("42601"), "got: {text}");
+        }
+    }
+
+    const VALID_UPSERT: &[u8] = br#"{"op":"upsert","table":"docs","rows":[{"id":1}],"on_conflict":{"columns":["id"],"do":"nothing"}}"#;
+
+    #[test]
+    fn valid_upsert_returns_dedicated_0a000_without_engine() {
+        let text = String::from_utf8(run(VALID_UPSERT, &[])).expect("utf-8");
+        assert!(text.starts_with("HTTP/1.1 501 "), "got: {text}");
+        assert!(text.contains("0A000"), "got: {text}");
+        assert!(
+            text.contains(UPSERT_NOT_YET_AVAILABLE_MESSAGE),
+            "got: {text}"
+        );
+        assert!(!text.contains(UNSUPPORTED_OP_MESSAGE), "got: {text}");
+    }
+
+    #[test]
+    fn valid_upsert_with_engine_still_returns_dedicated_0a000() {
+        let (core, _guard) = empty_core();
+        let text = String::from_utf8(run_with_engine(&core, VALID_UPSERT, &[])).expect("utf-8");
+        assert!(text.starts_with("HTTP/1.1 501 "), "got: {text}");
+        assert!(
+            text.contains(UPSERT_NOT_YET_AVAILABLE_MESSAGE),
+            "got: {text}"
+        );
+    }
+
+    #[test]
+    fn upsert_schema_violations_reject_with_42601_not_0a000() {
+        let bodies: [&[u8]; 2] = [
+            br#"{"op":"upsert","table":"docs","rows":[],"on_conflict":{"columns":["id"],"do":"nothing"},"returning":["id"]}"#,
+            br#"{"op":"upsert","table":"docs","rows":[],"on_conflict":{"columns":["id"],"do":"nothing","where":"x"}}"#,
+        ];
+        for body in bodies {
+            let text = String::from_utf8(run(body, &[])).expect("utf-8");
+            assert!(text.starts_with("HTTP/1.1 400 "), "got: {text}");
+            assert!(text.contains("42601"), "got: {text}");
+            assert!(!text.contains("0A000"), "got: {text}");
         }
     }
 
@@ -686,7 +765,7 @@ mod tests {
     fn ddl_udf_transaction_ops_reject_with_0a000() {
         // UDF 呼び出し・トランザクション制御・NOSQL-13 対象外の DDL 相当
         // （index／view 系）・表記揺れは、いずれも許可リスト（Op::parse の
-        // 11 値）に無いため 0A000 に落ちる（拒否リストを別途持たない設計の
+        // 12 値）に無いため 0A000 に落ちる（拒否リストを別途持たない設計の
         // 回帰確認。`update`／`delete` は Issue #875、`create_table`／
         // `alter_table`／`drop_table` は Issue #910 で語彙へ加わったため
         // 本テストの対象から除外した）。
@@ -848,5 +927,57 @@ mod tests {
             !text.contains("other") && !text.contains("key-1"),
             "got: {text}"
         );
+    }
+
+    #[test]
+    fn invalid_returning_is_42601_even_without_engine() {
+        for ret in [
+            r#"[]"#,
+            r#""a""#,
+            r#"["*"]"#,
+            r#"["a b"]"#,
+            r#"1"#,
+            r#"null"#,
+        ] {
+            let json = format!(r#"{{"op":"insert","table":"docs","rows":[],"returning":{ret}}}"#);
+            let text = String::from_utf8(run(json.as_bytes(), &[])).expect("utf-8");
+            assert!(text.starts_with("HTTP/1.1 400 "), "{ret} got: {text}");
+            assert!(text.contains("42601"), "{ret} got: {text}");
+            assert!(!text.contains(PLACEHOLDER_MESSAGE), "{ret} got: {text}");
+        }
+    }
+
+    #[test]
+    fn returning_with_partitioned_is_42601() {
+        let body = br#"{"op":"delete","table":"docs","filter":[{"column":"a","op":"eq","value":1}],"mode":"partitioned","returning":"*"}"#;
+        let text = String::from_utf8(run(body, &[])).expect("utf-8");
+        assert!(text.contains("42601"), "got: {text}");
+        assert!(text.contains("cannot be combined"), "got: {text}");
+    }
+
+    #[test]
+    fn valid_returning_is_fixed_0a000_not_placeholder() {
+        for body in [
+            &br#"{"op":"insert","table":"docs","rows":[],"returning":"*"}"#[..],
+            &br#"{"op":"update","table":"docs","set":{"a":1},"where":{"id":1},"returning":["a"]}"#
+                [..],
+            &br#"{"op":"delete","table":"docs","where":{"id":1},"returning":["a"]}"#[..],
+        ] {
+            let text = String::from_utf8(run(body, &[IDEM])).expect("utf-8");
+            assert!(text.starts_with("HTTP/1.1 501 "), "got: {text}");
+            assert!(text.contains("0A000"), "got: {text}");
+            assert!(
+                text.contains("returning is not yet available"),
+                "got: {text}"
+            );
+            assert!(!text.contains(PLACEHOLDER_MESSAGE), "got: {text}");
+        }
+    }
+
+    #[test]
+    fn returning_on_non_dml_op_is_unknown_key() {
+        let body = br#"{"op":"scan","table":"docs","limit":1,"returning":"*"}"#;
+        let text = String::from_utf8(run(body, &[])).expect("utf-8");
+        assert!(text.contains("42601"), "got: {text}");
     }
 }

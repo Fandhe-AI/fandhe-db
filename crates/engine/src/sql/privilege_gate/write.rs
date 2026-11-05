@@ -13,7 +13,11 @@
 //!
 //! 契約:
 //! - 現在ロール未束縛、または運用者権限のセッションは、トークン走査も ACL の照会もしない（従来と同一）。
-//! - 判定は表単位。列単位の付与だけでは表単位の要求を満たさない（暫定の fail-closed。#2081）。
+//! - 列単位の付与（Issue #2083。`columns.rs`）: `INSERT`／`UPDATE` は列リスト・`SET` 対象の列への列単位の付与で
+//!   満たせ、`SELECT` は文が名指しする列（上位近似）への付与で満たせる。精密化するのは単一 relation の
+//!   `INSERT ... VALUES`・述語形／`id` 指定形の `UPDATE`／`DELETE` だけで、それ以外の形（`ON CONFLICT` の
+//!   `UPDATE`・`INSERT ... SELECT`・`UPDATE ... FROM`・データ変更 CTE・`PARTITIONED`・EXPLAIN 形）は全列を要求する。
+//!   `DELETE`・`TRUNCATE` は常に表単位。
 //! - 判別できない式（SET 右辺の式・ON CONFLICT 句）は SELECT を要求する側（厳しい側）に倒す。
 //! - ビューへの DML はビュー自身の権限だけを判定する（基底表はビュー所有者の権限で書く扱い）。
 //! - `SHOW`／`CANCEL PARTITIONED DML` はジョブ表だけを触り利用者の行に触れないので対象外。一時表だけを
@@ -21,7 +25,7 @@
 //! - エラーは固定文言の `42501`。表名・ロール ID・テナントを含めない。
 
 use crate::catalog::privilege::{
-    relation_grant_bits_in_txn, PRIV_DELETE, PRIV_INSERT, PRIV_SELECT, PRIV_TRUNCATE, PRIV_UPDATE,
+    PRIV_DELETE, PRIV_INSERT, PRIV_SELECT, PRIV_TRUNCATE, PRIV_UPDATE,
 };
 use crate::core::ParsedSql;
 use crate::sql::allowlist::{
@@ -37,7 +41,8 @@ use crate::sql::relation_name::SchemaResolver;
 use crate::storage::read_source::ReadSource;
 use crate::storage::Storage;
 
-use super::read::{gate_relation_names, require_relations_bits, ParsedScope};
+use super::columns::{ColumnSpec, Want};
+use super::read::{evaluate_in_txn, gate_relation_names, require_relations_bits, ParsedScope};
 use super::{check, Principal, PrivilegeTarget};
 
 /// 文の書き込み側の要求。`targets` は書き込み先 relation（キー）と必要ビット。文が参照する他の relation
@@ -45,13 +50,39 @@ use super::{check, Principal, PrivilegeTarget};
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct WriteRequirement {
     pub(crate) targets: Vec<(String, u16)>,
+    /// `targets` と同じ並びの列の仕様（短ければ残りは全列）。
+    specs: Vec<TargetSpec>,
+}
+
+/// 書き込み先 1 件の、ビットごとの列の仕様。既定は全列（判別できない形の厳しい側）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TargetSpec {
+    insert: ColumnSpec,
+    update: ColumnSpec,
+    select: ColumnSpec,
+}
+
+impl Default for TargetSpec {
+    fn default() -> Self {
+        Self {
+            insert: ColumnSpec::All,
+            update: ColumnSpec::All,
+            select: ColumnSpec::All,
+        }
+    }
 }
 
 impl WriteRequirement {
     fn one(table: &str, bits: u16) -> Self {
         Self {
             targets: vec![(table.to_string(), bits)],
+            specs: Vec::new(),
         }
+    }
+
+    fn with_spec(mut self, spec: TargetSpec) -> Self {
+        self.specs = vec![spec];
+        self
     }
 
     /// 本ゲートの対象外（書き込み先を持たない）か。
@@ -77,6 +108,63 @@ fn on_conflict_bits(oc: Option<&OnConflictClause>) -> u16 {
                 ConflictTargetSpec::Columns(_) | ConflictTargetSpec::Constraint(_) => PRIV_SELECT,
             },
         },
+    }
+}
+
+/// 単一行／複数行 `INSERT ... VALUES` の列の仕様。列リストがあればその列、無ければ全列。`ON CONFLICT` の
+/// `UPDATE` は全列。`RETURNING`・衝突対象が読む列は、列リストの宣言位置を除いたトークンから集める。
+fn insert_spec(v: &ValidatedInsert) -> TargetSpec {
+    // `ON CONFLICT ON CONSTRAINT <name>` は制約名しかトークンに現れず、制約の対象列を SELECT 要求へ
+    // 上位近似できない（衝突判定が未許可列の値を読む）。fail-closed で SELECT を全列に倒す。
+    let constraint_target = v
+        .on_conflict
+        .as_ref()
+        .is_some_and(|c| matches!(c.target, ConflictTargetSpec::Constraint(_)));
+    TargetSpec {
+        insert: if v.columns_omitted || v.columns.is_empty() {
+            ColumnSpec::All
+        } else {
+            ColumnSpec::Names(v.columns.clone())
+        },
+        update: ColumnSpec::All,
+        select: if constraint_target {
+            ColumnSpec::All
+        } else {
+            ColumnSpec::ScanExcludingWrites
+        },
+    }
+}
+
+/// `UPDATE` の列の仕様。`SET` 対象の列に UPDATE、読む列（`WHERE`・`RETURNING`・右辺）に SELECT。
+/// `PARTITIONED` はチャンクごとの再判定（全列）と揃えるため全列。
+fn update_spec(u: &ValidatedUpdateForm) -> TargetSpec {
+    match u {
+        ValidatedUpdateForm::Single(v) => TargetSpec {
+            insert: ColumnSpec::All,
+            update: ColumnSpec::Names(v.assignments.iter().map(|(c, _)| c.clone()).collect()),
+            select: ColumnSpec::ScanExcludingWrites,
+        },
+        ValidatedUpdateForm::Predicate(v) if v.partitioned.is_none() => TargetSpec {
+            insert: ColumnSpec::All,
+            update: ColumnSpec::Names(v.assignments.iter().map(|(c, _)| c.clone()).collect()),
+            select: ColumnSpec::ScanExcludingWrites,
+        },
+        ValidatedUpdateForm::Predicate(_) => TargetSpec::default(),
+    }
+}
+
+/// `DELETE` の列の仕様。`DELETE` 自体は表単位で、`WHERE`・`RETURNING` が読む列に SELECT。
+fn delete_spec(d: &DeleteStatement) -> TargetSpec {
+    match d {
+        DeleteStatement::SingleRow(_) => TargetSpec {
+            select: ColumnSpec::Scan,
+            ..TargetSpec::default()
+        },
+        DeleteStatement::Predicate(v) if v.partitioned.is_none() => TargetSpec {
+            select: ColumnSpec::Scan,
+            ..TargetSpec::default()
+        },
+        DeleteStatement::Predicate(_) => TargetSpec::default(),
     }
 }
 
@@ -158,7 +246,9 @@ pub(crate) fn classify_write(parsed: &ParsedSql) -> WriteRequirement {
     use crate::sql::partitioned::PartitionedControl;
     let na = WriteRequirement::default;
     match parsed {
-        ParsedSql::Insert(v) => WriteRequirement::one(&v.table_name, insert_bits(v)),
+        ParsedSql::Insert(v) => {
+            WriteRequirement::one(&v.table_name, insert_bits(v)).with_spec(insert_spec(v))
+        }
         ParsedSql::InsertSelect(v) => WriteRequirement::one(&v.table_name, insert_select_bits(v)),
         // Issue #2051: `EXPLAIN INSERT` は通常の `INSERT` と同じビットを課す（実行しなくても、
         // 権限の無い主体に計画を見せない）。
@@ -172,11 +262,11 @@ pub(crate) fn classify_write(parsed: &ParsedSql) -> WriteRequirement {
         },
         ParsedSql::Update(u) => {
             let (t, b) = update_form_bits(u);
-            WriteRequirement::one(&t, b)
+            WriteRequirement::one(&t, b).with_spec(update_spec(u))
         }
         ParsedSql::Delete(d) => {
             let (t, b) = delete_form_bits(d);
-            WriteRequirement::one(&t, b)
+            WriteRequirement::one(&t, b).with_spec(delete_spec(d))
         }
         ParsedSql::UpdateFrom(v) => {
             WriteRequirement::one(v.target.table(), PRIV_UPDATE | PRIV_SELECT)
@@ -190,6 +280,7 @@ pub(crate) fn classify_write(parsed: &ParsedSql) -> WriteRequirement {
                 .iter()
                 .map(|t| (t.clone(), PRIV_TRUNCATE))
                 .collect(),
+            specs: Vec::new(),
         },
         ParsedSql::ViewInsert(v) => WriteRequirement::one(v.view_name(), insert_bits(&v.shape)),
         ParsedSql::ViewUpdate(v) => {
@@ -206,6 +297,7 @@ pub(crate) fn classify_write(parsed: &ParsedSql) -> WriteRequirement {
                 .iter()
                 .map(|d| dml_statement_bits(&d.statement))
                 .collect(),
+            specs: Vec::new(),
         },
         // Issue #2050: 実行した場合と同じ DELETE／UPDATE 権限を要求する（SQL-40）。
         // Issue #2060: 中身と同じ検査（形式の違いで権限を緩めない）。
@@ -310,19 +402,25 @@ pub(crate) fn classify_write(parsed: &ParsedSql) -> WriteRequirement {
     }
 }
 
-/// `req` と参照トークンから relation ごとの必要ビットを組み立てる。参照から target を 1 回ずつ差し引いた
-/// 残りには SELECT を課す。target が参照に余分に現れる（自己参照）ときは、その分が残りに入り、同名の
-/// target に SELECT が OR で足される。
-fn build_wants(req: &WriteRequirement, candidates: &[String]) -> Vec<(String, u16)> {
+/// `req` と参照トークンから relation ごと・ビットごとの要求を組み立てる。参照から target を 1 回ずつ差し引いた
+/// 残りには全列の SELECT を課す。target が参照に余分に現れる（自己参照）ときは、その分が残りに入り、同名の
+/// target に SELECT が足される。
+fn build_wants(req: &WriteRequirement, candidates: &[String]) -> Vec<Want> {
     let mut remaining: Vec<&String> = candidates.iter().collect();
-    let mut wants: Vec<(String, u16)> = req.targets.clone();
-    for (t, _) in &req.targets {
+    let mut wants: Vec<Want> = Vec::new();
+    for (i, (t, b)) in req.targets.iter().enumerate() {
+        let spec = req.specs.get(i).cloned().unwrap_or_default();
+        wants.extend(Want::split(t, b & PRIV_INSERT, spec.insert));
+        wants.extend(Want::split(t, b & PRIV_UPDATE, spec.update));
+        wants.extend(Want::split(t, b & PRIV_SELECT, spec.select));
+        let rest = b & !(PRIV_INSERT | PRIV_UPDATE | PRIV_SELECT);
+        wants.extend(Want::split(t, rest, ColumnSpec::TableOnly));
         if let Some(i) = remaining.iter().position(|c| *c == t) {
             remaining.remove(i);
         }
     }
     for c in remaining {
-        wants.push((c.clone(), PRIV_SELECT));
+        wants.extend(Want::all(c, PRIV_SELECT));
     }
     wants
 }
@@ -406,13 +504,14 @@ fn require_with_scope(
     // 書き込み先が読み取り側にも現れる文（自己参照の `INSERT ... SELECT`・`UPDATE ... FROM`・
     // `DELETE ... USING`・サブクエリ）は、収集器の候補の数え引きに頼らず SELECT を必ず要求する。
     for name in self_read_targets(req, resolved_tokens) {
-        wants.push((name, PRIV_SELECT));
+        wants.extend(Want::all(&name, PRIV_SELECT));
     }
     require_relations_bits(
         storage,
         tenant,
         principal,
         &wants,
+        resolved_tokens,
         scope.read_snap,
         &parsed_relations,
     )
@@ -467,11 +566,13 @@ pub(crate) fn require_table_write(
     }
     // 呼び出し元が名前解決（`42P01`）を済ませた表なので、照会で見つからなければ解決後に DROP された
     // ものとして拒否する（fail-closed。DML の書き込み先と同じ規則）。
+    // 束縛前後を問わず列は特定できないので、列で満たせるビットは全列への要求にする（厳しい側）。
     require_relations_bits(
         storage,
         tenant,
         &principal,
-        &[(table.to_string(), required_bits)],
+        &Want::all(table, required_bits),
+        &[],
         None,
         &[table.to_string()],
     )
@@ -480,11 +581,15 @@ pub(crate) fn require_table_write(
 /// 書き込み txn の内側で権限を再判定するための値（分割実行 DML のチャンクごとの再検査と、TRUNCATE の
 /// CASCADE 閉包の再判定）。主体が束縛済みかつ運用者権限なしのときだけ作られる（それ以外は `None` を渡し、
 /// 従来と同一）。ACL 行は呼び出し側の txn から読むので、同じ txn の GRANT／REVOKE の結果を見る。
+/// 列で満たせるビット（`SELECT`／`INSERT`／`UPDATE`）は全列への要求として判定する（入口の判定も `PARTITIONED`
+/// は全列にしてあり、途中の列の剥奪も含めて入口と同じ結論になる）。
 #[derive(Debug, Clone)]
 pub(crate) struct RelationPrivilegeRecheck {
+    principal: Principal,
     tenant: String,
-    role_id: u64,
     required_bits: u16,
+    /// 列で満たせるビットの要求先。既定は全列（[`ColumnSpec::All`]）。COPY FROM だけが列リストへ絞る。
+    cols: ColumnSpec,
 }
 
 impl RelationPrivilegeRecheck {
@@ -499,26 +604,41 @@ impl RelationPrivilegeRecheck {
             return None;
         }
         Some(Self {
+            principal,
             tenant: tenant.to_string(),
-            role_id: principal.current_role_id().unwrap_or(0),
             required_bits,
+            cols: ColumnSpec::All,
         })
+    }
+
+    /// 列で満たせるビットの要求先を COPY FROM の列リストへ絞る（`copy.rs` の開始時の判定と同じ
+    /// [`super::copy::copy_from_columns`] の結果を渡す。開始時と commit 時で列集合を食い違わせない）。
+    #[must_use]
+    pub(crate) fn with_columns(mut self, cols: ColumnSpec) -> Self {
+        self.cols = cols;
+        self
     }
 
     /// `tables` のすべてに必要ビットがあるか。`Err(())` は権限不足、または照会失敗（fail-closed）。
     pub(crate) fn check_in_txn<R: ReadSource>(&self, src: &R, tables: &[String]) -> Result<(), ()> {
-        let bits =
-            relation_grant_bits_in_txn(src, &self.tenant, tables, self.role_id).map_err(|_| ())?;
-        // ACL を解決できない表（`None`）は権限を確認できないので拒否する（fail-closed。parse 時の
-        // `require_relations_bits` と同じ扱い）。
-        for granted in bits {
-            let Some(granted) = granted else {
-                return Err(());
-            };
-            if self.required_bits == 0 || granted & self.required_bits != self.required_bits {
-                return Err(());
-            }
+        if self.required_bits == 0 {
+            return Err(());
         }
-        Ok(())
+        let wants: Vec<Want> = tables
+            .iter()
+            .flat_map(|t| Want::split(t, self.required_bits, self.cols.clone()))
+            .collect();
+        // ACL を解決できない表は権限を確認できないので拒否する（fail-closed。parse 時の
+        // `require_relations_bits` と同じ扱い。`tables` をすべて「実在を確認した名前」として渡す）。
+        evaluate_in_txn(
+            &self.principal,
+            src,
+            &self.tenant,
+            tables,
+            &wants,
+            &[],
+            tables,
+        )
+        .map_err(|_| ())
     }
 }
