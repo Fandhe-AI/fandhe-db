@@ -6,6 +6,11 @@
 //! 固定する契約: スコープ外は実行前に `42501`（副作用なし）／応答から表の存在が分からない
 //! （スコープ外の表は存在の有無に依らず同一応答、スコープ内の存在しない表はスコープなしと同じ
 //! `42P01`）／`read_only` は許可リスト／スコープは権限を狭める方向にだけ働く。
+//!
+//! Issue #2102 では、発行後のスコープを要求側から広げられないこと（昇格不能性。HTTP-15・
+//! HTTP-7 ポインタ）を追加で固定する。本文の `scope` 相当キーは未知キーとして `42601`
+//! （スコープ検査の `42501` より先）／ヘッダは読まれず影響しない／パスの余分な要素は
+//! `08P01`／session・session/close からもスコープは変えられない。
 
 use crate::common;
 use crate::http_common;
@@ -23,6 +28,7 @@ use engine::storage::{Storage, Visibility};
 use http_common::temp_db;
 use http_common::{AfterWrite, HttpResponse};
 use wire_server::auth::UserStore;
+use wire_server::http::query::op::Op;
 use wire_server::http::session::store::SessionStore;
 use wire_server::limits::ConnectionLimiter;
 
@@ -336,4 +342,220 @@ fn create_table_foreign_key_target_is_checked_against_tables() {
         r#"{"op":"create_table","table":"child","columns":[{"name":"p","type":"integer"}]}"#,
     );
     assert_eq!(ok.status, 200, "got: {ok:?}");
+}
+// ---- Issue #2102: スコープの上書き・昇格の試行 ----
+
+const WIDE_SCOPE: &str = r#""scope":{"ops":["search","scan","aggregate","insert","upsert","update","delete","create_table","alter_table","drop_table","show_partitioned_dml","cancel_partitioned_dml"],"read_only":false}"#;
+
+/// op ごとの妥当な要求本文。網羅 match のため、op 追加時にコンパイルエラーで気づける。
+fn valid_body(op: Op) -> &'static str {
+    match op {
+        Op::Search => r#"{"op":"search","table":"docs","vector":[0.1],"limit":1}"#,
+        Op::Scan => r#"{"op":"scan","table":"docs","limit":1}"#,
+        Op::Aggregate => {
+            r#"{"op":"aggregate","table":"docs","aggregates":[{"fn":"count","column":"*"}]}"#
+        }
+        Op::Insert => {
+            r#"{"op":"insert","table":"docs","rows":[{"id":1,"lang":"ja"}],"operation_id":"w-1"}"#
+        }
+        Op::Upsert => {
+            r#"{"op":"upsert","table":"docs","rows":[{"id":1,"lang":"ja"}],"on_conflict":{"columns":["id"],"do":"nothing"},"operation_id":"w-2"}"#
+        }
+        Op::Update => {
+            r#"{"op":"update","table":"docs","set":{"lang":"en"},"where":{"id":1},"operation_id":"w-3"}"#
+        }
+        Op::Delete => r#"{"op":"delete","table":"docs","where":{"id":1},"operation_id":"w-4"}"#,
+        Op::CreateTable => {
+            r#"{"op":"create_table","table":"t1","columns":[{"name":"a","type":"text"}]}"#
+        }
+        Op::AlterTable => {
+            r#"{"op":"alter_table","table":"docs","add_column":{"name":"c","type":"text"}}"#
+        }
+        Op::DropTable => r#"{"op":"drop_table","table":"docs"}"#,
+        Op::ShowPartitionedDml => {
+            r#"{"op":"show_partitioned_dml","table":"docs","operation_id":"none"}"#
+        }
+        Op::CancelPartitionedDml => {
+            r#"{"op":"cancel_partitioned_dml","table":"docs","operation_id":"w-5"}"#
+        }
+    }
+}
+
+/// 本文（オブジェクト）の末尾へトップレベルのキー片 `"k":v` を足す。
+fn with_extra(body: &str, extra: &str) -> String {
+    let head = body.trim_end().strip_suffix('}').expect("object body");
+    format!("{head},{extra}}}")
+}
+
+fn assert_unknown_key(resp: &HttpResponse, what: &str) {
+    assert_eq!(resp.status, 400, "{what}: {resp:?}");
+    assert_eq!(http_common::wire_code_of(resp), "42601", "{what}: {resp:?}");
+}
+
+/// 追加ヘッダ付きの `/v1/query` 要求。
+fn q_with_headers(
+    addr: std::net::SocketAddr,
+    token: &str,
+    body: &str,
+    extra: &[(&str, &str)],
+) -> HttpResponse {
+    let len = body.len().to_string();
+    let auth = format!("Bearer {token}");
+    let mut headers = vec![
+        ("Content-Type", "application/json"),
+        ("Content-Length", len.as_str()),
+        ("Authorization", auth.as_str()),
+    ];
+    headers.extend_from_slice(extra);
+    let req = http_common::build_request("/v1/query", &headers, body.as_bytes());
+    http_common::parse_single_response(&http_common::send_raw(addr, &req, AfterWrite::HalfClose))
+}
+
+#[test]
+fn scope_key_in_query_body_is_rejected_with_42601_for_every_op() {
+    let (core, _g) = new_core();
+    let addr = spawn(core);
+    let unscoped = login(addr, "alice", "");
+    let scoped = login(
+        addr,
+        "alice",
+        r#""scope":{"ops":["scan"],"read_only":true}"#,
+    );
+    for op in Op::ALL {
+        let base = valid_body(op);
+        // 比較対照: scope を除いた本文はスキーマ検証を通る（42601 にならない）。
+        let ctrl = q(addr, &unscoped, base);
+        assert!(
+            ctrl.status == 200 || http_common::wire_code_of(&ctrl) != "42601",
+            "{base}: {ctrl:?}"
+        );
+        let body = with_extra(base, WIDE_SCOPE);
+        for token in [&unscoped, &scoped] {
+            let r = q(addr, token, &body);
+            assert_unknown_key(&r, &body);
+            let text = String::from_utf8_lossy(&r.body).into_owned();
+            assert!(!text.contains("scope") && !text.contains("docs"), "{text}");
+        }
+    }
+}
+
+#[test]
+fn scope_like_top_level_keys_are_rejected_with_42601() {
+    let (core, _g) = new_core();
+    let addr = spawn(core);
+    let unscoped = login(addr, "alice", "");
+    let scoped = login(addr, "alice", r#""scope":{"ops":["scan"]}"#);
+    let base = valid_body(Op::Scan);
+    for extra in [
+        r#""scopes":["scan"]"#,
+        r#""read_only":false"#,
+        r#""ops":["aggregate"]"#,
+        r#""tables":["other"]"#,
+    ] {
+        let body = with_extra(base, extra);
+        for token in [&unscoped, &scoped] {
+            assert_unknown_key(&q(addr, token, &body), &body);
+        }
+    }
+}
+
+#[test]
+fn widening_scope_in_body_never_turns_42501_into_success() {
+    let (core, _g) = new_core();
+    let addr = spawn(core);
+    let t = login(addr, "alice", r#""scope":{"ops":["scan"]}"#);
+    let agg = valid_body(Op::Aggregate);
+    // 前提: scope 無しなら 42501。
+    assert_scope_denied(&q(addr, &t, agg));
+    // 広げる scope を添えても 42601（42501 でも 200 でもない）。
+    let widened = with_extra(agg, r#""scope":{"ops":["scan","aggregate"]}"#);
+    assert_unknown_key(&q(addr, &t, &widened), &widened);
+
+    // read_only セッションの insert に read_only:false を添えても副作用なし。
+    let ro = login(addr, "alice", r#""scope":{"read_only":true}"#);
+    let full = login(addr, "alice", "");
+    let ins = valid_body(Op::Insert);
+    let widened_ins = with_extra(ins, r#""scope":{"read_only":false}"#);
+    assert_unknown_key(&q(addr, &ro, &widened_ins), &widened_ins);
+    assert_eq!(row_count(addr, &full, "docs"), 0);
+    // operation_id の台帳も消費されていない。
+    let ok = q(addr, &full, ins);
+    assert_eq!(ok.status, 200, "got: {ok:?}");
+    assert_eq!(row_count(addr, &full, "docs"), 1);
+
+    // 拒否後も元のスコープが効いている。
+    assert_scope_denied(&q(addr, &t, agg));
+    let scan = q(addr, &t, valid_body(Op::Scan));
+    assert_eq!(scan.status, 200, "got: {scan:?}");
+}
+
+#[test]
+fn missing_bearer_with_scope_key_still_rejects_with_28000() {
+    let (core, _g) = new_core();
+    let addr = spawn(core);
+    let body = with_extra(valid_body(Op::Scan), WIDE_SCOPE);
+    let r = post(addr, "/v1/query", None, &body);
+    assert_eq!(r.status, 401, "got: {r:?}");
+    assert_eq!(http_common::wire_code_of(&r), "28000");
+}
+
+#[test]
+fn scope_like_headers_do_not_widen_the_scope() {
+    let (core, _g) = new_core();
+    let addr = spawn(core);
+    let t = login(addr, "alice", r#""scope":{"ops":["scan"]}"#);
+    let agg = valid_body(Op::Aggregate);
+    let plain = q(addr, &t, agg);
+    assert_scope_denied(&plain);
+    let hdrs: [(&str, &str); 3] = [
+        ("Scope", "aggregate"),
+        ("X-Scope", r#"{"ops":["aggregate"],"read_only":false}"#),
+        ("X-Session-Scope", "*"),
+    ];
+    for h in hdrs {
+        let r = q_with_headers(addr, &t, agg, &[h]);
+        assert_scope_denied(&r);
+        assert_eq!(r.body, plain.body, "header {}", h.0);
+        // ヘッダは拒否も許可も引き起こさない（読まれていない）。
+        let ok = q_with_headers(addr, &t, valid_body(Op::Scan), &[h]);
+        assert_eq!(ok.status, 200, "header {}: {ok:?}", h.0);
+    }
+}
+
+#[test]
+fn scope_in_query_path_is_rejected_with_08p01() {
+    let (core, _g) = new_core();
+    let addr = spawn(core);
+    let t = login(addr, "alice", "");
+    let body = valid_body(Op::Scan);
+    for target in ["/v1/query?scope=all", "/v1/query/scope/all"] {
+        for token in [None, Some(t.as_str())] {
+            let r = post(addr, target, token, body);
+            assert_eq!(r.status, 400, "{target}: {r:?}");
+            assert_eq!(http_common::wire_code_of(&r), "08P01", "{target}: {r:?}");
+        }
+    }
+}
+
+#[test]
+fn scoped_token_cannot_mint_or_alter_a_session() {
+    let (core, _g) = new_core();
+    let addr = spawn(core);
+    let t = login(addr, "alice", r#""scope":{"ops":["scan"]}"#);
+    // トークンでは新規発行できない（user・password 必須）。
+    let r = post(addr, "/v1/session", Some(&t), r#"{"scope":{}}"#);
+    assert_unknown_key(&r, "session mint");
+    assert!(!String::from_utf8_lossy(&r.body).contains("token"));
+    // close にスコープを変える入口は無い。
+    let c = post(
+        addr,
+        "/v1/session/close",
+        Some(&t),
+        r#"{"scope":{"read_only":false}}"#,
+    );
+    assert_unknown_key(&c, "session close");
+    // トークンは有効なまま、元のスコープが強制される。
+    assert_scope_denied(&q(addr, &t, valid_body(Op::Aggregate)));
+    let scan = q(addr, &t, valid_body(Op::Scan));
+    assert_eq!(scan.status, 200, "got: {scan:?}");
 }

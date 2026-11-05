@@ -9,10 +9,8 @@
 //! 列の実在確認・権限検査（SQL-40）・RLS 再判定は engine の束縛段が単一の真実源として
 //! 担い、wire 側では行わない（存在情報の推知経路を増やさない）。
 //!
-//! 呼び出し元: [`super::gate::handle`] の手順 5b。実行結線は後続 Issue #2091 の担当で、
-//! 本 Issue では妥当な指定も [`ReturningRequestError::NotYetAvailable`]（`0A000`）で
-//! fail-closed に拒否する（指定を黙って無視して件数だけ返すと、行が返ると期待する
-//! クライアントへの契約違反になるため）。
+//! 呼び出し元: [`super::gate::handle`] の手順 5b。得た投影は `insert`／`update`／`delete` の
+//! `handle` が engine の RETURNING 付き束縛済み入口へ渡して実行する（Issue #2091）。
 //!
 //! エラー文言はすべて固定で、untrusted な入力（列名・文字列）を保持もエコーもしない
 //! （[`super::schema::SchemaError::UnknownKey`] と同じ理由）。
@@ -24,7 +22,7 @@ use engine::sql::allowlist::Projection;
 use super::ident::check_identifier;
 use super::schema::{SchemaError, StringOrArray, Validated};
 
-/// [`parse_returning`]・[`check_not_partitioned`]・未結線拒否の失敗。
+/// [`parse_returning`]・[`check_not_partitioned`] の失敗。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReturningRequestError {
     /// スキーマ層の失敗（透過。`42601`）。
@@ -35,15 +33,12 @@ pub enum ReturningRequestError {
     InvalidIdentifier,
     /// 分割実行（`mode`／`chunk`）との併用（`42601`）。
     WithPartitioned,
-    /// 実行の結線が未提供（`0A000`。Issue #2091 で撤去）。
-    NotYetAvailable,
 }
 
 impl ClassifiedError for ReturningRequestError {
     fn error_class(&self) -> ErrorClass {
         match self {
             ReturningRequestError::Shape(e) => e.error_class(),
-            ReturningRequestError::NotYetAvailable => ErrorClass::FeatureNotSupported,
             ReturningRequestError::Invalid
             | ReturningRequestError::InvalidIdentifier
             | ReturningRequestError::WithPartitioned => ErrorClass::UnsupportedSqlSyntax,
@@ -60,7 +55,6 @@ impl ClassifiedError for ReturningRequestError {
             ReturningRequestError::WithPartitioned => {
                 "returning cannot be combined with mode partitioned".to_string()
             }
-            ReturningRequestError::NotYetAvailable => "returning is not yet available".to_string(),
         }
     }
 }
@@ -211,12 +205,5 @@ mod tests {
         let ret = parse_returning(&validated).expect("parse");
         assert_eq!(ret, Some(Projection::All));
         assert_eq!(check_not_partitioned(&validated, &ret), Ok(()));
-    }
-
-    #[test]
-    fn not_yet_available_is_0a000() {
-        let e = ReturningRequestError::NotYetAvailable;
-        assert_eq!(e.error_class(), ErrorClass::FeatureNotSupported);
-        assert_eq!(ClassifiedError::wire_code(&e), "0A000");
     }
 }
