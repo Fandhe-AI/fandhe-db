@@ -245,6 +245,7 @@ pub(crate) mod cte_explain;
 pub(crate) mod distinct;
 pub(crate) mod dml_from_returning;
 pub mod exec;
+pub(crate) mod exec_stats;
 pub mod explain;
 pub mod explain_dml;
 pub(crate) mod explain_options;
