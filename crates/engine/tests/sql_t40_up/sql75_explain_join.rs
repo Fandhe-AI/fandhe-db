@@ -359,12 +359,10 @@ fn binding_errors_match_execution() {
 #[test]
 fn unsupported_forms_stay_rejected() {
     let (core, _g) = seeded("x75-reject");
-    for sql in [
-        "EXPLAIN SELECT * FROM a JOIN (SELECT k FROM b) s ON a.k = s.k LIMIT 10",
-        "EXPLAIN WITH w AS (SELECT k FROM b) SELECT * FROM a JOIN w ON a.k = w.k LIMIT 10",
-    ] {
-        assert_eq!(code(&core, sql), "42601", "{sql}");
-    }
+    // CTE・派生表を入力にする JOIN は Issue #2976 で対応した（`sql75_explain_cte_inputs.rs`）。
+    // ここでは JOIN と関係のない未対応形の代表を固定する。
+    let sql = "EXPLAIN SELECT * FROM a JOIN b ON a.k = b.k WHERE a.k = $1 UNION SELECT * FROM b";
+    assert_eq!(code(&core, sql), "42601", "{sql}");
     // セッションの無い入口は従来どおり EXPLAIN を 42601 で拒否する。
     let err = core
         .execute_sql(

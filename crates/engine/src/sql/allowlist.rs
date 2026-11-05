@@ -4338,8 +4338,10 @@ pub enum ExplainTarget {
     SetOperation(ValidatedSetOperation),
     /// 非再帰 CTE（`WITH`）または FROM 直後の派生表を、インライン展開で単一表の広域取得・集計へ
     /// 畳み込んだ形（Issue #2048・SQL-75 (2) ポインタ）。`cte` 段の下に畳み込み後の段を並べて
-    /// 報告し、走査は行わない。具体化経路（`MATERIALIZED`・本文に `ORDER BY`／`LIMIT` を持つ CTE）、
-    /// `WITH RECURSIVE`、JOIN・集合演算の入力になる CTE・派生表は `42601` で拒否する。
+    /// 報告し、走査は行わない。具体化経路（`MATERIALIZED`・本文に `ORDER BY`／`LIMIT` を持つ CTE。
+    /// Issue #2976）と `WITH RECURSIVE`（同）も受理する。集合演算の入力になる CTE・派生表、
+    /// 評価後射影形ビュー由来の形は `42601` で拒否する。CTE・派生表を入力にする JOIN は
+    /// [`ExplainTarget::Join`] で報告する。
     Cte(ValidatedCteExplain),
 }
 
@@ -4359,6 +4361,10 @@ pub enum CteExplainMain {
     Scan(ValidatedScan),
     /// 単一表の集計。
     Aggregate(ValidatedAggregate),
+    /// 具体化経路（`MATERIALIZED`・本文に `ORDER BY`／`LIMIT`／集計等を持つ CTE・派生表）と
+    /// 再帰 CTE（Issue #2976）。本文は `Scan`／`Aggregate`／`RecursiveCte` に限る。
+    /// 非 EXPLAIN と同じ検証本体が返す評価後射影形の文をそのまま運ぶ。
+    Buffered(Box<ValidatedBufferedView>),
 }
 
 /// CTE・派生表の `EXPLAIN` の検証済み対象（Issue #2048）。フィールドは crate 内専用で、
@@ -4378,11 +4384,18 @@ impl ExplainTarget {
             ExplainTarget::Search(v) => v.table_name(),
             ExplainTarget::Aggregate(v) => v.table_name(),
             ExplainTarget::Scan(v) => v.table_name(),
-            ExplainTarget::Join(v) => v.relations.first().map_or("", |r| r.table()),
+            // CTE・派生表を指す relation の名前（合成名を含む）は返さず、最初の実表の名前を返す。
+            ExplainTarget::Join(v) => v
+                .relations
+                .iter()
+                .enumerate()
+                .find(|(i, _)| !crate::sql::join::relation_is_cte(v, *i))
+                .map_or("", |(_, r)| r.table()),
             ExplainTarget::SetOperation(v) => crate::sql::set_op::leftmost_table(&v.tree),
             ExplainTarget::Cte(v) => match &v.main {
                 CteExplainMain::Scan(s) => s.table_name(),
                 CteExplainMain::Aggregate(a) => a.table_name(),
+                CteExplainMain::Buffered(b) => buffered_leftmost_table(&b.body),
             },
         }
     }
@@ -27873,10 +27886,10 @@ fn validate_with_statement(
     inline.map(WithOutcome::Read)
 }
 
-/// `EXPLAIN WITH ...` の検証（Issue #2048・SQL-75 (2) ポインタ）。`validate_sql_tokens_impl` の
-/// `EXPLAIN` アームだけが呼ぶ。`WITH RECURSIVE` は反復評価の作業表スキーマを実行せずに得る手段が無いため
-/// `42601`。それ以外は非 EXPLAIN と同じ [`validate_with_statement`] を通すので、構文・名前・列の
-/// エラー（`wire_code` と判定順）は EXPLAIN の有無で変わらない。データ変更 CTE は検証後に既存の
+/// `EXPLAIN WITH ...` の検証（Issue #2048・#2976・SQL-75 (2) ポインタ）。`validate_sql_tokens_impl` の
+/// `EXPLAIN` アームだけが呼ぶ。`WITH RECURSIVE` を含めて非 EXPLAIN と同じ [`validate_with_statement`] を
+/// 通すので、構文・名前・列のエラー（`wire_code` と判定順）は EXPLAIN の有無で変わらない（再帰項の束縛・
+/// 列整合は実行時と同じ計画を通して `core.rs` が検査する）。データ変更 CTE は検証後に既存の
 /// 固定 `0A000` で止まる（書き込みは発生しない）。
 fn explain_with_statement(
     rest: &[Token],
@@ -27884,11 +27897,6 @@ fn explain_with_statement(
     limits: crate::nesting_limits::NestingLimits,
     cte_evaluation: CteEvaluation,
 ) -> Result<Statement, SqlSurfaceError> {
-    if matches!(rest.get(1), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("RECURSIVE")) {
-        return Err(SqlSurfaceError::unsupported(
-            "EXPLAIN is not supported for WITH RECURSIVE",
-        ));
-    }
     match validate_with_statement(
         rest,
         lookup,
@@ -27902,9 +27910,11 @@ fn explain_with_statement(
     }
 }
 
-/// CTE・派生表の検証結果を `EXPLAIN` の対象にする（Issue #2048）。インライン展開で単一表の広域取得・
-/// 集計に畳み込まれた形だけを受理し、具体化経路（`BufferedView`）・JOIN・集合演算などの入力になる形は
-/// 描画する段を持たないため `42601` で拒否する（fail-closed。`Internal` に落とさない）。
+/// CTE・派生表の検証結果を `EXPLAIN` の対象にする（Issue #2048・#2976）。インライン展開で畳み込まれた
+/// 単一表の広域取得・集計（`ExplainTarget::Cte`）、具体化経路・再帰 CTE の評価後射影形
+/// （`CteExplainMain::Buffered`）、CTE・派生表を入力にする JOIN（`ExplainTarget::Join`）を受理する。
+/// 評価後射影形ビュー由来・FROM の関数呼び出し・窓関数を含む本文・本文に部分クエリが残る形など、
+/// 描画する段を持たない形は `42601` で拒否する（fail-closed。`Internal` に落とさない）。
 fn explain_cte_target(
     stmt: Statement,
     source: CteExplainSource,
@@ -27936,20 +27946,99 @@ fn explain_cte_target(
             ));
         }
         Statement::Aggregate(v) => CteExplainMain::Aggregate(v),
+        // 具体化経路（SQL-62）と再帰 CTE（SQL-35）。評価後射影形ビュー由来（`View`）・集計結果への窓
+        // （`GroupedWindow`）・FROM の関数呼び出し（`FunctionScan`）は描画する段を持たないので拒否する。
+        Statement::BufferedView(v)
+            if v.origin == BufferedOrigin::MaterializedCte
+                && matches!(
+                    &*v.body,
+                    Statement::Scan(_) | Statement::Aggregate(_) | Statement::RecursiveCte(_)
+                ) =>
+        {
+            if let Statement::Scan(body) = &*v.body {
+                // 窓の評価段の行は単一表の広域取得の `EXPLAIN` だけが持つ。本文の窓を黙って
+                // 落とした計画を返さないよう拒否する（fail-closed）。
+                if !body.window_items.is_empty() {
+                    return Err(SqlSurfaceError::unsupported(
+                        "EXPLAIN is not supported for window functions inside a CTE or derived table",
+                    ));
+                }
+                if body.has_value_subqueries()
+                    || body
+                        .where_predicates
+                        .iter()
+                        .any(super::subquery::predicate_contains_subquery)
+                {
+                    return Err(SqlSurfaceError::unsupported(
+                        "EXPLAIN is not supported for a CTE or derived table with subqueries",
+                    ));
+                }
+            }
+            if let Statement::Aggregate(body) = &*v.body {
+                if body
+                    .where_predicates
+                    .iter()
+                    .any(super::subquery::predicate_contains_subquery)
+                    || super::subquery::aggregate_has_filter_subquery(body)
+                {
+                    return Err(SqlSurfaceError::unsupported(
+                        "EXPLAIN is not supported for a CTE or derived table with subqueries",
+                    ));
+                }
+            }
+            CteExplainMain::Buffered(Box::new(v))
+        }
         Statement::BufferedView(_) => {
             return Err(SqlSurfaceError::unsupported(
-                "EXPLAIN is not supported for a CTE that is evaluated once (materialized)",
+                "EXPLAIN is not supported for this materialized form of a CTE or derived table",
             ));
+        }
+        // CTE・派生表を入力にする JOIN（SQL-62）。slot の本文に値の部分クエリが残る形は描画する段を
+        // 持たないので拒否する。
+        Statement::Join(v) => {
+            if let Some(cte) = v.cte_inputs.as_deref() {
+                for slot in &cte.slots {
+                    if let CteSlotSource::Scan(scan) = &slot.source {
+                        if !scan.window_items.is_empty() {
+                            return Err(SqlSurfaceError::unsupported(
+                                "EXPLAIN is not supported for window functions inside a CTE or derived table",
+                            ));
+                        }
+                        if scan.has_value_subqueries()
+                            || scan
+                                .where_predicates
+                                .iter()
+                                .any(super::subquery::predicate_contains_subquery)
+                        {
+                            return Err(SqlSurfaceError::unsupported(
+                                "EXPLAIN is not supported for a CTE or derived table with subqueries",
+                            ));
+                        }
+                    }
+                }
+            }
+            return Ok(Statement::Explain(ExplainTarget::Join(v)));
         }
         _ => {
             return Err(SqlSurfaceError::unsupported(
-                "EXPLAIN is not supported for CTEs or derived tables used as join or set operation inputs",
+                "EXPLAIN is not supported for CTEs or derived tables used as set operation inputs",
             ));
         }
     };
     Ok(Statement::Explain(ExplainTarget::Cte(
         ValidatedCteExplain { source, main },
     )))
+}
+
+/// 具体化 CTE・再帰 CTE の本文の左端の実表名（`ExplainTarget::table_name` 用。Issue #2976）。
+/// 表を読まない本文（`FROM` なし定数アンカーの再帰 CTE 等）は空文字を返す。
+fn buffered_leftmost_table(body: &Statement) -> &str {
+    match body {
+        Statement::Scan(v) => v.table_name(),
+        Statement::Aggregate(v) => v.table_name(),
+        Statement::RecursiveCte(v) => buffered_leftmost_table(&v.anchor),
+        _ => "",
+    }
 }
 
 /// セッションの最上位の文の入口（Issue #1876・SQL-63）。先頭が `WITH`（`RECURSIVE` でない）で CTE 定義に
@@ -28465,15 +28554,17 @@ fn validate_sql_tokens_impl(
         // `get` でスライスする（`.claude/rules/coding-rust.md`）。
         _ if is_explain_statement => {
             let rest = tokens.get(1..).unwrap_or(&[]);
-            // Issue #2048（SQL-75 (2) ポインタ）: 非再帰 CTE は非 EXPLAIN と同じ検証本体
-            // （`validate_with_statement`）へ渡し、インライン展開で単一表の広域取得・集計へ畳み込まれた
-            // 形だけ `ExplainTarget::Cte` にする。第 2 の WITH パーサーを持たない。
+            // Issue #2048・#2976（SQL-75 (2) ポインタ）: `WITH`（`RECURSIVE` を含む）は非 EXPLAIN と
+            // 同じ検証本体（`validate_with_statement`）へ渡し、返った文の形（インライン展開・具体化・
+            // 再帰・CTE 入力の JOIN）を `explain_cte_target` が `ExplainTarget` に写す。
+            // 第 2 の WITH パーサーを持たない。
             if matches!(rest.first(), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("WITH")) {
                 return explain_with_statement(rest, lookup, limits, cte_evaluation);
             }
             // FROM 直後の派生表（合成 CTE）。非 EXPLAIN の入口と同じく、括弧の深さを追わない
-            // 他の検出器（JOIN・集合演算）より前に判定する。JOIN・集合演算の入力になる派生表は
-            // `explain_cte_target` が `42601` にする。
+            // 他の検出器（JOIN・集合演算）より前に判定する。JOIN の入力になる派生表は
+            // `explain_cte_target` が `ExplainTarget::Join` にする（Issue #2976）。集合演算の入力に
+            // なる派生表は非 EXPLAIN でも未対応で、同じ検証本体が非 EXPLAIN と同じ `42601` にする。
             if cte_evaluation == CteEvaluation::AllowMaterialize
                 && matches!(rest.first(), Some(Token::Keyword(Keyword::Select)))
             {
@@ -28506,7 +28597,8 @@ fn validate_sql_tokens_impl(
             }
             // Issue #2046（SQL-75 (2) ポインタ）: JOIN は非 EXPLAIN 経路と同じ判定
             // （`looks_like_join` → `parse_join_statement`）で `ExplainTarget::Join` にする。派生表を
-            // 含む形は従来どおり `42601`（#2048 の担当）。JOIN の WHERE の部分クエリは構文段で
+            // 含む JOIN は上の `derived_table::gate` が先に受理する（Issue #2976）ので、ここまで来て
+            // 派生表が残る形（`gate` が受理しない文脈）は従来どおり `42601`。JOIN の WHERE の部分クエリは構文段で
             // 拒否されるため、ここで追加のガードは要らない。
             if looks_like_join(rest) {
                 if super::derived_table::contains_derived_table(rest) {

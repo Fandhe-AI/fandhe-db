@@ -155,6 +155,7 @@ mod sql72_vector_sum;
 mod sql73_where_knn_shortfall;
 mod sql74_radius_search;
 mod sql74_where_distance_compare;
+mod sql75_explain_cte_inputs;
 mod sql75_explain_cte_subquery;
 mod sql75_explain_join;
 mod sql75_explain_set_operation;

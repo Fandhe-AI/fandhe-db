@@ -478,3 +478,15 @@ JOIN を含む `SELECT` の `EXPLAIN` を受理する（従来は単一表の文
 - **出さない値と理由**: CTE 名・別名・表名、`LIMIT`／`OFFSET` の値、行数・可視件数・カーディナリティ・予算（SQL-75 (5)）。
 - **対象外（後続候補）**: 具体化 CTE（`cte_mode: materialized`）、相関部分クエリ（`correlated: true`）、再帰 CTE、
   JOIN／集合演算の入力になる CTE・派生表、DML（#2049〜#2051）、`EXPLAIN ANALYZE`／オプション（SQL-76）。NoSQL 表層は変えない。
+
+## 追記（Issue #2976・SQL-75 (2)）: 具体化 CTE・再帰 CTE・CTE／派生表を入力にする JOIN の段
+
+Issue #2048 で `42601` にしていた形のうち、次の 3 つを段の木で返す。いずれも非 EXPLAIN と同じ検証本体（`validate_with_statement`・`derived_table::gate`）が返す文の形を写すだけで、第 2 のパーサー・束縛器は持たない。行・CTE 本文・再帰の反復・キャッシュ・台帳・世代・書き込みロックには触れない。
+
+- **具体化 CTE**（明示 `MATERIALIZED`・本文に `ORDER BY`／`LIMIT`／`OFFSET`／集計を持つ CTE、同じ本文の FROM 直後の派生表）: 外側の層（`limit`／`sort`／`aggregate`／`filter`）を上、`cte`（`cte_mode: materialized`）を境界、本文の段（`limit`／`sort`／`aggregate`／`scan`）を下に並べる。外側の段が無ければ `cte` が根。検証順は Describe の評価後射影形アームと同じ（外側 `LIMIT` の範囲 → 照合 → 本文の結果列の導出 → 外側の束縛）。具体化できない形（序数 `ORDER BY` 等）は検証本体がインラインへ戻すので `cte_mode: inline` のまま。外側／本文に窓関数がある形は固定文の `42601`。
+- **再帰 CTE**: `cte`（`cte_mode: recursive`）→ `recursive_union`（`union: all|distinct`・`search: none|depth_first|breadth_first`・`cycle: present|none`）の下にアンカー項と再帰項を並べる。アンカーは既存の各 builder（`scan`／`aggregate`／`join`／`set_operation`）を再利用し、`FROM` なし定数式は新しい葉 `result`（`source: constant`）で表す。再帰項は単一関係なら `work_table_scan`（`filter: present|none`）、JOIN なら作業表の側を `work_table_scan`（`relation: k`）に置き換えた `join` 木。反復回数・累積行数はデータ依存なので出さない。計画は `recursive_eval::with_prepared` を Describe と共有する。アンカーが未対応の形（ビュー経由・順位付き検索等）は固定文の `42601`。
+- **CTE／派生表を入力にする JOIN**: `join` 木の CTE を指す側だけを `cte`（`relation`・`cte_source: with|derived_table`・`cte_mode: materialized`・`cte_shared: true|false`）に置き換える。`derived_table` かどうかは合成名の判定で決め、名前自体は出さない。slot の本文は `scan` 系の段、`Derived` slot は層（`filter`／`sort`／`limit`）の下に親 slot の `cte` を入れ子にする。実表の側の出力は従来の JOIN `EXPLAIN` とバイト単位で同じ。CTE の側ではカタログ・索引宣言を読まない。
+- **集合演算の入力になる CTE・派生表**: 非 EXPLAIN でも未対応（`42601`）のため、EXPLAIN も同じコードで拒否する（パリティ）。集合演算の実行器に CTE の枝を足す変更は別の機能追加として扱う。
+- **出さない値**: CTE 名・別名・表名・合成名・リテラル・`LIMIT` 値・行数・反復回数（SQL-75 (5)）。出力はテナントの可視行に依存しない。木の上限超過は `54001`。
+- **公開 API の注記**: `CteExplainMain` に variant（`Buffered`）を足した。`ValidatedCteExplain` のフィールドは crate 内専用でクレート外から値を取り出せないため、実質的な互換性影響は無い。
+- **対象外（後続候補）**: 相関／`$n` 付きの WITH・派生表（#2977）、DML（#2049〜#2051）、`EXPLAIN ANALYZE`／オプション（SQL-76）、評価後射影形ビュー由来の形（#1192）。新しい段の語彙の SQL-75 への反映はオーナー判断（spec リポ側）。

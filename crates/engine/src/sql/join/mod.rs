@@ -78,7 +78,7 @@ use crate::sql::allowlist::{SqlSurfaceError, ValidatedJoin};
 use crate::sql::exec::{Cell, ColumnMeta, QueryResult, ResultRow};
 use crate::sql::udf_call::UdfRegistry;
 
-pub(crate) use explain::explain_tree;
+pub(crate) use explain::{explain_tree_with_side_nodes, side_scan_node};
 pub(crate) use plan::CteIdColumns;
 use plan::{build_plan, JoinPlan, Shape};
 

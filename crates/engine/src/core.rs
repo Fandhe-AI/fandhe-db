@@ -2568,6 +2568,13 @@ fn table_schema_in(
     })
 }
 
+/// 再帰 CTE の計画入力（アンカー項の結果列・基底表のスキーマ・JOIN 上限。Issue #2976）。
+type RecursivePlanInputs = (
+    Vec<crate::sql::exec::ColumnMeta>,
+    std::collections::HashMap<String, crate::catalog::TableSchema>,
+    crate::sql::join::JoinLimits,
+);
+
 /// 評価後射影形ビュー本文が参照するテーブル名を集める（入れ子の評価後射影形ビューは本文を辿る）。
 fn buffered_body_tables(stmt: &crate::sql::allowlist::Statement, out: &mut Vec<String>) {
     use crate::sql::allowlist::Statement;
@@ -10546,6 +10553,34 @@ impl EngineCore {
         limits: &crate::result_limits::ResultLimits,
         snap: Option<&redb::ReadTransaction>,
     ) -> Result<Vec<crate::sql::exec::ColumnMeta>, crate::sql::allowlist::SqlSurfaceError> {
+        let (anchor_columns, schemas, join_limits) = self.recursive_cte_plan_inputs(
+            session,
+            validated,
+            skip_vector_literal_validation,
+            limits,
+            snap,
+        )?;
+        crate::sql::recursive_eval::describe(
+            validated,
+            &anchor_columns,
+            &schemas,
+            session.udfs(),
+            &join_limits,
+        )
+    }
+
+    /// 再帰 CTE の計画入力（アンカー項の結果列・基底表のスキーマ・JOIN 上限）を、行を読まずに導出する。
+    /// [`Self::describe_recursive_cte`] と `EXPLAIN`（[`Self::recursive_cte_explain_node`]。Issue #2976）が
+    /// 共有するので、静的に決まるエラー（定数アンカーの `current_schema()`・アンカーの束縛）は両経路で
+    /// 同じ `wire_code` と順序になる。
+    fn recursive_cte_plan_inputs(
+        &self,
+        session: &crate::sql::mode::SessionState,
+        validated: &crate::sql::allowlist::ValidatedRecursiveCte,
+        skip_vector_literal_validation: &crate::sql::parser::LiteralSkip,
+        limits: &crate::result_limits::ResultLimits,
+        snap: Option<&redb::ReadTransaction>,
+    ) -> Result<RecursivePlanInputs, crate::sql::allowlist::SqlSurfaceError> {
         // 定数アンカーの `current_schema()` 系は、通常の定数 SELECT が張る検索パスのスコープ外で実行
         // されるため未対応（Execute の実行本体の前提）。Describe と Execute が同じ `0A000` になるよう
         // 共有経路で拒否する。
@@ -10579,13 +10614,7 @@ impl EngineCore {
             self.join_limits,
             *limits,
         );
-        crate::sql::recursive_eval::describe(
-            validated,
-            &anchor_columns,
-            &schemas,
-            session.udfs(),
-            &join_limits,
-        )
+        Ok((anchor_columns, schemas, join_limits))
     }
 
     /// Describe 用のスキーマ解決（Issue #2403）。`snap` が `Some` なら明示トランザクションの
@@ -14152,45 +14181,223 @@ impl EngineCore {
         session: &crate::sql::mode::SessionState,
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
         use crate::sql::allowlist::CteExplainMain;
-        use crate::sql::cte_explain::CteMainShape;
         let (lines, shape) = match &validated.main {
             CteExplainMain::Scan(v) => {
-                let (read_txn, schema) = self.read_txn_with_schema(v.table_name())?;
-                let bound = crate::sql::parser::bind_scan_with_dummy_flags(
-                    v,
-                    &schema,
-                    session.udfs(),
-                    &[],
-                    &self.result_limits,
-                )?;
-                let gins = Self::gin_decls_for_explain(&read_txn, &bound)?;
-                let shape = CteMainShape {
-                    has_limit: !v.limit_implicit,
-                    has_offset: bound.offset != 0,
-                    sort_keys: bound.order_by.len(),
-                    aggregate: None,
-                };
-                (Self::scan_explain_lines(&schema, &bound, &gins), shape)
+                let read_txn = self.begin_read_txn()?;
+                self.scan_lines_and_shape(&read_txn, session, v)?
             }
             CteExplainMain::Aggregate(v) => {
-                let (read_txn, schema) = self.read_txn_with_schema(v.table_name())?;
-                let bound = crate::sql::parser::bind_aggregate(v, &schema, session.udfs())?;
-                let grouped = bound.group_by.as_ref();
-                let shape = CteMainShape {
-                    has_limit: grouped.is_some_and(|g| g.limit.is_some()),
-                    has_offset: grouped.is_some_and(|g| g.offset != 0),
-                    sort_keys: grouped.map_or(0, |g| g.order_by.len()),
-                    aggregate: Some(crate::sql::set_op::aggregate_shape(&bound)),
-                };
-                (
-                    self.aggregate_explain_lines_from_bound(&read_txn, &schema, &bound),
-                    shape,
-                )
+                let read_txn = self.begin_read_txn()?;
+                self.aggregate_lines_and_shape(&read_txn, session, v)?
+            }
+            // 具体化経路・再帰 CTE（Issue #2976）。
+            CteExplainMain::Buffered(view) => {
+                return self.run_buffered_cte_explain(validated.source, view, session);
             }
         };
         let node = crate::sql::cte_explain::cte_inline_tree(validated.source, &shape, lines)
             .map_err(Self::explain_tree_error)?;
         Ok(crate::sql::SqlOutcome::Explain(node.into_query_result()))
+    }
+
+    /// 単一表の広域取得の走査分類の行と、本文の段の形（`limit`・`sort`）。インライン展開の `cte` 節
+    /// （Issue #2048）・具体化 CTE の本文・アンカー項・JOIN 入力 slot の `Scan`（Issue #2976）が共有する
+    /// （第 2 の分類実装を持たない）。束縛は非 EXPLAIN と同じ `bind_scan_with_dummy_flags`。
+    fn scan_lines_and_shape(
+        &self,
+        read_txn: &redb::ReadTransaction,
+        session: &crate::sql::mode::SessionState,
+        v: &crate::sql::allowlist::ValidatedScan,
+    ) -> Result<
+        (Vec<String>, crate::sql::cte_explain::CteMainShape),
+        crate::sql::allowlist::SqlSurfaceError,
+    > {
+        let schema = table_schema_in(read_txn, v.table_name())?;
+        let bound = crate::sql::parser::bind_scan_with_dummy_flags(
+            v,
+            &schema,
+            session.udfs(),
+            &[],
+            &self.result_limits,
+        )?;
+        let gins = Self::gin_decls_for_explain(read_txn, &bound)?;
+        let shape = crate::sql::cte_explain::CteMainShape {
+            has_limit: !v.limit_implicit,
+            has_offset: bound.offset != 0,
+            sort_keys: bound.order_by.len(),
+            aggregate: None,
+        };
+        Ok((Self::scan_explain_lines(&schema, &bound, &gins), shape))
+    }
+
+    /// 単一表の集計の走査分類の行と段の形。[`Self::scan_lines_and_shape`] の集計版。
+    fn aggregate_lines_and_shape(
+        &self,
+        read_txn: &redb::ReadTransaction,
+        session: &crate::sql::mode::SessionState,
+        v: &crate::sql::allowlist::ValidatedAggregate,
+    ) -> Result<
+        (Vec<String>, crate::sql::cte_explain::CteMainShape),
+        crate::sql::allowlist::SqlSurfaceError,
+    > {
+        let schema = table_schema_in(read_txn, v.table_name())?;
+        let bound = crate::sql::parser::bind_aggregate(v, &schema, session.udfs())?;
+        let grouped = bound.group_by.as_ref();
+        let shape = crate::sql::cte_explain::CteMainShape {
+            has_limit: grouped.is_some_and(|g| g.limit.is_some()),
+            has_offset: grouped.is_some_and(|g| g.offset != 0),
+            sort_keys: grouped.map_or(0, |g| g.order_by.len()),
+            aggregate: Some(crate::sql::set_op::aggregate_shape(&bound)),
+        };
+        Ok((
+            self.aggregate_explain_lines_from_bound(read_txn, &schema, &bound),
+            shape,
+        ))
+    }
+
+    /// 具体化経路の CTE・派生表と再帰 CTE の `EXPLAIN`（Issue #2976・SQL-75 (2)(5)(6)・SQL-62・SQL-35
+    /// ポインタ）。検証の順序は Describe の `BufferedView` アームと同じ（外側 `LIMIT` の範囲 → 照合 →
+    /// 本文の結果列の導出 → 外側の束縛）で、束縛エラーの `wire_code` と判定順は非 EXPLAIN と一致する。
+    /// 本文の評価・反復・キャッシュ・台帳・世代・書き込みロックには触れず、CTE 名・行数・`LIMIT` 値は出さない。
+    fn run_buffered_cte_explain(
+        &self,
+        source: crate::sql::allowlist::CteExplainSource,
+        view: &crate::sql::allowlist::ValidatedBufferedView,
+        session: &crate::sql::mode::SessionState,
+    ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        use crate::sql::allowlist::{SqlSurfaceError, Statement};
+        use crate::sql::cte_explain as ce;
+        let limits = self.result_limits;
+        Self::check_buffered_outer_limit(view, &limits)?;
+        let read_txn = self.begin_read_txn()?;
+        check_buffered_view_collations(&read_txn, view)?;
+        let body_columns = self
+            .describe_parsed_in_session_snap(
+                session,
+                &ParsedSql::Statement((*view.body).clone()),
+                &crate::sql::parser::LiteralSkip::NONE,
+                &[],
+                &limits,
+                Some(&read_txn),
+            )?
+            .ok_or_else(|| SqlSurfaceError::Internal {
+                detail: "internal error".to_string(),
+            })?;
+        let plan = crate::sql::view_buffered::plan_outer(&body_columns, view, session.udfs())?;
+        let layer = plan.explain_layer_shape(view)?;
+        let body = match &*view.body {
+            Statement::Scan(v) => {
+                let (lines, shape) = self.scan_lines_and_shape(&read_txn, session, v)?;
+                let tree = ce::main_shape_tree(&shape, lines).map_err(Self::explain_tree_error)?;
+                ce::cte_materialized_node(source, tree).map_err(Self::explain_tree_error)?
+            }
+            Statement::Aggregate(v) => {
+                let (lines, shape) = self.aggregate_lines_and_shape(&read_txn, session, v)?;
+                let tree = ce::main_shape_tree(&shape, lines).map_err(Self::explain_tree_error)?;
+                ce::cte_materialized_node(source, tree).map_err(Self::explain_tree_error)?
+            }
+            Statement::RecursiveCte(v) => {
+                self.recursive_cte_explain_node(source, &read_txn, session, v, &limits)?
+            }
+            _ => {
+                return Err(SqlSurfaceError::unsupported(
+                    "EXPLAIN is not supported for this materialized form of a CTE or derived table",
+                ))
+            }
+        };
+        let root = ce::outer_layer_stages(&layer, body).map_err(Self::explain_tree_error)?;
+        Ok(crate::sql::SqlOutcome::Explain(root.into_query_result()))
+    }
+
+    /// 再帰 CTE の `cte` 節（`recursive_union` の下にアンカー項と再帰項）。計画は非 EXPLAIN の Describe と
+    /// 同じ [`Self::recursive_cte_plan_inputs`]・`recursive_eval` の計画を通すので、アンカー・再帰項の
+    /// 束縛と列整合のエラーは一致する。アンカー項は実行せず、各枝の走査分類だけを段にする。
+    fn recursive_cte_explain_node(
+        &self,
+        source: crate::sql::allowlist::CteExplainSource,
+        read_txn: &redb::ReadTransaction,
+        session: &crate::sql::mode::SessionState,
+        v: &crate::sql::allowlist::ValidatedRecursiveCte,
+        limits: &crate::result_limits::ResultLimits,
+    ) -> Result<crate::sql::explain_tree::ExplainNode, crate::sql::allowlist::SqlSurfaceError> {
+        let (anchor_columns, schemas, join_limits) = self.recursive_cte_plan_inputs(
+            session,
+            v,
+            &crate::sql::parser::LiteralSkip::NONE,
+            limits,
+            Some(read_txn),
+        )?;
+        let explained = crate::sql::recursive_eval::explain(
+            v,
+            &anchor_columns,
+            &schemas,
+            session.udfs(),
+            &join_limits,
+            &|schema, bound| {
+                let gins = Self::gin_decls_for_explain(read_txn, bound)?;
+                Ok(Self::scan_explain_lines(schema, bound, &gins))
+            },
+        )?;
+        let anchor = self.explain_node_for_statement(&v.anchor, session, read_txn)?;
+        crate::sql::cte_explain::recursive_cte_node(
+            source,
+            &explained.stage,
+            anchor,
+            explained.recursive,
+        )
+        .map_err(Self::explain_tree_error)
+    }
+
+    /// 入れ子の検証済み文（再帰 CTE のアンカー項）から段の木を返す。既存の各 `EXPLAIN` の行生成部を
+    /// 呼ぶだけで、第 2 の分類実装を持たない。対応は `Scan`・`Aggregate`・CTE 入力を持たない `Join`・
+    /// `SetOperation`・`FROM` なし定数式で、それ以外は固定文の `42601`（fail-closed）。
+    fn explain_node_for_statement(
+        &self,
+        stmt: &crate::sql::allowlist::Statement,
+        session: &crate::sql::mode::SessionState,
+        read_txn: &redb::ReadTransaction,
+    ) -> Result<crate::sql::explain_tree::ExplainNode, crate::sql::allowlist::SqlSurfaceError> {
+        use crate::sql::allowlist::{SqlSurfaceError, Statement};
+        match stmt {
+            Statement::Scan(v)
+                if v.has_value_subqueries()
+                    || !v.window_items.is_empty()
+                    || v.where_predicates
+                        .iter()
+                        .any(crate::sql::subquery::predicate_contains_subquery) =>
+            {
+                Err(SqlSurfaceError::unsupported(
+                    "EXPLAIN is not supported for this anchor term of WITH RECURSIVE",
+                ))
+            }
+            Statement::Scan(v) => {
+                let (lines, shape) = self.scan_lines_and_shape(read_txn, session, v)?;
+                crate::sql::cte_explain::main_shape_tree(&shape, lines)
+                    .map_err(Self::explain_tree_error)
+            }
+            Statement::Aggregate(v) => {
+                let (lines, shape) = self.aggregate_lines_and_shape(read_txn, session, v)?;
+                crate::sql::cte_explain::main_shape_tree(&shape, lines)
+                    .map_err(Self::explain_tree_error)
+            }
+            Statement::Join(v) if v.cte_inputs.is_none() => {
+                let names = crate::sql::join::collect_join_tables(v);
+                let schemas = table_schemas_in(read_txn, &names)?;
+                self.join_explain_node(read_txn, &schemas, v, session)
+            }
+            Statement::SetOperation(v) => {
+                let mut names = Vec::new();
+                crate::sql::set_op::collect_branch_tables(&v.tree, &mut names);
+                let schemas = table_schemas_in(read_txn, &names)?;
+                self.set_operation_explain_node(read_txn, &schemas, v, session)
+            }
+            Statement::ConstSelect(_) => {
+                crate::sql::cte_explain::const_result_leaf().map_err(Self::explain_tree_error)
+            }
+            _ => Err(SqlSurfaceError::unsupported(
+                "EXPLAIN is not supported for this anchor term of WITH RECURSIVE",
+            )),
+        }
     }
 
     /// 束縛済み集計計画（[`crate::sql::parser::BoundAggregate`]）から
@@ -14395,42 +14602,124 @@ impl EngineCore {
         validated: &crate::sql::allowlist::ValidatedJoin,
         session: &crate::sql::mode::SessionState,
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
-        use crate::sql::allowlist::SqlSurfaceError;
-        // Issue #2048: CTE・派生表を入力にする JOIN は構文段（`explain_cte_target`）が `42601` で
-        // 拒否するため通常は到達しない。到達しても `Internal` ではなく固定文の `42601` で拒否する。
-        if validated.cte_inputs.is_some() {
-            return Err(SqlSurfaceError::unsupported(
-                "EXPLAIN is not supported for a JOIN with CTE or derived table inputs",
-            ));
-        }
         let names = crate::sql::join::collect_join_tables(validated);
         let (read_txn, schemas) = self.read_txn_with_schemas(&names)?;
+        let node = self.join_explain_node(&read_txn, &schemas, validated, session)?;
+        Ok(crate::sql::SqlOutcome::Explain(node.into_query_result()))
+    }
+
+    /// JOIN の段の木（[`Self::run_join_explain`] の本体。再帰 CTE のアンカー項も共有する）。
+    /// `base_schemas` は実表の側のスキーマ（CTE・派生表の名前を含まない）。CTE・派生表を入力にする
+    /// JOIN（Issue #2976・SQL-62）は、Describe と同じ [`Self::describe_cte_slot`] で slot の結果列を
+    /// 本文を実行せずに導出して合成スキーマを差し込み、`prepare_join` を通す。そのため束縛エラーの
+    /// `wire_code` と順序は非 EXPLAIN と一致する。CTE の側は実表として引かない（カタログ・索引宣言を
+    /// 読まない）で、`cte` 節（`cte_slot_explain_node`）に置き換える。
+    fn join_explain_node(
+        &self,
+        read_txn: &redb::ReadTransaction,
+        base_schemas: &std::collections::HashMap<String, crate::catalog::TableSchema>,
+        validated: &crate::sql::allowlist::ValidatedJoin,
+        session: &crate::sql::mode::SessionState,
+    ) -> Result<crate::sql::explain_tree::ExplainNode, crate::sql::allowlist::SqlSurfaceError> {
+        use crate::sql::allowlist::SqlSurfaceError;
         let limits = crate::sql::join::JoinLimits::from_settings(
             self.group_by_limits,
             self.join_limits,
             self.result_limits,
         );
-        let prepared = crate::sql::join::prepare_join(
-            &schemas,
-            &crate::sql::join::CteIdColumns::new(),
-            validated,
-            session.udfs(),
-            &limits,
-        )?;
-        let mut side_lines = Vec::with_capacity(prepared.side_count());
+        let mut schemas = base_schemas.clone();
+        let mut cte_ids = crate::sql::join::CteIdColumns::new();
+        let cte_inputs = validated.cte_inputs.as_deref();
+        if let Some(cte) = cte_inputs {
+            for (rel, slot) in validated.relations.iter().zip(cte.relation_slot.iter()) {
+                let Some(k) = slot else { continue };
+                let cols = self.describe_cte_slot(
+                    session,
+                    cte,
+                    *k,
+                    &crate::sql::parser::LiteralSkip::NONE,
+                    &self.result_limits,
+                    Some(read_txn),
+                )?;
+                let (schema, id_columns) = crate::sql::join::cte_schema(rel.table(), &cols)?;
+                schemas.insert(rel.table().to_string(), schema);
+                cte_ids.insert(rel.table().to_string(), id_columns);
+            }
+        }
+        let prepared =
+            crate::sql::join::prepare_join(&schemas, &cte_ids, validated, session.udfs(), &limits)?;
+        let mut side_nodes = Vec::with_capacity(prepared.side_count());
         for side in 0..prepared.side_count() {
+            let cte_slot = cte_inputs
+                .and_then(|c| c.relation_slot.get(side).copied().flatten().map(|k| (c, k)));
+            if let Some((cte, k)) = cte_slot {
+                side_nodes.push(self.cte_slot_explain_node(
+                    session,
+                    read_txn,
+                    cte,
+                    k,
+                    Some(side.saturating_add(1)),
+                )?);
+                continue;
+            }
             let (schema, bound) =
                 prepared
                     .side_scan(side)
                     .ok_or_else(|| SqlSurfaceError::Internal {
                         detail: "JOIN side index out of range".to_string(),
                     })?;
-            let gins = Self::gin_decls_for_explain(&read_txn, bound)?;
-            side_lines.push(Self::scan_explain_lines(schema, bound, &gins));
+            let gins = Self::gin_decls_for_explain(read_txn, bound)?;
+            let lines = Self::scan_explain_lines(schema, bound, &gins);
+            side_nodes.push(
+                crate::sql::join::side_scan_node(side, lines).map_err(Self::explain_tree_error)?,
+            );
         }
-        let node = crate::sql::join::explain_tree(&prepared, side_lines)
-            .map_err(Self::explain_tree_error)?;
-        Ok(crate::sql::SqlOutcome::Explain(node.into_query_result()))
+        crate::sql::join::explain_tree_with_side_nodes(&prepared, side_nodes)
+            .map_err(Self::explain_tree_error)
+    }
+
+    /// JOIN の入力になる CTE・派生表 slot `k` の `cte` 節（Issue #2976）。slot の `Scan` は実表の
+    /// 走査分類（`limit`・`sort` の段つき）、`Derived` は親 slot の `cte` 節の上に層（`filter`・`sort`・
+    /// `limit`）を重ねる。呼び出し元が先に [`Self::describe_cte_slot`] で検証済みなので、ここでは
+    /// 構造を写すだけ。`from < k` の不変条件で再帰は slot 数以内に収まり、木の上限は `ExplainNode` が守る。
+    /// 名前は出さず、`cte_source` だけを出す（派生表の合成名か否かで判定）。
+    fn cte_slot_explain_node(
+        &self,
+        session: &crate::sql::mode::SessionState,
+        read_txn: &redb::ReadTransaction,
+        cte: &crate::sql::allowlist::JoinCteInputs,
+        k: usize,
+        relation: Option<usize>,
+    ) -> Result<crate::sql::explain_tree::ExplainNode, crate::sql::allowlist::SqlSurfaceError> {
+        use crate::sql::allowlist::{CteExplainSource, CteSlotSource, SqlSurfaceError};
+        let slot = cte.slots.get(k).ok_or_else(|| SqlSurfaceError::Internal {
+            detail: "CTE slot out of range".to_string(),
+        })?;
+        let source = if crate::sql::derived_table::is_derived_placeholder(&slot.name) {
+            CteExplainSource::DerivedTable
+        } else {
+            CteExplainSource::With
+        };
+        let tree = match &slot.source {
+            CteSlotSource::Scan(scan) => {
+                let (lines, shape) = self.scan_lines_and_shape(read_txn, session, scan)?;
+                crate::sql::cte_explain::main_shape_tree(&shape, lines)
+                    .map_err(Self::explain_tree_error)?
+            }
+            CteSlotSource::Derived { from, layer } => {
+                if *from >= k {
+                    return Err(SqlSurfaceError::Internal {
+                        detail: "CTE slot dependency out of order".to_string(),
+                    });
+                }
+                let parent = self.cte_slot_explain_node(session, read_txn, cte, *from, None)?;
+                let shape = crate::sql::view_buffered::rows_layer_shape(layer)?;
+                crate::sql::cte_explain::outer_layer_stages(&shape, parent)
+                    .map_err(Self::explain_tree_error)?
+            }
+        };
+        crate::sql::cte_explain::cte_input_node(relation, source, slot.shared, tree)
+            .map_err(Self::explain_tree_error)
     }
 
     /// 段の木の構築エラーを `wire_code` へ写す（JOIN・集合演算の `EXPLAIN` が共有）。
@@ -14461,13 +14750,25 @@ impl EngineCore {
         validated: &crate::sql::allowlist::ValidatedSetOperation,
         session: &crate::sql::mode::SessionState,
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
-        use crate::sql::allowlist::SqlSurfaceError;
         let mut names = Vec::new();
         crate::sql::set_op::collect_branch_tables(&validated.tree, &mut names);
         let (read_txn, schemas) = self.read_txn_with_schemas(&names)?;
+        let node = self.set_operation_explain_node(&read_txn, &schemas, validated, session)?;
+        Ok(crate::sql::SqlOutcome::Explain(node.into_query_result()))
+    }
+
+    /// 集合演算の段の木（[`Self::run_set_operation_explain`] の本体。再帰 CTE のアンカー項も共有する）。
+    fn set_operation_explain_node(
+        &self,
+        read_txn: &redb::ReadTransaction,
+        schemas: &std::collections::HashMap<String, crate::catalog::TableSchema>,
+        validated: &crate::sql::allowlist::ValidatedSetOperation,
+        session: &crate::sql::mode::SessionState,
+    ) -> Result<crate::sql::explain_tree::ExplainNode, crate::sql::allowlist::SqlSurfaceError> {
+        use crate::sql::allowlist::SqlSurfaceError;
         let mut leaves = Vec::new();
         crate::sql::set_op::prepare(
-            &schemas,
+            schemas,
             &validated.tree,
             session.udfs(),
             validated.limit,
@@ -14485,15 +14786,14 @@ impl EngineCore {
                             .ok_or_else(|| SqlSurfaceError::Internal {
                                 detail: "schema missing for set operation branch table".to_string(),
                             })?;
-                    let gins = Self::gin_decls_for_explain(&read_txn, bound)?;
+                    let gins = Self::gin_decls_for_explain(read_txn, bound)?;
                     leaf_lines.push(Self::scan_explain_lines(schema, bound, &gins));
                 }
                 None => leaf_lines.push(crate::sql::set_op::aggregate_branch_explain_lines()),
             }
         }
-        let node = crate::sql::set_op_explain::explain_tree(validated, &leaves, leaf_lines)
-            .map_err(Self::explain_tree_error)?;
-        Ok(crate::sql::SqlOutcome::Explain(node.into_query_result()))
+        crate::sql::set_op_explain::explain_tree(validated, &leaves, leaf_lines)
+            .map_err(Self::explain_tree_error)
     }
 
     /// 広域取得（scan）の `EXPLAIN` が GIN 相当索引の分類に使う宣言を読む（INDEX-8、Issue #2208）。

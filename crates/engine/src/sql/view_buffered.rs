@@ -198,6 +198,48 @@ impl OuterPlan {
     pub(crate) fn columns(&self) -> &[ColumnMeta] {
         &self.columns
     }
+
+    /// 外側の層の形（件数・有無のみ）。`EXPLAIN`（Issue #2976）が具体化 CTE の `cte` 節の上に積む
+    /// 段を決める。`view` は [`plan_outer`] に渡したものと同じ文で、値（`LIMIT` の値・述語の中身）は
+    /// 返さない。ウィンドウ項目を持つ外側は描画する段を持たないので固定文の `42601` で拒否する。
+    pub(crate) fn explain_layer_shape(
+        &self,
+        view: &ValidatedBufferedView,
+    ) -> Result<super::cte_explain::OuterLayerShape, SqlSurfaceError> {
+        match (&view.outer, &self.kind) {
+            (BufferedOuter::Rows(rows), _) => rows_layer_shape(rows),
+            (BufferedOuter::Aggregate(agg), OuterKind::Aggregate(plan)) => {
+                let grouped = plan.bound.group_by.as_ref();
+                Ok(super::cte_explain::OuterLayerShape {
+                    has_limit: grouped.is_some_and(|g| g.limit.is_some()),
+                    has_offset: grouped.is_some_and(|g| g.offset != 0),
+                    sort_keys: grouped.map_or(0, |g| g.order_by.len()),
+                    aggregate: Some(super::set_op::aggregate_shape(&plan.bound)),
+                    filter_predicates: agg.where_predicates.len(),
+                })
+            }
+            (BufferedOuter::Aggregate(_), OuterKind::Rows(_)) => Err(internal_error()),
+        }
+    }
+}
+
+/// 行形の層（外側、または CTE→CTE の派生 slot の層）の形。`EXPLAIN`（Issue #2976）用。
+/// ウィンドウ項目を持つ層は固定文の `42601`。
+pub(crate) fn rows_layer_shape(
+    rows: &BufferedRows,
+) -> Result<super::cte_explain::OuterLayerShape, SqlSurfaceError> {
+    if !rows.window_items.is_empty() {
+        return Err(SqlSurfaceError::unsupported(
+            "EXPLAIN is not supported for window functions over a materialized CTE",
+        ));
+    }
+    Ok(super::cte_explain::OuterLayerShape {
+        has_limit: rows.limit_explicit,
+        has_offset: rows.offset != 0,
+        sort_keys: rows.order_by.len().saturating_add(rows.order_keys.len()),
+        aggregate: None,
+        filter_predicates: rows.where_predicates.len(),
+    })
 }
 
 /// 外側のクエリを、本文の結果列に対して束縛・解決する（Issue #1360・Issue #1411）。

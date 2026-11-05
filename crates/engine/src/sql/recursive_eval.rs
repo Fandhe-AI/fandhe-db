@@ -1389,6 +1389,80 @@ pub(crate) fn describe(
     })
 }
 
+/// 再帰項の JOIN で作業表以外の側の走査分類の行を作る呼び出し元のコールバック（`EXPLAIN` 用）。
+pub(crate) type BaseScanLines<'a> =
+    dyn Fn(&TableSchema, &BoundScan) -> Result<Vec<String>, SqlSurfaceError> + 'a;
+
+/// 再帰 CTE の `EXPLAIN`（Issue #2976）が報告する静的な形。
+pub(crate) struct RecursiveExplain {
+    /// `recursive_union` 段の属性（`UNION` の種別・`SEARCH`／`CYCLE` の有無）。
+    pub(crate) stage: super::cte_explain::RecursiveStageSpec,
+    /// 再帰項の木。単一関係なら `work_table_scan`、JOIN なら作業表の側を `work_table_scan` に
+    /// した `join` 木。
+    pub(crate) recursive: super::explain_tree::ExplainNode,
+}
+
+/// 再帰項の静的な形を導出する（`EXPLAIN` 用。行は読まず、反復も行わない）。計画は [`describe`]・
+/// [`execute`] と同じ `with_prepared` を通すので、束縛・列整合のエラーと判定順は一致する。
+/// JOIN の再帰項で作業表以外の側の走査分類の行は、呼び出し元が `base_scan_lines`（`core.rs` の
+/// 単一表 `EXPLAIN` と共有の分類）で作る。反復回数・累積行数はデータ依存なので出さない。
+pub(crate) fn explain(
+    cte: &ValidatedRecursiveCte,
+    anchor_columns: &[ColumnMeta],
+    schemas: &HashMap<String, TableSchema>,
+    udfs: &UdfRegistry,
+    join_limits: &JoinLimits,
+    base_scan_lines: &BaseScanLines<'_>,
+) -> Result<RecursiveExplain, SqlSurfaceError> {
+    use super::cte_explain::{work_table_filter_lines, work_table_scan_node, RecursiveStageSpec};
+    use super::explain_tree::ExplainTreeError;
+    with_prepared(cte, anchor_columns, schemas, udfs, join_limits, |p| {
+        let stage = RecursiveStageSpec {
+            union_all: cte.union_all,
+            search: p.search.as_ref().map(|s| s.breadth_first),
+            cycle: p.cycle.is_some(),
+        };
+        let recursive = match &p.step {
+            Step::Scan(term) => {
+                let b = &term.bound;
+                let has_filter = !b.metadata_filters.is_empty()
+                    || !b.expr_filters.is_empty()
+                    || !b.or_filters.is_empty();
+                work_table_scan_node(work_table_filter_lines(has_filter))
+                    .map_err(ExplainTreeError::into_surface_error)?
+            }
+            Step::Join {
+                prepared, cte_side, ..
+            } => {
+                let mut nodes = Vec::with_capacity(prepared.side_count());
+                for side in 0..prepared.side_count() {
+                    if side == *cte_side {
+                        nodes.push(
+                            work_table_scan_node(vec![format!(
+                                "relation: {}",
+                                side.saturating_add(1)
+                            )])
+                            .map_err(ExplainTreeError::into_surface_error)?,
+                        );
+                        continue;
+                    }
+                    let (schema, bound) = prepared
+                        .side_scan(side)
+                        .ok_or_else(|| internal("recursive join side out of range"))?;
+                    let lines = base_scan_lines(schema, bound)?;
+                    nodes.push(
+                        super::join::side_scan_node(side, lines)
+                            .map_err(ExplainTreeError::into_surface_error)?,
+                    );
+                }
+                super::join::explain_tree_with_side_nodes(prepared, nodes)
+                    .map_err(ExplainTreeError::into_surface_error)?
+            }
+        };
+        Ok(RecursiveExplain { stage, recursive })
+    })
+}
+
 /// 反復評価を実行する。`anchor` はアンカー項の実行結果（最初の作業表）。
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execute(

@@ -4,8 +4,8 @@
 //!
 //! 派生表は名前を利用者が書けない合成 CTE として `WITH`＋JOIN 主クエリ経路の slot で評価される。
 //! 本テストは (A) CTE 版と結果が一致する、(B) JOIN 経由でも他テナントの行が混入しない、
-//! (C) 入れ子の深さ上限（`54000`）、(D) 未対応の形は固定エラーで止まり内部名が漏れない、(E) EXPLAIN は
-//! 対象外（`42601`）、を固定する。
+//! (C) 入れ子の深さ上限（`54000`）、(D) 未対応の形は固定エラーで止まり内部名が漏れない、を固定する。
+//! JOIN の入力になる派生表の `EXPLAIN` は Issue #2976 で対応した（`sql75_explain_cte_inputs.rs`）。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
@@ -392,12 +392,6 @@ fn inherited_join_input_restrictions_stay_fail_closed() {
             "0A000",
         ),
         ("SELECT * FROM docs d, (SELECT lang FROM docs)", "0A000"),
-        // JOIN の入力になる派生表の EXPLAIN は対象外（Issue #2048 の OUT 区分。単一の派生表・入れ子は
-        // 受理に変わった。`sql75_explain_cte_subquery.rs`）。
-        (
-            "EXPLAIN SELECT * FROM docs d JOIN (SELECT lang FROM docs) t ON d.lang = t.lang",
-            "42601",
-        ),
         // LATERAL は対象外。
         (
             "SELECT * FROM docs d JOIN LATERAL (SELECT lang FROM docs) t ON true",

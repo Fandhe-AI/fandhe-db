@@ -400,3 +400,7 @@ CTE 本文の集計・`GROUP BY`・`SELECT DISTINCT`・ウィンドウ関数を�
 （`MATERIALIZED`・本文に `ORDER BY`／`LIMIT` を持つ CTE）・JOIN／集合演算の入力になる CTE・主クエリに部分クエリを持つ形は
 従来どおり `42601`、データ変更 CTE は `0A000`（書き込みなし）。上の「`EXPLAIN` での表示は対象外」の記述のうち、
 インライン展開の範囲は本追記で更新された。
+
+## Issue #2976 追記: 具体化 CTE の EXPLAIN
+
+具体化経路（`MATERIALIZED`・本文に `ORDER BY`／`LIMIT`／集計を持つ CTE・派生表）と、CTE／派生表を入力にする JOIN の `EXPLAIN` は、Issue #2976 で段の木として受理する（`cte_mode: materialized`・`cte_shared`。詳細は [explain-search-engine-exposure.md](explain-search-engine-exposure.md) の #2976 追記）。上の対象外節の「`EXPLAIN` での具体化の表示」「`EXPLAIN` での表示」は本追記で更新された。集合演算の入力になる CTE・派生表は非 EXPLAIN でも未対応のため、`EXPLAIN` も `42601`。
