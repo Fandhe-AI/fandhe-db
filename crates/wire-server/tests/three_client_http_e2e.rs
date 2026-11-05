@@ -158,7 +158,7 @@
 //!
 //! 上記 3 シナリオ（#779・#877）に加え、Phase 7（親 #944。#945〜#949・
 //! #1061〜#1063）の追加機能・insert・DDL 3 op を含む
-//! `wire_server::http::query::op::Op::ALL`（9 語彙）全体へ層 B 到達性を
+//! `wire_server::http::query::op::Op::ALL`（12 語彙。うち実行未結線の `upsert` は Issue #2087 まで除外）全体へ層 B 到達性を
 //! 持たせる。範囲比較・`IN`・`OR`・`sort`・`offset`・複数列 `group_by`は
 //! `PARITY_CASES` への追加（`run_sql_nosql_parity_scenario` を再利用）、
 //! 拒否ケース（`sort`／`offset` on `search`/`aggregate`・語彙外 `op`・RLS
@@ -3840,6 +3840,8 @@ fn op_name_from_json_body(json_body: &str) -> &str {
 /// のみ、`PHASE7_WRITE_CASES` は [`Phase7CaseExpectation::Success`] の
 /// みを収集対象にし、`DmlExpectation::Error`／
 /// [`Phase7CaseExpectation::RejectionOnly`] は除外する。
+/// 注: 実行未結線の op（`Op::execution_wired` が偽。現状 `upsert`・Issue #2086）は
+/// 網羅対象から除外する。結線する Issue #2087 で成功ケースを追加し述語を反転する。
 #[test]
 fn parity_matrix_covers_every_nosql_op() {
     use std::collections::BTreeSet;
@@ -3865,7 +3867,20 @@ fn parity_matrix_covers_every_nosql_op() {
         }
     }
 
+    // 実行未結線の op（`upsert`。Issue #2086。結線は Issue #2087）は成功ケースを
+    // 作れないため網羅対象から外す。逆に未結線 op が成功ケースへ現れたら、
+    // `Op::execution_wired` の反転漏れとして失敗させる。
     for op in Op::ALL {
+        if !op.execution_wired() {
+            assert!(
+                !exercised.contains(op.name()),
+                "Op::{} is marked not execution_wired but has a success parity case; \
+                 flip Op::execution_wired",
+                op.name()
+            );
+        }
+    }
+    for op in Op::ALL.iter().copied().filter(|op| op.execution_wired()) {
         let name = op.name();
         assert!(
             exercised.contains(name),

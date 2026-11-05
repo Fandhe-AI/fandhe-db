@@ -227,13 +227,18 @@ fn copy_to_needs_select_on_every_referenced_relation() {
     assert_eq!(f.begin_to(&s, "COPY cb TO STDOUT"), "ok");
 }
 
+/// 暫定規則を Issue #2083 で置き換えた後の契約。`COPY` は列リストの列への列単位の付与で満たせる。列リストの
+/// 省略（全列）と、従来方式の表の疑似列 `id` を含む `FROM` の列リストは表単位でしか満たせない。
 #[test]
-fn column_level_grant_does_not_satisfy_table_level_copy() {
+fn column_level_grant_satisfies_only_the_listed_columns_of_copy() {
     let f = fx("copypriv-column");
     let s = bound(f.alice, false);
     f.admin_run("GRANT SELECT (n) ON ca TO alice");
     assert_eq!(f.begin_to(&s, "COPY ca TO STDOUT"), "42501");
+    assert_eq!(f.begin_to(&s, "COPY ca (n) TO STDOUT"), "ok");
+    assert_eq!(f.begin_to(&s, "COPY ca (embedding) TO STDOUT"), "42501");
     f.admin_run("GRANT INSERT (n) ON ca TO alice");
+    // `FROM` の列リストは疑似列 `id` を必ず含む（従来方式の表）ので、列単位の付与では満たせない。
     assert_eq!(
         f.begin_from(&s, &copy_from("ca", "col1")).err().as_deref(),
         Some("42501")

@@ -35,6 +35,10 @@
 //! `UPDATE_SCHEMA`（`set` を任意キーのオブジェクトとして型のみ検査する
 //! [`FieldType::AnyObject`]）・`DELETE_SCHEMA` の宣言に留める。
 //!
+//! `insert`／`update`／`delete` の任意キー `returning`（Issue #2090・NOSQL-22）は
+//! 型（文字列または文字列配列）のみ本モジュールが検査し、値（`"*"`／列名配列）の
+//! 意味検査・分割実行との併用拒否は [`super::returning`] が担う。
+//!
 //! 未知キーは無視せず拒否する（NOSQL-8 の一般則。クライアント自己申告の
 //! `tenant_id`（HTTP-7）・`HINT ORDER`／`SET search_mode` 相当フィールド
 //! （NOSQL-9）・`scan` への `vector`／`plan`／`mode`／`hybrid` 付与拒否
@@ -856,6 +860,84 @@ pub static INSERT_SCHEMA: ObjectSchema = ObjectSchema {
             ty: FieldType::String,
             nullable: true,
         },
+        // 返却制御（Issue #2090・NOSQL-22）。値（`"*"`／列名配列）の意味検査は
+        // `super::returning` が担い、本スキーマは型（文字列または文字列配列）のみ検査する。
+        FieldSpec {
+            key: "returning",
+            presence: Presence::Optional,
+            ty: FieldType::StringOrArray(ElementType::String),
+            nullable: false,
+        },
+    ],
+};
+
+/// `upsert` op の `on_conflict` サブスキーマ（NOSQL-1・NOSQL-21、Issue #2086）。
+/// `columns`（衝突判定列）・`do`（衝突時の動作）・`set`（更新列）の 3 キーのみを
+/// 受理する。制約名・式・`WHERE` に相当するキーは宣言しないため未知キーとして
+/// `42601` で拒否される（fail-closed）。`do` の語彙・`set` と `do` の整合・
+/// `columns` の非空・列名解決は値レベルの検査であり、実行器へ束縛する Issue #2087
+/// が担う（本スキーマは型のみを検査する）。
+pub static UPSERT_ON_CONFLICT_SCHEMA: ObjectSchema = ObjectSchema {
+    name: "on_conflict",
+    fields: &[
+        FieldSpec {
+            key: "columns",
+            presence: Presence::Required,
+            ty: FieldType::Array(ElementType::String),
+            nullable: false,
+        },
+        FieldSpec {
+            key: "do",
+            presence: Presence::Required,
+            ty: FieldType::String,
+            nullable: false,
+        },
+        FieldSpec {
+            key: "set",
+            presence: Presence::Optional,
+            ty: FieldType::Array(ElementType::String),
+            nullable: false,
+        },
+    ],
+};
+
+/// `upsert` op のトップレベルスキーマ（NOSQL-1・NOSQL-21、Issue #2086。親 #2085）。
+/// `rows[*]` の列検証は `insert` と同じく後段の責務で、`mode`／`chunk`／
+/// `returning` は宣言しない（未知キーとして `42601`）。実行は Issue #2087 の担当で、
+/// それまで [`super::gate::handle`] は本スキーマ通過後に固定文言の `0A000` を返す。
+pub static UPSERT_SCHEMA: ObjectSchema = ObjectSchema {
+    name: "upsert",
+    fields: &[
+        FieldSpec {
+            key: "op",
+            presence: Presence::Required,
+            ty: FieldType::String,
+            nullable: false,
+        },
+        FieldSpec {
+            key: "table",
+            presence: Presence::Required,
+            ty: FieldType::String,
+            nullable: false,
+        },
+        FieldSpec {
+            key: "rows",
+            presence: Presence::Required,
+            ty: FieldType::Array(ElementType::Any),
+            nullable: false,
+        },
+        FieldSpec {
+            key: "on_conflict",
+            presence: Presence::Required,
+            ty: FieldType::Object(&UPSERT_ON_CONFLICT_SCHEMA),
+            nullable: false,
+        },
+        FieldSpec {
+            key: "operation_id",
+            presence: Presence::Optional,
+            ty: FieldType::String,
+            nullable: true,
+        },
     ],
 };
 
@@ -918,6 +1000,14 @@ pub static UPDATE_SCHEMA: ObjectSchema = ObjectSchema {
             ty: FieldType::Number,
             nullable: false,
         },
+        // 返却制御（Issue #2090・NOSQL-22）。値（`"*"`／列名配列）の意味検査は
+        // `super::returning` が担い、本スキーマは型（文字列または文字列配列）のみ検査する。
+        FieldSpec {
+            key: "returning",
+            presence: Presence::Optional,
+            ty: FieldType::StringOrArray(ElementType::String),
+            nullable: false,
+        },
     ],
 };
 
@@ -971,6 +1061,14 @@ pub static DELETE_SCHEMA: ObjectSchema = ObjectSchema {
             key: "chunk",
             presence: Presence::Optional,
             ty: FieldType::Number,
+            nullable: false,
+        },
+        // 返却制御（Issue #2090・NOSQL-22）。値（`"*"`／列名配列）の意味検査は
+        // `super::returning` が担い、本スキーマは型（文字列または文字列配列）のみ検査する。
+        FieldSpec {
+            key: "returning",
+            presence: Presence::Optional,
+            ty: FieldType::StringOrArray(ElementType::String),
             nullable: false,
         },
     ],
@@ -1359,11 +1457,12 @@ pub static CANCEL_PARTITIONED_DML_SCHEMA: ObjectSchema = ObjectSchema {
 
 /// op 名（厳密一致。trim・大文字小文字の読み替えはしない）→ [`ObjectSchema`]
 /// の対応表。`schema_for` の実体であり、単一情報源として扱う。
-pub const OP_SCHEMAS: [(&str, &ObjectSchema); 11] = [
+pub const OP_SCHEMAS: [(&str, &ObjectSchema); 12] = [
     ("search", &SEARCH_SCHEMA),
     ("scan", &SCAN_SCHEMA),
     ("aggregate", &AGGREGATE_SCHEMA),
     ("insert", &INSERT_SCHEMA),
+    ("upsert", &UPSERT_SCHEMA),
     ("update", &UPDATE_SCHEMA),
     ("delete", &DELETE_SCHEMA),
     ("create_table", &CREATE_TABLE_SCHEMA),
@@ -1416,6 +1515,7 @@ mod tests {
                 "scan",
                 "aggregate",
                 "insert",
+                "upsert",
                 "update",
                 "delete",
                 "create_table",
@@ -1631,6 +1731,176 @@ mod tests {
         let delete_null =
             obj(r#"{"op":"delete","table":"docs","where":{"id":1},"operation_id":null}"#);
         assert!(DELETE_SCHEMA.validate(&delete_null).is_ok());
+    }
+
+    // --- upsert（Issue #2086） --------------------------------------------
+
+    fn upsert_with(on_conflict: &str) -> JsonValue {
+        obj(&format!(
+            r#"{{"op":"upsert","table":"docs","rows":[{{"id":1}}],"on_conflict":{on_conflict}}}"#
+        ))
+    }
+
+    #[test]
+    fn upsert_accepts_full_forms() {
+        let ok = [
+            r#"{"columns":["id"],"do":"update","set":["lang"]}"#,
+            r#"{"columns":["id"],"do":"nothing"}"#,
+        ];
+        for oc in ok {
+            assert!(UPSERT_SCHEMA.validate(&upsert_with(oc)).is_ok(), "{oc}");
+        }
+        for tail in [r#","operation_id":"u-1""#, r#","operation_id":null"#, ""] {
+            let json = format!(
+                r#"{{"op":"upsert","table":"docs","rows":[],"on_conflict":{{"columns":["id"],"do":"nothing"}}{tail}}}"#
+            );
+            assert!(UPSERT_SCHEMA.validate(&obj(&json)).is_ok(), "{tail}");
+        }
+    }
+
+    #[test]
+    fn upsert_on_conflict_missing_or_wrong_type_is_rejected() {
+        let missing = obj(r#"{"op":"upsert","table":"docs","rows":[]}"#);
+        assert_eq!(
+            UPSERT_SCHEMA.validate(&missing).unwrap_err(),
+            SchemaError::MissingRequired { key: "on_conflict" }
+        );
+        for oc in ["[]", "\"x\"", "null", "1"] {
+            assert_eq!(
+                UPSERT_SCHEMA.validate(&upsert_with(oc)).unwrap_err(),
+                SchemaError::TypeMismatch { key: "on_conflict" },
+                "{oc}"
+            );
+        }
+    }
+
+    #[test]
+    fn upsert_on_conflict_inner_violations_are_rejected() {
+        assert_eq!(
+            UPSERT_SCHEMA
+                .validate(&upsert_with(r#"{"do":"nothing"}"#))
+                .unwrap_err(),
+            SchemaError::MissingRequired { key: "columns" }
+        );
+        assert_eq!(
+            UPSERT_SCHEMA
+                .validate(&upsert_with(r#"{"columns":["id"]}"#))
+                .unwrap_err(),
+            SchemaError::MissingRequired { key: "do" }
+        );
+        for oc in [
+            r#"{"columns":"id","do":"nothing"}"#,
+            r#"{"columns":["id",1],"do":"nothing"}"#,
+            r#"{"columns":null,"do":"nothing"}"#,
+        ] {
+            assert_eq!(
+                UPSERT_SCHEMA.validate(&upsert_with(oc)).unwrap_err(),
+                SchemaError::TypeMismatch { key: "columns" },
+                "{oc}"
+            );
+        }
+        for oc in [
+            r#"{"columns":["id"],"do":1}"#,
+            r#"{"columns":["id"],"do":null}"#,
+        ] {
+            assert_eq!(
+                UPSERT_SCHEMA.validate(&upsert_with(oc)).unwrap_err(),
+                SchemaError::TypeMismatch { key: "do" },
+                "{oc}"
+            );
+        }
+        for set in [r#"{"a":1}"#, r#""lang""#, "null"] {
+            let oc = format!(r#"{{"columns":["id"],"do":"update","set":{set}}}"#);
+            assert_eq!(
+                UPSERT_SCHEMA.validate(&upsert_with(&oc)).unwrap_err(),
+                SchemaError::TypeMismatch { key: "set" },
+                "{oc}"
+            );
+        }
+    }
+
+    #[test]
+    fn upsert_unknown_keys_are_rejected() {
+        for k in ["constraint", "where", "target"] {
+            let oc = format!(r#"{{"columns":["id"],"do":"nothing","{k}":"x"}}"#);
+            assert_eq!(
+                UPSERT_SCHEMA.validate(&upsert_with(&oc)).unwrap_err(),
+                SchemaError::UnknownKey,
+                "{k}"
+            );
+        }
+        for k in ["returning", "mode", "tenant_id"] {
+            let json = format!(
+                r#"{{"op":"upsert","table":"docs","rows":[],"on_conflict":{{"columns":["id"],"do":"nothing"}},"{k}":"x"}}"#
+            );
+            assert_eq!(
+                UPSERT_SCHEMA.validate(&obj(&json)).unwrap_err(),
+                SchemaError::UnknownKey,
+                "{k}"
+            );
+        }
+    }
+
+    #[test]
+    fn upsert_rows_missing_or_non_array_is_rejected() {
+        let oc = r#""on_conflict":{"columns":["id"],"do":"nothing"}"#;
+        let missing = obj(&format!(r#"{{"op":"upsert","table":"docs",{oc}}}"#));
+        assert_eq!(
+            UPSERT_SCHEMA.validate(&missing).unwrap_err(),
+            SchemaError::MissingRequired { key: "rows" }
+        );
+        let bad = obj(&format!(
+            r#"{{"op":"upsert","table":"docs","rows":{{}},{oc}}}"#
+        ));
+        assert_eq!(
+            UPSERT_SCHEMA.validate(&bad).unwrap_err(),
+            SchemaError::TypeMismatch { key: "rows" }
+        );
+    }
+
+    #[test]
+    fn dml_schemas_declare_returning_as_optional_string_or_array() {
+        for schema in [&INSERT_SCHEMA, &UPDATE_SCHEMA, &DELETE_SCHEMA] {
+            let spec = schema
+                .fields
+                .iter()
+                .find(|f| f.key == "returning")
+                .expect("returning declared");
+            assert_eq!(spec.presence, Presence::Optional, "{}", schema.name);
+            assert!(!spec.nullable, "{}", schema.name);
+            assert!(
+                matches!(spec.ty, FieldType::StringOrArray(ElementType::String)),
+                "{}",
+                schema.name
+            );
+        }
+    }
+
+    #[test]
+    fn returning_type_check_accepts_string_and_string_array_only() {
+        let base = [
+            (&INSERT_SCHEMA, r#""op":"insert","table":"docs","rows":[]"#),
+            (
+                &UPDATE_SCHEMA,
+                r#""op":"update","table":"docs","set":{"a":1}"#,
+            ),
+            (&DELETE_SCHEMA, r#""op":"delete","table":"docs""#),
+        ];
+        for (schema, head) in base {
+            for ok in [r#""*""#, r#"["a","b"]"#, "[]"] {
+                let v = obj(&format!("{{{head},\"returning\":{ok}}}"));
+                assert!(schema.validate(&v).is_ok(), "{} {ok}", schema.name);
+            }
+            for bad in ["null", "1", "{}", "true", "[1]", r#"["a",null]"#] {
+                let v = obj(&format!("{{{head},\"returning\":{bad}}}"));
+                assert_eq!(
+                    schema.validate(&v).unwrap_err(),
+                    SchemaError::TypeMismatch { key: "returning" },
+                    "{} {bad}",
+                    schema.name
+                );
+            }
+        }
     }
 
     #[test]

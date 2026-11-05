@@ -1,8 +1,8 @@
 # NoSQL API
 
 `wire-server --surface nosql` が公開する 3 エンドポイント（`POST /v1/session`・
-`POST /v1/session/close`・`POST /v1/query`）と、`POST /v1/query` の `op` 11 値
-（`search`／`scan`／`aggregate`／`insert`／`update`／`delete`／`create_table`／
+`POST /v1/session/close`・`POST /v1/query`）と、`POST /v1/query` の `op` 12 値
+（`search`／`scan`／`aggregate`／`insert`／`upsert`／`update`／`delete`／`create_table`／
 `alter_table`／`drop_table`／`show_partitioned_dml`／`cancel_partitioned_dml`）の JSON
 スキーマを利用者向けに整理する。
 `update`／`delete` は `where`（単一行・PRIMARY KEY 列〔複合可〕または従来方式の表の `id`）・`filter`（述語形）の
@@ -43,7 +43,7 @@ spec で規範化された内部転送プロトコルの実装にすぎない。
 `engine::error_format::ErrorClass` を HTTP 応答（ステータス・本文）へ写像するのみ
 （ERR-4）。
 
-spec ポインタ一覧: TASK-184（基盤）・HTTP-1〜13・NOSQL-1〜11・ERR-4・SQL-1〜15・
+spec ポインタ一覧: TASK-184（基盤）・HTTP-1〜14・NOSQL-1〜11・ERR-4・SQL-1〜15・
 RLS-7・RLS-9・TABLE-12。
 
 ## 転送路の共通規則
@@ -151,7 +151,7 @@ JSON キー・ヘッダ（`tenant`／`tenant-id`／`tenantid` 相当。`x-` 接�
 2. `Authorization: Bearer` 認証（`28000`）
 3. ヘッダの `tenant_id` 相当拒否（`42601`）
 4. 本文の UTF-8／JSON 構文／`op` フィールドの形（`42601`）
-5. `op` 許可リスト判定（11 値の厳密一致。語彙外は `0A000`。DDL・UDF 呼び出し・
+5. `op` 許可リスト判定（12 値の厳密一致。語彙外は `0A000`。DDL・UDF 呼び出し・
    トランザクション制御を含む）
 6. op 別スキーマ検証（必須キー欠落・未知キー・型不一致・`null` は `42601`）
 7. `Idempotency-Key` ヘッダの解決（重複は `08P01`、空・256 バイト超・制御文字は `42601`。
@@ -163,6 +163,21 @@ JSON キー・ヘッダ（`tenant`／`tenant-id`／`tenantid` 相当。`x-` 接�
 （`--require-operation-id` の構成でも同じ）、両方ある場合は値の完全一致が必要で、不一致は `42601`
 （副作用なし）。応答にヘッダは返さず、解決した値を本文の `operation_id`（成功本文と分割実行 409 の
 `error.data.operation_id`）で返す。同じ値で内容が異なる再送の `22023` は従来どおり台帳が判定する
+
+ヘッダ値は SQL 表層の `USING OPERATION_ID '<id>'` および本文の `operation_id` と同じ台帳へ
+記録される。同一テナント・同一表で表層や指定方法（ヘッダ・本文・SQL）を跨いだ再送は、内容一致が
+`23505`（HTTP `409`）、内容違いが `22023`（HTTP `400`）になる。分割実行の中断ジョブも、
+ヘッダだけで SQL 側が開始したジョブを再開でき、その逆もできる。キーのスコープはテナント内で、
+台帳キーは（テナント・表・`operation_id`）である。テナントはサーバー側の認証結果から導出し、
+クライアントの申告は使わない。他テナントが同じ値を使っていても衝突せず、その使用有無は応答の
+ステータス・ヘッダ・本文に現れない（RLS-9）。
+
+Stripe 等の HTTP API の冪等キーとの違い: 再送時に最初の成功応答を保存・再生しない。同内容の
+再送は `23505` で、HTTP クライアントは `error.code`=`DUPLICATE_OPERATION_ID` を確認したときだけ
+「既に適用済み」として扱う（通常の `UNIQUE_VIOLATION` も同じ `23505`／`409` のため、`23505` や
+`409` だけで適用済みと判断しない。`UNIQUE_VIOLATION` は未適用のまま失敗した可能性があり、適用済み扱いにしない）。保存期限（TTL）は無く、
+台帳エントリは自動では削除されない（比較は `docs/design/idempotent-resend-comparison.md`）。
+ヘッダ付き要求の例は「curl 例」節を参照。
 
 `op` は完全一致のみで判定する（大文字小文字の読み替え・前後空白のトリムは
 しない）。`"SEARCH"`・`" search"`・`"select"`・`"explain"`・`"begin"` 等はいずれも
@@ -415,6 +430,7 @@ OFFSET ...` と同じ対象名解決・実行器を共有。第 2 の実行器�
 | `table` | ○ | string | |
 | `rows` | ○ | object[] | 各行はスキーマ列名をキーとする値。疑似列 `id` を持つ表（従来方式・NoSQL `create_table` で作った表）は `id`（非負整数）が必須。SQL の `CREATE TABLE` で作った表（暗黙の `id` を持たない採番方式。TABLE-23・NOSQL-23。Issue #2201）は `id` を要求せず、宣言した `id` 列は通常の列として扱い、宣言のない `id` キーは `22000`。PRIMARY KEY 列の省略は `23502`（`DEFAULT` があれば適用）、PK 重複は `23505`。行の識別子（rowid）は応答に出ない |
 | `operation_id` | △ | string | 既定では省略可（欠落・`null`・空文字は台帳に記録しない通常の書き込み。成功応答に `operation_id` キーなし。`Idempotency-Key` ヘッダでも指定でき、両方あれば一致必須で不一致は `42601`）。`--require-operation-id` の構成では欠落・`null`・空文字はいずれも `23502` |
+| `returning` | △ | string `"*"` または string[] | 返す列の指定（NOSQL-22）。`"*"` か非空の列名配列のみ受理し、それ以外（`null`・数値・空配列・`"*"` を含む配列・識別子でない要素・列名 1 つの文字列形）は `42601`。現在は妥当な指定でも固定文言の `0A000`（HTTP 501、書き込みなし）で拒否する（実行は Issue #2091 で結線予定。指定を黙って無視しない） |
 
 要求例:
 
@@ -506,6 +522,34 @@ OFFSET ...` と同じ対象名解決・実行器を共有。第 2 の実行器�
 `nosql6_insert.rs`・`nosql6_tenant_row_id_scope.rs`・
 `http_insert_response_boundary.rs`・`wire_insert_operation_id.rs`。
 
+### `upsert`
+
+`insert` に衝突時の動作（`on_conflict`）を加えた op（NOSQL-1・NOSQL-21。Issue #2086）。
+**現状はスキーマ検証までで、実行は未結線**。スキーマを通過した要求は、engine 接続の有無に
+かかわらず `0A000`（HTTP `501`、固定文言 `upsert execution not yet available`）を返す
+（実行は Issue #2087 で結線予定。応答・エラーの詳細は Issue #2088 で追記する）。
+
+| キー | 必須 | 型 | 備考 |
+| --- | --- | --- | --- |
+| `op` | ○ | string | `"upsert"` |
+| `table` | ○ | string | |
+| `rows` | ○ | object[] | `insert` と同じ形（列の検証は実行側の担当） |
+| `on_conflict` | ○ | object | `columns`（○・string[]）・`do`（○・string）・`set`（△・string[]）の 3 キーのみ。未知キー（制約名・式・`WHERE` 相当を含む）は `42601` |
+| `operation_id` | △ | string | `insert` と同じ扱い（欠落・`null` 可） |
+
+`mode`／`chunk`／`returning` は宣言していないため未知キーとして `42601`。型不一致（`null` を含む）・必須キー欠落も `42601`。
+
+要求例:
+
+```json
+{"op": "upsert", "table": "docs",
+ "rows": [{"id": 1, "lang": "en"}],
+ "on_conflict": {"columns": ["id"], "do": "update", "set": ["lang"]},
+ "operation_id": "upsert-1"}
+```
+
+検証コード: `crates/wire-server/tests/http_nosql/nosql9_op_allowlist.rs`・`nosql1_op_vocabulary.rs`。
+
 ### `update`
 
 `where`（単一行・`id` 完全一致形）は束縛・実行結線済み（Issue #876・
@@ -529,6 +573,7 @@ SQL の `WHERE` 句省略とのパリティ）。
 | `operation_id` | △ | string | 既定では省略可（成功応答に `operation_id` キーなし。`Idempotency-Key` ヘッダでも指定でき、両方あれば一致必須で不一致は `42601`）。`--require-operation-id` の構成では欠落・`null`・空文字は `23502`（分割実行は構成によらず `23502`）。同一値への再送は台帳照合により内容一致 `23505`（`DUPLICATE_OPERATION_ID`）・不一致 `22023`（SQL 表層と共有） |
 | `mode` | | string | 分割実行の修飾（Issue #1130・NOSQL-12）。受理値は `"partitioned"` のみで、それ以外の文字列・非文字列は `42601`（黙って原子実行へ切り替えない）。`filter`（述語形）とだけ組み合わせられ、`where` との併用は `42601`。詳細は[分割実行](#分割実行-dml)参照 |
 | `chunk` | | number | 1 チャンクの行数（`mode` 指定時のみ有効。`mode` なしは `42601`）。`0`・小数・`usize` 超過は `22000`、負数は `42601`、サーバー設定のチャンク幅超過は `22000`（SQL の `CHUNK n` と同じ規則） |
+| `returning` | △ | string `"*"` または string[] | 返す列の指定（NOSQL-22）。`"*"` か非空の列名配列のみ受理し、それ以外（`null`・数値・空配列・`"*"` を含む配列・識別子でない要素・列名 1 つの文字列形）は `42601`。`mode`／`chunk` との併用も `42601`。現在は妥当な指定でも固定文言の `0A000`（HTTP 501、書き込みなし）で拒否する（実行は Issue #2091 で結線予定。指定を黙って無視しない） |
 
 成功応答: `{"updated":<n>,"operation_id":"<echo>"}`（`operation_id` を省略した場合は `{"updated":<n>}`）。`where` 形（単一行）は
 `n` が `0` または `1`（他テナント所有 id・未存在 id はいずれも `updated:0`・
@@ -582,6 +627,7 @@ execute_delete`）・同一の台帳キー空間を共有する。`filter`（述
 | `operation_id` | △ | string | 既定では省略可（成功応答に `operation_id` キーなし。`Idempotency-Key` ヘッダでも指定でき、両方あれば一致必須で不一致は `42601`）。`--require-operation-id` の構成では欠落・`null`・空文字は `23502`（分割実行は構成によらず `23502`）。同一値への再送は台帳照合により `23505`（`DUPLICATE_OPERATION_ID`。内容一致。`DELETE` は行の有無に関わらず同一内容） |
 | `mode` | | string | 分割実行の修飾（Issue #1130・NOSQL-12）。受理値は `"partitioned"` のみで、それ以外の文字列・非文字列は `42601`（黙って原子実行へ切り替えない）。`filter`（述語形）とだけ組み合わせられ、`where` との併用は `42601`。詳細は[分割実行](#分割実行-dml)参照 |
 | `chunk` | | number | 1 チャンクの行数（`mode` 指定時のみ有効。`mode` なしは `42601`）。`0`・小数・`usize` 超過は `22000`、負数は `42601`、サーバー設定のチャンク幅超過は `22000`（SQL の `CHUNK n` と同じ規則） |
+| `returning` | △ | string `"*"` または string[] | 返す列の指定（NOSQL-22）。`"*"` か非空の列名配列のみ受理し、それ以外（`null`・数値・空配列・`"*"` を含む配列・識別子でない要素・列名 1 つの文字列形）は `42601`。`mode`／`chunk` との併用も `42601`。現在は妥当な指定でも固定文言の `0A000`（HTTP 501、書き込みなし）で拒否する（実行は Issue #2091 で結線予定。指定を黙って無視しない） |
 
 成功応答: `{"deleted":<n>,"operation_id":"<echo>"}`（`operation_id` を省略した場合は `{"deleted":<n>}`）。`where` 形（単一行）は
 `n` が `0` または `1`（他テナント所有 id・未存在 id はいずれも `deleted:0`・
@@ -1408,7 +1454,14 @@ curl -s -X POST http://127.0.0.1:5432/v1/query \
   -H 'Content-Type: application/json' \
   -d '{"op":"search","table":"docs","vector":[0.1,0.2,0.3,0.4],"limit":10}'
 
-# 3) セッション終了
+# 3) 書き込み（Idempotency-Key ヘッダで operation_id を渡す。再送は 23505）
+curl -s -X POST http://127.0.0.1:5432/v1/query \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: op-1' \
+  -d '{"op":"delete","table":"docs","where":{"id":1}}'
+
+# 4) セッション終了
 curl -s -X POST http://127.0.0.1:5432/v1/session/close \
   -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' -d '{}'
@@ -1440,6 +1493,9 @@ curl -s -X POST http://127.0.0.1:5432/v1/session/close \
   Issue #1198・NOSQL-15）
 - `explain`（`vector` 指定 `search`・`scan`・`aggregate` への対象拡大。
   Issue #948・NOSQL-16・SQL-27）: `nosql16_explain_targets.rs`
+- `Idempotency-Key`（HTTP-14）: `http14_idempotency_key.rs`（Issue #2064）・
+  `http14_idempotency_key_cross_surface.rs`（SQL との相互再送・テナント境界。
+  Issue #2065）・`idempotency_key.rs`（単体）
 - `insert`: `nosql6_insert.rs`・`nosql6_tenant_row_id_scope.rs`・
   `http_insert_response_boundary.rs`・`wire_insert_operation_id.rs`
 - `filter`: `nosql7_filter_mapping.rs`

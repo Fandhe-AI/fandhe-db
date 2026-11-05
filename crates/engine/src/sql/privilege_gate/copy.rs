@@ -13,14 +13,18 @@
 //! - 一時表（セッションの所有物）は呼び出し元が本ゲートの手前で分岐するので対象外。
 //! - ACL は明示 Tx では `BEGIN` 時のスナップショットで照会し（`read_snap`）、検証済みの対象表が照会で
 //!   見つからなければ `42P01` で拒否する（`read.rs` の `require_relations_bits` の規則をそのまま使う）。
+//! - 列単位の付与（Issue #2083。`columns.rs`）: `FROM` は列リストの列への INSERT、`TO` のテーブル形は列リスト
+//!   （省略時は全列）への SELECT、問い合わせ形は単一 relation なら名指しした列への SELECT（それ以外は全列）。
+//!   従来方式の表の疑似列 `id`（`FROM` の列リストは必ず含む）は表単位でしか満たせない。
 //! - 拒否は固定文言の `42501`。表名・ロール ID・テナントを含めない。
 
 use crate::catalog::privilege::{PRIV_INSERT, PRIV_SELECT};
-use crate::sql::allowlist::{CopyStatement, SqlSurfaceError};
+use crate::sql::allowlist::{CopyStatement, Projection, SqlSurfaceError};
 use crate::sql::lexer::Token;
 use crate::sql::mode::SessionState;
 use crate::storage::Storage;
 
+use super::columns::{ColumnSpec, Want};
 use super::read::require_relations_bits;
 use super::{check, Principal, PrivilegeTarget};
 
@@ -29,6 +33,18 @@ pub(crate) fn copy_required_bits(stmt: &CopyStatement) -> u16 {
     match stmt {
         CopyStatement::From(_) => PRIV_INSERT,
         CopyStatement::To(_) => PRIV_SELECT,
+    }
+}
+
+/// `COPY ... FROM` の列リストを列の仕様へ変換する。開始時の判定（[`require_copy_privileges`]）と
+/// commit 時の再検査（`core.rs` の `begin_copy_validated`）が同じ集合を使うための単一の入口。
+/// 列リストが空（省略）なら全列（疑似列 `id` を含む。厳しい側）。列リストに無い列は要求しない
+/// （既定値で埋まる列に INSERT 権限は要らない。PostgreSQL の COPY と同じ）。
+pub(crate) fn copy_from_columns(columns: &[String]) -> ColumnSpec {
+    if columns.is_empty() {
+        ColumnSpec::All
+    } else {
+        ColumnSpec::Names(columns.to_vec())
     }
 }
 
@@ -70,6 +86,36 @@ pub(crate) fn require_copy_privileges(
         CopyStatement::From(v) => v.table_name.clone(),
         CopyStatement::To(v) => v.inner.table_name().to_string(),
     }];
-    let wants: Vec<(String, u16)> = names.into_iter().map(|n| (n, required_bits)).collect();
-    require_relations_bits(storage, tenant, &principal, &wants, read_snap, &verified)
+    let mut wants: Vec<Want> = Vec::new();
+    match stmt {
+        CopyStatement::From(v) => wants.extend(Want::split(
+            &v.table_name,
+            required_bits,
+            copy_from_columns(&v.columns),
+        )),
+        CopyStatement::To(v) => {
+            let target = v.inner.table_name();
+            let target_spec = match (&v.inner.projection, v.is_table_form()) {
+                (Projection::Columns(cols), true) => ColumnSpec::Names(cols.clone()),
+                (_, true) => ColumnSpec::All,
+                (_, false) => ColumnSpec::Scan,
+            };
+            for n in names {
+                if n == target {
+                    wants.extend(Want::split(&n, required_bits, target_spec.clone()));
+                } else {
+                    wants.extend(Want::all(&n, required_bits));
+                }
+            }
+        }
+    }
+    require_relations_bits(
+        storage,
+        tenant,
+        &principal,
+        &wants,
+        resolved_tokens,
+        read_snap,
+        &verified,
+    )
 }

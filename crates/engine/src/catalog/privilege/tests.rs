@@ -822,3 +822,37 @@ fn identity_closure_stops_when_definition_bytes_exceed_the_budget() {
     assert!(relation_identity_closure_in_txn(&rt, &roots).is_err());
     assert!(relation_identity_closure_in_txn(&rt, &roots[..2]).is_ok());
 }
+/// 列単位の付与を表単位の付与と同じ閉包・PUBLIC 規則で集める（Issue #2083）。他テナント・他ロールの列の行は
+/// 数えず、形（列名・疑似列 `id`・ビュー）は列単位の判定が要るときだけ引ける。
+#[test]
+fn relation_grants_collect_column_rows_for_the_role_and_public_only() {
+    use redb::ReadableDatabase;
+    let (_g, s) = open("priv-relgrants");
+    mk_table(&s, "rg");
+    grant(&s, "t1", &col("rg", "a"), 7, PRIV_SELECT);
+    grant(&s, "t1", &col("rg", "a"), PUBLIC_GRANTEE_ID, PRIV_INSERT);
+    grant(&s, "t1", &col("rg", "b"), 8, PRIV_UPDATE);
+    grant(&s, "t2", &col("rg", "b"), 7, PRIV_SELECT);
+    grant(&s, "t1", &tbl("rg"), 7, PRIV_DELETE);
+    let rt = s.db().begin_read().expect("read");
+    let keys = vec!["rg".to_string(), "missing".to_string()];
+    let got = relation_grants_in_txn(&rt, "t1", &keys, 7).expect("grants");
+    let g = got[0].as_ref().expect("exists");
+    assert_eq!(g.table_bits, PRIV_DELETE);
+    assert_eq!(
+        g.column_bits,
+        vec![("a".to_string(), PRIV_SELECT | PRIV_INSERT)]
+    );
+    assert!(got[1].is_none());
+    // 別テナントの行は引けない。
+    let other = relation_grants_in_txn(&rt, "t2", &keys, 7).expect("grants");
+    assert_eq!(
+        other[0].as_ref().expect("exists").column_bits,
+        vec![("b".to_string(), PRIV_SELECT)]
+    );
+    // 形は実表の生存列と、疑似列 `id` の有無を返す。
+    let shape = relation_shape_in_txn(&rt, "rg").expect("shape");
+    assert_eq!(shape.columns, vec!["a".to_string(), "b".to_string()]);
+    assert!(shape.pseudo_id && !shape.view_like);
+    assert!(relation_shape_in_txn(&rt, "missing").is_err());
+}
