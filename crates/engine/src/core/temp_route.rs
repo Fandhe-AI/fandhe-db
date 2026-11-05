@@ -402,7 +402,13 @@ impl EngineCore {
         let store = session.temp_rows_arc().ok_or_else(internal)?;
         let core = store.core()?;
         let routed = core.parse_tokens(tokens)?;
-        if !is_routable(&routed)
+        // Issue #2059（SQL-76 (6)）: `EXPLAIN (FORMAT JSON)` の包みは、中身が一時コアで実行できる
+        // `EXPLAIN` のときに限り振り分け可否を中身で判定する（FORMAT TEXT と JSON の受理範囲を揃える）。
+        let routable_form = match &routed {
+            ParsedSql::ExplainJson(inner) => inner.as_ref(),
+            other => other,
+        };
+        if !is_routable(routable_form)
             || matches!(routed, ParsedSql::CreateIndex(_) | ParsedSql::DropIndex(_))
         {
             return Err(crate::sql::temp_catalog::temp_table_unsupported());
@@ -1233,6 +1239,15 @@ impl EngineCore {
             ParsedSql::Statement(stmt) => {
                 core.execute_validated_in_session(ctx, session, stmt.clone())
             }
+            // Issue #2059: 一時表に対する `EXPLAIN (FORMAT JSON)`。中身の `EXPLAIN` を実行し、
+            // 内部キーを表示名へ戻した後で JSON へ変換する（永続側の `ExplainJson` と同じ順序）。
+            ParsedSql::ExplainJson(json_inner) => match json_inner.as_ref() {
+                ParsedSql::Statement(stmt @ Statement::Explain(_)) => {
+                    let outcome = core.execute_validated_in_session(ctx, session, stmt.clone())?;
+                    crate::sql::explain_json::outcome_to_json(core.scrub_outcome(ctx, outcome))
+                }
+                _ => Err(internal()),
+            },
             _ if is_write(inner) => {
                 let gated = store.begin_write()?;
                 // `Err` を返すと `gated` が drop され abort する（部分書き込みを残さない）。
@@ -1385,6 +1400,11 @@ impl EngineCore {
             // 読み取り系は開いている書き込みトランザクションを読み取り源にする（自トランザクションの
             // 未 commit の変更を読める。キャッシュは使われない brute-force 経路）。
             ParsedSql::LockingSelect(_) => Err(super::row_lock_not_supported()),
+            // Issue #2059: 中身の `EXPLAIN` を同じ書き込みトランザクションで実行し、scrub の後で JSON 化する。
+            ParsedSql::ExplainJson(json_inner) => {
+                let outcome = self.temp_dispatch(ctx, session, gated, json_inner)?;
+                crate::sql::explain_json::outcome_to_json(self.scrub_outcome(ctx, outcome))
+            }
             ParsedSql::Statement(stmt) => match stmt {
                 Statement::Select(v) if v.using_plan().is_some() => {
                     self.execute_validated_with_dict(ctx, session, stmt.clone(), Some(write_txn))

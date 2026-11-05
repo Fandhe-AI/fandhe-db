@@ -398,3 +398,30 @@ fn tenant_schema_keys_never_appear_in_json() {
         assert_json_matches_text(&core, body);
     }
 }
+
+/// 一時表に対する `EXPLAIN (FORMAT JSON)` も TEXT と同様に受理され、JSON 1 行を返す
+/// （SQL-76 (1)(6)。一時表の文は parse 時に一時コアへ振り分けられる）。
+#[test]
+fn explain_json_accepts_temp_table() {
+    let (core, _g) = seeded("x76-temp");
+    let mut session = SessionState::default();
+    session.allow_ddl();
+    let c = ctx("tenant-a");
+    core.execute_sql_in_session(&c, &mut session, "CREATE TEMP TABLE tt (a BIGINT)")
+        .expect("create temp");
+    let text = core
+        .execute_sql_in_session(&c, &mut session, "EXPLAIN SELECT a FROM tt")
+        .expect("text explain");
+    let json = core
+        .execute_sql_in_session(&c, &mut session, "EXPLAIN (FORMAT JSON) SELECT a FROM tt")
+        .expect("json explain on temp table must be accepted");
+    let (SqlOutcome::Explain(t) | SqlOutcome::Query(t)) = text else {
+        panic!("expected explain result");
+    };
+    let (SqlOutcome::Explain(j) | SqlOutcome::Query(j)) = json else {
+        panic!("expected explain result");
+    };
+    assert!(!t.rows.is_empty());
+    assert_eq!(j.rows.len(), 1);
+    assert!(matches!(&j.rows[0].cells[0], Cell::Json(_)));
+}
