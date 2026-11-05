@@ -15,7 +15,7 @@
 use std::fmt;
 use std::time::Duration;
 
-use super::chip::{json_escape, parse_json, JsonValue};
+use super::chip::{json_escape, parse_json_with_limit, JsonValue};
 use super::relational_p95::quantile_nearest_rank;
 
 pub const MIN_ROUNDS: u32 = 5;
@@ -24,6 +24,12 @@ pub const DEFAULT_ROUNDS: u32 = 5;
 pub const MIN_ITERS: u32 = 200;
 pub const MAX_ITERS: u32 = 20_000;
 pub const DEFAULT_ITERS: u32 = 1_000;
+/// 全形状（3）x arm（2）で計測した場合の最大サンプル数（MAX_ROUNDS x MAX_ITERS x 6）。
+pub const MAX_RAW_SAMPLES: usize = MAX_ROUNDS as usize * MAX_ITERS as usize * 6;
+/// 再判定入力（`raw.json`）の長さ上限。サンプル 1 件を区切り込みで最大 22 バイト
+/// （u64 の 20 桁 + `, `）と見積もり、構造部分の余裕 1 MiB を足す。
+/// 正常設定（ROUNDS=50・ITERS=20000・全形状）で生成した出力を必ず読み戻せる有限上限。
+pub const RAW_MAX_INPUT_BYTES: usize = MAX_RAW_SAMPLES * 22 + 1024 * 1024;
 /// 各 (shape, arm) の warmup 回数（計測プロトコルの下限）。
 pub const WARMUP: u32 = 20;
 /// 計測入力は決定的（乱数を使わない）。プロトコルが要求する固定シード。
@@ -820,9 +826,10 @@ fn arm_of(token: &str) -> Result<Arm, RlsTimingError> {
 /// `render_json` が書いた `raw.json` を読み戻し、計測した形状と `Round` 列を復元する。
 /// `schema_version`・`quantile_method`・形状／arm の語彙・サンプルの値域（非負整数・非空）・
 /// ラウンドごとの全 (shape, arm) セルの存在と重複・`mismatches == 0` を検証し、外れれば拒否する。
-/// 入力長の上限は `parse_json` が課す（呼び出し側も読み込み前に同じ上限で検査する）。
+/// 入力長の上限は `RAW_MAX_INPUT_BYTES`（`parse_json_with_limit` 経由）が課す（呼び出し側も読み込み前に同じ上限で検査する）。
 pub fn parse_raw_rounds(text: &str) -> Result<(Vec<Shape>, Vec<Round>), RlsTimingError> {
-    let root = parse_json(text).map_err(|e| RlsTimingError::InvalidRaw(format!("{e:?}")))?;
+    let root = parse_json_with_limit(text, RAW_MAX_INPUT_BYTES)
+        .map_err(|e| RlsTimingError::InvalidRaw(format!("{e:?}")))?;
     if as_uint(field(&root, "schema_version")?, "schema_version")? != 1 {
         return raw_err("unsupported schema_version");
     }

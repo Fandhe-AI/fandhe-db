@@ -326,7 +326,7 @@ fn rejudge(path_raw: &str) -> ! {
     let len = std::fs::metadata(&path)
         .unwrap_or_else(|e| fail_closed(format!("cannot stat rejudge input: {e}")))
         .len();
-    if len > harness::chip::JSON_MAX_INPUT_BYTES as u64 {
+    if len > harness::rls_timing::RAW_MAX_INPUT_BYTES as u64 {
         fail_closed("rejudge input exceeds the size limit");
     }
     let text = std::fs::read_to_string(&path)

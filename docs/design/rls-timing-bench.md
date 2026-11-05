@@ -101,7 +101,7 @@ flooded は「衝突」と「他テナントのデータ量」の両方が basel
 docs の数値は、この再判定の出力から転記する。入力は信頼せず fail-closed で検証し、次のいずれも
 非 0 終了する。
 
-- ファイルが 4 MiB を超える（読み込み前に検査。`harness::chip::parse_json` の上限と同じ）、または JSON として不正
+- ファイルが `harness::rls_timing::RAW_MAX_INPUT_BYTES` を超える（読み込み前に検査。全形状・ROUNDS=50・ITERS=20000 の最大出力量から導いた有限上限で、正常設定の `raw.json` は必ず読み戻せる）、または JSON として不正
 - `schema_version` が 1 でない、`quantile_method` が `nearest_rank` でない、必須キーの欠落
 - 未知の形状／arm、`config.shapes` の重複、`config` に無い形状のセル
 - `samples_ns` が空、または非整数・負数・非数値を含む、`mismatches` が 0 でない

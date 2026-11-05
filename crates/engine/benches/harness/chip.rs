@@ -611,9 +611,16 @@ impl<'a> JsonParser<'a> {
 /// false／null のみ。入力長・再帰深さに上限を設ける。無効な JSON・空入力・
 /// 末尾の余分なトークンはすべて `Err`）。
 pub fn parse_json(text: &str) -> Result<JsonValue, ChipError> {
-    if text.len() > JSON_MAX_INPUT_BYTES {
+    parse_json_with_limit(text, JSON_MAX_INPUT_BYTES)
+}
+
+/// 入力長上限を呼び出し側が指定する `parse_json`（再帰深さ上限は共通）。
+/// 計測出力量に有限上限が定まる入口（rls_timing の `raw.json` 再判定）が、
+/// 既定の 4 MiB より大きい上限を明示して使う。上限は有限値でなければならない。
+pub fn parse_json_with_limit(text: &str, max_bytes: usize) -> Result<JsonValue, ChipError> {
+    if text.len() > max_bytes {
         return Err(ChipError::ParseFailure(format!(
-            "input exceeds {JSON_MAX_INPUT_BYTES} bytes"
+            "input exceeds {max_bytes} bytes"
         )));
     }
     let mut parser = JsonParser::new(text.as_bytes());
