@@ -1739,6 +1739,8 @@ main に無く現行の `parse_order_by` は `<=>` のみ受理するため、�
 
 **Issue #2076（docs(design): 固定テナント方式の方針 ADR。RLS-6・RLS-8・RLS-10・RLS-12・RLS-13 ポインタ。詳細は [fixed-tenant-boundary.md](fixed-tenant-boundary.md)）**: テナント境界を外せない設計を方針として記録した。テナント ID はサーバーが導出し、利用者ポリシー・`BYPASSRLS`・所有者除外・`row_security` のいずれでも外れない。採用しないのは管理者バイパスだけで、利用者ポリシー（`PERMISSIVE`／`RESTRICTIVE`・コマンド別）はテナント境界の内側の追加の制限として実装済み。検索・読み取り・更新・分割 DML・HTTP・EXPLAIN の各経路が同じ単一照合パスを通ることを、symbol と根拠テストの表で示した。ドキュメントのみの変更で、コード・依存・CI は変えない。
 
+**Issue #2079（test(engine): 衝突有無で応答時間分布を比較するベンチハーネスを追加する。親 #2078・RLS-9・RLS-10 ポインタ。詳細は [rls-timing-bench.md](rls-timing-bench.md)）**: UNIQUE 違反・FK 親不在・正常の 3 形状を、閲覧テナントの行のみ（baseline）と他 2 テナントが同一値を持つ状態（flooded）で繰り返し実行し、p50／p95／p99 と生サンプルを `raw.json` へ出す `rls_timing_bench`（`make bench-rls-timing`）を追加した。時間非依存のロジックは `harness/rls_timing.rs` にあり `tests/rls_timing_accept.rs` が検証する。判定基準・実測値の記録・CI 配線は #2080 の担当で、本ベンチは判定をしない情報提供専用。
+
 **Issue #2069（docs(design): 冪等再送の他 DB・API 方式との比較表。RECOVER-1・RECOVER-7・RECOVER-10 ポインタ。詳細は [idempotent-resend-comparison.md](idempotent-resend-comparison.md)）**: `USING OPERATION_ID`／NoSQL `operation_id` の冪等再送を、Stripe と PostgreSQL・MySQL・SQLite の代替手段と同じ軸で比較した。「同等以上」は根拠テストのある項目（内容不一致の検出・書き込みとの原子性・並行再送・テナント分離・UPDATE／DELETE まで対象）に限り、結果を再生しないこと・テーブル単位の名前空間・TTL と掃除が無いことを差異として明記した。他社の記述は公式ドキュメントの確認日つき。ドキュメントのみの変更で、コード・依存・CI は変えない。
 
 **Issue #2077（docs(design): 行レベル分離の他 DB 比較表。RLS-9・RLS-10・RLS-12・RLS-13・SQL-40 ポインタ。詳細は [row-level-isolation-comparison.md](row-level-isolation-comparison.md)）**: PostgreSQL・Elasticsearch・Qdrant と fandhe の行レベル分離を同じ軸で並べた。「同等以上」はテストで固定した項目に限り、テナント内の制約違反からの推知は PostgreSQL と同等と書く。列レベル制御・ロール別のポリシー条件・利用者が付与できる `BYPASSRLS` は未提供と明記した。ドキュメントのみの変更で、コード・依存・CI は変えない。

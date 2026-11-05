@@ -75,6 +75,7 @@ pub mod parse_bind;
 pub mod proc_stats;
 pub mod protocol;
 pub mod relational_p95;
+pub mod rls_timing;
 pub mod rng;
 pub mod scalar_reference;
 pub mod scan_stage_profile;
