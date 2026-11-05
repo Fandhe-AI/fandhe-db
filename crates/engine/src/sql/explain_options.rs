@@ -18,7 +18,8 @@
 //!
 //! 受け渡し先: 受理した [`ExplainOptions`] のうち `ANALYZE`（Issue #2054）は `core::parse_tokens_in` が
 //! `ParsedSql::ExplainAnalyze` に運ぶ。`COSTS` は推定値を出さないため出力を変えない。
-//! `FORMAT JSON`（#2059）・`VERBOSE`（#2060）・`ANALYZE` なしの `SUMMARY` は未実装で `0A000` のゲートに
+//! `VERBOSE`（#2060）は `core::parse_tokens_in` が `ParsedSql::ExplainVerbose` に運ぶ（`ANALYZE` との併用は
+//! `0A000`）。`FORMAT JSON`（#2059）・`ANALYZE` なしの `SUMMARY` は未実装で `0A000` のゲートに
 //! 掛け、文を実行しない（黙って無視する fail-open を作らない）。
 //!
 //! untrusted な入力を扱うため、添字アクセス・`unwrap`・`expect` を使わず `get` で走査する。確保量は
@@ -38,7 +39,7 @@ pub(crate) enum ExplainFormat {
 
 /// 畳み込み後のオプション（後の指定が勝つ）。後続 Issue が `ParsedSql` へ運ぶ土台。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // `verbose`／`costs`／`format` は resolve の検証結果としてのみ使う（運搬は #2059／#2060）
+#[allow(dead_code)] // `costs`／`format` は resolve の検証結果としてのみ使う（`format` の運搬は #2059）
 pub(crate) struct ExplainOptions {
     pub(crate) analyze: bool,
     pub(crate) verbose: bool,
@@ -299,9 +300,11 @@ impl RawExplainOptions {
                 "EXPLAIN SUMMARY is not implemented yet",
             ));
         }
-        if opts.verbose {
+        // `ANALYZE` と `VERBOSE` の併用は、ANALYZE の計画の生成経路（実行と同じ経路を通る）へ描画
+        // オプションを運ぶ必要があるため未実装（黙って VERBOSE なしへ落とさない fail-closed）。
+        if opts.verbose && opts.analyze {
             return Err(SqlSurfaceError::feature_not_supported(
-                "EXPLAIN VERBOSE is not implemented yet",
+                "EXPLAIN ANALYZE with VERBOSE is not implemented yet",
             ));
         }
         if opts.format == ExplainFormat::Json {
@@ -363,9 +366,17 @@ mod tests {
             "EXPLAIN (ANALYZE, SUMMARY) SELECT 1",
             "EXPLAIN ANALYZE SELECT 1",
             "EXPLAIN ANALYSE SELECT 1",
+            "EXPLAIN (VERBOSE) SELECT 1",
+            "EXPLAIN (VERBOSE ON, COSTS OFF) SELECT 1",
+            "EXPLAIN VERBOSE SELECT 1",
         ] {
             assert!(run(sql).expect(sql).is_some(), "{sql}");
         }
+        // 後の指定が勝つ（Issue #2060）。
+        let v = |sql: &str| run(sql).expect(sql).expect("opts").verbose;
+        assert!(v("EXPLAIN (VERBOSE) SELECT 1"));
+        assert!(!v("EXPLAIN (VERBOSE, VERBOSE OFF) SELECT 1"));
+        assert!(v("EXPLAIN (VERBOSE OFF, VERBOSE) SELECT 1"));
         let (out, _) = extract(toks("EXPLAIN (COSTS OFF) SELECT 1")).expect("ok");
         assert_eq!(out, toks("EXPLAIN SELECT 1"));
     }
@@ -423,10 +434,8 @@ mod tests {
             "EXPLAIN (MEMORY) SELECT 1",
             "EXPLAIN (FORMAT XML) SELECT 1",
             "EXPLAIN (FORMAT YAML) SELECT 1",
-            "EXPLAIN (VERBOSE) SELECT 1",
             "EXPLAIN (ANALYZE, VERBOSE) SELECT 1",
             "EXPLAIN ANALYZE VERBOSE SELECT 1",
-            "EXPLAIN VERBOSE SELECT 1",
             "EXPLAIN (SUMMARY) SELECT 1",
             "EXPLAIN (FORMAT JSON) SELECT 1",
             "EXPLAIN (ANALYZE OFF, SUMMARY) SELECT 1",

@@ -23,6 +23,7 @@
 
 ### Added
 
+- `EXPLAIN (VERBOSE)`／`EXPLAIN VERBOSE` を実装した（Issue #2060・SQL-76 (4)(5) ポインタ）。根の段へ `output:`（結果の列名）と、距離順位付けの検索では `distance_metric:` を足す。`COSTS` は出力を変えない。`ANALYZE` との併用・`INSERT`・分割実行・一時表は `0A000`。`ParsedSql` に variant `ExplainVerbose` を追加した（`#[non_exhaustive]` のためクレート外に非破壊）。
 - SELECT の `EXPLAIN ANALYZE` を実装した（Issue #2054・SQL-76 (1)(2)(3) ポインタ）。`EXPLAIN (ANALYZE ...)` と前置形 `EXPLAIN ANALYZE` で SELECT を実行し、計画の根の段に `actual_rows`／`actual_loops`／`actual_total_time_ms`、末尾に `planning_time_ms`／`execution_time_ms` を併記する（結果の行は返さない）。DML・`USING PLAN`・一時表・`VERBOSE`・`FORMAT JSON`・`$n` 付きは拒否する。公開 enum `ParsedSql` に variant `ExplainAnalyze` を追加した（`#[non_exhaustive]` のため非破壊）
 - `EXPLAIN (<オプション>[, ...]) <文>` を解析するようにした（Issue #2058・SQL-76 (1) ポインタ）。`COSTS`・`FORMAT TEXT`・明示的な偽は受理し、未実装の `ANALYZE`／`VERBOSE`／`SUMMARY`／`FORMAT JSON` は `0A000`。同じオプションは後の指定が勝つ。公開 API の変更はない
 - `EXPLAIN INSERT` を受理した（Issue #2051・SQL-75 (2)(3)(5)(6) ポインタ）。実行せず `insert` 段の木（挿入方式・`ON CONFLICT` の対象の種別・`RETURNING`／`USING OPERATION_ID` の有無。`INSERT ... SELECT` は内側の計画）を返す。書き込み・台帳・採番は起こさない。公開 API に `ParsedSql::ExplainInsert`（`#[non_exhaustive]` への追加で非破壊）と `engine::sql::insert_explain` を追加した。ビュー・一時表は `0A000`、`$n` は `42601`。

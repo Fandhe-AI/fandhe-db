@@ -251,6 +251,7 @@ pub mod explain_analyze;
 pub mod explain_dml;
 pub(crate) mod explain_options;
 pub(crate) mod explain_tree;
+pub(crate) mod explain_verbose;
 pub(crate) mod expr_program;
 pub(crate) mod expression_key_index;
 pub(crate) mod fetch_clause;
