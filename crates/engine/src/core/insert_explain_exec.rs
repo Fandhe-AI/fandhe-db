@@ -201,7 +201,7 @@ impl EngineCore {
                 let SqlOutcome::Explain(result) = outcome else {
                     return Err(internal());
                 };
-                // 内側は描画済みの行を葉として載せる（行数・深さは内側の builder が上限検査済み）。
+                // 内側は描画済みの行を構造化された木へ戻して載せる（JSON 変換が見出しと属性を区別できるように）。
                 let lines = result
                     .rows
                     .into_iter()
@@ -210,7 +210,7 @@ impl EngineCore {
                         _ => Err(internal()),
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                ExplainNode::leaf(lines)
+                ExplainNode::from_rendered_lines(&lines).map_err(|e| e.into_surface_error())?
             }
         };
         let shape = InsertShape {
