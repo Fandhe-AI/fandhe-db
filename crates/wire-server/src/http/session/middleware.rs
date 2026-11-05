@@ -64,7 +64,7 @@ pub struct SessionPrincipal {
     /// 認証済みユーザーに対応づけたカタログのロール（HTTP-4・Issue #2238。未束縛は `None`）。
     role: Option<crate::http::session::store::SessionRole>,
     /// 発行時に宣言されたスコープ（HTTP-15・Issue #2100。省略は `None`＝全権限）。運ぶだけで、
-    /// 要求ごとの強制は後続 Issue #2101（本 Issue では `session_state()` に影響させない）。
+    /// 要求ごとの強制は `POST /v1/query` の手順 5c（Issue #2101）が行う（`session_state()` には影響させない）。
     scope: Option<std::sync::Arc<crate::http::session::scope::SessionScope>>,
     /// 認証済みユーザー名（Issue #2094。scan の不透明カーソルの AAD 用。`Debug` へ出さない）。
     user: Option<String>,
@@ -478,7 +478,7 @@ mod tests {
         let raw = format!("Authorization: Bearer {}\r\n", plain.encoded());
         let q = authenticate(&sessions, &headers_from(raw.as_bytes()), || now).expect("auth");
         assert!(q.scope().is_none());
-        // 本 Issue ではスコープを強制しない（#2101）。session_state は有無で変わらない。
+        // スコープの強制は gate 側（#2101）。session_state は有無で変わらない。
         assert_eq!(
             format!("{:?}", p.session_state()),
             format!("{:?}", q.session_state())

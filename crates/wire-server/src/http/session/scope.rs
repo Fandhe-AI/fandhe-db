@@ -6,7 +6,8 @@
 //! `42601`、表名件数の超過を `54000` で拒否する。受理した [`SessionScope`] は
 //! [`super::store::SessionStore::issue_with_scope`] でトークンに束縛され、
 //! [`super::middleware::SessionPrincipal::scope`] から読める。本モジュールは**運ぶだけ**で、
-//! 要求ごとの強制（`42501`）は後続 Issue #2101 の担当。
+//! 要求ごとの強制（`42501`）は Issue #2101 で [`SessionScope::check`] として加わり、
+//! [`crate::http::query::gate::handle`] の手順 5c が呼ぶ。
 //!
 //! 設計の要点:
 //! - `ops` の語彙は [`Op::parse`] を単一情報源にする（第 2 の語彙表を作らない）
@@ -19,7 +20,7 @@
 use std::collections::BTreeSet;
 use std::fmt;
 
-use engine::error_format::ErrorClass;
+use engine::error_format::{ClassifiedError, ErrorClass};
 use engine::json::JsonValue;
 
 use crate::http::query::ident::check_identifier;
@@ -51,6 +52,49 @@ impl SessionScope {
     /// 読み取り専用の宣言か。
     pub fn read_only(&self) -> bool {
         self.read_only
+    }
+
+    /// 要求の `op` と対象表がスコープ内かを検査する（HTTP-15・Issue #2101）。権限を狭める方向にだけ
+    /// 働く追加の AND 条件で、通過しても engine 側の権限判定は別に行われる。
+    ///
+    /// 判定順は read_only → ops → tables だが、どの軸で落ちても同一の [`ScopeViolation`] を返す
+    /// （どの軸・どの表かを区別させない）。`targets` が空でも `tables` 制限があれば、対象を特定できない
+    /// 要求として fail-closed に拒否する（呼び出し側は表を取り出せたときだけ空でない列を渡す）。
+    pub fn check(&self, op: Op, targets: &[&str]) -> Result<(), ScopeViolation> {
+        if self.read_only && !op.allowed_in_read_only() {
+            return Err(ScopeViolation);
+        }
+        if let Some(ops) = &self.ops {
+            if !ops.contains(&op) {
+                return Err(ScopeViolation);
+            }
+        }
+        if let Some(tables) = &self.tables {
+            if targets.is_empty() || targets.iter().any(|t| !tables.contains(*t)) {
+                return Err(ScopeViolation);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// スコープ違反の拒否（`42501`）。op 名・表名・違反した軸を保持も反映もしない固定文言で、
+/// 表の存在・スコープの内訳を応答から推測させない（HTTP-15・ERR-4）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScopeViolation;
+
+impl ScopeViolation {
+    /// クライアント向け固定文言。
+    pub const MESSAGE: &'static str = "operation not permitted by session scope";
+}
+
+impl ClassifiedError for ScopeViolation {
+    fn error_class(&self) -> ErrorClass {
+        ErrorClass::ForbiddenTenantMismatch
+    }
+
+    fn client_message(&self) -> String {
+        Self::MESSAGE.to_string()
     }
 }
 
@@ -175,6 +219,20 @@ pub fn parse_scope(validated: &Validated<'_>) -> Result<Option<SessionScope>, Sc
     }))
 }
 
+/// ops／tables／read_only を任意に指定して `SessionScope` を組み立てるテスト用入口。
+#[cfg(test)]
+pub(crate) fn scope_with_for_test(
+    ops: Option<&[Op]>,
+    tables: Option<&[&str]>,
+    read_only: bool,
+) -> SessionScope {
+    SessionScope {
+        ops: ops.map(|o| o.iter().copied().collect()),
+        tables: tables.map(|t| t.iter().map(|x| x.to_string()).collect()),
+        read_only,
+    }
+}
+
 /// 他モジュールの単体テストが `SessionScope` を組み立てるための入口（本番コードからは使えない）。
 #[cfg(test)]
 pub(crate) fn scope_for_test(tables: &[&str], read_only: bool) -> SessionScope {
@@ -296,5 +354,33 @@ mod tests {
             .expect("ok")
             .expect("some");
         assert!(!format!("{s:?}").contains("secret_table"));
+    }
+
+    #[test]
+    fn check_enforces_each_axis() {
+        let s = scope_with_for_test(Some(&[Op::Scan]), Some(&["docs"]), false);
+        assert!(s.check(Op::Scan, &["docs"]).is_ok());
+        assert_eq!(s.check(Op::Aggregate, &["docs"]), Err(ScopeViolation));
+        assert_eq!(s.check(Op::Scan, &["other"]), Err(ScopeViolation));
+        assert_eq!(s.check(Op::Scan, &["docs", "other"]), Err(ScopeViolation));
+        assert_eq!(s.check(Op::Scan, &[]), Err(ScopeViolation));
+        let ro = scope_with_for_test(None, None, true);
+        assert!(ro.check(Op::Search, &["x"]).is_ok());
+        assert_eq!(ro.check(Op::Insert, &["x"]), Err(ScopeViolation));
+        let none = scope_with_for_test(None, None, false);
+        assert!(none.check(Op::DropTable, &["x"]).is_ok());
+        assert!(none.check(Op::DropTable, &[]).is_ok());
+        let empty_ops = scope_with_for_test(Some(&[]), None, false);
+        assert_eq!(empty_ops.check(Op::Scan, &["x"]), Err(ScopeViolation));
+    }
+
+    #[test]
+    fn violation_is_fixed_and_classified() {
+        assert_eq!(
+            ScopeViolation.error_class(),
+            ErrorClass::ForbiddenTenantMismatch
+        );
+        assert!(!ScopeViolation::MESSAGE.contains("scan"));
+        assert!(!ScopeViolation::MESSAGE.contains("docs"));
     }
 }

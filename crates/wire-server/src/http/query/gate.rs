@@ -31,6 +31,13 @@
 //!    分割実行（`mode`／`chunk`）との併用は `42601`、妥当な指定も実行結線（Issue #2091）まで
 //!    固定文言の `0A000` で拒否する（黙って無視しない）。`42601` が常に `0A000` より先に決まり、
 //!    engine 未接続でも同じ順序。engine は呼ばないため副作用は無い
+//!    **5c.** セッションのスコープ検査（Issue #2101・HTTP-15。[`scope_targets`]・
+//!    [`crate::http::session::scope::SessionScope::check`]）。スコープ外の op・表・書き込み
+//!    （`read_only`）は `42501` の固定文言で拒否する。カタログ・engine に触れる最初の処理
+//!    （下の採番方式の表の事前判定）より前に置く。後ろに置くと、スコープ外の表が採番方式なら
+//!    `0A000`・存在しなければ `42501` と応答が分かれて表の存在が漏れるため、順序は契約の一部。
+//!    形の不正（`42601`）は公開済みの情報でテナント・カタログに依存しないので `42501` より先に返す。
+//!    engine は呼ばないため副作用は無く、engine 未接続でも同じ順序で効く
 //! 6. `op` と `engine`（接続済み `EngineCore`。`Router::new` 経由では
 //!    `None`・`Router::with_engine` 経由でのみ `Some`）の組でディスパッチ
 //!    する。`(Op::Search, Some(engine))` かつ `explain: true` は
@@ -88,6 +95,7 @@ use crate::http::query::returning::{self, ReturningRequestError};
 use crate::http::query::schema::Validated;
 use crate::http::query::{ddl, delete, insert, partitioned, scan, update};
 use crate::http::session::middleware::{self, SessionPrincipal};
+use crate::http::session::scope::ScopeViolation;
 use crate::http::{body, response};
 
 pub use crate::http::query::op::UNSUPPORTED_OP_MESSAGE;
@@ -204,6 +212,26 @@ pub fn handle(
         }
     }
 
+    // 手順 5c: セッションのスコープ検査（Issue #2101・HTTP-15）。カタログ・engine に触れる前に
+    // 決める（下の採番方式の事前判定より前。モジュール doc 参照）。スコープ無しは何もしない。
+    if let Some(scope) = principal.scope() {
+        let targets = scope_targets(op, &validated);
+        let refs: Vec<&str> = targets.as_deref().unwrap_or(&[]).to_vec();
+        let verdict = if targets.is_some() {
+            scope.check(op, &refs)
+        } else {
+            // 対象表を取り出せない（スキーマ検証後は通常起きない）ときは fail-closed。
+            Err(ScopeViolation)
+        };
+        if verdict.is_err() {
+            return response::encode_error(
+                ErrorClass::ForbiddenTenantMismatch,
+                ScopeViolation::MESSAGE,
+                now_wall,
+            );
+        }
+    }
+
     // 手順 6: op と engine 接続有無の組でディスパッチする（Issue #766・
     // #768・#772・#764・#876）。各アームは対応するモジュールへの 1 行委譲に
     // 留める。全 op が実行結線済みのため `(_, _)` は `engine` 未接続時
@@ -298,6 +326,29 @@ pub fn handle(
             now_wall,
         ),
     }
+}
+
+/// スコープ検査（手順 5c）が照合する対象表の名前列を取り出す（Issue #2101）。全 op のスキーマで
+/// `table` は必須。`create_table` は外部キーの参照先（`constraints[*].references.table`）も含める
+/// （他表の読み取りを伴い、参照先が無ければ `42P01` で存在が漏れうるため fail-closed で検査する）。
+/// `table` を取り出せなければ `None`（呼び出し側が拒否する）。参照先の形の不正は `ddl` の `42601` に任せる。
+fn scope_targets<'a>(op: Op, validated: &Validated<'a>) -> Option<Vec<&'a str>> {
+    let mut targets = vec![validated.required_str("table").ok()?];
+    if matches!(op, Op::CreateTable) {
+        if let Ok(Some(constraints)) = validated.optional_array("constraints") {
+            for c in constraints {
+                let engine::json::JsonValue::Object(map) = c else {
+                    continue;
+                };
+                if let Some(engine::json::JsonValue::Object(r)) = map.get("references") {
+                    if let Some(engine::json::JsonValue::String(t)) = r.get("table") {
+                        targets.push(t.as_str());
+                    }
+                }
+            }
+        }
+    }
+    Some(targets)
 }
 
 /// `validated`（`Op::Search`／`Op::Scan`／`Op::Aggregate` いずれかのスキーマ
@@ -449,6 +500,46 @@ mod tests {
             None,
             std::time::SystemTime::now(),
         )
+    }
+
+    /// スコープ付きトークンの principal を作る（`SessionStore::issue_with_scope` → `authenticate`）。
+    fn scoped_principal(scope: crate::http::session::scope::SessionScope) -> SessionPrincipal {
+        let sessions = SessionStore::new();
+        let now = Instant::now();
+        let ctx = PolicyContext::new("tenant-a").expect("valid ctx");
+        let token = sessions
+            .issue_with_scope(ctx, false, None, Some(scope), now)
+            .expect("issue");
+        let mut input = format!("Authorization: Bearer {}\r\n", token.encoded()).into_bytes();
+        input.extend_from_slice(b"Content-Length: 0\r\n\r\n");
+        let headers = match parse_headers(leak(input)).expect("header parse") {
+            HeaderParse::Complete { headers, .. } => headers,
+            other => panic!("expected Complete, got {other:?}"),
+        };
+        middleware::authenticate(&sessions, &headers, move || now).expect("authenticate")
+    }
+
+    #[test]
+    fn scope_violation_is_rejected_before_dispatch_even_without_engine() {
+        use crate::http::session::scope::scope_with_for_test;
+        let body = br#"{"op":"scan","table":"docs","limit":1}"#;
+        let headers = headers_with_body(body, &[]);
+        let now = std::time::SystemTime::now();
+        // 表がスコープ外 → engine 未接続でも 42501（プレースホルダ 0A000 より先）。
+        let p = scoped_principal(scope_with_for_test(None, Some(&["other"]), false));
+        let text = String::from_utf8(handle(&p, &headers, body, None, None, now)).expect("utf-8");
+        assert!(text.starts_with("HTTP/1.1 403 "), "got: {text}");
+        assert!(
+            text.contains("42501") && !text.contains("docs"),
+            "got: {text}"
+        );
+        // スコープ内なら従来どおり（未接続の暫定応答）。
+        let p = scoped_principal(scope_with_for_test(None, Some(&["docs"]), false));
+        let text = String::from_utf8(handle(&p, &headers, body, None, None, now)).expect("utf-8");
+        assert!(text.contains(PLACEHOLDER_MESSAGE), "got: {text}");
+        // スコープなしは従来どおり。
+        let text = String::from_utf8(run(body, &[])).expect("utf-8");
+        assert!(text.contains(PLACEHOLDER_MESSAGE), "got: {text}");
     }
 
     #[test]
