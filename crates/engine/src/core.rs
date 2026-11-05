@@ -13907,17 +13907,9 @@ impl EngineCore {
             &crate::sql::parser::LiteralSkip::NONE,
             &self.result_limits,
         )? {
-            let bound = crate::sql::parser::bind_scan_with_dummy_flags(
-                &scan,
-                &schema,
-                session.udfs(),
-                &[],
-                &self.result_limits,
-            )?;
-            let gins = Self::gin_decls_for_explain(&read_txn, &bound)?;
-            return Ok(crate::sql::SqlOutcome::Explain(Self::scan_explain_result(
-                &schema, &bound, &gins,
-            )));
+            // 未解決の `IN (SELECT ...)`／`EXISTS` を含む WHERE も実行と同じく通すため、
+            // 部分クエリ対応の共通ヘルパーへ委ねる（HALFVEC と同じ経路）。
+            return self.run_relational_explain_scan(&scan, session);
         }
         // HALFVEC 列の kNN は実行時と同じ全走査ソートの scan 経路へ写し、EXPLAIN も同じ計画を返す
         // （通常文との束縛・エラー契約の共有。Issue #2015・TABLE-46）。

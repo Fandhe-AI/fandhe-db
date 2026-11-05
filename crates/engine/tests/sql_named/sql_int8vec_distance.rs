@@ -559,6 +559,37 @@ fn explain_reports_scan_plan() {
     assert!(joined.contains("plain_scan"), "{joined}");
 }
 
+/// EXPLAIN は WHERE 付きでも部分クエリ対応の共通経路（HALFVEC と同じ `run_relational_explain_scan`）で
+/// scan の計画を返す。ランキング検索の部分クエリは構文段で HALFVEC と同じ固定文の `42601` になる。
+#[test]
+fn explain_with_where_uses_shared_scan_path() {
+    let (_g, core, _rows) = setup("ivd-explain-where", 4, 5, 7);
+    let SqlOutcome::Explain(q) = exec_as(
+        &core,
+        "alice",
+        "EXPLAIN SELECT id FROM t WHERE id > 1 ORDER BY v <-> '[1,2,3,4]' LIMIT 3",
+    )
+    .expect("explain") else {
+        panic!("EXPLAIN must return a plan");
+    };
+    let joined: String = q
+        .rows
+        .iter()
+        .flat_map(|r| r.cells.iter())
+        .filter_map(|c| match c {
+            Cell::Text(t) => Some(t.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(joined.contains("plain_scan"), "{joined}");
+    for pred in ["id IN (SELECT id FROM t)", "EXISTS (SELECT id FROM t)"] {
+        let sql =
+            format!("EXPLAIN SELECT id FROM t WHERE {pred} ORDER BY v <-> '[1,2,3,4]' LIMIT 3");
+        assert_eq!(code(&core, &sql), "42601", "{pred}");
+    }
+}
+
 /// テナント境界: 同じ id・近い値の行が他テナントにあっても結果・エラーへ出ない。
 #[test]
 fn tenant_isolation_holds_for_knn() {
