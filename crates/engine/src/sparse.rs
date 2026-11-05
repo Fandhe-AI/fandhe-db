@@ -67,6 +67,9 @@
 //! トークン数の累計に `MAX_CORPUS_TOKENS` の上限を設ける。詳細は
 //! [`SparseIndex::with_params`] を参照。
 //!
+//! 一致スパン（バイトオフセット）算出は子モジュール [`match_span`]（Issue #2124・
+//! SEARCH-14 ポインタ）が担い、同じ分割規則（`walk_tokens`）を共有する。
+//!
 //! untrusted 入力の扱い: すべての処理を入力長に対して線形に保つ（バイグラム生成含む）。
 //! `Vec::with_capacity` は入力を `chars()` で数えた実際の文字数からのみ見積もる。
 //! クエリはバイト長を `MAX_QUERY_BYTES`、一意語数を `MAX_QUERY_TERMS` で上限検証し
@@ -96,6 +99,8 @@ pub type DocId = u64;
 const DEFAULT_K1: f64 = 1.2;
 /// BM25 の Okapi パラメータ既定値（文書長正規化の強さ）。
 const DEFAULT_B: f64 = 0.75;
+
+pub mod match_span;
 
 /// [`SparseIndex::search`] が受け付けるクエリの一意語数の上限。
 ///
@@ -677,45 +682,81 @@ pub fn tokenize(text: &str) -> Vec<String> {
 /// ことを前提とする。本関数を直接 untrusted 入力に対して呼ぶ場合は、呼び出し側で
 /// 同等の長さ検証を行うこと。
 pub fn tokenize_with_options(text: &str, remove_stopwords: bool) -> Vec<String> {
-    let lower: Vec<char> = text.to_lowercase().chars().collect();
-    // ASCII 単語 + CJK ユニグラム/バイグラムを見積もった容量（過小でも Vec は伸長するため
-    // 上限としての正確性は不要。検証済み長さの char 数のみを根拠にする）。
-    let mut tokens: Vec<String> = Vec::with_capacity(lower.len());
-    let mut word = String::new();
+    // 容量は検証済み長さの char 数のみを根拠にする（過小でも Vec は伸長する）。
+    let mut tokens: Vec<String> = Vec::with_capacity(text.chars().count());
+    walk_tokens(text, remove_stopwords, |token, _span| {
+        tokens.push(token.to_owned());
+        true
+    });
+    tokens
+}
 
-    let mut i = 0usize;
-    while i < lower.len() {
-        let c = lower[i];
-        if is_ascii_word_char(c) {
-            word.push(c);
-            i += 1;
-            continue;
-        }
-        if !word.is_empty() {
-            tokens.push(std::mem::take(&mut word));
-        }
-        if is_cjk_char(c) {
-            // ユニグラム（助詞の単独トークン化のみ抑制。バイグラムは除去しないため
-            // 内容語の一部として現れる助詞文字は保持される）。
-            if !(remove_stopwords && is_cjk_stopword_unigram(c)) {
-                tokens.push(c.to_string());
-            }
-            // 直後の文字も CJK ならバイグラムを追加する（境界をまたぐ語の再現性向上）。
-            if let Some(&next) = lower.get(i + 1) {
-                if is_cjk_char(next) {
-                    let mut bigram = String::with_capacity(c.len_utf8() + next.len_utf8());
-                    bigram.push(c);
-                    bigram.push(next);
-                    tokens.push(bigram);
+/// 分割規則の単一真実源となる範囲付きトークン walker（Issue #2124・SEARCH-14 ポインタ）。
+///
+/// [`tokenize_with_options`]（索引・クエリ）と `match_span` モジュール（一致スパン算出）の
+/// 双方がこの 1 本を呼ぶため、分割規則が構造上食い違わない。`text` を元の文字単位で辿り、
+/// 各文字を `char::to_lowercase()` で展開した文字列に判定（[`is_ascii_word_char`]・
+/// [`is_cjk_char`]・[`is_cjk_stopword_unigram`]）を適用する。トークンの範囲は、構成する
+/// 生成文字が由来する元の文字のバイト範囲の和（`char_indices` 由来のため常に UTF-8 の
+/// 文字境界）で、全体の小文字化によるオフセットずれ（`İ`・ケルビン記号等）を起こさない。
+/// トークン順は「ASCII 単語は区切りで flush、CJK は直前文字とのバイグラム → 自身の
+/// ユニグラム」。`emit` が `false` を返した時点で走査を打ち切る。入力長に対して線形で、
+/// トークンごとの `String` 確保はしない（再利用バッファ）。
+pub(crate) fn walk_tokens<F>(text: &str, remove_stopwords: bool, mut emit: F)
+where
+    F: FnMut(&str, std::ops::Range<usize>) -> bool,
+{
+    let mut word = String::new();
+    let mut word_start = 0usize;
+    let mut word_end = 0usize;
+    let mut buf = String::new();
+    // 直前の生成文字が CJK のときのみ Some（元の文字の範囲つき）。
+    let mut prev_cjk: Option<(char, usize, usize)> = None;
+
+    for (src_start, src_char) in text.char_indices() {
+        let src_end = src_start.saturating_add(src_char.len_utf8());
+        for c in src_char.to_lowercase() {
+            if is_ascii_word_char(c) {
+                if word.is_empty() {
+                    word_start = src_start;
                 }
+                word.push(c);
+                word_end = src_end;
+                prev_cjk = None;
+                continue;
+            }
+            if !word.is_empty() {
+                if !emit(&word, word_start..word_end) {
+                    return;
+                }
+                word.clear();
+            }
+            if is_cjk_char(c) {
+                // バイグラム（直前が CJK の場合）を先に、続けて自身のユニグラムを出す。
+                if let Some((p, p_start, _)) = prev_cjk {
+                    buf.clear();
+                    buf.push(p);
+                    buf.push(c);
+                    if !emit(&buf, p_start..src_end) {
+                        return;
+                    }
+                }
+                if !(remove_stopwords && is_cjk_stopword_unigram(c)) {
+                    buf.clear();
+                    buf.push(c);
+                    if !emit(&buf, src_start..src_end) {
+                        return;
+                    }
+                }
+                prev_cjk = Some((c, src_start, src_end));
+            } else {
+                prev_cjk = None;
             }
         }
-        i += 1;
     }
     if !word.is_empty() {
-        tokens.push(word);
+        emit(&word, word_start..word_end);
     }
-    tokens
 }
 
 /// BM25 Okapi による疎検索インデックス。
@@ -2014,6 +2055,109 @@ impl SparseIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 書き換え前の実装（参照オラクル）。walker 版との完全一致を対照テストで固定する。
+    fn tokenize_reference(text: &str, remove_stopwords: bool) -> Vec<String> {
+        let lower: Vec<char> = text.to_lowercase().chars().collect();
+        let mut tokens: Vec<String> = Vec::with_capacity(lower.len());
+        let mut word = String::new();
+        let mut i = 0usize;
+        while i < lower.len() {
+            let c = lower[i];
+            if is_ascii_word_char(c) {
+                word.push(c);
+                i += 1;
+                continue;
+            }
+            if !word.is_empty() {
+                tokens.push(std::mem::take(&mut word));
+            }
+            if is_cjk_char(c) {
+                if !(remove_stopwords && is_cjk_stopword_unigram(c)) {
+                    tokens.push(c.to_string());
+                }
+                if let Some(&next) = lower.get(i + 1) {
+                    if is_cjk_char(next) {
+                        let mut bigram = String::new();
+                        bigram.push(c);
+                        bigram.push(next);
+                        tokens.push(bigram);
+                    }
+                }
+            }
+            i += 1;
+        }
+        if !word.is_empty() {
+            tokens.push(word);
+        }
+        tokens
+    }
+
+    #[test]
+    fn walker_matches_reference_tokenizer_on_edge_cases() {
+        let cases = [
+            "",
+            "!!! ???",
+            "Hello, world_1 foo",
+            "東京都に行く",
+            "Rust で東京タワー",
+            "İstanbul",
+            "\u{212A}elvin K",
+            "straße",
+            "e\u{301}cole",
+            "ab😀cd",
+            "cafés",
+            "ΑΣ ΑΣΑ",
+            "サーバー・東京",
+            "ＡＢＣ１２３",
+            "한글",
+            "ｱｲｳ",
+            "東京の都",
+            "のはがを",
+            "a東b京c",
+            "x_1 y_2",
+            "\u{3042}\u{3042}\u{3093}",
+        ];
+        for t in cases {
+            for rs in [true, false] {
+                assert_eq!(
+                    tokenize_with_options(t, rs),
+                    tokenize_reference(t, rs),
+                    "{t:?} {rs}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn walker_matches_reference_tokenizer_on_pseudo_random_input() {
+        let alphabet: Vec<char> =
+            "aAzZ09_ -!,東京都京の は日本語ーカタ・İ\u{212A}ßΣσé😀ＡｱＢ한\u{301}"
+                .chars()
+                .collect();
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        for _ in 0..3000 {
+            let mut s = String::new();
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let len = (state >> 59) as usize + 1;
+            for _ in 0..len {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let idx = ((state >> 33) as usize) % alphabet.len();
+                s.push(alphabet[idx]);
+            }
+            for rs in [true, false] {
+                assert_eq!(
+                    tokenize_with_options(&s, rs),
+                    tokenize_reference(&s, rs),
+                    "{s:?} {rs}"
+                );
+            }
+        }
+    }
 
     // --- トークナイザ（境界値含む） ---
 

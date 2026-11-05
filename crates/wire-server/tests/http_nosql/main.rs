@@ -47,6 +47,7 @@ mod nosql21_upsert;
 mod nosql22_returning_exec;
 mod nosql22_returning_schema;
 mod nosql23_scan_keyset;
+mod nosql23_scan_keyset_rls_concurrency;
 mod nosql2_search;
 mod nosql2_search_binding;
 mod nosql2_search_metric;

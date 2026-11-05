@@ -448,6 +448,36 @@ Issue #2094・NOSQL-23・TASK-253。`offset` のページングはページ取�
  "after": "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4/QEFC"}
 ```
 
+##### 利用手順・ページ間の書き込み・RLS・SQL との対応
+
+Issue #2095・NOSQL-23・RLS-7。
+
+- **利用手順**: 1 ページ目は `"after": null`、応答の `next_cursor` をそのまま次の要求の `after` へ
+  渡し、`null` が返ったら終了する。表と `sort` はページ間で変えない（変えると `22000`）。
+  `filter`・`columns`・`limit` は変えてよい。`offset` は併用しない。`22000` を受け取った場合
+  （サーバーの再起動・改ざんなど）は `after: null` からやり直す
+- **ページ間の書き込み**: 各ページはその時点のスナップショットで、位置より後ろを返す。
+  位置より後ろへ挿入された行は返り、前へ挿入された行は返らない。削除された行は返らず、位置の行が
+  削除されてもカーソルは有効のまま。並べ替え値が変わった行は位置をまたいで移動しうる
+  （返らなくなる、または再び返る）。書き込まれなかった行は 1 回ずつ返り、重複も欠落もしない。
+  全ページを通した単一スナップショットではない。同一テナントの別主体・SQL 表層・pg wire からの
+  書き込みも同じ規則に従う
+- **RLS**: 返るのは認証主体から見える行だけで、他テナントの不可視行は件数・ページ境界・位置に
+  影響しない。従来方式の表では他テナントの `Public` 行も可視集合に入り、順序と位置に含まれる。
+  カーソルは発行したテナント・主体に束縛され、他テナントが提示しても（その表に行を持たない
+  テナントでも）改ざんカーソルと同じ `22000` になる
+- **SQL 表層との対応**: 全ページの連結は `ORDER BY <sort 列>, <PK 列>`（PK の無い採番方式の表は
+  物理行 ID 順、従来方式の表は `id`）の一括取得と同じになる。1 ページは `WHERE` の比較と
+  `ORDER BY ... LIMIT` で表せる。`ORDER BY g` だけでは同点順が行の物理順のままで、末尾キーの
+  PK と一致しない点に注意する
+
+```sql
+-- sort: g 昇順、直前ページの最終行が (g = 'b', k = 20) のときの次ページ（limit 2）
+SELECT k, g FROM docs
+ WHERE g > 'b' OR (g = 'b' AND k > 20)
+ ORDER BY g ASC, k ASC LIMIT 2;
+```
+
 `after` の主な `wire_code`:
 
 - `after` が文字列・`null` 以外、`offset` との併用（`offset: 0` を含む） → `42601`
@@ -1760,7 +1790,9 @@ curl -s -X POST http://127.0.0.1:5432/v1/session/close \
 - `scan`: `nosql3_scan_mapping.rs`・`nosql3_scan_wire_parity.rs`・
   `nosql15_scan_sort.rs`（`sort`。Issue #946・NOSQL-15）・
   `nosql15_offset.rs`（`offset`。Issue #947・NOSQL-15）・
-  `nosql23_scan_keyset.rs`（`after`／`next_cursor`。Issue #2094・NOSQL-23）
+  `nosql23_scan_keyset.rs`（`after`／`next_cursor`。Issue #2094・NOSQL-23）・
+  `nosql23_scan_keyset_rls_concurrency.rs`（RLS・ページ間の並行変更・SQL パリティ。
+  Issue #2095・NOSQL-23・RLS-7）
 - `aggregate`: `nosql4_aggregate.rs`・`nosql5_group_by.rs`・
   `nosql4_5_aggregate_wire_parity.rs`・`nosql16_multi_group_by.rs`・
   `nosql15_aggregate_sort_offset.rs`（`sort`／`offset`・単一文字列形 `group_by`。
