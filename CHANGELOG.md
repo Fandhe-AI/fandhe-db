@@ -9,6 +9,8 @@
 
 ### Changed
 
+- セッションのスコープを `POST /v1/query` の要求ごとに強制するようにした（Issue #2101・HTTP-15・ERR-4 ポインタ）。スコープ外の op・表・`read_only` 違反は実行前に固定文言の `42501`（HTTP 403）で拒否し、副作用はない。スコープ外の表は存在の有無に依らず同一応答で、スコープ内の存在しない表はスコープなしと同じ `42P01`。`POST /v1/session` のスコープ付き発行は `0A000` ではなく 200 でトークンを返す。
+  BREAKING CHANGE: スコープ付きの `POST /v1/session` が `0A000` から成功に変わり、スコープ外の `POST /v1/query` が `42501` で拒否される。
 - NoSQL の `upsert` op を実行するようにした（Issue #2087・NOSQL-21・SQL-20・SQL-49 ポインタ）。SQL 表層の `INSERT ... ON CONFLICT` と同じ束縛関数・実行器を通り、応答は `{"upserted":n}`。従来の固定文言 `0A000` は返さない。`Idempotency-Key` ヘッダを `upsert` でも受け付ける。
   BREAKING CHANGE: wire-server の公開定数 `http::query::gate::UPSERT_NOT_YET_AVAILABLE_MESSAGE` を削除した。
 - `halfvec_*_ops` を VECTOR 列の `USING hnsw` に指定したときのエラーを `42704` から `42804` へ変えた（Issue #2016・TABLE-46 (3)・INDEX-7 ポインタ。PostgreSQL と同じ）。`vector_*_ops` を HALFVEC 列に指定した場合も `42804`。未知の演算子クラスは従来どおり `42704`。
@@ -25,6 +27,7 @@
 
 ### Added
 
+- wire-server に `http::session::scope::ScopeViolation`・`SessionScope::check`・`http::query::op::Op::allowed_in_read_only` を追加した（Issue #2101・HTTP-15 ポインタ）。
 - wire-server に公開モジュール `http::query::openapi` を追加した（Issue #2104・NOSQL-20 ポインタ）。`OP_SCHEMAS` から OpenAPI 3.1 の要求本文スキーマ文書を生成する `document`／`render_pretty` を提供する（手元確認用に `examples/openapi_dump.rs` も追加）。
 
 - `EngineCore::execute_bound_upsert_in_session` を追加した（Issue #2087・NOSQL-21 ポインタ）。束縛済み UPSERT のセッション対応入口で、権限・INDEX-4 上限・台帳を SQL 表層と同じ実行器で扱う。
