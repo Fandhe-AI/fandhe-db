@@ -570,7 +570,7 @@ INSERT は #2051 が担当する。`EXPLAIN ... PARTITIONED` は従来の出力�
   内側の文の検証が通った後に意味段（`resolve`）が出現順に評価する（PostgreSQL と同じく内側の文のエラーが先）。
   未知の名前は `42601`、PG にあって本 DB が対応しない名前と `FORMAT XML／YAML` は `0A000`、値の不正と
   `ANALYZE` を伴わない `TIMING` は `22023`。同じオプションは後の指定が勝つ。`FORMAT` の値の省略は `42601`。
-- **未実装のゲート（`0A000`・文は実行しない）**: `ANALYZE`・`SUMMARY` の真（#2052）、`VERBOSE` の真（#2060）、
+- **未実装のゲート（`0A000`・文は実行しない）**: `ANALYZE`（SELECT 以外。#2054 で SELECT は受理）・`ANALYZE` なしの `SUMMARY` の真、`VERBOSE` の真（#2060）、
   `FORMAT JSON`（#2059）。各 Issue がゲートを外すときに運搬用の field を `ParsedSql`／`SqlOutcome` へ足す。
   `COSTS`・`FORMAT TEXT`・明示的な偽は受理し、出力はオプションなしの `EXPLAIN` と同一（推定値を出さないため）。
 - **`$n` との併用**: `sql::params` の EXPLAIN 系ガードは先頭の次が `(` だと素通りするため、オプション付きで
@@ -578,4 +578,33 @@ INSERT は #2051 が担当する。`EXPLAIN ... PARTITIONED` は従来の出力�
 - **セッション無しの入口**: 抽出器を通らないため従来どおり `42601`（#2044 の契約を維持）。
 - **メッセージ**: 固定の英語文字列で、入力のオプション名・値をエコーしない。
 - **既知の差分**: 引用識別子のオプション名（`"analyze"`）は字句解析で引用の有無が残らず、引用なしと同じ扱いになる。
-  前置形（`EXPLAIN ANALYZE <文>`）は対象外で従来どおり `42601`。
+  前置形（`EXPLAIN ANALYZE <文>`）は #2054 で構文段に取り込んだ（次節）。
+
+## 追記（Issue #2054・SQL-76 (2)(3)）: SELECT の EXPLAIN ANALYZE
+
+- **決定 1（実行しない静的な計画）との関係**: オプションなしの `EXPLAIN` は従来どおり実行しない。`ANALYZE` を
+  利用者が明示したときに限り、同じ SELECT を通常の SELECT と同じ実行器で実際に実行し、実測値を計画に併記する。
+  結果の行はクライアントへ返さず捨てる（`QUERY PLAN` 単一列・`CommandComplete` は `EXPLAIN` のまま）。
+- **構文**: 括弧形 `EXPLAIN (ANALYZE[, TIMING …, SUMMARY …, COSTS …, FORMAT TEXT]) <文>` と前置形
+  `EXPLAIN ANALYZE|ANALYSE [VERBOSE] <文>`・`EXPLAIN VERBOSE <文>`。前置形は構文段（`sql::explain_options::extract`）で
+  括弧形と同じ生のオプション列へ正規化する。前置の直後に括弧のリストが続く形は `42601`。`TIMING`・`SUMMARY` の
+  省略は真（`ANALYZE` 時）。`TIMING` の真は `ANALYZE` を要する（`22023`）。`ANALYZE` なしの `SUMMARY` の真は `0A000`。
+- **対象**: 本 DB が `EXPLAIN` できる SELECT（単一表の検索・集計・広域取得、JOIN、集合演算、CTE〔再帰・具体化を含む〕、
+  派生表、WHERE の部分クエリ）。DML（`UPDATE`／`DELETE`／`INSERT`・分割実行）は `0A000`（#2055）。`USING PLAN` を伴う
+  検索（LLM・embedder の I/O を伴う）、一時表を参照する文、`VERBOSE`・`FORMAT JSON` との併用、`$n` を含む文
+  （拡張クエリの Parse は `42601`）は fail-closed で拒否する。セッション無しの入口は従来どおり `42601`。
+- **出力の語彙（安定契約）**: 根の段の属性行の末尾（最初の子の段の直前）に `actual_rows: <n>`（RLS 適用後の可視行・
+  LIMIT／OFFSET 適用後）、`actual_loops: 1`、`TIMING` が真なら `actual_total_time_ms: <x.xxx>`。計画の最後に `SUMMARY`
+  が真なら `planning_time_ms: <x.xxx>`（静的な計画の組み立て）、`execution_time_ms: <x.xxx>`（内側の文の実行）。
+  `TIMING OFF, SUMMARY OFF` の出力は、オプションなしの `EXPLAIN` の行へ 2 行を挿入した形と一致する。
+  挿入位置は `explain_tree` の字下げ規則（深さ 0 は前置なし、深さ 1 以上は `"-> "` か空白で始まる）に依存し、
+  描画後の行への後処理で行う。行数が既存の上限に定数行を足した範囲を超えたら `54001`。
+- **出さないもの（SQL-76 (3)）**: フィルタで除いた行数・走査した行数・推定値・他テナントを含む件数。他テナントの行量で
+  出力が変わらないことを結合テストで固定する。時間は壁時計の値で件数ではなく、通常の SELECT の応答時間を測るのと
+  同程度の情報しか持たない（`TIMING OFF` で抑止できる）。
+- **実行の読み取り源**: autocommit は計画と実行がそれぞれ読み取りトランザクションを開く（計画はカタログだけを読むため
+  行数の一致には影響しない。既知事項）。明示トランザクションは通常の SELECT と同じ読み取り源で、未 commit の自分の
+  変更が見え、`READ ONLY` でも可。SELECT 権限は実行前に read gate が要求する（`42501`）。実行時のエラーは通常の
+  SELECT と同じ `wire_code` で返し、計画は返さない。
+- **対象外**: 段ごとの実測（内側の段の行数・ループ・時間）と実行器の計測フック（#2053）、DML の ANALYZE（#2055）、
+  HNSW の反復走査の回数・上限到達・再取得回数（#2056）、`FORMAT JSON`（#2059）、`VERBOSE`（#2060）。NoSQL 表層は変えない。
