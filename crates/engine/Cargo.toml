@@ -327,6 +327,19 @@ harness = false
 test = false
 
 [[bench]]
+# Issue #2079（親 #2078。ポインタ: `docs/spec/04-behavior/` RLS-9・RLS-10）の実測入口。
+# 他テナントにだけ UNIQUE 値・FK 親がある状態（flooded）とどこにも無い状態（baseline）で、
+# 同一の書き込み文（UNIQUE 違反・FK 親不在・正常）の応答時間分布を取り、生サンプル入りの
+# JSON を出力する。判定基準・実測値の記録・CI 配線は Issue #2080 の担当で、本ベンチは
+# pass/fail を判定しない情報提供専用のため `.github/workflows/*` へは配線しない。
+# harness = false / test = false は上記ベンチと同一方針。`make bench-rls-timing`（Makefile）から
+# 実行する。時間非依存のロジックは harness/rls_timing.rs にあり tests/rls_timing_accept.rs で
+# 回帰検証する。依存・feature は変更しない。
+name = "rls_timing_bench"
+harness = false
+test = false
+
+[[bench]]
 # Issue #356（親 Issue #355。hybrid_rrf クエリの段別内訳プロファイル切り分け。
 # ポインタ: `docs/spec/04-behavior/search.md` SEARCH-1, SEARCH-3）の実測入口。
 # `EngineCore::execute_sql` 経由の hybrid_rrf/dense KNN 対照・本文 String 収集・
