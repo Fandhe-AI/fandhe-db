@@ -113,6 +113,9 @@ mod select_privilege_tests;
 // 書き込み系の文の権限検査（SQL-40・Issue #1968）。
 #[cfg(test)]
 mod dml_privilege_tests;
+// 列単位の権限検査（SQL-40・Issue #2083）。
+#[cfg(test)]
+mod column_privilege_tests;
 // SCHEMA 単位の GRANT／REVOKE と USAGE 検査（SQL-40・Issue #2234）。
 #[cfg(test)]
 mod schema_acl_tests;

@@ -635,17 +635,101 @@ impl Storage {
     }
 }
 
+/// relation 1 件の実効権限。表単位のビットと、列単位のビット（列名順）を同じスナップショットで集めたもの。
+/// 所有者の暗黙権限は `table_bits = u16::MAX` で表す（列の行は数えない）。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct RelationGrants {
+    /// 表単位の付与（INHERIT 閉包・PUBLIC の和。所有者は `u16::MAX`）。
+    pub(crate) table_bits: u16,
+    /// 列単位の付与（列名の昇順。ビットが 0 の列は含めない）。
+    pub(crate) column_bits: Vec<(String, u16)>,
+}
+
+/// relation の列の形（列単位の権限判定の入力。`sql::privilege_gate` が使う）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RelationShape {
+    /// 実表の生存列名（宣言順）。ビュー・matview は空。
+    pub(crate) columns: Vec<String>,
+    /// 従来方式の表の疑似列 `id`（利用者が与える行キー）を持つか。列単位の付与は作れないため、
+    /// 参照は表単位の権限でしか満たせない。
+    pub(crate) pseudo_id: bool,
+    /// ビュー・matview か（列単位の付与を持てない。参照は relation 自身の表単位の権限で判定する）。
+    pub(crate) view_like: bool,
+}
+
+/// `key` の [`RelationShape`] を `src` のスナップショットで引く（列単位の判定が要るときだけ呼ぶ）。
+/// 引けない・復号できない場合は `Err`（fail-closed。素通しにしない）。
+pub(crate) fn relation_shape_in_txn<R: ReadSource>(src: &R, key: &str) -> Result<RelationShape> {
+    match relation_identity_in_txn(src, key)? {
+        RelationIdentity::View(_) | RelationIdentity::MaterializedView(_) => Ok(RelationShape {
+            columns: Vec::new(),
+            pseudo_id: false,
+            view_like: true,
+        }),
+        RelationIdentity::Table => {
+            let schema = super::get_table_schema_in_txn(src, key)?;
+            let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+            let pseudo_id = schema.has_pseudo_id() && !columns.iter().any(|c| c == "id");
+            Ok(RelationShape {
+                columns,
+                pseudo_id,
+                view_like: false,
+            })
+        }
+        RelationIdentity::Missing => Err(CatalogError::TableNotFound(key.to_string())),
+    }
+}
+
+/// `key` の列単位の ACL のうち、`roles`（INHERIT 閉包）か PUBLIC への付与を列ごとに和にして返す。
+/// relation あたり 1 回の範囲走査で、列数に比例する個別照会はしない。破損行・件数超過は `Err`。
+fn column_grants_in_txn<R: ReadSource>(
+    src: &R,
+    tenant: &str,
+    key: &str,
+    roles: &[u64],
+) -> Result<Vec<(String, u16)>> {
+    let table = match src.open_table(ACL_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut out: Vec<(String, u16)> = Vec::new();
+    let mut seen = 0usize;
+    for entry in table.range((tenant, KIND_COLUMN, key, "", 0u64, 0u64)..)? {
+        let (k, v) = entry?;
+        let kv = k.value();
+        if kv.0 != tenant || kv.1 != KIND_COLUMN || kv.2 != key {
+            break;
+        }
+        seen += 1;
+        if seen > MAX_ACL_ENTRIES_PER_TENANT {
+            return Err(corrupt());
+        }
+        let (_, e) = decode_row(kv, v.value())?;
+        if e.grantee_id != PUBLIC_GRANTEE_ID && !roles.contains(&e.grantee_id) {
+            continue;
+        }
+        match out.last_mut() {
+            Some((c, bits)) if c == kv.3 => *bits |= e.privileges,
+            _ => out.push((kv.3.to_string(), e.privileges)),
+        }
+    }
+    Ok(out)
+}
+
 /// 読み取り系の権限検査（#1967。`sql::privilege_gate::read` から呼ばれる）の ACL 照会。`keys` の各 relation
-/// （表・ビュー・matview のキー）について、存在しなければ `None`、存在すれば `tenant` の表単位の ACL のうち
-/// 付与先が `role_id` の INHERIT 閉包のロールか PUBLIC の行の権限ビットの和を返す。列単位の行は含めない（暫定の fail-closed。
-/// #2081）。1 つの read txn で全件を引く。形が不正なキーは relation として存在しない扱い（`None`。
-/// 誤分類された識別子を拒否側へも利用者エラーへも倒さない）。ACL 行の破損・件数超過は `Err`（素通しにしない）。
-pub(crate) fn relation_grant_bits_in_txn<R: ReadSource>(
+/// （表・ビュー・matview のキー）について、存在しなければ `None`、存在すれば `tenant` の ACL のうち付与先が
+/// `role_id` の INHERIT 閉包のロールか PUBLIC の行の権限を [`RelationGrants`]（表単位のビットと列単位の
+/// ビット）で返す（列単位の判定は Issue #2083。ADR `docs/design/column-level-privilege.md`）。
+/// 1 つの read txn・同じ閉包・同じ PUBLIC 規則で全件を引く。形が不正なキーは relation として存在しない扱い
+/// （`None`。誤分類された識別子を拒否側へも利用者エラーへも倒さない）。ACL 行の破損・件数超過は `Err`
+/// （素通しにしない）。
+pub(crate) fn relation_grants_in_txn<R: ReadSource>(
     src: &R,
     tenant: &str,
     keys: &[String],
     role_id: u64,
-) -> Result<Vec<Option<u16>>> {
+) -> Result<Vec<Option<RelationGrants>>> {
     validate_tenant(tenant)?;
     // 同じスナップショットで INHERIT が真の辺だけの閉包を求め、到達するロール（自身を含む）への付与と
     // 所有者の暗黙権限を合算する（INHERIT FALSE の辺・他テナントのロールには波及しない）。PUBLIC の予約
@@ -678,12 +762,18 @@ pub(crate) fn relation_grant_bits_in_txn<R: ReadSource>(
         // 所有者は自身の relation の全権限を暗黙に持つ（`OWNER TO` は自己付与行を作らない・消す）。
         // 閉包内のいずれかのロールが所有者なら、同じ読み取りスナップショットで確認して加算する。
         let owner_id = owner::owner_of_in_txn(src, tenant, &PrivilegeObject::Table(key.clone()))?;
-        let bits = if owner_id.is_some_and(|o| roles.contains(&o)) {
-            bits | u16::MAX
+        let owned = owner_id.is_some_and(|o| roles.contains(&o));
+        let table_bits = if owned { bits | u16::MAX } else { bits };
+        // 表単位の付与が全権限なら列の行を引く必要がない（高速経路。所有者の判定を変えない）。
+        let column_bits = if table_bits == u16::MAX {
+            Vec::new()
         } else {
-            bits
+            column_grants_in_txn(src, tenant, key, &roles)?
         };
-        out.push(Some(bits));
+        out.push(Some(RelationGrants {
+            table_bits,
+            column_bits,
+        }));
     }
     Ok(out)
 }
@@ -837,16 +927,17 @@ fn relation_exists_in_txn<R: ReadSource>(src: &R, key: &str) -> Result<bool> {
 }
 
 impl Storage {
-    /// [`relation_grant_bits_in_txn`] を新しい読み取り Tx で呼ぶ。
-    pub(crate) fn relation_grant_bits(
+    /// [`relation_grants_in_txn`] を新しい読み取り Tx で呼ぶ。
+    #[cfg(test)]
+    pub(crate) fn relation_grants(
         &self,
         tenant: &str,
         keys: &[String],
         role_id: u64,
-    ) -> Result<Vec<Option<u16>>> {
+    ) -> Result<Vec<Option<RelationGrants>>> {
         use redb::ReadableDatabase;
         let rt = self.db().begin_read()?;
-        relation_grant_bits_in_txn(&rt, tenant, keys, role_id)
+        relation_grants_in_txn(&rt, tenant, keys, role_id)
     }
 }
 

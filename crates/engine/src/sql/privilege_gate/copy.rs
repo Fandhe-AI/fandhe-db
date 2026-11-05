@@ -13,14 +13,18 @@
 //! - 一時表（セッションの所有物）は呼び出し元が本ゲートの手前で分岐するので対象外。
 //! - ACL は明示 Tx では `BEGIN` 時のスナップショットで照会し（`read_snap`）、検証済みの対象表が照会で
 //!   見つからなければ `42P01` で拒否する（`read.rs` の `require_relations_bits` の規則をそのまま使う）。
+//! - 列単位の付与（Issue #2083。`columns.rs`）: `FROM` は列リストの列への INSERT、`TO` のテーブル形は列リスト
+//!   （省略時は全列）への SELECT、問い合わせ形は単一 relation なら名指しした列への SELECT（それ以外は全列）。
+//!   従来方式の表の疑似列 `id`（`FROM` の列リストは必ず含む）は表単位でしか満たせない。
 //! - 拒否は固定文言の `42501`。表名・ロール ID・テナントを含めない。
 
 use crate::catalog::privilege::{PRIV_INSERT, PRIV_SELECT};
-use crate::sql::allowlist::{CopyStatement, SqlSurfaceError};
+use crate::sql::allowlist::{CopyStatement, Projection, SqlSurfaceError};
 use crate::sql::lexer::Token;
 use crate::sql::mode::SessionState;
 use crate::storage::Storage;
 
+use super::columns::{ColumnSpec, Want};
 use super::read::require_relations_bits;
 use super::{check, Principal, PrivilegeTarget};
 
@@ -70,6 +74,36 @@ pub(crate) fn require_copy_privileges(
         CopyStatement::From(v) => v.table_name.clone(),
         CopyStatement::To(v) => v.inner.table_name().to_string(),
     }];
-    let wants: Vec<(String, u16)> = names.into_iter().map(|n| (n, required_bits)).collect();
-    require_relations_bits(storage, tenant, &principal, &wants, read_snap, &verified)
+    let mut wants: Vec<Want> = Vec::new();
+    match stmt {
+        CopyStatement::From(v) => wants.extend(Want::split(
+            &v.table_name,
+            required_bits,
+            ColumnSpec::Names(v.columns.clone()),
+        )),
+        CopyStatement::To(v) => {
+            let target = v.inner.table_name();
+            let target_spec = match (&v.inner.projection, v.is_table_form()) {
+                (Projection::Columns(cols), true) => ColumnSpec::Names(cols.clone()),
+                (_, true) => ColumnSpec::All,
+                (_, false) => ColumnSpec::Scan,
+            };
+            for n in names {
+                if n == target {
+                    wants.extend(Want::split(&n, required_bits, target_spec.clone()));
+                } else {
+                    wants.extend(Want::all(&n, required_bits));
+                }
+            }
+        }
+    }
+    require_relations_bits(
+        storage,
+        tenant,
+        &principal,
+        &wants,
+        resolved_tokens,
+        read_snap,
+        &verified,
+    )
 }

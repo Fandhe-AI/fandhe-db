@@ -21,7 +21,11 @@
 //!   未束縛（`None`）は移行期の主体として判定しない（#1971 で認証済みユーザーとロールを紐付けると、本番の
 //!   セッションで自動的に有効になる。`check_required` の明示の腕）。`Some(0)`（PUBLIC の予約 ID）は拒否する。
 //!   運用者権限（`ddl_allowed`）は所有者相当として全権限を持つ（所有者の機構 #2236 まで）。
-//! - 列単位の付与だけでは表単位の要求を満たさない（暫定の fail-closed。列集合の判定は #2081 の担当）。
+//! - 列単位の付与（Issue #2083。ADR `docs/design/column-level-privilege.md` の C1〜C5）: relation の要求は
+//!   [`columns::ColumnSpec`] で「どの列に」を持てる。表単位のビットで満たせれば列は見ない（高速経路）。満たせない
+//!   `SELECT`／`INSERT`／`UPDATE`／`REFERENCES` だけが、要求した列すべてへの列単位の付与で満たせる
+//!   （[`PrivilegeTarget::RelationColumns`] の `column_cover_bits`）。`DELETE` などは常に表単位。判別できない
+//!   形は全列（`All`）、ビュー・疑似列 `id` は表単位（`TableOnly`）として厳しい側に倒す。
 
 use crate::catalog::privilege::owner::OwnerGate;
 use crate::sql::allowlist::SqlSurfaceError;
@@ -207,9 +211,18 @@ pub(crate) enum PrivilegeTarget {
     Ddl(DdlStatementKind),
     /// relation（表・ビュー・matview）。`granted_bits` は呼び出し元が ACL から解決した実効権限
     /// （現在ロールの INHERIT 閉包への付与と PUBLIC の和。表単位の行だけで、列単位の付与は含めない）。
+    /// 列単位の付与を考慮する判定は [`PrivilegeTarget::RelationColumns`]。
     Relation {
         required_bits: u16,
         granted_bits: u16,
+    },
+    /// 列単位の付与を考慮する relation の判定（Issue #2083）。`column_cover_bits` は、表単位では満たせない
+    /// 要求ビットのうち、要求した列すべてへの列単位の付与で満たせたもの（呼び出し元が
+    /// [`columns::cover_bits`] で計算する。所有する値を持たず `Copy` を保つ）。
+    RelationColumns {
+        required_bits: u16,
+        granted_bits: u16,
+        column_cover_bits: u16,
     },
 }
 
@@ -231,6 +244,17 @@ pub(crate) fn check(
                 bits: required_bits,
             },
             granted_bits,
+        ),
+        PrivilegeTarget::RelationColumns {
+            required_bits,
+            granted_bits,
+            column_cover_bits,
+        } => check_required(
+            principal,
+            RequiredPrivilege::Object {
+                bits: required_bits,
+            },
+            granted_bits | column_cover_bits,
         ),
     }
 }
@@ -324,6 +348,7 @@ pub(crate) fn is_owner_equivalent(session: &SessionState) -> bool {
     session.owner_equivalent()
 }
 
+pub(crate) mod columns;
 pub(crate) mod copy;
 pub(crate) mod read;
 pub(crate) mod write;

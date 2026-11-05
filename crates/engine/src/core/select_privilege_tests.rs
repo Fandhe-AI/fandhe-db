@@ -275,11 +275,16 @@ fn error_order_is_syntax_then_resolution_then_privilege() {
     assert_eq!(f.alice_run("SELECT id FROM s_nowhere.ca LIMIT 5"), "3F000");
 }
 
+/// 暫定規則（列単位の付与だけでは表単位の要求を満たさない）を Issue #2083 で置き換えた後の契約。列単位の
+/// 付与は、文が名指しする列に限って読み取りを満たす（`*`・疑似列 `id` は表単位のまま。詳細は
+/// `column_privilege_tests`）。
 #[test]
-fn column_level_grant_does_not_satisfy_table_level_read() {
+fn column_level_grant_satisfies_only_the_granted_columns() {
     let f = fx("selpriv-column");
     f.admin_run("GRANT SELECT (n) ON ca TO alice");
-    assert_eq!(f.alice_run("SELECT n FROM ca LIMIT 5"), "42501");
+    assert_eq!(f.alice_run("SELECT n FROM ca LIMIT 5"), "ok");
+    assert_eq!(f.alice_run("SELECT embedding FROM ca LIMIT 5"), "42501");
+    assert_eq!(f.alice_run("SELECT * FROM ca LIMIT 5"), "42501");
 }
 
 #[test]
