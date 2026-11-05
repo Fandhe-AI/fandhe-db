@@ -595,6 +595,65 @@ fn halfvec_column_is_announced_as_text_oid() {
     drop(guard);
 }
 
+/// bit 距離（`<~>`・`hamming_distance`・`jaccard_distance`。TABLE-48 (2)・Issue #2970）の結果列は
+/// float8（OID 701）で公告され、値は距離のテキスト表現で返る。
+#[test]
+fn bit_distance_columns_are_announced_as_float8() {
+    let guard_path = temp_db::unique_db_path("wire13-bit-distance");
+    let guard = temp_db::CleanupGuard(guard_path.clone());
+    let storage = Storage::open(&guard_path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "bits",
+            vec![ColumnDef::new("code", ColumnType::Bit(4), true)],
+        ))
+        .expect("create table");
+    let ctx =
+        PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+            .expect("valid tenant");
+    let op_id = OperationId::parse("op-wire13-bit-1").expect("valid operation_id");
+    engine::tenant::insert_typed_row(
+        &storage,
+        "bits",
+        &ctx,
+        1,
+        Visibility::Private,
+        &[Value::Bit(
+            engine::bit_string::BitString::parse_text("1100", 4).expect("bit literal"),
+        )],
+        &op_id,
+    )
+    .expect("insert bit row");
+    let core = Arc::new(EngineCore::from_storage(
+        storage,
+        Box::new(CpuScalarProvider),
+    ));
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, core);
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    send_simple_query(
+        &mut stream,
+        "SELECT code <~> '1010', jaccard_distance(code, '1010'), hamming_distance(code, '1100') \
+         FROM bits LIMIT 10",
+    );
+    let columns = read_row_description_with_types(&mut stream);
+    assert_eq!(
+        columns.iter().map(|c| c.1).collect::<Vec<_>>(),
+        vec![701, 701, 701]
+    );
+    let row = read_data_row(&mut stream);
+    assert_eq!(row.first().cloned().flatten().as_deref(), Some("2"));
+    assert_eq!(
+        row.get(1).cloned().flatten().as_deref(),
+        Some("0.6666666666666667")
+    );
+    assert_eq!(row.get(2).cloned().flatten().as_deref(), Some("0"));
+    let _tag = read_command_complete(&mut stream);
+    read_ready_for_query(&mut stream);
+    drop(guard);
+}
+
 /// INT8VEC(N) 列は専用 OID を持たず `text`（OID 25）で公告され、値は `[1,-2]` のテキストで返る
 /// （TABLE-49・Issue #2018）。
 #[test]

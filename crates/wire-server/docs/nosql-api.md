@@ -188,6 +188,7 @@ JSON 本文の構文受理規則は `engine::json`（NOSQL-8）に従う: ネス
 | `columns` | △ | string[]（非空） | 省略時は `id`＋全実列 |
 | `filter` | △ | object[] | [`filter` 配列](#filter-配列)参照 |
 | `explain` | △ | bool | [`explain`](#explain)参照 |
+| `metric` | △ | string | `"cosine"`／`"l2"`／`"ip"`／`"l1"`（`vector` 検索のみ。`plan`・`hybrid` と併用は `42601`）。省略時は対象表の HNSW 索引の opclass に従い、索引が無ければ `"cosine"`。語彙外は `22023`。[距離の意味](#距離の意味vector-検索sql-33nosql-2)参照 |
 
 要求例（ベクトル検索）:
 
@@ -231,14 +232,25 @@ JSON 本文の構文受理規則は `engine::json`（NOSQL-8）に従う: ネス
 - ゼロノルムの行（またはクエリ）は距離が NaN になり、昇順の末尾に並ぶ。
   末尾に並ぶ行も `limit` の枠を消費する（枠が足りなければ返らない）
 - 応答に距離値の列は含まれず、観測できるのは順位だけである
-- 距離種別を選ぶ `metric` キーは未提供で、指定すると未知キーとして `42601`
-  になる（後続 Issue #2243 の担当）
+- `metric`（Issue #2243）で距離種別を選ぶ。`"cosine"`／`"l2"`／`"ip"`／`"l1"` は
+  SQL の `<=>`／`<->`／`<#>`／`<+>` と同じ距離・同じ順序（昇順、同点は id 昇順）。
+  小文字の完全一致のみ受理し、それ以外（大文字混じり・空文字・未知語）は `22023`
+  （エラー文言に入力値は含まれない）。型が string でない場合は `42601`
+- `metric` を省略した場合は、対象表の HNSW 索引の opclass に従う（HNSW opt-in の構成で、
+  `Declared` スコープの宣言があるときのみ。宣言が複数あり `cosine` を含むなら `cosine`、
+  含まないなら宣言の最小の opclass）。索引が無い場合・HNSW opt-in でない場合は `cosine`。
+  索引の opclass と `metric` が合わないときは、SQL と同じく厳密全走査に縮退する
+- `"l2"`／`"l1"` の実行は SQL 表層でも未対応のため、現時点では SQL と同じ
+  `0A000` になる。非 `cosine` と `mode: "precision"` の併用も SQL と同じ `0A000`
+- `metric` は `plan`・`hybrid` と併用できない（値によらず `42601`。`hybrid` の密側は
+  `cosine` 固定）
 - `hybrid` の密側も同じコサイン距離に従う（HNSW opt-in の密側を除く）
 
 主な `wire_code`:
 
 - `vector`／`plan` 両方指定・両方欠落・`plan`＋`hybrid` 併用・`columns: []`・
-  識別子形状不正 → `42601`
+  識別子形状不正・`metric` の型不一致または `plan`／`hybrid` との併用 → `42601`
+- `metric` の語彙外 → `22023`
 - 未知テーブル → `42P01`
 - 未知列・`VECTOR` 列でない列への `ORDER BY` 相当・非有限ベクトル要素等 → `22000`
 
@@ -431,7 +443,9 @@ OFFSET ...` と同じ対象名解決・実行器を共有。第 2 の実行器�
 - `BIT(n)` 列（SQL DDL で作成。TABLE-48・Issue #2021）への `insert`／`update` は JSON 文字列（`0`・`1` の
   並び）を束縛する。`0`・`1` 以外の文字は `22P02`、ビット数が宣言長 `n` と異なる値は `22026`
   （`STRING_DATA_LENGTH_MISMATCH`、HTTP `400`）で文全体を拒否し副作用を残さない。応答の列型名は
-  `"bit"`。`filter` に BIT 列を使うことは対象外で engine の非対応列判定により拒否される
+  `"bit"`。`filter` に BIT 列を使うことは対象外で engine の非対応列判定により拒否される。
+  bit 距離は SQL の `<~>`／`<%>`・`hamming_distance`・`jaccard_distance` でだけ扱い、`search` の対象にできない
+  （VECTOR 列を持たず BIT 列だけを持つ表への `search` は `0A000`。TABLE-48 (5)・Issue #2970）
 - `HALFVEC(N)` 列（SQL DDL で作成。TABLE-46・Issue #2014）への `insert`／`update` は `VECTOR` と同じ JSON 数値配列を
   束縛し、engine が IEEE 754 binary16 へ丸めて保存する（`scan` では丸めた値が返る）。次元不一致・非数値要素・
   非有限は `22000`、f16 の範囲外は `22003`（HTTP `400`）で文全体を拒否し副作用を残さない。応答の列型名は
@@ -1004,6 +1018,7 @@ nosql16_explain_targets.rs`（`vector` 指定 `search`・`scan`・`aggregate` �
 | --- | --- |
 | `SELECT id, lang FROM docs ORDER BY embedding <=> '[0.1,0.2,0.3,0.4]' LIMIT 10` | `search` + `vector` + `columns` |
 | `SELECT id FROM docs ORDER BY HYBRID(embedding, '[1.0,0.0]', body, 'alpha') LIMIT 3` | `search` + `vector` + `hybrid.text`（疎側列は `body` 固定） |
+| `SELECT id FROM docs ORDER BY embedding <#> '[0.1,0.2,0.3,0.4]' LIMIT 10` | `search` + `vector` + `"metric":"ip"` |
 | `SELECT id FROM docs USING PLAN('find content') LIMIT 10` | `search` + `plan` |
 | `... LIMIT n USING MODE 'recall'` | `"mode":"recall"` |
 | `WHERE lang = 'ja'` | `filter` 要素 `{"op":"eq",...}` |
@@ -1186,7 +1201,7 @@ Date: <IMF-fixdate>
 | `2201B` | `INVALID_REGULAR_EXPRESSION` | 400 | Bad Request | 正規表現パターンの構文誤り（括弧の不整合・量指定の対象不在・回数の範囲外など）。SQL 表層（`~`／`~*`・`SIMILAR TO`）専用で、NoSQL の `op` 語彙からは到達しない。Issue #1786 |
 | `2201E` | `INVALID_ARGUMENT_FOR_LOGARITHM` | 400 | Bad Request | `insert`／`update` が書き込む行の `CHECK` 制約の式評価での `ln`／`log` の 0・負の引数（SQL-65） |
 | `22023` | `OPERATION_ID_CONTENT_MISMATCH` | 400 | Bad Request | `insert` の `operation_id` 再送時の内容不一致 |
-| `22023` | `INVALID_PARAMETER_VALUE` | 400 | Bad Request | 型名の引数が範囲外（`FLOAT(p)` の精度。SQL 表層の DDL 専用で、NoSQL の `op` 語彙からは到達しない。Issue #2304） |
+| `22023` | `INVALID_PARAMETER_VALUE` | 400 | Bad Request | 型名の引数が範囲外（`FLOAT(p)` の精度。SQL 表層の DDL では発生し、NoSQL では `search` の `metric` の語彙外でも発生する。Issue #2304・#2243） |
 | `22025` | `INVALID_ESCAPE_SEQUENCE` | 400 | Bad Request | `like` op のパターンが末尾の単独 `\`（エスケープの次の文字が無い）で終わる。SQL 表層の `LIKE ... ESCAPE` の不正な ESCAPE 値・末尾エスケープも同じ分類。NoSQL の `like` から到達する。Issue #1779 |
 | `22026` | `STRING_DATA_LENGTH_MISMATCH` | 400 | Bad Request | `BIT(n)` 列へ入れる文字列のビット数が宣言長 `n` と異なる。NoSQL の BIT 列への `insert`／`update` の文字列束縛から到達する（文字種の不正は `22P02`）。TABLE-48・Issue #2021 |
 | `22033` | `JSON_SUBSCRIPT_INVALID` | 400 | Bad Request | jsonpath の配列添字が不正（strict）。engine の jsonpath 評価器の分類で、SQL 表層へは `jsonb_path_*`（#2185）・`@?`／`@@`（#2186）・`JSON_EXISTS` 等（#2187）で配線済み。NoSQL の `op` 語彙からは到達しない。Issue #2184 |
@@ -1403,7 +1418,8 @@ curl -s -X POST http://127.0.0.1:5432/v1/session/close \
   `http5_query_bearer.rs`・`http6_auth_failure.rs`・`http8_session_close.rs`
 - ルーティング・op 許可リスト・スキーマ: `nosql1_endpoint_routing.rs`・
   `nosql1_op_vocabulary.rs`・`nosql9_op_allowlist.rs`・`nosql8_schema_validation.rs`
-- `search`: `nosql2_search.rs`・`nosql2_search_binding.rs`・`nosql10_explain.rs`・
+- `search`: `nosql2_search.rs`・`nosql2_search_binding.rs`・
+  `nosql2_search_metric.rs`（`metric`。Issue #2243）・`nosql10_explain.rs`・
   `wire_using_plan.rs`・`wire_explain.rs`。距離の意味（コサイン距離の昇順）は
   `nosql2_search.rs`（`vector_search_follows_cosine_distance_not_inner_product`）・
   `nosql2_search_binding.rs`・`wire_sql33_cosine_order.rs`（pg wire 側）で固定

@@ -596,6 +596,15 @@ fn error_mapping_and_recovery() {
         &[Some(b"1")],
         "42601",
     );
+    // bit 距離演算子（Issue #2970・TABLE-48 (4)）の `$n` は本 Issue の対象外で、従来どおり 42601。
+    send_pbes_expect_error(
+        &mut s,
+        "SELECT id FROM documents ORDER BY embedding <~> $1 LIMIT 3",
+        &[],
+        &[],
+        &[Some(b"101")],
+        "42601",
+    );
     // ベクトル次元不一致はリテラル形と同じコード。
     let lit = {
         let mut simple = connect(addr, "alice");

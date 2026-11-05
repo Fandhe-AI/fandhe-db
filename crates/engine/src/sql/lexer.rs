@@ -48,8 +48,8 @@ impl DistanceKind {
 /// f32 ベクトル用の [`DistanceKind`] とは別の型にしている。`DistanceKind` は opclass 写像・
 /// f32 カーネル・content_hash のタグへ網羅的に接続されており、bit 用の種別を足すと偽の
 /// 写像か到達不能な腕が要る（fail-open の温床）ため。lexer が [`Token::BitDistanceOp`] に
-/// 載せる。`sql::allowlist` はどの文法位置でもこのトークンを受理せず構文段で 42601 にする
-/// （ORDER BY・式への接続は距離カーネル側の Issue の担当）。
+/// 載せる。`sql::allowlist` は ORDER BY 式キー・投影・WHERE の比較の被演算子でだけ受理し
+/// `hamming_distance`／`jaccard_distance` の呼び出しへ脱糖する（Issue #2970）。他の位置は構文段で 42601。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BitDistanceKind {
     /// `<~>`（ハミング距離）
@@ -163,8 +163,8 @@ pub enum Token {
     /// `ORDER BY`・`$n` のベクトル位置は 4 種とも受理する（Issue #1977）。実行は種別ごとの
     /// カーネル接続 Issue まで `0A000`（`sql::exec` の入口で fail-closed）。
     DistanceOp(DistanceKind),
-    /// 二値ベクトルの距離演算子 `<~>`・`<%>`（Issue #2021・TABLE-48 ポインタ）。allowlist は
-    /// どの位置でも受理しない（構文段 42601 で fail-closed）。
+    /// 二値ベクトルの距離演算子（Issue #2021・TABLE-48 ポインタ）。allowlist は広域取得の ORDER BY 式キー・
+    /// 投影・WHERE の比較の被演算子でだけ受理し（Issue #2970）、他は構文段 42601 で fail-closed。
     BitDistanceOp(BitDistanceKind),
     /// `<=`（TASK-79・SQL-9: 式述語の比較演算子）。
     Le,

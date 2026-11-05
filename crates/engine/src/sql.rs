@@ -215,6 +215,7 @@ mod truncate_restart_identity_tests;
 // `CREATE FUNCTION`／`DROP FUNCTION` の UDF カタログ書き込み経路（SQL-66・Issue #1920）。
 pub mod udf_ddl;
 // TRIGGER DDL（TABLE-45・Issue #1722）。
+pub(crate) mod bit_distance;
 pub mod default_privileges_ddl;
 pub mod grant_ddl;
 pub(crate) mod halfvec_knn;
