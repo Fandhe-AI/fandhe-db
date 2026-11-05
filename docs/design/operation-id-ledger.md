@@ -57,3 +57,4 @@ Issue #81（TASK-93）は、TASK-92（RECOVER-1）が必須化した `operation_
 - `docs/spec/04-behavior/recovery.md`（RECOVER-2）
 - `docs/spec/04-behavior/error-format.md`（ERR-2）
 - `docs/spec/04-behavior/sql-surface.md`（SQL-10）
+- [idempotent-resend-comparison.md](idempotent-resend-comparison.md)（他 DB・API 方式との比較）

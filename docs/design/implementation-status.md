@@ -1729,6 +1729,8 @@ main に無く現行の `parse_order_by` は `<=>` のみ受理するため、�
 
 **Issue #2056（feat(engine): HNSW 縮退・再取得ラウンド数・キャッシュ状態を ANALYZE に出す。親 #2052・SQL-76 (2)(3)・SQL-73 (3)(5) ポインタ。詳細は [explain-search-engine-exposure.md](explain-search-engine-exposure.md) の #2056 追記）**: `EXPLAIN ANALYZE` が実行した 1 文の HNSW の判断（索引キャッシュの再利用・構築・再構築・未索引、厳密走査への切り替え、反復スキャンのラウンド数・上限到達・調べた行数、hybrid 密側のラウンド数）を `hnsw_*` の行で根の段へ併記する。スレッドローカルの観測シンク（`sql/hnsw_observe.rs`）に実行段だけで記録し、全体の集計 API の差分は使わない。tenant-b の行量に出力が依存しないことを結合テスト（`sql76_explain_analyze_hnsw`）で固定。静的な `EXPLAIN` は不変。
 
+**Issue #2063（feat(wire): Idempotency-Key ヘッダの取り出しと長さ・文字検証を追加する。親 #2062・HTTP-14 (2) ポインタ）**: `Headers::idempotency_key()`（重複は `08P01`）と `http/idempotency_key.rs` の `extract_idempotency_key` を追加した。値は engine の `OperationId::parse` に委譲し（第 2 の検証器は作らない）、空・256 バイト超・制御文字（値内側の HTAB）は一律 `42601`。それ以外の制御バイトは従来どおりヘッダ構文解析で `08P01`。本文の空 `operation_id`（省略扱い）とは意図的に非対称。書き込み op への結線と本文との不一致拒否は #2064、相互再送とテナント境界は #2065 で扱う。
+
 **Issue #2071（feat(engine): PartitionedDmlLimits にチャンク間隔を追加し実行器で待機する。親 #2070・SQL-77 ポインタ。詳細は [partitioned-dml.md](partitioned-dml.md) の「チャンク間の待機（Issue #2071）」節）**: `PartitionedDmlLimits::chunk_interval`（既定 0・`0..=60,000` ms・上限は `MAX_WRITE_LOCK_WAIT_MS`）と検証関数 `validate_partitioned_chunk_interval_ms` を追加し、分割実行器がチャンク commit 後・次チャンク開始前に待機する。待機は 10 ms 刻みで取り消し・文の期限を確認し、writer を保持しない。時計・sleep は `Hooks` から注入する。既定 0 では挙動は変わらない。CLI フラグは #2073、時間上限は #2072。
 
 **Issue #2067（test(engine): 同一 operation_id の並行再送で二重適用が起きないことを固定する。RECOVER-3・RECOVER-10 ポインタ）**: 本番コードは変更せず、別接続の 2 スレッドが同じテナント・同じ `operation_id` で同時に書く場合を結合テスト `crates/engine/tests/table_rls/recovery_concurrent_resend.rs` で固定した。INSERT・UPDATE × 内容一致・不一致の 4 シナリオを各 100 回繰り返し、成功 1 件・敗者は台帳による `23505`（一致）または `22023`（不一致）であること、行・加算が 1 回分だけであること、台帳が 1 回分だけ記録され逐次再送で勝者の内容ハッシュが使われることを確認する。`Barrier` で開始を揃え、sleep・実時間の閾値は使わない。
@@ -1739,4 +1741,8 @@ main に無く現行の `parse_order_by` は `<=>` のみ受理するため、�
 
 **Issue #2079（test(engine): 衝突有無で応答時間分布を比較するベンチハーネスを追加する。親 #2078・RLS-9・RLS-10 ポインタ。詳細は [rls-timing-bench.md](rls-timing-bench.md)）**: UNIQUE 違反・FK 親不在・正常の 3 形状を、閲覧テナントの行のみ（baseline）と他 2 テナントが同一値を持つ状態（flooded）で繰り返し実行し、p50／p95／p99 と生サンプルを `raw.json` へ出す `rls_timing_bench`（`make bench-rls-timing`）を追加した。時間非依存のロジックは `harness/rls_timing.rs` にあり `tests/rls_timing_accept.rs` が検証する。判定基準・実測値の記録・CI 配線は #2080 の担当で、本ベンチは判定をしない情報提供専用。
 
+**Issue #2069（docs(design): 冪等再送の他 DB・API 方式との比較表。RECOVER-1・RECOVER-7・RECOVER-10 ポインタ。詳細は [idempotent-resend-comparison.md](idempotent-resend-comparison.md)）**: `USING OPERATION_ID`／NoSQL `operation_id` の冪等再送を、Stripe と PostgreSQL・MySQL・SQLite の代替手段と同じ軸で比較した。「同等以上」は根拠テストのある項目（内容不一致の検出・書き込みとの原子性・並行再送・テナント分離・UPDATE／DELETE まで対象）に限り、結果を再生しないこと・テーブル単位の名前空間・TTL と掃除が無いことを差異として明記した。他社の記述は公式ドキュメントの確認日つき。ドキュメントのみの変更で、コード・依存・CI は変えない。
+
 **Issue #2077（docs(design): 行レベル分離の他 DB 比較表。RLS-9・RLS-10・RLS-12・RLS-13・SQL-40 ポインタ。詳細は [row-level-isolation-comparison.md](row-level-isolation-comparison.md)）**: PostgreSQL・Elasticsearch・Qdrant と fandhe の行レベル分離を同じ軸で並べた。「同等以上」はテストで固定した項目に限り、テナント内の制約違反からの推知は PostgreSQL と同等と書く。列レベル制御・ロール別のポリシー条件・利用者が付与できる `BYPASSRLS` は未提供と明記した。ドキュメントのみの変更で、コード・依存・CI は変えない。
+
+**Issue #2082（docs(design): 列レベル制御を PostgreSQL の列権限の意味に揃える ADR。SQL-40・RLS-12 ポインタ。詳細は [column-level-privilege.md](column-level-privilege.md)）**: 列権限の意味（表単位は全列に及ぶ・`SELECT *` と RETURNING は全列に権限が要る・列を参照しない読み取りは少なくとも 1 列）、既存の共通ゲート `privilege_gate::check` への統合方式、HTTP 表層への写像、存在情報を漏らさない応答契約（固定文言の `42501`・他テナントは列の解決に入らない）を Proposed として記録し、Elasticsearch の `field_security` との差を比較した。ドキュメントのみの変更で、コード・依存・CI は変えない。
