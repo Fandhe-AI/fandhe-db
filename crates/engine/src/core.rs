@@ -6177,6 +6177,10 @@ impl EngineCore {
         // トークン列から取り除いて構文情報として保持し、既存の検証が文を受理した後に併用を検査する。
         // 構文誤りは `42601`、併用違反は `0A000`、`OF` の解決失敗は `42P01`。
         let tokens = Self::normalize_row_count_clauses(tokens)?;
+        // `EXPLAIN ( <オプション> ) <文>`（SQL-76 (1)・Issue #2058）の括弧付きオプションは、構文段で
+        // 取り除いて `EXPLAIN <文>` に組み直し、内側の文の検証が通った後に意味検証する
+        // （PostgreSQL と同じく内側の文のエラーが先）。未実装のオプションは `0A000` で止める。
+        let (tokens, explain_opts) = crate::sql::explain_options::extract(tokens)?;
         let (tokens, locking) = crate::sql::row_lock::extract_row_locking(tokens)?;
         // `SKIP LOCKED` の空結果前の RLS 判定（RLS-13）は、外側の FROM に現れないサブクエリ・CTE 内側の
         // 表にも掛ける。名前解決（`schema.name` → 内部キー）の後のトークン列から実参照表だけを集める
@@ -6191,6 +6195,9 @@ impl EngineCore {
             read_snap,
             locking.is_some().then_some(&mut read_tables),
         )?;
+        if let Some(raw) = &explain_opts {
+            raw.resolve()?;
+        }
         let Some(locking) = locking else {
             return Ok(parsed);
         };

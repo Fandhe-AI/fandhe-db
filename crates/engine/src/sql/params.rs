@@ -1370,6 +1370,17 @@ pub fn validate_param_positions(tokens: &[Token]) -> Result<u16, SqlSurfaceError
         ));
     }
 
+    // Issue #2058（SQL-76 (1)）: `EXPLAIN ( <オプション> ) <文>` は先頭の次が `(` になり、下の
+    // `EXPLAIN` 前置の JOIN・集合演算・CTE・部分クエリのガードが偽になって素通りする（その後 parse 段が
+    // オプションを剥いで受理してしまう）。`$n` との併用は受理を後続に譲り、fail-closed に拒否する。
+    if crate::sql::explain_options::has_option_list(tokens)
+        && tokens.iter().any(|t| matches!(t, Token::Param(_)))
+    {
+        return Err(SqlSurfaceError::unsupported(
+            "parameter placeholders are not supported in EXPLAIN with options",
+        ));
+    }
+
     // Issue #925（SQL-28・RLS-10、TASK-212）: JOIN 文も一律拒否する
     // （fail-closed。カーソル・`WITH` と同じ方針）。理由: `where_equality_
     // literal_is_param`（パターン 4）は `Ident '='` の形しか数えず、JOIN の

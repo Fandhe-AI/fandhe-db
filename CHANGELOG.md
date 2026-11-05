@@ -23,6 +23,7 @@
 
 ### Added
 
+- `EXPLAIN (<オプション>[, ...]) <文>` を解析するようにした（Issue #2058・SQL-76 (1) ポインタ）。`COSTS`・`FORMAT TEXT`・明示的な偽は受理し、未実装の `ANALYZE`／`VERBOSE`／`SUMMARY`／`FORMAT JSON` は `0A000`。同じオプションは後の指定が勝つ。公開 API の変更はない
 - HALFVEC 列の HNSW 索引を追加した（Issue #2016・TABLE-46 (3)(4)(6)・INDEX-7 ポインタ）。`USING hnsw (h halfvec_{cosine,l2,ip,l1}_ops)`（省略は `halfvec_cosine_ops`）を 4,000 次元まで宣言でき、宣言済み表への `<=>` kNN が HNSW を使う（常駐はエンジン設定と独立に F16。`--hnsw-scope all` でも宣言の無い HALFVEC 表には暗黙の HNSW を作らない）。公開 API に `catalog::HnswOpClassFamily`・`VectorOpClass::resolve_family_name`・`catalog::MAX_HALFVEC_HNSW_DIM`・`ValidatedCreateIndex::hnsw_family` を追加した（追加のみ）。
 - `INT8VEC(N)` 列で距離演算子 `<->`・`<#>`・`<=>` の kNN・WHERE の距離比較・投影の距離列が動くようにした（Issue #2953・TABLE-49 (1)(4)(5) ポインタ）。整数のまま厳密に計算し、距離列は float8。`<+>`・hybrid・`USING PLAN`・`USING MODE`・`HINT ORDER`・precision は `0A000`。NoSQL `search` は対象外（`0A000`）のまま。`vector` との差と量子化誤差の実測は `docs/design/column-type-extension.md` に記録。
   BREAKING CHANGE: 公開 enum `BoundExpr` に variant `Int8VecDistance { kind, index, query }` を追加した（網羅的 `match` の下流は追随が必要）。
