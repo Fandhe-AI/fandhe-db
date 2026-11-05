@@ -189,6 +189,7 @@ fn run_delete(
 fn real_hooks<'a>(after: Option<&'a mut dyn FnMut(usize)>) -> Hooks<'a> {
     Hooks {
         clock: &Instant::now,
+        sleep: &no_sleep,
         after_chunk: after,
         privilege: None,
     }
@@ -401,6 +402,7 @@ fn hold_limit_closes_scan_with_fake_clock() {
     let mut hook = |_: usize| chunks += 1;
     let mut hooks = Hooks {
         clock: &now,
+        sleep: &no_sleep,
         after_chunk: Some(&mut hook),
         privilege: None,
     };
@@ -447,6 +449,7 @@ fn hold_limit_cuts_apply_stage_and_cursor_is_last_applied_id() {
     let mut hook = |_: usize| seen.borrow_mut().push(job_record(&storage, "t-a", &o));
     let mut hooks = Hooks {
         clock: &now,
+        sleep: &no_sleep,
         after_chunk: Some(&mut hook),
         privilege: None,
     };
@@ -1315,6 +1318,7 @@ fn deadline_before_first_chunk_leaves_no_trace() {
     let _scope = crate::interrupt::DeadlineScope::install(clock.deadline());
     let mut hooks = Hooks {
         clock: &now,
+        sleep: &no_sleep,
         after_chunk: None,
         privilege: None,
     };
@@ -1355,6 +1359,7 @@ fn deadline_after_first_chunk_keeps_committed_chunk_and_resend_resumes() {
         };
         let mut hooks = Hooks {
             clock: &now,
+            sleep: &no_sleep,
             after_chunk: Some(&mut hook),
             privilege: None,
         };
@@ -1412,6 +1417,7 @@ fn deadline_during_scan_discards_the_running_chunk() {
     };
     let mut hooks = Hooks {
         clock: &now,
+        sleep: &no_sleep,
         after_chunk: None,
         privilege: None,
     };
@@ -1456,6 +1462,7 @@ fn deadline_during_apply_discards_the_running_chunk_instead_of_committing_partia
     };
     let mut hooks = Hooks {
         clock: &now,
+        sleep: &no_sleep,
         after_chunk: None,
         privilege: None,
     };
@@ -1479,6 +1486,228 @@ fn deadline_during_apply_discards_the_running_chunk_instead_of_committing_partia
     assert!(!ledger_has(&storage, "t-a", &o));
 }
 
+// --- チャンク間隔の待機（Issue #2071。SQL-77 のポインタ。疑似 sleep で決定的に検証する） ---
+
+fn interval_limits(chunk: usize, interval_ms: u64) -> PartitionedDmlLimits {
+    PartitionedDmlLimits {
+        chunk_interval: Duration::from_millis(interval_ms),
+        ..limits(chunk, 1000, 1000)
+    }
+}
+
+#[test]
+fn zero_chunk_interval_never_sleeps_and_keeps_existing_behavior() {
+    let (storage, _g) = setup("pdml-interval-zero");
+    let rows: Vec<(u64, &str)> = (1..=9).map(|i| (i, "x")).collect();
+    seed(&storage, "t-a", &rows);
+    // `real_hooks` の sleep は呼ばれたら panic する（既定 0 では一度も呼ばれない）。
+    let outcome = run_delete(
+        &storage,
+        "t-a",
+        &op("op-iv-zero"),
+        &hash(b"h-iv0"),
+        &limits(3, 1000, 1000),
+        None,
+        match_x as Pred,
+        &mut real_hooks(None),
+    )
+    .expect("completes");
+    assert_eq!(outcome, PartitionedDmlOutcome::Completed { total_rows: 9 });
+    assert!(rows_of(&storage, "t-a").is_empty());
+}
+
+#[test]
+fn chunk_interval_sleeps_between_chunks_in_slices() {
+    let (storage, _g) = setup("pdml-interval-slices");
+    let rows: Vec<(u64, &str)> = (1..=9).map(|i| (i, "x")).collect();
+    seed(&storage, "t-a", &rows);
+    let slept: std::cell::RefCell<Vec<u64>> = Default::default();
+    let sleep = |d: Duration| slept.borrow_mut().push(d.as_millis() as u64);
+    let mut hooks = Hooks {
+        clock: &Instant::now,
+        sleep: &sleep,
+        after_chunk: None,
+        privilege: None,
+    };
+    let outcome = run_delete(
+        &storage,
+        "t-a",
+        &op("op-iv-slices"),
+        &hash(b"h-iv1"),
+        &interval_limits(3, 35),
+        None,
+        match_x as Pred,
+        &mut hooks,
+    )
+    .expect("completes");
+    assert_eq!(outcome, PartitionedDmlOutcome::Completed { total_rows: 9 });
+    // 3 チャンクの各 commit 後に待つ（最初の前では待たず、完了を確かめる 4 回目の空走査の後も待たない）。
+    assert_eq!(
+        *slept.borrow(),
+        vec![10, 10, 10, 5, 10, 10, 10, 5, 10, 10, 10, 5],
+        "slices of 10 ms with the remainder last, once per chunk boundary"
+    );
+}
+
+#[test]
+fn cancel_during_interval_stops_without_waiting_for_the_rest() {
+    let (storage, _g) = setup("pdml-interval-cancel");
+    let rows: Vec<(u64, &str)> = (1..=9).map(|i| (i, "x")).collect();
+    seed(&storage, "t-a", &rows);
+    let o = op("op-iv-cancel");
+    let h = hash(b"h-iv2");
+    let c = ctx("t-a");
+    let registry = std::sync::Arc::clone(storage.partitioned_job_registry());
+    let calls = Cell::new(0u32);
+    let sleep = |_: Duration| {
+        calls.set(calls.get() + 1);
+        if calls.get() == 1 {
+            assert!(registry.request_cancel(&JobKey::for_context(&c, TABLE, &o)));
+        }
+    };
+    let mut hooks = Hooks {
+        clock: &Instant::now,
+        sleep: &sleep,
+        after_chunk: None,
+        privilege: None,
+    };
+    let err = run_delete(
+        &storage,
+        "t-a",
+        &o,
+        &h,
+        &interval_limits(3, 60_000),
+        None,
+        match_x as Pred,
+        &mut hooks,
+    )
+    .expect_err("cancelled during interval");
+    assert!(matches!(err.cause, PartitionedStopCause::CancelRequested));
+    assert_eq!(err.committed_total, 3);
+    // 取り消し要求は次の刻みの前に検出され、残りの待機は行われない。
+    assert_eq!(calls.get(), 1);
+    assert_eq!(rows_of(&storage, "t-a").len(), 6);
+    let key = JobKey::for_context(&c, TABLE, &o);
+    let read_txn = storage.db().begin_read().expect("read");
+    assert!(matches!(
+        partitioned_job::lookup_in_read_txn(&read_txn, &key).expect("lookup"),
+        Some(JobRecord::Cancelled { committed: 3, .. })
+    ));
+    drop(read_txn);
+    let err = run_delete(
+        &storage,
+        "t-a",
+        &o,
+        &h,
+        &limits(3, 1000, 1000),
+        None,
+        match_x as Pred,
+        &mut real_hooks(None),
+    )
+    .expect_err("resend of cancelled");
+    assert!(matches!(
+        err.cause,
+        PartitionedStopCause::ResendCancelled { committed: 3 }
+    ));
+}
+
+#[test]
+fn deadline_during_interval_stops_with_committed_chunks_and_resend_resumes() {
+    let (storage, _g) = setup("pdml-interval-deadline");
+    let rows: Vec<(u64, &str)> = (1..=9).map(|i| (i, "x")).collect();
+    seed(&storage, "t-a", &rows);
+    let o = op("op-iv-deadline");
+    let h = hash(b"h-iv3");
+    let base = Instant::now();
+    let offset = Cell::new(Duration::ZERO);
+    let now = || base + offset.get();
+    let slept: std::cell::RefCell<Vec<u64>> = Default::default();
+    let sleep = |d: Duration| {
+        slept.borrow_mut().push(d.as_millis() as u64);
+        offset.set(offset.get() + d);
+        // 2 回目の刻みの後に、期限（1 時間先）の 5 ms 手前まで疑似時計を進める。
+        if slept.borrow().len() == 2 {
+            offset.set(Duration::from_secs(3600) - Duration::from_millis(5));
+        }
+    };
+    {
+        let _scope = crate::interrupt::DeadlineScope::install(
+            crate::interrupt::StatementDeadline::at(base + Duration::from_secs(3600)),
+        );
+        let mut hooks = Hooks {
+            clock: &now,
+            sleep: &sleep,
+            after_chunk: None,
+            privilege: None,
+        };
+        let err = run_delete(
+            &storage,
+            "t-a",
+            &o,
+            &h,
+            &interval_limits(3, 100),
+            None,
+            match_x as Pred,
+            &mut hooks,
+        )
+        .expect_err("deadline during interval");
+        assert!(matches!(err.cause, PartitionedStopCause::DeadlineExceeded));
+        // 待機中は実行中のチャンクがなく、commit 済みの第 1 チャンクだけが残る。
+        assert_eq!(err.committed_total, 3);
+        assert_eq!(rows_of(&storage, "t-a").len(), 6);
+    }
+    // 最後の刻みは期限の残り（5 ms）へ縮められる。
+    assert_eq!(*slept.borrow(), vec![10, 10, 5]);
+    let outcome = run_delete(
+        &storage,
+        "t-a",
+        &o,
+        &h,
+        &limits(3, 1000, 1000),
+        None,
+        match_x as Pred,
+        &mut real_hooks(None),
+    )
+    .expect("resume completes");
+    assert_eq!(outcome, PartitionedDmlOutcome::Completed { total_rows: 9 });
+    assert!(rows_of(&storage, "t-a").is_empty());
+}
+
+#[test]
+fn writer_gate_is_free_during_interval() {
+    let (storage, _g) = setup("pdml-interval-gate");
+    let rows: Vec<(u64, &str)> = (1..=6).map(|i| (i, "x")).collect();
+    seed(&storage, "t-a", &rows);
+    let acquired = Cell::new(0u32);
+    let sleep = |_: Duration| {
+        // 待機中に writer gate が保持されていれば、同一スレッドの再入として失敗する。
+        let txn = storage
+            .begin_explicit_write_txn_nowait()
+            .expect("writer gate must be free during the interval");
+        drop(txn);
+        acquired.set(acquired.get() + 1);
+    };
+    let mut hooks = Hooks {
+        clock: &Instant::now,
+        sleep: &sleep,
+        after_chunk: None,
+        privilege: None,
+    };
+    let outcome = run_delete(
+        &storage,
+        "t-a",
+        &op("op-iv-gate"),
+        &hash(b"h-iv4"),
+        &interval_limits(3, 10),
+        None,
+        match_x as Pred,
+        &mut hooks,
+    )
+    .expect("completes");
+    assert_eq!(outcome, PartitionedDmlOutcome::Completed { total_rows: 6 });
+    assert_eq!(acquired.get(), 2);
+}
+
 #[test]
 fn disabled_deadline_does_not_affect_the_job() {
     let (storage, _g) = setup("pdml-deadline-disabled");
@@ -1489,6 +1718,7 @@ fn disabled_deadline_does_not_affect_the_job() {
     // 期限を入れなければ、時計がどれだけ進んでも期限超過では止まらない。
     let mut hooks = Hooks {
         clock: &now,
+        sleep: &no_sleep,
         after_chunk: None,
         privilege: None,
     };

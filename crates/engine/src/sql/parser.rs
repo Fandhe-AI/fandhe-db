@@ -5372,6 +5372,12 @@ pub const MAX_PARTITIONED_SCAN_BUDGET_ROWS: usize = crate::tenant::MAX_SCANNED_R
 pub const DEFAULT_PARTITIONED_MAX_HOLD_MS: u64 = 1_000;
 pub const MIN_PARTITIONED_MAX_HOLD_MS: u64 = 100;
 pub const MAX_PARTITIONED_MAX_HOLD_MS: u64 = 5_000;
+/// チャンク間隔（チャンク commit 後・次チャンク開始前の待機。ミリ秒）の既定値と範囲
+/// （SQL-77、Issue #2071。0 は待たない）。上限は書き込み待機上限
+/// （`storage::MAX_WRITE_LOCK_WAIT_MS`）と同じ値にそろえる。
+pub const DEFAULT_PARTITIONED_CHUNK_INTERVAL_MS: u64 = 0;
+pub const MIN_PARTITIONED_CHUNK_INTERVAL_MS: u64 = 0;
+pub const MAX_PARTITIONED_CHUNK_INTERVAL_MS: u64 = crate::storage::MAX_WRITE_LOCK_WAIT_MS;
 /// 中断記録数の上限の既定値と範囲（§15.2。CLI フラグは #1129）。
 pub const DEFAULT_PARTITIONED_INTERRUPTED_RECORD_LIMIT: u64 = 1_000;
 pub const MIN_PARTITIONED_INTERRUPTED_RECORD_LIMIT: u64 = 1;
@@ -5514,6 +5520,20 @@ pub fn validate_partitioned_max_hold_ms(
     Ok(std::time::Duration::from_millis(value))
 }
 
+/// チャンク間隔（ミリ秒）を検証して `Duration` へ変換する。CLI フラグの解析（Issue #2073）から
+/// 呼ばれる想定の公開検証関数。
+pub fn validate_partitioned_chunk_interval_ms(
+    value: u64,
+) -> Result<std::time::Duration, PartitionedDmlLimitsError> {
+    partitioned_range_check(
+        "partitioned chunk interval ms",
+        value,
+        MIN_PARTITIONED_CHUNK_INTERVAL_MS,
+        MAX_PARTITIONED_CHUNK_INTERVAL_MS,
+    )?;
+    Ok(std::time::Duration::from_millis(value))
+}
+
 /// 述語形 UPDATE／DELETE の分割実行（ADR `docs/design/partitioned-dml.md` §15.2）の
 /// プロセス全体の設定値。`core.rs::EngineCore::with_partitioned_dml_limits` が受け取り、
 /// `wire-server` の起動時 CLI フラグからのみ設定する（[`DmlLimits`] と同じ「起動時に
@@ -5528,6 +5548,9 @@ pub struct PartitionedDmlLimits {
     pub scan_budget_rows: std::num::NonZeroUsize,
     /// 1 チャンクの writer 保持時間の上限（既定 1 秒。`100..=5,000` ms）。
     pub max_writer_hold: std::time::Duration,
+    /// チャンク commit 後・次チャンク開始前の待機（既定 0＝待たない。`0..=60,000` ms。SQL-77）。
+    /// 待機中は writer を保持せず、取り消しと文の期限を小刻みに確認する。
+    pub chunk_interval: std::time::Duration,
     /// `(tenant, table)` 単位の中断記録数の上限（既定 1,000。`1..=1,000,000`）。
     pub interrupted_record_limit: std::num::NonZeroU64,
     /// テナント単位の同時実行数の上限（既定 1。`1..=64`。全体の上限以下）。
@@ -5546,6 +5569,7 @@ impl Default for PartitionedDmlLimits {
             scan_budget_rows: std::num::NonZeroUsize::new(DEFAULT_PARTITIONED_SCAN_BUDGET_ROWS)
                 .unwrap_or(std::num::NonZeroUsize::MIN),
             max_writer_hold: std::time::Duration::from_millis(DEFAULT_PARTITIONED_MAX_HOLD_MS),
+            chunk_interval: std::time::Duration::from_millis(DEFAULT_PARTITIONED_CHUNK_INTERVAL_MS),
             interrupted_record_limit: std::num::NonZeroU64::new(
                 DEFAULT_PARTITIONED_INTERRUPTED_RECORD_LIMIT,
             )
@@ -5568,6 +5592,8 @@ impl PartitionedDmlLimits {
         validate_partitioned_scan_budget(self.scan_budget_rows.get())?;
         let hold_ms = u64::try_from(self.max_writer_hold.as_millis()).unwrap_or(u64::MAX);
         validate_partitioned_max_hold_ms(hold_ms)?;
+        let interval_ms = u64::try_from(self.chunk_interval.as_millis()).unwrap_or(u64::MAX);
+        validate_partitioned_chunk_interval_ms(interval_ms)?;
         validate_partitioned_interrupted_record_limit(self.interrupted_record_limit.get())?;
         validate_partitioned_max_jobs(
             "partitioned max jobs per tenant",
@@ -14579,6 +14605,7 @@ mod tests {
         assert_eq!(d.chunk_rows.get(), 1_000);
         assert_eq!(d.scan_budget_rows.get(), 100_000);
         assert_eq!(d.max_writer_hold, std::time::Duration::from_secs(1));
+        assert_eq!(d.chunk_interval, std::time::Duration::ZERO);
         assert_eq!(d.interrupted_record_limit.get(), 1_000);
         assert_eq!(d.max_jobs_per_tenant.get(), 1);
         assert_eq!(d.max_jobs_total.get(), 4);
@@ -14599,6 +14626,14 @@ mod tests {
         assert!(validate_partitioned_max_hold_ms(100).is_ok());
         assert!(validate_partitioned_max_hold_ms(5_000).is_ok());
         assert!(validate_partitioned_max_hold_ms(5_001).is_err());
+        assert!(validate_partitioned_chunk_interval_ms(0).is_ok());
+        assert!(validate_partitioned_chunk_interval_ms(60_000).is_ok());
+        assert!(validate_partitioned_chunk_interval_ms(60_001).is_err());
+        assert!(validate_partitioned_chunk_interval_ms(u64::MAX).is_err());
+        assert_eq!(
+            MAX_PARTITIONED_CHUNK_INTERVAL_MS,
+            crate::storage::MAX_WRITE_LOCK_WAIT_MS
+        );
     }
 
     #[test]
@@ -14608,6 +14643,12 @@ mod tests {
             ..PartitionedDmlLimits::default()
         };
         assert!(l.validate().is_err());
+        let l = PartitionedDmlLimits {
+            chunk_interval: std::time::Duration::from_millis(60_001),
+            ..PartitionedDmlLimits::default()
+        };
+        let msg = l.validate().expect_err("out of range").to_string();
+        assert!(msg.contains("partitioned chunk interval ms"));
         let l = PartitionedDmlLimits {
             interrupted_record_limit: std::num::NonZeroU64::MAX,
             ..PartitionedDmlLimits::default()

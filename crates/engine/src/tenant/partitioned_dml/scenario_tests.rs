@@ -190,6 +190,17 @@ fn drive_delete(
     op: &str,
     hook: &mut dyn FnMut(usize),
 ) -> Result<PartitionedDmlOutcome, PartitionedDmlFailure<Infallible>> {
+    drive_delete_with(core, tenant, op, hook, &no_sleep)
+}
+
+/// [`drive_delete`] にチャンク間隔の sleep 注入先を渡せる版（Issue #2071）。
+fn drive_delete_with(
+    core: &EngineCore,
+    tenant: &str,
+    op: &str,
+    hook: &mut dyn FnMut(usize),
+    sleep: &dyn Fn(Duration),
+) -> Result<PartitionedDmlOutcome, PartitionedDmlFailure<Infallible>> {
     let storage = core.storage_for_test();
     let schema = storage.get_table_schema(TABLE).expect("schema");
     let operation = OperationId::parse(op).expect("valid op");
@@ -219,6 +230,7 @@ fn drive_delete(
         },
         &mut Hooks {
             clock: &Instant::now,
+            sleep,
             after_chunk: Some(hook),
             privilege: None,
         },
@@ -426,6 +438,55 @@ fn cancel_via_sql_while_running_stops_at_next_boundary() {
     );
     // 取り消し済みの ledger エントリは作られない（完了していない）。
     assert!(!ledger_entries(storage, "ta").contains(&JOB.to_string()));
+}
+
+/// チャンク間隔の待機中（SQL-77、Issue #2071）は writer gate が空いており、通常の書き込みが通る。
+/// SQL の CANCEL は残りの待機を待たずに反映される。
+#[test]
+fn normal_write_and_sql_cancel_proceed_during_chunk_interval() {
+    let lim = PartitionedDmlLimits {
+        chunk_interval: Duration::from_millis(1_000),
+        ..limits(1, 4)
+    };
+    let (core, _g) = new_core("pdml-scn-interval", lim);
+    let storage = core.storage_for_test();
+    let rows: Vec<(u64, &str)> = (1..=10).map(|i| (i, "x")).collect();
+    seed(&core, "ta", &rows);
+    let calls = std::cell::Cell::new(0u32);
+    let sleep = |_: Duration| {
+        calls.set(calls.get() + 1);
+        if calls.get() == 1 {
+            // 通常の書き込み（カーソルより後だが tag 不一致のため分割 DELETE の対象外）。
+            exec_ok(
+                &core,
+                "ta",
+                "INSERT INTO docs (id, tag, n) VALUES (100, 'keep', 100) USING OPERATION_ID 'inj-iv'",
+            );
+            match exec_ok(
+                &core,
+                "ta",
+                &format!("CANCEL PARTITIONED DML '{JOB}' ON docs"),
+            ) {
+                SqlOutcome::Query(q) => match q.rows.first().and_then(|r| r.cells.first()) {
+                    Some(Cell::Text(s)) => assert_eq!(s, "cancelling"),
+                    other => panic!("unexpected cells {other:?}"),
+                },
+                other => panic!("expected Query, got {other:?}"),
+            }
+        }
+    };
+    let err = drive_delete_with(&core, "ta", JOB, &mut |_| {}, &sleep).expect_err("cancelled");
+    assert!(matches!(err.cause, PartitionedStopCause::CancelRequested));
+    assert_eq!(err.committed_total, CHUNK as u64);
+    // 残りの待機（1 秒）を消化せず、最初の刻みの直後に止まる。
+    assert_eq!(calls.get(), 1);
+    let left = rows_direct(storage, "ta");
+    assert_eq!(left.len(), 10 - CHUNK + 1);
+    assert!(left.iter().any(|(id, t)| *id == 100 && t == "keep"));
+    assert_eq!(
+        show_rows(&core, "ta", JOB),
+        vec![("cancelled".to_string(), CHUNK as i64)]
+    );
 }
 
 #[test]
