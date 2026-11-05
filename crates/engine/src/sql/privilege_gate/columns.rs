@@ -136,12 +136,18 @@ pub(crate) fn resolve(
         ColumnSpec::Names(names) => {
             let mut set = BTreeSet::new();
             for n in names {
-                if shape.pseudo_id && n == "id" {
+                // `Scan` と同じ ASCII 大文字小文字非区別の照合に揃える（不一致で要求が空になり
+                // `Any` へ倒れる fail-open を防ぐ）。
+                if shape.pseudo_id && n.eq_ignore_ascii_case("id") {
                     return Ok(ColumnDemand::TableOnly);
                 }
-                // 実在しない名前は要求に入れない（実行段の束縛が `42703` にする）。
-                if shape.columns.iter().any(|c| c == n) {
-                    set.insert(n.clone());
+                match shape.columns.iter().find(|c| c.eq_ignore_ascii_case(n)) {
+                    Some(c) => {
+                        set.insert(c.clone());
+                    }
+                    // 実在しない名前は fail-closed（表単位の許可を要求）。実行段の束縛が後で
+                    // `42703` にするが、列単位 GRANT だけで通さない。
+                    None => return Ok(ColumnDemand::TableOnly),
                 }
             }
             Ok(finish(set))
@@ -406,6 +412,29 @@ mod tests {
         assert_eq!(
             resolve(&ColumnSpec::Scan, &shape(), &tokens, false).expect("resolve"),
             ColumnDemand::All
+        );
+    }
+
+    #[test]
+    fn explicit_names_match_case_insensitively_and_unknown_fails_closed() {
+        let mut s = shape();
+        assert_eq!(
+            demand("x", ColumnSpec::Names(vec!["A".into(), "b".into()]), &s),
+            cols(&["a", "b"])
+        );
+        // 実在しない名前は空集合の `Any` ではなく表単位の要求へ倒す。
+        assert_eq!(
+            demand("x", ColumnSpec::Names(vec!["zzz".into()]), &s),
+            ColumnDemand::TableOnly
+        );
+        assert_eq!(
+            demand("x", ColumnSpec::Names(vec!["a".into(), "zzz".into()]), &s),
+            ColumnDemand::TableOnly
+        );
+        s.pseudo_id = true;
+        assert_eq!(
+            demand("x", ColumnSpec::Names(vec!["ID".into()]), &s),
+            ColumnDemand::TableOnly
         );
     }
 
