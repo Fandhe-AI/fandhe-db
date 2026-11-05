@@ -163,6 +163,97 @@ fn insert_needs_insert_and_returning_needs_select() {
     assert_eq!(f.count("ca"), 2);
 }
 
+/// HTTP（NoSQL）表層の `RETURNING` 付き束縛済み入口（NOSQL-22・Issue #2091）は、書き込み権限に加えて
+/// `SELECT` を要求する（SQL 表層の `RETURNING` 付き文と同じ。全列要求で SQL より厳しい側）。
+/// 拒否時は行・台帳とも変化せず、`SELECT` 付与後の同じ `operation_id` の再送は新規として成功する。
+#[test]
+fn bound_returning_entries_need_select_in_addition() {
+    use crate::recovery::required_op_id::OperationId;
+    use crate::row_codec::Value;
+    use crate::sql::allowlist::{InsertLiteral, Projection, WherePredicate};
+    use crate::sql::parser::BoundInsert;
+
+    let f = fx("dmlpriv-bound-returning");
+    f.admin_run(&ins("ca", 1, "seed"));
+    f.admin_run("GRANT INSERT, UPDATE, DELETE ON ca TO alice");
+    let op = |s: &str| OperationId::parse(s).expect("op");
+    let session = || bound(f.alice, false);
+    let all = Projection::All;
+    let pred = || {
+        vec![WherePredicate::Equality {
+            column: "n".to_string(),
+            value: "1".to_string(),
+        }]
+    };
+    let insert_bound = |id: u64, o: &str| {
+        vec![BoundInsert {
+            table: "ca".to_string(),
+            id,
+            values: vec![Value::Vector(vec![1.0, 0.0]), Value::BigInt(1)],
+            operation_id: Some(op(o)),
+            volatile_default_columns: Vec::new(),
+            id_omitted: false,
+        }]
+    };
+    let ins_ret = |o: &str, id: u64| {
+        f.core
+            .execute_bound_insert_returning_in_session(
+                &ctx(),
+                &session(),
+                "ca",
+                1,
+                Some(&op(o)),
+                &all,
+                |_| Ok(insert_bound(id, o)),
+            )
+            .map(|r| r.rows_affected)
+            .map_err(|e| e.wire_code().to_string())
+    };
+    let upd_ret = |o: &str| {
+        f.core
+            .execute_bound_predicate_update_returning_in_session(
+                &ctx(),
+                &session(),
+                "ca",
+                Some(&op(o)),
+                &all,
+                |_| {
+                    Ok((
+                        vec![("n".to_string(), InsertLiteral::Number("1".to_string()))],
+                        pred(),
+                    ))
+                },
+            )
+            .map(|r| r.rows_affected)
+            .map_err(|e| e.wire_code().to_string())
+    };
+    let del_ret = |o: &str| {
+        f.core
+            .execute_bound_predicate_delete_returning_in_session(
+                &ctx(),
+                &session(),
+                "ca",
+                Some(&op(o)),
+                &all,
+                |_| Ok(pred()),
+            )
+            .map(|r| r.rows_affected)
+            .map_err(|e| e.wire_code().to_string())
+    };
+
+    // SELECT なし: 3 入口とも 42501 で、行は変わらない。
+    assert_eq!(ins_ret("b-i1", 2), Err("42501".to_string()));
+    assert_eq!(upd_ret("b-u1"), Err("42501".to_string()));
+    assert_eq!(del_ret("b-d1"), Err("42501".to_string()));
+    assert_eq!(f.count("ca"), 1);
+
+    f.admin_run("GRANT SELECT ON ca TO alice");
+    assert_eq!(ins_ret("b-i1", 2), Ok(1));
+    assert_eq!(upd_ret("b-u1"), Ok(2));
+    assert_eq!(del_ret("b-d1"), Ok(2));
+    assert_eq!(f.count("ca"), 0);
+}
+
 #[test]
 fn upsert_do_update_needs_update_and_select() {
     let f = fx("dmlpriv-upsert");

@@ -28,9 +28,10 @@
 //!    engine 呼び出しより前に返るため副作用は無い）。書き込み op へは検証済みの値を渡し、
 //!    本文の `operation_id` との一致検査は [`super::operation_id_source`] が行う
 //!    **5b.** `returning` の検査（Issue #2090・NOSQL-22。[`super::returning`]）。値の不正と
-//!    分割実行（`mode`／`chunk`）との併用は `42601`、妥当な指定も実行結線（Issue #2091）まで
-//!    固定文言の `0A000` で拒否する（黙って無視しない）。`42601` が常に `0A000` より先に決まり、
-//!    engine 未接続でも同じ順序。engine は呼ばないため副作用は無い
+//!    分割実行（`mode`／`chunk`）との併用は `42601`。妥当な指定は検証済みの投影として手順 6 の
+//!    `insert`／`update`／`delete` へ渡り、engine の RETURNING 付き入口で実行される
+//!    （Issue #2091）。`42601` は engine 呼び出しより前に決まり、engine 未接続でも同じ順序。
+//!    この手順自体は engine を呼ばないため副作用は無い
 //!    **5c.** セッションのスコープ検査（Issue #2101・HTTP-15。[`scope_targets`]・
 //!    [`crate::http::session::scope::SessionScope::check`]）。スコープ外の op・表・書き込み
 //!    （`read_only`）は `42501` の固定文言で拒否する。カタログ・engine に触れる最初の処理
@@ -97,6 +98,7 @@ use crate::http::query::{ddl, delete, insert, partitioned, scan, update};
 use crate::http::session::middleware::{self, SessionPrincipal};
 use crate::http::session::scope::ScopeViolation;
 use crate::http::{body, response};
+use engine::sql::allowlist::Projection;
 
 pub use crate::http::query::op::UNSUPPORTED_OP_MESSAGE;
 
@@ -126,15 +128,15 @@ pub(super) fn reject_allocated_schema(
 const IDEMPOTENCY_KEY_NOT_ALLOWED_MESSAGE: &str =
     "idempotency-key header is not allowed for this op";
 
-/// 手順 5b の本体。キー無しは `Ok`、不正値・分割実行との併用は `42601`、妥当な指定は
-/// 実行結線（Issue #2091）まで `0A000`（fail-closed）。
-fn check_returning(validated: &Validated<'_>) -> Result<(), ReturningRequestError> {
+/// 手順 5b の本体。キー無しは `Ok(None)`、不正値・分割実行との併用は `42601`、妥当な指定は
+/// engine の RETURNING 入口へ渡す [`Projection`] として返す（Issue #2091）。parse は 1 回だけで、
+/// `42601` は engine 呼び出しより前に決まる。
+fn resolve_returning(
+    validated: &Validated<'_>,
+) -> Result<Option<Projection>, ReturningRequestError> {
     let projection = returning::parse_returning(validated)?;
     returning::check_not_partitioned(validated, &projection)?;
-    if projection.is_some() {
-        return Err(ReturningRequestError::NotYetAvailable);
-    }
-    Ok(())
+    Ok(projection)
 }
 
 /// 検証を通過したが実行結線が未接続の要求に返す暫定応答の文言。
@@ -205,12 +207,17 @@ pub fn handle(
     let header_operation_id = header_operation_id.as_ref();
 
     // 手順 5b: `returning` の検査（Issue #2090・NOSQL-22）。engine 接続有無に依らず、
-    // ディスパッチより前に決める（`42601` → 未結線 `0A000` の順）。
-    if op.accepts_returning() {
-        if let Err(e) = check_returning(&validated) {
-            return response::encode_error(e.error_class(), &e.client_message(), now_wall);
+    // ディスパッチより前に `42601` を決める。妥当な指定は投影として書き込み op へ渡す（Issue #2091）。
+    let returning = if op.accepts_returning() {
+        match resolve_returning(&validated) {
+            Ok(projection) => projection,
+            Err(e) => {
+                return response::encode_error(e.error_class(), &e.client_message(), now_wall)
+            }
         }
-    }
+    } else {
+        None
+    };
 
     // 手順 5c: セッションのスコープ検査（Issue #2101・HTTP-15）。カタログ・engine に触れる前に
     // 決める（下の採番方式の事前判定より前。モジュール doc 参照）。スコープ無しは何もしない。
@@ -280,9 +287,14 @@ pub fn handle(
         (Op::Aggregate, Some(engine)) => {
             super::aggregate::handle(engine, principal, &validated, now_wall)
         }
-        (Op::Insert, Some(engine)) => {
-            insert::handle(engine, principal, &validated, header_operation_id, now_wall)
-        }
+        (Op::Insert, Some(engine)) => insert::handle(
+            engine,
+            principal,
+            &validated,
+            header_operation_id,
+            returning.as_ref(),
+            now_wall,
+        ),
         (Op::Search, Some(engine)) => {
             super::search::handle(engine, principal, &validated, now_wall)
         }
@@ -291,12 +303,22 @@ pub fn handle(
         // いずれも束縛・実行結線済み。`filter: []`（空配列）のみ各モジュール
         // 内部（`super::dml_target::DmlTargetError::EmptyFilter`）で `42601`
         // へ fail-closed に落とす。
-        (Op::Update, Some(engine)) => {
-            update::handle(engine, principal, &validated, header_operation_id, now_wall)
-        }
-        (Op::Delete, Some(engine)) => {
-            delete::handle(engine, principal, &validated, header_operation_id, now_wall)
-        }
+        (Op::Update, Some(engine)) => update::handle(
+            engine,
+            principal,
+            &validated,
+            header_operation_id,
+            returning.as_ref(),
+            now_wall,
+        ),
+        (Op::Delete, Some(engine)) => delete::handle(
+            engine,
+            principal,
+            &validated,
+            header_operation_id,
+            returning.as_ref(),
+            now_wall,
+        ),
         // `create_table`／`alter_table`／`drop_table`（Issue #910・NOSQL-13・
         // TASK-207）は SQL 表層の DDL と同一の実行器（`super::ddl` モジュール
         // doc 参照）へ委譲する。DDL 実行権限（`42501`）はテナント境界とは
@@ -1046,7 +1068,10 @@ mod tests {
     }
 
     #[test]
-    fn valid_returning_is_fixed_0a000_not_placeholder() {
+    fn valid_returning_passes_the_gate_and_reaches_dispatch() {
+        // 妥当な `returning` は 5b を通過し、engine 未接続の暫定応答（手順 6）まで到達する
+        // （Issue #2091。以前の固定 `0A000` は撤去済み）。実行結果の検査は層 A の
+        // `nosql22_returning_exec` が担う。
         for body in [
             &br#"{"op":"insert","table":"docs","rows":[],"returning":"*"}"#[..],
             &br#"{"op":"update","table":"docs","set":{"a":1},"where":{"id":1},"returning":["a"]}"#
@@ -1054,13 +1079,11 @@ mod tests {
             &br#"{"op":"delete","table":"docs","where":{"id":1},"returning":["a"]}"#[..],
         ] {
             let text = String::from_utf8(run(body, &[IDEM])).expect("utf-8");
-            assert!(text.starts_with("HTTP/1.1 501 "), "got: {text}");
-            assert!(text.contains("0A000"), "got: {text}");
             assert!(
-                text.contains("returning is not yet available"),
+                !text.contains("returning is not yet available"),
                 "got: {text}"
             );
-            assert!(!text.contains(PLACEHOLDER_MESSAGE), "got: {text}");
+            assert!(text.contains(PLACEHOLDER_MESSAGE), "got: {text}");
         }
     }
 

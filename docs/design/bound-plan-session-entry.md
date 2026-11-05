@@ -314,3 +314,25 @@ SQL 経由の実行と束縛済み計画経由の実行が混在しても結果�
 （第 2 の実装を作らない設計。テストでの後追い確認ではなく構造上の保証）。
 契約テストは `crates/engine/tests/core_explain_bound_entries.rs`
 （Refs #948）。
+
+## 追記（Issue #2091・NOSQL-22・SQL-21・SQL-40）: RETURNING 付き入口 5 本
+
+NoSQL 表層の `returning` を SQL 表層の `RETURNING` と同じ実行器へ結線するため、
+`execute_bound_insert_returning_in_session`・`execute_bound_update_returning_in_session`・
+`execute_bound_delete_checked_returning_in_session`・
+`execute_bound_predicate_update_returning_in_session`・
+`execute_bound_predicate_delete_returning_in_session` を追加した（戻りは `ReturningOutcome`）。
+
+- **共有本体**: `insert` は `execute_bound_insert_core` が判定 1〜6（`operation_id` 必須化・
+  件数・スキーマ取得・束縛・上限）と時刻スコープを持ち、最後の書き込みだけを関数で差し替える。
+  件数版と COPY は従来の書き込み関数、RETURNING 版は `execute_insert_returning_in` を渡す。
+  述語形は `run_predicate_{update,delete}_returning` が分割実行の多層防御・内容照合ハッシュ
+  （`RETURNING` 非依存）・SQL と同じ `execute_predicate_*_returning` を呼ぶ。
+- **判定順**: 件数版の判定順に、同じ `read_txn` 下の `bind_returning`（未知列は SQL と同じコード）が
+  加わり、その後に権限（SELECT を加えたビット）→ 書き込みの順に進む（束縛 → 権限 → 書き込み）。
+- **commit 境界**: 単一行・述語形の投影は commit 前に行われ失敗すれば abort する。`insert` の投影は
+  書き込み前に検証済み。commit 後に残るのは wire 側の本文エンコードだけで、失敗は
+  may-be-committed 応答（`data.state`）へ写像する。
+- **トリガ**: RETURNING 実行器にトリガ引数は無く、NoSQL 表層が発火しない従来契約と一致する。
+- 契約テスト: `crates/engine/tests/sql_named/nosql_bound_returning_public_api.rs`（SQL との完全一致）・
+  `crates/engine/src/core/dml_privilege_tests.rs`（SELECT 要求）。

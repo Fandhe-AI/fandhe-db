@@ -6,10 +6,10 @@
 //!
 //! - `returning` 未指定の成功本文は従来とバイト単位で同一
 //! - 不正な値は 3 op すべてで `42601`（HTTP 400）で、本文に入力値を含めない
-//! - 妥当な指定は実行結線（Issue #2091）まで固定文言の `0A000`（HTTP 501）で、副作用が無い
-//!   （行・値が変わらず、`operation_id` 台帳も消費しない）
+//! - 妥当な指定は実行される（Issue #2091。`0A000` は撤去済み）。応答は件数キーに続けて
+//!   `columns`／`rows` を持つ
 //! - 分割実行（`mode`／`chunk`）との併用は `42601`
-//! - `Idempotency-Key` ヘッダ付きでも判定順（型 → ヘッダ → 値 → 併用 → 未結線）は変わらない
+//! - `Idempotency-Key` ヘッダ付きでも判定順（型 → ヘッダ → 値 → 併用）は変わらない
 
 use crate::common;
 use crate::http_common;
@@ -203,33 +203,43 @@ fn invalid_returning_values_are_42601_without_echo() {
 }
 
 #[test]
-fn valid_returning_is_fixed_0a000_without_side_effects() {
-    let (core, _g) = new_core();
-    let before = snapshot(&core);
-    let c = spawn(core.clone());
+fn valid_returning_executes_and_returns_columns_and_rows() {
+    // Issue #2091: 妥当な `returning` は 0A000 ではなく実行され、件数キーに続けて
+    // `columns`／`rows` を返す。詳細な内容一致は `nosql22_returning_exec` が担う。
+    let keys = ["inserted", "updated", "deleted"];
     for value in [r#""*""#, r#"["n"]"#, r#"["n","u"]"#] {
-        for body in bodies(&format!(r#","returning":{value}"#)) {
+        for (i, key) in keys.iter().enumerate() {
             for header in [None, Some("idem-2")] {
-                let resp = query(&c, &body, header);
-                assert_eq!(resp.status, 501, "{value} {resp:?}");
-                assert_eq!(
-                    http_common::wire_code_of(&resp),
-                    "0A000",
-                    "{value} {resp:?}"
-                );
-                assert!(
-                    body_text(&resp).contains("returning is not yet available"),
-                    "{resp:?}"
-                );
+                let (core, _g) = new_core();
+                let c = spawn(core.clone());
+                let body = &bodies(&format!(r#","returning":{value}"#))[i];
+                let resp = query(&c, body, header);
+                assert_eq!(resp.status, 200, "{value} {resp:?}");
+                let text = body_text(&resp);
+                let prefix = match header {
+                    None => format!("{{\"{key}\":1,\"columns\":["),
+                    Some(h) => format!("{{\"{key}\":1,\"operation_id\":\"{h}\",\"columns\":["),
+                };
+                assert!(text.starts_with(&prefix), "{value} {text}");
+                assert!(text.contains(r#""rows":[["#), "{value} {text}");
             }
         }
     }
-    assert_eq!(snapshot(&core), before, "0A000 must not write");
-    // 台帳が消費されていない: 同じ Idempotency-Key を `returning` なしで送ると初回として成功する。
-    let [_, upd, _] = bodies("");
-    let resp = query(&c, &upd, Some("idem-2"));
-    assert_eq!(resp.status, 200, "{resp:?}");
-    assert_eq!(body_text(&resp), r#"{"updated":1,"operation_id":"idem-2"}"#);
+}
+
+#[test]
+fn replay_with_and_without_returning_shares_the_ledger_key() {
+    // 台帳の内容照合ハッシュは `returning` に依存しない: returning ありで成功した
+    // `Idempotency-Key` を returning なしで再送しても、新規実行として二重に適用されない。
+    let (core, _g) = new_core();
+    let c = spawn(core.clone());
+    let with = &bodies(r#","returning":"*""#)[1];
+    let without = &bodies("")[1];
+    let first = query(&c, with, Some("idem-3"));
+    assert_eq!(first.status, 200, "{first:?}");
+    let replay = query(&c, without, Some("idem-3"));
+    assert_ne!(replay.status, 200, "must not apply twice: {replay:?}");
+    assert_eq!(http_common::wire_code_of(&replay), "23505", "{replay:?}");
 }
 
 #[test]
