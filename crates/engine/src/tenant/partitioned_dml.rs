@@ -44,6 +44,12 @@
 //!   `SHOW` は `running` のまま・同時実行数の枠も占有する。待機は `CHUNK_INTERVAL_POLL_SLICE`
 //!   刻みで取り消しと文の期限を確認し（反映遅れは高々 1 刻み）、待機時間は文の期限の経過に含める。
 //!   新しい停止原因は設けず、既存の `CancelRequested`・`DeadlineExceeded` を再利用する。
+//! - 実行時間の上限（`max_run_time`。SQL-77 (3)、Issue #2072）は 1 回の実行にかかり（再送で 0 から
+//!   数え直す）、0（既定）なら時計も読まない。判定はチャンクの write txn 内の記録段の前で、
+//!   `経過 + chunk_interval >= 上限` なら**そのチャンクを commit したうえで**止める（実行中の
+//!   チャンクは打ち切らず、最初のチャンクは必ず実行する）。走査し尽くしたチャンクは上限より
+//!   完了を優先する。記録がなく変更 0 件でも再開用の `Running` を作る（唯一の例外）。止める際は
+//!   `chunk_interval` を待たない。取り消し・文の期限の確認は上限停止より先に評価される。
 //! - どの段で失敗しても write txn は commit せず drop（abort）する。停止原因と一緒に
 //!   返す `committed_total` は commit 済みのチャンクの累計だけを表す。
 //! - 失敗は fail-closed。ジョブ記録とメモリ上の状態の不一致は `XX000` 相当で止める。
@@ -109,6 +115,10 @@ pub(crate) enum PartitionedStopCause<E> {
     /// （原因 `57014`。同じ `operation_id` の再送で再開できる）。`suppressed` 区間では共有の確認点が
     /// 評価されないため、期限は注入時計（`Hooks::clock`）で明示評価する。
     DeadlineExceeded,
+    /// 1 回の実行の時間上限（`max_run_time`。SQL-77 (3)、Issue #2072）に達し、チャンク境界で
+    /// 止めた。直前のチャンクは commit 済みで、再開用の `Running` 記録も残してある。commit 済み
+    /// 件数が 0 でも `VD001`（原因クラス `54000`・補足文言つき）へ写像する。
+    RunTimeLimitReached,
 }
 
 /// 述語形 `DELETE` の分割実行入口（`core.rs` の分割実行 form から呼ばれる）。
@@ -337,6 +347,23 @@ fn wait_chunk_interval<E>(
     Ok(())
 }
 
+/// 実行時間の上限に達したか（SQL-77 (3)、Issue #2072）。次のチャンクの前に `chunk_interval` を
+/// 待つ分を先読みして加え、待った直後の境界で上限を超えているなら待たずに止める。overflow は
+/// `saturating_*` で潰す。`max_run` が 0（無効）なら常に `false`。
+fn run_time_limit_reached(
+    max_run: Duration,
+    interval: Duration,
+    run_start: Instant,
+    now: Instant,
+) -> bool {
+    if max_run.is_zero() {
+        return false;
+    }
+    now.saturating_duration_since(run_start)
+        .saturating_add(interval)
+        >= max_run
+}
+
 /// 取り消し検出時の共通終了処理。記録の書き込みに失敗した場合はその原因を返す
 /// （committed_total > 0 なら呼び出し側が部分完了として報告する）。
 fn cancel_stop<E>(storage: &Storage, key: &JobKey<'_>) -> PartitionedStopCause<E> {
@@ -431,6 +458,9 @@ fn chunk_loop<E>(
     // ジョブ開始時に値（`Copy`）を読み、注入時計で各確認点を明示評価する。
     let deadline = crate::interrupt::current_deadline();
     let mut chunk_index: usize = 0;
+    // 1 回の実行の開始時刻（再送は `chunk_loop` を新たに呼ぶので 0 から数え直す）。上限が無効なら
+    // 時計を余分に読まない。
+    let run_start = (!limits.max_run_time.is_zero()).then(clock);
 
     // 再開時の commit 済み累計を、取り消し・gate 待機・スキーマ検査など最初のチャンクの
     // どの早期失敗よりも前にメモリ状態へ復元する（失敗に添える `committed_total` が
@@ -718,6 +748,12 @@ fn chunk_loop<E>(
         };
         let rows_changed = u64::try_from(applied).unwrap_or(u64::MAX);
 
+        // 実行時間の上限（SQL-77 (3)）。走査し尽くしたチャンクは完了を優先する。
+        let stop_by_run_time = !exhausted
+            && run_start.is_some_and(|started| {
+                run_time_limit_reached(limits.max_run_time, limits.chunk_interval, started, clock())
+            });
+
         let completed_total = if exhausted {
             Some(
                 partitioned_job::complete_with_fixed_time_in_txn(
@@ -734,7 +770,13 @@ fn chunk_loop<E>(
             let Some(cursor) = new_cursor else {
                 return Err(map_job_err(PartitionedJobError::StateConflict));
             };
-            match partitioned_job::record_chunk_progress_in_txn(
+            // 上限停止の境界だけは、変更 0 件でも再開用の記録を作る（SQL-77 (3)）。
+            let record_progress = if stop_by_run_time {
+                partitioned_job::record_stop_point_in_txn
+            } else {
+                partitioned_job::record_chunk_progress_in_txn
+            };
+            match record_progress(
                 &write_txn,
                 &key,
                 hash,
@@ -746,6 +788,11 @@ fn chunk_loop<E>(
             .map_err(map_job_err)?
             {
                 ChunkCommitOutcome::NoRecord => {
+                    // 停止点用は `NoRecord` を返さない。万一返れば再開用の記録がないまま
+                    // 止まることになるため、fail-closed で止める。
+                    if stop_by_run_time {
+                        return Err(map_job_err(PartitionedJobError::StateConflict));
+                    }
                     // 記録がなく変更も 0 件: 何も書かずカーソルだけメモリ上で進める。
                     drop(write_txn);
                     state.cursor = Some(cursor);
@@ -800,6 +847,10 @@ fn chunk_loop<E>(
         chunk_index = chunk_index.saturating_add(1);
         if let Some(f) = hooks.after_chunk.as_mut() {
             f(chunk_index);
+        }
+        // 上限停止はチャンク間隔を待たずに返す（待っても次のチャンクは実行しないため）。
+        if stop_by_run_time {
+            return Err(PartitionedStopCause::RunTimeLimitReached);
         }
         wait_chunk_interval(
             limits.chunk_interval,

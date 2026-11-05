@@ -1238,6 +1238,9 @@ pub enum SqlSurfaceError {
         committed: u64,
         cause: ErrorClass,
         operation_id: String,
+        /// 停止原因の補足（固定の英語文言。実行時間の上限による停止だけ `Some`。SQL-77 (3)、
+        /// Issue #2072。`cause` のコードだけでは他の上限と見分けられないため Display に載せる）。
+        stop_reason: Option<&'static str>,
     },
     /// 分割実行 DML が取り消された（Issue #1129・RECOVER-11。`VD002`。`committed` は
     /// commit 済みの累計件数）。
@@ -1735,10 +1738,22 @@ impl SqlSurfaceError {
         cause: ErrorClass,
         operation_id: &str,
     ) -> Self {
+        Self::partial_completion_with_reason(committed, cause, operation_id, None)
+    }
+
+    /// `pub(crate)`: 停止原因の補足（固定の英語文言）つきの部分完了（`VD001`）。実行時間の
+    /// 上限による停止（SQL-77 (3)、Issue #2072）が使う。
+    pub(crate) fn partial_completion_with_reason(
+        committed: u64,
+        cause: ErrorClass,
+        operation_id: &str,
+        stop_reason: Option<&'static str>,
+    ) -> Self {
         SqlSurfaceError::PartialCompletion {
             committed,
             cause,
             operation_id: truncate_for_error(operation_id),
+            stop_reason,
         }
     }
 
@@ -2402,12 +2417,17 @@ impl std::fmt::Display for SqlSurfaceError {
                 committed,
                 cause,
                 operation_id,
+                stop_reason,
             } => {
                 write!(
                     f,
                     "partial completion: committed {committed} rows before stopping (cause {}); resend the same statement with operation_id '{operation_id}' to resume",
                     cause.wire_code()
-                )
+                )?;
+                match stop_reason {
+                    Some(reason) => write!(f, "; {reason}"),
+                    None => Ok(()),
+                }
             }
             SqlSurfaceError::PartitionedDmlCancelled { committed } => {
                 write!(
