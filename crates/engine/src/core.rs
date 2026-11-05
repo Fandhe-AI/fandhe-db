@@ -7221,10 +7221,28 @@ impl EngineCore {
         read_snap: Option<&'a redb::ReadTransaction>,
     ) -> Option<&'a redb::ReadTransaction> {
         use crate::sql::allowlist::Statement;
-        match parsed.peel_session_route() {
-            ParsedSql::Statement(Statement::Explain(_)) => None,
+        let peeled = parsed.peel_session_route();
+        if Self::explain_select_runs_on_latest_catalog(peeled) {
+            return None;
+        }
+        match peeled {
             ParsedSql::Statement(Statement::Select(s)) if s.using_plan().is_some() => None,
             _ => read_snap,
+        }
+    }
+
+    /// SELECT 系の `Statement::Explain` を（`FORMAT JSON`・`ANALYZE`・`VERBOSE` の包みごしでも）含む文か。
+    /// 該当すれば [`Self::acl_snapshot_for`] は最新カタログで権限を検査する。包みは中身と同じ扱いにそろえ、
+    /// TEXT の `EXPLAIN` と食い違って `BEGIN` 後に作り直された同名の表を旧 ACL で通さないようにする
+    /// （Issue #2059）。述語形 DML／INSERT の `EXPLAIN` は従来どおり対象外（包みの有無で挙動を変えない）。
+    fn explain_select_runs_on_latest_catalog(parsed: &ParsedSql) -> bool {
+        match parsed {
+            ParsedSql::Statement(crate::sql::allowlist::Statement::Explain(_))
+            | ParsedSql::ExplainAnalyze(_) => true,
+            ParsedSql::ExplainJson(inner) | ParsedSql::ExplainVerbose(inner) => {
+                Self::explain_select_runs_on_latest_catalog(inner)
+            }
+            _ => false,
         }
     }
 
