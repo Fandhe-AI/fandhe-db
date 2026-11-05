@@ -12,7 +12,7 @@
   `docs/spec/04-behavior/error-format.md`（ERR-1・ERR-2・ERR-4）・
   `docs/spec/05-tasks.md`・`docs/spec/06-roadmap.md`。spec 本文は転記しない
   （[spec-confidentiality](../../.claude/rules/spec-confidentiality.md)）
-- 関連 doc: [`multi-row-dml-operation-id.md`](multi-row-dml-operation-id.md)（Issue #868。
+- 関連 doc: [`partitioned-dml-comparison.md`](partitioned-dml-comparison.md)（Issue #2074。他 DB との比較）・[`multi-row-dml-operation-id.md`](multi-row-dml-operation-id.md)（Issue #868。
   1 文 = 1 台帳エントリ・候補 B 不採用の理由）・[`predicate-dml-exec.md`](predicate-dml-exec.md)
   （Issue #871。1 write トランザクションの実行契約・上限 API〔Issue #997〕）・
   [`operation-id-ledger.md`](operation-id-ledger.md)・
