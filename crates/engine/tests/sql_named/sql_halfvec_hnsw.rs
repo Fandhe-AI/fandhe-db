@@ -502,3 +502,38 @@ fn tenant_isolation_fail_closed_forms_and_dml_follow() {
         assert_eq!(d, e);
     }
 }
+
+/// 部分クエリ（IN／EXISTS／スカラー）を含む WHERE の kNN は、索引宣言済みでも scan 経路へ戻り、
+/// 宣言前と同じ結果を返す。EXPLAIN も ANN でなく scan の計画を示す（Issue #2016・TABLE-46）。
+#[test]
+fn subquery_where_knn_falls_back_to_scan_with_declared_index() {
+    let (core, _g, _path) = seeded_core("hvh-subq", HnswScope::Declared);
+    let q = vec_literal(&gen_vectors(77, 1)[0]);
+    let order = format!("ORDER BY h <=> '{q}' LIMIT 10");
+    let stmts = [
+        format!("SELECT id FROM hv WHERE id IN (SELECT id FROM hv WHERE id < 100) {order}"),
+        format!("SELECT id FROM hv WHERE EXISTS (SELECT id FROM hv WHERE id < 100) {order}"),
+        format!("SELECT id FROM hv WHERE NOT EXISTS (SELECT id FROM hv WHERE id < 0) {order}"),
+        format!("SELECT id FROM hv WHERE id >= (SELECT MIN(id) FROM hv) {order}"),
+        format!(
+            "SELECT id FROM hv WHERE id < 0 OR id IN (SELECT id FROM hv WHERE id < 100) {order}"
+        ),
+    ];
+    let before: Vec<Vec<i64>> = stmts.iter().map(|s| ids(&core, "tenant-a", s)).collect();
+    assert_eq!(
+        code(
+            &core,
+            "CREATE INDEX hv_h ON hv USING hnsw (h halfvec_cosine_ops)"
+        ),
+        ""
+    );
+    for (sql, expected) in stmts.iter().zip(&before) {
+        assert_eq!(&ids(&core, "tenant-a", sql), expected, "{sql}");
+        let plan = explain(&core, "tenant-a", sql);
+        assert!(!plan.iter().any(|l| l.starts_with("ann_plan:")), "{plan:?}");
+    }
+    assert_eq!(core.hnsw_index_cache_stats().hits, 0);
+    // 比較: 部分クエリなしの同形は ANN の計画になる。
+    let plan = explain(&core, "tenant-a", &format!("SELECT id FROM hv {order}"));
+    assert!(line(&plan, "ann_plan:").contains("hnsw"), "{plan:?}");
+}

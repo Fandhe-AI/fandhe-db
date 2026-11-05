@@ -13,7 +13,7 @@
 use crate::catalog::{ColumnType, TableSchema};
 use crate::sql::allowlist::{
     OrderByForm, Projection, ScanOrderKey, SelectItem, SqlSurfaceError, ValidatedScan,
-    ValidatedStatement,
+    ValidatedStatement, WherePredicate,
 };
 use crate::sql::lexer::DistanceKind;
 use crate::sql::mode::SearchMode;
@@ -126,6 +126,11 @@ pub(crate) fn halfvec_ann_shape(
     if v.using_plan().is_some() {
         return Ok(false);
     }
+    // 部分クエリを含む WHERE は ANN 束縛が解決できず `42601` になるため、索引宣言の有無に関わらず
+    // 従来の scan 経路（部分クエリ解決つき）へ戻す。Execute／EXPLAIN が共有する唯一の判定点。
+    if where_has_subquery(v.where_predicates()) {
+        return Ok(false);
+    }
     let OrderByForm::Distance { column, literal } = v.order_by() else {
         return Ok(false);
     };
@@ -151,6 +156,21 @@ pub(crate) fn halfvec_ann_shape(
         check_projected_query_matches(v, kind, literal, skip)?;
     }
     Ok(true)
+}
+
+/// WHERE 述語列が部分クエリ（`IN`／`EXISTS`／スカラー・量化比較。相関解決済みの内部葉を含む）を
+/// 1 つでも含むか。`Not`／`Or` の内側も再帰して見る。`halfvec_ann_shape` が ANN 対象から外す判定に使う。
+fn where_has_subquery(predicates: &[WherePredicate]) -> bool {
+    predicates.iter().any(|p| match p {
+        WherePredicate::InSubquery { .. }
+        | WherePredicate::Exists { .. }
+        | WherePredicate::ScalarSubqueryCompare { .. }
+        | WherePredicate::QuantifiedSubqueryCompare { .. }
+        | WherePredicate::CorrelatedExists(_) => true,
+        WherePredicate::Not(inner) => where_has_subquery(std::slice::from_ref(inner.as_ref())),
+        WherePredicate::Or(branches) => branches.iter().any(|b| where_has_subquery(b)),
+        _ => false,
+    })
 }
 
 /// 投影の距離列のクエリベクトルが `ORDER BY` のものと（f16 丸め後に）一致することを検査する。
