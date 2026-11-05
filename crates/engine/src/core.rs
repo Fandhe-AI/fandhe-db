@@ -6215,12 +6215,20 @@ impl EngineCore {
         // のときだけ結果の変換を表す包みを付ける。`FORMAT TEXT`／繰り返し指定の後勝ちで TEXT なら包まない。
         if crate::sql::explain_options::has_option_list(&tokens) {
             let (format, rest) = crate::sql::explain_options::split_explain_options(&tokens)?;
+            // オプション群は 1 回だけ。直後にもう一つ続く入力は構文誤りで拒否する（ネットワーク入力
+            // による再帰の深さ・トークン列の複製の増幅を防ぐ）。
+            if crate::sql::explain_options::has_option_list(&rest) {
+                return Err(crate::sql::allowlist::SqlSurfaceError::unsupported(
+                    "EXPLAIN option list may appear only once",
+                ));
+            }
             let inner = self.parse_tokens_in(rest, temp, hits, ledger_mode, resolver, read_snap)?;
             return match format {
                 crate::sql::explain_options::ExplainFormat::Text => Ok(inner),
                 crate::sql::explain_options::ExplainFormat::Json => match inner {
                     ParsedSql::Statement(crate::sql::allowlist::Statement::Explain(_))
                     | ParsedSql::ExplainDml(_)
+                    | ParsedSql::ExplainInsert(_)
                     | ParsedSql::Partitioned(
                         crate::sql::partitioned::PartitionedControl::ExplainDelete(_)
                         | crate::sql::partitioned::PartitionedControl::ExplainUpdate(_),

@@ -236,6 +236,8 @@ fn is_routable(parsed: &ParsedSql) -> bool {
         return false;
     }
     match parsed {
+        // Issue #2059: `EXPLAIN (FORMAT JSON)` は中身の `EXPLAIN` が振り分け可能かで決まる。
+        ParsedSql::ExplainJson(inner) => is_routable(inner),
         ParsedSql::Insert(_) | ParsedSql::Truncate(_) => true,
         ParsedSql::Delete(DeleteStatement::SingleRow(_)) => true,
         ParsedSql::Delete(DeleteStatement::Predicate(v)) => v.partitioned().is_none(),

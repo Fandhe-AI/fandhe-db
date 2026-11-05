@@ -200,6 +200,7 @@ fn json_matches_text_for_every_plan_shape() {
         "SELECT k FROM (SELECT k FROM a ORDER BY k LIMIT 2) t",
         "SELECT k FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k)",
         "SELECT k FROM a WHERE k IN (SELECT k FROM b) OR EXISTS (SELECT 1 FROM c)",
+        "INSERT INTO a (k) VALUES (1)",
         "DELETE FROM a WHERE k > 1",
         "UPDATE a SET v = 'z' WHERE k > 1",
         "DELETE FROM a WHERE k > 1 USING OPERATION_ID 'p' PARTITIONED CHUNK 2",
@@ -270,9 +271,10 @@ fn option_errors_use_fixed_codes() {
             "EXPLAIN (FORMAT JSON) SELECT * FROM missing",
             &code(&core, "EXPLAIN SELECT * FROM missing"),
         ),
+        // オプション群の繰り返しは構文誤り（再帰の増幅を防ぐ）。
         (
-            "EXPLAIN (FORMAT JSON) INSERT INTO a (k) VALUES (1)",
-            &code(&core, "EXPLAIN INSERT INTO a (k) VALUES (1)"),
+            "EXPLAIN (FORMAT TEXT) (FORMAT TEXT) SELECT * FROM a",
+            "42601",
         ),
         (
             "EXPLAIN (FORMAT JSON) SELECT * FROM a WHERE k = $1",
@@ -424,4 +426,21 @@ fn explain_json_accepts_temp_table() {
     assert!(!t.rows.is_empty());
     assert_eq!(j.rows.len(), 1);
     assert!(matches!(&j.rows[0].cells[0], Cell::Json(_)));
+}
+
+/// 一時表に対する準備済みの `EXPLAIN (FORMAT JSON)` も振り分けられる（`0A000` にならない）。
+#[test]
+fn explain_json_on_temp_table_is_routable_when_prepared() {
+    let (core, _g) = seeded("x76-temp-prep");
+    let mut session = SessionState::default();
+    session.allow_ddl();
+    let c = ctx("tenant-a");
+    core.execute_sql_in_session(&c, &mut session, "CREATE TEMP TABLE tt (a BIGINT)")
+        .expect("create temp");
+    core.parse_sql_prepared_with_declared_in_session(
+        &session,
+        "EXPLAIN (FORMAT JSON) SELECT a FROM tt",
+        &[],
+    )
+    .expect("prepare must not be rejected with 0A000");
 }
