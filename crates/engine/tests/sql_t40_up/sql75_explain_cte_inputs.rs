@@ -653,3 +653,18 @@ fn unrendered_recursive_anchor_and_term_shapes_are_never_planned() {
         }
     }
 }
+
+/// 具体化 CTE への外側集計の `FILTER` が部分クエリを含む形は、描画する段が無いので
+/// 素の集約段へ畳まず `42601` で拒否する。
+#[test]
+fn outer_aggregate_filter_subquery_over_materialized_cte_is_rejected() {
+    let (core, _g) = seeded("x2976-agg-filter-sub");
+    for sql in [
+        "EXPLAIN WITH w AS MATERIALIZED (SELECT k FROM a) \
+         SELECT count(*) FILTER (WHERE k IN (SELECT k FROM b)) FROM w",
+        "EXPLAIN WITH w AS MATERIALIZED (SELECT k FROM a) \
+         SELECT k, count(*) FILTER (WHERE k IN (SELECT k FROM b)) FROM w GROUP BY k",
+    ] {
+        assert_eq!(code(&core, sql), "42601", "{sql}");
+    }
+}

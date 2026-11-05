@@ -209,6 +209,13 @@ impl OuterPlan {
         match (&view.outer, &self.kind) {
             (BufferedOuter::Rows(rows), _) => rows_layer_shape(rows),
             (BufferedOuter::Aggregate(agg), OuterKind::Aggregate(plan)) => {
+                // 外側集計の `FILTER`・`HAVING` 集計の `FILTER` が部分クエリを含む形は、描画する段を
+                // 持たないので素の集約段へ畳まず固定文の `42601` で拒否する（fail-closed）。
+                if super::subquery::aggregate_has_filter_subquery(agg) {
+                    return Err(SqlSurfaceError::unsupported(
+                        "EXPLAIN is not supported for a subquery in an aggregate FILTER over a materialized CTE",
+                    ));
+                }
                 let grouped = plan.bound.group_by.as_ref();
                 Ok(super::cte_explain::OuterLayerShape {
                     has_limit: grouped.is_some_and(|g| g.limit.is_some()),
