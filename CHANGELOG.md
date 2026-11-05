@@ -23,6 +23,7 @@
 
 ### Added
 
+- DML の `EXPLAIN ANALYZE` を実装した（Issue #2055・SQL-76 (2)(3) ポインタ）。述語形の `UPDATE`／`DELETE` と `INSERT` を実際に実行し（autocommit では commit・`USING OPERATION_ID` の台帳記録を伴い、自動では巻き戻さない。明示トランザクションでは `ROLLBACK` で戻る）、`QUERY PLAN` に実測値を併記する。権限・READ ONLY（`25006`）は通常の DML と同じ。分割実行・`VERBOSE`・`FORMAT JSON` は拒否する。公開 enum `ParsedSql` に variant `ExplainAnalyzeDml` を追加した（`#[non_exhaustive]` のため非破壊）
 - SELECT の `EXPLAIN ANALYZE` を実装した（Issue #2054・SQL-76 (1)(2)(3) ポインタ）。`EXPLAIN (ANALYZE ...)` と前置形 `EXPLAIN ANALYZE` で SELECT を実行し、計画の根の段に `actual_rows`／`actual_loops`／`actual_total_time_ms`、末尾に `planning_time_ms`／`execution_time_ms` を併記する（結果の行は返さない）。DML・`USING PLAN`・一時表・`VERBOSE`・`FORMAT JSON`・`$n` 付きは拒否する。公開 enum `ParsedSql` に variant `ExplainAnalyze` を追加した（`#[non_exhaustive]` のため非破壊）
 - `EXPLAIN ANALYZE` が HNSW の実行時の判断を併記するようにした（Issue #2056・SQL-76 (2)(3) ポインタ）。HNSW 経路を通った文の根の段に `hnsw_index_cache`／`hnsw_exact_scan`／`hnsw_iterative_scan`／`hnsw_refetch_rounds` の行が加わる（実行した 1 文の分のみで、他テナントの行量に依存しない）。静的な `EXPLAIN` の出力は変わらない。
 - `EXPLAIN (<オプション>[, ...]) <文>` を解析するようにした（Issue #2058・SQL-76 (1) ポインタ）。`COSTS`・`FORMAT TEXT`・明示的な偽は受理し、未実装の `ANALYZE`／`VERBOSE`／`SUMMARY`／`FORMAT JSON` は `0A000`。同じオプションは後の指定が勝つ。公開 API の変更はない

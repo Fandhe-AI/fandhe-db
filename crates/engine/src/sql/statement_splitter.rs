@@ -398,7 +398,14 @@ pub fn classify_statement(stmt: &str) -> StatementEffect {
                 StatementEffect::ReadOnly
             }
         }
-        Token::Ident(name) if name.eq_ignore_ascii_case("EXPLAIN") => StatementEffect::ReadOnly,
+        // Issue #2055: `EXPLAIN ANALYZE <DML>` は対象を実際に実行して書き込む（txn 内ロールバックで
+        // 取り消す経路を含む）ため、複数文メッセージでは暗黙トランザクションに入れる必要がある。
+        // 前置形・括弧形のオプションを解釈し、ANALYZE が真で対象が `SELECT` 以外（DML・`WITH` 等）なら
+        // `Write` に倒す（fail-closed）。`ANALYZE false`／オプション不正は従来どおり `ReadOnly`
+        // （不正は後段で構文エラーになる）。
+        Token::Ident(name) if name.eq_ignore_ascii_case("EXPLAIN") => {
+            explain_effect(tokens.clone())
+        }
         // Issue #1129: `SHOW PARTITIONED DML` はジョブ表の読み取りのみ（commit を伴わない）。
         // `CANCEL`（書き込み）は未知の先頭語として `Write`（fail-closed）に落とす。
         Token::Ident(name) if name.eq_ignore_ascii_case("SHOW") => StatementEffect::ReadOnly,
@@ -513,6 +520,30 @@ pub fn classify_statement(stmt: &str) -> StatementEffect {
         // いずれも `Token::Ident` を要求する書き込み分岐に到達できない先頭トークン
         // 形であり、必ず `validate_sql` の許可リスト外（`42601`）へ落ちる。
         _ => StatementEffect::Rejected,
+    }
+}
+
+/// `EXPLAIN` 文の [`StatementEffect`] を決める。`ANALYZE` が真で対象が `SELECT` 以外、または
+/// `SELECT` でもユーザー定義関数呼び出し・行ロック句を含む場合は `Write`（`classify_statement` から呼ばれる）。
+fn explain_effect(tokens: Vec<Token>) -> StatementEffect {
+    let Ok((body, raw)) = crate::sql::explain_options::extract(tokens) else {
+        return StatementEffect::ReadOnly;
+    };
+    let Some(raw) = raw else {
+        return StatementEffect::ReadOnly;
+    };
+    let Ok(opts) = raw.resolve() else {
+        return StatementEffect::ReadOnly;
+    };
+    if !opts.analyze {
+        return StatementEffect::ReadOnly;
+    }
+    let target = body.get(1..).unwrap_or(&[]);
+    let is_select = matches!(target.first(), Some(Token::Keyword(Keyword::Select)));
+    if is_select && !calls_non_builtin_function(target) && !has_row_lock_clause(target) {
+        StatementEffect::ReadOnly
+    } else {
+        StatementEffect::Write
     }
 }
 
@@ -1672,6 +1703,29 @@ mod tests {
             "SELECT a FROM t WHERE a = 1 AND in(1)",
         ] {
             assert_eq!(classify_statement(sql), StatementEffect::Write, "{sql}");
+        }
+    }
+
+    /// Issue #2055: `EXPLAIN ANALYZE <DML>` は前置形・括弧形とも `Write`、ANALYZE 偽や SELECT は `ReadOnly`。
+    #[test]
+    fn explain_analyze_dml_is_classified_as_write() {
+        for sql in [
+            "EXPLAIN ANALYZE DELETE FROM a WHERE k > 1",
+            "EXPLAIN (ANALYZE) INSERT INTO a VALUES (1)",
+            "EXPLAIN (ANALYZE true, COSTS off) DELETE FROM a",
+            "EXPLAIN (ANALYZE on) DELETE FROM a",
+            "EXPLAIN (ANALYZE FALSE, ANALYZE) DELETE FROM a",
+        ] {
+            assert_eq!(classify_statement(sql), StatementEffect::Write, "{sql}");
+        }
+        for sql in [
+            "EXPLAIN DELETE FROM a",
+            "EXPLAIN (ANALYZE false) DELETE FROM a",
+            "EXPLAIN (ANALYZE off) UPDATE a SET v = 1",
+            "EXPLAIN (ANALYZE) SELECT 1",
+            "EXPLAIN ANALYZE SELECT 1",
+        ] {
+            assert_eq!(classify_statement(sql), StatementEffect::ReadOnly, "{sql}");
         }
     }
 
