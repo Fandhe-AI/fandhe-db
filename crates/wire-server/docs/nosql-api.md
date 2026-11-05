@@ -907,14 +907,23 @@ op 形は Issue #2107 で確定済み。**結線は Issue #2108 で、それま�
 | | `with` | 任意 | `{"m"?, "ef_construction"?}`（非負整数。範囲は engine が検査し `22023`） |
 | `drop_index` | `name` | ○ | string |
 
-要求例:
+要求例（OP_SCHEMAS 未登録の op のため検証対象外の `jsonc` フェンス。1 op ごとに 1 つの JSON 値）:
 
-```json
+```jsonc
 {"op": "create_index", "name": "docs_title_idx", "table": "docs", "columns": ["title"]}
+```
+
+```jsonc
 {"op": "create_index", "name": "docs_emb_idx", "table": "docs", "columns": ["emb"],
  "method": "hnsw", "opclass": "vector_cosine_ops", "with": {"m": 16, "ef_construction": 64}}
+```
+
+```jsonc
 {"op": "create_index", "name": "docs_meta_idx", "table": "docs", "columns": ["meta"],
  "method": "gin", "opclass": "jsonb_path_ops"}
+```
+
+```jsonc
 {"op": "drop_index", "name": "docs_title_idx"}
 ```
 
