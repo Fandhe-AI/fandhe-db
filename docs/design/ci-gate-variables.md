@@ -49,6 +49,10 @@ secrets を別経路へ渡すこと自体は防がない。`recall.yml` は元�
 ref から `workflow_dispatch` した run は Environment `bench-gate` にアクセス
 できないため、閾値 secrets を取得できない。
 
+例外: `bench-rls-timing` ジョブ（Issue #2080。判定基準は本リポで決めた公開値）は secrets を使わない
+ため `environment: bench-gate` を付けない。判定結果は終了コードに反映せず既定ゲートに含めない
+（`rls-timing-bench.md` 参照）。
+
 ## secret ↔ spec ポインタ対応（値は書かない）
 
 値そのもの（spec 由来の数値基準）は `.claude/rules/spec-confidentiality.md`

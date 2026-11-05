@@ -36,6 +36,10 @@ name: Bench
 # opt-in フラグである `BENCH_CORE6`・`BENCH_CORE16`・`BENCH_DEDICATED_ENV` は
 # 非機密（有効/無効の 0/1・専有環境フラグ）のため repo variables のまま維持する。
 #
+# bench-rls-timing（Issue #2080）は secrets を使わず environment も付けない参考実測ジョブで、
+# schedule / workflow_dispatch の両方で実行する。判定結果は既定ゲートに含めない
+# （ジョブ前のコメント参照）。
+#
 # secrets を repo レベルに置くだけでは不十分（codex-review P0 指摘）: `workflow_dispatch`
 # は任意の ref を選んで起動でき、選択した ref の workflow YAML・`run` ステップが
 # そのまま実行される。そのため write 権限者が別ブランチで `run` ステップを書き換えて
@@ -264,6 +268,44 @@ jobs:
           BENCH_SQL_C1_MAX_P95_MS: ${{ secrets.BENCH_SQL_C1_MAX_P95_MS }}
           BENCH_SQL_C1_MIN_RECALL: ${{ secrets.BENCH_SQL_C1_MIN_RECALL }}
         run: make bench-c1
+
+  # --------------------------------------------------
+  # bench-rls-timing（Issue #2080。RLS-9・RLS-10 のレイテンシ非観測性の参考実測）
+  # --------------------------------------------------
+  # 他テナントにだけ UNIQUE 値・FK 親がある状態（flooded）と無い状態（baseline）で同一の書き込み
+  # 文の応答時間分布を比較し、分位点の相対差を判定行として Actions ログへ出す
+  # （`crates/engine/benches/rls_timing_bench.rs`。判定基準は `docs/design/rls-timing-bench.md`）。
+  #
+  # 既定ゲートに含めない: 判定結果（pass／fail）は終了コードに反映されず、GitHub ホステッド
+  # runner（共有環境）の値は採否の根拠にしない（`benchmark-judgement-policy.md` §5。
+  # `BENCH_DEDICATED_ENV` は注入しない）。一方、事前検査の失敗・2 arm の応答不一致（RLS-10 の
+  # 応答面の違反）・計測中の期待外応答はベンチが非 0 終了するため、ジョブは red になる。
+  # 正しさの検出まで隠さないよう `continue-on-error` は使わない。
+  #
+  # secrets を使わない（判定基準は本リポで決めた公開値で、spec 由来の閾値ではない）ため
+  # `environment: bench-gate` は付けない。実測値を Actions ログへ出すことは
+  # spec-confidentiality の公開可の範囲（数値基準・実測値）に当たる。他ジョブが値を抑止して
+  # いるのは spec 由来の閾値を扱うためで、本ジョブには当たらない。`if` と `ref: main` は他ジョブ
+  # との一貫性と defense-in-depth（任意 ref のコードを実行しない）のために維持する。
+  bench-rls-timing:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          # dispatch 側の ref 選択に依存させず、常に main を checkout する。
+          ref: main
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        run: rustup show
+      - name: Run bench-rls-timing
+        # ROUNDS・ITERS は既定値（5・1000）。BENCH_RLS_TIMING_REJUDGE は GITHUB_ACTIONS 下で拒否される。
+        run: make bench-rls-timing
 
   # bench-tier（TASK-116 PLAN-4/6/7 のティア別レイテンシ受け入れ基準）は本
   # workflow に置かない。GitHub ホステッド runner には常駐 Ollama がなく、
