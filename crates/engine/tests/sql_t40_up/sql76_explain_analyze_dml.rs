@@ -10,6 +10,7 @@ use engine::kernel::CpuScalarProvider;
 use engine::policy::PolicyContext;
 use engine::sql::exec::Cell;
 use engine::sql::mode::SessionState;
+use engine::sql::statement_splitter::{plan_multi_statement, MultiStatementPlan};
 use engine::sql::SqlOutcome;
 use engine::storage::{Storage, Visibility};
 
@@ -242,19 +243,46 @@ fn runtime_error_leaves_nothing() {
     .expect("id not consumed");
 }
 
+/// wire-server の複数文オーケストレーション（`plan_multi_statement` → 暗黙トランザクション開始 →
+/// 各文を `execute_sql_in_txn` → 最後の成功後に commit）を engine API だけで再現する。
+/// 途中の失敗では暗黙トランザクションを abort して最初のエラーを返す。
+fn run_multi(core: &EngineCore, tenant: &str, stmts: &[&str]) -> Result<(), String> {
+    let plan = plan_multi_statement(stmts, false).map_err(|e| format!("plan: {e:?}"))?;
+    assert_eq!(
+        plan,
+        MultiStatementPlan::ImplicitTransaction,
+        "DML の EXPLAIN ANALYZE は書き込み扱いで暗黙トランザクションになる: {stmts:?}"
+    );
+    let mut session = SessionState::default();
+    let mut txn = core.new_session_transaction();
+    core.begin_implicit_transaction(&mut txn, &session)
+        .map_err(|e| e.wire_code().to_string())?;
+    for stmt in stmts {
+        if let Err(e) = core.execute_sql_in_txn(&ctx(tenant), &mut session, &mut txn, stmt) {
+            txn.abort_implicit();
+            return Err(e.wire_code().to_string());
+        }
+    }
+    txn.commit_implicit(&mut session)
+        .map_err(|e| e.wire_code().to_string())
+}
+
 /// 複数文メッセージ（前置形・括弧形）で後続文が失敗すると、先行の `EXPLAIN ANALYZE <DML>` も
 /// 暗黙トランザクションごと巻き戻る（DML の ANALYZE を読み取り扱いにしない）。
+/// `plan_multi_statement` を実際に通し、`explain_effect` が ReadOnly へ退行すると
+/// `ImplicitTransaction` の assert で落ちる。
 #[test]
 fn multi_statement_failure_rolls_back_analyze_dml() {
     let (core, _g) = seeded("x76d-multi");
     let before = snapshot(&core, "tenant-a", "a");
-    for sql in [
-        "EXPLAIN ANALYZE DELETE FROM a WHERE k > 1; SELECT 1 / 0",
-        "EXPLAIN (ANALYZE, TIMING OFF, SUMMARY OFF) DELETE FROM a WHERE k > 1; SELECT 1 / 0",
-        "EXPLAIN (ANALYZE true) UPDATE a SET v = 'z'; SELECT 1 / 0",
+    for first in [
+        "EXPLAIN ANALYZE DELETE FROM a WHERE k > 1",
+        "EXPLAIN (ANALYZE, TIMING OFF, SUMMARY OFF) DELETE FROM a WHERE k > 1",
+        "EXPLAIN (ANALYZE true) UPDATE a SET v = 'z'",
     ] {
-        assert!(run(&core, "tenant-a", sql).is_err(), "{sql}");
-        assert_eq!(snapshot(&core, "tenant-a", "a"), before, "{sql}");
+        let stmts = [first, "SELECT 1 / 0"];
+        assert!(run_multi(&core, "tenant-a", &stmts).is_err(), "{first}");
+        assert_eq!(snapshot(&core, "tenant-a", "a"), before, "{first}");
     }
 }
 
