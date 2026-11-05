@@ -197,6 +197,14 @@ JSON 本文の構文受理規則は `engine::json`（NOSQL-8）に従う: ネス
 （`filter[].op` の語彙、`aggregates[].fn`／`having[].op` の語彙等）は別途本節の
 説明文で扱う。
 
+本節の要求本文スキーマは、`OP_SCHEMAS` から機械生成した OpenAPI 3.1 文書
+[`crates/wire-server/docs/openapi.json`](openapi.json)（`docs/openapi.json`）としても
+参照できる（NOSQL-20・Issue #2105）。手で編集しない。`OP_SCHEMAS` かクレート版
+（`info.version`）を変えたら
+`cargo run -q -p fandhe-db-wire-server --example openapi_dump > crates/wire-server/docs/openapi.json`
+で再生成する（一致は `nosql20_openapi_golden.rs` が CI で検査する）。対象は要求本文のみで、
+応答スキーマ・他パスは #2103 で扱う。
+
 ### `search`
 
 | キー | 必須 | 型 | 備考 |
@@ -1605,6 +1613,7 @@ curl -s -X POST http://127.0.0.1:5432/v1/session/close \
   `http5_query_bearer.rs`・`http6_auth_failure.rs`・`http8_session_close.rs`
 - ルーティング・op 許可リスト・スキーマ: `nosql1_endpoint_routing.rs`・
   `nosql1_op_vocabulary.rs`・`nosql9_op_allowlist.rs`・`nosql8_schema_validation.rs`
+- OpenAPI 文書（`docs/openapi.json`）とのゴールデン一致: `nosql20_openapi_golden.rs`
 - `search`: `nosql2_search.rs`・`nosql2_search_binding.rs`・
   `nosql2_search_metric.rs`（`metric`。Issue #2243）・`nosql10_explain.rs`・
   `wire_using_plan.rs`・`wire_explain.rs`。距離の意味（コサイン距離の昇順）は
