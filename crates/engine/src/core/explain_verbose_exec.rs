@@ -52,7 +52,19 @@ impl EngineCore {
                 // 未解決の部分クエリ（`IN (SELECT ...)`／`EXISTS`）を含む WHERE は Describe の束縛が受理しない
                 // （`42601`）。計画段は部分クエリを解決して作れているため、この場合だけ `output:` を省く
                 // （追加情報の欠落であり、権限・テナント境界には影響しない）。
-                match self.describe_parsed_in_session_unscrubbed(session, &probe) {
+                //
+                // 粗いセッションゲート（`coarse_temp_gate`）は再適用しない。中身の EXPLAIN は呼び出し元の
+                // 実行入口で検査・計画済みであり、ここで作った `probe` は振り分け情報（`SessionRouted`）を
+                // 持たないため、再適用すると無関係な一時表の存在や `search_path` だけで永続表への
+                // `EXPLAIN (VERBOSE)` が `0A000` になる。列の読み取り源は計画（`Statement::Explain` は
+                // 確定済みカタログを自前で引く）と同じ最新の確定済みカタログに揃える。
+                match self.describe_parsed_in_session_impl(
+                    session,
+                    &probe,
+                    &crate::sql::parser::LiteralSkip::NONE,
+                    &[],
+                    &self.result_limits,
+                ) {
                     Ok(Some(columns)) => {
                         let names: Vec<&str> = columns
                             .iter()

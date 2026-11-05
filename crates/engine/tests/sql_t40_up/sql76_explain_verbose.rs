@@ -272,6 +272,38 @@ fn temp_table_is_rejected() {
     assert_eq!(err.wire_code(), "0A000");
 }
 
+/// SQL-76 (5): 無関係な一時表があっても、永続表への VERBOSE は `output:` つきで成功する
+/// （粗いセッションゲートを列導出で再適用しない回帰）。
+#[test]
+fn persistent_table_with_unrelated_temp_table_succeeds() {
+    let (core, _g) = seeded("x76v-temp-unrelated");
+    let mut s = SessionState::default();
+    s.allow_ddl();
+    core.execute_sql_in_session(&ctx("tenant-a"), &mut s, "CREATE TEMP TABLE t (k BIGINT)")
+        .expect("temp table");
+    let out = core
+        .execute_sql_in_session(
+            &ctx("tenant-a"),
+            &mut s,
+            "EXPLAIN (VERBOSE) SELECT k FROM a",
+        )
+        .expect("persistent VERBOSE with unrelated temp table");
+    match out {
+        SqlOutcome::Explain(r) => {
+            let texts: Vec<String> = r
+                .rows
+                .iter()
+                .filter_map(|row| match &row.cells[0] {
+                    Cell::Text(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert!(texts.iter().any(|l| l.contains("output:")), "{texts:?}");
+        }
+        other => panic!("expected Explain, got {other:?}"),
+    }
+}
+
 /// SQL-76 (5): 明示トランザクション内でも計画できる（READ ONLY でも可）。
 #[test]
 fn works_inside_transaction() {
