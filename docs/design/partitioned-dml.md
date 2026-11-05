@@ -529,7 +529,8 @@ Accepted と、15 節の提案値のオーナー確認後」。後者は 2026-10
 - いずれも `wire-server` 起動時の CLI フラグだけで設定する（フラグ名は #1129 で確定:
   `--partitioned-dml-chunk-rows`・`--partitioned-dml-scan-budget`・`--partitioned-dml-max-hold-ms`・
   `--partitioned-dml-max-jobs-per-tenant`・`--partitioned-dml-max-jobs`・
-  `--partitioned-dml-max-interrupted-records`）。範囲外・非数値・多重指定は起動時に fail-closed で拒否する。
+  `--partitioned-dml-max-interrupted-records`。#2073 でチャンク間隔の
+  `--partitioned-dml-chunk-interval-ms` と時間上限の `--partitioned-dml-max-run-ms` を追加）。範囲外・非数値・多重指定は起動時に fail-closed で拒否する。
   根拠: `--max-dml-affected-rows`・`--max-insert-rows`（`predicate-dml-exec.md` §6）と同じ流儀で、
   セッション・テナント単位の設定は持たない。環境変数は設けない（`batch_limits` の
   `FANDHE_DB_BATCH_MAX_FILES` は既存互換のためのもので、新しい上限には広げない）。
@@ -592,7 +593,7 @@ SQL-71 (4)・SQL-32 のポインタ。詳細は [statement-interrupt.md](stateme
 
 ## チャンク間の待機（Issue #2071）
 
-SQL-77・SQL-32 (4)・SQL-71 (4) のポインタ。設定値は `PartitionedDmlLimits::chunk_interval`（既定 0）。CLI フラグは #2073、ジョブ全体の時間上限は #2072 の担当。
+SQL-77・SQL-32 (4)・SQL-71 (4) のポインタ。設定値は `PartitionedDmlLimits::chunk_interval`（既定 0）。CLI フラグ `--partitioned-dml-chunk-interval-ms` は #2073 で実装、ジョブ全体の時間上限は #2072 の担当。
 
 - 待機は `chunk_loop` の末尾（`after_chunk` フックの後）に置く。最初のチャンクの前と、完了を返すチャンクの後では待たない。範囲を走査し尽くしたかは次の走査で初めて分かるため、最終の書き込みチャンクの後に完了確認の空走査が 1 回入り、その前にも待機が 1 回入る。
 - 待機中は write txn と writer permit を保持しない（通常の書き込みが取れる）。`max_writer_hold` の計測にも含まれない。一方で登録簿の登録は保持し、`SHOW` は `running` のまま、同時実行数の枠も占有する。
@@ -603,7 +604,7 @@ SQL-77・SQL-32 (4)・SQL-71 (4) のポインタ。設定値は `PartitionedDmlL
 
 ## 1 回の実行の時間上限（Issue #2072）
 
-SQL-77 (1)・(3)・(4) のポインタ。設定値は `PartitionedDmlLimits::max_run_time`（既定 0＝無効・`0..=86,400,000` ms。検証関数 `validate_partitioned_max_run_ms`）。CLI フラグは #2073 の担当。
+SQL-77 (1)・(3)・(4) のポインタ。設定値は `PartitionedDmlLimits::max_run_time`（既定 0＝無効・`0..=86,400,000` ms。検証関数 `validate_partitioned_max_run_ms`）。CLI フラグ `--partitioned-dml-max-run-ms` は #2073 で実装。
 
 - 上限は**ジョブ全体ではなく 1 回の実行**にかかる。同じ `operation_id` の再送は `chunk_loop` を新たに呼ぶので、保存済みカーソルから再開し、経過時間は 0 から数え直す。
 - 判定点はチャンクの write txn の中（適用段が終わり、ジョブ記録を書く前）。`経過 + chunk_interval >= 上限` なら、そのチャンクを commit したうえで止める。実行中のチャンクは打ち切らず、最初のチャンクは必ず実行する。`chunk_interval` を足すのは、待った直後の境界で上限を超えているなら待たずに止めるため（待機時間も 1 回の実行の経過に含まれる）。

@@ -5,7 +5,7 @@
 //! `Command::new(env!("CARGO_BIN_EXE_wire-server"))` で起動し、stderr の
 //! `listening on` 行または非 0 終了・エラーメッセージを外形的に確認する）。
 //!
-//! - R1: 範囲内（Issue #1128 で分割実行 DML の 3 フラグも同じ R1〜R4 に含める）（`1..=1_000_000`）の値はいずれのフラグも `listening on` に
+//! - R1: 範囲内（Issue #1128 で分割実行 DML の 3 フラグ、Issue #2073 でチャンク間隔・時間上限の 2 フラグも同じ R1〜R4 に含める）（`1..=1_000_000`）の値はいずれのフラグも `listening on` に
 //!   到達すること（起動を妨げない）
 //! - R2: 値の欠落は非 0 終了・stderr にフラグ名を含むこと
 //! - R3: 重複指定は非 0 終了・stderr に "specified more than once" を含むこと
@@ -167,7 +167,7 @@ fn wait_for_listening_lines(child: &mut Child) -> Vec<String> {
 /// R1: 範囲内の値はいずれのフラグも起動を妨げない。
 #[test]
 fn in_range_values_start_listening() {
-    let cases: [&[&str]; 7] = [
+    let cases: [&[&str]; 9] = [
         &["--max-dml-affected-rows", "5"],
         &["--max-insert-rows", "5"],
         // Issue #1128: 分割実行 DML の 3 フラグ（範囲の両端を含む）。
@@ -180,6 +180,20 @@ fn in_range_values_start_listening() {
             "100",
         ],
         &["--partitioned-dml-max-hold-ms", "5000"],
+        // Issue #2073: チャンク間隔・1 回の実行の時間上限（0 は「待たない」「無効」として受理。
+        // 範囲の両端）。
+        &[
+            "--partitioned-dml-chunk-interval-ms",
+            "0",
+            "--partitioned-dml-max-run-ms",
+            "0",
+        ],
+        &[
+            "--partitioned-dml-chunk-interval-ms",
+            "60000",
+            "--partitioned-dml-max-run-ms",
+            "86400000",
+        ],
         // Issue #1129: 同時実行数・中断記録数の 3 フラグ（範囲の両端と、テナント単位 = 全体）。
         &[
             "--partitioned-dml-max-jobs-per-tenant",
@@ -360,6 +374,57 @@ fn invalid_missing_duplicate_or_out_of_range_values_are_rejected() {
         (
             "--partitioned-dml-max-hold-ms",
             vec!["--partitioned-dml-max-hold-ms", "abc"],
+        ),
+        // Issue #2073: チャンク間隔・時間上限（値欠落・重複・範囲外・非数値）。
+        (
+            "--partitioned-dml-chunk-interval-ms",
+            vec!["--partitioned-dml-chunk-interval-ms"],
+        ),
+        (
+            "--partitioned-dml-chunk-interval-ms",
+            vec![
+                "--partitioned-dml-chunk-interval-ms",
+                "10",
+                "--partitioned-dml-chunk-interval-ms",
+                "20",
+            ],
+        ),
+        (
+            "--partitioned-dml-max-run-ms",
+            vec!["--partitioned-dml-max-run-ms"],
+        ),
+        (
+            "--partitioned-dml-max-run-ms",
+            vec![
+                "--partitioned-dml-max-run-ms",
+                "10",
+                "--partitioned-dml-max-run-ms",
+                "20",
+            ],
+        ),
+        (
+            "--partitioned-dml-chunk-interval-ms",
+            vec!["--partitioned-dml-chunk-interval-ms", "60001"],
+        ),
+        (
+            "--partitioned-dml-chunk-interval-ms",
+            vec!["--partitioned-dml-chunk-interval-ms", "+5"],
+        ),
+        (
+            "--partitioned-dml-chunk-interval-ms",
+            vec!["--partitioned-dml-chunk-interval-ms", "abc"],
+        ),
+        (
+            "--partitioned-dml-max-run-ms",
+            vec!["--partitioned-dml-max-run-ms", "86400001"],
+        ),
+        (
+            "--partitioned-dml-max-run-ms",
+            vec!["--partitioned-dml-max-run-ms", "+5"],
+        ),
+        (
+            "--partitioned-dml-max-run-ms",
+            vec!["--partitioned-dml-max-run-ms", "abc"],
         ),
         // Issue #1129: 同時実行数・中断記録数の 3 フラグ（値欠落・重複・範囲外・非数値）。
         (
