@@ -88,6 +88,7 @@ mod plan_rls_boost;
 mod predicate_dml_failure_injection;
 mod query_planner;
 mod recover12_explicit_txn_resend;
+mod recover12_txn_failure_no_ledger;
 mod regex_match;
 mod rerank;
 mod rerank_cross_encoder;
