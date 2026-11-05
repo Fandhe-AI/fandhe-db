@@ -111,6 +111,20 @@ fn date_header_value(now: SystemTime) -> String {
 /// <body>
 /// ```
 fn encode_known(status: u16, reason: &'static str, body: &str, now: SystemTime) -> Vec<u8> {
+    encode_known_with(status, reason, body, now, None)
+}
+
+/// [`encode_known`] の実体。`cache_control` が `Some` なら `Date` の後ろ（401 の
+/// `WWW-Authenticate` の後）に `Cache-Control` を 1 行足す。値は CR/LF を含まない
+/// `&'static str` 定数に限る（ヘッダインジェクション面を作らない）。`None` の出力は
+/// 従来のレイアウトとバイト同一。
+fn encode_known_with(
+    status: u16,
+    reason: &'static str,
+    body: &str,
+    now: SystemTime,
+    cache_control: Option<&'static str>,
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(body.len().saturating_add(FIXED_OVERHEAD));
     out.extend_from_slice(b"HTTP/1.1 ");
     // u16 は高々 3 桁。`itoa` 相当の追加依存を避け `to_string` で十分
@@ -134,9 +148,25 @@ fn encode_known(status: u16, reason: &'static str, body: &str, now: SystemTime) 
         // 本表層の認証方式は Bearer トークンのみ（`crate::http::session`）。
         out.extend_from_slice(b"WWW-Authenticate: Bearer\r\n");
     }
+    if let Some(value) = cache_control {
+        out.extend_from_slice(b"Cache-Control: ");
+        out.extend_from_slice(value.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
     out.extend_from_slice(b"\r\n");
     out.extend_from_slice(body.as_bytes());
     out
+}
+
+/// `Cache-Control` 付きの成功応答（`200 OK`）。`GET /v1/openapi.json`
+/// （Issue #2244）が認証付き応答を中間キャッシュ・ブラウザに保存させない
+/// `no-store` を付けるために使う。`cache_control` は CR/LF を含まない固定定数のみ。
+pub fn encode_ok_with_cache_control(
+    body: &str,
+    cache_control: &'static str,
+    now: SystemTime,
+) -> Vec<u8> {
+    encode_known_with(200, "OK", body, now, Some(cache_control))
 }
 
 /// ステータスコード＋JSON 本文 → 応答バイト列（汎用形）。
@@ -633,4 +663,15 @@ WWW-Authenticate: Bearer\r\n\
     /// `const fn` 固定: `reason_phrase` が定数文脈から利用できる形態を先取りして
     /// コンパイル時に検証する（`status`／`error_body` と同じ方針）。
     const _: Option<&str> = reason_phrase(200);
+
+    #[test]
+    fn cache_control_ok_golden_bytes_and_plain_ok_unchanged() {
+        let with =
+            String::from_utf8(encode_ok_with_cache_control("{}", "no-store", test_now())).unwrap();
+        let plain = String::from_utf8(encode_ok("{}", test_now())).unwrap();
+        assert!(with.contains("Content-Length: 2\r\n"));
+        assert!(with.contains("\r\nCache-Control: no-store\r\n\r\n{}"));
+        assert_eq!(plain, with.replace("Cache-Control: no-store\r\n", ""));
+        assert!(!plain.contains("Cache-Control"));
+    }
 }

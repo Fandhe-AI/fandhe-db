@@ -9,6 +9,8 @@
 
 ### Changed
 
+- `GET /v1/openapi.json` で OpenAPI 3.1 文書を配信するようにした（Issue #2244・NOSQL-20 (3) ポインタ）。有効な Bearer を必須とし、欠落・不正・期限切れ・close 済みは `28000`（401）。本文はビルド時に埋め込んだ静的文書で、主体・テナントによらずバイト同一。`Content-Length` は省略または `0` のみで、本文あり・このパス以外への `GET`・このパスへの `GET` 以外は認証前に `08P01`。応答に `Cache-Control: no-store` を付ける。
+  BREAKING CHANGE: 公開 enum `http::request::Method` に `Get` を追加した（網羅的 `match` の下流は追随が必要）。
 - wire-server の公開関数 `http::query::gate::handle` に引数 `cursor_key: Option<&KeysetSealKey>`（`engine` の次、`now_wall` の前）を追加し、公開構造体 `http::session::store::SessionGrant` にフィールド `user: Option<String>` を追加した（Issue #2094・NOSQL-23 ポインタ）。`scan` のカーソルを認証ユーザーへ束縛するため。
   BREAKING CHANGE: `gate::handle` の引数と `SessionGrant` のフィールドが増えた（呼び出し・構築している下流は追随が必要）。
   BREAKING CHANGE: 公開モジュール `http::query::scan` も変わった。`execute` は引数 `cursor_key: Option<&KeysetSealKey>` が増え、戻り値が `QueryResult` から `ScanOutcome` になった（従来の結果は `outcome.result` から取る。カーソルは `outcome.next_cursor`）。`explain`・`handle`・`handle_explain` にも同じ `cursor_key` 引数が増えた（`handle` は `now_wall` の前）。公開 enum `ScanError` に variant `CursorWithOffset`・`InvalidCursor`・`CursorUnavailable` を追加した（網羅的 `match` の下流は追随が必要）。非キーセットの呼び出しは `cursor_key` に `None` を渡せば従来と同じ挙動になる。

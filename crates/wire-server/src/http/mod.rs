@@ -106,6 +106,7 @@ pub mod error_body;
 pub mod headers;
 pub mod idempotency_key;
 pub mod listener;
+pub mod openapi_endpoint;
 pub mod query;
 pub mod request;
 pub mod response;

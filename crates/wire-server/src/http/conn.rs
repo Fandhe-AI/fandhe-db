@@ -11,8 +11,9 @@
 //!   `Expect` ヘッダの拒否（[`reject_if_expect`]。下記「`Expect` の扱い」節）
 //!   → 本文長・`Content-Type` の読み取り前検証（[`crate::http::body`]）→
 //!   本文読み取り → `handler: &impl RequestHandler` へのルーティング
-//!   （production は [`crate::http::router::Router`]。`/v1/session` のみ発行
-//!   パイプラインへ委譲し、他パスは `08P01`。Issue #752）の順に 1 往復だけ
+//!   （production は [`crate::http::router::Router`]。`POST` の 3 エンドポイントと
+//!   `GET /v1/openapi.json` を扱い、他パスは `08P01`。GET は `Content-Length`
+//!   省略可・本文なしで、Issue #2244）の順に 1 往復だけ
 //!   処理し、応答を 1 回書き込んでからクローズする（keep-alive・パイプライン
 //!   非対応。応答は常に `Connection: close`）。
 //!   `handler` はテスト（本ファイル・#749 の層 A 網羅テスト）が任意の
@@ -112,7 +113,7 @@ use std::time::{Duration, Instant, SystemTime};
 use engine::error_format::ErrorClass;
 
 use crate::framing::FrameError;
-use crate::http::headers::{parse_headers, HeaderParse, Headers};
+use crate::http::headers::{parse_headers_with, ContentLengthRule, HeaderParse, Headers};
 use crate::http::request::{parse_request_line, Method, RequestLine, RequestLineParse};
 use crate::http::response;
 use crate::http::{body, error_body, status};
@@ -432,7 +433,13 @@ fn build_outcome<S: WireStream, H: RequestHandler>(
         };
     }
 
-    let plan = match body::plan_body(&headers) {
+    // POST は Content-Type・本文長の検査、GET（`/v1/openapi.json` のみ）は本文なしの検査。
+    // どちらも `BodyPlan` を通してしか本文長をアロケーションへ渡さない。
+    let planned = match line.method {
+        Method::Post => body::plan_body(&headers),
+        Method::Get => body::plan_bodyless(&headers),
+    };
+    let plan = match planned {
         Ok(plan) => plan,
         // codex-review 再指摘（PR #810）の核心経路: `Content-Length` が
         // `MAX_BODY_LEN` を超える・`Content-Type` 不正等で本文を 1 バイトも
@@ -462,10 +469,9 @@ fn build_outcome<S: WireStream, H: RequestHandler>(
         }
     };
 
-    // メソッドは要求行パーサ（`crate::http::request::parse_method`）が
-    // 既に `POST` のみへ絞り込み済み（`Method` は単一 variant の閉じた語彙）。
-    // ここでの分岐は将来 `Method` へ variant が増えた場合の fail-closed 安全弁。
-    let Method::Post = line.method;
+    // メソッドは要求行パーサ（`crate::http::request::parse_method`）が `POST` と
+    // `GET /v1/openapi.json` だけへ絞り込み済み。メソッド別の本文計画は上で網羅
+    // `match` しており、variant が増えればコンパイルエラーで気付ける。
 
     let req = Request {
         line,
@@ -553,6 +559,16 @@ enum HeadParseState {
     Respond(Vec<u8>),
 }
 
+/// メソッドから `Content-Length` 欠落の扱いを決める唯一の関数。[`head_parse_state`] と
+/// [`parse_completed_head`] の両方が使い、2 回のヘッダ解析で規則が食い違わないようにする。
+/// 本文を持たない `GET /v1/openapi.json`（Issue #2244）だけが省略可。
+fn content_length_rule(method: Method) -> ContentLengthRule {
+    match method {
+        Method::Post => ContentLengthRule::Required,
+        Method::Get => ContentLengthRule::OptionalDefaultZero,
+    }
+}
+
 /// `buf[..filled]` の時点で要求の頭を解析できるかを判定する（借用非依存）。
 fn head_parse_state(buf: &[u8; HEAD_BUF_LEN], filled: usize) -> HeadParseState {
     let head_slice = match buf.get(..filled) {
@@ -562,8 +578,8 @@ fn head_parse_state(buf: &[u8; HEAD_BUF_LEN], filled: usize) -> HeadParseState {
 
     match parse_request_line(head_slice) {
         Ok(RequestLineParse::Complete {
+            line,
             consumed: line_consumed,
-            ..
         }) => {
             let headers_input = match buf.get(line_consumed..filled) {
                 Some(s) => s,
@@ -571,7 +587,7 @@ fn head_parse_state(buf: &[u8; HEAD_BUF_LEN], filled: usize) -> HeadParseState {
                     return HeadParseState::Respond(protocol_violation_bytes("request head bounds"))
                 }
             };
-            match parse_headers(headers_input) {
+            match parse_headers_with(headers_input, content_length_rule(line.method)) {
                 Ok(HeaderParse::Complete { .. }) => HeadParseState::Complete,
                 Ok(HeaderParse::Incomplete) => HeadParseState::NeedMore,
                 Err(e) => HeadParseState::Respond(frame_error_bytes(&e)),
@@ -599,10 +615,11 @@ fn parse_completed_head(
     let headers_input = buf
         .get(line_consumed..filled)
         .ok_or_else(|| protocol_violation_bytes("request head bounds"))?;
-    let (headers, header_consumed) = match parse_headers(headers_input) {
-        Ok(HeaderParse::Complete { headers, consumed }) => (headers, consumed),
-        _ => return Err(protocol_violation_bytes("request head bounds")),
-    };
+    let (headers, header_consumed) =
+        match parse_headers_with(headers_input, content_length_rule(line.method)) {
+            Ok(HeaderParse::Complete { headers, consumed }) => (headers, consumed),
+            _ => return Err(protocol_violation_bytes("request head bounds")),
+        };
     let head_len = line_consumed
         .checked_add(header_consumed)
         .ok_or_else(|| protocol_violation_bytes("request head length overflow"))?;
