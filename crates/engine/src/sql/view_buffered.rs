@@ -216,6 +216,15 @@ impl OuterPlan {
                         "EXPLAIN is not supported for a subquery in an aggregate FILTER over a materialized CTE",
                     ));
                 }
+                if agg
+                    .where_predicates
+                    .iter()
+                    .any(super::subquery::predicate_contains_subquery)
+                {
+                    return Err(SqlSurfaceError::unsupported(
+                        "EXPLAIN is not supported for a subquery in the outer WHERE over a materialized CTE",
+                    ));
+                }
                 let grouped = plan.bound.group_by.as_ref();
                 Ok(super::cte_explain::OuterLayerShape {
                     has_limit: grouped.is_some_and(|g| g.limit.is_some()),
@@ -238,6 +247,16 @@ pub(crate) fn rows_layer_shape(
     if !rows.window_items.is_empty() {
         return Err(SqlSurfaceError::unsupported(
             "EXPLAIN is not supported for window functions over a materialized CTE",
+        ));
+    }
+    // `WHERE` が部分クエリを含む層は subquery の段を描画できないので、段を黙って落とさず拒否する。
+    if rows
+        .where_predicates
+        .iter()
+        .any(super::subquery::predicate_contains_subquery)
+    {
+        return Err(SqlSurfaceError::unsupported(
+            "EXPLAIN is not supported for a subquery in a WHERE over a materialized CTE",
         ));
     }
     Ok(super::cte_explain::OuterLayerShape {

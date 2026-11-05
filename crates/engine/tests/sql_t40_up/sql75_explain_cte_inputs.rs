@@ -668,3 +668,21 @@ fn outer_aggregate_filter_subquery_over_materialized_cte_is_rejected() {
         assert_eq!(code(&core, sql), "42601", "{sql}");
     }
 }
+
+/// 具体化 CTE への外側 `WHERE` と派生表の層の `WHERE` が部分クエリを含む形は、
+/// subquery の段を黙って落とさず `42601` で拒否する。
+#[test]
+fn outer_where_subquery_over_materialized_cte_is_rejected() {
+    let (core, _g) = seeded("x2976-outer-where-sub");
+    for sql in [
+        "EXPLAIN WITH w AS MATERIALIZED (SELECT k FROM a) \
+         SELECT k FROM w WHERE k IN (SELECT k FROM b)",
+        "EXPLAIN WITH w AS MATERIALIZED (SELECT k FROM a) \
+         SELECT count(*) FROM w WHERE k IN (SELECT k FROM b)",
+        "EXPLAIN SELECT k FROM (SELECT k FROM a LIMIT 2) d WHERE k IN (SELECT k FROM b)",
+        "EXPLAIN WITH w AS MATERIALIZED (SELECT k FROM a) \
+         SELECT k FROM (SELECT k FROM w WHERE k IN (SELECT k FROM b)) d",
+    ] {
+        assert_eq!(code(&core, sql), "42601", "{sql}");
+    }
+}
