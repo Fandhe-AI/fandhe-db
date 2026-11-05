@@ -13,6 +13,7 @@
   `crates/engine/src/sql/{exec,scan,aggregate,pk_point,scalar_index,hnsw_cache,hnsw_hybrid,upsert_where,copy,explain,view_insert}.rs`・
   `crates/wire-server/src/http/query/{gate,op,scan,search,aggregate,insert,update,delete}.rs`
 - 関連 doc: [rls-generalized-read-paths.md](rls-generalized-read-paths.md)・
+  [row-level-isolation-comparison.md](row-level-isolation-comparison.md)（他 DB 横断の比較）・
   [privilege-check-paths.md](privilege-check-paths.md)・
   [hnsw-rls-cardinality-switch.md](hnsw-rls-cardinality-switch.md)・
   [hnsw-hybrid-iterative-scan.md](hnsw-hybrid-iterative-scan.md)・
