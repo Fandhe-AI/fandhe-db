@@ -933,6 +933,20 @@ fn shapes() -> Vec<Shape> {
     );
     oc.only = Some("ct");
     v.push(oc);
+    // PG の意味で実際に読む列を宣言する（fail-open 検出用オラクル。production の期待 `expected` とは独立）。
+    // `*`・`COPY ... TO STDOUT`・`RETURNING *` は全実列、結合・副問い合わせ・集合演算は両 relation の参照列。
+    for s in v.iter_mut() {
+        let (t, j): (&'static [&'static str], &'static [&'static str]) = match s.name {
+            "join" | "subquery_in" | "subquery_exists" | "subquery_scalar" => {
+                (&["pub_c", "n"], &["n"])
+            }
+            "setop_union" => (&["pub_c"], &["pub_c"]),
+            _ if s.class == Class::AllCols => (&REAL_COLS, &[]),
+            _ => continue,
+        };
+        s.pg_t = t;
+        s.pg_j = j;
+    }
     v
 }
 
@@ -1060,9 +1074,6 @@ fn pg_allows(shape: &Shape, g: Gs) -> bool {
             }
             let t_ok = if shape.class == Class::AnyCol {
                 g.any_grant()
-            } else if shape.class == Class::AllCols && shape.pg_t.is_empty() {
-                // 実際に読む列の宣言が無い全列の形は、少なくとも 1 列の付与を必要とする。
-                g.any_grant()
             } else {
                 !shape.pseudo && shape.pg_t.iter().all(|c| g.cols().contains(c))
             };
@@ -1159,7 +1170,7 @@ fn check_cell(
             return Err(format!("message: {v}"));
         }
     }
-    if entry == Entry::Ext && out.code == "42501" && out.stage == "execute" {
+    if entry == Entry::Ext && out.code == "42501" && matches!(out.stage, "bind" | "execute") {
         return Err("denied only after Describe".into());
     }
     Ok(())
@@ -1423,6 +1434,31 @@ fn detectors_flag_fabricated_violations() {
     let proj = &all[shape_by_name(&all, "proj_secret")];
     assert!(!pg_allows(proj, Gs::PubCol));
     assert!(pg_allows(proj, Gs::AllReal));
+    // PG オラクルは各文が実際に読む列で判定する（部分付与は全列の形・結合の両 relation で拒否側）。
+    assert!(!pg_allows(star, Gs::PubCol));
+    assert!(pg_allows(star, Gs::AllReal));
+    let join = &all[shape_by_name(&all, "join")];
+    assert!(!pg_allows(join, Gs::PubCol));
+    assert!(pg_allows(join, Gs::AllReal));
+    let setop = &all[shape_by_name(&all, "setop_union")];
+    assert!(pg_allows(setop, Gs::PubCol));
+    assert!(!pg_allows(setop, Gs::None));
+    assert!(pg_allows(join, Gs::PubN));
+    let copy_all = &all[shape_by_name(&all, "c_copy_all")];
+    assert!(!pg_allows(copy_all, Gs::PubCol));
+    let ret_star = &all[shape_by_name(&all, "w_insert_returning_star")];
+    assert!(!pg_allows(ret_star, Gs::PubCol));
+    // PubCol のみで成功した全列の形は fail-open として検出する。
+    assert!(check_cell(
+        star,
+        "ca",
+        Entry::Auto,
+        Gs::PubCol,
+        &okay(String::new()),
+        "tenant-a",
+        "tenant-b"
+    )
+    .is_err());
     // 拡張クエリの拒否が Describe より後（execute 段）になる応答は違反。
     let late = Out {
         code: "42501".into(),
@@ -1440,4 +1476,34 @@ fn detectors_flag_fabricated_violations() {
         "tenant-b"
     )
     .is_err());
+    // Describe が成功し Bind で初めて拒否される応答も違反。
+    let bind_late = Out {
+        stage: "bind",
+        ..late.clone()
+    };
+    assert!(check_cell(
+        star,
+        "ca",
+        Entry::Ext,
+        Gs::PubCol,
+        &bind_late,
+        "tenant-a",
+        "tenant-b"
+    )
+    .is_err());
+    // Describe 以前（describe 段）の拒否は正常。
+    let early = Out {
+        stage: "describe",
+        ..late
+    };
+    assert!(check_cell(
+        star,
+        "ca",
+        Entry::Ext,
+        Gs::PubCol,
+        &early,
+        "tenant-a",
+        "tenant-b"
+    )
+    .is_ok());
 }
