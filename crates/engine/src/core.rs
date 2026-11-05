@@ -7222,7 +7222,7 @@ impl EngineCore {
     ) -> Option<&'a redb::ReadTransaction> {
         use crate::sql::allowlist::Statement;
         let peeled = parsed.peel_session_route();
-        if Self::explain_select_runs_on_latest_catalog(peeled) {
+        if Self::static_explain_runs_on_latest_catalog(peeled) {
             return None;
         }
         match peeled {
@@ -7231,16 +7231,17 @@ impl EngineCore {
         }
     }
 
-    /// SELECT 系の `Statement::Explain` を（`FORMAT JSON`・`ANALYZE`・`VERBOSE` の包みごしでも）含む文か。
+    /// 実行せず静的な計画だけを返す `Statement::Explain` を（`FORMAT JSON`・`VERBOSE` の包みごしでも）含む文か。
     /// 該当すれば [`Self::acl_snapshot_for`] は最新カタログで権限を検査する。包みは中身と同じ扱いにそろえ、
     /// TEXT の `EXPLAIN` と食い違って `BEGIN` 後に作り直された同名の表を旧 ACL で通さないようにする
-    /// （Issue #2059）。述語形 DML／INSERT の `EXPLAIN` は従来どおり対象外（包みの有無で挙動を変えない）。
-    fn explain_select_runs_on_latest_catalog(parsed: &ParsedSql) -> bool {
+    /// （Issue #2059）。`EXPLAIN ANALYZE`（`ExplainAnalyze`・`ExplainAnalyzeDml`）は文を実際に実行し
+    /// `BEGIN` 時点のスナップショットのデータを読むため、ここでは対象外とし、そのスナップショットの ACL で検査する
+    /// （最新カタログの ACL で旧データの行数等を推測させない。fail-closed）。述語形 DML／INSERT の `EXPLAIN` も対象外。
+    fn static_explain_runs_on_latest_catalog(parsed: &ParsedSql) -> bool {
         match parsed {
-            ParsedSql::Statement(crate::sql::allowlist::Statement::Explain(_))
-            | ParsedSql::ExplainAnalyze(_) => true,
+            ParsedSql::Statement(crate::sql::allowlist::Statement::Explain(_)) => true,
             ParsedSql::ExplainJson(inner) | ParsedSql::ExplainVerbose(inner) => {
-                Self::explain_select_runs_on_latest_catalog(inner)
+                Self::static_explain_runs_on_latest_catalog(inner)
             }
             _ => false,
         }

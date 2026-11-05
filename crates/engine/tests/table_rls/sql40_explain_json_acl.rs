@@ -85,3 +85,40 @@ fn explain_format_json_matches_text_acl_in_explicit_txn() {
         assert_eq!(denied, "42501", "no grant, fmt={fmt:?}");
     }
 }
+
+/// `EXPLAIN ANALYZE` は `BEGIN` 時点のスナップショットのデータを読むため、権限も同じスナップショットで検査され、
+/// 通常の `SELECT` と同じ判定になる。`BEGIN` 後に作り直された同名の表の ACL で、旧表のデータを対象にした
+/// 実行を許可しない（行数から権限のない旧データを推測させない。Issue #2059・SQL-40 のポインタ）。
+#[test]
+fn explain_analyze_uses_snapshot_acl_like_select_in_explicit_txn() {
+    let path = unique_db_path("sql40_explain_analyze_acl");
+    let _guard = CleanupGuard(path.clone());
+    let core = EngineCore::from_storage(
+        Storage::open(&path).expect("open storage"),
+        Box::new(CpuScalarProvider),
+    );
+    let mut boot = SessionState::default();
+    boot.allow_ddl();
+    for sql in ["CREATE ROLE alice", "CREATE ROLE bob"] {
+        core.execute_sql_in_session(&ctx(), &mut boot, sql)
+            .expect("create role");
+    }
+    // bob に権限のない表を BEGIN 後に作り直し、新しい表にだけ SELECT を付与する。
+    for (i, prefix) in [
+        "SELECT",
+        "EXPLAIN ANALYZE SELECT",
+        "EXPLAIN (ANALYZE, TIMING OFF) SELECT",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let t = format!("an{i}");
+        operator(&core, &format!("CREATE TABLE {t} (a TEXT)"));
+        let got = in_txn(&core, &format!("{prefix} a FROM {t}"), || {
+            operator(&core, &format!("DROP TABLE {t}"));
+            operator(&core, &format!("CREATE TABLE {t} (a TEXT)"));
+            operator(&core, &format!("GRANT SELECT ON {t} TO bob"));
+        });
+        assert_eq!(got, "42501", "prefix={prefix:?}");
+    }
+}
