@@ -149,6 +149,7 @@ cargo run -p fandhe-db-wire-server -- --users <ユーザーストアのパス> -
   [--partitioned-dml-max-hold-ms <100-5000>] \
   [--partitioned-dml-max-jobs-per-tenant <1-64>] [--partitioned-dml-max-jobs <1-64>] \
   [--partitioned-dml-max-interrupted-records <1-1000000>] \
+  [--partitioned-dml-chunk-interval-ms <0-60000>] [--partitioned-dml-max-run-ms <0-86400000>] \
   [--ddl-allowed-users <user1>[,<user2>...]] \
   [--auth-method cleartext|scram-sha-256] \
   [--scram-mock-key-file <path>] \
@@ -411,6 +412,13 @@ NoSQL（HTTP）の `update`／`delete` は従来どおり filter 必須で、本
 `--partitioned-dml-max-jobs`（既定 4）・`--partitioned-dml-max-interrupted-records`（既定 1,000）は、
 分割実行の資源上限をプロセス全体に対して起動時に設定します（環境変数なし。範囲外・非数値・値欠落・
 重複指定・組合せ違反〔テナント単位 > 全体〕は起動エラー）。
+
+`--partitioned-dml-chunk-interval-ms`（既定 0＝待たない・範囲 `0..=60000`）はチャンク commit 後の
+待機時間で、待機中は writer を保持せず、取り消しと文の期限は待機中も効きます。
+`--partitioned-dml-max-run-ms`（既定 0＝無効・範囲 `0..=86400000`）は 1 回の実行の経過時間の上限で、
+超えるとチャンク境界で止めて `VD001` を返します（ジョブ全体ではなく 1 回の実行にかかり、同じ
+`operation_id` での再送は保存済みカーソルから再開して経過時間を 0 から数え直します）。いずれも
+未指定なら従来どおりの動作です（環境変数なし。範囲外・非数値・値欠落・重複指定は起動エラー）。
 
 `--batch-max-files <N>`（Issue #1166）は `batch_limits.max_files_per_batch`
 （SQL 複数行 `VALUES`・NoSQL `insert` の `rows[]`・ファイル形バッチ・

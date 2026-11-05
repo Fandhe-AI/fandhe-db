@@ -77,6 +77,15 @@ pub const PARTITIONED_SCAN_BUDGET_FLAG: &str = "--partitioned-dml-scan-budget";
 /// 分割実行 DML の 1 チャンクの writer 保持時間上限（ミリ秒）を設定する CLI フラグ名。
 pub const PARTITIONED_MAX_HOLD_MS_FLAG: &str = "--partitioned-dml-max-hold-ms";
 
+/// 分割実行 DML のチャンク commit 後の待機時間（ミリ秒）を設定する CLI フラグ名（Issue
+/// #2073。既定 0＝待たない・範囲 `0..=60,000`。SQL-77 ポインタ）。
+pub const PARTITIONED_CHUNK_INTERVAL_MS_FLAG: &str = "--partitioned-dml-chunk-interval-ms";
+
+/// 分割実行 DML の 1 回の実行の時間上限（ミリ秒）を設定する CLI フラグ名（Issue #2073。
+/// 既定 0＝無効・範囲 `0..=86,400,000`。ジョブ全体ではなく 1 回の実行にかかる。SQL-77
+/// ポインタ）。
+pub const PARTITIONED_MAX_RUN_MS_FLAG: &str = "--partitioned-dml-max-run-ms";
+
 /// テナント単位の同時実行数の上限を設定する CLI フラグ名（Issue #1129。既定 1・範囲
 /// `1..=64`・全体の上限以下）。
 pub const PARTITIONED_MAX_JOBS_PER_TENANT_FLAG: &str = "--partitioned-dml-max-jobs-per-tenant";
@@ -89,19 +98,22 @@ pub const PARTITIONED_MAX_JOBS_FLAG: &str = "--partitioned-dml-max-jobs";
 pub const PARTITIONED_MAX_INTERRUPTED_RECORDS_FLAG: &str =
     "--partitioned-dml-max-interrupted-records";
 
-/// 分割実行 DML の 6 つの CLI フラグの生の値（未指定は `None`）。`main.rs` が引数解析で
+/// 分割実行 DML の 8 つの CLI フラグの生の値（未指定は `None`）。`main.rs` が引数解析で
 /// 集め、[`resolve_partitioned_dml_limits`] へ渡す。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PartitionedDmlRawFlags<'a> {
     pub chunk_rows: Option<&'a str>,
     pub scan_budget: Option<&'a str>,
     pub max_hold_ms: Option<&'a str>,
+    pub chunk_interval_ms: Option<&'a str>,
+    pub max_run_ms: Option<&'a str>,
     pub max_jobs_per_tenant: Option<&'a str>,
     pub max_jobs: Option<&'a str>,
     pub max_interrupted_records: Option<&'a str>,
 }
 
-/// 分割実行 DML の設定（チャンク幅・走査予算・writer 保持時間・同時実行数・中断記録数）を
+/// 分割実行 DML の設定（チャンク幅・走査予算・writer 保持時間・チャンク間隔・時間上限・
+/// 同時実行数・中断記録数）を
 /// 解決する（Issue #1128・#1129）。`base` は既定値（[`PartitionedDmlLimits::default`]）で、
 /// `Some` のフラグだけを上書きする。範囲は engine 側の単一情報源（`validate_partitioned_*`）
 /// に委ね、最後に [`PartitionedDmlLimits::validate`]（起動時検証の唯一の入口。テナント単位の
@@ -115,6 +127,8 @@ pub fn resolve_partitioned_dml_limits(
         chunk_rows: chunk_rows_raw,
         scan_budget: scan_budget_raw,
         max_hold_ms: max_hold_ms_raw,
+        chunk_interval_ms: chunk_interval_raw,
+        max_run_ms: max_run_raw,
         max_jobs_per_tenant: max_jobs_per_tenant_raw,
         max_jobs: max_jobs_raw,
         max_interrupted_records: max_interrupted_raw,
@@ -176,6 +190,24 @@ pub fn resolve_partitioned_dml_limits(
             })?;
         limits.max_writer_hold = engine::sql::parser::validate_partitioned_max_hold_ms(value)
             .map_err(|e| format!("{PARTITIONED_MAX_HOLD_MS_FLAG}: {e}"))?;
+    }
+    if let Some(raw) = chunk_interval_raw {
+        let value = parse_strict_decimal(raw)
+            .and_then(|v| u64::try_from(v).ok())
+            .ok_or_else(|| {
+                format!("{PARTITIONED_CHUNK_INTERVAL_MS_FLAG} expects a non-negative integer, got {raw:?}")
+            })?;
+        limits.chunk_interval = engine::sql::parser::validate_partitioned_chunk_interval_ms(value)
+            .map_err(|e| format!("{PARTITIONED_CHUNK_INTERVAL_MS_FLAG}: {e}"))?;
+    }
+    if let Some(raw) = max_run_raw {
+        let value = parse_strict_decimal(raw)
+            .and_then(|v| u64::try_from(v).ok())
+            .ok_or_else(|| {
+                format!("{PARTITIONED_MAX_RUN_MS_FLAG} expects a non-negative integer, got {raw:?}")
+            })?;
+        limits.max_run_time = engine::sql::parser::validate_partitioned_max_run_ms(value)
+            .map_err(|e| format!("{PARTITIONED_MAX_RUN_MS_FLAG}: {e}"))?;
     }
     limits
         .validate()
@@ -298,6 +330,8 @@ mod tests {
                 chunk_rows: Some("10"),
                 scan_budget: Some("20"),
                 max_hold_ms: Some("250"),
+                chunk_interval_ms: Some("30"),
+                max_run_ms: Some("1500"),
                 max_jobs_per_tenant: Some("2"),
                 max_jobs: Some("8"),
                 max_interrupted_records: Some("77"),
@@ -307,6 +341,8 @@ mod tests {
         assert_eq!(l.chunk_rows.get(), 10);
         assert_eq!(l.scan_budget_rows.get(), 20);
         assert_eq!(l.max_writer_hold, std::time::Duration::from_millis(250));
+        assert_eq!(l.chunk_interval, std::time::Duration::from_millis(30));
+        assert_eq!(l.max_run_time, std::time::Duration::from_millis(1500));
         assert_eq!(l.max_jobs_per_tenant.get(), 2);
         assert_eq!(l.max_jobs_total.get(), 8);
         assert_eq!(l.interrupted_record_limit.get(), 77);
@@ -316,7 +352,7 @@ mod tests {
     fn partitioned_limits_reject_out_of_range_and_malformed() {
         let base = PartitionedDmlLimits::default();
         type Set = fn(&mut PartitionedDmlRawFlags<'static>, &'static str);
-        let cases: [(Set, &'static str, &'static str); 18] = [
+        let cases: [(Set, &'static str, &'static str); 28] = [
             (
                 |f, v| f.chunk_rows = Some(v),
                 "0",
@@ -399,6 +435,56 @@ mod tests {
                 "-1",
                 PARTITIONED_MAX_INTERRUPTED_RECORDS_FLAG,
             ),
+            (
+                |f, v| f.chunk_interval_ms = Some(v),
+                "60001",
+                PARTITIONED_CHUNK_INTERVAL_MS_FLAG,
+            ),
+            (
+                |f, v| f.chunk_interval_ms = Some(v),
+                "+5",
+                PARTITIONED_CHUNK_INTERVAL_MS_FLAG,
+            ),
+            (
+                |f, v| f.chunk_interval_ms = Some(v),
+                "abc",
+                PARTITIONED_CHUNK_INTERVAL_MS_FLAG,
+            ),
+            (
+                |f, v| f.chunk_interval_ms = Some(v),
+                "-1",
+                PARTITIONED_CHUNK_INTERVAL_MS_FLAG,
+            ),
+            (
+                |f, v| f.chunk_interval_ms = Some(v),
+                "",
+                PARTITIONED_CHUNK_INTERVAL_MS_FLAG,
+            ),
+            (
+                |f, v| f.max_run_ms = Some(v),
+                "86400001",
+                PARTITIONED_MAX_RUN_MS_FLAG,
+            ),
+            (
+                |f, v| f.max_run_ms = Some(v),
+                " 5",
+                PARTITIONED_MAX_RUN_MS_FLAG,
+            ),
+            (
+                |f, v| f.max_run_ms = Some(v),
+                "x",
+                PARTITIONED_MAX_RUN_MS_FLAG,
+            ),
+            (
+                |f, v| f.max_run_ms = Some(v),
+                "-1",
+                PARTITIONED_MAX_RUN_MS_FLAG,
+            ),
+            (
+                |f, v| f.max_run_ms = Some(v),
+                "18446744073709551616",
+                PARTITIONED_MAX_RUN_MS_FLAG,
+            ),
         ];
         for (set, value, flag) in cases {
             let mut raw = PartitionedDmlRawFlags::default();
@@ -449,10 +535,26 @@ mod tests {
                 chunk_rows: Some("1"),
                 scan_budget: Some("1000000"),
                 max_hold_ms: Some("5000"),
+                chunk_interval_ms: Some("60000"),
+                max_run_ms: Some("86400000"),
                 ..PartitionedDmlRawFlags::default()
             },
         )
         .unwrap();
+        assert_eq!(l.chunk_interval, std::time::Duration::from_millis(60_000));
+        assert_eq!(l.max_run_time, std::time::Duration::from_millis(86_400_000));
+        // 0 は「待たない」「無効」として受理される。
+        let z = resolve_partitioned_dml_limits(
+            PartitionedDmlLimits::default(),
+            PartitionedDmlRawFlags {
+                chunk_interval_ms: Some("0"),
+                max_run_ms: Some("0"),
+                ..PartitionedDmlRawFlags::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(z.chunk_interval, std::time::Duration::ZERO);
+        assert_eq!(z.max_run_time, std::time::Duration::ZERO);
         assert_eq!(l.chunk_rows.get(), 1);
         assert_eq!(l.scan_budget_rows.get(), 1_000_000);
         assert_eq!(l.max_writer_hold, std::time::Duration::from_millis(5000));
