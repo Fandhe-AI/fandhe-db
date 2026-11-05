@@ -3352,6 +3352,9 @@ pub(crate) fn execute_statement_with_cache_observed(
         _ => None,
     };
     let mut postfilter_done = false;
+    // 反復スキャンでは事後フィルタ前の候補件数を各ラウンドで積む（Distance 段の rows_out 用。
+    // Issue #2053。フィルタ後の件数にすると PostFilter 段との差が合わなくなる）。
+    let mut iter_raw_total: usize = 0;
     crate::interrupt::current_deadline().check()?;
     let distance_started = stage_start(&stats);
     let hits: Vec<(u64, f64)> = match iter_cfg {
@@ -3373,7 +3376,17 @@ pub(crate) fn execute_statement_with_cache_observed(
                 let raw = compute_hits(k_round)?;
                 rounds += 1;
                 let raw_len = raw.len();
+                iter_raw_total = iter_raw_total.saturating_add(raw_len);
+                // 反復中の事後フィルタも PostFilter 段として記録する（ラウンドごとに loops を積む）。
+                let postfilter_started = stage_start(&stats);
                 let mut kept = apply_postfilter(raw)?;
+                stage_end(
+                    &mut stats,
+                    ExecStage::PostFilter,
+                    postfilter_started,
+                    kept.len(),
+                    Some(raw_len.saturating_sub(kept.len())),
+                );
                 if kept.len() >= k_eff {
                     kept.truncate(k_eff);
                     break (kept, false);
@@ -3407,7 +3420,11 @@ pub(crate) fn execute_statement_with_cache_observed(
         &mut stats,
         ExecStage::Distance,
         distance_started,
-        hits.len(),
+        if postfilter_done {
+            iter_raw_total
+        } else {
+            hits.len()
+        },
         None,
     );
     // DISTANCE 段の直後の確認点（Issue #1953。上の直前確認と対）。

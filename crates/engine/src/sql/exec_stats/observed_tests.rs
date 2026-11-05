@@ -218,3 +218,58 @@ fn timing_off_has_no_elapsed_and_postfilter_records_removed() {
     assert!(st2.stage(ExecStage::PostFilter).is_none());
     assert!(st2.stage(ExecStage::PrecisionGate).is_none());
 }
+
+/// Issue #2053（PR #2986 指摘）: HNSW 反復スキャンの DISTANCE 先行経路でも、事後フィルタを
+/// PostFilter 段として記録する。Distance の rows_out はフィルタ前の候補件数、PostFilter は
+/// 前後の件数（差が removed）で、`Distance.rows_out == PostFilter.rows_out + removed` が成り立つ。
+#[test]
+fn iterative_scan_records_postfilter_and_prefilter_distance_rows() {
+    let (storage, _g) = fixture("exec-stats-iter", 3);
+    let cache = crate::sql::hnsw_cache::HnswIndexCache::new();
+    let gate_cache = crate::catalog::IndexCatalogGateCache::new();
+    let access = crate::sql::hnsw_cache::HnswCacheAccess {
+        storage: &storage,
+        cache: &cache,
+        provider: crate::hnsw::HnswSearchProvider::new(crate::hnsw::ValidatedHnswParams::default()),
+        index_gate_cache: &gate_cache,
+        hnsw_scope: crate::search_engine::HnswScope::All,
+        graph_metric: None,
+        build_options: None,
+    };
+    let sql = KERNEL_SQLS[2];
+    // fixture の行は Private のため、Private 可視の主体で流す。
+    let ctx =
+        PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+            .expect("tenant");
+    let Statement::Select(v) = validate_sql(sql, &storage).expect("valid") else {
+        panic!("expected Select");
+    };
+    let schema = schema();
+    let bound = crate::sql::parser::bind(&v, &schema).expect("bind");
+    let read_txn = storage.db().begin_read().expect("read");
+    let mut st = ExecStats::new(false);
+    crate::sql::exec::execute_statement_with_cache_observed(
+        &read_txn,
+        &crate::kernel::CpuScalarProvider,
+        &ctx,
+        &schema,
+        &bound,
+        &crate::precision::PrecisionPolicy::default(),
+        None,
+        None,
+        Some(access),
+        None,
+        Some(&mut st),
+    )
+    .expect("execute");
+    let d = st.stage(ExecStage::Distance).expect("distance");
+    let p = st.stage(ExecStage::PostFilter).expect("postfilter");
+    assert!(p.loops >= 1);
+    assert_eq!(
+        d.rows_out,
+        p.rows_out + p.rows_removed_by_filter.expect("removed")
+    );
+    // 目標 3 件に対し、初回 3 件取得（x 2 件）→ 倍の 6 件で再探索（x 3 件）の 2 ラウンド。
+    // 段の値はラウンドの合計（候補 3+6、フィルタ後 2+3）。
+    assert_eq!((p.loops, d.rows_out, p.rows_out), (2, 9, 5));
+}
