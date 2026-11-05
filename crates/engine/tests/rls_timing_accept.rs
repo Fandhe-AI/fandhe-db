@@ -201,3 +201,247 @@ fn json_roundtrips_with_raw_samples_and_no_paths() {
         .and_then(|n| n.as_f64());
     assert_eq!(pooled_n, Some(20.0));
 }
+// ---------------------------------------------------------------------
+// 判定ロジック（Issue #2080）。合成データで時間非依存に検証する。
+// ---------------------------------------------------------------------
+
+fn q_of(p50: u64, p95: u64, p99: u64) -> Quantiles {
+    Quantiles {
+        p50_ns: p50,
+        p95_ns: p95,
+        p99_ns: p99,
+        n: 100,
+    }
+}
+
+fn row(shape: Shape, arm: Arm, pooled: Quantiles, rounds: &[Quantiles]) -> SummaryRow {
+    SummaryRow {
+        shape,
+        arm,
+        pooled,
+        per_round: rounds
+            .iter()
+            .enumerate()
+            .map(|(i, q)| (i as u32, *q))
+            .collect(),
+    }
+}
+
+fn flat(q: Quantiles) -> Vec<Quantiles> {
+    vec![q; 5]
+}
+
+fn pair(base: Quantiles, flood: Quantiles) -> Vec<SummaryRow> {
+    vec![
+        row(Shape::Normal, Arm::Baseline, base, &flat(base)),
+        row(Shape::Normal, Arm::Flooded, flood, &flat(flood)),
+    ]
+}
+
+#[test]
+fn relative_diff_is_symmetric_and_zero_safe() {
+    assert_eq!(relative_diff(0, 0), 0.0);
+    assert_eq!(relative_diff(90, 100), relative_diff(100, 90));
+    assert_eq!(relative_diff(90, 100), 0.1);
+    assert_eq!(relative_diff(0, 5), 1.0);
+}
+
+#[test]
+fn aa_band_is_full_width_over_min_and_infinite_on_zero() {
+    assert_eq!(aa_band(&[100, 120, 110]), 0.2);
+    assert_eq!(aa_band(&[100, 100]), 0.0);
+    assert_eq!(aa_band(&[0, 10]), f64::INFINITY);
+    assert_eq!(aa_band(&[]), f64::INFINITY);
+}
+
+#[test]
+fn identical_distributions_are_indistinguishable() {
+    let q = q_of(1000, 2000, 3000);
+    let j = judge_rows(&pair(q, q)).expect("judge");
+    assert_eq!(j[0].verdict, Verdict::Indistinguishable);
+    assert_eq!(overall(&j), Verdict::Indistinguishable);
+    assert!(render_overall_line(&j).starts_with("rls_timing overall=pass"));
+}
+
+#[test]
+fn slow_p95_only_is_distinguishable_with_reason() {
+    let base = q_of(1000, 2000, 3000);
+    let flood = q_of(1000, 3000, 3000);
+    let j = judge_rows(&pair(base, flood)).expect("judge");
+    assert_eq!(j[0].verdict, Verdict::Distinguishable);
+    let p95 = j[0]
+        .quantiles
+        .iter()
+        .find(|x| x.quantile == Quantile::P95)
+        .expect("p95");
+    assert_eq!(p95.verdict, Verdict::Distinguishable);
+    assert_eq!(overall(&j), Verdict::Distinguishable);
+    let line = render_overall_line(&j);
+    assert!(line.starts_with("rls_timing overall=fail") && line.contains("normal:p95:"));
+}
+
+#[test]
+fn boundary_delta_equal_to_band_is_indistinguishable() {
+    // delta = 10/100 = 0.10 = 固定帯（p95）。厳密に超えた場合だけ区別可能。
+    let at = judge_rows(&pair(q_of(100, 90, 100), q_of(100, 100, 100))).expect("judge");
+    assert_eq!(at[0].verdict, Verdict::Indistinguishable);
+    let over = judge_rows(&pair(q_of(100, 89, 100), q_of(100, 100, 100))).expect("judge");
+    assert_eq!(over[0].verdict, Verdict::Distinguishable);
+}
+
+#[test]
+fn wide_aa_band_widens_threshold_and_cap_makes_it_inconclusive() {
+    // aa(p95) = 0.2 <= cap 0.5 のため許容幅は max(0.10, 0.2) = 0.2。delta 0.15 は区別不能。
+    let base_rounds = vec![q_of(1000, 1000, 3000), q_of(1000, 1200, 3000)];
+    let rows = vec![
+        row(
+            Shape::Normal,
+            Arm::Baseline,
+            q_of(1000, 1000, 3000),
+            &base_rounds,
+        ),
+        row(
+            Shape::Normal,
+            Arm::Flooded,
+            q_of(1000, 850, 3000),
+            &flat(q_of(1000, 850, 3000)),
+        ),
+    ];
+    let j = judge_rows(&rows).expect("judge");
+    assert_eq!(j[0].verdict, Verdict::Indistinguishable);
+    // aa = 1.0 > cap 0.5 は判定不能。
+    let noisy = vec![q_of(1000, 1000, 3000), q_of(1000, 2000, 3000)];
+    let rows = vec![
+        row(Shape::Normal, Arm::Baseline, q_of(1000, 1000, 3000), &noisy),
+        row(
+            Shape::Normal,
+            Arm::Flooded,
+            q_of(1000, 1000, 3000),
+            &flat(q_of(1000, 1000, 3000)),
+        ),
+    ];
+    let j = judge_rows(&rows).expect("judge");
+    assert_eq!(j[0].verdict, Verdict::Inconclusive);
+}
+
+#[test]
+fn inconclusive_beats_distinguishable_and_overall_needs_all_pass() {
+    // p50 は判定不能（aa 超過）、p95 は区別可能 → 形状は Inconclusive。
+    let noisy = vec![q_of(1000, 2000, 3000), q_of(2000, 2000, 3000)];
+    let rows = vec![
+        row(Shape::Normal, Arm::Baseline, q_of(1000, 2000, 3000), &noisy),
+        row(
+            Shape::Normal,
+            Arm::Flooded,
+            q_of(1000, 4000, 3000),
+            &flat(q_of(1000, 4000, 3000)),
+        ),
+    ];
+    let j = judge_rows(&rows).expect("judge");
+    assert_eq!(j[0].verdict, Verdict::Inconclusive);
+    assert_eq!(overall(&j), Verdict::Inconclusive);
+    // 形状が無ければ pass にしない。
+    assert_eq!(overall(&[]), Verdict::Inconclusive);
+    // 1 形状でも区別可能なら全体は pass にならない。
+    let q = q_of(1000, 2000, 3000);
+    let mut rows = pair(q, q);
+    rows.push(row(Shape::UniqueViolation, Arm::Baseline, q, &flat(q)));
+    rows.push(row(
+        Shape::UniqueViolation,
+        Arm::Flooded,
+        q_of(1000, 9000, 3000),
+        &flat(q_of(1000, 9000, 3000)),
+    ));
+    let j = judge_rows(&rows).expect("judge");
+    assert_eq!(overall(&j), Verdict::Distinguishable);
+}
+
+#[test]
+fn judge_rows_rejects_missing_arm() {
+    let q = q_of(1, 2, 3);
+    let rows = vec![row(Shape::Normal, Arm::Baseline, q, &flat(q))];
+    assert!(matches!(
+        judge_rows(&rows),
+        Err(RlsTimingError::MissingSummary(_))
+    ));
+}
+
+fn test_env() -> EnvInfo {
+    EnvInfo {
+        os: "linux".into(),
+        arch: "x86_64".into(),
+        logical_cpus: 8,
+        isa: "Avx2".into(),
+        loadavg: "0".into(),
+        dedicated_env_attested: false,
+        github_actions: false,
+        git_commit: None,
+    }
+}
+
+#[test]
+fn raw_json_roundtrip_matches_in_memory_summary() {
+    let rounds = sample_rounds();
+    let json = render_json(&test_env(), 10, &[Shape::Normal], &rounds).expect("json");
+    let (shapes, back) = parse_raw_rounds(&json).expect("parse raw");
+    assert_eq!(shapes, vec![Shape::Normal]);
+    let a = summarize(&rounds, &[Shape::Normal]).expect("a");
+    let b = summarize(&back, &shapes).expect("b");
+    assert_eq!(a.len(), b.len());
+    for (x, y) in a.iter().zip(b.iter()) {
+        assert_eq!((x.shape, x.arm, x.pooled), (y.shape, y.arm, y.pooled));
+        assert_eq!(x.per_round, y.per_round);
+    }
+}
+
+#[test]
+fn parse_raw_rounds_fails_closed() {
+    let json = render_json(&test_env(), 10, &[Shape::Normal], &sample_rounds()).expect("json");
+    let bad = |from: &str, to: &str| {
+        assert!(json.contains(from), "{from}");
+        assert!(
+            parse_raw_rounds(&json.replacen(from, to, 1)).is_err(),
+            "{to}"
+        );
+    };
+    bad("\"schema_version\":1", "\"schema_version\":2");
+    bad("\"quantile_method\"", "\"quantile_methodx\"");
+    bad("\"samples_ns\":[1,", "\"samples_ns\":[-1,");
+    bad("\"samples_ns\":[1,", "\"samples_ns\":[1.5,");
+    bad("\"samples_ns\":[1,", "\"samples_ns\":[\"x\",");
+    bad("\"shape\":\"normal\"", "\"shape\":\"bogus\"");
+    bad("\"arm\":\"baseline\"", "\"arm\":\"bogus\"");
+    bad("\"mismatches\":0", "\"mismatches\":1");
+    // 同じ arm が 2 回 → 重複セル（かつ flooded セル欠落）。
+    bad("\"arm\":\"flooded\"", "\"arm\":\"baseline\"");
+    // 宣言件数と実データの不一致（データ欠落）は拒否される。
+    let declared = format!("\"rounds\":{},", sample_rounds().len());
+    bad(&declared, "\"rounds\":99,");
+    bad("\"measured\":10", "\"measured\":11");
+    assert!(parse_raw_rounds("").is_err());
+    assert!(parse_raw_rounds("{").is_err());
+    assert!(parse_raw_rounds("{\"schema_version\":1}").is_err());
+    let empty = json.replacen(
+        "\"samples_ns\":[1,2,3,4,5,6,7,8,9,10]",
+        "\"samples_ns\":[]",
+        1,
+    );
+    assert!(parse_raw_rounds(&empty).is_err());
+}
+
+#[test]
+fn raw_input_limit_covers_max_measurement_output() {
+    // 最大設定の出力量（ROUNDS=50・ITERS=20000・全形状・両 arm）が既定の 4 MiB を超えても、
+    // 再判定の有限上限が最悪桁数のサンプル列を収められることを固定する。
+    const { assert!(RAW_MAX_INPUT_BYTES > 4 * 1024 * 1024) };
+    assert_eq!(MAX_RAW_SAMPLES, 50 * 20_000 * 6);
+    const { assert!(RAW_MAX_INPUT_BYTES >= MAX_RAW_SAMPLES * "18446744073709551615,".len()) };
+    // 4 MiB 超の入力が上限検査で拒否されず、構文／検証段（Err でも可）まで進む。
+    let big = format!("{{\"x\":\"{}\"}}", "a".repeat(5 * 1024 * 1024));
+    let err = parse_raw_rounds(&big).expect_err("invalid raw");
+    assert!(!format!("{err:?}").contains("exceeds"), "{err:?}");
+    // 有限上限を超える入力は拒否される。
+    let huge = "a".repeat(RAW_MAX_INPUT_BYTES + 1);
+    let err = parse_raw_rounds(&huge).expect_err("too large");
+    assert!(format!("{err:?}").contains("exceeds"), "{err:?}");
+}

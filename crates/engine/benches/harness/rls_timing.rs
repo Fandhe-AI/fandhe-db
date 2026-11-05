@@ -7,13 +7,15 @@
 //! 呼び出し元は `rls_timing_bench.rs`（実測）と `tests/rls_timing_accept.rs`（`cargo test` での
 //! 回帰検証）。`engine` には依存せず、エンジン呼び出し（seed 投入・SQL 実行）はベンチ側が担う。
 //!
-//! 判定基準（分位点差の上限）・実測値の記録・CI 配線は本モジュールの責務外（Issue #2080）。
-//! spec 由来の閾値は一切持たず、pass/fail 判定もしない。
+//! Issue #2080 で、(shape, arm) 要約から分位点差の判定（`judge_rows`・`overall`）と、生 JSON
+//! （`raw.json`）を読み戻して `Round` 列を復元する `parse_raw_rounds`（再判定の入口）を加えた。
+//! 判定基準は本リポで決めた公開値（固定帯・A/A 帯上限。`docs/design/rls-timing-bench.md`）で、
+//! spec 由来の閾値は持たない。判定は参考値であり、終了コードへは反映しない（呼び出し元の責務）。
 
 use std::fmt;
 use std::time::Duration;
 
-use super::chip::json_escape;
+use super::chip::{json_escape, parse_json_with_limit, JsonValue};
 use super::relational_p95::quantile_nearest_rank;
 
 pub const MIN_ROUNDS: u32 = 5;
@@ -22,6 +24,12 @@ pub const DEFAULT_ROUNDS: u32 = 5;
 pub const MIN_ITERS: u32 = 200;
 pub const MAX_ITERS: u32 = 20_000;
 pub const DEFAULT_ITERS: u32 = 1_000;
+/// 全形状（3）x arm（2）で計測した場合の最大サンプル数（MAX_ROUNDS x MAX_ITERS x 6）。
+pub const MAX_RAW_SAMPLES: usize = MAX_ROUNDS as usize * MAX_ITERS as usize * 6;
+/// 再判定入力（`raw.json`）の長さ上限。サンプル 1 件を区切り込みで最大 22 バイト
+/// （u64 の 20 桁 + `, `）と見積もり、構造部分の余裕 1 MiB を足す。
+/// 正常設定（ROUNDS=50・ITERS=20000・全形状）で生成した出力を必ず読み戻せる有限上限。
+pub const RAW_MAX_INPUT_BYTES: usize = MAX_RAW_SAMPLES * 22 + 1024 * 1024;
 /// 各 (shape, arm) の warmup 回数（計測プロトコルの下限）。
 pub const WARMUP: u32 = 20;
 /// 計測入力は決定的（乱数を使わない）。プロトコルが要求する固定シード。
@@ -46,6 +54,10 @@ pub enum RlsTimingError {
     EmptySamples,
     /// `GITHUB_ACTIONS` 下で専有環境を申告する矛盾した設定。
     ContradictoryEnv,
+    /// 生 JSON の読み戻しに失敗した（構文・スキーマ・値域の違反）。
+    InvalidRaw(String),
+    /// 判定に必要な (shape, arm) の要約が揃っていない。
+    MissingSummary(String),
 }
 
 impl fmt::Display for RlsTimingError {
@@ -55,6 +67,8 @@ impl fmt::Display for RlsTimingError {
             Self::InvalidIters(m) => write!(f, "invalid BENCH_RLS_TIMING_ITERS: {m}"),
             Self::InvalidShapes(m) => write!(f, "invalid BENCH_RLS_TIMING_SHAPES: {m}"),
             Self::EmptySamples => write!(f, "empty sample set"),
+            Self::InvalidRaw(m) => write!(f, "invalid raw json: {m}"),
+            Self::MissingSummary(m) => write!(f, "missing summary: {m}"),
             Self::ContradictoryEnv => write!(
                 f,
                 "BENCH_DEDICATED_ENV=1 under GITHUB_ACTIONS is contradictory (hosted runners are not dedicated)"
@@ -494,4 +508,411 @@ pub fn render_json(
     }
     s.push_str("]}\n");
     Ok(s)
+}
+// ---------------------------------------------------------------------
+// 判定（Issue #2080）
+// ---------------------------------------------------------------------
+
+/// 固定相対帯（p50）。`benchmark-judgement-policy.md` §4・Issue #401 の継承値。
+pub const FIXED_BAND_P50: f64 = 0.05;
+/// 固定相対帯（p95・p99）。
+pub const FIXED_BAND_TAIL: f64 = 0.10;
+/// A/A 帯の上限（p50）。超過は同一 arm 内のノイズが大きすぎて判定に使えない。
+pub const AA_BAND_CAP_P50: f64 = 0.25;
+/// A/A 帯の上限（p95・p99）。
+pub const AA_BAND_CAP_TAIL: f64 = 0.50;
+
+/// 判定対象の分位点。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Quantile {
+    P50,
+    P95,
+    P99,
+}
+
+pub const ALL_QUANTILES: [Quantile; 3] = [Quantile::P50, Quantile::P95, Quantile::P99];
+
+impl Quantile {
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::P50 => "p50",
+            Self::P95 => "p95",
+            Self::P99 => "p99",
+        }
+    }
+
+    pub fn pick(self, q: &Quantiles) -> u64 {
+        match self {
+            Self::P50 => q.p50_ns,
+            Self::P95 => q.p95_ns,
+            Self::P99 => q.p99_ns,
+        }
+    }
+
+    pub fn fixed_band(self) -> f64 {
+        match self {
+            Self::P50 => FIXED_BAND_P50,
+            _ => FIXED_BAND_TAIL,
+        }
+    }
+
+    pub fn aa_cap(self) -> f64 {
+        match self {
+            Self::P50 => AA_BAND_CAP_P50,
+            _ => AA_BAND_CAP_TAIL,
+        }
+    }
+}
+
+/// 判定結果。集約時の優先は `Inconclusive` ＞ `Distinguishable` ＞ `Indistinguishable`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    Indistinguishable,
+    Distinguishable,
+    Inconclusive,
+}
+
+impl Verdict {
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::Indistinguishable => "indistinguishable",
+            Self::Distinguishable => "distinguishable",
+            Self::Inconclusive => "inconclusive",
+        }
+    }
+
+    fn rank(self) -> u8 {
+        match self {
+            Self::Indistinguishable => 0,
+            Self::Distinguishable => 1,
+            Self::Inconclusive => 2,
+        }
+    }
+
+    /// 優先順位の高い方を返す。
+    pub fn merge(self, other: Self) -> Self {
+        if other.rank() > self.rank() {
+            other
+        } else {
+            self
+        }
+    }
+}
+
+/// 対称相対差 `|a-b| / max(a,b)`（引数の順序に依存しない。両方 0 なら 0）。
+pub fn relative_diff(a: u64, b: u64) -> f64 {
+    let hi = a.max(b);
+    if hi == 0 {
+        return 0.0;
+    }
+    (hi - a.min(b)) as f64 / hi as f64
+}
+
+/// 同一 arm のラウンド別分位点の run-to-run 全幅 `(max-min)/min`（`policy` §4 の参照区間と同式）。
+/// ラウンドが無い・最小値が 0 の場合は `+inf`（fail-closed で判定不能へ倒す）。
+pub fn aa_band(per_round: &[u64]) -> f64 {
+    let (Some(&min), Some(&max)) = (per_round.iter().min(), per_round.iter().max()) else {
+        return f64::INFINITY;
+    };
+    if min == 0 {
+        return f64::INFINITY;
+    }
+    (max - min) as f64 / min as f64
+}
+
+/// 1 分位点の判定内訳。
+#[derive(Debug, Clone, Copy)]
+pub struct QuantileJudgement {
+    pub quantile: Quantile,
+    pub baseline_ns: u64,
+    pub flooded_ns: u64,
+    pub delta: f64,
+    pub aa: f64,
+    pub fixed_band: f64,
+    pub aa_cap: f64,
+    pub verdict: Verdict,
+}
+
+/// 1 形状の判定（3 分位点の内訳と集約結果）。
+#[derive(Debug, Clone)]
+pub struct ShapeJudgement {
+    pub shape: Shape,
+    pub quantiles: Vec<QuantileJudgement>,
+    pub verdict: Verdict,
+}
+
+/// 1 分位点を判定する。`aa > cap` なら判定不能、`delta > max(固定帯, aa)` なら区別可能。
+pub fn judge_quantile(q: Quantile, base: &SummaryRow, flood: &SummaryRow) -> QuantileJudgement {
+    let b = q.pick(&base.pooled);
+    let f = q.pick(&flood.pooled);
+    let rounds =
+        |row: &SummaryRow| -> Vec<u64> { row.per_round.iter().map(|(_, x)| q.pick(x)).collect() };
+    let (ab, af) = (aa_band(&rounds(base)), aa_band(&rounds(flood)));
+    let aa = if ab >= af { ab } else { af };
+    let delta = relative_diff(b, f);
+    let (fixed_band, aa_cap) = (q.fixed_band(), q.aa_cap());
+    let verdict = if aa > aa_cap {
+        Verdict::Inconclusive
+    } else if delta > fixed_band.max(aa) {
+        Verdict::Distinguishable
+    } else {
+        Verdict::Indistinguishable
+    };
+    QuantileJudgement {
+        quantile: q,
+        baseline_ns: b,
+        flooded_ns: f,
+        delta,
+        aa,
+        fixed_band,
+        aa_cap,
+        verdict,
+    }
+}
+
+/// `summarize` の出力を形状ごとに判定する。baseline／flooded のどちらかが欠ければ拒否する。
+pub fn judge_rows(rows: &[SummaryRow]) -> Result<Vec<ShapeJudgement>, RlsTimingError> {
+    let mut shapes: Vec<Shape> = Vec::new();
+    for r in rows {
+        if !shapes.contains(&r.shape) {
+            shapes.push(r.shape);
+        }
+    }
+    let mut out = Vec::new();
+    for shape in shapes {
+        let find = |arm: Arm| {
+            rows.iter()
+                .find(|r| r.shape == shape && r.arm == arm)
+                .ok_or_else(|| {
+                    RlsTimingError::MissingSummary(format!(
+                        "shape={} arm={}",
+                        shape.token(),
+                        arm.token()
+                    ))
+                })
+        };
+        let (base, flood) = (find(Arm::Baseline)?, find(Arm::Flooded)?);
+        let quantiles: Vec<QuantileJudgement> = ALL_QUANTILES
+            .iter()
+            .map(|&q| judge_quantile(q, base, flood))
+            .collect();
+        let verdict = quantiles
+            .iter()
+            .fold(Verdict::Indistinguishable, |acc, j| acc.merge(j.verdict));
+        out.push(ShapeJudgement {
+            shape,
+            quantiles,
+            verdict,
+        });
+    }
+    Ok(out)
+}
+
+/// 全体の判定。形状が無い場合は判定不能（pass にしない）。全形状が区別不能のときだけ
+/// `Indistinguishable`（= pass）。
+pub fn overall(judgements: &[ShapeJudgement]) -> Verdict {
+    if judgements.is_empty() {
+        return Verdict::Inconclusive;
+    }
+    judgements
+        .iter()
+        .fold(Verdict::Indistinguishable, |acc, j| acc.merge(j.verdict))
+}
+
+/// 全体判定の標準出力用 1 行（`pass`／`fail` と理由。reason は区別可能・判定不能の形状と分位点）。
+pub fn render_overall_line(judgements: &[ShapeJudgement]) -> String {
+    let v = overall(judgements);
+    let mut reasons: Vec<String> = Vec::new();
+    for j in judgements {
+        for qj in &j.quantiles {
+            if qj.verdict != Verdict::Indistinguishable {
+                reasons.push(format!(
+                    "{}:{}:{}",
+                    j.shape.token(),
+                    qj.quantile.token(),
+                    qj.verdict.token()
+                ));
+            }
+        }
+    }
+    let reason = if v == Verdict::Indistinguishable {
+        "all_indistinguishable".to_string()
+    } else if reasons.is_empty() {
+        "no_shapes".to_string()
+    } else {
+        reasons.join(",")
+    };
+    let word = if v == Verdict::Indistinguishable {
+        "pass"
+    } else {
+        "fail"
+    };
+    format!(
+        "rls_timing overall={word} verdict={} reason={reason}",
+        v.token()
+    )
+}
+
+/// 分位点ごとの判定 1 行（単位 µs・比は小数 3 桁）。
+pub fn render_verdict_line(shape: Shape, j: &QuantileJudgement) -> String {
+    let us = |ns: u64| ns as f64 / 1000.0;
+    format!(
+        "rls_timing verdict shape={} q={} baseline_us={:.1} flooded_us={:.1} delta={:.3} \
+         aa={:.3} fixed_band={:.2} aa_cap={:.2} result={}",
+        shape.token(),
+        j.quantile.token(),
+        us(j.baseline_ns),
+        us(j.flooded_ns),
+        j.delta,
+        j.aa,
+        j.fixed_band,
+        j.aa_cap,
+        j.verdict.token()
+    )
+}
+
+// ---------------------------------------------------------------------
+// 生 JSON の読み戻し（再判定の入口。入力は untrusted として検証する）
+// ---------------------------------------------------------------------
+
+fn raw_err<T>(msg: impl Into<String>) -> Result<T, RlsTimingError> {
+    Err(RlsTimingError::InvalidRaw(msg.into()))
+}
+
+/// JSON 数値を非負整数（2^53 未満）として取り出す。
+fn as_uint(v: &JsonValue, what: &str) -> Result<u64, RlsTimingError> {
+    let Some(n) = v.as_f64() else {
+        return raw_err(format!("{what} is not a number"));
+    };
+    if !n.is_finite() || n < 0.0 || n.fract() != 0.0 || n >= 9_007_199_254_740_992.0 {
+        return raw_err(format!("{what} is not a non-negative integer"));
+    }
+    Ok(n as u64)
+}
+
+fn field<'a>(v: &'a JsonValue, key: &str) -> Result<&'a JsonValue, RlsTimingError> {
+    v.get(key)
+        .map_or_else(|| raw_err(format!("missing key {key:?}")), Ok)
+}
+
+fn str_field<'a>(v: &'a JsonValue, key: &str) -> Result<&'a str, RlsTimingError> {
+    field(v, key)?
+        .as_str()
+        .map_or_else(|| raw_err(format!("{key:?} is not a string")), Ok)
+}
+
+fn array_field<'a>(v: &'a JsonValue, key: &str) -> Result<&'a [JsonValue], RlsTimingError> {
+    field(v, key)?
+        .as_array()
+        .map_or_else(|| raw_err(format!("{key:?} is not an array")), Ok)
+}
+
+fn shape_of(token: &str) -> Result<Shape, RlsTimingError> {
+    ALL_SHAPES
+        .iter()
+        .copied()
+        .find(|s| s.token() == token)
+        .map_or_else(|| raw_err(format!("unknown shape {token:?}")), Ok)
+}
+
+fn arm_of(token: &str) -> Result<Arm, RlsTimingError> {
+    ALL_ARMS
+        .iter()
+        .copied()
+        .find(|a| a.token() == token)
+        .map_or_else(|| raw_err(format!("unknown arm {token:?}")), Ok)
+}
+
+/// `render_json` が書いた `raw.json` を読み戻し、計測した形状と `Round` 列を復元する。
+/// `schema_version`・`quantile_method`・形状／arm の語彙・サンプルの値域（非負整数・非空）・
+/// ラウンドごとの全 (shape, arm) セルの存在と重複・`mismatches == 0` を検証し、外れれば拒否する。
+/// 入力長の上限は `RAW_MAX_INPUT_BYTES`（`parse_json_with_limit` 経由）が課す（呼び出し側も読み込み前に同じ上限で検査する）。
+pub fn parse_raw_rounds(text: &str) -> Result<(Vec<Shape>, Vec<Round>), RlsTimingError> {
+    let root = parse_json_with_limit(text, RAW_MAX_INPUT_BYTES)
+        .map_err(|e| RlsTimingError::InvalidRaw(format!("{e:?}")))?;
+    if as_uint(field(&root, "schema_version")?, "schema_version")? != 1 {
+        return raw_err("unsupported schema_version");
+    }
+    if str_field(&root, "quantile_method")? != "nearest_rank" {
+        return raw_err("unsupported quantile_method");
+    }
+    let config = field(&root, "config")?;
+    let mut shapes: Vec<Shape> = Vec::new();
+    for t in array_field(config, "shapes")? {
+        let Some(tok) = t.as_str() else {
+            return raw_err("config.shapes entry is not a string");
+        };
+        let shape = shape_of(tok)?;
+        if shapes.contains(&shape) {
+            return raw_err(format!("duplicate shape {tok:?}"));
+        }
+        shapes.push(shape);
+    }
+    if shapes.is_empty() {
+        return raw_err("config.shapes is empty");
+    }
+    let raw_rounds = array_field(&root, "rounds")?;
+    if raw_rounds.is_empty() {
+        return raw_err("rounds is empty");
+    }
+    // 宣言された rounds／measured と実データを照合し、データ欠落入力の誤 pass を防ぐ。
+    let declared_rounds = as_uint(field(config, "rounds")?, "config.rounds")?;
+    if declared_rounds != raw_rounds.len() as u64 {
+        return raw_err("config.rounds does not match the number of rounds");
+    }
+    let declared_measured = as_uint(field(config, "measured")?, "config.measured")?;
+    let mut rounds: Vec<Round> = Vec::new();
+    for rr in raw_rounds {
+        let index = u32::try_from(as_uint(field(rr, "round")?, "round")?)
+            .map_err(|_| RlsTimingError::InvalidRaw("round index out of range".into()))?;
+        if rounds.iter().any(|r| r.index == index) {
+            return raw_err(format!("duplicate round {index}"));
+        }
+        let mut cells: Vec<Cell> = Vec::new();
+        for c in array_field(rr, "cells")? {
+            let shape = shape_of(str_field(c, "shape")?)?;
+            let arm = arm_of(str_field(c, "arm")?)?;
+            if !shapes.contains(&shape) {
+                return raw_err("cell shape is not in config.shapes");
+            }
+            if cells.iter().any(|x| x.shape == shape && x.arm == arm) {
+                return raw_err("duplicate cell in a round");
+            }
+            let mismatches = u32::try_from(as_uint(field(c, "mismatches")?, "mismatches")?)
+                .map_err(|_| RlsTimingError::InvalidRaw("mismatches out of range".into()))?;
+            if mismatches != 0 {
+                return raw_err("cell has mismatched responses");
+            }
+            let raw_samples = array_field(c, "samples_ns")?;
+            if raw_samples.is_empty() {
+                return raw_err("samples_ns is empty");
+            }
+            if raw_samples.len() as u64 != declared_measured {
+                return raw_err("samples_ns length does not match config.measured");
+            }
+            let mut samples = Vec::new();
+            for s in raw_samples {
+                samples.push(Duration::from_nanos(as_uint(s, "samples_ns entry")?));
+            }
+            cells.push(Cell {
+                shape,
+                arm,
+                mismatches,
+                samples,
+            });
+        }
+        for &shape in &shapes {
+            for arm in ALL_ARMS {
+                if !cells.iter().any(|x| x.shape == shape && x.arm == arm) {
+                    return raw_err(format!(
+                        "round {index} lacks cell shape={} arm={}",
+                        shape.token(),
+                        arm.token()
+                    ));
+                }
+            }
+        }
+        rounds.push(Round { index, cells });
+    }
+    Ok((shapes, rounds))
 }

@@ -155,7 +155,7 @@ JSON キー・ヘッダ（`tenant`／`tenant-id`／`tenantid` 相当。`x-` 接�
    トランザクション制御を含む）
 6. op 別スキーマ検証（必須キー欠落・未知キー・型不一致・`null` は `42601`）
 7. `Idempotency-Key` ヘッダの解決（重複は `08P01`、空・256 バイト超・制御文字は `42601`。
-   `insert`／`update`／`delete` 以外の op に付いていれば `42601`。engine 呼び出し前に返る）
+   `insert`／`upsert`／`update`／`delete` 以外の op に付いていれば `42601`。engine 呼び出し前に返る）
 8. op 別の意味検証・実行（`search` は `explain: true` を通常実行より先に判定）
 
 `Idempotency-Key` ヘッダは書き込み op（`insert`／`upsert`／`update`／`delete`。単一行形・述語形・分割実行を
@@ -551,25 +551,42 @@ OFFSET ...` と同じ対象名解決・実行器を共有。第 2 の実行器�
 
 ### `upsert`
 
-`insert` に衝突時の動作（`on_conflict`）を加えた op（NOSQL-1・NOSQL-21。Issue #2086）。
-**実行は結線済み**（Issue #2087）。SQL 表層の `INSERT ... ON CONFLICT` と同じ束縛関数・実行器を通り、
-成功時の応答は `{"upserted": n}`（`n` は SQL の `INSERT 0 n` と同じ値＝挿入件数＋更新件数。`operation_id` を
-指定したときは `"operation_id"` キーが付く）。`Idempotency-Key` ヘッダも `insert` と同じく受け付ける。
-応答例・エラー一覧・RLS の本格記述は Issue #2088 で追記する。現状の解釈: `rows` のキー集合は全行で一致すること、
-`do` は `"nothing"`／`"update"` のみ、`set` は `EXCLUDED` で更新する列名（`"update"` で省略時は rows のキーから
-`on_conflict.columns` と `id` を除いた列）。
+`insert` に衝突時の動作（`on_conflict`）を加えた op（NOSQL-1・NOSQL-21。Issue #2086・#2087・#2088）。
+SQL 表層の `INSERT ... ON CONFLICT`（SQL-20・SQL-49）と同じ束縛関数・同じ実行器を通る（第 2 の実行器・
+独自の衝突判定は無く、SQL テキストも生成しない）。`operation_id` の供給・台帳照合は `insert` と同じ
+（RECOVER-11）で、`Idempotency-Key` ヘッダも受け付ける（HTTP-14）。テナントはセッションからのみ導出し、
+JSON・ヘッダでの自己申告は `42601`。
 
 | キー | 必須 | 型 | 備考 |
 | --- | --- | --- | --- |
 | `op` | ○ | string | `"upsert"` |
 | `table` | ○ | string | |
-| `rows` | ○ | object[] | `insert` と同じ形（全行のキー集合は一致すること） |
-| `on_conflict` | ○ | object | `columns`（○・string[]）・`do`（○・string）・`set`（△・string[]）の 3 キーのみ。未知キー（制約名・式・`WHERE` 相当を含む）は `42601` |
-| `operation_id` | △ | string | `insert` と同じ扱い（欠落・`null` 可） |
+| `rows` | ○ | object[] | `insert` と同じ形で、各値の型の規則も同じ。全行のキー集合（`id` を含む）が一致すること（不一致と空配列は `22000`） |
+| `on_conflict` | ○ | object | `columns`（○）・`do`（○）・`set`（△）の 3 キーのみ。未知キー（制約名・式・`WHERE` 相当を含む）は `42601` |
+| `on_conflict.columns` | ○ | string[] | 衝突対象。非空・重複なし（空・重複は `42601`）。主キーまたは UNIQUE 制約のいずれかと一致すること。疑似列 `id` の表は `(id)` のみ。一致しない対象は `42P10` |
+| `on_conflict.do` | ○ | string | `"nothing"`／`"update"` の完全一致のみ。大文字や語彙外は `42601` |
+| `on_conflict.set` | △ | string[] | `do: "update"` で更新する列名。各列を `EXCLUDED.<col>` で更新する。`"nothing"` との併用と空配列は `42601`。省略時は「`rows` のキー − `columns` − `id`」を更新し、結果が空なら `42601`。表の全列を採らないのは、要求に含めていない列を既定値や NULL で上書きしないため |
+| `operation_id` | △ | string | `insert` と同じ扱い（欠落・`null` 可）。`Idempotency-Key` ヘッダでも指定できる |
 
 `mode`／`chunk`／`returning` は宣言していないため未知キーとして `42601`。型不一致（`null` を含む）・必須キー欠落も `42601`。
 
-要求例:
+要求例（衝突した行は何もしない）:
+
+```json
+{"op": "upsert", "table": "docs",
+ "rows": [{"id": 1, "lang": "en"}, {"id": 2, "lang": "ja"}],
+ "on_conflict": {"columns": ["id"], "do": "nothing"}}
+```
+
+要求例（`set` を省略。`lang` だけが `EXCLUDED.lang` で更新される）:
+
+```json
+{"op": "upsert", "table": "docs",
+ "rows": [{"id": 1, "lang": "en"}],
+ "on_conflict": {"columns": ["id"], "do": "update"}}
+```
+
+要求例（`set` を明示し、`operation_id` を付ける）:
 
 ```json
 {"op": "upsert", "table": "docs",
@@ -578,7 +595,35 @@ OFFSET ...` と同じ対象名解決・実行器を共有。第 2 の実行器�
  "operation_id": "upsert-1"}
 ```
 
-検証コード: `crates/wire-server/tests/http_nosql/nosql9_op_allowlist.rs`・`nosql1_op_vocabulary.rs`。
+成功応答は `{"upserted": n}`。`operation_id` を指定したときだけ `"operation_id"` キーが付く（キーはこの 2 つのみ）。
+`n` は SQL の `INSERT 0 n` と同じ値で、挿入した行数と更新した行数の合計。`DO NOTHING` で飛ばした行は数えない。
+
+```json
+{"upserted": 1, "operation_id": "upsert-1"}
+```
+
+エラー（エラー文言は固定で、列名・値を含まない。副作用を残さない）:
+
+| `wire_code` | 発生条件 |
+| --- | --- |
+| `42601` | スキーマ違反（未知キー〔`returning`・`mode`・`chunk`・`on_conflict` 内の未知キーを含む〕・型不一致・必須キー欠落）。`do` の語彙外。`set`／`columns` の不正。既定の `set` が空になる場合 |
+| `22000` | 行間でキー集合が異なる。`rows` が空。バッチ内の `id` や衝突対象キーの重複。値の型・次元の不一致（`insert` と同じ） |
+| `42P10` | `on_conflict.columns` が主キー・UNIQUE 制約のどれとも一致しない |
+| `23505` | 2 分類ある。`DUPLICATE_OPERATION_ID` は台帳が内容一致と判定した `operation_id` の再送。`UNIQUE_VIOLATION` は衝突対象以外の主キー／UNIQUE 制約の違反（`DO UPDATE` の結果によるものを含む）。衝突対象の衝突は `23505` にならず、`DO NOTHING` または `DO UPDATE` として扱われる |
+| `22023` | 同じ `operation_id` で内容が異なる再送。台帳照合は行の衝突判定より先に行う |
+| `23502` | `--require-operation-id` の構成での `operation_id` 欠落。`NOT NULL` 違反 |
+| `54000` | `rows` の件数・バイト量・チャンク数が INDEX-4 の上限を超えた（`insert` と同じ上限） |
+| `42501` | 行セキュリティポリシーの `WITH CHECK` 違反など（後述「行セキュリティポリシーの適用」） |
+| `55P03` | 書き込みゲートの待機上限超過（射影表参照） |
+
+SQL 表層と HTTP 表層は台帳を共有し、どちらの方向の再送も `23505`（内容一致）／`22023`（内容違い）になる。
+
+テナント境界（RLS-9）: 衝突判定はテナント名前空間のキーで行う。他テナントの同じ `id` や UNIQUE キーとは衝突せず、
+新規挿入として扱う。応答は他テナントの行が無い場合とバイト単位で同じになる。
+
+検証コード: `crates/wire-server/tests/http_nosql/nosql21_upsert.rs`・`nosql9_op_allowlist.rs`・
+`nosql1_op_vocabulary.rs`、`crates/wire-server/src/http/query/upsert.rs`（単体テスト）、
+層 B の `three_client_http_e2e.rs` の `DML_STEPS`（`up-*`）。
 
 ### `update`
 
@@ -1091,7 +1136,7 @@ nosql16_explain_targets.rs`（`vector` 指定 `search`・`scan`・`aggregate` �
 - 非有限（`NaN`／`±Infinity`）な浮動小数は `null` に丸めず内部エラーとして
   fail-closed に拒否する（通常は engine 側の評価時点で `22000` になり到達しない）
 
-`insert`・`explain: true` の応答形は前節の専用形（`{"inserted",...}`／
+`insert`・`upsert`・`explain: true` の応答形は前節の専用形（`{"inserted",...}`／`{"upserted",...}`／
 `{"explain":[...]}`）を参照。
 
 検証コード: `crates/wire-server/tests/nosql11_response_schema.rs`。
@@ -1118,6 +1163,8 @@ nosql16_explain_targets.rs`（`vector` 指定 `search`・`scan`・`aggregate` �
 | `SELECT lang, COUNT(*) FROM docs GROUP BY lang ORDER BY count DESC LIMIT 10000 OFFSET 1`（SQL-25 (a)(b)） | `aggregate` + `group_by` + `sort` + `offset`（Issue #1198・NOSQL-15。`limit` 相当のキーは無く、`LIMIT` は SQL 側のグループ数上限と同値で対応） |
 | `EXPLAIN SELECT COUNT(*) FROM docs` | `aggregate` + `"explain":true`（Issue #948） |
 | `INSERT INTO docs (id, embedding, lang) VALUES (1, '[0.1,0.2,0.3]', 'ja') USING OPERATION_ID 'op-1'` | `insert` + `operation_id` |
+| `INSERT INTO docs (id, lang) VALUES (1, 'en') ON CONFLICT (id) DO UPDATE SET lang = EXCLUDED.lang USING OPERATION_ID 'op-1'` | `upsert` + `on_conflict: {"columns":["id"],"do":"update","set":["lang"]}` + `operation_id`（同一実行器・同一台帳キー空間。Issue #2087） |
+| `INSERT INTO docs (id, lang) VALUES (1, 'en') ON CONFLICT (id) DO NOTHING` | `upsert` + `on_conflict: {"columns":["id"],"do":"nothing"}` |
 | `UPDATE docs SET lang = 'en' WHERE id = 1 USING OPERATION_ID 'op-1'` | `update` + `where.id` + `operation_id`（結線済み。同一実行器・同一台帳キー空間） |
 | `UPDATE t SET v = 'x' WHERE a = 'k' AND b = 1 USING OPERATION_ID 'op-1'`（複合 PRIMARY KEY `(a, b)`） | `update` + `where: {"a": "k", "b": 1}` + `operation_id`（PK の等価述語。同一実行器・同一台帳キー空間。Issue #2201） |
 | `UPDATE docs SET lang = 'en' WHERE lang = 'ja' USING OPERATION_ID 'op-1'` | `update` + `filter` + `operation_id`（結線済み。同一実行器・同一台帳キー空間。Issue #1062） |
@@ -1141,6 +1188,8 @@ nosql16_explain_targets.rs`（`vector` 指定 `search`・`scan`・`aggregate` �
 - 定数のみの `SELECT`
 - `aggregate` への `limit`（`GROUP BY ... LIMIT n` 相当。`sort`／`offset` は
   Issue #1198 で対応済みだが、`limit` 相当のキーは未対応）
+- `ON CONFLICT ON CONSTRAINT`、`DO UPDATE ... WHERE`、`EXCLUDED.<col>` 以外の式を使う `SET`（加算式・定数・`DEFAULT` 等）、
+  対象を省略した `ON CONFLICT DO NOTHING`、`upsert` の `RETURNING`（NoSQL に対応するキーが無く、未知キーとして `42601`）
 - `INSERT` のファイル形（`path`／`body` 列指定の増分インデックス投入）
 - `GROUP BY` への `LIMIT` の付与（`ORDER BY` は `aggregate` の `sort` で対応済み）
 - `ALTER TABLE ... ALTER COLUMN TYPE` 相当の op（`alter_table` に語彙なし。別論点）
@@ -1168,7 +1217,7 @@ SQL の `CREATE POLICY` で定義した利用者ポリシー（RLS-13）は、No
 
 - 読み取り（`scan`・`search`〔`vector`〕・`aggregate`。主キー等値の点取得を含む）: `SELECT` の `USING`
   を通る行だけが対象。除外された行は存在しない行と区別できない（件数・集計・`explain` にも含めない）
-- 書き込み（`insert`・`update`・`delete`。単一行形・述語形・`mode: "partitioned"`）: `USING` で対象行を
+- 書き込み（`insert`・`upsert`・`update`・`delete`。単一行形・述語形・`mode: "partitioned"`）: `USING` で対象行を
   選び、書く行は `WITH CHECK` を満たす必要がある。違反は `42501`（403）。`where` 単一行形で隠れた行を
   指すと、存在しない `id` を指したときと同じ応答（`updated: 0`／`deleted: 0`）になる
 - 適用表への `search` + `plan` は、SQL の `USING PLAN` と同じく辞書構築を拒否する（fail-closed。
@@ -1176,8 +1225,12 @@ SQL の `CREATE POLICY` で定義した利用者ポリシー（RLS-13）は、No
 - NoSQL からポリシーを定義・変更する手段は無い（`create_policy` は語彙外の `0A000`、`alter_table` の
   行セキュリティ用キーは閉じたスキーマで `42601`）。`row_security` は常に on で、HTTP の主体は
   ロール未束縛（所有者除外・`BYPASSRLS` は効かない）
+- `upsert` の `ON CONFLICT` も SQL と同じ実行器・同じ規則で評価する（規則の詳細は
+  `docs/design/row-security-policy-composition.md` 参照）。提案行には `INSERT` 側の `WITH CHECK` が、
+  `DO UPDATE` の既存行には `UPDATE`／`SELECT` 側の `USING` が、更新後の行には `WITH CHECK` がかかり、
+  違反は `42501`。HTTP の `upsert` とポリシーを組み合わせた結合テストは現状無い
 - 一意性はテナント内で判定するため、ポリシーで見えない同テナントの行と `id` が衝突する `insert` は
-  `23505` になる（他テナントの行とは衝突しない）
+  `23505` になる（他テナントの行とは衝突しない）。`upsert` では衝突対象以外の制約で同じ扱いになる
 
 検証コード: `crates/wire-server/tests/http_nosql/rls13_nosql_policy.rs`。
 
@@ -1284,7 +1337,7 @@ Date: <IMF-fixdate>
 | `22016` | `INVALID_ARGUMENT_FOR_NTH_VALUE` | 400 | Bad Request | `nth_value` の第 2 引数が 0 以下（SQL 表層専用。NoSQL の `op` 語彙からは到達しない）。Issue #1883 |
 | `2201B` | `INVALID_REGULAR_EXPRESSION` | 400 | Bad Request | 正規表現パターンの構文誤り（括弧の不整合・量指定の対象不在・回数の範囲外など）。SQL 表層（`~`／`~*`・`SIMILAR TO`）専用で、NoSQL の `op` 語彙からは到達しない。Issue #1786 |
 | `2201E` | `INVALID_ARGUMENT_FOR_LOGARITHM` | 400 | Bad Request | `insert`／`update` が書き込む行の `CHECK` 制約の式評価での `ln`／`log` の 0・負の引数（SQL-65） |
-| `22023` | `OPERATION_ID_CONTENT_MISMATCH` | 400 | Bad Request | `insert` の `operation_id` 再送時の内容不一致 |
+| `22023` | `OPERATION_ID_CONTENT_MISMATCH` | 400 | Bad Request | `insert`／`upsert` の `operation_id` 再送時の内容不一致 |
 | `22023` | `INVALID_PARAMETER_VALUE` | 400 | Bad Request | 型名の引数が範囲外（`FLOAT(p)` の精度。SQL 表層の DDL では発生し、NoSQL では `search` の `metric` の語彙外でも発生する。Issue #2304・#2243） |
 | `22025` | `INVALID_ESCAPE_SEQUENCE` | 400 | Bad Request | `like` op のパターンが末尾の単独 `\`（エスケープの次の文字が無い）で終わる。SQL 表層の `LIKE ... ESCAPE` の不正な ESCAPE 値・末尾エスケープも同じ分類。NoSQL の `like` から到達する。Issue #1779 |
 | `22026` | `STRING_DATA_LENGTH_MISMATCH` | 400 | Bad Request | `BIT(n)` 列へ入れる文字列のビット数が宣言長 `n` と異なる。NoSQL の BIT 列への `insert`／`update` の文字列束縛から到達する（文字種の不正は `22P02`）。TABLE-48・Issue #2021 |
@@ -1328,7 +1381,7 @@ Date: <IMF-fixdate>
 | `428C9` | `GENERATED_ALWAYS` | 400 | Bad Request | `GENERATED ALWAYS AS IDENTITY` 列へ値を書こうとした（TABLE-24・Issue #1695） |
 | `42939` | `RESERVED_NAME` | 400 | Bad Request | 予約名（`pg_` 接頭辞）の SCHEMA 名を指定した（TABLE-27・Issue #1713。NoSQL 表層からは到達しない） |
 | `42P02` | `UNDEFINED_PARAMETER` | 400 | Bad Request | 拡張クエリプロトコル（SQL 表層）の Parse で COPY 文に `$n` を置いた。NoSQL の `op` 語彙からは到達しない。Issue #1759 |
-| `42P10` | `INVALID_COLUMN_REFERENCE` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`ON CONFLICT` 衝突対象の束縛は SQL 表層専用。NoSQL の `insert` は `on_conflict` を持たない） |
+| `42P10` | `INVALID_COLUMN_REFERENCE` | 400 | Bad Request | `upsert` の `on_conflict.columns` が主キー・UNIQUE 制約のどれとも一致しない（`ON CONFLICT` 衝突対象の束縛は SQL 表層と共通。`insert` は `on_conflict` を持たない） |
 | `42P13` | `INVALID_FUNCTION_DEFINITION` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`CREATE FUNCTION ... RETURNS` の型検査は SQL 表層専用。後述） |
 | `42P16` | `INVALID_TABLE_DEFINITION` | 400 | Bad Request | `create_table.constraints` に `primary_key` を 2 個以上指定した場合（名前付きを含む。TABLE-22 (d)、Issue #1412・#1437。`ALTER TABLE ... ADD PRIMARY KEY` の重複宣言は SQL 表層専用。後述） |
 | `42P17` | `INVALID_OBJECT_DEFINITION` | 400 | Bad Request | 式索引の式が IMMUTABLE 相当でない（SQL 表層専用。NoSQL の `op` 語彙からは到達しない）。Issue #1647 |
@@ -1346,15 +1399,15 @@ Date: <IMF-fixdate>
 | `28000` | `AUTH_REQUIRED` | 401 | Unauthorized | `Authorization` ヘッダ欠落 |
 | `28P01` | `AUTH_INVALID` | 401 | Unauthorized | トークン形式不正・失効・セッション未存在 |
 | `25006` | `READ_ONLY_SQL_TRANSACTION` | 403 | Forbidden | 読み取り専用トランザクション内で書き込み系の文を実行した（SQL 表層専用。NoSQL にはトランザクション制御が無く到達不能。Issue #1934・ERR-6） |
-| `42501` | `FORBIDDEN_TENANT_MISMATCH` | 403 | Forbidden | DDL 実行権限の不足、または `insert`／`update` が行セキュリティポリシーの `WITH CHECK` に違反した（RLS-13。`code` は補助ラベルで、ポリシー違反も同じ値。応答に行の値・テナント ID・ポリシーの内容は含めない。後述「行セキュリティポリシーの適用」） |
+| `42501` | `FORBIDDEN_TENANT_MISMATCH` | 403 | Forbidden | DDL 実行権限の不足、または `insert`／`upsert`／`update` が行セキュリティポリシーの `WITH CHECK` に違反した（RLS-13。`code` は補助ラベルで、ポリシー違反も同じ値。応答に行の値・テナント ID・ポリシーの内容は含めない。後述「行セキュリティポリシーの適用」） |
 | `34000` | `INVALID_CURSOR_NAME` | 404 | Not Found | NoSQL 表層の実要求からは到達不能（カーソル〔`DECLARE`／`FETCH`／`CLOSE`〕は SQL 表層専用で op 許可リストに無い。後述） |
 | `3F000` | `INVALID_SCHEMA_NAME` | 404 | Not Found | 呼び出し元テナントに存在しない SCHEMA を指した（TABLE-27・Issue #1713。他テナントの名前も同じ応答。NoSQL 表層からは到達しない） |
 | `42P01` | `TABLE_NOT_FOUND` | 404 | Not Found | 未定義テーブルへの `search`／`scan`／`aggregate`／`insert` |
 | `P0002` | `ROW_NOT_FOUND` | 404 | Not Found | NoSQL 表層の実要求からは到達不能（対応する op が許可リストに無い。後述） |
 | `P0002` | `NO_DATA_FOUND` | 404 | Not Found | PL/pgSQL の `INTO STRICT` が 0 行（`wire_code` は `ROW_NOT_FOUND` と共有。SQL 表層の PL/pgSQL 専用で NoSQL の `op` 語彙からは到達しない）。Issue #2225・SQL-68 |
 | `23503` | `FOREIGN_KEY_VIOLATION` | 409 | Conflict | `FOREIGN KEY`（TABLE-17・TASK-205）を宣言したテーブルへの `insert`／`update` で参照先の値が同一テナント内に無い、または参照先の `update`／`delete` で参照元の行が残る |
-| `23505` | `UNIQUE_VIOLATION` | 409 | Conflict | 行 `id` の重複、`PRIMARY KEY`／UNIQUE 制約のテナント内一意性違反（`insert`／`update`。行セキュリティポリシーで見えない同テナントの行との衝突でも起きる。一意性はテナント内で判定する）。行制約由来のため commit 済みの根拠にならない |
-| `23505` | `DUPLICATE_OPERATION_ID` | 409 | Conflict | 台帳照合で内容一致と判定された `operation_id` の再送（`insert`／`update`／`delete`。`wire_code` は `UNIQUE_VIOLATION` と共有し `code` で区別。commit 済み確定の根拠。Issue #1180） |
+| `23505` | `UNIQUE_VIOLATION` | 409 | Conflict | 行 `id` の重複、`PRIMARY KEY`／UNIQUE 制約のテナント内一意性違反（`insert`／`upsert`／`update`。`upsert` では衝突対象以外の制約。行セキュリティポリシーで見えない同テナントの行との衝突でも起きる。一意性はテナント内で判定する）。行制約由来のため commit 済みの根拠にならない |
+| `23505` | `DUPLICATE_OPERATION_ID` | 409 | Conflict | 台帳照合で内容一致と判定された `operation_id` の再送（`insert`／`upsert`／`update`／`delete`。`wire_code` は `UNIQUE_VIOLATION` と共有し `code` で区別。commit 済み確定の根拠。Issue #1180） |
 | `23514` | `CHECK_VIOLATION` | 409 | Conflict | `insert`／`update` が書き込む行が `CHECK` 制約（TABLE-16・TASK-204）を満たさない |
 | `40001` | `SERIALIZATION_FAILURE` | 409 | Conflict | 明示トランザクションの writer 取得時に直列化の失敗を検出した（`ROLLBACK` の後に最初から再試行してよい。NoSQL の 1 要求は開始時に writer を取る暗黙トランザクションのため到達不能。TASK-333・Issue #2398・ERR-7） |
 | `42P06` | `DUPLICATE_SCHEMA` | 409 | Conflict | SCHEMA 名が同一テナント内の既存 SCHEMA または組み込み SCHEMA と衝突した（TABLE-27・Issue #1713。NoSQL 表層からは到達しない） |
@@ -1528,6 +1581,7 @@ curl -s -X POST http://127.0.0.1:5432/v1/session/close \
   Issue #2065）・`idempotency_key.rs`（単体）
 - `insert`: `nosql6_insert.rs`・`nosql6_tenant_row_id_scope.rs`・
   `http_insert_response_boundary.rs`・`wire_insert_operation_id.rs`
+- `upsert`: `nosql21_upsert.rs`・`upsert.rs`（単体）・層 B `three_client_http_e2e.rs` の `DML_STEPS`（`up-*`）
 - `filter`: `nosql7_filter_mapping.rs`
 - 応答形: `nosql11_response_schema.rs`
 - エラー射影: `err4_http_projection.rs`・`nosql_api_doc.rs`
