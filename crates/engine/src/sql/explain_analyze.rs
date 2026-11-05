@@ -21,9 +21,10 @@
 use crate::sql::allowlist::{CteExplainMain, ExplainTarget, SqlSurfaceError, Statement};
 use crate::sql::exec::{Cell, QueryResult, ResultRow};
 use crate::sql::explain_tree::MAX_EXPLAIN_TREE_LINES;
+use crate::sql::hnsw_observe::HnswObservation;
 
-/// 併記する行数の最大（根の段へ最大 3 行 + 末尾へ最大 2 行）。上限判定の余裕に使う。
-const ANNOTATION_LINES: usize = 5;
+/// 併記する行数の最大（根の段へ最大 3 行 + HNSW の最大 4 行 + 末尾へ最大 2 行）。上限判定の余裕に使う。
+const ANNOTATION_LINES: usize = 9;
 
 /// 実行して実測値を併記する `EXPLAIN ANALYZE` の検証済み対象。
 #[derive(Debug, Clone, PartialEq)]
@@ -39,6 +40,8 @@ pub(crate) struct AnalyzeStats {
     pub(crate) rows: usize,
     pub(crate) planning_ms: f64,
     pub(crate) execution_ms: f64,
+    /// 実行した 1 文の HNSW 実行時の判断（Issue #2056）。
+    pub(crate) hnsw: HnswObservation,
 }
 
 /// 計画の対象を、同じ本文を `EXPLAIN` なしで検証したときの [`Statement`] へ写す。
@@ -95,6 +98,38 @@ fn too_many_lines() -> SqlSurfaceError {
     }
 }
 
+/// HNSW 経路を試行した文だけに出す行（Issue #2056・SQL-76 (2)(3)・SQL-73 (3)）。件数と真偽だけで、
+/// 他テナントの行数・存在に依存しない値（可視行と自 ctx の索引だけから決まる）に限る。
+fn hnsw_lines(h: &HnswObservation) -> Vec<ResultRow> {
+    if !h.attempted {
+        return Vec::new();
+    }
+    let mut v = vec![
+        text_row(format!(
+            "hnsw_index_cache: cached={},built={},rebuilt={},not_indexed={}",
+            h.cache_cached, h.cache_built, h.cache_rebuilt, h.cache_not_indexed
+        )),
+        text_row(format!(
+            "hnsw_exact_scan: {},switches={}",
+            h.exact_scan_switches > 0,
+            h.exact_scan_switches
+        )),
+    ];
+    if let Some(it) = h.iterative {
+        v.push(text_row(format!(
+            "hnsw_iterative_scan: rounds={},cap_hit={},rows_examined={}",
+            it.rounds, it.cap_hit, it.rows_examined
+        )));
+    }
+    if h.hybrid_dense_rounds > 0 {
+        v.push(text_row(format!(
+            "hnsw_refetch_rounds: {}",
+            h.hybrid_dense_rounds
+        )));
+    }
+    v
+}
+
 /// 静的な計画へ実測値を併記する。行数が上限を超える場合は `54001`（固定文）で fail-closed にする。
 pub(crate) fn annotate(
     plan: QueryResult,
@@ -119,6 +154,7 @@ pub(crate) fn annotate(
             ms(stats.execution_ms)
         )));
     }
+    extra.extend(hnsw_lines(&stats.hnsw));
     let at = root_end(&rows);
     let tail = rows.split_off(at);
     rows.extend(extra);
@@ -162,6 +198,16 @@ mod tests {
         rows: 7,
         planning_ms: 0.5,
         execution_ms: 1.25,
+        hnsw: HnswObservation {
+            cache_cached: 0,
+            cache_built: 0,
+            cache_rebuilt: 0,
+            cache_not_indexed: 0,
+            exact_scan_switches: 0,
+            iterative: None,
+            hybrid_dense_rounds: 0,
+            attempted: false,
+        },
     };
 
     /// SQL-76 (2): 見出しなしの根は属性行の末尾へ挿入する。
@@ -228,9 +274,43 @@ mod tests {
             rows: 0,
             planning_ms: f64::NAN,
             execution_ms: -1.0,
+            hnsw: HnswObservation::default(),
         };
         let out = annotate(plan(&["a: 1"]), &s, true, true).unwrap();
         assert!(lines(&out).contains(&"planning_time_ms: 0.000".to_string()));
+    }
+
+    /// SQL-76 (2): HNSW を試行した文だけが根の段へ HNSW の行を足す（未試行なら 1 行も出ない）。
+    #[test]
+    fn hnsw_lines_only_when_attempted() {
+        use crate::sql::hnsw_observe::IterativeObs;
+        let mut s = STATS;
+        s.hnsw.attempted = true;
+        s.hnsw.cache_not_indexed = 1;
+        s.hnsw.exact_scan_switches = 1;
+        s.hnsw.iterative = Some(IterativeObs {
+            rounds: 3,
+            cap_hit: true,
+            rows_examined: 40,
+        });
+        s.hnsw.hybrid_dense_rounds = 2;
+        let p = plan(&["root", "-> child"]);
+        let out = annotate(p, &s, false, false).unwrap();
+        assert_eq!(
+            lines(&out),
+            [
+                "root",
+                "actual_rows: 7",
+                "actual_loops: 1",
+                "hnsw_index_cache: cached=0,built=0,rebuilt=0,not_indexed=1",
+                "hnsw_exact_scan: true,switches=1",
+                "hnsw_iterative_scan: rounds=3,cap_hit=true,rows_examined=40",
+                "hnsw_refetch_rounds: 2",
+                "-> child",
+            ]
+        );
+        let out = annotate(plan(&["root"]), &STATS, false, false).unwrap();
+        assert!(!lines(&out).iter().any(|l| l.starts_with("hnsw_")));
     }
 
     /// 行数の上限超過は 54001 で fail-closed。

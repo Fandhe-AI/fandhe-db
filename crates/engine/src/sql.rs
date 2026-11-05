@@ -259,6 +259,7 @@ pub mod group_by;
 pub(crate) mod grouping_sets;
 pub(crate) mod hnsw_cache;
 pub(crate) mod hnsw_hybrid;
+pub(crate) mod hnsw_observe;
 pub(crate) mod index_expr;
 pub(crate) mod index_implication;
 pub(crate) mod index_predicate;
