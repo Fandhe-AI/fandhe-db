@@ -16084,6 +16084,116 @@ impl EngineCore {
         )
     }
 
+    /// NoSQL 表層（`wire-server` の `POST /v1/query` の `upsert` op。Issue #2087・NOSQL-21 ポインタ）が
+    /// 呼ぶ、束縛済み UPSERT のセッション対応入口。SQL 表層の `INSERT ... ON CONFLICT`
+    /// （`execute_insert_form` の `Upsert` 腕）と同じ実行器（`sql::exec::execute_upsert_in`）・
+    /// 同じ INDEX-4 上限検査（`validate_upsert_batch_limits`）を共有し、第 2 の実行器は作らない。
+    /// `bind` は `sql::parser::bind_insert_form` を呼んで `BoundUpsert` を返す closure。
+    ///
+    /// 判定順（[`Self::execute_bound_insert_in_session`] と同型）:
+    ///
+    /// 1. `operation_id` 必須化ガード（`23502`。RECOVER-1）
+    /// 2. `row_count == 0` → `22000`
+    /// 3. 1 文あたり行数上限・`max_files_per_batch` → `54000`（カタログ参照より前）
+    /// 4. スキーマ取得（`42P01`）
+    /// 5. `bind(&schema)`（`DEFAULT` 時刻・sparsevec 上限のスコープ内。台帳 v3 の評価時刻は書き込み区間へ引き継ぐ）
+    /// 6. 束縛結果の `table`・行数・`operation_id` が引数と一致することの検証（不一致は `22000`）
+    /// 7. 権限: `INSERT` に `ON CONFLICT` 分岐が足すビット（`DO UPDATE` は `UPDATE|SELECT`、
+    ///    対象を明示した `DO NOTHING` は `SELECT`。`privilege_gate::write` の SQL 表層の規則と一致）
+    /// 8. `validate_upsert_batch_limits`（INDEX-4 のバイト量・チャンク総量）→ `execute_upsert_in`
+    ///
+    /// 衝突対象の列数上限は束縛側（`resolve_conflict_target`）が `42P10` として拒否する。
+    pub fn execute_bound_upsert_in_session<F>(
+        &self,
+        ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
+        table: &str,
+        row_count: usize,
+        operation_id: Option<&crate::recovery::required_op_id::OperationId>,
+        bind: F,
+    ) -> Result<crate::sql::exec::InsertOutcome, crate::sql::allowlist::SqlSurfaceError>
+    where
+        F: FnOnce(
+            &crate::catalog::TableSchema,
+        ) -> Result<
+            crate::sql::parser::BoundUpsert,
+            crate::sql::allowlist::SqlSurfaceError,
+        >,
+    {
+        use crate::sql::allowlist::SqlSurfaceError;
+        self.ledger_mode
+            .resolve(operation_id)
+            .map_err(|_| SqlSurfaceError::MissingOperationId)?;
+        if row_count == 0 {
+            return Err(SqlSurfaceError::invalid_input(
+                "INSERT batch must contain at least one row",
+            ));
+        }
+        self.check_insert_row_count_limit(row_count)?;
+        if row_count > self.batch_limits.max_files_per_batch {
+            return Err(SqlSurfaceError::payload_too_large(
+                crate::batch_limits::BatchLimitsError::TooManyFiles {
+                    count: row_count,
+                    max: self.batch_limits.max_files_per_batch,
+                }
+                .to_string(),
+            ));
+        }
+        let (read_txn, schema) = self.read_txn_with_schema(table)?;
+        let (bound, bound_evaluated_at) = {
+            let now = crate::sql::time_fn::now_micros()?;
+            let _default_clock_scope = crate::sql::time_fn::DefaultClockScope::enter(
+                crate::sql::time_fn::StatementClock {
+                    txn_start_micros: now,
+                    stmt_start_micros: now,
+                },
+            );
+            let _sparsevec_limits_scope = self.sparsevec_limits_scope();
+            let bound = bind(&schema)?;
+            (bound, crate::sql::time_fn::ledger_evaluated_at())
+        };
+        let _ledger_clock_scope =
+            bound_evaluated_at.map(|at| crate::sql::time_fn::LedgerClockScope::enter(Some(at)));
+        if bound.table != table
+            || bound.rows.len() != row_count
+            || bound.operation_id.as_ref() != operation_id
+            || bound
+                .rows
+                .iter()
+                .any(|b| b.table != table || b.operation_id.as_ref() != operation_id)
+        {
+            return Err(SqlSurfaceError::invalid_input(
+                "bound upsert plan does not match the requested table, row count, or operation_id",
+            ));
+        }
+        let mut bits = crate::catalog::privilege::PRIV_INSERT;
+        match &bound.action {
+            crate::sql::parser::BoundConflictAction::DoUpdate { .. } => {
+                bits |=
+                    crate::catalog::privilege::PRIV_UPDATE | crate::catalog::privilege::PRIV_SELECT;
+            }
+            crate::sql::parser::BoundConflictAction::DoNothing => {
+                if !matches!(
+                    bound.target,
+                    crate::sql::parser::BoundConflictTarget::AnyUnique
+                ) {
+                    bits |= crate::catalog::privilege::PRIV_SELECT;
+                }
+            }
+        }
+        self.require_table_write_privilege(ctx, session, table, bits)?;
+        drop(read_txn);
+
+        self.validate_upsert_batch_limits(&bound.rows)?;
+        crate::sql::exec::execute_upsert_in(
+            crate::tenant::WriteTarget::Autocommit(&self.storage),
+            ctx,
+            &bound,
+            self.dml_ledger_mode(),
+            &schema,
+        )
+    }
+
     /// `COPY` 文（Issue #939・WIRE-17・TASK-220）を構造検証し、`FROM STDIN` 形は
     /// ストリーミング取り込みセッション（[`crate::sql::copy::CopyInSession`]）を、
     /// `TO STDOUT` 形は広域取得と同じ実行本体（[`Self::run_scan_plan`]。RLS
