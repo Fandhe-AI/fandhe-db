@@ -90,6 +90,8 @@ mod dml_from_exec;
 
 // 述語形 UPDATE／DELETE の WHERE 内サブクエリの実行（SQL-53・Issue #1751）。
 mod dml_subquery_exec;
+// 述語形 UPDATE／DELETE の EXPLAIN（Issue #2050・SQL-75）。
+mod explain_dml;
 // 述語形 UPDATE ... FROM／DELETE ... USING の結合実行（SQL-53・Issue #1755）。
 #[cfg(test)]
 mod cte_join_budget_tests;
@@ -2004,6 +2006,13 @@ pub enum ParsedSql {
     ///
     /// `#[non_exhaustive]` な本 enum への追加のためクレート外に対して非破壊。
     ExplainInsert(Box<crate::sql::insert_explain::ExplainInsertTarget>),
+    /// 述語形 `UPDATE`／`DELETE` の `EXPLAIN`（Issue #2050・SQL-75。分割実行修飾なし）。実行せず
+    /// 計画の木だけを返す読み取り専用の文で、行・台帳・writer・シーケンス・トリガに触れない。
+    /// 構文段・実行段の本体は `core/explain_dml.rs`。
+    ///
+    /// **BREAKING CHANGE**（Issue #2050）: 本 variant の追加により `ParsedSql` を網羅的に
+    /// マッチするクレート外コードは追随が必要。
+    ExplainDml(crate::sql::explain_dml::ExplainDml),
     /// `ALTER TABLE <table> ADD COLUMN <column> <type>`（SQL-23・TASK-202、
     /// Issue #900）・`ALTER TABLE <table> ADD [CONSTRAINT <name>] UNIQUE
     /// (<col>[, ...])`／`DROP CONSTRAINT <name>`（TABLE-16・TASK-204、
@@ -2328,7 +2337,9 @@ fn statement_clock_scope(
         | ParsedSql::UpdateFrom(_)
         | ParsedSql::DeleteUsing(_)
         // Issue #2051: `EXPLAIN INSERT` の束縛は `DEFAULT now()` 等の評価に文の開始時刻を要する。
-        | ParsedSql::ExplainInsert(_) => true,
+        | ParsedSql::ExplainInsert(_)
+        // Issue #2050: `EXPLAIN UPDATE|DELETE` も非 EXPLAIN の DML と同じく束縛段が時刻を読む。
+        | ParsedSql::ExplainDml(_) => true,
         ParsedSql::Truncate(_)
         | ParsedSql::Transaction(_)
         | ParsedSql::SetTransaction(_)
@@ -2423,6 +2434,7 @@ fn insert_sequence_scope(
         | ParsedSql::CreateTempTable(_)
         | ParsedSql::Cursor(_)
         | ParsedSql::Partitioned(_)
+        | ParsedSql::ExplainDml(_)
         | ParsedSql::AlterTable(_)
         | ParsedSql::CreateView(_)
         | ParsedSql::DropView(_)
@@ -2508,6 +2520,7 @@ fn insert_default_clock_scope(
         | ParsedSql::CreateTempTable(_)
         | ParsedSql::Cursor(_)
         | ParsedSql::Partitioned(_)
+        | ParsedSql::ExplainDml(_)
         | ParsedSql::AlterTable(_)
         | ParsedSql::CreateView(_)
         | ParsedSql::DropView(_)
@@ -2701,6 +2714,9 @@ fn parsed_operation_id(parsed: &ParsedSql) -> Option<&str> {
         // operation_id 登録を変えない（拒否される文が再利用検査の状態を汚さない）。実行を結線する
         // SQL 経路の dispatch 結線時にここを見直す（#1755・#1757 は実行入口と台帳ハッシュまで）。
         ParsedSql::UpdateFrom(_) | ParsedSql::DeleteUsing(_) => None,
+        // Issue #2050: `EXPLAIN UPDATE|DELETE` は台帳に記録せず operation_id もトランザクションへ
+        // 登録しない（登録すると同じ operation_id の本実行が誤って再利用扱いになる）。
+        ParsedSql::ExplainDml(_) => None,
         // 永続側の文を包んだ形は中身の `operation_id` を使う（一時表の文は `operation_id` を持たない）。
         ParsedSql::SessionRouted(routed) if routed.is_persistent() => {
             parsed_operation_id(routed.inner())
@@ -2721,6 +2737,7 @@ fn is_partitioned_write(parsed: &ParsedSql) -> bool {
             v.partitioned().is_some()
         }
         ParsedSql::Partitioned(control) => control.writes(),
+        ParsedSql::ExplainDml(_) => false,
         ParsedSql::SessionRouted(routed) if routed.is_persistent() => {
             is_partitioned_write(routed.inner())
         }
@@ -2772,6 +2789,8 @@ fn read_only_permits(parsed: &ParsedSql) -> bool {
         ParsedSql::Partitioned(control) => !control.writes(),
         // Issue #2051: `EXPLAIN INSERT` は束縛だけで何も書かないため READ ONLY Tx でも許可する。
         ParsedSql::ExplainInsert(_) => true,
+        // Issue #2050: ANALYZE なしの EXPLAIN は何も書かないため READ ONLY でも可。
+        ParsedSql::ExplainDml(_) => true,
         ParsedSql::SequenceFunction(stmt) => !stmt.writes(),
         ParsedSql::SessionRouted(routed) => read_only_permits(routed.inner()),
         // `COPY ... TO` は読み取りだが、拡張クエリ経路の `Copy` は in-txn で別途拒否される。
@@ -6356,8 +6375,8 @@ impl EngineCore {
             return Ok(ParsedSql::Partitioned(control));
         }
 
-        // Issue #1129: `EXPLAIN UPDATE|DELETE ... PARTITIONED`。分割実行でない DML の
-        // `EXPLAIN` は従来どおり許可リスト外（`42601`）。
+        // Issue #1129: `EXPLAIN UPDATE|DELETE ... PARTITIONED`。分割実行でない述語形 DML の
+        // `EXPLAIN` は Issue #2050 の `parse_explain_dml` が受理し、それ以外の形は `42601`。
         if let (
             Some(crate::sql::lexer::Token::Ident(head)),
             Some(crate::sql::lexer::Token::Ident(second)),
@@ -6368,6 +6387,12 @@ impl EngineCore {
                 && crate::sql::partitioned::tokens_have_partitioned_clause(&tokens)
             {
                 return self.parse_explain_partitioned_dml(&tokens, &storage_lookup);
+            }
+            // Issue #2050: 分割実行でない述語形 `EXPLAIN UPDATE|DELETE`（SQL-75）。
+            if head.eq_ignore_ascii_case("EXPLAIN")
+                && (second.eq_ignore_ascii_case("DELETE") || second.eq_ignore_ascii_case("UPDATE"))
+            {
+                return self.parse_explain_dml(&tokens, temp, hits, ledger_mode, read_snap);
             }
         }
 
@@ -8344,6 +8369,8 @@ impl EngineCore {
             }
             // Issue #2051: `EXPLAIN INSERT` は束縛だけを行い書き込み・台帳・採番に触れない。
             ParsedSql::ExplainInsert(target) => self.run_insert_explain(ctx, session, target),
+            // Issue #2050: 述語形 UPDATE／DELETE の EXPLAIN（書き込まない）。
+            ParsedSql::ExplainDml(explain) => self.run_explain_dml(ctx, session, explain),
             // TABLE-44・Issue #1684: 一時表だけを参照する文は一時コアで実行する
             // （`core/temp_route.rs`）。永続コアの実行器へは渡さない。
             ParsedSql::SessionRouted(routed) if routed.is_persistent() => {
@@ -9766,6 +9793,8 @@ impl EngineCore {
             // Issue #2051: `EXPLAIN INSERT` は writer を取らず、確定済みのカタログで束縛だけを行う
             // （`operation_id` も登録しない。続く本物の `INSERT` が同じ ID を再利用できる）。
             ParsedSql::ExplainInsert(target) => self.run_insert_explain(ctx, session, target),
+            // Issue #2050: writer を要求せず、書き込み済みの印も付けない。
+            ParsedSql::ExplainDml(explain) => self.run_explain_dml(ctx, session, explain),
             ParsedSql::Cursor(stmt) => self.execute_cursor_in_active_txn(ctx, session, txn, stmt),
             // TABLE-44・Issue #1684: 一時表の文は、一時側の書き込みトランザクション（最初の一時表の
             // 文で開く）の上で一時コアが実行する。永続側の write txn・dirty 判定には触れない。
@@ -11102,6 +11131,11 @@ impl EngineCore {
             }
             // Issue #2051: `EXPLAIN INSERT` は `QUERY PLAN` 単一列（入力文によらず固定）。
             ParsedSql::ExplainInsert(_) => Ok(Some(vec![crate::sql::exec::ColumnMeta::Computed {
+                name: crate::sql::explain::QUERY_PLAN_COLUMN.to_string(),
+                ty: Some(crate::catalog::ColumnType::Text),
+            }])),
+            // Issue #2050: `EXPLAIN UPDATE|DELETE` も `QUERY PLAN` 単一列。
+            ParsedSql::ExplainDml(_) => Ok(Some(vec![crate::sql::exec::ColumnMeta::Computed {
                 name: crate::sql::explain::QUERY_PLAN_COLUMN.to_string(),
                 ty: Some(crate::catalog::ColumnType::Text),
             }])),

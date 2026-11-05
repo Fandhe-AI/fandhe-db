@@ -565,9 +565,8 @@ fn set_id_is_rejected_as_unsupported_syntax() {
     assert_eq!(err.wire_code(), "42601");
 }
 
-/// `EXPLAIN UPDATE ...` は許可形状に存在しないため `42601`
-/// （`EXPLAIN` は検索 SELECT の前置専用。`truncate_table.rs` の同型テストと
-/// 同じ確認）。
+/// 採番でない表の単一行形（`WHERE id = <n>`）の `EXPLAIN UPDATE ...` は既存の計画語彙で
+/// 表せないため対象外として `42601`（Issue #2050。述語形は受理）。
 #[test]
 fn explain_update_is_rejected_as_unsupported_syntax() {
     let (core, path) = new_core();

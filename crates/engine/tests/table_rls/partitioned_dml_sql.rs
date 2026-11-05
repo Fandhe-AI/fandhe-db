@@ -599,15 +599,14 @@ fn explain_partitioned_reports_the_mode_and_has_no_side_effects() {
         "EXPLAIN UPDATE docs SET n = 1 WHERE n > 0 USING OPERATION_ID 'ex2' PARTITIONED",
     );
     assert!(matches!(out, SqlOutcome::Explain(_)));
-    // 分割実行でない DML の EXPLAIN は従来どおり 42601。
-    assert_eq!(
-        code(
-            &core,
-            "alice",
-            "EXPLAIN DELETE FROM docs WHERE n > 0 USING OPERATION_ID 'ex3'"
-        ),
-        "42601"
+    // 分割実行でない述語形 DML の EXPLAIN は計画だけを返し、行を変えない（Issue #2050）。
+    let out = ok(
+        &core,
+        "alice",
+        "EXPLAIN DELETE FROM docs WHERE n > 0 USING OPERATION_ID 'ex3'",
     );
+    assert!(matches!(out, SqlOutcome::Explain(_)));
+    assert_eq!(count(&core, "alice"), 5);
 }
 
 // --- 構文の受理・拒否 ---------------------------------------------------------------

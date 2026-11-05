@@ -42,6 +42,8 @@
 //!   注記用に追加した公開 API（`build_explain_result` は非破壊のまま維持）
 //! - [`explain_tree`][]: `EXPLAIN` の段の木（Issue #2045・SQL-75 (2)。単一表は
 //!   ルート 1 節で出力不変。結合・集合演算・CTE の入れ子描画の土台）
+//! - [`explain_dml`][]: 述語形 `UPDATE`／`DELETE` の `EXPLAIN`（Issue #2050・SQL-75。実行器の全走査に
+//!   合わせた `scan` 段と有無のみの属性。副作用なし）
 //! - [`mode`][]: 取得モード（`recall`／`precision`）の優先順位解決・セッション状態
 //!   （TASK-161・SQL-12）
 //! - [`using_operation_id`][]: `USING OPERATION_ID '<id>'` 文末句の値型・検証（TASK-80）
@@ -244,6 +246,7 @@ pub(crate) mod distinct;
 pub(crate) mod dml_from_returning;
 pub mod exec;
 pub mod explain;
+pub mod explain_dml;
 pub(crate) mod explain_tree;
 pub(crate) mod expr_program;
 pub(crate) mod expression_key_index;

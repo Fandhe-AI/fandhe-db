@@ -97,6 +97,8 @@ pub(crate) fn classify(parsed: &ParsedSql) -> ReadRequirement {
         | ParsedSql::Partitioned(_)
         // Issue #2051: INSERT 権限と元表の SELECT は書き込みゲート（`write.rs`）が判定する。
         | ParsedSql::ExplainInsert(_)
+        // Issue #2050: 行を読まない。DELETE／UPDATE 権限は write gate が実行時と同じく要求する。
+        | ParsedSql::ExplainDml(_)
         | ParsedSql::Copy(_)
         | ParsedSql::Lock(_) => NotApplicable,
         // トランザクション・セッション制御・DDL・関数呼び出し。DDL は運用者権限のゲートを通った主体だけが
