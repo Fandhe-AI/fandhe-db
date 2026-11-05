@@ -605,7 +605,7 @@ INSERT は #2051 が担当する。`EXPLAIN ... PARTITIONED` は従来の出力�
   内側の文の検証が通った後に意味段（`resolve`）が出現順に評価する（PostgreSQL と同じく内側の文のエラーが先）。
   未知の名前は `42601`、PG にあって本 DB が対応しない名前と `FORMAT XML／YAML` は `0A000`、値の不正と
   `ANALYZE` を伴わない `TIMING` は `22023`。同じオプションは後の指定が勝つ。`FORMAT` の値の省略は `42601`。
-- **未実装のゲート（`0A000`・文は実行しない）**: `ANALYZE`・`SUMMARY` の真（#2052）、`VERBOSE` の真（#2060）、
+- **未実装のゲート（`0A000`・文は実行しない）**: `ANALYZE`（SELECT 以外。#2054 で SELECT は受理）・`ANALYZE` なしの `SUMMARY` の真（`VERBOSE` は #2060 で受理。`ANALYZE` との併用だけ `0A000`）、
   `FORMAT JSON`（#2059）。各 Issue がゲートを外すときに運搬用の field を `ParsedSql`／`SqlOutcome` へ足す。
   `COSTS`・`FORMAT TEXT`・明示的な偽は受理し、出力はオプションなしの `EXPLAIN` と同一（推定値を出さないため）。
 - **`$n` との併用**: `sql::params` の EXPLAIN 系ガードは先頭の次が `(` だと素通りするため、オプション付きで
@@ -613,4 +613,109 @@ INSERT は #2051 が担当する。`EXPLAIN ... PARTITIONED` は従来の出力�
 - **セッション無しの入口**: 抽出器を通らないため従来どおり `42601`（#2044 の契約を維持）。
 - **メッセージ**: 固定の英語文字列で、入力のオプション名・値をエコーしない。
 - **既知の差分**: 引用識別子のオプション名（`"analyze"`）は字句解析で引用の有無が残らず、引用なしと同じ扱いになる。
-  前置形（`EXPLAIN ANALYZE <文>`）は対象外で従来どおり `42601`。
+  前置形（`EXPLAIN ANALYZE <文>`）は #2054 で構文段に取り込んだ（次節）。
+
+## 追記（Issue #2054・SQL-76 (2)(3)）: SELECT の EXPLAIN ANALYZE
+
+- **決定 1（実行しない静的な計画）との関係**: オプションなしの `EXPLAIN` は従来どおり実行しない。`ANALYZE` を
+  利用者が明示したときに限り、同じ SELECT を通常の SELECT と同じ実行器で実際に実行し、実測値を計画に併記する。
+  結果の行はクライアントへ返さず捨てる（`QUERY PLAN` 単一列・`CommandComplete` は `EXPLAIN` のまま）。
+- **構文**: 括弧形 `EXPLAIN (ANALYZE[, TIMING …, SUMMARY …, COSTS …, FORMAT TEXT]) <文>` と前置形
+  `EXPLAIN ANALYZE|ANALYSE [VERBOSE] <文>`・`EXPLAIN VERBOSE <文>`。前置形は構文段（`sql::explain_options::extract`）で
+  括弧形と同じ生のオプション列へ正規化する。前置の直後に括弧のリストが続く形は `42601`。`TIMING`・`SUMMARY` の
+  省略は真（`ANALYZE` 時）。`TIMING` の真は `ANALYZE` を要する（`22023`）。`ANALYZE` なしの `SUMMARY` の真は `0A000`。
+- **対象**: 本 DB が `EXPLAIN` できる SELECT（単一表の検索・集計・広域取得、JOIN、集合演算、CTE〔再帰・具体化を含む〕、
+  派生表、WHERE の部分クエリ）。DML の ANALYZE は次節（#2055）。`USING PLAN` を伴う
+  検索（LLM・embedder の I/O を伴う）、一時表を参照する文、`VERBOSE`・`FORMAT JSON` との併用、`$n` を含む文
+  （拡張クエリの Parse は `42601`）は fail-closed で拒否する。セッション無しの入口は従来どおり `42601`。
+- **出力の語彙（安定契約）**: 根の段の属性行の末尾（最初の子の段の直前）に `actual_rows: <n>`（RLS 適用後の可視行・
+  LIMIT／OFFSET 適用後）、`actual_loops: 1`、`TIMING` が真なら `actual_total_time_ms: <x.xxx>`。計画の最後に `SUMMARY`
+  が真なら `planning_time_ms: <x.xxx>`（静的な計画の組み立て）、`execution_time_ms: <x.xxx>`（内側の文の実行）。
+  `TIMING OFF, SUMMARY OFF` の出力は、オプションなしの `EXPLAIN` の行へ 2 行を挿入した形と一致する。
+  挿入位置は `explain_tree` の字下げ規則（深さ 0 は前置なし、深さ 1 以上は `"-> "` か空白で始まる）に依存し、
+  描画後の行への後処理で行う。行数が既存の上限に定数行を足した範囲を超えたら `54001`。
+- **出さないもの（SQL-76 (3)）**: フィルタで除いた行数・走査した行数・推定値・他テナントを含む件数。他テナントの行量で
+  出力が変わらないことを結合テストで固定する。時間は壁時計の値で件数ではなく、通常の SELECT の応答時間を測るのと
+  同程度の情報しか持たない（`TIMING OFF` で抑止できる）。
+- **実行の読み取り源**: autocommit は計画と実行がそれぞれ読み取りトランザクションを開く（計画はカタログだけを読むため
+  行数の一致には影響しない。既知事項）。明示トランザクションは通常の SELECT と同じ読み取り源で、未 commit の自分の
+  変更が見え、`READ ONLY` でも可。SELECT 権限は実行前に read gate が要求する（`42501`）。実行時のエラーは通常の
+  SELECT と同じ `wire_code` で返し、計画は返さない。
+- **対象外**: 段ごとの実測（内側の段の行数・ループ・時間）と実行器の計測フック（#2053）、
+  HNSW の反復走査の回数・上限到達・再取得回数（実装済み。下の #2056 追記）、`FORMAT JSON`（#2059）、`VERBOSE`（#2060）。NoSQL 表層は変えない。
+
+## 追記（Issue #2055・SQL-76 (2)(3)）: DML の EXPLAIN ANALYZE
+
+- **対象**: 述語形の `UPDATE`／`DELETE`、`INSERT ... VALUES`、`INSERT ... SELECT`（静的な `EXPLAIN` が受理する形と同じ）。
+  オプション・出力の語彙は SELECT 版（#2054）と同じ。
+- **実際に実行し、自動では巻き戻さない**: PostgreSQL と同じく、autocommit では commit され、`USING OPERATION_ID` の
+  台帳にも通常の実行と同じく記録される。巻き戻したい場合は利用者が `BEGIN`／`ROLLBACK` で囲む（明示トランザクション内の
+  実行は `ROLLBACK` で戻り、`COMMIT` で残る）。Issue のタイトルにある「txn 内ロールバックで実装する」は、本文・親 Issue
+  の受け入れ条件（巻き戻さない）と食い違うため、後者に従った。静的な `EXPLAIN`（ANALYZE なし）は副作用ゼロのまま。
+- **実装の構造**: 読み取り専用の `ParsedSql::ExplainAnalyze` に載せず、別 variant `ParsedSql::ExplainAnalyzeDml` を
+  新設した。権限（write ゲートが内側の DML と同じビットを実行前に要求）・READ ONLY（`25006`）・operation_id の登録・
+  wire の書き込み判定が、読み取り扱いにならないことを網羅 `match` で強制するため。計画用と実行用の `ParsedSql` は
+  同じ検証済みの値から作り（第 2 の解析器・書き込み経路を作らない）、実行は通常の DML 実行関数をそのまま呼ぶ。
+- **`actual_rows` の意味**: 根の段（`update`／`delete`／`insert`）の `actual_rows` は文がクライアントへ返したはずの行数
+  （`RETURNING` の RLS 適用後の可視行。無ければ 0）。変更行数（`rows_affected`）は出さない（PostgreSQL の ModifyTable 段と
+  同じ。件数の出し方を `RETURNING` に一本化し、SQL-76 (3) の境界を保つ）。`RETURNING` の行そのものは返さない。
+- **fail-closed**: 実行時のエラーは通常の DML と同じ `wire_code` で返し、計画は返さない。分割実行（`PARTITIONED`）は
+  非原子・autocommit 専用のため `0A000`。一時表・単一行の id 形・ビュー・`UPDATE ... FROM`／`DELETE ... USING`・WHERE の
+  部分クエリは静的な `EXPLAIN` と同じ拒否のまま。`$n` 付きは Parse で `42601`、セッション無しの入口は `42601`。
+- **対象外**: 子の段（`scan`／`result`）の実測（#2053）、HNSW の可視化（#2056）、`FORMAT JSON`（#2059）、`VERBOSE`（#2060）。
+
+## 追記（Issue #2056・SQL-76 (2)(3)・SQL-73 (3)(5)）
+
+静的な `EXPLAIN` は実行時の縮退・キャッシュ状態・再取得ラウンド数を出さない（決定 1・「露出しない値」節）。実行を伴う
+`EXPLAIN ANALYZE` に限り、実行した**その 1 文**の HNSW の判断を根の段へ併記する。
+
+- **集め方**: `sql/hnsw_observe.rs` のスレッドローカルのシンク。`core/explain_analyze_exec.rs` が実行段だけをガード
+  （RAII）で囲み、`sql/hnsw_cache.rs` の記録点が書き込む。ガードが無いときは何もしない。全テナント共通の
+  `hnsw_index_cache_stats()` の前後差は他テナント・並行セッションの活動が混入するため使わない。記録点は文を実行する
+  スレッド上にある前提（別スレッドを使わない）。結合テストが「HNSW の行が実際に出る」ことで固定する。
+- **語彙（TEXT・安定契約。HNSW 経路を試行した文だけ。`TIMING`／`SUMMARY` では抑止しない）**:
+  `hnsw_index_cache: cached=<n>,built=<n>,rebuilt=<n>,not_indexed=<n>`（解決の回数）、
+  `hnsw_exact_scan: <true|false>,switches=<n>`（厳密走査へ切り替えた探索の回数。静的には HNSW 適格だったが実行時の
+  NULL 行で外れた場合を含む）、`hnsw_iterative_scan: rounds=<n>,cap_hit=<bool>,rows_examined=<n>`（反復スキャンが走った
+  ときだけ。`rows_examined` は DISTANCE 段が事後フィルタへ渡した可視の候補行数の合計）、`hnsw_refetch_rounds: <n>`
+  （hybrid 密側の探索の延べラウンド数。再取得は n-1 回）。複数の HNSW 探索を含む文は文全体の合計を根の段へ出す。
+- **テナント境界**: 索引は `(table, ctx, metric)` ごとで、最小規模の判定・厳密走査の比率・反復の行数は可視行と自 ctx の
+  グラフだけから決まる。`Lookup::Ready` と `NeedOverlay` は他テナントの書き込みでも変わるため区別せず `cached` に畳む。
+  既知事項: LRU 退避はキャッシュ全体で共通のため、他テナントの活動量で `cached` が `built` に変わりうる。行の存在・件数ではなく
+  時間と同じ区分の情報として許容する。ほか `delta_searches`・訪問ノード数・閾値は出さない。
+- **対象外**: 段ごとの帰属（#2053 の段の木への統合）、`FORMAT JSON` のキー（#2059）、`VERBOSE`（#2060）、HNSW グラフの訪問ノード数。
+
+## 追記（Issue #2053・SQL-76 (2)(3)）: 実行計測フック
+
+EXPLAIN ANALYZE（親 #2052）の「計測の土台」を実行器へ入れた。出力への配線（`QUERY PLAN` の `Actual Rows` 等・JSON キー・`ANALYZE` ゲートの解除）は #2054 以降で、本 Issue は収集型と計測点だけを持つ。
+
+- **収集型**: `sql/exec_stats.rs` の `ExecStats`（`pub(crate)`）。段は閉じた語彙 `ExecStage`（`Scan`／`Distance`／`PostFilter`／`PrecisionGate`／`Limit`／`Project`）の固定長配列で、確保量は型で決まる。各段は `rows_out`・`loops`・`elapsed`（`timing == false` では `None`）・`rows_removed_by_filter`（既存の長さの差から出せる段だけ `Some`）を持つ。同じ段が複数回記録されたら `loops` を増やし、行数と時間は飽和加算する。
+- **入口**: `exec::execute_statement_with_cache_observed`（kernel 経路）と `scan::execute_scan_with_budget_observed`（scan 経路）が末尾に `Option<&mut ExecStats>` を取る。従来の `execute_statement_with_cache`／`execute_scan_with_budget` は `None` を渡す薄いラッパーで、公開 API・`core.rs` の呼び出し元は変わらない。
+- **計測点（kernel）**: `Scan`＝候補の構築（arena のキャッシュ参照・RLS の暗黙適用・利用者ポリシー・SCALAR の事前フィルタ）から候補スロットの確定まで。`rows_out` は DISTANCE 段へ渡す候補スロット数で、arena のキャッシュ有無で同じ値になる。`Distance`＝`hits` の確定（brute-force／HNSW／hybrid／厳密全走査）。`PostFilter`＝DISTANCE 先行で事後フィルタを実際に適用したときだけ記録し、removed は前後の件数の差。`PrecisionGate`＝precision のときだけ。`Limit`＝RLS 安全網の後の OFFSET と行数上限。`Project`＝投影。途中でエラーになれば記録はそこで止まる。
+- **計測点（scan）**: ウィンドウ項目の委譲より後から `Scan` 1 段で計る（ORDER BY の直接走査と 2 パスの区別はしない）。`rows_out` は LIMIT の早期終了後に返す行数で、可視判定前の走査件数は持たない。`Project` はループと分かれていないため分けない。
+- **無効時のコスト**: `None` では段境界ごとの `is_some()` 分岐（文 1 回あたり高々 6 段）だけで、`Instant::now()` もヒープ確保もしない。行ごとのフック・カウンタ・クロージャ内の計測は置かず、行数は段境界にある既存の `Vec` の長さから取る。`hnsw.rs` の `const OBSERVE` 単相化は、2,000 行超の関数を 2 通りに複製するコスト（コード量・コンパイル時間・保守性）に見合わないため採らない。
+- **挙動不変の契約**: 計測コードは読み取りだけで `?` を持たない。計測の有無で結果の行・順序・エラー・キャッシュの効き方は変わらない（テストで同一性を固定）。
+- **テナント境界（SQL-76 (3)）**: `rows_out`／`rows_removed_by_filter` は RLS の暗黙適用の後の可視行だけから取る。他テナントを含む走査件数は型にも変数にも持たない。他テナントの行数を 0 件と多数件で変えても全段の値が変わらないことをテストで固定した。経過時間は性質上データ量で変わりうるが、不変条件は行数に関するもので、クエリの応答時間そのものが同じ情報を外へ出しており新しい漏えい路ではない。計測値をログ・notice・エラーへ出さない。
+- **未配線の経路**（同じ収集型を使って後続が足す）: aggregate・JOIN・集合演算・CTE・部分クエリ・DML は #2054／#2055、HNSW の反復走査の回数・再取得・厳密走査への切り替え・キャッシュ状態は #2056。ウィンドウ項目を持つ scan（`sql::window` への委譲）は未配線で、記録しない。
+- **オーバーヘッドのベンチ確認**: 本 Issue の実装環境では前後比較ベンチ（`make bench-c1`・`make bench-relational-p95`）を実行していない（未検証）。無効時のコストが構造上、境界の `Option` 分岐だけであることが根拠で、実測は後続で `benchmark-judgement-policy.md` の作法（N≥5 ラウンド・arm 輪番）に従って記録する。
+
+## 追記（Issue #2060・SQL-76 (4)(5)）: VERBOSE と COSTS
+
+- **受理する形**: `EXPLAIN (VERBOSE [ON|OFF]) <文>`・前置形 `EXPLAIN VERBOSE <文>`。後の指定が勝ち、`VERBOSE OFF` は
+  オプションなしと出力が完全に一致する。SELECT 系（検索・集計・広域取得・JOIN・集合演算・CTE・派生表）と述語形
+  `UPDATE`／`DELETE` を受理する。運搬は `ParsedSql::ExplainVerbose(Box<ParsedSql>)`（`#[non_exhaustive]` のため非破壊）。
+  権限ゲート（read／write）・読み取り専用の判定・台帳（`operation_id` なし）は中身と同じ扱いで、一時表を参照する文は
+  振り分けの段で `0A000`（黙って VERBOSE なしへ縮退しない）。
+- **出力の語彙（安定契約）**: 根の段の属性行の末尾（最初の子の段の直前。`explain_analyze::root_end` と同じ規則を共有）に
+  `output: <列>[, <列>...]`（結果の列名。Describe と同じ経路で導出し実行しない。素の識別子以外は `"` で囲み内部の `"` を
+  二重化、制御文字を含む名前は `0A000`）、距離順位付けの検索では `distance_metric: <cosine|l2|ip|l1>`（問い合わせの演算子の
+  種別。`USING PLAN` はコサイン）。`RETURNING` を持つ述語形 DML は `output:` を出し、無ければ追加行なし。
+  既存の行の文言・順序は変えない（VERBOSE の行を除くとオプションなしの出力と一致することをテストで固定）。
+- **使った索引の名前**: `scalar_plan:`／`ann_plan:` に Issue #1066 の注記として既に併記されるため、VERBOSE では重ねて出さない。
+  取得モードも検索の段の `mode:`／`mode_source:` が既にあるため重ねない。
+- **COSTS**: 推定のコスト・行数を持たないため ON／OFF とも出力を変えない（VERBOSE との併用も同じ）。
+- **出さないもの**: 表名・別名・推定値・行数・可視件数。追加行は文とカタログから決まる値だけで、他テナントの行量で変わらない。
+- **fail-closed**: `ANALYZE` との併用・`INSERT`・分割実行（PARTITIONED）は `0A000`。`$n` 付き（Prepare）とセッション無しの
+  入口は従来どおり `42601`。行数が上限（`MAX_EXPLAIN_TREE_LINES`）に追加行を足した範囲を超えたら `54001`。
+- **既知の制限**: 未解決の部分クエリ（`IN (SELECT ...)`／`EXISTS`）を含む WHERE の SELECT 系は、列の導出（Describe の束縛）が
+  受理しないため `output:` を省く（他の行は出る）。段ごとの中間の出力列は今回は根の最終出力だけ。

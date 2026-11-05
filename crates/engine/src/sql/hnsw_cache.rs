@@ -822,6 +822,29 @@ impl HnswIndexCache {
         }
     }
 
+    /// 厳密走査への縮退を 1 回数える（全体の `fallbacks` 加算に加え、`EXPLAIN ANALYZE` の観測シンクへも
+    /// 記録する。Issue #2056。シンクはガードが無ければ何もしない）。
+    pub(crate) fn record_fallback(&self) {
+        self.fallbacks.fetch_add(1, Ordering::Relaxed);
+        crate::sql::hnsw_observe::note(|o| {
+            o.exact_scan_switches = o.exact_scan_switches.saturating_add(1);
+        });
+    }
+
+    /// 観測シンクへ `built` だけを記録する。構築の成功後に呼ぶ（失敗時は `not_indexed` になる）。
+    pub(crate) fn note_built(&self) {
+        crate::sql::hnsw_observe::note_cache(|o| o.cache_built = o.cache_built.saturating_add(1));
+    }
+
+    /// 索引の再構築を数える（`rebuilds` 加算＋観測シンクの `rebuilt`。Issue #2056。再構築の
+    /// 試行側の `builds` 加算は呼び出し元が直接行い、シンクには `rebuilt` だけを記録する）。
+    pub(crate) fn record_rebuild(&self) {
+        self.rebuilds.fetch_add(1, Ordering::Relaxed);
+        crate::sql::hnsw_observe::note_cache(|o| {
+            o.cache_rebuilt = o.cache_rebuilt.saturating_add(1)
+        });
+    }
+
     /// `Subset` 形状の plain scan 縮退が候補 id マスク経路（複製なし）で完了した
     /// ことを記録する（Issue #676。`sql::exec` の DISTANCE 段が `SubsetSlotPlan::
     /// MaskScan` を選んだ全分岐で呼ぶ）。
@@ -838,7 +861,16 @@ impl HnswIndexCache {
 
     /// 反復スキャン 1 クエリ分の結果を記録する（SQL-73・Issue #2033。`sql::exec` の DISTANCE 段から
     /// 呼ばれる。統計はテナント ID・行 ID を含まない best-effort カウンタ）。
-    pub(crate) fn record_iterative_scan(&self, rounds: u64, cap_hit: bool) {
+    pub(crate) fn record_iterative_scan(&self, rounds: u64, cap_hit: bool, rows_examined: u64) {
+        crate::sql::hnsw_observe::note(|o| {
+            // 1 文に反復検索が複数あるときは文全体の合計（rounds・rows_examined は加算、cap_hit は OR）。
+            let prev = o.iterative.unwrap_or_default();
+            o.iterative = Some(crate::sql::hnsw_observe::IterativeObs {
+                rounds: prev.rounds.saturating_add(rounds),
+                cap_hit: prev.cap_hit || cap_hit,
+                rows_examined: prev.rows_examined.saturating_add(rows_examined),
+            });
+        });
         self.iterative_scan_queries.fetch_add(1, Ordering::Relaxed);
         self.iterative_scan_rounds
             .fetch_add(rounds, Ordering::Relaxed);
@@ -859,6 +891,9 @@ impl HnswIndexCache {
     /// ラウンド数で更新する。CAS ループは `Relaxed` の best-effort 統計のため
     /// 競合時は緩く失敗を許容する）。
     pub(crate) fn record_hybrid_query_rounds(&self, rounds: u64) {
+        crate::sql::hnsw_observe::note(|o| {
+            o.hybrid_dense_rounds = o.hybrid_dense_rounds.saturating_add(rounds);
+        });
         self.hybrid_queries.fetch_add(1, Ordering::Relaxed);
         let mut current = self.hybrid_rounds_max.load(Ordering::Relaxed);
         while rounds > current {
@@ -1332,6 +1367,44 @@ pub(crate) fn prepare_full_visible(
     ctx: &PolicyContext,
     arena: &VectorArena,
 ) -> PreparedHnswSearch {
+    let before = crate::sql::hnsw_observe::build_events();
+    let prepared = prepare_full_visible_inner(access, read_txn, table, ctx, arena);
+    // キャッシュ状態の分類（Issue #2056）。構築・再構築は `record_build`／`record_rebuild` が
+    // 記録済み。Ready／NeedOverlay は他テナントの書き込みでも変わるため区別せず `cached` に畳む。
+    if crate::sql::hnsw_observe::build_events() == before {
+        note_resolution(&prepared);
+    }
+    prepared
+}
+
+/// 索引を引けず厳密走査になった解決を 1 回記録する（Issue #2056）。
+fn note_not_indexed() {
+    crate::sql::hnsw_observe::note_cache(|o| {
+        o.cache_not_indexed = o.cache_not_indexed.saturating_add(1);
+    });
+}
+
+/// 解決結果を観測シンクへ 1 回分記録する（構築を伴わない解決。Issue #2056）。
+fn note_resolution(prepared: &PreparedHnswSearch) {
+    let indexed = !matches!(prepared, PreparedHnswSearch::FullScan);
+    crate::sql::hnsw_observe::note_cache(|o| {
+        if indexed {
+            o.cache_cached = o.cache_cached.saturating_add(1);
+        } else {
+            o.cache_not_indexed = o.cache_not_indexed.saturating_add(1);
+        }
+    });
+}
+
+/// 構築を伴うが分類済みの扱いにしない呼び出し（索引だけ作る `prepare_base_from_full_visible`）から
+/// 使う本体。
+fn prepare_full_visible_inner(
+    access: &HnswCacheAccess<'_>,
+    read_txn: &redb::ReadTransaction,
+    table: &str,
+    ctx: &PolicyContext,
+    arena: &VectorArena,
+) -> PreparedHnswSearch {
     let Some(metric) = access.graph_metric else {
         // metric が未解決（結線漏れ・未対応 metric）。誤ったグラフを引かないよう全件へ倒す。
         return PreparedHnswSearch::FullScan;
@@ -1382,6 +1455,8 @@ pub(crate) fn prepare_full_visible(
                 current_generation,
             ) {
                 Ok((built, f16_fallback, i8_fallback)) => {
+                    // 構築が成功したときだけ観測へ `built` を記録する（失敗は `not_indexed`）。
+                    access.cache.note_built();
                     if f16_fallback {
                         access
                             .cache
@@ -1452,7 +1527,7 @@ pub(crate) fn prepare_full_visible(
                         .i8_residency_fallbacks
                         .fetch_add(1, Ordering::Relaxed);
                 }
-                access.cache.rebuilds.fetch_add(1, Ordering::Relaxed);
+                access.cache.record_rebuild();
                 let new_base = access.cache.record_base(access.storage, table, built);
                 let mut identity_mask = crate::hnsw::NodeMask::new(new_base.index.len());
                 for node in 0..new_base.index.len() {
@@ -1548,7 +1623,7 @@ pub(crate) fn search_prepared(
             *success_stat,
         ),
         PreparedHnswSearch::FullScan => {
-            access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+            access.cache.record_fallback();
             let input = SearchInput {
                 ids: slot_ids,
                 vectors: arena.vectors(),
@@ -1559,7 +1634,7 @@ pub(crate) fn search_prepared(
             provider.search(input)
         }
         PreparedHnswSearch::PlainScanBelowRatio => {
-            access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+            access.cache.record_fallback();
             access.cache.plain_scans.fetch_add(1, Ordering::Relaxed);
             let input = SearchInput {
                 ids: slot_ids,
@@ -1618,7 +1693,7 @@ pub(crate) fn search_prepared_resumable(
         } => (base, overlay, *success_stat),
         PreparedHnswSearch::FullScan => {
             *resume = None;
-            access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+            access.cache.record_fallback();
             let input = SearchInput {
                 ids: slot_ids,
                 vectors: arena.vectors(),
@@ -1630,7 +1705,7 @@ pub(crate) fn search_prepared_resumable(
         }
         PreparedHnswSearch::PlainScanBelowRatio => {
             *resume = None;
-            access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+            access.cache.record_fallback();
             access.cache.plain_scans.fetch_add(1, Ordering::Relaxed);
             let input = SearchInput {
                 ids: slot_ids,
@@ -1645,18 +1720,18 @@ pub(crate) fn search_prepared_resumable(
 
     if overlay.arena_len != arena.len() {
         *resume = None;
-        access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+        access.cache.record_fallback();
         return full_scan_with_arena(provider, arena, query, k);
     }
     if overlay.regime == TraversalRegime::PlainScan {
         *resume = None;
-        access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+        access.cache.record_fallback();
         access.cache.plain_scans.fetch_add(1, Ordering::Relaxed);
         return full_scan_with_arena(provider, arena, query, k);
     }
     if overlay.mask_splits_graph {
         *resume = None;
-        access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+        access.cache.record_fallback();
         access
             .cache
             .mask_splits_graph
@@ -1665,7 +1740,7 @@ pub(crate) fn search_prepared_resumable(
     }
     if k > crate::hnsw::MAX_EF {
         *resume = None;
-        access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+        access.cache.record_fallback();
         access
             .cache
             .ef_cap_fallbacks
@@ -1720,7 +1795,7 @@ pub(crate) fn search_prepared_resumable(
                     }
                     Err(_) => {
                         *resume = None;
-                        access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+                        access.cache.record_fallback();
                         return full_scan_with_arena(provider, arena, query, k);
                     }
                 }
@@ -1737,7 +1812,7 @@ pub(crate) fn search_prepared_resumable(
             }
             Err(_) => {
                 *resume = None;
-                access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+                access.cache.record_fallback();
                 return full_scan_with_arena(provider, arena, query, k);
             }
         }
@@ -1831,6 +1906,21 @@ pub(crate) fn search_or_fallback(
 ///    自体は `k` に依存しないため、hybrid 密側再取得ループの複数ラウンドでも
 ///    1 回の呼び出し結果をそのまま使い回せる。
 pub(crate) fn prepare_subset(
+    access: &HnswCacheAccess<'_>,
+    read_txn: &redb::ReadTransaction,
+    table: &str,
+    ctx: &PolicyContext,
+    arena: &VectorArena,
+) -> PreparedHnswSearch {
+    // 事前構築が数え済みの検索では、この解決を重ねて数えない。
+    let _suppress = crate::sql::hnsw_observe::take_pre_resolved()
+        .then(crate::sql::hnsw_observe::suppress_cache_notes);
+    let prepared = prepare_subset_inner(access, read_txn, table, ctx, arena);
+    note_resolution(&prepared);
+    prepared
+}
+
+fn prepare_subset_inner(
     access: &HnswCacheAccess<'_>,
     read_txn: &redb::ReadTransaction,
     table: &str,
@@ -1983,17 +2073,42 @@ pub(crate) fn prepare_subset_from_slots(
     kept: &[u32],
     k: usize,
 ) -> SubsetSlotPlan {
+    // 事前構築が数え済みの検索では、この解決を重ねて数えない。
+    let _suppress = crate::sql::hnsw_observe::take_pre_resolved()
+        .then(crate::sql::hnsw_observe::suppress_cache_notes);
+    let before = crate::sql::hnsw_observe::cache_not_indexed();
+    let plan =
+        prepare_subset_from_slots_inner(access, read_txn, table, ctx, snapshot_arena, kept, k);
+    // 索引が引けない（metric 未解決・Miss など）ときは内側が `not_indexed` を記録済み。
+    // それ以外は索引を再利用した解決として `cached` を数える。
+    if crate::sql::hnsw_observe::cache_not_indexed() == before {
+        crate::sql::hnsw_observe::note_cache(|o| o.cache_cached = o.cache_cached.saturating_add(1));
+    }
+    plan
+}
+
+fn prepare_subset_from_slots_inner(
+    access: &HnswCacheAccess<'_>,
+    read_txn: &redb::ReadTransaction,
+    table: &str,
+    ctx: &PolicyContext,
+    snapshot_arena: &VectorArena,
+    kept: &[u32],
+    k: usize,
+) -> SubsetSlotPlan {
     let mask_scan = |access: &HnswCacheAccess<'_>| {
         access.cache.record_subset_mask_scan();
         SubsetSlotPlan::MaskScan
     };
 
     let Some(metric) = access.graph_metric else {
-        access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+        access.cache.record_fallback();
+        note_not_indexed();
         return mask_scan(access);
     };
     let Ok(build_params) = effective_build_params(access) else {
-        access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+        access.cache.record_fallback();
+        note_not_indexed();
         return mask_scan(access);
     };
     let base = match require_build_params(
@@ -2003,7 +2118,8 @@ pub(crate) fn prepare_subset_from_slots(
         &build_params,
     ) {
         Lookup::BuildFailedThisGeneration | Lookup::Miss => {
-            access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+            access.cache.record_fallback();
+            note_not_indexed();
             return mask_scan(access);
         }
         Lookup::Ready(base, _full_arena_overlay) => base,
@@ -2011,7 +2127,7 @@ pub(crate) fn prepare_subset_from_slots(
     };
 
     if base.arena_identity_mismatch_guard(snapshot_arena, ctx, metric) {
-        access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+        access.cache.record_fallback();
         return mask_scan(access);
     }
 
@@ -2025,13 +2141,13 @@ pub(crate) fn prepare_subset_from_slots(
         base.index.member_count(),
         access.provider.full_scan_ratio(),
     ) {
-        access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+        access.cache.record_fallback();
         access.cache.plain_scans.fetch_add(1, Ordering::Relaxed);
         return mask_scan(access);
     }
 
     let Ok(current_generation) = crate::catalog::table_generation_in_txn(read_txn, table) else {
-        access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+        access.cache.record_fallback();
         return mask_scan(access);
     };
 
@@ -2045,12 +2161,12 @@ pub(crate) fn prepare_subset_from_slots(
     );
 
     if overlay.regime == TraversalRegime::PlainScan {
-        access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+        access.cache.record_fallback();
         access.cache.plain_scans.fetch_add(1, Ordering::Relaxed);
         return mask_scan(access);
     }
     if overlay.mask_splits_graph {
-        access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+        access.cache.record_fallback();
         access
             .cache
             .mask_splits_graph
@@ -2058,7 +2174,7 @@ pub(crate) fn prepare_subset_from_slots(
         return mask_scan(access);
     }
     if k > crate::hnsw::MAX_EF {
-        access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+        access.cache.record_fallback();
         access
             .cache
             .ef_cap_fallbacks
@@ -2295,7 +2411,7 @@ fn search_with_overlay(
     success_stat: OverlaySuccessStat,
 ) -> Result<Vec<CandidateHit>, KernelError> {
     if overlay.arena_len != arena.len() {
-        access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+        access.cache.record_fallback();
         return full_scan_with_arena(provider, arena, query, k);
     }
 
@@ -2305,7 +2421,7 @@ fn search_with_overlay(
     // と同一の判定式（[`below_full_scan_ratio`] 由来）を共有する単一情報源
     // （Issue #488 の方針をそのまま踏襲。ここでの再計算を撤去した）。
     if overlay.regime == TraversalRegime::PlainScan {
-        access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+        access.cache.record_fallback();
         access.cache.plain_scans.fetch_add(1, Ordering::Relaxed);
         return full_scan_with_arena(provider, arena, query, k);
     }
@@ -2317,7 +2433,7 @@ fn search_with_overlay(
     // mask_splits_graph` ドキュメンテーションコメント参照。`masked_short` と
     // 区別できるよう独立カウンタへ計上する）。
     if overlay.mask_splits_graph {
-        access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+        access.cache.record_fallback();
         access
             .cache
             .mask_splits_graph
@@ -2334,7 +2450,7 @@ fn search_with_overlay(
     // 検証順序を先取りして `ef_cap_fallbacks` を独立計上する（`search_masked`
     // 自体は呼ばない。呼んでも同じ結果に帰着するが二重検証を避ける）。
     if k > crate::hnsw::MAX_EF {
-        access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+        access.cache.record_fallback();
         access
             .cache
             .ef_cap_fallbacks
@@ -2375,7 +2491,7 @@ fn search_with_overlay(
     let index_hits = match index_hits {
         Ok(hits) => hits,
         Err(_) => {
-            access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+            access.cache.record_fallback();
             return full_scan_with_arena(provider, arena, query, k);
         }
     };
@@ -2397,7 +2513,7 @@ fn search_with_overlay(
                 overlay.visible_in_index,
                 ratio,
             ) {
-                access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+                access.cache.record_fallback();
                 access
                     .cache
                     .acorn_guard_fallbacks
@@ -2472,7 +2588,7 @@ fn finish_indexed_search(
     // 縮退して k 件充足を保証する。
     let expected = k.min(overlay.visible_in_index);
     if index_hits.len() < expected {
-        access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+        access.cache.record_fallback();
         access.cache.masked_short.fetch_add(1, Ordering::Relaxed);
         fell_back.set(true);
         return full_scan_with_arena(provider, arena, query, k);
@@ -2482,7 +2598,7 @@ fn finish_indexed_search(
     for hit in index_hits {
         let node = hit.id as u32;
         let Some(&slot) = overlay.slot_of_node.get(node as usize) else {
-            access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+            access.cache.record_fallback();
             fell_back.set(true);
             return full_scan_with_arena(provider, arena, query, k);
         };
@@ -2492,31 +2608,31 @@ fn finish_indexed_search(
             // `slot_of_node[node] != STALE_SLOT` のノードのみを受理する）。
             // マスクとオーバーレイの不整合という想定外事態を fail-closed に
             // 全件 brute-force へ倒す（黙って握りつぶさない）。
-            access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+            access.cache.record_fallback();
             fell_back.set(true);
             return full_scan_with_arena(provider, arena, query, k);
         }
         let slot_usize = slot as usize;
         let Some(node_key) = base.node_keys.get(node as usize) else {
-            access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+            access.cache.record_fallback();
             fell_back.set(true);
             return full_scan_with_arena(provider, arena, query, k);
         };
         let arena_tenant = arena.tenant_id(slot_usize);
         let arena_id = arena.row_id(slot_usize).map(|r| r.raw_for_arena());
         if arena_tenant != Some(node_key.0.as_str()) || arena_id != Some(node_key.1) {
-            access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+            access.cache.record_fallback();
             fell_back.set(true);
             return full_scan_with_arena(provider, arena, query, k);
         }
         let Some(vec_at_slot) = arena.vector(slot_usize) else {
-            access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+            access.cache.record_fallback();
             fell_back.set(true);
             return full_scan_with_arena(provider, arena, query, k);
         };
         let Some(score) = rescore_indexed_hit(base.index.metric(), vec_at_slot, query) else {
             // 再採点が未対応の metric（delta・全走査の score 定義と揃えられない）。
-            access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+            access.cache.record_fallback();
             fell_back.set(true);
             return full_scan_with_arena(provider, arena, query, k);
         };
@@ -2856,7 +2972,12 @@ pub(crate) fn prepare_base_from_full_visible(
     ctx: &PolicyContext,
     full_visible_arena: &VectorArena,
 ) {
-    let _ = prepare_full_visible(access, read_txn, table, ctx, full_visible_arena);
+    let before = crate::sql::hnsw_observe::build_events();
+    let _ = prepare_full_visible_inner(access, read_txn, table, ctx, full_visible_arena);
+    // 構築した場合は built／rebuilt を数え済み。直後の部分集合解決は cached を足さない。
+    if crate::sql::hnsw_observe::build_events() != before {
+        crate::sql::hnsw_observe::mark_pre_resolved();
+    }
 }
 
 #[cfg(test)]
@@ -2865,6 +2986,30 @@ mod tests {
     use crate::catalog::{ColumnDef, ColumnType, TableSchema};
     use crate::rls::ImplicitRlsHook;
     use crate::storage::{RowInput, Storage, Visibility};
+
+    #[test]
+    fn record_iterative_scan_accumulates_across_searches() {
+        let cache = HnswIndexCache::new();
+        let g = crate::sql::hnsw_observe::enter();
+        cache.record_iterative_scan(2, false, 30);
+        cache.record_iterative_scan(3, true, 50);
+        let o = g.finish();
+        let it = o.iterative.expect("iterative recorded");
+        assert_eq!(it.rounds, 5);
+        assert!(it.cap_hit);
+        assert_eq!(it.rows_examined, 80);
+    }
+
+    #[test]
+    fn note_built_counts_only_observation_not_builds_counter() {
+        let cache = HnswIndexCache::new();
+        let g = crate::sql::hnsw_observe::enter();
+        cache.note_built();
+        let o = g.finish();
+        assert_eq!(o.cache_built, 1);
+        assert_eq!(cache.builds.load(Ordering::Relaxed), 0);
+    }
+
     use crate::test_util::temp_db::{unique_db_path, CleanupGuard};
 
     /// Issue #2243: opclass と距離種別の写像が往復で恒等になること。

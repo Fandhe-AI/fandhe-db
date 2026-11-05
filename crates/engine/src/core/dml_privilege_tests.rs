@@ -516,3 +516,34 @@ fn self_referencing_write_requires_select_on_the_target() {
         f.admin_run(&format!("REVOKE ALL ON {table} FROM alice"));
     }
 }
+
+/// Issue #2055・SQL-40: DML の `EXPLAIN ANALYZE` は実際に書き込むため、通常の DML と同じ権限を実行前に要求する。
+/// 拒否時は行も台帳も変わらず、GRANT の後は実行されて変更が残る。
+#[test]
+fn explain_analyze_dml_needs_the_same_privileges() {
+    let f = fx("dmlpriv-analyze");
+    f.admin_run(&ins("ca", 1, "seed"));
+    f.admin_run(&ins("cb", 5, "seed-b"));
+    let del = "EXPLAIN ANALYZE DELETE FROM ca WHERE n > 0 USING OPERATION_ID 'ea-d'";
+    let upd = "EXPLAIN ANALYZE UPDATE ca SET n = 5 WHERE n > 0";
+    let insert = "EXPLAIN ANALYZE INSERT INTO ca (id, embedding, n) VALUES (9, '[1.0, 0.0]', 1)";
+    let insert_select = "EXPLAIN ANALYZE INSERT INTO ca (id, embedding, n) \
+                         SELECT id, embedding, n FROM cb";
+    for sql in [del, upd, insert, insert_select] {
+        assert_eq!(f.alice_run(sql), "42501", "{sql}");
+    }
+    assert_eq!(f.count("ca"), 1);
+    f.admin_run("GRANT INSERT ON ca TO alice");
+    assert_eq!(f.alice_run(insert), "ok");
+    assert_eq!(f.alice_run(insert_select), "42501");
+    f.admin_run("GRANT SELECT ON cb TO alice");
+    assert_eq!(f.alice_run(insert_select), "ok");
+    assert_eq!(f.count("ca"), 3);
+    f.admin_run("GRANT UPDATE ON ca TO alice");
+    f.admin_run("GRANT DELETE ON ca TO alice");
+    assert_eq!(f.alice_run(del), "42501");
+    f.admin_run("GRANT SELECT ON ca TO alice");
+    assert_eq!(f.alice_run(upd), "ok");
+    assert_eq!(f.alice_run(del), "ok");
+    assert_eq!(f.count("ca"), 0);
+}

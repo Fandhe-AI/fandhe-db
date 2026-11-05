@@ -400,7 +400,7 @@ fn explain_format_json_returns_one_json_cell_with_oid_114() {
 }
 
 /// Issue #2058（SQL-76 (1)）: 簡易クエリで `EXPLAIN (COSTS OFF) SELECT ...` はオプションなしと同じ行を返し、
-/// 未実装の `EXPLAIN (ANALYZE) ...` は `0A000`、未知のオプションは `42601` の ErrorResponse になる。
+/// 未知のオプションは `42601` の ErrorResponse になる。
 #[test]
 fn explain_with_options_accepted_or_rejected() {
     let (core, _guard) = new_core_with_docs_table();
@@ -425,11 +425,118 @@ fn explain_with_options_accepted_or_rejected() {
     assert_eq!(read_command_complete(&mut stream), "EXPLAIN");
     read_ready_for_query(&mut stream);
 
-    send_simple_query(&mut stream, "EXPLAIN (ANALYZE) SELECT id FROM docs");
-    expect_error_response_with_sqlstate(&mut stream, "0A000");
-    read_ready_for_query(&mut stream);
-
     send_simple_query(&mut stream, "EXPLAIN (FOO) SELECT id FROM docs");
     expect_error_response_with_sqlstate(&mut stream, "42601");
+    read_ready_for_query(&mut stream);
+}
+
+/// Issue #2054（SQL-76 (2)）: 簡易クエリの `EXPLAIN ANALYZE SELECT ...` は `QUERY PLAN` 単一列の計画に
+/// `actual_rows` を併記して返し、docs の行そのものは返さない。`CommandComplete` は既存の EXPLAIN と同じ
+/// `EXPLAIN` タグ。分割実行 DML の ANALYZE は `0A000`。
+#[test]
+fn explain_analyze_select_returns_plan_with_actual_rows() {
+    let (core, _guard) = new_core_with_docs_table();
+    let (mut stream, _users_path) = spawn_with_alice(core);
+
+    send_simple_query(&mut stream, "EXPLAIN ANALYZE SELECT id FROM docs");
+    let columns = read_row_description(&mut stream);
+    assert_eq!(columns, vec!["QUERY PLAN".to_string()]);
+    let mut seen = Vec::new();
+    // 計画の行は有限。`execution_time_ms` が最後の行。
+    for _ in 0..64 {
+        let row = read_data_row(&mut stream);
+        let text = row[0].clone().expect("plan line");
+        let last = text.starts_with("execution_time_ms: ");
+        seen.push(text);
+        if last {
+            break;
+        }
+    }
+    assert!(seen.iter().any(|l| l == "actual_rows: 1"), "{seen:?}");
+    assert!(seen.iter().any(|l| l == "actual_loops: 1"), "{seen:?}");
+    assert!(
+        seen.iter().any(|l| l.starts_with("planning_time_ms: ")),
+        "{seen:?}"
+    );
+    assert!(!seen.iter().any(|l| l.contains("docs/a.md")), "{seen:?}");
+    assert_eq!(read_command_complete(&mut stream), "EXPLAIN");
+    read_ready_for_query(&mut stream);
+
+    // Issue #2055: 分割実行の ANALYZE は従来どおり `0A000`。
+    send_simple_query(
+        &mut stream,
+        "EXPLAIN ANALYZE DELETE FROM docs WHERE path = 'docs/a.md' USING OPERATION_ID 'w1' PARTITIONED CHUNK 1",
+    );
+    expect_error_response_with_sqlstate(&mut stream, "0A000");
+    read_ready_for_query(&mut stream);
+}
+
+/// Issue #2060（SQL-76 (4)(5)）: 簡易クエリの `EXPLAIN (VERBOSE) SELECT ...` は `QUERY PLAN` 単一列の計画の
+/// 根の段へ `output:`／`distance_metric:` を足して返し、`EXPLAIN (ANALYZE, VERBOSE)` は `0A000`。
+#[test]
+fn explain_verbose_adds_output_and_metric_rows() {
+    let (core, _guard) = new_core_with_docs_table();
+    let (mut stream, _users_path) = spawn_with_alice(core);
+
+    send_simple_query(
+        &mut stream,
+        "EXPLAIN (VERBOSE) SELECT id FROM docs ORDER BY embedding <=> '[1.0,0.0]' LIMIT 10",
+    );
+    let columns = read_row_description(&mut stream);
+    assert_eq!(columns, vec!["QUERY PLAN".to_string()]);
+    for expected in [
+        "mode: recall",
+        "mode_source: default",
+        "engine: (custom_provider)",
+        "ann_plan: unknown_custom_provider",
+        "scalar_plan: plain_scan",
+        "output: id",
+        "distance_metric: cosine",
+    ] {
+        let row = read_data_row(&mut stream);
+        assert_eq!(row[0].as_deref(), Some(expected));
+    }
+    assert_eq!(read_command_complete(&mut stream), "EXPLAIN");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(
+        &mut stream,
+        "EXPLAIN (ANALYZE, VERBOSE) SELECT id FROM docs",
+    );
+    expect_error_response_with_sqlstate(&mut stream, "0A000");
+    read_ready_for_query(&mut stream);
+}
+
+/// Issue #2055（SQL-76 (2)）: 簡易クエリの `EXPLAIN ANALYZE DELETE ...` は実際に削除して commit し、
+/// `QUERY PLAN` 単一列の計画を `EXPLAIN` タグで返す。続く SELECT に削除が反映されている。
+#[test]
+fn explain_analyze_delete_executes_and_commits() {
+    let (core, _guard) = new_core_with_docs_table();
+    let (mut stream, _users_path) = spawn_with_alice(core);
+
+    send_simple_query(
+        &mut stream,
+        "EXPLAIN (ANALYZE, TIMING OFF, SUMMARY OFF) DELETE FROM docs WHERE path = 'docs/a.md'",
+    );
+    let columns = read_row_description(&mut stream);
+    assert_eq!(columns, vec!["QUERY PLAN".to_string()]);
+    let mut seen = Vec::new();
+    // DataRow（'D'）が続く間だけ読む（子の段の行数は固定しない）。
+    loop {
+        let mut next = [0u8; 1];
+        stream.peek(&mut next).expect("peek message type");
+        if next[0] != b'D' {
+            break;
+        }
+        let row = read_data_row(&mut stream);
+        seen.push(row[0].clone().expect("plan line"));
+    }
+    assert!(seen.iter().any(|l| l == "actual_rows: 0"), "{seen:?}");
+    assert_eq!(read_command_complete(&mut stream), "EXPLAIN");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(&mut stream, "SELECT id FROM docs");
+    let _ = read_row_description(&mut stream);
+    assert_eq!(read_command_complete(&mut stream), "SELECT 0");
     read_ready_for_query(&mut stream);
 }

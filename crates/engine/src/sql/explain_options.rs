@@ -11,14 +11,16 @@
 //!   [`RawExplainOptions::resolve`] を呼ぶ）と `sql::params`（Prepare 経路で [`has_option_list`] により
 //!   `$n` との併用を拒否する）。`fetch_clause::normalize_statement_tokens` には置かない
 //!   （PL/pgSQL・ビュー本文・入れ子へ黙って効くのを避ける）。
+//! - 前置形 `EXPLAIN ANALYZE [VERBOSE] <文>`・`EXPLAIN VERBOSE <文>`（Issue #2054）も構文段で括弧形の
+//!   オプション列へ正規化する（PostgreSQL の旧構文。`ANALYSE` の綴りも可）。
 //! - セッション無しの入口（`execute_sql` 系）は `parse_tokens_in` を通らないため、従来どおり
-//!   `EXPLAIN` の直後が `(` の形は許可リストの `42601` になる。
+//!   `EXPLAIN` の直後が `(` の形・前置形は許可リストの `42601` になる。
 //!
-//! 受け渡し先: 受理した [`ExplainOptions`] のうち出力を変えるのは `FORMAT JSON`（#2059）だけで、
-//! `core::EngineCore::parse_tokens_in` が `ParsedSql::ExplainJson` で包む（`COSTS` は推定値を出さないため無影響）。
-//! `ANALYZE`（#2052）・`SUMMARY`（#2052）・`VERBOSE`（#2060）は未実装で `0A000`
-//! のゲートに掛け、文を実行しない（黙って無視する fail-open を作らない）。各 Issue がゲートを外すときに
-//! `ParsedSql`／`SqlOutcome` へ運ぶ field を足す。
+//! 受け渡し先: 受理した [`ExplainOptions`] のうち `ANALYZE`（Issue #2054）は `core::parse_tokens_in` が
+//! `ParsedSql::ExplainAnalyze` に運ぶ。`FORMAT JSON`（#2059）は同関数が `ParsedSql::ExplainJson` で包む。
+//! `COSTS` は推定値を出さないため出力を変えない。`VERBOSE`（#2060）は `ParsedSql::ExplainVerbose` に運ぶ
+//! （`ANALYZE` との併用は `0A000`）。`FORMAT JSON` と `ANALYZE`／`VERBOSE` の併用・`ANALYZE` なしの
+//! `SUMMARY` は未実装で `0A000` のゲートに掛け、文を実行しない（黙って無視する fail-open を作らない）。
 //!
 //! untrusted な入力を扱うため、添字アクセス・`unwrap`・`expect` を使わず `get` で走査する。確保量は
 //! 入力トークン数で上限が決まり、再帰しない。エラーメッセージは固定文字列で入力をエコーしない。
@@ -37,7 +39,7 @@ pub(crate) enum ExplainFormat {
 
 /// 畳み込み後のオプション（後の指定が勝つ）。後続 Issue が `ParsedSql` へ運ぶ土台。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // 現状は resolve の検証結果としてのみ使う（運搬は #2052／#2059／#2060）
+#[allow(dead_code)] // `costs`／`format` は resolve の検証結果としてのみ使う（`format` の運搬は #2059）
 pub(crate) struct ExplainOptions {
     pub(crate) analyze: bool,
     pub(crate) verbose: bool,
@@ -94,6 +96,11 @@ fn rest_has_option_list(rest: &[Token]) -> bool {
         || is_word(rest.get(1), "WITH"))
 }
 
+/// 前置形の修飾語（`ANALYZE`／`ANALYSE`／`VERBOSE`）か。
+fn is_prefix_modifier(tok: Option<&Token>) -> bool {
+    is_word(tok, "ANALYZE") || is_word(tok, "ANALYSE") || is_word(tok, "VERBOSE")
+}
+
 /// 先頭が `EXPLAIN ( <オプション>` の形か。`sql::params` が Prepare 経路で `$n` との併用を拒否するのに使う。
 pub(crate) fn has_option_list(tokens: &[Token]) -> bool {
     is_word(tokens.first(), "EXPLAIN") && rest_has_option_list(tokens.get(1..).unwrap_or(&[]))
@@ -101,6 +108,13 @@ pub(crate) fn has_option_list(tokens: &[Token]) -> bool {
 
 /// オプション数の上限（無制限走査・確保の防止。Issue #2059）。
 const MAX_EXPLAIN_OPTIONS: usize = 32;
+
+/// 先頭が `EXPLAIN` で、括弧のオプション列か前置の修飾語（`ANALYZE`／`VERBOSE`）を持つ形か。
+/// `sql::params` が Prepare 経路で `$n` との併用を拒否するのに使う（Issue #2054）。
+pub(crate) fn has_explain_modifiers(tokens: &[Token]) -> bool {
+    has_option_list(tokens)
+        || (is_word(tokens.first(), "EXPLAIN") && is_prefix_modifier(tokens.get(1)))
+}
 
 fn syntax(detail: &'static str) -> SqlSurfaceError {
     SqlSurfaceError::unsupported(detail)
@@ -112,6 +126,9 @@ pub(crate) fn extract(
     tokens: Vec<Token>,
 ) -> Result<(Vec<Token>, Option<RawExplainOptions>), SqlSurfaceError> {
     if !has_option_list(&tokens) {
+        if is_word(tokens.first(), "EXPLAIN") && is_prefix_modifier(tokens.get(1)) {
+            return extract_prefix_form(tokens);
+        }
         return Ok((tokens, None));
     }
     // tokens[0] = EXPLAIN, tokens[1] = '('。
@@ -170,6 +187,36 @@ pub(crate) fn extract(
         return Err(syntax("EXPLAIN requires a statement"));
     }
     // 二重のリスト（`EXPLAIN (a) (b) SELECT`）は受理しない。
+    if rest_has_option_list(body) {
+        return Err(syntax("invalid EXPLAIN option list"));
+    }
+    let mut out = Vec::with_capacity(body.len().saturating_add(1));
+    if let Some(head) = tokens.first() {
+        out.push(head.clone());
+    }
+    out.extend_from_slice(body);
+    Ok((out, Some(RawExplainOptions { items })))
+}
+
+/// 前置形 `EXPLAIN [ANALYZE|ANALYSE] [VERBOSE] <文>` を括弧形と同じ生のオプション列へ正規化する
+/// （Issue #2054）。前置の直後に括弧のリストが続く形・本文が空の形は `42601`。
+fn extract_prefix_form(
+    tokens: Vec<Token>,
+) -> Result<(Vec<Token>, Option<RawExplainOptions>), SqlSurfaceError> {
+    let mut pos = 1usize;
+    let mut items: Vec<(String, RawValue)> = Vec::new();
+    if is_word(tokens.get(pos), "ANALYZE") || is_word(tokens.get(pos), "ANALYSE") {
+        items.push(("ANALYZE".to_string(), RawValue::Omitted));
+        pos += 1;
+    }
+    if is_word(tokens.get(pos), "VERBOSE") {
+        items.push(("VERBOSE".to_string(), RawValue::Omitted));
+        pos += 1;
+    }
+    let body = tokens.get(pos..).unwrap_or(&[]);
+    if body.is_empty() || matches!(body.first(), Some(Token::Punct(';'))) {
+        return Err(syntax("EXPLAIN requires a statement"));
+    }
     if rest_has_option_list(body) {
         return Err(syntax("invalid EXPLAIN option list"));
     }
@@ -252,19 +299,18 @@ impl RawExplainOptions {
             });
         }
         // 未実装のゲート（後続 Issue が外す）。文は実行しない。
-        if opts.analyze {
-            return Err(SqlSurfaceError::feature_not_supported(
-                "EXPLAIN ANALYZE is not implemented yet",
-            ));
-        }
-        if opts.summary == Some(true) {
+        // `ANALYZE`（Issue #2054）は呼び出し元（`parse_tokens_in`）が対象の種別を見て受理・拒否する。
+        // `SUMMARY` の真は実測を伴う `ANALYZE` と併せたときだけ意味を持つ。
+        if opts.summary == Some(true) && !opts.analyze {
             return Err(SqlSurfaceError::feature_not_supported(
                 "EXPLAIN SUMMARY is not implemented yet",
             ));
         }
-        if opts.verbose {
+        // `ANALYZE` と `VERBOSE` の併用は、ANALYZE の計画の生成経路（実行と同じ経路を通る）へ描画
+        // オプションを運ぶ必要があるため未実装（黙って VERBOSE なしへ落とさない fail-closed）。
+        if opts.verbose && opts.analyze {
             return Err(SqlSurfaceError::feature_not_supported(
-                "EXPLAIN VERBOSE is not implemented yet",
+                "EXPLAIN ANALYZE with VERBOSE is not implemented yet",
             ));
         }
         Ok(opts)
@@ -318,9 +364,22 @@ mod tests {
             "EXPLAIN (FORMAT JSON) SELECT 1",
             "EXPLAIN (FORMAT TEXT, FORMAT JSON) SELECT 1",
             "EXPLAIN (TIMING, TIMING OFF) SELECT 1",
+            "EXPLAIN (ANALYZE) SELECT 1",
+            "EXPLAIN (ANALYZE, TIMING OFF, SUMMARY OFF) SELECT 1",
+            "EXPLAIN (ANALYZE, SUMMARY) SELECT 1",
+            "EXPLAIN ANALYZE SELECT 1",
+            "EXPLAIN ANALYSE SELECT 1",
+            "EXPLAIN (VERBOSE) SELECT 1",
+            "EXPLAIN (VERBOSE ON, COSTS OFF) SELECT 1",
+            "EXPLAIN VERBOSE SELECT 1",
         ] {
             assert!(run(sql).expect(sql).is_some(), "{sql}");
         }
+        // 後の指定が勝つ（Issue #2060）。
+        let v = |sql: &str| run(sql).expect(sql).expect("opts").verbose;
+        assert!(v("EXPLAIN (VERBOSE) SELECT 1"));
+        assert!(!v("EXPLAIN (VERBOSE, VERBOSE OFF) SELECT 1"));
+        assert!(v("EXPLAIN (VERBOSE OFF, VERBOSE) SELECT 1"));
         let (out, _) = extract(toks("EXPLAIN (COSTS OFF) SELECT 1")).expect("ok");
         assert_eq!(out, toks("EXPLAIN SELECT 1"));
     }
@@ -378,15 +437,37 @@ mod tests {
             "EXPLAIN (MEMORY) SELECT 1",
             "EXPLAIN (FORMAT XML) SELECT 1",
             "EXPLAIN (FORMAT YAML) SELECT 1",
-            "EXPLAIN (ANALYZE) SELECT 1",
-            "EXPLAIN (VERBOSE) SELECT 1",
+            "EXPLAIN (ANALYZE, VERBOSE) SELECT 1",
+            "EXPLAIN ANALYZE VERBOSE SELECT 1",
             "EXPLAIN (SUMMARY) SELECT 1",
-            "EXPLAIN (ANALYZE OFF, ANALYZE) SELECT 1",
+            "EXPLAIN (ANALYZE OFF, SUMMARY) SELECT 1",
             "EXPLAIN (BUFFERS, FOO) SELECT 1",
         ] {
             assert_eq!(code(sql), "0A000", "{sql}");
         }
         assert_eq!(code("EXPLAIN (FOO, BUFFERS) SELECT 1"), "42601");
+    }
+
+    /// SQL-76 (1)・Issue #2054: 前置形は括弧形と同じ生のオプション列へ正規化される。
+    #[test]
+    fn prefix_form_normalized() {
+        let (out, raw) = extract(toks("EXPLAIN ANALYZE SELECT 1")).expect("ok");
+        assert_eq!(out, toks("EXPLAIN SELECT 1"));
+        let opts = raw.expect("raw").resolve().expect("resolve");
+        assert!(opts.analyze && !opts.verbose);
+        let (out, raw) = extract(toks("EXPLAIN ANALYSE VERBOSE SELECT 1")).expect("ok");
+        assert_eq!(out, toks("EXPLAIN SELECT 1"));
+        assert_eq!(raw.expect("raw").items.len(), 2);
+        for sql in [
+            "EXPLAIN ANALYZE (COSTS) SELECT 1",
+            "EXPLAIN ANALYZE",
+            "EXPLAIN VERBOSE;",
+        ] {
+            assert_eq!(code(sql), "42601", "{sql}");
+        }
+        assert!(has_explain_modifiers(&toks("EXPLAIN ANALYZE SELECT 1")));
+        assert!(has_explain_modifiers(&toks("EXPLAIN (COSTS) SELECT 1")));
+        assert!(!has_explain_modifiers(&toks("EXPLAIN SELECT 1")));
     }
 
     /// SQL-76 (1): Prepare 経路の判別。

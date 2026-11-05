@@ -282,8 +282,14 @@ fn option_errors_use_fixed_codes() {
         ("EXPLAIN (FORMAT YAML) SELECT * FROM a", "0A000"),
         ("EXPLAIN (FORMAT CSV) SELECT * FROM a", "22023"),
         ("EXPLAIN (FORMAT) SELECT * FROM a", "42601"),
-        ("EXPLAIN (ANALYZE) SELECT * FROM a", "0A000"),
-        ("EXPLAIN (VERBOSE) SELECT * FROM a", "0A000"),
+        // ANALYZE／VERBOSE 単独は実装済み（#2054・#2060）。JSON との併用は JSON 化する経路が無く 0A000。
+        ("EXPLAIN (FORMAT JSON, ANALYZE) SELECT * FROM a", "0A000"),
+        ("EXPLAIN (FORMAT JSON, VERBOSE) SELECT * FROM a", "0A000"),
+        ("EXPLAIN (VERBOSE, FORMAT JSON) SELECT * FROM a", "0A000"),
+        (
+            "EXPLAIN (FORMAT JSON, ANALYZE) UPDATE a SET k = 1 WHERE k = 2",
+            "0A000",
+        ),
         ("EXPLAIN (BUFFERS) SELECT * FROM a", "0A000"),
         ("EXPLAIN (BOGUS) SELECT * FROM a", "42601"),
         ("EXPLAIN () SELECT * FROM a", "42601"),

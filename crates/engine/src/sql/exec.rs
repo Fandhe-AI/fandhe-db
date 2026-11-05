@@ -45,6 +45,7 @@ use crate::rls::{ImplicitRlsHook, RlsSafetyNet, RlsVerifiedHits};
 use crate::row_codec::{self, RowCodecError, ScalarRef, Value};
 use crate::sparse::{DocId, SparseError, SparseIndex};
 use crate::sql::allowlist::SqlSurfaceError;
+use crate::sql::exec_stats::{stage_end, stage_start, ExecStage, ExecStats};
 use crate::sql::parser::{
     BoundConflictAction, BoundPredicateDelete, BoundPredicateUpdate, BoundStatement, BoundUpsert,
     BoundUpsertValue, ProjectedColumn, Ranking,
@@ -1237,6 +1238,40 @@ pub(crate) fn execute_statement_with_cache(
     hnsw_cache: Option<crate::sql::hnsw_cache::HnswCacheAccess<'_>>,
     scalar_cache: Option<crate::sql::scalar_index::ScalarCacheAccess<'_>>,
 ) -> Result<QueryResult, SqlSurfaceError> {
+    execute_statement_with_cache_observed(
+        read_txn,
+        provider,
+        ctx,
+        schema,
+        bound,
+        precision_policy,
+        sparse_cache,
+        arena_cache,
+        hnsw_cache,
+        scalar_cache,
+        None,
+    )
+}
+
+/// [`execute_statement_with_cache`] の本体（Issue #2053・SQL-76 (2)(3)）。末尾の `stats` が
+/// `Some` のときだけ、段境界（Scan／Distance／PostFilter／PrecisionGate／Limit／Project）で
+/// 出力行数・ループ回数・経過時間を [`ExecStats`] へ記録する。`None` では段境界ごとの分岐のみで、
+/// 結果・エラー・キャッシュの挙動は計測の有無で変わらない（`sql::exec_stats` 参照）。
+/// 行数は RLS 暗黙適用後の可視行だけから取る。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_statement_with_cache_observed(
+    read_txn: &impl crate::storage::read_source::ReadSource,
+    provider: &dyn SearchProvider,
+    ctx: &PolicyContext,
+    schema: &TableSchema,
+    bound: &BoundStatement,
+    precision_policy: &crate::precision::PrecisionPolicy,
+    sparse_cache: Option<crate::sql::sparse_cache::SparseCacheAccess<'_>>,
+    arena_cache: Option<crate::sql::arena_cache::ArenaCacheAccess<'_>>,
+    hnsw_cache: Option<crate::sql::hnsw_cache::HnswCacheAccess<'_>>,
+    scalar_cache: Option<crate::sql::scalar_index::ScalarCacheAccess<'_>>,
+    mut stats: Option<&mut ExecStats>,
+) -> Result<QueryResult, SqlSurfaceError> {
     // SQL 実行経路に未接続の距離演算子（L2／L1）は、行ポリシー解決・ストレージ読み取りより前に
     // fail-closed で止める（Issue #1977・#1991）。
     ensure_distance_kind_executable(bound)?;
@@ -2127,6 +2162,7 @@ pub(crate) fn execute_statement_with_cache(
     // に委ねる必要があるため、投影段の分岐で `defer_projection` と同値に扱う。
     // `defer_projection` 自体は `WHERE` なしを要求するためこの経路では常に偽。
     let mut mask_trusted_defer = false;
+    let scan_started = stage_start(&stats);
     let arena: &VectorArena = match arena_cache {
         None => owned_arena.insert(
             VectorArena::build_filtered_with_rows_from_source_in_txn(
@@ -2637,10 +2673,31 @@ pub(crate) fn execute_statement_with_cache(
     // 全スロット（`slot_ids`）のまま保持する。
     let dense_id_counts = core::searched_id_counts(&slot_ids, dense_slots.as_deref());
     let has_null_rows = arena.null_row_count() != 0;
+    // 静的には HNSW 適格だったのに実行時の NULL 行で外れた縮退は、`EXPLAIN ANALYZE` の観測へ
+    // 厳密走査への切り替えとして記録する（Issue #2056。`has_null_rows` は自テナントの可視行だけで決まる）。
+    if has_null_rows
+        && (hnsw_full_visible_eligible
+            || hnsw_subset_eligible
+            || hnsw_hybrid_full_visible_eligible
+            || hnsw_hybrid_subset_eligible)
+    {
+        crate::sql::hnsw_observe::note(|o| {
+            o.exact_scan_switches = o.exact_scan_switches.saturating_add(1);
+        });
+    }
     let hnsw_full_visible_eligible = hnsw_full_visible_eligible && !has_null_rows;
     let hnsw_subset_eligible = hnsw_subset_eligible && !has_null_rows;
     let hnsw_hybrid_full_visible_eligible = hnsw_hybrid_full_visible_eligible && !has_null_rows;
     let hnsw_hybrid_subset_eligible = hnsw_hybrid_subset_eligible && !has_null_rows;
+    // SQL-76 (2)(3): Scan 段の終端。出力行数は DISTANCE 段へ渡す RLS・ポリシー通過後の候補スロット数
+    // （arena のキャッシュヒット有無によらず同じ値）。
+    stage_end(
+        &mut stats,
+        ExecStage::Scan,
+        scan_started,
+        slot_ids.len(),
+        None,
+    );
 
     // `precision` 時は DISTANCE 段の取得件数を `bound.limit` より広く取る
     // （`LIMIT 1` でも Top-2 を取得し、`precision::apply_gate` のマージン判定を
@@ -3308,6 +3365,7 @@ pub(crate) fn execute_statement_with_cache(
     };
     let mut postfilter_done = false;
     crate::interrupt::current_deadline().check()?;
+    let distance_started = stage_start(&stats);
     let hits: Vec<(u64, f64)> = match iter_cfg {
         // DISTANCE 先行（SCALAR 事後フィルタ）で WHERE があるときだけ、事後フィルタ後の件数が
         // 目標（`OFFSET + LIMIT`）に届くまで取得件数を倍々に増やして再探索する。上限は
@@ -3322,12 +3380,36 @@ pub(crate) fn execute_statement_with_cache(
             let cap = max_scan.min(core::MAX_SEARCH_K).min(visible).max(1);
             let mut k_round = k_eff.min(cap).max(1);
             let mut rounds: u64 = 0;
+            let mut rows_examined: u64 = 0;
             let (filtered, cap_hit) = loop {
                 crate::interrupt::current_deadline().check()?;
+                // 2 ラウンド目以降は同じ検索の再実行なので、キャッシュ状態を重ねて数えない。
+                let _suppress = (rounds > 0).then(crate::sql::hnsw_observe::suppress_cache_notes);
+                // Distance 段は反復スキャンではラウンドごとに記録する（loops＝ラウンド数、
+                // rows_out＝事後フィルタ前の候補件数の合計、時間は compute_hits のみ。Issue #2053）。
+                let round_started = stage_start(&stats);
                 let raw = compute_hits(k_round)?;
+                drop(_suppress);
                 rounds += 1;
                 let raw_len = raw.len();
+                rows_examined = rows_examined.saturating_add(raw_len as u64);
+                stage_end(
+                    &mut stats,
+                    ExecStage::Distance,
+                    round_started,
+                    raw_len,
+                    None,
+                );
+                // 反復中の事後フィルタも PostFilter 段として記録する（ラウンドごとに loops を積む）。
+                let postfilter_started = stage_start(&stats);
                 let mut kept = apply_postfilter(raw)?;
+                stage_end(
+                    &mut stats,
+                    ExecStage::PostFilter,
+                    postfilter_started,
+                    kept.len(),
+                    Some(raw_len.saturating_sub(kept.len())),
+                );
                 if kept.len() >= k_eff {
                     kept.truncate(k_eff);
                     break (kept, false);
@@ -3342,7 +3424,9 @@ pub(crate) fn execute_statement_with_cache(
                 k_round = k_round.saturating_mul(2).min(cap);
             };
             if let Some(access) = hnsw_cache.as_ref() {
-                access.cache.record_iterative_scan(rounds, cap_hit);
+                access
+                    .cache
+                    .record_iterative_scan(rounds, cap_hit, rows_examined);
             }
             postfilter_done = true;
             filtered
@@ -3357,6 +3441,16 @@ pub(crate) fn execute_statement_with_cache(
         _ => compute_hits(k_eff)?,
     };
 
+    // 反復スキャン経路は各ラウンドで Distance 段を記録済みのため、ここでは非反復経路のみ記録する。
+    if !postfilter_done {
+        stage_end(
+            &mut stats,
+            ExecStage::Distance,
+            distance_started,
+            hits.len(),
+            None,
+        );
+    }
     // DISTANCE 段の直後の確認点（Issue #1953。上の直前確認と対）。
     crate::interrupt::current_deadline().check()?;
 
@@ -3370,7 +3464,17 @@ pub(crate) fn execute_statement_with_cache(
     let hits: Vec<(u64, f64)> = if plan.scalar_prefilter || postfilter_done {
         hits
     } else {
-        apply_postfilter(hits)?
+        let postfilter_started = stage_start(&stats);
+        let before = hits.len();
+        let kept = apply_postfilter(hits)?;
+        stage_end(
+            &mut stats,
+            ExecStage::PostFilter,
+            postfilter_started,
+            kept.len(),
+            Some(before.saturating_sub(kept.len())),
+        );
+        kept
     };
 
     // PRECISION ゲート段（TASK-162・SEARCH-9）。SCALAR 事後フィルタの**後**・
@@ -3384,6 +3488,11 @@ pub(crate) fn execute_statement_with_cache(
     // する（`is_precision` は `bound.mode` のみに依存し、`plan.scalar_prefilter`
     // の分岐に触れない）。`recall`（既定）はこのブロックを一切通らないため、
     // 挙動は変わらない（SEARCH-1〜8 不変）。
+    let precision_started = if is_precision {
+        stage_start(&stats)
+    } else {
+        None
+    };
     let hits: Vec<(u64, f64)> = if is_precision {
         // 確信度指標はランキング方式ごとに正規化する（`crate::precision` モジュール
         // ドキュメント参照）: dense はクエリ・候補 embedding の cosine 類似度、
@@ -3447,6 +3556,15 @@ pub(crate) fn execute_statement_with_cache(
     } else {
         hits
     };
+    if is_precision {
+        stage_end(
+            &mut stats,
+            ExecStage::PrecisionGate,
+            precision_started,
+            hits.len(),
+            None,
+        );
+    }
 
     // RLS 実行時安全網（TASK-136・RLS-5）。`HINT ORDER` の内容に関係なく常に適用する
     // （モジュールドキュメント参照）。`ExecutionPlan` にはこの適用を分岐させる
@@ -3461,6 +3579,7 @@ pub(crate) fn execute_statement_with_cache(
     // `hits` の第 1 要素はアリーナのスロット番号。範囲外のスロット（provider の契約
     // 違反・データ不整合）は `None` を返し、`RlsSafetyNet::apply` が fail-closed に
     // 除去する（従来の「id が索引に無い」case と同じ扱い）。
+    let limit_started = stage_start(&stats);
     let verified: RlsVerifiedHits = RlsSafetyNet::new(ctx).apply(hits, |slot_id| {
         let slot = usize::try_from(slot_id).ok()?;
         let tenant = arena.tenant_id(slot)?;
@@ -3482,6 +3601,13 @@ pub(crate) fn execute_statement_with_cache(
             return Err(crate::sql::scan::row_limit_exceeded());
         }
     }
+    stage_end(
+        &mut stats,
+        ExecStage::Limit,
+        limit_started,
+        verified.len(),
+        None,
+    );
 
     // Issue #453: `defer_projection` が真のとき、`candidate_columns` は
     // 全スロットぶん空 `Vec` が積まれているだけ（`on_visible_row` の早期リターン・
@@ -3523,6 +3649,7 @@ pub(crate) fn execute_statement_with_cache(
         ScalarSource::Eager(&candidate_columns)
     };
 
+    let project_started = stage_start(&stats);
     let rows = project_rows(
         verified,
         &bound.projection,
@@ -3531,6 +3658,13 @@ pub(crate) fn execute_statement_with_cache(
         scalar_source,
         &needed_mask,
     )?;
+    stage_end(
+        &mut stats,
+        ExecStage::Project,
+        project_started,
+        rows.len(),
+        None,
+    );
 
     let columns = bound
         .projection

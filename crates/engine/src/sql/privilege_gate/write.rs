@@ -29,6 +29,7 @@ use crate::sql::allowlist::{
     SqlSurfaceError, ValidatedInsert, ValidatedUpdateForm,
 };
 use crate::sql::cte::DmlStatement;
+use crate::sql::explain_analyze::ExplainAnalyzeDmlTarget;
 use crate::sql::explain_dml::ExplainDml;
 use crate::sql::lexer::Token;
 use crate::sql::mode::SessionState;
@@ -207,6 +208,8 @@ pub(crate) fn classify_write(parsed: &ParsedSql) -> WriteRequirement {
                 .collect(),
         },
         // Issue #2050: 実行した場合と同じ DELETE／UPDATE 権限を要求する（SQL-40）。
+        // Issue #2060: 中身と同じ検査（形式の違いで権限を緩めない）。
+        ParsedSql::ExplainVerbose(inner) => classify_write(inner),
         ParsedSql::ExplainDml(e) => match e {
             ExplainDml::Delete(d) => {
                 let (t, b) = delete_form_bits(&DeleteStatement::Predicate(d.clone()));
@@ -216,6 +219,25 @@ pub(crate) fn classify_write(parsed: &ParsedSql) -> WriteRequirement {
                 let (t, b) = update_form_bits(&ValidatedUpdateForm::Predicate(u.clone()));
                 WriteRequirement::one(&t, b)
             }
+        },
+        // Issue #2055: ANALYZE は実際に書き込むため、内側の DML と同じ権限ビットを実行前に要求する（SQL-40）。
+        ParsedSql::ExplainAnalyzeDml(ea) => match &ea.target {
+            ExplainAnalyzeDmlTarget::Dml(ExplainDml::Delete(d)) => {
+                let (t, b) = delete_form_bits(&DeleteStatement::Predicate(d.clone()));
+                WriteRequirement::one(&t, b)
+            }
+            ExplainAnalyzeDmlTarget::Dml(ExplainDml::Update(u)) => {
+                let (t, b) = update_form_bits(&ValidatedUpdateForm::Predicate(u.clone()));
+                WriteRequirement::one(&t, b)
+            }
+            ExplainAnalyzeDmlTarget::Insert(t) => match &**t {
+                crate::sql::insert_explain::ExplainInsertTarget::Values(v) => {
+                    WriteRequirement::one(&v.table_name, insert_bits(v))
+                }
+                crate::sql::insert_explain::ExplainInsertTarget::Select { insert, .. } => {
+                    WriteRequirement::one(insert.table_name(), insert_select_bits(insert))
+                }
+            },
         },
         ParsedSql::Partitioned(c) => match c {
             PartitionedControl::ExplainDelete(d) => {
@@ -242,6 +264,8 @@ pub(crate) fn classify_write(parsed: &ParsedSql) -> WriteRequirement {
         // 読み取り・カーソル・行ロック（read ゲートが担う）。COPY は `copy.rs`（#1969。begin_copy* が直接呼ぶ）、LOCK TABLE は対象外。
         ParsedSql::Statement(_)
         | ParsedSql::LockingSelect(_)
+        // Issue #2054: `EXPLAIN ANALYZE <SELECT>` は読み取りのみ（SELECT 権限は read ゲート）。
+        | ParsedSql::ExplainAnalyze(_)
         | ParsedSql::Cursor(_)
         | ParsedSql::Copy(_)
         | ParsedSql::Lock(_)

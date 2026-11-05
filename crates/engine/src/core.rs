@@ -92,6 +92,10 @@ mod dml_from_exec;
 mod dml_subquery_exec;
 // 述語形 UPDATE／DELETE の EXPLAIN（Issue #2050・SQL-75）。
 mod explain_dml;
+// SELECT の EXPLAIN ANALYZE の実行（Issue #2054・SQL-76 (2)(3)）。
+mod explain_analyze_exec;
+// `EXPLAIN (VERBOSE)` の実行（Issue #2060・SQL-76 (5)）。
+mod explain_verbose_exec;
 // 述語形 UPDATE ... FROM／DELETE ... USING の結合実行（SQL-53・Issue #1755）。
 #[cfg(test)]
 mod cte_join_budget_tests;
@@ -2022,6 +2026,29 @@ pub enum ParsedSql {
     /// **BREAKING CHANGE**（Issue #2059）: 本 variant の追加により `ParsedSql` を網羅的に
     /// マッチするクレート外コードは追随が必要。
     ExplainJson(Box<ParsedSql>),
+    /// `EXPLAIN ANALYZE <SELECT>`（Issue #2054・SQL-76 (2)(3) ポインタ）。静的な計画を作ったうえで
+    /// 内側の SELECT を通常の SELECT と同じ実行器で実際に実行し、結果の行数と経過時間を計画へ併記する
+    /// （結果の行は返さない）。読み取りのみで、行・台帳・writer には触れない（DML は [`ParsedSql::ExplainAnalyzeDml`]）。`USING PLAN`・
+    /// 一時表・`VERBOSE`・`FORMAT JSON` との併用は構文段で拒否する（fail-closed）。
+    /// 本体は `core/explain_analyze_exec.rs`、併記の規則は `sql::explain_analyze`。
+    ///
+    /// `#[non_exhaustive]` な本 enum への追加のためクレート外に対して非破壊。
+    ExplainAnalyze(Box<crate::sql::explain_analyze::ExplainAnalyzeSelect>),
+    /// `EXPLAIN (VERBOSE) <文>`（Issue #2060・SQL-76 (5) ポインタ）。内側の `Statement::Explain`（SELECT 系）
+    /// または述語形 `UPDATE`／`DELETE` の `ExplainDml` を通常どおり計画し、根の段へ追加情報（出力の列名・
+    /// 距離の種別）を足す。文は実行せず、権限・読み取り専用・台帳の扱いは中身と同じ。`ANALYZE` との併用・
+    /// `INSERT`・分割実行は構文段で `0A000`（fail-closed）。本体は `core/explain_verbose_exec.rs`、
+    /// 追加行の語彙は `sql::explain_verbose`。
+    ///
+    /// `#[non_exhaustive]` な本 enum への追加のためクレート外に対して非破壊。
+    ExplainVerbose(Box<ParsedSql>),
+    /// `EXPLAIN ANALYZE <UPDATE|DELETE|INSERT>`（Issue #2055・SQL-76 (2)(3) ポインタ）。内側の DML を
+    /// **実際に実行**し（autocommit では commit・`USING OPERATION_ID` の台帳記録を伴う。PostgreSQL と同じく
+    /// 自動では巻き戻さない）、`QUERY PLAN` 1 列の計画へ実測値を併記する（`RETURNING` の行は返さない）。
+    /// 読み取り専用の [`ParsedSql::ExplainAnalyze`] とは別 variant にし、権限（write ゲート）・READ ONLY・
+    /// operation_id の分類が書き込みとして扱われることを網羅 `match` に強制させる。
+    /// 本体は `core/explain_analyze_exec.rs`。`#[non_exhaustive]` な本 enum への追加のため非破壊。
+    ExplainAnalyzeDml(Box<crate::sql::explain_analyze::ExplainAnalyzeDml>),
     /// `ALTER TABLE <table> ADD COLUMN <column> <type>`（SQL-23・TASK-202、
     /// Issue #900）・`ALTER TABLE <table> ADD [CONSTRAINT <name>] UNIQUE
     /// (<col>[, ...])`／`DROP CONSTRAINT <name>`（TABLE-16・TASK-204、
@@ -2350,7 +2377,13 @@ fn statement_clock_scope(
         // Issue #2051: `EXPLAIN INSERT` の束縛は `DEFAULT now()` 等の評価に文の開始時刻を要する。
         | ParsedSql::ExplainInsert(_)
         // Issue #2050: `EXPLAIN UPDATE|DELETE` も非 EXPLAIN の DML と同じく束縛段が時刻を読む。
-        | ParsedSql::ExplainDml(_) => true,
+        | ParsedSql::ExplainDml(_)
+        // Issue #2054: 内側の SELECT は通常の SELECT と同じく文の開始時刻を共有する。
+        | ParsedSql::ExplainAnalyze(_)
+        // Issue #2055: 内側の DML は通常の DML と同じく文の開始時刻を共有する（入れ子の呼び出しも張る）。
+        | ParsedSql::ExplainAnalyzeDml(_)
+        // Issue #2060: 中身の計画段・列の導出が同じ束縛を行うため同様に張る。
+        | ParsedSql::ExplainVerbose(_) => true,
         ParsedSql::Truncate(_)
         | ParsedSql::Transaction(_)
         | ParsedSql::SetTransaction(_)
@@ -2447,6 +2480,10 @@ fn insert_sequence_scope(
         | ParsedSql::Cursor(_)
         | ParsedSql::Partitioned(_)
         | ParsedSql::ExplainDml(_)
+        | ParsedSql::ExplainAnalyze(_)
+        | ParsedSql::ExplainVerbose(_)
+        // Issue #2055: 採番・既定時刻の文脈は入れ子で実行する内側の INSERT が張る（外側では張らない）。
+        | ParsedSql::ExplainAnalyzeDml(_)
         | ParsedSql::AlterTable(_)
         | ParsedSql::CreateView(_)
         | ParsedSql::DropView(_)
@@ -2536,6 +2573,10 @@ fn insert_default_clock_scope(
         | ParsedSql::Cursor(_)
         | ParsedSql::Partitioned(_)
         | ParsedSql::ExplainDml(_)
+        | ParsedSql::ExplainAnalyze(_)
+        | ParsedSql::ExplainVerbose(_)
+        // Issue #2055: 採番・既定時刻の文脈は入れ子で実行する内側の INSERT が張る（外側では張らない）。
+        | ParsedSql::ExplainAnalyzeDml(_)
         | ParsedSql::AlterTable(_)
         | ParsedSql::CreateView(_)
         | ParsedSql::DropView(_)
@@ -2732,6 +2773,12 @@ fn parsed_operation_id(parsed: &ParsedSql) -> Option<&str> {
         // Issue #2050: `EXPLAIN UPDATE|DELETE` は台帳に記録せず operation_id もトランザクションへ
         // 登録しない（登録すると同じ operation_id の本実行が誤って再利用扱いになる）。
         ParsedSql::ExplainDml(_) | ParsedSql::ExplainJson(_) => None,
+        // Issue #2054: 読み取りのみで台帳・operation_id に触れない。
+        ParsedSql::ExplainAnalyze(_) => None,
+        // Issue #2060: 読み取りのみで台帳・operation_id に触れない。
+        ParsedSql::ExplainVerbose(_) => None,
+        // Issue #2055: 実際に書き込むため内側の DML の operation_id を登録する（再利用検査・READ ONLY 判定）。
+        ParsedSql::ExplainAnalyzeDml(ea) => ea.operation_id(),
         // 永続側の文を包んだ形は中身の `operation_id` を使う（一時表の文は `operation_id` を持たない）。
         ParsedSql::SessionRouted(routed) if routed.is_persistent() => {
             parsed_operation_id(routed.inner())
@@ -2752,7 +2799,12 @@ fn is_partitioned_write(parsed: &ParsedSql) -> bool {
             v.partitioned().is_some()
         }
         ParsedSql::Partitioned(control) => control.writes(),
-        ParsedSql::ExplainDml(_) | ParsedSql::ExplainJson(_) => false,
+        ParsedSql::ExplainDml(_)
+        | ParsedSql::ExplainJson(_)
+        | ParsedSql::ExplainAnalyze(_)
+        | ParsedSql::ExplainVerbose(_) => false,
+        // Issue #2055: 分割実行の ANALYZE は構文段で拒否済み。
+        ParsedSql::ExplainAnalyzeDml(_) => false,
         ParsedSql::SessionRouted(routed) if routed.is_persistent() => {
             is_partitioned_write(routed.inner())
         }
@@ -2805,8 +2857,13 @@ fn read_only_permits(parsed: &ParsedSql) -> bool {
         // Issue #2051: `EXPLAIN INSERT` は束縛だけで何も書かないため READ ONLY Tx でも許可する。
         ParsedSql::ExplainInsert(_) => true,
         // Issue #2050: ANALYZE なしの EXPLAIN は何も書かないため READ ONLY でも可。
-        ParsedSql::ExplainDml(_) => true,
+        // Issue #2054: ANALYZE は SELECT だけを実行する（DML の ANALYZE は構文段で拒否）ため同様に可。
+        ParsedSql::ExplainDml(_) | ParsedSql::ExplainAnalyze(_) => true,
         ParsedSql::ExplainJson(inner) => read_only_permits(inner),
+        // Issue #2060: 中身（SELECT 系の EXPLAIN・述語形 DML の EXPLAIN）は何も書かないため可。
+        ParsedSql::ExplainVerbose(inner) => read_only_permits(inner),
+        // Issue #2055: ANALYZE の DML は実際に書き込むため READ ONLY Tx では許可しない（`25006`）。
+        ParsedSql::ExplainAnalyzeDml(_) => false,
         ParsedSql::SequenceFunction(stmt) => !stmt.writes(),
         ParsedSql::SessionRouted(routed) => read_only_permits(routed.inner()),
         // `COPY ... TO` は読み取りだが、拡張クエリ経路の `Copy` は in-txn で別途拒否される。
@@ -6232,9 +6289,28 @@ impl EngineCore {
             read_snap,
             locking.is_some().then_some(&mut read_tables),
         )?;
-        let format = match &explain_opts {
-            Some(raw) => raw.resolve()?.format,
-            None => crate::sql::explain_options::ExplainFormat::Text,
+        let opts = match &explain_opts {
+            Some(raw) => raw.resolve()?,
+            None => crate::sql::explain_options::ExplainOptions::default(),
+        };
+        let format = opts.format;
+        // Issue #2059: `FORMAT JSON` は ANALYZE／VERBOSE の追加行を JSON 化する経路を持たないため、
+        // 併用は `0A000` で止める（黙って TEXT／追加行なしへ縮退しない fail-closed）。
+        if format == crate::sql::explain_options::ExplainFormat::Json
+            && (opts.analyze || opts.verbose)
+        {
+            return Err(
+                crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
+                    "EXPLAIN FORMAT JSON is not supported with ANALYZE or VERBOSE",
+                ),
+            );
+        }
+        let parsed = if opts.analyze {
+            Self::wrap_explain_analyze(parsed, &opts)?
+        } else if opts.verbose {
+            Self::wrap_explain_verbose(parsed)?
+        } else {
+            parsed
         };
         let is_json = format == crate::sql::explain_options::ExplainFormat::Json;
         let Some(locking) = locking else {
@@ -6282,6 +6358,75 @@ impl EngineCore {
                     "row-level locking clauses are not supported for this statement",
                 ),
             ),
+        }
+    }
+
+    /// `EXPLAIN (ANALYZE ...)`（Issue #2054・SQL-76 (2)）で解析済みの `EXPLAIN <文>` を実行する形へ包む。
+    /// SELECT 系の `Statement::Explain` と述語形 UPDATE／DELETE・INSERT の EXPLAIN（#2055）を受理し、
+    /// `USING PLAN` の検索（LLM・embedder の I/O を伴う）と分割実行は `0A000` で拒否する（黙って静的な計画へ縮退しない fail-closed）。
+    fn wrap_explain_analyze(
+        parsed: ParsedSql,
+        opts: &crate::sql::explain_options::ExplainOptions,
+    ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
+        use crate::sql::allowlist::{ExplainTarget, SqlSurfaceError, Statement};
+        match parsed {
+            ParsedSql::Statement(Statement::Explain(target)) => {
+                if matches!(&target, ExplainTarget::Search(v) if v.using_plan().is_some()) {
+                    return Err(SqlSurfaceError::feature_not_supported(
+                        "EXPLAIN ANALYZE is not supported with USING PLAN",
+                    ));
+                }
+                Ok(ParsedSql::ExplainAnalyze(Box::new(
+                    crate::sql::explain_analyze::ExplainAnalyzeSelect {
+                        target,
+                        timing: opts.timing.unwrap_or(true),
+                        summary: opts.summary.unwrap_or(true),
+                    },
+                )))
+            }
+            ParsedSql::ExplainDml(d) => Ok(ParsedSql::ExplainAnalyzeDml(Box::new(
+                crate::sql::explain_analyze::ExplainAnalyzeDml {
+                    target: crate::sql::explain_analyze::ExplainAnalyzeDmlTarget::Dml(d),
+                    timing: opts.timing.unwrap_or(true),
+                    summary: opts.summary.unwrap_or(true),
+                },
+            ))),
+            ParsedSql::ExplainInsert(t) => Ok(ParsedSql::ExplainAnalyzeDml(Box::new(
+                crate::sql::explain_analyze::ExplainAnalyzeDml {
+                    target: crate::sql::explain_analyze::ExplainAnalyzeDmlTarget::Insert(t),
+                    timing: opts.timing.unwrap_or(true),
+                    summary: opts.summary.unwrap_or(true),
+                },
+            ))),
+            // 分割実行は非原子・autocommit 専用のため ANALYZE の対象外（fail-closed）。
+            ParsedSql::Partitioned(_) => Err(SqlSurfaceError::feature_not_supported(
+                "EXPLAIN ANALYZE is not supported for partitioned DML",
+            )),
+            _ => Err(SqlSurfaceError::Internal {
+                detail: "internal error".to_string(),
+            }),
+        }
+    }
+
+    /// `EXPLAIN (VERBOSE ...)`（Issue #2060・SQL-76 (5)）で解析済みの `EXPLAIN <文>` を [`ParsedSql::ExplainVerbose`]
+    /// へ包む。追加行を足せる SELECT 系の `Statement::Explain` と述語形 DML の `ExplainDml` だけを受理し、
+    /// `INSERT`・分割実行は `0A000` で拒否する（黙って VERBOSE なしへ縮退しない fail-closed）。
+    fn wrap_explain_verbose(
+        parsed: ParsedSql,
+    ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
+        use crate::sql::allowlist::{SqlSurfaceError, Statement};
+        match parsed {
+            ParsedSql::Statement(Statement::Explain(_)) | ParsedSql::ExplainDml(_) => {
+                Ok(ParsedSql::ExplainVerbose(Box::new(parsed)))
+            }
+            ParsedSql::ExplainInsert(_) | ParsedSql::Partitioned(_) => {
+                Err(SqlSurfaceError::feature_not_supported(
+                    "EXPLAIN VERBOSE is not supported for this statement yet",
+                ))
+            }
+            _ => Err(SqlSurfaceError::Internal {
+                detail: "internal error".to_string(),
+            }),
         }
     }
 
@@ -8435,6 +8580,20 @@ impl EngineCore {
                 };
                 crate::sql::explain_json::outcome_to_json(self.scrub_outcome(ctx, outcome))
             }
+            // Issue #2054: 静的な計画に続けて内側の SELECT を実行し、実測値を併記する（結果の行は返さない）。
+            ParsedSql::ExplainAnalyze(ea) => self.run_explain_analyze(session, ea, |s, stmt| {
+                self.execute_validated_in_session(ctx, s, stmt)
+            }),
+            // Issue #2060: 中身を通常どおり計画し、根の段へ追加情報を足す（実行しない）。
+            ParsedSql::ExplainVerbose(inner) => self.run_explain_verbose(session, inner, |s, p| {
+                self.execute_parsed_statement(ctx, s, p)
+            }),
+            // Issue #2055: 内側の DML を通常の autocommit 経路で実際に実行する（commit・台帳記録を伴う）。
+            ParsedSql::ExplainAnalyzeDml(ea) => {
+                self.run_explain_analyze_dml(session, ea, |s, p| {
+                    self.execute_parsed_statement(ctx, s, p)
+                })
+            }
             // TABLE-44・Issue #1684: 一時表だけを参照する文は一時コアで実行する
             // （`core/temp_route.rs`）。永続コアの実行器へは渡さない。
             ParsedSql::SessionRouted(routed) if routed.is_persistent() => {
@@ -9871,6 +10030,30 @@ impl EngineCore {
                 };
                 crate::sql::explain_json::outcome_to_json(self.scrub_outcome(ctx, outcome))
             }
+            // Issue #2054: 普通の SELECT と同じ読み取り源（BEGIN 時点のスナップショット・自トランザクションの
+            // 未 commit の変更）で計画と実行を行う。
+            ParsedSql::ExplainAnalyze(ea) => self.run_explain_analyze(session, ea, |s, stmt| {
+                self.read_only_in_active_txn(ctx, s, &*txn, stmt)
+            }),
+            // Issue #2060: 計画段は中身と同じ経路（書き込み・writer を要求しない）で作る。
+            ParsedSql::ExplainVerbose(inner) => {
+                self.run_explain_verbose(session, inner, |s, p| match p {
+                    ParsedSql::ExplainDml(explain) => self.run_explain_dml(ctx, s, explain),
+                    ParsedSql::Statement(stmt) => {
+                        self.read_only_in_active_txn(ctx, s, &*txn, stmt.clone())
+                    }
+                    _ => Err(SqlSurfaceError::Internal {
+                        detail: "internal error".to_string(),
+                    }),
+                })
+            }
+            // Issue #2055: 内側の DML を同じトランザクションで実際に実行する（`ROLLBACK` で巻き戻る）。
+            // 台帳の再利用検査は外側が 1 回だけ済ませているため `_inner` を直接呼ぶ。
+            ParsedSql::ExplainAnalyzeDml(ea) => {
+                self.run_explain_analyze_dml(session, ea, |s, p| {
+                    self.execute_in_active_txn_inner(ctx, s, &mut *txn, p)
+                })
+            }
             ParsedSql::Cursor(stmt) => self.execute_cursor_in_active_txn(ctx, session, txn, stmt),
             // TABLE-44・Issue #1684: 一時表の文は、一時側の書き込みトランザクション（最初の一時表の
             // 文で開く）の上で一時コアが実行する。永続側の write txn・dirty 判定には触れない。
@@ -11222,10 +11405,17 @@ impl EngineCore {
                 ty: Some(crate::catalog::ColumnType::Text),
             }])),
             // Issue #2050: `EXPLAIN UPDATE|DELETE` も `QUERY PLAN` 単一列。
-            ParsedSql::ExplainDml(_) => Ok(Some(vec![crate::sql::exec::ColumnMeta::Computed {
-                name: crate::sql::explain::QUERY_PLAN_COLUMN.to_string(),
-                ty: Some(crate::catalog::ColumnType::Text),
-            }])),
+            ParsedSql::ExplainDml(_)
+            | ParsedSql::ExplainAnalyze(_)
+            | ParsedSql::ExplainAnalyzeDml(_)
+            | ParsedSql::ExplainVerbose(_) => {
+                // Issue #2060: `EXPLAIN (VERBOSE)` も同じ単一列。
+                // Issue #2055: DML の ANALYZE も同じ。Issue #2054: `EXPLAIN ANALYZE` も `QUERY PLAN` 単一列。Describe は実行しない。
+                Ok(Some(vec![crate::sql::exec::ColumnMeta::Computed {
+                    name: crate::sql::explain::QUERY_PLAN_COLUMN.to_string(),
+                    ty: Some(crate::catalog::ColumnType::Text),
+                }]))
+            }
             ParsedSql::Statement(Statement::SetSearchMode { .. }) => Ok(None),
             ParsedSql::Statement(Statement::SetTimeZone { .. }) => Ok(None),
             // `SHOW TimeZone` は列名 `TimeZone`（text）の 1 列固定（TABLE-33・Issue #1575）。

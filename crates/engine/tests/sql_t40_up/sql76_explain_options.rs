@@ -2,7 +2,9 @@
 //! ポインタ）。
 //!
 //! 受理するオプション（`COSTS`・`FORMAT TEXT`・明示的な偽）はオプションなしの `EXPLAIN` と出力が
-//! 完全に一致し、未実装（`ANALYZE`・`VERBOSE`・`SUMMARY`）と対象外は `0A000`、
+//! 完全に一致し、未実装（`ANALYZE` なしの `SUMMARY`。`VERBOSE` は Issue #2060 で実装済みで
+//! `sql76_explain_verbose`）と対象外は `0A000`、
+//! （`ANALYZE` は SELECT のみ受理する。Issue #2054。結合テストは `sql76_explain_analyze_select`）
 //! 未知の名前は `42601`、値の不正は `22023`。後の指定が勝つ。セッション無しの入口は従来どおり `42601`。
 
 use engine::core::EngineCore;
@@ -107,10 +109,13 @@ fn accepted_options_match_plain_explain() {
 fn later_option_wins() {
     let (core, _g) = seeded("x76-last");
     let q = "SELECT k FROM a";
-    lines(
-        &core,
-        "tenant-a",
-        &format!("EXPLAIN (ANALYZE, ANALYZE OFF) {q}"),
+    assert_eq!(
+        lines(
+            &core,
+            "tenant-a",
+            &format!("EXPLAIN (VERBOSE, VERBOSE OFF) {q}")
+        ),
+        lines(&core, "tenant-a", &format!("EXPLAIN {q}"))
     );
     lines(
         &core,
@@ -122,9 +127,15 @@ fn later_option_wins() {
         "tenant-a",
         &format!("EXPLAIN (TIMING, TIMING OFF) {q}"),
     );
-    assert_eq!(
-        code(&core, &format!("EXPLAIN (ANALYZE OFF, ANALYZE) {q}")),
-        "0A000"
+    assert!(
+        lines(
+            &core,
+            "tenant-a",
+            &format!("EXPLAIN (VERBOSE OFF, VERBOSE) {q}")
+        )
+        .iter()
+        .any(|l| l.starts_with("output: ")),
+        "later VERBOSE wins"
     );
 }
 
@@ -155,8 +166,6 @@ fn error_codes_and_no_side_effects() {
         "MEMORY",
         "FORMAT XML",
         "FORMAT YAML",
-        "ANALYZE",
-        "VERBOSE",
         "SUMMARY",
     ] {
         for body in [
@@ -181,7 +190,7 @@ fn inner_statement_error_comes_first() {
     assert_eq!(code(&core, "EXPLAIN (FOO) SELECT * FROM missing"), "42P01");
 }
 
-/// SQL-76 (1): 括弧付きの集合演算は従来どおり。前置形は対象外のまま 42601。
+/// SQL-76 (1): 括弧付きの集合演算は従来どおり。前置形の `VERBOSE` は括弧形と同じく受理（Issue #2060）。
 #[test]
 fn set_operation_and_prefix_forms_unchanged() {
     let (core, _g) = seeded("x76-reg");
@@ -190,8 +199,11 @@ fn set_operation_and_prefix_forms_unchanged() {
         "tenant-a",
         "EXPLAIN (SELECT k FROM a) UNION SELECT k FROM a",
     );
-    assert_eq!(code(&core, "EXPLAIN ANALYZE SELECT k FROM a"), "42601");
-    assert_eq!(code(&core, "EXPLAIN VERBOSE SELECT k FROM a"), "42601");
+    lines(&core, "tenant-a", "EXPLAIN VERBOSE SELECT k FROM a");
+    assert_eq!(
+        code(&core, "EXPLAIN ANALYZE (COSTS) SELECT k FROM a"),
+        "42601"
+    );
     assert_eq!(
         code(&core, "EXPLAIN (COSTS) (COSTS) SELECT k FROM a"),
         "42601"

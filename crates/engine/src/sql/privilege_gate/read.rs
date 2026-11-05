@@ -69,6 +69,10 @@ pub(crate) fn classify(parsed: &ParsedSql) -> ReadRequirement {
         ParsedSql::LockingSelect(_) => SelectForUpdate,
         // Issue #2059: 包んだ `EXPLAIN` は中身と同じ検査を受ける（形式の違いで権限を緩めない）。
         ParsedSql::ExplainJson(inner) => classify(inner),
+        // Issue #2054: 実行する内側の SELECT と同じく、参照する全 relation に SELECT 権限を実行前に要求する。
+        ParsedSql::ExplainAnalyze(_) => Select,
+        // Issue #2060: 中身と同じ検査（形式の違いで権限を緩めない）。
+        ParsedSql::ExplainVerbose(inner) => classify(inner),
         ParsedSql::Cursor(c) => match c {
             CursorStatement::Declare { .. } => Select,
             // FETCH／CLOSE は DECLARE の時点で確定した結果を読むだけで、再検査しない（`sql-cursor.md` §1）。
@@ -101,6 +105,8 @@ pub(crate) fn classify(parsed: &ParsedSql) -> ReadRequirement {
         | ParsedSql::ExplainInsert(_)
         // Issue #2050: 行を読まない。DELETE／UPDATE 権限は write gate が実行時と同じく要求する。
         | ParsedSql::ExplainDml(_)
+        // Issue #2055: 実行する DML の権限（SELECT を含む）は write ゲートが判定する。
+        | ParsedSql::ExplainAnalyzeDml(_)
         | ParsedSql::Copy(_)
         | ParsedSql::Lock(_) => NotApplicable,
         // トランザクション・セッション制御・DDL・関数呼び出し。DDL は運用者権限のゲートを通った主体だけが
