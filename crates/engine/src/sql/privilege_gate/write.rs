@@ -588,6 +588,8 @@ pub(crate) struct RelationPrivilegeRecheck {
     principal: Principal,
     tenant: String,
     required_bits: u16,
+    /// 列で満たせるビットの要求先。既定は全列（[`ColumnSpec::All`]）。COPY FROM だけが列リストへ絞る。
+    cols: ColumnSpec,
 }
 
 impl RelationPrivilegeRecheck {
@@ -605,7 +607,16 @@ impl RelationPrivilegeRecheck {
             principal,
             tenant: tenant.to_string(),
             required_bits,
+            cols: ColumnSpec::All,
         })
+    }
+
+    /// 列で満たせるビットの要求先を COPY FROM の列リストへ絞る（`copy.rs` の開始時の判定と同じ
+    /// [`super::copy::copy_from_columns`] の結果を渡す。開始時と commit 時で列集合を食い違わせない）。
+    #[must_use]
+    pub(crate) fn with_columns(mut self, cols: ColumnSpec) -> Self {
+        self.cols = cols;
+        self
     }
 
     /// `tables` のすべてに必要ビットがあるか。`Err(())` は権限不足、または照会失敗（fail-closed）。
@@ -615,7 +626,7 @@ impl RelationPrivilegeRecheck {
         }
         let wants: Vec<Want> = tables
             .iter()
-            .flat_map(|t| Want::all(t, self.required_bits))
+            .flat_map(|t| Want::split(t, self.required_bits, self.cols.clone()))
             .collect();
         // ACL を解決できない表は権限を確認できないので拒否する（fail-closed。parse 時の
         // `require_relations_bits` と同じ扱い。`tables` をすべて「実在を確認した名前」として渡す）。

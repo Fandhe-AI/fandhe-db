@@ -76,6 +76,16 @@ fn fx(label: &str) -> Fx {
             .with_row_identity(RowIdentity::Allocated),
         )
         .expect("ca2");
+    // 従来方式の表で実列 `id` を宣言したもの（実列が名前 `id` を遮蔽するが、`*` は疑似列 `id` も返す）。
+    storage
+        .create_table(&TableSchema::new(
+            "cr",
+            vec![
+                ColumnDef::new("id", ColumnType::BigInt, false),
+                ColumnDef::new("n", ColumnType::BigInt, false),
+            ],
+        ))
+        .expect("cr");
     let admin = role(&storage, "admin_r");
     let alice = role(&storage, "alice");
     Fx {
@@ -327,4 +337,80 @@ fn unbound_and_owner_equivalent_ignore_column_grants() {
         ),
         "ok"
     );
+}
+
+#[test]
+fn star_on_legacy_table_with_real_id_column_still_needs_table_level_select() {
+    let f = fx("colpriv-realid");
+    f.admin_run("GRANT SELECT (id) ON cr TO alice");
+    f.admin_run("GRANT SELECT (n) ON cr TO alice");
+    // 実列 `id` が名前を遮蔽しても、`*` の展開は疑似列 `id`（行キー）を加えるので全実列の付与では足りない。
+    assert_eq!(f.alice("SELECT * FROM cr LIMIT 5"), "42501");
+    assert_eq!(f.alice("SELECT cr.* FROM cr LIMIT 5"), "42501");
+    assert_eq!(f.alice("SELECT count(*), id FROM cr GROUP BY id"), "ok");
+    // 名前で指す `id` は実列に束縛されるので列単位の付与で読める。
+    assert_eq!(f.alice("SELECT id, n FROM cr LIMIT 5"), "ok");
+    f.admin_run("GRANT SELECT ON cr TO alice");
+    assert_eq!(f.alice("SELECT * FROM cr LIMIT 5"), "ok");
+}
+
+#[test]
+fn star_on_legacy_table_without_real_id_column_needs_table_level_select() {
+    let f = fx("colpriv-noid");
+    for c in ["embedding", "n", "m"] {
+        f.admin_run(&format!("GRANT SELECT ({c}) ON ct TO alice"));
+    }
+    assert_eq!(f.alice("SELECT * FROM ct LIMIT 5"), "42501");
+    f.admin_run("GRANT SELECT ON ct TO alice");
+    assert_eq!(f.alice("SELECT * FROM ct LIMIT 5"), "ok");
+}
+
+#[test]
+fn returning_star_on_legacy_table_needs_table_level_select() {
+    let f = fx("colpriv-returning");
+    f.admin_run("GRANT DELETE ON cr TO alice");
+    f.admin_run("GRANT SELECT (id) ON cr TO alice");
+    f.admin_run("GRANT SELECT (n) ON cr TO alice");
+    assert_eq!(f.alice("DELETE FROM cr WHERE n = 1 RETURNING *"), "42501");
+    f.admin_run("GRANT SELECT ON cr TO alice");
+    assert_eq!(f.alice("DELETE FROM cr WHERE n = 1 RETURNING *"), "ok");
+}
+
+/// COPY FROM STDIN を開始し、1 行を流して `finish` までを返す。拒否は wire_code。
+fn begin_copy_from(f: &Fx, sql: &str, row: &[u8]) -> Result<crate::sql::copy::CopyInBatch, String> {
+    let s = bound(f.alice, false);
+    match f.core.begin_copy(&ctx(), &s, sql) {
+        Ok(super::CopyPlan::From(mut cs)) => {
+            cs.feed(row).expect("feed");
+            Ok(cs.finish().expect("finish"))
+        }
+        Ok(super::CopyPlan::To(..)) => panic!("expected COPY FROM plan"),
+        Err(e) => Err(e.wire_code().to_string()),
+    }
+}
+
+#[test]
+fn copy_from_commit_recheck_uses_the_same_column_list_as_begin() {
+    let f = fx("colpriv-copy-from");
+    f.admin_run("GRANT INSERT (a) ON ca2 TO alice");
+    f.admin_run("GRANT INSERT (b) ON ca2 TO alice");
+    // 列リスト外の列を含む形は開始時に拒否する。
+    assert_eq!(
+        begin_copy_from(&f, "COPY ca2 (a, b, c) FROM STDIN", b"1\t2\t3\n").err(),
+        Some("42501".to_string())
+    );
+    // 付与のある列だけを列リストに書けば、開始から commit まで通る。
+    let batch = begin_copy_from(&f, "COPY ca2 (a, b) FROM STDIN", b"1\t2\n").expect("begin");
+    f.core.commit_copy_in(&ctx(), batch).expect("commit");
+    // begin 後に列リストの列を剥奪すれば、commit 時の再検査が同じ列集合で拒否する。
+    let batch = begin_copy_from(&f, "COPY ca2 (a, b) FROM STDIN", b"3\t4\n").expect("begin");
+    f.admin_run("REVOKE INSERT (b) ON ca2 FROM alice");
+    let e = f.core.commit_copy_in(&ctx(), batch).expect_err("revoked");
+    assert_eq!(e.wire_code(), "42501");
+    // 列リストに無い列（c）の剥奪・付与は判定に影響しない。
+    f.admin_run("GRANT INSERT (b) ON ca2 TO alice");
+    let batch = begin_copy_from(&f, "COPY ca2 (a, b) FROM STDIN", b"5\t6\n").expect("begin");
+    f.admin_run("GRANT INSERT (c) ON ca2 TO alice");
+    f.admin_run("REVOKE INSERT (c) ON ca2 FROM alice");
+    f.core.commit_copy_in(&ctx(), batch).expect("commit");
 }

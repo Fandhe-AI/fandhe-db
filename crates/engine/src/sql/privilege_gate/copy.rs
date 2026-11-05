@@ -36,6 +36,18 @@ pub(crate) fn copy_required_bits(stmt: &CopyStatement) -> u16 {
     }
 }
 
+/// `COPY ... FROM` の列リストを列の仕様へ変換する。開始時の判定（[`require_copy_privileges`]）と
+/// commit 時の再検査（`core.rs` の `begin_copy_validated`）が同じ集合を使うための単一の入口。
+/// 列リストが空（省略）なら全列（疑似列 `id` を含む。厳しい側）。列リストに無い列は要求しない
+/// （既定値で埋まる列に INSERT 権限は要らない。PostgreSQL の COPY と同じ）。
+pub(crate) fn copy_from_columns(columns: &[String]) -> ColumnSpec {
+    if columns.is_empty() {
+        ColumnSpec::All
+    } else {
+        ColumnSpec::Names(columns.to_vec())
+    }
+}
+
 /// COPY 文の対象 relation に必要な権限があるかを判定する（不足は `42501`）。`resolved_tokens` は
 /// 名前解決済みの字句列。呼び出し元は構文検証（`42601`）と名前解決（`42P01`／`3F000`）の後に呼ぶ。
 pub(crate) fn require_copy_privileges(
@@ -79,7 +91,7 @@ pub(crate) fn require_copy_privileges(
         CopyStatement::From(v) => wants.extend(Want::split(
             &v.table_name,
             required_bits,
-            ColumnSpec::Names(v.columns.clone()),
+            copy_from_columns(&v.columns),
         )),
         CopyStatement::To(v) => {
             let target = v.inner.table_name();
