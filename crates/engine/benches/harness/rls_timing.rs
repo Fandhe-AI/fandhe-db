@@ -855,6 +855,12 @@ pub fn parse_raw_rounds(text: &str) -> Result<(Vec<Shape>, Vec<Round>), RlsTimin
     if raw_rounds.is_empty() {
         return raw_err("rounds is empty");
     }
+    // 宣言された rounds／measured と実データを照合し、データ欠落入力の誤 pass を防ぐ。
+    let declared_rounds = as_uint(field(config, "rounds")?, "config.rounds")?;
+    if declared_rounds != raw_rounds.len() as u64 {
+        return raw_err("config.rounds does not match the number of rounds");
+    }
+    let declared_measured = as_uint(field(config, "measured")?, "config.measured")?;
     let mut rounds: Vec<Round> = Vec::new();
     for rr in raw_rounds {
         let index = u32::try_from(as_uint(field(rr, "round")?, "round")?)
@@ -880,6 +886,9 @@ pub fn parse_raw_rounds(text: &str) -> Result<(Vec<Shape>, Vec<Round>), RlsTimin
             let raw_samples = array_field(c, "samples_ns")?;
             if raw_samples.is_empty() {
                 return raw_err("samples_ns is empty");
+            }
+            if raw_samples.len() as u64 != declared_measured {
+                return raw_err("samples_ns length does not match config.measured");
             }
             let mut samples = Vec::new();
             for s in raw_samples {
