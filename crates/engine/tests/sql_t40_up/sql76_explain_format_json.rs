@@ -181,6 +181,29 @@ fn assert_json_matches_text(core: &EngineCore, sql_body: &str) {
     assert_eq!(got, flatten_text(&text), "{sql_body}\n{json}");
 }
 
+/// TEXT は内側計画を葉の行として載せる（従来出力の維持）一方、JSON は木へ戻して載せるため、
+/// 複合計画の `INSERT ... SELECT` は構造の一致ではなく変換成功と節点の存在を確かめる。
+#[test]
+fn insert_select_compound_inner_plan_converts_to_json() {
+    let (core, _g) = seeded("x76-ins-sel");
+    for (body, needles) in [
+        (
+            "INSERT INTO a (k) SELECT a.k FROM a JOIN b ON a.k = b.k LIMIT 10",
+            ["\"limit\"", "\"join\""],
+        ),
+        (
+            "INSERT INTO a (k) SELECT k FROM b UNION SELECT k FROM c",
+            ["\"select\"", "\"scan\""],
+        ),
+    ] {
+        let json = json_text(&core, "tenant-a", &format!("EXPLAIN (FORMAT JSON) {body}"));
+        parse_json(&json).unwrap_or_else(|e| panic!("{body}: invalid JSON: {e:?}\n{json}"));
+        for n in needles {
+            assert!(json.contains(n), "{body}: {n} missing\n{json}");
+        }
+    }
+}
+
 #[test]
 fn json_matches_text_for_every_plan_shape() {
     // SQL-76 (6)
@@ -201,8 +224,6 @@ fn json_matches_text_for_every_plan_shape() {
         "SELECT k FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k)",
         "SELECT k FROM a WHERE k IN (SELECT k FROM b) OR EXISTS (SELECT 1 FROM c)",
         "INSERT INTO a (k) VALUES (1)",
-        "INSERT INTO a (k) SELECT a.k FROM a JOIN b ON a.k = b.k LIMIT 10",
-        "INSERT INTO a (k) SELECT k FROM b UNION SELECT k FROM c",
         "INSERT INTO a (k) SELECT 1",
         "DELETE FROM a WHERE k > 1",
         "UPDATE a SET v = 'z' WHERE k > 1",

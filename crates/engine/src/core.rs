@@ -8418,13 +8418,21 @@ impl EngineCore {
                 self.execute_partitioned_control(ctx, session, control)
             }
             // Issue #2051: `EXPLAIN INSERT` は束縛だけを行い書き込み・台帳・採番に触れない。
-            ParsedSql::ExplainInsert(target) => self.run_insert_explain(ctx, session, target),
+            ParsedSql::ExplainInsert(target) => {
+                self.run_insert_explain(ctx, session, target, false)
+            }
             // Issue #2050: 述語形 UPDATE／DELETE の EXPLAIN（書き込まない）。
             ParsedSql::ExplainDml(explain) => self.run_explain_dml(ctx, session, explain),
             // Issue #2059: 中身の `EXPLAIN` を実行し、内部キーを表示名へ戻した後で JSON へ変換する
             // （JSON 化の後では置換が JSON 文字列を壊しうるため、変換の前に scrub する）。
             ParsedSql::ExplainJson(inner) => {
-                let outcome = self.execute_parsed_statement(ctx, session, inner)?;
+                let outcome = match &**inner {
+                    // INSERT ... SELECT の内側計画は JSON 変換のため木へ戻して組む（TEXT は従来どおり）。
+                    ParsedSql::ExplainInsert(target) => {
+                        self.run_insert_explain(ctx, session, target, true)?
+                    }
+                    _ => self.execute_parsed_statement(ctx, session, inner)?,
+                };
                 crate::sql::explain_json::outcome_to_json(self.scrub_outcome(ctx, outcome))
             }
             // TABLE-44・Issue #1684: 一時表だけを参照する文は一時コアで実行する
@@ -9848,12 +9856,19 @@ impl EngineCore {
             }
             // Issue #2051: `EXPLAIN INSERT` は writer を取らず、確定済みのカタログで束縛だけを行う
             // （`operation_id` も登録しない。続く本物の `INSERT` が同じ ID を再利用できる）。
-            ParsedSql::ExplainInsert(target) => self.run_insert_explain(ctx, session, target),
+            ParsedSql::ExplainInsert(target) => {
+                self.run_insert_explain(ctx, session, target, false)
+            }
             // Issue #2050: writer を要求せず、書き込み済みの印も付けない。
             ParsedSql::ExplainDml(explain) => self.run_explain_dml(ctx, session, explain),
             // Issue #2059: 中身を同じ経路で実行し、scrub の後で JSON へ変換する。
             ParsedSql::ExplainJson(inner) => {
-                let outcome = self.execute_in_active_txn(ctx, session, txn, inner)?;
+                let outcome = match &**inner {
+                    ParsedSql::ExplainInsert(target) => {
+                        self.run_insert_explain(ctx, session, target, true)?
+                    }
+                    _ => self.execute_in_active_txn(ctx, session, txn, inner)?,
+                };
                 crate::sql::explain_json::outcome_to_json(self.scrub_outcome(ctx, outcome))
             }
             ParsedSql::Cursor(stmt) => self.execute_cursor_in_active_txn(ctx, session, txn, stmt),
