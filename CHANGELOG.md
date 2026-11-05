@@ -9,6 +9,8 @@
 
 ### Changed
 
+- `GET /v1/openapi.json` で OpenAPI 3.1 文書を配信するようにした（Issue #2244・NOSQL-20 (3) ポインタ）。有効な Bearer を必須とし、欠落・不正・期限切れ・close 済みは `28000`（401）。本文はビルド時に埋め込んだ静的文書で、主体・テナントによらずバイト同一。`Content-Length` は省略または `0` のみで、本文あり・このパス以外への `GET`・このパスへの `GET` 以外は認証前に `08P01`。応答に `Cache-Control: no-store` を付ける。
+  BREAKING CHANGE: 公開 enum `http::request::Method` に `Get` を追加した（網羅的 `match` の下流は追随が必要）。
 - セッションのスコープを `POST /v1/query` の要求ごとに強制するようにした（Issue #2101・HTTP-15・ERR-4 ポインタ）。スコープ外の op・表・`read_only` 違反は実行前に固定文言の `42501`（HTTP 403）で拒否し、副作用はない。スコープ外の表は存在の有無に依らず同一応答で、スコープ内の存在しない表はスコープなしと同じ `42P01`。`POST /v1/session` のスコープ付き発行は `0A000` ではなく 200 でトークンを返す。
   BREAKING CHANGE: スコープ付きの `POST /v1/session` が `0A000` から成功に変わり、スコープ外の `POST /v1/query` が `42501` で拒否される。
 - NoSQL の `upsert` op を実行するようにした（Issue #2087・NOSQL-21・SQL-20・SQL-49 ポインタ）。SQL 表層の `INSERT ... ON CONFLICT` と同じ束縛関数・実行器を通り、応答は `{"upserted":n}`。従来の固定文言 `0A000` は返さない。`Idempotency-Key` ヘッダを `upsert` でも受け付ける。

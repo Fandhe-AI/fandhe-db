@@ -42,12 +42,12 @@
 //! 結線済み（`engine` 未接続の [`Router::new`] 経由時のみ全 op が暫定
 //! `0A000`／501 を返す）。
 //!
-//! メソッド（`POST` 以外を拒否）は [`crate::http::conn`] が要求行パース時点で
-//! 既に絞り込み済み（[`crate::http::request::Method`] は `Post` の 1 variant
-//! のみを持つ閉じた語彙）だが、`Router::handle` 冒頭でも
-//! `Method` の網羅 match により再検査する（実行時コストなし。将来
-//! `Method` に variant が増えた場合にコンパイルエラーで気付ける
-//! defense in depth）。
+//! メソッドは [`crate::http::conn`] が要求行パース時点で既に絞り込み済み
+//! （`POST` と、`GET /v1/openapi.json` のバイト厳密一致のみ。`GET` の例外は
+//! パーサ側にあり、他パスへの `GET` はここへ到達しない）。`Router::handle` でも
+//! `(Method, Route)` の網羅 match により再検査する（`GET /v1/openapi.json` は
+//! Bearer 認証の後に埋め込み文書を返し〔Issue #2244・NOSQL-20 (3)〕、`POST` の
+//! `/v1/openapi.json` と `GET` のその他は認証せず未知パスと同一の `08P01`）。
 
 use std::time::{Instant, SystemTime};
 
@@ -55,8 +55,9 @@ use std::sync::Arc;
 
 use crate::auth::UserStore;
 use crate::http::conn::{unknown_target_response, Request, RequestHandler};
+use crate::http::openapi_endpoint;
 use crate::http::query::gate as query_gate;
-use crate::http::request::Method;
+use crate::http::request::{Method, OPENAPI_TARGET};
 use crate::http::response;
 use crate::http::session::close as session_close;
 use crate::http::session::issue as session_issue;
@@ -89,6 +90,8 @@ enum Endpoint {
     Session,
     SessionClose,
     Query,
+    /// `GET /v1/openapi.json`（Issue #2244）。`POST` では未知パス扱い。
+    OpenApi,
 }
 
 /// [`resolve_target`] の分類結果。`Router::handle` はこれを唯一の情報源
@@ -126,6 +129,9 @@ fn resolve_target(target: &str) -> Route {
     }
     if target == QUERY_TARGET {
         return Route::Endpoint(Endpoint::Query);
+    }
+    if target == OPENAPI_TARGET {
+        return Route::Endpoint(Endpoint::OpenApi);
     }
     let rest = target
         .strip_prefix("/v1/query?")
@@ -196,14 +202,36 @@ impl Router {
 
 impl RequestHandler for Router {
     fn handle(&self, req: &Request<'_>) -> Vec<u8> {
-        // `Method` は `Post` の 1 variant のみを持つ閉じた語彙（要求行
-        // パース時点で既に絞り込み済み）。この irrefutable な分配束縛は
-        // 将来 variant が増えた場合にコンパイルエラーで気付ける
-        // defense in depth であり、実行時の再検査コストは発生しない
-        // （モジュール doc 参照）。
-        let Method::Post = req.line.method;
+        let route = resolve_target(req.line.target);
+        // `(method, route)` の網羅 match。`Get` は要求行パーサが
+        // `/v1/openapi.json` だけに限って受理するため、他の組は到達不能だが、
+        // 多層防御として認証せず未知パスと同一の `08P01` に倒す。
+        match (req.line.method, route) {
+            (Method::Get, Route::Endpoint(Endpoint::OpenApi)) => {
+                // 文書はテナント文脈に依存しないため `reject_tenant_headers` は
+                // 適用しない。認証（`/v1/query` と同一の Bearer 検証）の後にだけ返す。
+                match middleware::authenticate(&self.sessions, &req.headers, Instant::now) {
+                    Ok(_principal) => openapi_endpoint::response(SystemTime::now()),
+                    Err(e) => response::encode_error(
+                        e.error_class(),
+                        e.client_message(),
+                        SystemTime::now(),
+                    ),
+                }
+            }
+            (Method::Get, _) | (Method::Post, Route::Endpoint(Endpoint::OpenApi)) => {
+                unknown_target_response(SystemTime::now())
+            }
+            (Method::Post, route) => self.handle_post(req, route),
+        }
+    }
+}
 
-        match resolve_target(req.line.target) {
+impl Router {
+    /// `POST` 要求のディスパッチ（従来のルーティング。`Endpoint::OpenApi` は呼び出し元で除外済み）。
+    fn handle_post(&self, req: &Request<'_>, route: Route) -> Vec<u8> {
+        match route {
+            Route::Endpoint(Endpoint::OpenApi) => unknown_target_response(SystemTime::now()),
             Route::Endpoint(Endpoint::Session) => session_issue::handle_with_engine(
                 &self.users,
                 self.engine.as_deref(),
@@ -263,6 +291,21 @@ mod tests {
             resolve_target(QUERY_TARGET),
             Route::Endpoint(Endpoint::Query)
         );
+    }
+
+    #[test]
+    fn resolve_target_classifies_openapi_exactly() {
+        assert_eq!(
+            resolve_target("/v1/openapi.json"),
+            Route::Endpoint(Endpoint::OpenApi)
+        );
+        for t in [
+            "/v1/openapi.json/",
+            "/v1/openapi.json?x=1",
+            "/V1/OPENAPI.JSON",
+        ] {
+            assert_eq!(resolve_target(t), Route::Unknown, "{t}");
+        }
     }
 
     #[test]

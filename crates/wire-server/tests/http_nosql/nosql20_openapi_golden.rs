@@ -57,6 +57,22 @@ fn nosql20_openapi_golden_matches_generator() {
     );
 }
 
+/// `GET /v1/openapi.json`（Issue #2244）が返す埋め込み文書がゴールデン・生成器と一致する。
+#[test]
+fn nosql20_openapi_embedded_document_matches_golden_and_generator() {
+    use wire_server::http::openapi_endpoint::OPENAPI_DOCUMENT;
+    assert_eq!(
+        OPENAPI_DOCUMENT,
+        read_golden(),
+        "embedded document differs from docs/openapi.json"
+    );
+    assert_eq!(
+        OPENAPI_DOCUMENT,
+        render_pretty().expect("OpenAPI generation must succeed"),
+        "embedded document differs from the generator; regenerate: {REGEN}"
+    );
+}
+
 #[test]
 fn nosql20_openapi_golden_parses_to_document() {
     let golden = read_golden();
