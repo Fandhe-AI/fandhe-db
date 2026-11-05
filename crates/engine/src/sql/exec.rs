@@ -3337,7 +3337,10 @@ pub(crate) fn execute_statement_with_cache(
             let mut rows_examined: u64 = 0;
             let (filtered, cap_hit) = loop {
                 crate::interrupt::current_deadline().check()?;
+                // 2 ラウンド目以降は同じ検索の再実行なので、キャッシュ状態を重ねて数えない。
+                let _suppress = (rounds > 0).then(crate::sql::hnsw_observe::suppress_cache_notes);
                 let raw = compute_hits(k_round)?;
+                drop(_suppress);
                 rounds += 1;
                 let raw_len = raw.len();
                 rows_examined = rows_examined.saturating_add(raw_len as u64);

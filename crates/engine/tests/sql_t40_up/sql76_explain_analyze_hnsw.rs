@@ -318,6 +318,13 @@ fn iterative_scan_cap_hit_is_reported() {
     assert!(it.contains("cap_hit=true"), "{capped:#?}");
     assert!(num(it, "rounds") >= 2, "{it}");
     assert!(num(it, "rows_examined") > 0, "{it}");
+    // 複数ラウンドでも 1 検索の解決は 1 回だけ数える（ラウンドごとに膨らまない）。
+    let cache = find(&capped, "hnsw_index_cache:");
+    let total = num(cache, "cached")
+        + num(cache, "built")
+        + num(cache, "rebuilt")
+        + num(cache, "not_indexed");
+    assert_eq!(total, 1, "{cache}");
     fx.set(&mut s, "SET hnsw.max_scan_tuples = 20000");
     let free = fx.analyze(&mut s, &sel);
     let it = find(&free, "hnsw_iterative_scan:");

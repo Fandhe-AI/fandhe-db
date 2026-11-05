@@ -50,6 +50,37 @@ pub(crate) struct HnswObservation {
 
 thread_local! {
     static SINK: RefCell<Option<HnswObservation>> = const { RefCell::new(None) };
+    /// true の間はキャッシュ状態（cached／built／rebuilt／not_indexed）の記録を捨てる。
+    static CACHE_SUPPRESSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// キャッシュ状態の記録を一時的に止めるガード。反復スキャンの 2 ラウンド目以降が同じ検索の
+/// 解決を重ねて数えないために使う（1 検索につき解決 1 回。Issue #2056）。Drop で元に戻す。
+pub(crate) struct CacheSuppressGuard {
+    prev: bool,
+}
+
+/// キャッシュ状態の記録を止める。返るガードが生きている間 [`note_cache`] は何もしない。
+pub(crate) fn suppress_cache_notes() -> CacheSuppressGuard {
+    let prev = CACHE_SUPPRESSED
+        .try_with(|c| c.replace(true))
+        .unwrap_or(false);
+    CacheSuppressGuard { prev }
+}
+
+impl Drop for CacheSuppressGuard {
+    fn drop(&mut self) {
+        let prev = self.prev;
+        let _ = CACHE_SUPPRESSED.try_with(|c| c.set(prev));
+    }
+}
+
+/// キャッシュ状態の記録専用の [`note`]。[`suppress_cache_notes`] 中は捨てる。
+pub(crate) fn note_cache(f: impl FnOnce(&mut HnswObservation)) {
+    if CACHE_SUPPRESSED.try_with(|c| c.get()).unwrap_or(false) {
+        return;
+    }
+    note(f);
 }
 
 /// 観測ガード。Drop で前の状態へ戻す（ネスト・panic でも復元される）。
@@ -178,5 +209,21 @@ mod tests {
     fn untouched_observation_is_not_attempted() {
         let o = enter().finish();
         assert!(!o.attempted);
+    }
+
+    #[test]
+    fn suppressed_cache_notes_are_dropped_and_restored() {
+        let g = enter();
+        note_cache(|o| o.cache_cached += 1);
+        {
+            let _s = suppress_cache_notes();
+            note_cache(|o| o.cache_cached += 10);
+            // キャッシュ以外の記録は止めない。
+            note(|o| o.exact_scan_switches += 1);
+        }
+        note_cache(|o| o.cache_cached += 1);
+        let o = g.finish();
+        assert_eq!(o.cache_cached, 2);
+        assert_eq!(o.exact_scan_switches, 1);
     }
 }
