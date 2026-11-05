@@ -15963,6 +15963,74 @@ impl EngineCore {
         )
     }
 
+    /// [`Self::execute_bound_insert_in_session`] の `RETURNING` 付き版（NOSQL-22・Issue #2091。
+    /// 呼び出し元は `wire-server::http::query::insert`）。SQL 表層 `INSERT ... RETURNING`
+    /// （SQL-21）と**同一の実行器**（`sql::exec::execute_insert_returning_in`）へ到達させるため、
+    /// 返却行の内容・件数は同じ状態に対する SQL の結果と一致する（第 2 の実行器を作らない）。
+    ///
+    /// 判定順序は件数版（[`Self::execute_bound_insert_in_session`]）の判定 1〜6 と共通本体を共有し、
+    /// 束縛（`bind` の直後に同じ `read_txn` 下で `bind_returning`。未知列は SQL と同じコード）→
+    /// 権限 → 書き込みの順に進む。必要権限は `INSERT | SELECT`（SQL-40。`privilege_gate::write` の
+    /// `insert_bits` が `RETURNING` で `SELECT` を足すのと同じ）。HTTP の束縛済み入口は列を
+    /// 特定できず全列要求のため、SQL より厳しい側（fail-closed）に倒れる。返却行は書き込み側の
+    /// 可視性で再判定され、`rows.len() < rows_affected` になりうる（`ReturningOutcome` 参照）。
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_bound_insert_returning_in_session<F>(
+        &self,
+        ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
+        table: &str,
+        row_count: usize,
+        operation_id: Option<&crate::recovery::required_op_id::OperationId>,
+        returning: &crate::sql::allowlist::Projection,
+        bind: F,
+    ) -> Result<crate::sql::exec::ReturningOutcome, crate::sql::allowlist::SqlSurfaceError>
+    where
+        F: FnOnce(
+            &crate::catalog::TableSchema,
+        ) -> Result<
+            Vec<crate::sql::parser::BoundInsert>,
+            crate::sql::allowlist::SqlSurfaceError,
+        >,
+    {
+        // 束縛クロージャで得た投影を、書き込みクロージャへ受け渡す（両者は同時に生存するため RefCell）。
+        let projected: std::cell::RefCell<Option<Vec<crate::sql::parser::ProjectedColumn>>> =
+            std::cell::RefCell::new(None);
+        self.execute_bound_insert_core(
+            crate::tenant::WriteTarget::Autocommit(&self.storage),
+            ctx,
+            Some((
+                session,
+                crate::catalog::privilege::PRIV_INSERT | crate::catalog::privilege::PRIV_SELECT,
+            )),
+            table,
+            row_count,
+            operation_id,
+            |schema| {
+                let bounds = bind(schema)?;
+                *projected.borrow_mut() =
+                    crate::sql::parser::bind_returning(Some(returning), schema)?;
+                Ok(bounds)
+            },
+            |target, bounds, schema| {
+                let projected = projected.borrow();
+                let projected = projected.as_deref().ok_or_else(|| {
+                    crate::sql::allowlist::SqlSurfaceError::Internal {
+                        detail: "bound INSERT RETURNING without a bound projection".to_string(),
+                    }
+                })?;
+                crate::sql::exec::execute_insert_returning_in(
+                    target,
+                    ctx,
+                    bounds,
+                    self.ledger_mode,
+                    projected,
+                    schema,
+                )
+            },
+        )
+    }
+
     /// [`Self::execute_bound_insert_in_session`] の本体（書き込み先を `target` で
     /// 選べる版。Issue #1179）。`InTxn` は明示トランザクション内の `COPY FROM STDIN`
     /// （[`Self::commit_copy_in_txn`]）が共有 `redb::WriteTransaction` へ書き込む
@@ -15987,6 +16055,59 @@ impl EngineCore {
             Vec<crate::sql::parser::BoundInsert>,
             crate::sql::allowlist::SqlSurfaceError,
         >,
+    {
+        self.execute_bound_insert_core(
+            target,
+            ctx,
+            privilege_session.map(|s| (s, crate::catalog::privilege::PRIV_INSERT)),
+            table,
+            row_count,
+            operation_id,
+            bind,
+            |target, bounds, schema| {
+                // 判定 7: 実書き込み。NoSQL 表層はトリガの発火に未対応（`None`。INSERT トリガのある表は
+                // `0A000`。Issue #1723）。
+                crate::sql::exec::execute_insert_batch_with_schema_in(
+                    target,
+                    ctx,
+                    bounds,
+                    self.ledger_mode,
+                    Some(schema),
+                    None,
+                )
+            },
+        )
+    }
+
+    /// 束縛済み INSERT 入口の共有本体（判定 1〜6 と書き込み直前までを持つ）。最後の書き込みだけを
+    /// `write` で差し替えられる。件数だけを返す従来の入口（[`Self::execute_bound_insert_in_session`]・
+    /// COPY）と `RETURNING` 付きの入口（[`Self::execute_bound_insert_returning_in_session`]）が
+    /// 判定順・時刻スコープ・上限をそのまま共有し、第 2 の検証経路を作らない。`privilege` の `Some` は
+    /// 判定する権限ビット（SQL-40）、`None` は COPY の commit 経路（権限は別所で判定済み）。
+    #[allow(clippy::too_many_arguments)]
+    fn execute_bound_insert_core<F, W, T>(
+        &self,
+        target: crate::tenant::WriteTarget<'_>,
+        ctx: &PolicyContext,
+        privilege: Option<(&crate::sql::mode::SessionState, u16)>,
+        table: &str,
+        row_count: usize,
+        operation_id: Option<&crate::recovery::required_op_id::OperationId>,
+        bind: F,
+        write: W,
+    ) -> Result<T, crate::sql::allowlist::SqlSurfaceError>
+    where
+        F: FnOnce(
+            &crate::catalog::TableSchema,
+        ) -> Result<
+            Vec<crate::sql::parser::BoundInsert>,
+            crate::sql::allowlist::SqlSurfaceError,
+        >,
+        W: FnOnce(
+            crate::tenant::WriteTarget<'_>,
+            &[crate::sql::parser::BoundInsert],
+            &crate::catalog::TableSchema,
+        ) -> Result<T, crate::sql::allowlist::SqlSurfaceError>,
     {
         // 判定 1: `operation_id` 必須化ガード（スキーマ取得より前）。
         self.ledger_mode
@@ -16050,13 +16171,8 @@ impl EngineCore {
                 "bound insert plan does not match the requested table, row count, or operation_id",
             ));
         }
-        if let Some(session) = privilege_session {
-            self.require_table_write_privilege(
-                ctx,
-                session,
-                table,
-                crate::catalog::privilege::PRIV_INSERT,
-            )?;
+        if let Some((session, bits)) = privilege {
+            self.require_table_write_privilege(ctx, session, table, bits)?;
         }
         drop(read_txn);
 
@@ -16073,15 +16189,7 @@ impl EngineCore {
         // に検出する（codex-review P1 指摘・PR #823。`tenant::insert_typed_row_unchecked`
         // のドキュメント参照。束縛後・書き込み前にテーブルが再定義され列順が
         // 入れ替わっても、値が誤った列へ保存されるのを防ぐ）。
-        // NoSQL 表層はトリガの発火に未対応（`None`。INSERT トリガのある表は `0A000`。Issue #1723）。
-        crate::sql::exec::execute_insert_batch_with_schema_in(
-            target,
-            ctx,
-            &bounds,
-            self.ledger_mode,
-            Some(&schema),
-            None,
-        )
+        write(target, &bounds, &schema)
     }
 
     /// `COPY` 文（Issue #939・WIRE-17・TASK-220）を構造検証し、`FROM STDIN` 形は
@@ -16892,6 +17000,243 @@ impl EngineCore {
             &validated,
             &schema,
         )
+    }
+
+    /// [`Self::execute_bound_update_in_session`] の `RETURNING` 付き版（NOSQL-22・Issue #2091。
+    /// 呼び出し元は `wire-server::http::query::update` の単一行形）。SQL 表層
+    /// `UPDATE ... WHERE id = ... RETURNING`（SQL-21）と同一の実行器
+    /// （`sql::exec::execute_update_returning_in`）を呼び、返却行は更新後の値になる。
+    ///
+    /// 判定順序は件数版と同じ（`operation_id` ガード → スキーマ取得 → 束縛 → 一致検証）に
+    /// `bind_returning`（同じ `read_txn` 下。未知列は SQL と同じコード）が加わり、その後に権限
+    /// （`UPDATE | SELECT`。単一行形はもともと `SELECT` を要求する。SQL-40）→ 書き込みと進む。
+    /// 他テナント行・未存在 id・不可視行は件数 0・返却行 0 で区別しない。
+    pub fn execute_bound_update_returning_in_session<F>(
+        &self,
+        ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
+        table: &str,
+        operation_id: Option<&crate::recovery::required_op_id::OperationId>,
+        returning: &crate::sql::allowlist::Projection,
+        bind: F,
+    ) -> Result<crate::sql::exec::ReturningOutcome, crate::sql::allowlist::SqlSurfaceError>
+    where
+        F: FnOnce(
+            &crate::catalog::TableSchema,
+        ) -> Result<
+            crate::sql::parser::BoundUpdate,
+            crate::sql::allowlist::SqlSurfaceError,
+        >,
+    {
+        self.ledger_mode
+            .resolve(operation_id)
+            .map_err(|_| crate::sql::allowlist::SqlSurfaceError::MissingOperationId)?;
+
+        let (read_txn, schema) = self.read_txn_with_schema(table)?;
+        let _sparsevec_limits_scope = self.sparsevec_limits_scope();
+        let bound = bind(&schema)?;
+        if bound.table != table || bound.operation_id.as_ref() != operation_id {
+            return Err(crate::sql::allowlist::SqlSurfaceError::invalid_input(
+                "bound update plan does not match the requested table or operation_id",
+            ));
+        }
+        let projected = Self::bind_returning_required(returning, &schema)?;
+        self.require_table_write_privilege(
+            ctx,
+            session,
+            table,
+            crate::catalog::privilege::PRIV_UPDATE | crate::catalog::privilege::PRIV_SELECT,
+        )?;
+        drop(read_txn);
+
+        crate::sql::exec::execute_update_returning_in(
+            crate::tenant::WriteTarget::Autocommit(&self.storage),
+            ctx,
+            &bound,
+            self.ledger_mode,
+            &projected,
+            &schema,
+        )
+    }
+
+    /// [`Self::execute_bound_delete_checked_in_session`] の `RETURNING` 付き版（NOSQL-22・
+    /// Issue #2091。呼び出し元は `wire-server::http::query::delete` の単一行形）。SQL 表層
+    /// `DELETE ... WHERE id = ... RETURNING`（SQL-21）と同一の実行器
+    /// （`sql::exec::execute_delete_returning_in`）を呼び、返却行は削除前の値になる（投影は
+    /// commit 前に行われ、失敗すれば削除ごと abort する）。判定順は
+    /// `operation_id` ガード → スキーマ取得 → `check` → `bind_returning` → 権限（`DELETE | SELECT`）
+    /// → 書き込み。
+    pub fn execute_bound_delete_checked_returning_in_session<F>(
+        &self,
+        ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
+        bound: &crate::sql::parser::BoundDelete,
+        returning: &crate::sql::allowlist::Projection,
+        check: F,
+    ) -> Result<crate::sql::exec::ReturningOutcome, crate::sql::allowlist::SqlSurfaceError>
+    where
+        F: FnOnce(
+            &crate::catalog::TableSchema,
+        ) -> Result<(), crate::sql::allowlist::SqlSurfaceError>,
+    {
+        self.ledger_mode
+            .resolve(bound.operation_id.as_ref())
+            .map_err(|_| crate::sql::allowlist::SqlSurfaceError::MissingOperationId)?;
+        let (read_txn, schema) = self.read_txn_with_schema(&bound.table)?;
+        check(&schema)?;
+        let projected = Self::bind_returning_required(returning, &schema)?;
+        self.require_table_write_privilege(
+            ctx,
+            session,
+            &bound.table,
+            crate::catalog::privilege::PRIV_DELETE | crate::catalog::privilege::PRIV_SELECT,
+        )?;
+        drop(read_txn);
+        crate::sql::exec::execute_delete_returning_in(
+            crate::tenant::WriteTarget::Autocommit(&self.storage),
+            ctx,
+            bound,
+            self.ledger_mode,
+            &projected,
+            &schema,
+        )
+    }
+
+    /// [`Self::execute_bound_predicate_update_in_session`] の `RETURNING` 付き版（NOSQL-22・
+    /// Issue #2091。`wire-server::http::query::update` の PK アドレス形・`filter` 述語形）。
+    /// engine 内で組み立てる `ValidatedPredicateUpdate` に `returning` を持たせるため、必要権限は
+    /// SQL 表層の述語形 UPDATE と同じ `partitioned_update_bits` が決め、`RETURNING` で `SELECT` が
+    /// 加わる（SQL-40）。実行は SQL と同じ `execute_predicate_update_returning`
+    /// （[`Self::run_predicate_update_returning`]）。内容照合ハッシュは `RETURNING` を材料にしない
+    /// ため、`returning` の有無が違っても同じ `operation_id` の再送は同一要求として扱われる
+    /// （RECOVER-10・11）。判定順は件数版と同じで、束縛（`bind_returning` を含む）→ 権限 → 書き込み。
+    pub fn execute_bound_predicate_update_returning_in_session<F>(
+        &self,
+        ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
+        table: &str,
+        operation_id: Option<&crate::recovery::required_op_id::OperationId>,
+        returning: &crate::sql::allowlist::Projection,
+        bind: F,
+    ) -> Result<crate::sql::exec::ReturningOutcome, crate::sql::allowlist::SqlSurfaceError>
+    where
+        F: FnOnce(
+            &crate::catalog::TableSchema,
+        ) -> Result<
+            (
+                Vec<(String, crate::sql::allowlist::InsertLiteral)>,
+                Vec<crate::sql::allowlist::WherePredicate>,
+            ),
+            crate::sql::allowlist::SqlSurfaceError,
+        >,
+    {
+        self.ledger_mode
+            .resolve(operation_id)
+            .map_err(|_| crate::sql::allowlist::SqlSurfaceError::MissingOperationId)?;
+
+        let (read_txn, schema) = self.read_txn_with_schema(table)?;
+        let _sparsevec_limits_scope = self.sparsevec_limits_scope();
+        let (assignments, where_predicates) = bind(&schema)?;
+        reject_unsupported_predicate_dml_forms(&where_predicates)?;
+        let projected = Self::bind_returning_required(returning, &schema)?;
+        drop(read_txn);
+
+        let assignments = assignments
+            .into_iter()
+            .map(|(name, literal)| (name, crate::sql::allowlist::SetValue::Literal(literal)))
+            .collect();
+        let validated = crate::sql::allowlist::ValidatedPredicateUpdate {
+            table_name: table.to_string(),
+            assignments,
+            where_predicates,
+            operation_id: operation_id.cloned(),
+            returning: Some(returning.clone()),
+            partitioned: None,
+        };
+        self.require_table_write_privilege(
+            ctx,
+            session,
+            table,
+            crate::sql::privilege_gate::write::partitioned_update_bits(&validated),
+        )?;
+        let udfs = crate::sql::udf_call::UdfRegistry::default();
+        self.run_predicate_update_returning(
+            crate::tenant::WriteTarget::Autocommit(&self.storage),
+            ctx,
+            &udfs,
+            &validated,
+            &schema,
+            &projected,
+        )
+    }
+
+    /// [`Self::execute_bound_predicate_delete_in_session`] の `RETURNING` 付き版（NOSQL-22・
+    /// Issue #2091）。[`Self::execute_bound_predicate_update_returning_in_session`] と同じ判定順・
+    /// 設計で、返却行は削除前の値になる。
+    pub fn execute_bound_predicate_delete_returning_in_session<F>(
+        &self,
+        ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
+        table: &str,
+        operation_id: Option<&crate::recovery::required_op_id::OperationId>,
+        returning: &crate::sql::allowlist::Projection,
+        bind: F,
+    ) -> Result<crate::sql::exec::ReturningOutcome, crate::sql::allowlist::SqlSurfaceError>
+    where
+        F: FnOnce(
+            &crate::catalog::TableSchema,
+        ) -> Result<
+            Vec<crate::sql::allowlist::WherePredicate>,
+            crate::sql::allowlist::SqlSurfaceError,
+        >,
+    {
+        self.ledger_mode
+            .resolve(operation_id)
+            .map_err(|_| crate::sql::allowlist::SqlSurfaceError::MissingOperationId)?;
+
+        let (read_txn, schema) = self.read_txn_with_schema(table)?;
+        let _sparsevec_limits_scope = self.sparsevec_limits_scope();
+        let where_predicates = bind(&schema)?;
+        reject_unsupported_predicate_dml_forms(&where_predicates)?;
+        let projected = Self::bind_returning_required(returning, &schema)?;
+        drop(read_txn);
+
+        let validated = crate::sql::allowlist::ValidatedPredicateDelete {
+            table_name: table.to_string(),
+            where_predicates,
+            operation_id: operation_id.cloned(),
+            returning: Some(returning.clone()),
+            partitioned: None,
+        };
+        self.require_table_write_privilege(
+            ctx,
+            session,
+            table,
+            crate::sql::privilege_gate::write::partitioned_delete_bits(&validated),
+        )?;
+        let udfs = crate::sql::udf_call::UdfRegistry::default();
+        self.run_predicate_delete_returning(
+            crate::tenant::WriteTarget::Autocommit(&self.storage),
+            ctx,
+            &udfs,
+            &validated,
+            &schema,
+            &projected,
+        )
+    }
+
+    /// `RETURNING` の投影を束縛する。HTTP の `RETURNING` 付き入口は必ず `Some` を渡すため、
+    /// 束縛結果が `None` になるのは内部不整合（`Internal`）として扱う。
+    fn bind_returning_required(
+        returning: &crate::sql::allowlist::Projection,
+        schema: &crate::catalog::TableSchema,
+    ) -> Result<Vec<crate::sql::parser::ProjectedColumn>, crate::sql::allowlist::SqlSurfaceError>
+    {
+        crate::sql::parser::bind_returning(Some(returning), schema)?.ok_or_else(|| {
+            crate::sql::allowlist::SqlSurfaceError::Internal {
+                detail: "bound RETURNING without a bound projection".to_string(),
+            }
+        })
     }
 
     /// NoSQL 表層 `update` op の分割実行修飾（`mode: partitioned`。Issue #1130・
@@ -18555,6 +18900,37 @@ impl EngineCore {
         )
     }
 
+    /// [`Self::run_predicate_delete`] の `RETURNING` 付き版（NOSQL-22・Issue #2091。HTTP の束縛済み
+    /// 入口 [`Self::execute_bound_predicate_delete_returning_in_session`] が呼ぶ）。分割実行修飾の
+    /// 拒否・内容照合ハッシュ（`RETURNING` 非依存）・実行器は SQL 表層の述語形と同じ関数を使う。
+    /// `returning` は呼び出し元が束縛済みの投影。
+    fn run_predicate_delete_returning(
+        &self,
+        target: crate::tenant::WriteTarget<'_>,
+        ctx: &PolicyContext,
+        udfs: &crate::sql::udf_call::UdfRegistry,
+        stmt: &crate::sql::allowlist::ValidatedPredicateDelete,
+        schema: &crate::catalog::TableSchema,
+        returning: &[crate::sql::parser::ProjectedColumn],
+    ) -> Result<crate::sql::exec::ReturningOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        // 多層防御（Issue #1129）: 分割実行修飾付きの文は原子実行器へ到達させない。
+        if stmt.partitioned().is_some() {
+            return Err(crate::sql::allowlist::SqlSurfaceError::PartitionedDmlInTransaction);
+        }
+        let (bound, content_hash_value) = Self::prepare_predicate_delete(stmt, stmt, schema, udfs)?;
+        crate::sql::exec::execute_predicate_delete_returning(
+            target,
+            ctx,
+            &bound,
+            self.dml_ledger_mode(),
+            schema,
+            &content_hash_value,
+            self.dml_limits.max_affected_rows,
+            self.scan_limits.max_scanned_rows(),
+            returning,
+        )
+    }
+
     /// 述語形 `DELETE ... PARTITIONED [CHUNK n]`（Issue #1129・SQL-19）の実行 form。
     /// スキーマ取得 → 束縛 → 分割実行用の内容照合ハッシュ（チャンク幅は含めない）→ 分割実行器、
     /// の順で、原子経路（[`Self::run_predicate_delete`]）の入口とは独立している。autocommit
@@ -19434,6 +19810,38 @@ impl EngineCore {
         schema: &crate::catalog::TableSchema,
     ) -> Result<crate::sql::exec::UpdateOutcome, crate::sql::allowlist::SqlSurfaceError> {
         self.run_predicate_update_resolved(target, ctx, udfs, validated, validated, schema, None)
+    }
+
+    /// [`Self::run_predicate_update`] の `RETURNING` 付き版（NOSQL-22・Issue #2091。
+    /// [`Self::execute_bound_predicate_update_returning_in_session`] が呼ぶ）。
+    /// [`Self::run_predicate_delete_returning`] と対で、更新後の値を返す。
+    fn run_predicate_update_returning(
+        &self,
+        target: crate::tenant::WriteTarget<'_>,
+        ctx: &PolicyContext,
+        udfs: &crate::sql::udf_call::UdfRegistry,
+        validated: &crate::sql::allowlist::ValidatedPredicateUpdate,
+        schema: &crate::catalog::TableSchema,
+        returning: &[crate::sql::parser::ProjectedColumn],
+    ) -> Result<crate::sql::exec::ReturningOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        if validated.partitioned().is_some() {
+            return Err(crate::sql::allowlist::SqlSurfaceError::PartitionedDmlInTransaction);
+        }
+        let _sparsevec_limits_scope = self.sparsevec_limits_scope();
+        let (bound, content_hash_value, legacy_hashes) =
+            Self::prepare_predicate_update(validated, validated, schema, udfs)?;
+        crate::sql::exec::execute_predicate_update_returning(
+            target,
+            ctx,
+            &bound,
+            self.dml_ledger_mode(),
+            schema,
+            &content_hash_value,
+            &legacy_hashes,
+            self.dml_limits.max_affected_rows,
+            self.scan_limits.max_scanned_rows(),
+            returning,
+        )
     }
 
     /// [`Self::run_predicate_update`] の本体（`bind_stmt`／`hash_stmt` の意味は
