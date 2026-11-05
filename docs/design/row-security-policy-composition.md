@@ -20,7 +20,7 @@
   [visible-bitmap-cache.md](visible-bitmap-cache.md)・[sql-upsert.md](sql-upsert.md)・
   [wire-copy-protocol.md](wire-copy-protocol.md)・
   [explain-search-engine-exposure.md](explain-search-engine-exposure.md)。
-  ロール・権限モデルの ADR は PR #2828（#1960。未マージのため番号で参照）
+  固定テナント方式の方針は [fixed-tenant-boundary.md](fixed-tenant-boundary.md)。ロール・権限モデルの ADR は PR #2828（#1960。未マージのため番号で参照）
 
 ## 背景・目的・範囲
 
