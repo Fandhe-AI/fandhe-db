@@ -74,6 +74,15 @@
 //! と同型）。他テナント所有 id・未存在 id はいずれも `updated:0`・`200`
 //! （RLS-9。`execute_update_with_schema` のドキュメント参照）。
 //!
+//! 期待値の条件 `if`（Issue #2098・NOSQL-18 ポインタ。ADR
+//! `docs/design/conditional-update-existence-hiding.md`）は `filter` と同じ形の条件配列で、
+//! 対象行の指定（`where` の PRIMARY KEY 形・従来の `id` 形、または `filter`）に AND で加える
+//! （[`super::dml_target::bind_condition`]・[`super::dml_target::bind_condition_predicates`]）。
+//! 述語形の実行入口へ `[対象の述語] ++ [if の述語]` を渡すだけで第 2 の実行器は作らない。
+//! 従来の `id` 形に `if` が付くときは、単一行の実行器が条件を持てないため述語形の入口へ
+//! `id = n` の述語として流す。不一致・不存在・他テナント・RLS で不可視はいずれも `updated:0` の
+//! 同一応答で、`mode: "partitioned"` との併用は `42601`（engine 呼び出し前に拒否）。
+//!
 //! `returning` キー（Issue #2090・NOSQL-22）は検査済みでも実行未結線（Issue #2091 で結線。
 //! 成功本文の形は `encode_success_body_with_returning`）。`filter` は `search` と同じ語彙（`or`・範囲比較・
 //! `in`・数値列を含む。Issue #1356）を `filter.rs` の `bind_filter_where_predicates` が
@@ -324,6 +333,9 @@ pub fn execute(
     // 分割実行修飾（Issue #1130）。述語形（`filter`）だけが受理する。
     let modifier = partitioned::parse_modifier(validated)?;
     partitioned::check_target_form(modifier, &target)?;
+    // 期待値の条件（Issue #2098）。空配列・分割実行との併用は engine 呼び出し前に拒否する。
+    let condition = dml_target::bind_condition(validated)?;
+    partitioned::check_condition(modifier, condition.is_some())?;
 
     let set = validated
         .required_object("set")
@@ -347,6 +359,7 @@ pub fn execute(
         // 食い違えば（並行 DDL）各経路の束縛 closure が fail-closed で拒否する。
         TargetForm::RowAddress(address)
             if dml_target::is_id_address(address)
+                && condition.is_none()
                 && !core.table_uses_allocated_row_identity(table) =>
         {
             let id = dml_target::row_id_from_address(address)?;
@@ -379,9 +392,32 @@ pub fn execute(
                 },
             )?
         }
+        // 従来の `id` 形 + `if`（Issue #2098）: 単一行の実行器は条件を持てないため、述語形の入口へ
+        // `id = n` の述語と `if` の述語を AND で渡す。並行 DDL で採番方式へ変わっていた場合は
+        // 束縛 closure の `reject_allocated_schema` が fail-closed で拒否する。
+        TargetForm::RowAddress(address)
+            if dml_target::is_id_address(address)
+                && !core.table_uses_allocated_row_identity(table) =>
+        {
+            let id = dml_target::row_id_from_address(address)?;
+            let bind = |schema: &TableSchema| {
+                super::gate::reject_allocated_schema(schema)?;
+                let assignments = map_set_assignments_for_engine(set, schema)?;
+                let predicates = dml_target::bind_id_address_with_condition(id, condition, schema)?;
+                Ok((assignments, predicates))
+            };
+            core.execute_bound_predicate_update_in_session(
+                principal.policy_context(),
+                &principal.session_state(),
+                table,
+                operation_id.as_ref(),
+                bind,
+            )?
+        }
         TargetForm::RowAddress(address) => {
             let bind = |schema: &TableSchema| {
-                let predicates = dml_target::bind_primary_key_predicates(address, schema)?;
+                let mut predicates = dml_target::bind_primary_key_predicates(address, schema)?;
+                predicates.extend(dml_target::bind_condition_predicates(condition, schema)?);
                 let assignments = map_set_assignments_for_engine(set, schema)?;
                 Ok((assignments, predicates))
             };
@@ -404,11 +440,17 @@ pub fn execute(
         TargetForm::Predicate(items) => {
             let bind = |schema: &TableSchema| {
                 let assignments = map_set_assignments_for_engine(set, schema)?;
-                let predicates = filter::bind_filter_where_predicates(items, schema)
+                let mut predicates = filter::bind_filter_where_predicates(items, schema)
                     .map_err(filter::FilterError::into_sql_surface_error)?;
+                predicates.extend(dml_target::bind_condition_predicates(condition, schema)?);
                 Ok((assignments, predicates))
             };
             match modifier {
+                // 多層防御: `check_condition` で拒否済みのため到達しないが、`if` を黙って無視せず
+                // 拒否側（`42601`）に倒す。
+                Some(_) if condition.is_some() => {
+                    return Err(PartitionedRequestError::ConditionNotAllowed.into())
+                }
                 // 分割実行（Issue #1130）: SQL 表層 `UPDATE ... PARTITIONED` と同一の
                 // 共通本体（内容照合ハッシュ・実行器・上限）へ到達する。
                 Some(m) => core.execute_bound_partitioned_update_in_session(
