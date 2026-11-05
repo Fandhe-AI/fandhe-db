@@ -24,7 +24,7 @@
 //!   TASK-173・HTTP-3, HTTP-11）
 //! - [`idempotency_key`]: `Idempotency-Key` ヘッダの取り出しと `OperationId` 検証
 //!   （長さ・文字不正は `42601`、重複は `08P01`。Issue #2063・HTTP-14 (2)。
-//!   書き込み op への結線は Issue #2064）
+//!   書き込み op への結線と本文との不一致拒否は Issue #2064）
 //! - [`status`]: `ErrorClass` → HTTP ステータスの決定的射影（Issue #744・ERR-4）
 //! - [`error_body`]: `ErrorClass` → JSON エラー本文（Issue #745・ERR-4・ERR-5）
 //! - [`conn`][]: 接続 1 本ぶんの受理後処理。要求行→ヘッダ→本文の読み取りと

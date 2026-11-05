@@ -150,17 +150,13 @@ pub fn check_target_form(
 
 /// `update`／`delete` の engine エラーを応答へ写像する。`VD001`・`VD002` は 409 と
 /// `data`（自テナントの commit 済み件数・クライアント自身の `operation_id`）付きの本文、
-/// それ以外は通常のエラー応答。`validated` の `operation_id` は engine 到達時点で検証済み。
+/// それ以外は通常のエラー応答。`operation_id` は本文／ヘッダから解決済みの値（`operation_id_source`。未指定は空文字）。
 pub fn encode_engine_error(
     err: &SqlSurfaceError,
-    validated: &Validated<'_>,
+    operation_id: Option<&OperationId>,
     now_wall: SystemTime,
 ) -> Vec<u8> {
-    let operation_id = validated
-        .optional_str("operation_id")
-        .ok()
-        .flatten()
-        .unwrap_or("");
+    let operation_id = operation_id.map_or("", OperationId::as_str);
     match err {
         SqlSurfaceError::PartialCompletion { committed, .. }
         | SqlSurfaceError::PartitionedDmlCancelled { committed } => {

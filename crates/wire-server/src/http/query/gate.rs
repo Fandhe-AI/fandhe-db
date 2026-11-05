@@ -22,7 +22,12 @@
 //! 4. `Op::schema().validate(...)`（必須欠落・未知キー・型不一致 →
 //!    `42601`。`tenant_id` の JSON 自己申告・`HINT ORDER`／
 //!    `SET search_mode` 相当フィールドはここで未知キーとして拒否される）
-//! 5. `op` と `engine`（接続済み `EngineCore`。`Router::new` 経由では
+//! 5. `Idempotency-Key` ヘッダの解決（Issue #2064・HTTP-14。
+//!    [`crate::http::idempotency_key::extract_idempotency_key`]。重複は `08P01`、不正値は
+//!    `42601`。`insert`／`update`／`delete` 以外の op に付いていれば `42601` で拒否する。
+//!    engine 呼び出しより前に返るため副作用は無い）。書き込み op へは検証済みの値を渡し、
+//!    本文の `operation_id` との一致検査は [`super::operation_id_source`] が行う
+//! 6. `op` と `engine`（接続済み `EngineCore`。`Router::new` 経由では
 //!    `None`・`Router::with_engine` 経由でのみ `Some`）の組でディスパッチ
 //!    する。`(Op::Search, Some(engine))` かつ `explain: true` は
 //!    [`super::explain::handle`]（`search` 本体〔`vector`・`plan` いずれも〕
@@ -69,6 +74,7 @@ use engine::core::EngineCore;
 use engine::error_format::{ClassifiedError, ErrorClass};
 use engine::json::parse_json;
 
+use crate::http::idempotency_key::extract_idempotency_key;
 use crate::http::query::op::{classify_op, Op};
 use crate::http::query::schema::Validated;
 use crate::http::query::{ddl, delete, insert, partitioned, scan, update};
@@ -97,6 +103,11 @@ pub(super) fn reject_allocated_schema(
     }
     Ok(())
 }
+
+/// 書き込み op 以外に `Idempotency-Key` ヘッダが付いていたときの固定文言（Issue #2064。
+/// ヘッダ値を含めない）。
+const IDEMPOTENCY_KEY_NOT_ALLOWED_MESSAGE: &str =
+    "idempotency-key header is not allowed for this op";
 
 /// 検証を通過したが実行結線が未接続の要求に返す暫定応答の文言。
 /// `scan`・`aggregate`・`insert`・`search`（`explain: true` の `search` を
@@ -149,7 +160,22 @@ pub fn handle(
         Err(e) => return response::encode_error(e.error_class(), &e.client_message(), now_wall),
     };
 
-    // 手順 5: op と engine 接続有無の組でディスパッチする（Issue #766・
+    // 手順 5: `Idempotency-Key` ヘッダの解決（Issue #2064）。書き込み op 以外への付与は
+    // 許可リスト方式で拒否する（fail-closed。DDL・ジョブ照会系を含む）。ヘッダ値は応答に含めない。
+    let header_operation_id = match extract_idempotency_key(headers) {
+        Ok(id) => id,
+        Err(e) => return response::encode_error(e.error_class(), e.client_message(), now_wall),
+    };
+    if header_operation_id.is_some() && !op.accepts_idempotency_key() {
+        return response::encode_error(
+            ErrorClass::UnsupportedSqlSyntax,
+            IDEMPOTENCY_KEY_NOT_ALLOWED_MESSAGE,
+            now_wall,
+        );
+    }
+    let header_operation_id = header_operation_id.as_ref();
+
+    // 手順 6: op と engine 接続有無の組でディスパッチする（Issue #766・
     // #768・#772・#764・#876）。各アームは対応するモジュールへの 1 行委譲に
     // 留める。全 6 op が実行結線済みのため `(_, _)` は `engine` 未接続時
     // （`Router::new` 経由）にのみ到達する。
@@ -190,7 +216,9 @@ pub fn handle(
         (Op::Aggregate, Some(engine)) => {
             super::aggregate::handle(engine, principal, &validated, now_wall)
         }
-        (Op::Insert, Some(engine)) => insert::handle(engine, principal, &validated, now_wall),
+        (Op::Insert, Some(engine)) => {
+            insert::handle(engine, principal, &validated, header_operation_id, now_wall)
+        }
         (Op::Search, Some(engine)) => {
             super::search::handle(engine, principal, &validated, now_wall)
         }
@@ -199,8 +227,12 @@ pub fn handle(
         // いずれも束縛・実行結線済み。`filter: []`（空配列）のみ各モジュール
         // 内部（`super::dml_target::DmlTargetError::EmptyFilter`）で `42601`
         // へ fail-closed に落とす。
-        (Op::Update, Some(engine)) => update::handle(engine, principal, &validated, now_wall),
-        (Op::Delete, Some(engine)) => delete::handle(engine, principal, &validated, now_wall),
+        (Op::Update, Some(engine)) => {
+            update::handle(engine, principal, &validated, header_operation_id, now_wall)
+        }
+        (Op::Delete, Some(engine)) => {
+            delete::handle(engine, principal, &validated, header_operation_id, now_wall)
+        }
         // `create_table`／`alter_table`／`drop_table`（Issue #910・NOSQL-13・
         // TASK-207）は SQL 表層の DDL と同一の実行器（`super::ddl` モジュール
         // doc 参照）へ委譲する。DDL 実行権限（`42501`）はテナント境界とは
@@ -759,5 +791,62 @@ mod tests {
         let response = run(body, &[]);
         let text = String::from_utf8_lossy(&response);
         assert!(!text.contains("tenant-a"));
+    }
+    const IDEM: &str = "Idempotency-Key: key-1\r\n";
+
+    #[test]
+    fn idempotency_key_on_non_write_ops_is_rejected_without_engine() {
+        for body in [
+            &br#"{"op":"scan","table":"docs","limit":1}"#[..],
+            &br#"{"op":"drop_table","table":"docs"}"#[..],
+            &br#"{"op":"show_partitioned_dml","table":"docs","operation_id":"x"}"#[..],
+        ] {
+            let response = run(body, &[IDEM]);
+            let text = String::from_utf8(response).expect("utf-8 response");
+            assert!(text.starts_with("HTTP/1.1 400 "), "got: {text}");
+            assert!(text.contains("42601"), "got: {text}");
+            assert!(
+                text.contains(IDEMPOTENCY_KEY_NOT_ALLOWED_MESSAGE),
+                "got: {text}"
+            );
+            assert!(!text.contains("key-1"), "got: {text}");
+        }
+    }
+
+    #[test]
+    fn idempotency_key_on_write_op_reaches_dispatch() {
+        let body = br#"{"op":"insert","table":"docs","rows":[]}"#;
+        let text = String::from_utf8(run(body, &[IDEM])).expect("utf-8 response");
+        assert!(text.contains(PLACEHOLDER_MESSAGE), "got: {text}");
+    }
+
+    #[test]
+    fn duplicate_idempotency_key_is_08p01_and_invalid_is_42601() {
+        let body = br#"{"op":"insert","table":"docs","rows":[]}"#;
+        let dup =
+            String::from_utf8(run(body, &[IDEM, "Idempotency-Key: key-2\r\n"])).expect("utf-8");
+        assert!(dup.contains("08P01"), "got: {dup}");
+        let empty = String::from_utf8(run(body, &["Idempotency-Key:\r\n"])).expect("utf-8");
+        assert!(empty.contains("42601"), "got: {empty}");
+    }
+
+    #[test]
+    fn unknown_op_with_idempotency_key_stays_0a000() {
+        let body = br#"{"op":"truncate","table":"docs"}"#;
+        let text = String::from_utf8(run(body, &[IDEM])).expect("utf-8 response");
+        assert!(text.contains("0A000"), "got: {text}");
+    }
+
+    #[test]
+    fn mismatch_between_header_and_body_is_42601_before_any_effect() {
+        let (core, _guard) = empty_core();
+        let body = br#"{"op":"insert","table":"docs","rows":[],"operation_id":"other"}"#;
+        let text = String::from_utf8(run_with_engine(&core, body, &[IDEM])).expect("utf-8");
+        assert!(text.starts_with("HTTP/1.1 400 "), "got: {text}");
+        assert!(text.contains("42601"), "got: {text}");
+        assert!(
+            !text.contains("other") && !text.contains("key-1"),
+            "got: {text}"
+        );
     }
 }

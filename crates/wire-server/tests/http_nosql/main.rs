@@ -13,6 +13,7 @@ mod legacy_table;
 mod err4_http_projection;
 mod http11_limits;
 mod http12_fail_closed;
+mod http14_idempotency_key;
 mod http2_framing;
 mod http3_content_type;
 mod http5_query_bearer;
