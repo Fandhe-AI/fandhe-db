@@ -80,6 +80,7 @@ use std::time::SystemTime;
 use engine::core::EngineCore;
 use engine::error_format::{ClassifiedError, ErrorClass};
 use engine::json::parse_json;
+use engine::sql::keyset::KeysetSealKey;
 
 use crate::http::idempotency_key::extract_idempotency_key;
 use crate::http::query::op::{classify_op, Op};
@@ -146,6 +147,7 @@ pub fn handle(
     headers: &crate::http::headers::Headers<'_>,
     raw_body: &[u8],
     engine: Option<&EngineCore>,
+    cursor_key: Option<&KeysetSealKey>,
     now_wall: SystemTime,
 ) -> Vec<u8> {
     // 手順 1: テナント指定ヘッダの拒否（本文検証より先）。
@@ -239,12 +241,14 @@ pub fn handle(
             super::explain::handle(engine, principal, &validated, now_wall)
         }
         (Op::Scan, Some(engine)) if explain_requested(&validated) => {
-            scan::handle_explain(engine, principal, &validated, now_wall)
+            scan::handle_explain(engine, principal, &validated, cursor_key, now_wall)
         }
         (Op::Aggregate, Some(engine)) if explain_requested(&validated) => {
             super::aggregate::handle_explain(engine, principal, &validated, now_wall)
         }
-        (Op::Scan, Some(engine)) => scan::handle(engine, principal, &validated, now_wall),
+        (Op::Scan, Some(engine)) => {
+            scan::handle(engine, principal, &validated, cursor_key, now_wall)
+        }
         (Op::Aggregate, Some(engine)) => {
             super::aggregate::handle(engine, principal, &validated, now_wall)
         }
@@ -429,7 +433,7 @@ mod tests {
     fn run(body: &[u8], extra_headers: &[&str]) -> Vec<u8> {
         let p = principal();
         let headers = headers_with_body(body, extra_headers);
-        handle(&p, &headers, body, None, std::time::SystemTime::now())
+        handle(&p, &headers, body, None, None, std::time::SystemTime::now())
     }
 
     /// `engine` 接続済み（`Router::with_engine` 相当）の経路。`scan` op の
@@ -437,7 +441,14 @@ mod tests {
     fn run_with_engine(core: &EngineCore, body: &[u8], extra_headers: &[&str]) -> Vec<u8> {
         let p = principal();
         let headers = headers_with_body(body, extra_headers);
-        handle(&p, &headers, body, Some(core), std::time::SystemTime::now())
+        handle(
+            &p,
+            &headers,
+            body,
+            Some(core),
+            None,
+            std::time::SystemTime::now(),
+        )
     }
 
     #[test]

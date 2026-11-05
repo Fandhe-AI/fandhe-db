@@ -9,6 +9,8 @@
 
 ### Changed
 
+- wire-server の公開関数 `http::query::gate::handle` に引数 `cursor_key: Option<&KeysetSealKey>`（`engine` の次、`now_wall` の前）を追加し、公開構造体 `http::session::store::SessionGrant` にフィールド `user: Option<String>` を追加した（Issue #2094・NOSQL-23 ポインタ）。`scan` のカーソルを認証ユーザーへ束縛するため。
+  BREAKING CHANGE: `gate::handle` の引数と `SessionGrant` のフィールドが増えた（呼び出し・構築している下流は追随が必要）。
 - NoSQL の `upsert` op を実行するようにした（Issue #2087・NOSQL-21・SQL-20・SQL-49 ポインタ）。SQL 表層の `INSERT ... ON CONFLICT` と同じ束縛関数・実行器を通り、応答は `{"upserted":n}`。従来の固定文言 `0A000` は返さない。`Idempotency-Key` ヘッダを `upsert` でも受け付ける。
   BREAKING CHANGE: wire-server の公開定数 `http::query::gate::UPSERT_NOT_YET_AVAILABLE_MESSAGE` を削除した。
 - `halfvec_*_ops` を VECTOR 列の `USING hnsw` に指定したときのエラーを `42704` から `42804` へ変えた（Issue #2016・TABLE-46 (3)・INDEX-7 ポインタ。PostgreSQL と同じ）。`vector_*_ops` を HALFVEC 列に指定した場合も `42804`。未知の演算子クラスは従来どおり `42704`。
@@ -25,6 +27,7 @@
 
 ### Added
 
+- NoSQL の `scan` に不透明カーソル `after`／`next_cursor` を追加した（Issue #2094・NOSQL-23・TASK-253 ポインタ）。`after`（文字列または `null`）を付けた要求だけがキーセットモードで、応答の `row_count` の後ろに `next_cursor`（最後のページは `null`）が付く。`offset` との併用は `42601`、改ざん・別ユーザー・別テナント・別 `sort`・別表・別サーバー鍵のカーソルは `22000`。`after` の無い要求は不変。封緘鍵はプロセス内だけで保持し、再起動で既発行カーソルは無効になる。
 - `EngineCore::execute_bound_upsert_in_session` を追加した（Issue #2087・NOSQL-21 ポインタ）。束縛済み UPSERT のセッション対応入口で、権限・INDEX-4 上限・台帳を SQL 表層と同じ実行器で扱う。
 - `EXPLAIN (FORMAT JSON) <文>` を追加した（Issue #2059・SQL-76 (1)(6) ポインタ）。PostgreSQL 互換の JSON を 1 行 1 列（`QUERY PLAN`・型 `json`・OID 114）で返し、JSON と TEXT は同じ情報を持つ。`FORMAT TEXT`／オプションなしは従来と同一。`FORMAT XML|YAML` と未実装の既知オプションは `0A000`、`FORMAT` の不正値は `22023`、未知の名前・構文の誤りは `42601`。
   BREAKING CHANGE: 公開 enum `ParsedSql` に variant `ExplainJson(Box<ParsedSql>)` を追加した（網羅的 `match` の下流は追随が必要）。

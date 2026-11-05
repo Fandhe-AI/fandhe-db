@@ -298,6 +298,7 @@ JSON 本文の構文受理規則は `engine::json`（NOSQL-8）に従う: ネス
 | `columns` | △ | string[]（非空） | 省略時は `id`＋全実列 |
 | `explain` | △ | bool | [`explain`](#explain)参照。`true` は `QUERY PLAN` を返す。`false`／省略時は通常実行 |
 | `sort` | △ | object[]（`{"column","dir"}`。非空、上限 8 要素） | `dir` は `"asc"`／`"desc"`（小文字完全一致）。省略時は順序保証なし |
+| `after` | △ | string または `null` | キーセットページング（[後述](#キーセットページングafternext_cursor)）。キーを付けるとキーセットモード。`null` は 1 ページ目、文字列は前ページの `next_cursor`。文字列・`null` 以外は `42601`。`offset` との併用は `42601` |
 
 `vector`／`plan`／`mode`／`hybrid` はスキーマが宣言しないフィールドのため、
 未知キーとして `42601` になる（`scan` への付与自体を個別に判定するロジックは
@@ -338,6 +339,46 @@ JSON 本文の構文受理規則は `engine::json`（NOSQL-8）に従う: ネス
 `explain: true`（[`explain`](#explain) 参照。Issue #948・NOSQL-16）は `sort`・
 `offset` を指定した場合も同じ束縛（`PreparedScan::bind`）を経由するため
 併用できる。
+
+#### キーセットページング（`after`／`next_cursor`）
+
+Issue #2094・NOSQL-23・TASK-253。`offset` のページングはページ取得の合間の書き込みで
+重複・欠落が起こり、深いページほど走査が増える。`after` を付けた要求は、前ページの最終行から
+作った不透明なカーソルより後ろだけを返す。
+
+- **opt-in**: `after` キーを付けた要求だけがキーセットモード。キーが無い要求は従来どおり
+  （応答に `next_cursor` を付けず、`sort` 付きの並びも変えない）
+- 1 ページ目は `"after": null`、続きは直前の応答の `next_cursor` を `after` へそのまま渡す
+- 応答はキーセット要求のときだけ、`row_count` の後ろに `next_cursor` を持つ。続きがあれば
+  不透明な文字列、最後のページでは `null`。**`null` を受け取ったら終了**する（`null` を
+  `after` に戻すと 1 ページ目に戻る）
+- 順序は `sort`（省略可）に続けて主キー（無い表は物理行 ID）の昇順で全順序になる。
+  `after` だけで `sort` が無い要求は主キー昇順
+- カーソルはサーバーの秘密鍵で封緘（暗号化＋改ざん検知）され、テナント・認証主体（ログイン
+  ユーザー）・表・`sort` に束縛される。`filter`／`columns`／`limit` はページ間で変えてよい
+- 封緘鍵はプロセス内だけで保持し永続化しない。サーバーを再起動すると既発行のカーソルは
+  `22000` になる（鍵の永続化・ローテーション・複数インスタンス共有は対象外）
+- `explain: true` と併用でき、カーソルは通常実行と同じ手順で検証される（応答に `next_cursor`
+  は付かず、プランへキーセット専用の表示は足さない）
+
+要求例（1 ページ目と続き）:
+
+```json
+{"op": "scan", "table": "docs", "limit": 100, "sort": [{"column": "lang", "dir": "asc"}],
+ "after": null}
+```
+
+```json
+{"op": "scan", "table": "docs", "limit": 100, "sort": [{"column": "lang", "dir": "asc"}],
+ "after": "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4/QEFC"}
+```
+
+`after` の主な `wire_code`:
+
+- `after` が文字列・`null` 以外、`offset` との併用（`offset: 0` を含む） → `42601`
+- カーソルの復号・検証失敗（改ざん・切り詰め・不正な base64・別ユーザー・別テナント・別 `sort`・
+  別表・別サーバー鍵・版違い）→ `22000`。失敗理由は区別されず、固定文言 `invalid keyset position`
+- 封緘鍵の生成失敗など内部の前提欠落 → `XX000`
 
 `sort` の主な `wire_code`:
 
@@ -1091,6 +1132,8 @@ nosql16_explain_targets.rs`（`vector` 指定 `search`・`scan`・`aggregate` �
 ```
 
 - キー順固定（`columns` → `rows` → `row_count`）・空白なし
+- `scan` のキーセット要求（`after` 指定）だけ、`row_count` の後ろに `next_cursor`
+  （文字列または `null`）が付く（[キーセットページング](#キーセットページングafternext_cursor)）
 - `row_count` は常に `rows` の長さ
 - `columns[].type` は列型ごとの名前を返す（Issue #896・NOSQL-17。SQL 表層
   `RowDescription`（Issue #895）の OID 写像とは**独立**の対応表——SQL wire
@@ -1542,7 +1585,8 @@ curl -s -X POST http://127.0.0.1:5432/v1/session/close \
   `nosql2_search_binding.rs`・`wire_sql33_cosine_order.rs`（pg wire 側）で固定
 - `scan`: `nosql3_scan_mapping.rs`・`nosql3_scan_wire_parity.rs`・
   `nosql15_scan_sort.rs`（`sort`。Issue #946・NOSQL-15）・
-  `nosql15_offset.rs`（`offset`。Issue #947・NOSQL-15）
+  `nosql15_offset.rs`（`offset`。Issue #947・NOSQL-15）・
+  `nosql23_scan_keyset.rs`（`after`／`next_cursor`。Issue #2094・NOSQL-23）
 - `aggregate`: `nosql4_aggregate.rs`・`nosql5_group_by.rs`・
   `nosql4_5_aggregate_wire_parity.rs`・`nosql16_multi_group_by.rs`・
   `nosql15_aggregate_sort_offset.rs`（`sort`／`offset`・単一文字列形 `group_by`。

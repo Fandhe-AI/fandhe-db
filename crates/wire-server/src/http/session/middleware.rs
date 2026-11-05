@@ -66,12 +66,20 @@ pub struct SessionPrincipal {
     /// 発行時に宣言されたスコープ（HTTP-15・Issue #2100。省略は `None`＝全権限）。運ぶだけで、
     /// 要求ごとの強制は後続 Issue #2101（本 Issue では `session_state()` に影響させない）。
     scope: Option<std::sync::Arc<crate::http::session::scope::SessionScope>>,
+    /// 認証済みユーザー名（Issue #2094。scan の不透明カーソルの AAD 用。`Debug` へ出さない）。
+    user: Option<String>,
 }
 
 impl SessionPrincipal {
     /// 発行時に宣言されたスコープ（省略は `None`）。読み取り専用で、書き換え経路は無い。
     pub fn scope(&self) -> Option<&crate::http::session::scope::SessionScope> {
         self.scope.as_deref()
+    }
+
+    /// 認証済みユーザー名（発行経路が与えないセッションは `None`）。scan のカーソルを認証主体へ束縛する
+    /// AAD の入力としてのみ使う（Issue #2094）。
+    pub(crate) fn auth_user(&self) -> Option<&str> {
+        self.user.as_deref()
     }
 
     /// この要求に束縛されたテナント文脈。
@@ -162,6 +170,7 @@ pub fn authenticate(
             ddl_allowed: grant.ddl_allowed,
             role: grant.role,
             scope: grant.scope,
+            user: grant.user,
         }),
         None => Err(MiddlewareError::Unknown),
     }

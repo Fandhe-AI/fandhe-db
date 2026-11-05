@@ -90,6 +90,7 @@
 
 pub mod aggregate;
 pub mod base64_std;
+pub mod cursor;
 pub mod ddl;
 pub mod delete;
 pub mod dml_target;
