@@ -1735,3 +1735,325 @@ fn disabled_deadline_does_not_affect_the_job() {
     .expect("completes");
     assert_eq!(outcome, PartitionedDmlOutcome::Completed { total_rows: 9 });
 }
+// --- 1 回の実行の時間上限（Issue #2072。SQL-77 (3) のポインタ。疑似時計で決定的に検証する） ---
+
+fn run_time_limits(
+    chunk: usize,
+    budget: usize,
+    run_ms: u64,
+    interval_ms: u64,
+) -> PartitionedDmlLimits {
+    PartitionedDmlLimits {
+        max_run_time: Duration::from_millis(run_ms),
+        chunk_interval: Duration::from_millis(interval_ms),
+        ..limits(chunk, budget, 5000)
+    }
+}
+
+/// 疑似時計（`base + offset`）。述語の評価回数に応じて `offset` を進める用途で使う。
+struct OffsetClock {
+    base: Instant,
+    offset: Cell<Duration>,
+}
+
+impl OffsetClock {
+    fn new() -> Self {
+        Self {
+            base: Instant::now(),
+            offset: Cell::new(Duration::ZERO),
+        }
+    }
+    fn now(&self) -> Instant {
+        self.base + self.offset.get()
+    }
+    fn advance(&self, d: Duration) {
+        self.offset.set(self.offset.get() + d);
+    }
+}
+
+#[test]
+fn disabled_run_time_limit_never_stops_even_if_the_clock_jumps() {
+    let (storage, _g) = setup("pdml-run-off");
+    let rows: Vec<(u64, &str)> = (1..=9).map(|i| (i, "x")).collect();
+    seed(&storage, "t-a", &rows);
+    let clock = OffsetClock::new();
+    let now = || clock.now();
+    let mut hooks = Hooks {
+        clock: &now,
+        sleep: &no_sleep,
+        after_chunk: None,
+        privilege: None,
+    };
+    let pred = |c: &DmlCandidate<'_>| -> Result<bool, Infallible> {
+        clock.advance(Duration::from_secs(3600));
+        match_x(c)
+    };
+    let outcome = run_delete(
+        &storage,
+        "t-a",
+        &op("op-rt-off"),
+        &hash(b"h-rt0"),
+        &run_time_limits(3, 1000, 0, 0),
+        None,
+        pred,
+        &mut hooks,
+    )
+    .expect("completes");
+    assert_eq!(outcome, PartitionedDmlOutcome::Completed { total_rows: 9 });
+}
+
+#[test]
+fn run_time_limit_stops_after_a_changed_chunk_and_resend_counts_from_zero() {
+    let (storage, _g) = setup("pdml-run-changed");
+    let rows: Vec<(u64, &str)> = (1..=9).map(|i| (i, "x")).collect();
+    seed(&storage, "t-a", &rows);
+    let o = op("op-rt-changed");
+    let h = hash(b"h-rt1");
+    let clock = OffsetClock::new();
+    let now = || clock.now();
+    let evaluated = Cell::new(0u32);
+    let pred = |c: &DmlCandidate<'_>| -> Result<bool, Infallible> {
+        evaluated.set(evaluated.get() + 1);
+        if evaluated.get() == 3 {
+            // 第 1 チャンクの走査を終える時点で、上限（1 秒）を超えるまで時計を進める。
+            clock.advance(Duration::from_secs(2));
+        }
+        match_x(c)
+    };
+    let lim = run_time_limits(3, 1000, 1000, 0);
+    let mut hooks = Hooks {
+        clock: &now,
+        sleep: &no_sleep,
+        after_chunk: None,
+        privilege: None,
+    };
+    let err = run_delete(&storage, "t-a", &o, &h, &lim, None, pred, &mut hooks)
+        .expect_err("run time limit");
+    assert!(matches!(
+        err.cause,
+        PartitionedStopCause::RunTimeLimitReached
+    ));
+    assert_eq!(err.committed_total, 3);
+    assert_eq!(rows_of(&storage, "t-a").len(), 6);
+    assert!(matches!(
+        job_record(&storage, "t-a", &o),
+        Some(JobRecord::Running { processed: 3, .. })
+    ));
+    assert!(!ledger_has(&storage, "t-a", &o));
+    // 再送は経過時間を 0 から数え直す（時計は進んだままでも最初のチャンクで止まらず完了する）。
+    let mut hooks = Hooks {
+        clock: &now,
+        sleep: &no_sleep,
+        after_chunk: None,
+        privilege: None,
+    };
+    let outcome = run_delete(&storage, "t-a", &o, &h, &lim, None, pred, &mut hooks)
+        .expect("resume completes");
+    assert_eq!(outcome, PartitionedDmlOutcome::Completed { total_rows: 9 });
+    assert!(rows_of(&storage, "t-a").is_empty());
+}
+
+#[test]
+fn run_time_limit_persists_a_resume_record_even_when_no_row_changed() {
+    let (storage, _g) = setup("pdml-run-zero");
+    seed(&storage, "t-a", &[(1, "y"), (2, "x"), (3, "x")]);
+    let o = op("op-rt-zero");
+    let h = hash(b"h-rt2");
+    let clock = OffsetClock::new();
+    let now = || clock.now();
+    let evaluated = Cell::new(0u32);
+    let pred = |c: &DmlCandidate<'_>| -> Result<bool, Infallible> {
+        evaluated.set(evaluated.get() + 1);
+        if evaluated.get() == 1 {
+            clock.advance(Duration::from_secs(2));
+        }
+        match_x(c)
+    };
+    // 走査予算 1: 第 1 チャンクは不一致の行 1 を走査するだけで 0 件。
+    let lim = run_time_limits(3, 1, 1000, 0);
+    let mut hooks = Hooks {
+        clock: &now,
+        sleep: &no_sleep,
+        after_chunk: None,
+        privilege: None,
+    };
+    let err = run_delete(&storage, "t-a", &o, &h, &lim, None, pred, &mut hooks)
+        .expect_err("run time limit");
+    assert!(matches!(
+        err.cause,
+        PartitionedStopCause::RunTimeLimitReached
+    ));
+    assert_eq!(err.committed_total, 0);
+    assert!(matches!(
+        job_record(&storage, "t-a", &o),
+        Some(JobRecord::Running { processed: 0, .. })
+    ));
+    assert_eq!(rows_of(&storage, "t-a").len(), 3);
+    let mut hooks = Hooks {
+        clock: &now,
+        sleep: &no_sleep,
+        after_chunk: None,
+        privilege: None,
+    };
+    let outcome = run_delete(&storage, "t-a", &o, &h, &lim, None, pred, &mut hooks)
+        .expect("resume completes");
+    assert_eq!(outcome, PartitionedDmlOutcome::Completed { total_rows: 2 });
+    assert_eq!(rows_of(&storage, "t-a").len(), 1);
+}
+
+#[test]
+fn exhausted_chunk_completes_instead_of_stopping_by_run_time() {
+    let (storage, _g) = setup("pdml-run-exhausted");
+    let rows: Vec<(u64, &str)> = (1..=7).map(|i| (i, "x")).collect();
+    seed(&storage, "t-a", &rows);
+    let clock = OffsetClock::new();
+    let now = || clock.now();
+    let evaluated = Cell::new(0u32);
+    let pred = |c: &DmlCandidate<'_>| -> Result<bool, Infallible> {
+        evaluated.set(evaluated.get() + 1);
+        if evaluated.get() == 7 {
+            // 走査し尽くす最終チャンクの中で上限を超える。
+            clock.advance(Duration::from_secs(2));
+        }
+        match_x(c)
+    };
+    let mut hooks = Hooks {
+        clock: &now,
+        sleep: &no_sleep,
+        after_chunk: None,
+        privilege: None,
+    };
+    let outcome = run_delete(
+        &storage,
+        "t-a",
+        &op("op-rt-exh"),
+        &hash(b"h-rt3"),
+        &run_time_limits(3, 1000, 1000, 0),
+        None,
+        pred,
+        &mut hooks,
+    )
+    .expect("completion wins");
+    assert_eq!(outcome, PartitionedDmlOutcome::Completed { total_rows: 7 });
+}
+
+#[test]
+fn run_time_limit_counts_the_interval_lookahead_and_does_not_wait_when_stopping() {
+    let (storage, _g) = setup("pdml-run-lookahead");
+    let rows: Vec<(u64, &str)> = (1..=9).map(|i| (i, "x")).collect();
+    seed(&storage, "t-a", &rows);
+    let clock = OffsetClock::new();
+    let now = || clock.now();
+    let slept: std::cell::RefCell<Vec<u64>> = Default::default();
+    let sleep = |d: Duration| {
+        slept.borrow_mut().push(d.as_millis() as u64);
+        clock.advance(d);
+    };
+    let mut hooks = Hooks {
+        clock: &now,
+        sleep: &sleep,
+        after_chunk: None,
+        privilege: None,
+    };
+    // 間隔 100 ms・上限 150 ms: 第 1 チャンク後は 0+100 < 150 で待つ。第 2 チャンク後は
+    // 100+100 >= 150 なので待たずに止める。
+    let err = run_delete(
+        &storage,
+        "t-a",
+        &op("op-rt-look"),
+        &hash(b"h-rt4"),
+        &run_time_limits(3, 1000, 150, 100),
+        None,
+        match_x as Pred,
+        &mut hooks,
+    )
+    .expect_err("run time limit");
+    assert!(matches!(
+        err.cause,
+        PartitionedStopCause::RunTimeLimitReached
+    ));
+    assert_eq!(err.committed_total, 6);
+    assert_eq!(
+        *slept.borrow(),
+        vec![10; 10],
+        "only the first boundary waits"
+    );
+}
+
+#[test]
+fn deadline_and_cancel_win_over_run_time_limit_at_the_same_boundary() {
+    // 文の期限が先に来る: チャンクは破棄され、記録は残らない。
+    let (storage, _g) = setup("pdml-run-deadline");
+    let rows: Vec<(u64, &str)> = (1..=9).map(|i| (i, "x")).collect();
+    seed(&storage, "t-a", &rows);
+    let o = op("op-rt-dl");
+    let clock = OffsetClock::new();
+    let now = || clock.now();
+    let evaluated = Cell::new(0u32);
+    let pred = |c: &DmlCandidate<'_>| -> Result<bool, Infallible> {
+        evaluated.set(evaluated.get() + 1);
+        if evaluated.get() == 3 {
+            clock.advance(Duration::from_secs(2));
+        }
+        match_x(c)
+    };
+    {
+        let _scope = crate::interrupt::DeadlineScope::install(
+            crate::interrupt::StatementDeadline::at(clock.base + Duration::from_millis(500)),
+        );
+        let mut hooks = Hooks {
+            clock: &now,
+            sleep: &no_sleep,
+            after_chunk: None,
+            privilege: None,
+        };
+        let err = run_delete(
+            &storage,
+            "t-a",
+            &o,
+            &hash(b"h-rt5"),
+            &run_time_limits(3, 1000, 1000, 0),
+            None,
+            pred,
+            &mut hooks,
+        )
+        .expect_err("deadline");
+        assert!(matches!(err.cause, PartitionedStopCause::DeadlineExceeded));
+        assert_eq!(err.committed_total, 0);
+    }
+    assert!(job_record(&storage, "t-a", &o).is_none());
+    assert_eq!(rows_of(&storage, "t-a").len(), 9);
+
+    // 取り消し要求が先に届いている: 取り消しとして止まる。
+    let o2 = op("op-rt-cancel");
+    let c = ctx("t-a");
+    let registry = std::sync::Arc::clone(storage.partitioned_job_registry());
+    let evaluated = Cell::new(0u32);
+    let pred = |c2: &DmlCandidate<'_>| -> Result<bool, Infallible> {
+        evaluated.set(evaluated.get() + 1);
+        if evaluated.get() == 3 {
+            clock.advance(Duration::from_secs(2));
+            assert!(registry.request_cancel(&JobKey::for_context(&c, TABLE, &o2)));
+        }
+        match_x(c2)
+    };
+    let mut hooks = Hooks {
+        clock: &now,
+        sleep: &no_sleep,
+        after_chunk: None,
+        privilege: None,
+    };
+    let err = run_delete(
+        &storage,
+        "t-a",
+        &o2,
+        &hash(b"h-rt6"),
+        &run_time_limits(3, 1000, 1000, 0),
+        None,
+        pred,
+        &mut hooks,
+    )
+    .expect_err("cancel");
+    assert!(matches!(err.cause, PartitionedStopCause::CancelRequested));
+    assert_eq!(err.committed_total, 0);
+}

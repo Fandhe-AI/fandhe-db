@@ -571,6 +571,55 @@ pub(crate) fn record_chunk_progress_in_txn(
     interrupted_limit: u64,
     fixed_time: Option<i64>,
 ) -> Result<ChunkCommitOutcome, PartitionedJobError> {
+    record_chunk_progress_impl(
+        txn,
+        key,
+        hash,
+        rows_changed,
+        last_scanned,
+        interrupted_limit,
+        fixed_time,
+        false,
+    )
+}
+
+/// [`record_chunk_progress_in_txn`] の停止点用版（SQL-77 (3)、Issue #2072）。実行時間の上限で
+/// 止める境界では、記録なしで `rows_changed == 0` でも再開用の `Running`（件数 0・カーソル）を
+/// 作る（「記録は最初の変更チャンクで作る」規則の唯一の例外）。台帳衝突の検査と中断記録数の
+/// 再判定は通常の作成経路と同じに行い、[`ChunkCommitOutcome::NoRecord`] は返さない。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_stop_point_in_txn(
+    txn: &redb::WriteTransaction,
+    key: &JobKey<'_>,
+    hash: &ContentHash,
+    rows_changed: u64,
+    last_scanned: RowId,
+    interrupted_limit: u64,
+    fixed_time: Option<i64>,
+) -> Result<ChunkCommitOutcome, PartitionedJobError> {
+    record_chunk_progress_impl(
+        txn,
+        key,
+        hash,
+        rows_changed,
+        last_scanned,
+        interrupted_limit,
+        fixed_time,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_chunk_progress_impl(
+    txn: &redb::WriteTransaction,
+    key: &JobKey<'_>,
+    hash: &ContentHash,
+    rows_changed: u64,
+    last_scanned: RowId,
+    interrupted_limit: u64,
+    fixed_time: Option<i64>,
+    persist_without_changes: bool,
+) -> Result<ChunkCommitOutcome, PartitionedJobError> {
     if last_scanned == RowId::MAX {
         // この範囲は走査し尽くしており、`Running` には縮約できない。
         return Err(PartitionedJobError::StateConflict);
@@ -578,7 +627,7 @@ pub(crate) fn record_chunk_progress_in_txn(
     let prior = lookup_in_write_txn(txn, key)?;
     match prior {
         None => {
-            if rows_changed == 0 {
+            if rows_changed == 0 && !persist_without_changes {
                 return Ok(ChunkCommitOutcome::NoRecord);
             }
             // 通常 DML が同じ operation_id を既に確定済みなら、行変更を commit する前に
@@ -1554,6 +1603,92 @@ mod tests {
         ));
         drop(wt);
         assert!(matches!(read_job(&db, &k), Some(JobRecord::Running { .. })));
+    }
+
+    // --- 停止点の強制記録（SQL-77 (3)、Issue #2072） ----------------------------
+
+    #[test]
+    fn stop_point_creates_running_record_even_with_zero_changes() {
+        let (db, _g) = open_db("pj-stop-point");
+        let id = op("op-1");
+        let k = key("t1", "docs", &id);
+        // 通常の記録は 0 件・記録なしなら何も書かない。
+        let wt = db.begin_write().expect("w");
+        assert_eq!(
+            record_chunk_progress_in_txn(&wt, &k, &hash("h"), 0, rid(5), 10, None).expect("p"),
+            ChunkCommitOutcome::NoRecord
+        );
+        drop(wt);
+        assert!(read_job(&db, &k).is_none());
+        // 停止点用は 0 件でも Running を作り、active 索引も張る。
+        let wt = db.begin_write().expect("w");
+        assert_eq!(
+            record_stop_point_in_txn(&wt, &k, &hash("h"), 0, rid(5), 10, None).expect("p"),
+            ChunkCommitOutcome::Created
+        );
+        wt.commit().expect("c");
+        assert!(matches!(
+            read_job(&db, &k),
+            Some(JobRecord::Running {
+                cursor,
+                processed: 0,
+                ..
+            }) if cursor == rid(5)
+        ));
+        assert_eq!(active_count(&db), 1);
+        // 記録があれば通常どおり更新する。
+        let wt = db.begin_write().expect("w");
+        assert_eq!(
+            record_stop_point_in_txn(&wt, &k, &hash("h"), 0, rid(9), 10, None).expect("p"),
+            ChunkCommitOutcome::Updated
+        );
+        wt.commit().expect("c");
+    }
+
+    #[test]
+    fn stop_point_rejects_ledger_conflict_and_interrupted_limit() {
+        let (db, _g) = open_db("pj-stop-point-guard");
+        let id = op("op-1");
+        let k = key("t1", "docs", &id);
+        let wt = db.begin_write().expect("w");
+        ledger::record_partitioned_completion_in_txn(&wt, "t1", "docs", &id, &hash("x"), None)
+            .expect("seed");
+        wt.commit().expect("c");
+        let wt = db.begin_write().expect("w");
+        assert!(matches!(
+            record_stop_point_in_txn(&wt, &k, &hash("h"), 0, rid(5), 10, None),
+            Err(PartitionedJobError::LedgerConflict(_))
+        ));
+        drop(wt);
+        assert!(read_job(&db, &k).is_none());
+
+        let id2 = op("op-2");
+        let wt = db.begin_write().expect("w");
+        record_stop_point_in_txn(
+            &wt,
+            &key("t1", "docs", &id2),
+            &hash("h"),
+            0,
+            rid(5),
+            1,
+            None,
+        )
+        .expect("first");
+        wt.commit().expect("c");
+        let id3 = op("op-3");
+        let wt = db.begin_write().expect("w");
+        assert!(matches!(
+            record_stop_point_in_txn(
+                &wt,
+                &key("t1", "docs", &id3),
+                &hash("h"),
+                0,
+                rid(5),
+                1,
+                None
+            ),
+            Err(PartitionedJobError::InterruptedRecordLimitReached)
+        ));
     }
 
     // --- 取り消し・数え方・上限 ---------------------------------------------

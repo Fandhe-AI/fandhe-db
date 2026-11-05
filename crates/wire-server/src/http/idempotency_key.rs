@@ -2,8 +2,8 @@
 //! ポインタ: `docs/spec/04-behavior/http-transport.md` HTTP-14 (2)）。
 //!
 //! 呼び出し文脈: `POST /v1/query` の書き込み op から、本文の `operation_id` と
-//! 並ぶ `operation_id` の供給元として呼ばれる予定（結線と本文との不一致拒否は
-//! Issue #2064、SQL／HTTP 間の相互再送は Issue #2065）。本モジュールは取り出しと
+//! 並ぶ `operation_id` の供給元として `gate::handle`（手順 5）から呼ばれる
+//! （結線と本文との不一致拒否は Issue #2064。SQL／HTTP 間の相互再送は Issue #2065）。本モジュールは取り出しと
 //! 検証だけを担い、第 2 の検証器を作らず `engine` の `OperationId::parse`
 //! （SQL の `USING OPERATION_ID`・本文の `operation_id` と同一）へ委譲する。
 //!

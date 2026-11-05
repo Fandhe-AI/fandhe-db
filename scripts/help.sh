@@ -186,6 +186,9 @@ cat <<'EOF'
   bench-relational-p95
       述語 OR/IN・ORDER BY・結合の p95 計測ベンチ（Issue #1204）
       $ cargo bench --bench relational_p95_bench -p fandhe-db-engine
+  bench-rls-timing
+      衝突有無で応答時間分布を比較するベンチ（Issue #2079）
+      $ cargo bench --bench rls_timing_bench -p fandhe-db-engine
   bench-hybrid-profile
       hybrid_rrf クエリの段別内訳プロファイル（Issue #356 ほか）
       $ cargo bench --bench hybrid_profile_bench -p fandhe-db-engine --features bench-internals

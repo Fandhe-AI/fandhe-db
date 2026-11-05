@@ -102,6 +102,12 @@ impl Op {
         }
     }
 
+    /// `Idempotency-Key` ヘッダを受け付ける op か（書き込み op の 3 値のみ true。
+    /// Issue #2064・HTTP-14。許可リスト方式で、他はすべて `42601` で拒否する）。
+    pub const fn accepts_idempotency_key(self) -> bool {
+        matches!(self, Op::Insert | Op::Update | Op::Delete)
+    }
+
     /// JSON 上の正準名（`op` フィールドの受理値そのもの）。
     pub fn name(self) -> &'static str {
         match self {
@@ -173,6 +179,14 @@ pub fn classify_op(raw: &str) -> Result<Op, UnsupportedOp> {
 mod tests {
     use super::*;
     use crate::http::query::schema::OP_SCHEMAS;
+
+    #[test]
+    fn accepts_idempotency_key_only_for_write_ops() {
+        for op in Op::ALL {
+            let expected = matches!(op, Op::Insert | Op::Update | Op::Delete);
+            assert_eq!(op.accepts_idempotency_key(), expected, "{}", op.name());
+        }
+    }
 
     #[test]
     fn parse_accepts_exact_eleven_values() {

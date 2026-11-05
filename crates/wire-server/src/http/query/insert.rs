@@ -66,6 +66,7 @@ use crate::http::response as http_response;
 use crate::http::session::middleware::SessionPrincipal;
 
 use super::ident::{self, InvalidIdentifier};
+use super::operation_id_source::{resolve_operation_id, OperationIdSourceError};
 use super::schema::{SchemaError, Validated};
 use super::typed_json::{self, TypedJsonError};
 
@@ -353,6 +354,7 @@ pub fn execute(
     core: &EngineCore,
     principal: &SessionPrincipal,
     validated: &Validated<'_>,
+    header_operation_id: Option<&OperationId>,
 ) -> Result<InsertSuccess, InsertError> {
     let table = validated
         .required_str("table")
@@ -361,17 +363,13 @@ pub fn execute(
     let rows = validated
         .required_array("rows")
         .map_err(InsertError::Shape)?;
-    // 欠落・`null`・空文字は「省略」として `None` に統一する（完全一致のみ。trim 等の
-    // 正規化はしない）。必須か任意かの判定は engine の `LedgerMode`（単一の真実源）が
-    // 担うため、wire 層では拒否しない（Issue #2203）。
-    let operation_id = match validated
-        .optional_str("operation_id")
-        .map_err(InsertError::Shape)?
-        .filter(|raw| !raw.is_empty())
-    {
-        None => None,
-        Some(raw) => Some(OperationId::parse(raw).map_err(InsertError::Exec)?),
-    };
+    // 本文／ヘッダの供給元解決（Issue #2064・HTTP-14）。省略の可否は engine の
+    // `LedgerMode`（単一の真実源）が担うため、wire 層では拒否しない（Issue #2203）。
+    let operation_id =
+        resolve_operation_id(validated, header_operation_id).map_err(|e| match e {
+            OperationIdSourceError::Shape(err) => InsertError::Shape(err),
+            other => InsertError::Exec(other.into_sql_surface_error()),
+        })?;
 
     let outcome: InsertOutcome = core
         .execute_bound_insert_in_session(
@@ -432,9 +430,10 @@ pub fn handle(
     core: &EngineCore,
     principal: &SessionPrincipal,
     validated: &Validated<'_>,
+    header_operation_id: Option<&OperationId>,
     now_wall: std::time::SystemTime,
 ) -> Vec<u8> {
-    match execute(core, principal, validated) {
+    match execute(core, principal, validated, header_operation_id) {
         Ok(success) => http_response::encode_ok(&encode_success_body(&success), now_wall),
         Err(err) => http_response::encode_error(err.error_class(), &err.client_message(), now_wall),
     }
@@ -787,7 +786,7 @@ mod tests {
             .validate(&value)
             .expect("schema ok");
 
-        let success = execute(&core, &principal, &validated).expect("insert ok");
+        let success = execute(&core, &principal, &validated, None).expect("insert ok");
         assert_eq!(success.inserted, 1);
         let _ = std::fs::remove_file(&path);
     }
@@ -802,7 +801,7 @@ mod tests {
             .validate(&value)
             .expect("schema ok");
 
-        let success = execute(&core, &principal, &validated).expect("insert ok");
+        let success = execute(&core, &principal, &validated, None).expect("insert ok");
         assert_eq!(
             success.operation_id.as_ref().map(OperationId::as_str),
             Some("op-echo")
@@ -821,7 +820,7 @@ mod tests {
             .expect("schema ok");
 
         let now = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(0);
-        let response = handle(&core, &principal, &validated, now);
+        let response = handle(&core, &principal, &validated, None, now);
         let text = String::from_utf8(response).expect("utf-8 response");
         assert!(text.starts_with("HTTP/1.1 200 "), "got: {text}");
         assert!(
@@ -844,7 +843,7 @@ mod tests {
             .expect("schema ok");
 
         let now = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(0);
-        let response = handle(&core, &principal, &validated, now);
+        let response = handle(&core, &principal, &validated, None, now);
         let text = String::from_utf8(response).expect("utf-8 response");
         assert!(text.starts_with("HTTP/1.1 400 "), "got: {text}");
         assert!(text.contains("23502"), "got: {text}");
@@ -867,7 +866,7 @@ mod tests {
             .validate(&value)
             .expect("schema ok");
 
-        let err = execute(&core, &principal, &validated).expect_err("must reject");
+        let err = execute(&core, &principal, &validated, None).expect_err("must reject");
         assert_eq!(err.wire_code(), "42601");
         let _ = std::fs::remove_file(&path);
     }
@@ -901,7 +900,7 @@ mod tests {
             .validate(&value)
             .expect("schema ok");
 
-        let err = execute(&core, &principal, &validated).expect_err("must reject");
+        let err = execute(&core, &principal, &validated, None).expect_err("must reject");
         assert_eq!(err.wire_code(), "42601");
         let _ = std::fs::remove_file(&path);
     }
@@ -918,7 +917,7 @@ mod tests {
             .validate(&value)
             .expect("schema ok");
 
-        let err = execute(&core, &principal, &validated).expect_err("must reject");
+        let err = execute(&core, &principal, &validated, None).expect_err("must reject");
         assert_eq!(err.wire_code(), "23502");
         let _ = std::fs::remove_file(&path);
     }
@@ -934,7 +933,7 @@ mod tests {
             .validate(&value)
             .expect("schema ok");
 
-        let err = execute(&core, &principal, &validated).expect_err("must reject");
+        let err = execute(&core, &principal, &validated, None).expect_err("must reject");
         assert_eq!(err.wire_code(), "23502");
         let _ = std::fs::remove_file(&path);
     }
@@ -950,7 +949,7 @@ mod tests {
             .validate(&value)
             .expect("schema ok");
 
-        let err = execute(&core, &principal, &validated).expect_err("must reject");
+        let err = execute(&core, &principal, &validated, None).expect_err("must reject");
         assert_eq!(err.wire_code(), "23502");
         let _ = std::fs::remove_file(&path);
     }
@@ -968,7 +967,8 @@ mod tests {
                 .validate(&value)
                 .expect("schema ok");
 
-            let success = execute(&core, &principal, &validated).expect("default mode accepts");
+            let success =
+                execute(&core, &principal, &validated, None).expect("default mode accepts");
             assert_eq!(success.inserted, 1);
             assert_eq!(success.operation_id, None);
             assert_eq!(encode_success_body(&success), r#"{"inserted":1}"#);
@@ -985,9 +985,9 @@ mod tests {
         let validated = super::super::schema::INSERT_SCHEMA
             .validate(&value)
             .expect("schema ok");
-        execute(&core, &principal, &validated).expect("first insert ok");
+        execute(&core, &principal, &validated, None).expect("first insert ok");
 
-        let err = execute(&core, &principal, &validated).expect_err("resend must fail");
+        let err = execute(&core, &principal, &validated, None).expect_err("resend must fail");
         assert_eq!(err.wire_code(), "23505");
         let _ = std::fs::remove_file(&path);
     }
@@ -1001,15 +1001,15 @@ mod tests {
         let first_validated = super::super::schema::INSERT_SCHEMA
             .validate(&first_value)
             .expect("schema ok");
-        execute(&core, &principal, &first_validated).expect("first insert ok");
+        execute(&core, &principal, &first_validated, None).expect("first insert ok");
 
         let second = r#"{"op":"insert","table":"docs","rows":[{"id":2,"embedding":[0,1,0,0],"lang":"en"}],"operation_id":"op-1"}"#;
         let second_value = parse_json(second).expect("valid json");
         let second_validated = super::super::schema::INSERT_SCHEMA
             .validate(&second_value)
             .expect("schema ok");
-        let err =
-            execute(&core, &principal, &second_validated).expect_err("mismatched resend must fail");
+        let err = execute(&core, &principal, &second_validated, None)
+            .expect_err("mismatched resend must fail");
         assert_eq!(err.wire_code(), "22023");
         let _ = std::fs::remove_file(&path);
     }
@@ -1024,7 +1024,7 @@ mod tests {
             .validate(&value)
             .expect("schema ok");
 
-        let success = execute(&core, &principal, &validated).expect("insert ok");
+        let success = execute(&core, &principal, &validated, None).expect("insert ok");
         assert_eq!(success.inserted, 2);
         let _ = std::fs::remove_file(&path);
     }
@@ -1068,7 +1068,7 @@ mod tests {
             .validate(&value)
             .expect("schema ok");
 
-        let err = execute(&core, &http_principal, &validated)
+        let err = execute(&core, &http_principal, &validated, None)
             .expect_err("resend of identical content across surfaces must be detected");
         assert_eq!(
             err.wire_code(),
@@ -1089,7 +1089,7 @@ mod tests {
         let validated = super::super::schema::INSERT_SCHEMA
             .validate(&value)
             .expect("schema ok");
-        execute(&core, &http_principal, &validated).expect("NoSQL insert ok");
+        execute(&core, &http_principal, &validated, None).expect("NoSQL insert ok");
 
         let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
         let mut session = engine::sql::mode::SessionState::default();
