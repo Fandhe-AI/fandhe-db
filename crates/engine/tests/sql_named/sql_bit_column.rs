@@ -387,8 +387,6 @@ fn features_not_yet_enabled_are_rejected_fail_closed() {
         "SELECT id FROM t WHERE v = '1010' LIMIT 5",
         "SELECT id FROM t WHERE v < '1010' LIMIT 5",
         "SELECT id FROM t ORDER BY v LIMIT 5",
-        "SELECT id FROM t ORDER BY v <~> '1010' LIMIT 5",
-        "SELECT id FROM t ORDER BY v <%> '1010' LIMIT 5",
         "SELECT id FROM t WHERE v <~> '1010' LIMIT 5",
         "SELECT v FROM t GROUP BY v",
         "SELECT DISTINCT v FROM t LIMIT 5",
@@ -409,15 +407,23 @@ fn features_not_yet_enabled_are_rejected_fail_closed() {
     ] {
         assert!(exec(&core, sql).is_err(), "{sql} must be rejected");
     }
-    // `<~>`・`<%>` はどの文法位置でも受理せず構文段（42601）で拒否する。
+    // `<~>`・`<%>` は ORDER BY・投影・WHERE の比較の被演算子として受理する（Issue #2970。距離値の検証は
+    // sql_bit_distance）。距離式そのものは真偽値でないため述語にはできず、CHECK 本体は従来どおり構文段で拒否する。
     for sql in [
         "SELECT id FROM t ORDER BY v <~> '1010' LIMIT 5",
         "SELECT id FROM t ORDER BY v <%> '1010' LIMIT 5",
-        "SELECT id FROM t WHERE v <~> '1010' LIMIT 5",
         "SELECT v <%> v FROM t LIMIT 5",
     ] {
-        assert_eq!(code(&core, sql), "42601", "{sql}");
+        assert!(exec(&core, sql).is_ok(), "{sql}");
     }
+    assert!(exec(&core, "SELECT id FROM t WHERE v <~> '1010' LIMIT 5").is_err());
+    assert_eq!(
+        code(
+            &core,
+            "ALTER TABLE t ADD CONSTRAINT c CHECK (v <~> '1010' < 2)"
+        ),
+        "42601"
+    );
     // 拒否された文は副作用を残さない。
     assert_eq!(values(&core, "SELECT id, v FROM t LIMIT 5").len(), 1);
     // NULL 判定は型に依らず存在ビットだけを見るため BIT 列でも正しく動く。

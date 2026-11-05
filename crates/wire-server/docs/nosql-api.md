@@ -443,7 +443,9 @@ OFFSET ...` と同じ対象名解決・実行器を共有。第 2 の実行器�
 - `BIT(n)` 列（SQL DDL で作成。TABLE-48・Issue #2021）への `insert`／`update` は JSON 文字列（`0`・`1` の
   並び）を束縛する。`0`・`1` 以外の文字は `22P02`、ビット数が宣言長 `n` と異なる値は `22026`
   （`STRING_DATA_LENGTH_MISMATCH`、HTTP `400`）で文全体を拒否し副作用を残さない。応答の列型名は
-  `"bit"`。`filter` に BIT 列を使うことは対象外で engine の非対応列判定により拒否される
+  `"bit"`。`filter` に BIT 列を使うことは対象外で engine の非対応列判定により拒否される。
+  bit 距離は SQL の `<~>`／`<%>`・`hamming_distance`・`jaccard_distance` でだけ扱い、`search` の対象にできない
+  （VECTOR 列を持たず BIT 列だけを持つ表への `search` は `0A000`。TABLE-48 (5)・Issue #2970）
 - `HALFVEC(N)` 列（SQL DDL で作成。TABLE-46・Issue #2014）への `insert`／`update` は `VECTOR` と同じ JSON 数値配列を
   束縛し、engine が IEEE 754 binary16 へ丸めて保存する（`scan` では丸めた値が返る）。次元不一致・非数値要素・
   非有限は `22000`、f16 の範囲外は `22003`（HTTP `400`）で文全体を拒否し副作用を残さない。応答の列型名は

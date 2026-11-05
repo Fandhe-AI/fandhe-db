@@ -6807,6 +6807,12 @@ struct Parser<'a> {
     /// 投影・SET・VALUES・UDF 本体・ORDER BY・JOIN など他の文脈は従来どおり `42601` のままにする。
     /// CHECK 本体は真にしない（従来の拒否を維持）。
     distance_expr_allowed: bool,
+    /// bit 列の距離式（`<~>`＝Hamming・`<%>`＝Jaccard。TABLE-48・Issue #2970）を値式の
+    /// 「その他の演算子」の段で受理してよいか。広域取得の `ORDER BY` 式キー・投影項目・WHERE の葉を
+    /// 解析している間だけ真で、CHECK 本体・UDF 本体・集約の引数などは従来どおり `42601` のままにする。
+    /// 受理した式は `hamming_distance`／`jaccard_distance` の関数呼び出しへ脱糖する
+    /// （演算子形と関数形を同じ束縛・評価の経路に通す）。
+    bit_distance_expr_allowed: bool,
     /// 投影トップレベルの距離列 `<VECTOR 列> <距離演算子> <ベクトルリテラル> [AS 別名]`
     /// （SQL-33 (7)・Issue #2007）を受理してよいか。`parse_select_shape` が最上位の SELECT リスト
     /// （`subquery_ctx == None`）を読む間だけ真にする。実際に使える形（距離 `ORDER BY` と列・種別が
@@ -6955,6 +6961,7 @@ impl<'a> Parser<'a> {
             allow_plus_param: false,
             in_check_body: false,
             distance_expr_allowed: false,
+            bit_distance_expr_allowed: false,
             projection_distance_allowed: false,
             max_insert_rows: None,
             from_ref: None,
@@ -7479,6 +7486,16 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_select_item(&mut self) -> Result<SelectItem, SqlSurfaceError> {
+        // bit 列の距離式（TABLE-48・Issue #2970）は投影項目の中だけで受理する（エラー時も元へ戻す）。
+        let prev = self.bit_distance_expr_allowed;
+        self.bit_distance_expr_allowed = !self.in_check_body;
+        let result = self.parse_select_item_inner();
+        self.bit_distance_expr_allowed = prev;
+        result
+    }
+
+    /// [`Self::parse_select_item`] の本体（bit 距離式の受理フラグを設定済みの状態で呼ばれる）。
+    fn parse_select_item_inner(&mut self) -> Result<SelectItem, SqlSurfaceError> {
         let mut is_extract_syntax = false;
         let expr = match self.peek().cloned() {
             Some(Token::Ident(name)) => {
@@ -7497,6 +7514,7 @@ impl<'a> Parser<'a> {
                     matches!(t, Token::Punct('+' | '-' | '*' | '/' | '['))
                         || matches!(t, Token::TypeCast)
                         || is_json_operator_token(t)
+                        || matches!(t, Token::BitDistanceOp(_))
                 }) || self.peek_ident_matches_at(1, "COLLATE")
                     || (self.peek_ident_matches_at(1, "AT")
                         && (self.peek_ident_matches_at(2, "LOCAL")
@@ -7520,6 +7538,7 @@ impl<'a> Parser<'a> {
                         || self.peek().is_some_and(|t| {
                             matches!(t, Token::Punct('+' | '-' | '*' | '/') | Token::TypeCast)
                                 || is_json_operator_token(t)
+                                || matches!(t, Token::BitDistanceOp(_))
                         })
                     {
                         // `parse_value_expr(0)` と同じ段位（add=0・mul=1・primary=2）で継続する。
@@ -7565,7 +7584,10 @@ impl<'a> Parser<'a> {
             }
             // Issue #1593: `'1'::int` のように文字列リテラルへ `::` が続く形だけ式項目として扱う。
             Some(Token::StringLiteral(_))
-                if matches!(self.tokens.get(self.pos + 1), Some(Token::TypeCast)) =>
+                if matches!(
+                    self.tokens.get(self.pos + 1),
+                    Some(Token::TypeCast | Token::BitDistanceOp(_))
+                ) =>
             {
                 self.parse_projection_infix(0)?
             }
@@ -8205,6 +8227,20 @@ impl<'a> Parser<'a> {
     /// 収集と単項マイナス拡張を無効にし、引数文法を従来と完全に同一に保つ（入れ子集計
     /// `sum(count(*))` は従来どおり `42601`）。
     fn parse_aggregate_call_after_name(
+        &mut self,
+        name: &str,
+    ) -> Result<AggregateItem, SqlSurfaceError> {
+        // bit 距離式（TABLE-48・Issue #2970）は射影項目の最上位式でのみ受理する。集計の引数は
+        // 入れ子の呼び出しなので、外側が許可中でも無効へ戻して `42601` を保つ（エラー時も復元）。
+        let prev_bit = self.bit_distance_expr_allowed;
+        self.bit_distance_expr_allowed = false;
+        let result = self.parse_aggregate_call_after_name_inner(name);
+        self.bit_distance_expr_allowed = prev_bit;
+        result
+    }
+
+    /// [`Self::parse_aggregate_call_after_name`] の本体（bit 距離式の受理フラグを無効化済みで呼ばれる）。
+    fn parse_aggregate_call_after_name_inner(
         &mut self,
         name: &str,
     ) -> Result<AggregateItem, SqlSurfaceError> {
@@ -9715,9 +9751,12 @@ impl<'a> Parser<'a> {
         // WHERE の葉の中だけ距離式を受理する（SQL-74 (1)・Issue #2035）。`in_check_body` と同じ
         // 保存・復元の流儀で、エラー経路でも元の値へ戻す。
         let prev = self.distance_expr_allowed;
+        let prev_bit = self.bit_distance_expr_allowed;
         self.distance_expr_allowed = !self.in_check_body;
+        self.bit_distance_expr_allowed = !self.in_check_body;
         let result = self.parse_where_leaf_inner(extra_close_paren, set_operators, leaf_count);
         self.distance_expr_allowed = prev;
+        self.bit_distance_expr_allowed = prev_bit;
         result
     }
 
@@ -11413,6 +11452,22 @@ impl<'a> Parser<'a> {
                         kind,
                         lhs: Box::new(lhs),
                         rhs: Box::new(rhs),
+                    };
+                    continue;
+                }
+                // bit 列の距離式（TABLE-48・Issue #2970）。許可された文脈の中だけで受理し、同じ段・
+                // 左結合で `hamming_distance`／`jaccard_distance` の呼び出しへ脱糖する。
+                Some(Token::BitDistanceOp(kind)) if self.bit_distance_expr_allowed => {
+                    let name = match kind {
+                        lexer::BitDistanceKind::Hamming => "hamming_distance",
+                        lexer::BitDistanceKind::Jaccard => "jaccard_distance",
+                    };
+                    self.advance();
+                    let rhs = self.parse_add_expr(depth + 1)?;
+                    self.consume_expr_node()?;
+                    lhs = Expr::Call {
+                        name: name.to_string(),
+                        args: vec![lhs, rhs],
                     };
                     continue;
                 }
@@ -13114,7 +13169,11 @@ impl<'a> Parser<'a> {
                 // `parse_select_shape` がベクトル順位付け経路へ振り分け済み）なら式キー。
                 // `COALESCE`／`NULLIF`／`EXTRACT` も `ident '('` に含まれる。
                 // 算術で始まるキー・括弧始まりは従来どおり構文拒否（`42601`）。
-                Key::Expr(self.parse_value_expr(0)?)
+                let prev_bit = self.bit_distance_expr_allowed;
+                self.bit_distance_expr_allowed = !self.in_check_body;
+                let parsed = self.parse_value_expr(0);
+                self.bit_distance_expr_allowed = prev_bit;
+                Key::Expr(parsed?)
             } else {
                 self.sink_mark(self.pos, super::colref_sink::Role::OrderKey);
                 Key::Column(self.expect_ident()?)
@@ -13250,8 +13309,18 @@ impl<'a> Parser<'a> {
             {
                 true
             }
+            // bit 列の距離式（TABLE-48・Issue #2970）: `ORDER BY '1010' <~> v`。
+            Some(Token::StringLiteral(_))
+                if matches!(self.tokens.get(self.pos + 1), Some(Token::BitDistanceOp(_))) =>
+            {
+                true
+            }
             Some(Token::Ident(name)) => {
                 if name.eq_ignore_ascii_case("CASE") && self.peek_ident_matches_at(1, "WHEN") {
+                    return true;
+                }
+                // bit 列の距離式（TABLE-48・Issue #2970）: `ORDER BY v <~> '1010'`。
+                if matches!(self.tokens.get(self.pos + 1), Some(Token::BitDistanceOp(_))) {
                     return true;
                 }
                 // 引用なしの括弧なし SQL 値関数（SQL-37・Issue #1586）は式キー。
