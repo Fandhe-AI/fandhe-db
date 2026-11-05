@@ -1373,7 +1373,8 @@ pub fn validate_param_positions(tokens: &[Token]) -> Result<u16, SqlSurfaceError
     // Issue #2058（SQL-76 (1)）: `EXPLAIN ( <オプション> ) <文>` は先頭の次が `(` になり、下の
     // `EXPLAIN` 前置の JOIN・集合演算・CTE・部分クエリのガードが偽になって素通りする（その後 parse 段が
     // オプションを剥いで受理してしまう）。`$n` との併用は受理を後続に譲り、fail-closed に拒否する。
-    if crate::sql::explain_options::has_option_list(tokens)
+    // Issue #2054: 前置形 `EXPLAIN ANALYZE|VERBOSE <文>` も同じ理由で拒否する。
+    if crate::sql::explain_options::has_explain_modifiers(tokens)
         && tokens.iter().any(|t| matches!(t, Token::Param(_)))
     {
         return Err(SqlSurfaceError::unsupported(

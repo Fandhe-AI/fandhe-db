@@ -515,7 +515,7 @@ SQL-40 (1)(2)(3)(6)・RLS-12 ポインタ。読み取り系の文が参照する
 - **拡張クエリは Parse でも検査する**: PG は Parse では検査しない意図的な差。権限の無い主体に列の型情報（Describe）を返さない
   fail-closed を優先し、Parse と Execute の間の REVOKE は Bind の再検証で反映する。
 - **行ロック句は SELECT に加えて UPDATE を要求する**: ロック強度によらず、`OF` で絞られた表だけでなく参照先の全表に要求する（PG より厳しい側）。
-- **`EXPLAIN ANALYZE` は構文として受理されない（`42601`）**: 計画を返す形は `EXPLAIN` だけで、検査は対象の文と同じ。
+- **`EXPLAIN ANALYZE <SELECT>`（Issue #2054）**: 内側の SELECT を実行するため、実行前に対象の SELECT と同じ権限を要求する（`42501`）。DML の ANALYZE は `0A000`。検査は `EXPLAIN` と同じく対象の文と同じ。
 - **エラーは固定文言の `42501`**: 表名・ロール ID・テナントを含めない。明示 Tx 内の `42501` は Tx を `Failed` にする。
   EXPLAIN・Describe は計画や列情報を返す前に拒否する。
 - **参照数の上限**: 重複除去後 256 件を超える文は ACL の照会より前に `PayloadTooLarge` で拒否する。
