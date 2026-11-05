@@ -132,6 +132,23 @@ impl Op {
         }
     }
 
+    /// セッションスコープの `read_only` が受理する op か（HTTP-15・Issue #2101。許可リスト方式で、
+    /// 読み取り系 4 値のみ true。副作用を持つ op〔書き込み・DDL・ジョブ取り消し〕は false。
+    /// 網羅 match のため、op 追加時に判断を強制する＝新しい op が黙って許可側へ入らない）。
+    pub const fn allowed_in_read_only(self) -> bool {
+        match self {
+            Op::Search | Op::Scan | Op::Aggregate | Op::ShowPartitionedDml => true,
+            Op::Insert
+            | Op::Upsert
+            | Op::Update
+            | Op::Delete
+            | Op::CreateTable
+            | Op::AlterTable
+            | Op::DropTable
+            | Op::CancelPartitionedDml => false,
+        }
+    }
+
     /// JSON 上の正準名（`op` フィールドの受理値そのもの）。
     pub fn name(self) -> &'static str {
         match self {
@@ -226,6 +243,19 @@ pub fn classify_op(raw: &str) -> Result<Op, UnsupportedOp> {
 mod tests {
     use super::*;
     use crate::http::query::schema::OP_SCHEMAS;
+
+    #[test]
+    fn read_only_allows_only_read_ops() {
+        for op in Op::ALL {
+            let expected = matches!(
+                op,
+                Op::Search | Op::Scan | Op::Aggregate | Op::ShowPartitionedDml
+            );
+            assert_eq!(op.allowed_in_read_only(), expected, "{}", op.name());
+        }
+        // 語彙外（create_index／drop_index）は手順 3 で 0A000 になりスコープ検査へ到達しない。
+        assert!(Op::parse("create_index").is_none() && Op::parse("drop_index").is_none());
+    }
 
     #[test]
     fn accepts_idempotency_key_only_for_write_ops() {

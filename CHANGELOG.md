@@ -9,6 +9,8 @@
 
 ### Changed
 
+- セッションのスコープを `POST /v1/query` の要求ごとに強制するようにした（Issue #2101・HTTP-15・ERR-4 ポインタ）。スコープ外の op・表・`read_only` 違反は実行前に固定文言の `42501`（HTTP 403）で拒否し、副作用はない。スコープ外の表は存在の有無に依らず同一応答で、スコープ内の存在しない表はスコープなしと同じ `42P01`。`POST /v1/session` のスコープ付き発行は `0A000` ではなく 200 でトークンを返す。
+  BREAKING CHANGE: スコープ付きの `POST /v1/session` が `0A000` から成功に変わり、スコープ外の `POST /v1/query` が `42501` で拒否される。
 - NoSQL の `upsert` op を実行するようにした（Issue #2087・NOSQL-21・SQL-20・SQL-49 ポインタ）。SQL 表層の `INSERT ... ON CONFLICT` と同じ束縛関数・実行器を通り、応答は `{"upserted":n}`。従来の固定文言 `0A000` は返さない。`Idempotency-Key` ヘッダを `upsert` でも受け付ける。
   BREAKING CHANGE: wire-server の公開定数 `http::query::gate::UPSERT_NOT_YET_AVAILABLE_MESSAGE` を削除した。
 - `halfvec_*_ops` を VECTOR 列の `USING hnsw` に指定したときのエラーを `42704` から `42804` へ変えた（Issue #2016・TABLE-46 (3)・INDEX-7 ポインタ。PostgreSQL と同じ）。`vector_*_ops` を HALFVEC 列に指定した場合も `42804`。未知の演算子クラスは従来どおり `42704`。
@@ -25,6 +27,7 @@
 
 ### Added
 
+- wire-server に `http::session::scope::ScopeViolation`・`SessionScope::check`・`http::query::op::Op::allowed_in_read_only` を追加した（Issue #2101・HTTP-15 ポインタ）。
 - `EngineCore::execute_bound_upsert_in_session` を追加した（Issue #2087・NOSQL-21 ポインタ）。束縛済み UPSERT のセッション対応入口で、権限・INDEX-4 上限・台帳を SQL 表層と同じ実行器で扱う。
 - `EXPLAIN (FORMAT JSON) <文>` を追加した（Issue #2059・SQL-76 (1)(6) ポインタ）。PostgreSQL 互換の JSON を 1 行 1 列（`QUERY PLAN`・型 `json`・OID 114）で返し、JSON と TEXT は同じ情報を持つ。`FORMAT TEXT`／オプションなしは従来と同一。`FORMAT XML|YAML` と未実装の既知オプションは `0A000`、`FORMAT` の不正値は `22023`、未知の名前・構文の誤りは `42601`。
   BREAKING CHANGE: 公開 enum `ParsedSql` に variant `ExplainJson(Box<ParsedSql>)` を追加した（網羅的 `match` の下流は追随が必要）。
