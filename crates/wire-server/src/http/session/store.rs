@@ -105,7 +105,7 @@ struct Entry {
     /// 搬送するだけで、第 2 の権限判定にはしない）。
     ddl_allowed: bool,
     /// 発行時に宣言されたスコープ（HTTP-15・Issue #2100。省略は `None`＝全権限）。発行時に 1 回だけ
-    /// 確定し以後変化しない（setter なし）。強制は後続 Issue #2101。
+    /// 確定し以後変化しない（setter なし）。強制は `POST /v1/query` の手順 5c（Issue #2101）。
     scope: Option<Arc<SessionScope>>,
     issued_at: Instant,
     _permit: SessionPermit,
