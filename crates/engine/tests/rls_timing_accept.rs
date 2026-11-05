@@ -424,3 +424,20 @@ fn parse_raw_rounds_fails_closed() {
     );
     assert!(parse_raw_rounds(&empty).is_err());
 }
+
+#[test]
+fn raw_input_limit_covers_max_measurement_output() {
+    // 最大設定の出力量（ROUNDS=50・ITERS=20000・全形状・両 arm）が既定の 4 MiB を超えても、
+    // 再判定の有限上限が最悪桁数のサンプル列を収められることを固定する。
+    assert!(RAW_MAX_INPUT_BYTES > 4 * 1024 * 1024);
+    assert_eq!(MAX_RAW_SAMPLES, 50 * 20_000 * 6);
+    assert!(RAW_MAX_INPUT_BYTES >= MAX_RAW_SAMPLES * "18446744073709551615,".len());
+    // 4 MiB 超の入力が上限検査で拒否されず、構文／検証段（Err でも可）まで進む。
+    let big = format!("{{\"x\":\"{}\"}}", "a".repeat(5 * 1024 * 1024));
+    let err = parse_raw_rounds(&big).expect_err("invalid raw");
+    assert!(!format!("{err:?}").contains("exceeds"), "{err:?}");
+    // 有限上限を超える入力は拒否される。
+    let huge = "a".repeat(RAW_MAX_INPUT_BYTES + 1);
+    let err = parse_raw_rounds(&huge).expect_err("too large");
+    assert!(format!("{err:?}").contains("exceeds"), "{err:?}");
+}
