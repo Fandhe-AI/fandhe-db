@@ -154,7 +154,15 @@ JSON キー・ヘッダ（`tenant`／`tenant-id`／`tenantid` 相当。`x-` 接�
 5. `op` 許可リスト判定（11 値の厳密一致。語彙外は `0A000`。DDL・UDF 呼び出し・
    トランザクション制御を含む）
 6. op 別スキーマ検証（必須キー欠落・未知キー・型不一致・`null` は `42601`）
-7. op 別の意味検証・実行（`search` は `explain: true` を通常実行より先に判定）
+7. `Idempotency-Key` ヘッダの解決（重複は `08P01`、空・256 バイト超・制御文字は `42601`。
+   `insert`／`update`／`delete` 以外の op に付いていれば `42601`。engine 呼び出し前に返る）
+8. op 別の意味検証・実行（`search` は `explain: true` を通常実行より先に判定）
+
+`Idempotency-Key` ヘッダは書き込み op（`insert`／`update`／`delete`。単一行形・述語形・分割実行を
+含む）の `operation_id` の供給元になる。本文の `operation_id` とヘッダのどちらか一方の指定で足り
+（`--require-operation-id` の構成でも同じ）、両方ある場合は値の完全一致が必要で、不一致は `42601`
+（副作用なし）。応答にヘッダは返さず、解決した値を本文の `operation_id`（成功本文と分割実行 409 の
+`error.data.operation_id`）で返す。同じ値で内容が異なる再送の `22023` は従来どおり台帳が判定する
 
 `op` は完全一致のみで判定する（大文字小文字の読み替え・前後空白のトリムは
 しない）。`"SEARCH"`・`" search"`・`"select"`・`"explain"`・`"begin"` 等はいずれも
@@ -406,7 +414,7 @@ OFFSET ...` と同じ対象名解決・実行器を共有。第 2 の実行器�
 | `op` | ○ | string | `"insert"` |
 | `table` | ○ | string | |
 | `rows` | ○ | object[] | 各行はスキーマ列名をキーとする値。疑似列 `id` を持つ表（従来方式・NoSQL `create_table` で作った表）は `id`（非負整数）が必須。SQL の `CREATE TABLE` で作った表（暗黙の `id` を持たない採番方式。TABLE-23・NOSQL-23。Issue #2201）は `id` を要求せず、宣言した `id` 列は通常の列として扱い、宣言のない `id` キーは `22000`。PRIMARY KEY 列の省略は `23502`（`DEFAULT` があれば適用）、PK 重複は `23505`。行の識別子（rowid）は応答に出ない |
-| `operation_id` | △ | string | 既定では省略可（欠落・`null`・空文字は台帳に記録しない通常の書き込み。成功応答に `operation_id` キーなし）。`--require-operation-id` の構成では欠落・`null`・空文字はいずれも `23502` |
+| `operation_id` | △ | string | 既定では省略可（欠落・`null`・空文字は台帳に記録しない通常の書き込み。成功応答に `operation_id` キーなし。`Idempotency-Key` ヘッダでも指定でき、両方あれば一致必須で不一致は `42601`）。`--require-operation-id` の構成では欠落・`null`・空文字はいずれも `23502` |
 
 要求例:
 
@@ -518,7 +526,7 @@ SQL の `WHERE` 句省略とのパリティ）。
 | `set` | ○ | object（任意キー・非空） | 列名をキーに持つ部分更新。`id`／`tenant_id`／`visibility` は `42601`。`TEXT` 列は JSON 文字列、`VECTOR` 列は数値配列（**文字列形のベクトルリテラルは受理しない**）のみ受理。他の列型は `insert` と同じ JSON 表現（Issue #896・NOSQL-17。上記参照）。`null` は列型を問わず nullable 判定込みで `bind_update` へ委譲する（非 nullable 列への `null` は `22000`）。型不一致・未知列・次元不一致は `22000`（新型の型不一致は `42601`） |
 | `where` | △ | object | 単一行アドレス（Issue #2201・TABLE-23・NOSQL-23）。キー集合が表の PRIMARY KEY の列集合と完全一致（複合可。値は `filter` の `eq` と同じ型規則）、または疑似列 `id` を持つ表で `{"id": number}`（小数は `22000`、負数は `42601`。SQL 表層とのパリティ）。PK なし表・キーの過不足・未知列・`null` 値・空オブジェクトは `42601`（副作用なし。述語形 `filter` は使える）。`filter` との排他（両方・双方欠落はいずれも `42601`） |
 | `filter` | △ | object[] | [`filter` 配列](#filter-配列)参照。空配列は `42601`。非空は述語形 `UPDATE` として実行される（影響行数上限 `MAX_DML_AFFECTED_ROWS` 超過は `54000`。副作用ゼロ） |
-| `operation_id` | △ | string | 既定では省略可（成功応答に `operation_id` キーなし）。`--require-operation-id` の構成では欠落・`null`・空文字は `23502`（分割実行は構成によらず `23502`）。同一値への再送は台帳照合により内容一致 `23505`（`DUPLICATE_OPERATION_ID`）・不一致 `22023`（SQL 表層と共有） |
+| `operation_id` | △ | string | 既定では省略可（成功応答に `operation_id` キーなし。`Idempotency-Key` ヘッダでも指定でき、両方あれば一致必須で不一致は `42601`）。`--require-operation-id` の構成では欠落・`null`・空文字は `23502`（分割実行は構成によらず `23502`）。同一値への再送は台帳照合により内容一致 `23505`（`DUPLICATE_OPERATION_ID`）・不一致 `22023`（SQL 表層と共有） |
 | `mode` | | string | 分割実行の修飾（Issue #1130・NOSQL-12）。受理値は `"partitioned"` のみで、それ以外の文字列・非文字列は `42601`（黙って原子実行へ切り替えない）。`filter`（述語形）とだけ組み合わせられ、`where` との併用は `42601`。詳細は[分割実行](#分割実行-dml)参照 |
 | `chunk` | | number | 1 チャンクの行数（`mode` 指定時のみ有効。`mode` なしは `42601`）。`0`・小数・`usize` 超過は `22000`、負数は `42601`、サーバー設定のチャンク幅超過は `22000`（SQL の `CHUNK n` と同じ規則） |
 
@@ -571,7 +579,7 @@ execute_delete`）・同一の台帳キー空間を共有する。`filter`（述
 | `table` | ○ | string | |
 | `where` | △ | object | 単一行アドレス（Issue #2201・TABLE-23・NOSQL-23）。キー集合が表の PRIMARY KEY の列集合と完全一致（複合可。値は `filter` の `eq` と同じ型規則）、または疑似列 `id` を持つ表で `{"id": number}`（小数は `22000`、負数は `42601`。SQL 表層とのパリティ）。PK なし表・キーの過不足・未知列・`null` 値・空オブジェクトは `42601`（副作用なし。述語形 `filter` は使える）。`filter` との排他（両方・双方欠落はいずれも `42601`） |
 | `filter` | △ | object[] | [`filter` 配列](#filter-配列)参照。空配列は `42601`。非空は述語形 `DELETE` として実行される（影響行数上限 `MAX_DML_AFFECTED_ROWS` 超過は `54000`。副作用ゼロ） |
-| `operation_id` | △ | string | 既定では省略可（成功応答に `operation_id` キーなし）。`--require-operation-id` の構成では欠落・`null`・空文字は `23502`（分割実行は構成によらず `23502`）。同一値への再送は台帳照合により `23505`（`DUPLICATE_OPERATION_ID`。内容一致。`DELETE` は行の有無に関わらず同一内容） |
+| `operation_id` | △ | string | 既定では省略可（成功応答に `operation_id` キーなし。`Idempotency-Key` ヘッダでも指定でき、両方あれば一致必須で不一致は `42601`）。`--require-operation-id` の構成では欠落・`null`・空文字は `23502`（分割実行は構成によらず `23502`）。同一値への再送は台帳照合により `23505`（`DUPLICATE_OPERATION_ID`。内容一致。`DELETE` は行の有無に関わらず同一内容） |
 | `mode` | | string | 分割実行の修飾（Issue #1130・NOSQL-12）。受理値は `"partitioned"` のみで、それ以外の文字列・非文字列は `42601`（黙って原子実行へ切り替えない）。`filter`（述語形）とだけ組み合わせられ、`where` との併用は `42601`。詳細は[分割実行](#分割実行-dml)参照 |
 | `chunk` | | number | 1 チャンクの行数（`mode` 指定時のみ有効。`mode` なしは `42601`）。`0`・小数・`usize` 超過は `22000`、負数は `42601`、サーバー設定のチャンク幅超過は `22000`（SQL の `CHUNK n` と同じ規則） |
 
@@ -607,7 +615,7 @@ NOSQL-12・RECOVER-11。設計判断は `docs/design/partitioned-dml.md` 10 節�
 - 述語の語彙は、既存の述語形 `update`／`delete` の `filter` と同じ（`search` と同じ語彙。
   Issue #1197 の `ne`・`like`・`between`・`is_null`・`not_null`・`not`、Issue #1356 の
   範囲比較・`in`・`or`・数値列の各語彙を含む）
-- `operation_id` は構成によらず必須（欠落は `23502`）。内容照合ハッシュのドメインは SQL 表層の分割実行と
+- `operation_id` は構成によらず必須（欠落は `23502`。`Idempotency-Key` ヘッダだけの指定でも満たす）。内容照合ハッシュのドメインは SQL 表層の分割実行と
   共有するため、表層を跨いだ同一 `operation_id` の再送で、中断ジョブの再開・完了済みへの
   `23505`・内容不一致の `22023` が SQL 表層と一致する。原子的な述語形（`mode` なし）とは
   ハッシュを共有しない（同じ `operation_id` は互いに `22023`）
