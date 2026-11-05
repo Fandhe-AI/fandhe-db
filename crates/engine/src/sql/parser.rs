@@ -231,6 +231,22 @@ fn check_precision_distance_kind(
     Ok(())
 }
 
+/// 束縛済み検索文の距離種別と順位付け・モードの整合を検査する（Issue #2243・NOSQL-2・SQL-33）。
+/// 公開ビルダー [`BoundStatement::with_distance_kind`] の誤用で、`Distance` 以外の順位付けや
+/// `precision` に非 Cosine が素通りしないよう、`EngineCore` の束縛済み検索入口が呼ぶ。
+/// 文言と分類は SQL 束縛段の [`check_distance_kind`]・[`check_precision_distance_kind`] と揃える。
+pub(crate) fn check_bound_distance_kind(bound: &BoundStatement) -> Result<(), SqlSurfaceError> {
+    let kind = bound.distance_kind();
+    if kind != crate::sql::lexer::DistanceKind::Cosine
+        && !matches!(bound.ranking(), Ranking::Distance { .. })
+    {
+        return Err(SqlSurfaceError::unsupported(
+            "distance operator kind requires a distance ORDER BY",
+        ));
+    }
+    check_precision_distance_kind(bound.distance_kind(), Some(bound.mode().mode()))
+}
+
 /// 投影の距離列（SQL-33 (7)・Issue #2007）と距離 `ORDER BY` の整合を検査する。
 /// 構文段（`parse_select_shape`）が列・種別の一致を保証するが、`ValidatedStatement::new` を直接
 /// 使う呼び出し元も迂回できないよう束縛段でも守る（多層防御）。距離列があるのに順位付けが
@@ -345,10 +361,12 @@ impl BoundStatement {
         self.result_cap
     }
 
-    /// 距離演算子の種別を設定した crate 内ビルダー（Issue #1977。テスト専用）。
-    #[cfg(test)]
+    /// 距離演算子の種別を設定する公開ビルダー（Issue #1977・#2243）。wire-server の NoSQL 表層
+    /// `search` op の `metric`（NOSQL-2・SQL-33 (7)）が `BoundStatement` を直接構築する際に使う。
+    /// 非 Cosine と順位付け・モードの整合は `EngineCore` の束縛済み検索入口
+    /// （`check_bound_search`）が [`check_bound_distance_kind`] で再検査する（fail-closed）。
     #[must_use]
-    pub(crate) fn with_distance_kind(mut self, kind: crate::sql::lexer::DistanceKind) -> Self {
+    pub fn with_distance_kind(mut self, kind: crate::sql::lexer::DistanceKind) -> Self {
         self.distance_kind = kind;
         self
     }
@@ -927,8 +945,9 @@ pub(crate) fn parse_int8vec_literal(
 /// 検証本体は [`crate::sparse_vector::SparseVector::parse_text`] に一本化し、ここでは
 /// SQLSTATE への写像（形式不正 `22P02`・値不正 `22000`・上限超過 `54000`）だけを行う。
 /// INSERT／UPDATE SET／UPSERT／`$n` テキスト束縛が共有する単一情報源。書き込み経路の非ゼロ数上限は
-/// ここ（[`crate::sparse_vector::DEFAULT_MAX_SPARSEVEC_NNZ`]）で決まり、Issue #2027 が
-/// 設定値へ差し替える唯一の点になる。エラー文言に入力値は含めない。
+/// ここで文の束縛スコープ（[`crate::sparsevec_limits::SparseVecLimitsScope`]。起動時 CLI
+/// `--max-sparsevec-nnz` の値を `core.rs` が張る。Issue #2027）から読む。スコープが無い経路は
+/// ハード上限（＝既定値）。エラー文言に入力値は含めない。
 pub(crate) fn parse_sparsevec_literal(
     literal: &str,
     expected_dim: u32,
@@ -937,7 +956,7 @@ pub(crate) fn parse_sparsevec_literal(
     crate::sparse_vector::SparseVector::parse_text(
         literal,
         expected_dim,
-        crate::sparse_vector::DEFAULT_MAX_SPARSEVEC_NNZ,
+        crate::sparsevec_limits::current_sparsevec_limits().max_nnz(),
     )
     .map_err(|e| match e.kind {
         Kind::InvalidText => SqlSurfaceError::invalid_text_representation(e.detail),
@@ -1771,6 +1790,16 @@ pub(crate) fn vector_column(schema: &TableSchema) -> Result<(usize, u32), SqlSur
                 // SPARSEVEC の距離計算・kNN は兄弟 Issue #2026 まで未対応（fail-closed。Issue #2025）。
                 SqlSurfaceError::feature_not_supported(
                     "vector search over SPARSEVEC columns is not supported",
+                )
+            } else if schema
+                .columns
+                .iter()
+                .any(|c| matches!(c.ty, ColumnType::Bit(_)))
+            {
+                // BIT 列は SQL の `<~>`／`<%>`（scan 経路）でだけ距離を扱い、NoSQL の `search`・
+                // `USING PLAN`・hybrid の対象にできない（TABLE-48 (5)・Issue #2970。fail-closed）。
+                SqlSurfaceError::feature_not_supported(
+                    "vector search over BIT columns is not supported",
                 )
             } else {
                 SqlSurfaceError::invalid_input("table has no VECTOR column")
@@ -16180,6 +16209,60 @@ mod tests {
         let err = check_distance_kind(DistanceKind::L2, &order_by).expect_err("non-distance");
         assert_eq!(err.wire_code(), "42601");
         assert!(check_distance_kind(DistanceKind::Cosine, &order_by).is_ok());
+    }
+
+    /// Issue #2243: 束縛済み検索文の距離種別整合の真理表（Distance/Hybrid × recall/precision）。
+    #[test]
+    fn check_bound_distance_kind_truth_table() {
+        use crate::sql::lexer::DistanceKind;
+        use crate::sql::mode::{resolve_mode, SearchMode};
+        let kinds = [
+            DistanceKind::Cosine,
+            DistanceKind::L2,
+            DistanceKind::NegativeInnerProduct,
+            DistanceKind::L1,
+        ];
+        for kind in kinds {
+            for hybrid in [false, true] {
+                for precision in [false, true] {
+                    let ranking = if hybrid {
+                        Ranking::Hybrid {
+                            query: vec![1.0],
+                            text_column_index: 0,
+                            query_text: "q".to_string(),
+                        }
+                    } else {
+                        Ranking::Distance { query: vec![1.0] }
+                    };
+                    let mut bound = BoundStatement::new(
+                        "t".to_string(),
+                        Vec::new(),
+                        Vec::new(),
+                        false,
+                        ranking,
+                        1,
+                        EvaluationOrder::DEFAULT,
+                    )
+                    .with_distance_kind(kind);
+                    if precision {
+                        bound = bound.with_mode(resolve_mode(Some(SearchMode::Precision), None));
+                    }
+                    let got = check_bound_distance_kind(&bound)
+                        .err()
+                        .map(|e| e.wire_code());
+                    let want = if kind == DistanceKind::Cosine {
+                        None
+                    } else if hybrid {
+                        Some("42601")
+                    } else if precision {
+                        Some("0A000")
+                    } else {
+                        None
+                    };
+                    assert_eq!(got, want, "{kind:?} hybrid={hybrid} precision={precision}");
+                }
+            }
+        }
     }
 
     #[test]

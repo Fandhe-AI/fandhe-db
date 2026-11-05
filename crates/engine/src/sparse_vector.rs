@@ -10,11 +10,12 @@
 //!   不整合を fail-closed（`RowCodecError::Invalid`）にする
 //! - wire-server の結果整形が [`SparseVector::format_text`] を呼ぶ
 //!
-//! 上限の扱い（Issue #2027 への引き継ぎ点）: 書き込み経路は設定可能な上限
-//! （現状は [`DEFAULT_MAX_SPARSEVEC_NNZ`]）で、decode 経路は [`HARD_MAX_SPARSEVEC_NNZ`] だけで
-//! 検査する。こうすることで上限を下げても既存行を読める。書き込み側の上限参照は
-//! [`SparseVector::parse_text`] / [`SparseVector::try_from_pairs`] の引数 `max_nnz` に集約しており、
-//! CLI 設定化はその呼び出し側（`sql::parser`）の値を差し替えるだけで済む。
+//! 上限の扱い（Issue #2027 で実装済み）: 書き込み経路は起動時 CLI で下げられる上限
+//! （[`crate::sparsevec_limits::SparseVecLimits`]。未設定は [`DEFAULT_MAX_SPARSEVEC_NNZ`] と同値）で、
+//! decode 経路は [`HARD_MAX_SPARSEVEC_NNZ`] だけで検査する。こうすることで上限を下げても
+//! 既存行を読める。書き込み側の上限参照は [`SparseVector::parse_text`] /
+//! [`SparseVector::try_from_pairs`] の引数 `max_nnz` に集約しており、`sql::parser` が
+//! 設定値を渡す。
 //!
 //! エラー文言は固定の英語で、入力値を含めない（テナント境界・情報漏えい対策）。
 

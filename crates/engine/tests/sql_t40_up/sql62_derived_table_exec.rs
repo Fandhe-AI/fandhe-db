@@ -351,7 +351,7 @@ fn unsupported_shapes_stay_fail_closed() {
     let (core, _g) = open_seeded();
     for (sql, expected) in [
         ("SELECT * FROM LATERAL (SELECT lang FROM docs) t", "0A000"),
-        ("EXPLAIN SELECT * FROM (SELECT lang FROM docs) t", "42601"),
+        // 単一の派生表の EXPLAIN は Issue #2048 で受理（`sql75_explain_cte_subquery.rs`）。
         (
             "SELECT * FROM (SELECT lang FROM docs) t WHERE lang IN (SELECT lang FROM docs)",
             "42601",

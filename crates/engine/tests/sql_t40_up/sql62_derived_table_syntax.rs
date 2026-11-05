@@ -331,12 +331,9 @@ fn derived_table_with_cte_and_data_modifying_cte() {
 #[test]
 fn derived_table_not_recognized_outside_session_select() {
     let (core, _g) = open_seeded();
-    for sql in [
-        "EXPLAIN SELECT * FROM (SELECT lang FROM docs) t",
-        "SELECT * FROM docs WHERE lang IN (SELECT lang FROM (SELECT lang FROM docs) s)",
-    ] {
-        assert_eq!(code(&core, "alice", sql), "42601", "{sql}");
-    }
+    // 単一の派生表の EXPLAIN は Issue #2048 で受理に変わった（`sql75_explain_cte_subquery.rs`）。
+    let sql = "SELECT * FROM docs WHERE lang IN (SELECT lang FROM (SELECT lang FROM docs) s)";
+    assert_eq!(code(&core, "alice", sql), "42601", "{sql}");
 }
 
 #[test]

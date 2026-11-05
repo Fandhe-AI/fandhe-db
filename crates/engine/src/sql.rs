@@ -214,6 +214,7 @@ mod truncate_restart_identity_tests;
 // `CREATE FUNCTION`／`DROP FUNCTION` の UDF カタログ書き込み経路（SQL-66・Issue #1920）。
 pub mod udf_ddl;
 // TRIGGER DDL（TABLE-45・Issue #1722）。
+pub(crate) mod bit_distance;
 pub mod default_privileges_ddl;
 pub mod grant_ddl;
 pub(crate) mod halfvec_knn;
@@ -236,6 +237,7 @@ mod write_time_ledger_tests;
 // `SELECT DISTINCT`・`COUNT(DISTINCT <expr>)`（SQL-25 (c)・TASK-209）が共有する
 // 正準キー化・予算管理。`allowlist`（構文の脱糖先）と `aggregate`／`group_by`
 // （`Accumulator::CountDistinct` の予算管理）の双方から参照される。
+pub(crate) mod cte_explain;
 pub(crate) mod distinct;
 pub(crate) mod dml_from_returning;
 pub mod exec;

@@ -1460,6 +1460,10 @@ pub struct EngineCore {
     /// `~` 系（Issue #1787）等が束縛時に [`Self::regex_limits`] を取り出して
     /// [`crate::regex_match::CompiledRegex::compile`] へ渡す。
     regex_limits: crate::regex_limits::RegexLimits,
+    /// `SPARSEVEC(N)` 書き込み経路の非ゼロ要素数上限（Issue #2027・TABLE-47 (2) ポインタ）。
+    /// 差し替えは [`Self::with_sparsevec_limits`] のみ（起動時 1 回）。束縛クロージャを呼ぶ区間と
+    /// 文実行入口が [`Self::sparsevec_limits_scope`] で張り、`sql::parser::parse_sparsevec_literal` が読む。
+    sparsevec_limits: crate::sparsevec_limits::SparseVecLimits,
     /// サブクエリ深さ・実行回数・CTE 定義数・CTE 連鎖深さの上限（Issue #1552）。
     /// 差し替えは [`Self::with_nesting_limits`] のみ（起動時 1 回）。構文解析段と
     /// サブクエリ解決段にだけ効き、格納済みビュー本文の再パースはハード上限のまま。
@@ -1579,6 +1583,36 @@ pub struct EngineCore {
     #[cfg(test)]
     cte_join_budget_cap_for_test: Option<usize>,
 }
+/// NoSQL 表層 `search` の `metric` 省略時に、対象表の HNSW 宣言の opclass へ揃えた距離種別を
+/// 遅延して解決する値（Issue #2243・NOSQL-2・SQL-33 (7)）。束縛 closure に渡され、
+/// `EngineCore` の束縛済み検索入口が持つ `read_txn`（スキーマ取得と同じスナップショット）で解決する。
+/// 明示指定の要求は呼ばないため、カタログ読み取り失敗の影響を受けない。
+pub struct IndexMetricDefault<'a> {
+    /// `Declared` スコープの opt-in 時だけ `Some`（読み取り txn・ゲートキャッシュ・表名）。
+    lookup: Option<(
+        &'a redb::ReadTransaction,
+        &'a crate::catalog::IndexCatalogGateCache,
+        &'a str,
+    )>,
+}
+
+impl IndexMetricDefault<'_> {
+    /// 既定の距離種別を返す。opt-in なし・宣言なし・宣言集合に Cosine を含む場合は `Cosine`。
+    /// カタログの読み取りに失敗したら黙って `Cosine` に倒さず `XX000`（固定文言）で拒否する。
+    pub fn distance_kind(
+        &self,
+    ) -> Result<crate::sql::lexer::DistanceKind, crate::sql::allowlist::SqlSurfaceError> {
+        let Some((read_txn, gate_cache, table)) = self.lookup else {
+            return Ok(crate::sql::lexer::DistanceKind::Cosine);
+        };
+        let opclass = crate::catalog::hnsw_default_metric_in_txn(read_txn, gate_cache, table)
+            .map_err(|_| crate::sql::allowlist::SqlSurfaceError::Internal {
+                detail: "index catalog read failed".to_string(),
+            })?;
+        Ok(crate::sql::hnsw_cache::distance_kind_for_opclass(opclass))
+    }
+}
+
 /// [`EngineCore::hnsw_state`] が保持する状態束（Issue #408）。`provider` は
 /// [`crate::hnsw::provider::HnswSearchProvider`]（`Copy`）のコピーであり、
 /// `sql::hnsw_cache::search_or_fallback` が `effective_ef`／構築パラメータへ
@@ -3234,6 +3268,7 @@ impl EngineCore {
             function_limits: crate::function_limits::FunctionLimits::default(),
             jsonpath_limits: crate::jsonpath_limits::JsonPathLimits::default(),
             regex_limits: crate::regex_limits::RegexLimits::default(),
+            sparsevec_limits: crate::sparsevec_limits::SparseVecLimits::default(),
             nesting_limits: crate::nesting_limits::NestingLimits::default(),
             window_limits: crate::window_limits::WindowLimits::default(),
             join_limits: crate::join_limits::JoinSizeLimits::default(),
@@ -3656,6 +3691,28 @@ impl EngineCore {
         self.regex_limits
     }
 
+    /// `SPARSEVEC(N)` の非ゼロ数上限（[`crate::sparsevec_limits::SparseVecLimits`]）を差し替えた
+    /// ビルダーを返す（Issue #2027）。`wire-server` の起動時 CLI フラグ `--max-sparsevec-nnz` から
+    /// のみ呼ぶ。未呼び出しならハード上限と同値の既定。
+    pub fn with_sparsevec_limits(
+        mut self,
+        limits: crate::sparsevec_limits::SparseVecLimits,
+    ) -> Self {
+        self.sparsevec_limits = limits;
+        self
+    }
+
+    /// 現在の `SPARSEVEC` 非ゼロ数上限（Issue #2027）。
+    pub fn sparsevec_limits(&self) -> crate::sparsevec_limits::SparseVecLimits {
+        self.sparsevec_limits
+    }
+
+    /// 束縛区間（`sql::parser::bind_*` 呼び出し）に張る `SPARSEVEC` 上限スコープ。スコープが無い
+    /// 経路はハード上限へ戻り、下げた設定が効かない fail-open になるため、束縛を行う入口では必ず保持する。
+    pub(crate) fn sparsevec_limits_scope(&self) -> crate::sparsevec_limits::SparseVecLimitsScope {
+        crate::sparsevec_limits::SparseVecLimitsScope::enter(self.sparsevec_limits)
+    }
+
     /// サブクエリ深さ・実行回数・CTE 定義数・CTE 連鎖深さの上限
     /// （[`crate::nesting_limits::NestingLimits`]）を差し替えたビルダーを返す（Issue #1552）。
     /// `wire-server` の起動時 CLI フラグ（`--max-subquery-depth` 等）からのみ呼ぶ。
@@ -3781,6 +3838,9 @@ impl EngineCore {
         &self,
         bound: &crate::sql::parser::BoundStatement,
     ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+        // Issue #2243: 公開ビルダー `with_distance_kind` の誤用で非 Cosine が Hybrid・`precision` に
+        // 素通りしないよう、早期 return する `result_cap` 分岐より前で整合を検査する。
+        crate::sql::parser::check_bound_distance_kind(bound)?;
         // Issue #2242: `LIMIT` 省略（暗黙上限の印 `result_cap`）付きの計画は、`cap` が設定値と一致し、
         // 取得上限が `cap + 1`、`OFFSET` が検索上限以内のときだけ通す（印の偽装で巨大な取得上限を
         // 通す経路を作らない。`check_bound_scan_limit` と同型）。
@@ -7990,6 +8050,7 @@ impl EngineCore {
             crate::sql::jsonpath_fn::JsonPathLimitsScope::enter(self.jsonpath_limits);
         // Issue #1787: `~` 系の束縛が起動時 CLI の正規表現上限を焼き込めるよう同じ区間に張る。
         let _regex_limits_scope = crate::sql::regex_op::RegexLimitsScope::enter(self.regex_limits);
+        let _sparsevec_limits_scope = self.sparsevec_limits_scope();
         // TABLE-33・Issue #1575: TZ 無しの TIMESTAMPTZ リテラル束縛・DDL 既定値の正規化が読む
         // セッション TimeZone を文ごとに張る（`SET TIME ZONE; INSERT` の後続文が新しい値を見る）。
         let _session_tz_scope = session_time_zone_scope(session);
@@ -9210,6 +9271,7 @@ impl EngineCore {
             crate::sql::jsonpath_fn::JsonPathLimitsScope::enter(self.jsonpath_limits);
         // Issue #1787: `~` 系の束縛が起動時 CLI の正規表現上限を焼き込めるよう同じ区間に張る。
         let _regex_limits_scope = crate::sql::regex_op::RegexLimitsScope::enter(self.regex_limits);
+        let _sparsevec_limits_scope = self.sparsevec_limits_scope();
         // TABLE-33・Issue #1575: TZ 無しの TIMESTAMPTZ リテラル束縛・DDL 既定値の正規化が読む
         // セッション TimeZone を文ごとに張る（`SET TIME ZONE; INSERT` の後続文が新しい値を見る）。
         let _session_tz_scope = session_time_zone_scope(session);
@@ -10612,6 +10674,7 @@ impl EngineCore {
             crate::sql::jsonpath_fn::JsonPathLimitsScope::enter(self.jsonpath_limits);
         // Issue #1787: `~` 系の束縛が起動時 CLI の正規表現上限を焼き込めるよう同じ区間に張る。
         let _regex_limits_scope = crate::sql::regex_op::RegexLimitsScope::enter(self.regex_limits);
+        let _sparsevec_limits_scope = self.sparsevec_limits_scope();
         // TABLE-33・Issue #1575: TZ 無しの TIMESTAMPTZ リテラル束縛・DDL 既定値の正規化が読む
         // セッション TimeZone を文ごとに張る（`SET TIME ZONE; INSERT` の後続文が新しい値を見る）。
         let _session_tz_scope = session_time_zone_scope(session);
@@ -11352,6 +11415,7 @@ impl EngineCore {
             crate::sql::jsonpath_fn::JsonPathLimitsScope::enter(self.jsonpath_limits);
         // Issue #1787: `~` 系の束縛が起動時 CLI の正規表現上限を焼き込めるよう同じ区間に張る。
         let _regex_limits_scope = crate::sql::regex_op::RegexLimitsScope::enter(self.regex_limits);
+        let _sparsevec_limits_scope = self.sparsevec_limits_scope();
         // TABLE-33・Issue #1575: TZ 無しの TIMESTAMPTZ リテラル束縛・DDL 既定値の正規化が読む
         // セッション TimeZone を文ごとに張る（`SET TIME ZONE; INSERT` の後続文が新しい値を見る）。
         let _session_tz_scope = session_time_zone_scope(session);
@@ -11828,6 +11892,11 @@ impl EngineCore {
                 // 走査分類を段の木で報告する（[`Self::run_set_operation_explain`] 参照）。
                 crate::sql::allowlist::ExplainTarget::SetOperation(validated) => {
                     self.run_set_operation_explain(&validated, session)
+                }
+                // Issue #2048（SQL-75 (2) ポインタ）: インライン展開の CTE・派生表。畳み込み後の文の
+                // 束縛結果だけから `cte` 段の木を報告する（[`Self::run_cte_explain`] 参照）。
+                crate::sql::allowlist::ExplainTarget::Cte(validated) => {
+                    self.run_cte_explain(&validated, session)
                 }
             },
             // Issue #929（SQL-29 (c)・RLS-10 (b)・TASK-213）: 集合演算は複数枝
@@ -12936,10 +13005,42 @@ impl EngineCore {
             crate::sql::allowlist::SqlSurfaceError,
         >,
     {
+        self.execute_bound_search_with_index_metric_in_session(
+            ctx,
+            session,
+            table,
+            |schema, udfs, _index_metric| bind(schema, udfs),
+        )
+    }
+
+    /// [`Self::execute_bound_search_in_session`] に、索引の opclass に従う既定の距離種別の解決
+    /// ([`IndexMetricDefault`]) を `bind` へ渡す形を加えた入口（Issue #2243・NOSQL-2・SQL-33 (7)）。
+    /// NoSQL 表層 `search` の `metric` 省略時に、`bind` が [`IndexMetricDefault::distance_kind`] を
+    /// 呼んで `BoundStatement::with_distance_kind` へ渡す。解決は `bind` と同じ `read_txn`
+    /// スナップショットで行う。処理順（権限検査 → 関数 ACL → 束縛 → 表一致 → 検索形検査 → 実行）と
+    /// RLS 暗黙適用は既存入口と同一。
+    pub fn execute_bound_search_with_index_metric_in_session<F>(
+        &self,
+        ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
+        table: &str,
+        bind: F,
+    ) -> Result<crate::sql::exec::QueryResult, crate::sql::allowlist::SqlSurfaceError>
+    where
+        F: FnOnce(
+            &crate::catalog::TableSchema,
+            &crate::sql::udf_call::UdfRegistry,
+            &IndexMetricDefault<'_>,
+        ) -> Result<
+            crate::sql::parser::BoundStatement,
+            crate::sql::allowlist::SqlSurfaceError,
+        >,
+    {
         self.require_table_select_privilege(ctx, session, table)?;
         let _function_acl_scope = self.function_acl_scope(ctx, session)?;
         let (read_txn, schema) = self.read_txn_with_schema(table)?;
-        let bound = bind(&schema, session.udfs())?;
+        let index_metric = self.index_metric_default(&read_txn, table);
+        let bound = bind(&schema, session.udfs(), &index_metric)?;
         if bound.table() != table {
             return Err(crate::sql::allowlist::SqlSurfaceError::invalid_input(
                 "bound search plan targets a different table than requested",
@@ -12953,6 +13054,21 @@ impl EngineCore {
             &bound,
             session.hnsw_search_settings(),
         )
+    }
+
+    /// 対象表の既定距離種別の解決器を作る（Issue #2243）。opt-in なし（`hnsw_state` が `None`）と
+    /// `HnswScope::All`（暗黙のコサイン HNSW を含むため実効 metric 集合に `Cosine` が入る）は
+    /// カタログに触れず `Cosine`。`Declared` のときだけ宣言の opclass を遅延して読む。
+    fn index_metric_default<'a>(
+        &'a self,
+        read_txn: &'a redb::ReadTransaction,
+        table: &'a str,
+    ) -> IndexMetricDefault<'a> {
+        IndexMetricDefault {
+            lookup: (self.hnsw_state.is_some()
+                && self.hnsw_scope == crate::search_engine::HnswScope::Declared)
+                .then_some((read_txn, &self.index_catalog_gate_cache, table)),
+        }
     }
 
     /// 束縛済み `plan` 検索（NoSQL 表層 `search` op の `plan` 指定。TASK-175・
@@ -14061,10 +14177,135 @@ impl EngineCore {
         session: &crate::sql::mode::SessionState,
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
         let (read_txn, schema) = self.read_txn_with_schema(validated.table_name())?;
-        let bound = crate::sql::parser::bind_aggregate(validated, &schema, session.udfs())?;
-        Ok(crate::sql::SqlOutcome::Explain(
-            self.aggregate_explain_from_bound(&read_txn, &schema, &bound),
-        ))
+        // Issue #2048: WHERE に部分クエリがあれば、内側を実行せず静的検証して `subquery` 段を子に足す。
+        // 外側は部分クエリ述語を索引に使えないフィルタとみなして束縛・分類する（部分クエリが無い文の
+        // 出力は従来とバイト単位で同一）。
+        let has_subqueries = validated
+            .where_predicates()
+            .iter()
+            .any(crate::sql::subquery::predicate_contains_subquery);
+        let mut specs = Vec::new();
+        let mut owned;
+        let outer = if has_subqueries {
+            let items = crate::sql::subquery::explain_subquery_predicates(
+                validated.where_predicates(),
+                &schema,
+                &read_txn,
+                &self.storage,
+                session.udfs(),
+                self.nesting_limits,
+                self.result_limits,
+            )?;
+            specs = Self::subquery_specs(&read_txn, items)?;
+            // 部分クエリを含む `OR` の通常述語は表示用の置換で落ちるため、別に束縛だけ検証する
+            // （未知列等の `42703` を非 EXPLAIN の文と揃える。結果は捨てる）。
+            let mut check = validated.clone();
+            check.where_predicates =
+                crate::sql::subquery::static_validation_predicates(validated.where_predicates());
+            crate::sql::parser::bind_aggregate(&check, &schema, session.udfs())?;
+            owned = validated.clone();
+            owned.where_predicates =
+                crate::sql::subquery::explain_outer_predicates(validated.where_predicates());
+            &owned
+        } else {
+            validated
+        };
+        let bound = crate::sql::parser::bind_aggregate(outer, &schema, session.udfs())?;
+        let lines = self.aggregate_explain_lines_from_bound(&read_txn, &schema, &bound);
+        let node = crate::sql::cte_explain::with_subqueries(lines, specs)
+            .map_err(Self::explain_tree_error)?;
+        Ok(crate::sql::SqlOutcome::Explain(node.into_query_result()))
+    }
+
+    /// WHERE の部分クエリの収集結果（[`crate::sql::subquery::explain_sink::SubqueryExplain`]）を、
+    /// 走査分類の行つきの段の記述へ変換する（Issue #2048）。内側の広域取得は単一表の広域取得
+    /// `EXPLAIN` と共有の [`Self::scan_explain_lines`]（内側の実行器 `execute_inner_scan_statement`
+    /// も同じ `sql::scan::execute_scan` を通る）。内側の集計形は実行器
+    /// `execute_inner_aggregate_statement` がキャッシュ・索引を渡さない事実に合わせて全走査に固定する
+    /// （集合演算の集計枝と同じ分類。**実行器が変わるときはこの分類も一緒に変えること**）。
+    fn subquery_specs(
+        read_txn: &redb::ReadTransaction,
+        items: Vec<crate::sql::subquery::explain_sink::SubqueryExplain>,
+    ) -> Result<
+        Vec<crate::sql::cte_explain::SubqueryStageSpec>,
+        crate::sql::allowlist::SqlSurfaceError,
+    > {
+        use crate::sql::cte_explain::{InnerStageSpec, SubqueryStageSpec};
+        use crate::sql::subquery::explain_sink::ExplainInner;
+        items
+            .into_iter()
+            .map(|item| {
+                let inner = match item.inner {
+                    ExplainInner::Scan { schema, bound } => {
+                        let gins = Self::gin_decls_for_explain(read_txn, &bound)?;
+                        InnerStageSpec::Scan {
+                            lines: Self::scan_explain_lines(&schema, &bound, &gins),
+                        }
+                    }
+                    ExplainInner::Aggregate { shape } => InnerStageSpec::Aggregate {
+                        shape,
+                        lines: crate::sql::set_op::aggregate_branch_explain_lines(),
+                    },
+                };
+                Ok(SubqueryStageSpec {
+                    kind: item.kind,
+                    inner,
+                    children: Self::subquery_specs(read_txn, item.children)?,
+                })
+            })
+            .collect()
+    }
+
+    /// CTE・派生表（インライン展開で畳み込まれた形）の `EXPLAIN`（Issue #2048・SQL-75 (2)(5)(6)
+    /// ポインタ）。`Statement::Explain` アームから呼ばれ、非 EXPLAIN と同じ畳み込み後の文を単一表の
+    /// 広域取得・集計と同じ束縛（`bind_scan_with_dummy_flags`／`bind_aggregate`）と走査分類で報告する
+    /// ので、束縛エラーの `wire_code` と順序が一致する。走査・キャッシュ・台帳・世代・書き込みロック
+    /// には触れず、CTE 名・行数等のテナント存在情報も出さない。
+    fn run_cte_explain(
+        &self,
+        validated: &crate::sql::allowlist::ValidatedCteExplain,
+        session: &crate::sql::mode::SessionState,
+    ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        use crate::sql::allowlist::CteExplainMain;
+        use crate::sql::cte_explain::CteMainShape;
+        let (lines, shape) = match &validated.main {
+            CteExplainMain::Scan(v) => {
+                let (read_txn, schema) = self.read_txn_with_schema(v.table_name())?;
+                let bound = crate::sql::parser::bind_scan_with_dummy_flags(
+                    v,
+                    &schema,
+                    session.udfs(),
+                    &[],
+                    &self.result_limits,
+                )?;
+                let gins = Self::gin_decls_for_explain(&read_txn, &bound)?;
+                let shape = CteMainShape {
+                    has_limit: !v.limit_implicit,
+                    has_offset: bound.offset != 0,
+                    sort_keys: bound.order_by.len(),
+                    aggregate: None,
+                };
+                (Self::scan_explain_lines(&schema, &bound, &gins), shape)
+            }
+            CteExplainMain::Aggregate(v) => {
+                let (read_txn, schema) = self.read_txn_with_schema(v.table_name())?;
+                let bound = crate::sql::parser::bind_aggregate(v, &schema, session.udfs())?;
+                let grouped = bound.group_by.as_ref();
+                let shape = CteMainShape {
+                    has_limit: grouped.is_some_and(|g| g.limit.is_some()),
+                    has_offset: grouped.is_some_and(|g| g.offset != 0),
+                    sort_keys: grouped.map_or(0, |g| g.order_by.len()),
+                    aggregate: Some(crate::sql::set_op::aggregate_shape(&bound)),
+                };
+                (
+                    self.aggregate_explain_lines_from_bound(&read_txn, &schema, &bound),
+                    shape,
+                )
+            }
+        };
+        let node = crate::sql::cte_explain::cte_inline_tree(validated.source, &shape, lines)
+            .map_err(Self::explain_tree_error)?;
+        Ok(crate::sql::SqlOutcome::Explain(node.into_query_result()))
     }
 
     /// 束縛済み集計計画（[`crate::sql::parser::BoundAggregate`]）から
@@ -14107,6 +14348,20 @@ impl EngineCore {
         schema: &crate::catalog::TableSchema,
         bound: &crate::sql::parser::BoundAggregate,
     ) -> crate::sql::exec::QueryResult {
+        crate::sql::explain_tree::ExplainNode::leaf(
+            self.aggregate_explain_lines_from_bound(read_txn, schema, bound),
+        )
+        .into_query_result()
+    }
+
+    /// [`Self::aggregate_explain_from_bound`] の行生成部（Issue #2048）。CTE・部分クエリの
+    /// `EXPLAIN` が `scan` 節に載せる行も、この関数が作る（第 2 の分類実装を持たない）。
+    fn aggregate_explain_lines_from_bound(
+        &self,
+        read_txn: &redb::ReadTransaction,
+        schema: &crate::catalog::TableSchema,
+        bound: &crate::sql::parser::BoundAggregate,
+    ) -> Vec<String> {
         let target = crate::sql::scalar_index::resolve_scalar_index_target_in_txn(
             read_txn,
             &schema.name,
@@ -14169,11 +14424,12 @@ impl EngineCore {
         } else {
             crate::sql::explain::ExplainIndexNames::default()
         };
-        crate::sql::explain::build_relational_explain_result(
+        crate::sql::explain::relational_explain_lines(
             scalar_plan,
             scalar_fallback,
             access_path,
             &index_names,
+            &[],
         )
     }
 
@@ -14190,17 +14446,57 @@ impl EngineCore {
         session: &crate::sql::mode::SessionState,
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
         let (read_txn, schema) = self.read_txn_with_schema(validated.table_name())?;
+        // Issue #2048: WHERE に部分クエリがあれば、内側を実行せず静的検証して `subquery` 段を子に足す。
+        // 外側は部分クエリ述語を索引に使えないフィルタとみなして束縛・分類する（部分クエリが無い文の
+        // 出力は従来とバイト単位で同一）。
+        let has_subqueries = validated
+            .where_predicates()
+            .iter()
+            .any(crate::sql::subquery::predicate_contains_subquery);
+        let mut specs = Vec::new();
+        let mut owned;
+        let outer = if has_subqueries {
+            let items = crate::sql::subquery::explain_subquery_predicates(
+                validated.where_predicates(),
+                &schema,
+                &read_txn,
+                &self.storage,
+                session.udfs(),
+                self.nesting_limits,
+                self.result_limits,
+            )?;
+            specs = Self::subquery_specs(&read_txn, items)?;
+            // 部分クエリを含む `OR` の通常述語は表示用の置換で落ちるため、別に束縛だけ検証する
+            // （未知列等の `42703` を非 EXPLAIN の文と揃える。結果は捨てる）。
+            let mut check = validated.clone();
+            check.where_predicates =
+                crate::sql::subquery::static_validation_predicates(validated.where_predicates());
+            crate::sql::parser::bind_scan_with_dummy_flags(
+                &check,
+                &schema,
+                session.udfs(),
+                &[],
+                &self.result_limits,
+            )?;
+            owned = validated.clone();
+            owned.where_predicates =
+                crate::sql::subquery::explain_outer_predicates(validated.where_predicates());
+            &owned
+        } else {
+            validated
+        };
         let bound = crate::sql::parser::bind_scan_with_dummy_flags(
-            validated,
+            outer,
             &schema,
             session.udfs(),
             &[],
             &self.result_limits,
         )?;
         let gins = Self::gin_decls_for_explain(&read_txn, &bound)?;
-        Ok(crate::sql::SqlOutcome::Explain(Self::scan_explain_result(
-            &schema, &bound, &gins,
-        )))
+        let lines = Self::scan_explain_lines(&schema, &bound, &gins);
+        let node = crate::sql::cte_explain::with_subqueries(lines, specs)
+            .map_err(Self::explain_tree_error)?;
+        Ok(crate::sql::SqlOutcome::Explain(node.into_query_result()))
     }
 
     /// JOIN の `EXPLAIN`（Issue #2046・SQL-75 (2)(5)(6) ポインタ）。`Statement::Explain` アームから
@@ -14215,11 +14511,12 @@ impl EngineCore {
         session: &crate::sql::mode::SessionState,
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
         use crate::sql::allowlist::SqlSurfaceError;
-        // EXPLAIN の構文段は CTE 入力を作らない（`EXPLAIN WITH` は `42601`）。到達は契約違反のみ。
+        // Issue #2048: CTE・派生表を入力にする JOIN は構文段（`explain_cte_target`）が `42601` で
+        // 拒否するため通常は到達しない。到達しても `Internal` ではなく固定文の `42601` で拒否する。
         if validated.cte_inputs.is_some() {
-            return Err(SqlSurfaceError::Internal {
-                detail: "EXPLAIN for a JOIN with CTE inputs is not supported".to_string(),
-            });
+            return Err(SqlSurfaceError::unsupported(
+                "EXPLAIN is not supported for a JOIN with CTE or derived table inputs",
+            ));
         }
         let names = crate::sql::join::collect_join_tables(validated);
         let (read_txn, schemas) = self.read_txn_with_schemas(&names)?;
@@ -14579,9 +14876,38 @@ impl EngineCore {
             crate::sql::allowlist::SqlSurfaceError,
         >,
     {
+        self.explain_bound_search_with_index_metric_in_session(
+            ctx,
+            session,
+            table,
+            |schema, udfs, _index_metric| bind(schema, udfs),
+        )
+    }
+
+    /// [`Self::explain_bound_search_in_session`] の既定距離種別解決付き版（Issue #2243）。
+    /// [`Self::execute_bound_search_with_index_metric_in_session`] と同じ束縛・同じエラー分類順で、
+    /// 実行本体の代わりに `EXPLAIN` 結果を返す。
+    pub fn explain_bound_search_with_index_metric_in_session<F>(
+        &self,
+        ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
+        table: &str,
+        bind: F,
+    ) -> Result<crate::sql::exec::QueryResult, crate::sql::allowlist::SqlSurfaceError>
+    where
+        F: FnOnce(
+            &crate::catalog::TableSchema,
+            &crate::sql::udf_call::UdfRegistry,
+            &IndexMetricDefault<'_>,
+        ) -> Result<
+            crate::sql::parser::BoundStatement,
+            crate::sql::allowlist::SqlSurfaceError,
+        >,
+    {
         self.require_table_select_privilege(ctx, session, table)?;
         let (read_txn, schema) = self.read_txn_with_schema(table)?;
-        let bound = bind(&schema, session.udfs())?;
+        let index_metric = self.index_metric_default(&read_txn, table);
+        let bound = bind(&schema, session.udfs(), &index_metric)?;
         if bound.table() != table {
             return Err(crate::sql::allowlist::SqlSurfaceError::invalid_input(
                 "bound search plan targets a different table than requested",
@@ -14810,6 +15136,7 @@ impl EngineCore {
                     stmt_start_micros: now,
                 },
             );
+            let _sparsevec_limits_scope = self.sparsevec_limits_scope();
             let bounds = bind(&schema)?;
             (bounds, crate::sql::time_fn::ledger_evaluated_at())
         };
@@ -15399,6 +15726,7 @@ impl EngineCore {
 
         // 判定 2・3: スキーマ取得 → 束縛（同一 read_txn 下）。
         let (read_txn, schema) = self.read_txn_with_schema(table)?;
+        let _sparsevec_limits_scope = self.sparsevec_limits_scope();
         let bound = bind(&schema)?;
         if bound.table != table || bound.operation_id.as_ref() != operation_id {
             // `bound.operation_id` は判定 1 の早期ガードと独立に `bind` closure
@@ -15577,6 +15905,7 @@ impl EngineCore {
 
         // 判定 2・3: スキーマ取得 → 束縛（同一 read_txn 下）。
         let (read_txn, schema) = self.read_txn_with_schema(table)?;
+        let _sparsevec_limits_scope = self.sparsevec_limits_scope();
         let (assignments, where_predicates) = bind(&schema)?;
         // 判定 4: wire 表層が生成しない述語形への多層防御（空列を含む）。
         reject_unsupported_predicate_dml_forms(&where_predicates)?;
@@ -15644,6 +15973,7 @@ impl EngineCore {
             .map_err(|_| crate::sql::allowlist::SqlSurfaceError::MissingOperationId)?;
 
         let (read_txn, schema) = self.read_txn_with_schema(table)?;
+        let _sparsevec_limits_scope = self.sparsevec_limits_scope();
         let where_predicates = bind(&schema)?;
         reject_unsupported_predicate_dml_forms(&where_predicates)?;
         drop(read_txn);
@@ -15714,6 +16044,7 @@ impl EngineCore {
             crate::sql::partitioned::apply_chunk_override(&clause, &self.partitioned_dml_limits)?;
 
         let (read_txn, schema) = self.read_txn_with_schema(table)?;
+        let _sparsevec_limits_scope = self.sparsevec_limits_scope();
         let (assignments, where_predicates) = bind(&schema)?;
         reject_unsupported_predicate_dml_forms(&where_predicates)?;
         drop(read_txn);
@@ -15771,6 +16102,7 @@ impl EngineCore {
             crate::sql::partitioned::apply_chunk_override(&clause, &self.partitioned_dml_limits)?;
 
         let (read_txn, schema) = self.read_txn_with_schema(table)?;
+        let _sparsevec_limits_scope = self.sparsevec_limits_scope();
         let where_predicates = bind(&schema)?;
         reject_unsupported_predicate_dml_forms(&where_predicates)?;
         drop(read_txn);
@@ -16941,6 +17273,7 @@ impl EngineCore {
                 })?,
         };
         self.reject_index_derived_conflict_constraint(&stmt.table_name, stmt.on_conflict.as_ref())?;
+        let _sparsevec_limits_scope = self.sparsevec_limits_scope();
         let bound = crate::sql::parser::bind_insert_form(stmt, &schema)?;
         match bound {
             crate::sql::parser::BoundInsertForm::Row(bound) => {
@@ -17047,6 +17380,7 @@ impl EngineCore {
                 detail: "execute_insert_returning_form called without RETURNING".to_string(),
             })?;
         self.reject_index_derived_conflict_constraint(&stmt.table_name, stmt.on_conflict.as_ref())?;
+        let _sparsevec_limits_scope = self.sparsevec_limits_scope();
         let bound = crate::sql::parser::bind_insert_form(stmt, &schema)?;
         match bound {
             crate::sql::parser::BoundInsertForm::Row(bound) => {
@@ -17526,6 +17860,7 @@ impl EngineCore {
             txn_start_micros: provisional,
             stmt_start_micros: provisional,
         });
+        let _sparsevec_limits_scope = self.sparsevec_limits_scope();
         let bound = bind()?;
         let hash = hash_fn()?;
         if !scope.was_used() {
@@ -17562,6 +17897,7 @@ impl EngineCore {
                     txn_start_micros: t,
                     stmt_start_micros: t,
                 });
+                let _sparsevec_limits_scope = self.sparsevec_limits_scope();
                 let bound = bind()?;
                 Ok((bound, hash, Some(t)))
             }
@@ -17644,6 +17980,7 @@ impl EngineCore {
                         stmt_start_micros: now,
                     },
                 );
+                let _sparsevec_limits_scope = self.sparsevec_limits_scope();
                 crate::sql::parser::bind_predicate_update(stmt, &schema, udfs)?;
                 let assignment_refs: Vec<(&str, &crate::sql::allowlist::SetValue)> = stmt
                     .assignments()
@@ -17920,6 +18257,7 @@ impl EngineCore {
         };
         let bound = {
             let set_columns: Vec<&str> = stmt.assignments.iter().map(|(n, _)| n.as_str()).collect();
+            let _sparsevec_limits_scope = self.sparsevec_limits_scope();
             let _defer = self.defer_not_null_scope_for_update(ctx, &schema.name, &set_columns);
             crate::sql::parser::bind_update(stmt, &schema)?
         };
@@ -17998,6 +18336,7 @@ impl EngineCore {
                         p.assignments().iter().map(|(n, _)| n.as_str()).collect()
                     }
                 };
+                let _sparsevec_limits_scope = self.sparsevec_limits_scope();
                 let _defer = self.defer_not_null_scope_for_update(ctx, &schema.name, &set_columns);
                 crate::sql::parser::bind_update_form(stmt, &schema, session.udfs())?
             };
@@ -18137,6 +18476,7 @@ impl EngineCore {
             })?;
         match stmt {
             ValidatedUpdateForm::Single(_) => {
+                let _sparsevec_limits_scope = self.sparsevec_limits_scope();
                 let bound = crate::sql::parser::bind_update_form(stmt, &schema, session.udfs())?;
                 let crate::sql::parser::BoundUpdateForm::Single(bound) = bound else {
                     return Err(crate::sql::allowlist::SqlSurfaceError::Internal {
@@ -18160,6 +18500,7 @@ impl EngineCore {
                         &target, ctx, session, stmt, &schema,
                     )?,
                 };
+                let _sparsevec_limits_scope = self.sparsevec_limits_scope();
                 let (bound, content_hash_value, legacy_hashes) = Self::prepare_predicate_update(
                     resolved.as_ref().unwrap_or(validated),
                     validated,
@@ -18227,6 +18568,7 @@ impl EngineCore {
                 .iter()
                 .map(|(n, _)| n.as_str())
                 .collect();
+            let _sparsevec_limits_scope = self.sparsevec_limits_scope();
             let _defer = triggers.and_then(|_| {
                 self.defer_not_null_scope_for_update(ctx, &schema.name, &set_columns)
             });
@@ -18391,6 +18733,7 @@ impl EngineCore {
                 &stmt.table_name,
                 stmt.on_conflict.as_ref(),
             )?;
+            let _sparsevec_limits_scope = self.sparsevec_limits_scope();
             let bound = crate::sql::parser::bind_insert_form(&stmt, &schema)?;
             match bound {
                 crate::sql::parser::BoundInsertForm::File(file_bound) => {

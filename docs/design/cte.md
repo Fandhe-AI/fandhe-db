@@ -112,7 +112,7 @@ CTE は原則として実体化しない（インライン展開。明示 `MATER
 
 - サブクエリ、集合演算（別 Issue の対象）。CTE を JOIN の入力にする併用は Issue #1861 で対応済み
   （セッションの最上位 SELECT の入口に限る。末尾の「Issue #1861 追記」節）。
-- 順位付き（`ORDER BY <=>`／`USING PLAN`）・`EXPLAIN` の主クエリで
+- 順位付き（`ORDER BY <=>`／`USING PLAN`）の主クエリで
   CTE を参照すること（VIEW と同じスコープ縮小。集計は Issue #1191 で対応済み。
   ベクトル順位付き主クエリはキャッシュ・precision 契約への影響が未検証のため
   fail-closed で `42601` を維持した）。
@@ -371,7 +371,9 @@ CTE 本文の集計・`GROUP BY`・`SELECT DISTINCT`・ウィンドウ関数を�
 - 引き継ぐ制限（固定文言の `0A000`。文言は CTE 前提のまま）: 集計本文の派生表を JOIN 入力にすること、
   非バイト列順の照合を持つ表を読む本文、層を導出できない述語を持つ先行 CTE 読み。入れ子の内側が
   `ORDER BY`／`LIMIT`／集計・窓を持つ場合も、外側の合成 CTE からの参照は `0A000`。
-- `EXPLAIN`: 先頭が `SELECT` でないため派生表のゲートに入らず、CTE と同じく `42601`（JOIN・入れ子とも対象外）。
+- `EXPLAIN`: Issue #2048 で、FROM 直後の単一の派生表（入れ子を含む）はインライン展開の合成 CTE として受理する
+  （`cte_source: derived_table`。[explain-search-engine-exposure.md](explain-search-engine-exposure.md) の #2048 追記）。
+  JOIN の入力になる派生表は従来どおり `42601`。
 - RLS-10 (b): 派生表は参照したセッションの `PolicyContext`・同一 `read_txn` の slot だけで評価され、別名が実表名と
   同じでも実表は読まれない。エラーは行・テナントに依存せず、内部名（`?derived`）は文言・結果列名に出ない。
 
@@ -389,3 +391,12 @@ CTE 本文の集計・`GROUP BY`・`SELECT DISTINCT`・ウィンドウ関数を�
   として比較され、どの行にも一致する形で切り詰めない。テナント境界の検査は変更しない。
 - 残置: `materialized_cte_statement` の `outer_may_evaluate_pseudo_id` によるインライン展開への
   回避は残す（撤去は型公告差の扱いを含む別判断）。
+
+## Issue #2048 追記: EXPLAIN での表示
+
+`EXPLAIN WITH ...` は、インライン展開で単一表の広域取得・集計に畳み込まれる非再帰 CTE を受理し、`cte` 段
+（`cte_source: with`・`cte_mode: inline`）の下に畳み込み後の段を返す（詳細は
+[explain-search-engine-exposure.md](explain-search-engine-exposure.md) の #2048 追記）。`WITH RECURSIVE`・具体化経路
+（`MATERIALIZED`・本文に `ORDER BY`／`LIMIT` を持つ CTE）・JOIN／集合演算の入力になる CTE・主クエリに部分クエリを持つ形は
+従来どおり `42601`、データ変更 CTE は `0A000`（書き込みなし）。上の「`EXPLAIN` での表示は対象外」の記述のうち、
+インライン展開の範囲は本追記で更新された。
