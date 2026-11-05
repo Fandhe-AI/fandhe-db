@@ -9897,6 +9897,12 @@ pub struct BoundScan {
     /// 同値を加えた件数が超えたら結果を打ち切らず `54000`。`None` は通常の `LIMIT`。
     /// [`Self::new`]（NoSQL 表層）は常に `None`。
     pub(crate) ties_row_cap: Option<usize>,
+    /// キーセットモード（Issue #2093・NOSQL-23・SQL-25）。`Some` のとき [`Self::order_by`] は
+    /// 「利用者の `sort` キー ＋ 末尾キー（PK 列、PK なし表は物理 rowid）」で、`sql::scan` は
+    /// 述語「位置より出力順で後ろ」と `limit + 1` 件目の存在判定による次位置の生成を行う。
+    /// SQL テキスト経由の [`bind_scan`] と [`Self::new`] は常に `None`（既存経路は不変）。
+    /// [`Self::with_after`] だけが設定する。
+    pub(crate) keyset: Option<crate::sql::keyset::BoundKeyset>,
 }
 
 /// 広域取得の式キーの `(束縛済み式, コンパイル済みプログラム)` 列（[`BoundScan::order_exprs`]）。
@@ -10060,6 +10066,55 @@ fn bind_order_column_at(
         nulls: NullPlacement::pg_default(descending),
         collation,
     })
+}
+
+/// キーセットモードの末尾キー（Issue #2093）を束縛する。宣言 PRIMARY KEY があればその全列を
+/// 宣言順・昇順で、無ければ物理 rowid（疑似列 `id` と同じ物理キー。採番方式の表では応答に出ない
+/// rowid を、従来方式の表では `id` を指す）を 1 キーとして返す。PK 列は NOT NULL のため NULL 位置は
+/// 実際には現れない。`BYTEA` の PK 列は利用者向けの `ORDER BY` では拒否される型だが、末尾専用に
+/// バイト列順で束縛する（`sql::order_value::extract_column_order_value_ref` の専用腕が対応）。
+pub(crate) fn bind_keyset_tail(
+    schema: &TableSchema,
+) -> Result<Vec<BoundOrderKey>, SqlSurfaceError> {
+    let Some(pk) = schema.primary_key() else {
+        return Ok(vec![BoundOrderKey {
+            target: BoundOrderTarget::Id,
+            kind: OrderKind::Id,
+            descending: false,
+            nulls: NullPlacement::pg_default(false),
+            collation: crate::collation::Collation::DEFAULT,
+        }]);
+    };
+    let mut tail = Vec::new();
+    tail.try_reserve(pk.len())
+        .map_err(|e| SqlSurfaceError::Internal {
+            detail: format!("failed to reserve keyset tail keys: {e}"),
+        })?;
+    for name in pk {
+        let index = schema
+            .columns
+            .iter()
+            .position(|c| &c.name == name)
+            .ok_or_else(|| SqlSurfaceError::Internal {
+                detail: "primary key column missing from the schema".to_string(),
+            })?;
+        let is_bytea = matches!(
+            schema.columns.get(index).map(|c| &c.ty),
+            Some(ColumnType::Bytea)
+        );
+        if is_bytea {
+            tail.push(BoundOrderKey {
+                target: BoundOrderTarget::Column(index),
+                kind: OrderKind::Bytes,
+                descending: false,
+                nulls: NullPlacement::pg_default(false),
+                collation: crate::collation::Collation::DEFAULT,
+            });
+        } else {
+            tail.push(bind_order_column_at(schema, index, false)?);
+        }
+    }
+    Ok(tail)
 }
 
 /// 式キーの静的型から比較規約を決める（Issue #1188）。`VECTOR` 値の式は VECTOR 列を
@@ -10615,6 +10670,7 @@ impl BoundScan {
             result_cap: None,
             order_exprs: Vec::new(),
             ties_row_cap: None,
+            keyset: None,
             // Issue #915・SQL-25: `Self::new` 単体は既存契約どおり常に空。
             // NoSQL `sort`（NOSQL-15・Issue #946）を付与する場合は呼び出し元が
             // 続けて `with_order_by` を呼ぶ（builder 形。シグネチャは変えない）。
@@ -10662,7 +10718,48 @@ impl BoundScan {
                 "too many scalar ORDER BY keys",
             ));
         }
+        // キーセットの末尾キーを足した後に利用者キーを差し替えると、末尾の位置づけ
+        // （`BoundKeyset::user_key_count`）が壊れるため fail-closed で拒否する。
+        if self.keyset.is_some() {
+            return Err(SqlSurfaceError::unsupported(
+                "ORDER BY cannot be changed after the keyset position is set",
+            ));
+        }
         self.order_by = bind_scalar_order_by(keys, schema)?;
+        Ok(self)
+    }
+
+    /// キーセットモード（「直前ページの最終行より後ろ」。Issue #2093・NOSQL-23・SQL-25）を
+    /// 設定した [`Self`] を返す。[`Self::with_order_by`] の後に 1 回だけ呼ぶ builder で、
+    /// wire-server の NoSQL 表層（`after`／`next_cursor`。Issue #2094）が呼び出し元。
+    ///
+    /// 順序は「利用者の `sort` キー ＋ 末尾キー」の辞書式になる。末尾キーは宣言 PRIMARY KEY の
+    /// 全列（宣言順・昇順）、PK を持たない表は物理 rowid で、`0A000` で拒否しない。これによりテナント内で
+    /// 全順序が確定する。`after = None` はキーセットの 1 ページ目（述語なし・次位置を返す）。
+    /// `after = Some(..)` は位置の形・型を拡張後の順序仕様と照合し、不一致は `22000`（値を含まない
+    /// 固定文言）。`offset`／`WITH TIES`／ウィンドウ／暗黙行数上限との併用は `42601`
+    /// （実行時にも再検査する多層防御。`offset` は本 builder の後に設定されうるため）。
+    pub fn with_after(
+        mut self,
+        after: Option<crate::sql::keyset::KeysetPosition>,
+        schema: &TableSchema,
+    ) -> Result<Self, SqlSurfaceError> {
+        if self.keyset.is_some() {
+            return Err(SqlSurfaceError::unsupported(
+                "the keyset position can be set only once",
+            ));
+        }
+        crate::sql::keyset::check_combination(&self)?;
+        let user_key_count = self.order_by.len();
+        let tail = bind_keyset_tail(schema)?;
+        self.order_by.extend(tail);
+        if let Some(position) = &after {
+            crate::sql::keyset::check_position_shape(&self.order_by, user_key_count, position)?;
+        }
+        self.keyset = Some(crate::sql::keyset::BoundKeyset {
+            user_key_count,
+            after,
+        });
         Ok(self)
     }
 
@@ -12198,6 +12295,7 @@ pub(crate) fn bind_scan_with_dummy_flags(
         } else {
             None
         },
+        keyset: None,
     })
 }
 
