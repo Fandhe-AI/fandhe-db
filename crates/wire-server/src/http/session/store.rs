@@ -107,6 +107,9 @@ struct Entry {
     /// 発行時に宣言されたスコープ（HTTP-15・Issue #2100。省略は `None`＝全権限）。発行時に 1 回だけ
     /// 確定し以後変化しない（setter なし）。強制は `POST /v1/query` の手順 5c（Issue #2101）。
     scope: Option<Arc<SessionScope>>,
+    /// 認証済みユーザー名（Issue #2094。scan の不透明カーソルを認証主体へ束縛する AAD の入力。
+    /// 発行経路が与えない場合は `None`）。`Debug` へ出さない。
+    user: Option<String>,
     issued_at: Instant,
     _permit: SessionPermit,
 }
@@ -129,7 +132,7 @@ impl fmt::Debug for SessionRole {
 /// [`SessionStore::lookup_grant`] が返す、テナント境界と DDL 実行権限の対
 /// （HTTP セッション認証ミドルウェアが両方を 1 回の照会で読む入口。
 /// NOSQL-13・TASK-207、Issue #910）。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct SessionGrant {
     pub ctx: engine::policy::PolicyContext,
     pub ddl_allowed: bool,
@@ -137,6 +140,17 @@ pub struct SessionGrant {
     pub role: Option<SessionRole>,
     /// 発行時に宣言されたスコープ（省略は `None`。HTTP-15・Issue #2100）。
     pub scope: Option<Arc<SessionScope>>,
+    /// 認証済みユーザー名（Issue #2094。発行経路が与えない場合は `None`）。
+    pub user: Option<String>,
+}
+
+/// ユーザー名・テナントを出さない（ログ経由の漏えい防止）。
+impl fmt::Debug for SessionGrant {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SessionGrant")
+            .field("ddl_allowed", &self.ddl_allowed)
+            .finish_non_exhaustive()
+    }
 }
 
 /// TTL 固定・同時有効数上限付きのメモリ内セッションストア（TASK-174・
@@ -251,6 +265,20 @@ impl SessionStore {
         scope: Option<SessionScope>,
         now: Instant,
     ) -> Result<SessionToken, IssueError> {
+        self.issue_with_user(ctx, None, ddl_allowed, role, scope, now)
+    }
+
+    /// [`SessionStore::issue_with_scope`] の認証ユーザー名つき版（Issue #2094）。`issue.rs` が認証成功後に
+    /// 呼ぶ production の発行入口。`user` は scan のカーソルを認証主体へ束縛するためにだけ使う。
+    pub fn issue_with_user(
+        &self,
+        ctx: engine::policy::PolicyContext,
+        user: Option<String>,
+        ddl_allowed: bool,
+        role: Option<SessionRole>,
+        scope: Option<SessionScope>,
+        now: Instant,
+    ) -> Result<SessionToken, IssueError> {
         let permit = match self.limiter.try_acquire() {
             Some(permit) => permit,
             None => {
@@ -280,6 +308,7 @@ impl SessionStore {
                 role,
                 ddl_allowed,
                 scope: scope.map(Arc::new),
+                user,
                 issued_at: now,
                 _permit: permit,
             },
@@ -320,6 +349,7 @@ impl SessionStore {
                 ddl_allowed: entry.ddl_allowed,
                 role: entry.role.clone(),
                 scope: entry.scope.clone(),
+                user: entry.user.clone(),
             })
         } else {
             table.remove(token);
@@ -364,6 +394,32 @@ mod tests {
 
     fn ctx(tenant: &str) -> PolicyContext {
         PolicyContext::new(tenant).expect("valid tenant id in test")
+    }
+
+    /// 認証ユーザー名はグラントに運ばれ（Issue #2094）、`Debug` には出ない。
+    #[test]
+    fn grant_carries_user_and_debug_redacts_it() {
+        let store = SessionStore::new();
+        let now = Instant::now();
+        let t = store
+            .issue_with_user(
+                ctx("tenant-x"),
+                Some("alice-user".into()),
+                false,
+                None,
+                None,
+                now,
+            )
+            .expect("issue");
+        let grant = store.lookup_grant(&t, now).expect("grant");
+        assert_eq!(grant.user.as_deref(), Some("alice-user"));
+        let dbg = format!("{grant:?}");
+        assert!(
+            !dbg.contains("alice-user") && !dbg.contains("tenant-x"),
+            "{dbg}"
+        );
+        let t2 = store.issue(ctx("tenant-x"), now).expect("issue");
+        assert!(store.lookup_grant(&t2, now).expect("grant").user.is_none());
     }
 
     #[test]

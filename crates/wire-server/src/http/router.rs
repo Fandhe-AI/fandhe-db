@@ -64,6 +64,7 @@ use crate::http::session::middleware;
 use crate::http::session::store::SessionStore;
 use engine::core::EngineCore;
 use engine::error_format::ErrorClass;
+use engine::sql::keyset::KeysetSealKey;
 
 /// `/v1/session` の要求ターゲット（バイト厳密一致のみ受理。クエリ文字列付き・
 /// 末尾スラッシュ違いは不一致として [`Route::Unknown`]／`08P01` へ落ちる）。
@@ -160,6 +161,17 @@ pub struct Router {
     users: Arc<UserStore>,
     sessions: SessionStore,
     engine: Option<Arc<EngineCore>>,
+    /// `scan` の不透明カーソルの封緘鍵（Issue #2094・NOSQL-23）。`with_engine` がプロセス起動時に
+    /// CSPRNG で 1 個作り、永続化しない（再起動で既発行カーソルは `22000` で無効になる）。
+    /// 生成に失敗したときは `None` のままで、`after` 付きの要求は `XX000` で fail-closed になる。
+    cursor_key: Option<KeysetSealKey>,
+}
+
+/// カーソル封緘鍵を OS の CSPRNG から作る（失敗・長さ不一致は `None`＝カーソル機能を無効化）。
+fn new_cursor_key() -> Option<KeysetSealKey> {
+    let raw = crate::auth::read_urandom(32).ok()?;
+    let bytes: [u8; 32] = raw.try_into().ok()?;
+    Some(KeysetSealKey::from_bytes(bytes))
 }
 
 impl Router {
@@ -170,6 +182,7 @@ impl Router {
             users,
             sessions,
             engine: None,
+            cursor_key: None,
         }
     }
 
@@ -190,6 +203,7 @@ impl Router {
             users,
             sessions,
             engine: Some(engine),
+            cursor_key: new_cursor_key(),
         }
     }
 }
@@ -226,6 +240,7 @@ impl RequestHandler for Router {
                         &req.headers,
                         req.body,
                         self.engine.as_deref(),
+                        self.cursor_key.as_ref(),
                         SystemTime::now(),
                     ),
                     Err(e) => response::encode_error(
