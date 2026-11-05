@@ -27,6 +27,10 @@
 //!    `42601`。`insert`／`update`／`delete` 以外の op に付いていれば `42601` で拒否する。
 //!    engine 呼び出しより前に返るため副作用は無い）。書き込み op へは検証済みの値を渡し、
 //!    本文の `operation_id` との一致検査は [`super::operation_id_source`] が行う
+//!    **5b.** `returning` の検査（Issue #2090・NOSQL-22。[`super::returning`]）。値の不正と
+//!    分割実行（`mode`／`chunk`）との併用は `42601`、妥当な指定も実行結線（Issue #2091）まで
+//!    固定文言の `0A000` で拒否する（黙って無視しない）。`42601` が常に `0A000` より先に決まり、
+//!    engine 未接続でも同じ順序。engine は呼ばないため副作用は無い
 //! 6. `op` と `engine`（接続済み `EngineCore`。`Router::new` 経由では
 //!    `None`・`Router::with_engine` 経由でのみ `Some`）の組でディスパッチ
 //!    する。`(Op::Search, Some(engine))` かつ `explain: true` は
@@ -79,6 +83,7 @@ use engine::json::parse_json;
 
 use crate::http::idempotency_key::extract_idempotency_key;
 use crate::http::query::op::{classify_op, Op};
+use crate::http::query::returning::{self, ReturningRequestError};
 use crate::http::query::schema::Validated;
 use crate::http::query::{ddl, delete, insert, partitioned, scan, update};
 use crate::http::session::middleware::{self, SessionPrincipal};
@@ -111,6 +116,17 @@ pub(super) fn reject_allocated_schema(
 /// ヘッダ値を含めない）。
 const IDEMPOTENCY_KEY_NOT_ALLOWED_MESSAGE: &str =
     "idempotency-key header is not allowed for this op";
+
+/// 手順 5b の本体。キー無しは `Ok`、不正値・分割実行との併用は `42601`、妥当な指定は
+/// 実行結線（Issue #2091）まで `0A000`（fail-closed）。
+fn check_returning(validated: &Validated<'_>) -> Result<(), ReturningRequestError> {
+    let projection = returning::parse_returning(validated)?;
+    returning::check_not_partitioned(validated, &projection)?;
+    if projection.is_some() {
+        return Err(ReturningRequestError::NotYetAvailable);
+    }
+    Ok(())
+}
 
 /// 検証を通過したが実行結線が未接続の要求に返す暫定応答の文言。
 /// `scan`・`aggregate`・`insert`・`search`（`explain: true` の `search` を
@@ -182,6 +198,14 @@ pub fn handle(
         );
     }
     let header_operation_id = header_operation_id.as_ref();
+
+    // 手順 5b: `returning` の検査（Issue #2090・NOSQL-22）。engine 接続有無に依らず、
+    // ディスパッチより前に決める（`42601` → 未結線 `0A000` の順）。
+    if op.accepts_returning() {
+        if let Err(e) = check_returning(&validated) {
+            return response::encode_error(e.error_class(), &e.client_message(), now_wall);
+        }
+    }
 
     // 手順 6: op と engine 接続有無の組でディスパッチする（Issue #766・
     // #768・#772・#764・#876）。各アームは対応するモジュールへの 1 行委譲に
@@ -903,5 +927,57 @@ mod tests {
             !text.contains("other") && !text.contains("key-1"),
             "got: {text}"
         );
+    }
+
+    #[test]
+    fn invalid_returning_is_42601_even_without_engine() {
+        for ret in [
+            r#"[]"#,
+            r#""a""#,
+            r#"["*"]"#,
+            r#"["a b"]"#,
+            r#"1"#,
+            r#"null"#,
+        ] {
+            let json = format!(r#"{{"op":"insert","table":"docs","rows":[],"returning":{ret}}}"#);
+            let text = String::from_utf8(run(json.as_bytes(), &[])).expect("utf-8");
+            assert!(text.starts_with("HTTP/1.1 400 "), "{ret} got: {text}");
+            assert!(text.contains("42601"), "{ret} got: {text}");
+            assert!(!text.contains(PLACEHOLDER_MESSAGE), "{ret} got: {text}");
+        }
+    }
+
+    #[test]
+    fn returning_with_partitioned_is_42601() {
+        let body = br#"{"op":"delete","table":"docs","filter":[{"column":"a","op":"eq","value":1}],"mode":"partitioned","returning":"*"}"#;
+        let text = String::from_utf8(run(body, &[])).expect("utf-8");
+        assert!(text.contains("42601"), "got: {text}");
+        assert!(text.contains("cannot be combined"), "got: {text}");
+    }
+
+    #[test]
+    fn valid_returning_is_fixed_0a000_not_placeholder() {
+        for body in [
+            &br#"{"op":"insert","table":"docs","rows":[],"returning":"*"}"#[..],
+            &br#"{"op":"update","table":"docs","set":{"a":1},"where":{"id":1},"returning":["a"]}"#
+                [..],
+            &br#"{"op":"delete","table":"docs","where":{"id":1},"returning":["a"]}"#[..],
+        ] {
+            let text = String::from_utf8(run(body, &[IDEM])).expect("utf-8");
+            assert!(text.starts_with("HTTP/1.1 501 "), "got: {text}");
+            assert!(text.contains("0A000"), "got: {text}");
+            assert!(
+                text.contains("returning is not yet available"),
+                "got: {text}"
+            );
+            assert!(!text.contains(PLACEHOLDER_MESSAGE), "got: {text}");
+        }
+    }
+
+    #[test]
+    fn returning_on_non_dml_op_is_unknown_key() {
+        let body = br#"{"op":"scan","table":"docs","limit":1,"returning":"*"}"#;
+        let text = String::from_utf8(run(body, &[])).expect("utf-8");
+        assert!(text.contains("42601"), "got: {text}");
     }
 }

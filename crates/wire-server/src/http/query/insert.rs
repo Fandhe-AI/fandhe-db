@@ -58,7 +58,7 @@ use engine::error_format::{ClassifiedError, ErrorClass};
 use engine::json::JsonValue;
 use engine::recovery::required_op_id::OperationId;
 use engine::sql::allowlist::{SqlSurfaceError, ValidatedInsert};
-use engine::sql::exec::InsertOutcome;
+use engine::sql::exec::{InsertOutcome, QueryResult};
 use engine::sql::parser::{bind_insert_identity, BoundInsert};
 
 use crate::http::error_body::escape_json_string_into;
@@ -67,6 +67,7 @@ use crate::http::session::middleware::SessionPrincipal;
 
 use super::ident::{self, InvalidIdentifier};
 use super::operation_id_source::{resolve_operation_id, OperationIdSourceError};
+use super::response::{write_columns_and_rows_into, ResponseEncodeError};
 use super::schema::{SchemaError, Validated};
 use super::typed_json::{self, TypedJsonError};
 
@@ -330,17 +331,43 @@ pub fn encode_success_body(success: &InsertSuccess) -> String {
             .map_or(0, |id| id.as_str().len())
             + 64,
     );
-    out.push_str("{\"inserted\":");
+    out.push('{');
+    write_success_fields(&mut out, success);
+    out.push('}');
+    out
+}
+
+/// `"inserted":<n>[,"operation_id":"<escaped>"]` を書く（波括弧は含めない）。
+/// [`encode_success_body`] と [`encode_success_body_with_returning`] が共有する。
+fn write_success_fields(out: &mut String, success: &InsertSuccess) {
+    out.push_str("\"inserted\":");
     // `u64` の `Display` 実装は infallible（`write!` への `String` 追記も
     // アロケーション失敗以外で失敗しない）ため戻り値は捨ててよい。
     let _ = write!(out, "{}", success.inserted);
     if let Some(id) = &success.operation_id {
         out.push_str(",\"operation_id\":\"");
-        escape_json_string_into(&mut out, id.as_str());
+        escape_json_string_into(out, id.as_str());
         out.push('"');
     }
+}
+
+/// `returning` 付きの成功応答本文（Issue #2090・NOSQL-22）。
+/// 出力形 `{"inserted":<n>[,"operation_id":"..."],"columns":[...],"rows":[...]}`
+/// （キー順固定・空白なし）。`row_count` は付けない（RLS 再判定で `rows.len()` が件数を
+/// 下回りうるため、件数キーと行数を別フィールドのまま保つ）。セル・型名の写像は
+/// [`super::response::write_columns_and_rows_into`] に一本化している。呼び出し元の結線は
+/// Issue #2091 の担当（commit 後のエンコード失敗は may-be-committed 系応答へ写像すること）。
+pub fn encode_success_body_with_returning(
+    success: &InsertSuccess,
+    result: &QueryResult,
+) -> Result<String, ResponseEncodeError> {
+    let mut out = String::new();
+    out.push('{');
+    write_success_fields(&mut out, success);
+    out.push(',');
+    write_columns_and_rows_into(&mut out, result)?;
     out.push('}');
-    out
+    Ok(out)
 }
 
 /// `POST /v1/query` の `insert` op を実行する。`validated` は
@@ -1234,5 +1261,68 @@ mod tests {
         let items = rows_from(r#"[{"id":1,"embedding":[1,0,0,0],"count":null}]"#);
         let bounds = bind_rows(&items, "docs", None, &typed_schema()).expect("bind ok");
         assert_eq!(bounds[0].values[1], Value::Null);
+    }
+
+    fn returning_result() -> engine::sql::exec::QueryResult {
+        use engine::catalog::ColumnType;
+        use engine::sql::exec::{Cell, ColumnMeta, QueryResult, ResultRow};
+        QueryResult {
+            columns: vec![
+                ColumnMeta::Id,
+                ColumnMeta::Scalar {
+                    name: "body".to_string(),
+                    ty: ColumnType::Text,
+                },
+            ],
+            rows: vec![ResultRow {
+                id: 7,
+                score: 0.0,
+                cells: vec![Cell::Integer(7), Cell::Text("a\"b\\c".to_string())],
+            }],
+        }
+    }
+
+    #[test]
+    fn encode_success_body_with_returning_has_fixed_key_order() {
+        let result = returning_result();
+        let columns_rows = {
+            let mut s = String::new();
+            crate::http::query::response::write_columns_and_rows_into(&mut s, &result)
+                .expect("encode");
+            s
+        };
+        let plain = InsertSuccess {
+            inserted: 3,
+            operation_id: None,
+        };
+        assert_eq!(
+            encode_success_body_with_returning(&plain, &result).expect("encode"),
+            format!(r#"{{"inserted":3,{columns_rows}}}"#)
+        );
+        let with_id = InsertSuccess {
+            inserted: 3,
+            operation_id: Some(OperationId::parse("op-1").expect("valid operation_id")),
+        };
+        assert_eq!(
+            encode_success_body_with_returning(&with_id, &result).expect("encode"),
+            format!(r#"{{"inserted":3,"operation_id":"op-1",{columns_rows}}}"#)
+        );
+        assert!(!columns_rows.contains("row_count"));
+        assert!(columns_rows.starts_with(r#""columns":["#));
+    }
+
+    #[test]
+    fn encode_success_body_with_returning_empty_rows() {
+        use engine::sql::exec::{ColumnMeta, QueryResult};
+        let success = InsertSuccess {
+            inserted: 0,
+            operation_id: None,
+        };
+        let empty = QueryResult {
+            columns: vec![ColumnMeta::Id],
+            rows: vec![],
+        };
+        let body = encode_success_body_with_returning(&success, &empty).expect("encode");
+        assert!(body.ends_with(r#""rows":[]}"#), "{body}");
     }
 }

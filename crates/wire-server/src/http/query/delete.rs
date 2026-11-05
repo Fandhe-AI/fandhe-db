@@ -47,7 +47,8 @@
 //! はいずれも `deleted:0`・`200`（RLS-9。`execute_delete` のドキュメント
 //! 参照）。
 //!
-//! 対象外: `RETURNING`（Issue #873。NoSQL は公開しない）。`filter` は `search` と同じ語彙
+//! `returning` キー（Issue #2090・NOSQL-22）は検査済みでも実行未結線（Issue #2091 で結線。
+//! 成功本文の形は `encode_success_body_with_returning`）。`filter` は `search` と同じ語彙
 //! （`or`・範囲比較・`in`・数値列を含む。Issue #1356）を `filter.rs` の
 //! `bind_filter_where_predicates` が SQL の述語形 `DELETE` と同一の構文形へ写像する
 //! （`ARRAY`／`JSON`／`JSONB` 列の `eq`／`ne`／`in` も受理する。Issue #1410）。
@@ -58,7 +59,7 @@ use engine::core::EngineCore;
 use engine::error_format::{ClassifiedError, ErrorClass};
 use engine::recovery::required_op_id::OperationId;
 use engine::sql::allowlist::SqlSurfaceError;
-use engine::sql::exec::DeleteOutcome;
+use engine::sql::exec::{DeleteOutcome, QueryResult};
 use engine::sql::parser::BoundDelete;
 
 use crate::http::error_body::escape_json_string_into;
@@ -70,6 +71,7 @@ use super::filter;
 use super::ident::{self, InvalidIdentifier};
 use super::operation_id_source::{resolve_operation_id, OperationIdSourceError};
 use super::partitioned::{self, PartitionedRequestError};
+use super::response::{write_columns_and_rows_into, ResponseEncodeError};
 use super::schema::{SchemaError, Validated};
 
 /// [`execute`] の失敗を表す。いずれも [`ClassifiedError`] を実装する
@@ -159,15 +161,39 @@ pub fn encode_success_body(success: &DeleteSuccess) -> String {
             .map_or(0, |id| id.as_str().len())
             + 64,
     );
-    out.push_str("{\"deleted\":");
+    out.push('{');
+    write_success_fields(&mut out, success);
+    out.push('}');
+    out
+}
+
+/// `"deleted":<n>[,"operation_id":"<escaped>"]` を書く（波括弧は含めない）。
+/// [`encode_success_body`] と [`encode_success_body_with_returning`] が共有する。
+fn write_success_fields(out: &mut String, success: &DeleteSuccess) {
+    out.push_str("\"deleted\":");
     let _ = write!(out, "{}", success.deleted);
     if let Some(id) = &success.operation_id {
         out.push_str(",\"operation_id\":\"");
-        escape_json_string_into(&mut out, id.as_str());
+        escape_json_string_into(out, id.as_str());
         out.push('"');
     }
+}
+
+/// `returning` 付きの成功応答本文（Issue #2090・NOSQL-22）。
+/// 出力形 `{"deleted":<n>[,"operation_id":"..."],"columns":[...],"rows":[...]}`
+/// （`insert::encode_success_body_with_returning` と同型。`row_count` は付けない）。
+/// 呼び出し元の結線は Issue #2091 の担当。
+pub fn encode_success_body_with_returning(
+    success: &DeleteSuccess,
+    result: &QueryResult,
+) -> Result<String, ResponseEncodeError> {
+    let mut out = String::new();
+    out.push('{');
+    write_success_fields(&mut out, success);
+    out.push(',');
+    write_columns_and_rows_into(&mut out, result)?;
     out.push('}');
-    out
+    Ok(out)
 }
 
 /// `POST /v1/query` の `delete` op を実行する。`validated` は
@@ -316,5 +342,68 @@ mod tests {
             encode_success_body(&success),
             r#"{"deleted":3,"operation_id":"op-1"}"#
         );
+    }
+
+    fn returning_result() -> engine::sql::exec::QueryResult {
+        use engine::catalog::ColumnType;
+        use engine::sql::exec::{Cell, ColumnMeta, QueryResult, ResultRow};
+        QueryResult {
+            columns: vec![
+                ColumnMeta::Id,
+                ColumnMeta::Scalar {
+                    name: "body".to_string(),
+                    ty: ColumnType::Text,
+                },
+            ],
+            rows: vec![ResultRow {
+                id: 7,
+                score: 0.0,
+                cells: vec![Cell::Integer(7), Cell::Text("a\"b\\c".to_string())],
+            }],
+        }
+    }
+
+    #[test]
+    fn encode_success_body_with_returning_has_fixed_key_order() {
+        let result = returning_result();
+        let columns_rows = {
+            let mut s = String::new();
+            crate::http::query::response::write_columns_and_rows_into(&mut s, &result)
+                .expect("encode");
+            s
+        };
+        let plain = DeleteSuccess {
+            deleted: 3,
+            operation_id: None,
+        };
+        assert_eq!(
+            encode_success_body_with_returning(&plain, &result).expect("encode"),
+            format!(r#"{{"deleted":3,{columns_rows}}}"#)
+        );
+        let with_id = DeleteSuccess {
+            deleted: 3,
+            operation_id: Some(OperationId::parse("op-1").expect("valid operation_id")),
+        };
+        assert_eq!(
+            encode_success_body_with_returning(&with_id, &result).expect("encode"),
+            format!(r#"{{"deleted":3,"operation_id":"op-1",{columns_rows}}}"#)
+        );
+        assert!(!columns_rows.contains("row_count"));
+        assert!(columns_rows.starts_with(r#""columns":["#));
+    }
+
+    #[test]
+    fn encode_success_body_with_returning_empty_rows() {
+        use engine::sql::exec::{ColumnMeta, QueryResult};
+        let success = DeleteSuccess {
+            deleted: 0,
+            operation_id: None,
+        };
+        let empty = QueryResult {
+            columns: vec![ColumnMeta::Id],
+            rows: vec![],
+        };
+        let body = encode_success_body_with_returning(&success, &empty).expect("encode");
+        assert!(body.ends_with(r#""rows":[]}"#), "{body}");
     }
 }
