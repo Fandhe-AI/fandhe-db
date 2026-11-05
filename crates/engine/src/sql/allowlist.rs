@@ -19648,9 +19648,17 @@ pub struct ValidatedCreateIndex {
     /// `USING hnsw ... WITH (m = n, ef_construction = n)` の検証済み構築パラメータ（SQL-33 (5)、
     /// Issue #2029）。`WITH` 省略は `None`。HNSW 以外への `WITH` は構文段で `0A000` 拒否済み。
     pub(crate) hnsw_options: Option<crate::catalog::HnswIndexOptions>,
+    /// 明示された `USING hnsw` の演算子クラスの系列（`vector_*_ops`／`halfvec_*_ops`。省略は `None`
+    /// で、列型の既定の系列に従う。Issue #2016・TABLE-46 (3)）。実行段が catalog の列型照合へ渡す。
+    pub(crate) hnsw_family: Option<crate::catalog::HnswOpClassFamily>,
 }
 
 impl ValidatedCreateIndex {
+    /// 明示された HNSW 演算子クラスの系列（省略は `None`）。
+    pub fn hnsw_family(&self) -> Option<crate::catalog::HnswOpClassFamily> {
+        self.hnsw_family
+    }
+
     /// HNSW の構築パラメータ（`WITH` 省略は `None`）。実行段は `IndexDef::with_hnsw_options` へ渡す。
     pub fn hnsw_options(&self) -> Option<crate::catalog::HnswIndexOptions> {
         self.hnsw_options
@@ -19841,6 +19849,8 @@ pub(crate) fn validate_create_index_tokens(
     let hnsw = matches!(method, IndexMethod::Hnsw(_));
     let is_gin = matches!(method, IndexMethod::Gin(_));
     let mut method = method;
+    // 明示された演算子クラスの系列（`vector_*_ops`／`halfvec_*_ops`。省略は `None`。Issue #2016）。
+    let mut hnsw_family: Option<crate::catalog::HnswOpClassFamily> = None;
     p.expect_punct('(')?;
     let mut columns = Vec::new();
     let mut expressions: Vec<Option<Expr>> = Vec::new();
@@ -19878,12 +19888,13 @@ pub(crate) fn validate_create_index_tokens(
                 if !["ASC", "DESC", "NULLS"].iter().any(|k| w.eq_ignore_ascii_case(k)))
         {
             let opclass_name = p.expect_ident()?;
-            let opclass =
-                crate::catalog::VectorOpClass::from_name(&opclass_name).ok_or_else(|| {
-                    SqlSurfaceError::UndefinedObject {
-                        name: truncate_for_error(&opclass_name),
-                    }
-                })?;
+            let (family, opclass) = crate::catalog::VectorOpClass::resolve_family_name(
+                &opclass_name,
+            )
+            .ok_or_else(|| SqlSurfaceError::UndefinedObject {
+                name: truncate_for_error(&opclass_name),
+            })?;
+            hnsw_family = Some(family);
             method = IndexMethod::Hnsw(opclass);
         }
         columns.push(column);
@@ -19954,6 +19965,7 @@ pub(crate) fn validate_create_index_tokens(
         predicate: None,
         pending_user_function: Some(pending),
         hnsw_options,
+        hnsw_family,
     };
     for expr in expressions.iter().flatten() {
         if let Some(pending) =
@@ -20006,6 +20018,7 @@ pub(crate) fn validate_create_index_tokens(
         predicate,
         pending_user_function: None,
         hnsw_options,
+        hnsw_family,
     })
 }
 
@@ -31297,7 +31310,6 @@ mod tests {
             assert!(v.is_hnsw(), "{sql}");
         }
         for (sql, code) in [
-            ("CREATE INDEX i ON t USING hnsw (a halfvec_l2_ops)", "42704"),
             (
                 "CREATE INDEX i ON t USING hnsw (a sparsevec_l2_ops)",
                 "42704",
@@ -31332,6 +31344,44 @@ mod tests {
             .expect("btree")
             .hnsw_opclass()
             .is_none());
+        // `halfvec_*_ops`（Issue #2016）は HALFVEC 系列として受理し、系列は DDL 実行まで運ぶ。
+        // 省略と `vector_*_ops` は列型照合の対象（系列なし／Vector）。
+        for (sql, metric, family) in [
+            (
+                "CREATE INDEX i ON t USING hnsw (a halfvec_cosine_ops)",
+                VectorOpClass::Cosine,
+                Some(crate::catalog::HnswOpClassFamily::HalfVec),
+            ),
+            (
+                "CREATE INDEX i ON t USING hnsw (a HALFVEC_L2_OPS)",
+                VectorOpClass::L2,
+                Some(crate::catalog::HnswOpClassFamily::HalfVec),
+            ),
+            (
+                "CREATE INDEX i ON t USING hnsw (a halfvec_ip_ops)",
+                VectorOpClass::Ip,
+                Some(crate::catalog::HnswOpClassFamily::HalfVec),
+            ),
+            (
+                "CREATE INDEX i ON t USING hnsw (a halfvec_l1_ops)",
+                VectorOpClass::L1,
+                Some(crate::catalog::HnswOpClassFamily::HalfVec),
+            ),
+            (
+                "CREATE INDEX i ON t USING hnsw (a vector_l2_ops)",
+                VectorOpClass::L2,
+                Some(crate::catalog::HnswOpClassFamily::Vector),
+            ),
+            (
+                "CREATE INDEX i ON t USING hnsw (a)",
+                VectorOpClass::Cosine,
+                None,
+            ),
+        ] {
+            let v = parse(sql).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+            assert_eq!(v.hnsw_opclass(), Some(metric), "{sql}");
+            assert_eq!(v.hnsw_family(), family, "{sql}");
+        }
     }
 
     /// `USING gin` の構文段（Issue #2206・INDEX-8）: 演算子クラスの解決（省略時 `jsonb_ops`・

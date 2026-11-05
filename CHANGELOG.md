@@ -9,6 +9,7 @@
 
 ### Changed
 
+- `halfvec_*_ops` を VECTOR 列の `USING hnsw` に指定したときのエラーを `42704` から `42804` へ変えた（Issue #2016・TABLE-46 (3)・INDEX-7 ポインタ。PostgreSQL と同じ）。`vector_*_ops` を HALFVEC 列に指定した場合も `42804`。未知の演算子クラスは従来どおり `42704`。
 - `BatchSearchError` に `ZeroNormQuery { query_index }` を追加した（Issue #2003・CORE-6・CORE-16・SQL-33 ポインタ）。コサイン metric のバッチにゼロノルム（アンダーフロー・オーバーフロー含む）のクエリが含まれると、primary へ渡す前に入力エラーで拒否する（縮退イベント・ラッチは起きない）。内積・L2 では従来どおり受理する。
   BREAKING CHANGE: 公開 enum `BatchSearchError` に variant `ZeroNormQuery` を追加した（網羅的 `match` の下流は追随が必要）。
 - `<=>` の実行をコサイン距離（`1 - cos`）の昇順へ切り替え、`<#>` を負の内積の昇順として実行経路へ接続した（Issue #1991・SQL-33 ポインタ）。ゼロノルムの行は距離 NaN で昇順の末尾（`DESC` では先頭）に並び、同点は行の順序キー昇順。従来の `<=>` の順位（内積の降順）は `<#>` で得られる。`ResultRow.score` は演算子の距離値（`<=>` は `1 - cos`、`<#>` は `-dot`）に変わる。`<->`／`<+>` は従来どおり `0A000`。`USING MODE 'precision'` と `<#>` の併用は `0A000`。HNSW の opt-in は内積グラフのまま返った候補を厳密なコサイン距離で再採点する（入力は L2 正規化済みが契約）。互換スイッチは無い。正規化済みのベクトルでは新しい `<=>` でも従来と同じ順位になる（ほぼ同点の境界を除く）。返る値の符号と大きさは変わる。移行ガイド（#1995）: `docs/design/cosine-operator-migration.md` の「移行ガイド（#1995）」節。
@@ -22,6 +23,7 @@
 
 ### Added
 
+- HALFVEC 列の HNSW 索引を追加した（Issue #2016・TABLE-46 (3)(4)(6)・INDEX-7 ポインタ）。`USING hnsw (h halfvec_{cosine,l2,ip,l1}_ops)`（省略は `halfvec_cosine_ops`）を 4,000 次元まで宣言でき、宣言済み表への `<=>` kNN が HNSW を使う（常駐はエンジン設定と独立に F16。`--hnsw-scope all` でも宣言の無い HALFVEC 表には暗黙の HNSW を作らない）。公開 API に `catalog::HnswOpClassFamily`・`VectorOpClass::resolve_family_name`・`catalog::MAX_HALFVEC_HNSW_DIM`・`ValidatedCreateIndex::hnsw_family` を追加した（追加のみ）。
 - `INT8VEC(N)` 列で距離演算子 `<->`・`<#>`・`<=>` の kNN・WHERE の距離比較・投影の距離列が動くようにした（Issue #2953・TABLE-49 (1)(4)(5) ポインタ）。整数のまま厳密に計算し、距離列は float8。`<+>`・hybrid・`USING PLAN`・`USING MODE`・`HINT ORDER`・precision は `0A000`。NoSQL `search` は対象外（`0A000`）のまま。`vector` との差と量子化誤差の実測は `docs/design/column-type-extension.md` に記録。
   BREAKING CHANGE: 公開 enum `BoundExpr` に variant `Int8VecDistance { kind, index, query }` を追加した（網羅的 `match` の下流は追随が必要）。
 - wire-server の公開関数 `bind_search_with_limits` は 4 引数のまま維持し（`metric` 省略時は従来どおり cosine）、索引既定の解決器付きの版を `bind_search_with_metric_resolver` として追加した（Issue #2243）。NoSQL（HTTP）表層は本リポの既存の実装範囲（NOSQL-2）であり、Web API 製品とは別である。

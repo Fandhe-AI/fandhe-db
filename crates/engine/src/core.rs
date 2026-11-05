@@ -12077,6 +12077,31 @@ impl EngineCore {
                 }
                 // HALFVEC 列の表への距離演算子形 kNN は全走査ソートの scan 経路へ写す
                 // （Issue #2015・TABLE-46。arena は VECTOR 専用のため）。
+                // 宣言済みの HNSW（`<=>` かつ昇順・明示 LIMIT）は ANN 経路で束縛する
+                // （Issue #2016・TABLE-46。それ以外は従来どおり scan 経路）。
+                if self.halfvec_ann_route(
+                    &validated,
+                    &schema,
+                    session.search_mode(),
+                    &limits,
+                    read_txn,
+                )? {
+                    let bound = crate::sql::parser::bind_halfvec_ann(
+                        &validated,
+                        &schema,
+                        session.search_mode(),
+                        session.udfs(),
+                        &limits,
+                    )?;
+                    let result = self.run_select_plan(
+                        read_txn,
+                        ctx,
+                        &schema,
+                        &bound,
+                        session.hnsw_search_settings(),
+                    )?;
+                    return Ok(crate::sql::SqlOutcome::Query(result));
+                }
                 if let Some(scan) = crate::sql::halfvec_knn::halfvec_select_as_scan(
                     &validated,
                     &schema,
@@ -12728,6 +12753,46 @@ impl EngineCore {
         }
     }
 
+    /// `HALFVEC` 列への距離演算子形 kNN を HNSW（ANN）経路で実行するか（Issue #2016・TABLE-46）。
+    /// Execute と `EXPLAIN` が同じ判定を共有し、実行と表示を食い違わせない。真になる条件は、静的な
+    /// 形（`sql::halfvec_knn::halfvec_ann_shape`）に加えて (1) HNSW が有効なエンジン、(2) 読み取りが
+    /// スナップショット由来、(3) `USING hnsw` の宣言があり問い合わせの距離種別（`<=>`）に合う
+    /// （ゲート `Targeted`。`HALFVEC` 表は scope にかかわらず宣言必須）。偽の文は従来の scan 経路へ
+    /// 流れる（fail-closed）。形が合う文では LIMIT/OFFSET 合計上限と投影距離列の照合を先に適用する。
+    fn halfvec_ann_route<R: crate::storage::read_source::ReadSource>(
+        &self,
+        validated: &crate::sql::allowlist::ValidatedStatement,
+        schema: &crate::catalog::TableSchema,
+        session_mode: Option<crate::sql::mode::SearchMode>,
+        limits: &crate::result_limits::ResultLimits,
+        read_txn: &R,
+    ) -> Result<bool, crate::sql::allowlist::SqlSurfaceError> {
+        if self.hnsw_state.is_none() {
+            return Ok(false);
+        }
+        if !crate::sql::halfvec_knn::halfvec_ann_shape(
+            validated,
+            schema,
+            session_mode,
+            &crate::sql::parser::LiteralSkip::NONE,
+            limits,
+        )? {
+            return Ok(false);
+        }
+        let Some(snapshot) = read_txn.snapshot() else {
+            return Ok(false);
+        };
+        let gate = crate::catalog::hnsw_gate_in_txn(
+            snapshot,
+            &self.index_catalog_gate_cache,
+            validated.table_name(),
+            crate::search_engine::HnswScope::Declared,
+            true,
+            crate::sql::hnsw_cache::cosine_query_metric(),
+        );
+        Ok(matches!(gate, crate::catalog::HnswGate::Targeted { .. }))
+    }
+
     /// [`Self::execute_validated_in_session`] の `Statement::Select` アーム
     /// （`USING PLAN` 経由を含む）・[`Self::execute_bound_search_in_session`]・
     /// [`Self::run_using_plan_select`] が共有する実行本体（TASK-186・
@@ -12773,7 +12838,17 @@ impl EngineCore {
                 .map(|s| crate::sql::hnsw_cache::HnswCacheAccess {
                     storage: &self.storage,
                     cache: &s.cache,
-                    provider: s.provider.with_session_search(hnsw_search),
+                    provider: match bound.dense_source {
+                        crate::arena::DenseSource::EmbeddingSlot => {
+                            s.provider.with_session_search(hnsw_search)
+                        }
+                        // `HALFVEC` 列は f16 で保存されているため、エンジン設定にかかわらず F16 常駐
+                        // （無損失。Issue #2016）。
+                        crate::arena::DenseSource::HalfVecColumn => s
+                            .provider
+                            .with_session_search(hnsw_search)
+                            .with_resident_precision(crate::hnsw::ResidentPrecision::F16),
+                    },
                     index_gate_cache: &self.index_catalog_gate_cache,
                     hnsw_scope: self.hnsw_scope,
                     // ゲート評価後に `sql::exec` が写像結果を載せ直す（Issue #2000）。
@@ -13168,6 +13243,7 @@ impl EngineCore {
                     distance_descending: false,
                     distance_kind: crate::sql::lexer::DistanceKind::Cosine,
                     result_cap: None,
+                    dense_source: crate::arena::DenseSource::EmbeddingSlot,
                 })
             },
         )
@@ -13630,6 +13706,7 @@ impl EngineCore {
             crate::sql::hnsw_cache::cosine_query_metric(),
             // USING PLAN（hybrid）の `LIMIT` 省略は対象外（`42601` のまま。Issue #2242）。
             false,
+            crate::arena::DenseSource::EmbeddingSlot,
         );
         drop(post_check_txn);
         Ok(crate::sql::explain::build_explain_result_with_indexes(
@@ -13720,11 +13797,25 @@ impl EngineCore {
         distance_descending: bool,
         query_metric: crate::catalog::VectorOpClass,
         limit_omitted: bool,
+        dense_source: crate::arena::DenseSource,
     ) -> (
         crate::sql::explain::ExplainEngine,
         crate::sql::explain::ExplainIndexNames,
     ) {
         let declarations_enabled = self.hnsw_state.is_some();
+        // `HALFVEC` 列の kNN（Issue #2016）は実行側（`sql::exec`・`run_select_plan`）と同じく、宣言必須の
+        // scope と F16 常駐を表示する。
+        let hnsw_scope =
+            crate::sql::hnsw_cache::hnsw_scope_for_dense(self.hnsw_scope, dense_source);
+        let engine_kind = match (self.search_engine_kind(), dense_source) {
+            (
+                Some(crate::search_engine::SearchEngineKind::Hnsw(params)),
+                crate::arena::DenseSource::HalfVecColumn,
+            ) => Some(crate::search_engine::SearchEngineKind::Hnsw(
+                params.with_resident_precision(crate::hnsw::ResidentPrecision::F16),
+            )),
+            (kind, _) => kind,
+        };
         // Issue #1065: `ann_plan:` 表示は実行時判定（`sql::exec` の
         // `hnsw_enabled`）と同じゲート（`catalog::hnsw_targeted_in_txn`）を
         // 通す（実行時判定と `EXPLAIN` 表示の乖離を作らない。`hnsw_state` の
@@ -13749,7 +13840,7 @@ impl EngineCore {
                 read_txn,
                 &self.index_catalog_gate_cache,
                 table,
-                self.hnsw_scope,
+                hnsw_scope,
                 true,
                 query_metric,
             )
@@ -13790,7 +13881,7 @@ impl EngineCore {
             ann_plan,
             crate::sql::hnsw_cache::AnnPlan::HnswFullVisible
                 | crate::sql::hnsw_cache::AnnPlan::HnswSubset
-        ) && self.hnsw_scope == crate::search_engine::HnswScope::Declared;
+        ) && hnsw_scope == crate::search_engine::HnswScope::Declared;
         // Issue #1066 codex-review P2 指摘対応: `scalar_plan` の静的分類・列
         // 被覆の前提条件（下記 `scalar_names_eligible`）は `index_decls` を
         // 読まなくても確定する。索引名を最終的に一切表示しない呼び出し
@@ -13868,17 +13959,13 @@ impl EngineCore {
             crate::catalog::HnswGate::NotTargeted => crate::catalog::VectorOpClass::Cosine,
         };
         (
-            crate::sql::explain::ExplainEngine::new(
-                self.search_engine_kind(),
-                ann_plan,
-                scalar_plan,
-            )
-            .with_scalar_fallback(scalar_fallback)
-            .with_ann_metric(ann_metric)
-            .with_ann_build_options(match hnsw_gate {
-                crate::catalog::HnswGate::Targeted { options, .. } => options,
-                _ => None,
-            }),
+            crate::sql::explain::ExplainEngine::new(engine_kind, ann_plan, scalar_plan)
+                .with_scalar_fallback(scalar_fallback)
+                .with_ann_metric(ann_metric)
+                .with_ann_build_options(match hnsw_gate {
+                    crate::catalog::HnswGate::Targeted { options, .. } => options,
+                    _ => None,
+                }),
             crate::sql::explain::ExplainIndexNames::new(ann_names, scalar_names),
         )
     }
@@ -13898,6 +13985,32 @@ impl EngineCore {
         session: &crate::sql::mode::SessionState,
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
         let (read_txn, schema) = self.read_txn_with_schema(validated.table_name())?;
+        // 宣言済みの HNSW へ向かう HALFVEC の kNN は、実行時と同じ ANN 経路の束縛で計画を返す
+        // （Issue #2016。判定は `halfvec_ann_route` を実行側と共有する）。
+        if self.halfvec_ann_route(
+            validated,
+            &schema,
+            session.search_mode(),
+            &self.result_limits,
+            &read_txn,
+        )? {
+            let bound = crate::sql::parser::bind_halfvec_ann(
+                validated,
+                &schema,
+                session.search_mode(),
+                session.udfs(),
+                &self.result_limits,
+            )?;
+            return Ok(crate::sql::SqlOutcome::Explain(
+                self.search_explain_from_bound(
+                    ctx,
+                    &read_txn,
+                    &schema,
+                    &bound,
+                    session.hnsw_search_settings(),
+                )?,
+            ));
+        }
         // TABLE-49・Issue #2953: INT8VEC 列の kNN は実行と同じく広域取得へ書き換わるため、EXPLAIN も
         // scan の計画（`plain_scan`／`full_scan`）を報告する（実経路と矛盾する ANN 注記を出さない）。
         if let Some(scan) = crate::sql::int8vec_knn::int8vec_select_as_scan(
@@ -14098,6 +14211,7 @@ impl EngineCore {
             bound.distance_descending(),
             crate::sql::hnsw_cache::query_metric_of_bound(bound),
             bound.result_cap().is_some(),
+            bound.dense_source,
         );
         // SQL-73・Issue #2030・#2033: ハイブリッドは実行側もセッション値を使わないため、既定値のまま出す
         // （`effective_hnsw_search` が実行側と同じ置き換えを行う）。

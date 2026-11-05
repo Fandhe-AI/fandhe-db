@@ -1233,6 +1233,19 @@ impl HnswCacheAccess<'_> {
     }
 }
 
+/// dense の取り出し元に応じた HNSW ゲートの scope（Issue #2016・D7）。`HALFVEC` 列は暗黙の HNSW を
+/// 作らず、エンジンの `HnswScope::All` でも `USING hnsw` の宣言を必須（`Declared`）にする。`sql::exec` の
+/// ゲート評価・`core.rs` の経路判定と `EXPLAIN` が同じ関数を通し、実行と表示を食い違わせない。
+pub(crate) fn hnsw_scope_for_dense(
+    scope: crate::search_engine::HnswScope,
+    source: crate::arena::DenseSource,
+) -> crate::search_engine::HnswScope {
+    match source {
+        crate::arena::DenseSource::EmbeddingSlot => scope,
+        crate::arena::DenseSource::HalfVecColumn => crate::search_engine::HnswScope::Declared,
+    }
+}
+
 /// HNSW グラフ構築に使う実効パラメータを解決する（SQL-33 (5)、Issue #2029）。宣言の
 /// `WITH (m, ef_construction)` があればそれを provider（CLI・内部既定）の値より優先し、
 /// `ef_search` は provider のまま使う。`validate` を通らない場合は `Err`（呼び出し元は

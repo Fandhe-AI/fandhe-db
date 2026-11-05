@@ -683,9 +683,14 @@ fn candidate_value_to_scalar_ref<'a>(
         Value::TimestampTz(v) => Some(ScalarRef::TimestampTz(*v)),
         Value::Interval(v) => Some(ScalarRef::Interval(*v)),
         Value::Bit(v) => Some(ScalarRef::Bit(v.as_bit_ref())),
-        // HALFVEC は借用で再構成できず、述語も持たない（束縛段が拒否）。到達しない契約だが、
-        // NULL 扱い（`None`）ではなく型不一致の `Bytes(&[])` を返して fail-closed にする（Issue #2014）。
-        Value::HalfVec(_) => Some(ScalarRef::Bytes(&[])),
+        // HALFVEC は f16 ビット列を LE で並べたペイロード（`array_payload_scratch` が行ごとに組み立てた
+        // スクラッチ）の借用から本物の `ScalarRef::HalfVec` を再構成する（Issue #2016: ANN 経路の
+        // 投影・WHERE の HALFVEC 距離式が読む）。スクラッチが無い場合は NULL 扱い（`None`）にせず、
+        // 型不一致の `Bytes(&[])` を返して fail-closed にする（Issue #2014）。
+        Value::HalfVec(_) => Some(match array_payload {
+            Some(payload) => ScalarRef::HalfVec(payload),
+            None => ScalarRef::Bytes(&[]),
+        }),
         // INT8VEC も同じ理由で型不一致の `Bytes(&[])` を返して fail-closed にする（Issue #2018）。
         Value::Int8Vec(_) => Some(ScalarRef::Bytes(&[])),
         // SPARSEVEC も同じ理由で型不一致の `Bytes(&[])` を返して fail-closed にする（Issue #2025）。
@@ -714,9 +719,10 @@ fn candidate_value_to_scalar_ref<'a>(
     }
 }
 
-/// 候補行の `Value::Array` を [`candidate_value_to_scalar_ref`] が借用する正準
-/// ペイロードへエンコードしたスクラッチ（列位置ごとに `Some`／`None`）。行ごとに
-/// 高々 1 列あたり `MAX_ARRAY_PAYLOAD_LEN` バイト（Top-k 行のみが対象）。
+/// 候補行の `Value::Array`・`Value::HalfVec` を [`candidate_value_to_scalar_ref`] が借用する
+/// ペイロードへエンコードしたスクラッチ（列位置ごとに `Some`／`None`）。配列は正準ペイロード、
+/// HALFVEC は f16 ビット列の LE 並び（Issue #2016）。行ごとに高々 1 列あたり
+/// `MAX_ARRAY_PAYLOAD_LEN` バイト（配列）／宣言次元 × 2 バイト（HALFVEC。Top-k 行のみが対象）。
 pub(crate) fn array_payload_scratch(
     values: &[Value],
 ) -> Result<Vec<Option<Vec<u8>>>, SqlSurfaceError> {
@@ -730,6 +736,20 @@ pub(crate) fn array_payload_scratch(
                     .map_err(|_| SqlSurfaceError::Internal {
                         detail: "candidate array column could not be re-encoded".to_string(),
                     })
+            }
+            Value::HalfVec(bits) => {
+                let mut payload = Vec::new();
+                payload
+                    .try_reserve_exact(bits.len().saturating_mul(2))
+                    .map_err(|_| {
+                        SqlSurfaceError::payload_too_large(
+                            "halfvec payload exceeds available memory",
+                        )
+                    })?;
+                for b in bits {
+                    payload.extend_from_slice(&b.to_le_bytes());
+                }
+                Ok(Some(payload))
             }
             _ => Ok(None),
         })
@@ -1344,7 +1364,9 @@ pub(crate) fn execute_statement_with_cache(
                 snapshot,
                 access.index_gate_cache,
                 &bound.table,
-                access.hnsw_scope,
+                // `HALFVEC` 表は暗黙の HNSW を作らないため、エンジンの scope にかかわらず宣言必須
+                // （Issue #2016・fail-closed。`core.rs` の経路判定と同じ規則）。
+                crate::sql::hnsw_cache::hnsw_scope_for_dense(access.hnsw_scope, bound.dense_source),
                 true,
                 crate::sql::hnsw_cache::query_metric_of_bound(bound),
             ),
@@ -2107,9 +2129,10 @@ pub(crate) fn execute_statement_with_cache(
     let mut mask_trusted_defer = false;
     let arena: &VectorArena = match arena_cache {
         None => owned_arena.insert(
-            VectorArena::build_filtered_with_rows_in_txn(
+            VectorArena::build_filtered_with_rows_from_source_in_txn(
                 read_txn,
                 &bound.table,
+                bound.dense_source,
                 rls_hook.predicate(),
                 on_visible_row,
             )
@@ -2202,9 +2225,7 @@ pub(crate) fn execute_statement_with_cache(
                     // 責務境界・クエリ結果はいずれの経路でも不変。索引は
                     // 候補行を「絞る」ことしかできず「通す」ことはできない
                     // ため、`on_visible_row` を省略しない）。
-                    let expected_dim = schema
-                        .vector_dim()
-                        .ok_or(ArenaError::InvalidDim)
+                    let expected_dim = crate::arena::dense_dim_of(schema, bound.dense_source)
                         .map_err(|e| map_arena_error(&bound.table, e))?;
                     scalar_snapshot_for_index = Some(std::sync::Arc::clone(&snapshot));
 
@@ -2407,9 +2428,7 @@ pub(crate) fn execute_statement_with_cache(
                 // 登録する（`SqlArenaCaptureBuilder` のドキュメント参照。容量超過等で
                 // 採取を断念した場合はキャッシュへ反映しないだけで、このクエリ自体の
                 // 応答には影響しない）。
-                let expected_dim = schema
-                    .vector_dim()
-                    .ok_or(ArenaError::InvalidDim)
+                let expected_dim = crate::arena::dense_dim_of(schema, bound.dense_source)
                     .map_err(|e| map_arena_error(&bound.table, e))?;
                 // `max_bytes`（第 3 引数）・`metadata_byte_cap`（第 4 引数）はいずれも
                 // `MAX_ARENA_TOTAL_BYTES` を渡すが、クエリ本体（応答用アリーナ）と
@@ -2443,9 +2462,10 @@ pub(crate) fn execute_statement_with_cache(
                     );
                     Ok(())
                 };
-                let built = VectorArena::build_filtered_with_rows_in_txn_capturing(
+                let built = VectorArena::build_filtered_with_rows_from_source_in_txn_capturing(
                     read_txn,
                     &bound.table,
+                    bound.dense_source,
                     rls_hook.predicate(),
                     on_visible_row,
                     &mut rls_capture,
