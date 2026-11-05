@@ -61,7 +61,7 @@ fandhe 側にテストで固定した根拠がある項目に限る。差異・�
 - 同等以上（根拠テストあり）:
   - 内容不一致の検出（`recovery_content_hash.rs` の `insert_resend_same_content_is_23505_and_different_content_is_22023`・`update_resend_with_different_content_is_22023`）。DB コアの代替手段は一意キーの衝突しか見ない
   - 書き込みとの原子性と keep-first（`recovery_ledger.rs` の `t2_ledger_write_is_atomic_with_row_write_failure`・`t8_keep_first_entry_remains_recorded_after_second_use`）
-  - 並行再送で成功 1 件のみ（`table_rls/recovery_concurrent_resend.rs`、`concurrent_same_operation_id_same_content_inserts_yield_exactly_one_success`）
+  - 並行再送で成功 1 件のみ（`table_rls/recovery_content_hash.rs`、`concurrent_same_operation_id_same_content_inserts_yield_exactly_one_success`）
   - テナントの分離（`t4_ledger_scope_is_per_tenant`。ID はサーバー導出）
   - UPDATE／DELETE／TRUNCATE まで対象にしていること（DB コアの UPSERT 系は INSERT のみ）
   - 失敗した Tx が記録を残さないこと（`core_misc/recover12_txn_failure_no_ledger.rs`・`recover12_explicit_txn_resend.rs`）
