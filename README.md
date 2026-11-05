@@ -779,6 +779,12 @@ github.ref == 'refs/heads/main'`・`checkout ref: main` は defense-in-depth
 `BENCH_DEDICATED_ENV`。値は 0/1 や専有環境宣言で非機密）は引き続き repo
 variables のままです。
 
+`bench-rls-timing`（Issue #2080。RLS-9・RLS-10 のレイテンシ非観測性の参考実測。判定基準と実測は
+`docs/design/rls-timing-bench.md`）は例外で、判定基準が本リポで決めた公開値のため secrets を
+使わず、Environment `bench-gate` も付けません（`if: github.ref == 'refs/heads/main'`・
+`checkout ref: main` は維持）。判定結果は終了コードに反映せず既定ゲートに含めません
+（事前検査の失敗・2 arm の応答不一致・計測中の期待外応答だけがジョブを red にします）。
+
 > [!WARNING]
 > **workflow を一度でも実行する前に、必ず deployment branch policy（`main` のみ）付きで Environment `bench-gate` を作成してください。** 未作成のまま `environment: bench-gate` を指定した job が走ると、GitHub は branch policy なしの environment を自動作成してしまい、`main` 以外の ref からもアクセスできる状態になります（`recall-gate` と同じ注意点）。**本リポジトリでは Environment `bench-gate` は作成済みです**（branch policy `main` 付き）。
 
