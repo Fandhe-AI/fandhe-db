@@ -52,6 +52,20 @@ thread_local! {
     static SINK: RefCell<Option<HnswObservation>> = const { RefCell::new(None) };
     /// true の間はキャッシュ状態（cached／built／rebuilt／not_indexed）の記録を捨てる。
     static CACHE_SUPPRESSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// 事前構築（`prepare_base_from_full_visible`）が同じ検索の解決を既に built／rebuilt として
+    /// 数えたことを、直後の部分集合解決へ引き継ぐフラグ。
+    static PRE_RESOLVED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// 事前構築が解決を数え済みであることを記録する。直後の部分集合解決が [`take_pre_resolved`] で
+/// 受け取り、cached を重ねて数えない（built／rebuilt と cached を排他にする。Issue #2056）。
+pub(crate) fn mark_pre_resolved() {
+    let _ = PRE_RESOLVED.try_with(|c| c.set(true));
+}
+
+/// [`mark_pre_resolved`] のフラグを取り出して下ろす。
+pub(crate) fn take_pre_resolved() -> bool {
+    PRE_RESOLVED.try_with(|c| c.replace(false)).unwrap_or(false)
 }
 
 /// キャッシュ状態の記録を一時的に止めるガード。反復スキャンの 2 ラウンド目以降が同じ検索の
@@ -90,6 +104,7 @@ pub(crate) struct HnswObserveGuard {
 
 /// 観測を開始する。返るガードが生きている間だけ [`note`] が値を書き込む。
 pub(crate) fn enter() -> HnswObserveGuard {
+    let _ = PRE_RESOLVED.try_with(|c| c.set(false));
     let prev = SINK
         .try_with(|s| {
             s.try_borrow_mut()
@@ -225,5 +240,18 @@ mod tests {
         let o = g.finish();
         assert_eq!(o.cache_cached, 2);
         assert_eq!(o.exact_scan_switches, 1);
+    }
+
+    #[test]
+    fn pre_resolved_flag_is_taken_once_and_reset_on_enter() {
+        let g = enter();
+        assert!(!take_pre_resolved());
+        mark_pre_resolved();
+        assert!(take_pre_resolved());
+        assert!(!take_pre_resolved());
+        mark_pre_resolved();
+        drop(g);
+        let _g2 = enter();
+        assert!(!take_pre_resolved());
     }
 }

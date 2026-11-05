@@ -1912,6 +1912,9 @@ pub(crate) fn prepare_subset(
     ctx: &PolicyContext,
     arena: &VectorArena,
 ) -> PreparedHnswSearch {
+    // 事前構築が数え済みの検索では、この解決を重ねて数えない。
+    let _suppress = crate::sql::hnsw_observe::take_pre_resolved()
+        .then(crate::sql::hnsw_observe::suppress_cache_notes);
     let prepared = prepare_subset_inner(access, read_txn, table, ctx, arena);
     note_resolution(&prepared);
     prepared
@@ -2070,6 +2073,9 @@ pub(crate) fn prepare_subset_from_slots(
     kept: &[u32],
     k: usize,
 ) -> SubsetSlotPlan {
+    // 事前構築が数え済みの検索では、この解決を重ねて数えない。
+    let _suppress = crate::sql::hnsw_observe::take_pre_resolved()
+        .then(crate::sql::hnsw_observe::suppress_cache_notes);
     let before = crate::sql::hnsw_observe::cache_not_indexed();
     let plan =
         prepare_subset_from_slots_inner(access, read_txn, table, ctx, snapshot_arena, kept, k);
@@ -2966,7 +2972,12 @@ pub(crate) fn prepare_base_from_full_visible(
     ctx: &PolicyContext,
     full_visible_arena: &VectorArena,
 ) {
+    let before = crate::sql::hnsw_observe::build_events();
     let _ = prepare_full_visible_inner(access, read_txn, table, ctx, full_visible_arena);
+    // 構築した場合は built／rebuilt を数え済み。直後の部分集合解決は cached を足さない。
+    if crate::sql::hnsw_observe::build_events() != before {
+        crate::sql::hnsw_observe::mark_pre_resolved();
+    }
 }
 
 #[cfg(test)]
