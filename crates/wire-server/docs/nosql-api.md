@@ -883,14 +883,47 @@ JSON の各フィールドを SQL 表層と同じ字句トークン列へ写像�
 {"op": "drop_table", "table": "docs"}
 ```
 
-`create_index`／`drop_index`／`create_view`／`drop_view` は NOSQL-13 の対象外
-のまま語彙外（`0A000`）に据え置く。
+`create_view`／`drop_view` は NOSQL-13 の対象外のまま語彙外（`0A000`）に据え置く。
+`create_index`／`drop_index` は次の小節で op 形を確定している。
 
 検証コード: `crates/wire-server/src/http/query/op.rs`・`schema.rs`・
 `ddl.rs`（単体テスト）・`gate.rs`・
 `crates/wire-server/tests/nosql13_ddl.rs`・`nosql1_op_vocabulary.rs`・
 `nosql8_schema_validation.rs`・`nosql9_op_allowlist.rs`・
 `crates/engine/tests/sql_ddl_tokens_public_api.rs`。
+
+### create_index／drop_index（索引 DDL）
+
+op 形は Issue #2107 で確定済み。**結線は Issue #2108 で、それまでは語彙外（`0A000`）のまま**
+（以下は確定した形であり、現時点の動作ではない）。写像・権限・エラー分類の詳細は
+[nosql-index-ddl-mapping.md](../../../docs/design/nosql-index-ddl-mapping.md)（NOSQL-19・INDEX-7・INDEX-8）。
+
+| op | キー | 必須 | 型 |
+| -- | ---- | ---- | -- |
+| `create_index` | `name`・`table` | ○ | string |
+| | `columns` | ○ | string[]（1 件以上） |
+| | `method` | 任意 | `"btree"`／`"hnsw"`／`"gin"` |
+| | `opclass` | 任意 | `vector_{cosine,l2,ip,l1}_ops`／`jsonb_ops`／`jsonb_path_ops`（`columns` が 1 件のときのみ） |
+| | `with` | 任意 | `{"m"?, "ef_construction"?}`（非負整数。範囲は engine が検査し `22023`） |
+| `drop_index` | `name` | ○ | string |
+
+要求例:
+
+```json
+{"op": "create_index", "name": "docs_title_idx", "table": "docs", "columns": ["title"]}
+{"op": "create_index", "name": "docs_emb_idx", "table": "docs", "columns": ["emb"],
+ "method": "hnsw", "opclass": "vector_cosine_ops", "with": {"m": 16, "ef_construction": 64}}
+{"op": "create_index", "name": "docs_meta_idx", "table": "docs", "columns": ["meta"],
+ "method": "gin", "opclass": "jsonb_path_ops"}
+{"op": "drop_index", "name": "docs_title_idx"}
+```
+
+- 成功応答は `{"ok":true}`。実行は DDL を許された主体に限り、権限の無い主体には存否にかかわらず
+  同一の `42501`（403）
+- 未知キー・型不一致・識別子不正・語彙外の `opclass`（`halfvec_*_ops` を含む）・`with: {}` は `42601`。
+  UNIQUE・`IF [NOT] EXISTS`・`COLLATE`・式索引・部分索引は対応キーが無く未知キーとして `42601`
+- 方式と opclass の不一致は `42704`、複数列の `hnsw`／`gin` や `hnsw` 以外の `with` は `0A000`、
+  表・列・索引の不在や衝突は `42P01`／`42703`／`42704`／`42P07`（engine の判定。SQL 表層と同じ）
 
 ## `filter` 配列
 
@@ -1194,7 +1227,8 @@ nosql16_explain_targets.rs`（`vector` 指定 `search`・`scan`・`aggregate` �
 - `GROUP BY` への `LIMIT` の付与（`ORDER BY` は `aggregate` の `sort` で対応済み）
 - `ALTER TABLE ... ALTER COLUMN TYPE` 相当の op（`alter_table` に語彙なし。別論点）
 - `alter_table` での `CHECK` の追加・削除、算術式を含む `CHECK` 述語、列制約形の既定名（Issue #1199 の対象外）
-- `CREATE INDEX`／`DROP INDEX`／`CREATE VIEW`／`DROP VIEW`（NOSQL-13 の対象外）
+- `CREATE VIEW`／`DROP VIEW`（NOSQL-13 の対象外）
+- `CREATE INDEX`／`DROP INDEX`（op 形は Issue #2107 で確定済み。結線は Issue #2108）
 - `FOREIGN KEY` の `MATCH {SIMPLE|FULL}`／`[NOT] DEFERRABLE`／
   `INITIALLY {DEFERRED|IMMEDIATE}` 句（NoSQL `references` に対応キーが無い。
   Issue #1148 の対象外。列リスト形の `SET NULL (col, ...)`／
@@ -1617,3 +1651,7 @@ curl -s -X POST http://127.0.0.1:5432/v1/session/close \
   申し送り候補）
 - `sort[].dir` を必須・小文字完全一致（`"asc"`／`"desc"`）とした実装既定
   （Issue #946。`filter[].op`・`having[].op` と同じ厳格な語彙判断を踏襲）
+- `create_index` で式索引・部分索引・UNIQUE・`IF [NOT] EXISTS` を NoSQL で表すか（Issue #2107。
+  現状は未知キーとして `42601`）
+- `create_index.opclass` の語彙外を `42601` とし、SQL 表層の `42704` と分けた判断（Issue #2107。
+  固定語彙の外という NoSQL の厳格方針による）
