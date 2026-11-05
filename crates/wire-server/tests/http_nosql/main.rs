@@ -39,6 +39,7 @@ mod nosql16_explain_targets;
 mod nosql16_multi_group_by;
 mod nosql17_typed_json_parity;
 mod nosql18_conditional_dml;
+mod nosql19_index_ddl;
 mod nosql1_endpoint_routing;
 mod nosql1_op_vocabulary;
 mod nosql20_openapi_endpoint;

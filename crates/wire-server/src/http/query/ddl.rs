@@ -36,6 +36,16 @@
 //! より前に判定するため。`ParsedSql::CreateTable` 等のドキュメント参照）が
 //! 返る——存在オラクルにならない。
 //!
+//! ## `create_index`／`drop_index`（Issue #2108・NOSQL-19）
+//!
+//! `create_index` は `CREATE INDEX <name> ON <table> [USING <method>]
+//! (<col> [<opclass>], ...) [WITH (m = n, ef_construction = n)]`、`drop_index` は
+//! `DROP INDEX <name>` のトークン列へ写像し、`validate_create_index_tokens`／
+//! `validate_drop_index_tokens` と [`run_ddl`] を通す（op 形の設計は
+//! `docs/design/nosql-index-ddl-mapping.md`）。`method`／`opclass`／`with` のキーは
+//! 固定語彙の `match` だけで固定トークンへ写し、untrusted 文字列を `Token::Ident` へ
+//! 流用しない。method と opclass の組み合わせ・`WITH` の範囲検証は engine が担う。
+//!
 //! ## 列型の語彙（Issue #1409）
 //!
 //! `create_table.columns[*]` と `alter_table.add_column` は共通の
@@ -117,7 +127,8 @@ use engine::core::{EngineCore, ParsedSql};
 use engine::error_format::{ClassifiedError, ErrorClass};
 use engine::json::JsonValue;
 use engine::sql::allowlist::{
-    validate_alter_table_tokens, validate_create_table_tokens_with_implicit_id,
+    validate_alter_table_tokens, validate_create_index_tokens,
+    validate_create_table_tokens_with_implicit_id, validate_drop_index_tokens,
     validate_drop_table_tokens, SqlSurfaceError,
 };
 use engine::sql::lexer::{tokenize, Keyword, Token};
@@ -131,6 +142,7 @@ use super::schema::{
     SchemaError, Validated, CHECK_LEAF_SCHEMA, DDL_ADD_COLUMN_SCHEMA, DDL_COLUMN_SCHEMA,
     DDL_CONSTRAINT_SCHEMA, DDL_DROP_COLUMN_SCHEMA, DDL_REFERENCES_SCHEMA,
 };
+use engine::catalog::MAX_COLUMN_COUNT;
 
 /// 旧 `create_table` の CHECK 未実装応答文言。Issue #1199 で CHECK を実装した
 /// ため、本クレート内では使用しない（公開 API 互換のため残置）。
@@ -859,6 +871,142 @@ pub fn execute_drop_table(
     run_ddl(core, principal, ParsedSql::DropTable(stmt))
 }
 
+/// `create_index.method` の固定語彙（小文字のみ）。語彙外は `None`。
+fn index_method_ident(raw: &str) -> Option<&'static str> {
+    match raw {
+        "btree" => Some("btree"),
+        "hnsw" => Some("hnsw"),
+        "gin" => Some("gin"),
+        _ => None,
+    }
+}
+
+/// `create_index.opclass` の固定語彙（小文字のみ）。語彙外（`halfvec_*_ops` を含む）は `None`。
+/// method との組み合わせの妥当性は engine が判定する。
+fn index_opclass_ident(raw: &str) -> Option<&'static str> {
+    match raw {
+        "vector_cosine_ops" => Some("vector_cosine_ops"),
+        "vector_l2_ops" => Some("vector_l2_ops"),
+        "vector_ip_ops" => Some("vector_ip_ops"),
+        "vector_l1_ops" => Some("vector_l1_ops"),
+        "jsonb_ops" => Some("jsonb_ops"),
+        "jsonb_path_ops" => Some("jsonb_path_ops"),
+        _ => None,
+    }
+}
+
+/// 固定文字列から `Token::Ident` を作る（呼び出し側は固定語彙のみを渡す）。
+fn fixed_ident(s: &str) -> Token {
+    Token::Ident(s.to_string())
+}
+
+/// `create_index` の JSON を `CREATE INDEX ...` のトークン列へ写像する（カタログ照会なし。
+/// [`execute_create_index`] が呼び、engine なしで単体テストできるよう切り出している）。
+fn build_create_index_tokens(validated: &Validated<'_>) -> Result<Vec<Token>, DdlError> {
+    let name = ident_token(validated.required_str("name").map_err(DdlError::from)?)?;
+    let table = ident_token(validated.required_str("table").map_err(DdlError::from)?)?;
+    let columns = validated
+        .required_array("columns")
+        .map_err(DdlError::from)?;
+    // `Vec` を確保する前に件数を検査する（untrusted な配列長）。
+    if columns.is_empty() {
+        return Err(DdlError::InvalidRequest);
+    }
+    if columns.len() > MAX_COLUMN_COUNT {
+        return Err(DdlError::Engine(SqlSurfaceError::PayloadTooLarge {
+            detail: "too many index columns".to_string(),
+        }));
+    }
+    let method = match validated.optional_str("method").map_err(DdlError::from)? {
+        Some(raw) => Some(index_method_ident(raw).ok_or(DdlError::InvalidRequest)?),
+        None => None,
+    };
+    let opclass = match validated.optional_str("opclass").map_err(DdlError::from)? {
+        Some(raw) => Some(index_opclass_ident(raw).ok_or(DdlError::InvalidRequest)?),
+        None => None,
+    };
+    if opclass.is_some() && columns.len() != 1 {
+        return Err(DdlError::InvalidRequest);
+    }
+
+    let mut tokens = vec![
+        fixed_ident("CREATE"),
+        fixed_ident("INDEX"),
+        name,
+        fixed_ident("ON"),
+        table,
+    ];
+    if let Some(method) = method {
+        tokens.push(fixed_ident("USING"));
+        tokens.push(fixed_ident(method));
+    }
+    tokens.push(Token::Punct('('));
+    for (i, column) in columns.iter().enumerate() {
+        if i > 0 {
+            tokens.push(Token::Punct(','));
+        }
+        let JsonValue::String(col) = column else {
+            return Err(DdlError::InvalidRequest);
+        };
+        tokens.push(ident_token(col)?);
+        if let Some(opclass) = opclass {
+            tokens.push(fixed_ident(opclass));
+        }
+    }
+    tokens.push(Token::Punct(')'));
+
+    if let Some(with) = validated.optional_nested("with").map_err(DdlError::from)? {
+        let m = with.optional_u32("m").map_err(DdlError::from)?;
+        let ef = with
+            .optional_u32("ef_construction")
+            .map_err(DdlError::from)?;
+        if m.is_none() && ef.is_none() {
+            return Err(DdlError::InvalidRequest);
+        }
+        tokens.push(fixed_ident("WITH"));
+        tokens.push(Token::Punct('('));
+        if let Some(m) = m {
+            tokens.push(fixed_ident("m"));
+            tokens.push(Token::Punct('='));
+            tokens.push(number_token(m));
+        }
+        if let Some(ef) = ef {
+            if m.is_some() {
+                tokens.push(Token::Punct(','));
+            }
+            tokens.push(fixed_ident("ef_construction"));
+            tokens.push(Token::Punct('='));
+            tokens.push(number_token(ef));
+        }
+        tokens.push(Token::Punct(')'));
+    }
+    Ok(tokens)
+}
+
+/// `create_index` op を実行する（NOSQL-19、Issue #2108）。
+pub fn execute_create_index(
+    core: &EngineCore,
+    principal: &SessionPrincipal,
+    validated: &Validated<'_>,
+) -> Result<(), DdlError> {
+    let tokens = build_create_index_tokens(validated)?;
+    let stmt = validate_create_index_tokens(&tokens)?;
+    run_ddl(core, principal, ParsedSql::CreateIndex(stmt))
+}
+
+/// `drop_index` op を実行する（NOSQL-19、Issue #2108）。HTTP は要求ごとに新しい
+/// `SessionState` を作り一時表が存在しないため、SQL 側の一時表振り分けは不要。
+pub fn execute_drop_index(
+    core: &EngineCore,
+    principal: &SessionPrincipal,
+    validated: &Validated<'_>,
+) -> Result<(), DdlError> {
+    let name = ident_token(validated.required_str("name").map_err(DdlError::from)?)?;
+    let tokens = vec![fixed_ident("DROP"), fixed_ident("INDEX"), name];
+    let stmt = validate_drop_index_tokens(&tokens)?;
+    run_ddl(core, principal, ParsedSql::DropIndex(stmt))
+}
+
 /// [`execute_create_table`]・[`execute_alter_table`]・[`execute_drop_table`]
 /// が共有する実行本体。`principal.ddl_allowed()` に応じて
 /// `SessionState::allow_ddl()` を呼んだうえで、SQL 表層の DDL と単一の
@@ -917,6 +1065,32 @@ pub fn handle_drop_table(
     now_wall: std::time::SystemTime,
 ) -> Vec<u8> {
     match execute_drop_table(core, principal, validated) {
+        Ok(()) => http_response::encode_ok(OK_BODY, now_wall),
+        Err(err) => http_response::encode_error(err.error_class(), &err.client_message(), now_wall),
+    }
+}
+
+/// `POST /v1/query` の `create_index` op を処理し応答バイト列を返す。
+pub fn handle_create_index(
+    core: &EngineCore,
+    principal: &SessionPrincipal,
+    validated: &Validated<'_>,
+    now_wall: std::time::SystemTime,
+) -> Vec<u8> {
+    match execute_create_index(core, principal, validated) {
+        Ok(()) => http_response::encode_ok(OK_BODY, now_wall),
+        Err(err) => http_response::encode_error(err.error_class(), &err.client_message(), now_wall),
+    }
+}
+
+/// `POST /v1/query` の `drop_index` op を処理し応答バイト列を返す。
+pub fn handle_drop_index(
+    core: &EngineCore,
+    principal: &SessionPrincipal,
+    validated: &Validated<'_>,
+    now_wall: std::time::SystemTime,
+) -> Vec<u8> {
+    match execute_drop_index(core, principal, validated) {
         Ok(()) => http_response::encode_ok(OK_BODY, now_wall),
         Err(err) => http_response::encode_error(err.error_class(), &err.client_message(), now_wall),
     }
@@ -1914,5 +2088,122 @@ mod tests {
         assert!(matches!(err, DdlError::FeatureNotSupported(_)), "{err:?}");
         drop(core);
         let _ = std::fs::remove_file(&path);
+    }
+
+    // --- create_index／drop_index（Issue #2108・NOSQL-19） -------------------
+
+    fn index_tokens(json: &str) -> Result<Vec<Token>, DdlError> {
+        let value = obj(json);
+        let v = super::super::schema::CREATE_INDEX_SCHEMA
+            .validate(&value)
+            .expect("fixture must pass the create_index schema");
+        build_create_index_tokens(&v)
+    }
+
+    fn sql_tokens(sql: &str) -> Vec<Token> {
+        tokenize(sql).expect("fixture SQL must tokenize")
+    }
+
+    #[test]
+    fn create_index_tokens_match_sql_tokenization() {
+        let cases = [
+            (
+                r#"{"op":"create_index","name":"i","table":"t","columns":["a","b"]}"#,
+                "CREATE INDEX i ON t (a, b)",
+            ),
+            (
+                r#"{"op":"create_index","name":"i","table":"t","method":"hnsw","columns":["c"],"opclass":"vector_cosine_ops","with":{"m":16,"ef_construction":64}}"#,
+                "CREATE INDEX i ON t USING hnsw (c vector_cosine_ops) WITH (m = 16, ef_construction = 64)",
+            ),
+            (
+                r#"{"op":"create_index","name":"i","table":"t","method":"gin","columns":["j"],"opclass":"jsonb_path_ops"}"#,
+                "CREATE INDEX i ON t USING gin (j jsonb_path_ops)",
+            ),
+            (
+                r#"{"op":"create_index","name":"i","table":"t","method":"hnsw","columns":["c"],"with":{"ef_construction":64}}"#,
+                "CREATE INDEX i ON t USING hnsw (c) WITH (ef_construction = 64)",
+            ),
+        ];
+        for (json, sql) in cases {
+            assert_eq!(index_tokens(json).expect("map"), sql_tokens(sql), "{sql}");
+        }
+    }
+
+    #[test]
+    fn drop_index_tokens_match_sql_tokenization() {
+        let expected = sql_tokens("DROP INDEX i");
+        let actual = vec![
+            fixed_ident("DROP"),
+            fixed_ident("INDEX"),
+            ident_token("i").expect("ident"),
+        ];
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn create_index_rejects_out_of_vocabulary_and_malformed_shapes() {
+        let cases = [
+            r#"{"op":"create_index","name":"i","table":"t","method":"hnsw","columns":["c"],"opclass":"VECTOR_COSINE_OPS"}"#,
+            r#"{"op":"create_index","name":"i","table":"t","method":"hnsw","columns":["c"],"opclass":"halfvec_cosine_ops"}"#,
+            r#"{"op":"create_index","name":"i","table":"t","method":"hnsw","columns":["c"],"opclass":""}"#,
+            r#"{"op":"create_index","name":"i","table":"t","method":"HNSW","columns":["c"]}"#,
+            r#"{"op":"create_index","name":"i","table":"t","method":"ivfflat","columns":["c"]}"#,
+            r#"{"op":"create_index","name":"i","table":"t","columns":[]}"#,
+            r#"{"op":"create_index","name":"i","table":"t","columns":["a","b"],"opclass":"jsonb_ops"}"#,
+            r#"{"op":"create_index","name":"i","table":"t","method":"hnsw","columns":["c"],"with":{}}"#,
+            r#"{"op":"create_index","name":"bad name","table":"t","columns":["c"]}"#,
+            r#"{"op":"create_index","name":"i","table":"t","columns":["a b"]}"#,
+        ];
+        for json in cases {
+            let err = index_tokens(json).expect_err(json);
+            assert!(
+                matches!(err, DdlError::InvalidRequest | DdlError::InvalidIdentifier),
+                "{json}"
+            );
+            assert_eq!(
+                err.error_class(),
+                ErrorClass::UnsupportedSqlSyntax,
+                "{json}"
+            );
+        }
+    }
+
+    #[test]
+    fn create_index_rejects_negative_or_fractional_with_values() {
+        for json in [
+            r#"{"op":"create_index","name":"i","table":"t","columns":["c"],"with":{"m":-1}}"#,
+            r#"{"op":"create_index","name":"i","table":"t","columns":["c"],"with":{"m":1.5}}"#,
+            r#"{"op":"create_index","name":"i","table":"t","columns":["c"],"with":{"ef_construction":4294967296}}"#,
+        ] {
+            let err = index_tokens(json).expect_err(json);
+            assert_eq!(
+                err.error_class(),
+                ErrorClass::UnsupportedSqlSyntax,
+                "{json}"
+            );
+        }
+    }
+
+    #[test]
+    fn create_index_column_count_over_limit_is_54000() {
+        let cols: Vec<String> = (0..=MAX_COLUMN_COUNT)
+            .map(|i| format!("\"c{i}\""))
+            .collect();
+        let json = format!(
+            r#"{{"op":"create_index","name":"i","table":"t","columns":[{}]}}"#,
+            cols.join(",")
+        );
+        let err = index_tokens(&json).expect_err("too many columns");
+        assert_eq!(err.error_class(), ErrorClass::PayloadTooLarge);
+        assert!(!err.client_message().contains("c1"));
+    }
+
+    #[test]
+    fn create_index_error_messages_do_not_echo_input() {
+        let err = index_tokens(
+            r#"{"op":"create_index","name":"i","table":"t","columns":["c"],"opclass":"secret_tenant_ops"}"#,
+        )
+        .expect_err("vocabulary");
+        assert_eq!(err.client_message(), INVALID_DDL_REQUEST_MESSAGE);
     }
 }

@@ -150,6 +150,55 @@
         ],
         "type": "object"
       },
+      "create_index": {
+        "additionalProperties": false,
+        "properties": {
+          "columns": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "method": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "op": {
+            "const": "create_index",
+            "type": "string"
+          },
+          "opclass": {
+            "type": "string"
+          },
+          "table": {
+            "type": "string"
+          },
+          "with": {
+            "$ref": "#/components/schemas/create_index_with"
+          }
+        },
+        "required": [
+          "op",
+          "name",
+          "table",
+          "columns"
+        ],
+        "type": "object"
+      },
+      "create_index_with": {
+        "additionalProperties": false,
+        "properties": {
+          "ef_construction": {
+            "type": "number"
+          },
+          "m": {
+            "type": "number"
+          }
+        },
+        "type": "object"
+      },
       "create_table": {
         "additionalProperties": false,
         "properties": {
@@ -388,6 +437,23 @@
         "required": [
           "op",
           "table"
+        ],
+        "type": "object"
+      },
+      "drop_index": {
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "op": {
+            "const": "drop_index",
+            "type": "string"
+          }
+        },
+        "required": [
+          "op",
+          "name"
         ],
         "type": "object"
       },
@@ -779,8 +845,10 @@
                     "aggregate": "#/components/schemas/aggregate",
                     "alter_table": "#/components/schemas/alter_table",
                     "cancel_partitioned_dml": "#/components/schemas/cancel_partitioned_dml",
+                    "create_index": "#/components/schemas/create_index",
                     "create_table": "#/components/schemas/create_table",
                     "delete": "#/components/schemas/delete",
+                    "drop_index": "#/components/schemas/drop_index",
                     "drop_table": "#/components/schemas/drop_table",
                     "insert": "#/components/schemas/insert",
                     "scan": "#/components/schemas/scan",
@@ -821,6 +889,12 @@
                   },
                   {
                     "$ref": "#/components/schemas/drop_table"
+                  },
+                  {
+                    "$ref": "#/components/schemas/create_index"
+                  },
+                  {
+                    "$ref": "#/components/schemas/drop_index"
                   },
                   {
                     "$ref": "#/components/schemas/show_partitioned_dml"

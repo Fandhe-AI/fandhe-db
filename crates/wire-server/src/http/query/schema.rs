@@ -1501,6 +1501,96 @@ pub static DROP_TABLE_SCHEMA: ObjectSchema = ObjectSchema {
     ],
 };
 
+/// `create_index.with` のサブスキーマ（HNSW の索引オプション。NOSQL-19、Issue #2108）。
+/// 範囲・相互制約の検証は engine（`HnswIndexOptions::new`）に任せ、ここでは形だけを見る。
+pub static CREATE_INDEX_WITH_SCHEMA: ObjectSchema = ObjectSchema {
+    name: "create_index_with",
+    fields: &[
+        FieldSpec {
+            key: "m",
+            presence: Presence::Optional,
+            ty: FieldType::Number,
+            nullable: false,
+        },
+        FieldSpec {
+            key: "ef_construction",
+            presence: Presence::Optional,
+            ty: FieldType::Number,
+            nullable: false,
+        },
+    ],
+};
+
+/// `create_index` op のトップレベルスキーマ（NOSQL-19、Issue #2108）。
+/// 語彙（`method`／`opclass`）の検証は [`super::ddl`] の固定語彙 `match` が担う。
+pub static CREATE_INDEX_SCHEMA: ObjectSchema = ObjectSchema {
+    name: "create_index",
+    fields: &[
+        FieldSpec {
+            key: "op",
+            presence: Presence::Required,
+            ty: FieldType::String,
+            nullable: false,
+        },
+        FieldSpec {
+            key: "name",
+            presence: Presence::Required,
+            ty: FieldType::String,
+            nullable: false,
+        },
+        FieldSpec {
+            key: "table",
+            presence: Presence::Required,
+            ty: FieldType::String,
+            nullable: false,
+        },
+        FieldSpec {
+            key: "columns",
+            presence: Presence::Required,
+            ty: FieldType::Array(ElementType::String),
+            nullable: false,
+        },
+        FieldSpec {
+            key: "method",
+            presence: Presence::Optional,
+            ty: FieldType::String,
+            nullable: false,
+        },
+        FieldSpec {
+            key: "opclass",
+            presence: Presence::Optional,
+            ty: FieldType::String,
+            nullable: false,
+        },
+        FieldSpec {
+            key: "with",
+            presence: Presence::Optional,
+            ty: FieldType::Object(&CREATE_INDEX_WITH_SCHEMA),
+            nullable: false,
+        },
+    ],
+};
+
+/// `drop_index` op のトップレベルスキーマ（NOSQL-19、Issue #2108）。`table` を持たない
+/// （索引名は表をまたいで一意）ため、セッションスコープの `tables` 制限下では常に拒否される。
+pub static DROP_INDEX_SCHEMA: ObjectSchema = ObjectSchema {
+    name: "drop_index",
+    fields: &[
+        FieldSpec {
+            key: "op",
+            presence: Presence::Required,
+            ty: FieldType::String,
+            nullable: false,
+        },
+        FieldSpec {
+            key: "name",
+            presence: Presence::Required,
+            ty: FieldType::String,
+            nullable: false,
+        },
+    ],
+};
+
 /// `show_partitioned_dml`／`cancel_partitioned_dml` op 共通のフィールド宣言を持つスキーマ
 /// （Issue #1130・NOSQL-12・RECOVER-11）。`operation_id` は欠落・`null`・空文字を
 /// `23502` へ収束させるため Optional＋nullable（`update` op と同じ）。
@@ -1555,7 +1645,7 @@ pub static CANCEL_PARTITIONED_DML_SCHEMA: ObjectSchema = ObjectSchema {
 
 /// op 名（厳密一致。trim・大文字小文字の読み替えはしない）→ [`ObjectSchema`]
 /// の対応表。`schema_for` の実体であり、単一情報源として扱う。
-pub const OP_SCHEMAS: [(&str, &ObjectSchema); 12] = [
+pub const OP_SCHEMAS: [(&str, &ObjectSchema); 14] = [
     ("search", &SEARCH_SCHEMA),
     ("scan", &SCAN_SCHEMA),
     ("aggregate", &AGGREGATE_SCHEMA),
@@ -1566,6 +1656,8 @@ pub const OP_SCHEMAS: [(&str, &ObjectSchema); 12] = [
     ("create_table", &CREATE_TABLE_SCHEMA),
     ("alter_table", &ALTER_TABLE_SCHEMA),
     ("drop_table", &DROP_TABLE_SCHEMA),
+    ("create_index", &CREATE_INDEX_SCHEMA),
+    ("drop_index", &DROP_INDEX_SCHEMA),
     ("show_partitioned_dml", &SHOW_PARTITIONED_DML_SCHEMA),
     ("cancel_partitioned_dml", &CANCEL_PARTITIONED_DML_SCHEMA),
 ];
@@ -1619,6 +1711,8 @@ mod tests {
                 "create_table",
                 "alter_table",
                 "drop_table",
+                "create_index",
+                "drop_index",
                 "show_partitioned_dml",
                 "cancel_partitioned_dml",
             ]
@@ -1632,7 +1726,13 @@ mod tests {
     fn op_schemas_all_require_op_and_table() {
         for (name, schema) in OP_SCHEMAS.iter() {
             let op_spec = schema.fields.iter().find(|f| f.key == "op");
-            let table_spec = schema.fields.iter().find(|f| f.key == "table");
+            // `drop_index` は索引名のみで `table` を持たない（Issue #2108・NOSQL-19）。
+            let table_key = if *name == "drop_index" {
+                "name"
+            } else {
+                "table"
+            };
+            let table_spec = schema.fields.iter().find(|f| f.key == table_key);
             assert!(
                 matches!(
                     op_spec,
@@ -1653,7 +1753,7 @@ mod tests {
                         ..
                     })
                 ),
-                "op {name} must declare required string `table`"
+                "op {name} must declare required string `{table_key}`"
             );
         }
     }
@@ -2161,7 +2261,7 @@ mod tests {
 
     #[test]
     fn unknown_key_is_rejected_per_op() {
-        let cases: [(&'static ObjectSchema, &str); 9] = [
+        let cases: [(&'static ObjectSchema, &str); 11] = [
             (
                 &SEARCH_SCHEMA,
                 r#"{"op":"search","table":"docs","limit":1,"bogus":1}"#,
@@ -2197,6 +2297,14 @@ mod tests {
             (
                 &DROP_TABLE_SCHEMA,
                 r#"{"op":"drop_table","table":"docs","bogus":1}"#,
+            ),
+            (
+                &CREATE_INDEX_SCHEMA,
+                r#"{"op":"create_index","name":"i","table":"docs","columns":["a"],"unique":true}"#,
+            ),
+            (
+                &DROP_INDEX_SCHEMA,
+                r#"{"op":"drop_index","name":"i","if_exists":true}"#,
             ),
         ];
         for (schema, json) in cases {
@@ -2234,6 +2342,14 @@ mod tests {
             (
                 &DROP_TABLE_SCHEMA,
                 r#"{"op":"drop_table","table":"docs","tenant_id":"evil"}"#,
+            ),
+            (
+                &CREATE_INDEX_SCHEMA,
+                r#"{"op":"create_index","name":"i","table":"docs","columns":["a"],"tenant_id":"evil"}"#,
+            ),
+            (
+                &DROP_INDEX_SCHEMA,
+                r#"{"op":"drop_index","name":"i","tenant_id":"evil"}"#,
             ),
         ] {
             let v = obj(json);

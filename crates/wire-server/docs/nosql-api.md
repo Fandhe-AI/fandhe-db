@@ -1,9 +1,9 @@
 # NoSQL API
 
 `wire-server --surface nosql` が公開する 3 エンドポイント（`POST /v1/session`・
-`POST /v1/session/close`・`POST /v1/query`）と、`POST /v1/query` の `op` 12 値
+`POST /v1/session/close`・`POST /v1/query`）と、`POST /v1/query` の `op` 14 値
 （`search`／`scan`／`aggregate`／`insert`／`upsert`／`update`／`delete`／`create_table`／
-`alter_table`／`drop_table`／`show_partitioned_dml`／`cancel_partitioned_dml`）の JSON
+`alter_table`／`drop_table`／`create_index`／`drop_index`／`show_partitioned_dml`／`cancel_partitioned_dml`）の JSON
 スキーマを利用者向けに整理する。
 `update`／`delete` は `where`（単一行・PRIMARY KEY 列〔複合可〕または従来方式の表の `id`）・`filter`（述語形）の
 いずれも束縛・実行結線済み（後述の各節参照）で、期待値の条件 `if` を付けられる。`create_table`／`alter_table`／
@@ -217,7 +217,7 @@ curl -H "Authorization: Bearer <token>" http://127.0.0.1:5432/v1/openapi.json
 2. `Authorization: Bearer` 認証（`28000`）
 3. ヘッダの `tenant_id` 相当拒否（`42601`）
 4. 本文の UTF-8／JSON 構文／`op` フィールドの形（`42601`）
-5. `op` 許可リスト判定（12 値の厳密一致。語彙外は `0A000`。DDL・UDF 呼び出し・
+5. `op` 許可リスト判定（14 値の厳密一致。語彙外は `0A000`。DDL・UDF 呼び出し・
    トランザクション制御を含む）
 6. op 別スキーマ検証（必須キー欠落・未知キー・型不一致・`null` は `42601`。`scope` 相当キーもここで未知キーになる）
 7. `Idempotency-Key` ヘッダの解決（重複は `08P01`、空・256 バイト超・制御文字は `42601`。
@@ -1057,18 +1057,19 @@ JSON の各フィールドを SQL 表層と同じ字句トークン列へ写像�
 ```
 
 `create_view`／`drop_view` は NOSQL-13 の対象外のまま語彙外（`0A000`）に据え置く。
-`create_index`／`drop_index` は次の小節で op 形を確定している。
+`create_index`／`drop_index` は次の小節（Issue #2108 で結線済み）で扱う。
 
 検証コード: `crates/wire-server/src/http/query/op.rs`・`schema.rs`・
 `ddl.rs`（単体テスト）・`gate.rs`・
 `crates/wire-server/tests/nosql13_ddl.rs`・`nosql1_op_vocabulary.rs`・
 `nosql8_schema_validation.rs`・`nosql9_op_allowlist.rs`・
-`crates/engine/tests/sql_ddl_tokens_public_api.rs`。
+`crates/engine/tests/sql_ddl_tokens_public_api.rs`・
+`crates/wire-server/tests/http_nosql/nosql19_index_ddl.rs`（索引 DDL）。
 
 ### create_index／drop_index（索引 DDL）
 
-op 形は Issue #2107 で確定済み。**結線は Issue #2108 で、それまでは語彙外（`0A000`）のまま**
-（以下は確定した形であり、現時点の動作ではない）。写像・権限・エラー分類の詳細は
+op 形は Issue #2107 で確定し、Issue #2108 で実行まで結線済み（SQL 表層の
+`CREATE INDEX`／`DROP INDEX` と同じ構造検証・実行器・権限ゲートを通る）。写像・権限・エラー分類の詳細は
 [nosql-index-ddl-mapping.md](../../../docs/design/nosql-index-ddl-mapping.md)（NOSQL-19・INDEX-7・INDEX-8）。
 
 | op | キー | 必須 | 型 |
@@ -1080,23 +1081,23 @@ op 形は Issue #2107 で確定済み。**結線は Issue #2108 で、それま�
 | | `with` | 任意 | `{"m"?, "ef_construction"?}`（非負整数。範囲は engine が検査し `22023`） |
 | `drop_index` | `name` | ○ | string |
 
-要求例（OP_SCHEMAS 未登録の op のため検証対象外の `jsonc` フェンス。1 op ごとに 1 つの JSON 値）:
+要求例（1 フェンスにつき 1 つの JSON 値）:
 
-```jsonc
+```json
 {"op": "create_index", "name": "docs_title_idx", "table": "docs", "columns": ["title"]}
 ```
 
-```jsonc
+```json
 {"op": "create_index", "name": "docs_emb_idx", "table": "docs", "columns": ["emb"],
  "method": "hnsw", "opclass": "vector_cosine_ops", "with": {"m": 16, "ef_construction": 64}}
 ```
 
-```jsonc
+```json
 {"op": "create_index", "name": "docs_meta_idx", "table": "docs", "columns": ["meta"],
  "method": "gin", "opclass": "jsonb_path_ops"}
 ```
 
-```jsonc
+```json
 {"op": "drop_index", "name": "docs_title_idx"}
 ```
 
@@ -1412,7 +1413,6 @@ nosql16_explain_targets.rs`（`vector` 指定 `search`・`scan`・`aggregate` �
 - `ALTER TABLE ... ALTER COLUMN TYPE` 相当の op（`alter_table` に語彙なし。別論点）
 - `alter_table` での `CHECK` の追加・削除、算術式を含む `CHECK` 述語、列制約形の既定名（Issue #1199 の対象外）
 - `CREATE VIEW`／`DROP VIEW`（NOSQL-13 の対象外）
-- `CREATE INDEX`／`DROP INDEX`（op 形は Issue #2107 で確定済み。結線は Issue #2108）
 - `FOREIGN KEY` の `MATCH {SIMPLE|FULL}`／`[NOT] DEFERRABLE`／
   `INITIALLY {DEFERRED|IMMEDIATE}` 句（NoSQL `references` に対応キーが無い。
   Issue #1148 の対象外。列リスト形の `SET NULL (col, ...)`／

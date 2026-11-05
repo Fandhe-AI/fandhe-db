@@ -6,6 +6,9 @@
 //! `docs/spec/04-behavior/nosql-surface.md` NOSQL-1・NOSQL-9・NOSQL-12・
 //! NOSQL-13）。
 //!
+//! `create_index`／`drop_index` は Issue #2108（NOSQL-19）で語彙へ加わり、[`super::ddl`] が
+//! SQL 表層の `CREATE INDEX`／`DROP INDEX` と同一の実行器へ写像する。
+//!
 //! `upsert` は Issue #2086（NOSQL-1・NOSQL-21）で語彙へ加わり、Issue #2087 で実行を結線した。
 //!
 //! 分割実行 DML の `show_partitioned_dml`／`cancel_partitioned_dml` は Issue #1130
@@ -13,9 +16,9 @@
 //!
 //! 責務境界: [`super::schema::extract_op`] が取り出した `op` 文字列を、
 //! [`Op::parse`] により **完全一致（大文字小文字・trim の読み替えなし）**
-//! でこの 12 値のいずれかへ分類する。これ以外の値（UDF 呼び出し・
-//! トランザクション制御・`create_index`／`drop_index`／`create_view`／
-//! `drop_view`（NOSQL-13 の対象外）・表記揺れをすべて含む）は
+//! でこの 14 値のいずれかへ分類する。これ以外の値（UDF 呼び出し・
+//! トランザクション制御・`create_view`／`drop_view`
+//! （NOSQL-13 の対象外。`create_index`／`drop_index` は Issue #2108 で語彙へ加わった）・表記揺れをすべて含む）は
 //! [`UnsupportedOp`] として `ErrorClass::FeatureNotSupported`（`0A000`）へ
 //! fail-closed に写像する。この判定は SQL 表層の許可リスト検証
 //! （`engine::sql::allowlist`・SQL-8）と同じ設計原則（許可リスト方式。
@@ -45,7 +48,7 @@ use super::schema::ObjectSchema;
 
 /// `POST /v1/query` の `op` が取りうる閉じた語彙。
 ///
-/// この 12 値以外を表す variant を追加しない（許可リストの意味が崩れる）。
+/// この 14 値以外を表す variant を追加しない（許可リストの意味が崩れる）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Op {
     Search,
@@ -65,6 +68,11 @@ pub enum Op {
     AlterTable,
     /// `DROP TABLE`（NOSQL-13・TASK-207、Issue #910）。
     DropTable,
+    /// `CREATE INDEX`（NOSQL-19、Issue #2108。op 形の設計は
+    /// `docs/design/nosql-index-ddl-mapping.md`）。[`super::ddl`] が実行を担う。
+    CreateIndex,
+    /// `DROP INDEX`（NOSQL-19、Issue #2108）。
+    DropIndex,
     /// `SHOW PARTITIONED DML` 相当の進捗照会（NOSQL-12・RECOVER-11、Issue #1130）。
     ShowPartitionedDml,
     /// `CANCEL PARTITIONED DML` 相当の取り消し（NOSQL-12・RECOVER-11、Issue #1130）。
@@ -74,7 +82,7 @@ pub enum Op {
 impl Op {
     /// 全 variant（宣言順）。[`super::schema::OP_SCHEMAS`] と名前列が
     /// 順序込みで一致することをテストで固定する。
-    pub const ALL: [Op; 12] = [
+    pub const ALL: [Op; 14] = [
         Op::Search,
         Op::Scan,
         Op::Aggregate,
@@ -85,6 +93,8 @@ impl Op {
         Op::CreateTable,
         Op::AlterTable,
         Op::DropTable,
+        Op::CreateIndex,
+        Op::DropIndex,
         Op::ShowPartitionedDml,
         Op::CancelPartitionedDml,
     ];
@@ -103,6 +113,8 @@ impl Op {
             "create_table" => Some(Op::CreateTable),
             "alter_table" => Some(Op::AlterTable),
             "drop_table" => Some(Op::DropTable),
+            "create_index" => Some(Op::CreateIndex),
+            "drop_index" => Some(Op::DropIndex),
             "show_partitioned_dml" => Some(Op::ShowPartitionedDml),
             "cancel_partitioned_dml" => Some(Op::CancelPartitionedDml),
             _ => None,
@@ -127,6 +139,8 @@ impl Op {
             | Op::AlterTable
             | Op::Upsert
             | Op::DropTable
+            | Op::CreateIndex
+            | Op::DropIndex
             | Op::ShowPartitionedDml
             | Op::CancelPartitionedDml => false,
         }
@@ -145,6 +159,8 @@ impl Op {
             | Op::CreateTable
             | Op::AlterTable
             | Op::DropTable
+            | Op::CreateIndex
+            | Op::DropIndex
             | Op::CancelPartitionedDml => false,
         }
     }
@@ -162,6 +178,8 @@ impl Op {
             Op::CreateTable => "create_table",
             Op::AlterTable => "alter_table",
             Op::DropTable => "drop_table",
+            Op::CreateIndex => "create_index",
+            Op::DropIndex => "drop_index",
             Op::ShowPartitionedDml => "show_partitioned_dml",
             Op::CancelPartitionedDml => "cancel_partitioned_dml",
         }
@@ -183,6 +201,8 @@ impl Op {
             | Op::CreateTable
             | Op::AlterTable
             | Op::DropTable
+            | Op::CreateIndex
+            | Op::DropIndex
             | Op::ShowPartitionedDml
             | Op::CancelPartitionedDml => true,
         }
@@ -202,6 +222,8 @@ impl Op {
             Op::CreateTable => &super::schema::CREATE_TABLE_SCHEMA,
             Op::AlterTable => &super::schema::ALTER_TABLE_SCHEMA,
             Op::DropTable => &super::schema::DROP_TABLE_SCHEMA,
+            Op::CreateIndex => &super::schema::CREATE_INDEX_SCHEMA,
+            Op::DropIndex => &super::schema::DROP_INDEX_SCHEMA,
             Op::ShowPartitionedDml => &super::schema::SHOW_PARTITIONED_DML_SCHEMA,
             Op::CancelPartitionedDml => &super::schema::CANCEL_PARTITIONED_DML_SCHEMA,
         }
@@ -253,8 +275,6 @@ mod tests {
             );
             assert_eq!(op.allowed_in_read_only(), expected, "{}", op.name());
         }
-        // 語彙外（create_index／drop_index）は手順 3 で 0A000 になりスコープ検査へ到達しない。
-        assert!(Op::parse("create_index").is_none() && Op::parse("drop_index").is_none());
     }
 
     #[test]
@@ -274,7 +294,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_accepts_exact_twelve_values() {
+    fn parse_accepts_exact_fourteen_values() {
         assert_eq!(Op::parse("search"), Some(Op::Search));
         assert_eq!(Op::parse("scan"), Some(Op::Scan));
         assert_eq!(Op::parse("aggregate"), Some(Op::Aggregate));
@@ -285,6 +305,8 @@ mod tests {
         assert_eq!(Op::parse("create_table"), Some(Op::CreateTable));
         assert_eq!(Op::parse("alter_table"), Some(Op::AlterTable));
         assert_eq!(Op::parse("drop_table"), Some(Op::DropTable));
+        assert_eq!(Op::parse("create_index"), Some(Op::CreateIndex));
+        assert_eq!(Op::parse("drop_index"), Some(Op::DropIndex));
         assert_eq!(
             Op::parse("show_partitioned_dml"),
             Some(Op::ShowPartitionedDml)
@@ -296,7 +318,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_rejects_vocabulary_outside_twelve_values() {
+    fn parse_rejects_vocabulary_outside_fourteen_values() {
         let negatives = [
             "",
             " search",
@@ -314,8 +336,10 @@ mod tests {
             " show_partitioned_dml",
             "cancel_partitioned_dml ",
             "Cancel_Partitioned_Dml",
-            "create_index",
-            "drop_index",
+            "CREATE_INDEX",
+            " drop_index",
+            "create_index ",
+            "Drop_Index",
             "create_view",
             "drop_view",
             "call",
@@ -362,7 +386,7 @@ mod tests {
 
     #[test]
     fn unsupported_op_message_is_always_the_fixed_literal() {
-        for raw in ["begin", "create_index", "SEARCH", ""] {
+        for raw in ["begin", "create_view", "SEARCH", ""] {
             let err = classify_op(raw).unwrap_err();
             assert_eq!(err.client_message(), "unsupported op");
         }
