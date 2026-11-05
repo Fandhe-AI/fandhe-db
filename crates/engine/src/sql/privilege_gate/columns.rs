@@ -136,18 +136,16 @@ pub(crate) fn resolve(
         ColumnSpec::Names(names) => {
             let mut set = BTreeSet::new();
             for n in names {
-                // `Scan` と同じ ASCII 大文字小文字非区別の照合に揃える（不一致で要求が空になり
-                // `Any` へ倒れる fail-open を防ぐ）。
+                // 疑似列 `id` は大文字小文字を問わず表単位（厳しい側）。
                 if shape.pseudo_id && n.eq_ignore_ascii_case("id") {
                     return Ok(ColumnDemand::TableOnly);
                 }
-                match shape.columns.iter().find(|c| c.eq_ignore_ascii_case(n)) {
-                    Some(c) => {
-                        set.insert(c.clone());
-                    }
-                    // 実在しない名前は fail-closed（表単位の許可を要求）。実行段の束縛が後で
-                    // `42703` にするが、列単位 GRANT だけで通さない。
-                    None => return Ok(ColumnDemand::TableOnly),
+                // 実行段の列束縛は完全一致なので、ここも完全一致で解決する（`a` と `A` が共存する表で
+                // 大文字小文字違いの別列の権限を流用させない）。完全一致が無い名前は実行段が `42703` に
+                // するのでスキップする（`TableOnly` へ倒すと列権限のみのロールが `42501` になる）。
+                // 取りこぼしても実在列の経路は開かない: 実在列として束縛される名前は完全一致で要求に入る。
+                if let Some(c) = shape.columns.iter().find(|c| c.as_str() == n.as_str()) {
+                    set.insert(c.clone());
                 }
             }
             Ok(finish(set))
@@ -416,20 +414,44 @@ mod tests {
     }
 
     #[test]
-    fn explicit_names_match_case_insensitively_and_unknown_fails_closed() {
+    fn explicit_names_match_exactly_and_unknown_is_skipped_for_bind_to_reject() {
         let mut s = shape();
         assert_eq!(
-            demand("x", ColumnSpec::Names(vec!["A".into(), "b".into()]), &s),
+            demand("x", ColumnSpec::Names(vec!["a".into(), "b".into()]), &s),
             cols(&["a", "b"])
         );
-        // 実在しない名前は空集合の `Any` ではなく表単位の要求へ倒す。
+        // 大文字小文字違いは実行段で束縛されない（42703）ので要求に入れない。
         assert_eq!(
-            demand("x", ColumnSpec::Names(vec!["zzz".into()]), &s),
-            ColumnDemand::TableOnly
+            demand("x", ColumnSpec::Names(vec!["A".into()]), &s),
+            ColumnDemand::Any
         );
         assert_eq!(
             demand("x", ColumnSpec::Names(vec!["a".into(), "zzz".into()]), &s),
-            ColumnDemand::TableOnly
+            cols(&["a"])
+        );
+        // a/A 共存表では完全一致の列だけを要求する。
+        let co = RelationShape {
+            columns: vec!["a".into(), "A".into()],
+            pseudo_id: false,
+            view_like: false,
+        };
+        assert_eq!(
+            demand("x", ColumnSpec::Names(vec!["A".into()]), &co),
+            cols(&["A"])
+        );
+        assert_eq!(
+            demand("x", ColumnSpec::Names(vec!["a".into()]), &co),
+            cols(&["a"])
+        );
+        assert_eq!(
+            cover_bits(
+                PRIV_INSERT,
+                0,
+                &[("a".to_string(), PRIV_INSERT)],
+                &cols(&["A"]),
+                &co
+            ),
+            0
         );
         s.pseudo_id = true;
         assert_eq!(
