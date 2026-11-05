@@ -1,7 +1,7 @@
 # 固定テナント方式（テナント境界を外せない設計）の方針
 
 - ステータス: Accepted（実装で確定済みの判断を方針として記録する。本書の追加でコードは変えない）
-- 対応 Issue: #2076（親 #2075）。他 DB との比較表は #2077 が担当し、本書では扱わない
+- 対応 Issue: #2076（親 #2075）。他 DB との比較表は #2077 が担当し、[row-level-isolation-comparison.md](row-level-isolation-comparison.md) に置く
 - ビヘイビア ID ポインタ: RLS-6・RLS-8・RLS-10・RLS-12・RLS-13（`docs/spec/04-behavior/rls.md`）。
   契約本文は spec を正とし、本書へは転記しない
 - 関連コード: `crates/engine/src/policy.rs`・`crates/engine/src/rls.rs`・`crates/engine/src/tenant.rs`・
@@ -10,6 +10,7 @@
   `crates/wire-server/src/auth.rs`・`crates/wire-server/src/http/query/gate.rs`・
   `crates/wire-server/src/http/session/middleware.rs`
 - 関連 doc: [row-security-policy-composition.md](row-security-policy-composition.md)・
+  [row-level-isolation-comparison.md](row-level-isolation-comparison.md)・
   [rls-generalized-read-paths.md](rls-generalized-read-paths.md)・
   [role-privilege-model.md](role-privilege-model.md)・
   [privilege-check-paths.md](privilege-check-paths.md)・
@@ -93,6 +94,6 @@
 
 ## 対象外
 
-- 他 DB（PostgreSQL・Elasticsearch・Qdrant）との比較表: #2077
+- 他 DB（PostgreSQL・Elasticsearch・Qdrant）との比較表: #2077（[row-level-isolation-comparison.md](row-level-isolation-comparison.md) で追加済み）
 - 列レベルの制御: 未提供
 - ロール属性 `BYPASSRLS` の解禁: #2278 の段 2

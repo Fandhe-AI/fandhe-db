@@ -37,6 +37,13 @@
 //!   ジョブ記録の保存・commit（いずれも行数に比例しない固定段）だけで、時計では中断
 //!   できない（redb の書き込みは途中で打ち切ると不整合になるため、段の途中では切らない）。
 //!   通常の書き込みの待ちは「上限 × 2 ＋ この非中断段の所要」で見積もる（ADR §15.2）。
+//! - チャンク間隔（`chunk_interval`。SQL-77、Issue #2071）の待機は、チャンクの commit（または
+//!   空振りチャンクの txn 破棄）の後・次チャンク開始前にだけ置く。最初のチャンクの前と最後の
+//!   チャンクの後では待たない。待機中は write txn と writer permit を保持せず（通常の書き込みが
+//!   取れる）、`max_writer_hold` の計測にも含まれない。一方で登録簿の登録（`JobGuard`）は保持し、
+//!   `SHOW` は `running` のまま・同時実行数の枠も占有する。待機は `CHUNK_INTERVAL_POLL_SLICE`
+//!   刻みで取り消しと文の期限を確認し（反映遅れは高々 1 刻み）、待機時間は文の期限の経過に含める。
+//!   新しい停止原因は設けず、既存の `CancelRequested`・`DeadlineExceeded` を再利用する。
 //! - どの段で失敗しても write txn は commit せず drop（abort）する。停止原因と一緒に
 //!   返す `committed_total` は commit 済みのチャンクの累計だけを表す。
 //! - 失敗は fail-closed。ジョブ記録とメモリ上の状態の不一致は `XX000` 相当で止める。
@@ -199,10 +206,15 @@ enum Kind<'a> {
     },
 }
 
-/// 時計とチャンク間フックの注入点。本番は実時間・no-op、テストは疑似時計と
+/// チャンク間隔の待機を小分けにする刻み。取り消し要求の反映遅れの上限になる（Issue #2071）。
+const CHUNK_INTERVAL_POLL_SLICE: Duration = Duration::from_millis(10);
+
+/// 時計・sleep とチャンク間フックの注入点。本番は実時間・no-op、テストは疑似時計と
 /// 「チャンク commit 後（txn の外）」の割り込みを差し込む。
 struct Hooks<'a> {
     clock: &'a dyn Fn() -> Instant,
+    /// チャンク間隔の待機（1 刻み分）。テストは疑似時計を進めるクロージャを差し込む。
+    sleep: &'a dyn Fn(Duration),
     after_chunk: Option<&'a mut dyn FnMut(usize)>,
     /// チャンクごとの権限再判定（Issue #1968）。現在ロール束縛済みで運用者権限なしの主体だけ `Some`。
     privilege: Option<RelationPrivilegeRecheck>,
@@ -212,6 +224,7 @@ impl Hooks<'static> {
     fn production(privilege: Option<RelationPrivilegeRecheck>) -> Self {
         Hooks {
             clock: &Instant::now,
+            sleep: &std::thread::sleep,
             after_chunk: None,
             privilege,
         }
@@ -289,6 +302,39 @@ fn finalize_cancel(storage: &Storage, key: &JobKey<'_>) -> Result<(), TenantWrit
     partitioned_job::cancel_in_txn(&txn, key)
         .map_err(|e| TenantWriteError::LedgerCorrupted(e.into_storage_error()))?;
     crate::recovery::commit_boundary::commit(txn).map_err(TenantWriteError::from)
+}
+
+/// チャンク間隔の待機（SQL-77、Issue #2071）。`interval` が 0 なら時計も読まず即座に戻る
+/// （既定設定で既存の挙動を変えない）。writer gate は保持しない状態で呼ぶこと。刻みごとに
+/// 取り消し・文の期限を確認し、期限が先に来るなら最後の刻みを残り時間へ縮める。
+fn wait_chunk_interval<E>(
+    interval: Duration,
+    hooks: &Hooks<'_>,
+    deadline: crate::interrupt::StatementDeadline,
+    cancel_requested: &dyn Fn() -> bool,
+    on_cancel: &dyn Fn() -> PartitionedStopCause<E>,
+) -> Result<(), PartitionedStopCause<E>> {
+    let mut remaining = interval;
+    while !remaining.is_zero() {
+        if cancel_requested() {
+            return Err(on_cancel());
+        }
+        let now = (hooks.clock)();
+        if deadline.is_expired_at(now) {
+            return Err(PartitionedStopCause::DeadlineExceeded);
+        }
+        let mut slice = remaining.min(CHUNK_INTERVAL_POLL_SLICE);
+        if let Some(left) = deadline.remaining_at(now) {
+            slice = slice.min(left);
+        }
+        if slice.is_zero() {
+            // 期限ちょうど: 空回りさせず期限超過として止める。
+            return Err(PartitionedStopCause::DeadlineExceeded);
+        }
+        (hooks.sleep)(slice);
+        remaining = remaining.saturating_sub(slice);
+    }
+    Ok(())
 }
 
 /// 取り消し検出時の共通終了処理。記録の書き込みに失敗した場合はその原因を返す
@@ -672,10 +718,6 @@ fn chunk_loop<E>(
         };
         let rows_changed = u64::try_from(applied).unwrap_or(u64::MAX);
 
-        if applied > 0 {
-            crate::catalog::bump_table_generation_in_txn(&write_txn, table).map_err(w)?;
-        }
-
         let completed_total = if exhausted {
             Some(
                 partitioned_job::complete_with_fixed_time_in_txn(
@@ -711,6 +753,13 @@ fn chunk_loop<E>(
                     if let Some(f) = hooks.after_chunk.as_mut() {
                         f(chunk_index);
                     }
+                    wait_chunk_interval(
+                        limits.chunk_interval,
+                        hooks,
+                        deadline,
+                        &|| guard.cancel_requested(),
+                        &|| cancel_stop(storage, &key),
+                    )?;
                     continue;
                 }
                 ChunkCommitOutcome::Created => {
@@ -733,6 +782,11 @@ fn chunk_loop<E>(
             return Err(PartitionedStopCause::DeadlineExceeded);
         }
 
+        // テーブル世代のバンプは commit 直前に置く（取り消し・期限の確認で txn を破棄する
+        // 経路ではバンプも破棄される。`table_generation_bump_coverage` の近傍検査にも対応）。
+        if applied > 0 {
+            crate::catalog::bump_table_generation_in_txn(&write_txn, table).map_err(w)?;
+        }
         crate::recovery::commit_boundary::commit(write_txn)
             .map_err(|e| w(TenantWriteError::from(e)))?;
 
@@ -747,6 +801,13 @@ fn chunk_loop<E>(
         if let Some(f) = hooks.after_chunk.as_mut() {
             f(chunk_index);
         }
+        wait_chunk_interval(
+            limits.chunk_interval,
+            hooks,
+            deadline,
+            &|| guard.cancel_requested(),
+            &|| cancel_stop(storage, &key),
+        )?;
     }
 }
 
@@ -898,6 +959,13 @@ fn scan_chunk<E>(
         last_scanned,
         exhausted,
     })
+}
+
+/// テスト用: チャンク間隔 0（既定）のとき sleep が一度も呼ばれないことを担保する注入先。
+/// 子モジュール（`tests`・`scenario_tests`）が共有する。
+#[cfg(test)]
+fn no_sleep(_: Duration) {
+    panic!("sleep must not be called when chunk_interval is zero");
 }
 
 #[cfg(test)]
