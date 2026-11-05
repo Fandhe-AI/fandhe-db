@@ -114,6 +114,12 @@ fn on_conflict_bits(oc: Option<&OnConflictClause>) -> u16 {
 /// 単一行／複数行 `INSERT ... VALUES` の列の仕様。列リストがあればその列、無ければ全列。`ON CONFLICT` の
 /// `UPDATE` は全列。`RETURNING`・衝突対象が読む列は、列リストの宣言位置を除いたトークンから集める。
 fn insert_spec(v: &ValidatedInsert) -> TargetSpec {
+    // `ON CONFLICT ON CONSTRAINT <name>` は制約名しかトークンに現れず、制約の対象列を SELECT 要求へ
+    // 上位近似できない（衝突判定が未許可列の値を読む）。fail-closed で SELECT を全列に倒す。
+    let constraint_target = v
+        .on_conflict
+        .as_ref()
+        .is_some_and(|c| matches!(c.target, ConflictTargetSpec::Constraint(_)));
     TargetSpec {
         insert: if v.columns_omitted || v.columns.is_empty() {
             ColumnSpec::All
@@ -121,7 +127,11 @@ fn insert_spec(v: &ValidatedInsert) -> TargetSpec {
             ColumnSpec::Names(v.columns.clone())
         },
         update: ColumnSpec::All,
-        select: ColumnSpec::ScanExcludingWrites,
+        select: if constraint_target {
+            ColumnSpec::All
+        } else {
+            ColumnSpec::ScanExcludingWrites
+        },
     }
 }
 

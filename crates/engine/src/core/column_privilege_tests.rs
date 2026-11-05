@@ -258,6 +258,30 @@ fn insert_needs_privilege_on_the_listed_columns() {
 }
 
 #[test]
+fn on_conflict_on_constraint_needs_select_on_the_constraint_columns() {
+    let f = fx("colpriv-conflict-constraint");
+    f.admin_run("ALTER TABLE ca2 ADD CONSTRAINT uq_c UNIQUE (c)");
+    f.admin_run("GRANT INSERT (c) ON ca2 TO alice");
+    f.admin_run("GRANT INSERT (a) ON ca2 TO alice");
+    f.admin_run("GRANT SELECT (a) ON ca2 TO alice");
+    // 制約の対象列 c への SELECT なしでは、制約名経由の衝突判定を通さない（fail-closed）。
+    assert_eq!(
+        f.alice(
+            "INSERT INTO ca2 (c, a) VALUES (1, 2) ON CONFLICT ON CONSTRAINT uq_c DO NOTHING RETURNING a"
+        ),
+        "42501"
+    );
+    f.admin_run("GRANT SELECT (c) ON ca2 TO alice");
+    f.admin_run("GRANT SELECT (b) ON ca2 TO alice");
+    assert_eq!(
+        f.alice(
+            "INSERT INTO ca2 (c, a) VALUES (1, 2) ON CONFLICT ON CONSTRAINT uq_c DO NOTHING RETURNING a"
+        ),
+        "ok"
+    );
+}
+
+#[test]
 fn update_and_delete_split_write_columns_from_read_columns() {
     let f = fx("colpriv-update");
     f.admin_run("GRANT UPDATE (b) ON ca2 TO alice");
