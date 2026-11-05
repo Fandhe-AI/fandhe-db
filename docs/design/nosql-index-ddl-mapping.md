@@ -66,6 +66,7 @@ drop_index   → DROP INDEX <name>
 | `method` 省略・`btree` に `opclass` | engine（構文段） | `42601` |
 | `hnsw` に `jsonb_*`、`gin` に `vector_*` | engine | `42704` |
 | `hnsw` 以外に `with` | engine | `0A000` |
+| `vector_*_ops` を `HALFVEC` 列へ（opclass の系列と列型の不一致） | engine | `42804` |
 | `hnsw`／`gin` で列が複数 | engine | `0A000` |
 
 ## 実行権限
@@ -95,7 +96,8 @@ drop_index   → DROP INDEX <name>
 | `42703` | 列が不在 | engine |
 | `42809` | 対象がビュー・索引、または drop にテーブル名 | engine |
 | `42704` | `drop_index` の対象が不在、opclass と方式の不一致 | engine |
-| `0A000` | 列複数の `hnsw`／`gin`、`hnsw` 以外の `with`、種別と列型の不整合 | engine |
+| `0A000` | 列複数の `hnsw`／`gin`、`hnsw` 以外の `with`、索引方式と列型の非対応 | engine |
+| `42804` | opclass の系列と列型の不一致（`vector_*_ops` を `HALFVEC` 列へ指定する等。固定文言） | engine |
 | `22023` | `with` の範囲違反、`ef_construction < 2*m` | engine |
 | `42601` | 未知キー・型不一致・識別子不正・語彙外・`opclass` で列数が 1 でない・`with: {}` | wire |
 | `54000` | 列数上限 | wire（確保前）と engine |
