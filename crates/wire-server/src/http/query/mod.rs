@@ -83,6 +83,7 @@
 //! 束縛関数・実行器へ写像する。
 //! [`returning`] は `insert`／`update`／`delete` の任意キー `returning` の値検査と
 //! 分割実行との併用拒否（Issue #2090・NOSQL-22。実行結線は #2091）を担う。
+//! [`openapi`] は `OP_SCHEMAS` から OpenAPI 3.1 文書を生成するテスト支援（Issue #2104・NOSQL-20）。
 //! [`partitioned`] は分割実行 DML の語彙（Issue #1130・NOSQL-12・RECOVER-11）を
 //! 担い、`update`／`delete` の `mode`／`chunk` 修飾の解析、`show_partitioned_dml`／
 //! `cancel_partitioned_dml` op、部分完了（`VD001`）・取り消し（`VD002`）の 409 本文
@@ -100,6 +101,7 @@ pub mod gate;
 pub mod ident;
 pub mod insert;
 pub mod op;
+pub mod openapi;
 pub mod operation_id_source;
 pub mod partitioned;
 pub mod response;

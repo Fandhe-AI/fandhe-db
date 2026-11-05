@@ -28,6 +28,12 @@
 //! （SQL 表層の `... PARTITIONED` と同一の共通本体。`where` との併用は `42601`）。
 //! `VD001`／`VD002` は [`handle`] が 409 と `data` 付き本文へ写像する。
 //!
+//! 期待値の条件 `if`（Issue #2098・NOSQL-18 ポインタ。[`super::update`] と同じ契約）は、対象行の指定に
+//! AND で加える追加条件として [`super::dml_target::bind_condition_predicates`] で束縛し、述語形の入口へ
+//! `[対象の述語] ++ [if の述語]` を渡す。従来の `id` 形に `if` が付くときは単一行の実行器が条件を持てない
+//! ため述語形の入口へ `id = n` の述語として流す。不一致・不存在・他テナント・不可視はいずれも `deleted:0`
+//! の同一応答で、`mode: "partitioned"` との併用は `42601`。
+//!
 //! テナントは `principal`（唯一の入口）からのみ導出する（`security.md` P0）。
 //!
 //! `operation_id` の欠落・`null`・空文字はいずれも「省略」として扱い、wire 層では拒否しない。
@@ -213,6 +219,9 @@ pub fn execute(
     // 分割実行修飾（Issue #1130）。述語形（`filter`）だけが受理する。
     let modifier = partitioned::parse_modifier(validated)?;
     partitioned::check_target_form(modifier, &target)?;
+    // 期待値の条件（Issue #2098・NOSQL-18 ポインタ）。空配列・分割実行との併用は engine 呼び出し前に拒否する。
+    let condition = dml_target::bind_condition(validated)?;
+    partitioned::check_condition(modifier, condition.is_some())?;
 
     // 本文／ヘッダの供給元解決（Issue #2064・HTTP-14）。省略の可否は engine の
     // `LedgerMode`（単一の真実源）が担うため、wire 層では拒否しない（Issue #2203）。
@@ -229,6 +238,7 @@ pub fn execute(
         // fail-closed で拒否する。
         TargetForm::RowAddress(address)
             if dml_target::is_id_address(address)
+                && condition.is_none()
                 && !core.table_uses_allocated_row_identity(table) =>
         {
             let id = dml_target::row_id_from_address(address)?;
@@ -244,12 +254,35 @@ pub fn execute(
                 super::gate::reject_allocated_schema,
             )?
         }
+        // 従来の `id` 形 + `if`（Issue #2098）: 単一行の実行器は条件を持てないため、述語形の入口へ
+        // `id = n` の述語と `if` の述語を AND で渡す。並行 DDL で採番方式へ変わっていた場合は
+        // 束縛 closure の `reject_allocated_schema` が fail-closed で拒否する。
+        TargetForm::RowAddress(address)
+            if dml_target::is_id_address(address)
+                && !core.table_uses_allocated_row_identity(table) =>
+        {
+            let id = dml_target::row_id_from_address(address)?;
+            core.execute_bound_predicate_delete_in_session(
+                principal.policy_context(),
+                &principal.session_state(),
+                table,
+                operation_id.as_ref(),
+                |schema| {
+                    super::gate::reject_allocated_schema(schema)?;
+                    dml_target::bind_id_address_with_condition(id, condition, schema)
+                },
+            )?
+        }
         TargetForm::RowAddress(address) => core.execute_bound_predicate_delete_in_session(
             principal.policy_context(),
             &principal.session_state(),
             table,
             operation_id.as_ref(),
-            |schema| dml_target::bind_primary_key_predicates(address, schema),
+            |schema| {
+                let mut predicates = dml_target::bind_primary_key_predicates(address, schema)?;
+                predicates.extend(dml_target::bind_condition_predicates(condition, schema)?);
+                Ok(predicates)
+            },
         )?,
         // 述語形（`filter`。TASK-186・NOSQL-12、Issue #1062）: `WHERE` 述語列は
         // `filter::bind_filter_where_predicates`（SQL 表層の述語形 `DELETE` が
@@ -259,10 +292,17 @@ pub fn execute(
         // 作らない。
         TargetForm::Predicate(items) => {
             let bind = |schema: &engine::catalog::TableSchema| {
-                filter::bind_filter_where_predicates(items, schema)
-                    .map_err(filter::FilterError::into_sql_surface_error)
+                let mut predicates = filter::bind_filter_where_predicates(items, schema)
+                    .map_err(filter::FilterError::into_sql_surface_error)?;
+                predicates.extend(dml_target::bind_condition_predicates(condition, schema)?);
+                Ok(predicates)
             };
             match modifier {
+                // 多層防御: `check_condition` で拒否済みのため到達しないが、`if` を黙って無視せず
+                // 拒否側（`42601`）に倒す。
+                Some(_) if condition.is_some() => {
+                    return Err(PartitionedRequestError::ConditionNotAllowed.into())
+                }
                 // 分割実行（Issue #1130）: SQL 表層 `DELETE ... PARTITIONED` と同一の
                 // 共通本体へ到達する。
                 Some(m) => core.execute_bound_partitioned_delete_in_session(

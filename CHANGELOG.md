@@ -28,6 +28,8 @@
 ### Added
 
 - NoSQL の `scan` に不透明カーソル `after`／`next_cursor` を追加した（Issue #2094・NOSQL-23・TASK-253 ポインタ）。`after`（文字列または `null`）を付けた要求だけがキーセットモードで、応答の `row_count` の後ろに `next_cursor`（最後のページは `null`）が付く。`offset` との併用は `42601`、改ざん・別ユーザー・別テナント・別 `sort`・別表・別サーバー鍵のカーソルは `22000`。`after` の無い要求は不変。封緘鍵はプロセス内だけで保持し、再起動で既発行カーソルは無効になる。
+- wire-server に公開モジュール `http::query::openapi` を追加した（Issue #2104・NOSQL-20 ポインタ）。`OP_SCHEMAS` から OpenAPI 3.1 の要求本文スキーマ文書を生成する `document`／`render_pretty` を提供する（手元確認用に `examples/openapi_dump.rs` も追加）。
+
 - `EngineCore::execute_bound_upsert_in_session` を追加した（Issue #2087・NOSQL-21 ポインタ）。束縛済み UPSERT のセッション対応入口で、権限・INDEX-4 上限・台帳を SQL 表層と同じ実行器で扱う。
 - `EXPLAIN (FORMAT JSON) <文>` を追加した（Issue #2059・SQL-76 (1)(6) ポインタ）。PostgreSQL 互換の JSON を 1 行 1 列（`QUERY PLAN`・型 `json`・OID 114）で返し、JSON と TEXT は同じ情報を持つ。`FORMAT TEXT`／オプションなしは従来と同一。`FORMAT XML|YAML` と未実装の既知オプションは `0A000`、`FORMAT` の不正値は `22023`、未知の名前・構文の誤りは `42601`。
   BREAKING CHANGE: 公開 enum `ParsedSql` に variant `ExplainJson(Box<ParsedSql>)` を追加した（網羅的 `match` の下流は追随が必要）。
