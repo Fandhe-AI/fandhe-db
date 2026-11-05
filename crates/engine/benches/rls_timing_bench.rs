@@ -166,7 +166,9 @@ fn normalize(res: Result<SqlOutcome, engine::sql::allowlist::SqlSurfaceError>) -
 }
 
 /// テンプレートを新しい一意パスへ複製して開く（複製は計測区間の外）。
-fn open_copy(template: &Path) -> (EngineCore, CleanupGuard) {
+/// 戻り値は (ガード, コア) の順。`(_guard, core)` 束縛で core が先に drop され、
+/// 開いたままの DB を削除できない環境（Windows）でも複製が残らない（temp_db の解放順契約）。
+fn open_copy(template: &Path) -> (CleanupGuard, EngineCore) {
     let path = unique_db_path("rls-timing-run");
     let guard = CleanupGuard(path.clone());
     if let Err(e) = std::fs::copy(template, &path) {
@@ -176,7 +178,7 @@ fn open_copy(template: &Path) -> (EngineCore, CleanupGuard) {
         Storage::open(&path).unwrap_or_else(|e| fail_closed(format!("open copy: {e:?}"))),
         Box::new(CpuScalarProvider),
     );
-    (core, guard)
+    (guard, core)
 }
 
 /// 事前検査: flooded に他テナント行が実在し、baseline には無いこと。
@@ -212,7 +214,7 @@ fn precheck_shape(shape: Shape, baseline: &Path, flooded: &Path) {
     let policy = ctx(TENANT_VIEWER);
     let mut seen: Vec<Outcome> = Vec::new();
     for template in [baseline, flooded] {
-        let (core, _guard) = open_copy(template);
+        let (_guard, core) = open_copy(template);
         let mut session = SessionState::default();
         let outcome = normalize(core.execute_sql_in_session(&policy, &mut session, &sql));
         if !classify_matches(shape.expected(), &outcome) {
@@ -237,7 +239,7 @@ fn run_cell(round: u32, shape: Shape, arm: Arm, template: &Path, iters: u32) -> 
     let total = WARMUP + iters;
     // SQL の生成は計測前に済ませる（計測区間に format! を入れない）。
     let statements = build_statements(round, shape, total);
-    let (core, _guard) = open_copy(template);
+    let (_guard, core) = open_copy(template);
     let policy = ctx(TENANT_VIEWER);
     let mut session = SessionState::default();
     let expected = shape.expected();
@@ -388,7 +390,13 @@ fn main() {
     if let Err(e) = std::fs::create_dir_all(&out_dir) {
         fail_closed(format!("failed to create {out_dir_raw}: {e}"));
     }
-    if let Err(e) = std::fs::write(&raw_json, json) {
+    // 存在確認と保存の間の競合で並行実行が上書きしないよう、排他的に作成する。
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&raw_json)
+        .and_then(|mut fh| std::io::Write::write_all(&mut fh, json.as_bytes()));
+    if let Err(e) = written {
         fail_closed(format!("failed to write {out_dir_raw}/raw.json: {e}"));
     }
     println!("rls_timing_bench: wrote {out_dir_raw}/raw.json");
