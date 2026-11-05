@@ -32,7 +32,7 @@ fandhe 側にテストで固定した根拠がある項目に限る。差異・�
 
 | 比較軸 | Stripe | PostgreSQL | MySQL | SQLite | fandhe |
 | ------ | ------ | ---------- | ----- | ------ | ------ |
-| キーの指定方法 | `Idempotency-Key` ヘッダ（POST） | 専用機能なし。一意列 + `ON CONFLICT` か自前の台帳表 | 専用機能なし。一意索引 + `ON DUPLICATE KEY UPDATE`／`INSERT IGNORE` か自前の台帳表 | 専用機能なし。一意制約 + UPSERT か自前の台帳表 | SQL は `USING OPERATION_ID '<id>'`、NoSQL は本文の `operation_id`。HTTP ヘッダ（HTTP-14）は実装中（#2063）で提供済みではない |
+| キーの指定方法 | `Idempotency-Key` ヘッダ（POST） | 専用機能なし。一意列 + `ON CONFLICT` か自前の台帳表 | 専用機能なし。一意索引 + `ON DUPLICATE KEY UPDATE`／`INSERT IGNORE` か自前の台帳表 | 専用機能なし。一意制約 + UPSERT か自前の台帳表 | SQL は `USING OPERATION_ID '<id>'`、NoSQL は本文の `operation_id`。HTTP では `Idempotency-Key` ヘッダでも指定でき、本文値と同じ台帳を使う（#2063〜#2065。`crates/wire-server/docs/nosql-api.md` 参照） |
 | キー長・文字種 | 255 文字まで | 該当なし | 該当なし | 該当なし | 256 バイトまで（単位はバイト）。制御文字は `22000` で拒否 |
 | 名前空間 | 公式ドキュメントで確認できず | 該当なし | 該当なし | 該当なし | `(tenant_id, table_name, operation_id)`。テナント ID はサーバーが導出。テーブル単位でもあり、別テーブルへ同じ ID を使っても再送と見なさない |
 | 内容不一致の検出 | 検出する（同じキーで引数が異なるとエラー） | 一意制約の衝突だけを見る。内容の違いは検出しない | 同左（一意索引・主キーの重複だけ） | 同左（一意制約の衝突だけ） | 要求由来の内容ハッシュで照合。一致は `23505`、不一致は `22023` |
