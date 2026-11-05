@@ -6,7 +6,7 @@
 //! `docs/spec/04-behavior/nosql-surface.md` NOSQL-1・NOSQL-9・NOSQL-12・
 //! NOSQL-13）。
 //!
-//! `upsert` は Issue #2086（NOSQL-1・NOSQL-21）で語彙へ加わった（実行は Issue #2087）。
+//! `upsert` は Issue #2086（NOSQL-1・NOSQL-21）で語彙へ加わり、Issue #2087 で実行を結線した。
 //!
 //! 分割実行 DML の `show_partitioned_dml`／`cancel_partitioned_dml` は Issue #1130
 //! （NOSQL-12・RECOVER-11）で語彙へ加わった（実行は [`super::partitioned`]）。
@@ -53,9 +53,7 @@ pub enum Op {
     Aggregate,
     Insert,
     /// `INSERT ... ON CONFLICT` 相当の upsert（NOSQL-1・NOSQL-21、Issue #2086。
-    /// 親 #2085）。語彙とスキーマのみ。実行器への結線は Issue #2087 の担当で、
-    /// それまで [`super::gate::handle`] は `0A000` を返す
-    /// （[`Op::execution_wired`] が `false`）。
+    /// 親 #2085）。実行は [`super::upsert`]（Issue #2087）。
     Upsert,
     Update,
     Delete,
@@ -111,10 +109,10 @@ impl Op {
         }
     }
 
-    /// `Idempotency-Key` ヘッダを受け付ける op か（書き込み op の 3 値のみ true。
+    /// `Idempotency-Key` ヘッダを受け付ける op か（書き込み op の 4 値のみ true。
     /// Issue #2064・HTTP-14。許可リスト方式で、他はすべて `42601` で拒否する）。
     pub const fn accepts_idempotency_key(self) -> bool {
-        matches!(self, Op::Insert | Op::Update | Op::Delete)
+        matches!(self, Op::Insert | Op::Upsert | Op::Update | Op::Delete)
     }
 
     /// 任意キー `returning` を受け付ける op か（Issue #2090・NOSQL-22。網羅 match で、
@@ -155,9 +153,22 @@ impl Op {
     /// 実行器へ結線済みか。`false` の op は語彙・スキーマ検証を通過しても
     /// 実行せず `0A000` で止める（実行器なしで成功を偽装しない）。層 B の
     /// パリティガード（`three_client_http_e2e`）が成功ケースの網羅対象を
-    /// 絞る根拠。`upsert` は Issue #2087 で結線し `true` へ反転する。
+    /// 絞る根拠。全 op が結線済み（`upsert` は Issue #2087 で結線）。網羅 match で、op 追加時に判断を強制する。
     pub const fn execution_wired(self) -> bool {
-        !matches!(self, Op::Upsert)
+        match self {
+            Op::Search
+            | Op::Scan
+            | Op::Aggregate
+            | Op::Insert
+            | Op::Upsert
+            | Op::Update
+            | Op::Delete
+            | Op::CreateTable
+            | Op::AlterTable
+            | Op::DropTable
+            | Op::ShowPartitionedDml
+            | Op::CancelPartitionedDml => true,
+        }
     }
 
     /// 対応する [`ObjectSchema`]（`super::schema::OP_SCHEMAS` と同一の表を
@@ -219,7 +230,7 @@ mod tests {
     #[test]
     fn accepts_idempotency_key_only_for_write_ops() {
         for op in Op::ALL {
-            let expected = matches!(op, Op::Insert | Op::Update | Op::Delete);
+            let expected = matches!(op, Op::Insert | Op::Upsert | Op::Update | Op::Delete);
             assert_eq!(op.accepts_idempotency_key(), expected, "{}", op.name());
         }
     }
@@ -303,14 +314,13 @@ mod tests {
     }
 
     #[test]
-    fn only_upsert_is_not_execution_wired() {
-        // Issue #2087 で upsert を結線する際、本テストと述語を必ず更新させる。
+    fn all_ops_are_execution_wired() {
         let unwired: Vec<Op> = Op::ALL
             .iter()
             .copied()
             .filter(|op| !op.execution_wired())
             .collect();
-        assert_eq!(unwired, vec![Op::Upsert]);
+        assert!(unwired.is_empty(), "{unwired:?}");
     }
 
     #[test]
