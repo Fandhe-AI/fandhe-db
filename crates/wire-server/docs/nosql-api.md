@@ -46,6 +46,9 @@ spec で規範化された内部転送プロトコルの実装にすぎない。
 spec ポインタ一覧: TASK-184（基盤）・HTTP-1〜15・NOSQL-1〜11・ERR-4・SQL-1〜15・
 RLS-7・RLS-9・TABLE-12。
 
+他製品（PostgREST・Elasticsearch `_bulk`・MySQL X DevAPI）との比較は
+`docs/design/nosql-http-surface-comparison.md` を参照。
+
 ## 転送路の共通規則
 
 `wire-server --users <path> --db <path> --surface nosql [--bind <addr:port>]
