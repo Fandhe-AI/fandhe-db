@@ -242,6 +242,22 @@ fn runtime_error_leaves_nothing() {
     .expect("id not consumed");
 }
 
+/// 複数文メッセージ（前置形・括弧形）で後続文が失敗すると、先行の `EXPLAIN ANALYZE <DML>` も
+/// 暗黙トランザクションごと巻き戻る（DML の ANALYZE を読み取り扱いにしない）。
+#[test]
+fn multi_statement_failure_rolls_back_analyze_dml() {
+    let (core, _g) = seeded("x76d-multi");
+    let before = snapshot(&core, "tenant-a", "a");
+    for sql in [
+        "EXPLAIN ANALYZE DELETE FROM a WHERE k > 1; SELECT 1 / 0",
+        "EXPLAIN (ANALYZE, TIMING OFF, SUMMARY OFF) DELETE FROM a WHERE k > 1; SELECT 1 / 0",
+        "EXPLAIN (ANALYZE true) UPDATE a SET v = 'z'; SELECT 1 / 0",
+    ] {
+        assert!(run(&core, "tenant-a", sql).is_err(), "{sql}");
+        assert_eq!(snapshot(&core, "tenant-a", "a"), before, "{sql}");
+    }
+}
+
 /// SQL-76 (3): 他テナントの行量で出力が変わらず、他テナントの行は変更されない。
 #[test]
 fn tenant_boundary() {
