@@ -82,8 +82,9 @@ impl EngineCore {
         let shape = match explain {
             ExplainDml::Delete(stmt) => {
                 let schema = self.load_table_schema_for_dml(stmt.table_name())?;
-                let (bound, _hash) = Self::prepare_predicate_delete(stmt, stmt, &schema, udfs)?;
+                // 通常実行（returning_form_pre）と同じ順序で RETURNING を先に束縛し、wire_code を一致させる。
                 crate::sql::parser::bind_returning(stmt.returning(), &schema)?;
+                let (bound, _hash) = Self::prepare_predicate_delete(stmt, stmt, &schema, udfs)?;
                 ExplainDmlShape {
                     assignments: None,
                     has_filter: bound.has_where_filters(),
@@ -93,13 +94,14 @@ impl EngineCore {
             }
             ExplainDml::Update(stmt) => {
                 let schema = self.load_table_schema_for_dml(stmt.table_name())?;
+                // 通常実行（returning_form_pre）と同じ順序で RETURNING を先に束縛し、wire_code を一致させる。
+                crate::sql::parser::bind_returning(stmt.returning(), &schema)?;
                 let set_columns: Vec<&str> =
                     stmt.assignments().iter().map(|(n, _)| n.as_str()).collect();
                 let _sparsevec_limits_scope = self.sparsevec_limits_scope();
                 let _defer = self.defer_not_null_scope_for_update(ctx, &schema.name, &set_columns);
                 let (bound, _hash, _legacy) =
                     Self::prepare_predicate_update(stmt, stmt, &schema, udfs)?;
-                crate::sql::parser::bind_returning(stmt.returning(), &schema)?;
                 ExplainDmlShape {
                     assignments: Some(stmt.assignments().len()),
                     has_filter: !bound.metadata_filters().is_empty()

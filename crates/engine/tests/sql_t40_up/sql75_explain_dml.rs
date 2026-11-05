@@ -38,6 +38,8 @@ fn seeded(name: &str) -> (EngineCore, CleanupGuard) {
     for sql in [
         "CREATE TABLE a (k BIGINT, v TEXT)",
         "CREATE TABLE pt (id BIGINT PRIMARY KEY, k BIGINT)",
+        "CREATE TABLE nn (k BIGINT NOT NULL)",
+        "INSERT INTO nn (k) VALUES (1)",
         "INSERT INTO a (k, v) VALUES (1, 'a1'), (2, 'a2'), (3, 'a3')",
         "INSERT INTO pt (id, k) VALUES (1, 2), (2, 3)",
     ] {
@@ -213,6 +215,8 @@ fn errors_match_execution() {
         "UPDATE a SET v = 'z' WHERE nocol = 1",
         "UPDATE a SET k = 'text' WHERE k = 1",
         "UPDATE a SET v = 'z' WHERE k > 0 RETURNING nocol",
+        // RETURNING の束縛は WHERE/SET より先（通常実行と同順）。NOT NULL 違反より未知列が優先される。
+        "UPDATE nn SET k = NULL WHERE k > 0 RETURNING nonexistent",
     ] {
         let expected = code(&core, sql);
         assert_eq!(code(&core, &format!("EXPLAIN {sql}")), expected, "{sql}");
