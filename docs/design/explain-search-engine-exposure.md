@@ -606,7 +606,8 @@ INSERT は #2051 が担当する。`EXPLAIN ... PARTITIONED` は従来の出力�
   行数の一致には影響しない。既知事項）。明示トランザクションは通常の SELECT と同じ読み取り源で、未 commit の自分の
   変更が見え、`READ ONLY` でも可。SELECT 権限は実行前に read gate が要求する（`42501`）。実行時のエラーは通常の
   SELECT と同じ `wire_code` で返し、計画は返さない。
-- **対象外**: 段ごとの実測（内側の段の行数・ループ・時間）と実行器の計測フック（#2053）、HNSW の反復走査の回数・上限到達・再取得回数（#2056）、`FORMAT JSON`（#2059）、`VERBOSE`（#2060）。NoSQL 表層は変えない。
+- **対象外**: 段ごとの実測（内側の段の行数・ループ・時間）と実行器の計測フック（#2053）、
+  HNSW の反復走査の回数・上限到達・再取得回数（実装済み。下の #2056 追記）、`FORMAT JSON`（#2059）、`VERBOSE`（#2060）。NoSQL 表層は変えない。
 
 ## 追記（Issue #2055・SQL-76 (2)(3)）: DML の EXPLAIN ANALYZE
 
@@ -627,6 +628,27 @@ INSERT は #2051 が担当する。`EXPLAIN ... PARTITIONED` は従来の出力�
   非原子・autocommit 専用のため `0A000`。一時表・単一行の id 形・ビュー・`UPDATE ... FROM`／`DELETE ... USING`・WHERE の
   部分クエリは静的な `EXPLAIN` と同じ拒否のまま。`$n` 付きは Parse で `42601`、セッション無しの入口は `42601`。
 - **対象外**: 子の段（`scan`／`result`）の実測（#2053）、HNSW の可視化（#2056）、`FORMAT JSON`（#2059）、`VERBOSE`（#2060）。
+
+## 追記（Issue #2056・SQL-76 (2)(3)・SQL-73 (3)(5)）
+
+静的な `EXPLAIN` は実行時の縮退・キャッシュ状態・再取得ラウンド数を出さない（決定 1・「露出しない値」節）。実行を伴う
+`EXPLAIN ANALYZE` に限り、実行した**その 1 文**の HNSW の判断を根の段へ併記する。
+
+- **集め方**: `sql/hnsw_observe.rs` のスレッドローカルのシンク。`core/explain_analyze_exec.rs` が実行段だけをガード
+  （RAII）で囲み、`sql/hnsw_cache.rs` の記録点が書き込む。ガードが無いときは何もしない。全テナント共通の
+  `hnsw_index_cache_stats()` の前後差は他テナント・並行セッションの活動が混入するため使わない。記録点は文を実行する
+  スレッド上にある前提（別スレッドを使わない）。結合テストが「HNSW の行が実際に出る」ことで固定する。
+- **語彙（TEXT・安定契約。HNSW 経路を試行した文だけ。`TIMING`／`SUMMARY` では抑止しない）**:
+  `hnsw_index_cache: cached=<n>,built=<n>,rebuilt=<n>,not_indexed=<n>`（解決の回数）、
+  `hnsw_exact_scan: <true|false>,switches=<n>`（厳密走査へ切り替えた探索の回数。静的には HNSW 適格だったが実行時の
+  NULL 行で外れた場合を含む）、`hnsw_iterative_scan: rounds=<n>,cap_hit=<bool>,rows_examined=<n>`（反復スキャンが走った
+  ときだけ。`rows_examined` は DISTANCE 段が事後フィルタへ渡した可視の候補行数の合計）、`hnsw_refetch_rounds: <n>`
+  （hybrid 密側の探索の延べラウンド数。再取得は n-1 回）。複数の HNSW 探索を含む文は文全体の合計を根の段へ出す。
+- **テナント境界**: 索引は `(table, ctx, metric)` ごとで、最小規模の判定・厳密走査の比率・反復の行数は可視行と自 ctx の
+  グラフだけから決まる。`Lookup::Ready` と `NeedOverlay` は他テナントの書き込みでも変わるため区別せず `cached` に畳む。
+  既知事項: LRU 退避はキャッシュ全体で共通のため、他テナントの活動量で `cached` が `built` に変わりうる。行の存在・件数ではなく
+  時間と同じ区分の情報として許容する。ほか `delta_searches`・訪問ノード数・閾値は出さない。
+- **対象外**: 段ごとの帰属（#2053 の段の木への統合）、`FORMAT JSON` のキー（#2059）、`VERBOSE`（#2060）、HNSW グラフの訪問ノード数。
 
 ## 追記（Issue #2053・SQL-76 (2)(3)）: 実行計測フック
 

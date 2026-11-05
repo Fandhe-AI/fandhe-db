@@ -2673,6 +2673,18 @@ pub(crate) fn execute_statement_with_cache_observed(
     // 全スロット（`slot_ids`）のまま保持する。
     let dense_id_counts = core::searched_id_counts(&slot_ids, dense_slots.as_deref());
     let has_null_rows = arena.null_row_count() != 0;
+    // 静的には HNSW 適格だったのに実行時の NULL 行で外れた縮退は、`EXPLAIN ANALYZE` の観測へ
+    // 厳密走査への切り替えとして記録する（Issue #2056。`has_null_rows` は自テナントの可視行だけで決まる）。
+    if has_null_rows
+        && (hnsw_full_visible_eligible
+            || hnsw_subset_eligible
+            || hnsw_hybrid_full_visible_eligible
+            || hnsw_hybrid_subset_eligible)
+    {
+        crate::sql::hnsw_observe::note(|o| {
+            o.exact_scan_switches = o.exact_scan_switches.saturating_add(1);
+        });
+    }
     let hnsw_full_visible_eligible = hnsw_full_visible_eligible && !has_null_rows;
     let hnsw_subset_eligible = hnsw_subset_eligible && !has_null_rows;
     let hnsw_hybrid_full_visible_eligible = hnsw_hybrid_full_visible_eligible && !has_null_rows;
@@ -3368,14 +3380,19 @@ pub(crate) fn execute_statement_with_cache_observed(
             let cap = max_scan.min(core::MAX_SEARCH_K).min(visible).max(1);
             let mut k_round = k_eff.min(cap).max(1);
             let mut rounds: u64 = 0;
+            let mut rows_examined: u64 = 0;
             let (filtered, cap_hit) = loop {
                 crate::interrupt::current_deadline().check()?;
+                // 2 ラウンド目以降は同じ検索の再実行なので、キャッシュ状態を重ねて数えない。
+                let _suppress = (rounds > 0).then(crate::sql::hnsw_observe::suppress_cache_notes);
                 // Distance 段は反復スキャンではラウンドごとに記録する（loops＝ラウンド数、
                 // rows_out＝事後フィルタ前の候補件数の合計、時間は compute_hits のみ。Issue #2053）。
                 let round_started = stage_start(&stats);
                 let raw = compute_hits(k_round)?;
+                drop(_suppress);
                 rounds += 1;
                 let raw_len = raw.len();
+                rows_examined = rows_examined.saturating_add(raw_len as u64);
                 stage_end(
                     &mut stats,
                     ExecStage::Distance,
@@ -3407,7 +3424,9 @@ pub(crate) fn execute_statement_with_cache_observed(
                 k_round = k_round.saturating_mul(2).min(cap);
             };
             if let Some(access) = hnsw_cache.as_ref() {
-                access.cache.record_iterative_scan(rounds, cap_hit);
+                access
+                    .cache
+                    .record_iterative_scan(rounds, cap_hit, rows_examined);
             }
             postfilter_done = true;
             filtered
