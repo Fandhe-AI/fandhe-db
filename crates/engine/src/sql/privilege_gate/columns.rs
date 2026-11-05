@@ -13,7 +13,7 @@
 //! - 列集合は束縛の結果ではなく、名前解決済みトークン列の識別子と relation の列名の照合による上位近似
 //!   （同名の別名・関数名・他表の列まで要求に入ることはあっても、取りこぼしは起きない）。この近似を使うのは
 //!   単一 relation の読み取りの形（呼び出し元が `Scan` を指定した場合）だけで、それ以外は全列（`All`）。
-//! - `*`・`t.*`（`count(*)` を除く）・`NATURAL`・`USING PLAN` は暗黙に全列を読むので `All`。
+//! - `*`・`t.*`（`count(*)` を除く）・`USING PLAN`・複数 relation の `NATURAL JOIN` は暗黙に全列を読むので `All`。
 //! - 疑似列 `id`（従来方式の表の行キー）とビュー・matview は列単位の付与を持てないので `TableOnly`。
 //! - 列を1つも参照しない形（`count(*)`・`SELECT 1 FROM t`）は `Any`（いずれかの列への付与が要る）。
 //! - 列名の数は [`MAX_COLUMN_DEMANDS`] で抑える（`54000`・固定文言）。
@@ -210,9 +210,8 @@ fn scan(
             Token::Punct('*') if !is_count_star(tokens, i) => return Ok(ColumnDemand::All),
             _ => {}
         }
-        if is_ident(Some(tok), "natural") {
-            return Ok(ColumnDemand::All);
-        }
+        // NATURAL JOIN は複数 relation の形で、上の `!single_relation` で `All` になる。
+        // 単一 relation の走査では `natural` は通常の識別子として扱う。
         if is_ident(Some(tok), "plan") && i > 0 && is_ident(tokens.get(i - 1), "using") {
             // `USING PLAN(...)` は文字列から検索対象の列を決める。
             return Ok(ColumnDemand::All);
@@ -382,6 +381,28 @@ mod tests {
             demand("SELECT A FROM t", ColumnSpec::Scan, &s),
             cols(&["a"]),
             "case-insensitive superset"
+        );
+    }
+
+    #[test]
+    fn natural_as_plain_identifier_in_single_relation_scan_does_not_widen() {
+        let s = RelationShape {
+            columns: vec!["natural".into(), "b".into()],
+            pseudo_id: false,
+            view_like: false,
+        };
+        assert_eq!(
+            demand(
+                "SELECT natural FROM natural AS natural",
+                ColumnSpec::Scan,
+                &s
+            ),
+            cols(&["natural"])
+        );
+        let tokens = tokenize("SELECT b FROM t NATURAL JOIN u").expect("tokenize");
+        assert_eq!(
+            resolve(&ColumnSpec::Scan, &s, &tokens, false).expect("resolve"),
+            ColumnDemand::All
         );
     }
 
