@@ -57,7 +57,7 @@ use engine::recovery::required_op_id::OperationId;
 use engine::row_codec::Value;
 use engine::storage::{Storage, Visibility};
 use http_common::{AfterWrite, HttpResponse};
-use wire_server::http::query::gate::UNSUPPORTED_OP_MESSAGE;
+use wire_server::http::query::gate::{UNSUPPORTED_OP_MESSAGE, UPSERT_NOT_YET_AVAILABLE_MESSAGE};
 use wire_server::http::session::store::SessionStore;
 use wire_server::limits::SESSION_TTL;
 
@@ -501,6 +501,43 @@ fn vocabulary_outside_six_ops_rejects_with_0a000_and_has_no_side_effect() {
 
     // 全拒否後も行数は不変（`drop_table` 相当が何も変更していないことを
     // 非 vacuous に確認する）。
+    let resp = query_as_alice(
+        addr,
+        br#"{"op":"scan","table":"docs","limit":10,"columns":["id"]}"#,
+    );
+    assert_eq!(resp.status, 200, "resp={resp:?}");
+    assert!(
+        body_utf8(&resp).contains(r#""row_count":4"#),
+        "{}",
+        body_utf8(&resp)
+    );
+}
+
+// --- upsert: 語彙・スキーマ通過後も実行せず副作用なし（Issue #2086） --------
+
+#[test]
+fn upsert_returns_dedicated_0a000_and_has_no_side_effect() {
+    // 実行器は Issue #2087 で結線する。seed 済み fixture でも行数は不変で、
+    // 応答に罠行のセンチネル・テナント情報を含まない。
+    let (core, _guard) = new_core_two_tenant_docs();
+    let addr = spawn(Arc::clone(&core));
+
+    let body = br#"{"op":"upsert","table":"docs","rows":[{"id":1,"lang":"en"}],"on_conflict":{"columns":["id"],"do":"update","set":["lang"]},"operation_id":"n1-upsert-1"}"#;
+    let resp = query_as_alice(addr, body);
+    assert_eq!(resp.status, 501, "resp={resp:?}");
+    assert_eq!(http_common::wire_code_of(&resp), "0A000");
+    assert_eq!(
+        http_common::error_message_of(&resp),
+        UPSERT_NOT_YET_AVAILABLE_MESSAGE
+    );
+    assert_rls_clean(&resp);
+
+    // 不正な形はスキーマ段で 42601。
+    let bad = br#"{"op":"upsert","table":"docs","rows":[],"on_conflict":{"columns":["id"],"do":"nothing","constraint":"x"}}"#;
+    let resp = query_as_alice(addr, bad);
+    assert_eq!(resp.status, 400, "resp={resp:?}");
+    assert_eq!(http_common::wire_code_of(&resp), "42601");
+
     let resp = query_as_alice(
         addr,
         br#"{"op":"scan","table":"docs","limit":10,"columns":["id"]}"#,

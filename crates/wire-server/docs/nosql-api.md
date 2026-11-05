@@ -1,8 +1,8 @@
 # NoSQL API
 
 `wire-server --surface nosql` が公開する 3 エンドポイント（`POST /v1/session`・
-`POST /v1/session/close`・`POST /v1/query`）と、`POST /v1/query` の `op` 11 値
-（`search`／`scan`／`aggregate`／`insert`／`update`／`delete`／`create_table`／
+`POST /v1/session/close`・`POST /v1/query`）と、`POST /v1/query` の `op` 12 値
+（`search`／`scan`／`aggregate`／`insert`／`upsert`／`update`／`delete`／`create_table`／
 `alter_table`／`drop_table`／`show_partitioned_dml`／`cancel_partitioned_dml`）の JSON
 スキーマを利用者向けに整理する。
 `update`／`delete` は `where`（単一行・PRIMARY KEY 列〔複合可〕または従来方式の表の `id`）・`filter`（述語形）の
@@ -151,7 +151,7 @@ JSON キー・ヘッダ（`tenant`／`tenant-id`／`tenantid` 相当。`x-` 接�
 2. `Authorization: Bearer` 認証（`28000`）
 3. ヘッダの `tenant_id` 相当拒否（`42601`）
 4. 本文の UTF-8／JSON 構文／`op` フィールドの形（`42601`）
-5. `op` 許可リスト判定（11 値の厳密一致。語彙外は `0A000`。DDL・UDF 呼び出し・
+5. `op` 許可リスト判定（12 値の厳密一致。語彙外は `0A000`。DDL・UDF 呼び出し・
    トランザクション制御を含む）
 6. op 別スキーマ検証（必須キー欠落・未知キー・型不一致・`null` は `42601`）
 7. op 別の意味検証・実行（`search` は `explain: true` を通常実行より先に判定）
@@ -497,6 +497,34 @@ OFFSET ...` と同じ対象名解決・実行器を共有。第 2 の実行器�
 `nosql4_aggregate.rs`・`nosql5_group_by.rs`・`nosql4_5_aggregate_wire_parity.rs`・
 `nosql6_insert.rs`・`nosql6_tenant_row_id_scope.rs`・
 `http_insert_response_boundary.rs`・`wire_insert_operation_id.rs`。
+
+### `upsert`
+
+`insert` に衝突時の動作（`on_conflict`）を加えた op（NOSQL-1・NOSQL-21。Issue #2086）。
+**現状はスキーマ検証までで、実行は未結線**。スキーマを通過した要求は、engine 接続の有無に
+かかわらず `0A000`（HTTP `501`、固定文言 `upsert execution not yet available`）を返す
+（実行は Issue #2087 で結線予定。応答・エラーの詳細は Issue #2088 で追記する）。
+
+| キー | 必須 | 型 | 備考 |
+| --- | --- | --- | --- |
+| `op` | ○ | string | `"upsert"` |
+| `table` | ○ | string | |
+| `rows` | ○ | object[] | `insert` と同じ形（列の検証は実行側の担当） |
+| `on_conflict` | ○ | object | `columns`（○・string[]）・`do`（○・string）・`set`（△・string[]）の 3 キーのみ。未知キー（制約名・式・`WHERE` 相当を含む）は `42601` |
+| `operation_id` | △ | string | `insert` と同じ扱い（欠落・`null` 可） |
+
+`mode`／`chunk`／`returning` は宣言していないため未知キーとして `42601`。型不一致（`null` を含む）・必須キー欠落も `42601`。
+
+要求例:
+
+```json
+{"op": "upsert", "table": "docs",
+ "rows": [{"id": 1, "lang": "en"}],
+ "on_conflict": {"columns": ["id"], "do": "update", "set": ["lang"]},
+ "operation_id": "upsert-1"}
+```
+
+検証コード: `crates/wire-server/tests/http_nosql/nosql9_op_allowlist.rs`・`nosql1_op_vocabulary.rs`。
 
 ### `update`
 

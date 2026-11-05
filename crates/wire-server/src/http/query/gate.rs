@@ -54,6 +54,9 @@
 //!    内部で engine の分割実行入口へ、`(Op::ShowPartitionedDml, Some(engine))`・
 //!    `(Op::CancelPartitionedDml, Some(engine))` が [`super::partitioned::handle_show`]・
 //!    [`super::partitioned::handle_cancel`] へ委譲する
+//!    `upsert`（Issue #2086・NOSQL-1・NOSQL-21）は語彙とスキーマ検証のみ結線済みで、
+//!    通過後は engine 接続の有無にかかわらず [`UPSERT_NOT_YET_AVAILABLE_MESSAGE`]
+//!    の `0A000` を返す（実行器への結線は Issue #2087）
 //!
 //! 手順 3（op 許可リスト）は手順 4（スキーマ検証）より前に行う。語彙外の
 //! `op` にスキーマ検証由来の情報（未知キー等）が先に返ることはない
@@ -104,6 +107,11 @@ pub(super) fn reject_allocated_schema(
 /// #1062）は実行結線済み（Issue #766・#768・#772・#764・#765・#876・#1062）
 /// のため `Router::new` 経由（`engine` 未接続）の場合にのみこの応答へ落ちる。
 pub const PLACEHOLDER_MESSAGE: &str = "query execution not yet available";
+
+/// 語彙・スキーマ検証を通過した `upsert` に返す固定文言（Issue #2086。
+/// 実行器は Issue #2087）。`PLACEHOLDER_MESSAGE`（engine 未接続の意味）とは
+/// 区別する。表名・値を含めない。
+pub const UPSERT_NOT_YET_AVAILABLE_MESSAGE: &str = "upsert execution not yet available";
 
 /// `POST /v1/query` を処理し応答バイト列を返す（認証済み要求のみ）。
 ///
@@ -171,6 +179,13 @@ pub fn handle(
     }
 
     match (op, engine) {
+        // `upsert`（Issue #2086）は実行器が無いため engine 接続の有無によらず
+        // `0A000` で止める。Issue #2087 で `super::upsert::handle` へ結線する。
+        (Op::Upsert, _) => response::encode_error(
+            ErrorClass::FeatureNotSupported,
+            UPSERT_NOT_YET_AVAILABLE_MESSAGE,
+            now_wall,
+        ),
         // `explain: true` は各 op の通常実行より必ず先に判定する
         // （`search` は Issue #765・TASK-186・NOSQL-10、`scan`／`aggregate` は
         // Issue #948・NOSQL-16・SQL-27 で対象拡大）。`explain: true` が
@@ -618,12 +633,13 @@ mod tests {
     }
 
     #[test]
-    fn tenant_id_in_json_is_rejected_for_all_eleven_ops() {
-        let cases: [&[u8]; 11] = [
+    fn tenant_id_in_json_is_rejected_for_all_twelve_ops() {
+        let cases: [&[u8]; 12] = [
             br#"{"op":"search","table":"docs","limit":1,"tenant_id":"evil"}"#,
             br#"{"op":"scan","table":"docs","limit":1,"tenant_id":"evil"}"#,
             br#"{"op":"aggregate","table":"docs","aggregates":[],"tenant_id":"evil"}"#,
             br#"{"op":"insert","table":"docs","rows":[],"tenant_id":"evil"}"#,
+            br#"{"op":"upsert","table":"docs","rows":[],"on_conflict":{"columns":["id"],"do":"nothing"},"tenant_id":"evil"}"#,
             br#"{"op":"update","table":"docs","set":{"lang":"en"},"tenant_id":"evil"}"#,
             br#"{"op":"delete","table":"docs","where":{"id":1},"tenant_id":"evil"}"#,
             br#"{"op":"create_table","table":"docs","columns":[{"name":"a","type":"text"}],"tenant_id":"evil"}"#,
@@ -637,6 +653,45 @@ mod tests {
             let text = String::from_utf8(response).expect("utf-8 response");
             assert!(text.starts_with("HTTP/1.1 400 "), "got: {text}");
             assert!(text.contains("42601"), "got: {text}");
+        }
+    }
+
+    const VALID_UPSERT: &[u8] = br#"{"op":"upsert","table":"docs","rows":[{"id":1}],"on_conflict":{"columns":["id"],"do":"nothing"}}"#;
+
+    #[test]
+    fn valid_upsert_returns_dedicated_0a000_without_engine() {
+        let text = String::from_utf8(run(VALID_UPSERT, &[])).expect("utf-8");
+        assert!(text.starts_with("HTTP/1.1 501 "), "got: {text}");
+        assert!(text.contains("0A000"), "got: {text}");
+        assert!(
+            text.contains(UPSERT_NOT_YET_AVAILABLE_MESSAGE),
+            "got: {text}"
+        );
+        assert!(!text.contains(UNSUPPORTED_OP_MESSAGE), "got: {text}");
+    }
+
+    #[test]
+    fn valid_upsert_with_engine_still_returns_dedicated_0a000() {
+        let (core, _guard) = empty_core();
+        let text = String::from_utf8(run_with_engine(&core, VALID_UPSERT, &[])).expect("utf-8");
+        assert!(text.starts_with("HTTP/1.1 501 "), "got: {text}");
+        assert!(
+            text.contains(UPSERT_NOT_YET_AVAILABLE_MESSAGE),
+            "got: {text}"
+        );
+    }
+
+    #[test]
+    fn upsert_schema_violations_reject_with_42601_not_0a000() {
+        let bodies: [&[u8]; 2] = [
+            br#"{"op":"upsert","table":"docs","rows":[],"on_conflict":{"columns":["id"],"do":"nothing"},"returning":["id"]}"#,
+            br#"{"op":"upsert","table":"docs","rows":[],"on_conflict":{"columns":["id"],"do":"nothing","where":"x"}}"#,
+        ];
+        for body in bodies {
+            let text = String::from_utf8(run(body, &[])).expect("utf-8");
+            assert!(text.starts_with("HTTP/1.1 400 "), "got: {text}");
+            assert!(text.contains("42601"), "got: {text}");
+            assert!(!text.contains("0A000"), "got: {text}");
         }
     }
 
@@ -654,7 +709,7 @@ mod tests {
     fn ddl_udf_transaction_ops_reject_with_0a000() {
         // UDF 呼び出し・トランザクション制御・NOSQL-13 対象外の DDL 相当
         // （index／view 系）・表記揺れは、いずれも許可リスト（Op::parse の
-        // 11 値）に無いため 0A000 に落ちる（拒否リストを別途持たない設計の
+        // 12 値）に無いため 0A000 に落ちる（拒否リストを別途持たない設計の
         // 回帰確認。`update`／`delete` は Issue #875、`create_table`／
         // `alter_table`／`drop_table` は Issue #910 で語彙へ加わったため
         // 本テストの対象から除外した）。
