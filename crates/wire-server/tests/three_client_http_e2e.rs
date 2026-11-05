@@ -149,8 +149,9 @@
 //! （NoSQL `filter` は Issue #1062 で実行結線済みだが、本ファイル特有の
 //! 複数プロセス・複数言語クライアント e2e への拡張はスコープ外。パリティ・
 //! 台帳照合・RLS-9 は層 A `nosql12_update_delete.rs` の述語形節が担う）・
-//! `RETURNING`・複数行 `INSERT` は NoSQL 表層が公開していないため
-//! パリティが成立せず対象外（UPSERT は Issue #2087 で結線し、`DML_STEPS` の `up-*` が担う）。ヘッダを含む HTTP 応答全体のバイト同一性は
+//! 複数行 `INSERT` は NoSQL 表層が公開していないためパリティが成立せず対象外
+//! （UPSERT は Issue #2087 で結線し、`DML_STEPS` の `up-*` が担う。`returning` は Issue #2091 で結線済みだが、
+//! 3 クライアント層 B への拡張は対象外。SQL とのバイト一致は層 A `nosql22_returning_exec.rs` が担う）。ヘッダを含む HTTP 応答全体のバイト同一性は
 //! 層 A（`nosql12_update_delete.rs::strip_date` 比較）の担当で、本ファイルは
 //! ステータス・本文までの一致に留める。
 //!

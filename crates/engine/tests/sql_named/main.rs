@@ -10,6 +10,7 @@ mod legacy_table;
 #[path = "../../src/test_util/temp_db.rs"]
 mod temp_db;
 
+mod nosql_bound_returning_public_api;
 mod sql33_cosine_negip_execution;
 mod sql33_crossdb_self_shapes;
 mod sql33_distance_kind_acceptance;

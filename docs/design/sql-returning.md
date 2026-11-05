@@ -317,7 +317,10 @@ e2e の RLS 回帰テスト（差分比較・独立オラクル・自己結合�
 ## 対象外・申し送り
 
 - **ファイル形 `INSERT`**: 従来どおり `42601`（サーバー側チャンク化行を返す応答形が未定義）。
-- **NoSQL 表層**: `op: insert`／`update`／`delete`／`search`／`scan`／`aggregate` の
-  いずれにも `returning` キーは無い（`http/query/update.rs`・`delete.rs` は
-  `returning: None` 固定）。spec 側の規範化待ち。
+- **NoSQL 表層**: `op: insert`／`update`／`delete` の任意キー `returning`（NOSQL-22）は、Issue #2090 で
+  スキーマと応答本文、Issue #2091 で実行を結線した。SQL 表層と同じ実行器
+  （`EngineCore::execute_bound_*_returning_in_session`）を通すため、返却行の内容・件数は SQL の
+  `RETURNING` と一致する。HTTP の束縛済み入口は返却列・SET 列を権限検査へ渡せず全列要求になるため、
+  列権限は SQL より厳しい側（fail-closed）に倒れる（精密化は #3003 の申し送り）。`search`／`scan`／
+  `aggregate` に `returning` は無い。`upsert` の `returning` は実行器（#2087）の結線後。
 - **3 クライアント層 B**: Issue #1347 で `three_client_e2e.rs::three_clients_receive_returning_rows_and_command_tags` を追加済み（`make e2e-three-client`・opt-in。詳細は `three-client-e2e-harness.md`「RETURNING」節）。拡張クエリ・明示トランザクション内は対象外。
