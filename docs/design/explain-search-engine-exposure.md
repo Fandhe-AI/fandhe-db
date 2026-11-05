@@ -590,7 +590,7 @@ INSERT は #2051 が担当する。`EXPLAIN ... PARTITIONED` は従来の出力�
   括弧形と同じ生のオプション列へ正規化する。前置の直後に括弧のリストが続く形は `42601`。`TIMING`・`SUMMARY` の
   省略は真（`ANALYZE` 時）。`TIMING` の真は `ANALYZE` を要する（`22023`）。`ANALYZE` なしの `SUMMARY` の真は `0A000`。
 - **対象**: 本 DB が `EXPLAIN` できる SELECT（単一表の検索・集計・広域取得、JOIN、集合演算、CTE〔再帰・具体化を含む〕、
-  派生表、WHERE の部分クエリ）。DML（`UPDATE`／`DELETE`／`INSERT`・分割実行）は `0A000`（#2055）。`USING PLAN` を伴う
+  派生表、WHERE の部分クエリ）。DML の ANALYZE は次節（#2055）。`USING PLAN` を伴う
   検索（LLM・embedder の I/O を伴う）、一時表を参照する文、`VERBOSE`・`FORMAT JSON` との併用、`$n` を含む文
   （拡張クエリの Parse は `42601`）は fail-closed で拒否する。セッション無しの入口は従来どおり `42601`。
 - **出力の語彙（安定契約）**: 根の段の属性行の末尾（最初の子の段の直前）に `actual_rows: <n>`（RLS 適用後の可視行・
@@ -606,5 +606,24 @@ INSERT は #2051 が担当する。`EXPLAIN ... PARTITIONED` は従来の出力�
   行数の一致には影響しない。既知事項）。明示トランザクションは通常の SELECT と同じ読み取り源で、未 commit の自分の
   変更が見え、`READ ONLY` でも可。SELECT 権限は実行前に read gate が要求する（`42501`）。実行時のエラーは通常の
   SELECT と同じ `wire_code` で返し、計画は返さない。
-- **対象外**: 段ごとの実測（内側の段の行数・ループ・時間）と実行器の計測フック（#2053）、DML の ANALYZE（#2055）、
-  HNSW の反復走査の回数・上限到達・再取得回数（#2056）、`FORMAT JSON`（#2059）、`VERBOSE`（#2060）。NoSQL 表層は変えない。
+- **対象外**: 段ごとの実測（内側の段の行数・ループ・時間）と実行器の計測フック（#2053）、HNSW の反復走査の回数・上限到達・再取得回数（#2056）、`FORMAT JSON`（#2059）、`VERBOSE`（#2060）。NoSQL 表層は変えない。
+
+## 追記（Issue #2055・SQL-76 (2)(3)）: DML の EXPLAIN ANALYZE
+
+- **対象**: 述語形の `UPDATE`／`DELETE`、`INSERT ... VALUES`、`INSERT ... SELECT`（静的な `EXPLAIN` が受理する形と同じ）。
+  オプション・出力の語彙は SELECT 版（#2054）と同じ。
+- **実際に実行し、自動では巻き戻さない**: PostgreSQL と同じく、autocommit では commit され、`USING OPERATION_ID` の
+  台帳にも通常の実行と同じく記録される。巻き戻したい場合は利用者が `BEGIN`／`ROLLBACK` で囲む（明示トランザクション内の
+  実行は `ROLLBACK` で戻り、`COMMIT` で残る）。Issue のタイトルにある「txn 内ロールバックで実装する」は、本文・親 Issue
+  の受け入れ条件（巻き戻さない）と食い違うため、後者に従った。静的な `EXPLAIN`（ANALYZE なし）は副作用ゼロのまま。
+- **実装の構造**: 読み取り専用の `ParsedSql::ExplainAnalyze` に載せず、別 variant `ParsedSql::ExplainAnalyzeDml` を
+  新設した。権限（write ゲートが内側の DML と同じビットを実行前に要求）・READ ONLY（`25006`）・operation_id の登録・
+  wire の書き込み判定が、読み取り扱いにならないことを網羅 `match` で強制するため。計画用と実行用の `ParsedSql` は
+  同じ検証済みの値から作り（第 2 の解析器・書き込み経路を作らない）、実行は通常の DML 実行関数をそのまま呼ぶ。
+- **`actual_rows` の意味**: 根の段（`update`／`delete`／`insert`）の `actual_rows` は文がクライアントへ返したはずの行数
+  （`RETURNING` の RLS 適用後の可視行。無ければ 0）。変更行数（`rows_affected`）は出さない（PostgreSQL の ModifyTable 段と
+  同じ。件数の出し方を `RETURNING` に一本化し、SQL-76 (3) の境界を保つ）。`RETURNING` の行そのものは返さない。
+- **fail-closed**: 実行時のエラーは通常の DML と同じ `wire_code` で返し、計画は返さない。分割実行（`PARTITIONED`）は
+  非原子・autocommit 専用のため `0A000`。一時表・単一行の id 形・ビュー・`UPDATE ... FROM`／`DELETE ... USING`・WHERE の
+  部分クエリは静的な `EXPLAIN` と同じ拒否のまま。`$n` 付きは Parse で `42601`、セッション無しの入口は `42601`。
+- **対象外**: 子の段（`scan`／`result`）の実測（#2053）、HNSW の可視化（#2056）、`FORMAT JSON`（#2059）、`VERBOSE`（#2060）。
