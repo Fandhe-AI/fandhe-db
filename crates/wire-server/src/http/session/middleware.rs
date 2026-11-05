@@ -63,9 +63,17 @@ pub struct SessionPrincipal {
     ddl_allowed: bool,
     /// 認証済みユーザーに対応づけたカタログのロール（HTTP-4・Issue #2238。未束縛は `None`）。
     role: Option<crate::http::session::store::SessionRole>,
+    /// 発行時に宣言されたスコープ（HTTP-15・Issue #2100。省略は `None`＝全権限）。運ぶだけで、
+    /// 要求ごとの強制は後続 Issue #2101（本 Issue では `session_state()` に影響させない）。
+    scope: Option<std::sync::Arc<crate::http::session::scope::SessionScope>>,
 }
 
 impl SessionPrincipal {
+    /// 発行時に宣言されたスコープ（省略は `None`）。読み取り専用で、書き換え経路は無い。
+    pub fn scope(&self) -> Option<&crate::http::session::scope::SessionScope> {
+        self.scope.as_deref()
+    }
+
     /// この要求に束縛されたテナント文脈。
     pub fn policy_context(&self) -> &PolicyContext {
         &self.ctx
@@ -153,6 +161,7 @@ pub fn authenticate(
             ctx: grant.ctx,
             ddl_allowed: grant.ddl_allowed,
             role: grant.role,
+            scope: grant.scope,
         }),
         None => Err(MiddlewareError::Unknown),
     }
@@ -441,5 +450,29 @@ mod tests {
         let headers = headers_from(b"X-Tenant-Id: other\r\n");
         let err = reject_tenant_headers(&headers).unwrap_err();
         assert!(!err.client_message().contains("X-Tenant-Id"));
+    }
+
+    #[test]
+    fn scope_is_carried_to_principal_without_affecting_session_state() {
+        use crate::http::session::scope::scope_for_test;
+        let sessions = SessionStore::new();
+        let now = Instant::now();
+        let scope = scope_for_test(&["docs"], true);
+        let scoped = sessions
+            .issue_with_scope(ctx("t"), false, None, Some(scope.clone()), now)
+            .expect("issue");
+        let plain = sessions.issue(ctx("t"), now).expect("issue");
+
+        let raw = format!("Authorization: Bearer {}\r\n", scoped.encoded());
+        let p = authenticate(&sessions, &headers_from(raw.as_bytes()), || now).expect("auth");
+        assert_eq!(p.scope(), Some(&scope));
+        let raw = format!("Authorization: Bearer {}\r\n", plain.encoded());
+        let q = authenticate(&sessions, &headers_from(raw.as_bytes()), || now).expect("auth");
+        assert!(q.scope().is_none());
+        // 本 Issue ではスコープを強制しない（#2101）。session_state は有無で変わらない。
+        assert_eq!(
+            format!("{:?}", p.session_state()),
+            format!("{:?}", q.session_state())
+        );
     }
 }

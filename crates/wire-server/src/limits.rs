@@ -254,6 +254,11 @@ impl ConnectionLimiter {
 /// モジュール doc 参照）。
 pub const MAX_SESSIONS: usize = 256;
 
+/// セッション発行 `scope.tables` の配列長の上限（HTTP-15・Issue #2100）。セッションはメモリ内に
+/// 保持され、発行本文は最大 1 MiB まで受理されるため、無制限だと [`MAX_SESSIONS`] 件ぶんの
+/// 表名集合でメモリを消費させる DoS になる。生の配列長を確保前に検査し、超過は `54000` で拒否する。
+pub const MAX_SCOPE_TABLES: usize = 64;
+
 /// セッショントークンの固定有効期間（TASK-174・HTTP-4）。発行時刻起点で
 /// スライドしない（`http::session::store::SessionStore::lookup` は
 /// `issued_at` を更新しない）。

@@ -15,11 +15,14 @@
 //! （`POST /v1/query` 前段の `Authorization: Bearer` ミドルウェア。[`bearer`]・
 //! [`store::SessionStore::lookup`] を再利用して [`middleware::
 //! SessionPrincipal`]（唯一のテナント文脈）を導出し、`tenant_id` 相当ヘッダの
-//! 拒否も担う。Issue #754・HTTP-5・HTTP-6・HTTP-7）を提供する。
+//! 拒否も担う。Issue #754・HTTP-5・HTTP-6・HTTP-7）・[`scope`]（発行時の任意 `scope`
+//! 〔op・表・読み取り専用〕の型と検証。トークンへ束縛して運ぶだけで強制は後続。
+//! Issue #2100・HTTP-15）を提供する。
 
 pub mod bearer;
 pub mod close;
 pub mod issue;
 pub mod middleware;
+pub mod scope;
 pub mod store;
 pub mod token;

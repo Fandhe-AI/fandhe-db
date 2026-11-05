@@ -63,10 +63,12 @@ use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::exec::{Cell, ColumnMeta, QueryResult, ResultRow};
 use crate::sql::exec_stats::{stage_end, stage_start, ExecStage, ExecStats};
 use crate::sql::expr_program::{ExprProgram, StackValue};
+use crate::sql::keyset::{KeysetPosition, ScanPage};
 use crate::sql::order_value::{
-    compare_nullable, compare_ref_and_owned_values, compare_statement_order,
-    expr_value_to_jsonb_key, expr_value_to_key_ref, extract_order_value_ref,
-    scalar_key_ref_to_owned, NullPlacement, OrderValue, ScalarKeyRef,
+    compare_keyset_order, compare_keyset_ref_to_owned, compare_nullable,
+    compare_ref_and_owned_values, compare_statement_order, expr_value_to_jsonb_key,
+    expr_value_to_key_ref, extract_order_value_ref, scalar_key_ref_to_owned, NullPlacement,
+    OrderValue, ScalarKeyRef,
 };
 use crate::sql::parser::{BoundOrderKey, BoundOrderTarget, BoundScan, OrderKind, ProjectedColumn};
 use crate::sql::row_policy::{resolve_row_policy, BoundRowPolicy, PolicyCmd, PolicyNeeds};
@@ -426,7 +428,18 @@ fn compare_candidate_ref_to_entry(
     id: u64,
     tenant_id: &str,
     other: &HeapEntry,
+    keyset: bool,
 ) -> Ordering {
+    // キーセットモード（Issue #2093）は物理 id を最終同点に使わない（末尾キーが一意性を担う）。
+    if keyset {
+        return compare_keyset_ref_to_owned(
+            order_by,
+            refs,
+            tenant_id.as_bytes(),
+            &other.keys,
+            other.tenant_id.as_bytes(),
+        );
+    }
     for (idx, key) in order_by.iter().enumerate() {
         let a = refs.get(idx).and_then(|o| o.as_ref());
         let b = other.keys.get(idx).and_then(|o| o.as_ref());
@@ -1111,6 +1124,9 @@ struct HeapEntry {
     tenant_id: String,
     id: u64,
     spec: Rc<[BoundOrderKey]>,
+    /// キーセットモード（Issue #2093）。`true` のとき順序は物理 `id` を使わない
+    /// （[`compare_keyset_order`]）。同一クエリの全候補で同じ値。
+    keyset: bool,
 }
 
 impl HeapEntry {
@@ -1118,6 +1134,15 @@ impl HeapEntry {
     /// `id` 昇順 → `tenant_id` バイト順。§受入基準 2「決定的な順序」）。
     /// 戻り値は「昇順ソートすると最終的な出力順になる」意味の `Ordering`。
     fn order(&self, other: &Self) -> Ordering {
+        if self.keyset {
+            return compare_keyset_order(
+                &self.spec,
+                &self.keys,
+                self.tenant_id.as_bytes(),
+                &other.keys,
+                other.tenant_id.as_bytes(),
+            );
+        }
         compare_statement_order(
             &self.spec,
             &self.keys,
@@ -1245,14 +1270,75 @@ pub(crate) fn execute_scan_with_budget_observed(
     max_result_bytes: usize,
     stats: Option<&mut ExecStats>,
 ) -> Result<QueryResult, SqlSurfaceError> {
-    let result =
-        execute_scan_with_budget_inner(read_txn, ctx, schema, bound, max_result_bytes, stats)?;
+    // 次位置は `execute_scan_page` だけが受け取る。ここ（キーセットでない文の本流）では捨てる。
+    let mut next = None;
+    let result = execute_scan_with_budget_inner(
+        read_txn,
+        ctx,
+        schema,
+        bound,
+        max_result_bytes,
+        stats,
+        &mut next,
+    )?;
     if let Some(cap) = bound.result_cap {
         if result.rows.len() > cap {
             return Err(row_limit_exceeded());
         }
     }
     Ok(result)
+}
+
+/// キーセット付き広域取得を 1 ページ分実行する（Issue #2093・NOSQL-23・SQL-25）。
+/// `core.rs::EngineCore::execute_bound_scan_page_in_session` から呼ばれる。実行本体は
+/// [`execute_scan`] と共有し、`bound.keyset` が `Some` のとき `limit + 1` 件目の存在で次位置
+/// （直前に返した最終行の位置）を返す。キーセットでない `bound` では `next = None`。
+pub fn execute_scan_page(
+    read_txn: &impl crate::storage::read_source::ReadSource,
+    ctx: &PolicyContext,
+    schema: &TableSchema,
+    bound: &BoundScan,
+) -> Result<ScanPage, SqlSurfaceError> {
+    let mut next = None;
+    let result = execute_scan_with_budget_inner(
+        read_txn,
+        ctx,
+        schema,
+        bound,
+        MAX_SCAN_RESULT_BYTES,
+        None,
+        &mut next,
+    )?;
+    Ok(ScanPage::new(result, next))
+}
+
+/// 経路 (A) の走査を打ち切るか。キーセットでは `limit` 件に達した後も、次ページの存在
+/// （`limit + 1` 件目の述語通過行）を確認するまで続ける。
+fn route_a_done(keyset_active: bool, more: bool, rows_len: usize, limit: usize) -> bool {
+    if keyset_active {
+        more
+    } else {
+        rows_len >= limit
+    }
+}
+
+/// キーセットの述語・位置生成のために行の順序キーを借用のまま取り出す（経路 (A) 用。経路 (B) は
+/// 式キーも扱う独自の抽出を持つ）。キーセットは列キー・疑似列 `id` しか持たない。
+fn keyset_row_refs<'a>(
+    schema: &TableSchema,
+    bound: &BoundScan,
+    id: u64,
+    scanned: &'a [Option<row_codec::ScalarRef<'a>>],
+) -> Result<Vec<Option<ScalarKeyRef<'a>>>, SqlSurfaceError> {
+    let mut refs = Vec::new();
+    refs.try_reserve_exact(bound.order_by.len())
+        .map_err(|e| SqlSurfaceError::Internal {
+            detail: format!("failed to reserve keyset order keys: {e}"),
+        })?;
+    for key in &bound.order_by {
+        refs.push(extract_order_value_ref(schema, key, id, scanned)?);
+    }
+    Ok(refs)
 }
 
 fn execute_scan_with_budget_inner(
@@ -1262,7 +1348,16 @@ fn execute_scan_with_budget_inner(
     bound: &BoundScan,
     max_result_bytes: usize,
     mut stats: Option<&mut ExecStats>,
+    next_out: &mut Option<KeysetPosition>,
 ) -> Result<QueryResult, SqlSurfaceError> {
+    // Issue #2093: キーセットと併用できない指定は走査の前に拒否する（`with_offset` は
+    // `with_after` の後にも呼べるため、ここが本命の検査）。
+    let keyset_active = bound.keyset.is_some();
+    if keyset_active {
+        crate::sql::keyset::check_combination(bound)?;
+    }
+    let keyset_after: Option<&KeysetPosition> =
+        bound.keyset.as_ref().and_then(|k| k.after.as_ref());
     // SQL-30・TASK-214（Issue #930）: ウィンドウ項目を持つ広域取得は専用の実行器
     // （`sql::window::execute_window_scan`）へ委譲する。本体側の変更をこの
     // dispatch 1 行に留めることで、`sql::scan` を編集する他 PR との衝突を
@@ -1538,6 +1633,10 @@ fn execute_scan_with_budget_inner(
         // 所有行のみを列挙し他テナント領域のキー・値には一切触れない
         // （`tenant.rs::enumerate_dml_candidates` と同型の閉区間。Issue #871
         // と同じ判断）。
+        // Issue #2093: キーセットモードの状態。`more` は `limit + 1` 件目（述語を通る可視行）が
+        // 存在したこと、`last_keys` は返す最後の行（`limit` 件目）の順序キー（次位置の材料）。
+        let more = std::cell::Cell::new(false);
+        let mut last_keys: Option<Vec<Option<OrderValue>>> = None;
         let mut build_visible_row = |key_tenant: &str, id: u64, buf: &[u8]| {
             with_visible_row(
                 buf,
@@ -1553,6 +1652,43 @@ fn execute_scan_with_budget_inner(
                 &mut embedding_scratch,
                 &mut where_expr_scratch,
                 |dim, scanned, embedding| {
+                    // Issue #2093: キーセットの述語は可視性・`WHERE` 確定後の行にだけ適用し
+                    // （不可視行は位置比較にも現れない）、`OFFSET` 計数・投影・予算計上より前に置く。
+                    if keyset_active {
+                        let refs = keyset_row_refs(schema, bound, id, scanned)?;
+                        if let Some(after) = keyset_after {
+                            if compare_keyset_ref_to_owned(
+                                &bound.order_by,
+                                &refs,
+                                key_tenant.as_bytes(),
+                                &after.keys,
+                                after.tenant_id.as_bytes(),
+                            ) != Ordering::Greater
+                            {
+                                return Ok(None);
+                            }
+                        }
+                        if emitted >= bound.limit {
+                            // `limit + 1` 件目: 次ページが存在する。投影も予算計上もしない。
+                            more.set(true);
+                            return Ok(None);
+                        }
+                        if emitted + 1 == bound.limit {
+                            let mut owned = Vec::new();
+                            owned.try_reserve_exact(refs.len()).map_err(|e| {
+                                SqlSurfaceError::Internal {
+                                    detail: format!("failed to reserve keyset position keys: {e}"),
+                                }
+                            })?;
+                            for r in refs {
+                                owned.push(match r {
+                                    Some(v) => Some(scalar_key_ref_to_owned(v)?),
+                                    None => None,
+                                });
+                            }
+                            last_keys = Some(owned);
+                        }
+                    }
                     // PR #1096 レビュー指摘 P1（codex-review・cursor Bugbot 双方が
                     // 独立検出）対応: 経路 (A) は物理走査順が疑似列 `id` による
                     // ソート確定順と一致するため、`skipped` 判定を投影・
@@ -1606,7 +1742,7 @@ fn execute_scan_with_budget_inner(
             .map_err(storage_internal)?;
         if descending {
             for entry in range.rev() {
-                if rows.len() >= bound.limit {
+                if route_a_done(keyset_active, more.get(), rows.len(), bound.limit) {
                     break;
                 }
                 let (k, v) = entry.map_err(storage_internal)?;
@@ -1623,7 +1759,7 @@ fn execute_scan_with_budget_inner(
             }
         } else {
             for entry in range {
-                if rows.len() >= bound.limit {
+                if route_a_done(keyset_active, more.get(), rows.len(), bound.limit) {
                     break;
                 }
                 let (k, v) = entry.map_err(storage_internal)?;
@@ -1635,6 +1771,15 @@ fn execute_scan_with_budget_inner(
                     })?;
                     rows.push(row);
                 }
+            }
+        }
+        // Issue #2093: `limit + 1` 件目が存在したときだけ、最後に返した行の位置を次位置にする。
+        if more.get() {
+            if let Some(keys) = last_keys.take() {
+                *next_out = Some(KeysetPosition {
+                    keys,
+                    tenant_id: ctx.tenant_id().to_string(),
+                });
             }
         }
     } else {
@@ -1649,7 +1794,13 @@ fn execute_scan_with_budget_inner(
         // `validate_search_offset` で `MAX_SEARCH_K` 以下に検証済みのため実際には
         // 桁あふれしないが、規約（`.claude/rules/coding-rust.md`）に従い
         // `saturating_add` で未定義動作を避ける。
-        let heap_capacity = bound.limit.saturating_add(bound.offset);
+        // Issue #2093: キーセットでは `offset` を使わず、次ページの存在を判定するため
+        // `limit + 1` 件を保持する（超過行は投影しない）。
+        let heap_capacity = if keyset_active {
+            bound.limit.saturating_add(1)
+        } else {
+            bound.limit.saturating_add(bound.offset)
+        };
         let spec: Rc<[BoundOrderKey]> = Rc::from(bound.order_by.clone());
         let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::new();
         let mut heap_budget: usize = 0;
@@ -1786,6 +1937,20 @@ fn execute_scan_with_budget_inner(
                                 refs.push(extract_order_value_ref(schema, key, id, scanned)?);
                             }
                         }
+                        // Issue #2093: キーセットの述語。可視性・`WHERE` 確定後の行に限り、位置より
+                        // 出力順で厳密に後ろの行だけを候補にする（ヒープ投入・予算照合より前）。
+                        if let Some(after) = keyset_after {
+                            if compare_keyset_ref_to_owned(
+                                &bound.order_by,
+                                &refs,
+                                key_tenant.as_bytes(),
+                                &after.keys,
+                                after.tenant_id.as_bytes(),
+                            ) != Ordering::Greater
+                            {
+                                return Ok(None);
+                            }
+                        }
                         if let Some(w) = &tie_worst {
                             // 2 回目の走査: `w` と同じ `(id, tenant_id)` を渡すと比較は `ORDER BY`
                             // キー部分だけになり、`Equal` が「キーが等しい」を意味する。
@@ -1795,6 +1960,7 @@ fn execute_scan_with_budget_inner(
                                 w.id,
                                 &w.tenant_id,
                                 w,
+                                false,
                             ) != Ordering::Equal
                             {
                                 return Ok(None);
@@ -1822,6 +1988,7 @@ fn execute_scan_with_budget_inner(
                                 id,
                                 key_tenant,
                                 worst,
+                                keyset_active,
                             );
                             if cmp != Ordering::Less {
                                 // 現在の最悪候補以上（採用されない）。複製せずスキップ。
@@ -1861,6 +2028,7 @@ fn execute_scan_with_budget_inner(
                     tenant_id: key_tenant.to_string(),
                     id,
                     spec: Rc::clone(&spec),
+                    keyset: keyset_active,
                 };
                 if tie_worst.is_some() {
                     // 同値行も結果行数の上限に数える。超過は結果を打ち切らず `54000`。
@@ -1977,7 +2145,23 @@ fn execute_scan_with_budget_inner(
         // `saturating_sub` ではなく `checked_sub` を使い、対応が崩れていれば
         // fail-closed に `Internal` へ落とす（過小申告のまま静かに処理を
         // 続けない）。
-        let mut sorted_winners = heap.into_sorted_vec().into_iter();
+        let mut sorted = heap.into_sorted_vec();
+        // Issue #2093: `limit + 1` 件目（次ページの存在の印）は投影せず、保持分の予算だけ戻す。
+        let mut keyset_has_more = false;
+        if keyset_active && sorted.len() > bound.limit {
+            if let Some(extra) = sorted.pop() {
+                let bytes = heap_entry_bytes(&extra);
+                drop(extra);
+                byte_budget = byte_budget.checked_sub(bytes).ok_or_else(|| {
+                    SqlSurfaceError::Internal {
+                        detail: "scan result byte budget underflow while releasing the keyset lookahead candidate"
+                            .to_string(),
+                    }
+                })?;
+                keyset_has_more = true;
+            }
+        }
+        let mut sorted_winners = sorted.into_iter();
         for winner in sorted_winners.by_ref().take(bound.offset) {
             let bytes = heap_entry_bytes(&winner);
             drop(winner);
@@ -2000,7 +2184,10 @@ fn execute_scan_with_budget_inner(
         // 直接代入できなくなるため（借用チェッカーに拒否される）、反復ごとに
         // 独立した一時クロージャとして渡す形へ変更した（パス 1 の候補判定
         // クロージャと同型。Issue #915）。
-        for mut winner in sorted_winners {
+        let winner_count = sorted_winners.len();
+        let mut next_keys: Option<Vec<Option<OrderValue>>> = None;
+        let mut next_tenant: Option<String> = None;
+        for (winner_index, mut winner) in sorted_winners.enumerate() {
             let guard = table
                 .get((winner.tenant_id.as_str(), winner.id))
                 .map_err(storage_internal)?;
@@ -2022,14 +2209,21 @@ fn execute_scan_with_budget_inner(
             // 小さい `max_result_bytes` を一時的に超える余地を残さない）。
             let keys_bytes = heap_entry_keys_bytes(&winner);
             let owned_keys = std::mem::take(&mut winner.keys);
-            drop(owned_keys);
-            byte_budget = byte_budget.checked_sub(keys_bytes).ok_or_else(|| {
-                SqlSurfaceError::Internal {
-                    detail:
-                        "scan result byte budget underflow while releasing a projected candidate's sort keys"
-                            .to_string(),
-                }
-            })?;
+            if keyset_has_more && winner_index + 1 == winner_count {
+                // Issue #2093: 最後に返す行のキーは次位置として返すため破棄せず、計上も残す
+                // （返却まで保持し続けるため「計上額 ≥ 実際の保持量」を保つ）。
+                next_keys = Some(owned_keys);
+                next_tenant = Some(winner.tenant_id.clone());
+            } else {
+                drop(owned_keys);
+                byte_budget = byte_budget.checked_sub(keys_bytes).ok_or_else(|| {
+                    SqlSurfaceError::Internal {
+                        detail:
+                            "scan result byte budget underflow while releasing a projected candidate's sort keys"
+                                .to_string(),
+                    }
+                })?;
+            }
 
             let row = with_visible_row(
                 buf,
@@ -2095,6 +2289,9 @@ fn execute_scan_with_budget_inner(
                             .to_string(),
                 }
                     })?;
+        }
+        if let (Some(keys), Some(tenant_id)) = (next_keys, next_tenant) {
+            *next_out = Some(KeysetPosition { keys, tenant_id });
         }
     }
 
@@ -2205,6 +2402,7 @@ mod tests {
             windows: Vec::new(),
             order_exprs: Vec::new(),
             ties_row_cap: None,
+            keyset: None,
         }
     }
 
@@ -2354,6 +2552,7 @@ mod tests {
             windows: Vec::new(),
             order_exprs: Vec::new(),
             ties_row_cap: None,
+            keyset: None,
         };
 
         // パス 1 のヒープ候補 1 件分の内訳（[`heap_entry_keys_bytes`]・
@@ -2462,6 +2661,7 @@ mod tests {
             tenant_id: "tenant-a".to_string(),
             id: 1,
             spec: Rc::clone(&spec),
+            keyset: false,
         };
 
         let one_key = make_entry(1);
@@ -2509,6 +2709,7 @@ mod tests {
             tenant_id: tenant_id.to_string(),
             id: 1,
             spec,
+            keyset: false,
         };
 
         assert_eq!(
@@ -2716,6 +2917,7 @@ mod tests {
             windows: Vec::new(),
             order_exprs: Vec::new(),
             ties_row_cap: None,
+            keyset: None,
         };
 
         let err = execute_scan_with_budget(&read_txn, &ctx, &schema, &bound, 4096)
@@ -2798,6 +3000,7 @@ mod tests {
             windows: Vec::new(),
             order_exprs: Vec::new(),
             ties_row_cap: None,
+            keyset: None,
         };
 
         // 巨大なキーを複製すれば単独でも超過するが、上位候補にならないため
@@ -2881,6 +3084,7 @@ mod tests {
             windows: Vec::new(),
             order_exprs: Vec::new(),
             ties_row_cap: None,
+            keyset: None,
         };
 
         // 十分大きい既定予算では、最終的に id=2（"a"）だけが残る。
@@ -2987,6 +3191,7 @@ mod tests {
             windows: Vec::new(),
             order_exprs: Vec::new(),
             ties_row_cap: None,
+            keyset: None,
         };
 
         // パス 1 終了時点のヒープ候補 7 件分（`heap_entry_bytes` と同じ計算式。
@@ -3058,6 +3263,7 @@ mod tests {
             windows: Vec::new(),
             order_exprs: Vec::new(),
             ties_row_cap: None,
+            keyset: None,
         }
     }
 
@@ -3129,6 +3335,7 @@ mod tests {
             windows: Vec::new(),
             order_exprs: Vec::new(),
             ties_row_cap: None,
+            keyset: None,
         };
 
         let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
@@ -3208,6 +3415,7 @@ mod tests {
             windows: Vec::new(),
             order_exprs: Vec::new(),
             ties_row_cap: None,
+            keyset: None,
         };
 
         let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
@@ -3281,6 +3489,7 @@ mod tests {
             windows: Vec::new(),
             order_exprs: Vec::new(),
             ties_row_cap: None,
+            keyset: None,
         };
 
         let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
@@ -3341,6 +3550,7 @@ mod tests {
             windows: Vec::new(),
             order_exprs: Vec::new(),
             ties_row_cap: None,
+            keyset: None,
         };
 
         let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
@@ -3513,6 +3723,7 @@ mod tests {
             windows: Vec::new(),
             order_exprs: Vec::new(),
             ties_row_cap: None,
+            keyset: None,
         };
         let (tier, mask) = decode_tier_for(&schema, &bound);
         assert_eq!(tier, DecodeTier::DimAndScalar);
@@ -3536,6 +3747,7 @@ mod tests {
             windows: Vec::new(),
             order_exprs: Vec::new(),
             ties_row_cap: None,
+            keyset: None,
         };
         let (tier, mask) = decode_tier_for(&schema, &bound);
         assert_eq!(tier, DecodeTier::Fast);
@@ -3565,6 +3777,7 @@ mod tests {
             windows: Vec::new(),
             order_exprs: Vec::new(),
             ties_row_cap: None,
+            keyset: None,
         };
         let (tier, _mask) = decode_tier_for(&schema, &bound);
         assert_eq!(tier, DecodeTier::Embedding);

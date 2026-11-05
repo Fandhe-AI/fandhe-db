@@ -19,3 +19,17 @@ pub(crate) mod md5;
 pub mod random;
 pub mod scram_verifier;
 pub mod sha256;
+
+/// 2 つのバイト列を定数時間で比較する（長さが異なれば不一致。長さそのものは秘密ではない）。
+/// MAC・トークン検証の比較で、先頭の不一致位置がタイミング差として漏れないようにするための
+/// 共有ヘルパー（Issue #2093 の `sql::keyset` の封緘位置の検証が使う）。
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
