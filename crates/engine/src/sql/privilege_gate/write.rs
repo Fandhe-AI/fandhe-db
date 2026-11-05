@@ -29,6 +29,7 @@ use crate::sql::allowlist::{
     SqlSurfaceError, ValidatedInsert, ValidatedUpdateForm,
 };
 use crate::sql::cte::DmlStatement;
+use crate::sql::explain_dml::ExplainDml;
 use crate::sql::lexer::Token;
 use crate::sql::mode::SessionState;
 use crate::sql::relation_name::SchemaResolver;
@@ -191,6 +192,17 @@ pub(crate) fn classify_write(parsed: &ParsedSql) -> WriteRequirement {
                 .iter()
                 .map(|d| dml_statement_bits(&d.statement))
                 .collect(),
+        },
+        // Issue #2050: 実行した場合と同じ DELETE／UPDATE 権限を要求する（SQL-40）。
+        ParsedSql::ExplainDml(e) => match e {
+            ExplainDml::Delete(d) => {
+                let (t, b) = delete_form_bits(&DeleteStatement::Predicate(d.clone()));
+                WriteRequirement::one(&t, b)
+            }
+            ExplainDml::Update(u) => {
+                let (t, b) = update_form_bits(&ValidatedUpdateForm::Predicate(u.clone()));
+                WriteRequirement::one(&t, b)
+            }
         },
         ParsedSql::Partitioned(c) => match c {
             PartitionedControl::ExplainDelete(d) => {

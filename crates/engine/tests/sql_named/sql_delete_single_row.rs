@@ -569,9 +569,8 @@ fn delete_invalidates_hnsw_index_cache_and_excludes_deleted_row() {
     );
 }
 
-/// `USING PLAN` と同じく `EXPLAIN DELETE ...` は許可形状に存在しないため
-/// `42601` で拒否される（`truncate_table.rs::explain_truncate_is_rejected_as_
-/// unsupported_syntax` と同型）。
+/// 採番でない表の単一行形（`WHERE id = <n>` は物理キーの直接指定）の `EXPLAIN DELETE ...` は
+/// 既存の計画語彙で表せないため対象外として `42601` で拒否される（Issue #2050。述語形は受理）。
 #[test]
 fn explain_delete_is_rejected_as_unsupported_syntax() {
     let (core, path) = new_core_with_table();
