@@ -406,6 +406,12 @@ impl<'a> PreparedScan<'a> {
         if self.after.is_none() {
             return Ok(None);
         }
+        // `sort` の上限超過は `build_sort` が余分な 1 キーを残して engine の
+        // `with_order_by`（`54000`）に判定させる設計。AAD 構築で `XX000` に化けないよう、
+        // ここではキーセット束縛を作らず従来の束縛経路へ回し、文書化どおり `54000` を返す。
+        if self.sort_keys.len() > MAX_SCALAR_ORDER_KEYS {
+            return Ok(None);
+        }
         let key = cursor_key.ok_or(ScanError::CursorUnavailable)?;
         let user = principal.auth_user().ok_or(ScanError::CursorUnavailable)?;
         let aad = cursor::build_aad(

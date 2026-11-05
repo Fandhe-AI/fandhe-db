@@ -11,6 +11,7 @@
 
 - wire-server の公開関数 `http::query::gate::handle` に引数 `cursor_key: Option<&KeysetSealKey>`（`engine` の次、`now_wall` の前）を追加し、公開構造体 `http::session::store::SessionGrant` にフィールド `user: Option<String>` を追加した（Issue #2094・NOSQL-23 ポインタ）。`scan` のカーソルを認証ユーザーへ束縛するため。
   BREAKING CHANGE: `gate::handle` の引数と `SessionGrant` のフィールドが増えた（呼び出し・構築している下流は追随が必要）。
+  BREAKING CHANGE: 公開モジュール `http::query::scan` も変わった。`execute` は引数 `cursor_key: Option<&KeysetSealKey>` が増え、戻り値が `QueryResult` から `ScanOutcome` になった（従来の結果は `outcome.result` から取る。カーソルは `outcome.next_cursor`）。`explain`・`handle`・`handle_explain` にも同じ `cursor_key` 引数が増えた（`handle` は `now_wall` の前）。公開 enum `ScanError` に variant `CursorWithOffset`・`InvalidCursor`・`CursorUnavailable` を追加した（網羅的 `match` の下流は追随が必要）。非キーセットの呼び出しは `cursor_key` に `None` を渡せば従来と同じ挙動になる。
 - NoSQL の `upsert` op を実行するようにした（Issue #2087・NOSQL-21・SQL-20・SQL-49 ポインタ）。SQL 表層の `INSERT ... ON CONFLICT` と同じ束縛関数・実行器を通り、応答は `{"upserted":n}`。従来の固定文言 `0A000` は返さない。`Idempotency-Key` ヘッダを `upsert` でも受け付ける。
   BREAKING CHANGE: wire-server の公開定数 `http::query::gate::UPSERT_NOT_YET_AVAILABLE_MESSAGE` を削除した。
 - `halfvec_*_ops` を VECTOR 列の `USING hnsw` に指定したときのエラーを `42704` から `42804` へ変えた（Issue #2016・TABLE-46 (3)・INDEX-7 ポインタ。PostgreSQL と同じ）。`vector_*_ops` を HALFVEC 列に指定した場合も `42804`。未知の演算子クラスは従来どおり `42704`。

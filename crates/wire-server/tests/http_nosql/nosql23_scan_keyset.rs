@@ -299,6 +299,20 @@ fn after_with_wrong_type_is_42601() {
 }
 
 #[test]
+fn after_with_sort_over_max_keys_is_54000() {
+    let (_core, srv, _g) = setup();
+    let items: String = (0..9)
+        .map(|_| r#"{"column":"g","dir":"asc"}"#)
+        .collect::<Vec<_>>()
+        .join(",");
+    let sort = format!("[{items}]");
+    for after in [None, Some("AAAA")] {
+        let body = scan_body("pkt", 2, &sort, after);
+        assert_code(&post(srv.addr, &srv.alice, &body), 413, "54000");
+    }
+}
+
+#[test]
 fn after_combined_with_offset_is_42601() {
     let (_core, srv, _g) = setup();
     let p1 = parse_page(&ok(&post(
