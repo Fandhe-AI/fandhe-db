@@ -316,17 +316,20 @@ fn print_summary_and_verdicts(summary: &[SummaryRow], dedicated: bool) {
 }
 
 /// `BENCH_RLS_TIMING_REJUDGE`: 計測せず `raw.json` を読み戻して判定だけ行う（untrusted 入力）。
-fn rejudge(path: &str) -> ! {
+fn rejudge(path_raw: &str) -> ! {
+    // 相対パスはリポジトリルート基準（BENCH_RLS_TIMING_OUT_DIR と同じ。cargo bench の cwd は
+    // crates/engine のため）。絶対パスはそのまま使われる。
+    let path = workspace_root().join(path_raw);
     if std::env::var("GITHUB_ACTIONS").is_ok() {
         fail_closed("BENCH_RLS_TIMING_REJUDGE is not allowed under GITHUB_ACTIONS");
     }
-    let len = std::fs::metadata(path)
+    let len = std::fs::metadata(&path)
         .unwrap_or_else(|e| fail_closed(format!("cannot stat rejudge input: {e}")))
         .len();
     if len > harness::chip::JSON_MAX_INPUT_BYTES as u64 {
         fail_closed("rejudge input exceeds the size limit");
     }
-    let text = std::fs::read_to_string(path)
+    let text = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| fail_closed(format!("cannot read rejudge input: {e}")));
     let (shapes, rounds) = parse_raw_rounds(&text).unwrap_or_else(|e| fail_closed(e));
     let summary = summarize(&rounds, &shapes).unwrap_or_else(|e| fail_closed(e));
