@@ -1,6 +1,8 @@
 //! JOIN の `EXPLAIN` 用の段の木の組み立て（Issue #2046・SQL-75 (2) ポインタ）。
 //!
-//! 呼び出し元は `core.rs` の `Statement::Explain` アーム（`run_join_explain`）。`prepare_join` で
+//! 呼び出し元は `core.rs` の `Statement::Explain` アーム（`run_join_explain`／`join_explain_node`。
+//! CTE・派生表の側は `cte` 節、再帰 CTE の再帰項〔`sql::recursive_eval::explain`〕では作業表の側を
+//! `work_table_scan` 節に差し替える。Issue #2976）。`prepare_join` で
 //! 行を読まずに束縛した [`PreparedJoin`] と、側ごとの走査分類の行（単一表の広域取得
 //! `EXPLAIN` と同じ `scalar_plan`／`access_path`）を受け取り、`sql::explain_tree` の
 //! [`ExplainNode`] を返す純粋関数だけを置く。行・ロック・台帳・世代・キャッシュには触れない。
@@ -14,25 +16,33 @@ use super::plan::{JoinMethod, Shape};
 use super::PreparedJoin;
 use crate::sql::explain_tree::{present, ExplainNode, ExplainTreeError};
 
+/// 側 `side`（0 起点）の `scan` 節（`relation: k` を先頭に、走査分類の行を並べる）。実表の側の
+/// 節の形は、JOIN の `EXPLAIN` と再帰 CTE の再帰項（作業表以外の側。Issue #2976）が共有する。
+pub(crate) fn side_scan_node(
+    side: usize,
+    lines: Vec<String>,
+) -> Result<ExplainNode, ExplainTreeError> {
+    let mut all = Vec::with_capacity(lines.len().saturating_add(1));
+    all.push(format!("relation: {}", side.saturating_add(1)));
+    all.extend(lines);
+    ExplainNode::try_stage("scan".to_string(), all)
+}
+
 /// 結合の段の木を組み立てる。外側から `limit` → `sort` → `aggregate` → `filter` → `join` 連鎖 →
-/// `scan`（実行順の逆）。`side_lines.len()` が relation 数と違うときは fail-closed
-/// （[`ExplainTreeError::InvalidLine`]）。left-deep の連鎖は再帰せずループで畳む。
-pub(crate) fn explain_tree(
+/// 各側の節（実行順の逆）。側ごとの節（`side_nodes`。relation の並び順）は呼び出し元が作って渡す
+/// （Issue #2976）。実表の側は [`side_scan_node`]、CTE・派生表の側は `cte` 節、再帰 CTE の作業表の側は
+/// `work_table_scan` 節になり、結合以降の段の積み方は側の種別によらず共通。`side_nodes.len()` が
+/// relation 数と違うときは fail-closed（[`ExplainTreeError::InvalidLine`]）。left-deep の連鎖は
+/// 再帰せずループで畳む。
+pub(crate) fn explain_tree_with_side_nodes(
     prepared: &PreparedJoin<'_>,
-    side_lines: Vec<Vec<String>>,
+    side_nodes: Vec<ExplainNode>,
 ) -> Result<ExplainNode, ExplainTreeError> {
     let plan = &prepared.plan;
-    if side_lines.len() != prepared.side_count() || plan.steps.len() + 1 != side_lines.len() {
+    if side_nodes.len() != prepared.side_count() || plan.steps.len() + 1 != side_nodes.len() {
         return Err(ExplainTreeError::InvalidLine);
     }
-    let mut scans = Vec::with_capacity(side_lines.len());
-    for (i, lines) in side_lines.into_iter().enumerate() {
-        let mut all = Vec::with_capacity(lines.len().saturating_add(1));
-        all.push(format!("relation: {}", i.saturating_add(1)));
-        all.extend(lines);
-        scans.push(ExplainNode::try_stage("scan".to_string(), all)?);
-    }
-    let mut it = scans.into_iter();
+    let mut it = side_nodes.into_iter();
     let mut current = it.next().ok_or(ExplainTreeError::InvalidLine)?;
     for (step, right) in plan.steps.iter().zip(it) {
         let join_type = match (step.preserve_acc, step.preserve_new) {

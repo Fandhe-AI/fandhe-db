@@ -127,7 +127,7 @@ RECURSIVE の下では後方の CTE 名も可視になり、非再帰経路の�
 | `UNION`（重複除去）・循環検出 | #1872（実装済み） |
 | RLS 境界テストの網羅 | #1873（実装済み。「Issue #1873 追記」節） |
 | `CYCLE` 句 | #2214（実装済み。「Issue #2214 追記」節） |
-| EXPLAIN | #2044 |
+| EXPLAIN | #2044（#2976 で実装済み。「Issue #2976 追記」節） |
 
 静的に決まるエラー（アンカーの束縛・再帰項の束縛・列数・型・照合・未対応型）は、Execute でもアンカーを実行する前に Describe と同じ経路で検査する（データ依存の実行エラーに覆われない）。
 
@@ -334,3 +334,7 @@ SQL-35・RLS-10 (b)・ERR-6 のポインタ。実装は `sql::allowlist`（`Cycl
 | ---- | ---- |
 | `UNION`（重複除去）と `SEARCH`／`CYCLE` の併用 | 未割当（固定 `0A000`。要 Issue） |
 | `TO`／`DEFAULT` の小数・`NULL`・型名付きリテラル、`CYCLE` の JSONB 等の列 | 未割当（固定 `0A000`） |
+
+## Issue #2976 追記: 再帰 CTE の EXPLAIN
+
+`EXPLAIN WITH RECURSIVE` は Issue #2976 で受理する。`cte`（`cte_mode: recursive`）→ `recursive_union`（`union`・`search`・`cycle`）の下にアンカー項と再帰項（`work_table_scan`）を並べ、反復は行わない。計画は `with_prepared` を Describe と共有するので、再帰の構造違反（`42P19` 等）・束縛・列整合のエラーは非 EXPLAIN と同じ `wire_code`。詳細は [explain-search-engine-exposure.md](explain-search-engine-exposure.md) の #2976 追記。

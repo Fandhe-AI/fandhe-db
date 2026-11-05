@@ -68,6 +68,21 @@ impl ExplainTreeError {
             Self::InvalidLine => "EXPLAIN plan line contains a line break",
         }
     }
+
+    /// `wire_code` への写像（`core.rs` の `explain_tree_error` と同じ規則）。`InvalidLine`
+    /// （契約違反）は `Internal`、上限超過は `54001`（固定文）で fail-closed。再帰 CTE の計画
+    /// （`sql::recursive_eval::explain`。Issue #2976）のように `core.rs` の外で木を組む呼び出し元が使う。
+    pub(crate) fn into_surface_error(self) -> crate::sql::allowlist::SqlSurfaceError {
+        use crate::sql::allowlist::SqlSurfaceError;
+        match self {
+            Self::InvalidLine => SqlSurfaceError::Internal {
+                detail: self.message().to_string(),
+            },
+            _ => SqlSurfaceError::StatementTooComplex {
+                detail: self.message(),
+            },
+        }
+    }
 }
 
 /// `EXPLAIN` の段の木の 1 節。フィールドは非公開で、組み立てはコンストラクタと

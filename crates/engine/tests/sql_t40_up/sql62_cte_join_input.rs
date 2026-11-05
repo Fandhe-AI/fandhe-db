@@ -436,7 +436,7 @@ fn duplicate_columns_and_data_modifying_cte_are_rejected() {
     );
 }
 
-/// インライン専用の文脈（CREATE VIEW の本文・`EXPLAIN`）では、CTE を入力に持つ JOIN は
+/// インライン専用の文脈（CREATE VIEW の本文）では、CTE を入力に持つ JOIN は
 /// 従来どおり `42601` で拒否される。
 #[test]
 fn inline_only_contexts_still_reject_cte_join() {
@@ -452,15 +452,20 @@ fn inline_only_contexts_still_reject_cte_join() {
         )
         .expect_err("view body");
     assert_eq!(err.wire_code(), "42601", "{err:?}");
-    assert_eq!(
-        code(
-            &core,
-            "alice",
+    // `EXPLAIN` は Issue #2976 で対応した（`sql75_explain_cte_inputs.rs`）。実行しないので、
+    // CTE 本文の評価回数は増えない。
+    let before = evals(&core);
+    let mut session = SessionState::default();
+    let out = core
+        .execute_sql_in_session(
+            &ctx("alice"),
+            &mut session,
             "EXPLAIN WITH c AS (SELECT id, lang FROM docs) \
-             SELECT a.id, b.id FROM c a JOIN c b ON a.lang = b.lang LIMIT 5"
-        ),
-        "42601"
-    );
+             SELECT a.id, b.id FROM c a JOIN c b ON a.lang = b.lang LIMIT 5",
+        )
+        .expect("explain");
+    assert!(matches!(out, SqlOutcome::Explain(_)));
+    assert_eq!(evals(&core), before);
 }
 
 /// VECTOR 列を素通しする CTE も JOIN の入力にできる（`SELECT *` は疑似列 `id` と列を展開する）。
