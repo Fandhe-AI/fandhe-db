@@ -68,6 +68,7 @@ mod sql39_role_login;
 mod sql39_users_file_bootstrap;
 mod sql39_users_file_role;
 mod sql40_default_privileges;
+mod sql40_explain_json_acl;
 mod sql40_grant_revoke;
 mod sql40_object_owner;
 mod sql40_schema_grant;

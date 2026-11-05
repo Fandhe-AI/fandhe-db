@@ -252,6 +252,8 @@ pub(crate) fn classify_write(parsed: &ParsedSql) -> WriteRequirement {
             PartitionedControl::Show(_) | PartitionedControl::Cancel(_) => na(),
         },
         // 一時表だけを対象にする文はセッションの所有物。永続側はセッション経由でも同じ検査を受ける。
+        // Issue #2059: 包んだ `EXPLAIN` は中身と同じ検査を受ける。
+        ParsedSql::ExplainJson(inner) => classify_write(inner),
         ParsedSql::SessionRouted(r) => {
             if r.is_persistent() {
                 classify_write(r.inner())

@@ -2017,6 +2017,15 @@ pub enum ParsedSql {
     /// **BREAKING CHANGE**（Issue #2050）: 本 variant の追加により `ParsedSql` を網羅的に
     /// マッチするクレート外コードは追随が必要。
     ExplainDml(crate::sql::explain_dml::ExplainDml),
+    /// `EXPLAIN (FORMAT JSON) <文>`（Issue #2059・SQL-76 (1)(6) ポインタ）。括弧付きオプション群を
+    /// 構文入口で取り除いた残りを従来どおり解析した `EXPLAIN` 系の文（`Statement::Explain`・
+    /// [`Self::ExplainDml`]・分割実行の `EXPLAIN`）を包む。実行・権限・トランザクション・時刻の扱いは
+    /// すべて中身と同じで、結果だけを計画テキストから JSON 1 セル（列型 `json`）へ変換する
+    /// （`sql::explain_json`）。`FORMAT TEXT`／オプションなしは包まず従来と同一の値になる。
+    ///
+    /// **BREAKING CHANGE**（Issue #2059）: 本 variant の追加により `ParsedSql` を網羅的に
+    /// マッチするクレート外コードは追随が必要。
+    ExplainJson(Box<ParsedSql>),
     /// `EXPLAIN ANALYZE <SELECT>`（Issue #2054・SQL-76 (2)(3) ポインタ）。静的な計画を作ったうえで
     /// 内側の SELECT を通常の SELECT と同じ実行器で実際に実行し、結果の行数と経過時間を計画へ併記する
     /// （結果の行は返さない）。読み取りのみで、行・台帳・writer には触れない（DML は [`ParsedSql::ExplainAnalyzeDml`]）。`USING PLAN`・
@@ -2350,6 +2359,8 @@ fn statement_clock_scope(
         ParsedSql::SessionRouted(routed) => {
             return statement_clock_scope(routed.inner(), txn_start_micros)
         }
+        // Issue #2059: 包んだ `EXPLAIN` は中身の文種で判定する。
+        ParsedSql::ExplainJson(inner) => return statement_clock_scope(inner, txn_start_micros),
         ParsedSql::Statement(_)
         | ParsedSql::LockingSelect(_)
         | ParsedSql::Insert(_)
@@ -2442,6 +2453,7 @@ fn insert_sequence_scope(
         ParsedSql::SessionRouted(routed) => {
             return insert_sequence_scope(storage, session, routed.inner())
         }
+        ParsedSql::ExplainJson(inner) => return insert_sequence_scope(storage, session, inner),
         ParsedSql::Insert(_) | ParsedSql::InsertSelect(_) | ParsedSql::ViewInsert(_) => true,
         // SQL-63・Issue #1876: 副文に `INSERT` を含むときだけ採番・既定時刻の文脈を張る。
         ParsedSql::DataModifyingCte(v) => v
@@ -2529,6 +2541,9 @@ fn insert_default_clock_scope(
     let is_insert = match parsed {
         ParsedSql::SessionRouted(routed) => {
             return insert_default_clock_scope(routed.inner(), txn_start_micros)
+        }
+        ParsedSql::ExplainJson(inner) => {
+            return insert_default_clock_scope(inner, txn_start_micros)
         }
         // Issue #2051: `EXPLAIN INSERT` の束縛は `DEFAULT now()` 列の評価に文脈を要する。
         ParsedSql::Insert(_)
@@ -2757,7 +2772,7 @@ fn parsed_operation_id(parsed: &ParsedSql) -> Option<&str> {
         ParsedSql::UpdateFrom(_) | ParsedSql::DeleteUsing(_) => None,
         // Issue #2050: `EXPLAIN UPDATE|DELETE` は台帳に記録せず operation_id もトランザクションへ
         // 登録しない（登録すると同じ operation_id の本実行が誤って再利用扱いになる）。
-        ParsedSql::ExplainDml(_) => None,
+        ParsedSql::ExplainDml(_) | ParsedSql::ExplainJson(_) => None,
         // Issue #2054: 読み取りのみで台帳・operation_id に触れない。
         ParsedSql::ExplainAnalyze(_) => None,
         // Issue #2060: 読み取りのみで台帳・operation_id に触れない。
@@ -2784,9 +2799,10 @@ fn is_partitioned_write(parsed: &ParsedSql) -> bool {
             v.partitioned().is_some()
         }
         ParsedSql::Partitioned(control) => control.writes(),
-        ParsedSql::ExplainDml(_) | ParsedSql::ExplainAnalyze(_) | ParsedSql::ExplainVerbose(_) => {
-            false
-        }
+        ParsedSql::ExplainDml(_)
+        | ParsedSql::ExplainJson(_)
+        | ParsedSql::ExplainAnalyze(_)
+        | ParsedSql::ExplainVerbose(_) => false,
         // Issue #2055: 分割実行の ANALYZE は構文段で拒否済み。
         ParsedSql::ExplainAnalyzeDml(_) => false,
         ParsedSql::SessionRouted(routed) if routed.is_persistent() => {
@@ -2843,6 +2859,7 @@ fn read_only_permits(parsed: &ParsedSql) -> bool {
         // Issue #2050: ANALYZE なしの EXPLAIN は何も書かないため READ ONLY でも可。
         // Issue #2054: ANALYZE は SELECT だけを実行する（DML の ANALYZE は構文段で拒否）ため同様に可。
         ParsedSql::ExplainDml(_) | ParsedSql::ExplainAnalyze(_) => true,
+        ParsedSql::ExplainJson(inner) => read_only_permits(inner),
         // Issue #2060: 中身（SELECT 系の EXPLAIN・述語形 DML の EXPLAIN）は何も書かないため可。
         ParsedSql::ExplainVerbose(inner) => read_only_permits(inner),
         // Issue #2055: ANALYZE の DML は実際に書き込むため READ ONLY Tx では許可しない（`25006`）。
@@ -6272,20 +6289,58 @@ impl EngineCore {
             read_snap,
             locking.is_some().then_some(&mut read_tables),
         )?;
-        let analyze = match &explain_opts {
+        let opts = match &explain_opts {
             Some(raw) => raw.resolve()?,
             None => crate::sql::explain_options::ExplainOptions::default(),
         };
-        let parsed = if analyze.analyze {
-            Self::wrap_explain_analyze(parsed, &analyze)?
-        } else if analyze.verbose {
+        let format = opts.format;
+        // Issue #2059: `FORMAT JSON` は ANALYZE／VERBOSE の追加行を JSON 化する経路を持たないため、
+        // 併用は `0A000` で止める（黙って TEXT／追加行なしへ縮退しない fail-closed）。
+        if format == crate::sql::explain_options::ExplainFormat::Json
+            && (opts.analyze || opts.verbose)
+        {
+            return Err(
+                crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
+                    "EXPLAIN FORMAT JSON is not supported with ANALYZE or VERBOSE",
+                ),
+            );
+        }
+        let parsed = if opts.analyze {
+            Self::wrap_explain_analyze(parsed, &opts)?
+        } else if opts.verbose {
             Self::wrap_explain_verbose(parsed)?
         } else {
             parsed
         };
+        let is_json = format == crate::sql::explain_options::ExplainFormat::Json;
         let Some(locking) = locking else {
-            return Ok(parsed);
+            // Issue #2059: `FORMAT JSON` のときだけ結果の変換を表す包みを付ける（TEXT は従来と同一）。
+            return if is_json {
+                match parsed {
+                    ParsedSql::Statement(crate::sql::allowlist::Statement::Explain(_))
+                    | ParsedSql::ExplainDml(_)
+                    | ParsedSql::ExplainInsert(_)
+                    | ParsedSql::Partitioned(
+                        crate::sql::partitioned::PartitionedControl::ExplainDelete(_)
+                        | crate::sql::partitioned::PartitionedControl::ExplainUpdate(_),
+                    ) => Ok(ParsedSql::ExplainJson(Box::new(parsed))),
+                    // `EXPLAIN` 以外の文がここへ来るのは契約違反（fail-closed）。
+                    _ => Err(crate::sql::allowlist::SqlSurfaceError::Internal {
+                        detail: "EXPLAIN option list attached to a non-EXPLAIN statement"
+                            .to_string(),
+                    }),
+                }
+            } else {
+                Ok(parsed)
+            };
         };
+        if is_json {
+            return Err(
+                crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
+                    "EXPLAIN FORMAT JSON is not supported with row-level locking clauses",
+                ),
+            );
+        }
         match parsed {
             ParsedSql::Statement(statement) => {
                 let locking = crate::sql::row_lock::check_row_locking(&statement, &locking)?;
@@ -7166,10 +7221,29 @@ impl EngineCore {
         read_snap: Option<&'a redb::ReadTransaction>,
     ) -> Option<&'a redb::ReadTransaction> {
         use crate::sql::allowlist::Statement;
-        match parsed.peel_session_route() {
-            ParsedSql::Statement(Statement::Explain(_)) => None,
+        let peeled = parsed.peel_session_route();
+        if Self::static_explain_runs_on_latest_catalog(peeled) {
+            return None;
+        }
+        match peeled {
             ParsedSql::Statement(Statement::Select(s)) if s.using_plan().is_some() => None,
             _ => read_snap,
+        }
+    }
+
+    /// 実行せず静的な計画だけを返す `Statement::Explain` を（`FORMAT JSON`・`VERBOSE` の包みごしでも）含む文か。
+    /// 該当すれば [`Self::acl_snapshot_for`] は最新カタログで権限を検査する。包みは中身と同じ扱いにそろえ、
+    /// TEXT の `EXPLAIN` と食い違って `BEGIN` 後に作り直された同名の表を旧 ACL で通さないようにする
+    /// （Issue #2059）。`EXPLAIN ANALYZE`（`ExplainAnalyze`・`ExplainAnalyzeDml`）は文を実際に実行し
+    /// `BEGIN` 時点のスナップショットのデータを読むため、ここでは対象外とし、そのスナップショットの ACL で検査する
+    /// （最新カタログの ACL で旧データの行数等を推測させない。fail-closed）。述語形 DML／INSERT の `EXPLAIN` も対象外。
+    fn static_explain_runs_on_latest_catalog(parsed: &ParsedSql) -> bool {
+        match parsed {
+            ParsedSql::Statement(crate::sql::allowlist::Statement::Explain(_)) => true,
+            ParsedSql::ExplainJson(inner) | ParsedSql::ExplainVerbose(inner) => {
+                Self::static_explain_runs_on_latest_catalog(inner)
+            }
+            _ => false,
         }
     }
 
@@ -8508,9 +8582,23 @@ impl EngineCore {
                 self.execute_partitioned_control(ctx, session, control)
             }
             // Issue #2051: `EXPLAIN INSERT` は束縛だけを行い書き込み・台帳・採番に触れない。
-            ParsedSql::ExplainInsert(target) => self.run_insert_explain(ctx, session, target),
+            ParsedSql::ExplainInsert(target) => {
+                self.run_insert_explain(ctx, session, target, false)
+            }
             // Issue #2050: 述語形 UPDATE／DELETE の EXPLAIN（書き込まない）。
             ParsedSql::ExplainDml(explain) => self.run_explain_dml(ctx, session, explain),
+            // Issue #2059: 中身の `EXPLAIN` を実行し、内部キーを表示名へ戻した後で JSON へ変換する
+            // （JSON 化の後では置換が JSON 文字列を壊しうるため、変換の前に scrub する）。
+            ParsedSql::ExplainJson(inner) => {
+                let outcome = match &**inner {
+                    // INSERT ... SELECT の内側計画は JSON 変換のため木へ戻して組む（TEXT は従来どおり）。
+                    ParsedSql::ExplainInsert(target) => {
+                        self.run_insert_explain(ctx, session, target, true)?
+                    }
+                    _ => self.execute_parsed_statement(ctx, session, inner)?,
+                };
+                crate::sql::explain_json::outcome_to_json(self.scrub_outcome(ctx, outcome))
+            }
             // Issue #2054: 静的な計画に続けて内側の SELECT を実行し、実測値を併記する（結果の行は返さない）。
             ParsedSql::ExplainAnalyze(ea) => self.run_explain_analyze(session, ea, |s, stmt| {
                 self.execute_validated_in_session(ctx, s, stmt)
@@ -9946,9 +10034,21 @@ impl EngineCore {
             }
             // Issue #2051: `EXPLAIN INSERT` は writer を取らず、確定済みのカタログで束縛だけを行う
             // （`operation_id` も登録しない。続く本物の `INSERT` が同じ ID を再利用できる）。
-            ParsedSql::ExplainInsert(target) => self.run_insert_explain(ctx, session, target),
+            ParsedSql::ExplainInsert(target) => {
+                self.run_insert_explain(ctx, session, target, false)
+            }
             // Issue #2050: writer を要求せず、書き込み済みの印も付けない。
             ParsedSql::ExplainDml(explain) => self.run_explain_dml(ctx, session, explain),
+            // Issue #2059: 中身を同じ経路で実行し、scrub の後で JSON へ変換する。
+            ParsedSql::ExplainJson(inner) => {
+                let outcome = match &**inner {
+                    ParsedSql::ExplainInsert(target) => {
+                        self.run_insert_explain(ctx, session, target, true)?
+                    }
+                    _ => self.execute_in_active_txn(ctx, session, txn, inner)?,
+                };
+                crate::sql::explain_json::outcome_to_json(self.scrub_outcome(ctx, outcome))
+            }
             // Issue #2054: 普通の SELECT と同じ読み取り源（BEGIN 時点のスナップショット・自トランザクションの
             // 未 commit の変更）で計画と実行を行う。
             ParsedSql::ExplainAnalyze(ea) => self.run_explain_analyze(session, ea, |s, stmt| {
@@ -11052,6 +11152,17 @@ impl EngineCore {
                     snap,
                 )
             }
+            // Issue #2059: 中身の列を導出し、`QUERY PLAN` 列の型だけ `json` にする（実行しない）。
+            ParsedSql::ExplainJson(inner) => Ok(self
+                .describe_parsed_in_session_snap(
+                    session,
+                    inner,
+                    skip_vector_literal_validation,
+                    dummy_equality_flags,
+                    limits,
+                    snap,
+                )?
+                .map(crate::sql::explain_json::columns_to_json)),
             ParsedSql::SessionRouted(routed) => self.describe_temp_routed(
                 session,
                 routed,

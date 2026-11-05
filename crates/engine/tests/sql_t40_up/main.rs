@@ -165,6 +165,7 @@ mod sql75_explain_set_operation;
 mod sql76_explain_analyze_dml;
 mod sql76_explain_analyze_hnsw;
 mod sql76_explain_analyze_select;
+mod sql76_explain_format_json;
 mod sql76_explain_options;
 mod sql76_explain_verbose;
 mod sql78_predicate_dml_noneq_between_params;

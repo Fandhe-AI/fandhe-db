@@ -364,6 +364,41 @@ fn explain_delete_returns_plan_tree_without_deleting() {
     read_ready_for_query(&mut stream);
 }
 
+/// SQL-76 (1)(6)（Issue #2059）: `EXPLAIN (FORMAT JSON)` は `QUERY PLAN` 単一列の `json` 型
+/// （OID 114）で、JSON 全体を 1 行 1 列の `DataRow` として返す。`USING PLAN` 経路の行
+/// （`key: value`）も JSON のキーと値へ写り、`CommandComplete` タグは `EXPLAIN` のまま。
+#[test]
+fn explain_format_json_returns_one_json_cell_with_oid_114() {
+    let (core, _guard) = new_core_with_docs_table();
+    let (mut stream, _users_path) = spawn_with_alice(core);
+
+    send_simple_query(
+        &mut stream,
+        "EXPLAIN (FORMAT JSON) SELECT id FROM docs USING PLAN('find content') LIMIT 10",
+    );
+
+    let columns = read_row_description_with_oids(&mut stream);
+    assert_eq!(columns, vec![("QUERY PLAN".to_string(), 114)]);
+
+    let row = read_data_row(&mut stream);
+    assert_eq!(row.len(), 1);
+    let json = row[0].as_deref().expect("json cell");
+    let parsed = engine::json::parse_json(json).expect("valid JSON");
+    assert!(matches!(parsed, engine::json::JsonValue::Array(ref a) if a.len() == 1));
+    for expected in [
+        "\"Plan\": {",
+        "\"Node Type\": ",
+        "\"search_terms[0]\": \"alpha\"",
+        "\"mode\": \"recall\"",
+        "\"scalar_plan\": \"plain_scan\"",
+    ] {
+        assert!(json.contains(expected), "{expected} not in {json}");
+    }
+
+    assert_eq!(read_command_complete(&mut stream), "EXPLAIN");
+    read_ready_for_query(&mut stream);
+}
+
 /// Issue #2058（SQL-76 (1)）: 簡易クエリで `EXPLAIN (COSTS OFF) SELECT ...` はオプションなしと同じ行を返し、
 /// 未知のオプションは `42601` の ErrorResponse になる。
 #[test]

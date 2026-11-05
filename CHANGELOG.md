@@ -23,6 +23,8 @@
 
 ### Added
 
+- `EXPLAIN (FORMAT JSON) <文>` を追加した（Issue #2059・SQL-76 (1)(6) ポインタ）。PostgreSQL 互換の JSON を 1 行 1 列（`QUERY PLAN`・型 `json`・OID 114）で返し、JSON と TEXT は同じ情報を持つ。`FORMAT TEXT`／オプションなしは従来と同一。`FORMAT XML|YAML` と未実装の既知オプションは `0A000`、`FORMAT` の不正値は `22023`、未知の名前・構文の誤りは `42601`。
+  BREAKING CHANGE: 公開 enum `ParsedSql` に variant `ExplainJson(Box<ParsedSql>)` を追加した（網羅的 `match` の下流は追随が必要）。
 - `EXPLAIN (VERBOSE)`／`EXPLAIN VERBOSE` を実装した（Issue #2060・SQL-76 (4)(5) ポインタ）。根の段へ `output:`（結果の列名）と、距離順位付けの検索では `distance_metric:` を足す。`COSTS` は出力を変えない。`ANALYZE` との併用・`INSERT`・分割実行・一時表は `0A000`。`ParsedSql` に variant `ExplainVerbose` を追加した（`#[non_exhaustive]` のためクレート外に非破壊）。
 - DML の `EXPLAIN ANALYZE` を実装した（Issue #2055・SQL-76 (2)(3) ポインタ）。述語形の `UPDATE`／`DELETE` と `INSERT` を実際に実行し（autocommit では commit・`USING OPERATION_ID` の台帳記録を伴い、自動では巻き戻さない。明示トランザクションでは `ROLLBACK` で戻る）、`QUERY PLAN` に実測値を併記する。権限・READ ONLY（`25006`）は通常の DML と同じ。分割実行・`VERBOSE`・`FORMAT JSON` は拒否する。公開 enum `ParsedSql` に variant `ExplainAnalyzeDml` を追加した（`#[non_exhaustive]` のため非破壊）
 - SELECT の `EXPLAIN ANALYZE` を実装した（Issue #2054・SQL-76 (1)(2)(3) ポインタ）。`EXPLAIN (ANALYZE ...)` と前置形 `EXPLAIN ANALYZE` で SELECT を実行し、計画の根の段に `actual_rows`／`actual_loops`／`actual_total_time_ms`、末尾に `planning_time_ms`／`execution_time_ms` を併記する（結果の行は返さない）。DML・`USING PLAN`・一時表・`VERBOSE`・`FORMAT JSON`・`$n` 付きは拒否する。公開 enum `ParsedSql` に variant `ExplainAnalyze` を追加した（`#[non_exhaustive]` のため非破壊）

@@ -17,10 +17,10 @@
 //!   `EXPLAIN` の直後が `(` の形・前置形は許可リストの `42601` になる。
 //!
 //! 受け渡し先: 受理した [`ExplainOptions`] のうち `ANALYZE`（Issue #2054）は `core::parse_tokens_in` が
-//! `ParsedSql::ExplainAnalyze` に運ぶ。`COSTS` は推定値を出さないため出力を変えない。
-//! `VERBOSE`（#2060）は `core::parse_tokens_in` が `ParsedSql::ExplainVerbose` に運ぶ（`ANALYZE` との併用は
-//! `0A000`）。`FORMAT JSON`（#2059）・`ANALYZE` なしの `SUMMARY` は未実装で `0A000` のゲートに
-//! 掛け、文を実行しない（黙って無視する fail-open を作らない）。
+//! `ParsedSql::ExplainAnalyze` に運ぶ。`FORMAT JSON`（#2059）は同関数が `ParsedSql::ExplainJson` で包む。
+//! `COSTS` は推定値を出さないため出力を変えない。`VERBOSE`（#2060）は `ParsedSql::ExplainVerbose` に運ぶ
+//! （`ANALYZE` との併用は `0A000`）。`FORMAT JSON` と `ANALYZE`／`VERBOSE` の併用・`ANALYZE` なしの
+//! `SUMMARY` は未実装で `0A000` のゲートに掛け、文を実行しない（黙って無視する fail-open を作らない）。
 //!
 //! untrusted な入力を扱うため、添字アクセス・`unwrap`・`expect` を使わず `get` で走査する。確保量は
 //! 入力トークン数で上限が決まり、再帰しない。エラーメッセージは固定文字列で入力をエコーしない。
@@ -33,7 +33,7 @@ use crate::sql::lexer::{Keyword, Token};
 pub(crate) enum ExplainFormat {
     /// `FORMAT TEXT`（既定）。
     Text,
-    /// `FORMAT JSON`（#2059 が実装するまで `0A000`）。
+    /// `FORMAT JSON`（#2059。PostgreSQL 互換の JSON 1 セルで返す）。
     Json,
 }
 
@@ -106,6 +106,9 @@ pub(crate) fn has_option_list(tokens: &[Token]) -> bool {
     is_word(tokens.first(), "EXPLAIN") && rest_has_option_list(tokens.get(1..).unwrap_or(&[]))
 }
 
+/// オプション数の上限（無制限走査・確保の防止。Issue #2059）。
+const MAX_EXPLAIN_OPTIONS: usize = 32;
+
 /// 先頭が `EXPLAIN` で、括弧のオプション列か前置の修飾語（`ANALYZE`／`VERBOSE`）を持つ形か。
 /// `sql::params` が Prepare 経路で `$n` との併用を拒否するのに使う（Issue #2054）。
 pub(crate) fn has_explain_modifiers(tokens: &[Token]) -> bool {
@@ -167,6 +170,9 @@ pub(crate) fn extract(
             _ => return Err(syntax("invalid EXPLAIN option list")),
         };
         items.push((name, value));
+        if items.len() > MAX_EXPLAIN_OPTIONS {
+            return Err(syntax("too many EXPLAIN options"));
+        }
         match tokens.get(pos) {
             Some(Token::Punct(',')) => pos += 1,
             Some(Token::Punct(')')) => {
@@ -307,11 +313,6 @@ impl RawExplainOptions {
                 "EXPLAIN ANALYZE with VERBOSE is not implemented yet",
             ));
         }
-        if opts.format == ExplainFormat::Json {
-            return Err(SqlSurfaceError::feature_not_supported(
-                "EXPLAIN FORMAT JSON is not implemented yet",
-            ));
-        }
         Ok(opts)
     }
 }
@@ -360,6 +361,8 @@ mod tests {
             "EXPLAIN (FORMAT 'text', SUMMARY false, TIMING off, ANALYZE FALSE) SELECT 1",
             "EXPLAIN (ANALYZE, ANALYSE OFF) SELECT 1",
             "EXPLAIN (FORMAT JSON, FORMAT TEXT) SELECT 1",
+            "EXPLAIN (FORMAT JSON) SELECT 1",
+            "EXPLAIN (FORMAT TEXT, FORMAT JSON) SELECT 1",
             "EXPLAIN (TIMING, TIMING OFF) SELECT 1",
             "EXPLAIN (ANALYZE) SELECT 1",
             "EXPLAIN (ANALYZE, TIMING OFF, SUMMARY OFF) SELECT 1",
@@ -437,9 +440,7 @@ mod tests {
             "EXPLAIN (ANALYZE, VERBOSE) SELECT 1",
             "EXPLAIN ANALYZE VERBOSE SELECT 1",
             "EXPLAIN (SUMMARY) SELECT 1",
-            "EXPLAIN (FORMAT JSON) SELECT 1",
             "EXPLAIN (ANALYZE OFF, SUMMARY) SELECT 1",
-            "EXPLAIN (FORMAT TEXT, FORMAT JSON) SELECT 1",
             "EXPLAIN (BUFFERS, FOO) SELECT 1",
         ] {
             assert_eq!(code(sql), "0A000", "{sql}");

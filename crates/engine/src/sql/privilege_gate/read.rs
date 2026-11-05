@@ -67,6 +67,8 @@ pub(crate) fn classify(parsed: &ParsedSql) -> ReadRequirement {
     match parsed {
         ParsedSql::Statement(s) => classify_statement(s),
         ParsedSql::LockingSelect(_) => SelectForUpdate,
+        // Issue #2059: 包んだ `EXPLAIN` は中身と同じ検査を受ける（形式の違いで権限を緩めない）。
+        ParsedSql::ExplainJson(inner) => classify(inner),
         // Issue #2054: 実行する内側の SELECT と同じく、参照する全 relation に SELECT 権限を実行前に要求する。
         ParsedSql::ExplainAnalyze(_) => Select,
         // Issue #2060: 中身と同じ検査（形式の違いで権限を緩めない）。

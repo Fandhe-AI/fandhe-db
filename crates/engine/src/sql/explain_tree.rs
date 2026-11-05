@@ -192,6 +192,122 @@ impl ExplainNode {
         out
     }
 
+    /// [`ExplainNode::into_lines`] が描画した行を構造化された木へ戻す（逆変換）。
+    ///
+    /// `INSERT ... SELECT` の EXPLAIN が内側 `SELECT` の描画済み計画を `select` 段の子へ
+    /// 載せ直すために使う。行のままの再字下げでは見出しが属性位置に現れ、`FORMAT JSON` への
+    /// 変換が失敗するため、字下げ規則（深さ 0 は字下げなし、深さ d>=1 の見出しは `2(d-1)` の
+    /// `-> `、属性行は `2(d-1)+3`）を読んで木に戻す。再帰は使わない。字下げの不整合・複数の
+    /// ルート・上限超過は `Err`（fail-closed）。
+    pub(crate) fn from_rendered_lines(lines: &[String]) -> Result<Self, ExplainTreeError> {
+        struct Slot {
+            stage: Option<String>,
+            lines: Vec<String>,
+            children: Vec<usize>,
+        }
+        let bad = ExplainTreeError::InvalidLine;
+        let mut slots: Vec<Slot> = Vec::new();
+        // (深さ, slots の添字)。根からの経路。
+        let mut path: Vec<(usize, usize)> = Vec::new();
+        for line in lines {
+            let indent = line.len() - line.trim_start_matches(' ').len();
+            let body = line.get(indent..).ok_or(bad)?;
+            if let Some(stage) = body.strip_prefix("-> ") {
+                if indent % 2 != 0 {
+                    return Err(bad);
+                }
+                let depth = indent / 2 + 1;
+                while path.last().is_some_and(|(d, _)| *d >= depth) {
+                    path.pop();
+                }
+                let &(pd, parent) = path.last().ok_or(bad)?;
+                if pd + 1 != depth {
+                    return Err(bad);
+                }
+                let idx = slots.len();
+                slots.push(Slot {
+                    stage: Some(stage.to_string()),
+                    lines: Vec::new(),
+                    children: Vec::new(),
+                });
+                slots.get_mut(parent).ok_or(bad)?.children.push(idx);
+                path.push((depth, idx));
+                continue;
+            }
+            if indent == 0 && path.is_empty() && !body.contains(": ") && !body.ends_with(':') {
+                slots.push(Slot {
+                    stage: Some(body.to_string()),
+                    lines: Vec::new(),
+                    children: Vec::new(),
+                });
+                path.push((0, 0));
+                continue;
+            }
+            let (depth, text) = if indent == 0 {
+                (0, body)
+            } else if indent % 2 == 1 && indent >= 3 {
+                ((indent - 1) / 2, body)
+            } else {
+                return Err(bad);
+            };
+            while path.last().is_some_and(|(d, _)| *d > depth) {
+                path.pop();
+            }
+            let target = match path.last().copied() {
+                Some((d, idx)) if d == depth => idx,
+                Some((d, parent)) if d + 1 == depth => {
+                    let idx = slots.len();
+                    slots.push(Slot {
+                        stage: None,
+                        lines: Vec::new(),
+                        children: Vec::new(),
+                    });
+                    slots.get_mut(parent).ok_or(bad)?.children.push(idx);
+                    path.push((depth, idx));
+                    idx
+                }
+                None if depth == 0 => {
+                    slots.push(Slot {
+                        stage: None,
+                        lines: Vec::new(),
+                        children: Vec::new(),
+                    });
+                    path.push((0, 0));
+                    0
+                }
+                _ => return Err(bad),
+            };
+            slots
+                .get_mut(target)
+                .ok_or(bad)?
+                .lines
+                .push(text.to_string());
+        }
+        // 子の添字は親より大きいため、逆順に確定すれば子は常に完成済み。
+        let mut built: Vec<Option<ExplainNode>> = (0..slots.len()).map(|_| None).collect();
+        for idx in (0..slots.len()).rev() {
+            let slot = slots.get_mut(idx).ok_or(bad)?;
+            let mut node = match slot.stage.take() {
+                Some(stage) => ExplainNode::try_stage(stage, std::mem::take(&mut slot.lines))?,
+                None => {
+                    let lines = std::mem::take(&mut slot.lines);
+                    if lines.iter().any(|l| has_break(l)) {
+                        return Err(bad);
+                    }
+                    ExplainNode::leaf(lines)
+                }
+            };
+            for &c in &slot.children {
+                let child = built.get_mut(c).and_then(Option::take).ok_or(bad)?;
+                node.push_child(child)?;
+            }
+            if let Some(cell) = built.get_mut(idx) {
+                *cell = Some(node);
+            }
+        }
+        built.into_iter().next().flatten().ok_or(bad)
+    }
+
     /// 描画して `QUERY PLAN` 単一列の [`QueryResult`] にする。
     pub(crate) fn into_query_result(self) -> QueryResult {
         super::explain::lines_to_query_result(self.into_lines())

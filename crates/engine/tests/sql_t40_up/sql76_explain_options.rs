@@ -2,7 +2,7 @@
 //! ポインタ）。
 //!
 //! 受理するオプション（`COSTS`・`FORMAT TEXT`・明示的な偽）はオプションなしの `EXPLAIN` と出力が
-//! 完全に一致し、未実装（`ANALYZE` なしの `SUMMARY`・`FORMAT JSON`。`VERBOSE` は Issue #2060 で実装済みで
+//! 完全に一致し、未実装（`ANALYZE` なしの `SUMMARY`。`VERBOSE` は Issue #2060 で実装済みで
 //! `sql76_explain_verbose`）と対象外は `0A000`、
 //! （`ANALYZE` は SELECT のみ受理する。Issue #2054。結合テストは `sql76_explain_analyze_select`）
 //! 未知の名前は `42601`、値の不正は `22023`。後の指定が勝つ。セッション無しの入口は従来どおり `42601`。
@@ -137,10 +137,6 @@ fn later_option_wins() {
         .any(|l| l.starts_with("output: ")),
         "later VERBOSE wins"
     );
-    assert_eq!(
-        code(&core, &format!("EXPLAIN (FORMAT TEXT, FORMAT JSON) {q}")),
-        "0A000"
-    );
 }
 
 /// SQL-76 (1): エラーコード。未実装・対象外のオプションは DML でも文を実行しない。
@@ -171,7 +167,6 @@ fn error_codes_and_no_side_effects() {
         "FORMAT XML",
         "FORMAT YAML",
         "SUMMARY",
-        "FORMAT JSON",
     ] {
         for body in [
             "SELECT k FROM a",

@@ -2534,7 +2534,8 @@ fn execute_portal<'e, S: WireStream>(
             // Issue #2051: `EXPLAIN INSERT` は束縛だけで書き込まず commit を伴わない。
             ParsedSql::ExplainInsert(_) => false,
             // Issue #2050: `EXPLAIN UPDATE|DELETE` も読み取りのみで commit を伴わない。
-            ParsedSql::ExplainDml(_) => false,
+            // Issue #2059: `EXPLAIN (FORMAT JSON)` も中身と同じく読み取りのみ。
+            ParsedSql::ExplainDml(_) | ParsedSql::ExplainJson(_) => false,
             // Issue #2054: `EXPLAIN ANALYZE` は SELECT だけを実行し commit を伴わない。
             ParsedSql::ExplainAnalyze(_) => false,
             // Issue #2060: `EXPLAIN (VERBOSE)` も読み取りのみで commit を伴わない。

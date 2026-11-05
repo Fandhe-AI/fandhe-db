@@ -223,6 +223,41 @@ fn insert_select_nests_inner_plan_under_select_stage() {
 }
 
 #[test]
+fn insert_select_join_text_output_keeps_inner_plan_as_leaf_lines() {
+    let (core, _g) = seeded("x75i-join-text");
+    let sql =
+        "EXPLAIN INSERT INTO t (id, k, v) SELECT a.id, a.k, a.v FROM src a JOIN src b ON a.k = b.k";
+    let default = plan(&core, sql);
+    // 構造復元（JSON 経路専用）は TEXT へ漏らさない: 内側の見出しは属性位置の字下げ行のまま。
+    assert_eq!(
+        default,
+        strs(&[
+            "insert",
+            "insert_source: select",
+            "on_conflict: none",
+            "returning: none",
+            "operation_id: none",
+            "-> select",
+            "     join",
+            "     join_method: hash",
+            "     join_type: inner",
+            "     join_keys: 1",
+            "     join_filter: none",
+            "     -> scan",
+            "        relation: 1",
+            "        scalar_plan: plain_scan",
+            "        access_path: full_scan",
+            "     -> scan",
+            "        relation: 2",
+            "        scalar_plan: plain_scan",
+            "        access_path: full_scan",
+        ])
+    );
+    let explicit = plan(&core, &sql.replacen("EXPLAIN", "EXPLAIN (FORMAT TEXT)", 1));
+    assert_eq!(default, explicit);
+}
+
+#[test]
 fn explain_writes_nothing_and_does_not_record_ledger() {
     let (core, _g) = seeded("x75i-no-write");
     let before = count(&core, "t");

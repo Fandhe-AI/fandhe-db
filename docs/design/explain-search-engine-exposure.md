@@ -556,6 +556,41 @@ INSERT は #2051 が担当する。`EXPLAIN ... PARTITIONED` は従来の出力�
   `UPDATE ... FROM`／`DELETE ... USING`、自動更新可能なビュー、WHERE の部分クエリ、一時表、セッション無しの入口。
   `$n` 付きの拡張クエリの EXPLAIN は既存の EXPLAIN の規則どおり。
 
+## #2059 追記: `EXPLAIN (FORMAT JSON)`（SQL-76 (1)(6) ポインタ）
+
+親 #2057。括弧付きオプション群のうち `FORMAT` だけを受理し、計画を PostgreSQL 互換の JSON で返す。
+括弧なしの `EXPLAIN ANALYZE|VERBOSE` と ANALYZE・VERBOSE・COSTS 等の意味は #2058・#2060 の範囲。
+
+- **構文**: `EXPLAIN (FORMAT TEXT|JSON [, ...]) <文>`。入口は `core.rs` の `parse_tokens_in` の冒頭 1 箇所で、
+  オプション群（`sql::explain_options`）を取り除いた `EXPLAIN` + 本体を従来と同じ解析器へ渡す。
+  先頭が `EXPLAIN (` でも次が `WITH`／`VALUES`／`TABLE` や `SELECT`／`(` なら集合演算・部分クエリの括弧であり、
+  オプション群とみなさない。同じオプションの繰り返しは後の指定を使う。大文字小文字は区別しない。
+- **エラー**: 固定の英語文で入力値を含めない。
+
+  | 入力 | wire_code |
+  | ---- | --------- |
+  | `FORMAT XML`／`FORMAT YAML` | `0A000` |
+  | `FORMAT` のその他の値 | `22023` |
+  | `FORMAT` の値の欠落・空の `()`・`,` の誤り・`)` の欠落・未知の名前・33 個以上のオプション | `42601` |
+  | ANALYZE・VERBOSE・COSTS・TIMING・SUMMARY・BUFFERS・WAL・SETTINGS・GENERIC_PLAN・SERIALIZE・MEMORY | `0A000`（名前は既知・未実装。#2058・#2060 が受理へ切り替える） |
+
+- **包み**: `FORMAT JSON` のときだけ `ParsedSql::ExplainJson(Box<ParsedSql>)` が中身の `EXPLAIN` 系（`Statement::Explain`・
+  `ExplainDml`・分割実行の `EXPLAIN`）を包む。TEXT／オプションなしは包まず従来と同一の値（バイト単位で不変）。
+  実行・権限（`privilege_gate` は中身へ委譲）・トランザクション・時刻の扱いは中身と同じで、結果だけを変換する。
+  準備済み文では Bind 時に同じ入口を通る。オプション群つきの `EXPLAIN` に `$n` を含む文は `42601`（fail-closed）。
+- **変換の方式**: 各 `EXPLAIN` 経路が作る字下げ付きの計画テキスト（`sql::explain_tree` の安定契約）を `sql::explain_json`
+  が逆に読んで JSON にする。経路ごとに format を持ち回らず変換点を 1 箇所にし、JSON と TEXT が同一の情報を持つことを
+  構造上保証する（新しい情報源を足さない。行数・可視件数などテナント存在情報も増えない。SQL-75 (5)）。
+  内部キー（`#<id>.`）は変換の前に表示名へ戻すので、JSON 文字列の中身を後から書き換えない。
+- **JSON の形（出したら変えない安定契約）**: 最上位は `[{"Plan": <節>}]`（2 スペース字下げ）。節は `"Node Type"`（見出し。
+  見出しなしの節は固定の `result`）→ 属性行 `key: value` を最初の `": "` で分けたもの（行の順を保ち、値は文字列のまま）
+  → 子があれば `"Plans"`。列は `QUERY PLAN`（型 `json`・OID 114）の 1 行 1 列。`": "` を持たない属性行・同一節の重複キー・
+  `Node Type`／`Plans` との衝突・字下げの不整合は `Internal` で fail-closed。#2060 が VERBOSE の項目を足すときは
+  「行のキー = JSON のキー」の規則に従う。
+- **Describe**: 実行せず `QUERY PLAN` 列の型だけ `json` にする。
+- **対象外**: NoSQL 表層の `explain`、公開 API の `explain_bound_*_in_session`／`build_explain_result*`（TEXT のまま）、
+  セッションなしの入口（従来どおり `EXPLAIN` は `42601`）。
+
 ## 追記（Issue #2058・SQL-76 (1)）: 括弧付きオプションの解析
 
 `EXPLAIN ( <オプション> [, ...] ) <文>` の構文を解析する（実装は `crates/engine/src/sql/explain_options.rs`）。

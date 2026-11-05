@@ -249,6 +249,7 @@ pub(crate) mod exec_stats;
 pub mod explain;
 pub mod explain_analyze;
 pub mod explain_dml;
+pub(crate) mod explain_json;
 pub(crate) mod explain_options;
 pub(crate) mod explain_tree;
 pub(crate) mod explain_verbose;

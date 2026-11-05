@@ -79,16 +79,18 @@ impl EngineCore {
     }
 
     /// `ParsedSql::ExplainInsert` の実行。書き込まずに挿入方式の段の木（`QUERY PLAN` 1 列）を返す。
+    /// `structured` は `FORMAT JSON` 用（内側計画を木へ戻して組む）。TEXT は偽で従来の出力を保つ。
     pub(super) fn run_insert_explain(
         &self,
         ctx: &PolicyContext,
         session: &mut SessionState,
         target: &ExplainInsertTarget,
+        structured: bool,
     ) -> Result<SqlOutcome, SqlSurfaceError> {
         let node = match target {
             ExplainInsertTarget::Values(stmt) => self.insert_values_explain_node(stmt)?,
             ExplainInsertTarget::Select { insert, inner } => {
-                self.insert_select_explain_node(ctx, session, insert, inner)?
+                self.insert_select_explain_node(ctx, session, insert, inner, structured)?
             }
         };
         Ok(SqlOutcome::Explain(node.into_query_result()))
@@ -168,6 +170,7 @@ impl EngineCore {
         session: &mut SessionState,
         insert: &crate::sql::allowlist::ValidatedInsertSelect,
         inner: &InsertSelectExplainInner,
+        structured: bool,
     ) -> Result<ExplainNode, SqlSurfaceError> {
         self.bind_insert_select(
             session,
@@ -201,7 +204,8 @@ impl EngineCore {
                 let SqlOutcome::Explain(result) = outcome else {
                     return Err(internal());
                 };
-                // 内側は描画済みの行を葉として載せる（行数・深さは内側の builder が上限検査済み）。
+                // TEXT は描画済みの行を葉として載せる（従来の出力をバイト単位で維持）。`FORMAT JSON` のときだけ
+                // 木へ戻して載せる（JSON 変換が見出しと属性を区別できるように。`structured`）。
                 let lines = result
                     .rows
                     .into_iter()
@@ -210,7 +214,11 @@ impl EngineCore {
                         _ => Err(internal()),
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                ExplainNode::leaf(lines)
+                if structured {
+                    ExplainNode::from_rendered_lines(&lines).map_err(|e| e.into_surface_error())?
+                } else {
+                    ExplainNode::leaf(lines)
+                }
             }
         };
         let shape = InsertShape {
