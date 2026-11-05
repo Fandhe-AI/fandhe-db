@@ -43,6 +43,7 @@ use std::time::{Duration, Instant};
 
 use crate::limits::{SessionLimiter, SessionPermit, MAX_SESSIONS, SESSION_TTL};
 
+use super::scope::SessionScope;
 use super::token::SessionToken;
 
 /// [`SessionStore::issue`] の拒否理由。
@@ -103,6 +104,9 @@ struct Entry {
     /// その判定へ渡す `SessionState::allow_ddl` の入力値をセッションへ
     /// 搬送するだけで、第 2 の権限判定にはしない）。
     ddl_allowed: bool,
+    /// 発行時に宣言されたスコープ（HTTP-15・Issue #2100。省略は `None`＝全権限）。発行時に 1 回だけ
+    /// 確定し以後変化しない（setter なし）。強制は後続 Issue #2101。
+    scope: Option<Arc<SessionScope>>,
     issued_at: Instant,
     _permit: SessionPermit,
 }
@@ -131,6 +135,8 @@ pub struct SessionGrant {
     pub ddl_allowed: bool,
     /// 束縛するカタログのロール（未束縛は `None`）。
     pub role: Option<SessionRole>,
+    /// 発行時に宣言されたスコープ（省略は `None`。HTTP-15・Issue #2100）。
+    pub scope: Option<Arc<SessionScope>>,
 }
 
 /// TTL 固定・同時有効数上限付きのメモリ内セッションストア（TASK-174・
@@ -231,6 +237,20 @@ impl SessionStore {
         role: Option<SessionRole>,
         now: Instant,
     ) -> Result<SessionToken, IssueError> {
+        self.issue_with_scope(ctx, ddl_allowed, role, None, now)
+    }
+
+    /// [`SessionStore::issue_with_grant`] のスコープつき版（HTTP-15・Issue #2100）。`scope` は発行時に
+    /// トークンへ束縛され、メモリ内だけで保持される（失効・TTL で消える）。既存の入口は `None` を渡す
+    /// 薄いラッパーで互換を保つ。
+    pub fn issue_with_scope(
+        &self,
+        ctx: engine::policy::PolicyContext,
+        ddl_allowed: bool,
+        role: Option<SessionRole>,
+        scope: Option<SessionScope>,
+        now: Instant,
+    ) -> Result<SessionToken, IssueError> {
         let permit = match self.limiter.try_acquire() {
             Some(permit) => permit,
             None => {
@@ -259,6 +279,7 @@ impl SessionStore {
                 ctx,
                 role,
                 ddl_allowed,
+                scope: scope.map(Arc::new),
                 issued_at: now,
                 _permit: permit,
             },
@@ -298,6 +319,7 @@ impl SessionStore {
                 ctx: entry.ctx.clone(),
                 ddl_allowed: entry.ddl_allowed,
                 role: entry.role.clone(),
+                scope: entry.scope.clone(),
             })
         } else {
             table.remove(token);
@@ -540,5 +562,55 @@ mod tests {
         let store = SessionStore::new();
         assert_eq!(store.limiter.max(), MAX_SESSIONS);
         assert_eq!(store.ttl, SESSION_TTL);
+    }
+
+    #[test]
+    fn scope_is_bound_at_issue_and_returned_by_lookup_grant() {
+        use crate::http::session::scope::scope_for_test;
+        let store = SessionStore::new();
+        let now = Instant::now();
+        let scope = scope_for_test(&["secret_table"], true);
+        let token = store
+            .issue_with_scope(ctx("tenant"), false, None, Some(scope.clone()), now)
+            .expect("issue");
+        let grant = store.lookup_grant(&token, now).expect("grant");
+        assert_eq!(grant.scope.as_deref(), Some(&scope));
+        assert!(!format!("{grant:?}").contains("secret_table"));
+    }
+
+    #[test]
+    fn legacy_issue_entrypoints_have_no_scope() {
+        let store = SessionStore::new();
+        let now = Instant::now();
+        for token in [
+            store.issue(ctx("t"), now).expect("issue"),
+            store.issue_with_ddl(ctx("t"), true, now).expect("ddl"),
+            store
+                .issue_with_grant(ctx("t"), false, None, now)
+                .expect("grant"),
+        ] {
+            assert!(store
+                .lookup_grant(&token, now)
+                .expect("grant")
+                .scope
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn scope_disappears_after_ttl_and_close() {
+        use crate::http::session::scope::scope_for_test;
+        let store = SessionStore::new();
+        let base = Instant::now();
+        let scoped = || Some(scope_for_test(&["docs"], false));
+        let t1 = store
+            .issue_with_scope(ctx("t"), false, None, scoped(), base)
+            .expect("issue");
+        assert!(store.lookup_grant(&t1, base + SESSION_TTL).is_none());
+        let t2 = store
+            .issue_with_scope(ctx("t"), false, None, scoped(), base)
+            .expect("issue");
+        assert!(store.close(&t2, base));
+        assert!(store.lookup_grant(&t2, base).is_none());
     }
 }
