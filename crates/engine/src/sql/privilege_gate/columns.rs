@@ -328,7 +328,8 @@ pub(crate) fn cover_bits(
             ColumnDemand::Any => true,
             ColumnDemand::All => {
                 !shape.view_like
-                    && !shape.pseudo_id
+                    // 全列展開は疑似列 `id` も返す。実列 `id` が名前を遮蔽していても表単位の権限を要する。
+                    && !shape.pseudo_column
                     && !shape.columns.is_empty()
                     && shape.columns.iter().all(|c| has.contains(c.as_str()))
             }
@@ -349,6 +350,7 @@ mod tests {
         RelationShape {
             columns: vec!["a".into(), "b".into(), "c".into()],
             pseudo_id: false,
+            pseudo_column: false,
             view_like: false,
         }
     }
@@ -389,6 +391,7 @@ mod tests {
         let s = RelationShape {
             columns: vec!["natural".into(), "b".into()],
             pseudo_id: false,
+            pseudo_column: false,
             view_like: false,
         };
         assert_eq!(
@@ -410,6 +413,7 @@ mod tests {
     fn pseudo_id_view_and_multi_relation_are_strict() {
         let mut s = shape();
         s.pseudo_id = true;
+        s.pseudo_column = true;
         assert_eq!(
             demand("SELECT id FROM t", ColumnSpec::Scan, &s),
             ColumnDemand::TableOnly
@@ -421,6 +425,7 @@ mod tests {
         let view = RelationShape {
             columns: Vec::new(),
             pseudo_id: false,
+            pseudo_column: false,
             view_like: true,
         };
         assert_eq!(
@@ -454,6 +459,7 @@ mod tests {
         let co = RelationShape {
             columns: vec!["a".into(), "A".into()],
             pseudo_id: false,
+            pseudo_column: false,
             view_like: false,
         };
         assert_eq!(
@@ -475,6 +481,7 @@ mod tests {
             0
         );
         s.pseudo_id = true;
+        s.pseudo_column = true;
         assert_eq!(
             demand("x", ColumnSpec::Names(vec!["ID".into()]), &s),
             ColumnDemand::TableOnly

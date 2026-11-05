@@ -653,6 +653,10 @@ pub(crate) struct RelationShape {
     /// 従来方式の表の疑似列 `id`（利用者が与える行キー）を持つか。列単位の付与は作れないため、
     /// 参照は表単位の権限でしか満たせない。
     pub(crate) pseudo_id: bool,
+    /// 実行時の `SELECT *` 等の全列展開が疑似列 `id` を追加するか（従来方式の表。同名の実列があって
+    /// 名前の解決が実列に遮蔽される場合も真）。全列の要求（`ColumnDemand::All`）が表単位の権限を要する
+    /// 根拠で、`pseudo_id`（名前 `id` の解決先）とは独立に保持する。
+    pub(crate) pseudo_column: bool,
     /// ビュー・matview か（列単位の付与を持てない。参照は relation 自身の表単位の権限で判定する）。
     pub(crate) view_like: bool,
 }
@@ -664,15 +668,18 @@ pub(crate) fn relation_shape_in_txn<R: ReadSource>(src: &R, key: &str) -> Result
         RelationIdentity::View(_) | RelationIdentity::MaterializedView(_) => Ok(RelationShape {
             columns: Vec::new(),
             pseudo_id: false,
+            pseudo_column: false,
             view_like: true,
         }),
         RelationIdentity::Table => {
             let schema = super::get_table_schema_in_txn(src, key)?;
             let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
-            let pseudo_id = schema.has_pseudo_id() && !columns.iter().any(|c| c == "id");
+            let pseudo_column = schema.has_pseudo_id();
+            let pseudo_id = pseudo_column && !columns.iter().any(|c| c == "id");
             Ok(RelationShape {
                 columns,
                 pseudo_id,
+                pseudo_column,
                 view_like: false,
             })
         }
