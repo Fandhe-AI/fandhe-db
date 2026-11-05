@@ -34,7 +34,7 @@ fn schema() -> TableSchema {
     )
 }
 
-/// tenant-a に 6 行（tag は 1..=4 が "x"、5..=6 が "y"）、tenant-b に `other` 行（Private）を置く。
+/// tenant-a に 6 行（tag は 1..=2 が "y"、3..=6 が "x"。cosine・内積のどちらでも id が小さいほど近い）、tenant-b に `other` 行（Private）を置く。
 fn fixture(name: &str, other: u64) -> (Storage, CleanupGuard) {
     let path = unique_db_path(name);
     let guard = CleanupGuard(path.clone());
@@ -47,7 +47,9 @@ fn fixture(name: &str, other: u64) -> (Storage, CleanupGuard) {
         n += 1;
         let op = crate::recovery::required_op_id::OperationId::parse(&format!("op-{name}-{n}"))
             .expect("op id");
-        let x = 1.0 + (id % 7) as f32 * 0.1;
+        // 単位ベクトルで角度を id に対し単調に増やし、cosine と内積（HNSW 候補の採点）の
+        // どちらでも「id が小さいほど問い合わせ [1.0,0.5] に近い」順位になるようにする。
+        let theta = 0.5 + (id % 7) as f32 * 0.1;
         crate::tenant::insert_typed_row(
             &storage,
             "docs",
@@ -55,7 +57,7 @@ fn fixture(name: &str, other: u64) -> (Storage, CleanupGuard) {
             id,
             Visibility::Private,
             &[
-                crate::row_codec::Value::Vector(vec![x, 0.5]),
+                crate::row_codec::Value::Vector(vec![theta.cos(), theta.sin()]),
                 crate::row_codec::Value::Text(tag.to_string()),
             ],
             &op,
@@ -63,7 +65,7 @@ fn fixture(name: &str, other: u64) -> (Storage, CleanupGuard) {
         .expect("insert");
     };
     for id in 1..=6u64 {
-        put(&a, id, if id <= 4 { "x" } else { "y" });
+        put(&a, id, if id <= 2 { "y" } else { "x" });
     }
     for id in 101..101 + other {
         put(&b, id, "x");
@@ -87,8 +89,15 @@ fn snapshot(stats: &ExecStats) -> Snapshot {
         .collect()
 }
 
+/// fixture の行は Private のため、Private 可視の主体を使う（Public のみだと可視行 0 件で
+/// アサーションが空虚に成立する）。
+fn private_ctx() -> PolicyContext {
+    PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+        .expect("tenant")
+}
+
 fn run_kernel(storage: &Storage, sql: &str, stats: Option<&mut ExecStats>) -> QueryResult {
-    let ctx = PolicyContext::new("tenant-a").expect("tenant");
+    let ctx = private_ctx();
     let Statement::Select(v) = validate_sql(sql, storage).expect("valid") else {
         panic!("expected Select");
     };
@@ -112,7 +121,7 @@ fn run_kernel(storage: &Storage, sql: &str, stats: Option<&mut ExecStats>) -> Qu
 }
 
 fn run_scan(storage: &Storage, sql: &str, stats: Option<&mut ExecStats>) -> QueryResult {
-    let ctx = PolicyContext::new("tenant-a").expect("tenant");
+    let ctx = private_ctx();
     let Statement::Scan(v) = validate_sql(sql, storage).expect("valid") else {
         panic!("expected Scan");
     };
@@ -155,6 +164,10 @@ fn observed_matches_unobserved_and_project_rows_equal_result_rows() {
         let mut st = ExecStats::new(true);
         let seen = run_kernel(&storage, sql, Some(&mut st));
         assert_eq!(plain.rows, seen.rows, "{sql}");
+        // precision は確信度ゲートで 0 件になりうるため、それ以外で可視行が実在することを確かめる。
+        if !sql.contains("precision") {
+            assert!(!seen.rows.is_empty(), "visible rows must exist: {sql}");
+        }
         let p = st.stage(ExecStage::Project).expect("project");
         assert_eq!(p.rows_out as usize, seen.rows.len(), "{sql}");
         assert!(p.elapsed.is_some(), "{sql}");
@@ -164,6 +177,7 @@ fn observed_matches_unobserved_and_project_rows_equal_result_rows() {
         let mut st = ExecStats::new(true);
         let seen = run_scan(&storage, sql, Some(&mut st));
         assert_eq!(plain.rows, seen.rows, "{sql}");
+        assert!(!seen.rows.is_empty(), "visible rows must exist: {sql}");
         let s = st.stage(ExecStage::Scan).expect("scan");
         // LIMIT の早期終了後も、出力行数は返した件数（走査した件数ではない）。
         assert_eq!(s.rows_out as usize, seen.rows.len(), "{sql}");
@@ -238,9 +252,7 @@ fn iterative_scan_records_postfilter_and_prefilter_distance_rows() {
     };
     let sql = KERNEL_SQLS[2];
     // fixture の行は Private のため、Private 可視の主体で流す。
-    let ctx =
-        PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
-            .expect("tenant");
+    let ctx = private_ctx();
     let Statement::Select(v) = validate_sql(sql, &storage).expect("valid") else {
         panic!("expected Select");
     };
@@ -269,7 +281,8 @@ fn iterative_scan_records_postfilter_and_prefilter_distance_rows() {
         d.rows_out,
         p.rows_out + p.rows_removed_by_filter.expect("removed")
     );
-    // 目標 3 件に対し、初回 3 件取得（x 2 件）→ 倍の 6 件で再探索（x 3 件）の 2 ラウンド。
-    // 段の値はラウンドの合計（候補 3+6、フィルタ後 2+3）。
+    // 近い順は id 1..=6。第 1 ラウンドの候補 3 件（id 1,2,3）は x が id 3 の 1 件だけで目標 3 件に
+    // 届かず、倍の 6 件で再探索し x が 4 件（id 3..=6）になって終了する。
+    // 段の値はラウンドの合計（候補 3+6、フィルタ後 1+4）。
     assert_eq!((p.loops, d.rows_out, p.rows_out), (2, 9, 5));
 }
