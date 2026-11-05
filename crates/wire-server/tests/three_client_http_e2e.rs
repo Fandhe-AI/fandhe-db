@@ -159,7 +159,7 @@
 //!
 //! 上記 3 シナリオ（#779・#877）に加え、Phase 7（親 #944。#945〜#949・
 //! #1061〜#1063）の追加機能・insert・DDL 3 op を含む
-//! `wire_server::http::query::op::Op::ALL`（12 語彙。全 op が実行結線済み）全体へ層 B 到達性を
+//! `wire_server::http::query::op::Op::ALL`（14 語彙。全 op が実行結線済み）全体へ層 B 到達性を
 //! 持たせる。範囲比較・`IN`・`OR`・`sort`・`offset`・複数列 `group_by`は
 //! `PARITY_CASES` への追加（`run_sql_nosql_parity_scenario` を再利用）、
 //! 拒否ケース（`sort`／`offset` on `search`/`aggregate`・語彙外 `op`・RLS
@@ -3170,6 +3170,15 @@ const PHASE7_WRITE_CASES: &[Phase7WriteCase] = &[
         json_body: r#"{"op":"cancel_partitioned_dml","table":"widgets","operation_id":"op-del-1"}"#,
         expect: Phase7CaseExpectation::Success,
     },
+    // 索引 DDL（Issue #2108・NOSQL-19）。添字 10・11（既存の添字直書きをずらさないため末尾）。
+    Phase7WriteCase {
+        json_body: r#"{"op":"create_index","name":"widgets_name_idx","table":"widgets","columns":["name"]}"#,
+        expect: Phase7CaseExpectation::Success,
+    },
+    Phase7WriteCase {
+        json_body: r#"{"op":"drop_index","name":"widgets_name_idx"}"#,
+        expect: Phase7CaseExpectation::Success,
+    },
 ];
 
 fn run_phase7_write_parity_scenario(client: HttpClient) {
@@ -3284,6 +3293,39 @@ fn run_phase7_write_parity_scenario(client: HttpClient) {
             NULL_SENTINEL.to_string(),
         ]],
         "SQL read-back after predicate delete: {sql_rows:?}"
+    );
+
+    // 索引 DDL（Issue #2108）。権限のない bob は 42501、alice は作成・削除できる。
+    let bob_index_attempt = run_sql_dml(
+        sql_port,
+        "bob",
+        "pw-bob",
+        "CREATE INDEX widgets_name_idx ON widgets (name)",
+    );
+    match &bob_index_attempt {
+        SqlDmlOutcome::Error { sqlstate, .. } => assert_eq!(sqlstate, "42501"),
+        other => panic!("expected 42501 permission error, got {other:?}"),
+    }
+    let create_index = run_sql_dml(
+        sql_port,
+        "alice",
+        "pw-alice",
+        "CREATE INDEX widgets_name_idx ON widgets (name)",
+    );
+    assert_eq!(
+        create_index,
+        SqlDmlOutcome::Success {
+            tag: "CREATE INDEX".to_string()
+        },
+        "SQL create_index: {create_index:?}"
+    );
+    let drop_index = run_sql_dml(sql_port, "alice", "pw-alice", "DROP INDEX widgets_name_idx");
+    assert_eq!(
+        drop_index,
+        SqlDmlOutcome::Success {
+            tag: "DROP INDEX".to_string()
+        },
+        "SQL drop_index: {drop_index:?}"
     );
 
     let drop = run_sql_dml(sql_port, "alice", "pw-alice", "DROP TABLE widgets");
@@ -3418,6 +3460,23 @@ fn run_phase7_write_parity_scenario(client: HttpClient) {
         );
     }
 
+    let (status, body) = query(&bob_token, PHASE7_WRITE_CASES[10].json_body, &mut seq);
+    assert_ne!(
+        status, 200,
+        "bob create_index unexpectedly succeeded: {body}"
+    );
+    assert_eq!(
+        nosql_wire_code_of(&body),
+        "42501",
+        "bob create_index: {body}"
+    );
+    let (status, body) = query(&alice_token, PHASE7_WRITE_CASES[10].json_body, &mut seq);
+    assert_eq!(status, 200, "NoSQL create_index: {body}");
+    assert_eq!(body.trim(), r#"{"ok":true}"#);
+    let (status, body) = query(&alice_token, PHASE7_WRITE_CASES[11].json_body, &mut seq);
+    assert_eq!(status, 200, "NoSQL drop_index: {body}");
+    assert_eq!(body.trim(), r#"{"ok":true}"#);
+
     let (status, body) = query(&alice_token, PHASE7_WRITE_CASES[1].json_body, &mut seq);
     assert_eq!(status, 200, "NoSQL drop_table: {body}");
     assert_eq!(body.trim(), r#"{"ok":true}"#);
@@ -3438,6 +3497,7 @@ fn run_phase7_write_parity_scenario(client: HttpClient) {
         "[e2e-record] ddl-parity/{label}: psql_version={psql_version:?} \
          client_version={client_version:?} create_table=ok non_ddl_user_drop_denied=42501 \
          insert=ok(2) alter_table=ok predicate_delete=ok(1) read_back_match=true \
+         create_index=ok drop_index=ok non_ddl_user_create_index_denied=42501 \
          drop_table=ok post_drop=42P01",
         label = client.label(),
     );

@@ -4,7 +4,7 @@
 - 対象ビヘイビア: NOSQL-19（関連: NOSQL-1・NOSQL-13・SQL-23・SQL-33 (5)・INDEX-7・INDEX-8・HTTP-15）
 - 関連 doc: [nosql-ddl-mapping.md](nosql-ddl-mapping.md)・[index-ddl-declaration.md](index-ddl-declaration.md)・
   [nosql-api.md](../../crates/wire-server/docs/nosql-api.md)
-- ステータス: Accepted（op 形の確定のみ。**実行結線は Issue #2108 で未実装**。それまでは語彙外の `0A000`）
+- ステータス: Accepted（Issue #2108 で実行結線済み）
 - 本書は本リポで確定した設計判断の記録であり、private spec の本文は転記しない（ID はポインタ）
 
 ## 背景
@@ -120,9 +120,12 @@ drop_index   → DROP INDEX <name>
 - (b) `method`／`opclass` を `ident_token` で engine へ素通しする方式: engine のエラー文言が入力値を
   echo し、NoSQL の固定文言方針に反する
 
-## #2108 への申し送り
+## #2108 での対応（実装済み）
 
-- `validate_create_index_tokens`／`validate_drop_index_tokens` は現状 `pub(crate)`。Issue #910 の DDL 3 種と
-  同じく公開化か公開入口の追加が要る
-- `CREATE`／`INDEX`／`ON`／`USING`／`WITH` が `Token::Ident`、`=` が `Punct` になることは、推測せず
-  `tokenize("CREATE INDEX ...")` との比較単体テストで固定する
+- `validate_create_index_tokens`／`validate_drop_index_tokens` を `pub` にした（Issue #910 の DDL 3 種と同じ扱い）
+- `CREATE`／`INDEX`／`ON`／`USING`／`WITH` が `Token::Ident`、`=` が `Punct` になることは、
+  `ddl.rs` の単体テストが `tokenize("CREATE INDEX ...")` との比較で固定し、engine 側は
+  `sql_ddl_tokens_public_api.rs` が `parse_sql` の結果との一致で固定する
+- 写像と実行は `http/query/ddl.rs`、層 A の結合テストは `tests/http_nosql/nosql19_index_ddl.rs`
+- `drop_index` は `table` を持たないため、スコープ検査（`gate.rs` の `scope_targets`）は対象表を空列で返す。
+  `tables` 制限のあるスコープでは常に `42501`（fail-closed）、制限が無ければ ops／`read_only` の判定だけを行う

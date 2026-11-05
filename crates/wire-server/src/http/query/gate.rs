@@ -333,6 +333,13 @@ pub fn handle(
         (Op::DropTable, Some(engine)) => {
             ddl::handle_drop_table(engine, principal, &validated, now_wall)
         }
+        // `create_index`／`drop_index`（Issue #2108・NOSQL-19）も同じ DDL 実行器・権限ゲートを通る。
+        (Op::CreateIndex, Some(engine)) => {
+            ddl::handle_create_index(engine, principal, &validated, now_wall)
+        }
+        (Op::DropIndex, Some(engine)) => {
+            ddl::handle_drop_index(engine, principal, &validated, now_wall)
+        }
         // 分割実行 DML の進捗照会・取り消し（Issue #1130・NOSQL-12・RECOVER-11）。
         (Op::ShowPartitionedDml, Some(engine)) => {
             partitioned::handle_show(engine, principal, &validated, now_wall)
@@ -350,11 +357,16 @@ pub fn handle(
     }
 }
 
-/// スコープ検査（手順 5c）が照合する対象表の名前列を取り出す（Issue #2101）。全 op のスキーマで
-/// `table` は必須。`create_table` は外部キーの参照先（`constraints[*].references.table`）も含める
+/// スコープ検査（手順 5c）が照合する対象表の名前列を取り出す（Issue #2101）。`drop_index` 以外の
+/// 全 op のスキーマで `table` は必須。`drop_index` は `table` を持たず（索引名のみ）、対象表を
+/// 特定できないため空列を返す（`SessionScope::check` は `tables` 制限があれば拒否し、制限が無ければ
+/// ops／read_only の判定だけを行う＝fail-closed。Issue #2108）。`create_table` は外部キーの参照先（`constraints[*].references.table`）も含める
 /// （他表の読み取りを伴い、参照先が無ければ `42P01` で存在が漏れうるため fail-closed で検査する）。
 /// `table` を取り出せなければ `None`（呼び出し側が拒否する）。参照先の形の不正は `ddl` の `42601` に任せる。
 fn scope_targets<'a>(op: Op, validated: &Validated<'a>) -> Option<Vec<&'a str>> {
+    if matches!(op, Op::DropIndex) {
+        return Some(Vec::new());
+    }
     let mut targets = vec![validated.required_str("table").ok()?];
     if matches!(op, Op::CreateTable) {
         if let Ok(Some(constraints)) = validated.optional_array("constraints") {
@@ -877,13 +889,11 @@ mod tests {
     fn ddl_udf_transaction_ops_reject_with_0a000() {
         // UDF 呼び出し・トランザクション制御・NOSQL-13 対象外の DDL 相当
         // （index／view 系）・表記揺れは、いずれも許可リスト（Op::parse の
-        // 12 値）に無いため 0A000 に落ちる（拒否リストを別途持たない設計の
+        // 14 値）に無いため 0A000 に落ちる（拒否リストを別途持たない設計の
         // 回帰確認。`update`／`delete` は Issue #875、`create_table`／
         // `alter_table`／`drop_table` は Issue #910 で語彙へ加わったため
         // 本テストの対象から除外した）。
         let ops = [
-            "create_index",
-            "drop_index",
             "create_view",
             "drop_view",
             "call",
@@ -915,8 +925,8 @@ mod tests {
         // 語彙外 op に未知キー（本来ならスキーマ検証で 42601）が同時に
         // 付与されていても、op 許可リスト判定（0A000）が先に効く
         // （手順の順序が契約であることの回帰確認。`drop_table` は Issue #910
-        // で語彙に加わったため、引き続き語彙外の `drop_index` を使う）。
-        let body = br#"{"op":"drop_index","table":"docs","hint_order":["path"]}"#;
+        // で語彙に加わったため、引き続き語彙外の `drop_view` を使う）。
+        let body = br#"{"op":"drop_view","table":"docs","hint_order":["path"]}"#;
         let response = run(body, &[]);
         let text = String::from_utf8(response).expect("utf-8 response");
         assert!(text.starts_with("HTTP/1.1 501 "), "got: {text}");

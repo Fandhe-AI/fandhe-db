@@ -304,7 +304,7 @@ mod tests {
     #[test]
     fn malformed_scopes_are_invalid() {
         for json in [
-            r#"{"scope":{"ops":["create_index"]}}"#,
+            r#"{"scope":{"ops":["create_view"]}}"#,
             r#"{"scope":{"ops":["Scan"]}}"#,
             r#"{"scope":{"ops":[""]}}"#,
             r#"{"scope":{"ops":"scan"}}"#,

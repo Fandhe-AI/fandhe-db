@@ -19843,7 +19843,11 @@ pub(crate) fn is_drop_index_statement(tokens: &[Token]) -> bool {
 /// `CONCURRENTLY`／`INCLUDE`／
 /// `ASC|DESC`／opclass・スキーマ修飾名・`$n` 等は、いずれも期待するトークン列と
 /// 一致しないため `expect_*` ヘルパー経由で構造的に `42601` へ落ちる。
-pub(crate) fn validate_create_index_tokens(
+///
+/// NoSQL 表層（`wire-server` の `http/query/ddl.rs`）が JSON の `create_index` を
+/// トークン列へ写像したうえで直接呼ぶ公開入口（Issue #2108・NOSQL-19。
+/// `validate_create_table_tokens` と同じ前例）。カタログ照会は行わない。
+pub fn validate_create_index_tokens(
     tokens: &[Token],
 ) -> Result<ValidatedCreateIndex, SqlSurfaceError> {
     let mut p = Parser::new(tokens);
@@ -20331,9 +20335,9 @@ fn parse_index_collation(
 /// [`ValidatedDropIndex`] の構造検証本体。`RESTRICT`（既定と同義）は受理し、`CASCADE`
 /// （一意索引に依存する FK の連鎖削除。Issue #1641 の対象外）は明示的に `42601`、複数名の
 /// 同時指定はトレイリングトークン検査により構造的に `42601` へ落ちる。
-pub(crate) fn validate_drop_index_tokens(
-    tokens: &[Token],
-) -> Result<ValidatedDropIndex, SqlSurfaceError> {
+///
+/// NoSQL 表層の `http/query/ddl.rs` が直接呼ぶ公開入口（Issue #2108・NOSQL-19）。
+pub fn validate_drop_index_tokens(tokens: &[Token]) -> Result<ValidatedDropIndex, SqlSurfaceError> {
     let mut p = Parser::new(tokens);
     p.expect_ident_matching("DROP")?;
     p.expect_ident_matching("INDEX")?;

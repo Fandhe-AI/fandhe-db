@@ -492,7 +492,9 @@ mod tests {
         }
         for (n, o) in OP_SCHEMAS.iter() {
             let req = strs(get(&cm[o.name], "required"));
-            assert!(req.contains(&"table".to_string()), "{n} requires table");
+            // `drop_index` は索引名のみで `table` を持たない（Issue #2108・NOSQL-19）。
+            let key = if *n == "drop_index" { "name" } else { "table" };
+            assert!(req.contains(&key.to_string()), "{n} requires {key}");
         }
     }
 
