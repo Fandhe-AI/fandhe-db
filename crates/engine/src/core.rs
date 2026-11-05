@@ -6210,41 +6210,14 @@ impl EngineCore {
         resolver: Option<crate::sql::relation_name::SchemaResolver<'_>>,
         read_snap: Option<&redb::ReadTransaction>,
     ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
-        // Issue #2059（SQL-76 (1)）: `EXPLAIN (<オプション群>) <文>` はオプション群をここで取り除き、
-        // 残りを従来と同じ入口で解析する（オプションなしと同じ解析器・エラー契約を通す）。`FORMAT JSON`
-        // のときだけ結果の変換を表す包みを付ける。`FORMAT TEXT`／繰り返し指定の後勝ちで TEXT なら包まない。
-        if crate::sql::explain_options::has_option_list(&tokens) {
-            let (format, rest) = crate::sql::explain_options::split_explain_options(&tokens)?;
-            // オプション群は 1 回だけ。直後にもう一つ続く入力は構文誤りで拒否する（ネットワーク入力
-            // による再帰の深さ・トークン列の複製の増幅を防ぐ）。
-            if crate::sql::explain_options::has_option_list(&rest) {
-                return Err(crate::sql::allowlist::SqlSurfaceError::unsupported(
-                    "EXPLAIN option list may appear only once",
-                ));
-            }
-            let inner = self.parse_tokens_in(rest, temp, hits, ledger_mode, resolver, read_snap)?;
-            return match format {
-                crate::sql::explain_options::ExplainFormat::Text => Ok(inner),
-                crate::sql::explain_options::ExplainFormat::Json => match inner {
-                    ParsedSql::Statement(crate::sql::allowlist::Statement::Explain(_))
-                    | ParsedSql::ExplainDml(_)
-                    | ParsedSql::ExplainInsert(_)
-                    | ParsedSql::Partitioned(
-                        crate::sql::partitioned::PartitionedControl::ExplainDelete(_)
-                        | crate::sql::partitioned::PartitionedControl::ExplainUpdate(_),
-                    ) => Ok(ParsedSql::ExplainJson(Box::new(inner))),
-                    // `EXPLAIN` 以外の文がここへ来るのは契約違反（fail-closed）。
-                    _ => Err(crate::sql::allowlist::SqlSurfaceError::Internal {
-                        detail: "EXPLAIN option list attached to a non-EXPLAIN statement"
-                            .to_string(),
-                    }),
-                },
-            };
-        }
         // SELECT の行ロック句（SQL-38・Issue #1957）は、行数制限句の正規化の後・名前解決の前に
         // トークン列から取り除いて構文情報として保持し、既存の検証が文を受理した後に併用を検査する。
         // 構文誤りは `42601`、併用違反は `0A000`、`OF` の解決失敗は `42P01`。
         let tokens = Self::normalize_row_count_clauses(tokens)?;
+        // `EXPLAIN ( <オプション> ) <文>`（SQL-76 (1)・Issue #2058）の括弧付きオプションは、構文段で
+        // 取り除いて `EXPLAIN <文>` に組み直し、内側の文の検証が通った後に意味検証する
+        // （PostgreSQL と同じく内側の文のエラーが先）。未実装のオプションは `0A000` で止める。
+        let (tokens, explain_opts) = crate::sql::explain_options::extract(tokens)?;
         let (tokens, locking) = crate::sql::row_lock::extract_row_locking(tokens)?;
         // `SKIP LOCKED` の空結果前の RLS 判定（RLS-13）は、外側の FROM に現れないサブクエリ・CTE 内側の
         // 表にも掛ける。名前解決（`schema.name` → 内部キー）の後のトークン列から実参照表だけを集める
@@ -6259,9 +6232,39 @@ impl EngineCore {
             read_snap,
             locking.is_some().then_some(&mut read_tables),
         )?;
-        let Some(locking) = locking else {
-            return Ok(parsed);
+        let format = match &explain_opts {
+            Some(raw) => raw.resolve()?.format,
+            None => crate::sql::explain_options::ExplainFormat::Text,
         };
+        let is_json = format == crate::sql::explain_options::ExplainFormat::Json;
+        let Some(locking) = locking else {
+            // Issue #2059: `FORMAT JSON` のときだけ結果の変換を表す包みを付ける（TEXT は従来と同一）。
+            return if is_json {
+                match parsed {
+                    ParsedSql::Statement(crate::sql::allowlist::Statement::Explain(_))
+                    | ParsedSql::ExplainDml(_)
+                    | ParsedSql::ExplainInsert(_)
+                    | ParsedSql::Partitioned(
+                        crate::sql::partitioned::PartitionedControl::ExplainDelete(_)
+                        | crate::sql::partitioned::PartitionedControl::ExplainUpdate(_),
+                    ) => Ok(ParsedSql::ExplainJson(Box::new(parsed))),
+                    // `EXPLAIN` 以外の文がここへ来るのは契約違反（fail-closed）。
+                    _ => Err(crate::sql::allowlist::SqlSurfaceError::Internal {
+                        detail: "EXPLAIN option list attached to a non-EXPLAIN statement"
+                            .to_string(),
+                    }),
+                }
+            } else {
+                Ok(parsed)
+            };
+        };
+        if is_json {
+            return Err(
+                crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
+                    "EXPLAIN FORMAT JSON is not supported with row-level locking clauses",
+                ),
+            );
+        }
         match parsed {
             ParsedSql::Statement(statement) => {
                 let locking = crate::sql::row_lock::check_row_locking(&statement, &locking)?;

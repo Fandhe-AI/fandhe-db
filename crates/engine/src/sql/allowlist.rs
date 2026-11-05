@@ -28599,6 +28599,9 @@ fn validate_sql_tokens_impl(
         // 自然にここへ落ちる）。untrusted 入力経路のため添字アクセスではなく
         // `get` でスライスする（`.claude/rules/coding-rust.md`）。
         _ if is_explain_statement => {
+            // Issue #2058（SQL-76 (1)）: 括弧付きオプション（`EXPLAIN (COSTS OFF) ...`）は
+            // `sql::explain_options` が `core::EngineCore::parse_tokens_in` で剥いでから本アームへ届く。
+            // セッション無しの入口はここへ直接届くため、オプション付きは下の経路で `42601` になる。
             let rest = tokens.get(1..).unwrap_or(&[]);
             // Issue #2048・#2976（SQL-75 (2) ポインタ）: `WITH`（`RECURSIVE` を含む）は非 EXPLAIN と
             // 同じ検証本体（`validate_with_statement`）へ渡し、返った文の形（インライン展開・具体化・

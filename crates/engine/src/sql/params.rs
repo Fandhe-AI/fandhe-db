@@ -1370,6 +1370,17 @@ pub fn validate_param_positions(tokens: &[Token]) -> Result<u16, SqlSurfaceError
         ));
     }
 
+    // Issue #2058（SQL-76 (1)）: `EXPLAIN ( <オプション> ) <文>` は先頭の次が `(` になり、下の
+    // `EXPLAIN` 前置の JOIN・集合演算・CTE・部分クエリのガードが偽になって素通りする（その後 parse 段が
+    // オプションを剥いで受理してしまう）。`$n` との併用は受理を後続に譲り、fail-closed に拒否する。
+    if crate::sql::explain_options::has_option_list(tokens)
+        && tokens.iter().any(|t| matches!(t, Token::Param(_)))
+    {
+        return Err(SqlSurfaceError::unsupported(
+            "parameter placeholders are not supported in EXPLAIN with options",
+        ));
+    }
+
     // Issue #925（SQL-28・RLS-10、TASK-212）: JOIN 文も一律拒否する
     // （fail-closed。カーソル・`WITH` と同じ方針）。理由: `where_equality_
     // literal_is_param`（パターン 4）は `Ident '='` の形しか数えず、JOIN の
@@ -1378,16 +1389,6 @@ pub fn validate_param_positions(tokens: &[Token]) -> Result<u16, SqlSurfaceError
     // 述語列の対応付けが保証できない（Issue #925 §2.7・対象外事項）。
     // Issue #2046: `EXPLAIN` 前置の JOIN も同じ理由で拒否する（`looks_like_join` は先頭 `SELECT` を
     // 要求するため、先頭の `EXPLAIN` を 1 トークン剥がして判定する。fail-closed）。
-    // Issue #2059: `EXPLAIN (<オプション群>) <文>` に `$n` を含む文も拒否する（fail-closed）。オプション群が
-    // 先頭語の直後に入ると下の `EXPLAIN` 前置の判定（`looks_like_join` 等）が本体を見られないため、
-    // 受理は後続に譲る。
-    if crate::sql::explain_options::has_option_list(tokens)
-        && tokens.iter().any(|t| matches!(t, Token::Param(_)))
-    {
-        return Err(SqlSurfaceError::unsupported(
-            "parameter placeholders are not supported in EXPLAIN with options",
-        ));
-    }
     let join_tokens = match tokens.first() {
         Some(Token::Ident(w)) if w.eq_ignore_ascii_case("EXPLAIN") => {
             tokens.get(1..).unwrap_or(&[])

@@ -1,199 +1,400 @@
-//! `EXPLAIN (<option> [, ...]) <文>` の括弧付きオプション群の解析（Issue #2059・SQL-76 (1) ポインタ）。
+//! `EXPLAIN ( <オプション> [, ...] ) <文>` の括弧付きオプションの構文解釈と意味検証
+//! （SQL-76 (1) のポインタ。Issue #2058。設計記録は `docs/design/explain-search-engine-exposure.md`）。
 //!
-//! 責務境界: `core.rs` の構文入口（`parse_tokens_in`）が、文の先頭が `EXPLAIN (` で始まるときに
-//! 本モジュールでオプション群をトークン列から取り除き、残り（`EXPLAIN` + 本体）を従来どおりの
-//! 解析器へ渡す。本モジュールは「オプション群の構文と閉じた語彙の照合」だけを担い、`FORMAT` 以外の
-//! オプションの意味（ANALYZE・VERBOSE 等。兄弟 Issue #2058・#2060 の範囲）は実装しない。
+//! 役割分担:
 //!
-//! fail-closed: 未知の名前は `42601`、既知だが未実装の名前と `FORMAT XML|YAML` は `0A000`、
-//! `FORMAT` のその他の値は `22023`。エラー文は固定の英語文で入力値を含めない。括弧の探索は
-//! `get()` による有界の走査で、オプション数にも上限を置く。
+//! - 本モジュールは [`extract`]（構文段。リストの形だけを見て本文を `EXPLAIN <文>` に組み直す）と
+//!   [`RawExplainOptions::resolve`]（意味段。名前・値の検証、後の指定を勝たせる畳み込み、未実装の
+//!   ゲート）を担う。実行計画の組み立て・表示は `sql::explain` 系の担当で、本モジュールは触れない。
+//! - 呼び出し元は `core::EngineCore::parse_tokens_in`（`row_lock::extract_row_locking` と同じ型で、
+//!   行数制限句の正規化の後に [`extract`] を 1 回だけ呼び、内側の文の検証が通った後に
+//!   [`RawExplainOptions::resolve`] を呼ぶ）と `sql::params`（Prepare 経路で [`has_option_list`] により
+//!   `$n` との併用を拒否する）。`fetch_clause::normalize_statement_tokens` には置かない
+//!   （PL/pgSQL・ビュー本文・入れ子へ黙って効くのを避ける）。
+//! - セッション無しの入口（`execute_sql` 系）は `parse_tokens_in` を通らないため、従来どおり
+//!   `EXPLAIN` の直後が `(` の形は許可リストの `42601` になる。
+//!
+//! 受け渡し先: 受理した [`ExplainOptions`] のうち出力を変えるのは `FORMAT JSON`（#2059）だけで、
+//! `core::EngineCore::parse_tokens_in` が `ParsedSql::ExplainJson` で包む（`COSTS` は推定値を出さないため無影響）。
+//! `ANALYZE`（#2052）・`SUMMARY`（#2052）・`VERBOSE`（#2060）は未実装で `0A000`
+//! のゲートに掛け、文を実行しない（黙って無視する fail-open を作らない）。各 Issue がゲートを外すときに
+//! `ParsedSql`／`SqlOutcome` へ運ぶ field を足す。
+//!
+//! untrusted な入力を扱うため、添字アクセス・`unwrap`・`expect` を使わず `get` で走査する。確保量は
+//! 入力トークン数で上限が決まり、再帰しない。エラーメッセージは固定文字列で入力をエコーしない。
 
 use crate::sql::allowlist::SqlSurfaceError;
-use crate::sql::lexer::Token;
+use crate::sql::lexer::{Keyword, Token};
 
-/// オプション数の上限（無制限走査の防止）。
-const MAX_EXPLAIN_OPTIONS: usize = 32;
-
-/// `EXPLAIN` の出力形式（`FORMAT` オプション）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ExplainFormat {
-    /// 字下げした複数行テキスト（従来の出力。既定）。
-    #[default]
+/// `FORMAT` の出力形式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExplainFormat {
+    /// `FORMAT TEXT`（既定）。
     Text,
-    /// PostgreSQL 互換の JSON（1 行 1 列・列型 `json`）。
+    /// `FORMAT JSON`（#2059。PostgreSQL 互換の JSON 1 セルで返す）。
     Json,
 }
 
-/// 名前は既知だが本 Issue では未実装のオプション（`0A000`）。#2058・#2060 が受理に切り替える。
-const KNOWN_UNSUPPORTED: &[&str] = &[
-    "ANALYZE",
-    "ANALYSE",
-    "VERBOSE",
-    "COSTS",
-    "TIMING",
-    "SUMMARY",
-    "BUFFERS",
-    "WAL",
-    "SETTINGS",
-    "GENERIC_PLAN",
-    "SERIALIZE",
-    "MEMORY",
-];
-
-/// 先頭が `EXPLAIN (` + オプション名の形か（`EXPLAIN (SELECT ..) UNION ..`・`EXPLAIN (WITH ..)` の
-/// 括弧は集合演算・部分クエリの括弧であり、オプション群とみなさない）。
-pub(crate) fn has_option_list(tokens: &[Token]) -> bool {
-    matches!(
-        (tokens.first(), tokens.get(1), tokens.get(2)),
-        (Some(Token::Ident(head)), Some(Token::Punct('(')), Some(Token::Ident(name)))
-            if head.eq_ignore_ascii_case("EXPLAIN")
-                && !["WITH", "VALUES", "TABLE"].iter().any(|k| name.eq_ignore_ascii_case(k))
-    )
+/// 畳み込み後のオプション（後の指定が勝つ）。後続 Issue が `ParsedSql` へ運ぶ土台。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // 現状は resolve の検証結果としてのみ使う（運搬は #2052／#2059／#2060）
+pub(crate) struct ExplainOptions {
+    pub(crate) analyze: bool,
+    pub(crate) verbose: bool,
+    pub(crate) costs: bool,
+    pub(crate) timing: Option<bool>,
+    pub(crate) summary: Option<bool>,
+    pub(crate) format: ExplainFormat,
 }
 
-/// オプション群を取り除く。`has_option_list` が真のときだけ呼ぶ。戻り値は出力形式と、
-/// オプション群を除いたトークン列（`EXPLAIN` + 本体）。
-pub(crate) fn split_explain_options(
-    tokens: &[Token],
-) -> Result<(ExplainFormat, Vec<Token>), SqlSurfaceError> {
-    let syntax = |d: &'static str| SqlSurfaceError::unsupported(d);
-    let bad_value = || SqlSurfaceError::InvalidParameterValue {
-        detail: "unrecognized value for EXPLAIN option FORMAT",
-    };
-    let mut format: ExplainFormat;
-    let mut i = 2usize;
-    let mut count = 0usize;
-    loop {
-        count += 1;
-        if count > MAX_EXPLAIN_OPTIONS {
-            return Err(syntax("too many EXPLAIN options"));
-        }
-        let Some(Token::Ident(name)) = tokens.get(i) else {
-            return Err(syntax("malformed EXPLAIN option list"));
-        };
-        i += 1;
-        let upper = name.to_ascii_uppercase();
-        if upper == "FORMAT" {
-            let value = match tokens.get(i) {
-                Some(Token::Ident(v)) => v.to_ascii_uppercase(),
-                Some(Token::Punct(',' | ')')) | None => {
-                    return Err(syntax("EXPLAIN option FORMAT requires a value"));
-                }
-                Some(_) => return Err(bad_value()),
-            };
-            i += 1;
-            format = match value.as_str() {
-                "TEXT" => ExplainFormat::Text,
-                "JSON" => ExplainFormat::Json,
-                "XML" | "YAML" => {
-                    return Err(SqlSurfaceError::feature_not_supported(
-                        "EXPLAIN FORMAT is not supported except TEXT and JSON",
-                    ));
-                }
-                _ => return Err(bad_value()),
-            };
-        } else if KNOWN_UNSUPPORTED.contains(&upper.as_str()) {
-            return Err(SqlSurfaceError::feature_not_supported(
-                "this EXPLAIN option is not supported",
-            ));
-        } else {
-            return Err(syntax("unrecognized EXPLAIN option"));
-        }
-        match tokens.get(i) {
-            Some(Token::Punct(',')) => i += 1,
-            Some(Token::Punct(')')) => {
-                i += 1;
-                break;
-            }
-            _ => return Err(syntax("malformed EXPLAIN option list")),
+impl Default for ExplainOptions {
+    fn default() -> Self {
+        Self {
+            analyze: false,
+            verbose: false,
+            costs: true,
+            timing: None,
+            summary: None,
+            format: ExplainFormat::Text,
         }
     }
-    let mut rest = Vec::with_capacity(tokens.len().saturating_sub(i).saturating_add(1));
-    rest.extend(tokens.first().cloned());
-    rest.extend(tokens.get(i..).unwrap_or(&[]).iter().cloned());
-    Ok((format, rest))
+}
+
+/// オプションの値（構文段の生の形）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RawValue {
+    /// 値の省略。
+    Omitted,
+    /// 識別子（`QuotedBoolWord` を含む）。
+    Word(String),
+    /// 文字列リテラル。
+    Str(String),
+    /// 数値（`signed` は前置の `+`／`-` の有無）。
+    Number { signed: bool, text: String },
+}
+
+/// 構文段が取り出したオプション列（名前と生の値。出現順）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RawExplainOptions {
+    items: Vec<(String, RawValue)>,
+}
+
+fn is_word(tok: Option<&Token>, word: &str) -> bool {
+    matches!(tok, Some(Token::Ident(w)) if w.eq_ignore_ascii_case(word))
+}
+
+/// `EXPLAIN` の直後（`rest`）がオプションのリストかを判定する。`(` の次が `SELECT`・`(`・`WITH`
+/// なら集合演算・CTE の括弧でありオプションではない。
+fn rest_has_option_list(rest: &[Token]) -> bool {
+    if !matches!(rest.first(), Some(Token::Punct('('))) {
+        return false;
+    }
+    !(matches!(rest.get(1), Some(Token::Keyword(Keyword::Select)))
+        || matches!(rest.get(1), Some(Token::Punct('(')))
+        || is_word(rest.get(1), "WITH"))
+}
+
+/// 先頭が `EXPLAIN ( <オプション>` の形か。`sql::params` が Prepare 経路で `$n` との併用を拒否するのに使う。
+pub(crate) fn has_option_list(tokens: &[Token]) -> bool {
+    is_word(tokens.first(), "EXPLAIN") && rest_has_option_list(tokens.get(1..).unwrap_or(&[]))
+}
+
+/// オプション数の上限（無制限走査・確保の防止。Issue #2059）。
+const MAX_EXPLAIN_OPTIONS: usize = 32;
+
+fn syntax(detail: &'static str) -> SqlSurfaceError {
+    SqlSurfaceError::unsupported(detail)
+}
+
+/// 構文段。オプションのリストを持たない文は `(tokens, None)` のまま返す。持つ場合は
+/// `EXPLAIN` + 本文のトークン列と生のオプション列を返す。誤りは `42601`。
+pub(crate) fn extract(
+    tokens: Vec<Token>,
+) -> Result<(Vec<Token>, Option<RawExplainOptions>), SqlSurfaceError> {
+    if !has_option_list(&tokens) {
+        return Ok((tokens, None));
+    }
+    // tokens[0] = EXPLAIN, tokens[1] = '('。
+    let mut pos = 2usize;
+    let mut items: Vec<(String, RawValue)> = Vec::new();
+    loop {
+        let name = match tokens.get(pos) {
+            Some(Token::Ident(n)) => n.clone(),
+            _ => return Err(syntax("invalid EXPLAIN option list")),
+        };
+        pos += 1;
+        let value = match tokens.get(pos) {
+            Some(Token::Punct(',')) | Some(Token::Punct(')')) => RawValue::Omitted,
+            Some(Token::Ident(w)) | Some(Token::QuotedBoolWord(w)) => {
+                pos += 1;
+                RawValue::Word(w.clone())
+            }
+            Some(Token::StringLiteral(s)) => {
+                pos += 1;
+                RawValue::Str(s.clone())
+            }
+            Some(Token::Number(n)) => {
+                pos += 1;
+                RawValue::Number {
+                    signed: false,
+                    text: n.clone(),
+                }
+            }
+            Some(Token::Punct(c)) if *c == '+' || *c == '-' => match tokens.get(pos + 1) {
+                Some(Token::Number(n)) => {
+                    pos += 2;
+                    RawValue::Number {
+                        signed: true,
+                        text: n.clone(),
+                    }
+                }
+                _ => return Err(syntax("invalid EXPLAIN option list")),
+            },
+            _ => return Err(syntax("invalid EXPLAIN option list")),
+        };
+        items.push((name, value));
+        if items.len() > MAX_EXPLAIN_OPTIONS {
+            return Err(syntax("too many EXPLAIN options"));
+        }
+        match tokens.get(pos) {
+            Some(Token::Punct(',')) => pos += 1,
+            Some(Token::Punct(')')) => {
+                pos += 1;
+                break;
+            }
+            _ => return Err(syntax("invalid EXPLAIN option list")),
+        }
+    }
+    let body = tokens.get(pos..).unwrap_or(&[]);
+    if body.is_empty() || matches!(body.first(), Some(Token::Punct(';'))) {
+        return Err(syntax("EXPLAIN requires a statement"));
+    }
+    // 二重のリスト（`EXPLAIN (a) (b) SELECT`）は受理しない。
+    if rest_has_option_list(body) {
+        return Err(syntax("invalid EXPLAIN option list"));
+    }
+    let mut out = Vec::with_capacity(body.len().saturating_add(1));
+    if let Some(head) = tokens.first() {
+        out.push(head.clone());
+    }
+    out.extend_from_slice(body);
+    Ok((out, Some(RawExplainOptions { items })))
+}
+
+fn parse_bool(value: &RawValue) -> Result<bool, SqlSurfaceError> {
+    let invalid = || SqlSurfaceError::InvalidParameterValue {
+        detail: "EXPLAIN option requires a Boolean value",
+    };
+    match value {
+        RawValue::Omitted => Ok(true),
+        RawValue::Word(w) | RawValue::Str(w) => match w.to_ascii_lowercase().as_str() {
+            "true" | "on" => Ok(true),
+            "false" | "off" => Ok(false),
+            _ => Err(invalid()),
+        },
+        RawValue::Number {
+            signed: false,
+            text,
+        } => match text.as_str() {
+            "1" => Ok(true),
+            "0" => Ok(false),
+            _ => Err(invalid()),
+        },
+        RawValue::Number { .. } => Err(invalid()),
+    }
+}
+
+impl RawExplainOptions {
+    /// 意味段。名前・値を出現順に検証し、後の指定を勝たせて畳み込み、未実装のゲートを掛ける。
+    pub(crate) fn resolve(&self) -> Result<ExplainOptions, SqlSurfaceError> {
+        let mut opts = ExplainOptions::default();
+        for (name, value) in &self.items {
+            match name.to_ascii_uppercase().as_str() {
+                "ANALYZE" | "ANALYSE" => opts.analyze = parse_bool(value)?,
+                "VERBOSE" => opts.verbose = parse_bool(value)?,
+                "COSTS" => opts.costs = parse_bool(value)?,
+                "TIMING" => opts.timing = Some(parse_bool(value)?),
+                "SUMMARY" => opts.summary = Some(parse_bool(value)?),
+                "FORMAT" => {
+                    let word = match value {
+                        RawValue::Omitted => {
+                            return Err(syntax("EXPLAIN option FORMAT requires a value"));
+                        }
+                        RawValue::Word(w) | RawValue::Str(w) => w.to_ascii_uppercase(),
+                        RawValue::Number { .. } => String::new(),
+                    };
+                    opts.format = match word.as_str() {
+                        "TEXT" => ExplainFormat::Text,
+                        "JSON" => ExplainFormat::Json,
+                        "XML" | "YAML" => {
+                            return Err(SqlSurfaceError::feature_not_supported(
+                                "EXPLAIN format is not supported",
+                            ));
+                        }
+                        _ => {
+                            return Err(SqlSurfaceError::InvalidParameterValue {
+                                detail: "unrecognized value for EXPLAIN option FORMAT",
+                            });
+                        }
+                    };
+                }
+                "BUFFERS" | "WAL" | "SETTINGS" | "GENERIC_PLAN" | "SERIALIZE" | "MEMORY" => {
+                    return Err(SqlSurfaceError::feature_not_supported(
+                        "EXPLAIN option is not supported",
+                    ));
+                }
+                _ => return Err(syntax("unrecognized EXPLAIN option")),
+            }
+        }
+        if opts.timing == Some(true) && !opts.analyze {
+            return Err(SqlSurfaceError::InvalidParameterValue {
+                detail: "EXPLAIN option TIMING requires ANALYZE",
+            });
+        }
+        // 未実装のゲート（後続 Issue が外す）。文は実行しない。
+        if opts.analyze {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "EXPLAIN ANALYZE is not implemented yet",
+            ));
+        }
+        if opts.summary == Some(true) {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "EXPLAIN SUMMARY is not implemented yet",
+            ));
+        }
+        if opts.verbose {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "EXPLAIN VERBOSE is not implemented yet",
+            ));
+        }
+        Ok(opts)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::lexer::tokenize;
+    use crate::sql::lexer::tokenize_with_params;
 
-    fn run(sql: &str) -> Result<ExplainFormat, String> {
-        let toks = tokenize(sql).unwrap();
-        assert!(has_option_list(&toks), "{sql}");
-        split_explain_options(&toks)
-            .map(|(f, _)| f)
-            .map_err(|e| e.wire_code().to_string())
+    fn toks(sql: &str) -> Vec<Token> {
+        tokenize_with_params(sql).expect("tokenize")
     }
 
-    #[test]
-    fn format_values() {
-        // SQL-76 (1)
-        assert_eq!(
-            run("EXPLAIN (FORMAT JSON) SELECT 1"),
-            Ok(ExplainFormat::Json)
-        );
-        assert_eq!(
-            run("explain (format text) SELECT 1"),
-            Ok(ExplainFormat::Text)
-        );
-        assert_eq!(
-            run("EXPLAIN (FORMAT JSON, FORMAT TEXT) SELECT 1"),
-            Ok(ExplainFormat::Text)
-        );
-        assert_eq!(
-            run("EXPLAIN (FORMAT TEXT, FORMAT JSON) SELECT 1"),
-            Ok(ExplainFormat::Json)
-        );
+    fn run(sql: &str) -> Result<Option<ExplainOptions>, SqlSurfaceError> {
+        let (_, raw) = extract(toks(sql))?;
+        raw.map(|r| r.resolve()).transpose()
     }
 
-    #[test]
-    fn rest_keeps_explain_and_body() {
-        let toks = tokenize("EXPLAIN (FORMAT JSON) SELECT 1").unwrap();
-        let (_, rest) = split_explain_options(&toks).unwrap();
-        assert_eq!(rest, tokenize("EXPLAIN SELECT 1").unwrap());
+    fn code(sql: &str) -> &'static str {
+        run(sql).expect_err("error").wire_code()
     }
 
+    /// SQL-76 (1): 非対象の括弧（集合演算・CTE）はトークンに触れない。
     #[test]
-    fn rejections() {
-        let code = |s: &str| run(s).unwrap_err();
-        assert_eq!(code("EXPLAIN (FORMAT XML) SELECT 1"), "0A000");
-        assert_eq!(code("EXPLAIN (FORMAT YAML) SELECT 1"), "0A000");
-        assert_eq!(code("EXPLAIN (FORMAT CSV) SELECT 1"), "22023");
-        assert_eq!(code("EXPLAIN (FORMAT 1) SELECT 1"), "22023");
-        assert_eq!(code("EXPLAIN (FORMAT) SELECT 1"), "42601");
-        assert_eq!(code("EXPLAIN (FORMAT, FORMAT JSON) SELECT 1"), "42601");
-        assert_eq!(code("EXPLAIN (ANALYZE) SELECT 1"), "0A000");
-        assert_eq!(code("EXPLAIN (VERBOSE true) SELECT 1"), "0A000");
-        assert_eq!(code("EXPLAIN (COSTS off) SELECT 1"), "0A000");
-        assert_eq!(code("EXPLAIN (BUFFERS) SELECT 1"), "0A000");
-        assert_eq!(code("EXPLAIN (BOGUS) SELECT 1"), "42601");
-        assert_eq!(code("EXPLAIN (FORMAT JSON SELECT 1"), "42601");
-        assert_eq!(code("EXPLAIN (FORMAT JSON,) SELECT 1"), "42601");
-        assert_eq!(code("EXPLAIN (FORMAT JSON"), "42601");
-    }
-
-    #[test]
-    fn option_count_is_bounded() {
-        let many = vec!["FORMAT TEXT"; MAX_EXPLAIN_OPTIONS + 1].join(", ");
-        assert_eq!(
-            run(&format!("EXPLAIN ({many}) SELECT 1")).unwrap_err(),
-            "42601"
-        );
-        let ok = vec!["FORMAT TEXT"; MAX_EXPLAIN_OPTIONS].join(", ");
-        assert!(run(&format!("EXPLAIN ({ok}) SELECT 1")).is_ok());
-    }
-
-    #[test]
-    fn set_operation_parentheses_are_not_options() {
+    fn non_option_parens_untouched() {
         for sql in [
-            "EXPLAIN (SELECT 1) UNION SELECT 2",
-            "EXPLAIN (WITH a AS (SELECT 1) SELECT 1)",
+            "EXPLAIN (SELECT k FROM a) UNION SELECT k FROM a",
+            "EXPLAIN ((SELECT k FROM a)) UNION SELECT k FROM a",
+            "EXPLAIN (WITH x AS (SELECT 1) SELECT 1)",
             "EXPLAIN SELECT 1",
         ] {
-            assert!(!has_option_list(&tokenize(sql).unwrap()), "{sql}");
+            let t = toks(sql);
+            let (out, raw) = extract(t.clone()).expect("ok");
+            assert!(raw.is_none());
+            assert_eq!(out, t);
         }
+    }
+
+    /// SQL-76 (1): 受理する形と本文の組み直し。
+    #[test]
+    fn accepted_forms() {
+        for sql in [
+            "EXPLAIN (COSTS) SELECT 1",
+            "EXPLAIN (costs off) SELECT 1",
+            "EXPLAIN (COSTS 0, FORMAT TEXT) SELECT 1",
+            "EXPLAIN (FORMAT 'text', SUMMARY false, TIMING off, ANALYZE FALSE) SELECT 1",
+            "EXPLAIN (ANALYZE, ANALYSE OFF) SELECT 1",
+            "EXPLAIN (FORMAT JSON, FORMAT TEXT) SELECT 1",
+            "EXPLAIN (FORMAT JSON) SELECT 1",
+            "EXPLAIN (FORMAT TEXT, FORMAT JSON) SELECT 1",
+            "EXPLAIN (TIMING, TIMING OFF) SELECT 1",
+        ] {
+            assert!(run(sql).expect(sql).is_some(), "{sql}");
+        }
+        let (out, _) = extract(toks("EXPLAIN (COSTS OFF) SELECT 1")).expect("ok");
+        assert_eq!(out, toks("EXPLAIN SELECT 1"));
+    }
+
+    /// SQL-76 (1): 構文の誤りは 42601。
+    #[test]
+    fn syntax_errors() {
+        for sql in [
+            "EXPLAIN () SELECT 1",
+            "EXPLAIN (COSTS,) SELECT 1",
+            "EXPLAIN (COSTS SELECT 1",
+            "EXPLAIN (COSTS)",
+            "EXPLAIN (COSTS);",
+            "EXPLAIN (COSTS) (COSTS) SELECT 1",
+            "EXPLAIN (COSTS $1) SELECT 1",
+            "EXPLAIN (COSTS -) SELECT 1",
+            "EXPLAIN (1) SELECT 1",
+            "EXPLAIN (COSTS ON OFF) SELECT 1",
+            "EXPLAIN (FOO) SELECT 1",
+            "EXPLAIN (FORMAT) SELECT 1",
+        ] {
+            let c = match run(sql) {
+                Err(e) => e.wire_code(),
+                Ok(_) => "ok",
+            };
+            assert_eq!(c, "42601", "{sql}");
+        }
+    }
+
+    /// SQL-76 (1): 値の不正は 22023、TIMING は ANALYZE を要する。
+    #[test]
+    fn invalid_values() {
+        for sql in [
+            "EXPLAIN (COSTS 2) SELECT 1",
+            "EXPLAIN (COSTS 1.0) SELECT 1",
+            "EXPLAIN (COSTS -1) SELECT 1",
+            "EXPLAIN (COSTS 'maybe') SELECT 1",
+            "EXPLAIN (COSTS foo) SELECT 1",
+            "EXPLAIN (FORMAT foo) SELECT 1",
+            "EXPLAIN (TIMING) SELECT 1",
+        ] {
+            assert_eq!(code(sql), "22023", "{sql}");
+        }
+    }
+
+    /// SQL-76 (1): 対象外・未実装は 0A000。エラーは並び順の先頭で決まる。
+    #[test]
+    fn unsupported_and_gates() {
+        for sql in [
+            "EXPLAIN (BUFFERS) SELECT 1",
+            "EXPLAIN (WAL) SELECT 1",
+            "EXPLAIN (SETTINGS) SELECT 1",
+            "EXPLAIN (GENERIC_PLAN) SELECT 1",
+            "EXPLAIN (SERIALIZE) SELECT 1",
+            "EXPLAIN (MEMORY) SELECT 1",
+            "EXPLAIN (FORMAT XML) SELECT 1",
+            "EXPLAIN (FORMAT YAML) SELECT 1",
+            "EXPLAIN (ANALYZE) SELECT 1",
+            "EXPLAIN (VERBOSE) SELECT 1",
+            "EXPLAIN (SUMMARY) SELECT 1",
+            "EXPLAIN (ANALYZE OFF, ANALYZE) SELECT 1",
+            "EXPLAIN (BUFFERS, FOO) SELECT 1",
+        ] {
+            assert_eq!(code(sql), "0A000", "{sql}");
+        }
+        assert_eq!(code("EXPLAIN (FOO, BUFFERS) SELECT 1"), "42601");
+    }
+
+    /// SQL-76 (1): Prepare 経路の判別。
+    #[test]
+    fn has_option_list_detection() {
+        assert!(has_option_list(&toks("EXPLAIN (COSTS OFF) SELECT 1")));
+        assert!(!has_option_list(&toks("EXPLAIN (SELECT 1) UNION SELECT 1")));
+        assert!(!has_option_list(&toks("EXPLAIN SELECT 1")));
+        assert!(!has_option_list(&toks("SELECT (COSTS)")));
     }
 }
