@@ -1,5 +1,6 @@
 //! `POST /v1/query` の op 許可リスト（`search`／`scan`／`aggregate`／
-//! `insert`／`update`／`delete` の閉じた 6 値）を、production ルータ経由
+//! `insert`／`update`／`delete` の閉じた 6 値。Issue #2086 で `upsert` が加わり
+//! 語彙は計 12 値。`upsert` は実行未結線で専用文言の `0A000`）を、production ルータ経由
 //! （生バイトクライアント）で検証する層 A 結合テスト（Issue #759・
 //! TASK-179。`update`／`delete` の追加は Issue #875。対象ビヘイビア
 //! NOSQL-1・NOSQL-9・NOSQL-12。ポインタ: `docs/spec/05-tasks.md` TASK-179・
@@ -35,7 +36,7 @@ use crate::http_common;
 use std::net::SocketAddr;
 
 use http_common::{AfterWrite, HttpResponse};
-use wire_server::http::query::gate::UNSUPPORTED_OP_MESSAGE;
+use wire_server::http::query::gate::{UNSUPPORTED_OP_MESSAGE, UPSERT_NOT_YET_AVAILABLE_MESSAGE};
 use wire_server::http::session::store::SessionStore;
 
 /// `POST /v1/session` へログインしてトークン（base64url 表現）を取り出す。
@@ -128,6 +129,23 @@ fn six_allowlisted_ops_reach_the_engine_and_report_undefined_table() {
     }
 }
 
+// --- upsert: 語彙・スキーマ通過後も実行せず専用文言の 0A000（Issue #2086） ---
+
+#[test]
+fn valid_upsert_returns_dedicated_0a000_and_never_reaches_engine() {
+    // 実行器は Issue #2087 で結線する。それまでは engine 接続済みでも
+    // `42P01` には到達せず、固定文言の `0A000`／501 で止まる。
+    let addr = spawn();
+    let body = br#"{"op":"upsert","table":"docs","rows":[{"id":1}],"on_conflict":{"columns":["id"],"do":"update","set":["lang"]},"operation_id":"n9-upsert-1"}"#;
+    let resp = query(addr, body);
+    assert_eq!(resp.status, 501, "resp={resp:?}");
+    assert_eq!(http_common::wire_code_of(&resp), "0A000");
+    assert_eq!(
+        http_common::error_message_of(&resp),
+        UPSERT_NOT_YET_AVAILABLE_MESSAGE
+    );
+}
+
 // --- update／delete: `filter: []`（空配列）は engine を呼ばず 42601 ---
 
 #[test]
@@ -189,6 +207,8 @@ fn vocabulary_outside_six_ops_rejects_with_0a000_and_unsupported_message() {
         "set",
         "SEARCH",
         " search",
+        "UPSERT",
+        " upsert",
         "",
     ];
     for op in unsupported_ops {
@@ -230,7 +250,7 @@ fn op_allowlist_check_precedes_schema_validation_over_wire() {
 #[test]
 fn unknown_fields_on_valid_ops_reject_with_42601() {
     let addr = spawn();
-    let cases: [(&str, &str); 17] = [
+    let cases: [(&str, &str); 19] = [
         (
             "search",
             r#"{"op":"search","table":"docs","limit":1,"hint_order":["path"]}"#,
@@ -246,6 +266,14 @@ fn unknown_fields_on_valid_ops_reject_with_42601() {
         (
             "insert",
             r#"{"op":"insert","table":"docs","rows":[],"hint_order":["path"]}"#,
+        ),
+        (
+            "upsert",
+            r#"{"op":"upsert","table":"docs","rows":[],"on_conflict":{"columns":["id"],"do":"nothing"},"hint_order":["path"]}"#,
+        ),
+        (
+            "upsert",
+            r#"{"op":"upsert","table":"docs","rows":[],"on_conflict":{"columns":["id"],"do":"nothing","where":"x"}}"#,
         ),
         (
             "search",

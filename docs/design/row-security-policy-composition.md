@@ -508,9 +508,10 @@ HNSW のグラフ走査はテナント内の隠れたノードを経由しうる
 
 ### `get`・`upsert` の扱い
 
-NoSQL の op 語彙（`Op::ALL` の 11 値）に `get`・`upsert` は無く、語彙は広げない（許可リストの閉包は P0 性質）。
+NoSQL の op 語彙（`Op::ALL` の 12 値）に `get` は無く、語彙は広げない（許可リストの閉包は P0 性質）。
 点取得は `scan` の主キー等値と `update`／`delete` の `where` 単一行形で表し、いずれも SQL の同じ形と同じ実行器を通る。
-`insert` は `on_conflict` を持たないので、`ON CONFLICT` の規則（#2277）は SQL 表層だけに現れる。
+`upsert` は Issue #2086 で語彙とスキーマ（`on_conflict`。NOSQL-21 ポインタ）が加わったが、実行器への結線と RLS の合成は Issue #2087 の担当で、それまでは常に `0A000` を返し engine を呼ばない。
+`insert` は `on_conflict` を持たないので、`ON CONFLICT` の規則（#2277）は SQL 表層と NoSQL の `upsert`（結線後）に現れる。
 
 ### HTTP の主体
 
