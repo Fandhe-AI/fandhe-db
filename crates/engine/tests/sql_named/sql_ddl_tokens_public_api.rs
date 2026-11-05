@@ -9,11 +9,13 @@
 //! トークン列を渡した場合と、SQL 表層の `parse_sql` が返す [`ParsedSql`] が
 //! 同一の構造情報を持つことを固定する（token 入口が SQL テキスト経由の
 //! 通常経路と同一の構造検証を通ることの回帰検証）。
+//! `validate_create_index_tokens`／`validate_drop_index_tokens` も同様（Issue #2108・NOSQL-19）。
 
 use engine::core::{EngineCore, ParsedSql};
 use engine::kernel::CpuScalarProvider;
 use engine::sql::allowlist::{
-    validate_alter_table_tokens, validate_create_table_tokens, validate_drop_table_tokens,
+    validate_alter_table_tokens, validate_create_index_tokens, validate_create_table_tokens,
+    validate_drop_index_tokens, validate_drop_table_tokens,
 };
 use engine::sql::lexer::tokenize;
 use engine::storage::Storage;
@@ -69,5 +71,36 @@ fn drop_table_token_entry_matches_text_entry() {
     match via_text {
         ParsedSql::DropTable(stmt) => assert_eq!(stmt, via_tokens),
         other => panic!("expected ParsedSql::DropTable, got {other:?}"),
+    }
+}
+
+#[test]
+fn create_index_token_entry_matches_text_entry() {
+    let (core, path) = new_core("sql_ddl_tokens_public_api_create_index");
+    let _cleanup = CleanupGuard(path);
+    for sql in [
+        "CREATE INDEX i ON t (a, b)",
+        "CREATE INDEX i ON t USING hnsw (c vector_cosine_ops) WITH (m = 16, ef_construction = 64)",
+        "CREATE INDEX i ON t USING gin (j jsonb_path_ops)",
+    ] {
+        let tokens = tokenize(sql).expect("tokenize");
+        let via_tokens = validate_create_index_tokens(&tokens).expect("token entry");
+        match core.parse_sql(sql).expect("text entry") {
+            ParsedSql::CreateIndex(stmt) => assert_eq!(stmt, via_tokens, "{sql}"),
+            other => panic!("expected ParsedSql::CreateIndex, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn drop_index_token_entry_matches_text_entry() {
+    let (core, path) = new_core("sql_ddl_tokens_public_api_drop_index");
+    let _cleanup = CleanupGuard(path);
+    let sql = "DROP INDEX i";
+    let tokens = tokenize(sql).expect("tokenize");
+    let via_tokens = validate_drop_index_tokens(&tokens).expect("token entry");
+    match core.parse_sql(sql).expect("text entry") {
+        ParsedSql::DropIndex(stmt) => assert_eq!(stmt, via_tokens),
+        other => panic!("expected ParsedSql::DropIndex, got {other:?}"),
     }
 }
