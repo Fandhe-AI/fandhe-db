@@ -68,6 +68,17 @@ pub fn plan_body(headers: &Headers<'_>) -> Result<BodyPlan, FrameError> {
     })
 }
 
+/// 本文を持たない要求（`GET /v1/openapi.json`、Issue #2244）の本文計画。宣言長が
+/// 0 のときだけ [`BodyPlan`] を返し、それ以外は `08P01`。`Content-Type` は本文が
+/// 無いため検査しない（付いていても無視）。未検証の宣言長をアロケーションへ渡さない
+/// 不変条件を保つため、`BodyPlan` は [`plan_body`] かここでしか作れない。
+pub fn plan_bodyless(headers: &Headers<'_>) -> Result<BodyPlan, FrameError> {
+    if headers.content_length() != 0 {
+        return Err(FrameError::Malformed("request body is not allowed"));
+    }
+    Ok(BodyPlan { content_length: 0 })
+}
+
 /// `Content-Type` 値が `application/json`（パラメータ無し、または
 /// `charset=utf-8` 1 個のみ）であることを検証する。
 ///
@@ -487,5 +498,22 @@ mod tests {
         let body = &header_input[header_consumed..];
         assert_eq!(body.len(), plan.content_length());
         assert_eq!(body, b"BODY");
+    }
+
+    #[test]
+    fn plan_bodyless_accepts_zero_and_ignores_content_type() {
+        for raw in [
+            &b"Content-Length: 0\r\n\r\n"[..],
+            b"Content-Length: 0\r\nContent-Type: text/plain\r\n\r\n",
+        ] {
+            let plan = plan_bodyless(&parse(raw)).expect("zero length is accepted");
+            assert_eq!(plan.content_length(), 0);
+        }
+    }
+
+    #[test]
+    fn plan_bodyless_rejects_nonzero_length() {
+        let headers = parse(b"Content-Length: 3\r\nContent-Type: application/json\r\n\r\n");
+        assert_protocol_violation(&plan_bodyless(&headers).unwrap_err());
     }
 }

@@ -6,8 +6,8 @@
 //! 役割: op 別の要求スキーマの単一情報源は静的表 `OP_SCHEMAS` であり、本モジュールは
 //! それを読み取り専用で OpenAPI へ写像するだけで検証ロジックは持たない。後続の
 //! #2105 のゴールデン検査（`tests/http_nosql/nosql20_openapi_golden.rs`。置き場は
-//! `docs/openapi.json`）・#2244（`GET /v1/openapi.json` 配信）、および
-//! `examples/openapi_dump.rs` から呼ばれる。実行時のカタログ（表名・列名・
+//! `docs/openapi.json`）、および `examples/openapi_dump.rs` から呼ばれる（配信は `http::openapi_endpoint` が
+//! 埋め込んだゴールデンを返し、本モジュールの出力との一致を同ゴールデンの検査が固定する）。実行時のカタログ（表名・列名・
 //! テナントのデータ）は参照しないため、文書にテナント情報は含まれない。
 //!
 //! 方針:
@@ -19,7 +19,7 @@
 //! - 文字列エスケープは engine の `write_canonical` に委譲し、独自実装を持たない。
 //! - 別実体で同名の `ObjectSchema` は `$ref` が衝突するため [`OpenApiError`] で拒否する。
 //!
-//! 対象外: 応答スキーマ・他パス・securitySchemes・語彙の列挙値（#2103）、配信（#2244）。
+//! 対象外: 応答スキーマ・他パス・securitySchemes・語彙の列挙値（#2103）、配信は #2244 で実装済み。
 //! `info.version` は `CARGO_PKG_VERSION` なので、クレート版を上げたらゴールデンの
 //! 再生成が要る（手順は `examples/openapi_dump.rs`）。
 //!

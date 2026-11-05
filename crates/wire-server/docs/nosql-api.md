@@ -64,13 +64,13 @@ NoSQL 表層にも適用される（Issue #968）。HTTP には `SSLRequest` の
 
 要求の受理条件（いずれも接続ハンドラ層で判定し、違反はすべて `08P01`）:
 
-- メソッドは `POST` のみ、バージョンは `HTTP/1.1` のみ
+- メソッドは `POST` のみ（例外は `GET /v1/openapi.json`。ターゲットがバイト厳密一致のときだけ受理し、それ以外の `GET` は `08P01`）、バージョンは `HTTP/1.1` のみ
 - 要求行は 4 KiB 以下
 - ヘッダ部は合計 8 KiB 以下・32 個以下
-- `Content-Length` は必須・一意（欠落・重複・非数字は `08P01`）
+- `Content-Length` は必須・一意（欠落・重複・非数字は `08P01`。`GET /v1/openapi.json` だけは省略可で、省略は `0` と同じ）
 - `Transfer-Encoding` は拒否
 - `Content-Type` は `application/json`（パラメータなし、または
-  `charset=utf-8` 1 個のみ）。不一致・欠落は `08P01`
+  `charset=utf-8` 1 個のみ）。不一致・欠落は `08P01`（本文を持たない `GET /v1/openapi.json` では検査しない）
 - 本文長は 1 MiB 以下（超過は `54000`）。UTF-8 として不正な本文は `42601`
 - 要求読み取りには 30 秒のタイムアウトがある
 
@@ -144,6 +144,29 @@ JSON キー・ヘッダ（`tenant`／`tenant-id`／`tenantid` 相当。`x-` 接�
 
 検証コード: `crates/wire-server/tests/http4_session.rs`・`http5_query_bearer.rs`・
 `http6_auth_failure.rs`・`http8_session_close.rs`。
+
+### `GET /v1/openapi.json`
+
+NoSQL 表層の要求スキーマを記述した OpenAPI 3.1 文書を返す（NOSQL-20 (3) ポインタ）。
+本文はビルド時に埋め込んだ [`openapi.json`](openapi.json) と同一のバイト列で、認証主体・
+テナントによらず同一。表名・列名などテナントのデータは含まない。
+
+- `Authorization: Bearer <token>` が必須。欠落・不正・期限切れ・close 済みは `/v1/query` と同じ
+  `28000`（`401`）で、認証前に文書は返さない
+- 要求は本文を持たない。`Content-Length` は省略または `0` のみで、`Content-Type` は不要。
+  本文があれば `08P01`
+- このパスへの `GET` 以外のメソッド（`POST` を含む）と、他のパスへの `GET` は認証より前に
+  `08P01`（セッションを消費しない）
+- スコープ付きセッションでも取得できる
+- 応答は `200`・`Content-Type: application/json; charset=utf-8`・`Content-Length`（本文長と一致）・
+  `Cache-Control: no-store`
+
+```text
+curl -H "Authorization: Bearer <token>" http://127.0.0.1:5432/v1/openapi.json
+```
+
+検証コード: `crates/wire-server/tests/http_nosql/nosql20_openapi_endpoint.rs`・
+`nosql20_openapi_golden.rs`（埋め込み文書とゴールデン・生成器の一致）。
 
 ### セッションのスコープ（HTTP-15）
 
@@ -1728,7 +1751,7 @@ curl -s -X POST http://127.0.0.1:5432/v1/session/close \
   `http15_session_scope.rs`（HTTP-15。Issue #2101・#2102）
 - ルーティング・op 許可リスト・スキーマ: `nosql1_endpoint_routing.rs`・
   `nosql1_op_vocabulary.rs`・`nosql9_op_allowlist.rs`・`nosql8_schema_validation.rs`
-- OpenAPI 文書（`docs/openapi.json`）とのゴールデン一致: `nosql20_openapi_golden.rs`
+- OpenAPI 文書（`docs/openapi.json`）とのゴールデン一致・配信: `nosql20_openapi_golden.rs`・`nosql20_openapi_endpoint.rs`
 - `search`: `nosql2_search.rs`・`nosql2_search_binding.rs`・
   `nosql2_search_metric.rs`（`metric`。Issue #2243）・`nosql10_explain.rs`・
   `wire_using_plan.rs`・`wire_explain.rs`。距離の意味（コサイン距離の昇順）は
