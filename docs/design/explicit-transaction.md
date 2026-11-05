@@ -769,6 +769,10 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
   → `ROLLBACK` で `'I'` に戻り、行・台帳に痕跡なし、`BEGIN` からの同一 `operation_id` の
   全体再試行が 1 回だけ反映されることを固定。
 
+- `crates/engine/tests/core_misc/recover12_txn_failure_no_ledger.rs`（Issue #2068）: 明示 Tx の
+  `ROLLBACK`・事前拒否（`23502`・`42601`）の後に台帳へ記録が無いこと（`operation_recorded`・
+  `last_operation_id`）、新しい `BEGIN` での同一 ID 再利用（別内容を含む）、読み取り文の
+  `USING OPERATION_ID` の `42601` 拒否、テナント境界を固定。
 - `crates/engine/tests/sql31_transaction.rs`: BEGIN/INSERT/INSERT/COMMIT の
   可視性・ROLLBACK の完全巻き戻し・入れ子 BEGIN の `25001`・トランザクション外
   COMMIT/ROLLBACK の `25P01`・同一トランザクション内 `operation_id` 再利用の
@@ -1207,3 +1211,10 @@ crash 道具 `crates/engine/examples/crash_tool_cross_table.rs` の `txn` モー
 - `scripts/crash_test_txn_kill_points.sh`（`make crash-test-txn-kill-points`）が 3 点をセットごとに実行し、PAUSED が最後の進行行であること・終了コード 137・verify の `rows`／`batches` が期待値と完全一致することを確かめる。観測できなかった点があれば失敗にする。
 - ランダム段（`crash_test_cross_table.sh` の txn 段）は最後の進行行で kill 位置を分類し、`rows <= acked + 4` の上限検査を足し、txn 段全体で `IN_TXN` を 1 度も観測しなければ失敗にする。判定を段全体にするのは遅い runner での不安定化を避けるため（3 点の網羅は決定的段が担う）。
 - 実行場所: 既存の `crash-test-cross-table` ジョブの step（必須チェック名は不変）。DDL の道具は #2417、kill 位置の分類は #2418、DDL エラー・`55P03` は #2419。
+
+## 失敗時の台帳非記録と読み取り文の `USING OPERATION_ID`（Issue #2068・RECOVER-12・RECOVER-9・SQL-10 ポインタ）
+
+- 台帳エントリは `COMMIT` と同じ redb の write txn に載る。`ROLLBACK`・接続断・事前拒否（`23502`・`42601`）の後には何も残らず、新しい `BEGIN` の内側で同じ `operation_id` を（別の内容でも）使える。この性質は共有 write txn の abort で台帳も同時に消える既存の仕組みから出るもので、追加のコードは無い（本番コードの変更なし）。
+- NOT NULL 違反（`23502`）は台帳照合の後に起きうるため、失敗した文の台帳が共有 write txn に書かれうる。Tx が `Failed` から `ROLLBACK` で破棄されるので残らない。
+- 読み取り文（kNN・走査・集約・定数・`EXPLAIN SELECT`）に付けた `USING OPERATION_ID` は、autocommit・明示 Tx・`BEGIN READ ONLY` のすべてで `42601` により拒否される（無視されて受理される形は無い）。kNN の形は USING 句の未対応、それ以外は文末の余剰トークンとして拒否される。明示 Tx は `Failed` へ遷移し、ID は台帳にも Tx 内の使用済み ID にも登録されない。READ ONLY の Tx でも parse の段で `42601` になり `25006` には届かない。
+- 範囲外: `ROLLBACK TO` 後の再利用（`sql69_savepoint_*` が担当）・wire 層越しの射影・暗黙トランザクション（`wire16_implicit_txn.rs`）。

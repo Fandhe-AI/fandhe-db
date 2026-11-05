@@ -1729,4 +1729,6 @@ main に無く現行の `parse_order_by` は `<=>` のみ受理するため、�
 
 **Issue #2056（feat(engine): HNSW 縮退・再取得ラウンド数・キャッシュ状態を ANALYZE に出す。親 #2052・SQL-76 (2)(3)・SQL-73 (3)(5) ポインタ。詳細は [explain-search-engine-exposure.md](explain-search-engine-exposure.md) の #2056 追記）**: `EXPLAIN ANALYZE` が実行した 1 文の HNSW の判断（索引キャッシュの再利用・構築・再構築・未索引、厳密走査への切り替え、反復スキャンのラウンド数・上限到達・調べた行数、hybrid 密側のラウンド数）を `hnsw_*` の行で根の段へ併記する。スレッドローカルの観測シンク（`sql/hnsw_observe.rs`）に実行段だけで記録し、全体の集計 API の差分は使わない。tenant-b の行量に出力が依存しないことを結合テスト（`sql76_explain_analyze_hnsw`）で固定。静的な `EXPLAIN` は不変。
 
+**Issue #2068（test(engine): 明示トランザクション・複数文内の operation_id と失敗時の非記録を固定する。RECOVER-12・RECOVER-9・SQL-10 ポインタ。詳細は [explicit-transaction.md](explicit-transaction.md) の #2068 節）**: 明示 Tx の `ROLLBACK`・事前拒否（`23502`・`42601`）の後に台帳へ記録が残らず、新しい `BEGIN` で同じ `operation_id` を再利用できること、読み取り文に付けた `USING OPERATION_ID` が全入口で `42601` になることを `core_misc/recover12_txn_failure_no_ledger.rs` で固定した。本番コードの変更なし、依存の追加・更新なし。
+
 **Issue #2076（docs(design): 固定テナント方式の方針 ADR。RLS-6・RLS-8・RLS-10・RLS-12・RLS-13 ポインタ。詳細は [fixed-tenant-boundary.md](fixed-tenant-boundary.md)）**: テナント境界を外せない設計を方針として記録した。テナント ID はサーバーが導出し、利用者ポリシー・`BYPASSRLS`・所有者除外・`row_security` のいずれでも外れない。採用しないのは管理者バイパスだけで、利用者ポリシー（`PERMISSIVE`／`RESTRICTIVE`・コマンド別）はテナント境界の内側の追加の制限として実装済み。検索・読み取り・更新・分割 DML・HTTP・EXPLAIN の各経路が同じ単一照合パスを通ることを、symbol と根拠テストの表で示した。ドキュメントのみの変更で、コード・依存・CI は変えない。
