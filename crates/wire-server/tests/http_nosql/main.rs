@@ -40,6 +40,7 @@ mod nosql17_typed_json_parity;
 mod nosql18_conditional_dml;
 mod nosql1_endpoint_routing;
 mod nosql1_op_vocabulary;
+mod nosql20_openapi_golden;
 mod nosql21_upsert;
 mod nosql22_returning_schema;
 mod nosql2_search;
