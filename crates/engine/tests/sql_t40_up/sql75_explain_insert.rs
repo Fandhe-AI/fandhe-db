@@ -375,3 +375,28 @@ fn explain_requires_the_same_privileges_as_the_plain_insert() {
         .is_ok());
     assert_eq!(denied(&mut bob, sql_select), "42501");
 }
+
+/// 内側 kNN が `LIMIT` 省略（構文段が cap+1 を注入する形）のとき、設定上限がハード上限未満でも
+/// 通常の `INSERT ... SELECT` が受理される文は EXPLAIN でも受理される（受理条件の一致）。
+#[test]
+fn insert_select_with_injected_limit_is_explained_under_lowered_result_limits() {
+    let path = unique_db_path("x75i-injected-limit");
+    let _g = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_result_limits(engine::result_limits::ResultLimits::new(10));
+    for sql in [
+        "CREATE TABLE kv (id BIGINT PRIMARY KEY, embedding VECTOR(2) NOT NULL)",
+        "CREATE TABLE kd (id BIGINT PRIMARY KEY, embedding VECTOR(2) NOT NULL)",
+        "INSERT INTO kv (id, embedding) VALUES (1, '[1,0]'), (2, '[0,1]')",
+    ] {
+        exec_as(&core, "tenant-a", sql);
+    }
+    let inner = "INSERT INTO kd (id, embedding) SELECT id, embedding FROM kv \
+                 ORDER BY embedding <=> '[1,0]'";
+    // 通常実行が受理されることを前提にする。
+    run(&core, "tenant-a", inner).expect("plain INSERT ... SELECT is accepted");
+    let got = plan(&core, &format!("EXPLAIN {inner}"));
+    assert_eq!(got.first().map(String::as_str), Some("insert"), "{got:?}");
+    assert!(got.contains(&"-> select".to_string()), "{got:?}");
+}

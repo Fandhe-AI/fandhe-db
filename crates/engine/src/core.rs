@@ -12000,7 +12000,7 @@ impl EngineCore {
 
                     crate::sql::parser::validate_search_limit_with(
                         validated.limit(),
-                        &self.result_limits,
+                        &self.explain_limits(),
                     )?;
 
                     // `USING MODE` リテラルの解析は `run_explain_plan` に委譲し、
@@ -14137,7 +14137,7 @@ impl EngineCore {
             validated,
             &schema,
             session.search_mode(),
-            &self.result_limits,
+            &self.explain_limits(),
             &read_txn,
         )? {
             let bound = crate::sql::parser::bind_halfvec_ann(
@@ -14145,7 +14145,7 @@ impl EngineCore {
                 &schema,
                 session.search_mode(),
                 session.udfs(),
-                &self.result_limits,
+                &self.explain_limits(),
             )?;
             return Ok(crate::sql::SqlOutcome::Explain(
                 self.search_explain_from_bound(
@@ -14164,7 +14164,7 @@ impl EngineCore {
             &schema,
             session.search_mode(),
             &crate::sql::parser::LiteralSkip::NONE,
-            &self.result_limits,
+            &self.explain_limits(),
         )? {
             // 未解決の `IN (SELECT ...)`／`EXISTS` を含む WHERE も実行と同じく通すため、
             // 部分クエリ対応の共通ヘルパーへ委ねる（HALFVEC と同じ経路）。
@@ -14177,7 +14177,7 @@ impl EngineCore {
             &schema,
             session.search_mode(),
             &crate::sql::parser::LiteralSkip::NONE,
-            &self.result_limits,
+            &self.explain_limits(),
         )? {
             return self.run_relational_explain_scan(&scan, session);
         }
@@ -14186,7 +14186,7 @@ impl EngineCore {
             &schema,
             session.search_mode(),
             session.udfs(),
-            &self.result_limits,
+            &self.explain_limits(),
         )?;
         Ok(crate::sql::SqlOutcome::Explain(
             self.search_explain_from_bound(
@@ -14429,7 +14429,7 @@ impl EngineCore {
             &self.storage,
             session.udfs(),
             self.nesting_limits,
-            self.result_limits,
+            self.explain_limits(),
         )?;
         let specs = Self::subquery_specs(read_txn, items)?;
         // 部分クエリを含む `OR` の通常述語は表示用の置換で落ちるため、別に束縛だけ検証する
@@ -14442,7 +14442,7 @@ impl EngineCore {
             schema,
             session.udfs(),
             &[],
-            &self.result_limits,
+            &self.explain_limits(),
         )?;
         let mut owned = validated.clone();
         owned.where_predicates =
@@ -14478,7 +14478,7 @@ impl EngineCore {
             &self.storage,
             session.udfs(),
             self.nesting_limits,
-            self.result_limits,
+            self.explain_limits(),
         )?;
         let specs = Self::subquery_specs(read_txn, items)?;
         // 部分クエリを含む `OR` の通常述語は表示用の置換で落ちるため、別に束縛だけ検証する
@@ -14556,7 +14556,7 @@ impl EngineCore {
                     &schema,
                     session.udfs(),
                     &[],
-                    &self.result_limits,
+                    &self.explain_limits(),
                 )?;
                 let gins = Self::gin_decls_for_explain(&read_txn, &bound)?;
                 let shape = CteMainShape {
@@ -14618,7 +14618,7 @@ impl EngineCore {
             &schema,
             session.udfs(),
             &[],
-            &self.result_limits,
+            &self.explain_limits(),
         )?;
         let gins = Self::gin_decls_for_explain(read_txn, &bound)?;
         let shape = crate::sql::cte_explain::CteMainShape {
@@ -14667,7 +14667,7 @@ impl EngineCore {
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
         use crate::sql::allowlist::{SqlSurfaceError, Statement};
         use crate::sql::cte_explain as ce;
-        let limits = self.result_limits;
+        let limits = self.explain_limits();
         Self::check_buffered_outer_limit(view, &limits)?;
         let read_txn = self.begin_read_txn()?;
         check_buffered_view_collations(&read_txn, view)?;
@@ -14953,7 +14953,7 @@ impl EngineCore {
             &schema,
             session.udfs(),
             &[],
-            &self.result_limits,
+            &self.explain_limits(),
         )?;
         let gins = Self::gin_decls_for_explain(&read_txn, &bound)?;
         let lines = Self::scan_explain_lines(&schema, &bound, &gins);
@@ -14996,7 +14996,7 @@ impl EngineCore {
         let limits = crate::sql::join::JoinLimits::from_settings(
             self.group_by_limits,
             self.join_limits,
-            self.result_limits,
+            self.explain_limits(),
         );
         let mut schemas = base_schemas.clone();
         let mut cte_ids = crate::sql::join::CteIdColumns::new();
@@ -15009,7 +15009,7 @@ impl EngineCore {
                     cte,
                     *k,
                     &crate::sql::parser::LiteralSkip::NONE,
-                    &self.result_limits,
+                    &self.explain_limits(),
                     Some(read_txn),
                 )?;
                 let (schema, id_columns) = crate::sql::join::cte_schema(rel.table(), &cols)?;
@@ -15144,7 +15144,7 @@ impl EngineCore {
             session.udfs(),
             validated.limit,
             validated.offset,
-            &self.result_limits,
+            &self.explain_limits(),
             Some(&mut leaves),
         )?;
         let mut leaf_lines = Vec::with_capacity(leaves.len());

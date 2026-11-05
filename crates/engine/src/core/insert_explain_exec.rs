@@ -20,6 +20,27 @@ use crate::sql::mode::SessionState;
 use crate::sql::parser::{BoundConflictTarget, BoundInsertForm};
 use crate::sql::SqlOutcome;
 
+thread_local! {
+    /// `INSERT ... SELECT` の EXPLAIN が内側の計画生成の間だけ張る結果行数上限の上書き。
+    static EXPLAIN_LIMITS_OVERRIDE: std::cell::Cell<Option<crate::result_limits::ResultLimits>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// [`EXPLAIN_LIMITS_OVERRIDE`] を張る RAII ガード。drop で直前の値へ戻す（入れ子・早期 return 安全）。
+struct ExplainLimitsScope(Option<crate::result_limits::ResultLimits>);
+
+impl ExplainLimitsScope {
+    fn enter(limits: crate::result_limits::ResultLimits) -> Self {
+        Self(EXPLAIN_LIMITS_OVERRIDE.with(|c| c.replace(Some(limits))))
+    }
+}
+
+impl Drop for ExplainLimitsScope {
+    fn drop(&mut self) {
+        EXPLAIN_LIMITS_OVERRIDE.with(|c| c.set(self.0));
+    }
+}
+
 fn internal() -> SqlSurfaceError {
     SqlSurfaceError::Internal {
         detail: "internal error".to_string(),
@@ -48,6 +69,15 @@ fn conflict_shape(clause: &OnConflictClause, target: &BoundConflictTarget) -> Co
 }
 
 impl EngineCore {
+    /// EXPLAIN 系の束縛が使う結果行数上限。`INSERT ... SELECT` の EXPLAIN が暗黙 `LIMIT`（cap+1）を
+    /// 付けた内側を作る間は、通常実行の `bind_insert_select` と同じ上限（付与値）を返し、受理条件を
+    /// 一致させる。それ以外は設定値（`result_limits`）。
+    pub(super) fn explain_limits(&self) -> crate::result_limits::ResultLimits {
+        EXPLAIN_LIMITS_OVERRIDE
+            .with(|c| c.get())
+            .unwrap_or(self.result_limits)
+    }
+
     /// `ParsedSql::ExplainInsert` の実行。書き込まずに挿入方式の段の木（`QUERY PLAN` 1 列）を返す。
     pub(super) fn run_insert_explain(
         &self,
@@ -158,6 +188,11 @@ impl EngineCore {
                 constant_result_leaf().map_err(|e| e.into_surface_error())?
             }
             InsertSelectExplainInner::Target(t) => {
+                // 暗黙 `LIMIT` を付けた内側は、`bind_insert_select` と同じ付与値を上限にして計画を作る。
+                let _limits_scope = insert
+                    .implicit_limit
+                    .and_then(|n| usize::try_from(n).ok())
+                    .map(|n| ExplainLimitsScope::enter(crate::result_limits::ResultLimits::new(n)));
                 let outcome = self.execute_validated_in_session(
                     ctx,
                     session,
@@ -187,5 +222,36 @@ impl EngineCore {
         };
         let child = select_stage(inner_node).map_err(|e| e.into_surface_error())?;
         insert_node(&shape, child).map_err(|e| e.into_surface_error())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::result_limits::ResultLimits;
+
+    /// スコープ中だけ上限が差し替わり、drop（入れ子含む）で直前の状態へ戻る。
+    #[test]
+    fn explain_limits_scope_overrides_and_restores() {
+        assert_eq!(EXPLAIN_LIMITS_OVERRIDE.with(|c| c.get()), None);
+        {
+            let _outer = ExplainLimitsScope::enter(ResultLimits::new(11));
+            assert_eq!(
+                EXPLAIN_LIMITS_OVERRIDE.with(|c| c.get()),
+                Some(ResultLimits::new(11))
+            );
+            {
+                let _inner = ExplainLimitsScope::enter(ResultLimits::new(21));
+                assert_eq!(
+                    EXPLAIN_LIMITS_OVERRIDE.with(|c| c.get()),
+                    Some(ResultLimits::new(21))
+                );
+            }
+            assert_eq!(
+                EXPLAIN_LIMITS_OVERRIDE.with(|c| c.get()),
+                Some(ResultLimits::new(11))
+            );
+        }
+        assert_eq!(EXPLAIN_LIMITS_OVERRIDE.with(|c| c.get()), None);
     }
 }
