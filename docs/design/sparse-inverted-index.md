@@ -305,6 +305,7 @@ warmup 20・計測 30。`GITHUB_ACTIONS` 下は fail-closed 拒否のため未�
 
 ## スコープ外・申し送り
 
+- 位置付き posting と前方一致用の順序付き語彙は [fulltext-query-syntax.md](fulltext-query-syntax.md)（Issue #2112）で設計する
 - posting list の CSR 化・圧縮（可変長整数・delta encoding）・枝刈り高速化は未着手
 - `VisibleBitmap` はクエリ（`search_within` 呼び出し）ごとに再構築しており、
   ループ間での再利用はしていない
