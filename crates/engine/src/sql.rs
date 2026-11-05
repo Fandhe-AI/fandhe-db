@@ -276,6 +276,7 @@ pub(crate) mod insert_select_scope;
 pub(crate) mod join;
 pub(crate) mod json_fn;
 pub(crate) mod jsonpath_fn;
+pub mod keyset;
 pub mod lexer;
 pub mod lock_table;
 pub mod mode;
