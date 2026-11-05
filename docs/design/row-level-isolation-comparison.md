@@ -64,6 +64,7 @@ fandhe の行レベル分離を PostgreSQL・Elasticsearch・Qdrant と同じ軸
   利用者が付与できる `BYPASSRLS` 属性（[role-privilege-model.md](role-privilege-model.md) の「#2278 段 2」）
   - ロール別のポリシー条件と `BYPASSRLS` 属性の付与は fail-closed（`0A000`／`42501`）で拒否し、
     テナント境界は緩めない
+  - 列レベル制御の方針は [column-level-privilege.md](column-level-privilege.md)（Proposed）に置く
   - 列レベル制御は拒否契約ではない。列単位 `GRANT` は受理されカタログに保存されるが、
     参照時の列集合の判定が未実装（#2081）で、保存された列権限はまだ適用されない
 - 運用上の差: 管理者バイパスが無いため、全テナントを横断するバックアップ・調査を 1 接続で行う手段は提供しない
