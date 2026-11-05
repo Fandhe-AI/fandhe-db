@@ -63,9 +63,9 @@
 //!    内部で engine の分割実行入口へ、`(Op::ShowPartitionedDml, Some(engine))`・
 //!    `(Op::CancelPartitionedDml, Some(engine))` が [`super::partitioned::handle_show`]・
 //!    [`super::partitioned::handle_cancel`] へ委譲する
-//!    `upsert`（Issue #2086・NOSQL-1・NOSQL-21）は語彙とスキーマ検証のみ結線済みで、
-//!    通過後は engine 接続の有無にかかわらず [`UPSERT_NOT_YET_AVAILABLE_MESSAGE`]
-//!    の `0A000` を返す（実行器への結線は Issue #2087）
+//!    `upsert`（Issue #2086・#2087・NOSQL-1・NOSQL-21）は `(Op::Upsert, Some(engine))` が
+//!    [`super::upsert::handle`]（SQL 表層の UPSERT と同じ束縛関数・実行器）へ委譲し、
+//!    `engine` 未接続時は [`PLACEHOLDER_MESSAGE`] へ落ちる
 //!
 //! 手順 3（op 許可リスト）は手順 4（スキーマ検証）より前に行う。語彙外の
 //! `op` にスキーマ検証由来の情報（未知キー等）が先に返ることはない
@@ -134,11 +134,6 @@ fn check_returning(validated: &Validated<'_>) -> Result<(), ReturningRequestErro
 /// #1062）は実行結線済み（Issue #766・#768・#772・#764・#765・#876・#1062）
 /// のため `Router::new` 経由（`engine` 未接続）の場合にのみこの応答へ落ちる。
 pub const PLACEHOLDER_MESSAGE: &str = "query execution not yet available";
-
-/// 語彙・スキーマ検証を通過した `upsert` に返す固定文言（Issue #2086。
-/// 実行器は Issue #2087）。`PLACEHOLDER_MESSAGE`（engine 未接続の意味）とは
-/// 区別する。表名・値を含めない。
-pub const UPSERT_NOT_YET_AVAILABLE_MESSAGE: &str = "upsert execution not yet available";
 
 /// `POST /v1/query` を処理し応答バイト列を返す（認証済み要求のみ）。
 ///
@@ -209,7 +204,7 @@ pub fn handle(
 
     // 手順 6: op と engine 接続有無の組でディスパッチする（Issue #766・
     // #768・#772・#764・#876）。各アームは対応するモジュールへの 1 行委譲に
-    // 留める。全 6 op が実行結線済みのため `(_, _)` は `engine` 未接続時
+    // 留める。全 op が実行結線済みのため `(_, _)` は `engine` 未接続時
     // （`Router::new` 経由）にのみ到達する。
     // 採番方式の表（暗黙の `id` を持たない表。TABLE-23・NOSQL-23）への `scan`／`insert`／
     // `update`／`delete` は PRIMARY KEY 基準の行アドレスで動く（Issue #2201）。`aggregate`／`search`
@@ -229,13 +224,11 @@ pub fn handle(
     }
 
     match (op, engine) {
-        // `upsert`（Issue #2086）は実行器が無いため engine 接続の有無によらず
-        // `0A000` で止める。Issue #2087 で `super::upsert::handle` へ結線する。
-        (Op::Upsert, _) => response::encode_error(
-            ErrorClass::FeatureNotSupported,
-            UPSERT_NOT_YET_AVAILABLE_MESSAGE,
-            now_wall,
-        ),
+        // `upsert`（Issue #2087）は SQL 表層の UPSERT と同じ束縛関数・実行器へ委譲する。
+        // `engine` 未接続時は下の `(_, _)`（`PLACEHOLDER_MESSAGE`）へ落ちる。
+        (Op::Upsert, Some(engine)) => {
+            super::upsert::handle(engine, principal, &validated, header_operation_id, now_wall)
+        }
         // `explain: true` は各 op の通常実行より必ず先に判定する
         // （`search` は Issue #765・TASK-186・NOSQL-10、`scan`／`aggregate` は
         // Issue #948・NOSQL-16・SQL-27 で対象拡大）。`explain: true` が
@@ -715,26 +708,21 @@ mod tests {
     const VALID_UPSERT: &[u8] = br#"{"op":"upsert","table":"docs","rows":[{"id":1}],"on_conflict":{"columns":["id"],"do":"nothing"}}"#;
 
     #[test]
-    fn valid_upsert_returns_dedicated_0a000_without_engine() {
+    fn valid_upsert_without_engine_returns_placeholder_0a000() {
         let text = String::from_utf8(run(VALID_UPSERT, &[])).expect("utf-8");
         assert!(text.starts_with("HTTP/1.1 501 "), "got: {text}");
         assert!(text.contains("0A000"), "got: {text}");
-        assert!(
-            text.contains(UPSERT_NOT_YET_AVAILABLE_MESSAGE),
-            "got: {text}"
-        );
+        assert!(text.contains(PLACEHOLDER_MESSAGE), "got: {text}");
         assert!(!text.contains(UNSUPPORTED_OP_MESSAGE), "got: {text}");
     }
 
     #[test]
-    fn valid_upsert_with_engine_still_returns_dedicated_0a000() {
+    fn valid_upsert_with_engine_is_executed_not_0a000() {
+        // 実行器へ結線済み（Issue #2087）。表が無いので `42P01` になり、`0A000` では止まらない。
         let (core, _guard) = empty_core();
         let text = String::from_utf8(run_with_engine(&core, VALID_UPSERT, &[])).expect("utf-8");
-        assert!(text.starts_with("HTTP/1.1 501 "), "got: {text}");
-        assert!(
-            text.contains(UPSERT_NOT_YET_AVAILABLE_MESSAGE),
-            "got: {text}"
-        );
+        assert!(text.contains("42P01"), "got: {text}");
+        assert!(!text.contains("0A000"), "got: {text}");
     }
 
     #[test]

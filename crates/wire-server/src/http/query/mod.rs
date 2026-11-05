@@ -79,6 +79,8 @@
 //! から呼ばれる）。
 //! [`operation_id_source`] は書き込み op の `operation_id` 供給元（本文／`Idempotency-Key`
 //! ヘッダ）の解決と不一致拒否（Issue #2064・HTTP-14）を `insert`／`update`／`delete` で共有する。
+//! [`upsert`] は `upsert` op（Issue #2087・NOSQL-21）を SQL 表層の `INSERT ... ON CONFLICT` と同じ
+//! 束縛関数・実行器へ写像する。
 //! [`returning`] は `insert`／`update`／`delete` の任意キー `returning` の値検査と
 //! 分割実行との併用拒否（Issue #2090・NOSQL-22。実行結線は #2091）を担う。
 //! [`partitioned`] は分割実行 DML の語彙（Issue #1130・NOSQL-12・RECOVER-11）を
@@ -106,3 +108,4 @@ pub mod schema;
 pub mod search;
 pub mod typed_json;
 pub mod update;
+pub mod upsert;
