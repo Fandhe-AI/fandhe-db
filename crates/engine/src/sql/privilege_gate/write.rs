@@ -240,6 +240,8 @@ pub(crate) fn classify_write(parsed: &ParsedSql) -> WriteRequirement {
         // 読み取り・カーソル・行ロック（read ゲートが担う）。COPY は `copy.rs`（#1969。begin_copy* が直接呼ぶ）、LOCK TABLE は対象外。
         ParsedSql::Statement(_)
         | ParsedSql::LockingSelect(_)
+        // Issue #2054: `EXPLAIN ANALYZE <SELECT>` は読み取りのみ（SELECT 権限は read ゲート）。
+        | ParsedSql::ExplainAnalyze(_)
         | ParsedSql::Cursor(_)
         | ParsedSql::Copy(_)
         | ParsedSql::Lock(_)

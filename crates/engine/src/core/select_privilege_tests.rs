@@ -177,7 +177,6 @@ fn nested_references_are_checked() {
 #[test]
 fn explain_is_checked_like_the_statement() {
     let f = fx("selpriv-explain");
-    // `EXPLAIN ANALYZE` は構文として受理されない（`42601`）ため、計画を返す形は `EXPLAIN` だけ。
     let sql = "EXPLAIN SELECT id FROM ca LIMIT 5";
     let mut s = bound(f.alice, A, false);
     let e = f
@@ -190,6 +189,31 @@ fn explain_is_checked_like_the_statement() {
     assert!(!msg.contains("ca"), "{msg}");
     f.admin_run("GRANT SELECT ON ca TO alice");
     assert_eq!(f.alice_run("EXPLAIN SELECT id FROM ca LIMIT 5"), "ok");
+}
+
+/// Issue #2054（SQL-76 (2)）: `EXPLAIN ANALYZE` は内側の SELECT を実行するため、実行前に同じ SELECT 権限を
+/// 要求する（括弧形・前置形とも）。拒否は固定文言で表名を含まない。
+#[test]
+fn explain_analyze_is_checked_before_execution() {
+    let f = fx("selpriv-explain-analyze");
+    for sql in [
+        "EXPLAIN ANALYZE SELECT id FROM ca LIMIT 5",
+        "EXPLAIN (ANALYZE, TIMING OFF) SELECT id FROM ca LIMIT 5",
+    ] {
+        let mut s = bound(f.alice, A, false);
+        let e = f
+            .core
+            .execute_sql_in_session(&ctx(A), &mut s, sql)
+            .expect_err("denied");
+        assert_eq!(e.wire_code(), "42501", "{sql}");
+        let msg = e.client_message();
+        assert!(!msg.contains("ca"), "{msg}");
+    }
+    f.admin_run("GRANT SELECT ON ca TO alice");
+    assert_eq!(
+        f.alice_run("EXPLAIN ANALYZE SELECT id FROM ca LIMIT 5"),
+        "ok"
+    );
 }
 
 #[test]

@@ -67,6 +67,8 @@ pub(crate) fn classify(parsed: &ParsedSql) -> ReadRequirement {
     match parsed {
         ParsedSql::Statement(s) => classify_statement(s),
         ParsedSql::LockingSelect(_) => SelectForUpdate,
+        // Issue #2054: 実行する内側の SELECT と同じく、参照する全 relation に SELECT 権限を実行前に要求する。
+        ParsedSql::ExplainAnalyze(_) => Select,
         ParsedSql::Cursor(c) => match c {
             CursorStatement::Declare { .. } => Select,
             // FETCH／CLOSE は DECLARE の時点で確定した結果を読むだけで、再検査しない（`sql-cursor.md` §1）。

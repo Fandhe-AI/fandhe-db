@@ -2535,6 +2535,8 @@ fn execute_portal<'e, S: WireStream>(
             ParsedSql::ExplainInsert(_) => false,
             // Issue #2050: `EXPLAIN UPDATE|DELETE` も読み取りのみで commit を伴わない。
             ParsedSql::ExplainDml(_) => false,
+            // Issue #2054: `EXPLAIN ANALYZE` は SELECT だけを実行し commit を伴わない。
+            ParsedSql::ExplainAnalyze(_) => false,
             // `COPY` は上で横取り済みでここへは到達しない（書き込み扱いの見直し申し送りへの回答）。
             ParsedSql::Copy(_) => !was_active_before_execution,
             _ => !was_active_before_execution,
