@@ -43,7 +43,7 @@ spec で規範化された内部転送プロトコルの実装にすぎない。
 `engine::error_format::ErrorClass` を HTTP 応答（ステータス・本文）へ写像するのみ
 （ERR-4）。
 
-spec ポインタ一覧: TASK-184（基盤）・HTTP-1〜13・NOSQL-1〜11・ERR-4・SQL-1〜15・
+spec ポインタ一覧: TASK-184（基盤）・HTTP-1〜14・NOSQL-1〜11・ERR-4・SQL-1〜15・
 RLS-7・RLS-9・TABLE-12。
 
 ## 転送路の共通規則
@@ -163,6 +163,21 @@ JSON キー・ヘッダ（`tenant`／`tenant-id`／`tenantid` 相当。`x-` 接�
 （`--require-operation-id` の構成でも同じ）、両方ある場合は値の完全一致が必要で、不一致は `42601`
 （副作用なし）。応答にヘッダは返さず、解決した値を本文の `operation_id`（成功本文と分割実行 409 の
 `error.data.operation_id`）で返す。同じ値で内容が異なる再送の `22023` は従来どおり台帳が判定する
+
+ヘッダ値は SQL 表層の `USING OPERATION_ID '<id>'` および本文の `operation_id` と同じ台帳へ
+記録される。同一テナント・同一表で表層や指定方法（ヘッダ・本文・SQL）を跨いだ再送は、内容一致が
+`23505`（HTTP `409`）、内容違いが `22023`（HTTP `400`）になる。分割実行の中断ジョブも、
+ヘッダだけで SQL 側が開始したジョブを再開でき、その逆もできる。キーのスコープはテナント内で、
+台帳キーは（テナント・表・`operation_id`）である。テナントはサーバー側の認証結果から導出し、
+クライアントの申告は使わない。他テナントが同じ値を使っていても衝突せず、その使用有無は応答の
+ステータス・ヘッダ・本文に現れない（RLS-9）。
+
+Stripe 等の HTTP API の冪等キーとの違い: 再送時に最初の成功応答を保存・再生しない。同内容の
+再送は `23505` で、HTTP クライアントは `error.code`=`DUPLICATE_OPERATION_ID` を確認したときだけ
+「既に適用済み」として扱う（通常の `UNIQUE_VIOLATION` も同じ `23505`／`409` のため、`23505` や
+`409` だけで適用済みと判断しない。`UNIQUE_VIOLATION` は未適用のまま失敗した可能性があり、適用済み扱いにしない）。保存期限（TTL）は無く、
+台帳エントリは自動では削除されない（比較は `docs/design/idempotent-resend-comparison.md`）。
+ヘッダ付き要求の例は「curl 例」節を参照。
 
 `op` は完全一致のみで判定する（大文字小文字の読み替え・前後空白のトリムは
 しない）。`"SEARCH"`・`" search"`・`"select"`・`"explain"`・`"begin"` 等はいずれも
@@ -1436,7 +1451,14 @@ curl -s -X POST http://127.0.0.1:5432/v1/query \
   -H 'Content-Type: application/json' \
   -d '{"op":"search","table":"docs","vector":[0.1,0.2,0.3,0.4],"limit":10}'
 
-# 3) セッション終了
+# 3) 書き込み（Idempotency-Key ヘッダで operation_id を渡す。再送は 23505）
+curl -s -X POST http://127.0.0.1:5432/v1/query \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: op-1' \
+  -d '{"op":"delete","table":"docs","where":{"id":1}}'
+
+# 4) セッション終了
 curl -s -X POST http://127.0.0.1:5432/v1/session/close \
   -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' -d '{}'
@@ -1468,6 +1490,9 @@ curl -s -X POST http://127.0.0.1:5432/v1/session/close \
   Issue #1198・NOSQL-15）
 - `explain`（`vector` 指定 `search`・`scan`・`aggregate` への対象拡大。
   Issue #948・NOSQL-16・SQL-27）: `nosql16_explain_targets.rs`
+- `Idempotency-Key`（HTTP-14）: `http14_idempotency_key.rs`（Issue #2064）・
+  `http14_idempotency_key_cross_surface.rs`（SQL との相互再送・テナント境界。
+  Issue #2065）・`idempotency_key.rs`（単体）
 - `insert`: `nosql6_insert.rs`・`nosql6_tenant_row_id_scope.rs`・
   `http_insert_response_boundary.rs`・`wire_insert_operation_id.rs`
 - `filter`: `nosql7_filter_mapping.rs`
