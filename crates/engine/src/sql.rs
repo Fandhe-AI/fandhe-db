@@ -191,6 +191,7 @@ pub(crate) mod embedded_unit;
 pub(crate) mod function_scan;
 #[cfg(test)]
 mod identity_column_tests;
+pub mod insert_explain;
 pub(crate) mod insert_select;
 pub(crate) mod int8vec_knn;
 pub(crate) mod interval_arith;

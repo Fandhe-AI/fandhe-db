@@ -512,3 +512,26 @@ Issue #2048 で `42601` にしていた形のうち、次の 3 つを段の木�
 - **対象外（後続）**: 投影位置・式に埋め込んだ部分クエリ、集計の `FILTER`／`HAVING` の部分クエリ、`$n` を含む
   EXPLAIN 前置の WITH・派生表・部分クエリは引き続き `42601`（fail-closed）。CTE・派生表の主クエリの部分クエリは
   実行側が拒否している間は EXPLAIN も同じコードで拒否する。
+
+## 追記（Issue #2051・SQL-75 (2)(3)(5)(6)）: INSERT の段
+
+- **経路**: `EXPLAIN INSERT ...` は `ParsedSql::ExplainInsert`（`#[non_exhaustive]` な `ParsedSql` への variant
+  追加で、クレート外に対して非破壊）。`Statement::Explain` には載せない。書き込みゲートが通常の `INSERT` と
+  同じビット（`INSERT`、`ON CONFLICT DO UPDATE` の `UPDATE`、`RETURNING` の `SELECT`、`INSERT ... SELECT` の元表の
+  `SELECT`）を課す必要があるため。解析は先頭の `EXPLAIN` を外した文を通常の INSERT と同じ解析に再帰で通す
+  （第 2 のパーサーを持たない）ので、構文・名前解決・台帳必須構成（`23502`）の `wire_code` と判定順が一致する。
+- **実行しない**: 実行腕は `execute_insert_form` 等と同じ束縛（行数上限・スキーマ・`RETURNING`・索引由来の衝突制約・
+  `bind_insert_form`・バッチ上限、`INSERT ... SELECT` は `bind_insert_select`）までで止まる。行の書き込み・
+  writer・台帳（`operation_id` を登録しない）・採番（`SequenceScope` を張らない）・トリガー・埋め込み I/O は起こさない。
+  明示トランザクション内でも writer を取らず、`BEGIN READ ONLY` でも実行できる。
+- **語彙**: 根は `insert`。属性は `insert_source`（`values`／`default_values`／`select`）・`insert_method`（`row`／
+  `row_batch`／`file`／`upsert`。VALUES 系のみ）・`on_conflict`（`none`／`do_nothing`／`do_update`）・
+  `conflict_target`（`row_id`／`unique`／`omitted`）・`conflict_filter`（`do_update` のみ）・`returning`・
+  `operation_id`（有無は `present`／`none`）。子は VALUES 系が `result`（`source: values`）、`INSERT ... SELECT` が
+  属性なしの `select` 段で、その下に内側の計画（`EXPLAIN SELECT` と同じ実行本体の出力）を置く。FROM なし SELECT は
+  `result`（`source: constant`）。行数・件数・表名・列名・制約名・シーケンス名・リテラルは出さない。
+- **暗黙 LIMIT**: `INSERT ... SELECT` で内側の `LIMIT` を省略したときの暗黙 `LIMIT`（Issue #2615）は、内側の
+  再検証のために付けるので、内側の計画では `limit: present` と表示される（値は出ない）。
+- **対象外（後続）**: 自動更新可能なビューへの INSERT（`0A000`）、一時表（既存の振り分けで `0A000`）、`$n` を含む
+  `EXPLAIN INSERT`（`42601`）、内側が評価後射影形ビューの `INSERT ... SELECT`（`42601`）、データ変更 CTE、
+  `EXPLAIN ANALYZE`／オプション。セッションの無い入口（`execute_sql`）は従来どおり `42601`。

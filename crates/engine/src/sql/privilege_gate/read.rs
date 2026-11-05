@@ -95,6 +95,8 @@ pub(crate) fn classify(parsed: &ParsedSql) -> ReadRequirement {
         | ParsedSql::UpdateFrom(_)
         | ParsedSql::DeleteUsing(_)
         | ParsedSql::Partitioned(_)
+        // Issue #2051: INSERT 権限と元表の SELECT は書き込みゲート（`write.rs`）が判定する。
+        | ParsedSql::ExplainInsert(_)
         | ParsedSql::Copy(_)
         | ParsedSql::Lock(_) => NotApplicable,
         // トランザクション・セッション制御・DDL・関数呼び出し。DDL は運用者権限のゲートを通った主体だけが

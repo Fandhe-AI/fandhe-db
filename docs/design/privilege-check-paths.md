@@ -287,3 +287,9 @@ SQL 表層・HTTP 表層の主体付き入口だけがゲートを通る。
 | 不安全な設計 | 既定拒否（fail-closed）を明記し、ゲート対象外は理由付きで列挙する |
 | インジェクション | NoSQL の DDL はトークン列で渡す現行設計をチェックリストに含める |
 | 秘密情報 | 実ユーザー名・資格情報・PHC 文字列の例を載せない。spec 本文を転記しない |
+
+## EXPLAIN INSERT（Issue #2051）
+
+`ParsedSql::ExplainInsert` は書き込みゲート（`privilege_gate::write::classify_write`）が通常の `INSERT`／
+`INSERT ... SELECT` と同じビットで判定する（実行しなくても権限の無い主体に計画を見せない）。読み取りゲートは
+`NotApplicable`（元表の `SELECT` は書き込みゲートの参照走査が課す）。

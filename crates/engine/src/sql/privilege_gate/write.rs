@@ -141,6 +141,15 @@ pub(crate) fn partitioned_delete_bits(d: &crate::sql::allowlist::ValidatedPredic
     delete_form_bits(&DeleteStatement::Predicate(d.clone())).1
 }
 
+/// `INSERT ... SELECT` の対象表に課すビット（`INSERT`、`ON CONFLICT` の分、`RETURNING` の `SELECT`）。
+fn insert_select_bits(v: &crate::sql::allowlist::ValidatedInsertSelect) -> u16 {
+    let mut b = PRIV_INSERT | on_conflict_bits(v.on_conflict.as_ref());
+    if v.returning.is_some() {
+        b |= PRIV_SELECT;
+    }
+    b
+}
+
 /// 検証済みの文を書き込みの要求に分類する。ワイルドカード腕を置かない網羅 `match` で、`ParsedSql` に
 /// variant が足されたときに分類の更新（書き込みか否か）をコンパイラが強制する。
 pub(crate) fn classify_write(parsed: &ParsedSql) -> WriteRequirement {
@@ -148,13 +157,17 @@ pub(crate) fn classify_write(parsed: &ParsedSql) -> WriteRequirement {
     let na = WriteRequirement::default;
     match parsed {
         ParsedSql::Insert(v) => WriteRequirement::one(&v.table_name, insert_bits(v)),
-        ParsedSql::InsertSelect(v) => {
-            let mut b = PRIV_INSERT | on_conflict_bits(v.on_conflict.as_ref());
-            if v.returning.is_some() {
-                b |= PRIV_SELECT;
+        ParsedSql::InsertSelect(v) => WriteRequirement::one(&v.table_name, insert_select_bits(v)),
+        // Issue #2051: `EXPLAIN INSERT` は通常の `INSERT` と同じビットを課す（実行しなくても、
+        // 権限の無い主体に計画を見せない）。
+        ParsedSql::ExplainInsert(t) => match &**t {
+            crate::sql::insert_explain::ExplainInsertTarget::Values(v) => {
+                WriteRequirement::one(&v.table_name, insert_bits(v))
             }
-            WriteRequirement::one(&v.table_name, b)
-        }
+            crate::sql::insert_explain::ExplainInsertTarget::Select { insert, .. } => {
+                WriteRequirement::one(insert.table_name(), insert_select_bits(insert))
+            }
+        },
         ParsedSql::Update(u) => {
             let (t, b) = update_form_bits(u);
             WriteRequirement::one(&t, b)
