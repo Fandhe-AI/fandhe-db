@@ -61,8 +61,11 @@ fandhe の行レベル分離を PostgreSQL・Elasticsearch・Qdrant と同じ軸
 - 同等の点: テナント内で隠れた行の存在が制約違反から推知されうること、PERMISSIVE／RESTRICTIVE の合成・既定拒否・
   `row_security = off` の拒否、所有者除外と `FORCE`（根拠: `table_rls/rls13_policy_constraint_scope.rs`）
 - 未提供の点: 列レベル制御（#2081）、ロール別のポリシー条件（`TO <ロール>`）、
-  利用者が付与できる `BYPASSRLS` 属性（[role-privilege-model.md](role-privilege-model.md) の「#2278 段 2」）。
-  いずれも fail-closed（`0A000`／`42501`）で拒否し、テナント境界は緩めない
+  利用者が付与できる `BYPASSRLS` 属性（[role-privilege-model.md](role-privilege-model.md) の「#2278 段 2」）
+  - ロール別のポリシー条件と `BYPASSRLS` 属性の付与は fail-closed（`0A000`／`42501`）で拒否し、
+    テナント境界は緩めない
+  - 列レベル制御は拒否契約ではない。列単位 `GRANT` は受理されカタログに保存されるが、
+    参照時の列集合の判定が未実装（#2081）で、保存された列権限はまだ適用されない
 - 運用上の差: 管理者バイパスが無いため、全テナントを横断するバックアップ・調査を 1 接続で行う手段は提供しない
   （[運用](fixed-tenant-boundary.md)）
 
