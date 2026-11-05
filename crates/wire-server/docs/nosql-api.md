@@ -158,7 +158,7 @@ JSON キー・ヘッダ（`tenant`／`tenant-id`／`tenantid` 相当。`x-` 接�
    `insert`／`update`／`delete` 以外の op に付いていれば `42601`。engine 呼び出し前に返る）
 8. op 別の意味検証・実行（`search` は `explain: true` を通常実行より先に判定）
 
-`Idempotency-Key` ヘッダは書き込み op（`insert`／`update`／`delete`。単一行形・述語形・分割実行を
+`Idempotency-Key` ヘッダは書き込み op（`insert`／`upsert`／`update`／`delete`。単一行形・述語形・分割実行を
 含む）の `operation_id` の供給元になる。本文の `operation_id` とヘッダのどちらか一方の指定で足り
 （`--require-operation-id` の構成でも同じ）、両方ある場合は値の完全一致が必要で、不一致は `42601`
 （副作用なし）。応答にヘッダは返さず、解決した値を本文の `operation_id`（成功本文と分割実行 409 の
@@ -552,15 +552,18 @@ OFFSET ...` と同じ対象名解決・実行器を共有。第 2 の実行器�
 ### `upsert`
 
 `insert` に衝突時の動作（`on_conflict`）を加えた op（NOSQL-1・NOSQL-21。Issue #2086）。
-**現状はスキーマ検証までで、実行は未結線**。スキーマを通過した要求は、engine 接続の有無に
-かかわらず `0A000`（HTTP `501`、固定文言 `upsert execution not yet available`）を返す
-（実行は Issue #2087 で結線予定。応答・エラーの詳細は Issue #2088 で追記する）。
+**実行は結線済み**（Issue #2087）。SQL 表層の `INSERT ... ON CONFLICT` と同じ束縛関数・実行器を通り、
+成功時の応答は `{"upserted": n}`（`n` は SQL の `INSERT 0 n` と同じ値＝挿入件数＋更新件数。`operation_id` を
+指定したときは `"operation_id"` キーが付く）。`Idempotency-Key` ヘッダも `insert` と同じく受け付ける。
+応答例・エラー一覧・RLS の本格記述は Issue #2088 で追記する。現状の解釈: `rows` のキー集合は全行で一致すること、
+`do` は `"nothing"`／`"update"` のみ、`set` は `EXCLUDED` で更新する列名（`"update"` で省略時は rows のキーから
+`on_conflict.columns` と `id` を除いた列）。
 
 | キー | 必須 | 型 | 備考 |
 | --- | --- | --- | --- |
 | `op` | ○ | string | `"upsert"` |
 | `table` | ○ | string | |
-| `rows` | ○ | object[] | `insert` と同じ形（列の検証は実行側の担当） |
+| `rows` | ○ | object[] | `insert` と同じ形（全行のキー集合は一致すること） |
 | `on_conflict` | ○ | object | `columns`（○・string[]）・`do`（○・string）・`set`（△・string[]）の 3 キーのみ。未知キー（制約名・式・`WHERE` 相当を含む）は `42601` |
 | `operation_id` | △ | string | `insert` と同じ扱い（欠落・`null` 可） |
 
@@ -1363,7 +1366,7 @@ Date: <IMF-fixdate>
 | `XX000` | `INTERNAL_ERROR` | 500 | Internal Server Error | 内部エラー（詳細は非開示。`message` は固定文言へ差し替え） |
 | `0A000` | `FEATURE_NOT_SUPPORTED` | 501 | Not Implemented | 語彙外の `op` 指定 |
 | `53300` | `CONNECTION_LIMIT_EXCEEDED` | 503 | Service Unavailable | 接続数上限（64）超過、同時有効セッション数上限（256）超過 |
-| `55P03` | `LOCK_NOT_AVAILABLE` | 503 | Service Unavailable | SQL 表層の明示トランザクション（SQL-31・TASK-221）が単一ライタを保持している間に、書き込み op（`insert`／`update`／`delete`）が書き込みゲートの待機上限を超えた |
+| `55P03` | `LOCK_NOT_AVAILABLE` | 503 | Service Unavailable | SQL 表層の明示トランザクション（SQL-31・TASK-221）が単一ライタを保持している間に、書き込み op（`insert`／`upsert`／`update`／`delete`）が書き込みゲートの待機上限を超えた |
 | `57014` | `QUERY_CANCELED` | 503 | Service Unavailable | 実行中の文を協調的に打ち切った（クライアント切断の検出。Issue #1798）。SQL 表層の接続スレッドが起点で、現状 NoSQL の `op` からは到達しない |
 
 到達不能な 25 分類（`40001`・`25006`・`20000`・`2F005`・`P0003`・`21000`・`34000`・`P0002`（`ROW_NOT_FOUND`・`NO_DATA_FOUND`）・`42701`・`42P07`・`2BP01`・

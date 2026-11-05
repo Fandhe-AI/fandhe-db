@@ -496,6 +496,26 @@ impl<'a> Validated<'a> {
             _ => Err(SchemaError::TypeMismatch { key }),
         }
     }
+
+    /// 固定フィールド集合を持つ入れ子オブジェクト（`FieldType::Object(_)`）を、そのサブスキーマに
+    /// 紐づいた [`Validated`] として読む（`upsert` の `on_conflict`。Issue #2087）。
+    /// `AnyObject` は固定スキーマを持たないため `TypeMismatch`。他アクセサと同じく spec 型を再検査する。
+    pub fn required_nested(&self, key: &'static str) -> Result<Validated<'a>, SchemaError> {
+        let Some(spec) = self.field_spec(key) else {
+            return Err(SchemaError::UnknownKey);
+        };
+        let FieldType::Object(sub) = spec.ty else {
+            return Err(SchemaError::TypeMismatch { key });
+        };
+        match self.map.get(key) {
+            None => Err(SchemaError::MissingRequired { key }),
+            Some(JsonValue::Object(m)) => Ok(Validated {
+                map: m,
+                schema: sub,
+            }),
+            _ => Err(SchemaError::TypeMismatch { key }),
+        }
+    }
 }
 
 /// `hybrid` フィールドのサブスキーマ（`search` op）。
@@ -903,8 +923,8 @@ pub static UPSERT_ON_CONFLICT_SCHEMA: ObjectSchema = ObjectSchema {
 
 /// `upsert` op のトップレベルスキーマ（NOSQL-1・NOSQL-21、Issue #2086。親 #2085）。
 /// `rows[*]` の列検証は `insert` と同じく後段の責務で、`mode`／`chunk`／
-/// `returning` は宣言しない（未知キーとして `42601`）。実行は Issue #2087 の担当で、
-/// それまで [`super::gate::handle`] は本スキーマ通過後に固定文言の `0A000` を返す。
+/// `returning` は宣言しない（未知キーとして `42601`）。実行は [`super::upsert`]
+/// （Issue #2087）が担う。
 pub static UPSERT_SCHEMA: ObjectSchema = ObjectSchema {
     name: "upsert",
     fields: &[

@@ -149,9 +149,9 @@
 //! （NoSQL `filter` は Issue #1062 で実行結線済みだが、本ファイル特有の
 //! 複数プロセス・複数言語クライアント e2e への拡張はスコープ外。パリティ・
 //! 台帳照合・RLS-9 は層 A `nosql12_update_delete.rs` の述語形節が担う）・
-//! UPSERT・複数行 `INSERT` は NoSQL 表層が公開していないためパリティが成立せず対象外
-//! （`returning` は Issue #2091 で結線済みだが、3 クライアント層 B への拡張は対象外。
-//! SQL とのバイト一致は層 A `nosql22_returning_exec.rs` が担う）。ヘッダを含む HTTP 応答全体のバイト同一性は
+//! 複数行 `INSERT` は NoSQL 表層が公開していないためパリティが成立せず対象外
+//! （UPSERT は Issue #2087 で結線し、`DML_STEPS` の `up-*` が担う。`returning` は Issue #2091 で結線済みだが、
+//! 3 クライアント層 B への拡張は対象外。SQL とのバイト一致は層 A `nosql22_returning_exec.rs` が担う）。ヘッダを含む HTTP 応答全体のバイト同一性は
 //! 層 A（`nosql12_update_delete.rs::strip_date` 比較）の担当で、本ファイルは
 //! ステータス・本文までの一致に留める。
 //!
@@ -159,7 +159,7 @@
 //!
 //! 上記 3 シナリオ（#779・#877）に加え、Phase 7（親 #944。#945〜#949・
 //! #1061〜#1063）の追加機能・insert・DDL 3 op を含む
-//! `wire_server::http::query::op::Op::ALL`（12 語彙。うち実行未結線の `upsert` は Issue #2087 まで除外）全体へ層 B 到達性を
+//! `wire_server::http::query::op::Op::ALL`（12 語彙。全 op が実行結線済み）全体へ層 B 到達性を
 //! 持たせる。範囲比較・`IN`・`OR`・`sort`・`offset`・複数列 `group_by`は
 //! `PARITY_CASES` への追加（`run_sql_nosql_parity_scenario` を再利用）、
 //! 拒否ケース（`sort`／`offset` on `search`/`aggregate`・語彙外 `op`・RLS
@@ -2368,6 +2368,48 @@ const DML_STEPS: &[DmlStep] = &[
         expect: DmlExpectation::Error("23505"),
     },
     DmlStep {
+        label: "up-new",
+        sql: "INSERT INTO docs (id, body, embedding, lang) VALUES (21, 'b21', '[0.1,0.2]', 'ja') ON CONFLICT (id) DO NOTHING USING OPERATION_ID 'dml-up1'",
+        json_body: r#"{"op":"upsert","table":"docs","rows":[{"id":21,"body":"b21","embedding":[0.1,0.2],"lang":"ja"}],"on_conflict":{"columns":["id"],"do":"nothing"},"operation_id":"dml-up1"}"#,
+        expect: DmlExpectation::Affected(1),
+    },
+    DmlStep {
+        label: "up-nothing-own",
+        sql: "INSERT INTO docs (id, body, embedding, lang) VALUES (11, 'bx', '[0.3,0.3]', 'en') ON CONFLICT (id) DO NOTHING USING OPERATION_ID 'dml-up2'",
+        json_body: r#"{"op":"upsert","table":"docs","rows":[{"id":11,"body":"bx","embedding":[0.3,0.3],"lang":"en"}],"on_conflict":{"columns":["id"],"do":"nothing"},"operation_id":"dml-up2"}"#,
+        expect: DmlExpectation::Affected(0),
+    },
+    DmlStep {
+        label: "up-update-own",
+        sql: "INSERT INTO docs (id, body, embedding, lang) VALUES (11, 'bx', '[0.3,0.3]', 'fr') ON CONFLICT (id) DO UPDATE SET body = EXCLUDED.body, embedding = EXCLUDED.embedding, lang = EXCLUDED.lang USING OPERATION_ID 'dml-up3'",
+        json_body: r#"{"op":"upsert","table":"docs","rows":[{"id":11,"body":"bx","embedding":[0.3,0.3],"lang":"fr"}],"on_conflict":{"columns":["id"],"do":"update"},"operation_id":"dml-up3"}"#,
+        expect: DmlExpectation::Affected(1),
+    },
+    DmlStep {
+        label: "up-mixed",
+        sql: "INSERT INTO docs (id, body, embedding, lang) VALUES (11, 'by', '[0.4,0.4]', 'de'), (22, 'b22', '[0.5,0.5]', 'de') ON CONFLICT (id) DO UPDATE SET body = EXCLUDED.body, embedding = EXCLUDED.embedding, lang = EXCLUDED.lang USING OPERATION_ID 'dml-up4'",
+        json_body: r#"{"op":"upsert","table":"docs","rows":[{"id":11,"body":"by","embedding":[0.4,0.4],"lang":"de"},{"id":22,"body":"b22","embedding":[0.5,0.5],"lang":"de"}],"on_conflict":{"columns":["id"],"do":"update"},"operation_id":"dml-up4"}"#,
+        expect: DmlExpectation::Affected(2),
+    },
+    DmlStep {
+        label: "up-foreign-id",
+        sql: "INSERT INTO docs (id, body, embedding, lang) VALUES (2, 'b2', '[0.6,0.6]', 'es') ON CONFLICT (id) DO NOTHING USING OPERATION_ID 'dml-up5'",
+        json_body: r#"{"op":"upsert","table":"docs","rows":[{"id":2,"body":"b2","embedding":[0.6,0.6],"lang":"es"}],"on_conflict":{"columns":["id"],"do":"nothing"},"operation_id":"dml-up5"}"#,
+        expect: DmlExpectation::Affected(1),
+    },
+    DmlStep {
+        label: "up-resend-same",
+        sql: "INSERT INTO docs (id, body, embedding, lang) VALUES (21, 'b21', '[0.1,0.2]', 'ja') ON CONFLICT (id) DO NOTHING USING OPERATION_ID 'dml-up1'",
+        json_body: r#"{"op":"upsert","table":"docs","rows":[{"id":21,"body":"b21","embedding":[0.1,0.2],"lang":"ja"}],"on_conflict":{"columns":["id"],"do":"nothing"},"operation_id":"dml-up1"}"#,
+        expect: DmlExpectation::Error("23505"),
+    },
+    DmlStep {
+        label: "up-resend-diff",
+        sql: "INSERT INTO docs (id, body, embedding, lang) VALUES (21, 'b21', '[0.1,0.2]', 'it') ON CONFLICT (id) DO NOTHING USING OPERATION_ID 'dml-up1'",
+        json_body: r#"{"op":"upsert","table":"docs","rows":[{"id":21,"body":"b21","embedding":[0.1,0.2],"lang":"it"}],"on_conflict":{"columns":["id"],"do":"nothing"},"operation_id":"dml-up1"}"#,
+        expect: DmlExpectation::Error("22023"),
+    },
+    DmlStep {
         // `operation_id` 省略。SQL 側は `USING OPERATION_ID` 句そのものを
         // 省く（単一行 `UPDATE` 構文は本節句を必須とするため許可リストが
         // `42601` を返す想定にはならず、`bind_update` の必須化ガードで
@@ -2408,16 +2450,19 @@ fn affected_count_from_tag(tag: &str) -> u64 {
 }
 
 /// NoSQL 応答本文から `updated`／`deleted`／`inserted`（Issue #950・insert
-/// パリティで追加）の影響行数を取り出す。
+/// パリティで追加）／`upserted`（Issue #2087）の影響行数を取り出す。
 fn affected_count_from_nosql_body(body: &str) -> u64 {
     let obj = json_object(body);
     match obj
         .get("updated")
         .or_else(|| obj.get("deleted"))
         .or_else(|| obj.get("inserted"))
+        .or_else(|| obj.get("upserted"))
     {
         Some(JsonValue::Number(JsonNumber::PosInt(n))) => *n,
-        other => panic!("expected updated/deleted/inserted field, got {other:?} (body={body:?})"),
+        other => panic!(
+            "expected updated/deleted/inserted/upserted field, got {other:?} (body={body:?})"
+        ),
     }
 }
 
@@ -2674,11 +2719,16 @@ fn run_sql_nosql_dml_parity_scenario(client: HttpClient) {
 
     // 最終状態の一致（両表層が同じ誤りを返すケースの排除も兼ねる固定
     // オラクル）。alice 視点: id=1 は d-own で削除済み、id=11 は
-    // u-own-private で 'en' のまま、id=2/3 は他テナント所有のため不変。
+    // up-update-own／up-mixed（Issue #2087）で 'de'、id=21・22 は upsert で新規挿入、
+    // id=2（tenant-b 所有の 'en'）・3 は他テナント所有のため不変。id=2 は up-foreign-id で
+    // alice 自身の行（'es'）も作られ、他テナントの行と並存する（RLS-9）。
     let expected_alice: Vec<(String, String)> = vec![
         ("2".into(), "en".into()),
+        ("2".into(), "es".into()),
         ("3".into(), "ja".into()),
-        ("11".into(), "en".into()),
+        ("11".into(), "de".into()),
+        ("21".into(), "ja".into()),
+        ("22".into(), "de".into()),
     ];
     let mut sql_final_alice_sorted = sql_final_alice.clone();
     sql_final_alice_sorted.sort();
@@ -3841,8 +3891,8 @@ fn op_name_from_json_body(json_body: &str) -> &str {
 /// のみ、`PHASE7_WRITE_CASES` は [`Phase7CaseExpectation::Success`] の
 /// みを収集対象にし、`DmlExpectation::Error`／
 /// [`Phase7CaseExpectation::RejectionOnly`] は除外する。
-/// 注: 実行未結線の op（`Op::execution_wired` が偽。現状 `upsert`・Issue #2086）は
-/// 網羅対象から除外する。結線する Issue #2087 で成功ケースを追加し述語を反転する。
+/// 注: 実行未結線の op（`Op::execution_wired` が偽）は網羅対象から除外する。
+/// 現状は全 op が結線済み（`upsert` は Issue #2087 で結線し、`DML_STEPS` に成功ケースを持つ）。
 #[test]
 fn parity_matrix_covers_every_nosql_op() {
     use std::collections::BTreeSet;
@@ -3868,7 +3918,7 @@ fn parity_matrix_covers_every_nosql_op() {
         }
     }
 
-    // 実行未結線の op（`upsert`。Issue #2086。結線は Issue #2087）は成功ケースを
+    // 実行未結線の op（現状はなし。`upsert` は Issue #2087 で結線済み）は成功ケースを
     // 作れないため網羅対象から外す。逆に未結線 op が成功ケースへ現れたら、
     // `Op::execution_wired` の反転漏れとして失敗させる。
     for op in Op::ALL {
