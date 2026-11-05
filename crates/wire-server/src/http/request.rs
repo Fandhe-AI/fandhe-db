@@ -6,7 +6,8 @@
 //! ハンドラ）が担い、[`consumed`](RequestLineParse::Complete) が指す
 //! オフセット以降を後続のヘッダパーサ（Issue #741）へ渡す想定である。
 //!
-//! 受理するのは `POST` メソッド・`HTTP/1.1` のみ（閉じた語彙）で、それ以外
+//! 受理するのは `POST` メソッドと `GET /v1/openapi.json`（Issue #2244。GET は
+//! パスと一体で判定する唯一の例外）・`HTTP/1.1` のみ（閉じた語彙）で、それ以外
 //! （非対応メソッド・非対応バージョン・CRLF 以外の行終端・4 KiB 超過・トークン
 //! 数不正等）はすべて [`FrameError::Malformed`] として拒否する（fail-closed）。
 //! `FrameError` は `crate::framing` が pg wire 経路向けに定義した型をそのまま
@@ -29,12 +30,18 @@ use crate::framing::FrameError;
 /// 等と同様、untrusted なピアに許すアロケーション量を構造的に絞る）。
 pub const MAX_REQUEST_LINE_LEN: usize = 4 * 1024;
 
-/// 受理するメソッドの閉じた語彙（HTTP-2）。`POST` 以外は
-/// [`parse_request_line`] の時点で `Malformed` として拒否するため、他の
-/// バリアントは持たない。
+/// OpenAPI 文書の配信ターゲット（NOSQL-20、Issue #2244）。`GET` はこのターゲットに
+/// バイト厳密一致する場合だけ受理する（パス判定の単一情報源。ルータも参照する）。
+pub const OPENAPI_TARGET: &str = "/v1/openapi.json";
+
+/// 受理するメソッドの閉じた語彙（HTTP-2）。`POST` と、[`OPENAPI_TARGET`] に
+/// 限った `GET` だけを受理する。それ以外は [`parse_request_line`] の時点で
+/// `Malformed` として拒否するため、他のバリアントは持たない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Method {
     Post,
+    /// 本文を持たない取得要求。`/v1/openapi.json` 以外のターゲットでは構築されない。
+    Get,
 }
 
 /// 受理する HTTP バージョンの閉じた語彙（HTTP-2）。`HTTP/1.1` 以外
@@ -110,8 +117,8 @@ pub fn parse_request_line(input: &[u8]) -> Result<RequestLineParse<'_>, FrameErr
         return Err(FrameError::Malformed("too many request line tokens"));
     }
 
-    let method = parse_method(method_bytes)?;
     let target = validate_target(target_bytes)?;
+    let method = parse_method(method_bytes, target)?;
     let version = parse_version(version_bytes)?;
 
     Ok(RequestLineParse::Complete {
@@ -124,11 +131,15 @@ pub fn parse_request_line(input: &[u8]) -> Result<RequestLineParse<'_>, FrameErr
     })
 }
 
-/// メソッドトークンが `POST` と完全一致するかを検証する（大文字小文字を
-/// 区別。HTTP-2）。
-fn parse_method(bytes: &[u8]) -> Result<Method, FrameError> {
+/// メソッドトークンを検証する（大文字小文字を区別。HTTP-2）。`POST` は常に受理し、
+/// `GET` は [`OPENAPI_TARGET`] とバイト厳密一致のときだけ受理する。これにより
+/// 「非 POST は要求行パーサで拒否されルータへ到達しない」契約を、当該パス以外の
+/// すべてで維持する（GET 用の緩和が及ぶ範囲を構造的に 1 パスへ限定する）。
+fn parse_method(bytes: &[u8], target: &str) -> Result<Method, FrameError> {
     if bytes == b"POST" {
         Ok(Method::Post)
+    } else if bytes == b"GET" && target == OPENAPI_TARGET {
+        Ok(Method::Get)
     } else {
         Err(FrameError::Malformed("unsupported request method"))
     }
@@ -293,6 +304,34 @@ mod tests {
     fn rejects_non_post_method() {
         let err = parse_request_line(b"GET /v1/query HTTP/1.1\r\n").unwrap_err();
         assert_protocol_violation(&err);
+    }
+
+    #[test]
+    fn accepts_get_only_for_exact_openapi_target() {
+        let input = b"GET /v1/openapi.json HTTP/1.1\r\n";
+        match parse_request_line(input).expect("parse should succeed") {
+            RequestLineParse::Complete { line, .. } => {
+                assert_eq!(line.method, Method::Get);
+                assert_eq!(line.target, OPENAPI_TARGET);
+            }
+            other => panic!("expected Complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_get_and_other_methods_for_non_openapi_targets() {
+        for raw in [
+            &b"GET / HTTP/1.1\r\n"[..],
+            b"GET /v1/openapi.json?x=1 HTTP/1.1\r\n",
+            b"GET /v1/openapi.json/ HTTP/1.1\r\n",
+            b"GET /V1/OPENAPI.JSON HTTP/1.1\r\n",
+            b"get /v1/openapi.json HTTP/1.1\r\n",
+            b"HEAD /v1/openapi.json HTTP/1.1\r\n",
+            b"PUT /v1/openapi.json HTTP/1.1\r\n",
+        ] {
+            let err = parse_request_line(raw).unwrap_err();
+            assert_protocol_violation(&err);
+        }
     }
 
     #[test]

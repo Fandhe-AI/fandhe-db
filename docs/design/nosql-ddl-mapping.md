@@ -106,8 +106,9 @@ SQL と NoSQL の同一宣言が同一のカタログ表現になることは、
 
 ## 未実装形（fail-closed。成功を偽装しない）
 
-- `create_index`／`drop_index`／`create_view`／`drop_view`: NOSQL-13 の対象外の
-  まま語彙外（`0A000`）に据え置く。
+- `create_view`／`drop_view`: NOSQL-13 の対象外のまま語彙外（`0A000`）に据え置く。
+- `create_index`／`drop_index`: op 形は [nosql-index-ddl-mapping.md](nosql-index-ddl-mapping.md)
+  で確定（Issue #2107）。結線は Issue #2108 で、それまでは語彙外（`0A000`）。
 
 ## CHECK 制約（Issue #1199・NOSQL-13・TABLE-16・SQL-23）
 
@@ -174,4 +175,5 @@ permission_denial_is_byte_identical_regardless_of_table_existence` で固定）�
   SQL 表層と同じ入口へ結線済み）。
 - `alter_table` での CHECK 追加・削除、算術式を含む CHECK 述語、列制約形の
   既定名、pk/unique/fk の制約名指定の NoSQL 表現。
-- `create_index`／`drop_index`／`create_view`／`drop_view` の NoSQL 対応。
+- `create_view`／`drop_view` の NoSQL 対応。`create_index`／`drop_index` は op 形を
+  [nosql-index-ddl-mapping.md](nosql-index-ddl-mapping.md) で確定済み（結線は Issue #2108）。
