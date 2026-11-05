@@ -15688,6 +15688,38 @@ impl EngineCore {
         self.run_scan_plan(&read_txn, ctx, &schema, &bound)
     }
 
+    /// [`Self::execute_bound_scan_in_session`] のキーセット版（Issue #2093・NOSQL-23・SQL-25）。
+    /// 権限検査・スナップショット・表名照合・取得上限の再検査は同一で、実行本体だけが
+    /// `sql::scan::execute_scan_page`（`limit + 1` 件目の存在で次位置を返す）になる。`bind` は
+    /// `BoundScan::with_after` を呼んだ計画を返す。キーセットでない計画では `next` は常に `None`。
+    /// 呼び出し元は wire-server の NoSQL 表層（Issue #2094）。
+    pub fn execute_bound_scan_page_in_session<F>(
+        &self,
+        ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
+        table: &str,
+        bind: F,
+    ) -> Result<crate::sql::keyset::ScanPage, crate::sql::allowlist::SqlSurfaceError>
+    where
+        F: FnOnce(
+            &crate::catalog::TableSchema,
+            &crate::sql::udf_call::UdfRegistry,
+        )
+            -> Result<crate::sql::parser::BoundScan, crate::sql::allowlist::SqlSurfaceError>,
+    {
+        self.require_table_select_privilege(ctx, session, table)?;
+        let _function_acl_scope = self.function_acl_scope(ctx, session)?;
+        let (read_txn, schema) = self.read_txn_with_schema(table)?;
+        let bound = bind(&schema, session.udfs())?;
+        if bound.table() != table {
+            return Err(crate::sql::allowlist::SqlSurfaceError::invalid_input(
+                "bound scan plan targets a different table than requested",
+            ));
+        }
+        self.check_bound_scan_limit(&bound)?;
+        crate::sql::scan::execute_scan_page(&read_txn, ctx, &schema, &bound)
+    }
+
     /// 束縛済み集計計画（[`crate::sql::parser::BoundAggregate`]。`GROUP BY`
     /// の有無を問わない）を単一スナップショット上で実行する（TASK-186・
     /// NOSQL-4・NOSQL-5。Issue #728）。契約・設計判断は

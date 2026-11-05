@@ -18,6 +18,7 @@ mod sql24_numeric_literal_compare;
 mod sql24_string_literal_remaining_forms;
 mod sql25_aggregate_order_by_scalar_keys;
 mod sql25_distinct;
+mod sql25_keyset;
 mod sql25_multi_group_by;
 mod sql25_offset;
 mod sql25_scalar_order_by;
