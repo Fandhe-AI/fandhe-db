@@ -537,12 +537,31 @@ pub fn encode(result: &QueryResult) -> Result<String, ResponseEncodeError> {
             .saturating_mul(result.columns.len().saturating_mul(8).max(8));
     let mut out = String::with_capacity(capacity_hint);
 
-    out.push_str("{\"columns\":[");
+    out.push('{');
+    write_columns_and_rows_into(&mut out, result)?;
+    out.push_str(",\"row_count\":");
+    let _ = write!(out, "{}", result.rows.len());
+    out.push('}');
+
+    Ok(out)
+}
+
+/// `"columns":[...],"rows":[...]` の 2 キーを `out` へ書く（波括弧と `row_count` は含めない）。
+///
+/// [`encode`] と、`insert`／`update`／`delete` の `returning` 付き成功本文
+/// （Issue #2090・NOSQL-22。各モジュールの `encode_success_body_with_returning`）が共有する
+/// 単一の写像実装で、セル値・型名の写像は [`write_cell`]・[`write_column`] に一本化する
+/// （2 つ目の実装を作らない）。非有限の `Float` 等は `Err` で fail-closed。
+pub fn write_columns_and_rows_into(
+    out: &mut String,
+    result: &QueryResult,
+) -> Result<(), ResponseEncodeError> {
+    out.push_str("\"columns\":[");
     for (i, meta) in result.columns.iter().enumerate() {
         if i > 0 {
             out.push(',');
         }
-        write_column(&mut out, meta);
+        write_column(out, meta);
     }
     out.push_str("],\"rows\":[");
     for (i, row) in result.rows.iter().enumerate() {
@@ -554,15 +573,12 @@ pub fn encode(result: &QueryResult) -> Result<String, ResponseEncodeError> {
             if j > 0 {
                 out.push(',');
             }
-            write_cell(&mut out, cell)?;
+            write_cell(out, cell)?;
         }
         out.push(']');
     }
-    out.push_str("],\"row_count\":");
-    let _ = write!(out, "{}", result.rows.len());
-    out.push('}');
-
-    Ok(out)
+    out.push(']');
+    Ok(())
 }
 
 /// `explain: true` の `search` 要求が返す `EXPLAIN` 応答本文

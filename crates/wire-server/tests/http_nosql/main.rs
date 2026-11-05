@@ -39,6 +39,7 @@ mod nosql16_multi_group_by;
 mod nosql17_typed_json_parity;
 mod nosql1_endpoint_routing;
 mod nosql1_op_vocabulary;
+mod nosql22_returning_schema;
 mod nosql2_search;
 mod nosql2_search_binding;
 mod nosql2_search_metric;
