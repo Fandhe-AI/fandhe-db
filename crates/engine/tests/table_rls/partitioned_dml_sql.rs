@@ -566,6 +566,61 @@ fn interrupted_record_limit_blocks_new_jobs_but_not_resumes() {
     );
 }
 
+// --- 1 回の実行の時間上限（Issue #2072。SQL-77 (3) のポインタ） ---------------------------
+
+#[test]
+fn run_time_limit_stops_every_run_with_vd001_and_resends_finish_each_row_once() {
+    let path = unique_db_path("pdml-sql-run-time");
+    let _g = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    // 間隔 1 ms・上限 1 ms: 先読み（経過 + 間隔 >= 上限）により、実時間によらず毎回 1 チャンクで
+    // 止まる。走査予算 1 なので 1 回の実行は 1 行しか進めない。
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_partitioned_dml_limits(PartitionedDmlLimits {
+            scan_budget_rows: std::num::NonZeroUsize::MIN,
+            chunk_interval: std::time::Duration::from_millis(1),
+            max_run_time: std::time::Duration::from_millis(1),
+            ..PartitionedDmlLimits::default()
+        });
+    ddl(
+        &core,
+        "CREATE TABLE docs (id BIGINT PRIMARY KEY, n BIGINT, u TEXT UNIQUE)",
+    );
+    seed(&core, "alice", &five_rows());
+    let sql = "DELETE FROM docs WHERE n > 15 USING OPERATION_ID 'rt-1' PARTITIONED";
+    // 先頭行は述語に一致しない: 変更 0 件でも VD001 になり、再開用の記録が残る。
+    let first = err(&core, "alice", sql);
+    assert_eq!(first.wire_code(), "VD001");
+    let msg = first.to_string();
+    assert!(msg.contains("committed 0 rows"), "{msg}");
+    assert!(msg.contains("(cause 54000)"), "{msg}");
+    assert!(msg.contains("run time limit"), "{msg}");
+    assert_eq!(
+        show(&core, "alice", "docs", "rt-1"),
+        vec![("interrupted".to_string(), 0)]
+    );
+    // 再送のたびに VD001 で、件数は単調に増える。最後は完了して累計が一致行数と同じになる。
+    let mut last_committed = 0i64;
+    let mut done = None;
+    for _ in 0..20 {
+        match run(&core, "alice", sql) {
+            Ok(outcome) => {
+                done = Some(affected(outcome));
+                break;
+            }
+            Err(e) => {
+                assert_eq!(e.wire_code(), "VD001", "{e}");
+                let rows = show(&core, "alice", "docs", "rt-1");
+                let n = rows.first().map(|r| r.1).expect("record");
+                assert!(n >= last_committed);
+                last_committed = n;
+            }
+        }
+    }
+    assert_eq!(done, Some(4), "each matching row is deleted exactly once");
+    assert_eq!(count(&core, "alice"), 1);
+}
+
 // --- EXPLAIN ----------------------------------------------------------------------
 
 #[test]

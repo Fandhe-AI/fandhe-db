@@ -68,6 +68,7 @@ use crate::http::session::middleware::SessionPrincipal;
 use super::dml_target::{self, bind_target_form, DmlTargetError, TargetForm};
 use super::filter;
 use super::ident::{self, InvalidIdentifier};
+use super::operation_id_source::{resolve_operation_id, OperationIdSourceError};
 use super::partitioned::{self, PartitionedRequestError};
 use super::schema::{SchemaError, Validated};
 
@@ -175,6 +176,7 @@ pub fn execute(
     core: &EngineCore,
     principal: &SessionPrincipal,
     validated: &Validated<'_>,
+    header_operation_id: Option<&OperationId>,
 ) -> Result<DeleteSuccess, DeleteError> {
     let table = validated
         .required_str("table")
@@ -186,17 +188,13 @@ pub fn execute(
     let modifier = partitioned::parse_modifier(validated)?;
     partitioned::check_target_form(modifier, &target)?;
 
-    // 欠落・`null`・空文字は「省略」として `None` に統一する（完全一致のみ。trim 等の
-    // 正規化はしない）。必須か任意かの判定は engine の `LedgerMode`（単一の真実源）が
-    // 担うため、wire 層では拒否しない（Issue #2203）。
-    let operation_id = match validated
-        .optional_str("operation_id")
-        .map_err(DeleteError::Shape)?
-        .filter(|raw| !raw.is_empty())
-    {
-        None => None,
-        Some(raw) => Some(OperationId::parse(raw)?),
-    };
+    // 本文／ヘッダの供給元解決（Issue #2064・HTTP-14）。省略の可否は engine の
+    // `LedgerMode`（単一の真実源）が担うため、wire 層では拒否しない（Issue #2203）。
+    let operation_id =
+        resolve_operation_id(validated, header_operation_id).map_err(|e| match e {
+            OperationIdSourceError::Shape(err) => DeleteError::Shape(err),
+            other => DeleteError::Engine(other.into_sql_surface_error()),
+        })?;
 
     let outcome: DeleteOutcome = match target {
         // 単一行アドレス（`where`。Issue #2201）: 疑似列 `id` を持つ表で `{"id"}` のみなら従来の
@@ -273,13 +271,18 @@ pub fn handle(
     core: &EngineCore,
     principal: &SessionPrincipal,
     validated: &Validated<'_>,
+    header_operation_id: Option<&OperationId>,
     now_wall: std::time::SystemTime,
 ) -> Vec<u8> {
-    match execute(core, principal, validated) {
+    match execute(core, principal, validated, header_operation_id) {
         Ok(success) => http_response::encode_ok(&encode_success_body(&success), now_wall),
         // `VD001`／`VD002` は 409 と `data` 付きの本文（Issue #1130）。
+        // 409 の `data.operation_id` はヘッダのみ指定でも解決済みの値を返す（Issue #2064）。
         Err(DeleteError::Engine(err)) => {
-            partitioned::encode_engine_error(&err, validated, now_wall)
+            let resolved = resolve_operation_id(validated, header_operation_id)
+                .ok()
+                .flatten();
+            partitioned::encode_engine_error(&err, resolved.as_ref(), now_wall)
         }
         Err(err) => http_response::encode_error(err.error_class(), &err.client_message(), now_wall),
     }
