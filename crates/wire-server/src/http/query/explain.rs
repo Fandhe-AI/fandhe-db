@@ -57,7 +57,9 @@ use engine::sql::parser::validate_search_limit_with;
 use super::ident::{self, InvalidIdentifier};
 use super::response::{self, ResponseEncodeError};
 use super::schema::{SchemaError, Validated};
-use super::search::{bind_search_with_limits, bind_vector_statement, BoundSearch, SearchError};
+use super::search::{
+    bind_search_with_metric_resolver, bind_vector_statement, BoundSearch, SearchError,
+};
 use crate::http::response as http_response;
 use crate::http::session::middleware::SessionPrincipal;
 
@@ -215,11 +217,15 @@ pub fn execute(
     // `explain` の有無で変わらない。
     if vector_present {
         let session = principal.session_state();
-        let result =
-            core.explain_bound_search_in_session(ctx, &session, table, |schema, udfs| {
+        let result = core.explain_bound_search_with_index_metric_in_session(
+            ctx,
+            &session,
+            table,
+            |schema, udfs, index_metric| {
                 super::gate::reject_allocated_schema(schema)?;
-                bind_vector_statement(validated, schema, udfs, &core.result_limits())
-            })?;
+                bind_vector_statement(validated, schema, udfs, &core.result_limits(), index_metric)
+            },
+        )?;
         return Ok(result);
     }
 
@@ -259,7 +265,13 @@ pub fn execute(
             // 両方欠落の判定を `bind_search` 自身のテーブル解決後へ委ねるのと
             // 同じ設計）。
             question.ok_or(ExplainError::ExplainRequiresPlan)?;
-            match bind_search_with_limits(validated, schema, udfs, &core.result_limits())? {
+            match bind_search_with_metric_resolver(
+                validated,
+                schema,
+                udfs,
+                &core.result_limits(),
+                &|| Ok(engine::sql::lexer::DistanceKind::Cosine),
+            )? {
                 BoundSearch::Plan(plan) => {
                     // Issue #945・NOSQL-14: NoSQL 表層の `plan` 検索経路も
                     // `filter` の範囲比較・IN・OR 拡張を受けるため、式述語・

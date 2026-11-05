@@ -34,6 +34,7 @@ mod composite_types;
 mod concurrent_write;
 mod core_api_stability;
 mod core_bound_plan_entry;
+mod core_bound_search_metric;
 mod core_explain_bound_entries;
 mod core_explain_plan_entry;
 mod cosine_kernel;

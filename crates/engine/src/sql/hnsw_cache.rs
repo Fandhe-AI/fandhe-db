@@ -2778,6 +2778,21 @@ pub(crate) fn opclass_for_distance_kind(
     }
 }
 
+/// 索引の opclass を距離演算子の種別へ写す（[`opclass_for_distance_kind`] の逆写像。Issue #2243）。
+/// NoSQL 表層 `search` の `metric` 省略時に、対象表の HNSW 宣言の opclass へ距離を揃えるために使う。
+pub(crate) fn distance_kind_for_opclass(
+    opclass: crate::catalog::VectorOpClass,
+) -> crate::sql::lexer::DistanceKind {
+    use crate::catalog::VectorOpClass;
+    use crate::sql::lexer::DistanceKind;
+    match opclass {
+        VectorOpClass::Cosine => DistanceKind::Cosine,
+        VectorOpClass::L2 => DistanceKind::L2,
+        VectorOpClass::Ip => DistanceKind::NegativeInnerProduct,
+        VectorOpClass::L1 => DistanceKind::L1,
+    }
+}
+
 /// 束縛済み検索文の距離演算子に対応する opclass（ゲートの問い合わせ側 metric。Issue #1977・#1979）。
 /// `bound.distance_kind()` を [`opclass_for_distance_kind`] で写すため、`<->`／`<#>`／`<+>` は
 /// 索引が Cosine のとき `MetricMismatch`（厳密全走査）になる。SQL 実行側・EXPLAIN 側が共有する。
@@ -2838,6 +2853,23 @@ mod tests {
     use crate::rls::ImplicitRlsHook;
     use crate::storage::{RowInput, Storage, Visibility};
     use crate::test_util::temp_db::{unique_db_path, CleanupGuard};
+
+    /// Issue #2243: opclass と距離種別の写像が往復で恒等になること。
+    #[test]
+    fn distance_kind_for_opclass_roundtrips_with_opclass_for_distance_kind() {
+        use crate::sql::lexer::DistanceKind;
+        for kind in [
+            DistanceKind::Cosine,
+            DistanceKind::L2,
+            DistanceKind::NegativeInnerProduct,
+            DistanceKind::L1,
+        ] {
+            assert_eq!(
+                distance_kind_for_opclass(opclass_for_distance_kind(kind)),
+                kind
+            );
+        }
+    }
 
     /// [`classify_ann_plan`] からの導出（`!is_hybrid && plan == FullVisible` 等）が
     /// `sql::exec::execute_statement_with_cache` の現行 4 式とビット一致することを

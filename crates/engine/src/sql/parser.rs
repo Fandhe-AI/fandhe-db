@@ -227,6 +227,22 @@ fn check_precision_distance_kind(
     Ok(())
 }
 
+/// 束縛済み検索文の距離種別と順位付け・モードの整合を検査する（Issue #2243・NOSQL-2・SQL-33）。
+/// 公開ビルダー [`BoundStatement::with_distance_kind`] の誤用で、`Distance` 以外の順位付けや
+/// `precision` に非 Cosine が素通りしないよう、`EngineCore` の束縛済み検索入口が呼ぶ。
+/// 文言と分類は SQL 束縛段の [`check_distance_kind`]・[`check_precision_distance_kind`] と揃える。
+pub(crate) fn check_bound_distance_kind(bound: &BoundStatement) -> Result<(), SqlSurfaceError> {
+    let kind = bound.distance_kind();
+    if kind != crate::sql::lexer::DistanceKind::Cosine
+        && !matches!(bound.ranking(), Ranking::Distance { .. })
+    {
+        return Err(SqlSurfaceError::unsupported(
+            "distance operator kind requires a distance ORDER BY",
+        ));
+    }
+    check_precision_distance_kind(bound.distance_kind(), Some(bound.mode().mode()))
+}
+
 /// 投影の距離列（SQL-33 (7)・Issue #2007）と距離 `ORDER BY` の整合を検査する。
 /// 構文段（`parse_select_shape`）が列・種別の一致を保証するが、`ValidatedStatement::new` を直接
 /// 使う呼び出し元も迂回できないよう束縛段でも守る（多層防御）。距離列があるのに順位付けが
@@ -340,10 +356,12 @@ impl BoundStatement {
         self.result_cap
     }
 
-    /// 距離演算子の種別を設定した crate 内ビルダー（Issue #1977。テスト専用）。
-    #[cfg(test)]
+    /// 距離演算子の種別を設定する公開ビルダー（Issue #1977・#2243）。wire-server の NoSQL 表層
+    /// `search` op の `metric`（NOSQL-2・SQL-33 (7)）が `BoundStatement` を直接構築する際に使う。
+    /// 非 Cosine と順位付け・モードの整合は `EngineCore` の束縛済み検索入口
+    /// （`check_bound_search`）が [`check_bound_distance_kind`] で再検査する（fail-closed）。
     #[must_use]
-    pub(crate) fn with_distance_kind(mut self, kind: crate::sql::lexer::DistanceKind) -> Self {
+    pub fn with_distance_kind(mut self, kind: crate::sql::lexer::DistanceKind) -> Self {
         self.distance_kind = kind;
         self
     }
@@ -16094,6 +16112,60 @@ mod tests {
         let err = check_distance_kind(DistanceKind::L2, &order_by).expect_err("non-distance");
         assert_eq!(err.wire_code(), "42601");
         assert!(check_distance_kind(DistanceKind::Cosine, &order_by).is_ok());
+    }
+
+    /// Issue #2243: 束縛済み検索文の距離種別整合の真理表（Distance/Hybrid × recall/precision）。
+    #[test]
+    fn check_bound_distance_kind_truth_table() {
+        use crate::sql::lexer::DistanceKind;
+        use crate::sql::mode::{resolve_mode, SearchMode};
+        let kinds = [
+            DistanceKind::Cosine,
+            DistanceKind::L2,
+            DistanceKind::NegativeInnerProduct,
+            DistanceKind::L1,
+        ];
+        for kind in kinds {
+            for hybrid in [false, true] {
+                for precision in [false, true] {
+                    let ranking = if hybrid {
+                        Ranking::Hybrid {
+                            query: vec![1.0],
+                            text_column_index: 0,
+                            query_text: "q".to_string(),
+                        }
+                    } else {
+                        Ranking::Distance { query: vec![1.0] }
+                    };
+                    let mut bound = BoundStatement::new(
+                        "t".to_string(),
+                        Vec::new(),
+                        Vec::new(),
+                        false,
+                        ranking,
+                        1,
+                        EvaluationOrder::DEFAULT,
+                    )
+                    .with_distance_kind(kind);
+                    if precision {
+                        bound = bound.with_mode(resolve_mode(Some(SearchMode::Precision), None));
+                    }
+                    let got = check_bound_distance_kind(&bound)
+                        .err()
+                        .map(|e| e.wire_code());
+                    let want = if kind == DistanceKind::Cosine {
+                        None
+                    } else if hybrid {
+                        Some("42601")
+                    } else if precision {
+                        Some("0A000")
+                    } else {
+                        None
+                    };
+                    assert_eq!(got, want, "{kind:?} hybrid={hybrid} precision={precision}");
+                }
+            }
+        }
     }
 
     #[test]

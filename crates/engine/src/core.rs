@@ -1583,6 +1583,36 @@ pub struct EngineCore {
     #[cfg(test)]
     cte_join_budget_cap_for_test: Option<usize>,
 }
+/// NoSQL 表層 `search` の `metric` 省略時に、対象表の HNSW 宣言の opclass へ揃えた距離種別を
+/// 遅延して解決する値（Issue #2243・NOSQL-2・SQL-33 (7)）。束縛 closure に渡され、
+/// `EngineCore` の束縛済み検索入口が持つ `read_txn`（スキーマ取得と同じスナップショット）で解決する。
+/// 明示指定の要求は呼ばないため、カタログ読み取り失敗の影響を受けない。
+pub struct IndexMetricDefault<'a> {
+    /// `Declared` スコープの opt-in 時だけ `Some`（読み取り txn・ゲートキャッシュ・表名）。
+    lookup: Option<(
+        &'a redb::ReadTransaction,
+        &'a crate::catalog::IndexCatalogGateCache,
+        &'a str,
+    )>,
+}
+
+impl IndexMetricDefault<'_> {
+    /// 既定の距離種別を返す。opt-in なし・宣言なし・宣言集合に Cosine を含む場合は `Cosine`。
+    /// カタログの読み取りに失敗したら黙って `Cosine` に倒さず `XX000`（固定文言）で拒否する。
+    pub fn distance_kind(
+        &self,
+    ) -> Result<crate::sql::lexer::DistanceKind, crate::sql::allowlist::SqlSurfaceError> {
+        let Some((read_txn, gate_cache, table)) = self.lookup else {
+            return Ok(crate::sql::lexer::DistanceKind::Cosine);
+        };
+        let opclass = crate::catalog::hnsw_default_metric_in_txn(read_txn, gate_cache, table)
+            .map_err(|_| crate::sql::allowlist::SqlSurfaceError::Internal {
+                detail: "index catalog read failed".to_string(),
+            })?;
+        Ok(crate::sql::hnsw_cache::distance_kind_for_opclass(opclass))
+    }
+}
+
 /// [`EngineCore::hnsw_state`] が保持する状態束（Issue #408）。`provider` は
 /// [`crate::hnsw::provider::HnswSearchProvider`]（`Copy`）のコピーであり、
 /// `sql::hnsw_cache::search_or_fallback` が `effective_ef`／構築パラメータへ
@@ -3808,6 +3838,9 @@ impl EngineCore {
         &self,
         bound: &crate::sql::parser::BoundStatement,
     ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+        // Issue #2243: 公開ビルダー `with_distance_kind` の誤用で非 Cosine が Hybrid・`precision` に
+        // 素通りしないよう、早期 return する `result_cap` 分岐より前で整合を検査する。
+        crate::sql::parser::check_bound_distance_kind(bound)?;
         // Issue #2242: `LIMIT` 省略（暗黙上限の印 `result_cap`）付きの計画は、`cap` が設定値と一致し、
         // 取得上限が `cap + 1`、`OFFSET` が検索上限以内のときだけ通す（印の偽装で巨大な取得上限を
         // 通す経路を作らない。`check_bound_scan_limit` と同型）。
@@ -12896,10 +12929,42 @@ impl EngineCore {
             crate::sql::allowlist::SqlSurfaceError,
         >,
     {
+        self.execute_bound_search_with_index_metric_in_session(
+            ctx,
+            session,
+            table,
+            |schema, udfs, _index_metric| bind(schema, udfs),
+        )
+    }
+
+    /// [`Self::execute_bound_search_in_session`] に、索引の opclass に従う既定の距離種別の解決
+    /// ([`IndexMetricDefault`]) を `bind` へ渡す形を加えた入口（Issue #2243・NOSQL-2・SQL-33 (7)）。
+    /// NoSQL 表層 `search` の `metric` 省略時に、`bind` が [`IndexMetricDefault::distance_kind`] を
+    /// 呼んで `BoundStatement::with_distance_kind` へ渡す。解決は `bind` と同じ `read_txn`
+    /// スナップショットで行う。処理順（権限検査 → 関数 ACL → 束縛 → 表一致 → 検索形検査 → 実行）と
+    /// RLS 暗黙適用は既存入口と同一。
+    pub fn execute_bound_search_with_index_metric_in_session<F>(
+        &self,
+        ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
+        table: &str,
+        bind: F,
+    ) -> Result<crate::sql::exec::QueryResult, crate::sql::allowlist::SqlSurfaceError>
+    where
+        F: FnOnce(
+            &crate::catalog::TableSchema,
+            &crate::sql::udf_call::UdfRegistry,
+            &IndexMetricDefault<'_>,
+        ) -> Result<
+            crate::sql::parser::BoundStatement,
+            crate::sql::allowlist::SqlSurfaceError,
+        >,
+    {
         self.require_table_select_privilege(ctx, session, table)?;
         let _function_acl_scope = self.function_acl_scope(ctx, session)?;
         let (read_txn, schema) = self.read_txn_with_schema(table)?;
-        let bound = bind(&schema, session.udfs())?;
+        let index_metric = self.index_metric_default(&read_txn, table);
+        let bound = bind(&schema, session.udfs(), &index_metric)?;
         if bound.table() != table {
             return Err(crate::sql::allowlist::SqlSurfaceError::invalid_input(
                 "bound search plan targets a different table than requested",
@@ -12913,6 +12978,21 @@ impl EngineCore {
             &bound,
             session.hnsw_search_settings(),
         )
+    }
+
+    /// 対象表の既定距離種別の解決器を作る（Issue #2243）。opt-in なし（`hnsw_state` が `None`）と
+    /// `HnswScope::All`（暗黙のコサイン HNSW を含むため実効 metric 集合に `Cosine` が入る）は
+    /// カタログに触れず `Cosine`。`Declared` のときだけ宣言の opclass を遅延して読む。
+    fn index_metric_default<'a>(
+        &'a self,
+        read_txn: &'a redb::ReadTransaction,
+        table: &'a str,
+    ) -> IndexMetricDefault<'a> {
+        IndexMetricDefault {
+            lookup: (self.hnsw_state.is_some()
+                && self.hnsw_scope == crate::search_engine::HnswScope::Declared)
+                .then_some((read_txn, &self.index_catalog_gate_cache, table)),
+        }
     }
 
     /// 束縛済み `plan` 検索（NoSQL 表層 `search` op の `plan` 指定。TASK-175・
@@ -14681,9 +14761,38 @@ impl EngineCore {
             crate::sql::allowlist::SqlSurfaceError,
         >,
     {
+        self.explain_bound_search_with_index_metric_in_session(
+            ctx,
+            session,
+            table,
+            |schema, udfs, _index_metric| bind(schema, udfs),
+        )
+    }
+
+    /// [`Self::explain_bound_search_in_session`] の既定距離種別解決付き版（Issue #2243）。
+    /// [`Self::execute_bound_search_with_index_metric_in_session`] と同じ束縛・同じエラー分類順で、
+    /// 実行本体の代わりに `EXPLAIN` 結果を返す。
+    pub fn explain_bound_search_with_index_metric_in_session<F>(
+        &self,
+        ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
+        table: &str,
+        bind: F,
+    ) -> Result<crate::sql::exec::QueryResult, crate::sql::allowlist::SqlSurfaceError>
+    where
+        F: FnOnce(
+            &crate::catalog::TableSchema,
+            &crate::sql::udf_call::UdfRegistry,
+            &IndexMetricDefault<'_>,
+        ) -> Result<
+            crate::sql::parser::BoundStatement,
+            crate::sql::allowlist::SqlSurfaceError,
+        >,
+    {
         self.require_table_select_privilege(ctx, session, table)?;
         let (read_txn, schema) = self.read_txn_with_schema(table)?;
-        let bound = bind(&schema, session.udfs())?;
+        let index_metric = self.index_metric_default(&read_txn, table);
+        let bound = bind(&schema, session.udfs(), &index_metric)?;
         if bound.table() != table {
             return Err(crate::sql::allowlist::SqlSurfaceError::invalid_input(
                 "bound search plan targets a different table than requested",
