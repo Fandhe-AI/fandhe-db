@@ -43,7 +43,7 @@ spec で規範化された内部転送プロトコルの実装にすぎない。
 `engine::error_format::ErrorClass` を HTTP 応答（ステータス・本文）へ写像するのみ
 （ERR-4）。
 
-spec ポインタ一覧: TASK-184（基盤）・HTTP-1〜14・NOSQL-1〜11・ERR-4・SQL-1〜15・
+spec ポインタ一覧: TASK-184（基盤）・HTTP-1〜15・NOSQL-1〜11・ERR-4・SQL-1〜15・
 RLS-7・RLS-9・TABLE-12。
 
 ## 転送路の共通規則
@@ -91,11 +91,17 @@ NoSQL 表層にも適用される（Issue #968）。HTTP には `SSLRequest` の
 
 ### `POST /v1/session`
 
-要求本文は `user`・`password` の 2 つの必須文字列フィールドのみ（未知キーは
-`42601`）。
+要求本文は `user`・`password` の 2 つの必須文字列フィールドと、任意の `scope`
+（HTTP-15。後述「セッションのスコープ」節）。それ以外の未知キーは `42601`。
 
 ```json
 {"user": "alice", "password": "pw-alice"}
+```
+
+スコープ付きの要求例:
+
+```json
+{"user": "alice", "password": "pw-alice", "scope": {"ops": ["search", "scan"], "tables": ["docs"], "read_only": true}}
 ```
 
 成功時（`200`）:
@@ -139,6 +145,43 @@ JSON キー・ヘッダ（`tenant`／`tenant-id`／`tenantid` 相当。`x-` 接�
 検証コード: `crates/wire-server/tests/http4_session.rs`・`http5_query_bearer.rs`・
 `http6_auth_failure.rs`・`http8_session_close.rs`。
 
+### セッションのスコープ（HTTP-15）
+
+`POST /v1/session` の `scope`（`ops`: op 名の配列、`tables`: 表名の配列、
+`read_only`: 真偽値。各キー任意）は、そのトークンで実行できる範囲を認証主体の権限より
+狭める。省略時は認証主体の全権限。スコープはトークンとともにプロセス内メモリにのみ
+保持され、close・期限で消える。
+
+- 形の不正（未知の op 名・識別子でない表名・未知キー・`null`）は `42601`、`tables` の
+  件数上限 64 超過は `54000`。存在しない表・他テナントの表を含めても発行の応答は変わらない
+  （存在の秘匿）
+- 要求ごとの強制: スコープ外の op・表・`read_only` 違反は実行前に `42501`（`403`）・
+  固定文言（op 名・表名・違反した軸を含まない）。副作用はなく、`Idempotency-Key`／
+  `operation_id` の台帳も消費しない
+- スコープ外の表は存在の有無に依らず同一応答。スコープ内の存在しない表はスコープなしと
+  同じ `42P01`
+- `read_only` で受理する op は `search`・`scan`・`aggregate`・`show_partitioned_dml`
+  （`explain` を含む）のみで、それ以外は `42501`
+- スコープは権限を狭める方向にだけ働く。スコープに含めても権限の無い op は engine 側の
+  `42501`
+
+**上書き・昇格の拒否**: 発行後のスコープを要求側から広げる手段は無い。
+
+- `POST /v1/query` の本文に `scope` 等のスコープ相当キーを含めた要求は無視されず、
+  未知キーとして `42601`（`tenant_id` の自己申告と同じ扱い）。形の不正の判定がスコープ検査
+  より先のため、スコープ外の op に広げる `scope` を添えても `42601` になる
+- ヘッダ（`Scope`・`X-Scope` 等）はサーバーが読まないため、スコープに影響しない
+- パス・クエリ文字列（`/v1/query?scope=...` 等）は厳密一致違反で `08P01`
+- `POST /v1/session/close` はスコープを変える入口を持たない（`scope` キーは `42601`）。
+  新しいスコープはユーザー・パスワードによる再発行でのみ得られる
+
+<!-- expect: reject -->
+```json
+{"op": "scan", "table": "docs", "limit": 1, "scope": {"read_only": false}}
+```
+
+検証コード: `crates/wire-server/tests/http_nosql/http15_session_scope.rs`。
+
 ## `POST /v1/query` 共通規則
 
 3 パスとも要求ターゲットのバイト厳密一致でのみ受理する（クエリ文字列付き・
@@ -153,10 +196,11 @@ JSON キー・ヘッダ（`tenant`／`tenant-id`／`tenantid` 相当。`x-` 接�
 4. 本文の UTF-8／JSON 構文／`op` フィールドの形（`42601`）
 5. `op` 許可リスト判定（12 値の厳密一致。語彙外は `0A000`。DDL・UDF 呼び出し・
    トランザクション制御を含む）
-6. op 別スキーマ検証（必須キー欠落・未知キー・型不一致・`null` は `42601`）
+6. op 別スキーマ検証（必須キー欠落・未知キー・型不一致・`null` は `42601`。`scope` 相当キーもここで未知キーになる）
 7. `Idempotency-Key` ヘッダの解決（重複は `08P01`、空・256 バイト超・制御文字は `42601`。
    `insert`／`upsert`／`update`／`delete` 以外の op に付いていれば `42601`。engine 呼び出し前に返る）
-8. op 別の意味検証・実行（`search` は `explain: true` を通常実行より先に判定）
+8. セッションのスコープ検査（`42501`。カタログ・engine に触れる前）
+9. op 別の意味検証・実行（`search` は `explain: true` を通常実行より先に判定）
 
 `Idempotency-Key` ヘッダは書き込み op（`insert`／`upsert`／`update`／`delete`。単一行形・述語形・分割実行を
 含む）の `operation_id` の供給元になる。本文の `operation_id` とヘッダのどちらか一方の指定で足り
@@ -306,6 +350,7 @@ JSON 本文の構文受理規則は `engine::json`（NOSQL-8）に従う: ネス
 | `columns` | △ | string[]（非空） | 省略時は `id`＋全実列 |
 | `explain` | △ | bool | [`explain`](#explain)参照。`true` は `QUERY PLAN` を返す。`false`／省略時は通常実行 |
 | `sort` | △ | object[]（`{"column","dir"}`。非空、上限 8 要素） | `dir` は `"asc"`／`"desc"`（小文字完全一致）。省略時は順序保証なし |
+| `after` | △ | string または `null` | キーセットページング（[後述](#キーセットページングafternext_cursor)）。キーを付けるとキーセットモード。`null` は 1 ページ目、文字列は前ページの `next_cursor`。文字列・`null` 以外は `42601`。`offset` との併用は `42601` |
 
 `vector`／`plan`／`mode`／`hybrid` はスキーマが宣言しないフィールドのため、
 未知キーとして `42601` になる（`scan` への付与自体を個別に判定するロジックは
@@ -346,6 +391,46 @@ JSON 本文の構文受理規則は `engine::json`（NOSQL-8）に従う: ネス
 `explain: true`（[`explain`](#explain) 参照。Issue #948・NOSQL-16）は `sort`・
 `offset` を指定した場合も同じ束縛（`PreparedScan::bind`）を経由するため
 併用できる。
+
+#### キーセットページング（`after`／`next_cursor`）
+
+Issue #2094・NOSQL-23・TASK-253。`offset` のページングはページ取得の合間の書き込みで
+重複・欠落が起こり、深いページほど走査が増える。`after` を付けた要求は、前ページの最終行から
+作った不透明なカーソルより後ろだけを返す。
+
+- **opt-in**: `after` キーを付けた要求だけがキーセットモード。キーが無い要求は従来どおり
+  （応答に `next_cursor` を付けず、`sort` 付きの並びも変えない）
+- 1 ページ目は `"after": null`、続きは直前の応答の `next_cursor` を `after` へそのまま渡す
+- 応答はキーセット要求のときだけ、`row_count` の後ろに `next_cursor` を持つ。続きがあれば
+  不透明な文字列、最後のページでは `null`。**`null` を受け取ったら終了**する（`null` を
+  `after` に戻すと 1 ページ目に戻る）
+- 順序は `sort`（省略可）に続けて主キー（無い表は物理行 ID）の昇順で全順序になる。
+  `after` だけで `sort` が無い要求は主キー昇順
+- カーソルはサーバーの秘密鍵で封緘（暗号化＋改ざん検知）され、テナント・認証主体（ログイン
+  ユーザー）・表・`sort` に束縛される。`filter`／`columns`／`limit` はページ間で変えてよい
+- 封緘鍵はプロセス内だけで保持し永続化しない。サーバーを再起動すると既発行のカーソルは
+  `22000` になる（鍵の永続化・ローテーション・複数インスタンス共有は対象外）
+- `explain: true` と併用でき、カーソルは通常実行と同じ手順で検証される（応答に `next_cursor`
+  は付かず、プランへキーセット専用の表示は足さない）
+
+要求例（1 ページ目と続き）:
+
+```json
+{"op": "scan", "table": "docs", "limit": 100, "sort": [{"column": "lang", "dir": "asc"}],
+ "after": null}
+```
+
+```json
+{"op": "scan", "table": "docs", "limit": 100, "sort": [{"column": "lang", "dir": "asc"}],
+ "after": "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4/QEFC"}
+```
+
+`after` の主な `wire_code`:
+
+- `after` が文字列・`null` 以外、`offset` との併用（`offset: 0` を含む） → `42601`
+- カーソルの復号・検証失敗（改ざん・切り詰め・不正な base64・別ユーザー・別テナント・別 `sort`・
+  別表・別サーバー鍵・版違い）→ `22000`。失敗理由は区別されず、固定文言 `invalid keyset position`
+- 封緘鍵の生成失敗など内部の前提欠落 → `XX000`
 
 `sort` の主な `wire_code`:
 
@@ -1168,6 +1253,8 @@ nosql16_explain_targets.rs`（`vector` 指定 `search`・`scan`・`aggregate` �
 ```
 
 - キー順固定（`columns` → `rows` → `row_count`）・空白なし
+- `scan` のキーセット要求（`after` 指定）だけ、`row_count` の後ろに `next_cursor`
+  （文字列または `null`）が付く（[キーセットページング](#キーセットページングafternext_cursor)）
 - `row_count` は常に `rows` の長さ
 - `columns[].type` は列型ごとの名前を返す（Issue #896・NOSQL-17。SQL 表層
   `RowDescription`（Issue #895）の OID 写像とは**独立**の対応表——SQL wire
@@ -1610,7 +1697,8 @@ curl -s -X POST http://127.0.0.1:5432/v1/session/close \
   `http2_framing.rs`・`http3_content_type.rs`・`http11_limits.rs`・
   `http12_fail_closed.rs`・`http_limits.rs`
 - セッション: `http4_session.rs`・`http4_session_issue.rs`・
-  `http5_query_bearer.rs`・`http6_auth_failure.rs`・`http8_session_close.rs`
+  `http5_query_bearer.rs`・`http6_auth_failure.rs`・`http8_session_close.rs`・
+  `http15_session_scope.rs`（HTTP-15。Issue #2101・#2102）
 - ルーティング・op 許可リスト・スキーマ: `nosql1_endpoint_routing.rs`・
   `nosql1_op_vocabulary.rs`・`nosql9_op_allowlist.rs`・`nosql8_schema_validation.rs`
 - OpenAPI 文書（`docs/openapi.json`）とのゴールデン一致: `nosql20_openapi_golden.rs`
@@ -1621,7 +1709,8 @@ curl -s -X POST http://127.0.0.1:5432/v1/session/close \
   `nosql2_search_binding.rs`・`wire_sql33_cosine_order.rs`（pg wire 側）で固定
 - `scan`: `nosql3_scan_mapping.rs`・`nosql3_scan_wire_parity.rs`・
   `nosql15_scan_sort.rs`（`sort`。Issue #946・NOSQL-15）・
-  `nosql15_offset.rs`（`offset`。Issue #947・NOSQL-15）
+  `nosql15_offset.rs`（`offset`。Issue #947・NOSQL-15）・
+  `nosql23_scan_keyset.rs`（`after`／`next_cursor`。Issue #2094・NOSQL-23）
 - `aggregate`: `nosql4_aggregate.rs`・`nosql5_group_by.rs`・
   `nosql4_5_aggregate_wire_parity.rs`・`nosql16_multi_group_by.rs`・
   `nosql15_aggregate_sort_offset.rs`（`sort`／`offset`・単一文字列形 `group_by`。
@@ -1659,6 +1748,8 @@ curl -s -X POST http://127.0.0.1:5432/v1/session/close \
 - `hybrid.text` の疎側テキスト列を JSON で選択可能にするか（現状は `body`
   固定）
 - `/v1/session/close` 成功応答のキー名（`{"closed":true}`。実装既定値）
+- スコープ相当の**ヘッダ**を `tenant` 相当ヘッダと同様に `42601` で拒否するか（現状は
+  サーバーが読まないため影響しないが、拒否もしない。Issue #2102）
 - `/v1/query` 配下のパス上 `tenant_id` マーカーと未知ターゲットの優先順位
   （本リポの実装判断であり spec 側での明文化は未定）
 - 集計 `id` 列等の巨大整数（`u64`。2^53 超）を JSON number としてそのまま返す

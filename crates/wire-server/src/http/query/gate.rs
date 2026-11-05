@@ -87,6 +87,7 @@ use std::time::SystemTime;
 use engine::core::EngineCore;
 use engine::error_format::{ClassifiedError, ErrorClass};
 use engine::json::parse_json;
+use engine::sql::keyset::KeysetSealKey;
 
 use crate::http::idempotency_key::extract_idempotency_key;
 use crate::http::query::op::{classify_op, Op};
@@ -154,6 +155,7 @@ pub fn handle(
     headers: &crate::http::headers::Headers<'_>,
     raw_body: &[u8],
     engine: Option<&EngineCore>,
+    cursor_key: Option<&KeysetSealKey>,
     now_wall: SystemTime,
 ) -> Vec<u8> {
     // 手順 1: テナント指定ヘッダの拒否（本文検証より先）。
@@ -267,12 +269,14 @@ pub fn handle(
             super::explain::handle(engine, principal, &validated, now_wall)
         }
         (Op::Scan, Some(engine)) if explain_requested(&validated) => {
-            scan::handle_explain(engine, principal, &validated, now_wall)
+            scan::handle_explain(engine, principal, &validated, cursor_key, now_wall)
         }
         (Op::Aggregate, Some(engine)) if explain_requested(&validated) => {
             super::aggregate::handle_explain(engine, principal, &validated, now_wall)
         }
-        (Op::Scan, Some(engine)) => scan::handle(engine, principal, &validated, now_wall),
+        (Op::Scan, Some(engine)) => {
+            scan::handle(engine, principal, &validated, cursor_key, now_wall)
+        }
         (Op::Aggregate, Some(engine)) => {
             super::aggregate::handle(engine, principal, &validated, now_wall)
         }
@@ -480,7 +484,7 @@ mod tests {
     fn run(body: &[u8], extra_headers: &[&str]) -> Vec<u8> {
         let p = principal();
         let headers = headers_with_body(body, extra_headers);
-        handle(&p, &headers, body, None, std::time::SystemTime::now())
+        handle(&p, &headers, body, None, None, std::time::SystemTime::now())
     }
 
     /// `engine` 接続済み（`Router::with_engine` 相当）の経路。`scan` op の
@@ -488,7 +492,14 @@ mod tests {
     fn run_with_engine(core: &EngineCore, body: &[u8], extra_headers: &[&str]) -> Vec<u8> {
         let p = principal();
         let headers = headers_with_body(body, extra_headers);
-        handle(&p, &headers, body, Some(core), std::time::SystemTime::now())
+        handle(
+            &p,
+            &headers,
+            body,
+            Some(core),
+            None,
+            std::time::SystemTime::now(),
+        )
     }
 
     /// スコープ付きトークンの principal を作る（`SessionStore::issue_with_scope` → `authenticate`）。
@@ -516,7 +527,7 @@ mod tests {
         let now = std::time::SystemTime::now();
         // 表がスコープ外 → engine 未接続でも 42501（プレースホルダ 0A000 より先）。
         let p = scoped_principal(scope_with_for_test(None, Some(&["other"]), false));
-        let text = String::from_utf8(handle(&p, &headers, body, None, now)).expect("utf-8");
+        let text = String::from_utf8(handle(&p, &headers, body, None, None, now)).expect("utf-8");
         assert!(text.starts_with("HTTP/1.1 403 "), "got: {text}");
         assert!(
             text.contains("42501") && !text.contains("docs"),
@@ -524,7 +535,7 @@ mod tests {
         );
         // スコープ内なら従来どおり（未接続の暫定応答）。
         let p = scoped_principal(scope_with_for_test(None, Some(&["docs"]), false));
-        let text = String::from_utf8(handle(&p, &headers, body, None, now)).expect("utf-8");
+        let text = String::from_utf8(handle(&p, &headers, body, None, None, now)).expect("utf-8");
         assert!(text.contains(PLACEHOLDER_MESSAGE), "got: {text}");
         // スコープなしは従来どおり。
         let text = String::from_utf8(run(body, &[])).expect("utf-8");

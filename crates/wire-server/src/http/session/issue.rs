@@ -218,7 +218,14 @@ fn handle_inner(
     // `now_mono()` の呼び出し自体もここまで遅延させ、Argon2id 照合・セマフォ
     // 待機の時間が TTL 起点に含まれてしまわないようにする（本関数 doc 参照）。
     let token = sessions
-        .issue_with_scope(ctx, ddl_allowed, role, parsed_scope, now_mono())
+        .issue_with_user(
+            ctx,
+            Some(user.to_string()),
+            ddl_allowed,
+            role,
+            parsed_scope,
+            now_mono(),
+        )
         .map_err(|e| HandleError::new(e.error_class(), issue_error_message(&e)))?;
 
     Ok(token.encoded())

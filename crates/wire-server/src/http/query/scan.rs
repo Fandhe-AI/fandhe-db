@@ -39,6 +39,13 @@
 //! `VECTOR` 列は `22000`、上限超過は `54000`）を委譲する——第 2 の実行器・
 //! 第 2 の並べ替え実装は持たない。
 //!
+//! `after`（Issue #2094・NOSQL-23・TASK-253）を付けた要求はキーセットモードで、
+//! [`engine::core::EngineCore::execute_bound_scan_page_in_session`] が返す次位置を
+//! [`super::cursor`] で封緘して `next_cursor` として返す。カーソルはテナント・認証主体・表・
+//! `sort` に束縛され、`offset` との併用は `42601`、開封失敗は理由を区別しない `22000`。
+//! `after` の無い要求は従来経路のまま（応答に `next_cursor` を付けない）。封緘鍵は
+//! [`crate::http::router::Router`] が持ち、[`super::gate::handle`] 経由で渡される。
+//!
 //! 応答は `score` を一切含まない: `Projection::All`（`columns` 省略時）は
 //! `schema.columns` の実列と（疑似列 `id` を持つ表では）疑似列 `id` のみを列挙し（`bind_projection` の
 //! 既存契約）、`hybrid`／スカラー `ORDER BY`（`sort` 指定時を含む）を経由
@@ -72,11 +79,13 @@ use engine::error_format::{ClassifiedError, ErrorClass};
 use engine::json::JsonValue;
 use engine::sql::allowlist::{Projection, ScalarOrderKey, SqlSurfaceError, MAX_SCALAR_ORDER_KEYS};
 use engine::sql::exec::QueryResult;
+use engine::sql::keyset::{KeysetPosition, KeysetSealKey};
 use engine::sql::parser::{
     bind_projection, validate_search_limit_with, validate_search_offset, BoundScan,
 };
 use engine::sql::udf_call::{UdfRegistry, MAX_EXPR_NODES};
 
+use super::cursor;
 use super::filter::{bind_filter, FilterError};
 use super::ident::{self, InvalidIdentifier};
 use super::schema::{SchemaError, Validated};
@@ -120,6 +129,15 @@ pub enum ScanError {
     /// untrusted な `sort` の内容（列名・`dir` の生値）を一切含まない
     /// （`InvalidColumns` と同じ判断）。
     InvalidSort,
+    /// `after` と `offset` の併用（Issue #2094・NOSQL-23。キーの有無で判定し、`offset: 0` や
+    /// `after: null` も併用とみなす。`42601`）。
+    CursorWithOffset,
+    /// `after` のカーソルを開封・照合できない（改ざん・別主体・別 `sort`・別表・別鍵・形式不正。
+    /// `22000`。理由を区別させない固定文言で、engine の位置不整合と同一）。
+    InvalidCursor,
+    /// カーソルを扱うための前提（封緘鍵・認証主体）が無い、または AAD を組み立てられない
+    /// （`XX000`。fail-closed。内部詳細は出さない）。
+    CursorUnavailable,
     /// engine 側の束縛・実行エラー（未知列・`VECTOR` 列・テーブル不存在・
     /// `sort` の上限超過〔`54000`〕・内部エラー等）をそのまま透過する。
     Engine(SqlSurfaceError),
@@ -159,7 +177,10 @@ impl ClassifiedError for ScanError {
             | ScanError::InvalidIdentifier
             | ScanError::InvalidColumns
             | ScanError::ExplainNotSupported
-            | ScanError::InvalidSort => ErrorClass::UnsupportedSqlSyntax,
+            | ScanError::InvalidSort
+            | ScanError::CursorWithOffset => ErrorClass::UnsupportedSqlSyntax,
+            ScanError::InvalidCursor => ErrorClass::InvalidInput,
+            ScanError::CursorUnavailable => ErrorClass::InternalError,
             ScanError::Engine(err) => err.error_class(),
         }
     }
@@ -183,9 +204,19 @@ impl ClassifiedError for ScanError {
                 "sort must be a non-empty array of {column, dir} with dir \"asc\" or \"desc\""
                     .to_string()
             }
+            ScanError::CursorWithOffset => "after cannot be combined with offset".to_string(),
+            ScanError::InvalidCursor => "invalid keyset position".to_string(),
+            ScanError::CursorUnavailable => "cursor paging is unavailable".to_string(),
             ScanError::Engine(err) => err.client_message(),
         }
     }
+}
+
+/// [`execute`] の成功結果。`next_cursor` はキーセット要求（`after` 指定）のときだけ `Some`
+/// （内側が `None` なら最後のページ）で、非キーセット要求は `None`＝応答に `next_cursor` を付けない。
+pub struct ScanOutcome {
+    pub result: QueryResult,
+    pub next_cursor: Option<Option<String>>,
 }
 
 /// JSON `limit`（`f64`。[`Validated::required_number`] が返す）が非負の
@@ -314,6 +345,9 @@ struct PreparedScan<'a> {
     projection: Projection,
     filter_items: &'a [JsonValue],
     sort_keys: Vec<ScalarOrderKey>,
+    /// `after` の指定（Issue #2094）。キー省略は `None`（非キーセット）、`null` は
+    /// `Some(None)`（1 ページ目）、文字列は `Some(Some(カーソル))`。
+    after: Option<Option<&'a str>>,
 }
 
 impl<'a> PreparedScan<'a> {
@@ -334,6 +368,12 @@ impl<'a> PreparedScan<'a> {
         // `42601` へ揃え、63 文字を超える長大文字列を schema 走査より前に
         // 打ち切る）。
         ident::check_identifier(table)?;
+        // `after` と `offset` の併用は表の解決より前に `42601` で拒否する（キーの有無で判定。
+        // engine の `check_combination` は多層防御として残る）。
+        let after = validated.optional_nullable_str("after")?;
+        if after.is_some() && validated.has_key("offset")? {
+            return Err(ScanError::CursorWithOffset);
+        }
         let raw_limit = validated.required_number("limit")?;
         let limit = validate_search_limit_with(limit_to_u32(raw_limit)?, limits)?;
         // `offset`（Issue #947・NOSQL-15）は任意キー。省略時は 0（no-op。
@@ -352,7 +392,49 @@ impl<'a> PreparedScan<'a> {
             projection,
             filter_items,
             sort_keys,
+            after,
         })
+    }
+
+    /// キーセット要求なら、カーソルの封緘鍵と AAD（テナント・認証主体・表・`sort`）を用意する。
+    /// 非キーセット要求は `None`。前提（鍵・認証主体）が欠けるときは `XX000` で fail-closed。
+    fn cursor_binding<'k>(
+        &self,
+        principal: &SessionPrincipal,
+        cursor_key: Option<&'k KeysetSealKey>,
+    ) -> Result<Option<(&'k KeysetSealKey, Vec<u8>)>, ScanError> {
+        if self.after.is_none() {
+            return Ok(None);
+        }
+        // `sort` の上限超過は `build_sort` が余分な 1 キーを残して engine の
+        // `with_order_by`（`54000`）に判定させる設計。AAD 構築で `XX000` に化けないよう、
+        // ここではキーセット束縛を作らず従来の束縛経路へ回し、文書化どおり `54000` を返す。
+        if self.sort_keys.len() > MAX_SCALAR_ORDER_KEYS {
+            return Ok(None);
+        }
+        let key = cursor_key.ok_or(ScanError::CursorUnavailable)?;
+        let user = principal.auth_user().ok_or(ScanError::CursorUnavailable)?;
+        let aad = cursor::build_aad(
+            principal.policy_context().tenant_id(),
+            user,
+            self.table,
+            &self.sort_keys,
+        )
+        .map_err(|_| ScanError::CursorUnavailable)?;
+        Ok(Some((key, aad)))
+    }
+
+    /// `after` の文字列を開封して位置にする（`null`・省略は `None`）。失敗は理由を区別せず `22000`。
+    fn open_position(
+        &self,
+        binding: &Option<(&KeysetSealKey, Vec<u8>)>,
+    ) -> Result<Option<KeysetPosition>, ScanError> {
+        match (self.after, binding) {
+            (Some(Some(raw)), Some((key, aad))) => cursor::decode_cursor(raw, key, aad)
+                .map(Some)
+                .map_err(|_| ScanError::InvalidCursor),
+            _ => Ok(None),
+        }
     }
 
     /// [`bind_projection`]・[`super::filter::bind_filter`]（いずれもスキーマ
@@ -362,14 +444,22 @@ impl<'a> PreparedScan<'a> {
     /// `22000`、上限超過は `54000`）、さらに [`BoundScan::with_offset`] で
     /// `offset` を適用する（`sort` 適用後の順序に対する `OFFSET`。
     /// Issue #947・NOSQL-15）。
-    fn bind(&self, schema: &TableSchema, udfs: &UdfRegistry) -> Result<BoundScan, SqlSurfaceError> {
+    ///
+    /// `keyset` が `Some` のときはキーセットモード（Issue #2094・NOSQL-23）: `with_order_by` の後に
+    /// [`BoundScan::with_after`] を適用し、`offset` は適用しない（`prepare` が併用を拒否済み）。
+    fn bind(
+        &self,
+        schema: &TableSchema,
+        udfs: &UdfRegistry,
+        keyset: Option<Option<KeysetPosition>>,
+    ) -> Result<BoundScan, SqlSurfaceError> {
         let mut node_budget = MAX_EXPR_NODES;
         let bound_projection = bind_projection(&self.projection, schema, udfs, &mut node_budget)?;
         let (metadata_filters, expr_filters, or_filters) =
             bind_filter(self.filter_items, schema, udfs)
                 .map_err(FilterError::into_sql_surface_error)?
                 .into_parts();
-        Ok(BoundScan::new(
+        let bound = BoundScan::new(
             self.table.to_string(),
             bound_projection,
             metadata_filters,
@@ -377,8 +467,11 @@ impl<'a> PreparedScan<'a> {
             self.limit,
         )
         .with_or_filters(or_filters)
-        .with_order_by(&self.sort_keys, schema)?
-        .with_offset(self.offset))
+        .with_order_by(&self.sort_keys, schema)?;
+        match keyset {
+            Some(position) => bound.with_after(position, schema),
+            None => Ok(bound.with_offset(self.offset)),
+        }
     }
 }
 
@@ -392,7 +485,8 @@ pub fn execute(
     core: &EngineCore,
     principal: &SessionPrincipal,
     validated: &Validated<'_>,
-) -> Result<QueryResult, ScanError> {
+    cursor_key: Option<&KeysetSealKey>,
+) -> Result<ScanOutcome, ScanError> {
     let ctx = principal.policy_context();
     if validated.optional_bool("explain")?.unwrap_or(false) {
         return Err(ScanError::ExplainNotSupported);
@@ -400,11 +494,32 @@ pub fn execute(
 
     let prepared = PreparedScan::prepare(validated, &core.result_limits())?;
     let session = principal.session_state();
-    let result =
-        core.execute_bound_scan_in_session(ctx, &session, prepared.table, |schema, udfs| {
-            prepared.bind(schema, udfs)
+    let binding = prepared.cursor_binding(principal, cursor_key)?;
+    let Some((key, aad)) = &binding else {
+        // 非キーセット要求: 従来の経路を変えない（応答に `next_cursor` を付けない）。
+        let result =
+            core.execute_bound_scan_in_session(ctx, &session, prepared.table, |schema, udfs| {
+                prepared.bind(schema, udfs, None)
+            })?;
+        return Ok(ScanOutcome {
+            result,
+            next_cursor: None,
+        });
+    };
+    let position = prepared.open_position(&binding)?;
+    let page =
+        core.execute_bound_scan_page_in_session(ctx, &session, prepared.table, |schema, udfs| {
+            prepared.bind(schema, udfs, Some(position))
         })?;
-    Ok(result)
+    let (result, next) = page.into_parts();
+    let next_cursor = match next {
+        Some(position) => Some(cursor::encode_cursor(&position, key, aad)?),
+        None => None,
+    };
+    Ok(ScanOutcome {
+        result,
+        next_cursor: Some(next_cursor),
+    })
 }
 
 /// `scan` op の `EXPLAIN`（Issue #948・NOSQL-16・SQL-27）。検索本体
@@ -415,15 +530,30 @@ pub fn explain(
     core: &EngineCore,
     principal: &SessionPrincipal,
     validated: &Validated<'_>,
+    cursor_key: Option<&KeysetSealKey>,
 ) -> Result<QueryResult, ScanError> {
     let ctx = principal.policy_context();
     let prepared = PreparedScan::prepare(validated, &core.result_limits())?;
     let session = principal.session_state();
+    // `after` 付きでもカーソルを同じ手順で検証する（エラー分類を `explain` の有無で変えない）。
+    let binding = prepared.cursor_binding(principal, cursor_key)?;
+    let keyset = match &binding {
+        Some(_) => Some(prepared.open_position(&binding)?),
+        None => None,
+    };
     let result =
         core.explain_bound_scan_in_session(ctx, &session, prepared.table, |schema, udfs| {
-            prepared.bind(schema, udfs)
+            prepared.bind(schema, udfs, keyset)
         })?;
     Ok(result)
+}
+
+/// 成功本文を作る。キーセット要求だけ `next_cursor` を付け、それ以外は従来の形のまま。
+fn encode_outcome(outcome: &ScanOutcome) -> Result<String, super::response::ResponseEncodeError> {
+    match &outcome.next_cursor {
+        Some(next) => super::response::encode_page(&outcome.result, next.as_deref()),
+        None => super::response::encode(&outcome.result),
+    }
 }
 
 /// `POST /v1/query`（`op: "scan"`）を処理し応答バイト列を返す（[`super::gate`]
@@ -432,10 +562,11 @@ pub fn handle(
     core: &EngineCore,
     principal: &SessionPrincipal,
     validated: &Validated<'_>,
+    cursor_key: Option<&KeysetSealKey>,
     now_wall: SystemTime,
 ) -> Vec<u8> {
-    match execute(core, principal, validated) {
-        Ok(result) => match super::response::encode(&result) {
+    match execute(core, principal, validated, cursor_key) {
+        Ok(outcome) => match encode_outcome(&outcome) {
             Ok(body) => http_response::encode_ok(&body, now_wall),
             Err(err) => {
                 http_response::encode_error(err.error_class(), &err.client_message(), now_wall)
@@ -452,9 +583,10 @@ pub fn handle_explain(
     core: &EngineCore,
     principal: &SessionPrincipal,
     validated: &Validated<'_>,
+    cursor_key: Option<&KeysetSealKey>,
     now_wall: SystemTime,
 ) -> Vec<u8> {
-    match explain(core, principal, validated) {
+    match explain(core, principal, validated, cursor_key) {
         Ok(result) => match super::response::encode_explain(&result) {
             Ok(body) => http_response::encode_ok(&body, now_wall),
             Err(err) => {
@@ -525,6 +657,18 @@ mod tests {
         assert_eq!(ScanError::InvalidIdentifier.wire_code(), "42601");
         assert_eq!(ScanError::InvalidColumns.wire_code(), "42601");
         assert_eq!(ScanError::ExplainNotSupported.wire_code(), "42601");
+        assert_eq!(ScanError::CursorWithOffset.wire_code(), "42601");
+        assert_eq!(ScanError::InvalidCursor.wire_code(), "22000");
+        assert_eq!(ScanError::CursorUnavailable.wire_code(), "XX000");
+    }
+
+    /// カーソル失敗の文言は固定で、入力値を含まず、失敗理由を区別させない。
+    #[test]
+    fn invalid_cursor_client_message_is_fixed() {
+        assert_eq!(
+            ScanError::InvalidCursor.client_message(),
+            "invalid keyset position"
+        );
     }
 
     /// `ScanError::InvalidOffset` の応答文言は固定文言であり、untrusted な

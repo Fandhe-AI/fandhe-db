@@ -44,6 +44,7 @@ mod nosql1_op_vocabulary;
 mod nosql20_openapi_golden;
 mod nosql21_upsert;
 mod nosql22_returning_schema;
+mod nosql23_scan_keyset;
 mod nosql2_search;
 mod nosql2_search_binding;
 mod nosql2_search_metric;

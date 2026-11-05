@@ -546,6 +546,30 @@ pub fn encode(result: &QueryResult) -> Result<String, ResponseEncodeError> {
     Ok(out)
 }
 
+/// キーセット要求（`scan` の `after` 指定。Issue #2094・NOSQL-23）の成功本文。[`encode`] と同じ
+/// `columns`／`rows`／`row_count` の後ろに `next_cursor`（続きがあれば不透明な文字列、無ければ
+/// `null`）を付ける。`next_cursor` は標準 base64（`A-Za-z0-9+/=`）のみでエスケープ不要。
+/// キーセットでない要求は従来どおり [`encode`] を使い、応答形を変えない。
+pub fn encode_page(
+    result: &QueryResult,
+    next_cursor: Option<&str>,
+) -> Result<String, ResponseEncodeError> {
+    let mut out = encode(result)?;
+    // `encode` の末尾 `}` を外して `next_cursor` を足す（セル写像を二重実装しない）。
+    out.pop();
+    out.push_str(",\"next_cursor\":");
+    match next_cursor {
+        Some(cursor) => {
+            out.push('"');
+            out.push_str(cursor);
+            out.push('"');
+        }
+        None => out.push_str("null"),
+    }
+    out.push('}');
+    Ok(out)
+}
+
 /// `"columns":[...],"rows":[...]` の 2 キーを `out` へ書く（波括弧と `row_count` は含めない）。
 ///
 /// [`encode`] と、`insert`／`update`／`delete` の `returning` 付き成功本文
@@ -671,6 +695,24 @@ mod tests {
                 ty: Some(ColumnType::Double),
             },
         ]
+    }
+
+    /// `encode_page` は既存の `encode` の本文の後ろへ `next_cursor` を足すだけで、先頭部分を変えない。
+    #[test]
+    fn encode_page_appends_next_cursor_after_row_count() {
+        let result = QueryResult {
+            columns: vec![ColumnMeta::Id],
+            rows: vec![row(vec![Cell::SignedInteger(1)])],
+        };
+        let plain = encode(&result).expect("encode");
+        let prefix = &plain[..plain.len() - 1];
+        let with_cursor = encode_page(&result, Some("QUJD")).expect("encode");
+        assert_eq!(with_cursor, format!("{prefix},\"next_cursor\":\"QUJD\"}}"));
+        let last = encode_page(&result, None).expect("encode");
+        assert_eq!(last, format!("{prefix},\"next_cursor\":null}}"));
+        let top = parse_top(&last);
+        assert_eq!(top.get("next_cursor"), Some(&JsonValue::Null));
+        assert!(!plain.contains("next_cursor"));
     }
 
     /// 再帰 CTE の SEARCH 順序列（SQL-35・Issue #2213）: 型名は `record`／`_record`、値は入れ子の
