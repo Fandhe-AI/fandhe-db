@@ -25,6 +25,7 @@
 
 - `EXPLAIN (FORMAT JSON) <文>` を追加した（Issue #2059・SQL-76 (1)(6) ポインタ）。PostgreSQL 互換の JSON を 1 行 1 列（`QUERY PLAN`・型 `json`・OID 114）で返し、JSON と TEXT は同じ情報を持つ。`FORMAT TEXT`／オプションなしは従来と同一。`FORMAT XML|YAML` と未実装の既知オプションは `0A000`、`FORMAT` の不正値は `22023`、未知の名前・構文の誤りは `42601`。
   BREAKING CHANGE: 公開 enum `ParsedSql` に variant `ExplainJson(Box<ParsedSql>)` を追加した（網羅的 `match` の下流は追随が必要）。
+- `EXPLAIN INSERT` を受理した（Issue #2051・SQL-75 (2)(3)(5)(6) ポインタ）。実行せず `insert` 段の木（挿入方式・`ON CONFLICT` の対象の種別・`RETURNING`／`USING OPERATION_ID` の有無。`INSERT ... SELECT` は内側の計画）を返す。書き込み・台帳・採番は起こさない。公開 API に `ParsedSql::ExplainInsert`（`#[non_exhaustive]` への追加で非破壊）と `engine::sql::insert_explain` を追加した。ビュー・一時表は `0A000`、`$n` は `42601`。
 - HALFVEC 列の HNSW 索引を追加した（Issue #2016・TABLE-46 (3)(4)(6)・INDEX-7 ポインタ）。`USING hnsw (h halfvec_{cosine,l2,ip,l1}_ops)`（省略は `halfvec_cosine_ops`）を 4,000 次元まで宣言でき、宣言済み表への `<=>` kNN が HNSW を使う（常駐はエンジン設定と独立に F16。`--hnsw-scope all` でも宣言の無い HALFVEC 表には暗黙の HNSW を作らない）。公開 API に `catalog::HnswOpClassFamily`・`VectorOpClass::resolve_family_name`・`catalog::MAX_HALFVEC_HNSW_DIM`・`ValidatedCreateIndex::hnsw_family` を追加した（追加のみ）。
 - `INT8VEC(N)` 列で距離演算子 `<->`・`<#>`・`<=>` の kNN・WHERE の距離比較・投影の距離列が動くようにした（Issue #2953・TABLE-49 (1)(4)(5) ポインタ）。整数のまま厳密に計算し、距離列は float8。`<+>`・hybrid・`USING PLAN`・`USING MODE`・`HINT ORDER`・precision は `0A000`。NoSQL `search` は対象外（`0A000`）のまま。`vector` との差と量子化誤差の実測は `docs/design/column-type-extension.md` に記録。
   BREAKING CHANGE: 公開 enum `BoundExpr` に variant `Int8VecDistance { kind, index, query }` を追加した（網羅的 `match` の下流は追随が必要）。

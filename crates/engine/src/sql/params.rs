@@ -1438,6 +1438,18 @@ pub fn validate_param_positions(tokens: &[Token]) -> Result<u16, SqlSurfaceError
         }
     }
 
+    // Issue #2051: `EXPLAIN INSERT` に `$n` を含む文は拒否する（fail-closed）。EXPLAIN 経路は値の束縛を
+    // 行わず、`$n` の位置と束縛後の行の対応を検証できていないため、受理は後続に譲る
+    // （非 EXPLAIN の `INSERT` の `$n` は従来どおり）。
+    if matches!(tokens.first(), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("EXPLAIN"))
+        && ident_eq_ignore_case(tokens.get(1), "INSERT")
+        && tokens.iter().any(|t| matches!(t, Token::Param(_)))
+    {
+        return Err(SqlSurfaceError::unsupported(
+            "parameter placeholders are not supported in EXPLAIN of INSERT statements",
+        ));
+    }
+
     // パターン 4（WHERE 等価）の受理範囲は [`where_region`] が単一情報源として
     // 判定する（[`where_equality_literal_is_param`] も同じ境界判定を再利用し、
     // 両関数間で境界判定がずれる余地をなくす）。`SET`（statement 全体）である
@@ -3000,6 +3012,22 @@ mod tests {
         let tokens =
             crate::sql::lexer::tokenize_with_params("EXPLAIN SELECT id FROM t WHERE id = $1")
                 .expect("tokenize");
+        assert!(validate_param_positions(&tokens).is_ok());
+    }
+
+    /// Issue #2051: `EXPLAIN INSERT` に `$n` を含む文は `42601`。非 EXPLAIN の `INSERT` は従来どおり。
+    #[test]
+    fn explain_insert_with_param_is_rejected() {
+        let tokens = crate::sql::lexer::tokenize_with_params(
+            "EXPLAIN INSERT INTO t (id, a) VALUES (1, $1) USING OPERATION_ID 'op'",
+        )
+        .expect("tokenize");
+        let err = validate_param_positions(&tokens).unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+        let tokens = crate::sql::lexer::tokenize_with_params(
+            "INSERT INTO t (id, a) VALUES (1, $1) USING OPERATION_ID 'op'",
+        )
+        .expect("tokenize");
         assert!(validate_param_positions(&tokens).is_ok());
     }
 

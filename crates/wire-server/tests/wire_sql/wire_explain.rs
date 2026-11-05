@@ -196,6 +196,38 @@ fn explain_accepts_plain_select_without_using_plan() {
     read_ready_for_query(&mut stream);
 }
 
+/// Issue #2051（SQL-75 ポインタ）: `EXPLAIN INSERT` は wire 越しにも `QUERY PLAN` 単一列の段の木を返し、
+/// 行は書き込まれない。後続の同じ文の本物の INSERT は `operation_id` を再送とみなされず新規に通る。
+#[test]
+fn explain_insert_returns_plan_and_does_not_write() {
+    let (core, _guard) = new_core_with_docs_table();
+    let (mut stream, _users_path) = spawn_with_alice(core);
+
+    let insert = "INSERT INTO docs (id, embedding, path, body) VALUES (2, '[0.0,1.0]', 'docs/b.md', 'beta') USING OPERATION_ID 'wire-explain-insert-op'";
+    send_simple_query(&mut stream, &format!("EXPLAIN {insert}"));
+    let columns = read_row_description(&mut stream);
+    assert_eq!(columns, vec!["QUERY PLAN".to_string()]);
+    for expected in [
+        "insert",
+        "insert_source: values",
+        "insert_method: row",
+        "on_conflict: none",
+        "returning: none",
+        "operation_id: present",
+        "-> result",
+        "   source: values",
+    ] {
+        let row = read_data_row(&mut stream);
+        assert_eq!(row[0].as_deref(), Some(expected));
+    }
+    assert_eq!(read_command_complete(&mut stream), "EXPLAIN");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(&mut stream, insert);
+    assert_eq!(read_command_complete(&mut stream), "INSERT 0 1");
+    read_ready_for_query(&mut stream);
+}
+
 fn new_hnsw_core_with_docs_table() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
     let path = temp_db::unique_db_path("wire-explain-hnsw-docs");
     let guard = temp_db::CleanupGuard(path.clone());

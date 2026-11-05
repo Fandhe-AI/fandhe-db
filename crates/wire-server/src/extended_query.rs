@@ -2531,6 +2531,8 @@ fn execute_portal<'e, S: WireStream>(
                 | engine::sql::partitioned::PartitionedControl::ExplainDelete(_)
                 | engine::sql::partitioned::PartitionedControl::ExplainUpdate(_),
             ) => false,
+            // Issue #2051: `EXPLAIN INSERT` は束縛だけで書き込まず commit を伴わない。
+            ParsedSql::ExplainInsert(_) => false,
             // Issue #2050: `EXPLAIN UPDATE|DELETE` も読み取りのみで commit を伴わない。
             // Issue #2059: `EXPLAIN (FORMAT JSON)` も中身と同じく読み取りのみ。
             ParsedSql::ExplainDml(_) | ParsedSql::ExplainJson(_) => false,
