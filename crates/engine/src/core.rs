@@ -12750,7 +12750,6 @@ impl EngineCore {
     /// 〔Issue #473〕）を配線した `execute_statement_with_cache` を経由する
     /// ことで、束縛済み計画エントリも SQL テキスト経由と同一のキャッシュ
     /// 最適化・ANN opt-in・precision fail-closed 契約（SEARCH-9）を受ける。
-
     fn run_select_plan(
         &self,
         read_txn: &impl crate::storage::read_source::ReadSource,
