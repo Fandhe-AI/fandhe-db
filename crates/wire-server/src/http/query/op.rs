@@ -6,12 +6,14 @@
 //! `docs/spec/04-behavior/nosql-surface.md` NOSQL-1・NOSQL-9・NOSQL-12・
 //! NOSQL-13）。
 //!
+//! `upsert` は Issue #2086（NOSQL-1・NOSQL-21）で語彙へ加わった（実行は Issue #2087）。
+//!
 //! 分割実行 DML の `show_partitioned_dml`／`cancel_partitioned_dml` は Issue #1130
 //! （NOSQL-12・RECOVER-11）で語彙へ加わった（実行は [`super::partitioned`]）。
 //!
 //! 責務境界: [`super::schema::extract_op`] が取り出した `op` 文字列を、
 //! [`Op::parse`] により **完全一致（大文字小文字・trim の読み替えなし）**
-//! でこの 11 値のいずれかへ分類する。これ以外の値（UDF 呼び出し・
+//! でこの 12 値のいずれかへ分類する。これ以外の値（UDF 呼び出し・
 //! トランザクション制御・`create_index`／`drop_index`／`create_view`／
 //! `drop_view`（NOSQL-13 の対象外）・表記揺れをすべて含む）は
 //! [`UnsupportedOp`] として `ErrorClass::FeatureNotSupported`（`0A000`）へ
@@ -43,13 +45,18 @@ use super::schema::ObjectSchema;
 
 /// `POST /v1/query` の `op` が取りうる閉じた語彙。
 ///
-/// この 11 値以外を表す variant を追加しない（許可リストの意味が崩れる）。
+/// この 12 値以外を表す variant を追加しない（許可リストの意味が崩れる）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
     Search,
     Scan,
     Aggregate,
     Insert,
+    /// `INSERT ... ON CONFLICT` 相当の upsert（NOSQL-1・NOSQL-21、Issue #2086。
+    /// 親 #2085）。語彙とスキーマのみ。実行器への結線は Issue #2087 の担当で、
+    /// それまで [`super::gate::handle`] は `0A000` を返す
+    /// （[`Op::execution_wired`] が `false`）。
+    Upsert,
     Update,
     Delete,
     /// `CREATE TABLE`（NOSQL-13・TASK-207、Issue #910）。[`super::ddl`] が
@@ -69,11 +76,12 @@ pub enum Op {
 impl Op {
     /// 全 variant（宣言順）。[`super::schema::OP_SCHEMAS`] と名前列が
     /// 順序込みで一致することをテストで固定する。
-    pub const ALL: [Op; 11] = [
+    pub const ALL: [Op; 12] = [
         Op::Search,
         Op::Scan,
         Op::Aggregate,
         Op::Insert,
+        Op::Upsert,
         Op::Update,
         Op::Delete,
         Op::CreateTable,
@@ -91,6 +99,7 @@ impl Op {
             "scan" => Some(Op::Scan),
             "aggregate" => Some(Op::Aggregate),
             "insert" => Some(Op::Insert),
+            "upsert" => Some(Op::Upsert),
             "update" => Some(Op::Update),
             "delete" => Some(Op::Delete),
             "create_table" => Some(Op::CreateTable),
@@ -118,6 +127,7 @@ impl Op {
             | Op::Aggregate
             | Op::CreateTable
             | Op::AlterTable
+            | Op::Upsert
             | Op::DropTable
             | Op::ShowPartitionedDml
             | Op::CancelPartitionedDml => false,
@@ -131,6 +141,7 @@ impl Op {
             Op::Scan => "scan",
             Op::Aggregate => "aggregate",
             Op::Insert => "insert",
+            Op::Upsert => "upsert",
             Op::Update => "update",
             Op::Delete => "delete",
             Op::CreateTable => "create_table",
@@ -141,6 +152,14 @@ impl Op {
         }
     }
 
+    /// 実行器へ結線済みか。`false` の op は語彙・スキーマ検証を通過しても
+    /// 実行せず `0A000` で止める（実行器なしで成功を偽装しない）。層 B の
+    /// パリティガード（`three_client_http_e2e`）が成功ケースの網羅対象を
+    /// 絞る根拠。`upsert` は Issue #2087 で結線し `true` へ反転する。
+    pub const fn execution_wired(self) -> bool {
+        !matches!(self, Op::Upsert)
+    }
+
     /// 対応する [`ObjectSchema`]（`super::schema::OP_SCHEMAS` と同一の表を
     /// 参照。表引きの単一情報源は本モジュール）。
     pub fn schema(self) -> &'static ObjectSchema {
@@ -149,6 +168,7 @@ impl Op {
             Op::Scan => &super::schema::SCAN_SCHEMA,
             Op::Aggregate => &super::schema::AGGREGATE_SCHEMA,
             Op::Insert => &super::schema::INSERT_SCHEMA,
+            Op::Upsert => &super::schema::UPSERT_SCHEMA,
             Op::Update => &super::schema::UPDATE_SCHEMA,
             Op::Delete => &super::schema::DELETE_SCHEMA,
             Op::CreateTable => &super::schema::CREATE_TABLE_SCHEMA,
@@ -213,11 +233,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_accepts_exact_eleven_values() {
+    fn parse_accepts_exact_twelve_values() {
         assert_eq!(Op::parse("search"), Some(Op::Search));
         assert_eq!(Op::parse("scan"), Some(Op::Scan));
         assert_eq!(Op::parse("aggregate"), Some(Op::Aggregate));
         assert_eq!(Op::parse("insert"), Some(Op::Insert));
+        assert_eq!(Op::parse("upsert"), Some(Op::Upsert));
         assert_eq!(Op::parse("update"), Some(Op::Update));
         assert_eq!(Op::parse("delete"), Some(Op::Delete));
         assert_eq!(Op::parse("create_table"), Some(Op::CreateTable));
@@ -234,7 +255,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_rejects_vocabulary_outside_eleven_values() {
+    fn parse_rejects_vocabulary_outside_twelve_values() {
         let negatives = [
             "",
             " search",
@@ -268,7 +289,10 @@ mod tests {
             "DELETE",
             " delete",
             "delete ",
-            "upsert",
+            "UPSERT",
+            " upsert",
+            "upsert ",
+            "Upsert",
             "truncate",
             "merge",
             "patch",
@@ -276,6 +300,17 @@ mod tests {
         for raw in negatives {
             assert_eq!(Op::parse(raw), None, "unexpected accept for {raw:?}");
         }
+    }
+
+    #[test]
+    fn only_upsert_is_not_execution_wired() {
+        // Issue #2087 で upsert を結線する際、本テストと述語を必ず更新させる。
+        let unwired: Vec<Op> = Op::ALL
+            .iter()
+            .copied()
+            .filter(|op| !op.execution_wired())
+            .collect();
+        assert_eq!(unwired, vec![Op::Upsert]);
     }
 
     #[test]
