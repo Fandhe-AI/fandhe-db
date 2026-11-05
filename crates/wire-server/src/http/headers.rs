@@ -62,8 +62,8 @@ impl<'a> Headers<'a> {
         self.len
     }
 
-    /// ヘッダが 1 件も無いか（終端行のみだった場合。`Content-Length` は
-    /// 必須のため実際には到達しないが、`len` との対で提供する）。
+    /// ヘッダが 1 件も無いか（終端行のみだった場合。`Content-Length` 必須の
+    /// 規則では到達せず、GET の省略許可規則でのみ起こりうる。`len` との対で提供する）。
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -132,6 +132,25 @@ pub enum HeaderParse<'a> {
 /// 以降）を指すスライスで、本文が続いていてもよい（無視し `consumed` で
 /// 境界だけを返す）。
 pub fn parse_headers(input: &[u8]) -> Result<HeaderParse<'_>, FrameError> {
+    parse_headers_with(input, ContentLengthRule::Required)
+}
+
+/// `Content-Length` 欠落の扱い。本文を持たない `GET /v1/openapi.json`（Issue #2244）
+/// だけが [`ContentLengthRule::OptionalDefaultZero`] を使い、`POST` は常に `Required`。
+/// 重複・非数値・`Transfer-Encoding` の拒否は規則によらず不変（request smuggling 面を増やさない）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContentLengthRule {
+    /// 欠落は `08P01`（従来挙動）。
+    Required,
+    /// 欠落は宣言長 0 として扱う。
+    OptionalDefaultZero,
+}
+
+/// [`parse_headers`] の規則指定版。接続ハンドラがメソッドから規則を決めて呼ぶ。
+pub fn parse_headers_with(
+    input: &[u8],
+    rule: ContentLengthRule,
+) -> Result<HeaderParse<'_>, FrameError> {
     let mut entries: [Option<(&[u8], &[u8])>; MAX_HEADER_COUNT] = [None; MAX_HEADER_COUNT];
     let mut count = 0usize;
     let mut pos = 0usize;
@@ -166,8 +185,13 @@ pub fn parse_headers(input: &[u8]) -> Result<HeaderParse<'_>, FrameError> {
 
         if line.is_empty() {
             // 終端空行（CRLF のみ）に到達。
-            let content_length =
-                content_length.ok_or(FrameError::Malformed("missing content-length"))?;
+            let content_length = match (content_length, rule) {
+                (Some(v), _) => v,
+                (None, ContentLengthRule::OptionalDefaultZero) => 0,
+                (None, ContentLengthRule::Required) => {
+                    return Err(FrameError::Malformed("missing content-length"));
+                }
+            };
             let consumed = line_end;
             if consumed > MAX_HEADER_SECTION_LEN {
                 return Err(FrameError::Malformed("header section exceeds limit"));
@@ -792,5 +816,27 @@ mod tests {
         let input = b"Content-Length: 0\rX-Foo: bar\r\n\r\n";
         let err = parse_headers(input).unwrap_err();
         assert_protocol_violation(&err);
+    }
+
+    #[test]
+    fn optional_rule_defaults_missing_content_length_to_zero() {
+        let input = b"Host: x\r\n\r\n";
+        match parse_headers_with(input, ContentLengthRule::OptionalDefaultZero).unwrap() {
+            HeaderParse::Complete { headers, .. } => assert_eq!(headers.content_length(), 0),
+            other => panic!("expected Complete, got {other:?}"),
+        }
+        assert!(parse_headers_with(input, ContentLengthRule::Required).is_err());
+        assert!(parse_headers(input).is_err());
+    }
+
+    #[test]
+    fn optional_rule_still_rejects_duplicates_and_transfer_encoding() {
+        for raw in [
+            &b"Content-Length: 0\r\nContent-Length: 0\r\n\r\n"[..],
+            b"Content-Length: abc\r\n\r\n",
+            b"Transfer-Encoding: chunked\r\n\r\n",
+        ] {
+            assert!(parse_headers_with(raw, ContentLengthRule::OptionalDefaultZero).is_err());
+        }
     }
 }
