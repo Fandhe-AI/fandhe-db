@@ -269,6 +269,12 @@ pub(crate) fn extract_column_order_value_ref<'a>(
         ) => Ok(Some(collated_text_key(key.collation, t.as_bytes()))),
         // `CHAR(n)` は保存形（n 文字へ空白詰め）の末尾の半角空白を除いた値で比較する
         // （TABLE-31・Issue #1566）。
+        // キーセットの末尾キー専用（Issue #2093）: `BYTEA` の PK 列はバイト列順で比較する。
+        // 利用者向けの `ORDER BY <bytea 列>` は束縛段（`resolve_order_kind`）が `22000` で拒否
+        // するため、この腕へはキーセットの末尾束縛（`bind_keyset_tail`）からしか到達しない。
+        (ColumnType::Bytea, OrderKind::Bytes, row_codec::ScalarRef::Bytes(b)) => {
+            Ok(Some(ScalarKeyRef::Bytes(b)))
+        }
         (ColumnType::Bpchar(_), OrderKind::Bpchar, row_codec::ScalarRef::Text(t)) => Ok(Some(
             collated_text_key(key.collation, t.trim_end_matches(' ').as_bytes()),
         )),
@@ -405,6 +411,56 @@ pub(crate) fn compare_statement_order(
         Ordering::Equal => a_tenant.cmp(b_tenant),
         id_ord => id_ord,
     }
+}
+
+/// キーセットモード（Issue #2093・NOSQL-23・SQL-25）の行順序を決める比較器。キーを順に
+/// 比較し（NULL 位置・降順は [`compare_order_key`] と同一）、全キー同点なら `tenant_id` の
+/// バイト順で確定する。[`compare_statement_order`] との違いは物理キー `id` を最終同点に
+/// 使わない点だけ: 順序仕様の末尾キー（PK 列、PK なし表では物理 id）が既にテナント内の
+/// 一意性を担うため、同一 PK の削除→再挿入で物理 id だけが変わっても行の位置が変わらない。
+/// `sql::scan` の経路 (B) の `HeapEntry` と述語（[`compare_keyset_ref_to_owned`]）が共有する。
+pub(crate) fn compare_keyset_order(
+    spec: &[BoundOrderKey],
+    a_keys: &[Option<OrderValue>],
+    a_tenant: &[u8],
+    b_keys: &[Option<OrderValue>],
+    b_tenant: &[u8],
+) -> Ordering {
+    for (idx, key) in spec.iter().enumerate() {
+        let a = a_keys.get(idx).and_then(|o| o.as_ref());
+        let b = b_keys.get(idx).and_then(|o| o.as_ref());
+        let ord = compare_order_key(a, b, key.descending, key.nulls);
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    a_tenant.cmp(b_tenant)
+}
+
+/// [`compare_keyset_order`] の借用対応版（候補行〔複製前の借用キー〕対 保持済みの所有キー）。
+/// キーセット述語「行が位置より出力順で厳密に後ろ」は `== Ordering::Greater` で判定する。
+pub(crate) fn compare_keyset_ref_to_owned(
+    spec: &[BoundOrderKey],
+    refs: &[Option<ScalarKeyRef<'_>>],
+    tenant: &[u8],
+    other_keys: &[Option<OrderValue>],
+    other_tenant: &[u8],
+) -> Ordering {
+    for (idx, key) in spec.iter().enumerate() {
+        let a = refs.get(idx).and_then(|o| o.as_ref());
+        let b = other_keys.get(idx).and_then(|o| o.as_ref());
+        let ord = compare_nullable(
+            a,
+            b,
+            key.descending,
+            key.nulls,
+            compare_ref_and_owned_values,
+        );
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    tenant.cmp(other_tenant)
 }
 
 /// [`ScalarKeyRef`] 1 件分と [`OrderValue`] 1 件分を「昇順が自然な順序」として
@@ -786,5 +842,132 @@ mod tests {
         };
         let cell = order_value_to_cell(&v, Some(&ColumnType::Text)).expect("cell");
         assert!(matches!(cell, crate::sql::exec::Cell::Text(s) if s == "あ"));
+    }
+    // --- キーセット比較器（Issue #2093・NOSQL-23・SQL-25） -----------------------------
+
+    fn okey(descending: bool, nulls: NullPlacement, kind: OrderKind) -> BoundOrderKey {
+        BoundOrderKey {
+            target: BoundOrderTarget::Column(0),
+            kind,
+            descending,
+            nulls,
+            collation: Collation::DEFAULT,
+        }
+    }
+
+    fn int_row(vals: &[Option<i64>]) -> Vec<Option<OrderValue>> {
+        vals.iter().map(|v| v.map(OrderValue::SignedInt)).collect()
+    }
+
+    /// 昇降順 × NULL 位置の全組で、`compare_keyset_order` は `compare_order_key` と一致する。
+    #[test]
+    fn keyset_order_matches_scalar_comparator_for_direction_and_null_placement() {
+        for descending in [false, true] {
+            for nulls in [NullPlacement::First, NullPlacement::Last] {
+                let spec = [okey(descending, nulls, OrderKind::SignedInt)];
+                let vals = [None, Some(1), Some(2)];
+                for a in &vals {
+                    for b in &vals {
+                        let ka = int_row(&[*a]);
+                        let kb = int_row(&[*b]);
+                        let expect = compare_order_key(
+                            ka.first().and_then(|o| o.as_ref()),
+                            kb.first().and_then(|o| o.as_ref()),
+                            descending,
+                            nulls,
+                        );
+                        assert_eq!(
+                            compare_keyset_order(&spec, &ka, b"t", &kb, b"t"),
+                            expect,
+                            "desc={descending} nulls={nulls:?} a={a:?} b={b:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// 複数キー: 第 1 キー同点なら第 2 キー、全キー同点なら tenant のバイト順で決まる。
+    #[test]
+    fn keyset_order_breaks_ties_by_next_key_then_tenant() {
+        let spec = [
+            okey(true, NullPlacement::First, OrderKind::SignedInt),
+            okey(false, NullPlacement::Last, OrderKind::SignedInt),
+        ];
+        let a = int_row(&[Some(5), Some(1)]);
+        let b = int_row(&[Some(5), Some(2)]);
+        assert_eq!(
+            compare_keyset_order(&spec, &a, b"t", &b, b"t"),
+            Ordering::Less
+        );
+        let c = int_row(&[Some(6), Some(9)]);
+        // 第 1 キーは降順: 6 が 5 より前。
+        assert_eq!(
+            compare_keyset_order(&spec, &c, b"t", &a, b"t"),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_keyset_order(&spec, &a, b"a", &a, b"b"),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_keyset_order(&spec, &a, b"a", &a, b"a"),
+            Ordering::Equal
+        );
+    }
+
+    /// 述語の性質検査: 小さな固定データ（NULL・NaN・±0・重複を含む）を全順序で並べ、
+    /// 全組 (i, j) について「`after = 行 j` の述語が行 i を通す ⇔ i が j より後ろ」。
+    #[test]
+    fn keyset_predicate_selects_exactly_the_rows_after_the_position() {
+        let values: Vec<Option<f64>> = vec![
+            None,
+            Some(f64::NAN),
+            Some(0.0),
+            Some(-0.0),
+            Some(1.5),
+            Some(1.5),
+            Some(-3.0),
+            None,
+        ];
+        for descending in [false, true] {
+            for nulls in [NullPlacement::First, NullPlacement::Last] {
+                let spec = [
+                    okey(descending, nulls, OrderKind::Float),
+                    okey(false, NullPlacement::Last, OrderKind::SignedInt),
+                ];
+                // 第 2 キー（末尾キー相当）は行番号で一意にする。
+                let rows: Vec<Vec<Option<OrderValue>>> = values
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| {
+                        vec![
+                            v.map(OrderValue::Float),
+                            Some(OrderValue::SignedInt(i64::try_from(i).expect("small"))),
+                        ]
+                    })
+                    .collect();
+                let mut sorted: Vec<usize> = (0..rows.len()).collect();
+                sorted
+                    .sort_by(|&x, &y| compare_keyset_order(&spec, &rows[x], b"t", &rows[y], b"t"));
+                let rank = |i: usize| sorted.iter().position(|&r| r == i).expect("rank");
+                for i in 0..rows.len() {
+                    for j in 0..rows.len() {
+                        let refs: Vec<Option<ScalarKeyRef<'_>>> = rows[i]
+                            .iter()
+                            .map(|o| o.as_ref().map(|v| v.as_key_ref()))
+                            .collect();
+                        let passes =
+                            compare_keyset_ref_to_owned(&spec, &refs, b"t", &rows[j], b"t")
+                                == Ordering::Greater;
+                        assert_eq!(
+                            passes,
+                            rank(i) > rank(j),
+                            "desc={descending} nulls={nulls:?} i={i} j={j}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

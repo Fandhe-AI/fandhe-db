@@ -111,7 +111,7 @@
 | --- | --- |
 | `OFFSET`（本 ADR） | ステートレス（サーバー側に状態を持たない）・実装が単純・深いページングは走査コストが線形に増える |
 | カーソル（`DECLARE`/`FETCH`。WIRE-15、既存） | `DECLARE` 時に一度だけ実行して確定するため書き込み挟み込みの影響を受けない。ただしトランザクション・セッション byte 予算（`MAX_CURSOR_BYTES_PER_SESSION`）に縛られる |
-| keyset（`WHERE id > <last>`） | 広域取得の物理走査順はテナント主順で `id` 単調ではないため、スカラー `ORDER BY`（`ORDER BY id` 前提。SQL-25 (a) 実装後）でのみ正しく機能する。現時点では一般には適用できない |
+| keyset（`WHERE id > <last>`） | 広域取得の物理走査順はテナント主順で `id` 単調ではないため、スカラー `ORDER BY`（`ORDER BY id` 前提。SQL-25 (a) 実装後）でのみ正しく機能する。現時点では一般には適用できない（NoSQL 表層のキーセットは Issue #2093・#2094。[scalar-order-by-scan.md](scalar-order-by-scan.md) のキーセットモード節） |
 
 本 Issue では `OFFSET` を採用し、安定性が必要な場合はカーソルを既存経路として
 併用可能とした。ステートレスな任意ページアクセス（`OFFSET`）と、書き込み挟み
