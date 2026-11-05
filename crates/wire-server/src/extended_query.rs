@@ -2531,6 +2531,8 @@ fn execute_portal<'e, S: WireStream>(
                 | engine::sql::partitioned::PartitionedControl::ExplainDelete(_)
                 | engine::sql::partitioned::PartitionedControl::ExplainUpdate(_),
             ) => false,
+            // Issue #2050: `EXPLAIN UPDATE|DELETE` も読み取りのみで commit を伴わない。
+            ParsedSql::ExplainDml(_) => false,
             // `COPY` は上で横取り済みでここへは到達しない（書き込み扱いの見直し申し送りへの回答）。
             ParsedSql::Copy(_) => !was_active_before_execution,
             _ => !was_active_before_execution,

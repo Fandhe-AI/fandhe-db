@@ -512,3 +512,24 @@ Issue #2048 で `42601` にしていた形のうち、次の 3 つを段の木�
 - **対象外（後続）**: 投影位置・式に埋め込んだ部分クエリ、集計の `FILTER`／`HAVING` の部分クエリ、`$n` を含む
   EXPLAIN 前置の WITH・派生表・部分クエリは引き続き `42601`（fail-closed）。CTE・派生表の主クエリの部分クエリは
   実行側が拒否している間は EXPLAIN も同じコードで拒否する。
+
+## 追記（Issue #2050・SQL-75 (1)(2)(3)(5)(6)）: 述語形 UPDATE／DELETE の対象走査
+
+親 #2049（SQL-75 のポインタ）の DML の EXPLAIN のうち、述語形の `UPDATE`／`DELETE`（`PARTITIONED` なし）を受理する。
+INSERT は #2051 が担当する。`EXPLAIN ... PARTITIONED` は従来の出力のまま不変。
+
+- **出力語彙**: 根は `delete`／`update`。`assignments: <SET の列数>`（UPDATE のみ）、`filter: present|none`
+  （束縛後のフィルタの有無）、`returning: present|none`、`operation_id: present|none`（値は出さない）に続き、
+  子として `scan` 段（`scalar_plan`・`access_path`。SELECT と同じ組み立て関数）を 1 つ置く。値・表名・件数は出さない。
+- **走査分類を全走査に固定する根拠**: DML 実行器の候補列挙（`core/tenant.rs` の `enumerate_dml_candidates_with`）は
+  PK 点検索・GIN・スカラー索引を使わず、自テナントの物理キー範囲を全走査して行ごとに述語を評価する。
+  SELECT 用の分類を流用すると実経路と矛盾する出力になるため、`plain_scan`／`full_scan` に固定した。
+  **実行器が索引を使うよう変わるときは分類も一緒に変えること**。
+- **副作用ゼロ・エラー一致**: 構文段は非 EXPLAIN の DML と同じ入口で解析し、実行段は実行と同じ `prepare_predicate_*` で
+  束縛する。スキーマの読み取りのみで、write txn・writer・台帳・行・シーケンス・トリガに触れない。READ ONLY
+  トランザクションでも実行できる。未知の列・型不一致・不存在表は実行と同じ `wire_code`。
+- **権限**: 実行した場合と同じ DELETE／UPDATE 権限を write gate で要求する（`42501`。SQL-40）。
+- **対象外（`42601`、一時表は `0A000`）**: 採番でない表の単一行形（物理キー直接指定の語彙が未定義）、
+  `UPDATE ... FROM`／`DELETE ... USING`、自動更新可能なビュー、WHERE の部分クエリ、一時表、セッション無しの入口。
+  `$n` 付きの拡張クエリの EXPLAIN は既存の EXPLAIN の規則どおり。
+

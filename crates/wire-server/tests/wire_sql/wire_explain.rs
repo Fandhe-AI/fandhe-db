@@ -294,3 +294,40 @@ fn explain_reports_plain_scan_precision_ann_plan_for_hnsw_precision_mode() {
     assert_eq!(read_command_complete(&mut stream), "EXPLAIN");
     read_ready_for_query(&mut stream);
 }
+
+/// Issue #2050（SQL-75）: 述語形 `EXPLAIN DELETE` は `QUERY PLAN` 単一列の段の木を返し、
+/// `CommandComplete` は `EXPLAIN`。実行しないため後続の `SELECT` で行は残る。
+#[test]
+fn explain_delete_returns_plan_tree_without_deleting() {
+    let (core, _guard) = new_core_with_docs_table();
+    let (mut stream, _users_path) = spawn_with_alice(core);
+
+    send_simple_query(
+        &mut stream,
+        "EXPLAIN DELETE FROM docs WHERE path = 'docs/a.md'",
+    );
+    let columns = read_row_description(&mut stream);
+    assert_eq!(columns, vec!["QUERY PLAN".to_string()]);
+    let expected_lines = [
+        "delete",
+        "filter: present",
+        "returning: none",
+        "operation_id: none",
+        "-> scan",
+        "   scalar_plan: plain_scan",
+        "   access_path: full_scan",
+    ];
+    for expected in expected_lines {
+        let row = read_data_row(&mut stream);
+        assert_eq!(row[0].as_deref(), Some(expected));
+    }
+    assert_eq!(read_command_complete(&mut stream), "EXPLAIN");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(&mut stream, "SELECT path FROM docs");
+    let _columns = read_row_description(&mut stream);
+    let row = read_data_row(&mut stream);
+    assert_eq!(row[0].as_deref(), Some("docs/a.md"));
+    assert_eq!(read_command_complete(&mut stream), "SELECT 1");
+    read_ready_for_query(&mut stream);
+}
