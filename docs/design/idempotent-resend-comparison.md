@@ -40,7 +40,7 @@ fandhe 側にテストで固定した根拠がある項目に限る。差異・�
 | 明示 Tx・失敗時 | 検証失敗や同時実行の衝突は結果を保存せず再試行できる | 該当なし | 該当なし | 該当なし | COMMIT と同時に永続化。ROLLBACK・事前拒否後は記録が残らず ID を再利用できる。同一 Tx 内の再利用は `25000` |
 | 対象操作 | POST 要求（GET・DELETE は対象外） | UPSERT は INSERT のみ。UPDATE／DELETE の冪等化は自前の台帳表が要る | 同左（INSERT 系のみ） | 同左（INSERT 系のみ） | INSERT（単一・複数行・ファイル形）・UPSERT・UPDATE／DELETE・TRUNCATE・分割実行 DML。0 行の DELETE も記録 |
 | 保持期間（TTL） | v1 は 24 時間以上経過したキーを自動削除しうる。削除後の再利用は新規要求になる | 該当なし | 該当なし | 該当なし | 自動掃除なし。`DROP TABLE` でのみ消え、`RENAME TO` では新しい名前へ移す |
-| 結果の再生 | v1 は最初の応答（ステータスとボディ。500 を含む）を保存して返す | 該当なし | 該当なし | 該当なし | 再生しない。再送には `23505`（NoSQL は 409・`DUPLICATE_OPERATION_ID`）を返し、commit 済みの確定根拠とする。例外として分割実行 DML は保存したカーソルから再開する |
+| 結果の再生 | v1 は最初の応答（ステータスとボディ。500 を含む）を保存して返す | 該当なし | 該当なし | 該当なし | 再生しない。台帳の内容一致による重複拒否として再送には `23505`（NoSQL は 409・`DUPLICATE_OPERATION_ID`）を返す。commit 済みの確定根拠は台帳の内容一致による重複拒否であり、SQL の `23505` 単独では主キー等の通常の一意制約違反（書き込み失敗）と区別できないため、NoSQL では `code=DUPLICATE_OPERATION_ID` を確認する。例外として分割実行 DML は保存したカーソルから再開する |
 | commit 済みかの照会 | 公式ドキュメントで確認できず | 該当なし | 該当なし | 該当なし | engine API の `EngineCore::operation_recorded`・`last_operation_id`（RECOVER-7）のみ。wire・HTTP からの照会は未提供 |
 | 必須・任意 | 任意（ヘッダを付けた要求のみ） | 該当なし | 該当なし | 該当なし | 既定は任意。`--require-operation-id` で必須 |
 
