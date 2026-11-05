@@ -6,7 +6,8 @@
 //! 有界読み取り・EOF 判断は呼び出し元（Issue #747 の接続ハンドラ）が担い、
 //! 本モジュールが返す `consumed`（ヘッダ部先頭からの消費バイト数）は本文の
 //! 開始位置を指す。後続の `Content-Type`・本文長検証（Issue #742）・
-//! `Authorization` の解釈（`crate::http::session::bearer`。Issue #753・#754）はいずれも [`Headers::get_single`] 等
+//! `Authorization` の解釈（`crate::http::session::bearer`。Issue #753・#754）・`Idempotency-Key` の取り出し
+//! （`crate::http::idempotency_key`。Issue #2063）はいずれも [`Headers::get_single`] 等
 //! 本モジュールの公開 API 経由でヘッダへアクセスする。
 //!
 //! ヘッダ部合計バイト数・個数の上限（[`MAX_HEADER_SECTION_LEN`]・
@@ -36,6 +37,7 @@ pub const MAX_HEADER_COUNT: usize = 32;
 
 const TRANSFER_ENCODING: &[u8] = b"transfer-encoding";
 const CONTENT_LENGTH: &[u8] = b"content-length";
+const IDEMPOTENCY_KEY: &[u8] = b"idempotency-key";
 
 /// 解析済みヘッダ群。名前・値はいずれも入力バッファからの借用であり、
 /// コピー・ヒープ確保を行わない（`[Option<_>; MAX_HEADER_COUNT]` は `Copy`）。
@@ -92,6 +94,16 @@ impl<'a> Headers<'a> {
             }
         }
         Ok(found)
+    }
+
+    /// `Idempotency-Key` ヘッダの生の値（OWS 除去済みの借用）を取り出す薄い包み
+    /// （Issue #2063・HTTP-14 (2) ポインタ）。
+    ///
+    /// 0 件は `Ok(None)`、2 件以上は `08P01`（[`Self::get_single`] の一般則）。
+    /// 長さ・文字の検証は本層では行わず、`crate::http::idempotency_key` が
+    /// `OperationId::parse` で担う（本モジュールは engine に依存しない）。
+    pub fn idempotency_key(&self) -> Result<Option<&'a [u8]>, FrameError> {
+        self.get_single(IDEMPOTENCY_KEY)
     }
 }
 
@@ -413,6 +425,42 @@ mod tests {
                 assert_protocol_violation(&err);
             }
             other => panic!("expected Complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn idempotency_key_absent_is_none_and_name_is_case_insensitive() {
+        let input = body_after(b"Content-Length: 0\r\n\r\n");
+        match parse_headers(&input).expect("parse should succeed") {
+            HeaderParse::Complete { headers, .. } => {
+                assert_eq!(headers.idempotency_key().expect("lookup"), None);
+            }
+            other => panic!("expected Complete, got {other:?}"),
+        }
+        for name in ["IDEMPOTENCY-KEY", "idempotency-key", "Idempotency-Key"] {
+            let raw = format!("{name}: k1\r\nContent-Length: 0\r\n\r\n");
+            match parse_headers(raw.as_bytes()).expect("parse should succeed") {
+                HeaderParse::Complete { headers, .. } => {
+                    assert_eq!(headers.idempotency_key().expect("lookup"), Some(&b"k1"[..]));
+                }
+                other => panic!("expected Complete, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn idempotency_key_duplicate_is_protocol_violation() {
+        for raw in [
+            &b"Idempotency-Key: a\r\nIdempotency-Key: a\r\nContent-Length: 0\r\n\r\n"[..],
+            &b"Idempotency-Key: a\r\nidempotency-key: b\r\nContent-Length: 0\r\n\r\n"[..],
+        ] {
+            match parse_headers(raw).expect("parse should succeed") {
+                HeaderParse::Complete { headers, .. } => {
+                    let err = headers.idempotency_key().unwrap_err();
+                    assert_protocol_violation(&err);
+                }
+                other => panic!("expected Complete, got {other:?}"),
+            }
         }
     }
 
