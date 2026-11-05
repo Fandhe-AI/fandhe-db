@@ -29,6 +29,7 @@ use crate::sql::allowlist::{
     SqlSurfaceError, ValidatedInsert, ValidatedUpdateForm,
 };
 use crate::sql::cte::DmlStatement;
+use crate::sql::explain_analyze::ExplainAnalyzeDmlTarget;
 use crate::sql::explain_dml::ExplainDml;
 use crate::sql::lexer::Token;
 use crate::sql::mode::SessionState;
@@ -218,6 +219,25 @@ pub(crate) fn classify_write(parsed: &ParsedSql) -> WriteRequirement {
                 let (t, b) = update_form_bits(&ValidatedUpdateForm::Predicate(u.clone()));
                 WriteRequirement::one(&t, b)
             }
+        },
+        // Issue #2055: ANALYZE は実際に書き込むため、内側の DML と同じ権限ビットを実行前に要求する（SQL-40）。
+        ParsedSql::ExplainAnalyzeDml(ea) => match &ea.target {
+            ExplainAnalyzeDmlTarget::Dml(ExplainDml::Delete(d)) => {
+                let (t, b) = delete_form_bits(&DeleteStatement::Predicate(d.clone()));
+                WriteRequirement::one(&t, b)
+            }
+            ExplainAnalyzeDmlTarget::Dml(ExplainDml::Update(u)) => {
+                let (t, b) = update_form_bits(&ValidatedUpdateForm::Predicate(u.clone()));
+                WriteRequirement::one(&t, b)
+            }
+            ExplainAnalyzeDmlTarget::Insert(t) => match &**t {
+                crate::sql::insert_explain::ExplainInsertTarget::Values(v) => {
+                    WriteRequirement::one(&v.table_name, insert_bits(v))
+                }
+                crate::sql::insert_explain::ExplainInsertTarget::Select { insert, .. } => {
+                    WriteRequirement::one(insert.table_name(), insert_select_bits(insert))
+                }
+            },
         },
         ParsedSql::Partitioned(c) => match c {
             PartitionedControl::ExplainDelete(d) => {

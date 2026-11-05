@@ -2,7 +2,7 @@
 //!
 //! (1) 構文: 括弧形・前置形（`ANALYZE`／`ANALYSE`）。(2) ANALYZE: 文を実際に実行し、計画の根の段へ
 //! 結果の行数を併記する（結果の行は返さない）。(3) 計測値のテナント境界: 併記する行数は可視行に限り、
-//! 他テナントの行量で出力が変わらない。DML・`USING PLAN`・一時表・`VERBOSE`・`FORMAT JSON` は `0A000`。
+//! 他テナントの行量で出力が変わらない。`USING PLAN`・一時表・`VERBOSE`・`FORMAT JSON` は `0A000`。
 
 use engine::core::EngineCore;
 use engine::kernel::CpuScalarProvider;
@@ -283,9 +283,6 @@ fn unsupported_forms_are_rejected() {
     let (core, _g) = seeded("x76a-reject");
     let before = snapshot(&core);
     for sql in [
-        "EXPLAIN ANALYZE DELETE FROM a WHERE k > 1",
-        "EXPLAIN ANALYZE UPDATE a SET v = 'z' WHERE k > 1",
-        "EXPLAIN ANALYZE INSERT INTO a (k, v) VALUES (9, 'z')",
         "EXPLAIN ANALYZE DELETE FROM a WHERE k > 1 USING OPERATION_ID 'p-del' PARTITIONED CHUNK 1",
         "EXPLAIN ANALYZE VERBOSE SELECT k FROM a",
         "EXPLAIN (ANALYZE, VERBOSE) SELECT k FROM a",

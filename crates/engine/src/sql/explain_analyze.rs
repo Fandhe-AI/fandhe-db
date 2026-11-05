@@ -11,6 +11,11 @@
 //! - [`annotate`] は描画済みの静的な計画（`QUERY PLAN` 1 列）へ、実行結果の行数と経過時間を併記する。
 //!   呼び出し元は `core/explain_analyze_exec.rs`（計画の生成と文の実行を担う）。
 //!
+//! DML（Issue #2055）: [`ExplainAnalyzeDml`] は書き込み文を実際に実行する。PostgreSQL と同じく自動では
+//! 巻き戻さない（autocommit では commit・台帳記録が残り、巻き戻すなら利用者が `BEGIN`／`ROLLBACK` で囲む）。
+//! 根の段の `actual_rows` は文がクライアントへ返したはずの行数（`RETURNING` の可視行。無ければ 0）で、
+//! 変更行数（`rows_affected`）は出さない。
+//!
 //! テナント境界（SQL-76 (3)）: 併記する `actual_rows` は通常の SELECT の実行器が返した結果の行数
 //! （RLS を暗黙適用した後の可視行・LIMIT／OFFSET 適用後）に限る。走査した行数・フィルタで除いた行数・
 //! 推定値・他テナントを含む件数は出さない。経過時間は壁時計の値で、`TIMING OFF` で抑止できる。
@@ -20,8 +25,10 @@
 
 use crate::sql::allowlist::{CteExplainMain, ExplainTarget, SqlSurfaceError, Statement};
 use crate::sql::exec::{Cell, QueryResult, ResultRow};
+use crate::sql::explain_dml::ExplainDml;
 use crate::sql::explain_tree::MAX_EXPLAIN_TREE_LINES;
 use crate::sql::hnsw_observe::HnswObservation;
+use crate::sql::insert_explain::ExplainInsertTarget;
 
 /// 併記する行数の最大（根の段へ最大 3 行 + HNSW の最大 4 行 + 末尾へ最大 2 行）。上限判定の余裕に使う。
 const ANNOTATION_LINES: usize = 9;
@@ -32,6 +39,50 @@ pub struct ExplainAnalyzeSelect {
     pub(crate) target: ExplainTarget,
     pub(crate) timing: bool,
     pub(crate) summary: bool,
+}
+
+/// `EXPLAIN ANALYZE` の対象となる書き込み文（Issue #2055・SQL-76 (2)(3) のポインタ）。
+///
+/// 静的な `EXPLAIN` が検証済みの値（[`ExplainDml`]・[`ExplainInsertTarget`]）をそのまま保持し、
+/// 計画の生成と実行の両方がこの 1 つの値から作られる（第 2 の解析器・書き込み経路を作らない）。
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum ExplainAnalyzeDmlTarget {
+    /// 述語形の `UPDATE`／`DELETE`。
+    Dml(ExplainDml),
+    /// `INSERT ... VALUES`／`INSERT ... SELECT`。
+    Insert(Box<ExplainInsertTarget>),
+}
+
+/// 実際に書き込んで実測値を併記する `EXPLAIN ANALYZE <DML>` の検証済み対象。
+///
+/// `ExplainAnalyzeSelect` と違い、実行は書き込み（autocommit では commit・台帳記録を伴う）。
+/// 権限・READ ONLY・台帳の分類は読み取りと別の `ParsedSql::ExplainAnalyzeDml` として行う。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExplainAnalyzeDml {
+    pub(crate) target: ExplainAnalyzeDmlTarget,
+    pub(crate) timing: bool,
+    pub(crate) summary: bool,
+}
+
+impl ExplainAnalyzeDml {
+    /// `USING OPERATION_ID` の値（トランザクション内の再利用検査・台帳に使う）。
+    pub(crate) fn operation_id(&self) -> Option<&str> {
+        match &self.target {
+            ExplainAnalyzeDmlTarget::Dml(ExplainDml::Delete(v)) => {
+                v.operation_id().map(|id| id.as_str())
+            }
+            ExplainAnalyzeDmlTarget::Dml(ExplainDml::Update(v)) => {
+                v.operation_id().map(|id| id.as_str())
+            }
+            ExplainAnalyzeDmlTarget::Insert(t) => match &**t {
+                ExplainInsertTarget::Values(v) => v.operation_id.as_ref().map(|id| id.as_str()),
+                ExplainInsertTarget::Select { insert, .. } => {
+                    insert.operation_id().map(|id| id.as_str())
+                }
+            },
+        }
+    }
 }
 
 /// 実行で得た実測値（行数と経過時間。単位はミリ秒の小数）。
