@@ -15,7 +15,7 @@
 //! [--hnsw-sparse-visited-max <N>]
 //! [--auth-method cleartext|scram-sha-256] [--scram-mock-key-file <path>]
 //! [--stopwords-file <path>] [--synonyms-file <path>]
-//! [--reranker off|lexical] [--rerank-window <N>]
+//! [--reranker off|lexical|mmr] [--rerank-window <N>] [--rerank-mmr-lambda <0..1>]
 //! [--ddl-allowed-users <user1>[,<user2>...]]
 //! [--tls-cert <pem> --tls-key <pem> [--tls-mode require|allow]
 //!  [--tls-scram-channel-binding enable|disable]]
@@ -394,7 +394,9 @@
 //!
 //! `--reranker <off|lexical|mmr|cross_encoder>`／`--rerank-window <N>`（Issue #2142・SEARCH-15
 //! ポインタ）: ハイブリッド検索の後段のリランカーと、リランク対象の窓幅 `W`（`1..=10000`、
-//! 既定 200）。既定は `off`（従来経路。結果もレイテンシも変わらない）。`mmr`・`cross_encoder` は
+//! 既定 200）。既定は `off`（従来経路。結果もレイテンシも変わらない）。`mmr`（Issue #2143）は
+//! 多様性を考慮するリランカーで、`--rerank-mmr-lambda <0..1>`（既定 0.5。範囲外・不正な書式は起動
+//! エラー。`mmr` 以外での指定も拒否）で関連度と多様性を釣り合わせる。`cross_encoder` は
 //! 語彙としては正しいが本ビルドでは未対応で、固定文言の起動エラーにする。語彙外・範囲外・非数値・
 //! 重複指定・`off` のままの `--rerank-window` も fail-closed で起動エラー。リランカーの契約違反は
 //! 検索を拒否せずリランキング前の順位で応答し、縮退は実行ログとカウンタに残る。解決は
@@ -612,6 +614,7 @@ fn run_server(args: &[String]) -> ExitCode {
     let mut synonyms_file_raw: Option<PathBuf> = None;
     let mut reranker_raw: Option<String> = None;
     let mut rerank_window_raw: Option<String> = None;
+    let mut rerank_mmr_lambda_raw: Option<String> = None;
     let mut tls_cert_raw: Option<PathBuf> = None;
     let mut tls_key_raw: Option<PathBuf> = None;
     let mut tls_mode_raw: Option<String> = None;
@@ -1990,6 +1993,24 @@ fn run_server(args: &[String]) -> ExitCode {
                 rerank_window_raw = Some(v.clone());
                 i += 2;
             }
+            wire_server::rerank_opt::RERANK_MMR_LAMBDA_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires an argument",
+                        wire_server::rerank_opt::RERANK_MMR_LAMBDA_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                if rerank_mmr_lambda_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::rerank_opt::RERANK_MMR_LAMBDA_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                rerank_mmr_lambda_raw = Some(v.clone());
+                i += 2;
+            }
             wire_server::tls_opt::CERT_FLAG => {
                 let Some(v) = args.get(i + 1) else {
                     engine::log_stderr!(
@@ -2394,6 +2415,7 @@ fn run_server(args: &[String]) -> ExitCode {
         match wire_server::rerank_opt::resolve(wire_server::rerank_opt::RerankRawFlags {
             reranker: reranker_raw.as_deref(),
             window: rerank_window_raw.as_deref(),
+            mmr_lambda: rerank_mmr_lambda_raw.as_deref(),
         }) {
             Ok(s) => s,
             Err(e) => {
