@@ -109,3 +109,14 @@ SQL 表層の入口だけを実装した。実行器への反映は後続 Issue 
 - 範囲外と極端値: 範囲外は束縛段で `22000`。`Bm25Params::new` は `k1` の数値安全上限 `1e200` を超える指定も拒否する（有限でも巨大な `k1` は分子・分母が桁あふれして NaN となり候補が黙って落ちる、または `inf` スコアで `XX000` になるため）。上限は 1 文書の tf・文書長の上界と `len/avgdl` の上界から導いた、データに依存しない定数で、拒否の有無から他テナントの存在は推測できない。さらに `score_within_with_params` は非有限スコアを検出すると `SparseError::InvalidParams` で fail-closed にし、sql 層で固定文言の `22000` に写す。spec は `k1` の上限を定めていないため、上限は実装上の数値安全上限という解釈であり、spec 側（SEARCH-13）での確認を要する
 - テナント境界: 統計は従来どおり可視集合へ縮約して計算し、`k1`／`b` はスコア式の係数だけに作用する
 - 対象外: EXPLAIN への実効値の表示（EXPLAIN は `k1`／`b` を受理する）、NoSQL の `hybrid` オブジェクトの `k1`／`b`（#2122）
+
+## 11. Issue #2122 での実装（NoSQL）
+
+NoSQL `search` の `hybrid` オブジェクトに調整キー `k1`・`b`・`rrf_k`・`window`・`weights`（`{"dense","sparse"}`）を追加した（NOSQL-2・SEARCH-13 のポインタ）。
+
+- 経路: SQL テキストは組み立てず、`weights` も JSON 文字列の再パースを通さず構文解析済みの値から読む。`HybridTuning::new` を呼んで `BoundStatement` の `Ranking::Hybrid.tuning` に入れるため、同じ値を与えた NoSQL と SQL の束縛結果は一致する（束縛段のパリティテストと HTTP 経由のバイト一致テストで固定）
+- 検証は 3 層: (1) 型・未知キー・`weights` の形は `HYBRID_SCHEMA`／`HYBRID_WEIGHTS_SCHEMA` とアクセサ（`42601`）、(2) 値の範囲は engine の `HybridTuning::new`（`22000`。範囲を wire-server に複製しない）、(3) `window` と `LIMIT`・`--max-result-rows` の関係、`window` と precision の併用（`0A000`）、`k1` の数値安全上限は engine の `check_bound_search`（通常実行と EXPLAIN の両入口）。調整値は `vector` の値検証より先に検証し、SQL と同じエラー優先順位にした
+- `window` は整数のみ受け付ける。小数・負数・指数表記は `42601`。`usize` に収まらない値は飽和させて範囲外（`22000`）として拒否し、切り捨てない
+- SQL との差分: 型・形の不正の分類だけが異なる。SQL の名前付き引数は型不一致も `22000` だが、NoSQL は NOSQL-8 の一般則（型の不一致は `42601`）に従う。値の範囲の分類と正常値での結果は一致する。SEARCH-13 との整合は spec 側での確認事項
+- テナント境界: 調整値はスコア計算と融合だけに作用し、可視集合を変えない。エラー文言は固定で入力値を含まない
+- 対象外: EXPLAIN への調整値の実効値の表示、`hybrid.text` の疎側列の選択
