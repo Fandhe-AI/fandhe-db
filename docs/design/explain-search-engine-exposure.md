@@ -727,3 +727,15 @@ EXPLAIN ANALYZE（親 #2052）の「計測の土台」を実行器へ入れた�
 （[fulltext-query-syntax.md](fulltext-query-syntax.md) D9）。したがって `search_terms[i]` 行に
 出る語（演算子の文字を含んでも加工しない）がそのまま実行時の解釈であり、EXPLAIN の出力は
 構文の導入前後で変わらない。構文の解釈結果を示す行は新しい安定契約になるため追加していない。
+
+## 追記（Issue #3051・SEARCH-13 ポインタ）: 融合・BM25 の実効値の行
+
+`Ranking::Hybrid` の検索の EXPLAIN は、`scalar_plan:` の後ろに `hybrid_rrf:`（`rrf_k`・`window`・`dense_weight`・
+`sparse_weight`）と `hybrid_bm25:`（`k1`・`b`）を追記する。各値に `[default]`／`[specified]` を付け、
+利用者が明示した値か既定値かを区別する。値の書式と解決の方針は [hybrid-tuning-parameters.md](hybrid-tuning-parameters.md) §12。
+
+- **露出する値**: 文の引数と定数・設定（`--max-result-rows` を含む取得件数）だけから決まる値。
+- **露出しない値**: 可視件数に依存する既定の `window`（precision かつ DISTANCE 先行）は数値を出さず `dynamic`。
+  疎索引の有無・可視行数・他テナントの行量では変わらない。
+- **JSON**: 各行は `key: value` 分割で 1 属性（`"hybrid_rrf"`・`"hybrid_bm25"`）になる。値に `": "` を含めない。
+- `USING PLAN` の EXPLAIN と非 hybrid の文は出力を変えない。

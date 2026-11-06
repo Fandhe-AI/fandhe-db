@@ -78,6 +78,90 @@ const NONE_LABEL: &str = "(none)";
 /// （安定契約）。ヒント未指定の [`NONE_LABEL`] と意味が異なるため区別する。
 const CUSTOM_PROVIDER_LABEL: &str = "(custom_provider)";
 
+/// `hybrid_rrf:`／`hybrid_bm25:` 行の各値の指定元（Issue #3051・SEARCH-13）。閉じた語彙
+/// （`default`／`specified`）で、利用者が引数を明示したか既定値かを区別する。指定値が既定値と等しくても
+/// `Specified` になる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParamSource {
+    /// 引数が未指定で、実行器の既定値が使われる。
+    Default,
+    /// 利用者が名前付き引数で明示した。
+    Specified,
+}
+
+impl ParamSource {
+    /// 行へ出す語彙（`default`／`specified`）。
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Specified => "specified",
+        }
+    }
+}
+
+/// `window=` の実効値（Issue #3051）。precision かつ SCALAR 先行でない文の既定値は可視件数に依存する
+/// ため、数値を出さず固定トークン `dynamic` にする（テナント間で EXPLAIN 出力を一致させる P0 要件）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExplainHybridWindow {
+    /// 静的に決まる候補プール深さ。
+    Fixed(usize),
+    /// 可視件数に依存する（`dynamic` と表示）。
+    Dynamic,
+}
+
+/// `hybrid_rrf:`／`hybrid_bm25:` 行の入力（Issue #3051・SEARCH-13。ポインタ:
+/// `docs/spec/04-behavior/search.md`）。実行器と同じ解決関数（`hybrid_tuning::explain_hybrid_params`）
+/// が束縛結果と定数だけから組み立てる。テナントのデータには依存しない。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ExplainHybridParams {
+    pub(crate) rrf_k: f64,
+    pub(crate) rrf_k_source: ParamSource,
+    pub(crate) window: ExplainHybridWindow,
+    pub(crate) window_source: ParamSource,
+    pub(crate) dense_weight: f64,
+    pub(crate) sparse_weight: f64,
+    /// `weights` は 1 つの引数なので dense／sparse に共通の指定元を付ける。
+    pub(crate) weights_source: ParamSource,
+    pub(crate) k1: f64,
+    pub(crate) k1_source: ParamSource,
+    pub(crate) b: f64,
+    pub(crate) b_source: ParamSource,
+}
+
+/// f64 を行へ出す書式。`-0.0` は `0.0` へ正規化し、`{:?}`（往復可能な最短表記。`60.0`・`1.2`・
+/// `1e200`）で整形する。`{}` は巨大値・微小値で数百桁になるため使わない。
+fn fmt_param_f64(v: f64) -> String {
+    let v = if v == 0.0 { 0.0 } else { v };
+    format!("{v:?}")
+}
+
+/// `hybrid_rrf:`／`hybrid_bm25:` の 2 行を `lines` へ追記する（`scalar_plan:` 行の後ろ）。値の区切りは
+/// `=`・`,`・`[`・`]` のみで `": "` を含まないため、FORMAT JSON では 1 属性になる。
+fn push_hybrid_rows(lines: &mut Vec<String>, p: &ExplainHybridParams) {
+    let window = match p.window {
+        ExplainHybridWindow::Fixed(n) => n.to_string(),
+        ExplainHybridWindow::Dynamic => "dynamic".to_string(),
+    };
+    lines.push(format!(
+        "hybrid_rrf: rrf_k={}[{}],window={}[{}],dense_weight={}[{}],sparse_weight={}[{}]",
+        fmt_param_f64(p.rrf_k),
+        p.rrf_k_source.as_str(),
+        window,
+        p.window_source.as_str(),
+        fmt_param_f64(p.dense_weight),
+        p.weights_source.as_str(),
+        fmt_param_f64(p.sparse_weight),
+        p.weights_source.as_str(),
+    ));
+    lines.push(format!(
+        "hybrid_bm25: k1={}[{}],b={}[{}]",
+        fmt_param_f64(p.k1),
+        p.k1_source.as_str(),
+        fmt_param_f64(p.b),
+        p.b_source.as_str(),
+    ));
+}
+
 /// `EXPLAIN` の `engine:`／`hnsw_params:`／`ann_plan:` 行（Issue #411）を組み立てる
 /// ための入力。呼び出し元 `core.rs::EngineCore::execute_sql_in_session` の
 /// `Statement::Explain` アームが、実行時に executor（`sql::exec`）が使うのと同じ
@@ -111,6 +195,9 @@ pub struct ExplainEngine {
     /// `Some` のとき `hnsw_params:` 行の `m=`／`ef_construction=` は実行時の構築と同じく宣言の値を
     /// 出す（`ef_search=` は provider のまま）。ゲートが `Targeted` のときだけ `core.rs` が設定する。
     pub(crate) ann_build_options: Option<crate::catalog::HnswIndexOptions>,
+    /// `hybrid_rrf:`／`hybrid_bm25:` 行の入力（Issue #3051）。`Some` は `Ranking::Hybrid` の
+    /// `EXPLAIN SELECT` だけ（`core.rs::search_explain_from_bound` が設定）。`None` なら行を足さない。
+    pub(crate) hybrid: Option<ExplainHybridParams>,
 }
 
 impl ExplainEngine {
@@ -133,6 +220,7 @@ impl ExplainEngine {
             iterative_scan: crate::hnsw::HnswIterativeScan::default(),
             max_scan_tuples: crate::hnsw::DEFAULT_MAX_SCAN_TUPLES,
             ann_build_options: None,
+            hybrid: None,
         }
     }
 
@@ -161,6 +249,12 @@ impl ExplainEngine {
         self.max_scan_tuples = s
             .max_scan_tuples
             .unwrap_or(crate::hnsw::DEFAULT_MAX_SCAN_TUPLES);
+        self
+    }
+
+    /// `hybrid_rrf:`／`hybrid_bm25:` 行の入力を設定する（Issue #3051・SEARCH-13）。
+    pub(crate) fn with_hybrid_params(mut self, p: ExplainHybridParams) -> Self {
+        self.hybrid = Some(p);
         self
     }
 
@@ -876,6 +970,10 @@ fn push_engine_tail_rows(
     append_index_suffix(&mut scalar_line, names.scalar());
     append_reason_suffix(&mut scalar_line, engine.scalar_fallback);
     lines.push(scalar_line);
+    // Issue #3051・SEARCH-13: HYBRID の融合（RRF）と BM25 の実効値。既存行の後ろへの追記のみ。
+    if let Some(p) = &engine.hybrid {
+        push_hybrid_rows(lines, p);
+    }
 }
 
 /// `line` の末尾へ、索引を使えない理由があれば ` reason=<語彙>` を追記する（Issue #2191。
@@ -1088,7 +1186,77 @@ mod tests {
             iterative_scan: crate::hnsw::HnswIterativeScan::default(),
             max_scan_tuples: crate::hnsw::DEFAULT_MAX_SCAN_TUPLES,
             ann_build_options: None,
+            hybrid: None,
         }
+    }
+
+    fn sample_hybrid() -> ExplainHybridParams {
+        ExplainHybridParams {
+            rrf_k: 60.0,
+            rrf_k_source: ParamSource::Default,
+            window: ExplainHybridWindow::Fixed(200),
+            window_source: ParamSource::Default,
+            dense_weight: 1.0,
+            sparse_weight: 1.0,
+            weights_source: ParamSource::Default,
+            k1: 1.2,
+            k1_source: ParamSource::Default,
+            b: 0.75,
+            b_source: ParamSource::Default,
+        }
+    }
+
+    fn search_lines(engine: &ExplainEngine) -> Vec<String> {
+        let r = build_search_explain_result(
+            ResolvedMode::new(SearchMode::Recall, ModeSource::Default),
+            engine,
+            &ExplainIndexNames::default(),
+        );
+        (0..r.rows.len())
+            .map(|i| cell_text(&r, i).to_string())
+            .collect()
+    }
+
+    /// Issue #3051: `hybrid: None` は既存出力と同一で、`Some` は `scalar_plan:` の後ろに 2 行だけ足す。
+    #[test]
+    fn hybrid_rows_are_appended_after_scalar_plan_only_when_set() {
+        let base = search_lines(&default_engine());
+        assert!(base.iter().all(|l| !l.starts_with("hybrid_")));
+        let with = search_lines(&default_engine().with_hybrid_params(sample_hybrid()));
+        assert_eq!(&with[..base.len()], &base[..]);
+        assert_eq!(
+            &with[base.len()..],
+            [
+                "hybrid_rrf: rrf_k=60.0[default],window=200[default],dense_weight=1.0[default],sparse_weight=1.0[default]",
+                "hybrid_bm25: k1=1.2[default],b=0.75[default]",
+            ]
+        );
+    }
+
+    /// Issue #3051: `dynamic`・`-0.0` の正規化・極端値の短い表記・指定元の閉じた語彙。
+    #[test]
+    fn hybrid_rows_format_edge_values() {
+        let mut p = sample_hybrid();
+        p.window = ExplainHybridWindow::Dynamic;
+        p.dense_weight = -0.0;
+        p.k1 = 1e200;
+        p.k1_source = ParamSource::Specified;
+        let lines = search_lines(&default_engine().with_hybrid_params(p));
+        let n = lines.len();
+        assert!(
+            lines[n - 2].contains("window=dynamic[default]"),
+            "{lines:?}"
+        );
+        assert!(
+            lines[n - 2].contains("dense_weight=0.0[default]"),
+            "{lines:?}"
+        );
+        assert_eq!(
+            lines[n - 1],
+            "hybrid_bm25: k1=1e200[specified],b=0.75[default]"
+        );
+        assert_eq!(ParamSource::Default.as_str(), "default");
+        assert_eq!(ParamSource::Specified.as_str(), "specified");
     }
 
     #[test]
@@ -1205,6 +1373,7 @@ mod tests {
             iterative_scan: crate::hnsw::HnswIterativeScan::default(),
             max_scan_tuples: crate::hnsw::DEFAULT_MAX_SCAN_TUPLES,
             ann_build_options: None,
+            hybrid: None,
         };
 
         let result = build_explain_result(&planned, &engine);
@@ -1236,6 +1405,7 @@ mod tests {
             iterative_scan: crate::hnsw::HnswIterativeScan::default(),
             max_scan_tuples: crate::hnsw::DEFAULT_MAX_SCAN_TUPLES,
             ann_build_options: None,
+            hybrid: None,
         };
 
         let result = build_explain_result(&planned, &engine);
@@ -1282,6 +1452,7 @@ mod tests {
                 iterative_scan: crate::hnsw::HnswIterativeScan::default(),
                 max_scan_tuples: crate::hnsw::DEFAULT_MAX_SCAN_TUPLES,
                 ann_build_options: None,
+                hybrid: None,
             };
             let result = build_explain_result(&planned, &engine);
             // `ann_plan` は末尾から 2 番目（末尾行は Issue #474 の
@@ -1362,6 +1533,7 @@ mod tests {
                 iterative_scan: crate::hnsw::HnswIterativeScan::default(),
                 max_scan_tuples: crate::hnsw::DEFAULT_MAX_SCAN_TUPLES,
                 ann_build_options: None,
+                hybrid: None,
             };
             let result = build_explain_result(&planned, &engine);
 
@@ -1468,6 +1640,7 @@ mod tests {
             iterative_scan: crate::hnsw::HnswIterativeScan::default(),
             max_scan_tuples: crate::hnsw::DEFAULT_MAX_SCAN_TUPLES,
             ann_build_options: None,
+            hybrid: None,
         };
         let names = ExplainIndexNames::new(
             vec!["idx_vec".to_string()],

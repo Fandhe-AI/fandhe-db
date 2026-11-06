@@ -14847,6 +14847,20 @@ impl EngineCore {
             bound,
             hnsw_search,
         ));
+        // Issue #3051・SEARCH-13: HYBRID の RRF・BM25 の実効値。束縛結果と定数だけから求め、
+        // 可視件数に依存する値（precision の既定 window）は `dynamic` として数値を出さない。
+        let engine = if let crate::sql::parser::Ranking::Hybrid { tuning, .. } = bound.ranking() {
+            let static_k = crate::sql::exec::static_fetch_k(
+                is_precision,
+                scalar_prefilter,
+                bound.fetch_count(),
+            );
+            engine.with_hybrid_params(crate::sql::hybrid_tuning::explain_hybrid_params(
+                tuning, static_k,
+            )?)
+        } else {
+            engine
+        };
         Ok(crate::sql::explain::build_search_explain_result(
             bound.mode(),
             &engine,

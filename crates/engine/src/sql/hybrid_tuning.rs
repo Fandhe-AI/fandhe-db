@@ -17,6 +17,10 @@
 //! BM25 への接続（Issue #2121）: `k1`・`b` は [`hybrid_bm25_params`] がクエリ時の
 //! `Bm25Params` に解決し、疎検索のスコア計算だけに渡す（索引・キャッシュキー・世代は不変）。
 //! これにより #2119 の暫定ゲート（`0A000`）は撤去した。
+//!
+//! EXPLAIN への接続（Issue #3051）: [`explain_hybrid_params`] が上記と同じ解決関数
+//! （[`hybrid_bm25_params`]・[`hybrid_rrf_config`]）を呼んで実効値と指定元を求め、`core.rs` の
+//! EXPLAIN 経路が `hybrid_rrf:`／`hybrid_bm25:` 行として出す。既定値は再導出しない。
 
 use crate::hybrid::{RrfConfig, MAX_POOL_DEPTH};
 use crate::json::{parse_json, JsonValue};
@@ -265,6 +269,56 @@ pub(crate) fn hybrid_rrf_config(
     })
 }
 
+/// EXPLAIN の `hybrid_rrf:`／`hybrid_bm25:` 行の入力を解決する（SEARCH-13・Issue #3051）。実行器と
+/// 同じ [`hybrid_bm25_params`]・[`hybrid_rrf_config`] を呼ぶため既定値を二重管理しない。
+/// `static_k_eff` は `sql::exec::static_fetch_k` の結果で、`None`（precision かつ SCALAR 先行でない
+/// ＝取得件数が可視件数に依存）のとき既定の `window` は数値を出さず `Dynamic` にする
+/// （テナントのデータ量を EXPLAIN に漏らさない）。この場合に `window` が指定済みの組み合わせは束縛段が
+/// `0A000` で拒否済みで到達しないが、多層防御として `Internal` で fail-closed にする。
+/// `core.rs::search_explain_from_bound` から呼ばれ、解決失敗は実行時と同じ `wire_code` になる。
+pub(crate) fn explain_hybrid_params(
+    tuning: &HybridTuning,
+    static_k_eff: Option<usize>,
+) -> Result<crate::sql::explain::ExplainHybridParams, SqlSurfaceError> {
+    use crate::sql::explain::{ExplainHybridParams, ExplainHybridWindow, ParamSource};
+    let source = |specified: bool| {
+        if specified {
+            ParamSource::Specified
+        } else {
+            ParamSource::Default
+        }
+    };
+    let bm25 = hybrid_bm25_params(tuning, crate::sparse::Bm25Params::default())?;
+    let (rrf, window) = match static_k_eff {
+        Some(k) => {
+            let rrf = hybrid_rrf_config(tuning, k)?;
+            let window = ExplainHybridWindow::Fixed(rrf.pool_depth());
+            (rrf, window)
+        }
+        None => {
+            if tuning.window().is_some() {
+                return Err(SqlSurfaceError::Internal {
+                    detail: "unexpected HYBRID window with data-dependent fetch size".to_string(),
+                });
+            }
+            (hybrid_rrf_config(tuning, 1)?, ExplainHybridWindow::Dynamic)
+        }
+    };
+    Ok(ExplainHybridParams {
+        rrf_k: rrf.k_const(),
+        rrf_k_source: source(tuning.rrf_k().is_some()),
+        window,
+        window_source: source(tuning.window().is_some()),
+        dense_weight: rrf.dense_weight(),
+        sparse_weight: rrf.sparse_weight(),
+        weights_source: source(tuning.weights().is_some()),
+        k1: bm25.k1(),
+        k1_source: source(tuning.k1().is_some()),
+        b: bm25.b(),
+        b_source: source(tuning.b().is_some()),
+    })
+}
+
 fn range_error(name: &str) -> SqlSurfaceError {
     SqlSurfaceError::invalid_input(format!("HYBRID argument {name} is out of range"))
 }
@@ -327,6 +381,69 @@ mod tests {
     }
     fn code(r: Result<HybridTuning, SqlSurfaceError>) -> &'static str {
         r.expect_err("must be rejected").wire_code()
+    }
+
+    fn tuning(
+        k1: Option<f64>,
+        b: Option<f64>,
+        rrf_k: Option<f64>,
+        window: Option<usize>,
+        weights: Option<(f64, f64)>,
+    ) -> HybridTuning {
+        HybridTuning::new(k1, b, rrf_k, window, weights).unwrap()
+    }
+
+    /// Issue #3051: 未指定は既定値と `Default`、指定は `Specified`（既定値と等しくても）。
+    #[test]
+    fn explain_params_defaults_and_sources() {
+        use crate::sql::explain::{ExplainHybridWindow, ParamSource};
+        let p = explain_hybrid_params(&HybridTuning::default(), Some(10)).unwrap();
+        assert_eq!((p.rrf_k, p.dense_weight, p.sparse_weight), (60.0, 1.0, 1.0));
+        assert_eq!((p.k1, p.b), (1.2, 0.75));
+        assert_eq!(p.window, ExplainHybridWindow::Fixed(200));
+        for s in [
+            p.rrf_k_source,
+            p.window_source,
+            p.weights_source,
+            p.k1_source,
+            p.b_source,
+        ] {
+            assert_eq!(s, ParamSource::Default);
+        }
+        let p = explain_hybrid_params(
+            &tuning(Some(1.2), None, Some(60.0), None, Some((2.0, 1.0))),
+            Some(10),
+        )
+        .unwrap();
+        assert_eq!(p.k1_source, ParamSource::Specified);
+        assert_eq!(p.b_source, ParamSource::Default);
+        assert_eq!(p.rrf_k_source, ParamSource::Specified);
+        assert_eq!(p.weights_source, ParamSource::Specified);
+        assert_eq!((p.dense_weight, p.sparse_weight), (2.0, 1.0));
+    }
+
+    /// Issue #3051: 既定 window は `k_eff` に追従し、静的に決まらないときは `Dynamic`。
+    #[test]
+    fn explain_params_window_resolution() {
+        use crate::sql::explain::ExplainHybridWindow;
+        let t = HybridTuning::default();
+        assert_eq!(
+            explain_hybrid_params(&t, Some(260)).unwrap().window,
+            ExplainHybridWindow::Fixed(260)
+        );
+        assert_eq!(
+            explain_hybrid_params(&t, None).unwrap().window,
+            ExplainHybridWindow::Dynamic
+        );
+        let w = tuning(None, None, None, Some(5), None);
+        assert_eq!(
+            explain_hybrid_params(&w, Some(3)).unwrap().window,
+            ExplainHybridWindow::Fixed(5)
+        );
+        assert_eq!(
+            explain_hybrid_params(&w, None).unwrap_err().wire_code(),
+            "XX000"
+        );
     }
 
     /// SEARCH-13: 受理（境界値を含む）。
