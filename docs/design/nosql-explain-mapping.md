@@ -197,3 +197,9 @@ PLAN` なし検索 `SELECT`・集計・広域取得への `EXPLAIN` を受理す
 同一の `bind`（`crates/wire-server/src/http/query/aggregate.rs`）を経由する
 ため複数列 `group_by` とも併用でき、後続 Issue の対象ではなくなったため
 本節から除いた）
+
+## 追記（Issue #2147・SEARCH-15 ポインタ）
+
+`vector` 指定の `search`（`explain: true`）は、リランクが有効なとき SQL の `EXPLAIN SELECT` と同じ `rerank:` 行を
+末尾に含む（同じ `search_explain_from_bound` を通る）。`plan` 指定の `search` には載せない
+（[rerank-wiring-policy.md](rerank-wiring-policy.md) 第 10 節）。

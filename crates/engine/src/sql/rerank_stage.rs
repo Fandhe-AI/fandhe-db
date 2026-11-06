@@ -31,6 +31,86 @@ pub(crate) struct RerankAccess<'a> {
     pub(crate) counters: &'a RerankCounters,
 }
 
+/// 文の形と設定から静的に決まるリランクの扱い（Issue #2147・SEARCH-15。設計記録
+/// `docs/design/rerank-wiring-policy.md` D3・D4・D7）。実行器（`exec.rs`）と EXPLAIN の
+/// `rerank:` 行（`core.rs::search_explain_from_bound` → `sql::explain`）が同じ判定関数を共有し、
+/// 両者が食い違わないことを構造的に保証する。実行時の縮退（timeout 等）は含まない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RerankPlan {
+    /// リランクを試みる対象。
+    Eligible,
+    /// `USING MODE 'precision'` のため適用外（D3）。
+    NotApplicablePrecision,
+    /// 密のみの文にテキストを読む方式を組み合わせたため適用外（D3）。
+    NotApplicableDenseText,
+    /// MMR の計算量予算を超えるため縮退する（D4）。
+    DegradedMmrBudget,
+}
+
+impl RerankPlan {
+    /// `rerank:` 行の `status=` に出す閉じた語彙。
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Eligible => "eligible",
+            Self::NotApplicablePrecision => "not_applicable_precision",
+            Self::NotApplicableDenseText => "not_applicable_dense_text",
+            Self::DegradedMmrBudget => "degraded_mmr_budget",
+        }
+    }
+}
+
+/// 文の形（hybrid／密のみ・precision）と設定だけから決まる適用可否（ADR D3）。off は `None`。
+/// 優先順位は precision、形の順。実行器の `rerank_shape_active` と EXPLAIN が共有する。
+pub(crate) fn classify_rerank_shape(
+    settings: &RerankSettings,
+    is_hybrid: bool,
+    is_precision: bool,
+) -> Option<RerankPlan> {
+    if !settings.is_enabled() {
+        return None;
+    }
+    if is_precision {
+        return Some(RerankPlan::NotApplicablePrecision);
+    }
+    if is_hybrid || settings.method().required_input() == RerankInput::Embedding {
+        Some(RerankPlan::Eligible)
+    } else {
+        Some(RerankPlan::NotApplicableDenseText)
+    }
+}
+
+/// MMR の計算量予算（ADR D4）を超えるか。MMR 以外は常に偽。実行器と EXPLAIN が共有する。
+pub(crate) fn mmr_over_budget(settings: &RerankSettings, k_eff: usize) -> bool {
+    matches!(settings.method(), crate::rerank::RerankMethod::Mmr(_))
+        && !crate::rerank::mmr_budget_allows(settings.window(), k_eff)
+}
+
+/// [`classify_rerank_shape`] に MMR の予算判定を重ねた静的な扱い（EXPLAIN 用）。`static_k` は
+/// `sql::exec::static_fetch_k` の結果。precision は予算判定へ進む前に確定するためデータに依存しない。
+/// 非 precision で `static_k` が `None` になるのは不変条件違反で、MMR では予算を満たすと
+/// 言えないため fail-closed に `DegradedMmrBudget` を返す。
+pub(crate) fn classify_rerank_plan(
+    settings: &RerankSettings,
+    is_hybrid: bool,
+    is_precision: bool,
+    static_k: Option<usize>,
+) -> Option<RerankPlan> {
+    match classify_rerank_shape(settings, is_hybrid, is_precision)? {
+        RerankPlan::Eligible => {
+            let over = match static_k {
+                Some(k) => mmr_over_budget(settings, k),
+                None => matches!(settings.method(), crate::rerank::RerankMethod::Mmr(_)),
+            };
+            Some(if over {
+                RerankPlan::DegradedMmrBudget
+            } else {
+                RerankPlan::Eligible
+            })
+        }
+        other => Some(other),
+    }
+}
+
 /// 縮退を文の実行ログへ 1 行記録する。固定の英語メッセージと閉じた語彙（理由・種別）だけを
 /// 出し、id・本文・表名・テナント情報は含めない（ADR D7）。
 pub(crate) fn log_degraded(reason: RerankDegradeReason, kind: &'static str) {
@@ -551,6 +631,50 @@ mod tests {
         assert_eq!(ids, vec![2, 1, 0]);
         // スコアは融合スコアのまま。
         assert_eq!(rows[0].1, h[2].1);
+    }
+
+    /// Issue #2147: 静的な適用可否の優先順位（off・precision・形・予算）と `static_k` 欠落時の fail-closed。
+    #[test]
+    fn classify_rerank_plan_priorities() {
+        use crate::rerank::{LexicalOverlapReranker, MmrReranker, RerankMethod};
+        let off = RerankSettings::off();
+        let lex = RerankSettings::new(RerankMethod::Lexical(LexicalOverlapReranker::default()), 50)
+            .unwrap();
+        let mmr = RerankSettings::new(RerankMethod::Mmr(MmrReranker::default()), 10_000).unwrap();
+        assert_eq!(classify_rerank_plan(&off, true, false, Some(3)), None);
+        assert_eq!(
+            classify_rerank_plan(&lex, true, true, None),
+            Some(RerankPlan::NotApplicablePrecision)
+        );
+        assert_eq!(
+            classify_rerank_plan(&mmr, false, true, None),
+            Some(RerankPlan::NotApplicablePrecision)
+        );
+        assert_eq!(
+            classify_rerank_plan(&lex, false, false, Some(3)),
+            Some(RerankPlan::NotApplicableDenseText)
+        );
+        assert_eq!(
+            classify_rerank_plan(&lex, true, false, Some(3)),
+            Some(RerankPlan::Eligible)
+        );
+        assert_eq!(
+            classify_rerank_plan(&mmr, true, false, Some(100)),
+            Some(RerankPlan::Eligible)
+        );
+        assert_eq!(
+            classify_rerank_plan(&mmr, false, false, Some(101)),
+            Some(RerankPlan::DegradedMmrBudget)
+        );
+        // 非 precision で k が欠落する不変条件違反は MMR では fail-closed、他方式は予算と無関係。
+        assert_eq!(
+            classify_rerank_plan(&mmr, true, false, None),
+            Some(RerankPlan::DegradedMmrBudget)
+        );
+        assert_eq!(
+            classify_rerank_plan(&lex, true, false, None),
+            Some(RerankPlan::Eligible)
+        );
     }
 
     #[test]

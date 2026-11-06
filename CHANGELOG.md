@@ -9,6 +9,7 @@
 
 ### Changed
 
+- `EXPLAIN` の検索計画に、リランクが有効なとき末尾へ `rerank: method=...,window=...[,mmr_lambda=...],status=...` の 1 行を追記した（Issue #2147・SEARCH-15 ポインタ）。off では出力は不変で、実行時の縮退は含まない。NoSQL `search`（`vector` 指定）の explain にも載る。公開 API の変更はない。
 - `EXPLAIN` の `HYBRID` 検索計画に、`scalar_plan:` の後ろへ `hybrid_rrf:`・`hybrid_bm25:` の 2 行を追記した（Issue #3051・SEARCH-13 ポインタ）。BM25（`k1`・`b`）と RRF（`rrf_k`・`window`・`weights`）の実効値を、指定値か既定値かの区別（`[specified]`／`[default]`）付きで表示する。既存の行は不変で、公開 API の変更はない。
 - MMR リランカーを追加した（Issue #2143・SEARCH-15 ポインタ）。engine に `rerank::{MmrReranker, validate_mmr_lambda, mmr_budget_allows, DEFAULT_MMR_LAMBDA, MMR_PAIR_BUDGET}` と `RerankMethod::{Mmr, CustomEmbedding}` を追加した。ハイブリッドに加えて密のみ（`ORDER BY embedding <=> ...` 等）にも適用し、計算量は `W × min(k_eff, W) ≤ 1,000,000` に抑える（超過は縮退 `mmr_budget`）。密のみの縮退は `k_eff` で再検索して off と同一の結果へ戻す。wire-server に `--reranker mmr` と `--rerank-mmr-lambda <0..1>`（既定 0.5）を追加した（`mmr` 以外での λ 指定・範囲外・不正書式は起動エラー）。
   BREAKING CHANGE: 公開構造体 `rerank::RerankCandidate` にフィールド `embedding: Option<&[f32]>` を、公開 enum `rerank::RerankError` に variant `InvalidEmbedding` を追加した（構造体リテラル・網羅的 `match` の下流は追随が必要。`RerankError` は今後も `#[non_exhaustive]` を後付けしない方針）。

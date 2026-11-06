@@ -47,6 +47,9 @@
 //! `EXPLAIN` が検索本体を実行しない契約（本ファイル冒頭「責務境界」参照）は
 //! 呼び出し元にも求められる。
 //!
+//! Issue #2147（SEARCH-15 ポインタ）: リランクが有効なとき、検索の末尾（`hybrid_bm25:` または
+//! `scalar_plan:` の後ろ）へ `rerank:` 行を 1 行だけ追記する。off のときは行を出さず出力は不変。
+//!
 //! Issue #2045（SQL-75 (2) ポインタ）: 単一表の 3 builder は `sql::explain_tree::ExplainNode`
 //! の「見出しなし・子なしのルート 1 節」として組み立てて描画する（出力はバイト不変）。
 //! 入れ子の字下げ契約と上限は `explain_tree.rs` と設計ドキュメントを参照。
@@ -198,6 +201,38 @@ pub struct ExplainEngine {
     /// `hybrid_rrf:`／`hybrid_bm25:` 行の入力（Issue #3051）。`Some` は `Ranking::Hybrid` の
     /// `EXPLAIN SELECT` だけ（`core.rs::search_explain_from_bound` が設定）。`None` なら行を足さない。
     pub(crate) hybrid: Option<ExplainHybridParams>,
+    /// `rerank:` 行の入力（Issue #2147・SEARCH-15）。`Some` はリランクが有効なときの検索の
+    /// `EXPLAIN SELECT` だけ（`core.rs::search_explain_from_bound` が設定）。`None` なら行を足さない。
+    pub(crate) rerank: Option<ExplainRerank>,
+}
+
+/// `rerank:` 行の入力（Issue #2147・SEARCH-15。設計記録 `docs/design/rerank-wiring-policy.md` D7）。
+/// 起動時の設定（方式・窓幅・MMR の λ）と、実行器と共有する静的判定
+/// （`sql::rerank_stage::classify_rerank_plan`）だけから作る。テナントのデータや実行時の縮退には依存しない。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ExplainRerank {
+    /// `RerankMethod::kind_name` の閉じた語彙。
+    pub(crate) method_token: &'static str,
+    pub(crate) window: usize,
+    /// MMR のときだけ `Some`。
+    pub(crate) mmr_lambda: Option<f64>,
+    pub(crate) plan: crate::sql::rerank_stage::RerankPlan,
+}
+
+/// `rerank:` 行を `lines` へ追記する（`hybrid_bm25:` または `scalar_plan:` の後ろ）。値の区切りは
+/// `=`・`,` のみで `": "` を含まないため、FORMAT JSON では 1 属性になる。
+fn push_rerank_row(lines: &mut Vec<String>, r: &ExplainRerank) {
+    let lambda = match r.mmr_lambda {
+        Some(l) => format!(",mmr_lambda={}", fmt_param_f64(l)),
+        None => String::new(),
+    };
+    lines.push(format!(
+        "rerank: method={},window={}{},status={}",
+        r.method_token,
+        r.window,
+        lambda,
+        r.plan.as_str()
+    ));
 }
 
 impl ExplainEngine {
@@ -221,6 +256,7 @@ impl ExplainEngine {
             max_scan_tuples: crate::hnsw::DEFAULT_MAX_SCAN_TUPLES,
             ann_build_options: None,
             hybrid: None,
+            rerank: None,
         }
     }
 
@@ -255,6 +291,12 @@ impl ExplainEngine {
     /// `hybrid_rrf:`／`hybrid_bm25:` 行の入力を設定する（Issue #3051・SEARCH-13）。
     pub(crate) fn with_hybrid_params(mut self, p: ExplainHybridParams) -> Self {
         self.hybrid = Some(p);
+        self
+    }
+
+    /// `rerank:` 行の入力を設定する（Issue #2147・SEARCH-15）。
+    pub(crate) fn with_rerank(mut self, r: ExplainRerank) -> Self {
+        self.rerank = Some(r);
         self
     }
 
@@ -974,6 +1016,11 @@ fn push_engine_tail_rows(
     if let Some(p) = &engine.hybrid {
         push_hybrid_rows(lines, p);
     }
+    // Issue #2147・SEARCH-15: リランカーの種別・窓幅・静的な適用可否。既存行の後ろへの追記のみ。
+    // 実行時の縮退（timeout 等）は出さない（ADR D7）。
+    if let Some(r) = &engine.rerank {
+        push_rerank_row(lines, r);
+    }
 }
 
 /// `line` の末尾へ、索引を使えない理由があれば ` reason=<語彙>` を追記する（Issue #2191。
@@ -1187,6 +1234,7 @@ mod tests {
             max_scan_tuples: crate::hnsw::DEFAULT_MAX_SCAN_TUPLES,
             ann_build_options: None,
             hybrid: None,
+            rerank: None,
         }
     }
 
@@ -1231,6 +1279,72 @@ mod tests {
                 "hybrid_bm25: k1=1.2[default],b=0.75[default]",
             ]
         );
+    }
+
+    /// Issue #2147: `rerank: None` は既存出力と同一で、`Some` は末尾（hybrid 行の後ろ）に 1 行だけ足す。
+    #[test]
+    fn rerank_row_is_appended_last_only_when_set() {
+        use crate::sql::rerank_stage::RerankPlan;
+        let base = search_lines(&default_engine().with_hybrid_params(sample_hybrid()));
+        assert!(base.iter().all(|l| !l.starts_with("rerank:")));
+        let r = ExplainRerank {
+            method_token: "lexical",
+            window: 50,
+            mmr_lambda: None,
+            plan: RerankPlan::Eligible,
+        };
+        let with = search_lines(
+            &default_engine()
+                .with_hybrid_params(sample_hybrid())
+                .with_rerank(r),
+        );
+        assert_eq!(&with[..base.len()], &base[..]);
+        assert_eq!(
+            &with[base.len()..],
+            ["rerank: method=lexical,window=50,status=eligible"]
+        );
+    }
+
+    /// Issue #2147: 4 種の status・λ の書式・語彙が閉じていて `": "` を含まない。
+    #[test]
+    fn rerank_row_formats_status_and_lambda() {
+        use crate::sql::rerank_stage::RerankPlan;
+        let cases = [
+            (RerankPlan::Eligible, "eligible"),
+            (
+                RerankPlan::NotApplicablePrecision,
+                "not_applicable_precision",
+            ),
+            (
+                RerankPlan::NotApplicableDenseText,
+                "not_applicable_dense_text",
+            ),
+            (RerankPlan::DegradedMmrBudget, "degraded_mmr_budget"),
+        ];
+        for (plan, token) in cases {
+            for (lambda, text) in [
+                (Some(0.5), ",mmr_lambda=0.5"),
+                (Some(-0.0), ",mmr_lambda=0.0"),
+                (Some(1.0), ",mmr_lambda=1.0"),
+                (None, ""),
+            ] {
+                let mut lines = Vec::new();
+                push_rerank_row(
+                    &mut lines,
+                    &ExplainRerank {
+                        method_token: "mmr",
+                        window: 10,
+                        mmr_lambda: lambda,
+                        plan,
+                    },
+                );
+                assert_eq!(
+                    lines,
+                    [format!("rerank: method=mmr,window=10{text},status={token}")]
+                );
+                assert!(!lines[0]["rerank: ".len()..].contains(": "));
+            }
+        }
     }
 
     /// Issue #3051: `dynamic`・`-0.0` の正規化・極端値の短い表記・指定元の閉じた語彙。
@@ -1374,6 +1488,7 @@ mod tests {
             max_scan_tuples: crate::hnsw::DEFAULT_MAX_SCAN_TUPLES,
             ann_build_options: None,
             hybrid: None,
+            rerank: None,
         };
 
         let result = build_explain_result(&planned, &engine);
@@ -1406,6 +1521,7 @@ mod tests {
             max_scan_tuples: crate::hnsw::DEFAULT_MAX_SCAN_TUPLES,
             ann_build_options: None,
             hybrid: None,
+            rerank: None,
         };
 
         let result = build_explain_result(&planned, &engine);
@@ -1453,6 +1569,7 @@ mod tests {
                 max_scan_tuples: crate::hnsw::DEFAULT_MAX_SCAN_TUPLES,
                 ann_build_options: None,
                 hybrid: None,
+                rerank: None,
             };
             let result = build_explain_result(&planned, &engine);
             // `ann_plan` は末尾から 2 番目（末尾行は Issue #474 の
@@ -1534,6 +1651,7 @@ mod tests {
                 max_scan_tuples: crate::hnsw::DEFAULT_MAX_SCAN_TUPLES,
                 ann_build_options: None,
                 hybrid: None,
+                rerank: None,
             };
             let result = build_explain_result(&planned, &engine);
 
@@ -1641,6 +1759,7 @@ mod tests {
             max_scan_tuples: crate::hnsw::DEFAULT_MAX_SCAN_TUPLES,
             ann_build_options: None,
             hybrid: None,
+            rerank: None,
         };
         let names = ExplainIndexNames::new(
             vec!["idx_vec".to_string()],
