@@ -1810,11 +1810,7 @@ main に無く現行の `parse_order_by` は `<=>` のみ受理するため、�
 **Issue #2119（feat(engine)!: HYBRID の調整引数の字句・構文・束縛を追加する。SEARCH-13 ポインタ。親 #2117）**: `=>` トークン（`Token::NamedArgArrow`）、位置引数の後ろの名前付き引数 `name => value`（`FunctionArg::Named`・`NamedArgValue`）、束縛結果 `sql::hybrid_tuning::HybridTuning`（`k1`・`b`・`rrf_k`・`window`・`weights`）を追加した。範囲外・型の不一致は `22000`、未知の名前・曖昧な構文は `42601`。実行器が未接続のため、既定以外の調整値を持つ文は実行と EXPLAIN で `0A000`（暫定ゲート。#2120・#2121 で撤去）。名前付き引数なしの結果は不変。`weights` の SQL 形などは `docs/design/hybrid-tuning-parameters.md` の第 8 節。公開 enum `FunctionArg`・`Ranking::Hybrid` の変更は破壊的。対象外は実行器への反映（#2120）、BM25（#2121）、NoSQL（#2122）、EXPLAIN への実効値表示。依存の追加なし。
 
 **Issue #2120（feat(engine): 実行器で RrfConfig と pool_depth をクエリ指定値から組み立てる。SEARCH-13 ポインタ。親 #2117）**: `sql::hybrid_tuning::hybrid_rrf_config` が `rrf_k`・`weights`・`window` から `RrfConfig` を組み立て、融合と precision 正規化の両方で使う。調整引数なしの文は従来とバイト一致。`window` は束縛段・`check_bound_search`・実行時の 3 層で `22000` 検証する。`RrfConfig::new` は片側 0 の重みを受理するよう緩めた。スコア非有限は `22000`。暫定ゲートは `k1`／`b` 専用に狭めた（#2121 で撤去）。詳細は hybrid-tuning-parameters.md §9。
-<<<<<<< HEAD
 
 **Issue #2121（feat(engine): BM25 の k1・b を疎検索へ渡す。SEARCH-13 ポインタ。親 #2117）**: `sparse::Bm25Params`・`SparseIndex::score_within_with_params`・`hybrid::hybrid_search_with_bm25` を追加し、`HYBRID` の `k1`／`b` をクエリ時の計算だけに適用する。索引・`SparseIndexCache` のキー・世代は不変で、値が違うクエリでも再構築しない。指定なしの文は従来とバイト一致。`k1` の数値安全上限（`1e200`）超えと非有限スコアは `22000`。`0A000` の暫定ゲート（`ensure_tuning_applied`）を撤去した。EXPLAIN の実効値表示と NoSQL（#2122）は対象外。詳細は hybrid-tuning-parameters.md §10。
-||||||| 79df931cc
-=======
 
 **Issue #2132（docs(design): 形態素解析（lindera・opt-in）を日本語コーパスで評価し承認資料を作る。親 #2131・EXT-8／SEARCH-11 ポインタ。詳細は [lindera-morphological-tokenizer-adoption.md](lindera-morphological-tokenizer-adoption.md)）**: 依存とコードの変更なしで、`lindera = "=6.2.0"` の承認資料を作った。既存の合成日本語コーパス評価（5,000 文書・100 クエリ）をリポ外の probe で再現し、基準のバイグラム（Recall@20 の hit 933、Recall@100 の hit 1630）を完全に再現したうえで lindera（IPADIC・UniDic）と比べた。再現率の差は天井効果で測れず（基準は理論上限の 99.5%）、索引のトークン総数は 23〜33%・トークン化の時間は 3.4〜6.9 倍になった。承認事項として、辞書がビルド時に `Lindera.dev` から MD5 検証のみで取得されること、`cargo deny` が `CDLA-Permissive-2.0`（build 依存の `webpki-roots`）で失敗すること、バイナリ増分が IPADIC 約 48 MB・UniDic 約 200 MB であることを記録した。ステータスは Proposed で、オーナー承認は未取得（記録先は #2131）。承認まで #2133・#2134 に着手しない。
->>>>>>> refs/worktree/pr-push/base
