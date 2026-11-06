@@ -222,7 +222,12 @@ fn bind_and_apply_reject_invalid_declarations() {
     let boosts: Vec<_> = (0..=engine::scoring_boost::MAX_SCORING_BOOSTS)
         .map(|_| bound.clone())
         .collect();
-    let mut hits = vec![HybridHit { id: 1, score: 0.1 }];
+    let mut hits = vec![HybridHit {
+        id: 1,
+        score: 0.1,
+        dense_rank: None,
+        sparse_rank: None,
+    }];
     assert!(apply_scoring_boosts(&mut hits, &boosts, &[], &RrfConfig::default()).is_err());
 }
 
@@ -278,7 +283,12 @@ fn apply_scoring_boosts_rejects_oversized_metadata_before_scanning() {
         .collect();
     assert_eq!(metadata.len(), MAX_BOOST_IDS + 1);
 
-    let mut hits = vec![HybridHit { id: 1, score: 0.1 }];
+    let mut hits = vec![HybridHit {
+        id: 1,
+        score: 0.1,
+        dense_rank: None,
+        sparse_rank: None,
+    }];
     let err = apply_scoring_boosts(&mut hits, &[bound], &metadata, &RrfConfig::default())
         .expect_err("oversized metadata must be rejected");
     assert_eq!(

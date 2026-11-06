@@ -385,11 +385,23 @@ mod tests {
         // しか許さないため、真の 1 位（id=1）とプール最下位（id=3）はそのままに、
         // 中間 2 件（id=2・id=3）の順位だけを入れ替えて近接順位の逆転を確認する。
         let mut hits = vec![
-            HybridHit { id: 1, score: 0.5 },
-            HybridHit { id: 2, score: 0.45 },
+            HybridHit {
+                id: 1,
+                score: 0.5,
+                dense_rank: None,
+                sparse_rank: None,
+            },
+            HybridHit {
+                id: 2,
+                score: 0.45,
+                dense_rank: None,
+                sparse_rank: None,
+            },
             HybridHit {
                 id: 3,
                 score: 0.4495,
+                dense_rank: None,
+                sparse_rank: None,
             },
         ];
         let before: BTreeSet<u64> = hits.iter().map(|h| h.id).collect();
@@ -416,7 +428,12 @@ mod tests {
 
     #[test]
     fn apply_scoring_boosts_rejects_too_many_boosts() {
-        let mut hits = vec![HybridHit { id: 1, score: 0.1 }];
+        let mut hits = vec![HybridHit {
+            id: 1,
+            score: 0.1,
+            dense_rank: None,
+            sparse_rank: None,
+        }];
         let cfg = RrfConfig::default();
         let bound = ScoringBoost::equals("kind", "doc", 0.0004)
             .bind(&schema())
