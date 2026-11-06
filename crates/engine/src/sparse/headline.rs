@@ -336,6 +336,13 @@ impl HeadlineOptions {
                 return Err(too_long);
             }
         }
+        // HighlightAll でも断片方式（MaxFragments > 0）では MaxWords を数えるため、非正値は拒否する
+        // （単位を数えられず分割ループが進まない無限の候補積み上げを fail-closed で防ぐ）。
+        if o.highlight_all && o.max_fragments > 0 && o.max_words <= 0 {
+            return Err(HeadlineError::InvalidValue {
+                detail: "MaxWords should be positive",
+            });
+        }
         if !o.highlight_all {
             if o.min_words >= o.max_words {
                 return Err(HeadlineError::InvalidValue {
@@ -759,6 +766,10 @@ fn select_fragments(
                     excluded: false,
                 },
             )?;
+            // 無進捗（終端が開始より手前）なら打ち切る（候補の無限積み上げ防止）。
+            if endpos < startpos {
+                break;
+            }
             startpos = endpos + 1;
             endpos = q;
         }
@@ -1114,6 +1125,23 @@ mod tests {
         }
         assert_eq!(opts("MaxWords=2147483647").max_words, i32::MAX);
         assert_eq!(opts("MaxWords=3, MinWords=1, ShortWord=0").short_word, 0);
+    }
+
+    #[test]
+    fn highlight_all_rejects_nonpositive_max_words_with_fragments() {
+        for bad in [
+            "HighlightAll=true, MaxFragments=2, MaxWords=0",
+            "HighlightAll=true, MaxFragments=1, MaxWords=-5",
+        ] {
+            assert!(
+                matches!(
+                    HeadlineOptions::parse(Some(bad)),
+                    Err(HeadlineError::InvalidValue { .. })
+                ),
+                "{bad}"
+            );
+        }
+        assert!(HeadlineOptions::parse(Some("HighlightAll=true, MaxWords=0")).is_ok());
     }
 
     #[test]

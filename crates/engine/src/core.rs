@@ -5928,6 +5928,9 @@ impl EngineCore {
         resolver: Option<crate::sql::relation_name::SchemaResolver<'_>>,
         read_snap: Option<&redb::ReadTransaction>,
     ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
+        // Issue #2125: 構文解析中の定数式評価（INSERT VALUES・列 DEFAULT の `ts_headline` 畳み込み）にも
+        // 設定済みの上限を効かせる（束縛区間より前に評価されるため、ここで張らないとハード上限に戻る）。
+        let _bind_limits_scope = self.sparsevec_limits_scope();
         let gate_tokens = session.object_privileges_enforced().then(|| tokens.clone());
         // parse 中に実在を確認した relation 名の記録先。ACL 照会の時点で見つからない名前を、解析後に
         // DROP された参照先として権限ゲートが拒否する根拠になる（通常 SQL でも省略しない）。

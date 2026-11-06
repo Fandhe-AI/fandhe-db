@@ -127,6 +127,26 @@ fn lowered_limit_applies_to_prepared_statements() {
     );
 }
 
+/// 構文解析時の定数式評価（INSERT VALUES・列 DEFAULT）にも下げた上限が効く（Issue #2125 レビュー指摘）。
+#[test]
+fn lowered_limit_applies_to_parse_time_const_folding() {
+    let (_g, core) = open_with("tshl-fold", Some(HeadlineLimits::new(OUT.len() - 1, 1)));
+    exec(
+        &core,
+        "CREATE TABLE docs (id BIGINT PRIMARY KEY, body TEXT)",
+    )
+    .expect("ddl");
+    let ins = format!("INSERT INTO docs (id, body) VALUES (1, ts_headline('{DOC}', 'fox'))");
+    assert_eq!(code(&core, &ins), "54000");
+    let frag = "INSERT INTO docs (id, body) VALUES (1, ts_headline('a fox b fox', 'fox', \
+                'MaxFragments=2, MaxWords=3, MinWords=1'))";
+    assert_eq!(code(&core, frag), "54000");
+    let ddl = format!(
+        "CREATE TABLE d2 (id BIGINT PRIMARY KEY, body TEXT DEFAULT ts_headline('{DOC}', 'fox'))"
+    );
+    assert_eq!(code(&core, &ddl), "54000");
+}
+
 /// 既定のコアはハード上限で動く（大きな本文もそのまま強調できる）。
 #[test]
 fn default_core_uses_hard_limits() {
