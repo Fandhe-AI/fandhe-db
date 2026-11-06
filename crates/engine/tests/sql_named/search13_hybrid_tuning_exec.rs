@@ -348,3 +348,27 @@ fn search13_exec_tuning_does_not_leak_other_tenant_rows() {
     );
     assert_eq!(r.rows.len(), 6);
 }
+
+/// 疎索引が無い（可視行に本文が無い）文でも `k1`／`b` の不正値は 22000 になり、
+/// データ依存で受理されない。EXPLAIN も実行と同じ検証を行う（Issue #2121）。
+#[test]
+fn search13_exec_invalid_k1_b_rejected_without_sparse_index_and_in_explain() {
+    let (core, _g) = setup("search13-exec-k1-nosparse", None);
+    let other = PolicyContext::new("tenant-without-rows").expect("valid tenant");
+    for tail in [", k1 => 1e300", ", k1 => 1e201", ", b => 2"] {
+        let sql = format!("{BASE}{tail}) LIMIT 3");
+        let e = core
+            .execute_sql(&other, &sql)
+            .expect_err("must be rejected");
+        assert_eq!(e.wire_code(), "22000", "{tail}");
+        let e = core
+            .execute_sql_in_session(
+                &other,
+                &mut SessionState::default(),
+                &format!("EXPLAIN {sql}"),
+            )
+            .expect_err("explain must be rejected");
+        assert_eq!(e.wire_code(), "22000", "explain {tail}");
+        assert_eq!(code(&core, tail, "LIMIT 3"), "22000", "{tail}");
+    }
+}

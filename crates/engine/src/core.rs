@@ -3973,6 +3973,9 @@ impl EngineCore {
             self.result_limits.max_result_rows(),
             bound.mode().mode(),
         )?;
+        // Issue #2121: `k1`／`b` も束縛済み計画の段階で検証する（EXPLAIN も実行と同じ 22000。
+        // 疎索引の有無に依らない）。
+        crate::sql::hybrid_tuning::check_bm25_args(bound.ranking())?;
         // Issue #2242: `LIMIT` 省略（暗黙上限の印 `result_cap`）付きの計画は、`cap` が設定値と一致し、
         // 取得上限が `cap + 1`、`OFFSET` が検索上限以内のときだけ通す（印の偽装で巨大な取得上限を
         // 通す経路を作らない。`check_bound_scan_limit` と同型）。

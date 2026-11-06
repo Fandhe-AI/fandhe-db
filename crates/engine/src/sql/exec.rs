@@ -3302,6 +3302,10 @@ pub(crate) fn execute_statement_with_cache_observed(
                                 _ => Some(Arc::new(built)),
                             }
                         };
+                    // 疎索引が無く密のみへ縮退する文でも `k1`／`b` を検証する（データ依存で
+                    // 不正な引数が受理されないようにする。Issue #2121）。
+                    let bm25_default = crate::sparse::Bm25Params::default();
+                    crate::sql::hybrid_tuning::hybrid_bm25_params(tuning, bm25_default)?;
                     let fused: Vec<HybridHit> = match &sparse_index_for_fusion {
                         None => {
                             // 疎側の寄与を 0 件として扱い、密側のみを `rrf_fuse` に通して

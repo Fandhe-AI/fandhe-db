@@ -156,6 +156,19 @@ pub(crate) fn hybrid_bm25_params(
     .map_err(|_| SqlSurfaceError::invalid_input("HYBRID BM25 arguments k1 and b are out of range"))
 }
 
+/// `Ranking::Hybrid` の `k1`／`b` を、疎索引の有無に依らず同じ基準で検証する（Issue #2121）。
+/// 疎索引が無い（密のみへ縮退する）文でも不正な引数がデータ依存で受理されないよう、
+/// 既定値で補った [`hybrid_bm25_params`] を通す。`core.rs::EngineCore::check_bound_search`
+/// （EXPLAIN を含む全経路）と `sql::exec` の `Ranking::Hybrid` 実行から呼ばれる。
+pub(crate) fn check_bm25_args(
+    ranking: &crate::sql::parser::Ranking,
+) -> Result<(), SqlSurfaceError> {
+    let crate::sql::parser::Ranking::Hybrid { tuning, .. } = ranking else {
+        return Ok(());
+    };
+    hybrid_bm25_params(tuning, crate::sparse::Bm25Params::default()).map(|_| ())
+}
+
 /// `window` の範囲検証（SEARCH-13・Issue #2120）。`window` 未指定なら何もしない。
 /// 受理条件は `fetch_count`（`LIMIT + OFFSET`）以上かつ `max_result_rows` 以下で、
 /// 範囲外はクランプ・黙った件数削減をせず `22000` で拒否する（fail-closed）。`LIMIT` 省略
