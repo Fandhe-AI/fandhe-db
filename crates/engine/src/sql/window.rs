@@ -1732,6 +1732,8 @@ fn decode_tier_for_window(schema: &TableSchema, bound: &BoundScan) -> (DecodeTie
                 }
             }
             ProjectedColumn::Id | ProjectedColumn::AliasedId { .. } => {}
+            // 検索 SELECT 以外では束縛段が生成しない（SEARCH-17）。値の生成側が `Internal` で拒否する。
+            ProjectedColumn::HybridDetail { .. } => {}
         }
     }
     if !bound.metadata_filters().is_empty() {

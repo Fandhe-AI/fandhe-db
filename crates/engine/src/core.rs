@@ -3987,6 +3987,9 @@ impl EngineCore {
         // Issue #2243: 公開ビルダー `with_distance_kind` の誤用で非 Cosine が Hybrid・`precision` に
         // 素通りしないよう、早期 return する `result_cap` 分岐より前で整合を検査する。
         crate::sql::parser::check_bound_distance_kind(bound)?;
+        // SEARCH-17・Issue #2137: 外部で組み立てた計画の `HybridDetail` 投影も、ハイブリッド順位付けの
+        // 文にだけ許す（多層防御。違反は `42601`）。
+        crate::sql::parser::check_hybrid_detail(bound.projection(), bound.ranking())?;
         // Issue #2120: 外部で組み立てた計画の `window` も束縛段と同じ範囲で再検査する
         // （`result_cap` の早期 return より前。多層防御）。
         crate::sql::hybrid_tuning::check_window(
@@ -13804,7 +13807,9 @@ impl EngineCore {
                 rejected(schema.columns.get(*index).map(|c| &c.ty))
             }
             ProjectedColumn::Computed { result_ty, .. } => rejected(result_ty.as_ref()),
-            ProjectedColumn::Id | ProjectedColumn::AliasedId { .. } => None,
+            ProjectedColumn::Id
+            | ProjectedColumn::AliasedId { .. }
+            | ProjectedColumn::HybridDetail { .. } => None,
         });
         if let Some(message) = hit {
             return Err(crate::sql::allowlist::SqlSurfaceError::feature_not_supported(message));

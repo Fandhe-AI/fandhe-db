@@ -152,6 +152,7 @@ pub enum BoundSearch {
 /// [`bind_search`] の失敗を表す。いずれも [`ClassifiedError`] を実装し
 /// `wire_code`／`client_message` を経由して HTTP エラー応答へ射影される。
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum SearchError {
     /// [`super::schema::Validated`] アクセサの型・キー不一致（`42601`）。
     Shape(SchemaError),
@@ -172,6 +173,10 @@ pub enum SearchError {
     MetricWithPlan,
     /// `metric` と `hybrid` の併用（SQL に等価形が無い。`42601`。Issue #2243）。
     MetricWithHybrid,
+    /// `hybrid.explain_score: true` の追加列名（`hybrid_dense_rank`／`hybrid_sparse_rank`／
+    /// `hybrid_score`）が、投影される表の列と同名（`42601`。SEARCH-17 (4)。Issue #2137）。
+    /// 文言は固定で、列名を応答へ含めない。
+    ExplainScoreColumnConflict,
     /// `columns: []`（空配列）。SQL 表層に等価形（空の SELECT リスト）が
     /// 存在しないため fail-closed に拒否する（`42601`）。
     EmptyColumns,
@@ -234,6 +239,7 @@ impl ClassifiedError for SearchError {
             | SearchError::MetricWithPlan
             | SearchError::MetricWithHybrid
             | SearchError::EmptyColumns
+            | SearchError::ExplainScoreColumnConflict
             | SearchError::InvalidIdentifier
             | SearchError::ExplainRequiresPlan => ErrorClass::UnsupportedSqlSyntax,
             SearchError::ExplainNotSupported => ErrorClass::FeatureNotSupported,
@@ -263,6 +269,10 @@ impl ClassifiedError for SearchError {
             }
             SearchError::EmptyColumns => {
                 "search request \"columns\" must not be an empty array".to_string()
+            }
+            SearchError::ExplainScoreColumnConflict => {
+                "search request \"explain_score\" conflicts with an existing column name"
+                    .to_string()
             }
             SearchError::InvalidIdentifier => "invalid identifier".to_string(),
             SearchError::ExplainRequiresPlan => {
@@ -496,7 +506,7 @@ pub fn bind_search_with_metric_resolver(
         Some([]) => return Err(SearchError::EmptyColumns),
         Some(items) => Some(columns_as_strings(items)?),
     };
-    let projection = bind_column_projection(columns.as_deref(), schema)?;
+    let mut projection = bind_column_projection(columns.as_deref(), schema)?;
 
     let filter_items = validated.optional_array("filter")?.unwrap_or(&[]);
     let filters = bind_filter(filter_items, schema, udfs)?;
@@ -531,6 +541,14 @@ pub fn bind_search_with_metric_resolver(
         let ranking = match hybrid_parts {
             Some((query_text, tuning)) => {
                 let text_column_index = bind_body_text_column(schema)?;
+                // SEARCH-17 (4)・Issue #2137: `explain_score: true` のときだけ、投影の末尾へ
+                // 系統別順位・融合スコアの 3 列を足す（SQL の `hybrid_*()` と同じ値・型）。省略／
+                // `false` は従来の応答と同一。表に同名の列があれば `42601`（`columns` 省略時も検査）。
+                if let Some(h) = &hybrid {
+                    if h.optional_bool("explain_score")? == Some(true) {
+                        append_explain_score_columns(&mut projection, schema)?;
+                    }
+                }
                 Ranking::Hybrid {
                     query,
                     text_column_index,
@@ -589,6 +607,45 @@ pub fn bind_search_with_metric_resolver(
         query_mode,
         explain,
     }))
+}
+
+/// `hybrid.explain_score: true` の 3 列（密順位・疎順位・スコア）を投影の末尾へ足す
+/// （SEARCH-17 (4)・Issue #2137）。既存の投影列に同名（大文字小文字を区別しない）があれば
+/// [`SearchError::ExplainScoreColumnConflict`]。
+fn append_explain_score_columns(
+    projection: &mut Vec<engine::sql::parser::ProjectedColumn>,
+    schema: &TableSchema,
+) -> Result<(), SearchError> {
+    use engine::sql::hybrid_detail::HybridDetailKind;
+    use engine::sql::parser::ProjectedColumn;
+    // 表の全列（投影に含めない列も）と同名なら拒否する。
+    let schema_conflicts = schema.columns.iter().any(|c| {
+        HybridDetailKind::ALL
+            .iter()
+            .any(|k| c.name.eq_ignore_ascii_case(k.column_name()))
+    });
+    let conflicts = schema_conflicts
+        || projection.iter().any(|col| {
+            let name = match col {
+                ProjectedColumn::Column { name, .. } | ProjectedColumn::AliasedId { name } => name,
+                ProjectedColumn::Computed { name, .. }
+                | ProjectedColumn::HybridDetail { name, .. } => name,
+                ProjectedColumn::Id => return false,
+            };
+            HybridDetailKind::ALL
+                .iter()
+                .any(|k| name.eq_ignore_ascii_case(k.column_name()))
+        });
+    if conflicts {
+        return Err(SearchError::ExplainScoreColumnConflict);
+    }
+    for kind in HybridDetailKind::ALL {
+        projection.push(ProjectedColumn::HybridDetail {
+            name: kind.column_name().to_string(),
+            kind,
+        });
+    }
+    Ok(())
 }
 
 /// `explain: true` を伴う `plan` 検索に返す固定文言（[`super::gate::
@@ -844,6 +901,34 @@ mod tests {
     use engine::json::{parse_json, JsonNumber};
 
     use crate::http::query::schema::SEARCH_SCHEMA;
+
+    /// SEARCH-17 (4)・Issue #2137: 同名の列（大文字小文字を区別しない）があれば `42601`、無ければ
+    /// 3 列を末尾へ足す。
+    #[test]
+    fn explain_score_columns_conflict_and_append() {
+        use engine::sql::parser::ProjectedColumn;
+        let mut clash = vec![ProjectedColumn::Column {
+            index: 0,
+            name: "Hybrid_Score".to_string(),
+        }];
+        let err = append_explain_score_columns(&mut clash, &schema()).expect_err("must conflict");
+        assert_eq!(err.error_class(), ErrorClass::UnsupportedSqlSyntax);
+        assert!(!err.client_message().contains("Hybrid_Score"));
+        let mut ok = vec![ProjectedColumn::Id];
+        append_explain_score_columns(&mut ok, &schema()).expect("no conflict");
+        assert_eq!(ok.len(), 4);
+        // 投影に含めない列（`columns: ["id"]`）でも、表の列が同名なら拒否する。
+        let with_col = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(4), false),
+                ColumnDef::new("hybrid_score", ColumnType::Text, false),
+            ],
+        );
+        let mut id_only = vec![ProjectedColumn::Id];
+        let err = append_explain_score_columns(&mut id_only, &with_col).expect_err("schema clash");
+        assert_eq!(err.error_class(), ErrorClass::UnsupportedSqlSyntax);
+    }
 
     fn schema() -> TableSchema {
         TableSchema::new(
