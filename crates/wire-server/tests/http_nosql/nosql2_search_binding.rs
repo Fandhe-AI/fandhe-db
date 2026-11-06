@@ -171,6 +171,31 @@ fn c4_hybrid_matches_sql_order_by_hybrid_function() {
 }
 
 #[test]
+fn c4_hybrid_tuning_keys_match_sql_named_args() {
+    let nosql = expect_vector(nosql_side_bound(
+        r#"{"op":"search","table":"docs","vector":[0.1,0.2,0.3,0.4],"limit":10,"hybrid":{"text":"hello world","k1":1.5,"b":0.5,"rrf_k":30,"window":50,"weights":{"dense":2,"sparse":0.5}}}"#,
+    ));
+    let sql = sql_side_bound(
+        "SELECT * FROM docs ORDER BY HYBRID(embedding, '[0.1,0.2,0.3,0.4]', body, 'hello world', \
+         k1 => 1.5, b => 0.5, rrf_k => 30, window => 50, \
+         weights => '{\"dense\":2,\"sparse\":0.5}') LIMIT 10",
+    );
+    assert_eq!(nosql, sql);
+}
+
+#[test]
+fn c4_hybrid_partial_tuning_keys_match_sql_named_args() {
+    let nosql = expect_vector(nosql_side_bound(
+        r#"{"op":"search","table":"docs","vector":[0.1,0.2,0.3,0.4],"limit":10,"hybrid":{"text":"hello world","rrf_k":10,"weights":{"dense":0,"sparse":1}}}"#,
+    ));
+    let sql = sql_side_bound(
+        "SELECT * FROM docs ORDER BY HYBRID(embedding, '[0.1,0.2,0.3,0.4]', body, 'hello world', \
+         rrf_k => 10, weights => '{\"dense\":0,\"sparse\":1}') LIMIT 10",
+    );
+    assert_eq!(nosql, sql);
+}
+
+#[test]
 fn plan_only_binds_projection_filter_and_limit_matching_a_placeholder_order_by_form() {
     // `plan` 指定は LLM 展開（engine 内部 I/O）を要するため、本ファイルの
     // `bind_search` 単体テストでは `BoundStatement` まで完成させない
