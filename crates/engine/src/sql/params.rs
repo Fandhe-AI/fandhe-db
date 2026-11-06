@@ -2888,7 +2888,8 @@ pub(crate) fn decode_bind_values_nullable_typed(
             | Token::RegexNotMatch
             | Token::RegexNotMatchCi
             | Token::TypeCast
-            | Token::Concat => 0,
+            | Token::Concat
+            | Token::NamedArgArrow => 0,
         };
         total = total.checked_add(len).ok_or_else(|| {
             SqlSurfaceError::payload_too_large("substituted parameter payload size overflowed")

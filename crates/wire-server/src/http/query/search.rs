@@ -496,6 +496,7 @@ pub fn bind_search_with_metric_resolver(
                     query,
                     text_column_index,
                     query_text,
+                    tuning: engine::sql::hybrid_tuning::HybridTuning::default(),
                 }
             }
             None => Ranking::Distance { query },

@@ -293,7 +293,12 @@ pub(crate) fn relation_positions(tokens: &[Token]) -> RelationWalk {
                 _ => false,
             },
             Some(
-                Token::Le | Token::Ge | Token::Concat | Token::TypeCast | Token::DistanceOp(_),
+                Token::Le
+                | Token::Ge
+                | Token::Concat
+                | Token::NamedArgArrow
+                | Token::TypeCast
+                | Token::DistanceOp(_),
             ) => true,
             // `IF NOT EXISTS t`・`COMMENT ON TABLE t` の `NOT`／`ON` は表参照の文脈。
             Some(Token::Ident(w))

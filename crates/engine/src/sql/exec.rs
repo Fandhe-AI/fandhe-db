@@ -1275,6 +1275,9 @@ pub(crate) fn execute_statement_with_cache_observed(
     // SQL 実行経路に未接続の距離演算子（L2／L1）は、行ポリシー解決・ストレージ読み取りより前に
     // fail-closed で止める（Issue #1977・#1991）。
     ensure_distance_kind_executable(bound)?;
+    // HYBRID の調整引数は束縛済みだが実行器が未接続のため、指定を黙って無視せず拒否する
+    // （SEARCH-13・Issue #2119。#2120／#2121 で撤去）。
+    crate::sql::hybrid_tuning::ensure_tuning_applied(&bound.ranking)?;
     // RLS-13（Issue #2279）: 利用者ポリシーは、アリーナ構築と同じ read txn から 1 回だけ解決し、下の
     // `on_visible_row`（RLS 段の直後・利用者の `WHERE` より前）で各行へ適用する。キャッシュ
     // （アリーナ・HNSW・疎索引・スカラー索引）はテナント境界だけの内容のまま保ち（`rls_capture` は

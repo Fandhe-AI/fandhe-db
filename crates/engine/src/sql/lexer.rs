@@ -118,6 +118,11 @@ pub enum Token {
     /// `*` は SELECT リストの `*` と式内の乗算の両方を表す。文脈による使い分けは
     /// `allowlist::Parser` の管轄）。
     Punct(char),
+    /// `=>`（名前付き引数の区切り。SEARCH-13・Issue #2119）。`=` の直後に空白なしで `>` が続く
+    /// 場合だけ 1 トークンに融合する（`= >` は従来どおり 2 つの `Punct`）。構文段
+    /// （`sql::allowlist`）は `HYBRID`／`hybrid_rrf` の名前付き調整引数の位置でのみ受理し、
+    /// 他の位置では `42601` で拒否する（fail-closed）。
+    NamedArgArrow,
     /// `->`（SQL-42・Issue #1520: 多文字演算子の字句化）。構文段（`sql::allowlist`）は
     /// 本トークンを受理せず `42601` で拒否する（fail-closed）。以下 5 つの多文字演算子も同様。
     Arrow,
@@ -318,6 +323,7 @@ pub(crate) fn render_tokens(tokens: &[Token]) -> Option<String> {
             Token::RegexNotMatchCi => out.push_str("!~*"),
             Token::TypeCast => out.push_str("::"),
             Token::Concat => out.push_str("||"),
+            Token::NamedArgArrow => out.push_str("=>"),
             Token::QualifiedIdent { qualifier, name } => {
                 out.push_str(qualifier);
                 out.push('.');
@@ -995,6 +1001,18 @@ fn tokenize_impl(
             tokens.push(Token::Punct('>'));
             chars.next();
             continue;
+        }
+
+        if c == '=' {
+            // `=>`（名前付き引数。SEARCH-13・Issue #2119）。空白なしの `=>` だけを融合する。
+            let mut lookahead = chars.clone();
+            lookahead.next();
+            if matches!(lookahead.peek(), Some(&(_, '>'))) {
+                lookahead.next();
+                tokens.push(Token::NamedArgArrow);
+                chars = lookahead;
+                continue;
+            }
         }
 
         if matches!(
@@ -2949,6 +2967,26 @@ mod bit_distance_op_tests {
         assert_eq!(toks("a < b")[1], p('<'));
         assert_eq!(toks("a ~ 'x'")[1], Token::RegexMatch);
         assert_eq!(toks("a !~ 'x'")[1], Token::RegexNotMatch);
+    }
+
+    /// SEARCH-13・Issue #2119: `=>` は空白なしの `=` `>` だけを 1 トークンに融合する。
+    #[test]
+    fn named_arg_arrow_fuses_only_without_whitespace() {
+        let id = |s: &str| Token::Ident(s.to_string());
+        let n = |s: &str| Token::Number(s.to_string());
+        assert_eq!(toks("a => 1"), vec![id("a"), Token::NamedArgArrow, n("1")]);
+        assert_eq!(toks("a=>1"), vec![id("a"), Token::NamedArgArrow, n("1")]);
+        assert_eq!(
+            toks("a = > 1"),
+            vec![id("a"), Token::Punct('='), Token::Punct('>'), n("1")]
+        );
+        assert_eq!(toks("a >= 1")[1], Token::Ge);
+        assert_eq!(toks("a <= 1")[1], Token::Le);
+        assert_eq!(toks("a <=> b")[1], Token::DistanceOp(DistanceKind::Cosine));
+        assert_eq!(toks("a = 1")[1], Token::Punct('='));
+        let tokens = toks("f(a => 1)");
+        let rendered = render_tokens(&tokens).expect("render");
+        assert_eq!(toks(&rendered), tokens);
     }
 
     #[test]

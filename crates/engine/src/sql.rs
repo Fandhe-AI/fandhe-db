@@ -263,16 +263,17 @@ pub(crate) mod grouping_sets;
 pub(crate) mod hnsw_cache;
 pub(crate) mod hnsw_hybrid;
 pub(crate) mod hnsw_observe;
-pub(crate) mod index_expr;
-pub(crate) mod index_implication;
-pub(crate) mod index_predicate;
-pub(crate) mod index_udf;
-pub(crate) mod insert_select_scope;
 /// `[INNER|LEFT|RIGHT|FULL] JOIN`（等価結合の left-deep 連鎖・集計形・スカラー
 /// `ORDER BY`）の束縛・実行本体（SQL-28・RLS-10、TASK-212、Issue #925・#926・
 /// #1190）。`sql::allowlist::ValidatedJoin` を受け取り、
 /// `core.rs::EngineCore` の SQL 実行経路から呼ばれる（`sql::set_op` と同じ
 /// 構成）。
+pub mod hybrid_tuning;
+pub(crate) mod index_expr;
+pub(crate) mod index_implication;
+pub(crate) mod index_predicate;
+pub(crate) mod index_udf;
+pub(crate) mod insert_select_scope;
 pub(crate) mod join;
 pub(crate) mod json_fn;
 pub(crate) mod jsonpath_fn;

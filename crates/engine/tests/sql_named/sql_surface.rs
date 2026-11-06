@@ -376,6 +376,42 @@ fn sql4_two_arg_form_is_rejected_as_not_executable() {
     assert_eq!(err.wire_code(), "22000");
 }
 
+/// SEARCH-13・Issue #2119: HYBRID の名前付き調整引数は SQL 表層まで届き、範囲外は `22000`、
+/// 未知の名前は `42601`。実行器が未接続の間は有効な指定も `0A000` で拒否し（黙って無視しない）、
+/// 名前付き引数なしの文は従来どおり実行できる。
+#[test]
+fn search13_hybrid_named_tuning_arguments_surface_contract() {
+    let path = unique_db_path("search13-named-args");
+    let _guard = CleanupGuard(path.clone());
+    let storage = open_storage(&path);
+    storage
+        .create_table(&TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("body", ColumnType::Text, true),
+            ],
+        ))
+        .expect("create table");
+    let core = new_core(storage);
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    let base = "SELECT * FROM docs ORDER BY HYBRID(embedding, '[1.0,0.0]', body, 'q'";
+    let code = |tail: &str| {
+        core.execute_sql(&ctx, &format!("{base}{tail}) LIMIT 5"))
+            .expect_err("must be rejected")
+            .wire_code()
+    };
+    assert_eq!(code(", rrf_k => 10"), "0A000");
+    assert_eq!(code(", k1 => 1.2, b => 0.75"), "0A000");
+    assert_eq!(code(", rrf_k => 0"), "22000");
+    assert_eq!(code(", b => 2"), "22000");
+    assert_eq!(code(", window => 1.5"), "22000");
+    assert_eq!(code(", pool_depth => 10"), "42601");
+    assert_eq!(code(", rrf_k := 10"), "42601");
+    core.execute_sql(&ctx, &format!("{base}) LIMIT 5"))
+        .expect("hybrid without named arguments still executes");
+}
+
 #[test]
 fn sql4_hybrid_degrades_to_dense_only_when_no_visible_body_text() {
     let path = unique_db_path("sql4-dense-degrade");
