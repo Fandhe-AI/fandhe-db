@@ -3633,6 +3633,8 @@ fn bind_in_session_with_policy(
         result_limits.max_result_rows(),
         resolved_mode.mode(),
     )?;
+    // Issue #2121: `k1`／`b` も束縛段で検証する（EXPLAIN も実行と同じ 22000。疎索引の有無に依らない）。
+    crate::sql::hybrid_tuning::check_bm25_args(&ranking)?;
 
     // SQL-74 (2)・Issue #2036: 距離述語を含む文は `HINT ORDER` が DISTANCE を先にしても SCALAR を
     // 先（事前フィルタ）に倒す。距離述語を DISTANCE 段の後の事後フィルタにすると、上位 k 件が
@@ -3787,6 +3789,8 @@ pub(crate) fn bind_projection_for_describe(
         result_limits.max_result_rows(),
         resolved_mode.mode(),
     )?;
+    // Issue #2121: `k1`／`b` も束縛段で検証する（EXPLAIN も実行と同じ 22000。疎索引の有無に依らない）。
+    crate::sql::hybrid_tuning::check_bm25_args(&ranking)?;
 
     Ok(projection)
 }
