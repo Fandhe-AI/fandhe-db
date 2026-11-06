@@ -272,6 +272,44 @@ fn vector_search_explain_hybrid_matches_sql_explain_rows() {
     assert_eq!(parse_explain_lines(&resp), expected);
 }
 
+/// Issue #2147・SEARCH-15: リランクが有効なとき、`vector` 指定 `search`（密のみ・hybrid）の EXPLAIN は
+/// 等価な SQL の行と一致し、末尾に `rerank:` 行を含む。
+#[test]
+fn vector_search_explain_with_rerank_matches_sql_explain_rows_and_has_rerank_row() {
+    let (core, _guard) = new_core();
+    let core = match Arc::try_unwrap(core) {
+        Ok(c) => Arc::new(
+            c.with_rerank(
+                engine::rerank::RerankSettings::new(
+                    engine::rerank::RerankMethod::Mmr(
+                        engine::rerank::MmrReranker::new(0.5).expect("valid lambda"),
+                    ),
+                    20,
+                )
+                .expect("valid settings"),
+            ),
+        ),
+        Err(_) => panic!("core must be uniquely owned"),
+    };
+    let ctx_a = ctx_for("tenant-a");
+    let (addr, token) = spawn_alice_session(Arc::clone(&core));
+    let want = "rerank: method=mmr,window=20,mmr_lambda=0.5,status=eligible";
+
+    let sql = "SELECT id FROM docs ORDER BY embedding <=> '[0.1,0.2,0.3,0.4]' LIMIT 5";
+    let expected = sql_explain_lines(&core, &ctx_a, &format!("EXPLAIN {sql}"));
+    assert_eq!(expected.last().map(String::as_str), Some(want));
+    let body =
+        br#"{"op":"search","table":"docs","vector":[0.1,0.2,0.3,0.4],"limit":5,"explain":true}"#;
+    assert_eq!(parse_explain_lines(&query(addr, &token, body)), expected);
+
+    let sql = "SELECT id FROM docs ORDER BY HYBRID(embedding, '[0.1,0.2,0.3,0.4]', body, 'alpha') LIMIT 5";
+    let expected = sql_explain_lines(&core, &ctx_a, &format!("EXPLAIN {sql}"));
+    assert_eq!(expected.last().map(String::as_str), Some(want));
+    let body = br#"{"op":"search","table":"docs","vector":[0.1,0.2,0.3,0.4],"limit":5,
+        "hybrid":{"text":"alpha"},"explain":true}"#;
+    assert_eq!(parse_explain_lines(&query(addr, &token, body)), expected);
+}
+
 /// Issue #3051・SEARCH-13: 調整キーを付けた `hybrid` の EXPLAIN も、等価な SQL の行（`hybrid_rrf:`／
 /// `hybrid_bm25:` を含む）と一致する。
 #[test]

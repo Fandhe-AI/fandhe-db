@@ -228,7 +228,7 @@
   絞り直して off と同一の列に戻す。固定の英語 1 行（理由・種別のみ）を実行ログへ出し、理由別
   カウンタ（`EngineCore::rerank_stats`）を増やす。`statement_timeout`／キャンセルは 57014 が
   優先で縮退にしない。`timeout` は #2144 で到達し、`mmr_budget` は語彙のみで #2143 で到達する。
-- EXPLAIN は変更しない（off ではバイト単位で不変。行の追加は #2147）。
+- EXPLAIN は変更しない（off ではバイト単位で不変。行の追加は #2147 で実装済み。第 10 節）。
 - 性能（受け入れ 1。off の無劣化）: 同一マシンで base（main）と head を
   `cargo bench --bench hybrid_profile_bench -p fandhe-db-engine --features bench-internals` で
   比較した（25,000 行・dim 128・共有環境の参考値）。`sql_hybrid` は p95/median
@@ -269,7 +269,7 @@ MMR リランカーと、それに伴う密経路の結線（D3・D4・D6・D8 �
   指定は起動エラー。
 - 破壊的変更: `RerankCandidate` への `embedding` 追加、`RerankError` への `InvalidEmbedding` 追加
   （`CHANGELOG.md` の 0.2.0 参照）。
-- NoSQL `search` は同じ実行器を通るため追加の結線は無い。EXPLAIN の rerank 行は #2147 の担当で変更しない。
+- NoSQL `search` は同じ実行器を通るため追加の結線は無い。EXPLAIN の rerank 行は第 10 節（#2147）で実装した。
 
 ## 9. 実装メモ（#2144）
 
@@ -291,3 +291,30 @@ MMR リランカーと、それに伴う密経路の結線（D3・D4・D6・D8 �
   （検索は拒否しない）。スレッドは作らず、超過幅は最大 1 バッチ分。
 - 検証: スタブバックエンドで決定的に確かめた。実モデルでの起動は `ORT_DYLIB_PATH` とモデルが要る手動手順で、
   本変更では未検証。
+
+## 10. 実装メモ（#2147）
+
+- 行の書式（新しい安定契約）: リランクが有効なとき、検索の EXPLAIN の末尾（hybrid は `hybrid_bm25:` の後ろ、
+  密のみは `scalar_plan:` の後ろ）に 1 行だけ追記する。
+
+  ```text
+  rerank: method=<kind>,window=<W>[,mmr_lambda=<λ>],status=<status>
+  ```
+
+- `<kind>` は `RerankMethod::kind_name` の閉じた語彙（`lexical`・`mmr`・`cross_encoder`・`identity`・`custom`）。
+  `identity`・`custom` は Rust API からしか設定できない。`mmr_lambda` は `mmr` のときだけ出し、書式は
+  `hybrid_rrf:` と同じ `{:?}`（`-0.0` は `0.0`）。クロスエンコーダの期限は出さない。
+- `<status>` は閉じた 4 語。`eligible`（試みる対象）・`not_applicable_precision`（D3）・
+  `not_applicable_dense_text`（D3。密のみ × テキストを読む方式）・`degraded_mmr_budget`（D4。設定値と静的な
+  `LIMIT + OFFSET` だけで決まる）。優先順位は precision、形、予算。実行時の縮退（`timeout`・`backend_error`・
+  `contract_violation`・`input_limit`）は出さず、実行ログと `rerank_stats` で扱う。
+- 判定は `sql::rerank_stage::classify_rerank_shape`・`mmr_over_budget`（実行器 `exec.rs` と共有）と
+  `classify_rerank_plan`（EXPLAIN 用）に集約し、EXPLAIN と実行が食い違わない。off では行を出さず出力は不変。
+  行の値は起動時の設定と文の形だけで決まり、可視行数・テナント・空の表に依存しない。EXPLAIN は統計を変えない。
+- 融合方式の行: 融合は RRF だけで、`hybrid_rrf:`（#3051）が方式とパラメータを示すため、新しい `fusion:` 行は
+  追加しない（hybrid-tuning-parameters.md §12）。
+- `USING PLAN` の EXPLAIN には出さない（対象外）。MMR の予算判定に `k_eff`（`LIMIT + OFFSET`）が要るが、
+  共有ヘルパー `run_explain_plan` にも公開 API にも LIMIT が届かず、渡すには公開 API の変更が要るため。
+  `USING PLAN` の実行ではリランクが走るので、この EXPLAIN はリランクを示さない制約として残る。
+  #3051 が `USING PLAN` を外した理由（調整引数を持てない）とは別の理由である。
+- NoSQL: `search`（`vector` 指定・`explain: true`）は同じ `search_explain_from_bound` を通るため、SQL の行と一致する。

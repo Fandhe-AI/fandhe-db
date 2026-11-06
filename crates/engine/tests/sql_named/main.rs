@@ -15,6 +15,7 @@ mod search12_hybrid_text_syntax;
 mod search13_hybrid_tuning_exec;
 mod search13_hybrid_tuning_explain;
 mod search14_ts_headline;
+mod search15_rerank_explain;
 mod search15_rerank_wiring;
 mod search17_hybrid_explain_score;
 mod sql33_cosine_negip_execution;

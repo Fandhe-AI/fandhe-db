@@ -123,6 +123,8 @@ NoSQL `search` の `hybrid` オブジェクトに調整キー `k1`・`b`・`rrf_
 
 ## 12. Issue #3051 での実装（EXPLAIN）
 
+融合方式の表示は `hybrid_rrf:` 行が担う（融合は RRF のみ）。Issue #2147 では新しい行を足さず、リランカーの `rerank:` 行だけを追加した（[rerank-wiring-policy.md](rerank-wiring-policy.md) 第 10 節）。
+
 `EXPLAIN SELECT ... ORDER BY HYBRID(...)`（SQL の `hybrid_rrf(...)` 形と、NoSQL `search` の `hybrid` を伴う
 `explain: true` を含む）の検索計画に、`scalar_plan:` の後ろへ次の 2 行を追記する（TEXT・FORMAT JSON 共通。
 VERBOSE／ANALYZE でも同じ行が載る）。非 hybrid の文と `USING PLAN` の EXPLAIN は出力を変えない。

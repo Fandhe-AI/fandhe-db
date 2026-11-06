@@ -739,3 +739,16 @@ EXPLAIN ANALYZE（親 #2052）の「計測の土台」を実行器へ入れた�
   疎索引の有無・可視行数・他テナントの行量では変わらない。
 - **JSON**: 各行は `key: value` 分割で 1 属性（`"hybrid_rrf"`・`"hybrid_bm25"`）になる。値に `": "` を含めない。
 - `USING PLAN` の EXPLAIN と非 hybrid の文は出力を変えない。
+
+## 追記（Issue #2147・SEARCH-15 ポインタ）: リランカーの行
+
+リランクが有効なとき、検索の EXPLAIN の末尾（`hybrid_bm25:` または `scalar_plan:` の後ろ）に
+`rerank: method=<kind>,window=<W>[,mmr_lambda=<λ>],status=<status>` を 1 行追記する。off では行を出さず、出力は不変。
+
+- **露出する値**: 起動時の設定（方式の種別名・窓幅・MMR の λ）と、文の形（hybrid か密のみか、precision か、
+  `LIMIT + OFFSET`）から決まる静的な適用可否（`eligible`・`not_applicable_precision`・`not_applicable_dense_text`・
+  `degraded_mmr_budget`）。
+- **露出しない値**: 実行時の縮退の理由（期限超過・バックエンド失敗等）、候補数、クロスエンコーダの期限、モデルのパス。
+- **JSON**: `"rerank"` という 1 属性になる。値に `": "` を含めない。
+- `USING PLAN` の EXPLAIN は対象外（`LIMIT + OFFSET` が届かない。rerank-wiring-policy.md 第 10 節）。
+- 融合方式は `hybrid_rrf:`（#3051）で表すため、融合の行は追加していない。

@@ -14861,6 +14861,28 @@ impl EngineCore {
         } else {
             engine
         };
+        // Issue #2147・SEARCH-15: リランカーの種別・窓幅・静的な適用可否。読むのは起動時の設定と
+        // 束縛結果だけで、storage・arena・ポリシー結果・統計は読まない（実行器と判定関数を共有）。
+        // `USING PLAN` の EXPLAIN（`run_explain_plan`）へは `k_eff` が届かないため付けない。
+        let static_k =
+            crate::sql::exec::static_fetch_k(is_precision, scalar_prefilter, bound.fetch_count());
+        let engine = match crate::sql::rerank_stage::classify_rerank_plan(
+            &self.rerank_settings,
+            is_hybrid,
+            is_precision,
+            static_k,
+        ) {
+            Some(plan) => engine.with_rerank(crate::sql::explain::ExplainRerank {
+                method_token: self.rerank_settings.method().kind_name(),
+                window: self.rerank_settings.window(),
+                mmr_lambda: match self.rerank_settings.method() {
+                    crate::rerank::RerankMethod::Mmr(m) => Some(m.lambda()),
+                    _ => None,
+                },
+                plan,
+            }),
+            None => engine,
+        };
         Ok(crate::sql::explain::build_search_explain_result(
             bound.mode(),
             &engine,

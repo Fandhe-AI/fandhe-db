@@ -1404,17 +1404,14 @@ pub(crate) fn execute_statement_with_cache_observed(
     // 「適用外」で、素通しする（off と同じ結果。拒否もログも出さない）。off（`rerank == None`）は
     // この判定の外で、以降の追加処理は一切走らない。計算量予算（MMR）は `k_eff` 確定後に判定する。
     let rerank_shape_active: Option<crate::sql::rerank_stage::RerankAccess<'_>> =
-        match (&rerank, &bound.ranking) {
-            (Some(r), Ranking::Hybrid { .. }) if !is_precision => Some(*r),
-            (Some(r), Ranking::Distance { .. })
-                if !is_precision
-                    && r.settings.method().required_input()
-                        == crate::rerank::RerankInput::Embedding =>
-            {
-                Some(*r)
-            }
-            _ => None,
-        };
+        rerank.filter(|r| {
+            // Issue #2147: EXPLAIN の `rerank:` 行と同じ判定関数を共有する。
+            crate::sql::rerank_stage::classify_rerank_shape(
+                r.settings,
+                matches!(bound.ranking, Ranking::Hybrid { .. }),
+                is_precision,
+            ) == Some(crate::sql::rerank_stage::RerankPlan::Eligible)
+        });
 
     // RLS 段（無条件）+ SCALAR 段（同一走査の行フック。`plan.scalar_prefilter` が
     // `false` の場合はここでは等価条件を判定せず、DISTANCE 段の後で事後適用する）。
@@ -2850,10 +2847,7 @@ pub(crate) fn execute_statement_with_cache_observed(
     let mut rerank_budget_degraded = false;
     let rerank_active: Option<crate::sql::rerank_stage::RerankAccess<'_>> =
         match rerank_shape_active {
-            Some(r)
-                if matches!(r.settings.method(), crate::rerank::RerankMethod::Mmr(_))
-                    && !crate::rerank::mmr_budget_allows(r.settings.window(), k_eff) =>
-            {
+            Some(r) if crate::sql::rerank_stage::mmr_over_budget(r.settings, k_eff) => {
                 r.counters
                     .record_degraded(crate::rerank::RerankDegradeReason::MmrBudget);
                 crate::sql::rerank_stage::log_degraded(
