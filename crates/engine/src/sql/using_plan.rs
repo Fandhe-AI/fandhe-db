@@ -288,6 +288,9 @@ pub(crate) fn bind_expansion(
         distance_kind: crate::sql::lexer::DistanceKind::Cosine,
         result_cap: None,
         dense_source: crate::arena::DenseSource::EmbeddingSlot,
+        // D9: LLM 出力の `search_terms` には構文を適用しない（プロンプトインジェクションで
+        // 除外・フレーズのフィルタを操作させない）。
+        hybrid_text_syntax: crate::sql::hybrid_tuning::HybridTextSyntax::Literal,
     })
 }
 

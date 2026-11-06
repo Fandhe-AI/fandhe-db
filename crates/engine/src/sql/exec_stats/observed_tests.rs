@@ -115,6 +115,9 @@ fn run_kernel(storage: &Storage, sql: &str, stats: Option<&mut ExecStats>) -> Qu
         None,
         None,
         None,
+        &std::sync::Arc::new(crate::sparse::TextAnalysis::default()),
+        &crate::text_query_limits::TextQueryLimits::default(),
+        None,
         stats,
     )
     .expect("execute")
@@ -270,6 +273,9 @@ fn iterative_scan_records_postfilter_and_prefilter_distance_rows() {
         None,
         None,
         Some(access),
+        None,
+        &std::sync::Arc::new(crate::sparse::TextAnalysis::default()),
+        &crate::text_query_limits::TextQueryLimits::default(),
         None,
         Some(&mut st),
     )

@@ -47,14 +47,14 @@ const MAX_QUERY_TEXT_BYTES: usize = 16 * 1024;
 /// 別途上限があるため、この上限と合わせて候補側の走査・アロケーションコストの総量を
 /// 有界に保つ（[`MAX_CANDIDATE_TEXT_BYTES`] は 1 件あたり、[`MAX_POOL_DEPTH`] は件数の
 /// 上限で、互いに独立な検証のため両方が必要）。
-const MAX_CANDIDATE_TEXT_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_CANDIDATE_TEXT_BYTES: usize = 1024 * 1024;
 
 /// 候補テキスト（`RerankCandidate::text`）の合計バイト長上限。`sparse.rs::MAX_CORPUS_BYTES`
 /// と同じ理由: [`MAX_CANDIDATE_TEXT_BYTES`]（1 件あたり）・[`MAX_POOL_DEPTH`]（件数）は
 /// それぞれ独立な上限のため、両方の上限値ちょうどの入力（1 MiB × 10,000 件 ≈ 10 GiB）を
 /// 同時に許すと `tokenize()` の総コストが無制限に近い規模へ増幅しうる（CPU DoS）。
 /// `sparse.rs` の値をそのまま踏襲する。
-const MAX_TOTAL_CANDIDATE_TEXT_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_TOTAL_CANDIDATE_TEXT_BYTES: usize = 64 * 1024 * 1024;
 
 /// リランク対象の候補 1 件（[`crate::hybrid::HybridHit`] から融合スコアと文書テキストを
 /// 添えて渡す入力表現）。`text` はリランカーの素性計算専用であり、SQL・プラン文字列の
@@ -64,6 +64,9 @@ pub struct RerankCandidate<'a> {
     pub id: u64,
     pub fused_score: f64,
     pub text: &'a str,
+    /// 候補の埋め込み（Issue #2143。[`MmrReranker`] だけが読む。字句一致・クロスエンコーダ・
+    /// 恒等リランカーは参照しない）。実行器は RLS 適用後の可視アリーナ由来の値だけを渡す。
+    pub embedding: Option<&'a [f32]>,
 }
 
 /// 再順位付け後の検索結果 1 件。[`crate::hybrid::HybridHit`] とスコア尺度が異なるため
@@ -183,6 +186,11 @@ pub enum RerankError {
     /// **破壊的変更**として扱う（コミットの `BREAKING CHANGE:` フッタ・PR 本文の
     /// Breaking changes 節で明示する）。
     CrossEncoder(CrossEncoderError),
+    /// [`MmrReranker`]（Issue #2143）が受けた候補の埋め込みが使えない（欠落・次元不一致・
+    /// ノルムが 0 または非有限・類似度が NaN）。`RerankError` は `#[non_exhaustive]` を
+    /// 持たない既公開 enum のため、この variant 追加も [`RerankError::CrossEncoder`] と同じく
+    /// ソース非互換な**破壊的変更**として扱う。
+    InvalidEmbedding { id: u64 },
 }
 
 impl fmt::Display for RerankError {
@@ -226,6 +234,9 @@ impl fmt::Display for RerankError {
                 "rerank candidate text total too long: {total} bytes (max {max})"
             ),
             RerankError::CrossEncoder(e) => write!(f, "cross-encoder reranker error: {e}"),
+            RerankError::InvalidEmbedding { id } => {
+                write!(f, "rerank candidate has an unusable embedding: id={id}")
+            }
         }
     }
 }
@@ -696,6 +707,206 @@ impl Reranker for LexicalOverlapReranker {
     }
 }
 
+// ---------- MMR リランカー（Issue #2143・SEARCH-15。設計記録:
+// `docs/design/rerank-wiring-policy.md` D2・D3・D4・D8） ----------
+
+/// `--rerank-mmr-lambda` の既定値（関連度と多様性の中立点）。
+pub const DEFAULT_MMR_LAMBDA: f64 = 0.5;
+
+/// MMR の計算量予算（ADR D4）。`窓幅 W × min(k_eff, W)` の上限で、貪欲選択の
+/// 内積計算回数（約 `n × final_k`）を有界にする。
+pub const MMR_PAIR_BUDGET: usize = 1_000_000;
+
+/// MMR の λ を検証する（有限かつ `0.0..=1.0`）。wire-server の起動引数検証（`rerank_opt`）から
+/// 呼ばれ、範囲の判定を engine に一本化する。範囲外は [`RerankError::InvalidConfig`]。
+pub fn validate_mmr_lambda(lambda: f64) -> Result<f64, RerankError> {
+    if !lambda.is_finite() || !(0.0..=1.0).contains(&lambda) {
+        return Err(RerankError::InvalidConfig);
+    }
+    Ok(lambda)
+}
+
+/// 窓幅 `window` と実効件数 `k_eff` が MMR の計算量予算内か（`window × min(k_eff, window)`
+/// が [`MMR_PAIR_BUDGET`] 以下）。オーバーフローは予算超過として偽を返す。実行器が取得の前に
+/// 設定値だけで判定する（表の内容に依存しない。ADR D4）。
+pub fn mmr_budget_allows(window: usize, k_eff: usize) -> bool {
+    window
+        .checked_mul(k_eff.min(window))
+        .is_some_and(|pairs| pairs <= MMR_PAIR_BUDGET)
+}
+
+/// MMR（Maximal Marginal Relevance）リランカー。関連度と、既に選んだ結果との類似度を λ で
+/// 釣り合わせて貪欲に選ぶ。
+///
+/// - 関連度は入力位置から導く順位ベースの値（`1 - i/(n-1)`、`n = 1` は 1.0）。入力の並び
+///   （融合スコア降順・同点 id 昇順）をそのまま反映するため、λ=1 は元の順位を厳密に再現する。
+/// - 類似度は埋め込み同士のコサイン類似度（`kernel` の内積・コサイン距離カーネルで計算する）。
+/// - 1 件目は入力先頭を選ぶ。2 件目以降は `λ·rel − (1−λ)·max_sim` が最大の候補で、同点は
+///   id 昇順（ADR D8）。
+/// - 出力スコアは位置由来の狭義単調減少値（[`rerank_candidates`] の出力検証を通すため）。
+///   実行器は融合スコア（または元の距離）のまま応答するので、この値は外へ出ない。
+///
+/// 構築は [`MmrReranker::new`] だけ（フィールド非公開。λ の検証迂回を防ぐ）。
+#[derive(Debug, Clone, Copy)]
+pub struct MmrReranker {
+    lambda: f64,
+}
+
+impl Default for MmrReranker {
+    fn default() -> Self {
+        Self {
+            lambda: DEFAULT_MMR_LAMBDA,
+        }
+    }
+}
+
+impl MmrReranker {
+    /// 検証付きコンストラクタ（λ は [`validate_mmr_lambda`]）。
+    pub fn new(lambda: f64) -> Result<Self, RerankError> {
+        Ok(Self {
+            lambda: validate_mmr_lambda(lambda)?,
+        })
+    }
+
+    /// 検証済みの λ。
+    pub fn lambda(&self) -> f64 {
+        self.lambda
+    }
+}
+
+/// [`MmrReranker::rerank`] の貪欲選択の作業状態（候補 1 件分）。
+struct MmrItem<'a> {
+    id: u64,
+    rel: f64,
+    emb: &'a [f32],
+    norm_sq: f32,
+    selected: bool,
+    max_sim: f64,
+}
+
+impl Reranker for MmrReranker {
+    fn rerank(
+        &self,
+        _query_text: &str,
+        candidates: &[RerankCandidate<'_>],
+        final_k: usize,
+    ) -> Result<Vec<RerankedHit>, RerankError> {
+        // trait を直接呼ぶ経路でも迂回できないよう、件数・予算・入力契約をこの実装自身で
+        // 検証する（`LexicalOverlapReranker` と同じ設計判断）。確保より前に行う。
+        let n = candidates.len();
+        if n > MAX_POOL_DEPTH {
+            return Err(RerankError::TooManyCandidates {
+                len: n,
+                max: MAX_POOL_DEPTH,
+            });
+        }
+        if final_k == 0 || final_k > n {
+            return Err(RerankError::InvalidK);
+        }
+        if n.checked_mul(final_k)
+            .is_none_or(|pairs| pairs > MMR_PAIR_BUDGET)
+        {
+            return Err(RerankError::TooManyCandidates {
+                len: n,
+                max: MMR_PAIR_BUDGET / final_k,
+            });
+        }
+        if candidates.iter().any(|c| !c.fused_score.is_finite()) {
+            return Err(RerankError::NonFiniteScore);
+        }
+        if !is_sorted_desc_id_asc(candidates.iter().map(|c| (c.fused_score, c.id))) {
+            return Err(RerankError::UnsortedInput);
+        }
+        if has_duplicate_id(candidates.iter().map(|c| c.id)) {
+            return Err(RerankError::DuplicateId);
+        }
+
+        // 埋め込みの検証とノルム² の前計算（候補ごとに 1 回）。
+        let dim = candidates
+            .first()
+            .and_then(|c| c.embedding)
+            .map_or(0, <[f32]>::len);
+        let denom = n.saturating_sub(1).max(1) as f64;
+        let mut items: Vec<MmrItem<'_>> = Vec::with_capacity(n);
+        for (i, c) in candidates.iter().enumerate() {
+            let invalid = RerankError::InvalidEmbedding { id: c.id };
+            let emb = c.embedding.ok_or_else(|| invalid.clone())?;
+            if dim == 0 || emb.len() != dim {
+                return Err(invalid);
+            }
+            let norm_sq = crate::kernel::dot(emb, emb);
+            if !norm_sq.is_finite() || norm_sq <= 0.0 {
+                return Err(invalid);
+            }
+            let rel = if n == 1 {
+                1.0
+            } else {
+                1.0 - (i as f64) / denom
+            };
+            items.push(MmrItem {
+                id: c.id,
+                rel,
+                emb,
+                norm_sq,
+                selected: false,
+                max_sim: f64::NEG_INFINITY,
+            });
+        }
+
+        let lambda = self.lambda;
+        let mut out: Vec<RerankedHit> = Vec::with_capacity(final_k);
+        for pos in 0..final_k {
+            // 1 件目は入力先頭（選択集合が空の段は類似度項が全候補で 0 になるため固定する）。
+            let pick = if pos == 0 {
+                0
+            } else {
+                let mut best: Option<(usize, f64, u64)> = None;
+                for (j, it) in items.iter().enumerate().filter(|(_, it)| !it.selected) {
+                    let score = lambda * it.rel - (1.0 - lambda) * it.max_sim;
+                    let better = match best {
+                        None => true,
+                        Some((_, b_score, b_id)) => match score.total_cmp(&b_score) {
+                            std::cmp::Ordering::Greater => true,
+                            std::cmp::Ordering::Equal => it.id < b_id,
+                            std::cmp::Ordering::Less => false,
+                        },
+                    };
+                    if better {
+                        best = Some((j, score, it.id));
+                    }
+                }
+                best.map(|b| b.0).ok_or(RerankError::InvalidK)?
+            };
+            let (pick_id, pick_emb, pick_norm) = {
+                let it = items.get_mut(pick).ok_or(RerankError::InvalidK)?;
+                it.selected = true;
+                (it.id, it.emb, it.norm_sq)
+            };
+            out.push(RerankedHit {
+                id: pick_id,
+                score: (final_k - pos) as f64,
+            });
+            if pos + 1 < final_k {
+                for it in items.iter_mut().filter(|it| !it.selected) {
+                    let d = crate::kernel::cosine_distance_from_parts(
+                        crate::kernel::dot(it.emb, pick_emb),
+                        it.norm_sq,
+                        pick_norm,
+                    );
+                    if d.is_nan() {
+                        return Err(RerankError::InvalidEmbedding { id: it.id });
+                    }
+                    let sim = 1.0 - d;
+                    if sim > it.max_sim {
+                        it.max_sim = sim;
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
 // ---------- クロスエンコーダ型リランカー（Issue #333・SEARCH-7 方式変更） ----------
 //
 // `LexicalOverlapReranker`（字句一致順位の RRF 型融合）は Issue #330 で構造上限
@@ -770,6 +981,35 @@ pub enum CrossEncoderError {
     /// 同上。`passages` 全体の合計バイト長が [`MAX_TOTAL_CANDIDATE_TEXT_BYTES`]
     /// を超える（checked 加算。オーバーフローも同じエラーへ丸めて拒否する）。
     TotalCandidateTextTooLong { total: usize, max: usize },
+    /// 推論の期限（[`CrossEncoderReranker::with_timeout`]）を超過した（Issue #2144）。
+    /// 検索実行器はこれを検索拒否ではなく「リランキング前の順位への縮退」として扱う
+    /// （`sql::rerank_stage::degrade_reason` が `RerankDegradeReason::Timeout` へ写す）。
+    Timeout,
+    /// モデル／トークナイザファイルの事前検証違反（Issue #2144。`read_bounded_model_file`）。
+    /// パスやファイル内容は含めず、閉じた固定語の `reason` だけを持つ（情報漏えい防止）。
+    ModelFile {
+        file: CrossEncoderFile,
+        reason: &'static str,
+    },
+}
+
+/// [`CrossEncoderError::ModelFile`] が指す対象ファイルの種別（CLI フラグ名への対応づけ用）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrossEncoderFile {
+    /// ONNX モデル本体。
+    Model,
+    /// `tokenizer.json`。
+    Tokenizer,
+}
+
+impl CrossEncoderFile {
+    /// ログ・エラー文に出す固定語。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Model => "model",
+            Self::Tokenizer => "tokenizer",
+        }
+    }
 }
 
 impl fmt::Display for CrossEncoderError {
@@ -797,6 +1037,12 @@ impl fmt::Display for CrossEncoderError {
             } => write!(
                 f,
                 "cross-encoder backend max_seq_len ({backend}) does not match configured max_seq_len ({configured})"
+            ),
+            CrossEncoderError::Timeout => write!(f, "cross-encoder inference timed out"),
+            CrossEncoderError::ModelFile { file, reason } => write!(
+                f,
+                "cross-encoder {} file rejected: {reason}",
+                file.as_str()
             ),
             CrossEncoderError::QueryTextTooLong { len, max } => write!(
                 f,
@@ -889,6 +1135,8 @@ impl CrossEncoderConfig {
 pub struct CrossEncoderReranker<B: CrossEncoderBackend> {
     backend: B,
     cfg: CrossEncoderConfig,
+    /// 推論全体の期限（Issue #2144）。`None` は無期限（従来挙動）。
+    timeout: Option<std::time::Duration>,
 }
 
 impl<B: CrossEncoderBackend> CrossEncoderReranker<B> {
@@ -904,7 +1152,19 @@ impl<B: CrossEncoderBackend> CrossEncoderReranker<B> {
                 configured: cfg.max_seq_len(),
             });
         }
-        Ok(Self { backend, cfg })
+        Ok(Self {
+            backend,
+            cfg,
+            timeout: None,
+        })
+    }
+
+    /// 推論全体の期限を設定する（Issue #2144。`--rerank-timeout-ms` の注入点）。
+    /// `rerank` の入口から計測し、各バッチ完了後に超過を検査して
+    /// [`CrossEncoderError::Timeout`] を返す（スレッドは作らない。超過幅は最大 1 バッチ分）。
+    pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
     }
 }
 
@@ -942,6 +1202,7 @@ impl<B: CrossEncoderBackend> Reranker for CrossEncoderReranker<B> {
         // 対応が崩れないよう `scores` は候補順（＝ `candidates` の順）にそのまま
         // 積み上げる（`Vec` の位置対応。バックエンドは長さを保つ契約
         // [`CrossEncoderError::LengthMismatch`] で検証済み）。
+        let started = std::time::Instant::now();
         let mut scores: Vec<f64> = Vec::with_capacity(candidates.len());
         for chunk in candidates.chunks(self.cfg.batch_size()) {
             let passages: Vec<&str> = chunk.iter().map(|c| c.text).collect();
@@ -961,6 +1222,13 @@ impl<B: CrossEncoderBackend> Reranker for CrossEncoderReranker<B> {
                 return Err(RerankError::CrossEncoder(CrossEncoderError::NonFiniteScore));
             }
             scores.extend(chunk_scores);
+            // 期限検査はバッチ境界で行う。超過は検索拒否ではなく縮退として扱われる
+            // （`sql::rerank_stage::degrade_reason`）。
+            if let Some(limit) = self.timeout {
+                if started.elapsed() >= limit {
+                    return Err(RerankError::CrossEncoder(CrossEncoderError::Timeout));
+                }
+            }
         }
 
         // スコア降順・同点 id 昇順の決定的順序（`rerank_candidates` の出力契約と
@@ -987,6 +1255,463 @@ impl<B: CrossEncoderBackend> Reranker for CrossEncoderReranker<B> {
 #[cfg(feature = "cross-encoder")]
 pub mod cross_encoder_onnx;
 
+// ---------------------------------------------------------------------------
+// 検索実行器への結線用の設定・統計型（Issue #2142。設計記録:
+// `docs/design/rerank-wiring-policy.md`。ビヘイビア: SEARCH-15 をポインタで参照）
+// ---------------------------------------------------------------------------
+
+/// `--rerank-window` の既定値。`RerankConfig::default()`・ハイブリッド既定 pool と揃える。
+pub const DEFAULT_RERANK_WINDOW: usize = 200;
+
+/// リランク窓の幅 `W` を検証する（`1..=MAX_POOL_DEPTH`）。wire-server の起動引数検証
+/// （`rerank_opt`）から呼ばれ、範囲の判定を engine 側に一本化する（`MAX_POOL_DEPTH` は
+/// 非公開のまま。`validate_statement_timeout_ms` と同形）。範囲外は
+/// [`RerankError::InvalidConfig`]（fail-closed）。
+pub fn validate_rerank_window(window: usize) -> Result<usize, RerankError> {
+    if window == 0 || window > MAX_POOL_DEPTH {
+        return Err(RerankError::InvalidConfig);
+    }
+    Ok(window)
+}
+
+/// `--rerank-timeout-ms` の既定値（ミリ秒。Issue #2144。設計記録 ADR D5）。
+pub const DEFAULT_RERANK_TIMEOUT_MS: u64 = 1000;
+
+/// `--rerank-timeout-ms` の上限（ミリ秒）。
+const MAX_RERANK_TIMEOUT_MS: u64 = 60_000;
+
+/// 推論期限（ミリ秒）を検証して [`std::time::Duration`] にする（`1..=60000`）。
+/// wire-server の起動引数検証（`rerank_opt`）から呼ばれ、範囲判定を engine に一本化する
+/// （`validate_rerank_window` と同形）。範囲外は [`RerankError::InvalidConfig`]。
+pub fn validate_rerank_timeout_ms(ms: u64) -> Result<std::time::Duration, RerankError> {
+    if ms == 0 || ms > MAX_RERANK_TIMEOUT_MS {
+        return Err(RerankError::InvalidConfig);
+    }
+    Ok(std::time::Duration::from_millis(ms))
+}
+
+/// クロスエンコーダ推論の 1 バッチ件数（固定。CLI には出さない）。
+pub const DEFAULT_CROSS_ENCODER_BATCH_SIZE: usize = 32;
+
+/// クロスエンコーダの最大シーケンス長（固定。BERT 系の標準。CLI には出さない）。
+pub const DEFAULT_CROSS_ENCODER_MAX_SEQ_LEN: usize = 512;
+
+/// ONNX モデルファイルの読み込み上限（バイト。protobuf 単一ファイルの 2 GiB 上限に合わせる。
+/// 外部データ形式の ONNX は非対応）。自動運転下の暫定値で、人間による確認が必要
+/// （`docs/design/rerank-wiring-policy.md` 参照）。
+pub const MAX_CROSS_ENCODER_MODEL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// `tokenizer.json` の読み込み上限（バイト）。上記と同様に暫定値。
+pub const MAX_CROSS_ENCODER_TOKENIZER_BYTES: u64 = 64 * 1024 * 1024;
+
+/// 本ビルドが `cross-encoder` feature 付きかどうか。wire-server は feature を持たないため、
+/// この関数で実行時に分岐する（feature 無効のビルドでは `cross_encoder` 指定を拒否する）。
+pub fn cross_encoder_available() -> bool {
+    cfg!(feature = "cross-encoder")
+}
+
+/// モデル／トークナイザファイルを上限付きで読む（Issue #2144。ADR D2 の持ち越し事項）。
+///
+/// 検証順序: (1) パスに `..` を含めば拒否（パストラバーサル対策）、(2) 通常ファイルでなければ
+/// open 前に拒否（FIFO でのブロック回避）、(3) open 後にハンドルでも通常ファイルとサイズ上限を
+/// 確認（パス差し替え対策）、(4) `take(max + 1)` で読み上限超過を拒否（TOCTOU・無限ストリーム対策）。
+/// エラーはパスを含まない閉じた固定語のみ。feature の有無に関わらずコンパイルされ、
+/// `onnx_cross_encoder_method` から呼ばれる。
+pub fn read_bounded_model_file(
+    path: &std::path::Path,
+    file: CrossEncoderFile,
+    max: u64,
+) -> Result<Vec<u8>, CrossEncoderError> {
+    use std::io::Read;
+    let fail = |reason: &'static str| CrossEncoderError::ModelFile { file, reason };
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(fail("parent_dir_component"));
+    }
+    match std::fs::metadata(path) {
+        Ok(m) if m.is_file() => {}
+        Ok(_) => return Err(fail("not_regular_file")),
+        Err(_) => return Err(fail("unreadable")),
+    }
+    // 確認後に FIFO 等へ差し替えられても open 自体が停止しないよう、unix では非ブロッキングで
+    // 開いてからハンドルの種別を確認する。
+    let mut oo = std::fs::OpenOptions::new();
+    oo.read(true);
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        oo.custom_flags(0o4000); // O_NONBLOCK
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        oo.custom_flags(0x4); // O_NONBLOCK
+    }
+    let f = oo.open(path).map_err(|_| fail("unreadable"))?;
+    let meta = f.metadata().map_err(|_| fail("unreadable"))?;
+    if !meta.is_file() {
+        return Err(fail("not_regular_file"));
+    }
+    if meta.len() > max {
+        return Err(fail("too_large"));
+    }
+    let mut buf = Vec::new();
+    f.take(max.saturating_add(1))
+        .read_to_end(&mut buf)
+        .map_err(|_| fail("unreadable"))?;
+    if buf.len() as u64 > max {
+        return Err(fail("too_large"));
+    }
+    Ok(buf)
+}
+
+/// ONNX クロスエンコーダ方式を構築する（`--reranker cross_encoder` の実体。Issue #2144）。
+/// 2 ファイルを上限付きで読み、バックエンド構築・設定検証・期限設定まで行う。失敗は
+/// すべて起動エラーとして wire-server が扱う。`cross-encoder` feature 無効のビルドでは
+/// ファイルに触れず固定文言の `Err` を返す（多層防御）。
+#[cfg(feature = "cross-encoder")]
+pub fn onnx_cross_encoder_method(
+    model_path: &std::path::Path,
+    tokenizer_path: &std::path::Path,
+    window: usize,
+    timeout: std::time::Duration,
+) -> Result<RerankMethod, CrossEncoderError> {
+    let model = read_bounded_model_file(
+        model_path,
+        CrossEncoderFile::Model,
+        MAX_CROSS_ENCODER_MODEL_BYTES,
+    )?;
+    let tokenizer = read_bounded_model_file(
+        tokenizer_path,
+        CrossEncoderFile::Tokenizer,
+        MAX_CROSS_ENCODER_TOKENIZER_BYTES,
+    )?;
+    let backend = cross_encoder_onnx::OnnxCrossEncoderBackend::from_bytes(
+        &model,
+        &tokenizer,
+        DEFAULT_CROSS_ENCODER_MAX_SEQ_LEN,
+    )?;
+    drop(model);
+    drop(tokenizer);
+    let cfg = CrossEncoderConfig::new(
+        DEFAULT_CROSS_ENCODER_BATCH_SIZE,
+        window,
+        DEFAULT_CROSS_ENCODER_MAX_SEQ_LEN,
+    )?;
+    let reranker = CrossEncoderReranker::new(backend, cfg)?.with_timeout(timeout);
+    Ok(RerankMethod::cross_encoder(reranker))
+}
+
+/// `cross-encoder` feature 無効ビルド用。ファイルに触れずに拒否する。
+#[cfg(not(feature = "cross-encoder"))]
+pub fn onnx_cross_encoder_method(
+    _model_path: &std::path::Path,
+    _tokenizer_path: &std::path::Path,
+    _window: usize,
+    _timeout: std::time::Duration,
+) -> Result<RerankMethod, CrossEncoderError> {
+    Err(CrossEncoderError::Backend(
+        "cross-encoder feature is disabled in this build".to_string(),
+    ))
+}
+
+/// 検索実行器に結線するリランク方式。`EngineCore::with_rerank` で起動時に 1 回だけ注入
+/// する（セッション・SQL・NoSQL からは変更できない。ADR D1）。`Identity`・`Custom` は
+/// Rust API 専用で CLI からは到達できない。
+#[derive(Clone, Default)]
+#[non_exhaustive]
+pub enum RerankMethod {
+    /// リランクしない（既定。従来経路をそのまま通る）。
+    #[default]
+    Off,
+    /// 恒等リランカー（テスト用。順位を変えない）。
+    Identity,
+    /// 字句一致リランカー（`--reranker lexical`）。
+    Lexical(LexicalOverlapReranker),
+    /// 任意のリランカー（契約違反の注入テスト用。出力は実行器が検証する）。
+    Custom(std::sync::Arc<dyn Reranker>),
+    /// クロスエンコーダ（`--reranker cross_encoder`。Issue #2144）。
+    CrossEncoder(std::sync::Arc<dyn Reranker>),
+    /// MMR リランカー（`--reranker mmr`。Issue #2143）。埋め込みを読む。
+    Mmr(MmrReranker),
+    /// 埋め込みを読む任意のリランカー（密経路の縮退・再検索の注入テスト用。Rust API 専用）。
+    CustomEmbedding(std::sync::Arc<dyn Reranker>),
+}
+
+/// リランカーが要求する入力の種別（実行器が窓内の行から何を取り出すかを決める）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RerankInput {
+    /// 行のテキスト列（ハイブリッドのみ適用）。
+    Text,
+    /// 行の埋め込み（ハイブリッド・密のみの両方に適用）。
+    Embedding,
+}
+
+impl fmt::Debug for RerankMethod {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.kind_name())
+    }
+}
+
+impl RerankMethod {
+    /// ログ・統計に出す閉じた語彙の種別名。
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Identity => "identity",
+            Self::Lexical(_) => "lexical",
+            Self::CrossEncoder(_) => "cross_encoder",
+            Self::Custom(_) | Self::CustomEmbedding(_) => "custom",
+            Self::Mmr(_) => "mmr",
+        }
+    }
+
+    /// 方式が要求する入力（ADR D3 の適用形状表）。`Off` は使われない。
+    pub(crate) fn required_input(&self) -> RerankInput {
+        match self {
+            Self::Mmr(_) | Self::CustomEmbedding(_) => RerankInput::Embedding,
+            _ => RerankInput::Text,
+        }
+    }
+
+    /// クロスエンコーダ方式を構築する（スタブバックエンドでも ONNX でも共通。Issue #2144）。
+    pub fn cross_encoder<B: CrossEncoderBackend + 'static>(r: CrossEncoderReranker<B>) -> Self {
+        Self::CrossEncoder(std::sync::Arc::new(r))
+    }
+
+    /// 実行器が呼ぶリランカー。`Off` は `None`。
+    pub(crate) fn reranker(&self) -> Option<&dyn Reranker> {
+        match self {
+            Self::Off => None,
+            Self::Identity => Some(&IdentityReranker),
+            Self::Lexical(r) => Some(r),
+            Self::Custom(r) | Self::CustomEmbedding(r) | Self::CrossEncoder(r) => Some(r.as_ref()),
+            Self::Mmr(r) => Some(r),
+        }
+    }
+}
+
+/// リランク設定（方式と窓幅 `W`）。検証付きコンストラクタ [`RerankSettings::new`] のみで
+/// 構築する（フィールド非公開。検証迂回による fail-open を防ぐ）。
+#[derive(Debug, Clone)]
+pub struct RerankSettings {
+    method: RerankMethod,
+    window: usize,
+}
+
+impl Default for RerankSettings {
+    fn default() -> Self {
+        Self::off()
+    }
+}
+
+impl RerankSettings {
+    /// リランク無効の設定（既定）。
+    pub fn off() -> Self {
+        Self {
+            method: RerankMethod::Off,
+            window: DEFAULT_RERANK_WINDOW,
+        }
+    }
+
+    /// 検証付きコンストラクタ。`window` は `1..=10_000`（[`validate_rerank_window`]）。
+    /// `Off` のとき窓幅は使われないが、値は検証する。
+    pub fn new(method: RerankMethod, window: usize) -> Result<Self, RerankError> {
+        let window = validate_rerank_window(window)?;
+        Ok(Self { method, window })
+    }
+
+    /// 方式。
+    pub fn method(&self) -> &RerankMethod {
+        &self.method
+    }
+
+    /// 窓幅 `W`。
+    pub fn window(&self) -> usize {
+        self.window
+    }
+
+    /// リランクが有効（`Off` 以外）か。
+    pub fn is_enabled(&self) -> bool {
+        !matches!(self.method, RerankMethod::Off)
+    }
+}
+
+/// 縮退（リランキング前の順位で応答すること）の理由。ログ・統計で使う閉じた語彙
+/// （ADR D7）。`Timeout` は #2144 で、`MmrBudget` は後続 Issue（#2143）で到達する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RerankDegradeReason {
+    /// 推論の期限超過。
+    Timeout,
+    /// バックエンド（クロスエンコーダ等）の失敗。
+    BackendError,
+    /// リランカーの入出力契約違反。
+    ContractViolation,
+    /// テキスト長などの入力上限超過。
+    InputLimit,
+    /// MMR の計算量予算超過。
+    MmrBudget,
+}
+
+impl RerankDegradeReason {
+    /// ログ・統計に出す固定の語彙。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::BackendError => "backend_error",
+            Self::ContractViolation => "contract_violation",
+            Self::InputLimit => "input_limit",
+            Self::MmrBudget => "mmr_budget",
+        }
+    }
+}
+
+/// リランクの観測用統計（`EngineCore::rerank_stats` が返す累計のスナップショット）。
+/// 件数だけを持ち、id・本文・テナント情報は含まない。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RerankStats {
+    /// リランクを適用して応答した文の数。
+    pub applied: u64,
+    /// 文の形（密のみ等）により適用外として素通しした文の数。
+    pub not_applicable: u64,
+    /// 縮退: 期限超過。
+    pub degraded_timeout: u64,
+    /// 縮退: バックエンド失敗。
+    pub degraded_backend_error: u64,
+    /// 縮退: 契約違反。
+    pub degraded_contract_violation: u64,
+    /// 縮退: 入力上限超過。
+    pub degraded_input_limit: u64,
+    /// 縮退: MMR 予算超過。
+    pub degraded_mmr_budget: u64,
+}
+
+impl RerankStats {
+    /// 全理由の縮退件数の合計。
+    pub fn degraded_total(&self) -> u64 {
+        self.degraded_timeout
+            .saturating_add(self.degraded_backend_error)
+            .saturating_add(self.degraded_contract_violation)
+            .saturating_add(self.degraded_input_limit)
+            .saturating_add(self.degraded_mmr_budget)
+    }
+}
+
+/// [`RerankStats`] の実体（`EngineCore` が保持し、実行器が更新する crate 内部型）。
+#[derive(Debug, Default)]
+pub(crate) struct RerankCounters {
+    applied: std::sync::atomic::AtomicU64,
+    not_applicable: std::sync::atomic::AtomicU64,
+    timeout: std::sync::atomic::AtomicU64,
+    backend_error: std::sync::atomic::AtomicU64,
+    contract_violation: std::sync::atomic::AtomicU64,
+    input_limit: std::sync::atomic::AtomicU64,
+    mmr_budget: std::sync::atomic::AtomicU64,
+}
+
+impl RerankCounters {
+    fn bump(c: &std::sync::atomic::AtomicU64) {
+        c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_applied(&self) {
+        Self::bump(&self.applied);
+    }
+
+    pub(crate) fn record_not_applicable(&self) {
+        Self::bump(&self.not_applicable);
+    }
+
+    pub(crate) fn record_degraded(&self, reason: RerankDegradeReason) {
+        match reason {
+            RerankDegradeReason::Timeout => Self::bump(&self.timeout),
+            RerankDegradeReason::BackendError => Self::bump(&self.backend_error),
+            RerankDegradeReason::ContractViolation => Self::bump(&self.contract_violation),
+            RerankDegradeReason::InputLimit => Self::bump(&self.input_limit),
+            RerankDegradeReason::MmrBudget => Self::bump(&self.mmr_budget),
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> RerankStats {
+        use std::sync::atomic::Ordering::Relaxed;
+        RerankStats {
+            applied: self.applied.load(Relaxed),
+            not_applicable: self.not_applicable.load(Relaxed),
+            degraded_timeout: self.timeout.load(Relaxed),
+            degraded_backend_error: self.backend_error.load(Relaxed),
+            degraded_contract_violation: self.contract_violation.load(Relaxed),
+            degraded_input_limit: self.input_limit.load(Relaxed),
+            degraded_mmr_budget: self.mmr_budget.load(Relaxed),
+        }
+    }
+}
+
+#[cfg(test)]
+mod wiring_tests {
+    use super::*;
+
+    #[test]
+    fn window_bounds() {
+        assert!(validate_rerank_window(0).is_err());
+        assert_eq!(validate_rerank_window(1), Ok(1));
+        assert_eq!(validate_rerank_window(10_000), Ok(10_000));
+        assert!(validate_rerank_window(10_001).is_err());
+    }
+
+    #[test]
+    fn settings_default_is_off_and_validates_window() {
+        let s = RerankSettings::default();
+        assert!(!s.is_enabled());
+        assert_eq!(s.window(), DEFAULT_RERANK_WINDOW);
+        assert!(RerankSettings::new(RerankMethod::Identity, 0).is_err());
+        let s = RerankSettings::new(RerankMethod::Identity, 50).unwrap();
+        assert!(s.is_enabled());
+        assert_eq!(s.window(), 50);
+        assert_eq!(s.method().kind_name(), "identity");
+    }
+
+    #[test]
+    fn degrade_reason_vocabulary_is_closed() {
+        let all = [
+            RerankDegradeReason::Timeout,
+            RerankDegradeReason::BackendError,
+            RerankDegradeReason::ContractViolation,
+            RerankDegradeReason::InputLimit,
+            RerankDegradeReason::MmrBudget,
+        ];
+        let names: Vec<&str> = all.iter().map(RerankDegradeReason::as_str).collect();
+        assert_eq!(
+            names,
+            [
+                "timeout",
+                "backend_error",
+                "contract_violation",
+                "input_limit",
+                "mmr_budget"
+            ]
+        );
+    }
+
+    #[test]
+    fn counters_snapshot_tracks_each_reason() {
+        let c = RerankCounters::default();
+        c.record_applied();
+        c.record_not_applicable();
+        c.record_degraded(RerankDegradeReason::InputLimit);
+        c.record_degraded(RerankDegradeReason::ContractViolation);
+        let s = c.snapshot();
+        assert_eq!(s.applied, 1);
+        assert_eq!(s.not_applicable, 1);
+        assert_eq!(s.degraded_input_limit, 1);
+        assert_eq!(s.degraded_contract_violation, 1);
+        assert_eq!(s.degraded_total(), 2);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -996,6 +1721,7 @@ mod tests {
             id,
             fused_score,
             text,
+            embedding: None,
         }
     }
 
@@ -1747,5 +2473,307 @@ mod tests {
                 configured: 256,
             })
         ));
+    }
+
+    // ---------- Issue #2144: 推論期限・モデルファイル検証・方式結線 ----------
+
+    #[test]
+    fn cross_encoder_zero_timeout_returns_timeout_after_first_batch() {
+        let cfg = CrossEncoderConfig::new(32, 200, 512).unwrap();
+        let reranker = CrossEncoderReranker::new(LengthScoreBackend, cfg)
+            .unwrap()
+            .with_timeout(std::time::Duration::ZERO);
+        let candidates = [cand(1, 2.0, "aa"), cand(2, 1.0, "aaaa")];
+        let err =
+            rerank_candidates(&reranker, "q", &candidates, &RerankConfig::default()).unwrap_err();
+        assert!(matches!(
+            err,
+            RerankError::CrossEncoder(CrossEncoderError::Timeout)
+        ));
+    }
+
+    #[test]
+    fn cross_encoder_generous_timeout_keeps_output() {
+        let cfg = CrossEncoderConfig::new(32, 200, 512).unwrap();
+        let reranker = CrossEncoderReranker::new(LengthScoreBackend, cfg)
+            .unwrap()
+            .with_timeout(std::time::Duration::from_secs(3600));
+        let candidates = [cand(1, 2.0, "aa"), cand(2, 1.0, "aaaa")];
+        let hits =
+            rerank_candidates(&reranker, "q", &candidates, &RerankConfig::default()).expect("ok");
+        assert_eq!(hits.iter().map(|h| h.id).collect::<Vec<_>>(), vec![2, 1]);
+    }
+
+    #[test]
+    fn validate_rerank_timeout_ms_boundaries() {
+        assert!(validate_rerank_timeout_ms(0).is_err());
+        assert_eq!(
+            validate_rerank_timeout_ms(1).unwrap(),
+            std::time::Duration::from_millis(1)
+        );
+        assert!(validate_rerank_timeout_ms(60_000).is_ok());
+        assert!(validate_rerank_timeout_ms(60_001).is_err());
+        assert!(validate_rerank_timeout_ms(DEFAULT_RERANK_TIMEOUT_MS).is_ok());
+    }
+
+    #[test]
+    fn cross_encoder_method_kind_name() {
+        let cfg = CrossEncoderConfig::new(32, 200, 512).unwrap();
+        let m = RerankMethod::cross_encoder(
+            CrossEncoderReranker::new(LengthScoreBackend, cfg).unwrap(),
+        );
+        assert_eq!(m.kind_name(), "cross_encoder");
+        assert!(m.reranker().is_some());
+    }
+
+    /// 一意な一時ディレクトリ（Drop で削除。tmp-leak-check 対策）。
+    struct TmpDir(std::path::PathBuf);
+    impl TmpDir {
+        fn new(tag: &str) -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static N: AtomicU64 = AtomicU64::new(0);
+            let p = std::env::temp_dir().join(format!(
+                "fandhe-ce-{tag}-{}-{}",
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&p).unwrap();
+            Self(p)
+        }
+    }
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn reason(e: CrossEncoderError) -> &'static str {
+        match e {
+            CrossEncoderError::ModelFile { reason, .. } => reason,
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_bounded_model_file_checks() {
+        let d = TmpDir::new("bounded");
+        let f = d.0.join("m.bin");
+        std::fs::write(&f, b"12345").unwrap();
+        let file = CrossEncoderFile::Model;
+        assert_eq!(read_bounded_model_file(&f, file, 5).unwrap(), b"12345");
+        assert_eq!(
+            reason(read_bounded_model_file(&f, file, 4).unwrap_err()),
+            "too_large"
+        );
+        assert_eq!(
+            reason(read_bounded_model_file(&d.0, file, 100).unwrap_err()),
+            "not_regular_file"
+        );
+        assert_eq!(
+            reason(read_bounded_model_file(&d.0.join("none"), file, 100).unwrap_err()),
+            "unreadable"
+        );
+        let traversal = d.0.join("..").join("m.bin");
+        let e = read_bounded_model_file(&traversal, file, 100).unwrap_err();
+        assert!(!e.to_string().contains("fandhe-ce"));
+        assert_eq!(reason(e), "parent_dir_component");
+    }
+
+    #[cfg(feature = "cross-encoder")]
+    #[test]
+    fn onnx_method_with_missing_model_returns_model_file_error() {
+        let d = TmpDir::new("onnx-missing");
+        let err = onnx_cross_encoder_method(
+            &d.0.join("no-model"),
+            &d.0.join("no-tok"),
+            10,
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap_err();
+        assert_eq!(reason(err), "unreadable");
+    }
+}
+#[cfg(test)]
+mod mmr_tests {
+    use super::*;
+
+    /// `(id, 埋め込み)` から融合スコア降順（先頭が最大）の候補列を作る。
+    fn cands(rows: &[(u64, Vec<f32>)]) -> Vec<RerankCandidate<'_>> {
+        rows.iter()
+            .enumerate()
+            .map(|(i, (id, e))| RerankCandidate {
+                id: *id,
+                fused_score: 100.0 - i as f64,
+                text: "",
+                embedding: Some(e.as_slice()),
+            })
+            .collect()
+    }
+
+    fn ids(hits: &[RerankedHit]) -> Vec<u64> {
+        hits.iter().map(|h| h.id).collect()
+    }
+
+    fn cfg(n: usize, k: usize) -> RerankConfig {
+        RerankConfig::new(n, k).unwrap()
+    }
+
+    /// A が最上位、B は A とほぼ同じ向き、C は A と直交。
+    fn abc() -> Vec<(u64, Vec<f32>)> {
+        vec![
+            (1, vec![1.0, 0.0]),
+            (2, vec![0.99, 0.1]),
+            (3, vec![0.0, 1.0]),
+        ]
+    }
+
+    #[test]
+    fn lambda_one_reproduces_the_input_order() {
+        let rows = abc();
+        let c = cands(&rows);
+        let r = MmrReranker::new(1.0).unwrap();
+        let out = rerank_candidates(&r, "", &c, &cfg(3, 3)).unwrap();
+        assert_eq!(ids(&out), vec![1, 2, 3]);
+        let out = rerank_candidates(&r, "", &c, &cfg(3, 2)).unwrap();
+        assert_eq!(ids(&out), vec![1, 2]);
+    }
+
+    #[test]
+    fn lambda_one_keeps_order_for_ties_and_single_candidate() {
+        // 融合スコアが同点（id 昇順）でも入力位置どおり。
+        let rows = abc();
+        let mut c = cands(&rows);
+        for x in &mut c {
+            x.fused_score = 1.0;
+        }
+        let r = MmrReranker::new(1.0).unwrap();
+        assert_eq!(
+            ids(&rerank_candidates(&r, "", &c, &cfg(3, 3)).unwrap()),
+            vec![1, 2, 3]
+        );
+        let one = &c[..1];
+        assert_eq!(
+            ids(&rerank_candidates(&r, "", one, &cfg(1, 1)).unwrap()),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn lambda_zero_maximizes_diversity_but_starts_from_the_top() {
+        let rows = abc();
+        let c = cands(&rows);
+        let r = MmrReranker::new(0.0).unwrap();
+        let out = rerank_candidates(&r, "", &c, &cfg(3, 3)).unwrap();
+        assert_eq!(ids(&out), vec![1, 3, 2]);
+    }
+
+    #[test]
+    fn ties_break_by_id_ascending_and_runs_are_deterministic() {
+        // 2 件目の候補 9 と 5 は A と同じ類似度（ともに直交）。
+        let rows = vec![
+            (1, vec![1.0, 0.0]),
+            (9, vec![0.0, 1.0]),
+            (5, vec![0.0, -1.0]),
+        ];
+        let mut c = cands(&rows);
+        // 入力契約（スコア降順・同点 id 昇順）を満たすよう、9 と 5 を同点にして id 昇順へ並べる。
+        c[1].fused_score = 50.0;
+        c[2].fused_score = 50.0;
+        c.swap(1, 2);
+        let r = MmrReranker::new(0.0).unwrap();
+        let a = rerank_candidates(&r, "", &c, &cfg(3, 3)).unwrap();
+        let b = rerank_candidates(&r, "", &c, &cfg(3, 3)).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(ids(&a), vec![1, 5, 9]);
+    }
+
+    #[test]
+    fn lambda_validation() {
+        for ok in [0.0, 0.5, 1.0, -0.0] {
+            assert!(validate_mmr_lambda(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            -0.1,
+            1.000_000_1,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ] {
+            assert_eq!(validate_mmr_lambda(bad), Err(RerankError::InvalidConfig));
+            assert!(MmrReranker::new(bad).is_err());
+        }
+        assert_eq!(MmrReranker::default().lambda(), DEFAULT_MMR_LAMBDA);
+    }
+
+    #[test]
+    fn unusable_embeddings_are_rejected() {
+        let r = MmrReranker::new(0.5).unwrap();
+        let good = vec![(1, vec![1.0, 0.0]), (2, vec![0.0, 1.0])];
+        let mut c = cands(&good);
+        c[1].embedding = None;
+        assert_eq!(
+            r.rerank("", &c, 2),
+            Err(RerankError::InvalidEmbedding { id: 2 })
+        );
+        for bad in [
+            vec![1.0],
+            vec![0.0, 0.0],
+            vec![f32::NAN, 1.0],
+            vec![f32::INFINITY, 0.0],
+        ] {
+            let rows = vec![(1, vec![1.0, 0.0]), (2, bad)];
+            let c = cands(&rows);
+            assert_eq!(
+                r.rerank("", &c, 2),
+                Err(RerankError::InvalidEmbedding { id: 2 })
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_k_and_direct_call_contracts() {
+        let r = MmrReranker::new(0.5).unwrap();
+        let rows = abc();
+        let c = cands(&rows);
+        assert_eq!(r.rerank("", &c, 0), Err(RerankError::InvalidK));
+        assert_eq!(r.rerank("", &c, 4), Err(RerankError::InvalidK));
+        let mut unsorted = cands(&rows);
+        unsorted.swap(0, 1);
+        assert_eq!(r.rerank("", &unsorted, 2), Err(RerankError::UnsortedInput));
+    }
+
+    #[test]
+    fn budget_bounds() {
+        assert!(mmr_budget_allows(1000, 1000));
+        assert!(!mmr_budget_allows(1001, 1000));
+        assert!(!mmr_budget_allows(10_000, 101));
+        assert!(mmr_budget_allows(10_000, 100));
+        // k_eff が窓を超えても W × W で判定する。
+        assert!(mmr_budget_allows(1000, 5000));
+        assert!(!mmr_budget_allows(usize::MAX, usize::MAX));
+    }
+
+    #[test]
+    fn direct_call_over_budget_is_rejected() {
+        let r = MmrReranker::new(0.5).unwrap();
+        // 1001 件 × final_k 1000 = 1,001,000 > 予算。埋め込みの中身に入る前に拒否される。
+        let rows: Vec<(u64, Vec<f32>)> = (0..1001u64).map(|i| (i, vec![1.0, 0.0])).collect();
+        let c = cands(&rows);
+        assert!(matches!(
+            r.rerank("", &c, 1000),
+            Err(RerankError::TooManyCandidates { .. })
+        ));
+    }
+
+    #[test]
+    fn method_metadata() {
+        let m = RerankMethod::Mmr(MmrReranker::default());
+        assert_eq!(m.kind_name(), "mmr");
+        assert_eq!(m.required_input(), RerankInput::Embedding);
+        assert!(m.reranker().is_some());
+        let c = RerankMethod::CustomEmbedding(std::sync::Arc::new(IdentityReranker));
+        assert_eq!(c.kind_name(), "custom");
+        assert_eq!(c.required_input(), RerankInput::Embedding);
+        assert_eq!(RerankMethod::Identity.required_input(), RerankInput::Text);
     }
 }

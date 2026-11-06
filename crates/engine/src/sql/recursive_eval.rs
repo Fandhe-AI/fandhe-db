@@ -374,6 +374,9 @@ impl ScanTerm {
                 ProjectedColumn::Id | ProjectedColumn::AliasedId { .. } => {
                     Err(internal("pseudo column in the recursive reference"))
                 }
+                ProjectedColumn::HybridDetail { .. } => {
+                    Err(internal("hybrid detail in the recursive reference"))
+                }
             })
             .collect()
     }
@@ -436,6 +439,9 @@ impl ScanTerm {
                 }
                 ProjectedColumn::Id | ProjectedColumn::AliasedId { .. } => {
                     return Err(internal("pseudo column in the recursive reference"));
+                }
+                ProjectedColumn::HybridDetail { .. } => {
+                    return Err(internal("hybrid detail in the recursive reference"));
                 }
             }
         }

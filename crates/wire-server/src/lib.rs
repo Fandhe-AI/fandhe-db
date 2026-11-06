@@ -54,6 +54,11 @@
 //!   `engine::search_engine::HnswScope` へ untrusted な CLI 文字列から到達する
 //!   唯一の入口。`EngineCore::with_hnsw_scope` への注入は `main.rs::run_server`
 //!   の責務）
+//! - [`english_stemmer_opt`]: `--english-stemmer` の専用拒否入口（Issue #2129 Phase A・
+//!   SEARCH-16 ポインタ。承認と feature 有効化の前は常に起動エラー）
+//! - [`text_analysis_opt`]: `--stopwords-file`／`--synonyms-file` の上限付き読み込みと検証
+//!   （Issue #2130・SEARCH-16 ポインタ。`EngineCore::with_text_analysis` への注入は
+//!   `main.rs::run_server` の責務）
 //! - [`require_operation_id_opt`]: `--require-operation-id` 値なしスイッチの解決
 //!   （Issue #1703。`engine::recovery::required_op_id::LedgerMode` へ CLI から
 //!   到達する唯一の入口。`EngineCore::with_ledger_mode` への注入は
@@ -140,6 +145,7 @@ pub mod correlated_limits_opt;
 pub mod ddl_permission_opt;
 pub mod dml_limits_opt;
 pub mod durability_opt;
+pub mod english_stemmer_opt;
 pub mod error_response;
 pub mod extended_query;
 #[cfg(feature = "fault-injection")]
@@ -162,6 +168,7 @@ pub mod recursive_cte_limits_opt;
 pub mod regex_limits_opt;
 pub mod require_operation_id_opt;
 pub mod require_where_for_dml_opt;
+pub mod rerank_opt;
 pub(crate) mod response_buffer;
 pub mod result_encoder;
 pub mod result_limits_opt;
@@ -174,6 +181,8 @@ pub mod sparsevec_limits_opt;
 pub mod statement_timeout_opt;
 pub mod surface;
 pub mod temp_table_limits_opt;
+pub mod text_analysis_opt;
+pub mod text_query_limits_opt;
 pub mod tls;
 pub mod tls_opt;
 pub mod transaction_limits_opt;

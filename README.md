@@ -16,7 +16,7 @@ Rust 製のローカルファースト・vector 特化クエリ DB の実装リ�
 
 - **接続プロトコル**: PostgreSQL wire プロトコル v3 互換の**自作実装**（`pgwire` 等の外部ライブラリへ可能な限り依存しない）。psql・psycopg・node pg が無改造で接続可能なことを PoC-8 で実測済み
 - **クエリ表層**: 標準クエリカタログ C1〜C5 を MVP とする vector 特化 SQL（C6 集計・C7 結合は拡張扱い）。LLM クエリプランニングは専用構文 `USING PLAN(...)` で SQL に露出
-- **検索モード**: `recall`（広域・既定）／`precision`（ピンポイント抽出）の切り替えを提供。切替手段・実行契約の詳細は spec のビヘイビア定義（SQL-12・SEARCH-9/10・PLAN-11・TASK-161〜165）を参照
+- **検索モード**: `recall`（広域・既定）／`precision`（ピンポイント抽出）の切り替えを提供。切替手段・実行契約の詳細は spec のビヘイビア定義（SQL-12・SEARCH-9/10・PLAN-11・TASK-161〜165）を参照。利用者向けの説明は [docs/design/search-mode-and-reproducibility.md](docs/design/search-mode-and-reproducibility.md)
 - **照合順序（`COLLATE`）**: 既定は `C`（バイト列順）。`C`／`POSIX` に加え、ICU4X（`icu_collator`）による `und-x-icu`・`ja-x-icu`（deterministic。等しい値はバイト列順で二次比較）を列定義・式の `COLLATE` で指定できる。`ORDER BY`・`GROUP BY`・`DISTINCT`・`MIN`／`MAX`・`WHERE` の比較が照合に従い、照合を運べない経路は `0A000` で拒否する（fail-closed）。スカラー二次索引の辞書は列の実効照合順で並び（起動時 opt-in では `CREATE INDEX ... (col COLLATE "x")` の照合）、照合が異なる比較・ICU 列の前方一致は索引を使わず全走査へ縮退し `EXPLAIN` の `scalar_plan:` 行に `reason=collation_mismatch` が付く（#2191）。対応状況の詳細は [`docs/design/implementation-status.md`](docs/design/implementation-status.md) の Issue #2190
 - **広域取得（ソートなしのフィルタ取得）**: `ORDER BY`／`USING PLAN` を伴わない `SELECT ... [WHERE ...] LIMIT n` を SQL 表層へ追加（`Statement::Scan`。Issue #454）。ランキング段・取得モードを持たず、可視かつ `WHERE` を満たす行を先頭から `LIMIT` 件返す（順序保証なし・早期終了）。契約の詳細（spec 側では SQL-15・TASK-170 として付与済み〔fandhe-db-spec#12〕。受け入れ確認・確定化は TASK-170 が担う。閾値等は実装既定値）は [`docs/design/wide-retrieval-scan.md`](docs/design/wide-retrieval-scan.md) を参照
 - **クレート構成**: `engine`（コアロジック: データロード・検索カーネル・認証・RLS）＋ `wire-server`（バイナリ）の workspace 構成（TASK-66 で雛形を構築済み。各機能の実装は後続タスク）
@@ -132,7 +132,9 @@ cargo run -p fandhe-db-wire-server -- --users <ユーザーストアのパス> -
   [--wasm-max-fuel <1-100000000>] \
   [--max-jsonpath-steps <1-4000000>] [--max-jsonpath-depth <1-1024>] \
   [--max-regex-pattern-len <1-4096>] [--max-regex-input-len <1-4194304>] \
-  [--max-regex-compiled-size <1-10485760>] [--max-sparsevec-nnz <1-16000>] \
+  [--max-regex-compiled-size <1-10485760>] \
+  [--max-text-query-terms <1-1024>] [--max-text-query-prefix-expansions <1-1024>] \
+  [--max-sparsevec-nnz <1-16000>] \
   [--max-ts-headline-bytes <1-4194304>] [--max-ts-headline-fragments <1-1024>] \
   [--max-subquery-depth <1-4>] [--max-subquery-executions <1-16>] \
   [--max-cte-definitions <1-16>] [--max-cte-nesting-depth <1-4>] [--max-window-keys <1-8>] \
@@ -361,6 +363,36 @@ PostgreSQL と同じく `WHERE` 省略を受理します。プロセス起動時
 NoSQL（HTTP）の `update`／`delete` は従来どおり filter 必須で、本スイッチの影響を受けません
 （`docs/design/require-where-for-dml-cli.md`）。
 
+`--stopwords-file`／`--synonyms-file`（Issue #2130）は、疎検索（BM25）のストップワード一覧・同義語辞書を
+プロセス起動時にだけ読み込む opt-in の CLI 引数です。形式・上限・処理の順序は
+`docs/design/stopword-synonym-files.md` を参照してください。不正・上限超過のファイル、値欠落、重複指定は
+fail-closed で起動エラーとなり、エラー文にファイルの中身を出しません。セッション・SQL・HTTP からは
+変更できず、未指定（既定）では従来どおりのトークン化です。
+
+`--reranker <off|lexical|mmr|cross_encoder>`／`--rerank-window <N>`／`--rerank-mmr-lambda <0..1>`（Issue #2142・#2143）は、ハイブリッド検索の後段のリランカーと
+リランク対象の窓幅 `W`（`1..=10000`、既定 200）を、プロセス起動時にだけ指定する opt-in の CLI 引数です。
+既定は `off` で、結果もレイテンシも従来と変わりません。`precision` モードにはリランクを適用せず、密のみの検索には
+埋め込みを読む `mmr` だけを適用します（`lexical` は適用外で素通し）。`mmr` は関連度と、既に選んだ結果との類似度を
+λ（`--rerank-mmr-lambda`、`0..=1`、既定 0.5。`1` で元の順位、`0` で多様性が最大）で釣り合わせて選び直します。
+λ は `mmr` 以外での指定、範囲外、不正な書式（符号・指数・`nan` など）を起動エラーにします。計算量は
+`W × min(LIMIT+OFFSET, W) ≤ 1,000,000` に抑え、超える文はリランクせず従来どおりの結果で応答します。
+リランカーの契約違反やテキスト長の上限超過は検索を拒否せず、リランキング前の順位で応答し、縮退は
+実行ログ（固定の英語 1 行）とカウンタに残ります。語彙外・範囲外・重複指定・`off` のままの
+`--rerank-window` は起動エラーになります（`docs/design/rerank-wiring-policy.md`）。
+
+`--reranker cross_encoder`（Issue #2144）は、`--rerank-model <onnx>`・`--rerank-tokenizer <tokenizer.json>`
+（どちらも必須）と `--rerank-timeout-ms <N>`（`1..=60000`、既定 1000）を伴います。engine の `cross-encoder`
+feature 付きビルド（例: `cargo build --release -p fandhe-db-wire-server --features engine/cross-encoder`）
+と、実行時の環境変数 `ORT_DYLIB_PATH`（ONNX Runtime の動的ライブラリ）が必要です。feature 無効のビルドでは
+`cross_encoder` を起動エラーにします。モデルのパスは `..` を含められず、通常ファイルで、モデル 2 GiB・
+トークナイザ 64 MiB 以下に限ります（読み込み時のみ一時的にモデルの約 2 倍のメモリを使います）。
+読み込みに失敗すれば起動エラーで、エラー文にパスを出しません。推論が期限を超えた場合は検索を拒否せず、
+リランキング前の順位で応答します（縮退はログとカウンタ `degraded_timeout` に残ります）。モデルファイルは
+リポジトリにコミットしないでください。
+
+`--english-stemmer`（Issue #2129）は承認と feature 有効化の前のため、値の有無にかかわらず常に起動エラーになる
+（固定文言で拒否。`docs/design/stemming-crate-adoption.md`）。
+
 `--max-dml-affected-rows`・`--max-insert-rows`（Issue #997。オーナー判断の
 改訂・2026-09-27）は、それぞれ述語形 `UPDATE`／`DELETE`（`WHERE` 句付き）の
 1 文あたり影響行数上限・複数行 `VALUES` の 1 文あたり行数上限を、プロセス
@@ -494,6 +526,8 @@ fail-closed で起動エラーです。上限を引き上げることはでき�
 （詳細: [docs/design/jsonpath-limits-cli.md](docs/design/jsonpath-limits-cli.md)）。
 
 `--max-regex-pattern-len <N>`（既定 4,096・範囲 `1`〜`4,096`）・`--max-regex-input-len <N>`（既定 4,194,304・範囲 `1`〜`4,194,304`）・`--max-regex-compiled-size <N>`（既定 10,485,760・範囲 `1`〜`10,485,760`）（Issue #1786・SQL-55）は、正規表現マッチャ（`engine::regex_match`）のパターン長（バイト）・入力長（バイト）・コンパイル後サイズの上限を、プロセス全体に対して起動時に**下げる方向だけ**設定します（未指定はハード上限と同じ値です）。超過時の SQLSTATE は `54000` です。マッチャは線形時間の `regex` クレートで実装し、後方参照・先読み等は `0A000`、構文誤りは `2201B` で拒否します。SQL 表層（`~`／`~*`・`SIMILAR TO`）への配線は後続 Issue（#1787・#1788）で、現時点でこれらの上限が効く SQL 構文はありません。範囲外・非数値・値欠落・2 回目以降の重複指定は fail-closed で起動エラーです（詳細: [docs/design/regex-limits-cli.md](docs/design/regex-limits-cli.md)・[docs/design/regex-matcher.md](docs/design/regex-matcher.md)）。
+
+`--max-text-query-terms <N>`（既定 1,024・範囲 `1`〜`1,024`）・`--max-text-query-prefix-expansions <N>`（既定 1,024・範囲 `1`〜`1,024`）（Issue #2115・SEARCH-12）は、全文検索クエリの項数（`or` のグループごとの一意な語の総和）と前方一致（`語*`）の展開語数（可視集合で出現する語のみ）の上限を、プロセス全体に対して起動時に**下げる方向だけ**設定します（未指定はハード上限と同じ値です）。超過時の SQLSTATE は `54000` で、一部の語だけで黙って検索することはありません。`HYBRID` の検索語（SQL）と NoSQL の `hybrid.text` は、フレーズ（`"語 語"`）・`or`・除外（`-語`）・前方一致（`語*`）のクエリ構文として解釈され（Issue #2116。演算子を含まない検索語は従来と同じ結果。`USING PLAN` の検索語は構文を解釈しません）、これらの上限が効きます。範囲外・非数値・値欠落・2 回目以降の重複指定は fail-closed で起動エラーです（詳細: [docs/design/text-query-limits-cli.md](docs/design/text-query-limits-cli.md)）。
 
 `--max-sparsevec-nnz <N>`（既定 16,000・範囲 `1`〜`16,000`）（Issue #2027・TABLE-47 (2)）は、`SPARSEVEC(N)` 列へ書き込む値の非ゼロ要素数の上限を、プロセス全体に対して起動時に**下げる方向だけ**設定します（未指定はハード上限と同じ値です）。超過時の SQLSTATE は `54000` です。上限を下げて再起動しても既存の行は読め、下げた値は新しく書き込む値にだけ効きます。範囲外・非数値・値欠落・2 回目以降の重複指定は fail-closed で起動エラーです（詳細: [docs/design/sparsevec-limits-cli.md](docs/design/sparsevec-limits-cli.md)）。
 

@@ -268,6 +268,7 @@ pub(crate) mod hnsw_observe;
 /// #1190）。`sql::allowlist::ValidatedJoin` を受け取り、
 /// `core.rs::EngineCore` の SQL 実行経路から呼ばれる（`sql::set_op` と同じ
 /// 構成）。
+pub mod hybrid_detail;
 pub mod hybrid_tuning;
 pub(crate) mod index_expr;
 pub(crate) mod index_implication;
@@ -299,6 +300,7 @@ pub(crate) mod regex_op;
 pub mod relation;
 pub(crate) mod relation_name;
 pub mod relation_snapshot;
+pub(crate) mod rerank_stage;
 pub mod returning;
 pub mod row_lock;
 pub(crate) mod row_policy;

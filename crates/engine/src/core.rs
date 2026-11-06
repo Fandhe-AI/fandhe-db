@@ -1479,6 +1479,10 @@ pub struct EngineCore {
     /// `~` 系（Issue #1787）等が束縛時に [`Self::regex_limits`] を取り出して
     /// [`crate::regex_match::CompiledRegex::compile`] へ渡す。
     regex_limits: crate::regex_limits::RegexLimits,
+    /// 全文検索クエリ評価の項数・前方一致展開数の上限（Issue #2115・SEARCH-12 ポインタ）。
+    /// 差し替えは [`Self::with_text_query_limits`] のみ（起動時 1 回）。`run_select_plan` が
+    /// SQL の `HYBRID`／NoSQL の `hybrid.text` の実行（`sql::exec`）へ引数で渡す（Issue #2116）。
+    text_query_limits: crate::text_query_limits::TextQueryLimits,
     /// `SPARSEVEC(N)` 書き込み経路の非ゼロ要素数上限（Issue #2027・TABLE-47 (2) ポインタ）。
     /// 差し替えは [`Self::with_sparsevec_limits`] のみ（起動時 1 回）。束縛クロージャを呼ぶ区間と
     /// 文実行入口が [`Self::sparsevec_limits_scope`] で張り、`sql::parser::parse_sparsevec_literal` が読む。
@@ -1538,6 +1542,17 @@ pub struct EngineCore {
     /// （Issue #357）。詳細は `sql/sparse_cache.rs::SparseIndexCache` のドキュメント
     /// 参照。
     sparse_index_cache: crate::sql::sparse_cache::SparseIndexCache,
+    /// 疎検索のテキスト処理設定（ストップワード・同義語。Issue #2130・SEARCH-16 のポインタ）。
+    /// 起動時の CLI（wire-server の `text_analysis_opt`）だけが `with_text_analysis` で決め、
+    /// SQL／NoSQL のセッションからは変えられない。既定は恒等。
+    text_analysis: std::sync::Arc<crate::sparse::TextAnalysis>,
+    /// 検索後段のリランク設定（Issue #2142・SEARCH-15 のポインタ。設計記録:
+    /// `docs/design/rerank-wiring-policy.md`）。起動時の CLI（wire-server の `rerank_opt`）か
+    /// Rust の builder（`with_rerank`）だけが決め、SQL／NoSQL のセッションからは変えられない。
+    /// 既定は off（従来経路をそのまま通る）。
+    rerank_settings: crate::rerank::RerankSettings,
+    /// リランクの適用・適用外・縮退の累計カウンタ（`rerank_stats` で観測する。件数のみ）。
+    rerank_counters: crate::rerank::RerankCounters,
     /// SQL 表層（`sql::exec::execute_statement_with_cache`）専用の `VectorArena`
     /// テーブル世代整合キャッシュ（Issue #363）。[`Self::execute_validated_in_session`]
     /// の `Statement::Select` アームがこれを経由してアリーナ再構築（redb 全行走査・
@@ -3402,6 +3417,7 @@ impl EngineCore {
             function_limits: crate::function_limits::FunctionLimits::default(),
             jsonpath_limits: crate::jsonpath_limits::JsonPathLimits::default(),
             regex_limits: crate::regex_limits::RegexLimits::default(),
+            text_query_limits: crate::text_query_limits::TextQueryLimits::default(),
             sparsevec_limits: crate::sparsevec_limits::SparseVecLimits::default(),
             headline_limits: crate::headline_limits::HeadlineLimits::default(),
             nesting_limits: crate::nesting_limits::NestingLimits::default(),
@@ -3417,6 +3433,9 @@ impl EngineCore {
             dictionary_cache: DictionaryCache::new(),
             dictionary_config: crate::dictionary::DictionaryConfig::default(),
             sparse_index_cache: crate::sql::sparse_cache::SparseIndexCache::new(),
+            text_analysis: std::sync::Arc::new(crate::sparse::TextAnalysis::default()),
+            rerank_settings: crate::rerank::RerankSettings::off(),
+            rerank_counters: crate::rerank::RerankCounters::default(),
             sql_arena_cache: crate::sql::arena_cache::SqlArenaCache::new(),
             scalar_index_cache: crate::sql::scalar_index::ScalarIndexCache::new(),
             visible_bitmap_cache: crate::sql::visible_cache::VisibleBitmapCache::new(),
@@ -3446,6 +3465,55 @@ impl EngineCore {
     /// `VectorCore` trait には載せない固有メソッド（`core_api.snapshot` の対象外）。
     pub fn prefilter_cache_stats(&self) -> PrefilterCacheStats {
         self.prefilter_cache.stats()
+    }
+
+    /// 疎検索のテキスト処理設定（ストップワード・同義語。Issue #2130）を差し替える。
+    ///
+    /// `self` を消費するビルダーで、起動時の組み立て（wire-server の `main`）からだけ呼ばれる。
+    /// SQL／NoSQL のセッションからは届かない。`VectorCore` trait には載せない固有メソッド
+    /// （`core_api.snapshot` の対象外）。
+    pub fn with_text_analysis(mut self, analysis: crate::sparse::TextAnalysis) -> Self {
+        self.text_analysis = std::sync::Arc::new(analysis);
+        // 古い設定で作った疎索引を使わないよう、キャッシュごと作り直す（多層防御。
+        // `SparseIndexCache::lookup` も `analysis_id` を照合する）。
+        self.sparse_index_cache = crate::sql::sparse_cache::SparseIndexCache::new();
+        self
+    }
+
+    /// 現在のテキスト処理設定を返す。
+    pub fn text_analysis(&self) -> &crate::sparse::TextAnalysis {
+        &self.text_analysis
+    }
+
+    /// 検索後段のリランク設定（Issue #2142・SEARCH-15 のポインタ）を差し替える。
+    ///
+    /// `self` を消費するビルダーで、起動時の組み立て（wire-server の `main`）からだけ呼ばれる。
+    /// SQL／NoSQL のセッションからは届かない。既定は off で、off のとき実行器は従来経路を
+    /// そのまま通る。`VectorCore` trait には載せない固有メソッド（`core_api.snapshot` の対象外）。
+    pub fn with_rerank(mut self, settings: crate::rerank::RerankSettings) -> Self {
+        self.rerank_settings = settings;
+        self
+    }
+
+    /// 現在のリランク設定を返す。
+    pub fn rerank_settings(&self) -> &crate::rerank::RerankSettings {
+        &self.rerank_settings
+    }
+
+    /// リランクの適用・適用外・縮退の累計件数を返す（運用観測用。件数のみで、id・本文・
+    /// テナント情報は含まない）。`VectorCore` trait には載せない固有メソッド。
+    pub fn rerank_stats(&self) -> crate::rerank::RerankStats {
+        self.rerank_counters.snapshot()
+    }
+
+    /// 実行器へ渡すリランク設定の束。off のときは `None`（実行器の分岐自体を通らない）。
+    fn rerank_access(&self) -> Option<crate::sql::rerank_stage::RerankAccess<'_>> {
+        self.rerank_settings
+            .is_enabled()
+            .then_some(crate::sql::rerank_stage::RerankAccess {
+                settings: &self.rerank_settings,
+                counters: &self.rerank_counters,
+            })
     }
 
     /// [`crate::sql::sparse_cache::SparseIndexCache`] の現在の統計を返す
@@ -3826,6 +3894,23 @@ impl EngineCore {
         self.regex_limits
     }
 
+    /// 全文検索クエリ評価の上限（[`crate::text_query_limits::TextQueryLimits`]）を差し替えた
+    /// ビルダーを返す（Issue #2115）。`wire-server` の起動時 CLI フラグ
+    /// （`--max-text-query-terms`・`--max-text-query-prefix-expansions`）からのみ呼ぶ。
+    /// 未呼び出しならハード上限と同値の既定。
+    pub fn with_text_query_limits(
+        mut self,
+        limits: crate::text_query_limits::TextQueryLimits,
+    ) -> Self {
+        self.text_query_limits = limits;
+        self
+    }
+
+    /// 現在の全文検索クエリ評価上限（Issue #2115）。
+    pub fn text_query_limits(&self) -> crate::text_query_limits::TextQueryLimits {
+        self.text_query_limits
+    }
+
     /// `SPARSEVEC(N)` の非ゼロ数上限（[`crate::sparsevec_limits::SparseVecLimits`]）を差し替えた
     /// ビルダーを返す（Issue #2027）。`wire-server` の起動時 CLI フラグ `--max-sparsevec-nnz` から
     /// のみ呼ぶ。未呼び出しならハード上限と同値の既定。
@@ -3995,6 +4080,9 @@ impl EngineCore {
         // Issue #2243: 公開ビルダー `with_distance_kind` の誤用で非 Cosine が Hybrid・`precision` に
         // 素通りしないよう、早期 return する `result_cap` 分岐より前で整合を検査する。
         crate::sql::parser::check_bound_distance_kind(bound)?;
+        // SEARCH-17・Issue #2137: 外部で組み立てた計画の `HybridDetail` 投影も、ハイブリッド順位付けの
+        // 文にだけ許す（多層防御。違反は `42601`）。
+        crate::sql::parser::check_hybrid_detail(bound.projection(), bound.ranking())?;
         // Issue #2120: 外部で組み立てた計画の `window` も束縛段と同じ範囲で再検査する
         // （`result_cap` の早期 return より前。多層防御）。
         crate::sql::hybrid_tuning::check_window(
@@ -13391,6 +13479,11 @@ impl EngineCore {
                 cache: &self.scalar_index_cache,
                 declarations_enabled: self.hnsw_state.is_some(),
             }),
+            &self.text_analysis,
+            // Issue #2116: 全文検索クエリの上限は引数で明示的に渡す（スレッドローカル等の
+            // 暗黙経路にしない。張り忘れによる既定値への fail-open を避ける）。
+            &self.text_query_limits,
+            self.rerank_access(),
         )
     }
 
@@ -13774,6 +13867,8 @@ impl EngineCore {
                     distance_kind: crate::sql::lexer::DistanceKind::Cosine,
                     result_cap: None,
                     dense_source: crate::arena::DenseSource::EmbeddingSlot,
+                    // D9: `plan` 検索の LLM 出力 `search_terms` は literal として扱う。
+                    hybrid_text_syntax: crate::sql::hybrid_tuning::HybridTextSyntax::Literal,
                 })
             },
         )
@@ -13818,7 +13913,9 @@ impl EngineCore {
                 rejected(schema.columns.get(*index).map(|c| &c.ty))
             }
             ProjectedColumn::Computed { result_ty, .. } => rejected(result_ty.as_ref()),
-            ProjectedColumn::Id | ProjectedColumn::AliasedId { .. } => None,
+            ProjectedColumn::Id
+            | ProjectedColumn::AliasedId { .. }
+            | ProjectedColumn::HybridDetail { .. } => None,
         });
         if let Some(message) = hit {
             return Err(crate::sql::allowlist::SqlSurfaceError::feature_not_supported(message));
@@ -21827,6 +21924,9 @@ mod tests {
                 cache: &core.sql_arena_cache,
             }),
             None,
+            None,
+            &core.text_analysis,
+            &crate::text_query_limits::TextQueryLimits::default(),
             None,
         )
         .expect("execute_statement should succeed");

@@ -111,8 +111,9 @@ jiff-tzdb = "=0.1.9"
 #     が正規表現ベースの pre-tokenizer 設定を含む場合のロードに必要な既定機能の
 #     最小分。`esaxx_fast`／`progressbar`〔BPE 学習・進捗表示用〕は推論専用の
 #     本用途では不要なため含めない）
-# いずれも optional・下記 `cross-encoder` feature の背後に限定し、`wire-server` は
-# リンクしない（`cargo tree -p fandhe-db-wire-server` に出現しないことを確認済み）。
+# いずれも optional・下記 `cross-encoder` feature の背後に限定する。既定ビルドの
+# `wire-server` にはリンクしない（`cargo tree -p fandhe-db-wire-server` に出現しない）。
+# engine の feature を有効にしたビルドに限り `wire-server` の `rerank_opt`（Issue #2144）から到達する。
 # .claude/rules/dependency-policy.md に従い完全固定（=x.y.z）で管理する。
 ort = { version = "=2.0.0-rc.13", optional = true, default-features = false, features = [
     "load-dynamic",
@@ -149,8 +150,8 @@ contrast-bench = ["dep:usearch"]
 
 # Issue #333（SEARCH-7 方式変更）: `rerank::CrossEncoderReranker` の実 ONNX 推論
 # バックエンド（`src/rerank/cross_encoder_onnx.rs`）を有効化する feature。
-# `contrast-bench` と同パターンで、既定ビルド・`wire-server` には一切結線しない
-# （テナント境界・RLS 迂回 API は露出しない）。
+# 既定ビルドでは結線しない。engine の feature を有効にしたビルドに限り、`wire-server` の
+# `--reranker cross_encoder`（Issue #2144）から到達する（テナント境界・RLS 迂回 API は露出しない）。
 cross-encoder = ["dep:ort", "dep:tokenizers"]
 
 # Issue #387 PR #416 codex-review P2 指摘対応: `hybrid.rs::sparse_refetch_observed`

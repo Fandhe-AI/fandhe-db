@@ -27,11 +27,20 @@
 //! `hits` は [`crate::rls::RlsVerifiedHits`]（witness 型）としてのみ投影段へ渡り、
 //! 生の `Vec<(u64, f64)>` から投影へ到達する経路は型として存在しない。
 //!
+//! リランク段（Issue #2142・SEARCH-15。`sql::rerank_stage`）は、`EngineCore::with_rerank` で
+//! 有効化された起動時設定のときだけ、`Ranking::Hybrid`（recall モード）の文について、
+//! 事後 SCALAR フィルタと PRECISION ゲートの後・`RlsSafetyNet::apply` の前で窓内の候補を
+//! 並べ替える。off では段自体を通らず、従来の段構成と結果は変わらない。
+//!
 //! `core.rs::EngineCore::execute_sql`（TASK-75 で追加する固有メソッド。`VectorCore`
 //! trait は不変）からのみ呼ばれる想定で、`Storage`・`SearchProvider`・`PolicyContext`
 //! を束ねる。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+
+/// ハイブリッド検索の融合段が退避する「slot 番号 → (密順位, 疎順位)」の対応表
+/// （SEARCH-17・Issue #2137。`project_rows` が `hybrid_dense_rank()` 等の値を引く）。
+type HybridRankMap = HashMap<u64, (Option<u32>, Option<u32>)>;
 use std::sync::Arc;
 
 use crate::arena::{ArenaError, VectorArena};
@@ -1164,6 +1173,33 @@ fn map_hybrid_error(e: HybridError, cfg: &hybrid::RrfConfig) -> SqlSurfaceError 
     }
 }
 
+/// 構文経路の hybrid エラーを SQL 表層のエラーへ写す（Issue #2116・SEARCH-12 のポインタ）。
+/// `Hybrid` は既存の [`map_hybrid_error`] に委ねる。`Text` は `wire_code` で分ける: 既存上限（`22000`）は
+/// 従来と同じ固定文言、上限超過（`54000`）は固定の英語文にする。件数・上限値・語・語幹は
+/// 他テナントの語の存在を推測させ得るため含めない（fail-closed）。
+fn map_hybrid_text_error(e: hybrid::HybridTextError, cfg: &hybrid::RrfConfig) -> SqlSurfaceError {
+    match e {
+        hybrid::HybridTextError::Hybrid(e) => map_hybrid_error(e, cfg),
+        hybrid::HybridTextError::Text(e) => map_text_search_error(&e),
+    }
+}
+
+/// [`crate::sparse::text_eval::TextSearchError`] の写像（固定の英語文のみ）。
+fn map_text_search_error(e: &crate::sparse::text_eval::TextSearchError) -> SqlSurfaceError {
+    use crate::sparse::text_eval::TextSearchError as T;
+    match e {
+        T::QueryTooLong { .. } | T::TooManyQueryTerms { .. } => {
+            SqlSurfaceError::invalid_input("hybrid query text exceeds allowed length")
+        }
+        T::InvalidParams { .. } => {
+            SqlSurfaceError::invalid_input("HYBRID BM25 arguments produced an invalid score")
+        }
+        T::TooManyTerms { .. } | T::TooManyPrefixExpansions { .. } | T::PhraseTooLong { .. } => {
+            SqlSurfaceError::payload_too_large("hybrid query text is too complex")
+        }
+    }
+}
+
 /// SQL 実行経路にまだ接続していない距離演算子（`<->`／`<+>`）の文を実行入口で `0A000` に倒す関門
 /// （Issue #1977・SQL-33 (2)(4)。Issue #1991 で `<=>`〔コサイン距離〕と `<#>`〔負の内積〕を接続し、
 /// 対象を L2／L1 に狭めた）。構文と `$n` 束縛は 4 種とも通るが、L2／L1 の距離カーネルは SQL 実行経路に
@@ -1232,6 +1268,13 @@ fn ensure_distance_kind_executable(bound: &BoundStatement) -> Result<(), SqlSurf
 /// 一切参照しない。`None` を渡した場合はキャッシュを一切経由せず、常に全件
 /// brute-force で探索する（下記 [`execute_statement`] 参照）。
 ///
+/// `text_query_limits`（Issue #2116・SEARCH-12 のポインタ）は `HYBRID` の検索語をクエリ構文として
+/// 評価するときの項数・前方一致展開数の上限。`EngineCore::run_select_plan` が `--` 起動設定の値を渡す。
+///
+/// `text_analysis`（Issue #2130・SEARCH-16 のポインタ）は疎索引の構築に固定するテキスト処理
+/// 設定（ストップワード・同義語）。`SparseCacheAccess` には載せない: 書き込みトランザクション由来の
+/// 読み取りでは疎キャッシュが `None` に落ちるが、設定はその経路でも効かせる必要があるため。
+///
 /// `sparse_cache`・`arena_cache`・`hnsw_cache` の 3 引数を追加した結果
 /// `clippy::too_many_arguments` の閾値（7）を超える。3 キャッシュアクセス束は意味の
 /// 異なる独立したオプションパラメータであり、1 つの構造体へまとめると「呼ばれない
@@ -1250,6 +1293,9 @@ pub(crate) fn execute_statement_with_cache(
     arena_cache: Option<crate::sql::arena_cache::ArenaCacheAccess<'_>>,
     hnsw_cache: Option<crate::sql::hnsw_cache::HnswCacheAccess<'_>>,
     scalar_cache: Option<crate::sql::scalar_index::ScalarCacheAccess<'_>>,
+    text_analysis: &Arc<crate::sparse::TextAnalysis>,
+    text_query_limits: &crate::text_query_limits::TextQueryLimits,
+    rerank: Option<crate::sql::rerank_stage::RerankAccess<'_>>,
 ) -> Result<QueryResult, SqlSurfaceError> {
     execute_statement_with_cache_observed(
         read_txn,
@@ -1262,6 +1308,9 @@ pub(crate) fn execute_statement_with_cache(
         arena_cache,
         hnsw_cache,
         scalar_cache,
+        text_analysis,
+        text_query_limits,
+        rerank,
         None,
     )
 }
@@ -1283,6 +1332,9 @@ pub(crate) fn execute_statement_with_cache_observed(
     arena_cache: Option<crate::sql::arena_cache::ArenaCacheAccess<'_>>,
     hnsw_cache: Option<crate::sql::hnsw_cache::HnswCacheAccess<'_>>,
     scalar_cache: Option<crate::sql::scalar_index::ScalarCacheAccess<'_>>,
+    text_analysis: &Arc<crate::sparse::TextAnalysis>,
+    text_query_limits: &crate::text_query_limits::TextQueryLimits,
+    rerank: Option<crate::sql::rerank_stage::RerankAccess<'_>>,
     mut stats: Option<&mut ExecStats>,
 ) -> Result<QueryResult, SqlSurfaceError> {
     // SQL 実行経路に未接続の距離演算子（L2／L1）は、行ポリシー解決・ストレージ読み取りより前に
@@ -1327,6 +1379,24 @@ pub(crate) fn execute_statement_with_cache_observed(
     // ドキュメント参照。TASK-76・SQL-7）。RLS 安全網はこの構造体に分岐用の
     // フィールドを持たせず、下記で無条件に呼び出す。
     let plan = ExecutionPlan::from_evaluation_order(bound.evaluation_order);
+
+    // Issue #2142・#2143・SEARCH-15（設計記録 `docs/design/rerank-wiring-policy.md` D3）: リランクを
+    // 実際に走らせるのは「設定が有効・recall モード」かつ、ハイブリッド（全方式）または密のみ
+    // （埋め込みを読む方式だけ。MMR）の文。密のみで字句一致系・precision は文の形で決まる
+    // 「適用外」で、素通しする（off と同じ結果。拒否もログも出さない）。off（`rerank == None`）は
+    // この判定の外で、以降の追加処理は一切走らない。計算量予算（MMR）は `k_eff` 確定後に判定する。
+    let rerank_shape_active: Option<crate::sql::rerank_stage::RerankAccess<'_>> =
+        match (&rerank, &bound.ranking) {
+            (Some(r), Ranking::Hybrid { .. }) if !is_precision => Some(*r),
+            (Some(r), Ranking::Distance { .. })
+                if !is_precision
+                    && r.settings.method().required_input()
+                        == crate::rerank::RerankInput::Embedding =>
+            {
+                Some(*r)
+            }
+            _ => None,
+        };
 
     // RLS 段（無条件）+ SCALAR 段（同一走査の行フック。`plan.scalar_prefilter` が
     // `false` の場合はここでは等価条件を判定せず、DISTANCE 段の後で事後適用する）。
@@ -1500,6 +1570,7 @@ pub(crate) fn execute_statement_with_cache_observed(
                 &bound.table,
                 ctx,
                 idx,
+                text_analysis.analysis_id(),
             ),
             _ => None,
         }
@@ -1589,8 +1660,10 @@ pub(crate) fn execute_statement_with_cache_observed(
             // （`BoundExpr::TextColumnRef`）を持ちうるため、その列だけは下で
             // 個別に追加する（この `filter_map` 自体は単一列版のみを返せるため
             // `None` のまま素通しし、複数列を返せる下のループへ委ねる）。
+            // `HybridDetail`（SEARCH-17）は列を参照しない（値は融合段の対応表由来）。
             ProjectedColumn::Id
             | ProjectedColumn::AliasedId { .. }
+            | ProjectedColumn::HybridDetail { .. }
             | ProjectedColumn::Computed { .. } => None,
         })
         .collect();
@@ -2759,6 +2832,38 @@ pub(crate) fn execute_statement_with_cache_observed(
         bound.fetch_count()
     };
 
+    // Issue #2143・ADR D4: MMR の計算量予算（`W × min(k_eff, W)`）は取得の前に設定値と `k_eff`
+    // だけで静的に判定する（表の内容に依存しない）。超過は縮退（`mmr_budget`）で、窓を広げず
+    // リランクも走らせないため結果は off と同一になる（`off_prefix`・再検索は不要）。
+    let mut rerank_budget_degraded = false;
+    let rerank_active: Option<crate::sql::rerank_stage::RerankAccess<'_>> =
+        match rerank_shape_active {
+            Some(r)
+                if matches!(r.settings.method(), crate::rerank::RerankMethod::Mmr(_))
+                    && !crate::rerank::mmr_budget_allows(r.settings.window(), k_eff) =>
+            {
+                r.counters
+                    .record_degraded(crate::rerank::RerankDegradeReason::MmrBudget);
+                crate::sql::rerank_stage::log_degraded(
+                    crate::rerank::RerankDegradeReason::MmrBudget,
+                    r.settings.method().kind_name(),
+                );
+                rerank_budget_degraded = true;
+                None
+            }
+            other => other,
+        };
+    let rerank_fetch_window: Option<usize> = rerank_active.map(|r| r.settings.window());
+    // 密のみの DISTANCE 段の取得幅（Issue #2143・ADR D6）。リランクが有効なときだけ窓まで広げる
+    // （上限は `MAX_SEARCH_K`）。縮退時は `k_eff` で DISTANCE 段をやり直す。
+    let dense_fetch_target: usize = match (&rerank_active, &bound.ranking) {
+        (Some(r), Ranking::Distance { .. }) => k_eff
+            .max(r.settings.window())
+            .min(core::MAX_SEARCH_K)
+            .max(k_eff),
+        _ => k_eff,
+    };
+
     // `!plan.scalar_prefilter`（DISTANCE 先行・SCALAR 事後フィルタ）の precision
     // 経路で `arena.ids().len()` が `core::MAX_SEARCH_K` を超える場合、直上の
     // `k_eff` は `MAX_SEARCH_K` へクランプされ、DISTANCE 段は可視集合全体ではなく
@@ -2890,6 +2995,16 @@ pub(crate) fn execute_statement_with_cache_observed(
         }
         Ok(filtered)
     };
+
+    // SEARCH-17・Issue #2137: 投影に `hybrid_dense_rank()` 等があるときだけ、融合段の系統別順位を
+    // slot 番号で引ける対応表へ退避する（`project_rows` が引く）。呼び出しごとに上書きする。
+    // ハイブリッドで `compute_hits` を複数回呼ぶ反復スキャン経路は無い（反復スキャンは
+    // `Ranking::Distance` 専用）ため、表は最後の 1 回分で常に完結している。
+    let wants_hybrid_detail = bound
+        .projection
+        .iter()
+        .any(|c| matches!(c, ProjectedColumn::HybridDetail { .. }));
+    let hybrid_ranks: std::cell::RefCell<Option<HybridRankMap>> = std::cell::RefCell::new(None);
 
     let compute_hits = |k_eff: usize| -> Result<Vec<(u64, f64)>, SqlSurfaceError> {
         Ok(if completeness_unbounded {
@@ -3186,12 +3301,21 @@ pub(crate) fn execute_statement_with_cache_observed(
                     tuning,
                 } => {
                     let cfg = crate::sql::hybrid_tuning::hybrid_rrf_config(tuning, k_eff)?;
+                    // Issue #2142・D4: リランク窓のため融合済みリストの先頭 `max(k_eff, W)` 件を
+                    // 取る。RRF 設定（`pool_depth` 等）は常に外側の `k_eff` から作り、候補生成は
+                    // off と同一のまま取得件数だけを広げる（`hybrid_search_inner` は `k` を
+                    // `InvalidK` 判定と最後の `truncate` にしか使わないため、先頭 `k_eff` 件は
+                    // off と一致する）。上限は融合リスト長に当たる `pool_depth`。
+                    let k_fetch = match rerank_fetch_window {
+                        Some(w) => k_eff.max(w).min(cfg.pool_depth()).max(k_eff),
+                        None => k_eff,
+                    };
                     let input = SearchInput {
                         ids: &slot_ids,
                         vectors: arena.vectors(),
                         dim: arena.dim(),
                         query,
-                        k: k_eff,
+                        k: k_fetch,
                     };
                     // Issue #410: hybrid 密側の再取得ループ（下記の密のみ縮退経路・
                     // `hybrid::hybrid_search` の両方）へ HNSW を結線するアダプタ。
@@ -3259,55 +3383,83 @@ pub(crate) fn execute_statement_with_cache_observed(
                     // キャッシュへの挿入を試みる（`SparseIndexCache::insert` は挿入の
                     // 成否に関わらず構築済みの索引そのものを返す契約。
                     // `sql/sparse_cache.rs` モジュールドキュメント参照）。
-                    let sparse_index_for_fusion: Option<Arc<SparseIndex>> =
-                        if let Some(idx) = &cached_sparse_index {
-                            Some(Arc::clone(idx))
-                        } else if sparse_docs.is_empty() {
-                            // 疎文書が 0 件（可視行に本文を持つ行が 1 件もない）の場合は
-                            // `SparseIndex::build` が空コーパスを拒否する
-                            // （`SparseError::EmptyCorpus`）ため、密のみへ縮退させる
-                            // （下の `None` 分岐）。空コーパスはキャッシュへも積まない
-                            // （`SparseIndex::build` 自体が拒否するため構築できない）。
-                            None
-                        } else {
-                            let doc_refs: Vec<(DocId, &str)> = sparse_docs
-                                .iter()
-                                .map(|(id, text)| (*id, text.as_str()))
-                                .collect();
-                            let built = SparseIndex::build(&doc_refs)
+                    let sparse_index_for_fusion: Option<Arc<SparseIndex>> = if let Some(idx) =
+                        &cached_sparse_index
+                    {
+                        Some(Arc::clone(idx))
+                    } else if sparse_docs.is_empty() {
+                        // 疎文書が 0 件（可視行に本文を持つ行が 1 件もない）の場合は
+                        // `SparseIndex::build` が空コーパスを拒否する
+                        // （`SparseError::EmptyCorpus`）ため、密のみへ縮退させる
+                        // （下の `None` 分岐）。空コーパスはキャッシュへも積まない
+                        // （`SparseIndex::build` 自体が拒否するため構築できない）。
+                        None
+                    } else {
+                        let doc_refs: Vec<(DocId, &str)> = sparse_docs
+                            .iter()
+                            .map(|(id, text)| (*id, text.as_str()))
+                            .collect();
+                        let built =
+                            SparseIndex::build_with_analysis(&doc_refs, Arc::clone(text_analysis))
                                 .map_err(HybridError::Sparse)
                                 .map_err(|e| map_hybrid_error(e, &cfg))?;
-                            match (sparse_cache_eligible, sparse_cache.as_ref()) {
-                                (true, Some(access)) => {
-                                    // `built_generation` はこのクエリの `read_txn`
-                                    // スナップショットにおけるテーブル世代
-                                    // （`SparseIndexCache::insert` の契約。読み取れない
-                                    // 場合はキャッシュへ積まず、この場で構築した索引を
-                                    // そのまま使う）。
-                                    match crate::catalog::table_generation_in_txn(
-                                        read_txn,
+                        match (sparse_cache_eligible, sparse_cache.as_ref()) {
+                            (true, Some(access)) => {
+                                // `built_generation` はこのクエリの `read_txn`
+                                // スナップショットにおけるテーブル世代
+                                // （`SparseIndexCache::insert` の契約。読み取れない
+                                // 場合はキャッシュへ積まず、この場で構築した索引を
+                                // そのまま使う）。
+                                match crate::catalog::table_generation_in_txn(
+                                    read_txn,
+                                    &bound.table,
+                                ) {
+                                    Ok(built_generation) => Some(access.cache.insert(
+                                        access.storage,
                                         &bound.table,
-                                    ) {
-                                        Ok(built_generation) => Some(access.cache.insert(
-                                            access.storage,
-                                            &bound.table,
-                                            ctx,
-                                            *hybrid_text_column_index,
-                                            built,
-                                            built_generation,
-                                        )),
-                                        Err(_) => Some(Arc::new(built)),
-                                    }
+                                        ctx,
+                                        *hybrid_text_column_index,
+                                        built,
+                                        built_generation,
+                                    )),
+                                    Err(_) => Some(Arc::new(built)),
                                 }
-                                _ => Some(Arc::new(built)),
                             }
-                        };
+                            _ => Some(Arc::new(built)),
+                        }
+                    };
                     // 疎索引が無く密のみへ縮退する文でも `k1`／`b` を検証する（データ依存で
                     // 不正な引数が受理されないようにする。Issue #2121）。
                     let bm25_default = crate::sparse::Bm25Params::default();
                     crate::sql::hybrid_tuning::hybrid_bm25_params(tuning, bm25_default)?;
+                    // 検索語の構文解析は文 1 回につき 1 回だけ行う（Issue #2116・SEARCH-12 のポインタ）。
+                    // `Literal`（`USING PLAN` の `search_terms`）は解析せず従来の語列経路に残す（D9）。
+                    let parsed_text_query: Option<crate::sparse::text_query::TextQuery> =
+                        match bound.hybrid_text_syntax {
+                            crate::sql::hybrid_tuning::HybridTextSyntax::WebSearch => Some(
+                                crate::sparse::text_query::parse_text_query(query_text).map_err(
+                                    |e| {
+                                        map_text_search_error(
+                                            &crate::sparse::text_eval::TextSearchError::from(e),
+                                        )
+                                    },
+                                )?,
+                            ),
+                            crate::sql::hybrid_tuning::HybridTextSyntax::Literal => None,
+                        };
                     let fused: Vec<HybridHit> = match &sparse_index_for_fusion {
                         None => {
+                            // 疎索引が無くても、データに依存しない検索語の検査（項数・フレーズ長）は
+                            // 行う。結果が表の内容（本文の有無）次第で受理／拒否に変わらないようにする
+                            // 直前の `k1`／`b` 検証と同じ fail-closed の方針。
+                            if let Some(q) = &parsed_text_query {
+                                crate::sparse::text_eval::validate_text_query_static(
+                                    q,
+                                    text_analysis,
+                                    text_query_limits,
+                                )
+                                .map_err(|e| map_text_search_error(&e))?;
+                            }
                             // 疎側の寄与を 0 件として扱い、密側のみを `rrf_fuse` に通して
                             // 密のみの順序契約へ縮退させる（密側の可視性検証は
                             // `hybrid::hybrid_search` と同じ理由でここでも行う）。
@@ -3336,7 +3488,7 @@ pub(crate) fn execute_statement_with_cache_observed(
                             }
                             let mut fused = hybrid::rrf_fuse(&dense_hits, &[], &cfg)
                                 .map_err(|e| map_hybrid_error(e, &cfg))?;
-                            fused.truncate(k_eff);
+                            fused.truncate(k_fetch);
                             fused
                         }
                         Some(idx) => {
@@ -3348,16 +3500,29 @@ pub(crate) fn execute_statement_with_cache_observed(
                                 tuning,
                                 idx.params(),
                             )?;
-                            hybrid::hybrid_search_with_bm25(
-                                dense_provider,
-                                input,
-                                idx,
-                                query_text,
-                                k_eff,
-                                &cfg,
-                                bm25,
-                            )
-                            .map_err(|e| map_hybrid_error(e, &cfg))?
+                            match &parsed_text_query {
+                                Some(q) => hybrid::hybrid_search_with_text_query(
+                                    dense_provider,
+                                    input,
+                                    idx,
+                                    q,
+                                    k_fetch,
+                                    &cfg,
+                                    bm25,
+                                    text_query_limits,
+                                )
+                                .map_err(|e| map_hybrid_text_error(e, &cfg))?,
+                                None => hybrid::hybrid_search_with_bm25(
+                                    dense_provider,
+                                    input,
+                                    idx,
+                                    query_text,
+                                    k_fetch,
+                                    &cfg,
+                                    bm25,
+                                )
+                                .map_err(|e| map_hybrid_error(e, &cfg))?,
+                            }
                         }
                     };
                     // このクエリで観測された密側再取得ラウンド数を `HnswIndexCache` の
@@ -3365,6 +3530,16 @@ pub(crate) fn execute_statement_with_cache_observed(
                     // §`HnswDenseProvider::finish` ドキュメンテーションコメント参照）。
                     if let Some(adapter) = &hnsw_dense_provider {
                         adapter.finish();
+                    }
+                    if wants_hybrid_detail {
+                        // 件数は `fused.len() <= k_eff`（検証済みの LIMIT + OFFSET で上限あり）。
+                        // スコアは融合結果の値そのまま（SQL 経路はソフトブーストを使わない。
+                        // 結線する場合は SEARCH-17 (1) のスコア一致が崩れるため再検討が要る）。
+                        let map: HybridRankMap = fused
+                            .iter()
+                            .map(|h| (h.id, (h.dense_rank, h.sparse_rank)))
+                            .collect();
+                        *hybrid_ranks.borrow_mut() = Some(map);
                     }
                     fused.into_iter().map(|h| (h.id, h.score)).collect()
                 }
@@ -3386,207 +3561,291 @@ pub(crate) fn execute_statement_with_cache_observed(
         )),
         _ => None,
     };
-    let mut postfilter_done = false;
-    crate::interrupt::current_deadline().check()?;
-    let distance_started = stage_start(&stats);
-    let hits: Vec<(u64, f64)> = match iter_cfg {
-        // DISTANCE 先行（SCALAR 事後フィルタ）で WHERE があるときだけ、事後フィルタ後の件数が
-        // 目標（`OFFSET + LIMIT`）に届くまで取得件数を倍々に増やして再探索する。上限は
-        // `max_scan_tuples`（core.rs が SQL-46 の走査行数上限との min 済み）・`MAX_SEARCH_K`・
-        // 可視行数。上限到達はエラーにせずそれまでの結果を返す。
-        Some((mode, max_scan, _))
-            if mode != crate::hnsw::HnswIterativeScan::Off
-                && !plan.scalar_prefilter
-                && bound.has_where_filters() =>
-        {
-            let visible = slot_ids.len();
-            let cap = max_scan.min(core::MAX_SEARCH_K).min(visible).max(1);
-            let mut k_round = k_eff.min(cap).max(1);
-            let mut rounds: u64 = 0;
-            let mut rows_examined: u64 = 0;
-            let (filtered, cap_hit) = loop {
-                crate::interrupt::current_deadline().check()?;
-                // 2 ラウンド目以降は同じ検索の再実行なので、キャッシュ状態を重ねて数えない。
-                let _suppress = (rounds > 0).then(crate::sql::hnsw_observe::suppress_cache_notes);
-                // Distance 段は反復スキャンではラウンドごとに記録する（loops＝ラウンド数、
-                // rows_out＝事後フィルタ前の候補件数の合計、時間は compute_hits のみ。Issue #2053）。
-                let round_started = stage_start(&stats);
-                let raw = compute_hits(k_round)?;
-                drop(_suppress);
-                rounds += 1;
-                let raw_len = raw.len();
-                rows_examined = rows_examined.saturating_add(raw_len as u64);
-                stage_end(
-                    &mut stats,
-                    ExecStage::Distance,
-                    round_started,
-                    raw_len,
-                    None,
-                );
-                // 反復中の事後フィルタも PostFilter 段として記録する（ラウンドごとに loops を積む）。
-                let postfilter_started = stage_start(&stats);
-                let mut kept = apply_postfilter(raw)?;
-                stage_end(
-                    &mut stats,
-                    ExecStage::PostFilter,
-                    postfilter_started,
-                    kept.len(),
-                    Some(raw_len.saturating_sub(kept.len())),
-                );
-                if kept.len() >= k_eff {
-                    kept.truncate(k_eff);
-                    break (kept, false);
+    // Issue #2143・ADR D6: 密のみ＋MMR の縮退では off と同一の結果へ戻すため、`k_eff` で
+    // DISTANCE 段（事後 SCALAR フィルタを含む）をやり直す。それ以外の文は 1 周で抜ける。
+    let mut k_target = dense_fetch_target;
+    let mut refetched = false;
+    let hits: Vec<(u64, f64)> = loop {
+        // 再検索（2 周目）は同じ検索の再実行なので、キャッシュ状態を重ねて数えない。
+        let _suppress_refetch = refetched.then(crate::sql::hnsw_observe::suppress_cache_notes);
+        let mut postfilter_done = false;
+        crate::interrupt::current_deadline().check()?;
+        let distance_started = stage_start(&stats);
+        let hits: Vec<(u64, f64)> = match iter_cfg {
+            // DISTANCE 先行（SCALAR 事後フィルタ）で WHERE があるときだけ、事後フィルタ後の件数が
+            // 目標（`OFFSET + LIMIT`）に届くまで取得件数を倍々に増やして再探索する。上限は
+            // `max_scan_tuples`（core.rs が SQL-46 の走査行数上限との min 済み）・`MAX_SEARCH_K`・
+            // 可視行数。上限到達はエラーにせずそれまでの結果を返す。
+            Some((mode, max_scan, _))
+                if mode != crate::hnsw::HnswIterativeScan::Off
+                    && !plan.scalar_prefilter
+                    && bound.has_where_filters() =>
+            {
+                let visible = slot_ids.len();
+                let cap = max_scan.min(core::MAX_SEARCH_K).min(visible).max(1);
+                let mut k_round = k_target.min(cap).max(1);
+                let mut rounds: u64 = 0;
+                let mut rows_examined: u64 = 0;
+                let (filtered, cap_hit) = loop {
+                    crate::interrupt::current_deadline().check()?;
+                    // 2 ラウンド目以降は同じ検索の再実行なので、キャッシュ状態を重ねて数えない。
+                    let _suppress =
+                        (rounds > 0).then(crate::sql::hnsw_observe::suppress_cache_notes);
+                    // Distance 段は反復スキャンではラウンドごとに記録する（loops＝ラウンド数、
+                    // rows_out＝事後フィルタ前の候補件数の合計、時間は compute_hits のみ。Issue #2053）。
+                    let round_started = stage_start(&stats);
+                    let raw = compute_hits(k_round)?;
+                    drop(_suppress);
+                    rounds += 1;
+                    let raw_len = raw.len();
+                    rows_examined = rows_examined.saturating_add(raw_len as u64);
+                    stage_end(
+                        &mut stats,
+                        ExecStage::Distance,
+                        round_started,
+                        raw_len,
+                        None,
+                    );
+                    // 反復中の事後フィルタも PostFilter 段として記録する（ラウンドごとに loops を積む）。
+                    let postfilter_started = stage_start(&stats);
+                    let mut kept = apply_postfilter(raw)?;
+                    stage_end(
+                        &mut stats,
+                        ExecStage::PostFilter,
+                        postfilter_started,
+                        kept.len(),
+                        Some(raw_len.saturating_sub(kept.len())),
+                    );
+                    if kept.len() >= k_target {
+                        kept.truncate(k_target);
+                        break (kept, false);
+                    }
+                    // 可視集合を使い切った（取得件数が要求に満たない、または全行を要求済み）。
+                    if raw_len < k_round || k_round >= visible {
+                        break (kept, false);
+                    }
+                    if k_round >= cap {
+                        break (kept, true);
+                    }
+                    k_round = k_round.saturating_mul(2).min(cap);
+                };
+                if let Some(access) = hnsw_cache.as_ref() {
+                    access
+                        .cache
+                        .record_iterative_scan(rounds, cap_hit, rows_examined);
                 }
-                // 可視集合を使い切った（取得件数が要求に満たない、または全行を要求済み）。
-                if raw_len < k_round || k_round >= visible {
-                    break (kept, false);
-                }
-                if k_round >= cap {
-                    break (kept, true);
-                }
-                k_round = k_round.saturating_mul(2).min(cap);
-            };
-            if let Some(access) = hnsw_cache.as_ref() {
-                access
-                    .cache
-                    .record_iterative_scan(rounds, cap_hit, rows_examined);
+                postfilter_done = true;
+                filtered
             }
-            postfilter_done = true;
-            filtered
-        }
-        // `off`: 反復せず、取得件数を実効 `ef_search` で打ち切る（pgvector の `off` 相当。
-        // 経路内部で索引探索か厳密走査へ縮退したかによらず件数を揃える）。
-        Some((crate::hnsw::HnswIterativeScan::Off, _, ef)) => {
-            let mut h = compute_hits(k_eff.min(ef).max(1))?;
-            h.truncate(ef);
-            h
-        }
-        _ => compute_hits(k_eff)?,
-    };
-
-    // 反復スキャン経路は各ラウンドで Distance 段を記録済みのため、ここでは非反復経路のみ記録する。
-    if !postfilter_done {
-        stage_end(
-            &mut stats,
-            ExecStage::Distance,
-            distance_started,
-            hits.len(),
-            None,
-        );
-    }
-    // DISTANCE 段の直後の確認点（Issue #1953。上の直前確認と対）。
-    crate::interrupt::current_deadline().check()?;
-
-    // SCALAR 事後フィルタ（DISTANCE 先行時のみ。TASK-76・SQL-7）。`on_visible_row` は
-    // `plan.scalar_prefilter == false` の間、等価条件を判定せず可視行を通過させて
-    // いるため、ここで `postfilter_verdicts`（`on_visible_row` が生の
-    // `row_codec::ScalarRef` に対して判定済みの真偽値。宣言箇所のコメント参照）を
-    // 引く。値の取得不能（データ不整合。fail-closed）は除去する。返却件数が
-    // `limit` 未満になり得る（under-fetch。オーバーサンプルによる救済は行わない）。
-    // 反復スキャン（SQL-73・Issue #2033）で事後フィルタを済ませた場合は二重にかけない。
-    let hits: Vec<(u64, f64)> = if plan.scalar_prefilter || postfilter_done {
-        hits
-    } else {
-        let postfilter_started = stage_start(&stats);
-        let before = hits.len();
-        let kept = apply_postfilter(hits)?;
-        stage_end(
-            &mut stats,
-            ExecStage::PostFilter,
-            postfilter_started,
-            kept.len(),
-            Some(before.saturating_sub(kept.len())),
-        );
-        kept
-    };
-
-    // PRECISION ゲート段（TASK-162・SEARCH-9）。SCALAR 事後フィルタの**後**・
-    // `RlsSafetyNet::apply` の**前**に置く（`crate::precision` モジュール
-    // ドキュメント参照）。`WHERE` を満たす行だけを対象に Top-1／Top-2 の確信度を
-    // 見るため SCALAR 段より後、`RlsSafetyNet` は行を「減らす」ことしかしないため
-    // ゲート通過後に安全網が行を落としても確信のない行が増える方向にはならず、
-    // この位置より前に置く必要がある。候補集合自体は `ImplicitRlsHook` により
-    // 事前フィルタ済み（`arena` 構築時）のため、他テナント不可視行が Top-1／Top-2
-    // の比較対象に混入することはない。`HINT ORDER` の内容に関係なく無条件に適用
-    // する（`is_precision` は `bound.mode` のみに依存し、`plan.scalar_prefilter`
-    // の分岐に触れない）。`recall`（既定）はこのブロックを一切通らないため、
-    // 挙動は変わらない（SEARCH-1〜8 不変）。
-    let precision_started = if is_precision {
-        stage_start(&stats)
-    } else {
-        None
-    };
-    let hits: Vec<(u64, f64)> = if is_precision {
-        // 確信度指標はランキング方式ごとに正規化する（`crate::precision` モジュール
-        // ドキュメント参照）: dense はクエリ・候補 embedding の cosine 類似度、
-        // hybrid は融合スコアを理論最大値で割った正規化 RRF スコア。確信度は
-        // 先頭 `min(limit, max_results) + 1` 件分だけ計算する（有界・小規模。
-        // DoS 対策）。
-        let thresholds = match &bound.ranking {
-            Ranking::Distance { .. } => precision_policy.dense(),
-            Ranking::Hybrid { .. } => precision_policy.hybrid(),
+            // `off`: 反復せず、取得件数を実効 `ef_search` で打ち切る（pgvector の `off` 相当。
+            // 経路内部で索引探索か厳密走査へ縮退したかによらず件数を揃える）。
+            Some((crate::hnsw::HnswIterativeScan::Off, _, ef)) => {
+                let mut h = compute_hits(k_target.min(ef).max(1))?;
+                h.truncate(ef);
+                h
+            }
+            _ => compute_hits(k_target)?,
         };
-        let want = bound
-            .fetch_count()
-            .min(precision_policy.max_results())
-            .saturating_add(1);
-        let take_n = want.min(hits.len());
-        let mut conf: Vec<f64> = Vec::with_capacity(take_n);
-        match &bound.ranking {
-            Ranking::Distance { query } => {
-                for (slot_id, _score) in hits.iter().take(take_n) {
-                    let slot =
-                        usize::try_from(*slot_id).map_err(|_| SqlSurfaceError::Internal {
-                            detail: "candidate slot index out of range".to_string(),
-                        })?;
-                    let embedding =
-                        arena
-                            .vector_or_null(slot)
-                            .ok_or_else(|| SqlSurfaceError::Internal {
-                                detail: "candidate arena index out of range".to_string(),
-                            })?;
-                    // ノルム 0・次元不一致・非有限値は「確信なし」（`0.0`）として
-                    // 扱う。`ConfidenceThresholds::new` が閾値を厳密に正へ限定して
-                    // いるため、`0.0` は常に `min_top1` 未満となり空集合へ倒れる
-                    // （fail-closed。`crate::precision::cosine_similarity` の
-                    // ドキュメント参照）。
-                    conf.push(crate::precision::cosine_similarity(query, embedding).unwrap_or(0.0));
-                }
-            }
-            Ranking::Hybrid { tuning, .. } => {
-                // 正規化は DISTANCE 段の融合と同じ調整値（`rrf_k`・`weights`）の `RrfConfig` で行う
-                // （理論最大値が重み・定数に依存するため。SEARCH-13・Issue #2120）。`pool_depth` は
-                // 正規化式に現れない。
-                let cfg = crate::sql::hybrid_tuning::hybrid_rrf_config(tuning, k_eff)?;
-                for (_slot_id, score) in hits.iter().take(take_n) {
-                    conf.push(crate::precision::rrf_normalized(*score, &cfg).unwrap_or(0.0));
-                }
-            }
+
+        // 反復スキャン経路は各ラウンドで Distance 段を記録済みのため、ここでは非反復経路のみ記録する。
+        if !postfilter_done {
+            stage_end(
+                &mut stats,
+                ExecStage::Distance,
+                distance_started,
+                hits.len(),
+                None,
+            );
         }
-        let n = crate::precision::apply_gate(
-            &conf,
-            &thresholds,
-            bound.fetch_count(),
-            precision_policy.max_results(),
-        )
-        .map_err(|e| SqlSurfaceError::Internal {
-            detail: format!("precision gate contract violation: {e}"),
-        })?;
-        let mut truncated = hits;
-        truncated.truncate(n);
-        truncated
-    } else {
-        hits
+        // DISTANCE 段の直後の確認点（Issue #1953。上の直前確認と対）。
+        crate::interrupt::current_deadline().check()?;
+
+        // Issue #2142・D6: 縮退したとき off と同一の列へ戻すため、事後 SCALAR フィルタの**前**に
+        // 「off が返したはずの先頭 `k_eff` 件」のスロット集合を控える。事後フィルタは順序を保つ
+        // 行単位の判定なので、off の結果は「フィルタ後の列のうち、この集合に属する行」と一致する。
+        // リランクが無効（`rerank_active == None`）や密のみの文では何も確保しない。
+        let rerank_off_prefix: Option<HashSet<u64>> = rerank_active
+            .filter(|_| matches!(bound.ranking, Ranking::Hybrid { .. }))
+            .map(|_| {
+                hits.iter()
+                    .take(k_eff)
+                    .map(|h| h.0)
+                    .collect::<HashSet<u64>>()
+            });
+
+        // SCALAR 事後フィルタ（DISTANCE 先行時のみ。TASK-76・SQL-7）。`on_visible_row` は
+        // `plan.scalar_prefilter == false` の間、等価条件を判定せず可視行を通過させて
+        // いるため、ここで `postfilter_verdicts`（`on_visible_row` が生の
+        // `row_codec::ScalarRef` に対して判定済みの真偽値。宣言箇所のコメント参照）を
+        // 引く。値の取得不能（データ不整合。fail-closed）は除去する。返却件数が
+        // `limit` 未満になり得る（under-fetch。オーバーサンプルによる救済は行わない）。
+        // 反復スキャン（SQL-73・Issue #2033）で事後フィルタを済ませた場合は二重にかけない。
+        let hits: Vec<(u64, f64)> = if plan.scalar_prefilter || postfilter_done {
+            hits
+        } else {
+            let postfilter_started = stage_start(&stats);
+            let before = hits.len();
+            let kept = apply_postfilter(hits)?;
+            stage_end(
+                &mut stats,
+                ExecStage::PostFilter,
+                postfilter_started,
+                kept.len(),
+                Some(before.saturating_sub(kept.len())),
+            );
+            kept
+        };
+
+        // PRECISION ゲート段（TASK-162・SEARCH-9）。SCALAR 事後フィルタの**後**・
+        // `RlsSafetyNet::apply` の**前**に置く（`crate::precision` モジュール
+        // ドキュメント参照）。`WHERE` を満たす行だけを対象に Top-1／Top-2 の確信度を
+        // 見るため SCALAR 段より後、`RlsSafetyNet` は行を「減らす」ことしかしないため
+        // ゲート通過後に安全網が行を落としても確信のない行が増える方向にはならず、
+        // この位置より前に置く必要がある。候補集合自体は `ImplicitRlsHook` により
+        // 事前フィルタ済み（`arena` 構築時）のため、他テナント不可視行が Top-1／Top-2
+        // の比較対象に混入することはない。`HINT ORDER` の内容に関係なく無条件に適用
+        // する（`is_precision` は `bound.mode` のみに依存し、`plan.scalar_prefilter`
+        // の分岐に触れない）。`recall`（既定）はこのブロックを一切通らないため、
+        // 挙動は変わらない（SEARCH-1〜8 不変）。
+        let precision_started = if is_precision {
+            stage_start(&stats)
+        } else {
+            None
+        };
+        let hits: Vec<(u64, f64)> = if is_precision {
+            // 確信度指標はランキング方式ごとに正規化する（`crate::precision` モジュール
+            // ドキュメント参照）: dense はクエリ・候補 embedding の cosine 類似度、
+            // hybrid は融合スコアを理論最大値で割った正規化 RRF スコア。確信度は
+            // 先頭 `min(limit, max_results) + 1` 件分だけ計算する（有界・小規模。
+            // DoS 対策）。
+            let thresholds = match &bound.ranking {
+                Ranking::Distance { .. } => precision_policy.dense(),
+                Ranking::Hybrid { .. } => precision_policy.hybrid(),
+            };
+            let want = bound
+                .fetch_count()
+                .min(precision_policy.max_results())
+                .saturating_add(1);
+            let take_n = want.min(hits.len());
+            let mut conf: Vec<f64> = Vec::with_capacity(take_n);
+            match &bound.ranking {
+                Ranking::Distance { query } => {
+                    for (slot_id, _score) in hits.iter().take(take_n) {
+                        let slot =
+                            usize::try_from(*slot_id).map_err(|_| SqlSurfaceError::Internal {
+                                detail: "candidate slot index out of range".to_string(),
+                            })?;
+                        let embedding = arena.vector_or_null(slot).ok_or_else(|| {
+                            SqlSurfaceError::Internal {
+                                detail: "candidate arena index out of range".to_string(),
+                            }
+                        })?;
+                        // ノルム 0・次元不一致・非有限値は「確信なし」（`0.0`）として
+                        // 扱う。`ConfidenceThresholds::new` が閾値を厳密に正へ限定して
+                        // いるため、`0.0` は常に `min_top1` 未満となり空集合へ倒れる
+                        // （fail-closed。`crate::precision::cosine_similarity` の
+                        // ドキュメント参照）。
+                        conf.push(
+                            crate::precision::cosine_similarity(query, embedding).unwrap_or(0.0),
+                        );
+                    }
+                }
+                Ranking::Hybrid { tuning, .. } => {
+                    // 正規化は DISTANCE 段の融合と同じ調整値（`rrf_k`・`weights`）の `RrfConfig` で行う
+                    // （理論最大値が重み・定数に依存するため。SEARCH-13・Issue #2120）。`pool_depth` は
+                    // 正規化式に現れない。
+                    let cfg = crate::sql::hybrid_tuning::hybrid_rrf_config(tuning, k_eff)?;
+                    for (_slot_id, score) in hits.iter().take(take_n) {
+                        conf.push(crate::precision::rrf_normalized(*score, &cfg).unwrap_or(0.0));
+                    }
+                }
+            }
+            let n = crate::precision::apply_gate(
+                &conf,
+                &thresholds,
+                bound.fetch_count(),
+                precision_policy.max_results(),
+            )
+            .map_err(|e| SqlSurfaceError::Internal {
+                detail: format!("precision gate contract violation: {e}"),
+            })?;
+            let mut truncated = hits;
+            truncated.truncate(n);
+            truncated
+        } else {
+            hits
+        };
+        if is_precision {
+            stage_end(
+                &mut stats,
+                ExecStage::PrecisionGate,
+                precision_started,
+                hits.len(),
+                None,
+            );
+        }
+
+        // リランク段（Issue #2142・SEARCH-15。設計記録 `docs/design/rerank-wiring-policy.md`
+        // D3・D4・D6）。事後 SCALAR フィルタと precision ゲート（precision ではリランクしない）の
+        // **後**・`RlsSafetyNet::apply` の**前**に置く。候補は `ImplicitRlsHook` で RLS 適用済みの
+        // アリーナ由来の可視行だけで、窓内の行テキストはこの場で（キャッシュのヒット・ミスに
+        // 関わらず）認可済みの行から都度読む。契約違反・上限超過は縮退（off と同一の列へ戻す）で、
+        // 検索全体は拒否しない。`statement_timeout`／キャンセルは 57014 が優先で縮退にしない。
+        // 安全網・`OFFSET`・`LIMIT` 省略時の上限判定は従来どおり以降で無条件に適用される。
+        let hits: Vec<(u64, f64)> =
+            match (rerank_active, &bound.ranking, rerank_off_prefix.as_ref()) {
+                (Some(access), ranking, off_prefix) if !refetched => {
+                    crate::interrupt::current_deadline().check()?;
+                    let snapshot_metadata = if defer_projection || mask_trusted_defer {
+                        cache_hit_snapshot.as_ref().map(|s| s.metadata())
+                    } else {
+                        None
+                    };
+                    let (query_text, text_column_index, dense) = match ranking {
+                        Ranking::Hybrid {
+                            query_text,
+                            text_column_index,
+                            ..
+                        } => (query_text.as_str(), *text_column_index, false),
+                        Ranking::Distance { .. } => ("", 0, true),
+                    };
+                    let src = crate::sql::rerank_stage::StageSource {
+                        read_txn,
+                        schema,
+                        table: &bound.table,
+                        arena,
+                        snapshot_metadata,
+                        text_column_index,
+                        query_text,
+                        dense,
+                    };
+                    let result =
+                        crate::sql::rerank_stage::run_stage(access, &src, hits, k_eff, off_prefix);
+                    // 57014（期限・キャンセル）は縮退より優先する（ADR D5）。
+                    crate::interrupt::current_deadline().check()?;
+                    match result {
+                        crate::sql::rerank_stage::StageResult::Rows(rows) => rows,
+                        crate::sql::rerank_stage::StageResult::RefetchOff => {
+                            k_target = k_eff;
+                            refetched = true;
+                            // 2 周目のキャッシュ観測は 1 周目と重ねて数えない（ループ先頭の抑止ガード）。
+                            continue;
+                        }
+                    }
+                }
+                _ => {
+                    // 設定は有効だが文の形（密のみで字句一致系・precision）により適用外。素通しして件数だけ
+                    // 数える。MMR 予算超過で縮退済みの文と、縮退後の再検索（2 周目）は数えない。
+                    if !refetched && !rerank_budget_degraded {
+                        if let Some(access) = &rerank {
+                            access.counters.record_not_applicable();
+                        }
+                    }
+                    hits
+                }
+            };
+        break hits;
     };
-    if is_precision {
-        stage_end(
-            &mut stats,
-            ExecStage::PrecisionGate,
-            precision_started,
-            hits.len(),
-            None,
-        );
-    }
 
     // RLS 実行時安全網（TASK-136・RLS-5）。`HINT ORDER` の内容に関係なく常に適用する
     // （モジュールドキュメント参照）。`ExecutionPlan` にはこの適用を分岐させる
@@ -3679,6 +3938,7 @@ pub(crate) fn execute_statement_with_cache_observed(
         arena,
         scalar_source,
         &needed_mask,
+        hybrid_ranks.borrow().as_ref(),
     )?;
     stage_end(
         &mut stats,
@@ -3705,6 +3965,9 @@ pub(crate) fn execute_statement_with_cache_observed(
             ProjectedColumn::Computed {
                 name, result_ty, ..
             } => computed_column_meta(name, result_ty),
+            ProjectedColumn::HybridDetail { name, kind } => {
+                computed_column_meta(name, &Some(kind.result_type()))
+            }
         })
         .collect();
 
@@ -3738,6 +4001,13 @@ pub fn execute_statement(
         None,
         None,
         None,
+        None,
+        // 公開ラッパーは既定のテキスト処理（恒等）。ストップワード・同義語は
+        // `EngineCore::with_text_analysis` 経由でのみ有効になる（Issue #2130）。
+        &Arc::new(crate::sparse::TextAnalysis::default()),
+        // ハード上限＝既定値（公開ラッパーは `EngineCore::with_text_query_limits` を経由しない）。
+        &crate::text_query_limits::TextQueryLimits::default(),
+        // 公開ラッパーはリランクしない（`EngineCore::with_rerank` 経由でのみ有効。Issue #2142）。
         None,
     )
 }
@@ -4005,6 +4275,7 @@ fn project_rows(
     arena: &VectorArena,
     scalar_source: ScalarSource<'_>,
     needed_mask: &[bool],
+    hybrid_ranks: Option<&HybridRankMap>,
 ) -> Result<Vec<ResultRow>, SqlSurfaceError> {
     // `ScalarSource::Deferred(DeferredScalars::Redb { .. })` のときだけ行テーブルを
     // 1 回開く。行を 1 件も持たないテーブル（`user_rows/{table}` 未作成）は
@@ -4045,6 +4316,7 @@ fn project_rows(
             }
             ProjectedColumn::Id
             | ProjectedColumn::AliasedId { .. }
+            | ProjectedColumn::HybridDetail { .. }
             | ProjectedColumn::Column { .. } => None,
         })
         .collect();
@@ -4158,6 +4430,25 @@ fn project_rows(
             match col {
                 ProjectedColumn::Id | ProjectedColumn::AliasedId { .. } => {
                     cells.push(Cell::Integer(id))
+                }
+                ProjectedColumn::HybridDetail { kind, .. } => {
+                    // RLS 適用後の可視候補だけで融合した順位（SEARCH-17 (2)）。対応表に slot が
+                    // 無いのは不変条件違反で、黙って NULL にせず fail-closed で拒否する。
+                    let ranks = hybrid_ranks.and_then(|m| m.get(&slot_id)).ok_or_else(|| {
+                        SqlSurfaceError::Internal {
+                            detail: "hybrid rank is missing for a search hit".to_string(),
+                        }
+                    })?;
+                    let rank = match kind {
+                        crate::sql::hybrid_detail::HybridDetailKind::DenseRank => Some(ranks.0),
+                        crate::sql::hybrid_detail::HybridDetailKind::SparseRank => Some(ranks.1),
+                        crate::sql::hybrid_detail::HybridDetailKind::Score => None,
+                    };
+                    cells.push(match rank {
+                        Some(Some(r)) => Cell::SignedInteger(i64::from(r)),
+                        Some(None) => Cell::Null,
+                        None => Cell::Float(score),
+                    });
                 }
                 ProjectedColumn::Column { index, .. } => {
                     let column =

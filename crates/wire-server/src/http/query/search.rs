@@ -152,6 +152,7 @@ pub enum BoundSearch {
 /// [`bind_search`] の失敗を表す。いずれも [`ClassifiedError`] を実装し
 /// `wire_code`／`client_message` を経由して HTTP エラー応答へ射影される。
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum SearchError {
     /// [`super::schema::Validated`] アクセサの型・キー不一致（`42601`）。
     Shape(SchemaError),
@@ -172,6 +173,10 @@ pub enum SearchError {
     MetricWithPlan,
     /// `metric` と `hybrid` の併用（SQL に等価形が無い。`42601`。Issue #2243）。
     MetricWithHybrid,
+    /// `hybrid.explain_score: true` の追加列名（`hybrid_dense_rank`／`hybrid_sparse_rank`／
+    /// `hybrid_score`）が、投影される表の列と同名（`42601`。SEARCH-17 (4)。Issue #2137）。
+    /// 文言は固定で、列名を応答へ含めない。
+    ExplainScoreColumnConflict,
     /// `columns: []`（空配列）。SQL 表層に等価形（空の SELECT リスト）が
     /// 存在しないため fail-closed に拒否する（`42601`）。
     EmptyColumns,
@@ -234,6 +239,7 @@ impl ClassifiedError for SearchError {
             | SearchError::MetricWithPlan
             | SearchError::MetricWithHybrid
             | SearchError::EmptyColumns
+            | SearchError::ExplainScoreColumnConflict
             | SearchError::InvalidIdentifier
             | SearchError::ExplainRequiresPlan => ErrorClass::UnsupportedSqlSyntax,
             SearchError::ExplainNotSupported => ErrorClass::FeatureNotSupported,
@@ -263,6 +269,10 @@ impl ClassifiedError for SearchError {
             }
             SearchError::EmptyColumns => {
                 "search request \"columns\" must not be an empty array".to_string()
+            }
+            SearchError::ExplainScoreColumnConflict => {
+                "search request \"explain_score\" conflicts with an existing column name"
+                    .to_string()
             }
             SearchError::InvalidIdentifier => "invalid identifier".to_string(),
             SearchError::ExplainRequiresPlan => {
@@ -403,6 +413,50 @@ pub fn bind_search_with_limits(
     })
 }
 
+/// `hybrid` の調整キー（`k1`・`b`・`rrf_k`・`window`・`weights`。Issue #2122・NOSQL-2・
+/// SEARCH-13 ポインタ）を読み、`HybridTuning::new` で範囲検証する。
+///
+/// 検証は 3 層に分かれる。(1) 型・未知キーなどの形は `HYBRID_SCHEMA`／アクセサ（`42601`）、
+/// (2) 値の範囲は engine の `HybridTuning::new`（`22000`。範囲の正を wire-server に複製しない）、
+/// (3) `window` と `LIMIT`・`--max-result-rows`・`k1` の数値安全上限は engine の
+/// `check_bound_search` が束縛済み文に対して検査する。`window` は整数のみ受け付け、
+/// `usize` に収まらない値は飽和させて範囲外（`22000`）として拒否する。
+fn bind_hybrid_tuning(
+    hybrid: &Validated<'_>,
+) -> Result<engine::sql::hybrid_tuning::HybridTuning, SearchError> {
+    let k1 = hybrid.optional_number("k1")?;
+    let b = hybrid.optional_number("b")?;
+    let rrf_k = hybrid.optional_number("rrf_k")?;
+    let window = match hybrid.optional_json_number("window")? {
+        None => None,
+        Some(n) => match n.as_exact_u64() {
+            Some(v) => Some(usize::try_from(v).unwrap_or(usize::MAX)),
+            // `u64` 超の桁だけの整数リテラルは `Float` 保持になる。型は整数なので
+            // 型不一致ではなく範囲外（`22000`）として扱い、SQL 経路と分類を揃える。
+            None if matches!(
+                &n,
+                engine::json::JsonNumber::Float { text, .. }
+                    if !text.is_empty() && text.bytes().all(|c| c.is_ascii_digit())
+            ) =>
+            {
+                Some(usize::MAX)
+            }
+            None => {
+                return Err(SearchError::Shape(SchemaError::TypeMismatch {
+                    key: "window",
+                }))
+            }
+        },
+    };
+    let weights = match hybrid.optional_nested("weights")? {
+        None => None,
+        Some(w) => Some((w.required_number("dense")?, w.required_number("sparse")?)),
+    };
+    Ok(engine::sql::hybrid_tuning::HybridTuning::new(
+        k1, b, rrf_k, window, weights,
+    )?)
+}
+
 /// [`bind_search_with_limits`] に `metric` 省略時の解決器を足した版（Issue #2243）。
 /// `index_default` は `metric` 省略時の距離種別の解決器（Issue #2243。engine の
 /// `IndexMetricDefault::distance_kind`）で、`vector` かつ非 `hybrid` で `metric` が
@@ -422,7 +476,7 @@ pub fn bind_search_with_metric_resolver(
 
     let vector_items = validated.optional_array("vector")?;
     let plan = validated.optional_str("plan")?;
-    let hybrid = validated.optional_object("hybrid")?;
+    let hybrid = validated.optional_nested("hybrid")?;
 
     // 排他判定と同時に、以降の分岐が使う値をここで確定する（`.expect()` で
     // 「到達しないはず」の分岐を後段に残さない。受信データ経路では
@@ -452,7 +506,7 @@ pub fn bind_search_with_metric_resolver(
         Some([]) => return Err(SearchError::EmptyColumns),
         Some(items) => Some(columns_as_strings(items)?),
     };
-    let projection = bind_column_projection(columns.as_deref(), schema)?;
+    let mut projection = bind_column_projection(columns.as_deref(), schema)?;
 
     let filter_items = validated.optional_array("filter")?.unwrap_or(&[]);
     let filters = bind_filter(filter_items, schema, udfs)?;
@@ -476,27 +530,30 @@ pub fn bind_search_with_metric_resolver(
     let explicit_metric = metric.map(parse_metric).transpose()?;
 
     if let VectorOrPlan::Vector(vector_items) = vector_or_plan {
+        // 調整キーはベクトル値の検証より先に検証する（SQL の `bind_ranking` と同じ
+        // エラー優先順位。Issue #2122）。
+        let hybrid_parts = match &hybrid {
+            Some(h) => Some((h.required_str("text")?, bind_hybrid_tuning(h)?)),
+            None => None,
+        };
         let values = vector_as_f32(vector_items)?;
         let query = bind_vector_values(&values, schema)?;
-        let ranking = match hybrid {
-            Some(hybrid_obj) => {
+        let ranking = match hybrid_parts {
+            Some((query_text, tuning)) => {
                 let text_column_index = bind_body_text_column(schema)?;
-                let query_text = match hybrid_obj.get("text") {
-                    Some(JsonValue::String(s)) => s.clone(),
-                    // `HYBRID_SCHEMA` が既に `text: Required String` を検証
-                    // 済みだが、多層防御として再検査する（`filter.rs`
-                    // `map_filter_item` と同じ判断）。
-                    _ => {
-                        return Err(SearchError::Shape(SchemaError::TypeMismatch {
-                            key: "hybrid",
-                        }))
+                // SEARCH-17 (4)・Issue #2137: `explain_score: true` のときだけ、投影の末尾へ
+                // 系統別順位・融合スコアの 3 列を足す（SQL の `hybrid_*()` と同じ値・型）。省略／
+                // `false` は従来の応答と同一。表に同名の列があれば `42601`（`columns` 省略時も検査）。
+                if let Some(h) = &hybrid {
+                    if h.optional_bool("explain_score")? == Some(true) {
+                        append_explain_score_columns(&mut projection, schema)?;
                     }
-                };
+                }
                 Ranking::Hybrid {
                     query,
                     text_column_index,
-                    query_text,
-                    tuning: engine::sql::hybrid_tuning::HybridTuning::default(),
+                    query_text: query_text.to_string(),
+                    tuning,
                 }
             }
             None => Ranking::Distance { query },
@@ -550,6 +607,45 @@ pub fn bind_search_with_metric_resolver(
         query_mode,
         explain,
     }))
+}
+
+/// `hybrid.explain_score: true` の 3 列（密順位・疎順位・スコア）を投影の末尾へ足す
+/// （SEARCH-17 (4)・Issue #2137）。既存の投影列に同名（大文字小文字を区別しない）があれば
+/// [`SearchError::ExplainScoreColumnConflict`]。
+fn append_explain_score_columns(
+    projection: &mut Vec<engine::sql::parser::ProjectedColumn>,
+    schema: &TableSchema,
+) -> Result<(), SearchError> {
+    use engine::sql::hybrid_detail::HybridDetailKind;
+    use engine::sql::parser::ProjectedColumn;
+    // 表の全列（投影に含めない列も）と同名なら拒否する。
+    let schema_conflicts = schema.columns.iter().any(|c| {
+        HybridDetailKind::ALL
+            .iter()
+            .any(|k| c.name.eq_ignore_ascii_case(k.column_name()))
+    });
+    let conflicts = schema_conflicts
+        || projection.iter().any(|col| {
+            let name = match col {
+                ProjectedColumn::Column { name, .. } | ProjectedColumn::AliasedId { name } => name,
+                ProjectedColumn::Computed { name, .. }
+                | ProjectedColumn::HybridDetail { name, .. } => name,
+                ProjectedColumn::Id => return false,
+            };
+            HybridDetailKind::ALL
+                .iter()
+                .any(|k| name.eq_ignore_ascii_case(k.column_name()))
+        });
+    if conflicts {
+        return Err(SearchError::ExplainScoreColumnConflict);
+    }
+    for kind in HybridDetailKind::ALL {
+        projection.push(ProjectedColumn::HybridDetail {
+            name: kind.column_name().to_string(),
+            kind,
+        });
+    }
+    Ok(())
 }
 
 /// `explain: true` を伴う `plan` 検索に返す固定文言（[`super::gate::
@@ -805,6 +901,34 @@ mod tests {
     use engine::json::{parse_json, JsonNumber};
 
     use crate::http::query::schema::SEARCH_SCHEMA;
+
+    /// SEARCH-17 (4)・Issue #2137: 同名の列（大文字小文字を区別しない）があれば `42601`、無ければ
+    /// 3 列を末尾へ足す。
+    #[test]
+    fn explain_score_columns_conflict_and_append() {
+        use engine::sql::parser::ProjectedColumn;
+        let mut clash = vec![ProjectedColumn::Column {
+            index: 0,
+            name: "Hybrid_Score".to_string(),
+        }];
+        let err = append_explain_score_columns(&mut clash, &schema()).expect_err("must conflict");
+        assert_eq!(err.error_class(), ErrorClass::UnsupportedSqlSyntax);
+        assert!(!err.client_message().contains("Hybrid_Score"));
+        let mut ok = vec![ProjectedColumn::Id];
+        append_explain_score_columns(&mut ok, &schema()).expect("no conflict");
+        assert_eq!(ok.len(), 4);
+        // 投影に含めない列（`columns: ["id"]`）でも、表の列が同名なら拒否する。
+        let with_col = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(4), false),
+                ColumnDef::new("hybrid_score", ColumnType::Text, false),
+            ],
+        );
+        let mut id_only = vec![ProjectedColumn::Id];
+        let err = append_explain_score_columns(&mut id_only, &with_col).expect_err("schema clash");
+        assert_eq!(err.error_class(), ErrorClass::UnsupportedSqlSyntax);
+    }
 
     fn schema() -> TableSchema {
         TableSchema::new(
@@ -1123,6 +1247,92 @@ mod tests {
         };
         assert_eq!(schema().columns[*text_column_index].name, "body");
         assert_eq!(query_text, "hello world");
+    }
+
+    fn hybrid_req(extra: &str) -> String {
+        format!(
+            r#"{{"op":"search","table":"docs","vector":[0.1,0.2,0.3,0.4],"limit":5,"hybrid":{{"text":"x"{extra}}}}}"#
+        )
+    }
+
+    fn hybrid_tuning_of(text: &str) -> engine::sql::hybrid_tuning::HybridTuning {
+        let BoundSearch::Vector(stmt) = bind(text).expect("bind ok") else {
+            panic!("expected BoundSearch::Vector");
+        };
+        let Ranking::Hybrid { tuning, .. } = stmt.ranking() else {
+            panic!("expected Ranking::Hybrid");
+        };
+        tuning.clone()
+    }
+
+    #[test]
+    fn hybrid_without_tuning_keys_uses_default() {
+        assert_eq!(
+            hybrid_tuning_of(&hybrid_req("")),
+            engine::sql::hybrid_tuning::HybridTuning::default()
+        );
+    }
+
+    #[test]
+    fn hybrid_tuning_keys_bind_to_hybrid_tuning() {
+        let got = hybrid_tuning_of(&hybrid_req(
+            r#","k1":1.5,"b":0.5,"rrf_k":30,"window":50,"weights":{"dense":2,"sparse":0.5}"#,
+        ));
+        let want = engine::sql::hybrid_tuning::HybridTuning::new(
+            Some(1.5),
+            Some(0.5),
+            Some(30.0),
+            Some(50),
+            Some((2.0, 0.5)),
+        )
+        .expect("valid tuning");
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn hybrid_window_must_be_integer() {
+        for w in ["1.5", "-1", "1e3"] {
+            let err = bind(&hybrid_req(&format!(r#","window":{w}"#))).expect_err("must reject");
+            assert_eq!(err.wire_code(), "42601", "window={w}");
+        }
+    }
+
+    #[test]
+    fn hybrid_tuning_out_of_range_is_22000() {
+        for extra in [
+            r#","window":18446744073709551616"#,
+            r#","window":123456789012345678901234567890"#,
+            r#","k1":-1"#,
+            r#","b":1.5"#,
+            r#","rrf_k":0"#,
+            r#","window":0"#,
+            r#","window":18446744073709551615"#,
+            r#","weights":{"dense":0,"sparse":0}"#,
+            r#","weights":{"dense":-1,"sparse":1}"#,
+        ] {
+            let err = bind(&hybrid_req(extra)).expect_err("must reject");
+            assert_eq!(err.wire_code(), "22000", "{extra}");
+            assert_eq!(
+                to_sql_surface_error(err).wire_code(),
+                "22000",
+                "closure boundary: {extra}"
+            );
+        }
+    }
+
+    #[test]
+    fn plan_or_metric_with_tuned_hybrid_keeps_exclusion_errors() {
+        let tuned = r#"{"text":"y","k1":1.0}"#;
+        let err = bind(&format!(
+            r#"{{"op":"search","table":"docs","plan":"x","hybrid":{tuned},"limit":5}}"#
+        ))
+        .expect_err("must reject");
+        assert!(matches!(err, SearchError::PlanWithHybrid));
+        let err = bind(&format!(
+            r#"{{"op":"search","table":"docs","vector":[0.1,0.2,0.3,0.4],"hybrid":{tuned},"metric":"l2","limit":5}}"#
+        ))
+        .expect_err("must reject");
+        assert!(matches!(err, SearchError::MetricWithHybrid));
     }
 
     #[test]

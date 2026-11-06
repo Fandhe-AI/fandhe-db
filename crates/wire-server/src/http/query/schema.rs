@@ -570,14 +570,78 @@ impl<'a> Validated<'a> {
 }
 
 /// `hybrid` フィールドのサブスキーマ（`search` op）。
+///
+/// `text` に加え、SQL の `HYBRID(..., k1 => ...)` 名前付き調整引数と対応する任意キー
+/// `k1`・`b`・`rrf_k`・`window`・`weights`（Issue #2122・NOSQL-2・SEARCH-13 ポインタ）を宣言する。
+/// 形（型・未知キー）だけをここで検査し、値の範囲は `engine::sql::hybrid_tuning::
+/// HybridTuning::new` が検査する（範囲の正を engine へ一本化）。
 pub static HYBRID_SCHEMA: ObjectSchema = ObjectSchema {
     name: "hybrid",
-    fields: &[FieldSpec {
-        key: "text",
-        presence: Presence::Required,
-        ty: FieldType::String,
-        nullable: false,
-    }],
+    fields: &[
+        FieldSpec {
+            key: "text",
+            presence: Presence::Required,
+            ty: FieldType::String,
+            nullable: false,
+        },
+        FieldSpec {
+            key: "k1",
+            presence: Presence::Optional,
+            ty: FieldType::Number,
+            nullable: false,
+        },
+        FieldSpec {
+            key: "b",
+            presence: Presence::Optional,
+            ty: FieldType::Number,
+            nullable: false,
+        },
+        FieldSpec {
+            key: "rrf_k",
+            presence: Presence::Optional,
+            ty: FieldType::Number,
+            nullable: false,
+        },
+        FieldSpec {
+            key: "window",
+            presence: Presence::Optional,
+            ty: FieldType::Number,
+            nullable: false,
+        },
+        FieldSpec {
+            key: "weights",
+            presence: Presence::Optional,
+            ty: FieldType::Object(&HYBRID_WEIGHTS_SCHEMA),
+            nullable: false,
+        },
+        // SEARCH-17 (4)・Issue #2137: 真のとき応答へ系統別順位・融合スコアの 3 列を足す。
+        FieldSpec {
+            key: "explain_score",
+            presence: Presence::Optional,
+            ty: FieldType::Bool,
+            nullable: false,
+        },
+    ],
+};
+
+/// `hybrid.weights`（`{"dense": 数, "sparse": 数}`）のサブスキーマ（Issue #2122）。
+/// 両キー必須・余分なキーは `42601`。非負・両方 0 不可などの範囲は engine が検査する。
+pub static HYBRID_WEIGHTS_SCHEMA: ObjectSchema = ObjectSchema {
+    name: "hybrid_weights",
+    fields: &[
+        FieldSpec {
+            key: "dense",
+            presence: Presence::Required,
+            ty: FieldType::Number,
+            nullable: false,
+        },
+        FieldSpec {
+            key: "sparse",
+            presence: Presence::Required,
+            ty: FieldType::Number,
+            nullable: false,
+        },
+    ],
 };
 
 /// `create_table` の CHECK 述語の葉（`{column, op, value}`）のサブスキーマ
@@ -2505,6 +2569,34 @@ mod tests {
     }
 
     // --- ネスト -------------------------------------------------------
+
+    #[test]
+    fn hybrid_accepts_tuning_keys() {
+        let v = obj(
+            r#"{"op":"search","table":"docs","limit":1,"hybrid":{"text":"x","k1":1.5,"b":0.5,"rrf_k":30,"window":50,"weights":{"dense":2,"sparse":0.5}}}"#,
+        );
+        SEARCH_SCHEMA.validate(&v).expect("tuning keys are valid");
+    }
+
+    #[test]
+    fn hybrid_tuning_keys_reject_bad_shapes() {
+        for bad in [
+            r#""k1":"x""#,
+            r#""b":null"#,
+            r#""rrf_k":[1]"#,
+            r#""window":"5""#,
+            r#""weights":1"#,
+            r#""weights":{"dense":1}"#,
+            r#""weights":{"dense":1,"sparse":"x"}"#,
+            r#""weights":{"dense":1,"sparse":1,"extra":1}"#,
+            r#""k2":1"#,
+        ] {
+            let v = obj(&format!(
+                r#"{{"op":"search","table":"docs","limit":1,"hybrid":{{"text":"x",{bad}}}}}"#
+            ));
+            assert!(SEARCH_SCHEMA.validate(&v).is_err(), "must reject: {bad}");
+        }
+    }
 
     #[test]
     fn nested_hybrid_rejects_unknown_key() {

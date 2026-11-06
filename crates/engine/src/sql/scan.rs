@@ -323,6 +323,9 @@ fn decode_tier_for(schema: &TableSchema, bound: &BoundScan) -> (DecodeTier, Vec<
                 }
             }
             ProjectedColumn::Id | ProjectedColumn::AliasedId { .. } => {}
+            // 束縛段が検索 SELECT 以外では生成しない（SEARCH-17）。到達は不変条件違反で、
+            // 後続の投影段が `Internal` で fail-closed にする。
+            ProjectedColumn::HybridDetail { .. } => {}
         }
     }
     if !bound.metadata_filters.is_empty() {
@@ -707,6 +710,11 @@ fn build_projected_cells(
         match col {
             ProjectedColumn::Id | ProjectedColumn::AliasedId { .. } => {
                 cells.push(Cell::Integer(id))
+            }
+            ProjectedColumn::HybridDetail { .. } => {
+                return Err(SqlSurfaceError::Internal {
+                    detail: "hybrid detail is not supported in a scan".to_string(),
+                });
             }
             ProjectedColumn::Column { index, .. } => {
                 let column =
@@ -1412,6 +1420,11 @@ fn execute_scan_with_budget_inner(
             ProjectedColumn::Computed {
                 name, result_ty, ..
             } => crate::sql::exec::computed_column_meta(name, result_ty),
+            ProjectedColumn::HybridDetail { .. } => {
+                return Err(SqlSurfaceError::Internal {
+                    detail: "hybrid detail is not supported in a scan".to_string(),
+                });
+            }
         });
     }
 
@@ -1437,6 +1450,7 @@ fn execute_scan_with_budget_inner(
             ProjectedColumn::Computed { expr, .. } => Some(ExprProgram::compile(expr)),
             ProjectedColumn::Id
             | ProjectedColumn::AliasedId { .. }
+            | ProjectedColumn::HybridDetail { .. }
             | ProjectedColumn::Column { .. } => None,
         })
         .collect();

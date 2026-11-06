@@ -14,6 +14,9 @@
 //! [--hnsw-acorn-max-visible-ratio <num>/<den>]
 //! [--hnsw-sparse-visited-max <N>]
 //! [--auth-method cleartext|scram-sha-256] [--scram-mock-key-file <path>]
+//! [--stopwords-file <path>] [--synonyms-file <path>]
+//! [--reranker off|lexical|mmr|cross_encoder] [--rerank-window <N>] [--rerank-mmr-lambda <0..1>]
+//! [--rerank-model <path> --rerank-tokenizer <path> [--rerank-timeout-ms <N>]]
 //! [--ddl-allowed-users <user1>[,<user2>...]]
 //! [--tls-cert <pem> --tls-key <pem> [--tls-mode require|allow]
 //!  [--tls-scram-channel-binding enable|disable]]
@@ -179,6 +182,14 @@
 //! 起動エラー。値の解決は `wire_server::regex_limits_opt::resolve` に一本化し、
 //! `EngineCore::with_regex_limits` へ 1 回だけ注入する（`docs/design/regex-limits-cli.md`。
 //! SQL 表層からの利用は Issue #1787 以降）。
+//!
+//! `--max-text-query-terms`／`--max-text-query-prefix-expansions`（Issue #2115。SEARCH-12）:
+//! 全文検索クエリの項数（グループごとの一意な語の総和。`1`〜`1024`）・前方一致の展開語数
+//! （可視集合で df > 0 の語。`1`〜`1024`）の上限を、プロセス全体に対して起動時に**下げる方向だけ**
+//! 設定できる opt-in 注入点（未指定はハード上限と同値）。超過は `54000`。範囲外・非数値・値欠落・
+//! 重複指定は fail-closed で起動エラー。値の解決は `wire_server::text_query_limits_opt::resolve` に
+//! 一本化し、`EngineCore::with_text_query_limits` へ 1 回だけ注入する
+//! （`docs/design/text-query-limits-cli.md`。SQL／NoSQL 表層からの利用は Issue #2116 以降）。
 //!
 //! `--max-sparsevec-nnz`（Issue #2027。TABLE-47 (2)・SQL-46）: `SPARSEVEC(N)` 列へ書き込む値の
 //! 非ゼロ要素数の上限（`1`〜`16000`）を、プロセス全体に対して起動時に**下げる方向だけ**設定できる
@@ -382,6 +393,30 @@
 //! 台帳に記録しない通常の書き込み。分割実行 DML のみ常に必須。
 //! `docs/design/operation-id-optional.md` 参照）。
 //!
+//! `--stopwords-file <path>`／`--synonyms-file <path>`（Issue #2130・SEARCH-16 ポインタ）:
+//! 疎検索（BM25）のストップワード一覧・同義語辞書。値欠落・重複指定・読めない／上限超過／
+//! 不正な内容は fail-closed で起動エラー（エラー文にファイルの中身を出さない）。解決は
+//! `wire_server::text_analysis_opt::resolve` に一本化し、`EngineCore::with_text_analysis` へ
+//! 1 回だけ注入する（セッション・SQL・HTTP からは変更できない）。未指定時は従来どおり
+//! （`docs/design/stopword-synonym-files.md` 参照）。
+//!
+//! `--reranker <off|lexical|mmr|cross_encoder>`／`--rerank-window <N>`（Issue #2142・SEARCH-15
+//! ポインタ）: ハイブリッド検索の後段のリランカーと、リランク対象の窓幅 `W`（`1..=10000`、
+//! 既定 200）。既定は `off`（従来経路。結果もレイテンシも変わらない）。`mmr`（Issue #2143）は
+//! 多様性を考慮するリランカーで、`--rerank-mmr-lambda <0..1>`（既定 0.5。範囲外・不正な書式は起動
+//! エラー。`mmr` 以外での指定も拒否）で関連度と多様性を釣り合わせる。`cross_encoder`（Issue #2144）は
+//! `--rerank-model`／`--rerank-tokenizer`（必須）と `--rerank-timeout-ms`（`1..=60000`、既定
+//! 1000。超過時は検索を拒否せずリランキング前の順位へ縮退）を伴い、engine の `cross-encoder`
+//! feature 付きビルド（`--features engine/cross-encoder`）でのみ受理する。語彙外・範囲外・非数値・
+//! 重複指定・`off` のままの `--rerank-window` も fail-closed で起動エラー。リランカーの契約違反は
+//! 検索を拒否せずリランキング前の順位で応答し、縮退は実行ログとカウンタに残る。解決は
+//! `wire_server::rerank_opt::resolve` に一本化し、`EngineCore::with_rerank` へ 1 回だけ注入する
+//! （`docs/design/rerank-wiring-policy.md` 参照）。
+//!
+//! `--english-stemmer`（Issue #2129 Phase A・SEARCH-16 ポインタ）: 依存の承認と engine の
+//! feature 有効化の前は未提供。値の有無にかかわらず固定文言で起動エラーにする
+//! （`wire_server::english_stemmer_opt`。`docs/design/stemming-crate-adoption.md` 参照）。
+//!
 //! `--require-where-for-dml`（Issue #2210・SQL-36 ポインタ）: 値を取らないスイッチ。
 //! 指定すると `WHERE` 省略の SQL `UPDATE`／`DELETE` を変更開始前に `42601` で拒否する
 //! （明示した述語は受理。MySQL の `sql_safe_updates` 相当）。重複指定・`=` 連結形・後続の値は
@@ -549,6 +584,8 @@ fn run_server(args: &[String]) -> ExitCode {
     let mut max_regex_pattern_len_raw: Option<String> = None;
     let mut max_regex_input_len_raw: Option<String> = None;
     let mut max_regex_compiled_size_raw: Option<String> = None;
+    let mut max_text_query_terms_raw: Option<String> = None;
+    let mut max_text_query_prefix_expansions_raw: Option<String> = None;
     let mut max_sparsevec_nnz_raw: Option<String> = None;
     let mut max_ts_headline_bytes_raw: Option<String> = None;
     let mut max_ts_headline_fragments_raw: Option<String> = None;
@@ -585,6 +622,14 @@ fn run_server(args: &[String]) -> ExitCode {
     let mut ddl_allowed_users_raw: Option<String> = None;
     let mut auth_method_raw: Option<String> = None;
     let mut scram_mock_key_file_raw: Option<PathBuf> = None;
+    let mut stopwords_file_raw: Option<PathBuf> = None;
+    let mut synonyms_file_raw: Option<PathBuf> = None;
+    let mut reranker_raw: Option<String> = None;
+    let mut rerank_window_raw: Option<String> = None;
+    let mut rerank_model_raw: Option<PathBuf> = None;
+    let mut rerank_tokenizer_raw: Option<PathBuf> = None;
+    let mut rerank_timeout_raw: Option<String> = None;
+    let mut rerank_mmr_lambda_raw: Option<String> = None;
     let mut tls_cert_raw: Option<PathBuf> = None;
     let mut tls_key_raw: Option<PathBuf> = None;
     let mut tls_mode_raw: Option<String> = None;
@@ -1157,6 +1202,46 @@ fn run_server(args: &[String]) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
                 max_regex_compiled_size_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::text_query_limits_opt::MAX_TEXT_QUERY_TERMS_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::text_query_limits_opt::MAX_TEXT_QUERY_TERMS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #2115: 他の起動時構成フラグと同じく 2 回目以降の指定を
+                // fail-closed に拒否する（last-wins にしない）。
+                if max_text_query_terms_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::text_query_limits_opt::MAX_TEXT_QUERY_TERMS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                max_text_query_terms_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::text_query_limits_opt::MAX_TEXT_QUERY_PREFIX_EXPANSIONS_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::text_query_limits_opt::MAX_TEXT_QUERY_PREFIX_EXPANSIONS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #2115: 他の起動時構成フラグと同じく 2 回目以降の指定を
+                // fail-closed に拒否する（last-wins にしない）。
+                if max_text_query_prefix_expansions_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::text_query_limits_opt::MAX_TEXT_QUERY_PREFIX_EXPANSIONS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                max_text_query_prefix_expansions_raw = Some(v.clone());
                 i += 2;
             }
             wire_server::sparsevec_limits_opt::MAX_SPARSEVEC_NNZ_FLAG => {
@@ -1885,6 +1970,156 @@ fn run_server(args: &[String]) -> ExitCode {
                 scram_mock_key_file_raw = Some(PathBuf::from(v));
                 i += 2;
             }
+            wire_server::text_analysis_opt::STOPWORDS_FILE_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a path argument",
+                        wire_server::text_analysis_opt::STOPWORDS_FILE_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // 起動後に変更できない構成値のため、2 回目以降の指定は fail-closed で拒否する
+                // （last-wins にしない。Issue #2130）。
+                if stopwords_file_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::text_analysis_opt::STOPWORDS_FILE_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                stopwords_file_raw = Some(PathBuf::from(v));
+                i += 2;
+            }
+            wire_server::text_analysis_opt::SYNONYMS_FILE_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a path argument",
+                        wire_server::text_analysis_opt::SYNONYMS_FILE_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // 起動後に変更できない構成値のため、2 回目以降の指定は fail-closed で拒否する
+                // （last-wins にしない。Issue #2130）。
+                if synonyms_file_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::text_analysis_opt::SYNONYMS_FILE_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                synonyms_file_raw = Some(PathBuf::from(v));
+                i += 2;
+            }
+            wire_server::rerank_opt::RERANKER_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires an argument",
+                        wire_server::rerank_opt::RERANKER_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // 起動後に変更できない構成値のため、2 回目以降の指定は fail-closed で拒否する
+                // （last-wins にしない。Issue #2142）。
+                if reranker_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::rerank_opt::RERANKER_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                reranker_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::rerank_opt::RERANK_WINDOW_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires an integer argument",
+                        wire_server::rerank_opt::RERANK_WINDOW_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                if rerank_window_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::rerank_opt::RERANK_WINDOW_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                rerank_window_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::rerank_opt::RERANK_MODEL_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a path argument",
+                        wire_server::rerank_opt::RERANK_MODEL_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                if rerank_model_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::rerank_opt::RERANK_MODEL_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                rerank_model_raw = Some(PathBuf::from(v));
+                i += 2;
+            }
+            wire_server::rerank_opt::RERANK_TOKENIZER_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a path argument",
+                        wire_server::rerank_opt::RERANK_TOKENIZER_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                if rerank_tokenizer_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::rerank_opt::RERANK_TOKENIZER_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                rerank_tokenizer_raw = Some(PathBuf::from(v));
+                i += 2;
+            }
+            wire_server::rerank_opt::RERANK_TIMEOUT_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires an integer argument",
+                        wire_server::rerank_opt::RERANK_TIMEOUT_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                if rerank_timeout_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::rerank_opt::RERANK_TIMEOUT_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                rerank_timeout_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::rerank_opt::RERANK_MMR_LAMBDA_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires an argument",
+                        wire_server::rerank_opt::RERANK_MMR_LAMBDA_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                if rerank_mmr_lambda_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::rerank_opt::RERANK_MMR_LAMBDA_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                rerank_mmr_lambda_raw = Some(v.clone());
+                i += 2;
+            }
             wire_server::tls_opt::CERT_FLAG => {
                 let Some(v) = args.get(i + 1) else {
                     engine::log_stderr!(
@@ -1987,6 +2222,15 @@ fn run_server(args: &[String]) -> ExitCode {
                 }
                 fault_inject_raw = Some(v.clone());
                 i += 2;
+            }
+            // Issue #2129 Phase A（SEARCH-16 ポインタ）。承認と feature 有効化の前は
+            // 値の有無にかかわらず値を読まず・echo せず固定文言で拒否する。
+            wire_server::english_stemmer_opt::FLAG => {
+                engine::log_stderr!(
+                    "wire-server: {}",
+                    wire_server::english_stemmer_opt::reject()
+                );
+                return ExitCode::FAILURE;
             }
             other => {
                 engine::log_stderr!("wire-server: unknown argument: {other}");
@@ -2226,6 +2470,22 @@ fn run_server(args: &[String]) -> ExitCode {
         }
     };
 
+    // Issue #2115: 全文検索クエリの項数・前方一致展開数の上限を bind・ユーザーストア読込より前に
+    // 解決する（fail-closed。範囲外・非数値は listen へ進まず起動エラー）。未指定は
+    // `TextQueryLimits::default()`＝ハード上限。
+    let text_query_limits = match wire_server::text_query_limits_opt::resolve(
+        wire_server::text_query_limits_opt::TextQueryLimitsRawFlags {
+            max_terms: max_text_query_terms_raw.as_deref(),
+            max_prefix_expansions: max_text_query_prefix_expansions_raw.as_deref(),
+        },
+    ) {
+        Ok(limits) => limits,
+        Err(e) => {
+            engine::log_stderr!("wire-server: invalid text query limit configuration: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     // Issue #2027: SPARSEVEC の非ゼロ数上限を bind・ユーザーストア読込より前に解決する
     // （fail-closed。範囲外・非数値は listen へ進まず起動エラー）。未指定は
     // `SparseVecLimits::default()`＝ハード上限。
@@ -2256,6 +2516,41 @@ fn run_server(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    // Issue #2130（SEARCH-16 ポインタ）: ストップワード・同義語のファイルを bind・ユーザーストア
+    // 読込より前に読み、検証する（fail-closed。不正・上限超過・読めないファイルは listen へ
+    // 進まず起動エラー）。未指定は恒等＝従来どおりのトークン化。
+    let text_analysis = match wire_server::text_analysis_opt::resolve(
+        wire_server::text_analysis_opt::TextAnalysisRawFlags {
+            stopwords: stopwords_file_raw.as_deref(),
+            synonyms: synonyms_file_raw.as_deref(),
+        },
+    ) {
+        Ok(a) => a,
+        Err(e) => {
+            engine::log_stderr!("wire-server: invalid text analysis configuration: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Issue #2142（SEARCH-15 ポインタ）: リランカーの方式・窓幅を bind・ユーザーストア読込より
+    // 前に解決する（fail-closed。語彙外・未対応・範囲外・`off` のままの窓幅指定は listen へ
+    // 進まず起動エラー）。未指定は off＝従来経路。
+    let rerank_settings =
+        match wire_server::rerank_opt::resolve(wire_server::rerank_opt::RerankRawFlags {
+            reranker: reranker_raw.as_deref(),
+            window: rerank_window_raw.as_deref(),
+            model: rerank_model_raw.as_deref(),
+            tokenizer: rerank_tokenizer_raw.as_deref(),
+            timeout_ms: rerank_timeout_raw.as_deref(),
+            mmr_lambda: rerank_mmr_lambda_raw.as_deref(),
+        }) {
+            Ok(s) => s,
+            Err(e) => {
+                engine::log_stderr!("wire-server: invalid rerank configuration: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
 
     // Issue #1552: サブクエリ深さ・実行回数・CTE 定義数・CTE 連鎖深さの上限を bind・
     // ユーザーストア読込より前に解決する（fail-closed。範囲外・非数値は listen へ進まず
@@ -2903,12 +3198,20 @@ fn run_server(args: &[String]) -> ExitCode {
     // Issue #1786: 未指定でも常に呼ぶ（`regex_limits` は既定まで解決済み。既定は
     // ハード上限と同値）。SQL 表層からの利用は Issue #1787 以降。
     core = core.with_regex_limits(regex_limits);
+    // Issue #2115: 未指定でも常に呼ぶ（既定はハード上限と同値）。SQL／NoSQL 表層からの
+    // 読み出しは Issue #2116 以降。
+    core = core.with_text_query_limits(text_query_limits);
     // Issue #2027: 未指定でも常に呼ぶ（`sparsevec_limits` は既定まで解決済み。既定は
     // ハード上限と同値で、未注入と挙動が同一）。
     core = core.with_sparsevec_limits(sparsevec_limits);
     // Issue #2125: 未指定でも常に呼ぶ（`headline_limits` は既定まで解決済み。既定は
     // ハード上限と同値で、未注入と挙動が同一）。
     core = core.with_headline_limits(headline_limits);
+    // Issue #2130: 疎検索のストップワード・同義語（セッション・SQL からは変更できない）。
+    core = core.with_text_analysis(text_analysis);
+    // Issue #2142: リランカー（セッション・SQL・NoSQL からは変更できない）。未指定でも常に
+    // 呼ぶ（既定は off で、未注入と挙動が同一）。
+    core = core.with_rerank(rerank_settings);
     // Issue #1552: 未指定でも常に呼ぶ（`nesting_limits` は既定まで解決済み。既定は
     // ハード上限と同値で、未注入と挙動が同一）。
     core = core.with_nesting_limits(nesting_limits);

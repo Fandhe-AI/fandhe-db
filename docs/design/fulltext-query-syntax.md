@@ -26,7 +26,7 @@
 | 項目 | 現状 |
 | ---- | ---- |
 | トークナイザ | ASCII 単語＋CJK ユニグラム／バイグラム。CJK ストップワードのユニグラムは除去（[cjk-stopword-tokenizer.md](cjk-stopword-tokenizer.md)） |
-| posting | `Vec<Vec<(u32 doc_idx, u32 tf)>>`。位置を持たない |
+| posting | `Vec<Vec<(u32 doc_idx, u32 tf)>>`。位置は並列の `positions`（Issue #2114）が持つ（[sparse-inverted-index.md](sparse-inverted-index.md)） |
 | 語彙 | `TermDictionary` は `HashMap<String, TermId>`。順序付き範囲走査ができない |
 | クエリ上限 | `MAX_QUERY_BYTES`・`MAX_QUERY_TERMS` を `validate_query_bounds` で検証し、超過は `Err`（fail-closed） |
 | エラー写像 | `map_hybrid_error` は `TooManyQueryTerms`・`QueryTooLong` を `invalid_input`（22000）へ写す |
@@ -83,8 +83,9 @@
 - CJK 連続 n 文字（n ≥ 2）のフレーズは、バイグラム b1..b(n-1) が位置 p, p+1, …, p+n-2 に連続して現れることで一致とする。1 文字のフレーズはユニグラム一致
 - フレーズ内のストップワード（`"東京の店"`）は、ユニグラムが除去されてもそれを含むバイグラム（`京の`・`の店`）が残るので一致できる。
   ASCII と CJK の混在、およびストップワード 1 文字が単独の単位になる場合は、その位置を任意の 1 単位に一致する穴として扱う（PG がフレーズ内のストップワードを距離で数えるのと同じ考え方）
+- 必須トークン規則（Issue #2114 の実装。`sparse/phrase.rs`）: ASCII 単語はその語、長さ 2 以上の CJK の連続はバイグラムだけ（並び中のユニグラムは使わない）、バイグラムに含まれない CJK 1 文字はユニグラム、単独で抑止されたストップワード文字は穴（位置を消費し任意の 1 単位に一致）。先頭と末尾の穴は落とし、最初の必須トークンからの相対位置に正規化する。`"cafe の 東京"` は `cafe@0, 東京@2`
 - 区切り文字をまたぐ場合（`東京・都`）はバイグラムが生成されないので `"東京都"` に一致しない。既知の制約
-- 空白を含む CJK（`"東京 都"`）も同じ tokenizer の結果で判定する（SEARCH-11 ポインタとの整合）
+- 空白を含む CJK（`"東京 都"`）も同じ tokenizer の結果で判定する（SEARCH-11 ポインタとの整合）。区切りは位置を消費しないため、この規則では `東京@0, 都@2` となり、文書 `東京都`（位置 2 に `都` のユニグラムがある）と `東京・都` に一致する。実装でこの帰結を固定した
 - 除外語が CJK の複数文字なら上記のフレーズ一致による除外とする。トークンを 1 つでも含む文書を除外すると、`-東京` が `東` や `京` を含む文書をすべて落とすため避ける
 - CJK に付けた前方一致は何もしない（`*` を外す）。ユニグラム＋バイグラムで部分文字列一致がすでに成り立つため。展開語数にも数えない
 
@@ -106,15 +107,16 @@
 
 ### D6 前方一致の展開
 
-- 展開には順序付き語彙（`BTreeMap` かソート済み補助配列）の範囲走査を使う。`HashMap` の `TermDictionary` を変えるか補助索引を足すかは #2115 で決め、世代キャッシュ（[sparse-index-cache.md](sparse-index-cache.md)）の無効化経路に従う
+- 展開には順序付き語彙の範囲走査を使う。**決定（#2115）**: `HashMap` の `TermDictionary` は変えず、先頭が ASCII 単語文字の語だけを昇順に持つ補助索引 `prefix_vocab`（`Vec<(Box<str>, TermId)>`）を足した。CJK の前方一致はパーサが通常語へ落とす（D4）ため対象外。索引と同寿命なので世代キャッシュ（[sparse-index-cache.md](sparse-index-cache.md)）のキー・無効化経路は変えない。語幹の範囲の和集合を 1 回だけ走査して可視 df を判定する（語幹の数に比例して走査が増えない）
 - 展開語数は、可視集合で df > 0 の語だけで数える。語彙はテナントをまたいで共有されるため、全体語彙で数えると上限超過の有無から他テナントの語の存在を推測できる（RLS のサイドチャネル）
 - 走査コストは語彙サイズの上限（`MAX_CORPUS_TOKENS` 等）で有界
 - 時間差のサイドチャネルは既知の制約として記録する
 
 ### D7 上限とエラー契約
 
+- フレーズの必須トークン数には、データに依存しない定数 `MAX_PHRASE_REQUIRED_TOKENS`（暫定 64。Issue #2114）を置く。超過は切り詰めず `PhraseError::PatternTooLong` で拒否する（同じ語の繰り返しで位置の照合が `必須トークン数 × MAX_CORPUS_TOKENS` まで膨らむのを防ぐ）。`54000` への写像は #2115 で実装した（CLI 化はしない。[text-query-limits-cli.md](text-query-limits-cli.md) の D7）
 - 上限は 2 種類: (a) 1 つの検索語の項の数、(b) 前方一致の展開後の語の数。どちらも既定値と CLI フラグを持つ。既定値を「上限なし」にしない
-- フラグ名は既存の `*_limits_opt.rs` の `--max-…` 形式に揃える（例: `--max-text-query-terms`・`--max-text-query-prefix-expansions`。最終名は #2115 で決める）
+- フラグ名は既存の `*_limits_opt.rs` の `--max-…` 形式に揃える（#2115 で `--max-text-query-terms`・`--max-text-query-prefix-expansions` に確定。既定値・範囲は [text-query-limits-cli.md](text-query-limits-cli.md)）
 - 新設する上限（(a)(b)）の超過は `54000` で拒否する。一部の語だけで黙って検索しない
 - 既存の `MAX_QUERY_BYTES`・`MAX_QUERY_TERMS`（入口の `validate_query_bounds`）の超過は、現状の `map_hybrid_error` どおり `invalid_input`（22000）のまま変えない。既存の呼び出し元の契約と、演算子を含まない入力の後方互換（D8）を保つため。22000 を 54000 へ移すかは本書では決めず、#2115・#2116 の未決事項とする
 - `MAX_QUERY_BYTES`・`MAX_QUERY_TERMS` はパーサの入口でも引き継ぐ（#2113）
@@ -126,11 +128,16 @@
 - 単独の語 `or` を含む入力は、演算子として認識されるか捨てられるかを問わず後方互換の対象外とする（従来の tokenizer が生成していた語 `or` は残らない）。`or` を語として検索するには引用符で囲む（D1）
 - 演算子を意図していなくても結果が変わる入力: 先頭の `-5`、空白の後の `-x`、単独の語 `or`（`or`・`or a`・`a or` のように捨てられる位置を含む）、語末の `*`、閉じていない `"`
 - #2111 の「同一結果」の基準は上の定義の範囲で検証する
+- 実装（#2116）: `hybrid::hybrid_search_with_text_query`（`pub(crate)`）が疎側だけを `score_text_query_within` に差し替える。公開の `hybrid_search`／`hybrid_search_boosted`／`hybrid_search_with_bm25` は構文を解釈せず意味・結果とも不変。演算子を含まない検索語の一致は単体テスト（`hybrid::tests`）と結合テストで固定した
+- 縮退経路の挙動変更（#2116）: 可視行に本文が 1 件もなく疎索引を作れない文でも、データに依存しない検査（バイト長・一意語数 `22000`、項数・フレーズ長 `54000`）は行う。結果が表の内容次第で受理／拒否に変わらないようにするため（fail-closed）。従来は成功していた上限超過の検索語がこの経路で拒否される。展開数（データ依存）は可視集合が空なら評価されない
 
 ### D9 USING PLAN の経路
 
 - `expanded_query_text` は LLM 出力の `search_terms` を疎側の検索語へ連結する。ここに構文を適用すると、出力中の `-` や `"` で意味が変わり、プロンプトインジェクションでフィルタを操作できる
 - 既定ではこの経路に構文を適用せず、すべて通常語（リテラル）として扱う。EXPLAIN の `search_terms` への反映は #2116 へ申し送る
+- 実装（#2116）: `BoundStatement` の crate 内部フィールド `hybrid_text_syntax`（`WebSearch`／`Literal`）で切り替える。SQL の `HYBRID` と NoSQL の `hybrid.text` は既定の `WebSearch`、`USING PLAN`（`sql::using_plan::bind_expansion`）と NoSQL の `plan` 検索（`core.rs`）は `Literal` で、`Literal` は従来の `hybrid_search_with_bm25`（構文を解釈しない）を呼ぶ。公開 enum `Ranking::Hybrid` にはフィールドを足さない
+- EXPLAIN の判断（#2116）: `search_terms[i]` 行は `USING PLAN` の EXPLAIN にだけ出る。`USING PLAN` の疎側は `search_terms` を literal として実行するため、行に出る語の並びがそのまま実行時の解釈であり、構文の解釈結果を示す行は出さない（EXPLAIN の出力は 1 バイトも変えない）。構文の解釈結果を示す新しい行は新しい安定契約になるため、オーナー判断が要る将来の候補として残す
+- 上限の配線（#2116）: `TextQueryLimits` は `EngineCore::run_select_plan` から `sql::exec` へ引数で明示的に渡す（暗黙のスレッドローカルにしない。張り忘れによる既定値への fail-open を避ける）
 
 ### D10 近接演算子
 
@@ -173,9 +180,9 @@ D8 のとおり。演算子を含まない入力の結果は従来と一致し�
 | Issue | 申し送り |
 | ----- | -------- |
 | #2113 | 木の形（グループ、フィルタ／任意語／除外／前方一致の各ノード）・D1／D3 の字句規則・線形時間・上限の引き継ぎ（D7 の上限検証を通過した入力では構文不正でエラーにしない。上限超過は検証側で Err） |
-| #2114 | D4 の位置モデル・メモリ増の実測記録・世代キャッシュの経路 |
-| #2115 | D2／D5／D6／D7（順序付き語彙、可視 df による展開数の計数、54000 への写像、CLI 名、同点は id 昇順の決定性） |
-| #2116 | D8／D9・SQL と NoSQL のパリティ・EXPLAIN の `search_terms` |
+| #2114 | D4 の位置モデル・メモリ増の実測記録・世代キャッシュの経路（実装済み。実測は [sparse-inverted-index.md](sparse-inverted-index.md) の「位置付き posting」。キャッシュのキー・無効化は無変更） |
+| #2115 | D2／D5／D6／D7（実装済み。評価は `sparse::text_eval`、上限は `text_query_limits`。順序付き語彙、可視 df による展開数の計数、54000 への写像、CLI 名、同点は id 昇順の決定性。ADR の 22000／54000 の移管は未決のまま） |
+| #2116 | D8／D9・SQL と NoSQL のパリティ・EXPLAIN の `search_terms`（実装済み。SQL／NoSQL の疎側は構文を解釈、`USING PLAN` は literal、EXPLAIN は無変更。22000／54000 の移管は未決のまま） |
 
 ## 9. スコープ外
 

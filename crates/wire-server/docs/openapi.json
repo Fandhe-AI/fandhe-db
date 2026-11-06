@@ -501,12 +501,46 @@
       "hybrid": {
         "additionalProperties": false,
         "properties": {
+          "b": {
+            "type": "number"
+          },
+          "explain_score": {
+            "type": "boolean"
+          },
+          "k1": {
+            "type": "number"
+          },
+          "rrf_k": {
+            "type": "number"
+          },
           "text": {
             "type": "string"
+          },
+          "weights": {
+            "$ref": "#/components/schemas/hybrid_weights"
+          },
+          "window": {
+            "type": "number"
           }
         },
         "required": [
           "text"
+        ],
+        "type": "object"
+      },
+      "hybrid_weights": {
+        "additionalProperties": false,
+        "properties": {
+          "dense": {
+            "type": "number"
+          },
+          "sparse": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "dense",
+          "sparse"
         ],
         "type": "object"
       },

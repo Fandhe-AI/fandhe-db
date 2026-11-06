@@ -69,6 +69,13 @@ fn wire_scoped_ctx(tenant: &str) -> PolicyContext {
 /// `[1,0]` に対する cosine 距離: id1=0／id2=1／id3=2）＋ tenant-b の
 /// `Private` 行（id=12。クエリベクトルと完全一致で RLS 境界の対照に使う）。
 fn new_core_seed() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
+    new_core_seed_with_limits(None)
+}
+
+/// [`new_core_seed`] に全文検索クエリ上限（Issue #2116・`--max-text-query-*` 相当）を注入できる版。
+fn new_core_seed_with_limits(
+    limits: Option<engine::text_query_limits::TextQueryLimits>,
+) -> (Arc<EngineCore>, temp_db::CleanupGuard) {
     let path = temp_db::unique_db_path("nosql2-search-docs");
     let guard = temp_db::CleanupGuard(path.clone());
     let storage = Storage::open(&path).expect("open storage");
@@ -138,7 +145,10 @@ fn new_core_seed() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
     )
     .expect("insert private row");
 
-    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let mut core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    if let Some(l) = limits {
+        core = core.with_text_query_limits(l);
+    }
     (Arc::new(core), guard)
 }
 
@@ -409,6 +419,117 @@ fn hybrid_matches_sql_order_by_hybrid() {
         "SELECT id FROM docs ORDER BY HYBRID(embedding, '[1.0,0.0]', body, 'alpha') LIMIT 3",
     );
     assert_eq!(body_utf8(&resp), oracle);
+}
+
+/// Issue #2116・SEARCH-12 ポインタ: 検索語の構文（フレーズ・除外・前方一致・`or`）の結果が、
+/// 同じ文字列を渡した SQL `HYBRID` と応答本文でバイト一致する（SQL と NoSQL のパリティ）。
+#[test]
+fn hybrid_text_syntax_matches_sql_for_each_operator() {
+    let (core, _guard) = new_core_seed();
+    let addr = spawn(Arc::clone(&core));
+
+    // (JSON に入れる検索語, SQL リテラルに入れる同じ文字列)
+    for (json_text, sql_text) in [
+        ("alpha content", "alpha content"),
+        ("content -alpha", "content -alpha"),
+        ("\\\"alpha content\\\"", "\"alpha content\""),
+        ("alp*", "alp*"),
+        ("alpha or beta", "alpha or beta"),
+        ("-alpha", "-alpha"),
+    ] {
+        let body = format!(
+            r#"{{"op":"search","table":"docs","vector":[1.0,0.0],"limit":3,
+            "columns":["id"],"hybrid":{{"text":"{json_text}"}}}}"#
+        );
+        let resp = query_as_alice(addr, body.as_bytes());
+        assert_eq!(resp.status, 200, "text={sql_text} resp={resp:?}");
+        let oracle = sql_oracle_body(
+            &core,
+            "tenant-a",
+            &format!(
+                "SELECT id FROM docs ORDER BY HYBRID(embedding, '[1.0,0.0]', body, '{sql_text}') LIMIT 3"
+            ),
+        );
+        assert_eq!(body_utf8(&resp), oracle, "text={sql_text}");
+    }
+}
+
+/// Issue #2116: 項数・展開数の上限超過（`54000`）と既存の長さ上限（`22000`）が、SQL と同じ
+/// `wire_code` で返る。`explain: true` の出力は構文の有無で変わらない（EXPLAIN は不変）。
+#[test]
+fn hybrid_text_syntax_limit_errors_match_sql_codes_and_explain_is_unchanged() {
+    let (core, _guard) =
+        new_core_seed_with_limits(Some(engine::text_query_limits::TextQueryLimits::new(1, 1)));
+    let addr = spawn(Arc::clone(&core));
+
+    // 項数超過（上限 1 に対して 2 語）。SQL と同じ `54000`。
+    let body = br#"{"op":"search","table":"docs","vector":[1.0,0.0],"limit":3,
+        "hybrid":{"text":"alpha beta"}}"#;
+    let resp = query_as_alice(addr, body);
+    assert_eq!(http_common::wire_code_of(&resp), "54000", "resp={resp:?}");
+    let sql_code = sql_oracle_err(
+        &core,
+        "tenant-a",
+        "SELECT id FROM docs ORDER BY HYBRID(embedding, '[1.0,0.0]', body, 'alpha beta') LIMIT 3",
+    );
+    assert_eq!(sql_code, "54000");
+
+    // 上限内の検索語では `explain: true` が成功し、構文記号の有無で応答が変わらない。
+    let plain = br#"{"op":"search","table":"docs","vector":[1.0,0.0],"limit":3,"explain":true,
+        "hybrid":{"text":"alpha"}}"#;
+    let syntax = br#"{"op":"search","table":"docs","vector":[1.0,0.0],"limit":3,"explain":true,
+        "hybrid":{"text":"alpha -"}}"#;
+    let a = query_as_alice(addr, plain);
+    let b = query_as_alice(addr, syntax);
+    assert_eq!(a.status, 200, "resp={a:?}");
+    assert_eq!(body_utf8(&a), body_utf8(&b));
+}
+
+/// SEARCH-17 (4)・Issue #2137: `explain_score: true` は SQL の `hybrid_*()` 投影とバイト単位で
+/// 一致し、省略・`false` は従来の応答と同一。
+#[test]
+fn hybrid_explain_score_matches_sql_projection_and_default_is_unchanged() {
+    let (core, _guard) = new_core_seed();
+    let addr = spawn(Arc::clone(&core));
+
+    let body = br#"{"op":"search","table":"docs","vector":[1.0,0.0],"limit":3,
+        "columns":["id"],"hybrid":{"text":"alpha","explain_score":true}}"#;
+    let resp = query_as_alice(addr, body);
+    assert_eq!(resp.status, 200, "resp={resp:?}");
+    let oracle = sql_oracle_body(
+        &core,
+        "tenant-a",
+        "SELECT id, hybrid_dense_rank(), hybrid_sparse_rank(), hybrid_score() FROM docs \
+         ORDER BY HYBRID(embedding, '[1.0,0.0]', body, 'alpha') LIMIT 3",
+    );
+    assert_eq!(body_utf8(&resp), oracle);
+
+    let plain = br#"{"op":"search","table":"docs","vector":[1.0,0.0],"limit":3,
+        "columns":["id"],"hybrid":{"text":"alpha"}}"#;
+    let off = br#"{"op":"search","table":"docs","vector":[1.0,0.0],"limit":3,
+        "columns":["id"],"hybrid":{"text":"alpha","explain_score":false}}"#;
+    assert_eq!(
+        body_utf8(&query_as_alice(addr, plain)),
+        body_utf8(&query_as_alice(addr, off))
+    );
+}
+
+/// SEARCH-17 (4): 表に同名の列が無くても `columns` 省略（全列）で動き、型違反は 42601 系で拒否される。
+#[test]
+fn hybrid_explain_score_with_all_columns_and_bad_type() {
+    let (core, _guard) = new_core_seed();
+    let addr = spawn(Arc::clone(&core));
+
+    let all = br#"{"op":"search","table":"docs","vector":[1.0,0.0],"limit":3,
+        "hybrid":{"text":"alpha","explain_score":true}}"#;
+    let resp = query_as_alice(addr, all);
+    assert_eq!(resp.status, 200, "resp={resp:?}");
+    assert!(body_utf8(&resp).contains("hybrid_score"));
+
+    let bad = br#"{"op":"search","table":"docs","vector":[1.0,0.0],"limit":3,
+        "columns":["id"],"hybrid":{"text":"alpha","explain_score":1}}"#;
+    let resp = query_as_alice(addr, bad);
+    assert_ne!(resp.status, 200, "resp={resp:?}");
 }
 
 /// SQL-12: `mode: recall`（明示）は SQL `USING MODE 'recall'` と一致する。
@@ -965,4 +1086,85 @@ fn search_over_a_bit_only_table_is_rejected_with_0a000() {
     let body = br#"{"op":"search","table":"bits","vector":[1.0,0.0],"limit":3,"columns":["id"]}"#;
     let resp = query_as_alice(addr, body);
     assert_eq!(http_common::wire_code_of(&resp), "0A000", "resp={resp:?}");
+}
+
+// --- hybrid 調整キー（Issue #2122・NOSQL-2・SEARCH-13 ポインタ） ---
+
+/// 調整キー全指定の NoSQL `search` が SQL `HYBRID(..., name => value)` と応答本文で
+/// バイト一致し、`explain: true` も受理される。
+#[test]
+fn hybrid_tuning_keys_match_sql_named_args() {
+    let (core, _guard) = new_core_seed();
+    let addr = spawn(Arc::clone(&core));
+
+    let body = br#"{"op":"search","table":"docs","vector":[1.0,0.0],"limit":3,
+        "columns":["id"],"hybrid":{"text":"alpha","k1":1.5,"b":0.5,"rrf_k":30,"window":10,
+        "weights":{"dense":0.5,"sparse":2}}}"#;
+    let resp = query_as_alice(addr, body);
+    assert_eq!(resp.status, 200, "resp={resp:?}");
+    let oracle = sql_oracle_body(
+        &core,
+        "tenant-a",
+        "SELECT id FROM docs ORDER BY HYBRID(embedding, '[1.0,0.0]', body, 'alpha', \
+         k1 => 1.5, b => 0.5, rrf_k => 30, window => 10, \
+         weights => '{\"dense\":0.5,\"sparse\":2}') LIMIT 3",
+    );
+    assert_eq!(body_utf8(&resp), oracle);
+    // RLS: tenant-b の Private 行（id=12）は調整値によらず tenant-a に現れない。
+    assert!(!body_utf8(&resp).contains("12"), "{}", body_utf8(&resp));
+
+    let explain = br#"{"op":"search","table":"docs","vector":[1.0,0.0],"limit":3,"explain":true,
+        "hybrid":{"text":"alpha","k1":1.5,"window":10}}"#;
+    let resp = query_as_alice(addr, explain);
+    assert_eq!(resp.status, 200, "resp={resp:?}");
+}
+
+/// 範囲外・実行時検査の拒否が SQL と同じ `wire_code`（`22000`／`0A000`）になる。
+#[test]
+fn hybrid_tuning_rejections_match_sql_codes() {
+    let (core, _guard) = new_core_seed();
+    let addr = spawn(Arc::clone(&core));
+
+    // window < limit は engine の check_bound_search（22000）。SQL と同じコード。
+    let body = br#"{"op":"search","table":"docs","vector":[1.0,0.0],"limit":3,
+        "hybrid":{"text":"alpha","window":2}}"#;
+    let resp = query_as_alice(addr, body);
+    assert_eq!(http_common::wire_code_of(&resp), "22000", "resp={resp:?}");
+    let sql_code = sql_oracle_err(
+        &core,
+        "tenant-a",
+        "SELECT id FROM docs ORDER BY HYBRID(embedding, '[1.0,0.0]', body, 'alpha', window => 2) \
+         LIMIT 3",
+    );
+    assert_eq!(sql_code, "22000");
+
+    // window と precision の併用は 0A000。
+    let body = br#"{"op":"search","table":"docs","vector":[1.0,0.0],"limit":3,"mode":"precision",
+        "hybrid":{"text":"alpha","window":10}}"#;
+    let resp = query_as_alice(addr, body);
+    assert_eq!(http_common::wire_code_of(&resp), "0A000", "resp={resp:?}");
+
+    // k1 の数値安全上限超えは 22000。
+    let body = br#"{"op":"search","table":"docs","vector":[1.0,0.0],"limit":3,
+        "hybrid":{"text":"alpha","k1":1e201}}"#;
+    let resp = query_as_alice(addr, body);
+    assert_eq!(http_common::wire_code_of(&resp), "22000", "resp={resp:?}");
+
+    // 範囲外の値は 22000、形の不正・未知キーは 42601。
+    for (extra, code) in [
+        (r#""k1":-1"#, "22000"),
+        (r#""b":1.5"#, "22000"),
+        (r#""rrf_k":0"#, "22000"),
+        (r#""weights":{"dense":0,"sparse":0}"#, "22000"),
+        (r#""window":1.5"#, "42601"),
+        (r#""k1":"x""#, "42601"),
+        (r#""weights":{"dense":1}"#, "42601"),
+        (r#""k2":1"#, "42601"),
+    ] {
+        let body = format!(
+            r#"{{"op":"search","table":"docs","vector":[1.0,0.0],"limit":3,"hybrid":{{"text":"alpha",{extra}}}}}"#
+        );
+        let resp = query_as_alice(addr, body.as_bytes());
+        assert_eq!(http_common::wire_code_of(&resp), code, "{extra}: {resp:?}");
+    }
 }
