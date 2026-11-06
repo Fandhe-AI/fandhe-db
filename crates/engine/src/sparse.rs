@@ -95,8 +95,11 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::PoisonError;
+
+pub use analysis::TextAnalysis;
 
 /// 文書 ID。[`SparseIndex`] は呼び出し側が割り当てた ID をそのまま透過的に扱う。
 pub type DocId = u64;
@@ -165,6 +168,7 @@ impl Default for Bm25Params {
     }
 }
 
+pub mod analysis;
 pub mod match_span;
 pub mod phrase;
 pub mod text_query;
@@ -852,13 +856,41 @@ where
     }
 }
 
+/// [`walk_tokens_positioned`]（ストップワード除去 ON）の emit にテキスト処理設定
+/// （[`TextAnalysis`]。Issue #2130）をかけたもの。同義語の置き換えは範囲・位置を保ち、
+/// ストップワードは出力だけを落とす（位置は walker 側で消費済みのため欠けになる）。
+/// 設定が空なら素通しで、[`walk_tokens_positioned`] と完全に同じ出力になる。
+pub(crate) fn walk_analyzed_tokens_positioned<F>(text: &str, analysis: &TextAnalysis, mut emit: F)
+where
+    F: FnMut(&str, std::ops::Range<usize>, u32) -> bool,
+{
+    if analysis.is_empty() {
+        walk_tokens_positioned(text, true, emit);
+        return;
+    }
+    walk_tokens_positioned(text, true, |token, span, pos| match analysis.apply(token) {
+        Some(t) => emit(t, span, pos),
+        None => true,
+    });
+}
+
+/// 設定付きのトークン列（クエリ側。索引が持つ設定を渡す契約）。
+pub(crate) fn tokenize_analyzed(text: &str, analysis: &TextAnalysis) -> Vec<String> {
+    let mut tokens: Vec<String> = Vec::with_capacity(text.chars().count());
+    walk_analyzed_tokens_positioned(text, analysis, |token, _span, _pos| {
+        tokens.push(token.to_owned());
+        true
+    });
+    tokens
+}
+
 /// 文書をトークン列と位置列へ同時に分割する（Issue #2114）。`with_params` の索引構築専用で、
 /// ストップワード除去 ON の [`tokenize`] と同一のトークン列に、各トークンの位置を並べる。
-fn tokenize_positioned(text: &str) -> (Vec<String>, Vec<u32>) {
+fn tokenize_positioned(text: &str, analysis: &TextAnalysis) -> (Vec<String>, Vec<u32>) {
     let cap = text.chars().count();
     let mut tokens: Vec<String> = Vec::with_capacity(cap);
     let mut positions: Vec<u32> = Vec::with_capacity(cap);
-    walk_tokens_positioned(text, true, |token, _span, pos| {
+    walk_analyzed_tokens_positioned(text, analysis, |token, _span, pos| {
         tokens.push(token.to_owned());
         positions.push(pos);
         true
@@ -947,6 +979,10 @@ pub struct SparseIndex {
     /// 枯渇した場合は [`Self::acquire_scratch`] が新規確保へフォールバックする
     /// ため正当性には影響しない）。
     scratch_pool: Mutex<Vec<ScoreScratch>>,
+    /// 構築時に固定したテキスト処理設定（Issue #2130）。クエリ側のトークン化にも同じ
+    /// 設定を使うことで、索引とクエリの非対称を構造的に作れなくする。共有の `Arc` は
+    /// 索引ごとの所有ではないため [`Self::approx_heap_bytes`] には数えない。
+    analysis: Arc<TextAnalysis>,
 }
 
 /// [`SparseIndex::search_within`] が可視集合（`visible_ids`）を `doc_idx` 空間の
@@ -1244,6 +1280,20 @@ impl SparseIndex {
         Self::with_params(docs, DEFAULT_K1, DEFAULT_B)
     }
 
+    /// [`Self::build`] にテキスト処理設定（ストップワード・同義語。Issue #2130）を固定した版。
+    /// 以降のクエリ側のトークン化にも同じ設定が使われる。
+    pub fn build_with_analysis(
+        docs: &[(DocId, &str)],
+        analysis: Arc<TextAnalysis>,
+    ) -> Result<Self, SparseError> {
+        Self::with_params_and_analysis(docs, DEFAULT_K1, DEFAULT_B, analysis)
+    }
+
+    /// 構築時に固定したテキスト処理設定の世代 ID（恒等は 0）。キャッシュ・フレーズの照合用。
+    pub fn analysis_id(&self) -> u64 {
+        self.analysis.analysis_id()
+    }
+
     /// `k1`・`b` を明示してインデックスを構築する。
     ///
     /// `k1`・`b` は構築時に検証する（有限値かつ `k1 >= 0.0`・`b` は `[0.0, 1.0]`）。
@@ -1267,6 +1317,17 @@ impl SparseIndex {
     /// 前）に、それまでのトークン数の累計を `saturating_add` で求め、
     /// [`MAX_CORPUS_TOKENS`] を超えた時点で [`SparseError::TooManyTokens`] で拒否する。
     pub fn with_params(docs: &[(DocId, &str)], k1: f64, b: f64) -> Result<Self, SparseError> {
+        Self::with_params_and_analysis(docs, k1, b, Arc::new(TextAnalysis::default()))
+    }
+
+    /// [`Self::with_params`] にテキスト処理設定を固定した版（Issue #2130）。
+    /// 設定が空なら [`Self::with_params`] と完全に同じ索引になる。
+    pub fn with_params_and_analysis(
+        docs: &[(DocId, &str)],
+        k1: f64,
+        b: f64,
+        analysis: Arc<TextAnalysis>,
+    ) -> Result<Self, SparseError> {
         if !bm25_params_in_domain(k1, b) {
             return Err(SparseError::InvalidParams { k1, b });
         }
@@ -1333,7 +1394,7 @@ impl SparseIndex {
                 });
             }
 
-            let (doc_tokens, doc_positions) = tokenize_positioned(text);
+            let (doc_tokens, doc_positions) = tokenize_positioned(text, &analysis);
             // `term_freq`/`doc_freq` の構築（トークンごとの追加ヒープ確保）に入る前に、
             // ここまでのトークン数累計を検証する（MAX_CORPUS_TOKENS のコメント参照）。
             corpus_tokens_seen = corpus_tokens_seen.saturating_add(doc_tokens.len());
@@ -1474,6 +1535,7 @@ impl SparseIndex {
             len_classes,
             doc_len_class,
             scratch_pool: Mutex::new(Vec::new()),
+            analysis,
         })
     }
 
@@ -1522,7 +1584,7 @@ impl SparseIndex {
             });
         }
 
-        let query_terms = tokenize(query);
+        let query_terms = tokenize_analyzed(query, &self.analysis);
 
         // 重複クエリ語の IDF を二重計上しないよう一意化する（順序は不問。BTreeMap で決定的に）。
         // `k == 0` の早期 return より前にここまで（バイト長・一意語数）の入力検証を
@@ -1629,7 +1691,7 @@ impl SparseIndex {
             });
         }
 
-        let query_terms = tokenize(query);
+        let query_terms = tokenize_analyzed(query, &self.analysis);
 
         let mut unique_terms: BTreeMap<String, ()> = BTreeMap::new();
         for t in &query_terms {
@@ -1755,7 +1817,7 @@ impl SparseIndex {
             });
         }
 
-        let query_terms = tokenize(query);
+        let query_terms = tokenize_analyzed(query, &self.analysis);
 
         let mut unique_terms: BTreeMap<String, ()> = BTreeMap::new();
         for t in &query_terms {
@@ -2415,6 +2477,80 @@ mod tests {
             positioned("cafe 東京"),
             p(&[("cafe", 0), ("東", 1), ("東京", 1), ("京", 2)])
         );
+    }
+
+    #[test]
+    fn analyzed_walker_with_default_analysis_equals_plain_walker() {
+        let default = TextAnalysis::default();
+        let mut seed = 0x2130_u64;
+        let alphabet: Vec<char> = "abc ABC_0 \t,.日本語はがのAbc".chars().collect();
+        for _ in 0..300 {
+            let mut text = String::new();
+            for _ in 0..40 {
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let idx = (seed >> 33) as usize % alphabet.len();
+                text.push(alphabet[idx]);
+            }
+            let mut plain = Vec::new();
+            walk_tokens_positioned(&text, true, |t, s, p| {
+                plain.push((t.to_owned(), s, p));
+                true
+            });
+            let mut analyzed = Vec::new();
+            walk_analyzed_tokens_positioned(&text, &default, |t, s, p| {
+                analyzed.push((t.to_owned(), s, p));
+                true
+            });
+            assert_eq!(plain, analyzed);
+        }
+    }
+
+    #[test]
+    fn analyzed_walker_stopword_consumes_position_and_synonym_keeps_it() {
+        let a = TextAnalysis::from_lists(Some("the"), Some("car automobile")).unwrap();
+        let mut out = Vec::new();
+        walk_analyzed_tokens_positioned("the car and 日本", &a, |t, _s, p| {
+            out.push((t.to_owned(), p));
+            true
+        });
+        assert_eq!(
+            out,
+            p(&[
+                ("automobile", 1),
+                ("and", 2),
+                ("日", 3),
+                ("日本", 3),
+                ("本", 4)
+            ])
+        );
+    }
+
+    #[test]
+    fn analysis_is_symmetric_between_index_and_query() {
+        let a = Arc::new(TextAnalysis::from_lists(Some("the"), Some("car automobile")).unwrap());
+        let docs: [(DocId, &str); 3] = [(1, "an automobile"), (2, "a car"), (3, "the other thing")];
+        let idx = SparseIndex::build_with_analysis(&docs, a).unwrap();
+        for q in ["car", "automobile"] {
+            let ids: Vec<DocId> = idx
+                .search(q, 10)
+                .unwrap()
+                .iter()
+                .map(|d| d.doc_id)
+                .collect();
+            assert_eq!(ids, vec![1, 2], "{q}");
+        }
+        assert!(idx.search("the", 10).unwrap().is_empty());
+        // 既定の索引は同義語を知らない。
+        let plain = SparseIndex::build(&docs).unwrap();
+        let ids: Vec<DocId> = plain
+            .search("car", 10)
+            .unwrap()
+            .iter()
+            .map(|d| d.doc_id)
+            .collect();
+        assert_eq!(ids, vec![2]);
     }
 
     #[test]

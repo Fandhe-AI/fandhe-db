@@ -2,6 +2,7 @@
 //! 否定ケース、上限、可視集合の縮約、素朴な参照実装との一致を確かめる。
 
 use super::*;
+use crate::sparse::walk_tokens_positioned;
 use std::collections::{BTreeMap, BTreeSet};
 
 fn idx(docs: &[(DocId, &str)]) -> SparseIndex {
@@ -210,4 +211,45 @@ fn matches_naive_oracle_on_random_corpora() {
         }
         assert_eq!(ids(&index, &q), expected, "query={q:?} docs={texts:?}");
     }
+}
+
+fn analysis(stop: &str, syn: &str) -> std::sync::Arc<TextAnalysis> {
+    std::sync::Arc::new(TextAnalysis::from_lists(Some(stop), Some(syn)).unwrap())
+}
+
+#[test]
+fn analyzed_pattern_matches_across_stopword_gap_in_both_orders() {
+    let a = analysis("the", "car automobile");
+    let index = SparseIndex::build_with_analysis(
+        &[(1, "red car the road"), (2, "red car road")],
+        a.clone(),
+    )
+    .unwrap();
+    // "the" は位置を 1 つ消費して除かれるため、"red automobile the road" は文書 1 にだけ一致する。
+    let p = PhrasePattern::compile_with("red automobile the road", &a).unwrap();
+    let ids: Vec<DocId> = index
+        .phrase_matches(&p)
+        .iter()
+        .map(|h| h.doc_id())
+        .collect();
+    assert_eq!(ids, vec![1]);
+    // 同義語は索引側とクエリ側の両方で効く。
+    let p2 = PhrasePattern::compile_with("red car", &a).unwrap();
+    let ids2: Vec<DocId> = index
+        .phrase_matches(&p2)
+        .iter()
+        .map(|h| h.doc_id())
+        .collect();
+    assert_eq!(ids2, vec![1, 2]);
+}
+
+#[test]
+fn pattern_with_different_analysis_id_matches_nothing() {
+    let a = analysis("the", "car automobile");
+    let b = analysis("the", "car automobile");
+    let index = SparseIndex::build_with_analysis(&[(1, "red car road")], a).unwrap();
+    let p = PhrasePattern::compile_with("red car", &b).unwrap();
+    assert!(index.phrase_matches(&p).is_empty());
+    // 既定のパターンも設定付き索引には一致させない（fail-closed）。
+    assert!(index.phrase_matches(&pat("red car")).is_empty());
 }
