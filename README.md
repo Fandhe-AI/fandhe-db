@@ -360,6 +360,12 @@ PostgreSQL と同じく `WHERE` 省略を受理します。プロセス起動時
 NoSQL（HTTP）の `update`／`delete` は従来どおり filter 必須で、本スイッチの影響を受けません
 （`docs/design/require-where-for-dml-cli.md`）。
 
+`--stopwords-file`／`--synonyms-file`（Issue #2130）は、疎検索（BM25）のストップワード一覧・同義語辞書を
+プロセス起動時にだけ読み込む opt-in の CLI 引数です。形式・上限・処理の順序は
+`docs/design/stopword-synonym-files.md` を参照してください。不正・上限超過のファイル、値欠落、重複指定は
+fail-closed で起動エラーとなり、エラー文にファイルの中身を出しません。セッション・SQL・HTTP からは
+変更できず、未指定（既定）では従来どおりのトークン化です。
+
 `--english-stemmer`（Issue #2129）は承認と feature 有効化の前のため、値の有無にかかわらず常に起動エラーになる
 （固定文言で拒否。`docs/design/stemming-crate-adoption.md`）。
 
