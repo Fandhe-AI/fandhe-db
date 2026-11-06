@@ -279,7 +279,7 @@ impl SparseIndex {
         // 前方一致の展開（データ依存。可視集合の語だけを数える）。
         let all_stems: BTreeSet<&str> =
             plans.iter().flat_map(|p| p.stems.iter().copied()).collect();
-        let expansion = self.expand_stems(&all_stems, &bitmap);
+        let expansion = self.expand_stems(&all_stems, &bitmap, limits.max_prefix_expansions())?;
         let mut total_expansions: usize = 0;
         for p in &plans {
             for stem in &p.stems {
@@ -332,7 +332,15 @@ impl SparseIndex {
 
     /// 語幹（昇順・一意）ごとに、順序付き語彙の範囲から可視集合で df > 0 の語を求める。
     /// 範囲の和集合を 1 回だけ走査する（前方一致の範囲は入れ子か互いに素）。
-    fn expand_stems<'q>(&self, stems: &BTreeSet<&'q str>, bitmap: &VisibleBitmap) -> Expansion<'q> {
+    ///
+    /// 一意な可視展開語が `max` を超えた時点で `TooManyPrefixExpansions` を返して走査を打ち切る
+    /// （上限超過クエリで全該当語を走査・確保しない。一意数 <= 加算数なので判定は後段と整合する）。
+    fn expand_stems<'q>(
+        &self,
+        stems: &BTreeSet<&'q str>,
+        bitmap: &VisibleBitmap,
+        max: usize,
+    ) -> Result<Expansion<'q>, TextSearchError> {
         let mut visible: Vec<usize> = Vec::new();
         let mut spans: BTreeMap<&'q str, (usize, usize)> = BTreeMap::new();
         let mut scanned_to = 0usize;
@@ -344,6 +352,9 @@ impl SparseIndex {
                 if let Some(&(_, tid)) = self.prefix_vocab.get(i) {
                     if self.has_visible_posting(tid, bitmap) {
                         visible.push(i);
+                        if visible.len() > max {
+                            return Err(TextSearchError::TooManyPrefixExpansions { max });
+                        }
                     }
                 }
             }
@@ -352,7 +363,7 @@ impl SparseIndex {
             let b = visible.partition_point(|&i| i < hi);
             spans.insert(stem, (a, b));
         }
-        Expansion { visible, spans }
+        Ok(Expansion { visible, spans })
     }
 
     /// 語の posting に可視文書が 1 つでもあるか（最初のヒットで打ち切る）。
