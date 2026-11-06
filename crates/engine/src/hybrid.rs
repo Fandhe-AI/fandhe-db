@@ -61,6 +61,10 @@
 //! `docs/spec/04-behavior/extensions.md` EXT-4）: [`crate::scoring_boost`] が本モジュールの
 //! [`BoostRule`]/[`apply_soft_boost`] を一般化する（加点の意味論そのものは本モジュールへ
 //! 一元化したまま変更しない。詳細は `scoring_boost.rs` モジュールドキュメント参照）。
+//!
+//! Issue #2136（SEARCH-17・TASK-327 ポインタ。親 Issue #2135）: 融合結果 [`HybridHit`] に
+//! 系統別の実効順位（`dense_rank`・`sparse_rank`）を保持する。融合スコアと出力順は
+//! 変えない。投影（SQL・NoSQL 表層）での取り出しは別 Issue の担当である。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -91,6 +95,11 @@ pub(crate) const MAX_POOL_DEPTH: usize = 100_000;
 /// それ以上の倍増は起こらない）。可視集合が本上限以上に大きい構成でのみ、
 /// 倍増が本上限で打ち切られうる。
 pub(crate) const MAX_FETCH_K: usize = MAX_POOL_DEPTH * 4;
+
+// 系統別順位（`HybridHit::dense_rank` / `sparse_rank`。Issue #2136）は `u32` で保持する。
+// 入力列の長さは `MAX_FETCH_K` 以下に検証済みのため、`usize` から `u32` への変換が
+// 失敗しないことをコンパイル時に保証する。
+const _: () = assert!(MAX_FETCH_K <= u32::MAX as usize);
 
 /// RRF 融合の設定（本モジュールの既定値。関連: TASK-103）。
 ///
@@ -224,14 +233,29 @@ impl RrfConfig {
     }
 }
 
-/// 融合後の検索結果 1 件（行 ID と RRF スコア）。
+/// 融合後の検索結果 1 件（行 ID・RRF スコア・系統別の実効順位）。
 ///
 /// `crate::kernel::CandidateHit`（`score: f32`、内積スコア）・`crate::sparse::ScoredDoc`
 /// （`score: f64`、BM25 スコア）とは尺度が異なる値のため、型を分けて取り違えを防ぐ。
+///
+/// Issue #2136（SEARCH-17・TASK-327 ポインタ。親 Issue #2135）: 融合の入力にあった
+/// 密・疎それぞれの順位を保持する。ブースト前の `score` は、順位を持つ各系統について
+/// `weight / (k_const + rank)` を足した値とビット単位で一致する。上位層（SQL・NoSQL
+/// 表層の投影）が「どの系統で何位だったか」を取り出すための下地である。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct HybridHit {
     pub id: u64,
     pub score: f64,
+    /// 密側の候補列での 1 始まりの実効順位。融合の寄与計算に実際に使った順位で、
+    /// [`TieRank::GroupEnd`] では同点グループの末尾位置になる。密側の候補に無ければ
+    /// `None`。可視集合に絞った入力列の中での順位であり、境界同点グループ完全化
+    /// （[`hybrid_search_boosted`]）では `pool_depth` を超えうる（上限は [`MAX_FETCH_K`]）。
+    /// [`apply_soft_boost`] は `score` だけを書き換えるため、ブースト後は `score` が
+    /// 寄与の和と一致しなくなるが、順位は融合入力のまま保たれる。
+    pub dense_rank: Option<u32>,
+    /// 疎側の候補列での 1 始まりの実効順位（意味は `dense_rank` と同じ）。疎側の候補に
+    /// 無ければ `None`。
+    pub sparse_rank: Option<u32>,
 }
 
 /// [`rrf_fuse`]・[`hybrid_search`] が返すエラー。下位層（[`KernelError`]・[`SparseError`]）
@@ -553,6 +577,8 @@ pub(crate) fn rrf_fuse_with_limits(
     let n_d = dense.len();
     let n_s = sparse.len();
     let mut contrib = vec![0.0_f64; n_d + n_s];
+    // Issue #2136: 寄与の計算に使った実効順位を同じ位置に保持する（長さは検証済みで有界）。
+    let mut ranks = vec![0u32; n_d + n_s];
     compute_contributions(
         dense,
         |h| (f64::from(h.score), h.id),
@@ -560,7 +586,8 @@ pub(crate) fn rrf_fuse_with_limits(
         cfg.dense_weight(),
         cfg.tie_rank(),
         &mut contrib[0..n_d],
-    );
+        &mut ranks[0..n_d],
+    )?;
     compute_contributions(
         sparse,
         |d| (d.score, d.doc_id),
@@ -568,7 +595,8 @@ pub(crate) fn rrf_fuse_with_limits(
         cfg.sparse_weight(),
         cfg.tie_rank(),
         &mut contrib[n_d..],
-    );
+        &mut ranks[n_d..],
+    )?;
 
     let mut index: Vec<(u64, usize)> = Vec::with_capacity(n_d + n_s);
     for (pos, hit) in dense.iter().enumerate() {
@@ -587,12 +615,25 @@ pub(crate) fn rrf_fuse_with_limits(
     while i < index.len() {
         let id = index[i].0;
         let mut score = 0.0_f64;
+        let mut dense_rank = None;
+        let mut sparse_rank = None;
         let mut j = i;
         while j < index.len() && index[j].0 == id {
-            score += contrib[index[j].1];
+            let pos = index[j].1;
+            score += contrib[pos];
+            if pos < n_d {
+                dense_rank = Some(ranks[pos]);
+            } else {
+                sparse_rank = Some(ranks[pos]);
+            }
             j += 1;
         }
-        merged.push(HybridHit { id, score });
+        merged.push(HybridHit {
+            id,
+            score,
+            dense_rank,
+            sparse_rank,
+        });
         i = j;
     }
 
@@ -852,15 +893,26 @@ fn compute_contributions<T>(
     weight: f64,
     tie_rank: TieRank,
     contrib: &mut [f64],
-) {
+    ranks: &mut [u32],
+) -> Result<(), HybridError> {
     debug_assert_eq!(items.len(), contrib.len());
+    debug_assert_eq!(items.len(), ranks.len());
+    // 順位の `usize -> u32` 変換。到達不能（`MAX_FETCH_K` のコンパイル時 assert）だが
+    // panic させず fail-closed に `TooManyCandidates` を返す（Issue #2136）。
+    let to_u32 = |v: usize| {
+        u32::try_from(v).map_err(|_| HybridError::TooManyCandidates {
+            len: items.len(),
+            max: u32::MAX as usize,
+        })
+    };
     match tie_rank {
         TieRank::Positional => {
-            for (idx, slot) in contrib.iter_mut().enumerate() {
+            for (idx, (slot, rank_slot)) in contrib.iter_mut().zip(ranks.iter_mut()).enumerate() {
                 // 1-based 順位。`idx` は `items.len() <= pool_depth <= MAX_POOL_DEPTH`
                 // に収まるため `as f64` 変換で精度は失われない。
                 let rank = (idx as f64) + 1.0;
                 *slot = weight / (k_const + rank);
+                *rank_slot = to_u32(idx + 1)?;
             }
         }
         TieRank::GroupEnd => {
@@ -886,10 +938,15 @@ fn compute_contributions<T>(
                 for slot in &mut contrib[idx..end] {
                     *slot = contribution;
                 }
+                let rank_u32 = to_u32(end)?;
+                for slot in &mut ranks[idx..end] {
+                    *slot = rank_u32;
+                }
                 idx = end;
             }
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1011,7 +1068,13 @@ fn rrf_fuse_reference_with_limits(
 
     let mut out: Vec<HybridHit> = scores
         .into_iter()
-        .map(|(id, score)| HybridHit { id, score })
+        // Issue #2136: 参照実装はスコアの等価性専用。順位は別のオラクルで検証する。
+        .map(|(id, score)| HybridHit {
+            id,
+            score,
+            dense_rank: None,
+            sparse_rank: None,
+        })
         .collect();
     out.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.id.cmp(&b.id)));
     Ok(out)
@@ -2194,6 +2257,139 @@ mod tests {
         }
     }
 
+    // ---------- Issue #2136（SEARCH-17 ポインタ）: 系統別の実効順位 ----------
+
+    /// 入力列から直接求める順位オラクル。`Positional` は添字 + 1、`GroupEnd` は
+    /// 等スコア区間の最後の添字 + 1。系統に無い id は `None`。
+    fn rank_oracle(scores: &[(f64, u64)], id: u64, tie_rank: TieRank) -> Option<u32> {
+        let idx = scores.iter().position(|&(_, i)| i == id)?;
+        let end = match tie_rank {
+            TieRank::Positional => idx + 1,
+            TieRank::GroupEnd => {
+                let g = scores[idx].0;
+                let mut e = idx + 1;
+                while e < scores.len() && scores[e].0.total_cmp(&g) == std::cmp::Ordering::Equal {
+                    e += 1;
+                }
+                e
+            }
+        };
+        Some(end as u32)
+    }
+
+    #[test]
+    fn rrf_fuse_keeps_per_channel_rank_hand_computed() {
+        let cfg = RrfConfig::new(60.0, 1.0, 1.0, 10).unwrap();
+        let dense = [hit(1, 2.0), hit(2, 1.0)];
+        let sparse = [doc(1, 2.0), doc(3, 1.0)];
+        let fused = rrf_fuse(&dense, &sparse, &cfg).unwrap();
+        let by = |id: u64| *fused.iter().find(|h| h.id == id).unwrap();
+        assert_eq!((by(1).dense_rank, by(1).sparse_rank), (Some(1), Some(1)));
+        assert_eq!((by(2).dense_rank, by(2).sparse_rank), (Some(2), None));
+        assert_eq!((by(3).dense_rank, by(3).sparse_rank), (None, Some(2)));
+    }
+
+    #[test]
+    fn rrf_fuse_rank_uses_group_end_or_position_for_ties() {
+        let dense = [hit(1, 1.0), hit(2, 1.0), hit(3, 1.0), hit(4, 0.5)];
+        let sparse: [ScoredDoc; 0] = [];
+        let ge = RrfConfig::new(60.0, 1.0, 1.0, 10).unwrap();
+        let fused = rrf_fuse(&dense, &sparse, &ge).unwrap();
+        let ranks = |f: &[HybridHit]| -> Vec<(u64, Option<u32>)> {
+            let mut v: Vec<_> = f.iter().map(|h| (h.id, h.dense_rank)).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(
+            ranks(&fused),
+            vec![(1, Some(3)), (2, Some(3)), (3, Some(3)), (4, Some(4))]
+        );
+        let pos = ge.with_tie_rank(TieRank::Positional);
+        let fused = rrf_fuse(&dense, &sparse, &pos).unwrap();
+        assert_eq!(
+            ranks(&fused),
+            vec![(1, Some(1)), (2, Some(2)), (3, Some(3)), (4, Some(4))]
+        );
+    }
+
+    #[test]
+    fn rrf_fuse_rank_matches_independent_oracle_and_score_identity() {
+        let mut rng = Xorshift64::new(0x2136_2136_2136_2136u64);
+        for trial in 0..400usize {
+            let tie_rank = if trial % 2 == 0 {
+                TieRank::GroupEnd
+            } else {
+                TieRank::Positional
+            };
+            let n_d = rng.next_range(25);
+            let n_s = rng.next_range(25);
+            let id_space = ((n_d + n_s).max(1) as u64) + 3;
+            let dense_ids = sample_unique_ids(&mut rng, id_space, n_d);
+            let sparse_ids = sample_unique_ids(&mut rng, id_space, n_s);
+            let levels = 1 + rng.next_range(4);
+            let dense = gen_dense(&mut rng, &dense_ids, levels, 0.001);
+            let sparse = gen_sparse(&mut rng, &sparse_ids, levels, 0.001);
+            let (wd, ws) = match trial % 3 {
+                0 => (1.0, 1.0),
+                1 => (0.0, 1.0),
+                _ => (2.5, 0.0),
+            };
+            let cfg = RrfConfig::new(60.0, wd, ws, MAX_POOL_DEPTH)
+                .unwrap()
+                .with_tie_rank(tie_rank);
+            let fused = rrf_fuse(&dense, &sparse, &cfg).unwrap();
+            let dk: Vec<(f64, u64)> = dense.iter().map(|h| (f64::from(h.score), h.id)).collect();
+            let sk: Vec<(f64, u64)> = sparse.iter().map(|d| (d.score, d.doc_id)).collect();
+            for h in &fused {
+                assert_eq!(h.dense_rank, rank_oracle(&dk, h.id, tie_rank));
+                assert_eq!(h.sparse_rank, rank_oracle(&sk, h.id, tie_rank));
+                let mut sum = 0.0_f64;
+                if let Some(r) = h.dense_rank {
+                    sum += wd / (60.0 + f64::from(r));
+                }
+                if let Some(r) = h.sparse_rank {
+                    sum += ws / (60.0 + f64::from(r));
+                }
+                assert_eq!(sum.to_bits(), h.score.to_bits());
+            }
+        }
+    }
+
+    #[test]
+    fn rrf_fuse_zero_weight_channel_still_reports_rank() {
+        let cfg = RrfConfig::new(60.0, 0.0, 1.0, 10).unwrap();
+        let fused = rrf_fuse(&[hit(1, 1.0)], &[doc(2, 1.0)], &cfg).unwrap();
+        let h1 = fused.iter().find(|h| h.id == 1).unwrap();
+        assert_eq!(h1.dense_rank, Some(1));
+        assert_eq!(h1.score, 0.0);
+    }
+
+    #[test]
+    fn rrf_fuse_empty_side_yields_none_ranks_for_that_side() {
+        let cfg = RrfConfig::new(60.0, 1.0, 1.0, 10).unwrap();
+        let fused = rrf_fuse(&[hit(1, 1.0), hit(2, 0.5)], &[], &cfg).unwrap();
+        assert!(fused.iter().all(|h| h.sparse_rank.is_none()));
+        let fused = rrf_fuse(&[], &[doc(1, 1.0)], &cfg).unwrap();
+        assert!(fused.iter().all(|h| h.dense_rank.is_none()));
+    }
+
+    #[test]
+    fn apply_soft_boost_keeps_per_channel_ranks() {
+        let cfg = RrfConfig::new(60.0, 1.0, 1.0, 10).unwrap();
+        let mut hits = rrf_fuse(&[hit(1, 2.0), hit(2, 1.0)], &[doc(2, 2.0)], &cfg).unwrap();
+        let before: Vec<_> = hits
+            .iter()
+            .map(|h| (h.id, h.dense_rank, h.sparse_rank))
+            .collect();
+        let boosted_ids: BTreeSet<u64> = [1u64].into_iter().collect();
+        let rules = [BoostRule::new(&boosted_ids, 0.001).unwrap()];
+        apply_soft_boost(&mut hits, &rules, &cfg).unwrap();
+        for (id, d, s) in before {
+            let h = hits.iter().find(|h| h.id == id).unwrap();
+            assert_eq!((h.dense_rank, h.sparse_rank), (d, s));
+        }
+    }
+
     #[test]
     fn rrf_fuse_priority_duplicate_id_over_post_fusion_non_finite_score() {
         // 重複 id と融合後 +Inf を同時に含む入力で `DuplicateId` が返ること
@@ -2229,7 +2425,12 @@ mod tests {
     }
 
     fn hit_h(id: u64, score: f64) -> HybridHit {
-        HybridHit { id, score }
+        HybridHit {
+            id,
+            score,
+            dense_rank: None,
+            sparse_rank: None,
+        }
     }
 
     #[test]
@@ -2414,7 +2615,9 @@ mod tests {
             fused,
             vec![HybridHit {
                 id: 1,
-                score: 1.0 / 61.0
+                score: 1.0 / 61.0,
+                dense_rank: Some(1),
+                sparse_rank: None,
             }]
         );
     }
@@ -2848,7 +3051,9 @@ mod tests {
             hits,
             vec![HybridHit {
                 id: 1,
-                score: 2.0 / 61.0
+                score: 2.0 / 61.0,
+                dense_rank: Some(1),
+                sparse_rank: Some(1),
             }]
         );
         assert!(
@@ -2900,7 +3105,9 @@ mod tests {
             hits,
             vec![HybridHit {
                 id: 1,
-                score: 2.0 / 61.0
+                score: 2.0 / 61.0,
+                dense_rank: Some(1),
+                sparse_rank: Some(1),
             }]
         );
     }
@@ -2934,8 +3141,18 @@ mod tests {
     fn apply_soft_boost_adds_amount_for_single_match() {
         let cfg = RrfConfig::default();
         let mut hits = vec![
-            HybridHit { id: 1, score: 0.5 },
-            HybridHit { id: 2, score: 0.4 },
+            HybridHit {
+                id: 1,
+                score: 0.5,
+                dense_rank: None,
+                sparse_rank: None,
+            },
+            HybridHit {
+                id: 2,
+                score: 0.4,
+                dense_rank: None,
+                sparse_rank: None,
+            },
         ];
         let ids: BTreeSet<u64> = [2].into_iter().collect();
         let rule = BoostRule::new(&ids, SOFT_BOOST_PER_MATCH).unwrap();
@@ -2949,7 +3166,12 @@ mod tests {
     #[test]
     fn apply_soft_boost_sums_multiple_rule_matches() {
         let cfg = RrfConfig::default();
-        let mut hits = vec![HybridHit { id: 1, score: 0.1 }];
+        let mut hits = vec![HybridHit {
+            id: 1,
+            score: 0.1,
+            dense_rank: None,
+            sparse_rank: None,
+        }];
         let path_ids: BTreeSet<u64> = [1].into_iter().collect();
         let kind_ids: BTreeSet<u64> = [1].into_iter().collect();
         let rule_a = BoostRule::new(&path_ids, SOFT_BOOST_PER_MATCH).unwrap();
@@ -2967,11 +3189,23 @@ mod tests {
         // （加点 0.001 はこの絶対上限より十分小さく安全に受理される）。
         let cfg = RrfConfig::default();
         let mut hits = vec![
-            HybridHit { id: 1, score: 0.5 },
-            HybridHit { id: 2, score: 0.45 },
+            HybridHit {
+                id: 1,
+                score: 0.5,
+                dense_rank: None,
+                sparse_rank: None,
+            },
+            HybridHit {
+                id: 2,
+                score: 0.45,
+                dense_rank: None,
+                sparse_rank: None,
+            },
             HybridHit {
                 id: 3,
                 score: 0.4495,
+                dense_rank: None,
+                sparse_rank: None,
             },
         ];
         let ids: BTreeSet<u64> = [3].into_iter().collect();
@@ -3000,10 +3234,14 @@ mod tests {
             HybridHit {
                 id: 1,
                 score: top1_guaranteed_floor,
+                dense_rank: None,
+                sparse_rank: None,
             },
             HybridHit {
                 id: 2,
                 score: pool_bottom_worst_case,
+                dense_rank: None,
+                sparse_rank: None,
             },
         ];
         let ids: BTreeSet<u64> = [2].into_iter().collect();
@@ -3064,8 +3302,18 @@ mod tests {
         // 新 1 位へ押し上げられた）。
         let cfg = RrfConfig::default();
         let mut hits = vec![
-            HybridHit { id: 1, score: 0.5 },
-            HybridHit { id: 2, score: 0.0 },
+            HybridHit {
+                id: 1,
+                score: 0.5,
+                dense_rank: None,
+                sparse_rank: None,
+            },
+            HybridHit {
+                id: 2,
+                score: 0.0,
+                dense_rank: None,
+                sparse_rank: None,
+            },
         ];
         let ids: BTreeSet<u64> = [2].into_iter().collect();
         let rule = BoostRule::new(&ids, MAX_BOOST_AMOUNT).unwrap();
@@ -3087,8 +3335,18 @@ mod tests {
         let cfg = RrfConfig::new(60.0, 1.0, 0.0, 200).expect("zero weight is valid");
         assert_eq!(soft_boost_confirm_cap(&cfg), 0.0);
         let mut hits = vec![
-            HybridHit { id: 1, score: 0.5 },
-            HybridHit { id: 2, score: 0.0 },
+            HybridHit {
+                id: 1,
+                score: 0.5,
+                dense_rank: None,
+                sparse_rank: None,
+            },
+            HybridHit {
+                id: 2,
+                score: 0.0,
+                dense_rank: None,
+                sparse_rank: None,
+            },
         ];
         let ids: BTreeSet<u64> = [2].into_iter().collect();
         let rule = BoostRule::new(&ids, 1e-9).unwrap();
@@ -3121,6 +3379,8 @@ mod tests {
                 .map(|id| HybridHit {
                     id,
                     score: observed_top,
+                    dense_rank: None,
+                    sparse_rank: None,
                 })
                 .collect::<Vec<_>>()
         };
@@ -3186,11 +3446,15 @@ mod tests {
             .map(|id| HybridHit {
                 id,
                 score: observed_top,
+                dense_rank: None,
+                sparse_rank: None,
             })
             .collect();
         hits.push(HybridHit {
             id: 6,
             score: near_top_score,
+            dense_rank: None,
+            sparse_rank: None,
         });
 
         let ids: BTreeSet<u64> = [6].into_iter().collect();
@@ -3233,12 +3497,24 @@ mod tests {
         // この加点は受理され id=2 が新たな 1 位になる。
         let cfg = RrfConfig::default();
         let mut hits = vec![
-            HybridHit { id: 1, score: 0.5 },
+            HybridHit {
+                id: 1,
+                score: 0.5,
+                dense_rank: None,
+                sparse_rank: None,
+            },
             HybridHit {
                 id: 2,
                 score: 0.4995,
+                dense_rank: None,
+                sparse_rank: None,
             },
-            HybridHit { id: 3, score: 0.4 },
+            HybridHit {
+                id: 3,
+                score: 0.4,
+                dense_rank: None,
+                sparse_rank: None,
+            },
         ];
         let ids: BTreeSet<u64> = [2].into_iter().collect();
         let rule = BoostRule::new(&ids, 0.001).unwrap();
@@ -3263,10 +3539,17 @@ mod tests {
         let cap = soft_boost_confirm_cap(&cfg);
         let near_cap_score = cap - 0.005;
         let mut hits = vec![
-            HybridHit { id: 1, score: cap },
+            HybridHit {
+                id: 1,
+                score: cap,
+                dense_rank: None,
+                sparse_rank: None,
+            },
             HybridHit {
                 id: 2,
                 score: near_cap_score,
+                dense_rank: None,
+                sparse_rank: None,
             },
         ];
         let ids: BTreeSet<u64> = [2].into_iter().collect();
@@ -3306,8 +3589,18 @@ mod tests {
         let cfg = RrfConfig::default();
         let cap = soft_boost_confirm_cap(&cfg);
         let mut hits = vec![
-            HybridHit { id: 1, score: cap },
-            HybridHit { id: 2, score: 0.0 },
+            HybridHit {
+                id: 1,
+                score: cap,
+                dense_rank: None,
+                sparse_rank: None,
+            },
+            HybridHit {
+                id: 2,
+                score: 0.0,
+                dense_rank: None,
+                sparse_rank: None,
+            },
         ];
         let ids: BTreeSet<u64> = [1].into_iter().collect();
         let boost_amount_each = 0.015;
@@ -3354,8 +3647,18 @@ mod tests {
     fn apply_soft_boost_tie_breaks_by_id_ascending() {
         let cfg = RrfConfig::default();
         let mut hits = vec![
-            HybridHit { id: 5, score: 0.1 },
-            HybridHit { id: 3, score: 0.1 },
+            HybridHit {
+                id: 5,
+                score: 0.1,
+                dense_rank: None,
+                sparse_rank: None,
+            },
+            HybridHit {
+                id: 3,
+                score: 0.1,
+                dense_rank: None,
+                sparse_rank: None,
+            },
         ];
         apply_soft_boost(&mut hits, &[], &cfg).expect("ok");
         assert_eq!(hits[0].id, 3);
@@ -3366,8 +3669,18 @@ mod tests {
     fn apply_soft_boost_empty_rules_is_no_op() {
         let cfg = RrfConfig::default();
         let mut hits = vec![
-            HybridHit { id: 2, score: 0.5 },
-            HybridHit { id: 1, score: 0.4 },
+            HybridHit {
+                id: 2,
+                score: 0.5,
+                dense_rank: None,
+                sparse_rank: None,
+            },
+            HybridHit {
+                id: 1,
+                score: 0.4,
+                dense_rank: None,
+                sparse_rank: None,
+            },
         ];
         let before = hits.clone();
         apply_soft_boost(&mut hits, &[], &cfg).expect("ok");
@@ -3380,7 +3693,12 @@ mod tests {
         let ids: BTreeSet<u64> = BTreeSet::new();
         let rule = BoostRule::new(&ids, SOFT_BOOST_PER_MATCH).unwrap();
         let rules: Vec<BoostRule<'_>> = (0..(MAX_BOOST_RULES + 1)).map(|_| rule).collect();
-        let mut hits = vec![HybridHit { id: 1, score: 0.1 }];
+        let mut hits = vec![HybridHit {
+            id: 1,
+            score: 0.1,
+            dense_rank: None,
+            sparse_rank: None,
+        }];
         let err = apply_soft_boost(&mut hits, &rules, &cfg).unwrap_err();
         assert_eq!(
             err,
@@ -3402,6 +3720,8 @@ mod tests {
         let mut hits = vec![HybridHit {
             id: 1,
             score: f64::INFINITY,
+            dense_rank: None,
+            sparse_rank: None,
         }];
         let err = apply_soft_boost(&mut hits, &[], &cfg).unwrap_err();
         assert_eq!(err, HybridError::NonFiniteScore);
