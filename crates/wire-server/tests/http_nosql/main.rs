@@ -67,6 +67,7 @@ mod nosql_api_doc_examples;
 mod nosql_bigint_f64_exact_range;
 mod nosql_or_in_rewrite;
 mod nosql_result_limits;
+mod rls10_nosql_highlight_paths;
 mod rls10_nosql_returning_paths;
 mod rls12_nosql_column_privilege;
 mod rls13_nosql_policy;

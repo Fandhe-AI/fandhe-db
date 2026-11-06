@@ -498,6 +498,21 @@
         ],
         "type": "object"
       },
+      "highlight": {
+        "additionalProperties": false,
+        "properties": {
+          "column": {
+            "type": "string"
+          },
+          "options": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "column"
+        ],
+        "type": "object"
+      },
       "hybrid": {
         "additionalProperties": false,
         "properties": {
@@ -682,6 +697,9 @@
           "filter": {
             "items": {},
             "type": "array"
+          },
+          "highlight": {
+            "$ref": "#/components/schemas/highlight"
           },
           "hybrid": {
             "$ref": "#/components/schemas/hybrid"

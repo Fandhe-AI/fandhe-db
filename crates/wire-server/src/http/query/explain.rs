@@ -223,7 +223,14 @@ pub fn execute(
             table,
             |schema, udfs, index_metric| {
                 super::gate::reject_allocated_schema(schema)?;
-                bind_vector_statement(validated, schema, udfs, &core.result_limits(), index_metric)
+                bind_vector_statement(
+                    validated,
+                    schema,
+                    udfs,
+                    &core.result_limits(),
+                    index_metric,
+                    core.headline_limits(),
+                )
             },
         )?;
         return Ok(result);

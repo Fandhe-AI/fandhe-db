@@ -22,6 +22,15 @@
 //! ゲートが SQL と同じ規則で行う。L2／L1 の実行は SQL 表層と同じ入口の `0A000` ゲートを通る
 //! （現時点で SQL と同じく未対応）。`metric` は `plan`・`hybrid` と併用できない（`42601`）。
 //!
+//! `highlight: {column, options?}`（SEARCH-14・Issue #3056）は、`hybrid.text` を検索語として SQL の
+//! `ts_headline(<column>, '<text>'[, '<options>']) AS highlight` と**同じ束縛結果**を投影の末尾
+//! （`explain_score` の 3 列の後）へ足す。束縛は engine の
+//! `sql::udf_call::bind_ts_headline_projection` へ委譲し、オプション語彙（`22023`）・出力上限
+//! （`54000`）・列型検査（`42804`）を SQL と共有する。CLI で下げた上限は `EngineCore::
+//! headline_limits()` を明示引数で渡す（bound 検索入口は束縛スコープを張らないため）。`hybrid` が無い
+//! 検索（検索語の出どころが無い）・`plan` 併用・`highlight` 列名の衝突は `42601`。出力は HTML
+//! エスケープしない（SQL と同じ。表示側の責務）。
+//!
 //! `vector`／`plan` は排他（SQL の `ORDER BY`／`USING PLAN` が構文上
 //! 相互排他なのと対応）。`plan` 指定は LLM 展開（`EngineCore` の private
 //! フィールド `embedder`／`query_planner` 経由の I/O）が必要なため、本
@@ -177,6 +186,17 @@ pub enum SearchError {
     /// `hybrid_score`）が、投影される表の列と同名（`42601`。SEARCH-17 (4)。Issue #2137）。
     /// 文言は固定で、列名を応答へ含めない。
     ExplainScoreColumnConflict,
+    /// `highlight` を指定したのに `hybrid` が無い（`42601`。SEARCH-14・Issue #3056）。NoSQL では
+    /// 検索語の出どころが `hybrid.text` だけのため、`vector` のみの検索では強調を作れない
+    /// （SQL は密のみの `ORDER BY` にも検索語リテラル付きで `ts_headline` を置けるが、NoSQL に
+    /// その形は無い）。文言は固定。
+    HighlightRequiresHybrid,
+    /// `highlight` と `plan` の併用（`42601`。Issue #3056）。`MetricWithPlan` と対の拒否で、
+    /// 展開後の検索語での強調は未対応。文言は固定。
+    HighlightWithPlan,
+    /// 表の列（投影していない列を含む）または投影済みの列名が `highlight` と同名（大文字小文字を
+    /// 区別しない。`42601`。Issue #3056）。`ExplainScoreColumnConflict` と同じ規則。文言は固定。
+    HighlightColumnConflict,
     /// `columns: []`（空配列）。SQL 表層に等価形（空の SELECT リスト）が
     /// 存在しないため fail-closed に拒否する（`42601`）。
     EmptyColumns,
@@ -240,6 +260,9 @@ impl ClassifiedError for SearchError {
             | SearchError::MetricWithHybrid
             | SearchError::EmptyColumns
             | SearchError::ExplainScoreColumnConflict
+            | SearchError::HighlightRequiresHybrid
+            | SearchError::HighlightWithPlan
+            | SearchError::HighlightColumnConflict
             | SearchError::InvalidIdentifier
             | SearchError::ExplainRequiresPlan => ErrorClass::UnsupportedSqlSyntax,
             SearchError::ExplainNotSupported => ErrorClass::FeatureNotSupported,
@@ -273,6 +296,15 @@ impl ClassifiedError for SearchError {
             SearchError::ExplainScoreColumnConflict => {
                 "search request \"explain_score\" conflicts with an existing column name"
                     .to_string()
+            }
+            SearchError::HighlightRequiresHybrid => {
+                "search request \"highlight\" requires \"hybrid\"".to_string()
+            }
+            SearchError::HighlightWithPlan => {
+                "search request must not combine \"highlight\" with \"plan\"".to_string()
+            }
+            SearchError::HighlightColumnConflict => {
+                "search request \"highlight\" conflicts with an existing column name".to_string()
             }
             SearchError::InvalidIdentifier => "invalid identifier".to_string(),
             SearchError::ExplainRequiresPlan => {
@@ -458,6 +490,9 @@ fn bind_hybrid_tuning(
 }
 
 /// [`bind_search_with_limits`] に `metric` 省略時の解決器を足した版（Issue #2243）。
+/// `highlight` の `ts_headline` 上限はハード上限（`HeadlineLimits::default()`）で束縛する。
+/// 実行経路は CLI で下げた上限を持つ `EngineCore::headline_limits()` を渡す
+/// [`bind_vector_statement`] を通る（本関数は束縛の単体テスト用の入口）。
 /// `index_default` は `metric` 省略時の距離種別の解決器（Issue #2243。engine の
 /// `IndexMetricDefault::distance_kind`）で、`vector` かつ非 `hybrid` で `metric` が
 /// 省略されたときだけ呼ぶ（明示指定の要求はカタログ読み取りの影響を受けない）。
@@ -467,6 +502,27 @@ pub fn bind_search_with_metric_resolver(
     udfs: &engine::sql::udf_call::UdfRegistry,
     limits: &engine::result_limits::ResultLimits,
     index_default: &dyn Fn() -> Result<DistanceKind, SqlSurfaceError>,
+) -> Result<BoundSearch, SearchError> {
+    bind_search_inner(
+        validated,
+        schema,
+        udfs,
+        limits,
+        index_default,
+        engine::headline_limits::HeadlineLimits::default(),
+    )
+}
+
+/// 束縛の本体。`headline_limits` は `highlight`（`ts_headline`）の出力バイト・断片数上限で、
+/// 実行経路は `EngineCore::headline_limits()` を渡す（NoSQL の bound 検索入口は文実行の束縛
+/// スコープを張らないため、スレッドローカルに頼ると CLI の上限が効かず fail-open になる。Issue #3056）。
+fn bind_search_inner(
+    validated: &Validated<'_>,
+    schema: &TableSchema,
+    udfs: &engine::sql::udf_call::UdfRegistry,
+    limits: &engine::result_limits::ResultLimits,
+    index_default: &dyn Fn() -> Result<DistanceKind, SqlSurfaceError>,
+    headline_limits: engine::headline_limits::HeadlineLimits,
 ) -> Result<BoundSearch, SearchError> {
     let table = validated.required_str("table")?;
     ident::check_identifier(table)?;
@@ -498,6 +554,17 @@ pub fn bind_search_with_metric_resolver(
         }
         if hybrid.is_some() {
             return Err(SearchError::MetricWithHybrid);
+        }
+    }
+
+    // `highlight` の併用拒否も構造の違反として値の束縛より前に確定させる（Issue #3056）。
+    let highlight = validated.optional_nested("highlight")?;
+    if highlight.is_some() {
+        if plan.is_some() {
+            return Err(SearchError::HighlightWithPlan);
+        }
+        if hybrid.is_none() {
+            return Err(SearchError::HighlightRequiresHybrid);
         }
     }
 
@@ -548,6 +615,19 @@ pub fn bind_search_with_metric_resolver(
                     if h.optional_bool("explain_score")? == Some(true) {
                         append_explain_score_columns(&mut projection, schema)?;
                     }
+                }
+                // SEARCH-14・Issue #3056: 投影の末尾（`explain_score` の 3 列の後）へ `highlight` を
+                // 足す。SQL の `ts_headline(<col>, '<hybrid.text>'[, '<options>']) AS highlight` と
+                // 同じ束縛結果（engine の同一経路）を得る。
+                if let Some(hl) = &highlight {
+                    append_highlight_column(
+                        &mut projection,
+                        schema,
+                        udfs,
+                        hl,
+                        query_text,
+                        headline_limits,
+                    )?;
                 }
                 Ranking::Hybrid {
                     query,
@@ -648,6 +728,53 @@ fn append_explain_score_columns(
     Ok(())
 }
 
+/// `highlight` 列の結果列名（SQL の `ts_headline(...) AS highlight` と対応）。
+const HIGHLIGHT_COLUMN_NAME: &str = "highlight";
+
+/// `highlight: {column, options?}` を `ts_headline` 投影として投影の末尾へ足す（SEARCH-14・
+/// Issue #3056）。`search_text` は `hybrid.text` をそのまま渡す。表のいずれかの列または投影済みの
+/// 列名が `highlight` と同名（大文字小文字を区別しない）なら
+/// [`SearchError::HighlightColumnConflict`]。列の解決・型検査〔`42804`〕・オプション語彙〔`22023`〕・
+/// 上限超過〔`54000`〕は engine の束縛・評価に委ねる（SQL と同じ分類・同じ値）。
+fn append_highlight_column(
+    projection: &mut Vec<ProjectedColumn>,
+    schema: &TableSchema,
+    udfs: &engine::sql::udf_call::UdfRegistry,
+    highlight: &Validated<'_>,
+    search_text: &str,
+    headline_limits: engine::headline_limits::HeadlineLimits,
+) -> Result<(), SearchError> {
+    let column = highlight.required_str("column")?;
+    ident::check_identifier(column)?;
+    let options = highlight.optional_str("options")?;
+    let schema_conflicts = schema
+        .columns
+        .iter()
+        .any(|c| c.name.eq_ignore_ascii_case(HIGHLIGHT_COLUMN_NAME));
+    let projected_conflicts = projection.iter().any(|col| match col {
+        ProjectedColumn::Column { name, .. }
+        | ProjectedColumn::AliasedId { name }
+        | ProjectedColumn::Computed { name, .. }
+        | ProjectedColumn::HybridDetail { name, .. } => {
+            name.eq_ignore_ascii_case(HIGHLIGHT_COLUMN_NAME)
+        }
+        ProjectedColumn::Id => false,
+    });
+    if schema_conflicts || projected_conflicts {
+        return Err(SearchError::HighlightColumnConflict);
+    }
+    projection.push(engine::sql::udf_call::bind_ts_headline_projection(
+        schema,
+        udfs,
+        column,
+        search_text,
+        options,
+        headline_limits,
+        HIGHLIGHT_COLUMN_NAME,
+    )?);
+    Ok(())
+}
+
 /// `explain: true` を伴う `plan` 検索に返す固定文言（[`super::gate::
 /// PLACEHOLDER_MESSAGE`]・`aggregate.rs::EXPLAIN_NOT_YET_SUPPORTED_MESSAGE`
 /// と同型の「未実装」扱い。NOSQL-10・Issue #765 の担当）。
@@ -699,10 +826,16 @@ pub(crate) fn bind_vector_statement(
     udfs: &engine::sql::udf_call::UdfRegistry,
     limits: &engine::result_limits::ResultLimits,
     index_metric: &IndexMetricDefault<'_>,
+    headline_limits: engine::headline_limits::HeadlineLimits,
 ) -> Result<BoundStatement, SqlSurfaceError> {
-    match bind_search_with_metric_resolver(validated, schema, udfs, limits, &|| {
-        index_metric.distance_kind()
-    })
+    match bind_search_inner(
+        validated,
+        schema,
+        udfs,
+        limits,
+        &|| index_metric.distance_kind(),
+        headline_limits,
+    )
     .map_err(to_sql_surface_error)?
     {
         BoundSearch::Vector(stmt) => Ok(stmt),
@@ -865,6 +998,7 @@ pub fn execute(
                     udfs,
                     &engine.result_limits(),
                     index_metric,
+                    engine.headline_limits(),
                 )
             },
         )?;
