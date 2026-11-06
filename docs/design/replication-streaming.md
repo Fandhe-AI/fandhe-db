@@ -6,6 +6,7 @@
 - 関連コード: `crates/engine/src/storage.rs`（`GENERATION_TABLE`・`bump_generation_and_commit`）、`crates/engine/src/recovery/commit_boundary.rs`、`crates/engine/src/recovery/ledger.rs`、`crates/wire-server/src/tls/`（`server_handshake.rs` ほか primitive 群）、`tls_opt.rs`、`auth_method_opt.rs`、`connection_limits_opt.rs`、`bind_guard.rs`、`durability_opt.rs`
 - 関連 doc: [wire-copy-protocol.md](wire-copy-protocol.md)、[tls-scram-design.md](tls-scram-design.md)、[tls-server-handshake.md](tls-server-handshake.md)、[connection-limits-cli.md](connection-limits-cli.md)
 - 前提: 変更ログの ADR（#2165。#2166・#2167 を含む）は本書の作成時点で未マージ。第 3 節は「要求事項」であり、#2165 と食い違った場合は本書を改訂する
+- 公開境界: README「実装方針（要点）」で公開済みの範囲を超える契約（同期確認の段階・既定値・昇格時の契約など）は、本書では `docs/spec/04-behavior/recovery.md` の `RECOVER-15` のポインタに置き換えて具体化しない。公開境界の拡張には AGENTS.md「private spec 内容の漏えい」項の管理者承認が要るが、その承認記録は現時点で無い。承認が得られたとは書かず、承認が必要な事項として管理者の判断に委ねる
 - 検証コード: なし。本 ADR は docs のみの変更で、`Cargo.toml`・`Cargo.lock`・`deny.toml`・コードを変更しない
 
 ## 1. 背景・目的
@@ -39,6 +40,10 @@
 | 記録ごとの整合検査値 | 破損・改ざんを適用前に検出する（第 6 節） |
 | 保持範囲の下限・上限の問い合わせ | 保持外の位置の要求を検出する（第 8 節） |
 | 再開カーソル | 切断後に続きから送る |
+| 履歴の識別子（DB 識別子と timeline/epoch または履歴チェーン） | 昇格による履歴の分岐を識別する。再開位置は commit 番号だけでなく、これらとの組で扱う |
+
+- 再開時の検証: レプリカは再開位置と合わせて自分の DB 識別子と timeline/epoch を送り、プライマリは自分の履歴の上にその位置が乗っているか検証する。DB 識別子の不一致、または timeline が分岐していて要求位置が分岐点より後の場合は、続きの送信も適用もせず、再同期が必要な状態として拒否する（fail-closed）。例: 旧プライマリが 101 まで進み、100 で昇格した新プライマリが別の 101 を生成した場合、旧履歴の 101 を適用済みのレプリカは新履歴の 102 から再開できない
+- 昇格時は新しい timeline/epoch を採番して変更ログへ記録し、旧プライマリの再接続時も同じ検証で分岐を検出して再同期を要求する
 
 - `storage_generation`（`GENERATION_TABLE`）は commit ごとに +1 されるストレージ全体のカウンタで、RLS prefilter キャッシュの失効検出に使われている。commit 番号に流用できるかは #2165 への問いとし、本 ADR では判断しない
 - 一時表はセッションローカルで永続化しないため、複製の対象外とする
@@ -102,7 +107,7 @@
 
 ### 同期モード（#2245）
 
-- 確認の段階を CLI で選べるようにする: `remote_write`・`on`・`remote_apply`。既定は `on`
+- 確認の段階を CLI で選べるようにする。段階の種類と既定は `RECOVER-15` のポインタとし、本書では確定しない
 - 確認を受けるまで成功を返さない。待機の上限は既定で無い
 - 上限を設けて超えた場合の扱い（書き込みを拒否するか、非同期へ縮退するか）は、運用者が CLI で選ぶ。既定値はオーナー判断事項（第 9 節）で、推奨は fail-closed（拒否）
 - コミット完了と台帳記録の順序は、`commit_boundary.rs` の成功境界（RECOVER-5）との関係で #2245 が整理する
@@ -119,6 +124,7 @@
 - 昇格前に、受信・永続化済みで利用可能な変更ログの適用を完了し、最終適用位置（適用済み commit 番号）を確定する。受信位置ではなく最終適用位置を基準にする（受信済みでも未適用の commit は昇格後のデータに含まれないため）
 - 喪失の範囲（非同期の場合）は、確定した最終適用位置より後として運用者へ報告する。ただし旧プライマリの最終位置が不明なときは、喪失範囲の上端も不明であると明記して報告する（上端を受信位置などで推定して確定表示しない）
 - 昇格後の再送判定は、複製済みの台帳で行う
+- 昇格では新しい timeline/epoch を採番して記録し、再開時の履歴検証（第 3 節）の基準にする。旧プライマリは分岐検出後に再同期を経ずに受信側へ戻さない
 - 復元世代（RECOVER-17・#2446）との関係はポインタで触れるに留め、詳細は #2446 で扱う
 
 ## 9. 承認事項・オーナー判断事項
