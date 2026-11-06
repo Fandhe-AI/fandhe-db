@@ -24,6 +24,7 @@
 //! 計算量: 前方一致の展開は語幹の範囲の和集合を 1 回だけ走査し `O(V_ascii + Σ|postings|)`
 //! （語幹の数に比例して増えない）。グループの評価は同時に `ScorePass` を 1 つだけ保持する。
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
@@ -158,7 +159,8 @@ struct GroupPlan<'q> {
     /// どれかに一致したら落とすフレーズ（除外。1 語の除外は長さ 1）。
     excluded: Vec<PhrasePattern>,
     /// このグループが使う前方一致の語幹（正・除外）。
-    stems: BTreeSet<&'q str>,
+    /// 英語ステミング有効時は語幹もステミング後の形（Issue #3050。索引語と同じ形にそろえる）。
+    stems: BTreeSet<Cow<'q, str>>,
 }
 
 /// グループ内の一意な語（通常語・語幹・フレーズ／除外の構成トークン）の集合。
@@ -181,7 +183,7 @@ fn group_unique_words(group: &QueryGroup) -> BTreeSet<&str> {
 /// 語幹から `visible` 内の半開区間。区間で持つので語幹が重なっても複製しない。
 struct Expansion<'q> {
     visible: Vec<usize>,
-    spans: BTreeMap<&'q str, (usize, usize)>,
+    spans: BTreeMap<Cow<'q, str>, (usize, usize)>,
 }
 
 impl Expansion<'_> {
@@ -216,12 +218,12 @@ fn compile_group_plans<'q>(
     for g in query.groups() {
         let mut required = Vec::new();
         let mut excluded = Vec::new();
-        let mut stems: BTreeSet<&str> = BTreeSet::new();
+        let mut stems: BTreeSet<Cow<'_, str>> = BTreeSet::new();
         for c in g.clauses() {
             match c {
                 Clause::Term(_) => {}
                 Clause::Prefix(s) | Clause::Exclude(Excluded::Prefix(s)) => {
-                    stems.insert(s.as_str());
+                    stems.insert(analysis.stem_prefix(s.as_str()));
                 }
                 // 同一フィルタは評価前に一意化する（重複入力で走査量・中間結果を
                 // 増幅させない。max_terms は一意語で数えるため、ここで揃える）。
@@ -303,8 +305,8 @@ impl SparseIndex {
         }
 
         // 前方一致の展開（データ依存。可視集合の語だけを数える）。
-        let all_stems: BTreeSet<&str> =
-            plans.iter().flat_map(|p| p.stems.iter().copied()).collect();
+        let all_stems: BTreeSet<Cow<'_, str>> =
+            plans.iter().flat_map(|p| p.stems.iter().cloned()).collect();
         let expansion = self.expand_stems(&all_stems, &bitmap, limits.max_prefix_expansions())?;
         let mut total_expansions: usize = 0;
         for p in &plans {
@@ -363,17 +365,18 @@ impl SparseIndex {
     /// （上限超過クエリで全該当語を走査・確保しない。一意数 <= 加算数なので判定は後段と整合する）。
     fn expand_stems<'q>(
         &self,
-        stems: &BTreeSet<&'q str>,
+        stems: &BTreeSet<Cow<'q, str>>,
         bitmap: &VisibleBitmap,
         max: usize,
     ) -> Result<Expansion<'q>, TextSearchError> {
         let mut visible: Vec<usize> = Vec::new();
-        let mut spans: BTreeMap<&'q str, (usize, usize)> = BTreeMap::new();
+        let mut spans: BTreeMap<Cow<'q, str>, (usize, usize)> = BTreeMap::new();
         let mut scanned_to = 0usize;
-        for &stem in stems {
-            let lo = self.prefix_vocab.partition_point(|(t, _)| &**t < stem);
+        for stem in stems {
+            let stem_str: &str = stem;
+            let lo = self.prefix_vocab.partition_point(|(t, _)| &**t < stem_str);
             let tail = self.prefix_vocab.get(lo..).unwrap_or(&[]);
-            let hi = lo.saturating_add(tail.partition_point(|(t, _)| t.starts_with(stem)));
+            let hi = lo.saturating_add(tail.partition_point(|(t, _)| t.starts_with(stem_str)));
             for i in lo.max(scanned_to)..hi {
                 if let Some(&(_, tid)) = self.prefix_vocab.get(i) {
                     if self.has_visible_posting(tid, bitmap) {
@@ -387,7 +390,7 @@ impl SparseIndex {
             scanned_to = scanned_to.max(hi);
             let a = visible.partition_point(|&i| i < lo);
             let b = visible.partition_point(|&i| i < hi);
-            spans.insert(stem, (a, b));
+            spans.insert(stem.clone(), (a, b));
         }
         Ok(Expansion { visible, spans })
     }
@@ -459,14 +462,14 @@ impl SparseIndex {
         // 前方一致の除外は展開語ごとに文書番号を積まず、ビットセットへ直接立てる
         // （保持量を展開語数ではなく文書数に比例させる）。
         let mut excluded_bits: Vec<u64> = vec![0; self.doc_ids.len().div_ceil(64)];
-        let mut excluded_stems: BTreeSet<&str> = BTreeSet::new();
+        let mut excluded_stems: BTreeSet<Cow<'_, str>> = BTreeSet::new();
         for c in plan.group.clauses() {
             if let Clause::Exclude(Excluded::Prefix(stem)) = c {
-                excluded_stems.insert(stem.as_str());
+                excluded_stems.insert(self.analysis.stem_prefix(stem.as_str()));
             }
         }
         for stem in excluded_stems {
-            for &vi in expansion.indices(stem) {
+            for &vi in expansion.indices(&stem) {
                 let Some(&(_, tid)) = self.prefix_vocab.get(vi) else {
                     continue;
                 };
@@ -497,7 +500,7 @@ impl SparseIndex {
                     }
                 }
                 Clause::Prefix(stem) => {
-                    for &vi in expansion.indices(stem) {
+                    for &vi in expansion.indices(&self.analysis.stem_prefix(stem)) {
                         if let Some((t, tid)) = self.prefix_vocab.get(vi) {
                             words.insert((**t).to_owned(), *tid);
                         }

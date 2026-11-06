@@ -141,6 +141,16 @@ wasmtime = { version = "=48.0.8", optional = true, default-features = false, fea
     "std",
 ] }
 
+# Issue #3050（SEARCH-16 ポインタ。疎検索の英語ステミング用依存）:
+# `sparse/analysis.rs` の英語ステミング（Snowball English）を自作せず rust-stemmers に委ねる。
+# オーナー承認済み（2026-11-06・承認記録は Issue #2127 のコメントと
+# `docs/design/stemming-crate-adoption.md`〔Accepted〕第 8 節）。承認範囲はこの 1 行だけで、
+# 版の変更は再承認が要る。ライセンス: MIT/BSD-3-Clause。最終リリースは 2019 年で保守は停滞。
+# 推移的依存は serde・serde_derive（いずれも Cargo.lock に既存）で、lock への新規はこのクレート 1 件のみ。
+# optional・下記 `english-stemmer` feature の背後に限定し、既定ビルドの依存木に出現しない。
+# .claude/rules/dependency-policy.md に従い完全固定（=x.y.z）で管理する。
+rust-stemmers = { version = "=1.2.0", optional = true }
+
 [features]
 # CORE-5 の対照エンジン（usearch の総当たり `exact_search`）を bench 専用に有効化する
 # feature。`test-support` feature 廃止時（本ファイル上部の redb dev-dependency コメント
@@ -174,6 +184,12 @@ test-sync-points = []
 # 一切結線しない（テナント境界・RLS 迂回 API は露出しない）。現時点では依存を有効にする
 # だけで実行経路はない（実装は #1925 以降）。feature 無効時の fail-closed な拒否は #1926 で決める。
 wasm-udf = ["dep:wasmtime"]
+
+# Issue #3050（SEARCH-16 ポインタ）: 疎検索の英語ステミング（`TextAnalysis::with_english_stemmer`）
+# を有効化する feature。既定 off。`wasm-udf` と同パターンで依存を有効にするだけで、テナント境界・
+# RLS 迂回 API は露出しない。feature 名は実装側の選択（ADR 第 4 節 1 は名称を実装 Issue に委ねる）。
+# wire-server の `--english-stemmer` は `--features engine/english-stemmer` ビルドでのみ受理する。
+english-stemmer = ["dep:rust-stemmers"]
 
 [dev-dependencies]
 # codex P0-2 指摘（Issue #137）対応: 以前は `test-support` feature ＋ self
