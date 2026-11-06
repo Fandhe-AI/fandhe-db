@@ -31,6 +31,8 @@ pub struct TextAnalysisRawFlags<'a> {
     pub stopwords: Option<&'a Path>,
     /// `--synonyms-file` のパス。
     pub synonyms: Option<&'a Path>,
+    /// `--english-stemmer`（Issue #3050）が指定されたか。
+    pub english_stemmer: bool,
 }
 
 /// 上限付きで UTF-8 ファイルを読む。失敗時はフラグ名と理由だけの英語文を返す。
@@ -62,13 +64,22 @@ pub fn resolve(raw: TextAnalysisRawFlags<'_>) -> Result<TextAnalysis, String> {
         .synonyms
         .map(|p| read_limited(p, SYNONYMS_FILE_FLAG))
         .transpose()?;
-    TextAnalysis::from_lists(stopwords.as_deref(), synonyms.as_deref()).map_err(|e| {
-        let flag = match e.file {
-            engine::sparse::analysis::TextAnalysisFile::Stopwords => STOPWORDS_FILE_FLAG,
-            engine::sparse::analysis::TextAnalysisFile::Synonyms => SYNONYMS_FILE_FLAG,
-        };
-        format!("{flag}: {e}")
-    })
+    let base =
+        TextAnalysis::from_lists(stopwords.as_deref(), synonyms.as_deref()).map_err(|e| {
+            let flag = match e.file {
+                engine::sparse::analysis::TextAnalysisFile::Stopwords => STOPWORDS_FILE_FLAG,
+                engine::sparse::analysis::TextAnalysisFile::Synonyms => SYNONYMS_FILE_FLAG,
+                engine::sparse::analysis::TextAnalysisFile::EnglishStemmer => {
+                    crate::english_stemmer_opt::FLAG
+                }
+            };
+            format!("{flag}: {e}")
+        })?;
+    if !raw.english_stemmer {
+        return Ok(base);
+    }
+    base.with_english_stemmer()
+        .map_err(|e| format!("{}: {e}", crate::english_stemmer_opt::FLAG))
 }
 
 #[cfg(test)]
@@ -87,6 +98,7 @@ mod tests {
         let e = resolve(TextAnalysisRawFlags {
             stopwords: Some(p),
             synonyms: None,
+            english_stemmer: false,
         })
         .expect_err("rejected");
         assert!(e.starts_with(STOPWORDS_FILE_FLAG), "{e}");

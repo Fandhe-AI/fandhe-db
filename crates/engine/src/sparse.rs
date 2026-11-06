@@ -871,9 +871,11 @@ where
         walk_tokens_positioned(text, true, emit);
         return;
     }
-    walk_tokens_positioned(text, true, |token, span, pos| match analysis.apply(token) {
-        Some(t) => emit(t, span, pos),
-        None => true,
+    walk_tokens_positioned(text, true, |token, span, pos| {
+        match analysis.analyze(token) {
+            Some(t) => emit(&t, span, pos),
+            None => true,
+        }
     });
 }
 
@@ -2587,6 +2589,44 @@ mod tests {
             .map(|d| d.doc_id)
             .collect();
         assert_eq!(ids, vec![2]);
+    }
+
+    #[cfg(feature = "english-stemmer")]
+    #[test]
+    fn english_stemming_is_symmetric_and_off_by_default() {
+        let a = Arc::new(TextAnalysis::default().with_english_stemmer().unwrap());
+        let docs: [(DocId, &str); 3] = [(1, "he runs daily"), (2, "日本語 テキスト"), (3, "other")];
+        let on = SparseIndex::build_with_analysis(&docs, a).unwrap();
+        let hit = |idx: &SparseIndex, q: &str| -> Vec<DocId> {
+            idx.search(q, 10)
+                .unwrap()
+                .iter()
+                .map(|d| d.doc_id)
+                .collect()
+        };
+        assert_eq!(hit(&on, "running"), vec![1]);
+        // CJK はステミングされず従来どおりのバイグラムで当たる。
+        assert_eq!(hit(&on, "日本語"), vec![2]);
+        let off = SparseIndex::build(&docs).unwrap();
+        assert!(hit(&off, "running").is_empty());
+    }
+
+    #[cfg(feature = "english-stemmer")]
+    #[test]
+    fn english_stemming_applies_to_prefix_clauses() {
+        let a = Arc::new(TextAnalysis::default().with_english_stemmer().unwrap());
+        let docs: [(DocId, &str); 2] = [(1, "he runs daily"), (2, "other")];
+        let idx = SparseIndex::build_with_analysis(&docs, a).unwrap();
+        let visible: BTreeSet<DocId> = [1, 2].into_iter().collect();
+        let scored = idx
+            .score_text_query_str_within(
+                "running*",
+                &visible,
+                Bm25Params::default(),
+                &crate::text_query_limits::TextQueryLimits::default(),
+            )
+            .unwrap();
+        assert_eq!(scored.candidates.len(), 1);
     }
 
     #[test]

@@ -413,9 +413,10 @@
 //! `wire_server::rerank_opt::resolve` に一本化し、`EngineCore::with_rerank` へ 1 回だけ注入する
 //! （`docs/design/rerank-wiring-policy.md` 参照）。
 //!
-//! `--english-stemmer`（Issue #2129 Phase A・SEARCH-16 ポインタ）: 依存の承認と engine の
-//! feature 有効化の前は未提供。値の有無にかかわらず固定文言で起動エラーにする
-//! （`wire_server::english_stemmer_opt`。`docs/design/stemming-crate-adoption.md` 参照）。
+//! `--english-stemmer`（Issue #2129・#3050・SEARCH-16 ポインタ）: 値を取らないスイッチ。
+//! `--features engine/english-stemmer` でビルドしたときだけ受理し（索引・クエリの英語語形を
+//! そろえる。起動時固定）、既定ビルドでは固定文言で起動エラーにする（fail-closed。
+//! `wire_server::english_stemmer_opt`。`docs/design/stemming-crate-adoption.md` 参照）。
 //!
 //! `--require-where-for-dml`（Issue #2210・SQL-36 ポインタ）: 値を取らないスイッチ。
 //! 指定すると `WHERE` 省略の SQL `UPDATE`／`DELETE` を変更開始前に `42601` で拒否する
@@ -622,6 +623,7 @@ fn run_server(args: &[String]) -> ExitCode {
     let mut ddl_allowed_users_raw: Option<String> = None;
     let mut auth_method_raw: Option<String> = None;
     let mut scram_mock_key_file_raw: Option<PathBuf> = None;
+    let mut english_stemmer_raw = false;
     let mut stopwords_file_raw: Option<PathBuf> = None;
     let mut synonyms_file_raw: Option<PathBuf> = None;
     let mut reranker_raw: Option<String> = None;
@@ -2223,14 +2225,15 @@ fn run_server(args: &[String]) -> ExitCode {
                 fault_inject_raw = Some(v.clone());
                 i += 2;
             }
-            // Issue #2129 Phase A（SEARCH-16 ポインタ）。承認と feature 有効化の前は
-            // 値の有無にかかわらず値を読まず・echo せず固定文言で拒否する。
+            // Issue #2129・#3050（SEARCH-16 ポインタ）。値を取らないスイッチ。engine の
+            // `english-stemmer` feature 無効のビルドでは固定文言で拒否し、有効でも重複は拒否する。
             wire_server::english_stemmer_opt::FLAG => {
-                engine::log_stderr!(
-                    "wire-server: {}",
-                    wire_server::english_stemmer_opt::reject()
-                );
-                return ExitCode::FAILURE;
+                if let Err(msg) = wire_server::english_stemmer_opt::accept(english_stemmer_raw) {
+                    engine::log_stderr!("wire-server: {msg}");
+                    return ExitCode::FAILURE;
+                }
+                english_stemmer_raw = true;
+                i += 1;
             }
             other => {
                 engine::log_stderr!("wire-server: unknown argument: {other}");
@@ -2524,6 +2527,7 @@ fn run_server(args: &[String]) -> ExitCode {
         wire_server::text_analysis_opt::TextAnalysisRawFlags {
             stopwords: stopwords_file_raw.as_deref(),
             synonyms: synonyms_file_raw.as_deref(),
+            english_stemmer: english_stemmer_raw,
         },
     ) {
         Ok(a) => a,

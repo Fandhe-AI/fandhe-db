@@ -111,6 +111,8 @@ mod soft_boost;
 mod sparse;
 mod sparse_cache;
 mod sparse_determinism;
+#[cfg(feature = "english-stemmer")]
+mod sparse_english_stemming;
 mod sparse_phrase;
 mod sparse_stopwords;
 mod sparse_text_analysis;

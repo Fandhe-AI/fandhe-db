@@ -54,8 +54,8 @@
 //!   `engine::search_engine::HnswScope` へ untrusted な CLI 文字列から到達する
 //!   唯一の入口。`EngineCore::with_hnsw_scope` への注入は `main.rs::run_server`
 //!   の責務）
-//! - [`english_stemmer_opt`]: `--english-stemmer` の専用拒否入口（Issue #2129 Phase A・
-//!   SEARCH-16 ポインタ。承認と feature 有効化の前は常に起動エラー）
+//! - [`english_stemmer_opt`]: `--english-stemmer` の受理／拒否判定（Issue #2129・#3050・
+//!   SEARCH-16 ポインタ。engine の `english-stemmer` feature 無効のビルドは常に起動エラー）
 //! - [`text_analysis_opt`]: `--stopwords-file`／`--synonyms-file` の上限付き読み込みと検証
 //!   （Issue #2130・SEARCH-16 ポインタ。`EngineCore::with_text_analysis` への注入は
 //!   `main.rs::run_server` の責務）
