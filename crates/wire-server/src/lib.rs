@@ -56,6 +56,9 @@
 //!   の責務）
 //! - [`english_stemmer_opt`]: `--english-stemmer` の専用拒否入口（Issue #2129 Phase A・
 //!   SEARCH-16 ポインタ。承認と feature 有効化の前は常に起動エラー）
+//! - [`text_analysis_opt`]: `--stopwords-file`／`--synonyms-file` の上限付き読み込みと検証
+//!   （Issue #2130・SEARCH-16 ポインタ。`EngineCore::with_text_analysis` への注入は
+//!   `main.rs::run_server` の責務）
 //! - [`require_operation_id_opt`]: `--require-operation-id` 値なしスイッチの解決
 //!   （Issue #1703。`engine::recovery::required_op_id::LedgerMode` へ CLI から
 //!   到達する唯一の入口。`EngineCore::with_ledger_mode` への注入は
@@ -176,6 +179,7 @@ pub mod sparsevec_limits_opt;
 pub mod statement_timeout_opt;
 pub mod surface;
 pub mod temp_table_limits_opt;
+pub mod text_analysis_opt;
 pub mod text_query_limits_opt;
 pub mod tls;
 pub mod tls_opt;

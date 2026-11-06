@@ -26,8 +26,8 @@ use std::fmt;
 
 use super::text_query::Phrase;
 use super::{
-    is_ascii_word_char, validate_query_bounds, walk_tokens_positioned, DocId, SparseError,
-    SparseIndex, TermId, VisibleBitmap,
+    is_ascii_word_char, validate_query_bounds, walk_analyzed_tokens_positioned, DocId, SparseError,
+    SparseIndex, TermId, TextAnalysis, VisibleBitmap,
 };
 
 /// パターンの必須トークン数の上限（暫定値。D7）。
@@ -88,6 +88,9 @@ impl std::error::Error for PhraseError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PhrasePattern {
     entries: Vec<(u32, String)>,
+    /// 作成時のテキスト処理設定の世代 ID（Issue #2130。既定は 0）。索引の設定と違うときは
+    /// 一致を返さない（[`SparseIndex::phrase_matches`] 参照）。
+    analysis_id: u64,
 }
 
 /// トークンが CJK のバイグラム（先頭が ASCII 単語文字でなく 2 文字）か。
@@ -101,8 +104,19 @@ impl PhrasePattern {
         Self::compile(phrase.source())
     }
 
+    /// [`Self::from_phrase`] のテキスト処理設定付き版（Issue #2130）。索引と同じ設定で
+    /// ストップワード・同義語をかけるので、除かれた語は位置の欠けとして扱われる。
+    pub fn from_phrase_with(phrase: &Phrase, analysis: &TextAnalysis) -> Result<Self, PhraseError> {
+        Self::compile_with(phrase.source(), analysis)
+    }
+
     /// フレーズの元の部分文字列から作る。入口で長さ・一意語数を再検証する（多層防御）。
     pub fn compile(source: &str) -> Result<Self, PhraseError> {
+        Self::compile_with(source, &TextAnalysis::default())
+    }
+
+    /// [`Self::compile`] のテキスト処理設定付き版（Issue #2130）。
+    pub fn compile_with(source: &str, analysis: &TextAnalysis) -> Result<Self, PhraseError> {
         validate_query_bounds(source).map_err(|e| match e {
             SparseError::QueryTooLong { len, max } => PhraseError::QueryTooLong { len, max },
             SparseError::TooManyQueryTerms { unique_terms, max } => {
@@ -116,7 +130,7 @@ impl PhrasePattern {
         })?;
 
         let mut toks: Vec<(String, u32)> = Vec::new();
-        walk_tokens_positioned(source, true, |t, _span, pos| {
+        walk_analyzed_tokens_positioned(source, analysis, |t, _span, pos| {
             toks.push((t.to_owned(), pos));
             true
         });
@@ -149,7 +163,10 @@ impl PhrasePattern {
             .into_iter()
             .map(|(p, t)| (p.saturating_sub(base), t))
             .collect();
-        Ok(Self { entries })
+        Ok(Self {
+            entries,
+            analysis_id: analysis.analysis_id(),
+        })
     }
 
     /// 必須トークン数。0 のパターンは何にも一致しない。
@@ -220,6 +237,9 @@ impl SparseIndex {
     ///
     /// 可視集合を持たない呼び出し（テスト・管理用途）向け。テナント境界が必要な経路は
     /// [`SparseIndex::phrase_matches_within`] を使うこと。
+    ///
+    /// パターンと索引のテキスト処理設定が違う場合は空を返す（Issue #2130。fail-closed。
+    /// 設定が違うと位置の欠けや語が食い違い、誤った一致を返しうるため）。
     pub fn phrase_matches(&self, pattern: &PhrasePattern) -> Vec<PhraseHit> {
         self.phrase_hits(pattern, None)
     }
@@ -244,6 +264,9 @@ impl SparseIndex {
         pattern: &PhrasePattern,
         visible: Option<&VisibleBitmap>,
     ) -> Vec<PhraseHit> {
+        if pattern.analysis_id != self.analysis_id() {
+            return Vec::new();
+        }
         let mut hits: Vec<PhraseHit> = self
             .phrase_match_doc_idx(pattern, visible)
             .into_iter()

@@ -420,6 +420,9 @@ impl SparseIndex {
             excluded_docs.sort_unstable();
             excluded_docs.dedup();
         }
+        // 前方一致の除外は展開語ごとに文書番号を積まず、ビットセットへ直接立てる
+        // （保持量を展開語数ではなく文書数に比例させる）。
+        let mut excluded_bits: Vec<u64> = vec![0; self.doc_ids.len().div_ceil(64)];
         let mut excluded_stems: BTreeSet<&str> = BTreeSet::new();
         for c in plan.group.clauses() {
             if let Clause::Exclude(Excluded::Prefix(stem)) = c {
@@ -432,13 +435,18 @@ impl SparseIndex {
                     continue;
                 };
                 if let Some(list) = self.postings.get(tid.0 as usize) {
-                    excluded_docs
-                        .extend(list.iter().map(|&(d, _)| d).filter(|&d| bitmap.contains(d)));
+                    for &(d, _) in list {
+                        if bitmap.contains(d) {
+                            set_bit(&mut excluded_bits, d);
+                        }
+                    }
                 }
             }
-            excluded_docs.sort_unstable();
-            excluded_docs.dedup();
         }
+        for &d in &excluded_docs {
+            set_bit(&mut excluded_bits, d);
+        }
+        drop(excluded_docs);
 
         // 正の語を文字列の辞書順で一意化して TermId へ引く（`score_within` と同じ走査順）。
         let mut words: BTreeMap<&str, TermId> = BTreeMap::new();
@@ -487,7 +495,7 @@ impl SparseIndex {
             if score <= 0.0 {
                 continue;
             }
-            if excluded_docs.binary_search(&doc_idx).is_ok() {
+            if test_bit(&excluded_bits, doc_idx) {
                 continue;
             }
             let all_required = required
@@ -503,3 +511,16 @@ impl SparseIndex {
 
 #[cfg(test)]
 mod tests;
+
+/// 文書番号 `d` のビットを立てる（範囲外は無視。ビットセットは文書数で確保済み）。
+fn set_bit(bits: &mut [u64], d: u32) {
+    if let Some(w) = bits.get_mut((d / 64) as usize) {
+        *w |= 1u64 << (d % 64);
+    }
+}
+
+/// 文書番号 `d` のビットが立っているか。
+fn test_bit(bits: &[u64], d: u32) -> bool {
+    bits.get((d / 64) as usize)
+        .is_some_and(|w| w & (1u64 << (d % 64)) != 0)
+}
