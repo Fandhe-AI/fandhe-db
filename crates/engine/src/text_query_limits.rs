@@ -5,8 +5,8 @@
 //! `wire-server` の `text_query_limits_opt` が CLI フラグ（`--max-text-query-terms`・
 //! `--max-text-query-prefix-expansions`）を厳密パースし、本モジュールの `validate_*` で範囲検証
 //! したうえで [`TextQueryLimits`] を組み立て、`EngineCore::with_text_query_limits` へ 1 回だけ
-//! 注入する（`regex_limits` と同じ流儀）。SQL / NoSQL 表層からの読み出し配線は後続 Issue
-//! （#2116）で、本 Issue は上限型と評価 API までを担う。範囲検証の単一情報源は本モジュール。
+//! 注入する（`regex_limits` と同じ流儀）。SQL の `HYBRID`／NoSQL の `hybrid.text` への配線は
+//! Issue #2116 で済み、`sql::exec` へは引数で明示的に渡す。範囲検証の単一情報源は本モジュール。
 //!
 //! 設計上の不変条件（`docs/design/text-query-limits-cli.md`）:
 //!

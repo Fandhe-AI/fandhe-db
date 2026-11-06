@@ -25,4 +25,4 @@
 ## 対象外
 
 - ハード上限の引き上げ・セッション単位の `SET` による変更
-- SQL／NoSQL 表層への配線（`EngineCore::text_query_limits()` の読み出しと `map_hybrid_error` への `54000` の写像は #2116）
+- SQL／NoSQL 表層への配線（Issue #2116 で実装済み。`EngineCore::run_select_plan` が `sql::exec` へ引数で渡し、`54000` は `map_hybrid_text_error` が固定の英語文へ写す）

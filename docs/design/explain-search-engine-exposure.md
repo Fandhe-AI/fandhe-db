@@ -719,3 +719,11 @@ EXPLAIN ANALYZE（親 #2052）の「計測の土台」を実行器へ入れた�
   入口は従来どおり `42601`。行数が上限（`MAX_EXPLAIN_TREE_LINES`）に追加行を足した範囲を超えたら `54001`。
 - **既知の制限**: 未解決の部分クエリ（`IN (SELECT ...)`／`EXISTS`）を含む WHERE の SELECT 系は、列の導出（Describe の束縛）が
   受理しないため `output:` を省く（他の行は出る）。段ごとの中間の出力列は今回は根の最終出力だけ。
+
+## 追記（Issue #2116・SEARCH-12 ポインタ）: `search_terms[i]` と全文検索クエリ構文
+
+`HYBRID` の検索語は全文検索のクエリ構文（フレーズ・`or`・除外・前方一致）として解釈されるが、
+`USING PLAN` の疎側は LLM 出力の `search_terms` を literal の語列として実行する
+（[fulltext-query-syntax.md](fulltext-query-syntax.md) D9）。したがって `search_terms[i]` 行に
+出る語（演算子の文字を含んでも加工しない）がそのまま実行時の解釈であり、EXPLAIN の出力は
+構文の導入前後で変わらない。構文の解釈結果を示す行は新しい安定契約になるため追加していない。
