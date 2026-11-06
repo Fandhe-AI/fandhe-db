@@ -421,6 +421,16 @@ fn bind_hybrid_tuning(
         None => None,
         Some(n) => match n.as_exact_u64() {
             Some(v) => Some(usize::try_from(v).unwrap_or(usize::MAX)),
+            // `u64` 超の桁だけの整数リテラルは `Float` 保持になる。型は整数なので
+            // 型不一致ではなく範囲外（`22000`）として扱い、SQL 経路と分類を揃える。
+            None if matches!(
+                &n,
+                engine::json::JsonNumber::Float { text, .. }
+                    if !text.is_empty() && text.bytes().all(|c| c.is_ascii_digit())
+            ) =>
+            {
+                Some(usize::MAX)
+            }
             None => {
                 return Err(SearchError::Shape(SchemaError::TypeMismatch {
                     key: "window",
@@ -1205,6 +1215,8 @@ mod tests {
     #[test]
     fn hybrid_tuning_out_of_range_is_22000() {
         for extra in [
+            r#","window":18446744073709551616"#,
+            r#","window":123456789012345678901234567890"#,
             r#","k1":-1"#,
             r#","b":1.5"#,
             r#","rrf_k":0"#,
