@@ -38,7 +38,7 @@ use crate::arena::{ArenaError, VectorArena};
 use crate::catalog::{CatalogError, ColumnType, TableSchema};
 use crate::core;
 use crate::declarative_filter;
-use crate::hybrid::{self, HybridError, HybridHit, RrfConfig};
+use crate::hybrid::{self, HybridError, HybridHit};
 use crate::kernel::{KernelError, SearchInput, SearchProvider};
 use crate::policy::PolicyContext;
 use crate::rls::{ImplicitRlsHook, RlsSafetyNet, RlsVerifiedHits};
@@ -54,12 +54,6 @@ use crate::sql::plan::ExecutionPlan;
 use crate::sql::udf_call;
 use crate::storage::rowid::hit_id_for_response;
 use crate::storage::StorageError;
-
-/// 疎コーパス側へ集約する候補プールの既定深さ。`hybrid::hybrid_search` の
-/// `cfg.pool_depth()` に渡す（[`hybrid::RrfConfig::new`] の検証を通過する範囲で、
-/// `bound.limit`（`1..=core::MAX_SEARCH_K`）を必ず満たせるよう `bound.limit` との
-/// 最大値を取る）。
-const DEFAULT_HYBRID_POOL_DEPTH: usize = 200;
 
 /// `candidate_columns`（RLS/SCALAR 段を通過した可視行のうち、投影で実際に使う
 /// スカラー列だけを保持するキャッシュ）が累計で保持してよいバイト数の上限
@@ -239,8 +233,9 @@ fn try_alloc_bytes_for_budget(
     Ok(owned)
 }
 
-// `pool_depth = bound.fetch_count().max(DEFAULT_HYBRID_POOL_DEPTH)`（取得件数 = `limit + offset`。
-// 束縛段が合計を設定値以下に検証済み。Issue #2008）が常に
+// `pool_depth = k_eff.max(既定深さ 200)`（`window` 未指定。取得件数 = `limit + offset`。
+// 束縛段が合計を設定値以下に検証済み。Issue #2008）か、`window` 指定時はその値（束縛段が
+// `--max-result-rows` 以下を検証済み。Issue #2120。`sql::hybrid_tuning::hybrid_rrf_config`）が常に
 // `hybrid::RrfConfig::new` の検証（`1..=hybrid::MAX_POOL_DEPTH`）を通過するのは、
 // `bound.limit` の上限（設定可能なハード上限 `MAX_RESULT_ROWS_HARD_CAP`。`sql::parser::bind` が
 // 設定値 `<=` ハード上限で検証済み。Issue #1555）が
@@ -1145,6 +1140,11 @@ fn map_hybrid_error(e: HybridError) -> SqlSurfaceError {
             | SparseError::CorpusTooLarge { .. }
             | SparseError::TooManyTokens { .. },
         ) => SqlSurfaceError::payload_too_large("hybrid sparse corpus exceeds capacity"),
+        // 利用者指定の重み・`rrf_k` の極端値でスコアがオーバーフローした場合。入力起因なので
+        // `Internal` ではなく `22000` にする（既定設定ではオーバーフローしない。SEARCH-13）。
+        HybridError::NonFiniteScore => {
+            SqlSurfaceError::invalid_input("HYBRID tuning produced a non-finite score")
+        }
         _ => SqlSurfaceError::Internal {
             detail: "hybrid search error".to_string(),
         },
@@ -3173,14 +3173,9 @@ pub(crate) fn execute_statement_with_cache_observed(
                     query,
                     query_text,
                     text_column_index: hybrid_text_column_index,
-                    ..
+                    tuning,
                 } => {
-                    let pool_depth = k_eff.max(DEFAULT_HYBRID_POOL_DEPTH);
-                    let cfg = RrfConfig::new(60.0, 1.0, 1.0, pool_depth).map_err(|_| {
-                        SqlSurfaceError::Internal {
-                            detail: "invalid hybrid RRF config".to_string(),
-                        }
-                    })?;
+                    let cfg = crate::sql::hybrid_tuning::hybrid_rrf_config(tuning, k_eff)?;
                     let input = SearchInput {
                         ids: &slot_ids,
                         vectors: arena.vectors(),
@@ -3533,12 +3528,11 @@ pub(crate) fn execute_statement_with_cache_observed(
                     conf.push(crate::precision::cosine_similarity(query, embedding).unwrap_or(0.0));
                 }
             }
-            Ranking::Hybrid { .. } => {
-                // 正規化に使う重み・ランク減衰定数は DISTANCE 段で使ったものと
-                // 同一の固定値（`60.0, 1.0, 1.0`）で、`pool_depth` は正規化の
-                // 計算式に現れないため既定値で構わない
-                // （`crate::precision::rrf_normalized` のドキュメント参照）。
-                let cfg = RrfConfig::default();
+            Ranking::Hybrid { tuning, .. } => {
+                // 正規化は DISTANCE 段の融合と同じ調整値（`rrf_k`・`weights`）の `RrfConfig` で行う
+                // （理論最大値が重み・定数に依存するため。SEARCH-13・Issue #2120）。`pool_depth` は
+                // 正規化式に現れない。
+                let cfg = crate::sql::hybrid_tuning::hybrid_rrf_config(tuning, k_eff)?;
                 for (_slot_id, score) in hits.iter().take(take_n) {
                     conf.push(crate::precision::rrf_normalized(*score, &cfg).unwrap_or(0.0));
                 }

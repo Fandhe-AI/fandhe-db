@@ -11,6 +11,7 @@ mod legacy_table;
 mod temp_db;
 
 mod nosql_bound_returning_public_api;
+mod search13_hybrid_tuning_exec;
 mod sql33_cosine_negip_execution;
 mod sql33_crossdb_self_shapes;
 mod sql33_distance_kind_acceptance;

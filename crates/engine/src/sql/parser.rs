@@ -88,8 +88,8 @@ pub enum Ranking {
         text_column_index: usize,
         query_text: String,
         /// 名前付き調整引数の束縛結果（SEARCH-13・Issue #2119）。既定（未指定）は
-        /// [`HybridTuning::default`]。実行器が使うまでは既定以外を実行・EXPLAIN 経路で
-        /// `0A000` により拒否する（#2120／#2121 で撤去）。
+        /// [`HybridTuning::default`]。`rrf_k`・`window`・`weights` は #2120 で実行器に接続済み。
+        /// `k1`／`b` は実行器が使うまで実行・EXPLAIN 経路で `0A000` により拒否する（#2121 で撤去）。
         tuning: HybridTuning,
     },
 }
@@ -3624,6 +3624,14 @@ fn bind_in_session_with_policy(
 
     check_limit_omission(stmt.limit_implicit, Some(resolved_mode.mode()))?;
     let (limit, offset, result_cap) = bind_limit_and_offset(stmt, result_limits)?;
+    // SEARCH-13・Issue #2120: `window` は `LIMIT + OFFSET` 以上・`--max-result-rows` 以下
+    // （範囲外は `22000`。クランプしない）。
+    crate::sql::hybrid_tuning::check_window(
+        &ranking,
+        offset.saturating_add(limit),
+        result_cap,
+        result_limits.max_result_rows(),
+    )?;
 
     // SQL-74 (2)・Issue #2036: 距離述語を含む文は `HINT ORDER` が DISTANCE を先にしても SCALAR を
     // 先（事前フィルタ）に倒す。距離述語を DISTANCE 段の後の事後フィルタにすると、上位 k 件が

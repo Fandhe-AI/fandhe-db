@@ -10,11 +10,15 @@
 //! エラー契約: 範囲外・型の不一致は `22000`（`invalid_input`）、未知の引数名は `42601`
 //! （`unsupported`）。エラー文は固定の英語文と引数名に留め、入力値の全文を含めない。
 //!
-//! 暫定ゲート: 本 Issue の時点では実行器が束縛値を使わないため、既定以外の [`HybridTuning`] を
-//! 持つ文は実行・EXPLAIN 経路で `0A000` により拒否される（[`HybridTuning::is_default`]。
-//! 指定が黙って無視される fail-open を避ける。#2120／#2121 で撤去する）。
+//! 実行器への接続（Issue #2120）: `rrf_k`・`window`・`weights` は [`hybrid_rrf_config`] が
+//! `RrfConfig` と候補プール深さに組み立てる。`window` の範囲検証は [`check_window`] に集約し、
+//! 束縛段・`EngineCore::check_bound_search`・実行時の 3 層から呼ぶ。
+//!
+//! 暫定ゲート: `k1`・`b` は #2121 まで実行器が使わないため、これらを持つ文は実行・EXPLAIN
+//! 経路で `0A000` により拒否される（[`ensure_tuning_applied`]。指定が黙って無視される
+//! fail-open を避ける。#2121 で撤去する）。
 
-use crate::hybrid::MAX_POOL_DEPTH;
+use crate::hybrid::{RrfConfig, MAX_POOL_DEPTH};
 use crate::json::{parse_json, JsonValue};
 use crate::sql::allowlist::{NamedArgValue, SqlSurfaceError};
 
@@ -36,7 +40,8 @@ impl HybridTuning {
     /// 値の範囲を検証して構築する（SEARCH-13）。`k1` は有限かつ 0 以上、`b` は有限かつ 0〜1、
     /// `rrf_k` は有限かつ正、`window` は `1..=MAX_POOL_DEPTH`、`weights`（密・疎）は各値が
     /// 有限かつ 0 以上で両方 0 は不可。違反は `22000`。`--max-result-rows` に依存する
-    /// `window` の上限は実行時設定が要るため #2120 の実行器が検査する。
+    /// `window` の上限・`LIMIT` との関係は実行時設定が要るため [`check_window`]
+    /// （束縛段・`check_bound_search`・実行時の 3 層）が検査する。
     pub fn new(
         k1: Option<f64>,
         b: Option<f64>,
@@ -136,19 +141,96 @@ impl HybridTuning {
     }
 }
 
-/// 暫定ゲート（fail-closed）: 調整引数を持つ `Ranking::Hybrid` の実行・EXPLAIN を `0A000` で拒否する。
-/// 実行器（`sql::exec` の hybrid 腕）が束縛値を使うようになるまで、指定が既定値のまま黙って
-/// 無視されることを防ぐ。`sql::exec`（実行）と `core.rs` の EXPLAIN 経路から呼ばれる。
-/// #2120（`rrf_k`・`window`・`weights`）／#2121（`k1`・`b`）で撤去する。
+/// 暫定ゲート（fail-closed）: BM25 の `k1`／`b` を持つ `Ranking::Hybrid` の実行・EXPLAIN を
+/// `0A000` で拒否する。`k1`／`b` は実行器が未接続（#2121）のため、指定が黙って無視されることを
+/// 防ぐ。`rrf_k`・`window`・`weights` は #2120 で実行器に接続済みなので通す。
+/// `sql::exec`（実行）と `core.rs` の EXPLAIN 経路から呼ばれる。
 pub(crate) fn ensure_tuning_applied(
     ranking: &crate::sql::parser::Ranking,
 ) -> Result<(), SqlSurfaceError> {
     match ranking {
-        crate::sql::parser::Ranking::Hybrid { tuning, .. } if !tuning.is_default() => Err(
-            SqlSurfaceError::feature_not_supported("HYBRID tuning arguments are not supported yet"),
-        ),
+        crate::sql::parser::Ranking::Hybrid { tuning, .. }
+            if tuning.k1().is_some() || tuning.b().is_some() =>
+        {
+            Err(SqlSurfaceError::feature_not_supported(
+                "HYBRID tuning arguments k1 and b are not supported yet",
+            ))
+        }
         _ => Ok(()),
     }
+}
+
+/// `window` の範囲検証（SEARCH-13・Issue #2120）。`window` 未指定なら何もしない。
+/// 受理条件は `fetch_count`（`LIMIT + OFFSET`）以上かつ `max_result_rows` 以下で、
+/// 範囲外はクランプ・黙った件数削減をせず `22000` で拒否する（fail-closed）。`LIMIT` 省略
+/// （`result_cap` が `Some`）の文は取得窓が受理範囲を常に超えるため専用文言で拒否する。
+/// `sql::parser` の束縛段と `core.rs::EngineCore::check_bound_search`（外部で組み立てた計画への
+/// 多層防御）から呼ばれる。エラー文言は固定の英語で、入力値・件数を含めない。
+pub(crate) fn check_window(
+    ranking: &crate::sql::parser::Ranking,
+    fetch_count: usize,
+    result_cap: Option<usize>,
+    max_result_rows: usize,
+) -> Result<(), SqlSurfaceError> {
+    let crate::sql::parser::Ranking::Hybrid { tuning, .. } = ranking else {
+        return Ok(());
+    };
+    let Some(w) = tuning.window() else {
+        return Ok(());
+    };
+    if w > max_result_rows {
+        return Err(range_error("window"));
+    }
+    if result_cap.is_some() {
+        return Err(SqlSurfaceError::invalid_input(
+            "HYBRID argument window requires an explicit LIMIT",
+        ));
+    }
+    if w < fetch_count {
+        return Err(SqlSurfaceError::invalid_input(
+            "HYBRID argument window must be at least LIMIT plus OFFSET",
+        ));
+    }
+    Ok(())
+}
+
+/// 調整引数から RRF 設定を組み立てる（SEARCH-13・Issue #2120）。`sql::exec` の hybrid 融合と
+/// precision 正規化が同じ値を使うよう、組み立てをここに 1 本化する。
+///
+/// - `rrf_k`・`weights` 未指定は [`RrfConfig::default`] の値（60・等重み）。
+/// - `window` 未指定の `pool_depth` は従来どおり `k_eff.max(既定深さ)`（無指定文の結果を
+///   バイト一致させる）。指定時は `window` そのもので、`k_eff > window` は `22000`
+///   （precision／SCALAR 事後フィルタ経路は `k_eff` がデータ件数に依存するため、実行時の
+///   最終防衛。`hybrid_search_boosted` の `InvalidK` が `XX000` に化けるのを防ぐ。拒否条件は
+///   自テナントの可視件数のみに依存し、文言は固定で件数を含めない）。
+pub(crate) fn hybrid_rrf_config(
+    tuning: &HybridTuning,
+    k_eff: usize,
+) -> Result<RrfConfig, SqlSurfaceError> {
+    let default = RrfConfig::default();
+    let pool_depth = match tuning.window() {
+        None => k_eff.max(default.pool_depth()),
+        Some(w) => {
+            if k_eff > w {
+                return Err(SqlSurfaceError::invalid_input(
+                    "HYBRID argument window must be at least the number of candidates requested",
+                ));
+            }
+            w
+        }
+    };
+    let (dense_weight, sparse_weight) = tuning
+        .weights()
+        .unwrap_or((default.dense_weight(), default.sparse_weight()));
+    RrfConfig::new(
+        tuning.rrf_k().unwrap_or(default.k_const()),
+        dense_weight,
+        sparse_weight,
+        pool_depth,
+    )
+    .map_err(|_| SqlSurfaceError::Internal {
+        detail: "invalid hybrid RRF config".to_string(),
+    })
 }
 
 fn range_error(name: &str) -> SqlSurfaceError {
@@ -273,5 +355,82 @@ mod tests {
         for n in ["pool_depth", "dense_weight", "k2"] {
             assert_eq!(code(one(n, num("1"))), "42601", "{n}");
         }
+    }
+
+    fn hybrid_ranking(tuning: HybridTuning) -> crate::sql::parser::Ranking {
+        crate::sql::parser::Ranking::Hybrid {
+            query: vec![1.0],
+            text_column_index: 0,
+            query_text: "q".to_string(),
+            tuning,
+        }
+    }
+
+    /// Issue #2120: ゲートは `k1`／`b` だけを拒否し、接続済みの引数は通す。
+    #[test]
+    fn gate_rejects_only_k1_and_b() {
+        let ok = HybridTuning::new(None, None, Some(10.0), Some(5), Some((1.0, 0.0))).unwrap();
+        assert!(ensure_tuning_applied(&hybrid_ranking(ok)).is_ok());
+        for t in [
+            HybridTuning::new(Some(1.2), None, None, None, None).unwrap(),
+            HybridTuning::new(None, Some(0.5), None, None, None).unwrap(),
+        ] {
+            let e = ensure_tuning_applied(&hybrid_ranking(t)).unwrap_err();
+            assert_eq!(e.wire_code(), "0A000");
+        }
+    }
+
+    /// Issue #2120: `window` の境界（`LIMIT + OFFSET` 以上・上限以下・`LIMIT` 省略は拒否）。
+    #[test]
+    fn check_window_boundaries() {
+        let r =
+            |w: usize| hybrid_ranking(HybridTuning::new(None, None, None, Some(w), None).unwrap());
+        assert!(check_window(&r(5), 5, None, 100).is_ok());
+        assert_eq!(
+            check_window(&r(4), 5, None, 100).unwrap_err().wire_code(),
+            "22000"
+        );
+        assert!(check_window(&r(100), 5, None, 100).is_ok());
+        assert_eq!(
+            check_window(&r(101), 5, None, 100).unwrap_err().wire_code(),
+            "22000"
+        );
+        assert_eq!(
+            check_window(&r(50), 101, Some(100), 100)
+                .unwrap_err()
+                .wire_code(),
+            "22000"
+        );
+        // window 未指定・非 hybrid は対象外。
+        assert!(check_window(&hybrid_ranking(HybridTuning::default()), 500, None, 100).is_ok());
+    }
+
+    /// Issue #2120: `window` 未指定は従来の `k_eff.max(200)`、指定時はその値。
+    #[test]
+    fn rrf_config_assembly() {
+        let d = HybridTuning::default();
+        let c = hybrid_rrf_config(&d, 10).unwrap();
+        assert_eq!(
+            (
+                c.k_const(),
+                c.dense_weight(),
+                c.sparse_weight(),
+                c.pool_depth()
+            ),
+            (60.0, 1.0, 1.0, 200)
+        );
+        assert_eq!(hybrid_rrf_config(&d, 350).unwrap().pool_depth(), 350);
+        let t = HybridTuning::new(None, None, Some(7.0), Some(20), Some((2.0, 0.0))).unwrap();
+        let c = hybrid_rrf_config(&t, 20).unwrap();
+        assert_eq!(
+            (
+                c.k_const(),
+                c.dense_weight(),
+                c.sparse_weight(),
+                c.pool_depth()
+            ),
+            (7.0, 2.0, 0.0, 20)
+        );
+        assert_eq!(hybrid_rrf_config(&t, 21).unwrap_err().wire_code(), "22000");
     }
 }

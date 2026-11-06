@@ -37,7 +37,7 @@ spec 由来の具体的な方針・契約の公開は、オーナー承認を得
 | BM25 | `k1 = 1.2`・`b = 0.75`（`DEFAULT_K1`・`DEFAULT_B`） |
 | `FunctionArg` | Ident と StringLiteral のみ。数値・名前付き引数を表せない |
 | 字句 | `=>` トークンがない |
-| `RrfConfig::new` | 重み 0 を拒否する |
+| `RrfConfig::new` | 重み 0 を拒否する（#2120 で片側 0 を受理に変更） |
 | NoSQL スキーマ | `SchemaError` はすべて 42601 に写る |
 | precision の正規化 | 既定の `RrfConfig::default()` を固定で使う |
 
@@ -88,3 +88,13 @@ SQL 表層の入口だけを実装した。実行器への反映は後続 Issue 
 - `weights` の SQL 形: 文字列リテラルの JSON `'{"dense": <数>, "sparse": <数>}'`（キーはこの 2 つちょうど）。SEARCH-13 に SQL 形の定めがないため本実装で決めた解釈で、spec 側での確認を要する
 - 暫定ゲート: 実行器が束縛値を使うまで、既定以外の `tuning` を持つ文は実行と EXPLAIN で `0A000` にする（指定が黙って無視される fail-open の防止）。#2120・#2121 で撤去する
 - #2120 へ渡す事項: `window` の `--max-result-rows` 上限の検査、`RrfConfig::new` が重み 0 を拒否する点との整合（束縛は片側 0 の重みを受理する）、ソフトブーストの上限計算との整合
+
+## 9. Issue #2120 での実装（実行器）
+
+`rrf_k`・`window`・`weights` を実行器に接続した（SEARCH-13）。`k1`・`b` は #2121 の担当。
+
+- 組み立て: `sql::hybrid_tuning::hybrid_rrf_config` が `RrfConfig` を 1 か所で作り、融合と precision 正規化が同じ値を使う。未指定は従来値（60・等重み）で、`window` 未指定の `pool_depth` は従来どおり `max(k_eff, 200)`。調整引数なしの文は結果が従来とバイト一致する
+- `window` の検証（すべて `22000`・クランプなし）: 束縛段（`LIMIT + OFFSET` 以上、`--max-result-rows` 以下）、`EngineCore::check_bound_search`（外部で組み立てた計画への多層防御）、実行時（precision・SCALAR 事後フィルタ経路で `k_eff` が `window` を超える場合の最終防衛。自テナントの可視件数だけに依存し、文言は固定）。`LIMIT` 省略と `window` の併用も拒否する
+- `RrfConfig::new`: 重みを「有限かつ 0 以上、両方 0 は不可」に緩めた（受理範囲の拡大のみ）。重み 0 の側は寄与 0 になり、同点は id 昇順で決定的
+- 極端値: スコアが非有限になる指定（巨大な重みなど）は `XX000` ではなく `22000`。巨大な `rrf_k` は順位差が潰れ、所属リスト数と id 昇順で決まる
+- 暫定ゲート: `k1`／`b` を持つ文だけ `0A000` のまま。EXPLAIN は `rrf_k`・`window`・`weights` を受理するが、実効値の表示は対象外（担当 Issue なし）
