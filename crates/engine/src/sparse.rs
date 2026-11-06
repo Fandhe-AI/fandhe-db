@@ -100,6 +100,7 @@ const DEFAULT_K1: f64 = 1.2;
 /// BM25 の Okapi パラメータ既定値（文書長正規化の強さ）。
 const DEFAULT_B: f64 = 0.75;
 
+pub mod headline;
 pub mod match_span;
 
 /// [`SparseIndex::search`] が受け付けるクエリの一意語数の上限。

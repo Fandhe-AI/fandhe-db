@@ -148,6 +148,7 @@ pub mod framing;
 pub mod function_limits_opt;
 pub mod group_by_limits_opt;
 pub mod handshake;
+pub mod headline_limits_opt;
 pub mod hnsw_scope_opt;
 pub mod http;
 pub mod join_limits_opt;

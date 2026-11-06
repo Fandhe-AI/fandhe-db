@@ -223,6 +223,9 @@ fn is_known_non_immutable_name(lower: &str) -> bool {
     matches!(
         lower,
         "concat"
+            // `ts_headline` は検索設定に依存して STABLE（PostgreSQL の分類）。式索引・生成列に
+            // 置けない（Issue #2125）。
+            | "ts_headline"
             | "concat_ws"
             | "to_json"
             | "to_jsonb"

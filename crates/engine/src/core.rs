@@ -565,6 +565,13 @@ pub struct MaterializedCteEvalStats {
     pub evaluations: u64,
 }
 
+/// 束縛区間（`sql::parser::bind_*`）に張る文脈スコープの束。`SPARSEVEC` 上限（Issue #2027）と
+/// `ts_headline` 上限（Issue #2125）を同じ入口で保持するための RAII ガード（drop で両方戻る）。
+pub(crate) struct BindLimitsScope {
+    _sparsevec: crate::sparsevec_limits::SparseVecLimitsScope,
+    _headline: crate::headline_limits::HeadlineLimitsScope,
+}
+
 /// [`PrefilterCache`] の 1 エントリ（TASK-169）。`table`・`ctx` の組がキャッシュキー
 /// （`PolicyContext` は `Hash` を実装しないため `HashMap` ではなく `Vec` 線形走査で
 /// 照合する。エントリ数は [`MAX_PREFILTER_CACHE_ENTRIES`] で小さく抑えるため走査コストは
@@ -1476,6 +1483,10 @@ pub struct EngineCore {
     /// 差し替えは [`Self::with_sparsevec_limits`] のみ（起動時 1 回）。束縛クロージャを呼ぶ区間と
     /// 文実行入口が [`Self::sparsevec_limits_scope`] で張り、`sql::parser::parse_sparsevec_literal` が読む。
     sparsevec_limits: crate::sparsevec_limits::SparseVecLimits,
+    /// `ts_headline` の出力バイト長・断片数上限（Issue #2125）。既定はハード上限。差し替えは
+    /// [`Self::with_headline_limits`] のみ（起動時 1 回）。`sparsevec_limits_scope` が同じ区間で
+    /// スコープに張り、`sql::udf_call::bind_call` が束縛時に関数ノードへ焼き込む。
+    headline_limits: crate::headline_limits::HeadlineLimits,
     /// サブクエリ深さ・実行回数・CTE 定義数・CTE 連鎖深さの上限（Issue #1552）。
     /// 差し替えは [`Self::with_nesting_limits`] のみ（起動時 1 回）。構文解析段と
     /// サブクエリ解決段にだけ効き、格納済みビュー本文の再パースはハード上限のまま。
@@ -3392,6 +3403,7 @@ impl EngineCore {
             jsonpath_limits: crate::jsonpath_limits::JsonPathLimits::default(),
             regex_limits: crate::regex_limits::RegexLimits::default(),
             sparsevec_limits: crate::sparsevec_limits::SparseVecLimits::default(),
+            headline_limits: crate::headline_limits::HeadlineLimits::default(),
             nesting_limits: crate::nesting_limits::NestingLimits::default(),
             window_limits: crate::window_limits::WindowLimits::default(),
             join_limits: crate::join_limits::JoinSizeLimits::default(),
@@ -3832,8 +3844,27 @@ impl EngineCore {
 
     /// 束縛区間（`sql::parser::bind_*` 呼び出し）に張る `SPARSEVEC` 上限スコープ。スコープが無い
     /// 経路はハード上限へ戻り、下げた設定が効かない fail-open になるため、束縛を行う入口では必ず保持する。
-    pub(crate) fn sparsevec_limits_scope(&self) -> crate::sparsevec_limits::SparseVecLimitsScope {
-        crate::sparsevec_limits::SparseVecLimitsScope::enter(self.sparsevec_limits)
+    ///
+    /// `ts_headline` の上限スコープ（Issue #2125）も同じ区間で張る（束縛区間が同一のため、
+    /// 約 30 箇所の入口を個別に触らず戻り値のガードへ束ねる）。
+    pub(crate) fn sparsevec_limits_scope(&self) -> BindLimitsScope {
+        BindLimitsScope {
+            _sparsevec: crate::sparsevec_limits::SparseVecLimitsScope::enter(self.sparsevec_limits),
+            _headline: crate::headline_limits::HeadlineLimitsScope::enter(self.headline_limits),
+        }
+    }
+
+    /// `ts_headline` の出力バイト長・断片数上限（[`crate::headline_limits::HeadlineLimits`]）を
+    /// 差し替えたビルダーを返す（Issue #2125）。`wire-server` の起動時 CLI フラグ
+    /// `--max-ts-headline-bytes`／`--max-ts-headline-fragments` からのみ呼ぶ。
+    pub fn with_headline_limits(mut self, limits: crate::headline_limits::HeadlineLimits) -> Self {
+        self.headline_limits = limits;
+        self
+    }
+
+    /// 現在の `ts_headline` 上限（Issue #2125）。
+    pub fn headline_limits(&self) -> crate::headline_limits::HeadlineLimits {
+        self.headline_limits
     }
 
     /// サブクエリ深さ・実行回数・CTE 定義数・CTE 連鎖深さの上限

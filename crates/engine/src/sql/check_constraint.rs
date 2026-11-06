@@ -2182,6 +2182,22 @@ mod tests {
                     Expr::Number("2".to_string()),
                 ],
             ),
+            // Issue #2125・SEARCH-14: ts_headline の 2・3 引数形。
+            call(
+                "ts_headline",
+                vec![
+                    Expr::Ident("label".to_string()),
+                    Expr::String("a".to_string()),
+                ],
+            ),
+            call(
+                "ts_headline",
+                vec![
+                    Expr::Ident("label".to_string()),
+                    Expr::String("a".to_string()),
+                    Expr::String("MaxWords=9, MinWords=3".to_string()),
+                ],
+            ),
             call("trim", vec![Expr::Ident("label".to_string())]),
             call(
                 "replace",

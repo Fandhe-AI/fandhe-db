@@ -271,6 +271,7 @@ pub mod parallel_search;
 #[allow(dead_code)]
 pub(crate) mod plpgsql;
 // PL/pgSQL の実行上限（Issue #2224・#2225）。wire-server の CLI が `PlpgsqlLimits` を組み立てる。
+pub mod headline_limits;
 pub mod plpgsql_limits;
 pub mod policy;
 pub mod precision;
