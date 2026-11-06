@@ -12,6 +12,7 @@ mod temp_db;
 
 mod nosql_bound_returning_public_api;
 mod search13_hybrid_tuning_exec;
+mod search15_rerank_wiring;
 mod search17_hybrid_explain_score;
 mod sql33_cosine_negip_execution;
 mod sql33_crossdb_self_shapes;

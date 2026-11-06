@@ -1535,6 +1535,13 @@ pub struct EngineCore {
     /// 起動時の CLI（wire-server の `text_analysis_opt`）だけが `with_text_analysis` で決め、
     /// SQL／NoSQL のセッションからは変えられない。既定は恒等。
     text_analysis: std::sync::Arc<crate::sparse::TextAnalysis>,
+    /// 検索後段のリランク設定（Issue #2142・SEARCH-15 のポインタ。設計記録:
+    /// `docs/design/rerank-wiring-policy.md`）。起動時の CLI（wire-server の `rerank_opt`）か
+    /// Rust の builder（`with_rerank`）だけが決め、SQL／NoSQL のセッションからは変えられない。
+    /// 既定は off（従来経路をそのまま通る）。
+    rerank_settings: crate::rerank::RerankSettings,
+    /// リランクの適用・適用外・縮退の累計カウンタ（`rerank_stats` で観測する。件数のみ）。
+    rerank_counters: crate::rerank::RerankCounters,
     /// SQL 表層（`sql::exec::execute_statement_with_cache`）専用の `VectorArena`
     /// テーブル世代整合キャッシュ（Issue #363）。[`Self::execute_validated_in_session`]
     /// の `Statement::Select` アームがこれを経由してアリーナ再構築（redb 全行走査・
@@ -3415,6 +3422,8 @@ impl EngineCore {
             dictionary_config: crate::dictionary::DictionaryConfig::default(),
             sparse_index_cache: crate::sql::sparse_cache::SparseIndexCache::new(),
             text_analysis: std::sync::Arc::new(crate::sparse::TextAnalysis::default()),
+            rerank_settings: crate::rerank::RerankSettings::off(),
+            rerank_counters: crate::rerank::RerankCounters::default(),
             sql_arena_cache: crate::sql::arena_cache::SqlArenaCache::new(),
             scalar_index_cache: crate::sql::scalar_index::ScalarIndexCache::new(),
             visible_bitmap_cache: crate::sql::visible_cache::VisibleBitmapCache::new(),
@@ -3462,6 +3471,37 @@ impl EngineCore {
     /// 現在のテキスト処理設定を返す。
     pub fn text_analysis(&self) -> &crate::sparse::TextAnalysis {
         &self.text_analysis
+    }
+
+    /// 検索後段のリランク設定（Issue #2142・SEARCH-15 のポインタ）を差し替える。
+    ///
+    /// `self` を消費するビルダーで、起動時の組み立て（wire-server の `main`）からだけ呼ばれる。
+    /// SQL／NoSQL のセッションからは届かない。既定は off で、off のとき実行器は従来経路を
+    /// そのまま通る。`VectorCore` trait には載せない固有メソッド（`core_api.snapshot` の対象外）。
+    pub fn with_rerank(mut self, settings: crate::rerank::RerankSettings) -> Self {
+        self.rerank_settings = settings;
+        self
+    }
+
+    /// 現在のリランク設定を返す。
+    pub fn rerank_settings(&self) -> &crate::rerank::RerankSettings {
+        &self.rerank_settings
+    }
+
+    /// リランクの適用・適用外・縮退の累計件数を返す（運用観測用。件数のみで、id・本文・
+    /// テナント情報は含まない）。`VectorCore` trait には載せない固有メソッド。
+    pub fn rerank_stats(&self) -> crate::rerank::RerankStats {
+        self.rerank_counters.snapshot()
+    }
+
+    /// 実行器へ渡すリランク設定の束。off のときは `None`（実行器の分岐自体を通らない）。
+    fn rerank_access(&self) -> Option<crate::sql::rerank_stage::RerankAccess<'_>> {
+        self.rerank_settings
+            .is_enabled()
+            .then_some(crate::sql::rerank_stage::RerankAccess {
+                settings: &self.rerank_settings,
+                counters: &self.rerank_counters,
+            })
     }
 
     /// [`crate::sql::sparse_cache::SparseIndexCache`] の現在の統計を返す
@@ -13402,6 +13442,7 @@ impl EngineCore {
                 declarations_enabled: self.hnsw_state.is_some(),
             }),
             &self.text_analysis,
+            self.rerank_access(),
         )
     }
 
@@ -21842,6 +21883,7 @@ mod tests {
             None,
             None,
             &core.text_analysis,
+            None,
         )
         .expect("execute_statement should succeed");
         let row = result
