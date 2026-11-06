@@ -390,8 +390,10 @@ feature 付きビルド（例: `cargo build --release -p fandhe-db-wire-server -
 リランキング前の順位で応答します（縮退はログとカウンタ `degraded_timeout` に残ります）。モデルファイルは
 リポジトリにコミットしないでください。
 
-`--english-stemmer`（Issue #2129）は承認と feature 有効化の前のため、値の有無にかかわらず常に起動エラーになる
-（固定文言で拒否。`docs/design/stemming-crate-adoption.md`）。
+`--english-stemmer`（Issue #2129・#3050）は値を取らないスイッチで、疎検索の英語トークンを語幹にそろえる
+（索引とクエリの両方。起動時固定）。engine の `english-stemmer` feature 付き（`--features engine/english-stemmer`）の
+ビルドでのみ受理し、既定ビルドでは固定文言で起動エラーになる（重複指定も起動エラー）。CJK には適用しない。
+現状 `ts_headline` の強調には反映されない（`docs/design/stemming-crate-adoption.md`）。
 
 `--max-dml-affected-rows`・`--max-insert-rows`（Issue #997。オーナー判断の
 改訂・2026-09-27）は、それぞれ述語形 `UPDATE`／`DELETE`（`WHERE` 句付き）の

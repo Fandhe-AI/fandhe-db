@@ -1,11 +1,11 @@
 # ADR: 英語ステミング（Snowball 系）クレート導入（承認資料）
 
-- ステータス: Proposed（**オーナー承認は未取得**）。承認が記録されるまで #2129 に着手しない（第 7 節）
+- ステータス: Accepted（2026-11-06 に `rust-stemmers = "=1.2.0"` を承認。第 8 節・第 9 節）
 - 対応: Issue #2128（親 #2127。後続は #2129。#2130 の設定ファイルは依存を要さない）
 - 関連ビヘイビア: SEARCH-16（関連として SEARCH-5・SEARCH-11。日本語の形態素解析は EXT-8）。ポインタ: `docs/spec/04-behavior/`。本文は転記しない（[spec-confidentiality](../../.claude/rules/spec-confidentiality.md)）
 - 関連コード: `crates/engine/src/sparse.rs`（`walk_tokens`・`tokenize_with_options`）、`crates/engine/src/sparse/match_span.rs`（`normalize_for_match`。ステミングの拡張点として恒等関数で確保済み）、`crates/wire-server/src/main.rs`（未知の引数は `unknown argument` で非 0 終了）
 - 関連 doc（承認資料の先例）: [wasmtime-adoption.md](wasmtime-adoption.md)、[regex-crate-adoption.md](regex-crate-adoption.md)、[icu-collator-adoption.md](icu-collator-adoption.md)。関連: [cjk-stopword-tokenizer.md](cjk-stopword-tokenizer.md)、[fulltext-query-syntax.md](fulltext-query-syntax.md)
-- 本 ADR は docs のみの変更であり、`Cargo.toml`・`Cargo.lock`・`deny.toml`・コードを変更しない
+- 本 ADR は Proposed 時点では docs のみの変更だった。実装（Phase B）は Issue #3050 で第 9 節に記録する
 
 ## 1. 背景・自作しない理由
 
@@ -100,3 +100,35 @@
 - オーナーのコメントが明示すべき項目: 承認か却下か、クレートと版（`=x.y.z` の完全固定）、第 4 節 1〜5 それぞれの採否
 - 却下の場合は「ステミングは未提供（指定は拒否）のまま」と記録し、#2129 の扱いはオーナーが決める
 - 2026-11-06: #2129 の Phase A で専用フラグ `--english-stemmer` による起動拒否を追加した。承認は引き続き未取得（ステータスは Proposed のまま）
+- 2026-11-06: オーナーが #2127 のコメント（https://github.com/Fandhe-AI/fandhe-db/issues/2127#issuecomment-6683646303）で承認した。承認されたのは `rust-stemmers = "=1.2.0"` の直接依存 1 行で、版の変更は再承認とする。ステータスを Accepted に変えた
+- 上記コメントに**書かれていない項目は「未指定」**とする: 第 4 節 1〜5 それぞれの採否、feature 名。feature 名 `english-stemmer` は第 4 節 1 が最終決定を実装 Issue に委ねているため #3050 の実装側の選択であり、オーナーが承認した名前ではない
+
+## 9. 実装記録（Issue #3050・Phase B）
+
+### 確定した設計
+
+- 依存: `crates/engine/Cargo.toml` に `rust-stemmers = { version = "=1.2.0", optional = true }` と feature `english-stemmer`（default に含めない）。`Cargo.lock` の増分は `rust-stemmers` 1 件のみ。`make deny` は ok（`MIT/BSD-3-Clause` を受理）
+- 設定の置き場: `sparse::TextAnalysis`（#2130）にステミングのフラグを載せ、`TextAnalysis::with_english_stemmer()` で有効にして新しい `analysis_id` を採番する。索引は構築時に設定を固定し、`sql::sparse_cache` と `PhrasePattern` が `analysis_id` を照合するため、設定を変えると古い索引・パターンは使われず再構築される。`tokenize_with_options` のシグネチャは変えていない（Issue 本文の「`tokenize_with_options` に追加」からの意図的な乖離）
+- 処理順（PostgreSQL の辞書チェーンに合わせる）: 同義語に当たれば置き換え先を最終形とし**ステミングしない** → 当たらなければステミング前の形でストップワードと照合 → 残った語のうち、全文字が ASCII 小文字英字で長さが `MAX_STEM_INPUT_BYTES`（128）以下のものだけを英語でステミング。それ以外（CJK のユニグラム／バイグラム・数字や `_` を含む語・長すぎる語）は原形のまま通す。出力が空なら原形を通す
+- 既知の制約: 同義語の置き換え先はステミングされない。本文に置き換え先そのものが現れるとステミングされるため、一致させたい運用者は置き換え先を語幹形で書く
+- 前方一致（`語*`）: 有効時は語幹にもステミング段だけをかける（同義語・ストップワードは #2130 の挙動を保つためかけない）。`running*` は `run` 系の語に当たる
+- 可用性: `sparse::analysis::english_stemmer_available()`。feature 無効のビルドで `with_english_stemmer()` は `Err`（fail-closed）
+- CLI: wire-server の `--english-stemmer` は値を取らないスイッチ。wire-server は feature を持たず、`--features engine/english-stemmer` でビルドしたときだけ受理する。既定ビルドは従来どおり固定文言で起動エラー、有効ビルドでも 2 回の指定は起動エラー。サーバー全体の起動時設定のみで、SQL・NoSQL・テナントのセッションから変える経路は無い
+- 既定ビルドの保証: `make test-default-build` が `english_stemmer_feature_off` テストと、`cargo tree` に `rust-stemmers` が現れないことを検査する
+
+### 対象外・要追跡
+
+- `ts_headline`・`match_span` は `TextAnalysis` を受け取らない（#2130 のストップワード・同義語も未反映）。ステミング有効時も語形違いは強調されない。第 5 節の `normalize_for_match` への接続は未実施
+- 字句リランカー（`rerank.rs`）は素の `sparse::tokenize` を使い、ステミングしない
+- 英語以外の言語・実行時に言語名を指定する API（第 4 節 5 のとおり作らない）
+
+### 再現率の実測（AC3）
+
+自作の合成英語コーパス（20 主題 × 6 文書 = 120 文書。主題語を原形・三単現・過去形・進行形のいずれかで含み、一般語の雑音を足す）で、クエリは主題語の原形、正解はその主題の 6 文書。BM25 の Top-k で測った（`crates/engine/tests/sparse_english_stemming_recall.rs`。決定的で固定値を assert する）。
+
+| 設定 | Recall@5 | Recall@10 | MRR |
+| ---- | -------- | --------- | --- |
+| ステミング無効 | 0.4000 | 0.3333 | 1.0000 |
+| ステミング有効 | 1.0000 | 1.0000 | 1.0000 |
+
+合成コーパスは語形変化の効果を見るためのもので、実コーパスの再現率を表さない。再現手順: `cargo test -p fandhe-db-engine --features english-stemmer --test sparse_english_stemming_recall -- --nocapture`
