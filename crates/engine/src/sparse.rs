@@ -171,6 +171,7 @@ impl Default for Bm25Params {
 pub mod analysis;
 pub mod match_span;
 pub mod phrase;
+pub mod text_eval;
 pub mod text_query;
 
 /// [`SparseIndex::search`] が受け付けるクエリの一意語数の上限。
@@ -180,7 +181,7 @@ pub mod text_query;
 /// （モジュールコメントの計算量を参照）。untrusted なクエリ文字列の語数を無制限に
 /// 許すと、この積によって CPU コストを増幅させられる。1024 語は通常のキーワード
 /// クエリを十分満たす一方、積を有界に保つための上限として妥当な値とする。
-const MAX_QUERY_TERMS: usize = 1024;
+pub(crate) const MAX_QUERY_TERMS: usize = 1024;
 
 /// [`SparseIndex::search`] が受け付けるクエリのバイト長の上限。
 ///
@@ -979,6 +980,12 @@ pub struct SparseIndex {
     /// 枯渇した場合は [`Self::acquire_scratch`] が新規確保へフォールバックする
     /// ため正当性には影響しない）。
     scratch_pool: Mutex<Vec<ScoreScratch>>,
+    /// 前方一致の展開用の順序付き語彙（Issue #2115・SEARCH-12 ポインタ。D6）。先頭が ASCII
+    /// 単語文字の語だけを `(語, TermId)` で文字列の昇順に持つ。`terms`（`HashMap`）は変えず、
+    /// `語幹*` の展開を範囲走査（`partition_point`）で行うための補助索引。CJK の前方一致は
+    /// パーサが通常語へ落とす（D4）ため対象外で、CJK が語彙の大半を占めても重複保持が小さい。
+    /// 不変条件: 昇順・重複なし・`terms` の ASCII 語と 1 対 1。
+    prefix_vocab: Vec<(Box<str>, TermId)>,
     /// 構築時に固定したテキスト処理設定（Issue #2130）。クエリ側のトークン化にも同じ
     /// 設定を使うことで、索引とクエリの非対称を構造的に作れなくする。共有の `Arc` は
     /// 索引ごとの所有ではないため [`Self::approx_heap_bytes`] には数えない。
@@ -1520,6 +1527,16 @@ impl SparseIndex {
         }
         doc_len_class.shrink_to_fit();
 
+        // 前方一致用の順序付き語彙（Issue #2115）。キーは一意なので安定ソートで全順序が決まる。
+        let mut prefix_vocab: Vec<(Box<str>, TermId)> = terms
+            .ids
+            .iter()
+            .filter(|(t, _)| t.chars().next().is_some_and(is_ascii_word_char))
+            .map(|(t, &id)| (t.clone().into_boxed_str(), id))
+            .collect();
+        prefix_vocab.sort_by(|a, b| a.0.cmp(&b.0));
+        prefix_vocab.shrink_to_fit();
+
         Ok(SparseIndex {
             k1,
             b,
@@ -1535,6 +1552,7 @@ impl SparseIndex {
             len_classes,
             doc_len_class,
             scratch_pool: Mutex::new(Vec::new()),
+            prefix_vocab,
             analysis,
         })
     }
@@ -2290,12 +2308,28 @@ impl SparseIndex {
             .saturating_add(doc_freq)
             .saturating_add(postings)
             .saturating_add(self.approx_position_heap_bytes())
+            .saturating_add(self.approx_prefix_vocab_heap_bytes())
             .saturating_add(doc_len)
             .saturating_add(doc_ids)
             .saturating_add(id_index)
             .saturating_add(len_classes)
             .saturating_add(doc_len_class)
             .saturating_add(scratch_pool_upper_bound)
+    }
+
+    /// 前方一致用の順序付き語彙 `prefix_vocab`（Issue #2115）のヒープ確保分の概算バイト量。
+    /// 外側 `Vec` の容量と各 `Box<str>` の長さを数える（下回らない側の概算）。
+    pub fn approx_prefix_vocab_heap_bytes(&self) -> usize {
+        let outer = self
+            .prefix_vocab
+            .capacity()
+            .saturating_mul(std::mem::size_of::<(Box<str>, TermId)>());
+        let inner: usize = self
+            .prefix_vocab
+            .iter()
+            .map(|(t, _)| t.len())
+            .fold(0usize, |acc, n| acc.saturating_add(n));
+        outer.saturating_add(inner)
     }
 
     /// 位置配列 `positions`（Issue #2114）のヒープ確保分の概算バイト量。

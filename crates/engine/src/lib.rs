@@ -297,6 +297,7 @@ pub mod sql;
 pub mod storage;
 pub mod temp_table_limits;
 pub mod tenant;
+pub mod text_query_limits;
 // 注意: `test_sync` は feature `test-sync-points` 限定（既定ビルドには存在しない）。
 // core_api.snapshot は `pub mod` 行のみをテキスト抽出し cfg 属性を含めないため、
 // スナップショット上は無条件の `pub mod test_sync;` として記録される（Issue #1363）。

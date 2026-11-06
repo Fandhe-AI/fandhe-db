@@ -132,7 +132,9 @@ cargo run -p fandhe-db-wire-server -- --users <ユーザーストアのパス> -
   [--wasm-max-fuel <1-100000000>] \
   [--max-jsonpath-steps <1-4000000>] [--max-jsonpath-depth <1-1024>] \
   [--max-regex-pattern-len <1-4096>] [--max-regex-input-len <1-4194304>] \
-  [--max-regex-compiled-size <1-10485760>] [--max-sparsevec-nnz <1-16000>] \
+  [--max-regex-compiled-size <1-10485760>] \
+  [--max-text-query-terms <1-1024>] [--max-text-query-prefix-expansions <1-1024>] \
+  [--max-sparsevec-nnz <1-16000>] \
   [--max-subquery-depth <1-4>] [--max-subquery-executions <1-16>] \
   [--max-cte-definitions <1-16>] [--max-cte-nesting-depth <1-4>] [--max-window-keys <1-8>] \
   [--max-join-relations <2-8>] [--max-join-input-rows <1-100000>] [--max-join-output-rows <1-100000>] \
@@ -502,6 +504,8 @@ fail-closed で起動エラーです。上限を引き上げることはでき�
 （詳細: [docs/design/jsonpath-limits-cli.md](docs/design/jsonpath-limits-cli.md)）。
 
 `--max-regex-pattern-len <N>`（既定 4,096・範囲 `1`〜`4,096`）・`--max-regex-input-len <N>`（既定 4,194,304・範囲 `1`〜`4,194,304`）・`--max-regex-compiled-size <N>`（既定 10,485,760・範囲 `1`〜`10,485,760`）（Issue #1786・SQL-55）は、正規表現マッチャ（`engine::regex_match`）のパターン長（バイト）・入力長（バイト）・コンパイル後サイズの上限を、プロセス全体に対して起動時に**下げる方向だけ**設定します（未指定はハード上限と同じ値です）。超過時の SQLSTATE は `54000` です。マッチャは線形時間の `regex` クレートで実装し、後方参照・先読み等は `0A000`、構文誤りは `2201B` で拒否します。SQL 表層（`~`／`~*`・`SIMILAR TO`）への配線は後続 Issue（#1787・#1788）で、現時点でこれらの上限が効く SQL 構文はありません。範囲外・非数値・値欠落・2 回目以降の重複指定は fail-closed で起動エラーです（詳細: [docs/design/regex-limits-cli.md](docs/design/regex-limits-cli.md)・[docs/design/regex-matcher.md](docs/design/regex-matcher.md)）。
+
+`--max-text-query-terms <N>`（既定 1,024・範囲 `1`〜`1,024`）・`--max-text-query-prefix-expansions <N>`（既定 1,024・範囲 `1`〜`1,024`）（Issue #2115・SEARCH-12）は、全文検索クエリの項数（`or` のグループごとの一意な語の総和）と前方一致（`語*`）の展開語数（可視集合で出現する語のみ）の上限を、プロセス全体に対して起動時に**下げる方向だけ**設定します（未指定はハード上限と同じ値です）。超過時の SQLSTATE は `54000` で、一部の語だけで黙って検索することはありません。SQL／NoSQL 表層への配線は後続 Issue（#2116）で、現時点でこれらの上限が効く SQL 構文はありません。範囲外・非数値・値欠落・2 回目以降の重複指定は fail-closed で起動エラーです（詳細: [docs/design/text-query-limits-cli.md](docs/design/text-query-limits-cli.md)）。
 
 `--max-sparsevec-nnz <N>`（既定 16,000・範囲 `1`〜`16,000`）（Issue #2027・TABLE-47 (2)）は、`SPARSEVEC(N)` 列へ書き込む値の非ゼロ要素数の上限を、プロセス全体に対して起動時に**下げる方向だけ**設定します（未指定はハード上限と同じ値です）。超過時の SQLSTATE は `54000` です。上限を下げて再起動しても既存の行は読め、下げた値は新しく書き込む値にだけ効きます。範囲外・非数値・値欠落・2 回目以降の重複指定は fail-closed で起動エラーです（詳細: [docs/design/sparsevec-limits-cli.md](docs/design/sparsevec-limits-cli.md)）。
 

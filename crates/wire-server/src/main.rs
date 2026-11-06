@@ -181,6 +181,14 @@
 //! `EngineCore::with_regex_limits` へ 1 回だけ注入する（`docs/design/regex-limits-cli.md`。
 //! SQL 表層からの利用は Issue #1787 以降）。
 //!
+//! `--max-text-query-terms`／`--max-text-query-prefix-expansions`（Issue #2115。SEARCH-12）:
+//! 全文検索クエリの項数（グループごとの一意な語の総和。`1`〜`1024`）・前方一致の展開語数
+//! （可視集合で df > 0 の語。`1`〜`1024`）の上限を、プロセス全体に対して起動時に**下げる方向だけ**
+//! 設定できる opt-in 注入点（未指定はハード上限と同値）。超過は `54000`。範囲外・非数値・値欠落・
+//! 重複指定は fail-closed で起動エラー。値の解決は `wire_server::text_query_limits_opt::resolve` に
+//! 一本化し、`EngineCore::with_text_query_limits` へ 1 回だけ注入する
+//! （`docs/design/text-query-limits-cli.md`。SQL／NoSQL 表層からの利用は Issue #2116 以降）。
+//!
 //! `--max-sparsevec-nnz`（Issue #2027。TABLE-47 (2)・SQL-46）: `SPARSEVEC(N)` 列へ書き込む値の
 //! 非ゼロ要素数の上限（`1`〜`16000`）を、プロセス全体に対して起動時に**下げる方向だけ**設定できる
 //! opt-in 注入点（未指定はハード上限と同値）。超過は `54000`。範囲外・非数値・値欠落・重複指定は
@@ -554,6 +562,8 @@ fn run_server(args: &[String]) -> ExitCode {
     let mut max_regex_pattern_len_raw: Option<String> = None;
     let mut max_regex_input_len_raw: Option<String> = None;
     let mut max_regex_compiled_size_raw: Option<String> = None;
+    let mut max_text_query_terms_raw: Option<String> = None;
+    let mut max_text_query_prefix_expansions_raw: Option<String> = None;
     let mut max_sparsevec_nnz_raw: Option<String> = None;
     let mut max_subquery_depth_raw: Option<String> = None;
     let mut max_subquery_executions_raw: Option<String> = None;
@@ -1162,6 +1172,46 @@ fn run_server(args: &[String]) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
                 max_regex_compiled_size_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::text_query_limits_opt::MAX_TEXT_QUERY_TERMS_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::text_query_limits_opt::MAX_TEXT_QUERY_TERMS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #2115: 他の起動時構成フラグと同じく 2 回目以降の指定を
+                // fail-closed に拒否する（last-wins にしない）。
+                if max_text_query_terms_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::text_query_limits_opt::MAX_TEXT_QUERY_TERMS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                max_text_query_terms_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::text_query_limits_opt::MAX_TEXT_QUERY_PREFIX_EXPANSIONS_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::text_query_limits_opt::MAX_TEXT_QUERY_PREFIX_EXPANSIONS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #2115: 他の起動時構成フラグと同じく 2 回目以降の指定を
+                // fail-closed に拒否する（last-wins にしない）。
+                if max_text_query_prefix_expansions_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::text_query_limits_opt::MAX_TEXT_QUERY_PREFIX_EXPANSIONS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                max_text_query_prefix_expansions_raw = Some(v.clone());
                 i += 2;
             }
             wire_server::sparsevec_limits_opt::MAX_SPARSEVEC_NNZ_FLAG => {
@@ -2240,6 +2290,22 @@ fn run_server(args: &[String]) -> ExitCode {
         }
     };
 
+    // Issue #2115: 全文検索クエリの項数・前方一致展開数の上限を bind・ユーザーストア読込より前に
+    // 解決する（fail-closed。範囲外・非数値は listen へ進まず起動エラー）。未指定は
+    // `TextQueryLimits::default()`＝ハード上限。
+    let text_query_limits = match wire_server::text_query_limits_opt::resolve(
+        wire_server::text_query_limits_opt::TextQueryLimitsRawFlags {
+            max_terms: max_text_query_terms_raw.as_deref(),
+            max_prefix_expansions: max_text_query_prefix_expansions_raw.as_deref(),
+        },
+    ) {
+        Ok(limits) => limits,
+        Err(e) => {
+            engine::log_stderr!("wire-server: invalid text query limit configuration: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     // Issue #2027: SPARSEVEC の非ゼロ数上限を bind・ユーザーストア読込より前に解決する
     // （fail-closed。範囲外・非数値は listen へ進まず起動エラー）。未指定は
     // `SparseVecLimits::default()`＝ハード上限。
@@ -2917,6 +2983,9 @@ fn run_server(args: &[String]) -> ExitCode {
     // Issue #1786: 未指定でも常に呼ぶ（`regex_limits` は既定まで解決済み。既定は
     // ハード上限と同値）。SQL 表層からの利用は Issue #1787 以降。
     core = core.with_regex_limits(regex_limits);
+    // Issue #2115: 未指定でも常に呼ぶ（既定はハード上限と同値）。SQL／NoSQL 表層からの
+    // 読み出しは Issue #2116 以降。
+    core = core.with_text_query_limits(text_query_limits);
     // Issue #2027: 未指定でも常に呼ぶ（`sparsevec_limits` は既定まで解決済み。既定は
     // ハード上限と同値で、未注入と挙動が同一）。
     core = core.with_sparsevec_limits(sparsevec_limits);

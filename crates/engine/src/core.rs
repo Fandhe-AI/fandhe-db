@@ -1472,6 +1472,10 @@ pub struct EngineCore {
     /// `~` 系（Issue #1787）等が束縛時に [`Self::regex_limits`] を取り出して
     /// [`crate::regex_match::CompiledRegex::compile`] へ渡す。
     regex_limits: crate::regex_limits::RegexLimits,
+    /// 全文検索クエリ評価の項数・前方一致展開数の上限（Issue #2115・SEARCH-12 ポインタ）。
+    /// 差し替えは [`Self::with_text_query_limits`] のみ（起動時 1 回）。SQL / NoSQL 表層からの
+    /// 読み出し配線は後続 Issue（#2116）で、現状は保持のみ。
+    text_query_limits: crate::text_query_limits::TextQueryLimits,
     /// `SPARSEVEC(N)` 書き込み経路の非ゼロ要素数上限（Issue #2027・TABLE-47 (2) ポインタ）。
     /// 差し替えは [`Self::with_sparsevec_limits`] のみ（起動時 1 回）。束縛クロージャを呼ぶ区間と
     /// 文実行入口が [`Self::sparsevec_limits_scope`] で張り、`sql::parser::parse_sparsevec_literal` が読む。
@@ -3395,6 +3399,7 @@ impl EngineCore {
             function_limits: crate::function_limits::FunctionLimits::default(),
             jsonpath_limits: crate::jsonpath_limits::JsonPathLimits::default(),
             regex_limits: crate::regex_limits::RegexLimits::default(),
+            text_query_limits: crate::text_query_limits::TextQueryLimits::default(),
             sparsevec_limits: crate::sparsevec_limits::SparseVecLimits::default(),
             nesting_limits: crate::nesting_limits::NestingLimits::default(),
             window_limits: crate::window_limits::WindowLimits::default(),
@@ -3835,6 +3840,23 @@ impl EngineCore {
     /// 現在の正規表現マッチャ上限（Issue #1786）。
     pub fn regex_limits(&self) -> crate::regex_limits::RegexLimits {
         self.regex_limits
+    }
+
+    /// 全文検索クエリ評価の上限（[`crate::text_query_limits::TextQueryLimits`]）を差し替えた
+    /// ビルダーを返す（Issue #2115）。`wire-server` の起動時 CLI フラグ
+    /// （`--max-text-query-terms`・`--max-text-query-prefix-expansions`）からのみ呼ぶ。
+    /// 未呼び出しならハード上限と同値の既定。
+    pub fn with_text_query_limits(
+        mut self,
+        limits: crate::text_query_limits::TextQueryLimits,
+    ) -> Self {
+        self.text_query_limits = limits;
+        self
+    }
+
+    /// 現在の全文検索クエリ評価上限（Issue #2115）。
+    pub fn text_query_limits(&self) -> crate::text_query_limits::TextQueryLimits {
+        self.text_query_limits
     }
 
     /// `SPARSEVEC(N)` の非ゼロ数上限（[`crate::sparsevec_limits::SparseVecLimits`]）を差し替えた

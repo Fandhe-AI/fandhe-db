@@ -336,9 +336,18 @@ warmup 20・計測 30。`GITHUB_ACTIONS` 下は fail-closed 拒否のため未�
   Phase 1 の変更対象外、または k に依存しない部分）は比 0.97x〜1.13x で
   ノイズ帯内
 
+## 前方一致用の順序付き語彙（Issue #2115・SEARCH-12 ポインタ）
+
+`語幹*` の展開のため、`terms`（`HashMap`）とは別に `prefix_vocab: Vec<(Box<str>, TermId)>` を持つ。
+
+- 対象: 先頭が ASCII 単語文字の語だけ（CJK の前方一致は通常語へ落ちる）。構築の末尾で `terms` から集め、文字列で安定ソートする（キーは一意）
+- 不変条件: 昇順・重複なし・`terms` の ASCII 語と 1 対 1
+- メモリ: `approx_prefix_vocab_heap_bytes` を `approx_heap_bytes` に計上済み。上界は 24 B × ASCII 語彙数 + 語の長さの合計。実測（`sparse_build_total` 等の前後比）は未計測
+- 世代キャッシュ: 索引と同寿命でキー・無効化経路は無変更
+
 ## スコープ外・申し送り
 
-- 位置付き posting は Issue #2114 で実装した（上記）。前方一致用の順序付き語彙は [fulltext-query-syntax.md](fulltext-query-syntax.md)（Issue #2112）で設計し #2115 で実装する
+- 位置付き posting は Issue #2114 で実装した（上記）。前方一致用の順序付き語彙は [fulltext-query-syntax.md](fulltext-query-syntax.md)（Issue #2112）で設計し #2115 で実装した（下記）
 - 位置配列の CSR 化（構築の 2 パス化によるメモリ・ヘッダの削減）は未着手
 - posting list の CSR 化・圧縮（可変長整数・delta encoding）・枝刈り高速化は未着手
 - `VisibleBitmap` はクエリ（`search_within` 呼び出し）ごとに再構築しており、
