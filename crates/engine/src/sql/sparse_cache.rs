@@ -37,6 +37,12 @@
 //! `k1`／`b` はクエリ時のスコア計算だけに作用し、索引（文書統計・postings）には焼き込まない。
 //! このためキー・世代に含めず、値が違うクエリ間で同じ索引を再構築なしで再利用する。
 //!
+//! **テキスト処理の設定は世代に含める（Issue #2130・SEARCH-16 のポインタ。BM25 の `k1`／`b` とは
+//! 逆）**: ストップワード・同義語は索引（語彙・postings）に焼き込まれるため、各エントリは
+//! 構築時の [`crate::sparse::TextAnalysis::analysis_id`] を持ち、[`Self::lookup`] は一致しない
+//! エントリを stale として破棄する。設定は起動時にだけ決まりプロセス内メモリの索引は再起動で
+//! 消えるが、`EngineCore::with_text_analysis` での差し替えに備えた多層防御である。
+//!
 //! **fail-closed 契約（[`Self::lookup`] と [`Self::insert`] で非対称）**:
 //! - [`Self::lookup`] は世代不一致・ロック毒化・世代読み取り失敗のいずれも
 //!   「見つからなかった」として扱う（`PrefilterCache::lookup` と同じ方針。
@@ -108,6 +114,8 @@ struct CacheEntry {
     ctx: PolicyContext,
     text_column_index: usize,
     index: Arc<SparseIndex>,
+    /// 構築時のテキスト処理設定の世代 ID（Issue #2130）。
+    analysis_id: u64,
     built_generation: u64,
     approx_bytes: usize,
     /// LRU 追い出し判定用の単調シーケンス（アクセスのたびに更新）。
@@ -172,6 +180,7 @@ impl SparseIndexCache {
         table: &str,
         ctx: &PolicyContext,
         text_column_index: usize,
+        analysis_id: u64,
     ) -> Option<Arc<SparseIndex>> {
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
         let mut guard = self.state.write().ok()?;
@@ -181,6 +190,12 @@ impl SparseIndexCache {
         let position = guard.entries.iter().position(|e| {
             e.table == table && &e.ctx == ctx && e.text_column_index == text_column_index
         })?;
+        // テキスト処理設定が違う索引は、世代が合っていても使わず破棄する（Issue #2130）。
+        if guard.entries.get(position)?.analysis_id != analysis_id {
+            guard.entries.remove(position);
+            self.stale_evictions.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
         let built_generation = guard.entries.get(position)?.built_generation;
         if built_generation == current_generation {
             let entry = guard.entries.get_mut(position)?;
@@ -311,6 +326,7 @@ impl SparseIndexCache {
             ctx: ctx.clone(),
             text_column_index,
             index: Arc::clone(&index),
+            analysis_id: index.analysis_id(),
             built_generation,
             approx_bytes: own_bytes,
             last_used: seq,
@@ -382,7 +398,7 @@ mod tests {
         let inserted = cache.insert(&storage, "docs", &c, 0, sample_index(), gen);
 
         let read_txn2 = storage.db().begin_read().unwrap();
-        let hit = cache.lookup(&storage, &read_txn2, "docs", &c, 0);
+        let hit = cache.lookup(&storage, &read_txn2, "docs", &c, 0, 0);
         assert!(hit.is_some());
         assert!(Arc::ptr_eq(&hit.unwrap(), &inserted));
         assert_eq!(cache.stats().hits, 1);
@@ -407,7 +423,7 @@ mod tests {
         crate::recovery::commit_boundary::commit(write_txn).unwrap();
 
         let read_txn2 = storage.db().begin_read().unwrap();
-        let hit = cache.lookup(&storage, &read_txn2, "docs", &c, 0);
+        let hit = cache.lookup(&storage, &read_txn2, "docs", &c, 0, 0);
         assert!(hit.is_none(), "stale entry must be evicted, not reused");
         assert_eq!(cache.stats().stale_evictions, 1);
     }
@@ -428,7 +444,7 @@ mod tests {
 
         let read_txn2 = storage.db().begin_read().unwrap();
         assert!(cache
-            .lookup(&storage, &read_txn2, "docs", &other, 0)
+            .lookup(&storage, &read_txn2, "docs", &other, 0, 0)
             .is_none());
     }
 
@@ -454,12 +470,16 @@ mod tests {
         // text_column_index = 2（例: title 列）での lookup はミスでなければならない。
         let read_txn2 = storage.db().begin_read().unwrap();
         assert!(
-            cache.lookup(&storage, &read_txn2, "docs", &c, 2).is_none(),
+            cache
+                .lookup(&storage, &read_txn2, "docs", &c, 2, 0)
+                .is_none(),
             "a different text_column_index must not hit the entry built for another column"
         );
         // 同一 text_column_index (=1) の lookup は引き続きヒットする。
         let read_txn3 = storage.db().begin_read().unwrap();
-        assert!(cache.lookup(&storage, &read_txn3, "docs", &c, 1).is_some());
+        assert!(cache
+            .lookup(&storage, &read_txn3, "docs", &c, 1, 0)
+            .is_some());
     }
 
     #[test]
@@ -486,7 +506,9 @@ mod tests {
 
         // ただしキャッシュへは反映されていない（次の lookup はミス）。
         let read_txn2 = storage.db().begin_read().unwrap();
-        assert!(cache.lookup(&storage, &read_txn2, "docs", &c, 0).is_none());
+        assert!(cache
+            .lookup(&storage, &read_txn2, "docs", &c, 0, 0)
+            .is_none());
         assert_eq!(cache.stats().entries, 0);
     }
 
@@ -573,7 +595,7 @@ mod tests {
 
         // 古いスナップショットからの lookup はミス（世代が違うので使えない）だが、
         // 真に新しい有効なエントリを削除してはならない。
-        let miss = cache.lookup(&storage, &old_read_txn, "docs", &c, 0);
+        let miss = cache.lookup(&storage, &old_read_txn, "docs", &c, 0, 0);
         assert!(miss.is_none());
         assert_eq!(
             cache.stats().entries,
@@ -582,7 +604,35 @@ mod tests {
         );
 
         // 新しいスナップショットからの lookup は引き続きヒットする。
-        let hit = cache.lookup(&storage, &fresh_read_txn, "docs", &c, 0);
+        let hit = cache.lookup(&storage, &fresh_read_txn, "docs", &c, 0, 0);
         assert!(hit.is_some());
+    }
+
+    #[test]
+    fn lookup_evicts_entry_built_under_a_different_text_analysis() {
+        let path = unique_db_path("sparse-cache-analysis");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        create_table(&storage, "docs");
+        let cache = SparseIndexCache::new();
+        let c = ctx("tenant-a");
+        let analysis =
+            Arc::new(crate::sparse::TextAnalysis::from_lists(Some("the"), None).expect("analysis"));
+        let id = analysis.analysis_id();
+        let built = SparseIndex::build_with_analysis(&[(1u64, "the cat")], analysis).unwrap();
+
+        let read_txn = storage.db().begin_read().unwrap();
+        let gen = crate::catalog::table_generation_in_txn(&read_txn, "docs").unwrap();
+        cache.insert(&storage, "docs", &c, 0, built, gen);
+
+        let read_txn2 = storage.db().begin_read().unwrap();
+        // 既定の設定（ID 0）での lookup は外れ、エントリは stale として破棄される。
+        assert!(cache
+            .lookup(&storage, &read_txn2, "docs", &c, 0, 0)
+            .is_none());
+        assert_eq!(cache.stats().stale_evictions, 1);
+        assert_eq!(cache.stats().entries, 0);
+        assert_eq!(cache.stats().hits, 0);
+        assert_ne!(id, 0);
     }
 }

@@ -1232,6 +1232,10 @@ fn ensure_distance_kind_executable(bound: &BoundStatement) -> Result<(), SqlSurf
 /// 一切参照しない。`None` を渡した場合はキャッシュを一切経由せず、常に全件
 /// brute-force で探索する（下記 [`execute_statement`] 参照）。
 ///
+/// `text_analysis`（Issue #2130・SEARCH-16 のポインタ）は疎索引の構築に固定するテキスト処理
+/// 設定（ストップワード・同義語）。`SparseCacheAccess` には載せない: 書き込みトランザクション由来の
+/// 読み取りでは疎キャッシュが `None` に落ちるが、設定はその経路でも効かせる必要があるため。
+///
 /// `sparse_cache`・`arena_cache`・`hnsw_cache` の 3 引数を追加した結果
 /// `clippy::too_many_arguments` の閾値（7）を超える。3 キャッシュアクセス束は意味の
 /// 異なる独立したオプションパラメータであり、1 つの構造体へまとめると「呼ばれない
@@ -1250,6 +1254,7 @@ pub(crate) fn execute_statement_with_cache(
     arena_cache: Option<crate::sql::arena_cache::ArenaCacheAccess<'_>>,
     hnsw_cache: Option<crate::sql::hnsw_cache::HnswCacheAccess<'_>>,
     scalar_cache: Option<crate::sql::scalar_index::ScalarCacheAccess<'_>>,
+    text_analysis: &Arc<crate::sparse::TextAnalysis>,
 ) -> Result<QueryResult, SqlSurfaceError> {
     execute_statement_with_cache_observed(
         read_txn,
@@ -1262,6 +1267,7 @@ pub(crate) fn execute_statement_with_cache(
         arena_cache,
         hnsw_cache,
         scalar_cache,
+        text_analysis,
         None,
     )
 }
@@ -1283,6 +1289,7 @@ pub(crate) fn execute_statement_with_cache_observed(
     arena_cache: Option<crate::sql::arena_cache::ArenaCacheAccess<'_>>,
     hnsw_cache: Option<crate::sql::hnsw_cache::HnswCacheAccess<'_>>,
     scalar_cache: Option<crate::sql::scalar_index::ScalarCacheAccess<'_>>,
+    text_analysis: &Arc<crate::sparse::TextAnalysis>,
     mut stats: Option<&mut ExecStats>,
 ) -> Result<QueryResult, SqlSurfaceError> {
     // SQL 実行経路に未接続の距離演算子（L2／L1）は、行ポリシー解決・ストレージ読み取りより前に
@@ -1500,6 +1507,7 @@ pub(crate) fn execute_statement_with_cache_observed(
                 &bound.table,
                 ctx,
                 idx,
+                text_analysis.analysis_id(),
             ),
             _ => None,
         }
@@ -3259,49 +3267,51 @@ pub(crate) fn execute_statement_with_cache_observed(
                     // キャッシュへの挿入を試みる（`SparseIndexCache::insert` は挿入の
                     // 成否に関わらず構築済みの索引そのものを返す契約。
                     // `sql/sparse_cache.rs` モジュールドキュメント参照）。
-                    let sparse_index_for_fusion: Option<Arc<SparseIndex>> =
-                        if let Some(idx) = &cached_sparse_index {
-                            Some(Arc::clone(idx))
-                        } else if sparse_docs.is_empty() {
-                            // 疎文書が 0 件（可視行に本文を持つ行が 1 件もない）の場合は
-                            // `SparseIndex::build` が空コーパスを拒否する
-                            // （`SparseError::EmptyCorpus`）ため、密のみへ縮退させる
-                            // （下の `None` 分岐）。空コーパスはキャッシュへも積まない
-                            // （`SparseIndex::build` 自体が拒否するため構築できない）。
-                            None
-                        } else {
-                            let doc_refs: Vec<(DocId, &str)> = sparse_docs
-                                .iter()
-                                .map(|(id, text)| (*id, text.as_str()))
-                                .collect();
-                            let built = SparseIndex::build(&doc_refs)
+                    let sparse_index_for_fusion: Option<Arc<SparseIndex>> = if let Some(idx) =
+                        &cached_sparse_index
+                    {
+                        Some(Arc::clone(idx))
+                    } else if sparse_docs.is_empty() {
+                        // 疎文書が 0 件（可視行に本文を持つ行が 1 件もない）の場合は
+                        // `SparseIndex::build` が空コーパスを拒否する
+                        // （`SparseError::EmptyCorpus`）ため、密のみへ縮退させる
+                        // （下の `None` 分岐）。空コーパスはキャッシュへも積まない
+                        // （`SparseIndex::build` 自体が拒否するため構築できない）。
+                        None
+                    } else {
+                        let doc_refs: Vec<(DocId, &str)> = sparse_docs
+                            .iter()
+                            .map(|(id, text)| (*id, text.as_str()))
+                            .collect();
+                        let built =
+                            SparseIndex::build_with_analysis(&doc_refs, Arc::clone(text_analysis))
                                 .map_err(HybridError::Sparse)
                                 .map_err(|e| map_hybrid_error(e, &cfg))?;
-                            match (sparse_cache_eligible, sparse_cache.as_ref()) {
-                                (true, Some(access)) => {
-                                    // `built_generation` はこのクエリの `read_txn`
-                                    // スナップショットにおけるテーブル世代
-                                    // （`SparseIndexCache::insert` の契約。読み取れない
-                                    // 場合はキャッシュへ積まず、この場で構築した索引を
-                                    // そのまま使う）。
-                                    match crate::catalog::table_generation_in_txn(
-                                        read_txn,
+                        match (sparse_cache_eligible, sparse_cache.as_ref()) {
+                            (true, Some(access)) => {
+                                // `built_generation` はこのクエリの `read_txn`
+                                // スナップショットにおけるテーブル世代
+                                // （`SparseIndexCache::insert` の契約。読み取れない
+                                // 場合はキャッシュへ積まず、この場で構築した索引を
+                                // そのまま使う）。
+                                match crate::catalog::table_generation_in_txn(
+                                    read_txn,
+                                    &bound.table,
+                                ) {
+                                    Ok(built_generation) => Some(access.cache.insert(
+                                        access.storage,
                                         &bound.table,
-                                    ) {
-                                        Ok(built_generation) => Some(access.cache.insert(
-                                            access.storage,
-                                            &bound.table,
-                                            ctx,
-                                            *hybrid_text_column_index,
-                                            built,
-                                            built_generation,
-                                        )),
-                                        Err(_) => Some(Arc::new(built)),
-                                    }
+                                        ctx,
+                                        *hybrid_text_column_index,
+                                        built,
+                                        built_generation,
+                                    )),
+                                    Err(_) => Some(Arc::new(built)),
                                 }
-                                _ => Some(Arc::new(built)),
                             }
-                        };
+                            _ => Some(Arc::new(built)),
+                        }
+                    };
                     // 疎索引が無く密のみへ縮退する文でも `k1`／`b` を検証する（データ依存で
                     // 不正な引数が受理されないようにする。Issue #2121）。
                     let bm25_default = crate::sparse::Bm25Params::default();
@@ -3739,6 +3749,9 @@ pub fn execute_statement(
         None,
         None,
         None,
+        // 公開ラッパーは既定のテキスト処理（恒等）。ストップワード・同義語は
+        // `EngineCore::with_text_analysis` 経由でのみ有効になる（Issue #2130）。
+        &Arc::new(crate::sparse::TextAnalysis::default()),
     )
 }
 

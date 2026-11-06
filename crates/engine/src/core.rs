@@ -1527,6 +1527,10 @@ pub struct EngineCore {
     /// （Issue #357）。詳細は `sql/sparse_cache.rs::SparseIndexCache` のドキュメント
     /// 参照。
     sparse_index_cache: crate::sql::sparse_cache::SparseIndexCache,
+    /// 疎検索のテキスト処理設定（ストップワード・同義語。Issue #2130・SEARCH-16 のポインタ）。
+    /// 起動時の CLI（wire-server の `text_analysis_opt`）だけが `with_text_analysis` で決め、
+    /// SQL／NoSQL のセッションからは変えられない。既定は恒等。
+    text_analysis: std::sync::Arc<crate::sparse::TextAnalysis>,
     /// SQL 表層（`sql::exec::execute_statement_with_cache`）専用の `VectorArena`
     /// テーブル世代整合キャッシュ（Issue #363）。[`Self::execute_validated_in_session`]
     /// の `Statement::Select` アームがこれを経由してアリーナ再構築（redb 全行走査・
@@ -3405,6 +3409,7 @@ impl EngineCore {
             dictionary_cache: DictionaryCache::new(),
             dictionary_config: crate::dictionary::DictionaryConfig::default(),
             sparse_index_cache: crate::sql::sparse_cache::SparseIndexCache::new(),
+            text_analysis: std::sync::Arc::new(crate::sparse::TextAnalysis::default()),
             sql_arena_cache: crate::sql::arena_cache::SqlArenaCache::new(),
             scalar_index_cache: crate::sql::scalar_index::ScalarIndexCache::new(),
             visible_bitmap_cache: crate::sql::visible_cache::VisibleBitmapCache::new(),
@@ -3434,6 +3439,24 @@ impl EngineCore {
     /// `VectorCore` trait には載せない固有メソッド（`core_api.snapshot` の対象外）。
     pub fn prefilter_cache_stats(&self) -> PrefilterCacheStats {
         self.prefilter_cache.stats()
+    }
+
+    /// 疎検索のテキスト処理設定（ストップワード・同義語。Issue #2130）を差し替える。
+    ///
+    /// `self` を消費するビルダーで、起動時の組み立て（wire-server の `main`）からだけ呼ばれる。
+    /// SQL／NoSQL のセッションからは届かない。`VectorCore` trait には載せない固有メソッド
+    /// （`core_api.snapshot` の対象外）。
+    pub fn with_text_analysis(mut self, analysis: crate::sparse::TextAnalysis) -> Self {
+        self.text_analysis = std::sync::Arc::new(analysis);
+        // 古い設定で作った疎索引を使わないよう、キャッシュごと作り直す（多層防御。
+        // `SparseIndexCache::lookup` も `analysis_id` を照合する）。
+        self.sparse_index_cache = crate::sql::sparse_cache::SparseIndexCache::new();
+        self
+    }
+
+    /// 現在のテキスト処理設定を返す。
+    pub fn text_analysis(&self) -> &crate::sparse::TextAnalysis {
+        &self.text_analysis
     }
 
     /// [`crate::sql::sparse_cache::SparseIndexCache`] の現在の統計を返す
@@ -13353,6 +13376,7 @@ impl EngineCore {
                 cache: &self.scalar_index_cache,
                 declarations_enabled: self.hnsw_state.is_some(),
             }),
+            &self.text_analysis,
         )
     }
 
@@ -21790,6 +21814,7 @@ mod tests {
             }),
             None,
             None,
+            &core.text_analysis,
         )
         .expect("execute_statement should succeed");
         let row = result
