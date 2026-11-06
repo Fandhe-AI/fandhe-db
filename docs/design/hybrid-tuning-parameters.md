@@ -63,7 +63,7 @@ spec 由来の具体的な方針・契約の公開は、オーナー承認を得
 | #2120 | 実行器 |
 | #2121 | BM25 |
 | #2122 | NoSQL |
-| 未割当 | EXPLAIN への調整値表示（要起票） |
+| #3051 | EXPLAIN への調整値表示 |
 
 ## 6. セキュリティ
 
@@ -73,7 +73,7 @@ SEARCH-13 と [security](../../.claude/rules/security.md) を正とし、後続 
 
 ## 7. 対象外・未決
 
-- EXPLAIN への調整値表示を担う Issue が #2117 配下にない。起票が必要
+- EXPLAIN への調整値表示は #3051 で対応（§12）。当初は #2117 配下に担当 Issue がなかった
 - 片側ごとの窓など spec の解釈確認が要る点は spec 側（SEARCH-13）で扱う
 - `$n` 対応は別 Issue
 - spec 由来の具体的な方針・契約を本書へ記載するかは、オーナー判断を待つ
@@ -97,7 +97,7 @@ SQL 表層の入口だけを実装した。実行器への反映は後続 Issue 
 - `window` の検証（すべて `22000`・クランプなし）: 束縛段（`LIMIT + OFFSET` 以上、`--max-result-rows` 以下）、`EngineCore::check_bound_search`（外部で組み立てた計画への多層防御）、実行時（SCALAR 事後フィルタ経路などで `k_eff` が `window` を超える場合の最終防衛。自テナントの可視件数だけに依存し、文言は固定）。`USING MODE 'precision'` は `k_eff` がデータ件数に依存し束縛段で大小を決められないため、`window` との併用を束縛段で `0A000` 明示拒否する。重み 0 のチャネルがあると保証下限が 0 になり、ソフトブーストは常に `BoostSoftBoundExceeded` で拒否される（fail-closed）。`LIMIT` 省略と `window` の併用も拒否する
 - `RrfConfig::new`: 重みを「有限かつ 0 以上、両方 0 は不可」に緩めた（受理範囲の拡大のみ）。重み 0 の側は寄与 0 になり、同点は id 昇順で決定的
 - 極端値: スコアが非有限になる指定（巨大な重みなど）は `XX000` ではなく `22000`。巨大な `rrf_k` は順位差が潰れ、所属リスト数と id 昇順で決まる
-- 暫定ゲート: `k1`／`b` を持つ文だけ `0A000` のまま（#2121 で撤去。§10）。EXPLAIN は `rrf_k`・`window`・`weights` を受理するが、実効値の表示は対象外（担当 Issue なし）
+- 暫定ゲート: `k1`／`b` を持つ文だけ `0A000` のまま（#2121 で撤去。§10）。EXPLAIN は `rrf_k`・`window`・`weights` を受理するが、実効値の表示は対象外（#3051 で対応。§12）
 
 ## 10. Issue #2121 での実装（BM25）
 
@@ -108,7 +108,7 @@ SQL 表層の入口だけを実装した。実行器への反映は後続 Issue 
 - 解決: `sql::hybrid_tuning::hybrid_bm25_params` が未指定の項目を索引自身の構築時の値で補う。指定なしの文は従来とバイト一致する
 - 範囲外と極端値: 範囲外は束縛段で `22000`。`Bm25Params::new` は `k1` の数値安全上限 `1e200` を超える指定も拒否する（有限でも巨大な `k1` は分子・分母が桁あふれして NaN となり候補が黙って落ちる、または `inf` スコアで `XX000` になるため）。上限は 1 文書の tf・文書長の上界と `len/avgdl` の上界から導いた、データに依存しない定数で、拒否の有無から他テナントの存在は推測できない。さらに `score_within_with_params` は非有限スコアを検出すると `SparseError::InvalidParams` で fail-closed にし、sql 層で固定文言の `22000` に写す。spec は `k1` の上限を定めていないため、上限は実装上の数値安全上限という解釈であり、spec 側（SEARCH-13）での確認を要する
 - テナント境界: 統計は従来どおり可視集合へ縮約して計算し、`k1`／`b` はスコア式の係数だけに作用する
-- 対象外: EXPLAIN への実効値の表示（EXPLAIN は `k1`／`b` を受理する）、NoSQL の `hybrid` オブジェクトの `k1`／`b`（#2122）
+- 対象外: EXPLAIN への実効値の表示（EXPLAIN は `k1`／`b` を受理する。#3051 で対応。§12）、NoSQL の `hybrid` オブジェクトの `k1`／`b`（#2122）
 
 ## 11. Issue #2122 での実装（NoSQL）
 
@@ -119,4 +119,26 @@ NoSQL `search` の `hybrid` オブジェクトに調整キー `k1`・`b`・`rrf_
 - `window` は整数のみ受け付ける。小数・負数・指数表記は `42601`。`usize` に収まらない値は飽和させて範囲外（`22000`）として拒否し、切り捨てない
 - SQL との差分: 型・形の不正の分類だけが異なる。SQL の名前付き引数は型不一致も `22000` だが、NoSQL は NOSQL-8 の一般則（型の不一致は `42601`）に従う。値の範囲の分類と正常値での結果は一致する。SEARCH-13 との整合は spec 側での確認事項
 - テナント境界: 調整値はスコア計算と融合だけに作用し、可視集合を変えない。エラー文言は固定で入力値を含まない
-- 対象外: EXPLAIN への調整値の実効値の表示、`hybrid.text` の疎側列の選択
+- 対象外: EXPLAIN への調整値の実効値の表示（#3051 で対応。§12）、`hybrid.text` の疎側列の選択
+
+## 12. Issue #3051 での実装（EXPLAIN）
+
+`EXPLAIN SELECT ... ORDER BY HYBRID(...)`（SQL の `hybrid_rrf(...)` 形と、NoSQL `search` の `hybrid` を伴う
+`explain: true` を含む）の検索計画に、`scalar_plan:` の後ろへ次の 2 行を追記する（TEXT・FORMAT JSON 共通。
+VERBOSE／ANALYZE でも同じ行が載る）。非 hybrid の文と `USING PLAN` の EXPLAIN は出力を変えない。
+
+```text
+hybrid_rrf: rrf_k=<f>[<src>],window=<w>[<src>],dense_weight=<f>[<src>],sparse_weight=<f>[<src>]
+hybrid_bm25: k1=<f>[<src>],b=<f>[<src>]
+```
+
+- `<src>` は閉じた語彙 `default`／`specified`。`weights` は 1 つの引数なので dense／sparse に同じ値を付ける。
+  指定値が既定値と等しくても `specified` と表示する
+- `<f>` は `{:?}` の往復可能な最短表記（`60.0`・`1.2`・`1e200`）。`-0.0` は `0.0` に正規化する
+- `<w>` は整数。precision かつ DISTANCE 先行（SCALAR 事後フィルタ）で未指定のときだけ、取得件数が可視件数に
+  依存するため固定トークン `dynamic` を出す（テナント間で出力が一致する。P0）
+- 値は実行器と同じ解決関数（`hybrid_bm25_params`・`hybrid_rrf_config`）と、取得件数の静的導出
+  （`sql::exec::static_fetch_k`）から求め、既定値をハードコードして再導出しない。BM25 の行は疎索引の有無にかかわらず出す
+- 不正な引数は実行時と同じ `wire_code` で EXPLAIN も失敗する（成功する経路を新設しない）
+- `USING PLAN` の EXPLAIN は調整引数を持てず、公開関数 `build_explain_result` の出力契約を保つため対象外にした
+- 書式（`{:?}`）と指定元の語彙は本実装で決めた解釈で、spec 側（SEARCH-13）での確認事項

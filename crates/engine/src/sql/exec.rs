@@ -269,6 +269,24 @@ const _: () = assert!(
     "sql::exec's precision k_eff derivation assumes core::MAX_SEARCH_K >= 2"
 );
 
+/// 検索の取得件数 `k_eff` のうち、文から静的に決まる分を返す（Issue #3051）。非 precision は
+/// `LIMIT + OFFSET`、precision の SCALAR 先行は `max(2)`。precision で SCALAR 先行でない場合は可視件数
+/// に依存するため `None`（呼び出し側が動的に求める）。実行器（`execute_statement_with_cache`）と
+/// EXPLAIN（`core.rs::search_explain_from_bound`）が同じ導出を共有するための単一情報源。
+pub(crate) fn static_fetch_k(
+    is_precision: bool,
+    scalar_prefilter: bool,
+    fetch_count: usize,
+) -> Option<usize> {
+    if !is_precision {
+        Some(fetch_count)
+    } else if scalar_prefilter {
+        Some(fetch_count.max(2))
+    } else {
+        None
+    }
+}
+
 /// 投影結果 1 セル。`row_codec::Value` の公開 enum は変更せず、`id` 疑似列
 /// （`u64`）を表現するため独自の enum を持つ。
 /// **TASK-79（SQL-9）で追加した破壊的変更（BREAKING CHANGE）**: `Float`・`Bool`
@@ -2819,18 +2837,12 @@ pub(crate) fn execute_statement_with_cache_observed(
         }
     }
 
-    let k_eff = if is_precision {
-        if plan.scalar_prefilter {
-            bound.fetch_count().max(2)
-        } else {
-            arena.dense_len().clamp(2, core::MAX_SEARCH_K)
-        }
-    } else {
-        // Issue #2008・SQL-33 (8)・SQL-73 (3): 取得件数は `LIMIT + OFFSET`。先頭 `OFFSET` 件は
-        // RLS 安全網の後で捨てる（下の `skip_front`）。HNSW・厳密走査・hybrid はいずれも
-        // この `k_eff` を探索件数として受けるため、経路間の恒等式が構造的に成り立つ。
-        bound.fetch_count()
-    };
+    // Issue #2008・SQL-33 (8)・SQL-73 (3): 取得件数は `LIMIT + OFFSET`（非 precision）。先頭 `OFFSET`
+    // 件は RLS 安全網の後で捨てる（下の `skip_front`）。HNSW・厳密走査・hybrid はいずれもこの
+    // `k_eff` を探索件数として受けるため、経路間の恒等式が構造的に成り立つ。静的に決まらない
+    // precision（SCALAR 事後フィルタ）だけ可視件数から求める（Issue #3051: 静的部分は EXPLAIN と共有）。
+    let k_eff = static_fetch_k(is_precision, plan.scalar_prefilter, bound.fetch_count())
+        .unwrap_or_else(|| arena.dense_len().clamp(2, core::MAX_SEARCH_K));
 
     // Issue #2143・ADR D4: MMR の計算量予算（`W × min(k_eff, W)`）は取得の前に設定値と `k_eff`
     // だけで静的に判定する（表の内容に依存しない）。超過は縮退（`mmr_budget`）で、窓を広げず

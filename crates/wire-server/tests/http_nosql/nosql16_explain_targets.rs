@@ -272,6 +272,37 @@ fn vector_search_explain_hybrid_matches_sql_explain_rows() {
     assert_eq!(parse_explain_lines(&resp), expected);
 }
 
+/// Issue #3051・SEARCH-13: 調整キーを付けた `hybrid` の EXPLAIN も、等価な SQL の行（`hybrid_rrf:`／
+/// `hybrid_bm25:` を含む）と一致する。
+#[test]
+fn vector_search_explain_hybrid_with_tuning_matches_sql_explain_rows() {
+    let (core, _guard) = new_core();
+    let ctx_a = ctx_for("tenant-a");
+    let (addr, token) = spawn_alice_session(Arc::clone(&core));
+
+    let sql = "SELECT id FROM docs ORDER BY HYBRID(embedding, '[0.1,0.2,0.3,0.4]', body, 'alpha', \
+        k1 => 1.5, b => 0.5, rrf_k => 10, window => 5, weights => '{\"dense\": 2, \"sparse\": 1}') LIMIT 5";
+    let expected = sql_explain_lines(&core, &ctx_a, &format!("EXPLAIN {sql}"));
+    assert!(
+        expected.iter().any(|l| l.starts_with("hybrid_rrf: ")
+            && l.contains("rrf_k=10.0[specified]")
+            && l.contains("window=5[specified]")),
+        "{expected:?}"
+    );
+    assert!(
+        expected
+            .iter()
+            .any(|l| l == "hybrid_bm25: k1=1.5[specified],b=0.5[specified]"),
+        "{expected:?}"
+    );
+
+    let body = br#"{"op":"search","table":"docs","vector":[0.1,0.2,0.3,0.4],"limit":5,
+        "hybrid":{"text":"alpha","k1":1.5,"b":0.5,"rrf_k":10,"window":5,
+        "weights":{"dense":2,"sparse":1}},"explain":true}"#;
+    let resp = query(addr, &token, body);
+    assert_eq!(parse_explain_lines(&resp), expected);
+}
+
 #[test]
 fn vector_search_explain_with_mode_matches_sql_explain_rows() {
     let (core, _guard) = new_core();
