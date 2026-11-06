@@ -3028,6 +3028,23 @@ mod tests {
     }
 
     #[test]
+    fn apply_soft_boost_rejects_any_boost_when_a_channel_weight_is_zero() {
+        // Issue #2120: `RrfConfig::new` は重み 0 を受理するが、`soft_boost_confirm_cap` は
+        // `min(weights)/(k+1)` = 0 になり、正の加点はすべて `BoostSoftBoundExceeded` で
+        // 拒否される（fail-closed。重み 0 のチャネルが保証する下限が無いため）。
+        let cfg = RrfConfig::new(60.0, 1.0, 0.0, 200).expect("zero weight is valid");
+        assert_eq!(soft_boost_confirm_cap(&cfg), 0.0);
+        let mut hits = vec![
+            HybridHit { id: 1, score: 0.5 },
+            HybridHit { id: 2, score: 0.0 },
+        ];
+        let ids: BTreeSet<u64> = [2].into_iter().collect();
+        let rule = BoostRule::new(&ids, 1e-9).unwrap();
+        let err = apply_soft_boost(&mut hits, &[rule], &cfg).unwrap_err();
+        assert!(matches!(err, HybridError::BoostSoftBoundExceeded { .. }));
+    }
+
+    #[test]
     fn apply_soft_boost_cap_is_bounded_by_observed_top_when_top_is_tied_group() {
         // PR #320 codex-review P1 指摘の直接回帰（Issue #310 由来。1 回目）:
         // `RrfConfig` の既定同点順位規約が [`TieRank::GroupEnd`] になったため、

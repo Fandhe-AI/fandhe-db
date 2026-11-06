@@ -194,12 +194,22 @@ fn search13_exec_precision_mode_uses_tuned_normalization() {
         lim,
     );
     assert_eq!(format!("{:?}", base.rows), format!("{:?}", same.rows));
-    // k_eff が window を超えうる経路でも XX000 にならない（超過は 22000 で拒否）。
-    let c = core
-        .execute_sql(&ctx(), &format!("{BASE}, window => 3) {lim}"))
-        .map(|_| "ok")
-        .unwrap_or_else(|e| e.wire_code());
-    assert_ne!(c, "XX000");
+    // window と precision の組み合わせは k_eff がデータ依存のため、データ件数によらず
+    // 常に 0A000 で拒否する（LIMIT=window=1 の SCALAR 先行でも同じ）。
+    for tail in [", window => 3", ", window => 200", ", window => 1"] {
+        assert_eq!(code(&core, tail, lim), "0A000");
+    }
+    assert_eq!(
+        code(&core, ", window => 1", "LIMIT 1 USING MODE 'precision'"),
+        "0A000"
+    );
+    let scalar = format!("{BASE}, window => 1) WHERE id > 0 LIMIT 1 USING MODE 'precision'");
+    assert_ne!(
+        core.execute_sql(&ctx(), &scalar)
+            .map(|_| "ok")
+            .unwrap_or_else(|e| e.wire_code()),
+        "XX000"
+    );
 }
 
 #[test]

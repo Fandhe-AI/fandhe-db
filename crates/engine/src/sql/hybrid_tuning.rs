@@ -171,6 +171,7 @@ pub(crate) fn check_window(
     fetch_count: usize,
     result_cap: Option<usize>,
     max_result_rows: usize,
+    mode: crate::sql::mode::SearchMode,
 ) -> Result<(), SqlSurfaceError> {
     let crate::sql::parser::Ranking::Hybrid { tuning, .. } = ranking else {
         return Ok(());
@@ -178,6 +179,14 @@ pub(crate) fn check_window(
     let Some(w) = tuning.window() else {
         return Ok(());
     };
+    // precision は `k_eff` が可視件数（SCALAR 先行時は `fetch_count().max(2)`）に依存し、束縛段で
+    // `window` との大小を決められないため、データ依存の実行時 22000 を避けて組み合わせ自体を
+    // 明示的に拒否する（fail-closed。文言は固定で値を含めない）。
+    if mode == crate::sql::mode::SearchMode::Precision {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "HYBRID argument window cannot be combined with precision mode",
+        ));
+    }
     if w > max_result_rows {
         return Err(range_error("window"));
     }
@@ -383,26 +392,50 @@ mod tests {
     /// Issue #2120: `window` の境界（`LIMIT + OFFSET` 以上・上限以下・`LIMIT` 省略は拒否）。
     #[test]
     fn check_window_boundaries() {
+        use crate::sql::mode::SearchMode;
+        const M: SearchMode = SearchMode::Recall;
         let r =
             |w: usize| hybrid_ranking(HybridTuning::new(None, None, None, Some(w), None).unwrap());
-        assert!(check_window(&r(5), 5, None, 100).is_ok());
+        assert!(check_window(&r(5), 5, None, 100, M).is_ok());
         assert_eq!(
-            check_window(&r(4), 5, None, 100).unwrap_err().wire_code(),
+            check_window(&r(4), 5, None, 100, M)
+                .unwrap_err()
+                .wire_code(),
             "22000"
         );
-        assert!(check_window(&r(100), 5, None, 100).is_ok());
+        assert!(check_window(&r(100), 5, None, 100, M).is_ok());
         assert_eq!(
-            check_window(&r(101), 5, None, 100).unwrap_err().wire_code(),
+            check_window(&r(101), 5, None, 100, M)
+                .unwrap_err()
+                .wire_code(),
             "22000"
         );
         assert_eq!(
-            check_window(&r(50), 101, Some(100), 100)
+            check_window(&r(50), 101, Some(100), 100, M)
                 .unwrap_err()
                 .wire_code(),
             "22000"
         );
         // window 未指定・非 hybrid は対象外。
-        assert!(check_window(&hybrid_ranking(HybridTuning::default()), 500, None, 100).is_ok());
+        assert!(check_window(&hybrid_ranking(HybridTuning::default()), 500, None, 100, M).is_ok());
+        // precision と window の組み合わせは束縛段で明示的に 0A000 拒否（k_eff がデータ依存のため）。
+        for w in [1, 5, 100] {
+            assert_eq!(
+                check_window(&r(w), 1, None, 100, SearchMode::Precision)
+                    .unwrap_err()
+                    .wire_code(),
+                "0A000"
+            );
+        }
+        // window 未指定の precision は対象外。
+        assert!(check_window(
+            &hybrid_ranking(HybridTuning::default()),
+            1,
+            None,
+            100,
+            SearchMode::Precision
+        )
+        .is_ok());
     }
 
     /// Issue #2120: `window` 未指定は従来の `k_eff.max(200)`、指定時はその値。

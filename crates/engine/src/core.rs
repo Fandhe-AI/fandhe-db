@@ -3971,6 +3971,7 @@ impl EngineCore {
             bound.fetch_count(),
             bound.result_cap(),
             self.result_limits.max_result_rows(),
+            bound.mode().mode(),
         )?;
         // Issue #2242: `LIMIT` 省略（暗黙上限の印 `result_cap`）付きの計画は、`cap` が設定値と一致し、
         // 取得上限が `cap + 1`、`OFFSET` が検索上限以内のときだけ通す（印の偽装で巨大な取得上限を

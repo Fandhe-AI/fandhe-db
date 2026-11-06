@@ -3631,6 +3631,7 @@ fn bind_in_session_with_policy(
         offset.saturating_add(limit),
         result_cap,
         result_limits.max_result_rows(),
+        resolved_mode.mode(),
     )?;
 
     // SQL-74 (2)・Issue #2036: 距離述語を含む文は `HINT ORDER` が DISTANCE を先にしても SCALAR を

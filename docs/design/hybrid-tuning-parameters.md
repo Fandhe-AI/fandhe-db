@@ -94,7 +94,7 @@ SQL 表層の入口だけを実装した。実行器への反映は後続 Issue 
 `rrf_k`・`window`・`weights` を実行器に接続した（SEARCH-13）。`k1`・`b` は #2121 の担当。
 
 - 組み立て: `sql::hybrid_tuning::hybrid_rrf_config` が `RrfConfig` を 1 か所で作り、融合と precision 正規化が同じ値を使う。未指定は従来値（60・等重み）で、`window` 未指定の `pool_depth` は従来どおり `max(k_eff, 200)`。調整引数なしの文は結果が従来とバイト一致する
-- `window` の検証（すべて `22000`・クランプなし）: 束縛段（`LIMIT + OFFSET` 以上、`--max-result-rows` 以下）、`EngineCore::check_bound_search`（外部で組み立てた計画への多層防御）、実行時（precision・SCALAR 事後フィルタ経路で `k_eff` が `window` を超える場合の最終防衛。自テナントの可視件数だけに依存し、文言は固定）。`LIMIT` 省略と `window` の併用も拒否する
+- `window` の検証（すべて `22000`・クランプなし）: 束縛段（`LIMIT + OFFSET` 以上、`--max-result-rows` 以下）、`EngineCore::check_bound_search`（外部で組み立てた計画への多層防御）、実行時（SCALAR 事後フィルタ経路などで `k_eff` が `window` を超える場合の最終防衛。自テナントの可視件数だけに依存し、文言は固定）。`USING MODE 'precision'` は `k_eff` がデータ件数に依存し束縛段で大小を決められないため、`window` との併用を束縛段で `0A000` 明示拒否する。重み 0 のチャネルがあると保証下限が 0 になり、ソフトブーストは常に `BoostSoftBoundExceeded` で拒否される（fail-closed）。`LIMIT` 省略と `window` の併用も拒否する
 - `RrfConfig::new`: 重みを「有限かつ 0 以上、両方 0 は不可」に緩めた（受理範囲の拡大のみ）。重み 0 の側は寄与 0 になり、同点は id 昇順で決定的
 - 極端値: スコアが非有限になる指定（巨大な重みなど）は `XX000` ではなく `22000`。巨大な `rrf_k` は順位差が潰れ、所属リスト数と id 昇順で決まる
 - 暫定ゲート: `k1`／`b` を持つ文だけ `0A000` のまま。EXPLAIN は `rrf_k`・`window`・`weights` を受理するが、実効値の表示は対象外（担当 Issue なし）
