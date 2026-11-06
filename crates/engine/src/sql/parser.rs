@@ -17,10 +17,11 @@
 use crate::catalog::{ColumnDef, ColumnDefault, ColumnType, TableSchema};
 use crate::declarative_filter::{self, DeclarativeFilter, MetadataFilter};
 use crate::sql::allowlist::{
-    ConflictTargetSpec, FunctionArg, InsertLiteral, OnConflictAction, OnConflictClause,
-    OrderByForm, Projection, ScalarOrderKey, UpsertAddOperand, UpsertValue, ValidatedDelete,
-    ValidatedInsert, ValidatedPredicateDelete, ValidatedStatement, WherePredicate,
+    ConflictTargetSpec, FunctionArg, InsertLiteral, NamedArgValue, OnConflictAction,
+    OnConflictClause, OrderByForm, Projection, ScalarOrderKey, UpsertAddOperand, UpsertValue,
+    ValidatedDelete, ValidatedInsert, ValidatedPredicateDelete, ValidatedStatement, WherePredicate,
 };
+use crate::sql::hybrid_tuning::HybridTuning;
 use crate::sql::order_value::NullPlacement;
 use crate::sql::plan::EvaluationOrder;
 use crate::sql::udf_call::Expr;
@@ -86,6 +87,10 @@ pub enum Ranking {
         query: Vec<f32>,
         text_column_index: usize,
         query_text: String,
+        /// 名前付き調整引数の束縛結果（SEARCH-13・Issue #2119）。既定（未指定）は
+        /// [`HybridTuning::default`]。実行器が使うまでは既定以外を実行・EXPLAIN 経路で
+        /// `0A000` により拒否する（#2120／#2121 で撤去）。
+        tuning: HybridTuning,
     },
 }
 
@@ -2064,7 +2069,25 @@ fn bind_ranking(
             // 密側クエリベクトルをテキストから導出する経路を engine は持たないため
             // 実行不能として拒否する（advisor 方針: 既存 2 引数形の受理自体は
             // 変更しない。実行不能の判定はこの束縛層に閉じる）。
-            let (vec_col, vec_literal, text_col, query_text) = match args.as_slice() {
+            // 名前付き調整引数（SEARCH-13・Issue #2119）は位置引数の後ろにだけ置かれる（構文段で保証）。
+            // 位置引数と分けてから従来の形判定を行い、2 引数形・4 引数形の判定は変えない。
+            let positional_len = args
+                .iter()
+                .position(|a| matches!(a, FunctionArg::Named { .. }))
+                .unwrap_or(args.len());
+            let (positional, named_args) = args.split_at(positional_len);
+            let mut named: Vec<(String, NamedArgValue)> = Vec::new();
+            for a in named_args {
+                match a {
+                    FunctionArg::Named { name, value } => named.push((name.clone(), value.clone())),
+                    _ => {
+                        return Err(SqlSurfaceError::invalid_input(
+                            "unsupported hybrid ORDER BY function argument shape",
+                        ));
+                    }
+                }
+            }
+            let (vec_col, vec_literal, text_col, query_text) = match positional {
                 [FunctionArg::Ident(vec_col), FunctionArg::StringLiteral(vec_literal), FunctionArg::Ident(text_col), FunctionArg::StringLiteral(query_text)] => {
                     (vec_col, vec_literal, text_col, query_text)
                 }
@@ -2079,6 +2102,8 @@ fn bind_ranking(
                     ));
                 }
             };
+            // 2 引数形は上で 22000。ここへ来るのは 4 引数形のみ。未知の名前 42601・範囲外 22000。
+            let tuning = HybridTuning::from_named_args(&named)?;
             let vec_col_idx = schema
                 .columns
                 .iter()
@@ -2099,6 +2124,7 @@ fn bind_ranking(
                 query,
                 text_column_index,
                 query_text: query_text.clone(),
+                tuning,
             })
         }
         // `USING PLAN(...)`（TASK-77・SQL-5）が構文上選ばれた文には `ORDER BY` 節が
@@ -13735,6 +13761,62 @@ mod tests {
 
     // --- bind: C4（ハイブリッド） --------------------------------------------------
 
+    fn bind_hybrid_tail(tail: &str) -> Result<BoundStatement, SqlSurfaceError> {
+        bind_sql(&format!(
+            "SELECT * FROM documents ORDER BY HYBRID(embedding, '[0.1,0.2,0.3]', body, 'q'{tail}) LIMIT 5"
+        ))
+    }
+
+    fn tuning_of(bound: &BoundStatement) -> HybridTuning {
+        match &bound.ranking {
+            Ranking::Hybrid { tuning, .. } => tuning.clone(),
+            other => panic!("expected Ranking::Hybrid, got {other:?}"),
+        }
+    }
+
+    /// SEARCH-13・Issue #2119: 名前付き引数なしは既定の調整値、あり（全種）は束縛結果に保持する。
+    #[test]
+    fn binds_hybrid_named_tuning_arguments() {
+        assert!(tuning_of(&bind_hybrid_tail("").unwrap()).is_default());
+        let t = tuning_of(
+            &bind_hybrid_tail(
+                ", k1 => 1.5, b => 0.5, rrf_k => 10, window => 50, weights => '{\"dense\": 0, \"sparse\": 1}'",
+            )
+            .unwrap(),
+        );
+        assert_eq!(t.k1(), Some(1.5));
+        assert_eq!(t.b(), Some(0.5));
+        assert_eq!(t.rrf_k(), Some(10.0));
+        assert_eq!(t.window(), Some(50));
+        assert_eq!(t.weights(), Some((0.0, 1.0)));
+    }
+
+    /// SEARCH-13・Issue #2119: 範囲外・型の不一致は 22000、未知の名前は 42601。
+    #[test]
+    fn rejects_invalid_hybrid_named_tuning_arguments() {
+        for tail in [
+            ", k1 => -0.1",
+            ", b => 1.0001",
+            ", rrf_k => 0",
+            ", window => 0",
+            ", window => 1.5",
+            ", k1 => 'x'",
+            ", weights => '{\"dense\": 0, \"sparse\": 0}'",
+        ] {
+            let err = bind_hybrid_tail(tail).unwrap_err();
+            assert_eq!(err.wire_code(), "22000", "{tail}");
+        }
+        for tail in [", pool_depth => 10", ", dense_weight => 1"] {
+            let err = bind_hybrid_tail(tail).unwrap_err();
+            assert_eq!(err.wire_code(), "42601", "{tail}");
+        }
+        let err = bind_sql(
+            "SELECT * FROM documents ORDER BY HYBRID(embedding, 'q', rrf_k => 10) LIMIT 5",
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
     #[test]
     fn binds_hybrid_four_arg_form_to_ranking_hybrid() {
         let bound = bind_sql(
@@ -13746,6 +13828,7 @@ mod tests {
                 query,
                 text_column_index,
                 query_text,
+                tuning: _,
             } => {
                 assert_eq!(query, vec![0.1, 0.2, 0.3]);
                 assert_eq!(text_column_index, 1);
@@ -16418,6 +16501,7 @@ mod tests {
                             query: vec![1.0],
                             text_column_index: 0,
                             query_text: "q".to_string(),
+                            tuning: HybridTuning::default(),
                         }
                     } else {
                         Ranking::Distance { query: vec![1.0] }

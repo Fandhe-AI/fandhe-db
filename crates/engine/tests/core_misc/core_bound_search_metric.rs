@@ -115,6 +115,7 @@ fn build_hybrid_l2(
             query: vec![1.0, 0.0, 0.0, 0.0],
             text_column_index: 0,
             query_text: "q".to_string(),
+            tuning: Default::default(),
         },
         Some(DistanceKind::L2),
         false,

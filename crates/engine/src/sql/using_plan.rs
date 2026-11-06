@@ -278,6 +278,7 @@ pub(crate) fn bind_expansion(
             query: query_vector,
             text_column_index,
             query_text,
+            tuning: crate::sql::hybrid_tuning::HybridTuning::default(),
         },
         limit,
         offset: 0,
@@ -358,6 +359,7 @@ mod tests {
                 query,
                 text_column_index,
                 query_text,
+                tuning: _,
             } => {
                 assert_eq!(query, &vec![0.1, 0.2]);
                 assert_eq!(*text_column_index, 1);

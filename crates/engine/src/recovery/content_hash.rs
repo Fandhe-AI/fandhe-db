@@ -1557,6 +1557,8 @@ fn push_token(b: &mut HashInputBuilder, t: &crate::sql::lexer::Token) -> Result<
         Token::ArrayOverlap => b.push_u8(21),
         Token::TypeCast => b.push_u8(22),
         Token::Concat => b.push_u8(23),
+        // 名前付き引数の `=>`（SEARCH-13・Issue #2119）。既存タグと衝突しない 39 を割り当てる。
+        Token::NamedArgArrow => b.push_u8(39),
         // Cosine=24 は台帳ハッシュ（RECOVER-10）の互換のため不変。新種別は未使用タグを割り当てる（Issue #1976）。
         Token::DistanceOp(DistanceKind::Cosine) => b.push_u8(24),
         Token::DistanceOp(DistanceKind::L2) => b.push_u8(34),

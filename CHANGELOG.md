@@ -34,6 +34,8 @@
 
 ### Added
 
+- `HYBRID`／`hybrid_rrf` に名前付き調整引数 `k1`・`b`・`rrf_k`・`window`・`weights` の構文と束縛を追加した（Issue #2119・SEARCH-13 ポインタ）。字句は空白なしの `=>` を 1 トークンにする（`= >` は従来どおり 2 トークン）。範囲外・型の不一致は `22000`、未知の名前・曖昧な構文は `42601`。実行器が未接続の間は、調整引数を指定した文を実行・EXPLAIN とも `0A000` で拒否する。名前付き引数なしの文の結果は変わらない。
+  BREAKING CHANGE: 公開 enum `sql::allowlist::FunctionArg` に variant `Named` を、`sql::parser::Ranking::Hybrid` にフィールド `tuning` を、公開 enum `sql::lexer::Token` に variant `NamedArgArrow` を追加した（網羅的 `match` や構造体リテラルで構築している下流は追随が必要）。
 - NoSQL の `scan` に不透明カーソル `after`／`next_cursor` を追加した（Issue #2094・NOSQL-23・TASK-253 ポインタ）。`after`（文字列または `null`）を付けた要求だけがキーセットモードで、応答の `row_count` の後ろに `next_cursor`（最後のページは `null`）が付く。`offset` との併用は `42601`、改ざん・別ユーザー・別テナント・別 `sort`・別表・別サーバー鍵のカーソルは `22000`。`after` の無い要求は不変。封緘鍵はプロセス内だけで保持し、再起動で既発行カーソルは無効になる。
 - wire-server に `http::session::scope::ScopeViolation`・`SessionScope::check`・`http::query::op::Op::allowed_in_read_only` を追加した（Issue #2101・HTTP-15 ポインタ）。
 - wire-server に公開モジュール `http::query::openapi` を追加した（Issue #2104・NOSQL-20 ポインタ）。`OP_SCHEMAS` から OpenAPI 3.1 の要求本文スキーマ文書を生成する `document`／`render_pretty` を提供する（手元確認用に `examples/openapi_dump.rs` も追加）。

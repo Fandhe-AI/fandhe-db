@@ -2764,6 +2764,22 @@ pub trait TableLookup {
 pub enum FunctionArg {
     Ident(String),
     StringLiteral(String),
+    /// 名前付き調整引数 `name => value`（`HYBRID`／`hybrid_rrf` のみ。SEARCH-13・Issue #2119）。
+    /// 位置引数の後ろにだけ置ける。引数名の妥当性（未知の名前は `42601`）と値の範囲・型
+    /// （`22000`）は `sql::parser` の束縛段が [`crate::sql::hybrid_tuning::HybridTuning`] で検証する。
+    Named {
+        name: String,
+        value: NamedArgValue,
+    },
+}
+
+/// 名前付き引数の値（構造のみ。意味の解釈は束縛段）。識別子・式・`$n` は構文段で `42601`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NamedArgValue {
+    /// 数値リテラル（直前に単項 `-` があれば符号付きの文字列）。
+    Number(String),
+    /// 文字列リテラル（`weights` の JSON 文字列など）。
+    StringLiteral(String),
 }
 
 /// `ORDER BY` 式の許可形状。TASK-74・SQL-8 参照（docs/spec/05-tasks.md）。
@@ -13393,6 +13409,34 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// `offset` 個先が `<識別子> =>`（名前付き引数の開始）かどうかを消費せずに判定する
+    /// （`HYBRID` の 4 引数形と名前付き調整引数の判別。SEARCH-13・Issue #2119）。
+    fn peek_named_arg_at(&self, offset: usize) -> bool {
+        matches!(self.tokens.get(self.pos + offset), Some(Token::Ident(_)))
+            && matches!(
+                self.tokens.get(self.pos + offset + 1),
+                Some(Token::NamedArgArrow)
+            )
+    }
+
+    /// 名前付き引数の値（数値リテラル〔単項 `-` 可〕または文字列リテラル）を読む。識別子・式・
+    /// `$n`・括弧などは `42601`（fail-closed）。範囲の検証は束縛段の責務。
+    fn parse_named_arg_value(&mut self) -> Result<NamedArgValue, SqlSurfaceError> {
+        match self.advance() {
+            Some(Token::Number(n)) => Ok(NamedArgValue::Number(n.clone())),
+            Some(Token::StringLiteral(s)) => Ok(NamedArgValue::StringLiteral(s.clone())),
+            Some(Token::Punct('-')) => match self.advance() {
+                Some(Token::Number(n)) => Ok(NamedArgValue::Number(format!("-{n}"))),
+                other => Err(SqlSurfaceError::unsupported(format!(
+                    "expected number after '-' in named HYBRID argument, got {other:?}"
+                ))),
+            },
+            other => Err(SqlSurfaceError::unsupported(format!(
+                "expected number or string literal as named HYBRID argument value, got {other:?}"
+            ))),
+        }
+    }
+
     /// 許可された ORDER BY 関数ごとに、引数の個数・位置・トークン種別を明示的に
     /// 解析する。`name` は [`is_allowed_order_by_function_name`] を通過済みの
     /// 前提で呼ばれる。呼び出し元の `expect_punct(')')` が閉じ括弧を消費するため、
@@ -13418,12 +13462,43 @@ impl<'a> Parser<'a> {
                 args.push(FunctionArg::Ident(self.expect_ident()?));
                 self.expect_punct(',')?;
                 args.push(FunctionArg::StringLiteral(self.expect_string_literal()?));
-                if matches!(self.peek(), Some(Token::Punct(','))) {
+                if matches!(self.peek(), Some(Token::Punct(','))) && !self.peek_named_arg_at(1) {
                     self.advance();
                     self.sink_mark(self.pos, super::colref_sink::Role::Value);
                     args.push(FunctionArg::Ident(self.expect_ident()?));
                     self.expect_punct(',')?;
                     args.push(FunctionArg::StringLiteral(self.expect_string_literal()?));
+                }
+                // 名前付き調整引数（SEARCH-13・Issue #2119）。位置引数の後ろにだけ置ける。引数名は
+                // 列参照ではないため `sink_mark` しない（列権限・未定義列の検査に掛けない）。
+                let mut seen: Vec<String> = Vec::new();
+                while matches!(self.peek(), Some(Token::Punct(','))) {
+                    self.advance();
+                    if seen.len() >= super::hybrid_tuning::MAX_NAMED_TUNING_ARGS {
+                        return Err(SqlSurfaceError::unsupported(
+                            "too many named HYBRID arguments",
+                        ));
+                    }
+                    let arg_name = self.expect_ident()?;
+                    if seen.iter().any(|n| n.eq_ignore_ascii_case(&arg_name)) {
+                        return Err(SqlSurfaceError::unsupported(format!(
+                            "duplicate named HYBRID argument: {arg_name}"
+                        )));
+                    }
+                    match self.advance() {
+                        Some(Token::NamedArgArrow) => {}
+                        other => {
+                            return Err(SqlSurfaceError::unsupported(format!(
+                                "expected '=>' after HYBRID argument name, got {other:?}"
+                            )))
+                        }
+                    }
+                    let value = self.parse_named_arg_value()?;
+                    seen.push(arg_name.clone());
+                    args.push(FunctionArg::Named {
+                        name: arg_name,
+                        value,
+                    });
                 }
                 Ok(args)
             }
@@ -32948,6 +33023,64 @@ mod tests {
             &lookup,
         )
         .expect("4-arg HYBRID shape should be accepted");
+    }
+
+    /// SEARCH-13・Issue #2119: 位置引数の後ろの名前付き調整引数を構文として受理する。
+    #[test]
+    fn accepts_hybrid_named_tuning_arguments() {
+        let lookup = catalog_with(&["documents"]);
+        let base = "SELECT * FROM documents ORDER BY HYBRID(embedding, '[0.1]', body, 'q'";
+        for tail in [
+            ", rrf_k => 10",
+            ", K1 => 1.2, b => 0.75",
+            ", window => 50, rrf_k => -1",
+            ", weights => '{\"dense\": 1, \"sparse\": 2}'",
+            ", k1 => 1, b => 1, rrf_k => 1, window => 1, weights => 'x'",
+        ] {
+            let sql = format!("{base}{tail}) LIMIT 5");
+            validate_statement(&sql, &lookup)
+                .unwrap_or_else(|e| panic!("expected acceptance, got {e:?} for sql={sql:?}"));
+        }
+        let validated = validate_statement(
+            "SELECT * FROM documents ORDER BY HYBRID(embedding, '[0.1]', body, 'q', rrf_k => -2) LIMIT 5",
+            &lookup,
+        )
+        .unwrap();
+        let args = match validated.order_by() {
+            OrderByForm::FunctionCall { args, .. } => args.clone(),
+            other => panic!("unexpected order_by: {other:?}"),
+        };
+        assert_eq!(
+            args.last(),
+            Some(&FunctionArg::Named {
+                name: "rrf_k".to_string(),
+                value: NamedArgValue::Number("-2".to_string()),
+            })
+        );
+    }
+
+    /// SEARCH-13・Issue #2119: 名前付き引数の曖昧な形は 42601（fail-closed）。
+    #[test]
+    fn rejects_malformed_hybrid_named_arguments() {
+        let base = "SELECT * FROM documents ORDER BY HYBRID(embedding, '[0.1]', body, 'q'";
+        for tail in [
+            ", rrf_k => 1, other_col",
+            ", rrf_k => 1, 'x'",
+            ", rrf_k => 1, rrf_k => 2",
+            ", RRF_K => 1, rrf_k => 2",
+            ", rrf_k => other",
+            ", rrf_k => (1)",
+            ", rrf_k => 1 + 2",
+            ", rrf_k := 1",
+            ", rrf_k =>",
+            ", rrf_k => 1,",
+            ", rrf_k => $1",
+            ", rrf_k => - x",
+            ", => 1",
+            ", k1 => 1, b => 1, rrf_k => 1, window => 1, weights => 'x', k1 => 2",
+        ] {
+            assert_rejected_as_syntax_error(&format!("{base}{tail}) LIMIT 5"));
+        }
     }
 
     #[test]

@@ -13714,6 +13714,7 @@ impl EngineCore {
                         query: planned.query_vector,
                         text_column_index,
                         query_text,
+                        tuning: crate::sql::hybrid_tuning::HybridTuning::default(),
                     },
                     limit: validated_limit,
                     offset: 0,
@@ -14565,6 +14566,8 @@ impl EngineCore {
         bound: &crate::sql::parser::BoundStatement,
         hnsw_search: crate::hnsw::HnswSessionSearch,
     ) -> Result<crate::sql::exec::QueryResult, crate::sql::allowlist::SqlSurfaceError> {
+        // 実行側と同じ暫定ゲート（HYBRID の調整引数は実行器が未接続。SEARCH-13・Issue #2119）。
+        crate::sql::hybrid_tuning::ensure_tuning_applied(bound.ranking())?;
         // RLS-13（Issue #2279）: 実行側と同じ ANN 形状補正のため、同じ `read_txn` からポリシーの適用可否を求める。
         let row_policy_present =
             crate::sql::row_policy::policies_apply(read_txn, ctx, bound.table())?;
