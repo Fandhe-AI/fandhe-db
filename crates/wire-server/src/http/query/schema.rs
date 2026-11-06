@@ -624,6 +624,30 @@ pub static HYBRID_SCHEMA: ObjectSchema = ObjectSchema {
     ],
 };
 
+/// `highlight` フィールドのサブスキーマ（`search` op。SEARCH-14 ポインタ・Issue #3056）。
+///
+/// `{"column": "<TEXT 列名>", "options": "<ts_headline の options 文字列>"}`。`column` は必須、
+/// `options` は任意（省略は SQL の 2 引数形、指定は 3 引数形。`null` は型違反として拒否する）。
+/// 形（型・未知キー）だけをここで検査し、列の解決・オプションの語彙・上限は engine の
+/// `ts_headline` 束縛〔`engine::sql::udf_call::bind_ts_headline_projection`〕が SQL と同じ規則で担う。
+pub static HIGHLIGHT_SCHEMA: ObjectSchema = ObjectSchema {
+    name: "highlight",
+    fields: &[
+        FieldSpec {
+            key: "column",
+            presence: Presence::Required,
+            ty: FieldType::String,
+            nullable: false,
+        },
+        FieldSpec {
+            key: "options",
+            presence: Presence::Optional,
+            ty: FieldType::String,
+            nullable: false,
+        },
+    ],
+};
+
 /// `hybrid.weights`（`{"dense": 数, "sparse": 数}`）のサブスキーマ（Issue #2122）。
 /// 両キー必須・余分なキーは `42601`。非負・両方 0 不可などの範囲は engine が検査する。
 pub static HYBRID_WEIGHTS_SCHEMA: ObjectSchema = ObjectSchema {
@@ -829,6 +853,13 @@ pub static SEARCH_SCHEMA: ObjectSchema = ObjectSchema {
             key: "metric",
             presence: Presence::Optional,
             ty: FieldType::String,
+            nullable: false,
+        },
+        // SEARCH-14・Issue #3056: 強調済み抜粋（SQL `ts_headline` と同じ値）の列を足す。
+        FieldSpec {
+            key: "highlight",
+            presence: Presence::Optional,
+            ty: FieldType::Object(&HIGHLIGHT_SCHEMA),
             nullable: false,
         },
     ],
@@ -2596,6 +2627,41 @@ mod tests {
             ));
             assert!(SEARCH_SCHEMA.validate(&v).is_err(), "must reject: {bad}");
         }
+    }
+
+    /// SEARCH-14・Issue #3056: `highlight` は `column` 必須・`options` 任意で、それ以外の形は拒否する。
+    #[test]
+    fn highlight_accepts_valid_shapes_and_rejects_bad_ones() {
+        for ok in [
+            r#"{"column":"body"}"#,
+            r#"{"column":"body","options":"MaxWords=5"}"#,
+        ] {
+            let v = obj(&format!(
+                r#"{{"op":"search","table":"docs","limit":1,"highlight":{ok}}}"#
+            ));
+            SEARCH_SCHEMA.validate(&v).expect("valid highlight");
+        }
+        for bad in [
+            r#"{}"#,
+            r#"{"options":"x"}"#,
+            r#"{"column":1}"#,
+            r#"{"column":null}"#,
+            r#"{"column":"body","options":null}"#,
+            r#"{"column":"body","options":1}"#,
+            r#"{"column":"body","extra":1}"#,
+            r#""body""#,
+            r#"null"#,
+        ] {
+            let v = obj(&format!(
+                r#"{{"op":"search","table":"docs","limit":1,"highlight":{bad}}}"#
+            ));
+            assert!(SEARCH_SCHEMA.validate(&v).is_err(), "must reject: {bad}");
+        }
+        let scan = obj(r#"{"op":"scan","table":"docs","limit":1,"highlight":{"column":"body"}}"#);
+        assert_eq!(
+            SCAN_SCHEMA.validate(&scan).unwrap_err(),
+            SchemaError::UnknownKey
+        );
     }
 
     #[test]

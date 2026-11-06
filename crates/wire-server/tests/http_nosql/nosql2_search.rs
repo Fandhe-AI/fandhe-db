@@ -1168,3 +1168,339 @@ fn hybrid_tuning_rejections_match_sql_codes() {
         assert_eq!(http_common::wire_code_of(&resp), code, "{extra}: {resp:?}");
     }
 }
+// --- highlight（SEARCH-14・Issue #3056。SQL `ts_headline` とのパリティ） ---
+
+/// `highlight` 検証用の core。本文に ASCII（複数語・長文）と CJK を含む Public 行 4 件。
+/// `headline_limits` を渡すと CLI で下げた上限を持つ core になる（fail-open 防止の回帰に使う）。
+fn new_core_headline(
+    headline_limits: Option<engine::headline_limits::HeadlineLimits>,
+) -> (Arc<EngineCore>, temp_db::CleanupGuard) {
+    let path = temp_db::unique_db_path("nosql2-search-headline");
+    let guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema()).expect("create table");
+    let ctx = wire_scoped_ctx("tenant-a");
+    type Row<'a> = (u64, [f32; 2], &'a str);
+    let rows: [Row<'_>; 4] = [
+        (
+            1,
+            [1.0, 0.0],
+            "alpha content about the alpha release and beta tests",
+        ),
+        (
+            2,
+            [0.0, 1.0],
+            "beta content with gamma and alpha mixed in one long sentence of words",
+        ),
+        (
+            3,
+            [-1.0, 0.0],
+            "日本語の検索機能と全文検索の強調表示を確認する文章",
+        ),
+        (
+            4,
+            [0.5, 0.5],
+            "gamma only text without the other terms at all",
+        ),
+    ];
+    for (id, emb, body) in rows {
+        engine::tenant::insert_typed_row(
+            &storage,
+            TABLE,
+            &ctx,
+            id,
+            Visibility::Public,
+            &[
+                Value::Vector(emb.to_vec()),
+                Value::Text("ja".to_string()),
+                Value::Text(format!("docs/{id}.md")),
+                Value::Text(body.to_string()),
+            ],
+            &engine::recovery::required_op_id::OperationId::parse(&format!("nosql2-hl-op-{id}"))
+                .expect("valid operation_id"),
+        )
+        .expect("insert row");
+    }
+    let mut core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    if let Some(l) = headline_limits {
+        core = core.with_headline_limits(l);
+    }
+    (Arc::new(core), guard)
+}
+
+/// JSON 文字列リテラルの中身へ埋める（`\` と `"` のみエスケープ）。
+fn json_str(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// SQL 文字列リテラルの中身へ埋める（`'` の二重化）。
+fn sql_str(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
+/// `highlight` 付き `search` 要求本文（`columns_json` が空文字なら `columns` は省略）。
+fn highlight_request(text: &str, columns_json: &str, options: Option<&str>) -> String {
+    let opts = options
+        .map(|o| format!(r#","options":"{}""#, json_str(o)))
+        .unwrap_or_default();
+    let columns = if columns_json.is_empty() {
+        String::new()
+    } else {
+        format!(r#""columns":{columns_json},"#)
+    };
+    format!(
+        r#"{{"op":"search","table":"docs","vector":[1.0,0.0],"limit":4,{columns}
+        "hybrid":{{"text":"{}"}},"highlight":{{"column":"body"{opts}}}}}"#,
+        json_str(text)
+    )
+}
+
+/// 同じ本文・検索語・オプションの SQL（オラクル）。
+fn highlight_sql(text: &str, cols: &str, options: Option<&str>) -> String {
+    let args = match options {
+        Some(o) => format!("body, '{}', '{}'", sql_str(text), sql_str(o)),
+        None => format!("body, '{}'", sql_str(text)),
+    };
+    format!(
+        "SELECT {cols}ts_headline({args}) AS highlight FROM docs \
+         ORDER BY HYBRID(embedding, '[1.0,0.0]', body, '{}') LIMIT 4",
+        sql_str(text)
+    )
+}
+
+/// (a): ASCII の本文 × 検索語 × オプションで、NoSQL の応答が SQL `ts_headline` とバイト一致する。
+#[test]
+fn highlight_matches_sql_ts_headline_for_ascii_options() {
+    let (core, _guard) = new_core_headline(None);
+    let addr = spawn(Arc::clone(&core));
+    let options: [Option<&str>; 8] = [
+        None,
+        Some(""),
+        Some("StartSel=<i>, StopSel=</i>"),
+        Some("StartSel='[[', StopSel=']]'"),
+        Some("MaxWords=5, MinWords=2"),
+        Some("ShortWord=4"),
+        Some("HighlightAll=true"),
+        Some("MaxFragments=2, MaxWords=4, MinWords=2, FragmentDelimiter=' // '"),
+    ];
+    for text in ["alpha", "alpha beta", "gamma -alpha", "alp*"] {
+        for opt in options {
+            let resp = query_as_alice(addr, highlight_request(text, r#"["id"]"#, opt).as_bytes());
+            assert_eq!(resp.status, 200, "text={text} opt={opt:?} resp={resp:?}");
+            let oracle = sql_oracle_body(&core, "tenant-a", &highlight_sql(text, "id, ", opt));
+            assert_eq!(body_utf8(&resp), oracle, "text={text} opt={opt:?}");
+        }
+    }
+    // 空振り防止: 強調が実際に付いている。
+    let resp = query_as_alice(
+        addr,
+        highlight_request("alpha", r#"["id"]"#, None).as_bytes(),
+    );
+    assert!(body_utf8(&resp).contains("<b>alpha</b>"), "resp={resp:?}");
+}
+
+/// (a): CJK の本文・検索語でも SQL とバイト一致し、強調が付く。
+#[test]
+fn highlight_matches_sql_ts_headline_for_cjk() {
+    let (core, _guard) = new_core_headline(None);
+    let addr = spawn(Arc::clone(&core));
+    for text in ["検索", "全文検索", "日本語 強調"] {
+        for opt in [None, Some("StartSel=[, StopSel=]")] {
+            let resp = query_as_alice(addr, highlight_request(text, r#"["id"]"#, opt).as_bytes());
+            assert_eq!(resp.status, 200, "text={text} resp={resp:?}");
+            let oracle = sql_oracle_body(&core, "tenant-a", &highlight_sql(text, "id, ", opt));
+            assert_eq!(body_utf8(&resp), oracle, "text={text} opt={opt:?}");
+        }
+    }
+    let resp = query_as_alice(
+        addr,
+        highlight_request("検索", r#"["id"]"#, None).as_bytes(),
+    );
+    assert!(body_utf8(&resp).contains("<b>"), "resp={resp:?}");
+}
+
+/// 列順は「columns（省略は全列）→ explain_score の 3 列 → highlight」で固定される。
+#[test]
+fn highlight_column_order_is_fixed() {
+    let (core, _guard) = new_core_headline(None);
+    let addr = spawn(Arc::clone(&core));
+
+    // columns 省略（全列）。
+    let resp = query_as_alice(addr, highlight_request("alpha", "", None).as_bytes());
+    assert_eq!(resp.status, 200, "resp={resp:?}");
+    let oracle = sql_oracle_body(
+        &core,
+        "tenant-a",
+        &highlight_sql("alpha", "id, embedding, lang, path, body, ", None),
+    );
+    assert_eq!(body_utf8(&resp), oracle);
+
+    // explain_score 併用。
+    let body = r#"{"op":"search","table":"docs","vector":[1.0,0.0],"limit":4,"columns":["id","path"],
+        "hybrid":{"text":"alpha","explain_score":true},"highlight":{"column":"body"}}"#;
+    let resp = query_as_alice(addr, body.as_bytes());
+    assert_eq!(resp.status, 200, "resp={resp:?}");
+    let oracle = sql_oracle_body(
+        &core,
+        "tenant-a",
+        "SELECT id, path, hybrid_dense_rank(), hybrid_sparse_rank(), hybrid_score(), \
+         ts_headline(body, 'alpha') AS highlight FROM docs \
+         ORDER BY HYBRID(embedding, '[1.0,0.0]', body, 'alpha') LIMIT 4",
+    );
+    assert_eq!(body_utf8(&resp), oracle);
+}
+
+/// (b): 不正なオプション・上限超過のエラーコードが SQL と一致する（上限を下げた core でも
+/// NoSQL 側が同じ上限を使うこと＝fail-open にならないことの回帰を兼ねる）。
+#[test]
+fn highlight_error_codes_match_sql() {
+    let limits = engine::headline_limits::HeadlineLimits::new(8, 2);
+    let (core, _guard) = new_core_headline(Some(limits));
+    let addr = spawn(Arc::clone(&core));
+    for (text, opt, pinned) in [
+        ("alpha", Some("NoSuchOption=1"), Some("22023")),
+        ("alpha", Some("MaxWords=abc"), Some("22023")),
+        ("alpha", Some("MaxWords"), None),
+        (
+            "alpha",
+            Some("MaxFragments=3, MaxWords=5, MinWords=2"),
+            Some("54000"),
+        ),
+        (
+            "alpha",
+            Some("StartSel=<mark>, StopSel=</mark>"),
+            Some("54000"),
+        ),
+        ("alpha", None, Some("54000")),
+    ] {
+        let resp = query_as_alice(addr, highlight_request(text, r#"["id"]"#, opt).as_bytes());
+        let code = http_common::wire_code_of(&resp);
+        let sql_code = sql_oracle_err(&core, "tenant-a", &highlight_sql(text, "id, ", opt));
+        assert_eq!(code, sql_code, "opt={opt:?} resp={resp:?}");
+        if let Some(p) = pinned {
+            assert_eq!(code, p, "opt={opt:?}");
+        }
+    }
+}
+
+/// 形の拒否はすべて 42601 で、固定文言（入力値・列名を含まない）。
+#[test]
+fn highlight_shape_rejections() {
+    let (core, _guard) = new_core_headline(None);
+    let addr = spawn(Arc::clone(&core));
+    let base = r#""op":"search","table":"docs","limit":4"#;
+    let hv = r#""vector":[1.0,0.0],"hybrid":{"text":"a"}"#;
+    for (name, body) in [
+        (
+            "vector only",
+            format!(r#"{{{base},"vector":[1.0,0.0],"highlight":{{"column":"body"}}}}"#),
+        ),
+        (
+            "plan with hybrid",
+            format!(
+                r#"{{{base},"plan":"find alpha","hybrid":{{"text":"alpha"}},"highlight":{{"column":"body"}}}}"#
+            ),
+        ),
+        (
+            "plan",
+            format!(r#"{{{base},"plan":"find alpha","highlight":{{"column":"body"}}}}"#),
+        ),
+        (
+            "unknown key",
+            format!(r#"{{{base},{hv},"highlight":{{"column":"body","x":1}}}}"#),
+        ),
+        (
+            "missing column",
+            format!(r#"{{{base},{hv},"highlight":{{"options":""}}}}"#),
+        ),
+        (
+            "column type",
+            format!(r#"{{{base},{hv},"highlight":{{"column":1}}}}"#),
+        ),
+        (
+            "options null",
+            format!(r#"{{{base},{hv},"highlight":{{"column":"body","options":null}}}}"#),
+        ),
+        (
+            "bad identifier",
+            format!(r#"{{{base},{hv},"highlight":{{"column":"bo dy; drop"}}}}"#),
+        ),
+    ] {
+        let resp = query_as_alice(addr, body.as_bytes());
+        assert_eq!(
+            http_common::wire_code_of(&resp),
+            "42601",
+            "{name}: {resp:?}"
+        );
+        let msg = http_common::error_message_of(&resp);
+        assert!(
+            !msg.contains("drop") && !msg.contains("find alpha"),
+            "{name}: {msg}"
+        );
+    }
+}
+
+/// TEXT 以外の列・未知の列は SQL と同じ分類。
+#[test]
+fn highlight_column_resolution_matches_sql() {
+    let (core, _guard) = new_core_headline(None);
+    let addr = spawn(Arc::clone(&core));
+    for column in ["embedding", "id", "nope"] {
+        let body = format!(
+            r#"{{"op":"search","table":"docs","vector":[1.0,0.0],"limit":4,
+            "hybrid":{{"text":"alpha"}},"highlight":{{"column":"{column}"}}}}"#
+        );
+        let resp = query_as_alice(addr, body.as_bytes());
+        let sql_code = sql_oracle_err(
+            &core,
+            "tenant-a",
+            &format!(
+                "SELECT ts_headline({column}, 'alpha') AS highlight FROM docs \
+                 ORDER BY HYBRID(embedding, '[1.0,0.0]', body, 'alpha') LIMIT 4"
+            ),
+        );
+        assert_eq!(
+            http_common::wire_code_of(&resp),
+            sql_code,
+            "{column}: {resp:?}"
+        );
+    }
+}
+
+/// `explain: true` と `highlight` の併用は成功し、評価は走らない（上限を下げた core でも 54000 にならない）。
+#[test]
+fn highlight_with_explain_succeeds_without_evaluating() {
+    let limits = engine::headline_limits::HeadlineLimits::new(8, 2);
+    let (core, _guard) = new_core_headline(Some(limits));
+    let addr = spawn(Arc::clone(&core));
+    let body = r#"{"op":"search","table":"docs","vector":[1.0,0.0],"limit":4,"explain":true,
+        "hybrid":{"text":"alpha"},"highlight":{"column":"body"}}"#;
+    let resp = query_as_alice(addr, body.as_bytes());
+    assert_eq!(resp.status, 200, "resp={resp:?}");
+}
+
+/// 表に `highlight` 列があると衝突として 42601（投影していなくても。大文字小文字は区別しない）。
+#[test]
+fn highlight_column_name_conflict_is_rejected() {
+    let path = temp_db::unique_db_path("nosql2-search-headline-conflict");
+    let _guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    let schema = TableSchema::new(
+        TABLE,
+        vec![
+            ColumnDef::new("embedding", ColumnType::Vector(DIM), false),
+            ColumnDef::new("body", ColumnType::Text, false),
+            ColumnDef::new("Highlight", ColumnType::Text, false),
+        ],
+    );
+    storage.create_table(&schema).expect("create table");
+    let core = Arc::new(EngineCore::from_storage(
+        storage,
+        Box::new(CpuScalarProvider),
+    ));
+    let addr = spawn(core);
+    let body = r#"{"op":"search","table":"docs","vector":[1.0,0.0],"limit":4,"columns":["body"],
+        "hybrid":{"text":"alpha"},"highlight":{"column":"body"}}"#;
+    let resp = query_as_alice(addr, body.as_bytes());
+    assert_eq!(http_common::wire_code_of(&resp), "42601", "resp={resp:?}");
+}

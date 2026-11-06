@@ -5581,6 +5581,48 @@ pub(crate) fn bind_projection_expr(
     Ok(r)
 }
 
+/// NoSQL `search` の `highlight`（SEARCH-14 ポインタ・Issue #3056）用に、SQL の
+/// `ts_headline(<column>, '<query_text>'[, '<options>']) AS <output_name>` と**同じ束縛結果**の
+/// 投影列を得る入口。wire-server の `search` binder から呼ばれる。
+///
+/// SQL テキストを組み立てず `Expr` の AST を直接構築して [`bind_projection_expr`] へ渡す
+/// （第 2 の評価器を作らない。列型検査〔`42804`〕・NULL 伝播・評価時のエラー写像は SQL と同一経路）。
+/// `options` が `None` なら 2 引数形、`Some` なら 3 引数形（空文字列で代用しない）。
+///
+/// `limits` を**明示引数**で受ける理由: NoSQL の bound 検索入口は文実行の束縛スコープ
+/// （`sparsevec_limits_scope`）を張らないため、スレッドローカルに頼ると CLI で下げた上限が効かず
+/// ハード上限へ戻る（fail-open）。ここで一時的にスコープを張り、渡された上限をペイロードへ焼き込む。
+pub fn bind_ts_headline_projection(
+    schema: &TableSchema,
+    registry: &UdfRegistry,
+    column: &str,
+    query_text: &str,
+    options: Option<&str>,
+    limits: crate::headline_limits::HeadlineLimits,
+    output_name: &str,
+) -> Result<crate::sql::parser::ProjectedColumn, SqlSurfaceError> {
+    let mut args = vec![
+        Expr::Ident(column.to_string()),
+        Expr::String(query_text.to_string()),
+    ];
+    if let Some(opts) = options {
+        args.push(Expr::String(opts.to_string()));
+    }
+    let expr = Expr::Call {
+        name: "ts_headline".to_string(),
+        args,
+    };
+    let _scope = crate::headline_limits::HeadlineLimitsScope::enter(limits);
+    let mut node_budget = MAX_EXPR_NODES;
+    let (bound, ty, result_ty) = bind_projection_expr(&expr, schema, registry, &mut node_budget)?;
+    Ok(crate::sql::parser::ProjectedColumn::Computed {
+        name: output_name.to_string(),
+        expr: bound,
+        ty,
+        result_ty,
+    })
+}
+
 /// 集計後の投影項目（`sql::parser::bind_aggregate_projection_expr`）用の束縛（Issue #1592）。
 /// [`bind_projection_expr`] と同じだが、式の最上位が CAST の結果型（numeric・uuid・bytea・配列）
 /// の場合は許可する（集計行の出力セルとして投影される位置。結果バイト予算は `sql::group_by` の
@@ -13138,6 +13180,58 @@ mod tests {
                 ColumnDef::new("label", ColumnType::Text, false),
             ],
         )
+    }
+
+    /// Issue #3056: NoSQL 向け `ts_headline` 投影の束縛は、明示引数の上限をペイロードへ焼き込み、
+    /// options の有無で 2 引数形・3 引数形を分け、TEXT 以外の列は `42804` で拒否する。
+    #[test]
+    fn ts_headline_projection_bakes_limits_and_distinguishes_arity() {
+        use crate::headline_limits::HeadlineLimits;
+        let schema = schema_with_vector();
+        let registry = UdfRegistry::default();
+        let limits = HeadlineLimits::new(7, 3);
+        let two = bind_ts_headline_projection(
+            &schema,
+            &registry,
+            "label",
+            "q",
+            None,
+            limits,
+            "highlight",
+        )
+        .expect("2-arg form binds");
+        let three = bind_ts_headline_projection(
+            &schema,
+            &registry,
+            "label",
+            "q",
+            Some(""),
+            limits,
+            "highlight",
+        )
+        .expect("3-arg form binds");
+        let (d2, d3) = (format!("{two:?}"), format!("{three:?}"));
+        assert!(
+            d2.contains("TsHeadline2(HeadlineLimits { max_output_bytes: 7, max_fragments: 3 })")
+        );
+        assert!(
+            d3.contains("TsHeadline3(HeadlineLimits { max_output_bytes: 7, max_fragments: 3 })")
+        );
+        assert!(matches!(
+            &two,
+            crate::sql::parser::ProjectedColumn::Computed { name, .. } if name == "highlight"
+        ));
+        let err = bind_ts_headline_projection(
+            &schema,
+            &registry,
+            "embedding",
+            "q",
+            None,
+            limits,
+            "highlight",
+        )
+        .expect_err("non-text column");
+        assert_eq!(err.wire_code(), "42804");
     }
 
     fn num(s: &str) -> Expr {

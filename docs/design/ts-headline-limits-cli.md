@@ -5,7 +5,7 @@
 - ステータス: 採用（Issue #2125・SEARCH-14 のポインタのみ。spec 本文は転記しない）
 - 対象: SQL 組み込み関数 `ts_headline(doc, query[, options])`、フラグ `--max-ts-headline-bytes`／`--max-ts-headline-fragments`
 - 先行: 一致範囲の算出は Issue #2124（`sparse::match_span`）。上限の運搬は [sparsevec-limits-cli.md](sparsevec-limits-cli.md)（Issue #2027）と同型
-- 後続: NoSQL の `search` の `highlight` 公開と、SQL との一致・RLS／列の権限の網羅的な検証は #2126。検索語パーサ（フレーズ・除外・前方一致・`or`）は #2113 以降（[fulltext-query-syntax.md](fulltext-query-syntax.md)）
+- NoSQL の `search` の `highlight` 公開と SQL との一致・RLS／列の権限の検証は #3056 で実装済み（SQL 側の越境マトリクスは #2126）。NoSQL の bound 検索入口は束縛スコープを張らないため、`EngineCore::headline_limits()` を明示引数で渡して同じ上限を共有する。検索語パーサ（フレーズ・除外・前方一致・`or`）は #2113 以降（[fulltext-query-syntax.md](fulltext-query-syntax.md)）
 
 ## 背景
 
@@ -100,7 +100,7 @@ PostgreSQL の公開ドキュメントと同じ 8 つ。名前の大小文字は
 
 ## 対象外
 
-- NoSQL の `search` の `highlight` での公開と、SQL の投影との一致の検証（#2126）
+- NoSQL の `search` の `highlight` での公開と、SQL の投影との一致の検証（#3056 で実装済み。上限は明示引数で渡して共有する）
 - （SQL 側の RLS・列の権限の越境マトリクスは #2126 で `crates/engine/tests/table_rls/rls10_ts_headline_paths.rs` に追加済み）
 - フレーズ・除外・前方一致・`or` の意味づけ（cover の拡張。#2113 以降）
 - ステミング（SEARCH-16 ポインタ）・形態素解析（EXT-8 ポインタ）
