@@ -68,35 +68,46 @@ impl OnnxCrossEncoderBackend {
         tokenizer_path: &Path,
         max_seq_len: usize,
     ) -> Result<Self, CrossEncoderError> {
-        // codex-review 指摘（PR #336 P1）: `CrossEncoderConfig::new` を経由しない
-        // 直接呼び出し経路でも `MAX_CROSS_ENCODER_SEQ_LEN` の上限を必ず強制する
-        // （`CrossEncoderReranker::new` の一致検査だけに委ねると、`from_files`／
-        // `score_pairs` を直接呼ぶ利用者がこの上限契約を回避してトークナイズ時の
-        // テンソル確保を無制限化できてしまうため、構築時点で fail-closed に拒否する）。
-        if max_seq_len == 0 || max_seq_len > MAX_CROSS_ENCODER_SEQ_LEN {
-            return Err(CrossEncoderError::TruncationFailed);
-        }
-
-        // モジュール冒頭ドキュメント参照: `ort::` の他 API より前に、ここで
-        // 明示的に dylib を解決する。未設定のまま先へ進むと `ort` 内部の
-        // panic 経路（`.expect("Failed to load ONNX Runtime dylib")`）に到達しうる。
-        let dylib_path = env::var_os("ORT_DYLIB_PATH").filter(|s| !s.is_empty());
-        let dylib_path = match dylib_path {
-            Some(p) => p,
-            None => {
-                return Err(CrossEncoderError::Backend(
-                    "ORT_DYLIB_PATH is not set".to_string(),
-                ));
-            }
-        };
-        ort::init_from(&dylib_path)
-            .map_err(|e| {
-                CrossEncoderError::Backend(format!("failed to load onnxruntime dylib: {e}"))
-            })?
-            .commit();
-
-        let mut tokenizer = Tokenizer::from_file(tokenizer_path)
+        init_runtime(max_seq_len)?;
+        let tokenizer = Tokenizer::from_file(tokenizer_path)
             .map_err(|e| CrossEncoderError::Backend(format!("failed to load tokenizer: {e}")))?;
+        let mut builder = Session::builder().map_err(|e| {
+            CrossEncoderError::Backend(format!("failed to init onnxruntime session builder: {e}"))
+        })?;
+        let session = builder
+            .commit_from_file(model_path)
+            .map_err(|e| CrossEncoderError::Backend(format!("failed to load onnx model: {e}")))?;
+
+        Self::assemble(tokenizer, session, max_seq_len)
+    }
+
+    /// メモリ上のモデル／トークナイザ（`tokenizer.json`）のバイト列から構築する
+    /// （Issue #2144。wire-server 起動時の `rerank::onnx_cross_encoder_method` が、
+    /// サイズ上限付きで読んだバイト列を渡す。検証内容は [`Self::from_files`] と同じ）。
+    pub fn from_bytes(
+        model: &[u8],
+        tokenizer: &[u8],
+        max_seq_len: usize,
+    ) -> Result<Self, CrossEncoderError> {
+        init_runtime(max_seq_len)?;
+        let tokenizer = Tokenizer::from_bytes(tokenizer)
+            .map_err(|e| CrossEncoderError::Backend(format!("failed to load tokenizer: {e}")))?;
+        let mut builder = Session::builder().map_err(|e| {
+            CrossEncoderError::Backend(format!("failed to init onnxruntime session builder: {e}"))
+        })?;
+        let session = builder
+            .commit_from_memory(model)
+            .map_err(|e| CrossEncoderError::Backend(format!("failed to load onnx model: {e}")))?;
+
+        Self::assemble(tokenizer, session, max_seq_len)
+    }
+
+    /// `from_files`／`from_bytes` 共通の後段: truncation・padding の設定と入力名の検証。
+    fn assemble(
+        mut tokenizer: Tokenizer,
+        session: Session,
+        max_seq_len: usize,
+    ) -> Result<Self, CrossEncoderError> {
         tokenizer
             .with_truncation(Some(TruncationParams {
                 max_length: max_seq_len,
@@ -107,13 +118,6 @@ impl OnnxCrossEncoderBackend {
         // なので、常に `max_seq_len` へ固定パディングするより無駄なテンソル要素を
         // 減らせる）。
         tokenizer.with_padding(Some(PaddingParams::default()));
-
-        let mut builder = Session::builder().map_err(|e| {
-            CrossEncoderError::Backend(format!("failed to init onnxruntime session builder: {e}"))
-        })?;
-        let session = builder
-            .commit_from_file(model_path)
-            .map_err(|e| CrossEncoderError::Backend(format!("failed to load onnx model: {e}")))?;
 
         // 入力構成の検証（3.2 節の契約）: `input_ids`/`attention_mask` を持たない
         // モデルは推論経路の前提が崩れるため構築時に拒否する（fail-closed）。
@@ -132,6 +136,36 @@ impl OnnxCrossEncoderBackend {
             has_token_type_ids,
         })
     }
+}
+
+/// `max_seq_len` の上限検査と `ORT_DYLIB_PATH` の解決（`from_files`／`from_bytes` 共通。
+/// モジュール冒頭ドキュメントの fail-closed 契約: `ort::` の他 API より前に実行する）。
+fn init_runtime(max_seq_len: usize) -> Result<(), CrossEncoderError> {
+    // codex-review 指摘（PR #336 P1）: `CrossEncoderConfig::new` を経由しない
+    // 直接呼び出し経路でも `MAX_CROSS_ENCODER_SEQ_LEN` の上限を必ず強制する
+    // （`CrossEncoderReranker::new` の一致検査だけに委ねると、`from_files`／
+    // `score_pairs` を直接呼ぶ利用者がこの上限契約を回避してトークナイズ時の
+    // テンソル確保を無制限化できてしまうため、構築時点で fail-closed に拒否する）。
+    if max_seq_len == 0 || max_seq_len > MAX_CROSS_ENCODER_SEQ_LEN {
+        return Err(CrossEncoderError::TruncationFailed);
+    }
+
+    // モジュール冒頭ドキュメント参照: `ort::` の他 API より前に、ここで
+    // 明示的に dylib を解決する。未設定のまま先へ進むと `ort` 内部の
+    // panic 経路（`.expect("Failed to load ONNX Runtime dylib")`）に到達しうる。
+    let dylib_path = env::var_os("ORT_DYLIB_PATH").filter(|s| !s.is_empty());
+    let dylib_path = match dylib_path {
+        Some(p) => p,
+        None => {
+            return Err(CrossEncoderError::Backend(
+                "ORT_DYLIB_PATH is not set".to_string(),
+            ));
+        }
+    };
+    ort::init_from(&dylib_path)
+        .map_err(|e| CrossEncoderError::Backend(format!("failed to load onnxruntime dylib: {e}")))?
+        .commit();
+    Ok(())
 }
 
 /// codex-review 指摘（PR #336 P1、threadId: PRRT_kwDOUAKASM6dkqJv）への対応:

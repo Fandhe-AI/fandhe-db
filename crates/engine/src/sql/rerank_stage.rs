@@ -16,9 +16,9 @@
 use crate::arena::VectorArena;
 use crate::catalog::TableSchema;
 use crate::rerank::{
-    rerank_candidates, RerankCandidate, RerankConfig, RerankCounters, RerankDegradeReason,
-    RerankError, RerankInput, RerankSettings, Reranker, MAX_CANDIDATE_TEXT_BYTES,
-    MAX_TOTAL_CANDIDATE_TEXT_BYTES,
+    rerank_candidates, CrossEncoderError, RerankCandidate, RerankConfig, RerankCounters,
+    RerankDegradeReason, RerankError, RerankInput, RerankSettings, Reranker,
+    MAX_CANDIDATE_TEXT_BYTES, MAX_TOTAL_CANDIDATE_TEXT_BYTES,
 };
 use crate::row_codec;
 use crate::storage::read_source::ReadSource;
@@ -58,6 +58,7 @@ pub(crate) fn degrade_reason(err: &RerankError) -> RerankDegradeReason {
         RerankError::QueryTextTooLong { .. }
         | RerankError::CandidateTextTooLong { .. }
         | RerankError::TotalCandidateTextTooLong { .. } => RerankDegradeReason::InputLimit,
+        RerankError::CrossEncoder(CrossEncoderError::Timeout) => RerankDegradeReason::Timeout,
         RerankError::CrossEncoder(_) => RerankDegradeReason::BackendError,
         _ => RerankDegradeReason::ContractViolation,
     }
@@ -501,6 +502,20 @@ mod tests {
         ) -> Result<Vec<RerankedHit>, RerankError> {
             Ok(self.0.clone())
         }
+    }
+
+    #[test]
+    fn cross_encoder_timeout_maps_to_timeout_and_others_to_backend_error() {
+        assert_eq!(
+            degrade_reason(&RerankError::CrossEncoder(CrossEncoderError::Timeout)),
+            RerankDegradeReason::Timeout
+        );
+        assert_eq!(
+            degrade_reason(&RerankError::CrossEncoder(CrossEncoderError::Backend(
+                "x".to_string()
+            ))),
+            RerankDegradeReason::BackendError
+        );
     }
 
     #[test]
