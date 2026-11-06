@@ -101,7 +101,7 @@ PostgreSQL の公開ドキュメントと同じ 8 つ。名前の大小文字は
 ## 対象外
 
 - NoSQL の `search` の `highlight` での公開と、SQL の投影との一致の検証（#2126）
-- RLS・列の権限の網羅的な越境マトリクス（#2126。本 Issue では可視行だけが投影されることのスモークテスト 1 件）
+- （SQL 側の RLS・列の権限の越境マトリクスは #2126 で `crates/engine/tests/table_rls/rls10_ts_headline_paths.rs` に追加済み）
 - フレーズ・除外・前方一致・`or` の意味づけ（cover の拡張。#2113 以降）
 - ステミング（SEARCH-16 ポインタ）・形態素解析（EXT-8 ポインタ）
 - 設定名を取る 3・4 引数形と `tsquery` 型
