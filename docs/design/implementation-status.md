@@ -1811,6 +1811,8 @@ main に無く現行の `parse_order_by` は `<=>` のみ受理するため、�
 
 **Issue #2120（feat(engine): 実行器で RrfConfig と pool_depth をクエリ指定値から組み立てる。SEARCH-13 ポインタ。親 #2117）**: `sql::hybrid_tuning::hybrid_rrf_config` が `rrf_k`・`weights`・`window` から `RrfConfig` を組み立て、融合と precision 正規化の両方で使う。調整引数なしの文は従来とバイト一致。`window` は束縛段・`check_bound_search`・実行時の 3 層で `22000` 検証する。`RrfConfig::new` は片側 0 の重みを受理するよう緩めた。スコア非有限は `22000`。暫定ゲートは `k1`／`b` 専用に狭めた（#2121 で撤去）。詳細は hybrid-tuning-parameters.md §9。
 
+**Issue #2121（feat(engine): BM25 の k1・b を疎検索へ渡す。SEARCH-13 ポインタ。親 #2117）**: `sparse::Bm25Params`・`SparseIndex::score_within_with_params`・`hybrid::hybrid_search_with_bm25` を追加し、`HYBRID` の `k1`／`b` をクエリ時の計算だけに適用する。索引・`SparseIndexCache` のキー・世代は不変で、値が違うクエリでも再構築しない。指定なしの文は従来とバイト一致。`k1` の数値安全上限（`1e200`）超えと非有限スコアは `22000`。`0A000` の暫定ゲート（`ensure_tuning_applied`）を撤去した。EXPLAIN の実効値表示と NoSQL（#2122）は対象外。詳細は hybrid-tuning-parameters.md §10。
+
 **Issue #2128（docs(design): ステミング（Snowball 系）依存追加の承認資料。親 #2127・SEARCH-16 ポインタ。詳細は [stemming-crate-adoption.md](stemming-crate-adoption.md)）**: 承認資料 ADR を Proposed で新設した。候補（`rust-stemmers`・`qdrant-rust-stemmers`・`frostem` ほか）のライセンス・推移的依存・バイナリ増分を probe で実測し、推奨案と代替案を並べた。オーナー承認は未取得で、現時点ではステミングを提供せず指定は拒否のまま。依存・コード・CI の変更なし。承認が記録されるまで #2129 は着手停止。
 
 **Issue #2113（feat(engine): 無エラーのクエリ構文パーサ parse_text_query を追加する。SEARCH-12 ポインタ。親 #2111）**: 公開モジュール `sparse::text_query` に純関数 `parse_text_query` と構文木（`TextQuery`・`QueryGroup`・`Clause`・`Excluded`・`Phrase`）・`TextQueryError` を追加した。字句規則は fulltext-query-syntax.md の D1・D3・D4・D10 に従う。Issue 本文の「上限で打ち切る」は、ADR の fail-closed に合わせて「入口で `validate_query_bounds` を検証し超過は `Err`（切り詰めない）、通過した入力は常に `Ok`」とした。ADR に明記のない補完として、複数トークンになる `-word*` は `*` を外したフレーズ除外、連続する `or` は 1 つの区切りとして扱う。評価・統計・上限の写像・結線は #2114〜#2116 の担当で、本 Issue では既存の検索経路を変えない。
