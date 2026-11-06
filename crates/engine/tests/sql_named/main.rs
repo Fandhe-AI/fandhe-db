@@ -11,6 +11,7 @@ mod legacy_table;
 mod temp_db;
 
 mod nosql_bound_returning_public_api;
+mod search12_hybrid_text_syntax;
 mod search13_hybrid_tuning_exec;
 mod search15_rerank_wiring;
 mod search17_hybrid_explain_score;

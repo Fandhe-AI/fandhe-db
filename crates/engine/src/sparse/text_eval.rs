@@ -6,8 +6,8 @@
 //! 責務境界: [`SparseIndex::score_text_query_within`]（構文木入口）と
 //! [`SparseIndex::score_text_query_str_within`]（文字列入口。`parse_text_query` を先に呼ぶ）を
 //! 提供する。既存の文字列 API（`search`・`score_within`・`score_within_with_params`）は変えない。
-//! HYBRID／NoSQL 表層からの呼び出し・`map_hybrid_error` への写像・EXPLAIN は #2116 の責務で、
-//! 本モジュールは [`TextSearchError::wire_code`] までを定義する。
+//! HYBRID／NoSQL 表層からの呼び出しは #2116 で結線済み（`hybrid::hybrid_search_with_text_query`・
+//! `sql::exec` の `map_hybrid_text_error`）。本モジュールは [`TextSearchError::wire_code`] までを定義する。
 //!
 //! 評価（D2・D5）: `or` で分けたグループごとに、正の語（通常語・前方一致の展開語・フレーズの
 //! 構成トークン）を既存の `score_pass`（可視集合の統計）で採点し、フレーズ一致と除外で
@@ -33,7 +33,7 @@ use super::text_query::{
 };
 use super::{
     tokenize_analyzed, Bm25Params, Candidate, DocId, ScoreScope, SparseIndex, SparseScored, TermId,
-    VisibleBitmap,
+    TextAnalysis, VisibleBitmap,
 };
 use crate::text_query_limits::TextQueryLimits;
 
@@ -194,10 +194,78 @@ impl Expansion<'_> {
     }
 }
 
+/// データ非依存の入口検証（項数 `54000`・フレーズ長 `54000`）を行い、グループごとの評価計画
+/// （フレーズはコンパイル済み）を作る。[`SparseIndex::score_text_query_within`] と
+/// [`validate_text_query_static`] が共有し、検証ロジックを複製しない。
+fn compile_group_plans<'q>(
+    query: &'q TextQuery,
+    analysis: &TextAnalysis,
+    limits: &TextQueryLimits,
+) -> Result<Vec<GroupPlan<'q>>, TextSearchError> {
+    let mut total_words: usize = 0;
+    for g in query.groups() {
+        total_words = total_words.saturating_add(group_unique_words(g).len());
+    }
+    if total_words > limits.max_terms() {
+        return Err(TextSearchError::TooManyTerms {
+            count: total_words,
+            max: limits.max_terms(),
+        });
+    }
+    let mut plans: Vec<GroupPlan<'_>> = Vec::with_capacity(query.groups().len());
+    for g in query.groups() {
+        let mut required = Vec::new();
+        let mut excluded = Vec::new();
+        let mut stems: BTreeSet<&str> = BTreeSet::new();
+        for c in g.clauses() {
+            match c {
+                Clause::Term(_) => {}
+                Clause::Prefix(s) | Clause::Exclude(Excluded::Prefix(s)) => {
+                    stems.insert(s.as_str());
+                }
+                // 同一フィルタは評価前に一意化する（重複入力で走査量・中間結果を
+                // 増幅させない。max_terms は一意語で数えるため、ここで揃える）。
+                Clause::Phrase(p) => {
+                    let pat = PhrasePattern::from_phrase_with(p, analysis)?;
+                    if !required.contains(&pat) {
+                        required.push(pat);
+                    }
+                }
+                Clause::Exclude(Excluded::Phrase(p)) => {
+                    let pat = PhrasePattern::from_phrase_with(p, analysis)?;
+                    if !excluded.contains(&pat) {
+                        excluded.push(pat);
+                    }
+                }
+            }
+        }
+        plans.push(GroupPlan {
+            group: g,
+            required,
+            excluded,
+            stems,
+        });
+    }
+    Ok(plans)
+}
+
+/// 索引・可視集合を必要としない検索語の静的検証（SEARCH-12。Issue #2116）。項数とフレーズ長の
+/// 上限（`54000`）を [`SparseIndex::score_text_query_within`] の入口検証と同じ実装で行う。
+/// `sql::exec` が「可視行に本文が 1 件もなく疎索引を作れず密のみへ縮退する」文でも呼び、
+/// 結果が表の内容次第で変わらないようにする（fail-closed）。展開数の検査はデータ依存のため
+/// 含まない（可視集合が空なら評価経路も展開前に空を返すので非対称にならない）。
+pub(crate) fn validate_text_query_static(
+    query: &TextQuery,
+    analysis: &TextAnalysis,
+    limits: &TextQueryLimits,
+) -> Result<(), TextSearchError> {
+    compile_group_plans(query, analysis, limits).map(|_| ())
+}
+
 impl SparseIndex {
     /// 構文解析済みの検索語を可視集合内で評価する（SEARCH-12・RLS-8 ポインタ）。
     ///
-    /// HYBRID の全文検索側（#2116 が結線予定）が呼ぶ。統計（N・avgdl・df）・フレーズ・除外・
+    /// HYBRID の全文検索側（`hybrid::hybrid_search_with_text_query`。Issue #2116 で結線済み）が呼ぶ。統計（N・avgdl・df）・フレーズ・除外・
     /// 前方一致の展開数は `visible_ids` に限定し、不可視文書は結果にも上限判定にも影響しない。
     /// 演算子を含まない検索語は `score_within_with_params` とビット一致する（D8）。
     /// `params` が索引自身の値でなければ `Bm25Params::new` で再検証する。
@@ -220,50 +288,7 @@ impl SparseIndex {
         };
 
         // 入口検証（データ非依存。visible_ids が空でも実行する）。
-        let mut total_words: usize = 0;
-        for g in query.groups() {
-            total_words = total_words.saturating_add(group_unique_words(g).len());
-        }
-        if total_words > limits.max_terms() {
-            return Err(TextSearchError::TooManyTerms {
-                count: total_words,
-                max: limits.max_terms(),
-            });
-        }
-        let mut plans: Vec<GroupPlan<'_>> = Vec::with_capacity(query.groups().len());
-        for g in query.groups() {
-            let mut required = Vec::new();
-            let mut excluded = Vec::new();
-            let mut stems: BTreeSet<&str> = BTreeSet::new();
-            for c in g.clauses() {
-                match c {
-                    Clause::Term(_) => {}
-                    Clause::Prefix(s) | Clause::Exclude(Excluded::Prefix(s)) => {
-                        stems.insert(s.as_str());
-                    }
-                    // 同一フィルタは評価前に一意化する（重複入力で走査量・中間結果を
-                    // 増幅させない。max_terms は一意語で数えるため、ここで揃える）。
-                    Clause::Phrase(p) => {
-                        let pat = PhrasePattern::from_phrase_with(p, &self.analysis)?;
-                        if !required.contains(&pat) {
-                            required.push(pat);
-                        }
-                    }
-                    Clause::Exclude(Excluded::Phrase(p)) => {
-                        let pat = PhrasePattern::from_phrase_with(p, &self.analysis)?;
-                        if !excluded.contains(&pat) {
-                            excluded.push(pat);
-                        }
-                    }
-                }
-            }
-            plans.push(GroupPlan {
-                group: g,
-                required,
-                excluded,
-                stems,
-            });
-        }
+        let plans = compile_group_plans(query, &self.analysis, limits)?;
 
         let empty = || SparseScored {
             candidates: Vec::new(),

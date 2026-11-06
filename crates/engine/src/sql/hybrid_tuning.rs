@@ -22,6 +22,20 @@ use crate::hybrid::{RrfConfig, MAX_POOL_DEPTH};
 use crate::json::{parse_json, JsonValue};
 use crate::sql::allowlist::{NamedArgValue, SqlSurfaceError};
 
+/// `Ranking::Hybrid` の検索語を構文（フレーズ・`or`・除外・前方一致）として解釈するかの区分
+/// （Issue #2116・SEARCH-12 のポインタ。設計記録 `docs/design/fulltext-query-syntax.md` D8・D9）。
+/// `BoundStatement` の `pub(crate)` フィールドで保持し、`sql::exec` の `Ranking::Hybrid` アームが
+/// 実行経路を選ぶ。公開型の `Ranking::Hybrid` にはフィールドを足さない（破壊的変更の回避）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum HybridTextSyntax {
+    /// 検索語を構文として解釈する（SQL の `HYBRID`・NoSQL の `hybrid.text`。既定）。
+    #[default]
+    WebSearch,
+    /// 検索語をすべて literal の語列として扱う。`USING PLAN` が LLM 出力の `search_terms` を
+    /// 連結した検索語に使い、演算子による検索結果の操作（プロンプトインジェクション）を防ぐ（D9）。
+    Literal,
+}
+
 /// 名前付き調整引数として受理する引数名の種類数（重複を別途拒否するため、個数上限を兼ねる）。
 pub(crate) const MAX_NAMED_TUNING_ARGS: usize = 5;
 

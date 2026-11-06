@@ -65,12 +65,22 @@
 //! Issue #2136（SEARCH-17・TASK-327 ポインタ。親 Issue #2135）: 融合結果 [`HybridHit`] に
 //! 系統別の実効順位（`dense_rank`・`sparse_rank`）を保持する。融合スコアと出力順は
 //! 変えない。投影（SQL・NoSQL 表層）での取り出しは別 Issue の担当である。
+//!
+//! Issue #2116（SEARCH-12 ポインタ。親 #2111）: 疎側をクエリ構文（フレーズ・`or`・除外・前方一致）
+//! で評価する crate 内部入口 [`hybrid_search_with_text_query`] を追加した。公開の
+//! [`hybrid_search`]／[`hybrid_search_boosted`]／[`hybrid_search_with_bm25`] は従来どおり検索語を
+//! 構文解釈しない（literal の bag-of-terms。意味・結果ともに不変）。構文を解釈するのは
+//! `sql::exec` が SQL の `HYBRID`／NoSQL の `hybrid.text` で呼ぶ場合だけで、`USING PLAN` の
+//! `search_terms` は literal 経路のままにする（設計記録 `docs/design/fulltext-query-syntax.md` D9）。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use crate::kernel::{CandidateHit, KernelError, SearchInput, SearchProvider};
+use crate::sparse::text_eval::TextSearchError;
+use crate::sparse::text_query::TextQuery;
 use crate::sparse::{Bm25Params, ScoredDoc, SparseError, SparseIndex};
+use crate::text_query_limits::TextQueryLimits;
 
 /// 検索プールの深さ・k の上限。明示 `LIMIT` の設定可能なハード上限
 /// （`result_limits::MAX_RESULT_ROWS_HARD_CAP`＝100_000。Issue #1555）と同値のリテラルで、
@@ -1569,12 +1579,13 @@ pub fn hybrid_search_boosted(
         provider,
         input,
         sparse_index,
-        query_text,
+        SparseQuery::Literal(query_text),
         k,
         cfg,
         rules,
         sparse_index.params(),
     )
+    .map_err(HybridTextError::into_hybrid_error)
 }
 
 /// [`hybrid_search`] のクエリ時 BM25 パラメータ指定版（Issue #2121。SEARCH-13）。
@@ -1591,23 +1602,112 @@ pub fn hybrid_search_with_bm25(
     cfg: &RrfConfig,
     bm25: Bm25Params,
 ) -> Result<Vec<HybridHit>, HybridError> {
-    hybrid_search_inner(provider, input, sparse_index, query_text, k, cfg, &[], bm25)
+    hybrid_search_inner(
+        provider,
+        input,
+        sparse_index,
+        SparseQuery::Literal(query_text),
+        k,
+        cfg,
+        &[],
+        bm25,
+    )
+    .map_err(HybridTextError::into_hybrid_error)
 }
 
-/// [`hybrid_search_boosted`]・[`hybrid_search_with_bm25`] が共有する本体。
+/// 疎側の検索語の評価方式（Issue #2116）。[`sparse_refetch_loop`] の最初のスコアリング 1 回だけを
+/// 切り替え、再取得ループ本体・境界同点の処理は両方式で共有する。
+#[derive(Clone, Copy)]
+pub(crate) enum SparseQuery<'a> {
+    /// 従来の bag-of-terms（検索語を構文解釈しない）。公開 API と `USING PLAN` が使う。
+    Literal(&'a str),
+    /// 構文解析済みの検索語。`sql::exec` が文ごとに 1 回だけ解析して渡す。
+    Parsed {
+        /// 構文木。
+        query: &'a TextQuery,
+        /// 項数・展開数の上限（D7）。
+        limits: &'a TextQueryLimits,
+    },
+}
+
+/// [`hybrid_search_with_text_query`] のエラー。既存の [`HybridError`]（公開型。variant を足すと
+/// 破壊的変更になる）を変えず、構文経路だけが返す上限超過（`54000`）を運ぶ crate 内部の型。
+#[derive(Debug)]
+pub(crate) enum HybridTextError {
+    /// 従来経路と共通の hybrid エラー。
+    Hybrid(HybridError),
+    /// 構文経路の疎側評価のエラー（件数・上限値のみ。語は含まない）。
+    Text(TextSearchError),
+}
+
+impl From<HybridError> for HybridTextError {
+    fn from(e: HybridError) -> Self {
+        Self::Hybrid(e)
+    }
+}
+
+impl From<KernelError> for HybridTextError {
+    fn from(e: KernelError) -> Self {
+        Self::Hybrid(HybridError::from(e))
+    }
+}
+
+impl HybridTextError {
+    /// literal 経路（構文を解釈しない公開関数）向けに [`HybridError`] へ戻す。literal 経路は
+    /// `Text` を生成しないため `Text` は到達不能だが、万一到達しても fail-closed で
+    /// 非有限スコア扱い（内部エラー）に倒す。
+    fn into_hybrid_error(self) -> HybridError {
+        match self {
+            Self::Hybrid(e) => e,
+            Self::Text(_) => HybridError::NonFiniteScore,
+        }
+    }
+}
+
+/// 疎側を構文解析済みの検索語で評価する hybrid 検索（Issue #2116・SEARCH-12 ポインタ）。
+///
+/// `sql::exec` の `Ranking::Hybrid`（SQL の `HYBRID` と NoSQL の `hybrid.text`）だけが呼ぶ。
+/// 密側・融合・可視集合の縮約契約は [`hybrid_search_with_bm25`] と同一で、疎側のスコアリングだけを
+/// [`SparseIndex::score_text_query_within`] に差し替える。演算子を含まない検索語は
+/// [`hybrid_search_with_bm25`] とビット一致する結果を返す（D8）。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn hybrid_search_with_text_query(
+    provider: &dyn SearchProvider,
+    input: SearchInput<'_>,
+    sparse_index: &SparseIndex,
+    query: &TextQuery,
+    k: usize,
+    cfg: &RrfConfig,
+    bm25: Bm25Params,
+    limits: &TextQueryLimits,
+) -> Result<Vec<HybridHit>, HybridTextError> {
+    hybrid_search_inner(
+        provider,
+        input,
+        sparse_index,
+        SparseQuery::Parsed { query, limits },
+        k,
+        cfg,
+        &[],
+        bm25,
+    )
+}
+
+/// [`hybrid_search_boosted`]・[`hybrid_search_with_bm25`]・[`hybrid_search_with_text_query`] が
+/// 共有する本体。
 #[allow(clippy::too_many_arguments)]
 fn hybrid_search_inner(
     provider: &dyn SearchProvider,
     input: SearchInput<'_>,
     sparse_index: &SparseIndex,
-    query_text: &str,
+    query_text: SparseQuery<'_>,
     k: usize,
     cfg: &RrfConfig,
     rules: &[BoostRule<'_>],
     bm25: Bm25Params,
-) -> Result<Vec<HybridHit>, HybridError> {
+) -> Result<Vec<HybridHit>, HybridTextError> {
     if k == 0 || k > cfg.pool_depth() {
-        return Err(HybridError::InvalidK);
+        return Err(HybridError::InvalidK.into());
     }
     // ルール件数の検証は [`apply_soft_boost`] 内でも行われるが、ここではそれより先
     // （`provider.search`・可視性走査・`SparseIndex::search_within`・`rrf_fuse` より
@@ -1618,7 +1718,8 @@ fn hybrid_search_inner(
         return Err(HybridError::TooManyBoostRules {
             len: rules.len(),
             max: MAX_BOOST_RULES,
-        });
+        }
+        .into());
     }
     // 加点上限の**確定**判定は融合プールが揃った後の [`apply_soft_boost`]
     // （[`soft_boost_confirm_cap`]。`cfg` から導出する絶対上限）が担う。ここでは
@@ -1652,7 +1753,8 @@ fn hybrid_search_inner(
         return Err(HybridError::BoostSoftBoundExceeded {
             total: max_candidate_boost,
             max: loose_upper_bound,
-        });
+        }
+        .into());
     }
 
     let visible_ids: std::collections::BTreeSet<u64> = input.ids.iter().copied().collect();
@@ -1698,7 +1800,8 @@ fn hybrid_search_inner(
             return Err(HybridError::TooManyCandidates {
                 len: hits.len(),
                 max: dense_fetch_k,
-            });
+            }
+            .into());
         }
         // 事後フィルタ（不可視 id だけを黙って除外する）はしない: 不可視 id が
         // `dense_fetch_k` の候補枠を占有していた場合、フィルタ後に可視ヒットを
@@ -1717,7 +1820,7 @@ fn hybrid_search_inner(
         // 1 エントリへ畳み込まれないようにしている（`tests/row_id_tenant_scope.rs`
         // が固定）。
         if hits.iter().any(|hit| !visible_ids.contains(&hit.id)) {
-            return Err(HybridError::ProviderResultRejected);
+            return Err(HybridError::ProviderResultRejected.into());
         }
         // 拡張取得列（`dense_fetch_k` 件。`pool_depth` を超えうる）全体に対し、
         // 有限性・ソート順・重複 id を [`complete_boundary_tie_group`] の前に検証
@@ -1823,12 +1926,12 @@ fn hybrid_search_inner(
 /// push が追加されていた）。
 fn sparse_refetch_loop(
     sparse_index: &SparseIndex,
-    query_text: &str,
+    query_text: SparseQuery<'_>,
     visible_ids: &BTreeSet<u64>,
     cfg: &RrfConfig,
     bm25: Bm25Params,
     mut record_fetch_k: impl FnMut(usize),
-) -> Result<(Vec<ScoredDoc>, usize), HybridError> {
+) -> Result<(Vec<ScoredDoc>, usize), HybridTextError> {
     let sparse_cap = MAX_FETCH_K.min(visible_ids.len());
     let mut sparse_fetch_k = cfg
         .pool_depth()
@@ -1844,7 +1947,16 @@ fn sparse_refetch_loop(
     // [`crate::sparse::SparseScored::top`] による前方一致な Top-k 拡張へ
     // 置き換える。`fetch_k` のスケジュール・`hits.len()`（`min(fetch_k, M)`）・
     // 以降の境界同点判定はいずれも旧実装と同一のまま変わらない。
-    let mut scored = sparse_index.score_within_with_params(query_text, visible_ids, bm25)?;
+    // 最初のスコアリングだけが方式で分かれる（Issue #2116）。以降の再取得ループ・境界同点の
+    // 処理は literal／構文の両方で共有する。
+    let mut scored = match query_text {
+        SparseQuery::Literal(q) => sparse_index
+            .score_within_with_params(q, visible_ids, bm25)
+            .map_err(HybridError::from)?,
+        SparseQuery::Parsed { query, limits } => sparse_index
+            .score_text_query_within(query, visible_ids, bm25, limits)
+            .map_err(HybridTextError::Text)?,
+    };
     let (sparse_hits, sparse_limit) = loop {
         record_fetch_k(sparse_fetch_k);
         let hits: Vec<ScoredDoc> = scored.top(sparse_fetch_k);
@@ -1856,7 +1968,8 @@ fn sparse_refetch_loop(
             return Err(HybridError::TooManyCandidates {
                 len: hits.len(),
                 max: sparse_fetch_k,
-            });
+            }
+            .into());
         }
         validate_extended_pool(&hits, |d| d.score, |d| d.doc_id)?;
         // `hits` が可視集合内で存在しうる疎ヒットを全件含む（＝取得済み範囲の末尾が
@@ -1912,12 +2025,13 @@ pub fn sparse_refetch_observed(
     let mut fetch_ks = Vec::new();
     let (sparse_hits, sparse_limit) = sparse_refetch_loop(
         sparse_index,
-        query_text,
+        SparseQuery::Literal(query_text),
         visible_ids,
         cfg,
         sparse_index.params(),
         |fetch_k| fetch_ks.push(fetch_k),
-    )?;
+    )
+    .map_err(HybridTextError::into_hybrid_error)?;
     Ok((sparse_hits, sparse_limit, fetch_ks))
 }
 
@@ -4153,9 +4267,15 @@ mod tests {
         ];
 
         for (query, index, visible) in cases {
-            let (actual_hits, actual_limit) =
-                sparse_refetch_loop(index, query, visible, &cfg, index.params(), |_fetch_k| {})
-                    .expect("sparse_refetch_loop ok");
+            let (actual_hits, actual_limit) = sparse_refetch_loop(
+                index,
+                SparseQuery::Literal(query),
+                visible,
+                &cfg,
+                index.params(),
+                |_fetch_k| {},
+            )
+            .expect("sparse_refetch_loop ok");
             let (expected_hits, expected_limit) =
                 sparse_refetch_loop_oracle_via_search_within(index, query, visible, &cfg)
                     .expect("oracle ok");
@@ -4682,5 +4802,113 @@ mod tests {
             .expect("ok");
         assert_eq!(r0.first().map(|h| h.id), Some(2));
         assert_eq!(r1.first().map(|h| h.id), Some(1));
+    }
+
+    /// Issue #2116: クエリ構文入口の単体テスト群の共通フィクスチャ（密側は全文書が同スコア）。
+    fn text_query_fixture() -> (SparseIndex, Vec<u64>, Vec<f32>) {
+        let index = SparseIndex::build(&[
+            (1, "apple banana"),
+            (2, "apple cherry"),
+            (3, "banana cherry"),
+            (4, "apple banana cherry"),
+        ])
+        .expect("build ok");
+        (index, vec![1, 2, 3, 4], vec![1.0, 1.0, 1.0, 1.0])
+    }
+
+    fn run_text_query(
+        index: &SparseIndex,
+        ids: &[u64],
+        vectors: &[f32],
+        q: &str,
+        limits: &TextQueryLimits,
+    ) -> Result<Vec<HybridHit>, HybridTextError> {
+        let query = [1.0f32];
+        let input = SearchInput {
+            ids,
+            vectors,
+            dim: 1,
+            query: &query,
+            k: 10,
+        };
+        let parsed = crate::sparse::text_query::parse_text_query(q).expect("parse ok");
+        hybrid_search_with_text_query(
+            &CpuScalarProvider,
+            input,
+            index,
+            &parsed,
+            10,
+            &RrfConfig::default(),
+            index.params(),
+            limits,
+        )
+    }
+
+    #[test]
+    fn text_query_without_operators_matches_literal_path_exactly() {
+        let (index, ids, vectors) = text_query_fixture();
+        let query = [1.0f32];
+        for q in [
+            "apple",
+            "apple banana",
+            "cherry banana apple",
+            "zzz",
+            "apple apple",
+        ] {
+            let input = SearchInput {
+                ids: &ids,
+                vectors: &vectors,
+                dim: 1,
+                query: &query,
+                k: 10,
+            };
+            let literal = hybrid_search_with_bm25(
+                &CpuScalarProvider,
+                input,
+                &index,
+                q,
+                10,
+                &RrfConfig::default(),
+                index.params(),
+            )
+            .expect("literal ok");
+            let parsed = run_text_query(&index, &ids, &vectors, q, &TextQueryLimits::default())
+                .expect("parsed ok");
+            assert_eq!(literal, parsed, "query {q:?}");
+        }
+    }
+
+    #[test]
+    fn text_query_exclusion_and_phrase_narrow_the_sparse_side() {
+        let (index, ids, vectors) = text_query_fixture();
+        let limits = TextQueryLimits::default();
+        let excl = run_text_query(&index, &ids, &vectors, "apple -banana", &limits).expect("ok");
+        // 疎側は id=2 のみ。他の id は密側のみのヒット（sparse_rank なし）になる。
+        let sparse_ids: Vec<u64> = excl
+            .iter()
+            .filter(|h| h.sparse_rank.is_some())
+            .map(|h| h.id)
+            .collect();
+        assert_eq!(sparse_ids, vec![2]);
+        let phrase =
+            run_text_query(&index, &ids, &vectors, "\"apple banana\"", &limits).expect("ok");
+        let sparse_ids: Vec<u64> = phrase
+            .iter()
+            .filter(|h| h.sparse_rank.is_some())
+            .map(|h| h.id)
+            .collect();
+        assert_eq!(sparse_ids, vec![1, 4]);
+    }
+
+    #[test]
+    fn text_query_over_limit_returns_text_error_with_54000() {
+        let (index, ids, vectors) = text_query_fixture();
+        let tight = TextQueryLimits::new(1, 1);
+        let e = run_text_query(&index, &ids, &vectors, "apple banana", &tight)
+            .expect_err("too many terms");
+        match e {
+            HybridTextError::Text(t) => assert_eq!(t.wire_code(), "54000"),
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 }

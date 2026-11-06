@@ -1173,6 +1173,33 @@ fn map_hybrid_error(e: HybridError, cfg: &hybrid::RrfConfig) -> SqlSurfaceError 
     }
 }
 
+/// 構文経路の hybrid エラーを SQL 表層のエラーへ写す（Issue #2116・SEARCH-12 のポインタ）。
+/// `Hybrid` は既存の [`map_hybrid_error`] に委ねる。`Text` は `wire_code` で分ける: 既存上限（`22000`）は
+/// 従来と同じ固定文言、上限超過（`54000`）は固定の英語文にする。件数・上限値・語・語幹は
+/// 他テナントの語の存在を推測させ得るため含めない（fail-closed）。
+fn map_hybrid_text_error(e: hybrid::HybridTextError, cfg: &hybrid::RrfConfig) -> SqlSurfaceError {
+    match e {
+        hybrid::HybridTextError::Hybrid(e) => map_hybrid_error(e, cfg),
+        hybrid::HybridTextError::Text(e) => map_text_search_error(&e),
+    }
+}
+
+/// [`crate::sparse::text_eval::TextSearchError`] の写像（固定の英語文のみ）。
+fn map_text_search_error(e: &crate::sparse::text_eval::TextSearchError) -> SqlSurfaceError {
+    use crate::sparse::text_eval::TextSearchError as T;
+    match e {
+        T::QueryTooLong { .. } | T::TooManyQueryTerms { .. } => {
+            SqlSurfaceError::invalid_input("hybrid query text exceeds allowed length")
+        }
+        T::InvalidParams { .. } => {
+            SqlSurfaceError::invalid_input("HYBRID BM25 arguments produced an invalid score")
+        }
+        T::TooManyTerms { .. } | T::TooManyPrefixExpansions { .. } | T::PhraseTooLong { .. } => {
+            SqlSurfaceError::payload_too_large("hybrid query text is too complex")
+        }
+    }
+}
+
 /// SQL 実行経路にまだ接続していない距離演算子（`<->`／`<+>`）の文を実行入口で `0A000` に倒す関門
 /// （Issue #1977・SQL-33 (2)(4)。Issue #1991 で `<=>`〔コサイン距離〕と `<#>`〔負の内積〕を接続し、
 /// 対象を L2／L1 に狭めた）。構文と `$n` 束縛は 4 種とも通るが、L2／L1 の距離カーネルは SQL 実行経路に
@@ -1241,6 +1268,9 @@ fn ensure_distance_kind_executable(bound: &BoundStatement) -> Result<(), SqlSurf
 /// 一切参照しない。`None` を渡した場合はキャッシュを一切経由せず、常に全件
 /// brute-force で探索する（下記 [`execute_statement`] 参照）。
 ///
+/// `text_query_limits`（Issue #2116・SEARCH-12 のポインタ）は `HYBRID` の検索語をクエリ構文として
+/// 評価するときの項数・前方一致展開数の上限。`EngineCore::run_select_plan` が `--` 起動設定の値を渡す。
+///
 /// `text_analysis`（Issue #2130・SEARCH-16 のポインタ）は疎索引の構築に固定するテキスト処理
 /// 設定（ストップワード・同義語）。`SparseCacheAccess` には載せない: 書き込みトランザクション由来の
 /// 読み取りでは疎キャッシュが `None` に落ちるが、設定はその経路でも効かせる必要があるため。
@@ -1264,6 +1294,7 @@ pub(crate) fn execute_statement_with_cache(
     hnsw_cache: Option<crate::sql::hnsw_cache::HnswCacheAccess<'_>>,
     scalar_cache: Option<crate::sql::scalar_index::ScalarCacheAccess<'_>>,
     text_analysis: &Arc<crate::sparse::TextAnalysis>,
+    text_query_limits: &crate::text_query_limits::TextQueryLimits,
     rerank: Option<crate::sql::rerank_stage::RerankAccess<'_>>,
 ) -> Result<QueryResult, SqlSurfaceError> {
     execute_statement_with_cache_observed(
@@ -1278,6 +1309,7 @@ pub(crate) fn execute_statement_with_cache(
         hnsw_cache,
         scalar_cache,
         text_analysis,
+        text_query_limits,
         rerank,
         None,
     )
@@ -1301,6 +1333,7 @@ pub(crate) fn execute_statement_with_cache_observed(
     hnsw_cache: Option<crate::sql::hnsw_cache::HnswCacheAccess<'_>>,
     scalar_cache: Option<crate::sql::scalar_index::ScalarCacheAccess<'_>>,
     text_analysis: &Arc<crate::sparse::TextAnalysis>,
+    text_query_limits: &crate::text_query_limits::TextQueryLimits,
     rerank: Option<crate::sql::rerank_stage::RerankAccess<'_>>,
     mut stats: Option<&mut ExecStats>,
 ) -> Result<QueryResult, SqlSurfaceError> {
@@ -3361,8 +3394,34 @@ pub(crate) fn execute_statement_with_cache_observed(
                     // 不正な引数が受理されないようにする。Issue #2121）。
                     let bm25_default = crate::sparse::Bm25Params::default();
                     crate::sql::hybrid_tuning::hybrid_bm25_params(tuning, bm25_default)?;
+                    // 検索語の構文解析は文 1 回につき 1 回だけ行う（Issue #2116・SEARCH-12 のポインタ）。
+                    // `Literal`（`USING PLAN` の `search_terms`）は解析せず従来の語列経路に残す（D9）。
+                    let parsed_text_query: Option<crate::sparse::text_query::TextQuery> =
+                        match bound.hybrid_text_syntax {
+                            crate::sql::hybrid_tuning::HybridTextSyntax::WebSearch => Some(
+                                crate::sparse::text_query::parse_text_query(query_text).map_err(
+                                    |e| {
+                                        map_text_search_error(
+                                            &crate::sparse::text_eval::TextSearchError::from(e),
+                                        )
+                                    },
+                                )?,
+                            ),
+                            crate::sql::hybrid_tuning::HybridTextSyntax::Literal => None,
+                        };
                     let fused: Vec<HybridHit> = match &sparse_index_for_fusion {
                         None => {
+                            // 疎索引が無くても、データに依存しない検索語の検査（項数・フレーズ長）は
+                            // 行う。結果が表の内容（本文の有無）次第で受理／拒否に変わらないようにする
+                            // 直前の `k1`／`b` 検証と同じ fail-closed の方針。
+                            if let Some(q) = &parsed_text_query {
+                                crate::sparse::text_eval::validate_text_query_static(
+                                    q,
+                                    text_analysis,
+                                    text_query_limits,
+                                )
+                                .map_err(|e| map_text_search_error(&e))?;
+                            }
                             // 疎側の寄与を 0 件として扱い、密側のみを `rrf_fuse` に通して
                             // 密のみの順序契約へ縮退させる（密側の可視性検証は
                             // `hybrid::hybrid_search` と同じ理由でここでも行う）。
@@ -3403,16 +3462,29 @@ pub(crate) fn execute_statement_with_cache_observed(
                                 tuning,
                                 idx.params(),
                             )?;
-                            hybrid::hybrid_search_with_bm25(
-                                dense_provider,
-                                input,
-                                idx,
-                                query_text,
-                                k_fetch,
-                                &cfg,
-                                bm25,
-                            )
-                            .map_err(|e| map_hybrid_error(e, &cfg))?
+                            match &parsed_text_query {
+                                Some(q) => hybrid::hybrid_search_with_text_query(
+                                    dense_provider,
+                                    input,
+                                    idx,
+                                    q,
+                                    k_fetch,
+                                    &cfg,
+                                    bm25,
+                                    text_query_limits,
+                                )
+                                .map_err(|e| map_hybrid_text_error(e, &cfg))?,
+                                None => hybrid::hybrid_search_with_bm25(
+                                    dense_provider,
+                                    input,
+                                    idx,
+                                    query_text,
+                                    k_fetch,
+                                    &cfg,
+                                    bm25,
+                                )
+                                .map_err(|e| map_hybrid_error(e, &cfg))?,
+                            }
                         }
                     };
                     // このクエリで観測された密側再取得ラウンド数を `HnswIndexCache` の
@@ -3867,6 +3939,8 @@ pub fn execute_statement(
         // 公開ラッパーは既定のテキスト処理（恒等）。ストップワード・同義語は
         // `EngineCore::with_text_analysis` 経由でのみ有効になる（Issue #2130）。
         &Arc::new(crate::sparse::TextAnalysis::default()),
+        // ハード上限＝既定値（公開ラッパーは `EngineCore::with_text_query_limits` を経由しない）。
+        &crate::text_query_limits::TextQueryLimits::default(),
         // 公開ラッパーはリランクしない（`EngineCore::with_rerank` 経由でのみ有効。Issue #2142）。
         None,
     )
