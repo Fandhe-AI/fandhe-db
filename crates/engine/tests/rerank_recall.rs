@@ -482,6 +482,7 @@ fn measure_rerank_recall(docs: &[Doc], qa: &[QaCase]) -> RerankRecallResult {
                 id: h.id,
                 fused_score: h.score,
                 text: doc_text_by_id.get(&h.id).copied().unwrap_or(""),
+                embedding: None,
             })
             .collect();
         let reranked = rerank_candidates(&reranker, &case.query_text, &candidates, &rerank_cfg)
@@ -574,6 +575,7 @@ fn measure_rerank_recall_via_hnsw(
                 id: *id,
                 fused_score: *score,
                 text: doc_text_by_id.get(id).copied().unwrap_or(""),
+                embedding: None,
             })
             .collect();
         let reranked = rerank_candidates(&reranker, &case.query_text, &candidates, &rerank_cfg)

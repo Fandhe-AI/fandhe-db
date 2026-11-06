@@ -10,23 +10,25 @@
 //! bind・ユーザーストア読込より前に [`resolve`] で確定し、`EngineCore::with_rerank` へ 1 回だけ
 //! 注入する（セッション・SQL・NoSQL からは変更できない）。
 //!
-//! `mmr` は語彙としては受理するが、本ビルドでは未対応のため固定文言で起動を拒否する
-//! （黙って `off` へ読み替えない。後続 Issue #2143 で解禁）。`cross_encoder`（Issue #2144）は
+//! `mmr` は Issue #2143 で解禁した（λ は `--rerank-mmr-lambda`。既定 0.5・範囲 `0..=1` は engine の
+//! [`engine::rerank::validate_mmr_lambda`] で判定し、書式は `^[0-9]+(\.[0-9]+)?$` の厳密な 10 進に
+//! 限る。`mmr` 以外での指定は起動エラー）。`cross_encoder`（Issue #2144）は
 //! `--rerank-model`／`--rerank-tokenizer`（必須）と `--rerank-timeout-ms`（`1..=60000`、既定
 //! 1000）を伴い、engine の `cross-encoder` feature 付きビルドでのみ受理する（無効ビルドでは
 //! 固定文言で起動拒否）。モデルのパス検証・サイズ上限・読み込みは engine の
 //! `onnx_cross_encoder_method` に一本化し、失敗は起動エラーにする。`off`（または未指定）
 //! のまま `--rerank-window` を指定する、`cross_encoder` 以外でモデル系フラグを指定する、
 //! 語彙外の値、範囲外・非数値・先頭 `+`・空白付きの値も fail-closed で起動エラー。
-//! エラー文に含めるのはフラグ名・入力値（窓幅・期限のみ）・範囲だけで、パスとファイルの
+//! エラー文に含めるのはフラグ名・入力値（窓幅・期限・λ のみ）・範囲だけで、パスとファイルの
 //! 中身は出さない。
 
 use std::path::Path;
 
 use engine::rerank::{
-    cross_encoder_available, onnx_cross_encoder_method, validate_rerank_timeout_ms,
-    validate_rerank_window, CrossEncoderError, CrossEncoderFile, LexicalOverlapReranker,
-    RerankMethod, RerankSettings, DEFAULT_RERANK_TIMEOUT_MS, DEFAULT_RERANK_WINDOW,
+    cross_encoder_available, onnx_cross_encoder_method, validate_mmr_lambda,
+    validate_rerank_timeout_ms, validate_rerank_window, CrossEncoderError, CrossEncoderFile,
+    LexicalOverlapReranker, MmrReranker, RerankMethod, RerankSettings, DEFAULT_MMR_LAMBDA,
+    DEFAULT_RERANK_TIMEOUT_MS, DEFAULT_RERANK_WINDOW,
 };
 
 /// リランカー方式を選ぶ CLI フラグ名。
@@ -44,6 +46,9 @@ pub const RERANK_TOKENIZER_FLAG: &str = "--rerank-tokenizer";
 /// クロスエンコーダの推論期限（ミリ秒）を指定する CLI フラグ名（Issue #2144）。
 pub const RERANK_TIMEOUT_FLAG: &str = "--rerank-timeout-ms";
 
+/// MMR の λ（関連度と多様性の釣り合い）を指定する CLI フラグ名（`--reranker mmr` 専用）。
+pub const RERANK_MMR_LAMBDA_FLAG: &str = "--rerank-mmr-lambda";
+
 /// `--reranker` が受理する閉じた語彙（ADR D2）。
 pub const TOKENS: [&str; 4] = ["off", "lexical", "mmr", "cross_encoder"];
 
@@ -60,6 +65,8 @@ pub struct RerankRawFlags<'a> {
     pub tokenizer: Option<&'a Path>,
     /// `--rerank-timeout-ms` の値（`cross_encoder` のときだけ指定可。既定 1000）。
     pub timeout_ms: Option<&'a str>,
+    /// `--rerank-mmr-lambda` の値。
+    pub mmr_lambda: Option<&'a str>,
 }
 
 /// ASCII 数字だけを受理する厳密な 10 進パース（先頭 `+`・空白・全角数字・空文字を弾く）。
@@ -108,6 +115,20 @@ fn load_error(e: &CrossEncoderError) -> String {
     }
 }
 
+/// λ の厳密な 10 進パース。受理するのは `^[0-9]+(\.[0-9]+)?$` だけ（先頭 `+`／`-`・空白・
+/// 指数表記・`nan`／`inf`・`.5`／`1.`・全角・空文字を弾く）。範囲は呼び出し元が engine で検証する。
+fn parse_strict_lambda(raw: &str) -> Option<f64> {
+    let (int_part, frac_part) = match raw.split_once('.') {
+        Some((i, f)) => (i, Some(f)),
+        None => (raw, None),
+    };
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if !digits(int_part) || frac_part.is_some_and(|f| !digits(f)) {
+        return None;
+    }
+    raw.parse().ok()
+}
+
 /// 未パース値からリランク設定を解決する。未指定は off（従来経路）。`cross_encoder` のときだけ
 /// モデル／トークナイザの読み込み（ファイル I/O）を行う。
 ///
@@ -119,6 +140,14 @@ pub fn resolve(flags: RerankRawFlags<'_>) -> Result<RerankSettings, String> {
         return Err(format!(
             "{RERANKER_FLAG} expects one of off, lexical, mmr, cross_encoder, got {token:?}"
         ));
+    }
+    // λ は `mmr` 専用。他の方式（`off` を含む）での指定は黙って無視せず拒否する。
+    if token != "mmr" {
+        if let Some(l) = flags.mmr_lambda {
+            return Err(format!(
+                "{RERANK_MMR_LAMBDA_FLAG} requires {RERANKER_FLAG} mmr, got {l:?}"
+            ));
+        }
     }
     if token == "off" {
         if let Some(w) = flags.window {
@@ -165,7 +194,21 @@ pub fn resolve(flags: RerankRawFlags<'_>) -> Result<RerankSettings, String> {
             onnx_cross_encoder_method(model, tokenizer, window, timeout)
                 .map_err(|e| load_error(&e))?
         }
-        // `mmr`: 語彙としては正しいが本ビルドには実装が無い（Issue #2143）。
+        "mmr" => {
+            let err = |raw: &str| {
+                format!("{RERANK_MMR_LAMBDA_FLAG} expects a decimal in 0..=1, got {raw:?}")
+            };
+            let lambda = match flags.mmr_lambda {
+                None => DEFAULT_MMR_LAMBDA,
+                Some(raw) => {
+                    let v = parse_strict_lambda(raw).ok_or_else(|| err(raw))?;
+                    validate_mmr_lambda(v).map_err(|_| err(raw))?
+                }
+            };
+            let mmr = MmrReranker::new(lambda)
+                .map_err(|_| format!("{RERANK_MMR_LAMBDA_FLAG} expects a decimal in 0..=1"))?;
+            RerankMethod::Mmr(mmr)
+        }
         _ => {
             return Err(format!(
                 "{RERANKER_FLAG} {token} is not supported in this build"
@@ -198,6 +241,14 @@ mod tests {
             model,
             tokenizer,
             timeout_ms,
+            ..Default::default()
+        }
+    }
+
+    fn mmr_flags<'a>(lambda: Option<&'a str>) -> RerankRawFlags<'a> {
+        RerankRawFlags {
+            reranker: Some("mmr"),
+            mmr_lambda: lambda,
             ..Default::default()
         }
     }
@@ -236,8 +287,68 @@ mod tests {
             let e = resolve(flags(Some(bad), None)).expect_err(bad);
             assert!(e.contains(RERANKER_FLAG), "{bad}: {e}");
         }
-        let e = resolve(flags(Some("mmr"), None)).expect_err("mmr");
-        assert!(e.contains("not supported"), "mmr: {e}");
+    }
+
+    #[test]
+    fn mmr_uses_default_lambda_and_window() {
+        let s = resolve(flags(Some("mmr"), None)).unwrap();
+        assert!(s.is_enabled());
+        assert_eq!(s.method().kind_name(), "mmr");
+        assert_eq!(s.window(), DEFAULT_RERANK_WINDOW);
+        let s = resolve(flags(Some("mmr"), Some("50"))).unwrap();
+        assert_eq!(s.window(), 50);
+    }
+
+    #[test]
+    fn mmr_lambda_accepts_boundaries_and_decimals() {
+        for ok in ["0", "1", "0.0", "1.0", "0.25", "00.5", "0.50"] {
+            let s = resolve(mmr_flags(Some(ok))).expect(ok);
+            assert!(matches!(s.method(), RerankMethod::Mmr(_)), "{ok}");
+        }
+        let RerankMethod::Mmr(m) = resolve(mmr_flags(Some("0.25"))).unwrap().method().clone()
+        else {
+            panic!("expected mmr");
+        };
+        assert_eq!(m.lambda(), 0.25);
+    }
+
+    #[test]
+    fn mmr_lambda_rejects_malformed_and_out_of_range() {
+        for bad in [
+            "+0.5",
+            "-0",
+            "-0.5",
+            " 0.5",
+            "0.5 ",
+            "1e-1",
+            ".5",
+            "1.",
+            "nan",
+            "NaN",
+            "inf",
+            "1.5",
+            "1.0000001",
+            "2",
+            "１",
+            "0,5",
+            "",
+        ] {
+            let e = resolve(mmr_flags(Some(bad))).expect_err(bad);
+            assert!(e.contains(RERANK_MMR_LAMBDA_FLAG), "{bad}: {e}");
+        }
+    }
+
+    #[test]
+    fn mmr_lambda_requires_mmr() {
+        for token in [None, Some("off"), Some("lexical"), Some("cross_encoder")] {
+            let f = RerankRawFlags {
+                reranker: token,
+                mmr_lambda: Some("0.5"),
+                ..Default::default()
+            };
+            let e = resolve(f).expect_err("lambda without mmr");
+            assert!(e.contains(RERANK_MMR_LAMBDA_FLAG), "{token:?}: {e}");
+        }
     }
 
     #[test]

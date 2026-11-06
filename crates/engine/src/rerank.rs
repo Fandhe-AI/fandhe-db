@@ -64,6 +64,9 @@ pub struct RerankCandidate<'a> {
     pub id: u64,
     pub fused_score: f64,
     pub text: &'a str,
+    /// 候補の埋め込み（Issue #2143。[`MmrReranker`] だけが読む。字句一致・クロスエンコーダ・
+    /// 恒等リランカーは参照しない）。実行器は RLS 適用後の可視アリーナ由来の値だけを渡す。
+    pub embedding: Option<&'a [f32]>,
 }
 
 /// 再順位付け後の検索結果 1 件。[`crate::hybrid::HybridHit`] とスコア尺度が異なるため
@@ -183,6 +186,11 @@ pub enum RerankError {
     /// **破壊的変更**として扱う（コミットの `BREAKING CHANGE:` フッタ・PR 本文の
     /// Breaking changes 節で明示する）。
     CrossEncoder(CrossEncoderError),
+    /// [`MmrReranker`]（Issue #2143）が受けた候補の埋め込みが使えない（欠落・次元不一致・
+    /// ノルムが 0 または非有限・類似度が NaN）。`RerankError` は `#[non_exhaustive]` を
+    /// 持たない既公開 enum のため、この variant 追加も [`RerankError::CrossEncoder`] と同じく
+    /// ソース非互換な**破壊的変更**として扱う。
+    InvalidEmbedding { id: u64 },
 }
 
 impl fmt::Display for RerankError {
@@ -226,6 +234,9 @@ impl fmt::Display for RerankError {
                 "rerank candidate text total too long: {total} bytes (max {max})"
             ),
             RerankError::CrossEncoder(e) => write!(f, "cross-encoder reranker error: {e}"),
+            RerankError::InvalidEmbedding { id } => {
+                write!(f, "rerank candidate has an unusable embedding: id={id}")
+            }
         }
     }
 }
@@ -692,6 +703,206 @@ impl Reranker for LexicalOverlapReranker {
             .collect();
         out.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.id.cmp(&b.id)));
         out.truncate(final_k);
+        Ok(out)
+    }
+}
+
+// ---------- MMR リランカー（Issue #2143・SEARCH-15。設計記録:
+// `docs/design/rerank-wiring-policy.md` D2・D3・D4・D8） ----------
+
+/// `--rerank-mmr-lambda` の既定値（関連度と多様性の中立点）。
+pub const DEFAULT_MMR_LAMBDA: f64 = 0.5;
+
+/// MMR の計算量予算（ADR D4）。`窓幅 W × min(k_eff, W)` の上限で、貪欲選択の
+/// 内積計算回数（約 `n × final_k`）を有界にする。
+pub const MMR_PAIR_BUDGET: usize = 1_000_000;
+
+/// MMR の λ を検証する（有限かつ `0.0..=1.0`）。wire-server の起動引数検証（`rerank_opt`）から
+/// 呼ばれ、範囲の判定を engine に一本化する。範囲外は [`RerankError::InvalidConfig`]。
+pub fn validate_mmr_lambda(lambda: f64) -> Result<f64, RerankError> {
+    if !lambda.is_finite() || !(0.0..=1.0).contains(&lambda) {
+        return Err(RerankError::InvalidConfig);
+    }
+    Ok(lambda)
+}
+
+/// 窓幅 `window` と実効件数 `k_eff` が MMR の計算量予算内か（`window × min(k_eff, window)`
+/// が [`MMR_PAIR_BUDGET`] 以下）。オーバーフローは予算超過として偽を返す。実行器が取得の前に
+/// 設定値だけで判定する（表の内容に依存しない。ADR D4）。
+pub fn mmr_budget_allows(window: usize, k_eff: usize) -> bool {
+    window
+        .checked_mul(k_eff.min(window))
+        .is_some_and(|pairs| pairs <= MMR_PAIR_BUDGET)
+}
+
+/// MMR（Maximal Marginal Relevance）リランカー。関連度と、既に選んだ結果との類似度を λ で
+/// 釣り合わせて貪欲に選ぶ。
+///
+/// - 関連度は入力位置から導く順位ベースの値（`1 - i/(n-1)`、`n = 1` は 1.0）。入力の並び
+///   （融合スコア降順・同点 id 昇順）をそのまま反映するため、λ=1 は元の順位を厳密に再現する。
+/// - 類似度は埋め込み同士のコサイン類似度（`kernel` の内積・コサイン距離カーネルで計算する）。
+/// - 1 件目は入力先頭を選ぶ。2 件目以降は `λ·rel − (1−λ)·max_sim` が最大の候補で、同点は
+///   id 昇順（ADR D8）。
+/// - 出力スコアは位置由来の狭義単調減少値（[`rerank_candidates`] の出力検証を通すため）。
+///   実行器は融合スコア（または元の距離）のまま応答するので、この値は外へ出ない。
+///
+/// 構築は [`MmrReranker::new`] だけ（フィールド非公開。λ の検証迂回を防ぐ）。
+#[derive(Debug, Clone, Copy)]
+pub struct MmrReranker {
+    lambda: f64,
+}
+
+impl Default for MmrReranker {
+    fn default() -> Self {
+        Self {
+            lambda: DEFAULT_MMR_LAMBDA,
+        }
+    }
+}
+
+impl MmrReranker {
+    /// 検証付きコンストラクタ（λ は [`validate_mmr_lambda`]）。
+    pub fn new(lambda: f64) -> Result<Self, RerankError> {
+        Ok(Self {
+            lambda: validate_mmr_lambda(lambda)?,
+        })
+    }
+
+    /// 検証済みの λ。
+    pub fn lambda(&self) -> f64 {
+        self.lambda
+    }
+}
+
+/// [`MmrReranker::rerank`] の貪欲選択の作業状態（候補 1 件分）。
+struct MmrItem<'a> {
+    id: u64,
+    rel: f64,
+    emb: &'a [f32],
+    norm_sq: f32,
+    selected: bool,
+    max_sim: f64,
+}
+
+impl Reranker for MmrReranker {
+    fn rerank(
+        &self,
+        _query_text: &str,
+        candidates: &[RerankCandidate<'_>],
+        final_k: usize,
+    ) -> Result<Vec<RerankedHit>, RerankError> {
+        // trait を直接呼ぶ経路でも迂回できないよう、件数・予算・入力契約をこの実装自身で
+        // 検証する（`LexicalOverlapReranker` と同じ設計判断）。確保より前に行う。
+        let n = candidates.len();
+        if n > MAX_POOL_DEPTH {
+            return Err(RerankError::TooManyCandidates {
+                len: n,
+                max: MAX_POOL_DEPTH,
+            });
+        }
+        if final_k == 0 || final_k > n {
+            return Err(RerankError::InvalidK);
+        }
+        if n.checked_mul(final_k)
+            .is_none_or(|pairs| pairs > MMR_PAIR_BUDGET)
+        {
+            return Err(RerankError::TooManyCandidates {
+                len: n,
+                max: MMR_PAIR_BUDGET / final_k,
+            });
+        }
+        if candidates.iter().any(|c| !c.fused_score.is_finite()) {
+            return Err(RerankError::NonFiniteScore);
+        }
+        if !is_sorted_desc_id_asc(candidates.iter().map(|c| (c.fused_score, c.id))) {
+            return Err(RerankError::UnsortedInput);
+        }
+        if has_duplicate_id(candidates.iter().map(|c| c.id)) {
+            return Err(RerankError::DuplicateId);
+        }
+
+        // 埋め込みの検証とノルム² の前計算（候補ごとに 1 回）。
+        let dim = candidates
+            .first()
+            .and_then(|c| c.embedding)
+            .map_or(0, <[f32]>::len);
+        let denom = n.saturating_sub(1).max(1) as f64;
+        let mut items: Vec<MmrItem<'_>> = Vec::with_capacity(n);
+        for (i, c) in candidates.iter().enumerate() {
+            let invalid = RerankError::InvalidEmbedding { id: c.id };
+            let emb = c.embedding.ok_or_else(|| invalid.clone())?;
+            if dim == 0 || emb.len() != dim {
+                return Err(invalid);
+            }
+            let norm_sq = crate::kernel::dot(emb, emb);
+            if !norm_sq.is_finite() || norm_sq <= 0.0 {
+                return Err(invalid);
+            }
+            let rel = if n == 1 {
+                1.0
+            } else {
+                1.0 - (i as f64) / denom
+            };
+            items.push(MmrItem {
+                id: c.id,
+                rel,
+                emb,
+                norm_sq,
+                selected: false,
+                max_sim: f64::NEG_INFINITY,
+            });
+        }
+
+        let lambda = self.lambda;
+        let mut out: Vec<RerankedHit> = Vec::with_capacity(final_k);
+        for pos in 0..final_k {
+            // 1 件目は入力先頭（選択集合が空の段は類似度項が全候補で 0 になるため固定する）。
+            let pick = if pos == 0 {
+                0
+            } else {
+                let mut best: Option<(usize, f64, u64)> = None;
+                for (j, it) in items.iter().enumerate().filter(|(_, it)| !it.selected) {
+                    let score = lambda * it.rel - (1.0 - lambda) * it.max_sim;
+                    let better = match best {
+                        None => true,
+                        Some((_, b_score, b_id)) => match score.total_cmp(&b_score) {
+                            std::cmp::Ordering::Greater => true,
+                            std::cmp::Ordering::Equal => it.id < b_id,
+                            std::cmp::Ordering::Less => false,
+                        },
+                    };
+                    if better {
+                        best = Some((j, score, it.id));
+                    }
+                }
+                best.map(|b| b.0).ok_or(RerankError::InvalidK)?
+            };
+            let (pick_id, pick_emb, pick_norm) = {
+                let it = items.get_mut(pick).ok_or(RerankError::InvalidK)?;
+                it.selected = true;
+                (it.id, it.emb, it.norm_sq)
+            };
+            out.push(RerankedHit {
+                id: pick_id,
+                score: (final_k - pos) as f64,
+            });
+            if pos + 1 < final_k {
+                for it in items.iter_mut().filter(|it| !it.selected) {
+                    let d = crate::kernel::cosine_distance_from_parts(
+                        crate::kernel::dot(it.emb, pick_emb),
+                        it.norm_sq,
+                        pick_norm,
+                    );
+                    if d.is_nan() {
+                        return Err(RerankError::InvalidEmbedding { id: it.id });
+                    }
+                    let sim = 1.0 - d;
+                    if sim > it.max_sim {
+                        it.max_sim = sim;
+                    }
+                }
+            }
+        }
         Ok(out)
     }
 }
@@ -1209,6 +1420,19 @@ pub enum RerankMethod {
     Custom(std::sync::Arc<dyn Reranker>),
     /// クロスエンコーダ（`--reranker cross_encoder`。Issue #2144）。
     CrossEncoder(std::sync::Arc<dyn Reranker>),
+    /// MMR リランカー（`--reranker mmr`。Issue #2143）。埋め込みを読む。
+    Mmr(MmrReranker),
+    /// 埋め込みを読む任意のリランカー（密経路の縮退・再検索の注入テスト用。Rust API 専用）。
+    CustomEmbedding(std::sync::Arc<dyn Reranker>),
+}
+
+/// リランカーが要求する入力の種別（実行器が窓内の行から何を取り出すかを決める）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RerankInput {
+    /// 行のテキスト列（ハイブリッドのみ適用）。
+    Text,
+    /// 行の埋め込み（ハイブリッド・密のみの両方に適用）。
+    Embedding,
 }
 
 impl fmt::Debug for RerankMethod {
@@ -1224,8 +1448,17 @@ impl RerankMethod {
             Self::Off => "off",
             Self::Identity => "identity",
             Self::Lexical(_) => "lexical",
-            Self::Custom(_) => "custom",
             Self::CrossEncoder(_) => "cross_encoder",
+            Self::Custom(_) | Self::CustomEmbedding(_) => "custom",
+            Self::Mmr(_) => "mmr",
+        }
+    }
+
+    /// 方式が要求する入力（ADR D3 の適用形状表）。`Off` は使われない。
+    pub(crate) fn required_input(&self) -> RerankInput {
+        match self {
+            Self::Mmr(_) | Self::CustomEmbedding(_) => RerankInput::Embedding,
+            _ => RerankInput::Text,
         }
     }
 
@@ -1240,7 +1473,8 @@ impl RerankMethod {
             Self::Off => None,
             Self::Identity => Some(&IdentityReranker),
             Self::Lexical(r) => Some(r),
-            Self::Custom(r) | Self::CrossEncoder(r) => Some(r.as_ref()),
+            Self::Custom(r) | Self::CustomEmbedding(r) | Self::CrossEncoder(r) => Some(r.as_ref()),
+            Self::Mmr(r) => Some(r),
         }
     }
 }
@@ -1473,6 +1707,7 @@ mod tests {
             id,
             fused_score,
             text,
+            embedding: None,
         }
     }
 
@@ -2342,5 +2577,189 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(reason(err), "unreadable");
+    }
+}
+#[cfg(test)]
+mod mmr_tests {
+    use super::*;
+
+    /// `(id, 埋め込み)` から融合スコア降順（先頭が最大）の候補列を作る。
+    fn cands(rows: &[(u64, Vec<f32>)]) -> Vec<RerankCandidate<'_>> {
+        rows.iter()
+            .enumerate()
+            .map(|(i, (id, e))| RerankCandidate {
+                id: *id,
+                fused_score: 100.0 - i as f64,
+                text: "",
+                embedding: Some(e.as_slice()),
+            })
+            .collect()
+    }
+
+    fn ids(hits: &[RerankedHit]) -> Vec<u64> {
+        hits.iter().map(|h| h.id).collect()
+    }
+
+    fn cfg(n: usize, k: usize) -> RerankConfig {
+        RerankConfig::new(n, k).unwrap()
+    }
+
+    /// A が最上位、B は A とほぼ同じ向き、C は A と直交。
+    fn abc() -> Vec<(u64, Vec<f32>)> {
+        vec![
+            (1, vec![1.0, 0.0]),
+            (2, vec![0.99, 0.1]),
+            (3, vec![0.0, 1.0]),
+        ]
+    }
+
+    #[test]
+    fn lambda_one_reproduces_the_input_order() {
+        let rows = abc();
+        let c = cands(&rows);
+        let r = MmrReranker::new(1.0).unwrap();
+        let out = rerank_candidates(&r, "", &c, &cfg(3, 3)).unwrap();
+        assert_eq!(ids(&out), vec![1, 2, 3]);
+        let out = rerank_candidates(&r, "", &c, &cfg(3, 2)).unwrap();
+        assert_eq!(ids(&out), vec![1, 2]);
+    }
+
+    #[test]
+    fn lambda_one_keeps_order_for_ties_and_single_candidate() {
+        // 融合スコアが同点（id 昇順）でも入力位置どおり。
+        let rows = abc();
+        let mut c = cands(&rows);
+        for x in &mut c {
+            x.fused_score = 1.0;
+        }
+        let r = MmrReranker::new(1.0).unwrap();
+        assert_eq!(
+            ids(&rerank_candidates(&r, "", &c, &cfg(3, 3)).unwrap()),
+            vec![1, 2, 3]
+        );
+        let one = &c[..1];
+        assert_eq!(
+            ids(&rerank_candidates(&r, "", one, &cfg(1, 1)).unwrap()),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn lambda_zero_maximizes_diversity_but_starts_from_the_top() {
+        let rows = abc();
+        let c = cands(&rows);
+        let r = MmrReranker::new(0.0).unwrap();
+        let out = rerank_candidates(&r, "", &c, &cfg(3, 3)).unwrap();
+        assert_eq!(ids(&out), vec![1, 3, 2]);
+    }
+
+    #[test]
+    fn ties_break_by_id_ascending_and_runs_are_deterministic() {
+        // 2 件目の候補 9 と 5 は A と同じ類似度（ともに直交）。
+        let rows = vec![
+            (1, vec![1.0, 0.0]),
+            (9, vec![0.0, 1.0]),
+            (5, vec![0.0, -1.0]),
+        ];
+        let mut c = cands(&rows);
+        // 入力契約（スコア降順・同点 id 昇順）を満たすよう、9 と 5 を同点にして id 昇順へ並べる。
+        c[1].fused_score = 50.0;
+        c[2].fused_score = 50.0;
+        c.swap(1, 2);
+        let r = MmrReranker::new(0.0).unwrap();
+        let a = rerank_candidates(&r, "", &c, &cfg(3, 3)).unwrap();
+        let b = rerank_candidates(&r, "", &c, &cfg(3, 3)).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(ids(&a), vec![1, 5, 9]);
+    }
+
+    #[test]
+    fn lambda_validation() {
+        for ok in [0.0, 0.5, 1.0, -0.0] {
+            assert!(validate_mmr_lambda(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            -0.1,
+            1.000_000_1,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ] {
+            assert_eq!(validate_mmr_lambda(bad), Err(RerankError::InvalidConfig));
+            assert!(MmrReranker::new(bad).is_err());
+        }
+        assert_eq!(MmrReranker::default().lambda(), DEFAULT_MMR_LAMBDA);
+    }
+
+    #[test]
+    fn unusable_embeddings_are_rejected() {
+        let r = MmrReranker::new(0.5).unwrap();
+        let good = vec![(1, vec![1.0, 0.0]), (2, vec![0.0, 1.0])];
+        let mut c = cands(&good);
+        c[1].embedding = None;
+        assert_eq!(
+            r.rerank("", &c, 2),
+            Err(RerankError::InvalidEmbedding { id: 2 })
+        );
+        for bad in [
+            vec![1.0],
+            vec![0.0, 0.0],
+            vec![f32::NAN, 1.0],
+            vec![f32::INFINITY, 0.0],
+        ] {
+            let rows = vec![(1, vec![1.0, 0.0]), (2, bad)];
+            let c = cands(&rows);
+            assert_eq!(
+                r.rerank("", &c, 2),
+                Err(RerankError::InvalidEmbedding { id: 2 })
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_k_and_direct_call_contracts() {
+        let r = MmrReranker::new(0.5).unwrap();
+        let rows = abc();
+        let c = cands(&rows);
+        assert_eq!(r.rerank("", &c, 0), Err(RerankError::InvalidK));
+        assert_eq!(r.rerank("", &c, 4), Err(RerankError::InvalidK));
+        let mut unsorted = cands(&rows);
+        unsorted.swap(0, 1);
+        assert_eq!(r.rerank("", &unsorted, 2), Err(RerankError::UnsortedInput));
+    }
+
+    #[test]
+    fn budget_bounds() {
+        assert!(mmr_budget_allows(1000, 1000));
+        assert!(!mmr_budget_allows(1001, 1000));
+        assert!(!mmr_budget_allows(10_000, 101));
+        assert!(mmr_budget_allows(10_000, 100));
+        // k_eff が窓を超えても W × W で判定する。
+        assert!(mmr_budget_allows(1000, 5000));
+        assert!(!mmr_budget_allows(usize::MAX, usize::MAX));
+    }
+
+    #[test]
+    fn direct_call_over_budget_is_rejected() {
+        let r = MmrReranker::new(0.5).unwrap();
+        // 1001 件 × final_k 1000 = 1,001,000 > 予算。埋め込みの中身に入る前に拒否される。
+        let rows: Vec<(u64, Vec<f32>)> = (0..1001u64).map(|i| (i, vec![1.0, 0.0])).collect();
+        let c = cands(&rows);
+        assert!(matches!(
+            r.rerank("", &c, 1000),
+            Err(RerankError::TooManyCandidates { .. })
+        ));
+    }
+
+    #[test]
+    fn method_metadata() {
+        let m = RerankMethod::Mmr(MmrReranker::default());
+        assert_eq!(m.kind_name(), "mmr");
+        assert_eq!(m.required_input(), RerankInput::Embedding);
+        assert!(m.reranker().is_some());
+        let c = RerankMethod::CustomEmbedding(std::sync::Arc::new(IdentityReranker));
+        assert_eq!(c.kind_name(), "custom");
+        assert_eq!(c.required_input(), RerankInput::Embedding);
+        assert_eq!(RerankMethod::Identity.required_input(), RerankInput::Text);
     }
 }

@@ -1,9 +1,11 @@
-//! `--reranker`／`--rerank-window`（Issue #2142。ビヘイビア SEARCH-15 のポインタ）をバイナリ
+//! `--reranker`／`--rerank-window`／`--rerank-mmr-lambda`（Issue #2142・#2143。ビヘイビア
+//! SEARCH-15 のポインタ）をバイナリ
 //! 子プロセスとして起動し、起動の受理と拒否（fail-closed）を外形的に検証する。
 //!
-//! - R1: 未指定・`off`・`lexical`（窓幅の境界を含む）は `listening on` に到達する
-//! - R2: 語彙外・未対応（`mmr`／`cross_encoder`）・範囲外・非数値・値欠落・重複指定・
-//!   `off` のままの `--rerank-window` は非 0 終了で、stderr にフラグ名や理由を含む
+//! - R1: 未指定・`off`・`lexical`・`mmr`（窓幅・λ の境界を含む）は `listening on` に到達する
+//! - R2: 語彙外・未対応（`cross_encoder`）・範囲外・非数値・値欠落・重複指定・
+//!   `off` のままの `--rerank-window`・`mmr` 以外での λ 指定・λ の範囲外／不正書式は
+//!   非 0 終了で、stderr にフラグ名や理由を含む
 
 use crate::common;
 
@@ -15,6 +17,7 @@ const WINDOW: &str = "--rerank-window";
 const MODEL: &str = "--rerank-model";
 const TOKENIZER: &str = "--rerank-tokenizer";
 const TIMEOUT: &str = "--rerank-timeout-ms";
+const LAMBDA: &str = "--rerank-mmr-lambda";
 
 fn base_args(fixture: &common::TempFixtureDir) -> Vec<String> {
     vec![
@@ -43,12 +46,18 @@ fn starts_listening(args: &[String]) -> bool {
 /// R1: 受理される指定は起動を妨げない。
 #[test]
 fn valid_rerank_flags_start_listening() {
-    let cases: [&[&str]; 5] = [
+    let cases: [&[&str]; 11] = [
         &[],
         &[RERANKER, "off"],
         &[RERANKER, "lexical"],
         &[RERANKER, "lexical", WINDOW, "50"],
         &[RERANKER, "lexical", WINDOW, "10000"],
+        &[RERANKER, "mmr"],
+        &[RERANKER, "mmr", WINDOW, "50"],
+        &[RERANKER, "mmr", LAMBDA, "0"],
+        &[RERANKER, "mmr", LAMBDA, "1"],
+        &[RERANKER, "mmr", LAMBDA, "0.25", WINDOW, "100"],
+        &[LAMBDA, "0.5", RERANKER, "mmr"],
     ];
     for (n, extra) in cases.iter().enumerate() {
         let fixture = common::TempFixtureDir::new(&format!("rr-ok-{n}"));
@@ -62,7 +71,7 @@ fn valid_rerank_flags_start_listening() {
 /// R2: 不正な指定は起動エラー。
 #[test]
 fn invalid_rerank_flags_are_rejected() {
-    let cases: [(&[&str], &str); 23] = [
+    let cases: [(&[&str], &str); 33] = [
         (&[RERANKER], RERANKER),
         (
             &[RERANKER, "lexical", RERANKER, "off"],
@@ -76,7 +85,6 @@ fn invalid_rerank_flags_are_rejected() {
         (&[RERANKER, "Lexical"], RERANKER),
         (&[RERANKER, ""], RERANKER),
         (&[RERANKER, "identity"], RERANKER),
-        (&[RERANKER, "mmr"], "not supported"),
         // cross_encoder: 組み合わせ・書式の誤りは feature の有無によらず同じ拒否（Issue #2144）。
         (&[RERANKER, "cross_encoder"], MODEL),
         (
@@ -111,6 +119,20 @@ fn invalid_rerank_flags_are_rejected() {
         (&[RERANKER, "lexical", WINDOW, "abc"], WINDOW),
         (&[WINDOW, "10"], WINDOW),
         (&[RERANKER, "off", WINDOW, "10"], WINDOW),
+        (&[RERANKER, "mmr", LAMBDA], LAMBDA),
+        (
+            &[RERANKER, "mmr", LAMBDA, "0.5", LAMBDA, "0.6"],
+            "specified more than once",
+        ),
+        (&[RERANKER, "mmr", LAMBDA, "1.5"], LAMBDA),
+        (&[RERANKER, "mmr", LAMBDA, "-0.1"], LAMBDA),
+        (&[RERANKER, "mmr", LAMBDA, "+0.5"], LAMBDA),
+        (&[RERANKER, "mmr", LAMBDA, "nan"], LAMBDA),
+        (&[RERANKER, "mmr", LAMBDA, "1e-1"], LAMBDA),
+        (&[RERANKER, "mmr", LAMBDA, ".5"], LAMBDA),
+        (&[RERANKER, "lexical", LAMBDA, "0.5"], LAMBDA),
+        (&[RERANKER, "off", LAMBDA, "0.5"], LAMBDA),
+        (&[LAMBDA, "0.5"], LAMBDA),
     ];
     for (n, (extra, expected)) in cases.into_iter().enumerate() {
         let fixture = common::TempFixtureDir::new(&format!("rr-ng-{n}"));

@@ -201,7 +201,8 @@
 
 - 適用範囲: 実際にリランクが走るのは `Ranking::Hybrid`（recall モード）の文だけ。密のみの
   lexical と precision は「適用外」で素通しし、`RerankStats::not_applicable` だけを増やす。
-  MMR・密経路の `k` 拡張・密側の再検索は #2143 の担当で、本 Issue では作らない。
+  MMR・密経路の `k` 拡張・密側の再検索は #2143 の担当で、本 Issue では作らない（#2143 で実装済み。
+  次項の「実装メモ（#2143）」参照）。
 - 注入: `EngineCore::with_rerank(RerankSettings)`（起動時 1 回）。`RerankMethod` は
   `#[non_exhaustive]`（`Off`／`Identity`／`Lexical`／`Custom`）。`Identity`・`Custom` は
   Rust API 専用で CLI からは到達できない。CLI は `--reranker off|lexical` と
@@ -235,7 +236,42 @@
   ノイズ幅に収まる。bench 末尾の B1/B4 id 集合不一致の検査は base でも同じく失敗する
   既存事象で、本変更の影響ではない。
 
-## 8. 実装メモ（#2144）
+## 8. 実装メモ（#2143）
+
+MMR リランカーと、それに伴う密経路の結線（D3・D4・D6・D8 の実装）。
+
+- 関連度: 入力位置から導く順位ベースの値 `1 - i/(n-1)`（`n = 1` は 1.0）。融合スコアの値そのものは
+  使わないため、λ=1 は元の順位を厳密に再現する（min-max 正規化で起きる浮動小数の衝突が無い）。
+- 類似度: 埋め込み同士のコサイン類似度。ノルム² は候補ごとに 1 回だけ前計算し、対ごとに
+  `kernel::dot` と `kernel::cosine_distance_from_parts` を使う（依存追加なし）。
+- 選択: 1 件目は入力先頭に固定（選択集合が空の段は類似度項が全候補で 0 になり、λ=0 で全件が
+  同点になるため）。2 件目以降は `λ·rel − (1−λ)·max_sim` の最大、同点は候補 id（アリーナのスロット
+  番号）昇順（D8）。`max_sim` は選択のたびに増分更新し、内積の計算回数は約 `n × final_k`。
+  スロット番号は主キーと一致しない場合がある（TABLE-12）が、#2142 と同じ方針でキーに使う。
+- 出力スコア: 貪欲法の MMR 値は単調にならないため、`rerank_candidates` の出力検証を通す人工の
+  狭義単調減少値（`final_k - 位置`）を返す。実行器は融合スコア（密は元の距離）のまま応答する。
+- 入力種別: `RerankMethod::required_input()` が `Text`（lexical 等）か `Embedding`（`Mmr`・
+  `CustomEmbedding`）かを返す。`Embedding` では行テーブルのテキストをデコードしない。NULL・次元不一致・
+  ノルム 0／非有限の行は、テキスト無しの行と同じく窓内の元の位置に固定する。
+- 予算: `mmr_budget_allows(W, k_eff)` を取得の前に判定する。超過は `mmr_budget` で縮退し、窓を広げず
+  リランクもしないため、結果は off と同一（`off_prefix`・再検索は不要）。参考計測（共有環境）として
+  W=1000・final_k=1000・dim 768 の MMR は約 80 ms（予算の上限付近）。D4 の値は変えていない。
+- 密のみ: 距離は昇順で `rerank_candidates` のスコア降順契約に合わないため、位置由来の人工スコアで
+  リランカーへ渡し、結果は元の距離へ戻す。取得幅は `max(k_eff, W)`（上限 `MAX_SEARCH_K`）。反復
+  スキャンは目標件数と初期ラウンドを広げ、`iterative_scan = off` は `ef_search` が頭打ちになるため
+  窓は実質 `ef` までになる。取得幅を変えるのは MMR が有効な密の文だけで、off と字句一致系は従来のまま。
+- 密の縮退: 広げた取得の先頭 `k_eff` 件は HNSW で off と一致する保証が無いため、縮退時は DISTANCE 段
+  （事後 SCALAR フィルタを含む）を `k_eff` でやり直す（D6）。2 周目のキャッシュ観測は重ねて数えず、
+  実行統計（EXPLAIN ANALYZE 相当）の Distance 段は再検索の分だけ追加で記録される。再検索の前後で
+  57014 の確認点を置き、期限・キャンセルを縮退より優先する（D5）。
+- CLI: `--rerank-mmr-lambda` は `^[0-9]+(\.[0-9]+)?$` だけを受理し（符号・空白・指数・`nan`／`inf`・
+  `.5`／`1.`・全角を拒否）、範囲 `0..=1` は engine の `validate_mmr_lambda` で判定する。`mmr` 以外での
+  指定は起動エラー。
+- 破壊的変更: `RerankCandidate` への `embedding` 追加、`RerankError` への `InvalidEmbedding` 追加
+  （`CHANGELOG.md` の 0.2.0 参照）。
+- NoSQL `search` は同じ実行器を通るため追加の結線は無い。EXPLAIN の rerank 行は #2147 の担当で変更しない。
+
+## 9. 実装メモ（#2144）
 
 - 結線: `--reranker cross_encoder` は `--rerank-model`・`--rerank-tokenizer`（必須）と
   `--rerank-timeout-ms`（`1..=60000`、既定 1000）を伴う。判定順は、語彙、フラグの組み合わせ、

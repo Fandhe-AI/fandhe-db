@@ -14,8 +14,8 @@ use engine::kernel::CpuScalarProvider;
 use engine::policy::PolicyContext;
 use engine::rerank::{
     CrossEncoderBackend, CrossEncoderConfig, CrossEncoderError, CrossEncoderReranker,
-    LexicalOverlapReranker, RerankCandidate, RerankError, RerankMethod, RerankSettings,
-    RerankStats, RerankedHit, Reranker,
+    LexicalOverlapReranker, MmrReranker, RerankCandidate, RerankError, RerankMethod,
+    RerankSettings, RerankStats, RerankedHit, Reranker,
 };
 use engine::row_codec::Value;
 use engine::sql::exec::QueryResult;
@@ -487,6 +487,246 @@ fn search15_user_row_policy_hides_rows_from_the_reranker() {
     assert!(seen
         .iter()
         .all(|t| t != "zzz zzz zzz" && !t.contains("OTHERTENANT")));
+}
+// ---------------------------------------------------------------------------
+// MMR リランカー（Issue #2143）。設計記録: `docs/design/rerank-wiring-policy.md` D3・D4・D6。
+// ---------------------------------------------------------------------------
+
+/// `setup` の自テナント 8 行の埋め込み（id 1〜8）。
+const EMB: [[f32; 2]; 8] = [
+    [1.0, 0.0],
+    [0.95, 0.05],
+    [0.9, 0.1],
+    [0.85, 0.15],
+    [0.5, 0.5],
+    [0.4, 0.6],
+    [0.3, 0.7],
+    [0.2, 0.8],
+];
+
+fn emb_of(id: u64) -> [f32; 2] {
+    EMB[usize::try_from(id).expect("small id") - 1]
+}
+
+fn cos(a: [f32; 2], b: [f32; 2]) -> f64 {
+    let dot = f64::from(a[0] * b[0] + a[1] * b[1]);
+    let na = f64::from(a[0] * a[0] + a[1] * a[1]).sqrt();
+    let nb = f64::from(b[0] * b[0] + b[1] * b[1]).sqrt();
+    dot / (na * nb)
+}
+
+fn mmr(lambda: f64) -> RerankMethod {
+    RerankMethod::Mmr(MmrReranker::new(lambda).expect("valid lambda"))
+}
+
+const DENSE_COS: &str = "SELECT id FROM docs ORDER BY embedding <=> '[1.0,0.0]'";
+const DENSE_L2: &str = "SELECT id FROM docs ORDER BY embedding <#> '[1.0,0.0]'";
+
+/// 受け取った候補 id を溜め、入力順の先頭 `final_k` 件を返す（埋め込みを読む方式の記録用）。
+struct RecordingIds {
+    seen: Arc<Mutex<Vec<u64>>>,
+}
+
+impl Reranker for RecordingIds {
+    fn rerank(
+        &self,
+        _q: &str,
+        candidates: &[RerankCandidate<'_>],
+        final_k: usize,
+    ) -> Result<Vec<RerankedHit>, RerankError> {
+        let mut seen = self.seen.lock().expect("lock");
+        seen.extend(candidates.iter().map(|c| c.id));
+        Ok(candidates
+            .iter()
+            .take(final_k)
+            .map(|c| RerankedHit {
+                id: c.id,
+                score: c.fused_score,
+            })
+            .collect())
+    }
+}
+
+#[test]
+fn search15_mmr_lambda_one_matches_off_for_hybrid_and_dense() {
+    let (off, _g1) = setup("search15-mmr1-off", None);
+    for window in [3, 8, 50] {
+        let (core, _g2) = setup(
+            &format!("search15-mmr1-{window}"),
+            Some(settings(mmr(1.0), window)),
+        );
+        let mut sqls = vec![
+            hybrid_sql("LIMIT 2"),
+            hybrid_sql("LIMIT 3 OFFSET 1"),
+            hybrid_sql("LIMIT 8"),
+        ];
+        for base in [DENSE_COS, DENSE_L2] {
+            for tail in ["LIMIT 2", "LIMIT 3 OFFSET 1", "LIMIT 8"] {
+                sqls.push(format!("{base} {tail}"));
+            }
+        }
+        for sql in &sqls {
+            assert_eq!(run(&off, sql), run(&core, sql), "window={window} {sql}");
+        }
+        let s = core.rerank_stats();
+        assert_eq!(s.applied, sqls.len() as u64, "window={window}");
+        assert_eq!(s.degraded_total(), 0);
+        assert_eq!(s.not_applicable, 0);
+    }
+}
+
+#[test]
+fn search15_mmr_lambda_zero_promotes_diverse_rows_in_hybrid() {
+    let (off, _g1) = setup("search15-mmr0-off", None);
+    let (core, _g2) = setup("search15-mmr0", Some(settings(mmr(0.0), 8)));
+    let window = ids(&run(&off, &hybrid_sql("LIMIT 8")));
+    let got = ids(&run(&core, &hybrid_sql("LIMIT 2")));
+    assert_eq!(got.len(), 2);
+    // 1 件目は常に off の先頭。2 件目は 1 件目と最も似ていない窓内の行。
+    assert_eq!(got[0], window[0]);
+    let first = emb_of(got[0]);
+    let expected = window[1..]
+        .iter()
+        .copied()
+        .min_by(|a, b| {
+            cos(first, emb_of(*a))
+                .total_cmp(&cos(first, emb_of(*b)))
+                .then(a.cmp(b))
+        })
+        .expect("window has rows");
+    assert_eq!(got[1], expected);
+    assert_eq!(core.rerank_stats().applied, 1);
+}
+
+#[test]
+fn search15_mmr_applies_to_dense_only_and_keeps_distances() {
+    let (off, _g1) = setup("search15-mmrd-off", None);
+    let (core, _g2) = setup("search15-mmrd", Some(settings(mmr(0.0), 8)));
+    for base in [DENSE_COS, DENSE_L2] {
+        let sql = format!("{base} LIMIT 2");
+        let off_rows = run(&off, &format!("{base} LIMIT 8"));
+        let all = ids(&off_rows);
+        let got = run(&core, &sql);
+        let g = ids(&got);
+        assert_eq!(g[0], all[0], "{base}");
+        let first = emb_of(g[0]);
+        let expected = all[1..]
+            .iter()
+            .copied()
+            .min_by(|a, b| {
+                cos(first, emb_of(*a))
+                    .total_cmp(&cos(first, emb_of(*b)))
+                    .then(a.cmp(b))
+            })
+            .expect("window has rows");
+        assert_eq!(g[1], expected, "{base}");
+        // 返却スコア（距離）は元の距離のまま: off の同じ行と一致する。
+        for row in &got.rows {
+            let same = off_rows
+                .rows
+                .iter()
+                .find(|o| o.id == row.id)
+                .expect("row in off result");
+            assert_eq!(same, row, "{base}");
+        }
+    }
+    let s = core.rerank_stats();
+    assert_eq!(s.applied, 2);
+    assert_eq!(s.degraded_total(), 0);
+}
+
+#[test]
+fn search15_mmr_over_budget_degrades_to_off_without_widening() {
+    let (off, _g1) = setup("search15-budget-off", None);
+    // 10000 × min(200, 10000) = 2,000,000 > 1,000,000。
+    let (core, _g2) = setup("search15-budget", Some(settings(mmr(0.0), 10_000)));
+    let sqls = [hybrid_sql("LIMIT 200"), format!("{DENSE_COS} LIMIT 200")];
+    for sql in &sqls {
+        assert_eq!(run(&off, sql), run(&core, sql), "{sql}");
+    }
+    let s = core.rerank_stats();
+    assert_eq!(s.degraded_mmr_budget, 2);
+    assert_eq!(s.applied, 0);
+    assert_eq!(s.not_applicable, 0);
+    // 予算内（LIMIT 100: 10000 × 100 = 1,000,000）は適用される。
+    let _ = run(&core, &format!("{DENSE_COS} LIMIT 100"));
+    assert_eq!(core.rerank_stats().applied, 1);
+}
+
+#[test]
+fn search15_dense_contract_violation_refetches_the_off_result() {
+    let (off, _g) = setup("search15-drefetch-off", None);
+    for (name, bad) in [
+        ("foreign", Bad::ForeignId),
+        ("missing", Bad::Missing),
+        ("oversized", Bad::Oversized),
+    ] {
+        let (core, _g2) = setup(
+            &format!("search15-drefetch-{name}"),
+            Some(settings(RerankMethod::CustomEmbedding(Arc::new(bad)), 8)),
+        );
+        for tail in ["LIMIT 3", "LIMIT 2 OFFSET 1"] {
+            for base in [DENSE_COS, DENSE_L2] {
+                let sql = format!("{base} {tail}");
+                assert_eq!(run(&off, &sql), run(&core, &sql), "{name} {sql}");
+            }
+        }
+        let s = core.rerank_stats();
+        assert_eq!(s.applied, 0, "{name}");
+        assert_eq!(s.degraded_contract_violation, 4, "{name}");
+        assert_eq!(s.not_applicable, 0, "{name}");
+    }
+}
+
+#[test]
+fn search15_mmr_is_not_applied_in_precision_mode() {
+    let (off, _g1) = setup("search15-mmrp-off", None);
+    let (core, _g2) = setup("search15-mmrp", Some(settings(mmr(0.0), 8)));
+    let sql = hybrid_sql("LIMIT 3 USING MODE 'precision'");
+    assert_eq!(run(&off, &sql), run(&core, &sql));
+    let s = core.rerank_stats();
+    assert_eq!(s.not_applicable, 1);
+    assert_eq!(s.applied, 0);
+}
+
+#[test]
+fn search15_embedding_reranker_only_sees_own_tenant_visible_rows() {
+    for dense in [false, true] {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (core, _g) = setup(
+            &format!("search15-mmr-rls-{dense}"),
+            Some(settings(
+                RerankMethod::CustomEmbedding(Arc::new(RecordingIds { seen: seen.clone() })),
+                50,
+            )),
+        );
+        let sql = if dense {
+            format!("{DENSE_COS} LIMIT 3")
+        } else {
+            hybrid_sql("LIMIT 3")
+        };
+        let got = run(&core, &sql);
+        assert!(ids(&got).iter().all(|id| (1..=8).contains(id)));
+        let seen = seen.lock().expect("lock");
+        assert!(!seen.is_empty());
+        // 候補 id はアリーナのスロット番号。アリーナは自テナントの可視 8 行だけなので 0..8 に収まり、
+        // 別テナントの強一致 3 行（スロット 8 以降になるはずの行）は候補に現れない。
+        assert!(seen.iter().all(|slot| *slot < 8), "{seen:?}");
+        assert!(seen.len() <= 8, "{seen:?}");
+    }
+}
+
+#[test]
+fn search15_dense_text_rerankers_stay_not_applicable() {
+    // 字句一致系は密のみに適用しない（ADR D3）。MMR の追加で変わらないことを固定する。
+    let (off, _g1) = setup("search15-dtext-off", None);
+    let (core, _g2) = setup(
+        "search15-dtext",
+        Some(settings(RerankMethod::Custom(Arc::new(Reverse)), 8)),
+    );
+    let sql = format!("{DENSE_COS} LIMIT 3");
+    assert_eq!(run(&off, &sql), run(&core, &sql));
+    assert_eq!(core.rerank_stats().not_applicable, 1);
 }
 
 // ---------- Issue #2144: クロスエンコーダ方式（スタブバックエンドで決定的に検証） ----------
