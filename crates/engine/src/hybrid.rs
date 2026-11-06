@@ -149,8 +149,9 @@ impl Default for RrfConfig {
 }
 
 impl RrfConfig {
-    /// 検証付きコンストラクタ。`pool_depth` は `1..=MAX_POOL_DEPTH`、`k_const`・重みは
-    /// 有限かつ正であることを構築時に検証し、違反は `Err`（fail-closed）。
+    /// 検証付きコンストラクタ。`pool_depth` は `1..=MAX_POOL_DEPTH`、`k_const` は有限かつ正、
+    /// 重みは各々有限かつ 0 以上（両方 0 は不可）であることを構築時に検証し、違反は `Err`
+    /// （fail-closed）。
     /// フィールドが非 `pub` のため、`RrfConfig` を構築する経路はこの関数（と
     /// 常に妥当な値を返す [`Default::default`]）のみに限定される。これにより
     /// [`rrf_fuse`]・[`hybrid_search`] は妥当性検証済みの設定のみを扱える。
@@ -168,10 +169,16 @@ impl RrfConfig {
         if !k_const.is_finite() || k_const <= 0.0 {
             return Err(HybridError::InvalidConfig);
         }
-        if !dense_weight.is_finite() || dense_weight <= 0.0 {
+        // 重みは片側 0（その側の寄与を無効化）を許す。両方 0 は全件が同点 0 になり融合の意味が
+        // 無く、`precision::rrf_normalized` の理論最大値も 0 になるため拒否する（SEARCH-13・
+        // `sql::hybrid_tuning::HybridTuning::new` と同じ条件）。
+        if !dense_weight.is_finite() || dense_weight < 0.0 {
             return Err(HybridError::InvalidConfig);
         }
-        if !sparse_weight.is_finite() || sparse_weight <= 0.0 {
+        if !sparse_weight.is_finite() || sparse_weight < 0.0 {
+            return Err(HybridError::InvalidConfig);
+        }
+        if dense_weight == 0.0 && sparse_weight == 0.0 {
             return Err(HybridError::InvalidConfig);
         }
         Ok(Self {
@@ -188,12 +195,12 @@ impl RrfConfig {
         self.k_const
     }
 
-    /// 密検索側の寄与の重み（検証済み: 有限かつ正）。
+    /// 密検索側の寄与の重み（検証済み: 有限かつ 0 以上。疎側と両方 0 にはならない）。
     pub fn dense_weight(&self) -> f64 {
         self.dense_weight
     }
 
-    /// 疎検索側の寄与の重み（検証済み: 有限かつ正）。
+    /// 疎検索側の寄与の重み（検証済み: 有限かつ 0 以上。密側と両方 0 にはならない）。
     pub fn sparse_weight(&self) -> f64 {
         self.sparse_weight
     }
@@ -2232,6 +2239,37 @@ mod tests {
     }
 
     #[test]
+    fn rrf_config_accepts_one_sided_zero_weight_but_not_both() {
+        // SEARCH-13: 片側 0 は受理、両方 0・負・非有限は拒否。
+        assert!(RrfConfig::new(60.0, 0.0, 1.0, 10).is_ok());
+        assert!(RrfConfig::new(60.0, 1.0, 0.0, 10).is_ok());
+        for (d, s) in [
+            (0.0, 0.0),
+            (-0.5, 1.0),
+            (1.0, f64::NAN),
+            (f64::INFINITY, 1.0),
+        ] {
+            assert_eq!(
+                RrfConfig::new(60.0, d, s, 10).unwrap_err(),
+                HybridError::InvalidConfig
+            );
+        }
+    }
+
+    #[test]
+    fn rrf_fuse_with_zero_dense_weight_ties_dense_only_hits_by_id_ascending() {
+        // 密の重み 0: 密のみの候補は寄与 0 で同点になり、id 昇順で決定的に並ぶ。
+        let cfg = RrfConfig::new(60.0, 0.0, 1.0, 10).unwrap();
+        let dense = [hit(9, 3.0), hit(5, 2.0), hit(7, 1.0)];
+        let sparse = vec![doc(2, 3.0)];
+        let a = rrf_fuse(&dense, &sparse, &cfg).unwrap();
+        let b = rrf_fuse(&dense, &sparse, &cfg).unwrap();
+        assert_eq!(a, b);
+        let ids: Vec<u64> = a.iter().map(|h| h.id).collect();
+        assert_eq!(ids, vec![2, 5, 7, 9]);
+    }
+
+    #[test]
     fn rrf_fuse_matches_hand_computed_scores_for_top_rank_overlap() {
         // 両リストとも 1 位が id=1。融合スコアは 2 / (k_const + 1)（等重み）。
         let cfg = RrfConfig::new(60.0, 1.0, 1.0, 10).unwrap();
@@ -2987,6 +3025,23 @@ mod tests {
             }
             other => panic!("expected BoostSoftBoundExceeded, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn apply_soft_boost_rejects_any_boost_when_a_channel_weight_is_zero() {
+        // Issue #2120: `RrfConfig::new` は重み 0 を受理するが、`soft_boost_confirm_cap` は
+        // `min(weights)/(k+1)` = 0 になり、正の加点はすべて `BoostSoftBoundExceeded` で
+        // 拒否される（fail-closed。重み 0 のチャネルが保証する下限が無いため）。
+        let cfg = RrfConfig::new(60.0, 1.0, 0.0, 200).expect("zero weight is valid");
+        assert_eq!(soft_boost_confirm_cap(&cfg), 0.0);
+        let mut hits = vec![
+            HybridHit { id: 1, score: 0.5 },
+            HybridHit { id: 2, score: 0.0 },
+        ];
+        let ids: BTreeSet<u64> = [2].into_iter().collect();
+        let rule = BoostRule::new(&ids, 1e-9).unwrap();
+        let err = apply_soft_boost(&mut hits, &[rule], &cfg).unwrap_err();
+        assert!(matches!(err, HybridError::BoostSoftBoundExceeded { .. }));
     }
 
     #[test]

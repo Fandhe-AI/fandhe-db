@@ -3964,6 +3964,15 @@ impl EngineCore {
         // Issue #2243: 公開ビルダー `with_distance_kind` の誤用で非 Cosine が Hybrid・`precision` に
         // 素通りしないよう、早期 return する `result_cap` 分岐より前で整合を検査する。
         crate::sql::parser::check_bound_distance_kind(bound)?;
+        // Issue #2120: 外部で組み立てた計画の `window` も束縛段と同じ範囲で再検査する
+        // （`result_cap` の早期 return より前。多層防御）。
+        crate::sql::hybrid_tuning::check_window(
+            bound.ranking(),
+            bound.fetch_count(),
+            bound.result_cap(),
+            self.result_limits.max_result_rows(),
+            bound.mode().mode(),
+        )?;
         // Issue #2242: `LIMIT` 省略（暗黙上限の印 `result_cap`）付きの計画は、`cap` が設定値と一致し、
         // 取得上限が `cap + 1`、`OFFSET` が検索上限以内のときだけ通す（印の偽装で巨大な取得上限を
         // 通す経路を作らない。`check_bound_scan_limit` と同型）。

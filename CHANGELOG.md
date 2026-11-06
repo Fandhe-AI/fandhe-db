@@ -9,6 +9,7 @@
 
 ### Changed
 
+- `HYBRID`／`hybrid_rrf` の調整引数 `rrf_k`・`window`・`weights` を実行するようにした（Issue #2120・SEARCH-13 ポインタ）。従来の `0A000` から変わる。`window` が `LIMIT + OFFSET` 未満または `--max-result-rows` 超なら `22000`。`k1`／`b` は `0A000` のまま。公開関数 `hybrid::RrfConfig::new` は片側 0 の重みを受理する（両方 0・負・非有限は従来どおり `Err`。受理範囲の拡大のみ）。
 - NoSQL の `create_index`／`drop_index` op を実行するようにした（Issue #2108・NOSQL-19・INDEX-7・INDEX-8・HTTP-15 ポインタ）。JSON をトークン列へ写像し、SQL 表層の `CREATE INDEX`／`DROP INDEX` と同じ構造検証・実行器・DDL 権限ゲートを通る（成功は `{"ok":true}`、権限のない主体は存否に関わらず `42501`）。従来の語彙外 `0A000` は返さない。`drop_index` は `table` を持たないため、`tables` 制限のあるセッションスコープでは常に `42501`。engine の `sql::allowlist::validate_create_index_tokens`／`validate_drop_index_tokens` を公開した（追加）。
   BREAKING CHANGE: 公開 enum `http::query::op::Op` に `CreateIndex`／`DropIndex` を追加し、`Op::ALL` の型を `[Op; 12]` から `[Op; 14]`、`http::query::schema::OP_SCHEMAS` の型を `[...; 12]` から `[...; 14]` へ変えた（網羅的 `match` の下流は追随が必要）。`create_index`／`drop_index` は `0A000` ではなく実行される。
 - `GET /v1/openapi.json` で OpenAPI 3.1 文書を配信するようにした（Issue #2244・NOSQL-20 (3) ポインタ）。有効な Bearer を必須とし、欠落・不正・期限切れ・close 済みは `28000`（401）。本文はビルド時に埋め込んだ静的文書で、主体・テナントによらずバイト同一。`Content-Length` は省略または `0` のみで、本文あり・このパス以外への `GET`・このパスへの `GET` 以外は認証前に `08P01`。応答に `Cache-Control: no-store` を付ける。

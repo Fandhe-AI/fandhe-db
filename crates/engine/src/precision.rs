@@ -300,7 +300,10 @@ pub fn rrf_normalized(score: f64, cfg: &crate::hybrid::RrfConfig) -> Option<f64>
     if !score.is_finite() {
         return None;
     }
-    let max_score = (cfg.dense_weight() + cfg.sparse_weight()) / (cfg.k_const() + 1.0);
+    // 重みの和を先に取ると巨大重み（例: 各 1e308）で中間オーバーフローし、有限な理論最大値が
+    // 失われるため、項別に分母で割ってから加算する。
+    let denom = cfg.k_const() + 1.0;
+    let max_score = cfg.dense_weight() / denom + cfg.sparse_weight() / denom;
     if !max_score.is_finite() || max_score <= 0.0 {
         return None;
     }
@@ -575,7 +578,10 @@ mod tests {
     fn rrf_normalized_max_score_is_one() {
         let cfg = crate::hybrid::RrfConfig::new(60.0, 1.0, 1.0, 10).expect("valid cfg");
         // 両リストとも 1 位（rank=1）のスコア: weight/(k+1) + weight/(k+1)
-        let max_score = (cfg.dense_weight() + cfg.sparse_weight()) / (cfg.k_const() + 1.0);
+        // 重みの和を先に取ると巨大重み（例: 各 1e308）で中間オーバーフローし、有限な理論最大値が
+        // 失われるため、項別に分母で割ってから加算する。
+        let denom = cfg.k_const() + 1.0;
+        let max_score = cfg.dense_weight() / denom + cfg.sparse_weight() / denom;
         let normalized = rrf_normalized(max_score, &cfg).expect("must be Some");
         assert!((normalized - 1.0).abs() < 1e-9);
     }
@@ -585,6 +591,13 @@ mod tests {
         let cfg = crate::hybrid::RrfConfig::new(60.0, 1.0, 1.0, 10).expect("valid cfg");
         assert_eq!(rrf_normalized(f64::NAN, &cfg), None);
         assert_eq!(rrf_normalized(f64::INFINITY, &cfg), None);
+    }
+
+    #[test]
+    fn rrf_normalized_survives_huge_weights() {
+        let cfg = crate::hybrid::RrfConfig::new(60.0, 1e308, 1e308, 10).expect("cfg");
+        let normalized = rrf_normalized(1.0, &cfg).expect("must be Some");
+        assert!(normalized.is_finite() && normalized > 0.0);
     }
 
     #[test]
