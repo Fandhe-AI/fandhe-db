@@ -375,6 +375,10 @@
 //! 台帳に記録しない通常の書き込み。分割実行 DML のみ常に必須。
 //! `docs/design/operation-id-optional.md` 参照）。
 //!
+//! `--english-stemmer`（Issue #2129 Phase A・SEARCH-16 ポインタ）: 依存の承認と engine の
+//! feature 有効化の前は未提供。値の有無にかかわらず固定文言で起動エラーにする
+//! （`wire_server::english_stemmer_opt`。`docs/design/stemming-crate-adoption.md` 参照）。
+//!
 //! `--require-where-for-dml`（Issue #2210・SQL-36 ポインタ）: 値を取らないスイッチ。
 //! 指定すると `WHERE` 省略の SQL `UPDATE`／`DELETE` を変更開始前に `42601` で拒否する
 //! （明示した述語は受理。MySQL の `sql_safe_updates` 相当）。重複指定・`=` 連結形・後続の値は
@@ -1938,6 +1942,15 @@ fn run_server(args: &[String]) -> ExitCode {
                 }
                 fault_inject_raw = Some(v.clone());
                 i += 2;
+            }
+            // Issue #2129 Phase A（SEARCH-16 ポインタ）。承認と feature 有効化の前は
+            // 値の有無にかかわらず値を読まず・echo せず固定文言で拒否する。
+            wire_server::english_stemmer_opt::FLAG => {
+                engine::log_stderr!(
+                    "wire-server: {}",
+                    wire_server::english_stemmer_opt::reject()
+                );
+                return ExitCode::FAILURE;
             }
             other => {
                 engine::log_stderr!("wire-server: unknown argument: {other}");

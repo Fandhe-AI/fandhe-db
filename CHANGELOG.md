@@ -9,6 +9,7 @@
 
 ### Changed
 
+- wire-server に `--english-stemmer` を追加した（Issue #2129 Phase A・SEARCH-16 ポインタ）。依存の承認と feature 有効化の前は値の有無にかかわらず固定文言で起動エラーにする（従来は未知引数として拒否）。公開モジュール `english_stemmer_opt` を追加した。
 - `HYBRID`／`hybrid_rrf` の調整引数 `k1`・`b` をクエリ時の BM25 計算へ接続した（Issue #2121・SEARCH-13 ポインタ）。従来の `0A000` から変わり、索引・キャッシュは再構築せず再利用する。`k1` は `1e200` 以下、範囲外・非有限スコアは `22000`。公開 API に `sparse::Bm25Params`・`SparseIndex::params`・`SparseIndex::score_within_with_params`・`hybrid::hybrid_search_with_bm25` を追加した（追加のみ）。
 - 公開 struct `hybrid::HybridHit` にフィールド `dense_rank: Option<u32>`・`sparse_rank: Option<u32>` を追加した（Issue #2136・SEARCH-17 ポインタ）。融合に使った 1 始まりの実効順位（`GroupEnd` では同点グループ末尾）で、その系統の候補に無ければ `None`。融合スコア・順序は不変。
   BREAKING CHANGE: 構造体リテラルで構築している下流は追随が必要。

@@ -360,6 +360,9 @@ PostgreSQL と同じく `WHERE` 省略を受理します。プロセス起動時
 NoSQL（HTTP）の `update`／`delete` は従来どおり filter 必須で、本スイッチの影響を受けません
 （`docs/design/require-where-for-dml-cli.md`）。
 
+`--english-stemmer`（Issue #2129）は承認と feature 有効化の前のため、値の有無にかかわらず常に起動エラーになる
+（固定文言で拒否。`docs/design/stemming-crate-adoption.md`）。
+
 `--max-dml-affected-rows`・`--max-insert-rows`（Issue #997。オーナー判断の
 改訂・2026-09-27）は、それぞれ述語形 `UPDATE`／`DELETE`（`WHERE` 句付き）の
 1 文あたり影響行数上限・複数行 `VALUES` の 1 文あたり行数上限を、プロセス
