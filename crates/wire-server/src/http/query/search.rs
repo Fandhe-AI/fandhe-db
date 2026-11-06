@@ -403,6 +403,40 @@ pub fn bind_search_with_limits(
     })
 }
 
+/// `hybrid` の調整キー（`k1`・`b`・`rrf_k`・`window`・`weights`。Issue #2122・NOSQL-2・
+/// SEARCH-13 ポインタ）を読み、`HybridTuning::new` で範囲検証する。
+///
+/// 検証は 3 層に分かれる。(1) 型・未知キーなどの形は `HYBRID_SCHEMA`／アクセサ（`42601`）、
+/// (2) 値の範囲は engine の `HybridTuning::new`（`22000`。範囲の正を wire-server に複製しない）、
+/// (3) `window` と `LIMIT`・`--max-result-rows`・`k1` の数値安全上限は engine の
+/// `check_bound_search` が束縛済み文に対して検査する。`window` は整数のみ受け付け、
+/// `usize` に収まらない値は飽和させて範囲外（`22000`）として拒否する。
+fn bind_hybrid_tuning(
+    hybrid: &Validated<'_>,
+) -> Result<engine::sql::hybrid_tuning::HybridTuning, SearchError> {
+    let k1 = hybrid.optional_number("k1")?;
+    let b = hybrid.optional_number("b")?;
+    let rrf_k = hybrid.optional_number("rrf_k")?;
+    let window = match hybrid.optional_json_number("window")? {
+        None => None,
+        Some(n) => match n.as_exact_u64() {
+            Some(v) => Some(usize::try_from(v).unwrap_or(usize::MAX)),
+            None => {
+                return Err(SearchError::Shape(SchemaError::TypeMismatch {
+                    key: "window",
+                }))
+            }
+        },
+    };
+    let weights = match hybrid.optional_nested("weights")? {
+        None => None,
+        Some(w) => Some((w.required_number("dense")?, w.required_number("sparse")?)),
+    };
+    Ok(engine::sql::hybrid_tuning::HybridTuning::new(
+        k1, b, rrf_k, window, weights,
+    )?)
+}
+
 /// [`bind_search_with_limits`] に `metric` 省略時の解決器を足した版（Issue #2243）。
 /// `index_default` は `metric` 省略時の距離種別の解決器（Issue #2243。engine の
 /// `IndexMetricDefault::distance_kind`）で、`vector` かつ非 `hybrid` で `metric` が
@@ -422,7 +456,7 @@ pub fn bind_search_with_metric_resolver(
 
     let vector_items = validated.optional_array("vector")?;
     let plan = validated.optional_str("plan")?;
-    let hybrid = validated.optional_object("hybrid")?;
+    let hybrid = validated.optional_nested("hybrid")?;
 
     // 排他判定と同時に、以降の分岐が使う値をここで確定する（`.expect()` で
     // 「到達しないはず」の分岐を後段に残さない。受信データ経路では
@@ -476,27 +510,22 @@ pub fn bind_search_with_metric_resolver(
     let explicit_metric = metric.map(parse_metric).transpose()?;
 
     if let VectorOrPlan::Vector(vector_items) = vector_or_plan {
+        // 調整キーはベクトル値の検証より先に検証する（SQL の `bind_ranking` と同じ
+        // エラー優先順位。Issue #2122）。
+        let hybrid_parts = match &hybrid {
+            Some(h) => Some((h.required_str("text")?, bind_hybrid_tuning(h)?)),
+            None => None,
+        };
         let values = vector_as_f32(vector_items)?;
         let query = bind_vector_values(&values, schema)?;
-        let ranking = match hybrid {
-            Some(hybrid_obj) => {
+        let ranking = match hybrid_parts {
+            Some((query_text, tuning)) => {
                 let text_column_index = bind_body_text_column(schema)?;
-                let query_text = match hybrid_obj.get("text") {
-                    Some(JsonValue::String(s)) => s.clone(),
-                    // `HYBRID_SCHEMA` が既に `text: Required String` を検証
-                    // 済みだが、多層防御として再検査する（`filter.rs`
-                    // `map_filter_item` と同じ判断）。
-                    _ => {
-                        return Err(SearchError::Shape(SchemaError::TypeMismatch {
-                            key: "hybrid",
-                        }))
-                    }
-                };
                 Ranking::Hybrid {
                     query,
                     text_column_index,
-                    query_text,
-                    tuning: engine::sql::hybrid_tuning::HybridTuning::default(),
+                    query_text: query_text.to_string(),
+                    tuning,
                 }
             }
             None => Ranking::Distance { query },
@@ -1123,6 +1152,90 @@ mod tests {
         };
         assert_eq!(schema().columns[*text_column_index].name, "body");
         assert_eq!(query_text, "hello world");
+    }
+
+    fn hybrid_req(extra: &str) -> String {
+        format!(
+            r#"{{"op":"search","table":"docs","vector":[0.1,0.2,0.3,0.4],"limit":5,"hybrid":{{"text":"x"{extra}}}}}"#
+        )
+    }
+
+    fn hybrid_tuning_of(text: &str) -> engine::sql::hybrid_tuning::HybridTuning {
+        let BoundSearch::Vector(stmt) = bind(text).expect("bind ok") else {
+            panic!("expected BoundSearch::Vector");
+        };
+        let Ranking::Hybrid { tuning, .. } = stmt.ranking() else {
+            panic!("expected Ranking::Hybrid");
+        };
+        tuning.clone()
+    }
+
+    #[test]
+    fn hybrid_without_tuning_keys_uses_default() {
+        assert_eq!(
+            hybrid_tuning_of(&hybrid_req("")),
+            engine::sql::hybrid_tuning::HybridTuning::default()
+        );
+    }
+
+    #[test]
+    fn hybrid_tuning_keys_bind_to_hybrid_tuning() {
+        let got = hybrid_tuning_of(&hybrid_req(
+            r#","k1":1.5,"b":0.5,"rrf_k":30,"window":50,"weights":{"dense":2,"sparse":0.5}"#,
+        ));
+        let want = engine::sql::hybrid_tuning::HybridTuning::new(
+            Some(1.5),
+            Some(0.5),
+            Some(30.0),
+            Some(50),
+            Some((2.0, 0.5)),
+        )
+        .expect("valid tuning");
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn hybrid_window_must_be_integer() {
+        for w in ["1.5", "-1", "1e3"] {
+            let err = bind(&hybrid_req(&format!(r#","window":{w}"#))).expect_err("must reject");
+            assert_eq!(err.wire_code(), "42601", "window={w}");
+        }
+    }
+
+    #[test]
+    fn hybrid_tuning_out_of_range_is_22000() {
+        for extra in [
+            r#","k1":-1"#,
+            r#","b":1.5"#,
+            r#","rrf_k":0"#,
+            r#","window":0"#,
+            r#","window":18446744073709551615"#,
+            r#","weights":{"dense":0,"sparse":0}"#,
+            r#","weights":{"dense":-1,"sparse":1}"#,
+        ] {
+            let err = bind(&hybrid_req(extra)).expect_err("must reject");
+            assert_eq!(err.wire_code(), "22000", "{extra}");
+            assert_eq!(
+                to_sql_surface_error(err).wire_code(),
+                "22000",
+                "closure boundary: {extra}"
+            );
+        }
+    }
+
+    #[test]
+    fn plan_or_metric_with_tuned_hybrid_keeps_exclusion_errors() {
+        let tuned = r#"{"text":"y","k1":1.0}"#;
+        let err = bind(&format!(
+            r#"{{"op":"search","table":"docs","plan":"x","hybrid":{tuned},"limit":5}}"#
+        ))
+        .expect_err("must reject");
+        assert!(matches!(err, SearchError::PlanWithHybrid));
+        let err = bind(&format!(
+            r#"{{"op":"search","table":"docs","vector":[0.1,0.2,0.3,0.4],"hybrid":{tuned},"metric":"l2","limit":5}}"#
+        ))
+        .expect_err("must reject");
+        assert!(matches!(err, SearchError::MetricWithHybrid));
     }
 
     #[test]

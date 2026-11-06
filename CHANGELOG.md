@@ -9,6 +9,7 @@
 
 ### Changed
 
+- NoSQL `search` の `hybrid` オブジェクトが調整キー `k1`・`b`・`rrf_k`・`window`・`weights`（`{"dense","sparse"}`）を受け付けるようにした（Issue #2122・NOSQL-2・SEARCH-13 ポインタ）。SQL の `HYBRID(..., name => value)` と同じ意味・同じ結果で実行する。値の範囲外は `22000`、未知キー・型や形の不正は `42601`。公開 static `http::query::schema::HYBRID_WEIGHTS_SCHEMA` を追加した（追加のみ）。
 - `HYBRID`／`hybrid_rrf` の調整引数 `k1`・`b` をクエリ時の BM25 計算へ接続した（Issue #2121・SEARCH-13 ポインタ）。従来の `0A000` から変わり、索引・キャッシュは再構築せず再利用する。`k1` は `1e200` 以下、範囲外・非有限スコアは `22000`。公開 API に `sparse::Bm25Params`・`SparseIndex::params`・`SparseIndex::score_within_with_params`・`hybrid::hybrid_search_with_bm25` を追加した（追加のみ）。
 - 公開 struct `hybrid::HybridHit` にフィールド `dense_rank: Option<u32>`・`sparse_rank: Option<u32>` を追加した（Issue #2136・SEARCH-17 ポインタ）。融合に使った 1 始まりの実効順位（`GroupEnd` では同点グループ末尾）で、その系統の候補に無ければ `None`。融合スコア・順序は不変。
   BREAKING CHANGE: 構造体リテラルで構築している下流は追随が必要。
