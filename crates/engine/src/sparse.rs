@@ -71,6 +71,8 @@
 //! SEARCH-14 ポインタ）が担い、同じ分割規則（`walk_tokens`）を共有する。
 //! 検索語の構文（フレーズ・`or`・除外・前方一致）の解析は子モジュール [`text_query`]
 //! （Issue #2113・SEARCH-12 ポインタ）が担う。
+//! 索引は `postings` と並列に出現位置 `positions` を持ち（Issue #2114）、フレーズ一致は
+//! 子モジュール [`phrase`] が担う。スコア経路は位置を読まない。
 //!
 //! untrusted 入力の扱い: すべての処理を入力長に対して線形に保つ（バイグラム生成含む）。
 //! `Vec::with_capacity` は入力を `chars()` で数えた実際の文字数からのみ見積もる。
@@ -103,6 +105,7 @@ const DEFAULT_K1: f64 = 1.2;
 const DEFAULT_B: f64 = 0.75;
 
 pub mod match_span;
+pub mod phrase;
 pub mod text_query;
 
 /// [`SparseIndex::search`] が受け付けるクエリの一意語数の上限。
@@ -199,6 +202,9 @@ pub(crate) const MAX_CORPUS_BYTES: usize = 64 * 1024 * 1024;
 // コーパスを組み立てるため（巨大な単一バッファの重複確保を避ける）、この関係が崩れると
 // 境界値テストの前提が壊れる。
 const _: () = assert!(MAX_CORPUS_BYTES.is_multiple_of(MAX_DOC_BYTES));
+// 位置（Issue #2114）は 1 文書内の単位数で、単位数は文字数以下・文字数はバイト長以下の
+// ため `MAX_DOC_BYTES` 以下になる。`u32` の位置カウンタが索引経路で飽和しないことを固定する。
+const _: () = assert!(MAX_DOC_BYTES <= u32::MAX as usize);
 
 /// [`SparseIndex::with_params`]（構築）が受け付けるコーパス全体のトークン数合計の上限。
 ///
@@ -696,25 +702,46 @@ pub fn tokenize_with_options(text: &str, remove_stopwords: bool) -> Vec<String> 
 
 /// 分割規則の単一真実源となる範囲付きトークン walker（Issue #2124・SEARCH-14 ポインタ）。
 ///
-/// [`tokenize_with_options`]（索引・クエリ）と `match_span` モジュール（一致スパン算出）の
-/// 双方がこの 1 本を呼ぶため、分割規則が構造上食い違わない。`text` を元の文字単位で辿り、
-/// 各文字を `char::to_lowercase()` で展開した文字列に判定（[`is_ascii_word_char`]・
-/// [`is_cjk_char`]・[`is_cjk_stopword_unigram`]）を適用する。トークンの範囲は、構成する
-/// 生成文字が由来する元の文字のバイト範囲の和（`char_indices` 由来のため常に UTF-8 の
-/// 文字境界）で、全体の小文字化によるオフセットずれ（`İ`・ケルビン記号等）を起こさない。
-/// トークン順は「ASCII 単語は区切りで flush、CJK は直前文字とのバイグラム → 自身の
-/// ユニグラム」。`emit` が `false` を返した時点で走査を打ち切る。入力長に対して線形で、
-/// トークンごとの `String` 確保はしない（再利用バッファ）。
+/// [`walk_tokens_positioned`] から位置を捨てた薄いアダプタ。`tokenize_with_options`
+/// （索引・クエリ）と `match_span`・`text_query`・`headline` が呼ぶ既存の入口で、
+/// シグネチャと出力トークン列は位置対応化の前後で変わらない。
 pub(crate) fn walk_tokens<F>(text: &str, remove_stopwords: bool, mut emit: F)
 where
     F: FnMut(&str, std::ops::Range<usize>) -> bool,
+{
+    walk_tokens_positioned(text, remove_stopwords, |token, span, _pos| {
+        emit(token, span)
+    });
+}
+
+/// 位置つきの範囲付きトークン walker（Issue #2114・SEARCH-12 ポインタ。D4 の位置モデル）。
+///
+/// 分割規則そのものの正であり、[`walk_tokens`] はここから位置を捨てるだけである。
+/// `text` を元の文字単位で辿り、各文字を `char::to_lowercase()` で展開した文字列に
+/// 判定（[`is_ascii_word_char`]・[`is_cjk_char`]・[`is_cjk_stopword_unigram`]）を適用する。
+/// トークンの範囲は、構成する生成文字が由来する元の文字のバイト範囲の和（`char_indices`
+/// 由来のため常に UTF-8 の文字境界）で、全体の小文字化によるオフセットずれを起こさない。
+/// トークン順は「ASCII 単語は区切りで flush、CJK は直前文字とのバイグラム → 自身の
+/// ユニグラム」。`emit` が `false` を返した時点で走査を打ち切る。入力長に対して線形で、
+/// トークンごとの `String` 確保はしない（再利用バッファ）。
+///
+/// 位置モデル（`emit` の第 3 引数）: 位置は「単位」の通し番号（`u32`、0 始まり）。
+/// ASCII 単語は 1 単位、CJK は 1 文字ごとに 1 単位。バイグラムは先頭の文字の位置、
+/// ユニグラムはその文字の位置を持つ。ストップワード文字はユニグラムが抑止されても
+/// 位置を消費する。区切り（記号・空白・未対応文字）は位置を消費しない。カウンタは
+/// `saturating_add`（索引経路では 1 文書の単位数が [`MAX_DOC_BYTES`] 以下で飽和しない）。
+pub(crate) fn walk_tokens_positioned<F>(text: &str, remove_stopwords: bool, mut emit: F)
+where
+    F: FnMut(&str, std::ops::Range<usize>, u32) -> bool,
 {
     let mut word = String::new();
     let mut word_start = 0usize;
     let mut word_end = 0usize;
     let mut buf = String::new();
-    // 直前の生成文字が CJK のときのみ Some（元の文字の範囲つき）。
-    let mut prev_cjk: Option<(char, usize, usize)> = None;
+    // 次に割り当てる位置（単位の通し番号）。
+    let mut pos: u32 = 0;
+    // 直前の生成文字が CJK のときのみ Some（元の文字の範囲と位置つき）。
+    let mut prev_cjk: Option<(char, usize, usize, u32)> = None;
 
     for (src_start, src_char) in text.char_indices() {
         let src_end = src_start.saturating_add(src_char.len_utf8());
@@ -729,37 +756,53 @@ where
                 continue;
             }
             if !word.is_empty() {
-                if !emit(&word, word_start..word_end) {
+                if !emit(&word, word_start..word_end, pos) {
                     return;
                 }
+                pos = pos.saturating_add(1);
                 word.clear();
             }
             if is_cjk_char(c) {
                 // バイグラム（直前が CJK の場合）を先に、続けて自身のユニグラムを出す。
-                if let Some((p, p_start, _)) = prev_cjk {
+                if let Some((p, p_start, _, p_pos)) = prev_cjk {
                     buf.clear();
                     buf.push(p);
                     buf.push(c);
-                    if !emit(&buf, p_start..src_end) {
+                    if !emit(&buf, p_start..src_end, p_pos) {
                         return;
                     }
                 }
                 if !(remove_stopwords && is_cjk_stopword_unigram(c)) {
                     buf.clear();
                     buf.push(c);
-                    if !emit(&buf, src_start..src_end) {
+                    if !emit(&buf, src_start..src_end, pos) {
                         return;
                     }
                 }
-                prev_cjk = Some((c, src_start, src_end));
+                prev_cjk = Some((c, src_start, src_end, pos));
+                pos = pos.saturating_add(1);
             } else {
                 prev_cjk = None;
             }
         }
     }
     if !word.is_empty() {
-        emit(&word, word_start..word_end);
+        emit(&word, word_start..word_end, pos);
     }
+}
+
+/// 文書をトークン列と位置列へ同時に分割する（Issue #2114）。`with_params` の索引構築専用で、
+/// ストップワード除去 ON の [`tokenize`] と同一のトークン列に、各トークンの位置を並べる。
+fn tokenize_positioned(text: &str) -> (Vec<String>, Vec<u32>) {
+    let cap = text.chars().count();
+    let mut tokens: Vec<String> = Vec::with_capacity(cap);
+    let mut positions: Vec<u32> = Vec::with_capacity(cap);
+    walk_tokens_positioned(text, true, |token, _span, pos| {
+        tokens.push(token.to_owned());
+        positions.push(pos);
+        true
+    });
+    (tokens, positions)
 }
 
 /// BM25 Okapi による疎検索インデックス。
@@ -805,6 +848,13 @@ pub struct SparseIndex {
     /// 不変条件は `postings.len() == doc_freq.len() == terms.ids.len()`・
     /// 各 `t` について `postings[t].len() == doc_freq[t] as usize`。
     postings: Vec<Vec<(u32, u32)>>,
+    /// [`TermId`] を添字とする出現位置の配列（Issue #2114・SEARCH-12 ポインタ。D4 の位置
+    /// モデル）。`positions[t]` は `postings[t]` の各要素 `(doc_idx, tf)` について、その
+    /// 文書内での出現位置を `tf` 個ずつ posting の順に連結したもの（オフセット配列は持たず、
+    /// 走査側が `tf` の累積で区間を切る）。`postings` とスコア経路は変えず、フレーズ一致
+    /// （`sparse::phrase`）だけが読む。不変条件: `positions.len() == postings.len()`・
+    /// 各 `t` で `positions[t].len() == Σ tf`・各文書の区間内で位置は厳密に昇順。
+    positions: Vec<Vec<u32>>,
     /// `doc_idx` 添字の文書長配列（Issue #389）。`postings` 走査時に文書長正規化項
     /// （BM25 の `|d| / avgdl`）を `O(1)` で得るために [`Self::score_by_postings`]
     /// が参照する（Issue #390）。
@@ -1181,6 +1231,8 @@ impl SparseIndex {
         // [`TermId`] を添字とする posting list（Issue #389）。`doc_freq` と同じ
         // タイミング（新語 intern 時）で `push(Vec::new())` し長さを同期させる。
         let mut postings: Vec<Vec<(u32, u32)>> = Vec::new();
+        // [`TermId`] を添字とする出現位置（Issue #2114）。`postings` と同じタイミングで伸長する。
+        let mut positions: Vec<Vec<u32>> = Vec::new();
         // `doc_idx` 添字の文書長・`DocId` 配列（Issue #389）。`id_index` と同時に
         // push するため長さは常に `doc_len_by_idx.len()` と一致する（Issue #390で
         // `DocEntry`/`entries` を撤去し、この 2 配列が文書ごとの一次情報になった）。
@@ -1220,7 +1272,7 @@ impl SparseIndex {
                 });
             }
 
-            let doc_tokens = tokenize(text);
+            let (doc_tokens, doc_positions) = tokenize_positioned(text);
             // `term_freq`/`doc_freq` の構築（トークンごとの追加ヒープ確保）に入る前に、
             // ここまでのトークン数累計を検証する（MAX_CORPUS_TOKENS のコメント参照）。
             corpus_tokens_seen = corpus_tokens_seen.saturating_add(doc_tokens.len());
@@ -1242,14 +1294,15 @@ impl SparseIndex {
             // 既知語はヒープ確保なしで既存 `TermId` を返す）。新語が採番されるたびに
             // `doc_freq`／`postings` を `terms.len()` と同じ長さまで `push` して同期
             // させる（Issue #389: `postings` は `doc_freq` と対で伸長する）。
-            let mut ids: Vec<TermId> = Vec::with_capacity(doc_tokens.len());
-            for tok in doc_tokens {
+            let mut ids: Vec<(TermId, u32)> = Vec::with_capacity(doc_tokens.len());
+            for (tok, pos) in doc_tokens.into_iter().zip(doc_positions) {
                 let id = terms.intern(tok)?;
                 if id.0 as usize >= doc_freq.len() {
                     doc_freq.push(0);
                     postings.push(Vec::new());
+                    positions.push(Vec::new());
                 }
-                ids.push(id);
+                ids.push((id, pos));
             }
 
             // `TermId` 昇順にソートしランレングス圧縮して `(TermId, count)` へ畳み込む
@@ -1257,7 +1310,12 @@ impl SparseIndex {
             // `doc_freq`（この文書に出現した語のみ 1 件ずつ加算）を更新する。
             ids.sort_unstable();
             let mut term_freq: Vec<(TermId, u32)> = Vec::with_capacity(ids.len());
-            for id in ids {
+            // 位置は `(TermId, pos)` の全順序でソートされるため、語ごとに位置が昇順で並ぶ
+            // （Issue #2114。タプルの全順序なので `sort_unstable` でも結果は決定的）。
+            for (id, pos) in ids {
+                if let Some(list) = positions.get_mut(id.0 as usize) {
+                    list.push(pos);
+                }
                 match term_freq.last_mut() {
                     Some((last_id, count)) if *last_id == id => {
                         *count = count.saturating_add(1);
@@ -1304,6 +1362,9 @@ impl SparseIndex {
         for list in &mut postings {
             list.shrink_to_fit();
         }
+        for list in &mut positions {
+            list.shrink_to_fit();
+        }
 
         // `doc_len_by_idx.len() == docs.len()` であり、`docs.is_empty()` は関数冒頭で
         // 拒否済みのため、ここでの `doc_count` は必ず 1 以上（0 除算にはならない）。
@@ -1346,6 +1407,7 @@ impl SparseIndex {
             doc_freq,
             id_index,
             postings,
+            positions,
             doc_len: doc_len_by_idx,
             doc_ids: doc_ids_by_idx,
             len_classes,
@@ -2046,12 +2108,31 @@ impl SparseIndex {
         terms
             .saturating_add(doc_freq)
             .saturating_add(postings)
+            .saturating_add(self.approx_position_heap_bytes())
             .saturating_add(doc_len)
             .saturating_add(doc_ids)
             .saturating_add(id_index)
             .saturating_add(len_classes)
             .saturating_add(doc_len_class)
             .saturating_add(scratch_pool_upper_bound)
+    }
+
+    /// 位置配列 `positions`（Issue #2114）のヒープ確保分の概算バイト量。
+    ///
+    /// [`Self::approx_heap_bytes`] が合算する内訳で、位置による追加メモリを単独で測る
+    /// 計測用（docs の実測記録・`hybrid_profile` ベンチ）にも公開する。外側 `Vec` と各内側
+    /// `Vec<u32>` を容量ベースで数える（他フィールドと同じ「下回らない側」の概算）。
+    pub fn approx_position_heap_bytes(&self) -> usize {
+        let outer = self
+            .positions
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Vec<u32>>());
+        let inner: usize = self
+            .positions
+            .iter()
+            .map(|list| list.capacity().saturating_mul(std::mem::size_of::<u32>()))
+            .fold(0usize, |acc, n| acc.saturating_add(n));
+        outer.saturating_add(inner)
     }
 }
 
@@ -2163,6 +2244,122 @@ mod tests {
     }
 
     // --- トークナイザ（境界値含む） ---
+
+    // --- 位置モデル（Issue #2114・D4） ---
+
+    fn positioned(text: &str) -> Vec<(String, u32)> {
+        let mut v = Vec::new();
+        walk_tokens_positioned(text, true, |t, _, p| {
+            v.push((t.to_owned(), p));
+            true
+        });
+        v
+    }
+
+    fn p(items: &[(&str, u32)]) -> Vec<(String, u32)> {
+        items.iter().map(|&(t, p)| (t.to_owned(), p)).collect()
+    }
+
+    #[test]
+    fn positions_ascii_words_count_one_unit_each() {
+        assert_eq!(positioned("tokyo tower"), p(&[("tokyo", 0), ("tower", 1)]));
+        assert_eq!(positioned("a-b"), p(&[("a", 0), ("b", 1)]));
+        assert_eq!(positioned("a -- , b"), p(&[("a", 0), ("b", 1)]));
+    }
+
+    #[test]
+    fn positions_cjk_bigram_takes_first_char_position() {
+        assert_eq!(
+            positioned("東京都"),
+            p(&[("東", 0), ("東京", 0), ("京", 1), ("京都", 1), ("都", 2)])
+        );
+    }
+
+    #[test]
+    fn positions_stopword_char_consumes_a_position() {
+        assert_eq!(
+            positioned("東京の店"),
+            p(&[
+                ("東", 0),
+                ("東京", 0),
+                ("京", 1),
+                ("京の", 1),
+                ("の店", 2),
+                ("店", 3)
+            ])
+        );
+    }
+
+    #[test]
+    fn positions_mixed_ascii_and_cjk() {
+        assert_eq!(
+            positioned("cafe 東京"),
+            p(&[("cafe", 0), ("東", 1), ("東京", 1), ("京", 2)])
+        );
+    }
+
+    #[test]
+    fn positions_empty_input_yields_nothing() {
+        assert!(positioned("").is_empty());
+        assert!(positioned("  ,. ").is_empty());
+    }
+
+    #[test]
+    fn positions_property_matches_tokenizer_and_is_monotonic() {
+        let alphabet: Vec<char> = "ab c-東京都の店ー,Z_9 ".chars().collect();
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        for _ in 0..300 {
+            let mut text = String::new();
+            for _ in 0..40 {
+                state ^= state >> 12;
+                state ^= state << 25;
+                state ^= state >> 27;
+                let r = state.wrapping_mul(0x2545_F491_4F6C_DD1D);
+                text.push(alphabet[(r >> 33) as usize % alphabet.len()]);
+            }
+            let got = positioned(&text);
+            let toks: Vec<String> = got.iter().map(|(t, _)| t.clone()).collect();
+            assert_eq!(toks, tokenize(&text));
+            let units = text.chars().count() as u32;
+            let mut last = 0;
+            for (_, pos) in &got {
+                assert!(*pos >= last, "positions must be non-decreasing");
+                assert!(*pos < units);
+                last = *pos;
+            }
+        }
+    }
+
+    #[test]
+    fn build_positions_satisfy_invariants() {
+        let docs: Vec<(DocId, &str)> = vec![
+            (1, "a b a c a"),
+            (2, "東京都の店 a"),
+            (3, "b b"),
+            (4, "zzz"),
+        ];
+        let idx = SparseIndex::build(&docs).unwrap();
+        assert_eq!(idx.positions.len(), idx.postings.len());
+        for (list, pos) in idx.postings.iter().zip(&idx.positions) {
+            let total: u32 = list.iter().map(|&(_, tf)| tf).sum();
+            assert_eq!(pos.len(), total as usize);
+            let mut off = 0usize;
+            for &(_, tf) in list {
+                let seg = &pos[off..off + tf as usize];
+                assert!(seg.windows(2).all(|w| w[0] < w[1]));
+                off += tf as usize;
+            }
+        }
+    }
+
+    #[test]
+    fn approx_heap_bytes_accounts_positions() {
+        let docs: Vec<(DocId, &str)> = vec![(1, "a b a c a"), (2, "b b b b")];
+        let idx = SparseIndex::build(&docs).unwrap();
+        let total_tokens: usize = 9;
+        assert!(idx.approx_position_heap_bytes() >= 4 * total_tokens);
+        assert!(idx.approx_heap_bytes() > idx.approx_position_heap_bytes());
+    }
 
     #[test]
     fn tokenize_ascii_words() {
