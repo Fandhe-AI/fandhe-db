@@ -22,7 +22,9 @@
 //!
 //! で与え、`idf(t) = ln( (N - df(t) + 0.5) / (df(t) + 0.5) + 1 )` とする（`+ 1` により
 //! 常に非負となる）。`k1`・`b` は [`SparseIndex::with_params`] で調整可能とし、既定値は
-//! `k1 = 1.2`, `b = 0.75`。
+//! `k1 = 1.2`, `b = 0.75`。クエリ時の上書きは [`Bm25Params`] と
+//! [`SparseIndex::score_within_with_params`] で行い、索引（文書統計・postings）は
+//! 変えない（SEARCH-13 のクエリ時適用に対応するポインタ。Issue #2121）。
 //!
 //! トークナイザ（[`tokenize`]）は ASCII 英数字・アンダースコアの連続を単語トークンとし、
 //! CJK（ひらがな・カタカナ・CJK 統合漢字。カタカナ側は長音符 `ー`（U+30FC）を含むが
@@ -99,6 +101,65 @@ pub type DocId = u64;
 const DEFAULT_K1: f64 = 1.2;
 /// BM25 の Okapi パラメータ既定値（文書長正規化の強さ）。
 const DEFAULT_B: f64 = 0.75;
+
+/// クエリ時に受理する `k1` の数値安全上限（Issue #2121）。
+///
+/// 有限でも巨大な `k1`（例: `1e308`）では分子 `f * (k1 + 1)` や分母の
+/// `k1 * len_norm` が `inf` に桁あふれし、`inf / inf = NaN` で候補が黙って落ちる
+/// （fail-open）か `inf` スコアになる。1 文書の tf・文書長の上界
+/// （[`MAX_CORPUS_TOKENS`] = 8e6）と `len / avgdl` の上界（[`MAX_CORPUS_DOCS`] = 1e5）
+/// から、`1e200` なら分子・分母・累積和が最悪でも `1e215` 程度に収まり有限で、
+/// 正の寄与が `0.0` に丸められない。値はデータに依存しない定数のため、拒否の有無から
+/// 他テナントの存在・件数は推測できない。spec は範囲の上限を定めていないため、
+/// 実装上の数値安全上限という解釈である（ADR `hybrid-tuning-parameters.md` 参照）。
+const MAX_QUERY_K1: f64 = 1e200;
+
+/// BM25 の `k1`・`b` の定義域検査（`with_params` と [`Bm25Params::new`] で共有）。
+fn bm25_params_in_domain(k1: f64, b: f64) -> bool {
+    k1.is_finite() && k1 >= 0.0 && b.is_finite() && (0.0..=1.0).contains(&b)
+}
+
+/// クエリ時に疎検索へ渡す BM25 パラメータ（Issue #2121。SEARCH-13 のクエリ時適用）。
+///
+/// sql 層（`HYBRID(..., k1 => .., b => ..)` の束縛結果）が生成し、
+/// `hybrid.rs::hybrid_search_with_bm25` 経由で [`SparseIndex::score_within_with_params`]
+/// に届く。索引の文書統計・postings・キャッシュキーには影響せず、スコア式の係数
+/// だけに作用する。生成時に定義域と数値安全上限を検証するため、保持値は常に有効。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Bm25Params {
+    k1: f64,
+    b: f64,
+}
+
+impl Bm25Params {
+    /// 検証付きコンストラクタ。`k1` は有限・`0.0..=1e200`、`b` は有限・`[0.0, 1.0]`。
+    /// 違反は [`SparseError::InvalidParams`]（sql 層で `22000` に写像される）。
+    pub fn new(k1: f64, b: f64) -> Result<Self, SparseError> {
+        if !bm25_params_in_domain(k1, b) || k1 > MAX_QUERY_K1 {
+            return Err(SparseError::InvalidParams { k1, b });
+        }
+        Ok(Self { k1, b })
+    }
+
+    /// 項飽和度パラメータ。
+    pub fn k1(&self) -> f64 {
+        self.k1
+    }
+
+    /// 文書長正規化パラメータ。
+    pub fn b(&self) -> f64 {
+        self.b
+    }
+}
+
+impl Default for Bm25Params {
+    fn default() -> Self {
+        Self {
+            k1: DEFAULT_K1,
+            b: DEFAULT_B,
+        }
+    }
+}
 
 pub mod match_span;
 
@@ -1153,7 +1214,7 @@ impl SparseIndex {
     /// 前）に、それまでのトークン数の累計を `saturating_add` で求め、
     /// [`MAX_CORPUS_TOKENS`] を超えた時点で [`SparseError::TooManyTokens`] で拒否する。
     pub fn with_params(docs: &[(DocId, &str)], k1: f64, b: f64) -> Result<Self, SparseError> {
-        if !k1.is_finite() || k1 < 0.0 || !b.is_finite() || !(0.0..=1.0).contains(&b) {
+        if !bm25_params_in_domain(k1, b) {
             return Err(SparseError::InvalidParams { k1, b });
         }
         if docs.is_empty() {
@@ -1575,6 +1636,33 @@ impl SparseIndex {
         query: &str,
         visible_ids: &BTreeSet<DocId>,
     ) -> Result<SparseScored, SparseError> {
+        self.score_within_with_params(query, visible_ids, self.params())
+    }
+
+    /// 構築時の `k1`・`b` を [`Bm25Params`] として返す。
+    pub fn params(&self) -> Bm25Params {
+        Bm25Params {
+            k1: self.k1,
+            b: self.b,
+        }
+    }
+
+    /// [`Self::score_within`] のクエリ時パラメータ上書き版（Issue #2121。SEARCH-13）。
+    ///
+    /// `params` はスコア式の係数だけに使い、索引・文書統計（N・avgdl・df）は変えない。
+    /// このためキャッシュ済み索引を `k1`・`b` が違うクエリ間で再利用でき、スクラッチの
+    /// `k1 * len_norm` キャッシュはパスごとに消えるため、異なる `params` のパスが
+    /// 混ざらない。`self.params()` を渡した結果は [`Self::score_within`] とビット一致する。
+    /// 入口で `params` を再検証し（多層防御）、非有限スコアを検出したら
+    /// [`SparseError::InvalidParams`] で fail-closed にする（NaN は `> 0.0` 判定で
+    /// 黙って落ちるため）。
+    pub fn score_within_with_params(
+        &self,
+        query: &str,
+        visible_ids: &BTreeSet<DocId>,
+        params: Bm25Params,
+    ) -> Result<SparseScored, SparseError> {
+        let params = Bm25Params::new(params.k1, params.b)?;
         if query.len() > MAX_QUERY_BYTES {
             return Err(SparseError::QueryTooLong {
                 len: query.len(),
@@ -1619,7 +1707,7 @@ impl SparseIndex {
             return Ok(empty());
         }
 
-        let pass = self.score_pass(&query_ids, ScoreScope::Visible(&bitmap));
+        let pass = self.score_pass(&query_ids, ScoreScope::Visible(&bitmap), params);
         let acc = pass.acc();
         let touched = pass.touched();
 
@@ -1633,6 +1721,12 @@ impl SparseIndex {
             let Some(&score) = acc.get(idx) else {
                 continue;
             };
+            if !score.is_finite() {
+                return Err(SparseError::InvalidParams {
+                    k1: params.k1,
+                    b: params.b,
+                });
+            }
             if score > 0.0 {
                 let Some(&doc_id) = self.doc_ids.get(idx) else {
                     continue;
@@ -1701,7 +1795,7 @@ impl SparseIndex {
         scope: ScoreScope<'_>,
         k: usize,
     ) -> Vec<ScoredDoc> {
-        let pass = self.score_pass(query_ids, scope);
+        let pass = self.score_pass(query_ids, scope, self.params());
         let acc = pass.acc();
         let touched = pass.touched();
 
@@ -1746,7 +1840,12 @@ impl SparseIndex {
     /// ため）。分離前は `search_within` を呼ぶたびに本関数相当の処理
     /// （`acc: Vec<f64>` の `O(N)` 確保・ゼロ初期化を含む）をラウンドごとに
     /// 繰り返していた。
-    fn score_pass(&self, query_ids: &[TermId], scope: ScoreScope<'_>) -> ScorePass<'_> {
+    fn score_pass(
+        &self,
+        query_ids: &[TermId],
+        scope: ScoreScope<'_>,
+        params: Bm25Params,
+    ) -> ScorePass<'_> {
         let (n, avg_doc_len) = match scope {
             ScoreScope::All => (f64::from(self.doc_count), self.avg_doc_len),
             ScoreScope::Visible(bitmap) => {
@@ -1784,7 +1883,7 @@ impl SparseIndex {
         // は旧実装の `self.k1 * len_norm` と同一算出）は不変のため `denominator` は
         // 引き続きビット一致する。`HashMap` のキー・値は決定的に定まる（`class` →
         // 一意な `f64`）ためスコア自体の決定性に影響しない。
-        let k1_plus_1 = self.k1 + 1.0;
+        let k1_plus_1 = params.k1 + 1.0;
 
         // `doc_idx` を添字とするスコアアキュムレータ（f64。ビット一致契約のため
         // f32 化はしない）。`idf`・分子は数学的には常に正で `denominator > 0.0`
@@ -1861,9 +1960,9 @@ impl SparseIndex {
                 let kln = match k1_len_norm_cache.entry(class) {
                     std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
                     std::collections::hash_map::Entry::Vacant(entry) => {
-                        let value = self.k1
-                            * (1.0 - self.b
-                                + self.b * (f64::from(len) / avg_doc_len.max(f64::MIN_POSITIVE)));
+                        let value = params.k1
+                            * (1.0 - params.b
+                                + params.b * (f64::from(len) / avg_doc_len.max(f64::MIN_POSITIVE)));
                         entry.insert(value);
                         touched_classes.push(class);
                         value
@@ -4338,5 +4437,93 @@ mod tests {
         // （production の採否判断はビット一致契約が根拠であり、変動件数の実測値に
         // 依存しない。上記コメント参照）。ただし比較自体が実行されたことは確認する。
         assert!(total_compared > 0);
+    }
+
+    /// Issue #2121: クエリ時パラメータ版は既定 params で `score_within` とビット一致し、
+    /// `k1`／`b` を変えた呼び出しを挟んでもスクラッチ再利用で値が混入しない。
+    #[test]
+    fn score_within_with_params_default_is_bit_identical_and_isolated() {
+        let corpus = generate_mixed_corpus(300);
+        let refs: Vec<(DocId, &str)> = corpus.iter().map(|(id, s)| (*id, s.as_str())).collect();
+        let idx = SparseIndex::build(&refs).unwrap();
+        let visible: BTreeSet<DocId> = refs.iter().map(|&(id, _)| id).collect();
+        let bits = |s: &SparseScored| -> Vec<(DocId, u64)> {
+            s.candidates
+                .iter()
+                .map(|c| (c.doc_id, c.score.to_bits()))
+                .collect()
+        };
+        let base = idx.score_within("alpha beta", &visible).unwrap();
+        let other = Bm25Params::new(0.3, 0.1).unwrap();
+        for _ in 0..3 {
+            let same = idx
+                .score_within_with_params("alpha beta", &visible, idx.params())
+                .unwrap();
+            assert_eq!(bits(&base), bits(&same));
+            let changed = idx
+                .score_within_with_params("alpha beta", &visible, other)
+                .unwrap();
+            assert_ne!(bits(&base), bits(&changed), "k1/b change must alter scores");
+            let again = idx.score_within("alpha beta", &visible).unwrap();
+            assert_eq!(bits(&base), bits(&again));
+        }
+    }
+
+    /// Issue #2121: `Bm25Params::new` の定義域・数値安全上限・境界値。
+    #[test]
+    fn bm25_params_new_validates_domain_and_safety_cap() {
+        for (k1, b) in [
+            (f64::NAN, 0.5),
+            (f64::INFINITY, 0.5),
+            (-0.1, 0.5),
+            (1.0, f64::NAN),
+            (1.0, -0.1),
+            (1.0, 1.1),
+            (1e308, 0.5),
+            (MAX_QUERY_K1 * 10.0, 0.5),
+        ] {
+            assert!(
+                matches!(
+                    Bm25Params::new(k1, b),
+                    Err(SparseError::InvalidParams { .. })
+                ),
+                "{k1} {b}"
+            );
+        }
+        for (k1, b) in [(0.0, 0.0), (0.0, 1.0), (1.2, 0.75), (MAX_QUERY_K1, 1.0)] {
+            assert!(Bm25Params::new(k1, b).is_ok(), "{k1} {b}");
+        }
+        assert_eq!(Bm25Params::default(), Bm25Params::new(1.2, 0.75).unwrap());
+    }
+
+    /// Issue #2121: 上限ちょうどの `k1` でも全候補のスコアが有限・正で、脱落しない。
+    #[test]
+    fn score_within_with_params_at_cap_keeps_all_candidates_finite() {
+        let idx =
+            SparseIndex::build(&[(1, "apple zzz"), (2, "apple apple zzz zzz zzz zzz")]).unwrap();
+        let visible: BTreeSet<DocId> = [1, 2].into_iter().collect();
+        let p = Bm25Params::new(MAX_QUERY_K1, 1.0).unwrap();
+        let scored = idx.score_within_with_params("apple", &visible, p).unwrap();
+        assert_eq!(scored.candidates.len(), 2);
+        assert!(scored
+            .candidates
+            .iter()
+            .all(|c| c.score.is_finite() && c.score > 0.0));
+    }
+
+    /// Issue #2121: `k1 = 0` は全一致文書が同点になり doc_id 昇順で決定的。
+    #[test]
+    fn score_within_with_params_k1_zero_ties_by_doc_id() {
+        let idx = SparseIndex::build(&[
+            (3, "apple apple apple"),
+            (1, "apple zzz zzz"),
+            (2, "apple apple zzz"),
+        ])
+        .unwrap();
+        let visible: BTreeSet<DocId> = [1, 2, 3].into_iter().collect();
+        let p = Bm25Params::new(0.0, 0.75).unwrap();
+        let mut scored = idx.score_within_with_params("apple", &visible, p).unwrap();
+        let ids: Vec<DocId> = scored.top(3).iter().map(|d| d.doc_id).collect();
+        assert_eq!(ids, vec![1, 2, 3]);
     }
 }

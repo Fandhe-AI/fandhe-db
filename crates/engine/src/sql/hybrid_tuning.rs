@@ -14,9 +14,9 @@
 //! `RrfConfig` と候補プール深さに組み立てる。`window` の範囲検証は [`check_window`] に集約し、
 //! 束縛段・`EngineCore::check_bound_search`・実行時の 3 層から呼ぶ。
 //!
-//! 暫定ゲート: `k1`・`b` は #2121 まで実行器が使わないため、これらを持つ文は実行・EXPLAIN
-//! 経路で `0A000` により拒否される（[`ensure_tuning_applied`]。指定が黙って無視される
-//! fail-open を避ける。#2121 で撤去する）。
+//! BM25 への接続（Issue #2121）: `k1`・`b` は [`hybrid_bm25_params`] がクエリ時の
+//! `Bm25Params` に解決し、疎検索のスコア計算だけに渡す（索引・キャッシュキー・世代は不変）。
+//! これにより #2119 の暫定ゲート（`0A000`）は撤去した。
 
 use crate::hybrid::{RrfConfig, MAX_POOL_DEPTH};
 use crate::json::{parse_json, JsonValue};
@@ -141,23 +141,19 @@ impl HybridTuning {
     }
 }
 
-/// 暫定ゲート（fail-closed）: BM25 の `k1`／`b` を持つ `Ranking::Hybrid` の実行・EXPLAIN を
-/// `0A000` で拒否する。`k1`／`b` は実行器が未接続（#2121）のため、指定が黙って無視されることを
-/// 防ぐ。`rrf_k`・`window`・`weights` は #2120 で実行器に接続済みなので通す。
-/// `sql::exec`（実行）と `core.rs` の EXPLAIN 経路から呼ばれる。
-pub(crate) fn ensure_tuning_applied(
-    ranking: &crate::sql::parser::Ranking,
-) -> Result<(), SqlSurfaceError> {
-    match ranking {
-        crate::sql::parser::Ranking::Hybrid { tuning, .. }
-            if tuning.k1().is_some() || tuning.b().is_some() =>
-        {
-            Err(SqlSurfaceError::feature_not_supported(
-                "HYBRID tuning arguments k1 and b are not supported yet",
-            ))
-        }
-        _ => Ok(()),
-    }
+/// 調整引数 `k1`／`b` をクエリ時の BM25 パラメータへ解決する（SEARCH-13・Issue #2121）。
+/// 未指定の項目は索引自身の構築時の値（`index_params`。SQL 経路では既定値）で補うため、
+/// 指定なしの文は従来とバイト一致する。数値安全上限を含む検証違反は `22000`
+/// （固定の英語文言。入力値は含めない）。`sql::exec` の `Ranking::Hybrid` 実行から呼ばれる。
+pub(crate) fn hybrid_bm25_params(
+    tuning: &HybridTuning,
+    index_params: crate::sparse::Bm25Params,
+) -> Result<crate::sparse::Bm25Params, SqlSurfaceError> {
+    crate::sparse::Bm25Params::new(
+        tuning.k1().unwrap_or(index_params.k1()),
+        tuning.b().unwrap_or(index_params.b()),
+    )
+    .map_err(|_| SqlSurfaceError::invalid_input("HYBRID BM25 arguments k1 and b are out of range"))
 }
 
 /// `window` の範囲検証（SEARCH-13・Issue #2120）。`window` 未指定なら何もしない。
@@ -375,18 +371,23 @@ mod tests {
         }
     }
 
-    /// Issue #2120: ゲートは `k1`／`b` だけを拒否し、接続済みの引数は通す。
+    /// Issue #2121: 未指定は索引の値、部分指定は残りを補完、上限超えは 22000。
     #[test]
-    fn gate_rejects_only_k1_and_b() {
-        let ok = HybridTuning::new(None, None, Some(10.0), Some(5), Some((1.0, 0.0))).unwrap();
-        assert!(ensure_tuning_applied(&hybrid_ranking(ok)).is_ok());
-        for t in [
-            HybridTuning::new(Some(1.2), None, None, None, None).unwrap(),
-            HybridTuning::new(None, Some(0.5), None, None, None).unwrap(),
-        ] {
-            let e = ensure_tuning_applied(&hybrid_ranking(t)).unwrap_err();
-            assert_eq!(e.wire_code(), "0A000");
-        }
+    fn bm25_params_resolution() {
+        let idx = crate::sparse::Bm25Params::new(1.5, 0.4).unwrap();
+        let t = HybridTuning::default();
+        assert_eq!(hybrid_bm25_params(&t, idx).unwrap(), idx);
+        let t = HybridTuning::new(Some(2.0), None, None, None, None).unwrap();
+        let p = hybrid_bm25_params(&t, idx).unwrap();
+        assert_eq!((p.k1(), p.b()), (2.0, 0.4));
+        let t = HybridTuning::new(None, Some(1.0), None, None, None).unwrap();
+        let p = hybrid_bm25_params(&t, idx).unwrap();
+        assert_eq!((p.k1(), p.b()), (1.5, 1.0));
+        let t = HybridTuning::new(Some(1e308), None, None, None, None).unwrap();
+        assert_eq!(
+            hybrid_bm25_params(&t, idx).unwrap_err().wire_code(),
+            "22000"
+        );
     }
 
     /// Issue #2120: `window` の境界（`LIMIT + OFFSET` 以上・上限以下・`LIMIT` 省略は拒否）。

@@ -66,7 +66,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use crate::kernel::{CandidateHit, KernelError, SearchInput, SearchProvider};
-use crate::sparse::{ScoredDoc, SparseError, SparseIndex};
+use crate::sparse::{Bm25Params, ScoredDoc, SparseError, SparseIndex};
 
 /// 検索プールの深さ・k の上限。明示 `LIMIT` の設定可能なハード上限
 /// （`result_limits::MAX_RESULT_ROWS_HARD_CAP`＝100_000。Issue #1555）と同値のリテラルで、
@@ -1502,6 +1502,47 @@ pub fn hybrid_search_boosted(
     cfg: &RrfConfig,
     rules: &[BoostRule<'_>],
 ) -> Result<Vec<HybridHit>, HybridError> {
+    hybrid_search_inner(
+        provider,
+        input,
+        sparse_index,
+        query_text,
+        k,
+        cfg,
+        rules,
+        sparse_index.params(),
+    )
+}
+
+/// [`hybrid_search`] のクエリ時 BM25 パラメータ指定版（Issue #2121。SEARCH-13）。
+///
+/// sql 層の `HYBRID(..., k1 => .., b => ..)` 実行器から呼ばれる。`bm25` は疎側の
+/// スコア式の係数だけに作用し、索引・可視集合の縮約契約は [`hybrid_search`] と同一。
+/// `bm25` に `sparse_index.params()` を渡した結果は [`hybrid_search`] と完全一致する。
+pub fn hybrid_search_with_bm25(
+    provider: &dyn SearchProvider,
+    input: SearchInput<'_>,
+    sparse_index: &SparseIndex,
+    query_text: &str,
+    k: usize,
+    cfg: &RrfConfig,
+    bm25: Bm25Params,
+) -> Result<Vec<HybridHit>, HybridError> {
+    hybrid_search_inner(provider, input, sparse_index, query_text, k, cfg, &[], bm25)
+}
+
+/// [`hybrid_search_boosted`]・[`hybrid_search_with_bm25`] が共有する本体。
+#[allow(clippy::too_many_arguments)]
+fn hybrid_search_inner(
+    provider: &dyn SearchProvider,
+    input: SearchInput<'_>,
+    sparse_index: &SparseIndex,
+    query_text: &str,
+    k: usize,
+    cfg: &RrfConfig,
+    rules: &[BoostRule<'_>],
+    bm25: Bm25Params,
+) -> Result<Vec<HybridHit>, HybridError> {
     if k == 0 || k > cfg.pool_depth() {
         return Err(HybridError::InvalidK);
     }
@@ -1682,8 +1723,14 @@ pub fn hybrid_search_boosted(
     // 通常の検索経路では使わない。no-op クロージャを渡すことで記録用の
     // `Vec` 確保・push を通常経路のホットパスへ持ち込まない
     // （codex-review P2 指摘対応・PR #416）。
-    let (sparse_hits, sparse_limit) =
-        sparse_refetch_loop(sparse_index, query_text, &visible_ids, cfg, |_fetch_k| {})?;
+    let (sparse_hits, sparse_limit) = sparse_refetch_loop(
+        sparse_index,
+        query_text,
+        &visible_ids,
+        cfg,
+        bm25,
+        |_fetch_k| {},
+    )?;
 
     let mut fused =
         rrf_fuse_with_limits(&dense_hits, dense_limit, &sparse_hits, sparse_limit, cfg)?;
@@ -1716,6 +1763,7 @@ fn sparse_refetch_loop(
     query_text: &str,
     visible_ids: &BTreeSet<u64>,
     cfg: &RrfConfig,
+    bm25: Bm25Params,
     mut record_fetch_k: impl FnMut(usize),
 ) -> Result<(Vec<ScoredDoc>, usize), HybridError> {
     let sparse_cap = MAX_FETCH_K.min(visible_ids.len());
@@ -1733,7 +1781,7 @@ fn sparse_refetch_loop(
     // [`crate::sparse::SparseScored::top`] による前方一致な Top-k 拡張へ
     // 置き換える。`fetch_k` のスケジュール・`hits.len()`（`min(fetch_k, M)`）・
     // 以降の境界同点判定はいずれも旧実装と同一のまま変わらない。
-    let mut scored = sparse_index.score_within(query_text, visible_ids)?;
+    let mut scored = sparse_index.score_within_with_params(query_text, visible_ids, bm25)?;
     let (sparse_hits, sparse_limit) = loop {
         record_fetch_k(sparse_fetch_k);
         let hits: Vec<ScoredDoc> = scored.top(sparse_fetch_k);
@@ -1799,10 +1847,14 @@ pub fn sparse_refetch_observed(
     cfg: &RrfConfig,
 ) -> Result<(Vec<ScoredDoc>, usize, Vec<usize>), HybridError> {
     let mut fetch_ks = Vec::new();
-    let (sparse_hits, sparse_limit) =
-        sparse_refetch_loop(sparse_index, query_text, visible_ids, cfg, |fetch_k| {
-            fetch_ks.push(fetch_k)
-        })?;
+    let (sparse_hits, sparse_limit) = sparse_refetch_loop(
+        sparse_index,
+        query_text,
+        visible_ids,
+        cfg,
+        sparse_index.params(),
+        |fetch_k| fetch_ks.push(fetch_k),
+    )?;
     Ok((sparse_hits, sparse_limit, fetch_ks))
 }
 
@@ -3782,7 +3834,7 @@ mod tests {
 
         for (query, index, visible) in cases {
             let (actual_hits, actual_limit) =
-                sparse_refetch_loop(index, query, visible, &cfg, |_fetch_k| {})
+                sparse_refetch_loop(index, query, visible, &cfg, index.params(), |_fetch_k| {})
                     .expect("sparse_refetch_loop ok");
             let (expected_hits, expected_limit) =
                 sparse_refetch_loop_oracle_via_search_within(index, query, visible, &cfg)
@@ -4249,5 +4301,47 @@ mod tests {
                 "RRF スコアが密チャネル単独の理論値と一致しない: {hit:?}"
             );
         }
+    }
+
+    /// Issue #2121: 索引自身の params を渡した `hybrid_search_with_bm25` は `hybrid_search` と
+    /// 完全一致し、異なる params では疎側の順位が変わる。
+    #[test]
+    fn hybrid_search_with_bm25_matches_default_and_changes_with_params() {
+        let cfg = RrfConfig::new(60.0, 0.0, 1.0, 10).expect("cfg");
+        let vectors: Vec<f32> = vec![1.0, 0.0, 1.0, 0.0, 1.0, 0.0];
+        let ids = [1u64, 2, 3];
+        let mk = || SearchInput {
+            ids: &ids,
+            vectors: &vectors,
+            dim: 2,
+            query: &[1.0, 0.0],
+            k: 3,
+        };
+        let index = SparseIndex::build(&[
+            (1, "apple zzz"),
+            (2, "apple apple zzz zzz zzz zzz zzz zzz"),
+            (3, "zzz zzz"),
+        ])
+        .expect("build index");
+        let plain = hybrid_search(&CpuScalarProvider, mk(), &index, "apple", 3, &cfg).expect("ok");
+        let same = hybrid_search_with_bm25(
+            &CpuScalarProvider,
+            mk(),
+            &index,
+            "apple",
+            3,
+            &cfg,
+            index.params(),
+        )
+        .expect("ok");
+        assert_eq!(plain, same);
+        let b0 = Bm25Params::new(1.2, 0.0).unwrap();
+        let b1 = Bm25Params::new(1.2, 1.0).unwrap();
+        let r0 = hybrid_search_with_bm25(&CpuScalarProvider, mk(), &index, "apple", 3, &cfg, b0)
+            .expect("ok");
+        let r1 = hybrid_search_with_bm25(&CpuScalarProvider, mk(), &index, "apple", 3, &cfg, b1)
+            .expect("ok");
+        assert_eq!(r0.first().map(|h| h.id), Some(2));
+        assert_eq!(r1.first().map(|h| h.id), Some(1));
     }
 }
