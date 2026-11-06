@@ -111,6 +111,7 @@ mod soft_boost;
 mod sparse;
 mod sparse_cache;
 mod sparse_determinism;
+mod sparse_phrase;
 mod sparse_stopwords;
 mod sql74_radius_hnsw;
 mod tiering;
