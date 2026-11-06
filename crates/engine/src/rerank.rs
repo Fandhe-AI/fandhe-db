@@ -1335,7 +1335,21 @@ pub fn read_bounded_model_file(
         Ok(_) => return Err(fail("not_regular_file")),
         Err(_) => return Err(fail("unreadable")),
     }
-    let f = std::fs::File::open(path).map_err(|_| fail("unreadable"))?;
+    // 確認後に FIFO 等へ差し替えられても open 自体が停止しないよう、unix では非ブロッキングで
+    // 開いてからハンドルの種別を確認する。
+    let mut oo = std::fs::OpenOptions::new();
+    oo.read(true);
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        oo.custom_flags(0o4000); // O_NONBLOCK
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        oo.custom_flags(0x4); // O_NONBLOCK
+    }
+    let f = oo.open(path).map_err(|_| fail("unreadable"))?;
     let meta = f.metadata().map_err(|_| fail("unreadable"))?;
     if !meta.is_file() {
         return Err(fail("not_regular_file"));

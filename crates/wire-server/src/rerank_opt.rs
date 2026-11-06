@@ -111,7 +111,12 @@ fn load_error(e: &CrossEncoderError) -> String {
             };
             format!("{flag} rejected ({reason})")
         }
-        other => format!("{RERANKER_FLAG} cross_encoder: failed to load model ({other})"),
+        // `Backend(String)` はバックエンド由来の文言（入力名・ライブラリのパス等）を含み得るため
+        // 出力しない。他の variant も含め固定文言だけを返す。
+        CrossEncoderError::Backend(_) => {
+            format!("{RERANKER_FLAG} cross_encoder: failed to initialize model backend")
+        }
+        _ => format!("{RERANKER_FLAG} cross_encoder: failed to load model"),
     }
 }
 
