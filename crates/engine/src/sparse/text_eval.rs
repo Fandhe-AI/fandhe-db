@@ -240,9 +240,19 @@ impl SparseIndex {
                     Clause::Prefix(s) | Clause::Exclude(Excluded::Prefix(s)) => {
                         stems.insert(s.as_str());
                     }
-                    Clause::Phrase(p) => required.push(PhrasePattern::from_phrase(p)?),
+                    // 同一フィルタは評価前に一意化する（重複入力で走査量・中間結果を
+                    // 増幅させない。max_terms は一意語で数えるため、ここで揃える）。
+                    Clause::Phrase(p) => {
+                        let pat = PhrasePattern::from_phrase(p)?;
+                        if !required.contains(&pat) {
+                            required.push(pat);
+                        }
+                    }
                     Clause::Exclude(Excluded::Phrase(p)) => {
-                        excluded.push(PhrasePattern::from_phrase(p)?);
+                        let pat = PhrasePattern::from_phrase(p)?;
+                        if !excluded.contains(&pat) {
+                            excluded.push(pat);
+                        }
                     }
                 }
             }
@@ -365,17 +375,30 @@ impl SparseIndex {
             return Ok(Vec::new());
         }
 
-        // 必須フレーズ（doc_idx 昇順）。1 つでも一致 0 件ならグループは空。
-        let mut required: Vec<Vec<(u32, u32)>> = Vec::with_capacity(plan.required.len());
+        // 必須フレーズ: 逐次交差で絞り込み、フレーズ数×文書数の中間配列を作らない。
+        // 1 つでも一致 0 件（交差が空）ならグループは空。
+        let mut required: Option<Vec<u32>> = None;
         for pat in &plan.required {
-            let hits = self.phrase_match_doc_idx(pat, Some(bitmap));
-            if hits.is_empty() {
+            let hits: Vec<u32> = self
+                .phrase_match_doc_idx(pat, Some(bitmap))
+                .into_iter()
+                .map(|(d, _)| d)
+                .collect();
+            let next = match required.take() {
+                None => hits,
+                Some(prev) => prev
+                    .into_iter()
+                    .filter(|d| hits.binary_search(d).is_ok())
+                    .collect(),
+            };
+            if next.is_empty() {
                 return Ok(Vec::new());
             }
-            required.push(hits);
+            required = Some(next);
         }
 
         // 除外する文書（フレーズ一致と前方一致の展開語を含む文書）。
+        // 各源の後に整列・重複排除して、保持量を文書数以下に抑える。
         let mut excluded_docs: Vec<u32> = Vec::new();
         for pat in &plan.excluded {
             excluded_docs.extend(
@@ -383,22 +406,28 @@ impl SparseIndex {
                     .into_iter()
                     .map(|(d, _)| d),
             );
+            excluded_docs.sort_unstable();
+            excluded_docs.dedup();
         }
+        let mut excluded_stems: BTreeSet<&str> = BTreeSet::new();
         for c in plan.group.clauses() {
             if let Clause::Exclude(Excluded::Prefix(stem)) = c {
-                for &vi in expansion.indices(stem) {
-                    let Some(&(_, tid)) = self.prefix_vocab.get(vi) else {
-                        continue;
-                    };
-                    if let Some(list) = self.postings.get(tid.0 as usize) {
-                        excluded_docs
-                            .extend(list.iter().map(|&(d, _)| d).filter(|&d| bitmap.contains(d)));
-                    }
-                }
+                excluded_stems.insert(stem.as_str());
             }
         }
-        excluded_docs.sort();
-        excluded_docs.dedup();
+        for stem in excluded_stems {
+            for &vi in expansion.indices(stem) {
+                let Some(&(_, tid)) = self.prefix_vocab.get(vi) else {
+                    continue;
+                };
+                if let Some(list) = self.postings.get(tid.0 as usize) {
+                    excluded_docs
+                        .extend(list.iter().map(|&(d, _)| d).filter(|&d| bitmap.contains(d)));
+                }
+            }
+            excluded_docs.sort_unstable();
+            excluded_docs.dedup();
+        }
 
         // 正の語を文字列の辞書順で一意化して TermId へ引く（`score_within` と同じ走査順）。
         let mut words: BTreeMap<&str, TermId> = BTreeMap::new();
@@ -451,8 +480,8 @@ impl SparseIndex {
                 continue;
             }
             let all_required = required
-                .iter()
-                .all(|hits| hits.binary_search_by_key(&doc_idx, |&(d, _)| d).is_ok());
+                .as_ref()
+                .is_none_or(|docs| docs.binary_search(&doc_idx).is_ok());
             if all_required {
                 out.push((doc_idx, score));
             }

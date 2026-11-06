@@ -417,3 +417,19 @@ fn prefix_vocab_is_sorted_unique_ascii_and_one_to_one_with_terms() {
     }
     assert!(idx.approx_prefix_vocab_heap_bytes() > 0);
 }
+
+#[test]
+fn sparse_text_eval_duplicate_filters_are_deduplicated_before_evaluation() {
+    // 同一のフレーズ・除外フレーズ・除外前方一致を大量に並べても、一意化により
+    // 1 回分と同じ結果になる（走査量・中間結果が重複数に比例しない）。
+    let many = |unit: &str| vec![unit; 600].join(" ");
+    assert_eq!(run("\"alpha beta\""), run(&many("\"alpha beta\"")));
+    assert_eq!(
+        run("alpha -\"alpha beta\" -foo*"),
+        run(&format!(
+            "alpha {} {}",
+            many("-\"alpha beta\""),
+            many("-foo*")
+        ))
+    );
+}
