@@ -1128,7 +1128,14 @@ fn try_clone_text(text: &str) -> Result<String, SqlSurfaceError> {
     Ok(out)
 }
 
-fn map_hybrid_error(e: HybridError) -> SqlSurfaceError {
+/// 調整値（重み・`rrf_k`）だけで融合スコアの理論最大値が非有限になるかを返す。
+/// `precision::rrf_normalized` と同じ項別和（和を先に取らない）で評価する。
+fn tuning_overflows(cfg: &hybrid::RrfConfig) -> bool {
+    let denom = cfg.k_const() + 1.0;
+    !(cfg.dense_weight() / denom + cfg.sparse_weight() / denom).is_finite()
+}
+
+fn map_hybrid_error(e: HybridError, cfg: &hybrid::RrfConfig) -> SqlSurfaceError {
     match e {
         HybridError::Sparse(SparseError::QueryTooLong { .. })
         | HybridError::Sparse(SparseError::TooManyQueryTerms { .. }) => {
@@ -1140,9 +1147,11 @@ fn map_hybrid_error(e: HybridError) -> SqlSurfaceError {
             | SparseError::CorpusTooLarge { .. }
             | SparseError::TooManyTokens { .. },
         ) => SqlSurfaceError::payload_too_large("hybrid sparse corpus exceeds capacity"),
-        // 利用者指定の重み・`rrf_k` の極端値でスコアがオーバーフローした場合。入力起因なので
-        // `Internal` ではなく `22000` にする（既定設定ではオーバーフローしない。SEARCH-13）。
-        HybridError::NonFiniteScore => {
+        // 利用者指定の重み・`rrf_k` の極端値で理論最大スコア（各寄与の項別和）自体が
+        // オーバーフローする場合だけ入力起因として `22000` にする（SEARCH-13）。調整値が
+        // 有限な最大値に収まるのに非有限が出た場合は dense/sparse プロバイダ・索引の
+        // 契約違反（NaN/Inf）なので、従来どおり `Internal`（XX000）に倒す。
+        HybridError::NonFiniteScore if tuning_overflows(cfg) => {
             SqlSurfaceError::invalid_input("HYBRID tuning produced a non-finite score")
         }
         _ => SqlSurfaceError::Internal {
@@ -3266,7 +3275,7 @@ pub(crate) fn execute_statement_with_cache_observed(
                                 .collect();
                             let built = SparseIndex::build(&doc_refs)
                                 .map_err(HybridError::Sparse)
-                                .map_err(map_hybrid_error)?;
+                                .map_err(|e| map_hybrid_error(e, &cfg))?;
                             match (sparse_cache_eligible, sparse_cache.as_ref()) {
                                 (true, Some(access)) => {
                                     // `built_generation` はこのクエリの `read_txn`
@@ -3321,7 +3330,7 @@ pub(crate) fn execute_statement_with_cache_observed(
                                 });
                             }
                             let mut fused = hybrid::rrf_fuse(&dense_hits, &[], &cfg)
-                                .map_err(map_hybrid_error)?;
+                                .map_err(|e| map_hybrid_error(e, &cfg))?;
                             fused.truncate(k_eff);
                             fused
                         }
@@ -3333,7 +3342,7 @@ pub(crate) fn execute_statement_with_cache_observed(
                             k_eff,
                             &cfg,
                         )
-                        .map_err(map_hybrid_error)?,
+                        .map_err(|e| map_hybrid_error(e, &cfg))?,
                     };
                     // このクエリで観測された密側再取得ラウンド数を `HnswIndexCache` の
                     // 統計へ反映する（索引経路が一度も使われなかった場合は no-op。
@@ -7132,6 +7141,21 @@ pub(crate) fn map_batch_incremental_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 非有限スコアの写像: 調整値起因は `22000`、プロバイダ起因（調整値は有限）は `XX000`。
+    #[test]
+    fn non_finite_score_maps_by_origin() {
+        let sane = hybrid::RrfConfig::default();
+        assert!(matches!(
+            map_hybrid_error(HybridError::NonFiniteScore, &sane),
+            SqlSurfaceError::Internal { .. }
+        ));
+        let huge = hybrid::RrfConfig::new(1e-300, 1e308, 1e308, 10).expect("cfg");
+        assert!(!matches!(
+            map_hybrid_error(HybridError::NonFiniteScore, &huge),
+            SqlSurfaceError::Internal { .. }
+        ));
+    }
 
     /// Issue #1977・#1991: 未接続の距離種別（L2／L1）は実行入口の関門が `0A000` の固定文言で止め、
     /// 接続済みの Cosine（`<=>`）と NegativeInnerProduct（`<#>`）は通す。

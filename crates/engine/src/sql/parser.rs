@@ -3778,7 +3778,15 @@ pub(crate) fn bind_projection_for_describe(
         &|index| !skip.order_by && !skip.skips_projection_item(index),
     )?;
     check_limit_omission(stmt.limit_implicit, Some(resolved_mode.mode()))?;
-    let _limits = bind_limit_and_offset(stmt, result_limits)?;
+    let (limit, offset, result_cap) = bind_limit_and_offset(stmt, result_limits)?;
+    // Bind と同じ `window` 検査を行い、Describe 成功・Bind 失敗の食い違いを防ぐ。
+    crate::sql::hybrid_tuning::check_window(
+        &ranking,
+        offset.saturating_add(limit),
+        result_cap,
+        result_limits.max_result_rows(),
+        resolved_mode.mode(),
+    )?;
 
     Ok(projection)
 }
