@@ -411,6 +411,53 @@ fn hybrid_matches_sql_order_by_hybrid() {
     assert_eq!(body_utf8(&resp), oracle);
 }
 
+/// SEARCH-17 (4)・Issue #2137: `explain_score: true` は SQL の `hybrid_*()` 投影とバイト単位で
+/// 一致し、省略・`false` は従来の応答と同一。
+#[test]
+fn hybrid_explain_score_matches_sql_projection_and_default_is_unchanged() {
+    let (core, _guard) = new_core_seed();
+    let addr = spawn(Arc::clone(&core));
+
+    let body = br#"{"op":"search","table":"docs","vector":[1.0,0.0],"limit":3,
+        "columns":["id"],"hybrid":{"text":"alpha","explain_score":true}}"#;
+    let resp = query_as_alice(addr, body);
+    assert_eq!(resp.status, 200, "resp={resp:?}");
+    let oracle = sql_oracle_body(
+        &core,
+        "tenant-a",
+        "SELECT id, hybrid_dense_rank(), hybrid_sparse_rank(), hybrid_score() FROM docs \
+         ORDER BY HYBRID(embedding, '[1.0,0.0]', body, 'alpha') LIMIT 3",
+    );
+    assert_eq!(body_utf8(&resp), oracle);
+
+    let plain = br#"{"op":"search","table":"docs","vector":[1.0,0.0],"limit":3,
+        "columns":["id"],"hybrid":{"text":"alpha"}}"#;
+    let off = br#"{"op":"search","table":"docs","vector":[1.0,0.0],"limit":3,
+        "columns":["id"],"hybrid":{"text":"alpha","explain_score":false}}"#;
+    assert_eq!(
+        body_utf8(&query_as_alice(addr, plain)),
+        body_utf8(&query_as_alice(addr, off))
+    );
+}
+
+/// SEARCH-17 (4): 表に同名の列が無くても `columns` 省略（全列）で動き、型違反は 42601 系で拒否される。
+#[test]
+fn hybrid_explain_score_with_all_columns_and_bad_type() {
+    let (core, _guard) = new_core_seed();
+    let addr = spawn(Arc::clone(&core));
+
+    let all = br#"{"op":"search","table":"docs","vector":[1.0,0.0],"limit":3,
+        "hybrid":{"text":"alpha","explain_score":true}}"#;
+    let resp = query_as_alice(addr, all);
+    assert_eq!(resp.status, 200, "resp={resp:?}");
+    assert!(body_utf8(&resp).contains("hybrid_score"));
+
+    let bad = br#"{"op":"search","table":"docs","vector":[1.0,0.0],"limit":3,
+        "columns":["id"],"hybrid":{"text":"alpha","explain_score":1}}"#;
+    let resp = query_as_alice(addr, bad);
+    assert_ne!(resp.status, 200, "resp={resp:?}");
+}
+
 /// SQL-12: `mode: recall`（明示）は SQL `USING MODE 'recall'` と一致する。
 #[test]
 fn mode_recall_explicit_matches_sql_using_mode() {

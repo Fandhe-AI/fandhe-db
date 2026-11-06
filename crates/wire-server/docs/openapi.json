@@ -501,6 +501,9 @@
       "hybrid": {
         "additionalProperties": false,
         "properties": {
+          "explain_score": {
+            "type": "boolean"
+          },
           "text": {
             "type": "string"
           }

@@ -55,6 +55,10 @@ pub(crate) const MAX_ARRAY_LITERAL_BYTES: usize = 4 * 1024 * 1024;
 /// **Issue #1540（SQL-42）で追加した破壊的変更（BREAKING CHANGE）**: `AliasedId` variant を
 /// 追加した（疑似列 `id` への `AS` 別名。値は `Id` と同じ行キーで、結果列名だけが別名）。
 /// 実在列への別名は `Column` の `name` に別名を載せて表す。
+///
+/// **Issue #2137（SEARCH-17）で追加した破壊的変更（BREAKING CHANGE）**: `HybridDetail` variant を
+/// 追加した（ハイブリッド検索の投影で系統別順位・融合スコアを返す引数なし関数）。実行器が融合段で
+/// 退避した系統別順位の対応表から値を引くため、式評価器（`Computed`）では表さない。
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProjectedColumn {
     Id,
@@ -73,6 +77,12 @@ pub enum ProjectedColumn {
         expr: crate::sql::udf_call::BoundExpr,
         ty: crate::sql::udf_call::ExprType,
         result_ty: Option<crate::catalog::ColumnType>,
+    },
+    /// ハイブリッド検索の系統別順位・融合スコア（SEARCH-17・Issue #2137）。`name` は結果列名
+    /// （`AS` 別名、省略時は小文字の関数名）。`Ranking::Hybrid` の検索 SELECT だけが持てる。
+    HybridDetail {
+        name: String,
+        kind: crate::sql::hybrid_detail::HybridDetailKind,
     },
 }
 
@@ -250,6 +260,28 @@ pub(crate) fn check_bound_distance_kind(bound: &BoundStatement) -> Result<(), Sq
         ));
     }
     check_precision_distance_kind(bound.distance_kind(), Some(bound.mode().mode()))
+}
+
+/// `ORDER BY` がハイブリッド関数形（`HYBRID`／`HYBRID_RRF`）か。投影の `hybrid_score()` 等を
+/// 受理してよい文かの束縛段の入口判定（SEARCH-17・Issue #2137）。
+fn order_by_is_hybrid(order_by: &OrderByForm) -> bool {
+    matches!(order_by, OrderByForm::FunctionCall { .. })
+}
+
+/// 投影の `HybridDetail`（SEARCH-17・Issue #2137）がハイブリッド順位付けの文にだけあることを
+/// 検査する。構文段（`parse_select_shape`）が保証するが、`ValidatedStatement::new` を直接使う
+/// 呼び出し元も迂回できないよう束縛段でも守る（多層防御。違反は `42601`）。
+pub(crate) fn check_hybrid_detail(
+    projection: &[ProjectedColumn],
+    ranking: &Ranking,
+) -> Result<(), SqlSurfaceError> {
+    let has_detail = projection
+        .iter()
+        .any(|c| matches!(c, ProjectedColumn::HybridDetail { .. }));
+    if has_detail && !matches!(ranking, Ranking::Hybrid { .. }) {
+        return Err(crate::sql::hybrid_detail::misuse_error());
+    }
+    Ok(())
 }
 
 /// 投影の距離列（SQL-33 (7)・Issue #2007）と距離 `ORDER BY` の整合を検査する。
@@ -2251,7 +2283,14 @@ pub fn bind_projection(
     udfs: &crate::sql::udf_call::UdfRegistry,
     node_budget: &mut usize,
 ) -> Result<Vec<ProjectedColumn>, SqlSurfaceError> {
-    bind_projection_with_literals(projection, schema, udfs, node_budget, &LiteralSkip::NONE)
+    bind_projection_with_literals(
+        projection,
+        schema,
+        udfs,
+        node_budget,
+        &LiteralSkip::NONE,
+        false,
+    )
 }
 
 /// 投影トップレベルの距離列（SQL-33 (7)・Issue #2007）で、ベクトルリテラル側が文字列リテラルの
@@ -2275,6 +2314,7 @@ pub(crate) fn bind_projection_with_literals(
     udfs: &crate::sql::udf_call::UdfRegistry,
     node_budget: &mut usize,
     skip: &LiteralSkip,
+    allow_hybrid_detail: bool,
 ) -> Result<Vec<ProjectedColumn>, SqlSurfaceError> {
     match projection {
         Projection::All => {
@@ -2314,6 +2354,26 @@ pub(crate) fn bind_projection_with_literals(
                         alias: Some(alias),
                     } if !crate::sql::allowlist::is_scalar_subquery_placeholder_name(name) => {
                         cols.push(resolve_projected_column(name, alias, schema)?);
+                    }
+                    // SEARCH-17・Issue #2137: 引数なしの `hybrid_dense_rank()` 等。ハイブリッド検索の
+                    // SELECT 束縛（`allow_hybrid_detail`）だけが受理し、他の束縛（scan・サブクエリ・
+                    // USING PLAN 等）は式評価器へ渡す前に `42601` で拒否する（fail-closed）。
+                    crate::sql::allowlist::SelectItem::Expr {
+                        expr: Expr::Call { name, args },
+                        alias,
+                    } if crate::sql::hybrid_detail::is_hybrid_detail_function_name(name) => {
+                        let kind =
+                            crate::sql::hybrid_detail::HybridDetailKind::from_function_name(name)
+                                .ok_or_else(crate::sql::hybrid_detail::misuse_error)?;
+                        if !allow_hybrid_detail || !args.is_empty() {
+                            return Err(crate::sql::hybrid_detail::misuse_error());
+                        }
+                        cols.push(ProjectedColumn::HybridDetail {
+                            name: alias
+                                .clone()
+                                .unwrap_or_else(|| kind.column_name().to_string()),
+                            kind,
+                        });
                     }
                     crate::sql::allowlist::SelectItem::Expr { expr, alias } => {
                         let skip_literal = skip.skips_projection_item(item_index)
@@ -3604,7 +3664,14 @@ fn bind_in_session_with_policy(
     // （security.md「不安全な設計｜無制限リソース確保（DoS）」対応）。
     let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
 
-    let projection = bind_projection(&stmt.projection, schema, udfs, &mut node_budget)?;
+    let projection = bind_projection_with_literals(
+        &stmt.projection,
+        schema,
+        udfs,
+        &mut node_budget,
+        &LiteralSkip::NONE,
+        order_by_is_hybrid(&stmt.order_by),
+    )?;
 
     let distance_binds_before = crate::sql::udf_call::distance_bind_count();
     let (metadata_filters, expr_filters, rls_predicate_present, or_filters) =
@@ -3621,6 +3688,7 @@ fn bind_in_session_with_policy(
     check_distance_kind(stmt.distance_kind, &stmt.order_by)?;
     check_precision_distance_kind(stmt.distance_kind, Some(resolved_mode.mode()))?;
     check_projected_distance(&projection, &ranking, stmt.distance_kind, &|_| true)?;
+    check_hybrid_detail(&projection, &ranking)?;
 
     check_limit_omission(stmt.limit_implicit, Some(resolved_mode.mode()))?;
     let (limit, offset, result_cap) = bind_limit_and_offset(stmt, result_limits)?;
@@ -3745,8 +3813,14 @@ pub(crate) fn bind_projection_for_describe(
     let resolved_mode = mode::resolve_mode(query_mode, session_mode);
 
     let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
-    let projection =
-        bind_projection_with_literals(&stmt.projection, schema, udfs, &mut node_budget, skip)?;
+    let projection = bind_projection_with_literals(
+        &stmt.projection,
+        schema,
+        udfs,
+        &mut node_budget,
+        skip,
+        order_by_is_hybrid(&stmt.order_by),
+    )?;
 
     let (_metadata_filters, _expr_filters, _rls_predicate_present, _or_filters) =
         bind_where_predicates(
@@ -3777,6 +3851,7 @@ pub(crate) fn bind_projection_for_describe(
         // 投影項目ごとに判定する: `$n` 由来の項目だけ比較を省き、実リテラルの項目は常に検証する。
         &|index| !skip.order_by && !skip.skips_projection_item(index),
     )?;
+    check_hybrid_detail(&projection, &ranking)?;
     check_limit_omission(stmt.limit_implicit, Some(resolved_mode.mode()))?;
     let (limit, offset, result_cap) = bind_limit_and_offset(stmt, result_limits)?;
     // Bind と同じ `window` 検査を行い、Describe 成功・Bind 失敗の食い違いを防ぐ。
@@ -10659,6 +10734,9 @@ fn resolve_order_ordinal<'a>(
         }),
         Some(ProjectedColumn::Id | ProjectedColumn::AliasedId { .. }) => {
             Ok(ResolvedScanOrderKey::Id { descending, nulls })
+        }
+        Some(ProjectedColumn::HybridDetail { .. }) => {
+            Err(crate::sql::hybrid_detail::misuse_error())
         }
         Some(ProjectedColumn::Computed { expr, ty, .. }) => {
             if !windows.is_empty() {

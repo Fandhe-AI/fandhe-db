@@ -9462,6 +9462,12 @@ fn bind_call(
     env: &mut BindEnv<'_>,
     node_budget: &mut usize,
 ) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
+    // SEARCH-17・Issue #2137: ハイブリッド検索の投影最上位以外（WHERE・入れ子の式・ORDER BY 式・
+    // CHECK・DEFAULT 等、この束縛器へ届くすべての位置）での使用は未定義関数（`42883`）に化けさせず
+    // `42601` で拒否する（検索 SELECT の最上位項目は `sql::parser` がこの束縛器より前に処理する）。
+    if crate::sql::hybrid_detail::is_hybrid_detail_function_name(name) {
+        return Err(crate::sql::hybrid_detail::misuse_error());
+    }
     if is_typed_numeric_name(name) {
         // Issue #2799: 変数自身の scale を保つため `CAST ... AS numeric`（scale 16 へ固定）を
         // 通さず、リテラルを正確な Decimal として直接束縛する。raw は subst が Decimal の

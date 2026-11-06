@@ -23847,6 +23847,9 @@ fn parse_select_shape(
     // SQL-33 (7)・Issue #2007: 投影の距離列は距離 `ORDER BY` を持つ検索 SELECT だけが使える。
     // 他の出口（広域取得・`USING PLAN`・HYBRID・関数呼び出し形）は下で一括して `42601` にする。
     let projected_distances = projection_distance_items(&projection);
+    // SEARCH-17・Issue #2137: 投影トップレベルの `hybrid_dense_rank()` 等はハイブリッド検索の
+    // SELECT（深さ 0）だけが使える。他の出口は下で `42601` にする。
+    let has_hybrid_detail = projection_has_hybrid_detail(&projection);
     // Issue #1352: 投影位置のスカラーサブクエリとウィンドウ項目の併用は非対応
     // （ウィンドウ実行は結果列を独自に組み立てるため、合流位置の整合を持たない）。
     if !window_items.is_empty() && !scalar_subquery_items.is_empty() {
@@ -23875,6 +23878,7 @@ fn parse_select_shape(
     // 識別子 `USING` が現れるかどうかだけで両者を衝突なく判定できる。
     if p.peek_ident_matches("USING") {
         reject_projected_distance(&projected_distances)?;
+        reject_hybrid_detail(has_hybrid_detail)?;
         // SQL-30・TASK-214: `USING PLAN` はランキング段を持つ検索 SELECT 専用の
         // 経路で、ウィンドウ項目とは構造上両立しない（§計画 2「対象外」）。
         if !window_items.is_empty() {
@@ -23929,6 +23933,7 @@ fn parse_select_shape(
     // として受理する（`ORDER` 以外の余剰トークンは `expect_end_of_statement` が `42601`）。
     if !matches!(p.peek(), Some(Token::Keyword(Keyword::Order))) {
         reject_projected_distance(&projected_distances)?;
+        reject_hybrid_detail(has_hybrid_detail)?;
         let limit = p.parse_optional_limit()?;
 
         // Issue #916・SQL-25 (b)・TASK-209: `LIMIT n` の直後に任意で `OFFSET m` を
@@ -23992,6 +23997,7 @@ fn parse_select_shape(
 
     if !is_vector_ranking {
         reject_projected_distance(&projected_distances)?;
+        reject_hybrid_detail(has_hybrid_detail)?;
         let scan_keys = p.with_embedded_scalars(|p| p.parse_scalar_order_by())?;
         let (order_by, order_keys) = split_scan_order_keys(scan_keys);
         // Issue #1188: 式キーの `ORDER BY` とウィンドウ関数の併用は非対応（Issue #1189 で
@@ -24070,6 +24076,12 @@ fn parse_select_shape(
     }
     let (order_by, distance_kind) = p.parse_order_by()?;
     check_projected_distance_shape(&projected_distances, &order_by, distance_kind)?;
+    if has_hybrid_detail
+        && (!matches!(order_by, OrderByForm::FunctionCall { .. })
+            || subquery_ctx.is_some_and(|d| d > 0))
+    {
+        return Err(super::hybrid_detail::misuse_error());
+    }
     // Issue #2009・SQL-33 (2): 距離順 `ORDER BY` に限り方向語 `ASC`／`DESC` を 1 つ受理する
     // （文脈語のため大文字小文字非区別）。`NULLS` 句・重複・hybrid 関数形への付与は
     // ここで読まず、後続の `expect_keyword(Limit)` が従来どおり `42601` に落とす。
@@ -24143,6 +24155,29 @@ fn projection_distance_items(projection: &Projection) -> Vec<(lexer::DistanceKin
             _ => None,
         })
         .collect()
+}
+
+/// 投影トップレベルに `hybrid_dense_rank()`／`hybrid_sparse_rank()`／`hybrid_score()`
+/// （SEARCH-17・Issue #2137。引数の有無は束縛段が検査する）の呼び出し項目があるか。
+fn projection_has_hybrid_detail(projection: &Projection) -> bool {
+    let Projection::Items(items) = projection else {
+        return false;
+    };
+    items.iter().any(|item| {
+        matches!(
+            item,
+            SelectItem::Expr { expr: Expr::Call { name, .. }, .. }
+                if super::hybrid_detail::is_hybrid_detail_function_name(name)
+        )
+    })
+}
+
+/// ハイブリッド検索の `ORDER BY` を持たない形に `hybrid_*` 投影があれば `42601` で拒否する。
+fn reject_hybrid_detail(present: bool) -> Result<(), SqlSurfaceError> {
+    if present {
+        return Err(super::hybrid_detail::misuse_error());
+    }
+    Ok(())
 }
 
 /// 距離 `ORDER BY` を持たない形（広域取得・`USING PLAN`・スカラー `ORDER BY`）に投影の距離列が

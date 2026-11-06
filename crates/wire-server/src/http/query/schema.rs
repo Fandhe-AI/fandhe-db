@@ -572,12 +572,21 @@ impl<'a> Validated<'a> {
 /// `hybrid` フィールドのサブスキーマ（`search` op）。
 pub static HYBRID_SCHEMA: ObjectSchema = ObjectSchema {
     name: "hybrid",
-    fields: &[FieldSpec {
-        key: "text",
-        presence: Presence::Required,
-        ty: FieldType::String,
-        nullable: false,
-    }],
+    fields: &[
+        FieldSpec {
+            key: "text",
+            presence: Presence::Required,
+            ty: FieldType::String,
+            nullable: false,
+        },
+        // SEARCH-17 (4)・Issue #2137: 真のとき応答へ系統別順位・融合スコアの 3 列を足す。
+        FieldSpec {
+            key: "explain_score",
+            presence: Presence::Optional,
+            ty: FieldType::Bool,
+            nullable: false,
+        },
+    ],
 };
 
 /// `create_table` の CHECK 述語の葉（`{column, op, value}`）のサブスキーマ
