@@ -1825,4 +1825,6 @@ main に無く現行の `parse_order_by` は `<=>` のみ受理するため、�
 
 **Issue #2141（docs(design): リランカー結線方針 ADR。SEARCH-15 ポインタ。親 #2140）**: [rerank-wiring-policy.md](rerank-wiring-policy.md) を追加し、CLI・件数・期限・縮退・挿入位置を本リポの実装判断として確定した。コード変更なし。後続は #2142〜#2144・#2147。
 
+**Issue #2122（feat(wire): NoSQL search の hybrid 調整キー。NOSQL-2・SEARCH-13 ポインタ。親 #2117。詳細は [hybrid-tuning-parameters.md](hybrid-tuning-parameters.md) §11）**: `HYBRID_SCHEMA` に `k1`・`b`・`rrf_k`・`window`・`weights` を追加し（`HYBRID_WEIGHTS_SCHEMA` を新設）、`search.rs` が `HybridTuning::new` を通して `Ranking::Hybrid.tuning` へ渡す。範囲外は `22000`、未知キー・型や形の不正は `42601`（`window` の非整数を含む）、`window` と precision の併用は `0A000`。engine の変更なし。テスト: schema／search の単体、`nosql2_search_binding`（SQL 名前付き引数との束縛一致）、`nosql2_search`（HTTP 応答の SQL 一致・拒否コード）。OpenAPI ゴールデンと `nosql-api.md` を更新。
+
 **Issue #2129（Phase A のみ。feat(engine): トークナイザにステミング段を追加する。親 #2127・SEARCH-16 ポインタ。詳細は [stemming-crate-adoption.md](stemming-crate-adoption.md)）**: 依存のオーナー承認が未取得のため、ステマー依存・engine の feature・`tokenize_with_options` への設定追加は行っていない。wire-server に専用フラグ `--english-stemmer` を追加し、値の有無にかかわらず固定文言（引数値を含めない）で起動を拒否する（`wire_server::english_stemmer_opt`）。SQL・NoSQL から指定する経路は新設していないため、`0A000` で拒否する対象は存在しない。受入条件の再現率の実測と Phase B（`SparseIndex` への設定固定・CJK 非適用）は承認後に持ち越し。
