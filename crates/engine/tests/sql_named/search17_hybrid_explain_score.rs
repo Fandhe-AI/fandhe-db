@@ -264,9 +264,16 @@ fn search17_misuse_is_rejected_with_42601() {
             .to_string(),
         format!("SELECT id FROM docs WHERE hybrid_score() > 0 {HYBRID}) LIMIT 3"),
         format!("SELECT hybrid_score() + 1 FROM docs {HYBRID}) LIMIT 3"),
-        format!("SELECT hybrid_score(1) FROM docs {HYBRID}) LIMIT 3"),
         format!("SELECT COALESCE(hybrid_dense_rank(), 0) FROM docs {HYBRID}) LIMIT 3"),
     ] {
         assert_eq!(code(&core, &sql), "42601", "{sql}");
     }
+}
+
+/// 引数付きの同名呼び出しは予約対象外（既存 UDF の解決へ回り、未定義なら `42883`）。
+#[test]
+fn search17_call_with_arguments_is_not_reserved() {
+    let (core, _g) = setup("search17-args-not-reserved", false);
+    let sql = format!("SELECT hybrid_score(1) FROM docs {HYBRID}) LIMIT 3");
+    assert_ne!(code(&core, &sql), "42601", "{sql}");
 }

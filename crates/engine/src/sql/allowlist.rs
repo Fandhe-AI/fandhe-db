@@ -24166,8 +24166,8 @@ fn projection_has_hybrid_detail(projection: &Projection) -> bool {
     items.iter().any(|item| {
         matches!(
             item,
-            SelectItem::Expr { expr: Expr::Call { name, .. }, .. }
-                if super::hybrid_detail::is_hybrid_detail_function_name(name)
+            SelectItem::Expr { expr: Expr::Call { name, args }, .. }
+                if args.is_empty() && super::hybrid_detail::is_hybrid_detail_function_name(name)
         )
     })
 }

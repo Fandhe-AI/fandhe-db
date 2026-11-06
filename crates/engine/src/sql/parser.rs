@@ -2355,17 +2355,20 @@ pub(crate) fn bind_projection_with_literals(
                     } if !crate::sql::allowlist::is_scalar_subquery_placeholder_name(name) => {
                         cols.push(resolve_projected_column(name, alias, schema)?);
                     }
-                    // SEARCH-17・Issue #2137: 引数なしの `hybrid_dense_rank()` 等。ハイブリッド検索の
+                    // SEARCH-17・Issue #2137: 引数なしの `hybrid_dense_rank()` 等（引数付きの同名呼び出しは
+                    // 既存 UDF の解決へ回す）。ハイブリッド検索の
                     // SELECT 束縛（`allow_hybrid_detail`）だけが受理し、他の束縛（scan・サブクエリ・
                     // USING PLAN 等）は式評価器へ渡す前に `42601` で拒否する（fail-closed）。
                     crate::sql::allowlist::SelectItem::Expr {
                         expr: Expr::Call { name, args },
                         alias,
-                    } if crate::sql::hybrid_detail::is_hybrid_detail_function_name(name) => {
+                    } if args.is_empty()
+                        && crate::sql::hybrid_detail::is_hybrid_detail_function_name(name) =>
+                    {
                         let kind =
                             crate::sql::hybrid_detail::HybridDetailKind::from_function_name(name)
                                 .ok_or_else(crate::sql::hybrid_detail::misuse_error)?;
-                        if !allow_hybrid_detail || !args.is_empty() {
+                        if !allow_hybrid_detail {
                             return Err(crate::sql::hybrid_detail::misuse_error());
                         }
                         cols.push(ProjectedColumn::HybridDetail {

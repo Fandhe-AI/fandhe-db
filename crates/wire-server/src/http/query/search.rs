@@ -152,6 +152,7 @@ pub enum BoundSearch {
 /// [`bind_search`] の失敗を表す。いずれも [`ClassifiedError`] を実装し
 /// `wire_code`／`client_message` を経由して HTTP エラー応答へ射影される。
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum SearchError {
     /// [`super::schema::Validated`] アクセサの型・キー不一致（`42601`）。
     Shape(SchemaError),
@@ -505,7 +506,7 @@ pub fn bind_search_with_metric_resolver(
                 // 系統別順位・融合スコアの 3 列を足す（SQL の `hybrid_*()` と同じ値・型）。省略／
                 // `false` は従来の応答と同一。表に同名の列があれば `42601`（`columns` 省略時も検査）。
                 if matches!(hybrid_obj.get("explain_score"), Some(JsonValue::Bool(true))) {
-                    append_explain_score_columns(&mut projection)?;
+                    append_explain_score_columns(&mut projection, schema)?;
                 }
                 Ranking::Hybrid {
                     query,
@@ -572,21 +573,28 @@ pub fn bind_search_with_metric_resolver(
 /// [`SearchError::ExplainScoreColumnConflict`]。
 fn append_explain_score_columns(
     projection: &mut Vec<engine::sql::parser::ProjectedColumn>,
+    schema: &TableSchema,
 ) -> Result<(), SearchError> {
     use engine::sql::hybrid_detail::HybridDetailKind;
     use engine::sql::parser::ProjectedColumn;
-    let conflicts = projection.iter().any(|col| {
-        let name = match col {
-            ProjectedColumn::Column { name, .. } | ProjectedColumn::AliasedId { name } => name,
-            ProjectedColumn::Computed { name, .. } | ProjectedColumn::HybridDetail { name, .. } => {
-                name
-            }
-            ProjectedColumn::Id => return false,
-        };
+    // 表の全列（投影に含めない列も）と同名なら拒否する。
+    let schema_conflicts = schema.columns.iter().any(|c| {
         HybridDetailKind::ALL
             .iter()
-            .any(|k| name.eq_ignore_ascii_case(k.column_name()))
+            .any(|k| c.name.eq_ignore_ascii_case(k.column_name()))
     });
+    let conflicts = schema_conflicts
+        || projection.iter().any(|col| {
+            let name = match col {
+                ProjectedColumn::Column { name, .. } | ProjectedColumn::AliasedId { name } => name,
+                ProjectedColumn::Computed { name, .. }
+                | ProjectedColumn::HybridDetail { name, .. } => name,
+                ProjectedColumn::Id => return false,
+            };
+            HybridDetailKind::ALL
+                .iter()
+                .any(|k| name.eq_ignore_ascii_case(k.column_name()))
+        });
     if conflicts {
         return Err(SearchError::ExplainScoreColumnConflict);
     }
@@ -862,12 +870,23 @@ mod tests {
             index: 0,
             name: "Hybrid_Score".to_string(),
         }];
-        let err = append_explain_score_columns(&mut clash).expect_err("must conflict");
+        let err = append_explain_score_columns(&mut clash, &schema()).expect_err("must conflict");
         assert_eq!(err.error_class(), ErrorClass::UnsupportedSqlSyntax);
         assert!(!err.client_message().contains("Hybrid_Score"));
         let mut ok = vec![ProjectedColumn::Id];
-        append_explain_score_columns(&mut ok).expect("no conflict");
+        append_explain_score_columns(&mut ok, &schema()).expect("no conflict");
         assert_eq!(ok.len(), 4);
+        // 投影に含めない列（`columns: ["id"]`）でも、表の列が同名なら拒否する。
+        let with_col = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(4), false),
+                ColumnDef::new("hybrid_score", ColumnType::Text, false),
+            ],
+        );
+        let mut id_only = vec![ProjectedColumn::Id];
+        let err = append_explain_score_columns(&mut id_only, &with_col).expect_err("schema clash");
+        assert_eq!(err.error_class(), ErrorClass::UnsupportedSqlSyntax);
     }
 
     fn schema() -> TableSchema {
