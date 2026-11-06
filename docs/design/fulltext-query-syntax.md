@@ -128,11 +128,16 @@
 - 単独の語 `or` を含む入力は、演算子として認識されるか捨てられるかを問わず後方互換の対象外とする（従来の tokenizer が生成していた語 `or` は残らない）。`or` を語として検索するには引用符で囲む（D1）
 - 演算子を意図していなくても結果が変わる入力: 先頭の `-5`、空白の後の `-x`、単独の語 `or`（`or`・`or a`・`a or` のように捨てられる位置を含む）、語末の `*`、閉じていない `"`
 - #2111 の「同一結果」の基準は上の定義の範囲で検証する
+- 実装（#2116）: `hybrid::hybrid_search_with_text_query`（`pub(crate)`）が疎側だけを `score_text_query_within` に差し替える。公開の `hybrid_search`／`hybrid_search_boosted`／`hybrid_search_with_bm25` は構文を解釈せず意味・結果とも不変。演算子を含まない検索語の一致は単体テスト（`hybrid::tests`）と結合テストで固定した
+- 縮退経路の挙動変更（#2116）: 可視行に本文が 1 件もなく疎索引を作れない文でも、データに依存しない検査（バイト長・一意語数 `22000`、項数・フレーズ長 `54000`）は行う。結果が表の内容次第で受理／拒否に変わらないようにするため（fail-closed）。従来は成功していた上限超過の検索語がこの経路で拒否される。展開数（データ依存）は可視集合が空なら評価されない
 
 ### D9 USING PLAN の経路
 
 - `expanded_query_text` は LLM 出力の `search_terms` を疎側の検索語へ連結する。ここに構文を適用すると、出力中の `-` や `"` で意味が変わり、プロンプトインジェクションでフィルタを操作できる
 - 既定ではこの経路に構文を適用せず、すべて通常語（リテラル）として扱う。EXPLAIN の `search_terms` への反映は #2116 へ申し送る
+- 実装（#2116）: `BoundStatement` の crate 内部フィールド `hybrid_text_syntax`（`WebSearch`／`Literal`）で切り替える。SQL の `HYBRID` と NoSQL の `hybrid.text` は既定の `WebSearch`、`USING PLAN`（`sql::using_plan::bind_expansion`）と NoSQL の `plan` 検索（`core.rs`）は `Literal` で、`Literal` は従来の `hybrid_search_with_bm25`（構文を解釈しない）を呼ぶ。公開 enum `Ranking::Hybrid` にはフィールドを足さない
+- EXPLAIN の判断（#2116）: `search_terms[i]` 行は `USING PLAN` の EXPLAIN にだけ出る。`USING PLAN` の疎側は `search_terms` を literal として実行するため、行に出る語の並びがそのまま実行時の解釈であり、構文の解釈結果を示す行は出さない（EXPLAIN の出力は 1 バイトも変えない）。構文の解釈結果を示す新しい行は新しい安定契約になるため、オーナー判断が要る将来の候補として残す
+- 上限の配線（#2116）: `TextQueryLimits` は `EngineCore::run_select_plan` から `sql::exec` へ引数で明示的に渡す（暗黙のスレッドローカルにしない。張り忘れによる既定値への fail-open を避ける）
 
 ### D10 近接演算子
 
@@ -177,7 +182,7 @@ D8 のとおり。演算子を含まない入力の結果は従来と一致し�
 | #2113 | 木の形（グループ、フィルタ／任意語／除外／前方一致の各ノード）・D1／D3 の字句規則・線形時間・上限の引き継ぎ（D7 の上限検証を通過した入力では構文不正でエラーにしない。上限超過は検証側で Err） |
 | #2114 | D4 の位置モデル・メモリ増の実測記録・世代キャッシュの経路（実装済み。実測は [sparse-inverted-index.md](sparse-inverted-index.md) の「位置付き posting」。キャッシュのキー・無効化は無変更） |
 | #2115 | D2／D5／D6／D7（実装済み。評価は `sparse::text_eval`、上限は `text_query_limits`。順序付き語彙、可視 df による展開数の計数、54000 への写像、CLI 名、同点は id 昇順の決定性。ADR の 22000／54000 の移管は未決のまま） |
-| #2116 | D8／D9・SQL と NoSQL のパリティ・EXPLAIN の `search_terms` |
+| #2116 | D8／D9・SQL と NoSQL のパリティ・EXPLAIN の `search_terms`（実装済み。SQL／NoSQL の疎側は構文を解釈、`USING PLAN` は literal、EXPLAIN は無変更。22000／54000 の移管は未決のまま） |
 
 ## 9. スコープ外
 

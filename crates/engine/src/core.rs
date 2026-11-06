@@ -1473,8 +1473,8 @@ pub struct EngineCore {
     /// [`crate::regex_match::CompiledRegex::compile`] へ渡す。
     regex_limits: crate::regex_limits::RegexLimits,
     /// 全文検索クエリ評価の項数・前方一致展開数の上限（Issue #2115・SEARCH-12 ポインタ）。
-    /// 差し替えは [`Self::with_text_query_limits`] のみ（起動時 1 回）。SQL / NoSQL 表層からの
-    /// 読み出し配線は後続 Issue（#2116）で、現状は保持のみ。
+    /// 差し替えは [`Self::with_text_query_limits`] のみ（起動時 1 回）。`run_select_plan` が
+    /// SQL の `HYBRID`／NoSQL の `hybrid.text` の実行（`sql::exec`）へ引数で渡す（Issue #2116）。
     text_query_limits: crate::text_query_limits::TextQueryLimits,
     /// `SPARSEVEC(N)` 書き込み経路の非ゼロ要素数上限（Issue #2027・TABLE-47 (2) ポインタ）。
     /// 差し替えは [`Self::with_sparsevec_limits`] のみ（起動時 1 回）。束縛クロージャを呼ぶ区間と
@@ -13402,6 +13402,9 @@ impl EngineCore {
                 declarations_enabled: self.hnsw_state.is_some(),
             }),
             &self.text_analysis,
+            // Issue #2116: 全文検索クエリの上限は引数で明示的に渡す（スレッドローカル等の
+            // 暗黙経路にしない。張り忘れによる既定値への fail-open を避ける）。
+            &self.text_query_limits,
         )
     }
 
@@ -13785,6 +13788,8 @@ impl EngineCore {
                     distance_kind: crate::sql::lexer::DistanceKind::Cosine,
                     result_cap: None,
                     dense_source: crate::arena::DenseSource::EmbeddingSlot,
+                    // D9: `plan` 検索の LLM 出力 `search_terms` は literal として扱う。
+                    hybrid_text_syntax: crate::sql::hybrid_tuning::HybridTextSyntax::Literal,
                 })
             },
         )
@@ -21842,6 +21847,7 @@ mod tests {
             None,
             None,
             &core.text_analysis,
+            &crate::text_query_limits::TextQueryLimits::default(),
         )
         .expect("execute_statement should succeed");
         let row = result

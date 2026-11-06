@@ -196,6 +196,11 @@ pub struct BoundStatement {
     /// （`VECTOR` 列）で、`HALFVEC` 列への距離演算子形 kNN の Ann 経路
     /// （[`bind_halfvec_ann`]）だけが `HalfVecColumn` を立てる。`sql::exec` が arena 構築へ渡す。
     pub(crate) dense_source: crate::arena::DenseSource,
+    /// `Ranking::Hybrid` の検索語を構文として解釈するか（Issue #2116・SEARCH-12 のポインタ）。
+    /// 既定は `WebSearch`（SQL の `HYBRID`・NoSQL の `hybrid.text`）。`USING PLAN` が LLM 出力の
+    /// `search_terms` を連結した検索語だけが `Literal` を立てる（設計記録
+    /// `docs/design/fulltext-query-syntax.md` D9）。`Hybrid` 以外の ranking では意味を持たない。
+    pub(crate) hybrid_text_syntax: crate::sql::hybrid_tuning::HybridTextSyntax,
 }
 
 /// `LIMIT` 省略（暗黙上限）の距離順 SELECT と取得モードの整合を検査する（Issue #2242）。
@@ -390,6 +395,7 @@ impl BoundStatement {
             distance_kind: crate::sql::lexer::DistanceKind::Cosine,
             result_cap: None,
             dense_source: crate::arena::DenseSource::EmbeddingSlot,
+            hybrid_text_syntax: crate::sql::hybrid_tuning::HybridTextSyntax::default(),
         }
     }
 
@@ -3749,6 +3755,7 @@ fn bind_in_session_with_policy(
             DenseColumnPolicy::VectorOnly => crate::arena::DenseSource::EmbeddingSlot,
             DenseColumnPolicy::HalfVecForAnn => crate::arena::DenseSource::HalfVecColumn,
         },
+        hybrid_text_syntax: crate::sql::hybrid_tuning::HybridTextSyntax::default(),
     })
 }
 
