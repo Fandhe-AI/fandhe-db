@@ -4,7 +4,7 @@
 - 対応 Issue: #2112（親 #2111。後続 #2113・#2114・#2115・#2116）
 - ビヘイビア ID ポインタ: SEARCH-12（`docs/spec/04-behavior/search.md`）。前提として SEARCH-5・SEARCH-11 を参照する。
   契約本文は spec を正とし、本書へは転記しない
-- 関連コード: `crates/engine/src/sparse.rs`（`tokenize_with_options`・`TermDictionary`・`postings`・`search_within`・
+- 関連コード: `crates/engine/src/sparse/text_query.rs`（`parse_text_query`。Issue #2113）・`crates/engine/src/sparse.rs`（`tokenize_with_options`・`TermDictionary`・`postings`・`search_within`・
   `MAX_QUERY_TERMS`・`MAX_QUERY_BYTES`・`validate_query_bounds`）・`crates/engine/src/hybrid.rs`・
   `crates/engine/src/sql/exec.rs`（`map_hybrid_error`）・`crates/engine/src/sql/using_plan.rs`（`expanded_query_text`）・
   `crates/engine/src/query_planner.rs`（`search_terms`）

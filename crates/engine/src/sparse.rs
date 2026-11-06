@@ -69,6 +69,8 @@
 //!
 //! 一致スパン（バイトオフセット）算出は子モジュール [`match_span`]（Issue #2124・
 //! SEARCH-14 ポインタ）が担い、同じ分割規則（`walk_tokens`）を共有する。
+//! 検索語の構文（フレーズ・`or`・除外・前方一致）の解析は子モジュール [`text_query`]
+//! （Issue #2113・SEARCH-12 ポインタ）が担う。
 //!
 //! untrusted 入力の扱い: すべての処理を入力長に対して線形に保つ（バイグラム生成含む）。
 //! `Vec::with_capacity` は入力を `chars()` で数えた実際の文字数からのみ見積もる。
@@ -101,6 +103,7 @@ const DEFAULT_K1: f64 = 1.2;
 const DEFAULT_B: f64 = 0.75;
 
 pub mod match_span;
+pub mod text_query;
 
 /// [`SparseIndex::search`] が受け付けるクエリの一意語数の上限。
 ///
