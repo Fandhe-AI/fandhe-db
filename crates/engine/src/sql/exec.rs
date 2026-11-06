@@ -27,6 +27,11 @@
 //! `hits` は [`crate::rls::RlsVerifiedHits`]（witness 型）としてのみ投影段へ渡り、
 //! 生の `Vec<(u64, f64)>` から投影へ到達する経路は型として存在しない。
 //!
+//! リランク段（Issue #2142・SEARCH-15。`sql::rerank_stage`）は、`EngineCore::with_rerank` で
+//! 有効化された起動時設定のときだけ、`Ranking::Hybrid`（recall モード）の文について、
+//! 事後 SCALAR フィルタと PRECISION ゲートの後・`RlsSafetyNet::apply` の前で窓内の候補を
+//! 並べ替える。off では段自体を通らず、従来の段構成と結果は変わらない。
+//!
 //! `core.rs::EngineCore::execute_sql`（TASK-75 で追加する固有メソッド。`VectorCore`
 //! trait は不変）からのみ呼ばれる想定で、`Storage`・`SearchProvider`・`PolicyContext`
 //! を束ねる。
@@ -1259,6 +1264,7 @@ pub(crate) fn execute_statement_with_cache(
     hnsw_cache: Option<crate::sql::hnsw_cache::HnswCacheAccess<'_>>,
     scalar_cache: Option<crate::sql::scalar_index::ScalarCacheAccess<'_>>,
     text_analysis: &Arc<crate::sparse::TextAnalysis>,
+    rerank: Option<crate::sql::rerank_stage::RerankAccess<'_>>,
 ) -> Result<QueryResult, SqlSurfaceError> {
     execute_statement_with_cache_observed(
         read_txn,
@@ -1272,6 +1278,7 @@ pub(crate) fn execute_statement_with_cache(
         hnsw_cache,
         scalar_cache,
         text_analysis,
+        rerank,
         None,
     )
 }
@@ -1294,6 +1301,7 @@ pub(crate) fn execute_statement_with_cache_observed(
     hnsw_cache: Option<crate::sql::hnsw_cache::HnswCacheAccess<'_>>,
     scalar_cache: Option<crate::sql::scalar_index::ScalarCacheAccess<'_>>,
     text_analysis: &Arc<crate::sparse::TextAnalysis>,
+    rerank: Option<crate::sql::rerank_stage::RerankAccess<'_>>,
     mut stats: Option<&mut ExecStats>,
 ) -> Result<QueryResult, SqlSurfaceError> {
     // SQL 実行経路に未接続の距離演算子（L2／L1）は、行ポリシー解決・ストレージ読み取りより前に
@@ -1338,6 +1346,18 @@ pub(crate) fn execute_statement_with_cache_observed(
     // ドキュメント参照。TASK-76・SQL-7）。RLS 安全網はこの構造体に分岐用の
     // フィールドを持たせず、下記で無条件に呼び出す。
     let plan = ExecutionPlan::from_evaluation_order(bound.evaluation_order);
+
+    // Issue #2142・SEARCH-15（設計記録 `docs/design/rerank-wiring-policy.md` D3）: リランクを
+    // 実際に走らせるのは「設定が有効・`Ranking::Hybrid`・recall モード」の文だけ。密のみ
+    // （`Ranking::Distance`）の lexical と precision は文の形で決まる「適用外」で、素通しする
+    // （off と同じ結果。拒否もログも出さない）。off（`rerank == None`）はこの判定の外で、
+    // 以降の追加処理は一切走らない。
+    let rerank_hybrid: Option<crate::sql::rerank_stage::RerankAccess<'_>> =
+        match (&rerank, &bound.ranking) {
+            (Some(r), Ranking::Hybrid { .. }) if !is_precision => Some(*r),
+            _ => None,
+        };
+    let rerank_fetch_window: Option<usize> = rerank_hybrid.map(|r| r.settings.window());
 
     // RLS 段（無条件）+ SCALAR 段（同一走査の行フック。`plan.scalar_prefilter` が
     // `false` の場合はここでは等価条件を判定せず、DISTANCE 段の後で事後適用する）。
@@ -3210,12 +3230,21 @@ pub(crate) fn execute_statement_with_cache_observed(
                     tuning,
                 } => {
                     let cfg = crate::sql::hybrid_tuning::hybrid_rrf_config(tuning, k_eff)?;
+                    // Issue #2142・D4: リランク窓のため融合済みリストの先頭 `max(k_eff, W)` 件を
+                    // 取る。RRF 設定（`pool_depth` 等）は常に外側の `k_eff` から作り、候補生成は
+                    // off と同一のまま取得件数だけを広げる（`hybrid_search_inner` は `k` を
+                    // `InvalidK` 判定と最後の `truncate` にしか使わないため、先頭 `k_eff` 件は
+                    // off と一致する）。上限は融合リスト長に当たる `pool_depth`。
+                    let k_fetch = match rerank_fetch_window {
+                        Some(w) => k_eff.max(w).min(cfg.pool_depth()).max(k_eff),
+                        None => k_eff,
+                    };
                     let input = SearchInput {
                         ids: &slot_ids,
                         vectors: arena.vectors(),
                         dim: arena.dim(),
                         query,
-                        k: k_eff,
+                        k: k_fetch,
                     };
                     // Issue #410: hybrid 密側の再取得ループ（下記の密のみ縮退経路・
                     // `hybrid::hybrid_search` の両方）へ HNSW を結線するアダプタ。
@@ -3362,7 +3391,7 @@ pub(crate) fn execute_statement_with_cache_observed(
                             }
                             let mut fused = hybrid::rrf_fuse(&dense_hits, &[], &cfg)
                                 .map_err(|e| map_hybrid_error(e, &cfg))?;
-                            fused.truncate(k_eff);
+                            fused.truncate(k_fetch);
                             fused
                         }
                         Some(idx) => {
@@ -3379,7 +3408,7 @@ pub(crate) fn execute_statement_with_cache_observed(
                                 input,
                                 idx,
                                 query_text,
-                                k_eff,
+                                k_fetch,
                                 &cfg,
                                 bm25,
                             )
@@ -3513,6 +3542,17 @@ pub(crate) fn execute_statement_with_cache_observed(
     // DISTANCE 段の直後の確認点（Issue #1953。上の直前確認と対）。
     crate::interrupt::current_deadline().check()?;
 
+    // Issue #2142・D6: 縮退したとき off と同一の列へ戻すため、事後 SCALAR フィルタの**前**に
+    // 「off が返したはずの先頭 `k_eff` 件」のスロット集合を控える。事後フィルタは順序を保つ
+    // 行単位の判定なので、off の結果は「フィルタ後の列のうち、この集合に属する行」と一致する。
+    // リランクが無効（`rerank_hybrid == None`）では何も確保しない。
+    let rerank_off_prefix: Option<HashSet<u64>> = rerank_hybrid.map(|_| {
+        hits.iter()
+            .take(k_eff)
+            .map(|h| h.0)
+            .collect::<HashSet<u64>>()
+    });
+
     // SCALAR 事後フィルタ（DISTANCE 先行時のみ。TASK-76・SQL-7）。`on_visible_row` は
     // `plan.scalar_prefilter == false` の間、等価条件を判定せず可視行を通過させて
     // いるため、ここで `postfilter_verdicts`（`on_visible_row` が生の
@@ -3623,6 +3663,51 @@ pub(crate) fn execute_statement_with_cache_observed(
             None,
         );
     }
+
+    // リランク段（Issue #2142・SEARCH-15。設計記録 `docs/design/rerank-wiring-policy.md`
+    // D3・D4・D6）。事後 SCALAR フィルタと precision ゲート（precision ではリランクしない）の
+    // **後**・`RlsSafetyNet::apply` の**前**に置く。候補は `ImplicitRlsHook` で RLS 適用済みの
+    // アリーナ由来の可視行だけで、窓内の行テキストはこの場で（キャッシュのヒット・ミスに
+    // 関わらず）認可済みの行から都度読む。契約違反・上限超過は縮退（off と同一の列へ戻す）で、
+    // 検索全体は拒否しない。`statement_timeout`／キャンセルは 57014 が優先で縮退にしない。
+    // 安全網・`OFFSET`・`LIMIT` 省略時の上限判定は従来どおり以降で無条件に適用される。
+    let hits: Vec<(u64, f64)> = match (rerank_hybrid, &bound.ranking, rerank_off_prefix.as_ref()) {
+        (
+            Some(access),
+            Ranking::Hybrid {
+                query_text,
+                text_column_index: rerank_text_column,
+                ..
+            },
+            Some(off_prefix),
+        ) => {
+            crate::interrupt::current_deadline().check()?;
+            let snapshot_metadata = if defer_projection || mask_trusted_defer {
+                cache_hit_snapshot.as_ref().map(|s| s.metadata())
+            } else {
+                None
+            };
+            let src = crate::sql::rerank_stage::StageSource {
+                read_txn,
+                schema,
+                table: &bound.table,
+                arena,
+                snapshot_metadata,
+                text_column_index: *rerank_text_column,
+                query_text,
+            };
+            let out = crate::sql::rerank_stage::run_stage(access, &src, hits, k_eff, off_prefix);
+            crate::interrupt::current_deadline().check()?;
+            out
+        }
+        _ => {
+            // 設定は有効だが文の形（密のみ・precision）により適用外。素通しして件数だけ数える。
+            if let Some(access) = &rerank {
+                access.counters.record_not_applicable();
+            }
+            hits
+        }
+    };
 
     // RLS 実行時安全網（TASK-136・RLS-5）。`HINT ORDER` の内容に関係なく常に適用する
     // （モジュールドキュメント参照）。`ExecutionPlan` にはこの適用を分岐させる
@@ -3782,6 +3867,8 @@ pub fn execute_statement(
         // 公開ラッパーは既定のテキスト処理（恒等）。ストップワード・同義語は
         // `EngineCore::with_text_analysis` 経由でのみ有効になる（Issue #2130）。
         &Arc::new(crate::sparse::TextAnalysis::default()),
+        // 公開ラッパーはリランクしない（`EngineCore::with_rerank` 経由でのみ有効。Issue #2142）。
+        None,
     )
 }
 

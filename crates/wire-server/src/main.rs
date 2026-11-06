@@ -15,6 +15,7 @@
 //! [--hnsw-sparse-visited-max <N>]
 //! [--auth-method cleartext|scram-sha-256] [--scram-mock-key-file <path>]
 //! [--stopwords-file <path>] [--synonyms-file <path>]
+//! [--reranker off|lexical] [--rerank-window <N>]
 //! [--ddl-allowed-users <user1>[,<user2>...]]
 //! [--tls-cert <pem> --tls-key <pem> [--tls-mode require|allow]
 //!  [--tls-scram-channel-binding enable|disable]]
@@ -383,6 +384,15 @@
 //! 1 回だけ注入する（セッション・SQL・HTTP からは変更できない）。未指定時は従来どおり
 //! （`docs/design/stopword-synonym-files.md` 参照）。
 //!
+//! `--reranker <off|lexical|mmr|cross_encoder>`／`--rerank-window <N>`（Issue #2142・SEARCH-15
+//! ポインタ）: ハイブリッド検索の後段のリランカーと、リランク対象の窓幅 `W`（`1..=10000`、
+//! 既定 200）。既定は `off`（従来経路。結果もレイテンシも変わらない）。`mmr`・`cross_encoder` は
+//! 語彙としては正しいが本ビルドでは未対応で、固定文言の起動エラーにする。語彙外・範囲外・非数値・
+//! 重複指定・`off` のままの `--rerank-window` も fail-closed で起動エラー。リランカーの契約違反は
+//! 検索を拒否せずリランキング前の順位で応答し、縮退は実行ログとカウンタに残る。解決は
+//! `wire_server::rerank_opt::resolve` に一本化し、`EngineCore::with_rerank` へ 1 回だけ注入する
+//! （`docs/design/rerank-wiring-policy.md` 参照）。
+//!
 //! `--english-stemmer`（Issue #2129 Phase A・SEARCH-16 ポインタ）: 依存の承認と engine の
 //! feature 有効化の前は未提供。値の有無にかかわらず固定文言で起動エラーにする
 //! （`wire_server::english_stemmer_opt`。`docs/design/stemming-crate-adoption.md` 参照）。
@@ -590,6 +600,8 @@ fn run_server(args: &[String]) -> ExitCode {
     let mut scram_mock_key_file_raw: Option<PathBuf> = None;
     let mut stopwords_file_raw: Option<PathBuf> = None;
     let mut synonyms_file_raw: Option<PathBuf> = None;
+    let mut reranker_raw: Option<String> = None;
+    let mut rerank_window_raw: Option<String> = None;
     let mut tls_cert_raw: Option<PathBuf> = None;
     let mut tls_key_raw: Option<PathBuf> = None;
     let mut tls_mode_raw: Option<String> = None;
@@ -1890,6 +1902,44 @@ fn run_server(args: &[String]) -> ExitCode {
                 synonyms_file_raw = Some(PathBuf::from(v));
                 i += 2;
             }
+            wire_server::rerank_opt::RERANKER_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires an argument",
+                        wire_server::rerank_opt::RERANKER_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // 起動後に変更できない構成値のため、2 回目以降の指定は fail-closed で拒否する
+                // （last-wins にしない。Issue #2142）。
+                if reranker_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::rerank_opt::RERANKER_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                reranker_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::rerank_opt::RERANK_WINDOW_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires an integer argument",
+                        wire_server::rerank_opt::RERANK_WINDOW_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                if rerank_window_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::rerank_opt::RERANK_WINDOW_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                rerank_window_raw = Some(v.clone());
+                i += 2;
+            }
             wire_server::tls_opt::CERT_FLAG => {
                 let Some(v) = args.get(i + 1) else {
                     engine::log_stderr!(
@@ -2270,6 +2320,21 @@ fn run_server(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    // Issue #2142（SEARCH-15 ポインタ）: リランカーの方式・窓幅を bind・ユーザーストア読込より
+    // 前に解決する（fail-closed。語彙外・未対応・範囲外・`off` のままの窓幅指定は listen へ
+    // 進まず起動エラー）。未指定は off＝従来経路。
+    let rerank_settings =
+        match wire_server::rerank_opt::resolve(wire_server::rerank_opt::RerankRawFlags {
+            reranker: reranker_raw.as_deref(),
+            window: rerank_window_raw.as_deref(),
+        }) {
+            Ok(s) => s,
+            Err(e) => {
+                engine::log_stderr!("wire-server: invalid rerank configuration: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
 
     // Issue #1552: サブクエリ深さ・実行回数・CTE 定義数・CTE 連鎖深さの上限を bind・
     // ユーザーストア読込より前に解決する（fail-closed。範囲外・非数値は listen へ進まず
@@ -2922,6 +2987,9 @@ fn run_server(args: &[String]) -> ExitCode {
     core = core.with_sparsevec_limits(sparsevec_limits);
     // Issue #2130: 疎検索のストップワード・同義語（セッション・SQL からは変更できない）。
     core = core.with_text_analysis(text_analysis);
+    // Issue #2142: リランカー（セッション・SQL・NoSQL からは変更できない）。未指定でも常に
+    // 呼ぶ（既定は off で、未注入と挙動が同一）。
+    core = core.with_rerank(rerank_settings);
     // Issue #1552: 未指定でも常に呼ぶ（`nesting_limits` は既定まで解決済み。既定は
     // ハード上限と同値で、未注入と挙動が同一）。
     core = core.with_nesting_limits(nesting_limits);

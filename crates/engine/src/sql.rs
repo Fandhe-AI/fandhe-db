@@ -300,6 +300,7 @@ pub(crate) mod regex_op;
 pub mod relation;
 pub(crate) mod relation_name;
 pub mod relation_snapshot;
+pub(crate) mod rerank_stage;
 pub mod returning;
 pub mod row_lock;
 pub(crate) mod row_policy;

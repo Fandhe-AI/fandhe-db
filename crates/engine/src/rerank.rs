@@ -47,14 +47,14 @@ const MAX_QUERY_TEXT_BYTES: usize = 16 * 1024;
 /// 別途上限があるため、この上限と合わせて候補側の走査・アロケーションコストの総量を
 /// 有界に保つ（[`MAX_CANDIDATE_TEXT_BYTES`] は 1 件あたり、[`MAX_POOL_DEPTH`] は件数の
 /// 上限で、互いに独立な検証のため両方が必要）。
-const MAX_CANDIDATE_TEXT_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_CANDIDATE_TEXT_BYTES: usize = 1024 * 1024;
 
 /// 候補テキスト（`RerankCandidate::text`）の合計バイト長上限。`sparse.rs::MAX_CORPUS_BYTES`
 /// と同じ理由: [`MAX_CANDIDATE_TEXT_BYTES`]（1 件あたり）・[`MAX_POOL_DEPTH`]（件数）は
 /// それぞれ独立な上限のため、両方の上限値ちょうどの入力（1 MiB × 10,000 件 ≈ 10 GiB）を
 /// 同時に許すと `tokenize()` の総コストが無制限に近い規模へ増幅しうる（CPU DoS）。
 /// `sparse.rs` の値をそのまま踏襲する。
-const MAX_TOTAL_CANDIDATE_TEXT_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_TOTAL_CANDIDATE_TEXT_BYTES: usize = 64 * 1024 * 1024;
 
 /// リランク対象の候補 1 件（[`crate::hybrid::HybridHit`] から融合スコアと文書テキストを
 /// 添えて渡す入力表現）。`text` はリランカーの素性計算専用であり、SQL・プラン文字列の
@@ -986,6 +986,289 @@ impl<B: CrossEncoderBackend> Reranker for CrossEncoderReranker<B> {
 // 追加で利用可能になる）。
 #[cfg(feature = "cross-encoder")]
 pub mod cross_encoder_onnx;
+
+// ---------------------------------------------------------------------------
+// 検索実行器への結線用の設定・統計型（Issue #2142。設計記録:
+// `docs/design/rerank-wiring-policy.md`。ビヘイビア: SEARCH-15 をポインタで参照）
+// ---------------------------------------------------------------------------
+
+/// `--rerank-window` の既定値。`RerankConfig::default()`・ハイブリッド既定 pool と揃える。
+pub const DEFAULT_RERANK_WINDOW: usize = 200;
+
+/// リランク窓の幅 `W` を検証する（`1..=MAX_POOL_DEPTH`）。wire-server の起動引数検証
+/// （`rerank_opt`）から呼ばれ、範囲の判定を engine 側に一本化する（`MAX_POOL_DEPTH` は
+/// 非公開のまま。`validate_statement_timeout_ms` と同形）。範囲外は
+/// [`RerankError::InvalidConfig`]（fail-closed）。
+pub fn validate_rerank_window(window: usize) -> Result<usize, RerankError> {
+    if window == 0 || window > MAX_POOL_DEPTH {
+        return Err(RerankError::InvalidConfig);
+    }
+    Ok(window)
+}
+
+/// 検索実行器に結線するリランク方式。`EngineCore::with_rerank` で起動時に 1 回だけ注入
+/// する（セッション・SQL・NoSQL からは変更できない。ADR D1）。`Identity`・`Custom` は
+/// Rust API 専用で CLI からは到達できない。
+#[derive(Clone, Default)]
+#[non_exhaustive]
+pub enum RerankMethod {
+    /// リランクしない（既定。従来経路をそのまま通る）。
+    #[default]
+    Off,
+    /// 恒等リランカー（テスト用。順位を変えない）。
+    Identity,
+    /// 字句一致リランカー（`--reranker lexical`）。
+    Lexical(LexicalOverlapReranker),
+    /// 任意のリランカー（契約違反の注入テスト用。出力は実行器が検証する）。
+    Custom(std::sync::Arc<dyn Reranker>),
+}
+
+impl fmt::Debug for RerankMethod {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.kind_name())
+    }
+}
+
+impl RerankMethod {
+    /// ログ・統計に出す閉じた語彙の種別名。
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Identity => "identity",
+            Self::Lexical(_) => "lexical",
+            Self::Custom(_) => "custom",
+        }
+    }
+
+    /// 実行器が呼ぶリランカー。`Off` は `None`。
+    pub(crate) fn reranker(&self) -> Option<&dyn Reranker> {
+        match self {
+            Self::Off => None,
+            Self::Identity => Some(&IdentityReranker),
+            Self::Lexical(r) => Some(r),
+            Self::Custom(r) => Some(r.as_ref()),
+        }
+    }
+}
+
+/// リランク設定（方式と窓幅 `W`）。検証付きコンストラクタ [`RerankSettings::new`] のみで
+/// 構築する（フィールド非公開。検証迂回による fail-open を防ぐ）。
+#[derive(Debug, Clone)]
+pub struct RerankSettings {
+    method: RerankMethod,
+    window: usize,
+}
+
+impl Default for RerankSettings {
+    fn default() -> Self {
+        Self::off()
+    }
+}
+
+impl RerankSettings {
+    /// リランク無効の設定（既定）。
+    pub fn off() -> Self {
+        Self {
+            method: RerankMethod::Off,
+            window: DEFAULT_RERANK_WINDOW,
+        }
+    }
+
+    /// 検証付きコンストラクタ。`window` は `1..=10_000`（[`validate_rerank_window`]）。
+    /// `Off` のとき窓幅は使われないが、値は検証する。
+    pub fn new(method: RerankMethod, window: usize) -> Result<Self, RerankError> {
+        let window = validate_rerank_window(window)?;
+        Ok(Self { method, window })
+    }
+
+    /// 方式。
+    pub fn method(&self) -> &RerankMethod {
+        &self.method
+    }
+
+    /// 窓幅 `W`。
+    pub fn window(&self) -> usize {
+        self.window
+    }
+
+    /// リランクが有効（`Off` 以外）か。
+    pub fn is_enabled(&self) -> bool {
+        !matches!(self.method, RerankMethod::Off)
+    }
+}
+
+/// 縮退（リランキング前の順位で応答すること）の理由。ログ・統計で使う閉じた語彙
+/// （ADR D7）。`Timeout`・`MmrBudget` は後続 Issue（#2144・#2143）で到達する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RerankDegradeReason {
+    /// 推論の期限超過。
+    Timeout,
+    /// バックエンド（クロスエンコーダ等）の失敗。
+    BackendError,
+    /// リランカーの入出力契約違反。
+    ContractViolation,
+    /// テキスト長などの入力上限超過。
+    InputLimit,
+    /// MMR の計算量予算超過。
+    MmrBudget,
+}
+
+impl RerankDegradeReason {
+    /// ログ・統計に出す固定の語彙。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::BackendError => "backend_error",
+            Self::ContractViolation => "contract_violation",
+            Self::InputLimit => "input_limit",
+            Self::MmrBudget => "mmr_budget",
+        }
+    }
+}
+
+/// リランクの観測用統計（`EngineCore::rerank_stats` が返す累計のスナップショット）。
+/// 件数だけを持ち、id・本文・テナント情報は含まない。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RerankStats {
+    /// リランクを適用して応答した文の数。
+    pub applied: u64,
+    /// 文の形（密のみ等）により適用外として素通しした文の数。
+    pub not_applicable: u64,
+    /// 縮退: 期限超過。
+    pub degraded_timeout: u64,
+    /// 縮退: バックエンド失敗。
+    pub degraded_backend_error: u64,
+    /// 縮退: 契約違反。
+    pub degraded_contract_violation: u64,
+    /// 縮退: 入力上限超過。
+    pub degraded_input_limit: u64,
+    /// 縮退: MMR 予算超過。
+    pub degraded_mmr_budget: u64,
+}
+
+impl RerankStats {
+    /// 全理由の縮退件数の合計。
+    pub fn degraded_total(&self) -> u64 {
+        self.degraded_timeout
+            .saturating_add(self.degraded_backend_error)
+            .saturating_add(self.degraded_contract_violation)
+            .saturating_add(self.degraded_input_limit)
+            .saturating_add(self.degraded_mmr_budget)
+    }
+}
+
+/// [`RerankStats`] の実体（`EngineCore` が保持し、実行器が更新する crate 内部型）。
+#[derive(Debug, Default)]
+pub(crate) struct RerankCounters {
+    applied: std::sync::atomic::AtomicU64,
+    not_applicable: std::sync::atomic::AtomicU64,
+    timeout: std::sync::atomic::AtomicU64,
+    backend_error: std::sync::atomic::AtomicU64,
+    contract_violation: std::sync::atomic::AtomicU64,
+    input_limit: std::sync::atomic::AtomicU64,
+    mmr_budget: std::sync::atomic::AtomicU64,
+}
+
+impl RerankCounters {
+    fn bump(c: &std::sync::atomic::AtomicU64) {
+        c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_applied(&self) {
+        Self::bump(&self.applied);
+    }
+
+    pub(crate) fn record_not_applicable(&self) {
+        Self::bump(&self.not_applicable);
+    }
+
+    pub(crate) fn record_degraded(&self, reason: RerankDegradeReason) {
+        match reason {
+            RerankDegradeReason::Timeout => Self::bump(&self.timeout),
+            RerankDegradeReason::BackendError => Self::bump(&self.backend_error),
+            RerankDegradeReason::ContractViolation => Self::bump(&self.contract_violation),
+            RerankDegradeReason::InputLimit => Self::bump(&self.input_limit),
+            RerankDegradeReason::MmrBudget => Self::bump(&self.mmr_budget),
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> RerankStats {
+        use std::sync::atomic::Ordering::Relaxed;
+        RerankStats {
+            applied: self.applied.load(Relaxed),
+            not_applicable: self.not_applicable.load(Relaxed),
+            degraded_timeout: self.timeout.load(Relaxed),
+            degraded_backend_error: self.backend_error.load(Relaxed),
+            degraded_contract_violation: self.contract_violation.load(Relaxed),
+            degraded_input_limit: self.input_limit.load(Relaxed),
+            degraded_mmr_budget: self.mmr_budget.load(Relaxed),
+        }
+    }
+}
+
+#[cfg(test)]
+mod wiring_tests {
+    use super::*;
+
+    #[test]
+    fn window_bounds() {
+        assert!(validate_rerank_window(0).is_err());
+        assert_eq!(validate_rerank_window(1), Ok(1));
+        assert_eq!(validate_rerank_window(10_000), Ok(10_000));
+        assert!(validate_rerank_window(10_001).is_err());
+    }
+
+    #[test]
+    fn settings_default_is_off_and_validates_window() {
+        let s = RerankSettings::default();
+        assert!(!s.is_enabled());
+        assert_eq!(s.window(), DEFAULT_RERANK_WINDOW);
+        assert!(RerankSettings::new(RerankMethod::Identity, 0).is_err());
+        let s = RerankSettings::new(RerankMethod::Identity, 50).unwrap();
+        assert!(s.is_enabled());
+        assert_eq!(s.window(), 50);
+        assert_eq!(s.method().kind_name(), "identity");
+    }
+
+    #[test]
+    fn degrade_reason_vocabulary_is_closed() {
+        let all = [
+            RerankDegradeReason::Timeout,
+            RerankDegradeReason::BackendError,
+            RerankDegradeReason::ContractViolation,
+            RerankDegradeReason::InputLimit,
+            RerankDegradeReason::MmrBudget,
+        ];
+        let names: Vec<&str> = all.iter().map(RerankDegradeReason::as_str).collect();
+        assert_eq!(
+            names,
+            [
+                "timeout",
+                "backend_error",
+                "contract_violation",
+                "input_limit",
+                "mmr_budget"
+            ]
+        );
+    }
+
+    #[test]
+    fn counters_snapshot_tracks_each_reason() {
+        let c = RerankCounters::default();
+        c.record_applied();
+        c.record_not_applicable();
+        c.record_degraded(RerankDegradeReason::InputLimit);
+        c.record_degraded(RerankDegradeReason::ContractViolation);
+        let s = c.snapshot();
+        assert_eq!(s.applied, 1);
+        assert_eq!(s.not_applicable, 1);
+        assert_eq!(s.degraded_input_limit, 1);
+        assert_eq!(s.degraded_contract_violation, 1);
+        assert_eq!(s.degraded_total(), 2);
+    }
+}
 
 #[cfg(test)]
 mod tests {

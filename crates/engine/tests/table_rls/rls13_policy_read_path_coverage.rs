@@ -129,6 +129,12 @@ const TABLE: &[(&str, usize, Class, &str)] = &[
         "広域取得（順序なし・経路 A・B・PK 点取得・GIN 候補が共有する with_visible_row）にポリシー段",
     ),
     (
+        "sql/rerank_stage.rs",
+        1,
+        Class::Applied,
+        "リランク段（#2142）が窓内の候補行のテキスト列を再取得する。候補は exec.rs の行フックでポリシー適用済みのスロットだけで、キー・ヘッダのテナント整合も検査する",
+    ),
+    (
         "sql/window.rs",
         3,
         Class::Applied,

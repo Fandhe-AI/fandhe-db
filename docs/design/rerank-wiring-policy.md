@@ -196,3 +196,41 @@
 - クエリ単位の on／off（本書では設けない）。
 - SEARCH-17 との関係（ポインタのみ）。
 - モデルのサイズ上限の値（#2144）。
+
+## 7. 実装メモ（#2142）
+
+- 適用範囲: 実際にリランクが走るのは `Ranking::Hybrid`（recall モード）の文だけ。密のみの
+  lexical と precision は「適用外」で素通しし、`RerankStats::not_applicable` だけを増やす。
+  MMR・密経路の `k` 拡張・密側の再検索は #2143 の担当で、本 Issue では作らない。
+- 注入: `EngineCore::with_rerank(RerankSettings)`（起動時 1 回）。`RerankMethod` は
+  `#[non_exhaustive]`（`Off`／`Identity`／`Lexical`／`Custom`）。`Identity`・`Custom` は
+  Rust API 専用で CLI からは到達できない。CLI は `--reranker off|lexical` と
+  `--rerank-window`（`mmr`・`cross_encoder` は語彙として受理した上で「未対応」の起動エラー）。
+- 取得件数: RRF 設定は常に外側の `k_eff` から作り、取得件数 `k_fetch = max(k_eff, W)`
+  （上限は `pool_depth`）だけを広げる。`hybrid_search_inner` は `k` を `InvalidK` 判定と最後の
+  `truncate` にしか使わないため、先頭 `k_eff` 件は off と一致する（D6 の縮退の根拠）。
+- 候補 id はアリーナのスロット番号（融合スコア降順・同点スロット昇順の入力契約が成り立ち、
+  TABLE-12 の重複 `id` でも `DuplicateId` にならない）。
+- テキスト: 窓内の行だけを、キャッシュのヒット・ミスに関わらず挿入点で都度デコードする
+  （スナップショットの metadata、または行テーブルをテナント・行キーで引く。キーとヘッダの
+  tenant 整合も検査）。`needed_column_indices` にはテキスト列を足さない（eager 経路の複製量が
+  増え、off で成功する文が `54000` 相当になりうるため）。1 件 1 MiB・累計 64 MiB を確保前に
+  検査し、超過は `input_limit` で縮退する。
+- テキストが NULL・デコード不能の行は、その行だけ窓内の元の位置に固定する。リランカーへは
+  テキストのある行だけを渡す（空文字で代用すると順位が動くため採らない）。
+- 出力は `rerank_candidates` の検証に加え、件数が `final_k` ちょうどであることを実行器が検査する
+  （欠落も `contract_violation`）。
+- スコア: 並べ替えだけを行い、各行のスコア（`hybrid_score()` 等）は融合スコアのまま保持する
+  （SEARCH-17 (1) のスコア一致を保つ）。このため `W > k_eff` の昇格があると、返却スコアは
+  単調降順にならないことがある。
+- 縮退: 検索全体は拒否せず、事後フィルタ前に控えた「off の先頭 `k_eff` 件」のスロット集合で
+  絞り直して off と同一の列に戻す。固定の英語 1 行（理由・種別のみ）を実行ログへ出し、理由別
+  カウンタ（`EngineCore::rerank_stats`）を増やす。`statement_timeout`／キャンセルは 57014 が
+  優先で縮退にしない。`timeout`・`mmr_budget` は語彙のみで #2143・#2144 で到達する。
+- EXPLAIN は変更しない（off ではバイト単位で不変。行の追加は #2147）。
+- 性能（受け入れ 1。off の無劣化）: 同一マシンで base（main）と head を
+  `cargo bench --bench hybrid_profile_bench -p fandhe-db-engine --features bench-internals` で
+  比較した（25,000 行・dim 128・共有環境の参考値）。`sql_hybrid` は p95/median
+  4407/4062 us（base）→ 4328/4018 us（head）、`sql_dense_knn` は 948/889 us → 930/879 us で、
+  ノイズ幅に収まる。bench 末尾の B1/B4 id 集合不一致の検査は base でも同じく失敗する
+  既存事象で、本変更の影響ではない。

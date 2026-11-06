@@ -31,6 +31,7 @@ mod wire_recursive_cte_limits_cli;
 mod wire_regex_limits_cli;
 mod wire_require_operation_id_cli;
 mod wire_require_where_for_dml_cli;
+mod wire_rerank_cli;
 mod wire_result_limits_cli;
 mod wire_scan_limits_cli;
 mod wire_schema_limits_cli;
