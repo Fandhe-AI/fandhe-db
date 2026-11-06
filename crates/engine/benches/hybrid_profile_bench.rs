@@ -248,6 +248,15 @@ fn main() {
             vm_hwm_kb,
         )
     );
+    // 位置つき posting（Issue #2114）による追加ぶんの内訳。docs
+    // `sparse-inverted-index.md` の実測記録の再現用で、既存の memory 行の形式は変えない。
+    let position_heap_bytes = resident_index.approx_position_heap_bytes();
+    println!(
+        "hybrid_profile: memory stage=sparse_index_positions position_heap_bytes={} \
+         approx_heap_bytes_without_positions={}",
+        position_heap_bytes,
+        approx_heap_bytes.saturating_sub(position_heap_bytes),
+    );
     // `resident_index` は RSS 差分計測の対象そのものであり、以降の段では参照
     // しないため、計測直後に明示的に drop してよい（メモリ計測意図の明確化）。
     drop(resident_index);
