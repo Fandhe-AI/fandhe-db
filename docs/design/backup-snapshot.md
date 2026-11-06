@@ -2,7 +2,7 @@
 
 - ステータス: Accepted（方式）。運用者専用経路の細部は #2152 で確定する（第 9 節）
 - 対応: Issue #2150（親 #2149。後続は #2151 engine の書き出し実装・#2152 バックアップ用 CLI・#2153 一貫性と並行書き込みのテスト）
-- 関連ビヘイビア: RECOVER-13（項番 (1)(4)(5)(7) を参照）・PERSIST-4・PERSIST-5・TABLE-3。ポインタ: `docs/spec/04-behavior/recovery.md`。本文は転記しない（[spec-confidentiality](../../.claude/rules/spec-confidentiality.md)）
+- 関連ビヘイビア: RECOVER-13・PERSIST-4・PERSIST-5・TABLE-3。ポインタ: `docs/spec/04-behavior/recovery.md`。本文は転記しない（[spec-confidentiality](../../.claude/rules/spec-confidentiality.md)）
 - 関連コード: `crates/engine/src/storage.rs`（`Storage::open_with_durability`・`Storage::db`・`writer_gate`）、`crates/wire-server/src/main.rs`（`hash-password` サブコマンドの分岐）
 - 関連 doc: [wasmtime-adoption.md](wasmtime-adoption.md)（リポ外 probe の先例）
 - 本 ADR は docs のみの変更であり、`Cargo.toml`・`Cargo.lock`・`deny.toml`・コードを変更しない
@@ -66,7 +66,7 @@ engine の表は `TableDefinition<` を含む定義が約 65 行（テスト除�
 | -- | ---- | ---- |
 | A | 稼働中ファイルの素朴なコピー | **不採用**。保証が無く、実測でも open 不能（`Immediate`）または欠落（`None`） |
 | B | 読み取り Tx を握ったうえでのファイルコピー | **不採用**。header は commit ごとに上書きされ、読み取り Tx はファイルの一貫性を固定しない。redb の保証外 |
-| C | サーバー停止中のファイルコピー | 補助としてのみ許容。取得中も読み書きを止めない要件（RECOVER-13 (1)）を満たさない |
+| C | サーバー停止中のファイルコピー | 補助としてのみ許容。稼働中の読み書きを止めない要件を満たさない |
 | D | 読み取り Tx 上で全表を型付きで新ファイルへ書き出す | **採用** |
 | E | `ephemeral_savepoint`／`persistent_savepoint` | 不採用。書き込み Tx が要り、復元用でファイル書き出しにならない |
 
@@ -106,6 +106,6 @@ engine の表は `TableDefinition<` を含む定義が約 65 行（テスト除�
 
 - 運用者専用経路 (ii) の方式（#2152）
 - `--users` ファイルの扱い（#2151・#2152）
-- 増分バックアップ（RECOVER-13 (2)）・整合検査 CLI（(6)）・世代番号（RECOVER-17）は本 ADR の範囲外
+- 増分バックアップ・整合検査 CLI・世代管理は本 ADR の範囲外
 - ファイルロックに対応しない環境（redb は警告のみで続行する）での挙動は未確認
 - 素朴なコピーの失敗率は環境依存であり、本 ADR の実測は 1 環境のみ
