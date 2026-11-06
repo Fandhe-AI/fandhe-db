@@ -97,4 +97,15 @@ SQL 表層の入口だけを実装した。実行器への反映は後続 Issue 
 - `window` の検証（すべて `22000`・クランプなし）: 束縛段（`LIMIT + OFFSET` 以上、`--max-result-rows` 以下）、`EngineCore::check_bound_search`（外部で組み立てた計画への多層防御）、実行時（SCALAR 事後フィルタ経路などで `k_eff` が `window` を超える場合の最終防衛。自テナントの可視件数だけに依存し、文言は固定）。`USING MODE 'precision'` は `k_eff` がデータ件数に依存し束縛段で大小を決められないため、`window` との併用を束縛段で `0A000` 明示拒否する。重み 0 のチャネルがあると保証下限が 0 になり、ソフトブーストは常に `BoostSoftBoundExceeded` で拒否される（fail-closed）。`LIMIT` 省略と `window` の併用も拒否する
 - `RrfConfig::new`: 重みを「有限かつ 0 以上、両方 0 は不可」に緩めた（受理範囲の拡大のみ）。重み 0 の側は寄与 0 になり、同点は id 昇順で決定的
 - 極端値: スコアが非有限になる指定（巨大な重みなど）は `XX000` ではなく `22000`。巨大な `rrf_k` は順位差が潰れ、所属リスト数と id 昇順で決まる
-- 暫定ゲート: `k1`／`b` を持つ文だけ `0A000` のまま。EXPLAIN は `rrf_k`・`window`・`weights` を受理するが、実効値の表示は対象外（担当 Issue なし）
+- 暫定ゲート: `k1`／`b` を持つ文だけ `0A000` のまま（#2121 で撤去。§10）。EXPLAIN は `rrf_k`・`window`・`weights` を受理するが、実効値の表示は対象外（担当 Issue なし）
+
+## 10. Issue #2121 での実装（BM25）
+
+`k1`・`b` を疎検索のクエリ時の計算へ接続し、`0A000` の暫定ゲートを撤去した（SEARCH-13 (4) のポインタ）。
+
+- 型と経路: `sparse::Bm25Params`（検証付き。`k1` と `b` は private）を新設し、`SparseIndex::score_within_with_params` が索引を変えずにスコア式の係数だけを差し替える。`hybrid::hybrid_search_with_bm25` が sql 層から渡す。既存の `score_within`・`hybrid_search`・`hybrid_search_boosted` は索引自身の値を使い、結果はビット一致する
+- 索引は不変: 文書統計（N・avgdl・df）・postings・`SparseIndexCache` のキーと世代に `k1`／`b` は入らない。SQL 経路の索引は常に既定値で構築・キャッシュし、`k1`／`b` が違うクエリでも同じ索引を再構築なしで再利用する。文ごとの値を `with_params` に焼き込むとキャッシュ索引へ混入するため禁止（`sql/exec.rs` のコメントに明記）
+- 解決: `sql::hybrid_tuning::hybrid_bm25_params` が未指定の項目を索引自身の構築時の値で補う。指定なしの文は従来とバイト一致する
+- 範囲外と極端値: 範囲外は束縛段で `22000`。`Bm25Params::new` は `k1` の数値安全上限 `1e200` を超える指定も拒否する（有限でも巨大な `k1` は分子・分母が桁あふれして NaN となり候補が黙って落ちる、または `inf` スコアで `XX000` になるため）。上限は 1 文書の tf・文書長の上界と `len/avgdl` の上界から導いた、データに依存しない定数で、拒否の有無から他テナントの存在は推測できない。さらに `score_within_with_params` は非有限スコアを検出すると `SparseError::InvalidParams` で fail-closed にし、sql 層で固定文言の `22000` に写す。spec は `k1` の上限を定めていないため、上限は実装上の数値安全上限という解釈であり、spec 側（SEARCH-13）での確認を要する
+- テナント境界: 統計は従来どおり可視集合へ縮約して計算し、`k1`／`b` はスコア式の係数だけに作用する
+- 対象外: EXPLAIN への実効値の表示（EXPLAIN は `k1`／`b` を受理する）、NoSQL の `hybrid` オブジェクトの `k1`／`b`（#2122）

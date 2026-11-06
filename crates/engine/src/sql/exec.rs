@@ -1155,6 +1155,10 @@ fn map_hybrid_error(e: HybridError, cfg: &hybrid::RrfConfig) -> SqlSurfaceError 
         // オーバーフローする場合だけ入力起因として `22000` にする（SEARCH-13）。調整値が
         // 有限な最大値に収まるのに非有限が出た場合は dense/sparse プロバイダ・索引の
         // 契約違反（NaN/Inf）なので、従来どおり `Internal`（XX000）に倒す。
+        // クエリ時の `k1`／`b` が数値的に不正なスコアを生んだ場合（Issue #2121）。値は含めない。
+        HybridError::Sparse(SparseError::InvalidParams { .. }) => {
+            SqlSurfaceError::invalid_input("HYBRID BM25 arguments produced an invalid score")
+        }
         HybridError::NonFiniteScore if tuning_overflows(cfg) => {
             SqlSurfaceError::invalid_input("HYBRID tuning produced a non-finite score")
         }
@@ -1288,9 +1292,6 @@ pub(crate) fn execute_statement_with_cache_observed(
     // SQL 実行経路に未接続の距離演算子（L2／L1）は、行ポリシー解決・ストレージ読み取りより前に
     // fail-closed で止める（Issue #1977・#1991）。
     ensure_distance_kind_executable(bound)?;
-    // HYBRID の調整引数は束縛済みだが実行器が未接続のため、指定を黙って無視せず拒否する
-    // （SEARCH-13・Issue #2119。#2120／#2121 で撤去）。
-    crate::sql::hybrid_tuning::ensure_tuning_applied(&bound.ranking)?;
     // RLS-13（Issue #2279）: 利用者ポリシーは、アリーナ構築と同じ read txn から 1 回だけ解決し、下の
     // `on_visible_row`（RLS 段の直後・利用者の `WHERE` より前）で各行へ適用する。キャッシュ
     // （アリーナ・HNSW・疎索引・スカラー索引）はテナント境界だけの内容のまま保ち（`rls_capture` は
@@ -3317,6 +3318,10 @@ pub(crate) fn execute_statement_with_cache_observed(
                                 _ => Some(Arc::new(built)),
                             }
                         };
+                    // 疎索引が無く密のみへ縮退する文でも `k1`／`b` を検証する（データ依存で
+                    // 不正な引数が受理されないようにする。Issue #2121）。
+                    let bm25_default = crate::sparse::Bm25Params::default();
+                    crate::sql::hybrid_tuning::hybrid_bm25_params(tuning, bm25_default)?;
                     let fused: Vec<HybridHit> = match &sparse_index_for_fusion {
                         None => {
                             // 疎側の寄与を 0 件として扱い、密側のみを `rrf_fuse` に通して
@@ -3350,15 +3355,26 @@ pub(crate) fn execute_statement_with_cache_observed(
                             fused.truncate(k_eff);
                             fused
                         }
-                        Some(idx) => hybrid::hybrid_search(
-                            dense_provider,
-                            input,
-                            idx,
-                            query_text,
-                            k_eff,
-                            &cfg,
-                        )
-                        .map_err(|e| map_hybrid_error(e, &cfg))?,
+                        Some(idx) => {
+                            // `k1`／`b` はクエリ時の計算だけに渡す（SEARCH-13・Issue #2121）。
+                            // 索引は上で常に既定値（`SparseIndex::build`）で構築・キャッシュ
+                            // しており、文ごとの値をここで `with_params` へ焼き込んではならない
+                            // （キャッシュ索引へ文ごとの値が混入し、他のクエリへ影響するため）。
+                            let bm25 = crate::sql::hybrid_tuning::hybrid_bm25_params(
+                                tuning,
+                                idx.params(),
+                            )?;
+                            hybrid::hybrid_search_with_bm25(
+                                dense_provider,
+                                input,
+                                idx,
+                                query_text,
+                                k_eff,
+                                &cfg,
+                                bm25,
+                            )
+                            .map_err(|e| map_hybrid_error(e, &cfg))?
+                        }
                     };
                     // このクエリで観測された密側再取得ラウンド数を `HnswIndexCache` の
                     // 統計へ反映する（索引経路が一度も使われなかった場合は no-op。
@@ -8103,5 +8119,17 @@ mod tests {
                 "corruption must be rejected fail-closed as an internal error, got {err:?}"
             );
         }
+    }
+
+    /// Issue #2121: クエリ時 BM25 パラメータの不正は入力起因の `22000`（固定文言・値を含めない）。
+    #[test]
+    fn invalid_bm25_params_map_to_22000() {
+        let cfg = hybrid::RrfConfig::default();
+        let e = map_hybrid_error(
+            HybridError::Sparse(SparseError::InvalidParams { k1: 1e308, b: 0.5 }),
+            &cfg,
+        );
+        assert_eq!(e.wire_code(), "22000");
+        assert!(!e.to_string().contains("1e308"));
     }
 }

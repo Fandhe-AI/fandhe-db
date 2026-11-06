@@ -11,6 +11,7 @@
 
 - ハイブリッド検索の投影で系統別順位と融合スコアを返す引数なし関数 `hybrid_dense_rank()`・`hybrid_sparse_rank()`・`hybrid_score()` を追加した（Issue #2137・SEARCH-17 ポインタ）。順位は int8（その系統の候補に無ければ NULL）、スコアは float8。`ORDER BY HYBRID(...)` を持つ検索 SELECT の最上位項目だけが使え、他の位置は `42601`。NoSQL は `search` の `hybrid` に `explain_score: true` を付けると同名の 3 列を応答へ足す（表に同名の列があれば `42601`）。結果の行・順序は不変。
   BREAKING CHANGE: 公開 enum `sql::parser::ProjectedColumn` に variant `HybridDetail` を追加した（網羅的 `match` の下流は追随が必要）。
+- `HYBRID`／`hybrid_rrf` の調整引数 `k1`・`b` をクエリ時の BM25 計算へ接続した（Issue #2121・SEARCH-13 ポインタ）。従来の `0A000` から変わり、索引・キャッシュは再構築せず再利用する。`k1` は `1e200` 以下、範囲外・非有限スコアは `22000`。公開 API に `sparse::Bm25Params`・`SparseIndex::params`・`SparseIndex::score_within_with_params`・`hybrid::hybrid_search_with_bm25` を追加した（追加のみ）。
 - 公開 struct `hybrid::HybridHit` にフィールド `dense_rank: Option<u32>`・`sparse_rank: Option<u32>` を追加した（Issue #2136・SEARCH-17 ポインタ）。融合に使った 1 始まりの実効順位（`GroupEnd` では同点グループ末尾）で、その系統の候補に無ければ `None`。融合スコア・順序は不変。
   BREAKING CHANGE: 構造体リテラルで構築している下流は追随が必要。
 - `HYBRID`／`hybrid_rrf` の調整引数 `rrf_k`・`window`・`weights` を実行するようにした（Issue #2120・SEARCH-13 ポインタ）。従来の `0A000` から変わる。`window` が `LIMIT + OFFSET` 未満または `--max-result-rows` 超なら `22000`。`k1`／`b` は `0A000` のまま。公開関数 `hybrid::RrfConfig::new` は片側 0 の重みを受理する（両方 0・負・非有限は従来どおり `Err`。受理範囲の拡大のみ）。

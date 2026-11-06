@@ -403,7 +403,8 @@ fn search13_hybrid_named_tuning_arguments_surface_contract() {
     };
     core.execute_sql(&ctx, &format!("{base}, rrf_k => 10) LIMIT 5"))
         .expect("rrf_k is applied by the executor (Issue #2120)");
-    assert_eq!(code(", k1 => 1.2, b => 0.75"), "0A000");
+    core.execute_sql(&ctx, &format!("{base}, k1 => 1.2, b => 0.75) LIMIT 5"))
+        .expect("k1/b are applied by the executor (Issue #2121)");
     assert_eq!(code(", rrf_k => 0"), "22000");
     assert_eq!(code(", b => 2"), "22000");
     assert_eq!(code(", window => 1.5"), "22000");
