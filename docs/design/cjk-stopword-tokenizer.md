@@ -48,6 +48,7 @@
   `docs/design/cjk-tokenizer-impact-ja-corpus.md` を参照）
 - RRF 融合（TASK-103）・評価ハーネス回帰テスト化（TASK-104）
 - 2 文字以上の複合助詞のトークンレベル除去
+- フレーズ内でのストップワードの扱いは [fulltext-query-syntax.md](fulltext-query-syntax.md) の D4（Issue #2112）で決める
 
 ## 参照
 
