@@ -287,7 +287,8 @@ impl SparseIndex {
         visible: Option<&VisibleBitmap>,
     ) -> Vec<(u32, u32)> {
         let mut out: Vec<(u32, u32)> = Vec::new();
-        if pattern.is_empty() {
+        // 設定世代が違うパターンは何にも一致させない（fail-closed）。
+        if pattern.analysis_id != self.analysis_id() || pattern.is_empty() {
             return out;
         }
         // 語を TermId へ解決し、一意語ごとに 1 つのカーソルを持つ。未知語があれば空。

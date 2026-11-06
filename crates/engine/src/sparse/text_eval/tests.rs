@@ -2,6 +2,55 @@
 //! 構文の意味・決定性・後方互換（D8）・`54000`／`22000` の境界・可視集合の縮約を確かめる。
 
 use super::*;
+use crate::sparse::TextAnalysis;
+use std::sync::Arc;
+
+/// 同義語・ストップワード設定付き索引で、評価経路が従来 API と同じ結果を返す（D8・Issue #2130）。
+#[test]
+fn sparse_text_eval_applies_index_text_analysis() {
+    let a = Arc::new(TextAnalysis::from_lists(Some("the"), Some("car automobile")).unwrap());
+    let docs: [(DocId, &str); 4] = [
+        (1, "an automobile runs"),
+        (2, "a car runs fast"),
+        (3, "the other thing"),
+        (4, "the car park"),
+    ];
+    let idx = SparseIndex::build_with_analysis(&docs, a).unwrap();
+    let vis: BTreeSet<DocId> = docs.iter().map(|&(id, _)| id).collect();
+    let bits = |s: &SparseScored| -> Vec<(DocId, u64)> {
+        s.candidates
+            .iter()
+            .map(|c| (c.doc_id, c.score.to_bits()))
+            .collect()
+    };
+    let limits = TextQueryLimits::default();
+    for q in ["car", "automobile", "the car", "the", "car runs"] {
+        let old = idx.score_within_with_params(q, &vis, idx.params()).unwrap();
+        let new = idx
+            .score_text_query_str_within(q, &vis, idx.params(), &limits)
+            .unwrap();
+        let mut o = bits(&old);
+        let mut n = bits(&new);
+        o.sort();
+        n.sort();
+        assert_eq!(o, n, "query {q:?}");
+    }
+    let mut s = idx
+        .score_text_query_str_within("car", &vis, idx.params(), &limits)
+        .unwrap();
+    let mut got: Vec<DocId> = s.top(10).iter().map(|d| d.doc_id).collect();
+    got.sort();
+    assert_eq!(got, vec![1, 2, 4]);
+    // フレーズと除外にも同じ設定がかかる。
+    let mut s = idx
+        .score_text_query_str_within("\"the car\" runs", &vis, idx.params(), &limits)
+        .unwrap();
+    assert!(!s.top(10).is_empty());
+    let mut s = idx
+        .score_text_query_str_within("runs -car", &vis, idx.params(), &limits)
+        .unwrap();
+    assert!(s.top(10).is_empty());
+}
 
 const CORPUS: &[(DocId, &str)] = &[
     (1, "alpha beta gamma"),

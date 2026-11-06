@@ -32,7 +32,8 @@ use super::text_query::{
     parse_text_query, Clause, Excluded, QueryGroup, TextQuery, TextQueryError,
 };
 use super::{
-    Bm25Params, Candidate, DocId, ScoreScope, SparseIndex, SparseScored, TermId, VisibleBitmap,
+    tokenize_analyzed, Bm25Params, Candidate, DocId, ScoreScope, SparseIndex, SparseScored, TermId,
+    VisibleBitmap,
 };
 use crate::text_query_limits::TextQueryLimits;
 
@@ -243,13 +244,13 @@ impl SparseIndex {
                     // 同一フィルタは評価前に一意化する（重複入力で走査量・中間結果を
                     // 増幅させない。max_terms は一意語で数えるため、ここで揃える）。
                     Clause::Phrase(p) => {
-                        let pat = PhrasePattern::from_phrase(p)?;
+                        let pat = PhrasePattern::from_phrase_with(p, &self.analysis)?;
                         if !required.contains(&pat) {
                             required.push(pat);
                         }
                     }
                     Clause::Exclude(Excluded::Phrase(p)) => {
-                        let pat = PhrasePattern::from_phrase(p)?;
+                        let pat = PhrasePattern::from_phrase_with(p, &self.analysis)?;
                         if !excluded.contains(&pat) {
                             excluded.push(pat);
                         }
@@ -366,6 +367,16 @@ impl SparseIndex {
         Ok(Expansion { visible, spans })
     }
 
+    /// 構文木の語 1 つを索引の `TextAnalysis` で正規化した語列にする（同義語置換・
+    /// ストップワード除去。`score_within_with_params` の `tokenize_analyzed` と同じ処理）。
+    /// 設定が恒等なら入力をそのまま返し、従来経路とビット一致を保つ（D8）。
+    fn analyzed_words(&self, word: &str) -> Vec<String> {
+        if self.analysis.is_empty() {
+            return vec![word.to_owned()];
+        }
+        tokenize_analyzed(word, &self.analysis)
+    }
+
     /// 語の posting に可視文書が 1 つでもあるか（最初のヒットで打ち切る）。
     fn has_visible_posting(&self, tid: TermId, bitmap: &VisibleBitmap) -> bool {
         self.postings
@@ -449,25 +460,30 @@ impl SparseIndex {
         drop(excluded_docs);
 
         // 正の語を文字列の辞書順で一意化して TermId へ引く（`score_within` と同じ走査順）。
-        let mut words: BTreeMap<&str, TermId> = BTreeMap::new();
+        let mut words: BTreeMap<String, TermId> = BTreeMap::new();
         for c in plan.group.clauses() {
             match c {
                 Clause::Term(t) => {
-                    if let Some(tid) = self.terms.lookup(t) {
-                        words.insert(t.as_str(), tid);
+                    // 索引と同じ設定（同義語・ストップワード）で正規化してから引く。
+                    for w in self.analyzed_words(t) {
+                        if let Some(tid) = self.terms.lookup(&w) {
+                            words.insert(w, tid);
+                        }
                     }
                 }
                 Clause::Prefix(stem) => {
                     for &vi in expansion.indices(stem) {
                         if let Some((t, tid)) = self.prefix_vocab.get(vi) {
-                            words.insert(&**t, *tid);
+                            words.insert((**t).to_owned(), *tid);
                         }
                     }
                 }
                 Clause::Phrase(p) => {
                     for t in p.tokens() {
-                        if let Some(tid) = self.terms.lookup(t) {
-                            words.insert(t.as_str(), tid);
+                        for w in self.analyzed_words(t) {
+                            if let Some(tid) = self.terms.lookup(&w) {
+                                words.insert(w, tid);
+                            }
                         }
                     }
                 }
