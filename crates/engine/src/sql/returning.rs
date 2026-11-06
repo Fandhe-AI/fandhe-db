@@ -168,6 +168,9 @@ pub(crate) fn column_meta(
             ProjectedColumn::AliasedId { .. } => Err(SqlSurfaceError::Internal {
                 detail: "aliased id is not supported in RETURNING".to_string(),
             }),
+            ProjectedColumn::HybridDetail { .. } => Err(SqlSurfaceError::Internal {
+                detail: "hybrid detail is not supported in RETURNING".to_string(),
+            }),
             ProjectedColumn::Column { index, name } => {
                 let ty = schema
                     .columns
@@ -209,6 +212,11 @@ pub(crate) fn project_row(
             ProjectedColumn::AliasedId { .. } => {
                 return Err(SqlSurfaceError::Internal {
                     detail: "aliased id is not supported in RETURNING".to_string(),
+                });
+            }
+            ProjectedColumn::HybridDetail { .. } => {
+                return Err(SqlSurfaceError::Internal {
+                    detail: "hybrid detail is not supported in RETURNING".to_string(),
                 });
             }
             ProjectedColumn::Column { index, .. } => match values.get(*index) {

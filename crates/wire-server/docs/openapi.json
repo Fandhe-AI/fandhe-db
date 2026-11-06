@@ -504,6 +504,9 @@
           "b": {
             "type": "number"
           },
+          "explain_score": {
+            "type": "boolean"
+          },
           "k1": {
             "type": "number"
           },
