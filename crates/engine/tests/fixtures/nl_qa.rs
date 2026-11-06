@@ -786,6 +786,7 @@ pub fn measure_recall_with_reranker(
                 id: h.id,
                 fused_score: h.score,
                 text: doc_text_by_id.get(&h.id).copied().unwrap_or(""),
+                embedding: None,
             })
             .collect();
         let reranked = rerank_candidates(reranker, &case.query_text, &candidates, &rerank_cfg)

@@ -25,6 +25,7 @@ fn cand<'a>(id: u64, fused_score: f64, text: &'a str) -> RerankCandidate<'a> {
         id,
         fused_score,
         text,
+        embedding: None,
     }
 }
 
