@@ -713,7 +713,10 @@ fn next_fragment(
         }
         i += 1;
     }
-    if *endpos > i {
+    // max_words 到達で抜けた i は未計数の次の単位を指すため、数え済みの最後の単位
+    // （i - 1）から閉区間終端を探す（curlen・poslen と選択範囲を一致させる）。
+    if *endpos >= i {
+        i -= 1;
         *endpos = i;
         while i >= *startpos {
             sel.budget.tick()?;
@@ -1204,6 +1207,19 @@ mod tests {
             hl("一二三四五六", "なし", Some("MinWords=3, MaxWords=9")),
             "一二三"
         );
+    }
+
+    #[test]
+    fn cjk_fragment_never_exceeds_max_words() {
+        // CJK は 1 文字 1 語。MaxWords=2 の断片は 2 文字までに収まる。
+        let out = hl(
+            "東京都",
+            "東京都",
+            Some("MaxFragments=1, MaxWords=2, MinWords=1, ShortWord=0"),
+        );
+        let plain = out.replace("<b>", "").replace("</b>", "");
+        assert!(plain.chars().count() <= 2, "{out}");
+        assert_eq!(out, "<b>東京</b>");
     }
 
     #[test]
