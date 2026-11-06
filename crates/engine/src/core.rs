@@ -6313,6 +6313,10 @@ impl EngineCore {
         resolver: Option<crate::sql::relation_name::SchemaResolver<'_>>,
         read_snap: Option<&redb::ReadTransaction>,
     ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
+        // Issue #2125: 全構文解析入口（parse_tokens／parse_tokens_r／parse_tokens_recorded を含む）が
+        // 通る共通点で上限スコープを保持する。INSERT VALUES・列 DEFAULT の定数畳み込みで
+        // `ts_headline` がハード上限に戻る fail-open を防ぐ。
+        let _bind_limits_scope = self.sparsevec_limits_scope();
         // SELECT の行ロック句（SQL-38・Issue #1957）は、行数制限句の正規化の後・名前解決の前に
         // トークン列から取り除いて構文情報として保持し、既存の検証が文を受理した後に併用を検査する。
         // 構文誤りは `42601`、併用違反は `0A000`、`OF` の解決失敗は `42P01`。

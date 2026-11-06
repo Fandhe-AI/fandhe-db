@@ -158,3 +158,43 @@ fn default_core_uses_hard_limits() {
     assert!(out.ends_with("<b>fox</b>"));
     assert_eq!(out.len(), doc.len() + "<b></b>".len());
 }
+
+/// 拡張クエリ（Parse/Bind）経路の INSERT VALUES 定数畳み込みにも下げた上限が効く（Issue #2125 レビュー指摘）。
+#[test]
+fn lowered_limit_applies_to_extended_query_const_folding() {
+    let (_g, core) = open_with("tshl-ext-fold", Some(HeadlineLimits::new(OUT.len() - 1, 8)));
+    exec(
+        &core,
+        "CREATE TABLE docs (id BIGINT PRIMARY KEY, body TEXT)",
+    )
+    .expect("ddl");
+    let sql = format!("INSERT INTO docs (id, body) VALUES (1, ts_headline('{DOC}', 'fox'))");
+    let err = core
+        .parse_sql_prepared(&sql)
+        .and_then(|p| core.bind_prepared(&p, &[]))
+        .and_then(|parsed| {
+            let mut s = SessionState::default();
+            core.execute_parsed_in_session(&ctx(), &mut s, &parsed)
+        })
+        .expect_err("over limit");
+    assert_eq!(err.wire_code(), "54000", "{err}");
+}
+
+/// 一時表（`for_temp_session` が設定を引き継ぐ）でも下げた上限が効く。
+#[test]
+fn temp_table_inherits_headline_limit() {
+    let (_g, core) = open_with("tshl-temp", Some(HeadlineLimits::new(OUT.len() - 1, 8)));
+    let mut s = SessionState::default();
+    s.allow_ddl();
+    core.execute_sql_in_session(
+        &ctx(),
+        &mut s,
+        "CREATE TEMP TABLE tt (id BIGINT PRIMARY KEY, body TEXT)",
+    )
+    .expect("temp ddl");
+    let ins = format!("INSERT INTO tt (id, body) VALUES (1, ts_headline('{DOC}', 'fox'))");
+    let e = core
+        .execute_sql_in_session(&ctx(), &mut s, &ins)
+        .expect_err("over limit");
+    assert_eq!(e.wire_code(), "54000", "{e}");
+}
