@@ -258,7 +258,7 @@ impl SparseIndex {
     }
 
     /// `doc_idx` 空間での中核。`(doc_idx, 一致箇所数)` を `doc_idx` 昇順で返す。
-    fn phrase_match_doc_idx(
+    pub(super) fn phrase_match_doc_idx(
         &self,
         pattern: &PhrasePattern,
         visible: Option<&VisibleBitmap>,

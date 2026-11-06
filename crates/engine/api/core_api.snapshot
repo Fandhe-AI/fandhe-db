@@ -60,6 +60,7 @@ pub mod sql;
 pub mod storage;
 pub mod temp_table_limits;
 pub mod tenant;
+pub mod text_query_limits;
 pub mod test_sync;
 pub mod tiering;
 pub mod trigger_limits;

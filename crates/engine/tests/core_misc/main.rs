@@ -113,6 +113,7 @@ mod sparse_cache;
 mod sparse_determinism;
 mod sparse_phrase;
 mod sparse_stopwords;
+mod sparse_text_eval;
 mod sql74_radius_hnsw;
 mod tiering;
 mod transaction_limits;

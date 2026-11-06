@@ -38,6 +38,7 @@ mod wire_search_engine_opt;
 mod wire_sparsevec_limits_cli;
 mod wire_statement_timeout_cli;
 mod wire_temp_table_limits_cli;
+mod wire_text_query_limits_cli;
 mod wire_tls_cli;
 mod wire_transaction_limits_cli;
 mod wire_trigger_limits_cli;

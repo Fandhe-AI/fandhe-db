@@ -107,16 +107,16 @@
 
 ### D6 前方一致の展開
 
-- 展開には順序付き語彙（`BTreeMap` かソート済み補助配列）の範囲走査を使う。`HashMap` の `TermDictionary` を変えるか補助索引を足すかは #2115 で決め、世代キャッシュ（[sparse-index-cache.md](sparse-index-cache.md)）の無効化経路に従う
+- 展開には順序付き語彙の範囲走査を使う。**決定（#2115）**: `HashMap` の `TermDictionary` は変えず、先頭が ASCII 単語文字の語だけを昇順に持つ補助索引 `prefix_vocab`（`Vec<(Box<str>, TermId)>`）を足した。CJK の前方一致はパーサが通常語へ落とす（D4）ため対象外。索引と同寿命なので世代キャッシュ（[sparse-index-cache.md](sparse-index-cache.md)）のキー・無効化経路は変えない。語幹の範囲の和集合を 1 回だけ走査して可視 df を判定する（語幹の数に比例して走査が増えない）
 - 展開語数は、可視集合で df > 0 の語だけで数える。語彙はテナントをまたいで共有されるため、全体語彙で数えると上限超過の有無から他テナントの語の存在を推測できる（RLS のサイドチャネル）
 - 走査コストは語彙サイズの上限（`MAX_CORPUS_TOKENS` 等）で有界
 - 時間差のサイドチャネルは既知の制約として記録する
 
 ### D7 上限とエラー契約
 
-- フレーズの必須トークン数には、データに依存しない定数 `MAX_PHRASE_REQUIRED_TOKENS`（暫定 64。Issue #2114）を置く。超過は切り詰めず `PhraseError::PatternTooLong` で拒否する（同じ語の繰り返しで位置の照合が `必須トークン数 × MAX_CORPUS_TOKENS` まで膨らむのを防ぐ）。`54000` への写像と CLI 化は #2115 で決める
+- フレーズの必須トークン数には、データに依存しない定数 `MAX_PHRASE_REQUIRED_TOKENS`（暫定 64。Issue #2114）を置く。超過は切り詰めず `PhraseError::PatternTooLong` で拒否する（同じ語の繰り返しで位置の照合が `必須トークン数 × MAX_CORPUS_TOKENS` まで膨らむのを防ぐ）。`54000` への写像は #2115 で実装した（CLI 化はしない。[text-query-limits-cli.md](text-query-limits-cli.md) の D7）
 - 上限は 2 種類: (a) 1 つの検索語の項の数、(b) 前方一致の展開後の語の数。どちらも既定値と CLI フラグを持つ。既定値を「上限なし」にしない
-- フラグ名は既存の `*_limits_opt.rs` の `--max-…` 形式に揃える（例: `--max-text-query-terms`・`--max-text-query-prefix-expansions`。最終名は #2115 で決める）
+- フラグ名は既存の `*_limits_opt.rs` の `--max-…` 形式に揃える（#2115 で `--max-text-query-terms`・`--max-text-query-prefix-expansions` に確定。既定値・範囲は [text-query-limits-cli.md](text-query-limits-cli.md)）
 - 新設する上限（(a)(b)）の超過は `54000` で拒否する。一部の語だけで黙って検索しない
 - 既存の `MAX_QUERY_BYTES`・`MAX_QUERY_TERMS`（入口の `validate_query_bounds`）の超過は、現状の `map_hybrid_error` どおり `invalid_input`（22000）のまま変えない。既存の呼び出し元の契約と、演算子を含まない入力の後方互換（D8）を保つため。22000 を 54000 へ移すかは本書では決めず、#2115・#2116 の未決事項とする
 - `MAX_QUERY_BYTES`・`MAX_QUERY_TERMS` はパーサの入口でも引き継ぐ（#2113）
@@ -176,7 +176,7 @@ D8 のとおり。演算子を含まない入力の結果は従来と一致し�
 | ----- | -------- |
 | #2113 | 木の形（グループ、フィルタ／任意語／除外／前方一致の各ノード）・D1／D3 の字句規則・線形時間・上限の引き継ぎ（D7 の上限検証を通過した入力では構文不正でエラーにしない。上限超過は検証側で Err） |
 | #2114 | D4 の位置モデル・メモリ増の実測記録・世代キャッシュの経路（実装済み。実測は [sparse-inverted-index.md](sparse-inverted-index.md) の「位置付き posting」。キャッシュのキー・無効化は無変更） |
-| #2115 | D2／D5／D6／D7（順序付き語彙、可視 df による展開数の計数、54000 への写像、CLI 名、同点は id 昇順の決定性） |
+| #2115 | D2／D5／D6／D7（実装済み。評価は `sparse::text_eval`、上限は `text_query_limits`。順序付き語彙、可視 df による展開数の計数、54000 への写像、CLI 名、同点は id 昇順の決定性。ADR の 22000／54000 の移管は未決のまま） |
 | #2116 | D8／D9・SQL と NoSQL のパリティ・EXPLAIN の `search_terms` |
 
 ## 9. スコープ外
