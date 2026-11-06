@@ -284,7 +284,7 @@ JSON 本文の構文受理規則は `engine::json`（NOSQL-8）に従う: ネス
 | `limit` | ○ | number | `1..=10000`。非整数・負値・`u32` 超過等の形状不正は `42601`、`0` または `10001` 以上の範囲外は `22000` |
 | `vector` | △ | number[] | `plan` と排他かつどちらか必須 |
 | `plan` | △ | string | `vector` と排他かつどちらか必須。LLM クエリ展開 |
-| `hybrid` | △ | `{"text": string, "explain_score"?: bool}` | `vector` とのみ併用可（`plan` と併用は `42601`）。疎側テキスト列は固定で `body` 列。`explain_score: true` のときだけ応答の末尾へ `hybrid_dense_rank`・`hybrid_sparse_rank`（int8。その系統の候補に入っていなければ null）・`hybrid_score`（float8）の 3 列を足す（SQL の同名の引数なし関数と同じ値。表に同名の列があれば `42601`。省略・`false` は従来の応答） |
+| `hybrid` | △ | `{"text": string, "k1"?: number, "b"?: number, "rrf_k"?: number, "window"?: integer, "weights"?: {"dense": number, "sparse": number}, "explain_score"?: bool}` | `vector` とのみ併用可（`plan` と併用は `42601`）。疎側テキスト列は固定で `body` 列。調整キーは SQL の `HYBRID(..., k1 => ...)` 名前付き引数と同じ意味・同じ結果。`explain_score: true` のときだけ応答の末尾へ `hybrid_dense_rank`・`hybrid_sparse_rank`（int8。その系統の候補に入っていなければ null）・`hybrid_score`（float8）の 3 列を足す（SQL の同名の引数なし関数と同じ値。表に同名の列があれば `42601`。省略・`false` は従来の応答） |
 | `mode` | △ | string | `"recall"`（`vector` 検索の既定）／`"precision"`。`plan` 検索で省略時は下記参照 |
 | `columns` | △ | string[]（非空） | 省略時は `id`＋全実列 |
 | `filter` | △ | object[] | [`filter` 配列](#filter-配列)参照 |
@@ -310,6 +310,15 @@ JSON 本文の構文受理規則は `engine::json`（NOSQL-8）に従う: ネス
 ```json
 {"op": "search", "table": "docs", "vector": [1.0, 0.0], "limit": 3,
  "columns": ["id"], "hybrid": {"text": "alpha", "explain_score": true}}
+```
+
+要求例（ハイブリッド検索の調整キー付き）:
+
+```json
+{"op": "search", "table": "docs", "vector": [1.0, 0.0], "limit": 3,
+ "columns": ["id"],
+ "hybrid": {"text": "alpha", "k1": 1.5, "b": 0.5, "rrf_k": 30, "window": 10,
+            "weights": {"dense": 0.5, "sparse": 2}}}
 ```
 
 要求例（クエリ展開検索）:
@@ -359,6 +368,12 @@ JSON 本文の構文受理規則は `engine::json`（NOSQL-8）に従う: ネス
 - `vector`／`plan` 両方指定・両方欠落・`plan`＋`hybrid` 併用・`columns: []`・
   識別子形状不正・`metric` の型不一致または `plan`／`hybrid` との併用 → `42601`
 - `metric` の語彙外 → `22023`
+- `hybrid` の調整キーの値が範囲外（`k1 < 0`・`b` が 0〜1 外・`rrf_k <= 0`・`window = 0` や上限超え・
+  重みが負または両方 0）、`window` が `limit` 未満、`k1` が数値安全上限超え → `22000`。
+  `window` と `mode: "precision"` の併用 → `0A000`
+- `hybrid` の未知キー・調整キーの型不一致（`window` が整数でない場合を含む）・`weights` の形の不正 →
+  `42601`（NoSQL の型不一致は `42601` とする規約に従う。SQL の名前付き引数は型不一致も `22000`
+  とするため、型・形の不正の分類だけが SQL と異なる）
 - 未知テーブル → `42P01`
 - 未知列・`VECTOR` 列でない列への `ORDER BY` 相当・非有限ベクトル要素等 → `22000`
 
@@ -1375,6 +1390,7 @@ nosql16_explain_targets.rs`（`vector` 指定 `search`・`scan`・`aggregate` �
 | --- | --- |
 | `SELECT id, lang FROM docs ORDER BY embedding <=> '[0.1,0.2,0.3,0.4]' LIMIT 10` | `search` + `vector` + `columns` |
 | `SELECT id FROM docs ORDER BY HYBRID(embedding, '[1.0,0.0]', body, 'alpha') LIMIT 3` | `search` + `vector` + `hybrid.text`（疎側列は `body` 固定） |
+| `SELECT id FROM docs ORDER BY HYBRID(embedding, '[1.0,0.0]', body, 'alpha', k1 => 1.5, window => 10) LIMIT 3` | `search` + `vector` + `hybrid.text` + `hybrid.k1`／`hybrid.window`（`b`・`rrf_k`・`weights` も同様） |
 | `SELECT id FROM docs ORDER BY embedding <#> '[0.1,0.2,0.3,0.4]' LIMIT 10` | `search` + `vector` + `"metric":"ip"` |
 | `SELECT id FROM docs USING PLAN('find content') LIMIT 10` | `search` + `plan` |
 | `... LIMIT n USING MODE 'recall'` | `"mode":"recall"` |
