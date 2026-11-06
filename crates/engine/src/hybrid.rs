@@ -4303,6 +4303,25 @@ mod tests {
         }
     }
 
+    /// Issue #2121 レビュー指摘: `k1 > 1e200` で構築した既存索引でも `hybrid_search` は従来どおり動く。
+    #[test]
+    fn hybrid_search_keeps_working_for_index_k1_above_query_upper_bound() {
+        let cfg = RrfConfig::new(60.0, 0.0, 1.0, 10).expect("cfg");
+        let vectors: Vec<f32> = vec![1.0, 0.0, 1.0, 0.0];
+        let ids = [1u64, 2];
+        let input = SearchInput {
+            ids: &ids,
+            vectors: &vectors,
+            dim: 2,
+            query: &[1.0, 0.0],
+            k: 2,
+        };
+        let index = SparseIndex::with_params(&[(1, "apple"), (2, "banana")], 1e201, 0.75)
+            .expect("build index");
+        let hits = hybrid_search(&CpuScalarProvider, input, &index, "apple", 2, &cfg).expect("ok");
+        assert!(!hits.is_empty());
+    }
+
     /// Issue #2121: 索引自身の params を渡した `hybrid_search_with_bm25` は `hybrid_search` と
     /// 完全一致し、異なる params では疎側の順位が変わる。
     #[test]

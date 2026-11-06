@@ -1636,7 +1636,10 @@ impl SparseIndex {
         query: &str,
         visible_ids: &BTreeSet<DocId>,
     ) -> Result<SparseScored, SparseError> {
-        self.score_within_with_params(query, visible_ids, self.params())
+        // 索引自身の構築済みパラメータは `with_params` の定義域検査を通過済み。
+        // クエリ時上書き専用の数値安全上限（`MAX_QUERY_K1`）は適用しない
+        // （`k1 > 1e200` で構築した既存索引の挙動を変えない）。
+        self.score_within_checked(query, visible_ids, self.params())
     }
 
     /// 構築時の `k1`・`b` を [`Bm25Params`] として返す。
@@ -1662,7 +1665,24 @@ impl SparseIndex {
         visible_ids: &BTreeSet<DocId>,
         params: Bm25Params,
     ) -> Result<SparseScored, SparseError> {
-        let params = Bm25Params::new(params.k1, params.b)?;
+        // 索引自身のパラメータ（`hybrid_search` 経路が `params()` で渡す）は
+        // `with_params` で検証済みのため、クエリ時上限 `MAX_QUERY_K1` を再適用しない。
+        let params = if params == self.params() {
+            params
+        } else {
+            Bm25Params::new(params.k1, params.b)?
+        };
+        self.score_within_checked(query, visible_ids, params)
+    }
+
+    /// [`Self::score_within`]・[`Self::score_within_with_params`] 共通の本体。
+    /// `params` は呼び出し側で検証済み（索引自身の値、または `Bm25Params::new` 経由）の前提。
+    fn score_within_checked(
+        &self,
+        query: &str,
+        visible_ids: &BTreeSet<DocId>,
+        params: Bm25Params,
+    ) -> Result<SparseScored, SparseError> {
         if query.len() > MAX_QUERY_BYTES {
             return Err(SparseError::QueryTooLong {
                 len: query.len(),
@@ -4091,6 +4111,19 @@ mod tests {
         let mut scored_empty_visible = idx.score_within("alpha beta", &BTreeSet::new()).unwrap();
         assert!(scored_empty_visible.is_empty());
         assert!(scored_empty_visible.top(10).is_empty());
+    }
+
+    #[test]
+    fn score_within_keeps_working_for_index_k1_above_query_upper_bound() {
+        // クエリ時上書きの k1 上限（1e200）は索引自身のパラメータ経路に波及しない。
+        let idx = SparseIndex::with_params(&[(1, "apple"), (2, "banana")], 1e201, 0.75).unwrap();
+        let visible: BTreeSet<DocId> = [1, 2].into_iter().collect();
+        let mut scored = idx.score_within("apple", &visible).unwrap();
+        let top = scored.top(5);
+        assert_eq!(top.len(), 1);
+        assert!(top[0].score.is_finite() && top[0].score > 0.0);
+        // 上書き経路では従来どおり拒否される。
+        assert!(Bm25Params::new(1e201, 0.75).is_err());
     }
 
     #[test]
