@@ -145,7 +145,7 @@ SEQUENCE と `nextval`／`currval`／`setval`／`lastval`（親 #1686）の実�
 
 ### D9. 変更ログとレプリカ
 
-- RECOVER-14・RECOVER-15 は未実装。「採番済みの値が記録対象になる」というポインタのみ残し、設計は対象外とする 変更ログの設計は [change-log-pitr.md](change-log-pitr.md)。
+- RECOVER-14・RECOVER-15 は未実装。「採番済みの値が記録対象になる」というポインタのみ残し、設計は対象外とする。変更ログの設計は [change-log-pitr.md](change-log-pitr.md)。
 
 ## 4. 後続 sub-issue の前提
 
