@@ -197,6 +197,13 @@
 //! fail-closed で起動エラー。値の解決は `wire_server::sparsevec_limits_opt::resolve` に一本化し、
 //! `EngineCore::with_sparsevec_limits` へ 1 回だけ注入する（`docs/design/sparsevec-limits-cli.md`）。
 //!
+//! `--max-ts-headline-bytes`／`--max-ts-headline-fragments`（Issue #2125。SEARCH-14 ポインタ）:
+//! `ts_headline` の出力バイト長（`1`〜`4194304`）と `MaxFragments` オプションの上限（`1`〜`1024`）を、
+//! プロセス全体に対して起動時に**下げる方向だけ**設定できる opt-in 注入点（未指定はハード上限と同値）。
+//! 超過は切り詰めずに `54000`。範囲外・非数値・値欠落・重複指定は fail-closed で起動エラー。
+//! 値の解決は `wire_server::headline_limits_opt::resolve` に一本化し、
+//! `EngineCore::with_headline_limits` へ 1 回だけ注入する（`docs/design/ts-headline-limits-cli.md`）。
+//!
 //! `--max-subquery-depth`／`--max-subquery-executions`／`--max-cte-definitions`／
 //! `--max-cte-nesting-depth`（Issue #1552。SQL-46）: サブクエリの入れ子深さ（`1`〜`4`）・
 //! 1 文あたりの内側サブクエリ実行回数（`1`〜`16`）・CTE 定義数（`1`〜`16`）・CTE 連鎖深さ
@@ -580,6 +587,8 @@ fn run_server(args: &[String]) -> ExitCode {
     let mut max_text_query_terms_raw: Option<String> = None;
     let mut max_text_query_prefix_expansions_raw: Option<String> = None;
     let mut max_sparsevec_nnz_raw: Option<String> = None;
+    let mut max_ts_headline_bytes_raw: Option<String> = None;
+    let mut max_ts_headline_fragments_raw: Option<String> = None;
     let mut max_subquery_depth_raw: Option<String> = None;
     let mut max_subquery_executions_raw: Option<String> = None;
     let mut max_cte_definitions_raw: Option<String> = None;
@@ -1253,6 +1262,46 @@ fn run_server(args: &[String]) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
                 max_sparsevec_nnz_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::headline_limits_opt::MAX_TS_HEADLINE_BYTES_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::headline_limits_opt::MAX_TS_HEADLINE_BYTES_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #2125: 他の起動時構成フラグと同じく 2 回目以降の指定を
+                // fail-closed に拒否する（last-wins にしない）。
+                if max_ts_headline_bytes_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::headline_limits_opt::MAX_TS_HEADLINE_BYTES_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                max_ts_headline_bytes_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::headline_limits_opt::MAX_TS_HEADLINE_FRAGMENTS_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::headline_limits_opt::MAX_TS_HEADLINE_FRAGMENTS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #2125: 他の起動時構成フラグと同じく 2 回目以降の指定を
+                // fail-closed に拒否する（last-wins にしない）。
+                if max_ts_headline_fragments_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::headline_limits_opt::MAX_TS_HEADLINE_FRAGMENTS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                max_ts_headline_fragments_raw = Some(v.clone());
                 i += 2;
             }
             wire_server::nesting_limits_opt::MAX_SUBQUERY_DEPTH_FLAG => {
@@ -2452,6 +2501,22 @@ fn run_server(args: &[String]) -> ExitCode {
         }
     };
 
+    // Issue #2125: ts_headline の出力バイト長・断片数の上限を bind・ユーザーストア読込より前に
+    // 解決する（fail-closed。範囲外・非数値は listen へ進まず起動エラー）。未指定は
+    // `HeadlineLimits::default()`＝ハード上限。
+    let headline_limits = match wire_server::headline_limits_opt::resolve(
+        wire_server::headline_limits_opt::HeadlineLimitsRawFlags {
+            max_bytes: max_ts_headline_bytes_raw.as_deref(),
+            max_fragments: max_ts_headline_fragments_raw.as_deref(),
+        },
+    ) {
+        Ok(limits) => limits,
+        Err(e) => {
+            engine::log_stderr!("wire-server: invalid ts_headline limit configuration: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     // Issue #2130（SEARCH-16 ポインタ）: ストップワード・同義語のファイルを bind・ユーザーストア
     // 読込より前に読み、検証する（fail-closed。不正・上限超過・読めないファイルは listen へ
     // 進まず起動エラー）。未指定は恒等＝従来どおりのトークン化。
@@ -3139,6 +3204,9 @@ fn run_server(args: &[String]) -> ExitCode {
     // Issue #2027: 未指定でも常に呼ぶ（`sparsevec_limits` は既定まで解決済み。既定は
     // ハード上限と同値で、未注入と挙動が同一）。
     core = core.with_sparsevec_limits(sparsevec_limits);
+    // Issue #2125: 未指定でも常に呼ぶ（`headline_limits` は既定まで解決済み。既定は
+    // ハード上限と同値で、未注入と挙動が同一）。
+    core = core.with_headline_limits(headline_limits);
     // Issue #2130: 疎検索のストップワード・同義語（セッション・SQL からは変更できない）。
     core = core.with_text_analysis(text_analysis);
     // Issue #2142: リランカー（セッション・SQL・NoSQL からは変更できない）。未指定でも常に

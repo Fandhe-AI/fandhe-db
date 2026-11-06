@@ -12890,6 +12890,8 @@ impl<'a> Parser<'a> {
             || name.eq_ignore_ascii_case("lpad")
             || name.eq_ignore_ascii_case("rpad")
             || name.eq_ignore_ascii_case("split_part")
+            // `ts_headline`（Issue #2125）も strict 関数として裸の `NULL` を受理する。
+            || name.eq_ignore_ascii_case("ts_headline")
             // `greatest`／`least`（Issue #1909・SQL-65）は NULL 引数を無視する新設の関数で、
             // 裸の `NULL` をリテラルとして受理する（`COALESCE` の引数と同じ扱い）。
             || name.eq_ignore_ascii_case("greatest")

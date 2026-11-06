@@ -36,6 +36,7 @@ pub mod nesting_limits;
 pub mod notice;
 pub mod numeric;
 pub mod parallel_search;
+pub mod headline_limits;
 pub mod plpgsql_limits;
 pub mod policy;
 pub mod precision;

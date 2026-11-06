@@ -1870,6 +1870,11 @@ pub enum BuiltinFn {
     Lpad2,
     /// `lpad(s: Text, len: Scalar, fill: Text) -> Text`。
     Lpad3,
+    /// `ts_headline(doc: Text, query: Text) -> Text`（Issue #2125・SEARCH-14 ポインタ）。
+    /// ペイロードは束縛時に焼き込んだ出力バイト長・断片数の上限（評価時にスコープへ依存しない）。
+    TsHeadline2(crate::headline_limits::HeadlineLimits),
+    /// `ts_headline(doc: Text, query: Text, options: Text) -> Text`。
+    TsHeadline3(crate::headline_limits::HeadlineLimits),
     /// `rpad(s: Text, len: Scalar) -> Text`（Issue #1904・SQL-65）。
     Rpad2,
     /// `rpad(s: Text, len: Scalar, fill: Text) -> Text`。
@@ -2373,6 +2378,9 @@ fn is_variadic_or_overloaded_builtin_name(name: &str) -> bool {
             | "timezone"
             | "lpad"
             | "rpad"
+            // `ts_headline`（Issue #2125）は 2／3 引数のオーバーロードで、束縛時に上限を
+            // 焼き込むため名前だけでは variant が定まらない。
+            | "ts_headline"
             // `greatest`／`least`（SQL-65・Issue #1909）は引数型を統一する可変長関数で、
             // `BuiltinFn` では表せないため専用ノード（`BoundExpr::MinMax`）へ束縛する。
             | "greatest"
@@ -2417,6 +2425,11 @@ pub(crate) fn builtin_signature(f: BuiltinFn) -> (&'static [ExprType], ExprType)
         }
         BuiltinFn::Lpad3 | BuiltinFn::Rpad3 => (
             &[ExprType::Text, ExprType::Scalar, ExprType::Text],
+            ExprType::Text,
+        ),
+        BuiltinFn::TsHeadline2(_) => (&[ExprType::Text, ExprType::Text], ExprType::Text),
+        BuiltinFn::TsHeadline3(_) => (
+            &[ExprType::Text, ExprType::Text, ExprType::Text],
             ExprType::Text,
         ),
         BuiltinFn::SplitPart => (
@@ -2585,6 +2598,8 @@ pub(crate) fn is_foldable_builtin(f: BuiltinFn) -> bool {
         | BuiltinFn::Substr3
         | BuiltinFn::Lpad2
         | BuiltinFn::Lpad3
+        | BuiltinFn::TsHeadline2(_)
+        | BuiltinFn::TsHeadline3(_)
         | BuiltinFn::Rpad2
         | BuiltinFn::Rpad3
         | BuiltinFn::SplitPart
@@ -2670,6 +2685,7 @@ pub(crate) fn builtin_call_arity(name: &str) -> Option<BuiltinArity> {
         "greatest" | "least" => fixed(1, MAX_FUNCTION_CALL_ARGS),
         "substr" => fixed(2, 3),
         "lpad" | "rpad" => fixed(2, 3),
+        "ts_headline" => fixed(2, 3),
         "round" => fixed(1, 2),
         "log" => fixed(1, 2),
         "trunc" => fixed(1, 2),
@@ -4041,6 +4057,7 @@ fn validate_closed_expr(
                 || name.eq_ignore_ascii_case("substring")
                 || name.eq_ignore_ascii_case("lpad")
                 || name.eq_ignore_ascii_case("rpad")
+                || name.eq_ignore_ascii_case("ts_headline")
             {
                 if !matches!(args.len(), 2 | 3) {
                     return Err(SqlSurfaceError::undefined_function(format!(
@@ -9615,6 +9632,9 @@ fn bind_call(
     if lower_name == "lpad" || lower_name == "rpad" {
         return bind_pad(name, &lower_name, args, env, node_budget);
     }
+    if lower_name == "ts_headline" {
+        return bind_ts_headline(name, args, env, node_budget);
+    }
     if lower_name == "round" || lower_name == "trunc" {
         // `round`（SQL-26）／`trunc`（Issue #1908・SQL-65）は arity オーバーロード:
         // 1 引数形は `Round1`／`Trunc1`、2 引数形（小数点以下 `n` 桁）は
@@ -10478,6 +10498,30 @@ fn bind_pad(
         (2, false) => BuiltinFn::Rpad2,
         (3, false) => BuiltinFn::Rpad3,
         (got, _) => {
+            return Err(SqlSurfaceError::undefined_function(format!(
+                "function {name} expects 2 or 3 arguments, got {got}"
+            )))
+        }
+    };
+    let (param_types, ret) = builtin_signature(builtin);
+    bind_strict_text_fn(name, builtin, args, param_types, ret, env, node_budget)
+}
+
+/// `TS_HEADLINE(doc, query[, options])`（Issue #2125・SEARCH-14 ポインタ）。引数 2 個は
+/// `TsHeadline2`、3 個は `TsHeadline3` へ束縛し、現在の束縛スコープの上限
+/// （`headline_limits`。CLI で下げた値）をペイロードに焼き込む。型不一致は `42804`、
+/// 個数不一致は `42883`。
+fn bind_ts_headline(
+    name: &str,
+    args: &[Expr],
+    env: &mut BindEnv<'_>,
+    node_budget: &mut usize,
+) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
+    let limits = crate::headline_limits::current_headline_limits();
+    let builtin = match args.len() {
+        2 => BuiltinFn::TsHeadline2(limits),
+        3 => BuiltinFn::TsHeadline3(limits),
+        got => {
             return Err(SqlSurfaceError::undefined_function(format!(
                 "function {name} expects 2 or 3 arguments, got {got}"
             )))
@@ -12015,6 +12059,23 @@ pub(crate) fn apply_builtin<'a>(
                     } else {
                         string_fn::rpad(&s, len, &fill)?
                     };
+                    Ok(ExprValue::Text(Cow::Owned(out)))
+                }
+                _ => Ok(ExprValue::Null),
+            }
+        }
+        BuiltinFn::TsHeadline2(limits) | BuiltinFn::TsHeadline3(limits) => {
+            let doc = take_text_or_null_arg(args, 0)?;
+            let query = take_text_or_null_arg(args, 1)?;
+            let options = if matches!(f, BuiltinFn::TsHeadline3(_)) {
+                take_text_or_null_arg(args, 2)?
+            } else {
+                None
+            };
+            let has_options_arg = matches!(f, BuiltinFn::TsHeadline3(_));
+            match (doc, query) {
+                (Some(doc), Some(query)) if !has_options_arg || options.is_some() => {
+                    let out = string_fn::ts_headline(&doc, &query, options.as_deref(), limits)?;
                     Ok(ExprValue::Text(Cow::Owned(out)))
                 }
                 _ => Ok(ExprValue::Null),
@@ -13728,6 +13789,7 @@ mod tests {
             "lpad",
             "rpad",
             "split_part",
+            "ts_headline",
             "round",
             "log",
             "ln",
@@ -13848,6 +13910,8 @@ mod tests {
             BuiltinFn::Substr3,
             BuiltinFn::Lpad2,
             BuiltinFn::Lpad3,
+            BuiltinFn::TsHeadline2(crate::headline_limits::HeadlineLimits::default()),
+            BuiltinFn::TsHeadline3(crate::headline_limits::HeadlineLimits::default()),
             BuiltinFn::Rpad2,
             BuiltinFn::Rpad3,
             BuiltinFn::SplitPart,

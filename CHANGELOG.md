@@ -49,6 +49,8 @@
 
 ### Added
 
+- SQL 組み込み関数 `ts_headline(doc, query[, options])` を追加した（Issue #2125・SEARCH-14 ポインタ）。一致箇所を `StartSel`／`StopSel` で囲んだ抜粋を返す。オプション 8 種（`StartSel`・`StopSel`・`MaxWords`・`MinWords`・`ShortWord`・`HighlightAll`・`MaxFragments`・`FragmentDelimiter`）と既定値は PostgreSQL 17 に合わせ、ASCII の英字・空白・基本的な句読点では出力が一致する。HTML などはエスケープしない（表示側の責務）。未知のオプション・不正な値は `22023`、書式エラーは `42601`、出力長・断片数・仕事量の上限超過は切り詰めずに `54000`。出力長と断片数の上限は新フラグ `--max-ts-headline-bytes`／`--max-ts-headline-fragments` で下げられる。公開モジュール `headline_limits`・`sparse::headline` と `EngineCore::with_headline_limits`／`headline_limits` を追加した。式索引・生成列には置けない（`42P17`）。
+  BREAKING CHANGE: 公開 enum `sql::udf_call::BuiltinFn` に variant `TsHeadline2`／`TsHeadline3` を追加した（網羅的 `match` の下流は追随が必要）。
 - 除外語・前方一致・`or` を可視集合の BM25 へ結線する評価経路を追加した（Issue #2115・SEARCH-12／RLS-8 ポインタ）。`SparseIndex::score_text_query_within`／`score_text_query_str_within`・`sparse::text_eval::TextSearchError`・`text_query_limits::TextQueryLimits`・`EngineCore::with_text_query_limits`、wire-server の起動フラグ `--max-text-query-terms`・`--max-text-query-prefix-expansions`（範囲 `1`〜`1024`）。上限超過は `54000`。SQL／NoSQL への配線は #2116。
 - wire-server に `--stopwords-file <path>`・`--synonyms-file <path>` を追加し、疎検索（BM25）のストップワード・同義語を opt-in で設定できるようにした（Issue #2130・SEARCH-16 ポインタ）。起動時にだけ読み、不正・上限超過のファイルは起動エラー（セッション・SQL・HTTP からは変更不可）。engine に `sparse::TextAnalysis`・`SparseIndex::build_with_analysis`・`EngineCore::with_text_analysis` 等を追加した。未指定時の結果は不変。
 - 疎索引に出現位置を持たせ、フレーズ一致の基本関数を追加した（Issue #2114・SEARCH-12 ポインタ）。公開モジュール `sparse::phrase` の `PhrasePattern`・`PhraseHit`・`PhraseError`・`MAX_PHRASE_REQUIRED_TOKENS` と、`SparseIndex::phrase_matches`／`phrase_matches_within`／`approx_position_heap_bytes`。位置のぶん `approx_heap_bytes` が増える（実測は docs/design/sparse-inverted-index.md）。スコアは変わらない。

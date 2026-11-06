@@ -32,6 +32,12 @@
 //!   int4 範囲外でも i64 範囲内なら受理する。
 //! - `lpad`/`rpad` の結果長は [`MAX_RESULT_LEN`]（4 MiB）で `54000` に拒否する
 //!   （PostgreSQL は約 1 GB で `54000`）。
+//! - `ts_headline(doc, query[, options])`（Issue #2125・SEARCH-14 ポインタ）は検索設定名を取る
+//!   3・4 引数形（`regconfig`）と `tsquery` 型を持たず、検索語は索引と同じトークナイザで任意語
+//!   （OR）として解釈する。HTML などのエスケープはしない（PostgreSQL と同じ。表示側の責務）。
+//!   整数として解釈できない値・範囲外の値は `22023`（PostgreSQL は `22P02`／`22003`）、
+//!   出力長・断片数・仕事量の上限超過は切り詰めず `54000`。詳細は
+//!   `docs/design/ts-headline-limits-cli.md`。
 //! - TEXT 同士の比較はバイト順（UTF-8 のコードポイント順）で、PostgreSQL の
 //!   `"C"` 照合順に相当する。
 //!
@@ -417,6 +423,46 @@ pub(crate) fn md5(s: &str) -> String {
         let _ = write!(out, "{b:02x}");
     }
     out
+}
+
+/// `ts_headline(doc, query[, options])`（Issue #2125・SEARCH-14 ポインタ）。純粋実装
+/// （`sparse::headline`）の [`HeadlineError`](crate::sparse::headline::HeadlineError) を
+/// `wire_code` へ写像する。エラー文言は固定で、本文・検索語・オプション値を含めない。
+///
+/// 写像: 未知のオプション名・不正な値は `22023`、オプション文字列の書式エラーは `42601`、
+/// 検索語の上限超過は `22000`、本文・一致数・出力長・断片数・仕事量の上限超過は `54000`。
+pub(crate) fn ts_headline(
+    doc: &str,
+    query: &str,
+    options: Option<&str>,
+    limits: crate::headline_limits::HeadlineLimits,
+) -> Result<String, SqlSurfaceError> {
+    use crate::sparse::headline::{ts_headline as run, HeadlineError};
+    use crate::sparse::match_span::MatchSpanError;
+    run(doc, query, options, &limits).map_err(|e| match e {
+        HeadlineError::UnknownOption => SqlSurfaceError::InvalidParameterValue {
+            detail: "unrecognized headline parameter",
+        },
+        HeadlineError::InvalidValue { detail } => SqlSurfaceError::InvalidParameterValue { detail },
+        HeadlineError::MalformedOptions => {
+            SqlSurfaceError::unsupported("invalid parameter list format")
+        }
+        HeadlineError::Span(MatchSpanError::TooManyQueryTerms { .. })
+        | HeadlineError::Span(MatchSpanError::QueryTooLong { .. }) => {
+            SqlSurfaceError::invalid_input("ts_headline query exceeds the search query limits")
+        }
+        HeadlineError::Span(_) => {
+            SqlSurfaceError::payload_too_large("ts_headline input exceeds the highlight limits")
+        }
+        HeadlineError::OutputTooLong { .. } => {
+            SqlSurfaceError::payload_too_large("ts_headline result exceeds the configured limit")
+        }
+        HeadlineError::TooManyFragments { .. } => SqlSurfaceError::payload_too_large(
+            "ts_headline MaxFragments exceeds the configured limit",
+        ),
+        // `HeadlineError` は non_exhaustive。将来の variant も拒否側（54000）に倒す。
+        _ => SqlSurfaceError::payload_too_large("ts_headline work limit exceeded"),
+    })
 }
 
 #[cfg(test)]

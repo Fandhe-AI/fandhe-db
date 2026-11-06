@@ -165,6 +165,8 @@ fn builtin_arg_is_text(name: &str, index: usize) -> bool {
         // Issue #1904・SQL-65: lpad／rpad は s と fill が text、split_part は s と delim が text。
         "lpad" | "rpad" => index == 0 || index == 2,
         "split_part" => index <= 1,
+        // Issue #2125: ts_headline は全引数が text（本文・検索語・オプション）。
+        "ts_headline" => true,
         "replace" | "position" | "concat" => true,
         // jsonb_extract_path(_text) のパス要素（2 番目以降）は text（Issue #1599）。
         "jsonb_extract_path" | "jsonb_extract_path_text" => index >= 1,
@@ -178,9 +180,8 @@ fn builtin_arg_is_text(name: &str, index: usize) -> bool {
 fn builtin_return_type(name: &str) -> Ty {
     match name.to_ascii_lowercase().as_str() {
         "lower" | "upper" | "trim" | "replace" | "concat" | "substr" | "substring" | "left"
-        | "right" | "reverse" | "initcap" | "lpad" | "rpad" | "split_part" | "md5" => {
-            Ty::Known(PreparedParamType::Text)
-        }
+        | "right" | "reverse" | "initcap" | "lpad" | "rpad" | "split_part" | "md5"
+        | "ts_headline" => Ty::Known(PreparedParamType::Text),
         // ベクトル形状関数（Issue #2012・#2023）。ベクトル・bit を返すものは `$n` の型付け対象外。
         "vector_dims" => Ty::Known(scalar("?column?", ColumnType::Integer)),
         "l2_normalize" | "subvector" | "binary_quantize" => Ty::Untyped,
@@ -243,6 +244,7 @@ fn operator_kind(other: &Expr) -> Option<ParamContextKind> {
                     | "lpad"
                     | "rpad"
                     | "split_part"
+                    | "ts_headline"
                     | "substring"
                     | "length"
                     | "position"

@@ -135,6 +135,7 @@ cargo run -p fandhe-db-wire-server -- --users <ユーザーストアのパス> -
   [--max-regex-compiled-size <1-10485760>] \
   [--max-text-query-terms <1-1024>] [--max-text-query-prefix-expansions <1-1024>] \
   [--max-sparsevec-nnz <1-16000>] \
+  [--max-ts-headline-bytes <1-4194304>] [--max-ts-headline-fragments <1-1024>] \
   [--max-subquery-depth <1-4>] [--max-subquery-executions <1-16>] \
   [--max-cte-definitions <1-16>] [--max-cte-nesting-depth <1-4>] [--max-window-keys <1-8>] \
   [--max-join-relations <2-8>] [--max-join-input-rows <1-100000>] [--max-join-output-rows <1-100000>] \
@@ -529,6 +530,8 @@ fail-closed で起動エラーです。上限を引き上げることはでき�
 `--max-text-query-terms <N>`（既定 1,024・範囲 `1`〜`1,024`）・`--max-text-query-prefix-expansions <N>`（既定 1,024・範囲 `1`〜`1,024`）（Issue #2115・SEARCH-12）は、全文検索クエリの項数（`or` のグループごとの一意な語の総和）と前方一致（`語*`）の展開語数（可視集合で出現する語のみ）の上限を、プロセス全体に対して起動時に**下げる方向だけ**設定します（未指定はハード上限と同じ値です）。超過時の SQLSTATE は `54000` で、一部の語だけで黙って検索することはありません。`HYBRID` の検索語（SQL）と NoSQL の `hybrid.text` は、フレーズ（`"語 語"`）・`or`・除外（`-語`）・前方一致（`語*`）のクエリ構文として解釈され（Issue #2116。演算子を含まない検索語は従来と同じ結果。`USING PLAN` の検索語は構文を解釈しません）、これらの上限が効きます。範囲外・非数値・値欠落・2 回目以降の重複指定は fail-closed で起動エラーです（詳細: [docs/design/text-query-limits-cli.md](docs/design/text-query-limits-cli.md)）。
 
 `--max-sparsevec-nnz <N>`（既定 16,000・範囲 `1`〜`16,000`）（Issue #2027・TABLE-47 (2)）は、`SPARSEVEC(N)` 列へ書き込む値の非ゼロ要素数の上限を、プロセス全体に対して起動時に**下げる方向だけ**設定します（未指定はハード上限と同じ値です）。超過時の SQLSTATE は `54000` です。上限を下げて再起動しても既存の行は読め、下げた値は新しく書き込む値にだけ効きます。範囲外・非数値・値欠落・2 回目以降の重複指定は fail-closed で起動エラーです（詳細: [docs/design/sparsevec-limits-cli.md](docs/design/sparsevec-limits-cli.md)）。
+
+`--max-ts-headline-bytes <N>`（既定 4,194,304・範囲 `1`〜`4,194,304`）と `--max-ts-headline-fragments <N>`（既定 1,024・範囲 `1`〜`1,024`）（Issue #2125・SEARCH-14）は、SQL 関数 `ts_headline` の出力のバイト長と `MaxFragments` オプションの値の上限を、プロセス全体に対して起動時に**下げる方向だけ**設定します（未指定はハード上限と同じ値です）。超過時は結果を切り詰めずに SQLSTATE `54000` で拒否します。`ts_headline` は HTML などをエスケープしないため、結果を HTML として表示する場合は表示する側でエスケープしてください。範囲外・非数値・値欠落・2 回目以降の重複指定は fail-closed で起動エラーです（詳細: [docs/design/ts-headline-limits-cli.md](docs/design/ts-headline-limits-cli.md)）。
 
 `--max-window-keys <N>`（既定 8・範囲 `1`〜`8`）（Issue #1900・SQL-46・SQL-64）は、ウィンドウ項目の `PARTITION BY`／`ORDER BY` の
 キー数上限（両句で 1 つの値を共有）を、プロセス全体に対して起動時に**下げる方向だけ**設定します（未指定は現行の
