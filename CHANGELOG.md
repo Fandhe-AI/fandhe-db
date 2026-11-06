@@ -35,6 +35,7 @@
 
 ### Added
 
+- 全文検索クエリ構文のパーサ `sparse::text_query::parse_text_query` を追加した（Issue #2113・SEARCH-12 ポインタ）。引用符フレーズ・`or`・`-` 除外・語末 `*` の前方一致を構文木へ変換する純関数で、追加のみ（既存の検索経路は未結線）。
 - `HYBRID`／`hybrid_rrf` に名前付き調整引数 `k1`・`b`・`rrf_k`・`window`・`weights` の構文と束縛を追加した（Issue #2119・SEARCH-13 ポインタ）。字句は空白なしの `=>` を 1 トークンにする（`= >` は従来どおり 2 トークン）。範囲外・型の不一致は `22000`、未知の名前・曖昧な構文は `42601`。実行器が未接続の間は、調整引数を指定した文を実行・EXPLAIN とも `0A000` で拒否する。名前付き引数なしの文の結果は変わらない。
   BREAKING CHANGE: 公開 enum `sql::allowlist::FunctionArg` に variant `Named` を、`sql::parser::Ranking::Hybrid` にフィールド `tuning` を、公開 enum `sql::lexer::Token` に variant `NamedArgArrow` を追加した（網羅的 `match` や構造体リテラルで構築している下流は追随が必要）。
 - NoSQL の `scan` に不透明カーソル `after`／`next_cursor` を追加した（Issue #2094・NOSQL-23・TASK-253 ポインタ）。`after`（文字列または `null`）を付けた要求だけがキーセットモードで、応答の `row_count` の後ろに `next_cursor`（最後のページは `null`）が付く。`offset` との併用は `42601`、改ざん・別ユーザー・別テナント・別 `sort`・別表・別サーバー鍵のカーソルは `22000`。`after` の無い要求は不変。封緘鍵はプロセス内だけで保持し、再起動で既発行カーソルは無効になる。
