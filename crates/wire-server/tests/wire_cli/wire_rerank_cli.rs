@@ -12,6 +12,9 @@ use std::time::Duration;
 
 const RERANKER: &str = "--reranker";
 const WINDOW: &str = "--rerank-window";
+const MODEL: &str = "--rerank-model";
+const TOKENIZER: &str = "--rerank-tokenizer";
+const TIMEOUT: &str = "--rerank-timeout-ms";
 
 fn base_args(fixture: &common::TempFixtureDir) -> Vec<String> {
     vec![
@@ -59,7 +62,7 @@ fn valid_rerank_flags_start_listening() {
 /// R2: 不正な指定は起動エラー。
 #[test]
 fn invalid_rerank_flags_are_rejected() {
-    let cases: [(&[&str], &str); 17] = [
+    let cases: [(&[&str], &str); 23] = [
         (&[RERANKER], RERANKER),
         (
             &[RERANKER, "lexical", RERANKER, "off"],
@@ -74,7 +77,32 @@ fn invalid_rerank_flags_are_rejected() {
         (&[RERANKER, ""], RERANKER),
         (&[RERANKER, "identity"], RERANKER),
         (&[RERANKER, "mmr"], "not supported"),
-        (&[RERANKER, "cross_encoder"], "not supported"),
+        // cross_encoder: 組み合わせ・書式の誤りは feature の有無によらず同じ拒否（Issue #2144）。
+        (&[RERANKER, "cross_encoder"], MODEL),
+        (
+            &[RERANKER, "cross_encoder", MODEL, "/nonexistent/m"],
+            TOKENIZER,
+        ),
+        (&[RERANKER, "cross_encoder", MODEL], MODEL),
+        (
+            &[RERANKER, "cross_encoder", MODEL, "a", MODEL, "b"],
+            "specified more than once",
+        ),
+        (&[RERANKER, "lexical", MODEL, "/nonexistent/m"], MODEL),
+        (&[RERANKER, "off", TIMEOUT, "5"], TIMEOUT),
+        (
+            &[
+                RERANKER,
+                "cross_encoder",
+                MODEL,
+                "a",
+                TOKENIZER,
+                "b",
+                TIMEOUT,
+                "0",
+            ],
+            TIMEOUT,
+        ),
         (&[RERANKER, "lexical", WINDOW], WINDOW),
         (&[RERANKER, "lexical", WINDOW, "0"], WINDOW),
         (&[RERANKER, "lexical", WINDOW, "10001"], WINDOW),
@@ -99,4 +127,33 @@ fn invalid_rerank_flags_are_rejected() {
             "args={extra:?}: expected {expected:?}, got: {stderr}"
         );
     }
+}
+
+/// R3: 書式が正しい `cross_encoder` でもモデルが存在しなければ起動エラー（feature の有無で
+/// 失敗の段は変わるため、非 0 終了・フラグ名の言及・パスを出さないことだけを確かめる）。
+#[test]
+fn cross_encoder_with_missing_model_files_is_rejected_without_leaking_paths() {
+    let fixture = common::TempFixtureDir::new("rr-ce-missing");
+    common::write_empty_user_store(&fixture.users_path_str());
+    let output = Command::new(env!("CARGO_BIN_EXE_wire-server"))
+        .args(base_args(&fixture))
+        .args([
+            RERANKER,
+            "cross_encoder",
+            MODEL,
+            "/nonexistent/secret-dir/model.onnx",
+            TOKENIZER,
+            "/nonexistent/secret-dir/tokenizer.json",
+            TIMEOUT,
+            "500",
+        ])
+        .output()
+        .expect("spawn wire-server");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(RERANKER) || stderr.contains(MODEL),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("secret-dir"), "{stderr}");
 }

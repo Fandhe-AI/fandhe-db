@@ -226,7 +226,7 @@
 - 縮退: 検索全体は拒否せず、事後フィルタ前に控えた「off の先頭 `k_eff` 件」のスロット集合で
   絞り直して off と同一の列に戻す。固定の英語 1 行（理由・種別のみ）を実行ログへ出し、理由別
   カウンタ（`EngineCore::rerank_stats`）を増やす。`statement_timeout`／キャンセルは 57014 が
-  優先で縮退にしない。`timeout`・`mmr_budget` は語彙のみで #2143・#2144 で到達する。
+  優先で縮退にしない。`timeout` は #2144 で到達し、`mmr_budget` は語彙のみで #2143 で到達する。
 - EXPLAIN は変更しない（off ではバイト単位で不変。行の追加は #2147）。
 - 性能（受け入れ 1。off の無劣化）: 同一マシンで base（main）と head を
   `cargo bench --bench hybrid_profile_bench -p fandhe-db-engine --features bench-internals` で
@@ -234,3 +234,24 @@
   4407/4062 us（base）→ 4328/4018 us（head）、`sql_dense_knn` は 948/889 us → 930/879 us で、
   ノイズ幅に収まる。bench 末尾の B1/B4 id 集合不一致の検査は base でも同じく失敗する
   既存事象で、本変更の影響ではない。
+
+## 8. 実装メモ（#2144）
+
+- 結線: `--reranker cross_encoder` は `--rerank-model`・`--rerank-tokenizer`（必須）と
+  `--rerank-timeout-ms`（`1..=60000`、既定 1000）を伴う。判定順は、語彙、フラグの組み合わせ、
+  窓幅・期限の書式、ビルドの対応可否、ファイルの読み込みで、前半は feature の有無によらず同じ結果になる。
+- ビルド構成: `wire-server` の `Cargo.toml` は変えていない。`#[cfg(feature = "cross-encoder")]` は
+  engine 側だけに置き、wire-server は `engine::rerank::cross_encoder_available()` で実行時に分岐する。
+  有効化は `--features engine/cross-encoder` で行う。**第 6 節の wire-server への feature 転送と、
+  既定ビルドへ含めるかどうかは、本変更では解決していない（ユーザー承認待ちのまま）**。
+- パス検証（D2 の持ち越しを確定）: `..` を含むパスを拒否し、通常ファイルであることをパスと open 後の
+  ハンドルの両方で確かめ、`take(上限 + 1)` で有界に読む（TOCTOU・無限ストリーム対策）。エラーは
+  パスを含まない閉じた固定語（`parent_dir_component`・`not_regular_file`・`too_large`・`unreadable`）。
+- サイズ上限（自動運転下の暫定判断で、**人間による確認が必要**）: モデル 2 GiB（protobuf の単一ファイル
+  上限。外部データ形式の ONNX は非対応）、トークナイザ 64 MiB。`batch_size` 32・`max_seq_len` 512 も同様。
+  読み込み中はモデルの約 2 倍のメモリを一時的に使う（ort が内部でコピーするため）。
+- 期限（D5）: `CrossEncoderReranker::with_timeout` が `rerank` の入口から計測し、各バッチの後に超過を
+  検査する。超過は `CrossEncoderError::Timeout` で、実行器は `degraded_timeout` として縮退する
+  （検索は拒否しない）。スレッドは作らず、超過幅は最大 1 バッチ分。
+- 検証: スタブバックエンドで決定的に確かめた。実モデルでの起動は `ORT_DYLIB_PATH` とモデルが要る手動手順で、
+  本変更では未検証。

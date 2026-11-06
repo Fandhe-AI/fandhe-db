@@ -1,22 +1,32 @@
-//! `wire-server` バイナリ（`main.rs`）が起動時に受け取る `--reranker`／`--rerank-window` の
-//! opt-in CLI 引数のパーサ（Issue #2142。ビヘイビア SEARCH-15 のポインタ。設計記録:
-//! `docs/design/rerank-wiring-policy.md` D1・D2）。
+//! `wire-server` バイナリ（`main.rs`）が起動時に受け取る `--reranker`／`--rerank-window`／
+//! `--rerank-model`／`--rerank-tokenizer`／`--rerank-timeout-ms` の opt-in CLI 引数のパーサ
+//! （Issue #2142・#2144。ビヘイビア SEARCH-15 のポインタ。設計記録:
+//! `docs/design/rerank-wiring-policy.md` D1・D2・D5）。
 //!
 //! `search_engine_opt`・`statement_timeout_opt` と同型の「プロセス起動時にのみ明示指定する
 //! 注入点」。語彙（`off`／`lexical`／`mmr`／`cross_encoder` の閉じた 4 語）はここで厳密一致
-//! だけで判定し（engine 側は `FromStr` を持たない）、窓幅の範囲判定は engine の単一情報源
-//! [`engine::rerank::validate_rerank_window`] に委ねる。解決結果は `main.rs` が bind・ユーザー
-//! ストア読込より前に [`resolve`] で確定し、`EngineCore::with_rerank` へ 1 回だけ注入する
-//! （セッション・SQL・NoSQL からは変更できない）。
+//! だけで判定し（engine 側は `FromStr` を持たない）、窓幅・期限の範囲判定は engine の単一情報源
+//! （`validate_rerank_window`・`validate_rerank_timeout_ms`）に委ねる。解決結果は `main.rs` が
+//! bind・ユーザーストア読込より前に [`resolve`] で確定し、`EngineCore::with_rerank` へ 1 回だけ
+//! 注入する（セッション・SQL・NoSQL からは変更できない）。
 //!
-//! `mmr`・`cross_encoder` は語彙としては受理するが、本ビルドでは未対応のため固定文言で起動を
-//! 拒否する（黙って `off` へ読み替えない。後続 Issue #2143・#2144 で解禁）。`off`（または未指定）
-//! のまま `--rerank-window` を指定する、語彙外の値、範囲外・非数値・先頭 `+`・空白付きの値も
-//! fail-closed で起動エラー。エラー文に含めるのはフラグ名・入力値・範囲だけとする。
+//! `mmr` は語彙としては受理するが、本ビルドでは未対応のため固定文言で起動を拒否する
+//! （黙って `off` へ読み替えない。後続 Issue #2143 で解禁）。`cross_encoder`（Issue #2144）は
+//! `--rerank-model`／`--rerank-tokenizer`（必須）と `--rerank-timeout-ms`（`1..=60000`、既定
+//! 1000）を伴い、engine の `cross-encoder` feature 付きビルドでのみ受理する（無効ビルドでは
+//! 固定文言で起動拒否）。モデルのパス検証・サイズ上限・読み込みは engine の
+//! `onnx_cross_encoder_method` に一本化し、失敗は起動エラーにする。`off`（または未指定）
+//! のまま `--rerank-window` を指定する、`cross_encoder` 以外でモデル系フラグを指定する、
+//! 語彙外の値、範囲外・非数値・先頭 `+`・空白付きの値も fail-closed で起動エラー。
+//! エラー文に含めるのはフラグ名・入力値（窓幅・期限のみ）・範囲だけで、パスとファイルの
+//! 中身は出さない。
+
+use std::path::Path;
 
 use engine::rerank::{
-    validate_rerank_window, LexicalOverlapReranker, RerankMethod, RerankSettings,
-    DEFAULT_RERANK_WINDOW,
+    cross_encoder_available, onnx_cross_encoder_method, validate_rerank_timeout_ms,
+    validate_rerank_window, CrossEncoderError, CrossEncoderFile, LexicalOverlapReranker,
+    RerankMethod, RerankSettings, DEFAULT_RERANK_TIMEOUT_MS, DEFAULT_RERANK_WINDOW,
 };
 
 /// リランカー方式を選ぶ CLI フラグ名。
@@ -24,6 +34,15 @@ pub const RERANKER_FLAG: &str = "--reranker";
 
 /// リランク窓の幅 `W` を指定する CLI フラグ名。
 pub const RERANK_WINDOW_FLAG: &str = "--rerank-window";
+
+/// クロスエンコーダの ONNX モデルファイルを指定する CLI フラグ名（Issue #2144）。
+pub const RERANK_MODEL_FLAG: &str = "--rerank-model";
+
+/// クロスエンコーダの `tokenizer.json` を指定する CLI フラグ名（Issue #2144）。
+pub const RERANK_TOKENIZER_FLAG: &str = "--rerank-tokenizer";
+
+/// クロスエンコーダの推論期限（ミリ秒）を指定する CLI フラグ名（Issue #2144）。
+pub const RERANK_TIMEOUT_FLAG: &str = "--rerank-timeout-ms";
 
 /// `--reranker` が受理する閉じた語彙（ADR D2）。
 pub const TOKENS: [&str; 4] = ["off", "lexical", "mmr", "cross_encoder"];
@@ -35,17 +54,65 @@ pub struct RerankRawFlags<'a> {
     pub reranker: Option<&'a str>,
     /// `--rerank-window` の値。
     pub window: Option<&'a str>,
+    /// `--rerank-model` の値（`cross_encoder` のときだけ指定可・必須）。
+    pub model: Option<&'a Path>,
+    /// `--rerank-tokenizer` の値（`cross_encoder` のときだけ指定可・必須）。
+    pub tokenizer: Option<&'a Path>,
+    /// `--rerank-timeout-ms` の値（`cross_encoder` のときだけ指定可。既定 1000）。
+    pub timeout_ms: Option<&'a str>,
 }
 
 /// ASCII 数字だけを受理する厳密な 10 進パース（先頭 `+`・空白・全角数字・空文字を弾く）。
-fn parse_strict_decimal(raw: &str) -> Option<usize> {
+fn parse_strict_decimal(raw: &str) -> Option<u64> {
     if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
     raw.parse().ok()
 }
 
-/// 未パース値からリランク設定を解決する純関数。未指定は off（従来経路）。
+/// 窓幅の書式・範囲を検証する。
+fn parse_window(raw: Option<&str>) -> Result<usize, String> {
+    let Some(raw) = raw else {
+        return Ok(DEFAULT_RERANK_WINDOW);
+    };
+    let err = || format!("{RERANK_WINDOW_FLAG} expects an integer in 1..=10000, got {raw:?}");
+    let v = parse_strict_decimal(raw)
+        .and_then(|v| usize::try_from(v).ok())
+        .ok_or_else(err)?;
+    validate_rerank_window(v).map_err(|_| err())
+}
+
+/// 推論期限の書式・範囲を検証する。
+fn parse_timeout(raw: Option<&str>) -> Result<std::time::Duration, String> {
+    let err =
+        |got: &str| format!("{RERANK_TIMEOUT_FLAG} expects an integer in 1..=60000, got {got:?}");
+    let ms = match raw {
+        None => DEFAULT_RERANK_TIMEOUT_MS,
+        Some(raw) => parse_strict_decimal(raw).ok_or_else(|| err(raw))?,
+    };
+    validate_rerank_timeout_ms(ms).map_err(|_| err(&ms.to_string()))
+}
+
+/// モデル構築失敗を起動エラー文へ変換する。パスとファイル内容は出さない
+/// （`ModelFile` は閉じた固定語、それ以外は engine の固定文言）。
+fn load_error(e: &CrossEncoderError) -> String {
+    match e {
+        CrossEncoderError::ModelFile { file, reason } => {
+            let flag = match file {
+                CrossEncoderFile::Model => RERANK_MODEL_FLAG,
+                CrossEncoderFile::Tokenizer => RERANK_TOKENIZER_FLAG,
+            };
+            format!("{flag} rejected ({reason})")
+        }
+        other => format!("{RERANKER_FLAG} cross_encoder: failed to load model ({other})"),
+    }
+}
+
+/// 未パース値からリランク設定を解決する。未指定は off（従来経路）。`cross_encoder` のときだけ
+/// モデル／トークナイザの読み込み（ファイル I/O）を行う。
+///
+/// 判定順: 語彙 → フラグの組み合わせ → 窓幅・期限の書式 → ビルドの対応可否 → 読み込み。
+/// 前半は純粋な検証で、feature の有無によらず同じ結果になる。
 pub fn resolve(flags: RerankRawFlags<'_>) -> Result<RerankSettings, String> {
     let token = flags.reranker.unwrap_or("off");
     if !TOKENS.contains(&token) {
@@ -53,32 +120,56 @@ pub fn resolve(flags: RerankRawFlags<'_>) -> Result<RerankSettings, String> {
             "{RERANKER_FLAG} expects one of off, lexical, mmr, cross_encoder, got {token:?}"
         ));
     }
+    if token == "off" {
+        if let Some(w) = flags.window {
+            return Err(format!(
+                "{RERANK_WINDOW_FLAG} requires {RERANKER_FLAG} other than off, got {w:?}"
+            ));
+        }
+    }
+    if token != "cross_encoder" {
+        let ce_flags = [
+            (RERANK_MODEL_FLAG, flags.model.is_some()),
+            (RERANK_TOKENIZER_FLAG, flags.tokenizer.is_some()),
+            (RERANK_TIMEOUT_FLAG, flags.timeout_ms.is_some()),
+        ];
+        if let Some((flag, _)) = ce_flags.iter().find(|(_, present)| *present) {
+            return Err(format!(
+                "{flag} requires {RERANKER_FLAG} cross_encoder, got {token:?}"
+            ));
+        }
+    }
+    if token == "off" {
+        return Ok(RerankSettings::off());
+    }
+    let window = parse_window(flags.window)?;
     let method = match token {
-        "off" => {
-            if let Some(w) = flags.window {
+        "lexical" => RerankMethod::Lexical(LexicalOverlapReranker::default()),
+        "cross_encoder" => {
+            let Some(model) = flags.model else {
                 return Err(format!(
-                    "{RERANK_WINDOW_FLAG} requires {RERANKER_FLAG} other than off, got {w:?}"
+                    "{RERANKER_FLAG} cross_encoder requires {RERANK_MODEL_FLAG}"
+                ));
+            };
+            let Some(tokenizer) = flags.tokenizer else {
+                return Err(format!(
+                    "{RERANKER_FLAG} cross_encoder requires {RERANK_TOKENIZER_FLAG}"
+                ));
+            };
+            let timeout = parse_timeout(flags.timeout_ms)?;
+            if !cross_encoder_available() {
+                return Err(format!(
+                    "{RERANKER_FLAG} cross_encoder is not supported in this build"
                 ));
             }
-            return Ok(RerankSettings::off());
+            onnx_cross_encoder_method(model, tokenizer, window, timeout)
+                .map_err(|e| load_error(&e))?
         }
-        "lexical" => RerankMethod::Lexical(LexicalOverlapReranker::default()),
-        // `mmr`・`cross_encoder`: 語彙としては正しいが本ビルドには実装が無い。
+        // `mmr`: 語彙としては正しいが本ビルドには実装が無い（Issue #2143）。
         _ => {
             return Err(format!(
                 "{RERANKER_FLAG} {token} is not supported in this build"
             ));
-        }
-    };
-    let window = match flags.window {
-        None => DEFAULT_RERANK_WINDOW,
-        Some(raw) => {
-            let v = parse_strict_decimal(raw).ok_or_else(|| {
-                format!("{RERANK_WINDOW_FLAG} expects an integer in 1..=10000, got {raw:?}")
-            })?;
-            validate_rerank_window(v).map_err(|_| {
-                format!("{RERANK_WINDOW_FLAG} expects an integer in 1..=10000, got {raw:?}")
-            })?
         }
     };
     RerankSettings::new(method, window)
@@ -90,7 +181,25 @@ mod tests {
     use super::*;
 
     fn flags<'a>(reranker: Option<&'a str>, window: Option<&'a str>) -> RerankRawFlags<'a> {
-        RerankRawFlags { reranker, window }
+        RerankRawFlags {
+            reranker,
+            window,
+            ..Default::default()
+        }
+    }
+
+    fn ce<'a>(
+        model: Option<&'a Path>,
+        tokenizer: Option<&'a Path>,
+        timeout_ms: Option<&'a str>,
+    ) -> RerankRawFlags<'a> {
+        RerankRawFlags {
+            reranker: Some("cross_encoder"),
+            model,
+            tokenizer,
+            timeout_ms,
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -127,10 +236,8 @@ mod tests {
             let e = resolve(flags(Some(bad), None)).expect_err(bad);
             assert!(e.contains(RERANKER_FLAG), "{bad}: {e}");
         }
-        for unsupported in ["mmr", "cross_encoder"] {
-            let e = resolve(flags(Some(unsupported), None)).expect_err(unsupported);
-            assert!(e.contains("not supported"), "{unsupported}: {e}");
-        }
+        let e = resolve(flags(Some("mmr"), None)).expect_err("mmr");
+        assert!(e.contains("not supported"), "mmr: {e}");
     }
 
     #[test]
@@ -156,5 +263,94 @@ mod tests {
     fn window_without_active_reranker_is_rejected() {
         assert!(resolve(flags(None, Some("10"))).is_err());
         assert!(resolve(flags(Some("off"), Some("10"))).is_err());
+    }
+
+    #[test]
+    fn cross_encoder_flags_require_cross_encoder() {
+        let p = Path::new("/nonexistent/secret-model-path");
+        for reranker in [None, Some("off"), Some("lexical"), Some("mmr")] {
+            for (flag, raw) in [
+                (
+                    RERANK_MODEL_FLAG,
+                    RerankRawFlags {
+                        reranker,
+                        model: Some(p),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    RERANK_TOKENIZER_FLAG,
+                    RerankRawFlags {
+                        reranker,
+                        tokenizer: Some(p),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    RERANK_TIMEOUT_FLAG,
+                    RerankRawFlags {
+                        reranker,
+                        timeout_ms: Some("10"),
+                        ..Default::default()
+                    },
+                ),
+            ] {
+                let e = resolve(raw).expect_err(flag);
+                assert!(e.contains(flag), "{reranker:?} {flag}: {e}");
+                assert!(!e.contains("secret-model-path"), "{e}");
+            }
+        }
+    }
+
+    #[test]
+    fn cross_encoder_requires_model_and_tokenizer() {
+        let p = Path::new("/nonexistent/secret-model-path");
+        let e = resolve(ce(None, Some(p), None)).expect_err("no model");
+        assert!(e.contains(RERANK_MODEL_FLAG), "{e}");
+        let e = resolve(ce(Some(p), None, None)).expect_err("no tokenizer");
+        assert!(e.contains(RERANK_TOKENIZER_FLAG), "{e}");
+    }
+
+    #[test]
+    fn cross_encoder_rejects_malformed_timeout_regardless_of_build() {
+        let p = Path::new("/nonexistent/secret-model-path");
+        for bad in [
+            "0",
+            "60001",
+            "+5",
+            " 5",
+            "",
+            "abc",
+            "-1",
+            "99999999999999999999999",
+        ] {
+            let e = resolve(ce(Some(p), Some(p), Some(bad))).expect_err(bad);
+            assert!(e.contains(RERANK_TIMEOUT_FLAG), "{bad}: {e}");
+        }
+    }
+
+    #[test]
+    fn cross_encoder_rejects_malformed_window_regardless_of_build() {
+        let p = Path::new("/nonexistent/secret-model-path");
+        let mut f = ce(Some(p), Some(p), None);
+        f.window = Some("0");
+        let e = resolve(f).expect_err("window");
+        assert!(e.contains(RERANK_WINDOW_FLAG), "{e}");
+    }
+
+    /// 書式が正しくても、feature 無効なら「未対応」、有効ならモデル読み込み失敗で拒否される。
+    /// どちらの場合もエラー文にパスを含めない。
+    #[test]
+    fn cross_encoder_with_missing_files_fails_closed_without_leaking_paths() {
+        let dir = Path::new("/nonexistent/secret-model-path");
+        let model = dir.join("model.onnx");
+        let tok = dir.join("tokenizer.json");
+        let e = resolve(ce(Some(&model), Some(&tok), Some("500"))).expect_err("must fail");
+        assert!(!e.contains("secret-model-path"), "{e}");
+        if cross_encoder_available() {
+            assert!(e.contains(RERANK_MODEL_FLAG), "{e}");
+        } else {
+            assert!(e.contains("not supported in this build"), "{e}");
+        }
     }
 }

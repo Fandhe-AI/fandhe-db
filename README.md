@@ -368,13 +368,23 @@ NoSQL（HTTP）の `update`／`delete` は従来どおり filter 必須で、本
 fail-closed で起動エラーとなり、エラー文にファイルの中身を出しません。セッション・SQL・HTTP からは
 変更できず、未指定（既定）では従来どおりのトークン化です。
 
-`--reranker <off|lexical>`／`--rerank-window <N>`（Issue #2142）は、ハイブリッド検索の後段のリランカーと
+`--reranker <off|lexical|cross_encoder>`／`--rerank-window <N>`（Issue #2142）は、ハイブリッド検索の後段のリランカーと
 リランク対象の窓幅 `W`（`1..=10000`、既定 200）を、プロセス起動時にだけ指定する opt-in の CLI 引数です。
 既定は `off` で、結果もレイテンシも従来と変わりません。密のみの検索と `precision` モードにはリランクを適用しません。
 リランカーの契約違反やテキスト長の上限超過は検索を拒否せず、リランキング前の順位で応答し、縮退は
-実行ログ（固定の英語 1 行）とカウンタに残ります。`mmr`・`cross_encoder` は語彙としては正しいものの
+実行ログ（固定の英語 1 行）とカウンタに残ります。`mmr` は語彙としては正しいものの
 本ビルドでは未対応で、語彙外・範囲外・重複指定・`off` のままの `--rerank-window` とあわせて起動エラーに
 なります（`docs/design/rerank-wiring-policy.md`）。
+
+`--reranker cross_encoder`（Issue #2144）は、`--rerank-model <onnx>`・`--rerank-tokenizer <tokenizer.json>`
+（どちらも必須）と `--rerank-timeout-ms <N>`（`1..=60000`、既定 1000）を伴います。engine の `cross-encoder`
+feature 付きビルド（例: `cargo build --release -p fandhe-db-wire-server --features engine/cross-encoder`）
+と、実行時の環境変数 `ORT_DYLIB_PATH`（ONNX Runtime の動的ライブラリ）が必要です。feature 無効のビルドでは
+`cross_encoder` を起動エラーにします。モデルのパスは `..` を含められず、通常ファイルで、モデル 2 GiB・
+トークナイザ 64 MiB 以下に限ります（読み込み時のみ一時的にモデルの約 2 倍のメモリを使います）。
+読み込みに失敗すれば起動エラーで、エラー文にパスを出しません。推論が期限を超えた場合は検索を拒否せず、
+リランキング前の順位で応答します（縮退はログとカウンタ `degraded_timeout` に残ります）。モデルファイルは
+リポジトリにコミットしないでください。
 
 `--english-stemmer`（Issue #2129）は承認と feature 有効化の前のため、値の有無にかかわらず常に起動エラーになる
 （固定文言で拒否。`docs/design/stemming-crate-adoption.md`）。

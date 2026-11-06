@@ -58,7 +58,7 @@ cat <<'EOF'
       cargo test（workspace 全体）
       $ cargo test --workspace --all-features
   test-default-build
-      既定ビルド（fault-injection・wasm-udf 無効）専用の回帰テスト
+      既定ビルド（fault-injection・wasm-udf・cross-encoder 無効）専用の回帰テスト
       $ scripts/test_default_build.sh
   crash-test
       クラッシュ耐性回帰テスト（PERSIST-1）

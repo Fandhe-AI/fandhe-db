@@ -15,7 +15,8 @@
 //! [--hnsw-sparse-visited-max <N>]
 //! [--auth-method cleartext|scram-sha-256] [--scram-mock-key-file <path>]
 //! [--stopwords-file <path>] [--synonyms-file <path>]
-//! [--reranker off|lexical] [--rerank-window <N>]
+//! [--reranker off|lexical|cross_encoder] [--rerank-window <N>]
+//! [--rerank-model <path> --rerank-tokenizer <path> [--rerank-timeout-ms <N>]]
 //! [--ddl-allowed-users <user1>[,<user2>...]]
 //! [--tls-cert <pem> --tls-key <pem> [--tls-mode require|allow]
 //!  [--tls-scram-channel-binding enable|disable]]
@@ -394,8 +395,11 @@
 //!
 //! `--reranker <off|lexical|mmr|cross_encoder>`／`--rerank-window <N>`（Issue #2142・SEARCH-15
 //! ポインタ）: ハイブリッド検索の後段のリランカーと、リランク対象の窓幅 `W`（`1..=10000`、
-//! 既定 200）。既定は `off`（従来経路。結果もレイテンシも変わらない）。`mmr`・`cross_encoder` は
-//! 語彙としては正しいが本ビルドでは未対応で、固定文言の起動エラーにする。語彙外・範囲外・非数値・
+//! 既定 200）。既定は `off`（従来経路。結果もレイテンシも変わらない）。`mmr` は語彙としては
+//! 正しいが本ビルドでは未対応で、固定文言の起動エラーにする。`cross_encoder`（Issue #2144）は
+//! `--rerank-model`／`--rerank-tokenizer`（必須）と `--rerank-timeout-ms`（`1..=60000`、既定
+//! 1000。超過時は検索を拒否せずリランキング前の順位へ縮退）を伴い、engine の `cross-encoder`
+//! feature 付きビルド（`--features engine/cross-encoder`）でのみ受理する。語彙外・範囲外・非数値・
 //! 重複指定・`off` のままの `--rerank-window` も fail-closed で起動エラー。リランカーの契約違反は
 //! 検索を拒否せずリランキング前の順位で応答し、縮退は実行ログとカウンタに残る。解決は
 //! `wire_server::rerank_opt::resolve` に一本化し、`EngineCore::with_rerank` へ 1 回だけ注入する
@@ -612,6 +616,9 @@ fn run_server(args: &[String]) -> ExitCode {
     let mut synonyms_file_raw: Option<PathBuf> = None;
     let mut reranker_raw: Option<String> = None;
     let mut rerank_window_raw: Option<String> = None;
+    let mut rerank_model_raw: Option<PathBuf> = None;
+    let mut rerank_tokenizer_raw: Option<PathBuf> = None;
+    let mut rerank_timeout_raw: Option<String> = None;
     let mut tls_cert_raw: Option<PathBuf> = None;
     let mut tls_key_raw: Option<PathBuf> = None;
     let mut tls_mode_raw: Option<String> = None;
@@ -1990,6 +1997,60 @@ fn run_server(args: &[String]) -> ExitCode {
                 rerank_window_raw = Some(v.clone());
                 i += 2;
             }
+            wire_server::rerank_opt::RERANK_MODEL_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a path argument",
+                        wire_server::rerank_opt::RERANK_MODEL_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                if rerank_model_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::rerank_opt::RERANK_MODEL_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                rerank_model_raw = Some(PathBuf::from(v));
+                i += 2;
+            }
+            wire_server::rerank_opt::RERANK_TOKENIZER_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a path argument",
+                        wire_server::rerank_opt::RERANK_TOKENIZER_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                if rerank_tokenizer_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::rerank_opt::RERANK_TOKENIZER_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                rerank_tokenizer_raw = Some(PathBuf::from(v));
+                i += 2;
+            }
+            wire_server::rerank_opt::RERANK_TIMEOUT_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires an integer argument",
+                        wire_server::rerank_opt::RERANK_TIMEOUT_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                if rerank_timeout_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::rerank_opt::RERANK_TIMEOUT_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                rerank_timeout_raw = Some(v.clone());
+                i += 2;
+            }
             wire_server::tls_opt::CERT_FLAG => {
                 let Some(v) = args.get(i + 1) else {
                     engine::log_stderr!(
@@ -2394,6 +2455,9 @@ fn run_server(args: &[String]) -> ExitCode {
         match wire_server::rerank_opt::resolve(wire_server::rerank_opt::RerankRawFlags {
             reranker: reranker_raw.as_deref(),
             window: rerank_window_raw.as_deref(),
+            model: rerank_model_raw.as_deref(),
+            tokenizer: rerank_tokenizer_raw.as_deref(),
+            timeout_ms: rerank_timeout_raw.as_deref(),
         }) {
             Ok(s) => s,
             Err(e) => {

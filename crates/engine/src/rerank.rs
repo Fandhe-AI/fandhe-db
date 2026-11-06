@@ -770,6 +770,35 @@ pub enum CrossEncoderError {
     /// 同上。`passages` 全体の合計バイト長が [`MAX_TOTAL_CANDIDATE_TEXT_BYTES`]
     /// を超える（checked 加算。オーバーフローも同じエラーへ丸めて拒否する）。
     TotalCandidateTextTooLong { total: usize, max: usize },
+    /// 推論の期限（[`CrossEncoderReranker::with_timeout`]）を超過した（Issue #2144）。
+    /// 検索実行器はこれを検索拒否ではなく「リランキング前の順位への縮退」として扱う
+    /// （`sql::rerank_stage::degrade_reason` が `RerankDegradeReason::Timeout` へ写す）。
+    Timeout,
+    /// モデル／トークナイザファイルの事前検証違反（Issue #2144。`read_bounded_model_file`）。
+    /// パスやファイル内容は含めず、閉じた固定語の `reason` だけを持つ（情報漏えい防止）。
+    ModelFile {
+        file: CrossEncoderFile,
+        reason: &'static str,
+    },
+}
+
+/// [`CrossEncoderError::ModelFile`] が指す対象ファイルの種別（CLI フラグ名への対応づけ用）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrossEncoderFile {
+    /// ONNX モデル本体。
+    Model,
+    /// `tokenizer.json`。
+    Tokenizer,
+}
+
+impl CrossEncoderFile {
+    /// ログ・エラー文に出す固定語。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Model => "model",
+            Self::Tokenizer => "tokenizer",
+        }
+    }
 }
 
 impl fmt::Display for CrossEncoderError {
@@ -797,6 +826,12 @@ impl fmt::Display for CrossEncoderError {
             } => write!(
                 f,
                 "cross-encoder backend max_seq_len ({backend}) does not match configured max_seq_len ({configured})"
+            ),
+            CrossEncoderError::Timeout => write!(f, "cross-encoder inference timed out"),
+            CrossEncoderError::ModelFile { file, reason } => write!(
+                f,
+                "cross-encoder {} file rejected: {reason}",
+                file.as_str()
             ),
             CrossEncoderError::QueryTextTooLong { len, max } => write!(
                 f,
@@ -889,6 +924,8 @@ impl CrossEncoderConfig {
 pub struct CrossEncoderReranker<B: CrossEncoderBackend> {
     backend: B,
     cfg: CrossEncoderConfig,
+    /// 推論全体の期限（Issue #2144）。`None` は無期限（従来挙動）。
+    timeout: Option<std::time::Duration>,
 }
 
 impl<B: CrossEncoderBackend> CrossEncoderReranker<B> {
@@ -904,7 +941,19 @@ impl<B: CrossEncoderBackend> CrossEncoderReranker<B> {
                 configured: cfg.max_seq_len(),
             });
         }
-        Ok(Self { backend, cfg })
+        Ok(Self {
+            backend,
+            cfg,
+            timeout: None,
+        })
+    }
+
+    /// 推論全体の期限を設定する（Issue #2144。`--rerank-timeout-ms` の注入点）。
+    /// `rerank` の入口から計測し、各バッチ完了後に超過を検査して
+    /// [`CrossEncoderError::Timeout`] を返す（スレッドは作らない。超過幅は最大 1 バッチ分）。
+    pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
     }
 }
 
@@ -942,6 +991,7 @@ impl<B: CrossEncoderBackend> Reranker for CrossEncoderReranker<B> {
         // 対応が崩れないよう `scores` は候補順（＝ `candidates` の順）にそのまま
         // 積み上げる（`Vec` の位置対応。バックエンドは長さを保つ契約
         // [`CrossEncoderError::LengthMismatch`] で検証済み）。
+        let started = std::time::Instant::now();
         let mut scores: Vec<f64> = Vec::with_capacity(candidates.len());
         for chunk in candidates.chunks(self.cfg.batch_size()) {
             let passages: Vec<&str> = chunk.iter().map(|c| c.text).collect();
@@ -961,6 +1011,13 @@ impl<B: CrossEncoderBackend> Reranker for CrossEncoderReranker<B> {
                 return Err(RerankError::CrossEncoder(CrossEncoderError::NonFiniteScore));
             }
             scores.extend(chunk_scores);
+            // 期限検査はバッチ境界で行う。超過は検索拒否ではなく縮退として扱われる
+            // （`sql::rerank_stage::degrade_reason`）。
+            if let Some(limit) = self.timeout {
+                if started.elapsed() >= limit {
+                    return Err(RerankError::CrossEncoder(CrossEncoderError::Timeout));
+                }
+            }
         }
 
         // スコア降順・同点 id 昇順の決定的順序（`rerank_candidates` の出力契約と
@@ -1006,6 +1063,135 @@ pub fn validate_rerank_window(window: usize) -> Result<usize, RerankError> {
     Ok(window)
 }
 
+/// `--rerank-timeout-ms` の既定値（ミリ秒。Issue #2144。設計記録 ADR D5）。
+pub const DEFAULT_RERANK_TIMEOUT_MS: u64 = 1000;
+
+/// `--rerank-timeout-ms` の上限（ミリ秒）。
+const MAX_RERANK_TIMEOUT_MS: u64 = 60_000;
+
+/// 推論期限（ミリ秒）を検証して [`std::time::Duration`] にする（`1..=60000`）。
+/// wire-server の起動引数検証（`rerank_opt`）から呼ばれ、範囲判定を engine に一本化する
+/// （`validate_rerank_window` と同形）。範囲外は [`RerankError::InvalidConfig`]。
+pub fn validate_rerank_timeout_ms(ms: u64) -> Result<std::time::Duration, RerankError> {
+    if ms == 0 || ms > MAX_RERANK_TIMEOUT_MS {
+        return Err(RerankError::InvalidConfig);
+    }
+    Ok(std::time::Duration::from_millis(ms))
+}
+
+/// クロスエンコーダ推論の 1 バッチ件数（固定。CLI には出さない）。
+pub const DEFAULT_CROSS_ENCODER_BATCH_SIZE: usize = 32;
+
+/// クロスエンコーダの最大シーケンス長（固定。BERT 系の標準。CLI には出さない）。
+pub const DEFAULT_CROSS_ENCODER_MAX_SEQ_LEN: usize = 512;
+
+/// ONNX モデルファイルの読み込み上限（バイト。protobuf 単一ファイルの 2 GiB 上限に合わせる。
+/// 外部データ形式の ONNX は非対応）。自動運転下の暫定値で、人間による確認が必要
+/// （`docs/design/rerank-wiring-policy.md` 参照）。
+pub const MAX_CROSS_ENCODER_MODEL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// `tokenizer.json` の読み込み上限（バイト）。上記と同様に暫定値。
+pub const MAX_CROSS_ENCODER_TOKENIZER_BYTES: u64 = 64 * 1024 * 1024;
+
+/// 本ビルドが `cross-encoder` feature 付きかどうか。wire-server は feature を持たないため、
+/// この関数で実行時に分岐する（feature 無効のビルドでは `cross_encoder` 指定を拒否する）。
+pub fn cross_encoder_available() -> bool {
+    cfg!(feature = "cross-encoder")
+}
+
+/// モデル／トークナイザファイルを上限付きで読む（Issue #2144。ADR D2 の持ち越し事項）。
+///
+/// 検証順序: (1) パスに `..` を含めば拒否（パストラバーサル対策）、(2) 通常ファイルでなければ
+/// open 前に拒否（FIFO でのブロック回避）、(3) open 後にハンドルでも通常ファイルとサイズ上限を
+/// 確認（パス差し替え対策）、(4) `take(max + 1)` で読み上限超過を拒否（TOCTOU・無限ストリーム対策）。
+/// エラーはパスを含まない閉じた固定語のみ。feature の有無に関わらずコンパイルされ、
+/// `onnx_cross_encoder_method` から呼ばれる。
+pub fn read_bounded_model_file(
+    path: &std::path::Path,
+    file: CrossEncoderFile,
+    max: u64,
+) -> Result<Vec<u8>, CrossEncoderError> {
+    use std::io::Read;
+    let fail = |reason: &'static str| CrossEncoderError::ModelFile { file, reason };
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(fail("parent_dir_component"));
+    }
+    match std::fs::metadata(path) {
+        Ok(m) if m.is_file() => {}
+        Ok(_) => return Err(fail("not_regular_file")),
+        Err(_) => return Err(fail("unreadable")),
+    }
+    let f = std::fs::File::open(path).map_err(|_| fail("unreadable"))?;
+    let meta = f.metadata().map_err(|_| fail("unreadable"))?;
+    if !meta.is_file() {
+        return Err(fail("not_regular_file"));
+    }
+    if meta.len() > max {
+        return Err(fail("too_large"));
+    }
+    let mut buf = Vec::new();
+    f.take(max.saturating_add(1))
+        .read_to_end(&mut buf)
+        .map_err(|_| fail("unreadable"))?;
+    if buf.len() as u64 > max {
+        return Err(fail("too_large"));
+    }
+    Ok(buf)
+}
+
+/// ONNX クロスエンコーダ方式を構築する（`--reranker cross_encoder` の実体。Issue #2144）。
+/// 2 ファイルを上限付きで読み、バックエンド構築・設定検証・期限設定まで行う。失敗は
+/// すべて起動エラーとして wire-server が扱う。`cross-encoder` feature 無効のビルドでは
+/// ファイルに触れず固定文言の `Err` を返す（多層防御）。
+#[cfg(feature = "cross-encoder")]
+pub fn onnx_cross_encoder_method(
+    model_path: &std::path::Path,
+    tokenizer_path: &std::path::Path,
+    window: usize,
+    timeout: std::time::Duration,
+) -> Result<RerankMethod, CrossEncoderError> {
+    let model = read_bounded_model_file(
+        model_path,
+        CrossEncoderFile::Model,
+        MAX_CROSS_ENCODER_MODEL_BYTES,
+    )?;
+    let tokenizer = read_bounded_model_file(
+        tokenizer_path,
+        CrossEncoderFile::Tokenizer,
+        MAX_CROSS_ENCODER_TOKENIZER_BYTES,
+    )?;
+    let backend = cross_encoder_onnx::OnnxCrossEncoderBackend::from_bytes(
+        &model,
+        &tokenizer,
+        DEFAULT_CROSS_ENCODER_MAX_SEQ_LEN,
+    )?;
+    drop(model);
+    drop(tokenizer);
+    let cfg = CrossEncoderConfig::new(
+        DEFAULT_CROSS_ENCODER_BATCH_SIZE,
+        window,
+        DEFAULT_CROSS_ENCODER_MAX_SEQ_LEN,
+    )?;
+    let reranker = CrossEncoderReranker::new(backend, cfg)?.with_timeout(timeout);
+    Ok(RerankMethod::cross_encoder(reranker))
+}
+
+/// `cross-encoder` feature 無効ビルド用。ファイルに触れずに拒否する。
+#[cfg(not(feature = "cross-encoder"))]
+pub fn onnx_cross_encoder_method(
+    _model_path: &std::path::Path,
+    _tokenizer_path: &std::path::Path,
+    _window: usize,
+    _timeout: std::time::Duration,
+) -> Result<RerankMethod, CrossEncoderError> {
+    Err(CrossEncoderError::Backend(
+        "cross-encoder feature is disabled in this build".to_string(),
+    ))
+}
+
 /// 検索実行器に結線するリランク方式。`EngineCore::with_rerank` で起動時に 1 回だけ注入
 /// する（セッション・SQL・NoSQL からは変更できない。ADR D1）。`Identity`・`Custom` は
 /// Rust API 専用で CLI からは到達できない。
@@ -1021,6 +1207,8 @@ pub enum RerankMethod {
     Lexical(LexicalOverlapReranker),
     /// 任意のリランカー（契約違反の注入テスト用。出力は実行器が検証する）。
     Custom(std::sync::Arc<dyn Reranker>),
+    /// クロスエンコーダ（`--reranker cross_encoder`。Issue #2144）。
+    CrossEncoder(std::sync::Arc<dyn Reranker>),
 }
 
 impl fmt::Debug for RerankMethod {
@@ -1037,7 +1225,13 @@ impl RerankMethod {
             Self::Identity => "identity",
             Self::Lexical(_) => "lexical",
             Self::Custom(_) => "custom",
+            Self::CrossEncoder(_) => "cross_encoder",
         }
+    }
+
+    /// クロスエンコーダ方式を構築する（スタブバックエンドでも ONNX でも共通。Issue #2144）。
+    pub fn cross_encoder<B: CrossEncoderBackend + 'static>(r: CrossEncoderReranker<B>) -> Self {
+        Self::CrossEncoder(std::sync::Arc::new(r))
     }
 
     /// 実行器が呼ぶリランカー。`Off` は `None`。
@@ -1046,7 +1240,7 @@ impl RerankMethod {
             Self::Off => None,
             Self::Identity => Some(&IdentityReranker),
             Self::Lexical(r) => Some(r),
-            Self::Custom(r) => Some(r.as_ref()),
+            Self::Custom(r) | Self::CrossEncoder(r) => Some(r.as_ref()),
         }
     }
 }
@@ -1098,7 +1292,7 @@ impl RerankSettings {
 }
 
 /// 縮退（リランキング前の順位で応答すること）の理由。ログ・統計で使う閉じた語彙
-/// （ADR D7）。`Timeout`・`MmrBudget` は後続 Issue（#2144・#2143）で到達する。
+/// （ADR D7）。`Timeout` は #2144 で、`MmrBudget` は後続 Issue（#2143）で到達する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RerankDegradeReason {
@@ -2030,5 +2224,123 @@ mod tests {
                 configured: 256,
             })
         ));
+    }
+
+    // ---------- Issue #2144: 推論期限・モデルファイル検証・方式結線 ----------
+
+    #[test]
+    fn cross_encoder_zero_timeout_returns_timeout_after_first_batch() {
+        let cfg = CrossEncoderConfig::new(32, 200, 512).unwrap();
+        let reranker = CrossEncoderReranker::new(LengthScoreBackend, cfg)
+            .unwrap()
+            .with_timeout(std::time::Duration::ZERO);
+        let candidates = [cand(1, 2.0, "aa"), cand(2, 1.0, "aaaa")];
+        let err =
+            rerank_candidates(&reranker, "q", &candidates, &RerankConfig::default()).unwrap_err();
+        assert!(matches!(
+            err,
+            RerankError::CrossEncoder(CrossEncoderError::Timeout)
+        ));
+    }
+
+    #[test]
+    fn cross_encoder_generous_timeout_keeps_output() {
+        let cfg = CrossEncoderConfig::new(32, 200, 512).unwrap();
+        let reranker = CrossEncoderReranker::new(LengthScoreBackend, cfg)
+            .unwrap()
+            .with_timeout(std::time::Duration::from_secs(3600));
+        let candidates = [cand(1, 2.0, "aa"), cand(2, 1.0, "aaaa")];
+        let hits =
+            rerank_candidates(&reranker, "q", &candidates, &RerankConfig::default()).expect("ok");
+        assert_eq!(hits.iter().map(|h| h.id).collect::<Vec<_>>(), vec![2, 1]);
+    }
+
+    #[test]
+    fn validate_rerank_timeout_ms_boundaries() {
+        assert!(validate_rerank_timeout_ms(0).is_err());
+        assert_eq!(
+            validate_rerank_timeout_ms(1).unwrap(),
+            std::time::Duration::from_millis(1)
+        );
+        assert!(validate_rerank_timeout_ms(60_000).is_ok());
+        assert!(validate_rerank_timeout_ms(60_001).is_err());
+        assert!(validate_rerank_timeout_ms(DEFAULT_RERANK_TIMEOUT_MS).is_ok());
+    }
+
+    #[test]
+    fn cross_encoder_method_kind_name() {
+        let cfg = CrossEncoderConfig::new(32, 200, 512).unwrap();
+        let m = RerankMethod::cross_encoder(
+            CrossEncoderReranker::new(LengthScoreBackend, cfg).unwrap(),
+        );
+        assert_eq!(m.kind_name(), "cross_encoder");
+        assert!(m.reranker().is_some());
+    }
+
+    /// 一意な一時ディレクトリ（Drop で削除。tmp-leak-check 対策）。
+    struct TmpDir(std::path::PathBuf);
+    impl TmpDir {
+        fn new(tag: &str) -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static N: AtomicU64 = AtomicU64::new(0);
+            let p = std::env::temp_dir().join(format!(
+                "fandhe-ce-{tag}-{}-{}",
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&p).unwrap();
+            Self(p)
+        }
+    }
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn reason(e: CrossEncoderError) -> &'static str {
+        match e {
+            CrossEncoderError::ModelFile { reason, .. } => reason,
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_bounded_model_file_checks() {
+        let d = TmpDir::new("bounded");
+        let f = d.0.join("m.bin");
+        std::fs::write(&f, b"12345").unwrap();
+        let file = CrossEncoderFile::Model;
+        assert_eq!(read_bounded_model_file(&f, file, 5).unwrap(), b"12345");
+        assert_eq!(
+            reason(read_bounded_model_file(&f, file, 4).unwrap_err()),
+            "too_large"
+        );
+        assert_eq!(
+            reason(read_bounded_model_file(&d.0, file, 100).unwrap_err()),
+            "not_regular_file"
+        );
+        assert_eq!(
+            reason(read_bounded_model_file(&d.0.join("none"), file, 100).unwrap_err()),
+            "unreadable"
+        );
+        let traversal = d.0.join("..").join("m.bin");
+        let e = read_bounded_model_file(&traversal, file, 100).unwrap_err();
+        assert!(!e.to_string().contains("fandhe-ce"));
+        assert_eq!(reason(e), "parent_dir_component");
+    }
+
+    #[cfg(feature = "cross-encoder")]
+    #[test]
+    fn onnx_method_with_missing_model_returns_model_file_error() {
+        let d = TmpDir::new("onnx-missing");
+        let err = onnx_cross_encoder_method(
+            &d.0.join("no-model"),
+            &d.0.join("no-tok"),
+            10,
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap_err();
+        assert_eq!(reason(err), "unreadable");
     }
 }

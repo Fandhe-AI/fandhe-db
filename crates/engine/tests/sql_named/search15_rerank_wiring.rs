@@ -13,6 +13,7 @@ use engine::core::EngineCore;
 use engine::kernel::CpuScalarProvider;
 use engine::policy::PolicyContext;
 use engine::rerank::{
+    CrossEncoderBackend, CrossEncoderConfig, CrossEncoderError, CrossEncoderReranker,
     LexicalOverlapReranker, RerankCandidate, RerankError, RerankMethod, RerankSettings,
     RerankStats, RerankedHit, Reranker,
 };
@@ -486,4 +487,98 @@ fn search15_user_row_policy_hides_rows_from_the_reranker() {
     assert!(seen
         .iter()
         .all(|t| t != "zzz zzz zzz" && !t.contains("OTHERTENANT")));
+}
+
+// ---------- Issue #2144: クロスエンコーダ方式（スタブバックエンドで決定的に検証） ----------
+
+/// passage の長さをスコアにする決定的スタブ。受け取ったテキストを記録する。
+struct StubBackend {
+    seen: Arc<Mutex<Vec<String>>>,
+    fail: bool,
+}
+
+impl CrossEncoderBackend for StubBackend {
+    fn score_pairs(&self, _q: &str, passages: &[&str]) -> Result<Vec<f64>, CrossEncoderError> {
+        if self.fail {
+            return Err(CrossEncoderError::Backend("stub failure".to_string()));
+        }
+        self.seen
+            .lock()
+            .expect("lock")
+            .extend(passages.iter().map(|p| p.to_string()));
+        Ok(passages.iter().map(|p| p.len() as f64).collect())
+    }
+
+    fn max_seq_len(&self) -> usize {
+        512
+    }
+}
+
+fn stub_method(
+    seen: &Arc<Mutex<Vec<String>>>,
+    fail: bool,
+    timeout: Option<std::time::Duration>,
+) -> RerankMethod {
+    let cfg = CrossEncoderConfig::new(4, 8, 512).expect("cfg");
+    let mut r = CrossEncoderReranker::new(
+        StubBackend {
+            seen: seen.clone(),
+            fail,
+        },
+        cfg,
+    )
+    .expect("reranker");
+    if let Some(t) = timeout {
+        r = r.with_timeout(t);
+    }
+    RerankMethod::cross_encoder(r)
+}
+
+#[test]
+fn search15_cross_encoder_applies_with_stub_and_sees_only_own_tenant() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let (core, _g) = setup(
+        "search15-ce-apply",
+        Some(settings(stub_method(&seen, false, None), 8)),
+    );
+    let got = run(&core, &hybrid_sql("LIMIT 3"));
+    // 最長テキスト（id 8）が先頭に昇格する。
+    assert_eq!(ids(&got).first(), Some(&8));
+    assert_eq!(core.rerank_stats().applied, 1);
+    let seen = seen.lock().expect("lock");
+    assert!(!seen.is_empty());
+    assert!(seen.iter().all(|t| !t.contains("OTHERTENANT")));
+}
+
+#[test]
+fn search15_cross_encoder_timeout_degrades_to_off_result() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let (off, _g1) = setup("search15-ce-to-off", None);
+    let (core, _g2) = setup(
+        "search15-ce-to",
+        Some(settings(
+            stub_method(&seen, false, Some(std::time::Duration::ZERO)),
+            8,
+        )),
+    );
+    let sql = hybrid_sql("LIMIT 3");
+    assert_eq!(run(&off, &sql), run(&core, &sql));
+    let s = core.rerank_stats();
+    assert_eq!(s.applied, 0);
+    assert_eq!(s.degraded_timeout, 1);
+}
+
+#[test]
+fn search15_cross_encoder_backend_failure_degrades_to_off_result() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let (off, _g1) = setup("search15-ce-fail-off", None);
+    let (core, _g2) = setup(
+        "search15-ce-fail",
+        Some(settings(stub_method(&seen, true, None), 8)),
+    );
+    let sql = hybrid_sql("LIMIT 3");
+    assert_eq!(run(&off, &sql), run(&core, &sql));
+    let s = core.rerank_stats();
+    assert_eq!(s.applied, 0);
+    assert_eq!(s.degraded_backend_error, 1);
 }
