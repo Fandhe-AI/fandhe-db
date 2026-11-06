@@ -74,7 +74,7 @@ fn measure(analysis: Arc<TextAnalysis>) -> (f64, f64, f64) {
         let hits = idx.search(&inflect(verb, 0), 10).expect("search");
         let rel = |id: u64| (lo..hi).contains(&id);
         let count = |k: usize| hits.iter().take(k).filter(|h| rel(h.doc_id)).count() as f64;
-        r5 += count(5) / 5.0;
+        r5 += count(5) / DOCS_PER_TOPIC as f64;
         r10 += count(10) / DOCS_PER_TOPIC as f64;
         if let Some(pos) = hits.iter().position(|h| rel(h.doc_id)) {
             mrr += 1.0 / (pos as f64 + 1.0);
@@ -103,11 +103,11 @@ fn stemming_improves_recall_on_synthetic_english_corpus() {
     // 実測値の固定（合成コーパスは決定的。回帰検知用）。
     let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
     assert!(
-        near(off.0, 0.4) && near(off.1, 1.0 / 3.0) && near(off.2, 1.0),
+        near(off.0, 1.0 / 3.0) && near(off.1, 1.0 / 3.0) && near(off.2, 1.0),
         "{off:?}"
     );
     assert!(
-        near(on.0, 1.0) && near(on.1, 1.0) && near(on.2, 1.0),
+        near(on.0, 5.0 / 6.0) && near(on.1, 1.0) && near(on.2, 1.0),
         "{on:?}"
     );
 }
