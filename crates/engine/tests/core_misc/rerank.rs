@@ -29,6 +29,7 @@ fn to_candidates<'a>(hits: &[HybridHit], texts: &'a [(u64, &'a str)]) -> Vec<Rer
                 id: h.id,
                 fused_score: h.score,
                 text,
+                embedding: None,
             }
         })
         .collect()
@@ -111,16 +112,19 @@ fn lexical_reranker_resurfaces_matching_document_over_identity_baseline() {
             id: 1,
             fused_score: 3.0,
             text: docs[0].1,
+            embedding: None,
         },
         RerankCandidate {
             id: 2,
             fused_score: 2.0,
             text: docs[1].1,
+            embedding: None,
         },
         RerankCandidate {
             id: 3,
             fused_score: 1.0,
             text: docs[2].1,
+            embedding: None,
         },
     ];
     let cfg = RerankConfig::new(3, 3).unwrap();
@@ -154,16 +158,19 @@ fn lexical_reranker_is_deterministic_across_repeated_calls() {
             id: 1,
             fused_score: 3.0,
             text: "vector search kernel",
+            embedding: None,
         },
         RerankCandidate {
             id: 2,
             fused_score: 2.0,
             text: "vector search kernel",
+            embedding: None,
         },
         RerankCandidate {
             id: 3,
             fused_score: 1.0,
             text: "unrelated",
+            embedding: None,
         },
     ];
     let cfg = RerankConfig::new(3, 3).unwrap();
@@ -193,6 +200,7 @@ fn rerank_candidates_rejects_pool_exceeding_max_pool_depth() {
             id: i,
             fused_score: (3 - i) as f64,
             text: "x",
+            embedding: None,
         })
         .collect();
     let cfg = RerankConfig::new(2, 2).unwrap();
@@ -206,6 +214,7 @@ fn rerank_candidates_rejects_non_finite_fused_score() {
         id: 1,
         fused_score: f64::NAN,
         text: "x",
+        embedding: None,
     }];
     let cfg = RerankConfig::default();
     let err = rerank_candidates(&IdentityReranker, "q", &candidates, &cfg).unwrap_err();
@@ -219,11 +228,13 @@ fn rerank_candidates_rejects_duplicate_input_id() {
             id: 1,
             fused_score: 2.0,
             text: "x",
+            embedding: None,
         },
         RerankCandidate {
             id: 1,
             fused_score: 1.0,
             text: "y",
+            embedding: None,
         },
     ];
     let cfg = RerankConfig::default();
@@ -238,11 +249,13 @@ fn rerank_candidates_rejects_unsorted_input() {
             id: 1,
             fused_score: 1.0,
             text: "x",
+            embedding: None,
         },
         RerankCandidate {
             id: 2,
             fused_score: 2.0,
             text: "y",
+            embedding: None,
         },
     ];
     let cfg = RerankConfig::default();
@@ -273,6 +286,7 @@ fn rerank_candidates_rejects_reranker_returning_id_outside_candidate_pool() {
         id: 1,
         fused_score: 1.0,
         text: "x",
+        embedding: None,
     }];
     let cfg = RerankConfig::default();
     let err = rerank_candidates(&LeakyReranker, "q", &candidates, &cfg).unwrap_err();
@@ -305,11 +319,13 @@ fn rerank_candidates_rejects_reranker_output_exceeding_final_k() {
             id: 1,
             fused_score: 2.0,
             text: "x",
+            embedding: None,
         },
         RerankCandidate {
             id: 2,
             fused_score: 1.0,
             text: "y",
+            embedding: None,
         },
     ];
     let cfg = RerankConfig::new(2, 1).unwrap();

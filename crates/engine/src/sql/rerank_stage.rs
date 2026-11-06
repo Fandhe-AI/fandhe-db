@@ -17,7 +17,7 @@ use crate::arena::VectorArena;
 use crate::catalog::TableSchema;
 use crate::rerank::{
     rerank_candidates, RerankCandidate, RerankConfig, RerankCounters, RerankDegradeReason,
-    RerankError, RerankSettings, Reranker, MAX_CANDIDATE_TEXT_BYTES,
+    RerankError, RerankInput, RerankSettings, Reranker, MAX_CANDIDATE_TEXT_BYTES,
     MAX_TOTAL_CANDIDATE_TEXT_BYTES,
 };
 use crate::row_codec;
@@ -63,29 +63,39 @@ pub(crate) fn degrade_reason(err: &RerankError) -> RerankDegradeReason {
     }
 }
 
+/// 窓内の 1 行分のリランカー入力（Issue #2143）。`text` は `RerankInput::Text` の方式だけが、
+/// `embedding` は `RerankInput::Embedding` の方式だけが読む（読まない側は空／`None`）。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RowInput<'a> {
+    pub(crate) text: &'a str,
+    pub(crate) embedding: Option<&'a [f32]>,
+}
+
 /// 窓内の行をリランクし、窓より後ろの行を元の順に連結して `k_eff` で切り詰めた列を返す。
 ///
-/// - `hits`: 融合スコア降順・同点スロット昇順の候補（`(スロット番号, 融合スコア)`）。
-/// - `texts`: 窓内の各行のテキスト。長さは `min(window, hits.len())` でなければならない
-///   （不一致は契約違反として縮退）。`None`（NULL・デコード失敗）の行は元の位置に固定する。
+/// - `hits`: スコア降順・同点スロット昇順の候補（`(スロット番号, スコア)`）。密のみの文は
+///   呼び出し元（[`run_stage`]）が位置由来の人工スコアへ置き換えて渡す。
+/// - `rows`: 窓内の各行の入力。長さは `min(window, hits.len())` でなければならない
+///   （不一致は契約違反として縮退）。`None`（対象外の行。NULL・デコード失敗・埋め込み無し）の
+///   行は元の位置に固定する。
 /// - 出力は `rerank_candidates` が検証し、さらに件数が `final_k` ちょうどであることを
 ///   本関数で検査する（欠落も契約違反）。
 pub(crate) fn rerank_window(
     reranker: &dyn Reranker,
     query_text: &str,
     hits: &[(u64, f64)],
-    texts: &[Option<String>],
+    rows: &[Option<RowInput<'_>>],
     window: usize,
     k_eff: usize,
 ) -> StageOutcome {
     let w_eff = window.min(hits.len());
-    if texts.len() != w_eff {
+    if rows.len() != w_eff {
         return StageOutcome::Degraded(RerankDegradeReason::ContractViolation);
     }
     let (win, rest) = hits.split_at(w_eff);
 
-    // テキストを持つ行（リランク対象 F）の窓内位置。
-    let positions: Vec<usize> = texts
+    // 入力を持つ行（リランク対象 F）の窓内位置。
+    let positions: Vec<usize> = rows
         .iter()
         .enumerate()
         .filter_map(|(i, t)| t.as_ref().map(|_| i))
@@ -97,13 +107,14 @@ pub(crate) fn rerank_window(
 
     let mut candidates: Vec<RerankCandidate<'_>> = Vec::with_capacity(positions.len());
     for &pos in &positions {
-        let (Some(&(id, score)), Some(Some(text))) = (win.get(pos), texts.get(pos)) else {
+        let (Some(&(id, score)), Some(Some(row))) = (win.get(pos), rows.get(pos)) else {
             return StageOutcome::Degraded(RerankDegradeReason::ContractViolation);
         };
         candidates.push(RerankCandidate {
             id,
             fused_score: score,
-            text: text.as_str(),
+            text: row.text,
+            embedding: row.embedding,
         });
     }
     let cfg = match RerankConfig::new(candidates.len(), final_k) {
@@ -139,7 +150,7 @@ pub(crate) fn rerank_window(
     let mut ordered_iter = ordered.into_iter();
     let mut result: Vec<(u64, f64)> = Vec::with_capacity(hits.len());
     for (i, original) in win.iter().enumerate() {
-        match texts.get(i) {
+        match rows.get(i) {
             Some(Some(_)) => match ordered_iter.next() {
                 Some(row) => result.push(row),
                 None => return StageOutcome::Degraded(RerankDegradeReason::ContractViolation),
@@ -152,7 +163,7 @@ pub(crate) fn rerank_window(
     StageOutcome::Applied(result)
 }
 
-/// [`run_stage`] が行テキストの取得に使う、文の実行コンテキスト（借用のみ）。
+/// [`run_stage`] が行の入力（テキスト・埋め込み）の取得に使う、文の実行コンテキスト（借用のみ）。
 pub(crate) struct StageSource<'a, R: ReadSource> {
     pub(crate) read_txn: &'a R,
     pub(crate) schema: &'a TableSchema,
@@ -162,54 +173,173 @@ pub(crate) struct StageSource<'a, R: ReadSource> {
     pub(crate) snapshot_metadata: Option<&'a [Vec<u8>]>,
     pub(crate) text_column_index: usize,
     pub(crate) query_text: &'a str,
+    /// 密のみ（`Ranking::Distance`）の文か。入力のスコアが「小さいほど近い」距離なので、
+    /// 位置由来の人工スコアへ置き換えてからリランカーへ渡し、結果は元の距離へ戻す。
+    pub(crate) dense: bool,
+}
+
+/// [`run_stage`] の結果（Issue #2143 で密のみの再検索を追加）。
+#[derive(Debug, PartialEq)]
+pub(crate) enum StageResult {
+    /// `k_eff` 以下の列。縮退したハイブリッドは off と同一の列に戻した結果。
+    Rows(Vec<(u64, f64)>),
+    /// 密のみの文が縮退した。広げた取得幅の結果は off と同一ではないため、呼び出し元が
+    /// `k_eff` で DISTANCE 段をやり直す（ADR D6）。
+    RefetchOff,
+}
+
+/// 窓内スロットの埋め込みを借用で取り出す。NULL（空スライス）・次元不一致・ノルム² が 0 以下
+/// または非有限の行は `None`（元の位置に固定される）。アリーナは RLS 適用後の可視行だけを
+/// 持つため、他テナントの行はここへ到達しない。
+pub(crate) fn window_embeddings<'a>(
+    arena: &'a VectorArena,
+    window_slots: &[u64],
+) -> Vec<Option<&'a [f32]>> {
+    let dim = usize::try_from(arena.dim()).unwrap_or(0);
+    window_slots
+        .iter()
+        .map(|&slot_id| {
+            let slot = usize::try_from(slot_id).ok()?;
+            let e = arena.vector_or_null(slot)?;
+            if e.is_empty() || e.len() != dim {
+                return None;
+            }
+            let n = crate::kernel::dot(e, e);
+            (n.is_finite() && n > 0.0).then_some(e)
+        })
+        .collect()
 }
 
 /// リランク段の本体。`hits` は RLS 暗黙適用後・事後 SCALAR フィルタ後の候補で、長さは
 /// `k_eff` 以上になりうる（窓のため広く取っている）。戻り値は `k_eff` 以下の列で、
-/// 縮退時は `off_prefix`（off が返したはずの先頭 `k_eff` 件のスロット集合）に属する行だけの
-/// 元の順位の列に戻す（ADR D6。off と同一の結果）。件数を統計へ、縮退を実行ログへ記録する。
+/// ハイブリッドの縮退時は `off_prefix`（off が返したはずの先頭 `k_eff` 件のスロット集合）に
+/// 属する行だけの元の順位の列に戻す（ADR D6。off と同一の結果）。密のみ（`off_prefix` が
+/// `None`）の縮退は [`StageResult::RefetchOff`] を返し、再検索を呼び出し元に委ねる。
+/// 件数を統計へ、縮退を実行ログへ記録する。
 pub(crate) fn run_stage<R: ReadSource>(
     access: RerankAccess<'_>,
     src: &StageSource<'_, R>,
     mut hits: Vec<(u64, f64)>,
     k_eff: usize,
-    off_prefix: &std::collections::HashSet<u64>,
-) -> Vec<(u64, f64)> {
+    off_prefix: Option<&std::collections::HashSet<u64>>,
+) -> StageResult {
     let method = access.settings.method();
     let Some(reranker) = method.reranker() else {
         hits.truncate(k_eff);
-        return hits;
+        return StageResult::Rows(hits);
     };
     let window = access.settings.window();
     let w_eff = window.min(hits.len());
     let slots: Vec<u64> = hits.iter().take(w_eff).map(|h| h.0).collect();
-    let outcome = match fetch_window_texts(
-        src.read_txn,
-        src.schema,
-        src.table,
-        src.arena,
-        src.snapshot_metadata,
-        src.text_column_index,
-        &slots,
-    ) {
-        Ok(texts) => rerank_window(reranker, src.query_text, &hits, &texts, window, k_eff),
-        Err(reason) => StageOutcome::Degraded(reason),
+
+    // 密のみの距離は昇順（小さいほど近い）で、`rerank_candidates` の入力契約（スコア降順）に
+    // 合わない。位置由来の狭義単調減少値を渡し、元の距離はスロットで引いて戻す。
+    let originals: Option<std::collections::HashMap<u64, f64>> = src
+        .dense
+        .then(|| hits.iter().map(|&(slot, d)| (slot, d)).collect());
+    let artificial: Vec<(u64, f64)>;
+    let work: &[(u64, f64)] = if src.dense {
+        let n = hits.len();
+        artificial = hits
+            .iter()
+            .enumerate()
+            .map(|(i, &(slot, _))| (slot, n.saturating_sub(i) as f64))
+            .collect();
+        &artificial
+    } else {
+        &hits
+    };
+
+    let outcome = match method.required_input() {
+        RerankInput::Text => match fetch_window_texts(
+            src.read_txn,
+            src.schema,
+            src.table,
+            src.arena,
+            src.snapshot_metadata,
+            src.text_column_index,
+            &slots,
+        ) {
+            Ok(texts) => {
+                let rows: Vec<Option<RowInput<'_>>> = texts
+                    .iter()
+                    .map(|t| {
+                        t.as_deref().map(|text| RowInput {
+                            text,
+                            embedding: None,
+                        })
+                    })
+                    .collect();
+                rerank_window(reranker, src.query_text, work, &rows, window, k_eff)
+            }
+            Err(reason) => StageOutcome::Degraded(reason),
+        },
+        RerankInput::Embedding => {
+            // 行テーブルのテキスト列は読まない（デコードコストを避ける）。
+            let embs = window_embeddings(src.arena, &slots);
+            let rows: Vec<Option<RowInput<'_>>> = embs
+                .iter()
+                .map(|e| {
+                    e.map(|embedding| RowInput {
+                        text: "",
+                        embedding: Some(embedding),
+                    })
+                })
+                .collect();
+            let q = if src.dense { "" } else { src.query_text };
+            rerank_window(reranker, q, work, &rows, window, k_eff)
+        }
     };
     match outcome {
         StageOutcome::Applied(rows) => {
-            access.counters.record_applied();
-            rows
+            let restored = match &originals {
+                None => Some(rows),
+                Some(orig) => rows
+                    .into_iter()
+                    .map(|(slot, _)| orig.get(&slot).map(|&d| (slot, d)))
+                    .collect::<Option<Vec<_>>>(),
+            };
+            match restored {
+                Some(rows) => {
+                    access.counters.record_applied();
+                    StageResult::Rows(rows)
+                }
+                None => degrade(
+                    access,
+                    method.kind_name(),
+                    RerankDegradeReason::ContractViolation,
+                    hits,
+                    off_prefix,
+                ),
+            }
         }
         StageOutcome::Unchanged => {
             hits.truncate(k_eff);
-            hits
+            StageResult::Rows(hits)
         }
         StageOutcome::Degraded(reason) => {
-            access.counters.record_degraded(reason);
-            log_degraded(reason, method.kind_name());
-            hits.retain(|h| off_prefix.contains(&h.0));
-            hits
+            degrade(access, method.kind_name(), reason, hits, off_prefix)
         }
+    }
+}
+
+/// 縮退の記録（統計・ログ）と結果の決定。ハイブリッドは `off_prefix` で off と同一の列へ戻し、
+/// 密のみは再検索を要求する。
+fn degrade(
+    access: RerankAccess<'_>,
+    kind: &'static str,
+    reason: RerankDegradeReason,
+    mut hits: Vec<(u64, f64)>,
+    off_prefix: Option<&std::collections::HashSet<u64>>,
+) -> StageResult {
+    access.counters.record_degraded(reason);
+    log_degraded(reason, kind);
+    match off_prefix {
+        Some(prefix) => {
+            hits.retain(|h| prefix.contains(&h.0));
+            StageResult::Rows(hits)
+        }
+        None => StageResult::RefetchOff,
     }
 }
 
@@ -340,6 +470,26 @@ mod tests {
         v.iter().map(|t| t.map(str::to_string)).collect()
     }
 
+    /// テキスト列を窓の入力へ変換して `rerank_window` を呼ぶ。
+    fn run(
+        r: &dyn Reranker,
+        h: &[(u64, f64)],
+        t: &[Option<String>],
+        window: usize,
+        k: usize,
+    ) -> StageOutcome {
+        let rows: Vec<Option<RowInput<'_>>> = t
+            .iter()
+            .map(|x| {
+                x.as_deref().map(|text| RowInput {
+                    text,
+                    embedding: None,
+                })
+            })
+            .collect();
+        rerank_window(r, "q", h, &rows, window, k)
+    }
+
     /// 固定の出力を返す（契約違反の注入用）。
     struct Fixed(Vec<RerankedHit>);
     impl Reranker for Fixed {
@@ -357,7 +507,7 @@ mod tests {
     fn identity_keeps_order_and_truncates() {
         let h = hits(5);
         let t = texts(&[Some("a"), Some("b"), Some("c")]);
-        let out = rerank_window(&IdentityReranker, "q", &h, &t, 3, 4);
+        let out = run(&IdentityReranker, &h, &t, 3, 4);
         assert_eq!(out, StageOutcome::Applied(h[..4].to_vec()));
     }
 
@@ -365,7 +515,7 @@ mod tests {
     fn rest_beyond_window_is_kept_in_order_when_k_exceeds_window() {
         let h = hits(6);
         let t = texts(&[Some("a"), Some("b")]);
-        let out = rerank_window(&IdentityReranker, "q", &h, &t, 2, 5);
+        let out = run(&IdentityReranker, &h, &t, 2, 5);
         assert_eq!(out, StageOutcome::Applied(h[..5].to_vec()));
     }
 
@@ -378,7 +528,7 @@ mod tests {
             RerankedHit { id: 2, score: 0.9 },
             RerankedHit { id: 0, score: 0.8 },
         ]);
-        let out = rerank_window(&rev, "q", &h, &t, 3, 3);
+        let out = run(&rev, &h, &t, 3, 3);
         let StageOutcome::Applied(rows) = out else {
             panic!("expected applied");
         };
@@ -393,7 +543,7 @@ mod tests {
         let h = hits(3);
         let t = texts(&[None, None, None]);
         assert_eq!(
-            rerank_window(&IdentityReranker, "q", &h, &t, 3, 3),
+            run(&IdentityReranker, &h, &t, 3, 3),
             StageOutcome::Unchanged
         );
     }
@@ -404,7 +554,7 @@ mod tests {
         let t = texts(&[Some("a"), Some("b"), Some("c")]);
         let short = Fixed(vec![RerankedHit { id: 0, score: 0.5 }]);
         assert_eq!(
-            rerank_window(&short, "q", &h, &t, 3, 3),
+            run(&short, &h, &t, 3, 3),
             StageOutcome::Degraded(RerankDegradeReason::ContractViolation)
         );
     }
@@ -418,7 +568,7 @@ mod tests {
             RerankedHit { id: 0, score: 0.5 },
         ]);
         assert_eq!(
-            rerank_window(&foreign, "q", &h, &t, 2, 2),
+            run(&foreign, &h, &t, 2, 2),
             StageOutcome::Degraded(RerankDegradeReason::ContractViolation)
         );
         let dup = Fixed(vec![
@@ -426,7 +576,7 @@ mod tests {
             RerankedHit { id: 0, score: 0.5 },
         ]);
         assert_eq!(
-            rerank_window(&dup, "q", &h, &t, 2, 2),
+            run(&dup, &h, &t, 2, 2),
             StageOutcome::Degraded(RerankDegradeReason::ContractViolation)
         );
     }
@@ -437,8 +587,48 @@ mod tests {
         let long = "x".repeat(crate::rerank::MAX_CANDIDATE_TEXT_BYTES + 1);
         let t = vec![Some(long)];
         assert_eq!(
-            rerank_window(&IdentityReranker, "q", &h, &t, 1, 1),
+            run(&IdentityReranker, &h, &t, 1, 1),
             StageOutcome::Degraded(RerankDegradeReason::InputLimit)
+        );
+    }
+
+    #[test]
+    fn embedding_rows_without_embedding_stay_pinned() {
+        // 窓 4 件の位置 1 が埋め込み無し（NULL 行）。λ=0 の MMR でも位置 1 は動かない。
+        let h = hits(4);
+        let embs: [Option<Vec<f32>>; 4] = [
+            Some(vec![1.0, 0.0]),
+            None,
+            Some(vec![0.99, 0.1]),
+            Some(vec![0.0, 1.0]),
+        ];
+        let rows: Vec<Option<RowInput<'_>>> = embs
+            .iter()
+            .map(|e| {
+                e.as_deref().map(|embedding| RowInput {
+                    text: "",
+                    embedding: Some(embedding),
+                })
+            })
+            .collect();
+        let mmr = crate::rerank::MmrReranker::new(0.0).unwrap();
+        let out = rerank_window(&mmr, "", &h, &rows, 4, 4);
+        let StageOutcome::Applied(rows) = out else {
+            panic!("expected applied");
+        };
+        let ids: Vec<u64> = rows.iter().map(|r| r.0).collect();
+        // 対象行 0・2・3 は多様性順 0, 3, 2 に並び、位置 1（id 1）は固定。
+        assert_eq!(ids, vec![0, 1, 3, 2]);
+    }
+
+    #[test]
+    fn embedding_input_missing_for_all_rows_means_unchanged() {
+        let h = hits(2);
+        let rows: Vec<Option<RowInput<'_>>> = vec![None, None];
+        let mmr = crate::rerank::MmrReranker::new(0.5).unwrap();
+        assert_eq!(
+            rerank_window(&mmr, "", &h, &rows, 2, 2),
+            StageOutcome::Unchanged
         );
     }
 
@@ -447,7 +637,7 @@ mod tests {
         let h = hits(3);
         let t = texts(&[Some("a")]);
         assert_eq!(
-            rerank_window(&IdentityReranker, "q", &h, &t, 3, 3),
+            run(&IdentityReranker, &h, &t, 3, 3),
             StageOutcome::Degraded(RerankDegradeReason::ContractViolation)
         );
     }

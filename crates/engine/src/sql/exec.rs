@@ -1347,17 +1347,23 @@ pub(crate) fn execute_statement_with_cache_observed(
     // フィールドを持たせず、下記で無条件に呼び出す。
     let plan = ExecutionPlan::from_evaluation_order(bound.evaluation_order);
 
-    // Issue #2142・SEARCH-15（設計記録 `docs/design/rerank-wiring-policy.md` D3）: リランクを
-    // 実際に走らせるのは「設定が有効・`Ranking::Hybrid`・recall モード」の文だけ。密のみ
-    // （`Ranking::Distance`）の lexical と precision は文の形で決まる「適用外」で、素通しする
-    // （off と同じ結果。拒否もログも出さない）。off（`rerank == None`）はこの判定の外で、
-    // 以降の追加処理は一切走らない。
-    let rerank_hybrid: Option<crate::sql::rerank_stage::RerankAccess<'_>> =
+    // Issue #2142・#2143・SEARCH-15（設計記録 `docs/design/rerank-wiring-policy.md` D3）: リランクを
+    // 実際に走らせるのは「設定が有効・recall モード」かつ、ハイブリッド（全方式）または密のみ
+    // （埋め込みを読む方式だけ。MMR）の文。密のみで字句一致系・precision は文の形で決まる
+    // 「適用外」で、素通しする（off と同じ結果。拒否もログも出さない）。off（`rerank == None`）は
+    // この判定の外で、以降の追加処理は一切走らない。計算量予算（MMR）は `k_eff` 確定後に判定する。
+    let rerank_shape_active: Option<crate::sql::rerank_stage::RerankAccess<'_>> =
         match (&rerank, &bound.ranking) {
             (Some(r), Ranking::Hybrid { .. }) if !is_precision => Some(*r),
+            (Some(r), Ranking::Distance { .. })
+                if !is_precision
+                    && r.settings.method().required_input()
+                        == crate::rerank::RerankInput::Embedding =>
+            {
+                Some(*r)
+            }
             _ => None,
         };
-    let rerank_fetch_window: Option<usize> = rerank_hybrid.map(|r| r.settings.window());
 
     // RLS 段（無条件）+ SCALAR 段（同一走査の行フック。`plan.scalar_prefilter` が
     // `false` の場合はここでは等価条件を判定せず、DISTANCE 段の後で事後適用する）。
@@ -2793,6 +2799,38 @@ pub(crate) fn execute_statement_with_cache_observed(
         bound.fetch_count()
     };
 
+    // Issue #2143・ADR D4: MMR の計算量予算（`W × min(k_eff, W)`）は取得の前に設定値と `k_eff`
+    // だけで静的に判定する（表の内容に依存しない）。超過は縮退（`mmr_budget`）で、窓を広げず
+    // リランクも走らせないため結果は off と同一になる（`off_prefix`・再検索は不要）。
+    let mut rerank_budget_degraded = false;
+    let rerank_active: Option<crate::sql::rerank_stage::RerankAccess<'_>> =
+        match rerank_shape_active {
+            Some(r)
+                if matches!(r.settings.method(), crate::rerank::RerankMethod::Mmr(_))
+                    && !crate::rerank::mmr_budget_allows(r.settings.window(), k_eff) =>
+            {
+                r.counters
+                    .record_degraded(crate::rerank::RerankDegradeReason::MmrBudget);
+                crate::sql::rerank_stage::log_degraded(
+                    crate::rerank::RerankDegradeReason::MmrBudget,
+                    r.settings.method().kind_name(),
+                );
+                rerank_budget_degraded = true;
+                None
+            }
+            other => other,
+        };
+    let rerank_fetch_window: Option<usize> = rerank_active.map(|r| r.settings.window());
+    // 密のみの DISTANCE 段の取得幅（Issue #2143・ADR D6）。リランクが有効なときだけ窓まで広げる
+    // （上限は `MAX_SEARCH_K`）。縮退時は `k_eff` で DISTANCE 段をやり直す。
+    let dense_fetch_target: usize = match (&rerank_active, &bound.ranking) {
+        (Some(r), Ranking::Distance { .. }) => k_eff
+            .max(r.settings.window())
+            .min(core::MAX_SEARCH_K)
+            .max(k_eff),
+        _ => k_eff,
+    };
+
     // `!plan.scalar_prefilter`（DISTANCE 先行・SCALAR 事後フィルタ）の precision
     // 経路で `arena.ids().len()` が `core::MAX_SEARCH_K` を超える場合、直上の
     // `k_eff` は `MAX_SEARCH_K` へクランプされ、DISTANCE 段は可視集合全体ではなく
@@ -3451,262 +3489,290 @@ pub(crate) fn execute_statement_with_cache_observed(
         )),
         _ => None,
     };
-    let mut postfilter_done = false;
-    crate::interrupt::current_deadline().check()?;
-    let distance_started = stage_start(&stats);
-    let hits: Vec<(u64, f64)> = match iter_cfg {
-        // DISTANCE 先行（SCALAR 事後フィルタ）で WHERE があるときだけ、事後フィルタ後の件数が
-        // 目標（`OFFSET + LIMIT`）に届くまで取得件数を倍々に増やして再探索する。上限は
-        // `max_scan_tuples`（core.rs が SQL-46 の走査行数上限との min 済み）・`MAX_SEARCH_K`・
-        // 可視行数。上限到達はエラーにせずそれまでの結果を返す。
-        Some((mode, max_scan, _))
-            if mode != crate::hnsw::HnswIterativeScan::Off
-                && !plan.scalar_prefilter
-                && bound.has_where_filters() =>
-        {
-            let visible = slot_ids.len();
-            let cap = max_scan.min(core::MAX_SEARCH_K).min(visible).max(1);
-            let mut k_round = k_eff.min(cap).max(1);
-            let mut rounds: u64 = 0;
-            let mut rows_examined: u64 = 0;
-            let (filtered, cap_hit) = loop {
-                crate::interrupt::current_deadline().check()?;
-                // 2 ラウンド目以降は同じ検索の再実行なので、キャッシュ状態を重ねて数えない。
-                let _suppress = (rounds > 0).then(crate::sql::hnsw_observe::suppress_cache_notes);
-                // Distance 段は反復スキャンではラウンドごとに記録する（loops＝ラウンド数、
-                // rows_out＝事後フィルタ前の候補件数の合計、時間は compute_hits のみ。Issue #2053）。
-                let round_started = stage_start(&stats);
-                let raw = compute_hits(k_round)?;
-                drop(_suppress);
-                rounds += 1;
-                let raw_len = raw.len();
-                rows_examined = rows_examined.saturating_add(raw_len as u64);
-                stage_end(
-                    &mut stats,
-                    ExecStage::Distance,
-                    round_started,
-                    raw_len,
-                    None,
-                );
-                // 反復中の事後フィルタも PostFilter 段として記録する（ラウンドごとに loops を積む）。
-                let postfilter_started = stage_start(&stats);
-                let mut kept = apply_postfilter(raw)?;
-                stage_end(
-                    &mut stats,
-                    ExecStage::PostFilter,
-                    postfilter_started,
-                    kept.len(),
-                    Some(raw_len.saturating_sub(kept.len())),
-                );
-                if kept.len() >= k_eff {
-                    kept.truncate(k_eff);
-                    break (kept, false);
+    // Issue #2143・ADR D6: 密のみ＋MMR の縮退では off と同一の結果へ戻すため、`k_eff` で
+    // DISTANCE 段（事後 SCALAR フィルタを含む）をやり直す。それ以外の文は 1 周で抜ける。
+    let mut k_target = dense_fetch_target;
+    let mut refetched = false;
+    let hits: Vec<(u64, f64)> = loop {
+        // 再検索（2 周目）は同じ検索の再実行なので、キャッシュ状態を重ねて数えない。
+        let _suppress_refetch = refetched.then(crate::sql::hnsw_observe::suppress_cache_notes);
+        let mut postfilter_done = false;
+        crate::interrupt::current_deadline().check()?;
+        let distance_started = stage_start(&stats);
+        let hits: Vec<(u64, f64)> = match iter_cfg {
+            // DISTANCE 先行（SCALAR 事後フィルタ）で WHERE があるときだけ、事後フィルタ後の件数が
+            // 目標（`OFFSET + LIMIT`）に届くまで取得件数を倍々に増やして再探索する。上限は
+            // `max_scan_tuples`（core.rs が SQL-46 の走査行数上限との min 済み）・`MAX_SEARCH_K`・
+            // 可視行数。上限到達はエラーにせずそれまでの結果を返す。
+            Some((mode, max_scan, _))
+                if mode != crate::hnsw::HnswIterativeScan::Off
+                    && !plan.scalar_prefilter
+                    && bound.has_where_filters() =>
+            {
+                let visible = slot_ids.len();
+                let cap = max_scan.min(core::MAX_SEARCH_K).min(visible).max(1);
+                let mut k_round = k_target.min(cap).max(1);
+                let mut rounds: u64 = 0;
+                let mut rows_examined: u64 = 0;
+                let (filtered, cap_hit) = loop {
+                    crate::interrupt::current_deadline().check()?;
+                    // 2 ラウンド目以降は同じ検索の再実行なので、キャッシュ状態を重ねて数えない。
+                    let _suppress =
+                        (rounds > 0).then(crate::sql::hnsw_observe::suppress_cache_notes);
+                    // Distance 段は反復スキャンではラウンドごとに記録する（loops＝ラウンド数、
+                    // rows_out＝事後フィルタ前の候補件数の合計、時間は compute_hits のみ。Issue #2053）。
+                    let round_started = stage_start(&stats);
+                    let raw = compute_hits(k_round)?;
+                    drop(_suppress);
+                    rounds += 1;
+                    let raw_len = raw.len();
+                    rows_examined = rows_examined.saturating_add(raw_len as u64);
+                    stage_end(
+                        &mut stats,
+                        ExecStage::Distance,
+                        round_started,
+                        raw_len,
+                        None,
+                    );
+                    // 反復中の事後フィルタも PostFilter 段として記録する（ラウンドごとに loops を積む）。
+                    let postfilter_started = stage_start(&stats);
+                    let mut kept = apply_postfilter(raw)?;
+                    stage_end(
+                        &mut stats,
+                        ExecStage::PostFilter,
+                        postfilter_started,
+                        kept.len(),
+                        Some(raw_len.saturating_sub(kept.len())),
+                    );
+                    if kept.len() >= k_target {
+                        kept.truncate(k_target);
+                        break (kept, false);
+                    }
+                    // 可視集合を使い切った（取得件数が要求に満たない、または全行を要求済み）。
+                    if raw_len < k_round || k_round >= visible {
+                        break (kept, false);
+                    }
+                    if k_round >= cap {
+                        break (kept, true);
+                    }
+                    k_round = k_round.saturating_mul(2).min(cap);
+                };
+                if let Some(access) = hnsw_cache.as_ref() {
+                    access
+                        .cache
+                        .record_iterative_scan(rounds, cap_hit, rows_examined);
                 }
-                // 可視集合を使い切った（取得件数が要求に満たない、または全行を要求済み）。
-                if raw_len < k_round || k_round >= visible {
-                    break (kept, false);
-                }
-                if k_round >= cap {
-                    break (kept, true);
-                }
-                k_round = k_round.saturating_mul(2).min(cap);
-            };
-            if let Some(access) = hnsw_cache.as_ref() {
-                access
-                    .cache
-                    .record_iterative_scan(rounds, cap_hit, rows_examined);
+                postfilter_done = true;
+                filtered
             }
-            postfilter_done = true;
-            filtered
-        }
-        // `off`: 反復せず、取得件数を実効 `ef_search` で打ち切る（pgvector の `off` 相当。
-        // 経路内部で索引探索か厳密走査へ縮退したかによらず件数を揃える）。
-        Some((crate::hnsw::HnswIterativeScan::Off, _, ef)) => {
-            let mut h = compute_hits(k_eff.min(ef).max(1))?;
-            h.truncate(ef);
-            h
-        }
-        _ => compute_hits(k_eff)?,
-    };
-
-    // 反復スキャン経路は各ラウンドで Distance 段を記録済みのため、ここでは非反復経路のみ記録する。
-    if !postfilter_done {
-        stage_end(
-            &mut stats,
-            ExecStage::Distance,
-            distance_started,
-            hits.len(),
-            None,
-        );
-    }
-    // DISTANCE 段の直後の確認点（Issue #1953。上の直前確認と対）。
-    crate::interrupt::current_deadline().check()?;
-
-    // Issue #2142・D6: 縮退したとき off と同一の列へ戻すため、事後 SCALAR フィルタの**前**に
-    // 「off が返したはずの先頭 `k_eff` 件」のスロット集合を控える。事後フィルタは順序を保つ
-    // 行単位の判定なので、off の結果は「フィルタ後の列のうち、この集合に属する行」と一致する。
-    // リランクが無効（`rerank_hybrid == None`）では何も確保しない。
-    let rerank_off_prefix: Option<HashSet<u64>> = rerank_hybrid.map(|_| {
-        hits.iter()
-            .take(k_eff)
-            .map(|h| h.0)
-            .collect::<HashSet<u64>>()
-    });
-
-    // SCALAR 事後フィルタ（DISTANCE 先行時のみ。TASK-76・SQL-7）。`on_visible_row` は
-    // `plan.scalar_prefilter == false` の間、等価条件を判定せず可視行を通過させて
-    // いるため、ここで `postfilter_verdicts`（`on_visible_row` が生の
-    // `row_codec::ScalarRef` に対して判定済みの真偽値。宣言箇所のコメント参照）を
-    // 引く。値の取得不能（データ不整合。fail-closed）は除去する。返却件数が
-    // `limit` 未満になり得る（under-fetch。オーバーサンプルによる救済は行わない）。
-    // 反復スキャン（SQL-73・Issue #2033）で事後フィルタを済ませた場合は二重にかけない。
-    let hits: Vec<(u64, f64)> = if plan.scalar_prefilter || postfilter_done {
-        hits
-    } else {
-        let postfilter_started = stage_start(&stats);
-        let before = hits.len();
-        let kept = apply_postfilter(hits)?;
-        stage_end(
-            &mut stats,
-            ExecStage::PostFilter,
-            postfilter_started,
-            kept.len(),
-            Some(before.saturating_sub(kept.len())),
-        );
-        kept
-    };
-
-    // PRECISION ゲート段（TASK-162・SEARCH-9）。SCALAR 事後フィルタの**後**・
-    // `RlsSafetyNet::apply` の**前**に置く（`crate::precision` モジュール
-    // ドキュメント参照）。`WHERE` を満たす行だけを対象に Top-1／Top-2 の確信度を
-    // 見るため SCALAR 段より後、`RlsSafetyNet` は行を「減らす」ことしかしないため
-    // ゲート通過後に安全網が行を落としても確信のない行が増える方向にはならず、
-    // この位置より前に置く必要がある。候補集合自体は `ImplicitRlsHook` により
-    // 事前フィルタ済み（`arena` 構築時）のため、他テナント不可視行が Top-1／Top-2
-    // の比較対象に混入することはない。`HINT ORDER` の内容に関係なく無条件に適用
-    // する（`is_precision` は `bound.mode` のみに依存し、`plan.scalar_prefilter`
-    // の分岐に触れない）。`recall`（既定）はこのブロックを一切通らないため、
-    // 挙動は変わらない（SEARCH-1〜8 不変）。
-    let precision_started = if is_precision {
-        stage_start(&stats)
-    } else {
-        None
-    };
-    let hits: Vec<(u64, f64)> = if is_precision {
-        // 確信度指標はランキング方式ごとに正規化する（`crate::precision` モジュール
-        // ドキュメント参照）: dense はクエリ・候補 embedding の cosine 類似度、
-        // hybrid は融合スコアを理論最大値で割った正規化 RRF スコア。確信度は
-        // 先頭 `min(limit, max_results) + 1` 件分だけ計算する（有界・小規模。
-        // DoS 対策）。
-        let thresholds = match &bound.ranking {
-            Ranking::Distance { .. } => precision_policy.dense(),
-            Ranking::Hybrid { .. } => precision_policy.hybrid(),
+            // `off`: 反復せず、取得件数を実効 `ef_search` で打ち切る（pgvector の `off` 相当。
+            // 経路内部で索引探索か厳密走査へ縮退したかによらず件数を揃える）。
+            Some((crate::hnsw::HnswIterativeScan::Off, _, ef)) => {
+                let mut h = compute_hits(k_target.min(ef).max(1))?;
+                h.truncate(ef);
+                h
+            }
+            _ => compute_hits(k_target)?,
         };
-        let want = bound
-            .fetch_count()
-            .min(precision_policy.max_results())
-            .saturating_add(1);
-        let take_n = want.min(hits.len());
-        let mut conf: Vec<f64> = Vec::with_capacity(take_n);
-        match &bound.ranking {
-            Ranking::Distance { query } => {
-                for (slot_id, _score) in hits.iter().take(take_n) {
-                    let slot =
-                        usize::try_from(*slot_id).map_err(|_| SqlSurfaceError::Internal {
-                            detail: "candidate slot index out of range".to_string(),
-                        })?;
-                    let embedding =
-                        arena
-                            .vector_or_null(slot)
-                            .ok_or_else(|| SqlSurfaceError::Internal {
-                                detail: "candidate arena index out of range".to_string(),
-                            })?;
-                    // ノルム 0・次元不一致・非有限値は「確信なし」（`0.0`）として
-                    // 扱う。`ConfidenceThresholds::new` が閾値を厳密に正へ限定して
-                    // いるため、`0.0` は常に `min_top1` 未満となり空集合へ倒れる
-                    // （fail-closed。`crate::precision::cosine_similarity` の
-                    // ドキュメント参照）。
-                    conf.push(crate::precision::cosine_similarity(query, embedding).unwrap_or(0.0));
-                }
-            }
-            Ranking::Hybrid { tuning, .. } => {
-                // 正規化は DISTANCE 段の融合と同じ調整値（`rrf_k`・`weights`）の `RrfConfig` で行う
-                // （理論最大値が重み・定数に依存するため。SEARCH-13・Issue #2120）。`pool_depth` は
-                // 正規化式に現れない。
-                let cfg = crate::sql::hybrid_tuning::hybrid_rrf_config(tuning, k_eff)?;
-                for (_slot_id, score) in hits.iter().take(take_n) {
-                    conf.push(crate::precision::rrf_normalized(*score, &cfg).unwrap_or(0.0));
-                }
-            }
-        }
-        let n = crate::precision::apply_gate(
-            &conf,
-            &thresholds,
-            bound.fetch_count(),
-            precision_policy.max_results(),
-        )
-        .map_err(|e| SqlSurfaceError::Internal {
-            detail: format!("precision gate contract violation: {e}"),
-        })?;
-        let mut truncated = hits;
-        truncated.truncate(n);
-        truncated
-    } else {
-        hits
-    };
-    if is_precision {
-        stage_end(
-            &mut stats,
-            ExecStage::PrecisionGate,
-            precision_started,
-            hits.len(),
-            None,
-        );
-    }
 
-    // リランク段（Issue #2142・SEARCH-15。設計記録 `docs/design/rerank-wiring-policy.md`
-    // D3・D4・D6）。事後 SCALAR フィルタと precision ゲート（precision ではリランクしない）の
-    // **後**・`RlsSafetyNet::apply` の**前**に置く。候補は `ImplicitRlsHook` で RLS 適用済みの
-    // アリーナ由来の可視行だけで、窓内の行テキストはこの場で（キャッシュのヒット・ミスに
-    // 関わらず）認可済みの行から都度読む。契約違反・上限超過は縮退（off と同一の列へ戻す）で、
-    // 検索全体は拒否しない。`statement_timeout`／キャンセルは 57014 が優先で縮退にしない。
-    // 安全網・`OFFSET`・`LIMIT` 省略時の上限判定は従来どおり以降で無条件に適用される。
-    let hits: Vec<(u64, f64)> = match (rerank_hybrid, &bound.ranking, rerank_off_prefix.as_ref()) {
-        (
-            Some(access),
-            Ranking::Hybrid {
-                query_text,
-                text_column_index: rerank_text_column,
-                ..
-            },
-            Some(off_prefix),
-        ) => {
-            crate::interrupt::current_deadline().check()?;
-            let snapshot_metadata = if defer_projection || mask_trusted_defer {
-                cache_hit_snapshot.as_ref().map(|s| s.metadata())
-            } else {
-                None
-            };
-            let src = crate::sql::rerank_stage::StageSource {
-                read_txn,
-                schema,
-                table: &bound.table,
-                arena,
-                snapshot_metadata,
-                text_column_index: *rerank_text_column,
-                query_text,
-            };
-            let out = crate::sql::rerank_stage::run_stage(access, &src, hits, k_eff, off_prefix);
-            crate::interrupt::current_deadline().check()?;
-            out
+        // 反復スキャン経路は各ラウンドで Distance 段を記録済みのため、ここでは非反復経路のみ記録する。
+        if !postfilter_done {
+            stage_end(
+                &mut stats,
+                ExecStage::Distance,
+                distance_started,
+                hits.len(),
+                None,
+            );
         }
-        _ => {
-            // 設定は有効だが文の形（密のみ・precision）により適用外。素通しして件数だけ数える。
-            if let Some(access) = &rerank {
-                access.counters.record_not_applicable();
-            }
+        // DISTANCE 段の直後の確認点（Issue #1953。上の直前確認と対）。
+        crate::interrupt::current_deadline().check()?;
+
+        // Issue #2142・D6: 縮退したとき off と同一の列へ戻すため、事後 SCALAR フィルタの**前**に
+        // 「off が返したはずの先頭 `k_eff` 件」のスロット集合を控える。事後フィルタは順序を保つ
+        // 行単位の判定なので、off の結果は「フィルタ後の列のうち、この集合に属する行」と一致する。
+        // リランクが無効（`rerank_active == None`）や密のみの文では何も確保しない。
+        let rerank_off_prefix: Option<HashSet<u64>> = rerank_active
+            .filter(|_| matches!(bound.ranking, Ranking::Hybrid { .. }))
+            .map(|_| {
+                hits.iter()
+                    .take(k_eff)
+                    .map(|h| h.0)
+                    .collect::<HashSet<u64>>()
+            });
+
+        // SCALAR 事後フィルタ（DISTANCE 先行時のみ。TASK-76・SQL-7）。`on_visible_row` は
+        // `plan.scalar_prefilter == false` の間、等価条件を判定せず可視行を通過させて
+        // いるため、ここで `postfilter_verdicts`（`on_visible_row` が生の
+        // `row_codec::ScalarRef` に対して判定済みの真偽値。宣言箇所のコメント参照）を
+        // 引く。値の取得不能（データ不整合。fail-closed）は除去する。返却件数が
+        // `limit` 未満になり得る（under-fetch。オーバーサンプルによる救済は行わない）。
+        // 反復スキャン（SQL-73・Issue #2033）で事後フィルタを済ませた場合は二重にかけない。
+        let hits: Vec<(u64, f64)> = if plan.scalar_prefilter || postfilter_done {
             hits
+        } else {
+            let postfilter_started = stage_start(&stats);
+            let before = hits.len();
+            let kept = apply_postfilter(hits)?;
+            stage_end(
+                &mut stats,
+                ExecStage::PostFilter,
+                postfilter_started,
+                kept.len(),
+                Some(before.saturating_sub(kept.len())),
+            );
+            kept
+        };
+
+        // PRECISION ゲート段（TASK-162・SEARCH-9）。SCALAR 事後フィルタの**後**・
+        // `RlsSafetyNet::apply` の**前**に置く（`crate::precision` モジュール
+        // ドキュメント参照）。`WHERE` を満たす行だけを対象に Top-1／Top-2 の確信度を
+        // 見るため SCALAR 段より後、`RlsSafetyNet` は行を「減らす」ことしかしないため
+        // ゲート通過後に安全網が行を落としても確信のない行が増える方向にはならず、
+        // この位置より前に置く必要がある。候補集合自体は `ImplicitRlsHook` により
+        // 事前フィルタ済み（`arena` 構築時）のため、他テナント不可視行が Top-1／Top-2
+        // の比較対象に混入することはない。`HINT ORDER` の内容に関係なく無条件に適用
+        // する（`is_precision` は `bound.mode` のみに依存し、`plan.scalar_prefilter`
+        // の分岐に触れない）。`recall`（既定）はこのブロックを一切通らないため、
+        // 挙動は変わらない（SEARCH-1〜8 不変）。
+        let precision_started = if is_precision {
+            stage_start(&stats)
+        } else {
+            None
+        };
+        let hits: Vec<(u64, f64)> = if is_precision {
+            // 確信度指標はランキング方式ごとに正規化する（`crate::precision` モジュール
+            // ドキュメント参照）: dense はクエリ・候補 embedding の cosine 類似度、
+            // hybrid は融合スコアを理論最大値で割った正規化 RRF スコア。確信度は
+            // 先頭 `min(limit, max_results) + 1` 件分だけ計算する（有界・小規模。
+            // DoS 対策）。
+            let thresholds = match &bound.ranking {
+                Ranking::Distance { .. } => precision_policy.dense(),
+                Ranking::Hybrid { .. } => precision_policy.hybrid(),
+            };
+            let want = bound
+                .fetch_count()
+                .min(precision_policy.max_results())
+                .saturating_add(1);
+            let take_n = want.min(hits.len());
+            let mut conf: Vec<f64> = Vec::with_capacity(take_n);
+            match &bound.ranking {
+                Ranking::Distance { query } => {
+                    for (slot_id, _score) in hits.iter().take(take_n) {
+                        let slot =
+                            usize::try_from(*slot_id).map_err(|_| SqlSurfaceError::Internal {
+                                detail: "candidate slot index out of range".to_string(),
+                            })?;
+                        let embedding = arena.vector_or_null(slot).ok_or_else(|| {
+                            SqlSurfaceError::Internal {
+                                detail: "candidate arena index out of range".to_string(),
+                            }
+                        })?;
+                        // ノルム 0・次元不一致・非有限値は「確信なし」（`0.0`）として
+                        // 扱う。`ConfidenceThresholds::new` が閾値を厳密に正へ限定して
+                        // いるため、`0.0` は常に `min_top1` 未満となり空集合へ倒れる
+                        // （fail-closed。`crate::precision::cosine_similarity` の
+                        // ドキュメント参照）。
+                        conf.push(
+                            crate::precision::cosine_similarity(query, embedding).unwrap_or(0.0),
+                        );
+                    }
+                }
+                Ranking::Hybrid { tuning, .. } => {
+                    // 正規化は DISTANCE 段の融合と同じ調整値（`rrf_k`・`weights`）の `RrfConfig` で行う
+                    // （理論最大値が重み・定数に依存するため。SEARCH-13・Issue #2120）。`pool_depth` は
+                    // 正規化式に現れない。
+                    let cfg = crate::sql::hybrid_tuning::hybrid_rrf_config(tuning, k_eff)?;
+                    for (_slot_id, score) in hits.iter().take(take_n) {
+                        conf.push(crate::precision::rrf_normalized(*score, &cfg).unwrap_or(0.0));
+                    }
+                }
+            }
+            let n = crate::precision::apply_gate(
+                &conf,
+                &thresholds,
+                bound.fetch_count(),
+                precision_policy.max_results(),
+            )
+            .map_err(|e| SqlSurfaceError::Internal {
+                detail: format!("precision gate contract violation: {e}"),
+            })?;
+            let mut truncated = hits;
+            truncated.truncate(n);
+            truncated
+        } else {
+            hits
+        };
+        if is_precision {
+            stage_end(
+                &mut stats,
+                ExecStage::PrecisionGate,
+                precision_started,
+                hits.len(),
+                None,
+            );
         }
+
+        // リランク段（Issue #2142・SEARCH-15。設計記録 `docs/design/rerank-wiring-policy.md`
+        // D3・D4・D6）。事後 SCALAR フィルタと precision ゲート（precision ではリランクしない）の
+        // **後**・`RlsSafetyNet::apply` の**前**に置く。候補は `ImplicitRlsHook` で RLS 適用済みの
+        // アリーナ由来の可視行だけで、窓内の行テキストはこの場で（キャッシュのヒット・ミスに
+        // 関わらず）認可済みの行から都度読む。契約違反・上限超過は縮退（off と同一の列へ戻す）で、
+        // 検索全体は拒否しない。`statement_timeout`／キャンセルは 57014 が優先で縮退にしない。
+        // 安全網・`OFFSET`・`LIMIT` 省略時の上限判定は従来どおり以降で無条件に適用される。
+        let hits: Vec<(u64, f64)> =
+            match (rerank_active, &bound.ranking, rerank_off_prefix.as_ref()) {
+                (Some(access), ranking, off_prefix) if !refetched => {
+                    crate::interrupt::current_deadline().check()?;
+                    let snapshot_metadata = if defer_projection || mask_trusted_defer {
+                        cache_hit_snapshot.as_ref().map(|s| s.metadata())
+                    } else {
+                        None
+                    };
+                    let (query_text, text_column_index, dense) = match ranking {
+                        Ranking::Hybrid {
+                            query_text,
+                            text_column_index,
+                            ..
+                        } => (query_text.as_str(), *text_column_index, false),
+                        Ranking::Distance { .. } => ("", 0, true),
+                    };
+                    let src = crate::sql::rerank_stage::StageSource {
+                        read_txn,
+                        schema,
+                        table: &bound.table,
+                        arena,
+                        snapshot_metadata,
+                        text_column_index,
+                        query_text,
+                        dense,
+                    };
+                    let result =
+                        crate::sql::rerank_stage::run_stage(access, &src, hits, k_eff, off_prefix);
+                    // 57014（期限・キャンセル）は縮退より優先する（ADR D5）。
+                    crate::interrupt::current_deadline().check()?;
+                    match result {
+                        crate::sql::rerank_stage::StageResult::Rows(rows) => rows,
+                        crate::sql::rerank_stage::StageResult::RefetchOff => {
+                            k_target = k_eff;
+                            refetched = true;
+                            // 2 周目のキャッシュ観測は 1 周目と重ねて数えない（ループ先頭の抑止ガード）。
+                            continue;
+                        }
+                    }
+                }
+                _ => {
+                    // 設定は有効だが文の形（密のみで字句一致系・precision）により適用外。素通しして件数だけ
+                    // 数える。MMR 予算超過で縮退済みの文と、縮退後の再検索（2 周目）は数えない。
+                    if !refetched && !rerank_budget_degraded {
+                        if let Some(access) = &rerank {
+                            access.counters.record_not_applicable();
+                        }
+                    }
+                    hits
+                }
+            };
+        break hits;
     };
 
     // RLS 実行時安全網（TASK-136・RLS-5）。`HINT ORDER` の内容に関係なく常に適用する
