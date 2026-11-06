@@ -4004,6 +4004,9 @@ impl EngineCore {
             self.result_limits.max_result_rows(),
             bound.mode().mode(),
         )?;
+        // Issue #2121: `k1`／`b` も束縛済み計画の段階で検証する（EXPLAIN も実行と同じ 22000。
+        // 疎索引の有無に依らない）。
+        crate::sql::hybrid_tuning::check_bm25_args(bound.ranking())?;
         // Issue #2242: `LIMIT` 省略（暗黙上限の印 `result_cap`）付きの計画は、`cap` が設定値と一致し、
         // 取得上限が `cap + 1`、`OFFSET` が検索上限以内のときだけ通す（印の偽装で巨大な取得上限を
         // 通す経路を作らない。`check_bound_scan_limit` と同型）。
@@ -14613,8 +14616,6 @@ impl EngineCore {
         bound: &crate::sql::parser::BoundStatement,
         hnsw_search: crate::hnsw::HnswSessionSearch,
     ) -> Result<crate::sql::exec::QueryResult, crate::sql::allowlist::SqlSurfaceError> {
-        // 実行側と同じ暫定ゲート（HYBRID の調整引数は実行器が未接続。SEARCH-13・Issue #2119）。
-        crate::sql::hybrid_tuning::ensure_tuning_applied(bound.ranking())?;
         // RLS-13（Issue #2279）: 実行側と同じ ANN 形状補正のため、同じ `read_txn` からポリシーの適用可否を求める。
         let row_policy_present =
             crate::sql::row_policy::policies_apply(read_txn, ctx, bound.table())?;
