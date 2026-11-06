@@ -614,6 +614,13 @@ pub static HYBRID_SCHEMA: ObjectSchema = ObjectSchema {
             ty: FieldType::Object(&HYBRID_WEIGHTS_SCHEMA),
             nullable: false,
         },
+        // SEARCH-17 (4)・Issue #2137: 真のとき応答へ系統別順位・融合スコアの 3 列を足す。
+        FieldSpec {
+            key: "explain_score",
+            presence: Presence::Optional,
+            ty: FieldType::Bool,
+            nullable: false,
+        },
     ],
 };
 

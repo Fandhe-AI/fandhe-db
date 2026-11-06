@@ -47,6 +47,9 @@ pub(crate) fn projected_columns(
             ProjectedColumn::Computed {
                 name, result_ty, ..
             } => crate::sql::exec::computed_column_meta(name, result_ty),
+            ProjectedColumn::HybridDetail { name, kind } => {
+                crate::sql::exec::computed_column_meta(name, &Some(kind.result_type()))
+            }
         })
         .collect()
 }

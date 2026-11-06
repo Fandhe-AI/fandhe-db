@@ -31,7 +31,11 @@
 //! trait は不変）からのみ呼ばれる想定で、`Storage`・`SearchProvider`・`PolicyContext`
 //! を束ねる。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+
+/// ハイブリッド検索の融合段が退避する「slot 番号 → (密順位, 疎順位)」の対応表
+/// （SEARCH-17・Issue #2137。`project_rows` が `hybrid_dense_rank()` 等の値を引く）。
+type HybridRankMap = HashMap<u64, (Option<u32>, Option<u32>)>;
 use std::sync::Arc;
 
 use crate::arena::{ArenaError, VectorArena};
@@ -1589,8 +1593,10 @@ pub(crate) fn execute_statement_with_cache_observed(
             // （`BoundExpr::TextColumnRef`）を持ちうるため、その列だけは下で
             // 個別に追加する（この `filter_map` 自体は単一列版のみを返せるため
             // `None` のまま素通しし、複数列を返せる下のループへ委ねる）。
+            // `HybridDetail`（SEARCH-17）は列を参照しない（値は融合段の対応表由来）。
             ProjectedColumn::Id
             | ProjectedColumn::AliasedId { .. }
+            | ProjectedColumn::HybridDetail { .. }
             | ProjectedColumn::Computed { .. } => None,
         })
         .collect();
@@ -2891,6 +2897,16 @@ pub(crate) fn execute_statement_with_cache_observed(
         Ok(filtered)
     };
 
+    // SEARCH-17・Issue #2137: 投影に `hybrid_dense_rank()` 等があるときだけ、融合段の系統別順位を
+    // slot 番号で引ける対応表へ退避する（`project_rows` が引く）。呼び出しごとに上書きする。
+    // ハイブリッドで `compute_hits` を複数回呼ぶ反復スキャン経路は無い（反復スキャンは
+    // `Ranking::Distance` 専用）ため、表は最後の 1 回分で常に完結している。
+    let wants_hybrid_detail = bound
+        .projection
+        .iter()
+        .any(|c| matches!(c, ProjectedColumn::HybridDetail { .. }));
+    let hybrid_ranks: std::cell::RefCell<Option<HybridRankMap>> = std::cell::RefCell::new(None);
+
     let compute_hits = |k_eff: usize| -> Result<Vec<(u64, f64)>, SqlSurfaceError> {
         Ok(if completeness_unbounded {
             Vec::new()
@@ -3366,6 +3382,16 @@ pub(crate) fn execute_statement_with_cache_observed(
                     if let Some(adapter) = &hnsw_dense_provider {
                         adapter.finish();
                     }
+                    if wants_hybrid_detail {
+                        // 件数は `fused.len() <= k_eff`（検証済みの LIMIT + OFFSET で上限あり）。
+                        // スコアは融合結果の値そのまま（SQL 経路はソフトブーストを使わない。
+                        // 結線する場合は SEARCH-17 (1) のスコア一致が崩れるため再検討が要る）。
+                        let map: HybridRankMap = fused
+                            .iter()
+                            .map(|h| (h.id, (h.dense_rank, h.sparse_rank)))
+                            .collect();
+                        *hybrid_ranks.borrow_mut() = Some(map);
+                    }
                     fused.into_iter().map(|h| (h.id, h.score)).collect()
                 }
             }
@@ -3679,6 +3705,7 @@ pub(crate) fn execute_statement_with_cache_observed(
         arena,
         scalar_source,
         &needed_mask,
+        hybrid_ranks.borrow().as_ref(),
     )?;
     stage_end(
         &mut stats,
@@ -3705,6 +3732,9 @@ pub(crate) fn execute_statement_with_cache_observed(
             ProjectedColumn::Computed {
                 name, result_ty, ..
             } => computed_column_meta(name, result_ty),
+            ProjectedColumn::HybridDetail { name, kind } => {
+                computed_column_meta(name, &Some(kind.result_type()))
+            }
         })
         .collect();
 
@@ -4005,6 +4035,7 @@ fn project_rows(
     arena: &VectorArena,
     scalar_source: ScalarSource<'_>,
     needed_mask: &[bool],
+    hybrid_ranks: Option<&HybridRankMap>,
 ) -> Result<Vec<ResultRow>, SqlSurfaceError> {
     // `ScalarSource::Deferred(DeferredScalars::Redb { .. })` のときだけ行テーブルを
     // 1 回開く。行を 1 件も持たないテーブル（`user_rows/{table}` 未作成）は
@@ -4045,6 +4076,7 @@ fn project_rows(
             }
             ProjectedColumn::Id
             | ProjectedColumn::AliasedId { .. }
+            | ProjectedColumn::HybridDetail { .. }
             | ProjectedColumn::Column { .. } => None,
         })
         .collect();
@@ -4158,6 +4190,25 @@ fn project_rows(
             match col {
                 ProjectedColumn::Id | ProjectedColumn::AliasedId { .. } => {
                     cells.push(Cell::Integer(id))
+                }
+                ProjectedColumn::HybridDetail { kind, .. } => {
+                    // RLS 適用後の可視候補だけで融合した順位（SEARCH-17 (2)）。対応表に slot が
+                    // 無いのは不変条件違反で、黙って NULL にせず fail-closed で拒否する。
+                    let ranks = hybrid_ranks.and_then(|m| m.get(&slot_id)).ok_or_else(|| {
+                        SqlSurfaceError::Internal {
+                            detail: "hybrid rank is missing for a search hit".to_string(),
+                        }
+                    })?;
+                    let rank = match kind {
+                        crate::sql::hybrid_detail::HybridDetailKind::DenseRank => Some(ranks.0),
+                        crate::sql::hybrid_detail::HybridDetailKind::SparseRank => Some(ranks.1),
+                        crate::sql::hybrid_detail::HybridDetailKind::Score => None,
+                    };
+                    cells.push(match rank {
+                        Some(Some(r)) => Cell::SignedInteger(i64::from(r)),
+                        Some(None) => Cell::Null,
+                        None => Cell::Float(score),
+                    });
                 }
                 ProjectedColumn::Column { index, .. } => {
                     let column =

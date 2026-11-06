@@ -689,3 +689,20 @@ fn describe_projected_distance_column_matches_execute() {
          ORDER BY embedding <=> '[0.1,0.2,0.3]' LIMIT 5",
     );
 }
+
+/// SEARCH-17・Issue #2137: 投影位置の `hybrid_*` 関数（int8／float8）の Describe 列は実行結果の列と一致する。
+#[test]
+fn describe_hybrid_detail_columns_match_execute() {
+    let path = unique_db_path("describe-hybrid-detail");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core_with_documents_table(&path);
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    seed_row(&core, &ctx, 1, "op-seed-0001");
+
+    assert_describe_matches_execute(
+        &core,
+        &ctx,
+        "SELECT id, hybrid_dense_rank(), hybrid_sparse_rank() AS sr, hybrid_score() \
+         FROM documents ORDER BY HYBRID(embedding, '[0.1,0.2,0.3]', body, 'hello') LIMIT 5",
+    );
+}

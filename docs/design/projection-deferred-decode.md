@@ -83,6 +83,13 @@ metadata バイト列を 2 通りの経路で取得する:
 （`defer_projection`・キャッシュ高速経路）には影響しない。距離項目はスカラー列を参照しない
 ので `needed_column_indices` にも列を足さない。
 
+## 系統別順位・融合スコア（Issue #2137）
+
+`hybrid_dense_rank()`／`hybrid_sparse_rank()`／`hybrid_score()`（SEARCH-17 ポインタ）は
+`ProjectedColumn::HybridDetail` として `project_rows` が融合段の対応表とヒットのスコアから
+作る。スカラー列を参照しないので `needed_column_indices` に列を足さず、遅延デコードの適格条件
+は変わらない。
+
 ## スコープ外・申し送り
 
 - hybrid（`Ranking::Hybrid`）で `SparseIndexCache` ヒット時の遅延投影化。
