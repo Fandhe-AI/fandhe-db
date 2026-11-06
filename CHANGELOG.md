@@ -9,6 +9,7 @@
 
 ### Changed
 
+- wire-server に `--english-stemmer` を追加した（Issue #2129 Phase A・SEARCH-16 ポインタ）。依存の承認と feature 有効化の前は値の有無にかかわらず固定文言で起動エラーにする（従来は未知引数として拒否）。公開モジュール `english_stemmer_opt` を追加した。
 - 公開 struct `hybrid::HybridHit` にフィールド `dense_rank: Option<u32>`・`sparse_rank: Option<u32>` を追加した（Issue #2136・SEARCH-17 ポインタ）。融合に使った 1 始まりの実効順位（`GroupEnd` では同点グループ末尾）で、その系統の候補に無ければ `None`。融合スコア・順序は不変。
   BREAKING CHANGE: 構造体リテラルで構築している下流は追随が必要。
 - `HYBRID`／`hybrid_rrf` の調整引数 `rrf_k`・`window`・`weights` を実行するようにした（Issue #2120・SEARCH-13 ポインタ）。従来の `0A000` から変わる。`window` が `LIMIT + OFFSET` 未満または `--max-result-rows` 超なら `22000`。`k1`／`b` は `0A000` のまま。公開関数 `hybrid::RrfConfig::new` は片側 0 の重みを受理する（両方 0・負・非有限は従来どおり `Err`。受理範囲の拡大のみ）。
