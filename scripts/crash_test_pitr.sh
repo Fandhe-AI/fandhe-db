@@ -26,10 +26,13 @@
 #   5. PITR の `restore` の最中に SIGKILL する反復。最終名は「存在しない」か「完全」のどちらかで、残骸は
 #      一時名（`.fandhe-restore-*.tmp`）だけ、入力（ベース・アーカイブ）は変わらないこと。
 #   6. 改ざん: アーカイブの複製に対し、途中のセグメントの削除・1 バイト反転・並べ替え、停止点より後ろの
-#      セグメントの反転・切り詰め、末尾セグメントの削除を行い、`change-log-verify`（末尾削除を除く）も
-#      `restore --until-lsn` も終了コード 1 で拒否し、復元先に何も作らないこと（無改ざんの対照は成功する）。
+#      セグメントの反転・切り詰め、末尾セグメントの削除を行い、`change-log-verify`（末尾削除は DB のコピーとの
+#      突き合わせで拒否）も `restore --until-lsn` も終了コード 1 で拒否し、復元先に何も作らないこと（無改ざんの対照は成功する）。
 #   7. 増分併用: 途中の検査点の DB から取った増分バックアップ + アーカイブで最新まで復元できること、
 #      増分だけで増分内の LSN まで復元できること、増分の反転を拒否すること。
+# 時刻指定の検査は壁時計に依存する。開発機では別ジョブの影響で壁時計が数百 ms 単位で前後に飛ぶことが
+# あったため、検査点の前後で壁時計が単調時計（/proc/uptime）から 30ms を超えてずれた場合は、飛びの無い
+# 検査点が採れるまでクラッシュ周期を足す（上限あり。採れなければ失敗）。
 # 空虚な成功を避けるため、書き込み中にサーバーを kill できた周期数と、PITR の restore を公開前
 # （一時名が新たにあり最終名が無い）に kill できた回数を数え、0 回なら失敗とする（反復を延長する。上限あり）。
 # Makefile の crash-test-pitr ターゲット（crash-test の前提）から呼ばれ、CI では既存の crash-test
@@ -440,9 +443,9 @@ for cycle in $(seq 1 "${CYCLES}"); do
   crash_cycle "${cycle}"
 done
 # 壁時計が飛んだ環境では時刻指定の検査が成り立たないため、飛びの無い検査点が採れるまで周期を足す
-# （上限 3 回。通常の環境では足さない）。
+# （上限 5 回。通常の環境では足さない）。
 extra=0
-while ! find_time_point && [ "${extra}" -lt 3 ]; do
+while ! find_time_point && [ "${extra}" -lt 5 ]; do
   extra=$((extra + 1))
   echo "wall clock stepped between points; running an extra crash cycle (${extra})"
   crash_cycle $((CYCLES + extra))
@@ -629,6 +632,12 @@ echo "=== phase 6: tampered archives are rejected by change-log-verify and resto
 mapfile -t SEGS < <(find "${ARCH}" -maxdepth 1 -name 'fandhe-cl-*.seg' -printf '%f\n' | sort)
 [ "${#SEGS[@]}" -ge 4 ] || fail "need 4+ segments, found ${#SEGS[@]}"
 LAST_SEG="${SEGS[$((${#SEGS[@]} - 1))]}"
+# 停止点より後ろのセグメントの改ざん（flip-after-stop・truncate-after-stop）が、停止点（検査点 1）の
+# 復元に必要なセグメントを壊すだけの検査にならないよう、末尾セグメントの先頭 LSN が停止点より後ろで
+# あることを名前（`...-<先頭 LSN>-<末尾 LSN>.seg`）から確かめる。
+LAST_SEG_FIRST="$(printf '%s\n' "${LAST_SEG}" | sed -n 's/.*-\([0-9][0-9]*\)-[0-9][0-9]*\.seg$/\1/p')"
+[[ "${LAST_SEG_FIRST}" =~ ^[0-9]+$ ]] || fail "could not parse the first lsn of ${LAST_SEG}"
+[ $((10#${LAST_SEG_FIRST})) -gt "${PT_LSN[1]}" ] || fail "the last segment starts at lsn ${LAST_SEG_FIRST}, not after the stop point ${PT_LSN[1]}"
 
 # ファイルの指定オフセットの 1 バイトを反転する。
 flip_byte() {
@@ -640,7 +649,7 @@ flip_byte() {
     || fail "could not rewrite a byte of ${file}"
 }
 
-# 改ざんの 1 ケース。引数: <名前> <until_lsn> <change-log-verify の期待: reject|any> <改ざん関数名>。
+# 改ざんの 1 ケース。引数: <名前> <until_lsn> <change-log-verify の期待: reject〔単体で拒否〕|tail〔--db との突き合わせで拒否〕> <改ざん関数名>。
 # アーカイブの複製を作って改ざんし、verify（reject のとき）と restore の拒否・復元先の空を確かめる。
 tamper_case() {
   local name="$1" until_lsn="$2" verify_expect="$3" mutate="$4"
@@ -652,6 +661,10 @@ tamper_case() {
   if [ "${verify_expect}" = "reject" ]; then
     run_clv "${copy}"
     [ "${CLV_RC}" -eq 1 ] || { echo "${CLV_OUT}" >&2; fail "tamper ${name}: change-log-verify exit ${CLV_RC}, expected 1"; }
+  elif [ "${verify_expect}" = "tail" ]; then
+    # 末尾の欠落はアーカイブ単体では検出できない。DB のコピーとの突き合わせ（--db）で検出される。
+    run_clv "${copy}" --db "${SRC_COPY}"
+    [ "${CLV_RC}" -eq 1 ] || { echo "${CLV_OUT}" >&2; fail "tamper ${name}: change-log-verify --db exit ${CLV_RC}, expected 1"; }
   fi
   restore_to "${dest_dir}/rst.redb" --change-log-archive-dir "${copy}" --until-lsn "${until_lsn}"
   [ "${RESTORE_RC}" -eq 1 ] || restore_fail "tamper ${name}: restore exit ${RESTORE_RC}, expected 1"
@@ -699,9 +712,9 @@ tamper_case swap "${PT_LSN[LAST]}" reject mutate_swap
 # 停止点（検査点 1）より後ろのセグメントの破損・切り詰めも拒否する。
 tamper_case flip-after-stop "${PT_LSN[1]}" reject mutate_flip_last
 tamper_case truncate-after-stop "${PT_LSN[1]}" reject mutate_truncate_last
-# 末尾の削除はアーカイブ単体では検出できない（DB との突き合わせが要る）。最新までの復元は、ログの
-# 最大 LSN が足りず範囲外として拒否される。
-tamper_case delete-last "${PT_LSN[LAST]}" any mutate_delete_last
+# 末尾の削除はアーカイブ単体では検出できないため、verify は --db との突き合わせで確かめる。最新までの
+# 復元は、ログの最大 LSN が足りず範囲外として拒否される。
+tamper_case delete-last "${PT_LSN[LAST]}" tail mutate_delete_last
 # 元のアーカイブは改ざん試験の影響を受けていない。
 [ "$(dir_fingerprint "${ARCH}")" = "${ARCH_FP_BEFORE}" ] || fail "the original archive changed during tamper cases"
 
