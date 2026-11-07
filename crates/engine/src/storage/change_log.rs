@@ -629,7 +629,8 @@ impl Drop for FrameRegistration {
                 ACTIVE_SLOTS[i].compare_exchange(self.addr, 0, Ordering::AcqRel, Ordering::Relaxed);
         }
         let mut frames = frames_lock();
-        // Box の解放後に別のトランザクションが同じアドレスで登録している場合、それを消さない。
+        // `GatedWriteTxn` は Box の解放前に解除するためアドレスの再利用とは競合しない想定だが、
+        // 万一別の登録が同じアドレスにあってもそれを消さない（多層防御）。
         if frames
             .get(&self.addr)
             .is_some_and(|f| Arc::ptr_eq(f, &self.frame))
@@ -646,11 +647,11 @@ impl Drop for FrameRegistration {
 
 /// `GatedWriteTxn` が寿命を結び付けて持つ捕捉の付帯物。commit 境界の prepare 段へ渡される。
 ///
-/// 宣言順が drop 順で、登録解除（`_registration`）を先に行い、`base` は最後に解放する。
+/// 宣言順が drop 順で、登録解除（`registration`）を先に行い、`base` は最後に解放する。
 /// `base`（読み取りトランザクション）は書き込みトランザクションの全期間、古いページの回収を止める
 /// （有効時のコスト。長い明示トランザクションほど効く）。
 pub(crate) struct CaptureSession {
-    _registration: FrameRegistration,
+    registration: Option<FrameRegistration>,
     state: Arc<ChangeLogState>,
     frame: Arc<CaptureFrame>,
     /// 書き込みトランザクション開始時点の確定状態（単一ライタなので基底の表集合を与える）。
@@ -675,15 +676,23 @@ impl CaptureSession {
             CaptureFrame::mark_overflow(&mut frame.lock());
         }
         Self {
-            _registration: FrameRegistration {
+            registration: Some(FrameRegistration {
                 frame: Arc::clone(&frame),
                 addr,
                 slot,
-            },
+            }),
             state,
             frame,
             base,
         }
+    }
+
+    /// 登録簿・公開表から外す（`ACTIVE_FRAMES` も 1 回だけ減る。2 回目以降は何もしない）。
+    /// `GatedWriteTxn` が `txn` の Box を解放する前に呼ぶ。解放後はアドレスを別の
+    /// トランザクションが得うるため、そのアドレスで frame を引けてはならない。prepare は
+    /// 登録簿を引かず、この session が持つ frame と基底の読み取りを直接使うので解除後も動く。
+    pub(crate) fn release_registration(&mut self) {
+        self.registration = None;
     }
 
     /// 記録対象（非除外表）のキーかイベントが積まれている、または積めなかった（上限超過）か。
@@ -1722,6 +1731,56 @@ mod tests {
         let c = change(&recs[0], "t_users");
         assert_eq!(c.upserts, vec![(b"a".to_vec(), b"1".to_vec())]);
         assert!(records(&disabled_storage).is_empty());
+    }
+
+    fn registered(addr: usize) -> bool {
+        slot_present(addr) || frames_lock().contains_key(&addr)
+    }
+
+    #[test]
+    fn registration_is_released_before_the_box_is_freed() {
+        use super::super::CommitTxn;
+        let (_g, storage) = enabled("change-log-release-order");
+
+        // split_for_commit の直後（Box 解放済み）には、元のアドレスは引けない。
+        let txn = storage.begin_write_txn().expect("txn");
+        let addr = addr_of(&txn);
+        assert!(registered(addr));
+        let parts = txn.split_for_commit();
+        assert!(!slot_present(addr));
+        assert!(!frames_lock().contains_key(&addr));
+        // 登録解除後でも prepare（session 直接）は動く。
+        let capture = parts.capture.as_ref().expect("capture");
+        assert!(!capture.has_pending_changes());
+        drop(parts);
+        assert!(!registered(addr));
+
+        // commit せず drop（abort 経路・通常 drop）でも外れる。
+        let txn = storage.begin_write_txn().expect("txn");
+        let addr = addr_of(&txn);
+        assert!(registered(addr));
+        txn.abort().expect("abort");
+        assert!(!registered(addr));
+        let txn = storage.begin_write_txn().expect("txn");
+        let addr = addr_of(&txn);
+        drop(txn);
+        assert!(!registered(addr));
+
+        // 解除は冪等で、カウンタを二重に減らさない（他テストと並行するため絶対値ではなく、
+        // 引き算の下回り＝巨大値になっていないことと、解除後の新規登録が引けることで判定する）。
+        let mut txn = storage.begin_write_txn().expect("txn");
+        let addr = addr_of(&txn);
+        if let Some(c) = txn.capture.as_mut() {
+            c.release_registration();
+            c.release_registration();
+        }
+        assert!(!registered(addr));
+        assert!(ACTIVE_FRAMES.load(Ordering::Relaxed) < usize::MAX / 2);
+        drop(txn);
+        let txn = storage.begin_write_txn().expect("txn");
+        assert!(registered(addr_of(&txn)));
+        drop(txn);
+        assert!(ACTIVE_FRAMES.load(Ordering::Relaxed) < usize::MAX / 2);
     }
 
     #[test]

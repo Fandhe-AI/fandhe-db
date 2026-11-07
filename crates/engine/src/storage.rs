@@ -428,10 +428,13 @@ pub type Result<T> = std::result::Result<T, StorageError>;
 /// `55P03` へ倒れる。`Deref`/`DerefMut` で `redb::WriteTransaction` として扱える。
 ///
 /// フィールドの宣言順が drop 順序を決める（`capture`・`recording` の登録解除 → `txn` の abort →
-/// `_permit` の解放の順）。並べ替えてはならない。
+/// `_permit` の解放の順）。並べ替えてはならない。フィールドを分解して `txn` を先に消費する経路
+/// （`abort`・`split_for_commit` 等）では、宣言順に頼れないため `txn` の Box を解放する前に
+/// [`change_log::CaptureSession::release_registration`] で明示的に登録を外す。
 pub(crate) struct GatedWriteTxn {
     /// 変更ログの捕捉の付帯物（変更ログが有効な永続ストレージだけ。無効なら `None` で何も確保しない）。
-    /// `recording` と同じ理由で `txn` より先に登録を外す。
+    /// `recording` と同じ理由で `txn` より先に登録を外す（宣言順。Box の解放後に別 Storage の
+    /// トランザクションが同じアドレスを得て、この frame を引かないようにするため）。
     capture: Option<change_log::CaptureSession>,
     /// commit 記録の付帯物（永続ストレージだけ。一時表用のストレージは `None`）。
     /// 先頭に置くのは、`txn`（Box のアドレス）・`_permit` より先に frame の登録を外すため
@@ -463,8 +466,12 @@ impl GatedWriteTxn {
             txn,
             _permit,
             recording: _recording,
-            capture: _capture,
+            mut capture,
         } = self;
+        // `txn` の Box を解放する前に登録を外す（分解後の drop 順は宣言順に従わない）。
+        if let Some(c) = capture.as_mut() {
+            c.release_registration();
+        }
         txn.abort()?;
         Ok(())
     }
@@ -477,8 +484,11 @@ impl GatedWriteTxn {
             txn,
             _permit,
             recording: _recording,
-            capture: _capture,
+            mut capture,
         } = self;
+        if let Some(c) = capture.as_mut() {
+            c.release_registration();
+        }
         txn.commit()?;
         Ok(())
     }
@@ -525,8 +535,13 @@ impl CommitTxn for GatedWriteTxn {
             txn,
             _permit,
             recording,
-            capture,
+            mut capture,
         } = self;
+        // `*txn` で Box を解放する前に登録を外す。以降の prepare は登録簿を引かず、session が
+        // 直接持つ frame と基底の読み取りだけを使うため支障はない。
+        if let Some(c) = capture.as_mut() {
+            c.release_registration();
+        }
         CommitParts {
             txn: *txn,
             permit: Some(_permit),
