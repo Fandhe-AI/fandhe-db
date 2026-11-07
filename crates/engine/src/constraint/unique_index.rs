@@ -638,6 +638,125 @@ where
     Ok(())
 }
 
+/// [`audit_tenant_streaming`] の結果（件数だけ。キー値・行 id・テナントは含めない）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct UniqueAudit {
+    /// テナントのマーカーが現在の宣言・形式版に一致するか。`false` のときは遅延再構築の待ちで、
+    /// 以下の件数は 0（索引は読まれず、次の書き込みで再構築される設計のため矛盾ではない）。
+    pub(super) marker_valid: bool,
+    /// 生存行のキーに対応する正引きエントリが無い、または別の行を指している件数（不変条件違反）。
+    pub(super) missing: u64,
+    /// 正引きエントリのうち、指す行が存在しない・行のキーと一致しない件数（衛生指標。正しさには影響しない）。
+    pub(super) dangling: u64,
+    /// 行のキーを計算できず突き合わせられなかった行・エントリの件数。
+    pub(super) unevaluable: u64,
+}
+
+/// 整合検査（`storage::integrity`。RECOVER-13 のポインタ）向けの、テナント 1 つ分の永続一意索引の
+/// 読み取り専用監査。[`verify_tenant_index_read_only`] と異なり最初の矛盾で止まらず件数を返し、
+/// 行→索引（欠落）と索引→行（宙に浮いたエントリ）の両方向を点照会だけで確かめるため、メモリは
+/// テナントの行数に比例しない。書き込み・遅延再構築は行わない。逆引き（`0x02`）は衛生用で正しさに
+/// 関与しないため対象外。
+pub(super) fn audit_tenant_streaming<R, I>(
+    row_table: &R,
+    index_table: &I,
+    schema: &TableSchema,
+    plan: &UniqueKeyPlan,
+    compiled: Option<&CompiledIndexExpressions>,
+    tenant_id: &str,
+) -> Result<UniqueAudit, TenantWriteError>
+where
+    R: ReadableTable<(&'static str, u64), &'static [u8]>,
+    I: ReadableTable<(&'static str, &'static [u8]), &'static [u8]>,
+{
+    let signature = schema_signature(schema, plan, compiled)?;
+    let mut audit = UniqueAudit::default();
+    if !marker_valid_read_only(index_table, tenant_id, &signature)? {
+        return Ok(audit);
+    }
+    audit.marker_valid = true;
+
+    let start = std::ops::Bound::Included(row_key(tenant_id, RowId::from_index_raw(0)));
+    let end = std::ops::Bound::Included(row_key(tenant_id, RowId::from_index_raw(u64::MAX)));
+    for entry in row_table
+        .range::<(&str, u64)>((start, end))
+        .map_err(storage_error)?
+    {
+        let (k, v) = entry.map_err(storage_error)?;
+        let (key_tenant, id) = split_row_key(k.value());
+        if key_tenant != tenant_id {
+            break;
+        }
+        let Ok(keys) = plan.row_keys(schema, compiled, id.legacy_id(), v.value()) else {
+            audit.unevaluable = audit.unevaluable.saturating_add(1);
+            continue;
+        };
+        for (ordinal, key) in keys.into_iter().enumerate() {
+            let Some(canonical) = key else {
+                continue;
+            };
+            let Ok(ordinal_u16) = u16::try_from(ordinal) else {
+                audit.unevaluable = audit.unevaluable.saturating_add(1);
+                continue;
+            };
+            // 読み取り・復号の失敗は「索引に無い」ではなく突き合わせられなかった件数に数える。
+            let owner =
+                match lookup_forward_read_only(index_table, tenant_id, ordinal_u16, &canonical) {
+                    Ok(owner) => owner,
+                    Err(_) => {
+                        audit.unevaluable = audit.unevaluable.saturating_add(1);
+                        continue;
+                    }
+                };
+            if owner != Some(id) {
+                audit.missing = audit.missing.saturating_add(1);
+            }
+        }
+    }
+
+    let lo = std::ops::Bound::Included((tenant_id, [FORWARD_TAG].as_slice()));
+    let hi = std::ops::Bound::Excluded((tenant_id, [REVERSE_TAG].as_slice()));
+    for entry in index_table
+        .range::<(&str, &[u8])>((lo, hi))
+        .map_err(storage_error)?
+    {
+        let (k, v) = entry.map_err(storage_error)?;
+        let (key_tenant, subkey) = k.value();
+        if key_tenant != tenant_id {
+            break;
+        }
+        let parsed = subkey
+            .get(1..3)
+            .and_then(|b| <[u8; 2]>::try_from(b).ok())
+            .map(u16::from_be_bytes)
+            .zip(subkey.get(3..));
+        let (Some((ordinal, canonical)), Ok(owner)) = (parsed, decode_row_id(v.value())) else {
+            audit.unevaluable = audit.unevaluable.saturating_add(1);
+            continue;
+        };
+        let live = match row_table
+            .get(row_key(tenant_id, owner))
+            .map_err(storage_error)?
+        {
+            Some(guard) => plan
+                .row_keys(schema, compiled, owner.legacy_id(), guard.value())
+                .ok()
+                .map(|keys| {
+                    keys.get(usize::from(ordinal))
+                        .and_then(|k| k.as_deref())
+                        .is_some_and(|k| k == canonical)
+                }),
+            None => Some(false),
+        };
+        match live {
+            Some(true) => {}
+            Some(false) => audit.dangling = audit.dangling.saturating_add(1),
+            None => audit.unevaluable = audit.unevaluable.saturating_add(1),
+        }
+    }
+    Ok(audit)
+}
+
 /// 読み取り側（`sql::pk_point` の候補探査）がマーカー照合に使うシグネチャを組み立てる
 /// （[`schema_signature`] の `pub(super)` 入口。書き込み側と同じバイト列を返す）。
 pub(super) fn signature_for_read(

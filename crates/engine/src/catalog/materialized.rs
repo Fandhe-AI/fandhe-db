@@ -110,6 +110,122 @@ impl ContextKey {
     }
 }
 
+/// [`audit_matview_rows`] の件数（整合検査 `storage::integrity` 向け。キー・値・テナントは含めない）。
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct MatviewRowsAudit {
+    /// 走査した行数。
+    pub(crate) rows: u64,
+    /// 実体の列で復号できない行数。
+    pub(crate) undecodable: u64,
+    /// 文脈キーのテナントと行ヘッダのテナントが一致しない行数。
+    pub(crate) tenant_mismatch: u64,
+    /// 実体の行表に対応する matview の定義が無い。
+    pub(crate) orphan: bool,
+    /// 実体の行表の物理キー形式が現行と合わない（`user_rows`・`rows` の形式違いと同じ扱い）。
+    pub(crate) format_mismatch: bool,
+}
+
+/// matview `name` の実体の行表（`matview_rows/{name}`）を読み取り専用で全件走査し、行の復号と文脈キーの
+/// テナント一致を検査する（整合検査 `storage::integrity`。RECOVER-13 のポインタ）。メモリは行数に非依存。
+/// 定義が無ければ `orphan`。定義の復号失敗・読み取り失敗は `Err`。
+pub(crate) fn audit_matview_rows(
+    read_txn: &redb::ReadTransaction,
+    name: &str,
+) -> Result<MatviewRowsAudit> {
+    let mut audit = MatviewRowsAudit::default();
+    let def = match read_txn.open_table(MATERIALIZED_VIEWS_TABLE) {
+        Ok(t) => match t.get(name)? {
+            Some(g) => Some(decode_materialized_view_def(name, g.value())?),
+            None => None,
+        },
+        Err(redb::TableError::TableDoesNotExist(_)) => None,
+        Err(e) => return Err(e.into()),
+    };
+    let Some(def) = def else {
+        audit.orphan = true;
+        return Ok(audit);
+    };
+    let schema = TableSchema::new(name.to_string(), def.columns.clone());
+    let rows_table_name = format!("matview_rows/{name}");
+    let rows_def: MatviewRowsDef = TableDefinition::new(&rows_table_name);
+    let rows_table = match read_txn.open_table(rows_def) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(audit),
+        Err(redb::TableError::TableTypeMismatch { .. }) => {
+            audit.format_mismatch = true;
+            return Ok(audit);
+        }
+        Err(e) => return Err(e.into()),
+    };
+    for entry in rows_table.iter()? {
+        let (k, v) = entry?;
+        audit.rows = audit.rows.saturating_add(1);
+        match row_codec::decode_row(&schema, v.value()) {
+            Ok(decoded) => {
+                // 文脈キー `[版][可視性フラグ][tenant_id]` のテナントと行ヘッダのテナントが一致すること。
+                let key_tenant = k.value().0.get(2..);
+                if key_tenant != Some(decoded.tenant_id.as_bytes()) {
+                    audit.tenant_mismatch = audit.tenant_mismatch.saturating_add(1);
+                }
+            }
+            Err(_) => audit.undecodable = audit.undecodable.saturating_add(1),
+        }
+    }
+    Ok(audit)
+}
+
+/// 定義の `after` より後ろの最小の matview 名を返す（`None` は先頭から。整合検査が定義を件数に
+/// 比例したメモリを使わず順に辿るための読み取り専用の入口）。
+pub(crate) fn next_matview_name_after(
+    read_txn: &redb::ReadTransaction,
+    after: Option<&str>,
+) -> Result<Option<String>> {
+    let table = match read_txn.open_table(MATERIALIZED_VIEWS_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let lower = match after {
+        Some(a) => std::ops::Bound::Excluded(a),
+        None => std::ops::Bound::Unbounded,
+    };
+    let mut iter = table.range::<&str>((lower, std::ops::Bound::Unbounded))?;
+    match iter.next() {
+        Some(entry) => Ok(Some(entry?.0.value().to_string())),
+        None => Ok(None),
+    }
+}
+
+/// matview `name` の実体の行表が消えているか（整合検査。RECOVER-13 のポインタ）。実体を書く経路は
+/// 文脈ごとのメタ行と行表を同じ Tx で作り（行表は行が 0 件でも開く）、メタ行がある限り行表も存在する。
+/// そのため「メタ行が 1 件でもあるのに行表が無い」ことは、一度も populate されていないビュー
+/// （メタ行が無い）と区別できる確定的な欠落である。
+pub(crate) fn matview_rows_table_missing(
+    read_txn: &redb::ReadTransaction,
+    name: &str,
+) -> Result<bool> {
+    let has_entity = match read_txn.open_table(MATVIEW_ENTITY_META_TABLE) {
+        Ok(t) => match t.range((name, [].as_slice())..)?.next() {
+            Some(entry) => entry?.0.value().0 == name,
+            None => false,
+        },
+        Err(redb::TableError::TableDoesNotExist(_)) => false,
+        Err(e) => return Err(e.into()),
+    };
+    if !has_entity {
+        return Ok(false);
+    }
+    let rows_table_name = format!("matview_rows/{name}");
+    let rows_def: MatviewRowsDef = TableDefinition::new(&rows_table_name);
+    match read_txn.open_table(rows_def) {
+        Ok(_) => Ok(false),
+        Err(redb::TableError::TableDoesNotExist(_)) => Ok(true),
+        // 型違いは行表が「ある」状態（形式の不一致は `audit_matview_rows` が報告する）。
+        Err(redb::TableError::TableTypeMismatch { .. }) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// matview の定義（カタログ値）。`FROM` 解決や SQL の意味論には踏み込まず、後続 Issue が
 /// 検証・正規化した値を運ぶだけの入れ物。
 #[derive(Debug, Clone, PartialEq, Eq)]

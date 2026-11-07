@@ -1,0 +1,1124 @@
+//! DB ファイルの整合検査（RECOVER-13 (6) のポインタ。Issue #2155。親 #2154）。
+//!
+//! # 役割
+//!
+//! 読み取りトランザクション 1 本（MVCC により単一 commit 点のスナップショット）の上で全表を走査し、
+//! カタログ・行・二次索引の矛盾を種類と件数で報告する。[`Storage::verify_integrity`] が公開入口で、
+//! 呼び出し元は運用者向けの整合検査 CLI（#2156）を想定する。DB・ファイルは一切変更しない
+//! （書き込みトランザクションを開かず、`writer_gate` も通さない）。
+//!
+//! # 検査項目
+//!
+//! 1. redb の全表（型の組の一覧 `table_image::SHAPES` で解決できること・全エントリを読めること。
+//!    multimap 表と未知の型の表は「未対応」）
+//! 2. カタログの各エントリが復号でき、行ストア（`user_rows/<表>`）が存在し形式が合うこと。
+//!    カタログに無い行ストア（孤児）
+//! 3. 全行が復号でき、行キーのテナントと行ヘッダのテナントが一致すること
+//! 4. 主キー・UNIQUE 制約・一意索引（式・部分を含む）の重複（索引に依存せず行だけから判定）
+//! 5. 永続一意索引と行の双方向の突き合わせ（行に対する正引きの欠落 / 行の無い正引き）
+//! 6. GIN 相当索引と行の双方向の突き合わせ（`gin_index::audit_tenant_streaming`）
+//! 7. `FOREIGN KEY` の孤児行（参照先に存在しない子行）
+//! 8. 採番方式の表の rowid 採番状態が既存の最大 rowid より進んでいること
+//! 9. カタログを経ない行ストア: `rows` 表（`Storage::put`・`put_batch`・`BatchWriteTxn` の書き込み先）の
+//!    行の復号と行キー・ヘッダのテナント一致、マテリアライズドビューの実体（`matview_rows/<名前>`）の
+//!    行の復号と文脈キー・ヘッダのテナント一致、対応する定義の無い実体（孤児）
+//! 10. 索引カタログのエントリ単位の復号（壊れたエントリを 1 件ずつ数える）
+//!
+//! # 対象外（理由）
+//!
+//! - シーケンスの現在値: 行から導出できる不変条件が無い（手動挿入で値が後ろに残るのは正常）
+//! - FK 用のキー索引（`key_index/…`）: 登録簿が遅延構築で、欠落は書き込み側が再構築する設計。
+//!   FK の判定は本検査が行から直接行う（4・7）ため、索引の状態に依存しない
+//! - 一意索引・GIN 索引の逆引き（`0x02`）: 後片付け用の衛生データで正しさに関与しない
+//! - マテリアライズドビューの実体と導出元の照合: クエリの再実行なしには照合できない（行の形式と
+//!   テナント一致だけを項目 9 で確認する）
+//! - 値が行形式でない表（操作 ID 台帳・分割実行ジョブ・権限/ロール/シーケンス等のカタログ類・採番状態・
+//!   各種カウンタ）: 値の形式を共有する検査対象の行形式が無い。型と全エントリの可読性は項目 1 で確認する
+//! - 一時表（接続ごとの別 `Storage`）: 永続ファイルに存在しない
+//! - 操作 ID 台帳・バッチ台帳・世代カウンタ・索引カタログ: 他のデータから導出できる不変条件が無い
+//! - 行を 1 件も持たないテナントに残る索引エントリ: 衛生指標で、行から辿れる範囲だけを検査する
+//! - 行ストアの消失の検出には限界がある（作成直後の表は行ストアを持たない設計のため）。行を書いた
+//!   証拠があるときだけ `RowStoreMissing` とする: 採番方式の表は rowid 採番状態（挿入と同じ Tx で書かれ、
+//!   行を消しても残る）、全方式で一意索引・GIN 索引の行の痕跡。従来方式・移行済みの表で索引にも
+//!   痕跡が無い場合は、消失を検出できない。行ストアが無ければ `RowStoreAbsentUnverified`（Warning）で
+//!   運用者に見せるだけで、整合の判定は覆さない
+//!
+//! # 行ストア・補助表の扱いの対応表
+//!
+//! 行ストア（数える単位はいずれも行ごと。不在・型違い・孤児は表ごとに 1 件）:
+//!
+//! | 観点 | `user_rows`（カタログ） | `rows`（API 直接） | `matview_rows`（実体） |
+//! | ---- | ---- | ---- | ---- |
+//! | 不在 | 行を書いた証拠があれば `RowStoreMissing`（Error）、従来方式で証拠なしは `RowStoreAbsentUnverified`（Warning） | 単一の共有表で、作成直後は無いのが正常のため報告しない | メタ行（実体化済みの文脈）があるのに行表が無ければ `RowStoreMissing`（Error）。メタ行が無い（未 populate）は報告しない |
+//! | 型違い | `RowStoreFormatMismatch`（Error） | 同左 | 同左 |
+//! | 行の復号失敗 | `RowUndecodable`（Error） | 同左 | 同左 |
+//! | テナント不一致 | `RowTenantMismatch`（Error） | 同左 | 同左（文脈キーとの照合） |
+//! | 孤児（定義なし） | `OrphanRowStore`（Error） | 該当なし | 同左 |
+//!
+//! 意図して違えるもの: `rows` は 1 つの共有表で定義が無いため不在と孤児を持たない。`user_rows` だけが
+//! 「証拠が無い不在」を Warning にするのは、実体化の有無を示すメタ行が無く作成直後と区別できないため
+//! （`matview_rows` はメタ行で確定できる）。
+//!
+//! 補助表:
+//!
+//! | 観点 | 一意索引 | GIN 索引 | rowid 採番状態 | 索引カタログ |
+//! | ---- | ---- | ---- | ---- | ---- |
+//! | 読めない・型違い | `CheckUnavailable`（Incomplete。表ごとに 1 件） | 同左（索引ごとに 1 件） | 同左（表ごとに 1 件） | `CheckUnavailable`（全体で 1 件。型違いは項目 1 の `UnsupportedTableType` も出る） |
+//! | 存在しない | `IndexRebuildPending`（Warning。テナントごと） | 同左 | 状態なしは矛盾ではない（初回の払い出しで初期化される設計） | 宣言なしとして扱う |
+//! | エントリの復号失敗 | `CheckUnevaluable`（Incomplete。エントリごと） | 同左 | 値は `u64` で復号失敗が無い | `IndexCatalogEntryUndecodable`（Error。エントリごと） |
+//!
+//! 意図して違えるもの: 索引カタログのエントリ破損だけが Error なのは、宣言そのものの破損で、行から再導出
+//! できる索引エントリとは性質が異なるため（索引エントリの読み取り・復号の失敗は、行を再構築すれば直る
+//! 派生データのため Incomplete）。`IndexRebuildPending` と `CheckBudgetExceeded` はテナントごとに数える
+//! （テナント単位の状態を表すため）。
+//!
+//! # 重大度と fail-closed
+//!
+//! 報告は [`Severity::Error`]（矛盾）・[`Severity::Warning`]（衛生指標・遅延再構築の待ち。正しさに
+//! 影響しない設計）・[`Severity::Incomplete`]（検査できなかった。未対応・読み取り失敗・予算超過）の
+//! 3 段。[`IntegrityReport::is_consistent`] は Error と Incomplete がどちらも 0 件のときだけ真で、
+//! 判定できなかったものを「整合」と報告しない。
+//!
+//! # 秘匿と資源
+//!
+//! - 報告は表の識別（カタログの内部キー。テナント固有の値ではない）・矛盾の種類・件数だけで、行の値・
+//!   キーの値・行 id・テナント名を含まない。ログにも出さない。未知の型の表は名前の最初の `/` までの
+//!   系統名だけを示す
+//! - 走査はすべてストリーミングで、行数に比例するメモリを使わない。重複・参照先キーの集合は
+//!   [`IntegrityOptions::memory_budget_bytes`] を上限とし、超えるときはキーのハッシュで空間を分割して
+//!   再走査する（分割数の上限を超えたら [`FindingKind::CheckBudgetExceeded`] で未検査と報告する）。
+//!   報告に載せる (種類, 表) の組の数は [`IntegrityOptions::max_finding_groups`] で打ち切り、
+//!   打ち切ったことを [`IntegrityReport::findings_truncated`] で示す（種類ごとの総件数は打ち切られない）
+
+use std::collections::BTreeMap;
+use std::fmt;
+
+use redb::{Key, ReadTransaction, ReadableTable, TableHandle, Value};
+
+use super::Storage;
+use crate::catalog::{self, TableSchema};
+use crate::constraint::integrity_audit::{self as audit, PassResult};
+use crate::storage::rowid::{row_key, split_row_key, RowId};
+
+/// 報告に載せる (種類, 表) の組の数の既定の上限。
+pub const DEFAULT_MAX_FINDING_GROUPS: usize = 1024;
+
+/// 重複・参照先キーの集合に使うバイト数の既定の上限（1 つの走査あたり）。
+pub const DEFAULT_MEMORY_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+
+/// ハッシュ分割による再走査の分割数の上限。
+const MAX_PARTITIONS: u32 = 64;
+
+/// 検査の資源上限。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IntegrityOptions {
+    /// 報告に載せる (種類, 表) の組の最大数。超えた分は載せず `findings_truncated` を立てる。
+    pub max_finding_groups: usize,
+    /// 重複・参照先キーの集合に使うバイト数の上限（1 つの走査あたり）。キーの長さに 1 エントリあたりの
+    /// 管理コストを足した概算の目安で、厳密な実メモリ上限ではない。
+    pub memory_budget_bytes: usize,
+}
+
+impl Default for IntegrityOptions {
+    fn default() -> Self {
+        Self {
+            max_finding_groups: DEFAULT_MAX_FINDING_GROUPS,
+            memory_budget_bytes: DEFAULT_MEMORY_BUDGET_BYTES,
+        }
+    }
+}
+
+/// 報告の重大度。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum Severity {
+    /// 矛盾（整合していない）。
+    Error,
+    /// 衛生指標・遅延再構築の待ち。設計上、正しさには影響しない。
+    Warning,
+    /// 検査できなかった（未対応・読み取り失敗・予算超過）。整合とは報告しない。
+    Incomplete,
+}
+
+/// 報告の種類。`code()` は運用ツール向けの安定した識別子。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum FindingKind {
+    /// カタログのエントリを復号できない。
+    CatalogEntryUndecodable,
+    /// 索引カタログのエントリを復号できない（式・GIN・部分索引の宣言を読めない）。
+    IndexCatalogEntryUndecodable,
+    /// カタログにある表の行ストアが無い（索引に行の痕跡がある）。
+    RowStoreMissing,
+    /// 行ストアの物理キー形式が現行と合わない。
+    RowStoreFormatMismatch,
+    /// カタログに無い表の行ストアが残っている。
+    OrphanRowStore,
+    /// 復号できない行（ヘッダ・本体・列・次元の不整合）。
+    RowUndecodable,
+    /// 行キーのテナントと行ヘッダのテナントが一致しない。
+    RowTenantMismatch,
+    /// 主キーの重複。
+    PrimaryKeyDuplicate,
+    /// UNIQUE 制約・一意索引の重複。
+    UniqueKeyDuplicate,
+    /// 行のキーに対する永続一意索引の正引きエントリが無い。
+    UniqueIndexEntryMissing,
+    /// 永続一意索引の正引きエントリが指す行が無い、または行のキーと一致しない。
+    UniqueIndexEntryDangling,
+    /// GIN 相当索引に、行から抽出されるポスティングが無い。
+    GinIndexEntryMissing,
+    /// GIN 相当索引のポスティングが指す行が無い、または行から抽出されない。
+    GinIndexEntryDangling,
+    /// 索引のマーカーが無効（次の書き込みで遅延再構築される設計。読み取りは索引を使わない）。
+    IndexRebuildPending,
+    /// 参照先に存在しない子行。
+    ForeignKeyOrphanRow,
+    /// `FOREIGN KEY` の参照先の表がカタログに無い、または参照先の列を解決できない。
+    ForeignKeyParentMissing,
+    /// 採番方式の表の rowid 採番状態が既存の最大 rowid より進んでいない。
+    RowIdAllocatorBehind,
+    /// 従来方式・移行済みの表の行ストアが無く、行を書いた証拠も無い（作成直後の表と区別できない）。
+    /// 消失の検出ではなく、運用者に見せるための警告。
+    RowStoreAbsentUnverified,
+    /// 未対応の表（multimap、または型の組の一覧にない型）。
+    UnsupportedTableType,
+    /// 表の全エントリを読めなかった。
+    TableUnreadable,
+    /// 検査に必要な情報（宣言・参照先の表など）を読めず、検査を実行できなかった。
+    CheckUnavailable,
+    /// 行・エントリのキーを計算できず、突き合わせられなかった。
+    CheckUnevaluable,
+    /// メモリ予算内に収まらず、分割数の上限まで分けても検査できなかった。
+    CheckBudgetExceeded,
+}
+
+impl FindingKind {
+    /// 重大度。
+    pub fn severity(self) -> Severity {
+        use FindingKind::*;
+        match self {
+            CatalogEntryUndecodable
+            | IndexCatalogEntryUndecodable
+            | RowStoreMissing
+            | RowStoreFormatMismatch
+            | OrphanRowStore
+            | RowUndecodable
+            | RowTenantMismatch
+            | PrimaryKeyDuplicate
+            | UniqueKeyDuplicate
+            | UniqueIndexEntryMissing
+            | GinIndexEntryMissing
+            | ForeignKeyOrphanRow
+            | ForeignKeyParentMissing
+            | RowIdAllocatorBehind => Severity::Error,
+            UniqueIndexEntryDangling
+            | GinIndexEntryDangling
+            | IndexRebuildPending
+            | RowStoreAbsentUnverified => Severity::Warning,
+            UnsupportedTableType | TableUnreadable | CheckUnavailable | CheckUnevaluable
+            | CheckBudgetExceeded => Severity::Incomplete,
+        }
+    }
+
+    /// 運用ツール向けの安定した識別子。
+    pub fn code(self) -> &'static str {
+        use FindingKind::*;
+        match self {
+            CatalogEntryUndecodable => "catalog_entry_undecodable",
+            IndexCatalogEntryUndecodable => "index_catalog_entry_undecodable",
+            RowStoreMissing => "row_store_missing",
+            RowStoreFormatMismatch => "row_store_format_mismatch",
+            OrphanRowStore => "orphan_row_store",
+            RowUndecodable => "row_undecodable",
+            RowTenantMismatch => "row_tenant_mismatch",
+            PrimaryKeyDuplicate => "primary_key_duplicate",
+            UniqueKeyDuplicate => "unique_key_duplicate",
+            UniqueIndexEntryMissing => "unique_index_entry_missing",
+            UniqueIndexEntryDangling => "unique_index_entry_dangling",
+            GinIndexEntryMissing => "gin_index_entry_missing",
+            GinIndexEntryDangling => "gin_index_entry_dangling",
+            IndexRebuildPending => "index_rebuild_pending",
+            ForeignKeyOrphanRow => "foreign_key_orphan_row",
+            ForeignKeyParentMissing => "foreign_key_parent_missing",
+            RowIdAllocatorBehind => "row_id_allocator_behind",
+            RowStoreAbsentUnverified => "row_store_absent_unverified",
+            UnsupportedTableType => "unsupported_table_type",
+            TableUnreadable => "table_unreadable",
+            CheckUnavailable => "check_unavailable",
+            CheckUnevaluable => "check_unevaluable",
+            CheckBudgetExceeded => "check_budget_exceeded",
+        }
+    }
+}
+
+impl fmt::Display for FindingKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.code())
+    }
+}
+
+/// (種類, 表) ごとの報告 1 件。行の値・キー・テナントは含まない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IntegrityFinding {
+    /// 種類。
+    pub kind: FindingKind,
+    /// 表の識別（カタログの内部キー。表に紐づかない報告は `None`）。
+    pub table: Option<String>,
+    /// 件数。
+    pub count: u64,
+}
+
+/// 整合検査の結果。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IntegrityReport {
+    /// 走査した redb の表の数。
+    pub storage_tables_scanned: u64,
+    /// 検査したカタログの表の数。
+    pub catalog_tables_checked: u64,
+    /// 走査した行の数。
+    pub rows_scanned: u64,
+    /// (種類, 表) ごとの報告（種類・表の順）。上限で打ち切られうる（`findings_truncated`）。
+    pub findings: Vec<IntegrityFinding>,
+    /// 報告の組の数が上限に達し、一部を載せていない。
+    pub findings_truncated: bool,
+    totals: BTreeMap<FindingKind, u64>,
+}
+
+impl IntegrityReport {
+    /// 種類 `kind` の総件数（`findings` の打ち切りの影響を受けない）。
+    pub fn total(&self, kind: FindingKind) -> u64 {
+        self.totals.get(&kind).copied().unwrap_or(0)
+    }
+
+    /// 重大度 `severity` の総件数。
+    pub fn total_by_severity(&self, severity: Severity) -> u64 {
+        self.totals
+            .iter()
+            .filter(|(k, _)| k.severity() == severity)
+            .fold(0u64, |a, (_, n)| a.saturating_add(*n))
+    }
+
+    /// 矛盾（Error）が無く、検査できなかったもの（Incomplete）も無いか。真のときだけ「整合」と言える。
+    pub fn is_consistent(&self) -> bool {
+        self.total_by_severity(Severity::Error) == 0
+            && self.total_by_severity(Severity::Incomplete) == 0
+    }
+}
+
+/// [`Storage::verify_integrity`] の失敗（検査を始められなかった）。個々の表の読み取り失敗は
+/// 報告の `Incomplete` として返り、本エラーにはならない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum IntegrityError {
+    /// 読み取りトランザクションを開始できなかった。
+    Backend,
+}
+
+impl fmt::Display for IntegrityError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("storage backend error during integrity check")
+    }
+}
+
+impl std::error::Error for IntegrityError {}
+
+/// 報告の収集器。
+struct Collector {
+    max_groups: usize,
+    groups: BTreeMap<(FindingKind, Option<String>), u64>,
+    totals: BTreeMap<FindingKind, u64>,
+    truncated: bool,
+    /// `add_once` で記録済みの (表, 検査の識別) の組。
+    noted: std::collections::HashSet<(String, String)>,
+}
+
+impl Collector {
+    /// 検査 `check`（表 `table` 内の識別）を実行できなかったことを、表ごと・検査ごとに 1 回だけ
+    /// `CheckUnavailable` として数える。補助表の読み取り失敗がテナントの数だけ件数を膨らませないための入口。
+    fn unavailable_once(&mut self, table: &str, check: &str) {
+        if self.noted.insert((table.to_string(), check.to_string())) {
+            self.add(FindingKind::CheckUnavailable, Some(table), 1);
+        }
+    }
+
+    fn add(&mut self, kind: FindingKind, table: Option<&str>, n: u64) {
+        if n == 0 {
+            return;
+        }
+        let total = self.totals.entry(kind).or_insert(0);
+        *total = total.saturating_add(n);
+        let key = (kind, table.map(str::to_string));
+        if let Some(c) = self.groups.get_mut(&key) {
+            *c = c.saturating_add(n);
+        } else if self.groups.len() < self.max_groups {
+            self.groups.insert(key, n);
+        } else {
+            self.truncated = true;
+        }
+    }
+}
+
+/// 読み取り失敗（詳細は表名・値を含みうるため保持しない）。
+struct ReadFail;
+
+impl<E: std::error::Error> From<E> for ReadFail {
+    fn from(_: E) -> Self {
+        ReadFail
+    }
+}
+
+/// 型の組 `(K, V)` で表を開いて全エントリを読んだ結果（`table_image::SHAPES` の探査用）。
+pub(super) enum ScanProbe {
+    /// この型の組ではない。
+    Mismatch,
+    /// 読めた（エントリ数）。
+    Scanned(u64),
+}
+
+/// `(K, V)` 型で `name` を開き、全エントリを読む（`table_image` の型の組の一覧から呼ばれる）。
+pub(super) fn scan_table<K: Key + 'static, V: Value + 'static>(
+    read: &ReadTransaction,
+    name: &str,
+) -> Result<ScanProbe, ()> {
+    let table = match read.open_table(redb::TableDefinition::<K, V>::new(name)) {
+        Ok(t) => t,
+        Err(redb::TableError::TableTypeMismatch { .. }) => return Ok(ScanProbe::Mismatch),
+        Err(_) => return Err(()),
+    };
+    let mut n = 0u64;
+    for entry in table.iter().map_err(|_| ())? {
+        let (k, v) = entry.map_err(|_| ())?;
+        let _ = (k.value(), v.value());
+        n = n.saturating_add(1);
+    }
+    Ok(ScanProbe::Scanned(n))
+}
+
+type RowsRo = redb::ReadOnlyTable<(&'static str, u64), &'static [u8]>;
+type IndexRo = redb::ReadOnlyTable<(&'static str, &'static [u8]), &'static [u8]>;
+
+/// 行ストアの `after` より後ろの最小のテナントを返す（`None` は先頭から）。
+fn next_tenant(rows: &RowsRo, after: Option<&str>) -> Result<Option<String>, ReadFail> {
+    let lower = match after {
+        Some(a) => std::ops::Bound::Excluded((a, u64::MAX)),
+        None => std::ops::Bound::Unbounded,
+    };
+    let mut iter = rows.range::<(&str, u64)>((lower, std::ops::Bound::Unbounded))?;
+    match iter.next() {
+        Some(entry) => Ok(Some(entry?.0.value().0.to_string())),
+        None => Ok(None),
+    }
+}
+
+/// ハッシュ分割で `pass` を走らせ、集合が予算内に収まる最小の分割数で全分割の結果を合算する。
+/// 分割数の上限でも収まらなければ `Ok(None)`。
+fn run_partitioned<T: Copy + Default>(
+    mut pass: impl FnMut(u32, u32) -> Result<PassResult<T>, ReadFail>,
+    merge: impl Fn(&mut T, T),
+) -> Result<Option<T>, ReadFail> {
+    let mut parts = 1u32;
+    loop {
+        let mut acc = T::default();
+        let mut over = false;
+        for part in 0..parts {
+            match pass(part, parts)? {
+                PassResult::Done(c) => merge(&mut acc, c),
+                PassResult::OverBudget => {
+                    over = true;
+                    break;
+                }
+            }
+        }
+        if !over {
+            return Ok(Some(acc));
+        }
+        parts = parts.saturating_mul(2);
+        if parts > MAX_PARTITIONS {
+            return Ok(None);
+        }
+    }
+}
+
+impl Storage {
+    /// DB ファイル全体の整合を**読み取りだけで**検査する（RECOVER-13 のポインタ。整合検査 CLI #2156 の
+    /// 入口）。DB は変更せず、書き込みトランザクションも書き込みロックも使わないため、稼働中のサーバーが
+    /// 開いている `Storage` に対しても呼べる（その時点の単一スナップショットを検査する）。
+    ///
+    /// 戻り値の [`IntegrityReport::is_consistent`] が真のときだけ「整合」と言える。個々の表の読み取り
+    /// 失敗・未対応の型・予算超過は `Err` ではなく `Incomplete` の報告として返る（黙って飛ばさない）。
+    /// 報告に行の値・キー・テナント名は含まれず、ログにも出さない。検査は読み取りトランザクションを
+    /// 保持して走るため、稼働中に長く走ると redb が旧ページを解放できず、その間ファイルが膨らむ。
+    pub fn verify_integrity(
+        &self,
+        options: &IntegrityOptions,
+    ) -> Result<IntegrityReport, IntegrityError> {
+        let snapshot = self.begin_read().map_err(|_| IntegrityError::Backend)?;
+        let read = snapshot.raw_txn();
+        let mut c = Collector {
+            max_groups: options.max_finding_groups,
+            groups: BTreeMap::new(),
+            totals: BTreeMap::new(),
+            truncated: false,
+            noted: std::collections::HashSet::new(),
+        };
+        let mut report = IntegrityReport::default();
+        check_storage_tables(read, &mut c, &mut report);
+        if check_legacy_rows_table(read, &mut c, &mut report).is_err() {
+            c.add(FindingKind::TableUnreadable, Some("rows"), 1);
+        }
+        check_catalog(read, options, &mut c, &mut report);
+        report.findings = c
+            .groups
+            .into_iter()
+            .map(|((kind, table), count)| IntegrityFinding { kind, table, count })
+            .collect();
+        report.findings_truncated = c.truncated;
+        report.totals = c.totals;
+        Ok(report)
+    }
+}
+
+/// 項目 1・孤児行ストア: redb の全表を型の組の一覧で解決して全エントリを読む。
+fn check_storage_tables(read: &ReadTransaction, c: &mut Collector, report: &mut IntegrityReport) {
+    match read.list_multimap_tables() {
+        Ok(it) => {
+            let n = it.count() as u64;
+            c.add(FindingKind::UnsupportedTableType, Some("multimap"), n);
+        }
+        Err(_) => c.add(FindingKind::TableUnreadable, None, 1),
+    }
+    let handles = match read.list_tables() {
+        Ok(h) => h,
+        Err(_) => {
+            c.add(FindingKind::TableUnreadable, None, 1);
+            return;
+        }
+    };
+    for handle in handles {
+        let name = handle.name();
+        report.storage_tables_scanned = report.storage_tables_scanned.saturating_add(1);
+        // 系統名（最初の `/` まで）だけを報告に使う。表名の残りは動的な識別子を含みうる。
+        let family = name.split('/').next().unwrap_or("");
+        match super::table_image::scan_by_shape(read, name) {
+            super::table_image::ScanOutcome::Scanned(_) => {}
+            super::table_image::ScanOutcome::Unknown => {
+                c.add(FindingKind::UnsupportedTableType, Some(family), 1)
+            }
+            super::table_image::ScanOutcome::Unreadable => {
+                c.add(FindingKind::TableUnreadable, Some(family), 1)
+            }
+        }
+        if let Some(view) = name.strip_prefix("matview_rows/") {
+            check_matview_rows(read, view, c, report);
+        }
+        if let Some(key) = name.strip_prefix("user_rows/") {
+            match catalog::catalog_has_key(read, key) {
+                Ok(true) => {}
+                Ok(false) => c.add(FindingKind::OrphanRowStore, Some(key), 1),
+                Err(_) => c.add(FindingKind::TableUnreadable, Some(family), 1),
+            }
+        }
+    }
+}
+
+/// 定義側から実体の存在を確かめる: メタ行（実体化済みの文脈）があるのに実体の行表が消えているものを
+/// `RowStoreMissing` とする。一度も populate されていないビュー（メタ行が無い）は何も報告しない。
+fn check_matview_definitions(read: &ReadTransaction, c: &mut Collector) {
+    let mut after: Option<String> = None;
+    loop {
+        let name = match catalog::materialized::next_matview_name_after(read, after.as_deref()) {
+            Ok(Some(n)) => n,
+            Ok(None) => return,
+            Err(_) => {
+                c.add(FindingKind::CheckUnavailable, None, 1);
+                return;
+            }
+        };
+        match catalog::materialized::matview_rows_table_missing(read, &name) {
+            Ok(true) => c.add(FindingKind::RowStoreMissing, Some(&name), 1),
+            Ok(false) => {}
+            Err(_) => c.add(FindingKind::CheckUnavailable, Some(&name), 1),
+        }
+        after = Some(name);
+    }
+}
+
+/// カタログを経ない行ストアの 1 つ、マテリアライズドビューの実体（`matview_rows/<名前>`）の行を検査する。
+fn check_matview_rows(
+    read: &ReadTransaction,
+    view: &str,
+    c: &mut Collector,
+    report: &mut IntegrityReport,
+) {
+    match catalog::materialized::audit_matview_rows(read, view) {
+        Ok(a) => {
+            report.rows_scanned = report.rows_scanned.saturating_add(a.rows);
+            if a.orphan {
+                c.add(FindingKind::OrphanRowStore, Some(view), 1);
+            }
+            if a.format_mismatch {
+                c.add(FindingKind::RowStoreFormatMismatch, Some(view), 1);
+            }
+            c.add(FindingKind::RowUndecodable, Some(view), a.undecodable);
+            c.add(
+                FindingKind::RowTenantMismatch,
+                Some(view),
+                a.tenant_mismatch,
+            );
+        }
+        Err(e) => c.add(
+            decode_failure_kind(&e, FindingKind::CatalogEntryUndecodable),
+            Some(view),
+            1,
+        ),
+    }
+}
+
+/// カタログを経ない行ストアの 1 つ、`Storage::put`・`put_batch`・`BatchWriteTxn` が使う `rows` 表を検査する。
+/// 行の復号（ヘッダ・本体・埋め込み）と、行キーのテナントと行ヘッダのテナントの一致を見る。
+fn check_legacy_rows_table(
+    read: &ReadTransaction,
+    c: &mut Collector,
+    report: &mut IntegrityReport,
+) -> Result<(), ReadFail> {
+    const NAME: &str = "rows";
+    let table = match read.open_table(super::ROWS_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
+        Err(redb::TableError::TableTypeMismatch { .. }) => {
+            c.add(FindingKind::RowStoreFormatMismatch, Some(NAME), 1);
+            return Ok(());
+        }
+        Err(_) => return Err(ReadFail),
+    };
+    let (mut undecodable, mut mismatch) = (0u64, 0u64);
+    for entry in table.iter()? {
+        let (k, v) = entry?;
+        report.rows_scanned = report.rows_scanned.saturating_add(1);
+        let (key_tenant, id) = k.value();
+        let buf = v.value();
+        match crate::storage::decode_row_header(buf) {
+            Ok((header_tenant, _, _)) if header_tenant != key_tenant => {
+                mismatch = mismatch.saturating_add(1);
+            }
+            Ok(_) => {
+                if crate::storage::decode_row(RowId::from_index_raw(id), buf).is_err() {
+                    undecodable = undecodable.saturating_add(1);
+                }
+            }
+            Err(_) => undecodable = undecodable.saturating_add(1),
+        }
+    }
+    c.add(FindingKind::RowUndecodable, Some(NAME), undecodable);
+    c.add(FindingKind::RowTenantMismatch, Some(NAME), mismatch);
+    Ok(())
+}
+
+/// カタログの全エントリを順に検査する。
+fn check_catalog(
+    read: &ReadTransaction,
+    options: &IntegrityOptions,
+    c: &mut Collector,
+    report: &mut IntegrityReport,
+) {
+    // 索引カタログの壊れたエントリは、エントリ単位でここで 1 回だけ数える（表ごとの宣言の取得は
+    // 別表のエントリを読み飛ばすため、表ごとの失敗から数えると取りこぼし・二重計上になる）。
+    // 各表は宣言を取得できないとき、宣言を使う検査だけを未検査にして続ける。
+    match catalog::count_undecodable_index_entries(read) {
+        Ok(n) => c.add(FindingKind::IndexCatalogEntryUndecodable, None, n),
+        Err(_) => c.add(FindingKind::CheckUnavailable, None, 1),
+    }
+    check_matview_definitions(read, c);
+    let mut after: Option<String> = None;
+    loop {
+        let key = match catalog::next_catalog_key_after(read, after.as_deref()) {
+            Ok(Some(k)) => k,
+            Ok(None) => break,
+            Err(_) => {
+                c.add(FindingKind::CheckUnavailable, None, 1);
+                break;
+            }
+        };
+        report.catalog_tables_checked = report.catalog_tables_checked.saturating_add(1);
+        match catalog::get_table_schema_in_txn(read, &key) {
+            Ok(schema) => {
+                if check_table(read, &key, &schema, options, c, report).is_err() {
+                    c.add(FindingKind::CheckUnavailable, Some(&key), 1);
+                }
+            }
+            // 復号の失敗だけが矛盾で、読み取りの失敗は未検査。
+            Err(e) => c.add(
+                decode_failure_kind(&e, FindingKind::CatalogEntryUndecodable),
+                Some(&key),
+                1,
+            ),
+        }
+        after = Some(key);
+    }
+}
+
+/// カタログ読み取りの失敗を種類へ写す: 値の破損（復号・検証の失敗）は `corrupt`、それ以外
+/// （redb の読み取り失敗など）は検査できなかったこととして `CheckUnavailable`。
+fn decode_failure_kind(e: &catalog::CatalogError, corrupt: FindingKind) -> FindingKind {
+    match e {
+        catalog::CatalogError::CorruptSchema(_) | catalog::CatalogError::Invalid(_) => corrupt,
+        _ => FindingKind::CheckUnavailable,
+    }
+}
+
+/// 表 1 つ分の検査（項目 2〜8）。
+fn check_table(
+    read: &ReadTransaction,
+    key: &str,
+    schema: &TableSchema,
+    options: &IntegrityOptions,
+    c: &mut Collector,
+    report: &mut IntegrityReport,
+) -> Result<(), ReadFail> {
+    let rows_name = catalog::user_rows_table_name(key);
+    let uniq_name = catalog::user_uniq_table_name(key);
+    // 型違いで読めない一意索引は「索引が無い」のではなく未検査（遅延再構築待ちとは区別する）。
+    let mut uniq_unreadable = false;
+    let uniq: Option<IndexRo> = match read.open_table(catalog::user_uniq_table_def(&uniq_name)) {
+        Ok(t) => Some(t),
+        Err(redb::TableError::TableDoesNotExist(_)) => None,
+        // 型違い・読み取り失敗のどちらも「索引が無い」ではなく未検査。
+        Err(_) => {
+            c.add(FindingKind::CheckUnavailable, Some(key), 1);
+            uniq_unreadable = true;
+            None
+        }
+    };
+    // 索引カタログを読めなくても、行の復号・主キーの重複・FK など宣言に依存しない検査は続ける。
+    // 壊れたエントリ自体は `check_catalog` が報告済みなので、ここでは未検査の印だけ数える。
+    let (decls, decls_complete) = match catalog::table_expression_decls_in_read_txn(read, key) {
+        Ok(d) => (d, true),
+        Err(_) => {
+            c.add(FindingKind::CheckUnavailable, Some(key), 1);
+            (catalog::TableExpressionDecls::default(), false)
+        }
+    };
+    let rows: RowsRo = match read.open_table(catalog::user_rows_table_def(&rows_name)) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => {
+            // 証拠を読めなければ、欠落とも「不明」とも断定せず未検査にする。
+            if report_absent_row_store(read, key, schema, &decls, uniq.as_ref(), c).is_err() {
+                c.add(FindingKind::CheckUnavailable, Some(key), 1);
+            }
+            return Ok(());
+        }
+        Err(redb::TableError::TableTypeMismatch { .. }) => {
+            c.add(FindingKind::RowStoreFormatMismatch, Some(key), 1);
+            return Ok(());
+        }
+        Err(_) => return Err(ReadFail),
+    };
+
+    // 行の走査が途中で失敗しても、他の検査（キー・FK・索引）は続ける。
+    if scan_rows(&rows, key, schema, c, report).is_err() {
+        c.add(FindingKind::CheckUnavailable, Some(key), 1);
+    }
+
+    // 以降はテナントごと。
+    let plan = match audit::UniqueAuditPlan::build(schema, &decls, decls_complete) {
+        Ok(p) => {
+            // コンパイルできず外した一意索引は、その索引だけを未検査にする。
+            c.add(FindingKind::CheckUnavailable, Some(key), p.excluded());
+            Some(p)
+        }
+        Err(_) => {
+            c.add(FindingKind::CheckUnavailable, Some(key), 1);
+            None
+        }
+    };
+    // 補助の表を開けない場合は、その検査だけを未検査（`CheckUnavailable`）にして残りを続ける。
+    let mut gin_tables: Vec<Result<Option<IndexRo>, ReadFail>> =
+        Vec::with_capacity(decls.gins.len());
+    for decl in &decls.gins {
+        let name = catalog::user_gin_table_name(&decl.index_name);
+        gin_tables.push(match read.open_table(catalog::user_gin_table_def(&name)) {
+            Ok(t) => Ok(Some(t)),
+            Err(redb::TableError::TableDoesNotExist(_)) => Ok(None),
+            Err(_) => Err(ReadFail),
+        });
+    }
+    let fks = resolve_foreign_keys(read, key, schema, c)?;
+    let rowid_state: Result<Option<_>, ReadFail> =
+        match read.open_table(catalog::rowid_alloc::ROWID_STATE_TABLE) {
+            Ok(t) => Ok(Some(t)),
+            Err(redb::TableError::TableDoesNotExist(_)) => Ok(None),
+            Err(_) => Err(ReadFail),
+        };
+    let allocated = matches!(schema.row_identity(), catalog::RowIdentity::Allocated);
+
+    let mut after: Option<String> = None;
+    while let Some(tenant) = next_tenant(&rows, after.as_deref())? {
+        if let Some(plan) = &plan {
+            if check_unique(
+                plan,
+                schema,
+                &rows,
+                uniq.as_ref(),
+                uniq_unreadable,
+                &tenant,
+                key,
+                options,
+                c,
+            )
+            .is_err()
+            {
+                c.unavailable_once(key, "unique");
+            }
+        }
+        for (i, (decl, table)) in decls.gins.iter().zip(gin_tables.iter()).enumerate() {
+            let done = match table {
+                Ok(t) => check_gin(&rows, t.as_ref(), schema, &tenant, decl, key, c),
+                Err(_) => Err(ReadFail),
+            };
+            if done.is_err() {
+                c.unavailable_once(key, &format!("gin:{i}"));
+            }
+        }
+        for (i, fk) in fks.iter().enumerate() {
+            if check_foreign_key(schema, fk, &rows, &tenant, key, options, c).is_err() {
+                c.unavailable_once(key, &format!("fk:{i}"));
+            }
+        }
+        if allocated {
+            let done = match &rowid_state {
+                Ok(state) => check_rowid_state(&rows, state.as_ref(), &tenant, key, c),
+                Err(_) => Err(ReadFail),
+            };
+            if done.is_err() {
+                c.unavailable_once(key, "rowid");
+            }
+        }
+        after = Some(tenant);
+    }
+    Ok(())
+}
+
+/// 行ストアが無い表について、行を書いた証拠を調べて報告する。
+/// 行ストアは初回の挿入まで作られない設計なので、行を書いた証拠があるときだけ欠落とする。
+/// 証拠 1: 採番方式の表は、挿入と同じ Tx で rowid 採番状態が書かれ、行を消しても残る
+/// （表の削除で消え、改名で新名へ移る: `catalog::rowid_alloc`）。
+/// 証拠 2: 索引に行の痕跡（正引き・ポスティング）がある。
+fn report_absent_row_store(
+    read: &ReadTransaction,
+    key: &str,
+    schema: &TableSchema,
+    decls: &catalog::TableExpressionDecls,
+    uniq: Option<&IndexRo>,
+    c: &mut Collector,
+) -> Result<(), ReadFail> {
+    let allocated = matches!(schema.row_identity(), catalog::RowIdentity::Allocated);
+    let mut evidence = allocated && has_rowid_state(read, key)?;
+    evidence = evidence
+        || match uniq {
+            Some(u) => has_entry_with_tag(u, 0x01)?,
+            None => false,
+        };
+    // 読めない GIN 表があっても、他の証拠で欠落が確定していればそれを報告する。
+    let mut unreadable = false;
+    for decl in &decls.gins {
+        let name = catalog::user_gin_table_name(&decl.index_name);
+        match read.open_table(catalog::user_gin_table_def(&name)) {
+            Ok(t) => evidence = evidence || has_entry_with_tag(&t, 0x01)?,
+            Err(redb::TableError::TableDoesNotExist(_)) => {}
+            Err(_) => unreadable = true,
+        }
+    }
+    if evidence {
+        c.add(FindingKind::RowStoreMissing, Some(key), 1);
+    } else if unreadable {
+        return Err(ReadFail);
+    } else if !allocated {
+        // 従来方式・移行済みの表は行を書いた証拠が残らず、作成直後の表と区別できない。
+        c.add(FindingKind::RowStoreAbsentUnverified, Some(key), 1);
+    }
+    Ok(())
+}
+
+/// 項目 6: テナント 1 つ・GIN 索引 1 本の双方向の突き合わせ。
+fn check_gin(
+    rows: &RowsRo,
+    table: Option<&IndexRo>,
+    schema: &TableSchema,
+    tenant: &str,
+    decl: &catalog::DeclaredGinIndex,
+    key: &str,
+    c: &mut Collector,
+) -> Result<(), ReadFail> {
+    let limits = crate::gin_index::GinLimits::default();
+    let (a, unevaluable) =
+        crate::gin_index::audit_tenant_streaming(rows, table, schema, tenant, decl, &limits)?;
+    if !a.marker_valid {
+        c.add(FindingKind::IndexRebuildPending, Some(key), 1);
+    }
+    c.add(
+        FindingKind::GinIndexEntryMissing,
+        Some(key),
+        a.missing as u64,
+    );
+    c.add(
+        FindingKind::GinIndexEntryDangling,
+        Some(key),
+        a.stale as u64,
+    );
+    c.add(FindingKind::CheckUnevaluable, Some(key), unevaluable);
+    Ok(())
+}
+
+/// 項目 8: テナント 1 つの rowid 採番状態が最大 rowid より進んでいるか。
+fn check_rowid_state(
+    rows: &RowsRo,
+    state: Option<&redb::ReadOnlyTable<(&'static str, &'static str), u64>>,
+    tenant: &str,
+    key: &str,
+    c: &mut Collector,
+) -> Result<(), ReadFail> {
+    let max = rows
+        .range::<(&str, u64)>((
+            std::ops::Bound::Included(row_key(tenant, RowId::from_index_raw(0))),
+            std::ops::Bound::Included(row_key(tenant, RowId::from_index_raw(u64::MAX))),
+        ))?
+        .next_back()
+        .transpose()?
+        .map(|(k, _)| split_row_key(k.value()).1.to_index_raw());
+    if let Some(max) = max {
+        let last = match state {
+            Some(t) => t.get((key, tenant))?.map(|g| g.value()),
+            None => None,
+        };
+        // 状態が未作成なら最初の払い出しで既存の最大 rowid から初期化される設計（矛盾ではない）。
+        if last.is_some_and(|last| last < max) {
+            c.add(FindingKind::RowIdAllocatorBehind, Some(key), 1);
+        }
+    }
+    Ok(())
+}
+
+/// 採番方式の表 `key` の rowid 採番状態が 1 件でもあるか（先頭 1 件だけ見る）。
+fn has_rowid_state(read: &ReadTransaction, key: &str) -> Result<bool, ReadFail> {
+    let state = match read.open_table(catalog::rowid_alloc::ROWID_STATE_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
+        Err(_) => return Err(ReadFail),
+    };
+    let found = match state.range((key, "")..)?.next() {
+        Some(entry) => entry?.0.value().0 == key,
+        None => false,
+    };
+    Ok(found)
+}
+
+/// 索引表に先頭バイトが `tag` のサブキーのエントリが 1 つでもあるか。
+fn has_entry_with_tag(index: &IndexRo, tag: u8) -> Result<bool, ReadFail> {
+    for entry in index.iter()? {
+        let (k, _) = entry?;
+        if k.value().1.first() == Some(&tag) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// 項目 3: 全テナントの全行を復号する（ストリーミング）。
+fn scan_rows(
+    rows: &RowsRo,
+    key: &str,
+    schema: &TableSchema,
+    c: &mut Collector,
+    report: &mut IntegrityReport,
+) -> Result<(), ReadFail> {
+    let (mut undecodable, mut mismatch) = (0u64, 0u64);
+    for entry in rows.iter()? {
+        let (k, v) = entry?;
+        report.rows_scanned = report.rows_scanned.saturating_add(1);
+        let (key_tenant, _) = k.value();
+        let buf = v.value();
+        let decoded = (|| {
+            let (header_tenant, _, _) = crate::storage::decode_row_header(buf).ok()?;
+            let tenant_ok = header_tenant == key_tenant;
+            let (dim, metadata) = crate::storage::decode_row_dim_and_metadata_borrowed(buf).ok()?;
+            crate::row_codec::validate_scalar_columns(schema, metadata).ok()?;
+            schema
+                .validate_row_embedding_dim(usize::try_from(dim).ok()?)
+                .ok()?;
+            Some(tenant_ok)
+        })();
+        match decoded {
+            Some(true) => {}
+            Some(false) => mismatch = mismatch.saturating_add(1),
+            None => undecodable = undecodable.saturating_add(1),
+        }
+    }
+    c.add(FindingKind::RowUndecodable, Some(key), undecodable);
+    c.add(FindingKind::RowTenantMismatch, Some(key), mismatch);
+    Ok(())
+}
+
+/// 項目 4・5: 主キー・一意キーの重複と、永続一意索引との突き合わせ。
+#[allow(clippy::too_many_arguments)] // 走査ドライバ内の検査部品。表・テナント・資源上限を明示する。
+fn check_unique(
+    plan: &audit::UniqueAuditPlan,
+    schema: &TableSchema,
+    rows: &RowsRo,
+    uniq: Option<&IndexRo>,
+    uniq_unreadable: bool,
+    tenant: &str,
+    key: &str,
+    options: &IntegrityOptions,
+    c: &mut Collector,
+) -> Result<(), ReadFail> {
+    if plan.is_empty() {
+        return Ok(());
+    }
+    // 行の重複検査（索引に依存しない）と索引の突き合わせは独立で、片方の失敗でもう片方を止めない。
+    match run_partitioned(
+        |part, parts| {
+            Ok(audit::duplicate_keys_in_tenant(
+                plan,
+                schema,
+                rows,
+                tenant,
+                part,
+                parts,
+                options.memory_budget_bytes,
+            )?)
+        },
+        |acc: &mut audit::DuplicateCounts, d| {
+            acc.primary_key = acc.primary_key.saturating_add(d.primary_key);
+            acc.unique = acc.unique.saturating_add(d.unique);
+            acc.unevaluable = acc.unevaluable.saturating_add(d.unevaluable);
+        },
+    ) {
+        Ok(Some(d)) => {
+            c.add(FindingKind::PrimaryKeyDuplicate, Some(key), d.primary_key);
+            c.add(FindingKind::UniqueKeyDuplicate, Some(key), d.unique);
+            c.add(FindingKind::CheckUnevaluable, Some(key), d.unevaluable);
+        }
+        Ok(None) => c.add(FindingKind::CheckBudgetExceeded, Some(key), 1),
+        Err(_) => c.unavailable_once(key, "unique-duplicates"),
+    }
+    // 宣言が不完全・外した索引がある場合は、永続索引のシグネチャと一致しないため突き合わせない
+    // （未検査は表単位で記録済み）。
+    if !plan.index_comparable() {
+        return Ok(());
+    }
+    match uniq {
+        // 読めない索引は呼び出し側が `CheckUnavailable` を記録済み。
+        None if uniq_unreadable => {}
+        None => c.add(FindingKind::IndexRebuildPending, Some(key), 1),
+        Some(index) => match audit::unique_index_audit(plan, schema, rows, index, tenant) {
+            Ok(a) => {
+                if !a.marker_valid {
+                    c.add(FindingKind::IndexRebuildPending, Some(key), 1);
+                }
+                c.add(FindingKind::UniqueIndexEntryMissing, Some(key), a.missing);
+                c.add(FindingKind::UniqueIndexEntryDangling, Some(key), a.dangling);
+                c.add(FindingKind::CheckUnevaluable, Some(key), a.unevaluable);
+            }
+            Err(_) => c.unavailable_once(key, "unique-index"),
+        },
+    }
+    Ok(())
+}
+
+/// 子表の `FOREIGN KEY` 1 件と、参照先の解決結果。
+struct ResolvedFk<'a> {
+    fk: &'a catalog::ForeignKeyDef,
+    parent_schema: TableSchema,
+    parent_rows: Option<RowsRo>,
+}
+
+/// 子表の `FOREIGN KEY` の参照先（スキーマと行ストア）を解決する。解決できないものは
+/// `ForeignKeyParentMissing` として報告し、検査対象から外す。
+fn resolve_foreign_keys<'a>(
+    read: &ReadTransaction,
+    key: &str,
+    schema: &'a TableSchema,
+    c: &mut Collector,
+) -> Result<Vec<ResolvedFk<'a>>, ReadFail> {
+    let mut out = Vec::with_capacity(schema.foreign_keys().len());
+    for fk in schema.foreign_keys() {
+        let parent_schema = if fk.parent_table() == key {
+            schema.clone()
+        } else {
+            match catalog::get_table_schema_in_txn(read, fk.parent_table()) {
+                Ok(s) => s,
+                Err(catalog::CatalogError::TableNotFound(_)) => {
+                    c.add(FindingKind::ForeignKeyParentMissing, Some(key), 1);
+                    continue;
+                }
+                Err(_) => {
+                    c.add(FindingKind::CheckUnavailable, Some(key), 1);
+                    continue;
+                }
+            }
+        };
+        if !audit::parent_columns_resolve(&parent_schema, fk) {
+            c.add(FindingKind::ForeignKeyParentMissing, Some(key), 1);
+            continue;
+        }
+        let rows_name = catalog::user_rows_table_name(fk.parent_table());
+        let parent_rows = match read.open_table(catalog::user_rows_table_def(&rows_name)) {
+            Ok(t) => Some(t),
+            Err(redb::TableError::TableDoesNotExist(_)) => None,
+            Err(_) => {
+                c.add(FindingKind::CheckUnavailable, Some(key), 1);
+                continue;
+            }
+        };
+        out.push(ResolvedFk {
+            fk,
+            parent_schema,
+            parent_rows,
+        });
+    }
+    Ok(out)
+}
+
+/// 項目 7: 子表 1 つ・FK 1 つ・テナント 1 つの孤児行。
+#[allow(clippy::too_many_arguments)] // 走査ドライバ内の検査部品。表・テナント・資源上限を明示する。
+fn check_foreign_key(
+    schema: &TableSchema,
+    fk: &ResolvedFk<'_>,
+    rows: &RowsRo,
+    tenant: &str,
+    key: &str,
+    options: &IntegrityOptions,
+    c: &mut Collector,
+) -> Result<(), ReadFail> {
+    let result = run_partitioned(
+        |part, parts| {
+            Ok(audit::foreign_key_orphans_in_tenant(
+                schema,
+                &fk.parent_schema,
+                fk.fk,
+                rows,
+                fk.parent_rows.as_ref(),
+                tenant,
+                part,
+                parts,
+                options.memory_budget_bytes,
+            )?)
+        },
+        |acc: &mut audit::ForeignKeyCounts, d| {
+            acc.orphans = acc.orphans.saturating_add(d.orphans);
+            acc.unresolved = acc.unresolved.saturating_add(d.unresolved);
+            acc.unevaluable = acc.unevaluable.saturating_add(d.unevaluable);
+        },
+    )?;
+    match result {
+        Some(d) => {
+            c.add(FindingKind::ForeignKeyOrphanRow, Some(key), d.orphans);
+            // 参照先のキー集合が不完全で、孤児と断定できなかった子行は未検査として数える。
+            c.add(FindingKind::CheckUnavailable, Some(key), d.unresolved);
+            c.add(FindingKind::CheckUnevaluable, Some(key), d.unevaluable);
+        }
+        None => c.add(FindingKind::CheckBudgetExceeded, Some(key), 1),
+    }
+    Ok(())
+}
