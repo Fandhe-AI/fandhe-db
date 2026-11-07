@@ -1217,3 +1217,102 @@ fn materialized_view_rows_are_checked() {
     assert_eq!(report.total(FindingKind::RowTenantMismatch), 1);
     assert!(!report.is_consistent());
 }
+
+#[test]
+fn unreadable_auxiliary_tables_are_counted_once_per_table_not_per_tenant() {
+    let (path, _g) = build_db("integrity-aux-once");
+    corrupt(&path, |w| {
+        w.delete_table(PARENT_GIN).expect("drop gin");
+        w.open_table(TableDefinition::<u8, u8>::new("user_gin/parents_doc"))
+            .expect("replace gin");
+        w.delete_table(TableDefinition::<(&str, &str), u64>::new("rowid_state"))
+            .expect("drop rowid state");
+        w.open_table(TableDefinition::<u8, u8>::new("rowid_state"))
+            .expect("replace rowid state");
+    });
+    let report = verify(&path);
+    // 2 テナントでも、壊れた補助表ごとに 1 件（parents: GIN と rowid 採番状態、kids: rowid 採番状態）。
+    let count = |table: &str| -> u64 {
+        report
+            .findings
+            .iter()
+            .filter(|f| {
+                f.kind == FindingKind::CheckUnavailable && f.table.as_deref() == Some(table)
+            })
+            .map(|f| f.count)
+            .sum()
+    };
+    assert_eq!(count("parents"), 2);
+    assert_eq!(count("kids"), 1);
+}
+
+fn build_matview_db(label: &str) -> (std::path::PathBuf, CleanupGuard) {
+    let (path, g) = build_db(label);
+    let core = core_at(&path);
+    run(
+        &core,
+        TENANTS[0],
+        "CREATE MATERIALIZED VIEW parent_codes AS SELECT code FROM parents",
+    );
+    drop(core);
+    (path, g)
+}
+
+#[test]
+fn missing_materialized_view_rows_table_is_detected_from_the_definition() {
+    let (path, _g) = build_matview_db("integrity-matview-missing");
+    assert!(verify(&path).findings.is_empty());
+    corrupt(&path, |w| {
+        w.delete_table(TableDefinition::<(&[u8], u64), &[u8]>::new(
+            "matview_rows/parent_codes",
+        ))
+        .expect("drop matview rows");
+    });
+    let report = verify(&path);
+    assert_eq!(report.total(FindingKind::RowStoreMissing), 1);
+    assert!(report
+        .findings
+        .iter()
+        .any(|f| f.kind == FindingKind::RowStoreMissing
+            && f.table.as_deref() == Some("parent_codes")));
+    assert!(!report.is_consistent());
+}
+
+#[test]
+fn never_populated_materialized_view_is_not_reported_missing() {
+    let (path, _g) = build_matview_db("integrity-matview-unpopulated");
+    corrupt(&path, |w| {
+        // 実体化済みの文脈（メタ行）と行表を消す: 一度も populate されていない状態と同じ。
+        w.delete_table(TableDefinition::<(&[u8], u64), &[u8]>::new(
+            "matview_rows/parent_codes",
+        ))
+        .expect("drop rows");
+        w.delete_table(TableDefinition::<(&str, &[u8]), &[u8]>::new(
+            "matview_entities",
+        ))
+        .expect("drop meta");
+    });
+    let report = verify(&path);
+    assert_eq!(report.total(FindingKind::RowStoreMissing), 0);
+}
+
+#[test]
+fn materialized_view_rows_table_of_wrong_type_is_a_format_mismatch_error() {
+    let (path, _g) = build_matview_db("integrity-matview-format");
+    corrupt(&path, |w| {
+        w.delete_table(TableDefinition::<(&[u8], u64), &[u8]>::new(
+            "matview_rows/parent_codes",
+        ))
+        .expect("drop rows");
+        w.open_table(TableDefinition::<u8, u8>::new("matview_rows/parent_codes"))
+            .expect("replace rows");
+    });
+    let report = verify(&path);
+    assert_eq!(report.total(FindingKind::RowStoreFormatMismatch), 1);
+    assert_eq!(
+        FindingKind::RowStoreFormatMismatch.severity(),
+        Severity::Error
+    );
+    assert_eq!(report.total(FindingKind::RowStoreMissing), 0);
+    assert!(!report.is_consistent());
+}

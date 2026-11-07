@@ -43,6 +43,35 @@
 //!   痕跡が無い場合は、消失を検出できない。行ストアが無ければ `RowStoreAbsentUnverified`（Warning）で
 //!   運用者に見せるだけで、整合の判定は覆さない
 //!
+//! # 行ストア・補助表の扱いの対応表
+//!
+//! 行ストア（数える単位はいずれも行ごと。不在・型違い・孤児は表ごとに 1 件）:
+//!
+//! | 観点 | `user_rows`（カタログ） | `rows`（API 直接） | `matview_rows`（実体） |
+//! | ---- | ---- | ---- | ---- |
+//! | 不在 | 行を書いた証拠があれば `RowStoreMissing`（Error）、従来方式で証拠なしは `RowStoreAbsentUnverified`（Warning） | 単一の共有表で、作成直後は無いのが正常のため報告しない | メタ行（実体化済みの文脈）があるのに行表が無ければ `RowStoreMissing`（Error）。メタ行が無い（未 populate）は報告しない |
+//! | 型違い | `RowStoreFormatMismatch`（Error） | 同左 | 同左 |
+//! | 行の復号失敗 | `RowUndecodable`（Error） | 同左 | 同左 |
+//! | テナント不一致 | `RowTenantMismatch`（Error） | 同左 | 同左（文脈キーとの照合） |
+//! | 孤児（定義なし） | `OrphanRowStore`（Error） | 該当なし | 同左 |
+//!
+//! 意図して違えるもの: `rows` は 1 つの共有表で定義が無いため不在と孤児を持たない。`user_rows` だけが
+//! 「証拠が無い不在」を Warning にするのは、実体化の有無を示すメタ行が無く作成直後と区別できないため
+//! （`matview_rows` はメタ行で確定できる）。
+//!
+//! 補助表:
+//!
+//! | 観点 | 一意索引 | GIN 索引 | rowid 採番状態 | 索引カタログ |
+//! | ---- | ---- | ---- | ---- | ---- |
+//! | 読めない・型違い | `CheckUnavailable`（Incomplete。表ごとに 1 件） | 同左（索引ごとに 1 件） | 同左（表ごとに 1 件） | `CheckUnavailable`（全体で 1 件。型違いは項目 1 の `UnsupportedTableType` も出る） |
+//! | 存在しない | `IndexRebuildPending`（Warning。テナントごと） | 同左 | 状態なしは矛盾ではない（初回の払い出しで初期化される設計） | 宣言なしとして扱う |
+//! | エントリの復号失敗 | `CheckUnevaluable`（Incomplete。エントリごと） | 同左 | 値は `u64` で復号失敗が無い | `IndexCatalogEntryUndecodable`（Error。エントリごと） |
+//!
+//! 意図して違えるもの: 索引カタログのエントリ破損だけが Error なのは、宣言そのものの破損で、行から再導出
+//! できる索引エントリとは性質が異なるため（索引エントリの読み取り・復号の失敗は、行を再構築すれば直る
+//! 派生データのため Incomplete）。`IndexRebuildPending` と `CheckBudgetExceeded` はテナントごとに数える
+//! （テナント単位の状態を表すため）。
+//!
 //! # 重大度と fail-closed
 //!
 //! 報告は [`Severity::Error`]（矛盾）・[`Severity::Warning`]（衛生指標・遅延再構築の待ち。正しさに
@@ -300,9 +329,19 @@ struct Collector {
     groups: BTreeMap<(FindingKind, Option<String>), u64>,
     totals: BTreeMap<FindingKind, u64>,
     truncated: bool,
+    /// `add_once` で記録済みの (表, 検査の識別) の組。
+    noted: std::collections::HashSet<(String, String)>,
 }
 
 impl Collector {
+    /// 検査 `check`（表 `table` 内の識別）を実行できなかったことを、表ごと・検査ごとに 1 回だけ
+    /// `CheckUnavailable` として数える。補助表の読み取り失敗がテナントの数だけ件数を膨らませないための入口。
+    fn unavailable_once(&mut self, table: &str, check: &str) {
+        if self.noted.insert((table.to_string(), check.to_string())) {
+            self.add(FindingKind::CheckUnavailable, Some(table), 1);
+        }
+    }
+
     fn add(&mut self, kind: FindingKind, table: Option<&str>, n: u64) {
         if n == 0 {
             return;
@@ -421,6 +460,7 @@ impl Storage {
             groups: BTreeMap::new(),
             totals: BTreeMap::new(),
             truncated: false,
+            noted: std::collections::HashSet::new(),
         };
         let mut report = IntegrityReport::default();
         check_storage_tables(read, &mut c, &mut report);
@@ -482,6 +522,28 @@ fn check_storage_tables(read: &ReadTransaction, c: &mut Collector, report: &mut 
     }
 }
 
+/// 定義側から実体の存在を確かめる: メタ行（実体化済みの文脈）があるのに実体の行表が消えているものを
+/// `RowStoreMissing` とする。一度も populate されていないビュー（メタ行が無い）は何も報告しない。
+fn check_matview_definitions(read: &ReadTransaction, c: &mut Collector) {
+    let mut after: Option<String> = None;
+    loop {
+        let name = match catalog::materialized::next_matview_name_after(read, after.as_deref()) {
+            Ok(Some(n)) => n,
+            Ok(None) => return,
+            Err(_) => {
+                c.add(FindingKind::CheckUnavailable, None, 1);
+                return;
+            }
+        };
+        match catalog::materialized::matview_rows_table_missing(read, &name) {
+            Ok(true) => c.add(FindingKind::RowStoreMissing, Some(&name), 1),
+            Ok(false) => {}
+            Err(_) => c.add(FindingKind::CheckUnavailable, Some(&name), 1),
+        }
+        after = Some(name);
+    }
+}
+
 /// カタログを経ない行ストアの 1 つ、マテリアライズドビューの実体（`matview_rows/<名前>`）の行を検査する。
 fn check_matview_rows(
     read: &ReadTransaction,
@@ -494,6 +556,9 @@ fn check_matview_rows(
             report.rows_scanned = report.rows_scanned.saturating_add(a.rows);
             if a.orphan {
                 c.add(FindingKind::OrphanRowStore, Some(view), 1);
+            }
+            if a.format_mismatch {
+                c.add(FindingKind::RowStoreFormatMismatch, Some(view), 1);
             }
             c.add(FindingKind::RowUndecodable, Some(view), a.undecodable);
             c.add(
@@ -564,6 +629,7 @@ fn check_catalog(
         Ok(n) => c.add(FindingKind::IndexCatalogEntryUndecodable, None, n),
         Err(_) => c.add(FindingKind::CheckUnavailable, None, 1),
     }
+    check_matview_definitions(read, c);
     let mut after: Option<String> = None;
     loop {
         let key = match catalog::next_catalog_key_after(read, after.as_deref()) {
@@ -702,21 +768,21 @@ fn check_table(
             )
             .is_err()
             {
-                c.add(FindingKind::CheckUnavailable, Some(key), 1);
+                c.unavailable_once(key, "unique");
             }
         }
-        for (decl, table) in decls.gins.iter().zip(gin_tables.iter()) {
+        for (i, (decl, table)) in decls.gins.iter().zip(gin_tables.iter()).enumerate() {
             let done = match table {
                 Ok(t) => check_gin(&rows, t.as_ref(), schema, &tenant, decl, key, c),
                 Err(_) => Err(ReadFail),
             };
             if done.is_err() {
-                c.add(FindingKind::CheckUnavailable, Some(key), 1);
+                c.unavailable_once(key, &format!("gin:{i}"));
             }
         }
-        for fk in &fks {
+        for (i, fk) in fks.iter().enumerate() {
             if check_foreign_key(schema, fk, &rows, &tenant, key, options, c).is_err() {
-                c.add(FindingKind::CheckUnavailable, Some(key), 1);
+                c.unavailable_once(key, &format!("fk:{i}"));
             }
         }
         if allocated {
@@ -725,7 +791,7 @@ fn check_table(
                 Err(_) => Err(ReadFail),
             };
             if done.is_err() {
-                c.add(FindingKind::CheckUnavailable, Some(key), 1);
+                c.unavailable_once(key, "rowid");
             }
         }
         after = Some(tenant);
@@ -934,7 +1000,7 @@ fn check_unique(
             c.add(FindingKind::CheckUnevaluable, Some(key), d.unevaluable);
         }
         Ok(None) => c.add(FindingKind::CheckBudgetExceeded, Some(key), 1),
-        Err(_) => c.add(FindingKind::CheckUnavailable, Some(key), 1),
+        Err(_) => c.unavailable_once(key, "unique-duplicates"),
     }
     // 宣言が不完全・外した索引がある場合は、永続索引のシグネチャと一致しないため突き合わせない
     // （未検査は表単位で記録済み）。
@@ -954,7 +1020,7 @@ fn check_unique(
                 c.add(FindingKind::UniqueIndexEntryDangling, Some(key), a.dangling);
                 c.add(FindingKind::CheckUnevaluable, Some(key), a.unevaluable);
             }
-            Err(_) => c.add(FindingKind::CheckUnavailable, Some(key), 1),
+            Err(_) => c.unavailable_once(key, "unique-index"),
         },
     }
     Ok(())
