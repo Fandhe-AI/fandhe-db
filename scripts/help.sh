@@ -61,12 +61,16 @@ cat <<'EOF'
       既定ビルド（fault-injection・wasm-udf・cross-encoder 無効）専用の回帰テスト
       $ scripts/test_default_build.sh
   crash-test
-      クラッシュ耐性回帰テスト（PERSIST-1。バックアップ復元の段を含む）
+      クラッシュ耐性回帰テスト（PERSIST-1。バックアップ復元・PITR の段を含む）
       $ scripts/crash_test_backup_restore.sh
+      $ scripts/crash_test_pitr.sh
       $ scripts/crash_test.sh
   crash-test-backup-restore
       バックアップ取得・復元中の強制終了と復元後検査の回帰テスト
       $ scripts/crash_test_backup_restore.sh
+  crash-test-pitr
+      変更ログ有効時の強制終了と PITR 復元の一致・ログ欠落改ざん拒否の回帰テスト
+      $ scripts/crash_test_pitr.sh
   crash-test-interrupt
       crash_test.sh の中断パス（SIGTERM・プロセスグループ）のセルフテスト
       $ scripts/crash_test_interrupt.sh
@@ -150,6 +154,7 @@ cat <<'EOF'
       $ cargo test --workspace --all-features
       $ scripts/test_default_build.sh
       $ scripts/crash_test_backup_restore.sh
+      $ scripts/crash_test_pitr.sh
       $ scripts/crash_test.sh
       $ scripts/crash_test_interrupt.sh
       $ scripts/crash_test_cross_table.sh

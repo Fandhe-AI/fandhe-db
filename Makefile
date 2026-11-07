@@ -95,9 +95,9 @@ test: ## cargo test（workspace 全体）
 test-default-build: ## 既定ビルド（fault-injection・wasm-udf・cross-encoder 無効）専用の回帰テスト
 	@scripts/test_default_build.sh
 
-# クラッシュ耐性回帰テスト（TASK-142・PERSIST-1。scripts/crash_test.sh を実行）。Issue #2157 のバックアップ復元の段は前提ターゲットで実行する（CI の crash-test ジョブから走らせる）
+# クラッシュ耐性回帰テスト（TASK-142・PERSIST-1。scripts/crash_test.sh を実行）。Issue #2157 のバックアップ復元の段・Issue #2170 の PITR の段は前提ターゲットで実行する（CI の crash-test ジョブから走らせる）
 .PHONY: crash-test
-crash-test: crash-test-backup-restore ## クラッシュ耐性回帰テスト（PERSIST-1。バックアップ復元の段を含む）
+crash-test: crash-test-backup-restore crash-test-pitr ## クラッシュ耐性回帰テスト（PERSIST-1。バックアップ復元・PITR の段を含む）
 	scripts/crash_test.sh
 
 # crash_test.sh の中断パス（SIGTERM 単体・プロセスグループ）のセルフテスト（Issue #134・TASK-142。scripts/crash_test_interrupt.sh を実行）
@@ -109,6 +109,11 @@ crash-test-interrupt: ## crash_test.sh の中断パス（SIGTERM・プロセス�
 .PHONY: crash-test-backup-restore
 crash-test-backup-restore: ## バックアップ取得・復元中の強制終了と復元後検査の回帰テスト
 	scripts/crash_test_backup_restore.sh
+
+# 変更ログ・PITR の crash 耐性とラウンドトリップの回帰テスト（Issue #2170・RECOVER-14 ポインタ。scripts/crash_test_pitr.sh を実行。crash-test の前提）
+.PHONY: crash-test-pitr
+crash-test-pitr: ## 変更ログ有効時の強制終了と PITR 復元の一致・ログ欠落改ざん拒否の回帰テスト
+	scripts/crash_test_pitr.sh
 
 # 2 テーブル横断トランザクション・クラッシュ耐性回帰テスト（TASK-90・TABLE-10。scripts/crash_test_cross_table.sh を実行）
 .PHONY: crash-test-cross-table
