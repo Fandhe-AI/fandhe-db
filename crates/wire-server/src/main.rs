@@ -500,9 +500,16 @@
 //! RECOVER-13 (6) ポインタ）。終了コード: 0=整合（Warning のみを含む）、1=実行時の失敗（稼働中の
 //! サーバーが使用中を含む）、2=引数／パスの拒否、4=矛盾あり、5=検査できなかった項目のみ
 //! （3=検査は完了したが一時コピーを消せなかった。失敗時は本来のコード）。詳細は `wire_server::verify_opt`。
-//! `wire-server restore --from <backup> --db <new path>` サブコマンドは、バックアップを一時名へ
-//! コピーして検査し、通った場合だけ新規パスへ公開する（既存の出力先は上書きしない。通らなければ
-//! 何も公開せず 4 または 5 で終了。詳細は `wire_server::restore_opt`）。
+//! `wire-server restore --from <backup> --db <new path> [--incremental <file>]...` サブコマンドは、
+//! バックアップを一時名へコピーして検査し、通った場合だけ新規パスへ公開する（既存の出力先は上書きしない。
+//! 通らなければ何も公開せず 4 または 5 で終了。詳細は `wire_server::restore_opt`）。`--incremental` を
+//! 指定すると、検査の前に増分バックアップ（古い順）を一時コピーへ適用する（連鎖が切れていれば何も公開せず 1 で終了）。
+//!
+//! `wire-server backup-incremental --db <path> --base <path> --out <path>` サブコマンドは、**停止中**の DB から、
+//! 直前のベース（フルバックアップまたは前回の増分）が終わった commit の次から最新までのログ区間を増分
+//! バックアップとして書き出す（Issue #2168・RECOVER-13・RECOVER-14 ポインタ。変更ログ `--change-log` を有効にした
+//! DB に限る）。終了コード: 0=成功、1=実行時の失敗（連鎖の切断・別 DB・区間が空・稼働中を含む）、2=引数／
+//! 出力先の拒否。詳細は `wire_server::incremental_opt`。
 //!
 //! `wire-server hash-password` サブコマンドはユーザーストア（`username:tenant_id:phc`）
 //! に登録する 1 行を生成する補助コマンド（stdin からパスワードを読み、平文を
@@ -561,6 +568,9 @@ fn main() -> ExitCode {
     }
     if args.get(1).map(String::as_str) == Some("backup") {
         return run_backup(&args[2..]);
+    }
+    if args.get(1).map(String::as_str) == Some("backup-incremental") {
+        return run_backup_incremental(&args[2..]);
     }
     if args.get(1).map(String::as_str) == Some("change-log-verify") {
         return run_change_log_verify(&args[2..]);
@@ -4107,6 +4117,44 @@ fn run_backup(args: &[String]) -> ExitCode {
     }
 }
 
+/// `backup-incremental --db <path> --base <path> --out <path>` サブコマンド（Issue #2168・RECOVER-13・
+/// RECOVER-14 ポインタ）。ベースの終点を読み（フルバックアップは読み取り専用で開き、増分は全体を検証する）、
+/// 停止中の DB を読み取り専用で開いて、その次から最新までのログ区間を `--out` へ書き出す。稼働中のサーバーが
+/// 開いている DB は拒否する（終了コード 1）。DB・ベースへは書き込まない。エラー文に行の値・パス・表名・
+/// commit 番号は含めない。
+fn run_backup_incremental(args: &[String]) -> ExitCode {
+    use engine::storage::{chain_point_of, IncrementalError, ReadOnlyOpenError, ReadOnlyStorage};
+    use wire_server::{backup_opt, incremental_opt};
+
+    let parsed = match incremental_opt::parse(args) {
+        Ok(p) => p,
+        Err(msg) => {
+            engine::log_stderr!("wire-server: backup-incremental: {msg}");
+            return ExitCode::from(backup_opt::EXIT_USAGE);
+        }
+    };
+    let result = chain_point_of(&parsed.base).and_then(|base| {
+        let ro = ReadOnlyStorage::open(&parsed.db).map_err(|e| match e {
+            ReadOnlyOpenError::InUse => IncrementalError::InUse,
+            _ => IncrementalError::SourceUnreadable,
+        })?;
+        ro.export_incremental(&base, &parsed.out)
+    });
+    let (code, msg) = incremental_opt::classify(&result);
+    match code {
+        0 => {
+            if write_stdout(&format!("backup-incremental written: {msg}\n")).is_err() {
+                return ExitCode::from(backup_opt::EXIT_FAILURE);
+            }
+            ExitCode::SUCCESS
+        }
+        _ => {
+            engine::log_stderr!("wire-server: backup-incremental: {msg}");
+            ExitCode::from(code)
+        }
+    }
+}
+
 /// 消せなかった一時コピーの場所を標準エラーへ固定の英語文で通知する（全テナントのデータを
 /// 含むため手動で消す必要がある）。
 fn report_leftover(sub: &str, path: &std::path::Path) {
@@ -4189,7 +4237,12 @@ fn run_restore(args: &[String]) -> ExitCode {
         }
     };
     let mut leftover = None;
-    let result = restore_opt::restore(&parsed.from, &parsed.db, &mut leftover);
+    let result = restore_opt::restore_with_incrementals(
+        &parsed.from,
+        &parsed.db,
+        &parsed.incrementals,
+        &mut leftover,
+    );
     if matches!(
         &result,
         Err(restore_opt::RestoreError::UncheckedContentPublished)
