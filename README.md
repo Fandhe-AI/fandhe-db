@@ -420,8 +420,8 @@ redb トランザクションで DB 内の `change_log` 表へ追記されます
 
 - **`--change-log` だけでは記録だけです。** アーカイブ先を指定しない限り、`change_log` 表は DB ファイルの中で
   増え続けます（行データを表とログに二重に持つため、書き込み量の多い DB ではファイルが無効時の約 3 倍、
-  一括 ingest のスループットが約 0.6 倍になりました。実測は設計書の D11 を参照）。PITR
-  の復元は後続（#2169）です。増分バックアップは下記のとおり使えます。
+  一括 ingest のスループットが約 0.6 倍になりました。実測は設計書の D11 を参照）。増分バックアップと
+  PITR は下記のとおり使えます。
 - **一度有効にした DB は、フラグなしでは起動できません。** 無効のまま書くとログに欠落（LSN の欠落）が
   生じるため、起動を固定文言で拒否します（`backup` サブコマンドの読み取りは影響を受けません）。いまの
   版に有効化を戻す手段はありません。`backup` で取った複製も変更ログを含むため有効扱いで、起動には
@@ -467,7 +467,17 @@ redb トランザクションで DB 内の `change_log` 表へ追記されます
   計算し直したファイルは通ります)。増分とベースは信頼できる経路で受け渡してください(ベースの DB ファイルと
   同じ信頼境界)。復元した DB は元と同じ DB 識別子・timeline を持つため、別系統の増分を誤って適用しても検出
   できません(#2446 の timeline が前提)。
-  稼働中のサーバーからの取得と、指定 LSN／時刻までの復元（PITR）は未対応です。
+  稼働中のサーバーからの取得は未対応です。
+
+**指定 LSN／時刻までの復元（PITR）**（Issue #2169。RECOVER-14 ポインタ。判断は設計書の D12、手順は [backup-restore-operations.md](docs/design/backup-restore-operations.md) の 4.5）:
+
+- `wire-server restore --from <ベース> --db <新規パス> [--incremental <増分>...] [--change-log-archive-dir <dir>]
+  (--until-lsn <n> | --until-time <RFC 3339>)`: ベースの複製へ増分・アーカイブのログを指定点まで適用してから検査・公開します。
+  停止は commit 境界だけで、`--until-time` はゾーン必須です（この時刻を超える最初の commit の直前で止まります）。
+- 指定できるのはベースの終点より後、入力したログ全体（増分とアーカイブ）の最大 LSN 以下です。範囲外・欠落・破損・
+  別 DB・別 timeline は何も公開せず終了コード 1、引数の不備は DB を開く前に終了コード 2 です。
+- 復元した DB は元と同じ DB 識別子・timeline のまま LSN が巻き戻るため、元のアーカイブ先とは別のアーカイブ先で
+  運用してください（timeline の分岐は #2446 が前提）。
 
 **論理ダンプ**（Issue #2162。RECOVER-16 ポインタ。形式と判断は [docs/design/logical-dump.md](docs/design/logical-dump.md) の §12、手順は [backup-restore-operations.md](docs/design/backup-restore-operations.md) の 4.6）:
 
