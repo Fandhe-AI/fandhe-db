@@ -18,26 +18,26 @@ use wire_server::dump_opt::{DumpFormat, DumpParts, DumpScope};
 const BOB_SECRET: &str = "BOBSECRET-row-content";
 const BOB_SCHEMA: &str = "bobschema";
 
-fn run(args: &[&str]) -> Output {
+pub(crate) fn run(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_wire-server"))
         .args(args)
         .output()
         .expect("run wire-server")
 }
 
-fn code(o: &Output) -> Option<i32> {
+pub(crate) fn code(o: &Output) -> Option<i32> {
     o.status.code()
 }
 
-fn stderr(o: &Output) -> String {
+pub(crate) fn stderr(o: &Output) -> String {
     String::from_utf8_lossy(&o.stderr).into_owned()
 }
 
-fn dir_of(path: &str) -> PathBuf {
+pub(crate) fn dir_of(path: &str) -> PathBuf {
     Path::new(path).parent().expect("parent dir").to_path_buf()
 }
 
-fn s(p: &Path) -> &str {
+pub(crate) fn s(p: &Path) -> &str {
     p.to_str().expect("utf-8 path")
 }
 
@@ -143,14 +143,14 @@ impl Fixture {
 
 /// engine を直接開いて文を実行する（サーバー経由だと `--users` の初期ブートストラップ権限が
 /// 記録され、権限を書き出せない現状のダンプが拒否するため。設計書の第 12 節を参照）。
-struct Direct<'a> {
+pub(crate) struct Direct<'a> {
     core: &'a engine::core::EngineCore,
     ctx: engine::policy::PolicyContext,
     session: engine::sql::mode::SessionState,
 }
 
 impl<'a> Direct<'a> {
-    fn new(core: &'a engine::core::EngineCore, tenant: &str) -> Self {
+    pub(crate) fn new(core: &'a engine::core::EngineCore, tenant: &str) -> Self {
         use engine::policy::PolicyContext;
         use engine::storage::Visibility;
         let mut session = engine::sql::mode::SessionState::default();
@@ -166,12 +166,28 @@ impl<'a> Direct<'a> {
         }
     }
 
-    fn exec(&mut self, sql: &str) {
+    pub(crate) fn exec(&mut self, sql: &str) {
         if let Err(e) = self
             .core
             .execute_sql_in_session(&self.ctx, &mut self.session, sql)
         {
             panic!("statement failed: {}", e.wire_code());
+        }
+    }
+
+    /// 読み取りを実行し、各行のセルを `Debug` 表記の文字列として返す（往復後の値比較用）。
+    pub(crate) fn rows(&mut self, sql: &str) -> Vec<Vec<String>> {
+        match self
+            .core
+            .execute_sql_in_session(&self.ctx, &mut self.session, sql)
+        {
+            Ok(engine::sql::SqlOutcome::Query(r)) => r
+                .rows
+                .into_iter()
+                .map(|row| row.cells.iter().map(|c| format!("{c:?}")).collect())
+                .collect(),
+            Ok(_) => panic!("expected rows"),
+            Err(e) => panic!("query failed: {}", e.wire_code()),
         }
     }
 }
@@ -228,14 +244,14 @@ fn populated(label: &str, extra_alice: &[&str]) -> Fixture {
     Fixture { _fx: fx, users, db }
 }
 
-fn dump_args<'a>(db: &'a str, out: &'a str, extra: &[&'a str]) -> Vec<&'a str> {
+pub(crate) fn dump_args<'a>(db: &'a str, out: &'a str, extra: &[&'a str]) -> Vec<&'a str> {
     let mut v = vec!["dump", "--db", db, "--out", out];
     v.extend_from_slice(extra);
     v
 }
 
 /// 復元先のディレクトリに一時名（`.fandhe-` 始まり）が残っていないこと。
-fn assert_no_temp_leftovers(dir: &Path) {
+pub(crate) fn assert_no_temp_leftovers(dir: &Path) {
     for e in std::fs::read_dir(dir).expect("read dir") {
         let name = e.expect("entry").file_name();
         let name = name.to_string_lossy();
@@ -243,7 +259,7 @@ fn assert_no_temp_leftovers(dir: &Path) {
     }
 }
 
-fn read_text(path: &str) -> String {
+pub(crate) fn read_text(path: &str) -> String {
     String::from_utf8(std::fs::read(path).expect("read dump")).expect("utf-8 dump")
 }
 
