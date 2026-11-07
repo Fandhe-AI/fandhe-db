@@ -328,6 +328,11 @@ fn time_target_is_a_prefix_even_when_the_wall_clock_goes_backwards() {
     let end = s.base_point.end_lsn as usize;
     let mut times: Vec<i64> = (0..total as i64).map(|i| 1_000 + i * 100).collect();
     times[end + 2] = 1_000; // LSN end+3 が過去の時刻
+                            // ベースと重なる区間は本物の時刻のまま
+                            // （重なり区間の内容がベースの履歴と食い違えば拒否されるため）。
+    for (i, (_, t)) in s.fx.commit_times().iter().take(end).enumerate() {
+        times[i] = *t;
+    }
     let forged_dir = private_dir("pitr-clock-forged");
     let forged = forged_dir.path().join(&seg_name);
     retime_segment(&seg, &forged, &times);
@@ -614,4 +619,81 @@ fn explicit_transaction_is_applied_or_skipped_as_a_whole() {
         PitrTarget::Lsn(after_tx - 1),
     );
     assert!(matches!(r, Err(IncrementalError::TargetOutOfRange)));
+}
+
+/// 唯一のアーカイブのセグメントの全レコードのコミット時刻を `time` に付け替えた別ディレクトリを作る。
+/// チェックサムは正しいまま、重なり区間の内容だけが適用済みの履歴と食い違う（分岐した履歴の混在）。
+fn diverged_archive(archive: &Path, label: &str, time: i64) -> TempDir {
+    let seg = std::fs::read_dir(archive)
+        .expect("dir")
+        .next()
+        .expect("one segment")
+        .expect("entry")
+        .path();
+    let count = {
+        let r = SegmentReader::open(&seg, usize::MAX >> 8).expect("open");
+        r.header().record_count as usize
+    };
+    let dir = private_dir(label);
+    retime_segment(
+        &seg,
+        &dir.path().join(seg.file_name().expect("name")),
+        &vec![time; count],
+    );
+    dir
+}
+
+#[test]
+fn overlap_with_the_base_must_match_the_applied_history() {
+    let s = scenario("pitr-overlap-base", usize::MAX >> 8);
+    let last = s.fx.generation();
+    // 同じ内容のアーカイブは通る（対照）。
+    let (_w, _db, r) = restore(&s.base, &[], Some(s.archive.path()), PitrTarget::Lsn(last));
+    r.expect("same history");
+    // ベースの終点以下のレコードの内容が食い違うアーカイブは、成功として公開しない。
+    let bad = diverged_archive(s.archive.path(), "pitr-overlap-base-bad", 5);
+    let (_w, _db, r) = restore(&s.base, &[], Some(bad.path()), PitrTarget::Lsn(last));
+    assert!(matches!(r, Err(IncrementalError::ChainBroken)));
+    let (_w, _db, r) = restore(
+        &s.base,
+        &[],
+        Some(bad.path()),
+        PitrTarget::TimeMicros(i64::MAX),
+    );
+    assert!(matches!(r, Err(IncrementalError::TargetOutOfRange)));
+}
+
+#[test]
+fn overlap_with_an_incremental_must_match_the_applied_history() {
+    let mut fx = Fixture::new("pitr-overlap-inc");
+    fx.round_1();
+    let (base, base_point) = fx.full_backup("base.redb");
+    fx.step("INSERT INTO ev (id, embedding) VALUES (30, '[0.1,0.1]')");
+    fx.step("INSERT INTO ev (id, embedding) VALUES (31, '[0.1,0.1]')");
+    let inc = fx.path("inc.seg");
+    fx.storage()
+        .export_incremental(&base_point, &inc)
+        .expect("incremental");
+    fx.round_2();
+    let archive = private_dir("pitr-overlap-inc-arc");
+    fx.archive_into(archive.path(), usize::MAX >> 8);
+    let last = fx.generation();
+
+    let (_w, db, r) = restore(
+        &base,
+        std::slice::from_ref(&inc),
+        Some(archive.path()),
+        PitrTarget::Lsn(last),
+    );
+    r.expect("same history");
+    assert_state_at(&fx, &db, last);
+
+    let bad = diverged_archive(archive.path(), "pitr-overlap-inc-bad", 5);
+    let (_w, _db, r) = restore(
+        &base,
+        std::slice::from_ref(&inc),
+        Some(bad.path()),
+        PitrTarget::Lsn(last),
+    );
+    assert!(matches!(r, Err(IncrementalError::ChainBroken)));
 }

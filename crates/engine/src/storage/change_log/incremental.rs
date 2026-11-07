@@ -43,7 +43,7 @@ use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use redb::ReadableDatabase;
+use redb::{ReadableDatabase, ReadableTable};
 
 use super::archive::{
     check_dir_not_shared, check_row, map_decode, publish_with, read_meta_u64, verify_segment_file,
@@ -560,6 +560,8 @@ pub(super) fn replay_segments(
                     .map_err(map_decode)
                     .map_err(IncrementalError::from)?;
                 if h.lsn <= current {
+                    // 適用済みの LSN と重なる区間。内容が食い違う（分岐した履歴の混在）なら拒否する。
+                    check_overlap(&db, batch.as_ref(), &raw, &h, &info.header)?;
                     continue;
                 }
             }
@@ -636,6 +638,50 @@ pub(super) fn replay_segments(
         records,
         last_lsn: expected_last,
     })
+}
+
+/// 適用済みの LSN と重なるアーカイブのレコード `raw`（ヘッダ `h`）が、適用先に既にある内容と一致することを
+/// 確かめる。適用先の `change_log` 表（書き込み中のバッチ、無ければコミット済みの状態）の同じ LSN の行と
+/// バイト列で照合し、不一致は `ChainBroken`。行が無い（刈り込み済みなど）場合は照合の基準がないので、
+/// ヘッダの DB 識別子・timeline・ストレージ形式と `prev_lsn == lsn - 1` だけを確かめる。
+fn check_overlap(
+    db: &redb::Database,
+    batch: Option<&Batch>,
+    raw: &[u8],
+    h: &super::RecordHeader,
+    seg: &SegmentHeader,
+) -> Result<()> {
+    let logged: Option<Vec<u8>> = match batch {
+        Some(b) => {
+            // 許可（clippy::disallowed_methods）: 本体表は記録範囲の例外（D3）で、読み取りだけ。
+            #[allow(clippy::disallowed_methods)]
+            let t = b.txn.open_table(CHANGE_LOG_TABLE)?;
+            let row = t.get(h.lsn)?.map(|v| v.value().to_vec());
+            row
+        }
+        None => {
+            let read = db.begin_read()?;
+            match read.open_table(CHANGE_LOG_TABLE) {
+                Ok(t) => t.get(h.lsn)?.map(|v| v.value().to_vec()),
+                Err(redb::TableError::TableDoesNotExist(_)) => None,
+                Err(e) => return Err(e.into()),
+            }
+        }
+    };
+    match logged {
+        Some(row) if row == raw => Ok(()),
+        Some(_) => Err(IncrementalError::ChainBroken),
+        None => {
+            if h.db_id != seg.db_id
+                || h.timeline != seg.timeline
+                || h.storage_format != STORAGE_FORMAT_VERSION
+                || h.lsn.checked_sub(1) != Some(h.prev_lsn)
+            {
+                return Err(IncrementalError::ChainBroken);
+            }
+            Ok(())
+        }
+    }
 }
 
 /// レコード本体を writer へ適用する（`dropped` の削除 → `created` の作成 → `tables` の反映。参照実装は

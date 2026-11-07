@@ -680,6 +680,13 @@ fn list_segments(dir: &Path) -> Result<Vec<(PathBuf, SegmentName)>> {
     Ok(out)
 }
 
+/// `dir` のセグメントファイルの数（名前の一覧だけ。中身は読まない）。PITR が、全体を読んで検証する前に
+/// 件数の上限を確かめるために使う。
+pub(super) fn count_segment_files(dir: &Path) -> Result<usize> {
+    check_dir(dir)?;
+    Ok(list_segments(dir)?.len())
+}
+
 /// アーカイブ先ディレクトリ全体を検証する。各セグメントを [`verify_segment_file`] で検証し、名前と
 /// ヘッダの一致、DB 識別子・timeline の一貫、LSN の連鎖（前の末尾 + 1 == 次の先頭。飛びも重複も拒否）、
 /// `expect` との一致を確かめる。欠落・順序違反・改ざん・別 DB／別 timeline は非 `Ok`。

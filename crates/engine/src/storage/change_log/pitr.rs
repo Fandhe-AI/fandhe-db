@@ -35,7 +35,9 @@
 
 use std::path::{Path, PathBuf};
 
-use super::archive::{check_dir_not_shared, verified_segments, ArchiveExpectation, SegmentReader};
+use super::archive::{
+    check_dir_not_shared, count_segment_files, verified_segments, ArchiveExpectation, SegmentReader,
+};
 use super::incremental::{
     chain_point_of, replay_segments, verify_incrementals, ApplySummary, IncrementalError,
     ReplaySegment,
@@ -89,6 +91,10 @@ pub fn restore_to_point(
     let mut archive: Vec<ReplaySegment> = Vec::new();
     if let Some(dir) = archive_dir {
         check_dir_not_shared(dir).map_err(IncrementalError::from)?;
+        // 件数の上限は、アーカイブ全体を読んで検証する前に（名前の一覧だけで）確かめる。
+        if count_segment_files(dir)? > MAX_PITR_SEGMENTS {
+            return Err(IncrementalError::BadSegmentList);
+        }
         let expect = ArchiveExpectation {
             db_id: Some(base.db_id),
             timeline: Some(base.timeline),
@@ -143,6 +149,9 @@ pub fn restore_to_point(
 
 /// コミット時刻が `t` を超える最初のレコードの直前の LSN を求める（ヘッダだけを読む）。ベースの終点
 /// `base_end` 以下のレコードと、既に見た LSN 以下のレコード（アーカイブが増分と重なる区間）は数えない。
+/// 読むのはヘッダだけで、全体チェックサム（`finish`）は照合しない。安全の根拠は、(1) 呼び出し前に
+/// アーカイブ全体を検証済み、(2) 結果は停止 LSN にすぎず、再生（`replay_segments`）が各セグメントの
+/// ヘッダ・全体チェックサムと、重なり区間の内容（適用先の `change_log` の行）を再検証することにある。
 /// 該当するレコードが無い（末尾まで行く）、または最初の候補がすでに `t` を超えている（停止点がベース以前）
 /// なら `TargetOutOfRange`。
 fn resolve_time(
@@ -162,6 +171,10 @@ fn resolve_time(
                 .map_err(super::archive::map_decode)
                 .map_err(IncrementalError::from)?;
             if h.lsn <= seen {
+                // 重なり区間。内容の照合は再生側が行う（ここでは連鎖の形だけ確かめる）。
+                if h.lsn.checked_sub(1) != Some(h.prev_lsn) {
+                    return Err(IncrementalError::ChainBroken);
+                }
                 continue;
             }
             if h.commit_time_us > t {
