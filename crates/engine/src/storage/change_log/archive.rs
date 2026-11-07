@@ -392,6 +392,15 @@ impl SegmentBuilder {
         }
     }
 
+    /// 次のレコードがこのセグメントの版数と同じか（先頭のレコードや読めないレコードは `true` で、
+    /// 後続の [`Self::push`] の検査に委ねる）。
+    fn accepts_format(&self, value: &[u8]) -> bool {
+        match (self.storage_format, peek_record(value, self.max_payload)) {
+            (Some(f), Ok(h)) => f == h.storage_format,
+            _ => true,
+        }
+    }
+
     fn body_len(&self) -> usize {
         self.buf.len().saturating_sub(SEG_PREFIX_LEN)
     }
@@ -727,6 +736,20 @@ fn publish(_dir: &Path, _final_path: &Path, _bytes: &[u8]) -> Result<bool> {
     Err(ArchiveError::Unsupported)
 }
 
+/// 競合で先に在った同名ファイルの中身が `bytes` と同一か。通常ファイルで長さが一致するときだけ
+/// 読む（FIFO・デバイス・巨大ファイルを読まない。読み取りも `bytes` の長さ + 1 で打ち切る）。
+fn existing_equals(path: &Path, bytes: &[u8]) -> Result<bool> {
+    let meta = std::fs::symlink_metadata(path)?;
+    if !meta.file_type().is_file() || meta.len() != bytes.len() as u64 {
+        return Ok(false);
+    }
+    let mut existing = Vec::with_capacity(bytes.len());
+    std::fs::File::open(path)?
+        .take(bytes.len() as u64 + 1)
+        .read_to_end(&mut existing)?;
+    Ok(existing == bytes)
+}
+
 /// 次に書き出す区間の計画。
 enum Plan {
     /// 書くものが無い（水位より後のレコードが無い）。
@@ -840,6 +863,10 @@ fn plan_next(
     let mut builder = SegmentBuilder::new(state, first);
     for row in table.range(first..)? {
         let (k, v) = row?;
+        // ストレージ形式の版数が変わる境界でセグメントを切る（1 セグメントは 1 つの版数。残りは次の周期）。
+        if !builder.accepts_format(v.value()) {
+            break;
+        }
         builder.push(k.value(), v.value())?;
         if builder.body_len() >= opts.segment_bytes {
             break;
@@ -956,8 +983,7 @@ pub(in crate::storage) fn run_cycle(
                 let path = opts.dir.join(name);
                 if !publish(&opts.dir, &path, &bytes)? {
                     // 競合で同名が先に在った。中身が同一なら採用し、違えば置換せずに止める。
-                    let existing = std::fs::read(&path)?;
-                    if existing != bytes {
+                    if !existing_equals(&path, &bytes)? {
                         return Err(ArchiveError::Conflict);
                     }
                     (header.last_lsn, true)

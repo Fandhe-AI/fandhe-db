@@ -104,7 +104,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #2167: `storage/change_log/archive.rs` の保守 commit（アーカイブ済み水位の更新と水位以下の
     // 刈り込み）。書き込むのは `change_log_meta`・`change_log` 表だけで、`CATALOG_TABLE`・`user_rows` には
     // 触れず、世代も進めない（バンプ対象の表が構造的に存在しない）。
-    ("storage/change_log/archive.rs", 927),
+    ("storage/change_log/archive.rs", 954),
     ("storage/change_log.rs", 1508),
     ("storage/change_log.rs", 1516),
     ("recovery/panic_hook.rs", 404),

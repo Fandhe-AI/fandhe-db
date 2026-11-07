@@ -861,3 +861,53 @@ fn errors_carry_no_variable_content() {
         );
     }
 }
+
+#[test]
+fn segment_is_cut_at_a_storage_format_boundary() {
+    use super::super::{encode_record, RecordBody, RecordHeader, STORAGE_FORMAT_VERSION};
+    let f = Fixture::new("arc-format");
+    let state = f.storage().change_log.clone().expect("state");
+    let rec = |lsn: u64, format: u32| {
+        encode_record(
+            &RecordHeader {
+                db_id: state.db_id,
+                timeline: state.timeline,
+                lsn,
+                prev_lsn: lsn - 1,
+                commit_time_us: 0,
+                storage_format: format,
+            },
+            &RecordBody::default(),
+            1024,
+        )
+        .expect("encode")
+    };
+    let (a, b) = (
+        rec(1, STORAGE_FORMAT_VERSION),
+        rec(2, STORAGE_FORMAT_VERSION + 1),
+    );
+    let mut builder = SegmentBuilder::new(&state, 1);
+    assert!(
+        builder.accepts_format(&a),
+        "the first record is always accepted"
+    );
+    builder.push(1, &a).expect("push");
+    assert!(
+        !builder.accepts_format(&b),
+        "a different version starts a new segment"
+    );
+    assert!(builder.accepts_format(&rec(2, STORAGE_FORMAT_VERSION)));
+}
+
+#[test]
+fn a_racing_non_regular_file_is_a_conflict_and_is_never_read() {
+    let dir = TempDir::new("arc-fifo");
+    let path = dir.path().join("x");
+    std::os::unix::fs::symlink("/dev/zero", &path).expect("symlink");
+    assert!(!existing_equals(&path, b"abc").expect("no read"));
+    std::fs::remove_file(&path).expect("rm");
+    std::fs::write(&path, b"abc").expect("write");
+    assert!(existing_equals(&path, b"abc").expect("eq"));
+    assert!(!existing_equals(&path, b"abd").expect("ne"));
+    assert!(!existing_equals(&path, b"ab").expect("len"));
+}

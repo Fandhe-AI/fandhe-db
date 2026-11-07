@@ -4067,7 +4067,7 @@ fn run_backup(args: &[String]) -> ExitCode {
     let storage = match Storage::open(db) {
         Ok(s) => s,
         Err(e) => {
-            if e.to_string().contains("already open") {
+            if database_in_use(&e) {
                 engine::log_stderr!(
                     "wire-server: backup: database is in use by another process \
                      (stop the server first)"
@@ -4092,11 +4092,20 @@ fn run_backup(args: &[String]) -> ExitCode {
     }
 }
 
+/// `Storage::open` の失敗が「別プロセスが DB を開いている」ことによるか。engine は専用の列挙子を
+/// 持たず redb の文言（`already open`）に依存するため、文言が変わると運用者向けの案内が出なくなるだけで
+/// 失敗の扱いは変わらない（呼び出し側はどちらでも非 0 終了）。
+fn database_in_use(e: &engine::storage::StorageError) -> bool {
+    e.to_string().contains("already open")
+}
+
 /// `change-log-verify --archive-dir <dir> [--db <path>]` サブコマンド（Issue #2167・RECOVER-14 ポインタ）。
 /// アーカイブ先のセグメントを検証し、欠落（LSN の飛び・先頭や末尾の紛失）・チェックサム不一致・別 DB／別
 /// timeline を非 0 終了で知らせる。`--db` を付けると停止中の DB のメタ情報（DB 識別子・timeline・有効化時の
-/// 世代・水位）と突き合わせ、付けなければディレクトリ内の整合だけを検査する。検証は読み取りだけで何も変更
-/// しない。結果は運用者向けの標準出力（パス・テナント情報を含まない）。
+/// 世代・水位）と突き合わせ、付けなければディレクトリ内の整合だけを検査する。アーカイブ先のファイルは
+/// 変更しないが、`--db` を付けると `Storage::open` が DB の初期化・修復の書き込みをしうる（読み取り専用の
+/// open は #3074）。運用上は停止中の DB かそのコピーに対して実行する。結果は運用者向けの標準出力
+/// （パス・テナント情報を含まない）。
 fn run_change_log_verify(args: &[String]) -> ExitCode {
     use wire_server::change_log_opt;
 
@@ -4111,7 +4120,7 @@ fn run_change_log_verify(args: &[String]) -> ExitCode {
         Some(db) => match engine::storage::Storage::open(db) {
             Ok(storage) => storage.verify_change_log_archive(&parsed.dir),
             Err(e) => {
-                if e.to_string().contains("already open") {
+                if database_in_use(&e) {
                     engine::log_stderr!(
                         "wire-server: change-log-verify: database is in use by another process \
                          (stop the server first)"
