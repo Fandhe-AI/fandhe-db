@@ -947,7 +947,6 @@ mod wellformed_tests {
     /// redb 自身の符号化で作った正しいバイト列は、可変長タプルを含めて受理される(検証が厳しすぎない)。
     #[test]
     fn encoded_values_are_accepted() {
-        use redb::Value as _;
         fn enc<T: redb::Value + 'static>(v: T::SelfType<'_>) -> Vec<u8> {
             T::as_bytes(&v).as_ref().to_vec()
         }
