@@ -846,6 +846,16 @@ pub(crate) fn list_overloads_in_txn(
     list_in_txn(w, scope, Some(&key))
 }
 
+/// 読み取り元（確定済みスナップショットなど）から `scope` の全定義を `(関数名, シグネチャ)` の昇順で返す
+/// （論理ダンプの書き出し専用。RECOVER-16。他テナントの定義は構造上引けない）。
+pub(crate) fn list_functions_in_source<R: ReadSource>(
+    src: &R,
+    scope: &str,
+) -> Result<Vec<FunctionDef>> {
+    validate_scope(scope)?;
+    list_in_txn(src, scope, None)
+}
+
 fn list_in_txn<R: ReadSource>(
     src: &R,
     scope: &str,
