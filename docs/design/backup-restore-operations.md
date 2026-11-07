@@ -207,14 +207,15 @@ wire-server dump --db /var/lib/fandhe/db.redb --out /backup/tenant-a.sql --tenan
 #    --schema-only／--data-only で片方だけ、--format insert で INSERT 形式（既定は COPY）
 
 # 2. 新規パスへ復元する（既存のパスは拒否。途中で失敗したら何も公開しない）
-wire-server dump-restore --from /backup/tenant-a.sql --db /var/lib/fandhe/restored.redb
+wire-server dump-restore --from /backup/tenant-a.sql --db /var/lib/fandhe/restored.redb \
+  --expect-tenant tenant-a   # 任意。ヘッダのテナントと一致しなければ拒否する
 ```
 
 - `--tenant` か `--shared-only` のどちらかが必須。全テナントを 1 回で書き出す指定は無い（テナントごとに取る）
 - 出力は 0600 の一時名に書いて成功したときだけ公開する。ロールの SCRAM 検証子と全行の値を含むので、保管先の権限を管理する
 - `dump-restore` は流し込み後に整合検査を行い、通ったときだけ公開する。終了コード: 0=成功、1=実行時の失敗（文の適用の失敗を含む。通し番号と SQLSTATE を標準エラーへ出す）、2=引数／パスの拒否（復元先が既存を含む）、3=公開済みだが後始末を確かめられなかった、4=ダンプファイルの拒否（改ざん・破損・許可外の文・データのみのダンプ）、5=整合検査の失敗。`dump` は 0〜3
 - `--data-only` のダンプは新規 DB へ復元できない（表が無いため）。復元に使うのは全部（既定）または `--schema-only` のダンプ
-- ダンプファイルは書き込み SQL を運ぶ。信頼できる出典のものだけを復元する
+- ダンプファイルは書き込み SQL を運ぶ。信頼できる出典のものだけを復元する。ヘッダのテナントは信用されるため、取り違えを防ぐには `--expect-tenant` を使う。枠の順序（作成 → データ → 後段）とヘッダとの整合は復元時に検査される
 - **制約**: `--users` ファイルから起動したサーバーが作った DB は、そのテナントの利用者のブートストラップ権限が記録されているため、現状は `dump` が書き出せないオブジェクトとして拒否する（終了コード 1）。権限の書き出しが実装されるまでの制約
 - 稼働中のサーバーからの取得は未対応（`dump` は停止中の DB を開く）
 
