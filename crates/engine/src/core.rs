@@ -4257,6 +4257,20 @@ impl EngineCore {
         self.storage.export_snapshot(dest)
     }
 
+    /// 稼働中の永続ストレージのスキーマを DDL 文として書き出す（RECOVER-16 (1)・Issue #2160）。
+    /// 運用者の CLI（#2162）から呼ぶ入口で、[`Storage::export_schema_ddl`] へそのまま委譲する
+    /// （読み取りスナップショット上で動き、書き込みを止めない。SQL・NoSQL の表層からは呼べない）。
+    pub fn export_schema_ddl<E>(
+        &self,
+        scope: &crate::catalog::ddl_export::SchemaDdlScope,
+        sink: impl FnMut(&crate::catalog::ddl_export::DdlStatement<'_>) -> std::result::Result<(), E>,
+    ) -> std::result::Result<
+        crate::catalog::ddl_export::SchemaDdlSummary,
+        crate::catalog::ddl_export::SchemaDdlError<E>,
+    > {
+        self.storage.export_schema_ddl(scope, sink)
+    }
+
     /// 結合ではなくモジュール内テストが登録簿などの内部状態へ届くための入口
     /// （Issue #1129 の同時実行数上限のテスト用。本番ビルドには含めない）。
     #[cfg(test)]
