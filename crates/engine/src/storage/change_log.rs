@@ -65,6 +65,7 @@ pub(crate) mod incremental;
 pub(crate) mod oracle;
 #[cfg(test)]
 mod oracle_tests;
+pub(crate) mod stream;
 
 use super::table_image::{self, AfterImage, Meter, ReadMode, ReadOutcome};
 use super::{Result, StorageError, GENERATION_KEY, GENERATION_TABLE};
@@ -569,11 +570,53 @@ impl PartialEq for ArchiveLock {
 
 impl Eq for ArchiveLock {}
 
+/// ストリーミングレプリケーションの送信側（Issue #2173・RECOVER-15 ポインタ）が登録する保持位置の
+/// 登録簿。接続中のレプリカごとに「確認応答済みの最後の LSN」を持ち、刈り込み（`archive` の保守
+/// commit）はその最小値より後のレコードを消さない。接続の切断（[`ReplicaPin`] の `Drop`）で登録が外れる
+/// ため、死んだレプリカが刈り込みを止め続けることはない（遅れ過ぎたレプリカの再同期は #2176）。
+/// `ChangeLogState` の導出に合わせ、比較は常に等しく、複製は空の登録簿になる。
+#[derive(Debug, Default)]
+pub(crate) struct ReplicaPins {
+    pins: Mutex<std::collections::BTreeMap<u64, u64>>,
+    next_id: std::sync::atomic::AtomicU64,
+}
+
+impl Clone for ReplicaPins {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl PartialEq for ReplicaPins {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for ReplicaPins {}
+
+impl ReplicaPins {
+    /// 登録簿のロックを取る。刈り込みの保守 commit はこれを commit まで保持し、登録する側の
+    /// 「登録 → 開始位置の存在確認」と競合しないようにする。汚染は無視する（値は単純な数値のみ）。
+    pub(crate) fn lock(&self) -> MutexGuard<'_, std::collections::BTreeMap<u64, u64>> {
+        self.pins
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// 刈り込める LSN の上限（確認応答済みの最小値。登録が無ければ上限なし）。
+    pub(crate) fn floor(pins: &std::collections::BTreeMap<u64, u64>) -> u64 {
+        pins.values().copied().min().unwrap_or(u64::MAX)
+    }
+}
+
 /// 変更ログが有効な `Storage` が持つ不変の設定。無効な `Storage` はこれを持たない（`None`）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ChangeLogState {
     /// アーカイブの 1 周期（計画 → 公開 → 水位更新）を直列化する（`archive`。D6）。複製は別のロックになる。
     pub(crate) archive_lock: ArchiveLock,
+    /// レプリカの保持位置の登録簿（`stream`。Issue #2173）。複製は空の登録簿になる。
+    pub(crate) replica_pins: ReplicaPins,
     pub(crate) db_id: [u8; DB_ID_LEN],
     pub(crate) timeline: u64,
     pub(crate) limits: CaptureLimits,
@@ -635,6 +678,7 @@ pub(crate) fn load_or_init_identity(
     Ok((
         ChangeLogState {
             archive_lock: ArchiveLock::default(),
+            replica_pins: ReplicaPins::default(),
             db_id,
             timeline,
             limits,

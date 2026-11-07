@@ -35,9 +35,9 @@ use std::path::{Path, PathBuf};
 use redb::{ReadableDatabase, ReadableTable};
 
 use super::{
-    peek_record, ChangeLogState, DecodeError, Reader, CHANGE_LOG_TABLE, CHECKSUM_LEN, DB_ID_LEN,
-    HEADER_LEN, META_KEY_ARCHIVED_LSN, META_KEY_BASE_GENERATION, META_KEY_DB_ID, META_KEY_TIMELINE,
-    META_TABLE,
+    peek_record, ChangeLogState, DecodeError, Reader, ReplicaPins, CHANGE_LOG_TABLE, CHECKSUM_LEN,
+    DB_ID_LEN, HEADER_LEN, META_KEY_ARCHIVED_LSN, META_KEY_BASE_GENERATION, META_KEY_DB_ID,
+    META_KEY_TIMELINE, META_TABLE,
 };
 use crate::crypto::sha256::Sha256;
 use crate::storage::{Storage, StorageError};
@@ -1064,6 +1064,12 @@ fn maintenance_commit(
     opts: &ArchiveOptions,
     prune_cap: u64,
 ) -> Result<Step> {
+    // レプリカの保持位置（Issue #2173）。登録簿のロックを commit まで保持し、レプリカの登録（登録 →
+    // 開始位置の存在確認）が刈り込みの途中に割り込んで、確認した範囲が commit で消える競合を作らない。
+    // ゲートの待機中に保持するが、登録側はゲートを取らず、ack の更新も短時間のロックだけなので、
+    // 順序の逆転（ゲート → 登録簿）は存在しない。
+    let pins = storage.change_log.as_ref().map(|s| s.replica_pins.lock());
+    let pin_floor = pins.as_ref().map_or(u64::MAX, |p| ReplicaPins::floor(p));
     let Some(txn) = storage.begin_maintenance_txn()? else {
         return Ok(Step::Skipped);
     };
@@ -1095,7 +1101,8 @@ fn maintenance_commit(
         if let Some(retain) = opts.retain_records {
             // 削除は水位以下に構造的に限る（水位より後は未アーカイブで、決して消さない）。
             // さらに、現在のアーカイブ先で覆いを確認できた範囲（`prune_cap`）を超えて消さない。
-            let upto = new_w.saturating_sub(retain).min(prune_cap);
+            // さらに、接続中のレプリカが確認応答していないレコードも消さない（`pin_floor`）。
+            let upto = new_w.saturating_sub(retain).min(prune_cap).min(pin_floor);
             #[allow(clippy::disallowed_methods)]
             let mut log = txn.open_table(CHANGE_LOG_TABLE)?;
             let mut bytes = 0usize;

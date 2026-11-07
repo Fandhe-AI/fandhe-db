@@ -51,6 +51,9 @@ pub use change_log::incremental::{
     apply_incremental_segments, chain_point_of, ApplySummary, ChainPoint, IncrementalError,
     IncrementalSummary,
 };
+pub use change_log::stream::{
+    ChangeLogBatch, ReplicaPin, StreamError, StreamIdentity, MAX_RECORD_BYTES,
+};
 pub use integrity::{
     FindingKind, IntegrityError, IntegrityFinding, IntegrityOptions, IntegrityReport, Severity,
 };
