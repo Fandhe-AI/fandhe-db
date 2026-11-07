@@ -97,6 +97,9 @@ pub enum RestoreError {
     OpenFailed,
     /// 検査を始められなかった。
     VerifyFailed,
+    /// 検査用の一時コピーのパスが、作成した fd と別のファイルに差し替えられた・消えた・長さが合わない
+    /// （空 DB が整合扱いで公開されるのを防ぐ。公開しない）。
+    TempReplaced,
     /// 検査で矛盾または検査できない項目が見つかり、公開しなかった。
     NotConsistent(IntegrityReport),
     /// この環境では復元できない（unix 以外・hard link 非対応など）。
@@ -119,6 +122,7 @@ impl std::fmt::Display for RestoreError {
             Self::OpenFailed => {
                 "backup file could not be opened as a database; nothing was published"
             }
+            Self::TempReplaced => "temporary copy was replaced or removed; nothing was published",
             Self::VerifyFailed => "integrity check could not be started; nothing was published",
             Self::NotConsistent(_) => "backup failed the integrity check; nothing was published",
             Self::Unsupported => "restore is not supported in this environment",
@@ -171,27 +175,59 @@ pub fn restore(from: &Path, dest: &Path) -> Result<RestoreSummary, RestoreError>
     unix_impl::restore(from, dest)
 }
 
+/// 停止中の DB `db` を**開かずに**整合検査する（`verify` の本体。Issue #2156）。`db` を読み取りで開いて
+/// 排他のアドバイザリロックを取り（redb が `Database::create` で使うロックと同じ仕組みで競合するため、
+/// 稼働中なら [`RestoreError::SourceInUse`]）、ロックを保持したまま同じディレクトリの 0600 の
+/// 一時名へコピーし、コピーを開いて `verify_integrity` を実行して一時名を消す。元ファイルへは
+/// 書き込まない（open 時の移行・ヘッダ更新はコピーにだけ入る）。DB と同程度の空き容量が要る。
+#[cfg(unix)]
+pub fn verify_via_copy(
+    db: &Path,
+    options: &engine::storage::IntegrityOptions,
+) -> Result<IntegrityReport, RestoreError> {
+    unix_impl::verify_via_copy(db, options)
+}
+
+/// [`verify_via_copy`] の非 unix スタブ。
+#[cfg(not(unix))]
+pub fn verify_via_copy(
+    _db: &Path,
+    _options: &engine::storage::IntegrityOptions,
+) -> Result<IntegrityReport, RestoreError> {
+    Err(RestoreError::Unsupported)
+}
+
 #[cfg(unix)]
 mod unix_impl {
     use std::fs::{File, OpenOptions, TryLockError};
     use std::io::ErrorKind;
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use engine::storage::{IntegrityOptions, Storage};
+    use engine::storage::{IntegrityOptions, IntegrityReport, Storage};
 
     use super::{RestoreError, RestoreSummary};
 
     static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
-    /// 一時ファイルの削除ガード。公開（`hard_link`）前の失敗で一時名を消す。
-    struct TempFileGuard {
-        path: PathBuf,
-        armed: bool,
+    fn io_err(e: std::io::Error) -> RestoreError {
+        RestoreError::Io(e.kind())
     }
 
-    impl Drop for TempFileGuard {
+    /// 一時コピー。作成時に開いた fd を保持し続け、パスが差し替え・unlink されていないことを
+    /// [`TempCopy::check_path`] で確かめる（`Storage::open` はパスで開くため、その間に一時パスが
+    /// unlink されると redb が空 DB を新規作成し、空の DB が整合扱いになりうる）。
+    /// 公開前の drop で一時名を消す（公開後は `armed = false`）。
+    pub(super) struct TempCopy {
+        pub(super) file: File,
+        pub(super) path: PathBuf,
+        dev: u64,
+        ino: u64,
+        pub(super) armed: bool,
+    }
+
+    impl Drop for TempCopy {
         fn drop(&mut self) {
             if self.armed {
                 let _ = std::fs::remove_file(&self.path);
@@ -199,20 +235,135 @@ mod unix_impl {
         }
     }
 
-    fn io_err(e: std::io::Error) -> RestoreError {
-        RestoreError::Io(e.kind())
+    impl TempCopy {
+        /// `parent` に所有者のみ読み書きの一時ファイルを排他的に作る。
+        pub(super) fn create(parent: &Path, prefix: &str) -> Result<Self, RestoreError> {
+            let mut attempts = 0u32;
+            loop {
+                let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+                let p = parent.join(format!(".{prefix}-{}-{seq}.tmp", std::process::id()));
+                match OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&p)
+                {
+                    Ok(file) => {
+                        let m = file.metadata().map_err(io_err)?;
+                        return Ok(Self {
+                            file,
+                            path: p,
+                            dev: m.dev(),
+                            ino: m.ino(),
+                            armed: true,
+                        });
+                    }
+                    Err(e) if e.kind() == ErrorKind::AlreadyExists && attempts < 8 => {
+                        attempts += 1;
+                    }
+                    Err(e) => return Err(io_err(e)),
+                }
+            }
+        }
+
+        /// パス（リンクをたどらない）が保持 fd と同じ (dev, ino) の通常ファイルで、長さが保持 fd の
+        /// 現在の長さと一致することを確かめる。`expected_len` があればその長さとも一致させる
+        /// （`Storage::open` の前はコピーしたバイト数。open 後は正当に伸びうるため fd の長さと比べる）。
+        pub(super) fn check_path(&self, expected_len: Option<u64>) -> Result<(), RestoreError> {
+            let path_meta =
+                std::fs::symlink_metadata(&self.path).map_err(|_| RestoreError::TempReplaced)?;
+            let fd_meta = self.file.metadata().map_err(io_err)?;
+            if !path_meta.is_file()
+                || path_meta.dev() != self.dev
+                || path_meta.ino() != self.ino
+                || path_meta.len() != fd_meta.len()
+                || expected_len.is_some_and(|n| n != path_meta.len())
+            {
+                return Err(RestoreError::TempReplaced);
+            }
+            Ok(())
+        }
     }
 
-    pub(super) fn restore(from: &Path, dest: &Path) -> Result<RestoreSummary, RestoreError> {
-        dest.file_name().ok_or(RestoreError::InvalidDestination)?;
-        let parent: &Path = match dest.parent() {
+    /// `path` を読み取りで開き、`exclusive` なら排他、でなければ共有のロックを試みて、通常ファイルかつ
+    /// 長さ 1 以上であることを開いた fd で確かめる。ロックは返す `File` を保持する間有効。
+    fn open_locked_source(path: &Path, exclusive: bool) -> Result<(File, u64), RestoreError> {
+        let src = File::open(path).map_err(io_err)?;
+        let locked = if exclusive {
+            src.try_lock()
+        } else {
+            src.try_lock_shared()
+        };
+        match locked {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => return Err(RestoreError::SourceInUse),
+            Err(TryLockError::Error(e)) => return Err(io_err(e)),
+        }
+        // parse 後に差し替えられた（長さ 0・FIFO 等）復元元を、開いた fd の属性で再確認する。
+        // 長さ 0 のままだと空の DB が「復元」として公開されてしまう。
+        let meta = src.metadata().map_err(io_err)?;
+        if !meta.is_file() || meta.len() == 0 {
+            return Err(RestoreError::InvalidSource);
+        }
+        Ok((src, meta.len()))
+    }
+
+    /// ロック済みの `src`（長さ `src_len`）を一時コピーへ書き、サイズ一致を確かめて fsync する。
+    fn copy_into(src: &mut File, src_len: u64, tmp: &mut TempCopy) -> Result<(), RestoreError> {
+        let copied = std::io::copy(src, &mut tmp.file).map_err(io_err)?;
+        if copied != src_len || src.metadata().map_err(io_err)?.len() != src_len {
+            return Err(RestoreError::SourceChanged);
+        }
+        tmp.file.sync_all().map_err(io_err)
+    }
+
+    /// 一時コピーを開いて検査する。開く直前と検査後に、パスが保持 fd のままであることを確かめる。
+    /// `Storage` は検査後に必ず drop する（排他ロックと redb のクローズ書き込みを終える）。
+    fn open_and_verify(
+        tmp: &TempCopy,
+        len: u64,
+        options: &IntegrityOptions,
+    ) -> Result<IntegrityReport, RestoreError> {
+        tmp.check_path(Some(len))?;
+        let report = {
+            let storage = Storage::open(&tmp.path).map_err(|_| RestoreError::OpenFailed)?;
+            storage
+                .verify_integrity(options)
+                .map_err(|_| RestoreError::VerifyFailed)?
+        };
+        tmp.check_path(None)?;
+        Ok(report)
+    }
+
+    fn parent_of(path: &Path) -> Result<&Path, RestoreError> {
+        path.file_name().ok_or(RestoreError::InvalidDestination)?;
+        let parent: &Path = match path.parent() {
             Some(p) if !p.as_os_str().is_empty() => p,
             _ => Path::new("."),
         };
         match std::fs::metadata(parent) {
-            Ok(m) if m.is_dir() => {}
-            _ => return Err(RestoreError::InvalidDestination),
+            Ok(m) if m.is_dir() => Ok(parent),
+            _ => Err(RestoreError::InvalidDestination),
         }
+    }
+
+    pub(super) fn verify_via_copy(
+        db: &Path,
+        options: &IntegrityOptions,
+    ) -> Result<IntegrityReport, RestoreError> {
+        let parent = parent_of(db)?;
+        // 排他ロックを検査の間保持する（redb と同じ flock。取れなければ稼働中）。
+        let (mut src, src_len) = open_locked_source(db, true)?;
+        let mut tmp = TempCopy::create(parent, "fandhe-verify")?;
+        copy_into(&mut src, src_len, &mut tmp)?;
+        let report = open_and_verify(&tmp, src_len, options)?;
+        drop(src);
+        Ok(report)
+    }
+
+    pub(super) fn restore(from: &Path, dest: &Path) -> Result<RestoreSummary, RestoreError> {
+        let parent = parent_of(dest)?;
         // 早期失敗のための確認。最終判定は後段の hard_link（確認後の競合を残さない）。
         if std::fs::symlink_metadata(dest).is_ok() {
             return Err(RestoreError::InvalidDestination);
@@ -220,42 +371,15 @@ mod unix_impl {
 
         // 1. 復元元は読み取りだけで開き、共有ロックを試みる。稼働中の DB（redb が排他ロックを
         //    保持）なら取れず、書き込み中のファイルをコピーしない。ロックは copy の間保持する。
-        let mut src = File::open(from).map_err(io_err)?;
-        match src.try_lock_shared() {
-            Ok(()) => {}
-            Err(TryLockError::WouldBlock) => return Err(RestoreError::SourceInUse),
-            Err(TryLockError::Error(e)) => return Err(io_err(e)),
-        }
-        // parse 後に差し替えられた（長さ 0・FIFO 等）復元元を、開いた fd の属性で再確認する。
-        // 長さ 0 のままだと空の DB が「復元」として公開されてしまう。
-        let src_meta = src.metadata().map_err(io_err)?;
-        if !src_meta.is_file() || src_meta.len() == 0 {
-            return Err(RestoreError::InvalidSource);
-        }
-        let src_len = src_meta.len();
+        let (mut src, src_len) = open_locked_source(from, false)?;
 
-        // 2. 一時ファイルへ 0600 の排他作成でコピーする。
-        let (mut tmp, tmp_path) = create_temp(parent)?;
-        let mut guard = TempFileGuard {
-            path: tmp_path.clone(),
-            armed: true,
-        };
-        let copied = std::io::copy(&mut src, &mut tmp).map_err(io_err)?;
-        if copied != src_len || src.metadata().map_err(io_err)?.len() != src_len {
-            return Err(RestoreError::SourceChanged);
-        }
-        tmp.sync_all().map_err(io_err)?;
-        drop(tmp);
+        // 2. 一時ファイルへ 0600 の排他作成でコピーする。fd は公開まで保持する。
+        let mut tmp = TempCopy::create(parent, "fandhe-restore")?;
+        copy_into(&mut src, src_len, &mut tmp)?;
         drop(src);
 
-        // 3. コピーを開いて検査する。`Storage` は検査後に必ず drop（排他ロックと redb の
-        //    クリーンクローズ書き込みを公開前に終える）。
-        let report = {
-            let storage = Storage::open(&tmp_path).map_err(|_| RestoreError::OpenFailed)?;
-            storage
-                .verify_integrity(&IntegrityOptions::default())
-                .map_err(|_| RestoreError::VerifyFailed)?
-        };
+        // 3. コピーを開いて検査する（パスの同一性を前後で確認）。
+        let report = open_and_verify(&tmp, src_len, &IntegrityOptions::default())?;
         if !report.is_consistent() {
             return Err(RestoreError::NotConsistent(report));
         }
@@ -264,13 +388,10 @@ mod unix_impl {
         // docs/design/restore-generation.md、実装は #2448）。公開前の一時ファイルへ書く必要がある
         // ため、API ができたらここ（検査の通過後・fsync と公開の前）で呼ぶ。現在は未実装。
 
-        // 4. 公開前に、open・クローズ後の最終内容を fsync し直す。
-        OpenOptions::new()
-            .read(true)
-            .open(&tmp_path)
-            .and_then(|f| f.sync_all())
-            .map_err(io_err)?;
-        match std::fs::hard_link(&tmp_path, dest) {
+        // 4. 公開前に、open・クローズ後の最終内容を fsync し直す（保持 fd で。同一性は確認済み）。
+        tmp.check_path(None)?;
+        tmp.file.sync_all().map_err(io_err)?;
+        match std::fs::hard_link(&tmp.path, dest) {
             Ok(()) => {}
             Err(e) if e.kind() == ErrorKind::AlreadyExists => {
                 return Err(RestoreError::InvalidDestination);
@@ -278,34 +399,18 @@ mod unix_impl {
             Err(e) if e.kind() == ErrorKind::Unsupported => return Err(RestoreError::Unsupported),
             Err(e) => return Err(io_err(e)),
         }
-        // 公開済み。以降の失敗でも最終ファイルは完全なので消さない。
-        guard.armed = false;
-        let finalized = std::fs::remove_file(&tmp_path)
+        // 公開済み。以降の失敗でも最終ファイルは完全なので消さない。ただし公開先が保持 fd と同じ
+        // ファイルであることを確かめ、違えば（確認直前の差し替え）後始末の失敗と同じ扱い（3）にする。
+        tmp.armed = false;
+        let published_ok = std::fs::symlink_metadata(dest)
+            .map(|m| m.is_file() && m.dev() == tmp.dev && m.ino() == tmp.ino)
+            .unwrap_or(false);
+        let finalized = std::fs::remove_file(&tmp.path)
             .and_then(|()| File::open(parent).and_then(|d| d.sync_all()));
-        if finalized.is_err() {
+        if !published_ok || finalized.is_err() {
             return Err(RestoreError::PublishedButNotFinalized);
         }
         Ok(RestoreSummary { report })
-    }
-
-    /// 出力先と同じディレクトリに、所有者のみ読み書きの一時ファイルを排他的に作る。
-    fn create_temp(parent: &Path) -> Result<(File, PathBuf), RestoreError> {
-        let mut attempts = 0u32;
-        loop {
-            let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-            let p = parent.join(format!(".fandhe-restore-{}-{seq}.tmp", std::process::id()));
-            match OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&p)
-            {
-                Ok(f) => return Ok((f, p)),
-                Err(e) if e.kind() == ErrorKind::AlreadyExists && attempts < 8 => attempts += 1,
-                Err(e) => return Err(io_err(e)),
-            }
-        }
     }
 }
 
@@ -344,6 +449,43 @@ mod tests {
         assert!(parse(&v(&["--from", "/", "--db", "x"])).is_err());
     }
 
+    /// 一時コピーのパスが unlink・差し替え・リンク化・長さ不一致のとき `TempReplaced` になる
+    /// （`Storage::open` がパスで開く間の差し替えで空 DB が整合扱いになるのを防ぐ検査）。
+    #[cfg(unix)]
+    #[test]
+    fn temp_copy_detects_unlink_replacement_and_length_mismatch() {
+        use std::io::Write as _;
+        let dir = std::env::temp_dir().join(format!("restore-opt-tempcopy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let is_replaced =
+            |r: Result<(), RestoreError>| matches!(r, Err(RestoreError::TempReplaced));
+
+        // 一致: 作成直後（長さ 0）と、書いた後の長さ
+        let mut t = unix_impl::TempCopy::create(&dir, "fandhe-test").expect("create");
+        assert!(t.check_path(Some(0)).is_ok());
+        t.file.write_all(b"abcd").expect("write");
+        assert!(t.check_path(Some(4)).is_ok());
+        assert!(t.check_path(None).is_ok());
+        // 期待長と違う
+        assert!(is_replaced(t.check_path(Some(5))));
+        // unlink された
+        let path = t.path.clone();
+        std::fs::remove_file(&path).expect("unlink");
+        assert!(is_replaced(t.check_path(None)));
+        // 別 inode の同名ファイル（空 DB を新規作成された状況）
+        std::fs::write(&path, b"abcd").expect("recreate");
+        assert!(is_replaced(t.check_path(None)));
+        // リンクへの差し替え
+        std::fs::remove_file(&path).expect("unlink");
+        let other = dir.join("other");
+        std::fs::write(&other, b"abcd").expect("other");
+        std::os::unix::fs::symlink(&other, &path).expect("symlink");
+        assert!(is_replaced(t.check_path(None)));
+        std::fs::remove_file(&path).expect("unlink link");
+        t.armed = false;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn classify_maps_failures_to_distinct_codes() {
         let r = IntegrityReport::default();
@@ -354,6 +496,7 @@ mod tests {
             EXIT_USAGE
         );
         assert_eq!(classify(&Err(RestoreError::OpenFailed)).0, EXIT_FAILURE);
+        assert_eq!(classify(&Err(RestoreError::TempReplaced)).0, EXIT_FAILURE);
         assert_eq!(classify(&Err(RestoreError::SourceInUse)).0, EXIT_FAILURE);
         assert_eq!(
             classify(&Err(RestoreError::PublishedButNotFinalized)).0,

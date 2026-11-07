@@ -3977,11 +3977,10 @@ fn write_stdout(text: &str) -> std::io::Result<()> {
 
 /// `verify --db <path>` サブコマンド（Issue #2156・RECOVER-13 (6) ポインタ）。引数を検証してから
 /// `--db` を開き、`Storage::verify_integrity` の報告を標準出力へ出す。稼働中のサーバーが DB を
-/// 開いている場合は open が失敗して終了コード 1（fail-closed。`backup` と同じ）。open は
-/// ヘッダを書き換えうる（読み取り専用の open は #3074）。エラー文に
+/// 開いている場合は排他ロックが取れず終了コード 1（fail-closed。`backup` と同じ）。元ファイルへは
+/// 書き込まない（コピーを検査する。コピーを省く読み取り専用の open は #3074）。エラー文に
 /// 行の値・パスの内容・表名は含めない。
 fn run_verify(args: &[String]) -> ExitCode {
-    use engine::storage::Storage;
     use wire_server::{backup_opt, verify_opt};
 
     let parsed = match verify_opt::parse(args) {
@@ -3991,21 +3990,10 @@ fn run_verify(args: &[String]) -> ExitCode {
             return ExitCode::from(backup_opt::EXIT_USAGE);
         }
     };
-    let storage = match Storage::open(&parsed.db) {
-        Ok(s) => s,
-        Err(e) => {
-            if backup_opt::is_already_open(&e) {
-                engine::log_stderr!(
-                    "wire-server: verify: database is in use by another process \
-                     (stop the server first)"
-                );
-            } else {
-                engine::log_stderr!("wire-server: verify: failed to open database");
-            }
-            return ExitCode::from(backup_opt::EXIT_FAILURE);
-        }
-    };
-    match storage.verify_integrity(&parsed.options) {
+    // 元ファイルは開かない（`Storage::open` は旧形式の移行などで書き込むため）。排他ロックを
+    // 保持したまま一時コピーを検査する（`restore_opt::verify_via_copy`）。
+    use wire_server::restore_opt::RestoreError;
+    match wire_server::restore_opt::verify_via_copy(&parsed.db, &parsed.options) {
         Ok(report) => {
             // 出力先の閉鎖（EPIPE 等）で panic させない。書けなければ実行時の失敗（1）。
             if write_stdout(&verify_opt::render(&report)).is_err() {
@@ -4013,9 +4001,37 @@ fn run_verify(args: &[String]) -> ExitCode {
             }
             ExitCode::from(verify_opt::classify(&report))
         }
-        Err(_) => {
-            engine::log_stderr!("wire-server: verify: integrity check could not be started");
-            ExitCode::from(backup_opt::EXIT_FAILURE)
+        Err(e) => {
+            let (code, msg) = match e {
+                RestoreError::SourceInUse => (
+                    backup_opt::EXIT_FAILURE,
+                    "database is in use by another process (stop the server first)",
+                ),
+                RestoreError::InvalidSource => (
+                    backup_opt::EXIT_USAGE,
+                    "--db must be an existing non-empty database file",
+                ),
+                RestoreError::OpenFailed => (backup_opt::EXIT_FAILURE, "failed to open database"),
+                RestoreError::SourceChanged => (
+                    backup_opt::EXIT_FAILURE,
+                    "database file changed while it was being copied",
+                ),
+                RestoreError::TempReplaced => (
+                    backup_opt::EXIT_FAILURE,
+                    "temporary copy was replaced or removed",
+                ),
+                RestoreError::VerifyFailed => (
+                    backup_opt::EXIT_FAILURE,
+                    "integrity check could not be started",
+                ),
+                _ => (
+                    backup_opt::EXIT_FAILURE,
+                    "failed to copy the database for checking (needs free space next to it \
+                     about as large as the database, and a writable directory)",
+                ),
+            };
+            engine::log_stderr!("wire-server: verify: {msg}");
+            ExitCode::from(code)
         }
     }
 }

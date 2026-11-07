@@ -154,7 +154,7 @@ fn verify_consistent_db_exits_zero_and_rejects_running_db() {
     assert_no_leak(&o, &[&db]);
 }
 
-/// 行の復号不能は 4（矛盾）で、種類・表・件数だけが出る（open がヘッダを書き換えうるため、ファイルのバイト列は検証しない。読み取り専用の open は #3074）。
+/// 行の復号不能は 4（矛盾）で、種類・表・件数だけが出る元ファイルは変更しない（コピーを検査する。バイト列の同一性は専用のテストで固定する）。
 #[test]
 fn verify_corrupted_db_exits_with_inconsistent_code() {
     let fx = common::TempFixtureDir::new("verify-cli-corrupt");
@@ -170,6 +170,47 @@ fn verify_corrupted_db_exits_with_inconsistent_code() {
         "stdout: {out}"
     );
     assert_no_leak(&o, &["MARKER-0123456789"]);
+}
+
+/// verify は元ファイルを変更しない（コピーを検査する）。サーバーを強制終了した直後の DB
+/// （open すると redb が修復で書き換える状態）と壊れた DB の両方で、検査前後のバイト列が同一で、
+/// 一時コピーも残らない。旧形式の DB の fixture は wire-server の既存テストに無いため、
+/// 旧形式の移行そのものはここでは再現していない（open を元ファイルに行わないことで担保する）。
+#[test]
+fn verify_never_modifies_the_original_file() {
+    let fx = common::TempFixtureDir::new("verify-cli-readonly");
+    let (_users, db) = populate(&fx);
+    let dir = parent_of(&db).to_path_buf();
+    let before = std::fs::read(&db).expect("read");
+    for args in [
+        vec!["--db", db.as_str()],
+        vec!["--db", db.as_str(), "--memory-budget-bytes", "1"],
+    ] {
+        let o = verify(&args);
+        assert!(
+            matches!(code(&o), Some(0) | Some(5)),
+            "stderr: {}",
+            stderr(&o)
+        );
+        assert_eq!(std::fs::read(&db).expect("read"), before);
+        assert!(leftovers(&dir).is_empty(), "{:?}", leftovers(&dir));
+    }
+
+    let bad = dir.join("bad.redb");
+    write_db_with_undecodable_row(&bad);
+    let bad_before = std::fs::read(&bad).expect("read");
+    let o = verify(&["--db", bad.to_str().expect("utf-8 path")]);
+    assert_eq!(code(&o), Some(4), "stderr: {}", stderr(&o));
+    assert_eq!(std::fs::read(&bad).expect("read"), bad_before);
+    assert!(leftovers(&dir).is_empty(), "{:?}", leftovers(&dir));
+
+    // DB として開けないファイルでも一時コピーは残らず、元ファイルは不変
+    let junk = dir.join("junk.redb");
+    std::fs::write(&junk, b"not a database").expect("write");
+    let o = verify(&["--db", junk.to_str().expect("utf-8 path")]);
+    assert_eq!(code(&o), Some(1), "stderr: {}", stderr(&o));
+    assert_eq!(std::fs::read(&junk).expect("read"), b"not a database");
+    assert!(leftovers(&dir).is_empty(), "{:?}", leftovers(&dir));
 }
 
 /// 検査できない項目だけのとき 5（整合とは報告しない）。
