@@ -4257,6 +4257,16 @@ impl EngineCore {
         self.storage.export_snapshot(dest)
     }
 
+    /// 変更ログの未アーカイブのレコードを外部セグメントへ書き出し、保持設定があれば刈り込む
+    /// （RECOVER-14・Issue #2167）。wire-server のアーカイブ常駐スレッドが周期的に呼ぶ入口で、
+    /// [`Storage::archive_change_log`] へ委譲する。SQL・NoSQL の表層からは呼べない。
+    pub fn archive_change_log(
+        &self,
+        opts: &crate::storage::ArchiveOptions,
+    ) -> std::result::Result<crate::storage::ArchiveReport, crate::storage::ArchiveError> {
+        self.storage.archive_change_log(opts)
+    }
+
     /// 結合ではなくモジュール内テストが登録簿などの内部状態へ届くための入口
     /// （Issue #1129 の同時実行数上限のテスト用。本番ビルドには含めない）。
     #[cfg(test)]

@@ -421,8 +421,13 @@
 //! `--change-log`（Issue #3067・#3069・親 #2166・RECOVER-14 ポインタ）: 値を取らないスイッチ。永続変更ログ
 //! （増分バックアップ・PITR の土台）の opt-in。指定すると engine の `Storage::enable_change_log` で有効に
 //! し、重複指定は起動エラー。一度有効にした DB をフラグなしで起動すると、LSN の欠落を作らないよう固定文言で
-//! 起動エラーにする（fail-closed。`wire_server::change_log_opt`。アーカイブ・保持・PITR は後続の Issue。
-//! `docs/design/change-log-pitr.md` 参照）。
+//! 起動エラーにする（fail-closed。`wire_server::change_log_opt`。`docs/design/change-log-pitr.md` 参照）。
+//!
+//! `--change-log-archive-dir <dir>`・`--change-log-retain-records <n>`・`--change-log-archive-interval-secs <n>`
+//! （Issue #2167・RECOVER-14 ポインタ）: 変更ログのアーカイブ先・保持件数・書き出し周期。`--change-log` が前提で、
+//! 保持・周期はアーカイブ先が前提（欠落・重複・不正値は起動エラー）。保持の既定は刈り込まない。常駐スレッドが
+//! 周期的に書き出し（`wire_server::change_log_archive`）、`change-log-verify` サブコマンドがアーカイブを検査する。
+//! PITR の復元は後続の Issue。
 //!
 //! `--require-where-for-dml`（Issue #2210・SQL-36 ポインタ）: 値を取らないスイッチ。
 //! 指定すると `WHERE` 省略の SQL `UPDATE`／`DELETE` を変更開始前に `42601` で拒否する
@@ -557,6 +562,9 @@ fn main() -> ExitCode {
     if args.get(1).map(String::as_str) == Some("backup") {
         return run_backup(&args[2..]);
     }
+    if args.get(1).map(String::as_str) == Some("change-log-verify") {
+        return run_change_log_verify(&args[2..]);
+    }
     if args.get(1).map(String::as_str) == Some("verify") {
         return run_verify(&args[2..]);
     }
@@ -604,6 +612,9 @@ fn run_server(args: &[String]) -> ExitCode {
     let mut hnsw_scope_raw: Option<String> = None;
     let mut require_operation_id = false;
     let mut change_log = false;
+    let mut change_log_archive_dir: Option<std::path::PathBuf> = None;
+    let mut change_log_retain_records: Option<u64> = None;
+    let mut change_log_interval_secs: Option<u64> = None;
     let mut require_where_for_dml = false;
     let mut max_dml_affected_rows_raw: Option<String> = None;
     let mut max_insert_rows_raw: Option<String> = None;
@@ -2300,12 +2311,89 @@ fn run_server(args: &[String]) -> ExitCode {
                 change_log = true;
                 i += 1;
             }
+            // Issue #2167（RECOVER-14 ポインタ）。アーカイブ先・保持件数・書き出し周期。値の検証と重複指定の
+            // 拒否は `change_log_opt`（エラー文は固定の英語で、値を含めない）。
+            wire_server::change_log_opt::ARCHIVE_DIR_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a value",
+                        wire_server::change_log_opt::ARCHIVE_DIR_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                match wire_server::change_log_opt::accept_archive_dir(
+                    change_log_archive_dir.is_some(),
+                    v,
+                ) {
+                    Ok(p) => change_log_archive_dir = Some(p),
+                    Err(msg) => {
+                        engine::log_stderr!("wire-server: {msg}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+                i += 2;
+            }
+            wire_server::change_log_opt::RETAIN_RECORDS_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a value",
+                        wire_server::change_log_opt::RETAIN_RECORDS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                match wire_server::change_log_opt::accept_retain_records(
+                    change_log_retain_records.is_some(),
+                    v,
+                ) {
+                    Ok(n) => change_log_retain_records = Some(n),
+                    Err(msg) => {
+                        engine::log_stderr!("wire-server: {msg}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+                i += 2;
+            }
+            wire_server::change_log_opt::INTERVAL_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a value",
+                        wire_server::change_log_opt::INTERVAL_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                match wire_server::change_log_opt::accept_interval_secs(
+                    change_log_interval_secs.is_some(),
+                    v,
+                ) {
+                    Ok(n) => change_log_interval_secs = Some(n),
+                    Err(msg) => {
+                        engine::log_stderr!("wire-server: {msg}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+                i += 2;
+            }
             other => {
                 engine::log_stderr!("wire-server: unknown argument: {other}");
                 return ExitCode::FAILURE;
             }
         }
     }
+
+    // Issue #2167: アーカイブ系フラグの組み合わせ（`--change-log` が前提、保持・周期はアーカイブ先が前提）を
+    // DB を開く前に検査する（fail-closed）。
+    let change_log_archive = match wire_server::change_log_opt::resolve(
+        change_log,
+        change_log_archive_dir,
+        change_log_retain_records,
+        change_log_interval_secs,
+    ) {
+        Ok(a) => a,
+        Err(msg) => {
+            engine::log_stderr!("wire-server: {msg}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     // TASK-117（PLAN-9）: `--planner-endpoint`／`--planner-model` は両方揃って
     // 初めて `OllamaClient` を構築できる契約（片方のみは操作ミスの検出漏れを防ぐ
@@ -3513,6 +3601,15 @@ fn run_server(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    // Issue #2167: 変更ログのアーカイブ常駐スレッド（`--change-log-archive-dir` 指定時だけ）。起動直後に
+    // 1 回、以降は周期的に engine の `archive_change_log` を呼ぶ。スレッドを作れなければ起動を拒否する。
+    if let Some(settings) = change_log_archive.as_ref() {
+        if wire_server::change_log_archive::spawn(Arc::clone(&core), settings).is_err() {
+            engine::log_stderr!("wire-server: failed to start the change log archive thread");
+            return ExitCode::FAILURE;
+        }
+    }
+
     // 実際に bind されたアドレスを出す（`--bind 127.0.0.1:0` の ephemeral port
     // 割り当て結果を E2E テストハーネスがこの行から取得する前提。TASK-73）。
     match listener.local_addr() {
@@ -4126,6 +4223,64 @@ fn run_restore(args: &[String]) -> ExitCode {
         _ => {
             engine::log_stderr!("wire-server: restore: {msg}");
             ExitCode::from(code)
+        }
+    }
+}
+
+/// `change-log-verify --archive-dir <dir> [--db <path>]` サブコマンド（Issue #2167・RECOVER-14 ポインタ）。
+/// アーカイブ先のセグメントを検証し、欠落（LSN の飛び・先頭や末尾の紛失）・チェックサム不一致・別 DB／別
+/// timeline を非 0 終了で知らせる。`--db` を付けると停止中の DB のメタ情報（DB 識別子・timeline・有効化時の
+/// 世代・水位）と突き合わせ、付けなければディレクトリ内の整合だけを検査する。アーカイブ先のファイルも
+/// DB も変更しない（`--db` は engine の読み取り専用 open〔`ReadOnlyStorage`〕で開く。書き込みを要する状態の
+/// DB は拒否し、コピーでの検査を案内する）。結果は運用者向けの標準出力（パス・テナント情報を含まない）。
+fn run_change_log_verify(args: &[String]) -> ExitCode {
+    use wire_server::change_log_opt;
+
+    let parsed = match change_log_opt::parse_verify(args) {
+        Ok(p) => p,
+        Err(msg) => {
+            engine::log_stderr!("wire-server: change-log-verify: {msg}");
+            return ExitCode::from(change_log_opt::EXIT_VERIFY_USAGE);
+        }
+    };
+    let result = match &parsed.db {
+        Some(db) => match engine::storage::ReadOnlyStorage::open(db) {
+            Ok(ro) => ro.verify_change_log_archive(&parsed.dir),
+            Err(e) => {
+                let msg = match e {
+                    engine::storage::ReadOnlyOpenError::InUse => {
+                        "database is in use by another process (stop the server first)"
+                    }
+                    engine::storage::ReadOnlyOpenError::NeedsWrite => {
+                        "database needs repair or upgrade before it can be opened read-only \
+                         (verify a copy, or start the server once)"
+                    }
+                    _ => "failed to open database",
+                };
+                engine::log_stderr!("wire-server: change-log-verify: {msg}");
+                return ExitCode::from(change_log_opt::EXIT_VERIFY_FAILED);
+            }
+        },
+        None => engine::storage::verify_archive_dir(
+            &parsed.dir,
+            &engine::storage::ArchiveExpectation::default(),
+        ),
+    };
+    match result {
+        Ok(s) => {
+            let range = match (s.first_lsn, s.last_lsn) {
+                (Some(a), Some(b)) => format!("{a}..{b}"),
+                _ => "none".to_string(),
+            };
+            println!(
+                "change log archive ok: segments={} records={} lsn={range}",
+                s.segments, s.records
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            engine::log_stderr!("wire-server: change-log-verify: {e}");
+            ExitCode::from(change_log_opt::EXIT_VERIFY_FAILED)
         }
     }
 }
