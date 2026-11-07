@@ -4271,6 +4271,36 @@ impl EngineCore {
         self.storage.export_schema_ddl(scope, sink)
     }
 
+    /// 稼働中の永続ストレージの表データ（行）を COPY／INSERT 形式で書き出す（RECOVER-16・Issue #2161）。
+    /// 運用者の CLI（#2162）から呼ぶ入口で、[`Storage::export_table_data`] へそのまま委譲する
+    /// （読み取りスナップショット上で行を順に走査し、書き込みを止めない。SQL・NoSQL の表層からは呼べない）。
+    pub fn export_table_data<E>(
+        &self,
+        scope: &crate::catalog::ddl_export::SchemaDdlScope,
+        format: crate::catalog::ddl_export::TableDataFormat,
+        sink: impl FnMut(&crate::catalog::ddl_export::TableDataItem<'_>) -> std::result::Result<(), E>,
+    ) -> std::result::Result<
+        crate::catalog::ddl_export::TableDataSummary,
+        crate::catalog::ddl_export::SchemaDdlError<E>,
+    > {
+        self.storage.export_table_data(scope, format, sink)
+    }
+
+    /// スキーマ（`PreData`）・表データ・スキーマ（`PostData`）を単一の読み取りスナップショットから
+    /// この順に書き出す（RECOVER-16・Issue #2161）。[`Storage::export_logical_dump`] へそのまま委譲する
+    /// （定義とデータが同じ commit 点に対応する。SQL・NoSQL の表層からは呼べない）。
+    pub fn export_logical_dump<E>(
+        &self,
+        scope: &crate::catalog::ddl_export::SchemaDdlScope,
+        format: crate::catalog::ddl_export::TableDataFormat,
+        sink: impl FnMut(&crate::catalog::ddl_export::LogicalDumpItem<'_>) -> std::result::Result<(), E>,
+    ) -> std::result::Result<
+        crate::catalog::ddl_export::LogicalDumpSummary,
+        crate::catalog::ddl_export::SchemaDdlError<E>,
+    > {
+        self.storage.export_logical_dump(scope, format, sink)
+    }
+
     /// 変更ログの未アーカイブのレコードを外部セグメントへ書き出し、保持設定があれば刈り込む
     /// （RECOVER-14・Issue #2167）。wire-server のアーカイブ常駐スレッドが周期的に呼ぶ入口で、
     /// [`Storage::archive_change_log`] へ委譲する。SQL・NoSQL の表層からは呼べない。
