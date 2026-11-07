@@ -1,8 +1,8 @@
 # 論理ダンプのスキーマ側（DDL の書き出し）
 
-- ステータス: 実装済み（Issue #2160）。データの書き出し（#2161）・CLI（#2162）・往復試験（#2163）は後続
+- ステータス: スキーマ側は実装済み（Issue #2160）、表データ側は実装済み（Issue #2161。本書 §11）。CLI（#2162）・往復試験（#2163）は後続
 - 対応: Issue #2160（親 #2159）。関連ビヘイビア: RECOVER-16 (1)。ポインタ: `docs/spec/04-behavior/recovery.md`。本文は転記しない（[spec-confidentiality](../../.claude/rules/spec-confidentiality.md)）
-- 関連コード: `crates/engine/src/catalog/ddl_export.rs` と配下（`quote.rs`・`table.rs`・`object.rs`・`access.rs`）、入口は `Storage::export_schema_ddl`・`EngineCore::export_schema_ddl`
+- 関連コード: `crates/engine/src/catalog/ddl_export.rs` と配下（`quote.rs`・`table.rs`・`object.rs`・`access.rs`・`data.rs`）、入口は `Storage::export_schema_ddl`・`EngineCore::export_schema_ddl`、表データは `export_table_data`、両者を単一スナップショットで出すのは `export_logical_dump`
 - 関連 doc: [backup-snapshot.md](backup-snapshot.md)（一貫性の取得点の方式）
 
 ## 1. 役割と API
@@ -105,3 +105,87 @@ DDL へ戻す手段が無い種別・属性があれば `Unsupported` でダン�
 - 権限（GRANT・所有者・既定権限・メンバーシップ）の書き出し: 復元を現在ロールを束縛した主体で実行する設計（#2162・#2163）と、`GRANTED BY` 相当の構文の追加が前提
 - 外部キー: 現行の SQL 表層は採番方式の表への外部キーを受理しない（`0A000`）ため、書き出し側は文の組み立てを単体試験で確かめるにとどまり、SQL 経由の往復は未検証
 - マテリアライズド VIEW、SCHEMA 配下の単独 SEQUENCE と現在値
+
+## 11. 表データの書き出し（Issue #2161）
+
+RECOVER-16 (1)(2)(3) のデータ側（ポインタ: `docs/spec/04-behavior/recovery.md`）。値のテキスト表現は WIRE-13 に揃える。本節は実装判断の記録で、spec 本文は転記しない。
+
+### 11.1 API
+
+```rust
+Storage::export_table_data<E>(
+    &self,
+    scope: &SchemaDdlScope,
+    format: TableDataFormat,            // Copy | Insert
+    sink: impl FnMut(&TableDataItem<'_>) -> Result<(), E>,
+) -> Result<TableDataSummary, SchemaDdlError<E>>
+
+Storage::export_logical_dump<E>(scope, format, sink: impl FnMut(&LogicalDumpItem<'_>) -> ...)
+```
+
+- スコープ・`Summary`・`Error<E>`（`SchemaDdlError` を共用）は §1 と同じ形。`TableDataItem { tenant, part, text }` は 1 断片で、`part` は `CopyHeader`（`COPY <表> (<列>, ...) FROM STDIN`）・`CopyRow`（エスケープ済みの 1 行）・`CopyEnd`（`\.`）・`Insert`（1 文）。`text` に `;` と改行は含まない（書き手が足す）。`Debug` は本文を伏せる
+- `export_logical_dump` は `PreData` → データ → `PostData` を読み取り Tx 1 本の上で渡す（`LogicalDumpItem::{Schema, Data}`）。`export_schema_ddl` と `export_table_data` を別々に呼ぶと取得点が 2 つになり、その間の commit で定義とデータが食い違いうるため、CLI（#2162）は `export_logical_dump` を使う
+- 全テナントのダンプは §3 と同様、`shared_only`（行は出ない）に続けてテナントごとに `tenant_only` で呼ぶ。`tenant_only` でも共有の表の「自テナントの行」は出る（行はすべてテナント所有で、共有なのは定義だけのため）
+
+### 11.2 走査とストリーミング
+
+- 行ストア `user_rows/<表>` の物理キーは `(tenant_id, id)` で、指定テナントの行は 1 本の連続範囲になる。この範囲だけを redb のカーソルで読み、他テナントの行は読み出しもしない（構造的な絞り込み）。範囲内でも復号した行のテナントがキーと食い違えば失敗する
+- 1 行を復号し、使い回す 1 本のバッファへ描画してシンクへ渡す。表全体・結果集合をためない（メモリは 1 行ぶんで、表の大きさに比例しない）。行数の上限は設けない（COPY TO 用の `--max-result-rows` の上限は通らない）
+- 表の順は DDL 側と同じ `(SCHEMA 名, 名前)`。行は物理キー昇順（挿入順）。外部キー・索引は `PostData` なので表の順を依存順にする必要はない
+- 行を 1 件も持たない表は何も出さない（COPY のヘッダも出さない）
+
+### 11.3 形式（COPY と INSERT の使い分け）
+
+- 既定は `Copy`（text 形式）。COPY が受理しない列型（`HALFVEC`・`INT8VEC`・`SPARSEVEC`）を持つ表だけ、その表を `INSERT` で出す（省かず、形式だけ落とす）
+- `Insert` は 1 行 1 文。`GENERATED ALWAYS AS IDENTITY` の列を持つ表は、`INSERT` が `OVERRIDING` を受理せず明示値を書けないため `Unsupported`（COPY は明示値で書ける）
+- COPY text のエスケープは本リポの COPY 復号器が受理する集合に限る（`\\`・タブ・LF・CR・`\b`・`\f`・`\v`）。NULL は `\N`。値が文字どおり `\N` の文字列は `\\N` になり NULL と混同しない。復号器が受理しない 8 進・16 進エスケープは使わない
+- `INSERT` のリテラルは、整数・浮動小数・NUMERIC が裸、真偽値が `TRUE`／`FALSE`、NULL が `NULL`、それ以外は `'...'`（`'` を二重化。§5 と同じ `push_literal`）。本リポの `INSERT` は数値列に文字列を受理しない
+- 識別子は §5 の `Namer`／`push_ident` を共用する。SCHEMA 配下の表は `schema.name` で書く
+
+### 11.4 値の表現（WIRE-13 に揃える）
+
+| 型 | 表現 |
+| -- | ---- |
+| ベクトル | `[1.5,-2,0.25]`（`f32` の最短表現）。`HALFVEC` は `f32` へ広げて同形、`INT8VEC` は整数、`SPARSEVEC` は `{idx:val,...}/N` |
+| 配列 | `ArrayValue::to_pg_text`（`{a,"b c",NULL}`。引用・NULL 要素・多次元は同所の規則） |
+| JSON／JSONB | 保存済みテキストをそのまま出す（再整形しない） |
+| 浮動小数 | `format_real`／`format_double`（`REAL` は `f32` の最短表現で往復する） |
+| 日付時刻 | `format_date`／`format_timestamp`／`format_time`／`format_interval`。`TIMESTAMPTZ` はセッションの TimeZone に依存させず UTC の壁時計と `+00` で出す（読み戻しは offset を解釈するので復元先のセッション設定に依存しない） |
+| BYTEA | `\x` ＋小文字 16 進。COPY ではバックスラッシュが `\\x...` に二重化される |
+| BIT・UUID・NUMERIC・ENUM | 既存の `format_text`／`Display`／ラベル文字列 |
+
+- `NUL` 文字を含む値は COPY・文字列リテラルのどちらでも運べないため `Unsupported`
+- `VECTOR` 列は行の embedding から取り、空は NULL（nullable な VECTOR 列の NULL の保存形）。`ALTER TABLE ADD COLUMN` 前に書いた行の欠落列は、行 codec の読み出し時補完と同じ値で出る
+- 値の描画は `Value` の網羅 `match` で、ワイルドカード腕を置かない。型が増えるとコンパイルエラーで対応漏れを検出する
+
+### 11.5 暗号化列の扱い（設計判断）
+
+RECOVER-16 に暗号化列の定めは無く、現行の列型にも暗号化列は存在しない（`ColumnType` に該当 variant が無い）。判断は次のとおり。
+
+- 現時点で書き出し対象の暗号化列は無いので、特別な出力経路は作らない
+- 将来、暗号化列の型が足された場合は、`value_text` の網羅 `match` がコンパイルエラーで対応を迫る。その時点では **平文を出さない**（既定は `Unsupported` でダンプ全体を失敗させる）。暗号文をそのまま運ぶ場合も、復元先で同じ鍵で読める保証が要るため、鍵管理を含む設計を別途決めてから足す
+- 理由: ダンプは平文のファイルとして残るため、暗号化の意図を黙って外す（fail-open）より、書き出せないと明示して止める方が安全
+
+### 11.6 失敗させるもの（fail-closed）
+
+| 対象 | 理由 |
+| ---- | ---- |
+| 暗黙 `id` の表（旧方式・移行済み方式） | DDL 側と同じ。SQL で再作成できない表の行だけを出さない |
+| 可視性が `Private` 以外の行 | SQL の `INSERT`／`COPY` が書く行は常に `Private`。再投入で可視性を黙って変えない（SQL だけで作った表では起きない） |
+| `GENERATED ALWAYS` 列を持つ表（`Insert` 形式のみ） | `INSERT` が明示値を書けない |
+| `NUL` を含む値 | 運べない |
+| 行の復号失敗・キーとテナントの不一致 | 破損として全体を失敗させる（`Catalog`） |
+
+`Unsupported` の文言は固定文字列で、表名・テナント名・行の内容を含まない。
+
+### 11.7 運用上の制約（#2162・#2163 への申し送り）
+
+- 復元側は、断片の `tenant` の文脈で実行する（行の帰属を保って戻すため）。`COPY ... FROM STDIN` は `OPERATION_ID` が要る構成（`Ledgered`）では付けて実行するか、台帳なしの構成で復元する（台帳は論理ダンプに含めない）
+- `COPY` のデータ行は NULL・タブ・改行を含むため、CLI は `CopyHeader` から `CopyEnd` までを 1 つの COPY として書き、行を再分割・再整形しない
+- 採番列（`SERIAL`・`IDENTITY`）の値は表データの明示値で戻り、次回の採番値は `PostData` の `setval` が戻す（§6）。SCHEMA 配下の SEQUENCE の現在値は §4 のとおり書き出せず、そのスキーマ配下に現在値を持つ表があるとダンプ全体が失敗する
+
+### 11.8 残課題
+
+- 一括 `INSERT`（複数行 `VALUES`）形式、COPY の CSV／バイナリ形式
+- 可視性が `Public` の行を持つ表（SQL 経由では作れない）の扱い
+- テナント一覧の取得 API（全テナントのダンプを CLI が組み立てるときに行を持つテナントを列挙する手段。現状は呼び出し側がテナントを知っている前提）
