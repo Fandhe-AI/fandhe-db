@@ -585,16 +585,18 @@ fn unarchived_rows_are_never_pruned() {
     let mut opts = f.opts();
     opts.retain_records = Some(0);
     // 水位を途中（base + 3）までしか進めない保守 commit。以降は未アーカイブで、保持 0 でも消えない。
-    let step = maintenance_commit(f.storage(), base, base + 3, &opts).expect("maintenance");
+    let step =
+        maintenance_commit(f.storage(), base, base + 3, &opts, u64::MAX).expect("maintenance");
     assert!(matches!(step, Step::Done { pruned: 3 }));
     assert_eq!(f.row_lsns(), (base + 4..=generation).collect::<Vec<_>>());
     // 水位を超えて消すことは構造的にできない: 続けて刈り込みだけを実行しても何も消えない。
-    let again = maintenance_commit(f.storage(), base + 3, base + 3, &opts).expect("again");
+    let again =
+        maintenance_commit(f.storage(), base + 3, base + 3, &opts, u64::MAX).expect("again");
     assert!(matches!(again, Step::Done { pruned: 0 }));
     assert_eq!(f.row_lsns().len() as u64, generation - base - 3);
     // 古い水位を渡した（並行した別の更新を見ていない）保守 commit は拒否する。
     assert!(matches!(
-        maintenance_commit(f.storage(), base, base + 1, &opts),
+        maintenance_commit(f.storage(), base, base + 1, &opts, u64::MAX),
         Err(ArchiveError::WatermarkMoved)
     ));
     // アーカイブ先が使えない間は何も消えない。
@@ -612,17 +614,21 @@ fn prune_is_bounded_per_maintenance_commit() {
     f.populate(9);
     let generation = f.generation();
     let base = f.watermark();
+    // 刈り込みの覆いのためにセグメントを先に書き出し、水位だけを戻して保守 commit を直接呼ぶ。
+    f.storage().archive_change_log(&f.opts()).expect("archive");
+    set_watermark(f.storage(), base);
     let mut opts = f.opts();
     opts.retain_records = Some(0);
     opts.max_prune_records = 3;
-    let step = maintenance_commit(f.storage(), base, generation, &opts).expect("m1");
+    let step = maintenance_commit(f.storage(), base, generation, &opts, u64::MAX).expect("m1");
     assert!(
         matches!(step, Step::Done { pruned: 3 }),
         "bounded by records"
     );
     opts.max_prune_records = 1000;
     opts.max_prune_bytes = 1;
-    let step = maintenance_commit(f.storage(), generation, generation, &opts).expect("m2");
+    let step =
+        maintenance_commit(f.storage(), generation, generation, &opts, u64::MAX).expect("m2");
     assert!(matches!(step, Step::Done { pruned: 1 }), "bounded by bytes");
     // 全体の呼び出しは残りを引き継いで完了する。
     opts.max_prune_bytes = DEFAULT_PRUNE_BYTES;
@@ -910,4 +916,110 @@ fn a_racing_non_regular_file_is_a_conflict_and_is_never_read() {
     assert!(existing_equals(&path, b"abc").expect("eq"));
     assert!(!existing_equals(&path, b"abd").expect("ne"));
     assert!(!existing_equals(&path, b"ab").expect("len"));
+}
+
+#[test]
+fn many_stale_temp_files_of_the_same_pid_do_not_block_publishing() {
+    let f = Fixture::new("arc-tmp");
+    f.populate(1);
+    // 旧形式の名前（PID と通番だけ）の残骸が多数ある。
+    for seq in 0..200 {
+        let name = format!("{TMP_PREFIX}{}-{seq}.tmp", std::process::id());
+        std::fs::write(f.archive.path().join(name), b"stale").expect("stale");
+    }
+    let r = f.storage().archive_change_log(&f.opts()).expect("archive");
+    assert_eq!(r.segments_written, 1);
+    assert!(f
+        .storage()
+        .verify_change_log_archive(f.archive.path())
+        .is_ok());
+}
+
+#[test]
+fn adopting_a_segment_syncs_before_the_watermark_moves() {
+    // 採用経路は fsync に成功してから水位を進める。ファイルが読めなくなっていれば水位は進まない。
+    let f = Fixture::new("arc-adopt-sync");
+    f.populate(2);
+    let base = f.watermark();
+    f.storage().archive_change_log(&f.opts()).expect("archive");
+    set_watermark(f.storage(), base);
+    let file = f.segment_files().pop().expect("segment");
+    let dir = f.archive.path();
+    assert!(sync_adopted(dir, &file).is_ok());
+    assert!(sync_adopted(dir, &dir.join("missing.seg")).is_err());
+    let r = f.storage().archive_change_log(&f.opts()).expect("adopt");
+    assert_eq!(r.segments_adopted, 1);
+}
+
+#[test]
+fn pruning_is_refused_when_the_archive_does_not_cover_the_range() {
+    let f = Fixture::new("arc-nocover");
+    f.populate(4);
+    // 保持なしで書き出した後、アーカイブ先が空のディレクトリに置き換わった。
+    f.storage().archive_change_log(&f.opts()).expect("archive");
+    let rows = f.row_lsns();
+    let empty = TempDir::new("arc-nocover-empty");
+    let mut opts = ArchiveOptions::new(empty.path());
+    opts.retain_records = Some(0);
+    assert!(matches!(
+        f.storage().archive_change_log(&opts),
+        Err(ArchiveError::ArchiveIncomplete)
+    ));
+    assert_eq!(f.row_lsns(), rows, "nothing is deleted");
+    // 覆いがあっても壊れていれば刈り込まない。
+    opts = f.opts();
+    opts.retain_records = Some(0);
+    let file = f.segment_files().pop().expect("segment");
+    let original = std::fs::read(&file).expect("read");
+    flip_byte(&file, CHECKSUM_LEN + 3);
+    assert!(f.storage().archive_change_log(&opts).is_err());
+    assert_eq!(f.row_lsns(), rows);
+    std::fs::write(&file, original).expect("restore");
+    let r = f.storage().archive_change_log(&opts).expect("covered");
+    assert_eq!(r.pruned_records, rows.len() as u64);
+    assert!(f.row_lsns().is_empty());
+}
+
+#[test]
+fn pruning_needs_contiguous_segments_over_the_whole_range() {
+    let f = Fixture::new("arc-hole");
+    f.populate(5);
+    let mut opts = f.opts();
+    opts.segment_bytes = 1;
+    f.storage().archive_change_log(&opts).expect("archive");
+    let rows = f.row_lsns();
+    let files = f.segment_files();
+    std::fs::remove_file(files.get(2).expect("segment")).expect("rm");
+    opts.retain_records = Some(0);
+    assert!(matches!(
+        f.storage().archive_change_log(&opts),
+        Err(ArchiveError::ArchiveIncomplete)
+    ));
+    assert_eq!(f.row_lsns(), rows);
+}
+
+#[test]
+fn concurrent_archive_calls_never_leave_overlapping_segments() {
+    let f = Fixture::new("arc-concurrent");
+    f.populate(12);
+    let storage = f.storage();
+    std::thread::scope(|scope| {
+        for bytes in [1usize, 1_000, 1_000_000, usize::MAX, 1, 2_000] {
+            let opts = {
+                let mut o = f.opts();
+                o.segment_bytes = bytes;
+                o
+            };
+            scope.spawn(move || {
+                for _ in 0..3 {
+                    storage.archive_change_log(&opts).expect("archive");
+                }
+            });
+        }
+    });
+    let s = storage
+        .verify_change_log_archive(f.archive.path())
+        .expect("chain has no gap or overlap");
+    assert_eq!(s.records, f.generation());
+    assert_eq!(f.watermark(), f.generation());
 }

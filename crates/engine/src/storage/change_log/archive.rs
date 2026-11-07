@@ -100,6 +100,8 @@ pub enum ArchiveError {
     /// `change_log` 表の側に欠落や破損がある（水位の次のレコードが無い、レコードのチェックサム不一致等）。
     /// アーカイブを進めず止める。
     LogCorrupt,
+    /// 刈り込む範囲を覆う検証済みのセグメントが現在のアーカイブ先に無い（fail-closed で刈り込まない）。
+    ArchiveIncomplete,
     /// 同名のセグメントが既に在り、表のレコードと一致しない（黙って置換しない）。
     Conflict,
     /// 水位が呼び出し中に別の経路で動いた（並行するアーカイブ）。次の呼び出しで再試行する。
@@ -123,6 +125,7 @@ impl std::fmt::Display for ArchiveError {
             Self::ForeignDatabase => "archive segment belongs to another database",
             Self::ForeignTimeline => "archive segment belongs to another timeline",
             Self::LogCorrupt => "change log table is inconsistent with the archive position",
+            Self::ArchiveIncomplete => "archive does not cover the records to prune",
             Self::Conflict => "an archive segment with the same name differs from the log",
             Self::WatermarkMoved => "archive position changed concurrently",
             Self::Storage(_) => "storage error during archive",
@@ -685,15 +688,29 @@ fn check_dir(dir: &Path) -> Result<()> {
 /// 戻り値が `Ok(true)` なら新規に公開し、`Ok(false)` なら競合で既に在った（呼び出し側が内容を照合する）。
 #[cfg(unix)]
 fn publish(dir: &Path, final_path: &Path, bytes: &[u8]) -> Result<bool> {
+    use std::hash::{BuildHasher, Hasher};
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     use std::sync::atomic::{AtomicU64, Ordering};
     static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
+    // 一時名は再起動をまたいでも衝突しにくいよう、プロセスごとにランダムな鍵を持つ `RandomState` と時刻の
+    // ナノ秒、通番を混ぜる（同じ PID の残骸が多数あっても進める。PID 1 のコンテナ等）。試行は残骸の数に
+    // 依らず新しい名前で行い、上限は異常な環境で無限に回らないための安全弁。
     let mut attempts = 0u32;
     let (mut file, tmp) = loop {
         let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-        let p = dir.join(format!("{TMP_PREFIX}{}-{seq}.tmp", std::process::id()));
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u128(nanos);
+        h.write_u64(seq);
+        let nonce = h.finish();
+        let p = dir.join(format!(
+            "{TMP_PREFIX}{}-{nonce:016x}-{seq}.tmp",
+            std::process::id()
+        ));
         match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -701,7 +718,7 @@ fn publish(dir: &Path, final_path: &Path, bytes: &[u8]) -> Result<bool> {
             .open(&p)
         {
             Ok(f) => break (f, p),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempts < 8 => {
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempts < 64 => {
                 attempts += 1;
             }
             Err(e) => return Err(e.into()),
@@ -736,6 +753,14 @@ fn publish(_dir: &Path, _final_path: &Path, _bytes: &[u8]) -> Result<bool> {
     Err(ArchiveError::Unsupported)
 }
 
+/// 採用するセグメントとその親ディレクトリの永続化を確認する。公開の直後に失敗した周期の次の周期は
+/// 採用経路を通るため、水位を進める前に（刈り込みで DB のログを消す前に）必ず fsync を成功させる。
+fn sync_adopted(dir: &Path, path: &Path) -> Result<()> {
+    std::fs::File::open(path)?.sync_all()?;
+    std::fs::File::open(dir)?.sync_all()?;
+    Ok(())
+}
+
 /// 競合で先に在った同名ファイルの中身が `bytes` と同一か。通常ファイルで長さが一致するときだけ
 /// 読む（FIFO・デバイス・巨大ファイルを読まない。読み取りも `bytes` の長さ + 1 で打ち切る）。
 fn existing_equals(path: &Path, bytes: &[u8]) -> Result<bool> {
@@ -760,7 +785,7 @@ enum Plan {
         bytes: Vec<u8>,
     },
     /// 同じ先頭 LSN の検証済みセグメントが既に在り、表のレコードと一致した（書き直さない）。
-    Adopt { last_lsn: u64 },
+    Adopt { last_lsn: u64, path: PathBuf },
 }
 
 fn read_meta_u64(read: &redb::ReadTransaction, key: &str) -> Result<Option<u64>> {
@@ -854,6 +879,7 @@ fn plan_next(
         return if matches {
             Ok(Plan::Adopt {
                 last_lsn: h.last_lsn,
+                path,
             })
         } else {
             Err(ArchiveError::Conflict)
@@ -891,12 +917,14 @@ enum Step {
 
 /// 水位を `new_w` へ進め（`expect_w` から変わっていなければ）、保持設定があれば水位以下を上限つきで
 /// 刈り込む保守 commit。世代を進めずレコードも生まない（D6）。通常の書き込みが待機している間は
-/// ゲートを譲り、見送ったら [`Step::Skipped`]。
+/// ゲートを譲り、見送ったら [`Step::Skipped`]。`prune_cap` は刈り込める LSN の上限（[`prune_cap_for`] が
+/// アーカイブ先を検証して求める。0 は刈り込まない）。
 fn maintenance_commit(
     storage: &Storage,
     expect_w: u64,
     new_w: u64,
     opts: &ArchiveOptions,
+    prune_cap: u64,
 ) -> Result<Step> {
     let Some(txn) = storage.begin_maintenance_txn()? else {
         return Ok(Step::Skipped);
@@ -928,7 +956,8 @@ fn maintenance_commit(
         }
         if let Some(retain) = opts.retain_records {
             // 削除は水位以下に構造的に限る（水位より後は未アーカイブで、決して消さない）。
-            let upto = new_w.saturating_sub(retain);
+            // さらに、現在のアーカイブ先で覆いを確認できた範囲（`prune_cap`）を超えて消さない。
+            let upto = new_w.saturating_sub(retain).min(prune_cap);
             #[allow(clippy::disallowed_methods)]
             let mut log = txn.open_table(CHANGE_LOG_TABLE)?;
             let mut bytes = 0usize;
@@ -955,6 +984,60 @@ fn maintenance_commit(
     Ok(Step::Done { pruned: deleted })
 }
 
+/// 刈り込みで消してよい LSN の上限を求める。アーカイブ済み水位は DB 全体の値で、アーカイブ先が差し替わる・
+/// 欠けることがあるため、今回の保守 commit で消す範囲（先頭の行から最大 `max_prune_records` 件、かつ
+/// `new_w - retain` 以下）を、現在のアーカイブ先の**検証済みのセグメントが連続して覆う**ことを確認する。
+/// 覆えない場合は `ArchiveIncomplete`（呼び出し側は水位の更新だけ行い、刈り込まない）。検証の範囲は
+/// 消す範囲に掛かるセグメントだけで、費用は消すバイト数（上限つき）に比例する。保持なし・消す行なしは 0。
+fn prune_cap_for(
+    storage: &Storage,
+    state: &ChangeLogState,
+    opts: &ArchiveOptions,
+    new_w: u64,
+) -> Result<u64> {
+    let Some(retain) = opts.retain_records else {
+        return Ok(0);
+    };
+    let upto = new_w.saturating_sub(retain);
+    let lo = {
+        let read = storage.db.begin_read()?;
+        match read.open_table(CHANGE_LOG_TABLE) {
+            Ok(t) => t.first()?.map(|(k, _)| k.value()),
+            Err(redb::TableError::TableDoesNotExist(_)) => None,
+            Err(e) => return Err(e.into()),
+        }
+    };
+    let Some(lo) = lo else { return Ok(0) };
+    let span = u64::try_from(opts.max_prune_records).unwrap_or(u64::MAX);
+    let hi = upto.min(lo.saturating_add(span.saturating_sub(1)));
+    if lo > hi {
+        return Ok(0);
+    }
+    let mut need = lo;
+    for (path, name) in list_segments(&opts.dir)? {
+        if name.db_id != state.db_id || name.timeline != state.timeline || name.last_lsn < need {
+            continue;
+        }
+        if name.first_lsn > need {
+            break;
+        }
+        let info = verify_segment_file(&path, state.limits.max_payload_bytes)?;
+        let h = info.header;
+        if h.db_id != name.db_id
+            || h.timeline != name.timeline
+            || h.first_lsn != name.first_lsn
+            || h.last_lsn != name.last_lsn
+        {
+            return Err(ArchiveError::BadFormat);
+        }
+        if h.last_lsn >= hi {
+            return Ok(hi);
+        }
+        need = h.last_lsn.checked_add(1).ok_or(ArchiveError::LsnGap)?;
+    }
+    Err(ArchiveError::ArchiveIncomplete)
+}
+
 /// [`Storage::archive_change_log`] の本体。未アーカイブのレコードをセグメントへ書き出して水位を進め
 /// （上限つきで複数セグメント）、保持設定があれば水位以下を刈り込む。
 pub(in crate::storage) fn run_cycle(
@@ -966,13 +1049,25 @@ pub(in crate::storage) fn run_cycle(
         return Err(ArchiveError::InvalidOptions);
     }
     check_dir(&opts.dir)?;
+    // 計画から公開・水位更新までを直列化する。同じ水位から別々の末尾のセグメントを計画する並行呼び出し
+    // （上限設定の違い・読み取りの間の利用者 commit）が、重複区間を残さないようにする。別プロセスからの
+    // 並行は、redb が DB ファイルを単一プロセスで排他的に開くため起きない（同じ DB を 2 プロセスで開けない）。
+    let _cycle = state
+        .archive_lock
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut report = ArchiveReport::default();
+    let mut prune_error: Option<ArchiveError> = None;
     for _ in 0..MAX_SEGMENTS_PER_CYCLE {
         let w = watermark(&storage.db.begin_read()?)?;
         report.archived_through = w;
         let (last_lsn, adopted) = match plan_next(storage, &state, opts, w)? {
             Plan::Nothing => break,
-            Plan::Adopt { last_lsn } => (last_lsn, true),
+            Plan::Adopt { last_lsn, path } => {
+                sync_adopted(&opts.dir, &path)?;
+                (last_lsn, true)
+            }
             Plan::Write { header, bytes } => {
                 let name = segment_name(
                     &header.db_id,
@@ -986,13 +1081,22 @@ pub(in crate::storage) fn run_cycle(
                     if !existing_equals(&path, &bytes)? {
                         return Err(ArchiveError::Conflict);
                     }
+                    sync_adopted(&opts.dir, &path)?;
                     (header.last_lsn, true)
                 } else {
                     (header.last_lsn, false)
                 }
             }
         };
-        match maintenance_commit(storage, w, last_lsn, opts)? {
+        // 刈り込みの覆いを確認できなければ、水位の更新だけ行って刈り込まず、周期の最後にエラーを返す。
+        let cap = match prune_cap_for(storage, &state, opts, last_lsn) {
+            Ok(c) => c,
+            Err(e) => {
+                prune_error.get_or_insert(e);
+                0
+            }
+        };
+        match maintenance_commit(storage, w, last_lsn, opts, cap)? {
             Step::Skipped => {
                 report.skipped = true;
                 return Ok(report);
@@ -1011,7 +1115,14 @@ pub(in crate::storage) fn run_cycle(
     if opts.retain_records.is_some() {
         for _ in 0..MAX_PRUNE_ROUNDS {
             let w = watermark(&storage.db.begin_read()?)?;
-            match maintenance_commit(storage, w, w, opts)? {
+            let cap = match prune_cap_for(storage, &state, opts, w) {
+                Ok(c) => c,
+                Err(e) => {
+                    prune_error.get_or_insert(e);
+                    break;
+                }
+            };
+            match maintenance_commit(storage, w, w, opts, cap)? {
                 Step::Skipped => {
                     report.skipped = true;
                     break;
@@ -1023,7 +1134,10 @@ pub(in crate::storage) fn run_cycle(
             }
         }
     }
-    Ok(report)
+    match prune_error {
+        Some(e) => Err(e),
+        None => Ok(report),
+    }
 }
 
 /// [`Storage::verify_change_log_archive`] の本体。DB のメタ表（DB 識別子・timeline・有効化時の世代・

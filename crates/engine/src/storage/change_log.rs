@@ -549,9 +549,30 @@ fn split_record(
 // DB 識別子・有効状態（D5・D8）
 // ---------------------------------------------------------------------------
 
+/// アーカイブ周期の直列化用ロック。`ChangeLogState` の導出（比較・複製）に合わせ、比較は常に等しく、
+/// 複製は新しいロックを作る。
+#[derive(Debug, Default)]
+pub(crate) struct ArchiveLock(pub(crate) Mutex<()>);
+
+impl Clone for ArchiveLock {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl PartialEq for ArchiveLock {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for ArchiveLock {}
+
 /// 変更ログが有効な `Storage` が持つ不変の設定。無効な `Storage` はこれを持たない（`None`）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ChangeLogState {
+    /// アーカイブの 1 周期（計画 → 公開 → 水位更新）を直列化する（`archive`。D6）。複製は別のロックになる。
+    pub(crate) archive_lock: ArchiveLock,
     pub(crate) db_id: [u8; DB_ID_LEN],
     pub(crate) timeline: u64,
     pub(crate) limits: CaptureLimits,
@@ -612,6 +633,7 @@ pub(crate) fn load_or_init_identity(
     }
     Ok((
         ChangeLogState {
+            archive_lock: ArchiveLock::default(),
             db_id,
             timeline,
             limits,
