@@ -1,10 +1,10 @@
 //! `wire-server verify` サブコマンドの引数解釈・報告の整形・終了コード対応
 //! （Issue #2156・RECOVER-13 (6) のポインタ。親 #2154。検査本体は
-//! `engine::storage::Storage::verify_integrity`）。
+//! `engine::storage::Storage::verify_integrity`／`ReadOnlyStorage::verify_integrity`）。
 //!
 //! 責務境界: untrusted な CLI 文字列を検証済みの [`VerifyArgs`] に変換し、engine が返す
 //! [`IntegrityReport`] を「安定したテキスト行」と終了コードへ対応づけるまで。DB を開いて検査を
-//! 呼ぶのは `main.rs::run_verify`、復元後の検査は [`crate::restore_opt`] が同じ [`classify`]・
+//! 呼ぶのは `main.rs::run_verify`（`restore_opt::verify_db`）、復元後の検査は [`crate::restore_opt`] が同じ [`classify`]・
 //! [`render`] を使う（終了コードと出力形式の唯一の定義）。
 //!
 //! # 終了コード規約

@@ -4126,11 +4126,11 @@ fn write_stdout(text: &str) -> std::io::Result<()> {
     out.flush()
 }
 
-/// `verify --db <path>` サブコマンド（Issue #2156・RECOVER-13 (6) ポインタ）。引数を検証してから
-/// `--db` を開き、`Storage::verify_integrity` の報告を標準出力へ出す。稼働中のサーバーが DB を
-/// 開いている場合は排他ロックが取れず終了コード 1（fail-closed。`backup` と同じ）。元ファイルへは
-/// 書き込まない（コピーを検査する。コピーを省く読み取り専用の open は #3074）。エラー文に
-/// 行の値・パスの内容・表名は含めない。
+/// `verify --db <path>` サブコマンド（Issue #2156・#3074・RECOVER-13 (6) ポインタ）。引数を検証してから
+/// `--db` を読み取り専用で開いて検査し、報告と検査経路（`verify_mode=read_only|copy`）を標準出力へ出す。
+/// 稼働中のサーバーが DB を開いている場合はロックが取れず終了コード 1（fail-closed。`backup` と同じ）。
+/// 元ファイルへは書き込まない（修復・形式更新が要るときだけ一時コピーを検査する。
+/// `restore_opt::verify_db`）。エラー文に行の値・パスの内容・表名は含めない。
 fn run_verify(args: &[String]) -> ExitCode {
     use wire_server::{backup_opt, verify_opt};
 
@@ -4141,18 +4141,21 @@ fn run_verify(args: &[String]) -> ExitCode {
             return ExitCode::from(backup_opt::EXIT_USAGE);
         }
     };
-    // 元ファイルは開かない（`Storage::open` は旧形式の移行などで書き込むため）。排他ロックを
-    // 保持したまま一時コピーを検査する（`restore_opt::verify_via_copy`）。
+    // 元ファイルへは書き込まない。まず読み取り専用で開いて直接検査し（コピーなし）、修復・形式更新が
+    // 要るときだけ排他ロックを保持した一時コピーの検査へ切り替える（`restore_opt::verify_db`）。
     let mut leftover = None;
-    let result =
-        wire_server::restore_opt::verify_via_copy(&parsed.db, &parsed.options, &mut leftover);
+    let verified = wire_server::restore_opt::verify_db(&parsed.db, &parsed.options, &mut leftover);
+    let mode = verified.as_ref().ok().map(|(_, m)| *m);
+    let result = verified.map(|(report, _)| report);
     // 終了コードは restore と同じ規則: 検査が完了した（Ok）うえで消せなかった場合だけ 3、
     // 失敗（Err）は本来の失敗の文言と終了コードを保ち、残置は併せて通知する。
     let code = wire_server::restore_opt::verify_exit_code(&result, leftover.is_some());
     match &result {
         Ok(report) => {
             // 出力先の閉鎖（EPIPE 等）で panic させない。書けなければ実行時の失敗（1）。
-            if write_stdout(&verify_opt::render(report)).is_err() {
+            // どの経路で検査したかを key=value 行で末尾に添える（`Ok` のときは常に `Some`）。
+            let mode_line = mode.map_or(String::new(), |m| format!("verify_mode={}\n", m.as_str()));
+            if write_stdout(&format!("{}{mode_line}", verify_opt::render(report))).is_err() {
                 if let Some(p) = &leftover {
                     report_leftover("verify", p);
                 }

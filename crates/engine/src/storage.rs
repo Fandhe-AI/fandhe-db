@@ -35,6 +35,7 @@ pub mod integrity;
 /// 同一ソースを取り込む。テストコードのみで使うため通常ビルドには含めない。
 #[cfg(test)]
 mod power_loss_model;
+pub mod read_only;
 pub(crate) mod read_source;
 pub(crate) mod rowid;
 pub mod snapshot;
@@ -49,6 +50,7 @@ pub use change_log::archive::{
 pub use integrity::{
     FindingKind, IntegrityError, IntegrityFinding, IntegrityOptions, IntegrityReport, Severity,
 };
+pub use read_only::{ReadOnlyOpenError, ReadOnlyStorage};
 pub use snapshot::{SnapshotExportError, SnapshotSummary};
 
 /// 行ストアの物理キー型（対象ビヘイビア: TABLE-12。ポインタ:
