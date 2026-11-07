@@ -60,10 +60,11 @@ fn table_keys<E>(ctx: &Ctx<'_>) -> Result<Vec<String>, SchemaDdlError<E>> {
     let mut keys = Vec::new();
     for (k, _) in read_str_table::<E>(ctx, CATALOG_TABLE)? {
         if in_scope(ctx, &k)? {
-            keys.push(k);
+            keys.push((ctx.namer.sort_key::<E>(&k)?, k));
         }
     }
-    Ok(keys)
+    keys.sort();
+    Ok(keys.into_iter().map(|(_, k)| k).collect())
 }
 
 /// 範囲内の索引宣言（名前の昇順）。
@@ -71,10 +72,11 @@ fn index_defs<E>(ctx: &Ctx<'_>) -> Result<Vec<IndexDef>, SchemaDdlError<E>> {
     let mut out = Vec::new();
     for (k, v) in read_str_table::<E>(ctx, INDEX_CATALOG_TABLE)? {
         if in_scope(ctx, &k)? {
-            out.push(decode_index_def(&k, &v)?);
+            out.push((ctx.namer.sort_key::<E>(&k)?, decode_index_def(&k, &v)?));
         }
     }
-    Ok(out)
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(out.into_iter().map(|(_, d)| d).collect())
 }
 
 /// 全 SEQUENCE の定義と所有者（relation キーで引く。他テナントの分も含むが、出力は範囲で絞る）。
@@ -264,15 +266,17 @@ fn export_views<E>(ctx: &Ctx<'_>, out: &mut Emitter<'_, E>) -> Result<(), Schema
         }
     }
     while !pending.is_empty() {
-        let ready: Vec<String> = pending
-            .iter()
-            .filter(|(_, d)| !pending.contains_key(&d.base_relation))
-            .map(|(k, _)| k.clone())
-            .collect();
+        let mut ready: Vec<((String, String), String)> = Vec::new();
+        for (k, d) in &pending {
+            if !pending.contains_key(&d.base_relation) {
+                ready.push((ctx.namer.sort_key::<E>(k)?, k.clone()));
+            }
+        }
         if ready.is_empty() {
             return Err(unsupported("view", "views reference each other in a cycle"));
         }
-        for key in ready {
+        ready.sort();
+        for (_, key) in ready {
             if let Some(def) = pending.remove(&key) {
                 let sql = render_create_view(ctx, &key, &def)?;
                 out.emit(DdlSection::PreData, DdlObjectKind::View, &sql)?;

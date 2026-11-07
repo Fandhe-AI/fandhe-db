@@ -209,4 +209,19 @@ impl Namer {
         }
         Ok(out)
     }
+
+    /// 出力順のための並べ替えキー `(SCHEMA 名, 名前部)`。共有の relation は SCHEMA 名が空で先に並ぶ。
+    /// 内部キーの並び（`#<schema_id>.` の ID 順）は復元先で付け直される ID に依存して変わるため、
+    /// 出力順には使わない（往復で同じ DDL 列になるように、描画名で決める）。他テナントのキーは
+    /// 出力しないので、並べ替えに使う前に除外済みであること（`Foreign` は `Unsupported`）。
+    pub(super) fn sort_key<E>(&self, key: &str) -> Result<(String, String), SchemaDdlError<E>> {
+        match self.scope(key)? {
+            KeyScope::Shared => Ok((String::new(), key.to_string())),
+            KeyScope::Tenant { schema, name } => Ok((schema, name)),
+            KeyScope::Foreign => Err(unsupported(
+                "relation",
+                "reference to a relation outside the dump scope",
+            )),
+        }
+    }
 }

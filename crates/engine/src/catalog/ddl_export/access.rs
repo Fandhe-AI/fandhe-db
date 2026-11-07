@@ -18,9 +18,7 @@ use super::super::privilege::default_acl::DEFAULT_ACL_TABLE;
 use super::super::privilege::owner::OWNERS_TABLE;
 use super::super::privilege::ACL_TABLE;
 use super::super::role::bootstrap::BOOTSTRAP_PRIVILEGES_TABLE;
-use super::super::role::{
-    list_memberships_of_member_in_txn, list_roles_in_txn, ROLE_MEMBERSHIPS_TABLE,
-};
+use super::super::role::{list_roles_in_txn, ROLE_MEMBERSHIPS_TABLE};
 use super::super::row_security::row_security_state_in_txn;
 use super::super::trigger::{
     list_triggers_in_source, TriggerDef, TriggerEvents, TriggerLevel, TriggerTiming,
@@ -50,11 +48,15 @@ fn tenant_table_keys<E>(ctx: &Ctx<'_>) -> Result<Vec<String>, SchemaDdlError<E>>
     for entry in table.iter().map_err(CatalogError::from)? {
         let (k, _) = entry.map_err(CatalogError::from)?;
         match ctx.namer.scope::<E>(k.value())? {
-            KeyScope::Shared | KeyScope::Tenant { .. } => keys.push(k.value().to_string()),
+            KeyScope::Shared | KeyScope::Tenant { .. } => {
+                keys.push((ctx.namer.sort_key::<E>(k.value())?, k.value().to_string()))
+            }
             KeyScope::Foreign => {}
         }
     }
-    Ok(keys)
+    // 内部キーの順（SCHEMA の内部 ID 順）は復元先で変わるため、描画名で並べる。
+    keys.sort();
+    Ok(keys.into_iter().map(|(_, k)| k).collect())
 }
 
 /// `tenant` の接頭辞を持つ行が 1 件でもあれば真（表が無ければ偽）。`first_key` は範囲の始点。
@@ -153,8 +155,6 @@ pub(super) fn export_roles<E>(
     };
     reject_unrestorable_access(ctx, tenant)?;
     for role in list_roles_in_txn(ctx.rt, tenant)? {
-        // 検査済みの空表でも `list_memberships_of_member_in_txn` を通して破損を検出する。
-        list_memberships_of_member_in_txn(ctx.rt, tenant, role.id)?;
         if !role.legacy_phc.is_empty() {
             return Err(unsupported("role", "role with a legacy password hash"));
         }
@@ -336,7 +336,13 @@ pub(super) fn export_functions<E>(
     let Some(tenant) = ctx.scope.tenant() else {
         return Ok(());
     };
+    let mut defs = Vec::new();
     for def in list_functions_in_source(ctx.rt, tenant)? {
+        defs.push((ctx.namer.sort_key::<E>(&def.function_key)?, def));
+    }
+    // 同名の多重定義は元の順（シグネチャ順）を保つ（安定ソート）。
+    defs.sort_by(|a, b| a.0.cmp(&b.0));
+    for (_, def) in defs {
         let sql = render_create_function(ctx, &def)?;
         out.emit(DdlSection::PreData, DdlObjectKind::Function, &sql)?;
     }

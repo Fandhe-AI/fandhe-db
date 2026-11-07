@@ -403,3 +403,42 @@ fn materialized_views_fail_the_whole_dump() {
     let err = dump(&src, &SchemaDdlScope::shared_only()).expect_err("matview");
     assert!(matches!(err, SchemaDdlError::Unsupported(u) if u.kind == "materialized view"));
 }
+
+#[test]
+fn output_order_does_not_depend_on_internal_schema_ids() {
+    // SCHEMA を名前の逆順に作ると内部 ID が名前順と逆になる。復元先では名前順に ID が付き直されるため、
+    // 出力順を内部キーの順で決めると 2 回目のダンプと食い違う。
+    let dump = assert_round_trip(
+        "order",
+        "tenant-a",
+        &[
+            "CREATE SCHEMA zz",
+            "CREATE SCHEMA aa",
+            "CREATE TABLE zz.t (a INTEGER PRIMARY KEY, b TEXT)",
+            "CREATE TABLE aa.t (a INTEGER PRIMARY KEY, b TEXT)",
+            "CREATE TABLE plain_t (a INTEGER PRIMARY KEY, b TEXT)",
+            "CREATE VIEW zz.v AS SELECT b FROM zz.t",
+            "CREATE VIEW aa.v AS SELECT b FROM aa.t",
+            "CREATE INDEX ix ON zz.t (b)",
+            "CREATE INDEX ix ON aa.t (b)",
+            "CREATE FUNCTION zz.f(x INTEGER) RETURNS INTEGER LANGUAGE sql AS $q$ SELECT x $q$",
+            "CREATE FUNCTION aa.f(x INTEGER) RETURNS INTEGER LANGUAGE sql AS $q$ SELECT x $q$",
+            "CREATE FUNCTION trg() RETURNS trigger LANGUAGE plpgsql AS $q$ BEGIN RETURN NEW; END $q$",
+            "CREATE TRIGGER tg AFTER INSERT ON zz.t FOR EACH ROW EXECUTE FUNCTION trg()",
+            "CREATE TRIGGER tg AFTER INSERT ON aa.t FOR EACH ROW EXECUTE FUNCTION trg()",
+            "CREATE POLICY pp ON zz.t USING (a > 0)",
+            "CREATE POLICY pp ON aa.t USING (a > 0)",
+            "ALTER TABLE zz.t ENABLE ROW LEVEL SECURITY",
+            "ALTER TABLE aa.t ENABLE ROW LEVEL SECURITY",
+        ],
+    );
+    let tables: Vec<&str> = dump
+        .iter()
+        .filter(|(_, s)| s.starts_with("CREATE TABLE"))
+        .map(|(_, s)| s.as_str())
+        .collect();
+    // 共有の表が先、SCHEMA 配下は SCHEMA 名の昇順。
+    assert!(tables[0].starts_with("CREATE TABLE \"plain_t\""));
+    assert!(tables[1].starts_with("CREATE TABLE aa.t"));
+    assert!(tables[2].starts_with("CREATE TABLE zz.t"));
+}
