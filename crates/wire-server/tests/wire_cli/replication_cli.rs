@@ -649,7 +649,7 @@ fn recover15_records_stream_in_commit_order_and_ack_moves_the_retention_floor() 
     );
     // 確認応答の違反（送信済みより先・後退）は切断される。
     b.ack(1_000_000);
-    assert_eq!(b.drain_until_closed(), None);
+    assert_eq!(b.drain_until_closed(), Some(E_BAD_REQUEST));
     assert!(p.archive.as_ref().is_some_and(|d| d.is_dir()));
 }
 
@@ -923,4 +923,41 @@ fn recover15_lag_limit_applies_while_the_send_window_is_full() {
         Duration::from_secs(30),
         || resync_required_from(&p, base),
     );
+}
+
+/// 不正な Ack（後退・送信済みの超過・型違い・長さ違反）は、固定コード `BAD_REQUEST` を返してから切断される。
+#[test]
+fn recover15_invalid_acks_get_bad_request_before_the_close() {
+    let p = Primary::start("repl-bad-ack", &[], false);
+    let mut alice = p.setup_table();
+    let cases: [(&str, Box<dyn Fn(&mut Replica, u64)>); 4] = [
+        (
+            "regressing ack",
+            Box::new(|r, lsn| {
+                r.ack(lsn);
+                r.ack(lsn - 1);
+            }),
+        ),
+        (
+            "ack beyond what was sent",
+            Box::new(|r, lsn| r.ack(lsn + 1_000)),
+        ),
+        (
+            "wrong frame type",
+            Box::new(|r, lsn| r.send(b'X', &lsn.to_be_bytes())),
+        ),
+        ("wrong ack length", Box::new(|r, _| r.send(b'K', &[0u8; 4]))),
+    ];
+    for (n, (what, bad)) in cases.into_iter().enumerate() {
+        let (mut r, _) = begin_at_current(&p);
+        alice.insert(u32::try_from(n).expect("small") + 1);
+        let (lsn, _) = r.next_record().expect("record");
+        bad(&mut r, lsn);
+        assert_eq!(r.drain_until_closed(), Some(E_BAD_REQUEST), "{what}");
+    }
+    // 長さが上限を超えるフレームも同様。
+    let (mut r, _) = begin_at_current(&p);
+    r.0.write_all(&[b'K', 0, 0, 0, 100])
+        .expect("oversize header");
+    assert_eq!(r.drain_until_closed(), Some(E_BAD_REQUEST), "oversize ack");
 }

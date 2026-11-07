@@ -317,6 +317,8 @@ const CUT_NONE: u8 = 0;
 const CUT_ACK_TIMEOUT: u8 = 1;
 const CUT_LAG: u8 = 2;
 const CUT_INTERNAL: u8 = 3;
+/// ack 読み取りが見つけたプロトコル違反（型・長さ・値）。
+const CUT_PROTOCOL: u8 = 4;
 /// 監視がプライマリの最新 LSN を読み直す間隔。送信ループの状態（窓が満杯・書き込みが塞がる）に依らず遅れを判定する。
 const LAG_POLL: Duration = Duration::from_millis(100);
 
@@ -340,16 +342,21 @@ impl Shared {
 
 /// ack を読み続ける（レプリカ→プライマリの方向。別スレッド）。違反・切断で `failed` を立てて終わる。
 fn read_acks(stream: &TcpStream, shared: &Shared, pin: &engine::storage::ReplicaPin) {
-    loop {
-        let acked = match read_frame(stream, ACK_BODY_LEN, None) {
-            Ok((T_ACK, body)) if body.len() == ACK_BODY_LEN => be_u64(&body),
-            _ => None,
+    // 通常の切断（`Closed`）とプロトコル違反（型・長さ・値）を区別する。違反は理由を立てて抜け、送信ループが
+    // `BAD_REQUEST` を書いてから切る（書き込みは送信ループだけが行うので、フレームは交錯しない）。
+    let violation = loop {
+        let lsn = match read_frame(stream, ACK_BODY_LEN, None) {
+            Ok((T_ACK, body)) if body.len() == ACK_BODY_LEN => match be_u64(&body) {
+                Some(l) => l,
+                None => break true,
+            },
+            Err(FrameError::Closed) => break false,
+            _ => break true,
         };
-        let Some(lsn) = acked else { break };
         let mut g = shared.lock();
         // 単調増加で、送信済みの範囲内でなければならない（未送信の位置への ack は不正）。
         if lsn < g.acked || lsn > g.sent {
-            break;
+            break true;
         }
         while g.queue.front().is_some_and(|(l, _, _)| *l <= lsn) {
             if let Some((_, len, _)) = g.queue.pop_front() {
@@ -359,6 +366,17 @@ fn read_acks(stream: &TcpStream, shared: &Shared, pin: &engine::storage::Replica
         g.acked = lsn;
         drop(g);
         pin.advance(lsn);
+    };
+    if violation {
+        // 他の理由（監視の切断）が先に立っていればそちらを優先する。
+        let _ = shared.cut.compare_exchange(
+            CUT_NONE,
+            CUT_PROTOCOL,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        // 送信ループが通知を書くまで接続は閉じない（書き込みが塞がる場合は監視が有界の待機で閉じる）。
+        return;
     }
     shared.failed.store(true, Ordering::Release);
     let _ = stream.shutdown(Shutdown::Both);
@@ -399,10 +417,17 @@ fn watchdog(stream: &TcpStream, core: &EngineCore, shared: &Shared, cfg: &Replic
                 CUT_NONE
             }
         };
+        // ack 読み取りが先にプロトコル違反を立てていればそれを使う（通知を書く有界の待機は同じ）。
+        let reason = match shared.cut.load(Ordering::Acquire) {
+            CUT_NONE => reason,
+            already => already,
+        };
         if reason == CUT_NONE {
             continue;
         }
-        shared.cut.store(reason, Ordering::Release);
+        let _ = shared
+            .cut
+            .compare_exchange(CUT_NONE, reason, Ordering::AcqRel, Ordering::Acquire);
         let grace = Instant::now() + NOTICE_TIMEOUT;
         while Instant::now() < grace && !shared.done.load(Ordering::Acquire) {
             std::thread::sleep(WATCHDOG_STEP);
@@ -590,6 +615,7 @@ fn send_records(
     let max_unacked = cfg.max_unacked_bytes;
     let max_batch_bytes = usize::try_from(max_unacked).unwrap_or(usize::MAX);
     let mut last_write = Instant::now();
+    let mut held: Option<(u64, Vec<u8>)> = None;
     loop {
         // 監視が切断を決めたら、通知を書いて抜ける（ack の待機上限・遅れの上限）。
         match shared.cut.load(Ordering::Acquire) {
@@ -605,6 +631,10 @@ fn send_records(
                 send_error(stream, code::INTERNAL);
                 return "log position unavailable";
             }
+            CUT_PROTOCOL => {
+                send_error(stream, code::BAD_REQUEST);
+                return "replica violated the protocol";
+            }
             _ => {}
         }
         if shared.failed.load(Ordering::Acquire) {
@@ -613,47 +643,54 @@ fn send_records(
         let inflight_bytes = shared.lock().bytes;
         let budget =
             max_batch_bytes.saturating_sub(usize::try_from(inflight_bytes).unwrap_or(usize::MAX));
-        let batch = if budget == 0 {
-            None
+        let mut sent_any = false;
+        let mut window_full = false;
+        let mut current = next;
+        // 窓に入らず持ち越した 1 件があれば、読み直さずにそれを使う（毎ループの再読み出しと検証を避ける）。
+        // 持ち越しは常に 1 件までで、その大きさは 1 件のレコードの上限（`MAX_RECORD_BYTES`）以内。通常は
+        // 窓（`max_unacked`）に収まらなかったレコードなので、読み出し 1 回分のメモリと同じ範囲に収まる。
+        let records: Vec<(u64, Vec<u8>)> = if let Some(rec) = held.take() {
+            vec![rec]
+        } else if budget == 0 {
+            window_full = true;
+            Vec::new()
         } else {
             match core.read_change_log_from(next, BATCH_RECORDS, budget.min(MAX_BATCH_BYTES)) {
-                Ok(b) => Some(b),
+                Ok(b) => {
+                    current = b.current_lsn;
+                    b.records
+                }
                 Err(e) => {
                     send_error(stream, stream_error_code(&e));
                     return "log read failed";
                 }
             }
         };
-        let mut sent_any = false;
-        let mut window_full = batch.is_none();
-        let mut current = next;
-        if let Some(batch) = batch {
-            current = batch.current_lsn;
-            let mut pending = inflight_bytes;
-            for (lsn, bytes) in &batch.records {
-                let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-                // 未確認が空でなければ、上限を超える送信はしない（空なら 1 件は必ず送る）。
-                if pending > 0 && pending.saturating_add(len) > max_unacked {
-                    window_full = true;
-                    break;
-                }
-                // 書き込みでブロックしても監視が経過時間を見られるよう、書く前に勘定へ入れる。
-                {
-                    let mut g = shared.lock();
-                    g.queue.push_back((*lsn, len, Instant::now()));
-                    g.bytes = g.bytes.saturating_add(len);
-                    g.sent = *lsn;
-                }
-                if write_frame(&mut out, T_RECORD, &[&lsn.to_be_bytes(), bytes]).is_err() {
-                    return "write failed or timed out";
-                }
-                pending = pending.saturating_add(len);
-                next = match lsn.checked_add(1) {
-                    Some(n) => n,
-                    None => return "internal error",
-                };
-                sent_any = true;
+        let mut pending = inflight_bytes;
+        for (lsn, bytes) in records {
+            let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+            // 未確認が空でなければ、上限を超える送信はしない（空なら 1 件は必ず送る）。
+            if pending > 0 && pending.saturating_add(len) > max_unacked {
+                window_full = true;
+                held = Some((lsn, bytes));
+                break;
             }
+            // 書き込みでブロックしても監視が経過時間を見られるよう、書く前に勘定へ入れる。
+            {
+                let mut g = shared.lock();
+                g.queue.push_back((lsn, len, Instant::now()));
+                g.bytes = g.bytes.saturating_add(len);
+                g.sent = lsn;
+            }
+            if write_frame(&mut out, T_RECORD, &[&lsn.to_be_bytes(), &bytes]).is_err() {
+                return "write failed or timed out";
+            }
+            pending = pending.saturating_add(len);
+            next = match lsn.checked_add(1) {
+                Some(n) => n,
+                None => return "internal error",
+            };
+            sent_any = true;
         }
         if sent_any {
             if out.flush().is_err() {
