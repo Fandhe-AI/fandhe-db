@@ -471,3 +471,35 @@ fn role_password_verifier_survives_the_round_trip_unchanged() {
     replay(&dst, "tenant-a", &stmts);
     assert_eq!(verifier(&src), verifier(&dst));
 }
+
+#[test]
+fn views_are_ordered_by_every_relation_their_body_reads() {
+    // 名前順と依存順が逆になるよう、依存先を後ろの名前にする。集合演算の後続の枝で別の VIEW を読む
+    // VIEW は、`base_relation`（先頭の枝）だけを見る並べ方では依存先より先に出てしまう。
+    // （この SQL 表層は JOIN・部分問い合わせ・CTE の本文で別の VIEW を読む VIEW を作らせない。
+    // それらの参照も同じ `view_body_relations` が集めるため、並べ方は同じ導出に従う。）
+    let dump = assert_round_trip(
+        "view-order",
+        "tenant-a",
+        &[
+            "CREATE TABLE docs (id BIGINT PRIMARY KEY, x TEXT)",
+            "CREATE TABLE notes (id BIGINT PRIMARY KEY, y TEXT)",
+            "CREATE VIEW z_base AS SELECT id FROM docs",
+            "CREATE VIEW z_base2 AS SELECT id FROM notes",
+            "CREATE VIEW a_union AS SELECT id FROM docs UNION ALL SELECT id FROM z_base",
+            "CREATE VIEW b_inter AS SELECT id FROM docs INTERSECT SELECT id FROM z_base2",
+            "CREATE VIEW c_except AS SELECT id FROM docs EXCEPT SELECT id FROM z_base2",
+            "CREATE VIEW d_two AS SELECT id FROM docs UNION SELECT id FROM z_base \
+             UNION SELECT id FROM z_base2",
+        ],
+    );
+    let pos = |name: &str| {
+        dump.iter()
+            .position(|(_, s)| s.starts_with(&format!("CREATE VIEW \"{name}\"")))
+            .unwrap_or_else(|| panic!("{name} missing"))
+    };
+    assert!(pos("z_base") < pos("a_union"));
+    assert!(pos("z_base2") < pos("b_inter"));
+    assert!(pos("z_base2") < pos("c_except"));
+    assert!(pos("z_base") < pos("d_two") && pos("z_base2") < pos("d_two"));
+}

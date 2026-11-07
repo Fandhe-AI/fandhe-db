@@ -13,8 +13,8 @@ use redb::{ReadableTable, TableDefinition};
 use super::super::sequence::{list_sequence_definitions_in, sequence_state_in};
 use super::super::{
     decode_enum_type_def, decode_index_def, decode_view_def, get_table_schema_in_txn_impl,
-    CatalogError, EnumTypeDef, IndexDef, TableSchema, ViewDef, CATALOG_TABLE, ENUM_TYPES_TABLE,
-    INDEX_CATALOG_TABLE, MAX_LIST_TABLES, VIEWS_TABLE,
+    view_body_relations, CatalogError, EnumTypeDef, IndexDef, TableSchema, ViewDef, CATALOG_TABLE,
+    ENUM_TYPES_TABLE, INDEX_CATALOG_TABLE, MAX_LIST_TABLES, VIEWS_TABLE,
 };
 use super::quote::{literal, push_ident, KeyScope};
 use super::table::{
@@ -273,10 +273,23 @@ fn export_views<E>(ctx: &Ctx<'_>, out: &mut Emitter<'_, E>) -> Result<(), Schema
             pending.insert(k, decode_view_def(&v)?);
         }
     }
+    // 各 VIEW が読む relation をすべて集める。保存済み本文の構文検証（DROP の依存列挙と同じ
+    // `view_body_relations`）で UNION／INTERSECT／EXCEPT の各枝・JOIN・部分問い合わせ・CTE の参照まで得る。
+    // 導出できない本文は、並べ方を推測せず全体を失敗させる。
+    let mut deps: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (k, d) in &pending {
+        let mut rels = view_body_relations(&d.body_sql)
+            .map_err(|_| unsupported("view", "view body references cannot be determined"))?;
+        rels.push(d.base_relation.clone());
+        deps.insert(k.clone(), rels);
+    }
     while !pending.is_empty() {
         let mut ready: Vec<((String, String), String)> = Vec::new();
-        for (k, d) in &pending {
-            if !pending.contains_key(&d.base_relation) {
+        for k in pending.keys() {
+            if !deps
+                .get(k)
+                .is_some_and(|ds| ds.iter().any(|r| pending.contains_key(r)))
+            {
                 ready.push((ctx.namer.sort_key::<E>(k)?, k.clone()));
             }
         }
