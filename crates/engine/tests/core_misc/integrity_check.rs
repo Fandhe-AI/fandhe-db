@@ -802,3 +802,102 @@ fn foreign_key_shapes_are_not_false_positives_and_orphans_are_found() {
     let report = verify(&path);
     assert_eq!(report.total(FindingKind::ForeignKeyOrphanRow), 2);
 }
+
+#[test]
+fn mass_duplicates_of_one_key_are_reported_even_with_a_small_budget() {
+    let (path, _g) = build_db("integrity-mass-dup");
+    let (_, parent_value) = first_row(&path, PARENT_ROWS, TENANTS[0]);
+    let (_, kid_value) = first_row(&path, KID_ROWS, TENANTS[0]);
+    corrupt(&path, |w| {
+        let mut p = w.open_table(PARENT_ROWS).expect("parents");
+        let mut k = w.open_table(KID_ROWS).expect("kids");
+        for i in 0..5u64 {
+            p.insert((TENANTS[0], 910_000 + i), parent_value.as_slice())
+                .expect("dup parent");
+            k.insert((TENANTS[0], 920_000 + i), kid_value.as_slice())
+                .expect("dup kid");
+        }
+    });
+    // 実際の集合は 1 キー分なので、重複行の数に関わらず予算内に収まる。
+    let report = verify_with(
+        &path,
+        &IntegrityOptions {
+            memory_budget_bytes: 400,
+            ..IntegrityOptions::default()
+        },
+    );
+    assert_eq!(report.total(FindingKind::CheckBudgetExceeded), 0);
+    // parents: 主キー重複 5。kids: 主キー重複 5 と、UNIQUE（tag）重複 5。
+    assert_eq!(report.total(FindingKind::PrimaryKeyDuplicate), 10);
+    assert_eq!(report.total(FindingKind::UniqueKeyDuplicate), 5);
+    assert!(!report.is_consistent());
+}
+
+#[test]
+fn gin_posting_with_a_wrong_length_field_is_not_silently_accepted() {
+    let (path, _g) = build_db("integrity-gin-len");
+    corrupt(&path, |w| {
+        let mut t = w.open_table(PARENT_GIN).expect("gin");
+        let mut victim = None;
+        for e in t.iter().expect("iter") {
+            let (k, _) = e.expect("entry");
+            let (tenant, sub) = k.value();
+            if tenant == TENANTS[0] && sub.first() == Some(&0x01) {
+                victim = Some(sub.to_vec());
+                break;
+            }
+        }
+        let mut forged = victim.expect("a posting");
+        // 長さフィールド（2 バイト）だけを書き換えた別キーを足す。
+        forged[2] = forged[2].wrapping_add(1);
+        t.insert((TENANTS[0], forged.as_slice()), [].as_slice())
+            .expect("insert");
+    });
+    let report = verify(&path);
+    assert_eq!(report.total(FindingKind::CheckUnevaluable), 1);
+    assert_eq!(
+        FindingKind::CheckUnevaluable.severity(),
+        Severity::Incomplete
+    );
+    assert!(!report.is_consistent());
+}
+
+#[test]
+fn failure_of_an_auxiliary_table_does_not_stop_the_other_checks() {
+    let (path, _g) = build_db("integrity-aux-failure");
+    let (_, value) = first_row(&path, PARENT_ROWS, TENANTS[0]);
+    corrupt(&path, |w| {
+        // GIN 表を別の型の表へ差し替え、開けなくする。
+        w.delete_table(PARENT_GIN).expect("drop gin");
+        w.open_table(TableDefinition::<u8, u8>::new("user_gin/parents_doc"))
+            .expect("replace gin");
+        // 後続の検査（主キー重複）が走ることを見るための矛盾。
+        let mut t = w.open_table(PARENT_ROWS).expect("rows");
+        t.insert((TENANTS[0], 930_000u64), value.as_slice())
+            .expect("dup");
+    });
+    let report = verify(&path);
+    assert!(report.total(FindingKind::CheckUnavailable) >= 1);
+    assert_eq!(report.total(FindingKind::PrimaryKeyDuplicate), 1);
+    assert!(!report.is_consistent());
+}
+
+#[test]
+fn undecodable_parent_row_is_not_counted_as_an_orphan_but_complete_tenants_still_are() {
+    let (path, _g) = build_db("integrity-fk-incomplete");
+    // tenant0: 親 p1 の行を壊す（子 k1 は参照先を確認できない）。
+    let (p1_rowid, _) = first_row(&path, PARENT_ROWS, TENANTS[0]);
+    // tenant1: 親 p1 の行を消す（キー集合は完全で、子 k1 は本当の孤児）。
+    let (p1_other, _) = first_row(&path, PARENT_ROWS, TENANTS[1]);
+    corrupt(&path, |w| {
+        let mut t = w.open_table(PARENT_ROWS).expect("rows");
+        t.insert((TENANTS[0], p1_rowid), [0xFFu8, 1].as_slice())
+            .expect("garble");
+        t.remove((TENANTS[1], p1_other)).expect("remove");
+    });
+    let report = verify(&path);
+    assert_eq!(report.total(FindingKind::RowUndecodable), 1);
+    assert_eq!(report.total(FindingKind::ForeignKeyOrphanRow), 1);
+    assert!(report.total(FindingKind::CheckUnavailable) >= 1);
+    assert!(!report.is_consistent());
+}

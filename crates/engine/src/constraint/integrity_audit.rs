@@ -140,16 +140,17 @@ where
             if part_of(&key, parts) != part {
                 continue;
             }
-            used = used.saturating_add(key.len().saturating_add(ENTRY_OVERHEAD));
-            if used > budget_bytes {
-                return Ok(PassResult::OverBudget);
-            }
-            if !seen.insert((ordinal_u16, key)) {
-                if ordinal == 0 && plan.has_primary_key {
-                    counts.primary_key = counts.primary_key.saturating_add(1);
-                } else {
-                    counts.unique = counts.unique.saturating_add(1);
+            let cost = key.len().saturating_add(ENTRY_OVERHEAD);
+            if seen.insert((ordinal_u16, key)) {
+                // 新規のキーだけ予算に計上する（同じキーの大量重複で予算を使い果たさない）。
+                used = used.saturating_add(cost);
+                if used > budget_bytes {
+                    return Ok(PassResult::OverBudget);
                 }
+            } else if ordinal == 0 && plan.has_primary_key {
+                counts.primary_key = counts.primary_key.saturating_add(1);
+            } else {
+                counts.unique = counts.unique.saturating_add(1);
             }
         }
     }
@@ -204,6 +205,18 @@ pub(crate) struct ForeignKeyCounts {
     pub(crate) orphans: u64,
     /// 判定できなかった行の数（分割番号 0 の走査でだけ数える）。
     pub(crate) unevaluable: u64,
+    /// 参照先のキー集合が不完全（参照先の行を復号できない）で、集合に見つからない子行を孤児と
+    /// 断定できなかった数。
+    pub(crate) unresolved: u64,
+}
+
+/// 参照先の列がすべて参照先のスキーマに存在するか（`id` 参照は常に真）。
+pub(crate) fn parent_columns_resolve(parent_schema: &TableSchema, fk: &ForeignKeyDef) -> bool {
+    fk.references_parent_id()
+        || fk
+            .parent_columns()
+            .iter()
+            .all(|n| parent_schema.columns.iter().any(|c| &c.name == n))
 }
 
 /// 子表 1 つ・`FOREIGN KEY` 1 つ・テナント 1 つについて、参照先に存在しない子行（孤児）を数える。
@@ -235,6 +248,8 @@ where
     // 参照先のキー集合（列参照のみ。このハッシュ分割に属するキーだけを持つ）。
     let mut parent_keys: HashSet<Vec<u8>> = HashSet::new();
     let mut used = 0usize;
+    // 参照先の行を復号・キー計算できず、キー集合が不完全か（分割に関わらず全区画に影響する）。
+    let mut parent_incomplete = false;
     if !by_id {
         let mut indices = Vec::with_capacity(fk.parent_columns().len());
         let mut pmask = vec![false; parent_schema.columns.len()];
@@ -262,6 +277,7 @@ where
                     break;
                 }
                 let Ok(values) = decode_key_columns(parent_schema, &pmask, v.value()) else {
+                    parent_incomplete = true;
                     if part == 0 {
                         counts.unevaluable = counts.unevaluable.saturating_add(1);
                     }
@@ -272,6 +288,7 @@ where
                     // 構成列が NULL の行は参照先になり得ない（MATCH SIMPLE）。
                     Ok(None) => continue,
                     Err(_) => {
+                        parent_incomplete = true;
                         if part == 0 {
                             counts.unevaluable = counts.unevaluable.saturating_add(1);
                         }
@@ -281,11 +298,13 @@ where
                 if part_of(&key, parts) != part {
                     continue;
                 }
-                used = used.saturating_add(key.len().saturating_add(ENTRY_OVERHEAD));
-                if used > budget_bytes {
-                    return Ok(PassResult::OverBudget);
+                let cost = key.len().saturating_add(ENTRY_OVERHEAD);
+                if parent_keys.insert(key) {
+                    used = used.saturating_add(cost);
+                    if used > budget_bytes {
+                        return Ok(PassResult::OverBudget);
+                    }
                 }
-                parent_keys.insert(key);
             }
         }
     }
@@ -354,7 +373,11 @@ where
                             if part_of(&parent_key, parts) == part
                                 && !parent_keys.contains(&parent_key)
                             {
-                                counts.orphans = counts.orphans.saturating_add(1);
+                                if parent_incomplete {
+                                    counts.unresolved = counts.unresolved.saturating_add(1);
+                                } else {
+                                    counts.orphans = counts.orphans.saturating_add(1);
+                                }
                             }
                         }
                         Ok(None) => {

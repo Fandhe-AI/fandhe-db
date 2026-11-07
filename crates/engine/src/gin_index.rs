@@ -855,7 +855,10 @@ where
         let parsed = subkey.len().checked_sub(8).and_then(|split| {
             let rowid = <[u8; 8]>::try_from(subkey.get(split..)?).ok()?;
             let entry = subkey.get(3..split)?;
-            Some((entry, RowId::from_index_raw(u64::from_be_bytes(rowid))))
+            // 宣言された長さと実際の entry 長が一致しないキーは壊れている。
+            let declared = u16::from_be_bytes(<[u8; 2]>::try_from(subkey.get(1..3)?).ok()?);
+            (usize::from(declared) == entry.len())
+                .then_some((entry, RowId::from_index_raw(u64::from_be_bytes(rowid))))
         });
         let Some((posting_entry, owner)) = parsed else {
             unevaluable = unevaluable.saturating_add(1);

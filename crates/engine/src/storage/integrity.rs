@@ -563,78 +563,116 @@ fn check_table(
             None
         }
     };
-    let mut gin_tables = Vec::with_capacity(decls.gins.len());
+    // 補助の表を開けない場合は、その検査だけを未検査（`CheckUnavailable`）にして残りを続ける。
+    let mut gin_tables: Vec<Result<Option<IndexRo>, ReadFail>> =
+        Vec::with_capacity(decls.gins.len());
     for decl in &decls.gins {
         let name = catalog::user_gin_table_name(&decl.index_name);
-        let t: Option<IndexRo> = match read.open_table(catalog::user_gin_table_def(&name)) {
-            Ok(t) => Some(t),
-            Err(redb::TableError::TableDoesNotExist(_)) => None,
-            Err(_) => return Err(ReadFail),
-        };
-        gin_tables.push(t);
+        gin_tables.push(match read.open_table(catalog::user_gin_table_def(&name)) {
+            Ok(t) => Ok(Some(t)),
+            Err(redb::TableError::TableDoesNotExist(_)) => Ok(None),
+            Err(_) => Err(ReadFail),
+        });
     }
     let fks = resolve_foreign_keys(read, key, schema, c)?;
-    let rowid_state = match read.open_table(catalog::rowid_alloc::ROWID_STATE_TABLE) {
-        Ok(t) => Some(t),
-        Err(redb::TableError::TableDoesNotExist(_)) => None,
-        Err(_) => return Err(ReadFail),
-    };
+    let rowid_state: Result<Option<_>, ReadFail> =
+        match read.open_table(catalog::rowid_alloc::ROWID_STATE_TABLE) {
+            Ok(t) => Ok(Some(t)),
+            Err(redb::TableError::TableDoesNotExist(_)) => Ok(None),
+            Err(_) => Err(ReadFail),
+        };
     let allocated = matches!(schema.row_identity(), catalog::RowIdentity::Allocated);
 
     let mut after: Option<String> = None;
     while let Some(tenant) = next_tenant(&rows, after.as_deref())? {
         if let Some(plan) = &plan {
-            check_unique(plan, schema, &rows, uniq.as_ref(), &tenant, key, options, c)?;
+            if check_unique(plan, schema, &rows, uniq.as_ref(), &tenant, key, options, c).is_err() {
+                c.add(FindingKind::CheckUnavailable, Some(key), 1);
+            }
         }
         for (decl, table) in decls.gins.iter().zip(gin_tables.iter()) {
-            let limits = crate::gin_index::GinLimits::default();
-            let (a, unevaluable) = crate::gin_index::audit_tenant_streaming(
-                &rows,
-                table.as_ref(),
-                schema,
-                &tenant,
-                decl,
-                &limits,
-            )?;
-            if !a.marker_valid {
-                c.add(FindingKind::IndexRebuildPending, Some(key), 1);
+            let done = match table {
+                Ok(t) => check_gin(&rows, t.as_ref(), schema, &tenant, decl, key, c),
+                Err(_) => Err(ReadFail),
+            };
+            if done.is_err() {
+                c.add(FindingKind::CheckUnavailable, Some(key), 1);
             }
-            c.add(
-                FindingKind::GinIndexEntryMissing,
-                Some(key),
-                a.missing as u64,
-            );
-            c.add(
-                FindingKind::GinIndexEntryDangling,
-                Some(key),
-                a.stale as u64,
-            );
-            c.add(FindingKind::CheckUnevaluable, Some(key), unevaluable);
         }
         for fk in &fks {
-            check_foreign_key(schema, fk, &rows, &tenant, key, options, c)?;
+            if check_foreign_key(schema, fk, &rows, &tenant, key, options, c).is_err() {
+                c.add(FindingKind::CheckUnavailable, Some(key), 1);
+            }
         }
         if allocated {
-            let max = rows
-                .range::<(&str, u64)>((
-                    std::ops::Bound::Included(row_key(&tenant, RowId::from_index_raw(0))),
-                    std::ops::Bound::Included(row_key(&tenant, RowId::from_index_raw(u64::MAX))),
-                ))?
-                .next_back()
-                .transpose()?
-                .map(|(k, _)| split_row_key(k.value()).1.to_index_raw());
-            if let Some(max) = max {
-                let state = match &rowid_state {
-                    Some(t) => t.get((key, tenant.as_str()))?.map(|g| g.value()),
-                    None => None,
-                };
-                // 状態が未作成なら最初の払い出しで既存の最大 rowid から初期化される設計（矛盾ではない）。
-                if state.is_some_and(|last| last < max) {
-                    c.add(FindingKind::RowIdAllocatorBehind, Some(key), 1);
-                }
+            let done = match &rowid_state {
+                Ok(state) => check_rowid_state(&rows, state.as_ref(), &tenant, key, c),
+                Err(_) => Err(ReadFail),
+            };
+            if done.is_err() {
+                c.add(FindingKind::CheckUnavailable, Some(key), 1);
             }
         }
         after = Some(tenant);
+    }
+    Ok(())
+}
+
+/// 項目 6: テナント 1 つ・GIN 索引 1 本の双方向の突き合わせ。
+fn check_gin(
+    rows: &RowsRo,
+    table: Option<&IndexRo>,
+    schema: &TableSchema,
+    tenant: &str,
+    decl: &catalog::DeclaredGinIndex,
+    key: &str,
+    c: &mut Collector,
+) -> Result<(), ReadFail> {
+    let limits = crate::gin_index::GinLimits::default();
+    let (a, unevaluable) =
+        crate::gin_index::audit_tenant_streaming(rows, table, schema, tenant, decl, &limits)?;
+    if !a.marker_valid {
+        c.add(FindingKind::IndexRebuildPending, Some(key), 1);
+    }
+    c.add(
+        FindingKind::GinIndexEntryMissing,
+        Some(key),
+        a.missing as u64,
+    );
+    c.add(
+        FindingKind::GinIndexEntryDangling,
+        Some(key),
+        a.stale as u64,
+    );
+    c.add(FindingKind::CheckUnevaluable, Some(key), unevaluable);
+    Ok(())
+}
+
+/// 項目 8: テナント 1 つの rowid 採番状態が最大 rowid より進んでいるか。
+fn check_rowid_state(
+    rows: &RowsRo,
+    state: Option<&redb::ReadOnlyTable<(&'static str, &'static str), u64>>,
+    tenant: &str,
+    key: &str,
+    c: &mut Collector,
+) -> Result<(), ReadFail> {
+    let max = rows
+        .range::<(&str, u64)>((
+            std::ops::Bound::Included(row_key(tenant, RowId::from_index_raw(0))),
+            std::ops::Bound::Included(row_key(tenant, RowId::from_index_raw(u64::MAX))),
+        ))?
+        .next_back()
+        .transpose()?
+        .map(|(k, _)| split_row_key(k.value()).1.to_index_raw());
+    if let Some(max) = max {
+        let last = match state {
+            Some(t) => t.get((key, tenant))?.map(|g| g.value()),
+            None => None,
+        };
+        // 状態が未作成なら最初の払い出しで既存の最大 rowid から初期化される設計（矛盾ではない）。
+        if last.is_some_and(|last| last < max) {
+            c.add(FindingKind::RowIdAllocatorBehind, Some(key), 1);
+        }
     }
     Ok(())
 }
@@ -787,6 +825,10 @@ fn resolve_foreign_keys<'a>(
                 }
             }
         };
+        if !audit::parent_columns_resolve(&parent_schema, fk) {
+            c.add(FindingKind::ForeignKeyParentMissing, Some(key), 1);
+            continue;
+        }
         let rows_name = catalog::user_rows_table_name(fk.parent_table());
         let parent_rows = match read.open_table(catalog::user_rows_table_def(&rows_name)) {
             Ok(t) => Some(t),
@@ -832,12 +874,15 @@ fn check_foreign_key(
         },
         |acc: &mut audit::ForeignKeyCounts, d| {
             acc.orphans = acc.orphans.saturating_add(d.orphans);
+            acc.unresolved = acc.unresolved.saturating_add(d.unresolved);
             acc.unevaluable = acc.unevaluable.saturating_add(d.unevaluable);
         },
     )?;
     match result {
         Some(d) => {
             c.add(FindingKind::ForeignKeyOrphanRow, Some(key), d.orphans);
+            // 参照先のキー集合が不完全で、孤児と断定できなかった子行は未検査として数える。
+            c.add(FindingKind::CheckUnavailable, Some(key), d.unresolved);
             c.add(FindingKind::CheckUnevaluable, Some(key), d.unevaluable);
         }
         None => c.add(FindingKind::CheckBudgetExceeded, Some(key), 1),
