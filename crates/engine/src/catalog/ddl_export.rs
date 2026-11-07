@@ -28,6 +28,7 @@
 //! （どの種別にも分類されていないカタログ表）も同様に失敗させる（[`classify_redb_table`]）。
 
 mod access;
+mod data;
 mod object;
 mod quote;
 mod table;
@@ -42,6 +43,8 @@ use redb::{ReadableDatabase, TableHandle};
 use super::namespace::schema_names_for_tenant_in_txn;
 use super::{CatalogError, Storage};
 use quote::Namer;
+
+pub use data::{TableDataFormat, TableDataItem, TableDataPart, TableDataSummary};
 
 /// 書き出す範囲。共有分（`public` の表・ビュー・索引・ENUM・SEQUENCE の定義）に、指定したテナント分
 /// （SCHEMA・ロール・関数・トリガ・ポリシー・権限・SEQUENCE の現在値）を足す。
@@ -366,6 +369,83 @@ impl Storage {
         object::export_post_data(&ctx, &mut out)?;
         Ok(SchemaDdlSummary {
             statements: out.count,
+        })
+    }
+}
+
+/// [`Storage::export_logical_dump`] がシンクへ渡す断片（スキーマの文またはデータ）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogicalDumpItem<'a> {
+    /// DDL 文 1 件（`PreData` の全件、データの後に `PostData` の全件の順）。
+    Schema(DdlStatement<'a>),
+    /// 表データの断片 1 件（`PreData` と `PostData` の間）。
+    Data(TableDataItem<'a>),
+}
+
+/// [`Storage::export_logical_dump`] の件数。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LogicalDumpSummary {
+    /// 書き出した DDL 文の数。
+    pub schema: SchemaDdlSummary,
+    /// 書き出したデータの件数。
+    pub data: TableDataSummary,
+}
+
+impl Storage {
+    /// スキーマ（`PreData`）・表データ・スキーマ（`PostData`）を、読み取りトランザクション 1 つの上で
+    /// この順に `sink` へ渡す（RECOVER-16 (1)(2)）。全体が単一の commit 点の内容に対応するため、
+    /// 定義とデータが食い違わない。契約・失敗時の扱いは [`Storage::export_schema_ddl`]・
+    /// [`Storage::export_table_data`] と同じ（一部でも失敗したら出力全体を破棄すること）。
+    ///
+    /// 運用者の CLI（#2162）専用の入口で、テナントの認可は呼び出し側が担う。
+    pub fn export_logical_dump<E>(
+        &self,
+        scope: &SchemaDdlScope,
+        format: TableDataFormat,
+        mut sink: impl FnMut(&LogicalDumpItem<'_>) -> Result<(), E>,
+    ) -> Result<LogicalDumpSummary, SchemaDdlError<E>> {
+        if let Some(t) = scope.tenant() {
+            super::role::validate_tenant(t).map_err(SchemaDdlError::Catalog)?;
+        }
+        let rt = self.db().begin_read().map_err(CatalogError::from)?;
+        ensure_all_tables_classified(&rt)?;
+        let namer = Namer {
+            schemas: match scope.tenant() {
+                Some(t) => schema_names_for_tenant_in_txn(&rt, t)?,
+                None => BTreeMap::new(),
+            },
+        };
+        let ctx = Ctx {
+            rt: &rt,
+            scope,
+            namer,
+        };
+        let mut schema_count: u64 = 0;
+        {
+            let mut schema_sink = |st: &DdlStatement<'_>| sink(&LogicalDumpItem::Schema(*st));
+            let mut out = Emitter {
+                sink: &mut schema_sink,
+                count: 0,
+            };
+            object::export_pre_data(&ctx, &mut out)?;
+            schema_count = schema_count.saturating_add(out.count);
+        }
+        let mut data_sink = |it: &TableDataItem<'_>| sink(&LogicalDumpItem::Data(*it));
+        let data = data::export_table_data_in(&rt, scope, format, &mut data_sink)?;
+        {
+            let mut schema_sink = |st: &DdlStatement<'_>| sink(&LogicalDumpItem::Schema(*st));
+            let mut out = Emitter {
+                sink: &mut schema_sink,
+                count: 0,
+            };
+            object::export_post_data(&ctx, &mut out)?;
+            schema_count = schema_count.saturating_add(out.count);
+        }
+        Ok(LogicalDumpSummary {
+            schema: SchemaDdlSummary {
+                statements: schema_count,
+            },
+            data,
         })
     }
 }

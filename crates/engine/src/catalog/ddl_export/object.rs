@@ -67,6 +67,23 @@ fn table_keys<E>(ctx: &Ctx<'_>) -> Result<Vec<String>, SchemaDdlError<E>> {
     Ok(keys.into_iter().map(|(_, k)| k).collect())
 }
 
+/// データ書き出し（[`super::data`]）の対象になる表のキー一覧（昇順）。行はすべてテナント所有のため、
+/// 共有の表の行も範囲のテナント分は含める（範囲が共有の定義を出すかどうかとは独立）。他テナントの
+/// SCHEMA 配下の表は存在を示さず黙って対象外にする。
+pub(super) fn data_table_keys<E>(ctx: &Ctx<'_>) -> Result<Vec<String>, SchemaDdlError<E>> {
+    let mut keys = Vec::new();
+    for (k, _) in read_str_table::<E>(ctx, CATALOG_TABLE)? {
+        match ctx.namer.scope::<E>(&k)? {
+            KeyScope::Shared | KeyScope::Tenant { .. } => {
+                keys.push((ctx.namer.sort_key::<E>(&k)?, k));
+            }
+            KeyScope::Foreign => {}
+        }
+    }
+    keys.sort();
+    Ok(keys.into_iter().map(|(_, k)| k).collect())
+}
+
 /// 範囲内の索引宣言（名前の昇順）。
 fn index_defs<E>(ctx: &Ctx<'_>) -> Result<Vec<IndexDef>, SchemaDdlError<E>> {
     let mut out = Vec::new();
