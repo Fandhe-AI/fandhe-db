@@ -51,6 +51,7 @@ pub use change_log::incremental::{
     apply_incremental_segments, chain_point_of, ApplySummary, ChainPoint, IncrementalError,
     IncrementalSummary,
 };
+pub use change_log::pitr::{restore_to_point, PitrTarget};
 pub use integrity::{
     FindingKind, IntegrityError, IntegrityFinding, IntegrityOptions, IntegrityReport, Severity,
 };

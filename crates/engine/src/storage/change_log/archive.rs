@@ -686,13 +686,27 @@ fn list_segments(dir: &Path) -> Result<Vec<(PathBuf, SegmentName)>> {
 /// 運用者の検証サブコマンドと [`Storage::verify_change_log_archive`] から呼ばれる。
 pub fn verify_archive_dir(dir: &Path, expect: &ArchiveExpectation) -> Result<ArchiveSummary> {
     check_dir(dir)?;
-    verify_listed(dir, expect, None)
+    verify_listed(dir, expect, None, None)
+}
+
+/// [`verify_archive_dir`] と同じ検証を行い、検証済みの各セグメント（パスと検証結果。LSN 順）も返す。
+/// PITR（`pitr`）が、検証と再生の間にセグメントが差し替えられていないことを再生側で照合するために使う。
+/// 検証の基準は [`verify_archive_dir`] と同一で、二重実装しない。
+pub(super) fn verified_segments(
+    dir: &Path,
+    expect: &ArchiveExpectation,
+) -> Result<(ArchiveSummary, Vec<(PathBuf, SegmentInfo)>)> {
+    check_dir(dir)?;
+    let mut segments = Vec::new();
+    let summary = verify_listed(dir, expect, None, Some(&mut segments))?;
+    Ok((summary, segments))
 }
 
 fn verify_listed(
     dir: &Path,
     expect: &ArchiveExpectation,
     max_payload: Option<usize>,
+    mut collect: Option<&mut Vec<(PathBuf, SegmentInfo)>>,
 ) -> Result<ArchiveSummary> {
     let max_payload = max_payload.unwrap_or(super::CaptureLimits::default().max_payload_bytes);
     let mut summary = ArchiveSummary::default();
@@ -727,6 +741,9 @@ fn verify_listed(
         summary.records = summary.records.saturating_add(h.record_count);
         summary.first_lsn.get_or_insert(h.first_lsn);
         summary.last_lsn = Some(h.last_lsn);
+        if let Some(out) = collect.as_deref_mut() {
+            out.push((path, info));
+        }
     }
     Ok(summary)
 }
@@ -1388,7 +1405,7 @@ pub(in crate::storage) fn verify_against_read(
         timeline: Some(timeline),
         start_lsn: base.checked_add(1),
     };
-    let summary = verify_listed(dir, &expect, None)?;
+    let summary = verify_listed(dir, &expect, None, None)?;
     // 水位が進んでいるのに、その LSN まで届くセグメントが無い（末尾の紛失）。
     if archived > base && summary.last_lsn.is_none_or(|l| l < archived) {
         return Err(ArchiveError::LsnGap);
