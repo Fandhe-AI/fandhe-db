@@ -51,53 +51,51 @@ pub(crate) struct UniqueAuditPlan {
     plan: UniqueKeyPlan,
     compiled: Option<crate::sql::expression_key_index::CompiledIndexExpressions>,
     has_primary_key: bool,
+    excluded: u64,
+    index_comparable: bool,
 }
 
 impl UniqueAuditPlan {
-    /// 現在のカタログ宣言から計画を組み立てる。宣言を解決できなければ `Err`（呼び出し元は未検査として
-    /// 報告する）。
+    /// 宣言 `decls` から計画を組み立てる。一意性に関わる式（一意の式索引・部分 UNIQUE 索引）だけを
+    /// コンパイルし、コンパイルできない索引は計画から外して `excluded` に数える（列の主キー・UNIQUE
+    /// 制約と、他の索引の検査は続ける）。一意でない式索引は一意性に関わらないので見ない。
+    /// `decls_complete` が偽（索引カタログを読めず `decls` が空の代用）のときは、永続索引との突き合わせを
+    /// 行わない（シグネチャが一致しないため）。列の宣言を解決できないなど計画自体を作れなければ `Err`。
     pub(crate) fn build(
-        read_txn: &redb::ReadTransaction,
-        table_name: &str,
         schema: &TableSchema,
+        decls: &crate::catalog::TableExpressionDecls,
+        decls_complete: bool,
     ) -> Result<Self, TenantWriteError> {
-        let decls = crate::catalog::table_expression_decls_in_read_txn(read_txn, table_name)?;
-        // 一意性に関わる式（一意の式索引の要素）だけをコンパイルする。一意でない式索引の宣言が壊れて
-        // いても、列の主キー・UNIQUE 制約の重複検査と一意索引の突き合わせを止めない。式要素の位置
-        // （`UniqueElementDecl::Expr`）は絞り込み後の並びへ振り直す。
-        let unique_names: HashSet<&str> = decls
-            .uniques
-            .iter()
-            .map(|u| u.index_name.as_str())
-            .collect();
-        let mut remap: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
-        let mut keys = Vec::new();
-        for (pos, key) in decls.keys.iter().enumerate() {
-            if unique_names.contains(key.index_name.as_str()) {
-                remap.insert(pos, keys.len());
-                keys.push(key.clone());
+        let mut excluded = 0u64;
+        let mut kept_uniques: Vec<String> = Vec::new();
+        for unique in &decls.uniques {
+            let names: HashSet<&str> = std::iter::once(unique.index_name.as_str()).collect();
+            let usable = narrow(decls, &names, &[])
+                .and_then(|n| compile_plan(schema, &n))
+                .is_ok();
+            if usable {
+                kept_uniques.push(unique.index_name.clone());
+            } else {
+                excluded = excluded.saturating_add(1);
             }
         }
-        let mut narrowed = decls.clone();
-        narrowed.keys = keys;
-        for unique in &mut narrowed.uniques {
-            for element in &mut unique.elements {
-                if let crate::catalog::UniqueElementDecl::Expr(pos) = element {
-                    *pos = *remap.get(pos).ok_or_else(|| {
-                        internal("unique expression index element not found in declarations")
-                    })?;
-                }
+        let mut kept_partials = Vec::new();
+        for partial in decls.partials.iter().filter(|p| p.unique) {
+            if UniqueKeyPlan::for_single_partial_unique_index(schema, partial).is_ok() {
+                kept_partials.push(partial.clone());
+            } else {
+                excluded = excluded.saturating_add(1);
             }
         }
-        let plan = UniqueKeyPlan::build(schema, &narrowed)?;
-        let compiled = crate::sql::expression_key_index::CompiledIndexExpressions::compile(
-            schema,
-            &narrowed.keys,
-        )?;
+        let names: HashSet<&str> = kept_uniques.iter().map(String::as_str).collect();
+        let narrowed = narrow(decls, &names, &kept_partials)?;
+        let (plan, compiled) = compile_plan(schema, &narrowed)?;
         Ok(Self {
             plan,
             compiled,
             has_primary_key: schema.primary_key().is_some(),
+            excluded,
+            index_comparable: decls_complete && excluded == 0,
         })
     }
 
@@ -105,6 +103,72 @@ impl UniqueAuditPlan {
     pub(crate) fn is_empty(&self) -> bool {
         self.plan.is_empty()
     }
+
+    /// コンパイルできず計画から外した一意索引の数。
+    pub(crate) fn excluded(&self) -> u64 {
+        self.excluded
+    }
+
+    /// 永続一意索引と突き合わせられるか（宣言が完全で、外した索引が無い）。
+    pub(crate) fn index_comparable(&self) -> bool {
+        self.index_comparable
+    }
+}
+
+/// `names` の一意の式索引と `partials` だけを残した宣言を作る（式要素の位置は並びに合わせて振り直す）。
+fn narrow(
+    decls: &crate::catalog::TableExpressionDecls,
+    names: &HashSet<&str>,
+    partials: &[crate::catalog::DeclaredPartialIndex],
+) -> Result<crate::catalog::TableExpressionDecls, TenantWriteError> {
+    let mut remap: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    let mut keys = Vec::new();
+    for (pos, key) in decls.keys.iter().enumerate() {
+        if names.contains(key.index_name.as_str()) {
+            remap.insert(pos, keys.len());
+            keys.push(key.clone());
+        }
+    }
+    let mut uniques: Vec<_> = decls
+        .uniques
+        .iter()
+        .filter(|u| names.contains(u.index_name.as_str()))
+        .cloned()
+        .collect();
+    for unique in &mut uniques {
+        for element in &mut unique.elements {
+            if let crate::catalog::UniqueElementDecl::Expr(pos) = element {
+                *pos = *remap.get(pos).ok_or_else(|| {
+                    internal("unique expression index element not found in declarations")
+                })?;
+            }
+        }
+    }
+    Ok(crate::catalog::TableExpressionDecls {
+        keys,
+        uniques,
+        partials: partials.to_vec(),
+        gins: Vec::new(),
+    })
+}
+
+/// 絞り込み済みの宣言から一意キー計画と式のコンパイル結果を作る。
+fn compile_plan(
+    schema: &TableSchema,
+    narrowed: &crate::catalog::TableExpressionDecls,
+) -> Result<
+    (
+        UniqueKeyPlan,
+        Option<crate::sql::expression_key_index::CompiledIndexExpressions>,
+    ),
+    TenantWriteError,
+> {
+    let plan = UniqueKeyPlan::build(schema, narrowed)?;
+    let compiled = crate::sql::expression_key_index::CompiledIndexExpressions::compile(
+        schema,
+        &narrowed.keys,
+    )?;
+    Ok((plan, compiled))
 }
 
 /// [`duplicate_keys_in_tenant`] の件数。

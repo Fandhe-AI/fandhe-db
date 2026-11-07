@@ -110,6 +110,8 @@ pub enum Severity {
 pub enum FindingKind {
     /// カタログのエントリを復号できない。
     CatalogEntryUndecodable,
+    /// 索引カタログのエントリを復号できない（式・GIN・部分索引の宣言を読めない）。
+    IndexCatalogEntryUndecodable,
     /// カタログにある表の行ストアが無い（索引に行の痕跡がある）。
     RowStoreMissing,
     /// 行ストアの物理キー形式が現行と合わない。
@@ -161,6 +163,7 @@ impl FindingKind {
         use FindingKind::*;
         match self {
             CatalogEntryUndecodable
+            | IndexCatalogEntryUndecodable
             | RowStoreMissing
             | RowStoreFormatMismatch
             | OrphanRowStore
@@ -187,6 +190,7 @@ impl FindingKind {
         use FindingKind::*;
         match self {
             CatalogEntryUndecodable => "catalog_entry_undecodable",
+            IndexCatalogEntryUndecodable => "index_catalog_entry_undecodable",
             RowStoreMissing => "row_store_missing",
             RowStoreFormatMismatch => "row_store_format_mismatch",
             OrphanRowStore => "orphan_row_store",
@@ -472,6 +476,16 @@ fn check_catalog(
     c: &mut Collector,
     report: &mut IntegrityReport,
 ) {
+    // 索引カタログは全表の宣言を一度に読むため、壊れたエントリは 1 件でも全表の宣言の取得を失敗させる。
+    // 壊れていること自体をここで 1 回だけ報告し、各表は宣言を使う検査だけを未検査にして続ける。
+    match catalog::table_expression_decls_in_read_txn(read, "") {
+        Ok(_) => {}
+        Err(e) => c.add(
+            decode_failure_kind(&e, FindingKind::IndexCatalogEntryUndecodable),
+            None,
+            1,
+        ),
+    }
     let mut after: Option<String> = None;
     loop {
         let key = match catalog::next_catalog_key_after(read, after.as_deref()) {
@@ -489,9 +503,23 @@ fn check_catalog(
                     c.add(FindingKind::CheckUnavailable, Some(&key), 1);
                 }
             }
-            Err(_) => c.add(FindingKind::CatalogEntryUndecodable, Some(&key), 1),
+            // 復号の失敗だけが矛盾で、読み取りの失敗は未検査。
+            Err(e) => c.add(
+                decode_failure_kind(&e, FindingKind::CatalogEntryUndecodable),
+                Some(&key),
+                1,
+            ),
         }
         after = Some(key);
+    }
+}
+
+/// カタログ読み取りの失敗を種類へ写す: 値の破損（復号・検証の失敗）は `corrupt`、それ以外
+/// （redb の読み取り失敗など）は検査できなかったこととして `CheckUnavailable`。
+fn decode_failure_kind(e: &catalog::CatalogError, corrupt: FindingKind) -> FindingKind {
+    match e {
+        catalog::CatalogError::CorruptSchema(_) | catalog::CatalogError::Invalid(_) => corrupt,
+        _ => FindingKind::CheckUnavailable,
     }
 }
 
@@ -511,41 +539,28 @@ fn check_table(
     let uniq: Option<IndexRo> = match read.open_table(catalog::user_uniq_table_def(&uniq_name)) {
         Ok(t) => Some(t),
         Err(redb::TableError::TableDoesNotExist(_)) => None,
-        Err(redb::TableError::TableTypeMismatch { .. }) => {
+        // 型違い・読み取り失敗のどちらも「索引が無い」ではなく未検査。
+        Err(_) => {
             c.add(FindingKind::CheckUnavailable, Some(key), 1);
             uniq_unreadable = true;
             None
         }
-        Err(_) => return Err(ReadFail),
     };
-    let decls = catalog::table_expression_decls_in_read_txn(read, key)?;
+    // 索引カタログを読めなくても、行の復号・主キーの重複・FK など宣言に依存しない検査は続ける。
+    // 壊れたエントリ自体は `check_catalog` が報告済みなので、ここでは未検査の印だけ数える。
+    let (decls, decls_complete) = match catalog::table_expression_decls_in_read_txn(read, key) {
+        Ok(d) => (d, true),
+        Err(_) => {
+            c.add(FindingKind::CheckUnavailable, Some(key), 1);
+            (catalog::TableExpressionDecls::default(), false)
+        }
+    };
     let rows: RowsRo = match read.open_table(catalog::user_rows_table_def(&rows_name)) {
         Ok(t) => t,
         Err(redb::TableError::TableDoesNotExist(_)) => {
-            // 行ストアは初回の挿入まで作られない設計。行を書いた証拠があるときだけ欠落とする。
-            // 証拠 1: 採番方式の表は、挿入と同じ Tx で rowid 採番状態が書かれ、行を消しても残る
-            // （表の削除で消え、改名で新名へ移る: `catalog::rowid_alloc`）。
-            let allocated = matches!(schema.row_identity(), catalog::RowIdentity::Allocated);
-            let mut evidence = allocated && has_rowid_state(read, key)?;
-            // 証拠 2: 索引に行の痕跡（正引き・ポスティング）がある。
-            evidence = evidence
-                || match &uniq {
-                    Some(u) => has_entry_with_tag(u, 0x01)?,
-                    None => false,
-                };
-            for decl in &decls.gins {
-                let name = catalog::user_gin_table_name(&decl.index_name);
-                match read.open_table(catalog::user_gin_table_def(&name)) {
-                    Ok(t) => evidence = evidence || has_entry_with_tag(&t, 0x01)?,
-                    Err(redb::TableError::TableDoesNotExist(_)) => {}
-                    Err(_) => return Err(ReadFail),
-                }
-            }
-            if evidence {
-                c.add(FindingKind::RowStoreMissing, Some(key), 1);
-            } else if !allocated {
-                // 従来方式・移行済みの表は行を書いた証拠が残らず、作成直後の表と区別できない。
-                c.add(FindingKind::RowStoreAbsentUnverified, Some(key), 1);
+            // 証拠を読めなければ、欠落とも「不明」とも断定せず未検査にする。
+            if report_absent_row_store(read, key, schema, &decls, uniq.as_ref(), c).is_err() {
+                c.add(FindingKind::CheckUnavailable, Some(key), 1);
             }
             return Ok(());
         }
@@ -556,11 +571,18 @@ fn check_table(
         Err(_) => return Err(ReadFail),
     };
 
-    scan_rows(&rows, key, schema, c, report)?;
+    // 行の走査が途中で失敗しても、他の検査（キー・FK・索引）は続ける。
+    if scan_rows(&rows, key, schema, c, report).is_err() {
+        c.add(FindingKind::CheckUnavailable, Some(key), 1);
+    }
 
     // 以降はテナントごと。
-    let plan = match audit::UniqueAuditPlan::build(read, key, schema) {
-        Ok(p) => Some(p),
+    let plan = match audit::UniqueAuditPlan::build(schema, &decls, decls_complete) {
+        Ok(p) => {
+            // コンパイルできず外した一意索引は、その索引だけを未検査にする。
+            c.add(FindingKind::CheckUnavailable, Some(key), p.excluded());
+            Some(p)
+        }
         Err(_) => {
             c.add(FindingKind::CheckUnavailable, Some(key), 1);
             None
@@ -629,6 +651,47 @@ fn check_table(
             }
         }
         after = Some(tenant);
+    }
+    Ok(())
+}
+
+/// 行ストアが無い表について、行を書いた証拠を調べて報告する。
+/// 行ストアは初回の挿入まで作られない設計なので、行を書いた証拠があるときだけ欠落とする。
+/// 証拠 1: 採番方式の表は、挿入と同じ Tx で rowid 採番状態が書かれ、行を消しても残る
+/// （表の削除で消え、改名で新名へ移る: `catalog::rowid_alloc`）。
+/// 証拠 2: 索引に行の痕跡（正引き・ポスティング）がある。
+fn report_absent_row_store(
+    read: &ReadTransaction,
+    key: &str,
+    schema: &TableSchema,
+    decls: &catalog::TableExpressionDecls,
+    uniq: Option<&IndexRo>,
+    c: &mut Collector,
+) -> Result<(), ReadFail> {
+    let allocated = matches!(schema.row_identity(), catalog::RowIdentity::Allocated);
+    let mut evidence = allocated && has_rowid_state(read, key)?;
+    evidence = evidence
+        || match uniq {
+            Some(u) => has_entry_with_tag(u, 0x01)?,
+            None => false,
+        };
+    // 読めない GIN 表があっても、他の証拠で欠落が確定していればそれを報告する。
+    let mut unreadable = false;
+    for decl in &decls.gins {
+        let name = catalog::user_gin_table_name(&decl.index_name);
+        match read.open_table(catalog::user_gin_table_def(&name)) {
+            Ok(t) => evidence = evidence || has_entry_with_tag(&t, 0x01)?,
+            Err(redb::TableError::TableDoesNotExist(_)) => {}
+            Err(_) => unreadable = true,
+        }
+    }
+    if evidence {
+        c.add(FindingKind::RowStoreMissing, Some(key), 1);
+    } else if unreadable {
+        return Err(ReadFail);
+    } else if !allocated {
+        // 従来方式・移行済みの表は行を書いた証拠が残らず、作成直後の表と区別できない。
+        c.add(FindingKind::RowStoreAbsentUnverified, Some(key), 1);
     }
     Ok(())
 }
@@ -768,7 +831,8 @@ fn check_unique(
     if plan.is_empty() {
         return Ok(());
     }
-    let dup = run_partitioned(
+    // 行の重複検査（索引に依存しない）と索引の突き合わせは独立で、片方の失敗でもう片方を止めない。
+    match run_partitioned(
         |part, parts| {
             Ok(audit::duplicate_keys_in_tenant(
                 plan,
@@ -785,28 +849,35 @@ fn check_unique(
             acc.unique = acc.unique.saturating_add(d.unique);
             acc.unevaluable = acc.unevaluable.saturating_add(d.unevaluable);
         },
-    )?;
-    match dup {
-        Some(d) => {
+    ) {
+        Ok(Some(d)) => {
             c.add(FindingKind::PrimaryKeyDuplicate, Some(key), d.primary_key);
             c.add(FindingKind::UniqueKeyDuplicate, Some(key), d.unique);
             c.add(FindingKind::CheckUnevaluable, Some(key), d.unevaluable);
         }
-        None => c.add(FindingKind::CheckBudgetExceeded, Some(key), 1),
+        Ok(None) => c.add(FindingKind::CheckBudgetExceeded, Some(key), 1),
+        Err(_) => c.add(FindingKind::CheckUnavailable, Some(key), 1),
+    }
+    // 宣言が不完全・外した索引がある場合は、永続索引のシグネチャと一致しないため突き合わせない
+    // （未検査は表単位で記録済み）。
+    if !plan.index_comparable() {
+        return Ok(());
     }
     match uniq {
-        // 読めない索引は呼び出し側が `CheckUnavailable` を記録済み。行の重複検査は上で済んでいる。
+        // 読めない索引は呼び出し側が `CheckUnavailable` を記録済み。
         None if uniq_unreadable => {}
         None => c.add(FindingKind::IndexRebuildPending, Some(key), 1),
-        Some(index) => {
-            let a = audit::unique_index_audit(plan, schema, rows, index, tenant)?;
-            if !a.marker_valid {
-                c.add(FindingKind::IndexRebuildPending, Some(key), 1);
+        Some(index) => match audit::unique_index_audit(plan, schema, rows, index, tenant) {
+            Ok(a) => {
+                if !a.marker_valid {
+                    c.add(FindingKind::IndexRebuildPending, Some(key), 1);
+                }
+                c.add(FindingKind::UniqueIndexEntryMissing, Some(key), a.missing);
+                c.add(FindingKind::UniqueIndexEntryDangling, Some(key), a.dangling);
+                c.add(FindingKind::CheckUnevaluable, Some(key), a.unevaluable);
             }
-            c.add(FindingKind::UniqueIndexEntryMissing, Some(key), a.missing);
-            c.add(FindingKind::UniqueIndexEntryDangling, Some(key), a.dangling);
-            c.add(FindingKind::CheckUnevaluable, Some(key), a.unevaluable);
-        }
+            Err(_) => c.add(FindingKind::CheckUnavailable, Some(key), 1),
+        },
     }
     Ok(())
 }

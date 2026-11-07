@@ -975,3 +975,128 @@ fn broken_non_unique_expression_index_does_not_stop_the_key_checks() {
     // 一意でない式索引は一意性に関わらないので、主キーの重複検出は止まらない。
     assert_eq!(report.total(FindingKind::PrimaryKeyDuplicate), 1);
 }
+
+#[test]
+fn broken_index_catalog_entry_is_reported_and_independent_checks_continue() {
+    let (path, _g) = build_db("integrity-index-catalog-broken");
+    let (_, value) = first_row(&path, PARENT_ROWS, TENANTS[0]);
+    let (orphan_parent, _) = first_row(&path, PARENT_ROWS, TENANTS[1]);
+    corrupt(&path, |w| {
+        // 索引カタログに復号できないエントリを足す（全表の宣言の取得が失敗する）。
+        let mut cat = w
+            .open_table(TableDefinition::<&str, &[u8]>::new("index_catalog"))
+            .expect("index catalog");
+        cat.insert("zz_broken", b"garbage".as_slice())
+            .expect("broken entry");
+        let mut rows = w.open_table(PARENT_ROWS).expect("rows");
+        rows.insert((TENANTS[0], 960_000u64), [0xFFu8].as_slice())
+            .expect("garbage row");
+        rows.insert((TENANTS[0], 960_001u64), value.as_slice())
+            .expect("dup");
+        rows.remove((TENANTS[1], orphan_parent)).expect("orphan");
+    });
+    let report = verify(&path);
+    assert_eq!(report.total(FindingKind::IndexCatalogEntryUndecodable), 1);
+    assert_eq!(
+        FindingKind::IndexCatalogEntryUndecodable.severity(),
+        Severity::Error
+    );
+    // 宣言に依存しない検査は続く。
+    assert_eq!(report.total(FindingKind::RowUndecodable), 1);
+    assert_eq!(report.total(FindingKind::PrimaryKeyDuplicate), 1);
+    assert_eq!(report.total(FindingKind::ForeignKeyOrphanRow), 1);
+    // 宣言を使う検査は未検査になる（遅延再構築待ちなどの誤報は出ない）。
+    assert!(report.total(FindingKind::CheckUnavailable) >= 1);
+    assert_eq!(report.total(FindingKind::IndexRebuildPending), 0);
+    assert!(!report.is_consistent());
+}
+
+#[test]
+fn broken_unique_expression_index_only_disables_that_index() {
+    let (path, _g) = build_db("integrity-unique-expr-broken");
+    {
+        let core = core_at(&path);
+        run(
+            &core,
+            TENANTS[0],
+            "CREATE UNIQUE INDEX parents_lower_code ON parents ((lower(code)))",
+        );
+    }
+    let (_, value) = first_row(&path, PARENT_ROWS, TENANTS[0]);
+    corrupt(&path, |w| {
+        let mut t = w
+            .open_table(TableDefinition::<&str, &[u8]>::new("index_catalog"))
+            .expect("index catalog");
+        let old = t
+            .get("parents_lower_code")
+            .expect("get")
+            .expect("entry")
+            .value()
+            .to_vec();
+        // `lower(code)` → `lower(nope)`（16 進で保存。長さは同じ）。
+        let from = b"6c6f77657228636f646529";
+        let at = old
+            .windows(from.len())
+            .position(|b| b == from)
+            .expect("expression text");
+        let mut forged = old.clone();
+        forged[at..at + from.len()].copy_from_slice(b"6c6f776572286e6f706529");
+        t.insert("parents_lower_code", forged.as_slice())
+            .expect("write");
+        let mut rows = w.open_table(PARENT_ROWS).expect("rows");
+        rows.insert((TENANTS[0], 970_000u64), value.as_slice())
+            .expect("dup");
+    });
+    let report = verify(&path);
+    // 列の主キーの重複は、式索引がコンパイルできなくても検出される。
+    assert_eq!(report.total(FindingKind::PrimaryKeyDuplicate), 1);
+    assert!(report.total(FindingKind::CheckUnavailable) >= 1);
+    // 永続索引と突き合わせられないので、欠落・再構築待ちの誤報は出ない。
+    assert_eq!(report.total(FindingKind::UniqueIndexEntryMissing), 0);
+    assert!(!report.findings.iter().any(
+        |f| f.kind == FindingKind::IndexRebuildPending && f.table.as_deref() == Some("parents")
+    ));
+    assert!(!report.is_consistent());
+}
+
+#[test]
+fn unreadable_unique_index_entry_value_is_unevaluable_not_missing() {
+    let (path, _g) = build_db("integrity-uniq-entry-unreadable");
+    corrupt(&path, |w| {
+        let mut t = w.open_table(PARENT_UNIQ).expect("uniq");
+        let victim = {
+            let mut found = None;
+            for e in t.iter().expect("iter") {
+                let (k, _) = e.expect("entry");
+                let (tenant, sub) = k.value();
+                if tenant == TENANTS[0] && sub.first() == Some(&0x01) {
+                    found = Some(sub.to_vec());
+                    break;
+                }
+            }
+            found.expect("a forward entry")
+        };
+        // 値の長さが不正（行 id を復号できない）。
+        t.insert((TENANTS[0], victim.as_slice()), [1u8, 2, 3].as_slice())
+            .expect("write");
+    });
+    let report = verify(&path);
+    assert_eq!(report.total(FindingKind::UniqueIndexEntryMissing), 0);
+    assert!(report.total(FindingKind::CheckUnevaluable) >= 1);
+    assert!(!report.is_consistent());
+}
+
+#[test]
+fn unreadable_gin_table_does_not_hide_a_confirmed_row_store_loss() {
+    let (path, _g) = build_db("integrity-absent-evidence");
+    corrupt(&path, |w| {
+        w.delete_table(PARENT_ROWS).expect("drop rows");
+        w.delete_table(PARENT_GIN).expect("drop gin");
+        w.open_table(TableDefinition::<u8, u8>::new("user_gin/parents_doc"))
+            .expect("replace gin");
+    });
+    let report = verify(&path);
+    // 一意索引の痕跡で欠落が確定しているので、GIN 表を読めなくても報告される。
+    assert_eq!(report.total(FindingKind::RowStoreMissing), 1);
+    assert!(!report.is_consistent());
+}

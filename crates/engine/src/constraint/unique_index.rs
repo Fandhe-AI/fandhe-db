@@ -698,9 +698,15 @@ where
                 audit.unevaluable = audit.unevaluable.saturating_add(1);
                 continue;
             };
-            let owner = lookup_forward_read_only(index_table, tenant_id, ordinal_u16, &canonical)
-                .ok()
-                .flatten();
+            // 読み取り・復号の失敗は「索引に無い」ではなく突き合わせられなかった件数に数える。
+            let owner =
+                match lookup_forward_read_only(index_table, tenant_id, ordinal_u16, &canonical) {
+                    Ok(owner) => owner,
+                    Err(_) => {
+                        audit.unevaluable = audit.unevaluable.saturating_add(1);
+                        continue;
+                    }
+                };
             if owner != Some(id) {
                 audit.missing = audit.missing.saturating_add(1);
             }
