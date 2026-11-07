@@ -35,6 +35,7 @@
 //! `sql::allowlist` との関係（TASK-74、対象ビヘイビア: SQL-8）: `impl TableLookup for
 //! Storage`（本ファイル下部）が SQL 表層の FROM テーブル存在確認を橋渡しする。
 
+use crate::storage::change_log::CaptureWriteTxn as _;
 use std::fmt;
 use std::sync::Arc;
 
@@ -180,7 +181,7 @@ const INDEX_CATALOG_GENERATION_KEY: &str = "generation";
 /// 検出し、新規 variant を追加せず既存の [`CatalogError::TableGenerationCounterOverflow`]
 /// を流用する（`core_api.snapshot` の破壊的変更を避けるため）。
 fn bump_index_catalog_generation_in_txn(write_txn: &redb::WriteTransaction) -> Result<()> {
-    let mut gen_table = write_txn.open_table(INDEX_CATALOG_GENERATION_TABLE)?;
+    let mut gen_table = write_txn.open_table_logged(INDEX_CATALOG_GENERATION_TABLE)?;
     let current = gen_table
         .get(INDEX_CATALOG_GENERATION_KEY)?
         .map(|v| v.value())
@@ -1700,7 +1701,7 @@ pub(crate) fn table_expression_decls_in_txn(
     write_txn: &redb::WriteTransaction,
     table: &str,
 ) -> Result<TableExpressionDecls> {
-    match write_txn.open_table(INDEX_CATALOG_TABLE) {
+    match write_txn.open_table_logged(INDEX_CATALOG_TABLE) {
         Ok(t) => table_expression_decls_from(&t, table),
         Err(redb::TableError::TableDoesNotExist(_)) => Ok(TableExpressionDecls::default()),
         Err(e) => Err(e.into()),
@@ -1735,6 +1736,31 @@ pub(crate) fn gin_decl_in_read_txn(
             opclass,
         },
     )))
+}
+
+/// 索引カタログの全エントリを復号して、復号できないエントリの数を返す（整合検査
+/// `storage::integrity`。RECOVER-13 のポインタ）。[`table_expression_decls_in_read_txn`] は別表と確定した
+/// エントリを復号せずに読み飛ばし、1 件の破損が表ごとの失敗として現れるため、エントリ単位で
+/// 1 件ずつ数える。読み取り自体の失敗は `Err`（破損とは区別する）。
+pub(crate) fn count_undecodable_index_entries(read_txn: &redb::ReadTransaction) -> Result<u64> {
+    let table = match read_txn.open_table(INDEX_CATALOG_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(0),
+        Err(e) => return Err(e.into()),
+    };
+    let mut bad = 0u64;
+    for entry in table.iter()? {
+        let (key, value) = entry?;
+        match decode_index_def(key.value(), value.value()) {
+            // GIN 宣言は列を 1 個だけ持つ。無い値は宣言の取得側が破損として拒否するものと同じ。
+            Ok(def) if matches!(def.kind, IndexKind::Gin(_)) && def.columns.is_empty() => {
+                bad = bad.saturating_add(1);
+            }
+            Ok(_) => {}
+            Err(_) => bad = bad.saturating_add(1),
+        }
+    }
+    Ok(bad)
 }
 
 /// [`table_expression_decls_in_txn`] の read txn 版（クラッシュ耐性検証の読み取り専用診断が使う）。
@@ -2170,7 +2196,7 @@ fn unique_index_def_for_table_in_txn(
     table: &str,
     name: &str,
 ) -> Result<bool> {
-    let index_table = match write_txn.open_table(INDEX_CATALOG_TABLE) {
+    let index_table = match write_txn.open_table_logged(INDEX_CATALOG_TABLE) {
         Ok(t) => t,
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
         Err(e) => return Err(e.into()),
@@ -2194,7 +2220,7 @@ fn unique_index_names_for_table_in_txn(
     write_txn: &redb::WriteTransaction,
     table: &str,
 ) -> Result<Vec<String>> {
-    let index_table = match write_txn.open_table(INDEX_CATALOG_TABLE) {
+    let index_table = match write_txn.open_table_logged(INDEX_CATALOG_TABLE) {
         Ok(t) => t,
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
         Err(e) => return Err(e.into()),
@@ -2304,7 +2330,7 @@ fn build_unique_index_schema_in_txn(
         assign_unique_constraint_names(schema.clone().with_unique_constraints(constraints));
     validate_schema(&updated)?;
     let row_table_name = user_rows_table_name(&def.table);
-    match write_txn.open_table(user_rows_table_def(&row_table_name)) {
+    match write_txn.open_table_logged(user_rows_table_def(&row_table_name)) {
         Ok(row_table) => {
             if crate::constraint::table_has_duplicate_unique_key(
                 &row_table,
@@ -2365,10 +2391,10 @@ fn drop_unique_index_constraint_in_txn(
     let updated = schema.clone().with_unique_constraints(constraints);
     let encoded = encode_schema(&updated)?;
     {
-        let mut catalog_table = write_txn.open_table(CATALOG_TABLE)?;
+        let mut catalog_table = write_txn.open_table_logged(CATALOG_TABLE)?;
         catalog_table.insert(def.table.as_str(), encoded.as_slice())?;
     }
-    write_txn.delete_table(user_uniq_table_def(&user_uniq_table_name(&def.table)))?;
+    write_txn.delete_table_logged(user_uniq_table_def(&user_uniq_table_name(&def.table)))?;
     let required = required_key_index_names_in_txn(write_txn, &def.table)?;
     crate::key_index::prune_unneeded_indexes_in_txn(write_txn, &def.table, &required)?;
     Ok(())
@@ -2399,7 +2425,7 @@ fn foreign_keys_relying_on_unique_columns_in_txn(
 /// 判定する（relation 名前空間の衝突・種別判定用）。索引カタログ自体が未作成
 /// （宣言 0 件）の場合は `false`。
 fn index_name_exists_in_txn(write_txn: &redb::WriteTransaction, name: &str) -> Result<bool> {
-    match write_txn.open_table(INDEX_CATALOG_TABLE) {
+    match write_txn.open_table_logged(INDEX_CATALOG_TABLE) {
         Ok(t) => Ok(t.get(name)?.is_some()),
         Err(redb::TableError::TableDoesNotExist(_)) => Ok(false),
         Err(e) => Err(e.into()),
@@ -2409,7 +2435,7 @@ fn index_name_exists_in_txn(write_txn: &redb::WriteTransaction, name: &str) -> R
 /// `name` が [`CATALOG_TABLE`] に表として登録済みかを write txn 内で判定する
 /// （relation 名前空間の衝突・存在確認用。表が未作成なら `false` で、表を作らない）。
 pub(crate) fn table_exists_in_txn(write_txn: &redb::WriteTransaction, name: &str) -> Result<bool> {
-    match write_txn.open_table(CATALOG_TABLE) {
+    match write_txn.open_table_logged(CATALOG_TABLE) {
         Ok(t) => Ok(t.get(name)?.is_some()),
         Err(redb::TableError::TableDoesNotExist(_)) => Ok(false),
         Err(e) => Err(e.into()),
@@ -2418,7 +2444,7 @@ pub(crate) fn table_exists_in_txn(write_txn: &redb::WriteTransaction, name: &str
 
 /// `name` が [`VIEWS_TABLE`] にビューとして登録済みかを write txn 内で判定する。
 fn view_exists_in_txn(write_txn: &redb::WriteTransaction, name: &str) -> Result<bool> {
-    match write_txn.open_table(VIEWS_TABLE) {
+    match write_txn.open_table_logged(VIEWS_TABLE) {
         Ok(t) => Ok(t.get(name)?.is_some()),
         Err(redb::TableError::TableDoesNotExist(_)) => Ok(false),
         Err(e) => Err(e.into()),
@@ -2430,7 +2456,7 @@ fn view_exists_in_txn(write_txn: &redb::WriteTransaction, name: &str) -> Result<
 /// ため、`index_name_exists_in_txn` を呼ぶ DDL の衝突・種別判定には必ず併記する。
 /// 表が未作成なら `false` で、表を作らない。
 fn materialized_view_exists_in_txn(write_txn: &redb::WriteTransaction, name: &str) -> Result<bool> {
-    match write_txn.open_table(materialized::MATERIALIZED_VIEWS_TABLE) {
+    match write_txn.open_table_logged(materialized::MATERIALIZED_VIEWS_TABLE) {
         Ok(t) => Ok(t.get(name)?.is_some()),
         Err(redb::TableError::TableDoesNotExist(_)) => Ok(false),
         Err(e) => Err(e.into()),
@@ -2452,7 +2478,7 @@ fn retain_index_defs_in_txn(
     mut keep: impl FnMut(&IndexDef) -> bool,
 ) -> Result<()> {
     let removed = {
-        let mut index_table = match write_txn.open_table(INDEX_CATALOG_TABLE) {
+        let mut index_table = match write_txn.open_table_logged(INDEX_CATALOG_TABLE) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
             Err(e) => return Err(e.into()),
@@ -2516,7 +2542,7 @@ fn rewrite_views_for_renamed_table_in_txn(
                 .to_string(),
         })
     };
-    let mut views_table = match write_txn.open_table(VIEWS_TABLE) {
+    let mut views_table = match write_txn.open_table_logged(VIEWS_TABLE) {
         Ok(t) => t,
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
         Err(e) => return Err(CatalogError::from(e).into()),
@@ -2599,7 +2625,7 @@ fn rewrite_views_for_renamed_column_in_txn(
                 .to_string(),
         })
     };
-    let mut views_table = match write_txn.open_table(VIEWS_TABLE) {
+    let mut views_table = match write_txn.open_table_logged(VIEWS_TABLE) {
         Ok(t) => t,
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
         Err(e) => return Err(CatalogError::from(e).into()),
@@ -2741,7 +2767,7 @@ fn rename_index_def_columns_in_txn(
         })
     };
     let (rewritten, unique_expression_touched) = {
-        let mut index_table = match write_txn.open_table(INDEX_CATALOG_TABLE) {
+        let mut index_table = match write_txn.open_table_logged(INDEX_CATALOG_TABLE) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
             Err(e) => return Err(CatalogError::from(e).into()),
@@ -2868,7 +2894,7 @@ fn rename_index_def_table_in_txn(
     new: &str,
 ) -> Result<()> {
     let rewritten = {
-        let mut index_table = match write_txn.open_table(INDEX_CATALOG_TABLE) {
+        let mut index_table = match write_txn.open_table_logged(INDEX_CATALOG_TABLE) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
             Err(e) => return Err(e.into()),
@@ -2922,7 +2948,7 @@ fn delete_indexes_referencing_column_in_txn(
     // 索引カタログのハンドルを `retain_index_defs_in_txn` が閉じた後に呼ぶ。
     if removed_unique_expression_index {
         write_txn
-            .delete_table(user_uniq_table_def(&user_uniq_table_name(table_name)))
+            .delete_table_logged(user_uniq_table_def(&user_uniq_table_name(table_name)))
             .map_err(CatalogError::from)?;
     }
     Ok(())
@@ -2944,7 +2970,7 @@ fn column_referenced_by_views_in_txn(
     if !schema.columns.iter().any(|c| c.name == column_name) {
         return Err(CatalogError::ColumnNotFound(column_name.to_string()));
     }
-    match write_txn.open_table(VIEWS_TABLE) {
+    match write_txn.open_table_logged(VIEWS_TABLE) {
         Ok(views_table) => {
             let remaining: Vec<String> = ["id", "tenant_id", "visibility"]
                 .iter()
@@ -3123,7 +3149,7 @@ fn alter_column_type_rewrite_expr_in_txn(
     }
     let encoded = encode_schema(&schema)?;
     let mut table = write_txn
-        .open_table(CATALOG_TABLE)
+        .open_table_logged(CATALOG_TABLE)
         .map_err(CatalogError::from)?;
     table
         .insert(table_name, encoded.as_slice())
@@ -3175,7 +3201,7 @@ fn validate_dependents_statically_in_txn(
     new_schema: &TableSchema,
     column_name: &str,
 ) -> std::result::Result<(), AlterCheckError> {
-    match write_txn.open_table(INDEX_CATALOG_TABLE) {
+    match write_txn.open_table_logged(INDEX_CATALOG_TABLE) {
         Ok(index_table) => {
             for (scanned, entry) in index_table.iter().map_err(CatalogError::from)?.enumerate() {
                 if scanned >= MAX_INDEX_COUNT {
@@ -3333,7 +3359,7 @@ fn invalidate_user_uniq_if_key_column_in_txn(
             .any(|u| u.columns().iter().any(|c| c == column_name))
     {
         write_txn
-            .delete_table(user_uniq_table_def(&user_uniq_table_name(table_name)))
+            .delete_table_logged(user_uniq_table_def(&user_uniq_table_name(table_name)))
             .map_err(CatalogError::from)?;
     }
     Ok(())
@@ -3363,7 +3389,7 @@ fn revalidate_checks_after_type_change_in_txn(
                 "CHECK constraint failed to recompile after column type change".to_string(),
             ))
         })?;
-    match write_txn.open_table(user_rows_table_def(&user_rows_table_name(table_name))) {
+    match write_txn.open_table_logged(user_rows_table_def(&user_rows_table_name(table_name))) {
         Ok(row_table) => {
             crate::constraint::validate_existing_rows_for_check(
                 &row_table,
@@ -5084,7 +5110,7 @@ fn get_enum_type_in_write_txn(
     write_txn: &redb::WriteTransaction,
     name: &str,
 ) -> Result<Arc<EnumTypeDef>> {
-    let table = match write_txn.open_table(ENUM_TYPES_TABLE) {
+    let table = match write_txn.open_table_logged(ENUM_TYPES_TABLE) {
         Ok(t) => t,
         Err(redb::TableError::TableDoesNotExist(_)) => {
             return Err(CatalogError::TypeNotFound(name.to_string()))
@@ -6104,7 +6130,7 @@ fn drop_targets_with_dependents_in_txn(
     use std::collections::HashSet;
     let target_set: HashSet<&str> = targets.iter().copied().collect();
     let mut view_dependent: HashSet<String> = HashSet::new();
-    match write_txn.open_table(VIEWS_TABLE) {
+    match write_txn.open_table_logged(VIEWS_TABLE) {
         Ok(views_table) => {
             for (scanned, entry) in views_table.iter()?.enumerate() {
                 if scanned >= MAX_VIEWS {
@@ -6137,7 +6163,7 @@ fn drop_targets_with_dependents_in_txn(
         .map(|v| format!("{v}\n").into_bytes())
         .collect();
     let candidates: Vec<(String, Vec<u8>)> = {
-        let table = match write_txn.open_table(CATALOG_TABLE) {
+        let table = match write_txn.open_table_logged(CATALOG_TABLE) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => {
                 return Ok((view_dependent, HashSet::new()));
@@ -6233,7 +6259,7 @@ pub(crate) fn reject_relation_with_function_dependents_in_txn(
 /// 削除できない（`2BP01`。Issue #2219。CASCADE の連鎖削除の適用も同じ入口を通る）。
 fn drop_view_in_txn(write_txn: &redb::WriteTransaction, name: &str) -> Result<()> {
     reject_relation_with_function_dependents_in_txn(write_txn, name)?;
-    let mut views_table = write_txn.open_table(VIEWS_TABLE)?;
+    let mut views_table = write_txn.open_table_logged(VIEWS_TABLE)?;
     if views_table.remove(name)?.is_none() {
         return Err(CatalogError::ViewNotFound(name.to_string()));
     }
@@ -6266,7 +6292,7 @@ fn drop_foreign_key_in_txn(
         fks.remove(fk_index);
         let updated = schema.with_foreign_keys(fks);
         let encoded = encode_schema(&updated)?;
-        let mut catalog_table = write_txn.open_table(CATALOG_TABLE)?;
+        let mut catalog_table = write_txn.open_table_logged(CATALOG_TABLE)?;
         catalog_table.insert(child_table, encoded.as_slice())?;
     }
     let required = required_key_index_names_in_txn(write_txn, child_table)?;
@@ -6330,8 +6356,8 @@ pub(crate) fn view_write_fingerprint_in_txn(
     write_txn: &redb::WriteTransaction,
     view_name: &str,
 ) -> Result<Vec<u8>> {
-    let catalog_table = write_txn.open_table(CATALOG_TABLE)?;
-    let views_table = write_txn.open_table(VIEWS_TABLE)?;
+    let catalog_table = write_txn.open_table_logged(CATALOG_TABLE)?;
+    let views_table = write_txn.open_table_logged(VIEWS_TABLE)?;
     replace_fingerprint(
         vec![view_name.to_string()],
         &|n| Ok(catalog_table.get(n)?.map(|g| g.value().to_vec())),
@@ -9668,7 +9694,7 @@ fn rebuild_expression_indexes_after_type_change_in_txn(
     let mut affected_unique: Vec<String> = Vec::new();
     let mut any_affected = false;
     {
-        let index_table = match write_txn.open_table(INDEX_CATALOG_TABLE) {
+        let index_table = match write_txn.open_table_logged(INDEX_CATALOG_TABLE) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
             Err(e) => return Err(CatalogError::from(e).into()),
@@ -9735,7 +9761,7 @@ fn rebuild_expression_indexes_after_type_change_in_txn(
     if !updates.is_empty() {
         {
             let mut index_table = write_txn
-                .open_table(INDEX_CATALOG_TABLE)
+                .open_table_logged(INDEX_CATALOG_TABLE)
                 .map_err(CatalogError::from)?;
             for (name, bytes) in &updates {
                 index_table
@@ -9761,7 +9787,7 @@ fn rebuild_expression_indexes_after_type_change_in_txn(
     else {
         return Ok(());
     };
-    match write_txn.open_table(user_rows_table_def(&user_rows_table_name(table_name))) {
+    match write_txn.open_table_logged(user_rows_table_def(&user_rows_table_name(table_name))) {
         Ok(row_table) => {
             crate::constraint::validate_existing_rows_for_index_expressions(
                 &row_table, new_schema, &compiled,
@@ -9789,7 +9815,7 @@ fn rebuild_expression_indexes_after_type_change_in_txn(
     }
     if !affected_unique.is_empty() {
         write_txn
-            .delete_table(user_uniq_table_def(&user_uniq_table_name(table_name)))
+            .delete_table_logged(user_uniq_table_def(&user_uniq_table_name(table_name)))
             .map_err(CatalogError::from)?;
     }
     Ok(())
@@ -9828,7 +9854,7 @@ fn revalidate_keys_after_type_change(
         }
     }
     if !key_sets.is_empty() {
-        match write_txn.open_table(user_rows_table_def(&user_rows_table_name(table_name))) {
+        match write_txn.open_table_logged(user_rows_table_def(&user_rows_table_name(table_name))) {
             Ok(row_table) => {
                 for cols in &key_sets {
                     if crate::constraint::table_has_duplicate_unique_key(
@@ -12301,6 +12327,13 @@ pub(crate) fn user_rows_table_name(table_name: &str) -> String {
     // 明示トランザクションの読み取り集合（SQL-38・Issue #2404）。行テーブルに触れる経路は読み書きとも
     // ここで名前を作るため、区間が張られているときだけ記録する（`sql::read_set`）。
     crate::sql::read_set::record(table_name);
+    user_rows_physical_name(table_name)
+}
+
+/// [`user_rows_table_name`] の命名規則だけを切り出したもの（読み取り集合へ記録しない）。
+/// 変更ログの commit 前検査（`storage::change_log` の論理表名→物理表名の対応）が、利用者の
+/// 読み取りとして数えられないよう副作用なしで名前を引くために使う。命名規則の唯一の定義。
+pub(crate) fn user_rows_physical_name(table_name: &str) -> String {
     format!("user_rows/{table_name}")
 }
 
@@ -12390,7 +12423,7 @@ pub(crate) fn user_gin_table_def(gin_table_name: &str) -> GinIndexTableDef<'_> {
 /// の唯一の掃除経路。
 fn delete_gin_index_table_in_txn(write_txn: &redb::WriteTransaction, def: &IndexDef) -> Result<()> {
     if matches!(def.kind, IndexKind::Gin(_)) {
-        write_txn.delete_table(user_gin_table_def(&user_gin_table_name(&def.name)))?;
+        write_txn.delete_table_logged(user_gin_table_def(&user_gin_table_name(&def.name)))?;
     }
     Ok(())
 }
@@ -12504,7 +12537,7 @@ pub(crate) fn require_table_schema_write_any_identity(
     write_txn: &redb::WriteTransaction,
     table_name: &str,
 ) -> Result<TableSchema> {
-    let catalog_table = match write_txn.open_table(CATALOG_TABLE) {
+    let catalog_table = match write_txn.open_table_logged(CATALOG_TABLE) {
         Ok(t) => t,
         Err(redb::TableError::TableDoesNotExist(_)) => {
             return Err(CatalogError::TableNotFound(table_name.to_string()))
@@ -12529,7 +12562,7 @@ pub(crate) fn write_schema_in_txn(
 ) -> Result<()> {
     validate_schema(schema)?;
     let encoded = encode_schema(schema)?;
-    let mut catalog_table = write_txn.open_table(CATALOG_TABLE)?;
+    let mut catalog_table = write_txn.open_table_logged(CATALOG_TABLE)?;
     catalog_table.insert(schema.name.as_str(), encoded.as_slice())?;
     Ok(())
 }
@@ -12651,7 +12684,8 @@ fn require_row_identity_read(
 /// （テナント単位・可視性境界単位への細分化は行わない）であることの設計判断は
 /// Issue #285 で現状維持として確定した。根拠・移行トリガーは
 /// `docs/design/table-generation-rejection-granularity.md` を参照。
-const TABLE_GENERATION_TABLE: TableDefinition<&str, u64> = TableDefinition::new("table_generation");
+pub(crate) const TABLE_GENERATION_TABLE: TableDefinition<&str, u64> =
+    TableDefinition::new("table_generation");
 
 /// [`TABLE_GENERATION_TABLE`] を 1 つ進める（`write_txn.commit()` 前に呼ぶ）。
 ///
@@ -12675,7 +12709,7 @@ pub(crate) fn bump_table_generation_in_txn(
     write_txn: &redb::WriteTransaction,
     table_name: &str,
 ) -> Result<()> {
-    let mut gen_table = write_txn.open_table(TABLE_GENERATION_TABLE)?;
+    let mut gen_table = write_txn.open_table_logged(TABLE_GENERATION_TABLE)?;
     let current = gen_table.get(table_name)?.map(|v| v.value()).unwrap_or(0);
     let next = current
         .checked_add(1)
@@ -12834,14 +12868,14 @@ impl Storage {
                     }
                 }
             }
-            let table = write_txn.open_table(CATALOG_TABLE)?;
+            let table = write_txn.open_table_logged(CATALOG_TABLE)?;
             if table.get(schema.name.as_str())?.is_some() {
                 return Err(CatalogError::TableAlreadyExists(schema.name.clone()));
             }
             // ビューとテーブルは名前空間を共有する（TABLE-18・SQL-23・TASK-205、
             // Issue #909）。`VIEWS_TABLE` 側の衝突も同じ `TableAlreadyExists` へ
             // 写像する。
-            match write_txn.open_table(VIEWS_TABLE) {
+            match write_txn.open_table_logged(VIEWS_TABLE) {
                 Ok(views_table) => {
                     if views_table.get(schema.name.as_str())?.is_some() {
                         return Err(CatalogError::TableAlreadyExists(schema.name.clone()));
@@ -12872,7 +12906,7 @@ impl Storage {
             None => encode_schema(&resolve_foreign_keys_in_txn(write_txn, schema)?)?,
         };
         {
-            let mut table = write_txn.open_table(CATALOG_TABLE)?;
+            let mut table = write_txn.open_table_logged(CATALOG_TABLE)?;
             table.insert(schema.name.as_str(), encoded.as_slice())?;
         }
         // 予約された作成者を所有者として同じ txn に書く（Issue #2236。別 txn だと DROP・同名再作成と競合する）。
@@ -13008,7 +13042,7 @@ impl Storage {
         let mut existing: Vec<&str> = Vec::new();
         let mut skipped: Vec<String> = Vec::new();
         for &name in &targets {
-            match write_txn.open_table(VIEWS_TABLE) {
+            match write_txn.open_table_logged(VIEWS_TABLE) {
                 Ok(views_table) => {
                     if views_table.get(name)?.is_some() {
                         return Err(CatalogError::WrongObjectKind(name.to_string()));
@@ -13030,7 +13064,7 @@ impl Storage {
             if sequence::sequence_exists_in_txn(write_txn, name)? {
                 return Err(CatalogError::WrongObjectKind(name.to_string()));
             }
-            let found = match write_txn.open_table(CATALOG_TABLE) {
+            let found = match write_txn.open_table_logged(CATALOG_TABLE) {
                 Ok(table) => table.get(name)?.is_some(),
                 Err(redb::TableError::TableDoesNotExist(_)) => false,
                 Err(e) => return Err(CatalogError::from(e)),
@@ -13100,17 +13134,17 @@ impl Storage {
         // Phase 3: 削除。
         for &name in &existing {
             {
-                let mut table = write_txn.open_table(CATALOG_TABLE)?;
+                let mut table = write_txn.open_table_logged(CATALOG_TABLE)?;
                 if table.remove(name)?.is_none() {
                     return Err(CatalogError::TableNotFound(name.to_string()));
                 }
             }
             // `CATALOG_TABLE` のハンドルは上のブロックを抜けた時点で解放済み
             // （`TableAlreadyOpen` 回避）。
-            write_txn.delete_table(user_rows_table_def(&user_rows_table_name(name)))?;
+            write_txn.delete_table_logged(user_rows_table_def(&user_rows_table_name(name)))?;
             // 永続一意索引（TABLE-16・TASK-204、Issue #1070）。残置すると同名再作成で旧索引が
             // 新テーブルの行と突き合わされる。
-            write_txn.delete_table(user_uniq_table_def(&user_uniq_table_name(name)))?;
+            write_txn.delete_table_logged(user_uniq_table_def(&user_uniq_table_name(name)))?;
             // 台帳・分割実行ジョブ表（Issue #226・#1127）は同名再作成での引き継ぎ防止。
             crate::recovery::ledger::delete_table_in_txn(write_txn, name)
                 .map_err(convert_storage_error)?;
@@ -13344,7 +13378,7 @@ impl Storage {
                     ));
                 }
             }
-            let mut table = write_txn.open_table(CATALOG_TABLE)?;
+            let mut table = write_txn.open_table_logged(CATALOG_TABLE)?;
             let existing: Vec<u8> = {
                 let guard = table
                     .get(table_name)?
@@ -13445,7 +13479,7 @@ impl Storage {
         write_txn: &redb::WriteTransaction,
         table_name: &str,
     ) -> Result<()> {
-        let table = write_txn.open_table(CATALOG_TABLE)?;
+        let table = write_txn.open_table_logged(CATALOG_TABLE)?;
         let existing: Vec<u8> = {
             let guard = table
                 .get(table_name)?
@@ -13491,7 +13525,7 @@ impl Storage {
         drop_owned_sequences: bool,
     ) -> Result<Vec<u64>> {
         {
-            let mut table = write_txn.open_table(CATALOG_TABLE)?;
+            let mut table = write_txn.open_table_logged(CATALOG_TABLE)?;
             let existing: Vec<u8> = {
                 let guard = table
                     .get(table_name)?
@@ -13591,7 +13625,7 @@ impl Storage {
             // 黙って壊す暗黙 cascade を作らない）。同一 write txn 内で判定する
             // （TOCTOU 回避）。SQL 表層・NoSQL 表層とも本メソッドを通るため
             // 双方で防がれる。
-            match write_txn.open_table(VIEWS_TABLE) {
+            match write_txn.open_table_logged(VIEWS_TABLE) {
                 Ok(views_table) => {
                     let remaining: Vec<String> = ["id", "tenant_id", "visibility"]
                         .iter()
@@ -13716,7 +13750,7 @@ impl Storage {
         }
         let mut schema = {
             let table = write_txn
-                .open_table(CATALOG_TABLE)
+                .open_table_logged(CATALOG_TABLE)
                 .map_err(CatalogError::from)?;
             let existing: Vec<u8> = {
                 let guard = table
@@ -13782,7 +13816,7 @@ impl Storage {
             let child_encoded = encode_schema(&child)?;
             {
                 let mut table = write_txn
-                    .open_table(CATALOG_TABLE)
+                    .open_table_logged(CATALOG_TABLE)
                     .map_err(CatalogError::from)?;
                 table
                     .insert(child.name.as_str(), child_encoded.as_slice())
@@ -13808,7 +13842,7 @@ impl Storage {
                 .any(|u| u.columns().iter().any(|c| c == old_name))
         {
             write_txn
-                .delete_table(user_uniq_table_def(&user_uniq_table_name(table_name)))
+                .delete_table_logged(user_uniq_table_def(&user_uniq_table_name(table_name)))
                 .map_err(CatalogError::from)?;
         }
         crate::key_index::drop_indexes_containing_column_in_txn(&write_txn, table_name, old_name)?;
@@ -13818,7 +13852,7 @@ impl Storage {
         let encoded = encode_schema(&schema)?;
         {
             let mut table = write_txn
-                .open_table(CATALOG_TABLE)
+                .open_table_logged(CATALOG_TABLE)
                 .map_err(CatalogError::from)?;
             table
                 .insert(table_name, encoded.as_slice())
@@ -13878,7 +13912,7 @@ impl Storage {
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         let mut schema = {
             let table = write_txn
-                .open_table(CATALOG_TABLE)
+                .open_table_logged(CATALOG_TABLE)
                 .map_err(CatalogError::from)?;
             let existing: Vec<u8> = {
                 let guard = table
@@ -13893,7 +13927,7 @@ impl Storage {
         // 改名先の衝突判定（`create_table` と同じ名前空間: 表・ビュー・索引）。
         {
             let table = write_txn
-                .open_table(CATALOG_TABLE)
+                .open_table_logged(CATALOG_TABLE)
                 .map_err(CatalogError::from)?;
             if table
                 .get(new_table_name)
@@ -13903,7 +13937,7 @@ impl Storage {
                 return Err(CatalogError::TableAlreadyExists(new_table_name.to_string()).into());
             }
         }
-        match write_txn.open_table(VIEWS_TABLE) {
+        match write_txn.open_table_logged(VIEWS_TABLE) {
             Ok(views_table) => {
                 if views_table
                     .get(new_table_name)
@@ -13945,7 +13979,7 @@ impl Storage {
             let child_encoded = encode_schema(&child)?;
             {
                 let mut table = write_txn
-                    .open_table(CATALOG_TABLE)
+                    .open_table_logged(CATALOG_TABLE)
                     .map_err(CatalogError::from)?;
                 table
                     .insert(child.name.as_str(), child_encoded.as_slice())
@@ -13972,7 +14006,7 @@ impl Storage {
         let encoded = encode_schema(&schema)?;
         {
             let mut table = write_txn
-                .open_table(CATALOG_TABLE)
+                .open_table_logged(CATALOG_TABLE)
                 .map_err(CatalogError::from)?;
             table
                 .insert(new_table_name, encoded.as_slice())
@@ -13989,7 +14023,7 @@ impl Storage {
         // 改名先に行テーブルが既に在る（`TableExists`）のは孤児であり、統合も削除もしない。
         let old_rows = user_rows_table_name(table_name);
         let new_rows = user_rows_table_name(new_table_name);
-        match write_txn.rename_table(
+        match write_txn.rename_table_logged(
             user_rows_table_def(&old_rows),
             user_rows_table_def(&new_rows),
         ) {
@@ -14025,7 +14059,7 @@ impl Storage {
         // （移送で旧名のキーは消える。削除すると改名後の再送が未記録と誤判定される）。
         for name in [table_name, new_table_name] {
             write_txn
-                .delete_table(user_uniq_table_def(&user_uniq_table_name(name)))
+                .delete_table_logged(user_uniq_table_def(&user_uniq_table_name(name)))
                 .map_err(CatalogError::from)?;
             crate::key_index::drop_indexes_for_table_in_txn(&write_txn, name)?;
             // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログを変える書き込みは DDL として記録する。
@@ -14169,7 +14203,7 @@ impl Storage {
                 })?;
 
             let row_table_name = user_rows_table_name(table_name);
-            match write_txn.open_table(user_rows_table_def(&row_table_name)) {
+            match write_txn.open_table_logged(user_rows_table_def(&row_table_name)) {
                 Ok(row_table) => {
                     if crate::constraint::table_has_duplicate_unique_key(
                         &row_table,
@@ -14186,7 +14220,7 @@ impl Storage {
             }
 
             let encoded = encode_schema(&updated)?;
-            let mut catalog_table = write_txn.open_table(CATALOG_TABLE)?;
+            let mut catalog_table = write_txn.open_table_logged(CATALOG_TABLE)?;
             catalog_table.insert(table_name, encoded.as_slice())?;
         }
         // 永続一意索引（TABLE-16・TASK-204、Issue #1070）を無効化する。索引の
@@ -14195,7 +14229,7 @@ impl Storage {
         // 二重の安全策とする（各テナントは次回の書き込み時に遅延再構築される。
         // `row_table` の借用は上のブロックを抜けた時点で解放済みのため、
         // 別テーブルである索引テーブルの削除はここで安全に行える）。
-        write_txn.delete_table(user_uniq_table_def(&user_uniq_table_name(table_name)))?;
+        write_txn.delete_table_logged(user_uniq_table_def(&user_uniq_table_name(table_name)))?;
         // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログを変える書き込みは DDL として記録する。
         crate::storage::commit_log::note_ddl(&write_txn, table_name);
         bump_table_generation_in_txn(&write_txn, table_name)?;
@@ -14288,7 +14322,7 @@ impl Storage {
             validate_schema(&updated)?;
 
             let row_table_name = user_rows_table_name(table_name);
-            match write_txn.open_table(user_rows_table_def(&row_table_name)) {
+            match write_txn.open_table_logged(user_rows_table_def(&row_table_name)) {
                 Ok(row_table) => {
                     if let Some(column) = crate::constraint::table_first_null_in_columns(
                         &row_table,
@@ -14312,10 +14346,10 @@ impl Storage {
             }
 
             let encoded = encode_schema(&updated)?;
-            let mut catalog_table = write_txn.open_table(CATALOG_TABLE)?;
+            let mut catalog_table = write_txn.open_table_logged(CATALOG_TABLE)?;
             catalog_table.insert(table_name, encoded.as_slice())?;
         }
-        write_txn.delete_table(user_uniq_table_def(&user_uniq_table_name(table_name)))?;
+        write_txn.delete_table_logged(user_uniq_table_def(&user_uniq_table_name(table_name)))?;
         // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログを変える書き込みは DDL として記録する。
         crate::storage::commit_log::note_ddl(&write_txn, table_name);
         bump_table_generation_in_txn(&write_txn, table_name)?;
@@ -14410,7 +14444,7 @@ impl Storage {
             }
 
             let row_table_name = user_rows_table_name(table_name);
-            match write_txn.open_table(user_rows_table_def(&row_table_name)) {
+            match write_txn.open_table_logged(user_rows_table_def(&row_table_name)) {
                 Ok(row_table) => {
                     if let Some(col) = crate::constraint::table_first_null_in_columns(
                         &row_table,
@@ -14427,7 +14461,7 @@ impl Storage {
             }
 
             let encoded = encode_schema(&updated)?;
-            let mut catalog_table = write_txn.open_table(CATALOG_TABLE)?;
+            let mut catalog_table = write_txn.open_table_logged(CATALOG_TABLE)?;
             catalog_table.insert(table_name, encoded.as_slice())?;
         }
         Ok(AlterApply::Applied)
@@ -14519,7 +14553,7 @@ impl Storage {
         }
         {
             let encoded = encode_schema(&updated)?;
-            let mut catalog_table = write_txn.open_table(CATALOG_TABLE)?;
+            let mut catalog_table = write_txn.open_table_logged(CATALOG_TABLE)?;
             catalog_table.insert(table_name, encoded.as_slice())?;
         }
         Ok(AlterApply::Applied)
@@ -14654,7 +14688,7 @@ impl Storage {
             validate_schema(&updated)?;
 
             let encoded = encode_schema(&updated)?;
-            let mut catalog_table = write_txn.open_table(CATALOG_TABLE)?;
+            let mut catalog_table = write_txn.open_table_logged(CATALOG_TABLE)?;
             catalog_table.insert(table_name, encoded.as_slice())?;
         }
         Ok(AlterApply::Applied)
@@ -14779,7 +14813,7 @@ impl Storage {
             confirmed_name = name;
 
             let row_table_name = user_rows_table_name(table_name);
-            match write_txn.open_table(user_rows_table_def(&row_table_name)) {
+            match write_txn.open_table_logged(user_rows_table_def(&row_table_name)) {
                 Ok(row_table) => {
                     // 新しい CHECK 1 件だけをコンパイルして既存行を検査する
                     // （既存 CHECK は変更しておらず再評価不要。違反時のエラーが
@@ -14808,7 +14842,7 @@ impl Storage {
 
             let encoded = encode_schema(&updated).map_err(AlterCheckError::Catalog)?;
             let mut catalog_table = write_txn
-                .open_table(CATALOG_TABLE)
+                .open_table_logged(CATALOG_TABLE)
                 .map_err(CatalogError::from)?;
             catalog_table
                 .insert(table_name, encoded.as_slice())
@@ -14907,7 +14941,7 @@ impl Storage {
             let parent: &TableSchema = if parent_table_name == schema.name {
                 &schema
             } else {
-                match write_txn.open_table(VIEWS_TABLE) {
+                match write_txn.open_table_logged(VIEWS_TABLE) {
                     Ok(views_table) => {
                         if views_table.get(parent_table_name.as_str())?.is_some() {
                             return Err(CatalogError::WrongObjectKind(parent_table_name.clone()));
@@ -14983,7 +15017,7 @@ impl Storage {
             })?;
 
             let encoded = encode_schema(&updated)?;
-            let mut catalog_table = write_txn.open_table(CATALOG_TABLE)?;
+            let mut catalog_table = write_txn.open_table_logged(CATALOG_TABLE)?;
             catalog_table.insert(table_name, encoded.as_slice())?;
         }
         // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログを変える書き込みは DDL として記録する。
@@ -15121,14 +15155,15 @@ impl Storage {
             };
 
             let encoded = encode_schema(&updated)?;
-            let mut catalog_table = write_txn.open_table(CATALOG_TABLE)?;
+            let mut catalog_table = write_txn.open_table_logged(CATALOG_TABLE)?;
             catalog_table.insert(table_name, encoded.as_slice())?;
         }
         // PRIMARY KEY 削除時は永続一意索引を無効化する（PK も UNIQUE も残らない場合
         // `enforce_unique_keys_in_txn` は即 return し、古い索引が残り続けるのを防ぐ。
         // Issue #1196）。
         if dropped_primary_key {
-            write_txn.delete_table(user_uniq_table_def(&user_uniq_table_name(table_name)))?;
+            write_txn
+                .delete_table_logged(user_uniq_table_def(&user_uniq_table_name(table_name)))?;
         }
         // 索引衛生（P0・設計 §3.4）: カタログ書き換え後（＝索引の要否判定が
         // 「削除後」の状態を見る）に、影響を受けうる表の stale 索引を刈り込む。
@@ -15439,7 +15474,7 @@ impl Storage {
         )> = None;
         'apply: {
             let mut table = write_txn
-                .open_table(CATALOG_TABLE)
+                .open_table_logged(CATALOG_TABLE)
                 .map_err(CatalogError::from)?;
             let existing: Vec<u8> = {
                 let guard = table
@@ -15666,7 +15701,7 @@ impl Storage {
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         namespace::ensure_key_schema_alive_in_txn(&*write_txn, name)?;
         {
-            let mut table = write_txn.open_table(ENUM_TYPES_TABLE)?;
+            let mut table = write_txn.open_table_logged(ENUM_TYPES_TABLE)?;
             if table.get(name)?.is_some() {
                 return Err(CatalogError::TypeAlreadyExists(name.to_string()));
             }
@@ -15716,7 +15751,7 @@ impl Storage {
         validate_enum_label(&label)?;
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         let updated = {
-            let mut table = write_txn.open_table(ENUM_TYPES_TABLE)?;
+            let mut table = write_txn.open_table_logged(ENUM_TYPES_TABLE)?;
             let existing = table
                 .get(name)?
                 .ok_or_else(|| CatalogError::TypeNotFound(name.to_string()))?
@@ -15756,7 +15791,7 @@ impl Storage {
             if !dependents.is_empty() {
                 return Err(CatalogError::DependentObjectsStillExist(name.to_string()));
             }
-            let mut table = write_txn.open_table(ENUM_TYPES_TABLE)?;
+            let mut table = write_txn.open_table_logged(ENUM_TYPES_TABLE)?;
             if table.remove(name)?.is_none() {
                 return Err(CatalogError::TypeNotFound(name.to_string()));
             }
@@ -15862,11 +15897,11 @@ impl Storage {
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         namespace::ensure_key_schema_alive_in_txn(&*write_txn, name)?;
         {
-            let catalog_table = write_txn.open_table(CATALOG_TABLE)?;
+            let catalog_table = write_txn.open_table_logged(CATALOG_TABLE)?;
             if catalog_table.get(name)?.is_some() {
                 return Err(CatalogError::TableAlreadyExists(name.to_string()));
             }
-            let mut views_table = write_txn.open_table(VIEWS_TABLE)?;
+            let mut views_table = write_txn.open_table_logged(VIEWS_TABLE)?;
             if views_table.get(name)?.is_some() {
                 return Err(CatalogError::TableAlreadyExists(name.to_string()));
             }
@@ -15926,7 +15961,7 @@ impl Storage {
         validate_relation_key(name)?;
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         {
-            let catalog_table = write_txn.open_table(CATALOG_TABLE)?;
+            let catalog_table = write_txn.open_table_logged(CATALOG_TABLE)?;
             if catalog_table.get(name)?.is_some() {
                 return Err(CatalogError::WrongObjectKind(name.to_string()));
             }
@@ -15950,7 +15985,7 @@ impl Storage {
                 {
                     return Err(CatalogError::DependentViewsExist(name.to_string()));
                 }
-                let mut views_table = write_txn.open_table(VIEWS_TABLE)?;
+                let mut views_table = write_txn.open_table_logged(VIEWS_TABLE)?;
                 let dependents = views_depending_on_in_txn(&views_table, name)?;
                 if !dependents.is_empty() {
                     return Err(CatalogError::DependentViewsExist(name.to_string()));
@@ -16130,14 +16165,14 @@ impl Storage {
         namespace::ensure_key_schema_alive_in_txn(&*write_txn, &def.name)?;
         {
             let views_contains = |name: &str| -> Result<bool> {
-                match write_txn.open_table(VIEWS_TABLE) {
+                match write_txn.open_table_logged(VIEWS_TABLE) {
                     Ok(t) => Ok(t.get(name)?.is_some()),
                     Err(redb::TableError::TableDoesNotExist(_)) => Ok(false),
                     Err(e) => Err(e.into()),
                 }
             };
             let table_contains = |name: &str| -> Result<bool> {
-                match write_txn.open_table(CATALOG_TABLE) {
+                match write_txn.open_table_logged(CATALOG_TABLE) {
                     Ok(t) => Ok(t.get(name)?.is_some()),
                     Err(redb::TableError::TableDoesNotExist(_)) => Ok(false),
                     Err(e) => Err(e.into()),
@@ -16253,7 +16288,7 @@ impl Storage {
                 .map_err(map_index_validation_error)?;
                 if let Some(compiled) = compiled {
                     let row_table_name = user_rows_table_name(&def.table);
-                    match write_txn.open_table(user_rows_table_def(&row_table_name)) {
+                    match write_txn.open_table_logged(user_rows_table_def(&row_table_name)) {
                         Ok(row_table) => {
                             crate::constraint::validate_existing_rows_for_partial_indexes(
                                 &row_table, &schema, &compiled,
@@ -16296,7 +16331,7 @@ impl Storage {
                 .map_err(map_index_validation_error)?;
                 if let Some(compiled) = compiled {
                     let row_table_name = user_rows_table_name(&def.table);
-                    match write_txn.open_table(user_rows_table_def(&row_table_name)) {
+                    match write_txn.open_table_logged(user_rows_table_def(&row_table_name)) {
                         Ok(row_table) => {
                             crate::constraint::validate_existing_rows_for_index_expressions(
                                 &row_table, &schema, &compiled,
@@ -16328,7 +16363,7 @@ impl Storage {
             } else {
                 None
             };
-            let mut index_table = write_txn.open_table(INDEX_CATALOG_TABLE)?;
+            let mut index_table = write_txn.open_table_logged(INDEX_CATALOG_TABLE)?;
             if index_table.len()? >= MAX_INDEX_COUNT as u64 {
                 return Err(
                     CatalogError::IndexLimitExceeded("too many indexes".to_string()).into(),
@@ -16337,7 +16372,7 @@ impl Storage {
             index_table.insert(def.name.as_str(), encoded.as_slice())?;
             if let Some(updated) = &unique_schema {
                 let encoded_schema = encode_schema(updated)?;
-                let mut catalog_table = write_txn.open_table(CATALOG_TABLE)?;
+                let mut catalog_table = write_txn.open_table_logged(CATALOG_TABLE)?;
                 catalog_table.insert(def.table.as_str(), encoded_schema.as_slice())?;
             }
             // GIN 相当索引（INDEX-8、Issue #2207）の初回構築。同じ write txn で全テナント・全可視性の
@@ -16362,7 +16397,8 @@ impl Storage {
         if def.unique {
             // 永続一意索引を無効化する（`ADD UNIQUE` と同じ二重の安全策。各テナントは
             // 次回の書き込み時に遅延再構築される）。
-            write_txn.delete_table(user_uniq_table_def(&user_uniq_table_name(&def.table)))?;
+            write_txn
+                .delete_table_logged(user_uniq_table_def(&user_uniq_table_name(&def.table)))?;
         }
         // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログを変える書き込みは DDL として記録する。
         crate::storage::commit_log::note_ddl(&write_txn, &def.table);
@@ -16384,7 +16420,7 @@ impl Storage {
         validate_relation_key(name)?;
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         let removed = {
-            match write_txn.open_table(INDEX_CATALOG_TABLE) {
+            match write_txn.open_table_logged(INDEX_CATALOG_TABLE) {
                 Ok(mut index_table) => {
                     let bytes = index_table
                         .remove(name)?
@@ -16400,7 +16436,7 @@ impl Storage {
         };
         let Some(def) = removed else {
             for relation_table in [CATALOG_TABLE, VIEWS_TABLE] {
-                match write_txn.open_table(relation_table) {
+                match write_txn.open_table_logged(relation_table) {
                     Ok(t) => {
                         if t.get(name)?.is_some() {
                             return Err(CatalogError::WrongObjectKind(name.to_string()));
@@ -16425,7 +16461,8 @@ impl Storage {
                 // いないので外す制約が無い。
                 // 永続一意索引だけ失効させる（強制はカタログの宣言が無くなった時点で外れ、
                 // 残りのキーは次回の書き込みで再構築される）。
-                write_txn.delete_table(user_uniq_table_def(&user_uniq_table_name(&def.table)))?;
+                write_txn
+                    .delete_table_logged(user_uniq_table_def(&user_uniq_table_name(&def.table)))?;
             } else {
                 drop_unique_index_constraint_in_txn(&write_txn, &def)?;
             }
@@ -16625,7 +16662,7 @@ impl Storage {
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         namespace::ensure_key_schema_alive_in_txn(&*write_txn, name)?;
         {
-            let catalog_table = write_txn.open_table(CATALOG_TABLE)?;
+            let catalog_table = write_txn.open_table_logged(CATALOG_TABLE)?;
             // matview とも名前空間を共有する（TABLE-42 (2)、Issue #1663）。
             if catalog_table.get(name)?.is_some()
                 || index_name_exists_in_txn(&write_txn, name)?
@@ -16634,7 +16671,7 @@ impl Storage {
             {
                 return Err(CatalogError::WrongObjectKind(name.to_string()));
             }
-            let mut views_table = write_txn.open_table(VIEWS_TABLE)?;
+            let mut views_table = write_txn.open_table_logged(VIEWS_TABLE)?;
             let current = match views_table.get(name)? {
                 Some(guard) => Some(decode_view_def(guard.value())?),
                 None => None,
@@ -18256,7 +18293,7 @@ fn resolve_foreign_keys_in_txn(
         let parent: &TableSchema = if fk.parent_table == schema.name {
             schema
         } else {
-            match write_txn.open_table(VIEWS_TABLE) {
+            match write_txn.open_table_logged(VIEWS_TABLE) {
                 Ok(views_table) => {
                     if views_table.get(fk.parent_table.as_str())?.is_some() {
                         return Err(CatalogError::WrongObjectKind(fk.parent_table.clone()));
@@ -18310,7 +18347,7 @@ pub(crate) fn referencing_foreign_keys_in_txn(
         .map(|v| format!("{v}\n").into_bytes())
         .collect();
     let candidates: Vec<(String, Vec<u8>)> = {
-        let table = match write_txn.open_table(CATALOG_TABLE) {
+        let table = match write_txn.open_table_logged(CATALOG_TABLE) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
             Err(e) => return Err(e.into()),
@@ -18438,7 +18475,7 @@ pub(crate) fn changed_table_generations_in_write_txn(
     if !exists {
         return Ok(Vec::new());
     }
-    let gen_table = write_txn.open_table(TABLE_GENERATION_TABLE)?;
+    let gen_table = write_txn.open_table_logged(TABLE_GENERATION_TABLE)?;
     let mut changed = Vec::new();
     for entry in gen_table.iter()? {
         let (name, generation) = entry?;

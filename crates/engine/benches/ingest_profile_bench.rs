@@ -76,6 +76,11 @@
 //! `make ci` 側から回帰検証する。redb は本クレートの既存 dev-dependency
 //! （`=4.2.0`）を再利用し、新規依存の追加は行わない。
 
+// 許可（clippy::disallowed_methods）: 本ファイルは engine の公開 API の外から redb を直接開き、
+// 永続内容の検査・破壊・裏口の対照を行う。変更ログの捕捉（`storage::change_log`）を通す
+// 対象は engine 製品コードの書き込み点で、外部クレートとしての直接操作は対象外。
+#![allow(clippy::disallowed_methods)]
+
 #[allow(dead_code)]
 mod harness;
 

@@ -31,6 +31,7 @@
 //! - 世代表: 書き換えた表の世代を同じ txn で進める（open 中でキャッシュは未構築だが、カタログ変更と世代 bump を
 //!   常に組にする既存規約に従う）。
 
+use crate::storage::change_log::CaptureWriteTxn as _;
 use redb::{ReadableDatabase, ReadableTable};
 
 use super::{
@@ -100,7 +101,7 @@ fn migrate_marks_with(
             let read = &*txn;
             let bytes = {
                 let table = read
-                    .open_table(CATALOG_TABLE)
+                    .open_table_logged(CATALOG_TABLE)
                     .map_err(|e| catalog_to_storage(e.into()))?;
                 let guard = table
                     .get(name.as_str())
@@ -129,7 +130,7 @@ fn migrate_marks_with(
         };
         {
             let mut table = txn
-                .open_table(CATALOG_TABLE)
+                .open_table_logged(CATALOG_TABLE)
                 .map_err(|e| catalog_to_storage(e.into()))?;
             table
                 .insert(name.as_str(), bytes.as_slice())

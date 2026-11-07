@@ -20,6 +20,7 @@
 //! fail-closed: 未知の版・予約ビット・長さ違いは固定文言の `CorruptSchema` とし、blob の断片・tenant_id を
 //! エラーに含めない。
 
+use crate::storage::change_log::CaptureWriteTxn as _;
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 
 use crate::storage::read_source::ReadSource;
@@ -197,7 +198,7 @@ pub(crate) fn remove_row_security_for_table_in_txn(
         if batch.is_empty() {
             return Ok(());
         }
-        let mut table = write_txn.open_table(ROW_SECURITY_TABLE)?;
+        let mut table = write_txn.open_table_logged(ROW_SECURITY_TABLE)?;
         for (scope, _) in &batch {
             table.remove((table_key, scope.as_str()))?;
         }
@@ -218,7 +219,7 @@ pub(crate) fn rename_row_security_table_in_txn(
         if batch.is_empty() {
             return Ok(());
         }
-        let mut table = write_txn.open_table(ROW_SECURITY_TABLE)?;
+        let mut table = write_txn.open_table_logged(ROW_SECURITY_TABLE)?;
         for (scope, blob) in &batch {
             table.remove((old_key, scope.as_str()))?;
             table.insert((new_key, scope.as_str()), blob.as_slice())?;
@@ -273,7 +274,7 @@ impl Storage {
             return Ok(AlterApply::Unchanged);
         }
         {
-            let mut table = write_txn.open_table(ROW_SECURITY_TABLE)?;
+            let mut table = write_txn.open_table_logged(ROW_SECURITY_TABLE)?;
             if next.is_default() {
                 table.remove((table_key, scope))?;
             } else {

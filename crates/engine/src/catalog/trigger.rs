@@ -19,6 +19,7 @@
 //! fail-closed: 未知の版・タグ・ビット、切断、末尾の余り、上限超過、キーと値の不整合は固定文言の
 //! `CorruptSchema` とし、blob の断片・tenant_id・本文をエラーに含めない。
 
+use crate::storage::change_log::CaptureWriteTxn as _;
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 
 use crate::storage::read_source::ReadSource;
@@ -434,7 +435,7 @@ pub(crate) fn list_triggers_in_txn(
 
 /// 内部 ID を 1 つ払い出す（1 始まり・`checked_add`・再利用しない）。
 fn allocate_id_in_txn(write_txn: &redb::WriteTransaction) -> Result<u64> {
-    let mut counter = write_txn.open_table(TRIGGER_ID_COUNTER_TABLE)?;
+    let mut counter = write_txn.open_table_logged(TRIGGER_ID_COUNTER_TABLE)?;
     let current = counter
         .get(TRIGGER_ID_COUNTER_KEY)?
         .map(|v| v.value())
@@ -483,7 +484,7 @@ pub(crate) fn remove_triggers_for_table_in_txn(
         if batch.is_empty() {
             return Ok(());
         }
-        let mut table = write_txn.open_table(TRIGGERS_TABLE)?;
+        let mut table = write_txn.open_table_logged(TRIGGERS_TABLE)?;
         for (scope, name, _) in &batch {
             table.remove((table_key, scope.as_str(), name.as_str()))?;
         }
@@ -503,7 +504,7 @@ pub(crate) fn rename_table_in_txn(
         if batch.is_empty() {
             return Ok(());
         }
-        let mut table = write_txn.open_table(TRIGGERS_TABLE)?;
+        let mut table = write_txn.open_table_logged(TRIGGERS_TABLE)?;
         for (scope, name, blob) in &batch {
             table.remove((old_key, scope.as_str(), name.as_str()))?;
             table.insert((new_key, scope.as_str(), name.as_str()), blob.as_slice())?;
@@ -572,7 +573,7 @@ pub(crate) fn remove_triggers_with_function_prefix_in_txn(
         if targets.is_empty() {
             return Ok(());
         }
-        let mut table = write_txn.open_table(TRIGGERS_TABLE)?;
+        let mut table = write_txn.open_table_logged(TRIGGERS_TABLE)?;
         for (t, name) in &targets {
             table.remove((t.as_str(), scope, name.as_str()))?;
         }
@@ -614,7 +615,7 @@ pub(crate) fn remove_triggers_referencing_function_in_txn(
         if targets.is_empty() {
             break;
         }
-        let mut table = write_txn.open_table(TRIGGERS_TABLE)?;
+        let mut table = write_txn.open_table_logged(TRIGGERS_TABLE)?;
         for (t, name) in &targets {
             table.remove((t.as_str(), scope, name.as_str()))?;
             if !touched_tables.iter().any(|x| x == t) {
@@ -760,7 +761,7 @@ impl Storage {
         }
         let blob = encode_trigger_def(&stored)?;
         {
-            let mut table = write_txn.open_table(TRIGGERS_TABLE)?;
+            let mut table = write_txn.open_table_logged(TRIGGERS_TABLE)?;
             table.insert((table_key, scope, stored.name.as_str()), blob.as_slice())?;
         }
         // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログ・実体を変える書き込みは DDL として記録する。
@@ -807,7 +808,7 @@ impl Storage {
             return Ok(false);
         }
         {
-            let mut table = write_txn.open_table(TRIGGERS_TABLE)?;
+            let mut table = write_txn.open_table_logged(TRIGGERS_TABLE)?;
             table.remove((table_key, scope, name))?;
         }
         // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログ・実体を変える書き込みは DDL として記録する。

@@ -27,6 +27,7 @@
 //! fail-closed: 未知の版・予約ビット・切断は固定文言の `CorruptSchema`。検証子・tenant_id は
 //! エラー・Debug に出さない。
 
+use crate::storage::change_log::CaptureWriteTxn as _;
 use std::collections::BTreeMap;
 
 use redb::{ReadableTable, TableDefinition};
@@ -254,14 +255,14 @@ fn put_privileges(
     privileges: BootstrapPrivileges,
 ) -> Result<()> {
     let blob = [BLOB_VERSION, privileges.to_flags()];
-    let mut table = write_txn.open_table(BOOTSTRAP_PRIVILEGES_TABLE)?;
+    let mut table = write_txn.open_table_logged(BOOTSTRAP_PRIVILEGES_TABLE)?;
     table.insert((tenant, role_id), blob.as_slice())?;
     Ok(())
 }
 
 fn put_marker(write_txn: &redb::WriteTransaction, tenant: &str) -> Result<()> {
     let blob = [BLOB_VERSION];
-    let mut table = write_txn.open_table(BOOTSTRAP_MARKER_TABLE)?;
+    let mut table = write_txn.open_table_logged(BOOTSTRAP_MARKER_TABLE)?;
     table.insert(tenant, blob.as_slice())?;
     Ok(())
 }
@@ -298,7 +299,7 @@ pub(crate) fn remove_bootstrap_privileges_in_txn(
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
         Err(e) => return Err(e.into()),
     }
-    let mut table = write_txn.open_table(BOOTSTRAP_PRIVILEGES_TABLE)?;
+    let mut table = write_txn.open_table_logged(BOOTSTRAP_PRIVILEGES_TABLE)?;
     table.remove((tenant, role_id))?;
     Ok(())
 }
@@ -509,7 +510,7 @@ fn adopt_tenant(
                 }
             }
             let blob = super::encode_role_def(&next)?;
-            let mut table = write_txn.open_table(ROLES_TABLE)?;
+            let mut table = write_txn.open_table_logged(ROLES_TABLE)?;
             table.insert((tenant, u.username.as_str()), blob.as_slice())?;
             kind = BootstrapEntryKind::AdoptedCredentials;
         } else if !role.scram_verifier.is_empty() || !role.legacy_phc.is_empty() {

@@ -19,6 +19,7 @@
 //! （`begin_read`）は開始時点のスナップショットを見る（進行中の未コミット書き込みは見えない）。
 //! 本モジュールは独自のロック層を追加しない。
 
+use crate::storage::change_log::CaptureWriteTxn as _;
 use std::fmt;
 use std::path::Path;
 
@@ -572,7 +573,7 @@ impl CommitTxn for GatedWriteTxn {
 /// 無関係なテーブルへの書き込みでも既存インデックスを失効させる（過剰拒否）が、
 /// fail-closed 方向のため許容する。
 pub(crate) fn prepare_generation_bump(write_txn: &redb::WriteTransaction) -> Result<u64> {
-    let mut gen_table = write_txn.open_table(GENERATION_TABLE)?;
+    let mut gen_table = write_txn.open_table_logged(GENERATION_TABLE)?;
     let current = gen_table
         .get(GENERATION_KEY)?
         .map(|v| v.value())
@@ -1119,15 +1120,15 @@ impl Storage {
     /// 変更ログを有効にする（RECOVER-14・D5・D8）。DB 識別子と timeline が無ければ永続化し
     /// （世代を進めない保守 commit）、以降の書き込みトランザクションが capture frame を持つ。
     /// 一時表用ストレージでは拒否する。`&mut self` なのは `Arc` 化前の構築段階でだけ有効化できる
-    /// ようにするため。運用者の CLI からの到達は書き込み点の移行（#3068）とオラクル（#3069）が
+    /// ようにするため。運用者の CLI からの到達はオラクル試験と有効化（#3069）が
     /// 済むまで拒否される。
-    #[cfg_attr(not(test), allow(dead_code))] // 運用経路の結線は #3068・#3069。それまではテストだけが呼ぶ
+    #[cfg_attr(not(test), allow(dead_code))] // 運用経路の結線は #3069。それまではテストだけが呼ぶ
     pub(crate) fn enable_change_log(&mut self) -> Result<()> {
         self.enable_change_log_with(change_log::CaptureLimits::default())
     }
 
     /// [`Self::enable_change_log`] の上限指定版（上限のテストが使う）。
-    #[cfg_attr(not(test), allow(dead_code))] // 運用経路の結線は #3068・#3069。それまではテストだけが呼ぶ
+    #[cfg_attr(not(test), allow(dead_code))] // 運用経路の結線は #3069。それまではテストだけが呼ぶ
     pub(crate) fn enable_change_log_with(
         &mut self,
         limits: change_log::CaptureLimits,
@@ -1150,7 +1151,7 @@ impl Storage {
     }
 
     /// 有効な変更ログの DB 識別子と timeline（無効なら `None`）。
-    #[cfg_attr(not(test), allow(dead_code))] // 運用経路の結線は #3068・#3069。それまではテストだけが呼ぶ
+    #[cfg_attr(not(test), allow(dead_code))] // 運用経路の結線は #3069。それまではテストだけが呼ぶ
     pub(crate) fn change_log_identity(&self) -> Option<([u8; change_log::DB_ID_LEN], u64)> {
         self.change_log.as_ref().map(|s| (s.db_id, s.timeline))
     }
@@ -1262,7 +1263,7 @@ impl Storage {
         let write_txn = self.begin_write_txn()?;
         {
             let mut table = write_txn
-                .open_table(ROWS_TABLE)
+                .open_table_logged(ROWS_TABLE)
                 .map_err(map_rows_table_error)?;
             table.insert(
                 rowid::row_key(row.tenant_id, rowid::RowId::from_legacy_id(id)),
@@ -1290,7 +1291,7 @@ impl Storage {
         let write_txn = self.begin_write_txn()?;
         {
             let mut table = write_txn
-                .open_table(ROWS_TABLE)
+                .open_table_logged(ROWS_TABLE)
                 .map_err(map_rows_table_error)?;
             // clear 再利用の 1 面スクラッチ（Issue #398。`tenant.rs` の同パターンと
             // 揃える）。txn 内でのみ有効なため、行数分の `Vec<u8>` 確保を避ける。

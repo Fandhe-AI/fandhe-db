@@ -22,6 +22,7 @@
 //! fail-closed: 許可集合の外のビット・`grant_options` が `privileges` の部分集合でない値・`privileges` が 0 の値・
 //! 未知の版やタグ・切断・末尾の余りは固定文言の `CorruptSchema`。エラーに blob の断片・tenant_id を含めない。
 
+use crate::storage::change_log::CaptureWriteTxn as _;
 use redb::{ReadableTable, TableDefinition};
 
 use crate::storage::read_source::ReadSource;
@@ -321,7 +322,7 @@ fn upsert_acl_limited(
             ACL_LIMIT_MESSAGE.to_string(),
         ));
     }
-    let mut table = write_txn.open_table(ACL_TABLE)?;
+    let mut table = write_txn.open_table_logged(ACL_TABLE)?;
     table.insert(k, blob.as_slice())?;
     Ok(())
 }
@@ -370,7 +371,7 @@ pub(crate) fn remove_acl_in_txn(
     if !exists {
         return Ok(false);
     }
-    let mut table = write_txn.open_table(ACL_TABLE)?;
+    let mut table = write_txn.open_table_logged(ACL_TABLE)?;
     table.remove(k)?;
     Ok(true)
 }
@@ -482,7 +483,7 @@ fn remove_matching(
         if batch.is_empty() {
             return Ok(());
         }
-        let mut table = write_txn.open_table(ACL_TABLE)?;
+        let mut table = write_txn.open_table_logged(ACL_TABLE)?;
         for ((t, kind, key, col, grantee, grantor), _) in &batch {
             table.remove((
                 t.as_str(),
@@ -511,7 +512,7 @@ fn move_matching(
         if batch.is_empty() {
             return Ok(());
         }
-        let mut table = write_txn.open_table(ACL_TABLE)?;
+        let mut table = write_txn.open_table_logged(ACL_TABLE)?;
         for (old, blob) in &batch {
             let new = rewrite(old);
             table.remove((

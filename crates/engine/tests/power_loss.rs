@@ -41,6 +41,11 @@
 //! 本ファイルは `#[path]` で同一ソースを取り込んだ上で、部分 write-back 固有の
 //! 探索（`apply_subset`/`crash_image`）だけを拡張 `impl` として追加している。
 
+// 許可（clippy::disallowed_methods）: 本ファイルは engine の公開 API の外から redb を直接開き、
+// 永続内容の検査・破壊・裏口の対照を行う。変更ログの捕捉（`storage::change_log`）を通す
+// 対象は engine 製品コードの書き込み点で、外部クレートとしての直接操作は対象外。
+#![allow(clippy::disallowed_methods)]
+
 use redb::{Database, ReadableDatabase, TableDefinition};
 
 /// テスト対象のテーブル定義（`crates/engine/src/storage.rs` の `ROWS_TABLE` と同一の

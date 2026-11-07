@@ -46,6 +46,7 @@
 //!
 //! 2 つのテーブル名は `op_ledger` と同じくユーザーテーブルの一覧には現れない。
 
+use crate::storage::change_log::CaptureWriteTxn as _;
 use std::collections::HashMap;
 use std::ops::Bound;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -448,7 +449,7 @@ pub(crate) fn lookup_in_write_txn(
     txn: &redb::WriteTransaction,
     key: &JobKey<'_>,
 ) -> Result<Option<JobRecord>, PartitionedJobError> {
-    let table = txn.open_table(PARTITIONED_JOB_TABLE)?;
+    let table = txn.open_table_logged(PARTITIONED_JOB_TABLE)?;
     let got = table.get(key.tuple())?;
     got.map(|g| decode_record(g.value())).transpose()
 }
@@ -479,8 +480,8 @@ pub(crate) fn count_interrupted_in_txn(
     table: &str,
     stop_at: u64,
 ) -> Result<u64, PartitionedJobError> {
-    let active = txn.open_table(PARTITIONED_JOB_ACTIVE_TABLE)?;
-    let jobs = txn.open_table(PARTITIONED_JOB_TABLE)?;
+    let active = txn.open_table_logged(PARTITIONED_JOB_ACTIVE_TABLE)?;
+    let jobs = txn.open_table_logged(PARTITIONED_JOB_TABLE)?;
     let lower = Bound::Included((tenant, table, ""));
     let iter = active.range::<(&str, &str, &str)>((lower, Bound::Unbounded))?;
     let mut count: u64 = 0;
@@ -524,7 +525,7 @@ fn verify_active_index_present(
     txn: &redb::WriteTransaction,
     key: &JobKey<'_>,
 ) -> Result<(), PartitionedJobError> {
-    let active = txn.open_table(PARTITIONED_JOB_ACTIVE_TABLE)?;
+    let active = txn.open_table_logged(PARTITIONED_JOB_ACTIVE_TABLE)?;
     let got = active.get(key.tuple())?;
     match got {
         Some(g) if g.value() == ACTIVE_INDEX_VALUE.as_slice() => Ok(()),
@@ -648,7 +649,7 @@ fn record_chunk_progress_impl(
                 fixed_time,
             };
             write_record(txn, key, &record)?;
-            let mut active = txn.open_table(PARTITIONED_JOB_ACTIVE_TABLE)?;
+            let mut active = txn.open_table_logged(PARTITIONED_JOB_ACTIVE_TABLE)?;
             if active
                 .insert(key.tuple(), ACTIVE_INDEX_VALUE.as_slice())?
                 .is_some()
@@ -783,7 +784,7 @@ fn write_record(
     key: &JobKey<'_>,
     record: &JobRecord,
 ) -> Result<(), PartitionedJobError> {
-    let mut table = txn.open_table(PARTITIONED_JOB_TABLE)?;
+    let mut table = txn.open_table_logged(PARTITIONED_JOB_TABLE)?;
     table.insert(key.tuple(), encode_record(record).as_slice())?;
     Ok(())
 }
@@ -792,7 +793,7 @@ fn remove_active_index(
     txn: &redb::WriteTransaction,
     key: &JobKey<'_>,
 ) -> Result<(), PartitionedJobError> {
-    let mut active = txn.open_table(PARTITIONED_JOB_ACTIVE_TABLE)?;
+    let mut active = txn.open_table_logged(PARTITIONED_JOB_ACTIVE_TABLE)?;
     let removed_ok = match active.remove(key.tuple())? {
         None => {
             return Err(PartitionedJobError::corrupt(
@@ -815,7 +816,7 @@ fn ledger_entry_exists_in_txn(
     txn: &redb::WriteTransaction,
     key: &JobKey<'_>,
 ) -> Result<bool, PartitionedJobError> {
-    let ledger = txn.open_table(crate::recovery::ledger::OP_LEDGER_TABLE)?;
+    let ledger = txn.open_table_logged(crate::recovery::ledger::OP_LEDGER_TABLE)?;
     let found = ledger.get(key.tuple())?.is_some();
     Ok(found)
 }
@@ -873,7 +874,7 @@ fn move_table_rows(
     old: &str,
     new: &str,
 ) -> Result<(), StorageError> {
-    let mut handle = write_txn.open_table(def)?;
+    let mut handle = write_txn.open_table_logged(def)?;
     let mut resume_after: Option<(String, String, String)> = None;
     loop {
         let mut batch: Vec<(String, String, Vec<u8>)> = Vec::new();
@@ -922,7 +923,7 @@ fn purge_table_rows(
     def: TableDefinition<(&str, &str, &str), &[u8]>,
     table: &str,
 ) -> Result<(), StorageError> {
-    let mut handle = write_txn.open_table(def)?;
+    let mut handle = write_txn.open_table_logged(def)?;
     let mut resume_after: Option<(String, String, String)> = None;
     loop {
         let mut keys: Vec<(String, String, String)> = Vec::new();

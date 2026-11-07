@@ -19,6 +19,7 @@
 //! されないため行・トリガの書いた行・台帳・索引はいずれも残らない。トリガが書いた表の遅延 FK は
 //! [`super::trigger_insert`] と同じ規則で扱う。エラーは `TenantWriteError`（トリガ由来は `TriggerFailed`）。
 
+use crate::storage::change_log::CaptureWriteTxn as _;
 use redb::ReadableTable;
 
 use super::trigger_insert::settle_trigger_written_tables;
@@ -96,7 +97,7 @@ fn read_row(
 ) -> Result<crate::storage::Row, TenantWriteError> {
     let row_table_name = user_rows_table_name(table);
     let row_table = write_txn
-        .open_table(user_rows_table_def(&row_table_name))
+        .open_table_logged(user_rows_table_def(&row_table_name))
         .map_err(map_row_table_error)?;
     let key = row_key(ctx.tenant_id(), RowId::from_legacy_id(id));
     let guard = row_table
@@ -264,7 +265,7 @@ pub(super) fn update_rows_with_triggers(
         {
             let row_table_name = user_rows_table_name(table);
             let mut row_table = write_txn
-                .open_table(user_rows_table_def(&row_table_name))
+                .open_table_logged(user_rows_table_def(&row_table_name))
                 .map_err(map_row_table_error)?;
             let key = row_key(ctx.tenant_id(), RowId::from_legacy_id(*id));
             row_table
@@ -416,7 +417,7 @@ pub(super) fn delete_rows_with_triggers(
         {
             let row_table_name = user_rows_table_name(table);
             let mut row_table = write_txn
-                .open_table(user_rows_table_def(&row_table_name))
+                .open_table_logged(user_rows_table_def(&row_table_name))
                 .map_err(map_row_table_error)?;
             let key = row_key(ctx.tenant_id(), RowId::from_legacy_id(*id));
             // commit 記録の行の足跡: 削除される前の行（SQL-38・Issue #2404）。
@@ -506,7 +507,7 @@ pub(super) fn id_is_target(
 ) -> Result<bool, TenantWriteError> {
     let row_table_name = user_rows_table_name(table);
     let row_table = write_txn
-        .open_table(user_rows_table_def(&row_table_name))
+        .open_table_logged(user_rows_table_def(&row_table_name))
         .map_err(map_row_table_error)?;
     let key = row_key(ctx.tenant_id(), RowId::from_legacy_id(id));
     let found = match row_table.get(&key).map_err(CatalogError::from)? {

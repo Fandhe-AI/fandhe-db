@@ -20,6 +20,7 @@
 //! fail-closed: 未知の版・タグ、予約バイトが 0 以外、切断、末尾の余り、上限超過、キーと値の不整合は固定文言の
 //! `CorruptSchema` とし、blob の断片・tenant_id・式本文をエラーに含めない。
 
+use crate::storage::change_log::CaptureWriteTxn as _;
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 
 use crate::storage::read_source::ReadSource;
@@ -420,7 +421,7 @@ pub(crate) fn list_policies_in_source<R: ReadSource>(
 
 /// 内部 ID を 1 つ払い出す（1 始まり・`checked_add`・再利用しない）。
 fn allocate_id_in_txn(write_txn: &redb::WriteTransaction) -> Result<u64> {
-    let mut counter = write_txn.open_table(POLICY_ID_COUNTER_TABLE)?;
+    let mut counter = write_txn.open_table_logged(POLICY_ID_COUNTER_TABLE)?;
     let current = counter
         .get(POLICY_ID_COUNTER_KEY)?
         .map(|v| v.value())
@@ -469,7 +470,7 @@ pub(crate) fn remove_policies_for_table_in_txn(
         if batch.is_empty() {
             return Ok(());
         }
-        let mut table = write_txn.open_table(POLICIES_TABLE)?;
+        let mut table = write_txn.open_table_logged(POLICIES_TABLE)?;
         for (scope, name, _) in &batch {
             table.remove((table_key, scope.as_str(), name.as_str()))?;
         }
@@ -489,7 +490,7 @@ pub(crate) fn rename_table_in_txn(
         if batch.is_empty() {
             return Ok(());
         }
-        let mut table = write_txn.open_table(POLICIES_TABLE)?;
+        let mut table = write_txn.open_table_logged(POLICIES_TABLE)?;
         for (scope, name, blob) in &batch {
             table.remove((old_key, scope.as_str(), name.as_str()))?;
             table.insert((new_key, scope.as_str(), name.as_str()), blob.as_slice())?;
@@ -622,7 +623,7 @@ impl Storage {
         let blob = encode_policy_def(&stored)?;
         {
             let mut table = write_txn
-                .open_table(POLICIES_TABLE)
+                .open_table_logged(POLICIES_TABLE)
                 .map_err(CatalogError::from)?;
             table
                 .insert((table_key, scope, stored.name.as_str()), blob.as_slice())
@@ -668,7 +669,7 @@ impl Storage {
         let blob = encode_policy_def(&next)?;
         {
             let mut table = write_txn
-                .open_table(POLICIES_TABLE)
+                .open_table_logged(POLICIES_TABLE)
                 .map_err(CatalogError::from)?;
             table
                 .insert((table_key, scope, name), blob.as_slice())
@@ -709,7 +710,7 @@ impl Storage {
         current.name = new_name.to_string();
         let blob = encode_policy_def(&current)?;
         {
-            let mut table = write_txn.open_table(POLICIES_TABLE)?;
+            let mut table = write_txn.open_table_logged(POLICIES_TABLE)?;
             table.remove((table_key, scope, name))?;
             table.insert((table_key, scope, new_name), blob.as_slice())?;
         }
@@ -736,7 +737,7 @@ impl Storage {
             return Ok(false);
         }
         {
-            let mut table = write_txn.open_table(POLICIES_TABLE)?;
+            let mut table = write_txn.open_table_logged(POLICIES_TABLE)?;
             table.remove((table_key, scope, name))?;
         }
         bump_table_generation_in_txn(&write_txn, table_key)?;

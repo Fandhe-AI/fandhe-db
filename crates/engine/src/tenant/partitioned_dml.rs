@@ -904,7 +904,7 @@ fn scan_chunk<E>(
     };
     let row_table_name = user_rows_table_name(table);
     let row_table = write_txn
-        .open_table(user_rows_table_def(&row_table_name))
+        .open_table_logged(user_rows_table_def(&row_table_name))
         .map_err(|e| w(map_row_table_error(e)))?;
     let mut candidates: Vec<RowId> = Vec::with_capacity(width.min(4096));
     let mut embedding_scratch: Vec<f32> = Vec::new();

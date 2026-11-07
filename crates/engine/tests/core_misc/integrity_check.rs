@@ -7,6 +7,11 @@
 //! 行の値・テナント名が含まれない。(4) 資源上限（予算超過・報告の打ち切り）が fail-closed に働き、
 //! `export_snapshot` の出力にも検査が通る。
 
+// 許可（clippy::disallowed_methods）: 本ファイルは engine の公開 API の外から redb を直接開き、
+// 永続内容を意図的に壊して整合検査（読み取りのみ）の報告を確かめる。変更ログの捕捉（`storage::change_log`）を
+// 通す対象は engine 製品コードの書き込み点で、外部クレートとしての直接操作は対象外。
+#![allow(clippy::disallowed_methods)]
+
 use std::path::Path;
 
 use engine::core::EngineCore;
@@ -1098,5 +1103,117 @@ fn unreadable_gin_table_does_not_hide_a_confirmed_row_store_loss() {
     let report = verify(&path);
     // 一意索引の痕跡で欠落が確定しているので、GIN 表を読めなくても報告される。
     assert_eq!(report.total(FindingKind::RowStoreMissing), 1);
+    assert!(!report.is_consistent());
+}
+
+#[test]
+fn index_catalog_entry_with_valid_header_but_broken_value_is_one_error() {
+    let (path, _g) = build_db("integrity-index-catalog-header-ok");
+    corrupt(&path, |w| {
+        let mut cat = w
+            .open_table(TableDefinition::<&str, &[u8]>::new("index_catalog"))
+            .expect("index catalog");
+        // 版・表名の行は実在する表 `parents` を指し、以降が復号できない。
+        cat.insert("zz_half", b"v4\nparents\n\x01broken".as_slice())
+            .expect("broken entry");
+    });
+    let report = verify(&path);
+    // 同じエントリを表ごとの失敗と二重に数えない。
+    assert_eq!(report.total(FindingKind::IndexCatalogEntryUndecodable), 1);
+    assert!(report.total(FindingKind::CheckUnavailable) >= 1);
+    assert!(!report.is_consistent());
+}
+
+#[test]
+fn legacy_rows_table_outside_the_catalog_is_checked() {
+    use engine::storage::RowInput;
+    let path = unique_db_path("integrity-legacy-rows");
+    let _g = CleanupGuard(path.clone());
+    {
+        let storage = Storage::open(&path).expect("open");
+        for (id, tenant) in [(1u64, TENANTS[0]), (2, TENANTS[1])] {
+            storage
+                .put(
+                    id,
+                    &RowInput {
+                        tenant_id: tenant,
+                        visibility: Visibility::Public,
+                        embedding: &[1.0, 2.0],
+                        metadata: b"m",
+                    },
+                )
+                .expect("put");
+        }
+    }
+    let healthy = verify(&path);
+    assert!(healthy.findings.is_empty(), "{:?}", healthy.findings);
+    assert_eq!(healthy.rows_scanned, 2);
+
+    let rows_def = TableDefinition::<(&str, u64), &[u8]>::new("rows");
+    let (_, other_value) = {
+        let db = Database::open(&path).expect("raw open");
+        let r = db.begin_read().expect("read");
+        let t = r.open_table(rows_def).expect("rows");
+        let first = t
+            .range((TENANTS[1], 0u64)..=(TENANTS[1], u64::MAX))
+            .expect("range")
+            .next()
+            .expect("row")
+            .expect("entry");
+        (first.0.value().1, first.1.value().to_vec())
+    };
+    corrupt(&path, |w| {
+        let mut t = w.open_table(rows_def).expect("rows");
+        t.insert((TENANTS[0], 99u64), [0xFFu8, 1].as_slice())
+            .expect("garbage");
+        // 別テナントのヘッダを持つ行を、このテナントのキーで置く。
+        t.insert((TENANTS[0], 98u64), other_value.as_slice())
+            .expect("mismatch");
+    });
+    let report = verify(&path);
+    assert_eq!(report.total(FindingKind::RowUndecodable), 1);
+    assert_eq!(report.total(FindingKind::RowTenantMismatch), 1);
+    assert!(report
+        .findings
+        .iter()
+        .all(|f| f.table.as_deref() == Some("rows")));
+    assert!(!report.is_consistent());
+}
+
+#[test]
+fn materialized_view_rows_are_checked() {
+    let (path, _g) = build_db("integrity-matview-rows");
+    {
+        let core = core_at(&path);
+        run(
+            &core,
+            TENANTS[0],
+            "CREATE MATERIALIZED VIEW parent_codes AS SELECT code FROM parents",
+        );
+    }
+    let healthy = verify(&path);
+    assert!(healthy.findings.is_empty(), "{:?}", healthy.findings);
+    let mv_def = TableDefinition::<(&[u8], u64), &[u8]>::new("matview_rows/parent_codes");
+    let (key, value) = {
+        let db = Database::open(&path).expect("raw open");
+        let r = db.begin_read().expect("read");
+        let t = r.open_table(mv_def).expect("matview rows (populated)");
+        let first = t.iter().expect("iter").next().expect("row").expect("entry");
+        (first.0.value().0.to_vec(), first.1.value().to_vec())
+    };
+    corrupt(&path, |w| {
+        let mut t = w.open_table(mv_def).expect("rows");
+        t.insert((key.as_slice(), 900u64), [0xFFu8].as_slice())
+            .expect("garbage");
+        // 文脈キー（別テナントのもの）に、このテナントのヘッダを持つ行を置く。
+        let mut other = key.clone();
+        other.truncate(2);
+        other.extend_from_slice(TENANTS[1].as_bytes());
+        t.insert((other.as_slice(), 0u64), value.as_slice())
+            .expect("mismatch");
+    });
+    let report = verify(&path);
+    assert_eq!(report.total(FindingKind::RowUndecodable), 1);
+    assert_eq!(report.total(FindingKind::RowTenantMismatch), 1);
     assert!(!report.is_consistent());
 }

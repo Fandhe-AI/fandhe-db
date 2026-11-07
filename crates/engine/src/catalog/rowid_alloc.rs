@@ -16,6 +16,7 @@
 //! 呼び出し元: `delete_table_in_txn`・`rename_table_in_txn` は
 //! `Storage::drop_tables`／`Storage::alter_table_rename` が同一 txn で呼ぶ。
 
+use crate::storage::change_log::CaptureWriteTxn as _;
 use std::ops::RangeInclusive;
 
 use redb::{ReadableTable, TableDefinition, TableHandle};
@@ -59,7 +60,7 @@ pub(crate) fn allocate_in_txn(
         ));
     }
     let last = {
-        let state = write_txn.open_table(ROWID_STATE_TABLE)?;
+        let state = write_txn.open_table_logged(ROWID_STATE_TABLE)?;
         let stored = state.get((table, tenant))?.map(|g| g.value());
         stored
     };
@@ -73,7 +74,7 @@ pub(crate) fn allocate_in_txn(
     let end = last
         .checked_add(n)
         .ok_or_else(|| CatalogError::Invalid(EXHAUSTED_MESSAGE.to_string()))?;
-    let mut state = write_txn.open_table(ROWID_STATE_TABLE)?;
+    let mut state = write_txn.open_table_logged(ROWID_STATE_TABLE)?;
     state.insert((table, tenant), end)?;
     Ok(RowId::from_allocated(first)..=RowId::from_allocated(end))
 }
@@ -85,7 +86,7 @@ fn max_existing_rowid(
     table: &str,
 ) -> Result<u64> {
     let row_table_name = user_rows_table_name(table);
-    let rows = match write_txn.open_table(user_rows_table_def(&row_table_name)) {
+    let rows = match write_txn.open_table_logged(user_rows_table_def(&row_table_name)) {
         Ok(t) => t,
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(0),
         Err(e) => return Err(super::map_row_table_error(e)),
@@ -108,7 +109,7 @@ pub(crate) fn delete_table_in_txn(write_txn: &redb::WriteTransaction, table: &st
     if !state_table_exists(write_txn)? {
         return Ok(());
     }
-    let mut state = write_txn.open_table(ROWID_STATE_TABLE)?;
+    let mut state = write_txn.open_table_logged(ROWID_STATE_TABLE)?;
     loop {
         let keys = collect_tenants(&state, table)?;
         if keys.is_empty() {
@@ -131,7 +132,7 @@ pub(crate) fn rename_table_in_txn(
         return Ok(());
     }
     delete_table_in_txn(write_txn, new)?;
-    let mut state = write_txn.open_table(ROWID_STATE_TABLE)?;
+    let mut state = write_txn.open_table_logged(ROWID_STATE_TABLE)?;
     loop {
         let keys = collect_tenants(&state, old)?;
         if keys.is_empty() {

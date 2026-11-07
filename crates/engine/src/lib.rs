@@ -224,6 +224,15 @@
 // とする（`make lint` は `--all-targets` で動くため、テストの通常アサーション
 // 出力は妨げない）。
 #![cfg_attr(not(test), deny(clippy::print_stderr))]
+// 書き込み側の表操作（`WriteTransaction` の `open_table`・`delete_table`・`rename_table` 等）の
+// 直呼びは `clippy.toml` の `disallowed-methods` で禁止し、変更ログの捕捉つき
+// `storage::change_log::CaptureWriteTxn` の `*_logged` を経由させる（RECOVER-14・D1 の層 1）。
+// 単体テスト（`#[cfg(test)]`）は、永続内容の検査・破壊・裏口の対照のため素の redb を直接開くことを
+// 許す。製品コードへは漏れない: CI の `rust-ci` が呼ぶ外部 workflow（Fandhe-AI/actions の
+// `rust-base-ci.yml`）は `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+// （`make lint` と同じ）を実行し、`cfg(test)` でない lib ビルドも検査するため、製品コードの直呼びは
+// この許可の外で必ず検出される。
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
 
 pub mod arena;
 pub mod batch_fallback;

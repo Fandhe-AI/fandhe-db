@@ -19,6 +19,10 @@
 //! 6. GIN 相当索引と行の双方向の突き合わせ（`gin_index::audit_tenant_streaming`）
 //! 7. `FOREIGN KEY` の孤児行（参照先に存在しない子行）
 //! 8. 採番方式の表の rowid 採番状態が既存の最大 rowid より進んでいること
+//! 9. カタログを経ない行ストア: `rows` 表（`Storage::put`・`put_batch`・`BatchWriteTxn` の書き込み先）の
+//!    行の復号と行キー・ヘッダのテナント一致、マテリアライズドビューの実体（`matview_rows/<名前>`）の
+//!    行の復号と文脈キー・ヘッダのテナント一致、対応する定義の無い実体（孤児）
+//! 10. 索引カタログのエントリ単位の復号（壊れたエントリを 1 件ずつ数える）
 //!
 //! # 対象外（理由）
 //!
@@ -26,8 +30,11 @@
 //! - FK 用のキー索引（`key_index/…`）: 登録簿が遅延構築で、欠落は書き込み側が再構築する設計。
 //!   FK の判定は本検査が行から直接行う（4・7）ため、索引の状態に依存しない
 //! - 一意索引・GIN 索引の逆引き（`0x02`）: 後片付け用の衛生データで正しさに関与しない
-//! - マテリアライズドビューの実体: クエリの再実行なしには導出元と照合できない（表の型と全エントリの
-//!   可読性のみ項目 1 で確認する）
+//! - マテリアライズドビューの実体と導出元の照合: クエリの再実行なしには照合できない（行の形式と
+//!   テナント一致だけを項目 9 で確認する）
+//! - 値が行形式でない表（操作 ID 台帳・分割実行ジョブ・権限/ロール/シーケンス等のカタログ類・採番状態・
+//!   各種カウンタ）: 値の形式を共有する検査対象の行形式が無い。型と全エントリの可読性は項目 1 で確認する
+//! - 一時表（接続ごとの別 `Storage`）: 永続ファイルに存在しない
 //! - 操作 ID 台帳・バッチ台帳・世代カウンタ・索引カタログ: 他のデータから導出できる不変条件が無い
 //! - 行を 1 件も持たないテナントに残る索引エントリ: 衛生指標で、行から辿れる範囲だけを検査する
 //! - 行ストアの消失の検出には限界がある（作成直後の表は行ストアを持たない設計のため）。行を書いた
@@ -417,6 +424,9 @@ impl Storage {
         };
         let mut report = IntegrityReport::default();
         check_storage_tables(read, &mut c, &mut report);
+        if check_legacy_rows_table(read, &mut c, &mut report).is_err() {
+            c.add(FindingKind::TableUnreadable, Some("rows"), 1);
+        }
         check_catalog(read, options, &mut c, &mut report);
         report.findings = c
             .groups
@@ -459,6 +469,9 @@ fn check_storage_tables(read: &ReadTransaction, c: &mut Collector, report: &mut 
                 c.add(FindingKind::TableUnreadable, Some(family), 1)
             }
         }
+        if let Some(view) = name.strip_prefix("matview_rows/") {
+            check_matview_rows(read, view, c, report);
+        }
         if let Some(key) = name.strip_prefix("user_rows/") {
             match catalog::catalog_has_key(read, key) {
                 Ok(true) => {}
@@ -469,6 +482,74 @@ fn check_storage_tables(read: &ReadTransaction, c: &mut Collector, report: &mut 
     }
 }
 
+/// カタログを経ない行ストアの 1 つ、マテリアライズドビューの実体（`matview_rows/<名前>`）の行を検査する。
+fn check_matview_rows(
+    read: &ReadTransaction,
+    view: &str,
+    c: &mut Collector,
+    report: &mut IntegrityReport,
+) {
+    match catalog::materialized::audit_matview_rows(read, view) {
+        Ok(a) => {
+            report.rows_scanned = report.rows_scanned.saturating_add(a.rows);
+            if a.orphan {
+                c.add(FindingKind::OrphanRowStore, Some(view), 1);
+            }
+            c.add(FindingKind::RowUndecodable, Some(view), a.undecodable);
+            c.add(
+                FindingKind::RowTenantMismatch,
+                Some(view),
+                a.tenant_mismatch,
+            );
+        }
+        Err(e) => c.add(
+            decode_failure_kind(&e, FindingKind::CatalogEntryUndecodable),
+            Some(view),
+            1,
+        ),
+    }
+}
+
+/// カタログを経ない行ストアの 1 つ、`Storage::put`・`put_batch`・`BatchWriteTxn` が使う `rows` 表を検査する。
+/// 行の復号（ヘッダ・本体・埋め込み）と、行キーのテナントと行ヘッダのテナントの一致を見る。
+fn check_legacy_rows_table(
+    read: &ReadTransaction,
+    c: &mut Collector,
+    report: &mut IntegrityReport,
+) -> Result<(), ReadFail> {
+    const NAME: &str = "rows";
+    let table = match read.open_table(super::ROWS_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
+        Err(redb::TableError::TableTypeMismatch { .. }) => {
+            c.add(FindingKind::RowStoreFormatMismatch, Some(NAME), 1);
+            return Ok(());
+        }
+        Err(_) => return Err(ReadFail),
+    };
+    let (mut undecodable, mut mismatch) = (0u64, 0u64);
+    for entry in table.iter()? {
+        let (k, v) = entry?;
+        report.rows_scanned = report.rows_scanned.saturating_add(1);
+        let (key_tenant, id) = k.value();
+        let buf = v.value();
+        match crate::storage::decode_row_header(buf) {
+            Ok((header_tenant, _, _)) if header_tenant != key_tenant => {
+                mismatch = mismatch.saturating_add(1);
+            }
+            Ok(_) => {
+                if crate::storage::decode_row(RowId::from_index_raw(id), buf).is_err() {
+                    undecodable = undecodable.saturating_add(1);
+                }
+            }
+            Err(_) => undecodable = undecodable.saturating_add(1),
+        }
+    }
+    c.add(FindingKind::RowUndecodable, Some(NAME), undecodable);
+    c.add(FindingKind::RowTenantMismatch, Some(NAME), mismatch);
+    Ok(())
+}
+
 /// カタログの全エントリを順に検査する。
 fn check_catalog(
     read: &ReadTransaction,
@@ -476,15 +557,12 @@ fn check_catalog(
     c: &mut Collector,
     report: &mut IntegrityReport,
 ) {
-    // 索引カタログは全表の宣言を一度に読むため、壊れたエントリは 1 件でも全表の宣言の取得を失敗させる。
-    // 壊れていること自体をここで 1 回だけ報告し、各表は宣言を使う検査だけを未検査にして続ける。
-    match catalog::table_expression_decls_in_read_txn(read, "") {
-        Ok(_) => {}
-        Err(e) => c.add(
-            decode_failure_kind(&e, FindingKind::IndexCatalogEntryUndecodable),
-            None,
-            1,
-        ),
+    // 索引カタログの壊れたエントリは、エントリ単位でここで 1 回だけ数える（表ごとの宣言の取得は
+    // 別表のエントリを読み飛ばすため、表ごとの失敗から数えると取りこぼし・二重計上になる）。
+    // 各表は宣言を取得できないとき、宣言を使う検査だけを未検査にして続ける。
+    match catalog::count_undecodable_index_entries(read) {
+        Ok(n) => c.add(FindingKind::IndexCatalogEntryUndecodable, None, n),
+        Err(_) => c.add(FindingKind::CheckUnavailable, None, 1),
     }
     let mut after: Option<String> = None;
     loop {

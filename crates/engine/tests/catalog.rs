@@ -4,6 +4,11 @@
 //! ヘルパ（`unique_db_path` / `CleanupGuard`）は Issue #173 で
 //! `crates/engine/src/test_util/temp_db.rs` へ一本化した（旧: 結合テストごとの複製）。
 
+// 許可（clippy::disallowed_methods）: 本ファイルは engine の公開 API の外から redb を直接開き、
+// 永続内容の検査・破壊・裏口の対照を行う。変更ログの捕捉（`storage::change_log`）を通す
+// 対象は engine 製品コードの書き込み点で、外部クレートとしての直接操作は対象外。
+#![allow(clippy::disallowed_methods)]
+
 use std::time::Instant;
 
 use redb::{ReadableDatabase, ReadableTable};

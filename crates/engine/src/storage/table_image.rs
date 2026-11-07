@@ -30,6 +30,7 @@
 //! 上限値は実装既定値（[`MAX_IMAGE_BYTES_PER_SAVEPOINT`]・[`MAX_IMAGE_BYTES_PER_TXN`]）で、
 //! spec 由来の数値ではない。
 
+use crate::storage::change_log::CaptureWriteTxn as _;
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::time::Instant;
@@ -202,7 +203,7 @@ fn read_table<K: Key + 'static, V: Value + 'static>(
     mode: ReadMode<'_>,
     meter: &mut Meter,
 ) -> Result<ReadProbe, ImageError> {
-    let table = match writer.open_table(TableDefinition::<K, V>::new(name)) {
+    let table = match writer.open_table_logged(TableDefinition::<K, V>::new(name)) {
         Ok(t) => t,
         Err(TableError::TableTypeMismatch { .. }) => return Ok(ReadProbe::Mismatch),
         Err(_) => return Err(ImageError),
@@ -296,7 +297,7 @@ fn capture_table<K: Key + 'static, V: Value + 'static>(
     meter: &mut Meter,
 ) -> Result<Probe, ImageError> {
     let def = TableDefinition::<K, V>::new(name);
-    let wt = match writer.open_table(def) {
+    let wt = match writer.open_table_logged(def) {
         Ok(t) => t,
         Err(TableError::TableTypeMismatch { .. }) => return Ok(Probe::Mismatch),
         Err(_) => return Err(ImageError),
@@ -408,7 +409,7 @@ fn apply_table<K: Key + 'static, V: Value + 'static>(
     delta: &TableDelta,
 ) -> Result<(), ImageError> {
     let mut table = writer
-        .open_table(TableDefinition::<K, V>::new(&delta.name))
+        .open_table_logged(TableDefinition::<K, V>::new(&delta.name))
         .map_err(|_| ImageError)?;
     for k in &delta.removes {
         table.remove(K::from_bytes(k)).map_err(|_| ImageError)?;
@@ -606,7 +607,7 @@ pub(crate) fn apply(writer: &WriteTransaction, image: &TableImage) -> Result<(),
             .filter(|h| image.dropped.iter().any(|n| n == h.name()))
             .collect();
         for h in handles {
-            writer.delete_table(h).map_err(|_| ImageError)?;
+            writer.delete_table_logged(h).map_err(|_| ImageError)?;
         }
     }
     for d in &image.deltas {

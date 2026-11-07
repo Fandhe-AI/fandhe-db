@@ -48,6 +48,7 @@ use crate::catalog::{
     user_gin_table_def, user_gin_table_name, user_rows_table_def, user_rows_table_name,
     CatalogError, ColumnType, DeclaredGinIndex, GinIndexAudit, GinOpClass, TableSchema,
 };
+use crate::storage::change_log::{CaptureWriteTxn as _, CapturingTable};
 use crate::storage::rowid::{row_key, split_row_key, RowId};
 use crate::tenant::TenantWriteError;
 use redb::{ReadableTable, TableHandle};
@@ -75,7 +76,7 @@ const COLUMN_TYPE_TAG_JSONB: u8 = 0x01;
 const CLEAR_CHUNK_LIMIT: usize = 4096;
 
 /// 索引テーブルの型エイリアス（可変ハンドル）。
-type IndexTable<'a> = redb::Table<'a, (&'static str, &'static [u8]), &'static [u8]>;
+type IndexTable<'a> = CapturingTable<'a, (&'static str, &'static [u8]), &'static [u8]>;
 
 /// 内部矛盾（索引破損・宣言と実スキーマの不整合等）を fail-closed に拒否する固定文言のエラーへ包む。
 /// 値・id・テナント名は含めない（他テナントの存在情報を漏らさない。security.md P0）。
@@ -528,14 +529,14 @@ pub(crate) fn maintain_rows_in_txn(
     }
     let row_table_name = user_rows_table_name(table_name);
     let row_table = write_txn
-        .open_table(user_rows_table_def(&row_table_name))
+        .open_table_logged(user_rows_table_def(&row_table_name))
         .map_err(crate::catalog::map_row_table_error)?;
     for decl in decls {
         let target = resolve_target(schema, decl)?;
         let sig = signature(&target)?;
         let gin_table_name = user_gin_table_name(&decl.index_name);
         let mut index_table = write_txn
-            .open_table(user_gin_table_def(&gin_table_name))
+            .open_table_logged(user_gin_table_def(&gin_table_name))
             .map_err(table_error)?;
         let rebuilt = ensure_tenant_index(
             &row_table,
@@ -586,7 +587,7 @@ pub(crate) fn forget_rows_in_txn(
             continue;
         }
         let mut index_table = write_txn
-            .open_table(user_gin_table_def(&gin_table_name))
+            .open_table_logged(user_gin_table_def(&gin_table_name))
             .map_err(table_error)?;
         for &id in ids {
             forget_row(&mut index_table, tenant_id, id)?;
@@ -611,7 +612,7 @@ pub(crate) fn clear_tenant_in_txn(
         let target = resolve_target(schema, decl)?;
         let sig = signature(&target)?;
         let mut index_table = write_txn
-            .open_table(user_gin_table_def(&gin_table_name))
+            .open_table_logged(user_gin_table_def(&gin_table_name))
             .map_err(table_error)?;
         while clear_tenant_chunk(&mut index_table, tenant_id)? {}
         index_table
@@ -638,12 +639,12 @@ pub(crate) fn build_all_tenants_in_txn(
 ) -> Result<(), TenantWriteError> {
     let gin_table_name = user_gin_table_name(&decl.index_name);
     write_txn
-        .delete_table(user_gin_table_def(&gin_table_name))
+        .delete_table_logged(user_gin_table_def(&gin_table_name))
         .map_err(table_error)?;
     let target = resolve_target(schema, decl)?;
     let sig = signature(&target)?;
     let row_table_name = user_rows_table_name(table_name);
-    let row_table = match write_txn.open_table(user_rows_table_def(&row_table_name)) {
+    let row_table = match write_txn.open_table_logged(user_rows_table_def(&row_table_name)) {
         Ok(t) => t,
         // 行テーブル未作成は行 0 件として扱う（マーカーは各テナントの初回書き込みで遅延構築される）。
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
@@ -654,7 +655,7 @@ pub(crate) fn build_all_tenants_in_txn(
         }
     };
     let mut index_table = write_txn
-        .open_table(user_gin_table_def(&gin_table_name))
+        .open_table_logged(user_gin_table_def(&gin_table_name))
         .map_err(table_error)?;
     let marker = marker_value(&sig);
     let mut current_tenant: Option<String> = None;
