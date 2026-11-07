@@ -39,7 +39,10 @@
 //! `WriteTransaction` 実装は `list_tables` で存在を確認してから開き、無ければ
 //! `TableError::TableDoesNotExist` を返す（`ReadTransaction` と同じ契約）。
 
-use redb::{Key, ReadableTable, TableDefinition, TableError, Value};
+use std::borrow::Borrow;
+use std::ops::RangeBounds;
+
+use redb::{Key, ReadableTable, ReadableTableMetadata, TableDefinition, TableError, Value};
 
 /// 読み取り本体が行テーブル・カタログ・索引テーブルを開くための入力源。
 /// 実装は [`redb::ReadTransaction`]（確定済みスナップショット）と
@@ -85,9 +88,58 @@ impl ReadSource for redb::ReadTransaction {
     }
 }
 
+/// 書き込みトランザクション上で開いた、読み取り専用のハンドル。内側の `redb::Table` は書き込み可能な
+/// 具象型だが、本型は [`ReadableTable`]・[`ReadableTableMetadata`] だけを公開し、`Deref` も実装しない。
+/// そのため `ReadSource::open_table` の戻り値から変更系メソッドへ到達できず、変更ログの捕捉
+/// （`storage::change_log::CapturingTable`）を経ない書き込みの裏口にならない。
+pub struct WriteTxnReadTable<'s, K: Key + 'static, V: Value + 'static>(redb::Table<'s, K, V>);
+
+impl<K: Key + 'static, V: Value + 'static> ReadableTableMetadata for WriteTxnReadTable<'_, K, V> {
+    fn stats(&self) -> Result<redb::TableStats, redb::StorageError> {
+        self.0.stats()
+    }
+
+    fn len(&self) -> Result<u64, redb::StorageError> {
+        self.0.len()
+    }
+}
+
+impl<K: Key + 'static, V: Value + 'static> ReadableTable<K, V> for WriteTxnReadTable<'_, K, V> {
+    fn get<'a>(
+        &self,
+        key: impl Borrow<K::SelfType<'a>>,
+    ) -> Result<Option<redb::AccessGuard<'_, V>>, redb::StorageError> {
+        ReadableTable::get(&self.0, key)
+    }
+
+    fn range<'a, KR>(
+        &self,
+        range: impl RangeBounds<KR> + 'a,
+    ) -> Result<redb::Range<'_, K, V>, redb::StorageError>
+    where
+        KR: Borrow<K::SelfType<'a>> + 'a,
+    {
+        ReadableTable::range(&self.0, range)
+    }
+
+    fn first(
+        &self,
+    ) -> Result<Option<(redb::AccessGuard<'_, K>, redb::AccessGuard<'_, V>)>, redb::StorageError>
+    {
+        ReadableTable::first(&self.0)
+    }
+
+    fn last(
+        &self,
+    ) -> Result<Option<(redb::AccessGuard<'_, K>, redb::AccessGuard<'_, V>)>, redb::StorageError>
+    {
+        ReadableTable::last(&self.0)
+    }
+}
+
 impl ReadSource for redb::WriteTransaction {
     type Table<'s, K: Key + 'static, V: Value + 'static>
-        = redb::Table<'s, K, V>
+        = WriteTxnReadTable<'s, K, V>
     where
         Self: 's;
 
@@ -105,13 +157,13 @@ impl ReadSource for redb::WriteTransaction {
         if !exists {
             return Err(TableError::TableDoesNotExist(def.name().to_string()));
         }
-        // 許可（clippy::disallowed_methods）: `ReadSource::Table` は読み取り専用の境界
-        // （`ReadableTable`）でしか露出せず、書き込みの入口が無い。しかも上で存在確認済みなので
-        // 表の作成も起きない。変更ログの捕捉対象は書き込みハンドル経由の変更だけで、
-        // 読み取りのためのこの open は対象外（RECOVER-14 の層 1 は書き込み点のみ）。
+        // 許可（clippy::disallowed_methods）: 戻り値は変更系を公開しない [`WriteTxnReadTable`] に
+        // 包むため、このハンドルから書き込みへ到達できない。上で存在確認済みなので表の作成も
+        // 起きない。変更ログの捕捉対象は書き込みハンドル経由の変更だけで、読み取りのための
+        // この open は対象外（RECOVER-14 の層 1 は書き込み点のみ）。
         #[allow(clippy::disallowed_methods)]
         let table = redb::WriteTransaction::open_table(self, def);
-        table
+        table.map(WriteTxnReadTable)
     }
 
     fn snapshot(&self) -> Option<&redb::ReadTransaction> {

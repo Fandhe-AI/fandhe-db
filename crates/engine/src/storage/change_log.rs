@@ -871,6 +871,8 @@ impl CaptureSession {
     /// 論理→物理の対応が未定義の論理表（行ストアを持たない種類）は 3 を省く（拒否ではなく
     /// 実装時のテストで検出する。ADR D1）。行数は O(1) の読み取りで、全行は走査しない。
     /// 世代カウンタ表の走査は O(世代管理対象の表の数) で、変更ログ有効時の commit だけが負う。
+    /// 世代が変わった表ごとの追加費用は行数の読み取り 2 回で、`list_tables` は表集合の取得（2 回）に
+    /// 一本化してある。
     fn verify_footprint(
         &self,
         write_txn: &redb::WriteTransaction,
@@ -905,8 +907,8 @@ impl CaptureSession {
             {
                 continue;
             }
-            let after = row_store_len(write_txn, &row_store)?;
-            let before = row_store_len(&self.base, &row_store)?;
+            let after = write_row_store_len(write_txn, &row_store)?;
+            let before = base_row_store_len(&self.base, &row_store)?;
             let noted = st.keys.get(row_store.as_str()).map_or(0, BTreeSet::len);
             let delta = after.abs_diff(before);
             if delta > u64::try_from(noted).unwrap_or(u64::MAX) {
@@ -926,9 +928,21 @@ fn physical_row_store(logical: &str) -> Option<String> {
     Some(crate::catalog::user_rows_physical_name(logical))
 }
 
-/// 行ストアの行数（O(1)）。読み取り入力源の `open_table` は存在しない表を作らず、書き込みハンドルも返さない。
-fn row_store_len<R: super::read_source::ReadSource>(source: &R, name: &str) -> Result<u64> {
-    let table = source
+/// 書き込み側の行ストアの行数（O(1)）。呼び出し側が表の存在を表集合で確認済みなので、
+/// 読み取り入力源の `open_table` が表ごとに行う `list_tables` を避けて直接開く（読み取りのみ。
+/// 表は作らず、ハンドルは行数を読んですぐ捨てる）。
+fn write_row_store_len(write_txn: &redb::WriteTransaction, name: &str) -> Result<u64> {
+    // 許可（clippy::disallowed_methods）: 存在確認済みの表の行数を読むだけで、書き込まない。
+    #[allow(clippy::disallowed_methods)]
+    let table = write_txn
+        .open_table(crate::catalog::user_rows_table_def(name))
+        .map_err(|_| StorageError::CommitFootprintUnrecordable)?;
+    ReadableTableMetadata::len(&table).map_err(|_| StorageError::CommitFootprintUnrecordable)
+}
+
+/// 基底の行ストアの行数（O(1)。存在は表集合で確認済み）。
+fn base_row_store_len(base: &redb::ReadTransaction, name: &str) -> Result<u64> {
+    let table = base
         .open_table(crate::catalog::user_rows_table_def(name))
         .map_err(|_| StorageError::CommitFootprintUnrecordable)?;
     ReadableTableMetadata::len(&table).map_err(|_| StorageError::CommitFootprintUnrecordable)

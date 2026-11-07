@@ -365,6 +365,12 @@ commit 番号・アーカイブと保持・復元手順・有効化境界・性�
     （`lib.rs` の `cfg_attr(test, allow(...))`）、`crates/engine/tests/`・`benches/`・`examples/` の
     外部クレート側は破壊・検査用に各ファイル冒頭で許す。製品コードへは漏れない（`--all-targets` の
     lint は `cfg(test)` でない lib ビルドも検査する）。
+  - CI での強制: `rust-ci` が呼ぶ外部 workflow（Fandhe-AI/actions の `rust-base-ci.yml`）は
+    `cargo clippy --workspace --all-targets --all-features -- -D warnings` を実行する（`make lint` と
+    同じ）。wire-server のクレートでも `clippy.toml` は警告なしで通ることを確認した。
+  - `ReadSource` の書き込み Tx 実装の戻り値は、変更系を公開しない読み取り専用の newtype
+    （`WriteTxnReadTable`。`ReadableTable`・`ReadableTableMetadata` のみ。`Deref` なし）にした。
+    具体型で `ReadSource::open_table` を呼んでも、捕捉を経ない書き込みへ到達できない。
   - 層 2: `CaptureSession::prepare` が、表集合の差から導く作成・削除に加えて次を検査し、矛盾は
     `CommitFootprintUnrecordable` で commit 前に拒否する。(1) 基底に在って最終に無い表に
     `Dropped`／`Renamed` のイベントが無い、(2) 世代が変化した論理表（`changed_table_generations_in_
@@ -374,6 +380,9 @@ commit 番号・アーカイブと保持・復元手順・有効化境界・性�
     全行は走査しない。対応が未定義の論理表（行ストアを持たない種類）は(3)を省く。
   - 層 2 は補助的な早期検出で、完全性は層 1 と層 3（#3069 のオラクル）が負う。(3) は行数が同じ
     更新（同数の入れ替え）を検出できない。
+  - 層 2 の有効時のコストは、世代が変わった表の数 N と全表数 T に対し、世代カウンタ表の走査
+    O(T)・表集合の取得 O(T)・変わった表ごとの行数の読み取り O(N) の和（`list_tables` は表集合の
+    取得に一本化済み）。
   - 検証（一時的な試験用改変。コミットしない）: 単体テストの素の redb 直呼びをすべてラッパへ置換し、
     永続 `Storage` の open で変更ログの有効化を強制して engine の lib テスト（約 6,600 件）を走らせた。
     失敗は「無効時の表の有無・commit 回数・カタログのバイト列」を比べる 15 件（有効化そのものが
@@ -381,6 +390,12 @@ commit 番号・アーカイブと保持・復元手順・有効化境界・性�
     素の redb で書く状態）では、同じ強制で行ストアの書き込みが層 2 に拒否される失敗が 58 件出た。
 - 申し送り（Issue 起票はしていない。要否は人の判断）: #2166 の分割（ラッパ移行の規模）、
   #2149 への commit 番号系列の要件、#2446 との timeline の整合
+- #3069 への申し送り（計測）: 表が数千ある DB で、層 2 の有効時のコスト（世代カウンタ表の走査と
+  表集合の取得）を実測する
+- #3069 への申し送り（網羅）: 強制有効化で `tests/` 側の結合テスト（一時表、マテリアライズドビューの
+  再計算、索引の再構築、savepoint の復元）も流し、捕捉漏れと層 2 の誤拒否がないか確かめる
+- #3069 への申し送り（基準側）: `benches/ingest_profile_bench.rs` の素の redb の呼び出しが、計測の
+  基準側に限られるかを確認する
 - #3069 の範囲: 層 3 のオラクル試験（全面。ラッパ経由の捕捉の完全性。単体テストの専用ヘルパーのうち
   素の redb で書くもの〔`#[cfg(test)]` の `insert_row_into_table` 系〕は変更ログ有効時に層 2 で拒否
   されるため、オラクルの対象にするなら先にラッパへ移す）。変更ログを有効にした DB をフラグなしで再起動したときの検出（無効のまま書くと LSN の

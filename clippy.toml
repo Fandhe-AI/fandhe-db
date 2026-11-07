@@ -1,7 +1,9 @@
 # 変更ログ（増分バックアップ・PITR。RECOVER-14 ポインタ。設計は docs/design/change-log-pitr.md の D1 の層 1）の
 # 計装漏れを機械的に防ぐ。書き込み側の表操作は、書いたキーと表のライフサイクルを capture frame へ
 # 積むラッパ（crates/engine/src/storage/change_log.rs の CaptureWriteTxn）を必ず経由する。
-# CI の `cargo clippy --workspace --all-targets --all-features -- -D warnings` が直呼びを落とす。
+# CI の `rust-ci` が呼ぶ外部 workflow（Fandhe-AI/actions の `rust-base-ci.yml`）は
+# `cargo clippy --workspace --all-targets --all-features -- -D warnings`（`make lint` と同じ）を
+# 実行するため、直呼びは CI で落ちる。
 #
 # 許可する箇所（`#[allow(clippy::disallowed_methods)]`）は次の最小限に限る:
 # - crates/engine/src/storage/change_log.rs（ラッパ本体と、記録範囲の例外である本体表・メタ表）
