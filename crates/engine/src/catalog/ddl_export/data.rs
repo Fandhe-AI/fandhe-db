@@ -177,7 +177,11 @@ fn value_text<E>(v: &Value) -> Result<Option<String>, SchemaDdlError<E>> {
         }
         Value::Int8Vec(xs) => bracket_list(xs.iter(), |x| x.to_string()),
         Value::SparseVec(sv) => sv.format_text(),
-        Value::Array(a) => a.to_pg_text(),
+        // `to_pg_text` は描画失敗（寸法と要素数の食い違い）を空文字列へ丸めるため使わない。
+        // 壊れた配列を黙って空配列として書き出さず、破損として全体を失敗させる。
+        Value::Array(a) => a.to_pg_text_bounded(usize::MAX).ok_or_else(|| {
+            SchemaDdlError::Catalog(CatalogError::CorruptSchema("row is unreadable".into()))
+        })?,
         Value::Bytes(b) => crate::bytea::format_hex_text(b),
         Value::Numeric(d) => d.to_string(),
         Value::Uuid(u) => u.to_string(),
