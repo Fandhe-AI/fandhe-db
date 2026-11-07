@@ -56,7 +56,10 @@
 //!   の責務）
 //! - [`change_log_opt`]: `--change-log` 値なしスイッチの受理判定と起動時の固定文言（Issue #3067・
 //!   #3069・RECOVER-14 ポインタ。指定すると engine の変更ログを有効にし、有効にした DB をフラグなしで
-//!   起動すると拒否する）
+//!   起動すると拒否する）と、アーカイブ・保持のフラグ（`--change-log-archive-dir` ほか。Issue #2167）・
+//!   `change-log-verify` サブコマンドの引数解釈
+//! - [`change_log_archive`]: 変更ログのアーカイブ常駐スレッド（Issue #2167。周期的に engine の
+//!   `archive_change_log` を呼ぶ）
 //! - [`english_stemmer_opt`]: `--english-stemmer` の受理／拒否判定（Issue #2129・#3050・
 //!   SEARCH-16 ポインタ。engine の `english-stemmer` feature 無効のビルドは常に起動エラー）
 //! - [`text_analysis_opt`]: `--stopwords-file`／`--synonyms-file` の上限付き読み込みと検証
@@ -143,6 +146,7 @@ pub mod backup_opt;
 pub mod backup_socket;
 pub(crate) mod binary_param;
 pub mod bind_guard;
+pub mod change_log_archive;
 pub mod change_log_opt;
 pub mod connection_limits_opt;
 pub(crate) mod copy;

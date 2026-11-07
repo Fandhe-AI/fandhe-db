@@ -116,7 +116,7 @@ pub fn parse(args: &[String]) -> Result<BackupArgs, String> {
 
 /// `--db` の検証。`Storage::open` は存在しないパスに空の DB を作るため、既存の通常ファイルに限る
 /// （typo で空 DB が生成され「成功」するのを防ぐ）。
-fn validate_db(raw: &str) -> Result<PathBuf, String> {
+pub fn validate_db(raw: &str) -> Result<PathBuf, String> {
     if raw.is_empty() {
         return Err("--db must not be empty".into());
     }
