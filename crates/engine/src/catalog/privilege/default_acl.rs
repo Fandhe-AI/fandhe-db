@@ -21,6 +21,7 @@
 //! 余りは固定文言の `CorruptSchema`。エラーに blob の断片・tenant_id を含めない。件数上限・組み合わせ上限は
 //! 検証してから確保・書き込みする。
 
+use crate::storage::change_log::CaptureWriteTxn as _;
 use redb::{ReadableTable, TableDefinition};
 
 use crate::storage::read_source::ReadSource;
@@ -269,7 +270,7 @@ fn replace_entries_in_txn(
     entries: &[DefaultEntry],
 ) -> Result<()> {
     let old = load_entries(write_txn, tenant, role_id, schema_id, kind)?;
-    let mut table = write_txn.open_table(DEFAULT_ACL_TABLE)?;
+    let mut table = write_txn.open_table_logged(DEFAULT_ACL_TABLE)?;
     for e in &old {
         table.remove((tenant, role_id, schema_id, kind.tag(), e.grantee_id))?;
     }
@@ -296,7 +297,7 @@ fn set_init_marker_in_txn(
             Err(e) => return Err(e.into()),
         }
     }
-    let mut table = write_txn.open_table(DEFAULT_ACL_INIT_TABLE)?;
+    let mut table = write_txn.open_table_logged(DEFAULT_ACL_INIT_TABLE)?;
     if present {
         table.insert(
             (tenant, role_id, 0u64, KIND_FUNCTION),
@@ -701,7 +702,7 @@ pub(crate) fn remove_schema_default_acl_in_txn(
     if doomed.is_empty() {
         return Ok(());
     }
-    let mut table = write_txn.open_table(DEFAULT_ACL_TABLE)?;
+    let mut table = write_txn.open_table_logged(DEFAULT_ACL_TABLE)?;
     for (role, tag, grantee) in doomed {
         table.remove((tenant, role, schema_id, tag, grantee))?;
     }

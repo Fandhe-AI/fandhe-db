@@ -96,6 +96,7 @@ use crate::catalog::{
     CatalogError, ColumnType, ForeignKeyDef, ForeignKeyMatch, ReferentialAction, TableSchema,
 };
 use crate::row_codec::ScalarRef;
+use crate::storage::change_log::{CaptureWriteTxn as _, CapturingTable};
 use crate::storage::rowid::{row_key, split_row_key, RowId};
 use crate::tenant::TenantWriteError;
 use redb::ReadableTable;
@@ -837,7 +838,7 @@ fn enforce_row_policies_in_txn(
     };
     let row_table_name = crate::catalog::user_rows_table_name(table_name);
     let row_table = write_txn
-        .open_table(crate::catalog::user_rows_table_def(&row_table_name))
+        .open_table_logged(crate::catalog::user_rows_table_def(&row_table_name))
         .map_err(crate::catalog::map_row_table_error)?;
     let mut embedding: Vec<f32> = Vec::new();
     for &id in written_ids {
@@ -890,7 +891,7 @@ fn enforce_view_check_option_in_txn(
     };
     let row_table_name = crate::catalog::user_rows_table_name(table_name);
     let row_table = write_txn
-        .open_table(crate::catalog::user_rows_table_def(&row_table_name))
+        .open_table_logged(crate::catalog::user_rows_table_def(&row_table_name))
         .map_err(crate::catalog::map_row_table_error)?;
     let mut embedding: Vec<f32> = Vec::new();
     for &id in written_ids {
@@ -933,7 +934,7 @@ fn enforce_check_constraints_in_txn(
     };
     let row_table_name = crate::catalog::user_rows_table_name(table_name);
     let row_table = write_txn
-        .open_table(crate::catalog::user_rows_table_def(&row_table_name))
+        .open_table_logged(crate::catalog::user_rows_table_def(&row_table_name))
         .map_err(crate::catalog::map_row_table_error)?;
     let mut embedding: Vec<f32> = Vec::new();
     for &id in written_ids {
@@ -978,7 +979,7 @@ fn enforce_index_expressions_in_txn(
     };
     let row_table_name = crate::catalog::user_rows_table_name(table_name);
     let row_table = write_txn
-        .open_table(crate::catalog::user_rows_table_def(&row_table_name))
+        .open_table_logged(crate::catalog::user_rows_table_def(&row_table_name))
         .map_err(crate::catalog::map_row_table_error)?;
     let mut embedding: Vec<f32> = Vec::new();
     for &id in written_ids {
@@ -1024,7 +1025,7 @@ fn enforce_partial_indexes_in_txn(
     };
     let row_table_name = crate::catalog::user_rows_table_name(table_name);
     let row_table = write_txn
-        .open_table(crate::catalog::user_rows_table_def(&row_table_name))
+        .open_table_logged(crate::catalog::user_rows_table_def(&row_table_name))
         .map_err(crate::catalog::map_row_table_error)?;
     let mut embedding: Vec<f32> = Vec::new();
     for &id in written_ids {
@@ -1158,11 +1159,11 @@ pub(crate) fn enforce_unique_keys_with_decls(
 
     let row_table_name = crate::catalog::user_rows_table_name(table_name);
     let row_table = write_txn
-        .open_table(crate::catalog::user_rows_table_def(&row_table_name))
+        .open_table_logged(crate::catalog::user_rows_table_def(&row_table_name))
         .map_err(crate::catalog::map_row_table_error)?;
     let index_table_name = crate::catalog::user_uniq_table_name(table_name);
     let mut index_table = write_txn
-        .open_table(crate::catalog::user_uniq_table_def(&index_table_name))
+        .open_table_logged(crate::catalog::user_uniq_table_def(&index_table_name))
         .map_err(|e| TenantWriteError::Catalog(CatalogError::from(e)))?;
 
     let written_id_set: HashSet<RowId> = written_ids.iter().copied().collect();
@@ -1519,7 +1520,7 @@ where
 }
 
 /// 永続一意索引テーブル（`user_uniq/{table}`）の可変ハンドル型。
-type UniqIndexTable<'txn> = redb::Table<'txn, (&'static str, &'static [u8]), &'static [u8]>;
+type UniqIndexTable<'txn> = CapturingTable<'txn, (&'static str, &'static [u8]), &'static [u8]>;
 
 /// 対象省略の `ON CONFLICT DO NOTHING`（SQL-49、Issue #1736）の衝突判定器。
 ///
@@ -1567,7 +1568,7 @@ impl<'txn> AnyUniqueProbe<'txn> {
         } else {
             let index_table_name = crate::catalog::user_uniq_table_name(table_name);
             let mut index_table = write_txn
-                .open_table(crate::catalog::user_uniq_table_def(&index_table_name))
+                .open_table_logged(crate::catalog::user_uniq_table_def(&index_table_name))
                 .map_err(|e| TenantWriteError::Catalog(CatalogError::from(e)))?;
             unique_index::ensure_tenant_index(
                 row_table,
@@ -2840,20 +2841,21 @@ fn verify_required_parent_keys(
     match required {
         RequiredParentKeys::Ids(ids) => {
             let row_table_name = crate::catalog::user_rows_table_name(parent_table);
-            let row_table =
-                match write_txn.open_table(crate::catalog::user_rows_table_def(&row_table_name)) {
-                    Ok(t) => t,
-                    // 参照先へまだ 1 行も挿入されていない（行ストア未作成）。必要な
-                    // 値の組が 1 つ以上あるため違反。
-                    Err(redb::TableError::TableDoesNotExist(_)) => {
-                        return Err(TenantWriteError::ForeignKeyViolation)
-                    }
-                    Err(e) => {
-                        return Err(TenantWriteError::from(crate::catalog::map_row_table_error(
-                            e,
-                        )))
-                    }
-                };
+            let row_table = match write_txn
+                .open_table_logged(crate::catalog::user_rows_table_def(&row_table_name))
+            {
+                Ok(t) => t,
+                // 参照先へまだ 1 行も挿入されていない（行ストア未作成）。必要な
+                // 値の組が 1 つ以上あるため違反。
+                Err(redb::TableError::TableDoesNotExist(_)) => {
+                    return Err(TenantWriteError::ForeignKeyViolation)
+                }
+                Err(e) => {
+                    return Err(TenantWriteError::from(crate::catalog::map_row_table_error(
+                        e,
+                    )))
+                }
+            };
             for id in ids {
                 if row_table
                     .get(parent_row_key_by_id_value(parent_schema, tenant_id, id)?)
@@ -2923,18 +2925,18 @@ fn verify_required_parent_keys_by_scan(
     mut pending: BTreeSet<Vec<u8>>,
 ) -> Result<(), TenantWriteError> {
     let row_table_name = crate::catalog::user_rows_table_name(parent_table);
-    let row_table = match write_txn.open_table(crate::catalog::user_rows_table_def(&row_table_name))
-    {
-        Ok(t) => t,
-        Err(redb::TableError::TableDoesNotExist(_)) => {
-            return Err(TenantWriteError::ForeignKeyViolation)
-        }
-        Err(e) => {
-            return Err(TenantWriteError::from(crate::catalog::map_row_table_error(
-                e,
-            )))
-        }
-    };
+    let row_table =
+        match write_txn.open_table_logged(crate::catalog::user_rows_table_def(&row_table_name)) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => {
+                return Err(TenantWriteError::ForeignKeyViolation)
+            }
+            Err(e) => {
+                return Err(TenantWriteError::from(crate::catalog::map_row_table_error(
+                    e,
+                )))
+            }
+        };
     let mut indices = Vec::with_capacity(parent_columns.len());
     let mut mask = vec![false; parent_schema.columns.len()];
     for name in parent_columns {
@@ -3032,7 +3034,7 @@ fn enforce_foreign_keys_in_txn(
     {
         let row_table_name = crate::catalog::user_rows_table_name(table_name);
         let row_table = write_txn
-            .open_table(crate::catalog::user_rows_table_def(&row_table_name))
+            .open_table_logged(crate::catalog::user_rows_table_def(&row_table_name))
             .map_err(crate::catalog::map_row_table_error)?;
         let written: BTreeSet<RowId> = written_ids.iter().copied().collect();
         for id in written {
@@ -3261,16 +3263,16 @@ fn scan_child_fk_rows_for_keys(
         indices.push(idx);
     }
     let row_table_name = crate::catalog::user_rows_table_name(&child_schema.name);
-    let row_table = match write_txn.open_table(crate::catalog::user_rows_table_def(&row_table_name))
-    {
-        Ok(t) => t,
-        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(out),
-        Err(e) => {
-            return Err(TenantWriteError::from(crate::catalog::map_row_table_error(
-                e,
-            )))
-        }
-    };
+    let row_table =
+        match write_txn.open_table_logged(crate::catalog::user_rows_table_def(&row_table_name)) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(out),
+            Err(e) => {
+                return Err(TenantWriteError::from(crate::catalog::map_row_table_error(
+                    e,
+                )))
+            }
+        };
     let mut matched: u32 = 0;
     let range_start = std::ops::Bound::Included(row_key(tenant_id, RowId::from_index_raw(0)));
     let range_end = std::ops::Bound::Included(row_key(tenant_id, RowId::from_index_raw(u64::MAX)));
@@ -3329,16 +3331,16 @@ fn snapshot_child_rows_before_pass2(
 ) -> Result<HashMap<RowId, Vec<crate::row_codec::Value>>, TenantWriteError> {
     let mut out = HashMap::new();
     let row_table_name = crate::catalog::user_rows_table_name(&child_schema.name);
-    let row_table = match write_txn.open_table(crate::catalog::user_rows_table_def(&row_table_name))
-    {
-        Ok(t) => t,
-        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(out),
-        Err(e) => {
-            return Err(TenantWriteError::from(crate::catalog::map_row_table_error(
-                e,
-            )))
-        }
-    };
+    let row_table =
+        match write_txn.open_table_logged(crate::catalog::user_rows_table_def(&row_table_name)) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(out),
+            Err(e) => {
+                return Err(TenantWriteError::from(crate::catalog::map_row_table_error(
+                    e,
+                )))
+            }
+        };
     for id in ids {
         let Some(guard) = row_table
             .get(row_key(tenant_id, id))
@@ -3437,17 +3439,18 @@ fn enforce_referencing_rows_by_scan_for_fk(
     let mut required = RequiredParentKeys::new(fk);
     {
         let row_table_name = crate::catalog::user_rows_table_name(&child_schema.name);
-        let row_table =
-            match write_txn.open_table(crate::catalog::user_rows_table_def(&row_table_name)) {
-                Ok(t) => t,
-                // 参照元へまだ 1 行も挿入されていない（行ストア未作成）。
-                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
-                Err(e) => {
-                    return Err(TenantWriteError::from(crate::catalog::map_row_table_error(
-                        e,
-                    )))
-                }
-            };
+        let row_table = match write_txn
+            .open_table_logged(crate::catalog::user_rows_table_def(&row_table_name))
+        {
+            Ok(t) => t,
+            // 参照元へまだ 1 行も挿入されていない（行ストア未作成）。
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
+            Err(e) => {
+                return Err(TenantWriteError::from(crate::catalog::map_row_table_error(
+                    e,
+                )))
+            }
+        };
         let range_start = std::ops::Bound::Included((tenant_id, 0u64));
         let range_end = std::ops::Bound::Included((tenant_id, u64::MAX));
         for entry in row_table
@@ -3504,17 +3507,18 @@ pub(crate) fn verify_new_foreign_key_all_tenants_in_txn(
     let mut tenants: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     {
         let row_table_name = crate::catalog::user_rows_table_name(&child_schema.name);
-        let row_table =
-            match write_txn.open_table(crate::catalog::user_rows_table_def(&row_table_name)) {
-                Ok(t) => t,
-                // 参照元へまだ 1 行も挿入されていない（行ストア未作成）。
-                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
-                Err(e) => {
-                    return Err(TenantWriteError::from(crate::catalog::map_row_table_error(
-                        e,
-                    )))
-                }
-            };
+        let row_table = match write_txn
+            .open_table_logged(crate::catalog::user_rows_table_def(&row_table_name))
+        {
+            Ok(t) => t,
+            // 参照元へまだ 1 行も挿入されていない（行ストア未作成）。
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
+            Err(e) => {
+                return Err(TenantWriteError::from(crate::catalog::map_row_table_error(
+                    e,
+                )))
+            }
+        };
         for entry in row_table.iter().map_err(CatalogError::from)? {
             let (k, _v) = entry.map_err(CatalogError::from)?;
             let (tenant, _id) = k.value();
@@ -4570,7 +4574,7 @@ fn resolve_parent_by_id_value(
 ) -> Result<bool, TenantWriteError> {
     let key = parent_row_key_by_id_value(parent_schema, tenant_id, id_value)?;
     let row_table_name = crate::catalog::user_rows_table_name(parent_table);
-    match write_txn.open_table(crate::catalog::user_rows_table_def(&row_table_name)) {
+    match write_txn.open_table_logged(crate::catalog::user_rows_table_def(&row_table_name)) {
         Ok(t) => Ok(t.get(key).map_err(CatalogError::from)?.is_some()),
         Err(redb::TableError::TableDoesNotExist(_)) => Ok(false),
         Err(e) => Err(TenantWriteError::from(crate::catalog::map_row_table_error(
@@ -4595,16 +4599,16 @@ fn scan_parent_key_bytes(
 ) -> Result<HashSet<Vec<u8>>, TenantWriteError> {
     let mut out: HashSet<Vec<u8>> = HashSet::new();
     let row_table_name = crate::catalog::user_rows_table_name(parent_table);
-    let row_table = match write_txn.open_table(crate::catalog::user_rows_table_def(&row_table_name))
-    {
-        Ok(t) => t,
-        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(out),
-        Err(e) => {
-            return Err(TenantWriteError::from(crate::catalog::map_row_table_error(
-                e,
-            )))
-        }
-    };
+    let row_table =
+        match write_txn.open_table_logged(crate::catalog::user_rows_table_def(&row_table_name)) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(out),
+            Err(e) => {
+                return Err(TenantWriteError::from(crate::catalog::map_row_table_error(
+                    e,
+                )))
+            }
+        };
     let mut indices = Vec::with_capacity(fk.parent_columns().len());
     let mut mask = vec![false; parent_schema.columns.len()];
     for name in fk.parent_columns() {
@@ -4652,16 +4656,16 @@ fn read_parent_row_values(
     id: RowId,
 ) -> Result<Option<Vec<crate::row_codec::Value>>, TenantWriteError> {
     let row_table_name = crate::catalog::user_rows_table_name(parent_table);
-    let row_table = match write_txn.open_table(crate::catalog::user_rows_table_def(&row_table_name))
-    {
-        Ok(t) => t,
-        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
-        Err(e) => {
-            return Err(TenantWriteError::from(crate::catalog::map_row_table_error(
-                e,
-            )))
-        }
-    };
+    let row_table =
+        match write_txn.open_table_logged(crate::catalog::user_rows_table_def(&row_table_name)) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => {
+                return Err(TenantWriteError::from(crate::catalog::map_row_table_error(
+                    e,
+                )))
+            }
+        };
     let Some(guard) = row_table
         .get(row_key(tenant_id, id))
         .map_err(CatalogError::from)?
@@ -4746,7 +4750,7 @@ fn apply_referential_action(
         let mut pre_images = UpdatedKeyPreImages::new();
         {
             let mut row_table = write_txn
-                .open_table(crate::catalog::user_rows_table_def(&row_table_name))
+                .open_table_logged(crate::catalog::user_rows_table_def(&row_table_name))
                 .map_err(crate::catalog::map_row_table_error)?;
             for (id, _) in affected {
                 let key = row_key(tenant_id, *id);
@@ -4827,7 +4831,7 @@ fn apply_referential_action(
     {
         let row_table_name = crate::catalog::user_rows_table_name(&child_schema.name);
         let mut row_table = write_txn
-            .open_table(crate::catalog::user_rows_table_def(&row_table_name))
+            .open_table_logged(crate::catalog::user_rows_table_def(&row_table_name))
             .map_err(crate::catalog::map_row_table_error)?;
         for (id, new_key_values) in affected {
             let key = row_key(tenant_id, *id);

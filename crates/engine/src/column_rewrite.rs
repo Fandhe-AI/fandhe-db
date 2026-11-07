@@ -24,6 +24,7 @@
 //!   `CatalogError::CorruptSchema`（`XX000`）の固定文言へ丸め、tenant・id・値を
 //!   エラーへ含めない。呼び出し元は commit せず txn を破棄するため痕跡は残らない
 
+use crate::storage::change_log::CaptureWriteTxn as _;
 use std::ops::Bound;
 
 use redb::ReadableTable;
@@ -151,7 +152,7 @@ pub(crate) fn rewrite_rows_with_conversion_in_txn(
     conv: &BoundAlterConversion,
 ) -> Result<ConversionOutcome, CatalogError> {
     let row_table_name = user_rows_table_name(table_name);
-    let mut row_table = match write_txn.open_table(user_rows_table_def(&row_table_name)) {
+    let mut row_table = match write_txn.open_table_logged(user_rows_table_def(&row_table_name)) {
         Ok(t) => t,
         // 行ストア未作成（既存行 0 件）。
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(ConversionOutcome::Done),
@@ -252,7 +253,7 @@ fn scan_rows_in_txn(
     mode: Mode,
 ) -> Result<RewriteOutcome, CatalogError> {
     let row_table_name = user_rows_table_name(table_name);
-    let mut row_table = match write_txn.open_table(user_rows_table_def(&row_table_name)) {
+    let mut row_table = match write_txn.open_table_logged(user_rows_table_def(&row_table_name)) {
         Ok(t) => t,
         // 行ストア未作成（既存行 0 件）。
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(RewriteOutcome::Done),

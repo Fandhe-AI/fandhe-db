@@ -25,6 +25,7 @@
 //! `CorruptSchema` とし、検証子・tenant_id・blob の断片をエラーに含めない。一覧・有無の判定でも破損した行を
 //! 読み飛ばさず全体を `Err` にする（破損を「空」と取り違えて許可側へ倒さない）。
 
+use crate::storage::change_log::CaptureWriteTxn as _;
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 
 use crate::storage::read_source::ReadSource;
@@ -602,7 +603,7 @@ pub(crate) fn resolve_tenant_role_in_txn<R: ReadSource>(
 
 /// 内部 ID を 1 つ払い出す（1 始まり・`checked_add`・再利用しない）。
 fn allocate_role_id_in_txn(write_txn: &redb::WriteTransaction) -> Result<u64> {
-    let mut counter = write_txn.open_table(ROLE_ID_COUNTER_TABLE)?;
+    let mut counter = write_txn.open_table_logged(ROLE_ID_COUNTER_TABLE)?;
     let stored = counter.get(ROLE_ID_COUNTER_KEY)?.map(|v| v.value());
     let current = match stored {
         Some(v) => {
@@ -611,7 +612,7 @@ fn allocate_role_id_in_txn(write_txn: &redb::WriteTransaction) -> Result<u64> {
             if v == 0 {
                 return Err(corrupt());
             }
-            let roles = write_txn.open_table(ROLES_TABLE)?;
+            let roles = write_txn.open_table_logged(ROLES_TABLE)?;
             for entry in roles.iter()? {
                 let (k, val) = entry?;
                 let (_, name) = k.value();
@@ -626,7 +627,7 @@ fn allocate_role_id_in_txn(write_txn: &redb::WriteTransaction) -> Result<u64> {
             // カウンタ欠損は「未使用カタログ（全テナントでロール行 0 件）」のときだけ 1 から始める。
             // 既存ロールがあるのに欠損していれば ID 重複（ACL・メンバーシップの別名ロール化）を
             // 招くため fail-closed で拒否する（設計 D1「ID は再利用しない」）。
-            let roles = write_txn.open_table(ROLES_TABLE)?;
+            let roles = write_txn.open_table_logged(ROLES_TABLE)?;
             if roles.iter()?.next().is_some() {
                 return Err(corrupt());
             }
@@ -674,7 +675,7 @@ fn create_role_limited(
     let mut stored = def.clone();
     stored.id = allocate_role_id_in_txn(write_txn)?;
     let blob = encode_role_def(&stored)?;
-    let mut table = write_txn.open_table(ROLES_TABLE)?;
+    let mut table = write_txn.open_table_logged(ROLES_TABLE)?;
     table.insert((tenant, stored.name.as_str()), blob.as_slice())?;
     Ok(stored.id)
 }
@@ -707,7 +708,7 @@ pub(crate) fn remove_role_in_txn(
         return Ok(false);
     }
     {
-        let mut table = write_txn.open_table(ROLES_TABLE)?;
+        let mut table = write_txn.open_table_logged(ROLES_TABLE)?;
         table.remove((tenant, name))?;
     }
     // 対応表の登録も同じ txn で解除する（削除後の認証は不在と同じ経路になる。Issue #2233・J3）。
@@ -758,7 +759,7 @@ pub(crate) fn remove_memberships_of_role_in_txn(
     if doomed.is_empty() && orphaned.is_empty() {
         return Ok(0);
     }
-    let mut table = write_txn.open_table(ROLE_MEMBERSHIPS_TABLE)?;
+    let mut table = write_txn.open_table_logged(ROLE_MEMBERSHIPS_TABLE)?;
     for (member, granted) in &doomed {
         table.remove((tenant, *member, *granted))?;
     }
@@ -846,7 +847,7 @@ pub(crate) fn put_membership_in_txn(
             ROLE_LIMIT_MESSAGE.to_string(),
         ));
     }
-    let mut table = write_txn.open_table(ROLE_MEMBERSHIPS_TABLE)?;
+    let mut table = write_txn.open_table_logged(ROLE_MEMBERSHIPS_TABLE)?;
     table.insert(
         (tenant, member_id, granted_role_id),
         encode_membership(opts).as_slice(),
@@ -866,7 +867,7 @@ pub(crate) fn remove_membership_in_txn(
     if get_membership(write_txn, tenant, member_id, granted_role_id)?.is_none() {
         return Ok(false);
     }
-    let mut table = write_txn.open_table(ROLE_MEMBERSHIPS_TABLE)?;
+    let mut table = write_txn.open_table_logged(ROLE_MEMBERSHIPS_TABLE)?;
     table.remove((tenant, member_id, granted_role_id))?;
     Ok(true)
 }
@@ -977,7 +978,7 @@ pub(crate) fn alter_role_in_txn(
     next.id = current.id;
     next.name = current.name;
     let blob = encode_role_def(&next)?;
-    let mut table = write_txn.open_table(ROLES_TABLE)?;
+    let mut table = write_txn.open_table_logged(ROLES_TABLE)?;
     table.insert((tenant, name), blob.as_slice())?;
     Ok(())
 }
@@ -1013,7 +1014,7 @@ pub(crate) fn rename_role_in_txn(
     renamed.name = new_name.to_string();
     let blob = encode_role_def(&renamed)?;
     {
-        let mut table = write_txn.open_table(ROLES_TABLE)?;
+        let mut table = write_txn.open_table_logged(ROLES_TABLE)?;
         table.remove((tenant, old_name))?;
         table.insert((tenant, new_name), blob.as_slice())?;
     }
@@ -1117,7 +1118,7 @@ pub(crate) fn register_login_in_txn(
     if exists {
         return Err(invalid(LOGIN_ALREADY_EXISTS_MESSAGE));
     }
-    let mut table = write_txn.open_table(ROLE_LOGIN_NAMES_TABLE)?;
+    let mut table = write_txn.open_table_logged(ROLE_LOGIN_NAMES_TABLE)?;
     table.insert(identifier, blob.as_slice())?;
     Ok(())
 }
@@ -1136,7 +1137,7 @@ pub(crate) fn remove_login_in_txn(
     if !exists {
         return Ok(false);
     }
-    let mut table = write_txn.open_table(ROLE_LOGIN_NAMES_TABLE)?;
+    let mut table = write_txn.open_table_logged(ROLE_LOGIN_NAMES_TABLE)?;
     table.remove(identifier)?;
     Ok(true)
 }

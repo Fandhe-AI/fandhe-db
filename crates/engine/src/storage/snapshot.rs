@@ -24,6 +24,7 @@
 //! - 未知の型の表・multimap 表があれば中止する（黙って欠落させない）
 //! - エラーの `Display` は固定の英語文言で、パス・表名・行の値を含めない
 
+use crate::storage::change_log::CaptureWriteTxn as _;
 use std::fmt;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -113,7 +114,7 @@ pub(super) fn copy_table<K: Key + 'static, V: Value + 'static>(
     };
     // 空の表も再現するため、行が無くても出力側に表を作る。
     let mut dt = dst
-        .open_table(def)
+        .open_table_logged(def)
         .map_err(|_| SnapshotExportError::Backend)?;
     let iter = st.iter().map_err(|_| SnapshotExportError::Backend)?;
     for r in iter {

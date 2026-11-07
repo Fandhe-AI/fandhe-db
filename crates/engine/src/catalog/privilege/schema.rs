@@ -9,6 +9,7 @@
 //! テナント境界（P0）: 走査は `(tenant_id, kind, id)` の範囲だけで、他テナントの行は構造上引けない。
 //! 破損行は読み飛ばさず `Err`（fail-closed）。
 
+use crate::storage::change_log::CaptureWriteTxn as _;
 use redb::ReadableTable;
 
 use crate::storage::read_source::ReadSource;
@@ -74,7 +75,7 @@ pub(crate) fn remove_schema_acl_in_txn(
     if doomed.is_empty() {
         return Ok(());
     }
-    let mut table = write_txn.open_table(ACL_TABLE)?;
+    let mut table = write_txn.open_table_logged(ACL_TABLE)?;
     for (grantee, grantor) in doomed {
         table.remove((tenant, KIND_SCHEMA, key.as_str(), "", grantee, grantor))?;
     }

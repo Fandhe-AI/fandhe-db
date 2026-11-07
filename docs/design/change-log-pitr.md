@@ -119,7 +119,8 @@ commit 番号・アーカイブと保持・復元手順・有効化境界・性�
 - 計装漏れへの fail-closed 3 層:
   1. 構造: キーを積むのは writer 側の表ハンドルのラッパ（例: `CapturingTable`）に一本化する。
      redb の `open_table`・`delete_table`・`rename_table`・`open_multimap_table` の直呼びを
-     禁止する仕組み（clippy `disallowed-methods` か型）は #2166 で選ぶ。`retain`／
+     禁止する仕組み（clippy `disallowed-methods` か型）は #2166 で選ぶ（**#3068 で clippy
+     `disallowed-methods` を採用**。`clippy.toml`、実装メモは 7 節）。`retain`／
      `extract_if`／`drain` 系は削除したキーを積む実装に限る
   2. 本番の検査: `changed_table_generations_in_write_txn` で変更が確定した表に frame の
      エントリが無ければ commit 前に拒否する（`commit_log` と同じ契約）。ただし次の 2 点を
@@ -347,10 +348,42 @@ commit 番号・アーカイブと保持・復元手順・有効化境界・性�
 
 ## 7. 対象外・未決事項
 
-- コード変更・依存追加はしない。実測値は書かない
+- コード変更・依存追加はしない。実測値は書かない（本 ADR 作成時点。後続の実装メモは次項）
+- **#3068 の実装メモ（書き込み点の移行。D1 の層 1・層 2）**:
+  - 層 1: リポジトリ直下の `clippy.toml` で `redb::WriteTransaction` の `open_table`・`delete_table`・
+    `rename_table`・`open_multimap_table`（と multimap の delete／rename）を `disallowed-methods` に
+    指定した。型で縛る案は、読み取り側の `ReadSource` 境界・数百の関数シグネチャ・外部クレートの
+    結合テストへ波及するため採らない。書き込み点は `storage::change_log::CaptureWriteTxn` の
+    `open_table_logged`・`delete_table_logged`・`rename_table_logged`（`CapturingTable::open`・
+    `delete_table`・`rename_table` への委譲）へ移した。`CapturingTable` は `ReadableTable` も実装し、
+    読み取り境界（`&impl ReadableTable`）へ渡せる。変更系は `insert`・`remove`・`pop_first`・
+    `pop_last`・`retain`・`retain_in`・`insert_reserve` で、`extract_if`・`entry`・カーソルは engine に
+    利用がないため提供しない（必要になれば削除・更新したキーを積む実装を足してから使う）。
+    素の open を許す箇所は `change_log.rs`（捕捉つきハンドルの本体・イベントを積んだ後の委譲先・
+    記録範囲の例外である本体表とメタ表）と `storage::read_source`（読み取り専用の境界でだけ
+    露出するハンドル）に限る。単体テスト（`#[cfg(test)]`）は素の redb を直接開くことを許し
+    （`lib.rs` の `cfg_attr(test, allow(...))`）、`crates/engine/tests/`・`benches/`・`examples/` の
+    外部クレート側は破壊・検査用に各ファイル冒頭で許す。製品コードへは漏れない（`--all-targets` の
+    lint は `cfg(test)` でない lib ビルドも検査する）。
+  - 層 2: `CaptureSession::prepare` が、表集合の差から導く作成・削除に加えて次を検査し、矛盾は
+    `CommitFootprintUnrecordable` で commit 前に拒否する。(1) 基底に在って最終に無い表に
+    `Dropped`／`Renamed` のイベントが無い、(2) 世代が変化した論理表（`changed_table_generations_in_
+    write_txn`）の世代カウンタ表のキーが積まれていない、(3) 世代が変化した論理表の行ストア
+    （論理→物理の対応関数 `physical_row_store`）の行数の増減が積まれたキー数を超える。表の作成
+    （`Created`）は #3067 と同じく表集合の差から導き、イベントは積まない。行数は O(1) の読み取りで、
+    全行は走査しない。対応が未定義の論理表（行ストアを持たない種類）は(3)を省く。
+  - 層 2 は補助的な早期検出で、完全性は層 1 と層 3（#3069 のオラクル）が負う。(3) は行数が同じ
+    更新（同数の入れ替え）を検出できない。
+  - 検証（一時的な試験用改変。コミットしない）: 単体テストの素の redb 直呼びをすべてラッパへ置換し、
+    永続 `Storage` の open で変更ログの有効化を強制して engine の lib テスト（約 6,600 件）を走らせた。
+    失敗は「無効時の表の有無・commit 回数・カタログのバイト列」を比べる 15 件（有効化そのものが
+    差になる）だけで、層 2 の誤拒否と捕捉漏れは出なかった。置換前（`#[cfg(test)]` の専用ヘルパーが
+    素の redb で書く状態）では、同じ強制で行ストアの書き込みが層 2 に拒否される失敗が 58 件出た。
 - 申し送り（Issue 起票はしていない。要否は人の判断）: #2166 の分割（ラッパ移行の規模）、
   #2149 への commit 番号系列の要件、#2446 との timeline の整合
-- #3069 の範囲: 変更ログを有効にした DB をフラグなしで再起動したときの検出（無効のまま書くと LSN の
+- #3069 の範囲: 層 3 のオラクル試験（全面。ラッパ経由の捕捉の完全性。単体テストの専用ヘルパーのうち
+  素の redb で書くもの〔`#[cfg(test)]` の `insert_row_into_table` 系〕は変更ログ有効時に層 2 で拒否
+  されるため、オラクルの対象にするなら先にラッパへ移す）。変更ログを有効にした DB をフラグなしで再起動したときの検出（無効のまま書くと LSN の
   欠落になる）。また、エラーを `CommitFootprintUnrecordable` から分離するかの判断と、frame の上限値
   （キー数・バイト数・ペイロード）の見直し
 - 未決: 移行 commit の扱いの詳細、保守 commit の削除件数上限の既定値と呼び出し契機、CLI フラグ名の最終形（#2166／#2167）

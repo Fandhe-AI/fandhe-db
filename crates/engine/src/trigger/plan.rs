@@ -21,6 +21,7 @@ use crate::catalog::trigger::{
 };
 use crate::catalog::{CatalogError, ReferentialAction, TableSchema};
 use crate::sql::allowlist::SqlSurfaceError;
+use crate::storage::change_log::CaptureWriteTxn as _;
 use crate::tenant::TenantWriteError;
 
 /// 発火対象のトリガ（4 群とも名前のバイト順）と、それを呼ぶ通過証。INSERT・UPDATE・DELETE で共通
@@ -262,7 +263,7 @@ pub(crate) fn guard_unwired_dml(
 /// トリガ表に 1 件でも定義があるか（全テナント。有無の判定だけで中身は読まない）。
 fn any_triggers_exist(write_txn: &redb::WriteTransaction) -> Result<bool, TenantWriteError> {
     use redb::ReadableTableMetadata;
-    let table = match write_txn.open_table(crate::catalog::trigger::TRIGGERS_TABLE) {
+    let table = match write_txn.open_table_logged(crate::catalog::trigger::TRIGGERS_TABLE) {
         Ok(t) => t,
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
         Err(e) => return Err(TenantWriteError::from(CatalogError::from(e))),

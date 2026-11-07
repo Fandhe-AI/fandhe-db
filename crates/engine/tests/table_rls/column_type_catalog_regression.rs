@@ -13,6 +13,11 @@
 //! - `Storage` 経由の typed 行往復（`tenant::insert_typed_row` →
 //!   `get_row_from_table` → `row_codec::decode_scalar_columns`）
 
+// 許可（clippy::disallowed_methods）: 本ファイルは engine の公開 API の外から redb を直接開き、
+// 永続内容の検査・破壊・裏口の対照を行う。変更ログの捕捉（`storage::change_log`）を通す
+// 対象は engine 製品コードの書き込み点で、外部クレートとしての直接操作は対象外。
+#![allow(clippy::disallowed_methods)]
+
 use engine::catalog::{ArrayElemType, ArrayType, CatalogError, ColumnDef, ColumnType};
 use engine::numeric::Decimal;
 use engine::policy::PolicyContext;

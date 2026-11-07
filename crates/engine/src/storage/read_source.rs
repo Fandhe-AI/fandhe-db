@@ -105,7 +105,13 @@ impl ReadSource for redb::WriteTransaction {
         if !exists {
             return Err(TableError::TableDoesNotExist(def.name().to_string()));
         }
-        redb::WriteTransaction::open_table(self, def)
+        // 許可（clippy::disallowed_methods）: `ReadSource::Table` は読み取り専用の境界
+        // （`ReadableTable`）でしか露出せず、書き込みの入口が無い。しかも上で存在確認済みなので
+        // 表の作成も起きない。変更ログの捕捉対象は書き込みハンドル経由の変更だけで、
+        // 読み取りのためのこの open は対象外（RECOVER-14 の層 1 は書き込み点のみ）。
+        #[allow(clippy::disallowed_methods)]
+        let table = redb::WriteTransaction::open_table(self, def);
+        table
     }
 
     fn snapshot(&self) -> Option<&redb::ReadTransaction> {

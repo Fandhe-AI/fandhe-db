@@ -18,6 +18,7 @@
 //! 見る。応答に出す名前は削除対象自身の名前だけで、依存元の関数名・scope・件数は含めない。関数への
 //! 依存は同じ scope の中だけで解決する。decode の不整合は固定文言の `CorruptSchema`。
 
+use crate::storage::change_log::CaptureWriteTxn as _;
 use redb::{ReadableTable, TableDefinition};
 
 use crate::storage::read_source::ReadSource;
@@ -132,8 +133,8 @@ pub(crate) fn remove_for_function_in_txn(
     if edges.is_empty() {
         return Ok(());
     }
-    let mut by_function = write_txn.open_table(DEPS_BY_FUNCTION)?;
-    let mut by_dependee = write_txn.open_table(DEPS_BY_DEPENDEE)?;
+    let mut by_function = write_txn.open_table_logged(DEPS_BY_FUNCTION)?;
+    let mut by_dependee = write_txn.open_table_logged(DEPS_BY_DEPENDEE)?;
     for e in &edges {
         by_function.remove((scope, function_key, signature, e.kind.tag(), e.key.as_str()))?;
         by_dependee.remove((e.kind.tag(), e.key.as_str(), scope, function_key, signature))?;
@@ -166,8 +167,8 @@ pub(crate) fn replace_edges_in_txn(
     if unique.is_empty() {
         return Ok(());
     }
-    let mut by_function = write_txn.open_table(DEPS_BY_FUNCTION)?;
-    let mut by_dependee = write_txn.open_table(DEPS_BY_DEPENDEE)?;
+    let mut by_function = write_txn.open_table_logged(DEPS_BY_FUNCTION)?;
+    let mut by_dependee = write_txn.open_table_logged(DEPS_BY_DEPENDEE)?;
     for d in unique {
         by_function.insert(
             (scope, function_key, signature, d.kind.tag(), d.key.as_str()),

@@ -9,6 +9,7 @@
 //! ハンドルの取得に使われる想定であり、本モジュールはポリシー評価（RLS 事前フィルタ等）を
 //! 行わない（`storage.rs` と同方針）。
 
+use crate::storage::change_log::CaptureWriteTxn as _;
 use redb::{ReadableDatabase, ReadableTable};
 
 use crate::recovery::commit_boundary::commit_write_txn_guarded;
@@ -189,7 +190,7 @@ impl WriteTxn {
         self.has_writes = true;
         let mut table = self
             .txn
-            .open_table(ROWS_TABLE)
+            .open_table_logged(ROWS_TABLE)
             .map_err(map_rows_table_error)?;
         table.insert(
             crate::storage::rowid::row_key(
@@ -297,7 +298,7 @@ impl BatchWriteTxn {
         self.has_writes = true;
         let mut table = self
             .txn
-            .open_table(ROWS_TABLE)
+            .open_table_logged(ROWS_TABLE)
             .map_err(map_rows_table_error)?;
         let previous = table.insert(
             crate::storage::rowid::row_key(
@@ -355,7 +356,7 @@ impl BatchWriteTxn {
         // ここから先は redb の `BATCH_LOG_TABLE` に触れる（Issue #175）。
         // 上の `EmptyBatch` 早期 return は redb に一切触れないため対象外。
         self.has_writes = true;
-        let mut table = self.txn.open_table(BATCH_LOG_TABLE)?;
+        let mut table = self.txn.open_table_logged(BATCH_LOG_TABLE)?;
         if table.get(batch_seq)?.is_some() {
             return Err(StorageError::DuplicateBatchSeq(batch_seq));
         }

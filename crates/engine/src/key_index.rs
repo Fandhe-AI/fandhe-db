@@ -75,6 +75,7 @@ use crate::catalog::{CatalogError, TableSchema};
 use crate::constraint::{
     decode_key_columns, key_bytes, push_canonical_component, KeySpec, NullPolicy,
 };
+use crate::storage::change_log::{CaptureWriteTxn as _, CapturingTable};
 use crate::storage::rowid::{row_key, split_row_key, RowId};
 use crate::tenant::TenantWriteError;
 use redb::{ReadableTable, TableDefinition};
@@ -92,7 +93,7 @@ const REGISTRY_TABLE: TableDefinition<(&str, &str, &str), ()> =
 type FwdTableDef<'a> = TableDefinition<'a, (&'static str, &'static [u8], u64), ()>;
 type RevTableDef<'a> = TableDefinition<'a, (&'static str, u64), &'static [u8]>;
 /// 順引き索引の読み書きハンドル（clippy::type_complexity 対応の唯一の別名）。
-type FwdTable<'a> = redb::Table<'a, (&'static str, &'static [u8], u64), ()>;
+type FwdTable<'a> = CapturingTable<'a, (&'static str, &'static [u8], u64), ()>;
 
 fn fwd_table_def(name: &str) -> FwdTableDef<'_> {
     TableDefinition::new(name)
@@ -118,13 +119,13 @@ fn rev_table_name(table: &str, name: &str) -> String {
 fn open_kv_table<'a, 'n, K, V>(
     write_txn: &'a redb::WriteTransaction,
     def: TableDefinition<'n, K, V>,
-) -> Result<redb::Table<'a, K, V>, TenantWriteError>
+) -> Result<CapturingTable<'a, K, V>, TenantWriteError>
 where
     K: redb::Key + 'static,
     V: redb::Value + 'static,
 {
     write_txn
-        .open_table(def)
+        .open_table_logged(def)
         .map_err(|e| TenantWriteError::from(CatalogError::from(e)))
 }
 
@@ -262,7 +263,7 @@ fn registry_entries_for_table(
     write_txn: &redb::WriteTransaction,
     table: &str,
 ) -> Result<Vec<(String, String)>, CatalogError> {
-    let reg = match write_txn.open_table(REGISTRY_TABLE) {
+    let reg = match write_txn.open_table_logged(REGISTRY_TABLE) {
         Ok(t) => t,
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
         Err(e) => return Err(e.into()),
@@ -305,7 +306,7 @@ fn table_registry_len_at_least(
     table: &str,
     threshold: usize,
 ) -> Result<bool, CatalogError> {
-    let reg = match write_txn.open_table(REGISTRY_TABLE) {
+    let reg = match write_txn.open_table_logged(REGISTRY_TABLE) {
         Ok(t) => t,
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
         Err(e) => return Err(e.into()),
@@ -349,7 +350,7 @@ fn is_registered(
     name: &str,
     tenant: &str,
 ) -> Result<bool, CatalogError> {
-    match write_txn.open_table(REGISTRY_TABLE) {
+    match write_txn.open_table_logged(REGISTRY_TABLE) {
         Ok(t) => Ok(t.get((table, name, tenant))?.is_some()),
         Err(redb::TableError::TableDoesNotExist(_)) => Ok(false),
         Err(e) => Err(e.into()),
@@ -387,16 +388,16 @@ pub(crate) fn sync_rows_in_txn(
         return Ok(delta);
     }
     let row_table_name = crate::catalog::user_rows_table_name(table);
-    let row_table = match write_txn.open_table(crate::catalog::user_rows_table_def(&row_table_name))
-    {
-        Ok(t) => Some(t),
-        Err(redb::TableError::TableDoesNotExist(_)) => None,
-        Err(e) => {
-            return Err(TenantWriteError::from(crate::catalog::map_row_table_error(
-                e,
-            )))
-        }
-    };
+    let row_table =
+        match write_txn.open_table_logged(crate::catalog::user_rows_table_def(&row_table_name)) {
+            Ok(t) => Some(t),
+            Err(redb::TableError::TableDoesNotExist(_)) => None,
+            Err(e) => {
+                return Err(TenantWriteError::from(crate::catalog::map_row_table_error(
+                    e,
+                )))
+            }
+        };
     for name in &names {
         delta.registered.insert(name.clone());
         let Some(columns) = columns_from_index_name(name) else {
@@ -561,16 +562,16 @@ pub(crate) fn drop_indexes_for_table_in_txn(
     for name in &unique_names {
         let fwd_name = fwd_table_name(table, name);
         let rev_name = rev_table_name(table, name);
-        match write_txn.delete_table(fwd_table_def(&fwd_name)) {
+        match write_txn.delete_table_logged(fwd_table_def(&fwd_name)) {
             Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
             Err(e) => return Err(e.into()),
         }
-        match write_txn.delete_table(rev_table_def(&rev_name)) {
+        match write_txn.delete_table_logged(rev_table_def(&rev_name)) {
             Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
             Err(e) => return Err(e.into()),
         }
     }
-    let mut reg = write_txn.open_table(REGISTRY_TABLE)?;
+    let mut reg = write_txn.open_table_logged(REGISTRY_TABLE)?;
     for (name, tenant) in &entries {
         reg.remove((table, name.as_str(), tenant.as_str()))?;
     }
@@ -618,16 +619,16 @@ pub(crate) fn prune_unneeded_indexes_in_txn(
     for name in &stale_names {
         let fwd_name = fwd_table_name(table, name);
         let rev_name = rev_table_name(table, name);
-        match write_txn.delete_table(fwd_table_def(&fwd_name)) {
+        match write_txn.delete_table_logged(fwd_table_def(&fwd_name)) {
             Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
             Err(e) => return Err(e.into()),
         }
-        match write_txn.delete_table(rev_table_def(&rev_name)) {
+        match write_txn.delete_table_logged(rev_table_def(&rev_name)) {
             Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
             Err(e) => return Err(e.into()),
         }
     }
-    let mut reg = write_txn.open_table(REGISTRY_TABLE)?;
+    let mut reg = write_txn.open_table_logged(REGISTRY_TABLE)?;
     for (name, tenant) in &entries {
         if stale_names.contains(name.as_str()) {
             reg.remove((table, name.as_str(), tenant.as_str()))?;
@@ -664,16 +665,16 @@ pub(crate) fn drop_indexes_containing_column_in_txn(
     for name in &stale {
         let fwd_name = fwd_table_name(table, name);
         let rev_name = rev_table_name(table, name);
-        match write_txn.delete_table(fwd_table_def(&fwd_name)) {
+        match write_txn.delete_table_logged(fwd_table_def(&fwd_name)) {
             Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
             Err(e) => return Err(e.into()),
         }
-        match write_txn.delete_table(rev_table_def(&rev_name)) {
+        match write_txn.delete_table_logged(rev_table_def(&rev_name)) {
             Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
             Err(e) => return Err(e.into()),
         }
     }
-    let mut reg = write_txn.open_table(REGISTRY_TABLE)?;
+    let mut reg = write_txn.open_table_logged(REGISTRY_TABLE)?;
     for (name, tenant) in &entries {
         if stale.contains(name.as_str()) {
             reg.remove((table, name.as_str(), tenant.as_str()))?;
@@ -731,7 +732,7 @@ pub(crate) fn ensure_index_in_txn(
     let fwd_name = fwd_table_name(table, &name);
     let rev_name = rev_table_name(table, &name);
     let row_table_name = crate::catalog::user_rows_table_name(table);
-    match write_txn.open_table(crate::catalog::user_rows_table_def(&row_table_name)) {
+    match write_txn.open_table_logged(crate::catalog::user_rows_table_def(&row_table_name)) {
         Ok(row_table) => {
             let mut fwd = open_kv_table(write_txn, fwd_table_def(&fwd_name))?;
             let mut rev = open_kv_table(write_txn, rev_table_def(&rev_name))?;
@@ -857,7 +858,7 @@ fn open_fwd_readable<'a>(
         )));
     }
     write_txn
-        .open_table(fwd_table_def(fwd_name))
+        .open_table_logged(fwd_table_def(fwd_name))
         .map_err(|e| TenantWriteError::from(CatalogError::from(e)))
 }
 
@@ -868,14 +869,14 @@ fn open_fwd_readable<'a>(
 fn open_rev_writable<'a>(
     write_txn: &'a redb::WriteTransaction,
     rev_name: &str,
-) -> Result<redb::Table<'a, (&'static str, u64), &'static [u8]>, TenantWriteError> {
+) -> Result<CapturingTable<'a, (&'static str, u64), &'static [u8]>, TenantWriteError> {
     if !named_table_exists(write_txn, rev_name).map_err(TenantWriteError::from)? {
         return Err(TenantWriteError::from(CatalogError::CorruptSchema(
             format!("registered key index is missing its reverse table {rev_name:?}"),
         )));
     }
     write_txn
-        .open_table(rev_table_def(rev_name))
+        .open_table_logged(rev_table_def(rev_name))
         .map_err(|e| TenantWriteError::from(CatalogError::from(e)))
 }
 
