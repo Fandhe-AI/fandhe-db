@@ -61,8 +61,12 @@ cat <<'EOF'
       既定ビルド（fault-injection・wasm-udf・cross-encoder 無効）専用の回帰テスト
       $ scripts/test_default_build.sh
   crash-test
-      クラッシュ耐性回帰テスト（PERSIST-1）
+      クラッシュ耐性回帰テスト（PERSIST-1。バックアップ復元の段を含む）
+      $ scripts/crash_test_backup_restore.sh
       $ scripts/crash_test.sh
+  crash-test-backup-restore
+      バックアップ取得・復元中の強制終了と復元後検査の回帰テスト
+      $ scripts/crash_test_backup_restore.sh
   crash-test-interrupt
       crash_test.sh の中断パス（SIGTERM・プロセスグループ）のセルフテスト
       $ scripts/crash_test_interrupt.sh
@@ -145,6 +149,7 @@ cat <<'EOF'
       $ cargo clippy --workspace --all-targets --all-features -- -D warnings
       $ cargo test --workspace --all-features
       $ scripts/test_default_build.sh
+      $ scripts/crash_test_backup_restore.sh
       $ scripts/crash_test.sh
       $ scripts/crash_test_interrupt.sh
       $ scripts/crash_test_cross_table.sh
