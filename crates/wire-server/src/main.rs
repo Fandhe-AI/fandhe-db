@@ -495,6 +495,15 @@
 //! 終了コード: 0=成功、1=実行時の失敗、2=引数／出力先パスの拒否、3=出力は公開済みだが後始末を
 //! 確かめられなかった（バックアップは存在する。検証してから使う）。`--users` ファイルは対象外。
 //!
+//! `wire-server verify --db <path> [--memory-budget-bytes <n>]` サブコマンドは、**停止中**の DB を
+//! 開いて整合検査（行・索引は読み取りだけ。open 自体がヘッダを書き換えうる。読み取り専用の open は #3074）を実行し、結果を `key=value` 行で標準出力へ出す（Issue #2156・
+//! RECOVER-13 (6) ポインタ）。終了コード: 0=整合（Warning のみを含む）、1=実行時の失敗（稼働中の
+//! サーバーが使用中を含む）、2=引数／パスの拒否、4=矛盾あり、5=検査できなかった項目のみ
+//! （3=検査は完了したが一時コピーを消せなかった。失敗時は本来のコード）。詳細は `wire_server::verify_opt`。
+//! `wire-server restore --from <backup> --db <new path>` サブコマンドは、バックアップを一時名へ
+//! コピーして検査し、通った場合だけ新規パスへ公開する（既存の出力先は上書きしない。通らなければ
+//! 何も公開せず 4 または 5 で終了。詳細は `wire_server::restore_opt`）。
+//!
 //! `wire-server hash-password` サブコマンドはユーザーストア（`username:tenant_id:phc`）
 //! に登録する 1 行を生成する補助コマンド（stdin からパスワードを読み、平文を
 //! ログ・引数に残さない）。
@@ -555,6 +564,12 @@ fn main() -> ExitCode {
     }
     if args.get(1).map(String::as_str) == Some("change-log-verify") {
         return run_change_log_verify(&args[2..]);
+    }
+    if args.get(1).map(String::as_str) == Some("verify") {
+        return run_verify(&args[2..]);
+    }
+    if args.get(1).map(String::as_str) == Some("restore") {
+        return run_restore(&args[2..]);
     }
 
     run_server(&args)
@@ -4067,7 +4082,7 @@ fn run_backup(args: &[String]) -> ExitCode {
     let storage = match Storage::open(db) {
         Ok(s) => s,
         Err(e) => {
-            if database_in_use(&e) {
+            if backup_opt::is_already_open(&e) {
                 engine::log_stderr!(
                     "wire-server: backup: database is in use by another process \
                      (stop the server first)"
@@ -4092,11 +4107,121 @@ fn run_backup(args: &[String]) -> ExitCode {
     }
 }
 
-/// `Storage::open` の失敗が「別プロセスが DB を開いている」ことによるか。engine は専用の列挙子を
-/// 持たず redb の文言（`already open`）に依存するため、文言が変わると運用者向けの案内が出なくなるだけで
-/// 失敗の扱いは変わらない（呼び出し側はどちらでも非 0 終了）。
-fn database_in_use(e: &engine::storage::StorageError) -> bool {
-    e.to_string().contains("already open")
+/// 消せなかった一時コピーの場所を標準エラーへ固定の英語文で通知する（全テナントのデータを
+/// 含むため手動で消す必要がある）。
+fn report_leftover(sub: &str, path: &std::path::Path) {
+    engine::log_stderr!(
+        "wire-server: {sub}: WARNING: a temporary copy of the database could not be removed \
+         and remains at {}; delete it manually (it contains data of all tenants)",
+        path.display()
+    );
+}
+
+/// 標準出力へ書いて flush する。失敗（EPIPE 等）は呼び出し側が終了コード 1 にする
+/// （`print!` は失敗で panic し 101 で終わるため使わない）。
+fn write_stdout(text: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut out = std::io::stdout().lock();
+    out.write_all(text.as_bytes())?;
+    out.flush()
+}
+
+/// `verify --db <path>` サブコマンド（Issue #2156・RECOVER-13 (6) ポインタ）。引数を検証してから
+/// `--db` を開き、`Storage::verify_integrity` の報告を標準出力へ出す。稼働中のサーバーが DB を
+/// 開いている場合は排他ロックが取れず終了コード 1（fail-closed。`backup` と同じ）。元ファイルへは
+/// 書き込まない（コピーを検査する。コピーを省く読み取り専用の open は #3074）。エラー文に
+/// 行の値・パスの内容・表名は含めない。
+fn run_verify(args: &[String]) -> ExitCode {
+    use wire_server::{backup_opt, verify_opt};
+
+    let parsed = match verify_opt::parse(args) {
+        Ok(p) => p,
+        Err(msg) => {
+            engine::log_stderr!("wire-server: verify: {msg}");
+            return ExitCode::from(backup_opt::EXIT_USAGE);
+        }
+    };
+    // 元ファイルは開かない（`Storage::open` は旧形式の移行などで書き込むため）。排他ロックを
+    // 保持したまま一時コピーを検査する（`restore_opt::verify_via_copy`）。
+    let mut leftover = None;
+    let result =
+        wire_server::restore_opt::verify_via_copy(&parsed.db, &parsed.options, &mut leftover);
+    // 終了コードは restore と同じ規則: 検査が完了した（Ok）うえで消せなかった場合だけ 3、
+    // 失敗（Err）は本来の失敗の文言と終了コードを保ち、残置は併せて通知する。
+    let code = wire_server::restore_opt::verify_exit_code(&result, leftover.is_some());
+    match &result {
+        Ok(report) => {
+            // 出力先の閉鎖（EPIPE 等）で panic させない。書けなければ実行時の失敗（1）。
+            if write_stdout(&verify_opt::render(report)).is_err() {
+                if let Some(p) = &leftover {
+                    report_leftover("verify", p);
+                }
+                return ExitCode::from(backup_opt::EXIT_FAILURE);
+            }
+        }
+        Err(e) => {
+            engine::log_stderr!(
+                "wire-server: verify: {}",
+                wire_server::restore_opt::verify_failure_message(e)
+            );
+        }
+    }
+    if let Some(p) = &leftover {
+        report_leftover("verify", p);
+    }
+    ExitCode::from(code)
+}
+
+/// `restore --from <backup> --db <path>` サブコマンド（Issue #2156・RECOVER-13 (3)(7) ポインタ）。
+/// 公開手順と終了コードは `wire_server::restore_opt`。検査に通らなかったときの報告は標準エラーへ出す
+/// （標準出力は成功時の要約だけ）。
+fn run_restore(args: &[String]) -> ExitCode {
+    use wire_server::{backup_opt, restore_opt};
+
+    let parsed = match restore_opt::parse(args) {
+        Ok(p) => p,
+        Err(msg) => {
+            engine::log_stderr!("wire-server: restore: {msg}");
+            return ExitCode::from(backup_opt::EXIT_USAGE);
+        }
+    };
+    let mut leftover = None;
+    let result = restore_opt::restore(&parsed.from, &parsed.db, &mut leftover);
+    if matches!(
+        &result,
+        Err(restore_opt::RestoreError::UncheckedContentPublished)
+    ) {
+        // 検査していない内容が公開先に残っている（取り消しの削除に失敗）。終了コードは 1。
+        engine::log_stderr!(
+            "wire-server: restore: WARNING: {} holds content that was not checked; \
+             delete it manually",
+            parsed.db.display()
+        );
+    }
+    if let Some(p) = &leftover {
+        // 公開しなかった経路で一時コピーを消せなかった。終了コードは失敗の種別のまま通知する。
+        report_leftover("restore", p);
+    }
+    let (code, msg) = restore_opt::classify(&result);
+    match (&result, code) {
+        (Ok(_), 0) => {
+            if write_stdout(&format!("restore written: {msg}\n")).is_err() {
+                return ExitCode::from(backup_opt::EXIT_FAILURE);
+            }
+            ExitCode::SUCCESS
+        }
+        (Err(restore_opt::RestoreError::NotConsistent(report)), _) => {
+            engine::log_stderr!("wire-server: restore: {msg}");
+            for line in wire_server::verify_opt::render(report).lines() {
+                engine::log_stderr!("{line}");
+            }
+            ExitCode::from(code)
+        }
+        _ => {
+            engine::log_stderr!("wire-server: restore: {msg}");
+            ExitCode::from(code)
+        }
+    }
 }
 
 /// `change-log-verify --archive-dir <dir> [--db <path>]` サブコマンド（Issue #2167・RECOVER-14 ポインタ）。
@@ -4107,7 +4232,7 @@ fn database_in_use(e: &engine::storage::StorageError) -> bool {
 /// open は #3074）。運用上は停止中の DB かそのコピーに対して実行する。結果は運用者向けの標準出力
 /// （パス・テナント情報を含まない）。
 fn run_change_log_verify(args: &[String]) -> ExitCode {
-    use wire_server::change_log_opt;
+    use wire_server::{backup_opt, change_log_opt};
 
     let parsed = match change_log_opt::parse_verify(args) {
         Ok(p) => p,
@@ -4120,7 +4245,7 @@ fn run_change_log_verify(args: &[String]) -> ExitCode {
         Some(db) => match engine::storage::Storage::open(db) {
             Ok(storage) => storage.verify_change_log_archive(&parsed.dir),
             Err(e) => {
-                if database_in_use(&e) {
+                if backup_opt::is_already_open(&e) {
                     engine::log_stderr!(
                         "wire-server: change-log-verify: database is in use by another process \
                          (stop the server first)"
