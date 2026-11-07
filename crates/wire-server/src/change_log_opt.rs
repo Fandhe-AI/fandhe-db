@@ -60,18 +60,19 @@ pub const ARCHIVE_NEEDS_CHANGE_LOG_MESSAGE: &str =
 pub const NEEDS_ARCHIVE_DIR_MESSAGE: &str =
     "--change-log-retain-records and --change-log-archive-interval-secs require --change-log-archive-dir";
 
-/// アーカイブ先が他者に書き込める（グループ・その他が書き込めてスティッキーでない）ときの固定文言。
+/// アーカイブ先が他者に書き込める（グループ・その他が書き込める。スティッキービットの有無に依らない）ときの固定文言。
 pub const INSECURE_DIR_MESSAGE: &str =
-    "--change-log-archive-dir must not be writable by other users (group/other write without the sticky bit)";
+    "--change-log-archive-dir must not be writable by group or other users";
 
-/// 書き込み用のアーカイブ先として安全か（unix のみ。他者が一時名・セグメントを差し替えうるものを拒否）。
+/// 書き込み用のアーカイブ先として安全か（unix のみ。グループ・その他が書き込めるものは、一時名・セグメントの
+/// 差し替えや同名ファイルの先置きができるため常に拒否する）。
 #[cfg(unix)]
 fn dir_is_private_enough(dir: &std::path::Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     // 存在しない・読めないパスはここでは判定しない（`accept_archive_dir` が拒否済み）。
     std::fs::metadata(dir).map_or(true, |m| {
         let mode = m.permissions().mode();
-        mode & 0o022 == 0 || mode & 0o1000 != 0
+        mode & 0o022 == 0
     })
 }
 
@@ -380,9 +381,12 @@ mod tests {
             resolve(true, Some(dir.clone()), None, None),
             Err(INSECURE_DIR_MESSAGE)
         );
-        // スティッキー付き、または他者が書けないものは受理する。
+        // スティッキービットが付いていても拒否する。他者が書けないものは受理する。
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o1777)).expect("chmod");
-        assert!(resolve(true, Some(dir.clone()), None, None).is_ok());
+        assert_eq!(
+            resolve(true, Some(dir.clone()), None, None),
+            Err(INSECURE_DIR_MESSAGE)
+        );
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         assert!(resolve(true, Some(dir.clone()), None, None).is_ok());
         std::fs::remove_dir(&dir).expect("rmdir");

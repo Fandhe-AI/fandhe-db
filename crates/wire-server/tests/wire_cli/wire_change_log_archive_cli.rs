@@ -353,7 +353,7 @@ fn recover14_archive_dir_writable_by_others_is_refused() {
     ]);
     assert_ne!(out.status.code(), Some(0));
     assert!(
-        stderr(&out).contains("writable by other users"),
+        stderr(&out).contains("writable by group or other users"),
         "{}",
         stderr(&out)
     );

@@ -1098,10 +1098,16 @@ fn a_group_writable_archive_dir_is_refused_for_writing() {
         Err(ArchiveError::InsecureDirectory)
     ));
     assert!(f.segment_files().is_empty());
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o1775)).expect("chmod");
+    // スティッキービットが付いていても拒否する（他者が同名のファイルを先置きして止められる）。
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o1777)).expect("chmod");
+    assert!(matches!(
+        f.storage().archive_change_log(&f.opts()),
+        Err(ArchiveError::InsecureDirectory)
+    ));
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).expect("chmod");
     f.storage()
         .archive_change_log(&f.opts())
-        .expect("sticky is accepted");
+        .expect("private is accepted");
     // 読み取り（検証）は権限に依らない。
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o777)).expect("chmod");
     assert!(f.storage().verify_change_log_archive(dir).is_ok());

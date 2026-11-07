@@ -686,14 +686,25 @@ fn check_dir(dir: &Path) -> Result<()> {
     }
 }
 
-/// 書き出し先が他者に書き込めないことを確認する。グループまたはその他が書き込めるディレクトリでは、
-/// 他者が一時名や公開済みのセグメントを差し替えうるため、スティッキービット（他者が自分のものでない
-/// ファイルを消せない）が付いていない限り拒否する（fail-closed。設計書 D6）。
+/// 周期内の一覧へ、公開した（または競合で採用した）セグメントを `list_segments` と同じ整列順で加える。
+fn index_insert(index: &mut Vec<(PathBuf, SegmentName)>, path: PathBuf, name: SegmentName) {
+    if index.iter().any(|(p, _)| *p == path) {
+        return;
+    }
+    index.push((path, name));
+    index.sort_by_key(|(_, n)| (n.timeline, n.first_lsn, n.last_lsn));
+}
+
+/// 書き出し先が他者に書き込めないことを確認する。グループまたはその他が書き込めるディレクトリは、
+/// スティッキービットの有無に依らず常に拒否する（fail-closed。設計書 D6）。セグメント名は DB 識別子・
+/// timeline・LSN 範囲から決まるため、書ける他者が次の範囲の名前のファイルを置く・既存のセグメントを
+/// `hard_link` するだけで、書き出しを `Conflict` で止められる（スティッキービットは削除・改名を防ぐだけで
+/// 作成は防がない）。
 #[cfg(unix)]
 fn check_dir_not_shared(dir: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let mode = std::fs::metadata(dir)?.permissions().mode();
-    if mode & 0o022 != 0 && mode & 0o1000 == 0 {
+    if mode & 0o022 != 0 {
         return Err(ArchiveError::InsecureDirectory);
     }
     Ok(())
@@ -865,6 +876,7 @@ fn plan_next(
     storage: &Storage,
     state: &ChangeLogState,
     opts: &ArchiveOptions,
+    index: &[(PathBuf, SegmentName)],
     w: u64,
 ) -> Result<Plan> {
     let first = w.checked_add(1).ok_or(ArchiveError::LogCorrupt)?;
@@ -884,9 +896,12 @@ fn plan_next(
     }
     drop(k);
 
-    let existing = list_segments(&opts.dir)?.into_iter().find(|(_, n)| {
-        n.db_id == state.db_id && n.timeline == state.timeline && n.first_lsn == first
-    });
+    let existing = index
+        .iter()
+        .find(|(_, n)| {
+            n.db_id == state.db_id && n.timeline == state.timeline && n.first_lsn == first
+        })
+        .cloned();
     if let Some((path, name)) = existing {
         let info = verify_segment_file(&path, state.limits.max_payload_bytes)
             .map_err(|_| ArchiveError::Conflict)?;
@@ -1092,6 +1107,7 @@ fn prune_cap_for(
     storage: &Storage,
     state: &ChangeLogState,
     opts: &ArchiveOptions,
+    index: &[(PathBuf, SegmentName)],
     new_w: u64,
 ) -> Result<u64> {
     let Some(retain) = opts.retain_records else {
@@ -1113,14 +1129,14 @@ fn prune_cap_for(
         return Ok(0);
     }
     let mut need = lo;
-    for (path, name) in list_segments(&opts.dir)? {
+    for (path, name) in index {
         if name.db_id != state.db_id || name.timeline != state.timeline || name.last_lsn < need {
             continue;
         }
         if name.first_lsn > need {
             break;
         }
-        let info = verify_segment_file(&path, state.limits.max_payload_bytes)?;
+        let info = verify_segment_file(path, state.limits.max_payload_bytes)?;
         let h = info.header;
         if h.db_id != name.db_id
             || h.timeline != name.timeline
@@ -1132,7 +1148,7 @@ fn prune_cap_for(
         // セグメントのレコードが、消す対象の DB のレコードと同一であること（複製から分岐した系列など、
         // 同じ DB 識別子・timeline・LSN でも内容が違うセグメントで元のログを消さない）。
         compare_with_log(
-            &path,
+            path,
             &table,
             need,
             h.last_lsn.min(hi),
@@ -1166,12 +1182,18 @@ pub(in crate::storage) fn run_cycle(
         .0
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // セグメントの一覧は周期の開始時に 1 回だけ取得して共有し、周期内で公開した分だけ反映する（ファイルを
+    // 自動では削除しないため、毎回の列挙・整列は運用開始以来の全ファイル数に比例してしまう）。周期の途中で
+    // 他者が足したファイルは一覧に載らないが安全側に倒れる: 計画は一覧に無い同名ファイルを `hard_link` の
+    // `AlreadyExists` と内容照合（`existing_equals`）で検出し、刈り込みは一覧に無い分を覆いと認めず
+    // `ArchiveIncomplete` で止める。
+    let mut index = list_segments(&opts.dir)?;
     let mut report = ArchiveReport::default();
     let mut prune_error: Option<ArchiveError> = None;
     for _ in 0..MAX_SEGMENTS_PER_CYCLE {
         let w = watermark(&storage.db.begin_read()?)?;
         report.archived_through = w;
-        let (last_lsn, adopted) = match plan_next(storage, &state, opts, w)? {
+        let (last_lsn, adopted) = match plan_next(storage, &state, opts, &index, w)? {
             Plan::Nothing => break,
             Plan::Adopt { last_lsn, path } => {
                 sync_adopted(&opts.dir, &path)?;
@@ -1184,21 +1206,29 @@ pub(in crate::storage) fn run_cycle(
                     header.first_lsn,
                     header.last_lsn,
                 );
-                let path = opts.dir.join(name);
+                let path = opts.dir.join(&name);
+                let entry = SegmentName {
+                    db_id: header.db_id,
+                    timeline: header.timeline,
+                    first_lsn: header.first_lsn,
+                    last_lsn: header.last_lsn,
+                };
                 if !publish(&opts.dir, &path, &bytes)? {
                     // 競合で同名が先に在った。中身が同一なら採用し、違えば置換せずに止める。
                     if !existing_equals(&path, &bytes)? {
                         return Err(ArchiveError::Conflict);
                     }
                     sync_adopted(&opts.dir, &path)?;
+                    index_insert(&mut index, path, entry);
                     (header.last_lsn, true)
                 } else {
+                    index_insert(&mut index, path, entry);
                     (header.last_lsn, false)
                 }
             }
         };
         // 刈り込みの覆いを確認できなければ、水位の更新だけ行って刈り込まず、周期の最後にエラーを返す。
-        let cap = match prune_cap_for(storage, &state, opts, last_lsn) {
+        let cap = match prune_cap_for(storage, &state, opts, &index, last_lsn) {
             Ok(c) => c,
             Err(e) => {
                 prune_error.get_or_insert(e);
@@ -1224,7 +1254,7 @@ pub(in crate::storage) fn run_cycle(
     if opts.retain_records.is_some() {
         for _ in 0..MAX_PRUNE_ROUNDS {
             let w = watermark(&storage.db.begin_read()?)?;
-            let cap = match prune_cap_for(storage, &state, opts, w) {
+            let cap = match prune_cap_for(storage, &state, opts, &index, w) {
                 Ok(c) => c,
                 Err(e) => {
                     prune_error.get_or_insert(e);
