@@ -473,6 +473,10 @@
 //! （`CREATE ROLE ... LOGIN PASSWORD`）で SCRAM 接続するときの user（ログイン識別子）を表示する
 //! （Issue #2233・WIRE-18。DB は開かない）。
 //!
+//! `--backup-socket <path>`（Issue #2152・opt-in。既定は作らない。unix 限定）は、稼働中のサーバーから
+//! 書き込みを止めずに書き出すための運用者専用 Unix ドメインソケットを作る（親ディレクトリが自分の
+//! 所有で 0700 相当でなければ起動拒否。ソケットは 0600。詳細は `wire_server::backup_socket`）。
+//! `wire-server backup --socket <path> --out <path>` がそこへ依頼する（`--db` と排他）。
 //! `wire-server backup --db <path> --out <path>` サブコマンドは、**停止中**の DB ファイルを開いて
 //! 一貫スナップショットを新規ファイルへ書き出す（Issue #2152・RECOVER-13 ポインタ。方式は
 //! `docs/design/backup-snapshot.md`）。稼働中のサーバーが同じ `--db` を開いている間は
@@ -575,6 +579,7 @@ fn run_server(args: &[String]) -> ExitCode {
     let mut acorn_max_visible_ratio_raw: Option<String> = None;
     let mut sparse_visited_max_raw: Option<String> = None;
     let mut durability_raw: Option<String> = None;
+    let mut backup_socket_raw: Option<String> = None;
     let mut hnsw_scope_raw: Option<String> = None;
     let mut require_operation_id = false;
     let mut require_where_for_dml = false;
@@ -803,6 +808,25 @@ fn run_server(args: &[String]) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
                 sparse_visited_max_raw = Some(v.clone());
+                i += 2;
+            }
+            // Issue #2152: 運用者専用のバックアップ用 Unix ドメインソケット（opt-in。既定は作らない）。
+            wire_server::backup_opt::SOCKET_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a socket path",
+                        wire_server::backup_opt::SOCKET_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                if backup_socket_raw.is_some() || v.is_empty() {
+                    engine::log_stderr!(
+                        "wire-server: {} must be given once with a non-empty path",
+                        wire_server::backup_opt::SOCKET_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                backup_socket_raw = Some(v.clone());
                 i += 2;
             }
             wire_server::durability_opt::FLAG => {
@@ -3404,6 +3428,38 @@ fn run_server(args: &[String]) -> ExitCode {
         }
     }
 
+    // Issue #2152: バックアップ用ソケット（opt-in）。TCP の bind 後・「listening on」の前に作り、
+    // 失敗（親ディレクトリの権限不備・既存パス等）は fail-closed で起動を拒否する。
+    // ガードはサーバー停止時にソケットを片付ける（片付けられなくても次回起動が置換する）。
+    #[cfg(unix)]
+    let _backup_socket_guard = match backup_socket_raw.as_deref() {
+        None => None,
+        Some(path) => match wire_server::backup_socket::bind(std::path::Path::new(path)) {
+            Ok((l, guard)) => {
+                if wire_server::backup_socket::spawn_server(l, Arc::clone(&core)).is_err() {
+                    engine::log_stderr!("wire-server: failed to start the backup socket thread");
+                    return ExitCode::FAILURE;
+                }
+                Some(guard)
+            }
+            Err(msg) => {
+                engine::log_stderr!(
+                    "wire-server: {}: {msg}",
+                    wire_server::backup_opt::SOCKET_FLAG
+                );
+                return ExitCode::FAILURE;
+            }
+        },
+    };
+    #[cfg(not(unix))]
+    if backup_socket_raw.is_some() {
+        engine::log_stderr!(
+            "wire-server: {} is supported only on unix platforms",
+            wire_server::backup_opt::SOCKET_FLAG
+        );
+        return ExitCode::FAILURE;
+    }
+
     // 実際に bind されたアドレスを出す（`--bind 127.0.0.1:0` の ephemeral port
     // 割り当て結果を E2E テストハーネスがこの行から取得する前提。TASK-73）。
     match listener.local_addr() {
@@ -3837,7 +3893,7 @@ fn run_login_identifier(args: &[String]) -> ExitCode {
 /// 開いている場合は open が失敗して非 0 で終わる（fail-closed）。エラー文に行の値・パスの内容・
 /// 表名は含めない。
 fn run_backup(args: &[String]) -> ExitCode {
-    use engine::storage::{SnapshotExportError, Storage};
+    use engine::storage::Storage;
     use wire_server::backup_opt;
 
     let parsed = match backup_opt::parse(args) {
@@ -3847,7 +3903,11 @@ fn run_backup(args: &[String]) -> ExitCode {
             return ExitCode::from(backup_opt::EXIT_USAGE);
         }
     };
-    let storage = match Storage::open(&parsed.db) {
+    let db = match &parsed.target {
+        backup_opt::Target::Db(db) => db,
+        backup_opt::Target::Socket(sock) => return run_backup_via_socket(sock, &parsed.out),
+    };
+    let storage = match Storage::open(db) {
         Ok(s) => s,
         Err(e) => {
             if e.to_string().contains("already open") {
@@ -3861,26 +3921,44 @@ fn run_backup(args: &[String]) -> ExitCode {
             return ExitCode::from(backup_opt::EXIT_FAILURE);
         }
     };
-    match storage.export_snapshot(&parsed.out) {
-        Ok(summary) => {
-            println!(
-                "backup written: tables={} entries={}",
-                summary.tables, summary.entries
-            );
+    let result = storage.export_snapshot(&parsed.out);
+    let (code, msg) = backup_opt::classify(&result);
+    match code {
+        0 => {
+            println!("backup written: {msg}");
             ExitCode::SUCCESS
         }
-        Err(SnapshotExportError::PublishedButNotFinalized) => {
-            engine::log_stderr!(
-                "wire-server: backup: WARNING: the snapshot file was published but its durability \
-                 could not be confirmed; verify the output file before relying on it"
-            );
-            ExitCode::from(backup_opt::EXIT_PUBLISHED_UNVERIFIED)
-        }
-        Err(e) => {
-            engine::log_stderr!("wire-server: backup: {e}");
-            ExitCode::from(backup_opt::EXIT_FAILURE)
+        _ => {
+            engine::log_stderr!("wire-server: backup: {msg}");
+            ExitCode::from(code)
         }
     }
+}
+
+/// `backup --socket` の経路 (ii): 稼働中のサーバーの運用者専用ソケットへ出力先を依頼し、
+/// 応答の結果コードをそのまま終了コードにする（Issue #2152）。
+#[cfg(unix)]
+fn run_backup_via_socket(sock: &std::path::Path, out: &std::path::Path) -> ExitCode {
+    match wire_server::backup_socket::request(sock, out) {
+        Ok((0, msg)) => {
+            println!("backup written: {msg}");
+            ExitCode::SUCCESS
+        }
+        Ok((code, msg)) => {
+            engine::log_stderr!("wire-server: backup: {msg}");
+            ExitCode::from(code)
+        }
+        Err(msg) => {
+            engine::log_stderr!("wire-server: backup: {msg}");
+            ExitCode::from(wire_server::backup_opt::EXIT_FAILURE)
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn run_backup_via_socket(_sock: &std::path::Path, _out: &std::path::Path) -> ExitCode {
+    engine::log_stderr!("wire-server: backup: --socket is supported only on unix platforms");
+    ExitCode::from(wire_server::backup_opt::EXIT_USAGE)
 }
 
 /// `hash-password` サブコマンド: stdin からパスワードを 1 行読み、新規 salt を
