@@ -447,3 +447,30 @@ fn backup_incremental_refuses_databases_without_a_change_log() {
     );
     assert!(!out.exists());
 }
+
+/// 別のプロセス（ここではテストプロセス）が書き込み用に開いている DB は、読み取り専用 open がロックで
+/// 拒否し、終了コード 1 で何も出力しない。
+#[test]
+fn backup_incremental_refuses_a_database_in_use() {
+    let c = build_chain("inc-cli-in-use");
+    let out = c.root.join("busy.seg");
+    let held = Storage::open(&c.db).expect("hold the database open");
+    let o = run(&[
+        "backup-incremental",
+        "--db",
+        s(&c.db),
+        "--base",
+        s(&c.base),
+        "--out",
+        s(&out),
+    ]);
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    assert!(
+        stderr(&o).contains("open for writing by another process"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(!out.exists());
+    drop(held);
+    assert!(leftovers(&c.root).is_empty());
+}
