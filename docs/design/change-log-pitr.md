@@ -49,6 +49,25 @@ commit 番号・アーカイブと保持・復元手順・有効化境界・性�
 
 - 書き込み時は、`GatedWriteTxn` の寿命に結び付けた capture frame（`commit_log` の frame と
   同じ置き場）へ `(redb 表名, キーのバイト列)` だけを積む。キー集合は上位集合であれば正しい
+- **prepare への受け渡しは capture session の明示渡しとする（アドレス維持は採らない）。**
+  現行の frame 登録簿は `Box<redb::WriteTransaction>` のアドレスをキーにするが、
+  `GatedWriteTxn::split_for_commit` は Box 内のトランザクションを値として取り出して移動する
+  ため、`commit_and_finish`・`bump_generation_and_commit` の prepare 段で受ける
+  `&redb::WriteTransaction` のアドレスは登録時と異なり、`note_*` の登録簿引きは常に外れる。
+  アドレスの維持は Box を commit 後まで保持する形に `redb` の `commit(self)` の所有権要件が
+  噛み合わず採らない。代わりに capture session（`CommitParts` の `session` と同じ持ち方で、
+  frame への `Arc` を直接持つもの）を prepare に渡し、prepare 内ではアドレス引きを使わず
+  session 経由でだけ積む・読む。具体的には:
+  - `prepare_generation_bump` は `GENERATION_TABLE` の `GENERATION_KEY` を直接書く。この書き込みは
+    登録簿に載らないため、capture session の prepare が、世代採番の直後に
+    `(GENERATION_TABLE, GENERATION_KEY)` を固定のエントリとして frame へ積んでから after-image を
+    読む。D3 の世代カウンタの after-image が必ず入り、次のレコードの
+    `prev == storage_generation` 検査（D7）が成立する
+  - 同様に prepare 内で追加する他の書き込み（D6 の水位・`change_log` 表）は、記録範囲の例外であるため
+    積まない。prepare 内で積む必要があるのは世代カウンタだけである
+  - `bump_generation_and_commit` も同じ構造（`split_for_commit` → `prepare_generation_bump` →
+    session の prepare → commit → session の finish）で、`g_c` を session へ渡して同じ固定エントリを
+    積む。session を持たない経路（一時表ストレージ・テスト fixture）は従来どおり何も積まない
 - `commit_and_finish` の `prepare_fn` 内で `prepare_generation_bump` の直後（point of no
   return の前）に、積んだ各キーの現在値を読む。値があれば upsert、無ければ remove として
   レコードを組み、同一 redb トランザクションで `change_log` 表へ insert する。
@@ -74,16 +93,29 @@ commit 番号・アーカイブと保持・復元手順・有効化境界・性�
     するため、rename は旧名の `dropped` と新名の `created` + 全行 `upserts` へ**分解**する
     （正規化時に新名の表を全走査して after-image を読む。コストは O(改名表のサイズ) で、
     rename は DDL で頻度が低いため許容する）。`Renamed` イベントは正規化で「新名の表が
-    基底の旧名の表と同一の物理表か」を判定する手掛かりに留め、レコードへは出さない。
-    同名への戻し（A→B→A）は基底と最終が一致し、キー差分だけになる
+    基底の旧名の表と同一の物理表か」を判定する手掛かりに留め、レコードへは出さない
+  - **rename をまたぐキーは最終名へ写像せず、全行の after-image で正規化する（採用）。**
+    frame のキーは書き込み時点の表名に属するため、A→B と rename して B の行を更新し B→A と
+    戻す場合、また新規の空表へ挿入してから rename する場合、積まれたキーは途中の名前の
+    もので最終名の更新としては取得できない。表の実体ごとにキー集合を追跡して最終名へ
+    写像する案は、`ROLLBACK TO`・DROP 後の同名再作成・物理表を持つ索引まで含めて
+    実体の同一性を追う状態が要り、追い損ねが取りこぼし（fail-open）になるため採らない。
+    代わりに、当該 commit で `Created` または `Renamed`（旧名・新名のいずれか）のイベントが
+    あった表のうち最終の表集合に在るものは、キー差分を使わず**全行の after-image**で記録する
+    （基底に同名の表が在れば `dropped` も併載し、`created` + 全行 `upserts` とする）。
+    途中の名前のキーは、最終の表集合に無ければ読む対象にせず、在っても全行読みが上位集合として
+    包含するため破棄する。したがって A→B→A も A を全行で記録する。コストは
+    O(rename または作成を経た表のサイズ) で、DDL は頻度が低いため許容する。
+    判定はイベント列と最終の表集合だけから行え、キー集合の写像に依存しない
   - rename は catalog 側で表名キーの論理メタ（`catalog`・`op_ledger`・`last_op`・
     `rowid_state` 等）の付け替えも伴うため、これらはキー集合の通常経路（旧名キーの
     remove・新名キーの upsert）で捕捉される。物理表の付け替え（`user_rows/{旧名}` →
     `user_rows/{新名}`）だけが上記の分解対象である
   - 再生器は `table_image::apply` と同じ順序（`dropped` の削除 → `created` の作成 → 各 shape
     の upsert／remove）で適用する。同一レコード内で同名表が dropped かつ created になる
-    場合（DROP 後の同名再作成）は、正規化で「基底と別実体」と判定できるよう、基底の表を
-    `dropped` に、最終の表を `created` + 全行 `upserts` として両方載せる
+    場合（DROP 後の同名再作成、および上記の rename を経た同名の表）は、正規化で「基底と別実体」と
+    判定できるよう、基底の表を `dropped` に、最終の表を `created` + 全行 `upserts` として
+    両方載せる
 - 計装漏れへの fail-closed 3 層:
   1. 構造: キーを積むのは writer 側の表ハンドルのラッパ（例: `CapturingTable`）に一本化する。
      redb の `open_table`・`delete_table`・`rename_table`・`open_multimap_table` の直呼びを
@@ -158,6 +190,17 @@ commit 番号・アーカイブと保持・復元手順・有効化境界・性�
 - セグメント: `change_log` 表のレコードを LSN の連続区間かつバイト上限で区切る（上限値は実装
   既定値であり spec 由来ではない）
 - 書き出し: 一時名へ書く → fsync → rename → ディレクトリ fsync。ファイル権限は RECOVER-13 (4) のポインタに従う
+- **再試行は収束させる（採用）。** セグメントの rename 後・redb の水位更新前にクラッシュ
+  （または水位更新の失敗）すると、再起動後の再試行ではセグメント名（DB 識別子・timeline・
+  LSN 範囲から決まる決定的な名前）が既に存在する。既存ファイルへの書き込みを拒否して失敗を
+  繰り返すと、未アーカイブ量が減らず容量上限で利用者の書き込みが止まる。そのため、書き出し前に
+  同名のセグメントが在れば内容を検証する
+  - 一致（ヘッダ・各レコードのチェックサム・`change_log` 表から再構成したバイト列との比較で
+    同一と確認できた）: 書き出しは成功扱いとし、書き込みをやり直さずに水位だけを進める
+  - 不一致・読めない・途中までしか無い: 上書きも削除もせず fail-closed で止め、エラーを記録して
+    アーカイブを進めない。決定的な名前の衝突は破損か別源の混入であり、黙って置換しない。
+    一時名の残骸（rename 前のクラッシュ）は、再試行の先頭で一時名の掃除として削除してよい
+  - 検証と水位更新は、同じセグメントに対して何度繰り返しても結果が同じ（冪等）にする
 - アーカイブ済み水位を redb へ永続化し、`change_log` 表から削除するのは水位以下だけとする
 - **削除は後続の利用者書き込みの prepare への相乗りに限る（採用）。専用トランザクションは
   設けない。** 専用トランザクションでの削除も実書き込みであるため世代を進め、D2・D3 により
