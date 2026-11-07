@@ -60,6 +60,26 @@ pub const ARCHIVE_NEEDS_CHANGE_LOG_MESSAGE: &str =
 pub const NEEDS_ARCHIVE_DIR_MESSAGE: &str =
     "--change-log-retain-records and --change-log-archive-interval-secs require --change-log-archive-dir";
 
+/// アーカイブ先が他者に書き込める（グループ・その他が書き込めてスティッキーでない）ときの固定文言。
+pub const INSECURE_DIR_MESSAGE: &str =
+    "--change-log-archive-dir must not be writable by other users (group/other write without the sticky bit)";
+
+/// 書き込み用のアーカイブ先として安全か（unix のみ。他者が一時名・セグメントを差し替えうるものを拒否）。
+#[cfg(unix)]
+fn dir_is_private_enough(dir: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    // 存在しない・読めないパスはここでは判定しない（`accept_archive_dir` が拒否済み）。
+    std::fs::metadata(dir).map_or(true, |m| {
+        let mode = m.permissions().mode();
+        mode & 0o022 == 0 || mode & 0o1000 != 0
+    })
+}
+
+#[cfg(not(unix))]
+fn dir_is_private_enough(_dir: &std::path::Path) -> bool {
+    true
+}
+
 /// 検証済みのアーカイブ設定（`main.rs` が常駐スレッドへ渡す）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArchiveSettings {
@@ -141,6 +161,9 @@ pub fn resolve(
     let any = dir.is_some() || retain_records.is_some() || interval_secs.is_some();
     if any && !change_log {
         return Err(ARCHIVE_NEEDS_CHANGE_LOG_MESSAGE);
+    }
+    if dir.as_deref().is_some_and(|d| !dir_is_private_enough(d)) {
+        return Err(INSECURE_DIR_MESSAGE);
     }
     let Some(dir) = dir else {
         return if any {
@@ -228,6 +251,7 @@ mod tests {
             ENABLED_MESSAGE,
             ARCHIVE_NEEDS_CHANGE_LOG_MESSAGE,
             NEEDS_ARCHIVE_DIR_MESSAGE,
+            INSECURE_DIR_MESSAGE,
         ] {
             assert!(!m.contains('{') && !m.contains('\n'));
         }
@@ -343,5 +367,24 @@ mod tests {
         assert!(ok.db.is_none());
         let ok = parse_verify(&v(&["--archive-dir", &dir, "--db", exe])).expect("with db");
         assert_eq!(ok.db.as_deref(), Some(std::path::Path::new(exe)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_shared_writable_archive_dir_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("fandhe-opt-shared-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).expect("chmod");
+        assert_eq!(
+            resolve(true, Some(dir.clone()), None, None),
+            Err(INSECURE_DIR_MESSAGE)
+        );
+        // スティッキー付き、または他者が書けないものは受理する。
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o1777)).expect("chmod");
+        assert!(resolve(true, Some(dir.clone()), None, None).is_ok());
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        assert!(resolve(true, Some(dir.clone()), None, None).is_ok());
+        std::fs::remove_dir(&dir).expect("rmdir");
     }
 }

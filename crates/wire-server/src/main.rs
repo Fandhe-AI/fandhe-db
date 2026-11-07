@@ -4230,12 +4230,11 @@ fn run_restore(args: &[String]) -> ExitCode {
 /// `change-log-verify --archive-dir <dir> [--db <path>]` サブコマンド（Issue #2167・RECOVER-14 ポインタ）。
 /// アーカイブ先のセグメントを検証し、欠落（LSN の飛び・先頭や末尾の紛失）・チェックサム不一致・別 DB／別
 /// timeline を非 0 終了で知らせる。`--db` を付けると停止中の DB のメタ情報（DB 識別子・timeline・有効化時の
-/// 世代・水位）と突き合わせ、付けなければディレクトリ内の整合だけを検査する。アーカイブ先のファイルは
-/// 変更しないが、`--db` を付けると `Storage::open` が DB の初期化・修復の書き込みをしうる（読み取り専用の
-/// open は #3074）。運用上は停止中の DB かそのコピーに対して実行する。結果は運用者向けの標準出力
-/// （パス・テナント情報を含まない）。
+/// 世代・水位）と突き合わせ、付けなければディレクトリ内の整合だけを検査する。アーカイブ先のファイルも
+/// DB も変更しない（`--db` は engine の読み取り専用 open〔`ReadOnlyStorage`〕で開く。書き込みを要する状態の
+/// DB は拒否し、コピーでの検査を案内する）。結果は運用者向けの標準出力（パス・テナント情報を含まない）。
 fn run_change_log_verify(args: &[String]) -> ExitCode {
-    use wire_server::{backup_opt, change_log_opt};
+    use wire_server::change_log_opt;
 
     let parsed = match change_log_opt::parse_verify(args) {
         Ok(p) => p,
@@ -4245,17 +4244,20 @@ fn run_change_log_verify(args: &[String]) -> ExitCode {
         }
     };
     let result = match &parsed.db {
-        Some(db) => match engine::storage::Storage::open(db) {
-            Ok(storage) => storage.verify_change_log_archive(&parsed.dir),
+        Some(db) => match engine::storage::ReadOnlyStorage::open(db) {
+            Ok(ro) => ro.verify_change_log_archive(&parsed.dir),
             Err(e) => {
-                if backup_opt::is_already_open(&e) {
-                    engine::log_stderr!(
-                        "wire-server: change-log-verify: database is in use by another process \
-                         (stop the server first)"
-                    );
-                } else {
-                    engine::log_stderr!("wire-server: change-log-verify: failed to open database");
-                }
+                let msg = match e {
+                    engine::storage::ReadOnlyOpenError::InUse => {
+                        "database is in use by another process (stop the server first)"
+                    }
+                    engine::storage::ReadOnlyOpenError::NeedsWrite => {
+                        "database needs repair or upgrade before it can be opened read-only \
+                         (verify a copy, or start the server once)"
+                    }
+                    _ => "failed to open database",
+                };
+                engine::log_stderr!("wire-server: change-log-verify: {msg}");
                 return ExitCode::from(change_log_opt::EXIT_VERIFY_FAILED);
             }
         },

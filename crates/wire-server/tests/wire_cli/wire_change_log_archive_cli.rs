@@ -64,6 +64,20 @@ fn stderr(o: &Output) -> String {
     String::from_utf8_lossy(&o.stderr).into_owned()
 }
 
+/// アーカイブ先を作る。他者が書けるディレクトリは起動を拒否されるため、umask に依らず 0755 にする。
+fn make_archive_dir(path: impl AsRef<Path>) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir(path.as_ref()).expect("archive dir");
+    std::fs::set_permissions(path.as_ref(), std::fs::Permissions::from_mode(0o755))
+        .expect("chmod archive dir");
+}
+
+/// SIGKILL で止めたサーバーの DB は、読み取り専用 open が書き込み（修復）を要すると拒否する。テストでは
+/// 書き込み可能に開いて閉じ、修復を済ませてから `--db` 付きの検証を呼ぶ。
+fn repair(db: &str) {
+    drop(engine::storage::Storage::open(db).expect("open to repair"));
+}
+
 fn segments(dir: &Path) -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> = std::fs::read_dir(dir)
         .expect("read archive dir")
@@ -101,7 +115,7 @@ fn recover14_archive_flags_are_validated_before_the_database_is_opened() {
     let fx = common::TempFixtureDir::new("cl-arc-flags");
     common::write_empty_user_store(&fx.users_path_str());
     let arc = fx.db_path_str() + ".arc";
-    std::fs::create_dir(&arc).expect("archive dir");
+    make_archive_dir(&arc);
     let base = |extra: &[&str]| -> Output {
         let users = fx.users_path_str();
         let db = fx.db_path_str();
@@ -207,7 +221,7 @@ fn recover14_archive_thread_writes_segments_and_verify_detects_loss_and_tamperin
     let db = fx.db_path_str();
     write_user_store_with_alice(&users);
     let arc = PathBuf::from(db.clone() + ".arc");
-    std::fs::create_dir(&arc).expect("archive dir");
+    make_archive_dir(&arc);
     let arc_s = arc.to_str().expect("utf-8").to_string();
     let flags = [
         "--change-log",
@@ -244,6 +258,7 @@ fn recover14_archive_thread_writes_segments_and_verify_detects_loss_and_tamperin
     }
 
     // 停止後に検証する（DB の水位とも突き合わせる）。
+    repair(&db);
     let verify_db = run(&["change-log-verify", "--archive-dir", &arc_s, "--db", &db]);
     assert_eq!(verify_db.status.code(), Some(0), "{}", stderr(&verify_db));
     let stdout = String::from_utf8_lossy(&verify_db.stdout).into_owned();
@@ -260,6 +275,7 @@ fn recover14_archive_thread_writes_segments_and_verify_detects_loss_and_tamperin
         );
     }
 
+    repair(&db);
     let files = segments(&arc);
     assert!(files.len() >= 2, "{files:?}");
 
@@ -311,4 +327,35 @@ fn recover14_verify_subcommand_rejects_bad_arguments() {
             "the path must not be echoed"
         );
     }
+}
+
+/// 他者が書き込めるアーカイブ先は、一時名・セグメントの差し替えを許すため起動前に拒否される。
+#[test]
+fn recover14_archive_dir_writable_by_others_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+    let fx = common::TempFixtureDir::new("cl-arc-shared");
+    common::write_empty_user_store(&fx.users_path_str());
+    let arc = fx.db_path_str() + ".arc";
+    std::fs::create_dir(&arc).expect("archive dir");
+    std::fs::set_permissions(&arc, std::fs::Permissions::from_mode(0o777)).expect("chmod");
+    let users = fx.users_path_str();
+    let db = fx.db_path_str();
+    let out = run(&[
+        "--users",
+        &users,
+        "--db",
+        &db,
+        "--bind",
+        "127.0.0.1:0",
+        "--change-log",
+        "--change-log-archive-dir",
+        &arc,
+    ]);
+    assert_ne!(out.status.code(), Some(0));
+    assert!(
+        stderr(&out).contains("writable by other users"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(!Path::new(&db).exists(), "refused before the DB is created");
 }

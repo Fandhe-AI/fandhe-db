@@ -16,6 +16,14 @@ use crate::test_util::temp_db::TempDir;
 
 const TENANT: &str = "tenant-a";
 
+/// 書き出し先に使える（他者が書けない）一時ディレクトリ。umask に依らず 0755 にする。
+fn private_dir(label: &str) -> TempDir {
+    use std::os::unix::fs::PermissionsExt;
+    let d = TempDir::new(label);
+    std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    d
+}
+
 struct Fixture {
     _db_dir: TempDir,
     archive: TempDir,
@@ -25,7 +33,7 @@ struct Fixture {
 impl Fixture {
     fn new(label: &str) -> Self {
         let db_dir = TempDir::new(label);
-        let archive = TempDir::new(&format!("{label}-arc"));
+        let archive = private_dir(&format!("{label}-arc"));
         let mut storage = Storage::open(db_dir.db_path()).expect("open");
         storage.enable_change_log().expect("enable");
         let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
@@ -192,7 +200,7 @@ fn invalid_directory_and_options_are_rejected() {
 #[test]
 fn archive_requires_an_enabled_change_log() {
     let db_dir = TempDir::new("arc-disabled");
-    let arc = TempDir::new("arc-disabled-dir");
+    let arc = private_dir("arc-disabled-dir");
     let storage = Storage::open(db_dir.db_path()).expect("open");
     assert!(matches!(
         storage.archive_change_log(&ArchiveOptions::new(arc.path())),
@@ -641,7 +649,7 @@ fn prune_is_bounded_per_maintenance_commit() {
 #[test]
 fn reenabling_after_pruning_every_row_passes_the_continuity_check() {
     let db_dir = TempDir::new("arc-reenable");
-    let archive = TempDir::new("arc-reenable-dir");
+    let archive = private_dir("arc-reenable-dir");
     let generation;
     {
         let mut storage = Storage::open(db_dir.db_path()).expect("open");
@@ -703,7 +711,7 @@ fn reenabling_after_pruning_every_row_passes_the_continuity_check() {
 #[test]
 fn continuity_still_rejects_a_gap_after_pruning() {
     let db_dir = TempDir::new("arc-gap-reenable");
-    let archive = TempDir::new("arc-gap-reenable-dir");
+    let archive = private_dir("arc-gap-reenable-dir");
     {
         let mut storage = Storage::open(db_dir.db_path()).expect("open");
         storage.enable_change_log().expect("enable");
@@ -958,7 +966,7 @@ fn pruning_is_refused_when_the_archive_does_not_cover_the_range() {
     // 保持なしで書き出した後、アーカイブ先が空のディレクトリに置き換わった。
     f.storage().archive_change_log(&f.opts()).expect("archive");
     let rows = f.row_lsns();
-    let empty = TempDir::new("arc-nocover-empty");
+    let empty = private_dir("arc-nocover-empty");
     let mut opts = ArchiveOptions::new(empty.path());
     opts.retain_records = Some(0);
     assert!(matches!(
@@ -1022,4 +1030,119 @@ fn concurrent_archive_calls_never_leave_overlapping_segments() {
         .expect("chain has no gap or overlap");
     assert_eq!(s.records, f.generation());
     assert_eq!(f.watermark(), f.generation());
+}
+
+#[test]
+fn a_series_forked_from_a_copy_cannot_authorize_pruning_the_original_log() {
+    // 複製（同じ DB 識別子・timeline）から別々に書き込んだ系列のセグメントは、LSN の範囲・チェックサムが
+    // 自己整合でも、元の DB のレコードと内容が違うので刈り込みの根拠にならない。
+    let f = Fixture::new("arc-fork");
+    f.populate(3);
+    let rows = f.row_lsns();
+    let fork_dir = private_dir("arc-fork-other");
+    // 同じ LSN・同じ識別子で内容の違うレコードから、自己整合なセグメントを組み立てる。
+    let state = f.storage().change_log.clone().expect("state");
+    let first = rows[0];
+    let forked = {
+        use super::super::{encode_record, RecordBody, RecordHeader, STORAGE_FORMAT_VERSION};
+        let mut b = SegmentBuilder::new(&state, first);
+        for lsn in rows.iter().copied() {
+            let rec = encode_record(
+                &RecordHeader {
+                    db_id: state.db_id,
+                    timeline: state.timeline,
+                    lsn,
+                    prev_lsn: lsn - 1,
+                    commit_time_us: 1,
+                    storage_format: STORAGE_FORMAT_VERSION,
+                },
+                &RecordBody {
+                    dropped: vec!["forked".into()],
+                    ..RecordBody::default()
+                },
+                1024,
+            )
+            .expect("encode");
+            b.push(lsn, &rec).expect("push");
+        }
+        b.finish().expect("finish")
+    };
+    let (h, bytes) = forked;
+    std::fs::write(
+        fork_dir
+            .path()
+            .join(segment_name(&h.db_id, h.timeline, h.first_lsn, h.last_lsn)),
+        bytes,
+    )
+    .expect("write");
+    let mut opts = ArchiveOptions::new(fork_dir.path());
+    opts.retain_records = Some(0);
+    // 水位は進んでいない（未アーカイブ）。先に水位だけ進めた状態を作り、分岐系列で刈り込みを試みる。
+    set_watermark(f.storage(), *rows.last().expect("row"));
+    assert!(matches!(
+        f.storage().archive_change_log(&opts),
+        Err(ArchiveError::Conflict)
+    ));
+    assert_eq!(f.row_lsns(), rows, "the original log is not deleted");
+}
+
+#[test]
+fn a_group_writable_archive_dir_is_refused_for_writing() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new("arc-shared");
+    f.populate(1);
+    let dir = f.archive.path();
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o775)).expect("chmod");
+    assert!(matches!(
+        f.storage().archive_change_log(&f.opts()),
+        Err(ArchiveError::InsecureDirectory)
+    ));
+    assert!(f.segment_files().is_empty());
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o1775)).expect("chmod");
+    f.storage()
+        .archive_change_log(&f.opts())
+        .expect("sticky is accepted");
+    // 読み取り（検証）は権限に依らない。
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o777)).expect("chmod");
+    assert!(f.storage().verify_change_log_archive(dir).is_ok());
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+}
+
+#[test]
+fn read_only_verify_matches_the_writable_one() {
+    use crate::storage::ReadOnlyStorage;
+    let db_dir = TempDir::new("arc-ro");
+    let archive = private_dir("arc-ro-dir");
+    {
+        let mut storage = Storage::open(db_dir.db_path()).expect("open");
+        storage.enable_change_log().expect("enable");
+        let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+        let ctx = PolicyContext::with_visibilities(TENANT, [Visibility::Public]).expect("tenant");
+        let mut session = SessionState::default();
+        session.allow_ddl();
+        core.execute_sql_in_session(
+            &ctx,
+            &mut session,
+            "CREATE TABLE ev (id BIGINT PRIMARY KEY)",
+        )
+        .expect("sql");
+        core.storage_for_test()
+            .archive_change_log(&ArchiveOptions::new(archive.path()))
+            .expect("archive");
+    }
+    let ro = ReadOnlyStorage::open(db_dir.db_path()).expect("read-only open");
+    let s = ro
+        .verify_change_log_archive(archive.path())
+        .expect("verify");
+    assert_eq!(s.segments, 1);
+    let seg = list_segments(archive.path())
+        .expect("list")
+        .pop()
+        .expect("seg")
+        .0;
+    flip_byte(&seg, 1);
+    assert!(matches!(
+        ro.verify_change_log_archive(archive.path()),
+        Err(ArchiveError::ChecksumMismatch)
+    ));
 }

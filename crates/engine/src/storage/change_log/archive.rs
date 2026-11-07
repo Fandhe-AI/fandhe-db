@@ -100,6 +100,10 @@ pub enum ArchiveError {
     /// `change_log` 表の側に欠落や破損がある（水位の次のレコードが無い、レコードのチェックサム不一致等）。
     /// アーカイブを進めず止める。
     LogCorrupt,
+    /// 一時ファイルまたは公開先が、書き込んで fsync した実体と別のものに差し替えられた（公開を取り消す）。
+    TempReplaced,
+    /// アーカイブ先が他者に書き込める（グループ・その他が書き込めてスティッキーでない）。
+    InsecureDirectory,
     /// 刈り込む範囲を覆う検証済みのセグメントが現在のアーカイブ先に無い（fail-closed で刈り込まない）。
     ArchiveIncomplete,
     /// 同名のセグメントが既に在り、表のレコードと一致しない（黙って置換しない）。
@@ -125,6 +129,8 @@ impl std::fmt::Display for ArchiveError {
             Self::ForeignDatabase => "archive segment belongs to another database",
             Self::ForeignTimeline => "archive segment belongs to another timeline",
             Self::LogCorrupt => "change log table is inconsistent with the archive position",
+            Self::TempReplaced => "archive file was replaced while publishing",
+            Self::InsecureDirectory => "archive directory is writable by other users",
             Self::ArchiveIncomplete => "archive does not cover the records to prune",
             Self::Conflict => "an archive segment with the same name differs from the log",
             Self::WatermarkMoved => "archive position changed concurrently",
@@ -680,6 +686,24 @@ fn check_dir(dir: &Path) -> Result<()> {
     }
 }
 
+/// 書き出し先が他者に書き込めないことを確認する。グループまたはその他が書き込めるディレクトリでは、
+/// 他者が一時名や公開済みのセグメントを差し替えうるため、スティッキービット（他者が自分のものでない
+/// ファイルを消せない）が付いていない限り拒否する（fail-closed。設計書 D6）。
+#[cfg(unix)]
+fn check_dir_not_shared(dir: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(dir)?.permissions().mode();
+    if mode & 0o022 != 0 && mode & 0o1000 == 0 {
+        return Err(ArchiveError::InsecureDirectory);
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn check_dir_not_shared(_dir: &Path) -> Result<()> {
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // 書き出し
 // ---------------------------------------------------------------------------
@@ -724,11 +748,25 @@ fn publish(dir: &Path, final_path: &Path, bytes: &[u8]) -> Result<bool> {
             Err(e) => return Err(e.into()),
         }
     };
+    use std::os::unix::fs::MetadataExt;
     let written = file.write_all(bytes).and_then(|()| file.sync_all());
-    drop(file);
     if let Err(e) = written {
+        drop(file);
         let _ = std::fs::remove_file(&tmp);
         return Err(e.into());
+    }
+    // 保持した fd の実体（dev, ino, 長さ）。一時パス・公開先がこれと一致することを確かめる。
+    let fd_meta = file.metadata()?;
+    let same = |m: &std::fs::Metadata| {
+        m.is_file()
+            && m.dev() == fd_meta.dev()
+            && m.ino() == fd_meta.ino()
+            && m.len() == fd_meta.len()
+    };
+    // 公開の直前: 一時パスが書き込んだ実体のままか（unlink・差し替えを検出する）。
+    if !std::fs::symlink_metadata(&tmp).is_ok_and(|m| same(&m)) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(ArchiveError::TempReplaced);
     }
     let linked = std::fs::hard_link(&tmp, final_path);
     // 公開の成否にかかわらず一時名は不要（公開済みなら最終名が完全な中身を持つ）。
@@ -743,6 +781,16 @@ fn publish(dir: &Path, final_path: &Path, bytes: &[u8]) -> Result<bool> {
             })
         }
     };
+    // 公開の直後: 公開先が fsync した実体そのものか。違えば自分が作ったリンクを取り消す。
+    if created && !std::fs::symlink_metadata(final_path).is_ok_and(|m| same(&m)) {
+        if std::fs::remove_file(final_path).is_err() {
+            crate::log_stderr!(
+                "engine: change log archive: failed to revoke a published segment that does not match what was written"
+            );
+        }
+        return Err(ArchiveError::TempReplaced);
+    }
+    drop(file);
     removed?;
     std::fs::File::open(dir).and_then(|d| d.sync_all())?;
     Ok(created)
@@ -984,6 +1032,57 @@ fn maintenance_commit(
     Ok(Step::Done { pruned: deleted })
 }
 
+/// セグメントのレコードのうち LSN が `from..=to` のものが、`change_log` 表の同じ LSN の値とバイト列で
+/// 一致するか確認する（`verify_segment_file` で検証済みのセグメント向け。メモリは 1 レコード分）。
+/// 表に無い・一致しないときは `Conflict`。
+fn compare_with_log(
+    path: &Path,
+    table: &redb::ReadOnlyTable<u64, &'static [u8]>,
+    from: u64,
+    to: u64,
+    max_payload: usize,
+) -> Result<()> {
+    use std::io::Seek;
+    let mut file = std::fs::File::open(path)?;
+    file.seek(std::io::SeekFrom::Start(SEG_PREFIX_LEN as u64))
+        .map_err(read_err)?;
+    let frame_head = HEADER_LEN + CHECKSUM_LEN;
+    loop {
+        let mut record = vec![0u8; frame_head];
+        file.read_exact(&mut record).map_err(read_err)?;
+        let len_bytes: [u8; 4] = record
+            .get(HEADER_LEN - 4..HEADER_LEN)
+            .and_then(|b| b.try_into().ok())
+            .ok_or(ArchiveError::BadFormat)?;
+        let payload_len =
+            usize::try_from(u32::from_le_bytes(len_bytes)).map_err(|_| ArchiveError::BadFormat)?;
+        if payload_len > max_payload {
+            return Err(ArchiveError::BadFormat);
+        }
+        record.resize(frame_head + payload_len, 0);
+        file.read_exact(
+            record
+                .get_mut(frame_head..)
+                .ok_or(ArchiveError::BadFormat)?,
+        )
+        .map_err(read_err)?;
+        let lsn = peek_record(&record, max_payload).map_err(map_decode)?.lsn;
+        if lsn < from {
+            continue;
+        }
+        if lsn > to {
+            return Ok(());
+        }
+        match table.get(lsn)? {
+            Some(v) if v.value() == record.as_slice() => {}
+            _ => return Err(ArchiveError::Conflict),
+        }
+        if lsn == to {
+            return Ok(());
+        }
+    }
+}
+
 /// 刈り込みで消してよい LSN の上限を求める。アーカイブ済み水位は DB 全体の値で、アーカイブ先が差し替わる・
 /// 欠けることがあるため、今回の保守 commit で消す範囲（先頭の行から最大 `max_prune_records` 件、かつ
 /// `new_w - retain` 以下）を、現在のアーカイブ先の**検証済みのセグメントが連続して覆う**ことを確認する。
@@ -999,15 +1098,15 @@ fn prune_cap_for(
         return Ok(0);
     };
     let upto = new_w.saturating_sub(retain);
-    let lo = {
-        let read = storage.db.begin_read()?;
-        match read.open_table(CHANGE_LOG_TABLE) {
-            Ok(t) => t.first()?.map(|(k, _)| k.value()),
-            Err(redb::TableError::TableDoesNotExist(_)) => None,
-            Err(e) => return Err(e.into()),
-        }
+    let read = storage.db.begin_read()?;
+    let table = match read.open_table(CHANGE_LOG_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(0),
+        Err(e) => return Err(e.into()),
     };
-    let Some(lo) = lo else { return Ok(0) };
+    let Some(lo) = table.first()?.map(|(k, _)| k.value()) else {
+        return Ok(0);
+    };
     let span = u64::try_from(opts.max_prune_records).unwrap_or(u64::MAX);
     let hi = upto.min(lo.saturating_add(span.saturating_sub(1)));
     if lo > hi {
@@ -1030,6 +1129,15 @@ fn prune_cap_for(
         {
             return Err(ArchiveError::BadFormat);
         }
+        // セグメントのレコードが、消す対象の DB のレコードと同一であること（複製から分岐した系列など、
+        // 同じ DB 識別子・timeline・LSN でも内容が違うセグメントで元のログを消さない）。
+        compare_with_log(
+            &path,
+            &table,
+            need,
+            h.last_lsn.min(hi),
+            state.limits.max_payload_bytes,
+        )?;
         if h.last_lsn >= hi {
             return Ok(hi);
         }
@@ -1049,6 +1157,7 @@ pub(in crate::storage) fn run_cycle(
         return Err(ArchiveError::InvalidOptions);
     }
     check_dir(&opts.dir)?;
+    check_dir_not_shared(&opts.dir)?;
     // 計画から公開・水位更新までを直列化する。同じ水位から別々の末尾のセグメントを計画する並行呼び出し
     // （上限設定の違い・読み取りの間の利用者 commit）が、重複区間を残さないようにする。別プロセスからの
     // 並行は、redb が DB ファイルを単一プロセスで排他的に開くため起きない（同じ DB を 2 プロセスで開けない）。
@@ -1147,8 +1256,16 @@ pub(in crate::storage) fn verify_against_db(
     storage: &Storage,
     dir: &Path,
 ) -> Result<ArchiveSummary> {
+    verify_against_read(&storage.db.begin_read()?, dir)
+}
+
+/// [`verify_against_db`] の本体。読み取りトランザクションだけを使うため、読み取り専用 open
+/// （`ReadOnlyStorage`）からも呼べる。
+pub(in crate::storage) fn verify_against_read(
+    read: &redb::ReadTransaction,
+    dir: &Path,
+) -> Result<ArchiveSummary> {
     check_dir(dir)?;
-    let read = storage.db.begin_read()?;
     let id: Option<[u8; DB_ID_LEN]> = match read.open_table(META_TABLE) {
         Ok(t) => match t.get(META_KEY_DB_ID)? {
             Some(v) => Some(v.value().try_into().map_err(|_| ArchiveError::LogCorrupt)?),
@@ -1158,10 +1275,9 @@ pub(in crate::storage) fn verify_against_db(
         Err(e) => return Err(e.into()),
     };
     let id = id.ok_or(ArchiveError::NotEnabled)?;
-    let timeline = read_meta_u64(&read, META_KEY_TIMELINE)?.ok_or(ArchiveError::LogCorrupt)?;
-    let base = read_meta_u64(&read, META_KEY_BASE_GENERATION)?.ok_or(ArchiveError::LogCorrupt)?;
-    let archived = read_meta_u64(&read, META_KEY_ARCHIVED_LSN)?.unwrap_or(base);
-    drop(read);
+    let timeline = read_meta_u64(read, META_KEY_TIMELINE)?.ok_or(ArchiveError::LogCorrupt)?;
+    let base = read_meta_u64(read, META_KEY_BASE_GENERATION)?.ok_or(ArchiveError::LogCorrupt)?;
+    let archived = read_meta_u64(read, META_KEY_ARCHIVED_LSN)?.unwrap_or(base);
     let expect = ArchiveExpectation {
         db_id: Some(id),
         timeline: Some(timeline),
