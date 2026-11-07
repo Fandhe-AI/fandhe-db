@@ -20,7 +20,9 @@
   `sequence-namespace-and-ledger.md`・`operation-id-ledger.md`・`resend-semantics.md`・
   `partitioned-dml.md`・`crash-tolerance-reverification.md`・`benchmark-judgement-policy.md`・
   `ingest-write-path.md`・`temp-table.md`
-- 検証コード: なし（設計記録のみ。コード変更は後続 Issue）
+- 検証コード: オラクル試験（`storage::change_log::oracle`・`oracle_tests`、feature `change-log-oracle`）、
+  クラッシュ試験（`tests/change_log_crash_atomicity.rs`）、計測（`benches/change_log_bench.rs`）。
+  Issue #3069 で追加した（D10・D11・7 節）。それ以前の節は設計時点の記録で、変更ログの有効化は D11 に従う
 
 ## 1. 背景
 
@@ -300,7 +302,7 @@ commit 番号・アーカイブと保持・復元手順・有効化境界・性�
 - 有効時は書き込みトランザクションごとに基底の読み取りトランザクションを 1 本持つ。その期間は
   古いページの回収が止まるため、長い明示トランザクションほど DB ファイルの肥大につながる
 - 計測は `benchmark-judgement-policy.md`（交互実行・N ≥ 5 ペア・ノイズ帯併記・共有環境の数値を
-  採否根拠にしない）に従い、`make bench-ingest-profile` 等で #2166 が行う
+  採否根拠にしない）に従う。実測は D11 の「性能の実測」に記録した（Issue #3069）
 
 ### D10 テスト方針（#2166〜#2170 への申し送り）
 
@@ -309,6 +311,180 @@ commit 番号・アーカイブと保持・復元手順・有効化境界・性�
 - 欠落・順序違反・改ざん・別 DB／別 timeline の拒否
 - `scripts/crash_test*.sh` 系への PITR シナリオ追加（#2170。CI ジョブ追加時は `github-actions.md`）
 - テストは RECOVER-14 等の ID に紐付ける
+
+
+### D11 有効化の仕様・オラクル・エラー・性能の実測（Issue #3069）
+
+#2166 の完了条件に当たる実装メモ。D1 の層 3・D8・D9・D10 を満たす。
+
+#### 有効化と再起動の扱い
+
+| 状態 | 起動の扱い |
+| ---- | ---------- |
+| 一度も有効にしていない DB・フラグなし | 従来と同一（識別子の読み取り 1 回だけが増える） |
+| 一度も有効にしていない DB・`--change-log` | DB 識別子・timeline・**有効化時の世代**（`base_generation`）をメタ表へ書く（世代を進めない保守 commit）。以降の commit からレコードを持つ。それ以前の変更はログに無い（D8） |
+| 有効にした DB・`--change-log` | 記録の連続性を検査する（最後のレコードの LSN。レコードが無ければ `base_generation` が、現在の `storage_generation` と一致すること）。不一致は LSN の欠落で、起動を拒否する（書き込みも拒否されたまま） |
+| 有効にした DB・フラグなし | wire-server は固定文言で起動を拒否する。engine（ライブラリ利用）も書き込みを `54000` で拒否する（`wrap_gated` で書き込みトランザクションの取得時。読み取りと `backup` の書き出しは可）。無効のまま書くとレコードが欠けたまま世代が進むため |
+
+- 有効にした DB をフラグなしで開く経路は、LSN の欠落を**作れない**（起動拒否 + engine 側の書き込み拒否の二重）。
+  有効化を戻す手段は現時点で無く、止めたい場合は `backup` で取った複製から新しい DB を作る。無効化は
+  アーカイブ・保持（#2167）と合わせて後続で検討する
+- 旧形式の表の `id` 移行（`legacy_id_migration`）は `Storage::open` が commit する。有効にした DB では
+  その commit が記録されないとレコードに欠落ができるため、open では行わず、`enable_change_log` が
+  有効化の直後（記録される状態）で行う。フラグなしの起動は書き込めないので移行を要さない
+- `enable_change_log` は公開 API（`&mut self`。`Arc` 化前の構築段階でだけ呼べる）。一時表ストレージは拒否する
+
+#### エラーの分離（判断）
+
+**`StorageError::CommitFootprintUnrecordable`（`wire_code` は `54000`）のまま分けない。** 理由:
+1. `StorageError`・`CatalogError` は `#[non_exhaustive]` ではなく、variant の追加は公開 API の
+   破壊（`OpenWithEngineError` を別型にした前例と同じ判断）。写像の腕も `sql/ddl.rs` の 16 箇所ほか
+   `catalog.rs`・`exec.rs`・`transaction.rs` に及ぶ
+2. クライアントへ返す `wire_code` は `54000` に固定すべきで（他テナントの存在・件数を漏らさない）、
+   クライアントが原因を区別できる必要はない。区別が要るのは運用者だけである
+3. 運用者への区別は、拒否の原因ごとの固定文言を stderr へ 1 行出すことで足りる
+   （`storage::change_log::Unrecordable`。frame の上限／multimap 表／捕捉を通らない書き込み／after-image を
+   読めない／レコードが上限超過／世代・時計の失敗／有効にしていない起動。表名・件数・LSN は含めず、同じ秒の
+   重複は出さない＝利用者の連続した拒否でログを溢れさせない）
+
+#### オラクル試験（D1 の層 3）
+
+- 実装: `storage::change_log::oracle`。`CaptureSession::prepare` がレコードを追記した直後に
+  `verify_record` を呼ぶ。検査は、(1) レコードの LSN が基底の世代の次、(2) 作成・削除された表の集合が
+  基底と最終の表集合の差と一致、(3) 作成（再作成）された表は全行が書き込みトランザクションの内容と一致、
+  (4) `table_image::capture`（基底 → 書き込みトランザクション）の差分の upsert・remove がすべてレコードに載る、
+  (5) レコードの値が書き込みトランザクションの現在値と一致、の 5 点。(1)〜(5) は「レコードを基底へ適用すると
+  commit 後の状態になる」と同値である（レコードの余分な upsert は値が同じ no-op、余分な remove は基底に無いキー）。
+  不一致は panic（テスト専用）
+- 有効化の条件: `cfg(test)` では変更ログが有効な commit で常に検証する。結合テストは feature
+  `change-log-oracle` と環境変数 `FANDHE_CHANGE_LOG_ORACLE`（`1`＝強制有効化 + 検証、`force`＝強制有効化のみ）
+  を両方付けた実行に限り、永続 `Storage` の open で強制的に有効にする。feature だけでは挙動が変わらない
+  ため、`--all-features` の CI（`make lint`／`make test`）を壊さない
+- 場面集（`oracle_tests`）: DDL 全般・INSERT／UPDATE／DELETE／ON CONFLICT・列の追加と改名・表の rename・
+  DROP と同名の再作成・TRUNCATE・索引（B-tree／一意／GIN）の作成と削除・ビュー／マテリアライズドビューと
+  REFRESH・シーケンスと `setval`・`TRUNCATE ... RESTART IDENTITY`・トリガ（テスト用の呼び出し口。トリガ内の
+  書き込みを含む）・関数・明示トランザクションと SAVEPOINT／ROLLBACK TO／RELEASE・一時表・スキーマ／ロール／
+  ポリシー／GRANT／ENUM 型・分割実行・operation_id 台帳と複数テナント・`put`／`put_batch`／`BatchWriteTxn`／
+  `WriteTxn`。各場面の終了後に、有効化した時点の全表へ記録した全レコードを LSN 順に適用した結果が最終状態と
+  一致すること（再生器 `oracle::replay`。符号化・LSN の連鎖・正規化の通し検証）と、レコード数が世代の進みと
+  一致することも確かめる。再生器は #2169 の参照実装を兼ねる
+- オラクル自身の検出力: 層 2（行数の増減）が見逃す「行数が同じ更新を捕捉なしで行う」書き込みを、オラクルが
+  不一致として検出することをテストで固定している
+- 場面集では**不一致は出なかった**（直した不一致は無い）。一方、強制有効化で見つかった層 3 外の問題が 1 件
+  あった: open の旧形式移行 commit が記録されず LSN の欠落になる（上記「有効化と再起動の扱い」で修正）
+- 結合テストの強制走行（`FANDHE_CHANGE_LOG_ORACLE=1`、engine の `tests/` の 99 バイナリ・8,127 件）の結果は
+  下の「強制走行の結果」
+
+#### 強制走行の結果
+
+- engine の `tests/` を `FANDHE_CHANGE_LOG_ORACLE=1 cargo test -p fandhe-db-engine --features change-log-oracle
+  --no-fail-fast --test '*'` で流した（99 バイナリ。テスト実行 3 分 27 秒、10 論理 CPU、ビルド別）。
+  **8,106 件が成功、6 件が失敗、15 件が ignore（もとから）**。捕捉漏れ・層 2 の誤拒否・オラクルの不一致は
+  0 件だった。失敗 6 件の内訳:
+  - `table_rls/table_generation_bump_coverage`（1 件）: 許可リストの行番号の追随だけ（解消済み）
+  - `catalog` の `table5_alter_table_add_column_latency_is_independent_of_row_count`、
+    `catalog_latency` の `table4_create_table_latency_is_independent_of_row_count`、
+    `index7_create_index_latency` の 2 件（4 件）: 「行数が増えても遅延が増えない」を測るテストで、`=1` の
+    オラクルは commit ごとに O(DB サイズ) の突き合わせをするため落ちる。**`FANDHE_CHANGE_LOG_ORACLE=force`
+    （強制有効化のみ）で流すと 4 件とも成功する**ので、有効時の実コストが DB サイズに依存しないことの確認になっている
+  - `persistence` の `persist3_on_disk_row_entry_layout_via_raw_redb`（1 件）: 「redb の表は `rows` と
+    `storage_generation` だけ」と固定している。有効化そのものが差になる（`change_log`・`change_log_meta` が増える）
+    ため、期待値は変えていない
+- 単体テスト（lib）を同じ条件で流すと 6,563 件成功・47 件失敗だった。内訳は、素の redb で書く破損・直書きの
+  fixture 26 件（オラクルが「記録されていない変更」として検出するのが正しい）、素の `db().begin_write()` の
+  commit で世代だけが進む fixture 6 件（`commit_boundary` の subprocess 試験など。連続性検査が拒否する）、
+  有効化そのものが差になる構造テスト 8 件（commit 回数・生成物の有無を固定する）、無効または明示の有効化を前提にした
+  変更ログ自身のテスト 7 件。いずれも期待値は変えていない
+- 通常実行（feature・環境変数なし）では、lib 6,610 件（オラクルの場面集を含む）と結合テストはすべて成功する
+- 強制走行の対象外: wire-server のテスト（`--change-log` を付けた起動は `wire_cli` が外形で見る）。
+  COPY・wire プロトコル固有の書き込み経路は強制走行では流していない（engine の同じ書き込み関数を呼ぶ）
+
+#### 原子性
+
+- 構造: レコードの追記（`change_log` 表への insert）は世代採番と同じ redb トランザクションの prepare 段で行い、
+  point of no return（`commit`）の前に失敗すれば何も残らない。`commit` が `Err` の場合は従来どおり abort
+- 検証: (1) `rejected_prepare_leaves_no_record_no_data_and_no_generation_change` ほか既存の lib テストと、
+  `commit_boundary` の subprocess 試験（`commit_fn` の Err／パニックで abort）が有効時も成り立つ、
+  (2) `tests/change_log_crash_atomicity.rs`: 変更ログを有効にした子プロセスが DDL・DML・TRUNCATE・rename の
+  commit を回し、親が 24 回 SIGKILL する（同じ DB を kill のたびに再有効化）。kill 後に `change_log` の LSN が
+  欠落なく連続し、最後の LSN が `storage_generation` に一致し、最初の LSN が `base_generation` の次であること、
+  再有効化が連続性検査に拒否されないことを確かめる（`Immediate` の durability。24 回で世代 455 まで進んだ）
+
+#### CI へ入れる案（未決。オーナー判断）
+
+- すでに通常の CI（`rust-ci` の `cargo test --all-features`）に入っているもの: lib のオラクルの場面集（commit ごとの
+  突き合わせ込み）、`tests/change_log_crash_atomicity.rs`（0.2 秒）、`wire_cli` の `--change-log` の試験。追加の
+  ジョブは不要
+- 重い強制走行（上記の 99 バイナリ）は、別ジョブ `change-log-oracle` にする案がある。`--all-features` のビルドは
+  `rust-ci` と同じなので feature の追加ビルドは要らない。コマンドは
+  `FANDHE_CHANGE_LOG_ORACLE=1 cargo test -p fandhe-db-engine --all-features --no-fail-fast --test '*' --
+  --skip persist3_on_disk_row_entry_layout_via_raw_redb --skip latency_is_independent_of_row_count` と、遅延の 4 件だけを
+  `FANDHE_CHANGE_LOG_ORACLE=force` で別に流す 2 段。所要時間は手元（10 論理 CPU）でテスト実行 3 分 27 秒、
+  GitHub ホステッド runner（2〜4 コア）では 2〜3 倍、cold ビルドを含めて 15〜25 分と見込む（未計測）。ジョブを足すと
+  必須チェック名が増えるため ruleset の更新が要る（`.claude/rules/github-actions.md`）。
+  足さない場合の手元の実行手順は README「変更ログのオラクル試験」に書いた
+
+#### 性能の実測
+
+実測は `benches/change_log_bench.rs`（情報提供専用。公開 API だけを使う）で、無効と有効を**交互に 5 ペア**実行し、
+中央値と範囲を併記した（`benchmark-judgement-policy.md`）。環境: Linux x86_64・10 論理 CPU・AVX2。**共有環境の
+開発機での値で、採否根拠ではなく規模感の記録**である。DB は実ディスク（ext4）に置いた（`/tmp` は tmpfs で
+fsync が無いため。tmpfs の値は CPU コストの上限として併記）。
+
+| 場面 | 無効 | 有効 | 比 |
+| ---- | ---- | ---- | -- |
+| 1 行 commit の p50（実ディスク、`tenant::insert_rows` 1 行、1,500 commit） | 400 µs [376..1227] | 420 µs [405..426] | 1.05× |
+| 同 p95 | 741 µs | 1,037 µs | 1.40× |
+| 1 行 commit の p50（tmpfs＝fsync なしの CPU コスト） | 31.9 µs | 59.3 µs | 1.86× |
+| 大きな一括 ingest（1,000 行/commit × 20 commit、dim 128、実ディスク）のスループット | 200,613 行/s [178,167..211,852] | 129,086 行/s [121,403..130,876] | 0.64× |
+| 同 DB ファイルのサイズ | 16.1 MiB | 48.1 MiB | 2.99× |
+| 表が 100 個ある DB の 1 行 commit（中央値） | 0.371 ms | 0.417 ms | 1.12× |
+| 表が 1,000 個 | 0.376 ms | 0.534 ms | 1.42× |
+| 表が 5,000 個 | 0.392 ms | 0.999 ms | 2.55× |
+| 表が 20,000 個 | 0.383 ms | 2.724 ms | 7.11× |
+
+- 1 行 commit は fsync が支配的で、有効時の相対コストは小さい（p50 で 5%、p95 で 1.4 倍）。バイト律速の一括 ingest は
+  行データを表とログに二重に書くため、スループットは 0.64 倍、ファイルは約 3 倍になる。ファイルが D9 の見立て
+  （2 倍前後）より大きいのは、書き込みトランザクションごとに基底の読み取りトランザクションを持つ間は古いページを
+  回収できず、レコード（1 commit = 1 値で数百 KiB）の分も新しいページになるため
+- **表数依存（層 2 の `verify_footprint`）**: 世代が変わった表の数ではなく、**世代管理対象の表の総数 T** に比例する
+  （`changed_table_generations_in_write_txn` が世代表の全エントリを走査する。`list_tables` の取得は redb 上の
+  表が少ないと数 µs で、主要因ではなかった）。当初の実装は走査の各エントリで確定側の世代表を開き直しており、
+  T = 5,000 で 2.85 ms（無効の 7.13 倍）だった。確定側の表を 1 回だけ開き、両側をキー順に突き合わせる実装にして
+  T = 5,000 で 1.0 ms（2.55 倍）に下げた（結果は同じ。単体テストで点引きと一致を固定）。残りは世代表の走査
+  O(T)（約 0.13 µs/表）で、表が数千ある DB の有効時の commit 遅延は 1 ms 前後、2 万表で 2.7 ms。さらに下げるには
+  世代表の差分を frame に積んだキーだけで検査する必要があるが、それは層 2 が検出したい「捕捉を通らない世代の bump」
+  を検出できなくなる（完全性は層 1・3 が負うが、早期検出の意味が失われる）ため採らない。#2167 以降で問題になれば再検討する
+- **frame の上限と一括 ingest**（`limits` モード。dim 128、行ごとの after-image は約 0.55 KiB、実ディスク）:
+
+  | 1 commit の行数 | ペイロード見積 | 有効時 | 最大 RSS（入力データ込み） | 無効時 |
+  | --------------- | -------------- | ------ | -------- | ------ |
+  | 100,000 | 55 MiB | 成功（0.69 s） | 338 MiB | 成功 |
+  | 300,000 | 165 MiB | 成功（2.2 s） | 1,057 MiB | 成功 |
+  | 450,000 | 247 MiB | 成功（3.4 s） | 1,453 MiB | 成功 |
+  | 600,000 | 329 MiB | **拒否（`54000`）** | 1,218 MiB | 成功（2.1 s） |
+
+  dim 1536 では 20,000 行（118 MiB）は成功（最大 RSS 658 MiB。無効時は 408 MiB）、100,000 行（592 MiB）は拒否される。
+  拒否の stderr は `engine: change log: commit refused: after-image unreadable or over the payload limit`。
+  ペイロード上限（256 MiB）が先に効き、キー数（4M 個）とキーのバイト数（128 MiB）は dim 128 の行では届かない。
+  **既定値（キー 4M 個・128 MiB・ペイロード 256 MiB・イベント 65,536 個）は変えない**。理由: ①最大 RSS の増分
+  （ベンチ自身が持つ入力を除く）はペイロードの約 5 倍（after-image・符号化・frame・redb の書き込みバッファ）で、
+  上限を上げると 1 commit の一時メモリが比例して増える。書き込みは単一ライタなので同時には 1 commit 分だが、
+  247 MiB のペイロードで既に約 1.2 GiB 増える ②拒否は
+  commit 前で何も反映されず、クライアントは `54000`（payload too large）で書き込みを分割できる。無効時に通る
+  巨大な 1 commit が有効時に拒否されるのは意図した差で、運用では `--max-insert-rows` を下げるか、書き込みを分割する
+  （README に記載）
+- 無効時の既存ベンチに退行はない: 基準（#3068 直後）と本変更の `ingest_profile_bench` を交互に 5 ペア実行した。
+  batch モードの E0（`tenant::insert_rows` 1,000 行/バッチ）は基準 4.915 ms [4.769..5.063]・本変更 4.958 ms
+  [4.907..5.008]（+0.9%、基準側のばらつきの範囲内）。single モード（25,000 文）は E0 が 0.392 → 0.390 ms、
+  S0（SQL 表層）が 0.414 → 0.412 ms、I8（redb commit）が 0.368 → 0.364 ms で、差はノイズの範囲内（比 0.99〜1.00）。
+  無効時に増えたのは `Storage::open` の識別子の読み取り 1 回と `wrap_gated` の分岐 1 つ（確保なし）だけ
+- `benches/ingest_profile_bench.rs` の素の redb の呼び出しは、計装レプリカ（I1〜I8＝基準側）の関数だけで書き込む。
+  E0 側は `Storage::open`・`create_table`・`tenant::insert_rows`（engine の公開 API）で、素の redb は整合性検証の
+  読み取り専用の open だけであることを確認した。したがって有効化しても基準側の測定は変わらない
+- 手元の再現: `cargo bench -p fandhe-db-engine --bench change_log_bench -- single n=2000 pairs=5`、
+  `-- tables tables=5000`、`-- bulk rows=1000 dim=128 batches=20`、`-- limits rows=450000 dim=128 log=1`。
+  実ディスクで測るときは `TMPDIR` を実ディスクの空きに向ける
 
 ## 4. 却下した代替案
 
@@ -390,15 +566,29 @@ commit 番号・アーカイブと保持・復元手順・有効化境界・性�
     素の redb で書く状態）では、同じ強制で行ストアの書き込みが層 2 に拒否される失敗が 58 件出た。
 - 申し送り（Issue 起票はしていない。要否は人の判断）: #2166 の分割（ラッパ移行の規模）、
   #2149 への commit 番号系列の要件、#2446 との timeline の整合
-- #3069 への申し送り（計測）: 表が数千ある DB で、層 2 の有効時のコスト（世代カウンタ表の走査と
-  表集合の取得）を実測する
-- #3069 への申し送り（網羅）: 強制有効化で `tests/` 側の結合テスト（一時表、マテリアライズドビューの
-  再計算、索引の再構築、savepoint の復元）も流し、捕捉漏れと層 2 の誤拒否がないか確かめる
-- #3069 への申し送り（基準側）: `benches/ingest_profile_bench.rs` の素の redb の呼び出しが、計測の
-  基準側に限られるかを確認する
-- #3069 の範囲: 層 3 のオラクル試験（全面。ラッパ経由の捕捉の完全性。単体テストの専用ヘルパーのうち
-  素の redb で書くもの〔`#[cfg(test)]` の `insert_row_into_table` 系〕は変更ログ有効時に層 2 で拒否
-  されるため、オラクルの対象にするなら先にラッパへ移す）。変更ログを有効にした DB をフラグなしで再起動したときの検出（無効のまま書くと LSN の
-  欠落になる）。また、エラーを `CommitFootprintUnrecordable` から分離するかの判断と、frame の上限値
-  （キー数・バイト数・ペイロード）の見直し
+- **#3069 の実施状況（実施済み・残課題・後続）**:
+  - 実施済み: ①層 3 のオラクル（D11）。場面集は 11 場面、不一致は出なかった。②強制有効化での結合テスト
+    （`tests/` の 99 バイナリ）の走行と内訳（D11 の「強制走行の結果」）。単体テストの `insert_row_into_table`
+    系 3 関数は素の redb からラッパへ移した。③層 2 の表数依存の実測と削減（D11 の「性能の実測」。
+    `changed_table_generations_in_write_txn` を突き合わせ実装にした）。④`benches/ingest_profile_bench.rs` の素の
+    redb の書き込みは計装レプリカ（基準側）の関数に限られ、E0（`tenant::insert_rows`）側は engine の公開 API で、
+    素の redb は整合性検証の読み取り専用 open だけであることを確認した。⑤フラグなしの再起動・再有効化の
+    連続性・エラー分離の判断・frame の上限の判断（D11）。⑥`--change-log` の結線（`AVAILABLE = true`）
+  - 残課題: ①lib の単体テストを強制有効化で流すと 47 件が落ちる（D11）。内訳は、素の redb で書く
+    破損・直書きの fixture 26 件（オラクルが検出するのが正しい）、素の `db().begin_write()` の commit で世代だけが
+    進む fixture 6 件、有効化そのものが差になる構造テスト 8 件、無効または明示の有効化を前提にした変更ログ自身の
+    テスト 7 件。落ちたものの期待値は変えていない。
+    必要になれば fixture のうち正常データを書くもの（`sequence` の `put_state`、`partitioned_dml` の `seed` 等）を
+    ラッパへ移す。②1 commit の上限（キー 4M 個・128 MiB・ペイロード 256 MiB）を超える一括書き込みは有効時に
+    `54000` で拒否される（無効時は通る）。運用では書き込みを分割する（D11）。③重い強制走行を CI へ入れるかは
+    所要時間（D11）を見たオーナー判断
+  - 後続の Issue への申し送り:
+    - #2167（アーカイブ・保持）: `verify_continuity` は最後のレコードの LSN（無ければ `base_generation`）を使う。
+      保持・削除で最後のレコードを消す設計にする場合は、削除前に最後の LSN をメタ表へ残すこと。有効化を戻す
+      手段（無効化）の仕様もここで決める。D6 の保守 commit はメタ表の書き込みを増やすだけで、`base_generation` は動かさない
+    - #2168／#2169（増分・PITR）: `storage::change_log::oracle::{apply_record, replay}` が再生器の参照実装
+      （`dropped` の削除 → `created` → upsert／remove、LSN の連鎖検査）。復元の本実装はこれを `table_image` の
+      実表への適用にする
+    - #2149／#2154（バックアップ）: `Storage::enable_change_log` で `base_generation` を保存済み。取得時点の commit 番号は
+      同じ `storage_generation` の系列を使う（D2）
 - 未決: 移行 commit の扱いの詳細、保守 commit の削除件数上限の既定値と呼び出し契機、CLI フラグ名の最終形（#2166／#2167）
