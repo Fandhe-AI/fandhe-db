@@ -418,6 +418,11 @@
 //! そろえる。起動時固定）、既定ビルドでは固定文言で起動エラーにする（fail-closed。
 //! `wire_server::english_stemmer_opt`。`docs/design/stemming-crate-adoption.md` 参照）。
 //!
+//! `--change-log`（Issue #3067・親 #2166・RECOVER-14 ポインタ）: 値を取らないスイッチ。永続変更ログ
+//! （増分バックアップ・PITR の土台）の opt-in。書き込み点の移行（#3068）と有効化（#3069）が済むまでは
+//! 指定すると固定文言で起動エラーにする（fail-closed。`wire_server::change_log_opt`。
+//! `docs/design/change-log-pitr.md` 参照）。
+//!
 //! `--require-where-for-dml`（Issue #2210・SQL-36 ポインタ）: 値を取らないスイッチ。
 //! 指定すると `WHERE` 省略の SQL `UPDATE`／`DELETE` を変更開始前に `42601` で拒否する
 //! （明示した述語は受理。MySQL の `sql_safe_updates` 相当）。重複指定・`=` 連結形・後続の値は
@@ -582,6 +587,7 @@ fn run_server(args: &[String]) -> ExitCode {
     let mut backup_socket_raw: Option<String> = None;
     let mut hnsw_scope_raw: Option<String> = None;
     let mut require_operation_id = false;
+    let mut change_log = false;
     let mut require_where_for_dml = false;
     let mut max_dml_affected_rows_raw: Option<String> = None;
     let mut max_insert_rows_raw: Option<String> = None;
@@ -2267,6 +2273,16 @@ fn run_server(args: &[String]) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
                 english_stemmer_raw = true;
+                i += 1;
+            }
+            // Issue #3067（RECOVER-14 ポインタ）。値を取らないスイッチ。書き込み点の移行（#3068）と
+            // 有効化（#3069）が済むまでは固定文言で起動を拒否する（fail-closed）。
+            wire_server::change_log_opt::FLAG => {
+                if let Err(msg) = wire_server::change_log_opt::accept(change_log) {
+                    engine::log_stderr!("wire-server: {msg}");
+                    return ExitCode::FAILURE;
+                }
+                change_log = true;
                 i += 1;
             }
             other => {

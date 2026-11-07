@@ -25,6 +25,7 @@ use std::path::Path;
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 
 /// 明示トランザクションの書き込み時直列化検査が使う commit 記録（Issue #2404）。
+pub(crate) mod change_log;
 pub(crate) mod commit_log;
 /// 電源断シミュレーション用 `redb::StorageBackend` の共通モデル（TASK-145）。
 /// 本クレートのユニットテスト（本モジュール下部の `tests::power_loss`）と
@@ -426,9 +427,15 @@ pub type Result<T> = std::result::Result<T, StorageError>;
 /// の中で無期限に待つことはなく、ゲートの待機上限（`write_lock_wait`）で
 /// `55P03` へ倒れる。`Deref`/`DerefMut` で `redb::WriteTransaction` として扱える。
 ///
-/// フィールドの宣言順が drop 順序を決める（`recording` の登録解除 → `txn` の abort →
-/// `_permit` の解放の順）。並べ替えてはならない。
+/// フィールドの宣言順が drop 順序を決める（`capture`・`recording` の登録解除 → `txn` の abort →
+/// `_permit` の解放の順）。並べ替えてはならない。フィールドを分解して `txn` を先に消費する経路
+/// （`abort`・`split_for_commit` 等）では、宣言順に頼れないため `txn` の Box を解放する前に
+/// [`change_log::CaptureSession::release_registration`] で明示的に登録を外す。
 pub(crate) struct GatedWriteTxn {
+    /// 変更ログの捕捉の付帯物（変更ログが有効な永続ストレージだけ。無効なら `None` で何も確保しない）。
+    /// `recording` と同じ理由で `txn` より先に登録を外す（宣言順。Box の解放後に別 Storage の
+    /// トランザクションが同じアドレスを得て、この frame を引かないようにするため）。
+    capture: Option<change_log::CaptureSession>,
     /// commit 記録の付帯物（永続ストレージだけ。一時表用のストレージは `None`）。
     /// 先頭に置くのは、`txn`（Box のアドレス）・`_permit` より先に frame の登録を外すため
     /// （permit 解放後にアドレスが再利用されて新しい登録と競合しないように）。
@@ -459,7 +466,12 @@ impl GatedWriteTxn {
             txn,
             _permit,
             recording: _recording,
+            mut capture,
         } = self;
+        // `txn` の Box を解放する前に登録を外す（分解後の drop 順は宣言順に従わない）。
+        if let Some(c) = capture.as_mut() {
+            c.release_registration();
+        }
         txn.abort()?;
         Ok(())
     }
@@ -472,7 +484,11 @@ impl GatedWriteTxn {
             txn,
             _permit,
             recording: _recording,
+            mut capture,
         } = self;
+        if let Some(c) = capture.as_mut() {
+            c.release_registration();
+        }
         txn.commit()?;
         Ok(())
     }
@@ -485,6 +501,8 @@ pub(crate) struct CommitParts {
     pub(crate) permit: Option<writer_gate::WriterPermit>,
     /// commit 記録の付帯物（あれば。[`commit_log::CommitSession`]）。
     pub(crate) session: Option<commit_log::CommitSession>,
+    /// 変更ログの捕捉の付帯物（あれば。[`change_log::CaptureSession`]）。prepare 段へ明示的に渡す。
+    pub(crate) capture: Option<change_log::CaptureSession>,
 }
 
 /// commit 系の入口（[`commit_write_txn`]・[`bump_generation_and_commit`]・
@@ -506,6 +524,7 @@ impl CommitTxn for redb::WriteTransaction {
             txn: self,
             permit: None,
             session: None,
+            capture: None,
         }
     }
 }
@@ -516,11 +535,18 @@ impl CommitTxn for GatedWriteTxn {
             txn,
             _permit,
             recording,
+            mut capture,
         } = self;
+        // `*txn` で Box を解放する前に登録を外す。以降の prepare は登録簿を引かず、session が
+        // 直接持つ frame と基底の読み取りだけを使うため支障はない。
+        if let Some(c) = capture.as_mut() {
+            c.release_registration();
+        }
         CommitParts {
             txn: *txn,
             permit: Some(_permit),
             session: recording,
+            capture,
         }
     }
 }
@@ -599,12 +625,18 @@ pub(crate) fn bump_generation_and_commit(write_txn: impl CommitTxn) -> Result<()
         txn: write_txn,
         permit: _permit,
         session,
+        capture,
     } = write_txn.split_for_commit();
     let g_c = prepare_generation_bump(&write_txn)?;
     let record = match session.as_ref() {
         Some(s) => s.prepare(&write_txn)?,
         None => None,
     };
+    // 変更ログ（RECOVER-14）: 世代採番の直後・commit の前に after-image のレコードを同一
+    // トランザクションへ追記する。`Err` は commit 前の拒否（無効時は分岐だけ）。
+    if let Some(c) = capture.as_ref() {
+        c.prepare(&write_txn, g_c)?;
+    }
     commit_prepared_write_txn(write_txn)?;
     // commit 成功後・permit 解放前に commit 記録へ追記する（1a-5 の順序不変条件）。
     if let Some(s) = session.as_ref() {
@@ -645,6 +677,7 @@ pub(crate) fn commit_write_txn(write_txn: impl CommitTxn, has_writes: bool) -> R
             txn: write_txn,
             permit: _permit,
             session: _session,
+            capture: _capture,
         } = write_txn.split_for_commit();
         write_txn.abort()?;
         Ok(())
@@ -799,6 +832,9 @@ pub struct Storage {
     /// 明示トランザクションの書き込み時直列化検査（SQL-38・Issue #2404）が使う commit 記録と
     /// 生存中スナップショットの登録簿。永続ストレージだけが持つ（一時表用は `None`）。
     commit_log: Option<std::sync::Arc<commit_log::CommitLog>>,
+    /// 永続変更ログ（RECOVER-14）の有効状態。`None`（既定）なら書き込みトランザクションは
+    /// capture frame を確保しない。有効化は [`Storage::enable_change_log`]（crate 内。CLI は #3069 まで拒否）。
+    change_log: Option<std::sync::Arc<change_log::ChangeLogState>>,
     /// 一貫スナップショット書き出し（[`Storage::export_snapshot`]）の実行中フラグ。長い読み取り
     /// Tx はページ回収を止めるため、1 つの `Storage` につき同時に 1 本までに制限する。
     snapshot_export_busy: std::sync::atomic::AtomicBool,
@@ -861,6 +897,7 @@ impl Storage {
             function_generations: Default::default(),
             write_lock_wait: DEFAULT_WRITE_LOCK_WAIT,
             commit_log: Some(std::sync::Arc::new(commit_log::CommitLog::new())),
+            change_log: None,
             snapshot_export_busy: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "test-sync-points")]
             sync_hook: std::sync::Mutex::new(None),
@@ -1027,7 +1064,20 @@ impl Storage {
             }
             None => None,
         };
+        // 変更ログが有効なときだけ capture frame を登録する（無効時は確保もロックもしない）。
+        let capture = match self.change_log.as_ref() {
+            Some(state) => {
+                let base = self.db.begin_read()?;
+                Some(change_log::CaptureSession::begin(
+                    std::sync::Arc::clone(state),
+                    &txn,
+                    base,
+                ))
+            }
+            None => None,
+        };
         Ok(GatedWriteTxn {
+            capture,
             txn,
             _permit: permit,
             recording,
@@ -1060,6 +1110,45 @@ impl Storage {
         log.arm(current_generation_in_txn(&read_txn)?);
         self.commit_log = Some(std::sync::Arc::new(log));
         Ok(())
+    }
+
+    /// 変更ログを有効にする（RECOVER-14・D5・D8）。DB 識別子と timeline が無ければ永続化し
+    /// （世代を進めない保守 commit）、以降の書き込みトランザクションが capture frame を持つ。
+    /// 一時表用ストレージでは拒否する。`&mut self` なのは `Arc` 化前の構築段階でだけ有効化できる
+    /// ようにするため。運用者の CLI からの到達は書き込み点の移行（#3068）とオラクル（#3069）が
+    /// 済むまで拒否される。
+    #[cfg_attr(not(test), allow(dead_code))] // 運用経路の結線は #3068・#3069。それまではテストだけが呼ぶ
+    pub(crate) fn enable_change_log(&mut self) -> Result<()> {
+        self.enable_change_log_with(change_log::CaptureLimits::default())
+    }
+
+    /// [`Self::enable_change_log`] の上限指定版（上限のテストが使う）。
+    #[cfg_attr(not(test), allow(dead_code))] // 運用経路の結線は #3068・#3069。それまではテストだけが呼ぶ
+    pub(crate) fn enable_change_log_with(
+        &mut self,
+        limits: change_log::CaptureLimits,
+    ) -> Result<()> {
+        if self.temp_scoped {
+            return Err(StorageError::Codec(
+                "change log is not available for temporary storage".to_string(),
+            ));
+        }
+        // 有効化前に取るため capture session を持たない（識別子の書き込みは記録対象外）。
+        let txn = self.begin_write_txn()?;
+        let (state, wrote) = change_log::load_or_init_identity(&txn, limits)?;
+        if wrote {
+            crate::recovery::commit_boundary::commit_maintenance(txn)?;
+        } else {
+            txn.abort()?;
+        }
+        self.change_log = Some(std::sync::Arc::new(state));
+        Ok(())
+    }
+
+    /// 有効な変更ログの DB 識別子と timeline（無効なら `None`）。
+    #[cfg_attr(not(test), allow(dead_code))] // 運用経路の結線は #3068・#3069。それまではテストだけが呼ぶ
+    pub(crate) fn change_log_identity(&self) -> Option<([u8; change_log::DB_ID_LEN], u64)> {
+        self.change_log.as_ref().map(|s| (s.db_id, s.timeline))
     }
 
     /// commit 記録（永続ストレージのみ）。`ensure_writer_with` の `40001` 判定（#2405）が照会する。
@@ -3449,6 +3538,7 @@ mod tests {
                 function_generations: Default::default(),
                 write_lock_wait: DEFAULT_WRITE_LOCK_WAIT,
                 commit_log: None,
+                change_log: None,
                 snapshot_export_busy: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(feature = "test-sync-points")]
                 sync_hook: std::sync::Mutex::new(None),
@@ -3519,6 +3609,7 @@ mod tests {
                 function_generations: Default::default(),
                 write_lock_wait: DEFAULT_WRITE_LOCK_WAIT,
                 commit_log: None,
+                change_log: None,
                 snapshot_export_busy: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(feature = "test-sync-points")]
                 sync_hook: std::sync::Mutex::new(None),
@@ -3585,6 +3676,7 @@ mod tests {
                 function_generations: Default::default(),
                 write_lock_wait: DEFAULT_WRITE_LOCK_WAIT,
                 commit_log: None,
+                change_log: None,
                 snapshot_export_busy: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(feature = "test-sync-points")]
                 sync_hook: std::sync::Mutex::new(None),
@@ -3631,6 +3723,7 @@ mod tests {
                 function_generations: Default::default(),
                 write_lock_wait: DEFAULT_WRITE_LOCK_WAIT,
                 commit_log: None,
+                change_log: None,
                 snapshot_export_busy: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(feature = "test-sync-points")]
                 sync_hook: std::sync::Mutex::new(None),
