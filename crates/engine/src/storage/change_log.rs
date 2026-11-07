@@ -26,7 +26,8 @@
 //! 有効化の入口は公開の `Storage::enable_change_log`（wire-server の `--change-log` が呼ぶ。Issue #3069）。
 //! 一度有効にした DB は、有効にしない起動からの書き込みを `54000` で拒否し、再有効化では記録の連続性
 //! （最後のレコードの LSN か初回有効化時の世代が現在の世代と一致すること）を検査する（D8・D11）。
-//! 未使用項目の警告は、後続（アーカイブ・復元）が使う項目があるため抑止している。
+//! アーカイブと保持（外部セグメントへの書き出し・水位・刈り込み・検証）は [`archive`]（Issue #2167。D6）。
+//! 未使用項目の警告は、後続（復元）が使う項目があるため抑止している。
 //!
 //! # オラクル試験（D1 の層 3）
 //!
@@ -35,7 +36,7 @@
 //!
 //! # 記録範囲の例外
 //!
-//! [`CHANGE_LOG_TABLE_NAME`] 自身と [`CHANGE_LOG_META_TABLE_NAME`]（DB 識別子・timeline・後続の
+//! [`CHANGE_LOG_TABLE_NAME`] 自身と [`CHANGE_LOG_META_TABLE_NAME`]（DB 識別子・timeline・有効化時の世代・
 //! アーカイブ水位）は記録対象外で、SQL・カタログから名前解決されない（利用者の表は redb 上では
 //! `user_rows/{表名}` 等の接頭辞つきの名前になるため衝突しない。構造テストで固定する）。
 //!
@@ -58,6 +59,7 @@ use redb::{
     Key, MutInPlaceValue, ReadableTable, ReadableTableMetadata, TableDefinition, TableHandle, Value,
 };
 
+pub(crate) mod archive;
 #[cfg(any(test, feature = "change-log-oracle"))]
 pub(crate) mod oracle;
 #[cfg(test)]
@@ -68,7 +70,7 @@ use super::{Result, StorageError, GENERATION_KEY, GENERATION_TABLE};
 
 /// 変更ログの本体表の redb 名。キーは LSN（`storage_generation` の値）、値は [`encode_record`] の出力。
 pub(crate) const CHANGE_LOG_TABLE_NAME: &str = "change_log";
-/// DB 識別子・timeline（後続でアーカイブ水位）を持つ表の redb 名。
+/// DB 識別子・timeline・有効化時の世代・アーカイブ水位（`archive`）を持つ表の redb 名。
 pub(crate) const CHANGE_LOG_META_TABLE_NAME: &str = "change_log_meta";
 
 const CHANGE_LOG_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new(CHANGE_LOG_TABLE_NAME);
@@ -78,6 +80,11 @@ const META_KEY_TIMELINE: &str = "timeline";
 /// 変更ログを初めて有効にした時点の `storage_generation`。これ以前の変更は記録されない（D8）。
 /// 再有効化時の連続性検査（最後のレコードの LSN か本値が現在の世代と一致するか）の起点になる。
 const META_KEY_BASE_GENERATION: &str = "base_generation";
+/// アーカイブ済み水位（LSN の u64 LE）。この LSN 以下のレコードは外部セグメントへ書き出し済みで、
+/// 刈り込みの対象になりうる（D6）。無ければ `base_generation` を水位とみなす（まだ何も書き出していない）。
+/// 保守 commit だけが更新する。再有効化の連続性検査（[`verify_continuity`]）は、レコードを刈り込んだ後も
+/// 最後の LSN を保てるよう、本値を参照する。
+const META_KEY_ARCHIVED_LSN: &str = "archived_lsn";
 
 /// timeline の初期値（PITR・復元のたびに分岐する番号。#2446 と整合させる決め方は後続）。
 pub(crate) const INITIAL_TIMELINE: u64 = 1;
@@ -482,6 +489,29 @@ pub(crate) fn decode_record_with(
     max_payload: usize,
     max_elements: usize,
 ) -> std::result::Result<ChangeRecord, DecodeError> {
+    let (header, payload) = split_record(bytes, max_payload)?;
+    Ok(ChangeRecord {
+        header,
+        body: decode_payload(payload, max_elements)?,
+    })
+}
+
+/// レコードのヘッダだけを検証して取り出す（本体は復号しない）。マジック・版数・ペイロード長の上限・
+/// 余りの有無・チェックサムを [`decode_record`] と同じ基準で検査する。アーカイブのセグメント検証
+/// （`archive`）が、本体を復号せずに連続性とチェックサムだけを確かめるために使う。
+pub(crate) fn peek_record(
+    bytes: &[u8],
+    max_payload: usize,
+) -> std::result::Result<RecordHeader, DecodeError> {
+    split_record(bytes, max_payload).map(|(header, _)| header)
+}
+
+/// [`decode_record_with`]・[`peek_record`] の共通部。ヘッダの復号とチェックサムの検査までを行い、
+/// ヘッダとペイロードの切り出しを返す。
+fn split_record(
+    bytes: &[u8],
+    max_payload: usize,
+) -> std::result::Result<(RecordHeader, &[u8]), DecodeError> {
     let mut r = Reader { buf: bytes };
     let head = r.take(HEADER_LEN)?;
     let sum: [u8; CHECKSUM_LEN] = r.array()?;
@@ -512,19 +542,37 @@ pub(crate) fn decode_record_with(
     if !crate::crypto::constant_time_eq(&checksum(head, payload), &sum) {
         return Err(DecodeError::ChecksumMismatch);
     }
-    Ok(ChangeRecord {
-        header,
-        body: decode_payload(payload, max_elements)?,
-    })
+    Ok((header, payload))
 }
 
 // ---------------------------------------------------------------------------
 // DB 識別子・有効状態（D5・D8）
 // ---------------------------------------------------------------------------
 
+/// アーカイブ周期の直列化用ロック。`ChangeLogState` の導出（比較・複製）に合わせ、比較は常に等しく、
+/// 複製は新しいロックを作る。
+#[derive(Debug, Default)]
+pub(crate) struct ArchiveLock(pub(crate) Mutex<()>);
+
+impl Clone for ArchiveLock {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl PartialEq for ArchiveLock {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for ArchiveLock {}
+
 /// 変更ログが有効な `Storage` が持つ不変の設定。無効な `Storage` はこれを持たない（`None`）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ChangeLogState {
+    /// アーカイブの 1 周期（計画 → 公開 → 水位更新）を直列化する（`archive`。D6）。複製は別のロックになる。
+    pub(crate) archive_lock: ArchiveLock,
     pub(crate) db_id: [u8; DB_ID_LEN],
     pub(crate) timeline: u64,
     pub(crate) limits: CaptureLimits,
@@ -585,6 +633,7 @@ pub(crate) fn load_or_init_identity(
     }
     Ok((
         ChangeLogState {
+            archive_lock: ArchiveLock::default(),
             db_id,
             timeline,
             limits,
@@ -606,20 +655,30 @@ pub(crate) fn identity_present(db: &redb::Database) -> Result<bool> {
     }
 }
 
-/// 連続性の検査。最後のレコードの LSN（レコードが無ければ初回有効化時の世代）が現在の
-/// `storage_generation` と一致しなければ、無効のまま書かれた区間（LSN の欠落）があるため拒否する。
-/// 再有効化（`Storage::enable_change_log`）の前に呼ぶ。保持・削除（#2167）が最後のレコードを
-/// 消す設計にする場合は、削除前に最後の LSN を残す必要がある（本検査の前提）。
+/// 連続性の検査。最後の LSN が現在の `storage_generation` と一致しなければ、無効のまま書かれた区間
+/// （LSN の欠落）があるため拒否する。最後の LSN は、`change_log` 表の最後のレコード、表が空なら
+/// アーカイブ済み水位（刈り込みで表が空になった場合。D6）、水位も無ければ初回有効化時の世代である。
+/// 水位は書き出し済みの最後の LSN で、刈り込みは水位以下だけを消すため、水位より後のレコードが在る
+/// 限り最後のレコードが優先される。再有効化（`Storage::enable_change_log`）の前に呼ぶ。
 pub(crate) fn verify_continuity(db: &redb::Database, current_generation: u64) -> Result<()> {
     use redb::ReadableDatabase as _;
     let broken = || StorageError::Codec("change log continuity broken".to_string());
     let read = db.begin_read()?;
-    let base = match read.open_table(META_TABLE) {
-        Ok(t) => match t.get(META_KEY_BASE_GENERATION)? {
-            Some(v) => u64::from_le_bytes(v.value().try_into().map_err(|_| broken())?),
-            // 識別子はあるが起点が無い（想定外の不整合）。fail-closed に拒否する。
-            None => return Err(broken()),
-        },
+    let (base, archived) = match read.open_table(META_TABLE) {
+        Ok(t) => {
+            let base = match t.get(META_KEY_BASE_GENERATION)? {
+                Some(v) => u64::from_le_bytes(v.value().try_into().map_err(|_| broken())?),
+                // 識別子はあるが起点が無い（想定外の不整合）。fail-closed に拒否する。
+                None => return Err(broken()),
+            };
+            let archived = match t.get(META_KEY_ARCHIVED_LSN)? {
+                Some(v) => Some(u64::from_le_bytes(
+                    v.value().try_into().map_err(|_| broken())?,
+                )),
+                None => None,
+            };
+            (base, archived)
+        }
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
         Err(e) => return Err(e.into()),
     };
@@ -628,7 +687,7 @@ pub(crate) fn verify_continuity(db: &redb::Database, current_generation: u64) ->
         Err(redb::TableError::TableDoesNotExist(_)) => None,
         Err(e) => return Err(e.into()),
     };
-    if last.unwrap_or(base) == current_generation {
+    if last.or(archived).unwrap_or(base) == current_generation {
         Ok(())
     } else {
         Err(broken())

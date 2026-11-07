@@ -141,7 +141,8 @@ cargo run -p fandhe-db-wire-server -- --users <ユーザーストアのパス> -
   [--hnsw-scope all|declared] \
   [--durability immediate|none] \
   [--require-operation-id] \
-  [--change-log] \
+  [--change-log] [--change-log-archive-dir <dir>] [--change-log-retain-records <n>] \
+  [--change-log-archive-interval-secs <1-86400>] \
   [--require-where-for-dml] \
   [--max-dml-affected-rows <1-1000000>] [--max-insert-rows <1-1000000>] \
   [--batch-max-files <1-1000000>] \
@@ -417,24 +418,46 @@ feature 付きビルド（例: `cargo build --release -p fandhe-db-wire-server -
 redb の内容は従来と変わりません）。指定すると、各 commit の変更（評価済みの値の after-image）が、データと同じ
 redb トランザクションで DB 内の `change_log` 表へ追記されます。運用上の注意:
 
-- **現時点でできるのは記録だけです。** アーカイブへの書き出し・保持・増分バックアップ・PITR は後続
-  （#2167 以降）で、それまで `change_log` 表は DB ファイルの中で増え続けます（行データを表とログに二重に
-  持つため、書き込み量の多い DB ではファイルが無効時の約 3 倍、一括 ingest のスループットが約 0.6 倍になりました。
-  実測は設計書の D11 を参照）。
+- **`--change-log` だけでは記録だけです。** アーカイブ先を指定しない限り、`change_log` 表は DB ファイルの中で
+  増え続けます（行データを表とログに二重に持つため、書き込み量の多い DB ではファイルが無効時の約 3 倍、
+  一括 ingest のスループットが約 0.6 倍になりました。実測は設計書の D11 を参照）。増分バックアップ・PITR
+  の復元は後続（#2168 以降）です。
 - **一度有効にした DB は、フラグなしでは起動できません。** 無効のまま書くとログに欠落（LSN の欠落）が
   生じるため、起動を固定文言で拒否します（`backup` サブコマンドの読み取りは影響を受けません）。いまの
   版に有効化を戻す手段はありません。`backup` で取った複製も変更ログを含むため有効扱いで、起動には
-  `--change-log` が要ります（無効化の仕様は #2167 以降で決めます）。
+  `--change-log` が要ります（無効化の手段は用意していません）。
 - 有効にしたことのない既存の DB に後からフラグを付けることはできますが、**それ以前の変更はログに
   ありません**（有効化前のベースからの PITR はできません）。
 - 有効時は 1 回の commit に載せる変更に上限があり（キー 4M 個・128 MiB、レコード 256 MiB など）、
   超えた書き込みは `54000` で拒否されます（書き込みは何も反映されません。dim 128 の行で 1 commit 約 45 万行、
   無効時に通る大きな一括書き込みは `--max-insert-rows` を下げるか分割してください）。原因の区別は stderr の固定文言の
   1 行（`engine: change log: commit refused: ...`）で行えます。
-- 重複指定・値つきは起動エラーです。
+- `--change-log` の重複指定・値つきは起動エラーです。
+
+**アーカイブと保持**（Issue #2167。RECOVER-14 ポインタ。形式と判断は設計書の D6）:
+
+- `--change-log-archive-dir <dir>`: 既存のディレクトリを指定すると、常駐スレッドが `change_log` 表のレコードを
+  チェックサム付きのセグメントファイル（`fandhe-cl-*.seg`、権限 0600）へ周期的に書き出します
+  （`--change-log-archive-interval-secs`、既定 10 秒）。既存のファイルは上書きも削除もしません。同名で内容が違う
+  ファイルがあるときは書き出しを止め、stderr に固定文言を出します（水位は進まず、DB のログは消えません）。
+  アーカイブ先は DB と別の媒体に置くことを推奨します。グループ・その他が書き込めるディレクトリ（スティッキー
+  ビットの有無に依らず）は起動時に拒否されます（umask 002 で作ったものは `chmod 755` が要ります）。
+  `--change-log` が前提です。
+- `--change-log-retain-records <n>`: アーカイブ済みのレコードのうち新しい `n` 件を DB に残して、より古いものを
+  DB から刈り込みます（`0` はアーカイブ済みのすべて）。**指定しなければ刈り込みません。** アーカイブされていない
+  レコードは決して刈り込まれません。`--change-log-archive-dir` が前提です（なければ起動エラー）。
+  刈り込みは世代を進めず、再起動後の `--change-log` の連続性検査にも影響しません。
+- セグメントファイル自体の保持（古いファイルの削除）はまだできません。削除する場合は運用者が、復元に不要と
+  確認したものだけに対して行ってください（`change-log-verify` で連鎖の欠落を確認できます）。
+- 検証: `wire-server change-log-verify --archive-dir <dir> [--db <path>]`。チェックサムの不一致、LSN の飛び、
+  別 DB／別 timeline のセグメント、途中切れを非 0（終了コード 1）で報告します。`--db`（停止中の DB）を付けると
+  先頭と末尾のセグメントの紛失も検出します（DB は読み取り専用で開き、書き込みません。書き込みを要する状態の DB は
+  拒否するので、コピーを検査してください）。引数の不備は終了コード 2 です。
+- 重複指定・不正値・前提の欠落は、DB を開く前に固定文言で起動エラーになります。
 
 変更ログを有効にした構成での結合テストの流し方（オラクル試験）は、設計書 `docs/design/change-log-pitr.md`
 の D10・D11 を参照してください。
+変更ログの有効化・アーカイブ・検証の運用手順は [`docs/design/backup-restore-operations.md`](docs/design/backup-restore-operations.md) の「5. 変更ログ」節を参照してください（Issue #2158）。
 
 `--english-stemmer`（Issue #2129・#3050）は値を取らないスイッチで、疎検索の英語トークンを語幹にそろえる
 （索引とクエリの両方。起動時固定）。engine の `english-stemmer` feature 付き（`--features engine/english-stemmer`）の
@@ -1558,6 +1581,7 @@ Issue #2156・RECOVER-13 (6)(7) ポインタ（親 #2154）。検査の中身（
 | 5 | 検査できなかった項目（未対応の表・読み取り失敗・予算超過）だけがある。整合とは報告しません。`restore` では公開していません |
 
 0〜3 の意味は `backup` と共通で、検査結果にだけ 4・5 を割り当て、`backup` の 3 と重ならないようにしています。
+取得・検査・復元の運用手順（順序・一時名の掃除・未対応の範囲）は [`docs/design/backup-restore-operations.md`](docs/design/backup-restore-operations.md) を参照してください（Issue #2158）。
 
 ## 既存データディレクトリの `id` 移行とバックアップ
 

@@ -89,6 +89,17 @@ impl ReadOnlyStorage {
         let read = self.db.begin_read().map_err(|_| IntegrityError::Backend)?;
         Ok(verify_in_txn(&read, options))
     }
+
+    /// 変更ログのアーカイブ先の連鎖を、この DB のメタ情報（DB 識別子・timeline・有効化時の世代・水位）と
+    /// 突き合わせて検証する（[`Storage::verify_change_log_archive`](super::Storage::verify_change_log_archive)
+    /// と同じ検査。RECOVER-14 のポインタ・Issue #2167）。読み取りトランザクションだけを使い、DB へ書かない。
+    pub fn verify_change_log_archive(
+        &self,
+        dir: impl AsRef<Path>,
+    ) -> Result<super::ArchiveSummary, super::ArchiveError> {
+        let read = self.db.begin_read()?;
+        super::change_log::archive::verify_against_read(&read, dir.as_ref())
+    }
 }
 
 #[cfg(test)]
