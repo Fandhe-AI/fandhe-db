@@ -748,6 +748,13 @@ impl TempFixtureDir {
             seq
         ));
         std::fs::create_dir(&dir).expect("create unique fixture dir");
+        // umask が緩い環境でも他者が書き込めない作業場にする（`dump-restore` は復元先の親が
+        // グループ・その他から書き込める場合に拒否するため。他のテストにも害はない）。
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+                .expect("restrict fixture dir");
+        }
         Self { dir }
     }
 

@@ -31,7 +31,7 @@ use crate::dump_opt::{
     DumpFormat, DumpParts, DumpScope, EXIT_FAILURE, EXIT_INVALID_DUMP, EXIT_NOT_CONSISTENT,
     EXIT_PUBLISHED_UNVERIFIED, EXIT_USAGE,
 };
-use crate::dump_tmp::{parent_of, TempFile, TmpError, WorkDir};
+use crate::dump_tmp::{check_parent_not_shared, parent_of, TempFile, TmpError, WorkDir};
 
 /// 共有分だけのダンプ（テナント固有の内容が無い）を流し込むときの実行テナント。共有の定義は
 /// どのテナントの文脈で作っても同じ（行は無い）。実在のテナント名と衝突しても害は無い。
@@ -117,6 +117,12 @@ pub fn classify(result: &Result<RestoreSummary, RestoreError>) -> (u8, String) {
             EXIT_NOT_CONSISTENT,
             "the restored database failed the integrity check; nothing was published".into(),
         ),
+        Err(RestoreError::Tmp(TmpError::InsecureParent)) => (
+            EXIT_USAGE,
+            "the parent directory of --db is writable by group or others (or owned by another \
+             user); refusing to restore there"
+                .into(),
+        ),
         Err(RestoreError::Tmp(TmpError::InvalidDestination)) => (
             EXIT_USAGE,
             "--db already exists or its parent directory is missing; refusing to overwrite".into(),
@@ -148,6 +154,8 @@ pub fn restore(
     if std::fs::symlink_metadata(dest).is_ok() {
         return Err(RestoreError::Tmp(TmpError::InvalidDestination));
     }
+    // 復元先の親にグループ・その他が書き込めるなら、何も開かず作らずに拒否する。
+    check_parent_not_shared(parent).map_err(RestoreError::Tmp)?;
     let file = File::open(from).map_err(|_| RestoreError::SourceUnreadable)?;
     let meta = file
         .metadata()
@@ -179,7 +187,8 @@ pub fn restore(
     };
     let result = apply_verify_publish(&mut reader, &header, &mut tmp, &work, dest);
     if let Err(p) = tmp.remove() {
-        *leftover = Some(p);
+        // Linux では一時名が `/proc/self/fd/<n>/...` なので、運用者が探せる実パスに直して通知する。
+        *leftover = Some(work.real_path_of(&p));
     }
     if let Err(p) = work.remove() {
         leftover.get_or_insert(p);

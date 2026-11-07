@@ -919,41 +919,57 @@ fn restore_rejects_header_frame_mismatch() {
     assert_eq!(code(&o), Some(0), "stderr: {}", stderr(&o));
 }
 
-/// 他者が書き込める親ディレクトリ（0777）でも復元でき、作業ディレクトリ・一時名は成功時も失敗時も残らない。
+/// 復元先の親にグループ・その他が書き込める（sticky bit つきを含む）と、何も作らず終了コード 2 で
+/// 拒否する。0755・0700 の親では成功し、作業ディレクトリ・一時名は成功時も失敗時も残らない。
 #[test]
-fn restore_in_world_writable_parent_leaves_no_work_dir() {
-    let fx = common::TempFixtureDir::new("dump-shared-parent");
+fn restore_requires_a_parent_not_writable_by_others() {
+    let fx = common::TempFixtureDir::new("dump-parent-perms");
     let base = dir_of(&fx.db_path_str());
-    let dir = base.join("shared");
-    std::fs::create_dir(&dir).expect("mkdir");
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).expect("chmod");
-    let good = s(&dir.join("good.sql")).to_string();
-    let bad = s(&dir.join("bad.sql")).to_string();
     let h = || header(DumpScope::Tenant("t1".into()), DumpParts::All);
-    write_dump_with(&good, h(), |w| {
+    let src = s(&base.join("good.sql")).to_string();
+    write_dump_with(&src, h(), |w| {
         w.statement(StmtKind::Table, T_SQL).expect("s");
         w.statement(StmtKind::Insert, "INSERT INTO t (id, b) VALUES (1, 'x')")
             .expect("s");
     });
-    write_dump_with(&bad, h(), |w| {
+    let bad_src = s(&base.join("bad.sql")).to_string();
+    write_dump_with(&bad_src, h(), |w| {
         w.statement(StmtKind::Table, T_SQL).expect("s");
         w.statement(StmtKind::Table, T_SQL).expect("s");
     });
-    // 失敗時
-    let dest_bad = s(&dir.join("bad.redb")).to_string();
-    let o = run(&["dump-restore", "--from", &bad, "--db", &dest_bad]);
-    assert_eq!(code(&o), Some(1), "stderr: {}", stderr(&o));
-    assert!(!Path::new(&dest_bad).exists());
-    assert_no_temp_leftovers(&dir);
-    // 成功時
-    let dest = s(&dir.join("ok.redb")).to_string();
-    let o = run(&["dump-restore", "--from", &good, "--db", &dest]);
-    assert_eq!(code(&o), Some(0), "stderr: {}", stderr(&o));
-    assert_no_temp_leftovers(&dir);
-    assert_eq!(
-        std::fs::metadata(&dest).expect("meta").permissions().mode() & 0o777,
-        0o600
-    );
+    for mode in [0o777, 0o775, 0o757, 0o1777] {
+        let dir = base.join(format!("p{mode:o}"));
+        std::fs::create_dir(&dir).expect("mkdir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).expect("chmod");
+        let dest = s(&dir.join("out.redb")).to_string();
+        let o = run(&["dump-restore", "--from", &src, "--db", &dest]);
+        assert_eq!(code(&o), Some(2), "mode {mode:o}: stderr: {}", stderr(&o));
+        assert_eq!(
+            std::fs::read_dir(&dir).expect("read").count(),
+            0,
+            "mode {mode:o}: something was created"
+        );
+    }
+    for mode in [0o755, 0o700] {
+        let dir = base.join(format!("ok{mode:o}"));
+        std::fs::create_dir(&dir).expect("mkdir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).expect("chmod");
+        // 失敗時
+        let dest_bad = s(&dir.join("bad.redb")).to_string();
+        let o = run(&["dump-restore", "--from", &bad_src, "--db", &dest_bad]);
+        assert_eq!(code(&o), Some(1), "stderr: {}", stderr(&o));
+        assert!(!Path::new(&dest_bad).exists());
+        assert_no_temp_leftovers(&dir);
+        // 成功時
+        let dest = s(&dir.join("ok.redb")).to_string();
+        let o = run(&["dump-restore", "--from", &src, "--db", &dest]);
+        assert_eq!(code(&o), Some(0), "mode {mode:o}: stderr: {}", stderr(&o));
+        assert_no_temp_leftovers(&dir);
+        assert_eq!(
+            std::fs::metadata(&dest).expect("meta").permissions().mode() & 0o777,
+            0o600
+        );
+    }
 }
 
 /// engine のバッチ上限（行数・チャンク数・合計バイト）を小さくしても、複数行の COPY を

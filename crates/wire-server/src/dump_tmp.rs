@@ -25,6 +25,9 @@ pub enum TmpError {
     UncheckedContentPublished,
     /// 公開は済み内容も完全だが、後始末（一時名の削除・親ディレクトリの fsync）を確かめられなかった。
     PublishedButNotFinalized,
+    /// 親ディレクトリにグループ・その他が書き込める（sticky bit があっても同じ）か、親の所有者が
+    /// 作業ディレクトリを作る自分と異なる。一時 DB の差し替えを防げないので使わない。
+    InsecureParent,
     /// ファイルシステムが `hard_link` を持たない。
     Unsupported,
     /// その他の I/O 失敗。
@@ -163,28 +166,58 @@ impl TempFile {
     }
 }
 
-/// 復元中の一時 DB を置く作業ディレクトリ（0700・自分が `create_new` 相当で作ったもの）。
+/// 親ディレクトリの権限と所有者が、作業ディレクトリを安全に作れる条件を満たすか（純関数）。
+/// グループ・その他の書き込み権限（sticky bit の有無によらず）があれば不可。親の所有者は、そこへ
+/// 作業ディレクトリを作る自分（作成直後のディレクトリの所有者）と同じでなければ不可
+/// （所有者は名前を差し替えられる。`geteuid` を使わず、自分が作ったものの uid と比べる）。
+fn parent_is_acceptable(parent_mode: u32, parent_uid: u32, own_uid: u32) -> bool {
+    parent_mode & 0o022 == 0 && parent_uid == own_uid
+}
+
+/// 復元先の親ディレクトリがグループ・その他から書き込めないことを、開いた fd の `fstat` で確かめる
+/// （#2167 のアーカイブ先の検査と同じ基準。所有者の照合は [`WorkDir::create`] が行う）。
+/// 作業ディレクトリを作る前に呼び、他者が親に書き込めるという競合の前提そのものを無くす。
+pub fn check_parent_not_shared(parent: &Path) -> Result<(), TmpError> {
+    let m = File::open(parent)
+        .and_then(|f| f.metadata())
+        .map_err(io_err)?;
+    if m.is_dir() && m.mode() & 0o022 == 0 {
+        Ok(())
+    } else {
+        Err(TmpError::InsecureParent)
+    }
+}
+
+/// 復元中の一時 DB を置く作業ディレクトリ（0700・自分が `mkdir` で新規に作ったもの）。
 ///
-/// 復元先の親ディレクトリに他者が書き込める場合、一時名をパスで開く間に別のファイル（既存 DB への
-/// シンボリックリンク）へ差し替えられうる。親の中に自分だけが入れる新しいディレクトリを作り、その中に
-/// 一時 DB を置けば、差し替えを受けるのは作業ディレクトリの名前だけになる。作成時に開いた fd を保持し、
-/// Linux では `/proc/self/fd/<n>` 経由でその fd のディレクトリを指す（作業ディレクトリ自体が名前の
-/// 差し替えを受けても中身へ届かない）。それ以外の unix では実パスを使い、[`WorkDir::check`] の
-/// (dev, ino) 照合で差し替えを検出する。
+/// 前提: 親ディレクトリにグループ・その他が書き込めないこと（[`check_parent_not_shared`]・作成時にも
+/// 保持 fd で再確認）。この前提のもとでは、親の名前空間を変えられるのは親の所有者（自分）だけなので、
+/// 作業ディレクトリの作成・fd の取得・一時 DB のパスでの open の間に、他者が名前を差し替える窓は
+/// 悪用できない。そのうえで多層防御として、作成直後に開いた fd と実パスの (dev, ino)・所有者・権限を
+/// 照合し（[`WorkDir::check`]）、Linux では `/proc/self/fd/<n>` 経由で fd のディレクトリを指す。
+/// `/proc/self/fd` が使えない環境や Linux 以外では実パスで開くが、親の前提があるので同様に安全である。
 pub struct WorkDir {
     dir: File,
+    parent: File,
     path: PathBuf,
     access: PathBuf,
     dev: u64,
     ino: u64,
+    uid: u32,
     armed: bool,
 }
 
 impl WorkDir {
-    /// `parent` の中に 0700 の作業ディレクトリを新規に作る（既存の名前は使わない）。
+    /// `parent` の中に 0700 の作業ディレクトリを新規に作る（既存の名前は使わない）。親が共有
+    /// （グループ・その他が書き込める）か、所有者が自分と異なれば `InsecureParent` で拒否する。
     pub fn create(parent: &Path, prefix: &str) -> Result<Self, TmpError> {
         use std::os::fd::AsRawFd;
         use std::os::unix::fs::DirBuilderExt;
+        let parent_fd = File::open(parent).map_err(io_err)?;
+        let pm = parent_fd.metadata().map_err(io_err)?;
+        if !pm.is_dir() || pm.mode() & 0o022 != 0 {
+            return Err(TmpError::InsecureParent);
+        }
         let mut attempts = 0u32;
         let path = loop {
             let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -197,42 +230,35 @@ impl WorkDir {
                 Err(e) => return Err(io_err(e)),
             }
         };
-        let mut this = {
-            let dir = match File::open(&path) {
-                Ok(d) => d,
-                Err(e) => {
-                    let _ = std::fs::remove_dir(&path);
-                    return Err(io_err(e));
-                }
-            };
-            let m = match dir.metadata() {
-                Ok(m) => m,
-                Err(e) => {
-                    let _ = std::fs::remove_dir(&path);
-                    return Err(io_err(e));
-                }
-            };
-            let proc_path = PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()));
-            let access = if cfg!(target_os = "linux") && proc_path.is_dir() {
-                proc_path
-            } else {
-                path.clone()
-            };
-            Self {
-                dir,
-                path,
-                access,
-                dev: m.dev(),
-                ino: m.ino(),
-                armed: true,
-            }
+        let fail = |path: &Path, e: TmpError| {
+            let _ = std::fs::remove_dir(path);
+            e
         };
-        // 作ったのは自分だが、umask などで想定の権限にならなかった場合や、作成直後に差し替えられた
-        // 場合は使わない。
-        if let Err(e) = this.check() {
-            let _ = this.remove();
-            return Err(e);
+        let dir = File::open(&path).map_err(|e| fail(&path, io_err(e)))?;
+        let m = dir.metadata().map_err(|e| fail(&path, io_err(e)))?;
+        // 作成直後のディレクトリの所有者が自分の uid。親の所有者が違えば拒否する。
+        if !parent_is_acceptable(pm.mode(), pm.uid(), m.uid()) {
+            return Err(fail(&path, TmpError::InsecureParent));
         }
+        let proc_path = PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()));
+        let access = if cfg!(target_os = "linux") && proc_path.is_dir() {
+            proc_path
+        } else {
+            path.clone()
+        };
+        let this = Self {
+            dir,
+            parent: parent_fd,
+            path,
+            access,
+            dev: m.dev(),
+            ino: m.ino(),
+            uid: m.uid(),
+            armed: true,
+        };
+        // 想定の実体・権限・所有者でなければ（umask の異常や作成直後の差し替え）使わない。
+        // 失敗時は `this` の drop が作業ディレクトリを消す。
+        this.check()?;
         Ok(this)
     }
 
@@ -241,22 +267,37 @@ impl WorkDir {
         &self.access
     }
 
-    /// 作業ディレクトリが、作成時に開いた fd と同じ実体・0700・通常のディレクトリのままであること
-    /// （パスがシンボリックリンクや別のディレクトリに差し替えられていないこと）を確かめる。
+    /// 作業ディレクトリが、作成時に開いた fd と同じ実体・自分の所有・0700 の通常のディレクトリの
+    /// ままで、親が共有になっていないことを確かめる（パスがリンクや別のディレクトリに差し替えられて
+    /// いないこと）。
     pub fn check(&self) -> Result<(), TmpError> {
         let fd = self.dir.metadata().map_err(io_err)?;
         let by_path = std::fs::symlink_metadata(&self.path).map_err(|_| TmpError::Replaced)?;
+        let parent = self.parent.metadata().map_err(io_err)?;
+        if parent.mode() & 0o022 != 0 {
+            return Err(TmpError::InsecureParent);
+        }
         let same = by_path.is_dir()
             && by_path.dev() == self.dev
             && by_path.ino() == self.ino
+            && by_path.uid() == self.uid
             && fd.is_dir()
             && fd.dev() == self.dev
-            && fd.ino() == self.ino;
-        // 実体のパスが差し替えられていなくても、権限が 0700 でなければ使わない。
+            && fd.ino() == self.ino
+            && fd.uid() == self.uid;
         if same && fd.mode() & 0o777 == 0o700 {
             Ok(())
         } else {
             Err(TmpError::Replaced)
+        }
+    }
+
+    /// 作業ディレクトリ内のパス `p`（[`Self::access_path`] 配下。Linux では `/proc/self/fd/<n>/...`）を、
+    /// 運用者が残骸を探せる実パス（親 + 作業ディレクトリ名 + ファイル名）へ直す。
+    pub fn real_path_of(&self, p: &Path) -> PathBuf {
+        match p.file_name() {
+            Some(name) => self.path.join(name),
+            None => self.path.clone(),
         }
     }
 
@@ -291,6 +332,10 @@ mod tests {
             TMP_SEQ.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir(&p).expect("create parent");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        }
         p
     }
 
@@ -308,6 +353,57 @@ mod tests {
         assert!(t.remove().is_ok());
         assert!(w.remove().is_ok());
         assert_eq!(std::fs::read_dir(&parent).expect("read").count(), 0);
+        std::fs::remove_dir(&parent).expect("cleanup");
+    }
+
+    #[test]
+    fn parent_acceptance_rules() {
+        assert!(parent_is_acceptable(0o755, 1000, 1000));
+        assert!(parent_is_acceptable(0o700, 1000, 1000));
+        assert!(!parent_is_acceptable(0o775, 1000, 1000));
+        assert!(!parent_is_acceptable(0o777, 1000, 1000));
+        assert!(!parent_is_acceptable(0o1777, 1000, 1000));
+        assert!(!parent_is_acceptable(0o757, 1000, 1000));
+        // 所有者が異なる親（root 所有など）は、書き込めても拒否する。
+        assert!(!parent_is_acceptable(0o755, 0, 1000));
+    }
+
+    #[test]
+    fn rejects_shared_parents() {
+        use std::os::unix::fs::PermissionsExt;
+        for mode in [0o777, 0o775, 0o757, 0o1777] {
+            let parent = unique_parent("shared");
+            std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(mode))
+                .expect("chmod");
+            assert_eq!(
+                check_parent_not_shared(&parent),
+                Err(TmpError::InsecureParent)
+            );
+            assert!(matches!(
+                WorkDir::create(&parent, "t"),
+                Err(TmpError::InsecureParent)
+            ));
+            assert_eq!(std::fs::read_dir(&parent).expect("read").count(), 0);
+            std::fs::remove_dir(&parent).expect("cleanup");
+        }
+        let parent = unique_parent("ok");
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        assert!(check_parent_not_shared(&parent).is_ok());
+        assert!(WorkDir::create(&parent, "t").is_ok());
+        std::fs::remove_dir(&parent).expect("cleanup");
+    }
+
+    #[test]
+    fn real_path_report_never_uses_proc() {
+        let parent = unique_parent("real");
+        let w = WorkDir::create(&parent, "t").expect("create");
+        let t = TempFile::create(w.access_path(), "f").expect("tmp");
+        let shown = w.real_path_of(&t.path);
+        assert!(!shown.to_string_lossy().contains("/proc/self/fd"));
+        assert_eq!(shown.parent(), Some(w.path.as_path()));
+        assert_eq!(shown.file_name(), t.path.file_name());
+        drop(t);
+        drop(w);
         std::fs::remove_dir(&parent).expect("cleanup");
     }
 
