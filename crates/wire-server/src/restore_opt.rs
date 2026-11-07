@@ -164,15 +164,27 @@ pub fn classify(result: &Result<RestoreSummary, RestoreError>) -> (u8, String) {
 }
 
 /// バックアップ `from` を新しい DB `dest` へ復元する（モジュール doc の公開手順）。
+/// 公開しなかった経路で一時コピーを消せなかったときは、残ったパスを `leftover` に入れる
+/// （全テナントのデータのコピーが残るため、呼び出し元が通知する）。
 #[cfg(not(unix))]
-pub fn restore(_from: &Path, _dest: &Path) -> Result<RestoreSummary, RestoreError> {
+pub fn restore(
+    _from: &Path,
+    _dest: &Path,
+    _leftover: &mut Option<PathBuf>,
+) -> Result<RestoreSummary, RestoreError> {
     Err(RestoreError::Unsupported)
 }
 
 /// バックアップ `from` を新しい DB `dest` へ復元する（モジュール doc の公開手順）。
+/// 公開しなかった経路で一時コピーを消せなかったときは、残ったパスを `leftover` に入れる
+/// （全テナントのデータのコピーが残るため、呼び出し元が通知する）。
 #[cfg(unix)]
-pub fn restore(from: &Path, dest: &Path) -> Result<RestoreSummary, RestoreError> {
-    unix_impl::restore(from, dest)
+pub fn restore(
+    from: &Path,
+    dest: &Path,
+    leftover: &mut Option<PathBuf>,
+) -> Result<RestoreSummary, RestoreError> {
+    unix_impl::restore(from, dest, leftover)
 }
 
 /// 停止中の DB `db` を**開かずに**整合検査する（`verify` の本体。Issue #2156）。`db` を読み取りで開いて
@@ -180,12 +192,14 @@ pub fn restore(from: &Path, dest: &Path) -> Result<RestoreSummary, RestoreError>
 /// 稼働中なら [`RestoreError::SourceInUse`]）、ロックを保持したまま同じディレクトリの 0600 の
 /// 一時名へコピーし、コピーを開いて `verify_integrity` を実行して一時名を消す。元ファイルへは
 /// 書き込まない（open 時の移行・ヘッダ更新はコピーにだけ入る）。DB と同程度の空き容量が要る。
+/// 一時名を消せなかったときは、残ったパスを `leftover` に入れる（検査結果とは別に呼び出し元が通知する）。
 #[cfg(unix)]
 pub fn verify_via_copy(
     db: &Path,
     options: &engine::storage::IntegrityOptions,
+    leftover: &mut Option<PathBuf>,
 ) -> Result<IntegrityReport, RestoreError> {
-    unix_impl::verify_via_copy(db, options)
+    unix_impl::verify_via_copy(db, options, leftover)
 }
 
 /// [`verify_via_copy`] の非 unix スタブ。
@@ -193,6 +207,7 @@ pub fn verify_via_copy(
 pub fn verify_via_copy(
     _db: &Path,
     _options: &engine::storage::IntegrityOptions,
+    _leftover: &mut Option<PathBuf>,
 ) -> Result<IntegrityReport, RestoreError> {
     Err(RestoreError::Unsupported)
 }
@@ -264,6 +279,20 @@ mod unix_impl {
                     }
                     Err(e) => return Err(io_err(e)),
                 }
+            }
+        }
+
+        /// 一時名を明示的に消す。消せなければ残ったパスを返す（`Drop` は失敗を無視するため、
+        /// 正常な経路ではこちらで確かめて呼び出し元に通知する。既に無い場合は成功扱い）。
+        pub(super) fn remove(&mut self) -> Result<(), PathBuf> {
+            if !self.armed {
+                return Ok(());
+            }
+            self.armed = false;
+            match std::fs::remove_file(&self.path) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+                Err(_) => Err(self.path.clone()),
             }
         }
 
@@ -351,18 +380,27 @@ mod unix_impl {
     pub(super) fn verify_via_copy(
         db: &Path,
         options: &IntegrityOptions,
+        leftover: &mut Option<PathBuf>,
     ) -> Result<IntegrityReport, RestoreError> {
         let parent = parent_of(db)?;
         // 排他ロックを検査の間保持する（redb と同じ flock。取れなければ稼働中）。
         let (mut src, src_len) = open_locked_source(db, true)?;
         let mut tmp = TempCopy::create(parent, "fandhe-verify")?;
-        copy_into(&mut src, src_len, &mut tmp)?;
-        let report = open_and_verify(&tmp, src_len, options)?;
+        let result = copy_into(&mut src, src_len, &mut tmp)
+            .and_then(|()| open_and_verify(&tmp, src_len, options));
         drop(src);
-        Ok(report)
+        // 成功・失敗のどちらでも一時コピーを明示的に消し、消せなければ通知できるようにする。
+        if let Err(p) = tmp.remove() {
+            *leftover = Some(p);
+        }
+        result
     }
 
-    pub(super) fn restore(from: &Path, dest: &Path) -> Result<RestoreSummary, RestoreError> {
+    pub(super) fn restore(
+        from: &Path,
+        dest: &Path,
+        leftover: &mut Option<PathBuf>,
+    ) -> Result<RestoreSummary, RestoreError> {
         let parent = parent_of(dest)?;
         // 早期失敗のための確認。最終判定は後段の hard_link（確認後の競合を残さない）。
         if std::fs::symlink_metadata(dest).is_ok() {
@@ -375,11 +413,30 @@ mod unix_impl {
 
         // 2. 一時ファイルへ 0600 の排他作成でコピーする。fd は公開まで保持する。
         let mut tmp = TempCopy::create(parent, "fandhe-restore")?;
-        copy_into(&mut src, src_len, &mut tmp)?;
+        let result = restore_from_copy(&mut src, src_len, &mut tmp, dest, parent);
         drop(src);
+        // 公開しなかった経路（公開済みなら armed は false）では、一時コピーを明示的に消し、
+        // 消せなければ通知できるようにする。
+        if tmp.armed {
+            if let Err(p) = tmp.remove() {
+                *leftover = Some(p);
+            }
+        }
+        result
+    }
+
+    /// 一時コピーへのコピー・検査・公開（`restore` の本体。失敗時の一時名の後始末は呼び出し元）。
+    fn restore_from_copy(
+        src: &mut File,
+        src_len: u64,
+        tmp: &mut TempCopy,
+        dest: &Path,
+        parent: &Path,
+    ) -> Result<RestoreSummary, RestoreError> {
+        copy_into(src, src_len, tmp)?;
 
         // 3. コピーを開いて検査する（パスの同一性を前後で確認）。
-        let report = open_and_verify(&tmp, src_len, &IntegrityOptions::default())?;
+        let report = open_and_verify(tmp, src_len, &IntegrityOptions::default())?;
         if !report.is_consistent() {
             return Err(RestoreError::NotConsistent(report));
         }
@@ -483,6 +540,38 @@ mod tests {
         assert!(is_replaced(t.check_path(None)));
         std::fs::remove_file(&path).expect("unlink link");
         t.armed = false;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 一時名を消せないとき `remove` は残ったパスを返す（`Drop` は失敗を無視するため、呼び出し元が
+    /// 通知できる）。権限の剥奪は root では効かないため、パスを空でないディレクトリに差し替えて
+    /// `remove_file` を（権限に依らず）失敗させる。既に無い場合・解除済みの場合は成功。
+    #[cfg(unix)]
+    #[test]
+    fn temp_copy_remove_reports_leftover_path_on_failure() {
+        let dir = std::env::temp_dir().join(format!("restore-opt-remove-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        // 通常の削除は成功し、二重の削除も成功扱い
+        let mut t = unix_impl::TempCopy::create(&dir, "fandhe-test").expect("create");
+        let path = t.path.clone();
+        assert!(t.remove().is_ok());
+        assert!(!path.exists());
+        assert!(t.remove().is_ok());
+
+        // 既に消えている場合は成功
+        let mut t = unix_impl::TempCopy::create(&dir, "fandhe-test").expect("create");
+        std::fs::remove_file(&t.path).expect("unlink");
+        assert!(t.remove().is_ok());
+
+        // 消せない場合は残ったパスを返す
+        let mut t = unix_impl::TempCopy::create(&dir, "fandhe-test").expect("create");
+        let path = t.path.clone();
+        std::fs::remove_file(&path).expect("unlink");
+        std::fs::create_dir(&path).expect("dir in place of file");
+        std::fs::write(path.join("child"), b"x").expect("child");
+        assert_eq!(t.remove(), Err(path.clone()));
+        assert!(path.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

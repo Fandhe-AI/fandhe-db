@@ -390,7 +390,7 @@ fn restore_function_refuses_zero_length_source() {
     let src = dir.join("empty-src.redb");
     std::fs::write(&src, b"").expect("write empty");
     let dest = dir.join("restored.redb");
-    let r = restore(&src, &dest);
+    let r = restore(&src, &dest, &mut None);
     assert!(matches!(r, Err(RestoreError::InvalidSource)), "{r:?}");
     assert!(!dest.exists());
     assert!(leftovers(&dir).is_empty(), "{:?}", leftovers(&dir));
