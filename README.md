@@ -143,6 +143,9 @@ cargo run -p fandhe-db-wire-server -- --users <ユーザーストアのパス> -
   [--require-operation-id] \
   [--change-log] [--change-log-archive-dir <dir>] [--change-log-retain-records <n>] \
   [--change-log-archive-interval-secs <1-86400>] \
+  [--replication-bind <loopback addr>] [--replication-roles <file>] [--replication-allow <ip|cidr>]... \
+  [--replication-max-connections <1-256>] [--replication-max-unacked-bytes <1024-4294967296>] \
+  [--replication-ack-timeout-secs <1-3600>] \
   [--require-where-for-dml] \
   [--max-dml-affected-rows <1-1000000>] [--max-insert-rows <1-1000000>] \
   [--batch-max-files <1-1000000>] \
@@ -468,6 +471,20 @@ redb トランザクションで DB 内の `change_log` 表へ追記されます
   同じ信頼境界)。復元した DB は元と同じ DB 識別子・timeline を持つため、別系統の増分を誤って適用しても検出
   できません(#2446 の timeline が前提)。
   稼働中のサーバーからの取得と、指定 LSN／時刻までの復元（PITR）は未対応です。
+
+**レプリケーション送信側**（Issue #2173。RECOVER-15・WIRE-9 ポインタ。判断は [docs/design/replication-streaming.md](docs/design/replication-streaming.md) の「実装判断（Issue #2173）」）:
+
+- `--replication-bind <addr>` で、テナント向けの `--bind` とは別のポートに専用のリスナーを作り、承認済みのレプリカへ変更ログの
+  レコードを commit 番号順に送ります（非同期。レプリカの切断・遅延・停止はプライマリの書き込みを止めません）。**ループバック
+  だけ**を受け付け、非ループバックは起動エラーです（TLS は #2177。それまで平文を外へ晒しません）。`--change-log` が前提です。
+- 認証は専用のロール（`--replication-roles <file>`。`name:phc` の行。PHC は `wire-server hash-password` で作る）で行い、
+  `--users` のテナントのロールでは接続できません。送信元は `--replication-allow <ip|cidr>`（繰り返し可・1 件以上が必須）で
+  許可したものだけで、許可外には何も返さず閉じます。
+- 受信側の確認応答（ack）で送信位置を管理し、確認応答前の区間は `--change-log-retain-records` による刈り込みから守ります。
+  刈り込み済みの位置からの開始は拒否します（再同期は #2176）。
+- 上限: `--replication-max-connections`（既定 8）、`--replication-max-unacked-bytes`（既定 64 MiB。送信済みで未確認の量）、
+  `--replication-ack-timeout-secs`（既定 30。上限に達したまま ack が進まないレプリカだけを切る）。不正値は DB を開く前に起動エラーです。
+- 受信側の適用ループ（#2174）・読み取りレプリカ（#2175）・同期モード（#2245）は未対応です。
 
 **論理ダンプ**（Issue #2162。RECOVER-16 ポインタ。形式と判断は [docs/design/logical-dump.md](docs/design/logical-dump.md) の §12、手順は [backup-restore-operations.md](docs/design/backup-restore-operations.md) の 4.5）:
 
