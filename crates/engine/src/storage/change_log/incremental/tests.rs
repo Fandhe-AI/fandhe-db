@@ -532,6 +532,62 @@ fn apply_rejects_records_that_cannot_be_applied() {
             STORAGE_FORMAT_VERSION,
             "BadRecord",
         ),
+        // キー・値のバイト列が shape の型に合わない(panic させない)。shape 11 は (u64, u64)、shape 0 は (&str, u64)。
+        (
+            "bad-fixed-key",
+            RecordBody {
+                created: vec![("fresh".to_string(), 11)],
+                tables: vec![change("fresh", 11)],
+                ..RecordBody::default()
+            },
+            STORAGE_FORMAT_VERSION,
+            "BadRecord",
+        ),
+        (
+            "bad-utf8-key",
+            RecordBody {
+                created: vec![("fresh".to_string(), 0)],
+                tables: vec![TableChange {
+                    name: "fresh".to_string(),
+                    shape: 0,
+                    upserts: vec![(vec![0xff], 1u64.to_le_bytes().to_vec())],
+                    removes: Vec::new(),
+                }],
+                ..RecordBody::default()
+            },
+            STORAGE_FORMAT_VERSION,
+            "BadRecord",
+        ),
+        (
+            "bad-value",
+            RecordBody {
+                created: vec![("fresh".to_string(), 0)],
+                tables: vec![TableChange {
+                    name: "fresh".to_string(),
+                    shape: 0,
+                    upserts: vec![(b"k".to_vec(), vec![1, 2, 3])],
+                    removes: Vec::new(),
+                }],
+                ..RecordBody::default()
+            },
+            STORAGE_FORMAT_VERSION,
+            "BadRecord",
+        ),
+        (
+            "bad-remove-key",
+            RecordBody {
+                created: vec![("fresh".to_string(), 3)],
+                tables: vec![TableChange {
+                    name: "fresh".to_string(),
+                    shape: 3,
+                    upserts: Vec::new(),
+                    removes: vec![vec![0xff]],
+                }],
+                ..RecordBody::default()
+            },
+            STORAGE_FORMAT_VERSION,
+            "BadRecord",
+        ),
         // 世代の表を含まないレコード（末尾に世代が届かない）。
         (
             "no-generation",

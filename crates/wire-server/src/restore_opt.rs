@@ -131,7 +131,8 @@ pub enum RestoreError {
     UncheckedContentPublished,
     /// 最終名への公開は済み中身は完全だが、後始末（一時名の削除・親ディレクトリの fsync）を確かめられなかった。
     PublishedButNotFinalized,
-    /// 増分バックアップを適用できなかった（連鎖の切断・順序違反・別 DB・別 timeline・改ざん・形式不正。
+    /// 増分バックアップを適用できなかった（連鎖の切断・順序違反・別 DB・別 timeline・破損・形式不正。
+    /// チェックサムは破損・不整合の検出であり認証ではない(増分はベースと同じ信頼境界で受け渡す)。
     /// Issue #2168・RECOVER-14 のポインタ）。何も公開しない。
     Chain(engine::storage::IncrementalError),
     /// その他の入出力の失敗。
@@ -263,7 +264,8 @@ pub fn restore(
 /// ベース `from` へ増分バックアップ `incrementals`（古い順）を適用した状態を、新しい DB `dest` へ復元する
 /// （Issue #2168・RECOVER-13・RECOVER-14 のポインタ）。公開手順は [`restore`] と同じで、コピーの検査の前に
 /// engine の `apply_incremental_segments` を一時コピーへ適用する。連鎖が切れている・順序違反・別 DB／別
-/// timeline・改ざんは [`RestoreError::Chain`] で、何も公開しない。ベースと増分のファイルは変更しない。
+/// timeline・破損・形式不正は [`RestoreError::Chain`] で、何も公開しない。
+/// 細工してチェックサムを計算し直した増分は検証を通る(認証ではない)。ベースと増分のファイルは変更しない。
 /// `incrementals` が空なら [`restore`] と同じ。
 #[cfg(unix)]
 pub fn restore_with_incrementals(
@@ -588,7 +590,7 @@ mod unix_impl {
     ) -> Result<RestoreSummary, RestoreError> {
         copy_into(src, src_len, tmp)?;
 
-        // 2b. 増分バックアップを一時コピーへ適用する（元のバックアップには触れない。連鎖の検証・改ざんの
+        // 2b. 増分バックアップを一時コピーへ適用する（元のバックアップには触れない。連鎖の検証・破損の
         //     拒否は engine。失敗すれば公開せずに一時コピーを消す）。適用で DB ファイルは伸びるため、
         //     以降の長さの確認は適用後の長さを基準にする。
         let mut verified_len = src_len;
