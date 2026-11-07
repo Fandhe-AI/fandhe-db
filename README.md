@@ -457,6 +457,7 @@ redb トランザクションで DB 内の `change_log` 表へ追記されます
 
 変更ログを有効にした構成での結合テストの流し方（オラクル試験）は、設計書 `docs/design/change-log-pitr.md`
 の D10・D11 を参照してください。
+変更ログの有効化・アーカイブ・検証の運用手順は [`docs/design/backup-restore-operations.md`](docs/design/backup-restore-operations.md) の「5. 変更ログ」節を参照してください（Issue #2158）。
 
 `--english-stemmer`（Issue #2129・#3050）は値を取らないスイッチで、疎検索の英語トークンを語幹にそろえる
 （索引とクエリの両方。起動時固定）。engine の `english-stemmer` feature 付き（`--features engine/english-stemmer`）の
@@ -1580,6 +1581,7 @@ Issue #2156・RECOVER-13 (6)(7) ポインタ（親 #2154）。検査の中身（
 | 5 | 検査できなかった項目（未対応の表・読み取り失敗・予算超過）だけがある。整合とは報告しません。`restore` では公開していません |
 
 0〜3 の意味は `backup` と共通で、検査結果にだけ 4・5 を割り当て、`backup` の 3 と重ならないようにしています。
+取得・検査・復元の運用手順（順序・一時名の掃除・未対応の範囲）は [`docs/design/backup-restore-operations.md`](docs/design/backup-restore-operations.md) を参照してください（Issue #2158）。
 
 ## 既存データディレクトリの `id` 移行とバックアップ
 
