@@ -925,12 +925,15 @@ fn recover15_lag_limit_applies_while_the_send_window_is_full() {
     );
 }
 
+/// 不正な ack を送る操作（受け取った最後の LSN を渡す）。
+type BadAck = Box<dyn Fn(&mut Replica, u64)>;
+
 /// 不正な Ack（後退・送信済みの超過・型違い・長さ違反）は、固定コード `BAD_REQUEST` を返してから切断される。
 #[test]
 fn recover15_invalid_acks_get_bad_request_before_the_close() {
     let p = Primary::start("repl-bad-ack", &[], false);
     let mut alice = p.setup_table();
-    let cases: [(&str, Box<dyn Fn(&mut Replica, u64)>); 4] = [
+    let cases: [(&str, BadAck); 4] = [
         (
             "regressing ack",
             Box::new(|r, lsn| {
