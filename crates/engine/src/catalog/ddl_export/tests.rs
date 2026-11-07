@@ -116,6 +116,7 @@ fn storage_tables_are_classified_and_unknown_ones_fail_closed() {
         "key_index_rev/t/i",
         "matview_rows/m",
         "op_ledger",
+        "restore_generation",
     ] {
         assert!(classify_redb_table(known).is_some(), "{known}");
     }
