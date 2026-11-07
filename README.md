@@ -469,7 +469,7 @@ redb トランザクションで DB 内の `change_log` 表へ追記されます
   できません(#2446 の timeline が前提)。
   稼働中のサーバーからの取得と、指定 LSN／時刻までの復元（PITR）は未対応です。
 
-**論理ダンプ**（Issue #2162。RECOVER-16 ポインタ。形式と判断は [docs/design/logical-dump.md](docs/design/logical-dump.md) の §12、手順は [backup-restore-operations.md](docs/design/backup-restore-operations.md) の 4.5）:
+**論理ダンプ**（Issue #2162。RECOVER-16 ポインタ。形式と判断は [docs/design/logical-dump.md](docs/design/logical-dump.md) の §12、手順は [backup-restore-operations.md](docs/design/backup-restore-operations.md) の 4.6）:
 
 - `wire-server dump --db <停止中の DB> --out <新規ファイル> (--tenant <id> | --shared-only) [--schema-only | --data-only] [--format copy|insert]`:
   スキーマとデータを SQL スクリプト形式（版つきヘッダ・長さ付きの枠）で書き出します。`--tenant` は共有の定義に指定テナントの

@@ -46,15 +46,64 @@ pub struct RestoreArgs {
     /// ベースの後ろへ適用する増分バックアップ（`--incremental` の指定順。古い順。既存の通常ファイル。
     /// 変更しない）。空ならベースだけを復元する。
     pub incrementals: Vec<PathBuf>,
+    /// 指定点までの復元（`--until-lsn`／`--until-time`。Issue #2169・RECOVER-14 のポインタ）。`None` なら
+    /// ベース（と増分）の終点まで復元する。
+    pub pitr: Option<PitrSpec>,
+}
+
+/// 指定点までの復元の指定（変更ログのアーカイブと目標）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PitrSpec {
+    /// 変更ログのアーカイブのディレクトリ（`--change-log-archive-dir`。既存のディレクトリ。変更しない）。
+    /// 省略時は増分バックアップだけを入力にする。
+    pub archive_dir: Option<PathBuf>,
+    /// 停止点の目標。
+    pub target: engine::storage::PitrTarget,
+}
+
+/// `--until-time` の値を UTC のマイクロ秒にする。RFC 3339 の `YYYY-MM-DDTHH:MM:SS[.f]` に、ゾーン
+/// （`Z` または `±hh:mm`）を必須で付けた形だけを受理する。ゾーン省略・IANA 名・空白区切りは拒否する
+/// （時刻を推測しない）。解析は engine の `TIMESTAMPTZ` リテラル解析を使う。
+pub fn parse_until_time(raw: &str) -> Result<i64, String> {
+    const MSG: &str = "--until-time must be an RFC 3339 timestamp with a time zone \
+                       (for example 2030-01-02T03:04:05Z)";
+    let bytes = raw.as_bytes();
+    let has_zone = raw.is_ascii()
+        && (matches!(bytes.last(), Some(b'Z' | b'z'))
+            || (bytes.len() >= 6
+                && matches!(bytes.get(bytes.len() - 6), Some(b'+' | b'-'))
+                && bytes.get(bytes.len() - 3) == Some(&b':')));
+    // 空白はどこにも許さない（ゾーンの前の空白を解析器が受理するため、ここで拒否する）。
+    if !has_zone || bytes.get(10) != Some(&b'T') || raw.contains(' ') {
+        return Err(MSG.into());
+    }
+    engine::datetime::parse_timestamptz(raw, &engine::datetime::SessionTimeZone::utc())
+        .map_err(|_| MSG.to_string())
+}
+
+/// `--until-lsn` の値（1 以上の 10 進整数。符号・空白・0 を拒否する）。
+fn parse_until_lsn(raw: &str) -> Result<u64, String> {
+    const MSG: &str = "--until-lsn must be a positive integer";
+    if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(MSG.into());
+    }
+    match raw.parse::<u64>() {
+        Ok(n) if n > 0 => Ok(n),
+        _ => Err(MSG.into()),
+    }
 }
 
 /// `restore` サブコマンドの引数（サブコマンド名より後ろ）を解釈する。未知の引数・値欠落・重複・
 /// 必須欠落・復元元と復元先の衝突は拒否する（エラー文は英語で、パスの内容は含めない）。
 pub fn parse(args: &[String]) -> Result<RestoreArgs, String> {
-    const USAGE: &str =
-        "unknown argument (usage: restore --from <path> --db <path> [--incremental <path>]...)";
+    const USAGE: &str = "unknown argument (usage: restore --from <path> --db <path> \
+                         [--incremental <path>]... [--change-log-archive-dir <dir>] \
+                         [--until-lsn <n> | --until-time <rfc3339>])";
     let mut from: Option<&str> = None;
     let mut db: Option<&str> = None;
+    let mut archive_dir: Option<&str> = None;
+    let mut until_lsn: Option<&str> = None;
+    let mut until_time: Option<&str> = None;
     let mut incrementals: Vec<&str> = Vec::new();
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -69,6 +118,9 @@ pub fn parse(args: &[String]) -> Result<RestoreArgs, String> {
         let slot = match arg.as_str() {
             "--from" => &mut from,
             "--db" => &mut db,
+            "--change-log-archive-dir" => &mut archive_dir,
+            "--until-lsn" => &mut until_lsn,
+            "--until-time" => &mut until_time,
             _ => return Err(USAGE.into()),
         };
         if slot.is_some() {
@@ -89,10 +141,43 @@ pub fn parse(args: &[String]) -> Result<RestoreArgs, String> {
         .into_iter()
         .map(|p| validate_existing_file("--incremental", p))
         .collect::<Result<Vec<_>, _>>()?;
+    // 指定点までの復元。組み合わせの不正は DB を開く前に拒否する。
+    let pitr = match (until_lsn, until_time) {
+        (Some(_), Some(_)) => {
+            return Err("--until-lsn and --until-time cannot be combined".into());
+        }
+        (None, None) => {
+            if archive_dir.is_some() {
+                return Err("--change-log-archive-dir requires --until-lsn or --until-time".into());
+            }
+            None
+        }
+        (lsn, time) => {
+            if archive_dir.is_none() && incrementals.is_empty() {
+                return Err(
+                    "--until-lsn and --until-time require --change-log-archive-dir or --incremental"
+                        .into(),
+                );
+            }
+            let target = match (lsn, time) {
+                (Some(n), _) => engine::storage::PitrTarget::Lsn(parse_until_lsn(n)?),
+                (_, Some(t)) => engine::storage::PitrTarget::TimeMicros(parse_until_time(t)?),
+                (None, None) => return Err(USAGE.into()),
+            };
+            let archive_dir = archive_dir
+                .map(|d| crate::change_log_opt::accept_archive_dir(false, d))
+                .transpose()?;
+            Some(PitrSpec {
+                archive_dir,
+                target,
+            })
+        }
+    };
     Ok(RestoreArgs {
         from,
         db,
         incrementals,
+        pitr,
     })
 }
 
@@ -249,6 +334,18 @@ pub fn restore_with_incrementals(
     Err(RestoreError::Unsupported)
 }
 
+/// [`restore_with_incrementals`] の指定点つき版（非 unix では常に `Unsupported`）。
+#[cfg(not(unix))]
+pub fn restore_with_pitr(
+    _from: &Path,
+    _dest: &Path,
+    _incrementals: &[PathBuf],
+    _pitr: Option<&PitrSpec>,
+    _leftover: &mut Option<PathBuf>,
+) -> Result<RestoreSummary, RestoreError> {
+    Err(RestoreError::Unsupported)
+}
+
 /// バックアップ `from` を新しい DB `dest` へ復元する（モジュール doc の公開手順）。
 /// 公開しなかった経路で一時コピーを消せなかったときは、残ったパスを `leftover` に入れる
 /// （全テナントのデータのコピーが残るため、呼び出し元が通知する）。
@@ -258,7 +355,7 @@ pub fn restore(
     dest: &Path,
     leftover: &mut Option<PathBuf>,
 ) -> Result<RestoreSummary, RestoreError> {
-    unix_impl::restore(from, dest, &[], leftover)
+    unix_impl::restore(from, dest, &[], None, leftover)
 }
 
 /// ベース `from` へ増分バックアップ `incrementals`（古い順）を適用した状態を、新しい DB `dest` へ復元する
@@ -274,7 +371,24 @@ pub fn restore_with_incrementals(
     incrementals: &[PathBuf],
     leftover: &mut Option<PathBuf>,
 ) -> Result<RestoreSummary, RestoreError> {
-    unix_impl::restore(from, dest, incrementals, leftover)
+    unix_impl::restore(from, dest, incrementals, None, leftover)
+}
+
+/// ベース `from` に増分 `incrementals` と変更ログのアーカイブを、`pitr` の目標のコミット境界まで適用した状態を、
+/// 新しい DB `dest` へ復元する（Issue #2169・RECOVER-14 のポインタ）。`pitr` が `None` なら
+/// [`restore_with_incrementals`] と同じ。公開手順は [`restore`] と同じで、検査の前に engine の
+/// `restore_to_point` を一時コピーへ適用する。目標が範囲外（ベース DB の終点以前・入力したログ全体の最大 LSN より後）・
+/// 欠落・順序違反・別 DB・別 timeline・破損は [`RestoreError::Chain`] で、何も公開しない（黙って末尾まで
+/// 適用しない）。ベース・増分・アーカイブのファイルは変更しない。
+#[cfg(unix)]
+pub fn restore_with_pitr(
+    from: &Path,
+    dest: &Path,
+    incrementals: &[PathBuf],
+    pitr: Option<&PitrSpec>,
+    leftover: &mut Option<PathBuf>,
+) -> Result<RestoreSummary, RestoreError> {
+    unix_impl::restore(from, dest, incrementals, pitr, leftover)
 }
 
 /// `verify` が検査に使った経路（出力の `verify_mode=` 行の値。固定語で、パス・内容を含まない）。
@@ -366,7 +480,7 @@ mod unix_impl {
 
     use engine::storage::{IntegrityOptions, IntegrityReport, Storage};
 
-    use super::{RestoreError, RestoreSummary};
+    use super::{PitrSpec, RestoreError, RestoreSummary};
 
     static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -553,6 +667,7 @@ mod unix_impl {
         from: &Path,
         dest: &Path,
         incrementals: &[PathBuf],
+        pitr: Option<&PitrSpec>,
         leftover: &mut Option<PathBuf>,
     ) -> Result<RestoreSummary, RestoreError> {
         let parent = parent_of(dest)?;
@@ -567,7 +682,15 @@ mod unix_impl {
 
         // 2. 一時ファイルへ 0600 の排他作成でコピーする。fd は公開まで保持する。
         let mut tmp = TempCopy::create(parent, "fandhe-restore")?;
-        let result = restore_from_copy(&mut src, src_len, &mut tmp, dest, parent, incrementals);
+        let result = restore_from_copy(
+            &mut src,
+            src_len,
+            &mut tmp,
+            dest,
+            parent,
+            incrementals,
+            pitr,
+        );
         drop(src);
         // 公開しなかった経路（公開済みなら armed は false）では、一時コピーを明示的に消し、
         // 消せなければ通知できるようにする。
@@ -587,17 +710,31 @@ mod unix_impl {
         dest: &Path,
         parent: &Path,
         incrementals: &[PathBuf],
+        pitr: Option<&PitrSpec>,
     ) -> Result<RestoreSummary, RestoreError> {
         copy_into(src, src_len, tmp)?;
 
         // 2b. 増分バックアップを一時コピーへ適用する（元のバックアップには触れない。連鎖の検証・破損の
         //     拒否は engine。失敗すれば公開せずに一時コピーを消す）。適用で DB ファイルは伸びるため、
         //     以降の長さの確認は適用後の長さを基準にする。
+        //     指定点までの復元（`--until-*`）なら、同じ再生器に停止条件を渡す engine の `restore_to_point` を
+        //     使う（増分とアーカイブの選択・連鎖の検証・範囲外の拒否は engine。Issue #2169）。
         let mut verified_len = src_len;
-        if !incrementals.is_empty() {
+        if pitr.is_some() || !incrementals.is_empty() {
             tmp.check_path(Some(src_len))?;
-            engine::storage::apply_incremental_segments(&tmp.path, incrementals)
-                .map_err(RestoreError::Chain)?;
+            match pitr {
+                Some(spec) => engine::storage::restore_to_point(
+                    &tmp.path,
+                    incrementals,
+                    spec.archive_dir.as_deref(),
+                    spec.target,
+                )
+                .map(|_| ()),
+                None => {
+                    engine::storage::apply_incremental_segments(&tmp.path, incrementals).map(|_| ())
+                }
+            }
+            .map_err(RestoreError::Chain)?;
             tmp.check_path(None)?;
             verified_len = tmp.file.metadata().map_err(io_err)?.len();
         }
@@ -703,6 +840,127 @@ mod tests {
         .expect("repeatable");
         assert_eq!(ok.incrementals.len(), 2);
         assert!(parse(&v(&["--from", exe, "--from", exe, "--db", "x-not-created"])).is_err());
+    }
+
+    #[test]
+    fn until_time_requires_an_explicit_zone_and_rfc3339_shape() {
+        // 2030-01-02T03:04:05Z = 1893553445 秒（UTC）。
+        assert_eq!(
+            parse_until_time("2030-01-02T03:04:05Z"),
+            Ok(1_893_553_445_000_000)
+        );
+        assert_eq!(
+            parse_until_time("2030-01-02T03:04:05.250000Z"),
+            Ok(1_893_553_445_250_000)
+        );
+        // オフセットは UTC へ正規化される。
+        assert_eq!(
+            parse_until_time("2030-01-02T12:04:05+09:00"),
+            Ok(1_893_553_445_000_000)
+        );
+        for bad in [
+            "",
+            "2030-01-02T03:04:05",
+            "2030-01-02 03:04:05Z",
+            "2030-01-02T03:04:05 UTC",
+            "2030-01-02T03:04:05 Z",
+            "2030-01-02T03:04:05 +09:00",
+            "2030-01-02T03:04:05+09",
+            "2030-01-02T03:04:05Asia/Tokyo",
+            "2030-01-02Z",
+            "yesterday",
+            "2030-13-02T03:04:05Z",
+            "2030-01-02T03:04:05Z\u{3042}",
+        ] {
+            assert!(parse_until_time(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn pitr_flags_are_validated_before_anything_is_opened() {
+        let exe = std::env::current_exe().expect("current_exe");
+        let exe = exe.to_str().expect("utf-8 path");
+        let dir = std::env::temp_dir();
+        let dir = dir.to_str().expect("utf-8 path");
+        let base = ["--from", exe, "--db", "pitr-flag-test-not-created"];
+        let with = |extra: &[&str]| {
+            let mut a: Vec<&str> = base.to_vec();
+            a.extend_from_slice(extra);
+            parse(&v(&a))
+        };
+        // 正しい指定（アーカイブ + LSN、増分 + 時刻）。
+        let ok = with(&["--change-log-archive-dir", dir, "--until-lsn", "7"]).expect("lsn");
+        assert_eq!(
+            ok.pitr.map(|p| p.target),
+            Some(engine::storage::PitrTarget::Lsn(7))
+        );
+        let ok =
+            with(&["--incremental", exe, "--until-time", "2030-01-02T03:04:05Z"]).expect("time");
+        assert!(ok.pitr.is_some_and(|p| p.archive_dir.is_none()));
+        // 併用・片方だけ・ログ源なし・不正な値は拒否する。
+        let t = "2030-01-02T03:04:05Z";
+        assert!(with(&[
+            "--change-log-archive-dir",
+            dir,
+            "--until-lsn",
+            "7",
+            "--until-time",
+            t
+        ])
+        .is_err());
+        assert!(with(&["--change-log-archive-dir", dir]).is_err());
+        assert!(with(&["--until-lsn", "7"]).is_err());
+        assert!(with(&["--until-time", t]).is_err());
+        for bad in [
+            "0",
+            "-1",
+            "+1",
+            " 1",
+            "1 ",
+            "",
+            "1e3",
+            "18446744073709551616",
+        ] {
+            assert!(
+                with(&["--change-log-archive-dir", dir, "--until-lsn", bad]).is_err(),
+                "{bad:?}"
+            );
+        }
+        assert!(with(&[
+            "--change-log-archive-dir",
+            dir,
+            "--until-time",
+            "2030-01-02T03:04:05"
+        ])
+        .is_err());
+        assert!(with(&[
+            "--change-log-archive-dir",
+            "/nonexistent-archive-dir-for-test",
+            "--until-lsn",
+            "1"
+        ])
+        .is_err());
+        // 重複の指定。
+        assert!(with(&[
+            "--change-log-archive-dir",
+            dir,
+            "--change-log-archive-dir",
+            dir,
+            "--until-lsn",
+            "1"
+        ])
+        .is_err());
+        assert!(with(&[
+            "--change-log-archive-dir",
+            dir,
+            "--until-lsn",
+            "1",
+            "--until-lsn",
+            "2"
+        ])
+        .is_err());
+        // 指定なしなら従来どおり。
+        assert_eq!(with(&[]).expect("plain").pitr, None);
     }
 
     #[test]
