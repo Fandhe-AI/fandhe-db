@@ -213,30 +213,121 @@ fn full_fixture_round_trips_through_insert() {
     assert_full_round_trip("insert", TableDataFormat::Insert);
 }
 
-/// 復元した DB の制約・索引が実際に効いている（定義が文面だけでなく機能として戻る）。
+/// 失敗の SQLSTATE と文言の識別語を直接比べる（元と復元先の一致だけでは、意図しない理由での失敗を
+/// 見逃す）。
+fn assert_fails_with(core: &EngineCore, label: &str, sql: &str, state: &str, needle: &str) {
+    let err = run(core, sql).map(|_| ()).expect_err(sql);
+    assert_eq!(err.wire_code(), state, "{label}: {sql}: {err}");
+    assert!(err.to_string().contains(needle), "{label}: {sql}: {err}");
+}
+
+/// 復元した DB の制約・既定値が実際に効いている（定義が文面だけでなく機能として戻る）。
+/// 各ケースは意図した制約の SQLSTATE で、元の DB と復元先の両方で失敗する。
 #[test]
 fn restored_constraints_and_defaults_are_enforced() {
     let pair = round_trip("enforce", TableDataFormat::Copy);
-    for sql in [
-        "INSERT INTO parent (id, name) VALUES (1, 'dup-pk')",
-        "INSERT INTO parent (id, name) VALUES (10, 'a')",
-        "INSERT INTO parent (id, name, score) VALUES (11, 'neg', -1)",
-        "INSERT INTO parent (id, name, score, flag) VALUES (12, 'pairdup', 2, TRUE)",
-        "INSERT INTO parent (id) VALUES (13)",
-        "INSERT INTO pair (a, b) VALUES (0, 'q')",
-        "INSERT INTO pair (a, b) VALUES (9, 'x')",
-        "INSERT INTO app.items (label) VALUES ('first')",
-        "INSERT INTO member (mid, org_oid) VALUES (9, 99)",
-        "INSERT INTO member (mid, org_code) VALUES (9, 'nope')",
-        "INSERT INTO member (mid, region, seq) VALUES (9, 'eu', 2)",
-        "INSERT INTO app.notes (nid, item_label) VALUES (9, 'nope')",
-        "INSERT INTO node (nid, up) VALUES (9, 99)",
-        "DELETE FROM node WHERE nid = 1",
+    for (sql, state, needle) in [
+        // 主キー・UNIQUE（単一・複合・名前付き）・CHECK・NOT NULL。
+        (
+            "INSERT INTO parent (id, name) VALUES (1, 'dup-pk')",
+            "23505",
+            "unique",
+        ),
+        (
+            "INSERT INTO parent (id, name) VALUES (10, 'a')",
+            "23505",
+            "unique",
+        ),
+        (
+            "INSERT INTO parent (id, name, score) VALUES (11, 'neg', -1)",
+            "23514",
+            "parent_check",
+        ),
+        (
+            "INSERT INTO parent (id, name, score, flag) VALUES (12, 'pairdup', 2, TRUE)",
+            "23505",
+            "unique",
+        ),
+        // 既定の name（'x''y'）は既存の行と衝突しないが、2 行目の既定は衝突する。下の成功ケースの後。
+        (
+            "INSERT INTO pair (a, b) VALUES (0, 'q')",
+            "23514",
+            "pair_ck",
+        ),
+        ("INSERT INTO pair (a, b) VALUES (9, 'x')", "23505", "unique"),
+        (
+            "INSERT INTO app.items (iid, label) VALUES (9, 'first')",
+            "23505",
+            "unique",
+        ),
+        (
+            "INSERT INTO app.items (label) VALUES ('nokey')",
+            "23502",
+            "not-null",
+        ),
+        // 外部キー（列制約・表制約・複合・SCHEMA 配下・自己参照）と参照される側の削除。
+        (
+            "INSERT INTO member (mid, org_oid) VALUES (9, 99)",
+            "23503",
+            "foreign key",
+        ),
+        (
+            "INSERT INTO member (mid, org_code) VALUES (9, 'nope')",
+            "23503",
+            "foreign key",
+        ),
+        (
+            "INSERT INTO member (mid, region, seq) VALUES (9, 'eu', 2)",
+            "23503",
+            "foreign key",
+        ),
+        (
+            "INSERT INTO app.notes (nid, item_label) VALUES (9, 'nope')",
+            "23503",
+            "foreign key",
+        ),
+        (
+            "INSERT INTO node (nid, up) VALUES (9, 99)",
+            "23503",
+            "foreign key",
+        ),
+        ("DELETE FROM node WHERE nid = 1", "23503", "foreign key"),
     ] {
-        let err = run(&pair.dst, sql).map(|_| ()).expect_err(sql);
-        let want = run(&pair.src, sql).map(|_| ()).expect_err(sql);
-        assert_eq!(err.wire_code(), want.wire_code(), "{sql}");
+        assert_fails_with(&pair.src, "src", sql, state, needle);
+        assert_fails_with(&pair.dst, "dst", sql, state, needle);
     }
+
+    // 既定値そのものが復元後に入る: 省略した列の既定値が元の DB と一致する。
+    let probe = "INSERT INTO parent (id) VALUES (13)";
+    ok(&pair.src, probe);
+    ok(&pair.dst, probe);
+    let read = "SELECT name, score, flag, m FROM parent WHERE id = 13";
+    let defaults = select(&pair.dst, read);
+    assert_eq!(defaults, select(&pair.src, read));
+    assert_eq!(
+        defaults,
+        vec![vec![
+            Cell::Text("x'y".to_string()),
+            Cell::Float(1.5),
+            Cell::Bool(true),
+            Cell::Text("ok".to_string())
+        ]]
+    );
+    // 既定の name は UNIQUE なので、もう 1 行を既定で足すと衝突する（既定値が効いたうえでの制約）。
+    assert_fails_with(
+        &pair.src,
+        "src",
+        "INSERT INTO parent (id) VALUES (14)",
+        "23505",
+        "unique",
+    );
+    assert_fails_with(
+        &pair.dst,
+        "dst",
+        "INSERT INTO parent (id) VALUES (14)",
+        "23505",
+        "unique",
+    );
 }
 
 /// 参照先の列名が `id` の外部キーは、SQL 表層が暗黙 id への参照として扱い `0A000` で拒否する
