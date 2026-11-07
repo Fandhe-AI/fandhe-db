@@ -62,10 +62,37 @@ impl UniqueAuditPlan {
         schema: &TableSchema,
     ) -> Result<Self, TenantWriteError> {
         let decls = crate::catalog::table_expression_decls_in_read_txn(read_txn, table_name)?;
-        let plan = UniqueKeyPlan::build(schema, &decls)?;
+        // 一意性に関わる式（一意の式索引の要素）だけをコンパイルする。一意でない式索引の宣言が壊れて
+        // いても、列の主キー・UNIQUE 制約の重複検査と一意索引の突き合わせを止めない。式要素の位置
+        // （`UniqueElementDecl::Expr`）は絞り込み後の並びへ振り直す。
+        let unique_names: HashSet<&str> = decls
+            .uniques
+            .iter()
+            .map(|u| u.index_name.as_str())
+            .collect();
+        let mut remap: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+        let mut keys = Vec::new();
+        for (pos, key) in decls.keys.iter().enumerate() {
+            if unique_names.contains(key.index_name.as_str()) {
+                remap.insert(pos, keys.len());
+                keys.push(key.clone());
+            }
+        }
+        let mut narrowed = decls.clone();
+        narrowed.keys = keys;
+        for unique in &mut narrowed.uniques {
+            for element in &mut unique.elements {
+                if let crate::catalog::UniqueElementDecl::Expr(pos) = element {
+                    *pos = *remap.get(pos).ok_or_else(|| {
+                        internal("unique expression index element not found in declarations")
+                    })?;
+                }
+            }
+        }
+        let plan = UniqueKeyPlan::build(schema, &narrowed)?;
         let compiled = crate::sql::expression_key_index::CompiledIndexExpressions::compile(
             schema,
-            &decls.keys,
+            &narrowed.keys,
         )?;
         Ok(Self {
             plan,

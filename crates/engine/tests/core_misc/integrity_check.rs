@@ -901,3 +901,77 @@ fn undecodable_parent_row_is_not_counted_as_an_orphan_but_complete_tenants_still
     assert!(report.total(FindingKind::CheckUnavailable) >= 1);
     assert!(!report.is_consistent());
 }
+
+#[test]
+fn unreadable_unique_index_table_is_unavailable_not_rebuild_pending() {
+    let (path, _g) = build_db("integrity-uniq-unreadable");
+    let (_, value) = first_row(&path, PARENT_ROWS, TENANTS[0]);
+    corrupt(&path, |w| {
+        w.delete_table(PARENT_UNIQ).expect("drop uniq");
+        w.open_table(TableDefinition::<u8, u8>::new("user_uniq/parents"))
+            .expect("replace uniq");
+        let mut t = w.open_table(PARENT_ROWS).expect("rows");
+        t.insert((TENANTS[0], 940_000u64), value.as_slice())
+            .expect("dup");
+    });
+    let report = verify(&path);
+    assert!(report.total(FindingKind::CheckUnavailable) >= 1);
+    assert!(!report.findings.iter().any(
+        |f| f.kind == FindingKind::IndexRebuildPending && f.table.as_deref() == Some("parents")
+    ));
+    // 索引に依存しない行の重複検査は続く。
+    assert_eq!(report.total(FindingKind::PrimaryKeyDuplicate), 1);
+    assert!(!report.is_consistent());
+}
+
+#[test]
+fn absent_unique_index_table_is_still_rebuild_pending() {
+    let (path, _g) = build_db("integrity-uniq-absent");
+    corrupt(&path, |w| {
+        w.delete_table(PARENT_UNIQ).expect("drop uniq");
+    });
+    let report = verify(&path);
+    assert_eq!(report.total(FindingKind::CheckUnavailable), 0);
+    assert!(report.total(FindingKind::IndexRebuildPending) >= 1);
+}
+
+#[test]
+fn broken_non_unique_expression_index_does_not_stop_the_key_checks() {
+    let (path, _g) = build_db("integrity-nonunique-expr");
+    {
+        let core = core_at(&path);
+        run(
+            &core,
+            TENANTS[0],
+            "CREATE INDEX parents_lower ON parents ((lower(name)))",
+        );
+    }
+    let (_, value) = first_row(&path, PARENT_ROWS, TENANTS[0]);
+    corrupt(&path, |w| {
+        // 式のテキストを存在しない列名へ書き換え、再束縛できなくする。
+        let mut t = w
+            .open_table(TableDefinition::<&str, &[u8]>::new("index_catalog"))
+            .expect("index catalog");
+        let old = t
+            .get("parents_lower")
+            .expect("get")
+            .expect("entry")
+            .value()
+            .to_vec();
+        // 式のテキストは 16 進で保存されている（`lower(name)` → `lower(nope)`。長さは同じ）。
+        let from = b"6c6f776572286e616d6529";
+        let at = old
+            .windows(from.len())
+            .position(|b| b == from)
+            .expect("expression text");
+        let mut forged = old.clone();
+        forged[at..at + from.len()].copy_from_slice(b"6c6f776572286e6f706529");
+        t.insert("parents_lower", forged.as_slice()).expect("write");
+        let mut rows = w.open_table(PARENT_ROWS).expect("rows");
+        rows.insert((TENANTS[0], 950_000u64), value.as_slice())
+            .expect("dup");
+    });
+    let report = verify(&path);
+    // 一意でない式索引は一意性に関わらないので、主キーの重複検出は止まらない。
+    assert_eq!(report.total(FindingKind::PrimaryKeyDuplicate), 1);
+}

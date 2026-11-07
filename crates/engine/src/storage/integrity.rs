@@ -506,11 +506,14 @@ fn check_table(
 ) -> Result<(), ReadFail> {
     let rows_name = catalog::user_rows_table_name(key);
     let uniq_name = catalog::user_uniq_table_name(key);
+    // 型違いで読めない一意索引は「索引が無い」のではなく未検査（遅延再構築待ちとは区別する）。
+    let mut uniq_unreadable = false;
     let uniq: Option<IndexRo> = match read.open_table(catalog::user_uniq_table_def(&uniq_name)) {
         Ok(t) => Some(t),
         Err(redb::TableError::TableDoesNotExist(_)) => None,
         Err(redb::TableError::TableTypeMismatch { .. }) => {
             c.add(FindingKind::CheckUnavailable, Some(key), 1);
+            uniq_unreadable = true;
             None
         }
         Err(_) => return Err(ReadFail),
@@ -586,7 +589,19 @@ fn check_table(
     let mut after: Option<String> = None;
     while let Some(tenant) = next_tenant(&rows, after.as_deref())? {
         if let Some(plan) = &plan {
-            if check_unique(plan, schema, &rows, uniq.as_ref(), &tenant, key, options, c).is_err() {
+            if check_unique(
+                plan,
+                schema,
+                &rows,
+                uniq.as_ref(),
+                uniq_unreadable,
+                &tenant,
+                key,
+                options,
+                c,
+            )
+            .is_err()
+            {
                 c.add(FindingKind::CheckUnavailable, Some(key), 1);
             }
         }
@@ -744,6 +759,7 @@ fn check_unique(
     schema: &TableSchema,
     rows: &RowsRo,
     uniq: Option<&IndexRo>,
+    uniq_unreadable: bool,
     tenant: &str,
     key: &str,
     options: &IntegrityOptions,
@@ -779,6 +795,8 @@ fn check_unique(
         None => c.add(FindingKind::CheckBudgetExceeded, Some(key), 1),
     }
     match uniq {
+        // 読めない索引は呼び出し側が `CheckUnavailable` を記録済み。行の重複検査は上で済んでいる。
+        None if uniq_unreadable => {}
         None => c.add(FindingKind::IndexRebuildPending, Some(key), 1),
         Some(index) => {
             let a = audit::unique_index_audit(plan, schema, rows, index, tenant)?;
