@@ -89,6 +89,10 @@ pub(crate) struct CaptureLimits {
     pub(crate) max_events: usize,
     /// レコードのペイロード（after-image の合計）のバイト数の上限。デコードの上限も兼ねる。
     pub(crate) max_payload_bytes: usize,
+    /// レコード 1 件の要素数（[`element_count`]）の上限。デコーダの予算と同じ数え方で、既定は
+    /// [`MAX_DECODE_ELEMENTS`]。生成側で超えるレコードを commit 前に拒否し、永続化したレコードを
+    /// 自分のデコーダが拒否する事態を防ぐ。
+    pub(crate) max_record_elements: usize,
 }
 
 impl Default for CaptureLimits {
@@ -98,6 +102,7 @@ impl Default for CaptureLimits {
             max_key_bytes: 128 * 1024 * 1024,
             max_events: 65_536,
             max_payload_bytes: 256 * 1024 * 1024,
+            max_record_elements: MAX_DECODE_ELEMENTS,
         }
     }
 }
@@ -226,6 +231,37 @@ pub(crate) fn encode_record(
     body: &RecordBody,
     max_payload: usize,
 ) -> std::result::Result<Vec<u8>, EncodeError> {
+    encode_record_with(header, body, max_payload, MAX_DECODE_ELEMENTS)
+}
+
+/// レコード本体の要素数。デコーダ（[`read_count`]）が予算から引く件数の合計と同じ定義で、
+/// 生成側の検査（[`encode_record_with`]）と共有する: 削除表・作成表・変更表の件数と、
+/// 変更表ごとの upsert・remove の件数の総和。
+pub(crate) fn element_count(body: &RecordBody) -> Option<usize> {
+    let mut total = body
+        .dropped
+        .len()
+        .checked_add(body.created.len())?
+        .checked_add(body.tables.len())?;
+    for t in &body.tables {
+        total = total
+            .checked_add(t.upserts.len())?
+            .checked_add(t.removes.len())?;
+    }
+    Some(total)
+}
+
+/// [`encode_record`] の要素数上限指定版。`max_elements` を超えるレコードは [`EncodeError`]
+/// （デコーダが同じ上限で `Malformed` にするレコードを作らない）。
+pub(crate) fn encode_record_with(
+    header: &RecordHeader,
+    body: &RecordBody,
+    max_payload: usize,
+    max_elements: usize,
+) -> std::result::Result<Vec<u8>, EncodeError> {
+    if element_count(body).is_none_or(|n| n > max_elements) {
+        return Err(EncodeError);
+    }
     let payload = encode_payload(body, max_payload)?;
     let payload_len = u32::try_from(payload.len()).map_err(|_| EncodeError)?;
     let mut head = Vec::with_capacity(HEADER_LEN);
@@ -294,7 +330,7 @@ impl<'a> Reader<'a> {
 /// 1 レコードあたりの要素数（表・キー・値の組の合計）の既定上限。確保量を入力長の定数倍に収める。
 pub(crate) const MAX_DECODE_ELEMENTS: usize = 4 * 1024 * 1024;
 
-/// 件数を読み、要素数の予算から引く。各要素は最低 4 バイトを消費するため、残りバイト数で
+/// 件数を読み、要素数の予算から引く（合計は [`element_count`] と同じ定義）。各要素は最低 4 バイトを消費するため、残りバイト数で
 /// 割った値を超える件数は `Truncated`、予算超過は `Malformed`（件数を事前確保に使わない）。
 fn read_count(r: &mut Reader<'_>, left: &mut usize) -> std::result::Result<u32, DecodeError> {
     let n = r.u32()?;
@@ -725,8 +761,13 @@ impl CaptureSession {
             commit_time_us,
             storage_format: STORAGE_FORMAT_VERSION,
         };
-        let bytes = encode_record(&header, &body, self.state.limits.max_payload_bytes)
-            .map_err(|_| StorageError::CommitFootprintUnrecordable)?;
+        let bytes = encode_record_with(
+            &header,
+            &body,
+            self.state.limits.max_payload_bytes,
+            self.state.limits.max_record_elements,
+        )
+        .map_err(|_| StorageError::CommitFootprintUnrecordable)?;
         let mut table = write_txn.open_table(CHANGE_LOG_TABLE)?;
         table.insert(g_c, bytes.as_slice())?;
         Ok(())
@@ -1811,5 +1852,81 @@ mod tests {
             commit_maint(txn),
             Err(StorageError::CommitFootprintUnrecordable)
         ));
+    }
+
+    #[test]
+    fn record_at_the_element_limit_round_trips_and_one_over_is_refused() {
+        let b = body();
+        let n = element_count(&b).expect("count");
+        assert_eq!(n, 5);
+        let bytes = encode_record_with(&header(), &b, usize::MAX, n).expect("at the limit");
+        assert!(decode_record_with(&bytes, usize::MAX, n).is_ok());
+        assert_eq!(
+            encode_record_with(&header(), &b, usize::MAX, n - 1),
+            Err(EncodeError)
+        );
+        assert_eq!(
+            decode_record_with(&bytes, usize::MAX, n - 1),
+            Err(DecodeError::Malformed)
+        );
+    }
+
+    #[test]
+    fn prepare_refuses_records_over_the_element_limit_and_accepts_the_exact_limit() {
+        let write = |storage: &super::super::Storage| {
+            let txn = storage.begin_write_txn().expect("txn");
+            {
+                let mut t = CapturingTable::open(&txn, USERS).expect("open");
+                t.insert("a", b"1".as_slice()).expect("insert");
+            }
+            commit_result(txn)
+        };
+        // 最初の commit のレコードは、作成 2・変更表 2・upsert 2 の 6 要素。
+        let path = unique_db_path("change-log-element-limit");
+        let _guard = CleanupGuard(path.clone());
+        let mut storage = super::super::Storage::open(&path).expect("open");
+        storage
+            .enable_change_log_with(CaptureLimits {
+                max_record_elements: 5,
+                ..CaptureLimits::default()
+            })
+            .expect("enable");
+        let before = storage.current_generation().expect("gen");
+        assert!(matches!(
+            write(&storage),
+            Err(StorageError::CommitFootprintUnrecordable)
+        ));
+        assert_eq!(storage.current_generation().expect("gen"), before);
+        assert!(records(&storage).is_empty());
+        let read = storage.db.begin_read().expect("read");
+        assert!(matches!(
+            read.open_table(USERS),
+            Err(redb::TableError::TableDoesNotExist(_))
+        ));
+        drop(read);
+
+        let path2 = unique_db_path("change-log-element-limit-exact");
+        let _guard2 = CleanupGuard(path2.clone());
+        let mut exact = super::super::Storage::open(&path2).expect("open");
+        exact
+            .enable_change_log_with(CaptureLimits {
+                max_record_elements: 6,
+                ..CaptureLimits::default()
+            })
+            .expect("enable");
+        write(&exact).expect("exact limit commits");
+        let bytes = {
+            let read = exact.db.begin_read().expect("read");
+            let table = read.open_table(CHANGE_LOG_TABLE).expect("log");
+            let v = table
+                .iter()
+                .expect("iter")
+                .next()
+                .expect("row")
+                .expect("e")
+                .1;
+            v.value().to_vec()
+        };
+        assert!(decode_record_with(&bytes, usize::MAX, 6).is_ok());
     }
 }
