@@ -4237,6 +4237,18 @@ impl EngineCore {
         self
     }
 
+    /// 稼働中の永続ストレージから一貫スナップショットを `dest` の新規ファイルへ書き出す
+    /// （RECOVER-13・Issue #2152）。wire-server の運用者専用ソケットの接続処理から呼ばれる入口で、
+    /// [`Storage::export_snapshot`] へそのまま委譲する（書き込みゲートを通らず書き込みを止めない。
+    /// SQL・NoSQL の表層からは呼べない）。
+    pub fn export_snapshot(
+        &self,
+        dest: impl AsRef<std::path::Path>,
+    ) -> std::result::Result<crate::storage::SnapshotSummary, crate::storage::SnapshotExportError>
+    {
+        self.storage.export_snapshot(dest)
+    }
+
     /// 結合ではなくモジュール内テストが登録簿などの内部状態へ届くための入口
     /// （Issue #1129 の同時実行数上限のテスト用。本番ビルドには含めない）。
     #[cfg(test)]

@@ -137,6 +137,9 @@
 
 pub mod auth;
 pub mod auth_method_opt;
+pub mod backup_opt;
+#[cfg(unix)]
+pub mod backup_socket;
 pub(crate) mod binary_param;
 pub mod bind_guard;
 pub mod change_log_opt;
