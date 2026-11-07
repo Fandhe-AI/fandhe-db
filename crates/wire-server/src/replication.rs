@@ -544,6 +544,15 @@ fn handle(stream: TcpStream, peer: std::net::IpAddr, srv: &Server, pre_auth: Slo
         Some(Err(e)) => return send_error(&stream, stream_error_code(&e)),
         None => return send_error(&stream, code::AHEAD),
     };
+    // Identity から Start までの間（最大 START_TIMEOUT）に commit が進みうる。保持位置を登録した直後に取り直した
+    // 最新 LSN で遅れを再判定し、超えていれば登録（`pin`）を外して再同期を促す。
+    if current.saturating_sub(applied) > cfg.max_lag_records {
+        return send_error(&stream, code::RESYNC_REQUIRED);
+    }
+    // Ok の書き込みは短い期限にする（読まないレプリカで、監視が動き出す前に保持位置が残り続けない）。
+    if stream.set_write_timeout(Some(START_TIMEOUT)).is_err() {
+        return;
+    }
     {
         let mut w = &stream;
         let ok = write_frame(
@@ -559,6 +568,9 @@ fn handle(stream: TcpStream, peer: std::net::IpAddr, srv: &Server, pre_auth: Slo
         if ok.is_err() {
             return;
         }
+    }
+    if stream.set_write_timeout(Some(cfg.ack_timeout)).is_err() {
+        return;
     }
     engine::log_stderr!("wire-server: replication: replica '{role}' connected");
     let reason = stream_loop(&stream, core, cfg, applied, &pin);

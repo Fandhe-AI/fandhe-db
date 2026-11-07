@@ -964,3 +964,54 @@ fn recover15_invalid_acks_get_bad_request_before_the_close() {
         .expect("oversize header");
     assert_eq!(r.drain_until_closed(), Some(E_BAD_REQUEST), "oversize ack");
 }
+
+/// Identity から Start までの間に遅れの上限を超える commit が進んだら、Start は `RESYNC_REQUIRED` で拒否される
+/// （Identity 時点の LSN ではなく、保持位置を登録した直後に取り直した最新 LSN で判定する）。
+#[test]
+fn recover15_lag_is_rechecked_at_start_after_the_identity_frame() {
+    let p = Primary::start(
+        "repl-lag-start",
+        &["--replication-max-lag-records", "3"],
+        false,
+    );
+    let mut r = Replica::connect(p.repl);
+    let (db_id, timeline, base) = r.login(ROLE, ROLE_PW);
+    let mut alice = p.setup_table();
+    for id in 1..=5 {
+        alice.insert(id);
+    }
+    r.send(b'S', &start_body(&db_id, timeline, base));
+    r.expect_error(E_RESYNC);
+}
+
+/// 通常の書き込み（明示トランザクション）が書き込みゲートを長く持っている間も、刈り込みの保守 commit の
+/// ゲート待ちが ack の処理を塞がず、正常に ack しているレプリカは切られない。
+#[test]
+fn recover15_acks_keep_flowing_while_the_write_gate_is_held() {
+    let p = Primary::start("repl-gate", &["--replication-ack-timeout-secs", "2"], true);
+    let (mut r, _) = begin_at_current(&p);
+    let mut alice = p.setup_table();
+    alice.insert(1);
+    let mut holder = p.alice();
+    holder.exec("BEGIN");
+    holder.insert(2);
+    // 届いている分をすべて ack する（短い読み取り期限で、届き切るまで）。
+    r.0.set_read_timeout(Some(Duration::from_millis(500)))
+        .expect("timeout");
+    let mut last = 0;
+    while let Some((ty, body)) = r.recv() {
+        if ty == b'W' {
+            last = u64::from_be_bytes(body[..8].try_into().expect("lsn"));
+            r.ack(last);
+        }
+    }
+    r.0.set_read_timeout(Some(Duration::from_secs(20)))
+        .expect("timeout");
+    assert!(last >= 1);
+    std::thread::sleep(Duration::from_millis(3500));
+    holder.exec("COMMIT");
+    // ack の期限（2 秒）を過ぎても切られておらず、続きを受け取れる。
+    let (lsn, _) = r.next_record().expect("still connected");
+    assert!(lsn > last);
+    r.ack(lsn);
+}
