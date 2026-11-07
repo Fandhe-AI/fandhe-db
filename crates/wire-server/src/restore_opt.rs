@@ -87,6 +87,8 @@ pub struct RestoreSummary {
 pub enum RestoreError {
     /// 復元先に既に何かがある、またはパスが不正（公開直前の競合を含む）。
     InvalidDestination,
+    /// 復元元が通常ファイルでない、または長さ 0（parse 後の差し替えを含む。空 DB を公開しない）。
+    InvalidSource,
     /// 復元元を別のプロセスが開いている（稼働中の DB をコピーしない）。
     SourceInUse,
     /// 復元元のコピーが元のサイズと一致しなかった（コピー中に変更された等）。
@@ -109,6 +111,7 @@ impl std::fmt::Display for RestoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::InvalidDestination => "--db already exists or is not a valid destination",
+            Self::InvalidSource => "--from is not a non-empty regular file",
             Self::SourceInUse => {
                 "backup file is in use by another process (stop the server using it first)"
             }
@@ -146,9 +149,11 @@ pub fn classify(result: &Result<RestoreSummary, RestoreError>) -> (u8, String) {
             EXIT_PUBLISHED_UNVERIFIED,
             RestoreError::PublishedButNotFinalized.to_string(),
         ),
-        Err(e @ (RestoreError::InvalidDestination | RestoreError::Unsupported)) => {
-            (EXIT_USAGE, e.to_string())
-        }
+        Err(
+            e @ (RestoreError::InvalidDestination
+            | RestoreError::InvalidSource
+            | RestoreError::Unsupported),
+        ) => (EXIT_USAGE, e.to_string()),
         Err(e @ RestoreError::NotConsistent(r)) => (verify_opt::classify(r), e.to_string()),
         Err(e) => (EXIT_FAILURE, e.to_string()),
     }
@@ -221,7 +226,13 @@ mod unix_impl {
             Err(TryLockError::WouldBlock) => return Err(RestoreError::SourceInUse),
             Err(TryLockError::Error(e)) => return Err(io_err(e)),
         }
-        let src_len = src.metadata().map_err(io_err)?.len();
+        // parse 後に差し替えられた（長さ 0・FIFO 等）復元元を、開いた fd の属性で再確認する。
+        // 長さ 0 のままだと空の DB が「復元」として公開されてしまう。
+        let src_meta = src.metadata().map_err(io_err)?;
+        if !src_meta.is_file() || src_meta.len() == 0 {
+            return Err(RestoreError::InvalidSource);
+        }
+        let src_len = src_meta.len();
 
         // 2. 一時ファイルへ 0600 の排他作成でコピーする。
         let (mut tmp, tmp_path) = create_temp(parent)?;

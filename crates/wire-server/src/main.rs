@@ -490,7 +490,7 @@
 //! 確かめられなかった（バックアップは存在する。検証してから使う）。`--users` ファイルは対象外。
 //!
 //! `wire-server verify --db <path> [--memory-budget-bytes <n>]` サブコマンドは、**停止中**の DB を
-//! 開いて読み取りだけの整合検査を実行し、結果を `key=value` 行で標準出力へ出す（Issue #2156・
+//! 開いて整合検査（行・索引は読み取りだけ。open 自体がヘッダを書き換えうる。読み取り専用の open は #3074）を実行し、結果を `key=value` 行で標準出力へ出す（Issue #2156・
 //! RECOVER-13 (6) ポインタ）。終了コード: 0=整合（Warning のみを含む）、1=実行時の失敗（稼働中の
 //! サーバーが使用中を含む）、2=引数／パスの拒否、4=矛盾あり、5=検査できなかった項目のみ
 //! （3 は `backup`／`restore` 専用）。詳細は `wire_server::verify_opt`。
@@ -3941,7 +3941,7 @@ fn run_backup(args: &[String]) -> ExitCode {
     let storage = match Storage::open(db) {
         Ok(s) => s,
         Err(e) => {
-            if e.to_string().contains("already open") {
+            if backup_opt::is_already_open(&e) {
                 engine::log_stderr!(
                     "wire-server: backup: database is in use by another process \
                      (stop the server first)"
@@ -3966,9 +3966,19 @@ fn run_backup(args: &[String]) -> ExitCode {
     }
 }
 
+/// 標準出力へ書いて flush する。失敗（EPIPE 等）は呼び出し側が終了コード 1 にする
+/// （`print!` は失敗で panic し 101 で終わるため使わない）。
+fn write_stdout(text: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut out = std::io::stdout().lock();
+    out.write_all(text.as_bytes())?;
+    out.flush()
+}
+
 /// `verify --db <path>` サブコマンド（Issue #2156・RECOVER-13 (6) ポインタ）。引数を検証してから
 /// `--db` を開き、`Storage::verify_integrity` の報告を標準出力へ出す。稼働中のサーバーが DB を
-/// 開いている場合は open が失敗して終了コード 1（fail-closed。`backup` と同じ）。エラー文に
+/// 開いている場合は open が失敗して終了コード 1（fail-closed。`backup` と同じ）。open は
+/// ヘッダを書き換えうる（読み取り専用の open は #3074）。エラー文に
 /// 行の値・パスの内容・表名は含めない。
 fn run_verify(args: &[String]) -> ExitCode {
     use engine::storage::Storage;
@@ -3984,7 +3994,7 @@ fn run_verify(args: &[String]) -> ExitCode {
     let storage = match Storage::open(&parsed.db) {
         Ok(s) => s,
         Err(e) => {
-            if e.to_string().contains("already open") {
+            if backup_opt::is_already_open(&e) {
                 engine::log_stderr!(
                     "wire-server: verify: database is in use by another process \
                      (stop the server first)"
@@ -3997,7 +4007,10 @@ fn run_verify(args: &[String]) -> ExitCode {
     };
     match storage.verify_integrity(&parsed.options) {
         Ok(report) => {
-            print!("{}", verify_opt::render(&report));
+            // 出力先の閉鎖（EPIPE 等）で panic させない。書けなければ実行時の失敗（1）。
+            if write_stdout(&verify_opt::render(&report)).is_err() {
+                return ExitCode::from(backup_opt::EXIT_FAILURE);
+            }
             ExitCode::from(verify_opt::classify(&report))
         }
         Err(_) => {
@@ -4024,7 +4037,9 @@ fn run_restore(args: &[String]) -> ExitCode {
     let (code, msg) = restore_opt::classify(&result);
     match (&result, code) {
         (Ok(_), 0) => {
-            println!("restore written: {msg}");
+            if write_stdout(&format!("restore written: {msg}\n")).is_err() {
+                return ExitCode::from(backup_opt::EXIT_FAILURE);
+            }
             ExitCode::SUCCESS
         }
         (Err(restore_opt::RestoreError::NotConsistent(report)), _) => {

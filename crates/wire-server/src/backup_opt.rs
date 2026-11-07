@@ -114,6 +114,14 @@ pub fn parse(args: &[String]) -> Result<BackupArgs, String> {
     Ok(BackupArgs { target, out })
 }
 
+/// `Storage::open` の失敗が「別プロセスが開いている」ことによるかを判定する（`backup`・`verify` が
+/// 「stop the server first」を案内するために使う）。redb のエラー種別は wire-server から名前で
+/// 参照できない（redb 非依存）ため、`DatabaseAlreadyOpen` の表示文言に依存している。文言が変わると
+/// 案内が一般的な「failed to open」に落ちるだけで、終了コード（1）と fail-closed は変わらない。
+pub fn is_already_open(e: &engine::storage::StorageError) -> bool {
+    e.to_string().contains("already open")
+}
+
 /// `--db` の検証。`Storage::open` は存在しない・長さ 0 のパスに空の DB を作るため、既存の
 /// 空でない通常ファイルに限る（typo で空 DB が生成され「成功」するのを防ぐ）。
 /// `verify`・`restore` からも使う（[`crate::verify_opt`]・[`crate::restore_opt`]）。

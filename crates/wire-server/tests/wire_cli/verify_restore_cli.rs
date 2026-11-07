@@ -154,7 +154,7 @@ fn verify_consistent_db_exits_zero_and_rejects_running_db() {
     assert_no_leak(&o, &[&db]);
 }
 
-/// 行の復号不能は 4（矛盾）で、種類・表・件数だけが出る。ファイルは変更されない。
+/// 行の復号不能は 4（矛盾）で、種類・表・件数だけが出る（open がヘッダを書き換えうるため、ファイルのバイト列は検証しない。読み取り専用の open は #3074）。
 #[test]
 fn verify_corrupted_db_exits_with_inconsistent_code() {
     let fx = common::TempFixtureDir::new("verify-cli-corrupt");
@@ -336,6 +336,21 @@ fn restore_refuses_a_running_database_as_source() {
     let o = restore(&db, dest.to_str().expect("utf-8 path"));
     assert_eq!(code(&o), Some(1), "stderr: {}", stderr(&o));
     assert!(stderr(&o).contains("in use"), "stderr: {}", stderr(&o));
+    assert!(!dest.exists());
+    assert!(leftovers(&dir).is_empty(), "{:?}", leftovers(&dir));
+}
+
+/// parse 後に長さ 0 へ差し替わった復元元は、空 DB を公開せず 2 で拒否する（`restore()` の再確認）。
+#[test]
+fn restore_function_refuses_zero_length_source() {
+    use wire_server::restore_opt::{restore, RestoreError};
+    let fx = common::TempFixtureDir::new("restore-zero-src");
+    let dir = parent_of(&fx.db_path_str()).to_path_buf();
+    let src = dir.join("empty-src.redb");
+    std::fs::write(&src, b"").expect("write empty");
+    let dest = dir.join("restored.redb");
+    let r = restore(&src, &dest);
+    assert!(matches!(r, Err(RestoreError::InvalidSource)), "{r:?}");
     assert!(!dest.exists());
     assert!(leftovers(&dir).is_empty(), "{:?}", leftovers(&dir));
 }
