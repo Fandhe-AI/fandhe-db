@@ -487,3 +487,121 @@ fn rows_stream_one_at_a_time_without_a_row_cap() {
         .expect_err("sink error");
     assert!(matches!(err, SchemaDdlError::Sink("disk full")));
 }
+
+/// 接頭辞が重なるテナント（`tenant-a` と `tenant-ab`）の行は、互いのダンプに現れない。
+#[test]
+fn tenants_sharing_a_name_prefix_stay_separate() {
+    let p1 = unique_db_path("dump-data-prefix");
+    let _g1 = CleanupGuard(p1.clone());
+    let src = open_core(&p1);
+    ok(&src, "tenant-a", "CREATE TABLE docs (body TEXT)");
+    ok(
+        &src,
+        "tenant-a",
+        "INSERT INTO docs (body) VALUES ('row_of_a')",
+    );
+    ok(
+        &src,
+        "tenant-ab",
+        "INSERT INTO docs (body) VALUES ('row_of_ab')",
+    );
+    ok(
+        &src,
+        "tenant-",
+        "INSERT INTO docs (body) VALUES ('row_of_stem')",
+    );
+    for format in [TableDataFormat::Copy, TableDataFormat::Insert] {
+        let a = dump(&src, &SchemaDdlScope::tenant_only("tenant-a"), format).expect("dump");
+        let rows: Vec<_> = a
+            .iter()
+            .filter_map(|p| match p {
+                Piece::Data(TableDataPart::CopyRow | TableDataPart::Insert, tenant, t) => {
+                    Some((tenant.clone(), t.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "tenant-a");
+        assert!(rows[0].1.contains("row_of_a") && !rows[0].1.contains("row_of_ab"));
+    }
+}
+
+/// NUL を含む値は COPY・INSERT のどちらでも運べないため、ダンプは黙って成功せず失敗する。
+#[test]
+fn nul_in_a_value_never_dumps_silently() {
+    let p1 = unique_db_path("dump-data-nul");
+    let _g1 = CleanupGuard(p1.clone());
+    let src = open_core(&p1);
+    ok(&src, "tenant-a", "CREATE TABLE n (body TEXT)");
+    if run(&src, "tenant-a", "INSERT INTO n (body) VALUES ('a\u{0}b')").is_err() {
+        // 入口で拒否される（そもそも保存されない）。保存できないので書き出しの対象にもならない。
+        let pieces = dump(
+            &src,
+            &SchemaDdlScope::tenant_only("tenant-a"),
+            TableDataFormat::Copy,
+        )
+        .expect("dump");
+        assert!(pieces.is_empty());
+        return;
+    }
+    for format in [TableDataFormat::Copy, TableDataFormat::Insert] {
+        match dump(&src, &SchemaDdlScope::tenant_only("tenant-a"), format) {
+            Err(SchemaDdlError::Unsupported(_)) => {}
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+}
+
+/// 2 次元配列（NULL 要素あり）・ベクトル系の負値と極値・整数と浮動小数の極値も往復する。
+#[test]
+fn extreme_values_round_trip_in_both_formats() {
+    for (i, format) in [TableDataFormat::Copy, TableDataFormat::Insert]
+        .into_iter()
+        .enumerate()
+    {
+        let p1 = unique_db_path(&format!("dump-data-ext-src-{i}"));
+        let _g1 = CleanupGuard(p1.clone());
+        let p2 = unique_db_path(&format!("dump-data-ext-dst-{i}"));
+        let _g2 = CleanupGuard(p2.clone());
+        let src = open_core(&p1);
+        let t = "tenant-a";
+        let stmts = [
+            "CREATE TABLE ext_int (a SMALLINT, b INTEGER, c BIGINT, r REAL, d DOUBLE PRECISION)",
+            "INSERT INTO ext_int (a, b, c, r, d) VALUES (-32768, -2147483648, -9223372036854775808, \
+             -3.4028235e38, -1.7976931348623157e308)",
+            "INSERT INTO ext_int (a, b, c, r, d) VALUES (32767, 2147483647, 9223372036854775807, \
+             3.4028235e38, 1.7976931348623157e308)",
+            "INSERT INTO ext_int (a, b, c, r, d) VALUES (0, 0, 0, 1.17549435e-38, 2.2250738585072014e-308)",
+            "INSERT INTO ext_int (a, b, c, r, d) VALUES (1, 1, 1, -0.1, 0.1)",
+            "CREATE TABLE ext_arr (m INTEGER[][], tt TEXT[][])",
+            "INSERT INTO ext_arr (m, tt) VALUES ('{{1,NULL},{3,-4}}', '{{\"a b\",NULL},{\"\",\"q\\\"r\"}}')",
+            "CREATE TABLE ext_h (v HALFVEC(4))",
+            "INSERT INTO ext_h (v) VALUES ('[65504,-65504,-0.5,0.00006103515625]')",
+            "CREATE TABLE ext_q (v INT8VEC(3))",
+            "INSERT INTO ext_q (v) VALUES ('[-128,127,0]')",
+            "CREATE TABLE ext_s (v SPARSEVEC(6))",
+            "INSERT INTO ext_s (v) VALUES ('{1:-1.5,6:3.4028235e38}/6')",
+            "CREATE TABLE ext_v (v VECTOR(3))",
+            "INSERT INTO ext_v (v) VALUES ('[-1.5,3.4028235e38,-0.000001]')",
+        ];
+        for s in stmts {
+            ok(&src, t, s);
+        }
+        let pieces = dump(&src, &SchemaDdlScope::shared_and_tenant(t), format).expect("dump");
+        let dst = open_core(&p2);
+        replay(&dst, &pieces);
+        for q in [
+            "SELECT a, b, c, r, d FROM ext_int",
+            "SELECT m, tt FROM ext_arr",
+            "SELECT v FROM ext_h",
+            "SELECT v FROM ext_q",
+            "SELECT v FROM ext_s",
+            "SELECT v FROM ext_v",
+        ] {
+            let want = select(&src, t, q);
+            assert!(!want.is_empty(), "{q}");
+            assert_eq!(select(&dst, t, q), want, "{q}");
+        }
+    }
+}
