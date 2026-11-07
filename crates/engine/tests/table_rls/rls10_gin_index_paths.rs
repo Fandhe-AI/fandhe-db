@@ -24,6 +24,11 @@
 //!   自分の行が原因の場合と同一で、テナント・値・件数を含まない
 //! - T8 試行総数の固定（空振り防止）と負の対照（捏造した違反を検査器が検出する）
 
+// 許可（clippy::disallowed_methods）: 本ファイルは engine の公開 API の外から redb を直接開き、
+// 永続内容の検査・破壊・裏口の対照を行う。変更ログの捕捉（`storage::change_log`）を通す
+// 対象は engine 製品コードの書き込み点で、外部クレートとしての直接操作は対象外。
+#![allow(clippy::disallowed_methods)]
+
 use std::collections::BTreeSet;
 
 use engine::catalog::{ColumnDef, ColumnType, GinIndexAudit, TableSchema};

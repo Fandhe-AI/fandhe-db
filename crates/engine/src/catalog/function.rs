@@ -23,6 +23,7 @@
 //! fail-closed: 未知の版・タグ・flag ビット、切断、末尾の余り、上限超過、キーと値のシグネチャ
 //! 不一致は `CorruptSchema` とし、decode で黙って補正・既定化しない。
 
+use crate::storage::change_log::CaptureWriteTxn as _;
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 
 use crate::storage::read_source::ReadSource;
@@ -894,7 +895,7 @@ fn count_functions_capped<R: ReadSource>(src: &R, scope: &str, limit: usize) -> 
 
 /// 内部 ID を 1 つ払い出す（1 始まり・`checked_add`・再利用しない）。
 fn allocate_function_id_in_txn(write_txn: &redb::WriteTransaction) -> Result<u64> {
-    let mut counter = write_txn.open_table(FUNCTION_ID_COUNTER_TABLE)?;
+    let mut counter = write_txn.open_table_logged(FUNCTION_ID_COUNTER_TABLE)?;
     let current = counter
         .get(FUNCTION_ID_COUNTER_KEY)?
         .map(|v| v.value())
@@ -914,7 +915,7 @@ fn insert_function_in_txn(
     signature: &str,
 ) -> Result<()> {
     let blob = encode_function_def(def)?;
-    let mut table = write_txn.open_table(FUNCTIONS_TABLE)?;
+    let mut table = write_txn.open_table_logged(FUNCTIONS_TABLE)?;
     table.insert(
         (scope, def.function_key.as_str(), signature),
         blob.as_slice(),
@@ -949,7 +950,7 @@ fn remove_function_in_txn(
         function_key,
         signature,
     )?;
-    let mut table = write_txn.open_table(FUNCTIONS_TABLE)?;
+    let mut table = write_txn.open_table_logged(FUNCTIONS_TABLE)?;
     let removed = table.remove((scope, function_key, signature))?.is_some();
     Ok(removed)
 }
@@ -1054,7 +1055,7 @@ pub(crate) fn remove_functions_with_prefix_in_txn(
 ) -> Result<()> {
     let mut targets: Vec<(String, String)> = Vec::new();
     {
-        let table = match write_txn.open_table(FUNCTIONS_TABLE) {
+        let table = match write_txn.open_table_logged(FUNCTIONS_TABLE) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
             Err(e) => return Err(e.into()),

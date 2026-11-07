@@ -47,6 +47,7 @@
 //! 非キャッシュ経路のいずれでも
 //! `PrefilterSnapshot::search_with`／[`EngineCore::search_uncached`] が同一に適用する。
 
+use crate::storage::change_log::CaptureWriteTxn as _;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -4629,7 +4630,8 @@ impl EngineCore {
                 .any(|handle| handle.name() == row_table_name)
         };
         let row_table = if row_table_exists {
-            match write_txn.open_table(crate::catalog::user_rows_table_def(&row_table_name)) {
+            match write_txn.open_table_logged(crate::catalog::user_rows_table_def(&row_table_name))
+            {
                 Ok(t) => Some(t),
                 Err(redb::TableError::TableDoesNotExist(_)) => None,
                 Err(e) => return Err(CoreError::from(crate::catalog::map_row_table_error(e))),

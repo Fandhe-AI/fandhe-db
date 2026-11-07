@@ -20,6 +20,7 @@
 //! fail-closed: 定義 blob の未知の版・長さ不一致・owner 予約領域の非零・id=0 は `CorruptSchema`
 //! とし、decode で黙って補正しない。
 
+use crate::storage::change_log::CaptureWriteTxn as _;
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 
 use crate::storage::read_source::ReadSource;
@@ -316,7 +317,7 @@ fn count_schemas_capped<R: ReadSource>(src: &R, tenant_id: &str, limit: usize) -
 
 /// 内部 ID を 1 つ払い出す（1 始まり・`checked_add`・再利用しない）。
 fn allocate_schema_id_in_txn(write_txn: &redb::WriteTransaction) -> Result<u64> {
-    let mut counter = write_txn.open_table(SCHEMA_ID_COUNTER_TABLE)?;
+    let mut counter = write_txn.open_table_logged(SCHEMA_ID_COUNTER_TABLE)?;
     let current = counter
         .get(SCHEMA_ID_COUNTER_KEY)?
         .map(|v| v.value())
@@ -559,7 +560,7 @@ impl Storage {
         }
         let id = allocate_schema_id_in_txn(&write_txn)?;
         {
-            let mut table = write_txn.open_table(SCHEMAS_TABLE)?;
+            let mut table = write_txn.open_table_logged(SCHEMAS_TABLE)?;
             table.insert((tenant_id, name), encode_schema_def(id).as_slice())?;
         }
         if let Some(owner) = owner {
@@ -622,7 +623,7 @@ impl Storage {
             return Err(CatalogError::DependentObjectsStillExist(name.to_string()));
         }
         {
-            let mut table = write_txn.open_table(SCHEMAS_TABLE)?;
+            let mut table = write_txn.open_table_logged(SCHEMAS_TABLE)?;
             table.remove((tenant_id, name))?;
         }
         remove_owner_in_txn(&write_txn, tenant_id, &PrivilegeObject::Schema(id))?;
@@ -743,7 +744,7 @@ impl Storage {
         super::function::remove_functions_with_prefix_in_txn(&write_txn, tenant_id, &prefix)?;
         // (5) SCHEMA 行。
         {
-            let mut table = write_txn.open_table(SCHEMAS_TABLE)?;
+            let mut table = write_txn.open_table_logged(SCHEMAS_TABLE)?;
             table.remove((tenant_id, name))?;
         }
         // SCHEMA 単位の ACL 行も同じ txn で掃除する（#2234）。
@@ -804,7 +805,7 @@ impl Storage {
             return Err(CatalogError::ReservedSchemaName(new.to_string()));
         }
         {
-            let mut table = write_txn.open_table(SCHEMAS_TABLE)?;
+            let mut table = write_txn.open_table_logged(SCHEMAS_TABLE)?;
             table.remove((tenant_id, old))?;
             table.insert((tenant_id, new), encode_schema_def(id).as_slice())?;
         }

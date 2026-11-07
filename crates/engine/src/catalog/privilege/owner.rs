@@ -21,6 +21,7 @@
 //! fail-closed: 未知の版・owner 0・切断・末尾の余りは固定文言の `CorruptSchema`。エラーに blob の断片・
 //! tenant_id を含めない。
 
+use crate::storage::change_log::CaptureWriteTxn as _;
 use redb::{ReadableTable, TableDefinition};
 
 use crate::storage::read_source::ReadSource;
@@ -177,7 +178,7 @@ pub(crate) fn set_owner_unchecked_in_txn(
         return Err(CatalogError::Invalid("invalid object owner".to_string()));
     }
     let (kind, key) = owner_components(object)?;
-    let mut table = write_txn.open_table(OWNERS_TABLE)?;
+    let mut table = write_txn.open_table_logged(OWNERS_TABLE)?;
     table.insert(
         (kind, key.as_str(), tenant),
         encode_owner(owner_id).as_slice(),
@@ -196,7 +197,7 @@ pub(crate) fn remove_owner_in_txn(
     if owner_of_in_txn(write_txn, tenant, object)?.is_none() {
         return Ok(());
     }
-    let mut table = write_txn.open_table(OWNERS_TABLE)?;
+    let mut table = write_txn.open_table_logged(OWNERS_TABLE)?;
     table.remove((kind, key.as_str(), tenant))?;
     Ok(())
 }
@@ -234,7 +235,7 @@ pub(crate) fn remove_relation_owners_in_txn(
         if rows.is_empty() {
             return Ok(());
         }
-        let mut table = write_txn.open_table(OWNERS_TABLE)?;
+        let mut table = write_txn.open_table_logged(OWNERS_TABLE)?;
         for (tenant, _) in &rows {
             table.remove((KIND_TABLE, relation_key, tenant.as_str()))?;
         }
@@ -256,7 +257,7 @@ pub(crate) fn rename_relation_owners_in_txn(
         if rows.is_empty() {
             return Ok(());
         }
-        let mut table = write_txn.open_table(OWNERS_TABLE)?;
+        let mut table = write_txn.open_table_logged(OWNERS_TABLE)?;
         for (tenant, blob) in &rows {
             table.remove((KIND_TABLE, old_key, tenant.as_str()))?;
             table.insert((KIND_TABLE, new_key, tenant.as_str()), blob.as_slice())?;

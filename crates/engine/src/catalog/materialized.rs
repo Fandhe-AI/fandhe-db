@@ -31,6 +31,7 @@
 //! 実体のない文脈は `Ok(None)`（未実体化）で、他テナントの有無・件数は観測できない。
 //! 破損（件数不一致・ヘッダのテナント不一致など）は行を 1 件も返さず `CorruptSchema`。
 
+use crate::storage::change_log::CaptureWriteTxn as _;
 use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 
 use super::{
@@ -358,7 +359,7 @@ fn load_def_in_txn(
     write_txn: &redb::WriteTransaction,
     name: &str,
 ) -> Result<Option<MaterializedViewDef>> {
-    let table = match write_txn.open_table(MATERIALIZED_VIEWS_TABLE) {
+    let table = match write_txn.open_table_logged(MATERIALIZED_VIEWS_TABLE) {
         Ok(t) => t,
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
         Err(e) => return Err(e.into()),
@@ -373,14 +374,14 @@ fn load_def_in_txn(
 /// 定義を書き戻す。
 fn store_def_in_txn(write_txn: &redb::WriteTransaction, def: &MaterializedViewDef) -> Result<()> {
     let encoded = encode_materialized_view_def(def)?;
-    let mut table = write_txn.open_table(MATERIALIZED_VIEWS_TABLE)?;
+    let mut table = write_txn.open_table_logged(MATERIALIZED_VIEWS_TABLE)?;
     table.insert(def.name.as_str(), encoded.as_slice())?;
     Ok(())
 }
 
 /// matview `name` のメタ（全文脈ぶん）を削除する。表が未作成なら何もしない。
 fn delete_all_meta_in_txn(write_txn: &redb::WriteTransaction, name: &str) -> Result<()> {
-    let mut table = match write_txn.open_table(MATVIEW_ENTITY_META_TABLE) {
+    let mut table = match write_txn.open_table_logged(MATVIEW_ENTITY_META_TABLE) {
         Ok(t) => t,
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
         Err(e) => return Err(e.into()),
@@ -407,7 +408,7 @@ fn delete_all_meta_in_txn(write_txn: &redb::WriteTransaction, name: &str) -> Res
 fn delete_rows_table_in_txn(write_txn: &redb::WriteTransaction, name: &str) -> Result<()> {
     let table_name = matview_rows_table_name(name);
     let def: MatviewRowsDef = TableDefinition::new(&table_name);
-    write_txn.delete_table(def)?;
+    write_txn.delete_table_logged(def)?;
     Ok(())
 }
 
@@ -417,7 +418,7 @@ pub(crate) fn materialized_views_referencing_in_txn(
     write_txn: &redb::WriteTransaction,
     relation: &str,
 ) -> Result<Vec<String>> {
-    let table = match write_txn.open_table(MATERIALIZED_VIEWS_TABLE) {
+    let table = match write_txn.open_table_logged(MATERIALIZED_VIEWS_TABLE) {
         Ok(t) => t,
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
         Err(e) => return Err(e.into()),
@@ -484,7 +485,7 @@ fn insert_def_in_txn(
             return Err(CatalogError::TableNotFound(rel.clone()));
         }
     }
-    let mut table = write_txn.open_table(MATERIALIZED_VIEWS_TABLE)?;
+    let mut table = write_txn.open_table_logged(MATERIALIZED_VIEWS_TABLE)?;
     if table.len()? >= MAX_MATERIALIZED_VIEWS as u64 {
         return Err(CatalogError::ViewLimitExceeded(
             "too many materialized views".to_string(),
@@ -708,7 +709,7 @@ pub(crate) fn create_matview_index_in_txn(
         }
     }
     {
-        let table = write_txn.open_table(INDEX_CATALOG_TABLE)?;
+        let table = write_txn.open_table_logged(INDEX_CATALOG_TABLE)?;
         if table.len()? >= MAX_INDEX_COUNT as u64 {
             return Err(CatalogError::IndexLimitExceeded(
                 "too many indexes".to_string(),
@@ -720,7 +721,7 @@ pub(crate) fn create_matview_index_in_txn(
     {
         return Err(CatalogError::UniqueConstraintViolation);
     }
-    let mut table = write_txn.open_table(INDEX_CATALOG_TABLE)?;
+    let mut table = write_txn.open_table_logged(INDEX_CATALOG_TABLE)?;
     table.insert(def.name.as_str(), encoded)?;
     Ok(())
 }
@@ -779,8 +780,8 @@ fn write_entities_in_txn(
     delete_rows_table_in_txn(write_txn, name)?;
     let table_name = matview_rows_table_name(name);
     let rows_def: MatviewRowsDef = TableDefinition::new(&table_name);
-    let mut rows_table = write_txn.open_table(rows_def)?;
-    let mut meta_table = write_txn.open_table(MATVIEW_ENTITY_META_TABLE)?;
+    let mut rows_table = write_txn.open_table_logged(rows_def)?;
+    let mut meta_table = write_txn.open_table_logged(MATVIEW_ENTITY_META_TABLE)?;
     for ((ctx, rows), key) in entities.iter().zip(keys) {
         for (i, values) in rows.iter().enumerate() {
             let encoded =
@@ -949,8 +950,8 @@ pub(crate) fn write_context_entity_in_txn(
     }
     let table_name = matview_rows_table_name(&def.name);
     let rows_def: MatviewRowsDef = TableDefinition::new(&table_name);
-    let mut rows_table = write_txn.open_table(rows_def)?;
-    let mut meta_table = write_txn.open_table(MATVIEW_ENTITY_META_TABLE)?;
+    let mut rows_table = write_txn.open_table_logged(rows_def)?;
+    let mut meta_table = write_txn.open_table_logged(MATVIEW_ENTITY_META_TABLE)?;
     for (i, encoded) in encoded_rows.iter().enumerate() {
         rows_table.insert((key.as_bytes(), i as u64), encoded.as_slice())?;
     }
@@ -1296,7 +1297,7 @@ pub(crate) fn drop_materialized_view_in_txn(
     // 標準形の関数本体が参照する matview は削除できない（`2BP01`。Issue #2219）。
     super::reject_relation_with_function_dependents_in_txn(write_txn, name)?;
     {
-        let mut table = write_txn.open_table(MATERIALIZED_VIEWS_TABLE)?;
+        let mut table = write_txn.open_table_logged(MATERIALIZED_VIEWS_TABLE)?;
         if table.remove(name)?.is_none() {
             return Err(CatalogError::ViewNotFound(name.to_string()));
         }

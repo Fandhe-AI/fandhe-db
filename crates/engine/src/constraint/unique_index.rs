@@ -84,6 +84,7 @@
 use super::{KeySpec, NullPolicy, UniqueKeyPlan};
 use crate::catalog::{CatalogError, TableSchema};
 use crate::sql::expression_key_index::CompiledIndexExpressions;
+use crate::storage::change_log::{CaptureWriteTxn as _, CapturingTable};
 use crate::storage::rowid::{row_key, split_row_key, RowId};
 use crate::tenant::TenantWriteError;
 use redb::{ReadableTable, TableHandle};
@@ -319,7 +320,7 @@ fn encode_reverse<'a>(
 }
 
 /// 索引テーブルの型エイリアス（可変ハンドル）。
-type IndexTable<'a> = redb::Table<'a, (&'static str, &'static [u8]), &'static [u8]>;
+type IndexTable<'a> = CapturingTable<'a, (&'static str, &'static [u8]), &'static [u8]>;
 
 /// テナント範囲 `(tenant_id, ..)` の索引エントリを最大 [`CLEAR_CHUNK_LIMIT`]
 /// 件だけ収集して削除し、まだ残っている可能性があれば `true` を返す
@@ -386,7 +387,7 @@ pub(super) fn clear_tenant_in_txn(
         return Ok(());
     }
     let mut index_table = write_txn
-        .open_table(crate::catalog::user_uniq_table_def(&index_table_name))
+        .open_table_logged(crate::catalog::user_uniq_table_def(&index_table_name))
         .map_err(table_error)?;
     while clear_tenant_chunk(&mut index_table, tenant_id)? {}
     Ok(())
@@ -421,7 +422,7 @@ pub(super) fn forget_rows_in_txn(
         return Ok(());
     }
     let mut index_table = write_txn
-        .open_table(crate::catalog::user_uniq_table_def(&index_table_name))
+        .open_table_logged(crate::catalog::user_uniq_table_def(&index_table_name))
         .map_err(table_error)?;
     for &id in ids {
         let rev_sub = reverse_subkey(id);
@@ -721,7 +722,7 @@ pub(super) fn recover_forward_keys_for_rows(
     let ordinal_u16 =
         u16::try_from(ordinal).map_err(|_| internal("unique key ordinal exceeds u16 range"))?;
     let index_table = write_txn
-        .open_table(crate::catalog::user_uniq_table_def(&index_table_name))
+        .open_table_logged(crate::catalog::user_uniq_table_def(&index_table_name))
         .map_err(table_error)?;
     // 索引が現在のスキーマ・形式のものでなければ、逆引きは旧キーを指しうるため
     // 全行を復元不能として扱う（呼び出し側が一様に fail-closed に倒す）。

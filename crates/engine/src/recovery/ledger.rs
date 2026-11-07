@@ -31,6 +31,7 @@
 //! `docs/spec/05-tasks.md` TASK-98・`docs/spec/04-behavior/recovery.md` RECOVER-7。
 //! 契約の詳細は spec 参照）。
 
+use crate::storage::change_log::CaptureWriteTxn as _;
 use std::ops::Bound;
 
 use redb::{ReadableTable, TableDefinition, TableHandle};
@@ -484,7 +485,7 @@ pub(crate) fn precheck_in_write_txn(
     if !exists {
         return Ok(());
     }
-    let ledger_table = write_txn.open_table(OP_LEDGER_TABLE)?;
+    let ledger_table = write_txn.open_table_logged(OP_LEDGER_TABLE)?;
     let result = match ledger_table.get((tenant_id, table, op_id.as_str()))? {
         Some(guard) => classify_existing(guard.value(), content_hash),
         None => Ok(()),
@@ -542,7 +543,7 @@ fn record_core(
         } => Some(txn_start_micros),
         _ => None,
     };
-    let mut ledger_table = write_txn.open_table(OP_LEDGER_TABLE)?;
+    let mut ledger_table = write_txn.open_table_logged(OP_LEDGER_TABLE)?;
     let key = (tenant_id, table, op_id.as_str());
     if let Some(guard) = ledger_table.get(key)? {
         let stored = decode_entry(guard.value()).map_err(|_| {
@@ -589,7 +590,7 @@ fn record_core(
     // `last_op`（TASK-98・RECOVER-7）: 同一 write トランザクション内で upsert する
     // （`op_ledger` の keep-first 契約とは独立。原子性は `write_txn` の commit/drop
     // に委ねる）。
-    let mut last_op_table = write_txn.open_table(LAST_OP_TABLE)?;
+    let mut last_op_table = write_txn.open_table_logged(LAST_OP_TABLE)?;
     last_op_table.insert((tenant_id, table), encode_last_op(op_id).as_slice())?;
     Ok(RecordOutcome::Recorded)
 }
@@ -640,7 +641,7 @@ pub(crate) fn delete_table_in_txn(
     if existing_table_names.contains(OP_LEDGER_TABLE.name()) {
         // 同一 write txn 内で同じテーブルを二重に `open_table` すると
         // `TableAlreadyOpen` になるため、ハンドルはループ外で 1 度だけ取得する。
-        let mut ledger_table = write_txn.open_table(OP_LEDGER_TABLE)?;
+        let mut ledger_table = write_txn.open_table_logged(OP_LEDGER_TABLE)?;
         // 直前バッチで最後に処理したキー（次バッチの走査再開点。上記ドキュメント参照）。
         let mut resume_after: Option<(String, String, String)> = None;
         loop {
@@ -686,7 +687,7 @@ pub(crate) fn delete_table_in_txn(
     // （drop → 同名再作成での旧 `last_op` 引き継ぎ防止。有界バッチ走査パターンは
     // 上の `OP_LEDGER_TABLE` 側と揃える）。
     if existing_table_names.contains(LAST_OP_TABLE.name()) {
-        let mut last_op_table = write_txn.open_table(LAST_OP_TABLE)?;
+        let mut last_op_table = write_txn.open_table_logged(LAST_OP_TABLE)?;
         let mut resume_after: Option<(String, String)> = None;
         loop {
             let mut keys_to_remove: Vec<(String, String)> = Vec::new();
@@ -748,7 +749,7 @@ pub(crate) fn rename_table_in_txn(
     let target_exists = || StorageError::Codec("ledger rename target already has entries".into());
 
     if existing_table_names.contains(OP_LEDGER_TABLE.name()) {
-        let mut ledger_table = write_txn.open_table(OP_LEDGER_TABLE)?;
+        let mut ledger_table = write_txn.open_table_logged(OP_LEDGER_TABLE)?;
         let mut resume_after: Option<(String, String, String)> = None;
         loop {
             let mut batch: Vec<(String, String, Vec<u8>)> = Vec::new();
@@ -790,7 +791,7 @@ pub(crate) fn rename_table_in_txn(
     }
 
     if existing_table_names.contains(LAST_OP_TABLE.name()) {
-        let mut last_op_table = write_txn.open_table(LAST_OP_TABLE)?;
+        let mut last_op_table = write_txn.open_table_logged(LAST_OP_TABLE)?;
         let mut resume_after: Option<(String, String)> = None;
         loop {
             let mut batch: Vec<(String, Vec<u8>)> = Vec::new();
@@ -848,7 +849,7 @@ pub(crate) fn lookup_in_write_txn(
     if !exists {
         return Ok(false);
     }
-    let ledger_table = write_txn.open_table(OP_LEDGER_TABLE)?;
+    let ledger_table = write_txn.open_table_logged(OP_LEDGER_TABLE)?;
     let found = match ledger_table.get((tenant_id, table, op_id.as_str()))? {
         Some(guard) => {
             decode_entry(guard.value()).map_err(|_| {

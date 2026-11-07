@@ -13,6 +13,7 @@
 //! [`remove_function_acl_in_txn`] で行と印を同じ txn で消す。`CREATE OR REPLACE FUNCTION` は内部 ID を
 //! 保つので ACL を引き継ぐ。テナント境界: すべて `tenant_id` を先頭にしたキーだけを読み書きする。
 
+use crate::storage::change_log::CaptureWriteTxn as _;
 use redb::{ReadableTable, TableDefinition};
 
 use crate::storage::read_source::ReadSource;
@@ -93,7 +94,7 @@ pub(crate) fn mark_acl_initialized_in_txn(
         ));
     }
     let key = function_id.to_string();
-    let mut table = write_txn.open_table(ACL_INIT_TABLE)?;
+    let mut table = write_txn.open_table_logged(ACL_INIT_TABLE)?;
     table.insert(
         (tenant, KIND_FUNCTION, key.as_str()),
         [ACL_INIT_VERSION].as_slice(),
@@ -141,7 +142,7 @@ pub(crate) fn remove_function_acl_in_txn(
         Err(e) => return Err(CatalogError::from(e)),
     }
     if !doomed.is_empty() {
-        let mut table = write_txn.open_table(ACL_TABLE)?;
+        let mut table = write_txn.open_table_logged(ACL_TABLE)?;
         for (grantee, grantor) in doomed {
             table.remove((tenant, KIND_FUNCTION, key.as_str(), "", grantee, grantor))?;
         }
@@ -151,7 +152,7 @@ pub(crate) fn remove_function_acl_in_txn(
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
         Err(e) => return Err(CatalogError::from(e)),
     }
-    let mut table = write_txn.open_table(ACL_INIT_TABLE)?;
+    let mut table = write_txn.open_table_logged(ACL_INIT_TABLE)?;
     table.remove((tenant, KIND_FUNCTION, key.as_str()))?;
     Ok(())
 }

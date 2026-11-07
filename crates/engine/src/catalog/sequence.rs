@@ -27,6 +27,7 @@
 //! fail-closed: 定義 blob の未知の版・未知のタグ・長さ不一致・範囲不変条件の違反は
 //! `CorruptSchema` とし、decode で黙って補正しない。
 
+use crate::storage::change_log::CaptureWriteTxn as _;
 use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 
 mod migrated_identity;
@@ -511,7 +512,7 @@ pub(crate) fn sequence_exists_in_txn(
 
 /// 内部 ID を 1 つ払い出す（1 始まり・`checked_add`・再利用しない）。
 fn allocate_sequence_id_in_txn(write_txn: &redb::WriteTransaction) -> Result<u64> {
-    let mut counter = write_txn.open_table(SEQUENCE_ID_COUNTER_TABLE)?;
+    let mut counter = write_txn.open_table_logged(SEQUENCE_ID_COUNTER_TABLE)?;
     let current = counter
         .get(SEQUENCE_ID_COUNTER_KEY)?
         .map(|v| v.value())
@@ -774,7 +775,7 @@ fn write_state_in_txn(
     sequence_id: u64,
     cursor: &SeqCursor,
 ) -> Result<()> {
-    let mut t = write_txn.open_table(SEQUENCE_STATE_TABLE)?;
+    let mut t = write_txn.open_table_logged(SEQUENCE_STATE_TABLE)?;
     t.insert((tenant, sequence_id), encode_state(cursor).as_slice())?;
     Ok(())
 }
@@ -869,7 +870,7 @@ fn delete_sequence_state_in_txn(write_txn: &redb::WriteTransaction, id: u64) -> 
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
         Err(e) => return Err(e.into()),
     }
-    let mut t = write_txn.open_table(SEQUENCE_STATE_TABLE)?;
+    let mut t = write_txn.open_table_logged(SEQUENCE_STATE_TABLE)?;
     t.retain(|(_, sid), _| sid != id)?;
     Ok(())
 }
@@ -1087,7 +1088,7 @@ pub(crate) fn set_sequence_owner_in_txn(
             ));
         }
     }
-    let mut table = write_txn.open_table(SEQUENCES_TABLE)?;
+    let mut table = write_txn.open_table_logged(SEQUENCES_TABLE)?;
     table.insert(
         sequence_key(name),
         encode_sequence_def(def.id, &def.params, def.restart_value, owner.as_ref()).as_slice(),
@@ -1120,7 +1121,7 @@ pub(crate) fn create_sequence_in_txn(
         return Err(CatalogError::TableAlreadyExists(name.to_string()));
     }
     let id = allocate_sequence_id_in_txn(write_txn)?;
-    let mut table = write_txn.open_table(SEQUENCES_TABLE)?;
+    let mut table = write_txn.open_table_logged(SEQUENCES_TABLE)?;
     if table.len()? >= MAX_SEQUENCES as u64 {
         return Err(CatalogError::ViewLimitExceeded(
             "too many sequences".to_string(),
@@ -1281,7 +1282,7 @@ pub(crate) fn drop_sequence_in_txn(write_txn: &redb::WriteTransaction, name: &st
         return Err(CatalogError::DependentObjectsStillExist(name.to_string()));
     }
     {
-        let mut table = write_txn.open_table(SEQUENCES_TABLE)?;
+        let mut table = write_txn.open_table_logged(SEQUENCES_TABLE)?;
         table.remove(sequence_key(name))?;
     }
     delete_sequence_state_in_txn(write_txn, id)?;
@@ -1311,7 +1312,7 @@ pub(crate) fn drop_owned_sequences_in_txn(
     }
     for (name, def, _) in &targets {
         {
-            let mut table = write_txn.open_table(SEQUENCES_TABLE)?;
+            let mut table = write_txn.open_table_logged(SEQUENCES_TABLE)?;
             table.remove(sequence_key(name))?;
         }
         delete_sequence_state_in_txn(write_txn, def.id)?;
@@ -1405,7 +1406,7 @@ pub(crate) fn rewrite_sequence_owners_in_txn(
         let Some(new_owner) = rewrite(&owner) else {
             continue;
         };
-        let mut table = write_txn.open_table(SEQUENCES_TABLE)?;
+        let mut table = write_txn.open_table_logged(SEQUENCES_TABLE)?;
         table.insert(
             sequence_key(&name),
             encode_sequence_def(def.id, &def.params, def.restart_value, Some(&new_owner))
@@ -1522,7 +1523,7 @@ impl Storage {
             resolve_altered_definition(&def.params, def.restart_value, caller_current, alter)
                 .map_err(AlterSequenceError::Range)?;
         {
-            let mut table = write_txn.open_table(SEQUENCES_TABLE)?;
+            let mut table = write_txn.open_table_logged(SEQUENCES_TABLE)?;
             table.insert(
                 sequence_key(name),
                 encode_sequence_def(def.id, &params, restart_value, owner.as_ref()).as_slice(),
@@ -1572,7 +1573,7 @@ impl Storage {
             return Err(CatalogError::DependentObjectsStillExist(old.to_string()));
         }
         {
-            let mut table = write_txn.open_table(SEQUENCES_TABLE)?;
+            let mut table = write_txn.open_table_logged(SEQUENCES_TABLE)?;
             table.remove(sequence_key(old))?;
             table.insert(sequence_key(new), bytes.as_slice())?;
         }

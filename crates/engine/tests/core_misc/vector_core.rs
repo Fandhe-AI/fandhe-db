@@ -9,6 +9,11 @@
 //! 済ませてから、その所有権ごと [`EngineCore::from_storage`] へ渡して `EngineCore` を
 //! 構築する（構築後は `EngineCore` から生 `Storage` へ戻る経路がない）。
 
+// 許可（clippy::disallowed_methods）: 本ファイルは engine の公開 API の外から redb を直接開き、
+// 永続内容の検査・破壊・裏口の対照を行う。変更ログの捕捉（`storage::change_log`）を通す
+// 対象は engine 製品コードの書き込み点で、外部クレートとしての直接操作は対象外。
+#![allow(clippy::disallowed_methods)]
+
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};

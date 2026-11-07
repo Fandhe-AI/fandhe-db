@@ -30,6 +30,7 @@ use crate::catalog::{map_row_table_error, CatalogError, ColumnType, TableSchema}
 use crate::policy::PolicyContext;
 use crate::row_codec::Value;
 use crate::sql::allowlist::SqlSurfaceError;
+use crate::storage::change_log::CaptureWriteTxn as _;
 use crate::storage::{RowInput, Visibility};
 use crate::trigger::plan::InsertTriggerPlan;
 use crate::trigger::write_handle::TriggerWriteHandle;
@@ -122,7 +123,7 @@ pub(super) fn write_rows_with_triggers(
         {
             let row_table_name = user_rows_table_name(table);
             let mut row_table = write_txn
-                .open_table(user_rows_table_def(&row_table_name))
+                .open_table_logged(user_rows_table_def(&row_table_name))
                 .map_err(map_row_table_error)?;
             insert_unique_row(write_txn, table, &mut row_table, key, encoded.as_slice())?;
         }

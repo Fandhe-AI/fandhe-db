@@ -31,6 +31,7 @@
 //! テーブル単位分離を検討する場合は、本モジュールの可視性フィルタと独立した設計判断
 //! として扱うこと。
 
+use crate::storage::change_log::{CaptureWriteTxn as _, CapturingTable};
 use redb::{ReadableDatabase, ReadableTable};
 
 use crate::storage::rowid::{row_key, RowId};
@@ -1080,7 +1081,7 @@ impl From<LedgerRecordError> for TenantWriteError {
 fn insert_unique_row(
     write_txn: &redb::WriteTransaction,
     table: &str,
-    row_table: &mut redb::Table<'_, (&'static str, u64), &'static [u8]>,
+    row_table: &mut CapturingTable<'_, (&'static str, u64), &'static [u8]>,
     key: (&str, u64),
     encoded: &[u8],
 ) -> Result<(), TenantWriteError> {
@@ -1200,7 +1201,7 @@ pub(crate) fn insert_row_unchecked(
         )?;
         let row_table_name = user_rows_table_name(table);
         let mut row_table = write_txn
-            .open_table(user_rows_table_def(&row_table_name))
+            .open_table_logged(user_rows_table_def(&row_table_name))
             .map_err(map_row_table_error)?;
         // 物理キーはサーバー側導出テナントで名前空間化する（TABLE-12・RLS-9）。
         let key = row_key(ctx.tenant_id(), RowId::from_legacy_id(id));
@@ -1387,7 +1388,7 @@ pub(crate) fn insert_rows_unchecked(
         )?;
         let row_table_name = user_rows_table_name(table);
         let mut row_table = write_txn
-            .open_table(user_rows_table_def(&row_table_name))
+            .open_table_logged(user_rows_table_def(&row_table_name))
             .map_err(map_row_table_error)?;
         for ((id, row), range) in rows.iter().zip(ranges.iter()) {
             schema.validate_row_embedding_dim(row.embedding.len())?;
@@ -2302,7 +2303,7 @@ fn insert_typed_row_impl(
         };
         let row_table_name = user_rows_table_name(table);
         let mut row_table = write_txn
-            .open_table(user_rows_table_def(&row_table_name))
+            .open_table_logged(user_rows_table_def(&row_table_name))
             .map_err(map_row_table_error)?;
         let key = row_key(ctx.tenant_id(), row_id);
         let encoded = encode_row(&row)?;
@@ -2862,7 +2863,7 @@ pub(crate) fn insert_typed_rows_unchecked(
             }
             let row_table_name = user_rows_table_name(table);
             let mut row_table = write_txn
-                .open_table(user_rows_table_def(&row_table_name))
+                .open_table_logged(user_rows_table_def(&row_table_name))
                 .map_err(map_row_table_error)?;
             for (row_idx, (_, orig_values)) in rows.iter().enumerate() {
                 check_interrupt()?;
@@ -3476,7 +3477,7 @@ fn upsert_typed_rows_impl(
             };
             let row_table_name = user_rows_table_name(table);
             let mut row_table = write_txn
-                .open_table(user_rows_table_def(&row_table_name))
+                .open_table_logged(user_rows_table_def(&row_table_name))
                 .map_err(map_row_table_error)?;
 
             // UNIQUE 対象（Issue #1074）は書き込み**前**のスナップショットで対象
@@ -4175,7 +4176,7 @@ pub(crate) fn update_row_unchecked(
 
             let row_table_name = user_rows_table_name(table);
             let mut row_table = write_txn
-                .open_table(user_rows_table_def(&row_table_name))
+                .open_table_logged(user_rows_table_def(&row_table_name))
                 .map_err(map_row_table_error)?;
             // 物理キーの名前空間化（TABLE-12）により、他テナントの行はそもそも別キーで
             // 到達不能（構造的な遮断）。既存行の所有者照合は `is_owner` の単一照合パスに
@@ -5548,7 +5549,7 @@ fn update_row_columns_impl(
 
             let row_table_name = user_rows_table_name(table);
             let mut row_table = write_txn
-                .open_table(user_rows_table_def(&row_table_name))
+                .open_table_logged(user_rows_table_def(&row_table_name))
                 .map_err(map_row_table_error)?;
             // `AccessGuard` の借用はこのブロック内に閉じ込め、後続の可変借用
             // （`insert`）と衝突しないようにする（`update_row_unchecked` と同じ設計）。
@@ -6127,7 +6128,7 @@ fn delete_row_impl(
 
             let row_table_name = user_rows_table_name(table);
             let mut row_table = write_txn
-                .open_table(user_rows_table_def(&row_table_name))
+                .open_table_logged(user_rows_table_def(&row_table_name))
                 .map_err(map_row_table_error)?;
             // `update_row` と同じく `(tenant_id, id)` キー（TABLE-12）＋ `is_owner` の二重防御。
             let key = row_key(ctx.tenant_id(), RowId::from_legacy_id(id));
@@ -6968,7 +6969,7 @@ fn delete_rows_where_impl<E>(
             .map_err(dml_write_err)?;
             let row_table_name = user_rows_table_name(table);
             let row_table = write_txn
-                .open_table(user_rows_table_def(&row_table_name))
+                .open_table_logged(user_rows_table_def(&row_table_name))
                 .map_err(|e| dml_write_err(map_row_table_error(e)))?;
             let candidate_ids = enumerate_dml_candidates(
                 table,
@@ -7292,7 +7293,7 @@ fn update_rows_where_impl<E>(
             .map_err(dml_write_err)?;
             let row_table_name = user_rows_table_name(table);
             let row_table = write_txn
-                .open_table(user_rows_table_def(&row_table_name))
+                .open_table_logged(user_rows_table_def(&row_table_name))
                 .map_err(|e| dml_write_err(map_row_table_error(e)))?;
             let candidate_ids = enumerate_dml_candidates(
                 table,
@@ -7477,7 +7478,7 @@ pub(crate) fn update_rows_joined_unchecked<E>(
             .map_err(dml_write_err)?;
             let row_table_name = user_rows_table_name(table);
             let row_table = write_txn
-                .open_table(user_rows_table_def(&row_table_name))
+                .open_table_logged(user_rows_table_def(&row_table_name))
                 .map_err(|e| dml_write_err(map_row_table_error(e)))?;
             let candidates = enumerate_dml_candidates_with(
                 table,
@@ -7612,7 +7613,7 @@ fn apply_predicate_delete_in_txn<E>(
     {
         let row_table_name = user_rows_table_name(table);
         let mut row_table = write_txn
-            .open_table(user_rows_table_def(&row_table_name))
+            .open_table_logged(user_rows_table_def(&row_table_name))
             .map_err(|e| dml_write_err(map_row_table_error(e)))?;
         for id in candidate_ids {
             check_interrupt().map_err(dml_write_err)?;
@@ -7745,7 +7746,7 @@ fn apply_predicate_update_in_txn<E>(
     {
         let row_table_name = user_rows_table_name(table);
         let mut row_table = write_txn
-            .open_table(user_rows_table_def(&row_table_name))
+            .open_table_logged(user_rows_table_def(&row_table_name))
             .map_err(|e| dml_write_err(map_row_table_error(e)))?;
         for (pos, id) in candidate_ids.iter().enumerate() {
             check_interrupt().map_err(dml_write_err)?;
@@ -8082,7 +8083,7 @@ pub(crate) fn truncate_tables_unchecked(
                     check_interrupt()?;
                     let row_table_name = user_rows_table_name(table);
                     let mut row_table = write_txn
-                        .open_table(user_rows_table_def(&row_table_name))
+                        .open_table_logged(user_rows_table_def(&row_table_name))
                         .map_err(map_row_table_error)?;
                     let start = std::ops::Bound::Included((tenant, 0u64));
                     let end = std::ops::Bound::Included((tenant, u64::MAX));
@@ -8347,7 +8348,7 @@ pub(crate) fn replace_typed_rows_by_text_key(
 
             let row_table_name = user_rows_table_name(table);
             let mut row_table = write_txn
-                .open_table(user_rows_table_def(&row_table_name))
+                .open_table_logged(user_rows_table_def(&row_table_name))
                 .map_err(map_row_table_error)?;
 
             let tenant = ctx.tenant_id();

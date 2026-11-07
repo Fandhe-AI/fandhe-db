@@ -13,9 +13,18 @@
 //! - 無効時（[`ChangeLogState`] が `Storage` に無い）は frame・session を確保しない。ラッパの
 //!   open は原子的カウンタを 1 回読むだけで戻る
 //!
-//! 本モジュールは土台で、既存の書き込み点はまだラッパへ移行していない（後続 Issue #3068）。
-//! 有効化の入口（`Storage::enable_change_log`）も crate 内に閉じ、運用者の CLI からは
-//! 拒否される（#3069 まで）。そのため未使用項目の警告を抑止している。
+//! 書き込み側の表操作は、すべて [`CaptureWriteTxn`] の `*_logged`（本ファイルの [`CapturingTable`]・
+//! [`delete_table`]・[`rename_table`] へ委譲）を経由する。`redb::WriteTransaction` の
+//! `open_table`・`delete_table`・`rename_table`・`open_multimap_table` の直呼びは、リポジトリ直下の
+//! `clippy.toml`（`disallowed-methods`）で禁止され、CI の `-D warnings` で落ちる（D1 の層 1）。素の
+//! open を許す箇所は、本ファイル（捕捉つきハンドルの本体と、記録範囲の例外である本体表・メタ表）と
+//! `storage::read_source`（読み取り専用の境界でだけ露出するハンドル）に限る。
+//!
+//! commit 前の検査（D1 の層 2）は [`CaptureSession::prepare`] の中の `verify_footprint` で、論理表名から
+//! 物理表名を引く対応関数（`physical_row_store`）を経由して行う。
+//!
+//! 有効化の入口（`Storage::enable_change_log`）は crate 内に閉じ、運用者の CLI からは拒否される
+//! （オラクル試験と有効化は #3069）。そのため未使用項目の警告を抑止している。
 //!
 //! # 記録範囲の例外
 //!
@@ -38,7 +47,9 @@ use std::ops::Deref;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
-use redb::{Key, MutInPlaceValue, ReadableTable, TableDefinition, TableHandle, Value};
+use redb::{
+    Key, MutInPlaceValue, ReadableTable, ReadableTableMetadata, TableDefinition, TableHandle, Value,
+};
 
 use super::table_image::{self, AfterImage, Meter, ReadMode, ReadOutcome};
 use super::{Result, StorageError, GENERATION_KEY, GENERATION_TABLE};
@@ -456,6 +467,8 @@ pub(crate) fn load_or_init_identity(
     write_txn: &redb::WriteTransaction,
     limits: CaptureLimits,
 ) -> Result<(ChangeLogState, bool)> {
+    // 許可（clippy::disallowed_methods）: メタ表は記録範囲の例外（D3）で、捕捉の対象外。
+    #[allow(clippy::disallowed_methods)]
     let mut meta = write_txn.open_table(META_TABLE)?;
     let invalid = || StorageError::Codec("invalid change log identity".to_string());
     // 読み取りの借用を閉じてから書く（`get` のガードは `meta` を借用する）。
@@ -768,6 +781,8 @@ impl CaptureSession {
             self.state.limits.max_record_elements,
         )
         .map_err(|_| StorageError::CommitFootprintUnrecordable)?;
+        // 許可（clippy::disallowed_methods）: 本体表は記録範囲の例外（D3）。レコード自身を捕捉しない。
+        #[allow(clippy::disallowed_methods)]
         let mut table = write_txn.open_table(CHANGE_LOG_TABLE)?;
         table.insert(g_c, bytes.as_slice())?;
         Ok(())
@@ -803,6 +818,8 @@ impl CaptureSession {
                 }
             }
         }
+        // D1 の層 2: 計装漏れ（捕捉を通らない書き込み・表操作）を commit 前に拒否する。
+        self.verify_footprint(write_txn, &st, &base_names, &final_names, &touched)?;
         let full: BTreeSet<&str> = final_names
             .iter()
             .filter(|n| !base_names.contains(*n) || touched.contains(n.as_str()))
@@ -836,6 +853,99 @@ impl CaptureSession {
         body.tables = changes.into_values().collect();
         Ok(body)
     }
+}
+
+impl CaptureSession {
+    /// D1 の層 2（補助的な早期検出。完全性の担保は層 1 の直呼び禁止と層 3 のオラクルが負う）。
+    /// `build_body` が表集合の差を求めた直後に呼び、次のいずれかなら
+    /// `CommitFootprintUnrecordable` で commit 前に拒否する（fail-closed。durable な書き込みは無い）。
+    ///
+    /// 1. 基底に在って最終に無い表に `Dropped`／`Renamed` のイベントが無い（捕捉を通らない
+    ///    `delete_table`・`rename_table`）
+    /// 2. 世代が変化した論理表（[`crate::catalog::changed_table_generations_in_write_txn`]）の
+    ///    世代カウンタ表のキーが積まれていない（世代の採番が捕捉を通っていない）
+    /// 3. 世代が変化した論理表の行ストア（[`physical_row_store`] の対応）が、基底・最終の双方に在り
+    ///    イベントも受けていないのに、行数が変わったのにキーが積まれていない・行数の変化がキー数を
+    ///    超える（書き込まれたのにキーが積まれていない）
+    ///
+    /// 論理→物理の対応が未定義の論理表（行ストアを持たない種類）は 3 を省く（拒否ではなく
+    /// 実装時のテストで検出する。ADR D1）。行数は O(1) の読み取りで、全行は走査しない。
+    /// 世代カウンタ表の走査は O(世代管理対象の表の数) で、変更ログ有効時の commit だけが負う。
+    /// 世代が変わった表ごとの追加費用は行数の読み取り 2 回で、`list_tables` は表集合の取得（2 回）に
+    /// 一本化してある。
+    fn verify_footprint(
+        &self,
+        write_txn: &redb::WriteTransaction,
+        st: &FrameState,
+        base_names: &BTreeSet<String>,
+        final_names: &BTreeSet<String>,
+        touched: &BTreeSet<&str>,
+    ) -> Result<()> {
+        let unrecordable = || StorageError::CommitFootprintUnrecordable;
+        for n in base_names {
+            if !final_names.contains(n) && !touched.contains(n.as_str()) {
+                return Err(unrecordable());
+            }
+        }
+        let changed = crate::catalog::changed_table_generations_in_write_txn(write_txn, &self.base)
+            .map_err(|_| unrecordable())?;
+        let generation_table = crate::catalog::TABLE_GENERATION_TABLE.name();
+        for logical in &changed {
+            let captured = st
+                .keys
+                .get(generation_table)
+                .is_some_and(|keys| keys.contains(logical.as_bytes()));
+            if !captured {
+                return Err(unrecordable());
+            }
+            let Some(row_store) = physical_row_store(logical) else {
+                continue;
+            };
+            if !base_names.contains(&row_store)
+                || !final_names.contains(&row_store)
+                || touched.contains(row_store.as_str())
+            {
+                continue;
+            }
+            let after = write_row_store_len(write_txn, &row_store)?;
+            let before = base_row_store_len(&self.base, &row_store)?;
+            let noted = st.keys.get(row_store.as_str()).map_or(0, BTreeSet::len);
+            let delta = after.abs_diff(before);
+            if delta > u64::try_from(noted).unwrap_or(u64::MAX) {
+                return Err(unrecordable());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// 論理表名（`table_generation` の登録名）から、その行ストアの物理表名を引く対応関数。
+/// 層 2 が物理名を直接比較しないための唯一の経路。行ストアを持たない論理表は `None`。
+fn physical_row_store(logical: &str) -> Option<String> {
+    if logical.is_empty() || logical.contains('/') {
+        return None;
+    }
+    Some(crate::catalog::user_rows_physical_name(logical))
+}
+
+/// 書き込み側の行ストアの行数（O(1)）。呼び出し側が表の存在を表集合で確認済みなので、
+/// 読み取り入力源の `open_table` が表ごとに行う `list_tables` を避けて直接開く（読み取りのみ。
+/// 表は作らず、ハンドルは行数を読んですぐ捨てる）。
+fn write_row_store_len(write_txn: &redb::WriteTransaction, name: &str) -> Result<u64> {
+    // 許可（clippy::disallowed_methods）: 存在確認済みの表の行数を読むだけで、書き込まない。
+    #[allow(clippy::disallowed_methods)]
+    let table = write_txn
+        .open_table(crate::catalog::user_rows_table_def(name))
+        .map_err(|_| StorageError::CommitFootprintUnrecordable)?;
+    ReadableTableMetadata::len(&table).map_err(|_| StorageError::CommitFootprintUnrecordable)
+}
+
+/// 基底の行ストアの行数（O(1)。存在は表集合で確認済み）。
+fn base_row_store_len(base: &redb::ReadTransaction, name: &str) -> Result<u64> {
+    let table = base
+        .open_table(crate::catalog::user_rows_table_def(name))
+        .map_err(|_| StorageError::CommitFootprintUnrecordable)?;
+    ReadableTableMetadata::len(&table).map_err(|_| StorageError::CommitFootprintUnrecordable)
 }
 
 fn generation_key_bytes() -> &'static [u8] {
@@ -922,6 +1032,8 @@ impl<'txn, K: Key + 'static, V: Value + 'static> CapturingTable<'txn, K, V> {
         write_txn: &'txn redb::WriteTransaction,
         def: TableDefinition<'_, K, V>,
     ) -> std::result::Result<Self, redb::TableError> {
+        // 許可（clippy::disallowed_methods）: 捕捉つきハンドルを作る本体（素の open を許すのは本ファイルの数か所のみ）。
+        #[allow(clippy::disallowed_methods)]
         let table = write_txn.open_table(def)?;
         let capture = frame_for(write_txn).map(|frame| TableCapture {
             frame,
@@ -1000,6 +1112,71 @@ impl<'txn, K: Key + 'static, V: Value + 'static> CapturingTable<'txn, K, V> {
             keep
         })
     }
+
+    /// `range` の行のうち `predicate` が `false` を返したものを取り除く。取り除いたキーだけを積む
+    /// ([`Self::retain`] の範囲指定版。`predicate` は panic しないこと。redb の契約)。
+    pub(crate) fn retain_in<'a, KR, F>(
+        &mut self,
+        range: impl std::ops::RangeBounds<KR> + 'a,
+        mut predicate: F,
+    ) -> std::result::Result<(), redb::StorageError>
+    where
+        KR: Borrow<K::SelfType<'a>> + 'a,
+        F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) -> bool,
+    {
+        let Some(c) = &self.capture else {
+            return self.table.retain_in(range, predicate);
+        };
+        let mut buf: Vec<u8> = Vec::new();
+        self.table.retain_in(range, |k, v| {
+            buf.clear();
+            buf.extend_from_slice(K::as_bytes(&k).as_ref());
+            let keep = predicate(k, v);
+            if !keep {
+                c.frame.note_key(&c.name, &buf);
+            }
+            keep
+        })
+    }
+}
+
+/// 読み取り系の境界（`&impl ReadableTable<K, V>` を取る関数）へ渡せるよう、素の `Table` の
+/// 読み取りへそのまま委譲する。変更系の入口は増やさない（読み取りのみ）。
+impl<K: Key + 'static, V: Value + 'static> ReadableTableMetadata for CapturingTable<'_, K, V> {
+    fn stats(&self) -> std::result::Result<redb::TableStats, redb::StorageError> {
+        self.table.stats()
+    }
+
+    fn len(&self) -> std::result::Result<u64, redb::StorageError> {
+        self.table.len()
+    }
+}
+
+impl<K: Key + 'static, V: Value + 'static> ReadableTable<K, V> for CapturingTable<'_, K, V> {
+    fn get<'a>(
+        &self,
+        key: impl Borrow<K::SelfType<'a>>,
+    ) -> std::result::Result<Option<redb::AccessGuard<'_, V>>, redb::StorageError> {
+        ReadableTable::get(&self.table, key)
+    }
+
+    fn range<'a, KR>(
+        &self,
+        range: impl std::ops::RangeBounds<KR> + 'a,
+    ) -> std::result::Result<redb::Range<'_, K, V>, redb::StorageError>
+    where
+        KR: Borrow<K::SelfType<'a>> + 'a,
+    {
+        ReadableTable::range(&self.table, range)
+    }
+
+    fn first(&self) -> std::result::Result<Popped<'_, K, V>, redb::StorageError> {
+        ReadableTable::first(&self.table)
+    }
+
+    fn last(&self) -> std::result::Result<Popped<'_, K, V>, redb::StorageError> {
+        ReadableTable::last(&self.table)
+    }
 }
 
 impl<K: Key + 'static, V: MutInPlaceValue + 'static> CapturingTable<'_, K, V> {
@@ -1026,7 +1203,10 @@ pub(crate) fn delete_table(
             frame.note_event(TableEvent::Dropped(table.name().into()));
         }
     }
-    write_txn.delete_table(table)
+    // 許可（clippy::disallowed_methods）: イベントを積んだ後の委譲先。
+    #[allow(clippy::disallowed_methods)]
+    let deleted = write_txn.delete_table(table);
+    deleted
 }
 
 /// 表の名前を付け替える。`Renamed` イベントを積んでから redb へ委譲する（`write_txn.rename_table` の直呼びを置き換える）。
@@ -1043,7 +1223,61 @@ pub(crate) fn rename_table(
             });
         }
     }
-    write_txn.rename_table(from, to)
+    // 許可（clippy::disallowed_methods）: イベントを積んだ後の委譲先。
+    #[allow(clippy::disallowed_methods)]
+    let renamed = write_txn.rename_table(from, to);
+    renamed
+}
+
+/// 書き込みトランザクションの表操作を、変更ログの捕捉つきで行う拡張メソッド群。
+///
+/// engine の書き込み点は `redb::WriteTransaction` の `open_table`・`delete_table`・
+/// `rename_table` を直接呼ばず、本 trait の `*_logged` を経由する（直呼びは `clippy.toml` の
+/// `disallowed-methods` で禁止。D1 の層 1）。`*_logged` は本ファイルの [`CapturingTable::open`]・
+/// [`delete_table`]・[`rename_table`] へ委譲するだけで、無効時（frame なし）の挙動は素の redb と同じ。
+pub(crate) trait CaptureWriteTxn {
+    /// `def` を開き、書き込みを capture frame へ積むハンドルを返す。
+    fn open_table_logged<'txn, K: Key + 'static, V: Value + 'static>(
+        &'txn self,
+        def: TableDefinition<'_, K, V>,
+    ) -> std::result::Result<CapturingTable<'txn, K, V>, redb::TableError>;
+
+    /// 表を削除し、`Dropped` イベントを積む。
+    fn delete_table_logged(
+        &self,
+        table: impl TableHandle,
+    ) -> std::result::Result<bool, redb::TableError>;
+
+    /// 表の名前を付け替え、`Renamed` イベントを積む。
+    fn rename_table_logged(
+        &self,
+        from: impl TableHandle,
+        to: impl TableHandle,
+    ) -> std::result::Result<(), redb::TableError>;
+}
+
+impl CaptureWriteTxn for redb::WriteTransaction {
+    fn open_table_logged<'txn, K: Key + 'static, V: Value + 'static>(
+        &'txn self,
+        def: TableDefinition<'_, K, V>,
+    ) -> std::result::Result<CapturingTable<'txn, K, V>, redb::TableError> {
+        CapturingTable::open(self, def)
+    }
+
+    fn delete_table_logged(
+        &self,
+        table: impl TableHandle,
+    ) -> std::result::Result<bool, redb::TableError> {
+        delete_table(self, table)
+    }
+
+    fn rename_table_logged(
+        &self,
+        from: impl TableHandle,
+        to: impl TableHandle,
+    ) -> std::result::Result<(), redb::TableError> {
+        rename_table(self, from, to)
+    }
 }
 
 #[cfg(test)]
@@ -1928,5 +2162,181 @@ mod tests {
             v.value().to_vec()
         };
         assert!(decode_record_with(&bytes, usize::MAX, 6).is_ok());
+    }
+
+    /// 無効時のハンドルは素の `Table` に捕捉の保持枠（`Option<TableCapture>`）が足されただけで、
+    /// open は frame を引かず（`capture` が `None`）、書き込みごとの追加コストは分岐 1 つ。
+    #[test]
+    fn disabled_handle_only_adds_the_capture_slot() {
+        let extra = std::mem::size_of::<CapturingTable<'static, &str, &[u8]>>()
+            - std::mem::size_of::<redb::Table<'static, &str, &[u8]>>();
+        assert!(extra >= std::mem::size_of::<Option<TableCapture>>());
+        assert!(extra <= 32, "capture slot must stay small, got {extra}");
+
+        let path = unique_db_path("change-log-disabled-handle");
+        let _guard = CleanupGuard(path.clone());
+        let storage = super::super::Storage::open(&path).expect("open");
+        let txn = storage.begin_write_txn().expect("txn");
+        let t = CapturingTable::open(&txn, USERS).expect("open");
+        assert!(!t.is_capturing());
+    }
+
+    // ---- 層 2: commit 前の検査（D1）----
+
+    fn gen_table_def() -> TableDefinition<'static, &'static str, u64> {
+        crate::catalog::TABLE_GENERATION_TABLE
+    }
+
+    /// 捕捉を通らない `delete_table`・`rename_table` は、イベントが無いので commit 前に拒否される。
+    #[test]
+    fn uncaptured_drop_or_rename_is_rejected_before_commit() {
+        for rename in [false, true] {
+            let (_g, storage) = enabled("change-log-l2-bypass-table-op");
+            let txn = storage.begin_write_txn().expect("txn");
+            {
+                let mut t = CapturingTable::open(&txn, USERS).expect("open");
+                t.insert("a", b"1".as_slice()).expect("insert");
+            }
+            do_commit(txn);
+            let before = storage.current_generation().expect("gen");
+
+            let txn = storage.begin_write_txn().expect("txn");
+            if rename {
+                txn.rename_table(USERS, RENAMED).expect("raw rename");
+            } else {
+                txn.delete_table(USERS).expect("raw delete");
+            }
+            let err = commit_result(txn).expect_err("must reject");
+            assert!(matches!(err, StorageError::CommitFootprintUnrecordable));
+            assert_eq!(storage.current_generation().expect("gen"), before);
+            assert_eq!(records(&storage).len(), 1);
+        }
+    }
+
+    /// 世代が進んだ論理表の行ストアが、キーの積まれないまま行数を変えていれば拒否される。
+    #[test]
+    fn uncaptured_row_write_to_a_bumped_table_is_rejected() {
+        let (_g, storage) = enabled("change-log-l2-bypass-rows");
+        let physical = crate::catalog::user_rows_physical_name("ev");
+        let def = crate::catalog::user_rows_table_def(&physical);
+        let write_rows = |raw: bool| {
+            let txn = storage.begin_write_txn().expect("txn");
+            crate::catalog::bump_table_generation_in_txn(&txn, "ev").expect("bump");
+            // SQL-38 の commit 記録（別機構）の足跡。本テストは変更ログの層 2 だけを切り出して見る。
+            crate::storage::commit_log::note_table(&txn, "ev");
+            if raw {
+                let mut t = txn.open_table(def).expect("raw open");
+                t.insert(("tenant", 9u64), b"x".as_slice()).expect("insert");
+            } else {
+                let mut t = CapturingTable::open(&txn, def).expect("open");
+                t.insert(("tenant", 1u64), b"x".as_slice()).expect("insert");
+            }
+            commit_result(txn)
+        };
+        // 1 回目は捕捉つきで成功する（行ストアが基底に載る）。
+        write_rows(false).expect("captured write commits");
+        let before = storage.current_generation().expect("gen");
+        let recs = records(&storage);
+        assert_eq!(recs.len(), 1);
+        assert_eq!(change(&recs[0], &physical).upserts.len(), 1);
+        assert!(change(&recs[0], "table_generation")
+            .upserts
+            .iter()
+            .any(|(k, _)| k == b"ev"));
+        // 2 回目は素の open で行を足すので、キーが積まれず拒否される。
+        let err = write_rows(true).expect_err("must reject");
+        assert!(matches!(err, StorageError::CommitFootprintUnrecordable));
+        assert_eq!(storage.current_generation().expect("gen"), before);
+        assert_eq!(records(&storage).len(), 1);
+        // 同じ手順でも捕捉を通せば通る（拒否の理由が層 2 の検査であることの対照）。
+        write_rows(false).expect("captured write commits again");
+        assert_eq!(records(&storage).len(), 2);
+    }
+
+    /// 世代カウンタの書き込みが捕捉を通っていなければ拒否される（捕捉を通せば同じ書き込みは通る）。
+    #[test]
+    fn uncaptured_generation_bump_is_rejected() {
+        let (_g, storage) = enabled("change-log-l2-bypass-gen");
+        let write = |raw: bool| {
+            let txn = storage.begin_write_txn().expect("txn");
+            if raw {
+                let mut t = txn.open_table(gen_table_def()).expect("raw open");
+                t.insert("ev", 1u64).expect("insert");
+            } else {
+                let mut t = CapturingTable::open(&txn, gen_table_def()).expect("open");
+                t.insert("ev", 1u64).expect("insert");
+            }
+            // SQL-38 の commit 記録（別機構）の足跡。本テストは変更ログの層 2 だけを切り出して見る。
+            crate::storage::commit_log::note_table(&txn, "ev");
+            commit_result(txn)
+        };
+        let err = write(true).expect_err("must reject");
+        assert!(matches!(err, StorageError::CommitFootprintUnrecordable));
+        assert!(records(&storage).is_empty());
+        write(false).expect("captured write commits");
+        assert_eq!(records(&storage).len(), 1);
+    }
+
+    // ---- 書き込み点の移行（SQL 操作がレコードに載る）----
+
+    /// 製品経路の SQL 操作（DDL・INSERT・UPDATE・DELETE・RENAME・DROP）が、ラッパ経由で 1 commit = 1 レコードに載り、
+    /// LSN が連続し、層 2 の検査で誤って拒否されない。全面のオラクル試験は #3069。
+    #[test]
+    fn sql_operations_are_recorded_through_the_wrappers() {
+        use crate::core::EngineCore;
+        use crate::kernel::CpuScalarProvider;
+        use crate::policy::PolicyContext;
+        use crate::sql::mode::SessionState;
+        use crate::storage::Visibility;
+
+        let path = unique_db_path("change-log-sql");
+        let _guard = CleanupGuard(path.clone());
+        let ctx =
+            PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+                .expect("tenant");
+        {
+            let mut storage = super::super::Storage::open(&path).expect("open");
+            storage.enable_change_log().expect("enable");
+            let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+            let mut session = SessionState::default();
+            session.allow_ddl();
+            for sql in [
+                "CREATE TABLE ev (id BIGINT PRIMARY KEY, embedding VECTOR(2))",
+                "INSERT INTO ev (id, embedding) VALUES (1, '[0.1,0.2]') USING OPERATION_ID 'o-1'",
+                "UPDATE ev SET embedding = '[0.3,0.4]' WHERE id = 1 USING OPERATION_ID 'o-2'",
+                "DELETE FROM ev WHERE id = 1 USING OPERATION_ID 'o-3'",
+                "ALTER TABLE ev RENAME TO ev2",
+                "DROP TABLE ev2",
+            ] {
+                core.execute_sql_in_session(&ctx, &mut session, sql)
+                    .unwrap_or_else(|e| panic!("{sql}: {:?}", e.wire_code()));
+            }
+        }
+        let storage = super::super::Storage::open(&path).expect("reopen");
+        let recs = records(&storage);
+        assert!(recs.len() >= 6, "each write statement commits a record");
+        for pair in recs.windows(2) {
+            assert_eq!(pair[1].header.prev_lsn, pair[0].header.lsn, "LSN chain");
+            assert_eq!(pair[1].header.lsn, pair[0].header.lsn + 1);
+        }
+        let rows_ev = crate::catalog::user_rows_physical_name("ev");
+        let rows_ev2 = crate::catalog::user_rows_physical_name("ev2");
+        let touches = |r: &ChangeRecord, name: &str| r.body.tables.iter().any(|t| t.name == name);
+        // 行の挿入・更新・削除が行ストアの after-image に載る。
+        let inserts: Vec<_> = recs.iter().filter(|r| touches(r, &rows_ev)).collect();
+        assert!(inserts.len() >= 3, "insert, update and delete are recorded");
+        assert!(inserts
+            .iter()
+            .any(|r| change(r, &rows_ev).upserts.len() == 1));
+        assert!(inserts
+            .iter()
+            .any(|r| !change(r, &rows_ev).removes.is_empty()));
+        // 世代の採番と表世代の bump が載る。
+        assert!(recs.iter().all(|r| touches(r, GENERATION_TABLE.name())));
+        // rename は旧名の dropped + 新名の created に分解され、DROP は dropped に載る。
+        assert!(recs.iter().any(|r| {
+            r.body.dropped.contains(&rows_ev) && r.body.created.iter().any(|(n, _)| *n == rows_ev2)
+        }));
+        assert!(recs.iter().any(|r| r.body.dropped.contains(&rows_ev2)));
     }
 }
