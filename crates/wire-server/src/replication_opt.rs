@@ -39,23 +39,30 @@ pub const MAX_UNACKED_FLAG: &str = "--replication-max-unacked-bytes";
 /// 確認応答の待機上限のフラグ名。
 pub const ACK_TIMEOUT_FLAG: &str = "--replication-ack-timeout-secs";
 
+/// 確認応答済みの位置からの遅れ（レコード数）の上限のフラグ名。
+pub const MAX_LAG_FLAG: &str = "--replication-max-lag-records";
+
 /// すべての `--replication-*` フラグ名（`main.rs` の引数ループが 1 本の分岐で受けるための一覧）。
-pub const ALL_FLAGS: [&str; 6] = [
+pub const ALL_FLAGS: [&str; 7] = [
     BIND_FLAG,
     ROLES_FLAG,
     ALLOW_FLAG,
     MAX_CONNECTIONS_FLAG,
     MAX_UNACKED_FLAG,
     ACK_TIMEOUT_FLAG,
+    MAX_LAG_FLAG,
 ];
 
-/// 同時接続数の既定・上限（実装既定値で spec 由来ではない）。
+/// 同時接続数の既定・上限（実装既定値）。
 pub const DEFAULT_MAX_CONNECTIONS: usize = 8;
 pub const MAX_CONNECTIONS_LIMIT: usize = 256;
 /// 未確認量の既定・下限・上限（バイト。実装既定値）。
 pub const DEFAULT_MAX_UNACKED_BYTES: u64 = 64 * 1024 * 1024;
 pub const MIN_MAX_UNACKED_BYTES: u64 = 1024;
 pub const MAX_MAX_UNACKED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+/// 遅れの上限（レコード数）の既定・上限（実装既定値）。
+pub const DEFAULT_MAX_LAG_RECORDS: u64 = 100_000;
+pub const MAX_MAX_LAG_RECORDS: u64 = 1_000_000_000;
 /// 確認応答の待機上限の既定・上限（秒。実装既定値）。
 pub const DEFAULT_ACK_TIMEOUT_SECS: u64 = 30;
 pub const MAX_ACK_TIMEOUT_SECS: u64 = 3600;
@@ -216,6 +223,8 @@ pub struct ReplicationSettings {
     pub max_unacked_bytes: u64,
     /// 上限に達したまま確認応答が進まない場合に切断するまでの時間。
     pub ack_timeout: Duration,
+    /// 確認応答済みの位置からの遅れ（レコード数）の上限。超えたレプリカは切断され、保持位置が外れる。
+    pub max_lag_records: u64,
 }
 
 /// `--replication-*` の受け取り中の値。`main.rs` の引数ループが [`Self::accept`] を呼び、全引数の後に
@@ -228,6 +237,7 @@ pub struct ReplicationArgs {
     max_connections: Option<String>,
     max_unacked: Option<String>,
     ack_timeout: Option<String>,
+    max_lag: Option<String>,
 }
 
 fn duplicate(flag: &str) -> String {
@@ -251,6 +261,7 @@ impl ReplicationArgs {
             || self.max_connections.is_some()
             || self.max_unacked.is_some()
             || self.ack_timeout.is_some()
+            || self.max_lag.is_some()
     }
 
     /// フラグ 1 つ分を記録する。重複指定（`--replication-allow` を除く）・空の値は拒否する。
@@ -292,6 +303,10 @@ impl ReplicationArgs {
             ACK_TIMEOUT_FLAG => {
                 slot_taken(self.ack_timeout.is_some())?;
                 self.ack_timeout = Some(value.to_string());
+            }
+            MAX_LAG_FLAG => {
+                slot_taken(self.max_lag.is_some())?;
+                self.max_lag = Some(value.to_string());
             }
             _ => return Err("unknown replication flag".to_string()),
         }
@@ -351,6 +366,16 @@ impl ReplicationArgs {
                 n
             }
         };
+        let max_lag_records = match self.max_lag.as_deref() {
+            None => DEFAULT_MAX_LAG_RECORDS,
+            Some(raw) => {
+                let n = parse_digits(MAX_LAG_FLAG, raw)?;
+                if !(1..=MAX_MAX_LAG_RECORDS).contains(&n) {
+                    return Err(format!("{MAX_LAG_FLAG} is out of range"));
+                }
+                n
+            }
+        };
         // ループバックだけを受け付ける（TLS の配線は #2177。それまで平文を外へ晒す経路を作らない）。
         let guarded = GuardedBindAddrs::resolve(&bind_raw, TransportSecurity::Cleartext)
             .map_err(|_| LOOPBACK_ONLY_MESSAGE.to_string())?;
@@ -366,6 +391,7 @@ impl ReplicationArgs {
             max_connections,
             max_unacked_bytes,
             ack_timeout: Duration::from_secs(ack_secs),
+            max_lag_records,
         }))
     }
 }

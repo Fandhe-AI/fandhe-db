@@ -431,7 +431,7 @@
 //!
 //! `--replication-bind <addr>`・`--replication-roles <file>`・`--replication-allow <ip|cidr>`・
 //! `--replication-max-connections <n>`・`--replication-max-unacked-bytes <n>`・
-//! `--replication-ack-timeout-secs <n>`（Issue #2173・RECOVER-15・WIRE-9 ポインタ）: ストリーミング
+//! `--replication-ack-timeout-secs <n>`・`--replication-max-lag-records <n>`（Issue #2173・RECOVER-15・WIRE-9 ポインタ）: ストリーミング
 //! レプリケーションの送信側（プライマリ）の opt-in。テナント向けとは別のリスナーを作り、専用ロールで認証した
 //! 許可リスト内のレプリカへ変更ログを送る。`--change-log` が前提で、bind はループバックだけ（非ループバックは
 //! 起動エラー。TLS は #2177）。重複指定・不正値・前提の欠落は DB を開く前に起動エラー
@@ -2417,7 +2417,8 @@ fn run_server(args: &[String]) -> ExitCode {
             | "--replication-allow"
             | "--replication-max-connections"
             | "--replication-max-unacked-bytes"
-            | "--replication-ack-timeout-secs") => {
+            | "--replication-ack-timeout-secs"
+            | "--replication-max-lag-records") => {
                 let Some(v) = args.get(i + 1) else {
                     engine::log_stderr!("wire-server: {flag} requires a value");
                     return ExitCode::FAILURE;

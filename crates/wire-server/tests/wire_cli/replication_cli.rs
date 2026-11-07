@@ -303,6 +303,14 @@ fn recover15_replication_flags_are_validated_before_the_database_is_opened() {
     let bad_roles = dir.join("bad-roles.txt");
     std::fs::write(&bad_roles, "no-colon-line\n").expect("bad roles");
     let bad_roles_s = bad_roles.to_str().expect("utf-8").to_string();
+    // `--users` と同じ形式のファイルをロールの資格情報に指定しても通用しない（行の形式が違う）。
+    let users_like = dir.join("users-like.txt");
+    std::fs::write(
+        &users_like,
+        format!("alice:tenant-a:{}\n", phc_for("pw-alice")),
+    )
+    .expect("users-like");
+    let users_like_s = users_like.to_str().expect("utf-8").to_string();
     let base = |extra: &[&str]| -> Output {
         let users = fx.users_path_str();
         let db = fx.db_path_str();
@@ -442,6 +450,32 @@ fn recover15_replication_flags_are_validated_before_the_database_is_opened() {
             "line 1 is malformed",
         ),
         (
+            vec![
+                "--change-log",
+                "--replication-bind",
+                "127.0.0.1:0",
+                "--replication-roles",
+                &users_like_s,
+                "--replication-allow",
+                "127.0.0.1",
+            ],
+            "line 1 is malformed",
+        ),
+        (
+            vec![
+                "--change-log",
+                "--replication-bind",
+                "127.0.0.1:0",
+                "--replication-roles",
+                &roles_s,
+                "--replication-allow",
+                "127.0.0.1",
+                "--replication-max-lag-records",
+                "0",
+            ],
+            "is out of range",
+        ),
+        (
             vec!["--change-log", "--replication-bind"],
             "requires a value",
         ),
@@ -461,6 +495,17 @@ fn recover15_replication_flags_are_validated_before_the_database_is_opened() {
         !Path::new(&fx.db_path_str()).exists(),
         "every refusal happens before the DB file is created"
     );
+    // 逆向き: ロールの資格情報ファイルを `--users` に指定しても起動しない。
+    let out = run(&[
+        "--users",
+        &roles_s,
+        "--db",
+        &fx.db_path_str(),
+        "--bind",
+        "127.0.0.1:0",
+    ]);
+    assert_ne!(out.status.code(), Some(0));
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("listening on"));
 }
 
 /// 未認証・誤パスワード・未知のロール・テナントのロール・不正なフレームは拒否される。許可リスト外の送信元には
@@ -715,13 +760,14 @@ fn recover15_slow_or_gone_replicas_never_block_primary_writes() {
     let _ = stalled.drain_until_closed();
 }
 
-/// 同時接続数の上限を超えた接続は、空きが出るまで断られる。
+/// 同時接続数の上限（認証済みの枠）を超えた接続は、認証の後に断られ、空きが出るまで入れない。
 #[test]
 fn recover15_connection_limit_is_enforced() {
     let p = Primary::start("repl-limit", &["--replication-max-connections", "1"], false);
     let mut first = Replica::connect(p.repl);
     first.login(ROLE, ROLE_PW);
     let mut second = Replica::connect(p.repl);
+    second.send(b'H', &hello_body(ROLE, ROLE_PW));
     second.expect_error(E_BUSY);
     drop(first);
     wait_until("the slot to be released", Duration::from_secs(10), || {
@@ -729,5 +775,117 @@ fn recover15_connection_limit_is_enforced() {
         r.send(b'H', &hello_body(ROLE, ROLE_PW));
         matches!(r.recv(), Some((b'I', _)))
     });
-    drop(p.child);
+}
+
+/// 認証前の接続は認証済みの枠を使わず、認証に失敗し続ける送信元は、バックオフの間は何も返されずに閉じられる。
+/// 成功すれば数え直される。
+#[test]
+fn recover15_repeated_auth_failures_back_off_per_source() {
+    let p = Primary::start(
+        "repl-backoff",
+        &["--replication-max-connections", "1"],
+        false,
+    );
+    // 認証前の接続（Hello を送らない）が複数あっても、認証済みの枠 1 は塞がれない。
+    let idle: Vec<Replica> = (0..3).map(|_| Replica::connect(p.repl)).collect();
+    let mut ok = Replica::connect(p.repl);
+    ok.login(ROLE, ROLE_PW);
+    drop(ok);
+    drop(idle);
+    for _ in 0..5 {
+        let mut r = Replica::connect(p.repl);
+        r.send(b'H', &hello_body(ROLE, "wrong"));
+        r.expect_error(E_AUTH_FAILED);
+    }
+    // 5 回の失敗の後はバックオフ中。正しい資格情報でも何も返されない。
+    let mut r = Replica::connect(p.repl);
+    let _ = r.0.write_all(&[b'H', 0, 0, 0, 0]);
+    assert!(r.recv().is_none(), "no reply while backing off");
+    std::thread::sleep(Duration::from_millis(1300));
+    let mut r = Replica::connect(p.repl);
+    r.login(ROLE, ROLE_PW);
+}
+
+/// 保持位置からの Start が刈り込み済み（再同期が必要）か。受け付けられたら偽。
+fn resync_required_from(p: &Primary, applied: u64) -> bool {
+    let mut probe = Replica::connect(p.repl);
+    let (db_id, timeline, _) = probe.login(ROLE, ROLE_PW);
+    probe.send(b'S', &start_body(&db_id, timeline, applied));
+    matches!(probe.recv(), Some((b'E', body)) if body == vec![E_RESYNC])
+}
+
+/// 起動直後の最新 LSN から始めるレプリカを接続する（起動時の commit は保持位置が無く刈り込まれてよい）。
+fn begin_at_current(p: &Primary) -> (Replica, u64) {
+    let mut r = Replica::connect(p.repl);
+    let (db_id, timeline, base) = r.login(ROLE, ROLE_PW);
+    r.send(b'S', &start_body(&db_id, timeline, base));
+    assert_eq!(r.recv().expect("ok").0, b'O');
+    (r, base)
+}
+
+/// ack を一度も返さずに接続を保つレプリカは、ハートビートが続いていても `ack_timeout` の後に切られ、
+/// 保持位置が外れて刈り込みが進む。
+#[test]
+fn recover15_replica_that_never_acks_is_cut_and_retention_is_released() {
+    let p = Primary::start(
+        "repl-silent",
+        &["--replication-ack-timeout-secs", "1"],
+        true,
+    );
+    let (mut r, base) = begin_at_current(&p);
+    let mut alice = p.setup_table();
+    alice.insert(1);
+    // 保持位置が残っている間は、その位置から再開できる。
+    assert!(!resync_required_from(&p, base));
+    // 読み続けるだけで ack しない。切断（バックプレッシャのコード）まで待つ。
+    assert_eq!(r.drain_until_closed(), Some(E_BACKPRESSURE));
+    wait_until(
+        "the released retention floor to let pruning proceed",
+        Duration::from_secs(30),
+        || resync_required_from(&p, base),
+    );
+}
+
+/// 読み取りを極端に遅くして書き込みを塞ぐレプリカも、期限で切られる（書き込みタイムアウトをすり抜けない）。
+#[test]
+fn recover15_replica_reading_too_slowly_is_cut_at_the_deadline() {
+    let p = Primary::start("repl-slow", &["--replication-ack-timeout-secs", "1"], true);
+    let (mut r, base) = begin_at_current(&p);
+    let mut alice = p.alice();
+    alice.exec("CREATE TABLE blobs (id BIGINT PRIMARY KEY, body TEXT)");
+    let body = "x".repeat(200 * 1024);
+    for id in 0..40 {
+        alice.exec(&format!(
+            "INSERT INTO blobs (id, body) VALUES ({id}, '{body}')"
+        ));
+    }
+    // 1 バイトずつしか読まない。サーバー側の書き込みは塞がるが、監視が期限で切る。
+    let mut byte = [0u8; 1];
+    for _ in 0..3 {
+        let _ = r.0.read(&mut byte);
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    wait_until(
+        "the slow reader to be cut and its retention released",
+        Duration::from_secs(30),
+        || resync_required_from(&p, base),
+    );
+}
+
+/// 保持位置からの遅れ（レコード数）の上限を超えたレプリカは切られ、保持位置が外れる。再接続しても、
+/// 遅れた位置からは再同期が必要（`RESYNC_REQUIRED`）として拒否される。
+#[test]
+fn recover15_replica_beyond_the_lag_limit_is_cut() {
+    let p = Primary::start("repl-lag", &["--replication-max-lag-records", "3"], true);
+    let (mut r, base) = begin_at_current(&p);
+    let mut alice = p.setup_table();
+    for id in 1..=6 {
+        alice.insert(id);
+    }
+    assert_eq!(r.drain_until_closed(), Some(E_RESYNC));
+    assert!(resync_required_from(&p, base), "lagging start is refused");
+    // 遅れが上限以内の位置からは受け付けられる。
+    let mut probe = Replica::connect(p.repl);
+    let (_, _, current) = probe.login(ROLE, ROLE_PW);
+    assert!(!resync_required_from(&p, current.saturating_sub(1)));
 }

@@ -81,8 +81,21 @@ const MAX_PASSWORD_LEN: usize = 1024;
 const MAX_HELLO_BODY: usize = 2 + 1 + MAX_ROLE_NAME_LEN + MAX_PASSWORD_LEN;
 const START_BODY_LEN: usize = 16 + 8 + 8;
 const ACK_BODY_LEN: usize = 8;
-/// 認証と開始位置の受け取りに許す時間（フレームごと。1 バイトずつ送り続けても延びない）。
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// 認証前の Hello と、認証後の Start を受け取るまでに許す時間（フレームごと。1 バイトずつ送り続けても
+/// 延びない）。認証前の接続が枠を占有し続けないよう短くする。
+const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
+const START_TIMEOUT: Duration = Duration::from_secs(5);
+/// 認証前の同時接続数の上限（認証済みの枠 `max_connections` とは別枠）。
+const MAX_PRE_AUTH: usize = 16;
+/// 1 バッチで読むバイト数の上限（`max_unacked` とは別の固定上限。1 件でこれを超えるレコードは 1 件だけ返す）。
+const MAX_BATCH_BYTES: usize = 16 * 1024 * 1024;
+/// 送信元ごとの認証失敗の表の最大件数と、無料で許す失敗回数、バックオフの上限・失効時間。
+const MAX_FAILURE_ENTRIES: usize = 1024;
+const FREE_FAILURES: u32 = 5;
+const MAX_BACKOFF: Duration = Duration::from_secs(60);
+const FAILURE_TTL: Duration = Duration::from_secs(600);
+/// 監視スレッドの確認間隔。
+const WATCHDOG_STEP: Duration = Duration::from_millis(20);
 /// 追いついた状態での新規 commit のポーリング間隔と、ハートビートの間隔。
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
@@ -106,6 +119,76 @@ struct SlotGuard(Arc<AtomicUsize>);
 impl Drop for SlotGuard {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// 送信元アドレスごとの認証失敗の累積（総当たり攻撃の抑止）。失敗が [`FREE_FAILURES`] 回を超えると、
+/// 最後の失敗から指数的に伸びるバックオフの間（上限 [`MAX_BACKOFF`]）、その送信元の接続を読まずに閉じる。
+/// 成功で消える。表は [`MAX_FAILURE_ENTRIES`] 件で有界（満杯なら失効分、無ければ最も古い失敗を捨てる）。
+#[derive(Default)]
+struct FailureTable {
+    entries: std::collections::HashMap<std::net::IpAddr, (u32, Instant)>,
+}
+
+impl FailureTable {
+    fn backoff(failures: u32) -> Duration {
+        let over = failures.saturating_sub(FREE_FAILURES);
+        let secs = 1u64.checked_shl(over).unwrap_or(u64::MAX);
+        Duration::from_secs(secs).min(MAX_BACKOFF)
+    }
+
+    /// 送信元が現在バックオフ中か。
+    fn blocked(&self, ip: std::net::IpAddr, now: Instant) -> bool {
+        self.entries.get(&ip.to_canonical()).is_some_and(|(n, at)| {
+            *n >= FREE_FAILURES && now.saturating_duration_since(*at) < Self::backoff(*n)
+        })
+    }
+
+    fn record_failure(&mut self, ip: std::net::IpAddr, now: Instant) {
+        let ip = ip.to_canonical();
+        if !self.entries.contains_key(&ip) && self.entries.len() >= MAX_FAILURE_ENTRIES {
+            self.entries
+                .retain(|_, (_, at)| now.saturating_duration_since(*at) < FAILURE_TTL);
+            if self.entries.len() >= MAX_FAILURE_ENTRIES {
+                let oldest = self
+                    .entries
+                    .iter()
+                    .min_by_key(|(_, (_, at))| *at)
+                    .map(|(k, _)| *k);
+                if let Some(k) = oldest {
+                    self.entries.remove(&k);
+                }
+            }
+        }
+        let e = self.entries.entry(ip).or_insert((0, now));
+        // 長く失敗が無かった送信元は数え直す。
+        if now.saturating_duration_since(e.1) >= FAILURE_TTL {
+            e.0 = 0;
+        }
+        e.0 = e.0.saturating_add(1);
+        e.1 = now;
+    }
+
+    fn clear(&mut self, ip: std::net::IpAddr) {
+        self.entries.remove(&ip.to_canonical());
+    }
+}
+
+/// リスナーが全接続で共有する状態。
+struct Server {
+    core: Arc<EngineCore>,
+    cfg: ReplicationSettings,
+    /// 認証済みの接続数と、認証前の接続数（別枠）。
+    active: Arc<AtomicUsize>,
+    pre_auth: Arc<AtomicUsize>,
+    failures: Mutex<FailureTable>,
+}
+
+impl Server {
+    fn failures(&self) -> MutexGuard<'_, FailureTable> {
+        self.failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -219,21 +302,31 @@ fn authenticate(roles: &ReplicationRoles, role: &str, password: &[u8], start: In
     ok
 }
 
-/// 送信済みで未確認のレコードの勘定（書き込み側と ack 読み取り側で共有する）。
+/// 送信済みで未確認のレコードの勘定（書き込み側・ack 読み取り側・監視で共有する）。
 struct Inflight {
-    /// `(LSN, バイト数)`。送信順。
-    queue: VecDeque<(u64, u64)>,
+    /// `(LSN, バイト数, 送信を始めた時刻)`。送信順。先頭が最も古い未確認。
+    queue: VecDeque<(u64, u64, Instant)>,
     bytes: u64,
     /// 確認応答済みの最後の LSN と、送信済みの最後の LSN。
     acked: u64,
     sent: u64,
-    last_ack: Instant,
 }
+
+/// 切断の理由（監視が立てる。0 は無し）。
+const CUT_NONE: u8 = 0;
+const CUT_ACK_TIMEOUT: u8 = 1;
+const CUT_LAG: u8 = 2;
 
 struct Shared {
     inflight: Mutex<Inflight>,
     /// ack の違反・切断。立ったら書き込み側は終了する。
     failed: AtomicBool,
+    /// 送信ループが終わった。監視が抜ける合図。
+    done: AtomicBool,
+    /// 監視が決めた切断の理由。
+    cut: std::sync::atomic::AtomicU8,
+    /// 書き込み側が最後に見たプライマリの最新 LSN（遅れの計算用）。
+    current_lsn: std::sync::atomic::AtomicU64,
 }
 
 impl Shared {
@@ -245,9 +338,9 @@ impl Shared {
 }
 
 /// ack を読み続ける（レプリカ→プライマリの方向。別スレッド）。違反・切断で `failed` を立てて終わる。
-fn read_acks(stream: TcpStream, shared: Arc<Shared>, pin: Arc<engine::storage::ReplicaPin>) {
+fn read_acks(stream: &TcpStream, shared: &Shared, pin: &engine::storage::ReplicaPin) {
     loop {
-        let acked = match read_frame(&stream, ACK_BODY_LEN, None) {
+        let acked = match read_frame(stream, ACK_BODY_LEN, None) {
             Ok((T_ACK, body)) if body.len() == ACK_BODY_LEN => be_u64(&body),
             _ => None,
         };
@@ -257,18 +350,51 @@ fn read_acks(stream: TcpStream, shared: Arc<Shared>, pin: Arc<engine::storage::R
         if lsn < g.acked || lsn > g.sent {
             break;
         }
-        while g.queue.front().is_some_and(|(l, _)| *l <= lsn) {
-            if let Some((_, len)) = g.queue.pop_front() {
+        while g.queue.front().is_some_and(|(l, _, _)| *l <= lsn) {
+            if let Some((_, len, _)) = g.queue.pop_front() {
                 g.bytes = g.bytes.saturating_sub(len);
             }
         }
         g.acked = lsn;
-        g.last_ack = Instant::now();
         drop(g);
         pin.advance(lsn);
     }
     shared.failed.store(true, Ordering::Release);
     let _ = stream.shutdown(Shutdown::Both);
+}
+
+/// 監視（別スレッド）。書き込みが `write`／`flush` でブロックしても判定できるよう、送信ループとは独立に動く。
+/// 最も古い未確認レコードが送信を始めてから `ack_timeout` を超えた、またはプライマリの最新との差（確認応答済みの
+/// 位置からの遅れ）が `max_lag_records` を超えたら切断の理由を立てる。送信ループが [`NOTICE_TIMEOUT`] の
+/// うちに通知を書いて抜けなければ、`shutdown` でブロックを解く。
+fn watchdog(stream: &TcpStream, shared: &Shared, cfg: &ReplicationSettings) {
+    while !shared.done.load(Ordering::Acquire) && !shared.failed.load(Ordering::Acquire) {
+        std::thread::sleep(WATCHDOG_STEP);
+        let reason = {
+            let g = shared.lock();
+            let current = shared.current_lsn.load(Ordering::Acquire);
+            if g.queue
+                .front()
+                .is_some_and(|(_, _, at)| at.elapsed() >= cfg.ack_timeout)
+            {
+                CUT_ACK_TIMEOUT
+            } else if current.saturating_sub(g.acked) > cfg.max_lag_records {
+                CUT_LAG
+            } else {
+                CUT_NONE
+            }
+        };
+        if reason == CUT_NONE {
+            continue;
+        }
+        shared.cut.store(reason, Ordering::Release);
+        let grace = Instant::now() + NOTICE_TIMEOUT;
+        while Instant::now() < grace && !shared.done.load(Ordering::Acquire) {
+            std::thread::sleep(WATCHDOG_STEP);
+        }
+        let _ = stream.shutdown(Shutdown::Both);
+        return;
+    }
 }
 
 /// `StreamError` を `E` のコードへ写す。
@@ -281,13 +407,14 @@ fn stream_error_code(e: &StreamError) -> u8 {
 }
 
 /// 1 接続を処理する（認証 → 開始位置 → 送信ループ）。
-fn handle(stream: TcpStream, core: &EngineCore, cfg: &ReplicationSettings) {
+fn handle(stream: TcpStream, peer: std::net::IpAddr, srv: &Server, pre_auth: SlotGuard) {
+    let (core, cfg) = (&*srv.core, &srv.cfg);
     let _ = stream.set_nodelay(true);
     if stream.set_write_timeout(Some(cfg.ack_timeout)).is_err() {
         return;
     }
     let auth_start = Instant::now();
-    let deadline = Some(Instant::now() + HANDSHAKE_TIMEOUT);
+    let deadline = Some(Instant::now() + HELLO_TIMEOUT);
     let (ty, body) = match read_frame(&stream, MAX_HELLO_BODY, deadline) {
         Ok(f) => f,
         Err(_) => return send_error(&stream, code::BAD_REQUEST),
@@ -301,9 +428,18 @@ fn handle(stream: TcpStream, core: &EngineCore, cfg: &ReplicationSettings) {
         return send_error(&stream, code::BAD_REQUEST);
     };
     if !authenticate(&cfg.roles, role, password, auth_start) {
+        srv.failures().record_failure(peer, Instant::now());
         return send_error(&stream, code::AUTH_FAILED);
     }
+    srv.failures().clear(peer);
     let role = role.to_string();
+    // 認証前の枠を返し、認証済みの枠を取る（満杯なら断る）。
+    drop(pre_auth);
+    if srv.active.fetch_add(1, Ordering::AcqRel) >= cfg.max_connections {
+        srv.active.fetch_sub(1, Ordering::AcqRel);
+        return send_error(&stream, code::BUSY);
+    }
+    let _slot = SlotGuard(Arc::clone(&srv.active));
 
     // 認証成功の直後に識別子と最新 LSN を知らせる。レプリカは自分のベース（バックアップ）の識別子と
     // 照合してから Start を送る（サーバー側も Start で再度照合する）。
@@ -331,7 +467,7 @@ fn handle(stream: TcpStream, core: &EngineCore, cfg: &ReplicationSettings) {
         }
     }
 
-    let deadline = Some(Instant::now() + HANDSHAKE_TIMEOUT);
+    let deadline = Some(Instant::now() + START_TIMEOUT);
     let start = match read_frame(&stream, START_BODY_LEN, deadline) {
         Ok((T_START, body)) if body.len() == START_BODY_LEN => body,
         _ => return send_error(&stream, code::BAD_REQUEST),
@@ -345,6 +481,10 @@ fn handle(stream: TcpStream, core: &EngineCore, cfg: &ReplicationSettings) {
     };
     if db_id != identity.db_id || timeline != identity.timeline {
         return send_error(&stream, code::FOREIGN);
+    }
+    // 最初から遅れの上限を超えている位置からは始めさせない（保持を引き延ばさない。再同期が必要）。
+    if first_current.saturating_sub(applied) > cfg.max_lag_records {
+        return send_error(&stream, code::RESYNC_REQUIRED);
     }
     // 保持位置を登録してから、開始位置の存在を確かめる（engine が刈り込みとの競合を閉じる）。
     let pin = match core.pin_change_log_for_replica(applied) {
@@ -376,48 +516,43 @@ fn handle(stream: TcpStream, core: &EngineCore, cfg: &ReplicationSettings) {
         }
     }
     engine::log_stderr!("wire-server: replication: replica '{role}' connected");
-    let reason = stream_loop(&stream, core, cfg, applied, pin);
+    let reason = stream_loop(&stream, core, cfg, applied, &pin);
     engine::log_stderr!("wire-server: replication: replica '{role}' disconnected ({reason})");
 }
 
-/// 送信ループ。終了理由（運用者向けの固定語）を返す。
+/// 送信ループ。終了理由（運用者向けの固定語）を返す。ack の読み取りと監視を同じ接続の別スレッドで動かし、
+/// 抜けるときは必ず `shutdown` でそれらを止めてから返す。
 fn stream_loop(
     stream: &TcpStream,
     core: &EngineCore,
     cfg: &ReplicationSettings,
     applied: u64,
-    pin: Arc<engine::storage::ReplicaPin>,
+    pin: &engine::storage::ReplicaPin,
 ) -> &'static str {
-    let shared = Arc::new(Shared {
+    let shared = Shared {
         inflight: Mutex::new(Inflight {
             queue: VecDeque::new(),
             bytes: 0,
             acked: applied,
             sent: applied,
-            last_ack: Instant::now(),
         }),
         failed: AtomicBool::new(false),
-    });
-    let reader = match stream.try_clone() {
-        Ok(clone) => {
-            let (shared, pin) = (Arc::clone(&shared), Arc::clone(&pin));
-            std::thread::Builder::new()
-                .name("replication-ack".into())
-                .spawn(move || read_acks(clone, shared, pin))
-                .ok()
-        }
-        Err(_) => None,
+        done: AtomicBool::new(false),
+        cut: std::sync::atomic::AtomicU8::new(CUT_NONE),
+        current_lsn: std::sync::atomic::AtomicU64::new(applied),
     };
-    let reason = if reader.is_some() {
-        send_records(stream, core, cfg, applied, &shared)
-    } else {
-        "internal error"
+    let Ok(clone) = stream.try_clone() else {
+        return "internal error";
     };
-    let _ = stream.shutdown(Shutdown::Both);
-    if let Some(r) = reader {
-        let _ = r.join();
-    }
-    reason
+    std::thread::scope(|scope| {
+        let (shared, clone) = (&shared, &clone);
+        scope.spawn(move || read_acks(clone, shared, pin));
+        scope.spawn(move || watchdog(clone, shared, cfg));
+        let reason = send_records(stream, core, cfg, applied, shared);
+        shared.done.store(true, Ordering::Release);
+        let _ = stream.shutdown(Shutdown::Both);
+        reason
+    })
 }
 
 /// レコードを送り続ける（書き込み側）。
@@ -435,22 +570,30 @@ fn send_records(
     };
     let max_unacked = cfg.max_unacked_bytes;
     let max_batch_bytes = usize::try_from(max_unacked).unwrap_or(usize::MAX);
-    let mut blocked_since: Option<Instant> = None;
     let mut last_write = Instant::now();
     loop {
+        // 監視が切断を決めたら、通知を書いて抜ける（ack の待機上限・遅れの上限）。
+        match shared.cut.load(Ordering::Acquire) {
+            CUT_ACK_TIMEOUT => {
+                send_error(stream, code::BACKPRESSURE);
+                return "unacknowledged data timed out";
+            }
+            CUT_LAG => {
+                send_error(stream, code::RESYNC_REQUIRED);
+                return "replica lag limit exceeded";
+            }
+            _ => {}
+        }
         if shared.failed.load(Ordering::Acquire) {
             return "replica closed or violated the protocol";
         }
-        let (inflight_bytes, last_ack) = {
-            let g = shared.lock();
-            (g.bytes, g.last_ack)
-        };
+        let inflight_bytes = shared.lock().bytes;
         let budget =
             max_batch_bytes.saturating_sub(usize::try_from(inflight_bytes).unwrap_or(usize::MAX));
         let batch = if budget == 0 {
             None
         } else {
-            match core.read_change_log_from(next, BATCH_RECORDS, budget) {
+            match core.read_change_log_from(next, BATCH_RECORDS, budget.min(MAX_BATCH_BYTES)) {
                 Ok(b) => Some(b),
                 Err(e) => {
                     send_error(stream, stream_error_code(&e));
@@ -460,8 +603,10 @@ fn send_records(
         };
         let mut sent_any = false;
         let mut window_full = batch.is_none();
-        let current = batch.as_ref().map_or(next, |b| b.current_lsn);
+        let mut current = next;
         if let Some(batch) = batch {
+            current = batch.current_lsn;
+            shared.current_lsn.store(current, Ordering::Release);
             let mut pending = inflight_bytes;
             for (lsn, bytes) in &batch.records {
                 let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
@@ -470,17 +615,17 @@ fn send_records(
                     window_full = true;
                     break;
                 }
-                let sent = write_frame(&mut out, T_RECORD, &[&lsn.to_be_bytes(), bytes]);
-                if sent.is_err() {
-                    return "write failed or timed out";
-                }
-                pending = pending.saturating_add(len);
+                // 書き込みでブロックしても監視が経過時間を見られるよう、書く前に勘定へ入れる。
                 {
                     let mut g = shared.lock();
-                    g.queue.push_back((*lsn, len));
+                    g.queue.push_back((*lsn, len, Instant::now()));
                     g.bytes = g.bytes.saturating_add(len);
                     g.sent = *lsn;
                 }
+                if write_frame(&mut out, T_RECORD, &[&lsn.to_be_bytes(), bytes]).is_err() {
+                    return "write failed or timed out";
+                }
+                pending = pending.saturating_add(len);
                 next = match lsn.checked_add(1) {
                     Some(n) => n,
                     None => return "internal error",
@@ -493,25 +638,15 @@ fn send_records(
                 return "write failed or timed out";
             }
             last_write = Instant::now();
-            blocked_since = None;
             continue;
         }
-        if window_full {
-            // 上限に達している。ack が進まないまま待機上限を過ぎたレプリカだけを切る。
-            let since = *blocked_since.get_or_insert_with(Instant::now);
-            if since.max(last_ack).elapsed() >= cfg.ack_timeout {
-                send_error(stream, code::BACKPRESSURE);
-                return "unacknowledged data limit reached";
+        // 上限に達している間は送らない。ack が来ないままの切断は監視が判定する。
+        if !window_full && last_write.elapsed() >= HEARTBEAT_INTERVAL {
+            let hb = write_frame(&mut out, T_HEARTBEAT, &[&current.to_be_bytes()]);
+            if hb.is_err() || out.flush().is_err() {
+                return "write failed or timed out";
             }
-        } else {
-            blocked_since = None;
-            if last_write.elapsed() >= HEARTBEAT_INTERVAL {
-                let hb = write_frame(&mut out, T_HEARTBEAT, &[&current.to_be_bytes()]);
-                if hb.is_err() || out.flush().is_err() {
-                    return "write failed or timed out";
-                }
-                last_write = Instant::now();
-            }
+            last_write = Instant::now();
         }
         std::thread::sleep(POLL_INTERVAL);
     }
@@ -524,38 +659,46 @@ pub fn spawn_server(
     core: Arc<EngineCore>,
     cfg: ReplicationSettings,
 ) -> std::io::Result<()> {
-    let cfg = Arc::new(cfg);
+    let srv = Arc::new(Server {
+        core,
+        cfg,
+        active: Arc::new(AtomicUsize::new(0)),
+        pre_auth: Arc::new(AtomicUsize::new(0)),
+        failures: Mutex::new(FailureTable::default()),
+    });
     std::thread::Builder::new()
         .name("replication-accept".into())
         .spawn(move || {
-            let active = Arc::new(AtomicUsize::new(0));
             for conn in listener.incoming() {
                 let Ok(conn) = conn else {
                     std::thread::sleep(Duration::from_millis(50));
                     continue;
                 };
                 // 許可リスト外・送信元が分からない接続には何も返さず閉じる。
-                let permitted = conn
+                let Some(peer) = conn
                     .peer_addr()
-                    .map(|a| cfg.allow.permits(a.ip()))
-                    .unwrap_or(false);
-                if !permitted {
+                    .ok()
+                    .map(|a| a.ip())
+                    .filter(|ip| srv.cfg.allow.permits(*ip))
+                else {
+                    continue;
+                };
+                // 認証に失敗し続けている送信元は、バックオフの間は読まずに閉じる。
+                if srv.failures().blocked(peer, Instant::now()) {
                     continue;
                 }
-                if active.fetch_add(1, Ordering::AcqRel) >= cfg.max_connections {
-                    active.fetch_sub(1, Ordering::AcqRel);
+                // 認証前の枠（認証済みの枠とは別）。満杯なら断る。
+                if srv.pre_auth.fetch_add(1, Ordering::AcqRel) >= MAX_PRE_AUTH {
+                    srv.pre_auth.fetch_sub(1, Ordering::AcqRel);
                     send_error(&conn, code::BUSY);
                     continue;
                 }
-                let slot = SlotGuard(Arc::clone(&active));
-                let (core, cfg) = (Arc::clone(&core), Arc::clone(&cfg));
-                // スレッドを作れなかった場合、クロージャごと slot が落ちて数が戻る。
+                let pre = SlotGuard(Arc::clone(&srv.pre_auth));
+                let srv = Arc::clone(&srv);
+                // スレッドを作れなかった場合、クロージャごと枠が落ちて数が戻る。
                 let _ = std::thread::Builder::new()
                     .name("replication-conn".into())
-                    .spawn(move || {
-                        let _slot = slot;
-                        handle(conn, &core, &cfg);
-                    });
+                    .spawn(move || handle(conn, peer, &srv, pre));
             }
         })
         .map(|_| ())
@@ -594,5 +737,33 @@ mod tests {
         assert_eq!((ty, be_u64(&body)), (T_ACK, Some(7)));
         write_frame(&mut c, T_ACK, &[&[0u8; 9]]).expect("write");
         assert_eq!(read_frame(&s, 8, None), Err(FrameError::TooLarge));
+    }
+
+    #[test]
+    fn failure_table_backs_off_clears_and_stays_bounded() {
+        let ip = |n: u8| std::net::IpAddr::from([10, 0, 0, n]);
+        let t0 = Instant::now();
+        let mut t = FailureTable::default();
+        for _ in 0..FREE_FAILURES.saturating_sub(1) {
+            t.record_failure(ip(1), t0);
+        }
+        assert!(!t.blocked(ip(1), t0), "within the free failures");
+        t.record_failure(ip(1), t0);
+        assert!(t.blocked(ip(1), t0));
+        assert!(!t.blocked(ip(1), t0 + Duration::from_secs(2)));
+        assert!(!t.blocked(ip(2), t0), "per source");
+        t.record_failure(ip(1), t0);
+        assert!(
+            t.blocked(ip(1), t0 + Duration::from_secs(1)),
+            "backoff grows"
+        );
+        t.clear(ip(1));
+        assert!(!t.blocked(ip(1), t0));
+        for n in 0..=u16::MAX {
+            let [a, b] = n.to_be_bytes();
+            t.record_failure(std::net::IpAddr::from([172, 16, a, b]), t0);
+        }
+        assert!(t.entries.len() <= MAX_FAILURE_ENTRIES);
+        assert_eq!(FailureTable::backoff(u32::MAX), MAX_BACKOFF);
     }
 }
