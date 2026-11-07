@@ -73,7 +73,8 @@ pub fn parse_until_time(raw: &str) -> Result<i64, String> {
             || (bytes.len() >= 6
                 && matches!(bytes.get(bytes.len() - 6), Some(b'+' | b'-'))
                 && bytes.get(bytes.len() - 3) == Some(&b':')));
-    if !has_zone || bytes.get(10) != Some(&b'T') {
+    // 空白はどこにも許さない（ゾーンの前の空白を解析器が受理するため、ここで拒否する）。
+    if !has_zone || bytes.get(10) != Some(&b'T') || raw.contains(' ') {
         return Err(MSG.into());
     }
     engine::datetime::parse_timestamptz(raw, &engine::datetime::SessionTimeZone::utc())
@@ -862,6 +863,8 @@ mod tests {
             "2030-01-02T03:04:05",
             "2030-01-02 03:04:05Z",
             "2030-01-02T03:04:05 UTC",
+            "2030-01-02T03:04:05 Z",
+            "2030-01-02T03:04:05 +09:00",
             "2030-01-02T03:04:05+09",
             "2030-01-02T03:04:05Asia/Tokyo",
             "2030-01-02Z",
