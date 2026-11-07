@@ -285,7 +285,7 @@ COPY <表> (<列>, ...) FROM STDIN;
 | ---- | ---- | ---- |
 | engine の API での往復（COPY・INSERT の両形式） | `crates/engine/tests/table_rls/logical_dump_roundtrip.rs` | `export_logical_dump` の出力を空 DB へ流し、再出力が元とバイト単位で一致すること。全表・VIEW の値が一致すること。往復後の最初の採番（SERIAL・IDENTITY・SEQUENCE）が元と同じ値になること。制約（主キー・UNIQUE・CHECK・外部キー）の違反が元と同じ `wire_code` で拒否されること |
 | CLI での往復（COPY・INSERT の両形式） | `crates/wire-server/tests/wire_cli/dump_roundtrip_cli.rs` | `dump` → `dump-restore` → 再 `dump` がバイト一致し、全表・VIEW の値が一致すること |
-| 壊れた入力の拒否 | 同上 | 同じ fixture のダンプについて、次のいずれも終了コード 1 または 4 で拒否し、何も公開せず一時名を残さないこと。(a) 各枠の境界と境界の 1 バイト手前での切り詰め (b) ヘッダの各行・枠の見出し・長さ・種別語・本文の終端・COPY の終端・終端行の 1 バイト反転 (c) 枠の入れ替え（索引・VIEW・外部キー・COPY・トリガ・ポリシーを表より前へ、後段をデータより前へ、トリガを関数より前へ） (d) 枠の重複（種別ごとの先頭の枠・COPY／INSERT のデータ・ヘッダ・ダンプ全体の連結） |
+| 壊れた入力の拒否 | 同上 | 同じ fixture のダンプについて、次のいずれも終了コード 1 または 4 で拒否し、何も公開せず一時名を残さないこと。(a) 各枠の境界と境界の 1 バイト手前での切り詰め (b) ヘッダの各行・枠の見出し・長さ・種別語・本文の終端・COPY の終端・終端行の 1 バイト反転 (c) 枠の入れ替え（索引・VIEW・外部キー・COPY・トリガ・ポリシーを表より前へ、後段をデータより前へ、トリガを関数より前へ） (d) 枠の重複（種別ごとの先頭の枠・COPY／INSERT のデータ・ヘッダ・ダンプ全体の連結）。`sequence-value`（`setval`）と `row-security`（`ENABLE`／`FORCE`）は再実行しても同じ状態になる文なので重複の試験から外している。拒否ごとに終了コード（枠・ヘッダ・終端・順序の違反は 4、文の実行失敗は 1）と標準エラーの識別語・SQLSTATE を 1 組に固定する |
 
 ### 13.2 fixture の網羅範囲
 
