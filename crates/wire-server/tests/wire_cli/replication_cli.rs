@@ -60,7 +60,7 @@ fn phc_for(password: &str) -> String {
 
 struct Primary {
     _fx: common::TempFixtureDir,
-    child: ChildGuard,
+    _child: ChildGuard,
     tenant: SocketAddr,
     repl: SocketAddr,
     archive: Option<PathBuf>,
@@ -132,7 +132,7 @@ impl Primary {
             .unwrap_or_else(|| panic!("no replication address: {lines:?}"));
         Self {
             _fx: fx,
-            child: ChildGuard(child),
+            _child: ChildGuard(child),
             tenant,
             repl,
             archive: archive_dir,
