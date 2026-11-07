@@ -104,6 +104,9 @@ pub enum RestoreError {
     NotConsistent(IntegrityReport),
     /// この環境では復元できない（unix 以外・hard link 非対応など）。
     Unsupported,
+    /// 公開直後の確認で、公開先が検査したファイルと別だった（差し替え）うえ、公開先の削除にも失敗した。
+    /// 検査していない内容が公開先に残っているので、手動で削除する（公開済みの成功ではない）。
+    UncheckedContentPublished,
     /// 最終名への公開は済み中身は完全だが、後始末（一時名の削除・親ディレクトリの fsync）を確かめられなかった。
     PublishedButNotFinalized,
     /// その他の入出力の失敗。
@@ -126,6 +129,9 @@ impl std::fmt::Display for RestoreError {
             Self::VerifyFailed => "integrity check could not be started; nothing was published",
             Self::NotConsistent(_) => "backup failed the integrity check; nothing was published",
             Self::Unsupported => "restore is not supported in this environment",
+            Self::UncheckedContentPublished => {
+                "WARNING: the destination holds content that was not checked; delete it manually"
+            }
             Self::PublishedButNotFinalized => {
                 "WARNING: the database file was published but its durability could not be \
                  confirmed; verify it before relying on it"
@@ -326,6 +332,15 @@ mod unix_impl {
             }
         }
 
+        /// `path`（リンクをたどらない）が保持 fd と同じ (dev, ino) の通常ファイルで、長さも保持 fd と
+        /// 一致するか。公開先が検査したファイルそのものかの確認に使う。
+        pub(super) fn is_same_file_at(&self, path: &Path) -> bool {
+            let (Ok(m), Ok(fd)) = (std::fs::symlink_metadata(path), self.file.metadata()) else {
+                return false;
+            };
+            m.is_file() && m.dev() == self.dev && m.ino() == self.ino && m.len() == fd.len()
+        }
+
         /// パス（リンクをたどらない）が保持 fd と同じ (dev, ino) の通常ファイルで、長さが保持 fd の
         /// 現在の長さと一致することを確かめる。`expected_len` があればその長さとも一致させる
         /// （`Storage::open` の前はコピーしたバイト数。open 後は正当に伸びうるため fd の長さと比べる）。
@@ -475,9 +490,12 @@ mod unix_impl {
         // docs/design/restore-generation.md、実装は #2448）。公開前の一時ファイルへ書く必要がある
         // ため、API ができたらここ（検査の通過後・fsync と公開の前）で呼ぶ。現在は未実装。
 
-        // 4. 公開前に、open・クローズ後の最終内容を fsync し直す（保持 fd で。同一性は確認済み）。
+        // 4. open・クローズ後の最終内容を保持 fd で fsync し直す。fsync は長くかかりうるため、
+        //    パスの同一性は fsync の「後」、hard_link の直前に確かめる（hard_link は fd ではなく
+        //    パスを使うので、直前の確認が差し替えの窓を最小にする）。
         tmp.check_path(None)?;
         tmp.file.sync_all().map_err(io_err)?;
+        tmp.check_path(None)?;
         match std::fs::hard_link(&tmp.path, dest) {
             Ok(()) => {}
             Err(e) if e.kind() == ErrorKind::AlreadyExists => {
@@ -486,15 +504,20 @@ mod unix_impl {
             Err(e) if e.kind() == ErrorKind::Unsupported => return Err(RestoreError::Unsupported),
             Err(e) => return Err(io_err(e)),
         }
-        // 公開済み。以降の失敗でも最終ファイルは完全なので消さない。ただし公開先が保持 fd と同じ
-        // ファイルであることを確かめ、違えば（確認直前の差し替え）後始末の失敗と同じ扱い（3）にする。
+        // 公開先が保持 fd（検査したファイル）と同じでなければ、確認直後の差し替えで別の内容を
+        // 公開してしまっている。`hard_link` は新規作成なので公開先は自分が作ったリンクであり、
+        // 削除して公開を取り消す。削除にも失敗したら、検査していない内容が公開先に残る。
+        if !tmp.is_same_file_at(dest) {
+            return match std::fs::remove_file(dest) {
+                Ok(()) => Err(RestoreError::TempReplaced),
+                Err(_) => Err(RestoreError::UncheckedContentPublished),
+            };
+        }
+        // 公開済みで検査したファイルと一致した。以降の失敗でも最終ファイルは完全なので消さない。
         tmp.armed = false;
-        let published_ok = std::fs::symlink_metadata(dest)
-            .map(|m| m.is_file() && m.dev() == tmp.dev && m.ino() == tmp.ino)
-            .unwrap_or(false);
         let finalized = std::fs::remove_file(&tmp.path)
             .and_then(|()| File::open(parent).and_then(|d| d.sync_all()));
-        if !published_ok || finalized.is_err() {
+        if finalized.is_err() {
             return Err(RestoreError::PublishedButNotFinalized);
         }
         Ok(RestoreSummary { report })
@@ -626,6 +649,34 @@ mod tests {
         }
     }
 
+    /// 公開先が保持 fd と同じファイル（hard link）のときだけ `is_same_file_at` が真になる
+    /// （公開直後の差し替え検出の判定部分）。
+    #[cfg(unix)]
+    #[test]
+    fn temp_copy_identifies_published_destination() {
+        let dir = std::env::temp_dir().join(format!("restore-opt-same-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let mut t = unix_impl::TempCopy::create(&dir, "fandhe-test").expect("create");
+        let linked = dir.join("linked");
+        std::fs::hard_link(&t.path, &linked).expect("link");
+        assert!(t.is_same_file_at(&linked));
+        // 別 inode の同名ファイル・存在しないパス・リンクは偽
+        let other = dir.join("other");
+        std::fs::write(&other, b"").expect("other");
+        assert!(!t.is_same_file_at(&other));
+        assert!(!t.is_same_file_at(&dir.join("missing")));
+        let sym = dir.join("sym");
+        std::os::unix::fs::symlink(&linked, &sym).expect("symlink");
+        assert!(!t.is_same_file_at(&sym));
+        // 長さが保持 fd と違えば偽
+        std::fs::write(&other, b"x").expect("write");
+        std::fs::remove_file(&linked).expect("unlink");
+        std::fs::write(&linked, b"abc").expect("recreate");
+        assert!(!t.is_same_file_at(&linked));
+        t.armed = false;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn classify_maps_failures_to_distinct_codes() {
         let r = IntegrityReport::default();
@@ -637,6 +688,10 @@ mod tests {
         );
         assert_eq!(classify(&Err(RestoreError::OpenFailed)).0, EXIT_FAILURE);
         assert_eq!(classify(&Err(RestoreError::TempReplaced)).0, EXIT_FAILURE);
+        assert_eq!(
+            classify(&Err(RestoreError::UncheckedContentPublished)).0,
+            EXIT_FAILURE
+        );
         assert_eq!(classify(&Err(RestoreError::SourceInUse)).0, EXIT_FAILURE);
         assert_eq!(
             classify(&Err(RestoreError::PublishedButNotFinalized)).0,

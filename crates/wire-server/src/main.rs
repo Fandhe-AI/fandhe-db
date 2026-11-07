@@ -4090,6 +4090,17 @@ fn run_restore(args: &[String]) -> ExitCode {
     };
     let mut leftover = None;
     let result = restore_opt::restore(&parsed.from, &parsed.db, &mut leftover);
+    if matches!(
+        &result,
+        Err(restore_opt::RestoreError::UncheckedContentPublished)
+    ) {
+        // 検査していない内容が公開先に残っている（取り消しの削除に失敗）。終了コードは 1。
+        engine::log_stderr!(
+            "wire-server: restore: WARNING: {} holds content that was not checked; \
+             delete it manually",
+            parsed.db.display()
+        );
+    }
     if let Some(p) = &leftover {
         // 公開しなかった経路で一時コピーを消せなかった。終了コードは失敗の種別のまま通知する。
         report_leftover("restore", p);
