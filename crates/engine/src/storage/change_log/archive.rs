@@ -15,7 +15,8 @@
 //!
 //! 呼び出し元は `Storage::archive_change_log`（wire-server の常駐スレッドが `EngineCore` 経由で
 //! 周期的に呼ぶ）と `Storage::verify_change_log_archive`・[`verify_archive_dir`]（運用者の検証
-//! サブコマンド）。復元（ログの適用）は #2168 以降で、本ファイルは書き出しと検証だけを持つ。
+//! サブコマンド）。増分バックアップの出力・適用（Issue #2168）は `incremental` で、本ファイルのセグメント形式・
+//! 読み取り器（[`SegmentReader`]）・公開処理（`publish_with`）を共有する。本ファイルは書き出しと検証を持つ。
 //!
 //! # fail-closed
 //!
@@ -42,14 +43,14 @@ use crate::crypto::sha256::Sha256;
 use crate::storage::{Storage, StorageError};
 
 /// セグメントの先頭マジック。
-const SEG_MAGIC: [u8; 4] = *b"FCLA";
+pub(super) const SEG_MAGIC: [u8; 4] = *b"FCLA";
 /// セグメント形式の版数。未知の版数は拒否する。
 pub const SEGMENT_FORMAT_VERSION: u16 = 1;
 /// マジック 4 + 版数 2 + DB 識別子 16 + timeline 8 + 先頭 LSN 8 + 末尾 LSN 8 + レコード数 8 +
 /// ストレージ形式の版数 4 + 本体バイト数 8。
 const SEG_HEADER_LEN: usize = 4 + 2 + DB_ID_LEN + 8 + 8 + 8 + 8 + 4 + 8;
 /// ヘッダ + ヘッダのチェックサム。本体（レコード列）はこの直後から始まる。
-const SEG_PREFIX_LEN: usize = SEG_HEADER_LEN + CHECKSUM_LEN;
+pub(super) const SEG_PREFIX_LEN: usize = SEG_HEADER_LEN + CHECKSUM_LEN;
 const FILE_PREFIX: &str = "fandhe-cl-";
 const FILE_SUFFIX: &str = ".seg";
 const TMP_PREFIX: &str = ".fandhe-seg-";
@@ -247,18 +248,18 @@ pub struct ArchiveExpectation {
 
 /// セグメントのヘッダ。レコード列（本体）の前に置く。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SegmentHeader {
-    db_id: [u8; DB_ID_LEN],
-    timeline: u64,
-    first_lsn: u64,
-    last_lsn: u64,
-    record_count: u64,
-    storage_format: u32,
-    body_len: u64,
+pub(super) struct SegmentHeader {
+    pub(super) db_id: [u8; DB_ID_LEN],
+    pub(super) timeline: u64,
+    pub(super) first_lsn: u64,
+    pub(super) last_lsn: u64,
+    pub(super) record_count: u64,
+    pub(super) storage_format: u32,
+    pub(super) body_len: u64,
 }
 
 impl SegmentHeader {
-    fn encode(&self) -> [u8; SEG_PREFIX_LEN] {
+    pub(super) fn encode(&self) -> [u8; SEG_PREFIX_LEN] {
         let mut head = Vec::with_capacity(SEG_PREFIX_LEN);
         head.extend_from_slice(&SEG_MAGIC);
         head.extend_from_slice(&SEGMENT_FORMAT_VERSION.to_le_bytes());
@@ -458,7 +459,7 @@ impl SegmentBuilder {
 }
 
 /// 表の 1 行の検査（組み立てと採用の照合で共通）。
-fn check_row(
+pub(super) fn check_row(
     key: u64,
     value: &[u8],
     expect_lsn: u64,
@@ -499,7 +500,7 @@ fn read_err(e: std::io::Error) -> ArchiveError {
     }
 }
 
-fn map_decode(e: DecodeError) -> ArchiveError {
+pub(super) fn map_decode(e: DecodeError) -> ArchiveError {
     match e {
         DecodeError::Truncated => ArchiveError::Truncated,
         DecodeError::ChecksumMismatch => ArchiveError::ChecksumMismatch,
@@ -509,49 +510,74 @@ fn map_decode(e: DecodeError) -> ArchiveError {
 
 /// 検証済みセグメントの情報。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SegmentInfo {
-    header: SegmentHeader,
+pub(super) struct SegmentInfo {
+    pub(super) header: SegmentHeader,
     /// トレーラ（全体チェックサム）。採用時の照合に使う。
-    trailer: [u8; CHECKSUM_LEN],
+    pub(super) trailer: [u8; CHECKSUM_LEN],
 }
 
-/// セグメントファイル 1 つを検証する。ファイル全体を一度に読まず、レコード単位に
-/// 「ヘッダ → ペイロード長の上限検証 → 読み取り → チェックサム」の順で進める。検出するもの:
-/// ヘッダ・レコード・全体のチェックサム不一致、セグメント内の LSN の飛び、別 DB／別 timeline の
-/// レコードの混入、途中切れ・余り。通常ファイルでない（シンボリックリンク等）ものは拒否する。
-fn verify_segment_file(path: &Path, max_payload: usize) -> Result<SegmentInfo> {
-    let meta = std::fs::symlink_metadata(path)?;
-    if !meta.file_type().is_file() {
-        return Err(ArchiveError::BadFormat);
+/// セグメントファイルの前方読み取り器。ヘッダ・ファイル長の検証を済ませ、レコードを 1 件ずつ
+/// 「ヘッダ → ペイロード長の上限検証 → 読み取り」の順で取り出す（確保の前に長さを検証する。untrusted 入力）。
+/// 全体チェックサムは取り出したバイト列から逐次計算し、[`Self::finish`] でトレーラと照合する。
+/// 検証（[`verify_segment_file`]）と、増分バックアップの適用（`incremental`）が共有する。
+pub(super) struct SegmentReader {
+    file: std::fs::File,
+    header: SegmentHeader,
+    hasher: Sha256,
+    remaining: u64,
+    max_payload: usize,
+}
+
+impl SegmentReader {
+    /// `path` を開いてヘッダを検証する。通常ファイルでない（シンボリックリンク等）もの、ヘッダの
+    /// チェックサム不一致、ファイル長が宣言（ヘッダ + 本体 + トレーラ）と合わないものは拒否する。
+    pub(super) fn open(path: &Path, max_payload: usize) -> Result<Self> {
+        let meta = std::fs::symlink_metadata(path)?;
+        if !meta.file_type().is_file() {
+            return Err(ArchiveError::BadFormat);
+        }
+        let mut file = std::fs::File::open(path)?;
+        let mut prefix = [0u8; SEG_PREFIX_LEN];
+        file.read_exact(&mut prefix).map_err(read_err)?;
+        let header = SegmentHeader::decode(&prefix)?;
+        let expected_len = u64::try_from(SEG_PREFIX_LEN)
+            .ok()
+            .and_then(|p| p.checked_add(header.body_len))
+            .and_then(|n| n.checked_add(CHECKSUM_LEN as u64))
+            .ok_or(ArchiveError::BadFormat)?;
+        match meta.len().cmp(&expected_len) {
+            std::cmp::Ordering::Less => return Err(ArchiveError::Truncated),
+            std::cmp::Ordering::Greater => return Err(ArchiveError::BadFormat),
+            std::cmp::Ordering::Equal => {}
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(&prefix);
+        Ok(Self {
+            file,
+            remaining: header.body_len,
+            header,
+            hasher,
+            max_payload,
+        })
     }
-    let mut file = std::fs::File::open(path)?;
-    let mut prefix = [0u8; SEG_PREFIX_LEN];
-    file.read_exact(&mut prefix).map_err(read_err)?;
-    let header = SegmentHeader::decode(&prefix)?;
-    let expected_len = u64::try_from(SEG_PREFIX_LEN)
-        .ok()
-        .and_then(|p| p.checked_add(header.body_len))
-        .and_then(|n| n.checked_add(CHECKSUM_LEN as u64))
-        .ok_or(ArchiveError::BadFormat)?;
-    match meta.len().cmp(&expected_len) {
-        std::cmp::Ordering::Less => return Err(ArchiveError::Truncated),
-        std::cmp::Ordering::Greater => return Err(ArchiveError::BadFormat),
-        std::cmp::Ordering::Equal => {}
+
+    pub(super) fn header(&self) -> &SegmentHeader {
+        &self.header
     }
-    let mut hasher = Sha256::new();
-    hasher.update(&prefix);
-    let mut remaining = header.body_len;
-    let mut expect_lsn = header.first_lsn;
-    let mut count = 0u64;
-    let frame_head = HEADER_LEN + CHECKSUM_LEN;
-    let mut format: Option<u32> = None;
-    while remaining > 0 {
-        let mut record = vec![0u8; frame_head];
+
+    /// 次のレコード（`change_log` 表の値そのまま）を取り出す。本体を読み切っていれば `None`。
+    /// レコード自身のチェックサム・LSN の連鎖の検査は呼び出し側（`peek_record`／`decode_record`）が行う。
+    pub(super) fn next_record(&mut self) -> Result<Option<Vec<u8>>> {
+        if self.remaining == 0 {
+            return Ok(None);
+        }
+        let frame_head = HEADER_LEN + CHECKSUM_LEN;
         let head_len = frame_head as u64;
-        if remaining < head_len {
+        if self.remaining < head_len {
             return Err(ArchiveError::Truncated);
         }
-        file.read_exact(&mut record).map_err(read_err)?;
+        let mut record = vec![0u8; frame_head];
+        self.file.read_exact(&mut record).map_err(read_err)?;
         // ペイロード長はヘッダの末尾 4 バイト（`encode_record_with` の配置）。確保の前に上限と残量で検証する。
         let len_bytes: [u8; 4] = record
             .get(HEADER_LEN - 4..HEADER_LEN)
@@ -559,22 +585,53 @@ fn verify_segment_file(path: &Path, max_payload: usize) -> Result<SegmentInfo> {
             .ok_or(ArchiveError::BadFormat)?;
         let payload_len =
             usize::try_from(u32::from_le_bytes(len_bytes)).map_err(|_| ArchiveError::BadFormat)?;
-        if payload_len > max_payload {
+        if payload_len > self.max_payload {
             return Err(ArchiveError::BadFormat);
         }
         let payload_u64 = payload_len as u64;
-        let after_head = remaining - head_len;
+        let after_head = self.remaining - head_len;
         if payload_u64 > after_head {
             return Err(ArchiveError::Truncated);
         }
         record.resize(frame_head + payload_len, 0);
-        file.read_exact(
-            record
-                .get_mut(frame_head..)
-                .ok_or(ArchiveError::BadFormat)?,
-        )
-        .map_err(read_err)?;
-        remaining = after_head - payload_u64;
+        self.file
+            .read_exact(
+                record
+                    .get_mut(frame_head..)
+                    .ok_or(ArchiveError::BadFormat)?,
+            )
+            .map_err(read_err)?;
+        self.remaining = after_head - payload_u64;
+        self.hasher.update(&record);
+        Ok(Some(record))
+    }
+
+    /// 本体を読み切ったあとにトレーラ（全体チェックサム）を読んで照合し、トレーラを返す。
+    /// 本体が残っていれば `BadFormat`、不一致は `ChecksumMismatch`。
+    pub(super) fn finish(mut self) -> Result<[u8; CHECKSUM_LEN]> {
+        if self.remaining != 0 {
+            return Err(ArchiveError::BadFormat);
+        }
+        let mut trailer = [0u8; CHECKSUM_LEN];
+        self.file.read_exact(&mut trailer).map_err(read_err)?;
+        if !crate::crypto::constant_time_eq(&self.hasher.finalize(), &trailer) {
+            return Err(ArchiveError::ChecksumMismatch);
+        }
+        Ok(trailer)
+    }
+}
+
+/// セグメントファイル 1 つを検証する。ファイル全体を一度に読まず、レコード単位に
+/// 「ヘッダ → ペイロード長の上限検証 → 読み取り → チェックサム」の順で進める（[`SegmentReader`]）。検出するもの:
+/// ヘッダ・レコード・全体のチェックサム不一致、セグメント内の LSN の飛び、別 DB／別 timeline の
+/// レコードの混入、途中切れ・余り。通常ファイルでない（シンボリックリンク等）ものは拒否する。
+pub(super) fn verify_segment_file(path: &Path, max_payload: usize) -> Result<SegmentInfo> {
+    let mut reader = SegmentReader::open(path, max_payload)?;
+    let header = reader.header;
+    let mut expect_lsn = header.first_lsn;
+    let mut count = 0u64;
+    let mut format: Option<u32> = None;
+    while let Some(record) = reader.next_record()? {
         let h = peek_record(&record, max_payload).map_err(map_decode)?;
         if h.db_id != header.db_id {
             return Err(ArchiveError::ForeignDatabase);
@@ -590,7 +647,6 @@ fn verify_segment_file(path: &Path, max_payload: usize) -> Result<SegmentInfo> {
             Some(_) => {}
             None => format = Some(h.storage_format),
         }
-        hasher.update(&record);
         expect_lsn = expect_lsn.checked_add(1).ok_or(ArchiveError::LsnGap)?;
         count = count.checked_add(1).ok_or(ArchiveError::BadFormat)?;
     }
@@ -600,11 +656,7 @@ fn verify_segment_file(path: &Path, max_payload: usize) -> Result<SegmentInfo> {
     if expect_lsn.checked_sub(1) != Some(header.last_lsn) || format != Some(header.storage_format) {
         return Err(ArchiveError::BadFormat);
     }
-    let mut trailer = [0u8; CHECKSUM_LEN];
-    file.read_exact(&mut trailer).map_err(read_err)?;
-    if !crate::crypto::constant_time_eq(&hasher.finalize(), &trailer) {
-        return Err(ArchiveError::ChecksumMismatch);
-    }
+    let trailer = reader.finish()?;
     Ok(SegmentInfo { header, trailer })
 }
 
@@ -701,7 +753,7 @@ fn index_insert(index: &mut Vec<(PathBuf, SegmentName)>, path: PathBuf, name: Se
 /// `hard_link` するだけで、書き出しを `Conflict` で止められる（スティッキービットは削除・改名を防ぐだけで
 /// 作成は防がない）。
 #[cfg(unix)]
-fn check_dir_not_shared(dir: &Path) -> Result<()> {
+pub(super) fn check_dir_not_shared(dir: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let mode = std::fs::metadata(dir)?.permissions().mode();
     if mode & 0o022 != 0 {
@@ -711,7 +763,7 @@ fn check_dir_not_shared(dir: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn check_dir_not_shared(_dir: &Path) -> Result<()> {
+pub(super) fn check_dir_not_shared(_dir: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -723,8 +775,22 @@ fn check_dir_not_shared(_dir: &Path) -> Result<()> {
 /// 戻り値が `Ok(true)` なら新規に公開し、`Ok(false)` なら競合で既に在った（呼び出し側が内容を照合する）。
 #[cfg(unix)]
 fn publish(dir: &Path, final_path: &Path, bytes: &[u8]) -> Result<bool> {
+    publish_with(dir, final_path, |file| {
+        use std::io::Write;
+        file.write_all(bytes)
+    })
+}
+
+/// [`publish`] の本体。中身は `write` が一時ファイルへ書く（増分バックアップ〔`incremental`〕が、メモリに
+/// 載せ切れない大きさのファイルを逐次に書くために使う）。書き込み後の fsync・差し替え検出・`hard_link`
+/// による上書きなしの公開・親ディレクトリの fsync は共通。`write` が失敗したときは一時名を消して返す。
+#[cfg(unix)]
+pub(super) fn publish_with(
+    dir: &Path,
+    final_path: &Path,
+    write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> Result<bool> {
     use std::hash::{BuildHasher, Hasher};
-    use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     use std::sync::atomic::{AtomicU64, Ordering};
     static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -760,7 +826,7 @@ fn publish(dir: &Path, final_path: &Path, bytes: &[u8]) -> Result<bool> {
         }
     };
     use std::os::unix::fs::MetadataExt;
-    let written = file.write_all(bytes).and_then(|()| file.sync_all());
+    let written = write(&mut file).and_then(|()| file.sync_all());
     if let Err(e) = written {
         drop(file);
         let _ = std::fs::remove_file(&tmp);
@@ -812,6 +878,15 @@ fn publish(_dir: &Path, _final_path: &Path, _bytes: &[u8]) -> Result<bool> {
     Err(ArchiveError::Unsupported)
 }
 
+#[cfg(not(unix))]
+pub(super) fn publish_with(
+    _dir: &Path,
+    _final_path: &Path,
+    _write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> Result<bool> {
+    Err(ArchiveError::Unsupported)
+}
+
 /// 採用するセグメントとその親ディレクトリの永続化を確認する。公開の直後に失敗した周期の次の周期は
 /// 採用経路を通るため、水位を進める前に（刈り込みで DB のログを消す前に）必ず fsync を成功させる。
 fn sync_adopted(dir: &Path, path: &Path) -> Result<()> {
@@ -847,7 +922,7 @@ enum Plan {
     Adopt { last_lsn: u64, path: PathBuf },
 }
 
-fn read_meta_u64(read: &redb::ReadTransaction, key: &str) -> Result<Option<u64>> {
+pub(super) fn read_meta_u64(read: &redb::ReadTransaction, key: &str) -> Result<Option<u64>> {
     match read.open_table(META_TABLE) {
         Ok(t) => match t.get(key)? {
             Some(v) => {

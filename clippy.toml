@@ -8,6 +8,7 @@
 # 許可する箇所（`#[allow(clippy::disallowed_methods)]`）は次の最小限に限る:
 # - crates/engine/src/storage/change_log.rs（ラッパ本体と、記録範囲の例外である本体表・メタ表）
 # - crates/engine/src/storage/change_log/archive.rs（アーカイブの保守 commit が書く本体表・メタ表。同上）
+# - crates/engine/src/storage/change_log/incremental.rs（増分バックアップの適用が追記する本体表。同上）
 # - crates/engine/src/storage/read_source.rs（読み取り専用の境界でだけ露出するハンドル）
 # - 単体テスト（`#[cfg(test)]`。crates/engine/src/lib.rs の cfg_attr）と、外部クレート側の
 #   crates/engine/tests・benches・examples のうち redb を直接開いて検査・破壊するファイル

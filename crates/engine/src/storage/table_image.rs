@@ -157,6 +157,11 @@ impl TableImage {
 
 /// shape ごとの操作（関数ポインタ表）。
 struct Shape {
+    /// 増分バックアップの適用(`apply_change`)が、信頼しないバイト列を `from_bytes` へ渡す前に使う検証。
+    /// redb の `from_bytes` は長さ・UTF-8 の不整合で panic するため、型の組ごとに事前に確かめる。
+    /// `shapes!` が型の組の `WireCheck` 実装を要求するので、新しい型は検証なしに登録できない。
+    valid_key: fn(&[u8]) -> bool,
+    valid_value: fn(&[u8]) -> bool,
     capture: fn(
         &WriteTransaction,
         &ReadTransaction,
@@ -446,9 +451,191 @@ fn apply_table<K: Key + 'static, V: Value + 'static>(
     Ok(())
 }
 
+/// redb の `Value::from_bytes` が panic しない入力かを、実体化せずに確かめる(信頼しないバイト列用)。
+/// 判定は redb 4.2.0 の符号化(固定長は長さ一致・`&str` は UTF-8・タプルは「最後以外の可変長要素の
+/// varint 長を先頭に並べ、固定長要素は長さを持たない」)に従う。`shapes!` が各型の実装を要求する。
+trait WireCheck {
+    /// 固定長ならそのバイト数(redb の `fixed_width` と同じ)。
+    fn fixed() -> Option<usize>;
+    /// `bytes` を `from_bytes` に渡しても panic しないか。
+    fn valid(bytes: &[u8]) -> bool;
+}
+
+impl WireCheck for u8 {
+    fn fixed() -> Option<usize> {
+        Some(1)
+    }
+    fn valid(bytes: &[u8]) -> bool {
+        bytes.len() == 1
+    }
+}
+
+impl WireCheck for u64 {
+    fn fixed() -> Option<usize> {
+        Some(8)
+    }
+    fn valid(bytes: &[u8]) -> bool {
+        bytes.len() == 8
+    }
+}
+
+impl WireCheck for () {
+    fn fixed() -> Option<usize> {
+        Some(0)
+    }
+    fn valid(bytes: &[u8]) -> bool {
+        bytes.is_empty()
+    }
+}
+
+impl WireCheck for &'static str {
+    fn fixed() -> Option<usize> {
+        None
+    }
+    fn valid(bytes: &[u8]) -> bool {
+        std::str::from_utf8(bytes).is_ok()
+    }
+}
+
+impl WireCheck for &'static [u8] {
+    fn fixed() -> Option<usize> {
+        None
+    }
+    fn valid(_: &[u8]) -> bool {
+        true
+    }
+}
+
+/// redb の可変長整数(長さ前置き)を、範囲外アクセスなしで読む。`(長さ, 消費バイト数)`。
+fn read_varint(data: &[u8]) -> Option<(usize, usize)> {
+    match *data.first()? {
+        n @ 0..=253 => Some((usize::from(n), 1)),
+        254 => {
+            let b: [u8; 2] = data.get(1..3)?.try_into().ok()?;
+            Some((usize::from(u16::from_le_bytes(b)), 3))
+        }
+        255 => {
+            let b: [u8; 4] = data.get(1..5)?.try_into().ok()?;
+            Some((usize::try_from(u32::from_le_bytes(b)).ok()?, 5))
+        }
+    }
+}
+
+/// タプルの検証。`fixed`/`valids` は要素ごとの固定長と検証関数。
+fn tuple_valid(fixed: &[Option<usize>], valids: &[fn(&[u8]) -> bool], data: &[u8]) -> bool {
+    if fixed.len() != valids.len() || fixed.is_empty() {
+        return false;
+    }
+    // 全要素が固定長なら連結のみ(長さ前置きなし)。
+    let mut total = Some(0usize);
+    for f in fixed {
+        total = match (total, f) {
+            (Some(t), Some(w)) => t.checked_add(*w),
+            _ => None,
+        };
+    }
+    let mut offset = 0usize;
+    let mut lens = Vec::with_capacity(fixed.len());
+    if let Some(total) = total {
+        if data.len() != total {
+            return false;
+        }
+        lens.extend(fixed.iter().map(|f| f.unwrap_or(0)));
+    } else {
+        // 最後の要素を除く可変長要素の長さが、先頭に varint で並ぶ。
+        let last = fixed.len() - 1;
+        for f in fixed.iter().take(last) {
+            match f {
+                Some(w) => lens.push(*w),
+                None => {
+                    let Some((len, used)) = data.get(offset..).and_then(read_varint) else {
+                        return false;
+                    };
+                    let Some(next) = offset.checked_add(used) else {
+                        return false;
+                    };
+                    offset = next;
+                    lens.push(len);
+                }
+            }
+        }
+        // 最後の要素は、長さ前置きと先行要素を除いた残り全部。
+        let mut used = offset;
+        for l in &lens {
+            let Some(u) = used.checked_add(*l) else {
+                return false;
+            };
+            used = u;
+        }
+        let Some(rest) = data.len().checked_sub(used) else {
+            return false;
+        };
+        lens.push(rest);
+    }
+    for (valid, len) in valids.iter().zip(&lens) {
+        let Some(end) = offset.checked_add(*len) else {
+            return false;
+        };
+        let Some(slice) = data.get(offset..end) else {
+            return false;
+        };
+        if !valid(slice) {
+            return false;
+        }
+        offset = end;
+    }
+    // 固定長のタプルは全体を使い切る。可変長は最後が残りを取るので常に使い切る。
+    offset == data.len()
+}
+
+fn fixed_sum(parts: &[Option<usize>]) -> Option<usize> {
+    let mut sum = 0usize;
+    for p in parts {
+        sum = sum.checked_add((*p)?)?;
+    }
+    Some(sum)
+}
+
+macro_rules! wire_check_tuple {
+    ($($t:ident),+) => {
+        impl<$($t: WireCheck),+> WireCheck for ($($t,)+) {
+            fn fixed() -> Option<usize> {
+                fixed_sum(&[$($t::fixed()),+])
+            }
+            fn valid(bytes: &[u8]) -> bool {
+                tuple_valid(&[$($t::fixed()),+], &[$($t::valid as fn(&[u8]) -> bool),+], bytes)
+            }
+        }
+    };
+}
+
+wire_check_tuple!(A, B);
+wire_check_tuple!(A, B, C);
+wire_check_tuple!(A, B, C, D);
+wire_check_tuple!(A, B, C, D, E);
+wire_check_tuple!(A, B, C, D, E, F);
+
+/// `shape` の型の組に対して、`upserts`・`removes` の全キー・値のバイト列が `from_bytes` で panic しないか。
+/// 範囲外の `shape` も偽。
+pub(crate) fn changes_are_wellformed(
+    shape: usize,
+    upserts: &[(Vec<u8>, Vec<u8>)],
+    removes: &[Vec<u8>],
+) -> bool {
+    let Some(s) = SHAPES.get(shape) else {
+        return false;
+    };
+    upserts
+        .iter()
+        .all(|(k, v)| (s.valid_key)(k) && (s.valid_value)(v))
+        && removes.iter().all(|k| (s.valid_key)(k))
+}
+
 macro_rules! shapes {
     ($(($k:ty, $v:ty)),+ $(,)?) => {
         &[$(Shape {
+            valid_key: <$k as WireCheck>::valid,
+            valid_value: <$v as WireCheck>::valid,
             capture: capture_table::<$k, $v>,
             apply: apply_table::<$k, $v>,
             copy: super::snapshot::copy_table::<$k, $v>,
@@ -639,6 +826,165 @@ pub(crate) fn apply(writer: &WriteTransaction, image: &TableImage) -> Result<(),
         (shape.apply)(writer, d)?;
     }
     Ok(())
+}
+
+/// 変更ログのレコードの 1 表分（`storage::change_log::incremental` が増分バックアップを適用する）を
+/// writer へ適用する。表が無ければ `shape` の型の組で作り（行が無くても空の表を作る）、`removes` →
+/// `upserts` の順で反映する。既存の表の型が `shape` と合わなければ `ImageError`（`TableTypeMismatch`）。
+/// 呼び出し側は表の有無（作成か変更か）の整合を事前に検査する。
+pub(crate) fn apply_change(
+    writer: &WriteTransaction,
+    name: &str,
+    shape: usize,
+    upserts: Vec<(Vec<u8>, Vec<u8>)>,
+    removes: Vec<Vec<u8>>,
+) -> Result<(), ImageError> {
+    let shape_ops = SHAPES.get(shape).ok_or(ImageError)?;
+    // redb の `from_bytes` は不正なバイト列で panic するため、適用の前に必ず検証する。
+    if !changes_are_wellformed(shape, &upserts, &removes) {
+        return Err(ImageError);
+    }
+    (shape_ops.apply)(
+        writer,
+        &TableDelta {
+            name: name.to_string(),
+            shape,
+            upserts,
+            removes,
+        },
+    )
+}
+
+/// writer の `name` の表を削除する。無ければ `Ok(false)`（呼び出し側が整合を判断する）。
+pub(crate) fn drop_table_named(writer: &WriteTransaction, name: &str) -> Result<bool, ImageError> {
+    let handle = writer
+        .list_tables()
+        .map_err(|_| ImageError)?
+        .find(|h| h.name() == name);
+    match handle {
+        Some(h) => writer.delete_table_logged(h).map_err(|_| ImageError),
+        None => Ok(false),
+    }
+}
+
+/// [`SHAPES`] の件数。レコードの shape 番号の上限検証に使う。
+pub(crate) fn shapes_len() -> usize {
+    SHAPES.len()
+}
+
+#[cfg(test)]
+mod wellformed_tests {
+    use super::*;
+
+    /// 全 shape で、不正なキー(どの型の組でも不正になる 1 バイト 0xff)を upsert・remove のどちらでも拒否する。
+    #[test]
+    fn every_shape_rejects_malformed_keys() {
+        for shape in 0..SHAPES.len() {
+            let bad = vec![0xffu8];
+            assert!(
+                !changes_are_wellformed(shape, &[(bad.clone(), vec![])], &[]),
+                "shape {shape}: upsert key"
+            );
+            assert!(
+                !changes_are_wellformed(shape, &[], &[bad]),
+                "shape {shape}: remove key"
+            );
+        }
+        assert!(!changes_are_wellformed(SHAPES.len(), &[], &[]));
+    }
+
+    /// 固定長・単位型の値を持つ shape は、長さの合わない値を拒否する。
+    #[test]
+    fn fixed_width_values_reject_wrong_lengths() {
+        // (&str,u64) 値 u64: 0・3・11 / 値 (): 5・9・14・15。
+        for shape in [0usize, 3, 11, 5, 9, 14, 15] {
+            let key = match shape {
+                0 => b"k".to_vec(),
+                3 => encode_two_strs("a", "b"),
+                11 => 1u64.to_le_bytes().to_vec(),
+                5 => encode_three_strs("a", "b", "c"),
+                9 => {
+                    let mut k = vec![1u8, b'x'];
+                    k.extend_from_slice(&[1, 0, 0, 0, 0, 0, 0, 0]);
+                    // (&str, &[u8], u64): 先頭の長さ前置き 1 つ(&str)。
+                    let mut v = vec![1u8];
+                    v.extend_from_slice(b"s");
+                    v.extend_from_slice(b"x");
+                    v.extend_from_slice(&1u64.to_le_bytes());
+                    v
+                }
+                14 => {
+                    let mut k = vec![1u8];
+                    k.extend_from_slice(&[1, 1, 1]);
+                    k.extend_from_slice(b"abcd");
+                    k
+                }
+                _ => Vec::new(),
+            };
+            // キーが正しいかどうかに依らず、値が長さ 3 なら拒否される。
+            assert!(
+                !changes_are_wellformed(shape, &[(key, vec![1, 2, 3])], &[]),
+                "shape {shape}: wrong-length value"
+            );
+        }
+    }
+
+    fn encode_two_strs(a: &str, b: &str) -> Vec<u8> {
+        let mut v = vec![a.len() as u8];
+        v.extend_from_slice(a.as_bytes());
+        v.extend_from_slice(b.as_bytes());
+        v
+    }
+
+    fn encode_three_strs(a: &str, b: &str, c: &str) -> Vec<u8> {
+        let mut v = vec![a.len() as u8, b.len() as u8];
+        v.extend_from_slice(a.as_bytes());
+        v.extend_from_slice(b.as_bytes());
+        v.extend_from_slice(c.as_bytes());
+        v
+    }
+
+    /// redb 自身の符号化で作った正しいバイト列は、可変長タプルを含めて受理される(検証が厳しすぎない)。
+    #[test]
+    fn encoded_values_are_accepted() {
+        fn enc<T: redb::Value + 'static>(v: T::SelfType<'_>) -> Vec<u8> {
+            T::as_bytes(&v).as_ref().to_vec()
+        }
+        // shape 3: ((&str,&str), u64)
+        let k = enc::<(&str, &str)>(("a", "bcd"));
+        assert!(changes_are_wellformed(
+            3,
+            &[(k, 7u64.to_le_bytes().to_vec())],
+            &[]
+        ));
+        // shape 5: ((&str,&str,&str), ())
+        let k = enc::<(&str, &str, &str)>(("a", "", "ccc"));
+        assert!(changes_are_wellformed(5, &[(k, vec![])], &[]));
+        // shape 6: ((&str,u64), &[u8])
+        let k = enc::<(&str, u64)>(("tenant", 9));
+        assert!(changes_are_wellformed(6, &[(k, vec![1, 2])], &[]));
+        // shape 9: ((&str,&[u8],u64), ())
+        let k = enc::<(&str, &[u8], u64)>(("t", &[1u8, 2][..], 3));
+        assert!(changes_are_wellformed(9, &[(k, vec![])], &[]));
+        // shape 13: ((u8,&str,&str), &[u8])
+        let k = enc::<(u8, &str, &str)>((1, "x", "yz"));
+        assert!(changes_are_wellformed(13, &[(k, vec![0])], &[]));
+        // 長い可変長要素(254 バイト以上の varint 長)。
+        let long = "a".repeat(300);
+        let k = enc::<(&str, &str)>((long.as_str(), "b"));
+        assert!(changes_are_wellformed(
+            3,
+            &[(k, 1u64.to_le_bytes().to_vec())],
+            &[]
+        ));
+        // 切り詰めは拒否。
+        let k = enc::<(&str, &str)>((long.as_str(), "b"));
+        assert!(!changes_are_wellformed(
+            3,
+            &[(k[..100].to_vec(), 1u64.to_le_bytes().to_vec())],
+            &[]
+        ));
+    }
 }
 
 #[cfg(test)]

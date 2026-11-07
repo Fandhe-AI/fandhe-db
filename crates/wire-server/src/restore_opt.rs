@@ -43,19 +43,33 @@ pub struct RestoreArgs {
     pub from: PathBuf,
     /// 復元先の DB ファイル（まだ存在しない新規パス）。
     pub db: PathBuf,
+    /// ベースの後ろへ適用する増分バックアップ（`--incremental` の指定順。古い順。既存の通常ファイル。
+    /// 変更しない）。空ならベースだけを復元する。
+    pub incrementals: Vec<PathBuf>,
 }
 
 /// `restore` サブコマンドの引数（サブコマンド名より後ろ）を解釈する。未知の引数・値欠落・重複・
 /// 必須欠落・復元元と復元先の衝突は拒否する（エラー文は英語で、パスの内容は含めない）。
 pub fn parse(args: &[String]) -> Result<RestoreArgs, String> {
+    const USAGE: &str =
+        "unknown argument (usage: restore --from <path> --db <path> [--incremental <path>]...)";
     let mut from: Option<&str> = None;
     let mut db: Option<&str> = None;
+    let mut incrementals: Vec<&str> = Vec::new();
     let mut it = args.iter();
     while let Some(arg) = it.next() {
+        if arg == "--incremental" {
+            // 複数回の指定を許す唯一のフラグ。指定順（古い順）がそのまま適用順になる。
+            match it.next() {
+                Some(v) => incrementals.push(v.as_str()),
+                None => return Err(format!("{arg} requires a value")),
+            }
+            continue;
+        }
         let slot = match arg.as_str() {
             "--from" => &mut from,
             "--db" => &mut db,
-            _ => return Err("unknown argument (usage: restore --from <path> --db <path>)".into()),
+            _ => return Err(USAGE.into()),
         };
         if slot.is_some() {
             return Err(format!("{arg} specified more than once"));
@@ -71,7 +85,15 @@ pub fn parse(args: &[String]) -> Result<RestoreArgs, String> {
     let from = validate_existing_file("--from", from)?;
     // 復元先は新規パスに限る（既存の DB・ファイル・ディレクトリ・リンクは書かずに拒否）。
     let db = validate_new_path("--db", db)?;
-    Ok(RestoreArgs { from, db })
+    let incrementals = incrementals
+        .into_iter()
+        .map(|p| validate_existing_file("--incremental", p))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(RestoreArgs {
+        from,
+        db,
+        incrementals,
+    })
 }
 
 /// 復元の成功結果（行の値は含めない。CLI の表示用）。
@@ -109,6 +131,10 @@ pub enum RestoreError {
     UncheckedContentPublished,
     /// 最終名への公開は済み中身は完全だが、後始末（一時名の削除・親ディレクトリの fsync）を確かめられなかった。
     PublishedButNotFinalized,
+    /// 増分バックアップを適用できなかった（連鎖の切断・順序違反・別 DB・別 timeline・破損・形式不正。
+    /// チェックサムは破損・不整合の検出であり認証ではない(増分はベースと同じ信頼境界で受け渡す)。
+    /// Issue #2168・RECOVER-14 のポインタ）。何も公開しない。
+    Chain(engine::storage::IncrementalError),
     /// その他の入出力の失敗。
     Io(std::io::ErrorKind),
 }
@@ -136,6 +162,7 @@ impl std::fmt::Display for RestoreError {
                 "WARNING: the database file was published but its durability could not be \
                  confirmed; verify it before relying on it"
             }
+            Self::Chain(e) => return write!(f, "{e}; nothing was published"),
             Self::Io(_) => "restore failed due to an I/O error",
         })
     }
@@ -211,6 +238,17 @@ pub fn restore(
     Err(RestoreError::Unsupported)
 }
 
+/// [`restore`] の増分つき版（非 unix では常に `Unsupported`）。
+#[cfg(not(unix))]
+pub fn restore_with_incrementals(
+    _from: &Path,
+    _dest: &Path,
+    _incrementals: &[PathBuf],
+    _leftover: &mut Option<PathBuf>,
+) -> Result<RestoreSummary, RestoreError> {
+    Err(RestoreError::Unsupported)
+}
+
 /// バックアップ `from` を新しい DB `dest` へ復元する（モジュール doc の公開手順）。
 /// 公開しなかった経路で一時コピーを消せなかったときは、残ったパスを `leftover` に入れる
 /// （全テナントのデータのコピーが残るため、呼び出し元が通知する）。
@@ -220,7 +258,23 @@ pub fn restore(
     dest: &Path,
     leftover: &mut Option<PathBuf>,
 ) -> Result<RestoreSummary, RestoreError> {
-    unix_impl::restore(from, dest, leftover)
+    unix_impl::restore(from, dest, &[], leftover)
+}
+
+/// ベース `from` へ増分バックアップ `incrementals`（古い順）を適用した状態を、新しい DB `dest` へ復元する
+/// （Issue #2168・RECOVER-13・RECOVER-14 のポインタ）。公開手順は [`restore`] と同じで、コピーの検査の前に
+/// engine の `apply_incremental_segments` を一時コピーへ適用する。連鎖が切れている・順序違反・別 DB／別
+/// timeline・破損・形式不正は [`RestoreError::Chain`] で、何も公開しない。
+/// 細工してチェックサムを計算し直した増分は検証を通る(認証ではない)。ベースと増分のファイルは変更しない。
+/// `incrementals` が空なら [`restore`] と同じ。
+#[cfg(unix)]
+pub fn restore_with_incrementals(
+    from: &Path,
+    dest: &Path,
+    incrementals: &[PathBuf],
+    leftover: &mut Option<PathBuf>,
+) -> Result<RestoreSummary, RestoreError> {
+    unix_impl::restore(from, dest, incrementals, leftover)
 }
 
 /// `verify` が検査に使った経路（出力の `verify_mode=` 行の値。固定語で、パス・内容を含まない）。
@@ -498,6 +552,7 @@ mod unix_impl {
     pub(super) fn restore(
         from: &Path,
         dest: &Path,
+        incrementals: &[PathBuf],
         leftover: &mut Option<PathBuf>,
     ) -> Result<RestoreSummary, RestoreError> {
         let parent = parent_of(dest)?;
@@ -512,7 +567,7 @@ mod unix_impl {
 
         // 2. 一時ファイルへ 0600 の排他作成でコピーする。fd は公開まで保持する。
         let mut tmp = TempCopy::create(parent, "fandhe-restore")?;
-        let result = restore_from_copy(&mut src, src_len, &mut tmp, dest, parent);
+        let result = restore_from_copy(&mut src, src_len, &mut tmp, dest, parent, incrementals);
         drop(src);
         // 公開しなかった経路（公開済みなら armed は false）では、一時コピーを明示的に消し、
         // 消せなければ通知できるようにする。
@@ -531,11 +586,24 @@ mod unix_impl {
         tmp: &mut TempCopy,
         dest: &Path,
         parent: &Path,
+        incrementals: &[PathBuf],
     ) -> Result<RestoreSummary, RestoreError> {
         copy_into(src, src_len, tmp)?;
 
+        // 2b. 増分バックアップを一時コピーへ適用する（元のバックアップには触れない。連鎖の検証・破損の
+        //     拒否は engine。失敗すれば公開せずに一時コピーを消す）。適用で DB ファイルは伸びるため、
+        //     以降の長さの確認は適用後の長さを基準にする。
+        let mut verified_len = src_len;
+        if !incrementals.is_empty() {
+            tmp.check_path(Some(src_len))?;
+            engine::storage::apply_incremental_segments(&tmp.path, incrementals)
+                .map_err(RestoreError::Chain)?;
+            tmp.check_path(None)?;
+            verified_len = tmp.file.metadata().map_err(io_err)?.len();
+        }
+
         // 3. コピーを開いて検査する（パスの同一性を前後で確認）。
-        let report = open_and_verify(tmp, src_len, &IntegrityOptions::default())?;
+        let report = open_and_verify(tmp, verified_len, &IntegrityOptions::default())?;
         if !report.is_consistent() {
             return Err(RestoreError::NotConsistent(report));
         }
@@ -594,6 +662,47 @@ mod tests {
         assert!(parse(&v(&["--from", "a", "--from", "b", "--db", "c"])).is_err());
         assert!(parse(&v(&["--from", "a"])).is_err());
         assert!(parse(&v(&["--db", "c"])).is_err());
+    }
+
+    #[test]
+    fn incremental_flag_repeats_in_order_and_requires_existing_files() {
+        let exe = std::env::current_exe().expect("current_exe");
+        let exe = exe.to_str().expect("utf-8 path");
+        let parsed = parse(&v(&[
+            "--from",
+            exe,
+            "--incremental",
+            exe,
+            "--db",
+            "/nonexistent-dir-for-restore-test/x",
+        ]));
+        // 復元先の親が無いので拒否されるが、増分の検証より先に `--db` で落ちる（順序に依らず拒否）。
+        assert!(parsed.is_err());
+        // 値欠落・存在しない増分は拒否する。
+        assert!(parse(&v(&["--from", exe, "--db", "x", "--incremental"])).is_err());
+        assert!(parse(&v(&[
+            "--from",
+            exe,
+            "--db",
+            "x-not-created",
+            "--incremental",
+            "/nonexistent-incremental-for-restore-test"
+        ]))
+        .is_err());
+        // `--incremental` だけが複数回の指定を許す（他のフラグの重複は従来どおり拒否）。
+        let ok = parse(&v(&[
+            "--from",
+            exe,
+            "--db",
+            "x-not-created",
+            "--incremental",
+            exe,
+            "--incremental",
+            exe,
+        ]))
+        .expect("repeatable");
+        assert_eq!(ok.incrementals.len(), 2);
+        assert!(parse(&v(&["--from", exe, "--from", exe, "--db", "x-not-created"])).is_err());
     }
 
     #[test]
