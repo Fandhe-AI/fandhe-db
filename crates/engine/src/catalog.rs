@@ -16929,7 +16929,7 @@ impl Storage {
             let encoded = crate::storage::encode_row(row).map_err(convert_storage_error)?;
             let row_table_name = user_rows_table_name(table_name);
             let mut row_table = write_txn
-                .open_table(user_rows_table_def(&row_table_name))
+                .open_table_logged(user_rows_table_def(&row_table_name))
                 .map_err(map_row_table_error)?;
             // 物理キーは `(tenant_id, id)`（TABLE-12）。テナント境界チェックを行わない
             // 生の経路のため、キーの名前空間は入力 `row.tenant_id` に従う
@@ -16990,7 +16990,7 @@ impl Storage {
             }
             let row_table_name = user_rows_table_name(table_name);
             let mut row_table = write_txn
-                .open_table(user_rows_table_def(&row_table_name))
+                .open_table_logged(user_rows_table_def(&row_table_name))
                 .map_err(map_row_table_error)?;
             // clear 再利用の 1 面スクラッチ（Issue #398。`tenant.rs`・
             // `storage.rs::Storage::put_batch` の同パターンと揃える）。
@@ -17075,7 +17075,7 @@ impl Storage {
             let encoded = crate::storage::encode_row(&row_input).map_err(convert_storage_error)?;
             let row_table_name = user_rows_table_name(table_name);
             let mut row_table = write_txn
-                .open_table(user_rows_table_def(&row_table_name))
+                .open_table_logged(user_rows_table_def(&row_table_name))
                 .map_err(map_row_table_error)?;
             // 物理キーは `(tenant_id, id)`（TABLE-12）。`tenant_id` は本 API の引数
             // （呼び出し元がテナントを明示する契約）。
@@ -18416,11 +18416,41 @@ pub(crate) fn changed_table_generations_in_write_txn(
         return Ok(Vec::new());
     }
     let gen_table = write_txn.open_table_logged(TABLE_GENERATION_TABLE)?;
+    // 確定側の世代表は 1 回だけ開き、両方の表をキー順に並べて突き合わせる（表ごとに開き直す・引き直すと、
+    // 表の数に比例して commit が遅くなる。変更ログの有効時の層 2 の検査が毎 commit 呼ぶ）。意味は
+    // `table_generation_in_txn` と同じ: 確定側に無いキー（未作成の世代表を含む）は世代 0。
+    let committed_table = match committed.open_table(TABLE_GENERATION_TABLE) {
+        Ok(t) => Some(t),
+        Err(redb::TableError::TableDoesNotExist(_)) => None,
+        Err(e) => return Err(e.into()),
+    };
+    let mut committed_iter = match &committed_table {
+        Some(t) => Some(t.iter()?),
+        None => None,
+    };
+    let mut committed_cur = match committed_iter.as_mut() {
+        Some(it) => it.next().transpose()?,
+        None => None,
+    };
     let mut changed = Vec::new();
     for entry in gen_table.iter()? {
         let (name, generation) = entry?;
         let name = name.value();
-        if table_generation_in_txn(committed, name)? != generation.value() {
+        // 確定側のカーソルを `name` 以上まで進める（キーは `&str` の辞書順で両側とも整列済み）。
+        while let Some((k, _)) = &committed_cur {
+            if k.value() >= name {
+                break;
+            }
+            committed_cur = match committed_iter.as_mut() {
+                Some(it) => it.next().transpose()?,
+                None => None,
+            };
+        }
+        let base_generation = match &committed_cur {
+            Some((k, v)) if k.value() == name => v.value(),
+            _ => 0,
+        };
+        if base_generation != generation.value() {
             changed.push(name.to_string());
         }
     }

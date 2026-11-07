@@ -834,8 +834,13 @@ pub struct Storage {
     /// 生存中スナップショットの登録簿。永続ストレージだけが持つ（一時表用は `None`）。
     commit_log: Option<std::sync::Arc<commit_log::CommitLog>>,
     /// 永続変更ログ（RECOVER-14）の有効状態。`None`（既定）なら書き込みトランザクションは
-    /// capture frame を確保しない。有効化は [`Storage::enable_change_log`]（crate 内。CLI は #3069 まで拒否）。
+    /// capture frame を確保しない。有効化は [`Storage::enable_change_log`]（運用者の
+    /// `--change-log`）。
     change_log: Option<std::sync::Arc<change_log::ChangeLogState>>,
+    /// この DB が変更ログを一度でも有効にしたか（open 時にメタ表の識別子から読む。永続 DB だけ）。
+    /// 真なのに [`Self::change_log`] が `None` の間は、書き込みを `CommitFootprintUnrecordable` で
+    /// 拒否する（無効のまま書くとレコードが欠けたまま世代が進み、LSN の欠落になるため。D8）。
+    change_log_on_disk: bool,
     /// 一貫スナップショット書き出し（[`Storage::export_snapshot`]）の実行中フラグ。長い読み取り
     /// Tx はページ回収を止めるため、1 つの `Storage` につき同時に 1 本までに制限する。
     snapshot_export_busy: std::sync::atomic::AtomicBool,
@@ -861,14 +866,27 @@ impl Storage {
         durability: WriteDurability,
     ) -> Result<Self> {
         let db = redb::Database::create(path)?;
-        let storage = Self::from_db(db, durability);
+        let mut storage = Self::from_db(db, durability);
+        // 変更ログを一度でも有効にした DB は、有効にしない起動からの書き込みを拒否する（D8）。読み取りと
+        // バックアップの書き出しは影響を受けない。
+        let on_disk = change_log::identity_present(&storage.db)?;
         // 旧形式の表の `id` を移行済みの印へ一方向に移す（TABLE-23・Issue #2200）。
         // 一時表用の `open_with_backend` は対象外（永続 DB のカタログだけを移す）。
-        crate::catalog::legacy_id_migration::migrate_legacy_ids(&storage)?;
+        // 変更ログを有効にした DB では、移行の commit が記録されないままレコードに欠落（LSN の欠落）を作る
+        // ため、ここでは移行せず、`enable_change_log` が有効化の直後（記録される状態）で移行する。
+        if !on_disk {
+            crate::catalog::legacy_id_migration::migrate_legacy_ids(&storage)?;
+        }
         // 移行の commit は記録対象外（open 前にセッションは存在しない）。ここから記録を始める。
         if let Some(log) = storage.commit_log.as_ref() {
             let read_txn = storage.db.begin_read()?;
             log.arm(current_generation_in_txn(&read_txn)?);
+        }
+        storage.change_log_on_disk = on_disk;
+        // オラクル試験（feature `change-log-oracle` と環境変数）: 結合テストを変更ログ有効で流す。
+        #[cfg(feature = "change-log-oracle")]
+        if change_log::oracle::forced() {
+            storage.enable_change_log()?;
         }
         Ok(storage)
     }
@@ -899,6 +917,7 @@ impl Storage {
             write_lock_wait: DEFAULT_WRITE_LOCK_WAIT,
             commit_log: Some(std::sync::Arc::new(commit_log::CommitLog::new())),
             change_log: None,
+            change_log_on_disk: false,
             snapshot_export_busy: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "test-sync-points")]
             sync_hook: std::sync::Mutex::new(None),
@@ -1065,6 +1084,11 @@ impl Storage {
             }
             None => None,
         };
+        // 変更ログを一度有効にした DB を、有効にしないまま書くと LSN が欠落する。fail-closed に拒否する
+        // （`txn` と `permit` はここで破棄され、durable な書き込みは発生しない）。
+        if self.change_log.is_none() && self.change_log_on_disk {
+            return Err(change_log::Unrecordable::DisabledOnEnabledDb.refuse());
+        }
         // 変更ログが有効なときだけ capture frame を登録する（無効時は確保もロックもしない）。
         let capture = match self.change_log.as_ref() {
             Some(state) => {
@@ -1113,18 +1137,23 @@ impl Storage {
         Ok(())
     }
 
-    /// 変更ログを有効にする（RECOVER-14・D5・D8）。DB 識別子と timeline が無ければ永続化し
-    /// （世代を進めない保守 commit）、以降の書き込みトランザクションが capture frame を持つ。
-    /// 一時表用ストレージでは拒否する。`&mut self` なのは `Arc` 化前の構築段階でだけ有効化できる
-    /// ようにするため。運用者の CLI からの到達はオラクル試験と有効化（#3069）が
-    /// 済むまで拒否される。
-    #[cfg_attr(not(test), allow(dead_code))] // 運用経路の結線は #3069。それまではテストだけが呼ぶ
-    pub(crate) fn enable_change_log(&mut self) -> Result<()> {
+    /// 変更ログを有効にする（RECOVER-14・D5・D8。運用者の `--change-log` から呼ばれる）。DB 識別子と
+    /// timeline が無ければ永続化し（世代を進めない保守 commit）、以降の書き込みトランザクションが
+    /// capture frame を持つ。
+    ///
+    /// - 以前に有効にした DB を再び有効にするときは、記録の連続性（最後のレコードの LSN か初回有効化時の
+    ///   世代が現在の `storage_generation` と一致すること）を検査し、無効のまま書かれた区間があれば
+    ///   `Err` で拒否する（LSN の欠落。fail-closed）。このとき書き込みは拒否されたままになる
+    /// - まだ有効にしていない DB を有効にするときは、現在の世代を起点として記録を始める（それ以前の
+    ///   変更はログに無いので、有効化前のベースからの PITR はできない。D8）
+    /// - 一時表用ストレージでは拒否する
+    ///
+    /// `&mut self` なのは `Arc` 化前の構築段階でだけ有効化できるようにするため。
+    pub fn enable_change_log(&mut self) -> Result<()> {
         self.enable_change_log_with(change_log::CaptureLimits::default())
     }
 
     /// [`Self::enable_change_log`] の上限指定版（上限のテストが使う）。
-    #[cfg_attr(not(test), allow(dead_code))] // 運用経路の結線は #3069。それまではテストだけが呼ぶ
     pub(crate) fn enable_change_log_with(
         &mut self,
         limits: change_log::CaptureLimits,
@@ -1134,20 +1163,47 @@ impl Storage {
                 "change log is not available for temporary storage".to_string(),
             ));
         }
-        // 有効化前に取るため capture session を持たない（識別子の書き込みは記録対象外）。
-        let txn = self.begin_write_txn()?;
-        let (state, wrote) = change_log::load_or_init_identity(&txn, limits)?;
-        if wrote {
-            crate::recovery::commit_boundary::commit_maintenance(txn)?;
-        } else {
-            txn.abort()?;
+        let current = self.current_generation()?;
+        if self.change_log_on_disk {
+            change_log::verify_continuity(&self.db, current)?;
         }
-        self.change_log = Some(std::sync::Arc::new(state));
-        Ok(())
+        // 有効化前に取るため capture session を持たない（識別子の書き込みは記録対象外）。
+        // 「有効にしていない起動」の拒否（`wrap_gated`）はこの保守 commit に課さない。
+        let guard = std::mem::replace(&mut self.change_log_on_disk, false);
+        let result: Result<change_log::ChangeLogState> = (|| {
+            let txn = self.begin_write_txn()?;
+            let (state, wrote) = change_log::load_or_init_identity(&txn, limits, current)?;
+            if wrote {
+                crate::recovery::commit_boundary::commit_maintenance(txn)?;
+            } else {
+                txn.abort()?;
+            }
+            Ok(state)
+        })();
+        match result {
+            Ok(state) => {
+                self.change_log_on_disk = true;
+                self.change_log = Some(std::sync::Arc::new(state));
+                // `open` が保留した旧形式の表の移行を、記録される状態で行う（冪等。対象が無ければ何もしない）。
+                crate::catalog::legacy_id_migration::migrate_legacy_ids(self)?;
+                Ok(())
+            }
+            Err(e) => {
+                self.change_log_on_disk = guard;
+                Err(e)
+            }
+        }
+    }
+
+    /// 変更ログを有効にした DB を、有効にしないまま開いているか。真の間は書き込みを
+    /// `CommitFootprintUnrecordable`（`54000`）で拒否する。運用者の起動処理が、フラグなしの再起動を
+    /// 明示的に拒否するために照会する。
+    pub fn change_log_required(&self) -> bool {
+        self.change_log.is_none() && self.change_log_on_disk
     }
 
     /// 有効な変更ログの DB 識別子と timeline（無効なら `None`）。
-    #[cfg_attr(not(test), allow(dead_code))] // 運用経路の結線は #3069。それまではテストだけが呼ぶ
+    #[cfg_attr(not(test), allow(dead_code))] // 後続（バックアップ・アーカイブ）が使う。それまではテストだけが呼ぶ
     pub(crate) fn change_log_identity(&self) -> Option<([u8; change_log::DB_ID_LEN], u64)> {
         self.change_log.as_ref().map(|s| (s.db_id, s.timeline))
     }
@@ -3540,6 +3596,7 @@ mod tests {
                 write_lock_wait: DEFAULT_WRITE_LOCK_WAIT,
                 commit_log: None,
                 change_log: None,
+                change_log_on_disk: false,
                 snapshot_export_busy: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(feature = "test-sync-points")]
                 sync_hook: std::sync::Mutex::new(None),
@@ -3611,6 +3668,7 @@ mod tests {
                 write_lock_wait: DEFAULT_WRITE_LOCK_WAIT,
                 commit_log: None,
                 change_log: None,
+                change_log_on_disk: false,
                 snapshot_export_busy: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(feature = "test-sync-points")]
                 sync_hook: std::sync::Mutex::new(None),
@@ -3678,6 +3736,7 @@ mod tests {
                 write_lock_wait: DEFAULT_WRITE_LOCK_WAIT,
                 commit_log: None,
                 change_log: None,
+                change_log_on_disk: false,
                 snapshot_export_busy: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(feature = "test-sync-points")]
                 sync_hook: std::sync::Mutex::new(None),
@@ -3725,6 +3784,7 @@ mod tests {
                 write_lock_wait: DEFAULT_WRITE_LOCK_WAIT,
                 commit_log: None,
                 change_log: None,
+                change_log_on_disk: false,
                 snapshot_export_busy: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(feature = "test-sync-points")]
                 sync_hook: std::sync::Mutex::new(None),

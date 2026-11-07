@@ -179,6 +179,15 @@ bench-internals = []
 # API は露出せず、コールバックへ渡すのは同期点の種別だけ（行・テナント・テーブル名は渡さない）。
 test-sync-points = []
 
+# Issue #3069（RECOVER-14 ポインタ・設計は docs/design/change-log-pitr.md の D1 の層 3）: 変更ログの
+# オラクル試験を結合テスト（`tests/`）側へ広げる feature。有効にすると、環境変数
+# `FANDHE_CHANGE_LOG_ORACLE=1` を付けた実行に限り、永続 `Storage` の open で変更ログを強制的に有効にし、
+# 各 commit のレコードを `table_image::capture` の実差分と突き合わせる（不一致は panic）。環境変数が無ければ
+# feature を有効にしても挙動は変わらない（`--all-features` の CI を壊さない）。依存は追加しない（`[]`）。
+# `test-sync-points` と同パターンで default に含めず、`wire-server` でも有効化しない。テナント境界・RLS・
+# 認証・fail-closed の経路を迂回する API は露出しない。
+change-log-oracle = []
+
 # Issue #1924（EXT-9 ポインタ）: WASM UDF の実行バックエンド用依存（wasmtime）を有効化する
 # feature。`contrast-bench`/`cross-encoder` と同パターンで、既定ビルド・`wire-server` には
 # 一切結線しない（テナント境界・RLS 迂回 API は露出しない）。現時点では依存を有効にする
@@ -416,6 +425,15 @@ test = false
 # 回帰検証する。redb は本ファイル冒頭の dev-dependency（=4.2.0）を再利用し、
 # 新規依存の追加は行わない。
 name = "ingest_profile_bench"
+harness = false
+test = false
+
+[[bench]]
+# Issue #3069（RECOVER-14 ポインタ）: 変更ログの有効時と無効時のコスト（1 行 commit・大きな一括 ingest・
+# 表数依存・frame の上限の境界）を交互実行で測る情報提供専用ベンチ。spec 由来の pass/fail 閾値は
+# 持たないため `.github/workflows/*` へは配線しない。harness = false / test = false は上記ベンチと同一方針。
+# 公開 API だけを使い、新規依存は追加しない。
+name = "change_log_bench"
 harness = false
 test = false
 

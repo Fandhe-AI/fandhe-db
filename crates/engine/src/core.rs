@@ -3278,6 +3278,13 @@ impl EngineCore {
         ))
     }
 
+    /// 変更ログ（RECOVER-14）を有効にした DB を、有効にしないまま開いているか。真の間は書き込みが
+    /// `54000` で拒否される（LSN の欠落を作らないため。`docs/design/change-log-pitr.md` の D8・D11）。
+    /// wire-server の起動処理が、`--change-log` なしの再起動を明示的に拒否するために照会する。
+    pub fn change_log_required(&self) -> bool {
+        self.storage.change_log_required()
+    }
+
     /// [`Self::open`] の durability 版（Issue #849・構築時オプション）。
     /// `durability` に既定値（[`crate::storage::WriteDurability::default`]）を渡した
     /// 場合は [`Self::open`] と完全に同一の挙動になる（両者は同じ
