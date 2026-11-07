@@ -1,0 +1,708 @@
+//! 論理ダンプファイルの形式（版 1）の書き手と読み手（Issue #2162・RECOVER-16 ポインタ。
+//! 方式は `docs/design/logical-dump.md` の第 12 節）。
+//!
+//! 責務境界: ダンプファイルのバイト列と、`engine` が渡す DDL／データ断片の対応づけだけを担う。
+//! 文の実行は [`crate::dump_restore`]、書き出しの駆動は [`crate::dump_run`] が行う。
+//!
+//! 形式: 先頭のヘッダ（`-- ` で始まるコメント行 5 本）に続き、文ごとに「長さ付きの枠」を並べる。
+//! 枠の見出しも `--` コメントなので、ファイル全体は SQL スクリプトとしても読める（`psql` 等に流せる。
+//! COPY は `;` の後ろにデータ行と `\.` が続く標準の形）。復元側は **見出しの長さに従って本文を
+//! 切り出す**（`;` や改行で分割しない。文字列リテラル・ドル引用・コメントの中の `;`・改行を
+//! 壊さないため）。切り出した本文は復元側が字句解析器（`split_statements`）で 1 文であることを
+//! 検証するので、長さを書き換えた改ざんは 1 文でなくなって拒否される。
+//!
+//! 受信（ダンプファイル）は untrusted として扱う: 行長・文長に上限を設け、`unwrap`／`expect`／添字
+//! アクセスを使わず、長さは検証してから確保に使う（確保は読み出したバイト数に比例させる）。
+
+use std::io::{BufRead, Read, Write};
+
+use engine::catalog::ddl_export::DdlObjectKind;
+
+use crate::dump_opt::{DumpFormat, DumpParts, DumpScope};
+
+/// 先頭行（版を含む）。完全一致しなければ拒否する。
+pub const MAGIC: &str = "-- fandhe-db logical dump v1";
+/// ヘッダの終端行。
+pub const BODY_MARK: &str = "-- body";
+/// 末尾の終端行。これが無いファイル（枠の境界での切り詰めを含む）は読み切れても拒否する。
+pub const END_MARK: &str = "-- end";
+/// ヘッダ 1 行の最大バイト数（改行を除く）。テナント名の上限より十分に大きい。
+pub const MAX_HEADER_LINE: usize = 512;
+/// 1 文（DDL・`INSERT`・`COPY` の見出し文）の本文の最大バイト数。書き手も同じ上限を課し、
+/// 復元できないファイルを作らない。
+pub const MAX_STATEMENT_BYTES: usize = 64 * 1024 * 1024;
+/// COPY のデータ 1 行の最大バイト数（改行を除く）。書き手も同じ上限を課す。
+pub const MAX_COPY_LINE: usize = 64 * 1024 * 1024;
+/// 枠の見出し行の最大バイト数。
+const MAX_MARKER_LINE: usize = 128;
+
+/// ダンプファイルの読み書きの失敗（種別だけを持ち、文の内容・名前・パスは含めない）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileError {
+    /// ヘッダが版 1 の形式と一致しない。
+    BadHeader,
+    /// 枠の見出し・長さ・終端が形式と一致しない（改ざん・破損）。
+    BadFrame,
+    /// 長さが上限を超える。
+    TooLarge,
+    /// 途中でファイルが終わっている。
+    Truncated,
+    /// UTF-8 でない・NUL を含むなど、文として扱えない本文。
+    BadText,
+    /// 読み書きの I/O 失敗。
+    Io(std::io::ErrorKind),
+}
+
+impl From<std::io::Error> for FileError {
+    fn from(e: std::io::Error) -> Self {
+        FileError::Io(e.kind())
+    }
+}
+
+impl FileError {
+    /// 固定の英語の説明（内容を含まない）。
+    pub fn message(self) -> &'static str {
+        match self {
+            FileError::BadHeader => "dump file header is invalid or unsupported",
+            FileError::BadFrame => "dump file is malformed",
+            FileError::TooLarge => "dump file contains an item larger than the supported limit",
+            FileError::Truncated => "dump file is truncated",
+            FileError::BadText => "dump file contains text that is not valid",
+            FileError::Io(_) => "failed to read or write the dump file",
+        }
+    }
+}
+
+/// 枠の種別。`DdlObjectKind` と対応し、見出しに載る固定の語で表す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StmtKind {
+    /// `CREATE SCHEMA`。
+    Schema,
+    /// `CREATE ROLE`。
+    Role,
+    /// ロールのメンバーシップ（`GRANT`）。
+    RoleMembership,
+    /// `CREATE TYPE ... AS ENUM`。
+    EnumType,
+    /// `CREATE SEQUENCE`／`ALTER SEQUENCE`。
+    Sequence,
+    /// `SELECT setval(...)`。
+    SequenceValue,
+    /// `CREATE TABLE`。
+    Table,
+    /// 外部キー制約。
+    ForeignKey,
+    /// `CREATE [UNIQUE] INDEX`。
+    Index,
+    /// `CREATE VIEW`。
+    View,
+    /// `CREATE FUNCTION`。
+    Function,
+    /// `CREATE TRIGGER`。
+    Trigger,
+    /// 行セキュリティの有効化。
+    RowSecurity,
+    /// `CREATE POLICY`。
+    Policy,
+    /// `GRANT`。
+    Privilege,
+    /// データの `INSERT` 1 文。
+    Insert,
+}
+
+impl StmtKind {
+    /// `DdlObjectKind` から対応する種別へ。網羅 `match` で、型が増えたらコンパイルエラーになる。
+    pub fn from_ddl(kind: DdlObjectKind) -> Self {
+        match kind {
+            DdlObjectKind::Schema => StmtKind::Schema,
+            DdlObjectKind::Role => StmtKind::Role,
+            DdlObjectKind::RoleMembership => StmtKind::RoleMembership,
+            DdlObjectKind::EnumType => StmtKind::EnumType,
+            DdlObjectKind::Sequence => StmtKind::Sequence,
+            DdlObjectKind::SequenceValue => StmtKind::SequenceValue,
+            DdlObjectKind::Table => StmtKind::Table,
+            DdlObjectKind::ForeignKey => StmtKind::ForeignKey,
+            DdlObjectKind::Index => StmtKind::Index,
+            DdlObjectKind::View => StmtKind::View,
+            DdlObjectKind::Function => StmtKind::Function,
+            DdlObjectKind::Trigger => StmtKind::Trigger,
+            DdlObjectKind::RowSecurity => StmtKind::RowSecurity,
+            DdlObjectKind::Policy => StmtKind::Policy,
+            DdlObjectKind::Privilege => StmtKind::Privilege,
+        }
+    }
+
+    /// 見出しに載せる語。
+    pub fn token(self) -> &'static str {
+        match self {
+            StmtKind::Schema => "schema",
+            StmtKind::Role => "role",
+            StmtKind::RoleMembership => "role-membership",
+            StmtKind::EnumType => "enum-type",
+            StmtKind::Sequence => "sequence",
+            StmtKind::SequenceValue => "sequence-value",
+            StmtKind::Table => "table",
+            StmtKind::ForeignKey => "foreign-key",
+            StmtKind::Index => "index",
+            StmtKind::View => "view",
+            StmtKind::Function => "function",
+            StmtKind::Trigger => "trigger",
+            StmtKind::RowSecurity => "row-security",
+            StmtKind::Policy => "policy",
+            StmtKind::Privilege => "privilege",
+            StmtKind::Insert => "insert",
+        }
+    }
+
+    fn from_token(t: &str) -> Option<Self> {
+        const ALL: [StmtKind; 16] = [
+            StmtKind::Schema,
+            StmtKind::Role,
+            StmtKind::RoleMembership,
+            StmtKind::EnumType,
+            StmtKind::Sequence,
+            StmtKind::SequenceValue,
+            StmtKind::Table,
+            StmtKind::ForeignKey,
+            StmtKind::Index,
+            StmtKind::View,
+            StmtKind::Function,
+            StmtKind::Trigger,
+            StmtKind::RowSecurity,
+            StmtKind::Policy,
+            StmtKind::Privilege,
+            StmtKind::Insert,
+        ];
+        ALL.into_iter().find(|k| k.token() == t)
+    }
+
+    /// 本文が取りうる先頭の語句（書き手の出力形に一致する大文字の接頭辞）。復元側はこの許可表に
+    /// 合わない文を実行しない（ダンプファイルが任意の SQL を運ぶ経路を狭める）。
+    pub fn allowed_prefixes(self) -> &'static [&'static str] {
+        match self {
+            StmtKind::Schema => &["CREATE SCHEMA "],
+            StmtKind::Role => &["CREATE ROLE "],
+            StmtKind::RoleMembership | StmtKind::Privilege => &["GRANT "],
+            StmtKind::EnumType => &["CREATE TYPE "],
+            StmtKind::Sequence => &["CREATE SEQUENCE ", "ALTER SEQUENCE "],
+            StmtKind::SequenceValue => &["SELECT setval("],
+            StmtKind::Table => &["CREATE TABLE "],
+            StmtKind::ForeignKey | StmtKind::RowSecurity => &["ALTER TABLE "],
+            StmtKind::Index => &["CREATE INDEX ", "CREATE UNIQUE INDEX "],
+            StmtKind::View => &["CREATE VIEW "],
+            StmtKind::Function => &["CREATE FUNCTION "],
+            StmtKind::Trigger => &["CREATE TRIGGER "],
+            StmtKind::Policy => &["CREATE POLICY "],
+            StmtKind::Insert => &["INSERT INTO "],
+        }
+    }
+
+    /// 本文が許可表の接頭辞で始まるか。
+    pub fn accepts(self, sql: &str) -> bool {
+        self.allowed_prefixes().iter().any(|p| sql.starts_with(p))
+    }
+}
+
+/// ダンプファイルのヘッダ。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Header {
+    /// 対象範囲。
+    pub scope: DumpScope,
+    /// 含む内容。
+    pub parts: DumpParts,
+    /// データの書式。
+    pub format: DumpFormat,
+}
+
+fn parts_token(p: DumpParts) -> &'static str {
+    match p {
+        DumpParts::All => "all",
+        DumpParts::SchemaOnly => "schema",
+        DumpParts::DataOnly => "data",
+    }
+}
+
+fn format_token(f: DumpFormat) -> &'static str {
+    match f {
+        DumpFormat::Copy => "copy",
+        DumpFormat::Insert => "insert",
+    }
+}
+
+/// ダンプファイルの書き手。出力先（`Write`）へ枠を順に書く。
+pub struct FileWriter<W: Write> {
+    out: W,
+}
+
+impl<W: Write> FileWriter<W> {
+    /// ヘッダを書いて書き手を作る。
+    pub fn begin(mut out: W, header: &Header) -> Result<Self, FileError> {
+        let scope = match &header.scope {
+            DumpScope::Shared => "shared".to_string(),
+            DumpScope::Tenant(t) => format!("tenant={t}"),
+        };
+        write!(
+            out,
+            "{MAGIC}\n-- scope: {scope}\n-- parts: {}\n-- format: {}\n{BODY_MARK}\n",
+            parts_token(header.parts),
+            format_token(header.format),
+        )?;
+        Ok(Self { out })
+    }
+
+    /// 1 文の枠（見出し・本文・`;` と改行）を書く。`sql` は `;` を含まない 1 文。
+    pub fn statement(&mut self, kind: StmtKind, sql: &str) -> Result<(), FileError> {
+        check_text(sql)?;
+        writeln!(self.out, "-- @stmt {} {}", kind.token(), sql.len())?;
+        self.out.write_all(sql.as_bytes())?;
+        self.out.write_all(b";\n")?;
+        Ok(())
+    }
+
+    /// `COPY` の見出し文の枠を書く。続けて [`Self::copy_row`]・[`Self::copy_end`] を呼ぶ。
+    pub fn copy_header(&mut self, sql: &str) -> Result<(), FileError> {
+        check_text(sql)?;
+        writeln!(self.out, "-- @copy {}", sql.len())?;
+        self.out.write_all(sql.as_bytes())?;
+        self.out.write_all(b";\n")?;
+        Ok(())
+    }
+
+    /// COPY のデータ 1 行（エスケープ済み・改行なし）を書く。生の改行・CR を含む行は、行境界を
+    /// 壊すので拒否する（エンジンはこれらを `\n`・`\r` にエスケープする契約）。
+    pub fn copy_row(&mut self, row: &str) -> Result<(), FileError> {
+        if row.len() > MAX_COPY_LINE {
+            return Err(FileError::TooLarge);
+        }
+        // 終端行と同じ文字列の行は読み戻しで COPY を閉じてしまう（エンジンは値 `\.` を `\\.` に
+        // エスケープする契約）ので、書かずに拒否する。
+        if row == "\\." || row.contains(['\n', '\r', '\0']) {
+            return Err(FileError::BadText);
+        }
+        self.out.write_all(row.as_bytes())?;
+        self.out.write_all(b"\n")?;
+        Ok(())
+    }
+
+    /// COPY の終端行（`\.`）を書く。
+    pub fn copy_end(&mut self) -> Result<(), FileError> {
+        self.out.write_all(b"\\.\n")?;
+        Ok(())
+    }
+
+    /// 終端行を書き、バッファを流して出力先を返す。
+    pub fn finish(mut self) -> Result<W, FileError> {
+        writeln!(self.out, "{END_MARK}")?;
+        self.out.flush()?;
+        Ok(self.out)
+    }
+}
+
+/// 本文の検査（上限と NUL）。長さ 0 の本文は文ではないので拒否する。
+fn check_text(sql: &str) -> Result<(), FileError> {
+    if sql.len() > MAX_STATEMENT_BYTES {
+        return Err(FileError::TooLarge);
+    }
+    if sql.is_empty() || sql.contains('\0') {
+        return Err(FileError::BadText);
+    }
+    Ok(())
+}
+
+/// 読み出した枠。
+#[derive(Debug, PartialEq, Eq)]
+pub enum Record {
+    /// 1 文。
+    Statement {
+        /// 種別（許可表の照合に使う）。
+        kind: StmtKind,
+        /// 本文（`;` なし）。
+        sql: String,
+    },
+    /// `COPY` の見出し文。続けて [`FileReader::next_copy_line`] で行を読み切ること。
+    CopyHeader {
+        /// 見出し文の本文（`;` なし）。
+        sql: String,
+    },
+}
+
+/// [`FileReader::next_copy_line`] の結果。
+#[derive(Debug, PartialEq, Eq)]
+pub enum CopyLine {
+    /// データ 1 行（`buf` に末尾の改行つきで入っている）。
+    Row,
+    /// 終端行（`\.`）。
+    End,
+}
+
+/// ダンプファイルの読み手。
+pub struct FileReader<R: BufRead> {
+    inner: R,
+    in_copy: bool,
+    line: Vec<u8>,
+}
+
+impl<R: BufRead> FileReader<R> {
+    /// ヘッダを読み、検証して返す。版・順序・語彙が完全一致しなければ拒否する。
+    pub fn open(inner: R) -> Result<(Self, Header), FileError> {
+        let mut r = Self {
+            inner,
+            in_copy: false,
+            line: Vec::new(),
+        };
+        let magic = r.header_line()?;
+        if magic != MAGIC {
+            return Err(FileError::BadHeader);
+        }
+        let scope_line = r.header_line()?;
+        let scope = match scope_line.strip_prefix("-- scope: ") {
+            Some("shared") => DumpScope::Shared,
+            Some(v) => match v.strip_prefix("tenant=") {
+                Some(t) if crate::dump_opt::is_header_safe_tenant(t) => {
+                    DumpScope::Tenant(t.to_string())
+                }
+                _ => return Err(FileError::BadHeader),
+            },
+            None => return Err(FileError::BadHeader),
+        };
+        let parts = match r.header_line()?.as_str() {
+            "-- parts: all" => DumpParts::All,
+            "-- parts: schema" => DumpParts::SchemaOnly,
+            "-- parts: data" => DumpParts::DataOnly,
+            _ => return Err(FileError::BadHeader),
+        };
+        let format = match r.header_line()?.as_str() {
+            "-- format: copy" => DumpFormat::Copy,
+            "-- format: insert" => DumpFormat::Insert,
+            _ => return Err(FileError::BadHeader),
+        };
+        if r.header_line()? != BODY_MARK {
+            return Err(FileError::BadHeader);
+        }
+        Ok((
+            r,
+            Header {
+                scope,
+                parts,
+                format,
+            },
+        ))
+    }
+
+    /// 上限つきで 1 行（改行を除く）を `self.line` に読む。行が無ければ `Ok(false)`。
+    /// 上限を超える行・改行なしで終わる行は拒否する。
+    fn read_bounded_line(&mut self, max: usize, keep_newline: bool) -> Result<bool, FileError> {
+        self.line.clear();
+        let limit = (max as u64).saturating_add(1);
+        let n = (&mut self.inner)
+            .take(limit)
+            .read_until(b'\n', &mut self.line)?;
+        if n == 0 {
+            return Ok(false);
+        }
+        if self.line.last() != Some(&b'\n') {
+            // 上限に達したか、改行の前でファイルが終わった。
+            return if n as u64 >= limit {
+                Err(FileError::TooLarge)
+            } else {
+                Err(FileError::Truncated)
+            };
+        }
+        if !keep_newline {
+            self.line.pop();
+        }
+        Ok(true)
+    }
+
+    fn header_line(&mut self) -> Result<String, FileError> {
+        match self.read_bounded_line(MAX_HEADER_LINE, false) {
+            Ok(true) => {}
+            Ok(false) | Err(FileError::Truncated) => return Err(FileError::BadHeader),
+            Err(FileError::TooLarge) => return Err(FileError::BadHeader),
+            Err(e) => return Err(e),
+        }
+        String::from_utf8(self.line.clone()).map_err(|_| FileError::BadHeader)
+    }
+
+    /// 次の枠を読む。終端行（直後がファイルの終わり）なら `Ok(None)`。終端行が無いまま終わったら
+    /// `Truncated`。直前の COPY を読み切っていなければ拒否する。
+    pub fn next_record(&mut self) -> Result<Option<Record>, FileError> {
+        if self.in_copy {
+            return Err(FileError::BadFrame);
+        }
+        // 見出し行の長さ超過・途中終了・終端行の欠落は枠の破損（切り詰め）として扱う。
+        match self.read_bounded_line(MAX_MARKER_LINE, false) {
+            Ok(true) => {}
+            Ok(false) => return Err(FileError::Truncated),
+            Err(FileError::TooLarge) => return Err(FileError::BadFrame),
+            Err(e) => return Err(e),
+        }
+        if self.line == END_MARK.as_bytes() {
+            // 終端行の後ろには何も続かない（連結・追記された内容を黙って無視しない）。
+            return if self.inner.fill_buf()?.is_empty() {
+                Ok(None)
+            } else {
+                Err(FileError::BadFrame)
+            };
+        }
+        let marker = std::str::from_utf8(&self.line).map_err(|_| FileError::BadFrame)?;
+        let mut parts = marker.split(' ');
+        let (Some("--"), Some(tag)) = (parts.next(), parts.next()) else {
+            return Err(FileError::BadFrame);
+        };
+        match tag {
+            "@stmt" => {
+                let kind = parts
+                    .next()
+                    .and_then(StmtKind::from_token)
+                    .ok_or(FileError::BadFrame)?;
+                let len = parse_len(parts.next())?;
+                if parts.next().is_some() {
+                    return Err(FileError::BadFrame);
+                }
+                let sql = self.read_body(len)?;
+                Ok(Some(Record::Statement { kind, sql }))
+            }
+            "@copy" => {
+                let len = parse_len(parts.next())?;
+                if parts.next().is_some() {
+                    return Err(FileError::BadFrame);
+                }
+                let sql = self.read_body(len)?;
+                self.in_copy = true;
+                Ok(Some(Record::CopyHeader { sql }))
+            }
+            _ => Err(FileError::BadFrame),
+        }
+    }
+
+    /// 長さ `len` の本文と、続く `;` と改行を読む。確保は実際に読めたバイト数に比例させる
+    /// （長さの申告だけで確保しない）。
+    fn read_body(&mut self, len: usize) -> Result<String, FileError> {
+        let mut body = Vec::new();
+        let got = (&mut self.inner).take(len as u64).read_to_end(&mut body)?;
+        if got != len {
+            return Err(FileError::Truncated);
+        }
+        let mut tail = [0u8; 2];
+        self.inner.read_exact(&mut tail).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                FileError::Truncated
+            } else {
+                FileError::Io(e.kind())
+            }
+        })?;
+        if &tail != b";\n" {
+            return Err(FileError::BadFrame);
+        }
+        let sql = String::from_utf8(body).map_err(|_| FileError::BadText)?;
+        check_text(&sql)?;
+        Ok(sql)
+    }
+
+    /// `COPY` のデータを 1 行読み、`buf` に（末尾の改行つきで）入れる。終端行（`\.`）なら
+    /// [`CopyLine::End`] を返して COPY を閉じる。行は改行でのみ区切る（COPY text の行内の改行・CR は
+    /// エスケープされており、生の改行は行境界だけである）。
+    pub fn next_copy_line(&mut self, buf: &mut Vec<u8>) -> Result<CopyLine, FileError> {
+        if !self.in_copy {
+            return Err(FileError::BadFrame);
+        }
+        // 行（改行を含む）が上限を超えるか、終端行の前でファイルが終わったら拒否する。
+        match self.read_bounded_line(MAX_COPY_LINE, true) {
+            Ok(true) => {}
+            Ok(false) => return Err(FileError::Truncated),
+            Err(e) => return Err(e),
+        }
+        if self.line == b"\\.\n" {
+            self.in_copy = false;
+            return Ok(CopyLine::End);
+        }
+        if self.line.contains(&0) {
+            return Err(FileError::BadText);
+        }
+        buf.clear();
+        buf.extend_from_slice(&self.line);
+        Ok(CopyLine::Row)
+    }
+}
+
+fn parse_len(tok: Option<&str>) -> Result<usize, FileError> {
+    let tok = tok.ok_or(FileError::BadFrame)?;
+    // 先頭 0・符号・空白を許さない 10 進のみ。
+    if tok.is_empty()
+        || !tok.bytes().all(|b| b.is_ascii_digit())
+        || (tok.len() > 1 && tok.starts_with('0'))
+    {
+        return Err(FileError::BadFrame);
+    }
+    let n: usize = tok.parse().map_err(|_| FileError::BadFrame)?;
+    if n == 0 {
+        return Err(FileError::BadFrame);
+    }
+    if n > MAX_STATEMENT_BYTES {
+        return Err(FileError::TooLarge);
+    }
+    Ok(n)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn header() -> Header {
+        Header {
+            scope: DumpScope::Tenant("t1".into()),
+            parts: DumpParts::All,
+            format: DumpFormat::Copy,
+        }
+    }
+
+    fn sample() -> Vec<u8> {
+        let mut w = FileWriter::begin(Vec::new(), &header()).expect("begin");
+        w.statement(StmtKind::Table, "CREATE TABLE t (a TEXT)")
+            .expect("stmt");
+        w.statement(StmtKind::Insert, "INSERT INTO t (a) VALUES ('x;\ny -- $$')")
+            .expect("stmt");
+        w.copy_header("COPY t (a) FROM STDIN").expect("copy");
+        w.copy_row("a;b\\nc -- $$").expect("row");
+        w.copy_row("\\\\.").expect("row");
+        w.copy_end().expect("end");
+        w.finish().expect("finish")
+    }
+
+    #[test]
+    fn round_trips_statements_and_copy_rows() {
+        let bytes = sample();
+        let (mut r, h) = FileReader::open(&bytes[..]).expect("open");
+        assert_eq!(h, header());
+        assert_eq!(
+            r.next_record().expect("rec"),
+            Some(Record::Statement {
+                kind: StmtKind::Table,
+                sql: "CREATE TABLE t (a TEXT)".into()
+            })
+        );
+        assert_eq!(
+            r.next_record().expect("rec"),
+            Some(Record::Statement {
+                kind: StmtKind::Insert,
+                sql: "INSERT INTO t (a) VALUES ('x;\ny -- $$')".into()
+            })
+        );
+        assert_eq!(
+            r.next_record().expect("rec"),
+            Some(Record::CopyHeader {
+                sql: "COPY t (a) FROM STDIN".into()
+            })
+        );
+        let mut buf = Vec::new();
+        assert_eq!(r.next_copy_line(&mut buf).expect("row"), CopyLine::Row);
+        assert_eq!(buf, b"a;b\\nc -- $$\n");
+        assert_eq!(r.next_copy_line(&mut buf).expect("row"), CopyLine::Row);
+        assert_eq!(buf, b"\\\\.\n");
+        assert_eq!(r.next_copy_line(&mut buf).expect("end"), CopyLine::End);
+        assert_eq!(r.next_record().expect("eof"), None);
+    }
+
+    #[test]
+    fn rejects_tampered_headers() {
+        let bytes = sample();
+        let text = String::from_utf8(bytes).expect("utf-8");
+        for (from, to) in [
+            ("v1", "v2"),
+            ("scope: tenant=t1", "scope: tenant=t 1"),
+            ("scope: tenant=t1", "scope: all"),
+            ("parts: all", "parts: everything"),
+            ("format: copy", "format: csv"),
+            ("-- body", "-- bodyx"),
+        ] {
+            let bad = text.replacen(from, to, 1);
+            assert!(
+                FileReader::open(bad.as_bytes()).is_err(),
+                "header edit {from:?} must be rejected"
+            );
+        }
+        assert!(FileReader::open(&b""[..]).is_err());
+        assert!(FileReader::open(&b"-- fandhe-db logical dump v1"[..]).is_err());
+        let long = format!("{}{}\n", MAGIC, " ".repeat(MAX_HEADER_LINE));
+        assert!(FileReader::open(long.as_bytes()).is_err());
+    }
+
+    fn read_all(bytes: &[u8]) -> Result<usize, FileError> {
+        let (mut r, _) = FileReader::open(bytes)?;
+        let mut n = 0;
+        let mut buf = Vec::new();
+        while let Some(rec) = r.next_record()? {
+            n += 1;
+            if matches!(rec, Record::CopyHeader { .. }) {
+                while r.next_copy_line(&mut buf)? == CopyLine::Row {}
+            }
+        }
+        Ok(n)
+    }
+
+    #[test]
+    fn rejects_tampered_frames() {
+        let good = sample();
+        assert_eq!(read_all(&good).expect("good"), 3);
+        let text = String::from_utf8(good.clone()).expect("utf-8");
+        for (from, to) in [
+            ("@stmt table 23", "@stmt table 22"),
+            ("@stmt table 23", "@stmt table 24"),
+            ("@stmt table 23", "@stmt table 023"),
+            ("@stmt table 23", "@stmt table -23"),
+            ("@stmt table 23", "@stmt table 0"),
+            ("@stmt table 23", "@stmt table 99999999999999999999999"),
+            ("@stmt table 23", "@stmt nope 23"),
+            ("@stmt table 23", "@stmt table 23 extra"),
+            ("@stmt table", "@bogus table"),
+            ("@copy 21", "@copy 22"),
+        ] {
+            let bad = text.replacen(from, to, 1);
+            assert!(
+                read_all(bad.as_bytes()).is_err(),
+                "edit {from:?} must be rejected"
+            );
+        }
+        // 途中で切れたファイルは、どの位置で切っても成功しない（COPY の終端行の前で切れる場合を含む）。
+        for cut in 0..good.len() {
+            let r = read_all(good.get(..cut).unwrap_or(&[]));
+            assert!(r.is_err(), "truncation at {cut} must not be accepted");
+        }
+    }
+
+    #[test]
+    fn reader_rejects_oversized_lengths_without_allocating() {
+        let huge = format!(
+            "{}\n-- scope: shared\n-- parts: all\n-- format: copy\n-- body\n-- @stmt table {}\nx",
+            MAGIC,
+            MAX_STATEMENT_BYTES + 1
+        );
+        assert_eq!(read_all(huge.as_bytes()), Err(FileError::TooLarge));
+        // 上限以内の申告でも、実体が短ければ Truncated（申告分を先に確保しない）。
+        let lie = format!(
+            "{}\n-- scope: shared\n-- parts: all\n-- format: copy\n-- body\n-- @stmt table {}\nx",
+            MAGIC, MAX_STATEMENT_BYTES
+        );
+        assert_eq!(read_all(lie.as_bytes()), Err(FileError::Truncated));
+    }
+
+    #[test]
+    fn writer_rejects_unframeable_text() {
+        let mut w = FileWriter::begin(Vec::new(), &header()).expect("begin");
+        assert!(w.statement(StmtKind::Table, "").is_err());
+        assert!(w.statement(StmtKind::Table, "a\0b").is_err());
+        assert!(w.copy_row("a\nb").is_err());
+        assert!(w.copy_row("a\rb").is_err());
+        assert!(w.copy_row("\\.").is_err());
+    }
+
+    #[test]
+    fn kind_prefix_allowlist_is_enforced() {
+        assert!(StmtKind::Table.accepts("CREATE TABLE t (a INT)"));
+        assert!(!StmtKind::Table.accepts("DROP TABLE t"));
+        assert!(!StmtKind::Table.accepts("create table t (a INT)"));
+        assert!(!StmtKind::Insert.accepts("DELETE FROM t"));
+        assert!(!StmtKind::SequenceValue.accepts("SELECT 1"));
+    }
+}

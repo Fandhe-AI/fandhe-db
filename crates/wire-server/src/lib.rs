@@ -155,6 +155,14 @@ pub(crate) mod copy_binary_types;
 pub mod correlated_limits_opt;
 pub mod ddl_permission_opt;
 pub mod dml_limits_opt;
+pub mod dump_file;
+pub mod dump_opt;
+#[cfg(unix)]
+pub mod dump_restore;
+#[cfg(unix)]
+pub mod dump_run;
+#[cfg(unix)]
+pub mod dump_tmp;
 pub mod durability_opt;
 pub mod english_stemmer_opt;
 pub mod error_response;

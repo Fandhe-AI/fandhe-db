@@ -511,6 +511,17 @@
 //! DB に限る）。終了コード: 0=成功、1=実行時の失敗（連鎖の切断・別 DB・区間が空・稼働中を含む）、2=引数／
 //! 出力先の拒否。詳細は `wire_server::incremental_opt`。
 //!
+//! `wire-server dump --db <path> --out <file> (--tenant <id> | --shared-only) [--schema-only | --data-only]
+//! [--format copy|insert]` サブコマンドは、**停止中**の DB から論理ダンプ（SQL スクリプト形式）を新規ファイルへ
+//! 書き出す（Issue #2162・RECOVER-16 ポインタ。方式は `docs/design/logical-dump.md` の第 12 節）。
+//! `--tenant` は共有の定義に指定テナントの固有分と行を足した範囲、`--shared-only` は共有の定義だけ
+//! （どちらかが必須。全テナントを暗黙に書き出さない）。出力は 0600 の一時名へ書き、成功したときだけ公開する。
+//! `wire-server dump-restore --from <file> --db <new path>` サブコマンドは、ダンプを一時名の新規 DB へ流し込み、
+//! 整合検査に通ったときだけ新規パスへ公開する（既存の復元先は拒否＝空の DB のみ。途中の失敗は何も公開しない）。
+//! 終了コード: 0=成功、1=実行時の失敗、2=引数／パスの拒否、3=公開済みだが後始末を確かめられなかった、
+//! 4=ダンプファイルの拒否（`dump-restore` のみ）、5=復元結果の整合検査の失敗（`dump-restore` のみ）。
+//! 詳細は `wire_server::dump_opt`・`dump_run`・`dump_restore`。
+//!
 //! `wire-server hash-password` サブコマンドはユーザーストア（`username:tenant_id:phc`）
 //! に登録する 1 行を生成する補助コマンド（stdin からパスワードを読み、平文を
 //! ログ・引数に残さない）。
@@ -571,6 +582,12 @@ fn main() -> ExitCode {
     }
     if args.get(1).map(String::as_str) == Some("backup-incremental") {
         return run_backup_incremental(&args[2..]);
+    }
+    if args.get(1).map(String::as_str) == Some("dump") {
+        return run_dump(&args[2..]);
+    }
+    if args.get(1).map(String::as_str) == Some("dump-restore") {
+        return run_dump_restore(&args[2..]);
     }
     if args.get(1).map(String::as_str) == Some("change-log-verify") {
         return run_change_log_verify(&args[2..]);
@@ -4153,6 +4170,99 @@ fn run_backup_incremental(args: &[String]) -> ExitCode {
             ExitCode::from(code)
         }
     }
+}
+
+/// `dump --db <path> --out <file> ...` サブコマンド（Issue #2162・RECOVER-16 ポインタ）。引数と出力先を検証してから
+/// `--db` を開き、ダンプを一時名へ書いて成功したときだけ `--out` へ公開する。稼働中のサーバーが DB を
+/// 開いている場合は open が失敗して非 0 で終わる（fail-closed）。エラー文に DDL・行の値・名前・パスの内容は
+/// 含めない。
+#[cfg(unix)]
+fn run_dump(args: &[String]) -> ExitCode {
+    use wire_server::{dump_opt, dump_run};
+
+    let parsed = match dump_opt::parse_dump(args) {
+        Ok(p) => p,
+        Err(msg) => {
+            engine::log_stderr!("wire-server: dump: {msg}");
+            return ExitCode::from(dump_opt::EXIT_USAGE);
+        }
+    };
+    let mut leftover = None;
+    let result = dump_run::dump(&parsed, &mut leftover);
+    if let Some(p) = &leftover {
+        report_dump_leftover("dump", p);
+    }
+    let (code, msg) = dump_run::classify(&result);
+    match code {
+        0 => {
+            if write_stdout(&format!("dump written: {msg}\n")).is_err() {
+                return ExitCode::from(dump_opt::EXIT_FAILURE);
+            }
+            ExitCode::SUCCESS
+        }
+        _ => {
+            engine::log_stderr!("wire-server: dump: {msg}");
+            ExitCode::from(code)
+        }
+    }
+}
+
+/// 非 unix では論理ダンプを提供しない（一時名の公開に unix のファイル API を使う）。
+#[cfg(not(unix))]
+fn run_dump(_args: &[String]) -> ExitCode {
+    engine::log_stderr!("wire-server: dump: not supported on this platform");
+    ExitCode::from(wire_server::dump_opt::EXIT_FAILURE)
+}
+
+/// `dump-restore --from <file> --db <new path>` サブコマンド（Issue #2162・RECOVER-16 ポインタ）。
+/// 公開手順と終了コードは `wire_server::dump_restore`。失敗の報告は標準エラーへ出す（標準出力は成功時の要約だけ）。
+#[cfg(unix)]
+fn run_dump_restore(args: &[String]) -> ExitCode {
+    use wire_server::{dump_opt, dump_restore};
+
+    let parsed = match dump_opt::parse_restore(args) {
+        Ok(p) => p,
+        Err(msg) => {
+            engine::log_stderr!("wire-server: dump-restore: {msg}");
+            return ExitCode::from(dump_opt::EXIT_USAGE);
+        }
+    };
+    let mut leftover = None;
+    let result = dump_restore::restore(&parsed.from, &parsed.db, &mut leftover);
+    if let Some(p) = &leftover {
+        report_dump_leftover("dump-restore", p);
+    }
+    let (code, msg) = dump_restore::classify(&result);
+    match code {
+        0 => {
+            if write_stdout(&format!("dump-restore written: {msg}\n")).is_err() {
+                return ExitCode::from(dump_opt::EXIT_FAILURE);
+            }
+            ExitCode::SUCCESS
+        }
+        _ => {
+            engine::log_stderr!("wire-server: dump-restore: {msg}");
+            ExitCode::from(code)
+        }
+    }
+}
+
+/// 非 unix では論理ダンプを提供しない。
+#[cfg(not(unix))]
+fn run_dump_restore(_args: &[String]) -> ExitCode {
+    engine::log_stderr!("wire-server: dump-restore: not supported on this platform");
+    ExitCode::from(wire_server::dump_opt::EXIT_FAILURE)
+}
+
+/// 消せなかった一時ファイルの場所を標準エラーへ固定の英語文で通知する（ダンプ・復元中の DB は
+/// テナントのデータを含むため手動で消す必要がある）。
+#[cfg(unix)]
+fn report_dump_leftover(sub: &str, path: &std::path::Path) {
+    engine::log_stderr!(
+        "wire-server: {sub}: WARNING: a temporary file could not be removed and remains at {}; \
+         delete it manually (it may contain tenant data)",
+        path.display()
+    );
 }
 
 /// 消せなかった一時コピーの場所を標準エラーへ固定の英語文で通知する（全テナントのデータを
