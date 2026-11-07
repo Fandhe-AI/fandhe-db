@@ -34,8 +34,11 @@ pub(crate) mod commit_log;
 mod power_loss_model;
 pub(crate) mod read_source;
 pub(crate) mod rowid;
+pub mod snapshot;
 pub(crate) mod table_image;
 pub(crate) mod writer_gate;
+
+pub use snapshot::{SnapshotExportError, SnapshotSummary};
 
 /// 行ストアの物理キー型（対象ビヘイビア: TABLE-12。ポインタ:
 /// `docs/spec/04-behavior/data-model.md` TABLE-12）。キーはテナント ID・行 `id` の
@@ -796,6 +799,9 @@ pub struct Storage {
     /// 明示トランザクションの書き込み時直列化検査（SQL-38・Issue #2404）が使う commit 記録と
     /// 生存中スナップショットの登録簿。永続ストレージだけが持つ（一時表用は `None`）。
     commit_log: Option<std::sync::Arc<commit_log::CommitLog>>,
+    /// 一貫スナップショット書き出し（[`Storage::export_snapshot`]）の実行中フラグ。長い読み取り
+    /// Tx はページ回収を止めるため、1 つの `Storage` につき同時に 1 本までに制限する。
+    snapshot_export_busy: std::sync::atomic::AtomicBool,
     /// テスト専用の同期点コールバック（Issue #1363・TABLE-15）。feature
     /// `test-sync-points` 限定で、既定ビルドにはフィールドごと存在しない。
     #[cfg(feature = "test-sync-points")]
@@ -830,6 +836,17 @@ impl Storage {
         Ok(storage)
     }
 
+    /// 読み取りトランザクション 1 本の上で全 redb 表を `dest` の新ファイルへ複製する
+    /// （RECOVER-13・Issue #2151。方式は `docs/design/backup-snapshot.md`）。
+    /// 詳細と失敗時の契約は [`snapshot`] を参照。運用者の CLI（#2152）専用で、
+    /// SQL・NoSQL の表層からは呼べない。
+    pub fn export_snapshot(
+        &self,
+        dest: impl AsRef<Path>,
+    ) -> std::result::Result<SnapshotSummary, SnapshotExportError> {
+        snapshot::export_snapshot(self, dest.as_ref())
+    }
+
     /// 開いた `redb::Database` から `Storage` を組み立てる共通本体。
     fn from_db(db: redb::Database, durability: WriteDurability) -> Self {
         Self {
@@ -844,6 +861,7 @@ impl Storage {
             function_generations: Default::default(),
             write_lock_wait: DEFAULT_WRITE_LOCK_WAIT,
             commit_log: Some(std::sync::Arc::new(commit_log::CommitLog::new())),
+            snapshot_export_busy: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "test-sync-points")]
             sync_hook: std::sync::Mutex::new(None),
         }
@@ -3431,6 +3449,7 @@ mod tests {
                 function_generations: Default::default(),
                 write_lock_wait: DEFAULT_WRITE_LOCK_WAIT,
                 commit_log: None,
+                snapshot_export_busy: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(feature = "test-sync-points")]
                 sync_hook: std::sync::Mutex::new(None),
             };
@@ -3500,6 +3519,7 @@ mod tests {
                 function_generations: Default::default(),
                 write_lock_wait: DEFAULT_WRITE_LOCK_WAIT,
                 commit_log: None,
+                snapshot_export_busy: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(feature = "test-sync-points")]
                 sync_hook: std::sync::Mutex::new(None),
             };
@@ -3565,6 +3585,7 @@ mod tests {
                 function_generations: Default::default(),
                 write_lock_wait: DEFAULT_WRITE_LOCK_WAIT,
                 commit_log: None,
+                snapshot_export_busy: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(feature = "test-sync-points")]
                 sync_hook: std::sync::Mutex::new(None),
             };
@@ -3610,6 +3631,7 @@ mod tests {
                 function_generations: Default::default(),
                 write_lock_wait: DEFAULT_WRITE_LOCK_WAIT,
                 commit_log: None,
+                snapshot_export_busy: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(feature = "test-sync-points")]
                 sync_hook: std::sync::Mutex::new(None),
             };
