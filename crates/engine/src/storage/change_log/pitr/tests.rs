@@ -697,3 +697,53 @@ fn overlap_with_an_incremental_must_match_the_applied_history() {
     );
     assert!(matches!(r, Err(IncrementalError::ChainBroken)));
 }
+
+#[test]
+fn time_resolution_rejects_segments_rewritten_after_verification() {
+    // 1 レコード 1 セグメント。検証（ヘッダ・トレーラの取得）の後に、ヘッダを変えずにコミット時刻と
+    // チェックサムを書き換えたセグメントは、時刻解決で読み切って全体チェックサムを照合し、拒否する。
+    let s = scenario("pitr-resolve-swap", 1);
+    let end = s.base_point.end_lsn;
+    let expect = ArchiveExpectation {
+        db_id: Some(s.base_point.db_id),
+        timeline: Some(s.base_point.timeline),
+        start_lsn: None,
+    };
+    let (_, verified) =
+        crate::storage::change_log::archive::verified_segments(s.archive.path(), &expect)
+            .expect("verified");
+    let segs: Vec<ReplaySegment> = verified
+        .into_iter()
+        .filter(|(_, i)| i.header.last_lsn > end)
+        .map(|(path, info)| ReplaySegment {
+            path,
+            info,
+            overlap_ok: true,
+        })
+        .collect();
+    let refs: Vec<&ReplaySegment> = segs.iter().collect();
+    let max = CaptureLimits::default().max_payload_bytes;
+    let times = s.fx.commit_times();
+    let t_of = |lsn: u64| times.iter().find(|(l, _)| *l == lsn).expect("lsn").1;
+
+    // 書き換え前は、LSN end+2 の時刻を超える最初のレコード（end+3）の直前で止まる。
+    let before = resolve_time(&refs, end, t_of(end + 2), max).expect("resolve");
+    assert_eq!(before, end + 2);
+
+    // LSN end+2 のセグメントの時刻を、ヘッダ・チェックサムを整えたまま極端に大きくする。判定上は「このレコードが
+    // 最初に T を超える」ことになり、停止位置は 1 つ前のセグメントの末尾（end+1）になる。
+    // 書き換え後の内容は検証時のトレーラと一致しないので、読み切って照合し、拒否する。
+    let victim = &segs[1];
+    let forged_dir = private_dir("pitr-resolve-swap-forged");
+    let forged = forged_dir.path().join("forged.seg");
+    retime_segment(&victim.path, &forged, &[i64::MAX]);
+    std::fs::copy(&forged, &victim.path).expect("overwrite");
+    let r = resolve_time(&refs, end, t_of(end + 2), max);
+    assert!(
+        matches!(
+            r,
+            Err(IncrementalError::Segment(ArchiveError::ChecksumMismatch))
+        ),
+        "{r:?}"
+    );
+}

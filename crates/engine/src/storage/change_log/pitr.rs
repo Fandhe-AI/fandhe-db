@@ -147,11 +147,13 @@ pub fn restore_to_point(
     replay_segments(db_path, &list, Some(stop))
 }
 
-/// コミット時刻が `t` を超える最初のレコードの直前の LSN を求める（ヘッダだけを読む）。ベースの終点
+/// コミット時刻が `t` を超える最初のレコードの直前の LSN を求める。ベースの終点
 /// `base_end` 以下のレコードと、既に見た LSN 以下のレコード（アーカイブが増分と重なる区間）は数えない。
-/// 読むのはヘッダだけで、全体チェックサム（`finish`）は照合しない。安全の根拠は、(1) 呼び出し前に
-/// アーカイブ全体を検証済み、(2) 結果は停止 LSN にすぎず、再生（`replay_segments`）が各セグメントの
-/// ヘッダ・全体チェックサムと、重なり区間の内容（適用先の `change_log` の行）を再検証することにある。
+/// 読むのはレコードのヘッダだけだが、読んだセグメントは必ず最後まで読み切り、全体チェックサム
+/// （`finish`）を検証時のトレーラと照合する（停止位置が決まった後もそのセグメントは読み切る）。検証から
+/// ここまでの間に、ヘッダを変えずにコミット時刻とレコードのチェックサムを書き換えられても、不一致で
+/// 拒否する（書き換え後の時刻で停止 LSN を決めない）。停止位置より後ろのセグメントは読まない
+/// （再生の対象外で、ディレクトリ全体の検証は済んでいる）。重なり区間の内容の照合は再生側が行う。
 /// 該当するレコードが無い（末尾まで行く）、または最初の候補がすでに `t` を超えている（停止点がベース以前）
 /// なら `TargetOutOfRange`。
 fn resolve_time(
@@ -166,7 +168,12 @@ fn resolve_time(
         if *reader.header() != seg.info.header {
             return Err(ArchiveError::ChecksumMismatch.into());
         }
+        let mut found: Option<u64> = None;
         while let Some(raw) = reader.next_record()? {
+            if found.is_some() {
+                // 停止位置は決まった。チェックサムの照合のために読み切るだけ。
+                continue;
+            }
             let h = peek_record(&raw, max_payload)
                 .map_err(super::archive::map_decode)
                 .map_err(IncrementalError::from)?;
@@ -183,9 +190,17 @@ fn resolve_time(
                 if stop <= base_end {
                     return Err(IncrementalError::TargetOutOfRange);
                 }
-                return Ok(stop);
+                found = Some(stop);
+                continue;
             }
             seen = h.lsn;
+        }
+        // 検証時と同じ全体チェックサム（読んだ内容が検証後に書き換えられていない）。
+        if reader.finish()? != seg.info.trailer {
+            return Err(ArchiveError::ChecksumMismatch.into());
+        }
+        if let Some(stop) = found {
+            return Ok(stop);
         }
     }
     Err(IncrementalError::TargetOutOfRange)
