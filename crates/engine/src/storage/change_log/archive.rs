@@ -1088,19 +1088,20 @@ fn maintenance_commit(
     opts: &ArchiveOptions,
     prune_cap: u64,
 ) -> Result<Step> {
-    // レプリカの保持位置（Issue #2173）。登録簿のロックを commit まで保持し、レプリカの登録（登録 →
-    // 開始位置の存在確認）が刈り込みの途中に割り込んで、確認した範囲が commit で消える競合を作らない。
-    // ゲートの待機中に保持するが、登録側はゲートを取らず、ack の更新も短時間のロックだけなので、
-    // 順序の逆転（ゲート → 登録簿）は存在しない。
-    // 刈り込みをしない周期（保持設定なし）では取らない（ゲート待ちの間、登録・ack 更新を止めない）。
+    // 書き込みゲートを先に取る（待機中は登録簿を持たない。ゲート待ちの間もレプリカの ack の更新・登録・解除が
+    // 止まらないようにするため）。ロックの順序は常に「ゲート → 登録簿」で、登録簿を持ったままゲートを待つ
+    // 経路は無い（登録・ack 更新・解除はゲートを取らず、登録簿のロックだけで済む）ので、逆転によるデッドロックは無い。
+    let Some(txn) = storage.begin_maintenance_txn()? else {
+        return Ok(Step::Skipped);
+    };
+    // レプリカの保持位置（Issue #2173）。ゲートを得てから登録簿のロックを取り、刈り込みの commit まで保持する。
+    // レプリカの登録（登録 → 開始位置の存在確認）が刈り込みの途中に割り込んで、確認した範囲が commit で消える
+    // 競合を作らない。刈り込みをしない周期（保持設定なし）では取らない。
     let pins = opts
         .retain_records
         .and(storage.change_log.as_ref())
         .map(|s| s.replica_pins.lock());
     let pin_floor = pins.as_ref().map_or(u64::MAX, |p| ReplicaPins::floor(p));
-    let Some(txn) = storage.begin_maintenance_txn()? else {
-        return Ok(Step::Skipped);
-    };
     let mut deleted: u64 = 0;
     {
         // 許可（clippy::disallowed_methods）: メタ表と本体表は記録範囲の例外（D3）で、捕捉の対象外。

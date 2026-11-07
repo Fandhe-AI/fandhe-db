@@ -192,3 +192,43 @@ fn identity_is_exposed_only_when_enabled() {
         Err(StreamError::NotEnabled)
     ));
 }
+
+/// 刈り込みの保守 commit が書き込みゲートを待っている間も、レプリカの保持位置の更新・登録・解除は止まらない
+/// （ゲートを先に取ってから登録簿のロックを取るため。正常に ack しているレプリカが塞がれて切られない）。
+#[test]
+fn pin_updates_do_not_wait_for_the_write_gate() {
+    use std::time::{Duration, Instant};
+    let f = Fixture::new("stream-gate");
+    f.insert(3);
+    let pin = f
+        .storage()
+        .pin_change_log_for_replica(f.current())
+        .expect("pin");
+    let mut opts = ArchiveOptions::new(f.archive.path());
+    opts.retain_records = Some(0);
+    std::thread::scope(|scope| {
+        // 通常の書き込みがゲートを持ち続ける。
+        let holder = scope.spawn(|| {
+            let txn = f.storage().begin_write_txn().expect("gate");
+            std::thread::sleep(Duration::from_millis(1500));
+            drop(txn);
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        // 保守 commit（ゲート待ち）。
+        let archiver = scope.spawn(|| f.storage().archive_change_log(&opts));
+        std::thread::sleep(Duration::from_millis(300));
+        let started = Instant::now();
+        pin.advance(f.current());
+        let second = f
+            .storage()
+            .pin_change_log_for_replica(f.current())
+            .expect("register while the gate is busy");
+        drop(second);
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "pin operations must not wait for the write gate"
+        );
+        holder.join().expect("holder");
+        let _ = archiver.join().expect("archiver");
+    });
+}
