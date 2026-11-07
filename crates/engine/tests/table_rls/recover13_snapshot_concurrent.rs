@@ -37,6 +37,8 @@ const ACCOUNTS: i64 = 8;
 const INITIAL_BAL: i64 = 1000;
 /// 取得回数。
 const EXPORTS: usize = 6;
+/// 取得中に commit が重なる実行が現れるまでの繰り返しの上限（上限に達したら失敗）。
+const MAX_EXPORTS: usize = 40;
 /// 書き込みスレッドの周回数の上限。SELECT の LIMIT 上限（10000）に収め、stop が立たない異常時にも止まる。
 const MAX_ITERATIONS: u64 = 5_000;
 
@@ -259,7 +261,12 @@ fn snapshot_under_concurrent_writes_is_a_single_commit_point() {
 
     let mut seen: Vec<u64> = Vec::new();
     let mut outputs = Vec::new();
-    for i in 0..EXPORTS {
+    // 取得の最中に commit が完了した実行（取得開始前の完了数 < 取得完了時の完了数。K とは別に測る）の数。
+    let mut overlapped = 0usize;
+    for i in 0..MAX_EXPORTS {
+        if i >= EXPORTS && overlapped > 0 {
+            break;
+        }
         // 書き込みが 1 件以上進むまで待つ（i 回目の取得の前に必ず前進させ、取得間で内容が進むことを保証）。
         let floor = committed
             .load(Ordering::SeqCst)
@@ -280,7 +287,11 @@ fn snapshot_under_concurrent_writes_is_a_single_commit_point() {
         // 取得ファイルが出力先として未存在であること。
         let _ = std::fs::remove_file(&out);
         core.export_snapshot(&out).expect("export snapshot");
+        let after_committed = committed.load(Ordering::SeqCst);
         let after_started = started.load(Ordering::SeqCst);
+        if after_committed > before_committed {
+            overlapped += 1;
+        }
 
         let k = verify_snapshot(&out);
         assert!(
@@ -294,6 +305,10 @@ fn snapshot_under_concurrent_writes_is_a_single_commit_point() {
         seen.push(k);
     }
     stop.store(true, Ordering::SeqCst);
+    assert!(
+        seen.len() >= EXPORTS && overlapped > 0,
+        "no export overlapped a commit within {MAX_EXPORTS} attempts (seen {seen:?})"
+    );
     let errors = writer.join().expect("writer thread");
     assert!(errors.is_empty(), "writer errors: {errors:?}");
 

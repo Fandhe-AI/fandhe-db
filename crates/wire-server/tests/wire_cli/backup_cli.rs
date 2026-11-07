@@ -582,7 +582,6 @@ fn socket_backup_under_two_tenant_writers_restores_prefixes_and_keeps_boundary()
     let db = fx.db_path_str();
     write_user_store_with_alice_and_bob(&users);
     let (_dir, sock) = private_socket_path(&db);
-    let out = parent_of(&db).join("snap.redb");
     let sock_s = sock.to_str().expect("utf-8").to_string();
 
     let mut a = spawn_server_with(&users, &db, &["--backup-socket", &sock_s]);
@@ -603,7 +602,13 @@ fn socket_backup_under_two_tenant_writers_restores_prefixes_and_keeps_boundary()
     }
 
     let stop = Arc::new(AtomicBool::new(false));
-    let spawn_writer = |user: &'static str, base: u32, tx: mpsc::Sender<()>| {
+    // 各 writer が完了した INSERT の件数（応答を受けた後に更新する）。
+    let done_a = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let done_b = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let spawn_writer = |user: &'static str,
+                        base: u32,
+                        tx: mpsc::Sender<()>,
+                        done: Arc<std::sync::atomic::AtomicU32>| {
         let stop = Arc::clone(&stop);
         std::thread::spawn(move || {
             let mut w = common::authenticate_to_ready_for_query(addr, user, "pw-alice");
@@ -611,6 +616,7 @@ fn socket_backup_under_two_tenant_writers_restores_prefixes_and_keeps_boundary()
             while !stop.load(Ordering::Relaxed) {
                 insert(&mut w, base + n);
                 n += 1;
+                done.store(n, Ordering::SeqCst);
                 if n == 1 {
                     let _ = tx.send(());
                 }
@@ -620,18 +626,37 @@ fn socket_backup_under_two_tenant_writers_restores_prefixes_and_keeps_boundary()
     };
     let (tx_a, rx_a) = mpsc::channel();
     let (tx_b, rx_b) = mpsc::channel();
-    let wa = spawn_writer("alice", 100_000, tx_a);
-    let wb = spawn_writer("bob", 200_000, tx_b);
+    let wa = spawn_writer("alice", 100_000, tx_a, Arc::clone(&done_a));
+    let wb = spawn_writer("bob", 200_000, tx_b, Arc::clone(&done_b));
     rx_a.recv_timeout(Duration::from_secs(30))
         .expect("alice writer started");
     rx_b.recv_timeout(Duration::from_secs(30))
         .expect("bob writer started");
-    let o = backup_via_socket(&sock, &out);
+    // 取得の最中に両 writer のいずれかの INSERT が完了した実行（取得開始前の完了数 < 取得完了後の完了数）が
+    // 現れるまで、別名の出力へ取得を繰り返す。上限に達したら失敗にする。
+    let mut chosen: Option<(std::path::PathBuf, u32, u32)> = None;
+    for attempt in 0..40 {
+        let cand = parent_of(&db).join(format!("snap{attempt}.redb"));
+        let (a0, b0) = (done_a.load(Ordering::SeqCst), done_b.load(Ordering::SeqCst));
+        let o = backup_via_socket(&sock, &cand);
+        let (a1, b1) = (done_a.load(Ordering::SeqCst), done_b.load(Ordering::SeqCst));
+        assert_eq!(code(&o), Some(0), "stderr: {}", stderr(&o));
+        if a1 + b1 > a0 + b0 {
+            chosen = Some((cand, a0, b0));
+            break;
+        }
+    }
     stop.store(true, Ordering::Relaxed);
     let wrote_a = wa.join().expect("alice writer must not fail");
     let wrote_b = wb.join().expect("bob writer must not fail");
-    assert_eq!(code(&o), Some(0), "stderr: {}", stderr(&o));
-    assert!(wrote_a > 0 && wrote_b > 0, "writes must continue");
+    let (out, done_a0, done_b0) = chosen.expect("no backup overlapped a completed write");
+    assert!(
+        done_a0 >= 1 && done_b0 >= 1,
+        "writers started before backup"
+    );
+    // 既存の出力先は拒否される
+    let o = backup_via_socket(&sock, &out);
+    assert_eq!(code(&o), Some(2), "stderr: {}", stderr(&o));
     drop(alice);
     drop(bob);
     drop(a);
@@ -646,7 +671,12 @@ fn socket_backup_under_two_tenant_writers_restores_prefixes_and_keeps_boundary()
             .map(|i| i.parse().expect("numeric id"))
             .collect()
     };
-    let check = |ids: &[u32], own_seed: &[u32], base: u32, other_base: u32, wrote: u32| {
+    let check = |ids: &[u32],
+                 own_seed: &[u32],
+                 base: u32,
+                 other_base: u32,
+                 done_before: u32,
+                 wrote: u32| {
         for s in own_seed {
             assert!(ids.contains(s), "missing seed {s}: {ids:?}");
         }
@@ -657,6 +687,16 @@ fn socket_backup_under_two_tenant_writers_restores_prefixes_and_keeps_boundary()
             .collect();
         let want: Vec<u32> = (base..base + run.len() as u32).collect();
         assert_eq!(run, want, "writes must be a gapless prefix");
+        // 取得の開始前に完了した書き込みはすべて含まれる（空や古い出力は不可）。
+        assert!(
+            !run.is_empty() && run[0] == base,
+            "first write missing: {run:?}"
+        );
+        assert!(
+            run.len() as u32 >= done_before,
+            "snapshot lost completed writes: {} < {done_before}",
+            run.len()
+        );
         assert!(run.len() as u32 <= wrote);
         assert!(
             ids.iter()
@@ -667,8 +707,8 @@ fn socket_backup_under_two_tenant_writers_restores_prefixes_and_keeps_boundary()
     };
     let alice_ids = ids_of("alice");
     let bob_ids = ids_of("bob");
-    check(&alice_ids, &[1, 2, 3], 100_000, 200_000, wrote_a);
-    check(&bob_ids, &[10, 11], 200_000, 100_000, wrote_b);
+    check(&alice_ids, &[1, 2, 3], 100_000, 200_000, done_a0, wrote_a);
+    check(&bob_ids, &[10, 11], 200_000, 100_000, done_b0, wrote_b);
     assert!(!bob_ids.iter().any(|i| [1, 2, 3].contains(i)));
     assert!(!alice_ids.iter().any(|i| [10, 11].contains(i)));
 }
