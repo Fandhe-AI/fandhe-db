@@ -82,11 +82,14 @@ pub(super) fn render_column_type<E>(ty: &ColumnType) -> Result<String, SchemaDdl
 }
 
 /// 数値リテラルとして安全な文字だけで構成されているかを確かめて返す（SQL へ連結する前の検証）。
-fn safe_number<E>(text: &str) -> Result<&str, SchemaDdlError<E>> {
+pub(super) fn safe_number<E>(text: &str) -> Result<&str, SchemaDdlError<E>> {
     let ok = !text.is_empty()
         && text
             .bytes()
-            .all(|b| b.is_ascii_digit() || matches!(b, b'.' | b'-' | b'+' | b'e' | b'E'));
+            .all(|b| b.is_ascii_digit() || matches!(b, b'.' | b'-' | b'+' | b'e' | b'E'))
+        // 文字種に加えて数値として読めることを確かめる（`--` のコメント開始などを含む形を通さない）。
+        && !text.contains("--")
+        && (text.parse::<i128>().is_ok() || text.parse::<f64>().is_ok_and(f64::is_finite));
     if ok {
         Ok(text)
     } else {

@@ -133,7 +133,9 @@ pub enum DdlObjectKind {
 }
 
 /// シンクへ渡す DDL 文 1 件。`sql` は 1 文（末尾の `;` を含まない）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `sql` にはロールの SCRAM 検証子など秘匿値が入りうるため、`Debug` は `sql` を伏せる（ログに出さない）。
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct DdlStatement<'a> {
     /// 出力の区分。
     pub section: DdlSection,
@@ -141,6 +143,16 @@ pub struct DdlStatement<'a> {
     pub kind: DdlObjectKind,
     /// 文本体（`;` なし）。
     pub sql: &'a str,
+}
+
+impl fmt::Debug for DdlStatement<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DdlStatement")
+            .field("section", &self.section)
+            .field("kind", &self.kind)
+            .field("sql", &format_args!("<{} bytes redacted>", self.sql.len()))
+            .finish()
+    }
 }
 
 /// 書き出しの件数。

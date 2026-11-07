@@ -442,3 +442,32 @@ fn output_order_does_not_depend_on_internal_schema_ids() {
     assert!(tables[1].starts_with("CREATE TABLE aa.t"));
     assert!(tables[2].starts_with("CREATE TABLE zz.t"));
 }
+
+#[test]
+fn role_password_verifier_survives_the_round_trip_unchanged() {
+    // 復元側の CREATE ROLE ... PASSWORD は、事前ハッシュ済みの検証子をそのまま保存し、平文として
+    // 再ハッシュしない（再ハッシュすると salt が変わり、元のパスワードで認証できなくなる）。
+    let verifier = |core: &EngineCore| {
+        let ident = EngineCore::login_identifier("tenant-a", "app").expect("identifier");
+        core.resolve_login_role(&ident)
+            .expect("lookup")
+            .map(|c| c.scram_verifier.clone())
+            .expect("role exists")
+    };
+    let p1 = unique_db_path("dump-verifier-src");
+    let _g1 = CleanupGuard(p1.clone());
+    let p2 = unique_db_path("dump-verifier-dst");
+    let _g2 = CleanupGuard(p2.clone());
+    let src = open_core(&p1);
+    ok(
+        &src,
+        "tenant-a",
+        "CREATE ROLE app LOGIN PASSWORD 'plain-secret'",
+    );
+    let stmts = dump(&src, &SchemaDdlScope::tenant_only("tenant-a")).expect("dump");
+    let text: String = stmts.iter().map(|(_, s)| s.as_str()).collect();
+    assert!(text.contains("SCRAM-SHA-256$") && !text.contains("plain-secret"));
+    let dst = open_core(&p2);
+    replay(&dst, "tenant-a", &stmts);
+    assert_eq!(verifier(&src), verifier(&dst));
+}

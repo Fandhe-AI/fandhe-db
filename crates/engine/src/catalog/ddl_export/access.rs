@@ -216,21 +216,26 @@ fn render_fn_type<E>(
     render_function_type::<E>(&ty)
 }
 
-/// 本体をドル引用符で囲む。タグは本体に現れない値を選ぶ。
-fn dollar_quote<E>(body: &str) -> Result<String, SchemaDdlError<E>> {
+/// 本体をドル引用符で囲む。タグは `$fandhe<n>$` で、開きタグの直後から最初に現れる同じタグが
+/// 末尾の閉じタグそのものである値を選ぶ（本体の末尾と閉じタグが結合して早く閉じる形を避ける）。
+pub(super) fn dollar_quote<E>(body: &str) -> Result<String, SchemaDdlError<E>> {
     for n in 0..=32u32 {
         let tag = if n == 0 {
             "$fandhe$".to_string()
         } else {
             format!("$fandhe{n}$")
         };
-        if !body.contains(&tag) {
-            return Ok(format!("{tag}{body}{tag}"));
+        let quoted = format!("{tag}{body}{tag}");
+        let expected_close = quoted.len() - tag.len();
+        if quoted.get(tag.len()..).and_then(|rest| rest.find(&tag))
+            == Some(expected_close - tag.len())
+        {
+            return Ok(quoted);
         }
     }
     Err(unsupported(
         "function",
-        "body contains every candidate quote tag",
+        "function body cannot be safely dollar-quoted",
     ))
 }
 

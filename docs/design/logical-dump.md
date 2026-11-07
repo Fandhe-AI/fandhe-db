@@ -96,6 +96,10 @@ DDL へ戻す手段が無い種別・属性があれば `Unsupported` でダン�
 - ダンプにはロールの SCRAM 検証子（`CREATE ROLE ... PASSWORD 'SCRAM-SHA-256$...'`）が含まれる（平文は持たない）。出力ファイルの権限（`0o600` 相当）は CLI（#2162）が守る
 - 復元は、ロールを作った後の文を束縛なしの運用者権限で実行できることが前提（現行の `CREATE TABLE`・`CREATE FUNCTION`・`CREATE POLICY` などは束縛なしで通る）
 
+- 未分類の redb 表の検査（`ensure_all_tables_classified`）は、利用者の名前から作られる表名（`user_rows/<名前>` など）が `SCHEMA_CATALOG_TABLES` の完全一致名と衝突しないことを前提にする。利用者の表名は `validate_identifier` が `/` を含ませないため、接頭辞付きの動的表名は固定名と重ならない
+- `DdlStatement.sql` には文字列リテラルとして `;` や改行を含みうる（既定値・ラベル・関数本体）。#2162 が `;` と改行で区切って書く場合、復元側は字句解析器を考慮した分割（`sql::statement_splitter` 相当）が必須で、単純な文字列分割は使えない
+- `DdlStatement` にはロールの SCRAM 検証子が入るため、ログへ出さない（`Debug` は `sql` を伏せる）
+
 ## 10. 残課題
 
 - 権限（GRANT・所有者・既定権限・メンバーシップ）の書き出し: 復元を現在ロールを束縛した主体で実行する設計（#2162・#2163）と、`GRANTED BY` 相当の構文の追加が前提

@@ -136,10 +136,19 @@ fn export_schemas<E>(ctx: &Ctx<'_>, out: &mut Emitter<'_, E>) -> Result<(), Sche
 
 /// 共有の ENUM 型。
 fn export_enums<E>(ctx: &Ctx<'_>, out: &mut Emitter<'_, E>) -> Result<(), SchemaDdlError<E>> {
-    if !ctx.scope.includes_shared() {
-        return Ok(());
-    }
     for (k, v) in read_str_table::<E>(ctx, ENUM_TYPES_TABLE)? {
+        // キーの所属で絞る（デコードより前。他テナントの SCHEMA 配下の型は存在を示さず無視する）。
+        match ctx.namer.scope::<E>(&k)? {
+            KeyScope::Shared if ctx.scope.includes_shared() => {}
+            KeyScope::Shared | KeyScope::Foreign => continue,
+            // `CREATE TYPE` は SCHEMA 修飾名を受理しないため、SCHEMA 配下の型は戻せない。
+            KeyScope::Tenant { .. } => {
+                return Err(unsupported(
+                    "enum type",
+                    "schema-scoped enum type cannot be recreated by SQL",
+                ));
+            }
+        }
         let def: EnumTypeDef = decode_enum_type_def(&k, &v)?;
         let mut s = String::from("CREATE TYPE ");
         push_ident(&mut s, def.name())?;
@@ -243,18 +252,17 @@ fn ensure_owned_sequences_consumed<E>(
 /// マテリアライズド VIEW は定義と実体（文脈ごとの行）が別で、実体を DDL へ戻す手段が無いため、
 /// 1 件でもあれば書き出せない（黙って省かない）。
 fn reject_materialized_views<E>(ctx: &Ctx<'_>) -> Result<(), SchemaDdlError<E>> {
-    if !ctx.scope.includes_shared() {
-        return Ok(());
+    // 他の種別と同じく relation キーの所属で絞る。範囲内（共有分を選んだときの共有、または選択した
+    // テナントの SCHEMA 配下）に 1 件でもあれば失敗し、範囲外（他テナント）は存在を示さず無視する。
+    for (k, _) in read_str_table::<E>(ctx, super::super::materialized::MATERIALIZED_VIEWS_TABLE)? {
+        if in_scope(ctx, &k)? {
+            return Err(unsupported(
+                "materialized view",
+                "materialized views cannot be recreated by the schema dump",
+            ));
+        }
     }
-    let any = read_str_table::<E>(ctx, super::super::materialized::MATERIALIZED_VIEWS_TABLE)?;
-    if any.is_empty() {
-        Ok(())
-    } else {
-        Err(unsupported(
-            "materialized view",
-            "materialized views cannot be recreated by the schema dump",
-        ))
-    }
+    Ok(())
 }
 
 /// 範囲内の VIEW。ビューが参照するビューを先に出す（トポロジカル順）。

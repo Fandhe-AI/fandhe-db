@@ -235,3 +235,129 @@ fn foreign_key_statement_lists_every_option_and_never_concatenates_raw_names() {
         "foreign key"
     );
 }
+
+fn dump_sql(s: &Storage, scope: &SchemaDdlScope) -> Result<Vec<String>, Err0> {
+    let mut v = Vec::new();
+    s.export_schema_ddl(scope, |st| {
+        v.push(st.sql.to_string());
+        Ok::<(), Infallible>(())
+    })?;
+    Ok(v)
+}
+
+/// カタログ表へ直接 1 行書く（SQL では SCHEMA 配下に作れない種別の行を再現する試験専用）。
+fn inject(storage: &Storage, table: &str, key: &str, value: &[u8]) {
+    let w = storage.db().begin_write().expect("begin");
+    {
+        #[allow(clippy::disallowed_methods)]
+        let mut t = w
+            .open_table(redb::TableDefinition::<&str, &[u8]>::new(table))
+            .expect("open");
+        t.insert(key, value).expect("insert");
+    }
+    w.commit().expect("commit");
+}
+
+#[test]
+fn matviews_and_enums_are_scoped_by_owner_and_never_leak_across_tenants() {
+    let path = unique_db_path("ddl-export-scoped-kinds");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open");
+    storage.create_schema("tenant-a", "a_s", false).expect("a");
+    storage.create_schema("tenant-b", "b_s", false).expect("b");
+    let id_a = storage
+        .schema_id("tenant-a", "a_s")
+        .expect("id")
+        .expect("some");
+    let id_b = storage
+        .schema_id("tenant-b", "b_s")
+        .expect("id")
+        .expect("some");
+    let scopes = [
+        SchemaDdlScope::shared_only(),
+        SchemaDdlScope::shared_and_tenant("tenant-a"),
+        SchemaDdlScope::tenant_only("tenant-a"),
+    ];
+    let before: Vec<_> = scopes
+        .iter()
+        .map(|s| dump_sql(&storage, s).expect("baseline"))
+        .collect();
+    // テナント B にだけ、SCHEMA 配下の matview と ENUM（中身は読まれない）を置く。
+    inject(&storage, "materialized_views", &format!("#{id_b}.mv"), b"x");
+    inject(&storage, "enum_types", &format!("#{id_b}.en"), b"x");
+    for (s, b) in scopes.iter().zip(&before) {
+        assert_eq!(&dump_sql(&storage, s).expect("unchanged by tenant-b"), b);
+    }
+    // 持ち主の B のダンプは、黙って落とさず失敗する。
+    assert_eq!(
+        unsupported_kind(dump_sql(&storage, &SchemaDdlScope::tenant_only("tenant-b"))),
+        "enum type"
+    );
+    // A 自身の SCHEMA 配下の matview・ENUM も黙って落とさない。
+    inject(&storage, "materialized_views", &format!("#{id_a}.mv"), b"x");
+    assert_eq!(
+        unsupported_kind(dump_sql(&storage, &SchemaDdlScope::tenant_only("tenant-a"))),
+        "materialized view"
+    );
+    inject(&storage, "enum_types", &format!("#{id_a}.en"), b"x");
+    assert_eq!(
+        unsupported_kind(dump_sql(&storage, &SchemaDdlScope::tenant_only("tenant-a"))),
+        "enum type"
+    );
+    // 共有分だけの書き出しは、テナント固有の行に影響されない。
+    dump_sql(&storage, &SchemaDdlScope::shared_only()).expect("shared only");
+}
+
+#[test]
+fn dollar_quoting_never_closes_early() {
+    for body in [
+        "SELECT 1",
+        "x$fandhe",
+        "x$f",
+        "a$fandhe$b",
+        "$fandhe$",
+        "SELECT '$fandhe1$'",
+        "ends with dollar$",
+        "$starts",
+    ] {
+        match access::dollar_quote::<Infallible>(body) {
+            Ok(q) => {
+                let tag_end = q[1..].find('$').expect("tag") + 2;
+                let tag = &q[..tag_end];
+                assert!(q.ends_with(tag) && q.starts_with(tag));
+                // 開きタグの後で最初に現れるタグが、末尾の閉じタグそのものである。
+                assert_eq!(
+                    q[tag.len()..].find(tag),
+                    Some(q.len() - 2 * tag.len()),
+                    "{body:?}"
+                );
+                assert_eq!(&q[tag.len()..q.len() - tag.len()], body);
+            }
+            Err(e) => panic!("{e:?}"),
+        }
+    }
+}
+
+#[test]
+fn numeric_defaults_must_parse_as_numbers() {
+    for ok in ["5", "-5", "1.5", "1e3", "-2.5E-3", "+7"] {
+        assert!(table::safe_number::<Infallible>(ok).is_ok(), "{ok}");
+    }
+    for bad in ["--1", "1-2", "e", "", "1;", "1e", "--", "5 -- x", "inf"] {
+        assert!(table::safe_number::<Infallible>(bad).is_err(), "{bad}");
+    }
+}
+
+#[test]
+fn statement_debug_hides_the_sql_text() {
+    let st = DdlStatement {
+        section: DdlSection::PreData,
+        kind: DdlObjectKind::Role,
+        sql: "CREATE ROLE r PASSWORD 'SCRAM-SHA-256$secret'",
+    };
+    let shown = format!("{st:?}");
+    assert!(
+        !shown.contains("SCRAM") && !shown.contains("secret"),
+        "{shown}"
+    );
+}
