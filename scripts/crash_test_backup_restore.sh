@@ -19,8 +19,8 @@
 #   5. 復元中 kill: 手順 3 と同形（一時名は `.fandhe-restore-*.tmp`）。
 #   6. 稼働中取得中のサーバー kill: `--backup-socket` 経由の取得中にサーバーを SIGKILL し、
 #      最終名が不完全にならず、同じ DB でサーバーを再起動して件数が保たれることを確かめる。
-# 空虚な成功を避けるため、kill が実際に実行中のプロセスへ当たった回数（終了ステータス 137）を
-# 数え、0 回なら失敗とする。Makefile の crash-test-backup-restore ターゲット（crash-test の
+# 空虚な成功を避けるため、処理が始まっていて公開前（一時名が新たにあり最終名が無い）に kill
+# できた回数を段ごとに数え、0 回なら失敗とする（0 のままなら反復を延長する。上限あり）。Makefile の crash-test-backup-restore ターゲット（crash-test の
 # 前提）から呼ばれ、CI では既存の crash-test ジョブで実行される。
 #
 # 使い方: scripts/crash_test_backup_restore.sh [反復回数（既定 12）]
@@ -227,6 +227,22 @@ check_residue() {
   done
 }
 
+# ディレクトリ直下の一時名（第 2 引数の glob）の個数。残骸は反復をまたいで残すため、反復前後の
+# 個数の増加は「その反復のプロセスが一時名を作った（処理が始まった）」ことを意味する。
+count_tmp() {
+  find "$1" -maxdepth 1 -name "$2" | wc -l
+}
+
+# 反復回数の方針（各段共通）。最低 ITERATIONS 回を実行し、さらに「処理が始まっていて公開前の
+# 一時名が残った状態で kill できた回（hit）」が 1 回以上になるまで続ける。打ち切りは
+# ITERATIONS の 4 倍（総所要時間の上限）で、その時点で hit が 0 なら失敗にする。
+# 終了ステータス 137 だけでは「処理開始前」「公開後」の kill と区別できないため hit には使わない。
+should_continue() {
+  local i="$1" hits="$2"
+  [ "${i}" -lt $((ITERATIONS * 4)) ] || return 1
+  [ "${i}" -lt "${ITERATIONS}" ] || [ "${hits}" -lt 1 ]
+}
+
 # ---------------------------------------------------------------------------
 # 1. データ投入 → 追記書き込み中にサーバーを SIGKILL（書き込みのある DB の異常終了）
 # ---------------------------------------------------------------------------
@@ -303,9 +319,13 @@ backup_limit_ms=$((BACKUP_MS * 3 / 2))
 [ "${backup_limit_ms}" -ge 20 ] || backup_limit_ms=20
 echo "=== phase 3: SIGKILL during backup (${ITERATIONS} iterations, delay 0-${backup_limit_ms}ms) ==="
 backup_killed=0
+backup_hits=0
 backup_completed=0
-for i in $(seq 1 "${ITERATIONS}"); do
+i=0
+while should_continue "${i}" "${backup_hits}"; do
+  i=$((i + 1))
   out="${BAK_DIR}/snap-${i}.redb"
+  tmp_before="$(count_tmp "${BAK_DIR}" '.fandhe-snapshot-*.tmp')"
   "${BIN}" backup --db "${SRC_DB}" --out "${out}" >/dev/null 2>&1 &
   job_pid=$!
   sleep_ms $((RANDOM % (backup_limit_ms + 1)))
@@ -315,6 +335,10 @@ for i in $(seq 1 "${ITERATIONS}"); do
   job_pid=""
   if [ "${status}" -eq 137 ]; then
     backup_killed=$((backup_killed + 1))
+    # hit: 一時名が新たに作られていて（処理開始後）、最終名が無い（公開前）。
+    if [ ! -e "${out}" ] && [ "$(count_tmp "${BAK_DIR}" '.fandhe-snapshot-*.tmp')" -gt "${tmp_before}" ]; then
+      backup_hits=$((backup_hits + 1))
+    fi
   else
     # kill より先に終了していた（完了）。成功終了のはず（3 は後始末不確実で完成済み）。
     case "${status}" in
@@ -329,9 +353,9 @@ for i in $(seq 1 "${ITERATIONS}"); do
   expect_verify_ok "${SRC_DB}" "source DB after backup iteration ${i}"
   check_residue "${BAK_DIR}" ".fandhe-snapshot-" "snap-"
 done
-echo "backup kills: killed=${backup_killed} completed_before_kill=${backup_completed}"
-if [ "${backup_killed}" -lt 1 ]; then
-  fail "no backup was killed mid-run (the kill timing never hit; test is vacuous)"
+echo "backup kills: iterations=${i} killed=${backup_killed} hit_mid_run=${backup_hits} completed_before_kill=${backup_completed}"
+if [ "${backup_hits}" -lt 1 ]; then
+  fail "no backup was killed after starting and before publishing (test is vacuous)"
 fi
 # 一時名の残骸は運用者が手動で消す前提（README）。ここで数えて報告し、後続のためにファイルは残す。
 backup_residue="$(find "${BAK_DIR}" -maxdepth 1 -name '.fandhe-snapshot-*.tmp' | wc -l)"
@@ -362,9 +386,15 @@ restore_limit_ms=$((RESTORE_MS * 3 / 2))
 [ "${restore_limit_ms}" -ge 20 ] || restore_limit_ms=20
 echo "=== phase 5: SIGKILL during restore (${ITERATIONS} iterations, delay 0-${restore_limit_ms}ms) ==="
 restore_killed=0
+restore_hits=0
 restore_completed=0
-for i in $(seq 1 "${ITERATIONS}"); do
+# 中断されて最終名が存在しなかった復元先（再試行で同じパスへ復元し直す）。
+RST_INTERRUPTED=""
+i=0
+while should_continue "${i}" "${restore_hits}"; do
+  i=$((i + 1))
   out="${RST_DIR}/rst-${i}.redb"
+  tmp_before="$(count_tmp "${RST_DIR}" '.fandhe-restore-*.tmp')"
   "${BIN}" restore --from "${BASE_BAK}" --db "${out}" >/dev/null 2>&1 &
   job_pid=$!
   sleep_ms $((RANDOM % (restore_limit_ms + 1)))
@@ -374,6 +404,10 @@ for i in $(seq 1 "${ITERATIONS}"); do
   job_pid=""
   if [ "${status}" -eq 137 ]; then
     restore_killed=$((restore_killed + 1))
+    if [ ! -e "${out}" ] && [ "$(count_tmp "${RST_DIR}" '.fandhe-restore-*.tmp')" -gt "${tmp_before}" ]; then
+      restore_hits=$((restore_hits + 1))
+      [ -n "${RST_INTERRUPTED}" ] || RST_INTERRUPTED="${out}"
+    fi
   else
     case "${status}" in
       0 | 3) restore_completed=$((restore_completed + 1)) ;;
@@ -387,23 +421,27 @@ for i in $(seq 1 "${ITERATIONS}"); do
   expect_verify_ok "${BASE_BAK}" "restore source after iteration ${i}"
   check_residue "${RST_DIR}" ".fandhe-restore-" "rst-"
 done
-echo "restore kills: killed=${restore_killed} completed_before_kill=${restore_completed}"
-if [ "${restore_killed}" -lt 1 ]; then
-  fail "no restore was killed mid-run (the kill timing never hit; test is vacuous)"
+echo "restore kills: iterations=${i} killed=${restore_killed} hit_mid_run=${restore_hits} completed_before_kill=${restore_completed}"
+if [ "${restore_hits}" -lt 1 ] || [ -z "${RST_INTERRUPTED}" ]; then
+  fail "no restore was killed after starting and before publishing (test is vacuous)"
 fi
 restore_residue="$(find "${RST_DIR}" -maxdepth 1 -name '.fandhe-restore-*.tmp' | wc -l)"
 echo "restore temp residue files: ${restore_residue}"
 
-# 殺された restore の後でも、同じ復元先名で取り直せ、サーバーで読める。
-RST_RETRY="${RST_DIR}/rst-retry.redb"
-"${BIN}" restore --from "${BASE_BAK}" --db "${RST_RETRY}" >/dev/null \
-  || fail "restore retry after killed restores failed"
-expect_verify_ok "${RST_RETRY}" "restore retry"
+# 中断されて最終名が無かった復元先と同じパスへ取り直せ、整合し、サーバーで基準と同じデータを読める。
+[ ! -e "${RST_INTERRUPTED}" ] || fail "interrupted restore target unexpectedly exists: ${RST_INTERRUPTED}"
+"${BIN}" restore --from "${BASE_BAK}" --db "${RST_INTERRUPTED}" >/dev/null \
+  || fail "restore retry to the interrupted target failed: ${RST_INTERRUPTED}"
+expect_verify_ok "${RST_INTERRUPTED}" "restore retry to the interrupted target"
+count_via_server "${RST_INTERRUPTED}"
+if [ "${COUNT}" != "${BASE_COUNT}" ] || [ "${MAXID}" != "${BASE_MAXID}" ]; then
+  fail "retried restore differs: count=${COUNT} max_id=${MAXID}, expected ${BASE_COUNT}/${BASE_MAXID}"
+fi
+echo "restore retry to the interrupted target: count=${COUNT} max_id=${MAXID} (server read OK)"
 
 # ---------------------------------------------------------------------------
 # 6. 稼働中取得（--backup-socket）の最中にサーバーを SIGKILL
 # ---------------------------------------------------------------------------
-LIVE_ITERATIONS="${ITERATIONS}"
 LIVE_DB="${LIVE_DIR}/live.redb"
 LIVE_SOCK="${LIVE_DIR}/backup.sock"
 "${BIN}" restore --from "${BASE_BAK}" --db "${LIVE_DB}" >/dev/null || fail "live DB restore failed"
@@ -419,11 +457,14 @@ stop_server
 # 稼働中取得は基準時間の範囲内で待つ（完了後の kill を減らし、取得中に当てる確率を上げる）。
 live_limit_ms="${LIVE_MS}"
 [ "${live_limit_ms}" -ge 20 ] || live_limit_ms=20
-echo "=== phase 6: SIGKILL the server during a live backup (${LIVE_ITERATIONS} iterations, delay 0-${live_limit_ms}ms) ==="
+echo "=== phase 6: SIGKILL the server during a live backup (${ITERATIONS}+ iterations, delay 0-${live_limit_ms}ms) ==="
 live_killed=0
 live_interrupted=0
-for i in $(seq 1 "${LIVE_ITERATIONS}"); do
+i=0
+while should_continue "${i}" "${live_interrupted}"; do
+  i=$((i + 1))
   out="${LIVE_DIR}/live-${i}.redb"
+  tmp_before="$(count_tmp "${LIVE_DIR}" '.fandhe-snapshot-*.tmp')"
   start_server "${LIVE_DB}" --backup-socket "${LIVE_SOCK}"
   "${BIN}" backup --socket "${LIVE_SOCK}" --out "${out}" >/dev/null 2>&1 &
   job_pid=$!
@@ -443,10 +484,10 @@ for i in $(seq 1 "${LIVE_ITERATIONS}"); do
     waited=$((waited + 1))
   done
   wait "${job_pid}" 2>/dev/null
-  cli_status=$?
   job_pid=""
-  # CLI が失敗終了した（出力も無い）回数 = 取得中にサーバーが消えた回数。
-  if [ "${cli_status}" -ne 0 ] && [ ! -e "${out}" ]; then
+  # hit: サーバー側が一時名を新たに作った（書き出し開始後）うえで、公開前（最終名なし）に
+  # サーバーが消えた回。CLI の失敗終了だけでは接続前の kill と区別できないため判定に使わない。
+  if [ ! -e "${out}" ] && [ "$(count_tmp "${LIVE_DIR}" '.fandhe-snapshot-*.tmp')" -gt "${tmp_before}" ]; then
     live_interrupted=$((live_interrupted + 1))
   fi
   if [ -e "${out}" ]; then
@@ -457,12 +498,12 @@ for i in $(seq 1 "${LIVE_ITERATIONS}"); do
   check_residue "${LIVE_DIR}" ".fandhe-snapshot-" "live"
 done
 if [ "${live_interrupted}" -lt 1 ]; then
-  fail "no live backup was interrupted by the server kill (the kill timing never hit; test is vacuous)"
+  fail "the server was never killed after a live backup started and before it published (test is vacuous)"
 fi
 count_via_server "${LIVE_DB}"
 if [ "${COUNT}" != "${BASE_COUNT}" ] || [ "${MAXID}" != "${BASE_MAXID}" ]; then
   fail "live DB data changed: count=${COUNT} max_id=${MAXID}, expected ${BASE_COUNT}/${BASE_MAXID}"
 fi
-echo "live backup: server killed ${live_killed}/${LIVE_ITERATIONS} times, interrupted=${live_interrupted}, data intact"
+echo "live backup: iterations=${i} server killed ${live_killed} times, hit_mid_run=${live_interrupted}, data intact"
 
-echo "crash_test_backup_restore.sh: OK (backup kills=${backup_killed}, restore kills=${restore_killed}, live kills=${live_killed}; baseline backup=${BACKUP_MS}ms restore=${RESTORE_MS}ms)"
+echo "crash_test_backup_restore.sh: OK (backup hits=${backup_hits}/${backup_killed}, restore hits=${restore_hits}/${restore_killed}, live hits=${live_interrupted}/${live_killed}; baseline backup=${BACKUP_MS}ms restore=${RESTORE_MS}ms)"
