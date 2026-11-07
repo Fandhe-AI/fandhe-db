@@ -312,10 +312,9 @@ commit 番号・アーカイブと保持・復元手順・有効化境界・性�
 - `scripts/crash_test*.sh` 系への PITR シナリオ追加（#2170。CI ジョブ追加時は `github-actions.md`）
 - テストは RECOVER-14 等の ID に紐付ける
 
-
 ### D11 有効化の仕様・オラクル・エラー・性能の実測（Issue #3069）
 
-#2166 の完了条件に当たる実装メモ。D1 の層 3・D8・D9・D10 を満たす。
+Issue #2166 の完了条件に当たる実装メモ。D1 の層 3・D8・D9・D10 を満たす。
 
 #### 有効化と再起動の扱い
 
@@ -338,6 +337,7 @@ commit 番号・アーカイブと保持・復元手順・有効化境界・性�
 #### エラーの分離（判断）
 
 **`StorageError::CommitFootprintUnrecordable`（`wire_code` は `54000`）のまま分けない。** 理由:
+
 1. `StorageError`・`CatalogError` は `#[non_exhaustive]` ではなく、variant の追加は公開 API の
    破壊（`OpenWithEngineError` を別型にした前例と同じ判断）。写像の腕も `sql/ddl.rs` の 16 箇所ほか
    `catalog.rs`・`exec.rs`・`transaction.rs` に及ぶ
