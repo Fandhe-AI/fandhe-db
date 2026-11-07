@@ -30,8 +30,11 @@
 //!   可読性のみ項目 1 で確認する）
 //! - 操作 ID 台帳・バッチ台帳・世代カウンタ・索引カタログ: 他のデータから導出できる不変条件が無い
 //! - 行を 1 件も持たないテナントに残る索引エントリ: 衛生指標で、行から辿れる範囲だけを検査する
-//! - 一度も行が書かれていない表の行ストアの不在: 作成直後の表は行ストアを持たない設計のため、
-//!   一意索引・GIN 索引に行の痕跡がある場合に限り欠落として報告する
+//! - 行ストアの消失の検出には限界がある（作成直後の表は行ストアを持たない設計のため）。行を書いた
+//!   証拠があるときだけ `RowStoreMissing` とする: 採番方式の表は rowid 採番状態（挿入と同じ Tx で書かれ、
+//!   行を消しても残る）、全方式で一意索引・GIN 索引の行の痕跡。従来方式・移行済みの表で索引にも
+//!   痕跡が無い場合は、消失を検出できない。行ストアが無ければ `RowStoreAbsentUnverified`（Warning）で
+//!   運用者に見せるだけで、整合の判定は覆さない
 //!
 //! # 重大度と fail-closed
 //!
@@ -75,7 +78,8 @@ const MAX_PARTITIONS: u32 = 64;
 pub struct IntegrityOptions {
     /// 報告に載せる (種類, 表) の組の最大数。超えた分は載せず `findings_truncated` を立てる。
     pub max_finding_groups: usize,
-    /// 重複・参照先キーの集合に使うバイト数の上限（1 つの走査あたり）。
+    /// 重複・参照先キーの集合に使うバイト数の上限（1 つの走査あたり）。キーの長さに 1 エントリあたりの
+    /// 管理コストを足した概算の目安で、厳密な実メモリ上限ではない。
     pub memory_budget_bytes: usize,
 }
 
@@ -90,6 +94,7 @@ impl Default for IntegrityOptions {
 
 /// 報告の重大度。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
 pub enum Severity {
     /// 矛盾（整合していない）。
     Error,
@@ -101,6 +106,7 @@ pub enum Severity {
 
 /// 報告の種類。`code()` は運用ツール向けの安定した識別子。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
 pub enum FindingKind {
     /// カタログのエントリを復号できない。
     CatalogEntryUndecodable,
@@ -134,6 +140,9 @@ pub enum FindingKind {
     ForeignKeyParentMissing,
     /// 採番方式の表の rowid 採番状態が既存の最大 rowid より進んでいない。
     RowIdAllocatorBehind,
+    /// 従来方式・移行済みの表の行ストアが無く、行を書いた証拠も無い（作成直後の表と区別できない）。
+    /// 消失の検出ではなく、運用者に見せるための警告。
+    RowStoreAbsentUnverified,
     /// 未対応の表（multimap、または型の組の一覧にない型）。
     UnsupportedTableType,
     /// 表の全エントリを読めなかった。
@@ -164,9 +173,10 @@ impl FindingKind {
             | ForeignKeyOrphanRow
             | ForeignKeyParentMissing
             | RowIdAllocatorBehind => Severity::Error,
-            UniqueIndexEntryDangling | GinIndexEntryDangling | IndexRebuildPending => {
-                Severity::Warning
-            }
+            UniqueIndexEntryDangling
+            | GinIndexEntryDangling
+            | IndexRebuildPending
+            | RowStoreAbsentUnverified => Severity::Warning,
             UnsupportedTableType | TableUnreadable | CheckUnavailable | CheckUnevaluable
             | CheckBudgetExceeded => Severity::Incomplete,
         }
@@ -192,6 +202,7 @@ impl FindingKind {
             ForeignKeyOrphanRow => "foreign_key_orphan_row",
             ForeignKeyParentMissing => "foreign_key_parent_missing",
             RowIdAllocatorBehind => "row_id_allocator_behind",
+            RowStoreAbsentUnverified => "row_store_absent_unverified",
             UnsupportedTableType => "unsupported_table_type",
             TableUnreadable => "table_unreadable",
             CheckUnavailable => "check_unavailable",
@@ -258,6 +269,7 @@ impl IntegrityReport {
 /// [`Storage::verify_integrity`] の失敗（検査を始められなかった）。個々の表の読み取り失敗は
 /// 報告の `Incomplete` として返り、本エラーにはならない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum IntegrityError {
     /// 読み取りトランザクションを開始できなかった。
     Backend,
@@ -385,7 +397,8 @@ impl Storage {
     ///
     /// 戻り値の [`IntegrityReport::is_consistent`] が真のときだけ「整合」と言える。個々の表の読み取り
     /// 失敗・未対応の型・予算超過は `Err` ではなく `Incomplete` の報告として返る（黙って飛ばさない）。
-    /// 報告に行の値・キー・テナント名は含まれず、ログにも出さない。
+    /// 報告に行の値・キー・テナント名は含まれず、ログにも出さない。検査は読み取りトランザクションを
+    /// 保持して走るため、稼働中に長く走ると redb が旧ページを解放できず、その間ファイルが膨らむ。
     pub fn verify_integrity(
         &self,
         options: &IntegrityOptions,
@@ -506,11 +519,17 @@ fn check_table(
     let rows: RowsRo = match read.open_table(catalog::user_rows_table_def(&rows_name)) {
         Ok(t) => t,
         Err(redb::TableError::TableDoesNotExist(_)) => {
-            // 行ストアは初回の挿入まで作られない設計。索引に行の痕跡があるときだけ欠落とする。
-            let mut evidence = match &uniq {
-                Some(u) => has_entry_with_tag(u, 0x01)?,
-                None => false,
-            };
+            // 行ストアは初回の挿入まで作られない設計。行を書いた証拠があるときだけ欠落とする。
+            // 証拠 1: 採番方式の表は、挿入と同じ Tx で rowid 採番状態が書かれ、行を消しても残る
+            // （表の削除で消え、改名で新名へ移る: `catalog::rowid_alloc`）。
+            let allocated = matches!(schema.row_identity(), catalog::RowIdentity::Allocated);
+            let mut evidence = allocated && has_rowid_state(read, key)?;
+            // 証拠 2: 索引に行の痕跡（正引き・ポスティング）がある。
+            evidence = evidence
+                || match &uniq {
+                    Some(u) => has_entry_with_tag(u, 0x01)?,
+                    None => false,
+                };
             for decl in &decls.gins {
                 let name = catalog::user_gin_table_name(&decl.index_name);
                 match read.open_table(catalog::user_gin_table_def(&name)) {
@@ -521,6 +540,9 @@ fn check_table(
             }
             if evidence {
                 c.add(FindingKind::RowStoreMissing, Some(key), 1);
+            } else if !allocated {
+                // 従来方式・移行済みの表は行を書いた証拠が残らず、作成直後の表と区別できない。
+                c.add(FindingKind::RowStoreAbsentUnverified, Some(key), 1);
             }
             return Ok(());
         }
@@ -590,7 +612,7 @@ fn check_table(
             c.add(FindingKind::CheckUnevaluable, Some(key), unevaluable);
         }
         for fk in &fks {
-            check_foreign_key(read, schema, fk, &rows, &tenant, key, options, c)?;
+            check_foreign_key(schema, fk, &rows, &tenant, key, options, c)?;
         }
         if allocated {
             let max = rows
@@ -615,6 +637,20 @@ fn check_table(
         after = Some(tenant);
     }
     Ok(())
+}
+
+/// 採番方式の表 `key` の rowid 採番状態が 1 件でもあるか（先頭 1 件だけ見る）。
+fn has_rowid_state(read: &ReadTransaction, key: &str) -> Result<bool, ReadFail> {
+    let state = match read.open_table(catalog::rowid_alloc::ROWID_STATE_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
+        Err(_) => return Err(ReadFail),
+    };
+    let found = match state.range((key, "")..)?.next() {
+        Some(entry) => entry?.0.value().0 == key,
+        None => false,
+    };
+    Ok(found)
 }
 
 /// 索引表に先頭バイトが `tag` のサブキーのエントリが 1 つでもあるか。
@@ -741,8 +777,12 @@ fn resolve_foreign_keys<'a>(
         } else {
             match catalog::get_table_schema_in_txn(read, fk.parent_table()) {
                 Ok(s) => s,
-                Err(_) => {
+                Err(catalog::CatalogError::TableNotFound(_)) => {
                     c.add(FindingKind::ForeignKeyParentMissing, Some(key), 1);
+                    continue;
+                }
+                Err(_) => {
+                    c.add(FindingKind::CheckUnavailable, Some(key), 1);
                     continue;
                 }
             }
@@ -768,7 +808,6 @@ fn resolve_foreign_keys<'a>(
 /// 項目 7: 子表 1 つ・FK 1 つ・テナント 1 つの孤児行。
 #[allow(clippy::too_many_arguments)] // 走査ドライバ内の検査部品。表・テナント・資源上限を明示する。
 fn check_foreign_key(
-    _read: &ReadTransaction,
     schema: &TableSchema,
     fk: &ResolvedFk<'_>,
     rows: &RowsRo,

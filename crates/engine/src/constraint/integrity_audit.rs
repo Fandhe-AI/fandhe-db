@@ -27,8 +27,9 @@ use crate::catalog::{ForeignKeyDef, TableSchema};
 use crate::storage::rowid::{row_key, split_row_key, RowId};
 use crate::tenant::TenantWriteError;
 
-/// 集合の 1 エントリあたりの管理コストの見積り（バイト。予算計上用の保守的な定数）。
-const ENTRY_OVERHEAD: usize = 64;
+/// 集合の 1 エントリあたりの管理コストの見積り（バイト。キーの `Vec` ヘッダ・ハッシュ表のスロットと
+/// 拡張時の余裕を見込んだ概算で、予算計上用の保守的な定数）。
+const ENTRY_OVERHEAD: usize = 96;
 
 /// 予算付きの 1 回の走査の結果。
 pub(crate) enum PassResult<T> {
@@ -130,15 +131,15 @@ where
         };
         for (ordinal, key) in keys.into_iter().enumerate() {
             let Some(key) = key else { continue };
-            if part_of(&key, parts) != part {
-                continue;
-            }
             let Ok(ordinal_u16) = u16::try_from(ordinal) else {
                 if part == 0 {
                     counts.unevaluable = counts.unevaluable.saturating_add(1);
                 }
                 continue;
             };
+            if part_of(&key, parts) != part {
+                continue;
+            }
             used = used.saturating_add(key.len().saturating_add(ENTRY_OVERHEAD));
             if used > budget_bytes {
                 return Ok(PassResult::OverBudget);
@@ -266,8 +267,16 @@ where
                     }
                     continue;
                 };
-                let Ok(Some(key)) = key_bytes(&pspec, &values) else {
-                    continue;
+                let key = match key_bytes(&pspec, &values) {
+                    Ok(Some(key)) => key,
+                    // 構成列が NULL の行は参照先になり得ない（MATCH SIMPLE）。
+                    Ok(None) => continue,
+                    Err(_) => {
+                        if part == 0 {
+                            counts.unevaluable = counts.unevaluable.saturating_add(1);
+                        }
+                        continue;
+                    }
                 };
                 if part_of(&key, parts) != part {
                     continue;

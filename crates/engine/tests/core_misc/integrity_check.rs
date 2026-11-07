@@ -333,7 +333,7 @@ fn orphan_foreign_key_rows_are_counted_per_tenant() {
     let tight = verify_with(
         &path,
         &IntegrityOptions {
-            memory_budget_bytes: 200,
+            memory_budget_bytes: 400,
             ..IntegrityOptions::default()
         },
     );
@@ -494,7 +494,7 @@ fn small_memory_budget_partitions_the_scan_without_changing_results() {
     });
     let tight = IntegrityOptions {
         // 1〜2 エントリ分。テナントの全キーを一度には持てず、複数の分割に分けて走査される。
-        memory_budget_bytes: 200,
+        memory_budget_bytes: 400,
         ..IntegrityOptions::default()
     };
     let a = verify_with(&path, &tight);
@@ -644,4 +644,161 @@ fn orphan_of_an_id_referencing_foreign_key_is_reported() {
     let report = verify(&path);
     assert_eq!(report.total(FindingKind::ForeignKeyOrphanRow), 1);
     assert!(!report.is_consistent());
+}
+
+fn core_at(path: &Path) -> EngineCore {
+    EngineCore::from_storage(
+        Storage::open(path).expect("open"),
+        Box::new(CpuScalarProvider),
+    )
+}
+
+const PLAIN_ROWS: Rows = TableDefinition::new("user_rows/plain");
+
+#[test]
+fn row_store_missing_is_detected_for_allocated_table_without_indexes() {
+    // 行を入れたまま行ストアが消えた場合。
+    let path = unique_db_path("integrity-alloc-kept");
+    let _g = CleanupGuard(path.clone());
+    {
+        let core = core_at(&path);
+        run(&core, TENANTS[0], "CREATE TABLE plain (a TEXT, b TEXT)");
+        run(
+            &core,
+            TENANTS[0],
+            "INSERT INTO plain (a, b) VALUES ('x', 'y')",
+        );
+    }
+    assert!(verify(&path).findings.is_empty());
+    corrupt(&path, |w| {
+        w.delete_table(PLAIN_ROWS).expect("delete rows table");
+    });
+    let report = verify(&path);
+    assert_eq!(report.total(FindingKind::RowStoreMissing), 1);
+    assert!(!report.is_consistent());
+
+    // 行を全削除した後で行ストアが消えた場合（採番状態は行を消しても残る）。
+    let path = unique_db_path("integrity-alloc-emptied");
+    let _g2 = CleanupGuard(path.clone());
+    {
+        let core = core_at(&path);
+        run(&core, TENANTS[0], "CREATE TABLE plain (a TEXT, b TEXT)");
+        run(
+            &core,
+            TENANTS[0],
+            "INSERT INTO plain (a, b) VALUES ('x', 'y')",
+        );
+        run(&core, TENANTS[0], "DELETE FROM plain WHERE a = 'x'");
+    }
+    assert!(verify(&path).findings.is_empty());
+    corrupt(&path, |w| {
+        w.delete_table(PLAIN_ROWS).expect("delete rows table");
+    });
+    let report = verify(&path);
+    assert_eq!(report.total(FindingKind::RowStoreMissing), 1);
+    assert!(!report.is_consistent());
+}
+
+#[test]
+fn never_written_allocated_table_reports_nothing() {
+    let path = unique_db_path("integrity-alloc-unwritten");
+    let _g = CleanupGuard(path.clone());
+    {
+        let core = core_at(&path);
+        run(&core, TENANTS[0], "CREATE TABLE plain (a TEXT, b TEXT)");
+    }
+    let report = verify(&path);
+    assert!(report.findings.is_empty(), "{:?}", report.findings);
+    assert!(report.is_consistent());
+}
+
+#[test]
+fn absent_row_store_of_legacy_table_is_a_warning_only() {
+    let path = unique_db_path("integrity-legacy-absent");
+    let _g = CleanupGuard(path.clone());
+    {
+        let core = core_at(&path);
+        crate::legacy_table::create_legacy_table(
+            &core,
+            &ctx(TENANTS[0]),
+            "CREATE TABLE legacy_only (note TEXT)",
+        )
+        .expect("create legacy");
+    }
+    let report = verify(&path);
+    assert_eq!(report.total(FindingKind::RowStoreAbsentUnverified), 1);
+    assert_eq!(report.total(FindingKind::RowStoreMissing), 0);
+    assert_eq!(
+        FindingKind::RowStoreAbsentUnverified.severity(),
+        Severity::Warning
+    );
+    // 消失とは区別できないため警告にとどめ、整合の判定は覆さない（検出できているわけではない）。
+    assert!(report.is_consistent());
+}
+
+/// 正常な DB で、複合キー・自己参照・ALTER で足した FK・NULL を含む子行が誤検知にならない。
+#[test]
+fn foreign_key_shapes_are_not_false_positives_and_orphans_are_found() {
+    let path = unique_db_path("integrity-fk-shapes");
+    let _g = CleanupGuard(path.clone());
+    {
+        let core = core_at(&path);
+        for t in TENANTS {
+            if t == TENANTS[0] {
+                for sql in [
+                    "CREATE TABLE cp (a TEXT NOT NULL, b INTEGER NOT NULL, PRIMARY KEY (a, b))",
+                    "CREATE TABLE cc (k TEXT NOT NULL PRIMARY KEY, a TEXT, b INTEGER, \
+                     FOREIGN KEY (a, b) REFERENCES cp (a, b))",
+                    "CREATE TABLE tree (n TEXT NOT NULL PRIMARY KEY, parent TEXT REFERENCES tree(n))",
+                    "CREATE TABLE late (k TEXT NOT NULL PRIMARY KEY, pc TEXT)",
+                ] {
+                    run(&core, t, sql);
+                }
+            }
+            for sql in [
+                "INSERT INTO cp (a, b) VALUES ('x', 1)",
+                "INSERT INTO cp (a, b) VALUES ('x', 2)",
+                "INSERT INTO cc (k, a, b) VALUES ('c1', 'x', 1)",
+                "INSERT INTO cc (k, a, b) VALUES ('c2', NULL, NULL)",
+                "INSERT INTO cc (k, a, b) VALUES ('c3', 'zz', NULL)",
+                "INSERT INTO tree (n, parent) VALUES ('root', NULL)",
+                "INSERT INTO tree (n, parent) VALUES ('leaf', 'root')",
+                "INSERT INTO late (k, pc) VALUES ('l1', 'x')",
+                "INSERT INTO late (k, pc) VALUES ('l2', NULL)",
+            ] {
+                run(&core, t, sql);
+            }
+        }
+        run(
+            &core,
+            TENANTS[0],
+            "CREATE TABLE lp (code TEXT NOT NULL PRIMARY KEY)",
+        );
+        run(&core, TENANTS[0], "INSERT INTO lp (code) VALUES ('x')");
+        run(&core, TENANTS[1], "INSERT INTO lp (code) VALUES ('x')");
+        run(
+            &core,
+            TENANTS[0],
+            "ALTER TABLE late ADD FOREIGN KEY (pc) REFERENCES lp (code)",
+        );
+    }
+    let healthy = verify(&path);
+    assert!(healthy.findings.is_empty(), "{:?}", healthy.findings);
+    assert!(healthy.is_consistent());
+
+    // 複合キーの親と自己参照の親を消すと、それぞれの子が孤児になる（NULL を含む子は数えない）。
+    let (cp_rowid, _) = first_row(&path, TableDefinition::new("user_rows/cp"), TENANTS[0]);
+    let (tree_rowid, _) = first_row(&path, TableDefinition::new("user_rows/tree"), TENANTS[0]);
+    corrupt(&path, |w| {
+        let mut t = w
+            .open_table(TableDefinition::<(&str, u64), &[u8]>::new("user_rows/cp"))
+            .expect("cp");
+        t.remove((TENANTS[0], cp_rowid)).expect("remove cp");
+        let mut t = w
+            .open_table(TableDefinition::<(&str, u64), &[u8]>::new("user_rows/tree"))
+            .expect("tree");
+        t.remove((TENANTS[0], tree_rowid)).expect("remove root");
+    });
+    let report = verify(&path);
+    assert_eq!(report.total(FindingKind::ForeignKeyOrphanRow), 2);
 }
