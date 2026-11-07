@@ -113,6 +113,7 @@ fn storage_tables_are_classified_and_unknown_ones_fail_closed() {
         "user_rows/t",
         "user_uniq/t",
         "key_index/t/i",
+        "key_index_rev/t/i",
         "matview_rows/m",
         "op_ledger",
     ] {

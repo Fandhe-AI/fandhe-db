@@ -7,12 +7,15 @@ mod common;
 mod http_common;
 // `http_common` が `temp_db` を取り込んでいるため、二重取り込み（`clippy::duplicate_mod`）を避けて再公開名で参照する。
 use http_common::temp_db;
+#[path = "../../../engine/src/test_util/dump_fixture.rs"]
+mod dump_fixture;
 #[path = "../common/tls_client.rs"]
 mod tls_client;
 
 mod backup_cli;
 mod batch_max_files_parity;
 mod dump_cli;
+mod dump_roundtrip_cli;
 mod incremental_backup_cli;
 mod persist4_second_server_same_db;
 mod recover12_explicit_txn_resend;
