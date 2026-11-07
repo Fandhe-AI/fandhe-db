@@ -1,7 +1,7 @@
 //! `wire-server dump` の実行本体（Issue #2162・RECOVER-16 ポインタ。方式は
 //! `docs/design/logical-dump.md` の第 12 節）。
 //!
-//! 責務境界: 検証済みの [`DumpArgs`] を engine の書き出し入口（`EngineCore::export_schema_ddl`・
+//! 責務境界: 検証済みの [`DumpArgs`] を engine の書き出し入口（`Storage::export_schema_ddl`・
 //! `export_table_data`・`export_logical_dump`）へ写し、渡された断片を [`crate::dump_file`] の形式で
 //! 0600 の一時名へ書き、成功したときだけ [`crate::dump_tmp`] で最終名へ公開する。`main.rs` の
 //! `run_dump` が呼ぶ。失敗時は一時ファイルを消し、何も公開しない（途中までの断片は不完全なため）。
@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use engine::catalog::ddl_export::{
     LogicalDumpItem, SchemaDdlError, SchemaDdlScope, TableDataFormat, TableDataPart,
 };
-use engine::core::EngineCore;
+use engine::storage::Storage;
 
 use crate::dump_file::{FileError, FileWriter, Header, StmtKind};
 use crate::dump_opt::{
@@ -132,8 +132,8 @@ pub fn dump(args: &DumpArgs, leftover: &mut Option<PathBuf>) -> Result<DumpSumma
     if std::fs::symlink_metadata(&args.out).is_ok() {
         return Err(DumpError::Tmp(TmpError::InvalidDestination));
     }
-    let core = EngineCore::open(&args.db).map_err(|e| {
-        if e.to_string().contains("already open") {
+    let core = Storage::open(&args.db).map_err(|e| {
+        if crate::backup_opt::is_already_open(&e) {
             DumpError::InUse
         } else {
             DumpError::OpenFailed
@@ -149,7 +149,7 @@ pub fn dump(args: &DumpArgs, leftover: &mut Option<PathBuf>) -> Result<DumpSumma
 }
 
 fn write_and_publish(
-    core: &EngineCore,
+    core: &Storage,
     args: &DumpArgs,
     tmp: &mut TempFile,
 ) -> Result<DumpSummary, DumpError> {

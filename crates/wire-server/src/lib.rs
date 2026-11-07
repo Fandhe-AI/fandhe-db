@@ -162,7 +162,7 @@ pub mod dump_restore;
 #[cfg(unix)]
 pub mod dump_run;
 #[cfg(unix)]
-pub mod dump_tmp;
+pub(crate) mod dump_tmp;
 pub mod durability_opt;
 pub mod english_stemmer_opt;
 pub mod error_response;
