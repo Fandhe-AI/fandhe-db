@@ -316,6 +316,9 @@ struct Inflight {
 const CUT_NONE: u8 = 0;
 const CUT_ACK_TIMEOUT: u8 = 1;
 const CUT_LAG: u8 = 2;
+const CUT_INTERNAL: u8 = 3;
+/// 監視がプライマリの最新 LSN を読み直す間隔。送信ループの状態（窓が満杯・書き込みが塞がる）に依らず遅れを判定する。
+const LAG_POLL: Duration = Duration::from_millis(100);
 
 struct Shared {
     inflight: Mutex<Inflight>,
@@ -325,8 +328,6 @@ struct Shared {
     done: AtomicBool,
     /// 監視が決めた切断の理由。
     cut: std::sync::atomic::AtomicU8,
-    /// 書き込み側が最後に見たプライマリの最新 LSN（遅れの計算用）。
-    current_lsn: std::sync::atomic::AtomicU64,
 }
 
 impl Shared {
@@ -367,12 +368,26 @@ fn read_acks(stream: &TcpStream, shared: &Shared, pin: &engine::storage::Replica
 /// 最も古い未確認レコードが送信を始めてから `ack_timeout` を超えた、またはプライマリの最新との差（確認応答済みの
 /// 位置からの遅れ）が `max_lag_records` を超えたら切断の理由を立てる。送信ループが [`NOTICE_TIMEOUT`] の
 /// うちに通知を書いて抜けなければ、`shutdown` でブロックを解く。
-fn watchdog(stream: &TcpStream, shared: &Shared, cfg: &ReplicationSettings) {
+fn watchdog(stream: &TcpStream, core: &EngineCore, shared: &Shared, cfg: &ReplicationSettings) {
+    // プライマリの最新 LSN は送信ループのキャッシュに頼らず、この監視が read トランザクションで自分で読む
+    // （窓が満杯・書き込みが塞がって送信ループが読まない間も遅れを判定するため）。取得に失敗したら
+    // 保持位置を無期限に残さないよう、fail-closed に切断する。
+    let mut current = applied_floor(shared);
+    let mut last_poll: Option<Instant> = None;
     while !shared.done.load(Ordering::Acquire) && !shared.failed.load(Ordering::Acquire) {
         std::thread::sleep(WATCHDOG_STEP);
-        let reason = {
+        let mut poll_failed = false;
+        if last_poll.is_none_or(|t| t.elapsed() >= LAG_POLL) {
+            last_poll = Some(Instant::now());
+            match core.read_change_log_from(0, 0, 0) {
+                Ok(b) => current = b.current_lsn,
+                Err(_) => poll_failed = true,
+            }
+        }
+        let reason = if poll_failed {
+            CUT_INTERNAL
+        } else {
             let g = shared.lock();
-            let current = shared.current_lsn.load(Ordering::Acquire);
             if g.queue
                 .front()
                 .is_some_and(|(_, _, at)| at.elapsed() >= cfg.ack_timeout)
@@ -395,6 +410,11 @@ fn watchdog(stream: &TcpStream, shared: &Shared, cfg: &ReplicationSettings) {
         let _ = stream.shutdown(Shutdown::Both);
         return;
     }
+}
+
+/// 監視の最初の「最新 LSN」の仮置き（確認応答済みの位置。最初の取得までは遅れ 0 とみなす）。
+fn applied_floor(shared: &Shared) -> u64 {
+    shared.lock().acked
 }
 
 /// `StreamError` を `E` のコードへ写す。
@@ -539,7 +559,6 @@ fn stream_loop(
         failed: AtomicBool::new(false),
         done: AtomicBool::new(false),
         cut: std::sync::atomic::AtomicU8::new(CUT_NONE),
-        current_lsn: std::sync::atomic::AtomicU64::new(applied),
     };
     let Ok(clone) = stream.try_clone() else {
         return "internal error";
@@ -547,7 +566,7 @@ fn stream_loop(
     std::thread::scope(|scope| {
         let (shared, clone) = (&shared, &clone);
         scope.spawn(move || read_acks(clone, shared, pin));
-        scope.spawn(move || watchdog(clone, shared, cfg));
+        scope.spawn(move || watchdog(clone, core, shared, cfg));
         let reason = send_records(stream, core, cfg, applied, shared);
         shared.done.store(true, Ordering::Release);
         let _ = stream.shutdown(Shutdown::Both);
@@ -582,6 +601,10 @@ fn send_records(
                 send_error(stream, code::RESYNC_REQUIRED);
                 return "replica lag limit exceeded";
             }
+            CUT_INTERNAL => {
+                send_error(stream, code::INTERNAL);
+                return "log position unavailable";
+            }
             _ => {}
         }
         if shared.failed.load(Ordering::Acquire) {
@@ -606,7 +629,6 @@ fn send_records(
         let mut current = next;
         if let Some(batch) = batch {
             current = batch.current_lsn;
-            shared.current_lsn.store(current, Ordering::Release);
             let mut pending = inflight_bytes;
             for (lsn, bytes) in &batch.records {
                 let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);

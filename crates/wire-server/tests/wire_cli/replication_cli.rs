@@ -889,3 +889,38 @@ fn recover15_replica_beyond_the_lag_limit_is_cut() {
     let (_, _, current) = probe.login(ROLE, ROLE_PW);
     assert!(!resync_required_from(&p, current.saturating_sub(1)));
 }
+
+/// 送信ウィンドウが満杯で送信ループがログを読まない間も、監視がプライマリの最新 LSN を自分で読んで遅れを判定する。
+/// `ack_timeout` を大きくして、切断が遅れの上限によるものだと区別できるようにする。
+#[test]
+fn recover15_lag_limit_applies_while_the_send_window_is_full() {
+    let p = Primary::start(
+        "repl-lag-window",
+        &[
+            "--replication-max-unacked-bytes",
+            "1024",
+            "--replication-max-lag-records",
+            "3",
+            "--replication-ack-timeout-secs",
+            "600",
+        ],
+        true,
+    );
+    let (mut r, base) = begin_at_current(&p);
+    let mut alice = p.setup_table();
+    // ウィンドウ（1024 バイト）が埋まって送信が止まった後も、commit を積み続ける。
+    for id in 1..=12 {
+        alice.insert(id);
+    }
+    let started = Instant::now();
+    assert_eq!(r.drain_until_closed(), Some(E_RESYNC));
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "cut by the lag limit, far earlier than the ack timeout"
+    );
+    wait_until(
+        "the released retention floor to let pruning proceed",
+        Duration::from_secs(30),
+        || resync_required_from(&p, base),
+    );
+}
