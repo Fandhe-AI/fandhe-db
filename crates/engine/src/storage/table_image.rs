@@ -641,6 +641,46 @@ pub(crate) fn apply(writer: &WriteTransaction, image: &TableImage) -> Result<(),
     Ok(())
 }
 
+/// 変更ログのレコードの 1 表分（`storage::change_log::incremental` が増分バックアップを適用する）を
+/// writer へ適用する。表が無ければ `shape` の型の組で作り（行が無くても空の表を作る）、`removes` →
+/// `upserts` の順で反映する。既存の表の型が `shape` と合わなければ `ImageError`（`TableTypeMismatch`）。
+/// 呼び出し側は表の有無（作成か変更か）の整合を事前に検査する。
+pub(crate) fn apply_change(
+    writer: &WriteTransaction,
+    name: &str,
+    shape: usize,
+    upserts: Vec<(Vec<u8>, Vec<u8>)>,
+    removes: Vec<Vec<u8>>,
+) -> Result<(), ImageError> {
+    let shape_ops = SHAPES.get(shape).ok_or(ImageError)?;
+    (shape_ops.apply)(
+        writer,
+        &TableDelta {
+            name: name.to_string(),
+            shape,
+            upserts,
+            removes,
+        },
+    )
+}
+
+/// writer の `name` の表を削除する。無ければ `Ok(false)`（呼び出し側が整合を判断する）。
+pub(crate) fn drop_table_named(writer: &WriteTransaction, name: &str) -> Result<bool, ImageError> {
+    let handle = writer
+        .list_tables()
+        .map_err(|_| ImageError)?
+        .find(|h| h.name() == name);
+    match handle {
+        Some(h) => writer.delete_table_logged(h).map_err(|_| ImageError),
+        None => Ok(false),
+    }
+}
+
+/// [`SHAPES`] の件数。レコードの shape 番号の上限検証に使う。
+pub(crate) fn shapes_len() -> usize {
+    SHAPES.len()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
