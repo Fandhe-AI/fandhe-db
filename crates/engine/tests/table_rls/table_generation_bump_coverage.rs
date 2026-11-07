@@ -90,17 +90,18 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #3068（書き込み点の移行。各ファイルへの `CaptureWriteTxn` の import 追加と、`*_logged` への置換に
     // 伴う rustfmt の折り返しで行番号が移動したための追随。以降の `catalog.rs`・`tenant.rs`・
     // `catalog/*.rs` の各エントリも同じ理由で移動している）。
-    ("storage.rs", 1276),
-    ("storage.rs", 1310),
+    // Issue #3069（`change_log_on_disk`・連続性検査・保留した移行の追加）で行番号が移動したための追随。
+    ("storage.rs", 1348),
+    ("storage.rs", 1382),
     // Issue #3067: `Storage::enable_change_log` が DB 識別子の永続化に使う保守 commit
     // （`commit_boundary::commit_maintenance`）。書き込むのは `change_log_meta` 表だけで、`CATALOG_TABLE`・
     // `user_rows` には触れず、世代も進めない（バンプ対象の表が構造的に存在しない）。
-    ("storage.rs", 1145),
+    ("storage.rs", 1183),
     // Issue #3067: `storage/change_log.rs` のテスト内の commit 入口（`commit_result`・`commit_maint`）。
     // 変更ログの `change_log` 表・メタ表と任意の試験用 redb 表だけを書くテスト fixture で、
     // `user_rows/{table_name}` を経由しないため対象外。
-    ("storage/change_log.rs", 1331),
-    ("storage/change_log.rs", 1339),
+    ("storage/change_log.rs", 1471),
+    ("storage/change_log.rs", 1479),
     ("recovery/panic_hook.rs", 404),
     ("txn.rs", 211),
     ("txn.rs", 388),

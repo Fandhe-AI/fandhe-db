@@ -23,8 +23,15 @@
 //! commit 前の検査（D1 の層 2）は [`CaptureSession::prepare`] の中の `verify_footprint` で、論理表名から
 //! 物理表名を引く対応関数（`physical_row_store`）を経由して行う。
 //!
-//! 有効化の入口（`Storage::enable_change_log`）は crate 内に閉じ、運用者の CLI からは拒否される
-//! （オラクル試験と有効化は #3069）。そのため未使用項目の警告を抑止している。
+//! 有効化の入口は公開の `Storage::enable_change_log`（wire-server の `--change-log` が呼ぶ。Issue #3069）。
+//! 一度有効にした DB は、有効にしない起動からの書き込みを `54000` で拒否し、再有効化では記録の連続性
+//! （最後のレコードの LSN か初回有効化時の世代が現在の世代と一致すること）を検査する（D8・D11）。
+//! 未使用項目の警告は、後続（アーカイブ・復元）が使う項目があるため抑止している。
+//!
+//! # オラクル試験（D1 の層 3）
+//!
+//! [`oracle`] が各 commit のレコードを `table_image::capture` の実差分と突き合わせる（`cfg(test)` と
+//! feature `change-log-oracle` の下だけ。製品ビルドには存在しない）。場面集は `oracle_tests`。
 //!
 //! # 記録範囲の例外
 //!
@@ -51,6 +58,11 @@ use redb::{
     Key, MutInPlaceValue, ReadableTable, ReadableTableMetadata, TableDefinition, TableHandle, Value,
 };
 
+#[cfg(any(test, feature = "change-log-oracle"))]
+pub(crate) mod oracle;
+#[cfg(test)]
+mod oracle_tests;
+
 use super::table_image::{self, AfterImage, Meter, ReadMode, ReadOutcome};
 use super::{Result, StorageError, GENERATION_KEY, GENERATION_TABLE};
 
@@ -63,6 +75,9 @@ const CHANGE_LOG_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new(CHANG
 const META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new(CHANGE_LOG_META_TABLE_NAME);
 const META_KEY_DB_ID: &str = "db_id";
 const META_KEY_TIMELINE: &str = "timeline";
+/// 変更ログを初めて有効にした時点の `storage_generation`。これ以前の変更は記録されない（D8）。
+/// 再有効化時の連続性検査（最後のレコードの LSN か本値が現在の世代と一致するか）の起点になる。
+const META_KEY_BASE_GENERATION: &str = "base_generation";
 
 /// timeline の初期値（PITR・復元のたびに分岐する番号。#2446 と整合させる決め方は後続）。
 pub(crate) const INITIAL_TIMELINE: u64 = 1;
@@ -83,6 +98,64 @@ const HEADER_LEN: usize = 4 + 2 + DB_ID_LEN + 8 + 8 + 8 + 8 + 4 + 4;
 /// 変更ログが記録対象から外す redb 表か（本体表とメタ表。D3 の記録範囲の例外）。
 pub(crate) fn is_excluded_table(name: &str) -> bool {
     name == CHANGE_LOG_TABLE_NAME || name == CHANGE_LOG_META_TABLE_NAME
+}
+
+// ---------------------------------------------------------------------------
+// 拒否の原因（運用者向けの分類）
+// ---------------------------------------------------------------------------
+
+/// commit 前拒否の原因。クライアントへ返すエラーは常に `StorageError::CommitFootprintUnrecordable`
+/// （`wire_code` は `54000`）に固定し、運用者が原因を区別できるよう、固定文言を stderr へ 1 行出す。
+/// 文言に表名・テナント ID・件数・LSN を含めない。同じ秒内の重複は出さない（利用者の連続した
+/// 拒否でログを溢れさせない）。専用の `StorageError` の variant を足さない理由は設計書の D11 を参照。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Unrecordable {
+    /// frame のキー数・バイト数・イベント数の上限超過、ロック汚染、公開表の満杯。
+    FrameLimit,
+    /// multimap 表が存在する（記録できない型）。
+    Multimap,
+    /// 層 2 の検査で捕捉を通らない書き込み・表操作を検出した。
+    Uncaptured,
+    /// after-image を読めない（未知の型の表・読み取り失敗・ペイロード上限超過）。
+    AfterImage,
+    /// レコードがペイロード・要素数の上限を超える、または符号化できない。
+    Record,
+    /// 世代の算術・時計の取得に失敗した。
+    Clock,
+    /// 変更ログを有効にしていない起動が、有効化済みの DB へ書こうとした。
+    DisabledOnEnabledDb,
+}
+
+impl Unrecordable {
+    fn text(self) -> &'static str {
+        match self {
+            Self::FrameLimit => "capture limit exceeded (keys, events or table registry)",
+            Self::Multimap => "multimap tables cannot be recorded",
+            Self::Uncaptured => "a write or table operation bypassed the capture wrappers",
+            Self::AfterImage => "after-image unreadable or over the payload limit",
+            Self::Record => "record exceeds the payload or element limit",
+            Self::Clock => "generation arithmetic or clock failure",
+            Self::DisabledOnEnabledDb => {
+                "this database has a change log but it is not enabled for this process"
+            }
+        }
+    }
+
+    /// 原因を stderr へ（同じ秒に 1 回まで）出して、クライアントへ返すエラーを作る。
+    pub(crate) fn refuse(self) -> StorageError {
+        // 抑止は原因ごと（ある原因の連続拒否で、別の原因の最初の 1 行が隠れない）。
+        const CAUSES: usize = 7;
+        static LAST_LOG_SECS: [std::sync::atomic::AtomicU64; CAUSES] =
+            [const { std::sync::atomic::AtomicU64::new(0) }; CAUSES];
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let slot = LAST_LOG_SECS.get(self as usize);
+        if slot.is_none_or(|l| l.swap(now, Ordering::Relaxed) != now) {
+            crate::log_stderr!("engine: change log: commit refused: {}", self.text());
+        }
+        StorageError::CommitFootprintUnrecordable
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -466,6 +539,7 @@ pub(crate) struct ChangeLogState {
 pub(crate) fn load_or_init_identity(
     write_txn: &redb::WriteTransaction,
     limits: CaptureLimits,
+    current_generation: u64,
 ) -> Result<(ChangeLogState, bool)> {
     // 許可（clippy::disallowed_methods）: メタ表は記録範囲の例外（D3）で、捕捉の対象外。
     #[allow(clippy::disallowed_methods)]
@@ -474,6 +548,9 @@ pub(crate) fn load_or_init_identity(
     // 読み取りの借用を閉じてから書く（`get` のガードは `meta` を借用する）。
     let stored_id: Option<Vec<u8>> = meta.get(META_KEY_DB_ID)?.map(|v| v.value().to_vec());
     let stored_timeline: Option<Vec<u8>> = meta.get(META_KEY_TIMELINE)?.map(|v| v.value().to_vec());
+    let stored_base: Option<Vec<u8>> = meta
+        .get(META_KEY_BASE_GENERATION)?
+        .map(|v| v.value().to_vec());
     let mut wrote = false;
     let db_id: [u8; DB_ID_LEN] = match stored_id {
         Some(v) => v.as_slice().try_into().map_err(|_| invalid())?,
@@ -495,6 +572,17 @@ pub(crate) fn load_or_init_identity(
             INITIAL_TIMELINE
         }
     };
+    if stored_base.is_none() {
+        // 初めて有効にした時点の世代。識別子だけが先に在って本値が無い DB（不整合）も、現在の世代で
+        // 起点を張り直すのではなく連続性検査（[`verify_continuity`]）が拒否する。
+        if !wrote {
+            return Err(invalid());
+        }
+        meta.insert(
+            META_KEY_BASE_GENERATION,
+            current_generation.to_le_bytes().as_slice(),
+        )?;
+    }
     Ok((
         ChangeLogState {
             db_id,
@@ -503,6 +591,48 @@ pub(crate) fn load_or_init_identity(
         },
         wrote,
     ))
+}
+
+/// この DB が変更ログを一度でも有効にしたか（メタ表に DB 識別子があるか）。`Storage` の open が
+/// 読み取りトランザクションで呼び、真なら有効にしない起動からの書き込みを拒否する（D8。レコードが
+/// 欠けたまま世代が進む LSN の欠落を作らない）。
+pub(crate) fn identity_present(db: &redb::Database) -> Result<bool> {
+    use redb::ReadableDatabase as _;
+    let read = db.begin_read()?;
+    match read.open_table(META_TABLE) {
+        Ok(t) => Ok(t.get(META_KEY_DB_ID)?.is_some()),
+        Err(redb::TableError::TableDoesNotExist(_)) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// 連続性の検査。最後のレコードの LSN（レコードが無ければ初回有効化時の世代）が現在の
+/// `storage_generation` と一致しなければ、無効のまま書かれた区間（LSN の欠落）があるため拒否する。
+/// 再有効化（`Storage::enable_change_log`）の前に呼ぶ。保持・削除（#2167）が最後のレコードを
+/// 消す設計にする場合は、削除前に最後の LSN を残す必要がある（本検査の前提）。
+pub(crate) fn verify_continuity(db: &redb::Database, current_generation: u64) -> Result<()> {
+    use redb::ReadableDatabase as _;
+    let broken = || StorageError::Codec("change log continuity broken".to_string());
+    let read = db.begin_read()?;
+    let base = match read.open_table(META_TABLE) {
+        Ok(t) => match t.get(META_KEY_BASE_GENERATION)? {
+            Some(v) => u64::from_le_bytes(v.value().try_into().map_err(|_| broken())?),
+            // 識別子はあるが起点が無い（想定外の不整合）。fail-closed に拒否する。
+            None => return Err(broken()),
+        },
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    let last = match read.open_table(CHANGE_LOG_TABLE) {
+        Ok(t) => t.last()?.map(|(k, _)| k.value()),
+        Err(redb::TableError::TableDoesNotExist(_)) => None,
+        Err(e) => return Err(e.into()),
+    };
+    if last.unwrap_or(base) == current_generation {
+        Ok(())
+    } else {
+        Err(broken())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -763,9 +893,9 @@ impl CaptureSession {
         let body = self.build_body(write_txn)?;
         let prev_lsn = g_c
             .checked_sub(1)
-            .ok_or(StorageError::CommitFootprintUnrecordable)?;
-        let commit_time_us = crate::sql::time_fn::now_micros()
-            .map_err(|_| StorageError::CommitFootprintUnrecordable)?;
+            .ok_or_else(|| Unrecordable::Clock.refuse())?;
+        let commit_time_us =
+            crate::sql::time_fn::now_micros().map_err(|_| Unrecordable::Clock.refuse())?;
         let header = RecordHeader {
             db_id: self.state.db_id,
             timeline: self.state.timeline,
@@ -780,27 +910,37 @@ impl CaptureSession {
             self.state.limits.max_payload_bytes,
             self.state.limits.max_record_elements,
         )
-        .map_err(|_| StorageError::CommitFootprintUnrecordable)?;
+        .map_err(|_| Unrecordable::Record.refuse())?;
         // 許可（clippy::disallowed_methods）: 本体表は記録範囲の例外（D3）。レコード自身を捕捉しない。
         #[allow(clippy::disallowed_methods)]
         let mut table = write_txn.open_table(CHANGE_LOG_TABLE)?;
         table.insert(g_c, bytes.as_slice())?;
+        drop(table);
+        // D1 の層 3: テストと oracle feature のビルドでは、追記したレコードを実差分と突き合わせる。
+        // 不一致は計装漏れ（fail-open）なので、隠さず panic で落とす（製品ビルドには存在しない）。
+        #[cfg(any(test, feature = "change-log-oracle"))]
+        if oracle::active() {
+            if let Err(msg) = oracle::verify_record(&self.base, write_txn, &bytes) {
+                panic!("change log oracle mismatch: {msg}");
+            }
+        }
         Ok(())
     }
 
     /// D1 の正規化。基底の表集合と最終の表集合の差から作成・削除を導き、作成・rename を経た表は
     /// 全行、それ以外は積まれたキーの現在値を読む。
     fn build_body(&self, write_txn: &redb::WriteTransaction) -> Result<RecordBody> {
-        let unrecordable = || StorageError::CommitFootprintUnrecordable;
+        let overflow = || Unrecordable::FrameLimit.refuse();
+        let multimap = || Unrecordable::Multimap.refuse();
         let st = self.frame.lock();
         if st.overflow {
-            return Err(unrecordable());
+            return Err(overflow());
         }
         // multimap 表は再生器が扱えないため、存在するだけで拒否する（`table_image::capture` と同じ扱い）。
         if write_txn.list_multimap_tables()?.next().is_some()
             || self.base.list_multimap_tables()?.next().is_some()
         {
-            return Err(unrecordable());
+            return Err(multimap());
         }
         let final_names = table_names(write_txn.list_tables()?);
         let base_names = table_names(self.base.list_tables()?);
@@ -881,7 +1021,7 @@ impl CaptureSession {
         final_names: &BTreeSet<String>,
         touched: &BTreeSet<&str>,
     ) -> Result<()> {
-        let unrecordable = || StorageError::CommitFootprintUnrecordable;
+        let unrecordable = || Unrecordable::Uncaptured.refuse();
         for n in base_names {
             if !final_names.contains(n) && !touched.contains(n.as_str()) {
                 return Err(unrecordable());
@@ -936,16 +1076,16 @@ fn write_row_store_len(write_txn: &redb::WriteTransaction, name: &str) -> Result
     #[allow(clippy::disallowed_methods)]
     let table = write_txn
         .open_table(crate::catalog::user_rows_table_def(name))
-        .map_err(|_| StorageError::CommitFootprintUnrecordable)?;
-    ReadableTableMetadata::len(&table).map_err(|_| StorageError::CommitFootprintUnrecordable)
+        .map_err(|_| Unrecordable::AfterImage.refuse())?;
+    ReadableTableMetadata::len(&table).map_err(|_| Unrecordable::AfterImage.refuse())
 }
 
 /// 基底の行ストアの行数（O(1)。存在は表集合で確認済み）。
 fn base_row_store_len(base: &redb::ReadTransaction, name: &str) -> Result<u64> {
     let table = base
         .open_table(crate::catalog::user_rows_table_def(name))
-        .map_err(|_| StorageError::CommitFootprintUnrecordable)?;
-    ReadableTableMetadata::len(&table).map_err(|_| StorageError::CommitFootprintUnrecordable)
+        .map_err(|_| Unrecordable::AfterImage.refuse())?;
+    ReadableTableMetadata::len(&table).map_err(|_| Unrecordable::AfterImage.refuse())
 }
 
 fn generation_key_bytes() -> &'static [u8] {
@@ -970,13 +1110,13 @@ fn read_image(
         Ok(ReadOutcome::Image(img)) => Ok(img),
         // 未知の型・上限超過・読み取り失敗はいずれも記録できないので commit 前に拒否する。
         Ok(ReadOutcome::UnknownShape | ReadOutcome::OverLimit) | Err(_) => {
-            Err(StorageError::CommitFootprintUnrecordable)
+            Err(Unrecordable::AfterImage.refuse())
         }
     }
 }
 
 fn shape_no(img: &AfterImage) -> Result<u32> {
-    u32::try_from(img.shape).map_err(|_| StorageError::CommitFootprintUnrecordable)
+    u32::try_from(img.shape).map_err(|_| Unrecordable::AfterImage.refuse())
 }
 
 fn into_change(name: &str, img: AfterImage) -> Result<TableChange> {

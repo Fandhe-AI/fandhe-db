@@ -90,6 +90,9 @@ cat <<'EOF'
   crash-test-sequence
       採番状態・operation_id 台帳・DO ブロックの crash 耐性回帰テスト
       $ scripts/crash_test_sequence.sh
+  change-log-oracle
+      変更ログのオラクル試験（結合テストを強制有効化で実行）
+      $ scripts/change_log_oracle.sh
   crash-test-gin-index
       GIN 相当索引の crash 耐性回帰テスト
       $ scripts/crash_test_gin_index.sh

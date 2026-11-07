@@ -131,6 +131,30 @@ impl TableImage {
     }
 }
 
+/// オラクル試験が読む 1 表分の差分（読み取り専用の窓）。
+#[cfg(any(test, feature = "change-log-oracle"))]
+pub(crate) struct DeltaView<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) shape: usize,
+    pub(crate) upserts: &'a [(Vec<u8>, Vec<u8>)],
+    pub(crate) removes: &'a [Vec<u8>],
+}
+
+/// オラクル試験（`storage::change_log::oracle`・RECOVER-14 のポインタ）が差分の中身を読むための
+/// 読み取り専用の窓。差分の組み立てには関与しない。
+#[cfg(any(test, feature = "change-log-oracle"))]
+impl TableImage {
+    /// 表ごとの差分。
+    pub(crate) fn oracle_deltas(&self) -> impl Iterator<Item = DeltaView<'_>> {
+        self.deltas.iter().map(|d| DeltaView {
+            name: d.name.as_str(),
+            shape: d.shape,
+            upserts: d.upserts.as_slice(),
+            removes: d.removes.as_slice(),
+        })
+    }
+}
+
 /// shape ごとの操作（関数ポインタ表）。
 struct Shape {
     capture: fn(
