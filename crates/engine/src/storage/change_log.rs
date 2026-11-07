@@ -36,7 +36,7 @@
 //!
 //! # 記録範囲の例外
 //!
-//! [`CHANGE_LOG_TABLE_NAME`] 自身と [`CHANGE_LOG_META_TABLE_NAME`]（DB 識別子・timeline・後続の
+//! [`CHANGE_LOG_TABLE_NAME`] 自身と [`CHANGE_LOG_META_TABLE_NAME`]（DB 識別子・timeline・有効化時の世代・
 //! アーカイブ水位）は記録対象外で、SQL・カタログから名前解決されない（利用者の表は redb 上では
 //! `user_rows/{表名}` 等の接頭辞つきの名前になるため衝突しない。構造テストで固定する）。
 //!
@@ -70,7 +70,7 @@ use super::{Result, StorageError, GENERATION_KEY, GENERATION_TABLE};
 
 /// 変更ログの本体表の redb 名。キーは LSN（`storage_generation` の値）、値は [`encode_record`] の出力。
 pub(crate) const CHANGE_LOG_TABLE_NAME: &str = "change_log";
-/// DB 識別子・timeline（後続でアーカイブ水位）を持つ表の redb 名。
+/// DB 識別子・timeline・有効化時の世代・アーカイブ水位（`archive`）を持つ表の redb 名。
 pub(crate) const CHANGE_LOG_META_TABLE_NAME: &str = "change_log_meta";
 
 const CHANGE_LOG_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new(CHANGE_LOG_TABLE_NAME);

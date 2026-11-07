@@ -709,6 +709,17 @@ fsync が無いため。tmpfs の値は CPU コストの上限として併記）
 - **#2167 の実施状況（実施済み・残課題）**:
   - 実施済み: セグメント形式・書き出し・水位・刈り込み・検証（ファイル／ディレクトリ／DB 突き合わせ）・
     常駐スレッド・CLI（D6 の実装判断）
+  - D6 の記述と実装の既存の差異: D6 は保守 commit に `recording`（commit 記録の `CommitSession`）を付けないと
+    書くが、`begin_maintenance_txn` は `wrap_gated` を通るため commit 記録があれば `recording` が付き、
+    `commit_maintenance` はそれを `finish` せず破棄する（#3067 の `enable_change_log` 経路から同じ）。
+    `CommitSession` の Drop は書き込み省略のスキップ印を戻すだけで、`last_generation`・床は `finish` でしか動かない
+    ため、保守 commit は commit 記録を動かさない（5 回の保守 commit と利用者 commit の交互試験で固定）。D6 の
+    「付けない」は「記録を進めない」の意味で読む
+  - 強制有効化（`FANDHE_CHANGE_LOG_ORACLE=1`）で lib を流すと、#2167 の試験のうち 3 件が落ちる（D11 の 47 件に
+    加わる）。いずれも「有効化そのものが差になる」区分で、強制有効化の `Storage::open` が連続性検査・
+    有効化済みの判定を先に済ませるため、無効状態・明示の有効化を前提にした試験（`NotEnabled` の確認、
+    再オープン後の連続性検査）が成り立たない。刈り込み → 利用者 commit をオラクルが検証する試験を含む
+    残りの 23 件は強制有効化下でも通る
   - 残課題（起票候補。Issue 化は人の判断）: ①未アーカイブ容量の上限と `54000` 拒否（RECOVER-14 (2)）。
     prepare 段で未アーカイブ量を O(1) に測る手段（水位以降のバイト数の維持）の設計が要り、本 Issue では
     実装していない。アーカイブ先が使えない間、`change_log` 表は DB 内で増え続ける（従来どおり）。

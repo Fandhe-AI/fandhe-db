@@ -1267,7 +1267,7 @@ impl Storage {
     }
 
     /// 有効な変更ログの DB 識別子と timeline（無効なら `None`）。
-    #[cfg_attr(not(test), allow(dead_code))] // 後続（バックアップ・アーカイブ）が使う。それまではテストだけが呼ぶ
+    #[cfg_attr(not(test), allow(dead_code))] // 後続（バックアップ）が使う。それまではテストだけが呼ぶ
     pub(crate) fn change_log_identity(&self) -> Option<([u8; change_log::DB_ID_LEN], u64)> {
         self.change_log.as_ref().map(|s| (s.db_id, s.timeline))
     }
