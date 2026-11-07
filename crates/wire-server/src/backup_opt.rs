@@ -114,35 +114,58 @@ pub fn parse(args: &[String]) -> Result<BackupArgs, String> {
     Ok(BackupArgs { target, out })
 }
 
-/// `--db` の検証。`Storage::open` は存在しないパスに空の DB を作るため、既存の通常ファイルに限る
-/// （typo で空 DB が生成され「成功」するのを防ぐ）。
-fn validate_db(raw: &str) -> Result<PathBuf, String> {
+/// `Storage::open` の失敗が「別プロセスが開いている」ことによるかを判定する（`backup`・`verify` が
+/// 「stop the server first」を案内するために使う）。redb のエラー種別は wire-server から名前で
+/// 参照できない（redb 非依存）ため、`DatabaseAlreadyOpen` の表示文言に依存している。文言が変わると
+/// 案内が一般的な「failed to open」に落ちるだけで、終了コード（1）と fail-closed は変わらない。
+pub fn is_already_open(e: &engine::storage::StorageError) -> bool {
+    e.to_string().contains("already open")
+}
+
+/// `--db` の検証。`Storage::open` は存在しない・長さ 0 のパスに空の DB を作るため、既存の
+/// 空でない通常ファイルに限る（typo で空 DB が生成され「成功」するのを防ぐ）。
+/// `verify`・`restore` からも使う（[`crate::verify_opt`]・[`crate::restore_opt`]）。
+pub fn validate_db(raw: &str) -> Result<PathBuf, String> {
+    validate_existing_file("--db", raw)
+}
+
+/// 既存の空でない通常ファイルだけを受け入れる共通検査（フラグ名はエラー文に使う。パスは出さない）。
+/// 長さ 0 のファイルは `Storage::open` が空 DB として初期化してしまうため拒否する。
+pub fn validate_existing_file(flag: &str, raw: &str) -> Result<PathBuf, String> {
     if raw.is_empty() {
-        return Err("--db must not be empty".into());
+        return Err(format!("{flag} must not be empty"));
     }
     let path = PathBuf::from(raw);
     match std::fs::metadata(&path) {
-        Ok(m) if m.is_file() => Ok(path),
-        _ => Err("--db must be an existing database file".into()),
+        Ok(m) if m.is_file() && m.len() > 0 => Ok(path),
+        _ => Err(format!(
+            "{flag} must be an existing non-empty database file"
+        )),
     }
 }
 
 /// `--out` の検証。空・`..` 成分・ファイル名なし・既存の何か（シンボリックリンクを含む）・
 /// 親ディレクトリの不在を拒否する。
 pub fn validate_out(raw: &str) -> Result<PathBuf, String> {
+    validate_new_path("--out", raw)
+}
+
+/// まだ存在しない新規パスの共通検査（`backup --out`・`restore --db` が使う。フラグ名はエラー文に
+/// 使い、パスの内容は出さない）。確認後の競合は公開側の `hard_link`（`EEXIST`）が原子的に拒否する。
+pub fn validate_new_path(flag: &str, raw: &str) -> Result<PathBuf, String> {
     if raw.is_empty() {
-        return Err("--out must not be empty".into());
+        return Err(format!("{flag} must not be empty"));
     }
     let path = PathBuf::from(raw);
     if path.components().any(|c| matches!(c, Component::ParentDir)) {
-        return Err("--out must not contain '..' components".into());
+        return Err(format!("{flag} must not contain '..' components"));
     }
     if path.file_name().is_none() {
-        return Err("--out must name a file".into());
+        return Err(format!("{flag} must name a file"));
     }
     // 存在確認はリンクをたどらない（壊れたリンク経由の書き出しも拒否する）。
     if std::fs::symlink_metadata(&path).is_ok() {
-        return Err("--out already exists; refusing to overwrite".into());
+        return Err(format!("{flag} already exists; refusing to overwrite"));
     }
     let parent = match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
@@ -150,7 +173,7 @@ pub fn validate_out(raw: &str) -> Result<PathBuf, String> {
     };
     match std::fs::metadata(parent) {
         Ok(m) if m.is_dir() => Ok(path),
-        _ => Err("parent directory of --out does not exist".into()),
+        _ => Err(format!("parent directory of {flag} does not exist")),
     }
 }
 
