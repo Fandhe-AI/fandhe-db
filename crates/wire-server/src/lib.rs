@@ -54,6 +54,8 @@
 //!   `engine::search_engine::HnswScope` へ untrusted な CLI 文字列から到達する
 //!   唯一の入口。`EngineCore::with_hnsw_scope` への注入は `main.rs::run_server`
 //!   の責務）
+//! - [`change_log_opt`]: `--change-log` 値なしスイッチの受理／拒否判定（Issue #3067・RECOVER-14
+//!   ポインタ。書き込み点の移行〔#3068〕と有効化〔#3069〕が済むまでは常に起動拒否する）
 //! - [`english_stemmer_opt`]: `--english-stemmer` の受理／拒否判定（Issue #2129・#3050・
 //!   SEARCH-16 ポインタ。engine の `english-stemmer` feature 無効のビルドは常に起動エラー）
 //! - [`text_analysis_opt`]: `--stopwords-file`／`--synonyms-file` の上限付き読み込みと検証
@@ -137,6 +139,7 @@ pub mod auth;
 pub mod auth_method_opt;
 pub(crate) mod binary_param;
 pub mod bind_guard;
+pub mod change_log_opt;
 pub mod connection_limits_opt;
 pub(crate) mod copy;
 pub(crate) mod copy_binary;

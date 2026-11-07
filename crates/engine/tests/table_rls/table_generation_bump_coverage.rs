@@ -83,8 +83,19 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1958（`begin_explicit_write_txn_nowait` の追加。+20 行）の取り込みでさらに移動。 Issue #2879（storage.rs への +1 行）で移動。
     // Issue #2151（`snapshot` モジュール宣言・`snapshot_export_busy` フィールド・`export_snapshot` の追加。+18 行）で追随（旧: 1164／1198）。
     // 追加した書き出しの commit は redb の別ファイル `Database` に対するもので commit_boundary を通らず、本一覧の対象外。
-    ("storage.rs", 1182),
-    ("storage.rs", 1216),
+    // Issue #3067（変更ログの土台。`GatedWriteTxn`・`CommitParts` への `capture` 追加、`Storage::change_log`、
+    // `enable_change_log` の追加）で行番号が移動したための追随（旧: 1182／1216）。
+    ("storage.rs", 1256),
+    ("storage.rs", 1290),
+    // Issue #3067: `Storage::enable_change_log` が DB 識別子の永続化に使う保守 commit
+    // （`commit_boundary::commit_maintenance`）。書き込むのは `change_log_meta` 表だけで、`CATALOG_TABLE`・
+    // `user_rows` には触れず、世代も進めない（バンプ対象の表が構造的に存在しない）。
+    ("storage.rs", 1125),
+    // Issue #3067: `storage/change_log.rs` のテスト内の commit 入口（`commit_result`・`commit_maint`）。
+    // 変更ログの `change_log` 表・メタ表と任意の試験用 redb 表だけを書くテスト fixture で、
+    // `user_rows/{table_name}` を経由しないため対象外。
+    ("storage/change_log.rs", 965),
+    ("storage/change_log.rs", 973),
     ("recovery/panic_hook.rs", 404),
     ("txn.rs", 210),
     ("txn.rs", 387),

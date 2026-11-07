@@ -120,6 +120,7 @@ cargo run -p fandhe-db-wire-server -- --users <ユーザーストアのパス> -
   [--hnsw-scope all|declared] \
   [--durability immediate|none] \
   [--require-operation-id] \
+  [--change-log] \
   [--require-where-for-dml] \
   [--max-dml-affected-rows <1-1000000>] [--max-insert-rows <1-1000000>] \
   [--batch-max-files <1-1000000>] \
@@ -389,6 +390,11 @@ feature 付きビルド（例: `cargo build --release -p fandhe-db-wire-server -
 読み込みに失敗すれば起動エラーで、エラー文にパスを出しません。推論が期限を超えた場合は検索を拒否せず、
 リランキング前の順位で応答します（縮退はログとカウンタ `degraded_timeout` に残ります）。モデルファイルは
 リポジトリにコミットしないでください。
+
+`--change-log`（Issue #3067。RECOVER-14 ポインタ）は永続変更ログ（増分バックアップ・PITR の土台。
+`docs/design/change-log-pitr.md`）の opt-in を表す値なしスイッチです。engine の土台（書き込み側のラッパ・
+capture frame・レコード形式・DB 識別子）だけが入っており、既存の書き込み点の移行とオラクルが済むまでは
+指定すると固定文言で起動エラーになります（fail-closed。重複指定・値つきも起動エラー）。未指定の挙動は変わりません。
 
 `--english-stemmer`（Issue #2129・#3050）は値を取らないスイッチで、疎検索の英語トークンを語幹にそろえる
 （索引とクエリの両方。起動時固定）。engine の `english-stemmer` feature 付き（`--features engine/english-stemmer`）の

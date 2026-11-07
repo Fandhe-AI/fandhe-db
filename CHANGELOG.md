@@ -9,6 +9,7 @@
 
 ### Changed
 
+- wire-server に `--change-log` と公開モジュール `change_log_opt` を追加した（Issue #3067・RECOVER-14 ポインタ。設計は [change-log-pitr.md](docs/design/change-log-pitr.md)）。永続変更ログ（増分バックアップ・PITR の土台）の opt-in だが、既存の書き込み点の移行とオラクルが済むまでは指定すると固定文言で起動エラーにする（fail-closed）。engine には変更ログの土台（書き込み側の表ハンドルのラッパ・capture frame・レコード形式・DB 識別子）を crate 内部の実装として追加した。公開 API の変更はなく、無効時（既定）の挙動・結果は不変。
 - engine に稼働中バックアップ向けの一貫スナップショット書き出し `Storage::export_snapshot(dest)` と公開型 `storage::{SnapshotSummary, SnapshotExportError}` を追加した（Issue #2151・RECOVER-13 ポインタ。方式は [backup-snapshot.md](docs/design/backup-snapshot.md)）。読み取り Tx 1 本の上で全 redb 表を新ファイルへ複製し、書き込みゲートを通らないため書き込みを止めない。出力先に何かあれば書かずに拒否し、一時名（0o600）へ書いて `hard_link` で公開するため最終名に不完全なファイルは残らない。未知の型の表があれば中止する。追加のみで、運用者用 CLI（#2152）が呼ぶまで表層からは使えない。
 - NoSQL `search` に `highlight: {column, options?}` を追加した（Issue #3056・SEARCH-14 ポインタ）。`hybrid.text` を検索語として、SQL の `ts_headline(<column>, '<text>'[, '<options>']) AS highlight` と同じ値の `highlight` 列を応答の末尾へ足す（オプション語彙 `22023`・上限超過 `54000`・列型 `42804` も SQL と同じ。上限は CLI の設定を共有する）。`hybrid` なし・`plan` 併用・`highlight` 同名の列は `42601`。`highlight` を省略した要求の応答は不変。公開 static `http::query::schema::HIGHLIGHT_SCHEMA` と engine の公開関数 `sql::udf_call::bind_ts_headline_projection` を追加し、`SearchError`（`#[non_exhaustive]` 済み）に variant `HighlightRequiresHybrid`・`HighlightWithPlan`・`HighlightColumnConflict` を追加した。
 - `EXPLAIN` の検索計画に、リランクが有効なとき末尾へ `rerank: method=...,window=...[,mmr_lambda=...],status=...` の 1 行を追記した（Issue #2147・SEARCH-15 ポインタ）。off では出力は不変で、実行時の縮退は含まない。NoSQL `search`（`vector` 指定）の explain にも載る。公開 API の変更はない。
