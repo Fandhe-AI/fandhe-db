@@ -1068,7 +1068,11 @@ fn maintenance_commit(
     // 開始位置の存在確認）が刈り込みの途中に割り込んで、確認した範囲が commit で消える競合を作らない。
     // ゲートの待機中に保持するが、登録側はゲートを取らず、ack の更新も短時間のロックだけなので、
     // 順序の逆転（ゲート → 登録簿）は存在しない。
-    let pins = storage.change_log.as_ref().map(|s| s.replica_pins.lock());
+    // 刈り込みをしない周期（保持設定なし）では取らない（ゲート待ちの間、登録・ack 更新を止めない）。
+    let pins = opts
+        .retain_records
+        .and(storage.change_log.as_ref())
+        .map(|s| s.replica_pins.lock());
     let pin_floor = pins.as_ref().map_or(u64::MAX, |p| ReplicaPins::floor(p));
     let Some(txn) = storage.begin_maintenance_txn()? else {
         return Ok(Step::Skipped);
