@@ -1,28 +1,37 @@
-//! `--change-log` CLI 引数の受理／拒否の判定（Issue #3067・親 #2166・RECOVER-14 ポインタ。
-//! 設計は `docs/design/change-log-pitr.md` の D8）。
+//! `--change-log` CLI 引数の受理判定と起動時の固定文言（Issue #3067・#3069・親 #2166・RECOVER-14
+//! ポインタ。設計は `docs/design/change-log-pitr.md` の D8・D11）。
 //!
-//! 永続変更ログ（増分バックアップ・PITR の土台）は opt-in の値なしスイッチで有効にする。
-//! ただし現段階は engine の書き込み点の移行（#3068）までが済んでおり、オラクル試験による
-//! 完全性の検証と有効化（#3069）が済むまでは記録が欠ける経路が残りうる。欠けた記録を
-//! 黙って許すと復元結果が静かに食い違うため、指定された起動は
-//! 「未提供」と分かる固定文言で拒否する（fail-closed。`english_stemmer_opt` と同じ流儀）。
-//! `main.rs` の引数ループから呼ばれ、値は読まず・echo しない（スイッチのみ）。#3069 が
-//! [`AVAILABLE`] を有効にし、engine の有効化入口へ結線する。
+//! 永続変更ログ（増分バックアップ・PITR の土台）は opt-in の値なしスイッチで有効にする。engine の
+//! 書き込み点の移行（#3068）とオラクル試験・性能計測（#3069）が済んだため、指定すると engine の
+//! `Storage::enable_change_log` へ結線される（`main.rs` の `open_engine_core_with_change_log`）。
+//! `main.rs` の引数ループから呼ばれ、値は読まず・echo しない（スイッチのみ。重複指定は
+//! last-wins にせず拒否する）。
+//!
+//! 一度有効にした DB をフラグなしで起動すると、レコードが欠けたまま世代が進む（LSN の欠落）ため、
+//! 起動を [`REQUIRED_MESSAGE`] で拒否する（fail-closed。engine も同じ状態の書き込みを `54000` で
+//! 拒否する）。アーカイブ・保持・PITR は後続（#2167 以降）で、現時点の変更ログは `change_log` 表へ
+//! 溜まるだけである。
 
 /// 受理対象の CLI フラグ名（値を取らないスイッチ）。
 pub const FLAG: &str = "--change-log";
 
-/// 変更ログを有効にして起動できるか。オラクル試験と有効化（#3069）が済むまでは `false`。
-pub const AVAILABLE: bool = false;
+/// 変更ログを有効にして起動できるか。オラクル試験と有効化（#3069）が済んだため `true`。
+pub const AVAILABLE: bool = true;
 
-/// 起動拒否時に stderr へ出す固定文言（引数値・パス・テナント情報を含めない）。
+/// 無効のビルドで指定された起動を拒否する固定文言（引数値・パス・テナント情報を含めない）。
 pub const REJECT_MESSAGE: &str = "--change-log is not available yet: the change log is not fully wired into the write paths, so enabling it is refused";
 
 /// 2 回目以降の指定を拒否する固定文言（last-wins にしない）。
 pub const DUPLICATE_MESSAGE: &str = "--change-log specified more than once";
 
+/// 一度有効にした DB をフラグなしで起動したときに拒否する固定文言（LSN の欠落を作らない）。
+pub const REQUIRED_MESSAGE: &str = "this database has a change log: restart with --change-log (writing without it would leave a gap in the log)";
+
+/// 有効化に成功したときに stderr へ出す固定文言（運用者向けの状態表示）。
+pub const ENABLED_MESSAGE: &str = "change log enabled (archive, retention and point-in-time recovery are not available yet; the log grows inside the database)";
+
 /// フラグ 1 回分の受理判定。`already_set` は既に 1 回指定済みか。
-/// 未提供の間は常に [`REJECT_MESSAGE`]、提供後も重複指定は [`DUPLICATE_MESSAGE`]。
+/// 無効のビルドでは常に [`REJECT_MESSAGE`]、有効なビルドでも重複指定は [`DUPLICATE_MESSAGE`]。
 pub fn accept(already_set: bool) -> Result<(), &'static str> {
     if !AVAILABLE {
         return Err(REJECT_MESSAGE);
@@ -46,8 +55,16 @@ mod tests {
     }
 
     #[test]
-    fn enabling_is_refused_until_the_write_paths_are_migrated() {
-        assert_eq!(accept(false), Err(REJECT_MESSAGE));
-        assert_eq!(accept(true), Err(REJECT_MESSAGE));
+    fn the_flag_is_accepted_once() {
+        assert_eq!(accept(false), Ok(()));
+        assert_eq!(accept(true), Err(DUPLICATE_MESSAGE));
+    }
+
+    #[test]
+    fn startup_messages_carry_no_variable_content() {
+        for m in [REQUIRED_MESSAGE, ENABLED_MESSAGE] {
+            assert!(!m.contains('{') && !m.contains('\n'));
+        }
+        assert!(REQUIRED_MESSAGE.contains(FLAG));
     }
 }
