@@ -429,6 +429,14 @@
 //! 周期的に書き出し（`wire_server::change_log_archive`）、`change-log-verify` サブコマンドがアーカイブを検査する。
 //! PITR の復元は後続の Issue。
 //!
+//! `--replication-bind <addr>`・`--replication-roles <file>`・`--replication-allow <ip|cidr>`・
+//! `--replication-max-connections <n>`・`--replication-max-unacked-bytes <n>`・
+//! `--replication-ack-timeout-secs <n>`（Issue #2173・RECOVER-15・WIRE-9 ポインタ）: ストリーミング
+//! レプリケーションの送信側（プライマリ）の opt-in。テナント向けとは別のリスナーを作り、専用ロールで認証した
+//! 許可リスト内のレプリカへ変更ログを送る。`--change-log` が前提で、bind はループバックだけ（非ループバックは
+//! 起動エラー。TLS は #2177）。重複指定・不正値・前提の欠落は DB を開く前に起動エラー
+//! （`wire_server::replication_opt`・`wire_server::replication`。`docs/design/replication-streaming.md` 参照）。
+//!
 //! `--require-where-for-dml`（Issue #2210・SQL-36 ポインタ）: 値を取らないスイッチ。
 //! 指定すると `WHERE` 省略の SQL `UPDATE`／`DELETE` を変更開始前に `42601` で拒否する
 //! （明示した述語は受理。MySQL の `sql_safe_updates` 相当）。重複指定・`=` 連結形・後続の値は
