@@ -316,7 +316,7 @@ wire-server change-log-verify --archive-dir <アーカイブ先> [--db <DB の�
 
 ### 7.1 変更ログ・PITR（`scripts/crash_test_pitr.sh`）
 
-`scripts/crash_test_pitr.sh`（Issue #2170・RECOVER-14 ポインタ）は、変更ログ有効時のクラッシュと、ベース + アーカイブからの PITR 復元の一致を確かめる。`make crash-test-pitr` で実行し、`crash-test`（CI の crash-test ジョブ）の前提になっている（新しい CI ジョブは足していない）。#2157 と同じく wire-server のリリースバイナリと最小 pg wire クライアント（`scripts/crash_test_backup_restore_client.py`）を使う。前提は「追記クライアントの 1 回の INSERT はちょうど 1 回の commit で、行 id は連番」で、これにより LSN と件数・最大 id が 1 対 1 に対応する。
+`scripts/crash_test_pitr.sh`（Issue #2170・RECOVER-14 ポインタ）は、変更ログ有効時のクラッシュと、ベース + アーカイブからの PITR 復元の一致を確かめる。`make crash-test-pitr` で実行し、`crash-test`（CI の crash-test ジョブ）の前提になっている（新しい CI ジョブは足していない）。#2157 と同じく wire-server のリリースバイナリと最小 pg wire クライアント（`scripts/crash_test_backup_restore_client.py`）を使う。**Linux 専用**（bash 5 以上と `/proc/uptime` が要る）。前提は「追記クライアントの 1 回の INSERT はちょうど 1 回の commit で、行 id は連番」で、これにより LSN と件数・最大 id が 1 対 1 に対応する。
 
 | 段 | 内容と不変条件 |
 | -- | -------------- |

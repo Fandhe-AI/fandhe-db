@@ -58,6 +58,13 @@ if [ "${CYCLES}" -lt 3 ]; then
   exit 1
 fi
 
+# 時刻指定の検査が壁時計と単調時計（/proc/uptime）の差を使うため Linux 専用。bash 5 未満は $EPOCHREALTIME が無い。
+[ -r /proc/uptime ] || { echo "ERROR: Linux (/proc/uptime) is required" >&2; exit 1; }
+if [ "${BASH_VERSINFO[0]}" -lt 5 ]; then
+  echo "ERROR: bash 5 or later is required (EPOCHREALTIME)" >&2
+  exit 1
+fi
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="${REPO_ROOT}/target/release/wire-server"
 CLIENT="${REPO_ROOT}/scripts/crash_test_backup_restore_client.py"
@@ -311,12 +318,17 @@ PT_MONO_MS=()
 # 期待値は「直前の検査点の LSN + 件数の増分」（1 INSERT = 1 commit）。最初の検査点だけは期待値を
 # 持たないため、末尾 LSN が 2 秒以上変わらないことで追いついたとみなす。
 capture_point() {
-  local idx="${#PT_LSN[@]}" t stamp up _
-  stamp="$(date -u +'%s%6N %Y-%m-%dT%H:%M:%S.%6NZ')"
-  t="${stamp#* }"
+  local idx="${#PT_LSN[@]}" t up _ rt_us
+  # 単調時計と壁時計を fork なしで連続して採る（間に外部コマンドを挟まず、採取のゆらぎを避ける）。
   read -r up _ < /proc/uptime || fail "cannot read /proc/uptime"
-  PT_RT_MS+=($((${stamp%% *} / 1000)))
+  rt_us="${EPOCHREALTIME/./}"
+  PT_RT_MS+=($((rt_us / 1000)))
   PT_MONO_MS+=($((${up/./} * 10)))
+  # 時刻指定の点は採取時刻の 300ms 後にする。直前の commit（採取より前）との余裕を広げるためで、
+  # 次の周期の最初の commit は、この後のサーバー再起動・アーカイブ待ち・次周期のサーバー起動と接続の
+  # 後（実測で 1 秒前後以上）になるので、300ms 後の点は次周期の commit より前に収まる。
+  t="$(date -u -d "@$(((rt_us + 300000) / 1000000)).$(printf '%06d' $(((rt_us + 300000) % 1000000)))" +%Y-%m-%dT%H:%M:%S.%6NZ)" \
+    || fail "date could not format the checkpoint time"
   start_src_server
   read_counts
   local expect="" waited=0 stable=0 last=""
@@ -565,7 +577,12 @@ echo "restored states match the recorded states; out-of-range requests are rejec
 # ---------------------------------------------------------------------------
 # 5. PITR の restore 中の SIGKILL
 # ---------------------------------------------------------------------------
-PER_RESTORE_MS=$((RESTORE_MS / (2 * LAST)))
+# kill の遅延幅は restore 単体の所要時間で決める（サーバー起動・件数読み出しを含む phase 4 の平均では広すぎる）。
+t0="$(now_ms)"
+restore_to "${RST_DIR}/timing.redb" --change-log-archive-dir "${ARCH}" --until-lsn "${PT_LSN[LAST]}"
+PER_RESTORE_MS=$(($(now_ms) - t0))
+[ "${RESTORE_RC}" -eq 0 ] || restore_fail "timing restore exit ${RESTORE_RC} (expected 0)"
+rm -f "${RST_DIR}/timing.redb"
 restore_limit_ms=$((PER_RESTORE_MS * 3 / 2))
 [ "${restore_limit_ms}" -ge 20 ] || restore_limit_ms=20
 echo "=== phase 5: SIGKILL during PITR restore (${ITERATIONS}+ iterations, delay 0-${restore_limit_ms}ms) ==="
@@ -613,6 +630,9 @@ while should_continue "${i}" "${restore_hits}"; do
   [ "$(dir_fingerprint "${BAK_DIR}")" = "${BASE_FP_BEFORE}" ] || fail "the base directory changed during restore iteration ${i}"
 done
 echo "restore kills: iterations=${i} killed=${restore_killed} hit_mid_run=${restore_hits} completed_before_kill=${restore_completed}"
+if [ $((restore_hits * 4)) -lt "${ITERATIONS}" ]; then
+  echo "WARN: only ${restore_hits} of ${i} restores were killed mid-run (delay range may not fit this machine)" >&2
+fi
 if [ "${restore_hits}" -lt 1 ] || [ -z "${RST_INTERRUPTED}" ]; then
   fail "no PITR restore was killed after starting and before publishing (test is vacuous)"
 fi
@@ -652,7 +672,7 @@ flip_byte() {
 # 改ざんの 1 ケース。引数: <名前> <until_lsn> <change-log-verify の期待: reject〔単体で拒否〕|tail〔--db との突き合わせで拒否〕> <改ざん関数名>。
 # アーカイブの複製を作って改ざんし、verify（reject のとき）と restore の拒否・復元先の空を確かめる。
 tamper_case() {
-  local name="$1" until_lsn="$2" verify_expect="$3" mutate="$4"
+  local name="$1" until_lsn="$2" verify_expect="$3" mutate="$4" want_msg="$5"
   local copy="${TAMP_DIR}/${name}" dest_dir="${TAMP_DIR}/${name}-out"
   cp -a "${ARCH}" "${copy}" || fail "copy of the archive failed (${name})"
   mkdir "${dest_dir}"
@@ -668,6 +688,11 @@ tamper_case() {
   fi
   restore_to "${dest_dir}/rst.redb" --change-log-archive-dir "${copy}" --until-lsn "${until_lsn}"
   [ "${RESTORE_RC}" -eq 1 ] || restore_fail "tamper ${name}: restore exit ${RESTORE_RC}, expected 1"
+  # 拒否の理由がアーカイブ起因であること（固定の英語文の識別語。引数の誤りなど別の理由での終了コード 1 と区別する）。
+  case "${RESTORE_ERR}" in
+    *"${want_msg}"*) ;;
+    *) restore_fail "tamper ${name}: restore error does not mention '${want_msg}'" ;;
+  esac
   if [ -n "$(find "${dest_dir}" -mindepth 1 -print -quit)" ]; then
     fail "tamper ${name}: a rejected restore left entries in the destination directory"
   fi
@@ -702,19 +727,23 @@ copy="${TAMP_DIR}/control"
 cp -a "${ARCH}" "${copy}" || fail "copy of the archive failed (control)"
 run_clv "${copy}"
 [ "${CLV_RC}" -eq 0 ] || fail "control archive copy does not verify"
+# 拒否ケースの停止点（検査点 1）と最新（改ざん全般の既定）の両方で成功する。
 restore_to "${TAMP_DIR}/control-rst.redb" --change-log-archive-dir "${copy}" --until-lsn "${PT_LSN[1]}"
 [ "${RESTORE_RC}" -eq 0 ] || restore_fail "control restore exit ${RESTORE_RC} (expected 0)"
+rm -f "${TAMP_DIR}/control-rst.redb"
+restore_to "${TAMP_DIR}/control-rst.redb" --change-log-archive-dir "${copy}" --until-lsn "${PT_LSN[LAST]}"
+[ "${RESTORE_RC}" -eq 0 ] || restore_fail "control restore to the last lsn exit ${RESTORE_RC} (expected 0)"
 rm -rf "${copy}" "${TAMP_DIR}/control-rst.redb"
 
-tamper_case delete-mid "${PT_LSN[LAST]}" reject mutate_delete_mid
-tamper_case flip-mid "${PT_LSN[LAST]}" reject mutate_flip_mid
-tamper_case swap "${PT_LSN[LAST]}" reject mutate_swap
+tamper_case delete-mid "${PT_LSN[LAST]}" reject mutate_delete_mid "gap or overlap"
+tamper_case flip-mid "${PT_LSN[LAST]}" reject mutate_flip_mid "checksum mismatch"
+tamper_case swap "${PT_LSN[LAST]}" reject mutate_swap "malformed"
 # 停止点（検査点 1）より後ろのセグメントの破損・切り詰めも拒否する。
-tamper_case flip-after-stop "${PT_LSN[1]}" reject mutate_flip_last
-tamper_case truncate-after-stop "${PT_LSN[1]}" reject mutate_truncate_last
+tamper_case flip-after-stop "${PT_LSN[1]}" reject mutate_flip_last "checksum mismatch"
+tamper_case truncate-after-stop "${PT_LSN[1]}" reject mutate_truncate_last "truncated"
 # 末尾の削除はアーカイブ単体では検出できないため、verify は --db との突き合わせで確かめる。最新までの
 # 復元は、ログの最大 LSN が足りず範囲外として拒否される。
-tamper_case delete-last "${PT_LSN[LAST]}" tail mutate_delete_last
+tamper_case delete-last "${PT_LSN[LAST]}" tail mutate_delete_last "outside the range"
 # 元のアーカイブは改ざん試験の影響を受けていない。
 [ "$(dir_fingerprint "${ARCH}")" = "${ARCH_FP_BEFORE}" ] || fail "the original archive changed during tamper cases"
 
