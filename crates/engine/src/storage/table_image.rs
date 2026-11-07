@@ -21,6 +21,8 @@
 //! 最初のものを使う。全 shape が不一致のテーブル・multimap テーブルがあれば [`Capture::Gate`]
 //! （呼び出し側は savepoint を巻き戻し不可に落とす = 従来どおり `0A000` の fail-closed）。
 //!
+//! 同じ一覧は稼働中バックアップの書き出し（`storage::snapshot`）も表の複製に共有する。
+//!
 //! # 資源上限
 //!
 //! 差分のバイト数は [`Meter`] で割り当て前に計上し、上限超過・期限超過は `Gate`。走査は排他 writer を
@@ -138,6 +140,14 @@ struct Shape {
         &mut Meter,
     ) -> Result<Probe, ImageError>,
     apply: fn(&WriteTransaction, &TableDelta) -> Result<(), ImageError>,
+    /// 稼働中バックアップの書き出し（`storage::snapshot`・RECOVER-13 のポインタ）が使う表の複製。
+    /// 型の組の一覧を savepoint と共有し、新しい型の表の登録漏れを両機能で同時に検知する。
+    copy: fn(
+        &ReadTransaction,
+        &WriteTransaction,
+        &str,
+        &mut u64,
+    ) -> Result<super::snapshot::CopyProbe, super::snapshot::SnapshotExportError>,
 }
 
 enum Probe {
@@ -287,6 +297,7 @@ macro_rules! shapes {
         &[$(Shape {
             capture: capture_table::<$k, $v>,
             apply: apply_table::<$k, $v>,
+            copy: super::snapshot::copy_table::<$k, $v>,
         }),+]
     };
 }
@@ -325,6 +336,30 @@ static SHAPES: &[Shape] = shapes![
     ),
     ((&'static str, u8, &'static str), &'static [u8]),
 ];
+
+/// 型の組の一覧の件数（`storage::snapshot` の網羅テストが、型の追加漏れを検知するために使う）。
+#[cfg(test)]
+pub(super) fn shape_count() -> usize {
+    SHAPES.len()
+}
+
+/// 型の組の一覧を順に試して `name` の表を `src` から `dst` へ複製する（`storage::snapshot` 用）。
+///
+/// どの shape でも開けなければ `Ok(false)`（呼び出し側は未知の型の表として中止する）。
+pub(super) fn copy_by_shape(
+    src: &ReadTransaction,
+    dst: &WriteTransaction,
+    name: &str,
+    entries: &mut u64,
+) -> Result<bool, super::snapshot::SnapshotExportError> {
+    for shape in SHAPES {
+        match (shape.copy)(src, dst, name, entries)? {
+            super::snapshot::CopyProbe::Mismatch => continue,
+            super::snapshot::CopyProbe::Copied => return Ok(true),
+        }
+    }
+    Ok(false)
+}
 
 /// writer の内容と確定済み状態（`committed`）の差分を取る。
 ///

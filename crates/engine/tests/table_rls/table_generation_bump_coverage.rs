@@ -81,8 +81,10 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1690（`Storage::sequence_allocator` の追加）で行番号が移動したための追随（旧: 950／981）。
     // PR #2566 レビュー対応（一時 DB 判定 `Storage::is_temp_scoped` の追加。+12 行）で追随（旧: 963／994）。
     // Issue #1958（`begin_explicit_write_txn_nowait` の追加。+20 行）の取り込みでさらに移動。 Issue #2879（storage.rs への +1 行）で移動。
-    ("storage.rs", 1164),
-    ("storage.rs", 1198),
+    // Issue #2151（`snapshot` モジュール宣言・`snapshot_export_busy` フィールド・`export_snapshot` の追加。+18 行）で追随（旧: 1164／1198）。
+    // 追加した書き出しの commit は redb の別ファイル `Database` に対するもので commit_boundary を通らず、本一覧の対象外。
+    ("storage.rs", 1182),
+    ("storage.rs", 1216),
     ("recovery/panic_hook.rs", 404),
     ("txn.rs", 210),
     ("txn.rs", 387),
