@@ -516,7 +516,9 @@ pub(super) fn replay_segments(
             .ok_or(IncrementalError::ChainBroken)?;
         let fh = first.info.header;
         let connects = if first.overlap_ok {
-            fh.first_lsn <= next && generation < fh.last_lsn
+            // 先頭が完全に適用済みの区間に収まってもよい（読み切って照合する）。続きの欠落は、
+            // 以降のレコードの `prev_lsn` の連鎖と最終の世代の検査が拒否する。
+            fh.first_lsn <= next
         } else {
             next == fh.first_lsn
         };

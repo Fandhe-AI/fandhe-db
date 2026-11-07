@@ -747,3 +747,74 @@ fn time_resolution_rejects_segments_rewritten_after_verification() {
         "{r:?}"
     );
 }
+
+/// アーカイブのディレクトリのうち、LSN `lsn` だけを含む（1 レコード 1 セグメント）セグメントの内容を、
+/// 時刻だけ付け替えたもの（チェックサムは正しい）に置き換える。
+fn diverge_one_segment(archive: &Path, lsn: u64) {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(archive)
+        .expect("dir")
+        .map(|e| e.expect("entry").path())
+        .collect();
+    files.sort();
+    let victim = files[(lsn - 1) as usize].clone();
+    let tmp = private_dir("pitr-diverge-one");
+    let forged = tmp.path().join("forged.seg");
+    retime_segment(&victim, &forged, &[5]);
+    std::fs::copy(&forged, &victim).expect("overwrite");
+}
+
+#[test]
+fn segments_fully_inside_the_base_are_compared_regardless_of_the_split() {
+    let s = scenario("pitr-split-base", 1);
+    let last = s.fx.generation();
+    // 対照: 同じ履歴なら通る。
+    let (_w, _db, r) = restore(&s.base, &[], Some(s.archive.path()), PitrTarget::Lsn(last));
+    r.expect("same history");
+    // ベースの内側(LSN 2)だけを含むセグメントの内容を食い違わせると、1 つの大きなセグメントのときと
+    // 同じく拒否される。
+    diverge_one_segment(s.archive.path(), 2);
+    let (_w, _db, r) = restore(&s.base, &[], Some(s.archive.path()), PitrTarget::Lsn(last));
+    assert!(matches!(r, Err(IncrementalError::ChainBroken)), "{r:?}");
+    // 時刻指定でも同じ（時刻の解決は通っても、再生が拒否する）。
+    let (_w, _db, r) = restore(
+        &s.base,
+        &[],
+        Some(s.archive.path()),
+        PitrTarget::TimeMicros(i64::MAX),
+    );
+    assert!(r.is_err());
+}
+
+#[test]
+fn segments_fully_inside_an_incremental_are_compared_regardless_of_the_split() {
+    let mut fx = Fixture::new("pitr-split-inc");
+    fx.round_1();
+    let (base, base_point) = fx.full_backup("base.redb");
+    fx.step("INSERT INTO ev (id, embedding) VALUES (30, '[0.1,0.1]')");
+    fx.step("INSERT INTO ev (id, embedding) VALUES (31, '[0.1,0.1]')");
+    let inc = fx.path("inc.seg");
+    fx.storage()
+        .export_incremental(&base_point, &inc)
+        .expect("incremental");
+    fx.round_2();
+    let archive = private_dir("pitr-split-inc-arc");
+    fx.archive_into(archive.path(), 1);
+    let last = fx.generation();
+    let (_w, db, r) = restore(
+        &base,
+        std::slice::from_ref(&inc),
+        Some(archive.path()),
+        PitrTarget::Lsn(last),
+    );
+    r.expect("same history");
+    assert_state_at(&fx, &db, last);
+    // 増分の範囲(LSN base+1)に完全に収まるアーカイブのセグメントを食い違わせる。
+    diverge_one_segment(archive.path(), base_point.end_lsn + 1);
+    let (_w, _db, r) = restore(
+        &base,
+        std::slice::from_ref(&inc),
+        Some(archive.path()),
+        PitrTarget::Lsn(last),
+    );
+    assert!(matches!(r, Err(IncrementalError::ChainBroken)), "{r:?}");
+}

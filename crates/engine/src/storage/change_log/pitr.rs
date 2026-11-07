@@ -102,9 +102,9 @@ pub fn restore_to_point(
         };
         let (_, segments) = verified_segments(dir, &expect)?;
         for (path, info) in segments {
-            if info.header.last_lsn <= covered_end {
-                continue;
-            }
+            // 適用済みの区間（ベース・増分）に完全に収まるセグメントも除外しない。再生器が読み切り、
+            // 各レコードを適用先の `change_log` の行と照合し、全体チェックサムも確かめる（セグメントの
+            // 分割位置で判定が変わらないようにする）。
             if info.header.storage_format != STORAGE_FORMAT_VERSION {
                 return Err(IncrementalError::UnsupportedFormat);
             }
@@ -115,7 +115,10 @@ pub fn restore_to_point(
             });
         }
         // 続きが欠けなく始まること（ベース・増分の終点の次を覆う先頭のセグメントがある）。
-        if let Some(first) = archive.first() {
+        if let Some(first) = archive
+            .iter()
+            .find(|r| r.info.header.last_lsn > covered_end)
+        {
             let next = covered_end
                 .checked_add(1)
                 .ok_or(IncrementalError::ChainBroken)?;
