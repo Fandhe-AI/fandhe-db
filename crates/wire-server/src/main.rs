@@ -493,7 +493,7 @@
 //! 開いて整合検査（行・索引は読み取りだけ。open 自体がヘッダを書き換えうる。読み取り専用の open は #3074）を実行し、結果を `key=value` 行で標準出力へ出す（Issue #2156・
 //! RECOVER-13 (6) ポインタ）。終了コード: 0=整合（Warning のみを含む）、1=実行時の失敗（稼働中の
 //! サーバーが使用中を含む）、2=引数／パスの拒否、4=矛盾あり、5=検査できなかった項目のみ
-//! （3=検査用の一時コピーを消せなかった。結果より優先）。詳細は `wire_server::verify_opt`。
+//! （3=検査は完了したが一時コピーを消せなかった。失敗時は本来のコード）。詳細は `wire_server::verify_opt`。
 //! `wire-server restore --from <backup> --db <new path>` サブコマンドは、バックアップを一時名へ
 //! コピーして検査し、通った場合だけ新規パスへ公開する（既存の出力先は上書きしない。通らなければ
 //! 何も公開せず 4 または 5 で終了。詳細は `wire_server::restore_opt`）。
@@ -4002,60 +4002,33 @@ fn run_verify(args: &[String]) -> ExitCode {
     };
     // 元ファイルは開かない（`Storage::open` は旧形式の移行などで書き込むため）。排他ロックを
     // 保持したまま一時コピーを検査する（`restore_opt::verify_via_copy`）。
-    use wire_server::restore_opt::RestoreError;
     let mut leftover = None;
     let result =
         wire_server::restore_opt::verify_via_copy(&parsed.db, &parsed.options, &mut leftover);
-    if let Some(p) = leftover {
-        // 一時コピー（全テナントのデータを含む）を消せなかった。検査結果より優先して 3 にする
-        // （`backup` の「3=後始末未確認」と同じ扱い）。検査結果は成功時に標準出力へ出す。
-        if let Ok(report) = &result {
-            let _ = write_stdout(&verify_opt::render(report));
-        }
-        report_leftover("verify", &p);
-        return ExitCode::from(backup_opt::EXIT_PUBLISHED_UNVERIFIED);
-    }
-    match result {
+    // 終了コードは restore と同じ規則: 検査が完了した（Ok）うえで消せなかった場合だけ 3、
+    // 失敗（Err）は本来の失敗の文言と終了コードを保ち、残置は併せて通知する。
+    let code = wire_server::restore_opt::verify_exit_code(&result, leftover.is_some());
+    match &result {
         Ok(report) => {
             // 出力先の閉鎖（EPIPE 等）で panic させない。書けなければ実行時の失敗（1）。
-            if write_stdout(&verify_opt::render(&report)).is_err() {
+            if write_stdout(&verify_opt::render(report)).is_err() {
+                if let Some(p) = &leftover {
+                    report_leftover("verify", p);
+                }
                 return ExitCode::from(backup_opt::EXIT_FAILURE);
             }
-            ExitCode::from(verify_opt::classify(&report))
         }
         Err(e) => {
-            let (code, msg) = match e {
-                RestoreError::SourceInUse => (
-                    backup_opt::EXIT_FAILURE,
-                    "database is in use by another process (stop the server first)",
-                ),
-                RestoreError::InvalidSource => (
-                    backup_opt::EXIT_USAGE,
-                    "--db must be an existing non-empty database file",
-                ),
-                RestoreError::OpenFailed => (backup_opt::EXIT_FAILURE, "failed to open database"),
-                RestoreError::SourceChanged => (
-                    backup_opt::EXIT_FAILURE,
-                    "database file changed while it was being copied",
-                ),
-                RestoreError::TempReplaced => (
-                    backup_opt::EXIT_FAILURE,
-                    "temporary copy was replaced or removed",
-                ),
-                RestoreError::VerifyFailed => (
-                    backup_opt::EXIT_FAILURE,
-                    "integrity check could not be started",
-                ),
-                _ => (
-                    backup_opt::EXIT_FAILURE,
-                    "failed to copy the database for checking (needs free space next to it \
-                     about as large as the database, and a writable directory)",
-                ),
-            };
-            engine::log_stderr!("wire-server: verify: {msg}");
-            ExitCode::from(code)
+            engine::log_stderr!(
+                "wire-server: verify: {}",
+                wire_server::restore_opt::verify_failure_message(e)
+            );
         }
     }
+    if let Some(p) = &leftover {
+        report_leftover("verify", p);
+    }
+    ExitCode::from(code)
 }
 
 /// `restore --from <backup> --db <path>` サブコマンド（Issue #2156・RECOVER-13 (3)(7) ポインタ）。

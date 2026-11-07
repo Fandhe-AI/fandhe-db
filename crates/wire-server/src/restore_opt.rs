@@ -163,6 +163,36 @@ pub fn classify(result: &Result<RestoreSummary, RestoreError>) -> (u8, String) {
     }
 }
 
+/// `verify` の失敗（[`verify_via_copy`] の `Err`）を表示する固定の英語文。パス・表名・行の値を含まない。
+pub fn verify_failure_message(e: &RestoreError) -> &'static str {
+    match e {
+        RestoreError::SourceInUse => {
+            "database is in use by another process (stop the server first)"
+        }
+        RestoreError::InvalidSource => "--db must be an existing non-empty database file",
+        RestoreError::OpenFailed => "failed to open database",
+        RestoreError::SourceChanged => "database file changed while it was being copied",
+        RestoreError::TempReplaced => "temporary copy was replaced or removed",
+        RestoreError::VerifyFailed => "integrity check could not be started",
+        _ => {
+            "failed to copy the database for checking (needs free space next to it about as \
+             large as the database, and a writable directory)"
+        }
+    }
+}
+
+/// `verify` の終了コードを決める。検査が完了した（`Ok`）うえで一時コピーを消せなかった
+/// （`leftover`）場合だけ 3（主処理は完了したが後始末未確認）。それ以外は、`Ok` なら検査結果
+/// （0・4・5）、`Err` なら本来の失敗（`InvalidSource`=2、他=1）。残置の有無で失敗を隠さない。
+pub fn verify_exit_code(result: &Result<IntegrityReport, RestoreError>, leftover: bool) -> u8 {
+    match result {
+        Ok(_) if leftover => EXIT_PUBLISHED_UNVERIFIED,
+        Ok(report) => verify_opt::classify(report),
+        Err(RestoreError::InvalidSource) => EXIT_USAGE,
+        Err(_) => EXIT_FAILURE,
+    }
+}
+
 /// バックアップ `from` を新しい DB `dest` へ復元する（モジュール doc の公開手順）。
 /// 公開しなかった経路で一時コピーを消せなかったときは、残ったパスを `leftover` に入れる
 /// （全テナントのデータのコピーが残るため、呼び出し元が通知する）。
@@ -573,6 +603,27 @@ mod tests {
         assert_eq!(t.remove(), Err(path.clone()));
         assert!(path.exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// verify の終了コード: 3 は検査が完了した（Ok）うえで消せなかったときだけ。失敗は残置があっても
+    /// 本来の終了コードのまま。
+    #[test]
+    fn verify_exit_code_keeps_real_failures_and_uses_3_only_after_completion() {
+        let ok = Ok(IntegrityReport::default());
+        assert_eq!(verify_exit_code(&ok, false), 0);
+        assert_eq!(verify_exit_code(&ok, true), EXIT_PUBLISHED_UNVERIFIED);
+        let cases = [
+            (RestoreError::SourceInUse, EXIT_FAILURE),
+            (RestoreError::OpenFailed, EXIT_FAILURE),
+            (RestoreError::TempReplaced, EXIT_FAILURE),
+            (RestoreError::Io(std::io::ErrorKind::Other), EXIT_FAILURE),
+            (RestoreError::InvalidSource, EXIT_USAGE),
+        ];
+        for (e, want) in cases {
+            let err = Err(e);
+            assert_eq!(verify_exit_code(&err, false), want);
+            assert_eq!(verify_exit_code(&err, true), want);
+        }
     }
 
     #[test]
