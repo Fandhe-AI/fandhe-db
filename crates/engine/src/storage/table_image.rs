@@ -149,6 +149,9 @@ struct Shape {
         &str,
         &mut u64,
     ) -> Result<super::snapshot::CopyProbe, super::snapshot::SnapshotExportError>,
+    /// 整合検査（`storage::integrity`・RECOVER-13 のポインタ）の全エントリ読み取り。型の組の一覧を
+    /// 共有し、一覧に無い型の表を「未対応」として検知する。
+    scan: fn(&ReadTransaction, &str) -> Result<super::integrity::ScanProbe, ()>,
     /// 変更ログ（`storage::change_log`・RECOVER-14 のポインタ）が commit 準備段階で writer の
     /// 現在内容（after-image）を読む操作。
     read: fn(
@@ -425,6 +428,7 @@ macro_rules! shapes {
             capture: capture_table::<$k, $v>,
             apply: apply_table::<$k, $v>,
             copy: super::snapshot::copy_table::<$k, $v>,
+            scan: super::integrity::scan_table::<$k, $v>,
             read: read_table::<$k, $v>,
         }),+]
     };
@@ -471,6 +475,28 @@ static SHAPES: &[Shape] = shapes![
 #[cfg(test)]
 pub(super) fn shape_count() -> usize {
     SHAPES.len()
+}
+
+/// [`scan_by_shape`] の結果。
+pub(super) enum ScanOutcome {
+    /// 読めた（エントリ数）。
+    Scanned(#[allow(dead_code)] u64),
+    /// どの型の組でも開けない（未知の型の表）。
+    Unknown,
+    /// 型は合ったが全エントリを読めなかった。
+    Unreadable,
+}
+
+/// 型の組の一覧を順に試して `name` の表の全エントリを読む（整合検査用。読み取り専用）。
+pub(super) fn scan_by_shape(read: &ReadTransaction, name: &str) -> ScanOutcome {
+    for shape in SHAPES {
+        match (shape.scan)(read, name) {
+            Ok(super::integrity::ScanProbe::Mismatch) => continue,
+            Ok(super::integrity::ScanProbe::Scanned(n)) => return ScanOutcome::Scanned(n),
+            Err(()) => return ScanOutcome::Unreadable,
+        }
+    }
+    ScanOutcome::Unknown
 }
 
 /// 型の組の一覧を順に試して `name` の表を `src` から `dst` へ複製する（`storage::snapshot` 用）。

@@ -772,6 +772,117 @@ where
     })
 }
 
+/// 整合検査（`storage::integrity`。RECOVER-13 のポインタ）向けの、テナント 1 つ分の GIN 相当索引の
+/// 読み取り専用監査。[`audit_tenant_read_only`] と同じ意味の件数を返すが、期待ポスティングの集合を
+/// メモリに溜めず、行→索引（点照会）と索引→行（行の読み戻し）で確かめるため、メモリはテナントの行数に
+/// 比例しない。マーカーが無効なときは遅延再構築の待ちとして件数 0 を返す（索引は読まれない設計）。
+/// 逆引きは衛生用で正しさに関与しないため対象外。`unevaluable` は抽出できず突き合わせられなかった件数。
+pub(crate) fn audit_tenant_streaming<R, I>(
+    row_table: &R,
+    index_table: Option<&I>,
+    schema: &TableSchema,
+    tenant_id: &str,
+    decl: &DeclaredGinIndex,
+    limits: &GinLimits,
+) -> Result<(GinIndexAudit, u64), TenantWriteError>
+where
+    R: ReadableTable<(&'static str, u64), &'static [u8]>,
+    I: ReadableTable<(&'static str, &'static [u8]), &'static [u8]>,
+{
+    let target = resolve_target(schema, decl)?;
+    let sig = signature(&target)?;
+    let mut audit = GinIndexAudit {
+        marker_valid: false,
+        missing: 0,
+        stale: 0,
+    };
+    let mut unevaluable = 0u64;
+    let Some(index_table) = index_table else {
+        return Ok((audit, unevaluable));
+    };
+    audit.marker_valid = match index_table
+        .get((tenant_id, MARKER_SUBKEY.as_slice()))
+        .map_err(storage_error)?
+    {
+        Some(guard) => marker_matches(guard.value(), &sig),
+        None => false,
+    };
+    if !audit.marker_valid {
+        return Ok((audit, unevaluable));
+    }
+
+    let start = std::ops::Bound::Included(row_key(tenant_id, RowId::from_index_raw(0)));
+    let end = std::ops::Bound::Included(row_key(tenant_id, RowId::from_index_raw(u64::MAX)));
+    for entry in row_table
+        .range::<(&str, u64)>((start, end))
+        .map_err(storage_error)?
+    {
+        let (k, v) = entry.map_err(storage_error)?;
+        let (key_tenant, id) = split_row_key(k.value());
+        if key_tenant != tenant_id {
+            break;
+        }
+        let Ok(entries) = row_entries(schema, &target, v.value(), limits) else {
+            unevaluable = unevaluable.saturating_add(1);
+            continue;
+        };
+        for e in &entries {
+            let Ok(sub) = posting_subkey(e, id) else {
+                unevaluable = unevaluable.saturating_add(1);
+                continue;
+            };
+            if index_table
+                .get((tenant_id, sub.as_slice()))
+                .map_err(storage_error)?
+                .is_none()
+            {
+                audit.missing = audit.missing.saturating_add(1);
+            }
+        }
+    }
+
+    let lo = std::ops::Bound::Included((tenant_id, [POSTING_TAG].as_slice()));
+    let hi = std::ops::Bound::Excluded((tenant_id, [REVERSE_TAG].as_slice()));
+    for entry in index_table
+        .range::<(&str, &[u8])>((lo, hi))
+        .map_err(storage_error)?
+    {
+        let (k, _) = entry.map_err(storage_error)?;
+        let (key_tenant, subkey) = k.value();
+        if key_tenant != tenant_id {
+            break;
+        }
+        // `[0x01][entry_len: u16 BE][entry][rowid: u64 BE]` を分解する。
+        let parsed = subkey.len().checked_sub(8).and_then(|split| {
+            let rowid = <[u8; 8]>::try_from(subkey.get(split..)?).ok()?;
+            let entry = subkey.get(3..split)?;
+            // 宣言された長さと実際の entry 長が一致しないキーは壊れている。
+            let declared = u16::from_be_bytes(<[u8; 2]>::try_from(subkey.get(1..3)?).ok()?);
+            (usize::from(declared) == entry.len())
+                .then_some((entry, RowId::from_index_raw(u64::from_be_bytes(rowid))))
+        });
+        let Some((posting_entry, owner)) = parsed else {
+            unevaluable = unevaluable.saturating_add(1);
+            continue;
+        };
+        match row_table
+            .get(row_key(tenant_id, owner))
+            .map_err(storage_error)?
+        {
+            None => audit.stale = audit.stale.saturating_add(1),
+            Some(guard) => match row_entries(schema, &target, guard.value(), limits) {
+                Ok(entries) => {
+                    if !entries.contains(posting_entry) {
+                        audit.stale = audit.stale.saturating_add(1);
+                    }
+                }
+                Err(_) => unevaluable = unevaluable.saturating_add(1),
+            },
+        }
+    }
+    Ok((audit, unevaluable))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

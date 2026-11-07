@@ -57,6 +57,12 @@ const TABLE: &[(&str, usize, Class, &str)] = &[
         "DDL・スキーマ書き換え・世代・件数・ページ走査の内部。SQL 表層は行を返さない",
     ),
     (
+        "storage/integrity.rs",
+        2,
+        Class::NonRead,
+        "整合検査（RECOVER-13 (6)）。運用者向けの読み取り専用検査で、報告は件数だけ。利用者へ行を返さない",
+    ),
+    (
         "storage/commit_log.rs",
         2,
         Class::NonRead,
