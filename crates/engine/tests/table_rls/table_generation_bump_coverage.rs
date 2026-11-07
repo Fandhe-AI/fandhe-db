@@ -242,7 +242,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1651（式索引の UNIQUE・列変更への追随。`catalog.rs` に行が追加）で一括追随（旧: 10597／12994／13075／13184／13257／13779）。
     // Issue #1651（式索引の UNIQUE・失効管理。`catalog.rs` に行が追加）で一括追随（旧: 13274／13355／13464／13537／14080／10874）。
     // Issue #2206（GIN 相当索引の宣言。`catalog.rs` に行が追加）で catalog.rs 全エントリを追随。
-    ("catalog.rs", 15716),
+    ("catalog.rs", 15718),
     // `Storage::drop_enum_type`（同上）: 削除前に依存列（当該型を参照する
     // `ColumnType::Enum` 列）が 1 つも無いことを `dependent_tables_in_txn`
     // で検証済みのため、こちらも `CATALOG_TABLE`／`user_rows/{table_name}`
@@ -309,7 +309,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1639（DROP TABLE の複数指定。`catalog.rs` に行が追加）で追随（+118 行）。
     // Issue #1624（RENAME TO の索引・FK・制約追随。`catalog.rs` に行が追加）で一括追随（+79 行。旧: 11412/11493/11632/11665）。
     // Issue #1659（CREATE VIEW の列別名。`catalog.rs` に行が追加）で追随（+101 行。旧: 11250）。
-    ("catalog.rs", 15799),
+    ("catalog.rs", 15801),
     // `Storage::create_view`（TABLE-18・SQL-23・TASK-205、Issue #909）: ビューは
     // `[VIEWS_TABLE]` のみを書き、`CATALOG_TABLE`／`user_rows/{table_name}` の
     // いずれにも触れない（行を持たない非マテリアライズド定義のため対象
@@ -369,7 +369,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1639（DROP TABLE の複数指定。`catalog.rs` に行が追加）で追随（+118 行）。
     // Issue #1624（RENAME TO の索引・FK・制約追随。`catalog.rs` に行が追加）で一括追随（+79 行。旧: 11412/11493/11632/11665）。
     // Issue #1659（CREATE VIEW の列別名。`catalog.rs` に行が追加）で追随（+131 行。旧: 11389）。
-    ("catalog.rs", 15935),
+    ("catalog.rs", 15937),
     // `Storage::drop_view`（同上）: 削除前に依存するビューが 1 つも無いことを
     // `views_depending_on_in_txn` で検証済みのうえで `[VIEWS_TABLE]` のみを
     // 書く。同じ理由でバンプ対象がない。PR #1048 レビュー対応（同上）で
@@ -438,11 +438,11 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1644（TRUNCATE CASCADE／RESTRICT）で catalog.rs 全エントリ +1・tenant.rs 506→516 に追随。
     // Issue #1663（MATERIALIZED VIEW のカタログ追加）の base 取り込みで追随（旧: 13013）。
     // Issue #1671（ビュー INSERT 書き換えで `catalog.rs` に行が追加）で全エントリを追随。
-    ("catalog.rs", 16017),
+    ("catalog.rs", 16019),
     // `Storage::create_or_replace_view_checked`（TABLE-41 (2)、Issue #1660。`create_or_replace_view` の本体）: `create_view` と同じく
     // `[VIEWS_TABLE]` のみを書く（上書き）。ビューは行ストア・世代を持たないためバンプ対象がない。
     // Issue #1737（`is_unique_index_of_table` の追加。`catalog.rs` に +22 行）で追随（旧: 15666）。
-    ("catalog.rs", 16741),
+    ("catalog.rs", 16743),
     // `Storage::drop_tables`（Issue #1684 で本体を `drop_tables_in_txn` へ切り出した）: 世代 bump は
     // 同一 write txn で先に呼ばれる `drop_tables_in_txn` 内（削除する各表と FK を外した参照元表）で
     // 行われ、本呼び出しはその結果（`dropped > 0`）を単一 commit で確定させるだけ。`bump` が
@@ -455,7 +455,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #2014（HALFVEC 型導入。catalog.rs +43 行）で追随（旧: 12545）。
     // Issue #2018（INT8VEC 型導入。catalog.rs +39 行）で追随（旧: 12588）。
     // Issue #2025（SPARSEVEC 型導入。catalog.rs +58 行）で追随（旧: 12627）。
-    ("catalog.rs", 12998),
+    ("catalog.rs", 13000),
     // 上記 `drop_tables_in_txn` 切り出し（+18 行）に伴い、以降の catalog.rs エントリ（12419／12500／12609／12681／13063）を追随（旧: 12401／12482／12591／12663／13045）。
     // `sql::transaction::SessionTransaction::commit`（SQL-31・TASK-221）:
     // ここで commit する共有 `write_txn` に対象テーブルの `user_rows/{table}`
@@ -625,31 +625,31 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // 作成時の適用は作成本体の txn に相乗りし、作成側が世代を進める）。単体テストの `write_txn` ヘルパはテスト専用の commit。
     ("catalog/privilege/default_acl.rs", 479),
     ("catalog/privilege/default_acl/tests.rs", 98),
-    ("catalog/sequence.rs", 1431),
-    ("catalog/sequence.rs", 1451),
-    ("catalog/sequence.rs", 1492),
-    ("catalog/sequence.rs", 1541),
-    ("catalog/sequence.rs", 1580),
-    ("catalog/sequence.rs", 1600),
-    ("catalog/sequence.rs", 1721),
-    ("catalog/sequence.rs", 1995),
-    ("catalog/sequence.rs", 2085),
-    ("catalog/sequence.rs", 2125),
-    ("catalog/sequence.rs", 2178),
-    ("catalog/sequence.rs", 2446),
-    ("catalog/sequence.rs", 2492),
-    ("catalog/sequence.rs", 2759),
+    ("catalog/sequence.rs", 1476),
+    ("catalog/sequence.rs", 1496),
+    ("catalog/sequence.rs", 1537),
+    ("catalog/sequence.rs", 1586),
+    ("catalog/sequence.rs", 1625),
+    ("catalog/sequence.rs", 1645),
+    ("catalog/sequence.rs", 1766),
+    ("catalog/sequence.rs", 2040),
+    ("catalog/sequence.rs", 2130),
+    ("catalog/sequence.rs", 2170),
+    ("catalog/sequence.rs", 2223),
+    ("catalog/sequence.rs", 2491),
+    ("catalog/sequence.rs", 2537),
+    ("catalog/sequence.rs", 2804),
     // `Storage::create_function`／`Storage::drop_function`（UDF カタログ・Issue #1919）:
     // UDF 定義は専用の関数カタログ表のみを書き、`CATALOG_TABLE`／`user_rows/{table_name}`
     // のいずれにも触れない（行を持たない定義メタデータのため、世代照合の対象テーブルが
     // 存在せずバンプ対象がない）。
     // Issue #1917: `replace_function`（862）の追加と行移動の追随（同じ表だけを書く）。
     // Issue #2236: 所有者の保存を作成と同じ txn へ移した（`record_function_owner` を廃止）ための行移動の追随。
-    ("catalog/function.rs", 1292),
-    ("catalog/function.rs", 1333),
-    ("catalog/function.rs", 1424),
-    ("catalog/function.rs", 1474),
-    ("catalog/function.rs", 1525),
+    ("catalog/function.rs", 1302),
+    ("catalog/function.rs", 1343),
+    ("catalog/function.rs", 1434),
+    ("catalog/function.rs", 1484),
+    ("catalog/function.rs", 1535),
     // Issue #1921: commit 後の世代（UDF カタログ）追加による行移動の追随。`sql/udf_load.rs` の 1 件は
     // `#[cfg(test)]` 内で壊れた定義 blob を直接書くテスト補助（関数カタログ表だけを書き、世代の対象外）。
     // Issue #2798（型付き永続化の単体テスト追加）・#2218（ルーチンのロード追加）で行番号が移動したための
@@ -659,10 +659,10 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // 同上（#2798 で追加した未知バージョン blob を直接書く単体テスト補助。関数カタログ表だけを書く）。
     ("sql/udf_load.rs", 559),
     // Issue #1920: 上の `#[cfg(test)]` 内のテスト補助（多重定義・SCHEMA 接頭辞削除の状態を直接作る）。
-    ("catalog/function.rs", 2110),
-    ("catalog/function.rs", 2322),
+    ("catalog/function.rs", 2120),
+    ("catalog/function.rs", 2332),
     // Issue #2882: `_in_txn` 書き込みの abort／commit を確かめる単体テスト（関数カタログ表だけを書く）。
-    ("catalog/function.rs", 1589),
+    ("catalog/function.rs", 1599),
     // Issue #1689（ALTER SEQUENCE）: `alter_sequence`／`rename_sequence`（803・842）も同じ表だけを書く
     // （定義 blob の上書き・キーの付け替え・状態行の削除）ため同じ理由で対象外。
     // Issue #1733（INSERT ... SELECT）: `core/insert_select_exec.rs` の 1012・1144 行（Issue #2613・#2614・#2615・#2212・#1726 で追随）は `#[cfg(test)]` 内の

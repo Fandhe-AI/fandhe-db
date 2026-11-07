@@ -83,6 +83,8 @@ pub(crate) mod namespace;
 // ため、該当項目に個別に `dead_code` を許可している。
 pub(crate) mod function;
 pub(crate) mod function_dependency;
+// 論理ダンプのスキーマ側（RECOVER-16 (1)・Issue #2160。設計記録: `docs/design/logical-dump.md`）。
+pub mod ddl_export;
 // TRIGGER のカタログ（TABLE-45・Issue #1722。設計記録: `docs/design/trigger-catalog.md`）。
 pub(crate) mod policy;
 pub(crate) mod trigger;

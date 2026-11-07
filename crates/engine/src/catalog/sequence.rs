@@ -921,6 +921,51 @@ fn caller_current_value_in_txn(
     Ok(read_state_in_txn(write_txn, tenant_id, id)?.map(|c| c.last_value))
 }
 
+/// 全 SEQUENCE の定義を `(relation キー, 定義, 所有者)` で読む（論理ダンプの書き出し専用。RECOVER-16。
+/// 読み取りスナップショットから 1 回走査する。テナントの絞り込みは呼び出し側が relation キーで行う）。
+/// 走査は [`MAX_SEQUENCES`] 件で打ち切り、超過・定義 blob の復号失敗は `Err`（fail-closed）。
+pub(crate) fn list_sequence_definitions_in<R: ReadSource>(
+    src: &R,
+) -> Result<Vec<(String, SequenceDef, Option<SequenceOwner>)>> {
+    let table = match src.open_table(SEQUENCES_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut out = Vec::new();
+    for entry in table.iter()? {
+        if out.len() >= MAX_SEQUENCES {
+            return Err(CatalogError::CorruptSchema(
+                "too many sequences".to_string(),
+            ));
+        }
+        let (k, v) = entry?;
+        let (def, owner) = decode_sequence_def_with_owner(v.value())?;
+        out.push((sequence_entry_name(k.value()), def, owner));
+    }
+    Ok(out)
+}
+
+/// `(tenant, sequence_id)` の永続化済み現在値 `(last_value, is_called)` を読む（論理ダンプの書き出し専用。
+/// 状態行が無ければ `None`）。他テナントの状態行は引かない。
+pub(crate) fn sequence_state_in<R: ReadSource>(
+    src: &R,
+    tenant: &str,
+    sequence_id: u64,
+) -> Result<Option<(i64, bool)>> {
+    match src.open_table(SEQUENCE_STATE_TABLE) {
+        Ok(t) => match t.get((tenant, sequence_id))? {
+            Some(g) => {
+                let c = decode_state(g.value())?;
+                Ok(Some((c.last_value, c.is_called)))
+            }
+            None => Ok(None),
+        },
+        Err(redb::TableError::TableDoesNotExist(_)) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// `setval` の失敗（`sql::sequence_fn` が SQL 表層のエラーへ写像する）。
 #[derive(Debug)]
 pub(crate) enum SetvalError {
@@ -1212,7 +1257,7 @@ pub(crate) fn create_table_with_implicit_sequences_in_txn(
 /// 収まらない場合は長い方の名前から 1 文字ずつ削る（同じ長さなら `name2` を削る）。識別子は
 /// ASCII（`validate_identifier` 済み）の前提で、境界で切れない不正入力は切らずにそのまま返し、
 /// 呼び出し側の `validate_identifier` に拒否させる。
-fn make_object_name(name1: &str, name2: &str, label: &str) -> String {
+pub(crate) fn make_object_name(name1: &str, name2: &str, label: &str) -> String {
     let overhead = label.len().saturating_add(2);
     let avail = super::MAX_IDENTIFIER_LEN.saturating_sub(overhead);
     let (mut l1, mut l2) = (name1.len(), name2.len());

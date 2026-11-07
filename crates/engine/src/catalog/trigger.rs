@@ -433,6 +433,16 @@ pub(crate) fn list_triggers_in_txn(
     list_in_txn(write_txn, table_key, scope)
 }
 
+/// 読み取り元（確定済みスナップショットなど）から `scope` の表 `table_key` のトリガを名前の昇順で引く
+/// （論理ダンプの書き出し専用。RECOVER-16。他テナントの定義は構造上引けない）。
+pub(crate) fn list_triggers_in_source<R: ReadSource>(
+    src: &R,
+    scope: &str,
+    table_key: &str,
+) -> Result<Vec<TriggerDef>> {
+    list_in_txn(src, table_key, scope)
+}
+
 /// 内部 ID を 1 つ払い出す（1 始まり・`checked_add`・再利用しない）。
 fn allocate_id_in_txn(write_txn: &redb::WriteTransaction) -> Result<u64> {
     let mut counter = write_txn.open_table_logged(TRIGGER_ID_COUNTER_TABLE)?;
