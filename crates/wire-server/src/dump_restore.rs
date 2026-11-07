@@ -19,6 +19,7 @@ use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
 use engine::core::{CopyPlan, EngineCore};
+use engine::sql::copy::CopyInSession;
 use engine::sql::mode::SessionState;
 use engine::sql::statement_splitter::{split_statements, SplitOutcome};
 use engine::storage::{IntegrityOptions, Storage};
@@ -30,7 +31,7 @@ use crate::dump_opt::{
     DumpFormat, DumpParts, DumpScope, EXIT_FAILURE, EXIT_INVALID_DUMP, EXIT_NOT_CONSISTENT,
     EXIT_PUBLISHED_UNVERIFIED, EXIT_USAGE,
 };
-use crate::dump_tmp::{parent_of, TempFile, TmpError};
+use crate::dump_tmp::{parent_of, TempFile, TmpError, WorkDir};
 
 /// 共有分だけのダンプ（テナント固有の内容が無い）を流し込むときの実行テナント。共有の定義は
 /// どのテナントの文脈で作っても同じ（行は無い）。実在のテナント名と衝突しても害は無い。
@@ -166,10 +167,22 @@ pub fn restore(
             return Err(RestoreError::TenantMismatch);
         }
     }
-    let mut tmp = TempFile::create(parent, "fandhe-dump-restore").map_err(RestoreError::Tmp)?;
-    let result = apply_verify_publish(&mut reader, &header, &mut tmp, dest);
+    // 一時 DB は、復元先の親の中に作る 0700 の作業ディレクトリに置く。親に他者が書き込めても、
+    // 一時名をパスで開く間に別のファイル（既存 DB へのリンク）へ差し替えられない。
+    let mut work = WorkDir::create(parent, "fandhe-dump-restore").map_err(RestoreError::Tmp)?;
+    let mut tmp = match TempFile::create(work.access_path(), "db") {
+        Ok(t) => t,
+        Err(e) => {
+            let _ = work.remove();
+            return Err(RestoreError::Tmp(e));
+        }
+    };
+    let result = apply_verify_publish(&mut reader, &header, &mut tmp, &work, dest);
     if let Err(p) = tmp.remove() {
         *leftover = Some(p);
+    }
+    if let Err(p) = work.remove() {
+        leftover.get_or_insert(p);
     }
     result
 }
@@ -178,10 +191,12 @@ fn apply_verify_publish(
     reader: &mut FileReader<BufReader<File>>,
     header: &Header,
     tmp: &mut TempFile,
+    work: &WorkDir,
     dest: &Path,
 ) -> Result<RestoreSummary, RestoreError> {
     // 長さ 0 の一時ファイルを開くと engine が新規 DB として初期化する。開く前後でパスが保持 fd の
     // ままであることを確かめる（差し替えられた場合に別のファイルへ書かない）。
+    work.check().map_err(RestoreError::Tmp)?;
     tmp.check_path().map_err(RestoreError::Tmp)?;
     let summary = {
         let core = EngineCore::open(&tmp.path).map_err(|_| RestoreError::OpenFailed)?;
@@ -190,6 +205,7 @@ fn apply_verify_publish(
         drop(core);
         summary
     };
+    work.check().map_err(RestoreError::Tmp)?;
     tmp.check_path().map_err(RestoreError::Tmp)?;
     {
         let storage = Storage::open(&tmp.path).map_err(|_| RestoreError::VerifyFailed)?;
@@ -200,6 +216,7 @@ fn apply_verify_publish(
             return Err(RestoreError::NotConsistent);
         }
     }
+    work.check().map_err(RestoreError::Tmp)?;
     tmp.publish(dest).map_err(RestoreError::Tmp)?;
     Ok(summary)
 }
@@ -313,41 +330,62 @@ fn restore_copy(
         ordinal,
         code: e.wire_code(),
     };
-    let mut total: u64 = 0;
-    loop {
+    let begin = |session: &mut SessionState| -> Result<CopyInSession, RestoreError> {
         core.refresh_session_udfs(ctx, session);
-        let plan = core.begin_copy(ctx, session, sql).map_err(apply_err)?;
-        let CopyPlan::From(mut copy) = plan else {
-            return Err(RestoreError::Disallowed { ordinal });
-        };
-        let max_rows = copy.batch_limits().max_files_per_batch.max(1);
-        let mut rows: usize = 0;
-        let mut bytes: usize = 0;
-        let mut ended = false;
-        while rows < max_rows && bytes < COPY_CHUNK_BYTES {
-            match reader.next_copy_line().map_err(RestoreError::Dump)? {
-                CopyLine::End => {
-                    ended = true;
-                    break;
+        match core.begin_copy(ctx, session, sql).map_err(apply_err)? {
+            CopyPlan::From(c) => Ok(c),
+            CopyPlan::To(..) => Err(RestoreError::Disallowed { ordinal }),
+        }
+    };
+    let commit = |copy: CopyInSession| -> Result<(), RestoreError> {
+        let batch = copy.finish().map_err(apply_err)?;
+        core.commit_copy_in(ctx, batch).map_err(apply_err)?;
+        Ok(())
+    };
+    let mut total: u64 = 0;
+    // 現在のバッチ（セッション・行数・合計バイト）と、engine のバッチ上限から求めた 1 バッチの上限。
+    // 上限は行数（①）・生成チャンク数（④。1 行 1 チャンク）・合計バイト（③）のすべてを見る。
+    let mut current: Option<(CopyInSession, usize, usize)> = None;
+    let mut max_rows: usize = 1;
+    let mut max_bytes: usize = COPY_CHUNK_BYTES;
+    loop {
+        match reader.next_copy_line().map_err(RestoreError::Dump)? {
+            CopyLine::End => break,
+            CopyLine::Row(line) => {
+                // 次の行を足すと上限を超えるなら、足す前に今のバッチを commit して新しく始める。
+                // 1 行だけで上限を超える場合は新しいバッチの `feed` が拒否する（fail-closed）。
+                let full = current.as_ref().is_some_and(|(_, rows, bytes)| {
+                    rows.saturating_add(1) > max_rows
+                        || bytes.saturating_add(line.len()) > max_bytes
+                });
+                if full {
+                    if let Some((copy, rows, _)) = current.take() {
+                        commit(copy)?;
+                        total = total.saturating_add(rows as u64);
+                    }
                 }
-                CopyLine::Row(line) => {
+                if current.is_none() {
+                    let copy = begin(session)?;
+                    let l = copy.batch_limits();
+                    max_rows = l.max_files_per_batch.min(l.max_batch_chunks).max(1);
+                    max_bytes = l.max_batch_total_bytes.clamp(1, COPY_CHUNK_BYTES);
+                    current = Some((copy, 0, 0));
+                }
+                if let Some((copy, rows, bytes)) = current.as_mut() {
                     copy.feed(line).map_err(apply_err)?;
-                    rows = rows.saturating_add(1);
-                    bytes = bytes.saturating_add(line.len());
+                    *rows = rows.saturating_add(1);
+                    *bytes = bytes.saturating_add(line.len());
                 }
             }
-        }
-        if rows > 0 {
-            let batch = copy.finish().map_err(apply_err)?;
-            core.commit_copy_in(ctx, batch).map_err(apply_err)?;
-            total = total.saturating_add(rows as u64);
-        }
-        if ended {
-            if total == 0 {
-                // 書き手は行の無い表の COPY を出さない。空の COPY は枠の破損として拒否する。
-                return Err(RestoreError::Dump(FileError::BadFrame));
-            }
-            return Ok(total);
         }
     }
+    if let Some((copy, rows, _)) = current.take() {
+        commit(copy)?;
+        total = total.saturating_add(rows as u64);
+    }
+    if total == 0 {
+        // 書き手は行の無い表の COPY を出さない。空の COPY は枠の破損として拒否する。
+        return Err(RestoreError::Dump(FileError::BadFrame));
+    }
+    Ok(total)
 }

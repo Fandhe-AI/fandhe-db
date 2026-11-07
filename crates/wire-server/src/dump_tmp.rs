@@ -162,3 +162,170 @@ impl TempFile {
         Ok(())
     }
 }
+
+/// 復元中の一時 DB を置く作業ディレクトリ（0700・自分が `create_new` 相当で作ったもの）。
+///
+/// 復元先の親ディレクトリに他者が書き込める場合、一時名をパスで開く間に別のファイル（既存 DB への
+/// シンボリックリンク）へ差し替えられうる。親の中に自分だけが入れる新しいディレクトリを作り、その中に
+/// 一時 DB を置けば、差し替えを受けるのは作業ディレクトリの名前だけになる。作成時に開いた fd を保持し、
+/// Linux では `/proc/self/fd/<n>` 経由でその fd のディレクトリを指す（作業ディレクトリ自体が名前の
+/// 差し替えを受けても中身へ届かない）。それ以外の unix では実パスを使い、[`WorkDir::check`] の
+/// (dev, ino) 照合で差し替えを検出する。
+pub struct WorkDir {
+    dir: File,
+    path: PathBuf,
+    access: PathBuf,
+    dev: u64,
+    ino: u64,
+    armed: bool,
+}
+
+impl WorkDir {
+    /// `parent` の中に 0700 の作業ディレクトリを新規に作る（既存の名前は使わない）。
+    pub fn create(parent: &Path, prefix: &str) -> Result<Self, TmpError> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::DirBuilderExt;
+        let mut attempts = 0u32;
+        let path = loop {
+            let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+            let p = parent.join(format!(".{prefix}-{}-{seq}.d", std::process::id()));
+            match std::fs::DirBuilder::new().mode(0o700).create(&p) {
+                Ok(()) => break p,
+                Err(e) if e.kind() == ErrorKind::AlreadyExists && attempts < 8 => {
+                    attempts = attempts.saturating_add(1);
+                }
+                Err(e) => return Err(io_err(e)),
+            }
+        };
+        let mut this = {
+            let dir = match File::open(&path) {
+                Ok(d) => d,
+                Err(e) => {
+                    let _ = std::fs::remove_dir(&path);
+                    return Err(io_err(e));
+                }
+            };
+            let m = match dir.metadata() {
+                Ok(m) => m,
+                Err(e) => {
+                    let _ = std::fs::remove_dir(&path);
+                    return Err(io_err(e));
+                }
+            };
+            let proc_path = PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()));
+            let access = if cfg!(target_os = "linux") && proc_path.is_dir() {
+                proc_path
+            } else {
+                path.clone()
+            };
+            Self {
+                dir,
+                path,
+                access,
+                dev: m.dev(),
+                ino: m.ino(),
+                armed: true,
+            }
+        };
+        // 作ったのは自分だが、umask などで想定の権限にならなかった場合や、作成直後に差し替えられた
+        // 場合は使わない。
+        if let Err(e) = this.check() {
+            let _ = this.remove();
+            return Err(e);
+        }
+        Ok(this)
+    }
+
+    /// 一時ファイルを作る・開くときに親として使うパス（Linux では保持 fd を指す）。
+    pub fn access_path(&self) -> &Path {
+        &self.access
+    }
+
+    /// 作業ディレクトリが、作成時に開いた fd と同じ実体・0700・通常のディレクトリのままであること
+    /// （パスがシンボリックリンクや別のディレクトリに差し替えられていないこと）を確かめる。
+    pub fn check(&self) -> Result<(), TmpError> {
+        let fd = self.dir.metadata().map_err(io_err)?;
+        let by_path = std::fs::symlink_metadata(&self.path).map_err(|_| TmpError::Replaced)?;
+        let same = by_path.is_dir()
+            && by_path.dev() == self.dev
+            && by_path.ino() == self.ino
+            && fd.is_dir()
+            && fd.dev() == self.dev
+            && fd.ino() == self.ino;
+        // 実体のパスが差し替えられていなくても、権限が 0700 でなければ使わない。
+        if same && fd.mode() & 0o777 == 0o700 {
+            Ok(())
+        } else {
+            Err(TmpError::Replaced)
+        }
+    }
+
+    /// 作業ディレクトリを消す（空でなければ消さず、残ったパスを返す）。
+    pub fn remove(&mut self) -> Result<(), PathBuf> {
+        if !self.armed {
+            return Ok(());
+        }
+        self.armed = false;
+        match std::fs::remove_dir(&self.path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+            Err(_) => Err(self.path.clone()),
+        }
+    }
+}
+
+impl Drop for WorkDir {
+    fn drop(&mut self) {
+        let _ = self.remove();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unique_parent(label: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "dump-tmp-{label}-{}-{}",
+            std::process::id(),
+            TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&p).expect("create parent");
+        p
+    }
+
+    #[test]
+    fn work_dir_is_private_and_removed() {
+        let parent = unique_parent("priv");
+        let mut w = WorkDir::create(&parent, "t").expect("create");
+        let mode = std::fs::metadata(&w.path).expect("meta").mode() & 0o777;
+        assert_eq!(mode, 0o700);
+        assert!(w.check().is_ok());
+        // 中に一時ファイルを作れて、消せば作業ディレクトリも消せる。
+        let mut t = TempFile::create(w.access_path(), "f").expect("tmp");
+        assert!(w.remove().is_err(), "non-empty dir must not be removed");
+        w.armed = true;
+        assert!(t.remove().is_ok());
+        assert!(w.remove().is_ok());
+        assert_eq!(std::fs::read_dir(&parent).expect("read").count(), 0);
+        std::fs::remove_dir(&parent).expect("cleanup");
+    }
+
+    #[test]
+    fn work_dir_detects_replacement_by_symlink() {
+        let parent = unique_parent("swap");
+        let w = WorkDir::create(&parent, "t").expect("create");
+        let moved = parent.join("moved");
+        std::fs::rename(&w.path, &moved).expect("rename away");
+        let victim = parent.join("victim");
+        std::fs::create_dir(&victim).expect("victim");
+        std::os::unix::fs::symlink(&victim, &w.path).expect("symlink");
+        assert_eq!(w.check(), Err(TmpError::Replaced));
+        std::fs::remove_file(&w.path).expect("rm link");
+        std::fs::rename(&moved, &w.path).expect("restore");
+        assert!(w.check().is_ok());
+        drop(w);
+        std::fs::remove_dir(&victim).expect("cleanup victim");
+        std::fs::remove_dir(&parent).expect("cleanup");
+    }
+}

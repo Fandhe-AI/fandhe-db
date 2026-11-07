@@ -918,3 +918,96 @@ fn restore_rejects_header_frame_mismatch() {
     ]);
     assert_eq!(code(&o), Some(0), "stderr: {}", stderr(&o));
 }
+
+/// 他者が書き込める親ディレクトリ（0777）でも復元でき、作業ディレクトリ・一時名は成功時も失敗時も残らない。
+#[test]
+fn restore_in_world_writable_parent_leaves_no_work_dir() {
+    let fx = common::TempFixtureDir::new("dump-shared-parent");
+    let base = dir_of(&fx.db_path_str());
+    let dir = base.join("shared");
+    std::fs::create_dir(&dir).expect("mkdir");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).expect("chmod");
+    let good = s(&dir.join("good.sql")).to_string();
+    let bad = s(&dir.join("bad.sql")).to_string();
+    let h = || header(DumpScope::Tenant("t1".into()), DumpParts::All);
+    write_dump_with(&good, h(), |w| {
+        w.statement(StmtKind::Table, T_SQL).expect("s");
+        w.statement(StmtKind::Insert, "INSERT INTO t (id, b) VALUES (1, 'x')")
+            .expect("s");
+    });
+    write_dump_with(&bad, h(), |w| {
+        w.statement(StmtKind::Table, T_SQL).expect("s");
+        w.statement(StmtKind::Table, T_SQL).expect("s");
+    });
+    // 失敗時
+    let dest_bad = s(&dir.join("bad.redb")).to_string();
+    let o = run(&["dump-restore", "--from", &bad, "--db", &dest_bad]);
+    assert_eq!(code(&o), Some(1), "stderr: {}", stderr(&o));
+    assert!(!Path::new(&dest_bad).exists());
+    assert_no_temp_leftovers(&dir);
+    // 成功時
+    let dest = s(&dir.join("ok.redb")).to_string();
+    let o = run(&["dump-restore", "--from", &good, "--db", &dest]);
+    assert_eq!(code(&o), Some(0), "stderr: {}", stderr(&o));
+    assert_no_temp_leftovers(&dir);
+    assert_eq!(
+        std::fs::metadata(&dest).expect("meta").permissions().mode() & 0o777,
+        0o600
+    );
+}
+
+/// engine のバッチ上限（行数・チャンク数・合計バイト）を小さくしても、複数行の COPY を
+/// バッチに分けて復元できる。上限は子プロセスの環境変数でだけ渡す（テストプロセスの環境は変えない）。
+#[test]
+fn restore_splits_copy_by_every_engine_batch_limit() {
+    let fx = common::TempFixtureDir::new("dump-batch-limits");
+    let dir = dir_of(&fx.db_path_str());
+    let from = s(&dir.join("o.sql")).to_string();
+    write_dump_with(
+        &from,
+        header(DumpScope::Tenant("t1".into()), DumpParts::All),
+        |w| {
+            w.statement(StmtKind::Table, T_SQL).expect("s");
+            w.copy_header("COPY t (id, b) FROM STDIN").expect("c");
+            for i in 0..12 {
+                w.copy_row(&format!("{i}\tvalue-{i}")).expect("r");
+            }
+            w.copy_end().expect("e");
+        },
+    );
+    let cases: [(&str, &str); 3] = [
+        ("FANDHE_DB_BATCH_MAX_CHUNKS", "1"),
+        ("FANDHE_DB_BATCH_MAX_CHUNKS", "5"),
+        // 1 行は 11〜12 バイト。2 行は入らない大きさにする。
+        ("FANDHE_DB_BATCH_MAX_TOTAL_BYTES", "16"),
+    ];
+    for (n, (key, val)) in cases.iter().enumerate() {
+        let dest = s(&dir.join(format!("d{n}.redb"))).to_string();
+        let o = Command::new(env!("CARGO_BIN_EXE_wire-server"))
+            .args(["dump-restore", "--from", &from, "--db", &dest])
+            .env(key, val)
+            .output()
+            .expect("run");
+        assert_eq!(code(&o), Some(0), "{key}={val}: stderr: {}", stderr(&o));
+        let again = s(&dir.join(format!("d{n}.sql"))).to_string();
+        let o = run(&dump_args(&dest, &again, &["--tenant", "t1"]));
+        assert_eq!(code(&o), Some(0), "stderr: {}", stderr(&o));
+        let text = read_text(&again);
+        for i in 0..12 {
+            assert!(
+                text.contains(&format!("{i}\tvalue-{i}\n")),
+                "{key}={val}: row {i}"
+            );
+        }
+    }
+    // 1 行だけで上限を超えるなら fail-closed（何も公開しない）。
+    let dest = s(&dir.join("tiny.redb")).to_string();
+    let o = Command::new(env!("CARGO_BIN_EXE_wire-server"))
+        .args(["dump-restore", "--from", &from, "--db", &dest])
+        .env("FANDHE_DB_BATCH_MAX_TOTAL_BYTES", "4")
+        .output()
+        .expect("run");
+    assert_eq!(code(&o), Some(1), "stderr: {}", stderr(&o));
+    assert!(!Path::new(&dest).exists());
+    assert_no_temp_leftovers(&dir);
+}
