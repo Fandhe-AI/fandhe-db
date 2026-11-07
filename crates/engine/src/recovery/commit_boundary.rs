@@ -428,18 +428,25 @@ pub(crate) fn commit(write_txn: impl storage::CommitTxn) -> StorageResult<()> {
 /// 永続化）で、アーカイブ水位の更新（#2167）も同じ入口を使う。
 #[cfg_attr(not(test), allow(dead_code))] // 保守 commit の運用経路（アーカイブ水位の更新）は #2167
 pub(crate) fn commit_maintenance(write_txn: impl storage::CommitTxn) -> StorageResult<()> {
-    // session・capture は保守 commit では使わない（引数として受けたものを commit 完了まで保持するだけ）。
+    // session は保守 commit では使わない。capture は記録対象の書き込みが無いことの検査にだけ使う。
     let storage::CommitParts {
         txn: write_txn,
         permit: _permit,
         session: _session,
-        capture: _capture,
+        capture,
     } = write_txn.split_for_commit();
     commit_and_finish_with(
         write_txn,
         (),
         |()| PostCommitResult::Ok,
-        |_| Ok(()),
+        |_| {
+            // 利用者の表を書いた（記録対象のキー・イベントが積まれた）トランザクションを保守 commit へ
+            // 流すと、変更ログに載らないまま確定する。黙って捨てず commit 前に拒否する（fail-closed）。
+            if capture.as_ref().is_some_and(|c| c.has_pending_changes()) {
+                return Err(storage::StorageError::CommitFootprintUnrecordable);
+            }
+            Ok(())
+        },
         storage::commit_prepared_write_txn,
     )
     .map(|((), _)| ())

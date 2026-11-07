@@ -516,11 +516,16 @@ pub(crate) fn capture(
         .list_tables()
         .map_err(|_| ImageError)?
         .map(|h| h.name().to_string())
+        // 変更ログの内部表は savepoint の巻き戻しに不要なので走査から外す。ログは commit の
+        // prepare 段でだけ書かれ、writer の取得中は基底と同一のため（有効化と保守 commit は別の
+        // トランザクション）。ログの行数に依存せず、`ROLLBACK TO` の再適用にも現れない。
+        .filter(|n| !super::change_log::is_excluded_table(n))
         .collect();
     let cnames: BTreeSet<String> = committed
         .list_tables()
         .map_err(|_| ImageError)?
         .map(|h| h.name().to_string())
+        .filter(|n| !super::change_log::is_excluded_table(n))
         .collect();
     let wset: BTreeSet<&String> = wnames.iter().collect();
     let dropped: Vec<String> = cnames

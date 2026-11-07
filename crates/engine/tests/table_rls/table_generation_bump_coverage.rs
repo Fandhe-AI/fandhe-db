@@ -94,8 +94,8 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #3067: `storage/change_log.rs` のテスト内の commit 入口（`commit_result`・`commit_maint`）。
     // 変更ログの `change_log` 表・メタ表と任意の試験用 redb 表だけを書くテスト fixture で、
     // `user_rows/{table_name}` を経由しないため対象外。
-    ("storage/change_log.rs", 965),
-    ("storage/change_log.rs", 973),
+    ("storage/change_log.rs", 1047),
+    ("storage/change_log.rs", 1055),
     ("recovery/panic_hook.rs", 404),
     ("txn.rs", 210),
     ("txn.rs", 387),

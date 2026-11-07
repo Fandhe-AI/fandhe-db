@@ -291,29 +291,46 @@ impl<'a> Reader<'a> {
     }
 }
 
-fn decode_payload(payload: &[u8]) -> std::result::Result<RecordBody, DecodeError> {
+/// 1 レコードあたりの要素数（表・キー・値の組の合計）の既定上限。確保量を入力長の定数倍に収める。
+pub(crate) const MAX_DECODE_ELEMENTS: usize = 4 * 1024 * 1024;
+
+/// 件数を読み、要素数の予算から引く。各要素は最低 4 バイトを消費するため、残りバイト数で
+/// 割った値を超える件数は `Truncated`、予算超過は `Malformed`（件数を事前確保に使わない）。
+fn read_count(r: &mut Reader<'_>, left: &mut usize) -> std::result::Result<u32, DecodeError> {
+    let n = r.u32()?;
+    let n_usize = usize::try_from(n).map_err(|_| DecodeError::Malformed)?;
+    if n_usize > r.buf.len() / 4 {
+        return Err(DecodeError::Truncated);
+    }
+    *left = left.checked_sub(n_usize).ok_or(DecodeError::Malformed)?;
+    Ok(n)
+}
+
+fn decode_payload(
+    payload: &[u8],
+    max_elements: usize,
+) -> std::result::Result<RecordBody, DecodeError> {
     let mut r = Reader { buf: payload };
+    let mut left = max_elements;
     let mut body = RecordBody::default();
-    // 各要素は最低 4 バイトを消費するため、件数が偽でも読み取り中の `Truncated` で止まる
-    // （件数を事前確保に使わない）。
-    for _ in 0..r.u32()? {
+    for _ in 0..read_count(&mut r, &mut left)? {
         body.dropped.push(r.string()?);
     }
-    for _ in 0..r.u32()? {
+    for _ in 0..read_count(&mut r, &mut left)? {
         let name = r.string()?;
         body.created.push((name, r.u32()?));
     }
-    for _ in 0..r.u32()? {
+    for _ in 0..read_count(&mut r, &mut left)? {
         let name = r.string()?;
         let shape = r.u32()?;
         let mut upserts = Vec::new();
-        for _ in 0..r.u32()? {
+        for _ in 0..read_count(&mut r, &mut left)? {
             let k = r.bytes()?.to_vec();
             let v = r.bytes()?.to_vec();
             upserts.push((k, v));
         }
         let mut removes = Vec::new();
-        for _ in 0..r.u32()? {
+        for _ in 0..read_count(&mut r, &mut left)? {
             removes.push(r.bytes()?.to_vec());
         }
         body.tables.push(TableChange {
@@ -335,6 +352,15 @@ fn decode_payload(payload: &[u8]) -> std::result::Result<RecordBody, DecodeError
 pub(crate) fn decode_record(
     bytes: &[u8],
     max_payload: usize,
+) -> std::result::Result<ChangeRecord, DecodeError> {
+    decode_record_with(bytes, max_payload, MAX_DECODE_ELEMENTS)
+}
+
+/// [`decode_record`] の要素数上限指定版。
+pub(crate) fn decode_record_with(
+    bytes: &[u8],
+    max_payload: usize,
+    max_elements: usize,
 ) -> std::result::Result<ChangeRecord, DecodeError> {
     let mut r = Reader { buf: bytes };
     let head = r.take(HEADER_LEN)?;
@@ -368,7 +394,7 @@ pub(crate) fn decode_record(
     }
     Ok(ChangeRecord {
         header,
-        body: decode_payload(payload)?,
+        body: decode_payload(payload, max_elements)?,
     })
 }
 
@@ -536,11 +562,25 @@ impl CaptureFrame {
 static CAPTURE_FRAMES: LazyLock<Mutex<HashMap<usize, Arc<CaptureFrame>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// 登録中の frame の個数。0 のとき（変更ログ無効のプロセス）はラッパの open が登録簿のロックを
-/// 取らずに戻るための印（無効時のホットパスに確保もロックも持ち込まない）。
+/// 登録中の frame の個数。0 のとき（変更ログ無効のプロセス）はラッパの open が何も引かずに戻るための印。
 static ACTIVE_FRAMES: AtomicUsize = AtomicUsize::new(0);
 
+/// 登録中のトランザクションのアドレスを公開するロックフリーの表（0 は空き）。変更ログが有効な
+/// `Storage` と無効な `Storage` が同じプロセスに同居しても、無効な側のトランザクションのアドレスは
+/// 登録されないため、ここで外れて登録簿の `Mutex` を取らずに `None` になる。登録は frame を登録簿へ
+/// 入れた後に公開し、解除は公開を外してから登録簿を消す（古い frame を引かない）。
+const SLOT_COUNT: usize = 64;
+static ACTIVE_SLOTS: [AtomicUsize; SLOT_COUNT] = [const { AtomicUsize::new(0) }; SLOT_COUNT];
+
+#[cfg(test)]
+thread_local! {
+    /// テスト用: このスレッドが登録簿の `Mutex` を取った回数。
+    static REGISTRY_LOCKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn frames_lock() -> MutexGuard<'static, HashMap<usize, Arc<CaptureFrame>>> {
+    #[cfg(test)]
+    REGISTRY_LOCKS.with(|c| c.set(c.get() + 1));
     CAPTURE_FRAMES
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -550,21 +590,44 @@ fn addr_of(write_txn: &redb::WriteTransaction) -> usize {
     std::ptr::from_ref(write_txn) as usize
 }
 
+fn slot_publish(addr: usize) -> Option<usize> {
+    (0..SLOT_COUNT).find(|&i| {
+        ACTIVE_SLOTS[i]
+            .compare_exchange(0, addr, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+    })
+}
+
+fn slot_present(addr: usize) -> bool {
+    ACTIVE_SLOTS
+        .iter()
+        .any(|s| s.load(Ordering::Acquire) == addr)
+}
+
 fn frame_for(write_txn: &redb::WriteTransaction) -> Option<Arc<CaptureFrame>> {
     if ACTIVE_FRAMES.load(Ordering::Relaxed) == 0 {
         return None;
     }
-    frames_lock().get(&addr_of(write_txn)).cloned()
+    let addr = addr_of(write_txn);
+    if !slot_present(addr) {
+        return None;
+    }
+    frames_lock().get(&addr).cloned()
 }
 
-/// frame の登録の RAII。Drop で登録簿から外す。
+/// frame の登録の RAII。Drop で公開を外してから登録簿から外す。
 struct FrameRegistration {
     frame: Arc<CaptureFrame>,
     addr: usize,
+    slot: Option<usize>,
 }
 
 impl Drop for FrameRegistration {
     fn drop(&mut self) {
+        if let Some(i) = self.slot {
+            let _ =
+                ACTIVE_SLOTS[i].compare_exchange(self.addr, 0, Ordering::AcqRel, Ordering::Relaxed);
+        }
         let mut frames = frames_lock();
         // Box の解放後に別のトランザクションが同じアドレスで登録している場合、それを消さない。
         if frames
@@ -582,13 +645,16 @@ impl Drop for FrameRegistration {
 // ---------------------------------------------------------------------------
 
 /// `GatedWriteTxn` が寿命を結び付けて持つ捕捉の付帯物。commit 境界の prepare 段へ渡される。
+///
+/// 宣言順が drop 順で、登録解除（`_registration`）を先に行い、`base` は最後に解放する。
+/// `base`（読み取りトランザクション）は書き込みトランザクションの全期間、古いページの回収を止める
+/// （有効時のコスト。長い明示トランザクションほど効く）。
 pub(crate) struct CaptureSession {
+    _registration: FrameRegistration,
     state: Arc<ChangeLogState>,
     frame: Arc<CaptureFrame>,
     /// 書き込みトランザクション開始時点の確定状態（単一ライタなので基底の表集合を与える）。
     base: redb::ReadTransaction,
-    /// 宣言順が drop 順（登録解除 → 基底の読み取りの解放）。
-    _registration: FrameRegistration,
 }
 
 impl CaptureSession {
@@ -603,12 +669,28 @@ impl CaptureSession {
         let addr = addr_of(write_txn);
         ACTIVE_FRAMES.fetch_add(1, Ordering::Relaxed);
         frames_lock().insert(addr, Arc::clone(&frame));
-        Self {
-            state,
-            frame: Arc::clone(&frame),
-            base,
-            _registration: FrameRegistration { frame, addr },
+        let slot = slot_publish(addr);
+        if slot.is_none() {
+            // 公開表が満杯。ラッパが frame を引けず積み漏れるため、prepare で必ず拒否させる（fail-closed）。
+            CaptureFrame::mark_overflow(&mut frame.lock());
         }
+        Self {
+            _registration: FrameRegistration {
+                frame: Arc::clone(&frame),
+                addr,
+                slot,
+            },
+            state,
+            frame,
+            base,
+        }
+    }
+
+    /// 記録対象（非除外表）のキーかイベントが積まれている、または積めなかった（上限超過）か。
+    /// 保守 commit が捕捉を黙って捨てないための検査に使う。
+    pub(crate) fn has_pending_changes(&self) -> bool {
+        let st = self.frame.lock();
+        st.overflow || !st.keys.is_empty() || !st.events.is_empty()
     }
 
     /// commit 準備段階（`prepare_generation_bump` の直後・point of no return の前）で、積まれたキーの
@@ -1544,5 +1626,131 @@ mod tests {
             !user_physical.is_empty(),
             "the user tables must be recorded under their own names"
         );
+    }
+
+    // ---- 追加の検証（レビュー対応）----
+
+    #[test]
+    fn decode_enforces_the_element_budget() {
+        let bytes = encode_record(&header(), &body(), usize::MAX).expect("encode");
+        // body() の要素数は 5（dropped・created・tables・upserts・removes が各 1）。
+        assert!(decode_record_with(&bytes, usize::MAX, 5).is_ok());
+        assert_eq!(
+            decode_record_with(&bytes, usize::MAX, 4),
+            Err(DecodeError::Malformed)
+        );
+        assert_eq!(
+            decode_record_with(&bytes, usize::MAX, 0),
+            Err(DecodeError::Malformed)
+        );
+    }
+
+    #[test]
+    fn savepoint_capture_ignores_the_log_tables() {
+        use super::super::table_image::{capture, Capture, Meter};
+        let (_g, storage) = enabled("change-log-savepoint-capture");
+        let txn = storage.begin_write_txn().expect("txn");
+        {
+            let mut t = CapturingTable::open(&txn, USERS).expect("open");
+            t.insert("a", b"1".as_slice()).expect("insert");
+        }
+        do_commit(txn);
+        // 書き込み Tx の中でログ表・メタ表を直接書き換えても、savepoint の差分には現れない
+        // （ログの行数・内容に依存しない）。
+        let txn = storage.begin_write_txn().expect("txn");
+        {
+            let mut log = txn.open_table(CHANGE_LOG_TABLE).expect("log");
+            for lsn in 1_000_000..1_000_050u64 {
+                log.insert(lsn, b"x".as_slice()).expect("insert");
+            }
+            let mut meta = txn.open_table(META_TABLE).expect("meta");
+            meta.insert("probe", b"1".as_slice()).expect("insert");
+        }
+        let committed = storage.db.begin_read().expect("read");
+        let mut meter = Meter::new(usize::MAX, None);
+        match capture(&txn, &committed, &mut meter).expect("capture") {
+            Capture::Image(img) => assert!(img.is_empty()),
+            Capture::Gate => panic!("unexpected gate"),
+        }
+    }
+
+    #[test]
+    fn export_snapshot_keeps_the_db_identity() {
+        let (_g, storage) = enabled("change-log-snapshot-identity");
+        let txn = storage.begin_write_txn().expect("txn");
+        {
+            let mut t = CapturingTable::open(&txn, USERS).expect("open");
+            t.insert("a", b"1".as_slice()).expect("insert");
+        }
+        do_commit(txn);
+        let dest = unique_db_path("change-log-snapshot-copy");
+        let _g2 = CleanupGuard(dest.clone());
+        storage.export_snapshot(&dest).expect("export");
+        let mut copy = super::super::Storage::open(&dest).expect("open copy");
+        copy.enable_change_log().expect("enable on copy");
+        // 同じ DB 識別子と timeline が残る（base backup とログを結びつける）。
+        assert_eq!(copy.change_log_identity(), storage.change_log_identity());
+        assert_eq!(records(&copy).len(), records(&storage).len());
+    }
+
+    #[test]
+    fn disabled_storage_never_touches_the_registry_or_picks_a_foreign_frame() {
+        let (_g, enabled_storage) = enabled("change-log-mixed-enabled");
+        let path = unique_db_path("change-log-mixed-disabled");
+        let _g2 = CleanupGuard(path.clone());
+        let disabled_storage = super::super::Storage::open(&path).expect("open");
+
+        let txn_e = enabled_storage.begin_write_txn().expect("txn e");
+        let txn_d = disabled_storage.begin_write_txn().expect("txn d");
+        let mut te = CapturingTable::open(&txn_e, USERS).expect("open e");
+        assert!(te.is_capturing());
+        te.insert("a", b"1".as_slice()).expect("insert");
+
+        // 有効な Storage の frame が登録されている間も、無効な側は登録簿の Mutex を取らず None。
+        let before = REGISTRY_LOCKS.with(|c| c.get());
+        let mut td = CapturingTable::open(&txn_d, USERS).expect("open d");
+        td.insert("b", b"2".as_slice()).expect("insert");
+        assert!(!td.is_capturing());
+        assert_eq!(REGISTRY_LOCKS.with(|c| c.get()), before);
+        drop(td);
+        drop(te);
+
+        do_commit(txn_d);
+        do_commit(txn_e);
+        // 無効側のキーは有効側のレコードに混ざらない。
+        let recs = records(&enabled_storage);
+        let c = change(&recs[0], "t_users");
+        assert_eq!(c.upserts, vec![(b"a".to_vec(), b"1".to_vec())]);
+        assert!(records(&disabled_storage).is_empty());
+    }
+
+    #[test]
+    fn maintenance_commit_refuses_to_drop_pending_captures() {
+        let (_g, storage) = enabled("change-log-maintenance-pending");
+        let before = storage.current_generation().expect("gen");
+        let txn = storage.begin_write_txn().expect("txn");
+        {
+            let mut t = CapturingTable::open(&txn, USERS).expect("open");
+            t.insert("a", b"1".as_slice()).expect("insert");
+        }
+        assert!(matches!(
+            commit_maint(txn),
+            Err(StorageError::CommitFootprintUnrecordable)
+        ));
+        // 拒否は commit 前で、データも世代も動かない。
+        assert_eq!(storage.current_generation().expect("gen"), before);
+        let read = storage.db.begin_read().expect("read");
+        assert!(matches!(
+            read.open_table(USERS),
+            Err(redb::TableError::TableDoesNotExist(_))
+        ));
+        // 表の削除イベントだけでも拒否する。
+        drop(read);
+        let txn = storage.begin_write_txn().expect("txn");
+        delete_table(&txn, USERS).expect("delete");
+        assert!(matches!(
+            commit_maint(txn),
+            Err(StorageError::CommitFootprintUnrecordable)
+        ));
     }
 }
