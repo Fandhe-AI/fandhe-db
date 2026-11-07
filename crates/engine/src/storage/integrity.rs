@@ -454,29 +454,36 @@ impl Storage {
         options: &IntegrityOptions,
     ) -> Result<IntegrityReport, IntegrityError> {
         let snapshot = self.begin_read().map_err(|_| IntegrityError::Backend)?;
-        let read = snapshot.raw_txn();
-        let mut c = Collector {
-            max_groups: options.max_finding_groups,
-            groups: BTreeMap::new(),
-            totals: BTreeMap::new(),
-            truncated: false,
-            noted: std::collections::HashSet::new(),
-        };
-        let mut report = IntegrityReport::default();
-        check_storage_tables(read, &mut c, &mut report);
-        if check_legacy_rows_table(read, &mut c, &mut report).is_err() {
-            c.add(FindingKind::TableUnreadable, Some("rows"), 1);
-        }
-        check_catalog(read, options, &mut c, &mut report);
-        report.findings = c
-            .groups
-            .into_iter()
-            .map(|((kind, table), count)| IntegrityFinding { kind, table, count })
-            .collect();
-        report.findings_truncated = c.truncated;
-        report.totals = c.totals;
-        Ok(report)
+        Ok(verify_in_txn(snapshot.raw_txn(), options))
     }
+}
+
+/// 読み取りトランザクション 1 本の上で全項目を検査して報告を作る共通本体。書き込み可能な
+/// [`Storage::verify_integrity`] と、読み取り専用の `ReadOnlyStorage::verify_integrity`
+/// （[`super::read_only`]）の双方から呼ばれる。`ReadTransaction` しか受け取らないため、
+/// ここから DB へ書き込む経路は構造的に存在しない。
+pub(super) fn verify_in_txn(read: &ReadTransaction, options: &IntegrityOptions) -> IntegrityReport {
+    let mut c = Collector {
+        max_groups: options.max_finding_groups,
+        groups: BTreeMap::new(),
+        totals: BTreeMap::new(),
+        truncated: false,
+        noted: std::collections::HashSet::new(),
+    };
+    let mut report = IntegrityReport::default();
+    check_storage_tables(read, &mut c, &mut report);
+    if check_legacy_rows_table(read, &mut c, &mut report).is_err() {
+        c.add(FindingKind::TableUnreadable, Some("rows"), 1);
+    }
+    check_catalog(read, options, &mut c, &mut report);
+    report.findings = c
+        .groups
+        .into_iter()
+        .map(|((kind, table), count)| IntegrityFinding { kind, table, count })
+        .collect();
+    report.findings_truncated = c.truncated;
+    report.totals = c.totals;
+    report
 }
 
 /// 項目 1・孤児行ストア: redb の全表を型の組の一覧で解決して全エントリを読む。
