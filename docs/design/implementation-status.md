@@ -1860,3 +1860,7 @@ main に無く現行の `parse_order_by` は `<=>` のみ受理するため、�
 **Issue #2139（docs(design): 全文検索・ハイブリッドの他 DB 比較表。SEARCH-12〜SEARCH-17 ポインタ。親 #2138。詳細は [fulltext-hybrid-comparison.md](fulltext-hybrid-comparison.md)）**: 全文検索（PostgreSQL・MySQL・SQLite FTS5・Elasticsearch）とハイブリッド（PostgreSQL・Elasticsearch・Qdrant・Redis）の各製品を fandhe と並べる比較表を追加した。他 DB の記述は公式ドキュメントを 2026-11-06 に確認した範囲に限り、確認できなかった点は「公式ドキュメントで確認できず」と書いた。「同等以上」はテストで固定した項目（可視集合での統計、ハイライトの越境、書き込み後の反映）に限った。未提供の主な項目は、RRF 以外の融合、近接、列ごとの重み、形態素解析、thesaurus、英語以外のステミング。拒否する契約があるもの（`42601`・`0A000`・`54000` 等）と機能が無いだけのものを区別して記した。ドキュメントのみの変更で、コード・依存・CI は変えない。
 
 **Issue #2165（docs(design): 変更ログ（増分・PITR）の設計 ADR。RECOVER-14 ポインタ。親 #2164）**: [change-log-pitr.md](change-log-pitr.md) を追加し、捕捉方式・commit 番号・レコード形式・アーカイブと保持・復元手順・有効化境界を本リポの実装判断として確定した。コード変更なし。後続は #2166〜#2170。
+
+**Issue #2447（docs(design): 復元の世代番号の決め方と参照の構文。親 #2446・RECOVER-17 ポインタ。詳細は [restore-generation.md](restore-generation.md)）**: 復元の世代番号の設計記録をポインタ表記で追加した。契約の本文は private spec（RECOVER-17・TASK-340）を正とし、実装は #2448〜#2451 で具体化する。ドキュメントのみの変更で、コード・依存・CI は変えない。
+
+**Issue #2150（docs(design): 稼働中バックアップの方式を検証し ADR に記録する。親 #2149・RECOVER-13 ポインタ。詳細は [backup-snapshot.md](backup-snapshot.md)）**: redb 4.2.0 の保証範囲を確認し、読み取りトランザクション上で全表を新ファイルへ書き出す方式を採用した。稼働中ファイルの素朴なコピーは保証が無く、リポ外のプロトタイプでも open 不能または欠落を観測したため不採用。稼働中の DB は別プロセスから開けないので、稼働中の取得はサーバープロセス内で実行する。入口は運用者の CLI のみで、SQL の `BACKUP` 文は設けない。型なし反復が無いため、表ごとの型付きコピー関数の対応表が要る。依存・コード・CI は変えない。残課題は運用者専用経路（#2152）と `--users` ファイルの扱い。
