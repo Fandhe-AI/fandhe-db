@@ -178,6 +178,26 @@ fn snapshot_reopens_with_all_tenants_policies_roles_and_opaque_bytes() {
     }
     assert_eq!(notes(&copy, "tenant-b"), b_rows, "b is unaffected");
 
+    // ポリシーで不可視の行（id=2）が出力に保存されていること。復元先だけで所有者が行セキュリティを
+    // 無効にして読む（元の DB は触らない）。不可視の行を落とす回帰はここで検知する。
+    ok(
+        &copy,
+        "tenant-a",
+        "ALTER TABLE notes DISABLE ROW LEVEL SECURITY",
+    );
+    assert_eq!(
+        notes(&copy, "tenant-a"),
+        vec![
+            (1, "vis".to_string()),
+            (2, "hid".to_string()),
+            (3, "vis".to_string())
+        ],
+        "hidden row must be stored in the snapshot"
+    );
+    assert_eq!(blob_of(&copy, "tenant-a", 2), Cell::Bytes(vec![0x00]));
+    // 元の DB のポリシーは無効化されていない。
+    assert_eq!(notes(&src, "tenant-a"), a_rows);
+
     // 4. ロールの検証子は同一、他テナントからは引けず、バイト列は一致。
     assert_eq!(verifier(&copy, "tenant-a", "app"), Some(va));
     assert_eq!(verifier(&copy, "tenant-b", "app"), Some(vb));
