@@ -145,7 +145,7 @@ cargo run -p fandhe-db-wire-server -- --users <ユーザーストアのパス> -
   [--change-log-archive-interval-secs <1-86400>] \
   [--replication-bind <loopback addr>] [--replication-roles <file>] [--replication-allow <ip|cidr>]... \
   [--replication-max-connections <1-256>] [--replication-max-unacked-bytes <1024-4294967296>] \
-  [--replication-ack-timeout-secs <1-3600>] \
+  [--replication-ack-timeout-secs <1-3600>] [--replication-max-lag-records <1-1000000000>] \
   [--require-where-for-dml] \
   [--max-dml-affected-rows <1-1000000>] [--max-insert-rows <1-1000000>] \
   [--batch-max-files <1-1000000>] \
@@ -483,7 +483,14 @@ redb トランザクションで DB 内の `change_log` 表へ追記されます
 - 受信側の確認応答（ack）で送信位置を管理し、確認応答前の区間は `--change-log-retain-records` による刈り込みから守ります。
   刈り込み済みの位置からの開始は拒否します（再同期は #2176）。
 - 上限: `--replication-max-connections`（既定 8）、`--replication-max-unacked-bytes`（既定 64 MiB。送信済みで未確認の量）、
-  `--replication-ack-timeout-secs`（既定 30。上限に達したまま ack が進まないレプリカだけを切る）。不正値は DB を開く前に起動エラーです。
+  `--replication-ack-timeout-secs`（既定 30。最も古い未確認レコードが送信から ack されないまま経過したレプリカだけを切る。
+  読み取りが遅く書き込みが塞がるレプリカも同じ期限で切る）、`--replication-max-lag-records`（既定 100000。確認応答済みの位置から
+  プライマリの最新までの遅れ。超えたレプリカは切断され保持位置が外れる）。不正値は DB を開く前に起動エラーです。
+- 切断されたレプリカが再接続したとき、開始位置が刈り込み済み、または遅れの上限を超える位置なら `RESYNC_REQUIRED` で拒否されます
+  （期待どおりの挙動。再同期は #2176）。認証に失敗し続ける送信元は、バックオフの間（最大 60 秒）何も返されずに閉じられます。
+- **注意**: リスナーはループバック限定ですが、port-forward やプロキシで外へ出すと資格情報とレコードが平文で流れます。外へ出す構成は
+  TLS が入る（#2177）まで使わないでください。`--replication-roles` は `--users` とは別のファイルを使ってください（形式が異なり、
+  互いのファイルでは起動できません）。
 - 受信側の適用ループ（#2174）・読み取りレプリカ（#2175）・同期モード（#2245）は未対応です。
 
 **論理ダンプ**（Issue #2162。RECOVER-16 ポインタ。形式と判断は [docs/design/logical-dump.md](docs/design/logical-dump.md) の §12、手順は [backup-restore-operations.md](docs/design/backup-restore-operations.md) の 4.5）:
