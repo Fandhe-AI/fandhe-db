@@ -543,3 +543,97 @@ fn restore_rejects_invalid_arguments_and_paths() {
     assert!(!dir.join("new.redb").exists());
     assert!(leftovers(&dir).is_empty());
 }
+
+/// 復元先の復元の世代番号を読む（復元後の DB を engine の公開 API で開く）。
+fn generation_of(path: &Path) -> u64 {
+    Storage::open(path)
+        .expect("open restored")
+        .restore_generation()
+        .expect("read restore generation")
+}
+
+/// 物理の復元の完了時に世代が進み（復元元より大きい）、同じ元からの繰り返しでも前回より大きい。
+/// 復元元は変わらない。復元した DB を元にした次の復元はさらに大きい（RECOVER-17・RECOVER-13 (3)。
+/// Issue #2448）。
+#[test]
+fn recover17_physical_restore_advances_the_generation_monotonically() {
+    let fx = common::TempFixtureDir::new("restore-cli-generation");
+    let db = fx.db_path_str();
+    let dir = parent_of(&db).to_path_buf();
+    let src = dir.join("src.redb");
+    write_clean_db(&src);
+    let src_s = src.to_str().expect("utf-8 path").to_string();
+    let src_before = std::fs::read(&src).expect("read src");
+
+    // 新規作成した DB の世代は 0（復元元を開く前に内容を控えたので、読み取りの open で変わらない）。
+    let mut previous = 0;
+    let mut paths = Vec::new();
+    for i in 0..3 {
+        let dest = dir.join(format!("restored-{i}.redb"));
+        let dest_s = dest.to_str().expect("utf-8 path").to_string();
+        let o = restore(&src_s, &dest_s);
+        assert_eq!(code(&o), Some(0), "stderr: {}", stderr(&o));
+        let g = generation_of(&dest);
+        assert!(g > previous, "restore {i}: {g} must exceed {previous}");
+        previous = g;
+        paths.push(dest);
+    }
+    // 復元元のファイルの内容は変わらない（世代は復元先にだけ書く）。
+    assert_eq!(std::fs::read(&src).expect("read src"), src_before);
+    assert_eq!(generation_of(&src), 0, "a new database starts at 0");
+
+    // 復元した DB からの復元は、その世代より大きい。
+    let chained = dir.join("chained.redb");
+    let o = restore(
+        paths[0].to_str().expect("utf-8 path"),
+        chained.to_str().expect("utf-8 path"),
+    );
+    assert_eq!(code(&o), Some(0), "stderr: {}", stderr(&o));
+    assert!(generation_of(&chained) > generation_of(&paths[0]));
+    // 世代を進めた復元先の整合検査が通る。
+    let o = verify(&["--db", chained.to_str().expect("utf-8 path")]);
+    assert_eq!(code(&o), Some(0), "stderr: {}", stderr(&o));
+    assert!(leftovers(&dir).is_empty(), "{:?}", leftovers(&dir));
+}
+
+/// 復元元の世代の値が壊れていると、復元は終了コード 1 で失敗し、宛先も残骸も残さない
+/// (RECOVER-17・Issue #2448。壊れた値を黙って受け入れない)。値のバイト列を直接書き換えて作る。
+#[test]
+fn recover17_restore_with_a_corrupt_source_generation_publishes_nothing() {
+    let fx = common::TempFixtureDir::new("restore-cli-generation-corrupt");
+    let db = fx.db_path_str();
+    let dir = parent_of(&db).to_path_buf();
+    let src = dir.join("src.redb");
+    write_clean_db(&src);
+    {
+        let mut s = Storage::open(&src).expect("open");
+        s.advance_restore_generation().expect("advance");
+    }
+    let g = generation_of(&src).to_le_bytes();
+    let mut bytes = std::fs::read(&src).expect("read src");
+    let mut patched = 0;
+    for pos in 0..bytes.len().saturating_sub(g.len()) {
+        if bytes.get(pos..pos + g.len()) == Some(&g[..]) {
+            // 上位バイトを立てて i64 の範囲外にする。
+            bytes[pos + 7] = 0xff;
+            patched += 1;
+        }
+    }
+    assert!(patched >= 1, "generation value not found");
+    std::fs::write(&src, &bytes).expect("write corrupted");
+
+    let dest = dir.join("restored.redb");
+    let o = restore(
+        src.to_str().expect("utf-8 path"),
+        dest.to_str().expect("utf-8 path"),
+    );
+    assert_eq!(code(&o), Some(1), "stderr: {}", stderr(&o));
+    assert!(
+        stderr(&o).contains("restore generation could not be advanced"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(!dest.exists());
+    assert!(leftovers(&dir).is_empty(), "{:?}", leftovers(&dir));
+    assert_eq!(std::fs::read(&src).expect("read src"), bytes);
+}
