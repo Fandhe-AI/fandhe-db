@@ -26,6 +26,7 @@ use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 
 /// 明示トランザクションの書き込み時直列化検査が使う commit 記録（Issue #2404）。
 pub(crate) mod commit_log;
+pub mod integrity;
 /// 電源断シミュレーション用 `redb::StorageBackend` の共通モデル（TASK-145）。
 /// 本クレートのユニットテスト（本モジュール下部の `tests::power_loss`）と
 /// `crates/engine/tests/power_loss.rs` 統合テストの双方から `#[path]` 経由で
@@ -38,6 +39,9 @@ pub mod snapshot;
 pub(crate) mod table_image;
 pub(crate) mod writer_gate;
 
+pub use integrity::{
+    FindingKind, IntegrityError, IntegrityFinding, IntegrityOptions, IntegrityReport, Severity,
+};
 pub use snapshot::{SnapshotExportError, SnapshotSummary};
 
 /// 行ストアの物理キー型（対象ビヘイビア: TABLE-12。ポインタ:

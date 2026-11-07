@@ -83,8 +83,9 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1958（`begin_explicit_write_txn_nowait` の追加。+20 行）の取り込みでさらに移動。 Issue #2879（storage.rs への +1 行）で移動。
     // Issue #2151（`snapshot` モジュール宣言・`snapshot_export_busy` フィールド・`export_snapshot` の追加。+18 行）で追随（旧: 1164／1198）。
     // 追加した書き出しの commit は redb の別ファイル `Database` に対するもので commit_boundary を通らず、本一覧の対象外。
-    ("storage.rs", 1182),
-    ("storage.rs", 1216),
+    // Issue #2155（`integrity` モジュール宣言・再公開の追加。+4 行）で追随（旧: 1182／1216）。
+    ("storage.rs", 1186),
+    ("storage.rs", 1220),
     ("recovery/panic_hook.rs", 404),
     ("txn.rs", 210),
     ("txn.rs", 387),

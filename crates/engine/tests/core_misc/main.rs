@@ -67,6 +67,7 @@ mod index_declaration_bytea;
 mod index_declaration_numeric;
 mod index_declaration_targets;
 mod index_failure_injection;
+mod integrity_check;
 mod join_limits;
 mod json_acceptance;
 mod json_column;

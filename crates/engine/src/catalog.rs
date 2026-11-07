@@ -17531,6 +17531,41 @@ pub(crate) fn get_table_schema_in_txn_impl(
     decode_schema_with_resolver_impl(table_name, &bytes, &mut resolve, require_live)
 }
 
+/// カタログ（[`CATALOG_TABLE`]）の `after` より後ろの最小のキー（内部キーのまま。SCHEMA 配下の表の
+/// `#<id>.<name>` を含む）を返す。整合検査（`storage::integrity`。RECOVER-13 のポインタ）が全表を
+/// 件数に比例したメモリを使わず順に辿るための読み取り専用の入口で、`after = None` は先頭から。
+/// 上限付きの一覧（[`Storage::list_tables`]）と異なり、キーの形式検証をしない（壊れたキーも検査対象にする）。
+pub(crate) fn next_catalog_key_after(
+    read_txn: &redb::ReadTransaction,
+    after: Option<&str>,
+) -> Result<Option<String>> {
+    let table = match read_txn.open_table(CATALOG_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let lower = match after {
+        Some(a) => std::ops::Bound::Excluded(a),
+        None => std::ops::Bound::Unbounded,
+    };
+    let mut iter = table.range::<&str>((lower, std::ops::Bound::Unbounded))?;
+    match iter.next() {
+        Some(entry) => Ok(Some(entry?.0.value().to_string())),
+        None => Ok(None),
+    }
+}
+
+/// カタログに `key` のエントリがあるか（整合検査の孤児行ストア判定用。読み取り専用の点照会）。
+pub(crate) fn catalog_has_key(read_txn: &redb::ReadTransaction, key: &str) -> Result<bool> {
+    let table = match read_txn.open_table(CATALOG_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
+        Err(e) => return Err(e.into()),
+    };
+    let found = table.get(key)?.is_some();
+    Ok(found)
+}
+
 /// [`Storage::list_tables`] が共有するトランザクションスコープの実装本体。
 fn list_tables_in_txn(
     read_txn: &impl crate::storage::read_source::ReadSource,

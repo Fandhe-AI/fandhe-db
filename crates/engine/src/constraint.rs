@@ -90,6 +90,7 @@
 //! （TABLE-16・RLS-10 (c)）。違反時のエラー（`TenantWriteError::UniqueViolation`）
 //! はキー値・列名・行 id・テナント名を含まない固定文言。
 
+pub(crate) mod integrity_audit;
 mod unique_index;
 
 use crate::catalog::{
@@ -2448,6 +2449,32 @@ fn foreign_key_specs(
         specs.push(ForeignKeySpec { fk, indices });
     }
     Ok((specs, mask))
+}
+
+/// `fk` 1 件分の参照元側の検査仕様と、その構成列だけのマスクを組み立てる
+/// （[`foreign_key_specs`] の 1 件版。整合検査 `integrity_audit` が使う）。
+fn foreign_key_specs_for<'a>(
+    schema: &TableSchema,
+    fk: &'a ForeignKeyDef,
+) -> Result<(ForeignKeySpec<'a>, Vec<bool>), CatalogError> {
+    let mut mask = vec![false; schema.columns.len()];
+    let mut indices = Vec::with_capacity(fk.columns().len());
+    for name in fk.columns() {
+        let idx = schema
+            .columns
+            .iter()
+            .position(|c| &c.name == name)
+            .ok_or_else(|| {
+                CatalogError::Invalid(
+                    "foreign key column not found in live schema columns".to_string(),
+                )
+            })?;
+        if let Some(slot) = mask.get_mut(idx) {
+            *slot = true;
+        }
+        indices.push(idx);
+    }
+    Ok((ForeignKeySpec { fk, indices }, mask))
 }
 
 /// 復元済みの参照元列の値から、参照先に存在しなければならない値の組を
