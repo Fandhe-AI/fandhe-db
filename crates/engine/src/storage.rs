@@ -41,6 +41,11 @@ pub mod snapshot;
 pub(crate) mod table_image;
 pub(crate) mod writer_gate;
 
+pub use change_log::archive::{
+    verify_archive_dir, ArchiveError, ArchiveExpectation, ArchiveOptions, ArchiveReport,
+    ArchiveSummary, DEFAULT_PRUNE_BYTES, DEFAULT_PRUNE_RECORDS, DEFAULT_SEGMENT_BYTES,
+    SEGMENT_FORMAT_VERSION,
+};
 pub use integrity::{
     FindingKind, IntegrityError, IntegrityFinding, IntegrityOptions, IntegrityReport, Severity,
 };
@@ -1213,6 +1218,45 @@ impl Storage {
     #[doc(hidden)]
     pub fn oracle_verify_replay(&self) -> std::result::Result<(), String> {
         change_log::oracle::verify_log_replay(self)
+    }
+
+    /// 変更ログの未アーカイブのレコードを外部セグメントへ書き出し、アーカイブ済み水位を進める
+    /// （RECOVER-14・Issue #2167。設計は `docs/design/change-log-pitr.md` の D6）。`opts.retain_records` が
+    /// あれば、水位以下のレコードを新しい側の指定件数を残して刈り込む（水位より後は決して消さない）。
+    /// wire-server の常駐スレッドが周期的に呼ぶ。変更ログが有効でなければ `NotEnabled`。
+    /// 書き込みゲートの待機を譲った場合は `ArchiveReport::skipped` が真で、次の呼び出しが再試行する。
+    pub fn archive_change_log(
+        &self,
+        opts: &ArchiveOptions,
+    ) -> std::result::Result<ArchiveReport, ArchiveError> {
+        change_log::archive::run_cycle(self, opts)
+    }
+
+    /// アーカイブ先の連鎖を、この DB のメタ情報（DB 識別子・timeline・有効化時の世代・水位）と突き合わせて
+    /// 検証する。LSN の飛び・チェックサム不一致・別 DB／別 timeline・先頭の欠落・末尾のセグメントの紛失を
+    /// 非 `Ok` で返す。運用者の検証サブコマンドが呼ぶ。
+    pub fn verify_change_log_archive(
+        &self,
+        dir: impl AsRef<Path>,
+    ) -> std::result::Result<ArchiveSummary, ArchiveError> {
+        change_log::archive::verify_against_db(self, dir.as_ref())
+    }
+
+    /// 保守 commit 用の書き込みトランザクション（変更ログの水位更新・刈り込み）。通常の書き込みが
+    /// 待機している間はゲートを譲り、待機上限を超えたら `None`（今回は見送り。D6）。
+    pub(crate) fn begin_maintenance_txn(&self) -> Result<Option<GatedWriteTxn>> {
+        let permit = match self
+            .writer_gate
+            .acquire_yielding(crate::interrupt::effective_lock_wait(self.write_lock_wait))
+        {
+            Ok(p) => p,
+            Err(writer_gate::GateError::Timeout) => return Ok(None),
+            Err(writer_gate::GateError::HeldByCurrentThread) => {
+                return Err(StorageError::WriteTxnHeldByCurrentSession)
+            }
+        };
+        let txn = self.begin_write_txn_raw()?;
+        self.wrap_gated(txn, permit).map(Some)
     }
 
     /// 変更ログを有効にした DB を、有効にしないまま開いているか。真の間は書き込みを

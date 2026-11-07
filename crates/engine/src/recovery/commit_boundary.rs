@@ -425,8 +425,7 @@ pub(crate) fn commit(write_txn: impl storage::CommitTxn) -> StorageResult<()> {
 /// トランザクション専用で、利用者の書き込みには使わない。`prepare_generation_bump` を呼ばないため
 /// `storage_generation` も表世代も動かない。point of no return の保護（`PostCommitPanicGuard`・
 /// commit の `Err` は abort）は他の commit と同じ。呼び出し元は `Storage::enable_change_log`（DB 識別子の
-/// 永続化）で、アーカイブ水位の更新（#2167）も同じ入口を使う。
-#[cfg_attr(not(test), allow(dead_code))] // 保守 commit の運用経路（アーカイブ水位の更新）は #2167
+/// 永続化）と、アーカイブ水位の更新・刈り込み（`storage::change_log::archive`。#2167）。
 pub(crate) fn commit_maintenance(write_txn: impl storage::CommitTxn) -> StorageResult<()> {
     // session は保守 commit では使わない。capture は記録対象の書き込みが無いことの検査にだけ使う。
     let storage::CommitParts {
