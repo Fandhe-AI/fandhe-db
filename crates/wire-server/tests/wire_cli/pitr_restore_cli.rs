@@ -3,10 +3,6 @@
 //! 確かめる。変更ログを有効にした DB は engine の公開 API で作る（サーバーを起動しない。ポート・固定パスに
 //! 依存しない）。受け入れ条件「指定点までの状態が再現される」を LSN・時刻の両方で確かめ、範囲外・欠落・
 //! 別 DB・改ざん・引数の不正の拒否と、拒否時に何も公開されず一時ファイルも残らないことを固定する。
-//!
-//! 注意: 時刻指定の成功ケースは壁時計と短い待機（30ms）に依存する（時刻境界の厳密な挙動は engine の
-//! `pitr/tests.rs` が実レコードの時刻で固定している）。時刻が飛ぶ環境では、このファイルの時刻の成功ケースだけが
-//! 影響を受ける。
 
 use crate::common;
 
@@ -120,11 +116,22 @@ fn rfc3339(micros: i64) -> String {
     )
 }
 
-fn now_micros() -> i64 {
-    let d = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock");
-    i64::try_from(d.as_micros()).expect("fits")
+/// 1 レコード 1 セグメントのアーカイブから、各レコードの (LSN, コミット時刻のマイクロ秒) を読む。
+/// 壁時計や待機に依存せず、記録済みの時刻から指定時刻を作るため。レイアウトは
+/// セグメントのヘッダ（66 バイト）+ チェックサム（32 バイト）の後に、レコードのヘッダ
+/// （マジック 4・版 2・DB 識別子 16・timeline 8・LSN 8・prev 8・時刻 8）が続く形。
+fn record_times(dir: &Path) -> Vec<(u64, i64)> {
+    const REC: usize = 66 + 32;
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(dir).expect("read_dir") {
+        let bytes = std::fs::read(e.expect("entry").path()).expect("read");
+        let at = |off: usize| -> [u8; 8] {
+            bytes[REC + off..REC + off + 8].try_into().expect("8 bytes")
+        };
+        out.push((u64::from_le_bytes(at(30)), i64::from_le_bytes(at(46))));
+    }
+    out.sort_unstable();
+    out
 }
 
 struct Pitr {
@@ -134,11 +141,9 @@ struct Pitr {
     archive: PathBuf,
     /// ベースの終点の LSN（ids 1..=3 の時点）。
     base_lsn: u64,
-    /// ids 6 を書いた直後の壁時計（マイクロ秒）。ids 7 以降はこれより後にコミットされる。
-    mid_micros: i64,
 }
 
-/// フルバックアップ（ids 1..=3）→ ids 4..=6 → 待機 → ids 7..=9 → アーカイブ。
+/// フルバックアップ（ids 1..=3）→ ids 4..=9 → アーカイブ。
 fn build(label: &str, segment_bytes: usize) -> Pitr {
     let fx = common::TempFixtureDir::new(label);
     let db = PathBuf::from(fx.db_path_str());
@@ -156,8 +161,6 @@ fn build(label: &str, segment_bytes: usize) -> Pitr {
         .end_lsn;
 
     write_rows(&db, 4..=6);
-    let mid_micros = now_micros();
-    std::thread::sleep(std::time::Duration::from_millis(30));
     write_rows(&db, 7..=9);
     archive(&db, &archive_dir, segment_bytes);
     Pitr {
@@ -166,7 +169,6 @@ fn build(label: &str, segment_bytes: usize) -> Pitr {
         base,
         archive: archive_dir,
         base_lsn,
-        mid_micros,
     }
 }
 
@@ -219,23 +221,49 @@ fn recover14_until_lsn_restores_the_prefix_up_to_the_point() {
     }
 }
 
-/// 時刻指定: コミット時刻が T を超える最初のコミットの直前で止まる。
+/// 時刻指定: コミット時刻が T を超える最初のコミットの直前で止まる。T はアーカイブのレコードに記録済みの
+/// 時刻から作る（壁時計・待機に依存しない）。
 #[test]
 fn recover14_until_time_stops_before_the_first_later_commit() {
-    let p = build("pitr-cli-time", usize::MAX >> 8);
-    let dest = p.root.join("restored.redb");
-    let t = rfc3339(p.mid_micros);
-    let o = p.restore_archive(&dest, &["--until-time", &t]);
-    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
-    assert_eq!(row_ids(&dest), (1..=6).collect::<Vec<_>>());
-
-    // オフセット表記でも同じ時刻になる（UTC へ正規化）。
-    let dest2 = p.root.join("restored2.redb");
-    let shifted = rfc3339(p.mid_micros + 9 * 3_600 * 1_000_000).replace('Z', "+09:00");
-    let o = p.restore_archive(&dest2, &["--until-time", &shifted]);
-    // 「+9h した現地時刻 +09:00」は同じ瞬間（mid）を指す。
-    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
-    assert_eq!(row_ids(&dest2), (1..=6).collect::<Vec<_>>());
+    let p = build("pitr-cli-time", 1);
+    let times: Vec<(u64, i64)> = record_times(&p.archive)
+        .into_iter()
+        .filter(|(l, _)| *l > p.base_lsn)
+        .collect();
+    assert_eq!(times.len(), 6);
+    for (i, (_, t)) in times.iter().enumerate() {
+        // 期待: T を超える最初のレコードの直前（無ければ範囲外）。
+        let later = times.iter().position(|(_, ct)| ct > t);
+        let dest = p.root.join(format!("restored-{i}.redb"));
+        let o = p.restore_archive(&dest, &["--until-time", &rfc3339(*t)]);
+        match later {
+            Some(n) => {
+                assert_eq!(o.status.code(), Some(0), "i={i}: {}", stderr(&o));
+                assert_eq!(row_ids(&dest), (1..=3 + n as u64).collect::<Vec<_>>());
+            }
+            None => {
+                assert_eq!(o.status.code(), Some(1), "i={i}: {}", stderr(&o));
+                p.assert_nothing_published(&dest);
+            }
+        }
+    }
+    // オフセット表記でも同じ瞬間になる（UTC へ正規化）。「+9h した現地時刻 +09:00」は同じ瞬間を指す。
+    let (_, t3) = times[2];
+    let first_later = times.iter().position(|(_, ct)| *ct > t3);
+    let dest = p.root.join("restored-offset.redb");
+    let shifted = rfc3339(t3 + 9 * 3_600 * 1_000_000).replace('Z', "+09:00");
+    let o = p.restore_archive(&dest, &["--until-time", &shifted]);
+    if let Some(n) = first_later {
+        assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+        assert_eq!(row_ids(&dest), (1..=3 + n as u64).collect::<Vec<_>>());
+    }
+    // 遠い過去・遠い未来は範囲外（終了コード 1）。
+    for far in ["1970-01-01T00:00:00Z", "2999-01-01T00:00:00Z"] {
+        let dest = p.root.join("restored-far.redb");
+        let o = p.restore_archive(&dest, &["--until-time", far]);
+        assert_eq!(o.status.code(), Some(1), "{far}: {}", stderr(&o));
+        p.assert_nothing_published(&dest);
+    }
 }
 
 /// 増分バックアップとアーカイブの併用。停止点が増分の外（アーカイブ側）でも内でも再現される。
@@ -275,7 +303,7 @@ fn recover14_pitr_argument_errors_exit_2_and_publish_nothing() {
     let p = build("pitr-cli-usage", usize::MAX >> 8);
     let dest = p.root.join("restored.redb");
     let arc = s(&p.archive).to_string();
-    let t = rfc3339(p.mid_micros);
+    let t = "2030-01-02T03:04:05Z".to_string();
     let cases: Vec<Vec<&str>> = vec![
         // 併用
         vec![
