@@ -818,3 +818,87 @@ fn segments_fully_inside_an_incremental_are_compared_regardless_of_the_split() {
     );
     assert!(matches!(r, Err(IncrementalError::ChainBroken)), "{r:?}");
 }
+
+/// ベースの終点 B、増分が B+1..B+8、アーカイブが 1..B+4(増分より短い)の構成。
+fn short_archive_with_longer_incremental(
+    label: &str,
+) -> (Fixture, PathBuf, ChainPoint, PathBuf, TempDir) {
+    let mut fx = Fixture::new(label);
+    fx.round_1();
+    let (base, base_point) = fx.full_backup("base.redb");
+    for i in 0..4 {
+        fx.step(&format!(
+            "INSERT INTO ev (id, embedding) VALUES ({}, '[0.1,0.1]')",
+            40 + i
+        ));
+    }
+    let archive = private_dir(&format!("{label}-arc"));
+    fx.archive_into(archive.path(), 1);
+    for i in 4..8 {
+        fx.step(&format!(
+            "INSERT INTO ev (id, embedding) VALUES ({}, '[0.1,0.1]')",
+            40 + i
+        ));
+    }
+    let inc = fx.path("inc.seg");
+    fx.storage()
+        .export_incremental(&base_point, &inc)
+        .expect("incremental");
+    (fx, base, base_point, inc, archive)
+}
+
+#[test]
+fn target_inside_a_longer_incremental_is_not_limited_by_a_shorter_archive() {
+    let (fx, base, p, inc, archive) = short_archive_with_longer_incremental("pitr-longer-inc");
+    let target = p.end_lsn + 7;
+    // 増分だけで復元できる目標は、アーカイブを併用しても復元できる(入力を足して契約が変わらない)。
+    let (_w, db, r) = restore(
+        &base,
+        std::slice::from_ref(&inc),
+        None,
+        PitrTarget::Lsn(target),
+    );
+    r.expect("incremental only");
+    assert_state_at(&fx, &db, target);
+    let (_w, db, r) = restore(
+        &base,
+        std::slice::from_ref(&inc),
+        Some(archive.path()),
+        PitrTarget::Lsn(target),
+    );
+    r.unwrap_or_else(|e| panic!("with archive: {e}"));
+    assert_state_at(&fx, &db, target);
+    // 時刻指定でも同じ。
+    let times = fx.commit_times();
+    let t = times
+        .iter()
+        .find(|(l, _)| *l == target)
+        .expect("target time")
+        .1;
+    let next = times.iter().find(|(_, ct)| *ct > t);
+    if let Some((l, _)) = next {
+        let (_w, db, r) = restore(
+            &base,
+            std::slice::from_ref(&inc),
+            Some(archive.path()),
+            PitrTarget::TimeMicros(t),
+        );
+        r.expect("time");
+        assert_state_at(&fx, &db, l - 1);
+    }
+}
+
+#[test]
+fn archive_inside_an_incremental_is_compared_even_when_the_target_stops_in_the_incremental() {
+    let (fx, base, p, inc, archive) = short_archive_with_longer_incremental("pitr-longer-inc-bad");
+    // 増分の内側(B+2)に収まるアーカイブのセグメントを食い違わせる。目標は増分の途中(B+7)。
+    diverge_one_segment(archive.path(), p.end_lsn + 2);
+    let (_w, _db, r) = restore(
+        &base,
+        std::slice::from_ref(&inc),
+        Some(archive.path()),
+        PitrTarget::Lsn(p.end_lsn + 7),
+    );
+    assert!(matches!(r, Err(IncrementalError::ChainBroken)), "{r:?}");
+    let _ = fx;
+}

@@ -486,12 +486,13 @@ pub(super) fn replay_segments(
         .first()
         .ok_or(IncrementalError::BadSegmentList)?
         .clone();
+    // 範囲の上限は全セグメントの最大。列は LSN の昇順とは限らない（PITR では増分の後ろに、適用済みの
+    // 区間に収まるアーカイブのセグメントが続く）ので、最後の要素から取らない。
     let list_last = segments
-        .last()
-        .ok_or(IncrementalError::BadSegmentList)?
-        .info
-        .header
-        .last_lsn;
+        .iter()
+        .map(|r| r.info.header.last_lsn)
+        .max()
+        .ok_or(IncrementalError::BadSegmentList)?;
 
     // 1. ベースを開いて連鎖を確かめる（DB 識別子・timeline・終点の次が先頭）。
     let db = redb::Database::open(db_path).map_err(|e| match e {
@@ -546,6 +547,11 @@ pub(super) fn replay_segments(
     let mut opened = 0u64;
     for seg in segments {
         let info = &seg.info;
+        if stopped && (!seg.overlap_ok || info.header.first_lsn > current) {
+            // 停止後は、適用済みの区間に重なるアーカイブのセグメントだけを読む（増分の途中で止まっても、
+            // 停止位置以前のアーカイブの内容を照合するため）。停止位置より後ろの入力は使わない。
+            continue;
+        }
         let mut reader = SegmentReader::open(&seg.path, max_payload)?;
         opened = opened.saturating_add(1);
         // 検証から再生までの間に差し替えられていないこと（ヘッダが検証時と同一）。
@@ -554,7 +560,16 @@ pub(super) fn replay_segments(
         }
         while let Some(raw) = reader.next_record()? {
             if stopped {
-                // 停止点より後ろ。適用せず、全体チェックサムのために読み切るだけ。
+                // 停止点より後ろは適用しない。アーカイブのセグメントの停止位置以前のレコードは、適用済みの
+                // 内容と照合する。残りは全体チェックサムのために読み切るだけ。
+                if seg.overlap_ok {
+                    let h = peek_record(&raw, max_payload)
+                        .map_err(map_decode)
+                        .map_err(IncrementalError::from)?;
+                    if h.lsn <= current {
+                        check_overlap(&db, batch.as_ref(), &raw, &h, &info.header)?;
+                    }
+                }
                 continue;
             }
             if seg.overlap_ok {
@@ -612,9 +627,6 @@ pub(super) fn replay_segments(
         // 検証時と同じ全体チェックサム（再生中に中身が変わっていない）。
         if reader.finish()? != info.trailer {
             return Err(ArchiveError::ChecksumMismatch.into());
-        }
-        if stopped {
-            break;
         }
     }
     if let Some(b) = batch.take() {
