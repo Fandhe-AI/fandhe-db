@@ -24,6 +24,7 @@ mod copy_prepared;
 mod copy_to_table;
 mod insert_multi_row;
 mod insert_without_vector_column;
+mod logical_dump_data;
 mod logical_dump_schema;
 mod multi_dim_tables;
 mod multi_relation_binding;
