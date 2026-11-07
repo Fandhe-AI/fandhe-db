@@ -428,7 +428,7 @@ fn no_flag_creates_no_socket() {
     assert_eq!(std::fs::read_dir(&dir).expect("read_dir").count(), 0);
     let out = parent_of(&db).join("snap.redb");
     let o = backup_via_socket(&sock, &out);
-    assert_eq!(code(&o), Some(1), "stderr: {}", stderr(&o));
+    assert_eq!(code(&o), Some(2), "stderr: {}", stderr(&o));
     assert!(!out.exists());
 }
 
@@ -468,6 +468,36 @@ fn socket_rejects_malformed_requests_and_server_survives() {
     assert!(exchange(b"/no-such-dir-for-backup/x\n").starts_with("2 "));
     assert!(exchange(b"").is_empty() || exchange(b"").starts_with("2 "));
 
+    // 1 バイトずつ送り続けても、要求全体の期限（5 秒）で閉じられる
+    let started = std::time::Instant::now();
+    let mut c = UnixStream::connect(&sock).expect("connect");
+    c.set_read_timeout(Some(Duration::from_millis(500)))
+        .expect("timeout");
+    let mut resp = String::new();
+    loop {
+        if c.write_all(b"a").is_err() {
+            break;
+        }
+        match c.read_to_string(&mut resp) {
+            Ok(_) => break,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(_) => break,
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "slow request must be cut off"
+        );
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(9),
+        "deadline not enforced"
+    );
+    assert!(resp.is_empty() || resp.starts_with("2 "), "resp: {resp:?}");
+
     assert!(
         a.0.try_wait().expect("try_wait").is_none(),
         "server must be alive"
@@ -484,4 +514,44 @@ fn socket_rejects_malformed_requests_and_server_survives() {
         .output()
         .expect("run");
     assert_eq!(code(&o), Some(2));
+}
+
+/// CLI は、ソケット型でない・権限が緩いパスへは接続せず終了コード 2 で拒否し、
+/// 応答の文字列（制御文字を含みうる）を端末へ出さない。
+#[test]
+fn cli_distrusts_loose_sockets_and_fake_responses() {
+    let fx = common::TempFixtureDir::new("bk5");
+    let db = fx.db_path_str();
+    let (dir, sock) = private_socket_path(&db);
+    let out = parent_of(&db).join("snap.redb");
+
+    // 通常ファイル
+    std::fs::write(&sock, b"x").expect("write");
+    let o = backup_via_socket(&sock, &out);
+    assert_eq!(code(&o), Some(2), "stderr: {}", stderr(&o));
+    std::fs::remove_file(&sock).expect("rm");
+
+    // 権限が緩いソケット
+    let l = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
+    std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o666)).expect("chmod");
+    let o = backup_via_socket(&sock, &out);
+    assert_eq!(code(&o), Some(2), "stderr: {}", stderr(&o));
+
+    // 0600 の偽サーバー: 制御文字つきの応答は信用せず、そのまま出さない
+    std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    let fake = std::thread::spawn(move || {
+        for _ in 0..2 {
+            if let Ok((mut c, _)) = l.accept() {
+                let mut buf = [0u8; 256];
+                let _ = c.read(&mut buf);
+                let _ = c.write_all(b"1 \x1b[31mevil\n");
+            }
+        }
+    });
+    let o = backup_via_socket(&sock, &out);
+    assert_eq!(code(&o), Some(1), "stderr: {}", stderr(&o));
+    assert!(!stderr(&o).contains("evil") && !stderr(&o).contains('\x1b'));
+    let _ = std::os::unix::net::UnixStream::connect(&sock);
+    let _ = fake.join();
+    drop(dir);
 }

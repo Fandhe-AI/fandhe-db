@@ -3939,15 +3939,24 @@ fn run_backup(args: &[String]) -> ExitCode {
 /// 応答の結果コードをそのまま終了コードにする（Issue #2152）。
 #[cfg(unix)]
 fn run_backup_via_socket(sock: &std::path::Path, out: &std::path::Path) -> ExitCode {
+    if let Err(msg) = wire_server::backup_socket::check_socket_owner(sock) {
+        engine::log_stderr!("wire-server: backup: {msg}");
+        return ExitCode::from(wire_server::backup_opt::EXIT_USAGE);
+    }
     match wire_server::backup_socket::request(sock, out) {
-        Ok((0, msg)) => {
-            println!("backup written: {msg}");
-            ExitCode::SUCCESS
-        }
-        Ok((code, msg)) => {
-            engine::log_stderr!("wire-server: backup: {msg}");
-            ExitCode::from(code)
-        }
+        Ok(r) => match r.counts {
+            Some((tables, entries)) if r.code == 0 => {
+                println!("backup written: tables={tables} entries={entries}");
+                ExitCode::SUCCESS
+            }
+            _ => {
+                engine::log_stderr!(
+                    "wire-server: backup: {}",
+                    wire_server::backup_socket::code_message(r.code)
+                );
+                ExitCode::from(r.code)
+            }
+        },
         Err(msg) => {
             engine::log_stderr!("wire-server: backup: {msg}");
             ExitCode::from(wire_server::backup_opt::EXIT_FAILURE)
