@@ -197,10 +197,127 @@ impl StmtKind {
         }
     }
 
-    /// 本文が許可表の接頭辞で始まるか。
-    pub fn accepts(self, sql: &str) -> bool {
-        self.allowed_prefixes().iter().any(|p| sql.starts_with(p))
+    /// 復元時に実行してよい段階。`engine` の `PreData`／`PostData` の区分と一致させ、データの投入中に
+    /// 効いてしまうもの（外部キー・索引・トリガ・ポリシー・行セキュリティ・権限・採番の現在値）は
+    /// 後段でしか受け付けない。
+    pub fn phase(self) -> Phase {
+        match self {
+            StmtKind::Schema
+            | StmtKind::Role
+            | StmtKind::RoleMembership
+            | StmtKind::EnumType
+            | StmtKind::Sequence
+            | StmtKind::Table
+            | StmtKind::View
+            | StmtKind::Function => Phase::Pre,
+            StmtKind::Insert => Phase::Data,
+            StmtKind::SequenceValue
+            | StmtKind::ForeignKey
+            | StmtKind::Index
+            | StmtKind::Trigger
+            | StmtKind::RowSecurity
+            | StmtKind::Policy
+            | StmtKind::Privilege => Phase::Post,
+        }
     }
+
+    /// 本文が種別ごとの期待する形か。多くは許可表の接頭辞だが、`setval`・`ALTER TABLE` の 2 種別は
+    /// 接頭辞だけで通すと別の式・別の操作（`DISABLE ROW LEVEL SECURITY` など）が通るため、
+    /// 構造で厳密に照合する。
+    pub fn accepts(self, sql: &str) -> bool {
+        match self {
+            StmtKind::SequenceValue => is_setval_call(sql),
+            StmtKind::ForeignKey => is_add_foreign_key(sql),
+            StmtKind::RowSecurity => is_enable_or_force_rls(sql),
+            _ => self.allowed_prefixes().iter().any(|p| sql.starts_with(p)),
+        }
+    }
+}
+
+/// 復元の段階。枠はこの順（`Pre` → `Data` → `Post`）にしか並べられない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Phase {
+    /// オブジェクトの作成。
+    Pre,
+    /// 行の投入（`INSERT`・`COPY`）。
+    Data,
+    /// 制約・索引・トリガ・ポリシー・採番の現在値。
+    Post,
+}
+
+/// `SELECT setval('<名前>', <整数>, TRUE|FALSE)` の厳密な形か（他の式・引数を許さない）。
+fn is_setval_call(sql: &str) -> bool {
+    let Some(rest) = sql.strip_prefix("SELECT setval('") else {
+        return false;
+    };
+    let Some((name, rest)) = rest.split_once("', ") else {
+        return false;
+    };
+    let Some(rest) = rest.strip_suffix(')') else {
+        return false;
+    };
+    let Some((num, flag)) = rest.split_once(", ") else {
+        return false;
+    };
+    let digits = num.strip_prefix('-').unwrap_or(num);
+    !name.is_empty()
+        && name.chars().all(|c| c.is_alphanumeric() || c == '_')
+        && !digits.is_empty()
+        && digits.len() <= 19
+        && digits.bytes().all(|b| b.is_ascii_digit())
+        && matches!(flag, "TRUE" | "FALSE")
+}
+
+/// `ALTER TABLE <表> ADD CONSTRAINT <名> FOREIGN KEY ...` の形か。
+fn is_add_foreign_key(sql: &str) -> bool {
+    let t: Vec<&str> = sql.split_whitespace().take(9).collect();
+    matches!(
+        (t.first(), t.get(1), t.get(2), t.get(3), t.get(4), t.get(5)),
+        (
+            Some(&"ALTER"),
+            Some(&"TABLE"),
+            Some(_),
+            Some(&"ADD"),
+            Some(&"CONSTRAINT"),
+            Some(_)
+        )
+    ) && t.get(6) == Some(&"FOREIGN")
+        && t.get(7).is_some_and(|k| k.starts_with("KEY"))
+}
+
+/// `ALTER TABLE <表> ENABLE|FORCE ROW LEVEL SECURITY` の形か（`DISABLE`・`NO FORCE` は不可）。
+fn is_enable_or_force_rls(sql: &str) -> bool {
+    let t: Vec<&str> = sql.split_whitespace().collect();
+    t.len() == 7
+        && t.first() == Some(&"ALTER")
+        && t.get(1) == Some(&"TABLE")
+        && matches!(t.get(3), Some(&"ENABLE") | Some(&"FORCE"))
+        && t.get(4) == Some(&"ROW")
+        && t.get(5) == Some(&"LEVEL")
+        && t.get(6) == Some(&"SECURITY")
+}
+
+/// `COPY <表> (<列>, ...) FROM STDIN` の形か（オプション句・副問い合わせ・`TO` を許さない）。
+/// 表・列は引用符付きまたは素の識別子（英数字・`_`・`.`）だけで構成される。
+pub fn is_copy_from_stdin(sql: &str) -> bool {
+    let Some(rest) = sql.strip_prefix("COPY ") else {
+        return false;
+    };
+    let Some(rest) = rest.strip_suffix(" FROM STDIN") else {
+        return false;
+    };
+    let Some((table, cols)) = rest.split_once(" (") else {
+        return false;
+    };
+    let Some(cols) = cols.strip_suffix(')') else {
+        return false;
+    };
+    let ident_ok = |s: &str| {
+        !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | '"'))
+    };
+    ident_ok(table) && !cols.is_empty() && cols.split(", ").all(ident_ok)
 }
 
 /// ダンプファイルのヘッダ。
@@ -328,9 +445,9 @@ pub enum Record {
 
 /// [`FileReader::next_copy_line`] の結果。
 #[derive(Debug, PartialEq, Eq)]
-pub enum CopyLine {
-    /// データ 1 行（`buf` に末尾の改行つきで入っている）。
-    Row,
+pub enum CopyLine<'a> {
+    /// データ 1 行（末尾の改行つき。読み手の内部バッファを借用する）。
+    Row(&'a [u8]),
     /// 終端行（`\.`）。
     End,
 }
@@ -500,10 +617,10 @@ impl<R: BufRead> FileReader<R> {
         Ok(sql)
     }
 
-    /// `COPY` のデータを 1 行読み、`buf` に（末尾の改行つきで）入れる。終端行（`\.`）なら
+    /// `COPY` のデータを 1 行読んで借用で返す（末尾の改行つき。行を二重に保持しない）。終端行（`\.`）なら
     /// [`CopyLine::End`] を返して COPY を閉じる。行は改行でのみ区切る（COPY text の行内の改行・CR は
     /// エスケープされており、生の改行は行境界だけである）。
-    pub fn next_copy_line(&mut self, buf: &mut Vec<u8>) -> Result<CopyLine, FileError> {
+    pub fn next_copy_line(&mut self) -> Result<CopyLine<'_>, FileError> {
         if !self.in_copy {
             return Err(FileError::BadFrame);
         }
@@ -520,9 +637,7 @@ impl<R: BufRead> FileReader<R> {
         if self.line.contains(&0) {
             return Err(FileError::BadText);
         }
-        buf.clear();
-        buf.extend_from_slice(&self.line);
-        Ok(CopyLine::Row)
+        Ok(CopyLine::Row(&self.line))
     }
 }
 
@@ -595,12 +710,12 @@ mod tests {
                 sql: "COPY t (a) FROM STDIN".into()
             })
         );
-        let mut buf = Vec::new();
-        assert_eq!(r.next_copy_line(&mut buf).expect("row"), CopyLine::Row);
-        assert_eq!(buf, b"a;b\\nc -- $$\n");
-        assert_eq!(r.next_copy_line(&mut buf).expect("row"), CopyLine::Row);
-        assert_eq!(buf, b"\\\\.\n");
-        assert_eq!(r.next_copy_line(&mut buf).expect("end"), CopyLine::End);
+        assert_eq!(
+            r.next_copy_line().expect("row"),
+            CopyLine::Row(b"a;b\\nc -- $$\n")
+        );
+        assert_eq!(r.next_copy_line().expect("row"), CopyLine::Row(b"\\\\.\n"));
+        assert_eq!(r.next_copy_line().expect("end"), CopyLine::End);
         assert_eq!(r.next_record().expect("eof"), None);
     }
 
@@ -631,11 +746,10 @@ mod tests {
     fn read_all(bytes: &[u8]) -> Result<usize, FileError> {
         let (mut r, _) = FileReader::open(bytes)?;
         let mut n = 0;
-        let mut buf = Vec::new();
         while let Some(rec) = r.next_record()? {
             n += 1;
             if matches!(rec, Record::CopyHeader { .. }) {
-                while r.next_copy_line(&mut buf)? == CopyLine::Row {}
+                while matches!(r.next_copy_line()?, CopyLine::Row(_)) {}
             }
         }
         Ok(n)
@@ -704,5 +818,49 @@ mod tests {
         assert!(!StmtKind::Table.accepts("create table t (a INT)"));
         assert!(!StmtKind::Insert.accepts("DELETE FROM t"));
         assert!(!StmtKind::SequenceValue.accepts("SELECT 1"));
+        assert!(StmtKind::SequenceValue.accepts("SELECT setval('s_seq', 12, TRUE)"));
+        assert!(StmtKind::SequenceValue.accepts("SELECT setval('s_seq', -3, FALSE)"));
+        for bad in [
+            "SELECT setval('s', 1, TRUE), f()",
+            "SELECT setval('s', 1, TRUE) FROM t",
+            "SELECT setval('s', f(), TRUE)",
+            "SELECT setval('s', 1)",
+            "SELECT setval('s''; x', 1, TRUE)",
+            "SELECT setval('s', 1, maybe)",
+        ] {
+            assert!(!StmtKind::SequenceValue.accepts(bad), "{bad}");
+        }
+        assert!(StmtKind::RowSecurity.accepts("ALTER TABLE t ENABLE ROW LEVEL SECURITY"));
+        assert!(StmtKind::RowSecurity.accepts("ALTER TABLE t FORCE ROW LEVEL SECURITY"));
+        for bad in [
+            "ALTER TABLE t DISABLE ROW LEVEL SECURITY",
+            "ALTER TABLE t NO FORCE ROW LEVEL SECURITY",
+            "ALTER TABLE t DROP COLUMN a",
+        ] {
+            assert!(!StmtKind::RowSecurity.accepts(bad), "{bad}");
+        }
+        assert!(StmtKind::ForeignKey.accepts(
+            "ALTER TABLE a.t ADD CONSTRAINT \"fk\" FOREIGN KEY (\"p\") REFERENCES u (id)"
+        ));
+        assert!(!StmtKind::ForeignKey.accepts("ALTER TABLE t DISABLE ROW LEVEL SECURITY"));
+        assert!(!StmtKind::ForeignKey.accepts("ALTER TABLE t DROP COLUMN a"));
+        assert!(StmtKind::Trigger.phase() > StmtKind::Insert.phase());
+        assert!(StmtKind::Function.phase() < StmtKind::Insert.phase());
+    }
+
+    #[test]
+    fn copy_header_shape_is_structural() {
+        assert!(is_copy_from_stdin("COPY \"t\" (\"a\", \"b\") FROM STDIN"));
+        assert!(is_copy_from_stdin("COPY app.t (a) FROM STDIN"));
+        for bad in [
+            "COPY (SELECT 1) TO STDOUT",
+            "COPY t (a) FROM STDIN WITH (FORMAT csv)",
+            "COPY t FROM STDIN",
+            "COPY t (a; DROP TABLE t) FROM STDIN",
+            "COPY t (a) TO STDOUT",
+            "COPY t (a)) FROM STDIN",
+        ] {
+            assert!(!is_copy_from_stdin(bad), "{bad}");
+        }
     }
 }

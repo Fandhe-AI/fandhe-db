@@ -516,7 +516,7 @@
 //! 書き出す（Issue #2162・RECOVER-16 ポインタ。方式は `docs/design/logical-dump.md` の第 12 節）。
 //! `--tenant` は共有の定義に指定テナントの固有分と行を足した範囲、`--shared-only` は共有の定義だけ
 //! （どちらかが必須。全テナントを暗黙に書き出さない）。出力は 0600 の一時名へ書き、成功したときだけ公開する。
-//! `wire-server dump-restore --from <file> --db <new path>` サブコマンドは、ダンプを一時名の新規 DB へ流し込み、
+//! `wire-server dump-restore --from <file> --db <new path> [--expect-tenant <id>]` サブコマンドは、ダンプを一時名の新規 DB へ流し込み、
 //! 整合検査に通ったときだけ新規パスへ公開する（既存の復元先は拒否＝空の DB のみ。途中の失敗は何も公開しない）。
 //! 終了コード: 0=成功、1=実行時の失敗、2=引数／パスの拒否、3=公開済みだが後始末を確かめられなかった、
 //! 4=ダンプファイルの拒否（`dump-restore` のみ）、5=復元結果の整合検査の失敗（`dump-restore` のみ）。
@@ -4228,7 +4228,12 @@ fn run_dump_restore(args: &[String]) -> ExitCode {
         }
     };
     let mut leftover = None;
-    let result = dump_restore::restore(&parsed.from, &parsed.db, &mut leftover);
+    let result = dump_restore::restore(
+        &parsed.from,
+        &parsed.db,
+        parsed.expect_tenant.as_deref(),
+        &mut leftover,
+    );
     if let Some(p) = &leftover {
         report_dump_leftover("dump-restore", p);
     }

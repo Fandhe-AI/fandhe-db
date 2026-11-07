@@ -78,6 +78,8 @@ pub struct DumpRestoreArgs {
     pub from: PathBuf,
     /// 復元先（まだ存在しない新規パス＝空の DB だけを受け付ける）。
     pub db: PathBuf,
+    /// 指定されたとき、ヘッダのテナントがこれと一致するダンプだけを復元する。
+    pub expect_tenant: Option<String>,
 }
 
 /// ダンプファイルのヘッダ行に載せられるテナント名か。ヘッダを行単位で読み戻すため、
@@ -182,14 +184,18 @@ pub fn parse_dump(args: &[String]) -> Result<DumpArgs, String> {
 pub fn parse_restore(args: &[String]) -> Result<DumpRestoreArgs, String> {
     let mut from: Option<&str> = None;
     let mut db: Option<&str> = None;
+    let mut expect: Option<&str> = None;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         let slot = match arg.as_str() {
             "--from" => &mut from,
             "--db" => &mut db,
+            "--expect-tenant" => &mut expect,
             _ => {
                 return Err(
-                    "unknown argument (usage: dump-restore --from <file> --db <path>)".into(),
+                    "unknown argument (usage: dump-restore --from <file> --db <path> \
+                     [--expect-tenant <id>])"
+                        .into(),
                 )
             }
         };
@@ -207,10 +213,21 @@ pub fn parse_restore(args: &[String]) -> Result<DumpRestoreArgs, String> {
     let Some(db) = db else {
         return Err("dump-restore requires --db".into());
     };
+    let expect_tenant = match expect {
+        None => None,
+        Some(t) if is_header_safe_tenant(t) => Some(t.to_string()),
+        Some(_) => {
+            return Err("--expect-tenant must be a valid tenant id (printable ASCII)".into())
+        }
+    };
     let from = validate_existing_file("--from", from)?;
     // 既存のパス（空でない DB を含む）は受け付けない。空の DB だけを新規に作る。
     let db = validate_new_path("--db", db)?;
-    Ok(DumpRestoreArgs { from, db })
+    Ok(DumpRestoreArgs {
+        from,
+        db,
+        expect_tenant,
+    })
 }
 
 #[cfg(test)]
@@ -315,5 +332,20 @@ mod tests {
         .is_err());
         assert!(parse_restore(&v(&["--from", &exe, "--db", "x-not-created", "--bogus"])).is_err());
         assert!(parse_restore(&v(&["--from", &exe, "--db", "x-not-created"])).is_ok());
+        let ok = parse_restore(&v(&[
+            "--from",
+            &exe,
+            "--db",
+            "x-not-created",
+            "--expect-tenant",
+            "t1",
+        ]))
+        .expect("valid");
+        assert_eq!(ok.expect_tenant.as_deref(), Some("t1"));
+        for bad in [["--expect-tenant", "a b"], ["--expect-tenant", ""]] {
+            let mut a = v(&["--from", &exe, "--db", "x-not-created"]);
+            a.extend(v(&bad));
+            assert!(parse_restore(&a).is_err());
+        }
     }
 }

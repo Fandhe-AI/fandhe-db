@@ -726,3 +726,195 @@ fn restore_rejects_tampered_and_malformed_dumps() {
     let o = run(&["dump-restore", "--from", &good, "--db", &dest]);
     assert_eq!(code(&o), Some(0), "stderr: {}", stderr(&o));
 }
+
+fn write_dump_with(path: &str, h: Header, build: impl FnOnce(&mut FileWriter<Vec<u8>>)) {
+    let mut w = FileWriter::begin(Vec::new(), &h).expect("begin");
+    build(&mut w);
+    std::fs::write(path, w.finish().expect("finish")).expect("write dump");
+}
+
+/// 復元を試み、終了コードと「何も公開されない」ことを確かめる。
+fn assert_restore_rejected(dir: &Path, from: &str, extra: &[&str], want: i32, why: &str) -> String {
+    let dest = s(&dir.join("dest.redb")).to_string();
+    let mut args = vec!["dump-restore", "--from", from, "--db", &dest];
+    args.extend_from_slice(extra);
+    let o = run(&args);
+    assert_eq!(code(&o), Some(want), "{why}: stderr: {}", stderr(&o));
+    assert!(!Path::new(&dest).exists(), "{why}: published a database");
+    assert_no_temp_leftovers(dir);
+    stderr(&o)
+}
+
+const T_SQL: &str = "CREATE TABLE t (id BIGINT PRIMARY KEY, b TEXT)";
+
+/// 枠の順序（作成 → データ → 後段）を強制する。データの後ろに作成系、後段の後ろにデータは置けない。
+/// 関数・トリガ・データの順は、トリガ関数がデータ投入中に走りうるので拒否される。
+#[test]
+fn restore_enforces_frame_order() {
+    let fx = common::TempFixtureDir::new("dump-order");
+    let dir = dir_of(&fx.db_path_str());
+    let from = s(&dir.join("o.sql")).to_string();
+    let h = || header(DumpScope::Tenant("t1".into()), DumpParts::All);
+    let trg = "CREATE TRIGGER tg BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION trg()";
+    let func =
+        "CREATE FUNCTION trg() RETURNS trigger LANGUAGE plpgsql AS $q$ BEGIN RETURN NEW; END $q$";
+    write_dump_with(&from, h(), |w| {
+        w.statement(StmtKind::Table, T_SQL).expect("s");
+        w.statement(StmtKind::Function, func).expect("s");
+        w.statement(StmtKind::Trigger, trg).expect("s");
+        w.statement(StmtKind::Insert, "INSERT INTO t (id, b) VALUES (1, 'x')")
+            .expect("s");
+    });
+    let err = assert_restore_rejected(&dir, &from, &[], 4, "trigger before data");
+    assert!(err.contains("dump item 4"), "{err}");
+    // COPY も同じ。
+    write_dump_with(&from, h(), |w| {
+        w.statement(StmtKind::Table, T_SQL).expect("s");
+        w.statement(StmtKind::Index, "CREATE INDEX i ON t (b)")
+            .expect("s");
+        w.copy_header("COPY t (id, b) FROM STDIN").expect("c");
+        w.copy_row("1\tx").expect("r");
+        w.copy_end().expect("e");
+    });
+    assert_restore_rejected(&dir, &from, &[], 4, "copy after post-data");
+    // データの前に後段（外部キー・索引・採番値）を置かない。作成系をデータの後ろにも置かない。
+    write_dump_with(&from, h(), |w| {
+        w.statement(StmtKind::Table, T_SQL).expect("s");
+        w.statement(StmtKind::Insert, "INSERT INTO t (id, b) VALUES (1, 'x')")
+            .expect("s");
+        w.statement(StmtKind::Table, "CREATE TABLE u (id BIGINT PRIMARY KEY)")
+            .expect("s");
+    });
+    assert_restore_rejected(&dir, &from, &[], 4, "table after data");
+}
+
+/// `setval` は厳密な形だけを受け付け、`ALTER TABLE` は種別ごとの形に絞る。
+#[test]
+fn restore_rejects_loose_setval_and_alter_table() {
+    let fx = common::TempFixtureDir::new("dump-shapes");
+    let dir = dir_of(&fx.db_path_str());
+    let from = s(&dir.join("o.sql")).to_string();
+    let h = || header(DumpScope::Tenant("t1".into()), DumpParts::All);
+    for (kind, sql) in [
+        (
+            StmtKind::SequenceValue,
+            "SELECT setval('s', 1, TRUE), now()",
+        ),
+        (
+            StmtKind::SequenceValue,
+            "SELECT setval('s', 1, TRUE) FROM t",
+        ),
+        (
+            StmtKind::RowSecurity,
+            "ALTER TABLE t DISABLE ROW LEVEL SECURITY",
+        ),
+        (
+            StmtKind::RowSecurity,
+            "ALTER TABLE t NO FORCE ROW LEVEL SECURITY",
+        ),
+        (StmtKind::ForeignKey, "ALTER TABLE t DROP COLUMN b"),
+    ] {
+        write_dump_with(&from, h(), |w| {
+            w.statement(StmtKind::Table, T_SQL).expect("s");
+            w.statement(kind, sql).expect("s");
+        });
+        assert_restore_rejected(&dir, &from, &[], 4, sql);
+    }
+}
+
+/// ヘッダ（scope・parts・format）と枠の内容が食い違うファイルは拒否する。
+#[test]
+fn restore_rejects_header_frame_mismatch() {
+    let fx = common::TempFixtureDir::new("dump-mismatch");
+    let dir = dir_of(&fx.db_path_str());
+    let from = s(&dir.join("o.sql")).to_string();
+    let ins = "INSERT INTO t (id, b) VALUES (1, 'x')";
+    let mk = |scope: DumpScope, parts: DumpParts, format: DumpFormat| Header {
+        scope,
+        parts,
+        format,
+    };
+    let tenant = || DumpScope::Tenant("t1".into());
+    // shared にデータ枠（INSERT／COPY）。
+    write_dump_with(
+        &from,
+        mk(DumpScope::Shared, DumpParts::All, DumpFormat::Copy),
+        |w| {
+            w.statement(StmtKind::Table, T_SQL).expect("s");
+            w.statement(StmtKind::Insert, ins).expect("s");
+        },
+    );
+    assert_restore_rejected(&dir, &from, &[], 4, "shared insert");
+    write_dump_with(
+        &from,
+        mk(DumpScope::Shared, DumpParts::All, DumpFormat::Copy),
+        |w| {
+            w.statement(StmtKind::Table, T_SQL).expect("s");
+            w.copy_header("COPY t (id, b) FROM STDIN").expect("c");
+            w.copy_row("1\tx").expect("r");
+            w.copy_end().expect("e");
+        },
+    );
+    assert_restore_rejected(&dir, &from, &[], 4, "shared copy");
+    // parts: schema にデータ枠。
+    write_dump_with(
+        &from,
+        mk(tenant(), DumpParts::SchemaOnly, DumpFormat::Copy),
+        |w| {
+            w.statement(StmtKind::Table, T_SQL).expect("s");
+            w.statement(StmtKind::Insert, ins).expect("s");
+        },
+    );
+    assert_restore_rejected(&dir, &from, &[], 4, "schema-only with data");
+    // format: insert に @copy。
+    write_dump_with(
+        &from,
+        mk(tenant(), DumpParts::All, DumpFormat::Insert),
+        |w| {
+            w.statement(StmtKind::Table, T_SQL).expect("s");
+            w.copy_header("COPY t (id, b) FROM STDIN").expect("c");
+            w.copy_row("1\tx").expect("r");
+            w.copy_end().expect("e");
+        },
+    );
+    assert_restore_rejected(&dir, &from, &[], 4, "insert format with copy");
+    // COPY の見出しが FROM STDIN の形でない。
+    write_dump_with(&from, mk(tenant(), DumpParts::All, DumpFormat::Copy), |w| {
+        w.statement(StmtKind::Table, T_SQL).expect("s");
+        w.copy_header("COPY t (id, b) FROM STDIN WITH (FORMAT csv)")
+            .expect("c");
+        w.copy_row("1,x").expect("r");
+        w.copy_end().expect("e");
+    });
+    assert_restore_rejected(&dir, &from, &[], 4, "copy options");
+    // 整合するファイルは受理され、--expect-tenant の一致／不一致が効く。
+    write_dump_with(&from, mk(tenant(), DumpParts::All, DumpFormat::Copy), |w| {
+        w.statement(StmtKind::Table, T_SQL).expect("s");
+        w.statement(StmtKind::Insert, ins).expect("s");
+    });
+    assert_restore_rejected(
+        &dir,
+        &from,
+        &["--expect-tenant", "other"],
+        4,
+        "tenant mismatch",
+    );
+    assert_restore_rejected(
+        &dir,
+        &from,
+        &["--expect-tenant", "has space"],
+        2,
+        "bad expect",
+    );
+    let dest = s(&dir.join("ok.redb")).to_string();
+    let o = run(&[
+        "dump-restore",
+        "--from",
+        &from,
+        "--db",
+        &dest,
+        "--expect-tenant",
+        "t1",
+    ]);
+    assert_eq!(code(&o), Some(0), "stderr: {}", stderr(&o));
+}

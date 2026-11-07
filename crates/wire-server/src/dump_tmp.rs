@@ -3,8 +3,8 @@
 //!
 //! 責務境界: 一時名の排他作成（0600）・保持 fd による同一性確認・`hard_link` による公開
 //! （既存の宛先は上書きしない）・失敗時の削除だけを担う。`restore_opt` の `TempCopy` と同じ手順だが、
-//! あちらは非公開で `restore_opt` が並行して変更されているため、本モジュールに小さく持ち直している
-//! （意図した重複。統合は別途）。`dump_run`・`dump_restore` が使う。
+//! あちらは `restore_opt` の内部型で公開されていないため、内部型を公開せずに済ませる目的で、
+//! 本モジュールに小さく持っている（意図した重複）。`dump_run`・`dump_restore` が使う。
 
 use std::fs::{File, OpenOptions};
 use std::io::ErrorKind;

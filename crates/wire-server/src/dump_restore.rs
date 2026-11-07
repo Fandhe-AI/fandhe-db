@@ -23,9 +23,11 @@ use engine::sql::mode::SessionState;
 use engine::sql::statement_splitter::{split_statements, SplitOutcome};
 use engine::storage::{IntegrityOptions, Storage};
 
-use crate::dump_file::{CopyLine, FileError, FileReader, Header, Record, StmtKind};
+use crate::dump_file::{
+    is_copy_from_stdin, CopyLine, FileError, FileReader, Header, Phase, Record, StmtKind,
+};
 use crate::dump_opt::{
-    DumpParts, DumpScope, EXIT_FAILURE, EXIT_INVALID_DUMP, EXIT_NOT_CONSISTENT,
+    DumpFormat, DumpParts, DumpScope, EXIT_FAILURE, EXIT_INVALID_DUMP, EXIT_NOT_CONSISTENT,
     EXIT_PUBLISHED_UNVERIFIED, EXIT_USAGE,
 };
 use crate::dump_tmp::{parent_of, TempFile, TmpError};
@@ -54,6 +56,8 @@ pub enum RestoreError {
     Dump(FileError),
     /// ヘッダが宣言する内容は新規 DB へ復元できない（データのみ）。
     NotRestorable,
+    /// ヘッダのテナントが `--expect-tenant` と一致しない。
+    TenantMismatch,
     /// 種別の許可表に合わない・1 文でない文を含む。`ordinal` は 1 から数える枠の通し番号。
     Disallowed {
         /// 枠の通し番号。
@@ -90,6 +94,10 @@ pub fn classify(result: &Result<RestoreSummary, RestoreError>) -> (u8, String) {
         Err(RestoreError::NotRestorable) => (
             EXIT_INVALID_DUMP,
             "a data-only dump cannot be restored into a new database".into(),
+        ),
+        Err(RestoreError::TenantMismatch) => (
+            EXIT_INVALID_DUMP,
+            "the dump tenant does not match --expect-tenant".into(),
         ),
         Err(RestoreError::Disallowed { ordinal }) => (
             EXIT_INVALID_DUMP,
@@ -132,6 +140,7 @@ pub fn classify(result: &Result<RestoreSummary, RestoreError>) -> (u8, String) {
 pub fn restore(
     from: &Path,
     dest: &Path,
+    expect_tenant: Option<&str>,
     leftover: &mut Option<PathBuf>,
 ) -> Result<RestoreSummary, RestoreError> {
     let parent = parent_of(dest).map_err(RestoreError::Tmp)?;
@@ -150,6 +159,12 @@ pub fn restore(
         FileReader::open(BufReader::new(file)).map_err(RestoreError::Dump)?;
     if header.parts == DumpParts::DataOnly {
         return Err(RestoreError::NotRestorable);
+    }
+    // ヘッダのテナントは信用される。取り違えを防ぎたい運用者は `--expect-tenant` で固定する。
+    if let Some(t) = expect_tenant {
+        if header.scope != DumpScope::Tenant(t.to_string()) {
+            return Err(RestoreError::TenantMismatch);
+        }
     }
     let mut tmp = TempFile::create(parent, "fandhe-dump-restore").map_err(RestoreError::Tmp)?;
     let result = apply_verify_publish(&mut reader, &header, &mut tmp, dest);
@@ -189,7 +204,24 @@ fn apply_verify_publish(
     Ok(summary)
 }
 
+/// ヘッダの宣言と枠の内容が整合するか。`scope: shared` の範囲には行が無く、`parts` と `format` が
+/// 排除するデータ枠・COPY 枠は受け付けない（取り違え・改ざんの検出）。`format: copy` のダンプでも、
+/// COPY が受理しない列型の表は `INSERT` で出る（#2161）ため、`Insert` 枠は `copy` の下でも許す。
+fn frame_matches_header(header: &Header, is_data: bool, is_copy: bool) -> bool {
+    if !is_data {
+        return true;
+    }
+    header.scope != DumpScope::Shared
+        && header.parts != DumpParts::SchemaOnly
+        && !(is_copy && header.format == DumpFormat::Insert)
+}
+
 /// 枠を順に実行する。ヘッダのテナントの文脈（認証済みセッションと同じ可視性集合）で実行する。
+///
+/// 枠は `Pre` → `Data` → `Post` の順にしか並べられない（逆行は拒否）。DDL 実行権限を持つのは
+/// `Pre`・`Post` を流すセッションだけで、`Data` の枠は DDL 権限なしの別セッションで実行する。
+/// トリガ・ポリシー・制約などデータ投入中に効くものは `Post` でしか受け付けないので、投入中に
+/// ダンプファイル由来のトリガ関数は走らない。
 fn apply(
     core: &EngineCore,
     reader: &mut FileReader<BufReader<File>>,
@@ -201,31 +233,43 @@ fn apply(
     };
     let ctx = crate::auth::session_policy_context(tenant)
         .map_err(|_| RestoreError::Dump(FileError::BadHeader))?;
-    let mut session = SessionState::default();
+    let load_failed = |_| RestoreError::Apply {
+        ordinal: 0,
+        code: "XX000",
+    };
     // 復元は運用者が明示して実行する CLI であり、ダンプの DDL 文を実行するには DDL 実行権限が要る。
-    // 権限を与えるのはこの一時 DB 上のこのセッションだけで、実行できる文は種別ごとの許可表で絞っている。
-    session.allow_ddl();
-    core.load_session_udfs(&ctx, &mut session)
-        .map_err(|_| RestoreError::Apply {
-            ordinal: 0,
-            code: "XX000",
-        })?;
+    // 権限を与えるのはこの一時 DB 上の DDL 用セッションだけで、実行できる文は種別ごとの形で絞っている。
+    let mut ddl_session = SessionState::default();
+    ddl_session.allow_ddl();
+    core.load_session_udfs(&ctx, &mut ddl_session)
+        .map_err(load_failed)?;
+    let mut data_session = SessionState::default();
+    core.load_session_udfs(&ctx, &mut data_session)
+        .map_err(load_failed)?;
     let mut summary = RestoreSummary::default();
     let mut ordinal: u64 = 0;
+    let mut phase = Phase::Pre;
     while let Some(record) = reader.next_record().map_err(RestoreError::Dump)? {
         ordinal = ordinal.saturating_add(1);
         let disallowed = RestoreError::Disallowed { ordinal };
         match record {
             Record::Statement { kind, sql } => {
                 let is_data = kind == StmtKind::Insert;
-                if is_data && header.parts == DumpParts::SchemaOnly {
+                if kind.phase() < phase
+                    || !frame_matches_header(header, is_data, false)
+                    || !kind.accepts(&sql)
+                    || !is_single_statement(&sql)
+                {
                     return Err(disallowed);
                 }
-                if !kind.accepts(&sql) || !is_single_statement(&sql) {
-                    return Err(disallowed);
-                }
-                core.refresh_session_udfs(&ctx, &mut session);
-                core.execute_sql_in_session(&ctx, &mut session, &sql)
+                phase = kind.phase();
+                let session = if is_data {
+                    &mut data_session
+                } else {
+                    &mut ddl_session
+                };
+                core.refresh_session_udfs(&ctx, session);
+                core.execute_sql_in_session(&ctx, session, &sql)
                     .map_err(|e| RestoreError::Apply {
                         ordinal,
                         code: e.wire_code(),
@@ -233,15 +277,15 @@ fn apply(
                 summary.statements = summary.statements.saturating_add(1);
             }
             Record::CopyHeader { sql } => {
-                if header.parts == DumpParts::SchemaOnly
-                    || !engine::sql::copy::is_copy_statement(&sql)
-                    || !sql.starts_with("COPY ")
-                    || !sql.ends_with(" FROM STDIN")
+                if phase > Phase::Data
+                    || !frame_matches_header(header, true, true)
+                    || !is_copy_from_stdin(&sql)
                     || !is_single_statement(&sql)
                 {
                     return Err(disallowed);
                 }
-                let rows = restore_copy(core, &ctx, &mut session, &sql, reader, ordinal)?;
+                phase = Phase::Data;
+                let rows = restore_copy(core, &ctx, &mut data_session, &sql, reader, ordinal)?;
                 summary.statements = summary.statements.saturating_add(1);
                 summary.copy_rows = summary.copy_rows.saturating_add(rows);
             }
@@ -269,7 +313,6 @@ fn restore_copy(
         ordinal,
         code: e.wire_code(),
     };
-    let mut line = Vec::new();
     let mut total: u64 = 0;
     loop {
         core.refresh_session_udfs(ctx, session);
@@ -282,16 +325,13 @@ fn restore_copy(
         let mut bytes: usize = 0;
         let mut ended = false;
         while rows < max_rows && bytes < COPY_CHUNK_BYTES {
-            match reader
-                .next_copy_line(&mut line)
-                .map_err(RestoreError::Dump)?
-            {
+            match reader.next_copy_line().map_err(RestoreError::Dump)? {
                 CopyLine::End => {
                     ended = true;
                     break;
                 }
-                CopyLine::Row => {
-                    copy.feed(&line).map_err(apply_err)?;
+                CopyLine::Row(line) => {
+                    copy.feed(line).map_err(apply_err)?;
                     rows = rows.saturating_add(1);
                     bytes = bytes.saturating_add(line.len());
                 }
