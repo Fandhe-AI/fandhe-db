@@ -92,6 +92,9 @@ pub enum IncrementalError {
     RangeUnavailable,
     /// ベースを DB ファイルまたは増分バックアップとして読めない。
     BaseUnreadable,
+    /// 出力元の DB を読み取り専用で開けない（書き込みを要する状態〔異常終了後の修復〕・DB ファイルではない・
+    /// 破損）。呼び出し側（CLI）が [`ReadOnlyStorage::open`](crate::storage::ReadOnlyStorage::open) の失敗を写す。
+    SourceUnreadable,
     /// 別のプロセスが DB を開いている。
     InUse,
     /// 出力先に既に何かがある。
@@ -128,6 +131,9 @@ impl std::fmt::Display for IncrementalError {
             Self::RangeUnavailable => "the change log does not cover the range after the base",
             Self::BaseUnreadable => {
                 "base could not be read as a database file or an incremental backup"
+            }
+            Self::SourceUnreadable => {
+                "source database could not be opened read-only (it may need recovery after an unclean shutdown)"
             }
             Self::InUse => "database is open for writing by another process",
             Self::DestinationExists => "incremental backup destination already exists",
