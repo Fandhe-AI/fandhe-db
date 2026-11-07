@@ -524,7 +524,7 @@ PITR の停止条件（#2169）は含まない。
 - D1 のオラクル試験
 - ラウンドトリップ: ベース + 再生の結果を `table_image::capture` で元と比べ、差分が空であること
 - 欠落・順序違反・改ざん・別 DB／別 timeline の拒否
-- `scripts/crash_test*.sh` 系への PITR シナリオ追加（#2170。CI ジョブ追加時は `github-actions.md`）
+- `scripts/crash_test*.sh` 系への PITR シナリオ追加（#2170。`scripts/crash_test_pitr.sh` を追加し、`crash-test` の前提ターゲットとして既存の CI ジョブで実行する。内容は [backup-restore-operations.md](backup-restore-operations.md) の 7.1 節）
 - テストは RECOVER-14 等の ID に紐付ける
 
 ### D11 有効化の仕様・オラクル・エラー・性能の実測（Issue #3069）
