@@ -504,6 +504,9 @@
 //! バックアップを一時名へコピーして検査し、通った場合だけ新規パスへ公開する（既存の出力先は上書きしない。
 //! 通らなければ何も公開せず 4 または 5 で終了。詳細は `wire_server::restore_opt`）。`--incremental` を
 //! 指定すると、検査の前に増分バックアップ（古い順）を一時コピーへ適用する（連鎖が切れていれば何も公開せず 1 で終了）。
+//! さらに `--change-log-archive-dir <dir>` と `--until-lsn <n>`（または `--until-time <RFC 3339・ゾーン必須>`）を
+//! 指定すると、アーカイブの変更ログを指定点のコミット境界まで適用する（PITR。Issue #2169・RECOVER-14 ポインタ。
+//! 範囲外・欠落・破損は何も公開せず 1 で終了。`--until-*` の組み合わせの不正は DB に触れる前に 2 で終了）。
 //!
 //! `wire-server backup-incremental --db <path> --base <path> --out <path>` サブコマンドは、**停止中**の DB から、
 //! 直前のベース（フルバックアップまたは前回の増分）が終わった commit の次から最新までのログ区間を増分
@@ -4237,10 +4240,11 @@ fn run_restore(args: &[String]) -> ExitCode {
         }
     };
     let mut leftover = None;
-    let result = restore_opt::restore_with_incrementals(
+    let result = restore_opt::restore_with_pitr(
         &parsed.from,
         &parsed.db,
         &parsed.incrementals,
+        parsed.pitr.as_ref(),
         &mut leftover,
     );
     if matches!(
