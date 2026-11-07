@@ -10,6 +10,7 @@ use http_common::temp_db;
 #[path = "../common/tls_client.rs"]
 mod tls_client;
 
+mod backup_cli;
 mod batch_max_files_parity;
 mod persist4_second_server_same_db;
 mod recover12_explicit_txn_resend;

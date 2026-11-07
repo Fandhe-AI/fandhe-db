@@ -473,6 +473,13 @@
 //! （`CREATE ROLE ... LOGIN PASSWORD`）で SCRAM 接続するときの user（ログイン識別子）を表示する
 //! （Issue #2233・WIRE-18。DB は開かない）。
 //!
+//! `wire-server backup --db <path> --out <path>` サブコマンドは、**停止中**の DB ファイルを開いて
+//! 一貫スナップショットを新規ファイルへ書き出す（Issue #2152・RECOVER-13 ポインタ。方式は
+//! `docs/design/backup-snapshot.md`）。稼働中のサーバーが同じ `--db` を開いている間は
+//! `DatabaseAlreadyOpen` で fail-closed に非 0 終了し、稼働中のプロセスとデータには影響しない。
+//! 終了コード: 0=成功、1=実行時の失敗、2=引数／出力先パスの拒否、3=出力は公開済みだが後始末を
+//! 確かめられなかった（バックアップは存在する。検証してから使う）。`--users` ファイルは対象外。
+//!
 //! `wire-server hash-password` サブコマンドはユーザーストア（`username:tenant_id:phc`）
 //! に登録する 1 行を生成する補助コマンド（stdin からパスワードを読み、平文を
 //! ログ・引数に残さない）。
@@ -527,6 +534,9 @@ fn main() -> ExitCode {
     }
     if args.get(1).map(String::as_str) == Some("login-identifier") {
         return run_login_identifier(&args[2..]);
+    }
+    if args.get(1).map(String::as_str) == Some("backup") {
+        return run_backup(&args[2..]);
     }
 
     run_server(&args)
@@ -3818,6 +3828,57 @@ fn run_login_identifier(args: &[String]) -> ExitCode {
         Err(_) => {
             engine::log_stderr!("wire-server: login-identifier: invalid tenant or role name");
             ExitCode::FAILURE
+        }
+    }
+}
+
+/// `backup --db <path> --out <path>` サブコマンド（Issue #2152）。引数と出力先パスを検証してから
+/// `--db` を開き、`Storage::export_snapshot` で `--out` へ書き出す。稼働中のサーバーが DB を
+/// 開いている場合は open が失敗して非 0 で終わる（fail-closed）。エラー文に行の値・パスの内容・
+/// 表名は含めない。
+fn run_backup(args: &[String]) -> ExitCode {
+    use engine::storage::{SnapshotExportError, Storage};
+    use wire_server::backup_opt;
+
+    let parsed = match backup_opt::parse(args) {
+        Ok(p) => p,
+        Err(msg) => {
+            engine::log_stderr!("wire-server: backup: {msg}");
+            return ExitCode::from(backup_opt::EXIT_USAGE);
+        }
+    };
+    let storage = match Storage::open(&parsed.db) {
+        Ok(s) => s,
+        Err(e) => {
+            if e.to_string().contains("already open") {
+                engine::log_stderr!(
+                    "wire-server: backup: database is in use by another process \
+                     (stop the server first)"
+                );
+            } else {
+                engine::log_stderr!("wire-server: backup: failed to open database");
+            }
+            return ExitCode::from(backup_opt::EXIT_FAILURE);
+        }
+    };
+    match storage.export_snapshot(&parsed.out) {
+        Ok(summary) => {
+            println!(
+                "backup written: tables={} entries={}",
+                summary.tables, summary.entries
+            );
+            ExitCode::SUCCESS
+        }
+        Err(SnapshotExportError::PublishedButNotFinalized) => {
+            engine::log_stderr!(
+                "wire-server: backup: WARNING: the snapshot file was published but its durability \
+                 could not be confirmed; verify the output file before relying on it"
+            );
+            ExitCode::from(backup_opt::EXIT_PUBLISHED_UNVERIFIED)
+        }
+        Err(e) => {
+            engine::log_stderr!("wire-server: backup: {e}");
+            ExitCode::from(backup_opt::EXIT_FAILURE)
         }
     }
 }

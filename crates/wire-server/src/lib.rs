@@ -135,6 +135,7 @@
 
 pub mod auth;
 pub mod auth_method_opt;
+pub mod backup_opt;
 pub(crate) mod binary_param;
 pub mod bind_guard;
 pub mod connection_limits_opt;
