@@ -284,6 +284,7 @@ const NOT_SCHEMA_TABLE_PREFIXES: &[&str] = &[
     "user_uniq/",
     "user_gin/",
     "key_index/",
+    "key_index_rev/",
     "matview_rows/",
 ];
 
