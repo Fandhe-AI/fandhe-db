@@ -418,9 +418,10 @@
 //! そろえる。起動時固定）、既定ビルドでは固定文言で起動エラーにする（fail-closed。
 //! `wire_server::english_stemmer_opt`。`docs/design/stemming-crate-adoption.md` 参照）。
 //!
-//! `--change-log`（Issue #3067・親 #2166・RECOVER-14 ポインタ）: 値を取らないスイッチ。永続変更ログ
-//! （増分バックアップ・PITR の土台）の opt-in。書き込み点の移行（#3068）と有効化（#3069）が済むまでは
-//! 指定すると固定文言で起動エラーにする（fail-closed。`wire_server::change_log_opt`。
+//! `--change-log`（Issue #3067・#3069・親 #2166・RECOVER-14 ポインタ）: 値を取らないスイッチ。永続変更ログ
+//! （増分バックアップ・PITR の土台）の opt-in。指定すると engine の `Storage::enable_change_log` で有効に
+//! し、重複指定は起動エラー。一度有効にした DB をフラグなしで起動すると、LSN の欠落を作らないよう固定文言で
+//! 起動エラーにする（fail-closed。`wire_server::change_log_opt`。アーカイブ・保持・PITR は後続の Issue。
 //! `docs/design/change-log-pitr.md` 参照）。
 //!
 //! `--require-where-for-dml`（Issue #2210・SQL-36 ポインタ）: 値を取らないスイッチ。
@@ -2290,8 +2291,7 @@ fn run_server(args: &[String]) -> ExitCode {
                 english_stemmer_raw = true;
                 i += 1;
             }
-            // Issue #3067（RECOVER-14 ポインタ）。値を取らないスイッチ。書き込み点の移行（#3068）と
-            // 有効化（#3069）が済むまでは固定文言で起動を拒否する（fail-closed）。
+            // Issue #3067・#3069（RECOVER-14 ポインタ）。値を取らないスイッチ。重複指定は固定文言で拒否する。
             wire_server::change_log_opt::FLAG => {
                 if let Err(msg) = wire_server::change_log_opt::accept(change_log) {
                     engine::log_stderr!("wire-server: {msg}");
@@ -3182,13 +3182,35 @@ fn run_server(args: &[String]) -> ExitCode {
     // 4 分岐で構築する（詳細は [`open_engine_core`] のドキュメント参照）。
     // 両方が既定のときは従来どおり `EngineCore::open` をそのまま呼ぶため、
     // エラー型・メッセージまで既存経路とビット同一に保たれる。
-    let mut core = match open_engine_core(&db_path, durability, search_engine_kind) {
+    //
+    // Issue #3069（RECOVER-14 ポインタ）: `--change-log` 指定時は `Storage` を開いて変更ログを有効にしてから
+    // 構築する（[`open_engine_core_with_change_log`]）。未指定でも、一度有効にした DB は書き込むと LSN が
+    // 欠落するため、起動を拒否する（fail-closed。無効の DB の経路は従来とビット同一）。
+    let opened = if change_log {
+        open_engine_core_with_change_log(&db_path, durability, search_engine_kind)
+    } else {
+        open_engine_core(&db_path, durability, search_engine_kind)
+    };
+    let mut core = match opened {
         Ok(c) => c,
         Err(e) => {
             engine::log_stderr!("wire-server: {e}");
             return ExitCode::FAILURE;
         }
     };
+    if !change_log && core.change_log_required() {
+        engine::log_stderr!(
+            "wire-server: {}",
+            wire_server::change_log_opt::REQUIRED_MESSAGE
+        );
+        return ExitCode::FAILURE;
+    }
+    if change_log {
+        engine::log_stderr!(
+            "wire-server: {}",
+            wire_server::change_log_opt::ENABLED_MESSAGE
+        );
+    }
     // WIRE-18・Issue #2233: カタログのロールのログイン名対応表を後追いで登録する（#1962 以降に作られた
     // 既存のロールを SCRAM 認証の対象にする。冪等）。失敗したら listen せず起動を拒否する（fail-closed。
     // 対応表が不整合のままログイン可否を決めない）。エラーは固定文言で、識別子・テナントを含まない。
@@ -3883,6 +3905,28 @@ fn open_engine_core(
             ))
         }
     }
+}
+
+/// `--change-log` 指定時の `EngineCore` 構築（Issue #3069・RECOVER-14 ポインタ）。`Storage` を
+/// [`engine::storage::Storage::open_with_durability`] で開き、`enable_change_log` で変更ログを有効にして
+/// から [`engine::core::EngineCore::from_storage_with_engine`] へ渡す。`kind` 未指定は既定の検索エンジン
+/// （[`engine::search_engine::default_kind`]）で、`EngineCore::open` と同じ構成になる（`EXPLAIN` の
+/// `engine:` 行が変わる `from_storage` は使わない）。有効化の失敗（記録の連続性が切れている等）は
+/// 起動エラーで、エラー文に表名・行の値を含めない。
+fn open_engine_core_with_change_log(
+    db_path: &std::path::Path,
+    durability: engine::storage::WriteDurability,
+    search_engine_kind: Option<engine::search_engine::SearchEngineKind>,
+) -> Result<engine::core::EngineCore, String> {
+    let mut storage = engine::storage::Storage::open_with_durability(db_path, durability)
+        .map_err(|e| format!("failed to open database at {db_path:?}: {e}"))?;
+    storage
+        .enable_change_log()
+        .map_err(|e| format!("failed to enable the change log: {e}"))?;
+    let kind = search_engine_kind.unwrap_or_else(engine::search_engine::default_kind);
+    Ok(engine::core::EngineCore::from_storage_with_engine(
+        storage, kind,
+    ))
 }
 
 /// `login-identifier --tenant <tenant_id> --role <role_name>` サブコマンド（Issue #2233・WIRE-18）。

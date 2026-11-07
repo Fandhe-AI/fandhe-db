@@ -63,6 +63,27 @@ cargo test -p fandhe-db-engine --test sql_named
 - 共通ヘルパー（`src/test_util/`）は束ね先の `main.rs` で 1 回だけ取り込み、各モジュールは `use crate::temp_db;` のように参照する
 - 次のいずれかに当たるテストは別プロセスであることを前提にするため束ねず、`tests/` 直下に単独バイナリのまま置く: ①`feature` ゲート付き・`test-sync-points` 利用 ②プロセス全体で共有する状態（`OnceLock`・`static` 等）・環境変数・カレントディレクトリ・子プロセス・異常終了に依存 ③時間・スレッド数・メモリなどを計測 ④`bench` 共通 harness・fixture モジュール（`recall_engine`・`nl_qa` 等）を取り込む ⑤ `Makefile`・`scripts/`・CI から `--test <name>` で名指しされる（`--ignored` の層 B ゲート等）。判断に迷うものは束ねない側に倒す
 
+### 変更ログのオラクル試験（強制有効化での結合テスト）
+
+変更ログ（`--change-log`。RECOVER-14 ポインタ）の完全性は、各 commit のレコードを `table_image::capture` の
+実差分と突き合わせるオラクルで検証します。lib の単体テストでは、変更ログを有効にした commit で常に走ります。
+結合テスト（`tests/`）は、テスト専用の feature `change-log-oracle` と環境変数で、永続 `Storage` の open
+時に変更ログを強制的に有効にして流せます（feature だけでは挙動は変わらず、`--all-features` の CI を壊しません）。
+
+```bash
+# 強制有効化 + 各 commit の突き合わせ（O(DB サイズ) / commit のため、遅延を測るテストは落ちる）
+FANDHE_CHANGE_LOG_ORACLE=1 cargo test -p fandhe-db-engine --features change-log-oracle --no-fail-fast --test '*'
+# 強制有効化だけ（検証なし）。遅延・件数を比べるテストはこちら
+FANDHE_CHANGE_LOG_ORACLE=force cargo test -p fandhe-db-engine --features change-log-oracle --test catalog_latency
+```
+
+上の 2 段（除外するテストと理由つき）をまとめて流すのは `make change-log-oracle`（`scripts/change_log_oracle.sh`。CI のジョブ `change-log-oracle` と同じ）です。
+
+有効化そのものが差になるテスト（`persistence` の「redb の表一覧」の固定など）は、この実行では落ちます
+（無効のときの期待値を固定しているため。落ちた内訳は `docs/design/change-log-pitr.md` の D11）。
+SIGKILL での原子性は `cargo test -p fandhe-db-engine --test change_log_crash_atomicity`、有効時・無効時の
+コストは `cargo bench -p fandhe-db-engine --bench change_log_bench -- <single|bulk|tables|limits>` で見られます。
+
 ### wire-server の結合テストの束ね方と個別実行
 
 `crates/wire-server/tests/` も engine と同じ方式で、サブディレクトリ単位で少数のテストバイナリへ束ねています（`tests/<束ね先>/main.rs` が `mod <ファイル名>;` を並べる。束ね先は `http_nosql`・`wire_proto`・`wire_sql`・`wire_cli`・`tls_auth`）。
@@ -391,10 +412,29 @@ feature 付きビルド（例: `cargo build --release -p fandhe-db-wire-server -
 リランキング前の順位で応答します（縮退はログとカウンタ `degraded_timeout` に残ります）。モデルファイルは
 リポジトリにコミットしないでください。
 
-`--change-log`（Issue #3067。RECOVER-14 ポインタ）は永続変更ログ（増分バックアップ・PITR の土台。
-`docs/design/change-log-pitr.md`）の opt-in を表す値なしスイッチです。engine の土台（書き込み側のラッパ・
-capture frame・レコード形式・DB 識別子）だけが入っており、既存の書き込み点の移行とオラクルが済むまでは
-指定すると固定文言で起動エラーになります（fail-closed。重複指定・値つきも起動エラー）。未指定の挙動は変わりません。
+`--change-log`（Issue #3067・#3069。RECOVER-14 ポインタ）は永続変更ログ（増分バックアップ・PITR の土台。
+`docs/design/change-log-pitr.md`）を有効にする値なしスイッチです（既定は無効で、無効の DB の挙動・性能・
+redb の内容は従来と変わりません）。指定すると、各 commit の変更（評価済みの値の after-image）が、データと同じ
+redb トランザクションで DB 内の `change_log` 表へ追記されます。運用上の注意:
+
+- **現時点でできるのは記録だけです。** アーカイブへの書き出し・保持・増分バックアップ・PITR は後続
+  （#2167 以降）で、それまで `change_log` 表は DB ファイルの中で増え続けます（行データを表とログに二重に
+  持つため、書き込み量の多い DB ではファイルが無効時の約 3 倍、一括 ingest のスループットが約 0.6 倍になりました。
+  実測は設計書の D11 を参照）。
+- **一度有効にした DB は、フラグなしでは起動できません。** 無効のまま書くとログに欠落（LSN の欠落）が
+  生じるため、起動を固定文言で拒否します（`backup` サブコマンドの読み取りは影響を受けません）。いまの
+  版に有効化を戻す手段はありません。`backup` で取った複製も変更ログを含むため有効扱いで、起動には
+  `--change-log` が要ります（無効化の仕様は #2167 以降で決めます）。
+- 有効にしたことのない既存の DB に後からフラグを付けることはできますが、**それ以前の変更はログに
+  ありません**（有効化前のベースからの PITR はできません）。
+- 有効時は 1 回の commit に載せる変更に上限があり（キー 4M 個・128 MiB、レコード 256 MiB など）、
+  超えた書き込みは `54000` で拒否されます（書き込みは何も反映されません。dim 128 の行で 1 commit 約 45 万行、
+  無効時に通る大きな一括書き込みは `--max-insert-rows` を下げるか分割してください）。原因の区別は stderr の固定文言の
+  1 行（`engine: change log: commit refused: ...`）で行えます。
+- 重複指定・値つきは起動エラーです。
+
+変更ログを有効にした構成での結合テストの流し方（オラクル試験）は、設計書 `docs/design/change-log-pitr.md`
+の D10・D11 を参照してください。
 
 `--english-stemmer`（Issue #2129・#3050）は値を取らないスイッチで、疎検索の英語トークンを語幹にそろえる
 （索引とクエリの両方。起動時固定）。engine の `english-stemmer` feature 付き（`--features engine/english-stemmer`）の
