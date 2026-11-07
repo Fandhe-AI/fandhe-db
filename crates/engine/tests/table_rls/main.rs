@@ -33,6 +33,8 @@ mod partitioned_dml_sql;
 mod prepared_declared_conversion;
 mod prepared_declared_param_types;
 mod prepared_params;
+mod recover13_snapshot_concurrent;
+mod recover13_snapshot_tenants;
 mod recovery_concurrent_resend;
 mod recovery_content_hash;
 mod recovery_ledger;
