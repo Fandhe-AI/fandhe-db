@@ -17,8 +17,8 @@
 //!   セグメントの間、および増分同士の間で行う
 //! - **適用**: ベースの DB ファイル（呼び出し側が用意した複製）へ、増分のセグメントを LSN 順に再生する。
 //!   参照実装は `oracle::apply_record`・`oracle::replay`。本ファイルは redb の実表へ適用する本番版で、
-//!   #2169 の PITR（指定 LSN・時刻での停止）が同じ再生器を共有できるよう、セグメント列の再生を 1 関数に
-//!   まとめている（停止条件は #2169 が足す）
+//!   #2169 の PITR（指定 LSN・時刻での停止。`pitr`）が同じ再生器を共有できるよう、セグメント列の再生を
+//!   1 関数（`replay_segments`）にまとめている（`pitr` が解決した停止 LSN を渡す）
 //!
 //! 呼び出し元は wire-server の `backup-incremental`・`restore --incremental`（`incremental_opt`・
 //! `restore_opt`）。出力先・複製の公開手順（一時名 → fsync → `hard_link`）は呼び出し側と engine の
