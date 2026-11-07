@@ -12,6 +12,7 @@ mod tls_client;
 
 mod backup_cli;
 mod batch_max_files_parity;
+mod dump_cli;
 mod incremental_backup_cli;
 mod persist4_second_server_same_db;
 mod pitr_restore_cli;

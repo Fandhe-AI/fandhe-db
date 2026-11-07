@@ -469,6 +469,20 @@ redb トランザクションで DB 内の `change_log` 表へ追記されます
   できません(#2446 の timeline が前提)。
   稼働中のサーバーからの取得と、指定 LSN／時刻までの復元（PITR）は未対応です。
 
+**論理ダンプ**（Issue #2162。RECOVER-16 ポインタ。形式と判断は [docs/design/logical-dump.md](docs/design/logical-dump.md) の §12、手順は [backup-restore-operations.md](docs/design/backup-restore-operations.md) の 4.6）:
+
+- `wire-server dump --db <停止中の DB> --out <新規ファイル> (--tenant <id> | --shared-only) [--schema-only | --data-only] [--format copy|insert]`:
+  スキーマとデータを SQL スクリプト形式（版つきヘッダ・長さ付きの枠）で書き出します。`--tenant` は共有の定義に指定テナントの
+  固有分と行を足した範囲、`--shared-only` は共有の定義だけです（どちらかが必須。全テナントを 1 回で書き出す指定はありません）。
+  出力は 0600 の一時名に書いて成功したときだけ公開し、既存の `--out` は上書きしません。他テナントの行・名前は出力に現れません。
+- `wire-server dump-restore --from <ダンプ> --db <新規パス> [--expect-tenant <id>]`: 一時名の新規 DB へ流し込み、整合検査に通ったときだけ新規パスへ
+  公開します。復元先は新規パスだけを受け付け（既存は終了コード 2）、途中で失敗したら何も公開しません。ダンプファイルは
+  untrusted として扱い、ヘッダ・枠・文の種別を検証しますが、書き込み SQL を運ぶ経路なので信頼できる出典のものだけを復元してください。
+  `--data-only` のダンプは新規 DB へ復元できません（終了コード 4）。ヘッダのテナントは信用されるので、取り違えを防ぐには `--expect-tenant` を使います。
+- 終了コード: 0=成功、1=実行時の失敗、2=引数／パスの拒否、3=公開済みだが後始末を確かめられなかった、4=ダンプファイルの拒否、
+  5=復元結果の整合検査の失敗（4・5 は `dump-restore` のみ）。制約: `--users` から起動したサーバーが作った DB は、ブートストラップ権限の
+  書き出しが未対応のため `dump` が拒否します。
+
 変更ログを有効にした構成での結合テストの流し方（オラクル試験）は、設計書 `docs/design/change-log-pitr.md`
 の D10・D11 を参照してください。
 変更ログの有効化・アーカイブ・検証の運用手順は [`docs/design/backup-restore-operations.md`](docs/design/backup-restore-operations.md) の「5. 変更ログ」節を参照してください（Issue #2158）。
