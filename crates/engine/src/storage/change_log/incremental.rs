@@ -558,7 +558,7 @@ fn apply_body(
     let bad = |_| IncrementalError::BadRecord;
     let shapes = table_image::shapes_len();
     for n in &body.dropped {
-        if is_excluded_table(n) || !names.remove(n) {
+        if !table_name_ok(n) || !names.remove(n) {
             return Err(IncrementalError::BadRecord);
         }
         if !table_image::drop_table_named(txn, n).map_err(bad)? {
@@ -567,19 +567,25 @@ fn apply_body(
     }
     for (n, shape) in &body.created {
         let shape = usize::try_from(*shape).map_err(bad_conv)?;
-        if is_excluded_table(n) || shape >= shapes || !names.insert(n.clone()) {
+        if !table_name_ok(n) || shape >= shapes || !names.insert(n.clone()) {
             return Err(IncrementalError::BadRecord);
         }
         table_image::apply_change(txn, n, shape, Vec::new(), Vec::new()).map_err(bad)?;
     }
     for t in body.tables {
         let shape = usize::try_from(t.shape).map_err(bad_conv)?;
-        if is_excluded_table(&t.name) || shape >= shapes || !names.contains(&t.name) {
+        if !table_name_ok(&t.name) || shape >= shapes || !names.contains(&t.name) {
             return Err(IncrementalError::BadRecord);
         }
         table_image::apply_change(txn, &t.name, shape, t.upserts, t.removes).map_err(bad)?;
     }
     Ok(())
+}
+
+/// 適用してよい表名か。空の名前は redb の `TableDefinition::new` が panic するため拒否し(`dropped`・
+/// `created`・`tables` のすべての経路で共通)、記録範囲外の表(`change_log`・`change_log_meta`)も拒否する。
+fn table_name_ok(name: &str) -> bool {
+    !name.is_empty() && !is_excluded_table(name)
 }
 
 fn bad_conv(_: std::num::TryFromIntError) -> IncrementalError {

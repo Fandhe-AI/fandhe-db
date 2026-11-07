@@ -588,6 +588,34 @@ fn apply_rejects_records_that_cannot_be_applied() {
             STORAGE_FORMAT_VERSION,
             "BadRecord",
         ),
+        // 空の表名(redb の `TableDefinition::new` が panic する)。作成・変更・削除のどの経路でも拒否する。
+        (
+            "empty-created",
+            RecordBody {
+                created: vec![(String::new(), 0)],
+                ..RecordBody::default()
+            },
+            STORAGE_FORMAT_VERSION,
+            "BadRecord",
+        ),
+        (
+            "empty-changed",
+            RecordBody {
+                tables: vec![change("", 0)],
+                ..RecordBody::default()
+            },
+            STORAGE_FORMAT_VERSION,
+            "BadRecord",
+        ),
+        (
+            "empty-dropped",
+            RecordBody {
+                dropped: vec![String::new()],
+                ..RecordBody::default()
+            },
+            STORAGE_FORMAT_VERSION,
+            "BadRecord",
+        ),
         // 世代の表を含まないレコード（末尾に世代が届かない）。
         (
             "no-generation",
