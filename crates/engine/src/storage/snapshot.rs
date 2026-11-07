@@ -58,7 +58,8 @@ pub enum SnapshotExportError {
     UnsupportedTable,
     /// 一時表用の `Storage` には書き出せない。
     TemporaryStorage,
-    /// 非 Unix、または hard link を作れないファイルシステム。
+    /// 非 Unix、または hard link 非対応（`ErrorKind::Unsupported`）のファイルシステム。
+    /// EPERM で hard link を禁止する環境は `Io(PermissionDenied)` として報告される。
     Unsupported,
     /// redb の失敗（詳細は表名を含みうるため保持しない）。
     Backend,
@@ -190,8 +191,7 @@ mod unix_impl {
         dest: &Path,
     ) -> Result<SnapshotSummary, SnapshotExportError> {
         // 出力先の解釈（親ディレクトリは作らない）。
-        let file_name = dest
-            .file_name()
+        dest.file_name()
             .ok_or(SnapshotExportError::InvalidDestination)?;
         let parent: &Path = match dest.parent() {
             Some(p) if !p.as_os_str().is_empty() => p,
@@ -220,10 +220,8 @@ mod unix_impl {
         let mut attempts = 0u32;
         let (file, tmp_path) = loop {
             let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-            let mut n = std::ffi::OsString::from(".");
-            n.push(file_name);
-            n.push(format!(".fandhe-snapshot-{}-{seq}.tmp", std::process::id()));
-            let p = parent.join(n);
+            // 一時名は最終名に依存させない（最終名が NAME_MAX 近くても一時名は収まる）。
+            let p = parent.join(format!(".fandhe-snapshot-{}-{seq}.tmp", std::process::id()));
             match std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -252,10 +250,11 @@ mod unix_impl {
                 return Err(SnapshotExportError::DestinationExists);
             }
             Err(e) => {
+                // `Unsupported` は ErrorKind::Unsupported（EOPNOTSUPP 等）に限る。EPERM は
+                // 権限不足と hard link 禁止（一部のファイルシステムやカーネル設定が EPERM で
+                // 返す）を区別できないため、`Io(PermissionDenied)` のまま返す。
                 return Err(match e.kind() {
-                    std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported => {
-                        SnapshotExportError::Unsupported
-                    }
+                    std::io::ErrorKind::Unsupported => SnapshotExportError::Unsupported,
                     _ => io_err(e),
                 });
             }
@@ -509,6 +508,17 @@ mod tests {
             dir_entries(dir.path()),
             ["db.redb", "exists.redb", "sub"].map(String::from)
         );
+    }
+
+    #[test]
+    fn long_destination_name_does_not_overflow_temp_name() {
+        let dir = TempDir::new("snap-long");
+        let storage = open_storage(&dir);
+        // NAME_MAX（255 バイト）ちょうどの最終名でも、一時名は最終名に依存しないため作れる。
+        let out = dir.path().join("a".repeat(255));
+        storage.export_snapshot(&out).unwrap();
+        assert!(Storage::open(&out).is_ok());
+        assert_eq!(dir_entries(dir.path()).len(), 2);
     }
 
     #[test]
