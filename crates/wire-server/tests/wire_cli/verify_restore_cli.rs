@@ -172,10 +172,28 @@ fn verify_corrupted_db_exits_with_inconsistent_code() {
     assert_no_leak(&o, &["MARKER-0123456789"]);
 }
 
-/// verify は元ファイルを変更しない（コピーを検査する）。サーバーを強制終了した直後の DB
-/// （open すると redb が修復で書き換える状態）と壊れた DB の両方で、検査前後のバイト列が同一で、
-/// 一時コピーも残らない。旧形式の DB の fixture は wire-server の既存テストに無いため、
-/// 旧形式の移行そのものはここでは再現していない（open を元ファイルに行わないことで担保する）。
+/// 3 行を書いて正常に閉じた DB を作る。
+fn write_clean_db(path: &Path) {
+    let storage = Storage::open(path).expect("open");
+    for id in 1..=3 {
+        storage
+            .put(
+                id,
+                &RowInput {
+                    tenant_id: "tnt",
+                    visibility: Visibility::Public,
+                    embedding: &[0.5],
+                    metadata: b"m",
+                },
+            )
+            .expect("put");
+    }
+}
+
+/// verify は元ファイルを変更しない（読み取り専用で開いて直接検査し、書き込みを要する状態だけ
+/// コピーを検査する。Issue #3074）。サーバー停止後の DB と壊れた DB の両方で、検査前後のバイト列が
+/// 同一で、一時コピーも残らない。`--memory-budget-bytes` 指定時も同じ。異常終了後の DB が
+/// コピー経路になることは `verify_falls_back_to_copy_for_crashed_db_without_writing` で固定する。
 #[test]
 fn verify_never_modifies_the_original_file() {
     let fx = common::TempFixtureDir::new("verify-cli-readonly");
@@ -194,6 +212,30 @@ fn verify_never_modifies_the_original_file() {
         );
         assert_eq!(std::fs::read(&db).expect("read"), before);
         assert!(leftovers(&dir).is_empty(), "{:?}", leftovers(&dir));
+        // populate のサーバーは強制終了されるため、読み取り専用では開けずコピー経路になる。
+        assert!(stdout(&o).ends_with("verify_mode=copy\n"), "{}", stdout(&o));
+    }
+
+    // 正常に閉じた DB は、コピーを作らず読み取り専用で直接検査する（予算指定時も同じ）。
+    let clean = dir.join("clean.redb");
+    write_clean_db(&clean);
+    let clean_before = std::fs::read(&clean).expect("read");
+    for extra in [&[][..], &["--memory-budget-bytes", "1"][..]] {
+        let mut args = vec!["--db", clean.to_str().expect("utf-8 path")];
+        args.extend_from_slice(extra);
+        let o = verify(&args);
+        assert!(
+            matches!(code(&o), Some(0) | Some(5)),
+            "stderr: {}",
+            stderr(&o)
+        );
+        assert!(
+            stdout(&o).ends_with("verify_mode=read_only\n"),
+            "{}",
+            stdout(&o)
+        );
+        assert_eq!(std::fs::read(&clean).expect("read"), clean_before);
+        assert!(leftovers(&dir).is_empty(), "{:?}", leftovers(&dir));
     }
 
     let bad = dir.join("bad.redb");
@@ -201,6 +243,11 @@ fn verify_never_modifies_the_original_file() {
     let bad_before = std::fs::read(&bad).expect("read");
     let o = verify(&["--db", bad.to_str().expect("utf-8 path")]);
     assert_eq!(code(&o), Some(4), "stderr: {}", stderr(&o));
+    assert!(
+        stdout(&o).contains("verify_mode=read_only\n"),
+        "{}",
+        stdout(&o)
+    );
     assert_eq!(std::fs::read(&bad).expect("read"), bad_before);
     assert!(leftovers(&dir).is_empty(), "{:?}", leftovers(&dir));
 
@@ -210,6 +257,38 @@ fn verify_never_modifies_the_original_file() {
     let o = verify(&["--db", junk.to_str().expect("utf-8 path")]);
     assert_eq!(code(&o), Some(1), "stderr: {}", stderr(&o));
     assert_eq!(std::fs::read(&junk).expect("read"), b"not a database");
+    assert!(leftovers(&dir).is_empty(), "{:?}", leftovers(&dir));
+}
+
+/// 異常終了後の DB（開いたまま複製した、正常に閉じていないファイル）は読み取り専用では開けないため
+/// コピー経路で検査し、元ファイルは書かず、一時コピーも残さない（Issue #3074）。
+#[test]
+fn verify_falls_back_to_copy_for_crashed_db_without_writing() {
+    let fx = common::TempFixtureDir::new("verify-cli-crashed");
+    let live = fx.db_path_str();
+    let storage = Storage::open(&live).expect("open");
+    for id in 1..=3 {
+        storage
+            .put(
+                id,
+                &RowInput {
+                    tenant_id: "tnt",
+                    visibility: Visibility::Public,
+                    embedding: &[0.5],
+                    metadata: b"m",
+                },
+            )
+            .expect("put");
+    }
+    let dir = parent_of(&live).to_path_buf();
+    let crashed = dir.join("crashed.redb");
+    std::fs::copy(&live, &crashed).expect("copy while open");
+    drop(storage);
+    let before = std::fs::read(&crashed).expect("read");
+    let o = verify(&["--db", crashed.to_str().expect("utf-8 path")]);
+    assert_eq!(code(&o), Some(0), "stderr: {}", stderr(&o));
+    assert!(stdout(&o).ends_with("verify_mode=copy\n"), "{}", stdout(&o));
+    assert_eq!(std::fs::read(&crashed).expect("read"), before);
     assert!(leftovers(&dir).is_empty(), "{:?}", leftovers(&dir));
 }
 

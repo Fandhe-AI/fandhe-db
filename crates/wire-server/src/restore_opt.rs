@@ -223,7 +223,61 @@ pub fn restore(
     unix_impl::restore(from, dest, leftover)
 }
 
-/// 停止中の DB `db` を**開かずに**整合検査する（`verify` の本体。Issue #2156）。`db` を読み取りで開いて
+/// `verify` が検査に使った経路（出力の `verify_mode=` 行の値。固定語で、パス・内容を含まない）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifyMode {
+    /// 元ファイルを読み取り専用で開いて直接検査した（コピーなし・空き容量不要）。
+    ReadOnly,
+    /// 読み取り専用では開けない（修復・形式更新が要る）ため、同じディレクトリの一時コピーを検査した。
+    Copy,
+}
+
+impl VerifyMode {
+    /// 出力用の固定語（`read_only` / `copy`）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read_only",
+            Self::Copy => "copy",
+        }
+    }
+}
+
+/// 停止中の DB `db` を整合検査する（`verify` の本体。Issue #3074・RECOVER-13 のポインタ）。まず
+/// engine の読み取り専用 open（`ReadOnlyStorage`）で元ファイルを直接検査し、コピーも書き込みもしない。
+/// 読み取り専用で開けない理由が「書き込みを要する状態（異常終了後の修復・形式更新）」のときだけ、
+/// [`verify_via_copy`]（一時コピーを検査。元ファイルは書かない）へ切り替える。稼働中（ロック競合）は
+/// フォールバックせず [`RestoreError::SourceInUse`]。どちらの経路でも元ファイルへは書き込まない。
+/// 返す [`VerifyMode`] で検査経路を呼び出し元が報告する。
+pub fn verify_db(
+    db: &Path,
+    options: &engine::storage::IntegrityOptions,
+    leftover: &mut Option<PathBuf>,
+) -> Result<(IntegrityReport, VerifyMode), RestoreError> {
+    use engine::storage::{ReadOnlyOpenError, ReadOnlyStorage};
+
+    // parse 後に差し替えられた（長さ 0・通常ファイルでない）パスは開かずに拒否する。
+    match std::fs::metadata(db) {
+        Ok(m) if m.is_file() && m.len() > 0 => {}
+        Ok(_) => return Err(RestoreError::InvalidSource),
+        Err(e) => return Err(RestoreError::Io(e.kind())),
+    }
+    match ReadOnlyStorage::open(db) {
+        Ok(ro) => {
+            let report = ro
+                .verify_integrity(options)
+                .map_err(|_| RestoreError::VerifyFailed)?;
+            Ok((report, VerifyMode::ReadOnly))
+        }
+        Err(ReadOnlyOpenError::NeedsWrite) => {
+            verify_via_copy(db, options, leftover).map(|r| (r, VerifyMode::Copy))
+        }
+        Err(ReadOnlyOpenError::InUse) => Err(RestoreError::SourceInUse),
+        Err(_) => Err(RestoreError::OpenFailed),
+    }
+}
+
+/// 停止中の DB `db` を、元ファイルを書き込み用に開かずに一時コピーで整合検査する（`verify` のコピー経路。
+/// Issue #2156。通常は [`verify_db`] の読み取り専用経路が使われ、本関数はそのフォールバック）。`db` を読み取りで開いて
 /// 排他のアドバイザリロックを取り（redb が `Database::create` で使うロックと同じ仕組みで競合するため、
 /// 稼働中なら [`RestoreError::SourceInUse`]）、ロックを保持したまま同じディレクトリの 0600 の
 /// 一時名へコピーし、コピーを開いて `verify_integrity` を実行して一時名を消す。元ファイルへは
