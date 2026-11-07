@@ -168,6 +168,7 @@ pub mod handshake;
 pub mod headline_limits_opt;
 pub mod hnsw_scope_opt;
 pub mod http;
+pub mod incremental_opt;
 pub mod join_limits_opt;
 pub mod jsonpath_limits_opt;
 pub mod limits;

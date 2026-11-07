@@ -102,6 +102,22 @@ impl ReadOnlyStorage {
     }
 }
 
+impl ReadOnlyStorage {
+    /// [`Storage::export_incremental`](super::Storage::export_incremental) と同じ増分バックアップの書き出しを、
+    /// 読み取り専用で開いた停止中の DB から行う（RECOVER-13・RECOVER-14・Issue #2168）。DB へ書かない。
+    pub fn export_incremental(
+        &self,
+        base: &super::ChainPoint,
+        dest: impl AsRef<Path>,
+    ) -> Result<super::IncrementalSummary, super::IncrementalError> {
+        super::change_log::incremental::export_from_read(
+            &self.db.begin_read()?,
+            base,
+            dest.as_ref(),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! RECOVER-13・Issue #3074: 読み取り専用 open の前後でファイルのバイト列が変わらないこと、

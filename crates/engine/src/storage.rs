@@ -47,6 +47,10 @@ pub use change_log::archive::{
     ArchiveSummary, DEFAULT_PRUNE_BYTES, DEFAULT_PRUNE_RECORDS, DEFAULT_SEGMENT_BYTES,
     SEGMENT_FORMAT_VERSION,
 };
+pub use change_log::incremental::{
+    apply_incremental_segments, chain_point_of, ApplySummary, ChainPoint, IncrementalError,
+    IncrementalSummary,
+};
 pub use integrity::{
     FindingKind, IntegrityError, IntegrityFinding, IntegrityOptions, IntegrityReport, Severity,
 };
@@ -1242,6 +1246,23 @@ impl Storage {
         dir: impl AsRef<Path>,
     ) -> std::result::Result<ArchiveSummary, ArchiveError> {
         change_log::archive::verify_against_db(self, dir.as_ref())
+    }
+
+    /// ベース（`base`。フルバックアップまたは前回の増分の終点。[`chain_point_of`]）が終わった commit の
+    /// 次から現在の最新までのログ区間を、増分バックアップとして `dest`（新規のファイル）へ書き出す
+    /// （RECOVER-13・RECOVER-14・Issue #2168。設計は `docs/design/change-log-pitr.md` の D7）。
+    /// 読み取りトランザクションを 1 本だけ取るので書き込みを止めない。連鎖が切れている（別 DB・別 timeline・
+    /// ベースが先に進んでいる・ログが刈り込まれている）ときは [`IncrementalError`] で拒否し、何も公開しない。
+    /// 運用者の CLI が呼ぶ。
+    pub fn export_incremental(
+        &self,
+        base: &ChainPoint,
+        dest: impl AsRef<Path>,
+    ) -> std::result::Result<IncrementalSummary, IncrementalError> {
+        if self.temp_scoped {
+            return Err(IncrementalError::NotEnabled);
+        }
+        change_log::incremental::export_from_read(&self.db.begin_read()?, base, dest.as_ref())
     }
 
     /// 保守 commit 用の書き込みトランザクション（変更ログの水位更新・刈り込み）。通常の書き込みが
