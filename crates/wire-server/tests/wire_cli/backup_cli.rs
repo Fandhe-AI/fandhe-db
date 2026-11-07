@@ -12,7 +12,7 @@ use std::process::{Child, Command, Output, Stdio};
 use std::time::Duration;
 
 /// panic 時にも子プロセスを残さないための kill＋wait ガード。
-struct ChildGuard(Child);
+pub(crate) struct ChildGuard(pub(crate) Child);
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
@@ -21,7 +21,7 @@ impl Drop for ChildGuard {
     }
 }
 
-fn backup(db: &str, out: &str) -> Output {
+pub(crate) fn backup(db: &str, out: &str) -> Output {
     Command::new(env!("CARGO_BIN_EXE_wire-server"))
         .args(["backup", "--db", db, "--out", out])
         .output()
@@ -36,7 +36,7 @@ fn stderr(o: &Output) -> String {
     String::from_utf8_lossy(&o.stderr).into_owned()
 }
 
-fn write_user_store_with_alice(path: &str) {
+pub(crate) fn write_user_store_with_alice(path: &str) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_wire-server"))
         .arg("hash-password")
         .stdin(Stdio::piped())
@@ -55,7 +55,7 @@ fn write_user_store_with_alice(path: &str) {
     std::fs::write(path, format!("alice:tenant-a:{}\n", phc.trim())).expect("write user store");
 }
 
-fn spawn_server(users: &str, db: &str) -> ChildGuard {
+pub(crate) fn spawn_server(users: &str, db: &str) -> ChildGuard {
     spawn_server_with(users, db, &[])
 }
 
@@ -73,7 +73,7 @@ fn spawn_server_with(users: &str, db: &str, extra: &[&str]) -> ChildGuard {
 }
 
 /// `SELECT id` の DataRow 件数を数える。
-fn count_rows(stream: &mut std::net::TcpStream) -> usize {
+pub(crate) fn count_rows(stream: &mut std::net::TcpStream) -> usize {
     common::send_simple_query(stream, "SELECT id FROM docs");
     let mut n = 0;
     loop {
@@ -87,7 +87,7 @@ fn count_rows(stream: &mut std::net::TcpStream) -> usize {
     }
 }
 
-fn parent_of(path: &str) -> &Path {
+pub(crate) fn parent_of(path: &str) -> &Path {
     Path::new(path).parent().expect("parent dir")
 }
 
@@ -557,7 +557,7 @@ fn cli_distrusts_loose_sockets_and_fake_responses() {
 }
 
 /// 2 テナント（alice=tenant-a・bob=tenant-b）のユーザーファイルを書く（同じパスワードの検証子を共有）。
-fn write_user_store_with_alice_and_bob(path: &str) {
+pub(crate) fn write_user_store_with_alice_and_bob(path: &str) {
     write_user_store_with_alice(path);
     let line = std::fs::read_to_string(path).expect("read user store");
     let phc = line

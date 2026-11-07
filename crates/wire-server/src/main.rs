@@ -489,6 +489,15 @@
 //! 終了コード: 0=成功、1=実行時の失敗、2=引数／出力先パスの拒否、3=出力は公開済みだが後始末を
 //! 確かめられなかった（バックアップは存在する。検証してから使う）。`--users` ファイルは対象外。
 //!
+//! `wire-server verify --db <path> [--memory-budget-bytes <n>]` サブコマンドは、**停止中**の DB を
+//! 開いて読み取りだけの整合検査を実行し、結果を `key=value` 行で標準出力へ出す（Issue #2156・
+//! RECOVER-13 (6) ポインタ）。終了コード: 0=整合（Warning のみを含む）、1=実行時の失敗（稼働中の
+//! サーバーが使用中を含む）、2=引数／パスの拒否、4=矛盾あり、5=検査できなかった項目のみ
+//! （3 は `backup`／`restore` 専用）。詳細は `wire_server::verify_opt`。
+//! `wire-server restore --from <backup> --db <new path>` サブコマンドは、バックアップを一時名へ
+//! コピーして検査し、通った場合だけ新規パスへ公開する（既存の出力先は上書きしない。通らなければ
+//! 何も公開せず 4 または 5 で終了。詳細は `wire_server::restore_opt`）。
+//!
 //! `wire-server hash-password` サブコマンドはユーザーストア（`username:tenant_id:phc`）
 //! に登録する 1 行を生成する補助コマンド（stdin からパスワードを読み、平文を
 //! ログ・引数に残さない）。
@@ -546,6 +555,12 @@ fn main() -> ExitCode {
     }
     if args.get(1).map(String::as_str) == Some("backup") {
         return run_backup(&args[2..]);
+    }
+    if args.get(1).map(String::as_str) == Some("verify") {
+        return run_verify(&args[2..]);
+    }
+    if args.get(1).map(String::as_str) == Some("restore") {
+        return run_restore(&args[2..]);
     }
 
     run_server(&args)
@@ -3946,6 +3961,81 @@ fn run_backup(args: &[String]) -> ExitCode {
         }
         _ => {
             engine::log_stderr!("wire-server: backup: {msg}");
+            ExitCode::from(code)
+        }
+    }
+}
+
+/// `verify --db <path>` サブコマンド（Issue #2156・RECOVER-13 (6) ポインタ）。引数を検証してから
+/// `--db` を開き、`Storage::verify_integrity` の報告を標準出力へ出す。稼働中のサーバーが DB を
+/// 開いている場合は open が失敗して終了コード 1（fail-closed。`backup` と同じ）。エラー文に
+/// 行の値・パスの内容・表名は含めない。
+fn run_verify(args: &[String]) -> ExitCode {
+    use engine::storage::Storage;
+    use wire_server::{backup_opt, verify_opt};
+
+    let parsed = match verify_opt::parse(args) {
+        Ok(p) => p,
+        Err(msg) => {
+            engine::log_stderr!("wire-server: verify: {msg}");
+            return ExitCode::from(backup_opt::EXIT_USAGE);
+        }
+    };
+    let storage = match Storage::open(&parsed.db) {
+        Ok(s) => s,
+        Err(e) => {
+            if e.to_string().contains("already open") {
+                engine::log_stderr!(
+                    "wire-server: verify: database is in use by another process \
+                     (stop the server first)"
+                );
+            } else {
+                engine::log_stderr!("wire-server: verify: failed to open database");
+            }
+            return ExitCode::from(backup_opt::EXIT_FAILURE);
+        }
+    };
+    match storage.verify_integrity(&parsed.options) {
+        Ok(report) => {
+            print!("{}", verify_opt::render(&report));
+            ExitCode::from(verify_opt::classify(&report))
+        }
+        Err(_) => {
+            engine::log_stderr!("wire-server: verify: integrity check could not be started");
+            ExitCode::from(backup_opt::EXIT_FAILURE)
+        }
+    }
+}
+
+/// `restore --from <backup> --db <path>` サブコマンド（Issue #2156・RECOVER-13 (3)(7) ポインタ）。
+/// 公開手順と終了コードは `wire_server::restore_opt`。検査に通らなかったときの報告は標準エラーへ出す
+/// （標準出力は成功時の要約だけ）。
+fn run_restore(args: &[String]) -> ExitCode {
+    use wire_server::{backup_opt, restore_opt};
+
+    let parsed = match restore_opt::parse(args) {
+        Ok(p) => p,
+        Err(msg) => {
+            engine::log_stderr!("wire-server: restore: {msg}");
+            return ExitCode::from(backup_opt::EXIT_USAGE);
+        }
+    };
+    let result = restore_opt::restore(&parsed.from, &parsed.db);
+    let (code, msg) = restore_opt::classify(&result);
+    match (&result, code) {
+        (Ok(_), 0) => {
+            println!("restore written: {msg}");
+            ExitCode::SUCCESS
+        }
+        (Err(restore_opt::RestoreError::NotConsistent(report)), _) => {
+            engine::log_stderr!("wire-server: restore: {msg}");
+            for line in wire_server::verify_opt::render(report).lines() {
+                engine::log_stderr!("{line}");
+            }
+            ExitCode::from(code)
+        }
+        _ => {
+            engine::log_stderr!("wire-server: restore: {msg}");
             ExitCode::from(code)
         }
     }

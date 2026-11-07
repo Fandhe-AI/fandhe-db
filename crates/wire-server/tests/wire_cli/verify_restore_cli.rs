@@ -1,0 +1,410 @@
+//! `wire-server verify` / `wire-server restore` サブコマンドの外形検証（Issue #2156・
+//! RECOVER-13 (3)(6)(7) ポインタ。親 #2154）。バイナリを子プロセスとして起動し、終了コード・
+//! 出力・ファイルの状態を確かめる。サーバーを起動するテストはポート 0 と一意な一時ディレクトリを使う。
+//! 壊れた DB は wire-server が redb に直接依存しないため、engine の公開 API で 1 行だけ書いた
+//! ファイルのバイト列を直接書き換えて作る。
+
+use crate::common;
+
+use std::path::Path;
+use std::process::{Command, Output};
+use std::time::Duration;
+
+use engine::storage::{RowInput, Storage, Visibility};
+
+use super::backup_cli::{
+    backup, count_rows, parent_of, spawn_server, write_user_store_with_alice, ChildGuard,
+};
+
+const SECRET_NOTE: &str = "secret-payload-qwxz";
+
+fn verify(args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_wire-server"))
+        .arg("verify")
+        .args(args)
+        .output()
+        .expect("run verify")
+}
+
+fn restore(from: &str, db: &str) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_wire-server"))
+        .args(["restore", "--from", from, "--db", db])
+        .output()
+        .expect("run restore")
+}
+
+fn code(o: &Output) -> Option<i32> {
+    o.status.code()
+}
+
+fn stdout(o: &Output) -> String {
+    String::from_utf8_lossy(&o.stdout).into_owned()
+}
+
+fn stderr(o: &Output) -> String {
+    String::from_utf8_lossy(&o.stderr).into_owned()
+}
+
+/// 標準出力と標準エラーに、行の値・テナント名・ユーザー名・パスが現れないことを確かめる。
+fn assert_no_leak(o: &Output, extra: &[&str]) {
+    let all = format!("{}{}", stdout(o), stderr(o));
+    for needle in [SECRET_NOTE, "tenant-a", "alice", "tnt-secret"]
+        .iter()
+        .chain(extra.iter())
+    {
+        assert!(!all.contains(needle), "output leaked {needle:?}: {all}");
+    }
+}
+
+fn exec(s: &mut std::net::TcpStream, sql: &str) {
+    common::send_simple_query(s, sql);
+    let _ = common::read_command_complete(s);
+    common::read_ready_for_query(s);
+}
+
+/// サーバーで表と 3 行を作り（行の値に秘匿対象の文字列を含める）、サーバーを停止する。
+fn populate(fx: &common::TempFixtureDir) -> (String, String) {
+    let users = fx.users_path_str();
+    let db = fx.db_path_str();
+    write_user_store_with_alice(&users);
+    let mut a = spawn_server(&users, &db);
+    let (addr, _) = common::wait_for_listening_addr_and_lines(&mut a.0, Duration::from_secs(10));
+    let mut s = common::authenticate_to_ready_for_query(addr, "alice", "pw-alice");
+    exec(
+        &mut s,
+        "CREATE TABLE docs (id BIGINT PRIMARY KEY, embedding VECTOR(3), note TEXT)",
+    );
+    for id in 1..=3 {
+        exec(
+            &mut s,
+            &format!(
+                "INSERT INTO docs (id, embedding, note) VALUES ({id}, '[0.1,0.2,0.3]', '{SECRET_NOTE}')"
+            ),
+        );
+    }
+    drop(s);
+    drop(a);
+    (users, db)
+}
+
+fn leftovers(dir: &Path) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .expect("read_dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(".fandhe-"))
+        .collect()
+}
+
+/// `rows` 表に 1 行だけ書いた DB を作り、行ヘッダの版バイトを壊して復号不能にする。
+fn write_db_with_undecodable_row(path: &Path) {
+    const MARKER: &[u8; 32] = b"MARKER-0123456789-ABCDEFGHIJKLMN";
+    {
+        let storage = Storage::open(path).expect("open");
+        storage
+            .put(
+                1,
+                &RowInput {
+                    tenant_id: "tnt",
+                    visibility: Visibility::Public,
+                    embedding: &[0.5],
+                    metadata: MARKER,
+                },
+            )
+            .expect("put");
+    }
+    let mut bytes = std::fs::read(path).expect("read db");
+    // 行の版バイトは、メタデータの手前 `1+2+len(tnt)+1+4+4+4` バイトにある。
+    let back = 1 + 2 + 3 + 1 + 4 + 4 + 4;
+    let mut patched = 0;
+    for pos in 0..bytes.len().saturating_sub(MARKER.len()) {
+        if bytes.get(pos..pos + MARKER.len()) == Some(&MARKER[..]) {
+            let v = pos.checked_sub(back).expect("version offset");
+            assert_eq!(bytes[v], 2, "row format version byte");
+            bytes[v] = 0xEE;
+            patched += 1;
+        }
+    }
+    assert!(patched >= 1, "marker not found");
+    std::fs::write(path, bytes).expect("write corrupted db");
+}
+
+/// 正常な DB は 0（報告に値・テナント名なし）。稼働中の DB は 1 で拒否し、サーバーは無傷。
+#[test]
+fn verify_consistent_db_exits_zero_and_rejects_running_db() {
+    let fx = common::TempFixtureDir::new("verify-cli");
+    let (users, db) = populate(&fx);
+
+    let mut a = spawn_server(&users, &db);
+    let (addr, _) = common::wait_for_listening_addr_and_lines(&mut a.0, Duration::from_secs(10));
+    let mut s = common::authenticate_to_ready_for_query(addr, "alice", "pw-alice");
+    let o = verify(&["--db", &db]);
+    assert_eq!(code(&o), Some(1), "stderr: {}", stderr(&o));
+    assert!(stderr(&o).contains("in use"), "stderr: {}", stderr(&o));
+    assert_eq!(count_rows(&mut s), 3);
+    drop(s);
+    drop(a);
+
+    let o = verify(&["--db", &db]);
+    assert_eq!(code(&o), Some(0), "stderr: {}", stderr(&o));
+    let out = stdout(&o);
+    assert!(out.starts_with("status=consistent\n"), "stdout: {out}");
+    assert!(out.contains("error_total=0\n"));
+    assert!(out.contains("findings_truncated=false\n"));
+    assert_no_leak(&o, &[&db]);
+}
+
+/// 行の復号不能は 4（矛盾）で、種類・表・件数だけが出る。ファイルは変更されない。
+#[test]
+fn verify_corrupted_db_exits_with_inconsistent_code() {
+    let fx = common::TempFixtureDir::new("verify-cli-corrupt");
+    let db = fx.db_path_str();
+    write_db_with_undecodable_row(Path::new(&db));
+
+    let o = verify(&["--db", &db]);
+    assert_eq!(code(&o), Some(4), "stderr: {}", stderr(&o));
+    let out = stdout(&o);
+    assert!(out.starts_with("status=inconsistent\n"), "stdout: {out}");
+    assert!(
+        out.contains("finding code=row_undecodable severity=error table=rows count=1\n"),
+        "stdout: {out}"
+    );
+    assert_no_leak(&o, &["MARKER-0123456789"]);
+}
+
+/// 検査できない項目だけのとき 5（整合とは報告しない）。
+#[test]
+fn verify_incomplete_only_exits_with_incomplete_code() {
+    let fx = common::TempFixtureDir::new("verify-cli-incomplete");
+    let (_users, db) = populate(&fx);
+    let o = verify(&["--db", &db, "--memory-budget-bytes", "1"]);
+    assert_eq!(
+        code(&o),
+        Some(5),
+        "stdout: {} stderr: {}",
+        stdout(&o),
+        stderr(&o)
+    );
+    let out = stdout(&o);
+    assert!(out.starts_with("status=incomplete\n"), "stdout: {out}");
+    assert!(out.contains("code=check_budget_exceeded severity=incomplete"));
+    assert_no_leak(&o, &[]);
+}
+
+/// 不正な引数・パスは DB を開く前に 2 で拒否される。空ファイルを DB として初期化しない。
+#[test]
+fn verify_rejects_invalid_arguments_and_paths() {
+    let fx = common::TempFixtureDir::new("verify-cli-invalid");
+    let db = fx.db_path_str();
+    let dir = parent_of(&db).to_path_buf();
+    let missing = dir.join("nodb.redb");
+    let empty = dir.join("empty.redb");
+    std::fs::write(&empty, b"").expect("write empty");
+    std::fs::write(&db, b"not a database").expect("write dummy db");
+
+    let missing_s = missing.to_str().expect("utf-8 path");
+    let empty_s = empty.to_str().expect("utf-8 path");
+    let dir_s = dir.to_str().expect("utf-8 path");
+    let cases: Vec<Vec<&str>> = vec![
+        vec![],
+        vec!["--db"],
+        vec!["--bogus"],
+        vec!["--db", missing_s],
+        vec!["--db", empty_s],
+        vec!["--db", dir_s],
+        vec!["--db", ""],
+        vec!["--db", &db, "--db", &db],
+        vec!["--db", &db, "--memory-budget-bytes", "0"],
+        vec!["--db", &db, "--memory-budget-bytes", "x"],
+    ];
+    for args in cases {
+        let o = verify(&args);
+        assert_eq!(code(&o), Some(2), "args={args:?} stderr: {}", stderr(&o));
+        assert!(stdout(&o).is_empty());
+    }
+    assert!(!missing.exists());
+    assert_eq!(std::fs::metadata(&empty).expect("meta").len(), 0);
+
+    // DB として開けないファイルは実行時の失敗（1）
+    let o = verify(&["--db", &db]);
+    assert_eq!(code(&o), Some(1), "stderr: {}", stderr(&o));
+}
+
+/// 復元の正常系: 元のバックアップは不変、復元先から別のサーバーが起動してデータを読める。
+/// 既存の復元先（ファイル・ディレクトリ・リンク）は書かずに 2 で拒否する。
+#[test]
+fn restore_publishes_verified_copy_and_refuses_existing_destination() {
+    let fx = common::TempFixtureDir::new("restore-cli");
+    let (users, db) = populate(&fx);
+    let dir = parent_of(&db).to_path_buf();
+    let snap = dir.join("snap.redb");
+    let snap_s = snap.to_str().expect("utf-8 path").to_string();
+    let o = backup(&db, &snap_s);
+    assert_eq!(code(&o), Some(0), "stderr: {}", stderr(&o));
+    let snap_before = std::fs::read(&snap).expect("read snap");
+
+    let restored = dir.join("restored.redb");
+    let restored_s = restored.to_str().expect("utf-8 path").to_string();
+    let o = restore(&snap_s, &restored_s);
+    assert_eq!(code(&o), Some(0), "stderr: {}", stderr(&o));
+    assert!(
+        stdout(&o).starts_with("restore written: "),
+        "{}",
+        stdout(&o)
+    );
+    assert_no_leak(&o, &[&snap_s, &restored_s]);
+    assert_eq!(std::fs::read(&snap).expect("read snap"), snap_before);
+    assert!(leftovers(&dir).is_empty(), "{:?}", leftovers(&dir));
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&restored)
+            .expect("meta")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+    let restored_before = std::fs::read(&restored).expect("read restored");
+
+    // 既存の復元先は拒否（ファイル・ディレクトリ・壊れたリンク）。内容は変わらない
+    let o = restore(&snap_s, &restored_s);
+    assert_eq!(code(&o), Some(2), "stderr: {}", stderr(&o));
+    assert_eq!(std::fs::read(&restored).expect("read"), restored_before);
+    let o = restore(&snap_s, dir.to_str().expect("utf-8 path"));
+    assert_eq!(code(&o), Some(2), "stderr: {}", stderr(&o));
+    let link = dir.join("link.redb");
+    let target = dir.join("link-target.redb");
+    std::os::unix::fs::symlink(&target, &link).expect("symlink");
+    let o = restore(&snap_s, link.to_str().expect("utf-8 path"));
+    assert_eq!(code(&o), Some(2), "stderr: {}", stderr(&o));
+    assert!(!target.exists());
+
+    // 復元した DB の整合検査が通り、サーバーが起動してデータが読める
+    let o = verify(&["--db", &restored_s]);
+    assert_eq!(code(&o), Some(0), "stderr: {}", stderr(&o));
+    let mut b = spawn_server(&users, &restored_s);
+    let (addr, _) = common::wait_for_listening_addr_and_lines(&mut b.0, Duration::from_secs(10));
+    let mut s = common::authenticate_to_ready_for_query(addr, "alice", "pw-alice");
+    assert_eq!(count_rows(&mut s), 3);
+}
+
+/// 壊れたバックアップは公開されず、一時ファイルも残らず、元ファイルは変わらない。
+#[test]
+fn restore_refuses_broken_backups_without_publishing() {
+    let fx = common::TempFixtureDir::new("restore-cli-broken");
+    let db = fx.db_path_str();
+    let dir = parent_of(&db).to_path_buf();
+    let dest = dir.join("restored.redb");
+    let dest_s = dest.to_str().expect("utf-8 path");
+
+    // DB として開けないファイル: 実行時の失敗（1）
+    let garbage = dir.join("garbage.redb");
+    std::fs::write(&garbage, b"this is not a redb file").expect("write garbage");
+    let garbage_before = std::fs::read(&garbage).expect("read");
+    let o = restore(garbage.to_str().expect("utf-8 path"), dest_s);
+    assert_eq!(code(&o), Some(1), "stderr: {}", stderr(&o));
+    assert!(!dest.exists());
+    assert!(leftovers(&dir).is_empty(), "{:?}", leftovers(&dir));
+    assert_eq!(std::fs::read(&garbage).expect("read"), garbage_before);
+
+    // 開けるが行が復号できない: 矛盾（4）。報告は標準エラーに出て、値は含まれない
+    let bad = dir.join("bad.redb");
+    write_db_with_undecodable_row(&bad);
+    let bad_before = std::fs::read(&bad).expect("read");
+    let o = restore(bad.to_str().expect("utf-8 path"), dest_s);
+    assert_eq!(code(&o), Some(4), "stderr: {}", stderr(&o));
+    assert!(stdout(&o).is_empty());
+    assert!(
+        stderr(&o).contains("code=row_undecodable"),
+        "{}",
+        stderr(&o)
+    );
+    assert_no_leak(&o, &["MARKER-0123456789"]);
+    assert!(!dest.exists());
+    assert!(leftovers(&dir).is_empty(), "{:?}", leftovers(&dir));
+    assert_eq!(std::fs::read(&bad).expect("read"), bad_before);
+}
+
+/// 稼働中の DB を復元元に指定すると、コピーせず 1 で拒否する。
+#[test]
+fn restore_refuses_a_running_database_as_source() {
+    let fx = common::TempFixtureDir::new("restore-cli-running");
+    let (users, db) = populate(&fx);
+    let dir = parent_of(&db).to_path_buf();
+    let dest = dir.join("restored.redb");
+    let mut a: ChildGuard = spawn_server(&users, &db);
+    let (_addr, _) = common::wait_for_listening_addr_and_lines(&mut a.0, Duration::from_secs(10));
+    let o = restore(&db, dest.to_str().expect("utf-8 path"));
+    assert_eq!(code(&o), Some(1), "stderr: {}", stderr(&o));
+    assert!(stderr(&o).contains("in use"), "stderr: {}", stderr(&o));
+    assert!(!dest.exists());
+    assert!(leftovers(&dir).is_empty(), "{:?}", leftovers(&dir));
+}
+
+/// 不正な引数・パスは何も作らず 2 で拒否される。
+#[test]
+fn restore_rejects_invalid_arguments_and_paths() {
+    let fx = common::TempFixtureDir::new("restore-cli-invalid");
+    let db = fx.db_path_str();
+    let dir = parent_of(&db).to_path_buf();
+    std::fs::write(&db, b"not a database").expect("write dummy");
+    let empty = dir.join("empty.redb");
+    std::fs::write(&empty, b"").expect("write empty");
+    let s = |p: std::path::PathBuf| p.to_str().expect("utf-8 path").to_string();
+    let new_ok = s(dir.join("new.redb"));
+    let cases: Vec<Vec<String>> = vec![
+        vec![],
+        vec!["restore".into()],
+        vec!["--from".into(), db.clone()],
+        vec!["--db".into(), new_ok.clone()],
+        vec!["--bogus".into()],
+        // 復元元が無い・空・ディレクトリ
+        vec![
+            "--from".into(),
+            s(dir.join("nope.redb")),
+            "--db".into(),
+            new_ok.clone(),
+        ],
+        vec!["--from".into(), s(empty), "--db".into(), new_ok.clone()],
+        vec![
+            "--from".into(),
+            s(dir.clone()),
+            "--db".into(),
+            new_ok.clone(),
+        ],
+        // 復元先が復元元自身・親ディレクトリ成分・親が無い・空
+        vec!["--from".into(), db.clone(), "--db".into(), db.clone()],
+        vec![
+            "--from".into(),
+            db.clone(),
+            "--db".into(),
+            s(dir.join("a/../x.redb")),
+        ],
+        vec![
+            "--from".into(),
+            db.clone(),
+            "--db".into(),
+            s(dir.join("missing/x.redb")),
+        ],
+        vec!["--from".into(), db.clone(), "--db".into(), String::new()],
+        // 重複指定
+        vec![
+            "--from".into(),
+            db.clone(),
+            "--from".into(),
+            db.clone(),
+            "--db".into(),
+            new_ok.clone(),
+        ],
+    ];
+    for args in cases {
+        let o = Command::new(env!("CARGO_BIN_EXE_wire-server"))
+            .arg("restore")
+            .args(&args)
+            .output()
+            .expect("run restore");
+        assert_eq!(code(&o), Some(2), "args={args:?} stderr: {}", stderr(&o));
+        assert!(stdout(&o).is_empty());
+    }
+    assert!(!dir.join("new.redb").exists());
+    assert!(leftovers(&dir).is_empty());
+}
