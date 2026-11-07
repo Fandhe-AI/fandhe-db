@@ -377,7 +377,7 @@ pub fn restore_with_incrementals(
 /// ベース `from` に増分 `incrementals` と変更ログのアーカイブを、`pitr` の目標のコミット境界まで適用した状態を、
 /// 新しい DB `dest` へ復元する（Issue #2169・RECOVER-14 のポインタ）。`pitr` が `None` なら
 /// [`restore_with_incrementals`] と同じ。公開手順は [`restore`] と同じで、検査の前に engine の
-/// `restore_to_point` を一時コピーへ適用する。目標が範囲外（ベースの終点以前・ログの末尾より後）・
+/// `restore_to_point` を一時コピーへ適用する。目標が範囲外（ベース DB の終点以前・入力したログ全体の最大 LSN より後）・
 /// 欠落・順序違反・別 DB・別 timeline・破損は [`RestoreError::Chain`] で、何も公開しない（黙って末尾まで
 /// 適用しない）。ベース・増分・アーカイブのファイルは変更しない。
 #[cfg(unix)]
