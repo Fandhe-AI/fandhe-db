@@ -152,21 +152,60 @@ fn parse_frames(text: &str) -> (usize, Vec<Frame>, usize) {
     }
 }
 
-/// 壊れた入力で `dump-restore` を試し、拒否（終了コード 1 または 4）・何も公開されない・一時名が
-/// 残らないことを確かめる。
-fn assert_rejected(dir: &Path, bytes: &[u8], why: &str) {
+/// 拒否の理由。終了コードと標準エラーの識別語を 1 組に固定し、別の理由での拒否を合格にしない。
+#[derive(Clone, Copy)]
+enum Reject {
+    /// 途中でファイルが終わっている（終了コード 4）。
+    Truncated,
+    /// 枠・終端の形式違反（終了コード 4）。
+    Malformed,
+    /// ヘッダの形式違反（終了コード 4）。
+    Header,
+    /// 許可表にない文、または枠の順序違反（終了コード 4）。
+    NotAllowed,
+    /// 文の実行失敗（終了コード 1）。値は SQLSTATE。
+    Apply(&'static str),
+}
+
+impl Reject {
+    fn expected(self) -> (i32, String) {
+        match self {
+            Reject::Truncated => (4, "dump file is truncated".into()),
+            Reject::Malformed => (4, "dump file is malformed".into()),
+            Reject::Header => (4, "dump file header is invalid".into()),
+            Reject::NotAllowed => (4, "is not an allowed statement".into()),
+            Reject::Apply(state) => (1, format!("(sqlstate {state})")),
+        }
+    }
+}
+
+/// 壊れた入力で `dump-restore` を試し、`why` の理由（終了コードと標準エラーの識別語）で拒否される・
+/// 何も公開されない・一時名が残らないことを確かめる。
+fn assert_rejected(dir: &Path, bytes: &[u8], name: &str, why: Reject) {
     let from = s(&dir.join("variant.sql")).to_string();
     let dest = s(&dir.join("dest.redb")).to_string();
     std::fs::write(&from, bytes).expect("write variant");
     let o = run(&["dump-restore", "--from", &from, "--db", &dest]);
-    let c = code(&o);
+    let (want_code, needle) = why.expected();
+    assert_eq!(code(&o), Some(want_code), "{name}: stderr: {}", stderr(&o));
     assert!(
-        matches!(c, Some(1) | Some(4)) || (bytes.is_empty() && c == Some(2)),
-        "{why}: code {c:?} stderr: {}",
+        stderr(&o).contains(&needle),
+        "{name}: stderr lacks {needle:?}: {}",
         stderr(&o)
     );
-    assert!(!Path::new(&dest).exists(), "{why}: published a database");
+    assert!(!Path::new(&dest).exists(), "{name}: published a database");
     assert_no_temp_leftovers(dir);
+}
+
+/// 同じ名前を再び作る枠の重複が、種別ごとに返す SQLSTATE。
+fn duplicate_sqlstate(kind: &str) -> &'static str {
+    match kind {
+        "schema" => "42P06",
+        "table" | "sequence" | "index" | "view" => "42P07",
+        "role" | "enum-type" | "foreign-key" | "trigger" | "policy" => "42710",
+        "function" => "42723",
+        other => panic!("no expected SQLSTATE for duplicated {other}"),
+    }
 }
 
 /// 網羅 fixture のダンプを壊した入力は、すべて拒否される。
@@ -201,14 +240,24 @@ fn damaged_full_fixture_dumps_are_rejected_and_publish_nothing() {
     cuts.sort_unstable();
     cuts.dedup();
     for cut in cuts {
-        assert_rejected(&dir, &text.as_bytes()[..cut], &format!("truncate@{cut}"));
+        assert_rejected(
+            &dir,
+            &text.as_bytes()[..cut],
+            &format!("truncate@{cut}"),
+            Reject::Truncated,
+        );
     }
 
     // 2. 1 バイト反転。ヘッダの各行の先頭と、種別ごとの先頭の枠の構造部分。
-    let mut flips: Vec<(String, usize, u8)> = Vec::new();
+    let mut flips: Vec<(String, usize, u8, Reject)> = Vec::new();
     let mut line_start = 0;
     for line in text[..header_end].split_inclusive('\n') {
-        flips.push((format!("header-line@{line_start}"), line_start + 3, b'#'));
+        flips.push((
+            format!("header-line@{line_start}"),
+            line_start + 3,
+            b'#',
+            Reject::Header,
+        ));
         line_start += line.len();
     }
     let first_of_kind = first_frame_of_each_kind(&frames);
@@ -216,12 +265,22 @@ fn damaged_full_fixture_dumps_are_rejected_and_publish_nothing() {
         let marker_end = f.start + text[f.start..].find('\n').expect("marker");
         let name = |what: &str| format!("{what}@{}:{}", f.kind, f.start);
         // 見出しの `@`、本文の終端の `;`。
-        flips.push((name("at"), f.start + 3, b'#'));
-        flips.push((name("semicolon"), semicolon_pos(&text, f, marker_end), b','));
+        flips.push((name("at"), f.start + 3, b'#', Reject::Malformed));
+        flips.push((
+            name("semicolon"),
+            semicolon_pos(&text, f, marker_end),
+            b',',
+            Reject::Malformed,
+        ));
         // `@stmt` の種別語の先頭と、長さの末尾の桁。
         let marker = &text[f.start..marker_end];
         if marker.starts_with("-- @stmt ") {
-            flips.push((name("kind"), f.start + "-- @stmt ".len(), b'X'));
+            flips.push((
+                name("kind"),
+                f.start + "-- @stmt ".len(),
+                b'X',
+                Reject::Malformed,
+            ));
         }
         let last_digit = marker_end - 1;
         let d = text.as_bytes()[last_digit];
@@ -229,20 +288,32 @@ fn damaged_full_fixture_dumps_are_rejected_and_publish_nothing() {
             name("length"),
             last_digit,
             if d == b'9' { b'8' } else { d + 1 },
+            Reject::Malformed,
         ));
     }
-    flips.push(("end-marker".to_string(), end_pos + 4, b'D'));
+    flips.push((
+        "end-marker".to_string(),
+        end_pos + 4,
+        b'D',
+        Reject::Malformed,
+    ));
     for f in first_of_kind.iter().filter(|f| f.kind == "copy") {
         // COPY の終端行 `\.` を `\,` に。
         let dot = f.end - 2;
         assert_eq!(text.as_bytes()[dot], b'.');
-        flips.push((format!("copy-end@{}", f.start), dot, b','));
+        // 終端を失った COPY は、続く枠の見出し行をデータ行として読み、列数の不一致（22000）で失敗する。
+        flips.push((
+            format!("copy-end@{}", f.start),
+            dot,
+            b',',
+            Reject::Apply("22000"),
+        ));
     }
-    for (name, pos, byte) in flips {
+    for (name, pos, byte, why) in flips {
         let mut bytes = text.clone().into_bytes();
         assert_ne!(bytes[pos], byte, "{name}: flip must change the byte");
         bytes[pos] = byte;
-        assert_rejected(&dir, &bytes, &format!("flip {name}"));
+        assert_rejected(&dir, &bytes, &format!("flip {name}"), why);
     }
 
     // 3. 枠の入れ替え。
@@ -269,7 +340,7 @@ fn damaged_full_fixture_dumps_are_rejected_and_publish_nothing() {
         s2.push_str(&slice(moved));
         s2.push_str(&text[first_table.start..moved.start]);
         s2.push_str(&text[moved.end..]);
-        assert_rejected(&dir, s2.as_bytes(), name);
+        assert_rejected(&dir, s2.as_bytes(), name, Reject::Apply("42P01"));
     }
     // 後段（最後の枠）を最初のデータ枠より前へ出す。
     let first_data = frames
@@ -283,7 +354,7 @@ fn damaged_full_fixture_dumps_are_rejected_and_publish_nothing() {
     s2.push_str(&slice(&last));
     s2.push_str(&text[first_data.start..last.start]);
     s2.push_str(&text[last.end..]);
-    assert_rejected(&dir, s2.as_bytes(), "post-before-data");
+    assert_rejected(&dir, s2.as_bytes(), "post-before-data", Reject::NotAllowed);
     // トリガをその関数より前へ。
     let func = kind_first("function");
     let trig = kind_first("trigger");
@@ -292,28 +363,51 @@ fn damaged_full_fixture_dumps_are_rejected_and_publish_nothing() {
     s2.push_str(&slice(&trig));
     s2.push_str(&text[func.start..trig.start]);
     s2.push_str(&text[trig.end..]);
-    assert_rejected(&dir, s2.as_bytes(), "trigger-before-function");
+    assert_rejected(
+        &dir,
+        s2.as_bytes(),
+        "trigger-before-function",
+        Reject::Apply("42883"),
+    );
 
     // 4. 枠の重複。すでにある名前を再び作る枠は拒否される。`sequence-value`（`setval`）と
     // `row-security`（`ENABLE`／`FORCE`）は再実行しても同じ状態になる文なので対象外にする。
+    // データの枠（`copy`・`insert`）は、次の主キー違反の試験で表名を指定して確かめる。
     for f in &first_of_kind {
-        if matches!(f.kind.as_str(), "sequence-value" | "row-security") {
+        if matches!(
+            f.kind.as_str(),
+            "sequence-value" | "row-security" | "copy" | "insert"
+        ) {
             continue;
         }
         let mut s2 = String::new();
         s2.push_str(&text[..f.end]);
         s2.push_str(&slice(f));
         s2.push_str(&text[f.end..]);
-        assert_rejected(&dir, s2.as_bytes(), &format!("duplicate {}", f.kind));
+        assert_rejected(
+            &dir,
+            s2.as_bytes(),
+            &format!("duplicate {}", f.kind),
+            Reject::Apply(duplicate_sqlstate(&f.kind)),
+        );
     }
-    // 主キーを持つ表のデータの重複は、主キー違反で拒否される。先頭の COPY の枠（`child` 表）は主キーを
-    // 持つ。INSERT 形式のダンプでも、先頭の INSERT 枠の重複を同様に確かめる。
-    let f = kind_first("copy");
+    // 主キーを持つ表（`child`）のデータの重複は、主キー違反（23505）で拒否される。COPY の枠は表名で
+    // 指定する。INSERT 形式のダンプでも、先頭の INSERT 枠（`child` 表）の重複を同様に確かめる。
+    let f = frames
+        .iter()
+        .find(|f| f.kind == "copy" && text[f.start..f.end].contains("COPY \"child\" ("))
+        .expect("COPY frame of the child table")
+        .clone();
     let mut s2 = String::new();
     s2.push_str(&text[..f.end]);
     s2.push_str(&slice(&f));
     s2.push_str(&text[f.end..]);
-    assert_rejected(&dir, s2.as_bytes(), "duplicate copy data");
+    assert_rejected(
+        &dir,
+        s2.as_bytes(),
+        "duplicate copy data",
+        Reject::Apply("23505"),
+    );
     let ins = s(&dir.join("insert.sql")).to_string();
     let o = run(&dump_args(
         &db,
@@ -325,22 +419,27 @@ fn damaged_full_fixture_dumps_are_rejected_and_publish_nothing() {
     let (_, iframes, _) = parse_frames(&itext);
     let f = iframes
         .iter()
-        .find(|f| f.kind == "insert")
+        .find(|f| f.kind == "insert" && itext[f.start..f.end].contains("INSERT INTO \"child\" ("))
         .expect("insert frame")
         .clone();
     let mut s2 = String::new();
     s2.push_str(&itext[..f.end]);
     s2.push_str(&itext[f.start..f.end]);
     s2.push_str(&itext[f.end..]);
-    assert_rejected(&dir, s2.as_bytes(), "duplicate insert data");
+    assert_rejected(
+        &dir,
+        s2.as_bytes(),
+        "duplicate insert data",
+        Reject::Apply("23505"),
+    );
     // ヘッダの重複（先頭が 2 回）。
     let mut s2 = text[..header_end].to_string();
     s2.push_str(&text);
-    assert_rejected(&dir, s2.as_bytes(), "duplicate header");
+    assert_rejected(&dir, s2.as_bytes(), "duplicate header", Reject::Malformed);
     // 終端行の重複・内容の連結（同じダンプを 2 つ連結）。
     let mut s2 = text.clone();
     s2.push_str(&text);
-    assert_rejected(&dir, s2.as_bytes(), "concatenated dumps");
+    assert_rejected(&dir, s2.as_bytes(), "concatenated dumps", Reject::Malformed);
 }
 
 /// 種別ごとに最初の枠を、出現順に返す。
