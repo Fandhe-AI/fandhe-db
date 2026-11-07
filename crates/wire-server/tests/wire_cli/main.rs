@@ -16,6 +16,7 @@ mod persist4_second_server_same_db;
 mod recover12_explicit_txn_resend;
 mod transaction_limits_parity;
 mod wire7_bind_guard;
+mod wire_change_log_cli;
 mod wire_correlated_limits_cli;
 mod wire_ddl_permission_cli;
 mod wire_dml_limits_cli;

@@ -151,6 +151,132 @@ struct Shape {
     /// 整合検査（`storage::integrity`・RECOVER-13 のポインタ）の全エントリ読み取り。型の組の一覧を
     /// 共有し、一覧に無い型の表を「未対応」として検知する。
     scan: fn(&ReadTransaction, &str) -> Result<super::integrity::ScanProbe, ()>,
+    /// 変更ログ（`storage::change_log`・RECOVER-14 のポインタ）が commit 準備段階で writer の
+    /// 現在内容（after-image）を読む操作。
+    read: fn(
+        &WriteTransaction,
+        &str,
+        usize,
+        ReadMode<'_>,
+        &mut Meter,
+    ) -> Result<ReadProbe, ImageError>,
+}
+
+/// [`read_after_image`] の読み方。
+#[derive(Clone, Copy)]
+pub(crate) enum ReadMode<'a> {
+    /// 表の全行を読む（作成・rename を経た表）。
+    All,
+    /// 指定したキー（`K::as_bytes` のバイト列）の現在値だけを読む。値があれば upsert、無ければ remove。
+    Keys(&'a BTreeSet<Vec<u8>>),
+}
+
+/// 1 テーブル分の after-image。`shape` は [`SHAPES`] の添字。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AfterImage {
+    pub(crate) shape: usize,
+    pub(crate) upserts: Vec<(Vec<u8>, Vec<u8>)>,
+    pub(crate) removes: Vec<Vec<u8>>,
+}
+
+/// [`read_after_image`] の結果。
+#[derive(Debug)]
+pub(crate) enum ReadOutcome {
+    /// どの shape でも開けない（未知の型の表）。
+    UnknownShape,
+    /// 上限超過（呼び出し側は commit 前拒否に倒す）。
+    OverLimit,
+    Image(AfterImage),
+}
+
+enum ReadProbe {
+    Mismatch,
+    OverLimit,
+    Image(AfterImage),
+}
+
+fn read_table<K: Key + 'static, V: Value + 'static>(
+    writer: &WriteTransaction,
+    name: &str,
+    shape: usize,
+    mode: ReadMode<'_>,
+    meter: &mut Meter,
+) -> Result<ReadProbe, ImageError> {
+    let table = match writer.open_table(TableDefinition::<K, V>::new(name)) {
+        Ok(t) => t,
+        Err(TableError::TableTypeMismatch { .. }) => return Ok(ReadProbe::Mismatch),
+        Err(_) => return Err(ImageError),
+    };
+    let mut upserts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut removes: Vec<Vec<u8>> = Vec::new();
+    match mode {
+        ReadMode::All => {
+            for entry in table.iter().map_err(|_| ImageError)? {
+                if !meter.tick() {
+                    return Ok(ReadProbe::OverLimit);
+                }
+                let (k, v) = entry.map_err(|_| ImageError)?;
+                let (kv, vv) = (k.value(), v.value());
+                let kb = K::as_bytes(&kv);
+                let vb = V::as_bytes(&vv);
+                let (kb, vb) = (kb.as_ref(), vb.as_ref());
+                if !meter.charge(kb.len().saturating_add(vb.len())) {
+                    return Ok(ReadProbe::OverLimit);
+                }
+                upserts.push((kb.to_vec(), vb.to_vec()));
+            }
+        }
+        ReadMode::Keys(keys) => {
+            for key in keys {
+                if !meter.tick() {
+                    return Ok(ReadProbe::OverLimit);
+                }
+                // `key` は同一プロセス内で `K::as_bytes` が作ったバイト列（変更ログの frame 由来）。
+                match table.get(K::from_bytes(key)).map_err(|_| ImageError)? {
+                    Some(guard) => {
+                        let vv = guard.value();
+                        let vb = V::as_bytes(&vv);
+                        let vb = vb.as_ref();
+                        if !meter.charge(key.len().saturating_add(vb.len())) {
+                            return Ok(ReadProbe::OverLimit);
+                        }
+                        upserts.push((key.clone(), vb.to_vec()));
+                    }
+                    None => {
+                        if !meter.charge(key.len()) {
+                            return Ok(ReadProbe::OverLimit);
+                        }
+                        removes.push(key.clone());
+                    }
+                }
+            }
+        }
+    }
+    Ok(ReadProbe::Image(AfterImage {
+        shape,
+        upserts,
+        removes,
+    }))
+}
+
+/// writer の `name` の表の現在内容を、[`SHAPES`] を順に試して読む（変更ログの commit 準備段階用）。
+///
+/// 前提: `name` は writer に既に存在する表であること（存在しない名前を渡すと型の組によっては
+/// 空の表を作ってしまう。呼び出し側は `list_tables` の結果だけを渡す）。
+pub(crate) fn read_after_image(
+    writer: &WriteTransaction,
+    name: &str,
+    mode: ReadMode<'_>,
+    meter: &mut Meter,
+) -> Result<ReadOutcome, ImageError> {
+    for (idx, shape) in SHAPES.iter().enumerate() {
+        match (shape.read)(writer, name, idx, mode, meter)? {
+            ReadProbe::Mismatch => continue,
+            ReadProbe::OverLimit => return Ok(ReadOutcome::OverLimit),
+            ReadProbe::Image(img) => return Ok(ReadOutcome::Image(img)),
+        }
+    }
+    Ok(ReadOutcome::UnknownShape)
 }
 
 enum Probe {
@@ -302,6 +428,7 @@ macro_rules! shapes {
             apply: apply_table::<$k, $v>,
             copy: super::snapshot::copy_table::<$k, $v>,
             scan: super::integrity::scan_table::<$k, $v>,
+            read: read_table::<$k, $v>,
         }),+]
     };
 }
@@ -309,6 +436,8 @@ macro_rules! shapes {
 /// engine が使う redb テーブルの `(K, V)` の型の組。新しい型のテーブルを追加したら、ここへ
 /// 足す（足し忘れは `Capture::Gate` = 書き込み後 savepoint の `ROLLBACK TO` が `0A000` になる
 /// だけで fail-closed。`table_image` の網羅テストが検知する）。
+///
+/// 並び順は変更しない（末尾への追加のみ）。変更ログのレコードが添字を shape 番号として保持する。
 static SHAPES: &[Shape] = shapes![
     (&'static str, u64),
     (&'static str, &'static [u8]),
@@ -413,11 +542,16 @@ pub(crate) fn capture(
         .list_tables()
         .map_err(|_| ImageError)?
         .map(|h| h.name().to_string())
+        // 変更ログの内部表は savepoint の巻き戻しに不要なので走査から外す。ログは commit の
+        // prepare 段でだけ書かれ、writer の取得中は基底と同一のため（有効化と保守 commit は別の
+        // トランザクション）。ログの行数に依存せず、`ROLLBACK TO` の再適用にも現れない。
+        .filter(|n| !super::change_log::is_excluded_table(n))
         .collect();
     let cnames: BTreeSet<String> = committed
         .list_tables()
         .map_err(|_| ImageError)?
         .map(|h| h.name().to_string())
+        .filter(|n| !super::change_log::is_excluded_table(n))
         .collect();
     let wset: BTreeSet<&String> = wnames.iter().collect();
     let dropped: Vec<String> = cnames

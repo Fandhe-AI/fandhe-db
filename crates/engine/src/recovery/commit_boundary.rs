@@ -296,9 +296,10 @@ pub(crate) fn commit_and_finish<T>(
         txn: write_txn,
         permit: _permit,
         session,
+        capture,
     } = write_txn.split_for_commit();
-    let Some(session) = session else {
-        // commit 記録を持たない write トランザクション（一時表用ストレージ・テスト fixture）。
+    if session.is_none() && capture.is_none() {
+        // commit 記録も変更ログも持たない write トランザクション（一時表用ストレージ・テスト fixture）。
         return commit_and_finish_with(
             write_txn,
             value,
@@ -306,7 +307,7 @@ pub(crate) fn commit_and_finish<T>(
             |wt| storage::prepare_generation_bump(wt).map(|_| ()),
             storage::commit_prepared_write_txn,
         );
-    };
+    }
     // commit 記録（SQL-38・Issue #2404）。準備段階（durable な書き込みの前）で世代の採番と
     // 足跡の検査を行い、`Err` なら commit 前に拒否する。追記は commit 成功後・permit 解放前
     // （`_permit` は本関数の終わりまで生きる）の `post_commit` 区間の先頭で行う（1a-5 の順序不変条件。
@@ -319,13 +320,23 @@ pub(crate) fn commit_and_finish<T>(
         value,
         |v| {
             if let Some((g_c, record)) = prepared.borrow_mut().take() {
-                session.finish(g_c, record);
+                if let Some(s) = session.as_ref() {
+                    s.finish(g_c, record);
+                }
             }
             post_commit(v)
         },
         |wt| {
             let g_c = storage::prepare_generation_bump(wt)?;
-            let record = session.prepare(wt)?;
+            let record = match session.as_ref() {
+                Some(s) => s.prepare(wt)?,
+                None => None,
+            };
+            // 変更ログ（RECOVER-14）: prepare 段に明示的に渡された session で after-image を読み、
+            // 同じトランザクションへレコードを追記する（`Err` は commit 前の拒否）。
+            if let Some(c) = capture.as_ref() {
+                c.prepare(wt, g_c)?;
+            }
             *prepared.borrow_mut() = Some((g_c, record));
             Ok(())
         },
@@ -407,6 +418,38 @@ fn commit_and_finish_with<T>(
 /// `post_commit` は常に [`PostCommitResult::Ok`] を返す no-op とする。
 pub(crate) fn commit(write_txn: impl storage::CommitTxn) -> StorageResult<()> {
     commit_and_finish(write_txn, (), |()| PostCommitResult::Ok).map(|((), _)| ())
+}
+
+/// 保守 commit の入口（変更ログの設計 D6。ポインタ: RECOVER-14）。世代を進めず、commit 記録・
+/// 変更ログのレコードも生まない。`change_log` 表・メタ表（DB 識別子・水位）だけを書く
+/// トランザクション専用で、利用者の書き込みには使わない。`prepare_generation_bump` を呼ばないため
+/// `storage_generation` も表世代も動かない。point of no return の保護（`PostCommitPanicGuard`・
+/// commit の `Err` は abort）は他の commit と同じ。呼び出し元は `Storage::enable_change_log`（DB 識別子の
+/// 永続化）で、アーカイブ水位の更新（#2167）も同じ入口を使う。
+#[cfg_attr(not(test), allow(dead_code))] // 保守 commit の運用経路（アーカイブ水位の更新）は #2167
+pub(crate) fn commit_maintenance(write_txn: impl storage::CommitTxn) -> StorageResult<()> {
+    // session は保守 commit では使わない。capture は記録対象の書き込みが無いことの検査にだけ使う。
+    let storage::CommitParts {
+        txn: write_txn,
+        permit: _permit,
+        session: _session,
+        capture,
+    } = write_txn.split_for_commit();
+    commit_and_finish_with(
+        write_txn,
+        (),
+        |()| PostCommitResult::Ok,
+        |_| {
+            // 利用者の表を書いた（記録対象のキー・イベントが積まれた）トランザクションを保守 commit へ
+            // 流すと、変更ログに載らないまま確定する。黙って捨てず commit 前に拒否する（fail-closed）。
+            if capture.as_ref().is_some_and(|c| c.has_pending_changes()) {
+                return Err(storage::StorageError::CommitFootprintUnrecordable);
+            }
+            Ok(())
+        },
+        storage::commit_prepared_write_txn,
+    )
+    .map(|((), _)| ())
 }
 
 /// `crate::txn::WriteTxn`/`BatchWriteTxn` の commit 一本化点
