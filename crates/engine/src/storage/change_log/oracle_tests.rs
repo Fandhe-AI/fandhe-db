@@ -688,3 +688,122 @@ fn changed_table_generations_matches_the_per_table_lookup() {
     );
     drop(txn);
 }
+
+// ---- 有効にした DB をフラグなしで開いたときの拒否の経路 ----
+
+/// SQL の INSERT・DDL と `put_batch` は `54000` 系で拒否され（durable な書き込みも世代の進みも無い）、
+/// SELECT と一貫スナップショットの書き出し（`backup` の本体）は通る。
+#[test]
+fn every_write_path_is_refused_without_the_flag_but_reads_and_snapshots_pass() {
+    use crate::storage::RowInput;
+    let (s, storage) = begin("oracle-refusal");
+    {
+        let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+        let mut session = SessionState::default();
+        session.allow_ddl();
+        run_sql(
+            &core,
+            "tenant-a",
+            &mut session,
+            &[
+                "CREATE TABLE t (id BIGINT PRIMARY KEY, v VECTOR(2))",
+                "INSERT INTO t (id, v) VALUES (1, '[0.1,0.2]')",
+            ],
+        );
+    }
+
+    // 有効にしない起動: put_batch は拒否される。
+    let plain = Storage::open(&s.path).expect("reopen");
+    let before = plain.current_generation().expect("gen");
+    let row = RowInput {
+        tenant_id: "tenant-a",
+        visibility: Visibility::Public,
+        embedding: &[0.1, 0.2],
+        metadata: &[],
+    };
+    let err = plain.put_batch(&[(5, row)]).expect_err("put_batch refused");
+    assert!(matches!(
+        err,
+        crate::storage::StorageError::CommitFootprintUnrecordable
+    ));
+    let snap = unique_db_path("oracle-refusal-snapshot");
+    let _snap_guard = CleanupGuard(snap.clone());
+    plain.export_snapshot(&snap).expect("snapshot is a read");
+    drop(plain);
+
+    // SQL: INSERT と DDL は 54000、SELECT は通る。
+    let core = EngineCore::from_storage(
+        Storage::open(&s.path).expect("reopen"),
+        Box::new(CpuScalarProvider),
+    );
+    let c = ctx("tenant-a");
+    let mut session = SessionState::default();
+    session.allow_ddl();
+    for sql in [
+        "INSERT INTO t (id, v) VALUES (2, '[0.3,0.4]')",
+        "CREATE TABLE u (id BIGINT PRIMARY KEY, v VECTOR(2))",
+    ] {
+        let err = core
+            .execute_sql_in_session(&c, &mut session, sql)
+            .expect_err("refused");
+        assert_eq!(err.wire_code(), "54000", "{sql}");
+    }
+    core.execute_sql_in_session(&c, &mut session, "SELECT id FROM t")
+        .expect("reads are unaffected");
+    drop(core);
+    let storage = Storage::open(&s.path).expect("reopen");
+    assert_eq!(storage.current_generation().expect("gen"), before);
+    drop(storage);
+    assert_eq!(finish(s) as u64, before);
+}
+
+// ---- shape の符号化そのものの検査（記録・突き合わせ・再生と別の読み方）----
+
+/// 記録・突き合わせ・再生は同じ `table_image` の読み取り（shape）を共有するため、符号化そのものの誤りは
+/// 3 つとも同じ向きにずれて見逃しうる。行ストアの実体を素の redb で直接読み、キーと値のバイト列が
+/// 再生結果と一致することを確かめる。
+#[test]
+fn replayed_row_store_matches_a_direct_raw_redb_read() {
+    let (s, storage) = begin("oracle-raw-bytes");
+    {
+        let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+        let mut session = SessionState::default();
+        session.allow_ddl();
+        run_sql(
+            &core,
+            "tenant-a",
+            &mut session,
+            &[
+                "CREATE TABLE ev (id BIGINT PRIMARY KEY, v VECTOR(2), note TEXT)",
+                "INSERT INTO ev (id, v, note) VALUES (1, '[0.1,0.2]', 'a'), (2, '[0.3,0.4]', 'b')",
+                "UPDATE ev SET note = 'z' WHERE id = 2",
+                "DELETE FROM ev WHERE id = 1",
+                "INSERT INTO ev (id, v, note) VALUES (3, '[0.5,0.6]', 'c')",
+            ],
+        );
+    }
+    let storage = Storage::open(&s.path).expect("reopen");
+    let recs = records(&storage);
+    drop(storage);
+    let replayed = oracle::replay(s.start.clone(), s.start_gen, &recs).expect("replay");
+    let physical = crate::catalog::user_rows_physical_name("ev");
+    let (_, model_rows) = replayed.get(&physical).expect("row store replayed");
+
+    let db = redb::Database::open(&s.path).expect("raw open");
+    let read = db.begin_read().expect("read");
+    let table = read
+        .open_table(crate::catalog::user_rows_table_def(&physical))
+        .expect("raw typed open");
+    let mut raw: std::collections::BTreeMap<Vec<u8>, Vec<u8>> = std::collections::BTreeMap::new();
+    for entry in table.iter().expect("iter") {
+        let (k, v) = entry.expect("entry");
+        let key = <(&str, u64) as redb::Value>::as_bytes(&k.value()).to_vec();
+        raw.insert(key, v.value().to_vec());
+    }
+    assert_eq!(raw.len(), 2, "rows 2 and 3 remain");
+    assert_eq!(&raw, model_rows, "the replayed bytes equal the raw bytes");
+    drop(table);
+    drop(read);
+    drop(db);
+    finish(s);
+}

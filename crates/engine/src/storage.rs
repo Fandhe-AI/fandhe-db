@@ -1066,6 +1066,11 @@ impl Storage {
         txn: redb::WriteTransaction,
         permit: writer_gate::WriterPermit,
     ) -> Result<GatedWriteTxn> {
+        // 変更ログを一度有効にした DB を、有効にしないまま書くと LSN が欠落する。fail-closed に拒否する
+        // （`txn` と `permit` はここで破棄され、durable な書き込みは発生しない）。
+        if self.change_log.is_none() && self.change_log_on_disk {
+            return Err(change_log::Unrecordable::DisabledOnEnabledDb.refuse());
+        }
         let txn = Box::new(txn);
         let recording = match self.commit_log.as_ref() {
             Some(log) => {
@@ -1084,11 +1089,6 @@ impl Storage {
             }
             None => None,
         };
-        // 変更ログを一度有効にした DB を、有効にしないまま書くと LSN が欠落する。fail-closed に拒否する
-        // （`txn` と `permit` はここで破棄され、durable な書き込みは発生しない）。
-        if self.change_log.is_none() && self.change_log_on_disk {
-            return Err(change_log::Unrecordable::DisabledOnEnabledDb.refuse());
-        }
         // 変更ログが有効なときだけ capture frame を登録する（無効時は確保もロックもしない）。
         let capture = match self.change_log.as_ref() {
             Some(state) => {
@@ -1147,6 +1147,8 @@ impl Storage {
     /// - まだ有効にしていない DB を有効にするときは、現在の世代を起点として記録を始める（それ以前の
     ///   変更はログに無いので、有効化前のベースからの PITR はできない。D8）
     /// - 一時表用ストレージでは拒否する
+    /// - 失敗（`Err`）した `Storage` は有効扱いにならない。識別子が永続化済みなら書き込みは拒否されたまま
+    ///   （[`Self::change_log_required`] が真）
     ///
     /// `&mut self` なのは `Arc` 化前の構築段階でだけ有効化できるようにするため。
     pub fn enable_change_log(&mut self) -> Result<()> {
@@ -1185,7 +1187,13 @@ impl Storage {
                 self.change_log_on_disk = true;
                 self.change_log = Some(std::sync::Arc::new(state));
                 // `open` が保留した旧形式の表の移行を、記録される状態で行う（冪等。対象が無ければ何もしない）。
-                crate::catalog::legacy_id_migration::migrate_legacy_ids(self)?;
+                // 移行の commit が記録されるには変更ログが有効でなければならないため、有効化の後に行う。
+                // 失敗したら有効化を取り消す（`Err` を返した `Storage` は有効扱いにしない。識別子は
+                // 永続化済みなので、書き込みは「有効にしていない起動」として拒否されたままになる）。
+                if let Err(e) = crate::catalog::legacy_id_migration::migrate_legacy_ids(self) {
+                    self.change_log = None;
+                    return Err(e);
+                }
                 Ok(())
             }
             Err(e) => {
@@ -1193,6 +1201,14 @@ impl Storage {
                 Err(e)
             }
         }
+    }
+
+    /// オラクル試験用: 全レコードを空の状態から再生した結果が実表と一致するか(feature `change-log-oracle` のみ。
+    /// 有効化時の世代が 0 で表が無い DB 用。`tests/change_log_crash_atomicity.rs` が呼ぶ)。
+    #[cfg(feature = "change-log-oracle")]
+    #[doc(hidden)]
+    pub fn oracle_verify_replay(&self) -> std::result::Result<(), String> {
+        change_log::oracle::verify_log_replay(self)
     }
 
     /// 変更ログを有効にした DB を、有効にしないまま開いているか。真の間は書き込みを

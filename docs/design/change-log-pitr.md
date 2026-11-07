@@ -327,8 +327,9 @@ commit 番号・アーカイブと保持・復元手順・有効化境界・性�
 | 有効にした DB・フラグなし | wire-server は固定文言で起動を拒否する。engine（ライブラリ利用）も書き込みを `54000` で拒否する（`wrap_gated` で書き込みトランザクションの取得時。読み取りと `backup` の書き出しは可）。無効のまま書くとレコードが欠けたまま世代が進むため |
 
 - 有効にした DB をフラグなしで開く経路は、LSN の欠落を**作れない**（起動拒否 + engine 側の書き込み拒否の二重）。
-  有効化を戻す手段は現時点で無く、止めたい場合は `backup` で取った複製から新しい DB を作る。無効化は
-  アーカイブ・保持（#2167）と合わせて後続で検討する
+  有効化を戻す手段は現時点で無い。`backup`（`export_snapshot`）の複製も `change_log`・`change_log_meta` を
+  含む（D5: ベースバックアップとログを同じ DB 識別子で結ぶため、除外しない）ので、複製も有効扱いで、
+  `--change-log` 付きで起動する必要がある。無効化の仕様はアーカイブ・保持（#2167）以降で決める
 - 旧形式の表の `id` 移行（`legacy_id_migration`）は `Storage::open` が commit する。有効にした DB では
   その commit が記録されないとレコードに欠落ができるため、open では行わず、`enable_change_log` が
   有効化の直後（記録される状態）で行う。フラグなしの起動は書き込めないので移行を要さない
@@ -368,6 +369,10 @@ commit 番号・アーカイブと保持・復元手順・有効化境界・性�
   `WriteTxn`。各場面の終了後に、有効化した時点の全表へ記録した全レコードを LSN 順に適用した結果が最終状態と
   一致すること（再生器 `oracle::replay`。符号化・LSN の連鎖・正規化の通し検証）と、レコード数が世代の進みと
   一致することも確かめる。再生器は #2169 の参照実装を兼ねる
+- **検出できないもの**: 記録・突き合わせ・再生は同じ `table_image` の読み取り（shape の符号化）を共有する。
+  shape の符号化そのものの誤り（キー・値のバイト列の取り違え）は 3 つとも同じ向きにずれて見逃しうる。
+  補うため、行ストアの実体を素の redb で直接読み、キー・値のバイト列が再生結果と一致する場面
+  （`replayed_row_store_matches_a_direct_raw_redb_read`）を 1 つ置いた。他の shape は未検証
 - オラクル自身の検出力: 層 2（行数の増減）が見逃す「行数が同じ更新を捕捉なしで行う」書き込みを、オラクルが
   不一致として検出することをテストで固定している
 - 場面集では**不一致は出なかった**（直した不一致は無い）。一方、強制有効化で見つかった層 3 外の問題が 1 件
@@ -410,19 +415,16 @@ commit 番号・アーカイブと保持・復元手順・有効化境界・性�
   欠落なく連続し、最後の LSN が `storage_generation` に一致し、最初の LSN が `base_generation` の次であること、
   再有効化が連続性検査に拒否されないことを確かめる（`Immediate` の durability。24 回で世代 455 まで進んだ）
 
-#### CI へ入れる案（未決。オーナー判断）
+#### CI ジョブ `change-log-oracle`
 
 - すでに通常の CI（`rust-ci` の `cargo test --all-features`）に入っているもの: lib のオラクルの場面集（commit ごとの
-  突き合わせ込み）、`tests/change_log_crash_atomicity.rs`（0.2 秒）、`wire_cli` の `--change-log` の試験。追加の
-  ジョブは不要
-- 重い強制走行（上記の 99 バイナリ）は、別ジョブ `change-log-oracle` にする案がある。`--all-features` のビルドは
-  `rust-ci` と同じなので feature の追加ビルドは要らない。コマンドは
-  `FANDHE_CHANGE_LOG_ORACLE=1 cargo test -p fandhe-db-engine --all-features --no-fail-fast --test '*' --
-  --skip persist3_on_disk_row_entry_layout_via_raw_redb --skip latency_is_independent_of_row_count` と、遅延の 4 件だけを
-  `FANDHE_CHANGE_LOG_ORACLE=force` で別に流す 2 段。所要時間は手元（10 論理 CPU）でテスト実行 3 分 27 秒、
-  GitHub ホステッド runner（2〜4 コア）では 2〜3 倍、cold ビルドを含めて 15〜25 分と見込む（未計測）。ジョブを足すと
-  必須チェック名が増えるため ruleset の更新が要る（`.claude/rules/github-actions.md`）。
-  足さない場合の手元の実行手順は README「変更ログのオラクル試験」に書いた
+  突き合わせ込み）、`tests/change_log_crash_atomicity.rs`、`wire_cli` の `--change-log` の試験
+- 重い強制走行（99 バイナリ）は `ci.yml` の独立ジョブ `change-log-oracle`（`make change-log-oracle` →
+  `scripts/change_log_oracle.sh`）。2 段: ①`FANDHE_CHANGE_LOG_ORACLE=1` で、`persist3_on_disk_row_entry_layout_via_raw_redb`
+  （redb の表一覧を固定していて、有効化そのものが差になる）と `*_latency_is_independent_of_row_count` の 4 件
+  （O(DB) の突き合わせで落ちる）をテスト名で除外して流す。②`=force`（強制有効化のみ）で遅延 4 件だけを流す。
+  除外の理由はスクリプト冒頭とジョブのコメントに書いた。必須チェックへの追加はマージ後に ruleset で行う（ユーザー作業）
+- 手元の所要時間は PR 本文に記載する（cold ビルド込み）。手元の実行手順は README「変更ログのオラクル試験」
 
 #### 性能の実測
 

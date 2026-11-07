@@ -136,6 +136,29 @@ fn recover14_backup_of_a_database_with_a_change_log_needs_no_flag() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(std::path::Path::new(&out).exists(), "snapshot is written");
+
+    // 複製も変更ログ（と DB 識別子）を含むため有効扱い: フラグなしでは拒否され、フラグ付きなら起動する。
+    let copy_args = |flag: bool| {
+        let mut args = vec![
+            "--users".to_string(),
+            fixture.users_path_str(),
+            "--db".to_string(),
+            out.clone(),
+            "--bind".to_string(),
+            "127.0.0.1:0".to_string(),
+        ];
+        if flag {
+            args.push(FLAG.to_string());
+        }
+        args
+    };
+    let (code, err) = run(&copy_args(false));
+    assert_ne!(code, Some(0), "{err}");
+    assert!(err.contains(REQUIRED), "{err}");
+    assert!(
+        reaches_listening(&copy_args(true)),
+        "the copy starts with the flag"
+    );
     let _ = std::fs::remove_file(&out);
 }
 

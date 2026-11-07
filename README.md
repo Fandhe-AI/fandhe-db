@@ -77,6 +77,8 @@ FANDHE_CHANGE_LOG_ORACLE=1 cargo test -p fandhe-db-engine --features change-log-
 FANDHE_CHANGE_LOG_ORACLE=force cargo test -p fandhe-db-engine --features change-log-oracle --test catalog_latency
 ```
 
+上の 2 段（除外するテストと理由つき）をまとめて流すのは `make change-log-oracle`（`scripts/change_log_oracle.sh`。CI のジョブ `change-log-oracle` と同じ）です。
+
 有効化そのものが差になるテスト（`persistence` の「redb の表一覧」の固定など）は、この実行では落ちます
 （無効のときの期待値を固定しているため。落ちた内訳は `docs/design/change-log-pitr.md` の D11）。
 SIGKILL での原子性は `cargo test -p fandhe-db-engine --test change_log_crash_atomicity`、有効時・無効時の
@@ -421,7 +423,8 @@ redb トランザクションで DB 内の `change_log` 表へ追記されます
   実測は設計書の D11 を参照）。
 - **一度有効にした DB は、フラグなしでは起動できません。** 無効のまま書くとログに欠落（LSN の欠落）が
   生じるため、起動を固定文言で拒否します（`backup` サブコマンドの読み取りは影響を受けません）。いまの
-  版に有効化を戻す手段はありません。止めたい場合は `backup` で取った複製から新しい DB を作ります。
+  版に有効化を戻す手段はありません。`backup` で取った複製も変更ログを含むため有効扱いで、起動には
+  `--change-log` が要ります（無効化の仕様は #2167 以降で決めます）。
 - 有効にしたことのない既存の DB に後からフラグを付けることはできますが、**それ以前の変更はログに
   ありません**（有効化前のベースからの PITR はできません）。
 - 有効時は 1 回の commit に載せる変更に上限があり（キー 4M 個・128 MiB、レコード 256 MiB など）、

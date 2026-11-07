@@ -89,17 +89,17 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // 伴う rustfmt の折り返しで行番号が移動したための追随。以降の `catalog.rs`・`tenant.rs`・
     // `catalog/*.rs` の各エントリも同じ理由で移動している）。
     // Issue #3069（`change_log_on_disk`・連続性検査・保留した移行の追加）で行番号が移動したための追随。
-    ("storage.rs", 1328),
-    ("storage.rs", 1362),
+    ("storage.rs", 1344),
+    ("storage.rs", 1378),
     // Issue #3067: `Storage::enable_change_log` が DB 識別子の永続化に使う保守 commit
     // （`commit_boundary::commit_maintenance`）。書き込むのは `change_log_meta` 表だけで、`CATALOG_TABLE`・
     // `user_rows` には触れず、世代も進めない（バンプ対象の表が構造的に存在しない）。
-    ("storage.rs", 1177),
+    ("storage.rs", 1179),
     // Issue #3067: `storage/change_log.rs` のテスト内の commit 入口（`commit_result`・`commit_maint`）。
     // 変更ログの `change_log` 表・メタ表と任意の試験用 redb 表だけを書くテスト fixture で、
     // `user_rows/{table_name}` を経由しないため対象外。
-    ("storage/change_log.rs", 1467),
-    ("storage/change_log.rs", 1475),
+    ("storage/change_log.rs", 1471),
+    ("storage/change_log.rs", 1479),
     ("recovery/panic_hook.rs", 404),
     ("txn.rs", 211),
     ("txn.rs", 388),

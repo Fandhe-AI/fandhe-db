@@ -117,6 +117,14 @@ fn child_workload(db: &Path, log: &Path) {
     }
 }
 
+struct RemoveOnDrop(PathBuf);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 struct ChildGuard(Child);
 
 impl Drop for ChildGuard {
@@ -139,6 +147,8 @@ fn complete_lines(log: &Path) -> usize {
 /// 子を起動し、マーカーが `min_lines` 行に達したら `jitter` 待って SIGKILL する。
 fn run_and_kill(test_name: &str, db: &Path, log: &Path, min_lines: usize, jitter: Duration) {
     let exe = std::env::current_exe().expect("current_exe");
+    // 子が書き始める前の行数（spawn の後に数えると、子の最初のマーカーを基準に含めてしまう）。
+    let already = complete_lines(log);
     let child = Command::new(exe)
         .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
         .env(ROLE_ENV, "workload")
@@ -151,7 +161,6 @@ fn run_and_kill(test_name: &str, db: &Path, log: &Path, min_lines: usize, jitter
         .expect("spawn child");
     let mut guard = ChildGuard(child);
     let start = Instant::now();
-    let already = complete_lines(log);
     while complete_lines(log) < already + min_lines {
         if let Some(status) = guard.0.try_wait().expect("try_wait") {
             panic!("child exited before the kill point: {status:?}");
@@ -242,6 +251,8 @@ fn change_log_records_and_generation_stay_together_across_sigkill() {
     let _guard = CleanupGuard(path.clone());
     let log = path.with_extension("markers");
     let _ = std::fs::remove_file(&log);
+    // 失敗（panic）しても進捗マーカーのファイルを残さない。
+    let _markers = RemoveOnDrop(log.clone());
     let test_name = "change_log_records_and_generation_stay_together_across_sigkill";
 
     const JITTER_US: [u64; 6] = [0, 30, 100, 300, 800, 2_000];
@@ -258,11 +269,19 @@ fn change_log_records_and_generation_stay_together_across_sigkill() {
         );
         last_generation = generation;
         assert!(last.is_some() || round == 0, "records accumulate");
+        // 全レコードを空の状態から再生した結果が実表と一致する（feature 有効のビルドのみ。
+        // DB は空から有効化したので、再生の起点は空）。
+        #[cfg(feature = "change-log-oracle")]
+        {
+            let storage = Storage::open(&path).expect("reopen after SIGKILL");
+            storage
+                .oracle_verify_replay()
+                .unwrap_or_else(|e| panic!("round {round}: {e}"));
+        }
     }
-    let _ = std::fs::remove_file(&log);
     println!("change_log_crash: rounds={KILL_ROUNDS} final_generation={last_generation}");
     assert!(
-        last_generation >= KILL_ROUNDS as u64,
-        "the workload committed in every round"
+        last_generation >= 4 * KILL_ROUNDS as u64,
+        "the workload committed several times in every round"
     );
 }

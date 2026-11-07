@@ -15,12 +15,6 @@
 /// 受理対象の CLI フラグ名（値を取らないスイッチ）。
 pub const FLAG: &str = "--change-log";
 
-/// 変更ログを有効にして起動できるか。オラクル試験と有効化（#3069）が済んだため `true`。
-pub const AVAILABLE: bool = true;
-
-/// 無効のビルドで指定された起動を拒否する固定文言（引数値・パス・テナント情報を含めない）。
-pub const REJECT_MESSAGE: &str = "--change-log is not available yet: the change log is not fully wired into the write paths, so enabling it is refused";
-
 /// 2 回目以降の指定を拒否する固定文言（last-wins にしない）。
 pub const DUPLICATE_MESSAGE: &str = "--change-log specified more than once";
 
@@ -30,12 +24,9 @@ pub const REQUIRED_MESSAGE: &str = "this database has a change log: restart with
 /// 有効化に成功したときに stderr へ出す固定文言（運用者向けの状態表示）。
 pub const ENABLED_MESSAGE: &str = "change log enabled (archive, retention and point-in-time recovery are not available yet; the log grows inside the database)";
 
-/// フラグ 1 回分の受理判定。`already_set` は既に 1 回指定済みか。
-/// 無効のビルドでは常に [`REJECT_MESSAGE`]、有効なビルドでも重複指定は [`DUPLICATE_MESSAGE`]。
+/// フラグ 1 回分の受理判定。`already_set` は既に 1 回指定済みか。重複指定は [`DUPLICATE_MESSAGE`]。
+/// （有効化できないビルドは無い。以前あった「未提供」の拒否文言と `AVAILABLE` は #3069 で削除した。）
 pub fn accept(already_set: bool) -> Result<(), &'static str> {
-    if !AVAILABLE {
-        return Err(REJECT_MESSAGE);
-    }
     if already_set {
         return Err(DUPLICATE_MESSAGE);
     }
@@ -50,7 +41,6 @@ mod tests {
     fn flag_is_a_bare_switch_name() {
         assert!(FLAG.starts_with("--"));
         assert!(!FLAG.contains('='));
-        assert!(REJECT_MESSAGE.starts_with(FLAG));
         assert!(DUPLICATE_MESSAGE.starts_with(FLAG));
     }
 

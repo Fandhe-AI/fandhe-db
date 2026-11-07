@@ -26,7 +26,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::LazyLock;
 
-use super::{decode_record, is_excluded_table, ChangeRecord, RecordBody};
+use super::{decode_record, is_excluded_table, ChangeRecord, RecordBody, CHANGE_LOG_TABLE};
 use crate::storage::table_image::{self, Capture, Meter, ReadMode, ReadOutcome};
 
 /// 環境変数名（feature `change-log-oracle` のビルドでだけ参照する）。値は 2 通り:
@@ -39,7 +39,15 @@ fn env_mode() -> Option<&'static str> {
         LazyLock::new(|| match std::env::var(ENV_VAR).as_deref() {
             Ok("1") => Some("1"),
             Ok("force") => Some("force"),
-            _ => None,
+            Err(std::env::VarError::NotPresent) => None,
+            // 未知の値（`true`・`0`・空・大文字違いなど）を黙って無効にすると、オラクルが走らないまま緑になる。
+            // feature 有効のビルドでは fail-closed に落とす（未設定のときの挙動は変えない）。
+            _ => {
+                if cfg!(feature = "change-log-oracle") {
+                    panic!("{ENV_VAR} must be unset, `1` or `force`");
+                }
+                None
+            }
         });
     *MODE
 }
@@ -326,4 +334,31 @@ pub(super) fn verify_record(
         }
     }
     Ok(())
+}
+
+/// 全レコードを空の状態から LSN 順に再生した結果が `storage` の実表と一致することを確かめる
+/// （有効化時の世代が 0 で、有効化の時点で表が無い DB 用。クラッシュ試験が kill のたびに呼ぶ）。
+pub(crate) fn verify_log_replay(storage: &crate::storage::Storage) -> Result<(), String> {
+    use redb::{ReadableDatabase, ReadableTable};
+    let read = storage.db.begin_read().map_err(|e| e.to_string())?;
+    let mut records = Vec::new();
+    match read.open_table(CHANGE_LOG_TABLE) {
+        Ok(t) => {
+            for e in t.iter().map_err(|e| e.to_string())? {
+                let (_, v) = e.map_err(|e| e.to_string())?;
+                records.push(decode_record(v.value(), usize::MAX).map_err(|e| format!("{e:?}"))?);
+            }
+        }
+        Err(redb::TableError::TableDoesNotExist(_)) => {}
+        Err(e) => return Err(e.to_string()),
+    }
+    drop(read);
+    let replayed = replay(Model::new(), 0, &records)?;
+    let txn = storage.db.begin_write().map_err(|e| e.to_string())?;
+    let actual = dump_writer(&txn);
+    txn.abort().map_err(|e| e.to_string())?;
+    match diff_models(&actual?, &replayed) {
+        None => Ok(()),
+        Some(d) => Err(format!("replay differs from the tables: {d}")),
+    }
 }

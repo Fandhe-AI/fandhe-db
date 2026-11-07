@@ -143,11 +143,15 @@ impl Unrecordable {
 
     /// 原因を stderr へ（同じ秒に 1 回まで）出して、クライアントへ返すエラーを作る。
     pub(crate) fn refuse(self) -> StorageError {
-        static LAST_LOG_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        // 抑止は原因ごと（ある原因の連続拒否で、別の原因の最初の 1 行が隠れない）。
+        const CAUSES: usize = 7;
+        static LAST_LOG_SECS: [std::sync::atomic::AtomicU64; CAUSES] =
+            [const { std::sync::atomic::AtomicU64::new(0) }; CAUSES];
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
-        if LAST_LOG_SECS.swap(now, Ordering::Relaxed) != now {
+        let slot = LAST_LOG_SECS.get(self as usize);
+        if slot.is_none_or(|l| l.swap(now, Ordering::Relaxed) != now) {
             crate::log_stderr!("engine: change log: commit refused: {}", self.text());
         }
         StorageError::CommitFootprintUnrecordable
