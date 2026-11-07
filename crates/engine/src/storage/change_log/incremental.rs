@@ -17,8 +17,8 @@
 //!   セグメントの間、および増分同士の間で行う
 //! - **適用**: ベースの DB ファイル（呼び出し側が用意した複製）へ、増分のセグメントを LSN 順に再生する。
 //!   参照実装は `oracle::apply_record`・`oracle::replay`。本ファイルは redb の実表へ適用する本番版で、
-//!   #2169 の PITR（指定 LSN・時刻での停止）が同じ再生器を共有できるよう、セグメント列の再生を 1 関数に
-//!   まとめている（停止条件は #2169 が足す）
+//!   #2169 の PITR（指定 LSN・時刻での停止。`pitr`）が同じ再生器を共有できるよう、セグメント列の再生を
+//!   1 関数（`replay_segments`）にまとめている（`pitr` が解決した停止 LSN を渡す）
 //!
 //! 呼び出し元は wire-server の `backup-incremental`・`restore --incremental`（`incremental_opt`・
 //! `restore_opt`）。出力先・複製の公開手順（一時名 → fsync → `hard_link`）は呼び出し側と engine の
@@ -43,15 +43,15 @@ use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use redb::ReadableDatabase;
+use redb::{ReadableDatabase, ReadableTable};
 
 use super::archive::{
     check_dir_not_shared, check_row, map_decode, publish_with, read_meta_u64, verify_segment_file,
-    ArchiveError, SegmentHeader, SegmentReader, SEG_MAGIC,
+    ArchiveError, SegmentHeader, SegmentInfo, SegmentReader, SEG_MAGIC,
 };
 use super::{
-    decode_record, is_excluded_table, CaptureLimits, CHANGE_LOG_TABLE, DB_ID_LEN, META_KEY_DB_ID,
-    META_KEY_TIMELINE, META_TABLE, STORAGE_FORMAT_VERSION,
+    decode_record, is_excluded_table, peek_record, CaptureLimits, CHANGE_LOG_TABLE, DB_ID_LEN,
+    META_KEY_DB_ID, META_KEY_TIMELINE, META_TABLE, STORAGE_FORMAT_VERSION,
 };
 use crate::crypto::sha256::Sha256;
 use crate::storage::table_image;
@@ -121,6 +121,11 @@ pub enum IncrementalError {
     Io(std::io::ErrorKind),
     /// この環境では扱えない（unix 以外・`hard_link` 非対応）。
     Unsupported,
+    /// PITR の目標（LSN・時刻）が不正（0・範囲外の値）。
+    InvalidTarget,
+    /// PITR の目標が、復元できる範囲の外にある（ベースの終点以前、または入力したログの末尾より後）。
+    /// 黙って末尾まで適用しない。
+    TargetOutOfRange,
 }
 
 impl std::fmt::Display for IncrementalError {
@@ -149,6 +154,10 @@ impl std::fmt::Display for IncrementalError {
             Self::Storage(_) => "storage error during incremental backup",
             Self::Io(_) => "i/o error during incremental backup",
             Self::Unsupported => "incremental backup is not supported in this environment",
+            Self::InvalidTarget => "point-in-time recovery target is invalid",
+            Self::TargetOutOfRange => {
+                "point-in-time recovery target is outside the range covered by the change log"
+            }
         };
         f.write_str(text)
     }
@@ -410,19 +419,36 @@ struct Batch {
 /// ので、呼び出し側は破棄する（元のバックアップには触れない）。DB は素の redb で開く（`Storage::open` は
 /// 変更ログ有効化済みの DB の書き込みを拒否し、移行・修復の副作用もあるため使わない）。
 ///
-/// 再生の停止条件（指定 LSN・時刻。#2169）はここには無い。復元後の世代番号の進行（#2446）は呼び出し側が、
+/// 指定 LSN・時刻での停止は [`restore_to_point`](super::pitr::restore_to_point)（Issue #2169）が同じ
+/// 再生器（[`replay_segments`]）に停止条件を渡して行う。復元後の世代番号の進行（#2446）は呼び出し側が、
 /// 本関数の成功後・公開の前に行う。
 pub fn apply_incremental_segments(db_path: &Path, segments: &[PathBuf]) -> Result<ApplySummary> {
+    let replay = verify_incrementals(segments)?;
+    replay_segments(db_path, &replay, None)
+}
+
+/// 再生するセグメント 1 つ（検証済み）。
+#[derive(Debug, Clone)]
+pub(super) struct ReplaySegment {
+    pub(super) path: PathBuf,
+    /// 検証時の結果。再生中に差し替えられていないことの照合に使う。
+    pub(super) info: SegmentInfo,
+    /// 真なら、既に適用した LSN 以下のレコードを読み飛ばす（アーカイブのセグメントは、ベースや
+    /// 増分の終点をまたぎうる）。偽（増分バックアップ）なら先頭がちょうど次の LSN でなければならない。
+    pub(super) overlap_ok: bool,
+}
+
+/// 増分バックアップのファイル列を検証し、再生用の列にする（DB に触れない）。各ファイルの検証、
+/// 同一 DB・timeline、前の末尾 + 1 == 次の先頭、ストレージ形式の版数を確かめる。
+pub(super) fn verify_incrementals(segments: &[PathBuf]) -> Result<Vec<ReplaySegment>> {
     if segments.is_empty() || segments.len() > MAX_APPLY_SEGMENTS {
         return Err(IncrementalError::BadSegmentList);
     }
     let max_payload = CaptureLimits::default().max_payload_bytes;
-
-    // 1. DB に触れる前に、全セグメントを検証し、増分同士の連鎖を確かめる。
-    let mut infos = Vec::with_capacity(segments.len());
+    let mut out: Vec<ReplaySegment> = Vec::with_capacity(segments.len());
     for path in segments {
         let info = verify_segment_file(path, max_payload)?;
-        if let Some(prev) = infos.last().map(|i: &super::archive::SegmentInfo| i.header) {
+        if let Some(prev) = out.last().map(|r| r.info.header) {
             if info.header.db_id != prev.db_id {
                 return Err(IncrementalError::ForeignDatabase);
             }
@@ -436,19 +462,39 @@ pub fn apply_incremental_segments(db_path: &Path, segments: &[PathBuf]) -> Resul
         if info.header.storage_format != STORAGE_FORMAT_VERSION {
             return Err(IncrementalError::UnsupportedFormat);
         }
-        infos.push(info);
+        out.push(ReplaySegment {
+            path: path.clone(),
+            info,
+            overlap_ok: false,
+        });
     }
-    let first = infos
+    Ok(out)
+}
+
+/// 検証済みのセグメント列 `segments` を `db_path` へ再生する（増分の適用と PITR が共有する再生器）。
+/// `stop_lsn` があれば、その LSN のレコード（commit 1 つ）を適用した直後で止める（コミット境界。
+/// 1 レコード = 1 commit）。止まった後も、同じセグメントの残りを読み切って全体チェックサムを照合する
+/// （適用はしない）。`stop_lsn` がベースの世代以下、または列の末尾より後なら `TargetOutOfRange`。
+/// `None` なら列の末尾まで適用する。
+pub(super) fn replay_segments(
+    db_path: &Path,
+    segments: &[ReplaySegment],
+    stop_lsn: Option<u64>,
+) -> Result<ApplySummary> {
+    let max_payload = CaptureLimits::default().max_payload_bytes;
+    let first = segments
         .first()
         .ok_or(IncrementalError::BadSegmentList)?
-        .header;
-    let last_lsn = infos
-        .last()
-        .ok_or(IncrementalError::BadSegmentList)?
-        .header
-        .last_lsn;
+        .clone();
+    // 範囲の上限は全セグメントの最大。列は LSN の昇順とは限らない（PITR では増分の後ろに、適用済みの
+    // 区間に収まるアーカイブのセグメントが続く）ので、最後の要素から取らない。
+    let list_last = segments
+        .iter()
+        .map(|r| r.info.header.last_lsn)
+        .max()
+        .ok_or(IncrementalError::BadSegmentList)?;
 
-    // 2. ベースを開いて連鎖を確かめる（DB 識別子・timeline・終点の次が先頭）。
+    // 1. ベースを開いて連鎖を確かめる（DB 識別子・timeline・終点の次が先頭）。
     let db = redb::Database::open(db_path).map_err(|e| match e {
         redb::DatabaseError::DatabaseAlreadyOpen => IncrementalError::InUse,
         _ => IncrementalError::BaseUnreadable,
@@ -456,14 +502,28 @@ pub fn apply_incremental_segments(db_path: &Path, segments: &[PathBuf]) -> Resul
     let (mut names, base_generation) = {
         let read = db.begin_read()?;
         let (db_id, timeline) = read_identity(&read)?;
-        if db_id != first.db_id {
-            return Err(IncrementalError::ForeignDatabase);
-        }
-        if timeline != first.timeline {
-            return Err(IncrementalError::ForeignTimeline);
+        // 列のすべてのセグメントが、ベースと同じ DB・timeline であること（先頭だけでなく全体）。
+        for seg in segments {
+            if seg.info.header.db_id != db_id {
+                return Err(IncrementalError::ForeignDatabase);
+            }
+            if seg.info.header.timeline != timeline {
+                return Err(IncrementalError::ForeignTimeline);
+            }
         }
         let generation = crate::storage::current_generation_in_txn(&read)?;
-        if generation.checked_add(1) != Some(first.first_lsn) {
+        let next = generation
+            .checked_add(1)
+            .ok_or(IncrementalError::ChainBroken)?;
+        let fh = first.info.header;
+        let connects = if first.overlap_ok {
+            // 先頭が完全に適用済みの区間に収まってもよい（読み切って照合する）。続きの欠落は、
+            // 以降のレコードの `prev_lsn` の連鎖と最終の世代の検査が拒否する。
+            fh.first_lsn <= next
+        } else {
+            next == fh.first_lsn
+        };
+        if !connects {
             return Err(IncrementalError::ChainBroken);
         }
         let names: BTreeSet<String> = read
@@ -473,18 +533,55 @@ pub fn apply_incremental_segments(db_path: &Path, segments: &[PathBuf]) -> Resul
             .collect();
         (names, generation)
     };
+    if let Some(stop) = stop_lsn {
+        if stop <= base_generation || stop > list_last {
+            return Err(IncrementalError::TargetOutOfRange);
+        }
+    }
 
-    // 3. 再生。レコードごとに連鎖・版数を検査し、途中 commit は durability を省く（公開前の一時コピー）。
+    // 2. 再生。レコードごとに連鎖・版数を検査し、途中 commit は durability を省く（公開前の一時コピー）。
     let mut current = base_generation;
     let mut batch: Option<Batch> = None;
     let mut records = 0u64;
-    for (path, info) in segments.iter().zip(&infos) {
-        let mut reader = SegmentReader::open(path, max_payload)?;
+    let mut stopped = false;
+    let mut opened = 0u64;
+    for seg in segments {
+        let info = &seg.info;
+        if stopped && (!seg.overlap_ok || info.header.first_lsn > current) {
+            // 停止後は、適用済みの区間に重なるアーカイブのセグメントだけを読む（増分の途中で止まっても、
+            // 停止位置以前のアーカイブの内容を照合するため）。停止位置より後ろの入力は使わない。
+            continue;
+        }
+        let mut reader = SegmentReader::open(&seg.path, max_payload)?;
+        opened = opened.saturating_add(1);
         // 検証から再生までの間に差し替えられていないこと（ヘッダが検証時と同一）。
         if *reader.header() != info.header {
             return Err(ArchiveError::ChecksumMismatch.into());
         }
         while let Some(raw) = reader.next_record()? {
+            if stopped {
+                // 停止点より後ろは適用しない。アーカイブのセグメントの停止位置以前のレコードは、適用済みの
+                // 内容と照合する。残りは全体チェックサムのために読み切るだけ。
+                if seg.overlap_ok {
+                    let h = peek_record(&raw, max_payload)
+                        .map_err(map_decode)
+                        .map_err(IncrementalError::from)?;
+                    if h.lsn <= current {
+                        check_overlap(&db, batch.as_ref(), &raw, &h, &info.header)?;
+                    }
+                }
+                continue;
+            }
+            if seg.overlap_ok {
+                let h = peek_record(&raw, max_payload)
+                    .map_err(map_decode)
+                    .map_err(IncrementalError::from)?;
+                if h.lsn <= current {
+                    // 適用済みの LSN と重なる区間。内容が食い違う（分岐した履歴の混在）なら拒否する。
+                    check_overlap(&db, batch.as_ref(), &raw, &h, &info.header)?;
+                    continue;
+                }
+            }
             let rec = decode_record(&raw, max_payload)
                 .map_err(map_decode)
                 .map_err(IncrementalError::from)?;
@@ -523,6 +620,9 @@ pub fn apply_incremental_segments(db_path: &Path, segments: &[PathBuf]) -> Resul
                     b.txn.commit()?;
                 }
             }
+            if stop_lsn == Some(h.lsn) {
+                stopped = true;
+            }
         }
         // 検証時と同じ全体チェックサム（再生中に中身が変わっていない）。
         if reader.finish()? != info.trailer {
@@ -532,19 +632,70 @@ pub fn apply_incremental_segments(db_path: &Path, segments: &[PathBuf]) -> Resul
     if let Some(b) = batch.take() {
         b.txn.commit()?;
     }
+    let expected_last = match stop_lsn {
+        Some(stop) if stopped => stop,
+        Some(_) => return Err(IncrementalError::TargetOutOfRange),
+        None => list_last,
+    };
     // 空の commit を Immediate で 1 回行い、それまでの内容を fsync で確定させる。
     db.begin_write()?.commit()?;
 
-    // 4. 世代が末尾に届いていること（レコードが世代の表を含まない・欠けた場合の fail-closed）。
+    // 3. 世代が停止点（または末尾）に届いていること（レコードが世代の表を含まない・欠けた場合の fail-closed）。
     let read = db.begin_read()?;
-    if crate::storage::current_generation_in_txn(&read)? != last_lsn || current != last_lsn {
+    if crate::storage::current_generation_in_txn(&read)? != expected_last
+        || current != expected_last
+    {
         return Err(IncrementalError::ChainBroken);
     }
     Ok(ApplySummary {
-        segments: segments.len() as u64,
+        segments: opened,
         records,
-        last_lsn,
+        last_lsn: expected_last,
     })
+}
+
+/// 適用済みの LSN と重なるアーカイブのレコード `raw`（ヘッダ `h`）が、適用先に既にある内容と一致することを
+/// 確かめる。適用先の `change_log` 表（書き込み中のバッチ、無ければコミット済みの状態）の同じ LSN の行と
+/// バイト列で照合し、不一致は `ChainBroken`。行が無い（刈り込み済みなど）場合は照合の基準がないので、
+/// ヘッダの DB 識別子・timeline・ストレージ形式と `prev_lsn == lsn - 1` だけを確かめる。
+fn check_overlap(
+    db: &redb::Database,
+    batch: Option<&Batch>,
+    raw: &[u8],
+    h: &super::RecordHeader,
+    seg: &SegmentHeader,
+) -> Result<()> {
+    let logged: Option<Vec<u8>> = match batch {
+        Some(b) => {
+            // 許可（clippy::disallowed_methods）: 本体表は記録範囲の例外（D3）で、読み取りだけ。
+            #[allow(clippy::disallowed_methods)]
+            let t = b.txn.open_table(CHANGE_LOG_TABLE)?;
+            let row = t.get(h.lsn)?.map(|v| v.value().to_vec());
+            row
+        }
+        None => {
+            let read = db.begin_read()?;
+            match read.open_table(CHANGE_LOG_TABLE) {
+                Ok(t) => t.get(h.lsn)?.map(|v| v.value().to_vec()),
+                Err(redb::TableError::TableDoesNotExist(_)) => None,
+                Err(e) => return Err(e.into()),
+            }
+        }
+    };
+    match logged {
+        Some(row) if row == raw => Ok(()),
+        Some(_) => Err(IncrementalError::ChainBroken),
+        None => {
+            if h.db_id != seg.db_id
+                || h.timeline != seg.timeline
+                || h.storage_format != STORAGE_FORMAT_VERSION
+                || h.lsn.checked_sub(1) != Some(h.prev_lsn)
+            {
+                return Err(IncrementalError::ChainBroken);
+            }
+            Ok(())
+        }
+    }
 }
 
 /// レコード本体を writer へ適用する（`dropped` の削除 → `created` の作成 → `tables` の反映。参照実装は

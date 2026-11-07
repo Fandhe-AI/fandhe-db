@@ -65,6 +65,7 @@ pub(crate) mod incremental;
 pub(crate) mod oracle;
 #[cfg(test)]
 mod oracle_tests;
+pub(crate) mod pitr;
 
 use super::table_image::{self, AfterImage, Meter, ReadMode, ReadOutcome};
 use super::{Result, StorageError, GENERATION_KEY, GENERATION_TABLE};

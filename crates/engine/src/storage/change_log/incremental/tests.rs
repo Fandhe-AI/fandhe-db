@@ -699,3 +699,45 @@ fn read_only_export_of_a_stopped_database_matches_the_live_export() {
         std::fs::read(&live).expect("read")
     );
 }
+
+/// 増分（`overlap_ok` でない経路）の先頭が、適用済みの区間に重なる場合は拒否する。読み飛ばしも
+/// 黙った受け入れも再適用もしない(PITR のアーカイブだけが重なりを許し、内容を照合する)。
+#[test]
+fn apply_rejects_an_increment_that_overlaps_the_applied_range() {
+    let fx = Fixture::new("inc-apply-overlap");
+    fx.write_round_1();
+    let (base, point) = fx.full_backup("base.redb");
+    fx.write_round_2();
+    let inc1 = fx.increment(&point, "inc1.seg");
+    let p1 = chain_point_of(&inc1).expect("p1");
+    fx.write_round_3();
+    let inc2 = fx.increment(&p1, "inc2.seg");
+    // ベースの直後から最新までを 1 つにした増分（inc1 の範囲を含む）。
+    let whole = fx.increment(&point, "whole.seg");
+
+    let work = TempDir::new("inc-apply-overlap-work");
+    let restored = copy_to(&base, &work, "restored.redb");
+    apply_incremental_segments(&restored, std::slice::from_ref(&inc1)).expect("apply inc1");
+    let after_inc1 = chain_point_of(&restored).expect("point");
+    let model = dump_db(&redb::Database::open(&restored).expect("open"));
+
+    // 同じ増分の再適用(先頭が適用済み)、適用済みの区間を含む増分、それらと続きの組み合わせ。
+    for segs in [
+        vec![inc1.clone()],
+        vec![whole.clone()],
+        vec![inc1.clone(), inc2.clone()],
+    ] {
+        assert!(matches!(
+            apply_incremental_segments(&restored, &segs),
+            Err(IncrementalError::ChainBroken)
+        ));
+    }
+    // 拒否は何も反映しない(世代も内容も変わらない)。
+    assert_eq!(chain_point_of(&restored).expect("point"), after_inc1);
+    let got = dump_db(&redb::Database::open(&restored).expect("open"));
+    assert_eq!(oracle::diff_models(&model, &got), None);
+    assert_eq!(oracle::diff_models(&got, &model), None);
+    // 正しい続きは通る。
+    apply_incremental_segments(&restored, &[inc2]).expect("apply inc2");
+    assert_matches_latest(&fx, &restored);
+}
