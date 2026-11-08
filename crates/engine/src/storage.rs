@@ -33,6 +33,7 @@ const REPLICA_FUNCTION_EPOCH_KEY: &str = "\u{0}replica-epoch";
 pub(crate) mod change_log;
 pub(crate) mod commit_log;
 pub mod integrity;
+mod panic_boundary;
 /// 電源断シミュレーション用 `redb::StorageBackend` の共通モデル（TASK-145）。
 /// 本クレートのユニットテスト（本モジュール下部の `tests::power_loss`）と
 /// `crates/engine/tests/power_loss.rs` 統合テストの双方から `#[path]` 経由で
@@ -912,7 +913,16 @@ impl Storage {
         path: impl AsRef<Path>,
         durability: WriteDurability,
     ) -> Result<Self> {
-        let db = redb::Database::create(path)?;
+        // 壊れたアロケータ状態表などで redb 内部が panic しても、プロセスを落とさず拒否する（Issue #3101）。
+        // 一時表用の `open_with_backend`（インメモリ）は永続ファイルを読まないため対象外。
+        let path = path.as_ref();
+        let db = panic_boundary::catch_backend_panic(|| redb::Database::create(path)).ok_or_else(
+            || {
+                StorageError::Backend(redb::Error::Corrupted(
+                    "database file is corrupted: internal check failed while opening".to_owned(),
+                ))
+            },
+        )??;
         let mut storage = Self::from_db(db, durability);
         // 変更ログを一度でも有効にした DB は、有効にしない起動からの書き込みを拒否する（D8）。読み取りと
         // バックアップの書き出しは影響を受けない。
