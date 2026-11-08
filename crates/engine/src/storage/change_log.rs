@@ -62,6 +62,7 @@ use redb::{
 
 pub(crate) mod archive;
 pub(crate) mod backlog;
+pub(crate) mod disable;
 pub(crate) mod incremental;
 #[cfg(any(test, feature = "change-log-oracle"))]
 pub(crate) mod oracle;
