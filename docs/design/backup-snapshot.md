@@ -104,6 +104,7 @@ engine の表は `TableDefinition<` を含む定義が約 65 行（テスト除�
 
 ## 9. 残課題
 
+- 増分バックアップ（#3098）は同じソケットで `incremental <db_id hex> <timeline> <end_lsn> <出力先>` の要求形式を追加し、フルの要求は変えない（[change-log-pitr.md](change-log-pitr.md) の D7）
 - 運用者専用経路 (ii) の方式は #2152 で確定した: opt-in の `--backup-socket` による Unix ドメインソケット。認可はファイルシステム権限（親ディレクトリ 0700 相当・ソケット 0600）、プロトコルは出力先 1 行の要求と結果コード 1 行の応答（README の `backup` の節）
 - `--users` ファイルは #2152 で対象外とした（README の `backup` の節に明記）
 - `--users` ファイルの扱い（#2151・#2152）
