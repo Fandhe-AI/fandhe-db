@@ -350,6 +350,43 @@ fn verify_rejects_invalid_arguments_and_paths() {
     assert_eq!(code(&o), Some(1), "stderr: {}", stderr(&o));
 }
 
+/// Issue #3094（RECOVER-13・RECOVER-14）: restore は復元先の親に残った自分の一時名の残骸だけを掃除し、
+/// 形式に一致しないもの・権限が想定外のものには触れない。報告は stderr で、終了コードは変わらない。
+#[test]
+fn restore_sweeps_stale_restore_temp_names_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let fx = common::TempFixtureDir::new("restore-sweep");
+    let (_users, db) = populate(&fx);
+    let dir = parent_of(&db).to_path_buf();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod dir");
+    let snap = dir.join("snap.redb");
+    let snap_s = snap.to_str().expect("utf-8 path").to_string();
+    let o = backup(&db, &snap_s);
+    assert_eq!(code(&o), Some(0), "stderr: {}", stderr(&o));
+
+    let stale = ".fandhe-restore-4242-7.tmp";
+    let wide = ".fandhe-restore-4242-8.tmp";
+    let decoy = ".fandhe-restore-decoy.tmp";
+    for (name, mode) in [(stale, 0o600), (wide, 0o644), (decoy, 0o600)] {
+        let p = dir.join(name);
+        std::fs::write(&p, b"x").expect("write");
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).expect("chmod");
+    }
+    let restored = dir.join("restored.redb");
+    let restored_s = restored.to_str().expect("utf-8 path").to_string();
+    let o = restore(&snap_s, &restored_s);
+    assert_eq!(code(&o), Some(0), "stderr: {}", stderr(&o));
+    let err = stderr(&o);
+    assert!(
+        err.contains("removed 1 stale temporary file(s)") && err.contains(stale),
+        "{err}"
+    );
+    assert!(err.contains("left 1 file(s)"), "{err}");
+    assert!(!dir.join(stale).exists());
+    assert!(dir.join(wide).exists() && dir.join(decoy).exists());
+    assert!(restored.exists());
+}
+
 /// 復元の正常系: 元のバックアップは不変、復元先から別のサーバーが起動してデータを読める。
 /// 既存の復元先（ファイル・ディレクトリ・リンク）は書かずに 2 で拒否する。
 #[test]

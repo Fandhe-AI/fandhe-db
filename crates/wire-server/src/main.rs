@@ -3867,6 +3867,25 @@ fn run_server(args: &[String]) -> ExitCode {
     // Issue #2167: 変更ログのアーカイブ常駐スレッド（`--change-log-archive-dir` 指定時だけ）。起動直後に
     // 1 回、以降は周期的に engine の `archive_change_log` を呼ぶ。スレッドを作れなければ起動を拒否する。
     if let Some(settings) = change_log_archive.as_ref() {
+        // Issue #3094: スレッドを動かす前（自分の一時名がまだ無い）に、前回の異常終了が残した一時名を
+        // 掃除する。失敗・見送りでも起動は止めない（共有ディレクトリは直後の周期が既存どおり拒否する）。
+        match engine::storage::sweep_change_log_archive_temps(&settings.dir) {
+            Ok(s) => {
+                for line in wire_server::change_log_archive::stale_temp_report_lines(
+                    "change log archive",
+                    &settings.dir,
+                    &s,
+                ) {
+                    engine::log_stderr!("{line}");
+                }
+            }
+            Err(_) => {
+                engine::log_stderr!(
+                    "wire-server: change log archive: stale temporary file sweep failed for {}",
+                    settings.dir.display()
+                );
+            }
+        }
         if wire_server::change_log_archive::spawn(Arc::clone(&core), settings).is_err() {
             engine::log_stderr!("wire-server: failed to start the change log archive thread");
             return ExitCode::FAILURE;
@@ -4650,6 +4669,13 @@ fn run_restore(args: &[String]) -> ExitCode {
             return ExitCode::from(backup_opt::EXIT_USAGE);
         }
     };
+    // Issue #3094: 前回の異常終了が復元先の親に残した一時名を、自分の一時コピーを作る前に掃除する。
+    // 掃除の失敗・見送りで復元は失敗させない（終了コードの意味は変えない）。
+    if let Some((dir, s)) = restore_opt::sweep_stale_restore_temps(&parsed.db) {
+        for line in wire_server::change_log_archive::stale_temp_report_lines("restore", &dir, &s) {
+            engine::log_stderr!("{line}");
+        }
+    }
     let mut leftover = None;
     let result = restore_opt::restore_with_args(&parsed, &mut leftover);
     if matches!(

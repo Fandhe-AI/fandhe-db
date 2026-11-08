@@ -307,6 +307,48 @@ fn recover14_archive_thread_writes_segments_and_verify_detects_loss_and_tamperin
     assert_eq!(ok.status.code(), Some(0), "{}", stderr(&ok));
 }
 
+/// Issue #3094（RECOVER-13・RECOVER-14）: 起動時に、前回の異常終了が残した一時名だけが消え、形式に
+/// 一致しないもの・権限が想定外のものは残る。消した名前と件数は stderr に出る。
+#[test]
+fn recover14_startup_sweeps_stale_archive_temp_names_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let fx = common::TempFixtureDir::new("cl-arc-sweep");
+    let users = fx.users_path_str();
+    let db = fx.db_path_str();
+    write_user_store_with_alice(&users);
+    let arc = PathBuf::from(db.clone() + ".arc");
+    make_archive_dir(&arc);
+    let stale = ".fandhe-seg-4242-0123456789abcdef-7.tmp";
+    let wide = ".fandhe-seg-4242-0123456789abcdef-8.tmp";
+    let decoy = ".fandhe-seg-decoy.tmp";
+    let unrelated = "notes.txt";
+    for (name, mode) in [
+        (stale, 0o600),
+        (wide, 0o644),
+        (decoy, 0o600),
+        (unrelated, 0o600),
+    ] {
+        let p = arc.join(name);
+        std::fs::write(&p, b"x").expect("write");
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).expect("chmod");
+    }
+    let arc_s = arc.to_str().expect("utf-8").to_string();
+    let flags = ["--change-log", "--change-log-archive-dir", &arc_s];
+    let mut server = spawn_server(&users, &db, &flags);
+    let (_addr, lines) =
+        common::wait_for_listening_addr_and_lines(&mut server.0, Duration::from_secs(10));
+    let joined = lines.join("\n");
+    assert!(
+        joined.contains("removed 1 stale temporary file(s)") && joined.contains(stale),
+        "{joined}"
+    );
+    assert!(joined.contains("left 1 file(s)"), "{joined}");
+    assert!(!arc.join(stale).exists());
+    for kept in [wide, decoy, unrelated] {
+        assert!(arc.join(kept).exists(), "{kept} must stay");
+    }
+}
+
 /// 検証サブコマンドの引数の不備は終了コード 2（DB は開かない）。
 #[test]
 fn recover14_verify_subcommand_rejects_bad_arguments() {

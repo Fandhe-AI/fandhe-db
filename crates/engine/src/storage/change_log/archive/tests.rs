@@ -954,6 +954,94 @@ fn many_stale_temp_files_of_the_same_pid_do_not_block_publishing() {
 }
 
 #[test]
+fn generated_temp_names_match_the_strict_format() {
+    for _ in 0..16 {
+        assert!(is_segment_temp_name(&tmp_name()));
+    }
+    for bad in [
+        ".fandhe-seg-1-abc.tmp",
+        ".fandhe-seg-1-0123456789ABCDEF-1.tmp",
+        ".fandhe-seg-1-0123456789abcdef-1.tmp.bak",
+        ".fandhe-seg-1-0123456789abcdef-1-2.tmp",
+        ".fandhe-seg-1-0123456789abcdef-.tmp",
+        ".fandhe-seg--0123456789abcdef-1.tmp",
+        ".fandhe-seg-12345678901-0123456789abcdef-1.tmp",
+        "fandhe-seg-1-0123456789abcdef-1.tmp",
+        "fandhe-cl-0123456789abcdef.seg",
+        // nonce の無い旧形式は対象外。
+        ".fandhe-seg-1-2.tmp",
+    ] {
+        assert!(!is_segment_temp_name(bad), "{bad}");
+    }
+}
+
+#[test]
+fn sweep_removes_only_stale_temp_names_in_the_archive_dir() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new("arc-sweep");
+    f.populate(1);
+    f.storage().archive_change_log(&f.opts()).expect("archive");
+    let dir = f.archive.path();
+    let stale = tmp_name();
+    std::fs::write(dir.join(&stale), b"stale").expect("stale");
+    std::fs::set_permissions(dir.join(&stale), std::fs::Permissions::from_mode(0o600))
+        .expect("chmod");
+    let decoy = ".fandhe-seg-decoy.tmp";
+    std::fs::write(dir.join(decoy), b"decoy").expect("decoy");
+    let legacy = format!("{TMP_PREFIX}{}-7.tmp", std::process::id());
+    std::fs::write(dir.join(&legacy), b"legacy").expect("legacy");
+    let wide = tmp_name();
+    std::fs::write(dir.join(&wide), b"wide").expect("wide");
+    std::fs::set_permissions(dir.join(&wide), std::fs::Permissions::from_mode(0o644))
+        .expect("chmod");
+
+    let s = sweep_change_log_archive_temps(dir).expect("sweep");
+    assert_eq!((s.removed, s.skipped, s.failed), (1, 1, 0));
+    assert_eq!(s.removed_names, vec![stale.clone()]);
+    assert!(!dir.join(&stale).exists());
+    assert!(dir.join(decoy).exists() && dir.join(&legacy).exists() && dir.join(&wide).exists());
+    // 公開済みのセグメントは検証を通り続ける。
+    assert!(f
+        .storage()
+        .verify_change_log_archive(f.archive.path())
+        .is_ok());
+}
+
+#[test]
+fn sweep_is_skipped_while_a_publisher_holds_the_dir_lock() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new("arc-sweep-lock");
+    let dir = f.archive.path();
+    let stale = tmp_name();
+    std::fs::write(dir.join(&stale), b"stale").expect("stale");
+    std::fs::set_permissions(dir.join(&stale), std::fs::Permissions::from_mode(0o600))
+        .expect("chmod");
+    let guard = crate::storage::TempDirLock::shared(dir).expect("lock");
+    let s = sweep_change_log_archive_temps(dir).expect("sweep");
+    assert_eq!(s.outcome, crate::storage::SweepOutcome::InUse);
+    assert!(dir.join(&stale).exists());
+    drop(guard);
+    let s = sweep_change_log_archive_temps(dir).expect("sweep");
+    assert_eq!(s.removed, 1);
+}
+
+#[test]
+fn sweep_rejects_missing_or_shared_directory() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new("arc-sweep-bad");
+    assert!(matches!(
+        sweep_change_log_archive_temps(f.archive.path().join("missing")),
+        Err(ArchiveError::InvalidDirectory)
+    ));
+    let shared = TempDir::new("arc-sweep-shared");
+    std::fs::set_permissions(shared.path(), std::fs::Permissions::from_mode(0o777)).expect("chmod");
+    assert!(matches!(
+        sweep_change_log_archive_temps(shared.path()),
+        Err(ArchiveError::InsecureDirectory)
+    ));
+}
+
+#[test]
 fn adopting_a_segment_syncs_before_the_watermark_moves() {
     // 採用経路は fsync に成功してから水位を進める。ファイルが読めなくなっていれば水位は進まない。
     let f = Fixture::new("arc-adopt-sync");

@@ -138,9 +138,115 @@ pub fn spawn(core: Arc<EngineCore>, settings: &ArchiveSettings) -> std::io::Resu
         .map(|_| ())
 }
 
+/// 一時名の残骸の掃除結果（Issue #3094・RECOVER-13・RECOVER-14 のポインタ）を運用者向けの stderr 行にする。
+/// `label` は `change log archive` や `restore` のような出所。`main.rs::run_server`（アーカイブのスレッドを
+/// 起動する前）と `run_restore` が呼ぶ。名前は pid・nonce・通番だけで、テナントのデータ・LSN を含まない。
+/// 何も起きなかった（消さず・残さず・失敗もなし）ときは空。
+pub fn stale_temp_report_lines(
+    label: &str,
+    dir: &std::path::Path,
+    s: &engine::storage::StaleTempSweep,
+) -> Vec<String> {
+    use engine::storage::SweepOutcome;
+    let mut out = Vec::new();
+    let skipped_why = match s.outcome {
+        SweepOutcome::Swept => None,
+        SweepOutcome::InUse => Some("another writer is using the directory"),
+        SweepOutcome::SharedDirectory => Some("the directory is writable by group or others"),
+        SweepOutcome::LockUnavailable => Some("the directory cannot be locked"),
+        SweepOutcome::OwnerUnknown => Some("the owner could not be determined"),
+        SweepOutcome::Unsupported => None,
+    };
+    if let Some(why) = skipped_why {
+        out.push(format!(
+            "wire-server: {label}: stale temporary file sweep skipped for {}: {why}",
+            dir.display()
+        ));
+        return out;
+    }
+    if s.removed > 0 {
+        let shown = s.removed_names.len();
+        let more = s.removed.saturating_sub(shown);
+        let mut line = format!(
+            "wire-server: {label}: removed {} stale temporary file(s) from {}: {}",
+            s.removed,
+            dir.display(),
+            s.removed_names.join(", ")
+        );
+        if more > 0 {
+            line.push_str(&format!(" and {more} more"));
+        }
+        out.push(line);
+    }
+    if s.skipped > 0 {
+        out.push(format!(
+            "wire-server: {label}: left {} file(s) in {} that match the temporary name pattern \
+             but have an unexpected type, owner or mode",
+            s.skipped,
+            dir.display()
+        ));
+    }
+    if s.failed > 0 {
+        out.push(format!(
+            "wire-server: {label}: failed to remove {} stale temporary file(s) in {}",
+            s.failed,
+            dir.display()
+        ));
+    }
+    if s.truncated {
+        out.push(format!(
+            "wire-server: {label}: stale temporary file sweep of {} stopped at the entry limit",
+            dir.display()
+        ));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sweep(outcome: engine::storage::SweepOutcome) -> engine::storage::StaleTempSweep {
+        engine::storage::StaleTempSweep {
+            outcome,
+            removed: 0,
+            skipped: 0,
+            failed: 0,
+            removed_names: Vec::new(),
+            truncated: false,
+        }
+    }
+
+    #[test]
+    fn stale_temp_report_is_empty_when_nothing_happened() {
+        let s = sweep(engine::storage::SweepOutcome::Swept);
+        assert!(stale_temp_report_lines("x", std::path::Path::new("/d"), &s).is_empty());
+    }
+
+    #[test]
+    fn stale_temp_report_lists_names_counts_and_skips() {
+        let mut s = sweep(engine::storage::SweepOutcome::Swept);
+        s.removed = 3;
+        s.removed_names = vec!["a".into(), "b".into()];
+        s.skipped = 2;
+        s.failed = 1;
+        let lines = stale_temp_report_lines("restore", std::path::Path::new("/d"), &s);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(
+            lines[0],
+            "wire-server: restore: removed 3 stale temporary file(s) from /d: a, b and 1 more"
+        );
+        assert!(lines[1].contains("left 2 file(s)"));
+        assert!(lines[2].contains("failed to remove 1"));
+    }
+
+    #[test]
+    fn stale_temp_report_says_when_the_sweep_was_skipped() {
+        let s = sweep(engine::storage::SweepOutcome::InUse);
+        let lines = stale_temp_report_lines("x", std::path::Path::new("/d"), &s);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("skipped"));
+    }
 
     #[test]
     fn limit_messages_carry_no_variable_content() {

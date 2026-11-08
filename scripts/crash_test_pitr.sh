@@ -288,6 +288,12 @@ count_tmp() {
   find "$1" -maxdepth 1 -name "$2" | wc -l
 }
 
+# ディレクトリ直下の restore の一時名（厳密な形式。decoy は数えない）の個数。
+count_restore_tmp() {
+  find "$1" -maxdepth 1 -type f -regextype posix-extended \
+    -regex '.*/\.fandhe-restore-[0-9]+-[0-9]+\.tmp' | wc -l
+}
+
 # ディレクトリ直下のファイルの「名前・サイズ・更新時刻」の一覧（入力が変わっていないことの比較用）。
 dir_fingerprint() {
   find "$1" -maxdepth 1 -type f -printf '%f %s %T@\n' | sort
@@ -599,11 +605,15 @@ restore_hits=0
 restore_completed=0
 restore_residue=0
 RST_INTERRUPTED=""
+# 形式に一致しない名前は掃除されない（Issue #3094 の受入基準）。
+# 掃除は他者が書けるディレクトリでは見送るため、umask に依らず 0755 にする。
+chmod 755 "${RSTK_DIR}"
+printf 'decoy' >"${RSTK_DIR}/.fandhe-restore-decoy.tmp"
+chmod 600 "${RSTK_DIR}/.fandhe-restore-decoy.tmp"
 i=0
 while should_continue "${i}" "${restore_hits}"; do
   i=$((i + 1))
   out="${RSTK_DIR}/rst-${i}.redb"
-  tmp_before="$(count_tmp "${RSTK_DIR}" '.fandhe-restore-*.tmp')"
   "${BIN}" restore --from "${BASE}" --db "${out}" --change-log-archive-dir "${ARCH}" \
     --until-lsn "${PT_LSN[LAST]}" >/dev/null 2>&1 &
   job_pid=$!
@@ -614,7 +624,7 @@ while should_continue "${i}" "${restore_hits}"; do
   job_pid=""
   if [ "${status}" -eq 137 ]; then
     restore_killed=$((restore_killed + 1))
-    if [ ! -e "${out}" ] && [ "$(count_tmp "${RSTK_DIR}" '.fandhe-restore-*.tmp')" -gt "${tmp_before}" ]; then
+    if [ ! -e "${out}" ] && [ "$(count_restore_tmp "${RSTK_DIR}")" -ge 1 ]; then
       restore_hits=$((restore_hits + 1))
       [ -n "${RST_INTERRUPTED}" ] || RST_INTERRUPTED="${out}"
     fi
@@ -628,9 +638,10 @@ while should_continue "${i}" "${restore_hits}"; do
     expect_verify_ok "${out}" "PITR restore output of iteration ${i}" "${LAST_RESTORED_ROWS}"
   fi
   check_residue "${RSTK_DIR}" "rst-"
-  # 一時名の残骸は運用者が手動で消す前提。共有の一時領域を圧迫しないよう、検査後に消して個数だけ数える。
-  restore_residue=$((restore_residue + $(count_tmp "${RSTK_DIR}" '.fandhe-restore-*.tmp')))
-  find "${RSTK_DIR}" -maxdepth 1 -name '.fandhe-restore-*.tmp' -delete
+  # 一時名の残骸は次の restore が自動で掃除する（Issue #3094）。反復をまたいで残るのは高々 1 件で、decoy は触られない。
+  restore_residue=$((restore_residue + $(count_restore_tmp "${RSTK_DIR}")))
+  [ "$(count_restore_tmp "${RSTK_DIR}")" -le 1 ] || fail "more than one stale restore temp name remains after iteration ${i}"
+  [ -f "${RSTK_DIR}/.fandhe-restore-decoy.tmp" ] || fail "decoy temp name was removed by restore iteration ${i}"
   # 入力（ベース・アーカイブ）は読み取りだけで変わらない。
   [ "$(dir_fingerprint "${ARCH}")" = "${ARCH_FP_BEFORE}" ] || fail "the archive changed during restore iteration ${i}"
   [ "$(dir_fingerprint "${BAK_DIR}")" = "${BASE_FP_BEFORE}" ] || fail "the base directory changed during restore iteration ${i}"
@@ -642,7 +653,7 @@ fi
 if [ "${restore_hits}" -lt 1 ] || [ -z "${RST_INTERRUPTED}" ]; then
   fail "no PITR restore was killed after starting and before publishing (test is vacuous)"
 fi
-echo "restore temp residue files (checked and removed per iteration): ${restore_residue}"
+echo "restore temp residue files seen after kills (swept by the next restore): ${restore_residue}"
 
 # 中断されて最終名が無かった復元先と同じパスへ取り直せ、検査点と一致する。
 [ ! -e "${RST_INTERRUPTED}" ] || fail "interrupted restore target unexpectedly exists: ${RST_INTERRUPTED}"
@@ -650,6 +661,9 @@ restore_to "${RST_INTERRUPTED}" --change-log-archive-dir "${ARCH}" --until-lsn "
 [ "${RESTORE_RC}" -eq 0 ] || restore_fail "restore retry to the interrupted target exit ${RESTORE_RC}"
 expect_state "${RST_INTERRUPTED}" "restore retry to the interrupted target" \
   "${PT_COUNT[LAST]}" "${PT_MAXID[LAST]}"
+# 完走した restore のあとは、SIGKILL の残骸が自動で掃除されて 0 件になり、decoy だけが残る。
+[ "$(count_restore_tmp "${RSTK_DIR}")" -eq 0 ] || fail "stale restore temp names were not swept by the next restore"
+[ -f "${RSTK_DIR}/.fandhe-restore-decoy.tmp" ] || fail "decoy temp name was removed by restore"
 
 # ---------------------------------------------------------------------------
 # 6. ログの欠落・改ざんの拒否

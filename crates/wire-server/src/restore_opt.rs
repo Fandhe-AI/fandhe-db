@@ -9,6 +9,8 @@
 //!
 //! # 公開手順（fail-closed。`export_snapshot` の公開手順にそろえる）
 //!
+//! 0. 前回の異常終了が残した一時名を掃除する（[`sweep_stale_restore_temps`]。Issue #3094。形式に厳密一致し、
+//!    通常ファイル・0600 系・自分の所有・使用中でないものだけ。一時名を作る間は親ディレクトリへ共有 lock を持つ）
 //! 1. `--from` を読み取りで開き共有ロックを試みる（稼働中の DB を誤ってコピーしない。取れなければ拒否）
 //! 2. 出力先と同じディレクトリの一時名（`.fandhe-restore-<pid>-<seq>.tmp`）へ `create_new`・0600 で
 //!    コピーし、サイズ一致を確かめて fsync する。元のバックアップには一切書かない
@@ -464,6 +466,25 @@ pub fn restore_with_pitr(
     Err(RestoreError::Unsupported)
 }
 
+/// 前回の異常終了が `dest` の親ディレクトリに残した復元の一時名を掃除する（Issue #3094・RECOVER-13・
+/// RECOVER-14 のポインタ）。`main.rs::run_restore` が [`restore_with_args`] の前に呼ぶ。消す条件は engine の
+/// `storage::stale_temp`（形式に厳密一致・通常ファイル・0600 系・自分の所有・使用中でない）。宛先が既に在る・
+/// 親が不正なときは `None`。結果は報告のためだけで、復元の成否には影響させない。
+#[cfg(unix)]
+pub fn sweep_stale_restore_temps(
+    dest: &Path,
+) -> Option<(PathBuf, engine::storage::StaleTempSweep)> {
+    unix_impl::sweep_stale_restore_temps(dest)
+}
+
+/// 非 unix では掃除しない。
+#[cfg(not(unix))]
+pub fn sweep_stale_restore_temps(
+    _dest: &Path,
+) -> Option<(PathBuf, engine::storage::StaleTempSweep)> {
+    None
+}
+
 /// バックアップ `from` を新しい DB `dest` へ復元する（モジュール doc の公開手順）。
 /// 公開しなかった経路で一時コピーを消せなかったときは、残ったパスを `leftover` に入れる
 /// （全テナントのデータのコピーが残るため、呼び出し元が通知する）。
@@ -637,6 +658,9 @@ mod unix_impl {
         dev: u64,
         ino: u64,
         pub(super) armed: bool,
+        /// 親ディレクトリの共有 lock（Issue #3094。掃除が使用中の一時名を消さないための相互排他）。
+        /// フィールドは `Drop::drop`（一時名の unlink）の後に drop されるため、lock は unlink の後まで残る。
+        _dir_lock: Option<engine::storage::TempDirLock>,
     }
 
     impl Drop for TempCopy {
@@ -650,6 +674,7 @@ mod unix_impl {
     impl TempCopy {
         /// `parent` に所有者のみ読み書きの一時ファイルを排他的に作る。
         pub(super) fn create(parent: &Path, prefix: &str) -> Result<Self, RestoreError> {
+            let dir_lock = engine::storage::TempDirLock::shared(parent);
             let mut attempts = 0u32;
             loop {
                 let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -669,6 +694,7 @@ mod unix_impl {
                             dev: m.dev(),
                             ino: m.ino(),
                             armed: true,
+                            _dir_lock: dir_lock,
                         });
                     }
                     Err(e) if e.kind() == ErrorKind::AlreadyExists && attempts < 8 => {
@@ -801,6 +827,34 @@ mod unix_impl {
             g.record(h, next)?;
         }
         Ok(gs)
+    }
+
+    /// `.fandhe-restore-<pid>-<seq>.tmp`（`TempCopy::create` が `fandhe-restore` で作る名前）の厳密な判定。
+    pub(super) fn is_restore_temp_name(name: &str) -> bool {
+        let dec = |s: &str, max: usize| {
+            !s.is_empty() && s.len() <= max && s.bytes().all(|b| b.is_ascii_digit())
+        };
+        name.strip_prefix(".fandhe-restore-")
+            .and_then(|r| r.strip_suffix(".tmp"))
+            .and_then(|r| r.split_once('-'))
+            .is_some_and(|(pid, seq)| dec(pid, 10) && dec(seq, 20))
+    }
+
+    /// `dest` の親ディレクトリに残った復元の一時名を掃除する（Issue #3094）。宛先が既に在る・親が
+    /// 不正なときは何もしない。掃除できなかった場合も復元は続ける（呼び出し元が結果だけ報告する）。
+    pub(super) fn sweep_stale_restore_temps(
+        dest: &Path,
+    ) -> Option<(PathBuf, engine::storage::StaleTempSweep)> {
+        let parent = parent_of(dest).ok()?;
+        if std::fs::symlink_metadata(dest).is_ok() {
+            return None;
+        }
+        let probe = |_: u64| {
+            let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+            format!(".fandhe-restore-{}-{seq}.tmp", std::process::id())
+        };
+        let s = engine::storage::sweep_stale_temps(parent, is_restore_temp_name, &probe).ok()?;
+        Some((parent.to_path_buf(), s))
     }
 
     fn parent_of(path: &Path) -> Result<&Path, RestoreError> {
@@ -1297,6 +1351,35 @@ mod tests {
         assert!(!t.is_same_file_at(&linked));
         t.armed = false;
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_temp_names_are_matched_strictly() {
+        let dir = std::env::temp_dir().join(format!("restore-opt-name-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let mut t = unix_impl::TempCopy::create(&dir, "fandhe-restore").expect("create");
+        let name = t
+            .path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("name")
+            .to_string();
+        assert!(unix_impl::is_restore_temp_name(&name), "{name}");
+        t.armed = false;
+        let _ = std::fs::remove_dir_all(&dir);
+        for bad in [
+            ".fandhe-restore-decoy.tmp",
+            ".fandhe-restore-1-2.tmp.bak",
+            ".fandhe-restore-1-2-3.tmp",
+            ".fandhe-restore--2.tmp",
+            ".fandhe-restore-1-.tmp",
+            ".fandhe-verify-1-2.tmp",
+            "fandhe-restore-1-2.tmp",
+            ".fandhe-restore-12345678901-2.tmp",
+        ] {
+            assert!(!unix_impl::is_restore_temp_name(bad), "{bad}");
+        }
     }
 
     #[test]
