@@ -213,6 +213,44 @@ fn the_first_log_row_of_the_database_lowers_the_cutoff() {
     assert_eq!(plan.cutoff(), first + 1);
 }
 
+#[cfg(unix)]
+#[test]
+fn executing_a_plan_against_another_directory_is_rejected_without_deleting() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new("cl-other-dir");
+    let b = two_rounds(&f);
+    let plan = plan_archive_cleanup(f.archive.path(), &f.policy(vec![b])).expect("plan");
+    assert!(plan.segments() >= 1);
+    let before = f.lsns();
+    let other = f.archive.path().join("other");
+    std::fs::create_dir(&other).expect("mkdir");
+    std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    let err = execute_archive_cleanup(&other, &plan).expect_err("mismatched directory");
+    assert!(matches!(err, CleanupError::Replaced));
+    assert_eq!(f.lsns(), before);
+}
+
+#[test]
+fn a_failure_on_the_second_unlink_reports_one_removed() {
+    // 2 件目の削除の失敗で、1 件目の削除済みの件数が Partial に載ることを固定する。
+    // （fsync の失敗は実ファイルシステムで注入できないため、unlink 後に数える順序はコードで担保する。）
+    let f = Fixture::new("cl-count-after-unlink");
+    let b = two_rounds(&f);
+    let plan = plan_archive_cleanup(f.archive.path(), &f.policy(vec![b])).expect("plan");
+    assert!(plan.segments() >= 2);
+    let mut calls = 0;
+    let err = execute_with(f.archive.path(), &plan, |p| {
+        calls += 1;
+        if calls == 2 {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        } else {
+            std::fs::remove_file(p)
+        }
+    })
+    .expect_err("injected failure");
+    assert!(matches!(err, CleanupError::Partial { removed: 1 }));
+}
+
 #[test]
 fn a_failure_midway_leaves_a_contiguous_tail_and_a_rerun_converges() {
     let f = Fixture::new("cl-partial");

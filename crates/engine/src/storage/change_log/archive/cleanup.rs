@@ -398,7 +398,7 @@ pub fn execute_archive_cleanup(
 
 /// [`execute_archive_cleanup`] の本体。`remove` はテストが途中失敗を注入するために差し替える。
 /// 各ファイルを「再照合 → 削除 → ディレクトリ fsync」の順で処理し、最初のエラーで止める。
-/// 1 件以上消した後の失敗は [`CleanupError::Partial`]（先頭から消しているので残りは連続した区間）。
+/// 1 件以上消した後の失敗（削除の直後の fsync の失敗を含む）は [`CleanupError::Partial`]（先頭から消しているので残りは連続した区間）。
 fn execute_with(
     dir: &Path,
     plan: &CleanupPlan,
@@ -406,18 +406,24 @@ fn execute_with(
 ) -> Result<CleanupReport, CleanupError> {
     check_dir(dir)?;
     check_dir_not_shared(dir)?;
+    // 計画は別のディレクトリで作ったものかもしれない。実行先と全件の親が一致しないものは、
+    // 別ディレクトリの権限確認・fsync のまま計画のファイルを消してしまうため、1 件も消す前に拒否する。
+    if plan.victims.iter().any(|v| v.path.parent() != Some(dir)) {
+        return Err(CleanupError::Replaced);
+    }
     let mut removed = 0u64;
     for v in &plan.victims {
-        let step = (|| -> Result<(), CleanupError> {
-            recheck(plan, v)?;
-            remove(&v.path)?;
-            sync_dir(dir)?;
-            Ok(())
-        })();
-        match step {
-            Ok(()) => removed += 1,
+        let pre = recheck(plan, v).and_then(|()| remove(&v.path).map_err(CleanupError::from));
+        match pre {
+            Ok(()) => {}
             Err(e) if removed == 0 => return Err(e),
             Err(_) => return Err(CleanupError::Partial { removed }),
+        }
+        // unlink に成功した時点で件数へ数える。以降の fsync の失敗は、消えたファイルの永続化に
+        // 失敗しただけなので、1 件目でも Partial（実際に消えた件数つき）で報告する。
+        removed += 1;
+        if sync_dir(dir).is_err() {
+            return Err(CleanupError::Partial { removed });
         }
     }
     Ok(CleanupReport { removed })
