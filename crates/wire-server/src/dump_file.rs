@@ -517,8 +517,13 @@ fn parse_generation(v: &str) -> Option<u64> {
         return None;
     }
     let n: u64 = v.parse().ok()?;
-    i64::try_from(n).ok()?;
-    Some(n)
+    generation_in_range(n).then_some(n)
+}
+
+/// 世代番号が `bigint` 範囲（`i64::MAX` 以下）か。読み手（[`parse_generation`]）と書き手
+/// （[`FileWriter::begin`]）が同じ判定を使い、復元できないファイルを作らないようにする。
+fn generation_in_range(n: u64) -> bool {
+    i64::try_from(n).is_ok()
 }
 
 fn parts_token(p: DumpParts) -> &'static str {
@@ -544,6 +549,10 @@ pub struct FileWriter<W: Write> {
 impl<W: Write> FileWriter<W> {
     /// ヘッダを書いて書き手を作る。
     pub fn begin(mut out: W, header: &Header) -> Result<Self, FileError> {
+        // 読み手が拒否する値は、何も書く前に拒否する（復元できないファイルを作らない）。
+        if !generation_in_range(header.restore_generation) {
+            return Err(FileError::BadHeader);
+        }
         let scope = match &header.scope {
             DumpScope::Shared => "shared".to_string(),
             DumpScope::Tenant(t) => format!("tenant={t}"),
@@ -1013,6 +1022,25 @@ mod tests {
             let (_, back) = FileReader::open(&bytes[..]).expect("open");
             assert_eq!(back.restore_generation, g);
         }
+    }
+
+    #[test]
+    fn writer_rejects_a_generation_beyond_bigint_and_writes_nothing() {
+        let h = Header {
+            restore_generation: i64::MAX as u64 + 1,
+            ..header()
+        };
+        let mut sink = Vec::new();
+        assert_eq!(
+            FileWriter::begin(&mut sink, &h).err(),
+            Some(FileError::BadHeader)
+        );
+        assert!(sink.is_empty());
+        let ok = Header {
+            restore_generation: i64::MAX as u64,
+            ..header()
+        };
+        assert!(FileWriter::begin(&mut sink, &ok).is_ok());
     }
 
     #[test]
