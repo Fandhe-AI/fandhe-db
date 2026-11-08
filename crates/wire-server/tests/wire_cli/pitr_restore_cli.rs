@@ -297,6 +297,80 @@ fn recover14_incrementals_and_archive_combine() {
     assert_eq!(row_ids(&dest), (1..=8).collect::<Vec<_>>());
 }
 
+/// 復元先の復元の世代番号を読む（復元後の DB を engine の公開 API で開く）。
+fn generation_of(path: &Path) -> u64 {
+    Storage::open(path)
+        .expect("open restored")
+        .restore_generation()
+        .expect("read restore generation")
+}
+
+/// RECOVER-17（Issue #2450）: PITR（LSN 指定・時刻指定・増分併用）の完了時にも復元の世代が進む。
+/// 物理の復元と共通の完了点（整合検査の後・公開の前）を通るため、ベース（世代 0）より大きく、
+/// 同じ元からの繰り返しでも前回より大きい。世代は復元先にだけ書かれ、入力は変わらない。
+#[test]
+fn recover17_pitr_restore_advances_the_generation_monotonically() {
+    let p = build("pitr-cli-generation", 1);
+    assert_eq!(generation_of(&p.base), 0, "a fresh backup starts at 0");
+    let base_bytes = std::fs::read(&p.base).expect("read base");
+    let lsn = (p.base_lsn + 3).to_string();
+
+    let mut previous = 0;
+    for i in 0..2 {
+        let dest = p.root.join(format!("gen-lsn-{i}.redb"));
+        let o = p.restore_archive(&dest, &["--until-lsn", &lsn]);
+        assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+        assert_no_leak(&o, &[s(&p.root)]);
+        assert_eq!(row_ids(&dest), (1..=6).collect::<Vec<_>>());
+        let generation = generation_of(&dest);
+        assert!(generation > previous, "{generation} must exceed {previous}");
+        previous = generation;
+        let o = run(&["verify", "--db", s(&dest)]);
+        assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    }
+
+    // 時刻指定でも進む。
+    let times: Vec<(u64, i64)> = record_times(&p.archive)
+        .into_iter()
+        .filter(|(l, _)| *l > p.base_lsn)
+        .collect();
+    let (_, t) = times[1];
+    let n = times
+        .iter()
+        .position(|(_, ct)| *ct > t)
+        .expect("a later commit exists after the target time");
+    let dest = p.root.join("gen-time.redb");
+    let o = p.restore_archive(&dest, &["--until-time", &rfc3339(t)]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert_eq!(row_ids(&dest), (1..=3 + n as u64).collect::<Vec<_>>());
+    let generation = generation_of(&dest);
+    assert!(generation > previous);
+    previous = generation;
+
+    // 増分 + PITR の併用でも進む。
+    let db = PathBuf::from(p._fx.db_path_str());
+    let inc = p.root.join("inc.seg");
+    let o = run(&[
+        "backup-incremental",
+        "--db",
+        s(&db),
+        "--base",
+        s(&p.base),
+        "--out",
+        s(&inc),
+    ]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    let dest = p.root.join("gen-inc.redb");
+    let o = p.restore(&dest, &["--incremental", s(&inc), "--until-lsn", &lsn]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert!(generation_of(&dest) > previous);
+
+    // 入力（ベース）は変わらず、一時ファイルも残らない。
+    assert_eq!(std::fs::read(&p.base).expect("read base"), base_bytes);
+    assert_eq!(generation_of(&p.base), 0);
+    assert!(leftovers(&p.root).iter().all(|n| !n.contains("tmp")));
+}
+
 /// 引数の不正は DB を開く前に 2 で拒否し、何も作らない。
 #[test]
 fn recover14_pitr_argument_errors_exit_2_and_publish_nothing() {

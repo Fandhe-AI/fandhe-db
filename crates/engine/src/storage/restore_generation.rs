@@ -3,8 +3,9 @@
 //!
 //! 責務境界: データベース全体で 1 つの値（テナント情報を含まない）を専用の redb 表に持ち、
 //! [`Storage::restore_generation`] で読み、[`Storage::advance_restore_generation`] で進める。
-//! 呼び出し元は wire-server の `restore`（物理の復元の完了点）で、PITR（#2450）・論理の復元（#2451）
-//! も完了点で同じ API を呼ぶ。セッションからの参照（#2449）は読み取り側を使い、構文は `SHOW restore_generation`（engine の `core.rs`）。
+//! 呼び出し元は wire-server の `restore`（物理・増分・PITR が共通で通る完了点。#2450）で、
+//! 論理の復元（#2451）も完了点で同じ API を呼ぶ予定。セッションからの参照（#2449）は読み取り側を使い、
+//! 構文は `SHOW restore_generation`（engine の `core.rs`）。
 //!
 //! 値が壊れている・欠けている・上限に達した場合は黙って補わず `Err` とする（fail-closed）。
 //! 書き込みは変更ログの記録に関与しない保守 commit で行う。
