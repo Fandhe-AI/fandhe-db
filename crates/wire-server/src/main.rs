@@ -437,6 +437,11 @@
 //! 起動エラー。TLS は #2177）。重複指定・不正値・前提の欠落は DB を開く前に起動エラー
 //! （`wire_server::replication_opt`・`wire_server::replication`。`docs/design/replication-streaming.md` 参照）。
 //!
+//! `replica --db <path> --primary <ip:port> --credentials <file>`（Issue #2174・RECOVER-15 ポインタ）:
+//! ストリーミングレプリケーションの受信側のサブコマンド。ベースのコピーをプライマリの `--replication-bind` に
+//! 追従させ、変更を commit 番号順に原子的に適用する（`wire_server::replica_opt`・`wire_server::replica`）。
+//! 接続先はループバックのみ。終了コード 10＝適用停止、11＝プライマリの拒否、2＝引数の不備。
+//!
 //! `--require-where-for-dml`（Issue #2210・SQL-36 ポインタ）: 値を取らないスイッチ。
 //! 指定すると `WHERE` 省略の SQL `UPDATE`／`DELETE` を変更開始前に `42601` で拒否する
 //! （明示した述語は受理。MySQL の `sql_safe_updates` 相当）。重複指定・`=` 連結形・後続の値は
@@ -608,6 +613,9 @@ fn main() -> ExitCode {
     }
     if args.get(1).map(String::as_str) == Some("restore") {
         return run_restore(&args[2..]);
+    }
+    if args.get(1).map(String::as_str) == Some("replica") {
+        return run_replica(&args[2..]);
     }
 
     run_server(&args)
@@ -4406,6 +4414,40 @@ fn run_verify(args: &[String]) -> ExitCode {
         report_leftover("verify", p);
     }
     ExitCode::from(code)
+}
+
+/// `replica --db <path> --primary <ip:port> --credentials <file>` サブコマンド（Issue #2174・
+/// RECOVER-15 ポインタ）。プライマリのレプリケーション endpoint から変更ログを受け取り、LSN 順に
+/// 原子的に適用し続ける。引数と資格情報は `wire_server::replica_opt`、受信・適用・再接続は
+/// `wire_server::replica`。停止は固定の終了コード（適用停止 / プライマリの拒否）で、DB は
+/// 変更ログを有効にしないまま開く（通常の書き込みは拒否される）。
+#[cfg(unix)]
+fn run_replica(args: &[String]) -> ExitCode {
+    use wire_server::{backup_opt, replica, replica_opt};
+
+    let opts = match replica_opt::parse(args) {
+        Ok(o) => o,
+        Err(msg) => {
+            engine::log_stderr!("wire-server: replica: {msg}");
+            return ExitCode::from(backup_opt::EXIT_USAGE);
+        }
+    };
+    let core = match engine::core::EngineCore::open(&opts.db) {
+        Ok(c) => c,
+        Err(_) => {
+            engine::log_stderr!("wire-server: replica: failed to open the database");
+            return ExitCode::from(backup_opt::EXIT_FAILURE);
+        }
+    };
+    engine::log_stderr!("wire-server: replica: started");
+    let halt = replica::run(&core, &opts);
+    ExitCode::from(halt.exit_code())
+}
+
+#[cfg(not(unix))]
+fn run_replica(_args: &[String]) -> ExitCode {
+    engine::log_stderr!("wire-server: replica is supported only on unix platforms");
+    ExitCode::from(wire_server::backup_opt::EXIT_USAGE)
 }
 
 /// `restore --from <backup> --db <path>` サブコマンド（Issue #2156・RECOVER-13 (3)(7) ポインタ）。
