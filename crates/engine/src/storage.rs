@@ -4084,3 +4084,9 @@ mod tests {
         txn.abort().expect("abort");
     }
 }
+
+// Issue #3105: 復元をまたぐ世代の高水位（状態ファイル）のコーデック。wire-server の `restore --generation-state` が使う。
+// 既存の commit 境界の行番号（table_generation_bump_coverage の許可リスト）を動かさないよう末尾に置く。
+pub use restore_generation::high_water::{
+    decode_high_water, encode_next_slot, HighWaterState, HIGH_WATER_FILE_LEN,
+};
