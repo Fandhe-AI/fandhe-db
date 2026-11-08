@@ -2289,7 +2289,7 @@ fn run_copy_portal<'e, S: WireStream>(
             stream.flush()?;
             Ok(LoopSignal::Continue)
         }
-        crate::copy::CopyStep::Failed => {
+        crate::copy::CopyStep::Failed | crate::copy::CopyStep::FailedAfterCommit => {
             // ErrorResponse は `copy.rs` が書き済み。`respond_error_and_await_sync` の
             // 例外経路として、旗だけを立てて Sync で回復する（二重送出しない）。
             engine::log_stderr!("wire-server: extended query COPY failed, awaiting Sync");
@@ -2573,6 +2573,13 @@ fn execute_portal<'e, S: WireStream>(
             engine.execute_parsed_in_txn(ctx, session, txn, &parsed)
         });
         let pending_notices = notices.finish();
+        // 同期レプリケーション（Issue #2245）: commit した LSN の確認を、応答を書く前に待つ。取れなければ
+        // commit 済みの応答を `may_be_committed` のエラー（`PostCommit`）へ差し替える。
+        if crate::sync_commit_wait::await_sync_commit(engine, || false).is_err() {
+            return Err(HandlerError::PostCommit(Box::new(internal_error(
+                crate::sync_commit_wait::NOT_CONFIRMED_MESSAGE,
+            ))));
+        }
         if let Err(e) = crate::error_response::write_notices(stream, &pending_notices) {
             let err = io_to_handler(e);
             return Err(if is_write_statement && outcome.is_ok() {

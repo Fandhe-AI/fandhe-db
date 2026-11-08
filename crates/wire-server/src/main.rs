@@ -444,6 +444,14 @@
 //! 起動エラー。TLS は #2177）。重複指定・不正値・前提の欠落は DB を開く前に起動エラー
 //! （`wire_server::replication_opt`・`wire_server::replication`。`docs/design/replication-streaming.md` 参照）。
 //!
+//! `--replication-sync-standby <role>`（繰り返し可）・`--replication-sync-commit <remote_write|on|remote_apply>`・
+//! `--replication-sync-timeout-secs <n>`・`--replication-sync-on-timeout <degrade|reject>`（Issue #2245・
+//! RECOVER-15 ポインタ）: 同期レプリケーション（オプション）。指定したロールのレプリカの確認を待ってから commit の
+//! 成功応答を返す（既定は非同期）。`--replication-bind` が前提で、ロールは `--replication-roles` に存在すること。
+//! 上限を指定したときは超過時の扱い（`degrade`／`reject`）が必須。起動時に調停役を `EngineCore::with_sync_commit` へ
+//! 1 回だけ注入し、テナントのセッション・SQL・HTTP からは水準を変えられない
+//! （`wire_server::sync_commit_wait`。`docs/design/replication-streaming.md` 参照）。
+//!
 //! `replica --db <path> --primary <ip:port> --credentials <file>`（Issue #2174・RECOVER-15 ポインタ）:
 //! ストリーミングレプリケーションの受信側のサブコマンド。ベースのコピーをプライマリの `--replication-bind` に
 //! 追従させ、変更を commit 番号順に原子的に適用する（`wire_server::replica_opt`・`wire_server::replica`）。
@@ -2494,7 +2502,11 @@ fn run_server(args: &[String]) -> ExitCode {
             | "--replication-max-connections"
             | "--replication-max-unacked-bytes"
             | "--replication-ack-timeout-secs"
-            | "--replication-max-lag-records") => {
+            | "--replication-max-lag-records"
+            | "--replication-sync-standby"
+            | "--replication-sync-commit"
+            | "--replication-sync-timeout-secs"
+            | "--replication-sync-on-timeout") => {
                 let Some(v) = args.get(i + 1) else {
                     engine::log_stderr!("wire-server: {flag} requires a value");
                     return ExitCode::FAILURE;
@@ -3592,6 +3604,11 @@ fn run_server(args: &[String]) -> ExitCode {
     // `Option` 分岐は不要——`with_dml_limits` は `DmlLimits::default()` を渡しても
     // 既存挙動とビット同一）。
     core = core.with_dml_limits(dml_limits);
+    // Issue #2245: 同期レプリケーション（`--replication-sync-standby` 指定時だけ）。テナント向けリスナーの
+    // accept より前に 1 回だけ注入する。指定が無ければ調停役を作らず、既定の非同期の経路は変わらない。
+    if let Some(sync) = replication.as_ref().and_then(|r| r.sync.clone()) {
+        core = core.with_sync_commit(Arc::new(engine::storage::SyncCommitCoordinator::new(sync)));
+    }
     // Issue #1548: 未指定でも常に呼ぶ（`schema_limits` は既定まで解決済み。既定は
     // ハード上限と同値で、未注入と挙動が同一）。
     core = core.with_schema_limits(schema_limits);
