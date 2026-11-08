@@ -170,6 +170,11 @@ fn assert_full_round_trip(tag: &str, format: TableDataFormat) {
         "CREATE SEQUENCE",
         "CREATE SCHEMA",
         "CREATE VIEW",
+        "CREATE MATERIALIZED VIEW",
+        "WITH NO DATA",
+        "REFRESH MATERIALIZED VIEW \"mv_pair\"",
+        "CREATE SEQUENCE app.counter",
+        "setval('app.counter'",
         "CREATE UNIQUE INDEX",
         "CREATE INDEX",
         "CREATE FUNCTION",
@@ -190,6 +195,14 @@ fn assert_full_round_trip(tag: &str, format: TableDataFormat) {
         assert!(!want.is_empty(), "{sql} must return rows in the source");
         assert_eq!(want, select(&pair.dst, sql), "{sql} differs after restore");
     }
+
+    // 実体化前のまま残した matview は復元後も実体化前（読み取りは元と同じ失敗）で、REFRESH も出ない。
+    assert!(!ddl.contains("REFRESH MATERIALIZED VIEW \"mv_empty\""));
+    let unread = "SELECT a FROM mv_empty";
+    let want = run(&pair.src, unread).map(|_| ()).expect_err(unread);
+    let got = run(&pair.dst, unread).map(|_| ()).expect_err(unread);
+    assert_eq!(want.wire_code(), got.wire_code());
+    assert_eq!(got.wire_code(), "55000");
 
     // 往復後の最初の採番が元と同じ値になる（setval・IDENTITY・SERIAL の次の値が戻っている）。
     for sql in dump_fixture::NEXT_VALUE_PROBES {

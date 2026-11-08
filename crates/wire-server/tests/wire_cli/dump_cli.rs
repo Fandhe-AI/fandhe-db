@@ -504,7 +504,11 @@ fn dump_shared_only_has_definitions_without_rows() {
 fn dump_failure_publishes_nothing_and_leaves_no_temp_file() {
     let f = populated(
         "dump-unsupported",
-        &["CREATE MATERIALIZED VIEW docs_mv AS SELECT id FROM docs"],
+        // 所有される SEQUENCE の RESTART は SQL で戻せない（マテリアライズド VIEW は #3097 で対応済み）。
+        &[
+            "CREATE TABLE plain (pid SERIAL PRIMARY KEY, v TEXT)",
+            "ALTER SEQUENCE plain_pid_seq RESTART WITH 5",
+        ],
     );
     let out = f.path("a.sql");
     let o = run(&dump_args(&f.db, &out, &["--tenant", "tenant-a"]));
@@ -512,7 +516,7 @@ fn dump_failure_publishes_nothing_and_leaves_no_temp_file() {
     let err = stderr(&o);
     assert!(err.contains("unsupported"), "stderr: {err}");
     assert!(
-        !err.contains("docs_mv") && !err.contains("plain"),
+        !err.contains("plain_pid_seq") && !err.contains("plain"),
         "stderr: {err}"
     );
     assert!(!Path::new(&out).exists());
@@ -835,6 +839,109 @@ fn restore_rejects_loose_setval_and_alter_table() {
             w.statement(kind, sql).expect("s");
         });
         assert_restore_rejected(&dir, &from, &[], 4, sql);
+    }
+}
+
+/// マテリアライズド VIEW の枠（Issue #3097）。`CREATE ... WITH NO DATA` と `REFRESH "<名前>"` の厳密な形、
+/// SCHEMA 修飾の `setval` は受理し、実体を作る形・修飾の崩れ・段階の違反・`parts` との不整合は拒否する。
+#[test]
+fn restore_accepts_matview_frames_and_rejects_loose_shapes() {
+    let fx = common::TempFixtureDir::new("dump-matview-shapes");
+    let dir = dir_of(&fx.db_path_str());
+    let from = s(&dir.join("o.sql")).to_string();
+    let h = || header(DumpScope::Tenant("t1".into()), DumpParts::All);
+    let create = "CREATE MATERIALIZED VIEW \"mv\" AS SELECT id FROM t WITH NO DATA";
+    // 受理: SCHEMA 配下の SEQUENCE の現在値・matview の定義と再計算。
+    write_dump_with(&from, h(), |w| {
+        w.statement(StmtKind::Schema, "CREATE SCHEMA app")
+            .expect("s");
+        w.statement(
+            StmtKind::Sequence,
+            "CREATE SEQUENCE app.q START WITH 5 INCREMENT BY 1 MINVALUE 1 \
+             MAXVALUE 100 NO CYCLE",
+        )
+        .expect("s");
+        w.statement(StmtKind::Table, T_SQL).expect("s");
+        w.statement(StmtKind::MaterializedView, create).expect("s");
+        w.statement(StmtKind::SequenceValue, "SELECT setval('app.q', 9, TRUE)")
+            .expect("s");
+        w.statement(
+            StmtKind::MaterializedViewRefresh,
+            "REFRESH MATERIALIZED VIEW \"mv\"",
+        )
+        .expect("s");
+    });
+    let dest = s(&dir.join("ok.redb")).to_string();
+    let o = run(&["dump-restore", "--from", &from, "--db", &dest]);
+    assert_eq!(code(&o), Some(0), "stderr: {}", stderr(&o));
+
+    // 拒否される文の形。
+    for (kind, sql) in [
+        (
+            StmtKind::MaterializedView,
+            "CREATE MATERIALIZED VIEW \"mv\" AS SELECT id FROM t",
+        ),
+        (
+            StmtKind::MaterializedView,
+            "CREATE MATERIALIZED VIEW \"mv\" AS SELECT id FROM t WITH DATA",
+        ),
+        (
+            StmtKind::MaterializedViewRefresh,
+            "REFRESH MATERIALIZED VIEW CONCURRENTLY \"mv\"",
+        ),
+        (
+            StmtKind::MaterializedViewRefresh,
+            "REFRESH MATERIALIZED VIEW \"mv\" WITH NO DATA",
+        ),
+        (
+            StmtKind::MaterializedViewRefresh,
+            "REFRESH MATERIALIZED VIEW \"mv\", \"mv2\"",
+        ),
+        (
+            StmtKind::MaterializedViewRefresh,
+            "REFRESH MATERIALIZED VIEW \"mv\" WITH DATA",
+        ),
+        (StmtKind::SequenceValue, "SELECT setval('a.b.c', 1, TRUE)"),
+        (StmtKind::SequenceValue, "SELECT setval('a.\"b\"', 1, TRUE)"),
+        (StmtKind::SequenceValue, "SELECT setval('.b', 1, TRUE)"),
+        (StmtKind::SequenceValue, "SELECT setval('a.', 1, TRUE)"),
+    ] {
+        write_dump_with(&from, h(), |w| {
+            w.statement(StmtKind::Table, T_SQL).expect("s");
+            w.statement(kind, sql).expect("s");
+        });
+        assert_restore_rejected(&dir, &from, &[], 4, sql);
+    }
+
+    // REFRESH は後段（Post）の枠。その後ろに Pre の枠（matview の作成）は置けない（順序違反）。
+    write_dump_with(&from, h(), |w| {
+        w.statement(StmtKind::Table, T_SQL).expect("s");
+        w.statement(StmtKind::MaterializedView, create).expect("s");
+        w.statement(
+            StmtKind::MaterializedViewRefresh,
+            "REFRESH MATERIALIZED VIEW \"mv\"",
+        )
+        .expect("s");
+        w.statement(
+            StmtKind::MaterializedView,
+            "CREATE MATERIALIZED VIEW \"mv2\" AS SELECT id FROM t WITH NO DATA",
+        )
+        .expect("s");
+    });
+    assert_restore_rejected(&dir, &from, &[], 4, "create after refresh");
+
+    // 再計算は論理ダンプ（parts: all）にしか現れない。schema・data のヘッダでは拒否する。
+    for parts in [DumpParts::SchemaOnly, DumpParts::DataOnly] {
+        write_dump_with(&from, header(DumpScope::Tenant("t1".into()), parts), |w| {
+            w.statement(StmtKind::Table, T_SQL).expect("s");
+            w.statement(StmtKind::MaterializedView, create).expect("s");
+            w.statement(
+                StmtKind::MaterializedViewRefresh,
+                "REFRESH MATERIALIZED VIEW \"mv\"",
+            )
+            .expect("s");
+        });
+        assert_restore_rejected(&dir, &from, &[], 4, "refresh outside parts: all");
     }
 }
 
