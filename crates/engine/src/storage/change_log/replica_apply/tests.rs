@@ -329,3 +329,56 @@ fn primary_and_plain_db_are_not_replica_bases() {
         Err(ReplicaApplyError::NotReplicaBase)
     ));
 }
+
+#[test]
+fn rejects_reversed_or_gapped_duplicates_before_new_record() {
+    let (f, _p, r, base, recs) = setup("rep-dupseq");
+    r.apply_replicated_records(&recs).unwrap();
+    let applied = r.replica_applied_lsn().unwrap();
+    assert!(applied > base);
+    f.sql("INSERT INTO ev (id, embedding) VALUES (77, '[0.7,0.7]')");
+    let new = f.records_from(applied + 1);
+    assert_eq!(new.len(), 1);
+    let before = dump(&r);
+    // 逆順の重複列の後に新規レコード。
+    let mut reversed: Vec<_> = recs.iter().rev().cloned().collect();
+    reversed.extend(new.iter().cloned());
+    assert!(matches!(
+        r.apply_replicated_records(&reversed),
+        Err(ReplicaApplyError::OutOfOrder)
+    ));
+    // 欠落のある重複列の後に新規レコード。
+    let mut gapped = vec![recs[0].clone(), recs[2].clone()];
+    gapped.extend(new.iter().cloned());
+    assert!(matches!(
+        r.apply_replicated_records(&gapped),
+        Err(ReplicaApplyError::OutOfOrder)
+    ));
+    assert_eq!(r.replica_applied_lsn().unwrap(), applied);
+    assert_eq!(dump(&r), before);
+    // 正しい連続列なら適用できる。
+    let mut ok = recs.clone();
+    ok.extend(new);
+    r.apply_replicated_records(&ok).expect("contiguous");
+    assert_same(f.storage(), &r);
+}
+
+#[test]
+fn applies_on_non_immediate_storage() {
+    let f = Fixture::new("rep-nodur");
+    f.write_round_1();
+    let p = f.out.path().join("nd.redb");
+    f.storage().export_snapshot(&p).expect("snapshot");
+    let r = Storage::open_with_durability(&p, crate::storage::WriteDurability::None)
+        .expect("open replica");
+    let base = r.replica_applied_lsn().unwrap();
+    f.write_round_2();
+    let recs = f.records_from(base + 1);
+    let rep = r.apply_replicated_records(&recs).expect("apply");
+    assert_eq!(rep.applied, recs.len() as u64);
+    assert_same(f.storage(), &r);
+    drop(r);
+    // 再オープン後も適用位置が残る（Immediate で確定している）。
+    let r2 = Storage::open(&p).expect("reopen");
+    assert_eq!(r2.replica_applied_lsn().unwrap(), f.generation());
+}

@@ -1295,7 +1295,12 @@ impl Storage {
     /// 追記も適用側が同じトランザクションで行うため。二重記録を避ける）。
     pub(in crate::storage) fn begin_replica_apply_txn(&self) -> Result<GatedWriteTxn> {
         let permit = self.acquire_writer_permit()?;
-        let txn = self.begin_write_txn_raw()?;
+        let mut txn = self.begin_write_txn_raw()?;
+        // ack 済みの適用位置を crash で失わないよう、Storage の durability 設定にかかわらず
+        // この専用トランザクションは Immediate に固定する（`begin_write` 直後なので失敗しない）。
+        if !matches!(self.durability, WriteDurability::Immediate) {
+            txn.set_durability(redb::Durability::Immediate)?;
+        }
         Ok(GatedWriteTxn {
             capture: None,
             recording: None,

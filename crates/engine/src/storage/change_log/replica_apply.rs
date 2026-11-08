@@ -171,6 +171,8 @@ impl Storage {
         let mut current = base_generation;
         let mut applied = 0u64;
         let mut skipped = 0u64;
+        // 受信列の直前 LSN。適用位置とは別に、重複区間を含めて列全体の連続性（+1 刻み）を検査する。
+        let mut prev_received: Option<u64> = None;
         for (frame_lsn, raw) in records {
             if raw.len() > MAX_RECORD_BYTES {
                 return Err(ReplicaApplyError::Corrupt);
@@ -180,6 +182,12 @@ impl Storage {
             if h.lsn != *frame_lsn {
                 return Err(ReplicaApplyError::OutOfOrder);
             }
+            if let Some(p) = prev_received {
+                if p.checked_add(1) != Some(h.lsn) {
+                    return Err(ReplicaApplyError::OutOfOrder);
+                }
+            }
+            prev_received = Some(h.lsn);
             if h.lsn <= base_generation {
                 // 適用済みの区間の再送。内容が一致すれば無害、食い違えば分岐。
                 check_duplicate(&txn, raw, &h, &db_id, timeline)?;
