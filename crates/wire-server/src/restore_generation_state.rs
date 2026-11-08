@@ -22,7 +22,6 @@ use crate::restore_opt::RestoreError;
 pub(crate) struct GenerationState {
     file: File,
     parent: PathBuf,
-    created: bool,
 }
 
 impl GenerationState {
@@ -39,8 +38,8 @@ impl GenerationState {
         crate::dump_tmp::check_parent_not_shared(parent).map_err(|_| rejected())?;
 
         // 開く前にリンクをたどらずに種別を確かめる（シンボリックリンク・ディレクトリは拒否）。
-        let (file, created) = match std::fs::symlink_metadata(path) {
-            Ok(m) if m.is_file() => (open_existing(path)?, false),
+        let file = match std::fs::symlink_metadata(path) {
+            Ok(m) if m.is_file() => open_existing(path)?,
             Ok(_) => return Err(rejected()),
             Err(e) if e.kind() == ErrorKind::NotFound => {
                 match OpenOptions::new()
@@ -50,9 +49,9 @@ impl GenerationState {
                     .mode(0o600)
                     .open(path)
                 {
-                    Ok(f) => (f, true),
+                    Ok(f) => f,
                     // 作成の競合は既存のファイルとして開き直す（以降の検査は同じ）。
-                    Err(e) if e.kind() == ErrorKind::AlreadyExists => (open_existing(path)?, false),
+                    Err(e) if e.kind() == ErrorKind::AlreadyExists => open_existing(path)?,
                     Err(e) => return Err(RestoreError::Io(e.kind())),
                 }
             }
@@ -76,16 +75,15 @@ impl GenerationState {
             Err(TryLockError::WouldBlock) => return Err(RestoreError::GenerationStateInUse),
             Err(TryLockError::Error(e)) => return Err(RestoreError::Io(e.kind())),
         }
-        if created {
-            // 作成したディレクトリエントリを永続化する。
-            File::open(parent)
-                .and_then(|d| d.sync_all())
-                .map_err(|e| RestoreError::Io(e.kind()))?;
-        }
+        // 作成の競合に負けた側（`AlreadyExists` で開き直した側）は `created` が false のまま、勝った側が
+        // fsync する前にロックを取りうる。どちらが作ったかに依らず、ロックを握った側が必ず親を fsync して
+        // ディレクトリエントリを永続化する（クラッシュで状態ファイルが消え公開済みの世代が再利用されるのを防ぐ）。
+        File::open(parent)
+            .and_then(|d| d.sync_all())
+            .map_err(|e| RestoreError::Io(e.kind()))?;
         Ok(Self {
             file,
             parent: parent.to_path_buf(),
-            created,
         })
     }
 
@@ -118,11 +116,9 @@ impl GenerationState {
         }
         self.file.write_all_at(&slot, offset).map_err(io)?;
         self.file.sync_all().map_err(io)?;
-        if self.created {
-            File::open(&self.parent)
-                .and_then(|d| d.sync_all())
-                .map_err(io)?;
-        }
+        File::open(&self.parent)
+            .and_then(|d| d.sync_all())
+            .map_err(io)?;
         Ok(())
     }
 }
