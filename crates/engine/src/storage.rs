@@ -1379,6 +1379,28 @@ impl Storage {
         change_log::incremental::export_from_read(&self.db.begin_read()?, base, dest.as_ref())
     }
 
+    /// [`Self::export_incremental`] と同じ増分の書き出しで、`change_log` 表の先頭側が保持設定で刈り込まれて
+    /// いるときは、刈り込み済みの区間を `archive_dir`（変更ログのアーカイブ先。Issue #2167）のセグメントから
+    /// 補う（RECOVER-14・Issue #3099）。アーカイブが区間を覆わない・壊れている・DB の行と食い違うときは
+    /// [`IncrementalError`] で拒否し、何も公開しない。刈り込まれていなければアーカイブを開かず、
+    /// [`Self::export_incremental`] と同じ出力になる。他者が書けるアーカイブ先は拒否する。
+    pub fn export_incremental_with_archive(
+        &self,
+        base: &ChainPoint,
+        archive_dir: impl AsRef<Path>,
+        dest: impl AsRef<Path>,
+    ) -> std::result::Result<IncrementalSummary, IncrementalError> {
+        if self.temp_scoped {
+            return Err(IncrementalError::NotEnabled);
+        }
+        change_log::incremental::export_from_read_with(
+            &self.db.begin_read()?,
+            base,
+            dest.as_ref(),
+            Some(archive_dir.as_ref()),
+        )
+    }
+
     /// 保守 commit 用の書き込みトランザクション（変更ログの水位更新・刈り込み）。通常の書き込みが
     /// 待機している間はゲートを譲り、待機上限を超えたら `None`（今回は見送り。D6）。
     ///
