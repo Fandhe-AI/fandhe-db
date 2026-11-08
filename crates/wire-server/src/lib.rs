@@ -201,6 +201,8 @@ pub mod require_operation_id_opt;
 pub mod require_where_for_dml_opt;
 pub mod rerank_opt;
 pub(crate) mod response_buffer;
+#[cfg(unix)]
+pub(crate) mod restore_generation_state;
 pub mod restore_opt;
 pub mod result_encoder;
 pub mod result_limits_opt;

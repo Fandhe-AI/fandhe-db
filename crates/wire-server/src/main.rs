@@ -530,6 +530,8 @@
 //! さらに `--change-log-archive-dir <dir>` と `--until-lsn <n>`（または `--until-time <RFC 3339・ゾーン必須>`）を
 //! 指定すると、アーカイブの変更ログを指定点のコミット境界まで適用する（PITR。Issue #2169・RECOVER-14 ポインタ。
 //! 範囲外・欠落・破損は何も公開せず 1 で終了。`--until-*` の組み合わせの不正は DB に触れる前に 2 で終了）。
+//! `--generation-state <path>` を指定すると、復元をまたぐ世代の高水位を状態ファイルに持ち、繰り返し復元でも
+//! 世代が単調に増える（Issue #3105・RECOVER-17 ポインタ。保持できなければ何も公開せず 1、引数の不正は 2 で終了）。
 //!
 //! `wire-server backup-incremental --db <path> --base <path> --out <path>` サブコマンドは、**停止中**の DB から、
 //! 直前のベース（フルバックアップまたは前回の増分）が終わった commit の次から最新までのログ区間を増分
@@ -4634,13 +4636,7 @@ fn run_restore(args: &[String]) -> ExitCode {
         }
     };
     let mut leftover = None;
-    let result = restore_opt::restore_with_pitr(
-        &parsed.from,
-        &parsed.db,
-        &parsed.incrementals,
-        parsed.pitr.as_ref(),
-        &mut leftover,
-    );
+    let result = restore_opt::restore_with_args(&parsed, &mut leftover);
     if matches!(
         &result,
         Err(restore_opt::RestoreError::UncheckedContentPublished)

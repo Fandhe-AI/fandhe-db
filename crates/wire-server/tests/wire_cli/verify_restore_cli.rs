@@ -33,7 +33,7 @@ fn restore(from: &str, db: &str) -> Output {
         .expect("run restore")
 }
 
-fn code(o: &Output) -> Option<i32> {
+pub(super) fn code(o: &Output) -> Option<i32> {
     o.status.code()
 }
 
@@ -41,7 +41,7 @@ fn stdout(o: &Output) -> String {
     String::from_utf8_lossy(&o.stdout).into_owned()
 }
 
-fn stderr(o: &Output) -> String {
+pub(super) fn stderr(o: &Output) -> String {
     String::from_utf8_lossy(&o.stderr).into_owned()
 }
 
@@ -87,7 +87,7 @@ fn populate(fx: &common::TempFixtureDir) -> (String, String) {
     (users, db)
 }
 
-fn leftovers(dir: &Path) -> Vec<String> {
+pub(super) fn leftovers(dir: &Path) -> Vec<String> {
     std::fs::read_dir(dir)
         .expect("read_dir")
         .filter_map(|e| e.ok())
@@ -173,7 +173,7 @@ fn verify_corrupted_db_exits_with_inconsistent_code() {
 }
 
 /// 3 行を書いて正常に閉じた DB を作る。
-fn write_clean_db(path: &Path) {
+pub(super) fn write_clean_db(path: &Path) {
     let storage = Storage::open(path).expect("open");
     for id in 1..=3 {
         storage
@@ -545,7 +545,7 @@ fn restore_rejects_invalid_arguments_and_paths() {
 }
 
 /// 復元先の復元の世代番号を読む（復元後の DB を engine の公開 API で開く）。
-fn generation_of(path: &Path) -> u64 {
+pub(super) fn generation_of(path: &Path) -> u64 {
     Storage::open(path)
         .expect("open restored")
         .restore_generation()

@@ -541,3 +541,28 @@ fn recover14_pitr_runtime_rejections_exit_1_and_publish_nothing() {
     assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
     assert_eq!(row_ids(&dest), (1..=9).collect::<Vec<_>>());
 }
+
+/// PITR の復元（`--until-lsn`）でも `--generation-state` が効き、同じ状態ファイルを共有する復元は
+/// 世代が厳密に増える（Issue #3105・RECOVER-17 のポインタ）。
+#[test]
+fn recover17_pitr_restore_honors_the_generation_state() {
+    let p = build("pitr-cli-generation-state", usize::MAX >> 8);
+    let state = p.root.join("gen-state.bin");
+    let lsn = (p.base_lsn + 2).to_string();
+    let mut previous = 0;
+    for i in 0..2 {
+        let dest = p.root.join(format!("restored-gen-{i}.redb"));
+        let o = p.restore_archive(
+            &dest,
+            &["--until-lsn", &lsn, "--generation-state", s(&state)],
+        );
+        assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+        let g = Storage::open(&dest)
+            .expect("open")
+            .restore_generation()
+            .expect("generation");
+        assert!(g > previous, "{g} must exceed {previous}");
+        previous = g;
+    }
+    assert!(leftovers(&p.root).is_empty());
+}
