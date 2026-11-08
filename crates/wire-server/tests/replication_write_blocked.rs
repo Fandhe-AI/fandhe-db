@@ -444,6 +444,38 @@ fn recover15_lag_limit_cuts_a_write_blocked_replica_and_releases_retention() {
     assert_cut_while_blocked(&p, &mut r, base, &reason, &mut alice);
 }
 
+/// 送信が塞がっている間も、切断の条件に当たらない限りテナントの書き込みは切断を待たずに完了する。
+/// ack 待ちの上限を十分に長く・遅れの上限を未到達にして小さい書き込みを完了させ、その時点で未切断であること
+/// を確かめてから、別段階で切断の条件（プロトコル違反）を起こす。切断後に書き込みが再開する実装でも通る
+/// ack timeout・遅れ上限のケースの検査を、閉塞中の継続性の観点で補う。
+#[test]
+fn recover15_writes_proceed_before_any_cut_while_replica_is_write_blocked() {
+    let p = Primary::start(
+        "repl-blocked-flow",
+        &[
+            "--replication-ack-timeout-secs",
+            "600",
+            "--replication-max-lag-records",
+            "1000000",
+            "--replication-max-unacked-bytes",
+            BIG_WINDOW,
+        ],
+    );
+    let (mut r, base, mut alice) = p.begin_blocked_target();
+    p.fill(&mut alice);
+    // 切断の条件はまだ無い。書き込みは短い上限で完了し、その時点で切断されていない。
+    alice.assert_small_writes_flow(0..5, Duration::from_secs(1));
+    assert_eq!(
+        p.disconnect_reason(),
+        None,
+        "writes completed while the blocked replica was still connected"
+    );
+    // 別段階: 切断の条件を起こす。
+    r.ack(u64::MAX);
+    let (reason, _) = p.wait_disconnect(Duration::from_secs(30));
+    assert_cut_while_blocked(&p, &mut r, base, &reason, &mut alice);
+}
+
 /// 送信が塞がっている間のプロトコル違反は、`BAD_REQUEST` を書けないので、通知の有界の待機（約 1 秒）の後に
 /// 監視が閉じる。`ack_timeout` を大きくして、切断が違反によるものだと区別できるようにする。
 #[test]
