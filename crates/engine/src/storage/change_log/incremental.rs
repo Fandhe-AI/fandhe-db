@@ -46,9 +46,8 @@ use std::path::{Path, PathBuf};
 use redb::{ReadableDatabase, ReadableTable};
 
 use super::archive::{
-    check_dir_not_shared, check_row, count_segment_files, map_decode, publish_with, read_meta_u64,
-    segments_covering, verify_segment_file, ArchiveError, SegmentHeader, SegmentInfo,
-    SegmentReader, SEG_MAGIC,
+    check_dir_not_shared, check_row, map_decode, publish_with, read_meta_u64, segments_covering,
+    verify_segment_file, ArchiveError, SegmentHeader, SegmentInfo, SegmentReader, SEG_MAGIC,
 };
 use super::{
     decode_record, is_excluded_table, peek_record, CaptureLimits, CHANGE_LOG_TABLE, DB_ID_LEN,
@@ -372,6 +371,11 @@ pub(in crate::storage) fn export_from_read_with(
         Some(entry) => entry?.0.value(),
         None => after_latest,
     };
+    // 要求区間より前の行が残っているなら先頭側は刈り込まれていない。区間内の欠けは刈り込みではなく
+    // 破損なので、アーカイブで補わず拒否する。
+    if db_first > first && log.first()?.is_some_and(|(k, _)| k.value() < first) {
+        return Err(IncrementalError::RangeUnavailable);
+    }
     let mut segments: Vec<(PathBuf, SegmentInfo)> = Vec::new();
     if db_first > first {
         let dir = archive.ok_or(IncrementalError::RangeUnavailable)?;
@@ -382,9 +386,8 @@ pub(in crate::storage) fn export_from_read_with(
             _ => return Err(IncrementalError::RangeUnavailable),
         }
         check_dir_not_shared(dir)?;
-        if count_segment_files(dir)? > MAX_APPLY_SEGMENTS {
-            return Err(IncrementalError::BadSegmentList);
-        }
+        // 件数の上限は一覧の列挙（`MAX_SEGMENT_FILES`）が担う。`MAX_APPLY_SEGMENTS` は untrusted な復元ファイル
+        // 一覧向けの上限で、補完対象の区間を覆うセグメントだけを検証するこの経路には当てない。
         segments = match segments_covering(dir, &db_id, timeline, first, pruned_to, max_payload) {
             Ok(s) => s,
             Err(ArchiveError::ArchiveIncomplete) => return Err(IncrementalError::RangeUnavailable),

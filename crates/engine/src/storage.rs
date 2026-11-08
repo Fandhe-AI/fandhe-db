@@ -1393,6 +1393,9 @@ impl Storage {
         if self.temp_scoped {
             return Err(IncrementalError::NotEnabled);
         }
+        // フル・増分の書き出しと同じ実行中フラグで同時 1 本に制限する（長い読み取り Tx を重ねない）。
+        let _busy = snapshot::try_acquire_busy(&self.snapshot_export_busy)
+            .ok_or(IncrementalError::InProgress)?;
         change_log::incremental::export_from_read_with(
             &self.db.begin_read()?,
             base,

@@ -1159,3 +1159,68 @@ fn live_export_is_limited_to_one_at_a_time_shared_with_full_backups() {
         .expect("export");
     assert!(!fx.storage().snapshot_export_busy.load(Ordering::Acquire));
 }
+
+/// アーカイブ補完付きの書き出しも、フル・増分と同じ実行中フラグで同時 1 本に制限する（補完が不要でも取る）。
+#[test]
+fn live_export_with_archive_shares_the_busy_flag() {
+    use std::sync::atomic::Ordering;
+
+    let fx = Fixture::new("inc-busy-arc");
+    fx.write_round_1();
+    let (_, point) = fx.full_backup("base.redb");
+    fx.write_round_2();
+    let archive = private_dir("inc-busy-arc-dir");
+
+    fx.storage()
+        .snapshot_export_busy
+        .store(true, Ordering::Release);
+    let dest = fx.path("busy.seg");
+    assert!(matches!(
+        fx.storage()
+            .export_incremental_with_archive(&point, archive.path(), &dest),
+        Err(IncrementalError::InProgress)
+    ));
+    assert!(std::fs::symlink_metadata(&dest).is_err());
+    assert!(fx.storage().snapshot_export_busy.load(Ordering::Acquire));
+    fx.storage()
+        .snapshot_export_busy
+        .store(false, Ordering::Release);
+
+    fx.storage()
+        .export_incremental_with_archive(&point, archive.path(), &dest)
+        .expect("export");
+    assert!(!fx.storage().snapshot_export_busy.load(Ordering::Acquire));
+}
+
+/// 要求区間より前の行が DB に残っているとき、区間内の欠けは刈り込みではなく破損なので、アーカイブが
+/// 覆っていても補わず `RangeUnavailable` で拒否する。
+#[test]
+fn export_rejects_an_interior_gap_even_when_the_archive_covers_it() {
+    let fx = Fixture::new("inc-interior-gap");
+    fx.write_round_1();
+    let (_, point) = fx.full_backup("base.redb");
+    fx.write_round_2();
+    fx.write_round_3();
+    let archive = private_dir("inc-interior-gap-arc");
+    // 全件を DB に残したままアーカイブして、水位を最新まで進める。
+    archive_and_prune(&fx, archive.path(), 100_000, 100_000);
+    let lsns = log_lsns(&fx);
+    assert!(lsns[0] <= point.end_lsn, "rows before the range remain");
+    let hole = point.end_lsn + 1;
+    assert!(lsns.contains(&hole) && lsns.iter().any(|l| *l > hole));
+    {
+        let txn = fx.storage().db().begin_write().expect("write");
+        {
+            let mut t = txn.open_table(CHANGE_LOG_TABLE).expect("table");
+            t.remove(hole).expect("remove");
+        }
+        txn.commit().expect("commit");
+    }
+    let dest = fx.path("gap.seg");
+    assert!(matches!(
+        fx.storage()
+            .export_incremental_with_archive(&point, archive.path(), &dest),
+        Err(IncrementalError::RangeUnavailable)
+    ));
+    assert!(!dest.exists());
+}
