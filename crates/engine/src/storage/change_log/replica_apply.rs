@@ -61,6 +61,8 @@ pub enum ReplicaApplyError {
     Diverged,
     /// 1 回に渡されたレコード数が上限を超える。
     BatchTooLarge,
+    /// ベースの変更ログが commit 番号と連続しない（記録のない区間がある。再同期のやり直しが要る。Issue #2176）。
+    BaseDiscontinuous,
     /// ストレージ層のエラー。
     Storage(StorageError),
 }
@@ -76,6 +78,9 @@ impl std::fmt::Display for ReplicaApplyError {
             Self::BadRecord => "replicated record cannot be applied",
             Self::Diverged => "replicated record diverges from the applied history",
             Self::BatchTooLarge => "too many replicated records in one batch",
+            Self::BaseDiscontinuous => {
+                "replica base change log is not continuous with its commit number"
+            }
             Self::Storage(_) => "storage error during replica apply",
         })
     }

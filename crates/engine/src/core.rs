@@ -4440,6 +4440,14 @@ impl EngineCore {
         self.storage.replica_identity()
     }
 
+    /// レプリカの変更ログの連続性を検査し、切り替え点を返す（RECOVER-15・Issue #2176）。レプリカの適用ループが
+    /// 開始時に呼ぶ。[`crate::storage::Storage::check_replica_base`] へ委譲する。
+    pub fn check_replica_base(
+        &self,
+    ) -> std::result::Result<crate::storage::ChainPoint, crate::storage::ReplicaApplyError> {
+        self.storage.check_replica_base()
+    }
+
     /// 受信した変更ログのレコード列を、LSN 順に 1 トランザクションで原子的に適用する
     /// （RECOVER-15・Issue #2174）。[`crate::storage::Storage::apply_replicated_records`] へ委譲する。テナントの
     /// セッションを経由せず、SQL・NoSQL の表層からは呼べない。

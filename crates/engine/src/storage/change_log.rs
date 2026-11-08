@@ -71,6 +71,7 @@ pub(crate) mod oracle;
 mod oracle_tests;
 pub(crate) mod pitr;
 pub(crate) mod replica_apply;
+pub(crate) mod replica_base;
 pub(crate) mod stream;
 pub(crate) mod sync_commit;
 
