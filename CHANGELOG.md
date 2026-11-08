@@ -92,6 +92,7 @@
 
 ### Fixed
 
+- 壊れたアロケータ状態表を持つ DB ファイルで、redb の内部が panic してプロセスが落ちる経路を、固定のエラーでの拒否に倒した（Issue #3101・RECOVER-13 ポインタ。#3074 のレビューで指摘）。`Storage::open`・`ReadOnlyStorage::open`・両者の `verify_integrity` の入口で panic を受け止め、`StorageError::Backend`・`ReadOnlyOpenError::Failed`・`IntegrityError::Backend` を返す（公開 API の形は変えない）。`wire-server verify` / `restore` は落ちずに終了コード 1 で拒否する。依存の追加はない。
 - 外部キーを持つ表に行があると、`export_schema_ddl`・`export_logical_dump` が逆引き索引の物理表（`key_index_rev/`）を未分類として全体を失敗させる不具合を直した（Issue #2163・RECOVER-16 ポインタ。論理ダンプの往復試験で発見。分類の接頭辞に加えた）。
 - 複数文メッセージで `CREATE [OR REPLACE] FUNCTION` の後続文が失敗したとき、関数がカタログに残る不具合を直した（Issue #2882・SQL-66・WIRE-16・RECOVER-12 ポインタ）。`CREATE FUNCTION` を書き込み扱いにして暗黙トランザクションの共有 write txn へ書き、後続文の失敗でカタログ・セッションごと巻き戻す。世代は commit 成功後にだけ進める。挙動の変化: `CREATE FUNCTION f ...; <後続文>` は暗黙トランザクションに入り（後続が未対応の DDL・`DROP FUNCTION` なら `0A000` で全体をロールバック）、`CREATE FUNCTION f ...; BEGIN; ...` は `0A000`。明示トランザクション内と暗黙トランザクション内の `DROP FUNCTION` は従来どおり `0A000`。公開 API の変更はない。
 

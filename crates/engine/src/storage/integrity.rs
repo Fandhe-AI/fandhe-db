@@ -311,7 +311,7 @@ impl IntegrityReport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum IntegrityError {
-    /// 読み取りトランザクションを開始できなかった。
+    /// 読み取りトランザクションを開始できなかった、または検査中に backend 内部の panic を受け止めた。
     Backend,
 }
 
@@ -453,8 +453,12 @@ impl Storage {
         &self,
         options: &IntegrityOptions,
     ) -> Result<IntegrityReport, IntegrityError> {
-        let snapshot = self.begin_read().map_err(|_| IntegrityError::Backend)?;
-        Ok(verify_in_txn(snapshot.raw_txn(), options))
+        // 壊れたページを読んで redb 内部が panic した場合も `Backend` にする（Issue #3101）。
+        super::panic_boundary::catch_backend_panic(|| {
+            let snapshot = self.begin_read().map_err(|_| IntegrityError::Backend)?;
+            Ok(verify_in_txn(snapshot.raw_txn(), options))
+        })
+        .unwrap_or(Err(IntegrityError::Backend))
     }
 }
 

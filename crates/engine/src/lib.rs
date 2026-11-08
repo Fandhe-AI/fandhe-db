@@ -330,6 +330,7 @@ pub mod window_limits;
 /// 取り込むため、結合テストバイナリごとの重複実行は発生しない。
 #[cfg(test)]
 mod test_util {
+    pub mod corrupt_allocator_state;
     pub mod temp_db;
     mod temp_db_tests;
 }
