@@ -324,9 +324,9 @@ capture_point() {
   rt_us="${EPOCHREALTIME/./}"
   PT_RT_MS+=($((rt_us / 1000)))
   PT_MONO_MS+=($((${up/./} * 10)))
-  # 時刻指定の点は採取時刻の 300ms 後にする。直前の commit（採取より前）との余裕を広げるためで、
-  # 次の周期の最初の commit は、この後のサーバー再起動・アーカイブ待ち・次周期のサーバー起動と接続の
-  # 後（実測で 1 秒前後以上）になるので、300ms 後の点は次周期の commit より前に収まる。
+  # 時刻指定の点は採取時刻の 300ms 後にする。直前の commit（採取より前）との余裕を広げるため。
+  # 次の周期の最初の commit がこの点より後になることは、関数の末尾で採取から 600ms 経つまで待って
+  # 保証する（再起動・アーカイブ待ちが速い環境では、待たないと次周期の commit が点より前に入る）。
   t="$(date -u -d "@$(((rt_us + 300000) / 1000000)).$(printf '%06d' $(((rt_us + 300000) % 1000000)))" +%Y-%m-%dT%H:%M:%S.%6NZ)" \
     || fail "date could not format the checkpoint time"
   start_src_server
@@ -364,6 +364,12 @@ capture_point() {
   PT_MAXID+=("${MAXID}")
   PT_TIME+=("${t}")
   echo "point ${idx}: lsn=${CLV_LAST} count=${COUNT} max_id=${MAXID} time=${t}"
+  # 次の周期の commit を時刻指定の点（採取の 300ms 後）より 300ms 以上後にする。
+  local now_us
+  now_us="${EPOCHREALTIME/./}"
+  if [ "${now_us}" -lt $((rt_us + 600000)) ]; then
+    sleep_ms $(((rt_us + 600000 - now_us) / 1000 + 1))
+  fi
 }
 
 # ---------------------------------------------------------------------------
