@@ -298,6 +298,10 @@ fn server_key_share(sh: &handshake::ServerHello) -> Result<[u8; 32], ClientHands
     }
 }
 
+/// サーバーから受け取る暗号化ハンドシェイクメッセージ本文長の上限。
+/// `Certificate` チェーン（証明書 1 通が `MAX_CERTIFICATE_DER_LEN` まで）を 16 通分とする。
+const MAX_SERVER_HANDSHAKE_MESSAGE_LEN: usize = 16 * super::x509::MAX_CERTIFICATE_DER_LEN;
+
 /// 暗号化されたレコードから次のハンドシェイクメッセージを 1 つ取り出す（足りなければレコードを読む）。
 fn next_encrypted_message<S: HandshakeTransport>(
     stream: &mut S,
@@ -395,7 +399,9 @@ fn drive<S: HandshakeTransport>(
         )
         .map_err(|_| ClientHandshakeError::Local)?;
 
-    let mut buffer = HandshakeBuffer::new();
+    // サーバーの Certificate チェーンは既定の受信上限（65535）を超え得るため、
+    // 証明書 1 通 64 KiB の上限を 16 通分見込んだ専用の上限を使う（有界・fail-closed）。
+    let mut buffer = HandshakeBuffer::with_max_message_len(MAX_SERVER_HANDSHAKE_MESSAGE_LEN);
 
     let ee = next_encrypted_message(stream, &mut opener, &mut buffer, deadline)?;
     if ee.msg_type != HandshakeType::EncryptedExtensions {
