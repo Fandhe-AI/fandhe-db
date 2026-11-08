@@ -1,10 +1,10 @@
-//! 論理ダンプファイルの形式（版 1）の書き手と読み手（Issue #2162・RECOVER-16 ポインタ。
+//! 論理ダンプファイルの形式（版 2）の書き手と読み手（Issue #2162・RECOVER-16 ポインタ。
 //! 方式は `docs/design/logical-dump.md` の第 12 節）。
 //!
 //! 責務境界: ダンプファイルのバイト列と、`engine` が渡す DDL／データ断片の対応づけだけを担う。
 //! 文の実行は [`crate::dump_restore`]、書き出しの駆動は [`crate::dump_run`] が行う。
 //!
-//! 形式: 先頭のヘッダ（`-- ` で始まるコメント行 5 本）に続き、文ごとに「長さ付きの枠」を並べる。
+//! 形式: 先頭のヘッダ（`-- ` で始まるコメント行 6 本。復元元の世代番号を含む）に続き、文ごとに「長さ付きの枠」を並べる。
 //! 枠の見出しも `--` コメントなので、ファイル全体は SQL スクリプトとしても読める（`psql` 等に流せる。
 //! COPY は `;` の後ろにデータ行と `\.` が続く標準の形）。復元側は **見出しの長さに従って本文を
 //! 切り出す**（`;` や改行で分割しない。文字列リテラル・ドル引用・コメントの中の `;`・改行を
@@ -21,7 +21,9 @@ use engine::catalog::ddl_export::DdlObjectKind;
 use crate::dump_opt::{DumpFormat, DumpParts, DumpScope};
 
 /// 先頭行（版を含む）。完全一致しなければ拒否する。
-pub const MAGIC: &str = "-- fandhe-db logical dump v1";
+pub const MAGIC: &str = "-- fandhe-db logical dump v2";
+/// 復元元の世代番号を載せるヘッダ行の接頭辞（RECOVER-17・Issue #2451）。
+pub const GENERATION_PREFIX: &str = "-- restore-generation: ";
 /// ヘッダの終端行。
 pub const BODY_MARK: &str = "-- body";
 /// 末尾の終端行。これが無いファイル（枠の境界での切り詰めを含む）は読み切れても拒否する。
@@ -39,7 +41,7 @@ const MAX_MARKER_LINE: usize = 128;
 /// ダンプファイルの読み書きの失敗（種別だけを持ち、文の内容・名前・パスは含めない）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileError {
-    /// ヘッダが版 1 の形式と一致しない。
+    /// ヘッダが版 2 の形式と一致しない。
     BadHeader,
     /// 枠の見出し・長さ・終端が形式と一致しない（改ざん・破損）。
     BadFrame,
@@ -502,6 +504,26 @@ pub struct Header {
     pub parts: DumpParts,
     /// データの書式。
     pub format: DumpFormat,
+    /// 書き出し元 DB の復元の世代番号（RECOVER-17。復元側がこれより大きい値へ進める下限に使う）。
+    pub restore_generation: u64,
+}
+
+/// 世代行の本体（10 進の `u64`、`bigint` 範囲）を厳密に解析する。符号・空白・先頭ゼロ・空は拒否。
+fn parse_generation(v: &str) -> Option<u64> {
+    if v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if v.len() > 1 && v.starts_with('0') {
+        return None;
+    }
+    let n: u64 = v.parse().ok()?;
+    generation_in_range(n).then_some(n)
+}
+
+/// 世代番号が `bigint` 範囲（`i64::MAX` 以下）か。読み手（[`parse_generation`]）と書き手
+/// （[`FileWriter::begin`]）が同じ判定を使い、復元できないファイルを作らないようにする。
+fn generation_in_range(n: u64) -> bool {
+    i64::try_from(n).is_ok()
 }
 
 fn parts_token(p: DumpParts) -> &'static str {
@@ -527,15 +549,20 @@ pub struct FileWriter<W: Write> {
 impl<W: Write> FileWriter<W> {
     /// ヘッダを書いて書き手を作る。
     pub fn begin(mut out: W, header: &Header) -> Result<Self, FileError> {
+        // 読み手が拒否する値は、何も書く前に拒否する（復元できないファイルを作らない）。
+        if !generation_in_range(header.restore_generation) {
+            return Err(FileError::BadHeader);
+        }
         let scope = match &header.scope {
             DumpScope::Shared => "shared".to_string(),
             DumpScope::Tenant(t) => format!("tenant={t}"),
         };
         write!(
             out,
-            "{MAGIC}\n-- scope: {scope}\n-- parts: {}\n-- format: {}\n{BODY_MARK}\n",
+            "{MAGIC}\n-- scope: {scope}\n-- parts: {}\n-- format: {}\n{GENERATION_PREFIX}{}\n{BODY_MARK}\n",
             parts_token(header.parts),
             format_token(header.format),
+            header.restore_generation,
         )?;
         Ok(Self { out })
     }
@@ -666,6 +693,14 @@ impl<R: BufRead> FileReader<R> {
             "-- format: insert" => DumpFormat::Insert,
             _ => return Err(FileError::BadHeader),
         };
+        let restore_generation = match r
+            .header_line()?
+            .strip_prefix(GENERATION_PREFIX)
+            .and_then(parse_generation)
+        {
+            Some(g) => g,
+            None => return Err(FileError::BadHeader),
+        };
         if r.header_line()? != BODY_MARK {
             return Err(FileError::BadHeader);
         }
@@ -675,6 +710,7 @@ impl<R: BufRead> FileReader<R> {
                 scope,
                 parts,
                 format,
+                restore_generation,
             },
         ))
     }
@@ -842,6 +878,7 @@ mod tests {
             scope: DumpScope::Tenant("t1".into()),
             parts: DumpParts::All,
             format: DumpFormat::Copy,
+            restore_generation: 42,
         }
     }
 
@@ -937,7 +974,23 @@ mod tests {
         let bytes = sample();
         let text = String::from_utf8(bytes).expect("utf-8");
         for (from, to) in [
-            ("v1", "v2"),
+            ("v2", "v1"),
+            ("-- restore-generation: 42", "-- restore-generation: "),
+            ("-- restore-generation: 42", "-- restore-generation: 042"),
+            ("-- restore-generation: 42", "-- restore-generation: +42"),
+            ("-- restore-generation: 42", "-- restore-generation: -42"),
+            ("-- restore-generation: 42", "-- restore-generation:  42"),
+            ("-- restore-generation: 42", "-- restore-generation: 42 "),
+            ("-- restore-generation: 42", "-- restore-generation: 4x"),
+            (
+                "-- restore-generation: 42",
+                "-- restore-generation: 9223372036854775808",
+            ),
+            (
+                "-- restore-generation: 42",
+                "-- restore-generation: 18446744073709551616",
+            ),
+            ("-- restore-generation: 42\n", ""),
             ("scope: tenant=t1", "scope: tenant=t 1"),
             ("scope: tenant=t1", "scope: all"),
             ("parts: all", "parts: everything"),
@@ -951,9 +1004,59 @@ mod tests {
             );
         }
         assert!(FileReader::open(&b""[..]).is_err());
-        assert!(FileReader::open(&b"-- fandhe-db logical dump v1"[..]).is_err());
+        assert!(FileReader::open(&b"-- fandhe-db logical dump v2"[..]).is_err());
         let long = format!("{}{}\n", MAGIC, " ".repeat(MAX_HEADER_LINE));
         assert!(FileReader::open(long.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn generation_boundaries_round_trip() {
+        for g in [0u64, 1, i64::MAX as u64] {
+            let h = Header {
+                restore_generation: g,
+                ..header()
+            };
+            let bytes = FileWriter::begin(Vec::new(), &h)
+                .and_then(FileWriter::finish)
+                .expect("write");
+            let (_, back) = FileReader::open(&bytes[..]).expect("open");
+            assert_eq!(back.restore_generation, g);
+        }
+    }
+
+    #[test]
+    fn writer_rejects_a_generation_beyond_bigint_and_writes_nothing() {
+        let h = Header {
+            restore_generation: i64::MAX as u64 + 1,
+            ..header()
+        };
+        let mut sink = Vec::new();
+        assert_eq!(
+            FileWriter::begin(&mut sink, &h).err(),
+            Some(FileError::BadHeader)
+        );
+        assert!(sink.is_empty());
+        let ok = Header {
+            restore_generation: i64::MAX as u64,
+            ..header()
+        };
+        assert!(FileWriter::begin(&mut sink, &ok).is_ok());
+    }
+
+    #[test]
+    fn a_v1_header_without_a_generation_is_rejected() {
+        let v1 = "-- fandhe-db logical dump v1\n-- scope: shared\n-- parts: all\n\
+                  -- format: copy\n-- body\n-- end\n";
+        assert_eq!(
+            FileReader::open(v1.as_bytes()).err(),
+            Some(FileError::BadHeader)
+        );
+        let no_gen =
+            format!("{MAGIC}\n-- scope: shared\n-- parts: all\n-- format: copy\n-- body\n-- end\n");
+        assert_eq!(
+            FileReader::open(no_gen.as_bytes()).err(),
+            Some(FileError::BadHeader)
+        );
     }
 
     fn read_all(bytes: &[u8]) -> Result<usize, FileError> {
@@ -1001,14 +1104,14 @@ mod tests {
     #[test]
     fn reader_rejects_oversized_lengths_without_allocating() {
         let huge = format!(
-            "{}\n-- scope: shared\n-- parts: all\n-- format: copy\n-- body\n-- @stmt table {}\nx",
+            "{}\n-- scope: shared\n-- parts: all\n-- format: copy\n-- restore-generation: 0\n-- body\n-- @stmt table {}\nx",
             MAGIC,
             MAX_STATEMENT_BYTES + 1
         );
         assert_eq!(read_all(huge.as_bytes()), Err(FileError::TooLarge));
         // 上限以内の申告でも、実体が短ければ Truncated（申告分を先に確保しない）。
         let lie = format!(
-            "{}\n-- scope: shared\n-- parts: all\n-- format: copy\n-- body\n-- @stmt table {}\nx",
+            "{}\n-- scope: shared\n-- parts: all\n-- format: copy\n-- restore-generation: 0\n-- body\n-- @stmt table {}\nx",
             MAGIC, MAX_STATEMENT_BYTES
         );
         assert_eq!(read_all(lie.as_bytes()), Err(FileError::Truncated));

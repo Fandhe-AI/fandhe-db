@@ -33,6 +33,33 @@ pub(crate) fn stderr(o: &Output) -> String {
     String::from_utf8_lossy(&o.stderr).into_owned()
 }
 
+/// ダンプ本文から復元の世代行を取り除き、世代の値と残りを返す。
+fn split_generation(text: &str) -> (u64, String) {
+    let mut generation = None;
+    let mut rest = String::new();
+    for line in text.split_inclusive('\n') {
+        match line.strip_prefix("-- restore-generation: ") {
+            Some(v) if generation.is_none() => {
+                generation = Some(v.trim_end().parse::<u64>().expect("generation"));
+            }
+            _ => rest.push_str(line),
+        }
+    }
+    (generation.expect("generation line"), rest)
+}
+
+/// 復元先の再ダンプが元のダンプと世代行以外でバイト一致し、世代が厳密に大きいことを確かめる
+/// （RECOVER-17・Issue #2451。復元は世代を進めるので、世代行だけが受け入れ条件どおり変わる）。
+pub(crate) fn assert_redump_matches(again: &str, original: &str) {
+    let (g_again, rest_again) = split_generation(again);
+    let (g_orig, rest_orig) = split_generation(original);
+    assert_eq!(rest_again, rest_orig, "dump differs beyond the generation");
+    assert!(
+        g_again > g_orig,
+        "redump generation {g_again} must exceed {g_orig}"
+    );
+}
+
 pub(crate) fn dir_of(path: &str) -> PathBuf {
     Path::new(path).parent().expect("parent dir").to_path_buf()
 }
@@ -279,7 +306,7 @@ fn dump_round_trip_copy_respects_tenant_boundary() {
 
     // 他テナントの行・値・名前は出力に現れない。
     let text = read_text(&out);
-    assert!(text.starts_with("-- fandhe-db logical dump v1\n-- scope: tenant=tenant-a\n"));
+    assert!(text.starts_with("-- fandhe-db logical dump v2\n-- scope: tenant=tenant-a\n"));
     assert!(text.contains("COPY "), "copy format expected");
     for needle in [BOB_SECRET, BOB_SCHEMA, "tenant-b", "bob", "1000"] {
         assert!(!text.contains(needle), "dump leaked {needle:?}");
@@ -295,7 +322,7 @@ fn dump_round_trip_copy_respects_tenant_boundary() {
     let again = f.path("again.sql");
     let o = run(&dump_args(&restored, &again, &["--tenant", "tenant-a"]));
     assert_eq!(code(&o), Some(0), "stderr: {}", stderr(&o));
-    assert_eq!(read_text(&again), text);
+    assert_redump_matches(&read_text(&again), &text);
 
     let (_g, addr) = spawn_server(&f.users, &restored);
     let mut a = common::authenticate_to_ready_for_query(addr, "alice", "pw");
@@ -367,7 +394,7 @@ fn dump_round_trip_covers_every_object_kind() {
     let again = s(&dir.join("again.sql")).to_string();
     let o = run(&dump_args(&restored, &again, &["--tenant", "tenant-a"]));
     assert_eq!(code(&o), Some(0), "stderr: {}", stderr(&o));
-    assert_eq!(read_text(&again), text);
+    assert_redump_matches(&read_text(&again), &text);
 }
 
 const RICH_SCHEMA: &[&str] = &[
@@ -602,6 +629,7 @@ pub(crate) fn header(scope: DumpScope, parts: DumpParts) -> Header {
         scope,
         parts,
         format: DumpFormat::Copy,
+        restore_generation: 0,
     }
 }
 
@@ -672,7 +700,7 @@ fn restore_rejects_tampered_and_malformed_dumps() {
     let n = "CREATE TABLE t (id BIGINT PRIMARY KEY, b TEXT)".len();
 
     let mut variants: Vec<(&str, Vec<u8>)> = vec![
-        ("version", text.replacen("v1", "v9", 1).into_bytes()),
+        ("version", text.replacen("v2", "v9", 1).into_bytes()),
         (
             "scope",
             text.replacen("tenant=t1", "tenant=t 1", 1).into_bytes(),
@@ -711,7 +739,7 @@ fn restore_rejects_tampered_and_malformed_dumps() {
         ("select-as-insert", "insert", "SELECT 1"),
     ] {
         let bad = format!(
-            "{}\n-- scope: tenant=t1\n-- parts: all\n-- format: copy\n-- body\n\
+            "{}\n-- scope: tenant=t1\n-- parts: all\n-- format: copy\n-- restore-generation: 0\n-- body\n\
              -- @stmt {kind} {}\n{body};\n-- end\n",
             wire_server::dump_file::MAGIC,
             body.len()
@@ -962,6 +990,7 @@ fn restore_rejects_header_frame_mismatch() {
         scope,
         parts,
         format,
+        restore_generation: 0,
     };
     let tenant = || DumpScope::Tenant("t1".into());
     // shared にデータ枠（INSERT／COPY）。
