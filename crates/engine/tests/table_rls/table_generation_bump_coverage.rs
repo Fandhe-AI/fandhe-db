@@ -109,7 +109,8 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #2448（復元の世代番号。RECOVER-17）: `Storage::advance_restore_generation` の保守 commit。
     // 書き込むのは `restore_generation` 専用表だけで、`CATALOG_TABLE`・`user_rows` には触れず、
     // 世代も進めない（バンプ対象の表が構造的に存在しない）。
-    ("storage/restore_generation.rs", 123),
+    // Issue #3105: モジュール doc の追記で行が 4 行動いた（commit 内容は不変）。
+    ("storage/restore_generation.rs", 127),
     // Issue #2174（レプリカの適用ループ。RECOVER-15）: `Storage::apply_replicated_records` の保守 commit。
     // 適用するのはプライマリが commit したレコード本体（表の物理的な差分）で、`CATALOG_TABLE` 内の
     // テーブル世代もプライマリ側のバンプ結果が同じレコードに含まれて複製される。レプリカ側で
