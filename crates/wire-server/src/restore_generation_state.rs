@@ -110,7 +110,7 @@ impl GenerationState {
         let io = |e: std::io::Error| RestoreError::Io(e.kind());
         let (offset, slot) =
             encode_next_slot(state, next).map_err(|_| RestoreError::GenerationFailed)?;
-        // 初回は長さ 0。全 0 の 64 バイトは新規として読めるので、書きかけで止まっても安全。
+        // 初回は長さ 0。全 0 の 64 バイトは新規として読める。書きかけで止まった場合は読み取りが拒否する（fail-closed）。
         if self.file.metadata().map_err(io)?.len() < HIGH_WATER_FILE_LEN as u64 {
             self.file.set_len(HIGH_WATER_FILE_LEN as u64).map_err(io)?;
         }

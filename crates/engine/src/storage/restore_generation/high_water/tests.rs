@@ -37,13 +37,31 @@ fn slots_alternate_and_the_latest_value_wins() {
 }
 
 #[test]
-fn a_torn_slot_falls_back_to_the_other_side() {
+fn a_corrupt_latest_slot_is_rejected_not_rolled_back() {
     let mut f = Vec::new();
     apply(&mut f, 7).expect("a");
     apply(&mut f, 8).expect("b");
-    // 新しい側（スロット 1）を壊す → 古い側の 7 が残る。
+    // 公開済みの最新側（スロット 1）の 1 バイトが壊れても、古い側の 7 は採らない。
     f[40] ^= 0xff;
-    assert_eq!(decode_high_water(&f).expect("fallback").value, 7);
+    assert!(decode_high_water(&f).is_err());
+    // 古い側が壊れた場合も、書きかけとは区別できないので拒否する。
+    let mut g = Vec::new();
+    apply(&mut g, 7).expect("a");
+    apply(&mut g, 8).expect("b");
+    g[10] ^= 0xff;
+    assert!(decode_high_water(&g).is_err());
+}
+
+#[test]
+fn a_zeroed_slot_is_accepted_only_after_the_first_write() {
+    let mut f = Vec::new();
+    apply(&mut f, 7).expect("a");
+    assert_eq!(decode_high_water(&f).expect("first").value, 7);
+    apply(&mut f, 8).expect("b");
+    apply(&mut f, 9).expect("c");
+    // seq 3 の側が残り、もう一方が全 0 になった（巻き戻しの形）→ 拒否。
+    f[..SLOT_LEN].fill(0);
+    assert!(decode_high_water(&f).is_err());
 }
 
 #[test]

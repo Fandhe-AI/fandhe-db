@@ -14,7 +14,11 @@
 //!
 //! - 長さ 0 と全 0 の 64 バイトは新規（高水位 0。作成直後・初回書き込みの途中で止まった状態）
 //! - それ以外で長さが 64 でなければ拒否する
-//! - 検査を通ったスロットのうち `seq` が最大のものを採る。片側が壊れていても、もう一方が有効なら採る
+//! - 両側が有効なら `seq` が大きい方を採る。片側が全 0（未書き込み）なのは、もう一方が `seq == 1`
+//!   （初回の書き込みだけが済んだ状態）のときに限り許す
+//! - 片側でも全 0 以外の無効なスロット（checksum 不正・書きかけ・破損）があれば拒否する。公開済みの最新の
+//!   スロットが壊れた場合と書きかけで止まった場合を区別できず、古い側を採ると公開済みの世代を再利用して
+//!   しまうため（復元の公開は記録の fsync の後なので、書きかけで止まった場合も運用者の確認を要する）
 //! - 検査を通ったスロットが無い（他のファイルを誤って指定した場合を含む）・値が上限超過・両側の `seq` が
 //!   同じなら拒否する。読み取りは何も書かないので、誤指定したファイルの内容を壊さない
 
@@ -48,6 +52,11 @@ fn checksum(head: &[u8]) -> [u8; 8] {
     out
 }
 
+/// スロットが全 0（未書き込み）か。
+fn is_zero_slot(slot: &[u8]) -> bool {
+    slot.len() == SLOT_LEN && slot.iter().all(|b| *b == 0)
+}
+
 /// スロット 1 つを検査して `(seq, value)` にする。形式が合わなければ `None`。
 fn parse_slot(slot: &[u8]) -> Option<(u64, u64)> {
     let head = slot.get(..24)?;
@@ -73,8 +82,14 @@ pub fn decode_high_water(bytes: &[u8]) -> Result<HighWaterState> {
     if bytes.len() != HIGH_WATER_FILE_LEN {
         return Err(invalid());
     }
-    let a = bytes.get(..SLOT_LEN).and_then(parse_slot);
-    let b = bytes.get(SLOT_LEN..).and_then(parse_slot);
+    let raw_a = bytes.get(..SLOT_LEN).ok_or_else(invalid)?;
+    let raw_b = bytes.get(SLOT_LEN..).ok_or_else(invalid)?;
+    let a = parse_slot(raw_a);
+    let b = parse_slot(raw_b);
+    // 全 0 以外の無効なスロットは、最新の公開済みスロットの破損かもしれないので古い側へ戻さず拒否する。
+    if (a.is_none() && !is_zero_slot(raw_a)) || (b.is_none() && !is_zero_slot(raw_b)) {
+        return Err(invalid());
+    }
     let (active_slot, (seq, value)) = match (a, b) {
         (Some(x), Some(y)) if x.0 == y.0 => return Err(invalid()),
         (Some(x), Some(y)) => {
@@ -84,8 +99,10 @@ pub fn decode_high_water(bytes: &[u8]) -> Result<HighWaterState> {
                 (1, y)
             }
         }
-        (Some(x), None) => (0, x),
-        (None, Some(y)) => (1, y),
+        // 未書き込みの側があってよいのは初回の書き込みだけが済んだ状態（seq == 1）のとき。
+        (Some(x), None) if x.0 == 1 => (0, x),
+        (None, Some(y)) if y.0 == 1 => (1, y),
+        (Some(_), None) | (None, Some(_)) => return Err(invalid()),
         (None, None) => return Err(invalid()),
     };
     // 検査を通った値が範囲外なら、古い側へ巻き戻さず拒否する（高水位を下げない）。

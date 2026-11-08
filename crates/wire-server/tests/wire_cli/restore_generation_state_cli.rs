@@ -149,12 +149,15 @@ fn recover17_an_invalid_state_file_publishes_nothing_and_is_left_untouched() {
     let mut both_corrupt = valid.clone();
     both_corrupt[10] ^= 0xff;
     both_corrupt[40] ^= 0xff;
+    let mut one_corrupt = valid.clone();
+    one_corrupt[10] ^= 0xff;
     let mut over_limit = vec![0u8; HIGH_WATER_FILE_LEN];
     over_limit[..8].copy_from_slice(b"FDRGHW01");
     over_limit[8..16].copy_from_slice(&1u64.to_le_bytes());
     over_limit[16..24].copy_from_slice(&u64::MAX.to_le_bytes());
     let cases: Vec<(&str, Vec<u8>)> = vec![
         ("both-corrupt", both_corrupt),
+        ("one-corrupt", one_corrupt),
         ("bad-length", vec![1u8; 10]),
         (
             "foreign",
