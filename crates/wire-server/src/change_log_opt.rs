@@ -193,6 +193,9 @@ pub struct VerifyArgs {
     /// 突き合わせる停止中の DB（任意）。指定すると DB の識別子・timeline・有効化時の世代・水位と照合し、
     /// 先頭と末尾の欠落も検出する。省略するとディレクトリ内の整合（連鎖・チェックサム）だけを検査する。
     pub db: Option<PathBuf>,
+    /// 保持しているフルバックアップ（繰り返し指定できる。Issue #3092）。指定すると、最も古い終点より前の
+    /// セグメントを `change-log-cleanup` で意図して消したアーカイブとして検査する（`--db` が前提）。
+    pub bases: Vec<PathBuf>,
 }
 
 /// `change-log-verify` サブコマンドの引数（サブコマンド名より後ろ）を解釈する。未知の引数・値欠落・
@@ -200,14 +203,22 @@ pub struct VerifyArgs {
 pub fn parse_verify(args: &[String]) -> Result<VerifyArgs, String> {
     let mut dir: Option<&str> = None;
     let mut db: Option<&str> = None;
+    let mut bases: Vec<&str> = Vec::new();
     let mut it = args.iter();
     while let Some(arg) = it.next() {
+        if arg == "--base" {
+            match it.next() {
+                Some(v) => bases.push(v.as_str()),
+                None => return Err(format!("{arg} requires a value")),
+            }
+            continue;
+        }
         let slot =
             match arg.as_str() {
                 "--archive-dir" => &mut dir,
                 "--db" => &mut db,
                 _ => return Err(
-                    "unknown argument (usage: change-log-verify --archive-dir <dir> [--db <path>])"
+                    "unknown argument (usage: change-log-verify --archive-dir <dir> [--db <path>] [--base <backup>]...)"
                         .into(),
                 ),
             };
@@ -225,7 +236,14 @@ pub fn parse_verify(args: &[String]) -> Result<VerifyArgs, String> {
     let dir =
         accept_archive_dir(false, dir).map_err(|m| m.replace(ARCHIVE_DIR_FLAG, "--archive-dir"))?;
     let db = db.map(crate::backup_opt::validate_db).transpose()?;
-    Ok(VerifyArgs { dir, db })
+    if !bases.is_empty() && db.is_none() {
+        return Err("--base requires --db".into());
+    }
+    let bases = bases
+        .into_iter()
+        .map(|b| crate::backup_opt::validate_existing_file("--base", b))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(VerifyArgs { dir, db, bases })
 }
 
 #[cfg(test)]
@@ -368,6 +386,31 @@ mod tests {
         assert!(ok.db.is_none());
         let ok = parse_verify(&v(&["--archive-dir", &dir, "--db", exe])).expect("with db");
         assert_eq!(ok.db.as_deref(), Some(std::path::Path::new(exe)));
+        assert!(ok.bases.is_empty());
+        // --base は繰り返し指定でき、--db が前提。
+        let ok = parse_verify(&v(&[
+            "--archive-dir",
+            &dir,
+            "--db",
+            exe,
+            "--base",
+            exe,
+            "--base",
+            exe,
+        ]))
+        .expect("with bases");
+        assert_eq!(ok.bases.len(), 2);
+        assert!(parse_verify(&v(&["--archive-dir", &dir, "--base", exe])).is_err());
+        assert!(parse_verify(&v(&[
+            "--archive-dir",
+            &dir,
+            "--db",
+            exe,
+            "--base",
+            "/nonexistent-base-for-test"
+        ]))
+        .is_err());
+        assert!(parse_verify(&v(&["--archive-dir", &dir, "--db", exe, "--base"])).is_err());
     }
 
     #[cfg(unix)]

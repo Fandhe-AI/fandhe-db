@@ -1401,10 +1401,23 @@ pub(in crate::storage) fn verify_against_db(
 }
 
 /// [`verify_against_db`] の本体。読み取りトランザクションだけを使うため、読み取り専用 open
-/// （`ReadOnlyStorage`）からも呼べる。
+/// （`ReadOnlyStorage`）からも呼べる。先頭は有効化時の世代の次を厳密に要求する。
 pub(in crate::storage) fn verify_against_read(
     read: &redb::ReadTransaction,
     dir: &Path,
+) -> Result<ArchiveSummary> {
+    verify_against_read_from(read, dir, None)
+}
+
+/// [`verify_against_read`] の一般化。`retained_from` が `Some(l)` のときは、`l` より前のセグメントを
+/// 意図して消した（Issue #3092 の保持管理）アーカイブを検査する。残ったセグメントが 1 本の連鎖で
+/// あること、先頭が `max(l, 有効化時の世代 + 1)` 以下から始まること（保持区間の先頭の紛失の検出）、
+/// 水位に届く末尾があること（末尾の紛失の検出）を要求する。セグメントが 0 本なのは水位が `l` 未満の
+/// ときだけ許す。`None` は従来どおり先頭を有効化時の世代の次に固定する。
+pub(in crate::storage) fn verify_against_read_from(
+    read: &redb::ReadTransaction,
+    dir: &Path,
+    retained_from: Option<u64>,
 ) -> Result<ArchiveSummary> {
     check_dir(dir)?;
     let id: Option<[u8; DB_ID_LEN]> = match read.open_table(META_TABLE) {
@@ -1419,18 +1432,41 @@ pub(in crate::storage) fn verify_against_read(
     let timeline = read_meta_u64(read, META_KEY_TIMELINE)?.ok_or(ArchiveError::LogCorrupt)?;
     let base = read_meta_u64(read, META_KEY_BASE_GENERATION)?.ok_or(ArchiveError::LogCorrupt)?;
     let archived = read_meta_u64(read, META_KEY_ARCHIVED_LSN)?.unwrap_or(base);
+    let first_required = base.checked_add(1).ok_or(ArchiveError::LsnGap)?;
     let expect = ArchiveExpectation {
         db_id: Some(id),
         timeline: Some(timeline),
-        start_lsn: base.checked_add(1),
+        start_lsn: if retained_from.is_none() {
+            Some(first_required)
+        } else {
+            None
+        },
     };
     let summary = verify_listed(dir, &expect, None, None)?;
-    // 水位が進んでいるのに、その LSN まで届くセグメントが無い（末尾の紛失）。
-    if archived > base && summary.last_lsn.is_none_or(|l| l < archived) {
-        return Err(ArchiveError::LsnGap);
+    if let (Some(l), Some(first)) = (retained_from, summary.first_lsn) {
+        // 保持区間の先頭の紛失（先頭が保持の始点より後ろ）。
+        if first > l.max(first_required) {
+            return Err(ArchiveError::LsnGap);
+        }
+    }
+    // 水位が進んでいるのに、その LSN まで届くセグメントが無い（末尾の紛失）。全削除は水位が保持の始点
+    // 未満のときだけ正当。
+    if archived > base {
+        match summary.last_lsn {
+            Some(last) if last >= archived => {}
+            None if retained_from.is_some_and(|l| archived < l) => {}
+            _ => return Err(ArchiveError::LsnGap),
+        }
     }
     Ok(summary)
 }
+
+pub use cleanup::{
+    execute_archive_cleanup, plan_archive_cleanup, retention_point_of, CleanupError, CleanupPlan,
+    CleanupPolicy, CleanupReport, RetentionPoint,
+};
+
+mod cleanup;
 
 #[cfg(test)]
 mod tests;
