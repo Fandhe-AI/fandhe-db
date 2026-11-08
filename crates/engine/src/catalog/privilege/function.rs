@@ -56,6 +56,37 @@ pub(crate) fn acl_initialized_in_txn<R: ReadSource>(
     }
 }
 
+/// `tenant` で ACL を実体化済みの関数 ID を昇順で返す（論理ダンプの書き出し専用。Issue #3096）。
+/// 関数以外の種別の印・不正な値は `CorruptSchema`。
+pub(crate) fn list_acl_initialized_functions_in_txn<R: ReadSource>(
+    src: &R,
+    tenant: &str,
+) -> Result<Vec<u64>> {
+    validate_tenant(tenant)?;
+    let table = match src.open_table(ACL_INIT_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut out = Vec::new();
+    for entry in table.range((tenant, 0u8, "")..)? {
+        let (k, v) = entry?;
+        let (t, kind, key) = k.value();
+        if t != tenant {
+            break;
+        }
+        if kind != KIND_FUNCTION || v.value() != [ACL_INIT_VERSION] {
+            return Err(corrupt());
+        }
+        let id: u64 = key.parse().map_err(|_| corrupt())?;
+        if id == 0 || id.to_string() != key {
+            return Err(corrupt());
+        }
+        out.push(id);
+    }
+    Ok(out)
+}
+
 /// 関数 `function_id` について、`role_ids` のいずれか（と PUBLIC）が持つ権限ビットの和を返す（EXECUTE）。
 /// 印が無ければ暗黙の既定で PUBLIC が EXECUTE を持つ。印が無いのに行がある場合は `CorruptSchema`。
 pub(crate) fn function_privileges_in_txn<R: ReadSource>(

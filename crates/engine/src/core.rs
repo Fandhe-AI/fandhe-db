@@ -4354,6 +4354,17 @@ impl EngineCore {
         self.storage.export_logical_dump(scope, format, sink)
     }
 
+    /// 論理ダンプの復元指示（`RESTORE ...`。ロール・権限の状態。RECOVER-16・Issue #3096）を 1 件、`tenant` へ
+    /// 単一 write txn で適用する。wire-server の `dump-restore`（空の一時 DB への復元）だけが呼ぶ入口で、
+    /// SQL・NoSQL の表層・認証済みセッションからは呼べない。[`Storage::apply_restore_directive`] へ委譲する。
+    pub fn apply_restore_directive(
+        &self,
+        tenant: &str,
+        directive: &str,
+    ) -> std::result::Result<(), crate::catalog::ddl_export::RestoreDirectiveError> {
+        self.storage.apply_restore_directive(tenant, directive)
+    }
+
     /// 変更ログの未アーカイブのレコードを外部セグメントへ書き出し、保持設定があれば刈り込む
     /// （RECOVER-14・Issue #2167）。wire-server のアーカイブ常駐スレッドが周期的に呼ぶ入口で、
     /// [`Storage::archive_change_log`] へ委譲する。SQL・NoSQL の表層からは呼べない。

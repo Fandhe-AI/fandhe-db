@@ -6,10 +6,11 @@
 //!    元と一致する（往復で同一カタログ）
 //! 2. 書き出せないオブジェクト（暗黙 id の表）があればダンプ全体が失敗する（fail-closed）
 //! 3. 他テナントのオブジェクトは出力にもエラーにも現れない
-//! 4. 権限・メンバーシップなど文で戻せない状態があれば全体が失敗する
+//! 4. ロール・権限（所有者・付与者・ACL・既定権限・メンバーシップ・初期権限）も指示文として往復し、
+//!    他テナントの分は混ざらない（Issue #3096）
 
 use engine::catalog::ddl_export::{DdlSection, SchemaDdlError, SchemaDdlScope};
-use engine::core::EngineCore;
+use engine::core::{BootstrapUser, EngineCore, UsersFileRoleBinding};
 use engine::kernel::CpuScalarProvider;
 use engine::policy::PolicyContext;
 use engine::sql::allowlist::SqlSurfaceError;
@@ -57,7 +58,13 @@ fn dump(
 
 fn replay(core: &EngineCore, tenant: &str, stmts: &[(DdlSection, String)]) {
     for (_, sql) in stmts {
-        ok(core, tenant, sql);
+        if sql.starts_with("RESTORE ") {
+            // ロール・権限の復元指示は SQL ではなく engine の復元用入口で適用する（Issue #3096）。
+            core.apply_restore_directive(tenant, sql)
+                .unwrap_or_else(|e| panic!("restore directive must apply: {e}"));
+        } else {
+            ok(core, tenant, sql);
+        }
     }
 }
 
@@ -366,26 +373,221 @@ fn schema_scoped_sequence_with_a_current_value_fails_closed() {
     assert!(matches!(err, SchemaDdlError::Unsupported(u) if u.kind == "sequence"));
 }
 
+fn user(line: usize, name: &str, tenant: &str, ddl: bool) -> BootstrapUser {
+    BootstrapUser {
+        line,
+        username: name.to_string(),
+        tenant_id: tenant.to_string(),
+        phc: format!("$argon2id$v=19$m=1,t=1,p=1$c2FsdA$phc-of-{name}-{tenant}"),
+        scram_verifier: None,
+        ddl_listed: ddl,
+    }
+}
+
+/// 認証層が行う束縛の写し（ロールの束縛・全権限フラグ・DDL 権限）。
+fn bound_session(core: &EngineCore, tenant: &str, name: &str, ddl: bool) -> SessionState {
+    let UsersFileRoleBinding::Role(c) = core.resolve_users_file_role(tenant, name).expect("find")
+    else {
+        panic!("{name} must be bound");
+    };
+    let mut s = SessionState::default();
+    s.bind_role_ids(c.role_id, c.role_id);
+    assert!(s.bind_resolution_tenant(tenant));
+    if ddl {
+        s.allow_ddl();
+    }
+    if c.initial_privileges.all_object_privileges {
+        s.grant_bootstrap_all_privileges();
+    }
+    s
+}
+
+fn run_as(core: &EngineCore, tenant: &str, s: &mut SessionState, sql: &str) {
+    core.execute_sql_in_session(&ctx(tenant), s, sql)
+        .unwrap_or_else(|e| panic!("{sql} must succeed: {e}"));
+}
+
+/// ロール・権限（所有者・付与者の連鎖・列・PUBLIC・関数・SEQUENCE・既定権限・メンバーシップ・初期権限・
+/// 旧形式ハッシュ・マーカー）を持つテナントを作る（Issue #3096）。
+fn populate_access(core: &EngineCore, t: &str) {
+    core.bootstrap_users_file(&[user(1, "alice", t, true), user(2, "bob", t, false)])
+        .expect("bootstrap");
+    for sql in [
+        "CREATE ROLE reader LOGIN PASSWORD 'pw'",
+        "CREATE ROLE writer NOLOGIN NOINHERIT",
+    ] {
+        ok(core, t, sql);
+    }
+    let mut alice = bound_session(core, t, "alice", true);
+    for sql in [
+        "CREATE SCHEMA s1",
+        "CREATE TABLE tab (a INTEGER, b INTEGER)",
+        "CREATE TABLE s1.u (a INTEGER)",
+        "CREATE VIEW vw AS SELECT a FROM tab",
+        "CREATE SEQUENCE q",
+        "CREATE FUNCTION f(x INTEGER) RETURNS INTEGER LANGUAGE sql AS $q$ SELECT x $q$",
+        "CREATE FUNCTION g(x INTEGER, y TEXT) RETURNS INTEGER LANGUAGE sql AS $q$ SELECT x $q$",
+        "GRANT SELECT ON tab TO reader WITH GRANT OPTION",
+        "GRANT UPDATE (b) ON tab TO PUBLIC",
+        "GRANT USAGE ON SCHEMA s1 TO reader",
+        "GRANT SELECT ON s1.u TO writer",
+        "GRANT SELECT ON vw TO bob",
+        "GRANT USAGE ON SEQUENCE q TO reader",
+        "REVOKE EXECUTE ON FUNCTION f FROM PUBLIC",
+        "GRANT EXECUTE ON FUNCTION f TO reader",
+        "GRANT reader TO writer",
+        "GRANT writer TO bob WITH ADMIN OPTION",
+        "ALTER DEFAULT PRIVILEGES FOR ROLE alice IN SCHEMA s1 GRANT SELECT ON TABLES TO reader",
+        "ALTER DEFAULT PRIVILEGES FOR ROLE alice REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC",
+    ] {
+        run_as(core, t, &mut alice, sql);
+    }
+    // GRANT OPTION を受けた非所有者が再付与する（付与者の連鎖）。
+    let mut reader = bound_session(core, t, "reader", false);
+    run_as(core, t, &mut reader, "GRANT SELECT ON tab TO writer");
+}
+
+fn dump_text(core: &EngineCore, tenant: &str) -> Vec<(DdlSection, String)> {
+    dump(core, &SchemaDdlScope::shared_and_tenant(tenant)).expect("dump")
+}
+
 #[test]
-fn role_membership_and_privileges_fail_closed() {
-    let p1 = unique_db_path("dump-priv");
+fn roles_and_privileges_round_trip_to_an_identical_dump() {
+    let p1 = unique_db_path("dump-priv-src");
+    let _g1 = CleanupGuard(p1.clone());
+    let p2 = unique_db_path("dump-priv-dst");
+    let _g2 = CleanupGuard(p2.clone());
+    let src = open_core(&p1);
+    populate_access(&src, "tenant-a");
+    let first = dump_text(&src, "tenant-a");
+    let all: String = first
+        .iter()
+        .map(|(_, s)| s.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    for needle in [
+        "RESTORE BOOTSTRAP MARKER",
+        "RESTORE ROLE \"alice\" BOOTSTRAP PRIVILEGES ALL_OBJECTS, DDL",
+        "RESTORE ROLE \"alice\" LEGACY PASSWORD",
+        "RESTORE MEMBERSHIP",
+        "RESTORE OWNER TABLE \"tab\" TO \"alice\"",
+        "RESTORE OWNER SCHEMA \"s1\" TO \"alice\"",
+        "RESTORE ACL TABLE \"tab\" TO \"writer\" BY \"reader\" PRIVILEGES SELECT",
+        "RESTORE ACL COLUMN \"tab\" \"b\" TO PUBLIC BY \"alice\" PRIVILEGES UPDATE",
+        "RESTORE ACL INIT FUNCTION",
+        "RESTORE DEFAULT ACL ROLE \"alice\" IN SCHEMA \"s1\" KIND TABLES TO \"reader\"",
+        "RESTORE DEFAULT ACL INIT ROLE \"alice\"",
+    ] {
+        assert!(all.contains(needle), "dump must contain {needle:?}\n{all}");
+    }
+    let dst = open_core(&p2);
+    replay(&dst, "tenant-a", &first);
+    assert_eq!(first, dump_text(&dst, "tenant-a"), "re-dump must match");
+    // 復元先の資格情報（旧形式ハッシュ・初期権限・マーカー）が引ける。
+    let UsersFileRoleBinding::Role(c) = dst
+        .resolve_users_file_role("tenant-a", "alice")
+        .expect("find")
+    else {
+        panic!("alice must exist");
+    };
+    assert!(c.initial_privileges.all_object_privileges && c.initial_privileges.ddl);
+    assert!(c.bootstrapped);
+}
+
+#[test]
+fn another_tenants_roles_and_privileges_never_reach_the_dump() {
+    let p1 = unique_db_path("dump-priv-iso");
     let _g1 = CleanupGuard(p1.clone());
     let src = open_core(&p1);
-    ok(&src, "tenant-a", "CREATE TABLE t (a INTEGER)");
-    ok(&src, "tenant-a", "CREATE ROLE adm LOGIN PASSWORD 'pw'");
-    ok(&src, "tenant-a", "CREATE ROLE reader NOLOGIN");
-    dump(&src, &SchemaDdlScope::shared_and_tenant("tenant-a")).expect("roles alone are fine");
-    // 権限の付与は束縛済みのロールが行う（付与者の記録が要る）。最初のロール `adm` の ID は 1。
-    let mut s = SessionState::default();
-    s.allow_ddl();
-    s.bind_role_ids(1, 1);
-    assert!(s.bind_resolution_tenant("tenant-a"));
-    src.execute_sql_in_session(&ctx("tenant-a"), &mut s, "GRANT SELECT ON t TO reader")
-        .expect("grant");
-    let err = dump(&src, &SchemaDdlScope::shared_and_tenant("tenant-a")).expect_err("acl present");
-    assert!(matches!(err, SchemaDdlError::Unsupported(u) if u.kind == "privilege"));
-    // 他テナントのダンプには影響しない（存在も示さない）。
-    dump(&src, &SchemaDdlScope::shared_and_tenant("tenant-b")).expect("other tenant unaffected");
+    populate_access(&src, "tenant-a");
+    // 他テナントには同名ロールと、固有名のロール・SCHEMA・権限を作る。
+    src.bootstrap_users_file(&[user(3, "alice", "tenant-b", true)])
+        .expect("bootstrap b");
+    ok(&src, "tenant-b", "CREATE ROLE other_secret NOLOGIN");
+    let mut b = bound_session(&src, "tenant-b", "alice", true);
+    run_as(&src, "tenant-b", &mut b, "CREATE SCHEMA hidden_schema");
+    run_as(
+        &src,
+        "tenant-b",
+        &mut b,
+        "GRANT USAGE ON SCHEMA hidden_schema TO other_secret",
+    );
+    let a_dump = dump_text(&src, "tenant-a");
+    let all: String = a_dump
+        .iter()
+        .map(|(_, s)| s.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    for leaked in [
+        "other_secret",
+        "hidden_schema",
+        "tenant-b",
+        "phc-of-alice-tenant-b",
+    ] {
+        assert!(
+            !all.contains(leaked),
+            "tenant-a dump must not mention {leaked}"
+        );
+    }
+    // 共有のみのダンプには権限系を一切出さない。
+    let shared = dump(&src, &SchemaDdlScope::shared_only()).expect("shared dump");
+    assert!(shared.iter().all(|(_, s)| !s.starts_with("RESTORE ")));
+    // 復元した tenant-a から tenant-b のロールは引けない。
+    let p2 = unique_db_path("dump-priv-iso-dst");
+    let _g2 = CleanupGuard(p2.clone());
+    let dst = open_core(&p2);
+    replay(&dst, "tenant-a", &a_dump);
+    let err = dst
+        .apply_restore_directive(
+            "tenant-a",
+            "RESTORE ROLE \"other_secret\" BOOTSTRAP PRIVILEGES DDL",
+        )
+        .expect_err("unknown role in this tenant");
+    assert_eq!(err.wire_code(), "42704");
+}
+
+#[test]
+fn restore_directives_reject_unknown_names_and_malformed_text_with_fixed_messages() {
+    let p1 = unique_db_path("dump-priv-bad");
+    let _g1 = CleanupGuard(p1.clone());
+    let src = open_core(&p1);
+    ok(&src, "tenant-a", "CREATE ROLE r1 NOLOGIN");
+    for (text, code) in [
+        ("RESTORE OWNER TABLE \"nosuch\" TO \"r1\"", "42704"),
+        ("RESTORE OWNER SCHEMA \"nosuch\" TO \"r1\"", "42704"),
+        (
+            "RESTORE ACL TABLE \"t\" TO PUBLIC BY \"r1\" PRIVILEGES SELECT",
+            "42704",
+        ),
+        ("RESTORE ACL INIT FUNCTION 'nosuch(integer)'", "42704"),
+        (
+            "RESTORE MEMBERSHIP \"r1\" MEMBER \"nobody\" GRANTOR NONE OPTIONS NONE",
+            "42704",
+        ),
+        (
+            "RESTORE ROLE \"r1\" LEGACY PASSWORD 'x'; DROP TABLE t",
+            "42601",
+        ),
+        ("DROP TABLE t", "42601"),
+    ] {
+        let err = src
+            .apply_restore_directive("tenant-a", text)
+            .expect_err(text);
+        assert_eq!(err.wire_code(), code, "{text}");
+        let shown = format!("{err} {err:?}");
+        assert!(
+            !shown.contains("nosuch") && !shown.contains("nobody"),
+            "{shown}"
+        );
+    }
+    // 旧形式ハッシュは 1 度だけ（既にあるロールへの上書きは拒否）。
+    src.apply_restore_directive("tenant-a", "RESTORE ROLE \"r1\" LEGACY PASSWORD 'hash-1'")
+        .expect("first");
+    let err = src
+        .apply_restore_directive("tenant-a", "RESTORE ROLE \"r1\" LEGACY PASSWORD 'hash-2'")
+        .expect_err("second");
+    assert_eq!(err.wire_code(), "22023");
+    assert!(!format!("{err} {err:?}").contains("hash-"));
 }
 
 #[test]
