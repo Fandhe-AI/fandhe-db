@@ -25,6 +25,12 @@ use crate::test_util::temp_db::TempDir;
 
 const TENANT: &str = "tenant-a";
 
+/// 手で組んだセグメントの権限を 0600 にする（読み取り器は他者が書けるファイルを拒否する。umask に依らせない）。
+fn set_owner_only(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+}
+
 /// 書き出し先に使える（他者が書けない）一時ディレクトリ。umask に依らず 0755 にする。
 fn private_dir(label: &str) -> TempDir {
     let d = TempDir::new(label);
@@ -337,6 +343,7 @@ fn retime_segment(src: &Path, dst: &Path, times: &[i64]) {
     let sum = crate::crypto::sha256::digest(&file);
     file.extend(sum);
     std::fs::write(dst, file).expect("write");
+    set_owner_only(dst);
 }
 
 #[test]
