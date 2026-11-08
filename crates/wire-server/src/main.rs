@@ -550,7 +550,8 @@
 //! 直前のベース（フルバックアップまたは前回の増分）が終わった commit の次から最新までのログ区間を増分
 //! バックアップとして書き出す（Issue #2168・RECOVER-13・RECOVER-14 ポインタ。変更ログ `--change-log` を有効にした
 //! DB に限る）。終了コード: 0=成功、1=実行時の失敗（連鎖の切断・別 DB・区間が空・稼働中を含む）、2=引数／
-//! 出力先の拒否。詳細は `wire_server::incremental_opt`。
+//! 出力先の拒否。`--change-log-archive-dir <dir>` を足すと、保持設定で刈り込まれた区間をアーカイブから補う
+//! （Issue #3099・RECOVER-14 ポインタ。欠落・改ざんは何も公開せず 1）。詳細は `wire_server::incremental_opt`。
 //!
 //! `wire-server dump --db <path> --out <file> (--tenant <id> | --shared-only) [--schema-only | --data-only]
 //! [--format copy|insert]` サブコマンドは、**停止中**の DB から論理ダンプ（SQL スクリプト形式）を新規ファイルへ
@@ -4454,7 +4455,11 @@ fn run_backup_incremental(args: &[String]) -> ExitCode {
             ReadOnlyOpenError::InUse => IncrementalError::InUse,
             _ => IncrementalError::SourceUnreadable,
         })?;
-        ro.export_incremental(&base, &parsed.out)
+        match &parsed.archive_dir {
+            // 刈り込み済みの区間をアーカイブから補う（Issue #3099・RECOVER-14）。
+            Some(dir) => ro.export_incremental_with_archive(&base, dir, &parsed.out),
+            None => ro.export_incremental(&base, &parsed.out),
+        }
     });
     let (code, msg) = incremental_opt::classify(&result);
     match code {
