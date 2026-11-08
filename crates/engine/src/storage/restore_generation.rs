@@ -9,7 +9,7 @@
 //! 値が壊れている・欠けている・上限に達した場合は黙って補わず `Err` とする（fail-closed）。
 //! 書き込みは変更ログの記録に関与しない保守 commit で行う。
 
-use redb::{ReadableDatabase, ReadableTable as _, ReadableTableMetadata as _, TableDefinition};
+use redb::{ReadableDatabase, ReadableTable as _, TableDefinition, TableHandle as _};
 
 use super::{Result, Storage, StorageError};
 
@@ -101,14 +101,18 @@ impl Storage {
 
     fn advance_in_txn(&self, floor: u64) -> Result<u64> {
         let txn = self.begin_write_txn()?;
+        // `open_table` は未存在の表を作成してしまうため、作成前に存在を確かめる。0 を許すのは表が
+        // 無かった場合（新規作成した DB）だけで、既存の表からキーが欠けた状態は拒否する（fail-closed）。
+        let table_existed = txn
+            .list_tables()?
+            .any(|handle| handle.name() == RESTORE_GENERATION_TABLE_NAME);
         // 許可（clippy::disallowed_methods）: 本表は復元の世代専用で、変更ログの捕捉・表世代の対象外。
         #[allow(clippy::disallowed_methods)]
         let mut table = txn.open_table(TABLE)?;
         let stored: Option<Vec<u8>> = table.get(KEY)?.map(|v| v.value().to_vec());
         let current = match stored {
             Some(bytes) => decode(&bytes)?,
-            // 表を作った直後（空）は 0。ただし既存の表でキーだけ欠けた状態は拒否する。
-            None if table.is_empty()? => 0,
+            None if !table_existed => 0,
             None => return Err(invalid()),
         };
         let next = next_generation(current, floor)?;

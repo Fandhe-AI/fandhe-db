@@ -10,6 +10,8 @@
 #             - persist3_on_disk_row_entry_layout_via_raw_redb: redb の表一覧を「rows と世代表だけ」と固定している
 #             - *_latency_is_independent_of_row_count（4 件）: 行数が増えても遅延が増えないことを測るため、
 #               O(DB) の突き合わせでは落ちる（2 段目で突き合わせなしで流す）
+#             - restore_generation::recover*（Issue #2448・RECOVER-17）: 復元の世代を進める API は変更ログを
+#               有効にしない復元先の DB にだけ使うため、強制有効化の Storage では設計どおり拒否される
 #   2 段目: FANDHE_CHANGE_LOG_ORACLE=force（強制有効化のみ）で上記の遅延 4 件だけを流す。
 #           有効時の実コストが DB サイズに依存しないことの確認になる。
 # Makefile の change-log-oracle ターゲット・CI の change-log-oracle ジョブから呼ばれる。
@@ -31,6 +33,7 @@ fi
 echo "== stage 1: forced change log + oracle (FANDHE_CHANGE_LOG_ORACLE=1)"
 FANDHE_CHANGE_LOG_ORACLE=1 cargo test -p fandhe-db-engine --all-features --no-fail-fast --test '*' -- \
     --skip persist3_on_disk_row_entry_layout_via_raw_redb \
+    --skip restore_generation::recover \
     --skip latency_is_independent_of_row_count
 
 echo "== stage 2: forced change log without the oracle (FANDHE_CHANGE_LOG_ORACLE=force), latency tests"

@@ -108,7 +108,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #2448（復元の世代番号。RECOVER-17）: `Storage::advance_restore_generation` の保守 commit。
     // 書き込むのは `restore_generation` 専用表だけで、`CATALOG_TABLE`・`user_rows` には触れず、
     // 世代も進めない（バンプ対象の表が構造的に存在しない）。
-    ("storage/restore_generation.rs", 117),
+    ("storage/restore_generation.rs", 121),
     ("storage/change_log.rs", 1536),
     ("storage/change_log.rs", 1544),
     ("recovery/panic_hook.rs", 404),

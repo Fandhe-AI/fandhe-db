@@ -116,6 +116,23 @@ fn a_table_without_the_key_is_refused() {
 }
 
 #[test]
+fn an_existing_empty_table_is_refused_and_not_treated_as_new() {
+    let path = unique_db_path("rg-empty-table");
+    let _g = CleanupGuard(path.clone());
+    let mut storage = Storage::open(&path).expect("open");
+    // 表だけを作ってキーを持たない状態（既存の表からキーが欠落した状態）。
+    let w = storage.db().begin_write().expect("begin");
+    {
+        #[allow(clippy::disallowed_methods)]
+        let _t = w.open_table(TABLE).expect("open");
+    }
+    w.commit().expect("commit");
+    assert!(storage.restore_generation().is_err());
+    assert!(storage.advance_restore_generation_with_floor(0).is_err());
+    assert!(storage.restore_generation().is_err(), "nothing is written");
+}
+
+#[test]
 fn the_limit_value_cannot_be_advanced() {
     let path = unique_db_path("rg-limit");
     let _g = CleanupGuard(path.clone());
