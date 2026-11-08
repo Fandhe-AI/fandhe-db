@@ -82,13 +82,14 @@ fn phc_for(password: &str) -> String {
         .to_string()
 }
 
-fn wait_until(what: &str, timeout: Duration, mut cond: impl FnMut() -> bool) {
+/// `cond` が真になるまで `poll` 間隔で繰り返し確かめる。
+fn wait_until(what: &str, timeout: Duration, poll: Duration, mut cond: impl FnMut() -> bool) {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if cond() {
             return;
         }
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(poll);
     }
     panic!("timed out waiting for {what}");
 }
@@ -371,9 +372,13 @@ fn assert_cut_while_blocked(
         None,
         "no error frame can be written while blocked"
     );
+    // 確認用の `probe-1` は受理されると保持位置を一時的に固定し、約 24 MiB のレコードの送信まで始めさせる。
+    // 短い間隔で繰り返すと固定が途切れず刈り込みを妨げる（高負荷の CI で観測）ので、刈り込みの周期（1 秒）に
+    // 合わせた間隔で確かめ、固定が解けた状態で周期を迎えられるようにする。
     wait_until(
         "the released retention floor to let pruning proceed",
-        Duration::from_secs(30),
+        Duration::from_secs(90),
+        Duration::from_secs(1),
         || p.resync_required_from(base),
     );
     alice.assert_small_writes_flow(100..103, Duration::from_secs(15));
