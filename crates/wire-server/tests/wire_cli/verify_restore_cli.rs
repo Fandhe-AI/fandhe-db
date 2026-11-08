@@ -387,6 +387,32 @@ fn restore_sweeps_stale_restore_temp_names_only() {
     assert!(restored.exists());
 }
 
+/// Issue #3094: `--from` が一時名の実体へのシンボリックリンクでも、掃除は復元元の実体を消さない。
+#[test]
+fn restore_sweep_keeps_source_reached_through_symlink_to_temp_name() {
+    use std::os::unix::fs::PermissionsExt;
+    let fx = common::TempFixtureDir::new("restore-sweep-alias");
+    let (_users, db) = populate(&fx);
+    let dir = parent_of(&db).to_path_buf();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod dir");
+    let snap = dir.join("snap.redb");
+    let o = backup(&db, snap.to_str().expect("utf-8 path"));
+    assert_eq!(code(&o), Some(0), "stderr: {}", stderr(&o));
+    let real = dir.join(".fandhe-restore-4242-7.tmp");
+    std::fs::rename(&snap, &real).expect("rename");
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    let alias = dir.join("backup.redb");
+    std::os::unix::fs::symlink(&real, &alias).expect("symlink");
+    let restored = dir.join("restored.redb");
+    let o = restore(
+        alias.to_str().expect("utf-8 path"),
+        restored.to_str().expect("utf-8 path"),
+    );
+    assert_eq!(code(&o), Some(0), "stderr: {}", stderr(&o));
+    assert!(real.exists(), "source entity must survive the sweep");
+    assert!(restored.exists());
+}
+
 /// 復元の正常系: 元のバックアップは不変、復元先から別のサーバーが起動してデータを読める。
 /// 既存の復元先（ファイル・ディレクトリ・リンク）は書かずに 2 で拒否する。
 #[test]

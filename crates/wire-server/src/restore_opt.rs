@@ -478,11 +478,16 @@ pub fn sweep_stale_restore_temps(
     dest: &Path,
     protected: &[&Path],
 ) -> Option<(PathBuf, engine::storage::StaleTempSweep)> {
-    let reserved = protected.iter().any(|p| {
+    let is_temp = |p: &Path| {
         p.file_name()
             .and_then(|n| n.to_str())
             .is_some_and(unix_impl::is_restore_temp_name)
-    });
+    };
+    // 指定名が別名（シンボリックリンク）でも、実体が一時名なら掃除対象になりうるため、実体のパスでも判定する。
+    // 実体を解決できないときは名前だけの判定に留まる（入力として開けないので復元自体も失敗する）。
+    let reserved = protected
+        .iter()
+        .any(|p| is_temp(p) || std::fs::canonicalize(p).is_ok_and(|c| is_temp(&c)));
     if reserved {
         return None;
     }
@@ -1032,6 +1037,26 @@ mod tests {
 
     fn v(a: &[&str]) -> Vec<String> {
         a.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// 入力が一時名の実体へのシンボリックリンクなら、掃除を見送って実体を残す（Issue #3094 の指摘対応）。
+    #[cfg(unix)]
+    #[test]
+    fn sweep_is_skipped_when_protected_input_aliases_a_temp_name() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("fandhe-sweep-alias-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).expect("mkdir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        let real = dir.join(".fandhe-restore-4242-7.tmp");
+        std::fs::write(&real, b"x").expect("write");
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        let alias = dir.join("backup.redb");
+        std::os::unix::fs::symlink(&real, &alias).expect("symlink");
+        let dest = dir.join("restored.redb");
+        assert!(sweep_stale_restore_temps(&dest, &[alias.as_path()]).is_none());
+        assert!(real.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
