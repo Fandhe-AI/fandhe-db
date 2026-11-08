@@ -59,7 +59,7 @@ pub(crate) fn spawn_server(users: &str, db: &str) -> ChildGuard {
     spawn_server_with(users, db, &[])
 }
 
-fn spawn_server_with(users: &str, db: &str, extra: &[&str]) -> ChildGuard {
+pub(crate) fn spawn_server_with(users: &str, db: &str, extra: &[&str]) -> ChildGuard {
     ChildGuard(
         Command::new(env!("CARGO_BIN_EXE_wire-server"))
             .args(["--users", users, "--db", db, "--bind", "127.0.0.1:0"])
@@ -209,7 +209,7 @@ fn backup_rejects_dangling_symlink_destination() {
 // ---- 経路 (ii): 稼働中のサーバーの運用者専用ソケット（Issue #2152） ----
 
 /// 0700 の子ディレクトリを作り、その中のソケットパスを返す（パス長の上限に収める短い名前）。
-fn private_socket_path(fx_db: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+pub(crate) fn private_socket_path(fx_db: &str) -> (std::path::PathBuf, std::path::PathBuf) {
     let dir = parent_of(fx_db).join("s");
     std::fs::create_dir(&dir).expect("create socket dir");
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod 0700");
@@ -217,7 +217,7 @@ fn private_socket_path(fx_db: &str) -> (std::path::PathBuf, std::path::PathBuf) 
     (dir, sock)
 }
 
-fn insert(stream: &mut std::net::TcpStream, id: u32) {
+pub(crate) fn insert(stream: &mut std::net::TcpStream, id: u32) {
     common::send_simple_query(
         stream,
         &format!("INSERT INTO docs (id, embedding) VALUES ({id}, '[0.1,0.2,0.3]')"),
@@ -226,7 +226,7 @@ fn insert(stream: &mut std::net::TcpStream, id: u32) {
     common::read_ready_for_query(stream);
 }
 
-fn select_ids(stream: &mut std::net::TcpStream) -> Vec<String> {
+pub(crate) fn select_ids(stream: &mut std::net::TcpStream) -> Vec<String> {
     common::send_simple_query(stream, "SELECT id FROM docs ORDER BY id");
     let mut ids = Vec::new();
     loop {

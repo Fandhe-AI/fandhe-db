@@ -248,7 +248,7 @@ pub(crate) fn bootstrap_privileges_in_txn<R: ReadSource>(
     }
 }
 
-fn put_privileges(
+pub(crate) fn put_privileges(
     write_txn: &redb::WriteTransaction,
     tenant: &str,
     role_id: u64,
@@ -260,7 +260,7 @@ fn put_privileges(
     Ok(())
 }
 
-fn put_marker(write_txn: &redb::WriteTransaction, tenant: &str) -> Result<()> {
+pub(crate) fn put_marker(write_txn: &redb::WriteTransaction, tenant: &str) -> Result<()> {
     let blob = [BLOB_VERSION];
     let mut table = write_txn.open_table_logged(BOOTSTRAP_MARKER_TABLE)?;
     table.insert(tenant, blob.as_slice())?;

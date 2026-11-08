@@ -130,12 +130,19 @@ pub(super) fn copy_table<K: Key + 'static, V: Value + 'static>(
 }
 
 /// 実行中フラグの解放ガード（panic・早期 return でも解放する）。
-struct BusyGuard<'a>(&'a AtomicBool);
+pub(super) struct BusyGuard<'a>(&'a AtomicBool);
 
 impl Drop for BusyGuard<'_> {
     fn drop(&mut self) {
         self.0.store(false, Ordering::Release);
     }
+}
+
+/// 実行中フラグを取る（取れなければ `None`）。増分の稼働中書き出し（Issue #3098）と共有する。
+pub(super) fn try_acquire_busy(flag: &AtomicBool) -> Option<BusyGuard<'_>> {
+    flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .ok()
+        .map(|_| BusyGuard(flag))
 }
 
 /// [`Storage::export_snapshot`] の本体。

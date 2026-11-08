@@ -147,6 +147,7 @@ pub mod backup_socket;
 pub(crate) mod binary_param;
 pub mod bind_guard;
 pub mod change_log_archive;
+pub mod change_log_cleanup_opt;
 pub mod change_log_opt;
 pub mod connection_limits_opt;
 pub(crate) mod copy;

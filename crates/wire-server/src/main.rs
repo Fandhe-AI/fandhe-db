@@ -548,11 +548,14 @@
 //! `--generation-state <path>` を指定すると、復元をまたぐ世代の高水位を状態ファイルに持ち、繰り返し復元でも
 //! 世代が単調に増える（Issue #3105・RECOVER-17 ポインタ。保持できなければ何も公開せず 1、引数の不正は 2 で終了）。
 //!
+//! `wire-server backup-incremental --socket <path> --base <path> --out <path>`（Issue #3098）は、稼働中のサーバーの
+//! 運用者専用ソケットへ増分を依頼する（`--db` と排他。ベースの終点は CLI が読んで送る）。
 //! `wire-server backup-incremental --db <path> --base <path> --out <path>` サブコマンドは、**停止中**の DB から、
 //! 直前のベース（フルバックアップまたは前回の増分）が終わった commit の次から最新までのログ区間を増分
 //! バックアップとして書き出す（Issue #2168・RECOVER-13・RECOVER-14 ポインタ。変更ログ `--change-log` を有効にした
 //! DB に限る）。終了コード: 0=成功、1=実行時の失敗（連鎖の切断・別 DB・区間が空・稼働中を含む）、2=引数／
-//! 出力先の拒否。詳細は `wire_server::incremental_opt`。
+//! 出力先の拒否。`--change-log-archive-dir <dir>` を足すと、保持設定で刈り込まれた区間をアーカイブから補う
+//! （Issue #3099・RECOVER-14 ポインタ。欠落・改ざんは何も公開せず 1）。詳細は `wire_server::incremental_opt`。
 //!
 //! `wire-server dump --db <path> --out <file> (--tenant <id> | --shared-only) [--schema-only | --data-only]
 //! [--format copy|insert]` サブコマンドは、**停止中**の DB から論理ダンプ（SQL スクリプト形式）を新規ファイルへ
@@ -634,6 +637,9 @@ fn main() -> ExitCode {
     }
     if args.get(1).map(String::as_str) == Some("change-log-verify") {
         return run_change_log_verify(&args[2..]);
+    }
+    if args.get(1).map(String::as_str) == Some("change-log-cleanup") {
+        return run_change_log_cleanup(&args[2..]);
     }
     if args.get(1).map(String::as_str) == Some("change-log-disable") {
         return run_change_log_disable(&args[2..]);
@@ -4428,11 +4434,12 @@ fn run_backup(args: &[String]) -> ExitCode {
     }
 }
 
-/// `backup-incremental --db <path> --base <path> --out <path>` サブコマンド（Issue #2168・RECOVER-13・
+/// `backup-incremental (--db <path> | --socket <path>) --base <path> --out <path>` サブコマンド（Issue #2168・RECOVER-13・
 /// RECOVER-14 ポインタ）。ベースの終点を読み（フルバックアップは読み取り専用で開き、増分は全体を検証する）、
 /// 停止中の DB を読み取り専用で開いて、その次から最新までのログ区間を `--out` へ書き出す。稼働中のサーバーが
 /// 開いている DB は拒否する（終了コード 1）。DB・ベースへは書き込まない。エラー文に行の値・パス・表名・
-/// commit 番号は含めない。
+/// commit 番号は含めない。`--socket`（Issue #3098）は稼働中のサーバーの運用者専用ソケットへ依頼する
+/// （[`run_backup_incremental_via_socket`]）。
 fn run_backup_incremental(args: &[String]) -> ExitCode {
     use engine::storage::{chain_point_of, IncrementalError, ReadOnlyOpenError, ReadOnlyStorage};
     use wire_server::{backup_opt, incremental_opt};
@@ -4444,12 +4451,22 @@ fn run_backup_incremental(args: &[String]) -> ExitCode {
             return ExitCode::from(backup_opt::EXIT_USAGE);
         }
     };
+    let db = match &parsed.target {
+        backup_opt::Target::Db(db) => db,
+        backup_opt::Target::Socket(sock) => {
+            return run_backup_incremental_via_socket(sock, &parsed.base, &parsed.out)
+        }
+    };
     let result = chain_point_of(&parsed.base).and_then(|base| {
-        let ro = ReadOnlyStorage::open(&parsed.db).map_err(|e| match e {
+        let ro = ReadOnlyStorage::open(db).map_err(|e| match e {
             ReadOnlyOpenError::InUse => IncrementalError::InUse,
             _ => IncrementalError::SourceUnreadable,
         })?;
-        ro.export_incremental(&base, &parsed.out)
+        match &parsed.archive_dir {
+            // 刈り込み済みの区間をアーカイブから補う（Issue #3099・RECOVER-14）。
+            Some(dir) => ro.export_incremental_with_archive(&base, dir, &parsed.out),
+            None => ro.export_incremental(&base, &parsed.out),
+        }
     });
     let (code, msg) = incremental_opt::classify(&result);
     match code {
@@ -4775,9 +4792,25 @@ fn run_change_log_verify(args: &[String]) -> ExitCode {
             return ExitCode::from(change_log_opt::EXIT_VERIFY_USAGE);
         }
     };
+    // `--base`: 保持しているフルバックアップの最も古い終点より前を、意図して消したアーカイブとして検査する
+    // （Issue #3092）。DB を読み取り専用で開く前に、DB と各バックアップの位置を読む（同じファイルを
+    // 二重に開かない）。DB 識別子・timeline が食い違うバックアップは拒否する（検査の緩和に使わせない）。
+    let retained_from = match (&parsed.db, parsed.bases.is_empty()) {
+        (Some(db), false) => match retained_from_bases(db, &parsed.bases) {
+            Ok(l) => Some(l),
+            Err(msg) => {
+                engine::log_stderr!("wire-server: change-log-verify: {msg}");
+                return ExitCode::from(change_log_opt::EXIT_VERIFY_FAILED);
+            }
+        },
+        _ => None,
+    };
     let result = match &parsed.db {
         Some(db) => match engine::storage::ReadOnlyStorage::open(db) {
-            Ok(ro) => ro.verify_change_log_archive(&parsed.dir),
+            Ok(ro) => match retained_from {
+                Some(l) => ro.verify_change_log_archive_from(&parsed.dir, l),
+                None => ro.verify_change_log_archive(&parsed.dir),
+            },
             Err(e) => {
                 let msg = match e {
                     engine::storage::ReadOnlyOpenError::InUse => {
@@ -4813,6 +4846,109 @@ fn run_change_log_verify(args: &[String]) -> ExitCode {
         Err(e) => {
             engine::log_stderr!("wire-server: change-log-verify: {e}");
             ExitCode::from(change_log_opt::EXIT_VERIFY_FAILED)
+        }
+    }
+}
+
+/// `change-log-verify --base` の始点（保持しているフルバックアップの最も古い終点の次）を求める。
+/// DB と各バックアップの DB 識別子・timeline が一致しなければ拒否する。エラー文は固定の英語。
+fn retained_from_bases(
+    db: &std::path::Path,
+    bases: &[std::path::PathBuf],
+) -> Result<u64, &'static str> {
+    let db_point = engine::storage::retention_point_of(db)
+        .map_err(|_| "failed to read the database position (stop the server first)")?;
+    let mut min_end = u64::MAX;
+    for b in bases {
+        let p = engine::storage::retention_point_of(b)
+            .map_err(|_| "failed to read a --base backup as a full backup")?;
+        if p.db_id != db_point.db_id || p.timeline != db_point.timeline {
+            return Err("a --base backup belongs to a different database or timeline");
+        }
+        min_end = min_end.min(p.end_lsn);
+    }
+    min_end
+        .checked_add(1)
+        .ok_or("a --base backup position is out of range")
+}
+
+/// `change-log-cleanup` サブコマンド（Issue #3092・RECOVER-14 (7) のポインタ）。保持しているフルバックアップ
+/// （`--backup`）から PITR するのに要らないアーカイブ済みセグメントだけを、先頭から連続して消す。既定は
+/// dry-run（消す予定の件数と LSN 範囲を出力するだけ）で、`--execute` を付けたときだけ消す。バックアップが
+/// 1 つも無い・識別子の不一致・アーカイブの検証失敗・他者が書けるアーカイブ先では何も消さない。
+/// 出力は運用者向けの標準出力（パス・テナント情報を含まない）。終了コード: 0 成功・1 失敗・2 引数の不備。
+fn run_change_log_cleanup(args: &[String]) -> ExitCode {
+    use wire_server::change_log_cleanup_opt as opt;
+
+    let parsed = match opt::parse(args) {
+        Ok(p) => p,
+        Err(msg) => {
+            engine::log_stderr!("wire-server: change-log-cleanup: {msg}");
+            return ExitCode::from(opt::EXIT_USAGE);
+        }
+    };
+    let fail = |e: &dyn std::fmt::Display| {
+        engine::log_stderr!("wire-server: change-log-cleanup: {e}");
+        ExitCode::from(opt::EXIT_FAILED)
+    };
+    let mut backups = Vec::with_capacity(parsed.backups.len());
+    for b in &parsed.backups {
+        match engine::storage::retention_point_of(b) {
+            Ok(p) => backups.push(p),
+            Err(e) => return fail(&e),
+        }
+    }
+    let db = match &parsed.db {
+        Some(path) => match engine::storage::retention_point_of(path) {
+            Ok(p) => Some(p),
+            Err(e) => return fail(&e),
+        },
+        None => None,
+    };
+    let now_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_micros()).ok());
+    let Some(now_us) = now_us else {
+        return fail(&"system clock is out of range");
+    };
+    let policy = engine::storage::CleanupPolicy {
+        backups,
+        db,
+        keep_secs: parsed.keep_secs,
+        keep_segments: parsed.keep_segments,
+        now_us,
+    };
+    let plan = match engine::storage::plan_archive_cleanup(&parsed.dir, &policy) {
+        Ok(p) => p,
+        Err(e) => return fail(&e),
+    };
+    let range = match plan.lsn_range() {
+        Some((a, b)) => format!("{a}..{b}"),
+        None => "none".to_string(),
+    };
+    if !parsed.execute {
+        println!(
+            "change log cleanup (dry-run): segments={} lsn={range} cutoff={}",
+            plan.segments(),
+            plan.cutoff()
+        );
+        return ExitCode::SUCCESS;
+    }
+    match engine::storage::execute_archive_cleanup(&parsed.dir, &plan) {
+        Ok(r) => {
+            println!(
+                "change log cleanup (removed): segments={} lsn={range} cutoff={}",
+                r.removed,
+                plan.cutoff()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            if let engine::storage::CleanupError::Partial { removed } = &e {
+                println!("change log cleanup (partial): segments={removed}");
+            }
+            fail(&e)
         }
     }
 }
@@ -4889,6 +5025,66 @@ fn run_backup_via_socket(sock: &std::path::Path, out: &std::path::Path) -> ExitC
             ExitCode::from(wire_server::backup_opt::EXIT_FAILURE)
         }
     }
+}
+
+/// `backup-incremental --socket` の経路: ベースの終点（フルバックアップは読み取り専用で開き、増分は全体を
+/// 検証する）を CLI 側で読み、終点と出力先をサーバーへ依頼する。サーバーは運用者指定のファイルを開かない。
+/// 応答の結果コードをそのまま終了コードにし、メッセージは固定文言だけを出す（Issue #3098）。
+#[cfg(unix)]
+fn run_backup_incremental_via_socket(
+    sock: &std::path::Path,
+    base: &std::path::Path,
+    out: &std::path::Path,
+) -> ExitCode {
+    use wire_server::{backup_opt, backup_socket, incremental_opt};
+
+    if let Err(msg) = backup_socket::check_socket_owner(sock) {
+        engine::log_stderr!("wire-server: backup-incremental: {msg}");
+        return ExitCode::from(backup_opt::EXIT_USAGE);
+    }
+    let point = match engine::storage::chain_point_of(base) {
+        Ok(p) => p,
+        Err(e) => {
+            let (code, msg) = incremental_opt::classify(&Err(e));
+            engine::log_stderr!("wire-server: backup-incremental: {msg}");
+            return ExitCode::from(code);
+        }
+    };
+    match backup_socket::request_incremental(sock, &point, out) {
+        Ok(r) => match r.records {
+            Some(records) if r.code == 0 => {
+                if write_stdout(&format!("backup-incremental written: records={records}\n"))
+                    .is_err()
+                {
+                    return ExitCode::from(backup_opt::EXIT_FAILURE);
+                }
+                ExitCode::SUCCESS
+            }
+            _ => {
+                engine::log_stderr!(
+                    "wire-server: backup-incremental: {}",
+                    backup_socket::incremental_code_message(r.code)
+                );
+                ExitCode::from(r.code)
+            }
+        },
+        Err(msg) => {
+            engine::log_stderr!("wire-server: backup-incremental: {msg}");
+            ExitCode::from(backup_opt::EXIT_FAILURE)
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn run_backup_incremental_via_socket(
+    _sock: &std::path::Path,
+    _base: &std::path::Path,
+    _out: &std::path::Path,
+) -> ExitCode {
+    engine::log_stderr!(
+        "wire-server: backup-incremental: --socket is supported only on unix platforms"
+    );
+    ExitCode::from(wire_server::backup_opt::EXIT_USAGE)
 }
 
 #[cfg(not(unix))]

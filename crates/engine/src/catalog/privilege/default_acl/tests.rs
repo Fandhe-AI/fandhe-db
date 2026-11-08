@@ -634,3 +634,38 @@ fn tenant_row_count_is_capped() {
     );
     let _ = bob;
 }
+
+#[test]
+fn restore_put_respects_tenant_row_cap() {
+    let (_g, s) = open("dacl_restore_cap");
+    let alice = role(&s, T, "alice");
+    write_txn(&s, |t| {
+        let mut table = t.open_table(DEFAULT_ACL_TABLE).expect("t");
+        for i in 0..MAX_DEFAULT_ACL_ENTRIES_PER_TENANT as u64 {
+            table
+                .insert(
+                    (T, alice, 0u64, KIND_SEQUENCE, 1_000 + i),
+                    [1u8, 0, 1, 0, 0].as_slice(),
+                )
+                .expect("ins");
+        }
+    });
+    let entry = |grantee_id| DefaultEntry {
+        grantee_id,
+        privileges: PRIV_SELECT,
+        grant_options: 0,
+    };
+    let txn = s.begin_write_txn().expect("w");
+    // 新規キーは上限超過で拒否される。
+    let r = put_default_acl_row_in_txn(&txn, T, alice, 0, DefaultAclKind::Tables, &entry(5));
+    assert!(
+        matches!(&r, Err(CatalogError::Invalid(m)) if m.contains("too many")),
+        "{r:?}"
+    );
+    // 既存キー（種別 SEQUENCE・付与先 1000）の置換は上限到達時も上限エラーにならない。
+    let r = put_default_acl_row_in_txn(&txn, T, alice, 0, DefaultAclKind::Sequences, &entry(1_000));
+    assert!(
+        !matches!(&r, Err(CatalogError::Invalid(m)) if m.contains("too many")),
+        "{r:?}"
+    );
+}

@@ -92,18 +92,18 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // `catalog/*.rs` の各エントリも同じ理由で移動している）。
     // Issue #3069（`change_log_on_disk`・連続性検査・保留した移行の追加）で行番号が移動したための追随。
     // Issue #2167（アーカイブ・保持の公開 API と `begin_maintenance_txn` の追加。+44 行）で追随（旧: 1348／1382）。
-    ("storage.rs", 1552), // Issue #2176（+1）・Issue #2245 で追随（旧: 1543）。Issue #3091 で追随（旧: 1477）。Issue #2174（begin_replica_apply_txn 等。+22 行）で追随（旧: 1420／1454）
+    ("storage.rs", 1593), // Issue #2176（+1）で追随。base 取り込み（Issue #3125 系の +3 行）で追随（旧: 1589）。Issue #3099（export_incremental_with_archive。+22 行）で追随（旧: 1567）。Issue #3093 で追随（旧: 1566）。Issue #3092 で追随（旧: 1543）。Issue #3091 で追随（旧: 1477）。Issue #2174（begin_replica_apply_txn 等。+22 行）で追随（旧: 1420／1454）
     // Issue #2175（読み取りレプリカの `read_replica` フラグ等。+35 行）で追随（旧: 1442／1476／1200）。対象は変わらない。
-    ("storage.rs", 1586), // Issue #2176（+1）・Issue #2245 で追随（旧: 1577）。Issue #3091 で追随（旧: 1511）
+    ("storage.rs", 1627), // Issue #2176（+1）で追随。base 取り込み（Issue #3125 系の +3 行）で追随（旧: 1623）。Issue #3099 で追随（旧: 1601）。Issue #3093 で追随（旧: 1600）。Issue #3092 で追随（旧: 1577）。Issue #3091 で追随（旧: 1511）
     // Issue #3067: `Storage::enable_change_log` が DB 識別子の永続化に使う保守 commit
     // （`commit_boundary::commit_maintenance`）。書き込むのは `change_log_meta` 表だけで、`CATALOG_TABLE`・
     // `user_rows` には触れず、世代も進めない（バンプ対象の表が構造的に存在しない）。
     // Issue #2174（`begin_replica_apply_txn` の追加。+1 行）で追随（旧: 1199）。
-    ("storage.rs", 1266), // Issue #2176（+1）・Issue #2245 で追随（旧: 1257）。Issue #3091（`enable_change_log_with_unarchived_limit` の追加）で追随（旧: 1224）
+    ("storage.rs", 1267), // Issue #2176（+1）で追随。Issue #3093 で追随（旧: 1265）。Issue #3092 で追随（旧: 1257）。Issue #3091（`enable_change_log_with_unarchived_limit` の追加）で追随（旧: 1224）
     // Issue #3091: `Storage::apply_unarchived_limit` が未アーカイブ量の数え値の数え直しを書く保守 commit。
     // 書き込むのは変更ログのメタ表（数え値）だけで、`CATALOG_TABLE`・`user_rows` には触れず、
     // 世代も進めない（バンプ対象の表が構造的に存在しない）。
-    ("storage.rs", 1307), // Issue #2176（+1）・Issue #2245 で追随（旧: 1298）
+    ("storage.rs", 1308), // Issue #2176（+1）で追随。Issue #3093 で追随（旧: 1306）。Issue #3092 で追随（旧: 1298）
     // Issue #3067: `storage/change_log.rs` のテスト内の commit 入口（`commit_result`・`commit_maint`）。
     // 変更ログの `change_log` 表・メタ表と任意の試験用 redb 表だけを書くテスト fixture で、
     // `user_rows/{table_name}` を経由しないため対象外。
@@ -620,6 +620,9 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // （同じ理由で対象外）。
     ("catalog/role/bootstrap.rs", 599),
     ("catalog/role/bootstrap/tests.rs", 42),
+    // Issue #3096: 論理ダンプの復元指示（`Storage::apply_restore_directive`）。ロール・権限・既定権限・
+    // 初期権限・マーカーの専用表だけを書き、表の行・スキーマ・世代に影響しない（同じ理由で対象外）。
+    ("catalog/ddl_export/restore_apply.rs", 320),
     // Issue #2232: メンバーシップの付与・取り消し（`apply_membership_changes`）とロール作成＋付与
     // （`create_role_with_memberships`）。メンバーシップ表だけを書き、表の計画・世代に影響しない（同じ理由）。
     ("catalog/role/membership_apply.rs", 314),
