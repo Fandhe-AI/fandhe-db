@@ -184,6 +184,31 @@ fn describe_show_statement_timeout_matches_execute() {
     }
 }
 
+/// RECOVER-17・Issue #2449: `SHOW restore_generation` の Describe 列は実行結果の列（bigint の 1 列）と一致する。
+#[test]
+fn describe_show_restore_generation_matches_execute() {
+    let path = unique_db_path("describe-show-restore-generation");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core_with_documents_table(&path);
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    let parsed = core
+        .parse_sql("SHOW restore_generation")
+        .expect("parse should succeed");
+    let described = core
+        .describe_parsed_in_session(&SessionState::default(), &parsed)
+        .expect("describe should succeed")
+        .expect("SHOW has result columns");
+    assert_eq!(described.len(), 1);
+    let mut session = SessionState::default();
+    match core
+        .execute_sql_in_session(&ctx, &mut session, "SHOW restore_generation")
+        .expect("execute should succeed")
+    {
+        SqlOutcome::Show(result) => assert_eq!(result.columns, described),
+        other => panic!("expected Show, got {other:?}"),
+    }
+}
+
 /// SQL-73・Issue #2030: `SHOW hnsw.ef_search` の Describe 列は実行結果の列（`hnsw.ef_search`・text）と一致する。
 #[test]
 fn describe_show_hnsw_ef_search_matches_execute() {

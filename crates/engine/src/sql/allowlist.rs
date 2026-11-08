@@ -3463,6 +3463,10 @@ pub enum Statement {
     },
     /// `SHOW row_security`（RLS-13・Issue #2278）。列名 `row_security` の text 1 行（`on`／`off`）。
     ShowRowSecurity,
+    /// `SHOW restore_generation`（RECOVER-17・Issue #2449）。列名 `restore_generation` の bigint 1 行。
+    /// 値は DB 全体で 1 つ（テナント非依存）。変更系（`SET`／`RESET`）は構文段で `42501` に拒否する。
+    /// **#2449 で追加した破壊的変更（BREAKING CHANGE）**: variant 追加。
+    ShowRestoreGeneration,
     /// `SET [SESSION] statement_timeout {TO|=} <ms|'<n>[unit]'|DEFAULT>`／`RESET statement_timeout`
     /// （SQL-71・Issue #1954）。値は構文段で範囲検証済み（不正値は `22023`）。`reset` は `RESET` 由来か。
     /// **#1954 で追加した破壊的変更（BREAKING CHANGE）**: variant 追加。
@@ -19627,6 +19631,7 @@ pub(crate) fn require_row_query_statement(
         | Statement::ShowSearchPath
         | Statement::SetRowSecurity { .. }
         | Statement::ShowRowSecurity
+        | Statement::ShowRestoreGeneration
         | Statement::SetStatementTimeout { .. }
         | Statement::ShowStatementTimeout
         | Statement::SetHnswEfSearch { .. }
@@ -25018,6 +25023,29 @@ pub(crate) fn is_show_row_security(tokens: &[Token]) -> bool {
         && p.expect_end_of_statement().is_ok()
 }
 
+/// 文が `SHOW restore_generation`（末尾 `;` 可）か。厳密一致のみ真（RECOVER-17・Issue #2449）。
+pub(crate) fn is_show_restore_generation(tokens: &[Token]) -> bool {
+    let mut p = Parser::new(tokens);
+    p.expect_ident_matching("SHOW").is_ok()
+        && p.expect_ident_matching("restore_generation").is_ok()
+        && p.expect_end_of_statement().is_ok()
+}
+
+/// 文が `SET [SESSION|LOCAL] restore_generation ...` の頭か。値の形に依らず真にし、
+/// 構文段で `42501` に拒否する（読み取り専用。TimeZone 系の頭判定より前に評価する）。
+fn is_set_restore_generation_head(tokens: &[Token]) -> bool {
+    let name_at = |i: usize| matches!(tokens.get(i), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("restore_generation"));
+    let modifier_at_1 = matches!(tokens.get(1), Some(Token::Ident(w))
+        if w.eq_ignore_ascii_case("SESSION") || w.eq_ignore_ascii_case("LOCAL"));
+    name_at(1) || (modifier_at_1 && name_at(2))
+}
+
+/// 文が `RESET restore_generation ...` の頭か。余剰トークンの有無に依らず拒否側へ倒す。
+fn is_reset_restore_generation_head(tokens: &[Token]) -> bool {
+    matches!(tokens.first(), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("RESET"))
+        && matches!(tokens.get(1), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("restore_generation"))
+}
+
 /// 文が `SET [SESSION|LOCAL] row_security ...` の頭か。`SET LOCAL` も真にして
 /// [`parse_set_row_security`] が `0A000` で拒否する（`SET LOCAL` を別経路の `42601` へ流さない）。
 /// TimeZone 系の頭判定（`SESSION`・`LOCAL` で真になる）より前に評価する。
@@ -28634,6 +28662,13 @@ fn validate_sql_tokens_impl(
         // （`SET SESSION` の 2 語目が TimeZone 系の頭として扱われるため）。他の `SET` の挙動は不変。
         // RLS-13・Issue #2278: `row_security` も TimeZone 系より先に判定する（`SET SESSION`／`SET LOCAL` の
         // 2 語目が TimeZone 系の頭として扱われるため）。
+        // RECOVER-17・Issue #2449: 復元の世代番号は読み取り専用。`SET`／`RESET` はセッション状態に
+        // 触れる前にここで固定の `42501` へ拒否する（値・テナントを応答に含めない）。
+        _ if (is_set_statement && is_set_restore_generation_head(tokens))
+            || is_reset_restore_generation_head(tokens) =>
+        {
+            Err(SqlSurfaceError::InsufficientPrivilege)
+        }
         _ if is_set_statement && is_set_row_security_head(tokens) => {
             let value = parse_set_row_security(tokens)?;
             Ok(Statement::SetRowSecurity {
@@ -28865,6 +28900,7 @@ fn validate_sql_tokens_impl(
                 | Statement::ShowSearchPath
                 | Statement::SetRowSecurity { .. }
                 | Statement::ShowRowSecurity
+                | Statement::ShowRestoreGeneration
                 | Statement::SetStatementTimeout { .. }
                 | Statement::ShowStatementTimeout
                 | Statement::SetHnswEfSearch { .. }
@@ -29202,6 +29238,7 @@ pub fn validate_statement(
         Statement::ShowTimeZone
         | Statement::ShowSearchPath
         | Statement::ShowRowSecurity
+        | Statement::ShowRestoreGeneration
         | Statement::ShowStatementTimeout
         | Statement::ShowHnswEfSearch
         | Statement::ShowHnswScanSetting(_) => Err(SqlSurfaceError::unsupported(
