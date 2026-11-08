@@ -241,6 +241,32 @@ fn restored_database_continues_with_the_change_log_enabled() {
     assert_eq!(st.current_generation().expect("gen"), stop);
 }
 
+/// RECOVER-17（Issue #2450）: PITR の後に復元の世代を進めても、全表の状態・LSN・変更ログの連続性は
+/// 変わらない（世代の表は変更ログ・再生・比較の対象外）。世代は単調に増える。
+#[test]
+fn recover17_advancing_the_generation_after_pitr_keeps_the_state_and_lsn() {
+    let s = scenario("pitr-generation", usize::MAX >> 8);
+    let stop = s.base_point.end_lsn + 3;
+    let mut previous = 0;
+    for _ in 0..2 {
+        let (_w, db, r) = restore(&s.base, &[], Some(s.archive.path()), PitrTarget::Lsn(stop));
+        r.expect("restore");
+        {
+            let mut st = Storage::open(&db).expect("open");
+            let g = st.advance_restore_generation().expect("advance");
+            assert!(g > 0);
+            assert_eq!(st.restore_generation().expect("read"), g);
+        }
+        assert_state_at(&s.fx, &db, stop);
+        let mut st = Storage::open(&db).expect("reopen");
+        st.enable_change_log().expect("continuity holds");
+        assert_eq!(st.current_generation().expect("gen"), stop);
+        let g = st.restore_generation().expect("read");
+        assert!(g >= previous);
+        previous = g;
+    }
+}
+
 #[test]
 fn time_target_stops_before_the_first_later_commit() {
     let s = scenario("pitr-time", 1);
