@@ -94,7 +94,7 @@ impl TlsReplica {
             .set_read_timeout(Some(Duration::from_secs(20)))
             .expect("timeout");
         let session = perform_client_handshake(&mut stream, &pin)?;
-        let (rd, wr) = replication_conn::tls(stream, session).expect("split");
+        let (mut rd, wr) = replication_conn::tls(stream, session).expect("split");
         rd.set_read_timeout(Some(Duration::from_secs(20)))
             .expect("timeout");
         Ok(Self { rd, wr })

@@ -18,7 +18,7 @@
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::tls::record::{RecordBuffer, RecordKind};
 use crate::tls::server_handshake::{AppEvent, TlsSession};
@@ -46,6 +46,9 @@ pub struct ConnReader {
     pos: usize,
     eof: bool,
     failed: bool,
+    /// `set_read_timeout` で設定した時刻起点の絶対期限。TLS の 1 回の `read` が内部で複数回ソケットを
+    /// 読んでも、この期限を超えて待たない（断片・空レコードの低速送信による期限回避の防止）。
+    deadline: Option<Instant>,
 }
 
 /// 接続の書き込み半分。
@@ -93,12 +96,16 @@ impl ConnReader {
             pos: 0,
             eof: false,
             failed: false,
+            deadline: None,
         }
     }
 
-    /// 読み取りタイムアウトを設定する（同じソケット。TLS でも効く）。
-    pub fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
-        self.raw.set_read_timeout(timeout)
+    /// 読み取りタイムアウトを設定する（同じソケット。TLS でも効く）。設定時点からの絶対期限として
+    /// 記録し、TLS の内部ループでも毎回の残り時間を再計算する。
+    pub fn set_read_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {
+        self.raw.set_read_timeout(timeout)?;
+        self.deadline = timeout.and_then(|t| Instant::now().checked_add(t));
+        Ok(())
     }
 
     /// 接続を両方向とも閉じるためのハンドル（同一ソケットの複製）。監視スレッドが使う。
@@ -119,6 +126,7 @@ impl ConnReader {
             return None;
         }
         self.raw.set_read_timeout(Some(wait)).ok()?;
+        self.deadline = None;
         let mut probe = [0u8; 1];
         match self.raw.peek(&mut probe) {
             Ok(0) => None,
@@ -185,6 +193,16 @@ impl ConnReader {
                     let mut chunk = [0u8; 4096];
                     let cap = self.rx.remaining_capacity().min(chunk.len());
                     let dst = chunk.get_mut(..cap).ok_or_else(|| invalid("TLS buffer"))?;
+                    if let Some(d) = self.deadline {
+                        let rem = d.saturating_duration_since(Instant::now());
+                        if rem.is_zero() {
+                            return Err(io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                "TLS read deadline exceeded",
+                            ));
+                        }
+                        self.raw.set_read_timeout(Some(rem))?;
+                    }
                     let n = self.raw.read(dst)?;
                     if n == 0 {
                         // close_notify なしの切断は、境界上でも切り詰めとして扱う（正常終端と区別する）。
@@ -306,5 +324,39 @@ mod tests {
         h.shutdown();
         drop(cw);
         assert_eq!(sr.data_ready(Duration::from_secs(2)), None);
+    }
+
+    /// TLS 越しに未完のレコード断片を期限より短い間隔で送り続けても、1 回の `read` が絶対期限で終わる
+    /// （事前認証スロットの占有防止。Issue #2177）。
+    #[test]
+    fn tls_read_honours_absolute_deadline_against_slow_fragments() {
+        use crate::tls::record_protection::{Opener, Sealer};
+        let (c, s) = pair();
+        let session = Box::new(TlsSession::new_for_tests(Sealer::new(), Opener::new()));
+        let (mut sr, _sw) = tls(s, session).expect("split");
+        let feeder = std::thread::spawn(move || {
+            let mut c = c;
+            // 宣言長 1000 の ApplicationData レコードのヘッダの後、1 バイトずつ低速で送る。
+            let _ = c.write_all(&[0x17, 0x03, 0x03, 0x03, 0xE8]);
+            for _ in 0..40 {
+                std::thread::sleep(Duration::from_millis(50));
+                if c.write_all(&[0]).is_err() {
+                    break;
+                }
+            }
+        });
+        sr.set_read_timeout(Some(Duration::from_millis(400)))
+            .expect("timeout");
+        let start = Instant::now();
+        let mut buf = [0u8; 8];
+        let res = sr.read(&mut buf);
+        assert!(res.is_err(), "slow fragments must not satisfy the read");
+        assert!(
+            start.elapsed() < Duration::from_millis(1200),
+            "read overran the absolute deadline: {:?}",
+            start.elapsed()
+        );
+        drop(sr);
+        let _ = feeder.join();
     }
 }
