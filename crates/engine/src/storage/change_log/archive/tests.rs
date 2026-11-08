@@ -16,6 +16,12 @@ use crate::test_util::temp_db::TempDir;
 
 const TENANT: &str = "tenant-a";
 
+/// 手で組んだセグメントの権限を 0600 にする（読み取り器は他者が書けるファイルを拒否する。umask に依らせない）。
+fn set_owner_only(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+}
+
 /// 書き出し先に使える（他者が書けない）一時ディレクトリ。umask に依らず 0755 にする。
 fn private_dir(label: &str) -> TempDir {
     use std::os::unix::fs::PermissionsExt;
@@ -395,7 +401,9 @@ fn mixed_timelines_in_one_directory_are_rejected() {
         h.update(&bytes);
         bytes.extend_from_slice(&h.finalize());
         let name = segment_name(&header.db_id, timeline, *key, *key);
-        std::fs::write(dir.path().join(name), bytes).expect("write");
+        let path = dir.path().join(name);
+        std::fs::write(&path, bytes).expect("write");
+        set_owner_only(&path);
     };
     write(0, state.timeline);
     write(1, state.timeline + 1);
@@ -517,13 +525,12 @@ fn a_conflicting_segment_of_the_same_name_stops_the_archive() {
         b.finish().expect("finish")
     };
     std::fs::remove_file(&file).expect("remove");
-    std::fs::write(
+    let short_path =
         f.archive
             .path()
-            .join(segment_name(&h.db_id, h.timeline, h.first_lsn, h.last_lsn)),
-        short,
-    )
-    .expect("write");
+            .join(segment_name(&h.db_id, h.timeline, h.first_lsn, h.last_lsn));
+    std::fs::write(&short_path, short).expect("write");
+    set_owner_only(&short_path);
     // 短いセグメントは表の先頭 1 件と一致するので採用され、残りは新しいセグメントに続く。
     let r = f
         .storage()
@@ -1175,13 +1182,12 @@ fn a_series_forked_from_a_copy_cannot_authorize_pruning_the_original_log() {
         b.finish().expect("finish")
     };
     let (h, bytes) = forked;
-    std::fs::write(
+    let fork_path =
         fork_dir
             .path()
-            .join(segment_name(&h.db_id, h.timeline, h.first_lsn, h.last_lsn)),
-        bytes,
-    )
-    .expect("write");
+            .join(segment_name(&h.db_id, h.timeline, h.first_lsn, h.last_lsn));
+    std::fs::write(&fork_path, bytes).expect("write");
+    set_owner_only(&fork_path);
     let mut opts = ArchiveOptions::new(fork_dir.path());
     opts.retain_records = Some(0);
     // 水位は進んでいない（未アーカイブ）。先に水位だけ進めた状態を作り、分岐系列で刈り込みを試みる。
@@ -1258,4 +1264,93 @@ fn read_only_verify_matches_the_writable_one() {
         ro.verify_change_log_archive(archive.path()),
         Err(ArchiveError::ChecksumMismatch)
     ));
+}
+// ---------------------------------------------------------------------------
+// SegmentReader::open の fd 基準の確認（Issue #3103・RECOVER-14 のポインタ）
+// ---------------------------------------------------------------------------
+
+/// 1 本だけアーカイブしたセグメントのパスを返す。
+fn one_segment(label: &str) -> (Fixture, PathBuf) {
+    let f = Fixture::new(label);
+    f.populate(2);
+    f.storage().archive_change_log(&f.opts()).expect("archive");
+    let file = f.segment_files().pop().expect("segment");
+    (f, file)
+}
+
+#[test]
+fn replaced_segment_after_open_is_not_read() {
+    let (f, file) = one_segment("arc-swap");
+    let original = std::fs::read(&file).expect("read");
+    let mut reader = SegmentReader::open(&file, 1 << 20).expect("open");
+    // open 後に同じパスへ別実体（壊れたバイト列）を rename で差し替える。
+    let other = f.archive.path().join("other.bin");
+    std::fs::write(&other, b"garbage").expect("write");
+    std::fs::rename(&other, &file).expect("rename");
+    // 既に開いた reader は確認済みの元の実体を最後まで読め、トレーラも一致する。
+    let mut n = 0;
+    while reader.next_record().expect("record").is_some() {
+        n += 1;
+    }
+    assert!(n > 0);
+    reader.finish().expect("finish");
+    assert_ne!(std::fs::read(&file).expect("read"), original);
+    // 新たに open すれば差し替え後の実体が検査され拒否される。
+    assert!(SegmentReader::open(&file, 1 << 20).is_err());
+}
+
+#[test]
+fn symlink_to_endless_device_is_rejected_without_following() {
+    let (_f, file) = one_segment("arc-zero");
+    std::fs::remove_file(&file).expect("rm");
+    std::os::unix::fs::symlink("/dev/zero", &file).expect("symlink");
+    assert!(matches!(
+        SegmentReader::open(&file, 1 << 20),
+        Err(ArchiveError::BadFormat)
+    ));
+}
+
+#[test]
+fn directory_and_socket_at_segment_path_are_rejected() {
+    let (_f, file) = one_segment("arc-kind");
+    std::fs::remove_file(&file).expect("rm");
+    std::fs::create_dir(&file).expect("mkdir");
+    assert!(matches!(
+        SegmentReader::open(&file, 1 << 20),
+        Err(ArchiveError::BadFormat)
+    ));
+    std::fs::remove_dir(&file).expect("rmdir");
+    // ソケットのパス長には上限（SUN_LEN）があるため、短い一時ディレクトリへ置く。
+    let short = TempDir::new("s");
+    let sock_path = short.path().join("s");
+    let _sock = std::os::unix::net::UnixListener::bind(&sock_path).expect("bind");
+    assert!(matches!(
+        SegmentReader::open(&sock_path, 1 << 20),
+        Err(ArchiveError::BadFormat)
+    ));
+}
+
+#[test]
+fn group_or_other_writable_segment_is_rejected() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_f, file) = one_segment("arc-mode");
+    for (mode, ok) in [(0o600, true), (0o644, true), (0o664, false), (0o646, false)] {
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(mode)).expect("chmod");
+        let r = SegmentReader::open(&file, 1 << 20);
+        assert_eq!(r.is_ok(), ok, "mode {mode:o}");
+        if !ok {
+            assert!(matches!(r, Err(ArchiveError::BadFormat)));
+        }
+    }
+}
+
+#[test]
+fn owner_and_mode_policies() {
+    assert!(owner_allowed(1000, 1000));
+    assert!(owner_allowed(0, 1000));
+    assert!(!owner_allowed(1001, 1000));
+    assert!(mode_allowed(0o100600));
+    assert!(mode_allowed(0o100644));
+    assert!(!mode_allowed(0o100620));
+    assert!(!mode_allowed(0o100602));
 }
