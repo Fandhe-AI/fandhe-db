@@ -505,3 +505,38 @@ fn read_replica_requires_a_replica_base() {
     let core = EngineCore::open(dir.db_path()).expect("open");
     assert!(core.with_read_replica().is_err());
 }
+
+/// 複製の適用が確定すると全スコープの UDF 世代が進み、既存接続が次の文で定義を再ロードする
+/// （適用が永続表だけを更新して世代を据え置くと、古い関数定義が残るため）。
+#[test]
+fn applying_records_advances_function_generation() {
+    let (_f, _p, r, _base, recs) = setup("rep-udfgen");
+    let before = r.function_generation(TENANT);
+    r.apply_replicated_records(&recs).expect("apply");
+    assert!(r.function_generation(TENANT) > before);
+    // 何も適用しない再送では進めない。
+    let mid = r.function_generation(TENANT);
+    r.apply_replicated_records(&recs).expect("resend");
+    assert_eq!(r.function_generation(TENANT), mid);
+}
+
+/// NoSQL の書き込み入口も、束縛・書き込み前に `25006` で拒否する（`54000` ではない）。
+#[test]
+fn read_replica_rejects_nosql_writes_with_25006() {
+    let (_f, p, r, _base, _recs) = setup("rep-ro-nosql");
+    drop(r);
+    let core = EngineCore::open(&p)
+        .expect("open")
+        .with_read_replica()
+        .expect("replica base");
+    let ctx = read_replica_ctx();
+    let s = SessionState::default();
+    let r = core.execute_bound_insert_in_session(&ctx, &s, "ev", 1, None, |_| {
+        panic!("bind must not run on a read replica")
+    });
+    assert_eq!(r.expect_err("rejected").wire_code(), "25006");
+    let r = core.execute_bound_upsert_in_session(&ctx, &s, "ev", 1, None, |_| {
+        panic!("bind must not run on a read replica")
+    });
+    assert_eq!(r.expect_err("rejected").wire_code(), "25006");
+}

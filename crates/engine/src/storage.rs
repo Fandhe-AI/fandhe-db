@@ -25,6 +25,10 @@ use std::path::Path;
 
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 
+/// 複製適用による UDF 世代の全スコープ共通の加算分を、世代表へ入れるときのキー。
+/// テナント識別子は制御文字を含められないため、実在のスコープと衝突しない。
+const REPLICA_FUNCTION_EPOCH_KEY: &str = "\u{0}replica-epoch";
+
 /// 明示トランザクションの書き込み時直列化検査が使う commit 記録（Issue #2404）。
 pub(crate) mod change_log;
 pub(crate) mod commit_log;
@@ -976,7 +980,17 @@ impl Storage {
             .function_generations
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        map.get(scope).copied().unwrap_or(0)
+        // 複製適用の世代（全スコープ共通）を足す。どちらも単調増加なので和も単調に増える。
+        let own = map.get(scope).copied().unwrap_or(0);
+        let replica = map.get(REPLICA_FUNCTION_EPOCH_KEY).copied().unwrap_or(0);
+        own.saturating_add(replica)
+    }
+
+    /// 複製の適用が確定した後に呼び、全スコープの UDF カタログの世代を進める（Issue #2175・RECOVER-15）。
+    /// 適用は永続表を直接書くため関数定義の変更がどのスコープに及んだか分からず、既存接続が古い定義を
+    /// 使い続けないよう、次の `refresh` で必ず再ロードさせる。
+    pub(crate) fn bump_all_function_generations(&self) {
+        self.bump_function_generation(REPLICA_FUNCTION_EPOCH_KEY);
     }
 
     /// `scope` の UDF カタログの世代を進める（定義を変える commit が成功した後にだけ呼ぶ）。

@@ -3298,6 +3298,15 @@ impl EngineCore {
         Ok(self)
     }
 
+    /// 読み取りレプリカなら `25006`（`ReadOnlySqlTransaction`）を返す。NoSQL（HTTP）の書き込み入口が、
+    /// 副作用の前に呼ぶ判定（SQL 表層は分類ゲートが担う。ストレージ側の拒否は安全網として残す）。
+    fn reject_if_read_replica(&self) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+        if self.storage.is_read_replica() {
+            return Err(crate::sql::allowlist::SqlSurfaceError::ReadOnlySqlTransaction);
+        }
+        Ok(())
+    }
+
     /// 読み取りレプリカとして構成されているか（[`Self::with_read_replica`]）。
     pub fn is_read_replica(&self) -> bool {
         self.storage.is_read_replica()
@@ -16393,6 +16402,8 @@ impl EngineCore {
             crate::sql::allowlist::SqlSurfaceError,
         >,
     {
+        // RECOVER-15・Issue #2175: 読み取りレプリカでは NoSQL の書き込みも副作用の前に `25006` で拒否する。
+        self.reject_if_read_replica()?;
         self.execute_bound_insert_with_target(
             crate::tenant::WriteTarget::Autocommit(&self.storage),
             ctx,
@@ -16434,6 +16445,8 @@ impl EngineCore {
             crate::sql::allowlist::SqlSurfaceError,
         >,
     {
+        // RECOVER-15・Issue #2175: 読み取りレプリカでは NoSQL の書き込みも副作用の前に `25006` で拒否する。
+        self.reject_if_read_replica()?;
         // 束縛クロージャで得た投影を、書き込みクロージャへ受け渡す（両者は同時に生存するため RefCell）。
         let projected: std::cell::RefCell<Option<Vec<crate::sql::parser::ProjectedColumn>>> =
             std::cell::RefCell::new(None);
@@ -16669,6 +16682,8 @@ impl EngineCore {
             crate::sql::allowlist::SqlSurfaceError,
         >,
     {
+        // RECOVER-15・Issue #2175: 読み取りレプリカでは NoSQL の書き込みも副作用の前に `25006` で拒否する。
+        self.reject_if_read_replica()?;
         use crate::sql::allowlist::SqlSurfaceError;
         self.ledger_mode
             .resolve(operation_id)
@@ -17279,6 +17294,8 @@ impl EngineCore {
             crate::sql::allowlist::SqlSurfaceError,
         >,
     {
+        // RECOVER-15・Issue #2175: 読み取りレプリカでは NoSQL の書き込みも副作用の前に `25006` で拒否する。
+        self.reject_if_read_replica()?;
         // 判定 1: `operation_id` 必須化ガード（スキーマ取得より前）。
         self.ledger_mode
             .resolve(operation_id)
@@ -17336,6 +17353,8 @@ impl EngineCore {
         session: &crate::sql::mode::SessionState,
         bound: &crate::sql::parser::BoundDelete,
     ) -> Result<crate::sql::exec::DeleteOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        // RECOVER-15・Issue #2175: 読み取りレプリカでは NoSQL の書き込みも副作用の前に `25006` で拒否する。
+        self.reject_if_read_replica()?;
         // SQL-40・Issue #1969: 判定順は「名前解決 `42P01` → 権限 `42501`」。束縛済みの主体のときだけ
         // 表の存在確認を先に行う（未束縛は従来と同一で追加の読み取りをしない）。
         if session.object_privileges_enforced() {
@@ -17368,6 +17387,8 @@ impl EngineCore {
             &crate::catalog::TableSchema,
         ) -> Result<(), crate::sql::allowlist::SqlSurfaceError>,
     {
+        // RECOVER-15・Issue #2175: 読み取りレプリカでは NoSQL の書き込みも副作用の前に `25006` で拒否する。
+        self.reject_if_read_replica()?;
         let ledger_write = self
             .ledger_mode
             .resolve(bound.operation_id.as_ref())
@@ -17458,6 +17479,8 @@ impl EngineCore {
             crate::sql::allowlist::SqlSurfaceError,
         >,
     {
+        // RECOVER-15・Issue #2175: 読み取りレプリカでは NoSQL の書き込みも副作用の前に `25006` で拒否する。
+        self.reject_if_read_replica()?;
         // 判定 1: `operation_id` 必須化ガード（スキーマ取得より前）。
         self.ledger_mode
             .resolve(operation_id)
@@ -17528,6 +17551,8 @@ impl EngineCore {
             crate::sql::allowlist::SqlSurfaceError,
         >,
     {
+        // RECOVER-15・Issue #2175: 読み取りレプリカでは NoSQL の書き込みも副作用の前に `25006` で拒否する。
+        self.reject_if_read_replica()?;
         self.ledger_mode
             .resolve(operation_id)
             .map_err(|_| crate::sql::allowlist::SqlSurfaceError::MissingOperationId)?;
@@ -17588,6 +17613,8 @@ impl EngineCore {
             crate::sql::allowlist::SqlSurfaceError,
         >,
     {
+        // RECOVER-15・Issue #2175: 読み取りレプリカでは NoSQL の書き込みも副作用の前に `25006` で拒否する。
+        self.reject_if_read_replica()?;
         self.ledger_mode
             .resolve(operation_id)
             .map_err(|_| crate::sql::allowlist::SqlSurfaceError::MissingOperationId)?;
@@ -17639,6 +17666,8 @@ impl EngineCore {
             &crate::catalog::TableSchema,
         ) -> Result<(), crate::sql::allowlist::SqlSurfaceError>,
     {
+        // RECOVER-15・Issue #2175: 読み取りレプリカでは NoSQL の書き込みも副作用の前に `25006` で拒否する。
+        self.reject_if_read_replica()?;
         self.ledger_mode
             .resolve(bound.operation_id.as_ref())
             .map_err(|_| crate::sql::allowlist::SqlSurfaceError::MissingOperationId)?;
@@ -17690,6 +17719,8 @@ impl EngineCore {
             crate::sql::allowlist::SqlSurfaceError,
         >,
     {
+        // RECOVER-15・Issue #2175: 読み取りレプリカでは NoSQL の書き込みも副作用の前に `25006` で拒否する。
+        self.reject_if_read_replica()?;
         self.ledger_mode
             .resolve(operation_id)
             .map_err(|_| crate::sql::allowlist::SqlSurfaceError::MissingOperationId)?;
@@ -17750,6 +17781,8 @@ impl EngineCore {
             crate::sql::allowlist::SqlSurfaceError,
         >,
     {
+        // RECOVER-15・Issue #2175: 読み取りレプリカでは NoSQL の書き込みも副作用の前に `25006` で拒否する。
+        self.reject_if_read_replica()?;
         self.ledger_mode
             .resolve(operation_id)
             .map_err(|_| crate::sql::allowlist::SqlSurfaceError::MissingOperationId)?;
@@ -17833,6 +17866,8 @@ impl EngineCore {
             crate::sql::allowlist::SqlSurfaceError,
         >,
     {
+        // RECOVER-15・Issue #2175: 読み取りレプリカでは NoSQL の書き込みも副作用の前に `25006` で拒否する。
+        self.reject_if_read_replica()?;
         // 分割実行は構成に関わらず operation_id 必須（Issue #1704・RECOVER-1）。
         crate::recovery::required_op_id::require_partitioned(operation_id)
             .map_err(|_| crate::sql::allowlist::SqlSurfaceError::MissingOperationId)?;
@@ -17891,6 +17926,8 @@ impl EngineCore {
             crate::sql::allowlist::SqlSurfaceError,
         >,
     {
+        // RECOVER-15・Issue #2175: 読み取りレプリカでは NoSQL の書き込みも副作用の前に `25006` で拒否する。
+        self.reject_if_read_replica()?;
         // 分割実行は構成に関わらず operation_id 必須（Issue #1704・RECOVER-1）。
         crate::recovery::required_op_id::require_partitioned(operation_id)
             .map_err(|_| crate::sql::allowlist::SqlSurfaceError::MissingOperationId)?;
