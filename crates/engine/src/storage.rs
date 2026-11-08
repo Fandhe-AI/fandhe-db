@@ -880,8 +880,8 @@ pub struct Storage {
     /// トランザクション生成（[`Self::wrap_gated`]）を fail-closed に拒否する。適用専用の
     /// [`Self::begin_replica_apply_txn`] は通らないため、複製の適用は従来どおり動く。
     read_replica: bool,
-    /// 一貫スナップショット書き出し（[`Storage::export_snapshot`]）の実行中フラグ。長い読み取り
-    /// Tx はページ回収を止めるため、1 つの `Storage` につき同時に 1 本までに制限する。
+    /// 書き出し（[`Storage::export_snapshot`]・[`Storage::export_incremental`]）の実行中フラグ。長い
+    /// 読み取り Tx はページ回収を止めるため、1 つの `Storage` につきフル・増分通じて同時 1 本まで。
     snapshot_export_busy: std::sync::atomic::AtomicBool,
     /// テスト専用の同期点コールバック（Issue #1363・TABLE-15）。feature
     /// `test-sync-points` 限定で、既定ビルドにはフィールドごと存在しない。
@@ -1367,7 +1367,7 @@ impl Storage {
     /// （RECOVER-13・RECOVER-14・Issue #2168。設計は `docs/design/change-log-pitr.md` の D7）。
     /// 読み取りトランザクションを 1 本だけ取るので書き込みを止めない。連鎖が切れている（別 DB・別 timeline・
     /// ベースが先に進んでいる・ログが刈り込まれている）ときは [`IncrementalError`] で拒否し、何も公開しない。
-    /// 運用者の CLI が呼ぶ。
+    /// 運用者の CLI・ソケットが呼ぶ。同時 1 本（超過は `InProgress`。フルの書き出しと共有。Issue #3098）。
     pub fn export_incremental(
         &self,
         base: &ChainPoint,
@@ -1376,7 +1376,7 @@ impl Storage {
         if self.temp_scoped {
             return Err(IncrementalError::NotEnabled);
         }
-        change_log::incremental::export_from_read(&self.db.begin_read()?, base, dest.as_ref())
+        change_log::incremental::export_live(self, base, dest.as_ref())
     }
 
     /// 保守 commit 用の書き込みトランザクション（変更ログの水位更新・刈り込み）。通常の書き込みが

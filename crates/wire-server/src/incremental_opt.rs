@@ -4,7 +4,8 @@
 //! 責務境界: untrusted な CLI 文字列（`--db`・`--base`・`--out`）を検証済みの [`IncrementalArgs`] に変換し、
 //! engine の結果を (終了コード, 固定の英語文) へ対応づけるところまで。連鎖検証・書き出しは
 //! `engine::storage::{chain_point_of, ReadOnlyStorage::export_incremental}` で、`main.rs::run_backup_incremental`
-//! が薄く呼ぶ（停止中の DB を読み取り専用で開く。稼働中のサーバーからの取得は #2169 以降）。
+//! が薄く呼ぶ（`--db`: 停止中の DB を読み取り専用で開く）。稼働中のサーバーからの取得（`--socket`。Issue #3098）は
+//! ベースの終点を CLI が読み、[`crate::backup_socket`] の運用者専用ソケットへ依頼する。
 //! 復元側（ベース＋増分の適用）は `restore --incremental`（[`crate::restore_opt`]）。
 //!
 //! 出力先は `backup --out` と同じ作法（既存の何かがあれば上書きせず拒否・`..` 拒否・親ディレクトリ必須）で、
@@ -16,17 +17,19 @@ use std::path::PathBuf;
 use engine::storage::IncrementalError;
 
 use crate::backup_opt::{
-    validate_db, validate_existing_file, validate_new_path, EXIT_FAILURE, EXIT_USAGE,
+    absolutize_for_socket, validate_db, validate_existing_file, validate_new_path, Target,
+    EXIT_FAILURE, EXIT_USAGE,
 };
 
 /// 検証済みの `backup-incremental` サブコマンド引数。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IncrementalArgs {
-    /// 出力元の DB ファイル（停止中。読み取り専用で開く）。
-    pub db: PathBuf,
+    /// 出力元。`Db` は停止中の DB ファイル（読み取り専用で開く）、`Socket` は稼働中のサーバーの
+    /// 運用者専用ソケット（`--db` と排他）。
+    pub target: Target,
     /// 直前のベース（フルバックアップの DB ファイル、または前回の増分バックアップ。読むだけ）。
     pub base: PathBuf,
-    /// 出力先（まだ存在しない新規パス）。
+    /// 出力先（まだ存在しない新規パス。`Socket` のときは絶対パスに直してある）。
     pub out: PathBuf,
 }
 
@@ -34,14 +37,16 @@ pub struct IncrementalArgs {
 /// 重複指定・必須欠落は拒否する（fail-closed。エラー文は英語で、パスの内容は含めない）。
 pub fn parse(args: &[String]) -> Result<IncrementalArgs, String> {
     const USAGE: &str =
-        "unknown argument (usage: backup-incremental --db <path> --base <path> --out <path>)";
+        "unknown argument (usage: backup-incremental (--db <path> | --socket <path>) --base <path> --out <path>)";
     let mut db: Option<&str> = None;
+    let mut socket: Option<&str> = None;
     let mut base: Option<&str> = None;
     let mut out: Option<&str> = None;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         let slot = match arg.as_str() {
             "--db" => &mut db,
+            "--socket" => &mut socket,
             "--base" => &mut base,
             "--out" => &mut out,
             _ => return Err(USAGE.into()),
@@ -54,14 +59,26 @@ pub fn parse(args: &[String]) -> Result<IncrementalArgs, String> {
             None => return Err(format!("{arg} requires a value")),
         }
     }
-    let (Some(db), Some(base), Some(out)) = (db, base, out) else {
-        return Err("backup-incremental requires --db, --base and --out".into());
+    let (Some(base), Some(out)) = (base, out) else {
+        return Err("backup-incremental requires --base and --out".into());
     };
-    Ok(IncrementalArgs {
-        db: validate_db(db)?,
-        base: validate_existing_file("--base", base)?,
-        out: validate_new_path("--out", out)?,
-    })
+    let target = match (db, socket) {
+        (Some(_), Some(_)) => return Err("--db and --socket are mutually exclusive".into()),
+        (None, None) => return Err("backup-incremental requires either --db or --socket".into()),
+        (Some(db), None) => Target::Db(validate_db(db)?),
+        (None, Some(sock)) => {
+            if sock.is_empty() {
+                return Err("--socket must not be empty".into());
+            }
+            Target::Socket(PathBuf::from(sock))
+        }
+    };
+    let base = validate_existing_file("--base", base)?;
+    let mut out = validate_new_path("--out", out)?;
+    if matches!(target, Target::Socket(_)) {
+        out = absolutize_for_socket(out)?;
+    }
+    Ok(IncrementalArgs { target, base, out })
 }
 
 /// 書き出しの結果を (終了コード, メッセージ) に対応づける。メッセージは固定の英語で、パス・表名・
@@ -98,6 +115,32 @@ mod tests {
         assert!(parse(&v(&["--db", "a", "--db", "b", "--base", "c", "--out", "d"])).is_err());
         assert!(parse(&v(&["--db", "a", "--base", "b"])).is_err());
         assert!(parse(&v(&["--db", "a", "--out", "b"])).is_err());
+        // --db と --socket は排他・どちらかは必須。
+        assert!(parse(&v(&[
+            "--db", "a", "--socket", "s", "--base", "b", "--out", "c"
+        ]))
+        .is_err());
+        assert!(parse(&v(&["--base", "b", "--out", "c"])).is_err());
+        assert!(parse(&v(&["--socket", "", "--base", "b", "--out", "c"])).is_err());
+    }
+
+    #[test]
+    fn socket_target_resolves_out_to_an_absolute_path() {
+        let exe = std::env::current_exe().expect("current_exe");
+        let exe = exe.to_str().expect("utf-8 path");
+        let dir = std::env::temp_dir();
+        let out = dir.join("incremental-opt-socket-test.seg");
+        let args = parse(&v(&[
+            "--socket",
+            "/some/sock",
+            "--base",
+            exe,
+            "--out",
+            out.to_str().expect("utf-8"),
+        ]))
+        .expect("parse");
+        assert_eq!(args.target, Target::Socket(PathBuf::from("/some/sock")));
+        assert!(args.out.is_absolute());
     }
 
     #[test]
