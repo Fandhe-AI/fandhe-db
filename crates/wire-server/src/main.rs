@@ -2503,6 +2503,16 @@ fn run_server(args: &[String]) -> ExitCode {
     // Issue #2175: 読み取りレプリカモード。変更ログ・送信側・バックアップとの併用は DB を開く前に拒否する
     // （変更ログを有効にすると適用が拒否され履歴が分岐する。カスケード・レプリカからのバックアップは対象外）。
     // 値・資格情報ファイルの検証は `replica_opt::parse`（DB は既存のベースだけを受け付ける）。
+    // 非 unix では `replica`・`replica_opt` モジュールが無いため、`--replica-*` は起動拒否（unix only）。
+    #[cfg(not(unix))]
+    let replica_opts: Option<std::convert::Infallible> = {
+        if !replica_pairs.is_empty() {
+            engine::log_stderr!("wire-server: --replica-* is supported on unix only");
+            return ExitCode::FAILURE;
+        }
+        None
+    };
+    #[cfg(unix)]
     let replica_opts = if replica_pairs.is_empty() {
         None
     } else {
@@ -3608,6 +3618,7 @@ fn run_server(args: &[String]) -> ExitCode {
     // 適用と読み取りの提供は同じプロセス・同じ `EngineCore` で行う）。適用が停止（整合性違反・プライマリの
     // 拒否）したら、古いデータを黙って配り続けないよう固定の終了コードでプロセスごと終える（fail-closed）。
     // 進捗は標準エラーだけに出る（テナントのセッションからは参照できない）。
+    #[cfg(unix)]
     if let Some(opts) = replica_opts {
         let apply_core = Arc::clone(&core);
         let spawned = std::thread::Builder::new()
