@@ -8,7 +8,8 @@
 
 use crate::common;
 use crate::dump_cli::{
-    assert_no_temp_leftovers, code, dir_of, dump_args, read_text, run, s, stderr, Direct,
+    assert_no_temp_leftovers, assert_redump_matches, code, dir_of, dump_args, read_text, run, s,
+    stderr, Direct,
 };
 use crate::dump_fixture;
 
@@ -76,7 +77,7 @@ fn round_trip_through_cli(label: &str, format: &str) {
         &["--tenant", "tenant-a", "--format", format],
     ));
     assert_eq!(code(&o), Some(0), "stderr: {}", stderr(&o));
-    assert_eq!(read_text(&again), text);
+    assert_redump_matches(&read_text(&again), &text);
     // 全表・VIEW の値も一致する（比較が空振りしないよう、空でないことを確認する）。
     let want = read_all(&db);
     assert!(want.iter().all(|rows| !rows.is_empty()));

@@ -46,6 +46,8 @@ pub enum DumpError {
     Unsupported(&'static str, &'static str),
     /// カタログの読み取りの失敗。
     Catalog,
+    /// 復元の世代番号を読めない（値の破損・キー欠落。RECOVER-17）。
+    Generation,
     /// ダンプファイルへの書き込みの失敗（上限超過・枠にできない値を含む）。
     Write(FileError),
     /// 一時ファイルの作成・公開の失敗。
@@ -72,6 +74,9 @@ pub fn classify(result: &Result<DumpSummary, DumpError>) -> (u8, String) {
             format!("cannot dump: unsupported object: {kind}: {reason}"),
         ),
         Err(DumpError::Catalog) => (EXIT_FAILURE, "failed to read the catalog".into()),
+        Err(DumpError::Generation) => {
+            (EXIT_FAILURE, "failed to read the restore generation".into())
+        }
         Err(DumpError::Write(e)) => (EXIT_FAILURE, e.message().into()),
         Err(DumpError::Tmp(TmpError::InvalidDestination)) => (
             EXIT_USAGE,
@@ -139,8 +144,13 @@ pub fn dump(args: &DumpArgs, leftover: &mut Option<PathBuf>) -> Result<DumpSumma
             DumpError::OpenFailed
         }
     })?;
+    // 停止中の DB を排他で開いているので、世代（書くのは閉じた復元先だけ）はこの読み取りの後に
+    // 変わらない。読めなければ何も作らずに失敗する（fail-closed。Issue #2451）。
+    let restore_generation = core
+        .restore_generation()
+        .map_err(|_| DumpError::Generation)?;
     let mut tmp = TempFile::create(parent, "fandhe-dump").map_err(DumpError::Tmp)?;
-    let result = write_and_publish(&core, args, &mut tmp);
+    let result = write_and_publish(&core, args, &mut tmp, restore_generation);
     if let Err(p) = tmp.remove() {
         // 公開済みなら armed は false で何もしない。公開しなかった経路で消せなかったときだけ通知する。
         *leftover = Some(p);
@@ -152,11 +162,13 @@ fn write_and_publish(
     core: &Storage,
     args: &DumpArgs,
     tmp: &mut TempFile,
+    restore_generation: u64,
 ) -> Result<DumpSummary, DumpError> {
     let header = Header {
         scope: args.scope.clone(),
         parts: args.parts,
         format: args.format,
+        restore_generation,
     };
     let out = BufWriter::new(&tmp.file);
     let mut writer = FileWriter::begin(out, &header).map_err(DumpError::Write)?;
