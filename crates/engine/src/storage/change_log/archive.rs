@@ -840,14 +840,16 @@ pub(crate) fn is_segment_temp_name(name: &str) -> bool {
 /// アーカイブ先 `dir` に、異常終了で残った一時名（[`is_segment_temp_name`] に厳密一致し、通常ファイル・
 /// 0600 系・自分の所有・他の書き込みが進行中でないもの）だけを消す（Issue #3094・RECOVER-13・RECOVER-14）。
 /// wire-server の起動時（アーカイブのスレッドを動かす前）に 1 回呼ぶ。`dir` が存在しない・共有ディレクトリ
-/// （`InsecureDirectory`）のときはエラー。公開済みのセグメント・形式に一致しないファイルには触れない。
+/// （`InsecureDirectory`）のときはエラー。`protected`（起動中の DB 等の消してはならないパス。実体・dev/inode でも
+/// 照合する）は名前が一時名の形式でも消さない。公開済みのセグメント・形式に一致しないファイルには触れない。
 pub fn sweep_change_log_archive_temps(
     dir: impl AsRef<Path>,
+    protected: &[&Path],
 ) -> Result<crate::storage::StaleTempSweep> {
     let dir = dir.as_ref();
     check_dir(dir)?;
     check_dir_not_shared(dir)?;
-    crate::storage::stale_temp::sweep_stale_temps(dir, is_segment_temp_name)
+    crate::storage::stale_temp::sweep_stale_temps(dir, is_segment_temp_name, protected)
         .map_err(ArchiveError::Io)
 }
 

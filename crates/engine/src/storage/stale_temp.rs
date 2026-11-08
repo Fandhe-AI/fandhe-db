@@ -173,13 +173,36 @@ impl TempDirLock {
     }
 }
 
+/// 掃除が消してはならないファイルの識別子（dev・inode）の集合を作る。`protected` の各パスについて、
+/// 指定そのもの（リンクをたどらない）と実体（リンクをたどる）の両方を登録する。存在しないパスは
+/// 登録されない（その名前が予約名なら呼び出し側の引数検査が拒否する）。
+#[cfg(unix)]
+fn protected_identities(protected: &[&Path]) -> Vec<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let mut ids = Vec::new();
+    for p in protected {
+        for meta in [std::fs::symlink_metadata(p), std::fs::metadata(p)]
+            .into_iter()
+            .flatten()
+        {
+            ids.push((meta.dev(), meta.ino()));
+        }
+    }
+    ids
+}
+
 /// `dir` の残骸を掃除する。`is_temp_name` は一時名の形式の厳密な判定。自分の uid の確認用に
 /// 作る probe は専用の形式（[`is_probe_name`]）で、`is_temp_name` と一致しないため呼び出し側の
 /// 残骸の数え方に混ざり、異常終了で残っても次の掃除が回収する。
+///
+/// `protected` は消してはならない既存のファイル（起動中の DB・入力ファイル等）のパス。名前が一時名の形式でも、
+/// 指定のパス・シンボリックリンクを解決した実体・同じ dev/inode のどれかに一致する候補は消さず `skipped` に数える
+/// （予約名の検査をすり抜けた永続ファイルを守る多層防御。Issue #3094）。
 #[cfg(unix)]
 pub fn sweep_stale_temps(
     dir: &Path,
     is_temp_name: fn(&str) -> bool,
+    protected: &[&Path],
 ) -> Result<StaleTempSweep, std::io::ErrorKind> {
     use std::fs::TryLockError;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -221,6 +244,11 @@ pub fn sweep_stale_temps(
         return Ok(StaleTempSweep::empty(SweepOutcome::OwnerUnknown));
     };
 
+    let protected_ids = protected_identities(protected);
+    let protected_real: Vec<std::path::PathBuf> = protected
+        .iter()
+        .filter_map(|p| std::fs::canonicalize(p).ok())
+        .collect();
     let mut sweep = StaleTempSweep::empty(SweepOutcome::Swept);
     let mut scanned = 0usize;
     let entries = std::fs::read_dir(dir).map_err(|e| e.kind())?;
@@ -249,6 +277,12 @@ pub fn sweep_stale_temps(
             sweep.skipped = sweep.skipped.saturating_add(1);
             continue;
         }
+        let is_protected = protected_ids.contains(&(meta.dev(), meta.ino()))
+            || std::fs::canonicalize(&path).is_ok_and(|c| protected_real.contains(&c));
+        if is_protected {
+            sweep.skipped = sweep.skipped.saturating_add(1);
+            continue;
+        }
         match std::fs::remove_file(&path) {
             Ok(()) => {
                 sweep.removed = sweep.removed.saturating_add(1);
@@ -271,6 +305,7 @@ pub fn sweep_stale_temps(
 pub fn sweep_stale_temps(
     _dir: &Path,
     _is_temp_name: fn(&str) -> bool,
+    _protected: &[&Path],
 ) -> Result<StaleTempSweep, std::io::ErrorKind> {
     Ok(StaleTempSweep::empty(SweepOutcome::Unsupported))
 }

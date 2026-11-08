@@ -455,9 +455,10 @@ fn restore_succeeds_with_many_legacy_leftovers_for_same_pid() {
     assert!(restored.exists());
 }
 
-/// Issue #3094: `--from` が一時名の実体へのシンボリックリンクでも、掃除は復元元の実体を消さない。
+/// Issue #3094: `--from` が一時名の実体へのシンボリックリンクなら、引数検査が終了コード 2 で拒否し、
+/// 復元元の実体は消えず復元先も作られない。
 #[test]
-fn restore_sweep_keeps_source_reached_through_symlink_to_temp_name() {
+fn restore_rejects_source_reached_through_symlink_to_temp_name() {
     use std::os::unix::fs::PermissionsExt;
     let fx = common::TempFixtureDir::new("restore-sweep-alias");
     let (_users, db) = populate(&fx);
@@ -476,9 +477,10 @@ fn restore_sweep_keeps_source_reached_through_symlink_to_temp_name() {
         alias.to_str().expect("utf-8 path"),
         restored.to_str().expect("utf-8 path"),
     );
-    assert_eq!(code(&o), Some(0), "stderr: {}", stderr(&o));
-    assert!(real.exists(), "source entity must survive the sweep");
-    assert!(restored.exists());
+    assert_eq!(code(&o), Some(2), "stderr: {}", stderr(&o));
+    assert!(stderr(&o).contains("reserved temporary file name"));
+    assert!(real.exists(), "source entity must survive");
+    assert!(!restored.exists());
 }
 
 /// 復元の正常系: 元のバックアップは不変、復元先から別のサーバーが起動してデータを読める。

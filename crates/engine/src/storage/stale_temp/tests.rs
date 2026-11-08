@@ -26,7 +26,7 @@ fn put(dir: &Path, name: &str, mode: u32) {
 }
 
 fn sweep(dir: &Path) -> StaleTempSweep {
-    sweep_stale_temps(dir, is_name).expect("sweep")
+    sweep_stale_temps(dir, is_name, &[]).expect("sweep")
 }
 
 #[test]
@@ -124,7 +124,7 @@ fn empty_directory_and_missing_directory() {
     let s = sweep(&d);
     assert_eq!((s.outcome, s.removed), (SweepOutcome::Swept, 0));
     let _ = std::fs::remove_dir_all(&d);
-    assert!(sweep_stale_temps(&d, is_name).is_err());
+    assert!(sweep_stale_temps(&d, is_name, &[]).is_err());
 }
 
 #[test]
@@ -183,4 +183,45 @@ fn reserved_temp_name_covers_every_swept_format() {
     ] {
         assert!(!is_reserved_temp_name(n), "{n}");
     }
+}
+
+#[test]
+fn protected_paths_are_never_removed() {
+    let d = tdir("protected");
+    put(&d, ".t-1.tmp", 0o600);
+    put(&d, ".t-2.tmp", 0o600);
+    put(&d, ".t-3.tmp", 0o600);
+    // 別ディレクトリ経由のシンボリックリンク・ハードリンクで指された実体も守る。
+    let other = tdir("protected-other");
+    symlink(d.join(".t-2.tmp"), other.join("db-link")).expect("symlink");
+    std::fs::hard_link(d.join(".t-3.tmp"), other.join("db-hard")).expect("hard link");
+    let by_name = d.join(".t-1.tmp");
+    let by_link = other.join("db-link");
+    let by_hard = other.join("db-hard");
+    let s = sweep_stale_temps(
+        &d,
+        is_name,
+        &[by_name.as_path(), by_link.as_path(), by_hard.as_path()],
+    )
+    .expect("sweep");
+    assert_eq!((s.removed, s.skipped), (0, 3));
+    for n in [".t-1.tmp", ".t-2.tmp", ".t-3.tmp"] {
+        assert!(d.join(n).exists(), "{n} must stay");
+    }
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&other);
+}
+
+#[test]
+fn unprotected_siblings_are_still_removed_and_missing_protected_is_ignored() {
+    let d = tdir("protected-mixed");
+    put(&d, ".t-1.tmp", 0o600);
+    put(&d, ".t-2.tmp", 0o600);
+    let keep = d.join(".t-1.tmp");
+    let missing = d.join("no-such-file");
+    let s = sweep_stale_temps(&d, is_name, &[keep.as_path(), missing.as_path()]).expect("sweep");
+    assert_eq!((s.removed, s.skipped), (1, 1));
+    assert!(d.join(".t-1.tmp").exists());
+    assert!(!d.join(".t-2.tmp").exists());
+    let _ = std::fs::remove_dir_all(&d);
 }

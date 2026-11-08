@@ -224,14 +224,7 @@ fn validate_generation_state_path(raw: &str, others: &[&Path]) -> Result<PathBuf
     };
     // 掃除（Issue #3094）が消す予約名の形式は、新規・既存を問わず拒否する。既存の状態ファイルが掃除に消され
     // 空で再作成されると高水位が失われ、世代番号の単調性（RECOVER-17）が崩れるため（fail-closed）。
-    if name
-        .to_str()
-        .is_some_and(engine::storage::is_reserved_temp_name)
-    {
-        return Err(format!(
-            "{FLAG} must not use a reserved temporary file name"
-        ));
-    }
+    crate::backup_opt::reject_reserved_name(FLAG, &path)?;
     let parent = match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),
@@ -502,7 +495,7 @@ pub fn sweep_stale_restore_temps(
     if reserved {
         return None;
     }
-    unix_impl::sweep_stale_restore_temps(dest)
+    unix_impl::sweep_stale_restore_temps(dest, protected)
 }
 
 /// 非 unix では掃除しない。
@@ -886,12 +879,13 @@ mod unix_impl {
     /// 不正なときは何もしない。掃除できなかった場合も復元は続ける（呼び出し元が結果だけ報告する）。
     pub(super) fn sweep_stale_restore_temps(
         dest: &Path,
+        protected: &[&Path],
     ) -> Option<(PathBuf, engine::storage::StaleTempSweep)> {
         let parent = parent_of(dest).ok()?;
         if std::fs::symlink_metadata(dest).is_ok() {
             return None;
         }
-        let s = engine::storage::sweep_stale_temps(parent, is_restore_temp_name).ok()?;
+        let s = engine::storage::sweep_stale_temps(parent, is_restore_temp_name, protected).ok()?;
         Some((parent.to_path_buf(), s))
     }
 

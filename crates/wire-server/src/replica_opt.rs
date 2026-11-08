@@ -183,6 +183,8 @@ pub(crate) fn check_primary_loopback(primary: &SocketAddr) -> Result<(), String>
 /// `role:password` の 1 行を読む。通常ファイルで小さく、group／other に読める権限が無いこと。
 /// パスワードは最初の `:` より後ろ全部（`:` を含んでよい）。末尾の改行は取り除く。
 pub(crate) fn load_credentials(path: &Path) -> Result<(String, Vec<u8>), String> {
+    // 掃除（Issue #3094）が消す予約名の形式のファイルは拒否する（fail-closed）。
+    crate::backup_opt::reject_reserved_name("--credentials", path)?;
     use std::os::unix::fs::PermissionsExt as _;
     let meta = std::fs::metadata(path).map_err(|_| "--credentials cannot be read".to_string())?;
     if !meta.is_file() || meta.len() > MAX_CREDENTIALS_FILE_BYTES {

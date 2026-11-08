@@ -499,9 +499,21 @@ RECOVER-14 (2) のポインタ（上限の超過で書き込みを拒否する�
   `backup-incremental --out`・dump 系・`replica-resync --out`）は、名前が掃除の予約名（復元・アーカイブの
   一時名・掃除の確認用ファイル）の形式なら引数エラー（終了コード 2）で拒否する。判定は engine の
   `storage::is_reserved_temp_name` に一本化し、出力先の共通検査 `validate_new_path` から呼ぶ。
-  すでに予約名で存在する完成済みファイルは、内容で見分けず（部分コピーも redb として開けうる）、
-  従来どおり掃除の対象とする（本修正の前に作られた名前への追加の安全策は取らない）
+  既存の入力ファイルも同じく拒否する（後述の表）。拒否をすり抜けた名前は、掃除の保護パスが守る
 - `restore --generation-state` も同じ予約名を新規・既存を問わず拒否する（掃除で高水位が失われ RECOVER-17 の単調性が崩れるため）。掃除の入力保護（`--from`・`--incremental`・`--generation-state`）の判定も `is_reserved_temp_name` に合わせ、確認用ファイル・アーカイブの一時名を含む
+- 予約名の防御は経路全体に敷く（Issue #3094 のレビュー指摘への最終対応）。名前の拒否は共通ヘルパー
+  `backup_opt::reject_reserved_name`（指定の名前と、シンボリックリンクを解決した実体の名前の両方を検査。
+  終了コード 2・パスはエラー文に出さない）に一本化し、掃除側は呼び出しごとに「保護するパスの集合」を受け取って
+  指定のパス・実体・dev/inode が一致する候補を消さない（`sweep_stale_temps(dir, is_temp, protected)`）
+
+  | 経路 | 拒否（終了コード 2） | 掃除の保護 |
+  | ---- | -------------------- | ---------- |
+  | 通常起動 `--db`・`--users`・TLS 証明書/鍵・SCRAM モック鍵・ストップワード/同義語・リランカーのモデル/トークナイザ | 起動前に新規・既存を問わず拒否 | 起動時の掃除（アーカイブ先）に全件を保護として渡す |
+  | `--replication-roles`・`--credentials`（`replica`・`replica-resync`・`--replica-credentials`） | 解析時に拒否 | 掃除を行わない経路 |
+  | `restore --db` `backup --out` `backup-incremental --out` dump 系 `--out`・`--db`・`replica-resync --out`（新規パス） | `validate_new_path` | 復元の掃除に入力を保護として渡す（`--db` は未作成） |
+  | `--db`（既存）・`--from`・`--base`・`--backup`・`--incremental`（既存ファイル） | `validate_existing_file`（`validate_db` 経由を含む） | `restore` の掃除に `--from`・`--incremental`・`--generation-state` を保護として渡す |
+  | `restore --generation-state` | 専用検査で新規・既存を問わず拒否 | 同上 |
+
 - 掃除の uid 確認用ファイルは専用の形式 `.fandhe-sweep-probe-*`（一時名と別）にし、確認中の SIGKILL で
   残っても次の掃除が回収する。呼び出し側（crash-test）の「一時名の残骸の件数」には混ざらない
 - 対象外: `backup` の `.fandhe-snapshot-*`・`verify` の `.fandhe-verify-*`・`dump` 系の一時名・

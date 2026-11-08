@@ -995,7 +995,7 @@ fn sweep_removes_only_stale_temp_names_in_the_archive_dir() {
     std::fs::set_permissions(dir.join(&wide), std::fs::Permissions::from_mode(0o644))
         .expect("chmod");
 
-    let s = sweep_change_log_archive_temps(dir).expect("sweep");
+    let s = sweep_change_log_archive_temps(dir, &[]).expect("sweep");
     assert_eq!((s.removed, s.skipped, s.failed), (1, 1, 0));
     assert_eq!(s.removed_names, vec![stale.clone()]);
     assert!(!dir.join(&stale).exists());
@@ -1026,11 +1026,11 @@ fn sweep_is_skipped_while_a_publisher_holds_the_dir_lock() {
     std::fs::set_permissions(dir.join(&stale), std::fs::Permissions::from_mode(0o600))
         .expect("chmod");
     let guard = crate::storage::TempDirLock::shared(dir).expect("lock");
-    let s = sweep_change_log_archive_temps(dir).expect("sweep");
+    let s = sweep_change_log_archive_temps(dir, &[]).expect("sweep");
     assert_eq!(s.outcome, crate::storage::SweepOutcome::InUse);
     assert!(dir.join(&stale).exists());
     drop(guard);
-    let s = sweep_change_log_archive_temps(dir).expect("sweep");
+    let s = sweep_change_log_archive_temps(dir, &[]).expect("sweep");
     assert_eq!(s.removed, 1);
 }
 
@@ -1039,13 +1039,13 @@ fn sweep_rejects_missing_or_shared_directory() {
     use std::os::unix::fs::PermissionsExt;
     let f = Fixture::new("arc-sweep-bad");
     assert!(matches!(
-        sweep_change_log_archive_temps(f.archive.path().join("missing")),
+        sweep_change_log_archive_temps(f.archive.path().join("missing"), &[]),
         Err(ArchiveError::InvalidDirectory)
     ));
     let shared = TempDir::new("arc-sweep-shared");
     std::fs::set_permissions(shared.path(), std::fs::Permissions::from_mode(0o777)).expect("chmod");
     assert!(matches!(
-        sweep_change_log_archive_temps(shared.path()),
+        sweep_change_log_archive_temps(shared.path(), &[]),
         Err(ArchiveError::InsecureDirectory)
     ));
 }
