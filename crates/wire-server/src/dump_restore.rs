@@ -3,8 +3,8 @@
 //!
 //! 責務境界: ダンプファイル（[`crate::dump_file`]）を 1 枠ずつ読み、一時名の新規 DB へ engine の
 //! 通常の SQL 実行経路（`EngineCore::execute_sql_in_session`・`begin_copy`／`commit_copy_in`。
-//! 第 2 の書き込み経路は作らない）で流し込み、整合検査に通ったときだけ [`crate::dump_tmp`] で
-//! 復元先へ公開する。途中のどこで失敗しても何も公開せず一時名を消すので、復元は全体として
+//! 第 2 の書き込み経路は作らない）で流し込み、整合検査に通り、復元の世代番号を復元元より
+//! 大きい値へ進められたときだけ [`crate::dump_tmp`] で復元先へ公開する（RECOVER-17・Issue #2451）。途中のどこで失敗しても何も公開せず一時名を消すので、復元は全体として
 //! 原子的に成功か不成功かのどちらかになる（既存の復元先は上書きしない＝空の DB だけを受け付ける）。
 //! `main.rs` の `run_dump_restore` が呼ぶ。
 //!
@@ -77,6 +77,8 @@ pub enum RestoreError {
     VerifyFailed,
     /// 流し込んだ DB が整合検査に通らなかった。
     NotConsistent,
+    /// 復元の世代番号を進められなかった（RECOVER-17・Issue #2451）。
+    GenerationFailed,
     /// 一時ファイルの作成・公開の失敗。
     Tmp(TmpError),
 }
@@ -116,6 +118,10 @@ pub fn classify(result: &Result<RestoreSummary, RestoreError>) -> (u8, String) {
         Err(RestoreError::NotConsistent) => (
             EXIT_NOT_CONSISTENT,
             "the restored database failed the integrity check; nothing was published".into(),
+        ),
+        Err(RestoreError::GenerationFailed) => (
+            EXIT_FAILURE,
+            "restore generation could not be advanced; nothing was published".into(),
         ),
         Err(RestoreError::Tmp(TmpError::InsecureParent)) => (
             EXIT_USAGE,
@@ -217,13 +223,19 @@ fn apply_verify_publish(
     work.check().map_err(RestoreError::Tmp)?;
     tmp.check_path().map_err(RestoreError::Tmp)?;
     {
-        let storage = Storage::open(&tmp.path).map_err(|_| RestoreError::VerifyFailed)?;
+        let mut storage = Storage::open(&tmp.path).map_err(|_| RestoreError::VerifyFailed)?;
         let report = storage
             .verify_integrity(&IntegrityOptions::default())
             .map_err(|_| RestoreError::VerifyFailed)?;
         if !report.is_consistent() {
             return Err(RestoreError::NotConsistent);
         }
+        // 整合を確かめた後・公開の前に、ダンプのヘッダが運ぶ復元元の世代を下限にして復元の世代番号を
+        // 進める（RECOVER-17・Issue #2451）。進められなければ何も公開しない。書き込むのは世代の 1 表だけ
+        // で同一 inode のまま公開するため、整合検査は再実行しない。
+        storage
+            .advance_restore_generation_from_source(header.restore_generation)
+            .map_err(|_| RestoreError::GenerationFailed)?;
     }
     work.check().map_err(RestoreError::Tmp)?;
     tmp.publish(dest).map_err(RestoreError::Tmp)?;

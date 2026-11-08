@@ -182,7 +182,18 @@ fn users_file_database_round_trips_with_roles_and_privileges() {
     let again = s(&dir.join("again.sql")).to_string();
     let o = run(&dump_args(&restored, &again, &["--tenant", "tenant-a"]));
     assert_eq!(code(&o), Some(0), "stderr: {}", stderr(&o));
-    assert_eq!(read_text(&again), text, "re-dump must match the original");
+    // 復元の完了時に復元の世代番号が進む（#2451）ので、ヘッダの `restore-generation` 行だけは比較から除く。
+    let without_generation = |t: &str| -> String {
+        t.lines()
+            .filter(|l| !l.starts_with("-- restore-generation: "))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert_eq!(
+        without_generation(&read_text(&again)),
+        without_generation(&text),
+        "re-dump must match the original"
+    );
 
     // 同じ users ファイルで復元先を起動する。ブートストラップは再投入せず、認証と権限が元と同じ。
     let (g, addr) = spawn_server(&users, &restored);
