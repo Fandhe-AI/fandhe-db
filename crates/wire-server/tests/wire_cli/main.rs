@@ -30,6 +30,7 @@ mod wire7_bind_guard;
 mod wire_change_log_archive_cli;
 mod wire_change_log_cleanup_cli;
 mod wire_change_log_cli;
+mod wire_change_log_disable_cli;
 mod wire_correlated_limits_cli;
 mod wire_ddl_permission_cli;
 mod wire_dml_limits_cli;

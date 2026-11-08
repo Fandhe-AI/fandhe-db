@@ -427,6 +427,8 @@
 //! （Issue #2167・RECOVER-14 ポインタ）: 変更ログのアーカイブ先・保持件数・書き出し周期。`--change-log` が前提で、
 //! 保持・周期はアーカイブ先が前提（欠落・重複・不正値は起動エラー）。保持の既定は刈り込まない。常駐スレッドが
 //! 周期的に書き出し（`wire_server::change_log_archive`）、`change-log-verify` サブコマンドがアーカイブを検査する。
+//! `change-log-disable --db <path> [--discard-unarchived]`（Issue #3093）は停止中の DB の変更ログを無効化する
+//! （未アーカイブのレコードが在ると既定では拒否する）。
 //! PITR の復元は後続の Issue。
 //!
 //! `--change-log-max-unarchived-bytes <n>`・`--change-log-max-unarchived-records <n>`（Issue #3091・RECOVER-14 (2)
@@ -631,6 +633,9 @@ fn main() -> ExitCode {
     }
     if args.get(1).map(String::as_str) == Some("change-log-cleanup") {
         return run_change_log_cleanup(&args[2..]);
+    }
+    if args.get(1).map(String::as_str) == Some("change-log-disable") {
+        return run_change_log_disable(&args[2..]);
     }
     if args.get(1).map(String::as_str) == Some("verify") {
         return run_verify(&args[2..]);
@@ -4882,6 +4887,51 @@ fn run_change_log_cleanup(args: &[String]) -> ExitCode {
                 println!("change log cleanup (partial): segments={removed}");
             }
             fail(&e)
+        }
+    }
+}
+
+/// `change-log-disable --db <path> [--discard-unarchived]` サブコマンド（Issue #3093・RECOVER-14 ポインタ。
+/// 設計は `docs/design/change-log-pitr.md` の D13）。停止中の DB の変更ログを無効化し、有効にしない起動・
+/// 書き込みができる状態へ戻す。未アーカイブのレコードが在ると既定では拒否し（終了コード 1）、
+/// `--discard-unarchived` の明示でだけ破棄する。稼働中のサーバーが開いている DB は拒否する。
+/// 標準出力・標準エラーは固定文言（件数・LSN・パスを含めない）。
+fn run_change_log_disable(args: &[String]) -> ExitCode {
+    use engine::storage::{DisableOptions, Storage};
+    use wire_server::{backup_opt, change_log_opt};
+
+    let parsed = match change_log_opt::parse_disable(args) {
+        Ok(p) => p,
+        Err(msg) => {
+            engine::log_stderr!("wire-server: change-log-disable: {msg}");
+            return ExitCode::from(change_log_opt::EXIT_DISABLE_USAGE);
+        }
+    };
+    let mut storage = match Storage::open(&parsed.db) {
+        Ok(s) => s,
+        Err(e) => {
+            if backup_opt::is_already_open(&e) {
+                engine::log_stderr!(
+                    "wire-server: change-log-disable: database is in use by another process \
+                     (stop the server first)"
+                );
+            } else {
+                engine::log_stderr!("wire-server: change-log-disable: failed to open database");
+            }
+            return ExitCode::from(change_log_opt::EXIT_DISABLE_FAILED);
+        }
+    };
+    let opts = DisableOptions {
+        discard_unarchived: parsed.discard_unarchived,
+    };
+    match storage.disable_change_log(&opts) {
+        Ok(()) => {
+            println!("{}", change_log_opt::DISABLED_MESSAGE);
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            engine::log_stderr!("wire-server: change-log-disable: {e}");
+            ExitCode::from(change_log_opt::EXIT_DISABLE_FAILED)
         }
     }
 }

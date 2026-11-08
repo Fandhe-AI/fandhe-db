@@ -54,6 +54,7 @@ pub use change_log::archive::{
     DEFAULT_PRUNE_RECORDS, DEFAULT_SEGMENT_BYTES, SEGMENT_FORMAT_VERSION,
 };
 pub use change_log::backlog::{UnarchivedLimit, UnarchivedStatus};
+pub use change_log::disable::{DisableError, DisableOptions};
 pub use change_log::incremental::{
     apply_incremental_segments, chain_point_of, ApplySummary, ChainPoint, IncrementalError,
     IncrementalSummary,
