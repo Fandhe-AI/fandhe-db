@@ -92,25 +92,25 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // `catalog/*.rs` の各エントリも同じ理由で移動している）。
     // Issue #3069（`change_log_on_disk`・連続性検査・保留した移行の追加）で行番号が移動したための追随。
     // Issue #2167（アーカイブ・保持の公開 API と `begin_maintenance_txn` の追加。+44 行）で追随（旧: 1348／1382）。
-    ("storage.rs", 1417),
-    ("storage.rs", 1451),
+    ("storage.rs", 1420),
+    ("storage.rs", 1454),
     // Issue #3067: `Storage::enable_change_log` が DB 識別子の永続化に使う保守 commit
     // （`commit_boundary::commit_maintenance`）。書き込むのは `change_log_meta` 表だけで、`CATALOG_TABLE`・
     // `user_rows` には触れず、世代も進めない（バンプ対象の表が構造的に存在しない）。
-    ("storage.rs", 1196),
+    ("storage.rs", 1199),
     // Issue #3067: `storage/change_log.rs` のテスト内の commit 入口（`commit_result`・`commit_maint`）。
     // 変更ログの `change_log` 表・メタ表と任意の試験用 redb 表だけを書くテスト fixture で、
     // `user_rows/{table_name}` を経由しないため対象外。
     // Issue #2167: `storage/change_log/archive.rs` の保守 commit（アーカイブ済み水位の更新と水位以下の
     // 刈り込み）。書き込むのは `change_log_meta`・`change_log` 表だけで、`CATALOG_TABLE`・`user_rows` には
     // 触れず、世代も進めない（バンプ対象の表が構造的に存在しない）。
-    ("storage/change_log/archive.rs", 1145),
+    ("storage/change_log/archive.rs", 1157),
     // Issue #2448（復元の世代番号。RECOVER-17）: `Storage::advance_restore_generation` の保守 commit。
     // 書き込むのは `restore_generation` 専用表だけで、`CATALOG_TABLE`・`user_rows` には触れず、
     // 世代も進めない（バンプ対象の表が構造的に存在しない）。
     ("storage/restore_generation.rs", 121),
-    ("storage/change_log.rs", 1536),
-    ("storage/change_log.rs", 1544),
+    ("storage/change_log.rs", 1580),
+    ("storage/change_log.rs", 1588),
     ("recovery/panic_hook.rs", 404),
     ("txn.rs", 211),
     ("txn.rs", 388),

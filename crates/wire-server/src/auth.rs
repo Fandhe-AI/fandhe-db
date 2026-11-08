@@ -598,7 +598,7 @@ impl AuthFailure {
 /// [`argon2id::synthesize_phc_without_hashing`] で組み立て、`encode_phc` は使わない
 /// （`encode_phc` は構築時に実際に Argon2id を計算してしまい、`verify()` 側の
 /// `verify_phc` 呼び出しと合わせて計算コストが二重になるため。review 指摘）。
-fn dummy_phc() -> &'static str {
+pub(crate) fn dummy_phc() -> &'static str {
     static DUMMY: OnceLock<String> = OnceLock::new();
     DUMMY.get_or_init(|| {
         argon2id::synthesize_phc_without_hashing(

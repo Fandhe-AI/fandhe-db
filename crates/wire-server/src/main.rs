@@ -429,6 +429,14 @@
 //! 周期的に書き出し（`wire_server::change_log_archive`）、`change-log-verify` サブコマンドがアーカイブを検査する。
 //! PITR の復元は後続の Issue。
 //!
+//! `--replication-bind <addr>`・`--replication-roles <file>`・`--replication-allow <ip|cidr>`・
+//! `--replication-max-connections <n>`・`--replication-max-unacked-bytes <n>`・
+//! `--replication-ack-timeout-secs <n>`・`--replication-max-lag-records <n>`（Issue #2173・RECOVER-15・WIRE-9 ポインタ）: ストリーミング
+//! レプリケーションの送信側（プライマリ）の opt-in。テナント向けとは別のリスナーを作り、専用ロールで認証した
+//! 許可リスト内のレプリカへ変更ログを送る。`--change-log` が前提で、bind はループバックだけ（非ループバックは
+//! 起動エラー。TLS は #2177）。重複指定・不正値・前提の欠落は DB を開く前に起動エラー
+//! （`wire_server::replication_opt`・`wire_server::replication`。`docs/design/replication-streaming.md` 参照）。
+//!
 //! `--require-where-for-dml`（Issue #2210・SQL-36 ポインタ）: 値を取らないスイッチ。
 //! 指定すると `WHERE` 省略の SQL `UPDATE`／`DELETE` を変更開始前に `42601` で拒否する
 //! （明示した述語は受理。MySQL の `sql_safe_updates` 相当）。重複指定・`=` 連結形・後続の値は
@@ -645,6 +653,7 @@ fn run_server(args: &[String]) -> ExitCode {
     let mut change_log_archive_dir: Option<std::path::PathBuf> = None;
     let mut change_log_retain_records: Option<u64> = None;
     let mut change_log_interval_secs: Option<u64> = None;
+    let mut replication_args = wire_server::replication_opt::ReplicationArgs::default();
     let mut require_where_for_dml = false;
     let mut max_dml_affected_rows_raw: Option<String> = None;
     let mut max_insert_rows_raw: Option<String> = None;
@@ -2403,6 +2412,26 @@ fn run_server(args: &[String]) -> ExitCode {
                 }
                 i += 2;
             }
+            // Issue #2173（RECOVER-15 ポインタ）。レプリケーション送信側の専用リスナー・認証ロール・許可リスト・
+            // 接続数とバックプレッシャの上限。値の検証と重複指定の拒否は `replication_opt`（エラー文は固定の英語で、
+            // 値・パスを含めない）。
+            flag @ ("--replication-bind"
+            | "--replication-roles"
+            | "--replication-allow"
+            | "--replication-max-connections"
+            | "--replication-max-unacked-bytes"
+            | "--replication-ack-timeout-secs"
+            | "--replication-max-lag-records") => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!("wire-server: {flag} requires a value");
+                    return ExitCode::FAILURE;
+                };
+                if let Err(msg) = replication_args.accept(flag, v) {
+                    engine::log_stderr!("wire-server: {msg}");
+                    return ExitCode::FAILURE;
+                }
+                i += 2;
+            }
             other => {
                 engine::log_stderr!("wire-server: unknown argument: {other}");
                 return ExitCode::FAILURE;
@@ -2419,6 +2448,16 @@ fn run_server(args: &[String]) -> ExitCode {
         change_log_interval_secs,
     ) {
         Ok(a) => a,
+        Err(msg) => {
+            engine::log_stderr!("wire-server: {msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Issue #2173: レプリケーション系フラグの組み合わせ（`--change-log` が前提、bind・ロール・許可リストが
+    // 必須、ループバックのみ）と値・資格情報ファイルを DB を開く前に検査する（fail-closed）。
+    let replication = match replication_args.resolve(change_log) {
+        Ok(r) => r,
         Err(msg) => {
             engine::log_stderr!("wire-server: {msg}");
             return ExitCode::FAILURE;
@@ -3638,6 +3677,34 @@ fn run_server(args: &[String]) -> ExitCode {
             engine::log_stderr!("wire-server: failed to start the change log archive thread");
             return ExitCode::FAILURE;
         }
+    }
+
+    // Issue #2173: レプリケーション送信側のリスナー（`--replication-bind` 指定時だけ）。テナント向けの
+    // リスナーとは別のソケット・別の認証で、「listening on」の前に bind して常駐スレッドを起動する。
+    // 失敗は fail-closed で起動を拒否する。出力行に「listening on」を使わない（テストの待機ヘルパーが
+    // テナント向けの行と取り違えないため）。
+    #[cfg(unix)]
+    if let Some(settings) = replication {
+        let listener = match std::net::TcpListener::bind(settings.bind) {
+            Ok(l) => l,
+            Err(_) => {
+                engine::log_stderr!("wire-server: failed to bind the replication listener");
+                return ExitCode::FAILURE;
+            }
+        };
+        match listener.local_addr() {
+            Ok(addr) => engine::log_stderr!("wire-server: replication endpoint bound to {addr}"),
+            Err(_) => engine::log_stderr!("wire-server: replication endpoint bound"),
+        }
+        if wire_server::replication::spawn_server(listener, Arc::clone(&core), settings).is_err() {
+            engine::log_stderr!("wire-server: failed to start the replication thread");
+            return ExitCode::FAILURE;
+        }
+    }
+    #[cfg(not(unix))]
+    if replication.is_some() {
+        engine::log_stderr!("wire-server: --replication-bind is supported only on unix platforms");
+        return ExitCode::FAILURE;
     }
 
     // 実際に bind されたアドレスを出す（`--bind 127.0.0.1:0` の ephemeral port
