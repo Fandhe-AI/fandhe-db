@@ -511,6 +511,98 @@ pub(super) fn map_decode(e: DecodeError) -> ArchiveError {
     }
 }
 
+// ---------------------------------------------------------------------------
+// セグメントの open（Issue #3103）
+// ---------------------------------------------------------------------------
+
+/// `O_NOFOLLOW`（最終要素がシンボリックリンクなら open を失敗させる）と `O_NONBLOCK`（FIFO への差し替えで
+/// open が停止しないようにする。通常ファイルの read には影響しない）の値。依存（libc）を足さないため target
+/// ごとに自前で定義する。値は libc クレートの各 target の定義と同じ（aarch64 Linux は asm-generic と異なる）。
+/// 対応外の target は `None`（`O_NOFOLLOW` を付けず、[`verify_same_inode_if_following`] の事後照合で担保する）。
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const OPEN_FLAGS: Option<i32> = Some(0o400000 | 0o4000);
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const OPEN_FLAGS: Option<i32> = Some(0o100000 | 0o4000);
+#[cfg(target_os = "macos")]
+const OPEN_FLAGS: Option<i32> = Some(0x100 | 0x4);
+#[cfg(not(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "aarch64"),
+    target_os = "macos"
+)))]
+const OPEN_FLAGS: Option<i32> = None;
+
+/// セグメントを読み取り専用で open する。シンボリックリンクは辿らない。open の失敗時に限り、パスが通常
+/// ファイルでないこと（シンボリックリンク・ソケット等）を `BadFormat` へ分類する（エラー種別の分類だけで、
+/// 読み取りの許可には使わないので TOCTOU を作らない）。`SegmentReader::open` だけが呼ぶ。
+fn open_segment_nofollow(path: &Path) -> Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    if let Some(flags) = OPEN_FLAGS {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(flags);
+    }
+    match opts.open(path) {
+        Ok(f) => Ok(f),
+        Err(e) => match std::fs::symlink_metadata(path) {
+            Ok(m) if !m.file_type().is_file() => Err(ArchiveError::BadFormat),
+            _ => Err(ArchiveError::from(e)),
+        },
+    }
+}
+
+/// グループ／その他が書けるモードか（`check_dir_not_shared` と同じ方針。読み取り中に書き換えられうる）。
+#[cfg(unix)]
+fn mode_allowed(mode: u32) -> bool {
+    mode & 0o022 == 0
+}
+
+/// ファイル所有者がセグメントを置いたディレクトリの所有者または root か。標準ライブラリだけでは euid を
+/// 得られず依存も足せないため、ディレクトリ所有者との比較で代える。
+#[cfg(unix)]
+fn owner_allowed(file_uid: u32, dir_uid: u32) -> bool {
+    file_uid == dir_uid || file_uid == 0
+}
+
+/// fd の fstat 結果に対する所有者・権限の検査（fail-closed。違反は固定文言の `BadFormat`）。
+#[cfg(unix)]
+fn check_segment_ownership(meta: &std::fs::Metadata, path: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    if !mode_allowed(meta.mode()) {
+        return Err(ArchiveError::BadFormat);
+    }
+    let dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let dir_uid = std::fs::metadata(dir)?.uid();
+    if !owner_allowed(meta.uid(), dir_uid) {
+        return Err(ArchiveError::BadFormat);
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn check_segment_ownership(_meta: &std::fs::Metadata, _path: &Path) -> Result<()> {
+    Ok(())
+}
+
+/// `O_NOFOLLOW` を付けられない target のみ、open 後にパスを再度 lstat して fd と同じ実体（dev, ino）か
+/// 照合する。付ける target では行わない（open 後の正当な削除・rename で新たな失敗を作らないため）。
+fn verify_same_inode_if_following(meta: &std::fs::Metadata, path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    if OPEN_FLAGS.is_none() {
+        use std::os::unix::fs::MetadataExt;
+        let now = std::fs::symlink_metadata(path)?;
+        if !now.file_type().is_file() || now.dev() != meta.dev() || now.ino() != meta.ino() {
+            return Err(ArchiveError::BadFormat);
+        }
+    }
+    let _ = (meta, path);
+    Ok(())
+}
+
 /// 検証済みセグメントの情報。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct SegmentInfo {
@@ -532,14 +624,19 @@ pub(super) struct SegmentReader {
 }
 
 impl SegmentReader {
-    /// `path` を開いてヘッダを検証する。通常ファイルでない（シンボリックリンク等）もの、ヘッダの
-    /// チェックサム不一致、ファイル長が宣言（ヘッダ + 本体 + トレーラ）と合わないものは拒否する。
+    /// `path` を開いてヘッダを検証する（Issue #3103・RECOVER-14 のポインタ）。先に open し、**開いた fd** に
+    /// 対して種類・権限・所有者・長さを確かめ、同じ fd から読む（パスの再解決をしないので、確認と読み取りの
+    /// 間にパスを差し替えられても確認していない実体は読まれない）。シンボリックリンクは辿らない。
+    /// 通常ファイルでない（シンボリックリンク・FIFO 等）もの、グループ／その他が書ける・所有者が想定外のもの、
+    /// ヘッダのチェックサム不一致、ファイル長が宣言（ヘッダ + 本体 + トレーラ）と合わないものは拒否する。
     pub(super) fn open(path: &Path, max_payload: usize) -> Result<Self> {
-        let meta = std::fs::symlink_metadata(path)?;
+        let mut file = open_segment_nofollow(path)?;
+        let meta = file.metadata()?;
         if !meta.file_type().is_file() {
             return Err(ArchiveError::BadFormat);
         }
-        let mut file = std::fs::File::open(path)?;
+        check_segment_ownership(&meta, path)?;
+        verify_same_inode_if_following(&meta, path)?;
         let mut prefix = [0u8; SEG_PREFIX_LEN];
         file.read_exact(&mut prefix).map_err(read_err)?;
         let header = SegmentHeader::decode(&prefix)?;

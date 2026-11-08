@@ -303,6 +303,9 @@ fn recover14_archive_thread_writes_segments_and_verify_detects_loss_and_tamperin
     assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
     assert!(stderr(&out).contains("gap"), "{}", stderr(&out));
     std::fs::write(&middle, saved).expect("restore");
+    // 読み取り器は他者が書けるファイルを拒否する（Issue #3103）ため、umask に依らず 0600 にする。
+    std::fs::set_permissions(&middle, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+        .expect("chmod");
     let ok = run(&["change-log-verify", "--archive-dir", &arc_s, "--db", &db]);
     assert_eq!(ok.status.code(), Some(0), "{}", stderr(&ok));
 }
