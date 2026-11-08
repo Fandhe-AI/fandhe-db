@@ -24,7 +24,7 @@
 #      サーバーで読んだ件数・最大 id が期待値と一致すること（半端な commit が無いこと）。範囲外の指定は
 #      終了コード 1 で拒否され何も公開されないこと。
 #   5. PITR の `restore` の最中に SIGKILL する反復。最終名は「存在しない」か「完全」のどちらかで、残骸は
-#      一時名（`.fandhe-restore-*.tmp`）だけ、入力（ベース・アーカイブ）は変わらないこと。
+#      一時名・作業ディレクトリ（`.fandhe-restore-*.tmp`・`.fandhe-restore-*.d`）だけ、入力（ベース・アーカイブ）は変わらないこと。
 #   6. 改ざん: アーカイブの複製に対し、途中のセグメントの削除・1 バイト反転・並べ替え、停止点より後ろの
 #      セグメントの反転・切り詰め、末尾セグメントの削除を行い、`change-log-verify`（末尾削除は DB のコピーとの
 #      突き合わせで拒否）も `restore --until-lsn` も終了コード 1 で拒否し、復元先に何も作らないこと（無改ざんの対照は成功する）。
@@ -134,7 +134,8 @@ RST_DIR="${WORKDIR}/rst"       # 検査用の復元先
 RSTK_DIR="${WORKDIR}/rstk"     # restore 中 kill の復元先（残骸検査の対象）
 TAMP_DIR="${WORKDIR}/tamp"     # 改ざん用のアーカイブ複製・その復元先
 mkdir "${SRC_DIR}" "${ARCH}" "${BAK_DIR}" "${RST_DIR}" "${RSTK_DIR}" "${TAMP_DIR}"
-chmod 700 "${ARCH}" "${BAK_DIR}" "${TAMP_DIR}"
+# 復元先・検査対象の親は、共有でない（グループ・その他が書けない）こと（Issue #3102）。
+chmod 700 "${SRC_DIR}" "${ARCH}" "${BAK_DIR}" "${RST_DIR}" "${RSTK_DIR}" "${TAMP_DIR}"
 
 USER_NAME="alice"
 USER_PASS="pw-crash-test"
@@ -263,7 +264,7 @@ run_clv() {
 # 出力ディレクトリの残骸検査。許可するのは、最終名（引数の接頭辞 glob）と一時名（`.fandhe-restore-*.tmp`）
 # だけ。最終名の接頭辞は第 2 引数以降に複数渡せる。一時名は 0600 であること（全テナントのデータのコピーのため）も確かめる。
 check_residue() {
-  local dir="$1" entry name mode prefix
+  local dir="$1" entry name mode prefix inner
   shift
   for entry in "${dir}"/* "${dir}"/.[!.]*; do
     [ -e "${entry}" ] || continue
@@ -272,6 +273,21 @@ check_residue() {
       .fandhe-restore-*.tmp)
         mode="$(stat -c '%a' "${entry}")"
         [ "${mode}" = "600" ] || fail "temp residue ${entry} has mode ${mode}, expected 600"
+        ;;
+      .fandhe-restore-*.d)
+        # 復元の作業ディレクトリ（Issue #3102）。0700 で、中身は 0600 の一時名だけ（空も可）。
+        [ -d "${entry}" ] && [ ! -L "${entry}" ] || fail "work dir residue ${entry} is not a directory"
+        mode="$(stat -c '%a' "${entry}")"
+        [ "${mode}" = "700" ] || fail "work dir residue ${entry} has mode ${mode}, expected 700"
+        for inner in "${entry}"/.[!.]* "${entry}"/*; do
+          [ -e "${inner}" ] || continue
+          case "$(basename "${inner}")" in
+            .fandhe-restore-*.tmp) ;;
+            *) fail "unexpected entry in work dir residue ${entry}: $(basename "${inner}")" ;;
+          esac
+          mode="$(stat -c '%a' "${inner}")"
+          [ "${mode}" = "600" ] || fail "temp residue ${inner} has mode ${mode}, expected 600"
+        done
         ;;
       *)
         for prefix in "$@"; do
@@ -292,8 +308,12 @@ count_tmp() {
 # 作る確認用ファイル（`.fandhe-sweep-probe-*`）は別の形式で、この正規表現に一致しない。掃除の最中の SIGKILL で
 # 確認用ファイルが残っても「残骸の件数」に混ざらず、次の掃除が回収する（Issue #3094 のレビュー指摘への対応）。
 count_restore_tmp() {
-  find "$1" -maxdepth 1 -type f -regextype posix-extended \
-    -regex '.*/\.fandhe-restore-[0-9]+(-[0-9a-f]{16})?-[0-9]+\.tmp' | wc -l
+  {
+    find "$1" -maxdepth 1 -type f -regextype posix-extended \
+      -regex '.*/\.fandhe-restore-[0-9]+(-[0-9a-f]{16})?-[0-9]+\.tmp'
+    find "$1" -maxdepth 1 -type d -regextype posix-extended \
+      -regex '.*/\.fandhe-restore-[0-9]+-[0-9a-f]{16}-[0-9]+\.d'
+  } | wc -l
 }
 
 # ディレクトリ直下のファイルの「名前・サイズ・更新時刻」の一覧（入力が変わっていないことの比較用）。

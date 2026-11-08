@@ -477,8 +477,15 @@ RECOVER-14 (2) のポインタ（上限の超過で書き込みを拒否する�
 
 ### 残骸の掃除（Issue #3094）
 
+Issue #3102（RECOVER-13 のポインタ）: `restore` と `verify` のコピー経路は一時コピーを 0700 の作業ディレクトリに置き、
+保持 fd 経由でパスを開き直す。掃除は engine の `sweep_stale_temps_with_work_dirs` で作業ディレクトリも消す。
+消す条件は、ディレクトリ（リンクをたどらない）・0700・自分の所有・保護対象でない・開いた fd が lstat と一致・
+項目数が上限（4）以下・中身がすべて一時名の 0600 系通常ファイル、の積。外れれば触らず `skipped` に数える。
+判断: restore の親が共有（グループ・その他が書き込める）なら、`dump-restore`・`--generation-state` と揃えて
+拒否する（終了コード 2）。`verify` の作業ディレクトリ（`.fandhe-verify-*.d`）は従来どおり手動で消す。
+
 公開前の一時名（アーカイブの `.fandhe-seg-<pid>-<nonce>-<seq>.tmp`、`restore` の
-`.fandhe-restore-<pid>-<seq>.tmp`）は、SIGKILL などで残ると全テナントのデータのコピーが残る。
+`.fandhe-restore-<pid>-<nonce>-<seq>.tmp`。Issue #3102 以降は 0700 の作業ディレクトリ `.fandhe-restore-<pid>-<nonce>-<seq>.d` の中）は、SIGKILL などで残ると全テナントのデータのコピーが残る。
 次の起動（`--change-log-archive-dir` 指定時。アーカイブのスレッドを動かす前）と `restore` の実行で
 自動的に掃除する（RECOVER-13・RECOVER-14）。実装は engine の `storage::stale_temp`。
 

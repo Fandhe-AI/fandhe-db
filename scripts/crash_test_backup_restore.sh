@@ -16,7 +16,7 @@
 #      最終名は「存在しない」か「存在して verify が通り基準と同じ件数」のどちらかで、
 #      元 DB も verify が通ること、残骸は一時名（`.fandhe-snapshot-*.tmp`）だけであることを検査する。
 #   4. 復元: 完成したバックアップを `restore` し、verify 0・サーバーで件数一致を確かめる。
-#   5. 復元中 kill: 手順 3 と同形（一時名は `.fandhe-restore-*.tmp`）。
+#   5. 復元中 kill: 手順 3 と同形（残骸は 0700 の作業ディレクトリ `.fandhe-restore-*.d`。Issue #3102）。
 #   6. 稼働中取得中のサーバー kill: `--backup-socket` 経由の取得中にサーバーを SIGKILL し、
 #      最終名が不完全にならず、同じ DB でサーバーを再起動して件数が保たれることを確かめる。
 # 空虚な成功を避けるため、処理が始まっていて公開前（一時名が新たにあり最終名が無い）に kill
@@ -103,7 +103,8 @@ BAK_DIR="${WORKDIR}/bak"       # backup の出力先（残骸検査の対象）
 RST_DIR="${WORKDIR}/rst"       # restore の復元先（残骸検査の対象）
 LIVE_DIR="${WORKDIR}/live"     # 稼働中取得（ソケット）用。親ディレクトリは 0700 が必須
 mkdir "${SRC_DIR}" "${BAK_DIR}" "${RST_DIR}" "${LIVE_DIR}"
-chmod 700 "${LIVE_DIR}"
+# 復元・検査のコピー経路は、親がグループ・その他から書けないことを要求する（Issue #3102）。
+chmod 700 "${SRC_DIR}" "${BAK_DIR}" "${RST_DIR}" "${LIVE_DIR}"
 
 USER_NAME="alice"
 USER_PASS="pw-crash-test"
@@ -212,7 +213,7 @@ expect_verify_ok() {
 # 一時名（引数の glob 接頭辞 `.fandhe-snapshot-` / `.fandhe-restore-` + `.tmp` 終端）だけ。
 # 一時名は 0600 であること（全テナントのデータのコピーのため）も確かめる。
 check_residue() {
-  local dir="$1" tmp_prefix="$2" final_prefix="$3" entry name mode
+  local dir="$1" tmp_prefix="$2" final_prefix="$3" entry name mode inner
   for entry in "${dir}"/* "${dir}"/.[!.]*; do
     [ -e "${entry}" ] || continue
     name="$(basename "${entry}")"
@@ -220,6 +221,21 @@ check_residue() {
       "${tmp_prefix}"*.tmp)
         mode="$(stat -c '%a' "${entry}")"
         [ "${mode}" = "600" ] || fail "temp residue ${entry} has mode ${mode}, expected 600"
+        ;;
+      "${tmp_prefix}"*.d)
+        # 復元の作業ディレクトリ（Issue #3102）。0700 で、中身は 0600 の一時名だけ（空も可）。
+        [ -d "${entry}" ] && [ ! -L "${entry}" ] || fail "work dir residue ${entry} is not a directory"
+        mode="$(stat -c '%a' "${entry}")"
+        [ "${mode}" = "700" ] || fail "work dir residue ${entry} has mode ${mode}, expected 700"
+        for inner in "${entry}"/.[!.]* "${entry}"/*; do
+          [ -e "${inner}" ] || continue
+          case "$(basename "${inner}")" in
+            "${tmp_prefix}"*.tmp) ;;
+            *) fail "unexpected entry in work dir residue ${entry}: $(basename "${inner}")" ;;
+          esac
+          mode="$(stat -c '%a' "${inner}")"
+          [ "${mode}" = "600" ] || fail "temp residue ${inner} has mode ${mode}, expected 600"
+        done
         ;;
       "${final_prefix}"* | backup.sock) ;;
       *) fail "unexpected entry in ${dir}: ${name}" ;;
@@ -394,7 +410,7 @@ i=0
 while should_continue "${i}" "${restore_hits}"; do
   i=$((i + 1))
   out="${RST_DIR}/rst-${i}.redb"
-  tmp_before="$(count_tmp "${RST_DIR}" '.fandhe-restore-*.tmp')"
+  tmp_before="$(count_tmp "${RST_DIR}" '.fandhe-restore-*.d')"
   "${BIN}" restore --from "${BASE_BAK}" --db "${out}" >/dev/null 2>&1 &
   job_pid=$!
   sleep_ms $((RANDOM % (restore_limit_ms + 1)))
@@ -404,7 +420,7 @@ while should_continue "${i}" "${restore_hits}"; do
   job_pid=""
   if [ "${status}" -eq 137 ]; then
     restore_killed=$((restore_killed + 1))
-    if [ ! -e "${out}" ] && [ "$(count_tmp "${RST_DIR}" '.fandhe-restore-*.tmp')" -gt "${tmp_before}" ]; then
+    if [ ! -e "${out}" ] && [ "$(count_tmp "${RST_DIR}" '.fandhe-restore-*.d')" -gt "${tmp_before}" ]; then
       restore_hits=$((restore_hits + 1))
       [ -n "${RST_INTERRUPTED}" ] || RST_INTERRUPTED="${out}"
     fi
@@ -425,7 +441,7 @@ echo "restore kills: iterations=${i} killed=${restore_killed} hit_mid_run=${rest
 if [ "${restore_hits}" -lt 1 ] || [ -z "${RST_INTERRUPTED}" ]; then
   fail "no restore was killed after starting and before publishing (test is vacuous)"
 fi
-restore_residue="$(find "${RST_DIR}" -maxdepth 1 -name '.fandhe-restore-*.tmp' | wc -l)"
+restore_residue="$(find "${RST_DIR}" -maxdepth 1 -name '.fandhe-restore-*.d' | wc -l)"
 echo "restore temp residue files: ${restore_residue}"
 
 # 中断されて最終名が無かった復元先と同じパスへ取り直せ、整合し、サーバーで基準と同じデータを読める。

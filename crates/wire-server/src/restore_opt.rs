@@ -9,19 +9,28 @@
 //!
 //! # 公開手順（fail-closed。`export_snapshot` の公開手順にそろえる）
 //!
-//! 0. 前回の異常終了が残した一時名を掃除する（[`sweep_stale_restore_temps`]。Issue #3094。形式に厳密一致し、
-//!    通常ファイル・0600 系・自分の所有・使用中でないものだけ。一時名を作る間は親ディレクトリへ共有 lock を持つ）
+//! 0. 前回の異常終了が残した一時名と作業ディレクトリを掃除する（[`sweep_stale_restore_temps`]。Issue #3094・#3102。
+//!    形式に厳密一致し、通常ファイル（作業ディレクトリは 0700・中身が一時名の 0600 系だけ）・自分の所有・
+//!    使用中でないものだけ。一時名を作る間は親ディレクトリへ共有 lock を持つ）
+//!    復元先の親ディレクトリがグループ・その他から書き込める、または他ユーザーの所有なら、何も作らず拒否する
+//!    （[`RestoreError::InsecureParent`]。Issue #3102。一時コピーの差し替えを防ぐ前提）
 //! 1. `--from` を読み取りで開き共有ロックを試みる（稼働中の DB を誤ってコピーしない。取れなければ拒否）
-//! 2. 出力先と同じディレクトリの一時名（`.fandhe-restore-<pid>-<nonce>-<seq>.tmp`）へ `create_new`・0600 で
-//!    コピーし、サイズ一致を確かめて fsync する。元のバックアップには一切書かない
+//! 2. 出力先と同じディレクトリの 0700 の作業ディレクトリ（`.fandhe-restore-<pid>-<nonce>-<seq>.d`）の中の
+//!    一時名（`.fandhe-restore-<pid>-<nonce>-<seq>.tmp`）へ `create_new`・0600 でコピーし、サイズ一致を確かめて
+//!    fsync する。元のバックアップには一切書かない。作業ディレクトリと一時ファイルは作成時に開いた fd を保持し、
+//!    Linux では `/proc/self/fd/<n>` 経由のパスで `Storage::open`・増分の適用・`hard_link` を行う（作業
+//!    ディレクトリの名前を差し替えられても、アクセス先は作成したディレクトリのまま。Issue #3102）。各段の
+//!    前後で、作業ディレクトリ（fd と実パスの同一性・0700・親が共有でない）と一時ファイル（(dev, ino)・長さ）を
+//!    照合し、食い違えば公開せず [`RestoreError::TempReplaced`] にする
 //! 3. 一時ファイルを `Storage::open` して `verify_integrity` を実行する。Error・Incomplete が 1 件でも
 //!    あれば公開せず一時ファイルを消す（検査できなかったものも整合とは扱わない）
 //!    通ったら、一時ファイルを開き直して復元の世代番号を進める（RECOVER-17。失敗したら公開しない）
 //!    `--generation-state` 指定時は、世代を進める直前に状態ファイル（自分所有・0600・親が共有でない通常
 //!    ファイル）を開いて排他ロックし、高水位より大きい値へ進め、新しい値を状態ファイルへ fsync してから
 //!    次へ進む（Issue #3105。ロックは公開の後まで保持。どの失敗でも公開しない）
-//! 4. 世代を進めた一時ファイルを fsync し直し、`hard_link` で最終名へ公開する（既存の宛先は
-//!    `EEXIST` で原子的に拒否。`rename` は置換するため使わない）。一時名を消し、親ディレクトリを fsync する
+//! 4. 世代を進めた一時ファイルを fsync し直し、`hard_link` の直前に作業ディレクトリと一時ファイルの inode を
+//!    照合してから、`hard_link` で最終名へ公開する（既存の宛先は `EEXIST` で原子的に拒否。`rename` は置換する
+//!    ため使わない）。公開先の inode も照合する。一時名と作業ディレクトリを消し、親ディレクトリを fsync する
 //!
 //! 既存の DB を上書きする明示フラグは設けない（置換には稼働中の判定と原子的な置換の両方が要り、
 //! `rename` は開いたままのサーバーの旧 inode を黙って切り離す。運用者が旧ファイルを明示的に退避する）。
@@ -308,9 +317,12 @@ pub enum RestoreError {
     /// `--generation-state` の状態ファイルが、自分所有の 0600 の通常ファイルで有効な状態を持つものでは
     /// なかった（Issue #3105。別のファイル・破損・上限超過・安全でない親ディレクトリを含む）。何も公開しない。
     GenerationStateRejected,
-    /// 検査用の一時コピーのパスが、作成した fd と別のファイルに差し替えられた・消えた・長さが合わない
-    /// （空 DB が整合扱いで公開されるのを防ぐ。公開しない）。
+    /// 検査用の一時コピー、またはそれを置く作業ディレクトリのパスが、作成した fd と別のものに差し替えられた・
+    /// 消えた・長さが合わない（空 DB が整合扱いで公開されるのを防ぐ。公開しない）。
     TempReplaced,
+    /// 復元先（verify では DB）の親ディレクトリがグループ・その他から書き込める、または他ユーザーの所有で、
+    /// 一時コピーの差し替えを防げない（Issue #3102）。何も作らず何も公開しない。
+    InsecureParent,
     /// 検査で矛盾または検査できない項目が見つかり、公開しなかった。
     NotConsistent(IntegrityReport),
     /// この環境では復元できない（unix 以外・hard link 非対応など）。
@@ -352,6 +364,10 @@ impl std::fmt::Display for RestoreError {
                 "restore generation state file is not a private regular file with a valid state; \
                  nothing was published"
             }
+            Self::InsecureParent => {
+                "the parent directory of --db is writable by group or others (or owned by another \
+                 user); refusing to use it for a temporary copy"
+            }
             Self::NotConsistent(_) => "backup failed the integrity check; nothing was published",
             Self::Unsupported => "restore is not supported in this environment",
             Self::UncheckedContentPublished => {
@@ -388,6 +404,7 @@ pub fn classify(result: &Result<RestoreSummary, RestoreError>) -> (u8, String) {
         Err(
             e @ (RestoreError::InvalidDestination
             | RestoreError::InvalidSource
+            | RestoreError::InsecureParent
             | RestoreError::Unsupported),
         ) => (EXIT_USAGE, e.to_string()),
         Err(e @ RestoreError::NotConsistent(r)) => (verify_opt::classify(r), e.to_string()),
@@ -405,6 +422,10 @@ pub fn verify_failure_message(e: &RestoreError) -> &'static str {
         RestoreError::OpenFailed => "failed to open database",
         RestoreError::SourceChanged => "database file changed while it was being copied",
         RestoreError::TempReplaced => "temporary copy was replaced or removed",
+        RestoreError::InsecureParent => {
+            "the parent directory of --db is writable by group or others (or owned by another \
+             user); refusing to copy the database there for checking"
+        }
         RestoreError::VerifyFailed => "integrity check could not be started",
         _ => {
             "failed to copy the database for checking (needs free space next to it about as \
@@ -420,7 +441,7 @@ pub fn verify_exit_code(result: &Result<IntegrityReport, RestoreError>, leftover
     match result {
         Ok(_) if leftover => EXIT_PUBLISHED_UNVERIFIED,
         Ok(report) => verify_opt::classify(report),
-        Err(RestoreError::InvalidSource) => EXIT_USAGE,
+        Err(RestoreError::InvalidSource | RestoreError::InsecureParent) => EXIT_USAGE,
         Err(_) => EXIT_FAILURE,
     }
 }
@@ -662,14 +683,29 @@ mod unix_impl {
 
     use crate::restore_generation_state::GenerationState;
 
+    use crate::dump_tmp::{check_parent_not_shared, TmpError, WorkDir};
+
     use super::{PitrSpec, RestoreError, RestoreSummary};
 
     static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
-    /// 一時名 `.{prefix}-<pid>-<nonce 16桁hex>-<通番>.tmp` を作る。nonce はプロセスごとにランダムな鍵を
-    /// 持つ `RandomState` と時刻・通番を混ぜた値で、PID の再利用（PID 1 のコンテナ等）や再起動で通番が
-    /// 0 に戻っても、残骸の数に依らず名前が衝突しない。掃除の所有権プローブと `TempCopy::create` が共用する。
-    fn unique_tmp_name(prefix: &str) -> String {
+    /// `dump_tmp` の失敗を復元の失敗へ対応づける（種別だけ。パスの内容は持ち越さない）。
+    fn map_tmp(e: TmpError) -> RestoreError {
+        match e {
+            TmpError::InsecureParent => RestoreError::InsecureParent,
+            TmpError::Replaced => RestoreError::TempReplaced,
+            TmpError::InvalidDestination => RestoreError::InvalidDestination,
+            TmpError::UncheckedContentPublished => RestoreError::UncheckedContentPublished,
+            TmpError::PublishedButNotFinalized => RestoreError::PublishedButNotFinalized,
+            TmpError::Unsupported => RestoreError::Unsupported,
+            TmpError::Io(k) => RestoreError::Io(k),
+        }
+    }
+
+    /// 名前 `.{prefix}-<pid>-<nonce 16桁hex>-<通番>.{suffix}`（一時ファイルは `tmp`・作業ディレクトリは `d`）を
+    /// 作る。nonce はプロセスごとにランダムな鍵を持つ `RandomState` と時刻・通番を混ぜた値で、PID の再利用
+    /// （PID 1 のコンテナ等）や再起動で通番が 0 に戻っても、残骸の数に依らず名前が衝突しない。
+    fn unique_name(prefix: &str, suffix: &str) -> String {
         use std::hash::{BuildHasher, Hasher};
         let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
         let nanos = std::time::SystemTime::now()
@@ -679,7 +715,7 @@ mod unix_impl {
         h.write_u128(nanos);
         h.write_u64(seq);
         format!(
-            ".{prefix}-{}-{:016x}-{seq}.tmp",
+            ".{prefix}-{}-{:016x}-{seq}.{suffix}",
             std::process::id(),
             h.finish()
         )
@@ -699,9 +735,6 @@ mod unix_impl {
         dev: u64,
         ino: u64,
         pub(super) armed: bool,
-        /// 親ディレクトリの共有 lock（Issue #3094。掃除が使用中の一時名を消さないための相互排他）。
-        /// フィールドは `Drop::drop`（一時名の unlink）の後に drop されるため、lock は unlink の後まで残る。
-        _dir_lock: engine::storage::TempDirLock,
     }
 
     impl Drop for TempCopy {
@@ -713,15 +746,12 @@ mod unix_impl {
     }
 
     impl TempCopy {
-        /// `parent` に所有者のみ読み書きの一時ファイルを排他的に作る。
+        /// `parent`（[`Staging`] では作業ディレクトリの保持 fd を指すアクセス用パス）に、所有者のみ読み書きの
+        /// 一時ファイルを排他的に作る。親ディレクトリの共有 lock は呼び出し側（[`Staging::create`]）が持つ。
         pub(super) fn create(parent: &Path, prefix: &str) -> Result<Self, RestoreError> {
-            // 共有 lock を取れなければ一時名を作らず中止する（fail-closed。lock なしでは掃除が
-            // 使用中の一時名を消しうる）。
-            let dir_lock = engine::storage::TempDirLock::shared(parent)
-                .map_err(|k| io_err(std::io::Error::from(k)))?;
             let mut attempts = 0u32;
             loop {
-                let p = parent.join(unique_tmp_name(prefix));
+                let p = parent.join(unique_name(prefix, "tmp"));
                 match OpenOptions::new()
                     .read(true)
                     .write(true)
@@ -737,7 +767,6 @@ mod unix_impl {
                             dev: m.dev(),
                             ino: m.ino(),
                             armed: true,
-                            _dir_lock: dir_lock,
                         });
                     }
                     Err(e) if e.kind() == ErrorKind::AlreadyExists && attempts < 8 => {
@@ -790,6 +819,93 @@ mod unix_impl {
         }
     }
 
+    /// 検査対象の一時コピーと、それを置く 0700 の作業ディレクトリ・親ディレクトリの共有 lock の組
+    /// （Issue #3102・RECOVER-13 のポインタ）。`restore` と `verify` のコピー経路が使う。
+    ///
+    /// 一時コピーをパスで開き直す箇所（`Storage::open`・増分の適用・`hard_link`）は、作業ディレクトリの保持 fd
+    /// 経由のパス（[`WorkDir::access_path`]）を使い、さらに [`Staging::check`] で前後を照合する。親ディレクトリが
+    /// 共有でない前提（[`WorkDir::create`] が検査）のもとで、作業ディレクトリは自分だけが変えられる。
+    ///
+    /// フィールドの宣言順が drop の順序（一時ファイル → 作業ディレクトリ → 親の共有 lock）。
+    pub(super) struct Staging {
+        pub(super) tmp: TempCopy,
+        work: WorkDir,
+        /// 親ディレクトリの共有 lock（Issue #3094。掃除が使用中の一時名・作業ディレクトリを消さないための
+        /// 相互排他）。作業ディレクトリを作る前に取り、消した後まで保持する。
+        _parent_lock: engine::storage::TempDirLock,
+    }
+
+    impl Staging {
+        /// `parent` に作業ディレクトリ（0700）と、その中の一時ファイル（0600）を作る。共有 lock を取れない・
+        /// 親が共有または他人所有なら、何も作らず失敗する（fail-closed）。
+        pub(super) fn create(parent: &Path, prefix: &str) -> Result<Self, RestoreError> {
+            let lock = engine::storage::TempDirLock::shared(parent)
+                .map_err(|k| io_err(std::io::Error::from(k)))?;
+            let work =
+                WorkDir::create_named(parent, &mut || unique_name(prefix, "d")).map_err(map_tmp)?;
+            let tmp = TempCopy::create(work.access_path(), prefix)?;
+            Ok(Self {
+                tmp,
+                work,
+                _parent_lock: lock,
+            })
+        }
+
+        /// 作業ディレクトリと一時ファイルが作成時のままであることを確かめる（差し替え・unlink・長さ違いは
+        /// `TempReplaced`、親が共有になっていれば `InsecureParent`）。
+        pub(super) fn check(&self, expected_len: Option<u64>) -> Result<(), RestoreError> {
+            self.work.check().map_err(map_tmp)?;
+            self.tmp.check_path(expected_len)
+        }
+
+        /// 利用者が残骸を探せる実パス（`/proc/self/fd` を見せない）の一時ファイル。
+        #[cfg(test)]
+        pub(super) fn real_tmp_path(&self) -> PathBuf {
+            self.work.real_path_of(&self.tmp.path)
+        }
+
+        /// 実パスの作業ディレクトリ。
+        #[cfg(test)]
+        pub(super) fn real_work_path(&self) -> PathBuf {
+            self.work.real_path_of(Path::new(""))
+        }
+
+        /// 一時ファイルを消し、作業ディレクトリが作成時のままなら作業ディレクトリも消す。消せなかった
+        /// ものの実パスを返す（作業ディレクトリが差し替えられていれば、別のディレクトリを消さずに残す）。
+        pub(super) fn cleanup(&mut self) -> Option<PathBuf> {
+            if let Err(p) = self.tmp.remove() {
+                return Some(self.work.real_path_of(&p));
+            }
+            match self.work.check() {
+                Ok(()) => self.work.remove().err(),
+                Err(_) => {
+                    self.work.disarm();
+                    Some(self.work.real_path_of(Path::new("")))
+                }
+            }
+        }
+
+        /// 公開後の後始末（一時名と作業ディレクトリの削除・親ディレクトリの fsync）。公開は済み中身は完全なので、
+        /// 失敗は `PublishedButNotFinalized`。
+        fn finalize_published(&mut self, parent: &Path) -> Result<(), RestoreError> {
+            self.tmp.armed = false;
+            let finalized = std::fs::remove_file(&self.tmp.path)
+                .map_err(|_| ())
+                .and_then(|()| self.work.check().map_err(|_| ()))
+                .and_then(|()| self.work.remove().map_err(|_| ()))
+                .and_then(|()| {
+                    File::open(parent)
+                        .and_then(|d| d.sync_all())
+                        .map_err(|_| ())
+                });
+            if finalized.is_err() {
+                self.work.disarm();
+                return Err(RestoreError::PublishedButNotFinalized);
+            }
+            Ok(())
+        }
+    }
+
     /// `path` を読み取りで開き、`exclusive` なら排他、でなければ共有のロックを試みて、通常ファイルかつ
     /// 長さ 1 以上であることを開いた fd で確かめる。ロックは返す `File` を保持する間有効。
     fn open_locked_source(path: &Path, exclusive: bool) -> Result<(File, u64), RestoreError> {
@@ -825,18 +941,20 @@ mod unix_impl {
     /// 一時コピーを開いて検査する。開く直前と検査後に、パスが保持 fd のままであることを確かめる。
     /// `Storage` は検査後に必ず drop する（排他ロックと redb のクローズ書き込みを終える）。
     fn open_and_verify(
-        tmp: &TempCopy,
+        staging: &Staging,
         len: u64,
         options: &IntegrityOptions,
     ) -> Result<IntegrityReport, RestoreError> {
-        tmp.check_path(Some(len))?;
+        staging.check(Some(len))?;
+        #[cfg(test)]
+        run_hook(hook::Stage::BeforeVerifyOpen, staging);
         let report = {
-            let storage = Storage::open(&tmp.path).map_err(|_| RestoreError::OpenFailed)?;
+            let storage = Storage::open(&staging.tmp.path).map_err(|_| RestoreError::OpenFailed)?;
             storage
                 .verify_integrity(options)
                 .map_err(|_| RestoreError::VerifyFailed)?
         };
-        tmp.check_path(None)?;
+        staging.check(None)?;
         Ok(report)
     }
 
@@ -847,25 +965,26 @@ mod unix_impl {
     /// 高水位より大きい世代へ進め、新しい世代を状態ファイルへ書いて fsync する。失敗したら公開しない。
     /// 返すガードは、並行の復元に同じ高水位を読ませないため、公開（`hard_link`）の後まで保持する。
     fn advance_generation(
-        tmp: &TempCopy,
+        staging: &Staging,
         state_path: Option<&Path>,
     ) -> Result<Option<GenerationState>, RestoreError> {
-        tmp.check_path(None)?;
+        staging.check(None)?;
         // 状態ファイルの所有者は一時コピーの所有者（自分）と一致させる（`geteuid` を使わない）。
-        let own_uid = tmp.file.metadata().map_err(io_err)?.uid();
+        let own_uid = staging.tmp.file.metadata().map_err(io_err)?.uid();
         let gs = state_path
             .map(|p| GenerationState::open(p, own_uid))
             .transpose()?;
         let high_water = gs.as_ref().map(GenerationState::read).transpose()?;
         let next = {
-            let mut storage = Storage::open(&tmp.path).map_err(|_| RestoreError::OpenFailed)?;
+            let mut storage =
+                Storage::open(&staging.tmp.path).map_err(|_| RestoreError::OpenFailed)?;
             match &high_water {
                 Some(h) => storage.advance_restore_generation_above(h.value),
                 None => storage.advance_restore_generation(),
             }
             .map_err(|_| RestoreError::GenerationFailed)?
         };
-        tmp.check_path(None)?;
+        staging.check(None)?;
         if let (Some(g), Some(h)) = (&gs, &high_water) {
             g.record(h, next)?;
         }
@@ -885,7 +1004,13 @@ mod unix_impl {
         if std::fs::symlink_metadata(dest).is_ok() {
             return None;
         }
-        let s = engine::storage::sweep_stale_temps(parent, is_restore_temp_name, protected).ok()?;
+        let s = engine::storage::sweep_stale_temps_with_work_dirs(
+            parent,
+            is_restore_temp_name,
+            engine::storage::is_restore_work_dir_name,
+            protected,
+        )
+        .ok()?;
         Some((parent.to_path_buf(), s))
     }
 
@@ -909,12 +1034,13 @@ mod unix_impl {
         let parent = parent_of(db)?;
         // 排他ロックを検査の間保持する（redb と同じ flock。取れなければ稼働中）。
         let (mut src, src_len) = open_locked_source(db, true)?;
-        let mut tmp = TempCopy::create(parent, "fandhe-verify")?;
-        let result = copy_into(&mut src, src_len, &mut tmp)
-            .and_then(|()| open_and_verify(&tmp, src_len, options));
+        let mut staging = Staging::create(parent, "fandhe-verify")?;
+        let result = copy_into(&mut src, src_len, &mut staging.tmp)
+            .and_then(|()| open_and_verify(&staging, src_len, options));
         drop(src);
-        // 成功・失敗のどちらでも一時コピーを明示的に消し、消せなければ通知できるようにする。
-        if let Err(p) = tmp.remove() {
+        // 成功・失敗のどちらでも一時コピーと作業ディレクトリを明示的に消し、消せなければ（差し替えを
+        // 検出して残した場合を含む）実パスを通知できるようにする。
+        if let Some(p) = staging.cleanup() {
             *leftover = Some(p);
         }
         result
@@ -934,26 +1060,30 @@ mod unix_impl {
             return Err(RestoreError::InvalidDestination);
         }
 
+        // 親ディレクトリが共有（グループ・その他が書き込める）なら、何も開かず何も作らずに拒否する
+        // （Issue #3102。一時コピーの差し替えを防ぐ前提。`dump-restore` と同じ基準）。
+        check_parent_not_shared(parent).map_err(map_tmp)?;
+
         // 1. 復元元は読み取りだけで開き、共有ロックを試みる。稼働中の DB（redb が排他ロックを
         //    保持）なら取れず、書き込み中のファイルをコピーしない。ロックは copy の間保持する。
         let (mut src, src_len) = open_locked_source(from, false)?;
 
-        // 2. 一時ファイルへ 0600 の排他作成でコピーする。fd は公開まで保持する。
-        let mut tmp = TempCopy::create(parent, "fandhe-restore")?;
+        // 2. 作業ディレクトリ（0700）の中へ、一時ファイルを 0600 の排他作成でコピーする。fd は公開まで保持する。
+        let mut staging = Staging::create(parent, "fandhe-restore")?;
         let result = restore_from_copy(
             &mut src,
             src_len,
-            &mut tmp,
+            &mut staging,
             (dest, parent),
             incrementals,
             pitr,
             generation_state,
         );
         drop(src);
-        // 公開しなかった経路（公開済みなら armed は false）では、一時コピーを明示的に消し、
+        // 公開しなかった経路（公開済みなら armed は false）では、一時コピーと作業ディレクトリを明示的に消し、
         // 消せなければ通知できるようにする。
-        if tmp.armed {
-            if let Err(p) = tmp.remove() {
+        if staging.tmp.armed {
+            if let Some(p) = staging.cleanup() {
                 *leftover = Some(p);
             }
         }
@@ -964,13 +1094,13 @@ mod unix_impl {
     fn restore_from_copy(
         src: &mut File,
         src_len: u64,
-        tmp: &mut TempCopy,
+        staging: &mut Staging,
         (dest, parent): (&Path, &Path),
         incrementals: &[PathBuf],
         pitr: Option<&PitrSpec>,
         generation_state: Option<&Path>,
     ) -> Result<RestoreSummary, RestoreError> {
-        copy_into(src, src_len, tmp)?;
+        copy_into(src, src_len, &mut staging.tmp)?;
 
         // 2b. 増分バックアップを一時コピーへ適用する（元のバックアップには触れない。連鎖の検証・破損の
         //     拒否は engine。失敗すれば公開せずに一時コピーを消す）。適用で DB ファイルは伸びるため、
@@ -979,26 +1109,27 @@ mod unix_impl {
         //     使う（増分とアーカイブの選択・連鎖の検証・範囲外の拒否は engine。Issue #2169）。
         let mut verified_len = src_len;
         if pitr.is_some() || !incrementals.is_empty() {
-            tmp.check_path(Some(src_len))?;
+            staging.check(Some(src_len))?;
             match pitr {
                 Some(spec) => engine::storage::restore_to_point(
-                    &tmp.path,
+                    &staging.tmp.path,
                     incrementals,
                     spec.archive_dir.as_deref(),
                     spec.target,
                 )
                 .map(|_| ()),
                 None => {
-                    engine::storage::apply_incremental_segments(&tmp.path, incrementals).map(|_| ())
+                    engine::storage::apply_incremental_segments(&staging.tmp.path, incrementals)
+                        .map(|_| ())
                 }
             }
             .map_err(RestoreError::Chain)?;
-            tmp.check_path(None)?;
-            verified_len = tmp.file.metadata().map_err(io_err)?.len();
+            staging.check(None)?;
+            verified_len = staging.tmp.file.metadata().map_err(io_err)?.len();
         }
 
         // 3. コピーを開いて検査する（パスの同一性を前後で確認）。
-        let report = open_and_verify(tmp, verified_len, &IntegrityOptions::default())?;
+        let report = open_and_verify(staging, verified_len, &IntegrityOptions::default())?;
         if !report.is_consistent() {
             return Err(RestoreError::NotConsistent(report));
         }
@@ -1009,15 +1140,18 @@ mod unix_impl {
         // 時間帯を作らない。失敗したら何も公開しない（一時ファイルは破棄される）。
         // 進めた後に整合検査を再実行しない: 書き込みは世代の 1 表のみで、同じ inode のまま公開する。
         // 状態ファイルを指定したときは、そのガード（排他ロック）を関数の終わり（公開・後始末の後）まで保持する。
-        let _generation_guard = advance_generation(tmp, generation_state)?;
+        let _generation_guard = advance_generation(staging, generation_state)?;
 
         // 4. open・クローズ後の最終内容を保持 fd で fsync し直す。fsync は長くかかりうるため、
         //    パスの同一性は fsync の「後」、hard_link の直前に確かめる（hard_link は fd ではなく
         //    パスを使うので、直前の確認が差し替えの窓を最小にする）。
-        tmp.check_path(None)?;
-        tmp.file.sync_all().map_err(io_err)?;
-        tmp.check_path(None)?;
-        match std::fs::hard_link(&tmp.path, dest) {
+        staging.check(None)?;
+        staging.tmp.file.sync_all().map_err(io_err)?;
+        #[cfg(test)]
+        run_hook(hook::Stage::BeforePublish, staging);
+        // 作業ディレクトリ・一時ファイルの inode を公開の直前に照合する（差し替えは公開しない）。
+        staging.check(None)?;
+        match std::fs::hard_link(&staging.tmp.path, dest) {
             Ok(()) => {}
             Err(e) if e.kind() == ErrorKind::AlreadyExists => {
                 return Err(RestoreError::InvalidDestination);
@@ -1028,20 +1162,47 @@ mod unix_impl {
         // 公開先が保持 fd（検査したファイル）と同じでなければ、確認直後の差し替えで別の内容を
         // 公開してしまっている。`hard_link` は新規作成なので公開先は自分が作ったリンクであり、
         // 削除して公開を取り消す。削除にも失敗したら、検査していない内容が公開先に残る。
-        if !tmp.is_same_file_at(dest) {
+        if !staging.tmp.is_same_file_at(dest) {
             return match std::fs::remove_file(dest) {
                 Ok(()) => Err(RestoreError::TempReplaced),
                 Err(_) => Err(RestoreError::UncheckedContentPublished),
             };
         }
         // 公開済みで検査したファイルと一致した。以降の失敗でも最終ファイルは完全なので消さない。
-        tmp.armed = false;
-        let finalized = std::fs::remove_file(&tmp.path)
-            .and_then(|()| File::open(parent).and_then(|d| d.sync_all()));
-        if finalized.is_err() {
-            return Err(RestoreError::PublishedButNotFinalized);
-        }
+        staging.finalize_published(parent)?;
         Ok(RestoreSummary { report })
+    }
+
+    /// テスト専用の差し替え注入点（状態を変えない読み取りだけの hook。本番のビルドには含めない）。
+    #[cfg(test)]
+    #[allow(clippy::items_after_test_module)]
+    pub(super) mod hook {
+        use std::cell::RefCell;
+        use std::path::Path;
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub(in crate::restore_opt) enum Stage {
+            /// 検査のための open の直前（直前の照合の後）。
+            BeforeVerifyOpen,
+            /// `hard_link` の直前（直前の照合の前）。
+            BeforePublish,
+        }
+
+        /// 引数は (段階, 実パスの作業ディレクトリ, 実パスの一時ファイル)。
+        pub(in crate::restore_opt) type Hook = Box<dyn Fn(Stage, &Path, &Path)>;
+
+        thread_local! {
+            pub(in crate::restore_opt) static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+        }
+    }
+
+    #[cfg(test)]
+    fn run_hook(stage: hook::Stage, staging: &Staging) {
+        hook::HOOK.with(|h| {
+            if let Some(f) = h.borrow().as_ref() {
+                f(stage, &staging.real_work_path(), &staging.real_tmp_path());
+            }
+        });
     }
 }
 
@@ -1495,5 +1656,282 @@ mod tests {
             classify(&Err(RestoreError::PublishedButNotFinalized)).0,
             EXIT_PUBLISHED_UNVERIFIED
         );
+    }
+    // ---- Issue #3102: 作業ディレクトリと保持 fd による一時コピーの差し替え防止 ----
+
+    #[cfg(unix)]
+    mod staging {
+        use super::super::unix_impl::hook::{Stage, HOOK};
+        use super::super::unix_impl::{self, Staging};
+        use super::super::*;
+        use std::os::unix::fs::PermissionsExt;
+        use std::path::{Path, PathBuf};
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+
+        /// pid・通番・時刻で一意な 0700 のディレクトリ（#2254 の衝突を避ける）。
+        fn dir(label: &str) -> PathBuf {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos());
+            let d = std::env::temp_dir().join(format!(
+                "restore-staging-{label}-{}-{}-{nanos}",
+                std::process::id(),
+                SEQ.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&d).expect("mkdir");
+            std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+            d
+        }
+
+        /// 空の正常な DB ファイルを作る。
+        fn make_db(path: &Path) {
+            drop(engine::storage::Storage::open(path).expect("open db"));
+        }
+
+        fn names(dir: &Path) -> Vec<String> {
+            let mut v: Vec<String> = std::fs::read_dir(dir)
+                .expect("rd")
+                .map(|e| e.expect("e").file_name().to_string_lossy().into_owned())
+                .collect();
+            v.sort();
+            v
+        }
+
+        /// hook を設定し、drop で必ず外す。
+        struct HookGuard;
+        impl HookGuard {
+            fn set(f: impl Fn(Stage, &Path, &Path) + 'static) -> Self {
+                HOOK.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+                Self
+            }
+        }
+        impl Drop for HookGuard {
+            fn drop(&mut self) {
+                HOOK.with(|h| *h.borrow_mut() = None);
+            }
+        }
+
+        /// 実パスの作業ディレクトリを別名へ退避し、同じ名前の 0700 のディレクトリへ、同じ一時名の別の
+        /// 正常な DB（decoy）を置く。
+        fn swap_work_dir(work: &Path, tmp: &Path, decoy_src: &Path) {
+            let moved = work.with_extension("moved");
+            std::fs::rename(work, &moved).expect("rename work");
+            std::fs::create_dir(work).expect("mkdir work");
+            std::fs::set_permissions(work, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+            std::fs::copy(decoy_src, work.join(tmp.file_name().expect("name"))).expect("decoy");
+        }
+
+        #[test]
+        fn restore_never_checks_a_swapped_work_dir() {
+            let d = dir("swapwork");
+            let from = d.join("backup.redb");
+            make_db(&from);
+            let decoy_src = d.join("decoy-src.redb");
+            make_db(&decoy_src);
+            let decoy_bytes = std::fs::read(&decoy_src).expect("read");
+            let out = dir("swapwork-out");
+            let dest = out.join("restored.redb");
+            let seen = std::rc::Rc::new(std::cell::RefCell::new(None::<PathBuf>));
+            let seen2 = seen.clone();
+            let _g = HookGuard::set(move |stage, work, tmp| {
+                if stage == Stage::BeforeVerifyOpen && seen2.borrow().is_none() {
+                    swap_work_dir(work, tmp, &decoy_src);
+                    *seen2.borrow_mut() = Some(work.join(tmp.file_name().expect("name")));
+                }
+            });
+            let mut leftover = None;
+            let r = restore(&from, &dest, &mut leftover);
+            assert!(matches!(r, Err(RestoreError::TempReplaced)), "{r:?}");
+            assert!(!dest.exists(), "swapped copy must not be published");
+            // 差し替え後の decoy は開かれても書かれてもいない（検査されていない）。
+            let decoy = seen.borrow().clone().expect("hook ran");
+            assert_eq!(std::fs::read(&decoy).expect("read decoy"), decoy_bytes);
+            // 差し替えを検出した作業ディレクトリは消さず、実パスで通知する。
+            let left = leftover.expect("leftover reported");
+            assert!(!left.to_string_lossy().contains("/proc/self/fd"));
+            let _ = std::fs::remove_dir_all(&d);
+            let _ = std::fs::remove_dir_all(&out);
+        }
+
+        #[test]
+        fn restore_never_publishes_a_replaced_temp_file() {
+            let d = dir("swaptmp");
+            let from = d.join("backup.redb");
+            make_db(&from);
+            let decoy_src = d.join("decoy-src.redb");
+            make_db(&decoy_src);
+            let out = dir("swaptmp-out");
+            let dest = out.join("restored.redb");
+            let _g = HookGuard::set(move |stage, work, tmp| {
+                if stage == Stage::BeforePublish {
+                    let staged = work.join("decoy.tmp");
+                    std::fs::copy(&decoy_src, &staged).expect("decoy");
+                    std::fs::rename(&staged, tmp).expect("replace tmp");
+                }
+            });
+            let mut leftover = None;
+            let r = restore(&from, &dest, &mut leftover);
+            assert!(matches!(r, Err(RestoreError::TempReplaced)), "{r:?}");
+            assert!(!dest.exists(), "decoy must not be published");
+            let _ = std::fs::remove_dir_all(&d);
+            let _ = std::fs::remove_dir_all(&out);
+        }
+
+        #[test]
+        fn verify_copy_never_checks_a_swapped_work_dir() {
+            let d = dir("verify-swap");
+            let db = d.join("db.redb");
+            make_db(&db);
+            let decoy_src = d.join("decoy-src.redb");
+            make_db(&decoy_src);
+            let decoy_bytes = std::fs::read(&decoy_src).expect("read");
+            let seen = std::rc::Rc::new(std::cell::RefCell::new(None::<PathBuf>));
+            let seen2 = seen.clone();
+            let _g = HookGuard::set(move |stage, work, tmp| {
+                if stage == Stage::BeforeVerifyOpen && seen2.borrow().is_none() {
+                    swap_work_dir(work, tmp, &decoy_src);
+                    *seen2.borrow_mut() = Some(work.join(tmp.file_name().expect("name")));
+                }
+            });
+            let mut leftover = None;
+            let r = verify_via_copy(
+                &db,
+                &engine::storage::IntegrityOptions::default(),
+                &mut leftover,
+            );
+            assert!(matches!(r, Err(RestoreError::TempReplaced)), "{r:?}");
+            let decoy = seen.borrow().clone().expect("hook ran");
+            assert_eq!(std::fs::read(&decoy).expect("read decoy"), decoy_bytes);
+            assert!(leftover.is_some());
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn success_leaves_nothing_and_work_dir_is_private() {
+            let d = dir("ok");
+            let from = d.join("backup.redb");
+            make_db(&from);
+            let out = dir("ok-out");
+            let dest = out.join("restored.redb");
+            let modes = std::rc::Rc::new(std::cell::RefCell::new(Vec::<u32>::new()));
+            let modes2 = modes.clone();
+            let _g = HookGuard::set(move |stage, work, tmp| {
+                if stage == Stage::BeforePublish {
+                    let m = std::fs::metadata(work).expect("meta");
+                    modes2.borrow_mut().push(m.permissions().mode() & 0o7777);
+                    assert!(!work.to_string_lossy().contains("/proc/self/fd"));
+                    assert!(!tmp.to_string_lossy().contains("/proc/self/fd"));
+                    assert_eq!(tmp.parent(), Some(work));
+                }
+            });
+            let mut leftover = None;
+            restore(&from, &dest, &mut leftover).expect("restore");
+            assert!(leftover.is_none());
+            assert_eq!(modes.borrow().as_slice(), &[0o700]);
+            assert_eq!(names(&out), vec!["restored.redb".to_string()]);
+            // verify のコピー経路も何も残さない。
+            let mut leftover = None;
+            verify_via_copy(
+                &dest,
+                &engine::storage::IntegrityOptions::default(),
+                &mut leftover,
+            )
+            .expect("verify");
+            assert!(leftover.is_none());
+            assert_eq!(names(&out), vec!["restored.redb".to_string()]);
+            let _ = std::fs::remove_dir_all(&d);
+            let _ = std::fs::remove_dir_all(&out);
+        }
+
+        #[test]
+        fn shared_parents_are_rejected_without_creating_anything() {
+            let d = dir("shared-src");
+            let from = d.join("backup.redb");
+            make_db(&from);
+            for mode in [0o775, 0o777, 0o757, 0o1777] {
+                let out = dir("shared");
+                let db = out.join("db.redb");
+                make_db(&db);
+                std::fs::set_permissions(&out, std::fs::Permissions::from_mode(mode))
+                    .expect("chmod");
+                let mut leftover = None;
+                let r = restore(&from, &out.join("restored.redb"), &mut leftover);
+                assert!(
+                    matches!(r, Err(RestoreError::InsecureParent)),
+                    "{mode:o} {r:?}"
+                );
+                let mut leftover = None;
+                let r = verify_via_copy(
+                    &db,
+                    &engine::storage::IntegrityOptions::default(),
+                    &mut leftover,
+                );
+                assert!(
+                    matches!(r, Err(RestoreError::InsecureParent)),
+                    "{mode:o} {r:?}"
+                );
+                assert_eq!(names(&out), vec!["db.redb".to_string()], "{mode:o}");
+                std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o700))
+                    .expect("chmod");
+                let _ = std::fs::remove_dir_all(&out);
+            }
+            assert_eq!(classify(&Err(RestoreError::InsecureParent)).0, EXIT_USAGE);
+            assert_eq!(
+                verify_exit_code(&Err(RestoreError::InsecureParent), false),
+                EXIT_USAGE
+            );
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        /// 作業ディレクトリの差し替え・一時ファイルの unlink・別 inode 化は `check` が拒否する。
+        #[test]
+        fn staging_check_detects_work_dir_and_temp_replacement() {
+            use std::io::Write as _;
+            let d = dir("check");
+            let mut s = Staging::create(&d, "fandhe-test").expect("create");
+            assert!(s.check(Some(0)).is_ok());
+            s.tmp.file.write_all(b"abcd").expect("write");
+            assert!(s.check(Some(4)).is_ok());
+            assert!(matches!(s.check(Some(5)), Err(RestoreError::TempReplaced)));
+            // 一時ファイルの別 inode 化
+            let t = s.real_tmp_path();
+            std::fs::remove_file(&t).expect("unlink");
+            assert!(matches!(s.check(None), Err(RestoreError::TempReplaced)));
+            std::fs::write(&t, b"abcd").expect("recreate");
+            assert!(matches!(s.check(None), Err(RestoreError::TempReplaced)));
+            std::fs::remove_file(&t).expect("unlink");
+            // 作業ディレクトリのリンクへの差し替え
+            let w = s.real_work_path();
+            let moved = d.join("moved");
+            std::fs::rename(&w, &moved).expect("rename");
+            let victim = d.join("victim");
+            std::fs::create_dir(&victim).expect("victim");
+            std::os::unix::fs::symlink(&victim, &w).expect("symlink");
+            assert!(matches!(s.check(None), Err(RestoreError::TempReplaced)));
+            // 差し替えられた作業ディレクトリは消さず、実パスを通知する。
+            let left = s.cleanup().expect("leftover");
+            assert_eq!(left, w);
+            assert!(victim.is_dir());
+            std::fs::remove_file(&w).expect("rm link");
+            std::fs::rename(&moved, &w).expect("restore");
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn staging_cleanup_removes_both_and_names_use_the_work_dir_format() {
+            let d = dir("cleanup");
+            let mut s = Staging::create(&d, "fandhe-restore").expect("create");
+            let w = s.real_work_path();
+            let wn = w.file_name().and_then(|n| n.to_str()).expect("name");
+            assert!(engine::storage::is_restore_work_dir_name(wn), "{wn}");
+            let tn = s.real_tmp_path();
+            let tn = tn.file_name().and_then(|n| n.to_str()).expect("name");
+            assert!(unix_impl::is_restore_temp_name(tn), "{tn}");
+            assert!(s.cleanup().is_none());
+            assert!(names(&d).is_empty());
+            let _ = std::fs::remove_dir_all(&d);
+        }
     }
 }

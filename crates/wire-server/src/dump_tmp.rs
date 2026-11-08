@@ -5,6 +5,8 @@
 //! （既存の宛先は上書きしない）・失敗時の削除だけを担う。`restore_opt` の `TempCopy` と同じ手順だが、
 //! あちらは `restore_opt` の内部型で公開されていないため、内部型を公開せずに済ませる目的で、
 //! 本モジュールに小さく持っている（意図した重複）。`dump_run`・`dump_restore` が使う。
+//! 作業ディレクトリ（[`WorkDir`]・[`check_parent_not_shared`]）は `restore_opt` の `restore`・`verify` の
+//! コピー経路も共有する（Issue #3102。一時コピーをパスで開き直す窓を 0700 の作業ディレクトリと保持 fd で塞ぐ）。
 
 use std::fs::{File, OpenOptions};
 use std::io::ErrorKind;
@@ -211,6 +213,18 @@ impl WorkDir {
     /// `parent` の中に 0700 の作業ディレクトリを新規に作る（既存の名前は使わない）。親が共有
     /// （グループ・その他が書き込める）か、所有者が自分と異なれば `InsecureParent` で拒否する。
     pub fn create(parent: &Path, prefix: &str) -> Result<Self, TmpError> {
+        Self::create_named(parent, &mut || {
+            let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+            format!(".{prefix}-{}-{seq}.d", std::process::id())
+        })
+    }
+
+    /// [`Self::create`] の名前を呼び出し側が決める版（`restore_opt` が nonce 付きの名前で使う。Issue #3102）。
+    /// `make_name` は衝突のたびに呼ばれ、親直下の 1 成分（パス区切りを含まない）を返すこと。
+    pub fn create_named(
+        parent: &Path,
+        make_name: &mut dyn FnMut() -> String,
+    ) -> Result<Self, TmpError> {
         use std::os::fd::AsRawFd;
         use std::os::unix::fs::DirBuilderExt;
         let parent_fd = File::open(parent).map_err(io_err)?;
@@ -220,8 +234,11 @@ impl WorkDir {
         }
         let mut attempts = 0u32;
         let path = loop {
-            let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-            let p = parent.join(format!(".{prefix}-{}-{seq}.d", std::process::id()));
+            let name = make_name();
+            if name.contains('/') || name == "." || name == ".." {
+                return Err(TmpError::InvalidDestination);
+            }
+            let p = parent.join(name);
             match std::fs::DirBuilder::new().mode(0o700).create(&p) {
                 Ok(()) => break p,
                 Err(e) if e.kind() == ErrorKind::AlreadyExists && attempts < 8 => {
@@ -299,6 +316,12 @@ impl WorkDir {
             Some(name) => self.path.join(name),
             None => self.path.clone(),
         }
+    }
+
+    /// 以降の drop で作業ディレクトリを消さない（差し替えを検出して別のディレクトリを消さないため。
+    /// Issue #3102。呼び出し側が残ったパスを通知する）。
+    pub fn disarm(&mut self) {
+        self.armed = false;
     }
 
     /// 作業ディレクトリを消す（空でなければ消さず、残ったパスを返す）。
