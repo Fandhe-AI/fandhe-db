@@ -145,13 +145,13 @@ pub fn dump(args: &DumpArgs, leftover: &mut Option<PathBuf>) -> Result<DumpSumma
             DumpError::OpenFailed
         }
     })?;
-    // マテリアライズド VIEW の列構成の検査（Issue #3097）は SQL 層を持つ `EngineCore` の入口にある。
-    let core = EngineCore::from_storage(storage, engine::search_engine::default_engine());
     // 停止中の DB を排他で開いているので、世代（書くのは閉じた復元先だけ）はこの読み取りの後に
     // 変わらない。読めなければ何も作らずに失敗する（fail-closed。Issue #2451）。
-    let restore_generation = core
+    let restore_generation = storage
         .restore_generation()
         .map_err(|_| DumpError::Generation)?;
+    // マテリアライズド VIEW の列構成の検査（Issue #3097）は SQL 層を持つ `EngineCore` の入口にある。
+    let core = EngineCore::from_storage(storage, engine::search_engine::default_engine());
     let mut tmp = TempFile::create(parent, "fandhe-dump").map_err(DumpError::Tmp)?;
     let result = write_and_publish(&core, args, &mut tmp, restore_generation);
     if let Err(p) = tmp.remove() {
