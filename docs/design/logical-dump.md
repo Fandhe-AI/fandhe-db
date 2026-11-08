@@ -26,8 +26,8 @@ Storage::export_schema_ddl<E>(
 
 | 区分 | 内容 |
 | ---- | ---- |
-| `PreData` | スキーマ・ロール・ENUM・SEQUENCE・表（列・既定値・PRIMARY KEY・UNIQUE・CHECK）・VIEW・関数 |
-| `PostData` | 外部キー・索引・SEQUENCE の現在値（`setval`）・トリガ・ポリシー・行セキュリティ |
+| `PreData` | スキーマ・ロール・ENUM・SEQUENCE（共有・SCHEMA 配下）・表（列・既定値・PRIMARY KEY・UNIQUE・CHECK）・VIEW・マテリアライズド VIEW（`WITH NO DATA`。§14）・関数 |
+| `PostData` | 外部キー・索引（表・マテリアライズド VIEW 上）・SEQUENCE の現在値（`setval`）・トリガ・ポリシー・行セキュリティ。論理ダンプ（`export_logical_dump`）だけは末尾にマテリアライズド VIEW の再計算（`REFRESH MATERIALIZED VIEW`。§14）を足す |
 
 データを入れる前に制約・トリガ・ポリシーが効くと流し込み自体が阻害されるため、`pg_dump` と同じくそれらはデータの後ろに置く。表の PRIMARY KEY・UNIQUE・CHECK は表の定義に含める。
 
@@ -58,10 +58,8 @@ DDL へ戻す手段が無い種別・属性があれば `Unsupported` でダン�
 | 対象 | 理由 |
 | ---- | ---- |
 | 暗黙 `id` を持つ表（旧方式・移行済み方式） | SQL の `CREATE TABLE` は暗黙 `id` を持たない採番方式の表しか作らない |
-| マテリアライズド VIEW | 実体（文脈ごとの行）を DDL へ戻す手段が無い |
+| SCHEMA 配下のマテリアライズド VIEW | `CREATE MATERIALIZED VIEW` が修飾名を受理せず、共有（`public`）にしか作れない（通常は存在しない。カタログに現れたら失敗させる） |
 | ロールが参照する他テナントのロール・SCHEMA・関数、SCHEMA 配下の SEQUENCE への権限 | 復元先の自テナントに戻せない（§14.4）。メンバーシップ・ACL・所有者・既定権限・初期権限そのものは第 14 節の復元指示で戻す |
-| SCHEMA 配下で現在値を持つ SEQUENCE | `setval`／`nextval` は SCHEMA 修飾・引用符付きの名前を受理しない |
-| SCHEMA 配下の単独の SEQUENCE | `CREATE SEQUENCE` が修飾名を受理しない |
 | 名前が既定の暗黙 SEQUENCE（`<表>_<列>_seq`）と異なる所有 SEQUENCE、既定でない SERIAL の定義 | 再実行で付く名前・定義が変わる |
 | `SECURITY DEFINER` の関数・標準形の本体（`RETURN`・`BEGIN ATOMIC`）の関数・宣言的関数 | SQL で再現できない |
 | `WHEN` 付きトリガ | 構文を受理しない |
@@ -77,7 +75,7 @@ DDL へ戻す手段が無い種別・属性があれば `Unsupported` でダン�
 
 ## 6. SEQUENCE の扱い
 
-- 所有者のない SEQUENCE は `CREATE SEQUENCE`（START・INCREMENT・MINVALUE・MAXVALUE・CYCLE）で出す。`RESTART` 値が START と異なれば `ALTER SEQUENCE ... RESTART WITH` を足す
+- 所有者のない SEQUENCE は `CREATE SEQUENCE`（SCHEMA 配下は引用符なしの `schema.name`。Issue #3097）（START・INCREMENT・MINVALUE・MAXVALUE・CYCLE）で出す。`RESTART` 値が START と異なれば `ALTER SEQUENCE ... RESTART WITH` を足す
 - 所有される SEQUENCE（SERIAL・IDENTITY）は表の列定義が作り直すので単独では出さない。SERIAL 系は列型の既定の定義と一致するときだけ `SERIAL` 等で、IDENTITY は SEQUENCE のオプションを明示した `GENERATED ... AS IDENTITY (...)` で出す
 - 現在値は選択したテナントの状態行（`last_value`・`is_called`）から `SELECT setval(...)` を `PostData` に出す。状態行が無い SEQUENCE は出さない（まだ採番していない）
 
@@ -87,7 +85,7 @@ DDL へ戻す手段が無い種別・属性があれば `Unsupported` でダン�
 
 ## 8. 出力順
 
-出力順は SCHEMA の内部 ID に依存させない。内部 ID はカウンタで払い出され、復元先で付け直されるため、内部キーの並び（`#<id>.<名前>`）で出すと再生成した DDL 列が元と食い違う。表・VIEW（依存を満たす順のうち）・索引・関数・トリガ・ポリシー・行セキュリティは `(SCHEMA 名, 名前)`（共有分は SCHEMA 名が空で先）で並べ、SCHEMA とロールは名前順で出す。
+出力順は SCHEMA の内部 ID に依存させない。内部 ID はカウンタで払い出され、復元先で付け直されるため、内部キーの並び（`#<id>.<名前>`）で出すと再生成した DDL 列が元と食い違う。表・VIEW（依存を満たす順のうち）・索引・関数・トリガ・ポリシー・行セキュリティは `(SCHEMA 名, 名前)`（共有分は SCHEMA 名が空で先）で並べ（単独の SEQUENCE とその現在値〔`setval`〕も同じ。Issue #3097）、SCHEMA とロールは名前順で出す。
 
 ## 9. 運用上の制約（#2162・#2163 への申し送り）
 
@@ -103,7 +101,7 @@ DDL へ戻す手段が無い種別・属性があれば `Unsupported` でダン�
 
 - 権限の書き出しは第 14 節で対応済み（Issue #3096）
 - 外部キー: 参照先の列名が `id` のものは SQL 表層が暗黙 id への参照として `0A000` で拒否するため、ダンプには現れない。それ以外の外部キーは SQL で作れ、SQL 経由の往復を第 13 節の試験が確かめる
-- マテリアライズド VIEW、SCHEMA 配下の単独 SEQUENCE と現在値
+- マテリアライズド VIEW・SCHEMA 配下の SEQUENCE は §15 で対応済み（既知の制約も §15）
 
 ## 11. 表データの書き出し（Issue #2161）
 
@@ -183,7 +181,7 @@ Storage::export_logical_dump<E>(scope, format, sink: impl FnMut(&LogicalDumpItem
 - `COPY` のデータ行は NULL・タブ・改行を含むため、CLI は `CopyHeader` から `CopyEnd` までを 1 つの COPY として書き、行を再分割・再整形しない
 - 途中で失敗したとき、それまでに渡した断片は不完全である。CLI（#2162）は一時ファイルへ書き、成功したときだけ公開する
 - `INSERT` 形式でも、TEXT 中の LF・CR は文字列リテラルの中にそのまま出る。行単位で再整形・再分割しない
-- 採番列（`SERIAL`・`IDENTITY`）の値は表データの明示値で戻り、次回の採番値は `PostData` の `setval` が戻す（§6）。SCHEMA 配下の SEQUENCE の現在値は §4 のとおり書き出せず、そのスキーマ配下に現在値を持つ表があるとダンプ全体が失敗する
+- 採番列（`SERIAL`・`IDENTITY`）の値は表データの明示値で戻り、次回の採番値は `PostData` の `setval` が戻す（§6）。SCHEMA 配下の SEQUENCE（SCHEMA 配下の表の SERIAL・IDENTITY を含む）の現在値も、SCHEMA 修飾名の `setval` で戻る（§14）
 
 ### 11.8 残課題
 
@@ -240,7 +238,7 @@ COPY <表> (<列>, ...) FROM STDIN;
 - COPY のデータ行だけは長さでなく行で区切る。COPY text 形式は行内の LF・CR・タブをエスケープする（§11.3）ので、生の LF は行境界だけである。終端行（`\.` の 1 行）は値としては出現しない（値 `\.` は `\\.` になる）
 - 末尾の `-- end` が無いファイル（枠の境界での切り詰めを含む）は読み切れても拒否する。終端行の後ろに何かが続くファイルも拒否する
 - 上限（書き手も同じ上限を課し、復元できないファイルを作らない）: ヘッダ 1 行 512 バイト、見出し 128 バイト、1 文の本文 64 MiB、COPY のデータ 1 行 64 MiB。確保は読み出したバイト数に比例させ、申告した長さだけで確保しない。NUL を含む本文・長さ 0 の本文・UTF-8 でない本文は拒否する
-- `kind` は `DdlObjectKind` に 1 対 1（`insert` はデータの `INSERT`）。復元側は種別ごとの許可表（先頭の語句。`CREATE TABLE`・`INSERT INTO`・`SELECT setval(` など。語句の後ろには空白が続く形だけを受け付ける）に合う本文だけを実行する
+- `kind` は `DdlObjectKind` に 1 対 1（`insert` はデータの `INSERT`。マテリアライズド VIEW は `materialized-view`・`materialized-view-refresh`）。復元側は種別ごとの許可表（先頭の語句。`CREATE TABLE`・`INSERT INTO`・`SELECT setval(` など。語句の後ろには空白が続く形だけを受け付ける）に合う本文だけを実行する
 
 ### 12.4 書き出し
 
@@ -261,7 +259,7 @@ COPY <表> (<列>, ...) FROM STDIN;
 - **COPY のバッチ分割**: 1 バッチの上限は engine の実際の上限（行数①・チャンク数④〔1 行 1 チャンク〕・合計バイト③）の最小値と 8 MiB で決め、次の行を足すと超える場合は足す前に commit して新しいバッチを始める。1 行だけで上限を超えるダンプは `feed` が拒否し、何も公開しない
 - 実行の文脈: ヘッダのテナントの文脈（認証済みセッションと同じ可視性集合）で、文ごとに実行する。`--shared-only` のダンプは固定の内部テナント名で実行する（共有の定義は実行テナントに依存せず、行は無い）。DDL 実行権限はこの一時 DB 上のセッションにだけ与える。`COPY` は engine のバッチ上限（行数）に収まる単位に分けて commit する（一時 DB は公開されるまで誰にも見えないため、分割 commit でも原子性は変わらない）。台帳（`OPERATION_ID`）は使わず、復元後の DB にも作らない（§11.7）
 - `--data-only` のダンプは、表が無い新規 DB へは復元できないため終了コード 4 で拒否する（既存 DB への流し込みは §12.7）
-- **ダンプファイルは untrusted 入力**: ヘッダは完全一致、枠は上限と長さの検証、本文は 1 文の検証と、種別ごとの形（先頭の語句。`setval` は `SELECT setval('<名前>', <整数>, TRUE|FALSE)`、外部キーは `ADD CONSTRAINT ... FOREIGN KEY`、行セキュリティは `ENABLE`／`FORCE` だけ、COPY は `COPY <表> (<列>, ...) FROM STDIN` だけ）で絞る。
+- **ダンプファイルは untrusted 入力**: ヘッダは完全一致、枠は上限と長さの検証、本文は 1 文の検証と、種別ごとの形（先頭の語句。`setval` は `SELECT setval('<名前>', <整数>, TRUE|FALSE)`、外部キーは `ADD CONSTRAINT ... FOREIGN KEY`、行セキュリティは `ENABLE`／`FORCE` だけ、`materialized-view` は末尾が `WITH NO DATA`（直前に空白）の `CREATE MATERIALIZED VIEW`、`materialized-view-refresh` は `REFRESH MATERIALIZED VIEW "<識別子>"`（または SCHEMA 修飾名）の厳密形で `parts: all` のヘッダのときだけ、COPY は `COPY <表> (<列>, ...) FROM STDIN` だけ）で絞る。
   - **枠の順序を強制する**: 作成系（`Pre`）→ 行の投入（`INSERT`・`COPY`）→ 後段（`Post`: 外部キー・索引・採番値・トリガ・行セキュリティ・ポリシー・権限）の順にしか並べられず、逆行は終了コード 4 で拒否する。トリガなどデータ投入中に効くものは後段でしか受け付けないので、投入中にダンプ由来のトリガ関数は走らない。engine の出力（トリガ・ポリシー・行セキュリティは `PostData`）と一致しており、変更なしで往復が成り立つ（`tests/wire_cli/dump_cli.rs`）。データの枠は DDL 実行権限を持たない別セッションで実行する
   - **ヘッダと枠の整合**: `scope: shared` のファイルにデータ枠、`parts: schema` にデータ枠、`format: insert` に COPY 枠があれば拒否する（`format: copy` でも COPY が受理しない列型の表は `INSERT` で出る〔§11.3〕ので `INSERT` 枠は許す）。ヘッダのテナントは信用される。取り違えを防ぐには `--expect-tenant <id>` を使う（一致しなければ終了コード 4。省略時は従来どおりヘッダのテナントで復元する）
   - **残るリスク**: それでもダンプファイルは書き込み SQL を運ぶ経路で、許可された種別の範囲で任意の `CREATE FUNCTION`・`INSERT`・`CREATE ROLE`（任意のパスワード検証子）・VIEW・CHECK 式・列の既定値の式などを新規 DB に作れる。作成系の段階では DDL 権限つきのセッションで実行され、列の既定値・CHECK 式・外部キーなど表に紐づく式はデータ投入中に評価される（関数を呼ぶ既定値でも、関数本体の SQL はデータ用の DDL 権限なしセッションの権限で走る）。復元結果は運用者が選んだ新規 DB に閉じる（既存の DB・ファイルには触れず、ファイルの読み書きに類する文は許可表に無い）が、**信頼できる出典のダンプだけを復元する**こと。ヘッダの世代を書き換えたダンプは復元先の世代を過大にしうる（上限に近づけて以後の復元を失敗させうる）が、ヘッダのテナント行と同じ信頼モデルの範囲として扱い、新たな緩和は設けない
@@ -296,6 +294,7 @@ COPY <表> (<列>, ...) FROM STDIN;
 - 索引: 通常・部分・式・複合 UNIQUE・HNSW・GIN、SCHEMA 配下の索引
 - VIEW: 表を読むもの、VIEW を読む VIEW、列名指定つき、SCHEMA 配下
 - 採番: SEQUENCE（開始値・増分つき）、SERIAL、`GENERATED BY DEFAULT AS IDENTITY`（開始値・増分つき）
+- マテリアライズド VIEW: 列別名つき、VIEW を読むもの、マテリアライズド VIEW を読むもの、実体化前（`WITH NO DATA`）のまま残るもの、UNIQUE・通常の索引つき。SCHEMA 配下の SEQUENCE（開始値・増分・RESTART つき）と、それを既定値にする列・SERIAL を持つ SCHEMA 配下の表（Issue #3097）
 - その他: ENUM、SCHEMA、SQL／PL/pgSQL 関数、トリガ、ポリシー（PERMISSIVE・RESTRICTIVE）、行セキュリティ（ENABLE・FORCE）、ロール（SCRAM 検証子）
 
 ### 13.3 fixture に含めない（書き出せない）要素と、それを固定する試験
@@ -304,9 +303,8 @@ COPY <表> (<列>, ...) FROM STDIN;
 | ---- | ---- | ------------ |
 | 参照先の列名が `id` の外部キー | SQL 表層が `0A000` で拒否する（列 `id` を明示した表でも同じ）。ダンプには現れない | `foreign_key_to_a_column_named_id_is_rejected_so_it_never_reaches_the_dump` |
 | 従来方式（暗黙 id）の表が持つ外部キー | 暗黙 id の表そのものが `Unsupported`（外部キーだけを落として戻すことはしない） | `dump_fails_closed_when_a_legacy_table_carries_a_foreign_key` |
-| SCHEMA 配下で現在値を持つ SEQUENCE（SCHEMA 配下の表の SERIAL・IDENTITY を含む） | `Unsupported`（§4） | `logical_dump_schema.rs` の `schema_scoped_sequence_with_a_current_value_fails_closed`。fixture の SCHEMA 配下の表は採番列を持たない |
 | `GENERATED ALWAYS` の IDENTITY | INSERT 形式では `Unsupported`、COPY 形式では往復する（§11.6） | `logical_dump_data.rs` の `identity_columns_round_trip_through_copy_and_fail_closed_for_insert`。fixture の IDENTITY は `BY DEFAULT` |
-| マテリアライズド VIEW・暗黙 id の表 | `Unsupported`（§4） | `logical_dump_schema.rs` の既存試験（`materialized_views_fail_the_whole_dump`・`table_with_implicit_id_row_identity_fails_the_whole_dump`） |
+| 暗黙 id の表 | `Unsupported`（§4） | `logical_dump_schema.rs` の既存試験（`table_with_implicit_id_row_identity_fails_the_whole_dump`） |
 
 ### 13.4 試験で見つかった不具合
 
@@ -359,3 +357,41 @@ COPY <表> (<列>, ...) FROM STDIN;
 
 - engine（`tests/table_rls/logical_dump_schema.rs`）: ロール・権限の往復（再ダンプのバイト一致、旧形式ハッシュ・初期権限・マーカーの復元）、他テナントの混入なし、不在の名前・文法違反・上書きの拒否と固定文言。単体試験は `restore_directive.rs`（描画と解析の往復・拒否・伏せ字・権限語の網羅）
 - wire-server（`tests/wire_cli/dump_users_cli.rs`）: `--users` で起動したサーバーが作った DB の `dump` → `dump-restore` → 再ダンプの一致と、復元先を同じ users ファイルで起動した認証・権限の観測の一致、出力が 0600 でハッシュが標準出力・標準エラーに出ないこと、指示の改ざん（許可外・段階違い・shared・存在しない名前）の拒否
+
+## 15. マテリアライズド VIEW と SCHEMA 配下の SEQUENCE（Issue #3097）
+
+- 対応: Issue #3097（親 #2159）。ビヘイビアのポインタ: RECOVER-16（`docs/spec/04-behavior/recovery.md`）。#2160 が `Unsupported` にしていた 2 種を、ダンプ→復元で往復できるようにした
+
+### 15.1 マテリアライズド VIEW は実体を運ばず、復元後に再計算する
+
+- 実体（文脈ごとの行）の書き込み経路は SQL 表層に無く、第 2 の書き込み経路は作らない（§12.5）。`pg_dump` と同じく定義だけを出し、復元後に再計算する
+- `PreData` に `CREATE MATERIALIZED VIEW "<名前>" [("<別名>", ...)] AS <本文> WITH NO DATA`（種別 `MaterializedView`）を出す。VIEW と 1 つの依存グラフで並べ（VIEW が読む relation・マテリアライズド VIEW が読む表・VIEW・マテリアライズド VIEW を先に出す。準備できたものは描画名順。循環は `Unsupported`）、共有分を出す範囲でだけ出す
+- マテリアライズド VIEW 上の索引（スカラーのみ。HNSW・GIN は SQL 表層が拒否する）は、表の索引と同じく `PostData` の `Index` として出す
+- **再計算（`REFRESH MATERIALIZED VIEW "<名前>"`。種別 `MaterializedViewRefresh`）は論理ダンプ（`export_logical_dump`）の末尾（`PostData` の後）だけに出す**。スキーマだけの書き出し（`export_schema_ddl`・`--schema-only`）は出さない。表が空のまま再計算すると「空で実体化済み」になり、元の「未実体化（`55000`）」より緩くなるため（fail-open を避ける。`pg_dump --schema-only` もマテリアライズド VIEW を未実体化のまま残す）
+- **再計算を出す条件は、選択したテナント自身の実体があること**。定義の `populated` は共有の 1 フラグで、どのテナントの `REFRESH` でも変わるため判定に使わない。他テナントの操作が自テナントのダンプ内容を変えないためで、`setval` が自テナントの状態行があるときだけ出るのと同じ扱いである。判定は自テナントの文脈キー（可視性集合の 4 通り）への点 `get` だけで行い、他テナントの実体のキーにも行にも触れない。`--shared-only`（テナント無し）では出さない
+  - `REFRESH` は全文脈の旧実体を消して実行者の文脈だけを再評価する。このため、別のテナントが `REFRESH` すると自テナントの実体は無くなり、自テナントのダンプからは再計算が消える（ダンプは自テナントの現在の状態を表す）。逆に、自テナントが実体を持たないうちは、他テナントが実体化してもダンプは変わらない
+- 実体の行（`matview_entities`・`matview_rows/*`）は読まない。他の文脈の値がダンプへ漏れる経路は無い
+
+### 15.2 SCHEMA 配下の SEQUENCE
+
+- SCHEMA 修飾名の SEQUENCE は SQL 表層が受理済み（#1717。`CREATE SEQUENCE s.q`・`ALTER SEQUENCE s.q RESTART`・`nextval('s.q')`・`setval('s.q', ..)`）。単独の SEQUENCE は `CREATE SEQUENCE <schema>.<name> ...`（引用符なしの修飾名）と、RESTART 値が START と異なるときの `ALTER SEQUENCE`、現在値は `SELECT setval('<schema>.<name>', n, TRUE|FALSE)`、既定値は `DEFAULT nextval('<schema>.<name>')` で出す。SCHEMA 配下の表の SERIAL・IDENTITY の現在値も同じ経路で戻る
+- 出力順は `(SCHEMA 名, 名前)`（§8）。単独 SEQUENCE と `setval` も内部キーの順ではなく描画名で並べる
+- 他テナントの SCHEMA 配下の SEQUENCE は従来どおり黙って対象外にし、現在値の状態行はテナント指定で引くので他テナントの値は読まない
+
+### 15.3 復元側（wire-server）
+
+- 種別語 `materialized-view`（`Pre`。本文の末尾が `WITH NO DATA`（直前に空白）のものだけ受理し、`Pre` の段で本文を評価させない）と `materialized-view-refresh`（`Post`。厳密形だけ受理し、`CONCURRENTLY`・`WITH [NO] DATA`・複数名・後続の語は拒否）を足した。`materialized-view-refresh` の枠は `parts: all` のヘッダ以外では拒否する（終了コード 4）
+- `setval` の名前は、素の識別子または `schema.name`（`.` は 1 個まで・両側は空でなく、各部は英数字と `_` だけ）を受理する
+
+### 15.4 既知の制約
+
+- 復元時の再計算は、復元セッションの文脈（CLI は認証済みセッションと同じ可視性集合）の実体だけを作る。元の DB で別の可視性集合の文脈にあった実体は、運用者が `REFRESH` するまで未実体化のまま
+- 最後の `REFRESH` 以降に基表が変わった実体は、そのまま運ばない。復元時点のデータで再計算される（`pg_dump` と同じ）
+- 再計算は全文脈の実体を作り直すので、同じ DB へ複数テナントを順に復元する用途には向かない（現行の CLI は単一テナントの新規 DB だけなので影響しない。全テナントのダンプ・復元の設計 §12.7 と合わせて扱う）
+- `SELECT *` の本文で、作成後に基表へ列を足したマテリアライズド VIEW は、復元すると列構成が変わりうる（元の DB では `REFRESH` が `0A000` になる状態）。この不一致は検出して拒否する: `EngineCore` の書き出し入口（CLI が通る経路）は、保存済みの列と本文から再導出した列が一致しなければ固定文言の `Unsupported` で全体を失敗させる。`Storage` の公開入口は再導出の手段を持たないため、範囲内にマテリアライズド VIEW があれば（列の一致を確かめられないので）拒否する
+- 出力順: `WITH NO DATA` は本文を解析して列型を保存するため、マテリアライズド VIEW とそれを（推移的に）読む VIEW は関数の後ろに出し、それ以外の VIEW は関数の前に置く（現行の SQL 表層は VIEW 本文での関数呼び出しを受理しないが、受理された場合に復元が壊れないよう順序を固定する。試験: `materialized_views_are_dumped_after_functions`）
+
+### 15.5 試験
+
+- engine: `logical_dump_schema.rs`（`schema_scoped_sequences_round_trip_with_current_values`・`other_tenants_schema_scoped_sequences_do_not_affect_the_dump`・`materialized_views_round_trip_as_no_data_in_the_schema_dump`・`logical_dump_refreshes_only_materialized_views_with_the_tenants_own_entity`・`other_tenants_materialized_view_state_does_not_affect_the_dump`）、`logical_dump_roundtrip.rs`（fixture にマテリアライズド VIEW・SCHEMA 配下の SEQUENCE を追加。値・次の採番値・未実体化のままの `55000` が往復する）
+- wire-server: `dump_cli.rs` の `restore_accepts_matview_frames_and_rejects_loose_shapes`、`dump_roundtrip_cli.rs` の改ざん試験（枠の入れ替え・重複・種別語）

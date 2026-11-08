@@ -55,6 +55,8 @@ fn round_trip_through_cli(label: &str, format: &str) {
         "foreign-key",
         "index",
         "view",
+        "materialized-view",
+        "materialized-view-refresh",
         "function",
         "trigger",
         "row-security",
@@ -202,7 +204,7 @@ fn assert_rejected(dir: &Path, bytes: &[u8], name: &str, why: Reject) {
 fn duplicate_sqlstate(kind: &str) -> &'static str {
     match kind {
         "schema" => "42P06",
-        "table" | "sequence" | "index" | "view" => "42P07",
+        "table" | "sequence" | "index" | "view" | "materialized-view" => "42P07",
         "role" | "enum-type" | "foreign-key" | "trigger" | "policy" => "42710",
         "function" => "42723",
         other => panic!("no expected SQLSTATE for duplicated {other}"),
@@ -330,6 +332,10 @@ fn damaged_full_fixture_dumps_are_rejected_and_publish_nothing() {
     let moves: Vec<(&str, Frame)> = vec![
         ("index-before-table", kind_first("index")),
         ("view-before-table", kind_first("view")),
+        (
+            "materialized-view-before-table",
+            kind_first("materialized-view"),
+        ),
         ("foreign-key-before-table", kind_first("foreign-key")),
         ("copy-before-table", kind_first("copy")),
         ("trigger-before-table", kind_first("trigger")),
@@ -377,7 +383,7 @@ fn damaged_full_fixture_dumps_are_rejected_and_publish_nothing() {
     for f in &first_of_kind {
         if matches!(
             f.kind.as_str(),
-            "sequence-value" | "row-security" | "copy" | "insert"
+            "sequence-value" | "materialized-view-refresh" | "row-security" | "copy" | "insert"
         ) {
             continue;
         }

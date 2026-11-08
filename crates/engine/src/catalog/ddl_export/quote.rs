@@ -156,16 +156,18 @@ impl Namer {
         })
     }
 
-    /// `nextval('...')`・`setval('...')` の文字列内に書く SEQUENCE 名。これらは引用符付き・SCHEMA 修飾の名前を
-    /// 受理しないため、共有（`public`）の SEQUENCE の素の名前だけを返し、SCHEMA 配下は書き出せない
-    /// （`Unsupported`）。他テナントのキーは `Ok(None)`。
+    /// `nextval('...')`・`setval('...')` の文字列内に書く SEQUENCE 名。これらは引用符付きの名前を
+    /// 受理しないため、共有（`public`）は素の名前（`name`）、SCHEMA 配下は引用符なしの修飾名
+    /// （`schema.name`。SQL 表層が文字列引数を内部キーへ解決する。Issue #1717）で返す。
+    /// 他テナントのキーは `Ok(None)`。
     pub(super) fn sequence_arg<E>(&self, key: &str) -> Result<Option<String>, SchemaDdlError<E>> {
         match self.scope(key)? {
             KeyScope::Shared => Ok(Some(bare_ident(key)?)),
-            KeyScope::Tenant { .. } => Err(unsupported(
-                "sequence",
-                "schema-scoped sequence name cannot be written in nextval or setval",
-            )),
+            KeyScope::Tenant { schema, name } => Ok(Some(format!(
+                "{}.{}",
+                bare_ident::<E>(&schema)?,
+                bare_ident::<E>(&name)?
+            ))),
             KeyScope::Foreign => Ok(None),
         }
     }

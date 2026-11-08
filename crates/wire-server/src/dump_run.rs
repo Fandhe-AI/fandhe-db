@@ -16,6 +16,7 @@ use std::path::PathBuf;
 use engine::catalog::ddl_export::{
     LogicalDumpItem, SchemaDdlError, SchemaDdlScope, TableDataFormat, TableDataPart,
 };
+use engine::core::EngineCore;
 use engine::storage::Storage;
 
 use crate::dump_file::{FileError, FileWriter, Header, StmtKind};
@@ -137,13 +138,15 @@ pub fn dump(args: &DumpArgs, leftover: &mut Option<PathBuf>) -> Result<DumpSumma
     if std::fs::symlink_metadata(&args.out).is_ok() {
         return Err(DumpError::Tmp(TmpError::InvalidDestination));
     }
-    let core = Storage::open(&args.db).map_err(|e| {
+    let storage = Storage::open(&args.db).map_err(|e| {
         if crate::backup_opt::is_already_open(&e) {
             DumpError::InUse
         } else {
             DumpError::OpenFailed
         }
     })?;
+    // マテリアライズド VIEW の列構成の検査（Issue #3097）は SQL 層を持つ `EngineCore` の入口にある。
+    let core = EngineCore::from_storage(storage, engine::search_engine::default_engine());
     // 停止中の DB を排他で開いているので、世代（書くのは閉じた復元先だけ）はこの読み取りの後に
     // 変わらない。読めなければ何も作らずに失敗する（fail-closed。Issue #2451）。
     let restore_generation = core
@@ -159,7 +162,7 @@ pub fn dump(args: &DumpArgs, leftover: &mut Option<PathBuf>) -> Result<DumpSumma
 }
 
 fn write_and_publish(
-    core: &Storage,
+    core: &EngineCore,
     args: &DumpArgs,
     tmp: &mut TempFile,
     restore_generation: u64,

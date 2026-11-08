@@ -298,6 +298,7 @@ fn apply(
                 let directive = kind.is_restore_directive();
                 if kind.phase() < phase
                     || !frame_matches_header(header, is_data, false)
+                    || (kind == StmtKind::MaterializedViewRefresh && header.parts != DumpParts::All)
                     || !kind.accepts(&sql)
                     || (directive && header.scope == DumpScope::Shared)
                     || (!directive && !is_single_statement(&sql))

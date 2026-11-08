@@ -97,10 +97,19 @@ pub(crate) struct ContextKey(Vec<u8>);
 impl ContextKey {
     /// `ctx` から導出する。判定パスは増やさず、`PolicyContext` の読み取り専用 accessor だけを使う。
     pub(crate) fn from_context(ctx: &PolicyContext) -> Self {
-        let tenant = ctx.tenant_id().as_bytes();
+        Self::from_parts(
+            ctx.tenant_id(),
+            u8::from(ctx.allows_public()) | (u8::from(ctx.allows_private()) << 1),
+        )
+    }
+
+    /// テナントと可視性フラグ（bit0 = Public, bit1 = Private）から組み立てる唯一の点
+    /// （[`Self::from_context`] と [`tenant_has_entity_in`] が形式を共有する）。
+    fn from_parts(tenant: &str, flags: u8) -> Self {
+        let tenant = tenant.as_bytes();
         let mut bytes = Vec::with_capacity(2usize.saturating_add(tenant.len()));
         bytes.push(CONTEXT_KEY_VERSION);
-        bytes.push(u8::from(ctx.allows_public()) | (u8::from(ctx.allows_private()) << 1));
+        bytes.push(flags);
         bytes.extend_from_slice(tenant);
         Self(bytes)
     }
@@ -108,6 +117,29 @@ impl ContextKey {
     fn as_bytes(&self) -> &[u8] {
         &self.0
     }
+}
+
+/// `tenant` 自身の文脈（可視性集合の 4 通りのいずれか）で `name` の実体が 1 つでもあるか
+/// （論理ダンプが REFRESH を出すかの判定用。Issue #3097）。取りうる文脈キーへの点 `get` だけで引き、
+/// 範囲走査はしないため、他テナントの実体のキーには触れない。定義側の共有フラグ `populated` は
+/// 他テナントの操作でも変わるので判定には使わない。
+pub(crate) fn tenant_has_entity_in(
+    read_txn: &redb::ReadTransaction,
+    name: &str,
+    tenant: &str,
+) -> Result<bool> {
+    let meta = match read_txn.open_table(MATVIEW_ENTITY_META_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
+        Err(e) => return Err(e.into()),
+    };
+    for flags in 0u8..=3 {
+        let key = ContextKey::from_parts(tenant, flags);
+        if meta.get((name, key.as_bytes()))?.is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// [`audit_matview_rows`] の件数（整合検査 `storage::integrity` 向け。キー・値・テナントは含めない）。
@@ -403,7 +435,10 @@ fn encode_materialized_view_def(def: &MaterializedViewDef) -> Result<Vec<u8>> {
 
 /// [`encode_materialized_view_def`] の逆変換。破損は `CorruptSchema`（格納値の破損として
 /// 扱い、本文のリテラルをエラー文言へ含めない）。
-fn decode_materialized_view_def(name: &str, bytes: &[u8]) -> Result<MaterializedViewDef> {
+pub(crate) fn decode_materialized_view_def(
+    name: &str,
+    bytes: &[u8],
+) -> Result<MaterializedViewDef> {
     let mut r = Reader { bytes, offset: 0 };
     if r.u8()? != DEF_FORMAT_VERSION {
         return Err(corrupt("unknown materialized view definition version"));
