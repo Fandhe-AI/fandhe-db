@@ -172,6 +172,52 @@ fn verify_corrupted_db_exits_with_inconsistent_code() {
     assert_no_leak(&o, &["MARKER-0123456789"]);
 }
 
+/// アロケータ状態表が壊れたファイルでも verify は panic（終了コード 101）せず、固定のエラーで拒否する。
+/// 元ファイルは変更せず、一時コピーも残さない（RECOVER-13・Issue #3101）。
+#[test]
+fn verify_corrupted_allocator_state_fails_without_panic() {
+    use super::corrupt_allocator_state::{patch_allocator_state_keys, Corruption};
+    for how in [
+        Corruption::InvalidTransactionIdTag,
+        Corruption::HiddenRegionTracker,
+    ] {
+        let fx = common::TempFixtureDir::new("verify-cli-alloc");
+        let db = fx.db_path_str();
+        {
+            let storage = Storage::open(&db).expect("open");
+            storage
+                .put(
+                    1,
+                    &RowInput {
+                        tenant_id: "tnt",
+                        visibility: Visibility::Public,
+                        embedding: &[0.5],
+                        metadata: b"m",
+                    },
+                )
+                .expect("put");
+        }
+        let mut bytes = std::fs::read(&db).expect("read db");
+        assert!(patch_allocator_state_keys(&mut bytes, how) >= 1);
+        std::fs::write(&db, &bytes).expect("write corrupted db");
+
+        let o = verify(&["--db", &db]);
+        assert_eq!(code(&o), Some(1), "{how:?} stderr: {}", stderr(&o));
+        assert!(
+            stderr(&o).contains("failed to open database"),
+            "stderr: {}",
+            stderr(&o)
+        );
+        assert!(
+            !stdout(&o).contains("verify_mode="),
+            "stdout: {}",
+            stdout(&o)
+        );
+        assert_eq!(std::fs::read(&db).expect("read db"), bytes);
+        assert!(leftovers(parent_of(&db)).is_empty());
+    }
+}
+
 /// 3 行を書いて正常に閉じた DB を作る。
 pub(super) fn write_clean_db(path: &Path) {
     let storage = Storage::open(path).expect("open");

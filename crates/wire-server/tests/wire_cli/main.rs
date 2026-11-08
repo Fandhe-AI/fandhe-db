@@ -7,6 +7,8 @@ mod common;
 mod http_common;
 // `http_common` が `temp_db` を取り込んでいるため、二重取り込み（`clippy::duplicate_mod`）を避けて再公開名で参照する。
 use http_common::temp_db;
+#[path = "../../../engine/src/test_util/corrupt_allocator_state.rs"]
+mod corrupt_allocator_state;
 #[path = "../../../engine/src/test_util/dump_fixture.rs"]
 mod dump_fixture;
 #[path = "../common/tls_client.rs"]
