@@ -555,7 +555,7 @@ redb トランザクションで DB 内の `change_log` 表へ追記されます
   レプリカが追いついたら自動で解除）。上限を指定しない既定では無期限に待つため、**レプリカを失うと書き込みの応答が返らず接続が溜まります**
   （運用では上限と扱いの指定を推奨）。同期の水準はこの CLI だけで決まり、テナントのセッションからは変えられません。同期ロールの接続は 1 本までです。
   レプリカは版数 2 のプロトコルで接続するため、混在させるときはプライマリを先に更新してください。
-- 読み取りレプリカ（#2175）は未対応です。
+- 運用手順（構成・監視・再同期・昇格）は [docs/design/replication-operations.md](docs/design/replication-operations.md) にまとめています。
 
 **論理ダンプ**（Issue #2162。RECOVER-16 ポインタ。形式と判断は [docs/design/logical-dump.md](docs/design/logical-dump.md) の §12、手順は [backup-restore-operations.md](docs/design/backup-restore-operations.md) の 4.6）:
 
