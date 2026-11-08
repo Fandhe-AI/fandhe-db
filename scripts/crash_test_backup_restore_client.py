@@ -11,11 +11,24 @@
 - `append <start-id>`: 1 行ずつ INSERT し、コミット応答を受けるたびに `ACK <id>` を標準出力へ出す
   （呼び出し側がサーバーを SIGKILL する直前までの確認済み最大 id を知るための同期点）。
 - `count`: `COUNT=<n> MAXID=<m>` を 1 行で出す（行が飛んでいないかの検査用）。
+
+Issue #2178（RECOVER-15 ポインタ）のレプリケーション障害注入試験
+（`scripts/crash_test_replication.sh`）向けに、以下を追加している（上の 3 つの挙動は変えない）:
+- `rsetup`: 3 表（docs・kv・markers）を作り、種の行を入れる（alice 用。DDL 権限が要る）。
+- `rseed <id-base>`: 呼び出したユーザー自身の種の行を入れる（テナントごとに id の範囲を分ける）。
+- `churn <id-base>`: 1 文 1 commit の INSERT・UPDATE・DELETE を回し続け、`ACK <seq>` を出す。
+- `ddl <step>`: 段の途中の DDL（1: 表の追加と列の追加。2: 同期の段の synclog 表）。
+- `marker <id>` / `wait-marker <id> <timeout-secs>`: 追従の目印の書き込みと待機（レプリカ側）。
+- `fingerprint <table:pk>...`: 表ごとの列名と全行の sha256（キーセット方式でページング）。
+- `sync-append <start-id>`: synclog へ 1 行ずつ INSERT し `ACK <id>`。結果不明は `MAYBE <id>`。
+- `ids-present <table> <lo> <hi>`: lo..hi の id がすべて在るか（`PRESENT=<n>`）。
 """
 
+import hashlib
 import socket
 import struct
 import sys
+import time
 
 PAYLOAD = "x" * 1000
 
@@ -69,13 +82,27 @@ def connect(port, user, password):
 
 def query(sock, sql):
     """Simple Query を 1 本実行し、DataRow を文字列タプルのリストで返す。エラー応答は例外。"""
+    return query_cols(sock, sql)[1]
+
+
+def query_cols(sock, sql):
+    """`query` と同じだが、RowDescription の列名のリストも `(列名, 行)` で返す（#2178 の fingerprint 用）。"""
     data = sql.encode() + b"\0"
     sock.sendall(b"Q" + struct.pack("!I", len(data) + 4) + data)
     rows = []
+    cols = []
     err = None
     while True:
         ty, payload = _read_msg(sock)
-        if ty == b"D":
+        if ty == b"T":
+            (n,) = struct.unpack("!H", payload[:2])
+            off = 2
+            cols = []
+            for _ in range(n):
+                end = payload.index(b"\0", off)
+                cols.append(payload[off:end].decode())
+                off = end + 1 + 18
+        elif ty == b"D":
             (n,) = struct.unpack("!H", payload[:2])
             off = 2
             row = []
@@ -93,7 +120,152 @@ def query(sock, sql):
         elif ty == b"Z":
             if err is not None:
                 raise RuntimeError("server error: " + _error_message(err))
-            return rows
+            return cols, rows
+
+
+# ---------------------------------------------------------------------------
+# Issue #2178 の追加分
+# ---------------------------------------------------------------------------
+
+PAGE = 1000
+CHURN_PAUSE_SECS = 0.02
+
+
+def _vec(i):
+    return "[%.1f,%.1f,%.1f]" % ((i % 7) / 10.0, (i % 11) / 10.0, (i % 13) / 10.0)
+
+
+def _body(i):
+    # NULL・多バイト文字・引用符を混ぜる（値は id から決まる）。
+    if i % 5 == 0:
+        return "NULL"
+    if i % 5 == 1:
+        return "'日本語-%d'" % i
+    if i % 5 == 2:
+        return "'it''s-%d'" % i
+    return "'b%d'" % i
+
+
+def _seed_rows(sock, base, n):
+    for lo in range(0, n, 50):
+        hi = min(lo + 50, n)
+        vals = ",".join("(%d,'%s',%s)" % (base + i, _vec(i), _body(i)) for i in range(lo, hi))
+        query(sock, "INSERT INTO docs (id, embedding, body) VALUES " + vals)
+        vals = ",".join("(%d,%s,%d)" % (base + i, _body(i), i * 3) for i in range(lo, hi))
+        query(sock, "INSERT INTO kv (k, v, n) VALUES " + vals)
+
+
+def cmd_rsetup(sock):
+    query(sock, "CREATE TABLE docs (id BIGINT PRIMARY KEY, embedding VECTOR(3), body TEXT)")
+    query(sock, "CREATE TABLE kv (k BIGINT PRIMARY KEY, v TEXT, n BIGINT)")
+    query(sock, "CREATE TABLE markers (id BIGINT PRIMARY KEY, tag TEXT)")
+    print("SETUP", flush=True)
+
+
+def cmd_rseed(sock, base):
+    _seed_rows(sock, base, 300)
+    print("SEEDED", 300, flush=True)
+
+
+def cmd_churn(sock, base, extra):
+    """1 文 1 commit で docs・kv を回し続ける。値は seq から決まる。"""
+    i = 0
+    while True:
+        k = base + i
+        query(sock, "INSERT INTO docs (id, embedding, body) VALUES (%d,'%s',%s)" % (k, _vec(i), _body(i)))
+        if extra:
+            query(sock, "INSERT INTO kv (k, v, n, extra) VALUES (%d,%s,%d,'e%d')" % (k, _body(i), i, i))
+        else:
+            query(sock, "INSERT INTO kv (k, v, n) VALUES (%d,%s,%d)" % (k, _body(i), i))
+        if i % 3 == 2:
+            query(sock, "UPDATE kv SET v = 'u%d', n = n + 1 WHERE k = %d" % (i, k - 1))
+        if i % 5 == 4:
+            query(sock, "DELETE FROM kv WHERE k = %d" % (k - 4))
+        print("ACK", i, flush=True)
+        i += 1
+        # レプリカの適用速度を超えて遅れの上限（既定 100000 レコード）へ達しないよう書き込み速度を抑える。
+        time.sleep(CHURN_PAUSE_SECS)
+
+
+def cmd_ddl(sock, step):
+    if step == 1:
+        query(sock, "CREATE TABLE late (id BIGINT PRIMARY KEY, note TEXT)")
+        query(sock, "ALTER TABLE kv ADD COLUMN extra TEXT")
+        query(sock, "INSERT INTO late (id, note) VALUES (1,'first')")
+    elif step == 2:
+        query(sock, "CREATE TABLE synclog (id BIGINT PRIMARY KEY, note TEXT)")
+    else:
+        raise SystemExit("unknown ddl step")
+    print("DDL", step, flush=True)
+
+
+def cmd_marker(sock, mid):
+    query(sock, "INSERT INTO markers (id, tag) VALUES (%d,'m%d')" % (mid, mid))
+    print("MARKER", mid, flush=True)
+
+
+def cmd_wait_marker(sock, mid, timeout):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        rows = query(sock, "SELECT count(*) FROM markers WHERE id = %d" % mid)
+        if rows and rows[0][0] == "1":
+            print("SEEN", mid, flush=True)
+            return 0
+        time.sleep(0.1)
+    print("TIMEOUT", mid, flush=True)
+    return 1
+
+
+def cmd_fingerprint(sock, specs):
+    for spec in specs:
+        name, _, pk = spec.partition(":")
+        if not name.isidentifier() or not pk.isidentifier():
+            raise SystemExit("bad table spec")
+        h = hashlib.sha256()
+        total = 0
+        last = -1
+        cols = None
+        try:
+            while True:
+                cols, rows = query_cols(
+                    sock,
+                    "SELECT * FROM %s WHERE %s > %d ORDER BY %s LIMIT %d" % (name, pk, last, pk, PAGE),
+                )
+                if total == 0 and cols:
+                    h.update(("|".join(cols) + "\n").encode())
+                for r in rows:
+                    for v in r:
+                        h.update(b"\x00N" if v is None else b"\x01" + v.encode() + b"\x02")
+                    h.update(b"\n")
+                total += len(rows)
+                if len(rows) < PAGE:
+                    break
+                last = int(rows[-1][cols.index(pk)])
+        except RuntimeError:
+            print("TABLE %s missing" % name, flush=True)
+            continue
+        print("TABLE %s rows=%d sha256=%s" % (name, total, h.hexdigest()), flush=True)
+
+
+def cmd_sync_append(sock, start):
+    i = start
+    while True:
+        try:
+            query(sock, "INSERT INTO synclog (id, note) VALUES (%d,'s%d')" % (i, i))
+        except (RuntimeError, OSError, ConnectionError, ValueError):
+            print("MAYBE", i, flush=True)
+            return 3
+        print("ACK", i, flush=True)
+        i += 1
+
+
+def cmd_ids_present(sock, table, lo, hi):
+    if not table.isidentifier():
+        raise SystemExit("bad table")
+    rows = query(sock, "SELECT count(*) FROM %s WHERE id >= %d AND id <= %d" % (table, lo, hi))
+    n = int(rows[0][0])
+    print("PRESENT=%d" % n, flush=True)
+    return 0 if n == hi - lo + 1 else 1
 
 
 def main(argv):
@@ -120,6 +292,24 @@ def main(argv):
     elif cmd == "count":
         rows = query(sock, "SELECT count(*), max(id) FROM docs")
         print("COUNT=%s MAXID=%s" % rows[0], flush=True)
+    elif cmd == "rsetup":
+        cmd_rsetup(sock)
+    elif cmd == "rseed":
+        cmd_rseed(sock, int(argv[5]))
+    elif cmd == "churn":
+        cmd_churn(sock, int(argv[5]), len(argv) > 6 and argv[6] == "extra")
+    elif cmd == "ddl":
+        cmd_ddl(sock, int(argv[5]))
+    elif cmd == "marker":
+        cmd_marker(sock, int(argv[5]))
+    elif cmd == "wait-marker":
+        return cmd_wait_marker(sock, int(argv[5]), float(argv[6]))
+    elif cmd == "fingerprint":
+        cmd_fingerprint(sock, argv[5:])
+    elif cmd == "sync-append":
+        return cmd_sync_append(sock, int(argv[5]))
+    elif cmd == "ids-present":
+        return cmd_ids_present(sock, argv[5], int(argv[6]), int(argv[7]))
     else:
         print("unknown subcommand", file=sys.stderr)
         return 2
