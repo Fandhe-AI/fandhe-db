@@ -297,9 +297,38 @@ fn is_setval_name(name: &str) -> bool {
 /// `CREATE MATERIALIZED VIEW ... WITH NO DATA` の形か。実体を作る `WITH DATA`（または句なし）は不可
 /// （`Pre` の段で本文を評価させない。再計算は `Post` の `REFRESH` 枠だけが行う）。
 fn is_create_matview_no_data(sql: &str) -> bool {
-    sql.starts_with("CREATE MATERIALIZED VIEW ")
+    // 末尾の `WITH NO DATA` をコメント（`-- WITH NO DATA` 等）で偽装できないよう、引用符の外に
+    // コメント開始記号があれば拒否する（engine の lexer はコメントを除去するため、実際は `WITH DATA`
+    // 既定となり `Pre` で本文が評価される）。ダンプの書き手は SQL を再描画し、コメントを出さない。
+    !has_comment_outside_quotes(sql)
+        && sql.starts_with("CREATE MATERIALIZED VIEW ")
         && sql.ends_with(" WITH NO DATA")
         && sql.len() > "CREATE MATERIALIZED VIEW  WITH NO DATA".len()
+}
+
+/// 単引用符の文字列・二重引用符の識別子の外に、行コメント `--` またはブロックコメント `/*` があるか。
+/// 引用符は閉じるまで読み飛ばす（`''` / `""` の連続は閉じて直ちに開き直す扱いで同じ結果になる）。
+fn has_comment_outside_quotes(sql: &str) -> bool {
+    let b = sql.as_bytes();
+    let mut i = 0;
+    let mut quote: Option<u8> = None;
+    while let Some(&c) = b.get(i) {
+        match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None;
+                }
+            }
+            None => match c {
+                b'\'' | b'"' => quote = Some(c),
+                b'-' if b.get(i + 1) == Some(&b'-') => return true,
+                b'/' if b.get(i + 1) == Some(&b'*') => return true,
+                _ => {}
+            },
+        }
+        i += 1;
+    }
+    false
 }
 
 /// `REFRESH MATERIALIZED VIEW <名前>` の厳密な形か。`CONCURRENTLY`・`WITH [NO] DATA`・複数名・後続の語は
@@ -733,6 +762,24 @@ mod tests {
         w.copy_row("\\\\.").expect("row");
         w.copy_end().expect("end");
         w.finish().expect("finish")
+    }
+
+    #[test]
+    fn matview_no_data_check_rejects_comment_disguise() {
+        assert!(is_create_matview_no_data(
+            "CREATE MATERIALIZED VIEW \"mv\" AS SELECT id FROM t WITH NO DATA"
+        ));
+        // 文字列・識別子内の `--` は許可する。
+        assert!(is_create_matview_no_data(
+            "CREATE MATERIALIZED VIEW \"mv\" AS SELECT '--x' FROM t WITH NO DATA"
+        ));
+        for sql in [
+            "CREATE MATERIALIZED VIEW \"mv\" AS SELECT id FROM t -- WITH NO DATA",
+            "CREATE MATERIALIZED VIEW \"mv\" AS SELECT id FROM t /* x */ WITH NO DATA",
+            "CREATE MATERIALIZED VIEW \"mv\" AS SELECT id FROM t --\n WITH NO DATA",
+        ] {
+            assert!(!is_create_matview_no_data(sql), "{sql}");
+        }
     }
 
     #[test]

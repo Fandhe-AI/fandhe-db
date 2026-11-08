@@ -140,20 +140,38 @@ pub(super) fn export_matview_refreshes<E>(
     let Some(tenant) = ctx.scope.tenant() else {
         return Ok(());
     };
-    for (key, kind) in view_like_order::<E>(ctx)? {
-        if !matches!(kind, ViewLike::Materialized(_)) {
-            continue;
-        }
-        if tenant_has_entity_in(ctx.rt, &key, tenant)? {
-            let sql = format!(
-                "REFRESH MATERIALIZED VIEW {}",
-                ctx.namer.qualified_required::<E>(&key)?
-            );
-            out.emit(
-                DdlSection::PostData,
-                DdlObjectKind::MaterializedViewRefresh,
-                &sql,
-            )?;
+    let (ordered, deps) = view_like_order_with_deps::<E>(ctx)?;
+    // 依存先まで含めた再計算可否の検査用。トポロジカル順に、実体を持たない matview か、
+    // そうしたものを（VIEW 経由を含め）読む定義を「未実体化に依存」として印を付ける。
+    // 実体を持つ matview がこの印を持つと、復元先の `REFRESH` が未実体化の relation を読んで
+    // 失敗する（55000）ため、復元不能なダンプを正常出力せず全体を失敗させる。
+    let mut tainted: BTreeSet<String> = BTreeSet::new();
+    for (key, kind) in &ordered {
+        let reads_tainted = deps
+            .get(key)
+            .is_some_and(|ds| ds.iter().any(|r| tainted.contains(r)));
+        if matches!(kind, ViewLike::Materialized(_)) {
+            if tenant_has_entity_in(ctx.rt, key, tenant)? {
+                if reads_tainted {
+                    return Err(unsupported(
+                        "materialized view",
+                        "populated materialized view depends on an unpopulated materialized view",
+                    ));
+                }
+                let sql = format!(
+                    "REFRESH MATERIALIZED VIEW {}",
+                    ctx.namer.qualified_required::<E>(key)?
+                );
+                out.emit(
+                    DdlSection::PostData,
+                    DdlObjectKind::MaterializedViewRefresh,
+                    &sql,
+                )?;
+            } else {
+                tainted.insert(key.clone());
+            }
+        } else if reads_tainted {
+            tainted.insert(key.clone());
         }
     }
     Ok(())
@@ -308,6 +326,15 @@ enum ViewLike {
 /// （VIEW が matview を、matview が VIEW・matview を読めるため 1 つの依存グラフで並べる）。
 /// 準備できたものは描画名の順に出す。導出できない本文・循環は全体を失敗させる。
 fn view_like_order<E>(ctx: &Ctx<'_>) -> Result<Vec<(String, ViewLike)>, SchemaDdlError<E>> {
+    view_like_order_with_deps::<E>(ctx).map(|(ordered, _)| ordered)
+}
+
+/// `view_like_order` の本体。並び順に加えて、各定義が読む relation の一覧（依存辺）も返す。
+/// matview の再計算可否の検査（`export_matview_refreshes`）が依存を辿るために使う。
+#[allow(clippy::type_complexity)]
+fn view_like_order_with_deps<E>(
+    ctx: &Ctx<'_>,
+) -> Result<(Vec<(String, ViewLike)>, BTreeMap<String, Vec<String>>), SchemaDdlError<E>> {
     let mut pending: BTreeMap<String, ViewLike> = BTreeMap::new();
     for (k, v) in read_str_table::<E>(ctx, VIEWS_TABLE)? {
         if in_scope(ctx, &k)? {
@@ -364,7 +391,7 @@ fn view_like_order<E>(ctx: &Ctx<'_>) -> Result<Vec<(String, ViewLike)>, SchemaDd
             }
         }
     }
-    Ok(ordered)
+    Ok((ordered, deps))
 }
 
 /// 範囲内の VIEW とマテリアライズド VIEW。読む relation を先に出す（トポロジカル順）。

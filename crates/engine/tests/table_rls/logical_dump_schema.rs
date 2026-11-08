@@ -587,6 +587,32 @@ fn other_tenants_materialized_view_state_does_not_affect_the_dump() {
         .any(|(_, s)| s == "REFRESH MATERIALIZED VIEW \"mv\""));
 }
 
+/// 実体を持つ matview が未実体化の matview に依存する状態は、復元先で `REFRESH` が
+/// 55000 になる復元不能なダンプになるため、ダンプ全体を失敗させる（Issue #3097）。
+#[test]
+fn populated_materialized_view_over_unpopulated_one_fails_the_dump() {
+    let p1 = unique_db_path("dump-matview-unpopulated-dep");
+    let _g1 = CleanupGuard(p1.clone());
+    let src = open_core(&p1);
+    for sql in [
+        "CREATE TABLE base (a INTEGER PRIMARY KEY)",
+        "INSERT INTO base (a) VALUES (1)",
+        "CREATE MATERIALIZED VIEW mv1 AS SELECT a FROM base",
+        "CREATE MATERIALIZED VIEW mv2 AS SELECT a FROM mv1",
+        "REFRESH MATERIALIZED VIEW mv1 WITH NO DATA",
+    ] {
+        ok(&src, "tenant-a", sql);
+    }
+    let err = src
+        .export_logical_dump(
+            &SchemaDdlScope::shared_and_tenant("tenant-a"),
+            engine::catalog::ddl_export::TableDataFormat::Insert,
+            |_| Ok::<(), std::convert::Infallible>(()),
+        )
+        .expect_err("unrestorable dump must fail");
+    assert!(matches!(err, SchemaDdlError::Unsupported(_)), "{err:?}");
+}
+
 #[test]
 fn output_order_does_not_depend_on_internal_schema_ids() {
     // SCHEMA を名前の逆順に作ると内部 ID が名前順と逆になる。復元先では名前順に ID が付き直されるため、
