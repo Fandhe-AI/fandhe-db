@@ -4311,6 +4311,33 @@ impl EngineCore {
         self.storage.archive_change_log(opts)
     }
 
+    /// ストリーミングレプリケーションの照合値（DB 識別子・timeline）。変更ログが無効なら `None`
+    /// （RECOVER-15・Issue #2173）。wire-server のレプリケーション送信側が呼ぶ。
+    pub fn change_log_stream_identity(&self) -> Option<crate::storage::StreamIdentity> {
+        self.storage.change_log_stream_identity()
+    }
+
+    /// `from_lsn` から連続した変更ログのレコードを上限つきで読む（RECOVER-15・Issue #2173）。
+    /// [`Storage::read_change_log_from`] へ委譲する。SQL・NoSQL の表層からは呼べない。
+    pub fn read_change_log_from(
+        &self,
+        from_lsn: u64,
+        max_records: usize,
+        max_bytes: usize,
+    ) -> std::result::Result<crate::storage::ChangeLogBatch, crate::storage::StreamError> {
+        self.storage
+            .read_change_log_from(from_lsn, max_records, max_bytes)
+    }
+
+    /// レプリカの保持位置を登録する（RECOVER-15・Issue #2173）。[`Storage::pin_change_log_for_replica`]
+    /// へ委譲する。
+    pub fn pin_change_log_for_replica(
+        &self,
+        applied_lsn: u64,
+    ) -> std::result::Result<crate::storage::ReplicaPin, crate::storage::StreamError> {
+        self.storage.pin_change_log_for_replica(applied_lsn)
+    }
+
     /// 結合ではなくモジュール内テストが登録簿などの内部状態へ届くための入口
     /// （Issue #1129 の同時実行数上限のテスト用。本番ビルドには含めない）。
     #[cfg(test)]

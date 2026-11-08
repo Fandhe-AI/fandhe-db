@@ -143,6 +143,9 @@ cargo run -p fandhe-db-wire-server -- --users <ユーザーストアのパス> -
   [--require-operation-id] \
   [--change-log] [--change-log-archive-dir <dir>] [--change-log-retain-records <n>] \
   [--change-log-archive-interval-secs <1-86400>] \
+  [--replication-bind <loopback addr>] [--replication-roles <file>] [--replication-allow <ip|cidr>]... \
+  [--replication-max-connections <1-256>] [--replication-max-unacked-bytes <1024-4294967296>] \
+  [--replication-ack-timeout-secs <1-3600>] [--replication-max-lag-records <1-1000000000>] \
   [--require-where-for-dml] \
   [--max-dml-affected-rows <1-1000000>] [--max-insert-rows <1-1000000>] \
   [--batch-max-files <1-1000000>] \
@@ -478,6 +481,27 @@ redb トランザクションで DB 内の `change_log` 表へ追記されます
   別 DB・別 timeline は何も公開せず終了コード 1、引数の不備は DB を開く前に終了コード 2 です。
 - 復元した DB は元と同じ DB 識別子・timeline のまま LSN が巻き戻るため、元のアーカイブ先とは別のアーカイブ先で
   運用してください（timeline の分岐は #2446 が前提）。
+
+**レプリケーション送信側**（Issue #2173。RECOVER-15・WIRE-9 ポインタ。判断は [docs/design/replication-streaming.md](docs/design/replication-streaming.md) の「実装判断（Issue #2173）」）:
+
+- `--replication-bind <addr>` で、テナント向けの `--bind` とは別のポートに専用のリスナーを作り、承認済みのレプリカへ変更ログの
+  レコードを commit 番号順に送ります（非同期。レプリカの切断・遅延・停止はプライマリの書き込みを止めません）。**ループバック
+  だけ**を受け付け、非ループバックは起動エラーです（TLS は #2177。それまで平文を外へ晒しません）。`--change-log` が前提です。
+- 認証は専用のロール（`--replication-roles <file>`。`name:phc` の行。PHC は `wire-server hash-password` で作る）で行い、
+  `--users` のテナントのロールでは接続できません。送信元は `--replication-allow <ip|cidr>`（繰り返し可・1 件以上が必須）で
+  許可したものだけで、許可外には何も返さず閉じます。
+- 受信側の確認応答（ack）で送信位置を管理し、確認応答前の区間は `--change-log-retain-records` による刈り込みから守ります。
+  刈り込み済みの位置からの開始は拒否します（再同期は #2176）。
+- 上限: `--replication-max-connections`（既定 8）、`--replication-max-unacked-bytes`（既定 64 MiB。送信済みで未確認の量）、
+  `--replication-ack-timeout-secs`（既定 30。最も古い未確認レコードが送信から ack されないまま経過したレプリカだけを切る。
+  読み取りが遅く書き込みが塞がるレプリカも同じ期限で切る）、`--replication-max-lag-records`（既定 100000。確認応答済みの位置から
+  プライマリの最新までの遅れ。超えたレプリカは切断され保持位置が外れる）。不正値は DB を開く前に起動エラーです。
+- 切断されたレプリカが再接続したとき、開始位置が刈り込み済み、または遅れの上限を超える位置なら `RESYNC_REQUIRED` で拒否されます
+  （期待どおりの挙動。再同期は #2176）。認証に失敗し続ける送信元は、バックオフの間（最大 60 秒）何も返されずに閉じられます。
+- **注意**: リスナーはループバック限定ですが、port-forward やプロキシで外へ出すと資格情報とレコードが平文で流れます。外へ出す構成は
+  TLS が入る（#2177）まで使わないでください。`--replication-roles` は `--users` とは別のファイルを使ってください（形式が異なり、
+  互いのファイルでは起動できません）。
+- 受信側の適用ループ（#2174）・読み取りレプリカ（#2175）・同期モード（#2245）は未対応です。
 
 **論理ダンプ**（Issue #2162。RECOVER-16 ポインタ。形式と判断は [docs/design/logical-dump.md](docs/design/logical-dump.md) の §12、手順は [backup-restore-operations.md](docs/design/backup-restore-operations.md) の 4.6）:
 
