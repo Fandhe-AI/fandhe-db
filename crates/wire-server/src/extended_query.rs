@@ -2573,6 +2573,13 @@ fn execute_portal<'e, S: WireStream>(
             engine.execute_parsed_in_txn(ctx, session, txn, &parsed)
         });
         let pending_notices = notices.finish();
+        // 同期レプリケーション（Issue #2245）: commit した LSN の確認を、応答を書く前に待つ。取れなければ
+        // commit 済みの応答を `may_be_committed` のエラー（`PostCommit`）へ差し替える。
+        if crate::sync_commit_wait::await_sync_commit(engine, || false).is_err() {
+            return Err(HandlerError::PostCommit(Box::new(internal_error(
+                crate::sync_commit_wait::NOT_CONFIRMED_MESSAGE,
+            ))));
+        }
         if let Err(e) = crate::error_response::write_notices(stream, &pending_notices) {
             let err = io_to_handler(e);
             return Err(if is_write_statement && outcome.is_ok() {

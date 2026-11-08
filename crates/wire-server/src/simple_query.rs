@@ -691,6 +691,13 @@ fn run_statement_as<'e, S: WireStream>(
         }),
     };
     let pending_notices = notices.finish();
+    // 同期レプリケーション（Issue #2245）: この文が commit した LSN の確認を、応答を 1 バイトも書く前に待つ
+    // （書き込みゲートの permit は engine から戻った時点で解放済み）。確認が取れなければ、commit 済みの成功
+    // 応答を `state=may_be_committed` のエラーへ差し替える。
+    if crate::sync_commit_wait::await_sync_commit(engine, || false).is_err() {
+        crate::sync_commit_wait::write_not_confirmed(stream)?;
+        return Ok(StatementStatus::Failed);
+    }
     crate::error_response::write_notices(stream, &pending_notices)?;
 
     match outcome {

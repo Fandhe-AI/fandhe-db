@@ -215,6 +215,10 @@ impl Router {
 }
 
 impl RequestHandler for Router {
+    fn engine_core(&self) -> Option<&EngineCore> {
+        self.engine.as_deref()
+    }
+
     fn handle(&self, req: &Request<'_>) -> Vec<u8> {
         let route = resolve_target(req.line.target);
         // `(method, route)` の網羅 match。`Get` は要求行パーサが

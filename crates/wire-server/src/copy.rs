@@ -1067,6 +1067,11 @@ fn finish_copy_from<'e, S: WireStream>(
             })
     };
 
+    // 同期レプリケーション（Issue #2245）: COPY FROM の commit の確認を、`CommandComplete` を書く前に待つ。
+    if crate::sync_commit_wait::await_sync_commit(engine, || false).is_err() {
+        crate::sync_commit_wait::write_not_confirmed(stream)?;
+        return Ok(CopyStep::Failed);
+    }
     match outcome {
         Ok(insert_outcome) => {
             let tag = format!("COPY {}", insert_outcome.rows_affected);
@@ -1167,6 +1172,12 @@ pub(crate) fn run<'e, S: WireStream>(
                 Ok(Ok(plan))
             })
     };
+    // 同期レプリケーション（Issue #2245）: 暗黙トランザクションの最後の COPY TO の commit の確認を、
+    // CopyOutResponse を書く前に待つ。取れなければ `may_be_committed` のエラーを返す。
+    if crate::sync_commit_wait::await_sync_commit(engine, || false).is_err() {
+        crate::sync_commit_wait::write_not_confirmed(stream)?;
+        return Ok(CopyStep::Failed);
+    }
     let plan = match plan {
         Ok(Ok(plan)) => Ok(plan),
         // 応答開始前の拒否。commit しておらず、`respond_error_and_ready` が暗黙トランザクションを破棄する。

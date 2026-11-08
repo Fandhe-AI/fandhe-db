@@ -15,6 +15,14 @@
 //! - `--replication-max-unacked-bytes <n>`: 送信済みで未確認の量の上限（バックプレッシャ）
 //! - `--replication-ack-timeout-secs <n>`: 上限に達したまま確認応答が進まない場合に切断するまでの秒数
 //!
+//! - `--replication-sync-standby <role>`（Issue #2245・繰り返し可）: 同期レプリケーション（オプション）の対象に
+//!   するレプリケーションのロール。指定すると、commit の成功応答を返す前に、指定した全ロールのレプリカの
+//!   確認を待つ（指定しなければ非同期のまま）。ロールは `--replication-roles` に存在すること
+//! - `--replication-sync-commit <remote_write|on|remote_apply>`: 待つ確認の段階（既定 `on`。実装既定値）
+//! - `--replication-sync-timeout-secs <n>`: 確認待ちの上限（既定は無期限。実装既定値）
+//! - `--replication-sync-on-timeout <degrade|reject>`: 上限超過時の扱い（`--replication-sync-timeout-secs` を
+//!   指定したときは必須。指定しなければ指定できない）
+//!
 //! 重複指定・不正値・組み合わせの不備は起動拒否で、エラー文は固定の英語（パス・値・資格情報を含まない）。
 //! すべて `--change-log` が前提（変更ログが送信元）。
 
@@ -42,8 +50,17 @@ pub const ACK_TIMEOUT_FLAG: &str = "--replication-ack-timeout-secs";
 /// 確認応答済みの位置からの遅れ（レコード数）の上限のフラグ名。
 pub const MAX_LAG_FLAG: &str = "--replication-max-lag-records";
 
+/// 同期レプリケーションの対象ロールのフラグ名（繰り返し可）。
+pub const SYNC_STANDBY_FLAG: &str = "--replication-sync-standby";
+/// 同期レプリケーションの確認の段階のフラグ名。
+pub const SYNC_COMMIT_FLAG: &str = "--replication-sync-commit";
+/// 同期レプリケーションの待機上限のフラグ名。
+pub const SYNC_TIMEOUT_FLAG: &str = "--replication-sync-timeout-secs";
+/// 同期レプリケーションの上限超過時の扱いのフラグ名。
+pub const SYNC_ON_TIMEOUT_FLAG: &str = "--replication-sync-on-timeout";
+
 /// すべての `--replication-*` フラグ名（`main.rs` の引数ループが 1 本の分岐で受けるための一覧）。
-pub const ALL_FLAGS: [&str; 7] = [
+pub const ALL_FLAGS: [&str; 11] = [
     BIND_FLAG,
     ROLES_FLAG,
     ALLOW_FLAG,
@@ -51,6 +68,10 @@ pub const ALL_FLAGS: [&str; 7] = [
     MAX_UNACKED_FLAG,
     ACK_TIMEOUT_FLAG,
     MAX_LAG_FLAG,
+    SYNC_STANDBY_FLAG,
+    SYNC_COMMIT_FLAG,
+    SYNC_TIMEOUT_FLAG,
+    SYNC_ON_TIMEOUT_FLAG,
 ];
 
 /// 同時接続数の既定・上限（実装既定値）。
@@ -66,11 +87,13 @@ pub const MAX_MAX_LAG_RECORDS: u64 = 1_000_000_000;
 /// 確認応答の待機上限の既定・上限（秒。実装既定値）。
 pub const DEFAULT_ACK_TIMEOUT_SECS: u64 = 30;
 pub const MAX_ACK_TIMEOUT_SECS: u64 = 3600;
+/// 同期レプリケーションの待機上限の上限（秒。実装既定値）。
+pub const MAX_SYNC_TIMEOUT_SECS: u64 = 86_400;
 
 /// 資格情報ファイルの最大バイト数と、ロール名の最大長・ロール数（untrusted なファイル向けの資源上限）。
 const MAX_ROLES_FILE_BYTES: u64 = 64 * 1024;
 pub const MAX_ROLE_NAME_LEN: usize = 64;
-const MAX_ROLES: usize = 256;
+pub const MAX_ROLES: usize = 256;
 /// 許可リストの最大件数。
 const MAX_ALLOW_ENTRIES: usize = 256;
 
@@ -81,6 +104,14 @@ pub const NEEDS_BIND_MESSAGE: &str =
 pub const NEEDS_ROLES_MESSAGE: &str = "--replication-bind requires --replication-roles";
 pub const NEEDS_ALLOW_MESSAGE: &str =
     "--replication-bind requires at least one --replication-allow";
+pub const NEEDS_SYNC_STANDBY_MESSAGE: &str =
+    "--replication-sync-commit, --replication-sync-timeout-secs and --replication-sync-on-timeout require --replication-sync-standby";
+pub const UNKNOWN_SYNC_STANDBY_MESSAGE: &str =
+    "--replication-sync-standby must name a role defined in --replication-roles";
+pub const SYNC_ON_TIMEOUT_REQUIRED_MESSAGE: &str =
+    "--replication-sync-timeout-secs requires --replication-sync-on-timeout (degrade or reject)";
+pub const SYNC_ON_TIMEOUT_NEEDS_TIMEOUT_MESSAGE: &str =
+    "--replication-sync-on-timeout requires --replication-sync-timeout-secs";
 pub const LOOPBACK_ONLY_MESSAGE: &str =
     "--replication-bind must be a loopback address (TLS for the replication endpoint is not available yet)";
 
@@ -157,6 +188,11 @@ impl ReplicationRoles {
         self.roles.get(role).map(String::as_str)
     }
 
+    /// ロールが定義されているか（同期レプリケーションの対象ロールの存在検査に使う）。
+    pub fn contains(&self, role: &str) -> bool {
+        self.roles.contains_key(role)
+    }
+
     /// ロール名として許される文字列か（`[A-Za-z0-9._-]`、1〜[`MAX_ROLE_NAME_LEN`] 文字）。
     pub fn valid_name(name: &str) -> bool {
         !name.is_empty()
@@ -225,6 +261,8 @@ pub struct ReplicationSettings {
     pub ack_timeout: Duration,
     /// 確認応答済みの位置からの遅れ（レコード数）の上限。超えたレプリカは切断され、保持位置が外れる。
     pub max_lag_records: u64,
+    /// 同期レプリケーションの設定（`--replication-sync-standby` 指定時だけ。`None` は非同期のまま）。
+    pub sync: Option<engine::storage::SyncCommitConfig>,
 }
 
 /// `--replication-*` の受け取り中の値。`main.rs` の引数ループが [`Self::accept`] を呼び、全引数の後に
@@ -238,6 +276,10 @@ pub struct ReplicationArgs {
     max_unacked: Option<String>,
     ack_timeout: Option<String>,
     max_lag: Option<String>,
+    sync_standby: Vec<String>,
+    sync_commit: Option<String>,
+    sync_timeout: Option<String>,
+    sync_on_timeout: Option<String>,
 }
 
 fn duplicate(flag: &str) -> String {
@@ -262,6 +304,10 @@ impl ReplicationArgs {
             || self.max_unacked.is_some()
             || self.ack_timeout.is_some()
             || self.max_lag.is_some()
+            || !self.sync_standby.is_empty()
+            || self.sync_commit.is_some()
+            || self.sync_timeout.is_some()
+            || self.sync_on_timeout.is_some()
     }
 
     /// フラグ 1 つ分を記録する。重複指定（`--replication-allow` を除く）・空の値は拒否する。
@@ -307,6 +353,27 @@ impl ReplicationArgs {
             MAX_LAG_FLAG => {
                 slot_taken(self.max_lag.is_some())?;
                 self.max_lag = Some(value.to_string());
+            }
+            SYNC_STANDBY_FLAG => {
+                if self.sync_standby.len() >= MAX_ROLES {
+                    return Err(format!("{SYNC_STANDBY_FLAG} has too many entries"));
+                }
+                if self.sync_standby.iter().any(|r| r == value) {
+                    return Err(format!("{SYNC_STANDBY_FLAG} repeats a role"));
+                }
+                self.sync_standby.push(value.to_string());
+            }
+            SYNC_COMMIT_FLAG => {
+                slot_taken(self.sync_commit.is_some())?;
+                self.sync_commit = Some(value.to_string());
+            }
+            SYNC_TIMEOUT_FLAG => {
+                slot_taken(self.sync_timeout.is_some())?;
+                self.sync_timeout = Some(value.to_string());
+            }
+            SYNC_ON_TIMEOUT_FLAG => {
+                slot_taken(self.sync_on_timeout.is_some())?;
+                self.sync_on_timeout = Some(value.to_string());
             }
             _ => return Err("unknown replication flag".to_string()),
         }
@@ -384,6 +451,13 @@ impl ReplicationArgs {
             _ => return Err(format!("{BIND_FLAG} must resolve to exactly one address")),
         };
         let roles = ReplicationRoles::load(&roles_path)?;
+        let sync = Self::resolve_sync(
+            &roles,
+            self.sync_standby,
+            self.sync_commit.as_deref(),
+            self.sync_timeout.as_deref(),
+            self.sync_on_timeout.as_deref(),
+        )?;
         Ok(Some(ReplicationSettings {
             bind,
             roles,
@@ -392,6 +466,64 @@ impl ReplicationArgs {
             max_unacked_bytes,
             ack_timeout: Duration::from_secs(ack_secs),
             max_lag_records,
+            sync,
+        }))
+    }
+
+    /// 同期レプリケーションの 4 フラグを検証する（`--replication-sync-standby` が無ければ他は指定できない）。
+    fn resolve_sync(
+        roles: &ReplicationRoles,
+        standbys: Vec<String>,
+        commit: Option<&str>,
+        timeout: Option<&str>,
+        on_timeout: Option<&str>,
+    ) -> Result<Option<engine::storage::SyncCommitConfig>, String> {
+        use engine::storage::{SyncCommitConfig, SyncCommitStage, SyncTimeoutAction};
+        if standbys.is_empty() {
+            if commit.is_some() || timeout.is_some() || on_timeout.is_some() {
+                return Err(NEEDS_SYNC_STANDBY_MESSAGE.to_string());
+            }
+            return Ok(None);
+        }
+        if standbys.iter().any(|r| !roles.contains(r)) {
+            return Err(UNKNOWN_SYNC_STANDBY_MESSAGE.to_string());
+        }
+        let stage = match commit {
+            None | Some("on") => SyncCommitStage::On,
+            Some("remote_write") => SyncCommitStage::RemoteWrite,
+            Some("remote_apply") => SyncCommitStage::RemoteApply,
+            Some(_) => {
+                return Err(format!(
+                    "{SYNC_COMMIT_FLAG} must be remote_write, on or remote_apply"
+                ))
+            }
+        };
+        let timeout = match timeout {
+            None => None,
+            Some(raw) => {
+                let n = parse_digits(SYNC_TIMEOUT_FLAG, raw)?;
+                if !(1..=MAX_SYNC_TIMEOUT_SECS).contains(&n) {
+                    return Err(format!("{SYNC_TIMEOUT_FLAG} is out of range"));
+                }
+                Some(Duration::from_secs(n))
+            }
+        };
+        let on_timeout = match (timeout.is_some(), on_timeout) {
+            (true, None) => return Err(SYNC_ON_TIMEOUT_REQUIRED_MESSAGE.to_string()),
+            (false, Some(_)) => return Err(SYNC_ON_TIMEOUT_NEEDS_TIMEOUT_MESSAGE.to_string()),
+            // 上限が無ければ使われない値。
+            (false, None) => SyncTimeoutAction::Reject,
+            (true, Some("degrade")) => SyncTimeoutAction::Degrade,
+            (true, Some("reject")) => SyncTimeoutAction::Reject,
+            (true, Some(_)) => {
+                return Err(format!("{SYNC_ON_TIMEOUT_FLAG} must be degrade or reject"))
+            }
+        };
+        Ok(Some(SyncCommitConfig {
+            standbys,
+            stage,
+            timeout,
+            on_timeout,
         }))
     }
 }
@@ -484,5 +616,101 @@ mod tests {
             a.resolve(true).expect_err("loopback"),
             LOOPBACK_ONLY_MESSAGE
         );
+    }
+
+    fn roles_of(names: &[&str]) -> ReplicationRoles {
+        ReplicationRoles {
+            roles: names
+                .iter()
+                .map(|n| ((*n).to_string(), String::new()))
+                .collect(),
+        }
+    }
+
+    fn sync(
+        standbys: &[&str],
+        commit: Option<&str>,
+        timeout: Option<&str>,
+        on_timeout: Option<&str>,
+    ) -> Result<Option<engine::storage::SyncCommitConfig>, String> {
+        ReplicationArgs::resolve_sync(
+            &roles_of(&["r1", "r2"]),
+            standbys.iter().map(|s| (*s).to_string()).collect(),
+            commit,
+            timeout,
+            on_timeout,
+        )
+    }
+
+    #[test]
+    fn sync_flags_default_to_async_and_accept_valid_combinations() {
+        use engine::storage::{SyncCommitStage, SyncTimeoutAction};
+        assert!(sync(&[], None, None, None).expect("off").is_none());
+        let c = sync(&["r1"], None, None, None).expect("ok").expect("on");
+        assert_eq!(c.stage, SyncCommitStage::On);
+        assert!(c.timeout.is_none());
+        let c = sync(
+            &["r1", "r2"],
+            Some("remote_write"),
+            Some("5"),
+            Some("degrade"),
+        )
+        .expect("ok")
+        .expect("on");
+        assert_eq!(c.stage, SyncCommitStage::RemoteWrite);
+        assert_eq!(c.timeout, Some(Duration::from_secs(5)));
+        assert_eq!(c.on_timeout, SyncTimeoutAction::Degrade);
+        let c = sync(&["r1"], Some("remote_apply"), Some("1"), Some("reject"))
+            .expect("ok")
+            .expect("on");
+        assert_eq!(c.stage, SyncCommitStage::RemoteApply);
+    }
+
+    #[test]
+    fn sync_flags_reject_invalid_combinations() {
+        assert_eq!(
+            sync(&[], Some("on"), None, None).expect_err("needs standby"),
+            NEEDS_SYNC_STANDBY_MESSAGE
+        );
+        assert_eq!(
+            sync(&[], None, Some("5"), Some("reject")).expect_err("needs standby"),
+            NEEDS_SYNC_STANDBY_MESSAGE
+        );
+        assert_eq!(
+            sync(&["nope"], None, None, None).expect_err("unknown role"),
+            UNKNOWN_SYNC_STANDBY_MESSAGE
+        );
+        assert!(sync(&["r1"], Some("local"), None, None).is_err());
+        assert_eq!(
+            sync(&["r1"], None, Some("5"), None).expect_err("on-timeout required"),
+            SYNC_ON_TIMEOUT_REQUIRED_MESSAGE
+        );
+        assert_eq!(
+            sync(&["r1"], None, None, Some("reject")).expect_err("needs timeout"),
+            SYNC_ON_TIMEOUT_NEEDS_TIMEOUT_MESSAGE
+        );
+        assert!(sync(&["r1"], None, Some("5"), Some("ignore")).is_err());
+        for bad in ["0", "86401", "-1", "x", ""] {
+            assert!(
+                sync(&["r1"], None, Some(bad), Some("reject")).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn sync_flag_duplicates_are_rejected_and_set_implies_replication() {
+        let mut a = ReplicationArgs::default();
+        a.accept(SYNC_STANDBY_FLAG, "r1").expect("first");
+        assert!(
+            a.accept(SYNC_STANDBY_FLAG, "r1").is_err(),
+            "same role twice"
+        );
+        a.accept(SYNC_STANDBY_FLAG, "r2").expect("second role");
+        a.accept(SYNC_COMMIT_FLAG, "on").expect("commit");
+        assert!(a.accept(SYNC_COMMIT_FLAG, "on").is_err());
+        assert!(a.is_set());
+        // bind が無ければ従属フラグとして拒否される。
+        assert_eq!(a.resolve(true).expect_err("needs bind"), NEEDS_BIND_MESSAGE);
     }
 }

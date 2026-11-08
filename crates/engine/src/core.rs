@@ -1428,6 +1428,10 @@ pub struct EngineCore {
     /// [`Self::with_ledger_mode`] のみ。`crate::recovery::required_op_id` モジュール
     /// ドキュメント参照）。
     ledger_mode: LedgerMode,
+    /// 同期レプリケーション（オプション。Issue #2245・RECOVER-15 ポインタ）の確認待ちの調停役。
+    /// `None`（既定）は非同期のまま。差し替えは [`Self::with_sync_commit`] のみで、セッション・SQL・HTTP
+    /// からは到達できない（テナントが保証を弱める経路を作らない）。
+    sync_commit: Option<std::sync::Arc<crate::storage::SyncCommitCoordinator>>,
     /// BEFORE ROW INSERT トリガの呼び出し口を保持する通過証（TABLE-45・Issue #1723）。発火に対応した
     /// INSERT 経路（SQL の `INSERT ... VALUES`・`INSERT ... SELECT`）だけが `tenant` へ渡す。既定は
     /// 未結線（トリガ関数の実行は `0A000`）で、本番の結線は Issue #1720（内部 API は #2228）。入れ子の深さ上限
@@ -3422,6 +3426,7 @@ impl EngineCore {
             query_planner: None,
             incremental_config: crate::incremental::IncrementalConfig::default(),
             ledger_mode: LedgerMode::default(),
+            sync_commit: None,
             trigger_runtime: crate::trigger::TriggerRuntime::unwired(),
             require_where_for_dml: false,
             batch_limits: crate::batch_limits::BatchLimits::default(),
@@ -3696,6 +3701,20 @@ impl EngineCore {
     pub fn with_ledger_mode(mut self, mode: LedgerMode) -> Self {
         self.ledger_mode = mode;
         self
+    }
+
+    /// 同期レプリケーションの調停役を注入するビルダー（`wire-server` が起動時に 1 回だけ呼ぶ。Issue #2245）。
+    pub fn with_sync_commit(
+        mut self,
+        coordinator: std::sync::Arc<crate::storage::SyncCommitCoordinator>,
+    ) -> Self {
+        self.sync_commit = Some(coordinator);
+        self
+    }
+
+    /// 同期レプリケーションの調停役（無効なら `None`）。wire-server の応答境界と送信側が参照する。
+    pub fn sync_commit(&self) -> Option<&std::sync::Arc<crate::storage::SyncCommitCoordinator>> {
+        self.sync_commit.as_ref()
     }
 
     /// テスト専用: トリガ関数の呼び出し口を差し替える（本番の invoker 結線〔#1720〕が未整備のため、

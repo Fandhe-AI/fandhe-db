@@ -57,6 +57,10 @@ pub use change_log::replica_apply::{ReplicaApplyError, ReplicaApplyReport, MAX_A
 pub use change_log::stream::{
     ChangeLogBatch, ReplicaPin, StreamError, StreamIdentity, MAX_RECORD_BYTES,
 };
+pub use change_log::sync_commit::{
+    AttachError, StandbyHandle, SyncCommitConfig, SyncCommitCoordinator, SyncCommitStage,
+    SyncTimeoutAction, SyncWaitOutcome,
+};
 pub use integrity::{
     FindingKind, IntegrityError, IntegrityFinding, IntegrityOptions, IntegrityReport, Severity,
 };
@@ -663,6 +667,9 @@ pub(crate) fn bump_generation_and_commit(write_txn: impl CommitTxn) -> Result<()
     // commit 成功後・permit 解放前に commit 記録へ追記する（1a-5 の順序不変条件）。
     if let Some(s) = session.as_ref() {
         s.finish(g_c, record);
+    }
+    if capture.is_some() {
+        crate::recovery::commit_boundary::record_pending_sync_lsn(g_c);
     }
     Ok(())
 }

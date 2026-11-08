@@ -92,13 +92,13 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // `catalog/*.rs` の各エントリも同じ理由で移動している）。
     // Issue #3069（`change_log_on_disk`・連続性検査・保留した移行の追加）で行番号が移動したための追随。
     // Issue #2167（アーカイブ・保持の公開 API と `begin_maintenance_txn` の追加。+44 行）で追随（旧: 1348／1382）。
-    ("storage.rs", 1442), // Issue #2174（begin_replica_apply_txn 等。+22 行）で追随（旧: 1420／1454）
-    ("storage.rs", 1476),
+    ("storage.rs", 1449), // Issue #2245（+7 行）で追随（旧: 1442。#2174 で 1420／1454 から追随）
+    ("storage.rs", 1483),
     // Issue #3067: `Storage::enable_change_log` が DB 識別子の永続化に使う保守 commit
     // （`commit_boundary::commit_maintenance`）。書き込むのは `change_log_meta` 表だけで、`CATALOG_TABLE`・
     // `user_rows` には触れず、世代も進めない（バンプ対象の表が構造的に存在しない）。
     // Issue #2174（`begin_replica_apply_txn` の追加。+1 行）で追随（旧: 1199）。
-    ("storage.rs", 1200),
+    ("storage.rs", 1207),
     // Issue #3067: `storage/change_log.rs` のテスト内の commit 入口（`commit_result`・`commit_maint`）。
     // 変更ログの `change_log` 表・メタ表と任意の試験用 redb 表だけを書くテスト fixture で、
     // `user_rows/{table_name}` を経由しないため対象外。
@@ -116,8 +116,8 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // 独自にバンプするとプライマリとの世代が食い違うため、ここでは呼ばない（`user_rows/{table}` の変更は
     // 必ず同じレコードの世代更新を伴う。伴わない場合の検出はプライマリ側の本テストが担う）。
     ("storage/change_log/replica_apply.rs", 214),
-    ("storage/change_log.rs", 1582), // Issue #2174 の mod 宣言追加で追随（旧: 1580）
-    ("storage/change_log.rs", 1590),
+    ("storage/change_log.rs", 1584), // Issue #2245 の mod 宣言追加で追随（旧: 1582。#2174 で 1580 から追随）
+    ("storage/change_log.rs", 1592),
     ("recovery/panic_hook.rs", 404),
     ("txn.rs", 211),
     ("txn.rs", 388),
