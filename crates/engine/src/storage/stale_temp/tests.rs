@@ -11,10 +11,6 @@ fn is_name(n: &str) -> bool {
         .is_some_and(|r| is_decimal(r, 10))
 }
 
-fn probe(i: u64) -> String {
-    format!(".t-9{}{i}.tmp", std::process::id())
-}
-
 fn tdir(tag: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("stale-temp-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
@@ -30,7 +26,7 @@ fn put(dir: &Path, name: &str, mode: u32) {
 }
 
 fn sweep(dir: &Path) -> StaleTempSweep {
-    sweep_stale_temps(dir, is_name, &probe).expect("sweep")
+    sweep_stale_temps(dir, is_name).expect("sweep")
 }
 
 #[test]
@@ -128,7 +124,7 @@ fn empty_directory_and_missing_directory() {
     let s = sweep(&d);
     assert_eq!((s.outcome, s.removed), (SweepOutcome::Swept, 0));
     let _ = std::fs::remove_dir_all(&d);
-    assert!(sweep_stale_temps(&d, is_name, &probe).is_err());
+    assert!(sweep_stale_temps(&d, is_name).is_err());
 }
 
 #[test]
@@ -149,4 +145,42 @@ fn name_helpers_are_strict() {
     assert!(is_decimal("123", 3) && !is_decimal("1234", 3) && !is_decimal("", 3));
     assert!(!is_decimal("-1", 3) && !is_decimal("１", 3));
     assert!(is_lower_hex("0a9f", 4) && !is_lower_hex("0A9f", 4) && !is_lower_hex("0a9", 4));
+}
+
+/// 異常終了で残った uid 確認用ファイル（probe 形式）は、呼び出し側の一時名の判定に一致しなくても
+/// 次の掃除が一時名と同じ安全条件で回収する。
+#[test]
+fn leftover_probe_files_are_reclaimed_but_unsafe_ones_are_kept() {
+    let d = tdir("probe");
+    put(&d, ".fandhe-sweep-probe-4242-0123456789abcdef-0.tmp", 0o600);
+    put(&d, ".fandhe-sweep-probe-4242-0123456789abcdef-1.tmp", 0o644);
+    put(&d, ".fandhe-sweep-probe-bad.tmp", 0o600);
+    let s = sweep(&d);
+    assert_eq!((s.removed, s.skipped), (1, 1));
+    assert!(d
+        .join(".fandhe-sweep-probe-4242-0123456789abcdef-1.tmp")
+        .exists());
+    assert!(d.join(".fandhe-sweep-probe-bad.tmp").exists());
+}
+
+/// 予約名の判定は復元・アーカイブ・probe の各形式に一致し、近い別名には一致しない。
+#[test]
+fn reserved_temp_name_covers_every_swept_format() {
+    for n in [
+        ".fandhe-restore-4242-7.tmp",
+        ".fandhe-restore-4242-0123456789abcdef-7.tmp",
+        ".fandhe-seg-4242-0123456789abcdef-7.tmp",
+        ".fandhe-sweep-probe-4242-0123456789abcdef-0.tmp",
+    ] {
+        assert!(is_reserved_temp_name(n), "{n}");
+    }
+    for n in [
+        "backup.redb",
+        ".fandhe-restore-decoy.tmp",
+        ".fandhe-restore-4242-7.tmp.bak",
+        ".fandhe-seg-4242-7.tmp",
+        ".fandhe-verify-4242-0123456789abcdef-7.tmp",
+    ] {
+        assert!(!is_reserved_temp_name(n), "{n}");
+    }
 }

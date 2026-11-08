@@ -288,7 +288,9 @@ count_tmp() {
   find "$1" -maxdepth 1 -name "$2" | wc -l
 }
 
-# ディレクトリ直下の restore の一時名（厳密な形式。decoy は数えない）の個数。
+# ディレクトリ直下の restore の一時名（厳密な形式。decoy は数えない）の個数。掃除が自分の uid を確かめるために
+# 作る確認用ファイル（`.fandhe-sweep-probe-*`）は別の形式で、この正規表現に一致しない。掃除の最中の SIGKILL で
+# 確認用ファイルが残っても「残骸の件数」に混ざらず、次の掃除が回収する（Issue #3094 のレビュー指摘への対応）。
 count_restore_tmp() {
   find "$1" -maxdepth 1 -type f -regextype posix-extended \
     -regex '.*/\.fandhe-restore-[0-9]+(-[0-9a-f]{16})?-[0-9]+\.tmp' | wc -l

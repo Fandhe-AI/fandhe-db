@@ -86,6 +86,75 @@ pub fn is_lower_hex(s: &str, len: usize) -> bool {
     s.len() == len && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
+/// 復元（`restore`）の一時名 `.fandhe-restore-<pid>-<seq>.tmp`（旧形式）または
+/// `.fandhe-restore-<pid>-<nonce 16桁小文字hex>-<seq>.tmp` の厳密な判定。wire-server の `restore_opt`
+/// （一時名の生成・掃除）と [`is_reserved_temp_name`] が使う単一の真実源。名前は untrusted として
+/// 添字を使わずに解析する。
+pub fn is_restore_temp_name(name: &str) -> bool {
+    let Some(rest) = name
+        .strip_prefix(".fandhe-restore-")
+        .and_then(|r| r.strip_suffix(".tmp"))
+    else {
+        return false;
+    };
+    let mut parts = rest.split('-');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(pid), Some(seq), None, None) => is_decimal(pid, 10) && is_decimal(seq, 20),
+        (Some(pid), Some(nonce), Some(seq), None) => {
+            is_decimal(pid, 10) && is_lower_hex(nonce, 16) && is_decimal(seq, 20)
+        }
+        _ => false,
+    }
+}
+
+/// 掃除の uid 確認用ファイルの名前の接頭辞。復元・アーカイブの一時名とは別の形式にして、
+/// 呼び出し側の「一時名の残骸」の数え方と混ざらないようにする（掃除自身は [`is_probe_name`] で回収する）。
+const PROBE_PREFIX: &str = ".fandhe-sweep-probe-";
+
+/// 掃除の uid 確認用ファイルの名前 `.fandhe-sweep-probe-<pid>-<nonce 16桁hex>-<試行番号>.tmp` を作る。
+#[cfg(unix)]
+fn make_probe_name(attempt: u64) -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u128(nanos);
+    h.write_u64(attempt);
+    format!(
+        "{PROBE_PREFIX}{}-{:016x}-{attempt}.tmp",
+        std::process::id(),
+        h.finish()
+    )
+}
+
+/// `name` が掃除の uid 確認用ファイルの厳密な形式か。確認用ファイルは作成後すぐ消すが、その間に
+/// 異常終了すると残るため、掃除は一時名と同じ安全条件で回収する。
+fn is_probe_name(name: &str) -> bool {
+    let Some(rest) = name
+        .strip_prefix(PROBE_PREFIX)
+        .and_then(|r| r.strip_suffix(".tmp"))
+    else {
+        return false;
+    };
+    let mut parts = rest.split('-');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(pid), Some(nonce), Some(attempt), None) => {
+            is_decimal(pid, 10) && is_lower_hex(nonce, 16) && is_decimal(attempt, 20)
+        }
+        _ => false,
+    }
+}
+
+/// `name` が掃除の対象になりうる予約名（復元の一時名・アーカイブの一時名・掃除の確認用ファイル）の形式か。
+/// 永続ファイル（`restore --db`・`backup --out` 等の出力先）がこの形式だと、同じ親ディレクトリでの
+/// 掃除に完成済みのファイルが消されうるため、wire-server の出力先の検証がこの判定で拒否する（fail-closed）。
+pub fn is_reserved_temp_name(name: &str) -> bool {
+    is_restore_temp_name(name)
+        || super::change_log::archive::is_segment_temp_name(name)
+        || is_probe_name(name)
+}
+
 /// 一時名を作る書き込み側が親ディレクトリに持つ共有 lock。drop で解放する。
 /// 掃除（排他 lock）との相互排他に使う。
 #[derive(Debug)]
@@ -104,13 +173,13 @@ impl TempDirLock {
     }
 }
 
-/// `dir` の残骸を掃除する。`is_temp_name` は一時名の形式の厳密な判定、`make_probe_name` は
-/// 形式に一致する新しい名前の生成（自分の uid の確認用の probe。引数は試行番号）。
+/// `dir` の残骸を掃除する。`is_temp_name` は一時名の形式の厳密な判定。自分の uid の確認用に
+/// 作る probe は専用の形式（[`is_probe_name`]）で、`is_temp_name` と一致しないため呼び出し側の
+/// 残骸の数え方に混ざり、異常終了で残っても次の掃除が回収する。
 #[cfg(unix)]
 pub fn sweep_stale_temps(
     dir: &Path,
     is_temp_name: fn(&str) -> bool,
-    make_probe_name: &dyn Fn(u64) -> String,
 ) -> Result<StaleTempSweep, std::io::ErrorKind> {
     use std::fs::TryLockError;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -169,7 +238,7 @@ pub fn sweep_stale_temps(
         let Some(name) = file_name.to_str() else {
             continue;
         };
-        if !is_temp_name(name) {
+        if !is_temp_name(name) && !is_probe_name(name) {
             continue;
         }
         let path = dir.join(name);
@@ -202,7 +271,6 @@ pub fn sweep_stale_temps(
 pub fn sweep_stale_temps(
     _dir: &Path,
     _is_temp_name: fn(&str) -> bool,
-    _make_probe_name: &dyn Fn(u64) -> String,
 ) -> Result<StaleTempSweep, std::io::ErrorKind> {
     Ok(StaleTempSweep::empty(SweepOutcome::Unsupported))
 }

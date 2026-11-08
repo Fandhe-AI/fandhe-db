@@ -48,7 +48,10 @@ mod stale_temp;
 pub(crate) mod table_image;
 pub(crate) mod writer_gate;
 
-pub use stale_temp::{sweep_stale_temps, StaleTempSweep, SweepOutcome, TempDirLock};
+pub use stale_temp::{
+    is_reserved_temp_name, is_restore_temp_name, sweep_stale_temps, StaleTempSweep, SweepOutcome,
+    TempDirLock,
+};
 
 pub use change_log::archive::{
     execute_archive_cleanup, plan_archive_cleanup, retention_point_of,

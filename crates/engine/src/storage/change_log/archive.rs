@@ -820,7 +820,7 @@ fn tmp_name() -> String {
 /// `name` がアーカイブの一時名の厳密な形式か（`.fandhe-seg-` + pid(10 進 1〜10 桁) + `-` + nonce(小文字
 /// 16 進 16 桁) + `-` + 通番(10 進 1〜20 桁) + `.tmp`）。名前は untrusted として添字を使わずに解析する。
 /// nonce の無い旧形式は出荷されていないため対象外。
-pub(super) fn is_segment_temp_name(name: &str) -> bool {
+pub(crate) fn is_segment_temp_name(name: &str) -> bool {
     use crate::storage::stale_temp::{is_decimal, is_lower_hex};
     let Some(rest) = name
         .strip_prefix(TMP_PREFIX)
@@ -847,18 +847,8 @@ pub fn sweep_change_log_archive_temps(
     let dir = dir.as_ref();
     check_dir(dir)?;
     check_dir_not_shared(dir)?;
-    crate::storage::stale_temp::sweep_stale_temps(dir, is_segment_temp_name, &|_| probe_name())
+    crate::storage::stale_temp::sweep_stale_temps(dir, is_segment_temp_name)
         .map_err(ArchiveError::Io)
-}
-
-#[cfg(unix)]
-fn probe_name() -> String {
-    tmp_name()
-}
-
-#[cfg(not(unix))]
-fn probe_name() -> String {
-    String::new()
 }
 
 /// 一時名から最終名へ、既存を上書きせずに公開する。公開は `hard_link`（宛先が在れば原子的に失敗する）。

@@ -868,29 +868,8 @@ mod unix_impl {
         Ok(gs)
     }
 
-    /// `.fandhe-restore-<pid>-<seq>.tmp`（旧形式）または `.fandhe-restore-<pid>-<nonce 16桁小文字hex>-<seq>.tmp`
-    /// （`TempCopy::create` が `fandhe-restore` で作る名前）の厳密な判定。
-    pub(super) fn is_restore_temp_name(name: &str) -> bool {
-        let dec = |s: &str, max: usize| {
-            !s.is_empty() && s.len() <= max && s.bytes().all(|b| b.is_ascii_digit())
-        };
-        let hex16 =
-            |s: &str| s.len() == 16 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
-        let Some(rest) = name
-            .strip_prefix(".fandhe-restore-")
-            .and_then(|r| r.strip_suffix(".tmp"))
-        else {
-            return false;
-        };
-        let mut parts = rest.split('-');
-        match (parts.next(), parts.next(), parts.next(), parts.next()) {
-            (Some(pid), Some(seq), None, None) => dec(pid, 10) && dec(seq, 20),
-            (Some(pid), Some(nonce), Some(seq), None) => {
-                dec(pid, 10) && hex16(nonce) && dec(seq, 20)
-            }
-            _ => false,
-        }
-    }
+    /// 復元の一時名の判定は engine の `storage::is_restore_temp_name`（単一の真実源。出力先の予約名検査と共有）。
+    pub(super) use engine::storage::is_restore_temp_name;
 
     /// `dest` の親ディレクトリに残った復元の一時名を掃除する（Issue #3094）。宛先が既に在る・親が
     /// 不正なときは何もしない。掃除できなかった場合も復元は続ける（呼び出し元が結果だけ報告する）。
@@ -901,8 +880,7 @@ mod unix_impl {
         if std::fs::symlink_metadata(dest).is_ok() {
             return None;
         }
-        let probe = |_: u64| unique_tmp_name("fandhe-restore");
-        let s = engine::storage::sweep_stale_temps(parent, is_restore_temp_name, &probe).ok()?;
+        let s = engine::storage::sweep_stale_temps(parent, is_restore_temp_name).ok()?;
         Some((parent.to_path_buf(), s))
     }
 
