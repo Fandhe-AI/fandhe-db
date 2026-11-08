@@ -36,8 +36,8 @@ use engine::storage::{ReplicaApplyError, MAX_RECORD_BYTES};
 
 use crate::replica_opt::{ReplicaOptions, EXIT_APPLY_HALTED, EXIT_PRIMARY_REJECTED};
 use crate::replication::{
-    code, PROTOCOL_VERSION, T_ACK, T_ERROR, T_HEARTBEAT, T_HELLO, T_IDENTITY, T_OK, T_RECORD,
-    T_START,
+    code, PROTOCOL_VERSION_RECEIVED, T_ACK, T_ERROR, T_HEARTBEAT, T_HELLO, T_IDENTITY, T_OK,
+    T_RECEIVED, T_RECORD, T_START,
 };
 
 /// 接続・ハンドシェイクの各フレームの待機上限。
@@ -254,7 +254,7 @@ fn session(core: &EngineCore, opts: &ReplicaOptions) -> SessionEnd {
         &stream,
         T_HELLO,
         &[
-            &PROTOCOL_VERSION.to_be_bytes(),
+            &PROTOCOL_VERSION_RECEIVED.to_be_bytes(),
             &[role_len],
             opts.role.as_bytes(),
             &opts.password,
@@ -490,6 +490,11 @@ fn flush(
 ) -> Result<(), Halt> {
     if batch.is_empty() {
         return Ok(());
+    }
+    // 同期レプリケーション（`remote_write`。Issue #2245）のため、適用の前に受け取り済みの位置（`R`）を知らせる。
+    // 失敗しても適用は続ける（切断は次のループの読み取りが検出する）。
+    if let Some((last, _)) = batch.last() {
+        let _ = write_frame(stream, T_RECEIVED, &[&last.to_be_bytes()]);
     }
     let report = core
         .apply_replicated_records(batch)

@@ -11,13 +11,14 @@
 //!
 //! | 方向 | 型 | 本体 |
 //! | ---- | -- | ---- |
-//! | C→S | `H` Hello | 版数 u16（=1）\| ロール名長 u8 \| ロール名 \| パスワード（残り全部） |
+//! | C→S | `H` Hello | 版数 u16（1 または 2）\| ロール名長 u8 \| ロール名 \| パスワード（残り全部） |
 //! | S→C | `I` Identity | DB 識別子 16B \| timeline u64 \| プライマリの最新 LSN u64（認証成功の直後。レプリカは自分のベースと照合する） |
 //! | C→S | `S` Start | DB 識別子 16B \| timeline u64 \| 適用済みの最後の LSN u64（次から送る） |
 //! | S→C | `O` Ok | DB 識別子 16B \| timeline u64 \| プライマリの最新 LSN u64 |
 //! | S→C | `W` Record | LSN u64 \| レコードのバイト列（D3 の自己完結形式） |
 //! | S→C | `P` Heartbeat | プライマリの最新 LSN u64（追いついて暇な間、約 1 秒ごと） |
-//! | C→S | `K` Ack | 受け取り済みの最後の LSN u64（単調増加・送信済み以下） |
+//! | C→S | `K` Ack | 永続化（適用の commit）済みの最後の LSN u64（単調増加・送信済み以下） |
+//! | C→S | `R` Received | 受け取り済み（適用前）の最後の LSN u64（版数 2 のみ。単調増加・送信済み以下。保持位置は進めない） |
 //! | S→C | `E` Error | コード u8（文言は載せない） |
 //!
 //! 入力は untrusted: 長さは確保前に上限検証し、フレームの型・長さ・値（ack の単調性と上限）を検証して、
@@ -27,7 +28,12 @@
 //! バックプレッシャ: 送信済みで未確認の量が `max_unacked_bytes` に達したら送信を止め（フロー制御）、
 //! `ack_timeout` の間 ack が進まなければそのレプリカだけを切る。書き込みタイムアウトも同じ時間で、読まない
 //! レプリカの書き込みで送信スレッドが固まり続けない。engine は読み取りトランザクションしか取らないため、
-//! レプリカの切断・遅延・停止がプライマリの書き込みを止めることはない（非同期。同期モードは #2245）。
+//! レプリカの切断・遅延・停止がプライマリの書き込みを止めることはない（既定は非同期）。
+//!
+//! 同期レプリケーション（Issue #2245。`--replication-sync-standby` で opt-in）: 同期対象のロールの接続は
+//! 1 本までで（2 本目は `BUSY`）、`K`・`R` の位置を engine の `SyncCommitCoordinator` へ報告する。確認を待つのは
+//! テナント向けの応答境界（`sync_commit_wait`）で、本モジュールは位置の報告と、待機の開始を検知して
+//! commit のポーリングを早めることだけを担う。
 #![cfg(unix)]
 
 use std::collections::VecDeque;
@@ -43,8 +49,10 @@ use engine::storage::StreamError;
 use crate::auth::{argon2id, AUTH_FAILURE_DELAY};
 use crate::replication_opt::{ReplicationRoles, ReplicationSettings, MAX_ROLE_NAME_LEN};
 
-/// プロトコルの版数（Hello で受け取る）。
+/// プロトコルの最小の版数（Hello で受け取る。`K` だけを送る）。
 pub const PROTOCOL_VERSION: u16 = 1;
+/// 版数 2: 受信済みの位置を知らせる `R` を送ってよい（同期レプリケーションの `remote_write` 用）。
+pub const PROTOCOL_VERSION_RECEIVED: u16 = 2;
 
 /// フレーム型。
 pub const T_HELLO: u8 = b'H';
@@ -54,6 +62,7 @@ pub const T_OK: u8 = b'O';
 pub const T_RECORD: u8 = b'W';
 pub const T_HEARTBEAT: u8 = b'P';
 pub const T_ACK: u8 = b'K';
+pub const T_RECEIVED: u8 = b'R';
 pub const T_ERROR: u8 = b'E';
 
 /// `E` フレームのコード（文言は載せない）。
@@ -268,10 +277,10 @@ fn be_u64(bytes: &[u8]) -> Option<u64> {
     Some(u64::from_be_bytes(bytes.try_into().ok()?))
 }
 
-/// Hello の本体を (ロール名, パスワード) に分解する。形式違反は `None`。
-fn parse_hello(body: &[u8]) -> Option<(&str, &[u8])> {
+/// Hello の本体を (版数, ロール名, パスワード) に分解する。形式違反・未知の版数は `None`。
+fn parse_hello(body: &[u8]) -> Option<(u16, &str, &[u8])> {
     let version = u16::from_be_bytes(body.get(..2)?.try_into().ok()?);
-    if version != PROTOCOL_VERSION {
+    if version != PROTOCOL_VERSION && version != PROTOCOL_VERSION_RECEIVED {
         return None;
     }
     let role_len = usize::from(*body.get(2)?);
@@ -281,7 +290,7 @@ fn parse_hello(body: &[u8]) -> Option<(&str, &[u8])> {
     let role_end = 3usize.checked_add(role_len)?;
     let role = std::str::from_utf8(body.get(3..role_end)?).ok()?;
     let password = body.get(role_end..)?;
-    (password.len() <= MAX_PASSWORD_LEN).then_some((role, password))
+    (password.len() <= MAX_PASSWORD_LEN).then_some((version, role, password))
 }
 
 /// ロールとパスワードを照合する。未知のロール・不正なロール名は既知ロールと同じコストのダミー照合を
@@ -309,6 +318,8 @@ struct Inflight {
     bytes: u64,
     /// 確認応答済みの最後の LSN と、送信済みの最後の LSN。
     acked: u64,
+    /// 受け取り済み（`R`）の最後の LSN（`acked` 以上。保持位置とは無関係）。
+    received: u64,
     sent: u64,
 }
 
@@ -341,19 +352,46 @@ impl Shared {
 }
 
 /// ack を読み続ける（レプリカ→プライマリの方向。別スレッド）。違反・切断で `failed` を立てて終わる。
-fn read_acks(stream: &TcpStream, shared: &Shared, pin: &engine::storage::ReplicaPin) {
+fn read_acks(
+    stream: &TcpStream,
+    shared: &Shared,
+    pin: &engine::storage::ReplicaPin,
+    version: u16,
+    standby: Option<&engine::storage::StandbyHandle>,
+) {
     // 通常の切断（`Closed`）とプロトコル違反（型・長さ・値）を区別する。違反は理由を立てて抜け、送信ループが
     // `BAD_REQUEST` を書いてから切る（書き込みは送信ループだけが行うので、フレームは交錯しない）。
     let violation = loop {
-        let lsn = match read_frame(stream, ACK_BODY_LEN, None) {
+        let (is_received, lsn) = match read_frame(stream, ACK_BODY_LEN, None) {
             Ok((T_ACK, body)) if body.len() == ACK_BODY_LEN => match be_u64(&body) {
-                Some(l) => l,
+                Some(l) => (false, l),
                 None => break true,
             },
+            // `R` は版数 2 の接続だけが送ってよい。
+            Ok((T_RECEIVED, body))
+                if version >= PROTOCOL_VERSION_RECEIVED && body.len() == ACK_BODY_LEN =>
+            {
+                match be_u64(&body) {
+                    Some(l) => (true, l),
+                    None => break true,
+                }
+            }
             Err(FrameError::Closed) => break false,
             _ => break true,
         };
         let mut g = shared.lock();
+        if is_received {
+            // 受信済みの位置: 単調増加で、送信済みの範囲内（保持位置・未確認の勘定は動かさない）。
+            if lsn < g.received.max(g.acked) || lsn > g.sent {
+                break true;
+            }
+            g.received = lsn;
+            drop(g);
+            if let Some(s) = standby {
+                s.report_received(lsn);
+            }
+            continue;
+        }
         // 単調増加で、送信済みの範囲内でなければならない（未送信の位置への ack は不正）。
         if lsn < g.acked || lsn > g.sent {
             break true;
@@ -364,8 +402,12 @@ fn read_acks(stream: &TcpStream, shared: &Shared, pin: &engine::storage::Replica
             }
         }
         g.acked = lsn;
+        g.received = g.received.max(lsn);
         drop(g);
         pin.advance(lsn);
+        if let Some(s) = standby {
+            s.report_durable(lsn);
+        }
     };
     if violation {
         // 他の理由（監視の切断）が先に立っていればそちらを優先する。
@@ -469,7 +511,7 @@ fn handle(stream: TcpStream, peer: std::net::IpAddr, srv: &Server, pre_auth: Slo
     } else {
         None
     };
-    let Some((role, password)) = parsed else {
+    let Some((version, role, password)) = parsed else {
         return send_error(&stream, code::BAD_REQUEST);
     };
     if !authenticate(&cfg.roles, role, password, auth_start) {
@@ -549,6 +591,13 @@ fn handle(stream: TcpStream, peer: std::net::IpAddr, srv: &Server, pre_auth: Slo
     if current.saturating_sub(applied) > cfg.max_lag_records {
         return send_error(&stream, code::RESYNC_REQUIRED);
     }
+    // 同期レプリケーションの対象ロールなら、位置の追跡を始める（同じロールの 2 本目は断る）。ハンドルは
+    // 接続の終わりまで持ち、`Drop` で位置を外して待機側を起こす。非対象のロール・同期無効では何もしない。
+    let standby = match core.sync_commit().map(|c| c.attach_standby(&role, applied)) {
+        Some(Err(_)) => return send_error(&stream, code::BUSY),
+        Some(Ok(h)) => h,
+        None => None,
+    };
     // Ok の書き込みは短い期限にする（読まないレプリカで、監視が動き出す前に保持位置が残り続けない）。
     if stream.set_write_timeout(Some(START_TIMEOUT)).is_err() {
         return;
@@ -573,7 +622,7 @@ fn handle(stream: TcpStream, peer: std::net::IpAddr, srv: &Server, pre_auth: Slo
         return;
     }
     engine::log_stderr!("wire-server: replication: replica '{role}' connected");
-    let reason = stream_loop(&stream, core, cfg, applied, &pin);
+    let reason = stream_loop(&stream, core, cfg, applied, &pin, version, standby.as_ref());
     engine::log_stderr!("wire-server: replication: replica '{role}' disconnected ({reason})");
 }
 
@@ -585,12 +634,15 @@ fn stream_loop(
     cfg: &ReplicationSettings,
     applied: u64,
     pin: &engine::storage::ReplicaPin,
+    version: u16,
+    standby: Option<&engine::storage::StandbyHandle>,
 ) -> &'static str {
     let shared = Shared {
         inflight: Mutex::new(Inflight {
             queue: VecDeque::new(),
             bytes: 0,
             acked: applied,
+            received: applied,
             sent: applied,
         }),
         failed: AtomicBool::new(false),
@@ -602,7 +654,7 @@ fn stream_loop(
     };
     std::thread::scope(|scope| {
         let (shared, clone) = (&shared, &clone);
-        scope.spawn(move || read_acks(clone, shared, pin));
+        scope.spawn(move || read_acks(clone, shared, pin, version, standby));
         scope.spawn(move || watchdog(clone, core, shared, cfg));
         let reason = send_records(stream, core, cfg, applied, shared);
         shared.done.store(true, Ordering::Release);
@@ -629,6 +681,9 @@ fn send_records(
     let mut last_write = Instant::now();
     let mut held: Option<(u64, Vec<u8>)> = None;
     loop {
+        // 同期レプリケーションが有効なら、読み出しの前に待機開始の連番を取る（取った後に始まる待機を
+        // 取りこぼさないため。commit は待機の開始より前に可視になっている）。
+        let wake_seen = core.sync_commit().map(|c| c.wake_seq());
         // 監視が切断を決めたら、通知を書いて抜ける（ack の待機上限・遅れの上限）。
         match shared.cut.load(Ordering::Acquire) {
             CUT_ACK_TIMEOUT => {
@@ -719,7 +774,11 @@ fn send_records(
             }
             last_write = Instant::now();
         }
-        std::thread::sleep(POLL_INTERVAL);
+        // 追いついている間の待機。同期有効なら commit の待機開始で起きて、同期 commit の遅延を下げる。
+        match (core.sync_commit(), wake_seen) {
+            (Some(c), Some(seen)) => c.park_until_commit_waiting(seen, POLL_INTERVAL),
+            _ => std::thread::sleep(POLL_INTERVAL),
+        }
     }
 }
 
@@ -784,7 +843,19 @@ mod tests {
         let mut ok = PROTOCOL_VERSION.to_be_bytes().to_vec();
         ok.push(3);
         ok.extend_from_slice(b"abcpw");
-        assert_eq!(parse_hello(&ok), Some(("abc", b"pw".as_slice())));
+        assert_eq!(
+            parse_hello(&ok),
+            Some((PROTOCOL_VERSION, "abc", b"pw".as_slice()))
+        );
+        let mut v2 = ok.clone();
+        v2[1] = 2;
+        assert_eq!(
+            parse_hello(&v2),
+            Some((PROTOCOL_VERSION_RECEIVED, "abc", b"pw".as_slice()))
+        );
+        let mut v3 = ok.clone();
+        v3[1] = 3;
+        assert!(parse_hello(&v3).is_none());
         // 版数違い・ロール名長 0 / 過大 / 本体を超える・UTF-8 でない。
         let mut bad_version = ok.clone();
         bad_version[1] = 9;

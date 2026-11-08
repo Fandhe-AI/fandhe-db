@@ -147,6 +147,8 @@ cargo run -p fandhe-db-wire-server -- --users <ユーザーストアのパス> -
   [--replication-bind <loopback addr>] [--replication-roles <file>] [--replication-allow <ip|cidr>]... \
   [--replication-max-connections <1-256>] [--replication-max-unacked-bytes <1024-4294967296>] \
   [--replication-ack-timeout-secs <1-3600>] [--replication-max-lag-records <1-1000000000>] \
+  [--replication-sync-standby <role>]... [--replication-sync-commit remote_write|on|remote_apply] \
+  [--replication-sync-timeout-secs <1-86400>] [--replication-sync-on-timeout degrade|reject] \
   [--require-where-for-dml] \
   [--max-dml-affected-rows <1-1000000>] [--max-insert-rows <1-1000000>] \
   [--batch-max-files <1-1000000>] \
@@ -535,7 +537,15 @@ redb トランザクションで DB 内の `change_log` 表へ追記されます
 - **注意**: リスナーはループバック限定ですが、port-forward やプロキシで外へ出すと資格情報とレコードが平文で流れます。外へ出す構成は
   TLS が入る（#2177）まで使わないでください。`--replication-roles` は `--users` とは別のファイルを使ってください（形式が異なり、
   互いのファイルでは起動できません）。
-- 受信側の適用ループ（#2174）・読み取りレプリカ（#2175）・同期モード（#2245）は未対応です。
+- **同期レプリケーション（オプション。Issue #2245）**: `--replication-sync-standby <role>`（繰り返し可。`--replication-roles` に存在するロール）を
+  指定すると、commit の成功応答を返す前に、指定した全ロールのレプリカの確認を待ちます（既定は非同期）。待つ段階は
+  `--replication-sync-commit`（`remote_write`＝受信、`on`＝永続化〔既定〕、`remote_apply`＝適用。受信側の実装上 `on` と `remote_apply` は同じ）。
+  `--replication-sync-timeout-secs` を指定すると上限を超えたときの扱いを `--replication-sync-on-timeout` で選びます
+  （`reject`＝`state=may_be_committed` のエラー。データはプライマリに残る／`degrade`＝成功を返し、縮退中は待たずに、
+  レプリカが追いついたら自動で解除）。上限を指定しない既定では無期限に待つため、**レプリカを失うと書き込みの応答が返らず接続が溜まります**
+  （運用では上限と扱いの指定を推奨）。同期の水準はこの CLI だけで決まり、テナントのセッションからは変えられません。同期ロールの接続は 1 本までです。
+  レプリカは版数 2 のプロトコルで接続するため、混在させるときはプライマリを先に更新してください。
+- 読み取りレプリカ（#2175）は未対応です。
 
 **論理ダンプ**（Issue #2162。RECOVER-16 ポインタ。形式と判断は [docs/design/logical-dump.md](docs/design/logical-dump.md) の §12、手順は [backup-restore-operations.md](docs/design/backup-restore-operations.md) の 4.6）:
 

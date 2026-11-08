@@ -28,6 +28,7 @@
 //! （最後のレコードの LSN か初回有効化時の世代が現在の世代と一致すること）を検査する（D8・D11）。
 //! アーカイブと保持（外部セグメントへの書き出し・水位・刈り込み・検証）は [`archive`]（Issue #2167。D6）。
 //! レプリカ側の適用（ストリーミング受信したレコードの原子的な適用。Issue #2174）は [`replica_apply`]。
+//! 同期レプリケーション（オプション。レプリカの確認待ちの調停。Issue #2245）は [`sync_commit`]。
 //! 未使用項目の警告は、後続（復元）が使う項目があるため抑止している。
 //!
 //! # オラクル試験（D1 の層 3）
@@ -71,6 +72,7 @@ pub(crate) mod pitr;
 pub(crate) mod replica_apply;
 pub(crate) mod replica_base;
 pub(crate) mod stream;
+pub(crate) mod sync_commit;
 
 use super::table_image::{self, AfterImage, Meter, ReadMode, ReadOutcome};
 use super::{Result, StorageError, GENERATION_KEY, GENERATION_TABLE};

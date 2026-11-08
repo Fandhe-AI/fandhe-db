@@ -21,7 +21,7 @@ use engine::policy::PolicyContext;
 use engine::storage::{chain_point_of, RowInput, Storage, Visibility};
 
 const BIN: &str = env!("CARGO_BIN_EXE_wire-server");
-const ROLE: &str = "replica-1";
+pub(crate) const ROLE: &str = "replica-1";
 const ROLE_PW: &str = "pw-replica";
 const EXIT_USAGE: i32 = 2;
 const EXIT_APPLY_HALTED: i32 = 10;
@@ -129,9 +129,9 @@ impl Lines {
 }
 
 pub(crate) struct Primary {
-    _fx: common::TempFixtureDir,
-    _child: ChildGuard,
-    tenant: SocketAddr,
+    pub(crate) _fx: common::TempFixtureDir,
+    pub(crate) _child: ChildGuard,
+    pub(crate) tenant: SocketAddr,
     pub(crate) repl: SocketAddr,
     pub(crate) dir: PathBuf,
     pub(crate) sock: PathBuf,
@@ -142,7 +142,7 @@ impl Primary {
         Self::start_with(label, &[])
     }
 
-    /// 追加のサーバーフラグ（例: `--replication-max-lag-records`）つきで起動する。
+    /// 追加の引数（同期レプリケーションの指定など）つきで起動する（Issue #2245）。
     pub(crate) fn start_with(label: &str, extra: &[&str]) -> Self {
         use std::os::unix::fs::PermissionsExt;
         let fx = common::TempFixtureDir::new(label);
@@ -207,7 +207,7 @@ impl Primary {
     }
 }
 
-pub(crate) struct TenantSession(TcpStream);
+pub(crate) struct TenantSession(pub(crate) TcpStream);
 
 impl TenantSession {
     pub(crate) fn exec(&mut self, sql: &str) {
