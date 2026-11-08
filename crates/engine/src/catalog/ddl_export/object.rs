@@ -191,6 +191,8 @@ pub(super) fn export_post_data<E>(
     export_sequence_values(ctx, out, &seqs)?;
     access::export_triggers(ctx, out)?;
     access::export_row_security_and_policies(ctx, out)?;
+    // ロール・権限の状態は最後に置く（既定権限が復元中に作るオブジェクトへ効かないようにする）。
+    super::privilege::export_access_state(ctx, out)?;
     Ok(())
 }
 
@@ -477,6 +479,11 @@ fn export_indexes<E>(ctx: &Ctx<'_>, out: &mut Emitter<'_, E>) -> Result<(), Sche
                 if matviews.is_none() {
                     let mut m = BTreeMap::new();
                     for (k, v) in read_str_table::<E>(ctx, MATERIALIZED_VIEWS_TABLE)? {
+                        // 他テナントの SCHEMA 範囲のキーは値を読まずに無視する（壊れた定義で
+                        // このテナントのダンプが失敗しない・存在を示さない）。
+                        if !in_scope(ctx, &k)? {
+                            continue;
+                        }
                         let d = decode_materialized_view_def(&k, &v)?;
                         m.insert(k, d);
                     }

@@ -4352,7 +4352,7 @@ impl EngineCore {
     > {
         self.storage.export_schema_ddl_checked(
             scope,
-            |defs| self.check_matview_columns_for_dump(defs),
+            |defs| self.check_matview_columns_for_dump(scope.tenant(), defs),
             sink,
         )
     }
@@ -4363,21 +4363,32 @@ impl EngineCore {
     /// `defs` は書き出しと同じ読み取りスナップショットから読んだ定義（Storage の書き出し入口が、
     /// 何かを出す前に渡す。Issue #3097）。基表の列の再導出は別の読み取りで行うため、スナップショット
     /// 取得後に基表の列が変わった場合は不一致として拒否側に倒れる（出力は破棄される）。
+    ///
+    /// 本文がテナントの関数（UDF）を呼ぶ場合に備え、ダンプ対象のテナントを束縛したセッションへ
+    /// そのテナントの UDF カタログを読み込んでから導出する（復元側も文ごとにセッション UDF を
+    /// 更新し、関数を `PreData` でマテリアライズド VIEW より前に出すため、同じ条件になる）。
+    /// テナントを持たない範囲（共有のみ）は既定のセッションで導出する。
     fn check_matview_columns_for_dump<E>(
         &self,
+        tenant: Option<&str>,
         defs: &[crate::catalog::materialized::MaterializedViewDef],
     ) -> std::result::Result<(), crate::catalog::ddl_export::SchemaDdlError<E>> {
         if defs.is_empty() {
             return Ok(());
         }
-        let session = crate::sql::mode::SessionState::default();
+        let mismatch = || {
+            crate::catalog::ddl_export::unsupported::<E>(
+                "materialized view",
+                "materialized view definition no longer matches its source columns",
+            )
+        };
+        let mut session = crate::sql::mode::SessionState::default();
+        if let Some(tenant) = tenant {
+            let ctx = PolicyContext::new(tenant).map_err(|_| mismatch())?;
+            self.load_session_udfs(&ctx, &mut session)
+                .map_err(|_| mismatch())?;
+        }
         for def in defs {
-            let mismatch = || {
-                crate::catalog::ddl_export::unsupported::<E>(
-                    "materialized view",
-                    "materialized view definition no longer matches its source columns",
-                )
-            };
             let view_columns = self
                 .view_output_columns(&session, &def.body_sql, &def.column_aliases)
                 .map_err(|_| mismatch())?;
@@ -4409,9 +4420,20 @@ impl EngineCore {
         self.storage.export_logical_dump_checked(
             scope,
             format,
-            |defs| self.check_matview_columns_for_dump(defs),
+            |defs| self.check_matview_columns_for_dump(scope.tenant(), defs),
             sink,
         )
+    }
+
+    /// 論理ダンプの復元指示（`RESTORE ...`。ロール・権限の状態。RECOVER-16・Issue #3096）を 1 件、`tenant` へ
+    /// 単一 write txn で適用する。wire-server の `dump-restore`（空の一時 DB への復元）だけが呼ぶ入口で、
+    /// SQL・NoSQL の表層・認証済みセッションからは呼べない。[`Storage::apply_restore_directive`] へ委譲する。
+    pub fn apply_restore_directive(
+        &self,
+        tenant: &str,
+        directive: &str,
+    ) -> std::result::Result<(), crate::catalog::ddl_export::RestoreDirectiveError> {
+        self.storage.apply_restore_directive(tenant, directive)
     }
 
     /// 変更ログの未アーカイブのレコードを外部セグメントへ書き出し、保持設定があれば刈り込む

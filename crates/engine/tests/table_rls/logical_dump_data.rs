@@ -79,6 +79,9 @@ fn replay(core: &EngineCore, pieces: &[Piece]) {
     let mut copy: Option<(String, String, Vec<u8>)> = None;
     for p in pieces {
         match p {
+            Piece::Ddl(sql) if sql.starts_with("RESTORE ") => core
+                .apply_restore_directive("tenant-a", sql)
+                .unwrap_or_else(|e| panic!("restore directive must apply: {e}")),
             Piece::Ddl(sql) => ok(core, "tenant-a", sql),
             Piece::Data(TableDataPart::Insert, tenant, sql) => ok(core, tenant, sql),
             Piece::Data(TableDataPart::CopyHeader, tenant, sql) => {

@@ -80,7 +80,7 @@ pub enum StmtKind {
     Schema,
     /// `CREATE ROLE`。
     Role,
-    /// ロールのメンバーシップ（`GRANT`）。
+    /// ロールのメンバーシップの復元指示（`RESTORE MEMBERSHIP ...`。SQL ではない。Issue #3096）。
     RoleMembership,
     /// `CREATE TYPE ... AS ENUM`。
     EnumType,
@@ -108,8 +108,14 @@ pub enum StmtKind {
     RowSecurity,
     /// `CREATE POLICY`。
     Policy,
-    /// `GRANT`。
+    /// ACL・関数 ACL の実体化印の復元指示（`RESTORE ACL ...`）。
     Privilege,
+    /// 所有者の復元指示（`RESTORE OWNER ...`）。
+    Owner,
+    /// 既定権限の復元指示（`RESTORE DEFAULT ACL ...`）。
+    DefaultPrivilege,
+    /// ロールの旧形式ハッシュ・初期権限・マーカーの復元指示（`RESTORE ROLE ...`／`RESTORE BOOTSTRAP MARKER`）。
+    RoleBootstrap,
     /// データの `INSERT` 1 文。
     Insert,
 }
@@ -135,6 +141,9 @@ impl StmtKind {
             DdlObjectKind::RowSecurity => StmtKind::RowSecurity,
             DdlObjectKind::Policy => StmtKind::Policy,
             DdlObjectKind::Privilege => StmtKind::Privilege,
+            DdlObjectKind::Owner => StmtKind::Owner,
+            DdlObjectKind::DefaultPrivilege => StmtKind::DefaultPrivilege,
+            DdlObjectKind::RoleBootstrap => StmtKind::RoleBootstrap,
         }
     }
 
@@ -158,12 +167,15 @@ impl StmtKind {
             StmtKind::RowSecurity => "row-security",
             StmtKind::Policy => "policy",
             StmtKind::Privilege => "privilege",
+            StmtKind::Owner => "owner",
+            StmtKind::DefaultPrivilege => "default-privilege",
+            StmtKind::RoleBootstrap => "role-bootstrap",
             StmtKind::Insert => "insert",
         }
     }
 
     fn from_token(t: &str) -> Option<Self> {
-        const ALL: [StmtKind; 18] = [
+        const ALL: [StmtKind; 21] = [
             StmtKind::Schema,
             StmtKind::Role,
             StmtKind::RoleMembership,
@@ -181,6 +193,9 @@ impl StmtKind {
             StmtKind::RowSecurity,
             StmtKind::Policy,
             StmtKind::Privilege,
+            StmtKind::Owner,
+            StmtKind::DefaultPrivilege,
+            StmtKind::RoleBootstrap,
             StmtKind::Insert,
         ];
         ALL.into_iter().find(|k| k.token() == t)
@@ -192,7 +207,11 @@ impl StmtKind {
         match self {
             StmtKind::Schema => &["CREATE SCHEMA "],
             StmtKind::Role => &["CREATE ROLE "],
-            StmtKind::RoleMembership | StmtKind::Privilege => &["GRANT "],
+            StmtKind::RoleMembership => &["RESTORE MEMBERSHIP "],
+            StmtKind::Privilege => &["RESTORE ACL "],
+            StmtKind::Owner => &["RESTORE OWNER "],
+            StmtKind::DefaultPrivilege => &["RESTORE DEFAULT ACL "],
+            StmtKind::RoleBootstrap => &["RESTORE ROLE ", "RESTORE BOOTSTRAP MARKER"],
             StmtKind::EnumType => &["CREATE TYPE "],
             StmtKind::Sequence => &["CREATE SEQUENCE ", "ALTER SEQUENCE "],
             StmtKind::SequenceValue => &["SELECT setval("],
@@ -216,7 +235,6 @@ impl StmtKind {
         match self {
             StmtKind::Schema
             | StmtKind::Role
-            | StmtKind::RoleMembership
             | StmtKind::EnumType
             | StmtKind::Sequence
             | StmtKind::Table
@@ -230,9 +248,26 @@ impl StmtKind {
             | StmtKind::Trigger
             | StmtKind::RowSecurity
             | StmtKind::Policy
+            | StmtKind::RoleMembership
             | StmtKind::Privilege
+            | StmtKind::Owner
+            | StmtKind::DefaultPrivilege
+            | StmtKind::RoleBootstrap
             | StmtKind::MaterializedViewRefresh => Phase::Post,
         }
+    }
+
+    /// 復元専用の指示（SQL ではなく engine の復元用入口で適用する種別。Issue #3096）か。復元側はこの種別の
+    /// 本文を SQL として実行せず、`scope: shared` のダンプでは受け付けない（テナント固有の状態のため）。
+    pub fn is_restore_directive(self) -> bool {
+        matches!(
+            self,
+            StmtKind::RoleMembership
+                | StmtKind::Privilege
+                | StmtKind::Owner
+                | StmtKind::DefaultPrivilege
+                | StmtKind::RoleBootstrap
+        )
     }
 
     /// 本文が種別ごとの期待する形か。多くは許可表の接頭辞だが、`setval`・`ALTER TABLE` の 2 種別は
@@ -987,6 +1022,45 @@ mod tests {
         assert!(w.copy_row("a\nb").is_err());
         assert!(w.copy_row("a\rb").is_err());
         assert!(w.copy_row("\\.").is_err());
+    }
+
+    #[test]
+    fn restore_directive_kinds_are_post_data_and_shaped_by_prefix() {
+        for (kind, ok, bad) in [
+            (
+                StmtKind::RoleMembership,
+                "RESTORE MEMBERSHIP \"r\" MEMBER \"m\"",
+                "GRANT r TO m",
+            ),
+            (
+                StmtKind::Privilege,
+                "RESTORE ACL TABLE \"t\"",
+                "GRANT SELECT ON t TO m",
+            ),
+            (
+                StmtKind::Owner,
+                "RESTORE OWNER TABLE \"t\"",
+                "ALTER TABLE t OWNER TO m",
+            ),
+            (
+                StmtKind::DefaultPrivilege,
+                "RESTORE DEFAULT ACL ROLE \"r\"",
+                "ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO m",
+            ),
+            (
+                StmtKind::RoleBootstrap,
+                "RESTORE BOOTSTRAP MARKER",
+                "RESTORE OWNER TABLE \"t\"",
+            ),
+        ] {
+            assert!(kind.is_restore_directive(), "{kind:?}");
+            assert_eq!(kind.phase(), Phase::Post, "{kind:?}");
+            assert!(kind.accepts(ok), "{ok}");
+            assert!(!kind.accepts(bad), "{bad}");
+            assert_eq!(StmtKind::from_token(kind.token()), Some(kind));
+        }
+        assert!(!StmtKind::Role.is_restore_directive());
+        assert!(!StmtKind::Insert.is_restore_directive());
     }
 
     #[test]

@@ -141,8 +141,8 @@ impl Fixture {
     }
 }
 
-/// engine を直接開いて文を実行する（サーバー経由だと `--users` の初期ブートストラップ権限が
-/// 記録され、権限を書き出せない現状のダンプが拒否するため。設計書の第 12 節を参照）。
+/// engine を直接開いて文を実行する（サーバーを起動せずに fixture を作る。`--users` を使う端から端までの
+/// 往復は `dump_users_cli.rs`）。
 pub(crate) struct Direct<'a> {
     core: &'a engine::core::EngineCore,
     ctx: engine::policy::PolicyContext,
@@ -597,7 +597,7 @@ fn dump_and_restore_reject_invalid_arguments() {
     assert_eq!(std::fs::read(&db).expect("db"), b"not a database");
 }
 
-fn header(scope: DumpScope, parts: DumpParts) -> Header {
+pub(crate) fn header(scope: DumpScope, parts: DumpParts) -> Header {
     Header {
         scope,
         parts,
@@ -747,14 +747,20 @@ fn restore_rejects_tampered_and_malformed_dumps() {
     assert_eq!(code(&o), Some(0), "stderr: {}", stderr(&o));
 }
 
-fn write_dump_with(path: &str, h: Header, build: impl FnOnce(&mut FileWriter<Vec<u8>>)) {
+pub(crate) fn write_dump_with(path: &str, h: Header, build: impl FnOnce(&mut FileWriter<Vec<u8>>)) {
     let mut w = FileWriter::begin(Vec::new(), &h).expect("begin");
     build(&mut w);
     std::fs::write(path, w.finish().expect("finish")).expect("write dump");
 }
 
 /// 復元を試み、終了コードと「何も公開されない」ことを確かめる。
-fn assert_restore_rejected(dir: &Path, from: &str, extra: &[&str], want: i32, why: &str) -> String {
+pub(crate) fn assert_restore_rejected(
+    dir: &Path,
+    from: &str,
+    extra: &[&str],
+    want: i32,
+    why: &str,
+) -> String {
     let dest = s(&dir.join("dest.redb")).to_string();
     let mut args = vec!["dump-restore", "--from", from, "--db", &dest];
     args.extend_from_slice(extra);
