@@ -110,7 +110,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #2167: `storage/change_log/archive.rs` の保守 commit（アーカイブ済み水位の更新と水位以下の
     // 刈り込み）。書き込むのは `change_log_meta`・`change_log` 表だけで、`CATALOG_TABLE`・`user_rows` には
     // 触れず、世代も進めない（バンプ対象の表が構造的に存在しない）。
-    ("storage/change_log/archive.rs", 1219), // 確認用ファイル名の移設（-10 行）で追随。 Issue #3094（一時名の掃除の追加）で追随（旧: 1170）。base 取り込みで +1 行（1226 から）
+    ("storage/change_log/archive.rs", 1306), // 確認用ファイル名の移設（-10 行）で追随。 Issue #3094（一時名の掃除の追加）で追随（旧: 1170）。Issue #3103（SegmentReader::open の fd 基準化）で追随（旧: 1219）。base 取り込みで +1 行（1226 から）
     // Issue #3093: `Storage::disable_change_log` の保守 commit。削除するのは `change_log`・`change_log_meta`
     // 表だけで、`CATALOG_TABLE`・`user_rows` には触れず、世代も進めない（バンプ対象の表が構造的に存在しない）。
     ("storage/change_log/disable.rs", 165),
