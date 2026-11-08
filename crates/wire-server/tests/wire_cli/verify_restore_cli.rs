@@ -387,6 +387,36 @@ fn restore_sweeps_stale_restore_temp_names_only() {
     assert!(restored.exists());
 }
 
+/// Issue #3094: 旧形式の残骸（`<pid>-0..16`）が多数あっても、掃除の所有権プローブと一時コピーの作成が
+/// 名前衝突で失敗せず、掃除と復元の両方が成功する（プローブ名・一時名に nonce を持つため）。
+#[test]
+fn restore_succeeds_with_many_legacy_leftovers_for_same_pid() {
+    use std::os::unix::fs::PermissionsExt;
+    let fx = common::TempFixtureDir::new("restore-sweep-many");
+    let (_users, db) = populate(&fx);
+    let dir = parent_of(&db).to_path_buf();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod dir");
+    let snap = dir.join("snap.redb");
+    let snap_s = snap.to_str().expect("utf-8 path").to_string();
+    let o = backup(&db, &snap_s);
+    assert_eq!(code(&o), Some(0), "stderr: {}", stderr(&o));
+    for seq in 0..=16 {
+        let p = dir.join(format!(".fandhe-restore-1-{seq}.tmp"));
+        std::fs::write(&p, b"x").expect("write");
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    }
+    let restored = dir.join("restored.redb");
+    let restored_s = restored.to_str().expect("utf-8 path").to_string();
+    let o = restore(&snap_s, &restored_s);
+    assert_eq!(code(&o), Some(0), "stderr: {}", stderr(&o));
+    assert!(
+        stderr(&o).contains("removed 17 stale temporary file(s)"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(restored.exists());
+}
+
 /// Issue #3094: `--from` が一時名の実体へのシンボリックリンクでも、掃除は復元元の実体を消さない。
 #[test]
 fn restore_sweep_keeps_source_reached_through_symlink_to_temp_name() {

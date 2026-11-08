@@ -12,7 +12,7 @@
 //! 0. 前回の異常終了が残した一時名を掃除する（[`sweep_stale_restore_temps`]。Issue #3094。形式に厳密一致し、
 //!    通常ファイル・0600 系・自分の所有・使用中でないものだけ。一時名を作る間は親ディレクトリへ共有 lock を持つ）
 //! 1. `--from` を読み取りで開き共有ロックを試みる（稼働中の DB を誤ってコピーしない。取れなければ拒否）
-//! 2. 出力先と同じディレクトリの一時名（`.fandhe-restore-<pid>-<seq>.tmp`）へ `create_new`・0600 で
+//! 2. 出力先と同じディレクトリの一時名（`.fandhe-restore-<pid>-<nonce>-<seq>.tmp`）へ `create_new`・0600 で
 //!    コピーし、サイズ一致を確かめて fsync する。元のバックアップには一切書かない
 //! 3. 一時ファイルを `Storage::open` して `verify_integrity` を実行する。Error・Incomplete が 1 件でも
 //!    あれば公開せず一時ファイルを消す（検査できなかったものも整合とは扱わない）
@@ -662,6 +662,25 @@ mod unix_impl {
 
     static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
+    /// 一時名 `.{prefix}-<pid>-<nonce 16桁hex>-<通番>.tmp` を作る。nonce はプロセスごとにランダムな鍵を
+    /// 持つ `RandomState` と時刻・通番を混ぜた値で、PID の再利用（PID 1 のコンテナ等）や再起動で通番が
+    /// 0 に戻っても、残骸の数に依らず名前が衝突しない。掃除の所有権プローブと `TempCopy::create` が共用する。
+    fn unique_tmp_name(prefix: &str) -> String {
+        use std::hash::{BuildHasher, Hasher};
+        let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u128(nanos);
+        h.write_u64(seq);
+        format!(
+            ".{prefix}-{}-{:016x}-{seq}.tmp",
+            std::process::id(),
+            h.finish()
+        )
+    }
+
     fn io_err(e: std::io::Error) -> RestoreError {
         RestoreError::Io(e.kind())
     }
@@ -695,8 +714,7 @@ mod unix_impl {
             let dir_lock = engine::storage::TempDirLock::shared(parent);
             let mut attempts = 0u32;
             loop {
-                let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-                let p = parent.join(format!(".{prefix}-{}-{seq}.tmp", std::process::id()));
+                let p = parent.join(unique_tmp_name(prefix));
                 match OpenOptions::new()
                     .read(true)
                     .write(true)
@@ -847,15 +865,28 @@ mod unix_impl {
         Ok(gs)
     }
 
-    /// `.fandhe-restore-<pid>-<seq>.tmp`（`TempCopy::create` が `fandhe-restore` で作る名前）の厳密な判定。
+    /// `.fandhe-restore-<pid>-<seq>.tmp`（旧形式）または `.fandhe-restore-<pid>-<nonce 16桁小文字hex>-<seq>.tmp`
+    /// （`TempCopy::create` が `fandhe-restore` で作る名前）の厳密な判定。
     pub(super) fn is_restore_temp_name(name: &str) -> bool {
         let dec = |s: &str, max: usize| {
             !s.is_empty() && s.len() <= max && s.bytes().all(|b| b.is_ascii_digit())
         };
-        name.strip_prefix(".fandhe-restore-")
+        let hex16 =
+            |s: &str| s.len() == 16 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+        let Some(rest) = name
+            .strip_prefix(".fandhe-restore-")
             .and_then(|r| r.strip_suffix(".tmp"))
-            .and_then(|r| r.split_once('-'))
-            .is_some_and(|(pid, seq)| dec(pid, 10) && dec(seq, 20))
+        else {
+            return false;
+        };
+        let mut parts = rest.split('-');
+        match (parts.next(), parts.next(), parts.next(), parts.next()) {
+            (Some(pid), Some(seq), None, None) => dec(pid, 10) && dec(seq, 20),
+            (Some(pid), Some(nonce), Some(seq), None) => {
+                dec(pid, 10) && hex16(nonce) && dec(seq, 20)
+            }
+            _ => false,
+        }
     }
 
     /// `dest` の親ディレクトリに残った復元の一時名を掃除する（Issue #3094）。宛先が既に在る・親が
@@ -867,10 +898,7 @@ mod unix_impl {
         if std::fs::symlink_metadata(dest).is_ok() {
             return None;
         }
-        let probe = |_: u64| {
-            let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-            format!(".fandhe-restore-{}-{seq}.tmp", std::process::id())
-        };
+        let probe = |_: u64| unique_tmp_name("fandhe-restore");
         let s = engine::storage::sweep_stale_temps(parent, is_restore_temp_name, &probe).ok()?;
         Some((parent.to_path_buf(), s))
     }
