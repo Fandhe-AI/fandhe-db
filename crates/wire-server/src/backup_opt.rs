@@ -155,7 +155,7 @@ pub fn validate_out(raw: &str) -> Result<PathBuf, String> {
     validate_new_path("--out", raw)
 }
 
-/// まだ存在しない新規パスの共通検査（`backup --out`・`restore --db` が使う。フラグ名はエラー文に
+/// まだ存在しない新規パスの共通検査（`backup --out`・`restore --db`・dump・incremental 等が使う。フラグ名はエラー文に
 /// 使い、パスの内容は出さない）。確認後の競合は公開側の `hard_link`（`EEXIST`）が原子的に拒否する。
 pub fn validate_new_path(flag: &str, raw: &str) -> Result<PathBuf, String> {
     if raw.is_empty() {
@@ -165,8 +165,18 @@ pub fn validate_new_path(flag: &str, raw: &str) -> Result<PathBuf, String> {
     if path.components().any(|c| matches!(c, Component::ParentDir)) {
         return Err(format!("{flag} must not contain '..' components"));
     }
-    if path.file_name().is_none() {
+    let Some(file_name) = path.file_name() else {
         return Err(format!("{flag} must name a file"));
+    };
+    // 掃除（Issue #3094）が消す一時名の形式の出力先は拒否する。完成済みのファイルが同じ親での
+    // 別の復元・アーカイブ起動の掃除に消されうるため（fail-closed）。non-UTF-8 の名前は形式に一致しない。
+    if file_name
+        .to_str()
+        .is_some_and(engine::storage::is_reserved_temp_name)
+    {
+        return Err(format!(
+            "{flag} must not use a reserved temporary file name"
+        ));
     }
     // 存在確認はリンクをたどらない（壊れたリンク経由の書き出しも拒否する）。
     if std::fs::symlink_metadata(&path).is_ok() {

@@ -495,6 +495,14 @@ RECOVER-14 (2) のポインタ（上限の超過で書き込みを拒否する�
   掃除の失敗・見送りで起動・復元は失敗させない
 - 残るリスク: この lock を使わない古いバイナリと同時に動かした場合は使用中を判定できない。その場合も
   相手側の差し替え検出（`TempReplaced`）が公開を止める
+- 予約名の出力先拒否（レビュー指摘への対応）: 永続ファイルの出力先（`restore --db`・`backup --out`・
+  `backup-incremental --out`・dump 系・`replica-resync --out`）は、名前が掃除の予約名（復元・アーカイブの
+  一時名・掃除の確認用ファイル）の形式なら引数エラー（終了コード 2）で拒否する。判定は engine の
+  `storage::is_reserved_temp_name` に一本化し、出力先の共通検査 `validate_new_path` から呼ぶ。
+  すでに予約名で存在する完成済みファイルは、内容で見分けず（部分コピーも redb として開けうる）、
+  従来どおり掃除の対象とする（本修正の前に作られた名前への追加の安全策は取らない）
+- 掃除の uid 確認用ファイルは専用の形式 `.fandhe-sweep-probe-*`（一時名と別）にし、確認中の SIGKILL で
+  残っても次の掃除が回収する。呼び出し側（crash-test）の「一時名の残骸の件数」には混ざらない
 - 対象外: `backup` の `.fandhe-snapshot-*`・`verify` の `.fandhe-verify-*`・`dump` 系の一時名・
   `backup --incremental` の出力先の残骸（従来どおり手動）
 
