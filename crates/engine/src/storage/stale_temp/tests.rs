@@ -102,6 +102,15 @@ fn skips_when_a_writer_holds_the_shared_lock() {
 }
 
 #[test]
+fn shared_lock_failure_is_an_error_not_a_silent_none() {
+    let d = tdir("lockfail");
+    let missing = d.join("no-such-dir");
+    assert!(TempDirLock::shared(&missing).is_err());
+    assert!(TempDirLock::shared(&d).is_ok());
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
 fn skips_shared_directory() {
     let d = tdir("shared");
     put(&d, ".t-1.tmp", 0o600);

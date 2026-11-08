@@ -1008,6 +1008,15 @@ fn sweep_removes_only_stale_temp_names_in_the_archive_dir() {
 }
 
 #[test]
+fn publish_aborts_without_creating_a_temp_when_the_dir_lock_is_unavailable() {
+    let f = Fixture::new("arc-publish-nolock");
+    let missing = f.archive.path().join("no-such-dir");
+    let r = publish_with(&missing, &missing.join("final"), |_| Ok(()));
+    assert!(matches!(r, Err(ArchiveError::Io(_))));
+    assert!(!missing.exists());
+}
+
+#[test]
 fn sweep_is_skipped_while_a_publisher_holds_the_dir_lock() {
     use std::os::unix::fs::PermissionsExt;
     let f = Fixture::new("arc-sweep-lock");

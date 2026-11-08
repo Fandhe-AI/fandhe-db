@@ -9,8 +9,9 @@
 //! # fail-closed
 //!
 //! - 使用中の一時名を消さないため、書き込み側は一時名を作る前にディレクトリへ共有の advisory
-//!   lock（[`TempDirLock`]）を取り、公開か削除までそれを保持する。掃除側は同じディレクトリに
-//!   排他 lock を試し、取れなければ（書き込み中）全体を見送る。lock が使えない FS でも見送る
+//!   lock（[`TempDirLock`]）を取り、公開か削除までそれを保持する。書き込み側は共有 lock を取れなければ
+//!   一時名を作らずエラーで中止する。掃除側は同じディレクトリに排他 lock を試し、取れなければ
+//!   （書き込み中）全体を見送る。lock が使えない FS でも見送る
 //! - 消す対象は「形式に厳密一致 × 通常ファイル（リンクをたどらない）× グループ・その他の権限なし
 //!   × 自分の uid × 共有でないディレクトリ」の積だけ。1 つでも外れれば触らない
 //! - 形式に一致しない項目は触らず、数えもしない。形式一致で型・所有者・権限が想定外のものは
@@ -93,12 +94,13 @@ pub struct TempDirLock {
 }
 
 impl TempDirLock {
-    /// `dir` へ共有 lock を取る。取れない（lock 非対応の FS など）ときは `None` を返し、
-    /// 従来どおり lock なしで進める（掃除側も lock が取れなければ何も消さない）。
-    pub fn shared(dir: &Path) -> Option<Self> {
-        let f = std::fs::File::open(dir).ok()?;
-        f.lock_shared().ok()?;
-        Some(Self { _dir: f })
+    /// `dir` へ共有 lock を取る。取れない（lock 非対応の FS・資源不足など）ときはエラーを返す。
+    /// 呼び出し側は一時名を作らずに中止すること（fail-closed。lock なしで書くと、並行する掃除が
+    /// 排他 lock を取って使用中の一時名を消しうる）。
+    pub fn shared(dir: &Path) -> Result<Self, std::io::ErrorKind> {
+        let f = std::fs::File::open(dir).map_err(|e| e.kind())?;
+        f.lock_shared().map_err(|e| e.kind())?;
+        Ok(Self { _dir: f })
     }
 }
 

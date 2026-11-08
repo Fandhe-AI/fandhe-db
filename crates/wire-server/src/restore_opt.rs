@@ -697,7 +697,7 @@ mod unix_impl {
         pub(super) armed: bool,
         /// 親ディレクトリの共有 lock（Issue #3094。掃除が使用中の一時名を消さないための相互排他）。
         /// フィールドは `Drop::drop`（一時名の unlink）の後に drop されるため、lock は unlink の後まで残る。
-        _dir_lock: Option<engine::storage::TempDirLock>,
+        _dir_lock: engine::storage::TempDirLock,
     }
 
     impl Drop for TempCopy {
@@ -711,7 +711,10 @@ mod unix_impl {
     impl TempCopy {
         /// `parent` に所有者のみ読み書きの一時ファイルを排他的に作る。
         pub(super) fn create(parent: &Path, prefix: &str) -> Result<Self, RestoreError> {
-            let dir_lock = engine::storage::TempDirLock::shared(parent);
+            // 共有 lock を取れなければ一時名を作らず中止する（fail-closed。lock なしでは掃除が
+            // 使用中の一時名を消しうる）。
+            let dir_lock = engine::storage::TempDirLock::shared(parent)
+                .map_err(|k| io_err(std::io::Error::from(k)))?;
             let mut attempts = 0u32;
             loop {
                 let p = parent.join(unique_tmp_name(prefix));

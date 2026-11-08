@@ -883,9 +883,10 @@ pub(super) fn publish_with(
     use std::os::unix::fs::OpenOptionsExt;
 
     // 一時名を作る前に親ディレクトリへ共有 lock を取り、公開か削除まで持つ（Issue #3094。掃除
-    // [`sweep_change_log_archive_temps`] が使用中の一時名を消さないための相互排他。取れない FS では
-    // lock なしで進み、掃除側も何も消さない）。
-    let _dir_lock = crate::storage::stale_temp::TempDirLock::shared(dir);
+    // [`sweep_change_log_archive_temps`] が使用中の一時名を消さないための相互排他）。取れなければ
+    // 一時名を作らずに中止する（fail-closed。lock なしでは掃除が使用中の一時名を消しうる）。
+    let _dir_lock =
+        crate::storage::stale_temp::TempDirLock::shared(dir).map_err(ArchiveError::Io)?;
 
     // 一時名は再起動をまたいでも衝突しにくくする（`tmp_name`）。試行は残骸の数に依らず新しい名前で行い、
     // 上限は異常な環境で無限に回らないための安全弁。
