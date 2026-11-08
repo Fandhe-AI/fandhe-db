@@ -241,8 +241,8 @@ fn restored_database_continues_with_the_change_log_enabled() {
     assert_eq!(st.current_generation().expect("gen"), stop);
 }
 
-/// RECOVER-17（Issue #2450）: PITR の後に復元の世代を進めても、全表の状態・LSN・変更ログの連続性は
-/// 変わらない（世代の表は変更ログ・再生・比較の対象外）。世代は単調に増える。
+/// RECOVER-17（Issue #2450）・Issue #3100: PITR の後に復元の世代を進めても、全表の状態・LSN は変わらない。
+/// 世代は単調に増え、変更ログの timeline は分岐する（本体表は空になり起点が分岐点へ移る）。
 #[test]
 fn recover17_advancing_the_generation_after_pitr_keeps_the_state_and_lsn() {
     let s = scenario("pitr-generation", usize::MAX >> 8);
@@ -251,13 +251,18 @@ fn recover17_advancing_the_generation_after_pitr_keeps_the_state_and_lsn() {
     for _ in 0..2 {
         let (_w, db, r) = restore(&s.base, &[], Some(s.archive.path()), PitrTarget::Lsn(stop));
         r.expect("restore");
+        // 状態の比較は世代を進める前に行う（進めた後は本体表が空になり、末尾 == stop を満たさない）。
+        assert_state_at(&s.fx, &db, stop);
+        let old_timeline = chain_point_of(&db).expect("point").timeline;
         {
             let mut st = Storage::open(&db).expect("open");
             let g = st.advance_restore_generation().expect("advance");
             assert!(g > 0);
             assert_eq!(st.restore_generation().expect("read"), g);
         }
-        assert_state_at(&s.fx, &db, stop);
+        let forked = chain_point_of(&db).expect("forked point");
+        assert!(forked.timeline > old_timeline, "the timeline must fork");
+        assert_eq!(forked.end_lsn, stop, "the LSN is unchanged");
         let mut st = Storage::open(&db).expect("reopen");
         st.enable_change_log().expect("continuity holds");
         assert_eq!(st.current_generation().expect("gen"), stop);
@@ -927,4 +932,23 @@ fn archive_inside_an_incremental_is_compared_even_when_the_target_stops_in_the_i
     );
     assert!(matches!(r, Err(IncrementalError::ChainBroken)), "{r:?}");
     let _ = fx;
+}
+/// Issue #3100（RECOVER-14）: 復元して世代を進めた DB（timeline が分岐済み）を基準に、元の系統の
+/// アーカイブで PITR を進めると、別系統の履歴が混ざるため拒否され、DB の内容は変わらない。
+#[test]
+fn fork_restored_base_rejects_the_original_archive_without_touching_the_db() {
+    let s = scenario("pitr-fork", usize::MAX >> 8);
+    let stop = s.base_point.end_lsn + 2;
+    let (w, db, r) = restore(&s.base, &[], Some(s.archive.path()), PitrTarget::Lsn(stop));
+    r.expect("restore");
+    {
+        let mut st = Storage::open(&db).expect("open");
+        st.advance_restore_generation().expect("advance");
+    }
+    let before = dump_db(&redb::Database::open(&db).expect("open raw"));
+    let r = restore_to_point(&db, &[], Some(s.archive.path()), PitrTarget::Lsn(stop + 1));
+    assert!(r.is_err(), "mixed lineages must be refused: {r:?}");
+    let after = dump_db(&redb::Database::open(&db).expect("open raw"));
+    assert_eq!(oracle::diff_models(&before, &after), None);
+    drop(w);
 }

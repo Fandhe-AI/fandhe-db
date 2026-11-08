@@ -28,6 +28,7 @@ mod replica_resync_cli;
 mod replication_cli;
 mod replication_sync_cli;
 mod restore_generation_state_cli;
+mod restore_timeline_fork_cli;
 mod transaction_limits_parity;
 mod verify_restore_cli;
 mod wire7_bind_guard;

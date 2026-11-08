@@ -11,7 +11,9 @@
 //! 受け取る下限として扱い、状態ファイルの形式は [`high_water`] が持つ（置き場所は設計ドキュメント）。
 //!
 //! 値が壊れている・欠けている・上限に達した場合は黙って補わず `Err` とする（fail-closed）。
-//! 書き込みは変更ログの記録に関与しない保守 commit で行う。
+//! 書き込みは変更ログの記録に関与しない保守 commit で行う。変更ログを有効にしたことのある DB では、
+//! 同じ保守 commit で変更ログの timeline も新しい世代で分岐させる（Issue #3100・RECOVER-14。
+//! [`super::change_log::fork`]）。失敗したときは世代も timeline も書かない。
 
 use redb::{ReadableDatabase, ReadableTable as _, TableDefinition, TableHandle as _};
 
@@ -144,6 +146,10 @@ impl Storage {
         let next = next_generation(current.max(source), floor)?;
         table.insert(KEY, next.to_le_bytes().as_slice())?;
         drop(table);
+        // 同じ保守 commit で、変更ログの timeline を新しい世代で分岐させる（Issue #3100）。増分・PITR の
+        // 適用は「ベースと同じ timeline」を要求するため、必ず適用と整合検査の後（本関数の呼び出し位置）に
+        // 行う。失敗したら `?` で txn を破棄し、世代も timeline も書かない。
+        super::change_log::fork::fork_timeline_in_txn(&txn, next)?;
         crate::recovery::commit_boundary::commit_maintenance(txn)?;
         Ok(next)
     }
