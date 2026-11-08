@@ -1,17 +1,3 @@
-  # ACK を受けた操作列（docs の INSERT と kv の INSERT・UPDATE・DELETE）の結果が、
-  # 両テナントとも再起動後のプライマリに残っている。
-  if [ "${last_a}" -ge 0 ]; then
-    on_primary alice ids-present docs $((WA_BASE + last_a)) $((WA_BASE + last_a)) > /dev/null \
-      || fail "an acknowledged commit was lost after primary restart (cycle ${i})"
-    on_primary alice churn-verify "${WA_BASE}" "${last_a}" > /dev/null \
-      || fail "an acknowledged alice operation was lost after primary restart (cycle ${i})"
-  fi
-  if [ "${last_b}" -ge 0 ]; then
-    on_primary bob ids-present docs $((WB_BASE + last_b)) $((WB_BASE + last_b)) > /dev/null \
-      || fail "an acknowledged bob commit was lost after primary restart (cycle ${i})"
-    on_primary bob churn-verify "${WB_BASE}" "${last_b}" > /dev/null \
-      || fail "an acknowledged bob operation was lost after primary restart (cycle ${i})"
-  fi
 #!/usr/bin/env bash
 # Issue #2178（RECOVER-15 ポインタ。親 #2171）のレプリケーションの障害注入・追従検証の回帰テスト。
 #
@@ -232,7 +218,7 @@ kill_primary() {
 
 PROXY_PORT=""
 start_proxy() {
-  "${PROXY}" --listen 127.0.0.1:0 --target-file "${TARGET_FILE}" > "${WORKDIR}/proxy.log" 2>&1 &
+  python3 -I "${PROXY}" --listen 127.0.0.1:0 --target-file "${TARGET_FILE}" > "${WORKDIR}/proxy.log" 2>&1 &
   proxy_pid=$!
   local waited=0
   while [ "${waited}" -lt 100 ]; do
@@ -524,7 +510,15 @@ while [ "${i}" -lt "${PRIMARY_KILLS}" ] || { [ "${hits}" -lt 1 ] && [ "${i}" -lt
   # ACK を受けた最後の commit が、再起動後のプライマリに残っている。
   if [ "${last_a}" -ge 0 ]; then
     on_primary alice ids-present docs $((WA_BASE + last_a)) $((WA_BASE + last_a)) > /dev/null \
-      || fail "an acknowledged commit was lost after primary restart (cycle ${i})"
+      || fail "an acknowledged alice commit was lost after primary restart (cycle ${i})"
+    on_primary alice churn-verify "${WA_BASE}" "${last_a}" > /dev/null \
+      || fail "an acknowledged alice operation was lost after primary restart (cycle ${i})"
+  fi
+  if [ "${last_b}" -ge 0 ]; then
+    on_primary bob ids-present docs $((WB_BASE + last_b)) $((WB_BASE + last_b)) > /dev/null \
+      || fail "an acknowledged bob commit was lost after primary restart (cycle ${i})"
+    on_primary bob churn-verify "${WB_BASE}" "${last_b}" > /dev/null \
+      || fail "an acknowledged bob operation was lost after primary restart (cycle ${i})"
   fi
 done
 [ "${hits}" -ge 1 ] || fail "no primary kill landed during writes"
