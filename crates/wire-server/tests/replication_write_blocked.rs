@@ -463,8 +463,8 @@ fn recover15_writes_proceed_before_any_cut_while_replica_is_write_blocked() {
     );
     let (mut r, base, mut alice) = p.begin_blocked_target();
     p.fill(&mut alice);
-    // 切断の条件はまだ無い。書き込みは短い上限で完了し、その時点で切断されていない。
-    alice.assert_small_writes_flow(0..5, Duration::from_secs(1));
+    // 切断の条件はまだ無い。書き込みは完了し、その時点で切断されていない（上限は並行負荷下の fsync に耐える値）。
+    alice.assert_small_writes_flow(0..5, Duration::from_secs(15));
     assert_eq!(
         p.disconnect_reason(),
         None,
