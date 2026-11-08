@@ -212,6 +212,29 @@ fn temp_name(out: &Path) -> Result<PathBuf, ResyncError> {
     )))
 }
 
+/// サーバーが一時名を残したままの失敗に備え、あれば消す（自分が決めた名前だけ。リンクはたどらない）。
+/// 消せなかったときは `leftover` に入れ、呼び出し元が通知できるようにする。
+fn discard_temp_name(tmp_path: PathBuf, leftover: &mut Option<PathBuf>) {
+    if std::fs::symlink_metadata(&tmp_path).is_ok() && std::fs::remove_file(&tmp_path).is_err() {
+        *leftover = Some(tmp_path);
+    }
+}
+
+/// 一時名を `TempBase` として保持する。保持できない（差し替え・空など）ときも、全テナントの
+/// スナップショットが残らないよう一時名を片付ける。
+fn adopt_or_discard(
+    tmp_path: PathBuf,
+    leftover: &mut Option<PathBuf>,
+) -> Result<TempBase, ResyncError> {
+    match TempBase::adopt(tmp_path.clone()) {
+        Ok(t) => Ok(t),
+        Err(e) => {
+            discard_temp_name(tmp_path, leftover);
+            Err(e)
+        }
+    }
+}
+
 /// 再同期を実行して、切り替え点の LSN を返す。失敗時は何も公開しない。一時名を消せなかったときは、
 /// 残ったパスを `leftover` に入れる（全テナントのデータが残るので、呼び出し元が通知する）。
 pub fn resync(
@@ -233,14 +256,10 @@ pub fn resync(
         Err(_) => Err(ResyncError::Request),
     };
     if let Err(e) = result {
-        // サーバーが一時名を残したままの失敗に備え、あれば消す（自分が決めた名前だけ）。
-        if std::fs::symlink_metadata(&tmp_path).is_ok() && std::fs::remove_file(&tmp_path).is_err()
-        {
-            *leftover = Some(tmp_path);
-        }
+        discard_temp_name(tmp_path, leftover);
         return Err(e);
     }
-    let mut tmp = TempBase::adopt(tmp_path)?;
+    let mut tmp = adopt_or_discard(tmp_path, leftover)?;
     let outcome = check_and_publish(opts, &mut tmp, leftover);
     tmp.remove();
     if leftover.is_none() {
@@ -387,3 +406,46 @@ fn publish(tmp: &mut TempBase, dest: &Path) -> Result<(), ResyncError> {
 
 // 公開した場合の `backup_opt` 定数との整合（終了コードの表の固定）。
 const _: () = assert!(EXIT_USAGE == backup_opt::EXIT_USAGE);
+
+#[cfg(test)]
+mod adopt_cleanup_tests {
+    use super::*;
+
+    fn scratch(label: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "fandhe-resync-adopt-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(&d).expect("mkdir");
+        d
+    }
+
+    #[test]
+    fn adopt_failure_removes_temp_file() {
+        let dir = scratch("empty");
+        let tmp = dir.join(".fandhe-replica-resync-test.redb");
+        std::fs::write(&tmp, b"").expect("write");
+        let mut leftover = None;
+        let r = adopt_or_discard(tmp.clone(), &mut leftover);
+        assert!(matches!(r, Err(ResyncError::TempReplaced)));
+        assert!(std::fs::symlink_metadata(&tmp).is_err());
+        assert!(leftover.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn adopt_failure_records_leftover_when_unremovable() {
+        let dir = scratch("dir");
+        let tmp = dir.join(".fandhe-replica-resync-test.redb");
+        std::fs::create_dir(&tmp).expect("mkdir");
+        std::fs::write(tmp.join("x"), b"x").expect("write");
+        let mut leftover = None;
+        let r = adopt_or_discard(tmp.clone(), &mut leftover);
+        assert!(r.is_err());
+        assert_eq!(leftover.as_deref(), Some(tmp.as_path()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
