@@ -212,6 +212,8 @@ impl Storage {
             txn.abort()?;
         } else {
             crate::recovery::commit_boundary::commit_maintenance(txn)?;
+            // 確定後に UDF の世代を進め、既存接続が次の文で定義を再ロードするようにする。
+            self.bump_all_function_generations();
         }
         Ok(ReplicaApplyReport {
             applied,

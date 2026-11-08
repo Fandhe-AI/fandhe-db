@@ -25,6 +25,10 @@ use std::path::Path;
 
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 
+/// 複製適用による UDF 世代の全スコープ共通の加算分を、世代表へ入れるときのキー。
+/// テナント識別子は制御文字を含められないため、実在のスコープと衝突しない。
+const REPLICA_FUNCTION_EPOCH_KEY: &str = "\u{0}replica-epoch";
+
 /// 明示トランザクションの書き込み時直列化検査が使う commit 記録（Issue #2404）。
 pub(crate) mod change_log;
 pub(crate) mod commit_log;
@@ -869,6 +873,10 @@ pub struct Storage {
     /// 真なのに [`Self::change_log`] が `None` の間は、書き込みを `CommitFootprintUnrecordable` で
     /// 拒否する（無効のまま書くとレコードが欠けたまま世代が進み、LSN の欠落になるため。D8）。
     change_log_on_disk: bool,
+    /// 読み取りレプリカ（RECOVER-15・Issue #2175）として構成されたか。真の間は、利用者経路の書き込み
+    /// トランザクション生成（[`Self::wrap_gated`]）を fail-closed に拒否する。適用専用の
+    /// [`Self::begin_replica_apply_txn`] は通らないため、複製の適用は従来どおり動く。
+    read_replica: bool,
     /// 一貫スナップショット書き出し（[`Storage::export_snapshot`]）の実行中フラグ。長い読み取り
     /// Tx はページ回収を止めるため、1 つの `Storage` につき同時に 1 本までに制限する。
     snapshot_export_busy: std::sync::atomic::AtomicBool,
@@ -946,6 +954,7 @@ impl Storage {
             commit_log: Some(std::sync::Arc::new(commit_log::CommitLog::new())),
             change_log: None,
             change_log_on_disk: false,
+            read_replica: false,
             snapshot_export_busy: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "test-sync-points")]
             sync_hook: std::sync::Mutex::new(None),
@@ -978,7 +987,17 @@ impl Storage {
             .function_generations
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        map.get(scope).copied().unwrap_or(0)
+        // 複製適用の世代（全スコープ共通）を足す。どちらも単調増加なので和も単調に増える。
+        let own = map.get(scope).copied().unwrap_or(0);
+        let replica = map.get(REPLICA_FUNCTION_EPOCH_KEY).copied().unwrap_or(0);
+        own.saturating_add(replica)
+    }
+
+    /// 複製の適用が確定した後に呼び、全スコープの UDF カタログの世代を進める（Issue #2175・RECOVER-15）。
+    /// 適用は永続表を直接書くため関数定義の変更がどのスコープに及んだか分からず、既存接続が古い定義を
+    /// 使い続けないよう、次の `refresh` で必ず再ロードさせる。
+    pub(crate) fn bump_all_function_generations(&self) {
+        self.bump_function_generation(REPLICA_FUNCTION_EPOCH_KEY);
     }
 
     /// `scope` の UDF カタログの世代を進める（定義を変える commit が成功した後にだけ呼ぶ）。
@@ -1094,6 +1113,11 @@ impl Storage {
         txn: redb::WriteTransaction,
         permit: writer_gate::WriterPermit,
     ) -> Result<GatedWriteTxn> {
+        // 読み取りレプリカでは利用者経路の書き込みを開始しない（安全網。SQL・NoSQL の表層は、これより
+        // 手前で `25006` を返す）。ログ行は出さない（運用者向けの「commit refused」と混同させない）。
+        if self.read_replica {
+            return Err(StorageError::CommitFootprintUnrecordable);
+        }
         // 変更ログを一度有効にした DB を、有効にしないまま書くと LSN が欠落する。fail-closed に拒否する
         // （`txn` と `permit` はここで破棄され、durable な書き込みは発生しない）。
         if self.change_log.is_none() && self.change_log_on_disk {
@@ -1314,6 +1338,17 @@ impl Storage {
             txn: Box::new(txn),
             _permit: permit,
         })
+    }
+
+    /// 読み取りレプリカとして構成する（RECOVER-15・Issue #2175）。以後、利用者経路の書き込みは
+    /// [`Self::wrap_gated`] で拒否される。open 直後（共有前）に `EngineCore::with_read_replica` が呼ぶ。
+    pub(crate) fn mark_read_replica(&mut self) {
+        self.read_replica = true;
+    }
+
+    /// 読み取りレプリカとして構成されているか。SQL 表層のトランザクション層・分類層が参照する。
+    pub fn is_read_replica(&self) -> bool {
+        self.read_replica
     }
 
     /// 変更ログを有効にした DB を、有効にしないまま開いているか。真の間は書き込みを
@@ -3718,6 +3753,7 @@ mod tests {
                 commit_log: None,
                 change_log: None,
                 change_log_on_disk: false,
+                read_replica: false,
                 snapshot_export_busy: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(feature = "test-sync-points")]
                 sync_hook: std::sync::Mutex::new(None),
@@ -3790,6 +3826,7 @@ mod tests {
                 commit_log: None,
                 change_log: None,
                 change_log_on_disk: false,
+                read_replica: false,
                 snapshot_export_busy: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(feature = "test-sync-points")]
                 sync_hook: std::sync::Mutex::new(None),
@@ -3858,6 +3895,7 @@ mod tests {
                 commit_log: None,
                 change_log: None,
                 change_log_on_disk: false,
+                read_replica: false,
                 snapshot_export_busy: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(feature = "test-sync-points")]
                 sync_hook: std::sync::Mutex::new(None),
@@ -3906,6 +3944,7 @@ mod tests {
                 commit_log: None,
                 change_log: None,
                 change_log_on_disk: false,
+                read_replica: false,
                 snapshot_export_busy: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(feature = "test-sync-points")]
                 sync_hook: std::sync::Mutex::new(None),
