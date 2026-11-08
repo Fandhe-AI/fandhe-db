@@ -231,8 +231,9 @@ impl Primary {
     }
 
     /// 約 24 MiB を 1 トランザクション（= 変更ログの 1 レコード）で書き、送信を確実に塞ぐ。その後、送信ループが
-    /// ブロックに入るまで少し待つ。
-    fn fill(&self, alice: &mut TenantSession) {
+    /// ブロックに入るまで少し待つ。戻り値は COMMIT 送信の直前の時刻（サーバー側の write timeout・未 ack の時計と
+    /// 同じ起点。経過時間の下限判定はこの時刻から測る）。
+    fn fill(&self, alice: &mut TenantSession) -> Instant {
         let before = self.current_lsn();
         let body = "x".repeat(STMT_BODY);
         alice.exec("BEGIN");
@@ -241,6 +242,7 @@ impl Primary {
                 "INSERT INTO blobs (id, body) VALUES ({id}, '{body}')"
             ));
         }
+        let committed_at = Instant::now();
         alice.exec("COMMIT");
         assert_eq!(
             self.current_lsn(),
@@ -248,6 +250,7 @@ impl Primary {
             "the fill is one change-log record"
         );
         std::thread::sleep(Duration::from_millis(500));
+        committed_at
     }
 }
 
@@ -386,8 +389,7 @@ fn recover15_ack_timeout_cuts_a_write_blocked_replica_and_releases_retention() {
         ],
     );
     let (mut r, base, mut alice) = p.begin_blocked_target();
-    p.fill(&mut alice);
-    let t0 = Instant::now();
+    let t0 = p.fill(&mut alice);
     alice.assert_small_writes_flow(0..5, Duration::from_secs(15));
     let (reason, seen) = p.wait_disconnect(Duration::from_secs(30));
     let elapsed = seen.duration_since(t0);
