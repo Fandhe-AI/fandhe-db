@@ -429,6 +429,11 @@
 //! 周期的に書き出し（`wire_server::change_log_archive`）、`change-log-verify` サブコマンドがアーカイブを検査する。
 //! PITR の復元は後続の Issue。
 //!
+//! `--change-log-max-unarchived-bytes <n>`・`--change-log-max-unarchived-records <n>`（Issue #3091・RECOVER-14 (2)
+//! ポインタ）: 未アーカイブの変更ログ量の上限（1 以上）。超過すると利用者の書き込みを `54000` で拒否し、
+//! アーカイブが進めば再開する。`--change-log-archive-dir` が前提（欠落・重複・0・不正値は起動エラー）。
+//! アーカイブ先を指定した起動ではバイト上限に実装既定値（4 GiB）を適用する。
+//!
 //! `--replication-bind <addr>`・`--replication-roles <file>`・`--replication-allow <ip|cidr>`・
 //! `--replication-max-connections <n>`・`--replication-max-unacked-bytes <n>`・
 //! `--replication-ack-timeout-secs <n>`・`--replication-max-lag-records <n>`（Issue #2173・RECOVER-15・WIRE-9 ポインタ）: ストリーミング
@@ -677,6 +682,8 @@ fn run_server(args: &[String]) -> ExitCode {
     let mut change_log_archive_dir: Option<std::path::PathBuf> = None;
     let mut change_log_retain_records: Option<u64> = None;
     let mut change_log_interval_secs: Option<u64> = None;
+    let mut change_log_max_unarchived_records: Option<u64> = None;
+    let mut change_log_max_unarchived_bytes: Option<u64> = None;
     let mut replication_args = wire_server::replication_opt::ReplicationArgs::default();
     // Issue #2175（RECOVER-15 ポインタ）: 読み取りレプリカモードの `--replica-*` フラグ（`replica` サブコマンドの
     // フラグ名へ写して集め、検証は `replica_opt::parse` に一本化する。重複指定もそこで拒否される）。
@@ -2439,6 +2446,48 @@ fn run_server(args: &[String]) -> ExitCode {
                 }
                 i += 2;
             }
+            // Issue #3091（RECOVER-14 (2) ポインタ）。未アーカイブの変更ログ量の上限。値の検証と重複指定の
+            // 拒否は `change_log_opt`（エラー文は固定の英語で、値を含めない）。
+            wire_server::change_log_opt::MAX_UNARCHIVED_RECORDS_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a value",
+                        wire_server::change_log_opt::MAX_UNARCHIVED_RECORDS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                match wire_server::change_log_opt::accept_max_unarchived_records(
+                    change_log_max_unarchived_records.is_some(),
+                    v,
+                ) {
+                    Ok(n) => change_log_max_unarchived_records = Some(n),
+                    Err(msg) => {
+                        engine::log_stderr!("wire-server: {msg}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+                i += 2;
+            }
+            wire_server::change_log_opt::MAX_UNARCHIVED_BYTES_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a value",
+                        wire_server::change_log_opt::MAX_UNARCHIVED_BYTES_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                match wire_server::change_log_opt::accept_max_unarchived_bytes(
+                    change_log_max_unarchived_bytes.is_some(),
+                    v,
+                ) {
+                    Ok(n) => change_log_max_unarchived_bytes = Some(n),
+                    Err(msg) => {
+                        engine::log_stderr!("wire-server: {msg}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+                i += 2;
+            }
             // Issue #2173（RECOVER-15 ポインタ）。レプリケーション送信側の専用リスナー・認証ロール・許可リスト・
             // 接続数とバックプレッシャの上限。値の検証と重複指定の拒否は `replication_opt`（エラー文は固定の英語で、
             // 値・パスを含めない）。
@@ -2491,11 +2540,13 @@ fn run_server(args: &[String]) -> ExitCode {
 
     // Issue #2167: アーカイブ系フラグの組み合わせ（`--change-log` が前提、保持・周期はアーカイブ先が前提）を
     // DB を開く前に検査する（fail-closed）。
-    let change_log_archive = match wire_server::change_log_opt::resolve(
+    let change_log_archive = match wire_server::change_log_opt::resolve_with_limits(
         change_log,
         change_log_archive_dir,
         change_log_retain_records,
         change_log_interval_secs,
+        change_log_max_unarchived_records,
+        change_log_max_unarchived_bytes,
     ) {
         Ok(a) => a,
         Err(msg) => {
@@ -3434,7 +3485,18 @@ fn run_server(args: &[String]) -> ExitCode {
     // 構築する（[`open_engine_core_with_change_log`]）。未指定でも、一度有効にした DB は書き込むと LSN が
     // 欠落するため、起動を拒否する（fail-closed。無効の DB の経路は従来とビット同一）。
     let opened = if change_log {
-        open_engine_core_with_change_log(&db_path, durability, search_engine_kind)
+        // 未アーカイブ量の上限（Issue #3091）はアーカイブ先を指定した起動だけに適用する（既定値の理由は
+        // `change_log_opt::DEFAULT_MAX_UNARCHIVED_BYTES`）。
+        let unarchived_limit =
+            change_log_archive
+                .as_ref()
+                .map_or(engine::storage::UnarchivedLimit::default(), |a| {
+                    engine::storage::UnarchivedLimit {
+                        max_records: a.max_unarchived_records,
+                        max_bytes: a.max_unarchived_bytes,
+                    }
+                });
+        open_engine_core_with_change_log(&db_path, durability, search_engine_kind, unarchived_limit)
     } else {
         open_engine_core(&db_path, durability, search_engine_kind)
     };
@@ -4260,11 +4322,12 @@ fn open_engine_core_with_change_log(
     db_path: &std::path::Path,
     durability: engine::storage::WriteDurability,
     search_engine_kind: Option<engine::search_engine::SearchEngineKind>,
+    unarchived_limit: engine::storage::UnarchivedLimit,
 ) -> Result<engine::core::EngineCore, String> {
     let mut storage = engine::storage::Storage::open_with_durability(db_path, durability)
         .map_err(|e| format!("failed to open database at {db_path:?}: {e}"))?;
     storage
-        .enable_change_log()
+        .enable_change_log_with_unarchived_limit(unarchived_limit)
         .map_err(|e| format!("failed to enable the change log: {e}"))?;
     let kind = search_engine_kind.unwrap_or_else(engine::search_engine::default_kind);
     Ok(engine::core::EngineCore::from_storage_with_engine(

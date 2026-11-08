@@ -52,6 +52,7 @@ pub use change_log::archive::{
     ArchiveSummary, DEFAULT_PRUNE_BYTES, DEFAULT_PRUNE_RECORDS, DEFAULT_SEGMENT_BYTES,
     SEGMENT_FORMAT_VERSION,
 };
+pub use change_log::backlog::{UnarchivedLimit, UnarchivedStatus};
 pub use change_log::incremental::{
     apply_incremental_segments, chain_point_of, ApplySummary, ChainPoint, IncrementalError,
     IncrementalSummary,
@@ -1207,11 +1208,43 @@ impl Storage {
         self.enable_change_log_with(change_log::CaptureLimits::default())
     }
 
+    /// [`Self::enable_change_log`] に未アーカイブの変更ログ量の上限を加えた版（RECOVER-14 (2)・
+    /// Issue #3091）。未アーカイブ量が上限以上の間、利用者の commit は `54000` で commit 前に拒否され
+    /// （世代・レコード・データは確定しない）、アーカイブが水位を進めれば再起動なしで再開する。
+    /// 上限は旧形式の表の移行が終わった後に有効になる（上限を超えた DB の再起動が移行の拒否で
+    /// 失敗しないようにするため）。0 の上限は `Err`。`&mut self` で構築段階だけから呼べる。
+    pub fn enable_change_log_with_unarchived_limit(
+        &mut self,
+        limit: change_log::backlog::UnarchivedLimit,
+    ) -> Result<()> {
+        self.enable_change_log_inner(change_log::CaptureLimits::default(), limit)
+    }
+
+    /// 未アーカイブの変更ログ量の状態（件数・バイト・上限・拒否中か）。変更ログが無効なら `None`。
+    /// 運用者向けで、SQL・NoSQL の表層からは呼べない（テナントに他者の書き込み量を見せない）。
+    pub fn change_log_unarchived_status(
+        &self,
+    ) -> Result<Option<change_log::backlog::UnarchivedStatus>> {
+        let Some(state) = self.change_log.as_ref() else {
+            return Ok(None);
+        };
+        change_log::backlog::status(&self.db.begin_read()?, state).map(Some)
+    }
+
     /// [`Self::enable_change_log`] の上限指定版（上限のテストが使う）。
     pub(crate) fn enable_change_log_with(
         &mut self,
         limits: change_log::CaptureLimits,
     ) -> Result<()> {
+        self.enable_change_log_inner(limits, change_log::backlog::UnarchivedLimit::default())
+    }
+
+    fn enable_change_log_inner(
+        &mut self,
+        limits: change_log::CaptureLimits,
+        unarchived_limit: change_log::backlog::UnarchivedLimit,
+    ) -> Result<()> {
+        unarchived_limit.validate()?;
         if self.temp_scoped {
             return Err(StorageError::Codec(
                 "change log is not available for temporary storage".to_string(),
@@ -1246,6 +1279,12 @@ impl Storage {
                     self.change_log = None;
                     return Err(e);
                 }
+                if !unarchived_limit.is_unlimited() {
+                    if let Err(e) = self.apply_unarchived_limit(unarchived_limit) {
+                        self.change_log = None;
+                        return Err(e);
+                    }
+                }
                 Ok(())
             }
             Err(e) => {
@@ -1253,6 +1292,27 @@ impl Storage {
                 Err(e)
             }
         }
+    }
+
+    /// 移行が終わった後に、バイト上限があれば数え値を数え直して書き（保守 commit）、上限を設定する。
+    fn apply_unarchived_limit(
+        &mut self,
+        limit: change_log::backlog::UnarchivedLimit,
+    ) -> Result<()> {
+        if limit.max_bytes.is_some() {
+            let txn = self.begin_write_txn()?;
+            change_log::backlog::recount_into(&txn)?;
+            crate::recovery::commit_boundary::commit_maintenance(txn)?;
+        }
+        let state = self
+            .change_log
+            .as_mut()
+            .and_then(std::sync::Arc::get_mut)
+            .ok_or_else(|| {
+                StorageError::Codec("change log state is shared during enable".to_string())
+            })?;
+        state.unarchived_limit = limit;
+        Ok(())
     }
 
     /// オラクル試験用: 全レコードを空の状態から再生した結果が実表と一致するか(feature `change-log-oracle` のみ。
@@ -1304,11 +1364,17 @@ impl Storage {
 
     /// 保守 commit 用の書き込みトランザクション（変更ログの水位更新・刈り込み）。通常の書き込みが
     /// 待機している間はゲートを譲り、待機上限を超えたら `None`（今回は見送り。D6）。
-    pub(crate) fn begin_maintenance_txn(&self) -> Result<Option<GatedWriteTxn>> {
-        let permit = match self
-            .writer_gate
-            .acquire_yielding(crate::interrupt::effective_lock_wait(self.write_lock_wait))
-        {
+    ///
+    /// `blocking` が真（未アーカイブ量が上限に達している。Issue #3091）のときは譲らず、通常の書き込みと
+    /// 同じ並びでゲートを取る（拒否された書き手の再試行が続いても、水位を進める保守 commit が飢えない）。
+    pub(crate) fn begin_maintenance_txn(&self, blocking: bool) -> Result<Option<GatedWriteTxn>> {
+        let wait = crate::interrupt::effective_lock_wait(self.write_lock_wait);
+        let acquired = if blocking {
+            self.writer_gate.acquire(wait)
+        } else {
+            self.writer_gate.acquire_yielding(wait)
+        };
+        let permit = match acquired {
             Ok(p) => p,
             Err(writer_gate::GateError::Timeout) => return Ok(None),
             Err(writer_gate::GateError::HeldByCurrentThread) => {
