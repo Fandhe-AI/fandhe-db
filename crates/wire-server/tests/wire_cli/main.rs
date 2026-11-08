@@ -28,6 +28,7 @@ mod transaction_limits_parity;
 mod verify_restore_cli;
 mod wire7_bind_guard;
 mod wire_change_log_archive_cli;
+mod wire_change_log_cleanup_cli;
 mod wire_change_log_cli;
 mod wire_change_log_disable_cli;
 mod wire_correlated_limits_cli;
