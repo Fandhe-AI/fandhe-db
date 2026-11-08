@@ -427,7 +427,14 @@
 //! （Issue #2167・RECOVER-14 ポインタ）: 変更ログのアーカイブ先・保持件数・書き出し周期。`--change-log` が前提で、
 //! 保持・周期はアーカイブ先が前提（欠落・重複・不正値は起動エラー）。保持の既定は刈り込まない。常駐スレッドが
 //! 周期的に書き出し（`wire_server::change_log_archive`）、`change-log-verify` サブコマンドがアーカイブを検査する。
+//! `change-log-disable --db <path> [--discard-unarchived]`（Issue #3093）は停止中の DB の変更ログを無効化する
+//! （未アーカイブのレコードが在ると既定では拒否する）。
 //! PITR の復元は後続の Issue。
+//!
+//! `--change-log-max-unarchived-bytes <n>`・`--change-log-max-unarchived-records <n>`（Issue #3091・RECOVER-14 (2)
+//! ポインタ）: 未アーカイブの変更ログ量の上限（1 以上）。超過すると利用者の書き込みを `54000` で拒否し、
+//! アーカイブが進めば再開する。`--change-log-archive-dir` が前提（欠落・重複・0・不正値は起動エラー）。
+//! アーカイブ先を指定した起動ではバイト上限に実装既定値（4 GiB）を適用する。
 //!
 //! `--replication-bind <addr>`・`--replication-roles <file>`・`--replication-allow <ip|cidr>`・
 //! `--replication-max-connections <n>`・`--replication-max-unacked-bytes <n>`・
@@ -437,10 +444,24 @@
 //! 起動エラー。TLS は #2177）。重複指定・不正値・前提の欠落は DB を開く前に起動エラー
 //! （`wire_server::replication_opt`・`wire_server::replication`。`docs/design/replication-streaming.md` 参照）。
 //!
+//! `--replication-sync-standby <role>`（繰り返し可）・`--replication-sync-commit <remote_write|on|remote_apply>`・
+//! `--replication-sync-timeout-secs <n>`・`--replication-sync-on-timeout <degrade|reject>`（Issue #2245・
+//! RECOVER-15 ポインタ）: 同期レプリケーション（オプション）。指定したロールのレプリカの確認を待ってから commit の
+//! 成功応答を返す（既定は非同期）。`--replication-bind` が前提で、ロールは `--replication-roles` に存在すること。
+//! 上限を指定したときは超過時の扱い（`degrade`／`reject`）が必須。起動時に調停役を `EngineCore::with_sync_commit` へ
+//! 1 回だけ注入し、テナントのセッション・SQL・HTTP からは水準を変えられない
+//! （`wire_server::sync_commit_wait`。`docs/design/replication-streaming.md` 参照）。
+//!
 //! `replica --db <path> --primary <ip:port> --credentials <file>`（Issue #2174・RECOVER-15 ポインタ）:
 //! ストリーミングレプリケーションの受信側のサブコマンド。ベースのコピーをプライマリの `--replication-bind` に
 //! 追従させ、変更を commit 番号順に原子的に適用する（`wire_server::replica_opt`・`wire_server::replica`）。
 //! 接続先はループバックのみ。終了コード 10＝適用停止、11＝プライマリの拒否、2＝引数の不備。
+//!
+//! `--replica-primary <ip:port>`・`--replica-credentials <file>`（任意で `--replica-max-backoff-secs`・
+//! `--replica-batch-records`・`--replica-batch-bytes`。Issue #2175・RECOVER-15 ポインタ）: 読み取りレプリカモード。
+//! 通常のテナント向けリスナーと `replica` サブコマンドの適用ループを同じプロセスで動かし、書き込み・DDL・`COPY FROM` は
+//! `25006` で拒否する。`--change-log`・`--replication-*`・`--backup-socket` との併用とベースでない DB は起動拒否。
+//! 適用が停止したらプロセスを終了する（終了コード 10・11）。判断は `docs/design/replication-streaming.md`。
 //!
 //! `--require-where-for-dml`（Issue #2210・SQL-36 ポインタ）: 値を取らないスイッチ。
 //! 指定すると `WHERE` 省略の SQL `UPDATE`／`DELETE` を変更開始前に `42601` で拒否する
@@ -520,12 +541,17 @@
 //! さらに `--change-log-archive-dir <dir>` と `--until-lsn <n>`（または `--until-time <RFC 3339・ゾーン必須>`）を
 //! 指定すると、アーカイブの変更ログを指定点のコミット境界まで適用する（PITR。Issue #2169・RECOVER-14 ポインタ。
 //! 範囲外・欠落・破損は何も公開せず 1 で終了。`--until-*` の組み合わせの不正は DB に触れる前に 2 で終了）。
+//! `--generation-state <path>` を指定すると、復元をまたぐ世代の高水位を状態ファイルに持ち、繰り返し復元でも
+//! 世代が単調に増える（Issue #3105・RECOVER-17 ポインタ。保持できなければ何も公開せず 1、引数の不正は 2 で終了）。
 //!
+//! `wire-server backup-incremental --socket <path> --base <path> --out <path>`（Issue #3098）は、稼働中のサーバーの
+//! 運用者専用ソケットへ増分を依頼する（`--db` と排他。ベースの終点は CLI が読んで送る）。
 //! `wire-server backup-incremental --db <path> --base <path> --out <path>` サブコマンドは、**停止中**の DB から、
 //! 直前のベース（フルバックアップまたは前回の増分）が終わった commit の次から最新までのログ区間を増分
 //! バックアップとして書き出す（Issue #2168・RECOVER-13・RECOVER-14 ポインタ。変更ログ `--change-log` を有効にした
 //! DB に限る）。終了コード: 0=成功、1=実行時の失敗（連鎖の切断・別 DB・区間が空・稼働中を含む）、2=引数／
-//! 出力先の拒否。詳細は `wire_server::incremental_opt`。
+//! 出力先の拒否。`--change-log-archive-dir <dir>` を足すと、保持設定で刈り込まれた区間をアーカイブから補う
+//! （Issue #3099・RECOVER-14 ポインタ。欠落・改ざんは何も公開せず 1）。詳細は `wire_server::incremental_opt`。
 //!
 //! `wire-server dump --db <path> --out <file> (--tenant <id> | --shared-only) [--schema-only | --data-only]
 //! [--format copy|insert]` サブコマンドは、**停止中**の DB から論理ダンプ（SQL スクリプト形式）を新規ファイルへ
@@ -608,6 +634,12 @@ fn main() -> ExitCode {
     if args.get(1).map(String::as_str) == Some("change-log-verify") {
         return run_change_log_verify(&args[2..]);
     }
+    if args.get(1).map(String::as_str) == Some("change-log-cleanup") {
+        return run_change_log_cleanup(&args[2..]);
+    }
+    if args.get(1).map(String::as_str) == Some("change-log-disable") {
+        return run_change_log_disable(&args[2..]);
+    }
     if args.get(1).map(String::as_str) == Some("verify") {
         return run_verify(&args[2..]);
     }
@@ -661,7 +693,12 @@ fn run_server(args: &[String]) -> ExitCode {
     let mut change_log_archive_dir: Option<std::path::PathBuf> = None;
     let mut change_log_retain_records: Option<u64> = None;
     let mut change_log_interval_secs: Option<u64> = None;
+    let mut change_log_max_unarchived_records: Option<u64> = None;
+    let mut change_log_max_unarchived_bytes: Option<u64> = None;
     let mut replication_args = wire_server::replication_opt::ReplicationArgs::default();
+    // Issue #2175（RECOVER-15 ポインタ）: 読み取りレプリカモードの `--replica-*` フラグ（`replica` サブコマンドの
+    // フラグ名へ写して集め、検証は `replica_opt::parse` に一本化する。重複指定もそこで拒否される）。
+    let mut replica_pairs: Vec<(&'static str, String)> = Vec::new();
     let mut require_where_for_dml = false;
     let mut max_dml_affected_rows_raw: Option<String> = None;
     let mut max_insert_rows_raw: Option<String> = None;
@@ -2420,6 +2457,48 @@ fn run_server(args: &[String]) -> ExitCode {
                 }
                 i += 2;
             }
+            // Issue #3091（RECOVER-14 (2) ポインタ）。未アーカイブの変更ログ量の上限。値の検証と重複指定の
+            // 拒否は `change_log_opt`（エラー文は固定の英語で、値を含めない）。
+            wire_server::change_log_opt::MAX_UNARCHIVED_RECORDS_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a value",
+                        wire_server::change_log_opt::MAX_UNARCHIVED_RECORDS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                match wire_server::change_log_opt::accept_max_unarchived_records(
+                    change_log_max_unarchived_records.is_some(),
+                    v,
+                ) {
+                    Ok(n) => change_log_max_unarchived_records = Some(n),
+                    Err(msg) => {
+                        engine::log_stderr!("wire-server: {msg}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+                i += 2;
+            }
+            wire_server::change_log_opt::MAX_UNARCHIVED_BYTES_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a value",
+                        wire_server::change_log_opt::MAX_UNARCHIVED_BYTES_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                match wire_server::change_log_opt::accept_max_unarchived_bytes(
+                    change_log_max_unarchived_bytes.is_some(),
+                    v,
+                ) {
+                    Ok(n) => change_log_max_unarchived_bytes = Some(n),
+                    Err(msg) => {
+                        engine::log_stderr!("wire-server: {msg}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+                i += 2;
+            }
             // Issue #2173（RECOVER-15 ポインタ）。レプリケーション送信側の専用リスナー・認証ロール・許可リスト・
             // 接続数とバックプレッシャの上限。値の検証と重複指定の拒否は `replication_opt`（エラー文は固定の英語で、
             // 値・パスを含めない）。
@@ -2429,7 +2508,11 @@ fn run_server(args: &[String]) -> ExitCode {
             | "--replication-max-connections"
             | "--replication-max-unacked-bytes"
             | "--replication-ack-timeout-secs"
-            | "--replication-max-lag-records") => {
+            | "--replication-max-lag-records"
+            | "--replication-sync-standby"
+            | "--replication-sync-commit"
+            | "--replication-sync-timeout-secs"
+            | "--replication-sync-on-timeout") => {
                 let Some(v) = args.get(i + 1) else {
                     engine::log_stderr!("wire-server: {flag} requires a value");
                     return ExitCode::FAILURE;
@@ -2438,6 +2521,25 @@ fn run_server(args: &[String]) -> ExitCode {
                     engine::log_stderr!("wire-server: {msg}");
                     return ExitCode::FAILURE;
                 }
+                i += 2;
+            }
+            flag @ ("--replica-primary"
+            | "--replica-credentials"
+            | "--replica-max-backoff-secs"
+            | "--replica-batch-records"
+            | "--replica-batch-bytes") => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!("wire-server: {flag} requires a value");
+                    return ExitCode::FAILURE;
+                };
+                let mapped = match flag {
+                    "--replica-primary" => "--primary",
+                    "--replica-credentials" => "--credentials",
+                    "--replica-max-backoff-secs" => "--max-backoff-secs",
+                    "--replica-batch-records" => "--batch-records",
+                    _ => "--batch-bytes",
+                };
+                replica_pairs.push((mapped, v.clone()));
                 i += 2;
             }
             other => {
@@ -2449,11 +2551,13 @@ fn run_server(args: &[String]) -> ExitCode {
 
     // Issue #2167: アーカイブ系フラグの組み合わせ（`--change-log` が前提、保持・周期はアーカイブ先が前提）を
     // DB を開く前に検査する（fail-closed）。
-    let change_log_archive = match wire_server::change_log_opt::resolve(
+    let change_log_archive = match wire_server::change_log_opt::resolve_with_limits(
         change_log,
         change_log_archive_dir,
         change_log_retain_records,
         change_log_interval_secs,
+        change_log_max_unarchived_records,
+        change_log_max_unarchived_bytes,
     ) {
         Ok(a) => a,
         Err(msg) => {
@@ -2469,6 +2573,46 @@ fn run_server(args: &[String]) -> ExitCode {
         Err(msg) => {
             engine::log_stderr!("wire-server: {msg}");
             return ExitCode::FAILURE;
+        }
+    };
+
+    // Issue #2175: 読み取りレプリカモード。変更ログ・送信側・バックアップとの併用は DB を開く前に拒否する
+    // （変更ログを有効にすると適用が拒否され履歴が分岐する。カスケード・レプリカからのバックアップは対象外）。
+    // 値・資格情報ファイルの検証は `replica_opt::parse`（DB は既存のベースだけを受け付ける）。
+    // 非 unix では `replica`・`replica_opt` モジュールが無いため、`--replica-*` は起動拒否（unix only）。
+    #[cfg(not(unix))]
+    let replica_opts: Option<std::convert::Infallible> = {
+        if !replica_pairs.is_empty() {
+            engine::log_stderr!("wire-server: --replica-* is supported on unix only");
+            return ExitCode::FAILURE;
+        }
+        None
+    };
+    #[cfg(unix)]
+    let replica_opts = if replica_pairs.is_empty() {
+        None
+    } else {
+        if change_log || replication.is_some() || backup_socket_raw.is_some() {
+            engine::log_stderr!(
+                "wire-server: --replica-* cannot be combined with --change-log, --replication-* or --backup-socket"
+            );
+            return ExitCode::FAILURE;
+        }
+        let Some(db) = db_path.as_ref().and_then(|p| p.to_str()) else {
+            engine::log_stderr!("wire-server: --replica-* requires --db <path> (UTF-8)");
+            return ExitCode::FAILURE;
+        };
+        let mut replica_args: Vec<String> = vec!["--db".to_string(), db.to_string()];
+        for (flag, value) in &replica_pairs {
+            replica_args.push((*flag).to_string());
+            replica_args.push(value.clone());
+        }
+        match wire_server::replica_opt::parse(&replica_args) {
+            Ok(o) => Some(o),
+            Err(msg) => {
+                engine::log_stderr!("wire-server: replica: {msg}");
+                return ExitCode::FAILURE;
+            }
         }
     };
 
@@ -3352,7 +3496,18 @@ fn run_server(args: &[String]) -> ExitCode {
     // 構築する（[`open_engine_core_with_change_log`]）。未指定でも、一度有効にした DB は書き込むと LSN が
     // 欠落するため、起動を拒否する（fail-closed。無効の DB の経路は従来とビット同一）。
     let opened = if change_log {
-        open_engine_core_with_change_log(&db_path, durability, search_engine_kind)
+        // 未アーカイブ量の上限（Issue #3091）はアーカイブ先を指定した起動だけに適用する（既定値の理由は
+        // `change_log_opt::DEFAULT_MAX_UNARCHIVED_BYTES`）。
+        let unarchived_limit =
+            change_log_archive
+                .as_ref()
+                .map_or(engine::storage::UnarchivedLimit::default(), |a| {
+                    engine::storage::UnarchivedLimit {
+                        max_records: a.max_unarchived_records,
+                        max_bytes: a.max_unarchived_bytes,
+                    }
+                });
+        open_engine_core_with_change_log(&db_path, durability, search_engine_kind, unarchived_limit)
     } else {
         open_engine_core(&db_path, durability, search_engine_kind)
     };
@@ -3363,7 +3518,21 @@ fn run_server(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    if !change_log && core.change_log_required() {
+    // Issue #2175: 読み取りレプリカとして構成する（ベースでなければ起動を拒否。以後の利用者経路の書き込みは
+    // すべて `25006`）。レプリカのベースは「変更ログを一度有効にして、有効にしないまま開いた」状態なので、
+    // 下の `change_log_required` による起動拒否はこのモードでは適用しない。
+    if replica_opts.is_some() {
+        core = match core.with_read_replica() {
+            Ok(c) => c,
+            Err(_) => {
+                engine::log_stderr!(
+                    "wire-server: replica: the database is not a replica base (restore a backup first)"
+                );
+                return ExitCode::FAILURE;
+            }
+        };
+    }
+    if !change_log && replica_opts.is_none() && core.change_log_required() {
         engine::log_stderr!(
             "wire-server: {}",
             wire_server::change_log_opt::REQUIRED_MESSAGE
@@ -3379,7 +3548,8 @@ fn run_server(args: &[String]) -> ExitCode {
     // WIRE-18・Issue #2233: カタログのロールのログイン名対応表を後追いで登録する（#1962 以降に作られた
     // 既存のロールを SCRAM 認証の対象にする。冪等）。失敗したら listen せず起動を拒否する（fail-closed。
     // 対応表が不整合のままログイン可否を決めない）。エラーは固定文言で、識別子・テナントを含まない。
-    if core.sync_login_names().is_err() {
+    // 読み取りレプリカは DB へ書かない（ログイン名の対応表・ブートストラップはプライマリ側で作られ複製される）。
+    if replica_opts.is_none() && core.sync_login_names().is_err() {
         engine::log_stderr!("wire-server: failed to synchronize role login names");
         return ExitCode::FAILURE;
     }
@@ -3387,7 +3557,13 @@ fn run_server(args: &[String]) -> ExitCode {
     // ファイルの行から初期ロールを作り（既存ロールのあるテナントはマーカーだけを補う）、以後の認証・
     // 権限はカタログを正とする。`--ddl-allowed-users` の適用後（上）に呼ぶ。失敗したらカタログへ何も
     // 書かれていないので listen せず起動を拒否する（fail-closed。固定文言で、資格情報・テナントを含めない）。
-    match wire_server::auth::bootstrap::bootstrap_users_file(&store, &core) {
+    let bootstrap_result = if replica_opts.is_some() {
+        engine::log_stderr!("wire-server: users file bootstrap skipped on read replica");
+        Ok(wire_server::auth::bootstrap::BootstrapSummary::default())
+    } else {
+        wire_server::auth::bootstrap::bootstrap_users_file(&store, &core)
+    };
+    match bootstrap_result {
         Ok(summary) => {
             if summary.tenants_bootstrapped + summary.tenants_adopted > 0 {
                 engine::log_stderr!(
@@ -3434,6 +3610,11 @@ fn run_server(args: &[String]) -> ExitCode {
     // `Option` 分岐は不要——`with_dml_limits` は `DmlLimits::default()` を渡しても
     // 既存挙動とビット同一）。
     core = core.with_dml_limits(dml_limits);
+    // Issue #2245: 同期レプリケーション（`--replication-sync-standby` 指定時だけ）。テナント向けリスナーの
+    // accept より前に 1 回だけ注入する。指定が無ければ調停役を作らず、既定の非同期の経路は変わらない。
+    if let Some(sync) = replication.as_ref().and_then(|r| r.sync.clone()) {
+        core = core.with_sync_commit(Arc::new(engine::storage::SyncCommitCoordinator::new(sync)));
+    }
     // Issue #1548: 未指定でも常に呼ぶ（`schema_limits` は既定まで解決済み。既定は
     // ハード上限と同値で、未注入と挙動が同一）。
     core = core.with_schema_limits(schema_limits);
@@ -3524,6 +3705,39 @@ fn run_server(args: &[String]) -> ExitCode {
         require_where_for_dml,
     ));
     let core = Arc::new(core);
+
+    // Issue #2175: 読み取りレプリカの適用ループを常駐させる（redb は 1 プロセスが排他的に開くため、
+    // 適用と読み取りの提供は同じプロセス・同じ `EngineCore` で行う）。適用が停止（整合性違反・プライマリの
+    // 拒否）したら、古いデータを黙って配り続けないよう固定の終了コードでプロセスごと終える（fail-closed）。
+    // 進捗は標準エラーだけに出る（テナントのセッションからは参照できない）。
+    #[cfg(unix)]
+    if let Some(opts) = replica_opts {
+        let apply_core = Arc::clone(&core);
+        let spawned = std::thread::Builder::new()
+            .name("replica-apply".to_string())
+            .spawn(move || {
+                // 適用スレッドの panic でも listener だけが生き残って古いデータを配り続けないよう、
+                // panic を捕捉してプロセスごと終える（fail-closed）。
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    wire_server::replica::run(&apply_core, &opts)
+                }));
+                match outcome {
+                    Ok(halt) => {
+                        engine::log_stderr!("wire-server: replica: apply loop stopped, exiting");
+                        std::process::exit(i32::from(halt.exit_code()));
+                    }
+                    Err(_) => {
+                        engine::log_stderr!("wire-server: replica: apply loop panicked, exiting");
+                        std::process::exit(1);
+                    }
+                }
+            });
+        if spawned.is_err() {
+            engine::log_stderr!("wire-server: failed to start the replica apply thread");
+            return ExitCode::FAILURE;
+        }
+        engine::log_stderr!("wire-server: read replica mode (writes are rejected)");
+    }
 
     // `guarded.bind()` は検証済みの数値アドレスへ直接 bind し、`bind_addr`
     // （文字列）を別途 `TcpListener::bind` へ渡すことはしない（検証時と bind 時で
@@ -4119,11 +4333,12 @@ fn open_engine_core_with_change_log(
     db_path: &std::path::Path,
     durability: engine::storage::WriteDurability,
     search_engine_kind: Option<engine::search_engine::SearchEngineKind>,
+    unarchived_limit: engine::storage::UnarchivedLimit,
 ) -> Result<engine::core::EngineCore, String> {
     let mut storage = engine::storage::Storage::open_with_durability(db_path, durability)
         .map_err(|e| format!("failed to open database at {db_path:?}: {e}"))?;
     storage
-        .enable_change_log()
+        .enable_change_log_with_unarchived_limit(unarchived_limit)
         .map_err(|e| format!("failed to enable the change log: {e}"))?;
     let kind = search_engine_kind.unwrap_or_else(engine::search_engine::default_kind);
     Ok(engine::core::EngineCore::from_storage_with_engine(
@@ -4212,11 +4427,12 @@ fn run_backup(args: &[String]) -> ExitCode {
     }
 }
 
-/// `backup-incremental --db <path> --base <path> --out <path>` サブコマンド（Issue #2168・RECOVER-13・
+/// `backup-incremental (--db <path> | --socket <path>) --base <path> --out <path>` サブコマンド（Issue #2168・RECOVER-13・
 /// RECOVER-14 ポインタ）。ベースの終点を読み（フルバックアップは読み取り専用で開き、増分は全体を検証する）、
 /// 停止中の DB を読み取り専用で開いて、その次から最新までのログ区間を `--out` へ書き出す。稼働中のサーバーが
 /// 開いている DB は拒否する（終了コード 1）。DB・ベースへは書き込まない。エラー文に行の値・パス・表名・
-/// commit 番号は含めない。
+/// commit 番号は含めない。`--socket`（Issue #3098）は稼働中のサーバーの運用者専用ソケットへ依頼する
+/// （[`run_backup_incremental_via_socket`]）。
 fn run_backup_incremental(args: &[String]) -> ExitCode {
     use engine::storage::{chain_point_of, IncrementalError, ReadOnlyOpenError, ReadOnlyStorage};
     use wire_server::{backup_opt, incremental_opt};
@@ -4228,12 +4444,22 @@ fn run_backup_incremental(args: &[String]) -> ExitCode {
             return ExitCode::from(backup_opt::EXIT_USAGE);
         }
     };
+    let db = match &parsed.target {
+        backup_opt::Target::Db(db) => db,
+        backup_opt::Target::Socket(sock) => {
+            return run_backup_incremental_via_socket(sock, &parsed.base, &parsed.out)
+        }
+    };
     let result = chain_point_of(&parsed.base).and_then(|base| {
-        let ro = ReadOnlyStorage::open(&parsed.db).map_err(|e| match e {
+        let ro = ReadOnlyStorage::open(db).map_err(|e| match e {
             ReadOnlyOpenError::InUse => IncrementalError::InUse,
             _ => IncrementalError::SourceUnreadable,
         })?;
-        ro.export_incremental(&base, &parsed.out)
+        match &parsed.archive_dir {
+            // 刈り込み済みの区間をアーカイブから補う（Issue #3099・RECOVER-14）。
+            Some(dir) => ro.export_incremental_with_archive(&base, dir, &parsed.out),
+            None => ro.export_incremental(&base, &parsed.out),
+        }
     });
     let (code, msg) = incremental_opt::classify(&result);
     match code {
@@ -4464,13 +4690,7 @@ fn run_restore(args: &[String]) -> ExitCode {
         }
     };
     let mut leftover = None;
-    let result = restore_opt::restore_with_pitr(
-        &parsed.from,
-        &parsed.db,
-        &parsed.incrementals,
-        parsed.pitr.as_ref(),
-        &mut leftover,
-    );
+    let result = restore_opt::restore_with_args(&parsed, &mut leftover);
     if matches!(
         &result,
         Err(restore_opt::RestoreError::UncheckedContentPublished)
@@ -4524,9 +4744,25 @@ fn run_change_log_verify(args: &[String]) -> ExitCode {
             return ExitCode::from(change_log_opt::EXIT_VERIFY_USAGE);
         }
     };
+    // `--base`: 保持しているフルバックアップの最も古い終点より前を、意図して消したアーカイブとして検査する
+    // （Issue #3092）。DB を読み取り専用で開く前に、DB と各バックアップの位置を読む（同じファイルを
+    // 二重に開かない）。DB 識別子・timeline が食い違うバックアップは拒否する（検査の緩和に使わせない）。
+    let retained_from = match (&parsed.db, parsed.bases.is_empty()) {
+        (Some(db), false) => match retained_from_bases(db, &parsed.bases) {
+            Ok(l) => Some(l),
+            Err(msg) => {
+                engine::log_stderr!("wire-server: change-log-verify: {msg}");
+                return ExitCode::from(change_log_opt::EXIT_VERIFY_FAILED);
+            }
+        },
+        _ => None,
+    };
     let result = match &parsed.db {
         Some(db) => match engine::storage::ReadOnlyStorage::open(db) {
-            Ok(ro) => ro.verify_change_log_archive(&parsed.dir),
+            Ok(ro) => match retained_from {
+                Some(l) => ro.verify_change_log_archive_from(&parsed.dir, l),
+                None => ro.verify_change_log_archive(&parsed.dir),
+            },
             Err(e) => {
                 let msg = match e {
                     engine::storage::ReadOnlyOpenError::InUse => {
@@ -4566,6 +4802,154 @@ fn run_change_log_verify(args: &[String]) -> ExitCode {
     }
 }
 
+/// `change-log-verify --base` の始点（保持しているフルバックアップの最も古い終点の次）を求める。
+/// DB と各バックアップの DB 識別子・timeline が一致しなければ拒否する。エラー文は固定の英語。
+fn retained_from_bases(
+    db: &std::path::Path,
+    bases: &[std::path::PathBuf],
+) -> Result<u64, &'static str> {
+    let db_point = engine::storage::retention_point_of(db)
+        .map_err(|_| "failed to read the database position (stop the server first)")?;
+    let mut min_end = u64::MAX;
+    for b in bases {
+        let p = engine::storage::retention_point_of(b)
+            .map_err(|_| "failed to read a --base backup as a full backup")?;
+        if p.db_id != db_point.db_id || p.timeline != db_point.timeline {
+            return Err("a --base backup belongs to a different database or timeline");
+        }
+        min_end = min_end.min(p.end_lsn);
+    }
+    min_end
+        .checked_add(1)
+        .ok_or("a --base backup position is out of range")
+}
+
+/// `change-log-cleanup` サブコマンド（Issue #3092・RECOVER-14 (7) のポインタ）。保持しているフルバックアップ
+/// （`--backup`）から PITR するのに要らないアーカイブ済みセグメントだけを、先頭から連続して消す。既定は
+/// dry-run（消す予定の件数と LSN 範囲を出力するだけ）で、`--execute` を付けたときだけ消す。バックアップが
+/// 1 つも無い・識別子の不一致・アーカイブの検証失敗・他者が書けるアーカイブ先では何も消さない。
+/// 出力は運用者向けの標準出力（パス・テナント情報を含まない）。終了コード: 0 成功・1 失敗・2 引数の不備。
+fn run_change_log_cleanup(args: &[String]) -> ExitCode {
+    use wire_server::change_log_cleanup_opt as opt;
+
+    let parsed = match opt::parse(args) {
+        Ok(p) => p,
+        Err(msg) => {
+            engine::log_stderr!("wire-server: change-log-cleanup: {msg}");
+            return ExitCode::from(opt::EXIT_USAGE);
+        }
+    };
+    let fail = |e: &dyn std::fmt::Display| {
+        engine::log_stderr!("wire-server: change-log-cleanup: {e}");
+        ExitCode::from(opt::EXIT_FAILED)
+    };
+    let mut backups = Vec::with_capacity(parsed.backups.len());
+    for b in &parsed.backups {
+        match engine::storage::retention_point_of(b) {
+            Ok(p) => backups.push(p),
+            Err(e) => return fail(&e),
+        }
+    }
+    let db = match &parsed.db {
+        Some(path) => match engine::storage::retention_point_of(path) {
+            Ok(p) => Some(p),
+            Err(e) => return fail(&e),
+        },
+        None => None,
+    };
+    let now_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_micros()).ok());
+    let Some(now_us) = now_us else {
+        return fail(&"system clock is out of range");
+    };
+    let policy = engine::storage::CleanupPolicy {
+        backups,
+        db,
+        keep_secs: parsed.keep_secs,
+        keep_segments: parsed.keep_segments,
+        now_us,
+    };
+    let plan = match engine::storage::plan_archive_cleanup(&parsed.dir, &policy) {
+        Ok(p) => p,
+        Err(e) => return fail(&e),
+    };
+    let range = match plan.lsn_range() {
+        Some((a, b)) => format!("{a}..{b}"),
+        None => "none".to_string(),
+    };
+    if !parsed.execute {
+        println!(
+            "change log cleanup (dry-run): segments={} lsn={range} cutoff={}",
+            plan.segments(),
+            plan.cutoff()
+        );
+        return ExitCode::SUCCESS;
+    }
+    match engine::storage::execute_archive_cleanup(&parsed.dir, &plan) {
+        Ok(r) => {
+            println!(
+                "change log cleanup (removed): segments={} lsn={range} cutoff={}",
+                r.removed,
+                plan.cutoff()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            if let engine::storage::CleanupError::Partial { removed } = &e {
+                println!("change log cleanup (partial): segments={removed}");
+            }
+            fail(&e)
+        }
+    }
+}
+
+/// `change-log-disable --db <path> [--discard-unarchived]` サブコマンド（Issue #3093・RECOVER-14 ポインタ。
+/// 設計は `docs/design/change-log-pitr.md` の D13）。停止中の DB の変更ログを無効化し、有効にしない起動・
+/// 書き込みができる状態へ戻す。未アーカイブのレコードが在ると既定では拒否し（終了コード 1）、
+/// `--discard-unarchived` の明示でだけ破棄する。稼働中のサーバーが開いている DB は拒否する。
+/// 標準出力・標準エラーは固定文言（件数・LSN・パスを含めない）。
+fn run_change_log_disable(args: &[String]) -> ExitCode {
+    use engine::storage::{DisableOptions, Storage};
+    use wire_server::{backup_opt, change_log_opt};
+
+    let parsed = match change_log_opt::parse_disable(args) {
+        Ok(p) => p,
+        Err(msg) => {
+            engine::log_stderr!("wire-server: change-log-disable: {msg}");
+            return ExitCode::from(change_log_opt::EXIT_DISABLE_USAGE);
+        }
+    };
+    let mut storage = match Storage::open(&parsed.db) {
+        Ok(s) => s,
+        Err(e) => {
+            if backup_opt::is_already_open(&e) {
+                engine::log_stderr!(
+                    "wire-server: change-log-disable: database is in use by another process \
+                     (stop the server first)"
+                );
+            } else {
+                engine::log_stderr!("wire-server: change-log-disable: failed to open database");
+            }
+            return ExitCode::from(change_log_opt::EXIT_DISABLE_FAILED);
+        }
+    };
+    let opts = DisableOptions {
+        discard_unarchived: parsed.discard_unarchived,
+    };
+    match storage.disable_change_log(&opts) {
+        Ok(()) => {
+            println!("{}", change_log_opt::DISABLED_MESSAGE);
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            engine::log_stderr!("wire-server: change-log-disable: {e}");
+            ExitCode::from(change_log_opt::EXIT_DISABLE_FAILED)
+        }
+    }
+}
+
 /// `backup --socket` の経路 (ii): 稼働中のサーバーの運用者専用ソケットへ出力先を依頼し、
 /// 応答の結果コードをそのまま終了コードにする（Issue #2152）。
 #[cfg(unix)]
@@ -4593,6 +4977,66 @@ fn run_backup_via_socket(sock: &std::path::Path, out: &std::path::Path) -> ExitC
             ExitCode::from(wire_server::backup_opt::EXIT_FAILURE)
         }
     }
+}
+
+/// `backup-incremental --socket` の経路: ベースの終点（フルバックアップは読み取り専用で開き、増分は全体を
+/// 検証する）を CLI 側で読み、終点と出力先をサーバーへ依頼する。サーバーは運用者指定のファイルを開かない。
+/// 応答の結果コードをそのまま終了コードにし、メッセージは固定文言だけを出す（Issue #3098）。
+#[cfg(unix)]
+fn run_backup_incremental_via_socket(
+    sock: &std::path::Path,
+    base: &std::path::Path,
+    out: &std::path::Path,
+) -> ExitCode {
+    use wire_server::{backup_opt, backup_socket, incremental_opt};
+
+    if let Err(msg) = backup_socket::check_socket_owner(sock) {
+        engine::log_stderr!("wire-server: backup-incremental: {msg}");
+        return ExitCode::from(backup_opt::EXIT_USAGE);
+    }
+    let point = match engine::storage::chain_point_of(base) {
+        Ok(p) => p,
+        Err(e) => {
+            let (code, msg) = incremental_opt::classify(&Err(e));
+            engine::log_stderr!("wire-server: backup-incremental: {msg}");
+            return ExitCode::from(code);
+        }
+    };
+    match backup_socket::request_incremental(sock, &point, out) {
+        Ok(r) => match r.records {
+            Some(records) if r.code == 0 => {
+                if write_stdout(&format!("backup-incremental written: records={records}\n"))
+                    .is_err()
+                {
+                    return ExitCode::from(backup_opt::EXIT_FAILURE);
+                }
+                ExitCode::SUCCESS
+            }
+            _ => {
+                engine::log_stderr!(
+                    "wire-server: backup-incremental: {}",
+                    backup_socket::incremental_code_message(r.code)
+                );
+                ExitCode::from(r.code)
+            }
+        },
+        Err(msg) => {
+            engine::log_stderr!("wire-server: backup-incremental: {msg}");
+            ExitCode::from(backup_opt::EXIT_FAILURE)
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn run_backup_incremental_via_socket(
+    _sock: &std::path::Path,
+    _base: &std::path::Path,
+    _out: &std::path::Path,
+) -> ExitCode {
+    engine::log_stderr!(
+        "wire-server: backup-incremental: --socket is supported only on unix platforms"
+    );
+    ExitCode::from(wire_server::backup_opt::EXIT_USAGE)
 }
 
 #[cfg(not(unix))]

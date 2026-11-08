@@ -293,14 +293,28 @@ fn apply(
         match record {
             Record::Statement { kind, sql } => {
                 let is_data = kind == StmtKind::Insert;
+                // ロール・権限の復元指示は SQL ではなく、テナント固有の状態なので `scope: shared` のダンプには
+                // 現れない（取り違え・改ざんの検出）。SQL の枠だけが 1 文の字句検査を通る。
+                let directive = kind.is_restore_directive();
                 if kind.phase() < phase
                     || !frame_matches_header(header, is_data, false)
                     || !kind.accepts(&sql)
-                    || !is_single_statement(&sql)
+                    || (directive && header.scope == DumpScope::Shared)
+                    || (!directive && !is_single_statement(&sql))
                 {
                     return Err(disallowed);
                 }
                 phase = kind.phase();
+                if directive {
+                    core.apply_restore_directive(tenant, &sql).map_err(|e| {
+                        RestoreError::Apply {
+                            ordinal,
+                            code: e.wire_code(),
+                        }
+                    })?;
+                    summary.statements = summary.statements.saturating_add(1);
+                    continue;
+                }
                 let session = if is_data {
                     &mut data_session
                 } else {

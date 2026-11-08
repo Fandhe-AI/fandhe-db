@@ -100,6 +100,21 @@ impl ReadOnlyStorage {
         let read = self.db.begin_read()?;
         super::change_log::archive::verify_against_read(&read, dir.as_ref())
     }
+
+    /// [`Storage::verify_change_log_archive_from`](super::Storage::verify_change_log_archive_from) と同じ検査を、
+    /// 読み取り専用で開いた DB から行う（保持管理で古いセグメントを消したアーカイブ向け。Issue #3092）。
+    pub fn verify_change_log_archive_from(
+        &self,
+        dir: impl AsRef<Path>,
+        retained_from: u64,
+    ) -> Result<super::ArchiveSummary, super::ArchiveError> {
+        let read = self.db.begin_read()?;
+        super::change_log::archive::verify_against_read_from(
+            &read,
+            dir.as_ref(),
+            Some(retained_from),
+        )
+    }
 }
 
 impl ReadOnlyStorage {
@@ -114,6 +129,22 @@ impl ReadOnlyStorage {
             &self.db.begin_read()?,
             base,
             dest.as_ref(),
+        )
+    }
+
+    /// [`Storage::export_incremental_with_archive`](super::Storage::export_incremental_with_archive) と同じ
+    /// 書き出しを、読み取り専用で開いた停止中の DB から行う（RECOVER-14・Issue #3099）。DB へ書かない。
+    pub fn export_incremental_with_archive(
+        &self,
+        base: &super::ChainPoint,
+        archive_dir: impl AsRef<Path>,
+        dest: impl AsRef<Path>,
+    ) -> Result<super::IncrementalSummary, super::IncrementalError> {
+        super::change_log::incremental::export_from_read_with(
+            &self.db.begin_read()?,
+            base,
+            dest.as_ref(),
+            Some(archive_dir.as_ref()),
         )
     }
 }

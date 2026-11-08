@@ -25,6 +25,10 @@ use std::path::Path;
 
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 
+/// 複製適用による UDF 世代の全スコープ共通の加算分を、世代表へ入れるときのキー。
+/// テナント識別子は制御文字を含められないため、実在のスコープと衝突しない。
+const REPLICA_FUNCTION_EPOCH_KEY: &str = "\u{0}replica-epoch";
+
 /// 明示トランザクションの書き込み時直列化検査が使う commit 記録（Issue #2404）。
 pub(crate) mod change_log;
 pub(crate) mod commit_log;
@@ -44,10 +48,13 @@ pub(crate) mod table_image;
 pub(crate) mod writer_gate;
 
 pub use change_log::archive::{
-    verify_archive_dir, ArchiveError, ArchiveExpectation, ArchiveOptions, ArchiveReport,
-    ArchiveSummary, DEFAULT_PRUNE_BYTES, DEFAULT_PRUNE_RECORDS, DEFAULT_SEGMENT_BYTES,
-    SEGMENT_FORMAT_VERSION,
+    execute_archive_cleanup, plan_archive_cleanup, retention_point_of, verify_archive_dir,
+    ArchiveError, ArchiveExpectation, ArchiveOptions, ArchiveReport, ArchiveSummary, CleanupError,
+    CleanupPlan, CleanupPolicy, CleanupReport, RetentionPoint, DEFAULT_PRUNE_BYTES,
+    DEFAULT_PRUNE_RECORDS, DEFAULT_SEGMENT_BYTES, SEGMENT_FORMAT_VERSION,
 };
+pub use change_log::backlog::{UnarchivedLimit, UnarchivedStatus};
+pub use change_log::disable::{DisableError, DisableOptions};
 pub use change_log::incremental::{
     apply_incremental_segments, chain_point_of, ApplySummary, ChainPoint, IncrementalError,
     IncrementalSummary,
@@ -56,6 +63,10 @@ pub use change_log::pitr::{restore_to_point, PitrTarget};
 pub use change_log::replica_apply::{ReplicaApplyError, ReplicaApplyReport, MAX_APPLY_RECORDS};
 pub use change_log::stream::{
     ChangeLogBatch, ReplicaPin, StreamError, StreamIdentity, MAX_RECORD_BYTES,
+};
+pub use change_log::sync_commit::{
+    AttachError, StandbyHandle, SyncCommitConfig, SyncCommitCoordinator, SyncCommitStage,
+    SyncTimeoutAction, SyncWaitOutcome,
 };
 pub use integrity::{
     FindingKind, IntegrityError, IntegrityFinding, IntegrityOptions, IntegrityReport, Severity,
@@ -664,6 +675,9 @@ pub(crate) fn bump_generation_and_commit(write_txn: impl CommitTxn) -> Result<()
     if let Some(s) = session.as_ref() {
         s.finish(g_c, record);
     }
+    if capture.is_some() {
+        crate::recovery::commit_boundary::record_pending_sync_lsn(g_c);
+    }
     Ok(())
 }
 
@@ -862,8 +876,12 @@ pub struct Storage {
     /// 真なのに [`Self::change_log`] が `None` の間は、書き込みを `CommitFootprintUnrecordable` で
     /// 拒否する（無効のまま書くとレコードが欠けたまま世代が進み、LSN の欠落になるため。D8）。
     change_log_on_disk: bool,
-    /// 一貫スナップショット書き出し（[`Storage::export_snapshot`]）の実行中フラグ。長い読み取り
-    /// Tx はページ回収を止めるため、1 つの `Storage` につき同時に 1 本までに制限する。
+    /// 読み取りレプリカ（RECOVER-15・Issue #2175）として構成されたか。真の間は、利用者経路の書き込み
+    /// トランザクション生成（[`Self::wrap_gated`]）を fail-closed に拒否する。適用専用の
+    /// [`Self::begin_replica_apply_txn`] は通らないため、複製の適用は従来どおり動く。
+    read_replica: bool,
+    /// 書き出し（[`Storage::export_snapshot`]・[`Storage::export_incremental`]）の実行中フラグ。長い
+    /// 読み取り Tx はページ回収を止めるため、1 つの `Storage` につきフル・増分通じて同時 1 本まで。
     snapshot_export_busy: std::sync::atomic::AtomicBool,
     /// テスト専用の同期点コールバック（Issue #1363・TABLE-15）。feature
     /// `test-sync-points` 限定で、既定ビルドにはフィールドごと存在しない。
@@ -939,6 +957,7 @@ impl Storage {
             commit_log: Some(std::sync::Arc::new(commit_log::CommitLog::new())),
             change_log: None,
             change_log_on_disk: false,
+            read_replica: false,
             snapshot_export_busy: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "test-sync-points")]
             sync_hook: std::sync::Mutex::new(None),
@@ -971,7 +990,17 @@ impl Storage {
             .function_generations
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        map.get(scope).copied().unwrap_or(0)
+        // 複製適用の世代（全スコープ共通）を足す。どちらも単調増加なので和も単調に増える。
+        let own = map.get(scope).copied().unwrap_or(0);
+        let replica = map.get(REPLICA_FUNCTION_EPOCH_KEY).copied().unwrap_or(0);
+        own.saturating_add(replica)
+    }
+
+    /// 複製の適用が確定した後に呼び、全スコープの UDF カタログの世代を進める（Issue #2175・RECOVER-15）。
+    /// 適用は永続表を直接書くため関数定義の変更がどのスコープに及んだか分からず、既存接続が古い定義を
+    /// 使い続けないよう、次の `refresh` で必ず再ロードさせる。
+    pub(crate) fn bump_all_function_generations(&self) {
+        self.bump_function_generation(REPLICA_FUNCTION_EPOCH_KEY);
     }
 
     /// `scope` の UDF カタログの世代を進める（定義を変える commit が成功した後にだけ呼ぶ）。
@@ -1087,6 +1116,11 @@ impl Storage {
         txn: redb::WriteTransaction,
         permit: writer_gate::WriterPermit,
     ) -> Result<GatedWriteTxn> {
+        // 読み取りレプリカでは利用者経路の書き込みを開始しない（安全網。SQL・NoSQL の表層は、これより
+        // 手前で `25006` を返す）。ログ行は出さない（運用者向けの「commit refused」と混同させない）。
+        if self.read_replica {
+            return Err(StorageError::CommitFootprintUnrecordable);
+        }
         // 変更ログを一度有効にした DB を、有効にしないまま書くと LSN が欠落する。fail-closed に拒否する
         // （`txn` と `permit` はここで破棄され、durable な書き込みは発生しない）。
         if self.change_log.is_none() && self.change_log_on_disk {
@@ -1176,11 +1210,43 @@ impl Storage {
         self.enable_change_log_with(change_log::CaptureLimits::default())
     }
 
+    /// [`Self::enable_change_log`] に未アーカイブの変更ログ量の上限を加えた版（RECOVER-14 (2)・
+    /// Issue #3091）。未アーカイブ量が上限以上の間、利用者の commit は `54000` で commit 前に拒否され
+    /// （世代・レコード・データは確定しない）、アーカイブが水位を進めれば再起動なしで再開する。
+    /// 上限は旧形式の表の移行が終わった後に有効になる（上限を超えた DB の再起動が移行の拒否で
+    /// 失敗しないようにするため）。0 の上限は `Err`。`&mut self` で構築段階だけから呼べる。
+    pub fn enable_change_log_with_unarchived_limit(
+        &mut self,
+        limit: change_log::backlog::UnarchivedLimit,
+    ) -> Result<()> {
+        self.enable_change_log_inner(change_log::CaptureLimits::default(), limit)
+    }
+
+    /// 未アーカイブの変更ログ量の状態（件数・バイト・上限・拒否中か）。変更ログが無効なら `None`。
+    /// 運用者向けで、SQL・NoSQL の表層からは呼べない（テナントに他者の書き込み量を見せない）。
+    pub fn change_log_unarchived_status(
+        &self,
+    ) -> Result<Option<change_log::backlog::UnarchivedStatus>> {
+        let Some(state) = self.change_log.as_ref() else {
+            return Ok(None);
+        };
+        change_log::backlog::status(&self.db.begin_read()?, state).map(Some)
+    }
+
     /// [`Self::enable_change_log`] の上限指定版（上限のテストが使う）。
     pub(crate) fn enable_change_log_with(
         &mut self,
         limits: change_log::CaptureLimits,
     ) -> Result<()> {
+        self.enable_change_log_inner(limits, change_log::backlog::UnarchivedLimit::default())
+    }
+
+    fn enable_change_log_inner(
+        &mut self,
+        limits: change_log::CaptureLimits,
+        unarchived_limit: change_log::backlog::UnarchivedLimit,
+    ) -> Result<()> {
+        unarchived_limit.validate()?;
         if self.temp_scoped {
             return Err(StorageError::Codec(
                 "change log is not available for temporary storage".to_string(),
@@ -1215,6 +1281,12 @@ impl Storage {
                     self.change_log = None;
                     return Err(e);
                 }
+                if !unarchived_limit.is_unlimited() {
+                    if let Err(e) = self.apply_unarchived_limit(unarchived_limit) {
+                        self.change_log = None;
+                        return Err(e);
+                    }
+                }
                 Ok(())
             }
             Err(e) => {
@@ -1222,6 +1294,27 @@ impl Storage {
                 Err(e)
             }
         }
+    }
+
+    /// 移行が終わった後に、バイト上限があれば数え値を数え直して書き（保守 commit）、上限を設定する。
+    fn apply_unarchived_limit(
+        &mut self,
+        limit: change_log::backlog::UnarchivedLimit,
+    ) -> Result<()> {
+        if limit.max_bytes.is_some() {
+            let txn = self.begin_write_txn()?;
+            change_log::backlog::recount_into(&txn)?;
+            crate::recovery::commit_boundary::commit_maintenance(txn)?;
+        }
+        let state = self
+            .change_log
+            .as_mut()
+            .and_then(std::sync::Arc::get_mut)
+            .ok_or_else(|| {
+                StorageError::Codec("change log state is shared during enable".to_string())
+            })?;
+        state.unarchived_limit = limit;
+        Ok(())
     }
 
     /// オラクル試験用: 全レコードを空の状態から再生した結果が実表と一致するか(feature `change-log-oracle` のみ。
@@ -1254,12 +1347,27 @@ impl Storage {
         change_log::archive::verify_against_db(self, dir.as_ref())
     }
 
+    /// [`Self::verify_change_log_archive`] の保持管理版（Issue #3092）。`retained_from` より前のセグメントを
+    /// 意図して消したアーカイブを検証する（先頭は `retained_from` 以下から始まること、水位に届く末尾が
+    /// あることを要求する。契約は `archive::verify_against_read_from`）。
+    pub fn verify_change_log_archive_from(
+        &self,
+        dir: impl AsRef<Path>,
+        retained_from: u64,
+    ) -> std::result::Result<ArchiveSummary, ArchiveError> {
+        change_log::archive::verify_against_read_from(
+            &self.db.begin_read()?,
+            dir.as_ref(),
+            Some(retained_from),
+        )
+    }
+
     /// ベース（`base`。フルバックアップまたは前回の増分の終点。[`chain_point_of`]）が終わった commit の
     /// 次から現在の最新までのログ区間を、増分バックアップとして `dest`（新規のファイル）へ書き出す
     /// （RECOVER-13・RECOVER-14・Issue #2168。設計は `docs/design/change-log-pitr.md` の D7）。
     /// 読み取りトランザクションを 1 本だけ取るので書き込みを止めない。連鎖が切れている（別 DB・別 timeline・
     /// ベースが先に進んでいる・ログが刈り込まれている）ときは [`IncrementalError`] で拒否し、何も公開しない。
-    /// 運用者の CLI が呼ぶ。
+    /// 運用者の CLI・ソケットが呼ぶ。同時 1 本（超過は `InProgress`。フルの書き出しと共有。Issue #3098）。
     pub fn export_incremental(
         &self,
         base: &ChainPoint,
@@ -1268,16 +1376,47 @@ impl Storage {
         if self.temp_scoped {
             return Err(IncrementalError::NotEnabled);
         }
-        change_log::incremental::export_from_read(&self.db.begin_read()?, base, dest.as_ref())
+        change_log::incremental::export_live(self, base, dest.as_ref())
+    }
+
+    /// [`Self::export_incremental`] と同じ増分の書き出しで、`change_log` 表の先頭側が保持設定で刈り込まれて
+    /// いるときは、刈り込み済みの区間を `archive_dir`（変更ログのアーカイブ先。Issue #2167）のセグメントから
+    /// 補う（RECOVER-14・Issue #3099）。アーカイブが区間を覆わない・壊れている・DB の行と食い違うときは
+    /// [`IncrementalError`] で拒否し、何も公開しない。刈り込まれていなければアーカイブを開かず、
+    /// [`Self::export_incremental`] と同じ出力になる。他者が書けるアーカイブ先は拒否する。
+    pub fn export_incremental_with_archive(
+        &self,
+        base: &ChainPoint,
+        archive_dir: impl AsRef<Path>,
+        dest: impl AsRef<Path>,
+    ) -> std::result::Result<IncrementalSummary, IncrementalError> {
+        if self.temp_scoped {
+            return Err(IncrementalError::NotEnabled);
+        }
+        // フル・増分の書き出しと同じ実行中フラグで同時 1 本に制限する（長い読み取り Tx を重ねない）。
+        let _busy = snapshot::try_acquire_busy(&self.snapshot_export_busy)
+            .ok_or(IncrementalError::InProgress)?;
+        change_log::incremental::export_from_read_with(
+            &self.db.begin_read()?,
+            base,
+            dest.as_ref(),
+            Some(archive_dir.as_ref()),
+        )
     }
 
     /// 保守 commit 用の書き込みトランザクション（変更ログの水位更新・刈り込み）。通常の書き込みが
     /// 待機している間はゲートを譲り、待機上限を超えたら `None`（今回は見送り。D6）。
-    pub(crate) fn begin_maintenance_txn(&self) -> Result<Option<GatedWriteTxn>> {
-        let permit = match self
-            .writer_gate
-            .acquire_yielding(crate::interrupt::effective_lock_wait(self.write_lock_wait))
-        {
+    ///
+    /// `blocking` が真（未アーカイブ量が上限に達している。Issue #3091）のときは譲らず、通常の書き込みと
+    /// 同じ並びでゲートを取る（拒否された書き手の再試行が続いても、水位を進める保守 commit が飢えない）。
+    pub(crate) fn begin_maintenance_txn(&self, blocking: bool) -> Result<Option<GatedWriteTxn>> {
+        let wait = crate::interrupt::effective_lock_wait(self.write_lock_wait);
+        let acquired = if blocking {
+            self.writer_gate.acquire(wait)
+        } else {
+            self.writer_gate.acquire_yielding(wait)
+        };
+        let permit = match acquired {
             Ok(p) => p,
             Err(writer_gate::GateError::Timeout) => return Ok(None),
             Err(writer_gate::GateError::HeldByCurrentThread) => {
@@ -1307,6 +1446,17 @@ impl Storage {
             txn: Box::new(txn),
             _permit: permit,
         })
+    }
+
+    /// 読み取りレプリカとして構成する（RECOVER-15・Issue #2175）。以後、利用者経路の書き込みは
+    /// [`Self::wrap_gated`] で拒否される。open 直後（共有前）に `EngineCore::with_read_replica` が呼ぶ。
+    pub(crate) fn mark_read_replica(&mut self) {
+        self.read_replica = true;
+    }
+
+    /// 読み取りレプリカとして構成されているか。SQL 表層のトランザクション層・分類層が参照する。
+    pub fn is_read_replica(&self) -> bool {
+        self.read_replica
     }
 
     /// 変更ログを有効にした DB を、有効にしないまま開いているか。真の間は書き込みを
@@ -3711,6 +3861,7 @@ mod tests {
                 commit_log: None,
                 change_log: None,
                 change_log_on_disk: false,
+                read_replica: false,
                 snapshot_export_busy: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(feature = "test-sync-points")]
                 sync_hook: std::sync::Mutex::new(None),
@@ -3783,6 +3934,7 @@ mod tests {
                 commit_log: None,
                 change_log: None,
                 change_log_on_disk: false,
+                read_replica: false,
                 snapshot_export_busy: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(feature = "test-sync-points")]
                 sync_hook: std::sync::Mutex::new(None),
@@ -3851,6 +4003,7 @@ mod tests {
                 commit_log: None,
                 change_log: None,
                 change_log_on_disk: false,
+                read_replica: false,
                 snapshot_export_busy: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(feature = "test-sync-points")]
                 sync_hook: std::sync::Mutex::new(None),
@@ -3899,6 +4052,7 @@ mod tests {
                 commit_log: None,
                 change_log: None,
                 change_log_on_disk: false,
+                read_replica: false,
                 snapshot_export_busy: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(feature = "test-sync-points")]
                 sync_hook: std::sync::Mutex::new(None),
@@ -4045,3 +4199,9 @@ mod tests {
         txn.abort().expect("abort");
     }
 }
+
+// Issue #3105: 復元をまたぐ世代の高水位（状態ファイル）のコーデック。wire-server の `restore --generation-state` が使う。
+// 既存の commit 境界の行番号（table_generation_bump_coverage の許可リスト）を動かさないよう末尾に置く。
+pub use restore_generation::high_water::{
+    decode_high_water, encode_next_slot, HighWaterState, HIGH_WATER_FILE_LEN,
+};

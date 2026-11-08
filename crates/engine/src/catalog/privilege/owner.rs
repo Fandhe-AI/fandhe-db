@@ -130,6 +130,38 @@ pub(crate) fn owner_of_in_txn<R: ReadSource>(
     Ok(Some(decode_owner(v.value())?))
 }
 
+/// `tenant` の所有者行をすべて `(対象, 所有者ロール ID)` で返す（論理ダンプの書き出し専用。Issue #3096）。
+/// キーは `(種別, 対象, テナント)` でテナントが末尾のため全行を走査して絞る（既存の掃除と同じ方式）。
+/// 破損行は `Err`。
+pub(crate) fn list_owners_for_tenant_in_txn<R: ReadSource>(
+    src: &R,
+    tenant: &str,
+) -> Result<Vec<(PrivilegeObject, u64)>> {
+    validate_tenant(tenant)?;
+    let table = match src.open_table(OWNERS_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut out = Vec::new();
+    for entry in table.iter()? {
+        let (k, v) = entry?;
+        let (kind, key, t) = k.value();
+        if t != tenant {
+            continue;
+        }
+        let object = PrivilegeObject::from_components(kind, key, "")?;
+        if !matches!(
+            object,
+            PrivilegeObject::Table(_) | PrivilegeObject::Schema(_) | PrivilegeObject::Function(_)
+        ) {
+            return Err(corrupt());
+        }
+        out.push((object, decode_owner(v.value())?));
+    }
+    Ok(out)
+}
+
 /// `role_id` が対象の所有者か。所有者判定の唯一の関数（`role_id` 0＝PUBLIC・未束縛は常に偽）。
 pub(crate) fn is_owner_in_txn<R: ReadSource>(
     src: &R,

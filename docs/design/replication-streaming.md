@@ -1,16 +1,17 @@
 # ADR: ストリーミングレプリケーションの方式（ポインタ記録）
 
-- ステータス: Proposed（実装は #2173〜#2177・#2245。#2173 送信側・#2174 受信側の適用ループは実装済み）
+- ステータス: Proposed（実装は #2173〜#2177・#2245。#2173 送信側・#2174 受信側の適用ループ・#2175 読み取りレプリカモード・#2245 同期モードは実装済み）
 - 対応 Issue: #2172（親 #2171）。後続: #2173・#2174・#2175・#2176・#2177・#2245。運用 doc は #2179、障害注入は #2178
 - ビヘイビア ID ポインタ: RECOVER-15（`docs/spec/04-behavior/recovery.md`）、
   関連 RECOVER-2・RECOVER-13・RECOVER-14・RECOVER-17、WIRE-9・WIRE-18、TASK-258
 
 ## 位置づけ
 
-本書は public リポのため、方式の比較・同期確認の段階と既定動作・待機上限・昇格時の契約・
+本書は public リポのため、方式の比較・spec が定める同期確認の段階と既定動作・待機上限・昇格時の契約・
 履歴の検証・認証と TLS の詳細を載せない。これらの本文は private spec（上記ポインタ）を正とし、
 [spec-confidentiality](../../.claude/rules/spec-confidentiality.md) に従って転記しない。
 公開してよい範囲は README「実装方針（要点）」で公開済みのものに限る。
+実装で選んだフラグ・値・既定（実装既定値。spec 由来ではない）は各「実装判断」節に記録する。
 確定した契約は後続 Issue の実装とテストで具体化し、実装記録は
 [implementation-status.md](implementation-status.md) に追記する。
 
@@ -137,5 +138,147 @@
 
 **既知の制約と後続**
 
-- 読み取りセッションの受け付けと書き込みの `25006`（#2175）、再同期（#2176）、TLS と認証（#2177）、同期モードの確認段階（#2245）、障害注入試験（#2178）、運用 doc（#2179）は未対応
-- 関数・UDF カタログなどプロセス内キャッシュは適用では更新されない。読み取りセッションを載せるとき（#2175）に無効化の仕組みが要る
+- 再同期（#2176）、TLS と認証（#2177）、運用 doc（#2179）は未対応（障害注入試験は #2178 で実装済み）
+- 関数・UDF カタログなどプロセス内キャッシュの無効化は #2175 で扱った（下記「実装判断（Issue #2175）」の既知の制約）
+
+## 実装判断（Issue #2175）
+
+読み取りレプリカモード（RECOVER-15 ポインタ。契約の本文は private spec を正とし、ここには実装上の判断だけを書く）。
+
+**起動方式**
+
+- `wire-server --users <f> --db <base> --replica-primary <ip:port> --replica-credentials <file>` で、通常のテナント向けリスナー
+  （SQL・NoSQL）と #2174 の適用ループを同じプロセス・同じ `EngineCore` で動かす（redb は 1 プロセスが排他的に開くため別プロセスにしない）。
+  `--replica-max-backoff-secs`・`--replica-batch-records`・`--replica-batch-bytes` は任意。値の検証は `replica_opt::parse` に一本化した
+- `--change-log`・`--replication-*`・`--backup-socket` との併用、ベースでない DB は DB を開く前後に起動拒否する（変更ログを有効にすると
+  適用が拒否され履歴も分岐する。カスケードとレプリカからのバックアップは対象外）。ログイン名の同期と `--users` のブートストラップは
+  DB へ書くため行わない（プライマリで作られ複製される）。`--users` は認証の構成に引き続き必須
+- 適用ループが停止（整合性違反・プライマリの拒否）したらプロセスごと終了する（終了コードは `replica` サブコマンドと同じ 10・11）。
+  古いデータを黙って配り続けない fail-closed の判断
+
+**書き込みの拒否（`25006`）の 3 層**
+
+1. トランザクション層: `Storage` の read-replica フラグが立っていると、`SessionTransaction` はどの起点でも READ ONLY で始まる。
+   暗黙トランザクションも writer を取らず読み取りスナップショットだけを開く。既存の READ ONLY の機構（許可リスト方式の判定・
+   `ensure_writer` の `25006`・COPY FROM の事前拒否）をそのまま再利用する。`BEGIN READ WRITE`・`SET TRANSACTION READ WRITE`・
+   `SET SESSION CHARACTERISTICS ... READ WRITE` は `25006`。修飾子なしの `BEGIN` は READ ONLY として始まる
+2. autocommit の分類層: `execute_parsed_in_session_inner` の先頭で、許可リスト（`read_only_permits`）に無い文を台帳・採番・
+   カタログ・writer に触れる前に `25006` で拒否する。`COPY FROM` は権限検査の後・CopyInResponse の前に拒否する
+3. ストレージの choke point: `Storage::wrap_gated` が read-replica フラグを見て書き込みトランザクションの生成を拒否する（安全網。
+   `54000` 相当で、ログ行は出さない）。適用専用の `begin_replica_apply_txn` は通らないため適用は動く
+
+**読み取りの意味と遅延**
+
+- 読み取りは redb の読み取りトランザクションで行い、適用はバッチ単位の 1 書き込みトランザクションで確定する。読み手には常に
+  commit 境界の状態だけが見える。読み取りは writer gate を取らないので適用を止めない。RLS・権限は通常の経路を通る
+- 遅延（適用済みの commit 番号・時刻）は標準エラーだけで観測できる。テナントのセッションには、LSN を返す関数・SHOW・
+  ParameterStatus を足していない（commit 番号の進みから他テナントの書き込み量を推測させないため）。`25006` の文言は固定で、
+  LSN・世代を含まない。`SHOW restore_generation` は全テナント共通の値で commit 番号ではないため許容する
+
+**既知の制約**
+
+- プロセス内キャッシュ: 表・索引カタログの世代をキーにしたキャッシュは、適用が同じ世代の表を書き換えるため自然に失効する。
+  世代をキーにしないもの（HNSW opt-in の増分グラフ、関数・UDF のプロセス内レジストリ）は網羅の確認が済んでいない。HNSW opt-in との
+  併用は未検証として扱う（後続で検討する）
+- 書き込み専用の Rust API 入口（`execute_bound_*_in_session` など）は、分類層ではなく安全網で拒否される（`25006` ではなく `54000`）。
+  SQL・NoSQL の表層は分類層・トランザクション層で `25006` になる
+- 昇格（フェイルオーバー）、PostgreSQL 互換の観測口（`pg_is_in_recovery()` など）は対象外
+
+## 実装判断（Issue #2245）
+
+本節は同期レプリケーション（オプション）の実装判断の記録で、契約の本文は private spec の RECOVER-15（上記ポインタ）を正とする。
+段階の名前は PostgreSQL の `synchronous_commit` の公開済みの値を使い、既定値・上限は実装既定値である。
+実装は engine の `storage::change_log::sync_commit`（調停役）・`recovery::commit_boundary::take_pending_sync_lsn`、
+wire-server の `replication_opt`・`replication`・`replica`・`sync_commit_wait`。
+
+**フラグ**（すべて `--replication-bind` が前提。不正値・組み合わせの不備は DB を開く前に起動拒否）
+
+| フラグ | 値 | 既定 |
+| ---- | ---- | ---- |
+| `--replication-sync-standby <role>`（繰り返し可） | 同期対象のレプリケーションのロール。`--replication-roles` に存在すること | 無指定は非同期（従来どおり） |
+| `--replication-sync-commit <stage>` | `remote_write`（受信）／`on`（永続化）／`remote_apply`（適用） | `on` |
+| `--replication-sync-timeout-secs <n>` | 1〜86400 | 無期限に待つ |
+| `--replication-sync-on-timeout <action>` | `degrade`／`reject`。上限を指定したときは必須、上限が無ければ指定不可 | なし |
+
+- 同期の水準はこの CLI だけで決まり、テナントのセッション（SQL の `SET`）・HTTP からは変えられない
+  （テナントが保証を弱める経路を作らない。レプリケーションの状態をテナントへ観測させない）
+- 段階の写像: 受信側は適用の commit（`Immediate`）の後に `K` を送るため、永続化と適用は同じ事象で、`on` と `remote_apply` は同じ判定になる。
+  別の段階になるのは `remote_write` だけで、適用の前に送る新しいフレーム `R` で判定する
+- 同期対象に指定した**全ロール**の確認が揃ったら完了とする（`ANY n`／`FIRST n` の quorum は対象外）。同期ロール 1 つにつき接続は 1 本までで、
+  2 本目は認証の後に `BUSY` で閉じる（半開きの古い接続は既存の ack 待機上限の切断で解放される）
+
+**待機する場所と順序**
+
+- commit の choke point（`commit_and_finish`・`bump_generation_and_commit`）は、変更ログ有効の commit の成功後に LSN をスレッドローカルへ
+  `max` で記録するだけで、待たない。待機は書き込みゲートの permit を解放した後（engine から戻った後）に、wire 層の 4 か所の応答境界
+  （簡易クエリ・拡張クエリの Execute・COPY・HTTP）が、応答を 1 バイトも書く前に `await_sync_commit` で行う。
+  既定（非同期）の経路で増える処理は Cell の書き込み 1 回と読み取り 1 回だけ
+- 順序は「redb commit → commit 記録 → permit 解放 → 同期の待機 → 応答」。台帳（`operation_id`）の行はデータと同じ commit・同じ変更ログの
+  レコードで複製されるため、確認はデータと台帳の両方を覆う。上限超過で拒否した後に同じ `operation_id` で再送しても、
+  プライマリでは一意制約違反（`23505`）になり二重実行にならない
+- 上限超過・中断は、commit 済みの応答を `state=may_be_committed`（ERR-5）のエラーへ差し替える（pg wire は `encode_with_detail`、HTTP は
+  `encode_error_may_be_committed`、拡張クエリは `PostCommit`）。文言は固定の英語で、ロール名・LSN・遅れを含めない。engine の commit の `Err` は
+  「durable でない」という契約のまま変えない（タイムアウトを engine の戻り値にしない）
+- 応答境界の呼び忘れは構造テスト（`ResponseBoundaryGuard::new()` のあるファイルは必ず `await_sync_commit` を呼ぶ）で固定する
+
+**切断・遅れ・上限**
+
+- レプリカが切れたらそのロールの位置を外し、待機は打ち切らず上限まで（上限が無ければ無期限に）待つ。再接続後は Start の適用済み位置と
+  ack で位置が戻る。無期限（既定）のままレプリカを失うと、書き込みの接続が応答を返せずに溜まる（接続数の上限で有界。PostgreSQL の同期レプリケーションと同じ運用上の注意）
+- `reject`: 上限で `may_be_committed` のエラー。`degrade`: 成功を返して縮退状態にする。縮退中は待たずに通すが、要求された LSN の最大値は
+  記録し続け、全同期ロールの確認位置が追いついたら自動で解除する。縮退と解除は運用者向けの標準エラーに固定文言だけを出す
+- 待機は permit を持たないため他の書き込みを止めない。待機するスレッドの数は接続数の上限で有界。期限の計算は `checked_add`
+
+**プロトコルの拡張（版数 2）**
+
+- 送信側は Hello の版数 1・2 を受理する。版数 2 のレプリカだけが `R`（受け取り済み・適用前の最後の LSN。8 バイト）を送ってよく、
+  版数 1 の接続での `R` は `BAD_REQUEST`。`R` は `K` と同じく単調増加・送信済み以下で、違反は `BAD_REQUEST` で切断する。`R` は保持位置を進めない
+- 受信側は版数 2 の Hello を送り、バッチを受け取り終えて適用する前に `R`、適用の commit 後に `K` を送る。古いプライマリ（版数 1 のみ）とは
+  Hello の段で `BAD_REQUEST` になるため、混在させるときはプライマリを先に上げる
+- 同期の commit の遅延を下げるため、送信側は追いついている間の待機を、待機開始の通知つきの待ちにする（非同期では従来どおりのポーリング）
+
+**既知の制約と後続**
+
+- 待機中の commit は、プライマリの他のセッションからは redb commit の時点で見える（PostgreSQL は確認後に見える。既知の差）
+- cancel 要求・クライアント切断による待機の中断、quorum、セッション・トランザクション単位の水準は未対応
+- commit の待ち時間からレプリカの状態がある程度推測できる点は、同期レプリケーションに本質的なものとして許容する
+- 昇格（RECOVER-15 の昇格の契約）・TLS（#2177）・再同期（#2176）・障害注入（#2178）・運用 doc（#2179）は対象外
+
+## 実装判断（Issue #2178）
+
+RECOVER-15 ポインタ。レプリケーションの障害注入・追従検証を `scripts/crash_test_replication.sh` として追加した
+（試験のみの変更。engine・wire-server のコード、依存、CI のジョブ構成は変えない）。`make crash-test-replication` を
+`crash-test` の前提ターゲットにして、既存の CI の `crash-test` ジョブで実行する。
+
+### 構成
+
+- リリースバイナリの実プロセス（プライマリ `--change-log --replication-bind` と、読み取りレプリカ
+  `--replica-primary`）を、alice・bob の 2 テナントの書き込み（1 文 1 commit の INSERT・UPDATE・DELETE）の
+  最中に障害へさらす。補助の pg wire クライアントは #2157 の `crash_test_backup_restore_client.py` を拡張した
+- レプリカとプライマリの間に、ループバック専用の TCP 中継（`crash_test_replication_proxy.py`）を置く。
+  プライマリは再起動のたびにポートが変わるため、中継先をファイルから都度読む。SIGUSR1 で全接続を切断し、
+  SIGUSR2 で通信の停滞（pause）を切り替える。単体試験は `scripts/tests/test_crash_test_replication_proxy.py`
+- 比較は `wire-server dump` が使えない（`--users` 起動の DB はブートストラップ権限の行を持ち `Unsupported`）ため、
+  テナントごとに pg wire で固定の表一覧の列名と全行を読み、sha256 を突き合わせる（ログへは内容を出さない）
+
+### 段と不変条件
+
+| 段 | 注入 | 確かめること |
+| -- | ---- | ------------ |
+| 1 | レプリカの SIGKILL（書き込み中） | 停止中の DB が verify を通る。再接続の適用位置が単調非減少 |
+| 2 | 中継の接続断（両プロセス生存） | レプリカの再起動なしで再接続。切断が観測される |
+| 3 | 中継の停滞・レプリカの SIGSTOP | 送信側の ack 待ちの上限が発火し、再接続する |
+| 4 | 書き込み中の DDL（表・列の追加） | 列名・内容が一致する |
+| 5 | プライマリの SIGKILL と再起動 | 確認済みの commit が残る。レプリカが先行して停止しない |
+| 6 | 同期レプリケーション（#2245）でのプライマリ喪失 | ack を受けた commit がレプリカにある |
+
+各段の後は、書き込みを止めてプライマリへ目印の行を入れ、レプリカから見えるまで待ってから比較する（適用は LSN 順）。
+停止直後の流れ込み中の commit が目印より後に入る競合に備え、不一致なら新しい目印で最大 3 回やり直す。
+空虚な成功を避けるため、障害が書き込み中に当たった回数・各種の切断の観測を数え、0 回なら失敗にする。
+
+### 設計上の注意と既知の制約
+
+- 書き込み速度は抑える（レプリカの適用速度を超えて遅れの上限へ達すると送信側が切断し、`RESYNC_REQUIRED` になるため）。
+  ack 待ちの上限を確実に発火させるため、試験のプライマリは未確認量の上限を小さく（8192 バイト）する
+- 遅れの上限超過と再同期（#2176）、TLS・非ループバック経路（#2177）、電源断・カーネル層のネットワーク分断、
+  quorum の段階ごとの障害注入、HNSW opt-in との併用は対象外

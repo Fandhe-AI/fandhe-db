@@ -21,13 +21,13 @@ use engine::policy::PolicyContext;
 use engine::storage::{chain_point_of, RowInput, Storage, Visibility};
 
 const BIN: &str = env!("CARGO_BIN_EXE_wire-server");
-const ROLE: &str = "replica-1";
+pub(crate) const ROLE: &str = "replica-1";
 const ROLE_PW: &str = "pw-replica";
 const EXIT_USAGE: i32 = 2;
 const EXIT_APPLY_HALTED: i32 = 10;
 const EXIT_PRIMARY_REJECTED: i32 = 11;
 
-struct ChildGuard(Child);
+pub(crate) struct ChildGuard(pub(crate) Child);
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
@@ -36,11 +36,11 @@ impl Drop for ChildGuard {
     }
 }
 
-fn run(args: &[&str]) -> Output {
+pub(crate) fn run(args: &[&str]) -> Output {
     Command::new(BIN).args(args).output().expect("run")
 }
 
-fn s(p: &Path) -> &str {
+pub(crate) fn s(p: &Path) -> &str {
     p.to_str().expect("utf-8 path")
 }
 
@@ -50,7 +50,7 @@ fn make_private_dir(path: &Path) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
 }
 
-fn phc_for(password: &str) -> String {
+pub(crate) fn phc_for(password: &str) -> String {
     let mut child = Command::new(BIN)
         .arg("hash-password")
         .stdin(Stdio::piped())
@@ -72,7 +72,7 @@ fn phc_for(password: &str) -> String {
 }
 
 /// `role:password` の資格情報ファイル（0600）を作る。
-fn write_credentials(dir: &Path, mode: u32) -> PathBuf {
+pub(crate) fn write_credentials(dir: &Path, mode: u32) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let p = dir.join("replica-credentials");
     std::fs::write(&p, format!("{ROLE}:{ROLE_PW}\n")).expect("credentials");
@@ -81,10 +81,10 @@ fn write_credentials(dir: &Path, mode: u32) -> PathBuf {
 }
 
 /// 子プロセスの標準エラーを行ごとに溜める。
-struct Lines(Arc<Mutex<Vec<String>>>);
+pub(crate) struct Lines(Arc<Mutex<Vec<String>>>);
 
 impl Lines {
-    fn attach(child: &mut Child) -> Self {
+    pub(crate) fn attach(child: &mut Child) -> Self {
         let stderr = child.stderr.take().expect("piped stderr");
         let buf = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&buf);
@@ -96,7 +96,7 @@ impl Lines {
         Self(buf)
     }
 
-    fn snapshot(&self) -> Vec<String> {
+    pub(crate) fn snapshot(&self) -> Vec<String> {
         self.0.lock().expect("lock").clone()
     }
 
@@ -116,7 +116,7 @@ impl Lines {
             .unwrap_or(0)
     }
 
-    fn wait_applied(&self, target: u64) {
+    pub(crate) fn wait_applied(&self, target: u64) {
         let deadline = Instant::now() + Duration::from_secs(60);
         while Instant::now() < deadline {
             if self.max_applied() >= target {
@@ -128,17 +128,22 @@ impl Lines {
     }
 }
 
-struct Primary {
-    _fx: common::TempFixtureDir,
-    _child: ChildGuard,
-    tenant: SocketAddr,
-    repl: SocketAddr,
-    dir: PathBuf,
-    sock: PathBuf,
+pub(crate) struct Primary {
+    pub(crate) _fx: common::TempFixtureDir,
+    pub(crate) _child: ChildGuard,
+    pub(crate) tenant: SocketAddr,
+    pub(crate) repl: SocketAddr,
+    pub(crate) dir: PathBuf,
+    pub(crate) sock: PathBuf,
 }
 
 impl Primary {
-    fn start(label: &str) -> Self {
+    pub(crate) fn start(label: &str) -> Self {
+        Self::start_with(label, &[])
+    }
+
+    /// 追加の引数（同期レプリケーションの指定など）つきで起動する（Issue #2245）。
+    pub(crate) fn start_with(label: &str, extra: &[&str]) -> Self {
         use std::os::unix::fs::PermissionsExt;
         let fx = common::TempFixtureDir::new(label);
         let users = fx.users_path_str();
@@ -171,6 +176,7 @@ impl Primary {
                 "--replication-allow",
                 "127.0.0.1",
             ])
+            .args(extra)
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
@@ -192,7 +198,7 @@ impl Primary {
         }
     }
 
-    fn session(&self) -> TenantSession {
+    pub(crate) fn session(&self) -> TenantSession {
         let stream = common::authenticate_to_ready_for_query(self.tenant, "alice", "pw-alice");
         stream
             .set_read_timeout(Some(Duration::from_secs(20)))
@@ -201,23 +207,23 @@ impl Primary {
     }
 }
 
-struct TenantSession(TcpStream);
+pub(crate) struct TenantSession(pub(crate) TcpStream);
 
 impl TenantSession {
-    fn exec(&mut self, sql: &str) {
+    pub(crate) fn exec(&mut self, sql: &str) {
         common::send_simple_query(&mut self.0, sql);
         let _ = common::read_command_complete(&mut self.0);
         common::read_ready_for_query(&mut self.0);
     }
 
-    fn insert(&mut self, id: u32) {
+    pub(crate) fn insert(&mut self, id: u32) {
         self.exec(&format!(
             "INSERT INTO docs (id, embedding) VALUES ({id}, '[0.1,0.2,0.3]')"
         ));
     }
 }
 
-fn spawn_replica(
+pub(crate) fn spawn_replica(
     db: &Path,
     primary: SocketAddr,
     cred: &Path,
@@ -237,7 +243,7 @@ fn spawn_replica(
 }
 
 /// レプリカの DB を開き直して `sql` の結果行数を返す（変更ログ有効の DB でも読み取りは通る）。
-fn count_rows(db: &Path, sql: &str) -> usize {
+pub(crate) fn count_rows(db: &Path, sql: &str) -> usize {
     let storage = Storage::open(db).expect("open");
     let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
     let ctx =
@@ -558,4 +564,173 @@ fn recover15_replica_rejects_bad_arguments_before_connecting() {
     }
     // 存在しなかった DB は作られない。
     assert!(!dir.join("absent.redb").exists());
+}
+// ---- 読み取りレプリカモード（Issue #2175）----
+
+/// simple query を送り、DataRow の件数（成功）または ErrorResponse の SQLSTATE（失敗）を返す。
+fn query_outcome(stream: &mut TcpStream, sql: &str) -> Result<usize, String> {
+    common::send_simple_query(stream, sql);
+    let mut rows = 0;
+    let mut error: Option<String> = None;
+    loop {
+        let (ty, body) = common::read_message(stream);
+        match ty {
+            b'D' => rows += 1,
+            b'E' => {
+                // フィールド列 `<code byte><cstring>` から `C`（SQLSTATE）を拾う。
+                let mut rest = body.as_slice();
+                while let Some((&code, tail)) = rest.split_first() {
+                    if code == 0 {
+                        break;
+                    }
+                    let end = tail.iter().position(|&b| b == 0).unwrap_or(tail.len());
+                    if code == b'C' {
+                        error = Some(String::from_utf8_lossy(&tail[..end]).into_owned());
+                    }
+                    rest = tail.get(end + 1..).unwrap_or(&[]);
+                }
+            }
+            b'Z' => break,
+            _ => {}
+        }
+    }
+    match error {
+        Some(code) => Err(code),
+        None => Ok(rows),
+    }
+}
+
+/// 読み取りレプリカ（`--replica-primary`）が、プライマリの書き込みに追従して読み取りに応じ、
+/// 書き込み・DDL・明示 READ WRITE を `25006` で拒否し、拒否の前後で内容が変わらないこと。
+#[test]
+fn recover15_read_replica_serves_reads_and_rejects_writes() {
+    let primary = Primary::start("read-replica");
+    let mut t = primary.session();
+    t.exec("CREATE TABLE docs (id BIGINT PRIMARY KEY, embedding VECTOR(3))");
+    for id in 1..=3 {
+        t.insert(id);
+    }
+    let base = primary.dir.join("base.redb");
+    let o = run(&["backup", "--socket", s(&primary.sock), "--out", s(&base)]);
+    assert_eq!(o.status.code(), Some(0), "{:?}", o);
+    let rdir = primary.dir.join("replica");
+    std::fs::create_dir(&rdir).expect("replica dir");
+    let rdb = rdir.join("replica.redb");
+    std::fs::copy(&base, &rdb).expect("copy base");
+    let cred = write_credentials(&rdir, 0o600);
+    let users = rdir.join("users.txt");
+    std::fs::write(&users, format!("alice:tenant-a:{}\n", phc_for("pw-alice"))).expect("users");
+    for id in 4..=6 {
+        t.insert(id);
+    }
+
+    let mut child = Command::new(BIN)
+        .args([
+            "--users",
+            s(&users),
+            "--db",
+            s(&rdb),
+            "--bind",
+            "127.0.0.1:0",
+        ])
+        .args(["--replica-primary", &primary.repl.to_string()])
+        .args(["--replica-credentials", s(&cred)])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn read replica");
+    let (addr, _lines) =
+        common::wait_for_listening_addr_and_lines(&mut child, Duration::from_secs(15));
+    let _guard = ChildGuard(child);
+    let mut r = common::authenticate_to_ready_for_query(addr, "alice", "pw-alice");
+    r.set_read_timeout(Some(Duration::from_secs(20)))
+        .expect("timeout");
+
+    // 追従: ポーリング（上限つき）でプライマリの 6 行がレプリカの読み取りに現れる。
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if query_outcome(&mut r, "SELECT id FROM docs LIMIT 1000") == Ok(6) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "replica did not catch up");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // 書き込み・DDL・明示 READ WRITE・COPY FROM は 25006。接続は生きたまま次の読み取りに応じる。
+    for sql in [
+        "INSERT INTO docs (id, embedding) VALUES (100, '[0.1,0.2,0.3]')",
+        "UPDATE docs SET embedding = '[0.9,0.9,0.9]' WHERE id = 1",
+        "DELETE FROM docs WHERE id = 1",
+        "CREATE TABLE t2 (id BIGINT PRIMARY KEY, embedding VECTOR(3))",
+        "BEGIN READ WRITE",
+        "COPY docs (id, embedding) FROM STDIN",
+    ] {
+        assert_eq!(
+            query_outcome(&mut r, sql),
+            Err("25006".to_string()),
+            "sql: {sql}"
+        );
+    }
+    // 修飾子なしの BEGIN の中でも書き込みは拒否され、ROLLBACK で戻れる。
+    assert_eq!(query_outcome(&mut r, "BEGIN"), Ok(0));
+    assert_eq!(
+        query_outcome(
+            &mut r,
+            "INSERT INTO docs (id, embedding) VALUES (101, '[0.1,0.2,0.3]')"
+        ),
+        Err("25006".to_string())
+    );
+    assert_eq!(query_outcome(&mut r, "ROLLBACK"), Ok(0));
+    // 拒否の後も内容は変わらない。
+    assert_eq!(
+        query_outcome(&mut r, "SELECT id FROM docs LIMIT 1000"),
+        Ok(6)
+    );
+    assert_eq!(
+        query_outcome(&mut r, "SELECT id FROM docs WHERE id = 100"),
+        Ok(0)
+    );
+}
+
+/// 読み取りレプリカのフラグは、変更ログ・送信側・バックアップ・ベースでない DB と併用できない（DB を開く前に拒否）。
+#[test]
+fn recover15_read_replica_rejects_bad_combinations() {
+    let fx = common::TempFixtureDir::new("read-replica-args");
+    let users = fx.users_path_str();
+    let db = fx.db_path_str();
+    let dir = Path::new(&db).parent().expect("parent").to_path_buf();
+    std::fs::write(&users, format!("alice:tenant-a:{}\n", phc_for("pw-alice"))).expect("users");
+    // ベースではない通常の DB（存在するファイル）。
+    {
+        let _ = Storage::open(&db).expect("create plain db");
+    }
+    let cred = write_credentials(&dir, 0o600);
+    let base_args = |extra: &[&str]| -> Output {
+        let mut a = vec![
+            "--users",
+            &users,
+            "--db",
+            &db,
+            "--bind",
+            "127.0.0.1:0",
+            "--replica-primary",
+            "127.0.0.1:9",
+            "--replica-credentials",
+            s(&cred),
+        ];
+        a.extend_from_slice(extra);
+        run(&a)
+    };
+    for extra in [
+        &["--change-log"][..],
+        &["--backup-socket", "/nonexistent/b.sock"][..],
+        &["--replica-primary", "127.0.0.1:9"][..],
+    ] {
+        let o = base_args(extra);
+        assert_ne!(o.status.code(), Some(0), "{extra:?}: {:?}", o);
+    }
+    // 併用の問題が無くても、ベースでない DB は起動を拒否する（listen しない）。
+    let o = base_args(&[]);
+    assert_ne!(o.status.code(), Some(0), "{:?}", o);
+    let err = String::from_utf8_lossy(&o.stderr).into_owned();
+    assert!(err.contains("not a replica base"), "{err}");
 }

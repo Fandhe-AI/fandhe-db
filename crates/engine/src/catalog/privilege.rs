@@ -41,8 +41,13 @@ mod sequence;
 pub(crate) use apply::{
     AclChangeError, AclFunctionRef, AclItem, AclRequest, AclScope, AclWarning, GranteeSpec,
 };
+pub(crate) use default_acl::{put_default_acl_init_in_txn, put_default_acl_row_in_txn};
 #[allow(unused_imports)] // 判定側（`sql::object_privilege`・テスト）が使う。
-pub(crate) use function::{function_privileges_in_txn, remove_function_acl_in_txn};
+pub(crate) use function::{
+    function_privileges_in_txn, list_acl_initialized_functions_in_txn, mark_acl_initialized_in_txn,
+    remove_function_acl_in_txn,
+};
+pub(crate) use owner::list_owners_for_tenant_in_txn;
 pub(crate) use schema::remove_schema_acl_in_txn;
 pub(crate) use sequence::{remove_sequence_acl_in_txn, sequence_privileges_in_txn};
 
@@ -402,6 +407,34 @@ pub(crate) fn list_acl_for_object_in_txn<R: ReadSource>(
         }
         let (_, e) = decode_row(kv, v.value())?;
         out.push(e);
+    }
+    Ok(out)
+}
+
+/// `tenant` の ACL 行をすべて `(対象, 行)` で返す（論理ダンプの書き出し専用。RECOVER-16・Issue #3096。
+/// 先頭が `tenant_id` のキー範囲だけを走査するため他テナントの行は構造上引けない）。破損行・上限超過は
+/// `Err`（読み飛ばさない）。
+pub(crate) fn list_acl_for_tenant_in_txn<R: ReadSource>(
+    src: &R,
+    tenant: &str,
+) -> Result<Vec<(PrivilegeObject, AclEntry)>> {
+    validate_tenant(tenant)?;
+    let table = match src.open_table(ACL_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut out = Vec::new();
+    for entry in table.range((tenant, 0u8, "", "", 0u64, 0u64)..)? {
+        let (k, v) = entry?;
+        let kv = k.value();
+        if kv.0 != tenant {
+            break;
+        }
+        if out.len() >= MAX_ACL_ENTRIES_PER_TENANT {
+            return Err(corrupt());
+        }
+        out.push(decode_row(kv, v.value())?);
     }
     Ok(out)
 }

@@ -11,7 +11,12 @@
 //! - `--change-log-retain-records <n>`: アーカイブ済みのレコードのうち新しい `n` 件を DB に残して、より古い
 //!   ものを刈り込む。指定しなければ刈り込まない（既定）。`--change-log-archive-dir` なしは起動拒否
 //! - `--change-log-archive-interval-secs <n>`: 書き出しの周期（秒）。`--change-log-archive-dir` なしは起動拒否
+//! - `--change-log-max-unarchived-bytes <n>`・`--change-log-max-unarchived-records <n>`: 未アーカイブの変更ログ量の
+//!   上限（1 以上。Issue #3091・RECOVER-14 (2) ポインタ）。超過すると利用者の書き込みを `54000` で拒否し、
+//!   アーカイブが進めば再開する。`--change-log-archive-dir` なしは起動拒否。アーカイブ先を指定した起動では
+//!   バイト上限に実装既定値（[`DEFAULT_MAX_UNARCHIVED_BYTES`]。spec 由来ではない）を適用する
 //! - `change-log-verify` サブコマンド: アーカイブの欠落・改ざんの検査（[`parse_verify`]）
+//! - `change-log-disable` サブコマンド: 停止中の DB の変更ログの無効化（[`parse_disable`]。Issue #3093・D13）
 //!
 //! 重複指定・不正値・組み合わせの不備は起動拒否で、エラー文は固定の英語（パス・値を含まない）。
 //! 一度有効にした DB をフラグなしで起動すると、レコードが欠けたまま世代が進む（LSN の欠落）ため、
@@ -27,7 +32,7 @@ pub const FLAG: &str = "--change-log";
 pub const DUPLICATE_MESSAGE: &str = "--change-log specified more than once";
 
 /// 一度有効にした DB をフラグなしで起動したときに拒否する固定文言（LSN の欠落を作らない）。
-pub const REQUIRED_MESSAGE: &str = "this database has a change log: restart with --change-log (writing without it would leave a gap in the log)";
+pub const REQUIRED_MESSAGE: &str = "this database has a change log: restart with --change-log (writing without it would leave a gap in the log), or disable the change log with `wire-server change-log-disable`";
 
 /// 有効化に成功したときに stderr へ出す固定文言（運用者向けの状態表示）。
 pub const ENABLED_MESSAGE: &str = "change log enabled (without --change-log-archive-dir the log is not archived and grows inside the database; point-in-time recovery is not available yet)";
@@ -48,6 +53,16 @@ pub const RETAIN_RECORDS_FLAG: &str = "--change-log-retain-records";
 /// 書き出し周期（秒）のフラグ名。
 pub const INTERVAL_FLAG: &str = "--change-log-archive-interval-secs";
 
+/// 未アーカイブのバイト上限のフラグ名。
+pub const MAX_UNARCHIVED_BYTES_FLAG: &str = "--change-log-max-unarchived-bytes";
+/// 未アーカイブの件数上限のフラグ名。
+pub const MAX_UNARCHIVED_RECORDS_FLAG: &str = "--change-log-max-unarchived-records";
+
+/// アーカイブ先を指定した起動に適用する、未アーカイブのバイト上限の既定（4 GiB）。実装既定値で
+/// spec 由来ではない。アーカイブ先が無い構成には適用しない（全レコードが未アーカイブになり、
+/// 上限到達後は書き込みが永久に止まって回復できないため）。
+pub const DEFAULT_MAX_UNARCHIVED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
 /// 書き出し周期の既定（秒）。実装既定値で spec 由来ではない。
 pub const DEFAULT_INTERVAL_SECS: u64 = 10;
 /// 書き出し周期の上限（秒。1 日）。
@@ -56,6 +71,12 @@ pub const MAX_INTERVAL_SECS: u64 = 86_400;
 /// アーカイブ系フラグを `--change-log` なしで指定したときの固定文言。
 pub const ARCHIVE_NEEDS_CHANGE_LOG_MESSAGE: &str =
     "--change-log-archive-dir, --change-log-retain-records and --change-log-archive-interval-secs require --change-log";
+/// 未アーカイブ量の上限フラグを `--change-log` なしで指定したときの固定文言。
+pub const UNARCHIVED_NEEDS_CHANGE_LOG_MESSAGE: &str =
+    "--change-log-max-unarchived-bytes and --change-log-max-unarchived-records require --change-log";
+/// 未アーカイブ量の上限フラグを `--change-log-archive-dir` なしで指定したときの固定文言。
+pub const UNARCHIVED_NEEDS_ARCHIVE_DIR_MESSAGE: &str =
+    "--change-log-max-unarchived-bytes and --change-log-max-unarchived-records require --change-log-archive-dir";
 /// 保持・周期を `--change-log-archive-dir` なしで指定したときの固定文言。
 pub const NEEDS_ARCHIVE_DIR_MESSAGE: &str =
     "--change-log-retain-records and --change-log-archive-interval-secs require --change-log-archive-dir";
@@ -90,6 +111,10 @@ pub struct ArchiveSettings {
     pub retain_records: Option<u64>,
     /// 書き出しの周期。
     pub interval: Duration,
+    /// 未アーカイブのレコード件数の上限（指定時のみ。`None` は件数の上限なし）。
+    pub max_unarchived_records: Option<u64>,
+    /// 未アーカイブのバイト数の上限（指定がなければ [`DEFAULT_MAX_UNARCHIVED_BYTES`]）。
+    pub max_unarchived_bytes: Option<u64>,
 }
 
 /// 同じフラグの重複指定を拒否する固定文言（フラグ名ごと）。
@@ -151,6 +176,28 @@ pub fn accept_interval_secs(already_set: bool, raw: &str) -> Result<u64, String>
     Ok(n)
 }
 
+/// 1 以上の 10 進整数だけを受理する（未アーカイブ量の上限。0 は常に拒否になるため受けない）。
+fn accept_positive(flag: &str, already_set: bool, raw: &str) -> Result<u64, String> {
+    if already_set {
+        return Err(duplicate(flag));
+    }
+    let n = parse_digits(flag, raw)?;
+    if n == 0 {
+        return Err(format!("{flag} must be at least 1"));
+    }
+    Ok(n)
+}
+
+/// `--change-log-max-unarchived-bytes` の値を検証する（1 以上）。
+pub fn accept_max_unarchived_bytes(already_set: bool, raw: &str) -> Result<u64, String> {
+    accept_positive(MAX_UNARCHIVED_BYTES_FLAG, already_set, raw)
+}
+
+/// `--change-log-max-unarchived-records` の値を検証する（1 以上）。
+pub fn accept_max_unarchived_records(already_set: bool, raw: &str) -> Result<u64, String> {
+    accept_positive(MAX_UNARCHIVED_RECORDS_FLAG, already_set, raw)
+}
+
 /// フラグの組み合わせを解決する。アーカイブ系のフラグは `--change-log` が前提で、保持・周期は
 /// アーカイブ先が前提（アーカイブされていない行を刈り込む設定を作らない。fail-closed）。
 pub fn resolve(
@@ -159,6 +206,26 @@ pub fn resolve(
     retain_records: Option<u64>,
     interval_secs: Option<u64>,
 ) -> Result<Option<ArchiveSettings>, &'static str> {
+    resolve_with_limits(change_log, dir, retain_records, interval_secs, None, None)
+}
+
+/// [`resolve`] に未アーカイブ量の上限（Issue #3091）を加えた版。上限フラグは `--change-log` と
+/// `--change-log-archive-dir` が前提。アーカイブ先を指定した起動ではバイト上限の既定を適用する。
+pub fn resolve_with_limits(
+    change_log: bool,
+    dir: Option<PathBuf>,
+    retain_records: Option<u64>,
+    interval_secs: Option<u64>,
+    max_unarchived_records: Option<u64>,
+    max_unarchived_bytes: Option<u64>,
+) -> Result<Option<ArchiveSettings>, &'static str> {
+    let limit_given = max_unarchived_records.is_some() || max_unarchived_bytes.is_some();
+    if limit_given && !change_log {
+        return Err(UNARCHIVED_NEEDS_CHANGE_LOG_MESSAGE);
+    }
+    if limit_given && dir.is_none() {
+        return Err(UNARCHIVED_NEEDS_ARCHIVE_DIR_MESSAGE);
+    }
     let any = dir.is_some() || retain_records.is_some() || interval_secs.is_some();
     if any && !change_log {
         return Err(ARCHIVE_NEEDS_CHANGE_LOG_MESSAGE);
@@ -177,6 +244,8 @@ pub fn resolve(
         dir,
         retain_records,
         interval: Duration::from_secs(interval_secs.unwrap_or(DEFAULT_INTERVAL_SECS)),
+        max_unarchived_records,
+        max_unarchived_bytes: Some(max_unarchived_bytes.unwrap_or(DEFAULT_MAX_UNARCHIVED_BYTES)),
     }))
 }
 
@@ -193,6 +262,9 @@ pub struct VerifyArgs {
     /// 突き合わせる停止中の DB（任意）。指定すると DB の識別子・timeline・有効化時の世代・水位と照合し、
     /// 先頭と末尾の欠落も検出する。省略するとディレクトリ内の整合（連鎖・チェックサム）だけを検査する。
     pub db: Option<PathBuf>,
+    /// 保持しているフルバックアップ（繰り返し指定できる。Issue #3092）。指定すると、最も古い終点より前の
+    /// セグメントを `change-log-cleanup` で意図して消したアーカイブとして検査する（`--db` が前提）。
+    pub bases: Vec<PathBuf>,
 }
 
 /// `change-log-verify` サブコマンドの引数（サブコマンド名より後ろ）を解釈する。未知の引数・値欠落・
@@ -200,14 +272,22 @@ pub struct VerifyArgs {
 pub fn parse_verify(args: &[String]) -> Result<VerifyArgs, String> {
     let mut dir: Option<&str> = None;
     let mut db: Option<&str> = None;
+    let mut bases: Vec<&str> = Vec::new();
     let mut it = args.iter();
     while let Some(arg) = it.next() {
+        if arg == "--base" {
+            match it.next() {
+                Some(v) => bases.push(v.as_str()),
+                None => return Err(format!("{arg} requires a value")),
+            }
+            continue;
+        }
         let slot =
             match arg.as_str() {
                 "--archive-dir" => &mut dir,
                 "--db" => &mut db,
                 _ => return Err(
-                    "unknown argument (usage: change-log-verify --archive-dir <dir> [--db <path>])"
+                    "unknown argument (usage: change-log-verify --archive-dir <dir> [--db <path>] [--base <backup>]...)"
                         .into(),
                 ),
             };
@@ -225,12 +305,115 @@ pub fn parse_verify(args: &[String]) -> Result<VerifyArgs, String> {
     let dir =
         accept_archive_dir(false, dir).map_err(|m| m.replace(ARCHIVE_DIR_FLAG, "--archive-dir"))?;
     let db = db.map(crate::backup_opt::validate_db).transpose()?;
-    Ok(VerifyArgs { dir, db })
+    if !bases.is_empty() && db.is_none() {
+        return Err("--base requires --db".into());
+    }
+    let bases = bases
+        .into_iter()
+        .map(|b| crate::backup_opt::validate_existing_file("--base", b))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(VerifyArgs { dir, db, bases })
+}
+
+/// `change-log-disable` の終了コード: 引数の不備（DB は開いていない）。
+pub const EXIT_DISABLE_USAGE: u8 = 2;
+/// `change-log-disable` の終了コード: 実行時の失敗（未アーカイブ・未有効化・使用中・開けない等）。
+pub const EXIT_DISABLE_FAILED: u8 = 1;
+
+/// 未アーカイブの破棄を許可するスイッチ名。
+pub const DISCARD_UNARCHIVED_FLAG: &str = "--discard-unarchived";
+
+/// 無効化に成功したときに stdout へ出す固定文言（件数・LSN・パスを含めない）。
+pub const DISABLED_MESSAGE: &str = "change log disabled (existing backups and archives no longer chain to this database; take a new full backup, and use a new archive directory if you re-enable)";
+
+/// 検証済みの `change-log-disable` サブコマンド引数。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisableArgs {
+    /// 無効化する停止中の DB。
+    pub db: PathBuf,
+    /// 未アーカイブのレコードを破棄して無効化するか（既定は拒否）。
+    pub discard_unarchived: bool,
+}
+
+/// `change-log-disable` サブコマンドの引数（サブコマンド名より後ろ）を解釈する。未知の引数・値欠落・
+/// 重複・必須欠落は拒否する（エラー文は英語の固定文言で、パスを含まない）。
+pub fn parse_disable(args: &[String]) -> Result<DisableArgs, String> {
+    let mut db: Option<&str> = None;
+    let mut discard = false;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--db" => {
+                if db.is_some() {
+                    return Err(duplicate(arg));
+                }
+                match it.next() {
+                    Some(v) => db = Some(v.as_str()),
+                    None => return Err(format!("{arg} requires a value")),
+                }
+            }
+            DISCARD_UNARCHIVED_FLAG => {
+                if discard {
+                    return Err(duplicate(arg));
+                }
+                discard = true;
+            }
+            _ => return Err(
+                "unknown argument (usage: change-log-disable --db <path> [--discard-unarchived])"
+                    .into(),
+            ),
+        }
+    }
+    let Some(db) = db else {
+        return Err("change-log-disable requires --db".into());
+    };
+    let db = crate::backup_opt::validate_db(db)?;
+    Ok(DisableArgs {
+        db,
+        discard_unarchived: discard,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unarchived_limit_flags_reject_duplicates_zero_and_garbage_without_echoing_values() {
+        for f in [accept_max_unarchived_bytes, accept_max_unarchived_records] {
+            assert_eq!(f(false, "7"), Ok(7));
+            assert!(f(true, "7").unwrap_err().contains("more than once"));
+            for bad in ["0", "", "-1", "1e3", " 5", "abc", "99999999999999999999999"] {
+                let e = f(false, bad).unwrap_err();
+                assert!(bad.is_empty() || !e.contains(bad), "{e}");
+            }
+        }
+    }
+
+    #[test]
+    fn unarchived_limits_need_change_log_and_archive_dir_and_default_the_byte_limit() {
+        let dir = PathBuf::from("/archive");
+        assert_eq!(
+            resolve_with_limits(false, Some(dir.clone()), None, None, Some(1), None),
+            Err(UNARCHIVED_NEEDS_CHANGE_LOG_MESSAGE)
+        );
+        assert_eq!(
+            resolve_with_limits(true, None, None, None, None, Some(1)),
+            Err(UNARCHIVED_NEEDS_ARCHIVE_DIR_MESSAGE)
+        );
+        let s = resolve_with_limits(true, Some(dir.clone()), None, None, None, None)
+            .expect("ok")
+            .expect("settings");
+        assert_eq!(s.max_unarchived_bytes, Some(DEFAULT_MAX_UNARCHIVED_BYTES));
+        assert_eq!(s.max_unarchived_records, None);
+        let s = resolve_with_limits(true, Some(dir), None, None, Some(5), Some(9))
+            .expect("ok")
+            .expect("settings");
+        assert_eq!(
+            (s.max_unarchived_records, s.max_unarchived_bytes),
+            (Some(5), Some(9))
+        );
+    }
 
     #[test]
     fn flag_is_a_bare_switch_name() {
@@ -253,10 +436,47 @@ mod tests {
             ARCHIVE_NEEDS_CHANGE_LOG_MESSAGE,
             NEEDS_ARCHIVE_DIR_MESSAGE,
             INSECURE_DIR_MESSAGE,
+            UNARCHIVED_NEEDS_CHANGE_LOG_MESSAGE,
+            UNARCHIVED_NEEDS_ARCHIVE_DIR_MESSAGE,
         ] {
             assert!(!m.contains('{') && !m.contains('\n'));
         }
         assert!(REQUIRED_MESSAGE.contains(FLAG));
+        assert!(REQUIRED_MESSAGE.contains("change-log-disable"));
+        assert!(!DISABLED_MESSAGE.contains('{') && !DISABLED_MESSAGE.contains('\n'));
+    }
+
+    fn argv(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn parse_disable_requires_db_and_rejects_bad_arguments() {
+        for bad in [
+            argv(&[]),
+            argv(&["--discard-unarchived"]),
+            argv(&["--db"]),
+            argv(&["--db", "a", "--db", "b"]),
+            argv(&["--db", "a", "--discard-unarchived", "--discard-unarchived"]),
+            argv(&["--db", "a", "--bogus"]),
+            argv(&["--db", "/nonexistent/path/for/test.db"]),
+        ] {
+            assert!(parse_disable(&bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn parse_disable_accepts_an_existing_db_with_optional_discard() {
+        let dir = std::env::temp_dir().join(format!("fandhe-disable-parse-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let db = dir.join("x.db");
+        std::fs::write(&db, b"x").expect("file");
+        let p = db.to_str().expect("utf8");
+        let a = parse_disable(&argv(&["--db", p])).expect("ok");
+        assert!(!a.discard_unarchived);
+        let b = parse_disable(&argv(&["--discard-unarchived", "--db", p])).expect("ok");
+        assert!(b.discard_unarchived);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn v(a: &[&str]) -> Vec<String> {
@@ -368,6 +588,31 @@ mod tests {
         assert!(ok.db.is_none());
         let ok = parse_verify(&v(&["--archive-dir", &dir, "--db", exe])).expect("with db");
         assert_eq!(ok.db.as_deref(), Some(std::path::Path::new(exe)));
+        assert!(ok.bases.is_empty());
+        // --base は繰り返し指定でき、--db が前提。
+        let ok = parse_verify(&v(&[
+            "--archive-dir",
+            &dir,
+            "--db",
+            exe,
+            "--base",
+            exe,
+            "--base",
+            exe,
+        ]))
+        .expect("with bases");
+        assert_eq!(ok.bases.len(), 2);
+        assert!(parse_verify(&v(&["--archive-dir", &dir, "--base", exe])).is_err());
+        assert!(parse_verify(&v(&[
+            "--archive-dir",
+            &dir,
+            "--db",
+            exe,
+            "--base",
+            "/nonexistent-base-for-test"
+        ]))
+        .is_err());
+        assert!(parse_verify(&v(&["--archive-dir", &dir, "--db", exe, "--base"])).is_err());
     }
 
     #[cfg(unix)]

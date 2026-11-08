@@ -1069,6 +1069,14 @@ impl<'e> SessionTransaction<'e> {
         isolation_level: Option<RequestedIsolationLevel>,
         acquire: WriterAcquire,
     ) -> Result<bool, SqlSurfaceError> {
+        // 読み取りレプリカ（RECOVER-15・Issue #2175）では、修飾子の有無・起点を問わず常に READ ONLY で
+        // 始める。既存の READ ONLY 機構（writer を取らない・書き込み文は `25006`）をそのまま再利用し、
+        // 利用者経路が writer を取得できない状態を構造で保つ。
+        let access_mode = if storage.is_read_replica() {
+            TxnAccessMode::ReadOnly
+        } else {
+            access_mode
+        };
         match &self.state {
             TxnState::Idle => {
                 // 壁時計の読み取り失敗（範囲外）は writer を開く前に fail-closed で返す
@@ -1105,6 +1113,11 @@ impl<'e> SessionTransaction<'e> {
                             .open_registered_snapshot()
                             .map_err(|_| internal_error())?;
                         (None, snap, reg)
+                    }
+                    // 読み取りレプリカの暗黙 Tx は writer を取らず、読み取りスナップショットだけを開く
+                    // （書き込み文は `25006`。`SKIP LOCKED` でも「取得せず」ではなく常に開始できる）。
+                    TxnOrigin::Implicit if access_mode == TxnAccessMode::ReadOnly => {
+                        (None, open_read_snapshot(storage)?, None)
                     }
                     // 暗黙トランザクション（WIRE-16・Issue #1175）: 従来どおり開始時に writer を
                     // 取る（#2401 が前提とする）。スナップショットは permit 保持中に開けば文ごとの
@@ -1875,6 +1888,13 @@ impl<'e> SessionTransaction<'e> {
             TxnState::Active(_) => {}
         }
         self.check_statement_limits(None)?;
+        // 読み取りレプリカでは READ WRITE への変更を `25006` で拒否する（`Failed` へ遷移。fail-closed）。
+        let replica_rw = access_mode == Some(TxnAccessMode::ReadWrite)
+            && matches!(&self.state, TxnState::Active(a) if a.storage.is_read_replica());
+        if replica_rw {
+            self.fail();
+            return Err(SqlSurfaceError::ReadOnlySqlTransaction);
+        }
         let mut reopen_failed = false;
         if let TxnState::Active(active) = &mut self.state {
             if let Some(mode) = access_mode {

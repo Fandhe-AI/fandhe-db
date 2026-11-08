@@ -239,3 +239,54 @@ fn the_public_from_source_api_uses_the_real_clock() {
         .expect("advance");
     assert!(v > 10);
 }
+
+#[test]
+fn the_high_water_raises_the_value_above_the_clock_and_the_stored_value() {
+    let path = unique_db_path("rg-hw");
+    let _g = CleanupGuard(path.clone());
+    let mut storage = Storage::open(&path).expect("open");
+    // 時計 < 高水位: 高水位 + 1。
+    assert_eq!(
+        storage
+            .advance_restore_generation_above_with_floor(1_000, 10)
+            .expect("hw"),
+        1_001
+    );
+    // 時計 > 高水位: 時計。
+    assert_eq!(
+        storage
+            .advance_restore_generation_above_with_floor(5, 5_000)
+            .expect("clock"),
+        5_000
+    );
+    // 保存値が最大: 保存値 + 1。
+    assert_eq!(
+        storage
+            .advance_restore_generation_above_with_floor(0, 0)
+            .expect("stored"),
+        5_001
+    );
+}
+
+#[test]
+fn the_high_water_limits_are_rejected() {
+    let path = unique_db_path("rg-hw-limit");
+    let _g = CleanupGuard(path.clone());
+    let mut storage = Storage::open(&path).expect("open");
+    assert!(storage
+        .advance_restore_generation_above_with_floor(MAX_RESTORE_GENERATION, 0)
+        .is_err());
+    assert!(storage
+        .advance_restore_generation_above_with_floor(u64::MAX, 0)
+        .is_err());
+    assert!(storage
+        .advance_restore_generation_above_with_floor(0, MAX_RESTORE_GENERATION + 1)
+        .is_err());
+    assert_eq!(storage.restore_generation().expect("untouched"), 0);
+    assert_eq!(
+        storage
+            .advance_restore_generation_above_with_floor(MAX_RESTORE_GENERATION - 1, 0)
+            .expect("max"),
+        MAX_RESTORE_GENERATION
+    );
+}

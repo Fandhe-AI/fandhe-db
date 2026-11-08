@@ -3,8 +3,12 @@
 //!
 //! 責務境界: データベース全体で 1 つの値（テナント情報を含まない）を専用の redb 表に持ち、
 //! [`Storage::restore_generation`] で読み、[`Storage::advance_restore_generation`] で進める。
-//! 呼び出し元は wire-server の `restore`（物理の復元の完了点）で、PITR（#2450）も完了点で同じ API を呼ぶ。
-//! 論理の復元（#2451）は [`Storage::advance_restore_generation_from_source`] でダンプが運ぶ復元元の世代を下限に入れる。セッションからの参照（#2449）は読み取り側を使い、構文は `SHOW restore_generation`（engine の `core.rs`）。
+//! 呼び出し元は wire-server の `restore`（物理・増分・PITR が共通で通る完了点。#2450）で、
+//! 論理の復元（#2451）は [`Storage::advance_restore_generation_from_source`] でダンプが運ぶ復元元の世代を下限に入れる。
+//! セッションからの参照（#2449）は読み取り側を使い、構文は `SHOW restore_generation`（engine の `core.rs`）。
+//!
+//! 復元をまたぐ高水位（Issue #3105）は `Storage::advance_restore_generation_above` が呼び出し元から
+//! 受け取る下限として扱い、状態ファイルの形式は [`high_water`] が持つ（置き場所は設計ドキュメント）。
 //!
 //! 値が壊れている・欠けている・上限に達した場合は黙って補わず `Err` とする（fail-closed）。
 //! 書き込みは変更ログの記録に関与しない保守 commit で行う。
@@ -79,8 +83,9 @@ impl Storage {
     ///   も LSN も動かさず、変更ログのレコードも生まない）
     /// - 変更ログを有効にした `Storage` と一時表用ストレージでは拒否する（復元先の確定前の DB にだけ使う）
     /// - 失敗したときは何も書かない
-    /// - 保証するのは新しい値が元の値より大きいこと。同じ元からの繰り返し復元での増加は通常の運用条件が前提で、
-    ///   復元間で共有する採番状態は持たない（それが必要かは別途の設計事項）
+    /// - 保証するのは新しい値が元の値より大きいこと。同じ元からの繰り返し復元での単調な増加は、復元間で
+    ///   共有する高水位を渡す [`Self::advance_restore_generation_above`] が担う（Issue #3105。高水位を
+    ///   使わないこの経路は時計の下限だけが頼りで、時計が戻ると増えない場合がある）
     pub fn advance_restore_generation(&mut self) -> Result<u64> {
         self.advance_restore_generation_with_floor(clock_floor()?)
     }
@@ -144,6 +149,29 @@ impl Storage {
     }
 }
 
+impl Storage {
+    /// 復元をまたぐ高水位 `high_water`（これまでに発行した世代の最大値）より大きい値へ世代を進める
+    /// （Issue #3105。wire-server の `restore --generation-state` が状態ファイルから読んだ値を渡す）。
+    /// 新しい値は `max(保存値 + 1, 時計の下限, high_water + 1)`。`high_water` が上限以上なら `Err`（丸めない）。
+    /// それ以外の条件は [`Self::advance_restore_generation`] と同じ。
+    pub fn advance_restore_generation_above(&mut self, high_water: u64) -> Result<u64> {
+        self.advance_restore_generation_above_with_floor(high_water, clock_floor()?)
+    }
+
+    /// [`Self::advance_restore_generation_above`] の時計下限指定版（時計に依存しないテストが使う）。
+    pub(crate) fn advance_restore_generation_above_with_floor(
+        &mut self,
+        high_water: u64,
+        floor: u64,
+    ) -> Result<u64> {
+        let above = high_water
+            .checked_add(1)
+            .filter(|v| *v <= MAX_RESTORE_GENERATION)
+            .ok_or_else(|| StorageError::Codec("restore generation limit reached".to_string()))?;
+        self.advance_restore_generation_with_floor(floor.max(above))
+    }
+}
+
 /// 読み取りトランザクションから世代を読む（表が無ければ 0）。
 fn read_generation(read: &redb::ReadTransaction) -> Result<u64> {
     let table = match read.open_table(TABLE) {
@@ -156,6 +184,8 @@ fn read_generation(read: &redb::ReadTransaction) -> Result<u64> {
         None => Err(invalid()),
     }
 }
+
+pub(crate) mod high_water;
 
 #[cfg(test)]
 mod tests;

@@ -59,7 +59,7 @@ DDL へ戻す手段が無い種別・属性があれば `Unsupported` でダン�
 | ---- | ---- |
 | 暗黙 `id` を持つ表（旧方式・移行済み方式） | SQL の `CREATE TABLE` は暗黙 `id` を持たない採番方式の表しか作らない |
 | マテリアライズド VIEW | 実体（文脈ごとの行）を DDL へ戻す手段が無い |
-| メンバーシップ・権限（ACL）・所有者・既定権限・ブートストラップ権限 | `GRANT`／`ALTER ... OWNER TO` は現在ロールの束縛（付与者の記録）が要り、付与者を指定する構文（`GRANTED BY`）を持たない。黙って落とすと復元後に意図しない権限状態になる（ACL の「実体化済み」印も同様） |
+| ロールが参照する他テナントのロール・SCHEMA・関数、SCHEMA 配下の SEQUENCE への権限 | 復元先の自テナントに戻せない（§14.4）。メンバーシップ・ACL・所有者・既定権限・初期権限そのものは第 14 節の復元指示で戻す |
 | SCHEMA 配下で現在値を持つ SEQUENCE | `setval`／`nextval` は SCHEMA 修飾・引用符付きの名前を受理しない |
 | SCHEMA 配下の単独の SEQUENCE | `CREATE SEQUENCE` が修飾名を受理しない |
 | 名前が既定の暗黙 SEQUENCE（`<表>_<列>_seq`）と異なる所有 SEQUENCE、既定でない SERIAL の定義 | 再実行で付く名前・定義が変わる |
@@ -91,8 +91,7 @@ DDL へ戻す手段が無い種別・属性があれば `Unsupported` でダン�
 
 ## 9. 運用上の制約（#2162・#2163 への申し送り）
 
-- 所有者の行（`ALTER ... OWNER TO` の相当）は、ロールを束縛したセッションが表・関数・SEQUENCE を作ると必ず記録される。現状は権限系として一括で `Unsupported` にするため、ロール束縛のセッションで作ったオブジェクトを持つ DB は書き出せない。`ALTER ... OWNER TO` は付与者の概念が無く SQL で表現できるので、権限系から切り離して後続で出す余地がある
-- ブートストラップ権限（ユーザーファイル由来のロールの初期権限）の行があるテナントも同様に書き出せない
+- 所有者・メンバーシップ・権限（ACL）・既定権限・ブートストラップ権限は SQL では戻せないため、第 14 節の復元指示として書き出す（Issue #3096）
 - ダンプにはロールの SCRAM 検証子（`CREATE ROLE ... PASSWORD 'SCRAM-SHA-256$...'`）が含まれる（平文は持たない）。出力ファイルの権限（`0o600` 相当）は CLI（#2162）が守る
 - 復元は、ロールを作った後の文を束縛なしの運用者権限で実行できることが前提（現行の `CREATE TABLE`・`CREATE FUNCTION`・`CREATE POLICY` などは束縛なしで通る）
 
@@ -102,7 +101,7 @@ DDL へ戻す手段が無い種別・属性があれば `Unsupported` でダン�
 
 ## 10. 残課題
 
-- 権限（GRANT・所有者・既定権限・メンバーシップ）の書き出し: 復元を現在ロールを束縛した主体で実行する設計（#2162・#2163）と、`GRANTED BY` 相当の構文の追加が前提
+- 権限の書き出しは第 14 節で対応済み（Issue #3096）
 - 外部キー: 参照先の列名が `id` のものは SQL 表層が暗黙 id への参照として `0A000` で拒否するため、ダンプには現れない。それ以外の外部キーは SQL で作れ、SQL 経由の往復を第 13 節の試験が確かめる
 - マテリアライズド VIEW、SCHEMA 配下の単独 SEQUENCE と現在値
 
@@ -213,7 +212,7 @@ wire-server dump-restore --from <ダンプ> --db <新規パス> [--expect-tenant
 - `--tenant <id>` は `SchemaDdlScope::shared_and_tenant`、`--shared-only` は `SchemaDdlScope::shared_only` にそのまま写す。どちらかの指定が必須で、**全テナントを暗黙に書き出す経路は無い**
 - 全テナントのダンプは対象外: engine にテナントを列挙する API が無く（§11.8）、テナントごとに別々のスナップショットで書き出すと定義とデータの取得点が食い違うため。必要になったら engine 側でテナント列挙と単一スナップショットの複数テナント版を足してから CLI を広げる（別 Issue）
 - 指定テナントの行だけが読み出され（§11.2）、他テナントの行・SCHEMA・ロールは出力に現れない。共有の定義（`public` の表・VIEW など）は設計上すべてのテナントに共通なので出る。テナント名は `is_header_safe_tenant`（印字可能な ASCII のみ＋engine の長さ検査）を満たすものだけを受理する
-- **既知の制約（#2160 の §9 から継続）**: `--users` ファイルから起動したサーバーが作った DB では、初回起動時にそのテナントの利用者のブートストラップ権限が記録されるため、権限を書き出せない現状のダンプは `Unsupported`（終了コード 1）で拒否する。権限の書き出し（§10）が済むまで、CLI で書き出せるのは権限を持たないテナントの DB に限る。結合試験は engine を直接開いて DB を作り、復元結果の読み取りだけサーバー経由で確かめている
+- **`--users` 起動のサーバーが作った DB**: ロール・権限・初期権限・旧形式ハッシュも復元指示として書き出し、`dump` → `dump-restore` で往復する（第 14 節。Issue #3096）
 
 ### 12.3 ファイル形式（版 2）
 
@@ -274,7 +273,6 @@ COPY <表> (<列>, ...) FROM STDIN;
 ### 12.7 残課題
 
 - 全テナントのダンプ（テナント列挙 API と単一スナップショットの複数テナント版が前提。§12.2）
-- 権限（GRANT・所有者・メンバーシップ・ブートストラップ権限）の書き出し（§10）。`--users` 起動のサーバーが作った DB を CLI で書き出すには、これが前提になる
 - 既存（空でない）DB へのデータのみの流し込み（`--into` 相当の opt-in）。新規パスだけを受け付ける現行の方針と原子性の方式（一時名＋公開）が合わないため、別途設計する
 - ダンプの圧縮・暗号化、`INSERT` の複数行まとめ（§11.8）
 
@@ -308,8 +306,56 @@ COPY <表> (<列>, ...) FROM STDIN;
 | 従来方式（暗黙 id）の表が持つ外部キー | 暗黙 id の表そのものが `Unsupported`（外部キーだけを落として戻すことはしない） | `dump_fails_closed_when_a_legacy_table_carries_a_foreign_key` |
 | SCHEMA 配下で現在値を持つ SEQUENCE（SCHEMA 配下の表の SERIAL・IDENTITY を含む） | `Unsupported`（§4） | `logical_dump_schema.rs` の `schema_scoped_sequence_with_a_current_value_fails_closed`。fixture の SCHEMA 配下の表は採番列を持たない |
 | `GENERATED ALWAYS` の IDENTITY | INSERT 形式では `Unsupported`、COPY 形式では往復する（§11.6） | `logical_dump_data.rs` の `identity_columns_round_trip_through_copy_and_fail_closed_for_insert`。fixture の IDENTITY は `BY DEFAULT` |
-| 権限・メンバーシップ・所有者・マテリアライズド VIEW・暗黙 id の表 | `Unsupported`（§4） | `logical_dump_schema.rs` の既存試験（`role_membership_and_privileges_fail_closed`・`materialized_views_fail_the_whole_dump`・`table_with_implicit_id_row_identity_fails_the_whole_dump`） |
+| マテリアライズド VIEW・暗黙 id の表 | `Unsupported`（§4） | `logical_dump_schema.rs` の既存試験（`materialized_views_fail_the_whole_dump`・`table_with_implicit_id_row_identity_fails_the_whole_dump`） |
 
 ### 13.4 試験で見つかった不具合
 
 - 外部キー（一意キー索引）を持つ表に行があると、逆引き索引の物理表（`key_index_rev/<表>/<名前>`）が「未分類の表」として扱われ、`export_schema_ddl`・`export_logical_dump` が全体を失敗させていた。分類の接頭辞に `key_index_rev/` を加えて直した（分類の単体試験にも追加）。
+
+## 14. ロールと権限の書き出し（Issue #3096。RECOVER-16・SQL-39・SQL-40・RLS-12 のポインタ）
+
+### 14.1 判断: 復元指示（`RESTORE ...`）で状態を直接戻す
+
+- 戻す対象: ロールのメンバーシップ（付与者・所有者相当を根拠とした付与かの別を含む）・所有者・ACL（表・列・SCHEMA・SEQUENCE・関数。付与者と GRANT OPTION を含む）・関数 ACL の実体化印・既定権限（`IN SCHEMA` の有無・関数の実体化印を含む）・ロールの初期権限（`--users` 由来の全権限・DDL）・旧形式ハッシュ・ブートストラップ済みマーカー
+- **採らなかった案 1: `GRANT` 文＋ロールを束縛した復元セッション**。付与者を元のロールとして記録するには、付与者ごとに別のロールとしてセッションを束縛し直す必要がある。所有者の再現も `ALTER ... OWNER TO` が表・VIEW・SCHEMA にしか無く、関数・既定権限を表せない。メンバーシップは付与の根拠（所有者相当・ADMIN）ごとに別の経路が要り、依存順の並べ替えと「付与者なし」の行の扱いが別に必要になる
+- **採らなかった案 2: SQL の `GRANTED BY` を解禁する**。稼働中のサーバーで運用者が任意の付与者を名乗れるようになる（なりすましの経路が増え、`0A000` の既存契約も変わる）
+- **採った案**: 状態を 1 件 1 文の指示（SQL ではない）として `PostData` の最後に書き出し、復元は engine の復元用入口（`EngineCore::apply_restore_directive`）が保存層の検証つき書き込み関数で 1 件ずつ単一 txn・1 回の commit で戻す。付与者・所有者・実体化印・メンバーシップの版をそのまま再現でき、「付与者なし」の古い行も戻せる
+- 復元を実行する主体: 復元 CLI（`dump-restore`）だけ。空の一時 DB 上で engine を直接呼ぶ。SQL・NoSQL・認証済みセッションからは到達できず、`GRANTED BY` の `0A000` は変わらない。付与者の表し方: 指示に付与者のロール名を明記する（復元側が自テナントのロール表で ID へ解決する）
+- SQL ではない指示なので、ダンプファイルを `psql` 等へ流しても `RESTORE` 行は構文エラーで止まる（安全側）。第 12.3 節の「SQL スクリプトとしても読める」は、この種別の枠を除く
+
+### 14.2 指示の文法（`catalog/ddl_export/restore_directive.rs` が唯一の定義）
+
+| 種別（枠の語） | 先頭 | 内容 |
+| -------------- | ---- | ---- |
+| `role-bootstrap` | `RESTORE ROLE`／`RESTORE BOOTSTRAP MARKER` | 旧形式ハッシュ・初期権限・マーカー |
+| `role-membership` | `RESTORE MEMBERSHIP` | 付与されたロール・メンバー・付与者（なし可）・根拠の別・ADMIN／INHERIT／SET |
+| `owner` | `RESTORE OWNER` | 表・VIEW・SCHEMA・関数の所有者（SEQUENCE は所有者を持てない） |
+| `privilege` | `RESTORE ACL` | ACL の 1 行、または関数 ACL の実体化印（`RESTORE ACL INIT FUNCTION`） |
+| `default-privilege` | `RESTORE DEFAULT ACL` | 既定権限の 1 行、または関数の実体化印 |
+
+- 識別子は引用符つき（`""` の二重化）、関数は署名（`名前(型, ...)`。書き出しと復元が同じ関数で描画して照合する。内部 ID は復元先で変わるため使わない）、権限は語（網羅表の単体試験で全ビットを固定）。解析は完全一致の厳格な文法で、余分な語・未知の語・重複・NUL・閉じていない引用を拒否する
+- 出力順は描画した文字列の昇順（内部 ID に依存しない）。種別の順は `role-bootstrap` → `role-membership` → `owner` → `privilege` → `default-privilege`。`PostData` の最後に置くので、復元中に作るオブジェクトへ既定権限が効かない
+- 書き出しは `catalog/ddl_export/privilege.rs`、適用は `restore_apply.rs`
+
+### 14.3 復元側の検査
+
+- wire-server は 5 種別を後段（`Post`）の枠としてだけ受け付け、データの前には置けない。`scope: shared` のダンプに現れたら終了コード 4 で拒否する。種別ごとの許可表（先頭の語句）に合わない本文も 4
+- 名前の解決（ロール・SCHEMA・relation・関数・SEQUENCE）はヘッダのテナントの中だけ。不在は他テナントにだけ在る場合を含め区別なく `42704`（終了コード 1）。文法違反は `42601`、保存形式の契約に反する値・旧形式ハッシュの上書きは `22023`。いずれも何も公開しない
+- エラー文言は固定で、名前・パスワードハッシュ・テナントを含まない。指示の型の `Debug` は伏せる
+
+### 14.4 テナント境界（AC2）と fail-closed
+
+- 読む表はすべて先頭が `tenant_id` のキー範囲（所有者表だけは全件走査してテナントで絞る）。ロール ID → 名前の写像は自テナントのロール表だけから作り、写像に無い ID（他テナントのロールを指す破損を含む）は固定文言の `Unsupported` で全体を失敗させる。SCHEMA・SEQUENCE・関数の ID も自テナントの一覧に無ければ同様
+- `--shared-only` は権限系を何も出さない
+- SCHEMA 配下の SEQUENCE への権限は `Unsupported`（SEQUENCE 自体を戻せない §4 と同じ理由）
+- マーカーは自テナントのキーだけを読み、DB 単位の番兵（移行済みの印）は書き出さない（復元先は新規 DB）。ログイン名の対応表は `CREATE ROLE ... LOGIN` が同じ txn で登録し直すため書き出さない
+
+### 14.5 残るリスクと残課題
+
+- 指示は初期権限（全権限）やメンバーシップを与えうるため、§12.5 の「信頼できる出典のダンプだけを復元する」に含まれる。影響は運用者が選んだ新規 DB に閉じる。復元側は ACL の列名の存在までは確かめない（書き出した出典のダンプが前提）
+- 全テナントのダンプ（§12.7）、マテリアライズド VIEW の ACL・所有者、既存（空でない）DB への権限の流し込みは対象外
+
+### 14.6 試験
+
+- engine（`tests/table_rls/logical_dump_schema.rs`）: ロール・権限の往復（再ダンプのバイト一致、旧形式ハッシュ・初期権限・マーカーの復元）、他テナントの混入なし、不在の名前・文法違反・上書きの拒否と固定文言。単体試験は `restore_directive.rs`（描画と解析の往復・拒否・伏せ字・権限語の網羅）
+- wire-server（`tests/wire_cli/dump_users_cli.rs`）: `--users` で起動したサーバーが作った DB の `dump` → `dump-restore` → 再ダンプの一致と、復元先を同じ users ファイルで起動した認証・権限の観測の一致、出力が 0600 でハッシュが標準出力・標準エラーに出ないこと、指示の改ざん（許可外・段階違い・shared・存在しない名前）の拒否

@@ -943,7 +943,12 @@ enum Plan {
         bytes: Vec<u8>,
     },
     /// 同じ先頭 LSN の検証済みセグメントが既に在り、表のレコードと一致した（書き直さない）。
-    Adopt { last_lsn: u64, path: PathBuf },
+    Adopt {
+        last_lsn: u64,
+        path: PathBuf,
+        /// 検証済みヘッダの本体バイト数（未アーカイブ量の合計から引く）。
+        body_len: u64,
+    },
 }
 
 pub(super) fn read_meta_u64(read: &redb::ReadTransaction, key: &str) -> Result<Option<u64>> {
@@ -1042,6 +1047,7 @@ fn plan_next(
             Ok(Plan::Adopt {
                 last_lsn: h.last_lsn,
                 path,
+                body_len: h.body_len,
             })
         } else {
             Err(ArchiveError::Conflict)
@@ -1080,18 +1086,22 @@ enum Step {
 /// 水位を `new_w` へ進め（`expect_w` から変わっていなければ）、保持設定があれば水位以下を上限つきで
 /// 刈り込む保守 commit。世代を進めずレコードも生まない（D6）。通常の書き込みが待機している間は
 /// ゲートを譲り、見送ったら [`Step::Skipped`]。`prune_cap` は刈り込める LSN の上限（[`prune_cap_for`] が
-/// アーカイブ先を検証して求める。0 は刈り込まない）。
+/// アーカイブ先を検証して求める。0 は刈り込まない）。`body_bytes` は今回書き出した本体バイト数
+/// （未アーカイブ量の合計から引く。Issue #3091）。`at_limit` が真（未アーカイブ量が上限に達している）
+/// のときはゲートを譲らず通常の書き込みと並んで取る（拒否された書き手の再試行で飢えないため）。
 fn maintenance_commit(
     storage: &Storage,
     expect_w: u64,
     new_w: u64,
     opts: &ArchiveOptions,
     prune_cap: u64,
+    body_bytes: u64,
+    at_limit: bool,
 ) -> Result<Step> {
     // 書き込みゲートを先に取る（待機中は登録簿を持たない。ゲート待ちの間もレプリカの ack の更新・登録・解除が
     // 止まらないようにするため）。ロックの順序は常に「ゲート → 登録簿」で、登録簿を持ったままゲートを待つ
     // 経路は無い（登録・ack 更新・解除はゲートを取らず、登録簿のロックだけで済む）ので、逆転によるデッドロックは無い。
-    let Some(txn) = storage.begin_maintenance_txn()? else {
+    let Some(txn) = storage.begin_maintenance_txn(at_limit)? else {
         return Ok(Step::Skipped);
     };
     // レプリカの保持位置（Issue #2173）。ゲートを得てから登録簿のロックを取り、刈り込みの commit まで保持する。
@@ -1126,6 +1136,9 @@ fn maintenance_commit(
         }
         if new_w != expect_w {
             meta.insert(META_KEY_ARCHIVED_LSN, new_w.to_le_bytes().as_slice())?;
+            if let Some(state) = storage.change_log.as_ref() {
+                super::backlog::on_watermark_advance(&mut meta, state, new_w, body_bytes)?;
+            }
         }
         if let Some(retain) = opts.retain_records {
             // 削除は水位以下に構造的に限る（水位より後は未アーカイブで、決して消さない）。
@@ -1155,6 +1168,11 @@ fn maintenance_commit(
         return Ok(Step::Done { pruned: 0 });
     }
     crate::recovery::commit_boundary::commit_maintenance(txn)?;
+    if new_w != expect_w {
+        if let Some(state) = storage.change_log.as_ref() {
+            state.rejected.lower();
+        }
+    }
     Ok(Step::Done { pruned: deleted })
 }
 
@@ -1304,11 +1322,15 @@ pub(in crate::storage) fn run_cycle(
     for _ in 0..MAX_SEGMENTS_PER_CYCLE {
         let w = watermark(&storage.db.begin_read()?)?;
         report.archived_through = w;
-        let (last_lsn, adopted) = match plan_next(storage, &state, opts, &index, w)? {
+        let (last_lsn, adopted, body_bytes) = match plan_next(storage, &state, opts, &index, w)? {
             Plan::Nothing => break,
-            Plan::Adopt { last_lsn, path } => {
+            Plan::Adopt {
+                last_lsn,
+                path,
+                body_len,
+            } => {
                 sync_adopted(&opts.dir, &path)?;
-                (last_lsn, true)
+                (last_lsn, true, body_len)
             }
             Plan::Write { header, bytes } => {
                 let name = segment_name(
@@ -1331,10 +1353,10 @@ pub(in crate::storage) fn run_cycle(
                     }
                     sync_adopted(&opts.dir, &path)?;
                     index_insert(&mut index, path, entry);
-                    (header.last_lsn, true)
+                    (header.last_lsn, true, header.body_len)
                 } else {
                     index_insert(&mut index, path, entry);
-                    (header.last_lsn, false)
+                    (header.last_lsn, false, header.body_len)
                 }
             }
         };
@@ -1346,7 +1368,8 @@ pub(in crate::storage) fn run_cycle(
                 0
             }
         };
-        match maintenance_commit(storage, w, last_lsn, opts, cap)? {
+        let full = super::backlog::at_limit(&storage.db.begin_read()?, &state)?;
+        match maintenance_commit(storage, w, last_lsn, opts, cap, body_bytes, full)? {
             Step::Skipped => {
                 report.skipped = true;
                 return Ok(report);
@@ -1372,7 +1395,8 @@ pub(in crate::storage) fn run_cycle(
                     break;
                 }
             };
-            match maintenance_commit(storage, w, w, opts, cap)? {
+            let full = super::backlog::at_limit(&storage.db.begin_read()?, &state)?;
+            match maintenance_commit(storage, w, w, opts, cap, 0, full)? {
                 Step::Skipped => {
                     report.skipped = true;
                     break;
@@ -1401,10 +1425,23 @@ pub(in crate::storage) fn verify_against_db(
 }
 
 /// [`verify_against_db`] の本体。読み取りトランザクションだけを使うため、読み取り専用 open
-/// （`ReadOnlyStorage`）からも呼べる。
+/// （`ReadOnlyStorage`）からも呼べる。先頭は有効化時の世代の次を厳密に要求する。
 pub(in crate::storage) fn verify_against_read(
     read: &redb::ReadTransaction,
     dir: &Path,
+) -> Result<ArchiveSummary> {
+    verify_against_read_from(read, dir, None)
+}
+
+/// [`verify_against_read`] の一般化。`retained_from` が `Some(l)` のときは、`l` より前のセグメントを
+/// 意図して消した（Issue #3092 の保持管理）アーカイブを検査する。残ったセグメントが 1 本の連鎖で
+/// あること、先頭が `max(l, 有効化時の世代 + 1)` 以下から始まること（保持区間の先頭の紛失の検出）、
+/// 水位に届く末尾があること（末尾の紛失の検出）を要求する。セグメントが 0 本なのは水位が `l` 未満の
+/// ときだけ許す。`None` は従来どおり先頭を有効化時の世代の次に固定する。
+pub(in crate::storage) fn verify_against_read_from(
+    read: &redb::ReadTransaction,
+    dir: &Path,
+    retained_from: Option<u64>,
 ) -> Result<ArchiveSummary> {
     check_dir(dir)?;
     let id: Option<[u8; DB_ID_LEN]> = match read.open_table(META_TABLE) {
@@ -1419,18 +1456,86 @@ pub(in crate::storage) fn verify_against_read(
     let timeline = read_meta_u64(read, META_KEY_TIMELINE)?.ok_or(ArchiveError::LogCorrupt)?;
     let base = read_meta_u64(read, META_KEY_BASE_GENERATION)?.ok_or(ArchiveError::LogCorrupt)?;
     let archived = read_meta_u64(read, META_KEY_ARCHIVED_LSN)?.unwrap_or(base);
+    let first_required = base.checked_add(1).ok_or(ArchiveError::LsnGap)?;
     let expect = ArchiveExpectation {
         db_id: Some(id),
         timeline: Some(timeline),
-        start_lsn: base.checked_add(1),
+        start_lsn: if retained_from.is_none() {
+            Some(first_required)
+        } else {
+            None
+        },
     };
     let summary = verify_listed(dir, &expect, None, None)?;
-    // 水位が進んでいるのに、その LSN まで届くセグメントが無い（末尾の紛失）。
-    if archived > base && summary.last_lsn.is_none_or(|l| l < archived) {
-        return Err(ArchiveError::LsnGap);
+    if let (Some(l), Some(first)) = (retained_from, summary.first_lsn) {
+        // 保持区間の先頭の紛失（先頭が保持の始点より後ろ）。
+        if first > l.max(first_required) {
+            return Err(ArchiveError::LsnGap);
+        }
+    }
+    // 水位が進んでいるのに、その LSN まで届くセグメントが無い（末尾の紛失）。全削除は水位が保持の始点
+    // 未満のときだけ正当。
+    if archived > base {
+        match summary.last_lsn {
+            Some(last) if last >= archived => {}
+            None if retained_from.is_some_and(|l| archived < l) => {}
+            _ => return Err(ArchiveError::LsnGap),
+        }
     }
     Ok(summary)
 }
+
+/// 増分バックアップの出力（`incremental`。Issue #3099・RECOVER-14）が、刈り込み済みの区間 `from..=to` を
+/// 補うために、`dir` から**その区間を連続して覆う検証済みのセグメント**を選んで返す（LSN 順）。
+/// `prune_cap_for` と同じく名前の一覧から区間に掛かるものだけを [`verify_segment_file`] で検証し（費用は
+/// 区間の大きさに比例。アーカイブ全体は読まない）、名前とヘッダの一致を確かめる。他者が書けるディレクトリは
+/// 読み取りでも拒否する（差し込まれたセグメントを使わない）。別の DB・timeline の名前は無視する。
+/// 区間を覆えない（先頭・途中・末尾の欠け）ときは `ArchiveIncomplete`。呼び出し側が再生時にヘッダとトレーラを
+/// 照合して、検証後の差し替えを検出する。
+pub(super) fn segments_covering(
+    dir: &Path,
+    db_id: &[u8; DB_ID_LEN],
+    timeline: u64,
+    from: u64,
+    to: u64,
+    max_payload: usize,
+) -> Result<Vec<(PathBuf, SegmentInfo)>> {
+    check_dir(dir)?;
+    check_dir_not_shared(dir)?;
+    let index = list_segments(dir)?;
+    let mut need = from;
+    let mut out = Vec::new();
+    for (path, name) in &index {
+        if &name.db_id != db_id || name.timeline != timeline || name.last_lsn < need {
+            continue;
+        }
+        if name.first_lsn > need {
+            break;
+        }
+        let info = verify_segment_file(path, max_payload)?;
+        let h = info.header;
+        if &h.db_id != db_id
+            || h.timeline != timeline
+            || h.first_lsn != name.first_lsn
+            || h.last_lsn != name.last_lsn
+        {
+            return Err(ArchiveError::BadFormat);
+        }
+        out.push((path.clone(), info));
+        if h.last_lsn >= to {
+            return Ok(out);
+        }
+        need = h.last_lsn.checked_add(1).ok_or(ArchiveError::LsnGap)?;
+    }
+    Err(ArchiveError::ArchiveIncomplete)
+}
+
+pub use cleanup::{
+    execute_archive_cleanup, plan_archive_cleanup, retention_point_of, CleanupError, CleanupPlan,
+    CleanupPolicy, CleanupReport, RetentionPoint,
+};
+
+mod cleanup;
 
 #[cfg(test)]
 mod tests;

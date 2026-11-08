@@ -1428,6 +1428,10 @@ pub struct EngineCore {
     /// [`Self::with_ledger_mode`] のみ。`crate::recovery::required_op_id` モジュール
     /// ドキュメント参照）。
     ledger_mode: LedgerMode,
+    /// 同期レプリケーション（オプション。Issue #2245・RECOVER-15 ポインタ）の確認待ちの調停役。
+    /// `None`（既定）は非同期のまま。差し替えは [`Self::with_sync_commit`] のみで、セッション・SQL・HTTP
+    /// からは到達できない（テナントが保証を弱める経路を作らない）。
+    sync_commit: Option<std::sync::Arc<crate::storage::SyncCommitCoordinator>>,
     /// BEFORE ROW INSERT トリガの呼び出し口を保持する通過証（TABLE-45・Issue #1723）。発火に対応した
     /// INSERT 経路（SQL の `INSERT ... VALUES`・`INSERT ... SELECT`）だけが `tenant` へ渡す。既定は
     /// 未結線（トリガ関数の実行は `0A000`）で、本番の結線は Issue #1720（内部 API は #2228）。入れ子の深さ上限
@@ -3288,6 +3292,30 @@ impl EngineCore {
         ))
     }
 
+    /// 読み取りレプリカ（RECOVER-15・Issue #2175）として構成する。レプリカのベース（変更ログの識別子を
+    /// 持つが有効化していない DB）であることを確かめ、以後は利用者経路の書き込みをすべて `25006` で
+    /// 拒否する（適用専用の [`Self::apply_replicated_records`] は従来どおり動く）。wire-server の
+    /// 起動処理が、DB を開いた直後・共有前に呼ぶ。ベースでなければ固定文言のエラーで拒否する（fail-closed）。
+    pub fn with_read_replica(mut self) -> Result<Self, crate::storage::ReplicaApplyError> {
+        self.storage.replica_identity()?;
+        self.storage.mark_read_replica();
+        Ok(self)
+    }
+
+    /// 読み取りレプリカなら `25006`（`ReadOnlySqlTransaction`）を返す。NoSQL（HTTP）の書き込み入口が、
+    /// 副作用の前に呼ぶ判定（SQL 表層は分類ゲートが担う。ストレージ側の拒否は安全網として残す）。
+    fn reject_if_read_replica(&self) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+        if self.storage.is_read_replica() {
+            return Err(crate::sql::allowlist::SqlSurfaceError::ReadOnlySqlTransaction);
+        }
+        Ok(())
+    }
+
+    /// 読み取りレプリカとして構成されているか（[`Self::with_read_replica`]）。
+    pub fn is_read_replica(&self) -> bool {
+        self.storage.is_read_replica()
+    }
+
     /// 変更ログ（RECOVER-14）を有効にした DB を、有効にしないまま開いているか。真の間は書き込みが
     /// `54000` で拒否される（LSN の欠落を作らないため。`docs/design/change-log-pitr.md` の D8・D11）。
     /// wire-server の起動処理が、`--change-log` なしの再起動を明示的に拒否するために照会する。
@@ -3422,6 +3450,7 @@ impl EngineCore {
             query_planner: None,
             incremental_config: crate::incremental::IncrementalConfig::default(),
             ledger_mode: LedgerMode::default(),
+            sync_commit: None,
             trigger_runtime: crate::trigger::TriggerRuntime::unwired(),
             require_where_for_dml: false,
             batch_limits: crate::batch_limits::BatchLimits::default(),
@@ -3696,6 +3725,20 @@ impl EngineCore {
     pub fn with_ledger_mode(mut self, mode: LedgerMode) -> Self {
         self.ledger_mode = mode;
         self
+    }
+
+    /// 同期レプリケーションの調停役を注入するビルダー（`wire-server` が起動時に 1 回だけ呼ぶ。Issue #2245）。
+    pub fn with_sync_commit(
+        mut self,
+        coordinator: std::sync::Arc<crate::storage::SyncCommitCoordinator>,
+    ) -> Self {
+        self.sync_commit = Some(coordinator);
+        self
+    }
+
+    /// 同期レプリケーションの調停役（無効なら `None`）。wire-server の応答境界と送信側が参照する。
+    pub fn sync_commit(&self) -> Option<&std::sync::Arc<crate::storage::SyncCommitCoordinator>> {
+        self.sync_commit.as_ref()
     }
 
     /// テスト専用: トリガ関数の呼び出し口を差し替える（本番の invoker 結線〔#1720〕が未整備のため、
@@ -4267,6 +4310,19 @@ impl EngineCore {
         self.storage.export_snapshot(dest)
     }
 
+    /// 稼働中の永続ストレージから増分バックアップ（`base` の終点の次から最新まで）を `dest` の新規ファイルへ
+    /// 書き出す（RECOVER-13・RECOVER-14・Issue #3098）。wire-server の運用者専用ソケットの接続処理から
+    /// 呼ばれる入口で、[`Storage::export_incremental`] へ委譲する（読み取り Tx 1 本で書き込みを止めない。
+    /// フルの書き出しと合わせ同時 1 本。SQL・NoSQL の表層からは呼べない）。
+    pub fn export_incremental(
+        &self,
+        base: &crate::storage::ChainPoint,
+        dest: impl AsRef<std::path::Path>,
+    ) -> std::result::Result<crate::storage::IncrementalSummary, crate::storage::IncrementalError>
+    {
+        self.storage.export_incremental(base, dest)
+    }
+
     /// 稼働中の永続ストレージのスキーマを DDL 文として書き出す（RECOVER-16 (1)・Issue #2160）。
     /// 運用者の CLI（#2162）から呼ぶ入口で、[`Storage::export_schema_ddl`] へそのまま委譲する
     /// （読み取りスナップショット上で動き、書き込みを止めない。SQL・NoSQL の表層からは呼べない）。
@@ -4311,6 +4367,17 @@ impl EngineCore {
         self.storage.export_logical_dump(scope, format, sink)
     }
 
+    /// 論理ダンプの復元指示（`RESTORE ...`。ロール・権限の状態。RECOVER-16・Issue #3096）を 1 件、`tenant` へ
+    /// 単一 write txn で適用する。wire-server の `dump-restore`（空の一時 DB への復元）だけが呼ぶ入口で、
+    /// SQL・NoSQL の表層・認証済みセッションからは呼べない。[`Storage::apply_restore_directive`] へ委譲する。
+    pub fn apply_restore_directive(
+        &self,
+        tenant: &str,
+        directive: &str,
+    ) -> std::result::Result<(), crate::catalog::ddl_export::RestoreDirectiveError> {
+        self.storage.apply_restore_directive(tenant, directive)
+    }
+
     /// 変更ログの未アーカイブのレコードを外部セグメントへ書き出し、保持設定があれば刈り込む
     /// （RECOVER-14・Issue #2167）。wire-server のアーカイブ常駐スレッドが周期的に呼ぶ入口で、
     /// [`Storage::archive_change_log`] へ委譲する。SQL・NoSQL の表層からは呼べない。
@@ -4319,6 +4386,15 @@ impl EngineCore {
         opts: &crate::storage::ArchiveOptions,
     ) -> std::result::Result<crate::storage::ArchiveReport, crate::storage::ArchiveError> {
         self.storage.archive_change_log(opts)
+    }
+
+    /// 未アーカイブの変更ログ量の状態（RECOVER-14 (2)・Issue #3091）。変更ログが無効なら `None`。
+    /// wire-server のアーカイブ常駐スレッドが上限の到達・解消を運用者へ知らせるために呼ぶ。
+    /// 運用者向けで、SQL・NoSQL の表層からは呼べない（テナントに他者の書き込み量を見せない）。
+    pub fn change_log_unarchived_status(
+        &self,
+    ) -> Result<Option<crate::storage::UnarchivedStatus>, StorageError> {
+        self.storage.change_log_unarchived_status()
     }
 
     /// ストリーミングレプリケーションの照合値（DB 識別子・timeline）。変更ログが無効なら `None`
@@ -8650,6 +8726,18 @@ impl EngineCore {
                 return self.execute_parsed_in_session_inner(ctx, session, routed.inner());
             }
         }
+        // RECOVER-15・Issue #2175: 読み取りレプリカでは、読み取りと分かる文だけを許可する（許可リストは
+        // 明示 READ ONLY Tx と共通の `read_only_permits`）。副作用（台帳・採番・カタログ・writer）に触れる
+        // 前に `25006` で拒否する。トランザクション制御文は専用の分岐が先に扱う。
+        if self.storage.is_read_replica()
+            && !matches!(
+                parsed,
+                ParsedSql::Transaction(_) | ParsedSql::SetTransaction(_)
+            )
+            && !read_only_permits(parsed)
+        {
+            return Err(crate::sql::allowlist::SqlSurfaceError::ReadOnlySqlTransaction);
+        }
         // SQL-53（Issue #1751）: サブクエリつき述語形 DML は文単位の暗黙トランザクションで実行する
         // （内側の評価と書き込みを同じ write txn に乗せる）。`ON COMMIT` の適用は commit 側が担う。
         // SQL-63・Issue #1876: データ変更 CTE も同じ暗黙トランザクションで実行する（全副文・台帳記録・
@@ -9800,6 +9888,12 @@ impl EngineCore {
                     Ok(crate::sql::SqlOutcome::SetTransaction)
                 }
                 SetTxnScope::SessionDefault => {
+                    // RECOVER-15・Issue #2175: 読み取りレプリカで既定を READ WRITE にする要求は拒否する。
+                    if self.storage.is_read_replica()
+                        && v.access_mode == Some(crate::sql::transaction::TxnAccessMode::ReadWrite)
+                    {
+                        return Err(crate::sql::allowlist::SqlSurfaceError::ReadOnlySqlTransaction);
+                    }
                     match txn.status() {
                         TransactionStatus::Failed => return Err(txn.take_failed_error()),
                         TransactionStatus::InTransaction => {
@@ -9816,6 +9910,17 @@ impl EngineCore {
         if let ParsedSql::Transaction(ctrl) = parsed {
             // Issue #1939: 修飾子が無い項目は `SET SESSION CHARACTERISTICS` の既定で補う
             // （明示した修飾子が優先）。実行中の Tx は自分の値を持つため既定の変更に影響されない。
+            // RECOVER-15・Issue #2175: 読み取りレプリカで明示された `READ WRITE` は拒否する
+            // （修飾子なしは `begin_with_origin` が READ ONLY へ強制する）。
+            if self.storage.is_read_replica()
+                && matches!(
+                    ctrl.control,
+                    TxnControl::Begin | TxnControl::StartTransaction
+                )
+                && ctrl.access_mode == Some(crate::sql::transaction::TxnAccessMode::ReadWrite)
+            {
+                return Err(crate::sql::allowlist::SqlSurfaceError::ReadOnlySqlTransaction);
+            }
             let access_mode = ctrl
                 .access_mode
                 .or(session.default_access_mode())
@@ -16349,6 +16454,8 @@ impl EngineCore {
             crate::sql::allowlist::SqlSurfaceError,
         >,
     {
+        // RECOVER-15・Issue #2175: 読み取りレプリカでは NoSQL の書き込みも副作用の前に `25006` で拒否する。
+        self.reject_if_read_replica()?;
         self.execute_bound_insert_with_target(
             crate::tenant::WriteTarget::Autocommit(&self.storage),
             ctx,
@@ -16390,6 +16497,8 @@ impl EngineCore {
             crate::sql::allowlist::SqlSurfaceError,
         >,
     {
+        // RECOVER-15・Issue #2175: 読み取りレプリカでは NoSQL の書き込みも副作用の前に `25006` で拒否する。
+        self.reject_if_read_replica()?;
         // 束縛クロージャで得た投影を、書き込みクロージャへ受け渡す（両者は同時に生存するため RefCell）。
         let projected: std::cell::RefCell<Option<Vec<crate::sql::parser::ProjectedColumn>>> =
             std::cell::RefCell::new(None);
@@ -16625,6 +16734,8 @@ impl EngineCore {
             crate::sql::allowlist::SqlSurfaceError,
         >,
     {
+        // RECOVER-15・Issue #2175: 読み取りレプリカでは NoSQL の書き込みも副作用の前に `25006` で拒否する。
+        self.reject_if_read_replica()?;
         use crate::sql::allowlist::SqlSurfaceError;
         self.ledger_mode
             .resolve(operation_id)
@@ -16796,6 +16907,11 @@ impl EngineCore {
     ) -> Result<CopyPlan, crate::sql::allowlist::SqlSurfaceError> {
         match stmt {
             crate::sql::allowlist::CopyStatement::From(v) => {
+                // RECOVER-15・Issue #2175: 読み取りレプリカの `COPY FROM` は CopyInResponse の前に拒否する
+                // （権限検査の後に呼ばれるため、権限エラーが先に返る既存の順序を保つ）。
+                if self.storage.is_read_replica() {
+                    return Err(crate::sql::allowlist::SqlSurfaceError::ReadOnlySqlTransaction);
+                }
                 let (_read_txn, schema) = self
                     .read_txn_with_schema(&v.table_name)
                     .map_err(|e| self.reclassify_matview_write_error(e))?;
@@ -17035,6 +17151,10 @@ impl EngineCore {
         if batch.temp.is_some() {
             return Err(crate::sql::temp_catalog::temp_table_unsupported());
         }
+        // RECOVER-15・Issue #2175: 読み取りレプリカでは COPY の確定も `25006` で拒否する（多重防御）。
+        if self.storage.is_read_replica() {
+            return Err(crate::sql::allowlist::SqlSurfaceError::ReadOnlySqlTransaction);
+        }
         // Issue #1953（SQL-71）: COPY 開始時の期限を commit 経路（INSERT 行ループ・writer 待ち）へ
         // 効かせる。既にスレッドに期限があれば厳しい方が勝つ（緩めない）。writer 取得の前に確認する。
         let _deadline_scope = crate::interrupt::DeadlineScope::install(batch.deadline);
@@ -17226,6 +17346,8 @@ impl EngineCore {
             crate::sql::allowlist::SqlSurfaceError,
         >,
     {
+        // RECOVER-15・Issue #2175: 読み取りレプリカでは NoSQL の書き込みも副作用の前に `25006` で拒否する。
+        self.reject_if_read_replica()?;
         // 判定 1: `operation_id` 必須化ガード（スキーマ取得より前）。
         self.ledger_mode
             .resolve(operation_id)
@@ -17283,6 +17405,8 @@ impl EngineCore {
         session: &crate::sql::mode::SessionState,
         bound: &crate::sql::parser::BoundDelete,
     ) -> Result<crate::sql::exec::DeleteOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        // RECOVER-15・Issue #2175: 読み取りレプリカでは NoSQL の書き込みも副作用の前に `25006` で拒否する。
+        self.reject_if_read_replica()?;
         // SQL-40・Issue #1969: 判定順は「名前解決 `42P01` → 権限 `42501`」。束縛済みの主体のときだけ
         // 表の存在確認を先に行う（未束縛は従来と同一で追加の読み取りをしない）。
         if session.object_privileges_enforced() {
@@ -17315,6 +17439,8 @@ impl EngineCore {
             &crate::catalog::TableSchema,
         ) -> Result<(), crate::sql::allowlist::SqlSurfaceError>,
     {
+        // RECOVER-15・Issue #2175: 読み取りレプリカでは NoSQL の書き込みも副作用の前に `25006` で拒否する。
+        self.reject_if_read_replica()?;
         let ledger_write = self
             .ledger_mode
             .resolve(bound.operation_id.as_ref())
@@ -17405,6 +17531,8 @@ impl EngineCore {
             crate::sql::allowlist::SqlSurfaceError,
         >,
     {
+        // RECOVER-15・Issue #2175: 読み取りレプリカでは NoSQL の書き込みも副作用の前に `25006` で拒否する。
+        self.reject_if_read_replica()?;
         // 判定 1: `operation_id` 必須化ガード（スキーマ取得より前）。
         self.ledger_mode
             .resolve(operation_id)
@@ -17475,6 +17603,8 @@ impl EngineCore {
             crate::sql::allowlist::SqlSurfaceError,
         >,
     {
+        // RECOVER-15・Issue #2175: 読み取りレプリカでは NoSQL の書き込みも副作用の前に `25006` で拒否する。
+        self.reject_if_read_replica()?;
         self.ledger_mode
             .resolve(operation_id)
             .map_err(|_| crate::sql::allowlist::SqlSurfaceError::MissingOperationId)?;
@@ -17535,6 +17665,8 @@ impl EngineCore {
             crate::sql::allowlist::SqlSurfaceError,
         >,
     {
+        // RECOVER-15・Issue #2175: 読み取りレプリカでは NoSQL の書き込みも副作用の前に `25006` で拒否する。
+        self.reject_if_read_replica()?;
         self.ledger_mode
             .resolve(operation_id)
             .map_err(|_| crate::sql::allowlist::SqlSurfaceError::MissingOperationId)?;
@@ -17586,6 +17718,8 @@ impl EngineCore {
             &crate::catalog::TableSchema,
         ) -> Result<(), crate::sql::allowlist::SqlSurfaceError>,
     {
+        // RECOVER-15・Issue #2175: 読み取りレプリカでは NoSQL の書き込みも副作用の前に `25006` で拒否する。
+        self.reject_if_read_replica()?;
         self.ledger_mode
             .resolve(bound.operation_id.as_ref())
             .map_err(|_| crate::sql::allowlist::SqlSurfaceError::MissingOperationId)?;
@@ -17637,6 +17771,8 @@ impl EngineCore {
             crate::sql::allowlist::SqlSurfaceError,
         >,
     {
+        // RECOVER-15・Issue #2175: 読み取りレプリカでは NoSQL の書き込みも副作用の前に `25006` で拒否する。
+        self.reject_if_read_replica()?;
         self.ledger_mode
             .resolve(operation_id)
             .map_err(|_| crate::sql::allowlist::SqlSurfaceError::MissingOperationId)?;
@@ -17697,6 +17833,8 @@ impl EngineCore {
             crate::sql::allowlist::SqlSurfaceError,
         >,
     {
+        // RECOVER-15・Issue #2175: 読み取りレプリカでは NoSQL の書き込みも副作用の前に `25006` で拒否する。
+        self.reject_if_read_replica()?;
         self.ledger_mode
             .resolve(operation_id)
             .map_err(|_| crate::sql::allowlist::SqlSurfaceError::MissingOperationId)?;
@@ -17780,6 +17918,8 @@ impl EngineCore {
             crate::sql::allowlist::SqlSurfaceError,
         >,
     {
+        // RECOVER-15・Issue #2175: 読み取りレプリカでは NoSQL の書き込みも副作用の前に `25006` で拒否する。
+        self.reject_if_read_replica()?;
         // 分割実行は構成に関わらず operation_id 必須（Issue #1704・RECOVER-1）。
         crate::recovery::required_op_id::require_partitioned(operation_id)
             .map_err(|_| crate::sql::allowlist::SqlSurfaceError::MissingOperationId)?;
@@ -17838,6 +17978,8 @@ impl EngineCore {
             crate::sql::allowlist::SqlSurfaceError,
         >,
     {
+        // RECOVER-15・Issue #2175: 読み取りレプリカでは NoSQL の書き込みも副作用の前に `25006` で拒否する。
+        self.reject_if_read_replica()?;
         // 分割実行は構成に関わらず operation_id 必須（Issue #1704・RECOVER-1）。
         crate::recovery::required_op_id::require_partitioned(operation_id)
             .map_err(|_| crate::sql::allowlist::SqlSurfaceError::MissingOperationId)?;

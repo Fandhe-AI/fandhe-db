@@ -593,18 +593,18 @@ fn unarchived_rows_are_never_pruned() {
     let mut opts = f.opts();
     opts.retain_records = Some(0);
     // 水位を途中（base + 3）までしか進めない保守 commit。以降は未アーカイブで、保持 0 でも消えない。
-    let step =
-        maintenance_commit(f.storage(), base, base + 3, &opts, u64::MAX).expect("maintenance");
+    let step = maintenance_commit(f.storage(), base, base + 3, &opts, u64::MAX, 0, false)
+        .expect("maintenance");
     assert!(matches!(step, Step::Done { pruned: 3 }));
     assert_eq!(f.row_lsns(), (base + 4..=generation).collect::<Vec<_>>());
     // 水位を超えて消すことは構造的にできない: 続けて刈り込みだけを実行しても何も消えない。
-    let again =
-        maintenance_commit(f.storage(), base + 3, base + 3, &opts, u64::MAX).expect("again");
+    let again = maintenance_commit(f.storage(), base + 3, base + 3, &opts, u64::MAX, 0, false)
+        .expect("again");
     assert!(matches!(again, Step::Done { pruned: 0 }));
     assert_eq!(f.row_lsns().len() as u64, generation - base - 3);
     // 古い水位を渡した（並行した別の更新を見ていない）保守 commit は拒否する。
     assert!(matches!(
-        maintenance_commit(f.storage(), base, base + 1, &opts, u64::MAX),
+        maintenance_commit(f.storage(), base, base + 1, &opts, u64::MAX, 0, false),
         Err(ArchiveError::WatermarkMoved)
     ));
     // アーカイブ先が使えない間は何も消えない。
@@ -628,15 +628,24 @@ fn prune_is_bounded_per_maintenance_commit() {
     let mut opts = f.opts();
     opts.retain_records = Some(0);
     opts.max_prune_records = 3;
-    let step = maintenance_commit(f.storage(), base, generation, &opts, u64::MAX).expect("m1");
+    let step =
+        maintenance_commit(f.storage(), base, generation, &opts, u64::MAX, 0, false).expect("m1");
     assert!(
         matches!(step, Step::Done { pruned: 3 }),
         "bounded by records"
     );
     opts.max_prune_records = 1000;
     opts.max_prune_bytes = 1;
-    let step =
-        maintenance_commit(f.storage(), generation, generation, &opts, u64::MAX).expect("m2");
+    let step = maintenance_commit(
+        f.storage(),
+        generation,
+        generation,
+        &opts,
+        u64::MAX,
+        0,
+        false,
+    )
+    .expect("m2");
     assert!(matches!(step, Step::Done { pruned: 1 }), "bounded by bytes");
     // 全体の呼び出しは残りを引き継いで完了する。
     opts.max_prune_bytes = DEFAULT_PRUNE_BYTES;
@@ -779,13 +788,14 @@ fn maintenance_yields_the_writer_gate_instead_of_failing() {
     let storage = std::sync::Arc::new(storage);
     let held = storage.begin_write_txn().expect("held writer");
     let other = std::sync::Arc::clone(&storage);
-    let skipped = std::thread::spawn(move || other.begin_maintenance_txn().map(|t| t.is_none()))
-        .join()
-        .expect("join")
-        .expect("txn");
+    let skipped =
+        std::thread::spawn(move || other.begin_maintenance_txn(false).map(|t| t.is_none()))
+            .join()
+            .expect("join")
+            .expect("txn");
     assert!(skipped, "a busy gate is skipped, not an error");
     drop(held);
-    assert!(storage.begin_maintenance_txn().expect("txn").is_some());
+    assert!(storage.begin_maintenance_txn(false).expect("txn").is_some());
 }
 
 #[test]

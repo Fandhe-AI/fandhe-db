@@ -9,7 +9,8 @@
 //! # 出力の区分（[`DdlSection`]）
 //!
 //! - `PreData`: スキーマ・ロール・ENUM・SEQUENCE・表（列・既定値・PRIMARY KEY・UNIQUE・CHECK）・VIEW・関数
-//! - `PostData`: 外部キー・索引・トリガ・行セキュリティ・ポリシー・権限・SEQUENCE の現在値
+//! - `PostData`: 外部キー・索引・トリガ・行セキュリティ・ポリシー・SEQUENCE の現在値、最後にロール・権限の
+//!   復元指示（メンバーシップ・所有者・ACL・既定権限・初期権限。SQL ではない。Issue #3096）
 //!
 //! データを入れる前に制約・トリガ・ポリシーが効くとデータの流し込み自体が阻害されるため、`pg_dump` と同じく
 //! それらはデータの後ろ（`PostData`）に置く。
@@ -30,7 +31,10 @@
 mod access;
 mod data;
 mod object;
+mod privilege;
 mod quote;
+pub mod restore_apply;
+pub mod restore_directive;
 mod table;
 #[cfg(test)]
 mod tests;
@@ -45,6 +49,7 @@ use super::{CatalogError, Storage};
 use quote::Namer;
 
 pub use data::{TableDataFormat, TableDataItem, TableDataPart, TableDataSummary};
+pub use restore_apply::RestoreDirectiveError;
 
 /// 書き出す範囲。共有分（`public` の表・ビュー・索引・ENUM・SEQUENCE の定義）に、指定したテナント分
 /// （SCHEMA・ロール・関数・トリガ・ポリシー・権限・SEQUENCE の現在値）を足す。
@@ -107,7 +112,7 @@ pub enum DdlObjectKind {
     Schema,
     /// `CREATE ROLE`。
     Role,
-    /// ロールのメンバーシップ（`GRANT <role> TO <member>`）。
+    /// ロールのメンバーシップの復元指示（`RESTORE MEMBERSHIP ...`。SQL ではない）。
     RoleMembership,
     /// `CREATE TYPE ... AS ENUM`。
     EnumType,
@@ -131,8 +136,15 @@ pub enum DdlObjectKind {
     RowSecurity,
     /// `CREATE POLICY`。
     Policy,
-    /// `GRANT`。
+    /// ACL・関数 ACL の実体化印の復元指示（`RESTORE ACL ...`。SQL ではない）。
     Privilege,
+    /// 所有者の復元指示（`RESTORE OWNER ...`。SQL ではない。Issue #3096）。
+    Owner,
+    /// 既定権限の復元指示（`RESTORE DEFAULT ACL ...`。SQL ではない。Issue #3096）。
+    DefaultPrivilege,
+    /// ロールの旧形式ハッシュ・初期権限・ブートストラップ済みマーカーの復元指示
+    /// （`RESTORE ROLE ...`／`RESTORE BOOTSTRAP MARKER`。SQL ではない。Issue #3096）。
+    RoleBootstrap,
 }
 
 /// シンクへ渡す DDL 文 1 件。`sql` は 1 文（末尾の `;` を含まない）。

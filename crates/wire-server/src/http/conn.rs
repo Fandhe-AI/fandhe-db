@@ -264,6 +264,12 @@ pub(crate) struct Request<'a> {
 /// テストでは任意のスタブ実装（panic 注入を含む）を渡す。
 pub(crate) trait RequestHandler {
     fn handle(&self, req: &Request<'_>) -> Vec<u8>;
+
+    /// この handler が書き込みを commit しうる engine（同期レプリケーションの確認待ちに使う。
+    /// Issue #2245）。engine 未接続の handler は `None`（既定）。
+    fn engine_core(&self) -> Option<&engine::core::EngineCore> {
+        None
+    }
 }
 
 /// 未知の要求ターゲットに対する固定応答バイト列（`08P01`）を組み立てる
@@ -513,8 +519,20 @@ fn build_outcome<S: WireStream, H: RequestHandler>(
     // 届くバイト列は「宣言」を持たない非パイプライン設計上の想定外の
     // 追加データであり、量を見積もる根拠が無いためフォールバック予算
     // （時間のみが実質的な上限）を使う。
+    let mut bytes = handler.handle(&req);
+    // 同期レプリケーション（Issue #2245）: handler が commit した LSN の確認を、応答を書く前に待つ。
+    // 取れなければ、commit 済みの応答を `state=may_be_committed` のエラーへ差し替える。
+    if let Some(core) = handler.engine_core() {
+        if crate::sync_commit_wait::await_sync_commit(core, || false).is_err() {
+            bytes = response::encode_error_may_be_committed(
+                ErrorClass::InternalError,
+                crate::sync_commit_wait::NOT_CONFIRMED_MESSAGE,
+                SystemTime::now(),
+            );
+        }
+    }
     Outcome::Respond {
-        bytes: handler.handle(&req),
+        bytes,
         drain_budget: HTTP_LINGER_DRAIN_FALLBACK_BUDGET,
     }
 }

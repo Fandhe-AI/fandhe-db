@@ -747,5 +747,126 @@ pub(crate) fn default_acl_references_role_in_txn<R: ReadSource>(
     init_marker_in_txn(src, tenant, role_id)
 }
 
+/// `tenant` の既定権限の行をすべて返す（論理ダンプの書き出し専用。Issue #3096）。先頭が `tenant_id` の
+/// キー範囲だけを走査する。破損行・上限超過は `Err`。
+pub(crate) fn list_default_acl_in_txn<R: ReadSource>(
+    src: &R,
+    tenant: &str,
+) -> Result<Vec<DefaultAclRow>> {
+    validate_tenant(tenant)?;
+    let table = match src.open_table(DEFAULT_ACL_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut out = Vec::new();
+    for entry in table.range((tenant, 0u64, 0u64, 0u8, 0u64)..)? {
+        let (k, v) = entry?;
+        let kv = k.value();
+        if kv.0 != tenant {
+            break;
+        }
+        if out.len() >= MAX_DEFAULT_ACL_ENTRIES_PER_TENANT {
+            return Err(corrupt());
+        }
+        let (role_id, schema_id, kind, entry) = decode_row(kv, v.value())?;
+        out.push(DefaultAclRow {
+            role_id,
+            schema_id,
+            kind,
+            entry,
+        });
+    }
+    Ok(out)
+}
+
+/// `tenant` で「関数の全体エントリが組み込みの既定を置き換えた」印のあるロール ID を昇順で返す
+/// （論理ダンプの書き出し専用。Issue #3096）。関数・全体以外の印や不正な値は `CorruptSchema`。
+pub(crate) fn list_default_acl_init_in_txn<R: ReadSource>(
+    src: &R,
+    tenant: &str,
+) -> Result<Vec<u64>> {
+    validate_tenant(tenant)?;
+    let table = match src.open_table(DEFAULT_ACL_INIT_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut out = Vec::new();
+    for entry in table.range((tenant, 0u64, 0u64, 0u8)..)? {
+        let (k, v) = entry?;
+        let (t, role_id, schema_id, kind) = k.value();
+        if t != tenant {
+            break;
+        }
+        if schema_id != 0
+            || kind != KIND_FUNCTION
+            || role_id == 0
+            || v.value() != [DEFAULT_ACL_VERSION]
+        {
+            return Err(corrupt());
+        }
+        out.push(role_id);
+    }
+    Ok(out)
+}
+
+/// 既定権限の 1 行を書く（論理ダンプの復元専用。Issue #3096）。種別ごとの許可集合・所有者自身への付与の
+/// 禁止・`IN SCHEMA` を持てない SCHEMA 種別は、保存形式の契約（[`decode_row`] が破損と見なす形）と同じ
+/// 規則で拒否する（`Invalid`）。ロール・SCHEMA の現存は呼び出し側（復元の名前解決）が確かめる。
+pub(crate) fn put_default_acl_row_in_txn(
+    write_txn: &redb::WriteTransaction,
+    tenant: &str,
+    role_id: u64,
+    schema_id: u64,
+    kind: DefaultAclKind,
+    entry: &DefaultEntry,
+) -> Result<()> {
+    validate_tenant(tenant)?;
+    if role_id == 0
+        || (entry.grantee_id != PUBLIC_GRANTEE_ID && entry.grantee_id == role_id)
+        || (kind == DefaultAclKind::Schemas && schema_id != 0)
+    {
+        return Err(CatalogError::Invalid(
+            "invalid default privilege entry".to_string(),
+        ));
+    }
+    let blob = encode_blob(kind, entry)?;
+    let key = (tenant, role_id, schema_id, kind.tag(), entry.grantee_id);
+    // 新規キーの追加だけテナント単位の行数上限を検査する（既存キーの置換は上限到達時も許す。
+    // 超過を通すと `list_default_acl_in_txn` が `CorruptSchema` になり再ダンプできなくなるため）。
+    let exists = match ReadSource::open_table(write_txn, DEFAULT_ACL_TABLE) {
+        Ok(t) => t.get(key)?.is_some(),
+        Err(redb::TableError::TableDoesNotExist(_)) => false,
+        Err(e) => return Err(e.into()),
+    };
+    if !exists
+        && count_tenant_entries(write_txn, tenant, MAX_DEFAULT_ACL_ENTRIES_PER_TENANT)?
+            >= MAX_DEFAULT_ACL_ENTRIES_PER_TENANT
+    {
+        return Err(CatalogError::Invalid(
+            "too many default privilege entries".to_string(),
+        ));
+    }
+    let mut table = write_txn.open_table_logged(DEFAULT_ACL_TABLE)?;
+    table.insert(key, blob.as_slice())?;
+    Ok(())
+}
+
+/// ロール `role_id` の関数の既定権限の印を書く（論理ダンプの復元専用。Issue #3096）。
+pub(crate) fn put_default_acl_init_in_txn(
+    write_txn: &redb::WriteTransaction,
+    tenant: &str,
+    role_id: u64,
+) -> Result<()> {
+    validate_tenant(tenant)?;
+    if role_id == 0 {
+        return Err(CatalogError::Invalid(
+            "invalid default privilege entry".to_string(),
+        ));
+    }
+    set_init_marker_in_txn(write_txn, tenant, role_id, true)
+}
+
 #[cfg(test)]
 mod tests;

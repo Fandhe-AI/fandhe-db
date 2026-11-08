@@ -1,24 +1,18 @@
-//! ロール・関数・トリガ・行セキュリティ・ポリシーの DDL 生成と、戻せない権限系の検出
-//! （RECOVER-16 (1)。親モジュール: [`super`]）。
+//! ロール・関数・トリガ・行セキュリティ・ポリシーの DDL 生成（RECOVER-16 (1)。親モジュール: [`super`]）。
 //!
 //! 責務境界: テナント固有のオブジェクト（キーの先頭がテナント）を、選択したテナントの分だけ書き出す。
-//! メンバーシップ・権限（ACL）・所有者・既定権限・ブートストラップ権限は、SQL 表層の `GRANT`／
-//! `ALTER ... OWNER TO` が現在ロールの束縛（付与者の記録）を要し、付与者を指定する構文（`GRANTED BY`）も
-//! 持たないため、文として戻す手段が無い。1 件でもあれば省かず全体を失敗させる（fail-closed。権限を
-//! 黙って落とすと復元後に意図しない権限状態になるため）。
+//! メンバーシップ・権限（ACL）・所有者・既定権限・初期権限・旧形式ハッシュは SQL の文では戻せないため、
+//! 復元専用の指示文として [`super::privilege`] が書き出す（Issue #3096）。ロールの `CREATE ROLE` は
+//! SCRAM 検証子を含めてここで出す。
 
-use redb::{ReadableTable, TableDefinition};
+use redb::ReadableTable;
 
 use super::super::function::{
     list_functions_in_source, FunctionDef, FunctionLanguage, Parallel, ReturnShape, Security,
     Volatility,
 };
 use super::super::policy::{list_policies_in_source, PolicyCommand, PolicyDef, PolicyRole};
-use super::super::privilege::default_acl::DEFAULT_ACL_TABLE;
-use super::super::privilege::owner::OWNERS_TABLE;
-use super::super::privilege::ACL_TABLE;
-use super::super::role::bootstrap::BOOTSTRAP_PRIVILEGES_TABLE;
-use super::super::role::{list_roles_in_txn, ROLE_MEMBERSHIPS_TABLE};
+use super::super::role::list_roles_in_txn;
 use super::super::row_security::row_security_state_in_txn;
 use super::super::trigger::{
     list_triggers_in_source, TriggerDef, TriggerEvents, TriggerLevel, TriggerTiming,
@@ -27,14 +21,6 @@ use super::super::{CatalogError, ColumnType, CATALOG_TABLE};
 use super::quote::{ident, literal, push_ident, KeyScope};
 use super::table::render_column_type;
 use super::{unsupported, Ctx, DdlObjectKind, DdlSection, Emitter, SchemaDdlError};
-
-/// 「関数 ACL を実体化済み」の印の表（`catalog::privilege::function`。非公開モジュールのため同じ名前・
-/// 型でここに宣言する。名前は [`super::SCHEMA_CATALOG_TABLES`] の分類と対応する）。
-const ACL_INIT_TABLE: TableDefinition<(&str, u8, &str), &[u8]> = TableDefinition::new("acl_init");
-
-/// 既定権限の「全体エントリが組み込みの既定を置き換えた」印の表（`catalog::privilege::default_acl`）。
-const DEFAULT_ACL_INIT_TABLE: TableDefinition<(&str, u64, u64, u8), &[u8]> =
-    TableDefinition::new("default_acl_init");
 
 /// 選択したテナントの表（共有の表 + そのテナントの SCHEMA 配下の表）のキー一覧。テナント固有の
 /// トリガ・ポリシー・行セキュリティは、共有の表に対しても各テナントが別々に持つ。
@@ -59,93 +45,7 @@ fn tenant_table_keys<E>(ctx: &Ctx<'_>) -> Result<Vec<String>, SchemaDdlError<E>>
     Ok(keys.into_iter().map(|(_, k)| k).collect())
 }
 
-/// `tenant` の接頭辞を持つ行が 1 件でもあれば真（表が無ければ偽）。`first_key` は範囲の始点。
-macro_rules! tenant_rows_exist {
-    ($ctx:expr, $def:expr, $start:expr, $tenant_of:expr) => {{
-        match $ctx.rt.open_table($def) {
-            Ok(t) => {
-                let mut it = t.range($start..).map_err(CatalogError::from)?;
-                match it.next() {
-                    Some(entry) => {
-                        let (k, _) = entry.map_err(CatalogError::from)?;
-                        #[allow(clippy::redundant_closure_call)]
-                        let found = ($tenant_of)(k.value());
-                        found
-                    }
-                    None => false,
-                }
-            }
-            Err(redb::TableError::TableDoesNotExist(_)) => false,
-            Err(e) => return Err(CatalogError::from(e).into()),
-        }
-    }};
-}
-
-/// 権限系（メンバーシップ・ACL・所有者・既定権限・ブートストラップ権限）が選択したテナントに 1 件でも
-/// あれば失敗させる。
-fn reject_unrestorable_access<E>(ctx: &Ctx<'_>, tenant: &str) -> Result<(), SchemaDdlError<E>> {
-    const REASON: &str = "privileges, ownership and role membership cannot be restored by SQL";
-    let acl =
-        tenant_rows_exist!(
-            ctx,
-            ACL_TABLE,
-            (tenant, 0u8, "", "", 0u64, 0u64),
-            |k: (&str, u8, &str, &str, u64, u64)| k.0 == tenant
-        );
-    let acl_init = tenant_rows_exist!(ctx, ACL_INIT_TABLE, (tenant, 0u8, ""), |k: (
-        &str,
-        u8,
-        &str
-    )| k.0 == tenant);
-    let default_acl = tenant_rows_exist!(
-        ctx,
-        DEFAULT_ACL_TABLE,
-        (tenant, 0u64, 0u64, 0u8, 0u64),
-        |k: (&str, u64, u64, u8, u64)| k.0 == tenant
-    );
-    let default_acl_init = tenant_rows_exist!(
-        ctx,
-        DEFAULT_ACL_INIT_TABLE,
-        (tenant, 0u64, 0u64, 0u8),
-        |k: (&str, u64, u64, u8)| k.0 == tenant
-    );
-    let bootstrap = tenant_rows_exist!(ctx, BOOTSTRAP_PRIVILEGES_TABLE, (tenant, 0u64), |k: (
-        &str,
-        u64
-    )| k.0
-        == tenant);
-    let membership = tenant_rows_exist!(
-        ctx,
-        ROLE_MEMBERSHIPS_TABLE,
-        (tenant, 0u64, 0u64),
-        |k: (&str, u64, u64)| k.0 == tenant
-    );
-    if acl || acl_init || default_acl || default_acl_init || bootstrap || membership {
-        return Err(unsupported("privilege", REASON));
-    }
-    // 所有者表のキーは `(種別, 対象, テナント)` でテナントが末尾のため、全行を走査して絞る。
-    let owners = match ctx.rt.open_table(OWNERS_TABLE) {
-        Ok(t) => {
-            let mut found = false;
-            for entry in t.iter().map_err(CatalogError::from)? {
-                let (k, _) = entry.map_err(CatalogError::from)?;
-                if k.value().2 == tenant {
-                    found = true;
-                    break;
-                }
-            }
-            found
-        }
-        Err(redb::TableError::TableDoesNotExist(_)) => false,
-        Err(e) => return Err(CatalogError::from(e).into()),
-    };
-    if owners {
-        return Err(unsupported("privilege", REASON));
-    }
-    Ok(())
-}
-
-/// 選択したテナントの `CREATE ROLE`。権限系の検査もここで行う（ロールは `PreData` の先頭付近）。
+/// 選択したテナントの `CREATE ROLE`（`PreData`）。旧形式ハッシュ・初期権限は [`super::privilege`] の指示文で戻す。
 pub(super) fn export_roles<E>(
     ctx: &Ctx<'_>,
     out: &mut Emitter<'_, E>,
@@ -153,11 +53,7 @@ pub(super) fn export_roles<E>(
     let Some(tenant) = ctx.scope.tenant() else {
         return Ok(());
     };
-    reject_unrestorable_access(ctx, tenant)?;
     for role in list_roles_in_txn(ctx.rt, tenant)? {
-        if !role.legacy_phc.is_empty() {
-            return Err(unsupported("role", "role with a legacy password hash"));
-        }
         let mut s = String::from("CREATE ROLE ");
         push_ident(&mut s, &role.name)?;
         let a = role.attributes;
@@ -207,6 +103,27 @@ fn render_function_type<E>(ty: &ColumnType) -> Result<String, SchemaDdlError<E>>
         }
         other => render_column_type::<E>(other),
     }
+}
+
+/// 関数の署名 `<修飾名>(<型>, ...)`。ACL・所有者の指示文が関数を指す安定した名前で、書き出し側と
+/// 復元側（[`super::restore_apply`]）が同じ関数で描画して一致を取る（内部 ID は復元先で変わるため）。
+pub(super) fn function_signature<E>(
+    namer: &super::quote::Namer,
+    def: &FunctionDef,
+) -> Result<String, SchemaDdlError<E>> {
+    let mut s = namer.qualified_required::<E>(&def.function_key)?;
+    s.push('(');
+    for (i, p) in def.params.iter().enumerate() {
+        if i > 0 {
+            s.push_str(", ");
+        }
+        let ty =
+            p.ty.as_ref()
+                .ok_or_else(|| unsupported("function", "untyped parameter"))?;
+        s.push_str(&render_fn_type::<E>(ty)?);
+    }
+    s.push(')');
+    Ok(s)
 }
 
 fn render_fn_type<E>(
