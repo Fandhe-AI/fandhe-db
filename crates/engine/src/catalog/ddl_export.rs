@@ -380,7 +380,10 @@ impl Storage {
     pub(crate) fn export_schema_ddl_checked<E>(
         &self,
         scope: &SchemaDdlScope,
-        check: impl FnOnce(&[MaterializedViewDef]) -> Result<(), SchemaDdlError<E>>,
+        check: impl FnOnce(
+            &redb::ReadTransaction,
+            &[MaterializedViewDef],
+        ) -> Result<(), SchemaDdlError<E>>,
         mut sink: impl FnMut(&DdlStatement<'_>) -> Result<(), E>,
     ) -> Result<SchemaDdlSummary, SchemaDdlError<E>> {
         if let Some(t) = scope.tenant() {
@@ -399,7 +402,7 @@ impl Storage {
             scope,
             namer,
         };
-        check(&object::in_scope_materialized_defs(&ctx)?)?;
+        check(&rt, &object::in_scope_materialized_defs(&ctx)?)?;
         let mut out = Emitter {
             sink: &mut sink,
             count: 0,
@@ -456,7 +459,10 @@ impl Storage {
         &self,
         scope: &SchemaDdlScope,
         format: TableDataFormat,
-        check: impl FnOnce(&[MaterializedViewDef]) -> Result<(), SchemaDdlError<E>>,
+        check: impl FnOnce(
+            &redb::ReadTransaction,
+            &[MaterializedViewDef],
+        ) -> Result<(), SchemaDdlError<E>>,
         mut sink: impl FnMut(&LogicalDumpItem<'_>) -> Result<(), E>,
     ) -> Result<LogicalDumpSummary, SchemaDdlError<E>> {
         if let Some(t) = scope.tenant() {
@@ -475,7 +481,7 @@ impl Storage {
             scope,
             namer,
         };
-        check(&object::in_scope_materialized_defs(&ctx)?)?;
+        check(&rt, &object::in_scope_materialized_defs(&ctx)?)?;
         let mut schema_count: u64 = 0;
         {
             let mut schema_sink = |st: &DdlStatement<'_>| sink(&LogicalDumpItem::Schema(*st));
@@ -510,7 +516,10 @@ impl Storage {
 
 /// SQL 層を持たない書き出し入口（[`Storage::export_schema_ddl`]・[`Storage::export_logical_dump`]）が
 /// 渡す検査。範囲内にマテリアライズド VIEW があれば、列構成の一致を確かめられないため拒否する。
-fn reject_unverifiable_matviews<E>(defs: &[MaterializedViewDef]) -> Result<(), SchemaDdlError<E>> {
+fn reject_unverifiable_matviews<E>(
+    _rt: &redb::ReadTransaction,
+    defs: &[MaterializedViewDef],
+) -> Result<(), SchemaDdlError<E>> {
     if defs.is_empty() {
         return Ok(());
     }
