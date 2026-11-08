@@ -185,9 +185,13 @@ fn apply_in_txn(txn: &redb::WriteTransaction, tenant: &str, d: &Directive) -> Re
     let r = Resolver { txn, tenant };
     match d {
         Directive::RoleLegacy { role, phc } => {
-            let current = get_role_in_txn(txn, tenant, role)
-                .map_err(|_| RestoreDirectiveError::NotFound)?
-                .ok_or(RestoreDirectiveError::NotFound)?;
+            let current = match get_role_in_txn(txn, tenant, role) {
+                Ok(Some(r)) => r,
+                Ok(None) | Err(CatalogError::Invalid(_)) => {
+                    return Err(RestoreDirectiveError::NotFound)
+                }
+                Err(e) => return Err(e.into()),
+            };
             if !current.legacy_phc.is_empty() {
                 return Err(RestoreDirectiveError::Rejected);
             }

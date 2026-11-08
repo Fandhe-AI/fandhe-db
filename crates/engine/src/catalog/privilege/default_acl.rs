@@ -832,11 +832,24 @@ pub(crate) fn put_default_acl_row_in_txn(
         ));
     }
     let blob = encode_blob(kind, entry)?;
+    let key = (tenant, role_id, schema_id, kind.tag(), entry.grantee_id);
+    // 新規キーの追加だけテナント単位の行数上限を検査する（既存キーの置換は上限到達時も許す。
+    // 超過を通すと `list_default_acl_in_txn` が `CorruptSchema` になり再ダンプできなくなるため）。
+    let exists = match ReadSource::open_table(write_txn, DEFAULT_ACL_TABLE) {
+        Ok(t) => t.get(key)?.is_some(),
+        Err(redb::TableError::TableDoesNotExist(_)) => false,
+        Err(e) => return Err(e.into()),
+    };
+    if !exists
+        && count_tenant_entries(write_txn, tenant, MAX_DEFAULT_ACL_ENTRIES_PER_TENANT)?
+            >= MAX_DEFAULT_ACL_ENTRIES_PER_TENANT
+    {
+        return Err(CatalogError::Invalid(
+            "too many default privilege entries".to_string(),
+        ));
+    }
     let mut table = write_txn.open_table_logged(DEFAULT_ACL_TABLE)?;
-    table.insert(
-        (tenant, role_id, schema_id, kind.tag(), entry.grantee_id),
-        blob.as_slice(),
-    )?;
+    table.insert(key, blob.as_slice())?;
     Ok(())
 }
 
