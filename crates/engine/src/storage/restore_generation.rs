@@ -79,6 +79,8 @@ impl Storage {
     ///   も LSN も動かさず、変更ログのレコードも生まない）
     /// - 変更ログを有効にした `Storage` と一時表用ストレージでは拒否する（復元先の確定前の DB にだけ使う）
     /// - 失敗したときは何も書かない
+    /// - 保証するのは新しい値が元の値より大きいこと。同じ元からの繰り返し復元での増加は通常の運用条件が前提で、
+    ///   復元間で共有する採番状態は持たない（それが必要かは別途の設計事項）
     pub fn advance_restore_generation(&mut self) -> Result<u64> {
         self.advance_restore_generation_with_floor(clock_floor()?)
     }
