@@ -518,7 +518,8 @@ pub(super) fn map_decode(e: DecodeError) -> ArchiveError {
 /// `O_NOFOLLOW`（最終要素がシンボリックリンクなら open を失敗させる）と `O_NONBLOCK`（FIFO への差し替えで
 /// open が停止しないようにする。通常ファイルの read には影響しない）の値。依存（libc）を足さないため target
 /// ごとに自前で定義する。値は libc クレートの各 target の定義と同じ（aarch64 Linux は asm-generic と異なる）。
-/// 対応外の target は `None`（`O_NOFOLLOW` を付けず、[`verify_same_inode_if_following`] の事後照合で担保する）。
+/// 対応外の target（非 Unix を含む）は `None`。リンクを辿らず FIFO でも停止しない open を保証できないため、
+/// [`open_segment_nofollow`] が `Unsupported` で拒否する（fail-closed）。
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 const OPEN_FLAGS: Option<i32> = Some(0o400000 | 0o4000);
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
@@ -536,13 +537,18 @@ const OPEN_FLAGS: Option<i32> = None;
 /// ファイルでないこと（シンボリックリンク・ソケット等）を `BadFormat` へ分類する（エラー種別の分類だけで、
 /// 読み取りの許可には使わないので TOCTOU を作らない）。`SegmentReader::open` だけが呼ぶ。
 fn open_segment_nofollow(path: &Path) -> Result<std::fs::File> {
+    let Some(flags) = OPEN_FLAGS else {
+        return Err(ArchiveError::Unsupported);
+    };
     let mut opts = std::fs::OpenOptions::new();
     opts.read(true);
     #[cfg(unix)]
-    if let Some(flags) = OPEN_FLAGS {
+    {
         use std::os::unix::fs::OpenOptionsExt;
         opts.custom_flags(flags);
     }
+    #[cfg(not(unix))]
+    let _ = flags;
     match opts.open(path) {
         Ok(f) => Ok(f),
         Err(e) => match std::fs::symlink_metadata(path) {
@@ -588,21 +594,6 @@ fn check_segment_ownership(_meta: &std::fs::Metadata, _path: &Path) -> Result<()
     Ok(())
 }
 
-/// `O_NOFOLLOW` を付けられない target のみ、open 後にパスを再度 lstat して fd と同じ実体（dev, ino）か
-/// 照合する。付ける target では行わない（open 後の正当な削除・rename で新たな失敗を作らないため）。
-fn verify_same_inode_if_following(meta: &std::fs::Metadata, path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    if OPEN_FLAGS.is_none() {
-        use std::os::unix::fs::MetadataExt;
-        let now = std::fs::symlink_metadata(path)?;
-        if !now.file_type().is_file() || now.dev() != meta.dev() || now.ino() != meta.ino() {
-            return Err(ArchiveError::BadFormat);
-        }
-    }
-    let _ = (meta, path);
-    Ok(())
-}
-
 /// 検証済みセグメントの情報。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct SegmentInfo {
@@ -636,7 +627,6 @@ impl SegmentReader {
             return Err(ArchiveError::BadFormat);
         }
         check_segment_ownership(&meta, path)?;
-        verify_same_inode_if_following(&meta, path)?;
         let mut prefix = [0u8; SEG_PREFIX_LEN];
         file.read_exact(&mut prefix).map_err(read_err)?;
         let header = SegmentHeader::decode(&prefix)?;
