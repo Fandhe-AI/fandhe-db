@@ -7,6 +7,7 @@
 //! DDL へ戻せない形（採番方式の異なる表・内部キーを含む保存済み本文・名前の合わない暗黙 SEQUENCE
 //! など）は [`super::unsupported`] で全体を失敗させる。
 
+use super::super::materialized::MaterializedViewDef;
 use super::super::sequence::{make_object_name, SequenceDef, SequenceOwner, SequenceParams};
 use super::super::{
     ArrayElemType, CheckConstraint, ColumnDef, ColumnDefault, ColumnType, ForeignKeyDef,
@@ -524,5 +525,28 @@ pub(super) fn render_create_view<E>(
         ViewCheckOption::Local => s.push_str(" WITH LOCAL CHECK OPTION"),
         ViewCheckOption::Cascaded => s.push_str(" WITH CASCADED CHECK OPTION"),
     }
+    Ok(s)
+}
+
+/// マテリアライズド VIEW 1 件の `CREATE MATERIALIZED VIEW ... WITH NO DATA` 文を作る。実体は運ばず、
+/// 復元後の再計算（論理ダンプだけが出す `REFRESH`。`object::export_matview_refreshes`）で
+/// 作り直す（Issue #3097）。
+pub(super) fn render_create_materialized_view<E>(
+    ctx: &Ctx<'_>,
+    key: &str,
+    def: &MaterializedViewDef,
+) -> Result<String, SchemaDdlError<E>> {
+    let body = ctx
+        .namer
+        .externalize::<E>("materialized view", &def.body_sql)?;
+    let mut s = String::from("CREATE MATERIALIZED VIEW ");
+    s.push_str(&ctx.namer.qualified_required::<E>(key)?);
+    if !def.column_aliases.is_empty() {
+        s.push(' ');
+        s.push_str(&render_column_list::<E>(&def.column_aliases)?);
+    }
+    s.push_str(" AS ");
+    s.push_str(&body);
+    s.push_str(" WITH NO DATA");
     Ok(s)
 }

@@ -283,6 +283,7 @@ fn apply(
                 let is_data = kind == StmtKind::Insert;
                 if kind.phase() < phase
                     || !frame_matches_header(header, is_data, false)
+                    || (kind == StmtKind::MaterializedViewRefresh && header.parts != DumpParts::All)
                     || !kind.accepts(&sql)
                     || !is_single_statement(&sql)
                 {

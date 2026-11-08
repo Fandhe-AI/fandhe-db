@@ -10,6 +10,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use redb::{ReadableTable, TableDefinition};
 
+use super::super::materialized::{
+    decode_materialized_view_def, tenant_has_entity_in, MaterializedViewDef,
+    MATERIALIZED_VIEWS_TABLE,
+};
 use super::super::sequence::{list_sequence_definitions_in, sequence_state_in};
 use super::super::{
     decode_enum_type_def, decode_index_def, decode_view_def, get_table_schema_in_txn_impl,
@@ -18,7 +22,8 @@ use super::super::{
 };
 use super::quote::{literal, push_ident, KeyScope};
 use super::table::{
-    render_create_index, render_create_table, render_create_view, render_foreign_key, SequenceMap,
+    render_create_index, render_create_materialized_view, render_create_table, render_create_view,
+    render_foreign_key, SequenceMap,
 };
 use super::{access, unsupported, Ctx, DdlObjectKind, DdlSection, Emitter, SchemaDdlError};
 
@@ -118,9 +123,39 @@ pub(super) fn export_pre_data<E>(
     export_standalone_sequences(ctx, out, &seqs)?;
     export_tables(ctx, out, &seqs, &mut consumed)?;
     ensure_owned_sequences_consumed(ctx, &seqs, &consumed)?;
-    reject_materialized_views(ctx)?;
     export_views(ctx, out)?;
     access::export_functions(ctx, out)?;
+    Ok(())
+}
+
+/// 論理ダンプの末尾（`PostData` の後）に出す、マテリアライズド VIEW の再計算（`REFRESH`）。
+/// スキーマだけの書き出し（`Storage::export_schema_ddl`）では呼ばない（表が空のまま
+/// 「実体化済み」にすると、元の未実体化の状態より緩くなるため）。Issue #3097。
+pub(super) fn export_matview_refreshes<E>(
+    ctx: &Ctx<'_>,
+    out: &mut Emitter<'_, E>,
+) -> Result<(), SchemaDdlError<E>> {
+    // 共有の `populated` は他テナントの REFRESH でも変わるため使わず、選択したテナント自身の
+    // 実体があるものだけ出す（`export_sequence_values` が自テナントの状態行だけを見るのと同じ扱い）。
+    let Some(tenant) = ctx.scope.tenant() else {
+        return Ok(());
+    };
+    for (key, kind) in view_like_order::<E>(ctx)? {
+        if !matches!(kind, ViewLike::Materialized(_)) {
+            continue;
+        }
+        if tenant_has_entity_in(ctx.rt, &key, tenant)? {
+            let sql = format!(
+                "REFRESH MATERIALIZED VIEW {}",
+                ctx.namer.qualified_required::<E>(&key)?
+            );
+            out.emit(
+                DdlSection::PostData,
+                DdlObjectKind::MaterializedViewRefresh,
+                &sql,
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -263,40 +298,52 @@ fn ensure_owned_sequences_consumed<E>(
     Ok(())
 }
 
-/// マテリアライズド VIEW は定義と実体（文脈ごとの行）が別で、実体を DDL へ戻す手段が無いため、
-/// 1 件でもあれば書き出せない（黙って省かない）。
-fn reject_materialized_views<E>(ctx: &Ctx<'_>) -> Result<(), SchemaDdlError<E>> {
-    // 他の種別と同じく relation キーの所属で絞る。範囲内（共有分を選んだときの共有、または選択した
-    // テナントの SCHEMA 配下）に 1 件でもあれば失敗し、範囲外（他テナント）は存在を示さず無視する。
-    for (k, _) in read_str_table::<E>(ctx, super::super::materialized::MATERIALIZED_VIEWS_TABLE)? {
-        if in_scope(ctx, &k)? {
-            return Err(unsupported(
-                "materialized view",
-                "materialized views cannot be recreated by the schema dump",
-            ));
-        }
-    }
-    Ok(())
+/// VIEW とマテリアライズド VIEW のどちらか（依存順の 1 要素）。
+enum ViewLike {
+    View(ViewDef),
+    Materialized(MaterializedViewDef),
 }
 
-/// 範囲内の VIEW。ビューが参照するビューを先に出す（トポロジカル順）。
-fn export_views<E>(ctx: &Ctx<'_>, out: &mut Emitter<'_, E>) -> Result<(), SchemaDdlError<E>> {
-    let mut pending: BTreeMap<String, ViewDef> = BTreeMap::new();
+/// 範囲内の VIEW・マテリアライズド VIEW を、読む relation を先に出すトポロジカル順で返す
+/// （VIEW が matview を、matview が VIEW・matview を読めるため 1 つの依存グラフで並べる）。
+/// 準備できたものは描画名の順に出す。導出できない本文・循環は全体を失敗させる。
+fn view_like_order<E>(ctx: &Ctx<'_>) -> Result<Vec<(String, ViewLike)>, SchemaDdlError<E>> {
+    let mut pending: BTreeMap<String, ViewLike> = BTreeMap::new();
     for (k, v) in read_str_table::<E>(ctx, VIEWS_TABLE)? {
         if in_scope(ctx, &k)? {
-            pending.insert(k, decode_view_def(&v)?);
+            pending.insert(k, ViewLike::View(decode_view_def(&v)?));
         }
     }
-    // 各 VIEW が読む relation をすべて集める。保存済み本文の構文検証（DROP の依存列挙と同じ
+    for (k, v) in read_str_table::<E>(ctx, MATERIALIZED_VIEWS_TABLE)? {
+        if in_scope(ctx, &k)? {
+            // `CREATE MATERIALIZED VIEW` は SCHEMA 修飾名を受理しない（共有にしか作れない）ため、
+            // SCHEMA 配下の定義は戻せない。デコードより前に、固定文言で全体を失敗させる。
+            if matches!(ctx.namer.scope::<E>(&k)?, KeyScope::Tenant { .. }) {
+                return Err(unsupported(
+                    "materialized view",
+                    "schema-scoped materialized view cannot be recreated by SQL",
+                ));
+            }
+            let def = decode_materialized_view_def(&k, &v)?;
+            pending.insert(k, ViewLike::Materialized(def));
+        }
+    }
+    // 各定義が読む relation をすべて集める。保存済み本文の構文検証（DROP の依存列挙と同じ
     // `view_body_relations`）で UNION／INTERSECT／EXCEPT の各枝・JOIN・部分問い合わせ・CTE の参照まで得る。
     // 導出できない本文は、並べ方を推測せず全体を失敗させる。
     let mut deps: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (k, d) in &pending {
-        let mut rels = view_body_relations(&d.body_sql)
-            .map_err(|_| unsupported("view", "view body references cannot be determined"))?;
-        rels.push(d.base_relation.clone());
+        let (body, mut rels) = match d {
+            ViewLike::View(v) => (&v.body_sql, vec![v.base_relation.clone()]),
+            ViewLike::Materialized(m) => (&m.body_sql, m.base_relations.clone()),
+        };
+        rels.extend(
+            view_body_relations(body)
+                .map_err(|_| unsupported("view", "view body references cannot be determined"))?,
+        );
         deps.insert(k.clone(), rels);
     }
+    let mut ordered = Vec::with_capacity(pending.len());
     while !pending.is_empty() {
         let mut ready: Vec<((String, String), String)> = Vec::new();
         for k in pending.keys() {
@@ -313,8 +360,25 @@ fn export_views<E>(ctx: &Ctx<'_>, out: &mut Emitter<'_, E>) -> Result<(), Schema
         ready.sort();
         for (_, key) in ready {
             if let Some(def) = pending.remove(&key) {
-                let sql = render_create_view(ctx, &key, &def)?;
+                ordered.push((key, def));
+            }
+        }
+    }
+    Ok(ordered)
+}
+
+/// 範囲内の VIEW とマテリアライズド VIEW。読む relation を先に出す（トポロジカル順）。
+/// マテリアライズド VIEW は `WITH NO DATA`（実体は運ばない）で出す。
+fn export_views<E>(ctx: &Ctx<'_>, out: &mut Emitter<'_, E>) -> Result<(), SchemaDdlError<E>> {
+    for (key, def) in view_like_order::<E>(ctx)? {
+        match def {
+            ViewLike::View(v) => {
+                let sql = render_create_view(ctx, &key, &v)?;
                 out.emit(DdlSection::PreData, DdlObjectKind::View, &sql)?;
+            }
+            ViewLike::Materialized(m) => {
+                let sql = render_create_materialized_view(ctx, &key, &m)?;
+                out.emit(DdlSection::PreData, DdlObjectKind::MaterializedView, &sql)?;
             }
         }
     }
@@ -338,15 +402,27 @@ fn export_foreign_keys<E>(
 
 /// 範囲内の索引宣言。
 fn export_indexes<E>(ctx: &Ctx<'_>, out: &mut Emitter<'_, E>) -> Result<(), SchemaDdlError<E>> {
+    let mut matviews: Option<BTreeMap<String, MaterializedViewDef>> = None;
     for def in index_defs::<E>(ctx)? {
-        // 対象が表でない索引（マテリアライズド VIEW 上など）は戻せない。
+        // 対象が表でなければマテリアライズド VIEW の定義を引く（どちらでもなければ戻せない）。
         let table = match get_table_schema_in_txn_impl(ctx.rt, &def.table, true) {
             Ok(t) => t,
             Err(CatalogError::TableNotFound(_)) => {
-                return Err(unsupported(
-                    "index",
-                    "index on a relation that is not a table",
-                ));
+                if matviews.is_none() {
+                    let mut m = BTreeMap::new();
+                    for (k, v) in read_str_table::<E>(ctx, MATERIALIZED_VIEWS_TABLE)? {
+                        let d = decode_materialized_view_def(&k, &v)?;
+                        m.insert(k, d);
+                    }
+                    matviews = Some(m);
+                }
+                let Some(mv) = matviews.as_ref().and_then(|m| m.get(&def.table)) else {
+                    return Err(unsupported(
+                        "index",
+                        "index on a relation that is neither a table nor a materialized view",
+                    ));
+                };
+                TableSchema::new(def.table.clone(), mv.columns.clone())
             }
             Err(e) => return Err(e.into()),
         };

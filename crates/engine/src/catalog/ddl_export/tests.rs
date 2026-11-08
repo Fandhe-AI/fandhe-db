@@ -88,6 +88,20 @@ fn relation_keys_render_as_public_or_schema_qualified_names() {
 }
 
 #[test]
+fn sequence_args_are_bare_names_and_other_tenants_are_skipped() {
+    let n = namer();
+    assert_eq!(
+        n.sequence_arg::<Infallible>("q").expect("ok"),
+        Some("q".to_string())
+    );
+    assert_eq!(
+        n.sequence_arg::<Infallible>("#7.q").expect("ok"),
+        Some("app.q".to_string())
+    );
+    assert_eq!(n.sequence_arg::<Infallible>("#8.q").expect("ok"), None);
+}
+
+#[test]
 fn internal_keys_in_stored_bodies_become_qualified_names() {
     let n = namer();
     let out = n

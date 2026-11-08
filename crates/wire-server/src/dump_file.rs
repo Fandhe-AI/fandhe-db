@@ -96,6 +96,10 @@ pub enum StmtKind {
     Index,
     /// `CREATE VIEW`。
     View,
+    /// `CREATE MATERIALIZED VIEW ... WITH NO DATA`（実体は運ばない。Issue #3097）。
+    MaterializedView,
+    /// `REFRESH MATERIALIZED VIEW`（実体の再計算。論理ダンプ（`parts: all`）の末尾だけに出る。Issue #3097）。
+    MaterializedViewRefresh,
     /// `CREATE FUNCTION`。
     Function,
     /// `CREATE TRIGGER`。
@@ -124,6 +128,8 @@ impl StmtKind {
             DdlObjectKind::ForeignKey => StmtKind::ForeignKey,
             DdlObjectKind::Index => StmtKind::Index,
             DdlObjectKind::View => StmtKind::View,
+            DdlObjectKind::MaterializedView => StmtKind::MaterializedView,
+            DdlObjectKind::MaterializedViewRefresh => StmtKind::MaterializedViewRefresh,
             DdlObjectKind::Function => StmtKind::Function,
             DdlObjectKind::Trigger => StmtKind::Trigger,
             DdlObjectKind::RowSecurity => StmtKind::RowSecurity,
@@ -145,6 +151,8 @@ impl StmtKind {
             StmtKind::ForeignKey => "foreign-key",
             StmtKind::Index => "index",
             StmtKind::View => "view",
+            StmtKind::MaterializedView => "materialized-view",
+            StmtKind::MaterializedViewRefresh => "materialized-view-refresh",
             StmtKind::Function => "function",
             StmtKind::Trigger => "trigger",
             StmtKind::RowSecurity => "row-security",
@@ -155,7 +163,7 @@ impl StmtKind {
     }
 
     fn from_token(t: &str) -> Option<Self> {
-        const ALL: [StmtKind; 16] = [
+        const ALL: [StmtKind; 18] = [
             StmtKind::Schema,
             StmtKind::Role,
             StmtKind::RoleMembership,
@@ -166,6 +174,8 @@ impl StmtKind {
             StmtKind::ForeignKey,
             StmtKind::Index,
             StmtKind::View,
+            StmtKind::MaterializedView,
+            StmtKind::MaterializedViewRefresh,
             StmtKind::Function,
             StmtKind::Trigger,
             StmtKind::RowSecurity,
@@ -190,6 +200,8 @@ impl StmtKind {
             StmtKind::ForeignKey | StmtKind::RowSecurity => &["ALTER TABLE "],
             StmtKind::Index => &["CREATE INDEX ", "CREATE UNIQUE INDEX "],
             StmtKind::View => &["CREATE VIEW "],
+            StmtKind::MaterializedView => &["CREATE MATERIALIZED VIEW "],
+            StmtKind::MaterializedViewRefresh => &["REFRESH MATERIALIZED VIEW "],
             StmtKind::Function => &["CREATE FUNCTION "],
             StmtKind::Trigger => &["CREATE TRIGGER "],
             StmtKind::Policy => &["CREATE POLICY "],
@@ -209,6 +221,7 @@ impl StmtKind {
             | StmtKind::Sequence
             | StmtKind::Table
             | StmtKind::View
+            | StmtKind::MaterializedView
             | StmtKind::Function => Phase::Pre,
             StmtKind::Insert => Phase::Data,
             StmtKind::SequenceValue
@@ -217,7 +230,8 @@ impl StmtKind {
             | StmtKind::Trigger
             | StmtKind::RowSecurity
             | StmtKind::Policy
-            | StmtKind::Privilege => Phase::Post,
+            | StmtKind::Privilege
+            | StmtKind::MaterializedViewRefresh => Phase::Post,
         }
     }
 
@@ -229,6 +243,8 @@ impl StmtKind {
             StmtKind::SequenceValue => is_setval_call(sql),
             StmtKind::ForeignKey => is_add_foreign_key(sql),
             StmtKind::RowSecurity => is_enable_or_force_rls(sql),
+            StmtKind::MaterializedView => is_create_matview_no_data(sql),
+            StmtKind::MaterializedViewRefresh => is_refresh_matview(sql),
             _ => self.allowed_prefixes().iter().any(|p| sql.starts_with(p)),
         }
     }
@@ -261,11 +277,45 @@ fn is_setval_call(sql: &str) -> bool {
     };
     let digits = num.strip_prefix('-').unwrap_or(num);
     !name.is_empty()
-        && name.chars().all(|c| c.is_alphanumeric() || c == '_')
+        && is_setval_name(name)
         && !digits.is_empty()
         && digits.len() <= 19
         && digits.bytes().all(|b| b.is_ascii_digit())
         && matches!(flag, "TRUE" | "FALSE")
+}
+
+/// `setval` の名前引数。素の識別子、または SCHEMA 修飾名 `schema.name`（`.` は 1 個まで。両側は空でない。
+/// 各部は英数字と `_` だけ。Issue #3097）。
+fn is_setval_name(name: &str) -> bool {
+    let part_ok = |p: &str| !p.is_empty() && p.chars().all(|c| c.is_alphanumeric() || c == '_');
+    match name.split_once('.') {
+        Some((schema, rel)) => part_ok(schema) && part_ok(rel),
+        None => part_ok(name),
+    }
+}
+
+/// `CREATE MATERIALIZED VIEW ... WITH NO DATA` の形か。実体を作る `WITH DATA`（または句なし）は不可
+/// （`Pre` の段で本文を評価させない。再計算は `Post` の `REFRESH` 枠だけが行う）。
+fn is_create_matview_no_data(sql: &str) -> bool {
+    sql.starts_with("CREATE MATERIALIZED VIEW ")
+        && sql.ends_with(" WITH NO DATA")
+        && sql.len() > "CREATE MATERIALIZED VIEW  WITH NO DATA".len()
+}
+
+/// `REFRESH MATERIALIZED VIEW <名前>` の厳密な形か。`CONCURRENTLY`・`WITH [NO] DATA`・複数名・後続の語は
+/// 不可。名前は書き手の出力形（共有は `"name"`、SCHEMA 配下は引用符なしの `schema.name`）に限る。
+fn is_refresh_matview(sql: &str) -> bool {
+    let Some(name) = sql.strip_prefix("REFRESH MATERIALIZED VIEW ") else {
+        return false;
+    };
+    let part_ok = |p: &str| !p.is_empty() && p.chars().all(|c| c.is_alphanumeric() || c == '_');
+    match name.strip_prefix('"').and_then(|n| n.strip_suffix('"')) {
+        Some(inner) => part_ok(inner),
+        None => match name.split_once('.') {
+            Some((schema, rel)) => part_ok(schema) && part_ok(rel),
+            None => part_ok(name),
+        },
+    }
 }
 
 /// `ALTER TABLE <表> ADD CONSTRAINT <名> FOREIGN KEY ...` の形か。

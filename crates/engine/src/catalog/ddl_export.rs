@@ -8,8 +8,10 @@
 //!
 //! # 出力の区分（[`DdlSection`]）
 //!
-//! - `PreData`: スキーマ・ロール・ENUM・SEQUENCE・表（列・既定値・PRIMARY KEY・UNIQUE・CHECK）・VIEW・関数
-//! - `PostData`: 外部キー・索引・トリガ・行セキュリティ・ポリシー・権限・SEQUENCE の現在値
+//! - `PreData`: スキーマ・ロール・ENUM・SEQUENCE・表（列・既定値・PRIMARY KEY・UNIQUE・CHECK）・VIEW・
+//!   マテリアライズド VIEW（`WITH NO DATA`）・関数
+//! - `PostData`: 外部キー・索引・トリガ・行セキュリティ・ポリシー・権限・SEQUENCE の現在値。論理ダンプ
+//!   （`Storage::export_logical_dump`）だけは末尾に実体の再計算（`REFRESH MATERIALIZED VIEW`）を足す
 //!
 //! データを入れる前に制約・トリガ・ポリシーが効くとデータの流し込み自体が阻害されるため、`pg_dump` と同じく
 //! それらはデータの後ろ（`PostData`）に置く。
@@ -123,6 +125,10 @@ pub enum DdlObjectKind {
     Index,
     /// `CREATE VIEW`。
     View,
+    /// `CREATE MATERIALIZED VIEW ... WITH NO DATA`（実体は運ばない。Issue #3097）。
+    MaterializedView,
+    /// `REFRESH MATERIALIZED VIEW`（論理ダンプの末尾だけに出る再計算。Issue #3097）。
+    MaterializedViewRefresh,
     /// `CREATE FUNCTION`。
     Function,
     /// `CREATE TRIGGER`。
@@ -441,6 +447,8 @@ impl Storage {
                 count: 0,
             };
             object::export_post_data(&ctx, &mut out)?;
+            // 実体の再計算はデータが入った後（論理ダンプだけ。スキーマだけの書き出しでは出さない）。
+            object::export_matview_refreshes(&ctx, &mut out)?;
             schema_count = schema_count.saturating_add(out.count);
         }
         Ok(LogicalDumpSummary {

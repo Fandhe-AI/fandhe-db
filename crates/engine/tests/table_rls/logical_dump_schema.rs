@@ -436,20 +436,155 @@ fn role_membership_and_privileges_fail_closed() {
     dump(&src, &SchemaDdlScope::shared_and_tenant("tenant-b")).expect("other tenant unaffected");
 }
 
+/// 論理ダンプ（スキーマ・データ・末尾の再計算）の DDL 文だけを集める。
+fn logical(core: &EngineCore, scope: &SchemaDdlScope) -> Vec<(DdlSection, String)> {
+    use engine::catalog::ddl_export::{LogicalDumpItem, TableDataFormat};
+    let mut out = Vec::new();
+    core.export_logical_dump(scope, TableDataFormat::Insert, |item| {
+        if let LogicalDumpItem::Schema(st) = item {
+            out.push((st.section, st.sql.to_string()));
+        }
+        Ok::<(), std::convert::Infallible>(())
+    })
+    .expect("logical dump");
+    out
+}
+
+/// マテリアライズド VIEW（列別名・VIEW を読む・matview を読む・実体化前のまま・索引つき）が、
+/// スキーマだけの書き出しで `WITH NO DATA` として往復し、REFRESH は出ない（Issue #3097）。
 #[test]
-fn materialized_views_fail_the_whole_dump() {
-    let p1 = unique_db_path("dump-matview");
+fn materialized_views_round_trip_as_no_data_in_the_schema_dump() {
+    let dump = assert_round_trip(
+        "matview",
+        "tenant-a",
+        &[
+            "CREATE TABLE base (a INTEGER PRIMARY KEY, b TEXT)",
+            "INSERT INTO base (a, b) VALUES (1, 'x')",
+            "CREATE VIEW bv AS SELECT a, b FROM base",
+            "CREATE MATERIALIZED VIEW mv_z (x, y) AS SELECT a, b FROM bv",
+            "CREATE MATERIALIZED VIEW mv_a AS SELECT x FROM mv_z",
+            "CREATE MATERIALIZED VIEW mv_empty AS SELECT a FROM base WITH NO DATA",
+            "CREATE UNIQUE INDEX mv_z_uq ON mv_z (x)",
+            "CREATE INDEX mv_z_y ON mv_z (y)",
+        ],
+    );
+    let stmts: Vec<&str> = dump.iter().map(|(_, s)| s.as_str()).collect();
+    assert!(!stmts.iter().any(|s| s.starts_with("REFRESH")));
+    let pos = |needle: &str| {
+        stmts
+            .iter()
+            .position(|s| s.contains(needle))
+            .unwrap_or_else(|| panic!("{needle} must appear"))
+    };
+    // 読まれる側が先（bv → mv_z → mv_a）。
+    assert!(pos("CREATE VIEW \"bv\"") < pos("CREATE MATERIALIZED VIEW \"mv_z\""));
+    assert!(pos("CREATE MATERIALIZED VIEW \"mv_z\"") < pos("CREATE MATERIALIZED VIEW \"mv_a\""));
+    assert!(stmts
+        .iter()
+        .all(|s| !s.starts_with("CREATE MATERIALIZED VIEW") || s.ends_with(" WITH NO DATA")));
+    assert!(stmts
+        .iter()
+        .any(|s| s.contains("CREATE UNIQUE INDEX \"mv_z_uq\" ON \"mv_z\"")));
+    assert!(stmts
+        .iter()
+        .any(|s| s.contains("CREATE INDEX \"mv_z_y\" ON \"mv_z\"")));
+}
+
+/// 論理ダンプは、選択したテナント自身の実体がある matview だけを依存順に末尾で再計算する。
+/// 往復後も、実体化前のままの matview は実体化前のまま（Issue #3097）。
+#[test]
+fn logical_dump_refreshes_only_materialized_views_with_the_tenants_own_entity() {
+    let p1 = unique_db_path("dump-matview-refresh-src");
+    let _g1 = CleanupGuard(p1.clone());
+    let p2 = unique_db_path("dump-matview-refresh-dst");
+    let _g2 = CleanupGuard(p2.clone());
+    let src = open_core(&p1);
+    for sql in [
+        "CREATE TABLE base (a INTEGER PRIMARY KEY)",
+        "INSERT INTO base (a) VALUES (1), (2)",
+        "CREATE MATERIALIZED VIEW mv_z AS SELECT a FROM base",
+        "CREATE MATERIALIZED VIEW mv_a AS SELECT a FROM mv_z",
+        "CREATE MATERIALIZED VIEW mv_empty AS SELECT a FROM base WITH NO DATA",
+    ] {
+        ok(&src, "tenant-a", sql);
+    }
+    let scope = SchemaDdlScope::shared_and_tenant("tenant-a");
+    let first = logical(&src, &scope);
+    let refreshes: Vec<&str> = first
+        .iter()
+        .map(|(_, s)| s.as_str())
+        .filter(|s| s.starts_with("REFRESH"))
+        .collect();
+    assert_eq!(
+        refreshes,
+        vec![
+            "REFRESH MATERIALIZED VIEW \"mv_z\"",
+            "REFRESH MATERIALIZED VIEW \"mv_a\""
+        ]
+    );
+    // 再計算は最後の文（データの後）。
+    assert!(first.last().is_some_and(
+        |(sec, s)| *sec == DdlSection::PostData && s == "REFRESH MATERIALIZED VIEW \"mv_a\""
+    ));
+    // スキーマだけの書き出しには出ない。
+    assert!(!dump(&src, &scope)
+        .expect("schema dump")
+        .iter()
+        .any(|(_, s)| s.starts_with("REFRESH")));
+
+    let dst = open_core(&p2);
+    replay(&dst, "tenant-a", &first);
+    assert_eq!(first, logical(&dst, &scope), "re-dump must match");
+    let read = |core: &EngineCore, sql: &str| match run(core, "tenant-a", sql) {
+        Ok(SqlOutcome::Query(r)) => Ok(r.rows.len()),
+        Ok(other) => panic!("unexpected {other:?}"),
+        Err(e) => Err(e.wire_code()),
+    };
+    // データは流していないので、再計算は空の基表を実体化する（未実体化の 55000 ではなく 0 行）。
+    // 値の往復は logical_dump_roundtrip が確かめる。
+    assert_eq!(read(&src, "SELECT a FROM mv_a"), Ok(2));
+    assert_eq!(read(&dst, "SELECT a FROM mv_a"), Ok(0));
+    assert_eq!(read(&dst, "SELECT a FROM mv_empty"), Err("55000"));
+    assert_eq!(read(&src, "SELECT a FROM mv_empty"), Err("55000"));
+}
+
+/// 他テナントの REFRESH・実体は、自テナントのダンプの成否にも内容にも影響しない。
+/// 共有の `populated` ではなく、自テナントの実体の有無で再計算を出すため（Issue #3097）。
+#[test]
+fn other_tenants_materialized_view_state_does_not_affect_the_dump() {
+    let p1 = unique_db_path("dump-matview-tenants");
     let _g1 = CleanupGuard(p1.clone());
     let src = open_core(&p1);
-    ok(&src, "tenant-a", "CREATE TABLE base (a INTEGER)");
-    dump(&src, &SchemaDdlScope::shared_only()).expect("tables alone are fine");
     ok(
         &src,
         "tenant-a",
-        "CREATE MATERIALIZED VIEW mv AS SELECT a FROM base",
+        "CREATE TABLE base (a INTEGER PRIMARY KEY)",
     );
-    let err = dump(&src, &SchemaDdlScope::shared_only()).expect_err("matview");
-    assert!(matches!(err, SchemaDdlError::Unsupported(u) if u.kind == "materialized view"));
+    ok(&src, "tenant-a", "INSERT INTO base (a) VALUES (1)");
+    ok(
+        &src,
+        "tenant-a",
+        "CREATE MATERIALIZED VIEW mv AS SELECT a FROM base WITH NO DATA",
+    );
+    let scope_a = SchemaDdlScope::shared_and_tenant("tenant-a");
+    let before = logical(&src, &scope_a);
+    assert!(!before.iter().any(|(_, s)| s.starts_with("REFRESH")));
+    // tenant-b が実体化する（共有の populated が変わる）。a のダンプは変わらない。
+    ok(&src, "tenant-b", "REFRESH MATERIALIZED VIEW \"mv\"");
+    assert_eq!(before, logical(&src, &scope_a));
+    let b = logical(&src, &SchemaDdlScope::shared_and_tenant("tenant-b"));
+    assert!(b
+        .iter()
+        .any(|(_, s)| s == "REFRESH MATERIALIZED VIEW \"mv\""));
+    // 共有分だけの書き出し（テナント無し）は再計算を出さない。
+    let shared = logical(&src, &SchemaDdlScope::shared_only());
+    assert!(!shared.iter().any(|(_, s)| s.starts_with("REFRESH")));
+    // a 自身が実体化すると出る。
+    ok(&src, "tenant-a", "REFRESH MATERIALIZED VIEW \"mv\"");
+    let after = logical(&src, &scope_a);
+    assert!(after
+        .iter()
+        .any(|(_, s)| s == "REFRESH MATERIALIZED VIEW \"mv\""));
 }
 
 #[test]
