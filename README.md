@@ -482,6 +482,14 @@ redb トランザクションで DB 内の `change_log` 表へ追記されます
 - 復元した DB は元と同じ DB 識別子・timeline のまま LSN が巻き戻るため、元のアーカイブ先とは別のアーカイブ先で
   運用してください（timeline の分岐は #2446 が前提）。
 
+**レプリケーション受信側**（Issue #2174。RECOVER-15 ポインタ。判断は [docs/design/replication-streaming.md](docs/design/replication-streaming.md) の「実装判断（Issue #2174）」）:
+
+- `wire-server replica --db <path> --primary <ip:port> --credentials <file>` で、`backup` で取ったベースのコピーを
+  プライマリの `--replication-bind` に追従させます。受け取った変更を commit 番号順に原子的に適用して適用位置を永続化し、
+  再接続・再起動では適用位置から再開します。順序違反・分岐・識別子や版数の不一致は何も適用せず終了コード 10 で停止し、
+  プライマリの拒否は終了コード 11 で報告します。接続先は**ループバックのみ**（TLS は #2177）、資格情報は
+  `role:password` の 1 行のファイル（group／other から読めない権限）で渡します。読み取りレプリカの受け付けと再同期は後続の Issue です。
+
 **レプリケーション送信側**（Issue #2173。RECOVER-15・WIRE-9 ポインタ。判断は [docs/design/replication-streaming.md](docs/design/replication-streaming.md) の「実装判断（Issue #2173）」）:
 
 - `--replication-bind <addr>` で、テナント向けの `--bind` とは別のポートに専用のリスナーを作り、承認済みのレプリカへ変更ログの
