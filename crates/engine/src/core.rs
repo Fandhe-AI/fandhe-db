@@ -4345,6 +4345,15 @@ impl EngineCore {
         self.storage.archive_change_log(opts)
     }
 
+    /// 未アーカイブの変更ログ量の状態（RECOVER-14 (2)・Issue #3091）。変更ログが無効なら `None`。
+    /// wire-server のアーカイブ常駐スレッドが上限の到達・解消を運用者へ知らせるために呼ぶ。
+    /// 運用者向けで、SQL・NoSQL の表層からは呼べない（テナントに他者の書き込み量を見せない）。
+    pub fn change_log_unarchived_status(
+        &self,
+    ) -> Result<Option<crate::storage::UnarchivedStatus>, StorageError> {
+        self.storage.change_log_unarchived_status()
+    }
+
     /// ストリーミングレプリケーションの照合値（DB 識別子・timeline）。変更ログが無効なら `None`
     /// （RECOVER-15・Issue #2173）。wire-server のレプリケーション送信側が呼ぶ。
     pub fn change_log_stream_identity(&self) -> Option<crate::storage::StreamIdentity> {

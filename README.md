@@ -143,6 +143,7 @@ cargo run -p fandhe-db-wire-server -- --users <ユーザーストアのパス> -
   [--require-operation-id] \
   [--change-log] [--change-log-archive-dir <dir>] [--change-log-retain-records <n>] \
   [--change-log-archive-interval-secs <1-86400>] \
+  [--change-log-max-unarchived-bytes <n>] [--change-log-max-unarchived-records <n>] \
   [--replication-bind <loopback addr>] [--replication-roles <file>] [--replication-allow <ip|cidr>]... \
   [--replication-max-connections <1-256>] [--replication-max-unacked-bytes <1024-4294967296>] \
   [--replication-ack-timeout-secs <1-3600>] [--replication-max-lag-records <1-1000000000>] \
@@ -446,6 +447,11 @@ redb トランザクションで DB 内の `change_log` 表へ追記されます
   アーカイブ先は DB と別の媒体に置くことを推奨します。グループ・その他が書き込めるディレクトリ（スティッキー
   ビットの有無に依らず）は起動時に拒否されます（umask 002 で作ったものは `chmod 755` が要ります）。
   `--change-log` が前提です。
+- `--change-log-max-unarchived-bytes <n>`・`--change-log-max-unarchived-records <n>`（Issue #3091。RECOVER-14 (2)
+  ポインタ）: 未アーカイブの変更ログ量（バイト・件数。1 以上）の上限です。上限以上の間、書き込みは `54000` で
+  拒否され（commit 前なので何も確定しません）、アーカイブが進めば再起動なしで再開します。`--change-log-archive-dir` が
+  前提です（なければ起動エラー）。アーカイブ先を指定した起動ではバイト上限に 4 GiB を適用します（実装既定値）。
+  到達・解消は stderr の固定文言で分かり、数値は埋め込み利用の運用者向け API だけで参照できます（SQL からは見えません）。
 - `--change-log-retain-records <n>`: アーカイブ済みのレコードのうち新しい `n` 件を DB に残して、より古いものを
   DB から刈り込みます（`0` はアーカイブ済みのすべて）。**指定しなければ刈り込みません。** アーカイブされていない
   レコードは決して刈り込まれません。`--change-log-archive-dir` が前提です（なければ起動エラー）。
