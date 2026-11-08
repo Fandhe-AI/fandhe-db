@@ -191,6 +191,10 @@ pub mod replica;
 #[cfg(unix)]
 pub mod replica_opt;
 #[cfg(unix)]
+pub mod replica_resync;
+#[cfg(unix)]
+pub mod replica_resync_opt;
+#[cfg(unix)]
 pub mod replication;
 pub mod replication_opt;
 pub mod require_operation_id_opt;

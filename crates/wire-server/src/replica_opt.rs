@@ -25,7 +25,7 @@ use crate::replication_opt::{ReplicationRoles, MAX_ROLE_NAME_LEN};
 
 /// 適用の停止（整合性違反）の終了コード。再接続して飛ばして進めない。運用者の調査が必要。
 pub const EXIT_APPLY_HALTED: u8 = 10;
-/// プライマリが拒否した（別系統・再同期が必要・認証失敗など）ときの終了コード。再同期は #2176。
+/// プライマリが拒否した（別系統・再同期が必要・認証失敗など）ときの終了コード。再同期は `replica-resync`（#2176）で、`RESYNC_REQUIRED` は標準エラーの文言で区別する。
 pub const EXIT_PRIMARY_REJECTED: u8 = 11;
 
 /// 再接続バックオフ上限の既定・上限（秒。実装既定値）。
@@ -135,9 +135,7 @@ pub fn parse(args: &[String]) -> Result<ReplicaOptions, String> {
     let primary: SocketAddr = primary
         .parse()
         .map_err(|_| "--primary must be an ip:port address".to_string())?;
-    if !primary.ip().is_loopback() {
-        return Err("--primary must be a loopback address until TLS is supported".to_string());
-    }
+    check_primary_loopback(&primary)?;
     let (role, password) = load_credentials(Path::new(&credentials))?;
     let max_backoff = match &backoff {
         Some(v) => bounded("--max-backoff-secs", v, 1, MAX_MAX_BACKOFF_SECS)?,
@@ -173,9 +171,18 @@ pub fn parse(args: &[String]) -> Result<ReplicaOptions, String> {
     })
 }
 
+/// `--primary` がループバックであることを確かめる（平文のレプリケーションはループバックに限る。TLS は #2177）。
+/// `replica` と `replica-resync` で共有する。
+pub(crate) fn check_primary_loopback(primary: &SocketAddr) -> Result<(), String> {
+    if !primary.ip().is_loopback() {
+        return Err("--primary must be a loopback address until TLS is supported".to_string());
+    }
+    Ok(())
+}
+
 /// `role:password` の 1 行を読む。通常ファイルで小さく、group／other に読める権限が無いこと。
 /// パスワードは最初の `:` より後ろ全部（`:` を含んでよい）。末尾の改行は取り除く。
-fn load_credentials(path: &Path) -> Result<(String, Vec<u8>), String> {
+pub(crate) fn load_credentials(path: &Path) -> Result<(String, Vec<u8>), String> {
     use std::os::unix::fs::PermissionsExt as _;
     let meta = std::fs::metadata(path).map_err(|_| "--credentials cannot be read".to_string())?;
     if !meta.is_file() || meta.len() > MAX_CREDENTIALS_FILE_BYTES {

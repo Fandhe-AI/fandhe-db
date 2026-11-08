@@ -17,7 +17,8 @@
 //! - **適用停止**（`EXIT_APPLY_HALTED`）: 順序違反・欠番・チェックサム不正・識別子／timeline／版数の不一致・
 //!   適用不能なレコード・分岐。再接続して飛ばして進めない
 //! - **要報告**（`EXIT_PRIMARY_REJECTED`）: プライマリからの `FOREIGN`・`RESYNC_REQUIRED`・`AHEAD`・認証失敗・
-//!   Identity 不一致。適用を止めて報告するだけで、再同期の実行は #2176
+//!   Identity 不一致。適用を止めて報告するだけで、再同期の実行は `replica-resync`（Issue #2176。
+//!   `RESYNC_REQUIRED` のときだけ固有の文言を標準エラーへ出す）
 //! - **一時障害**: 切断・タイムアウト・I/O エラー・ハートビート途絶・プライマリの `BUSY`／`INTERNAL`。
 //!   上限つき指数バックオフ（抖動つき）で再接続し、再開位置は常に DB の世代から取り直す
 //!
@@ -55,6 +56,10 @@ const INITIAL_BACKOFF: Duration = Duration::from_millis(200);
 /// 本体を読むときの 1 回の確保単位（宣言された長さをそのまま確保しない）。
 const READ_CHUNK: usize = 64 * 1024;
 
+/// プライマリが `RESYNC_REQUIRED` を返したときの運用者向けの固定文言（Issue #2176）。終了コードは他の拒否と
+/// 同じ 11 のまま、この文で「再同期が必要」だと区別できる。
+pub(crate) const RESYNC_REQUIRED_MESSAGE: &str = "wire-server: replica: resync required: the primary no longer retains changes after the applied position; rebuild the replica with replica-resync";
+
 /// 受信ループが終了する理由（終了コードへ写す）。
 #[derive(Debug, PartialEq, Eq)]
 pub enum Halt {
@@ -83,7 +88,7 @@ enum SessionEnd {
 }
 
 /// フレーム読み取りの失敗。
-enum FrameError {
+pub(crate) enum FrameError {
     /// 切断・タイムアウト・I/O エラー。
     Closed,
     /// 本体長が上限を超える。
@@ -92,6 +97,11 @@ enum FrameError {
 
 /// 受信ループ本体。停止すべき理由が出るまで戻らない（再接続はここで繰り返す）。
 pub fn run(core: &EngineCore, opts: &ReplicaOptions) -> Halt {
+    // 開始時にベースの変更ログが commit 番号と連続していることを確かめる（Issue #2176）。記録のない区間が
+    // あるベースへ `applied + 1` から続けると履歴が欠けるため、接続せずに適用停止にする。
+    if let Err(e) = core.check_replica_base() {
+        return apply_failure(&e);
+    }
     let mut backoff = INITIAL_BACKOFF;
     loop {
         match session(core, opts) {
@@ -118,7 +128,7 @@ fn with_jitter(base: Duration) -> Duration {
     base.saturating_add(Duration::from_millis(nanos % quarter))
 }
 
-fn be_u64(bytes: &[u8]) -> Option<u64> {
+pub(crate) fn be_u64(bytes: &[u8]) -> Option<u64> {
     Some(u64::from_be_bytes(bytes.try_into().ok()?))
 }
 
@@ -144,7 +154,7 @@ fn read_exact_by(stream: &TcpStream, buf: &mut [u8], deadline: Instant) -> Resul
 
 /// 1 フレームを読む。本体長は `max_body` 以内でなければ確保せずに `TooLarge`。本体は宣言長を一度に
 /// 確保せず、受け取った分ずつ伸ばす。
-fn read_frame(
+pub(crate) fn read_frame(
     stream: &TcpStream,
     max_body: usize,
     wait: Duration,
@@ -189,7 +199,7 @@ fn data_ready(stream: &TcpStream, wait: Duration) -> Option<bool> {
 }
 
 /// 1 フレームを書いて flush する。
-fn write_frame(stream: &TcpStream, ty: u8, parts: &[&[u8]]) -> std::io::Result<()> {
+pub(crate) fn write_frame(stream: &TcpStream, ty: u8, parts: &[&[u8]]) -> std::io::Result<()> {
     let total = parts
         .iter()
         .try_fold(0usize, |acc, p| acc.checked_add(p.len()))
@@ -205,7 +215,7 @@ fn write_frame(stream: &TcpStream, ty: u8, parts: &[&[u8]]) -> std::io::Result<(
 }
 
 /// プライマリの `E` コードを停止の分類へ写す。`None` は一時障害（再接続する）。
-fn classify_error(c: u8) -> Option<Halt> {
+pub(crate) fn classify_error(c: u8) -> Option<Halt> {
     match c {
         code::BUSY | code::INTERNAL | code::BACKPRESSURE => None,
         // FOREIGN・RESYNC_REQUIRED・AHEAD・AUTH_FAILED・BAD_REQUEST・未知のコードは、再接続しても
@@ -301,7 +311,7 @@ fn session(core: &EngineCore, opts: &ReplicaOptions) -> SessionEnd {
     stream_loop(core, opts, &stream, applied, primary_latest)
 }
 
-enum Handshake {
+pub(crate) enum Handshake {
     /// 期待した型のフレームの本体。
     Frame(Vec<u8>),
     /// プライマリの拒否（停止）。
@@ -311,12 +321,18 @@ enum Handshake {
 }
 
 /// ハンドシェイクのフレームを 1 つ読む。期待した型、または `E`。それ以外は停止（プロトコル違反）。
-fn read_handshake(stream: &TcpStream, expect: u8) -> Handshake {
+pub(crate) fn read_handshake(stream: &TcpStream, expect: u8) -> Handshake {
     match read_frame(stream, 64, HANDSHAKE_TIMEOUT) {
         Ok((ty, body)) if ty == expect && body.len() == 32 => Handshake::Frame(body),
         Ok((T_ERROR, body)) => match body.first().copied().and_then(classify_error) {
             Some(h) => {
-                engine::log_stderr!("wire-server: replica: the primary rejected the connection");
+                if body.first().copied() == Some(code::RESYNC_REQUIRED) {
+                    engine::log_stderr!("{RESYNC_REQUIRED_MESSAGE}");
+                } else {
+                    engine::log_stderr!(
+                        "wire-server: replica: the primary rejected the connection"
+                    );
+                }
                 Handshake::Rejected(h)
             }
             None => Handshake::Transient,
@@ -442,7 +458,13 @@ fn stream_loop(
                 }
                 return match body.first().copied().and_then(classify_error) {
                     Some(h) => {
-                        engine::log_stderr!("wire-server: replica: the primary reported an error");
+                        if body.first().copied() == Some(code::RESYNC_REQUIRED) {
+                            engine::log_stderr!("{RESYNC_REQUIRED_MESSAGE}");
+                        } else {
+                            engine::log_stderr!(
+                                "wire-server: replica: the primary reported an error"
+                            );
+                        }
                         SessionEnd::Halt(h)
                     }
                     None => transient,

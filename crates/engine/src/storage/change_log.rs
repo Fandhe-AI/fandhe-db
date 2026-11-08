@@ -68,6 +68,7 @@ pub(crate) mod oracle;
 mod oracle_tests;
 pub(crate) mod pitr;
 pub(crate) mod replica_apply;
+pub(crate) mod replica_base;
 pub(crate) mod stream;
 
 use super::table_image::{self, AfterImage, Meter, ReadMode, ReadOutcome};

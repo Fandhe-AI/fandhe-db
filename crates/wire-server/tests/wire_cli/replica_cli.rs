@@ -27,7 +27,7 @@ const EXIT_USAGE: i32 = 2;
 const EXIT_APPLY_HALTED: i32 = 10;
 const EXIT_PRIMARY_REJECTED: i32 = 11;
 
-struct ChildGuard(Child);
+pub(crate) struct ChildGuard(pub(crate) Child);
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
@@ -36,11 +36,11 @@ impl Drop for ChildGuard {
     }
 }
 
-fn run(args: &[&str]) -> Output {
+pub(crate) fn run(args: &[&str]) -> Output {
     Command::new(BIN).args(args).output().expect("run")
 }
 
-fn s(p: &Path) -> &str {
+pub(crate) fn s(p: &Path) -> &str {
     p.to_str().expect("utf-8 path")
 }
 
@@ -50,7 +50,7 @@ fn make_private_dir(path: &Path) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
 }
 
-fn phc_for(password: &str) -> String {
+pub(crate) fn phc_for(password: &str) -> String {
     let mut child = Command::new(BIN)
         .arg("hash-password")
         .stdin(Stdio::piped())
@@ -72,7 +72,7 @@ fn phc_for(password: &str) -> String {
 }
 
 /// `role:password` の資格情報ファイル（0600）を作る。
-fn write_credentials(dir: &Path, mode: u32) -> PathBuf {
+pub(crate) fn write_credentials(dir: &Path, mode: u32) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let p = dir.join("replica-credentials");
     std::fs::write(&p, format!("{ROLE}:{ROLE_PW}\n")).expect("credentials");
@@ -81,10 +81,10 @@ fn write_credentials(dir: &Path, mode: u32) -> PathBuf {
 }
 
 /// 子プロセスの標準エラーを行ごとに溜める。
-struct Lines(Arc<Mutex<Vec<String>>>);
+pub(crate) struct Lines(Arc<Mutex<Vec<String>>>);
 
 impl Lines {
-    fn attach(child: &mut Child) -> Self {
+    pub(crate) fn attach(child: &mut Child) -> Self {
         let stderr = child.stderr.take().expect("piped stderr");
         let buf = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&buf);
@@ -96,7 +96,7 @@ impl Lines {
         Self(buf)
     }
 
-    fn snapshot(&self) -> Vec<String> {
+    pub(crate) fn snapshot(&self) -> Vec<String> {
         self.0.lock().expect("lock").clone()
     }
 
@@ -116,7 +116,7 @@ impl Lines {
             .unwrap_or(0)
     }
 
-    fn wait_applied(&self, target: u64) {
+    pub(crate) fn wait_applied(&self, target: u64) {
         let deadline = Instant::now() + Duration::from_secs(60);
         while Instant::now() < deadline {
             if self.max_applied() >= target {
@@ -128,17 +128,22 @@ impl Lines {
     }
 }
 
-struct Primary {
+pub(crate) struct Primary {
     _fx: common::TempFixtureDir,
     _child: ChildGuard,
     tenant: SocketAddr,
-    repl: SocketAddr,
-    dir: PathBuf,
-    sock: PathBuf,
+    pub(crate) repl: SocketAddr,
+    pub(crate) dir: PathBuf,
+    pub(crate) sock: PathBuf,
 }
 
 impl Primary {
-    fn start(label: &str) -> Self {
+    pub(crate) fn start(label: &str) -> Self {
+        Self::start_with(label, &[])
+    }
+
+    /// 追加のサーバーフラグ（例: `--replication-max-lag-records`）つきで起動する。
+    pub(crate) fn start_with(label: &str, extra: &[&str]) -> Self {
         use std::os::unix::fs::PermissionsExt;
         let fx = common::TempFixtureDir::new(label);
         let users = fx.users_path_str();
@@ -171,6 +176,7 @@ impl Primary {
                 "--replication-allow",
                 "127.0.0.1",
             ])
+            .args(extra)
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
@@ -192,7 +198,7 @@ impl Primary {
         }
     }
 
-    fn session(&self) -> TenantSession {
+    pub(crate) fn session(&self) -> TenantSession {
         let stream = common::authenticate_to_ready_for_query(self.tenant, "alice", "pw-alice");
         stream
             .set_read_timeout(Some(Duration::from_secs(20)))
@@ -201,23 +207,23 @@ impl Primary {
     }
 }
 
-struct TenantSession(TcpStream);
+pub(crate) struct TenantSession(TcpStream);
 
 impl TenantSession {
-    fn exec(&mut self, sql: &str) {
+    pub(crate) fn exec(&mut self, sql: &str) {
         common::send_simple_query(&mut self.0, sql);
         let _ = common::read_command_complete(&mut self.0);
         common::read_ready_for_query(&mut self.0);
     }
 
-    fn insert(&mut self, id: u32) {
+    pub(crate) fn insert(&mut self, id: u32) {
         self.exec(&format!(
             "INSERT INTO docs (id, embedding) VALUES ({id}, '[0.1,0.2,0.3]')"
         ));
     }
 }
 
-fn spawn_replica(
+pub(crate) fn spawn_replica(
     db: &Path,
     primary: SocketAddr,
     cred: &Path,
@@ -237,7 +243,7 @@ fn spawn_replica(
 }
 
 /// レプリカの DB を開き直して `sql` の結果行数を返す（変更ログ有効の DB でも読み取りは通る）。
-fn count_rows(db: &Path, sql: &str) -> usize {
+pub(crate) fn count_rows(db: &Path, sql: &str) -> usize {
     let storage = Storage::open(db).expect("open");
     let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
     let ctx =
@@ -331,14 +337,14 @@ enum Bad {
     ResyncRequired,
 }
 
-fn frame(ty: u8, body: &[u8]) -> Vec<u8> {
+pub(crate) fn frame(ty: u8, body: &[u8]) -> Vec<u8> {
     let mut f = vec![ty];
     f.extend_from_slice(&u32::try_from(body.len()).expect("len").to_be_bytes());
     f.extend_from_slice(body);
     f
 }
 
-fn read_frame(stream: &mut TcpStream) -> Option<(u8, Vec<u8>)> {
+pub(crate) fn read_frame(stream: &mut TcpStream) -> Option<(u8, Vec<u8>)> {
     let mut h = [0u8; 5];
     stream.read_exact(&mut h).ok()?;
     let len = u32::from_be_bytes([h[1], h[2], h[3], h[4]]) as usize;
@@ -481,6 +487,17 @@ fn run_against_fake_primary(label: &str, bad: Bad) {
     for l in lines.snapshot() {
         assert!(!l.contains(ROLE_PW), "password leaked: {l}");
     }
+    // 再同期が必要なときだけ、固有の文言で他の拒否と区別できる（終了コードは 11 のまま。Issue #2176）。
+    let resync_line = lines
+        .snapshot()
+        .iter()
+        .any(|l| l.contains("resync required"));
+    assert_eq!(
+        resync_line,
+        matches!(bad, Bad::ResyncRequired),
+        "{:?}",
+        lines.snapshot()
+    );
 }
 
 #[test]

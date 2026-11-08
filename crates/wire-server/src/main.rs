@@ -442,6 +442,10 @@
 //! 追従させ、変更を commit 番号順に原子的に適用する（`wire_server::replica_opt`・`wire_server::replica`）。
 //! 接続先はループバックのみ。終了コード 10＝適用停止、11＝プライマリの拒否、2＝引数の不備。
 //!
+//! `replica-resync --socket <path> --out <path> --primary <ip:port> --credentials <file>`（Issue #2176・
+//! RECOVER-15 ポインタ）: レプリカの再同期。プライマリのバックアップソケットからフルバックアップを取り、整合・
+//! 変更ログの連続性・プライマリへの確認を通ったものだけを新しいレプリカ DB として公開する
+//! （`wire_server::replica_resync_opt`・`wire_server::replica_resync`）。
 //! `--replica-primary <ip:port>`・`--replica-credentials <file>`（任意で `--replica-max-backoff-secs`・
 //! `--replica-batch-records`・`--replica-batch-bytes`。Issue #2175・RECOVER-15 ポインタ）: 読み取りレプリカモード。
 //! 通常のテナント向けリスナーと `replica` サブコマンドの適用ループを同じプロセスで動かし、書き込み・DDL・`COPY FROM` は
@@ -622,6 +626,9 @@ fn main() -> ExitCode {
     }
     if args.get(1).map(String::as_str) == Some("replica") {
         return run_replica(&args[2..]);
+    }
+    if args.get(1).map(String::as_str) == Some("replica-resync") {
+        return run_replica_resync(&args[2..]);
     }
 
     run_server(&args)
@@ -4569,6 +4576,47 @@ fn run_replica(args: &[String]) -> ExitCode {
 #[cfg(not(unix))]
 fn run_replica(_args: &[String]) -> ExitCode {
     engine::log_stderr!("wire-server: replica is supported only on unix platforms");
+    ExitCode::from(wire_server::backup_opt::EXIT_USAGE)
+}
+
+/// `replica-resync --socket <path> --out <path> --primary <ip:port> --credentials <file>` サブコマンド
+/// （Issue #2176・RECOVER-15・RECOVER-13 ポインタ）。プライマリのバックアップソケットからフルバックアップを
+/// 取り、整合・変更ログの連続性・プライマリへの確認を通ったものだけを新しいレプリカ DB として `--out` へ公開する。
+/// 手順と終了コードは `wire_server::replica_resync`・`wire_server::replica_resync_opt`。標準出力は成功時の
+/// 要約（切り替え点の LSN。運用者向けでテナントからは見えない）だけで、失敗の報告は標準エラーへ出す。
+#[cfg(unix)]
+fn run_replica_resync(args: &[String]) -> ExitCode {
+    use wire_server::{replica_resync, replica_resync_opt};
+
+    let opts = match replica_resync_opt::parse(args) {
+        Ok(o) => o,
+        Err(msg) => {
+            engine::log_stderr!("wire-server: replica-resync: {msg}");
+            return ExitCode::from(replica_resync_opt::EXIT_USAGE);
+        }
+    };
+    let mut leftover = None;
+    let result = replica_resync::resync(&opts, &mut leftover);
+    if let Some(p) = &leftover {
+        report_leftover("replica-resync", p);
+    }
+    match result {
+        Ok(lsn) => {
+            if write_stdout(&format!("replica-resync written: base_lsn={lsn}\n")).is_err() {
+                return ExitCode::from(replica_resync_opt::EXIT_FAILURE);
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            engine::log_stderr!("wire-server: replica-resync: {e}");
+            ExitCode::from(e.exit_code())
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn run_replica_resync(_args: &[String]) -> ExitCode {
+    engine::log_stderr!("wire-server: replica-resync is supported only on unix platforms");
     ExitCode::from(wire_server::backup_opt::EXIT_USAGE)
 }
 
