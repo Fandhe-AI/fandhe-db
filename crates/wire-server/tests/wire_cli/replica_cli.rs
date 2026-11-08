@@ -337,14 +337,14 @@ enum Bad {
     ResyncRequired,
 }
 
-fn frame(ty: u8, body: &[u8]) -> Vec<u8> {
+pub(crate) fn frame(ty: u8, body: &[u8]) -> Vec<u8> {
     let mut f = vec![ty];
     f.extend_from_slice(&u32::try_from(body.len()).expect("len").to_be_bytes());
     f.extend_from_slice(body);
     f
 }
 
-fn read_frame(stream: &mut TcpStream) -> Option<(u8, Vec<u8>)> {
+pub(crate) fn read_frame(stream: &mut TcpStream) -> Option<(u8, Vec<u8>)> {
     let mut h = [0u8; 5];
     stream.read_exact(&mut h).ok()?;
     let len = u32::from_be_bytes([h[1], h[2], h[3], h[4]]) as usize;
@@ -487,6 +487,17 @@ fn run_against_fake_primary(label: &str, bad: Bad) {
     for l in lines.snapshot() {
         assert!(!l.contains(ROLE_PW), "password leaked: {l}");
     }
+    // 再同期が必要なときだけ、固有の文言で他の拒否と区別できる（終了コードは 11 のまま。Issue #2176）。
+    let resync_line = lines
+        .snapshot()
+        .iter()
+        .any(|l| l.contains("resync required"));
+    assert_eq!(
+        resync_line,
+        matches!(bad, Bad::ResyncRequired),
+        "{:?}",
+        lines.snapshot()
+    );
 }
 
 #[test]

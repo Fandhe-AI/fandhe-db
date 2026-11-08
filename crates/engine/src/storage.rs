@@ -65,6 +65,7 @@ pub use change_log::incremental::{
 };
 pub use change_log::pitr::{restore_to_point, PitrTarget};
 pub use change_log::replica_apply::{ReplicaApplyError, ReplicaApplyReport, MAX_APPLY_RECORDS};
+pub use change_log::replica_base::replica_base_point_of;
 pub use change_log::stream::{
     ChangeLogBatch, ReplicaPin, StreamError, StreamIdentity, MAX_RECORD_BYTES,
 };
