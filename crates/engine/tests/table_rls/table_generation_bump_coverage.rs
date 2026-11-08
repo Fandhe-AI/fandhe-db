@@ -92,18 +92,18 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // `catalog/*.rs` の各エントリも同じ理由で移動している）。
     // Issue #3069（`change_log_on_disk`・連続性検査・保留した移行の追加）で行番号が移動したための追随。
     // Issue #2167（アーカイブ・保持の公開 API と `begin_maintenance_txn` の追加。+44 行）で追随（旧: 1348／1382）。
-    ("storage.rs", 1592), // base 取り込み（Issue #3125 系の +3 行）で追随（旧: 1589）。Issue #3099（export_incremental_with_archive。+22 行）で追随（旧: 1567）。Issue #3093 で追随（旧: 1566）。Issue #3092 で追随（旧: 1543）。Issue #3091 で追随（旧: 1477）。Issue #2174（begin_replica_apply_txn 等。+22 行）で追随（旧: 1420／1454）
+    ("storage.rs", 1593), // Issue #2176（+1）で追随。base 取り込み（Issue #3125 系の +3 行）で追随（旧: 1589）。Issue #3099（export_incremental_with_archive。+22 行）で追随（旧: 1567）。Issue #3093 で追随（旧: 1566）。Issue #3092 で追随（旧: 1543）。Issue #3091 で追随（旧: 1477）。Issue #2174（begin_replica_apply_txn 等。+22 行）で追随（旧: 1420／1454）
     // Issue #2175（読み取りレプリカの `read_replica` フラグ等。+35 行）で追随（旧: 1442／1476／1200）。対象は変わらない。
-    ("storage.rs", 1626), // base 取り込み（Issue #3125 系の +3 行）で追随（旧: 1623）。Issue #3099 で追随（旧: 1601）。Issue #3093 で追随（旧: 1600）。Issue #3092 で追随（旧: 1577）。Issue #3091 で追随（旧: 1511）
+    ("storage.rs", 1627), // Issue #2176（+1）で追随。base 取り込み（Issue #3125 系の +3 行）で追随（旧: 1623）。Issue #3099 で追随（旧: 1601）。Issue #3093 で追随（旧: 1600）。Issue #3092 で追随（旧: 1577）。Issue #3091 で追随（旧: 1511）
     // Issue #3067: `Storage::enable_change_log` が DB 識別子の永続化に使う保守 commit
     // （`commit_boundary::commit_maintenance`）。書き込むのは `change_log_meta` 表だけで、`CATALOG_TABLE`・
     // `user_rows` には触れず、世代も進めない（バンプ対象の表が構造的に存在しない）。
     // Issue #2174（`begin_replica_apply_txn` の追加。+1 行）で追随（旧: 1199）。
-    ("storage.rs", 1266), // Issue #3093 で追随（旧: 1265）。Issue #3092 で追随（旧: 1257）。Issue #3091（`enable_change_log_with_unarchived_limit` の追加）で追随（旧: 1224）
+    ("storage.rs", 1267), // Issue #2176（+1）で追随。Issue #3093 で追随（旧: 1265）。Issue #3092 で追随（旧: 1257）。Issue #3091（`enable_change_log_with_unarchived_limit` の追加）で追随（旧: 1224）
     // Issue #3091: `Storage::apply_unarchived_limit` が未アーカイブ量の数え値の数え直しを書く保守 commit。
     // 書き込むのは変更ログのメタ表（数え値）だけで、`CATALOG_TABLE`・`user_rows` には触れず、
     // 世代も進めない（バンプ対象の表が構造的に存在しない）。
-    ("storage.rs", 1307), // Issue #3093 で追随（旧: 1306）。Issue #3092 で追随（旧: 1298）
+    ("storage.rs", 1308), // Issue #2176（+1）で追随。Issue #3093 で追随（旧: 1306）。Issue #3092 で追随（旧: 1298）
     // Issue #3067: `storage/change_log.rs` のテスト内の commit 入口（`commit_result`・`commit_maint`）。
     // 変更ログの `change_log` 表・メタ表と任意の試験用 redb 表だけを書くテスト fixture で、
     // `user_rows/{table_name}` を経由しないため対象外。
@@ -124,9 +124,9 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // テーブル世代もプライマリ側のバンプ結果が同じレコードに含まれて複製される。レプリカ側で
     // 独自にバンプするとプライマリとの世代が食い違うため、ここでは呼ばない（`user_rows/{table}` の変更は
     // 必ず同じレコードの世代更新を伴う。伴わない場合の検出はプライマリ側の本テストが担う）。
-    ("storage/change_log/replica_apply.rs", 214),
-    ("storage/change_log.rs", 1600), // Issue #2245 の mod 宣言追加で追随（旧: 1597）。Issue #3091 のテスト fixture 追加で追随（旧: 1582）
-    ("storage/change_log.rs", 1608), // Issue #2245 で追随（旧: 1605）。Issue #3091 で追随（旧: 1590）
+    ("storage/change_log/replica_apply.rs", 219), // Issue #2176 で追随（旧: 214）
+    ("storage/change_log.rs", 1601), // Issue #2176・Issue #2245 の mod 宣言追加で追随（旧: 1597）。Issue #3091 のテスト fixture 追加で追随（旧: 1582）
+    ("storage/change_log.rs", 1609), // Issue #2176（+1）・Issue #2245 で追随（旧: 1605）。Issue #3091 で追随（旧: 1590）
     ("recovery/panic_hook.rs", 404),
     ("txn.rs", 211),
     ("txn.rs", 388),
