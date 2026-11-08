@@ -494,7 +494,15 @@ redb トランザクションで DB 内の `change_log` 表へ追記されます
   プライマリの `--replication-bind` に追従させます。受け取った変更を commit 番号順に原子的に適用して適用位置を永続化し、
   再接続・再起動では適用位置から再開します。順序違反・分岐・識別子や版数の不一致は何も適用せず終了コード 10 で停止し、
   プライマリの拒否は終了コード 11 で報告します。接続先は**ループバックのみ**（TLS は #2177）、資格情報は
-  `role:password` の 1 行のファイル（group／other から読めない権限）で渡します。読み取りレプリカの受け付けと再同期は後続の Issue です。
+  `role:password` の 1 行のファイル（group／other から読めない権限）で渡します。再同期は後続の Issue です。
+
+**読み取りレプリカモード**（Issue #2175。RECOVER-15 ポインタ。判断は [docs/design/replication-streaming.md](docs/design/replication-streaming.md) の「実装判断（Issue #2175）」）:
+
+- `wire-server --users <file> --db <base> --replica-primary <ip:port> --replica-credentials <file>` で、適用ループと通常の
+  テナント向けリスナー（SQL・NoSQL）を同じプロセスで動かします。読み取りは適用済みの commit 境界の状態を返し、
+  書き込み・DDL・`COPY FROM`・明示 `READ WRITE` は `25006` で拒否します（行・カタログ・採番は変わりません）。
+- 適用の遅延は標準エラーだけで観測できます（テナントのセッションからは参照できません）。適用が停止したらプロセスを終了します
+  （終了コード 10・11）。`--change-log`・`--replication-*`・`--backup-socket` とは併用できず、ベースでない DB は起動拒否です。
 
 **レプリケーション送信側**（Issue #2173。RECOVER-15・WIRE-9 ポインタ。判断は [docs/design/replication-streaming.md](docs/design/replication-streaming.md) の「実装判断（Issue #2173）」）:
 
