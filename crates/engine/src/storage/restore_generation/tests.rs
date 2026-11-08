@@ -179,3 +179,63 @@ fn it_refuses_a_storage_with_the_change_log_enabled() {
     storage.enable_change_log().expect("enable");
     assert!(storage.advance_restore_generation_with_floor(0).is_err());
 }
+
+#[test]
+fn from_source_is_larger_than_the_source_on_a_fresh_database() {
+    let path = unique_db_path("rg-src-fresh");
+    let _g = CleanupGuard(path.clone());
+    let mut storage = Storage::open(&path).expect("open");
+    let v = storage
+        .advance_restore_generation_with_floor_and_source(0, 500)
+        .expect("advance");
+    assert_eq!(v, 501);
+    assert_eq!(storage.restore_generation().expect("read"), 501);
+}
+
+#[test]
+fn from_source_is_larger_than_both_stored_and_source() {
+    let path = unique_db_path("rg-src-both");
+    let _g = CleanupGuard(path.clone());
+    let mut storage = Storage::open(&path).expect("open");
+    storage
+        .advance_restore_generation_with_floor(100)
+        .expect("seed");
+    // 保存値 100 > source 7、保存値 100 < source 900 の両方。
+    assert_eq!(
+        storage
+            .advance_restore_generation_with_floor_and_source(0, 7)
+            .expect("small source"),
+        101
+    );
+    assert_eq!(
+        storage
+            .advance_restore_generation_with_floor_and_source(0, 900)
+            .expect("large source"),
+        901
+    );
+}
+
+#[test]
+fn from_source_at_or_above_the_limit_is_rejected_without_writing() {
+    let path = unique_db_path("rg-src-limit");
+    let _g = CleanupGuard(path.clone());
+    let mut storage = Storage::open(&path).expect("open");
+    assert!(storage
+        .advance_restore_generation_with_floor_and_source(0, MAX_RESTORE_GENERATION)
+        .is_err());
+    assert!(storage
+        .advance_restore_generation_with_floor_and_source(0, MAX_RESTORE_GENERATION + 1)
+        .is_err());
+    assert_eq!(storage.restore_generation().expect("read"), 0);
+}
+
+#[test]
+fn the_public_from_source_api_uses_the_real_clock() {
+    let path = unique_db_path("rg-src-pub");
+    let _g = CleanupGuard(path.clone());
+    let mut storage = Storage::open(&path).expect("open");
+    let v = storage
+        .advance_restore_generation_from_source(10)
+        .expect("advance");
+    assert!(v > 10);
+}

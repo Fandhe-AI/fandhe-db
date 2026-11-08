@@ -3,8 +3,8 @@
 //!
 //! 責務境界: データベース全体で 1 つの値（テナント情報を含まない）を専用の redb 表に持ち、
 //! [`Storage::restore_generation`] で読み、[`Storage::advance_restore_generation`] で進める。
-//! 呼び出し元は wire-server の `restore`（物理の復元の完了点）で、PITR（#2450）・論理の復元（#2451）
-//! も完了点で同じ API を呼ぶ。セッションからの参照（#2449）は読み取り側を使い、構文は `SHOW restore_generation`（engine の `core.rs`）。
+//! 呼び出し元は wire-server の `restore`（物理の復元の完了点）で、PITR（#2450）も完了点で同じ API を呼ぶ。
+//! 論理の復元（#2451）は [`Storage::advance_restore_generation_from_source`] でダンプが運ぶ復元元の世代を下限に入れる。セッションからの参照（#2449）は読み取り側を使い、構文は `SHOW restore_generation`（engine の `core.rs`）。
 //!
 //! 値が壊れている・欠けている・上限に達した場合は黙って補わず `Err` とする（fail-closed）。
 //! 書き込みは変更ログの記録に関与しない保守 commit で行う。
@@ -85,8 +85,27 @@ impl Storage {
         self.advance_restore_generation_with_floor(clock_floor()?)
     }
 
+    /// 復元元の世代 `source` を下限に入れて世代を進める（RECOVER-17・Issue #2451）。論理の復元
+    /// （wire-server の `dump-restore`）が使う。復元先は新規の DB で保存値が 0 のため、ダンプの
+    /// ヘッダが運ぶ復元元の世代を `max(保存値, source)` として使わないと「復元元より大きい」を
+    /// 保証できない。新しい値は `max(保存値, source) + 1` と時計の下限の大きい方で、`source` が
+    /// 上限を超える・上限ちょうどのときは `Err`（丸めない）。他の条件は [`Self::advance_restore_generation`]
+    /// と同じ（変更ログ有効・一時表用ストレージは拒否・失敗時は何も書かない）。
+    pub fn advance_restore_generation_from_source(&mut self, source: u64) -> Result<u64> {
+        self.advance_restore_generation_with_floor_and_source(clock_floor()?, source)
+    }
+
     /// [`Self::advance_restore_generation`] の下限指定版（時計に依存しないテストが使う）。
     pub(crate) fn advance_restore_generation_with_floor(&mut self, floor: u64) -> Result<u64> {
+        self.advance_restore_generation_with_floor_and_source(floor, 0)
+    }
+
+    /// 下限（時計）と復元元の世代の両方を指定する共通経路。
+    pub(crate) fn advance_restore_generation_with_floor_and_source(
+        &mut self,
+        floor: u64,
+        source: u64,
+    ) -> Result<u64> {
         if self.temp_scoped || self.change_log.is_some() {
             return Err(StorageError::Codec(
                 "restore generation can only be advanced on a closed restore target".to_string(),
@@ -96,12 +115,12 @@ impl Storage {
         // 拒否される。この保守 commit は記録対象を持たないので、`enable_change_log` と同じく
         // 検査を一時的に外し、結果にかかわらず戻す。
         let guard = std::mem::replace(&mut self.change_log_on_disk, false);
-        let result = self.advance_in_txn(floor);
+        let result = self.advance_in_txn(floor, source);
         self.change_log_on_disk = guard;
         result
     }
 
-    fn advance_in_txn(&self, floor: u64) -> Result<u64> {
+    fn advance_in_txn(&self, floor: u64, source: u64) -> Result<u64> {
         let txn = self.begin_write_txn()?;
         // `open_table` は未存在の表を作成してしまうため、作成前に存在を確かめる。0 を許すのは表が
         // 無かった場合（新規作成した DB）だけで、既存の表からキーが欠けた状態は拒否する（fail-closed）。
@@ -117,7 +136,7 @@ impl Storage {
             None if !table_existed => 0,
             None => return Err(invalid()),
         };
-        let next = next_generation(current, floor)?;
+        let next = next_generation(current.max(source), floor)?;
         table.insert(KEY, next.to_le_bytes().as_slice())?;
         drop(table);
         crate::recovery::commit_boundary::commit_maintenance(txn)?;
