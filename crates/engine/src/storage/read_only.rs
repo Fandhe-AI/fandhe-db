@@ -22,6 +22,11 @@
 //!   書き込み経路は redb 内部で到達しない分岐になっており、仮に呼ばれても書き込まずに中断する。
 //! - 閉じるとき（drop）も `Database` と違い、アロケータ状態やヘッダを書かない。
 //!
+//! # 壊れたファイル
+//!
+//! redb 内部の panic は `panic_boundary` で受け止め、open は [`ReadOnlyOpenError::Failed`]、検査は
+//! [`IntegrityError::Backend`] にする（Issue #3101）。
+//!
 //! # ロック
 //!
 //! 共有ロックなので、読み取り専用の open 同士は並行できる。稼働中のサーバー（排他ロック保持）とは
@@ -32,6 +37,7 @@ use std::path::Path;
 use redb::ReadableDatabase as _;
 
 use super::integrity::{verify_in_txn, IntegrityError, IntegrityOptions, IntegrityReport};
+use super::panic_boundary;
 
 /// [`ReadOnlyStorage::open`] の失敗。`Display` は固定の英語文言で、パス・内容を含まない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,7 +48,8 @@ pub enum ReadOnlyOpenError {
     /// 開くには書き込みが要る（異常終了後の修復、または redb ファイル形式の更新）。
     /// 書かずに拒否した。呼び出し元は、コピーを作ってそちらを開く等の別経路を選べる。
     NeedsWrite,
-    /// その他の失敗（存在しない・空・DB ファイルではない・破損・入出力エラー）。
+    /// その他の失敗（存在しない・空・DB ファイルではない・破損・入出力エラー。アロケータ状態表などの破損で
+    /// redb 内部が panic した場合も境界で受け止めてここへ倒す。Issue #3101）。
     /// 空のファイルや存在しないパスを新規作成することはない。
     Failed,
 }
@@ -69,7 +76,14 @@ impl ReadOnlyStorage {
     /// 作らず、書き込みを要する状態（修復・形式更新）なら書かずに [`ReadOnlyOpenError::NeedsWrite`]
     /// で拒否する。`Storage::open` の挙動は変えない。
     pub fn open(path: impl AsRef<Path>) -> Result<Self, ReadOnlyOpenError> {
-        match redb::ReadOnlyDatabase::open(path) {
+        let path = path.as_ref();
+        // redb が壊れたアロケータ状態表で panic しても落とさず拒否する（Issue #3101）。
+        let Some(opened) =
+            panic_boundary::catch_backend_panic(|| redb::ReadOnlyDatabase::open(path))
+        else {
+            return Err(ReadOnlyOpenError::Failed);
+        };
+        match opened {
             Ok(db) => Ok(Self { db }),
             Err(redb::DatabaseError::DatabaseAlreadyOpen) => Err(ReadOnlyOpenError::InUse),
             Err(redb::DatabaseError::RepairAborted | redb::DatabaseError::UpgradeRequired(_)) => {
@@ -86,8 +100,12 @@ impl ReadOnlyStorage {
         &self,
         options: &IntegrityOptions,
     ) -> Result<IntegrityReport, IntegrityError> {
-        let read = self.db.begin_read().map_err(|_| IntegrityError::Backend)?;
-        Ok(verify_in_txn(&read, options))
+        // 壊れたページを読んで redb 内部が panic した場合も `Backend` にする（Issue #3101）。
+        panic_boundary::catch_backend_panic(|| {
+            let read = self.db.begin_read().map_err(|_| IntegrityError::Backend)?;
+            Ok(verify_in_txn(&read, options))
+        })
+        .unwrap_or(Err(IntegrityError::Backend))
     }
 
     /// 変更ログのアーカイブ先の連鎖を、この DB のメタ情報（DB 識別子・timeline・有効化時の世代・水位）と
@@ -324,5 +342,74 @@ mod tests {
             Some(ReadOnlyOpenError::Failed)
         );
         assert_eq!(std::fs::read(&junk).unwrap(), vec![0xAB; 8192]);
+    }
+
+    use crate::test_util::corrupt_allocator_state::{patch_allocator_state_keys, Corruption};
+
+    const KINDS: [Corruption; 2] = [
+        Corruption::InvalidTransactionIdTag,
+        Corruption::HiddenRegionTracker,
+    ];
+
+    fn corrupted_db(dir: &TempDir, how: Corruption) -> (std::path::PathBuf, Vec<u8>) {
+        let path = clean_db(dir);
+        let clean = std::fs::read(&path).unwrap();
+        let mut bytes = clean.clone();
+        assert!(patch_allocator_state_keys(&mut bytes, how) >= 1);
+        std::fs::write(&path, &bytes).unwrap();
+        (path, clean)
+    }
+
+    /// 前提確認: 素の redb は壊れたアロケータ状態表で panic する。redb を更新して panic しなくなったら
+    /// 境界の要否ごと見直す（redb は `=4.2.0` 固定。Issue #3101）。
+    #[test]
+    fn raw_redb_panics_on_corrupted_allocator_state() {
+        for how in KINDS {
+            let dir = TempDir::new("ro-raw");
+            let (path, _) = corrupted_db(&dir, how);
+            let r = std::panic::catch_unwind(|| redb::ReadOnlyDatabase::open(&path).map(|_| ()));
+            assert!(r.is_err(), "{how:?} did not panic");
+        }
+    }
+
+    #[test]
+    fn corrupted_allocator_state_read_only_open_fails_without_panic() {
+        for how in KINDS {
+            let dir = TempDir::new("ro-corrupt");
+            let (path, _) = corrupted_db(&dir, how);
+            let before = std::fs::read(&path).unwrap();
+            assert_eq!(
+                ReadOnlyStorage::open(&path).err(),
+                Some(ReadOnlyOpenError::Failed)
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn corrupted_allocator_state_writable_open_fails_without_panic() {
+        for how in KINDS {
+            let dir = TempDir::new("rw-corrupt");
+            let (path, _) = corrupted_db(&dir, how);
+            let before = std::fs::read(&path).unwrap();
+            assert!(matches!(
+                Storage::open(&path).err(),
+                Some(crate::storage::StorageError::Backend(_))
+            ));
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn lock_is_released_after_caught_panic() {
+        for how in KINDS {
+            let dir = TempDir::new("lock-corrupt");
+            let (path, clean) = corrupted_db(&dir, how);
+            assert!(ReadOnlyStorage::open(&path).is_err());
+            assert!(Storage::open(&path).is_err());
+            std::fs::write(&path, &clean).unwrap();
+            drop(ReadOnlyStorage::open(&path).unwrap());
+            drop(Storage::open(&path).unwrap());
+        }
     }
 }
