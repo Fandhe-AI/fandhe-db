@@ -27,6 +27,7 @@
 //! 一度有効にした DB は、有効にしない起動からの書き込みを `54000` で拒否し、再有効化では記録の連続性
 //! （最後のレコードの LSN か初回有効化時の世代が現在の世代と一致すること）を検査する（D8・D11）。
 //! アーカイブと保持（外部セグメントへの書き出し・水位・刈り込み・検証）は [`archive`]（Issue #2167。D6）。
+//! レプリカ側の適用（ストリーミング受信したレコードの原子的な適用。Issue #2174）は [`replica_apply`]。
 //! 未使用項目の警告は、後続（復元）が使う項目があるため抑止している。
 //!
 //! # オラクル試験（D1 の層 3）
@@ -66,6 +67,7 @@ pub(crate) mod oracle;
 #[cfg(test)]
 mod oracle_tests;
 pub(crate) mod pitr;
+pub(crate) mod replica_apply;
 pub(crate) mod stream;
 
 use super::table_image::{self, AfterImage, Meter, ReadMode, ReadOutcome};

@@ -4338,6 +4338,33 @@ impl EngineCore {
         self.storage.pin_change_log_for_replica(applied_lsn)
     }
 
+    /// レプリカが適用済みの最後の LSN（再開位置。RECOVER-15・Issue #2174）。wire-server のレプリカ
+    /// 受信ループが呼ぶ。[`crate::storage::Storage::replica_applied_lsn`] へ委譲する。
+    pub fn replica_applied_lsn(
+        &self,
+    ) -> std::result::Result<u64, crate::storage::ReplicaApplyError> {
+        self.storage.replica_applied_lsn()
+    }
+
+    /// レプリカの DB 識別子と timeline（RECOVER-15・Issue #2174）。[`crate::storage::Storage::replica_identity`] へ委譲する。
+    pub fn replica_identity(
+        &self,
+    ) -> std::result::Result<crate::storage::StreamIdentity, crate::storage::ReplicaApplyError>
+    {
+        self.storage.replica_identity()
+    }
+
+    /// 受信した変更ログのレコード列を、LSN 順に 1 トランザクションで原子的に適用する
+    /// （RECOVER-15・Issue #2174）。[`crate::storage::Storage::apply_replicated_records`] へ委譲する。テナントの
+    /// セッションを経由せず、SQL・NoSQL の表層からは呼べない。
+    pub fn apply_replicated_records(
+        &self,
+        records: &[(u64, Vec<u8>)],
+    ) -> std::result::Result<crate::storage::ReplicaApplyReport, crate::storage::ReplicaApplyError>
+    {
+        self.storage.apply_replicated_records(records)
+    }
+
     /// 結合ではなくモジュール内テストが登録簿などの内部状態へ届くための入口
     /// （Issue #1129 の同時実行数上限のテスト用。本番ビルドには含めない）。
     #[cfg(test)]

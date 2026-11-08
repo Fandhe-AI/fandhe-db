@@ -53,6 +53,7 @@ pub use change_log::incremental::{
     IncrementalSummary,
 };
 pub use change_log::pitr::{restore_to_point, PitrTarget};
+pub use change_log::replica_apply::{ReplicaApplyError, ReplicaApplyReport, MAX_APPLY_RECORDS};
 pub use change_log::stream::{
     ChangeLogBatch, ReplicaPin, StreamError, StreamIdentity, MAX_RECORD_BYTES,
 };
@@ -1285,6 +1286,22 @@ impl Storage {
         };
         let txn = self.begin_write_txn_raw()?;
         self.wrap_gated(txn, permit).map(Some)
+    }
+
+    /// レプリカの適用専用の書き込みトランザクション（RECOVER-15・Issue #2174）。
+    /// [`Self::wrap_gated`] の `DisabledOnEnabledDb` 検査を通らない唯一の入口で、
+    /// `change_log::replica_apply` だけが呼ぶ（利用者の書き込みはこの入口に到達できない）。
+    /// capture frame も commit 記録も持たない（レコード本体が世代表の更新を含み、`change_log` 表への
+    /// 追記も適用側が同じトランザクションで行うため。二重記録を避ける）。
+    pub(in crate::storage) fn begin_replica_apply_txn(&self) -> Result<GatedWriteTxn> {
+        let permit = self.acquire_writer_permit()?;
+        let txn = self.begin_write_txn_raw()?;
+        Ok(GatedWriteTxn {
+            capture: None,
+            recording: None,
+            txn: Box::new(txn),
+            _permit: permit,
+        })
     }
 
     /// 変更ログを有効にした DB を、有効にしないまま開いているか。真の間は書き込みを
