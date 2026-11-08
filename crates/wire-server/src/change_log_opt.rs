@@ -11,6 +11,10 @@
 //! - `--change-log-retain-records <n>`: アーカイブ済みのレコードのうち新しい `n` 件を DB に残して、より古い
 //!   ものを刈り込む。指定しなければ刈り込まない（既定）。`--change-log-archive-dir` なしは起動拒否
 //! - `--change-log-archive-interval-secs <n>`: 書き出しの周期（秒）。`--change-log-archive-dir` なしは起動拒否
+//! - `--change-log-max-unarchived-bytes <n>`・`--change-log-max-unarchived-records <n>`: 未アーカイブの変更ログ量の
+//!   上限（1 以上。Issue #3091・RECOVER-14 (2) ポインタ）。超過すると利用者の書き込みを `54000` で拒否し、
+//!   アーカイブが進めば再開する。`--change-log-archive-dir` なしは起動拒否。アーカイブ先を指定した起動では
+//!   バイト上限に実装既定値（[`DEFAULT_MAX_UNARCHIVED_BYTES`]。spec 由来ではない）を適用する
 //! - `change-log-verify` サブコマンド: アーカイブの欠落・改ざんの検査（[`parse_verify`]）
 //!
 //! 重複指定・不正値・組み合わせの不備は起動拒否で、エラー文は固定の英語（パス・値を含まない）。
@@ -48,6 +52,16 @@ pub const RETAIN_RECORDS_FLAG: &str = "--change-log-retain-records";
 /// 書き出し周期（秒）のフラグ名。
 pub const INTERVAL_FLAG: &str = "--change-log-archive-interval-secs";
 
+/// 未アーカイブのバイト上限のフラグ名。
+pub const MAX_UNARCHIVED_BYTES_FLAG: &str = "--change-log-max-unarchived-bytes";
+/// 未アーカイブの件数上限のフラグ名。
+pub const MAX_UNARCHIVED_RECORDS_FLAG: &str = "--change-log-max-unarchived-records";
+
+/// アーカイブ先を指定した起動に適用する、未アーカイブのバイト上限の既定（4 GiB）。実装既定値で
+/// spec 由来ではない。アーカイブ先が無い構成には適用しない（全レコードが未アーカイブになり、
+/// 上限到達後は書き込みが永久に止まって回復できないため）。
+pub const DEFAULT_MAX_UNARCHIVED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
 /// 書き出し周期の既定（秒）。実装既定値で spec 由来ではない。
 pub const DEFAULT_INTERVAL_SECS: u64 = 10;
 /// 書き出し周期の上限（秒。1 日）。
@@ -56,6 +70,12 @@ pub const MAX_INTERVAL_SECS: u64 = 86_400;
 /// アーカイブ系フラグを `--change-log` なしで指定したときの固定文言。
 pub const ARCHIVE_NEEDS_CHANGE_LOG_MESSAGE: &str =
     "--change-log-archive-dir, --change-log-retain-records and --change-log-archive-interval-secs require --change-log";
+/// 未アーカイブ量の上限フラグを `--change-log` なしで指定したときの固定文言。
+pub const UNARCHIVED_NEEDS_CHANGE_LOG_MESSAGE: &str =
+    "--change-log-max-unarchived-bytes and --change-log-max-unarchived-records require --change-log";
+/// 未アーカイブ量の上限フラグを `--change-log-archive-dir` なしで指定したときの固定文言。
+pub const UNARCHIVED_NEEDS_ARCHIVE_DIR_MESSAGE: &str =
+    "--change-log-max-unarchived-bytes and --change-log-max-unarchived-records require --change-log-archive-dir";
 /// 保持・周期を `--change-log-archive-dir` なしで指定したときの固定文言。
 pub const NEEDS_ARCHIVE_DIR_MESSAGE: &str =
     "--change-log-retain-records and --change-log-archive-interval-secs require --change-log-archive-dir";
@@ -90,6 +110,10 @@ pub struct ArchiveSettings {
     pub retain_records: Option<u64>,
     /// 書き出しの周期。
     pub interval: Duration,
+    /// 未アーカイブのレコード件数の上限（指定時のみ。`None` は件数の上限なし）。
+    pub max_unarchived_records: Option<u64>,
+    /// 未アーカイブのバイト数の上限（指定がなければ [`DEFAULT_MAX_UNARCHIVED_BYTES`]）。
+    pub max_unarchived_bytes: Option<u64>,
 }
 
 /// 同じフラグの重複指定を拒否する固定文言（フラグ名ごと）。
@@ -151,6 +175,28 @@ pub fn accept_interval_secs(already_set: bool, raw: &str) -> Result<u64, String>
     Ok(n)
 }
 
+/// 1 以上の 10 進整数だけを受理する（未アーカイブ量の上限。0 は常に拒否になるため受けない）。
+fn accept_positive(flag: &str, already_set: bool, raw: &str) -> Result<u64, String> {
+    if already_set {
+        return Err(duplicate(flag));
+    }
+    let n = parse_digits(flag, raw)?;
+    if n == 0 {
+        return Err(format!("{flag} must be at least 1"));
+    }
+    Ok(n)
+}
+
+/// `--change-log-max-unarchived-bytes` の値を検証する（1 以上）。
+pub fn accept_max_unarchived_bytes(already_set: bool, raw: &str) -> Result<u64, String> {
+    accept_positive(MAX_UNARCHIVED_BYTES_FLAG, already_set, raw)
+}
+
+/// `--change-log-max-unarchived-records` の値を検証する（1 以上）。
+pub fn accept_max_unarchived_records(already_set: bool, raw: &str) -> Result<u64, String> {
+    accept_positive(MAX_UNARCHIVED_RECORDS_FLAG, already_set, raw)
+}
+
 /// フラグの組み合わせを解決する。アーカイブ系のフラグは `--change-log` が前提で、保持・周期は
 /// アーカイブ先が前提（アーカイブされていない行を刈り込む設定を作らない。fail-closed）。
 pub fn resolve(
@@ -159,6 +205,26 @@ pub fn resolve(
     retain_records: Option<u64>,
     interval_secs: Option<u64>,
 ) -> Result<Option<ArchiveSettings>, &'static str> {
+    resolve_with_limits(change_log, dir, retain_records, interval_secs, None, None)
+}
+
+/// [`resolve`] に未アーカイブ量の上限（Issue #3091）を加えた版。上限フラグは `--change-log` と
+/// `--change-log-archive-dir` が前提。アーカイブ先を指定した起動ではバイト上限の既定を適用する。
+pub fn resolve_with_limits(
+    change_log: bool,
+    dir: Option<PathBuf>,
+    retain_records: Option<u64>,
+    interval_secs: Option<u64>,
+    max_unarchived_records: Option<u64>,
+    max_unarchived_bytes: Option<u64>,
+) -> Result<Option<ArchiveSettings>, &'static str> {
+    let limit_given = max_unarchived_records.is_some() || max_unarchived_bytes.is_some();
+    if limit_given && !change_log {
+        return Err(UNARCHIVED_NEEDS_CHANGE_LOG_MESSAGE);
+    }
+    if limit_given && dir.is_none() {
+        return Err(UNARCHIVED_NEEDS_ARCHIVE_DIR_MESSAGE);
+    }
     let any = dir.is_some() || retain_records.is_some() || interval_secs.is_some();
     if any && !change_log {
         return Err(ARCHIVE_NEEDS_CHANGE_LOG_MESSAGE);
@@ -177,6 +243,8 @@ pub fn resolve(
         dir,
         retain_records,
         interval: Duration::from_secs(interval_secs.unwrap_or(DEFAULT_INTERVAL_SECS)),
+        max_unarchived_records,
+        max_unarchived_bytes: Some(max_unarchived_bytes.unwrap_or(DEFAULT_MAX_UNARCHIVED_BYTES)),
     }))
 }
 
@@ -251,6 +319,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unarchived_limit_flags_reject_duplicates_zero_and_garbage_without_echoing_values() {
+        for f in [accept_max_unarchived_bytes, accept_max_unarchived_records] {
+            assert_eq!(f(false, "7"), Ok(7));
+            assert!(f(true, "7").unwrap_err().contains("more than once"));
+            for bad in ["0", "", "-1", "1e3", " 5", "abc", "99999999999999999999999"] {
+                let e = f(false, bad).unwrap_err();
+                assert!(bad.is_empty() || !e.contains(bad), "{e}");
+            }
+        }
+    }
+
+    #[test]
+    fn unarchived_limits_need_change_log_and_archive_dir_and_default_the_byte_limit() {
+        let dir = PathBuf::from("/archive");
+        assert_eq!(
+            resolve_with_limits(false, Some(dir.clone()), None, None, Some(1), None),
+            Err(UNARCHIVED_NEEDS_CHANGE_LOG_MESSAGE)
+        );
+        assert_eq!(
+            resolve_with_limits(true, None, None, None, None, Some(1)),
+            Err(UNARCHIVED_NEEDS_ARCHIVE_DIR_MESSAGE)
+        );
+        let s = resolve_with_limits(true, Some(dir.clone()), None, None, None, None)
+            .expect("ok")
+            .expect("settings");
+        assert_eq!(s.max_unarchived_bytes, Some(DEFAULT_MAX_UNARCHIVED_BYTES));
+        assert_eq!(s.max_unarchived_records, None);
+        let s = resolve_with_limits(true, Some(dir), None, None, Some(5), Some(9))
+            .expect("ok")
+            .expect("settings");
+        assert_eq!(
+            (s.max_unarchived_records, s.max_unarchived_bytes),
+            (Some(5), Some(9))
+        );
+    }
+
+    #[test]
     fn flag_is_a_bare_switch_name() {
         assert!(FLAG.starts_with("--"));
         assert!(!FLAG.contains('='));
@@ -271,6 +376,8 @@ mod tests {
             ARCHIVE_NEEDS_CHANGE_LOG_MESSAGE,
             NEEDS_ARCHIVE_DIR_MESSAGE,
             INSECURE_DIR_MESSAGE,
+            UNARCHIVED_NEEDS_CHANGE_LOG_MESSAGE,
+            UNARCHIVED_NEEDS_ARCHIVE_DIR_MESSAGE,
         ] {
             assert!(!m.contains('{') && !m.contains('\n'));
         }

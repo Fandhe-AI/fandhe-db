@@ -8,7 +8,10 @@
 //!
 //! 失敗は固定文言を stderr へ出して次の周期で再試行する（アーカイブされていないレコードは engine が決して
 //! 削除しない）。同じ内容の失敗は連続して 1 回しか出さず、利用者の操作でログが溢れない。文言にパス・LSN・
-//! 件数を含めない。プロセス終了時に停止を待たない（書き出しは一時名 → 公開の順で、途中で止まっても
+//! 件数を含めない。未アーカイブの量が上限（Issue #3091）に達した・下回った状態遷移も、変化したときだけ
+//! 固定文言で 1 行ずつ出す
+//! （運用者向け。テナントのセッションには見せない）。
+//! プロセス終了時に停止を待たない（書き出しは一時名 → 公開の順で、途中で止まっても
 //! 次回の起動が収束させる）。
 
 use std::sync::Arc;
@@ -35,11 +38,39 @@ pub const SKIPPED_WARN_STREAK: u32 = 6;
 pub struct State {
     last_error: Option<String>,
     skipped_streak: u32,
+    /// 前回の周期で未アーカイブ量が上限に達していたか（変化したときだけ通知する）。
+    at_limit: bool,
 }
+
+/// 未アーカイブ量が上限に達した遷移の固定文言（件数・LSN・パスを含めない）。
+pub const LIMIT_REACHED_MESSAGE: &str = "change log unarchived backlog reached its limit; writes are refused until the archive catches up";
+/// 未アーカイブ量が上限を下回った遷移の固定文言。
+pub const LIMIT_CLEARED_MESSAGE: &str =
+    "change log unarchived backlog is below its limit again; writes are accepted";
 
 /// 1 回分を実行し、stderr へ出すべき固定文言を返す。同じ失敗は連続して 1 回だけ、見送りの警告は
 /// [`SKIPPED_WARN_STREAK`] 回連続した時点で 1 回だけ返す。成功すると記憶をクリアする。
-pub fn run_once(core: &EngineCore, opts: &ArchiveOptions, state: &mut State) -> Option<String> {
+/// アーカイブの成否にかかわらず、未アーカイブ量の上限の到達・解消が変わったときは遷移の文言を足す。
+pub fn run_once(core: &EngineCore, opts: &ArchiveOptions, state: &mut State) -> Vec<String> {
+    let mut out: Vec<String> = archive_cycle(core, opts, state).into_iter().collect();
+    // 状態を読めない周期は遷移を判定しない（次の周期に回す）。
+    if let Ok(Some(status)) = core.change_log_unarchived_status() {
+        if status.at_limit != state.at_limit {
+            state.at_limit = status.at_limit;
+            out.push(
+                if status.at_limit {
+                    LIMIT_REACHED_MESSAGE
+                } else {
+                    LIMIT_CLEARED_MESSAGE
+                }
+                .to_string(),
+            );
+        }
+    }
+    out
+}
+
+fn archive_cycle(core: &EngineCore, opts: &ArchiveOptions, state: &mut State) -> Option<String> {
     match core.archive_change_log(opts) {
         Ok(report) => {
             state.last_error = None;
@@ -92,8 +123,11 @@ pub fn spawn(core: Arc<EngineCore>, settings: &ArchiveSettings) -> std::io::Resu
                     run_once(&core, &opts, &mut state)
                 }));
                 match cycle {
-                    Ok(Some(msg)) => engine::log_stderr!("wire-server: {msg}"),
-                    Ok(None) => {}
+                    Ok(msgs) => {
+                        for msg in msgs {
+                            engine::log_stderr!("wire-server: {msg}");
+                        }
+                    }
                     Err(_) => engine::log_stderr!(
                         "wire-server: change log archive cycle panicked; it will be retried"
                     ),
@@ -107,6 +141,13 @@ pub fn spawn(core: Arc<EngineCore>, settings: &ArchiveSettings) -> std::io::Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn limit_messages_carry_no_variable_content() {
+        for m in [LIMIT_REACHED_MESSAGE, LIMIT_CLEARED_MESSAGE] {
+            assert!(!m.contains('{') && !m.chars().any(|c| c.is_ascii_digit()));
+        }
+    }
 
     #[test]
     fn io_failures_carry_only_the_error_kind() {
