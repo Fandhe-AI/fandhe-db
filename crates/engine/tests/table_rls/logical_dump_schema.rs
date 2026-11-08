@@ -490,6 +490,32 @@ fn materialized_views_round_trip_as_no_data_in_the_schema_dump() {
         .any(|s| s.contains("CREATE INDEX \"mv_z_y\" ON \"mv_z\"")));
 }
 
+/// matview は関数の後ろに出す（復元時の `WITH NO DATA` は本文を解析するため、問合せが呼ぶ関数が
+/// 先に要る。現行の SQL 表層は VIEW 本文での関数呼び出しを受理しないので、出力順だけを固定する）。
+/// matview に依存しない VIEW は関数より前のまま（Issue #3097）。
+#[test]
+fn materialized_views_are_dumped_after_functions() {
+    let dump = assert_round_trip(
+        "matview_fn",
+        "tenant-a",
+        &[
+            "CREATE TABLE base (a INTEGER PRIMARY KEY)",
+            "CREATE FUNCTION add_one(x INTEGER) RETURNS INTEGER LANGUAGE sql AS $q$ SELECT x + 1 $q$",
+            "CREATE VIEW plain_v AS SELECT a FROM base",
+            "CREATE MATERIALIZED VIEW mv_f AS SELECT a FROM base",
+        ],
+    );
+    let stmts: Vec<&str> = dump.iter().map(|(_, s)| s.as_str()).collect();
+    let pos = |needle: &str| {
+        stmts
+            .iter()
+            .position(|s| s.contains(needle))
+            .unwrap_or_else(|| panic!("{needle} must appear"))
+    };
+    assert!(pos("CREATE VIEW \"plain_v\"") < pos("CREATE FUNCTION"));
+    assert!(pos("CREATE FUNCTION") < pos("CREATE MATERIALIZED VIEW \"mv_f\""));
+}
+
 /// 論理ダンプは、選択したテナント自身の実体がある matview だけを依存順に末尾で再計算する。
 /// 往復後も、実体化前のままの matview は実体化前のまま（Issue #3097）。
 #[test]

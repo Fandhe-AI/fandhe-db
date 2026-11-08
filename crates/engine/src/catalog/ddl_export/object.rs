@@ -123,8 +123,11 @@ pub(super) fn export_pre_data<E>(
     export_standalone_sequences(ctx, out, &seqs)?;
     export_tables(ctx, out, &seqs, &mut consumed)?;
     ensure_owned_sequences_consumed(ctx, &seqs, &consumed)?;
-    export_views(ctx, out)?;
+    // マテリアライズド VIEW の `WITH NO DATA` は本文を解析して列型を保存するため、問合せが呼ぶ
+    // テナント関数が先に在る必要がある。マテリアライズド VIEW とそれを読む VIEW は関数の後ろへ回す。
+    export_views(ctx, out, false)?;
     access::export_functions(ctx, out)?;
+    export_views(ctx, out, true)?;
     Ok(())
 }
 
@@ -325,12 +328,8 @@ enum ViewLike {
 /// 範囲内の VIEW・マテリアライズド VIEW を、読む relation を先に出すトポロジカル順で返す
 /// （VIEW が matview を、matview が VIEW・matview を読めるため 1 つの依存グラフで並べる）。
 /// 準備できたものは描画名の順に出す。導出できない本文・循環は全体を失敗させる。
-fn view_like_order<E>(ctx: &Ctx<'_>) -> Result<Vec<(String, ViewLike)>, SchemaDdlError<E>> {
-    view_like_order_with_deps::<E>(ctx).map(|(ordered, _)| ordered)
-}
-
-/// `view_like_order` の本体。並び順に加えて、各定義が読む relation の一覧（依存辺）も返す。
-/// matview の再計算可否の検査（`export_matview_refreshes`）が依存を辿るために使う。
+/// 並び順に加えて、各定義が読む relation の一覧（依存辺）も返す。
+/// 出力順の分割（`export_views`）と matview の再計算可否の検査（`export_matview_refreshes`）が使う。
 #[allow(clippy::type_complexity)]
 fn view_like_order_with_deps<E>(
     ctx: &Ctx<'_>,
@@ -395,7 +394,7 @@ fn view_like_order_with_deps<E>(
 }
 
 /// 範囲内のマテリアライズド VIEW の定義を返す（論理ダンプ前の列構成の照合用。Issue #3097）。
-/// SCHEMA 配下の定義は戻せないため、`view_like_order` と同じく固定文言で全体を失敗させる。
+/// SCHEMA 配下の定義は戻せないため、`view_like_order_with_deps` と同じく固定文言で全体を失敗させる。
 pub(super) fn in_scope_materialized_defs<E>(
     ctx: &Ctx<'_>,
 ) -> Result<Vec<MaterializedViewDef>, SchemaDdlError<E>> {
@@ -416,8 +415,28 @@ pub(super) fn in_scope_materialized_defs<E>(
 
 /// 範囲内の VIEW とマテリアライズド VIEW。読む relation を先に出す（トポロジカル順）。
 /// マテリアライズド VIEW は `WITH NO DATA`（実体は運ばない）で出す。
-fn export_views<E>(ctx: &Ctx<'_>, out: &mut Emitter<'_, E>) -> Result<(), SchemaDdlError<E>> {
-    for (key, def) in view_like_order::<E>(ctx)? {
+/// `after_functions` が偽なら関数より前に出す分（マテリアライズド VIEW に依存しない VIEW）、
+/// 真なら関数の後ろに出す分（マテリアライズド VIEW と、それを（推移的に）読む VIEW）。
+fn export_views<E>(
+    ctx: &Ctx<'_>,
+    out: &mut Emitter<'_, E>,
+    after_functions: bool,
+) -> Result<(), SchemaDdlError<E>> {
+    let (ordered, deps) = view_like_order_with_deps::<E>(ctx)?;
+    // トポロジカル順に、マテリアライズド VIEW かそれを読む定義へ印を付ける。
+    let mut deferred: BTreeSet<String> = BTreeSet::new();
+    for (key, def) in &ordered {
+        let reads_deferred = deps
+            .get(key)
+            .is_some_and(|ds| ds.iter().any(|r| deferred.contains(r)));
+        if reads_deferred || matches!(def, ViewLike::Materialized(_)) {
+            deferred.insert(key.clone());
+        }
+    }
+    for (key, def) in ordered {
+        if deferred.contains(&key) != after_functions {
+            continue;
+        }
         match def {
             ViewLike::View(v) => {
                 let sql = render_create_view(ctx, &key, &v)?;
