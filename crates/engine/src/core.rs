@@ -3288,6 +3288,21 @@ impl EngineCore {
         ))
     }
 
+    /// 読み取りレプリカ（RECOVER-15・Issue #2175）として構成する。レプリカのベース（変更ログの識別子を
+    /// 持つが有効化していない DB）であることを確かめ、以後は利用者経路の書き込みをすべて `25006` で
+    /// 拒否する（適用専用の [`Self::apply_replicated_records`] は従来どおり動く）。wire-server の
+    /// 起動処理が、DB を開いた直後・共有前に呼ぶ。ベースでなければ固定文言のエラーで拒否する（fail-closed）。
+    pub fn with_read_replica(mut self) -> Result<Self, crate::storage::ReplicaApplyError> {
+        self.storage.replica_identity()?;
+        self.storage.mark_read_replica();
+        Ok(self)
+    }
+
+    /// 読み取りレプリカとして構成されているか（[`Self::with_read_replica`]）。
+    pub fn is_read_replica(&self) -> bool {
+        self.storage.is_read_replica()
+    }
+
     /// 変更ログ（RECOVER-14）を有効にした DB を、有効にしないまま開いているか。真の間は書き込みが
     /// `54000` で拒否される（LSN の欠落を作らないため。`docs/design/change-log-pitr.md` の D8・D11）。
     /// wire-server の起動処理が、`--change-log` なしの再起動を明示的に拒否するために照会する。
@@ -8650,6 +8665,18 @@ impl EngineCore {
                 return self.execute_parsed_in_session_inner(ctx, session, routed.inner());
             }
         }
+        // RECOVER-15・Issue #2175: 読み取りレプリカでは、読み取りと分かる文だけを許可する（許可リストは
+        // 明示 READ ONLY Tx と共通の `read_only_permits`）。副作用（台帳・採番・カタログ・writer）に触れる
+        // 前に `25006` で拒否する。トランザクション制御文は専用の分岐が先に扱う。
+        if self.storage.is_read_replica()
+            && !matches!(
+                parsed,
+                ParsedSql::Transaction(_) | ParsedSql::SetTransaction(_)
+            )
+            && !read_only_permits(parsed)
+        {
+            return Err(crate::sql::allowlist::SqlSurfaceError::ReadOnlySqlTransaction);
+        }
         // SQL-53（Issue #1751）: サブクエリつき述語形 DML は文単位の暗黙トランザクションで実行する
         // （内側の評価と書き込みを同じ write txn に乗せる）。`ON COMMIT` の適用は commit 側が担う。
         // SQL-63・Issue #1876: データ変更 CTE も同じ暗黙トランザクションで実行する（全副文・台帳記録・
@@ -9800,6 +9827,12 @@ impl EngineCore {
                     Ok(crate::sql::SqlOutcome::SetTransaction)
                 }
                 SetTxnScope::SessionDefault => {
+                    // RECOVER-15・Issue #2175: 読み取りレプリカで既定を READ WRITE にする要求は拒否する。
+                    if self.storage.is_read_replica()
+                        && v.access_mode == Some(crate::sql::transaction::TxnAccessMode::ReadWrite)
+                    {
+                        return Err(crate::sql::allowlist::SqlSurfaceError::ReadOnlySqlTransaction);
+                    }
                     match txn.status() {
                         TransactionStatus::Failed => return Err(txn.take_failed_error()),
                         TransactionStatus::InTransaction => {
@@ -9816,6 +9849,17 @@ impl EngineCore {
         if let ParsedSql::Transaction(ctrl) = parsed {
             // Issue #1939: 修飾子が無い項目は `SET SESSION CHARACTERISTICS` の既定で補う
             // （明示した修飾子が優先）。実行中の Tx は自分の値を持つため既定の変更に影響されない。
+            // RECOVER-15・Issue #2175: 読み取りレプリカで明示された `READ WRITE` は拒否する
+            // （修飾子なしは `begin_with_origin` が READ ONLY へ強制する）。
+            if self.storage.is_read_replica()
+                && matches!(
+                    ctrl.control,
+                    TxnControl::Begin | TxnControl::StartTransaction
+                )
+                && ctrl.access_mode == Some(crate::sql::transaction::TxnAccessMode::ReadWrite)
+            {
+                return Err(crate::sql::allowlist::SqlSurfaceError::ReadOnlySqlTransaction);
+            }
             let access_mode = ctrl
                 .access_mode
                 .or(session.default_access_mode())
@@ -16796,6 +16840,11 @@ impl EngineCore {
     ) -> Result<CopyPlan, crate::sql::allowlist::SqlSurfaceError> {
         match stmt {
             crate::sql::allowlist::CopyStatement::From(v) => {
+                // RECOVER-15・Issue #2175: 読み取りレプリカの `COPY FROM` は CopyInResponse の前に拒否する
+                // （権限検査の後に呼ばれるため、権限エラーが先に返る既存の順序を保つ）。
+                if self.storage.is_read_replica() {
+                    return Err(crate::sql::allowlist::SqlSurfaceError::ReadOnlySqlTransaction);
+                }
                 let (_read_txn, schema) = self
                     .read_txn_with_schema(&v.table_name)
                     .map_err(|e| self.reclassify_matview_write_error(e))?;
@@ -17034,6 +17083,10 @@ impl EngineCore {
         // （`ON COMMIT` の適用に `SessionState` が要る。永続 DB へ書く経路には絶対に載せない）。
         if batch.temp.is_some() {
             return Err(crate::sql::temp_catalog::temp_table_unsupported());
+        }
+        // RECOVER-15・Issue #2175: 読み取りレプリカでは COPY の確定も `25006` で拒否する（多重防御）。
+        if self.storage.is_read_replica() {
+            return Err(crate::sql::allowlist::SqlSurfaceError::ReadOnlySqlTransaction);
         }
         // Issue #1953（SQL-71）: COPY 開始時の期限を commit 経路（INSERT 行ループ・writer 待ち）へ
         // 効かせる。既にスレッドに期限があれば厳しい方が勝つ（緩めない）。writer 取得の前に確認する。
