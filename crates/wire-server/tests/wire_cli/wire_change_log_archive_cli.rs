@@ -307,6 +307,111 @@ fn recover14_archive_thread_writes_segments_and_verify_detects_loss_and_tamperin
     assert_eq!(ok.status.code(), Some(0), "{}", stderr(&ok));
 }
 
+/// Issue #3094（RECOVER-13・RECOVER-14）: 起動時に、前回の異常終了が残した一時名だけが消え、形式に
+/// 一致しないもの・権限が想定外のものは残る。消した名前と件数は stderr に出る。
+#[test]
+fn recover14_startup_sweeps_stale_archive_temp_names_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let fx = common::TempFixtureDir::new("cl-arc-sweep");
+    let users = fx.users_path_str();
+    let db = fx.db_path_str();
+    write_user_store_with_alice(&users);
+    let arc = PathBuf::from(db.clone() + ".arc");
+    make_archive_dir(&arc);
+    let stale = ".fandhe-seg-4242-0123456789abcdef-7.tmp";
+    let wide = ".fandhe-seg-4242-0123456789abcdef-8.tmp";
+    let decoy = ".fandhe-seg-decoy.tmp";
+    let unrelated = "notes.txt";
+    for (name, mode) in [
+        (stale, 0o600),
+        (wide, 0o644),
+        (decoy, 0o600),
+        (unrelated, 0o600),
+    ] {
+        let p = arc.join(name);
+        std::fs::write(&p, b"x").expect("write");
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).expect("chmod");
+    }
+    let arc_s = arc.to_str().expect("utf-8").to_string();
+    let flags = ["--change-log", "--change-log-archive-dir", &arc_s];
+    let mut server = spawn_server(&users, &db, &flags);
+    let (_addr, lines) =
+        common::wait_for_listening_addr_and_lines(&mut server.0, Duration::from_secs(10));
+    let joined = lines.join("\n");
+    assert!(
+        joined.contains("removed 1 stale temporary file(s)") && joined.contains(stale),
+        "{joined}"
+    );
+    assert!(joined.contains("left 1 file(s)"), "{joined}");
+    assert!(!arc.join(stale).exists());
+    for kept in [wide, decoy, unrelated] {
+        assert!(arc.join(kept).exists(), "{kept} must stay");
+    }
+}
+
+/// Issue #3094（Codex P1）: 通常起動の `--db`・`--users` に予約名（掃除が消す一時名の形式）を渡すと、
+/// 新規・既存・シンボリックリンク経由のいずれでも終了コード 2 で拒否され、何も作られず既存の中身も変わらない。
+#[test]
+fn recover14_normal_startup_rejects_reserved_names_for_persistent_files() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    let fx = common::TempFixtureDir::new("cl-arc-reserved-db");
+    let users = fx.users_path_str();
+    write_user_store_with_alice(&users);
+    let arc = PathBuf::from(fx.db_path_str() + ".arc");
+    make_archive_dir(&arc);
+    let arc_s = arc.to_str().expect("utf-8").to_string();
+    let reserved = ".fandhe-seg-4242-0123456789abcdef-7.tmp";
+
+    let check = |db: &str, users: &str, what: &str| {
+        let out = run(&[
+            "--users",
+            users,
+            "--db",
+            db,
+            "--bind",
+            "127.0.0.1:0",
+            "--change-log",
+            "--change-log-archive-dir",
+            &arc_s,
+        ]);
+        assert_eq!(out.status.code(), Some(2), "{what}: {}", stderr(&out));
+        assert!(
+            stderr(&out).contains("reserved temporary file name"),
+            "{what}: {}",
+            stderr(&out)
+        );
+    };
+
+    // 新規の DB パス: 拒否され、何も作られない。
+    let new_db = arc.join(reserved);
+    check(new_db.to_str().expect("utf-8"), &users, "new db");
+    assert!(!new_db.exists(), "a rejected --db must not be created");
+
+    // 既存のファイル: 拒否され、掃除もされず中身も変わらない。
+    std::fs::write(&new_db, b"precious").expect("write");
+    std::fs::set_permissions(&new_db, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    check(new_db.to_str().expect("utf-8"), &users, "existing db");
+    assert_eq!(std::fs::read(&new_db).expect("read"), b"precious");
+
+    // 別名（シンボリックリンク）経由でも、実体が予約名なら拒否される。
+    let link = fx.db_path_str() + ".link";
+    symlink(&new_db, &link).expect("symlink");
+    check(&link, &users, "symlinked db");
+    assert_eq!(std::fs::read(&new_db).expect("read"), b"precious");
+
+    // `--users` が予約名のときも拒否される。
+    let users_reserved = arc.join(".fandhe-seg-4242-0123456789abcdef-8.tmp");
+    std::fs::copy(&users, &users_reserved).expect("copy");
+    std::fs::set_permissions(&users_reserved, std::fs::Permissions::from_mode(0o600))
+        .expect("chmod");
+    check(
+        &fx.db_path_str(),
+        users_reserved.to_str().expect("utf-8"),
+        "users",
+    );
+    assert!(users_reserved.exists());
+}
+
 /// 検証サブコマンドの引数の不備は終了コード 2（DB は開かない）。
 #[test]
 fn recover14_verify_subcommand_rejects_bad_arguments() {

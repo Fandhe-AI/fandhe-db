@@ -23,6 +23,9 @@
 //! - アーカイブされていない行（水位より後）は刈り込まない。削除は水位以下に構造的に限る
 //! - 公開は一時名への書き出し → fsync → `hard_link` → 一時名の削除 → ディレクトリ fsync。`rename` は
 //!   既存ファイルを黙って置換するため使わず、既存のセグメントは上書きも削除もしない
+//! - 異常終了で残った一時名は、次の起動時に [`sweep_change_log_archive_temps`] が掃除する（Issue #3094）。
+//!   公開側は一時名を作る前にディレクトリへ共有 lock を取り、掃除は排他 lock が取れたときだけ、形式に
+//!   厳密一致・通常ファイル・0600 系・自分の所有のものだけを消す（詳細は `storage::stale_temp`）
 //! - 決定的な名前のセグメントが既に在るときは、中身が表のレコードと完全一致する場合に限り
 //!   書き直さずに採用し（再試行の収束）、一致しなければ [`ArchiveError::Conflict`] で止める
 //! - エラーの `Display` は固定文言で、パス・LSN・件数を含めない（運用者向けの詳細は列挙子の値）
@@ -795,6 +798,61 @@ pub(super) fn check_dir_not_shared(_dir: &Path) -> Result<()> {
 // 書き出し
 // ---------------------------------------------------------------------------
 
+/// 公開前の一時名 `.fandhe-seg-<pid>-<nonce 16桁hex>-<通番>.tmp` を新しく作る。nonce はプロセスごとに
+/// ランダムな鍵を持つ `RandomState` と時刻のナノ秒・通番を混ぜた値（同じ PID の残骸が多数あっても進める。
+/// PID 1 のコンテナ等）。形式の判定は [`is_segment_temp_name`]（生成側と同じ場所に置く単一の真実源）。
+#[cfg(unix)]
+fn tmp_name() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u128(nanos);
+    h.write_u64(seq);
+    let nonce = h.finish();
+    format!("{TMP_PREFIX}{}-{nonce:016x}-{seq}.tmp", std::process::id())
+}
+
+/// `name` がアーカイブの一時名の厳密な形式か（`.fandhe-seg-` + pid(10 進 1〜10 桁) + `-` + nonce(小文字
+/// 16 進 16 桁) + `-` + 通番(10 進 1〜20 桁) + `.tmp`）。名前は untrusted として添字を使わずに解析する。
+/// nonce の無い旧形式は出荷されていないため対象外。
+pub(crate) fn is_segment_temp_name(name: &str) -> bool {
+    use crate::storage::stale_temp::{is_decimal, is_lower_hex};
+    let Some(rest) = name
+        .strip_prefix(TMP_PREFIX)
+        .and_then(|r| r.strip_suffix(".tmp"))
+    else {
+        return false;
+    };
+    let mut parts = rest.splitn(3, '-');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(pid), Some(nonce), Some(seq)) => {
+            is_decimal(pid, 10) && is_lower_hex(nonce, 16) && is_decimal(seq, 20)
+        }
+        _ => false,
+    }
+}
+
+/// アーカイブ先 `dir` に、異常終了で残った一時名（[`is_segment_temp_name`] に厳密一致し、通常ファイル・
+/// 0600 系・自分の所有・他の書き込みが進行中でないもの）だけを消す（Issue #3094・RECOVER-13・RECOVER-14）。
+/// wire-server の起動時（アーカイブのスレッドを動かす前）に 1 回呼ぶ。`dir` が存在しない・共有ディレクトリ
+/// （`InsecureDirectory`）のときはエラー。`protected`（起動中の DB 等の消してはならないパス。実体・dev/inode でも
+/// 照合する）は名前が一時名の形式でも消さない。公開済みのセグメント・形式に一致しないファイルには触れない。
+pub fn sweep_change_log_archive_temps(
+    dir: impl AsRef<Path>,
+    protected: &[&Path],
+) -> Result<crate::storage::StaleTempSweep> {
+    let dir = dir.as_ref();
+    check_dir(dir)?;
+    check_dir_not_shared(dir)?;
+    crate::storage::stale_temp::sweep_stale_temps(dir, is_segment_temp_name, protected)
+        .map_err(ArchiveError::Io)
+}
+
 /// 一時名から最終名へ、既存を上書きせずに公開する。公開は `hard_link`（宛先が在れば原子的に失敗する）。
 /// 戻り値が `Ok(true)` なら新規に公開し、`Ok(false)` なら競合で既に在った（呼び出し側が内容を照合する）。
 #[cfg(unix)]
@@ -814,28 +872,19 @@ pub(super) fn publish_with(
     final_path: &Path,
     write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
 ) -> Result<bool> {
-    use std::hash::{BuildHasher, Hasher};
     use std::os::unix::fs::OpenOptionsExt;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
-    // 一時名は再起動をまたいでも衝突しにくいよう、プロセスごとにランダムな鍵を持つ `RandomState` と時刻の
-    // ナノ秒、通番を混ぜる（同じ PID の残骸が多数あっても進める。PID 1 のコンテナ等）。試行は残骸の数に
-    // 依らず新しい名前で行い、上限は異常な環境で無限に回らないための安全弁。
+    // 一時名を作る前に親ディレクトリへ共有 lock を取り、公開か削除まで持つ（Issue #3094。掃除
+    // [`sweep_change_log_archive_temps`] が使用中の一時名を消さないための相互排他）。取れなければ
+    // 一時名を作らずに中止する（fail-closed。lock なしでは掃除が使用中の一時名を消しうる）。
+    let _dir_lock =
+        crate::storage::stale_temp::TempDirLock::shared(dir).map_err(ArchiveError::Io)?;
+
+    // 一時名は再起動をまたいでも衝突しにくくする（`tmp_name`）。試行は残骸の数に依らず新しい名前で行い、
+    // 上限は異常な環境で無限に回らないための安全弁。
     let mut attempts = 0u32;
     let (mut file, tmp) = loop {
-        let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos());
-        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
-        h.write_u128(nanos);
-        h.write_u64(seq);
-        let nonce = h.finish();
-        let p = dir.join(format!(
-            "{TMP_PREFIX}{}-{nonce:016x}-{seq}.tmp",
-            std::process::id()
-        ));
+        let p = dir.join(tmp_name());
         match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)

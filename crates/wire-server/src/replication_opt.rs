@@ -330,7 +330,10 @@ impl ReplicationArgs {
             }
             ROLES_FLAG => {
                 slot_taken(self.roles.is_some())?;
-                self.roles = Some(PathBuf::from(value));
+                let path = PathBuf::from(value);
+                // 掃除（Issue #3094）が消す予約名の形式のファイルは拒否する（fail-closed）。
+                crate::backup_opt::reject_reserved_name(ROLES_FLAG, &path)?;
+                self.roles = Some(path);
             }
             ALLOW_FLAG => {
                 if self.allow.len() >= MAX_ALLOW_ENTRIES {

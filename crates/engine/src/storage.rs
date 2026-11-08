@@ -44,14 +44,21 @@ pub(crate) mod read_source;
 pub(crate) mod restore_generation;
 pub(crate) mod rowid;
 pub mod snapshot;
+mod stale_temp;
 pub(crate) mod table_image;
 pub(crate) mod writer_gate;
 
+pub use stale_temp::{
+    is_reserved_temp_name, is_restore_temp_name, sweep_stale_temps, StaleTempSweep, SweepOutcome,
+    TempDirLock,
+};
+
 pub use change_log::archive::{
-    execute_archive_cleanup, plan_archive_cleanup, retention_point_of, verify_archive_dir,
-    ArchiveError, ArchiveExpectation, ArchiveOptions, ArchiveReport, ArchiveSummary, CleanupError,
-    CleanupPlan, CleanupPolicy, CleanupReport, RetentionPoint, DEFAULT_PRUNE_BYTES,
-    DEFAULT_PRUNE_RECORDS, DEFAULT_SEGMENT_BYTES, SEGMENT_FORMAT_VERSION,
+    execute_archive_cleanup, plan_archive_cleanup, retention_point_of,
+    sweep_change_log_archive_temps, verify_archive_dir, ArchiveError, ArchiveExpectation,
+    ArchiveOptions, ArchiveReport, ArchiveSummary, CleanupError, CleanupPlan, CleanupPolicy,
+    CleanupReport, RetentionPoint, DEFAULT_PRUNE_BYTES, DEFAULT_PRUNE_RECORDS,
+    DEFAULT_SEGMENT_BYTES, SEGMENT_FORMAT_VERSION,
 };
 pub use change_log::backlog::{UnarchivedLimit, UnarchivedStatus};
 pub use change_log::disable::{DisableError, DisableOptions};

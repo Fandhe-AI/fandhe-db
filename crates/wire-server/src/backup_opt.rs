@@ -127,6 +127,23 @@ pub fn is_already_open(e: &engine::storage::StorageError) -> bool {
     e.to_string().contains("already open")
 }
 
+/// `path` の名前（シンボリックリンクを解決した実体の名前を含む）が、掃除（Issue #3094）が消す予約名の形式なら
+/// エラーを返す。永続ファイル・入力ファイルを指す全フラグの検証がこの関数を通る（fail-closed。新規・既存を問わない）。
+/// 同じ親での掃除に、完成済みのファイルや開いている DB が消されるのを防ぐ。パスの内容はエラー文に出さない。
+pub fn reject_reserved_name(flag: &str, path: &Path) -> Result<(), String> {
+    let reserved = |p: &Path| {
+        p.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(engine::storage::is_reserved_temp_name)
+    };
+    if reserved(path) || std::fs::canonicalize(path).is_ok_and(|c| reserved(&c)) {
+        return Err(format!(
+            "{flag} must not use a reserved temporary file name"
+        ));
+    }
+    Ok(())
+}
+
 /// `--db` の検証。`Storage::open` は存在しない・長さ 0 のパスに空の DB を作るため、既存の
 /// 空でない通常ファイルに限る（typo で空 DB が生成され「成功」するのを防ぐ）。
 /// `verify`・`restore` からも使う（[`crate::verify_opt`]・[`crate::restore_opt`]）。
@@ -141,6 +158,7 @@ pub fn validate_existing_file(flag: &str, raw: &str) -> Result<PathBuf, String> 
         return Err(format!("{flag} must not be empty"));
     }
     let path = PathBuf::from(raw);
+    reject_reserved_name(flag, &path)?;
     match std::fs::metadata(&path) {
         Ok(m) if m.is_file() && m.len() > 0 => Ok(path),
         _ => Err(format!(
@@ -155,7 +173,7 @@ pub fn validate_out(raw: &str) -> Result<PathBuf, String> {
     validate_new_path("--out", raw)
 }
 
-/// まだ存在しない新規パスの共通検査（`backup --out`・`restore --db` が使う。フラグ名はエラー文に
+/// まだ存在しない新規パスの共通検査（`backup --out`・`restore --db`・dump・incremental 等が使う。フラグ名はエラー文に
 /// 使い、パスの内容は出さない）。確認後の競合は公開側の `hard_link`（`EEXIST`）が原子的に拒否する。
 pub fn validate_new_path(flag: &str, raw: &str) -> Result<PathBuf, String> {
     if raw.is_empty() {
@@ -168,6 +186,8 @@ pub fn validate_new_path(flag: &str, raw: &str) -> Result<PathBuf, String> {
     if path.file_name().is_none() {
         return Err(format!("{flag} must name a file"));
     }
+    // 掃除（Issue #3094）が消す一時名の形式の出力先は拒否する（fail-closed。non-UTF-8 は形式に一致しない）。
+    reject_reserved_name(flag, &path)?;
     // 存在確認はリンクをたどらない（壊れたリンク経由の書き出しも拒否する）。
     if std::fs::symlink_metadata(&path).is_ok() {
         return Err(format!("{flag} already exists; refusing to overwrite"));

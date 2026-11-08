@@ -350,6 +350,139 @@ fn verify_rejects_invalid_arguments_and_paths() {
     assert_eq!(code(&o), Some(1), "stderr: {}", stderr(&o));
 }
 
+/// Issue #3094（RECOVER-13・RECOVER-14）: restore は復元先の親に残った自分の一時名の残骸だけを掃除し、
+/// 形式に一致しないもの・権限が想定外のものには触れない。報告は stderr で、終了コードは変わらない。
+#[test]
+fn restore_sweeps_stale_restore_temp_names_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let fx = common::TempFixtureDir::new("restore-sweep");
+    let (_users, db) = populate(&fx);
+    let dir = parent_of(&db).to_path_buf();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod dir");
+    let snap = dir.join("snap.redb");
+    let snap_s = snap.to_str().expect("utf-8 path").to_string();
+    let o = backup(&db, &snap_s);
+    assert_eq!(code(&o), Some(0), "stderr: {}", stderr(&o));
+
+    let stale = ".fandhe-restore-4242-7.tmp";
+    let wide = ".fandhe-restore-4242-8.tmp";
+    let decoy = ".fandhe-restore-decoy.tmp";
+    for (name, mode) in [(stale, 0o600), (wide, 0o644), (decoy, 0o600)] {
+        let p = dir.join(name);
+        std::fs::write(&p, b"x").expect("write");
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).expect("chmod");
+    }
+    let restored = dir.join("restored.redb");
+    let restored_s = restored.to_str().expect("utf-8 path").to_string();
+    let o = restore(&snap_s, &restored_s);
+    assert_eq!(code(&o), Some(0), "stderr: {}", stderr(&o));
+    let err = stderr(&o);
+    assert!(
+        err.contains("removed 1 stale temporary file(s)") && err.contains(stale),
+        "{err}"
+    );
+    assert!(err.contains("left 1 file(s)"), "{err}");
+    assert!(!dir.join(stale).exists());
+    assert!(dir.join(wide).exists() && dir.join(decoy).exists());
+    assert!(restored.exists());
+}
+
+/// Issue #3094（Codex P1）: 掃除が消す一時名の形式を永続ファイルの出力先に使うことは、fail-closed で
+/// 引数エラー（終了コード 2）として拒否する。拒否時は何も作らず、同じ親の既存ファイルにも触れない。
+#[test]
+fn restore_and_backup_reject_reserved_temp_names_as_outputs() {
+    let fx = common::TempFixtureDir::new("restore-reserved-name");
+    let (_users, db) = populate(&fx);
+    let dir = parent_of(&db).to_path_buf();
+    let snap = dir.join("snap.redb");
+    let snap_s = snap.to_str().expect("utf-8 path").to_string();
+    let o = backup(&db, &snap_s);
+    assert_eq!(code(&o), Some(0), "stderr: {}", stderr(&o));
+
+    for name in [
+        ".fandhe-restore-4242-7.tmp",
+        ".fandhe-restore-4242-0123456789abcdef-7.tmp",
+        ".fandhe-seg-4242-0123456789abcdef-7.tmp",
+        ".fandhe-sweep-probe-4242-0123456789abcdef-0.tmp",
+    ] {
+        let out = dir.join(name);
+        let out_s = out.to_str().expect("utf-8 path").to_string();
+        let o = restore(&snap_s, &out_s);
+        assert_eq!(code(&o), Some(2), "restore {name}: {}", stderr(&o));
+        assert!(
+            stderr(&o).contains("reserved temporary file name"),
+            "{}",
+            stderr(&o)
+        );
+        assert!(!out.exists(), "{name} must not be created");
+        let o = backup(&db, &out_s);
+        assert_eq!(code(&o), Some(2), "backup {name}: {}", stderr(&o));
+        assert!(!out.exists(), "{name} must not be created");
+    }
+    // 形式に一致しない名前は従来どおり受け付ける。
+    let ok = dir.join(".fandhe-restore-decoy.tmp");
+    let o = restore(&snap_s, ok.to_str().expect("utf-8 path"));
+    assert_eq!(code(&o), Some(0), "stderr: {}", stderr(&o));
+}
+
+/// Issue #3094: 旧形式の残骸（`<pid>-0..16`）が多数あっても、掃除の所有権プローブと一時コピーの作成が
+/// 名前衝突で失敗せず、掃除と復元の両方が成功する（プローブ名・一時名に nonce を持つため）。
+#[test]
+fn restore_succeeds_with_many_legacy_leftovers_for_same_pid() {
+    use std::os::unix::fs::PermissionsExt;
+    let fx = common::TempFixtureDir::new("restore-sweep-many");
+    let (_users, db) = populate(&fx);
+    let dir = parent_of(&db).to_path_buf();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod dir");
+    let snap = dir.join("snap.redb");
+    let snap_s = snap.to_str().expect("utf-8 path").to_string();
+    let o = backup(&db, &snap_s);
+    assert_eq!(code(&o), Some(0), "stderr: {}", stderr(&o));
+    for seq in 0..=16 {
+        let p = dir.join(format!(".fandhe-restore-1-{seq}.tmp"));
+        std::fs::write(&p, b"x").expect("write");
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    }
+    let restored = dir.join("restored.redb");
+    let restored_s = restored.to_str().expect("utf-8 path").to_string();
+    let o = restore(&snap_s, &restored_s);
+    assert_eq!(code(&o), Some(0), "stderr: {}", stderr(&o));
+    assert!(
+        stderr(&o).contains("removed 17 stale temporary file(s)"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(restored.exists());
+}
+
+/// Issue #3094: `--from` が一時名の実体へのシンボリックリンクなら、引数検査が終了コード 2 で拒否し、
+/// 復元元の実体は消えず復元先も作られない。
+#[test]
+fn restore_rejects_source_reached_through_symlink_to_temp_name() {
+    use std::os::unix::fs::PermissionsExt;
+    let fx = common::TempFixtureDir::new("restore-sweep-alias");
+    let (_users, db) = populate(&fx);
+    let dir = parent_of(&db).to_path_buf();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod dir");
+    let snap = dir.join("snap.redb");
+    let o = backup(&db, snap.to_str().expect("utf-8 path"));
+    assert_eq!(code(&o), Some(0), "stderr: {}", stderr(&o));
+    let real = dir.join(".fandhe-restore-4242-7.tmp");
+    std::fs::rename(&snap, &real).expect("rename");
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    let alias = dir.join("backup.redb");
+    std::os::unix::fs::symlink(&real, &alias).expect("symlink");
+    let restored = dir.join("restored.redb");
+    let o = restore(
+        alias.to_str().expect("utf-8 path"),
+        restored.to_str().expect("utf-8 path"),
+    );
+    assert_eq!(code(&o), Some(2), "stderr: {}", stderr(&o));
+    assert!(stderr(&o).contains("reserved temporary file name"));
+    assert!(real.exists(), "source entity must survive");
+    assert!(!restored.exists());
+}
+
 /// 復元の正常系: 元のバックアップは不変、復元先から別のサーバーが起動してデータを読める。
 /// 既存の復元先（ファイル・ディレクトリ・リンク）は書かずに 2 で拒否する。
 #[test]

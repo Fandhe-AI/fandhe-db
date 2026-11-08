@@ -475,6 +475,50 @@ RECOVER-14 (2) のポインタ（上限の超過で書き込みを拒否する�
   `Storage::change_log_unarchived_status`（`EngineCore` も同名）だけで、SQL・NoSQL の表層・`SHOW`・エラー詳細には
   出さない（他テナントの書き込み量を推測させない）。クライアントへのエラーは他の拒否と同じ `54000` の固定文言
 
+### 残骸の掃除（Issue #3094）
+
+公開前の一時名（アーカイブの `.fandhe-seg-<pid>-<nonce>-<seq>.tmp`、`restore` の
+`.fandhe-restore-<pid>-<seq>.tmp`）は、SIGKILL などで残ると全テナントのデータのコピーが残る。
+次の起動（`--change-log-archive-dir` 指定時。アーカイブのスレッドを動かす前）と `restore` の実行で
+自動的に掃除する（RECOVER-13・RECOVER-14）。実装は engine の `storage::stale_temp`。
+
+- 使用中の判定: PID や mtime では判定せず、**親ディレクトリの advisory lock** を使う。書き込み側は
+  一時名を作る前に共有 lock を取り、公開か削除まで持つ。掃除は排他 lock を試し、取れなければ
+  （書き込み中）全体を見送る。一時ファイルそのものには lock を掛けない（redb が DB ファイルの
+  lock を自前で取るため）。lock できない FS では何も消さない
+- 検査（すべて満たすものだけ消す。1 つでも外れれば触らない）: 親が他者に書き込めない・名前が
+  厳密な形式に一致（nonce の無い旧形式は対象外）・通常ファイル（リンクをたどらない）・グループ/
+  その他の権限なし（特殊ビットなし）・自分の uid（排他 lock の下で作った probe の所有者と比較）
+- 形式に一致しない項目は触らず数えもしない。形式一致で型・所有者・権限が想定外のものは残して件数を出す
+- 走査数と報告する名前数には上限がある。掃除は起動時と `restore` の実行時に 1 回だけ
+- 出力は固定の英語で stderr へ（名前・件数・運用者が指定したディレクトリ。テナントのデータは含まない）。
+  掃除の失敗・見送りで起動・復元は失敗させない
+- 残るリスク: この lock を使わない古いバイナリと同時に動かした場合は使用中を判定できない。その場合も
+  相手側の差し替え検出（`TempReplaced`）が公開を止める
+- 予約名の出力先拒否（レビュー指摘への対応）: 永続ファイルの出力先（`restore --db`・`backup --out`・
+  `backup-incremental --out`・dump 系・`replica-resync --out`）は、名前が掃除の予約名（復元・アーカイブの
+  一時名・掃除の確認用ファイル）の形式なら引数エラー（終了コード 2）で拒否する。判定は engine の
+  `storage::is_reserved_temp_name` に一本化し、出力先の共通検査 `validate_new_path` から呼ぶ。
+  既存の入力ファイルも同じく拒否する（後述の表）。拒否をすり抜けた名前は、掃除の保護パスが守る
+- `restore --generation-state` も同じ予約名を新規・既存を問わず拒否する（掃除で高水位が失われ RECOVER-17 の単調性が崩れるため）。掃除の入力保護（`--from`・`--incremental`・`--generation-state`）の判定も `is_reserved_temp_name` に合わせ、確認用ファイル・アーカイブの一時名を含む
+- 予約名の防御は経路全体に敷く（Issue #3094 のレビュー指摘への最終対応）。名前の拒否は共通ヘルパー
+  `backup_opt::reject_reserved_name`（指定の名前と、シンボリックリンクを解決した実体の名前の両方を検査。
+  終了コード 2・パスはエラー文に出さない）に一本化し、掃除側は呼び出しごとに「保護するパスの集合」を受け取って
+  指定のパス・実体・dev/inode が一致する候補を消さない（`sweep_stale_temps(dir, is_temp, protected)`）
+
+  | 経路 | 拒否（終了コード 2） | 掃除の保護 |
+  | ---- | -------------------- | ---------- |
+  | 通常起動 `--db`・`--users`・TLS 証明書/鍵・SCRAM モック鍵・ストップワード/同義語・リランカーのモデル/トークナイザ | 起動前に新規・既存を問わず拒否 | 起動時の掃除（アーカイブ先）に全件を保護として渡す |
+  | `--replication-roles`・`--credentials`（`replica`・`replica-resync`・`--replica-credentials`） | 解析時に拒否 | 掃除を行わない経路 |
+  | `restore --db` `backup --out` `backup-incremental --out` dump 系 `--out`・`--db`・`replica-resync --out`（新規パス） | `validate_new_path` | 復元の掃除に入力を保護として渡す（`--db` は未作成） |
+  | `--db`（既存）・`--from`・`--base`・`--backup`・`--incremental`（既存ファイル） | `validate_existing_file`（`validate_db` 経由を含む） | `restore` の掃除に `--from`・`--incremental`・`--generation-state` を保護として渡す |
+  | `restore --generation-state` | 専用検査で新規・既存を問わず拒否 | 同上 |
+
+- 掃除の uid 確認用ファイルは専用の形式 `.fandhe-sweep-probe-*`（一時名と別）にし、確認中の SIGKILL で
+  残っても次の掃除が回収する。呼び出し側（crash-test）の「一時名の残骸の件数」には混ざらない
+- 対象外: `backup` の `.fandhe-snapshot-*`・`verify` の `.fandhe-verify-*`・`dump` 系の一時名・
+  `backup --incremental` の出力先の残骸（従来どおり手動）
+
 ### D7 増分バックアップと PITR の復元手順（#2168／#2169）
 
 - 増分バックアップ = 直前バックアップの LSN より後のセグメント区間。連鎖検証は LSN の連続性・
@@ -1043,8 +1087,8 @@ fsync が無いため。tmpfs の値は CPU コストの上限として併記）
     残りの 23 件は強制有効化下でも通る
   - 残課題（起票候補。Issue 化は人の判断）: ①未アーカイブ容量の上限と `54000` 拒否（RECOVER-14 (2)）は
     #3091 で実施済み（D6 の実装判断（Issue #3091））。アーカイブ先なしの構成には上限を適用していない（要判断）。
-    ②アーカイブファイルの保持と削除（RECOVER-14 (7)）は #3092 で実施済み（D6 の実装判断）。③無効化の仕様（Issue #3093 で実装。D13）。
-    ④一時名の残骸（`.fandhe-seg-*.tmp`）の自動掃除。⑤常時書き込みが続いて保守 commit の見送り（`skipped`）が
+    ②アーカイブファイルの保持と削除（RECOVER-14 (7)）は #3092 で実施済み（D6 の実装判断）。③無効化の仕様
+    （Issue #3093 で実装。D13）。④一時名の残骸（`.fandhe-seg-*.tmp`）の自動掃除は #3094 で実施済み（「残骸の掃除（Issue #3094）」）。⑤常時書き込みが続いて保守 commit の見送り（`skipped`）が
     続く飢餓。水位が進まず `change_log` 表が増え続ける。常駐スレッドは見送りが 6 回連続した時点で stderr に
     固定文言の警告を 1 回出すが（実装済み）、ゲートを確実に取る手段（容量上限に達したときの `acquire` への
     切り替え。D6）は #3091 で実施済み。⑥`change-log-verify --db` は `Storage::open` を使うため、
