@@ -394,6 +394,26 @@ fn view_like_order_with_deps<E>(
     Ok((ordered, deps))
 }
 
+/// 範囲内のマテリアライズド VIEW の定義を返す（論理ダンプ前の列構成の照合用。Issue #3097）。
+/// SCHEMA 配下の定義は戻せないため、`view_like_order` と同じく固定文言で全体を失敗させる。
+pub(super) fn in_scope_materialized_defs<E>(
+    ctx: &Ctx<'_>,
+) -> Result<Vec<MaterializedViewDef>, SchemaDdlError<E>> {
+    let mut out = Vec::new();
+    for (k, v) in read_str_table::<E>(ctx, MATERIALIZED_VIEWS_TABLE)? {
+        if in_scope(ctx, &k)? {
+            if matches!(ctx.namer.scope::<E>(&k)?, KeyScope::Tenant { .. }) {
+                return Err(unsupported(
+                    "materialized view",
+                    "schema-scoped materialized view cannot be recreated by SQL",
+                ));
+            }
+            out.push(decode_materialized_view_def(&k, &v)?);
+        }
+    }
+    Ok(out)
+}
+
 /// 範囲内の VIEW とマテリアライズド VIEW。読む relation を先に出す（トポロジカル順）。
 /// マテリアライズド VIEW は `WITH NO DATA`（実体は運ばない）で出す。
 fn export_views<E>(ctx: &Ctx<'_>, out: &mut Emitter<'_, E>) -> Result<(), SchemaDdlError<E>> {

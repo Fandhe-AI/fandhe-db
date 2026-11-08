@@ -4339,6 +4339,36 @@ impl EngineCore {
         self.storage.export_table_data(scope, format, sink)
     }
 
+    /// 論理ダンプの範囲内のマテリアライズド VIEW について、保存済みの列と本文から再導出した列の
+    /// 一致を確かめる。不一致・再導出の失敗は固定文言の `Unsupported`（存在を示す情報は含めない）。
+    fn check_matview_columns_for_dump<E>(
+        &self,
+        scope: &crate::catalog::ddl_export::SchemaDdlScope,
+    ) -> std::result::Result<(), crate::catalog::ddl_export::SchemaDdlError<E>> {
+        let defs = self.storage.scoped_materialized_view_defs::<E>(scope)?;
+        if defs.is_empty() {
+            return Ok(());
+        }
+        let session = crate::sql::mode::SessionState::default();
+        for def in defs {
+            let mismatch = || {
+                crate::catalog::ddl_export::unsupported::<E>(
+                    "materialized view",
+                    "materialized view definition no longer matches its source columns",
+                )
+            };
+            let view_columns = self
+                .view_output_columns(&session, &def.body_sql, &def.column_aliases)
+                .map_err(|_| mismatch())?;
+            let current = crate::sql::matview::column_defs_from_view_columns(&view_columns)
+                .map_err(|_| mismatch())?;
+            if current != def.columns {
+                return Err(mismatch());
+            }
+        }
+        Ok(())
+    }
+
     /// スキーマ（`PreData`）・表データ・スキーマ（`PostData`）を単一の読み取りスナップショットから
     /// この順に書き出す（RECOVER-16・Issue #2161）。[`Storage::export_logical_dump`] へそのまま委譲する
     /// （定義とデータが同じ commit 点に対応する。SQL・NoSQL の表層からは呼べない）。
@@ -4351,6 +4381,10 @@ impl EngineCore {
         crate::catalog::ddl_export::LogicalDumpSummary,
         crate::catalog::ddl_export::SchemaDdlError<E>,
     > {
+        // マテリアライズド VIEW は本文を `WITH NO DATA` で再実行して復元するため、保存済みの列構成と
+        // 本文から再導出した列構成がずれる定義（基表への `ADD COLUMN` 後の `SELECT *` 等）は、復元で
+        // 列構成・`REFRESH` のエラー契約が黙って変わる。ダンプ全体を拒否する（fail-closed。Issue #3097）。
+        self.check_matview_columns_for_dump(scope)?;
         self.storage.export_logical_dump(scope, format, sink)
     }
 

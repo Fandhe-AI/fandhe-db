@@ -306,8 +306,12 @@ fn is_create_matview_no_data(sql: &str) -> bool {
         && sql.len() > "CREATE MATERIALIZED VIEW  WITH NO DATA".len()
 }
 
-/// 単引用符の文字列・二重引用符の識別子の外に、行コメント `--` またはブロックコメント `/*` があるか。
-/// 引用符は閉じるまで読み飛ばす（`''` / `""` の連続は閉じて直ちに開き直す扱いで同じ結果になる）。
+/// 単引用符の文字列・二重引用符の識別子・ドル引用（`$$...$$`・`$tag$...$tag$`）の外に、行コメント
+/// `--` またはブロックコメント `/*` があるか。引用符は閉じるまで読み飛ばす（`''` / `""` の連続は
+/// 閉じて直ちに開き直す扱いで同じ結果になる）。ドル引用は engine の lexer と同じ境界（タグは ASCII の
+/// `[A-Za-z_][A-Za-z0-9_]*`、空も可。終端は同一区切りの最初の出現）で読み飛ばし、本文中の引用符で
+/// 状態が狂わないようにする。直前が識別子継続文字の開始形・終端の無い開始形は engine の lexer が
+/// 拒否する形のため、判定できないものとして `true`（拒否側）に倒す。
 fn has_comment_outside_quotes(sql: &str) -> bool {
     let b = sql.as_bytes();
     let mut i = 0;
@@ -323,12 +327,67 @@ fn has_comment_outside_quotes(sql: &str) -> bool {
                 b'\'' | b'"' => quote = Some(c),
                 b'-' if b.get(i + 1) == Some(&b'-') => return true,
                 b'/' if b.get(i + 1) == Some(&b'*') => return true,
+                b'$' => match dollar_quote_end(sql, i) {
+                    DollarScan::NotQuote => {}
+                    DollarScan::Reject => return true,
+                    DollarScan::Skip(end) => {
+                        i = end;
+                        continue;
+                    }
+                },
                 _ => {}
             },
         }
         i += 1;
     }
     false
+}
+
+/// [`dollar_quote_end`] の結果。
+enum DollarScan {
+    /// ドル引用の開始形ではない（`$1`・単独 `$` 等）。
+    NotQuote,
+    /// 開始形だが直前が識別子継続文字、または終端が無い（engine の lexer が拒否する形）。
+    Reject,
+    /// 完結したドル引用。直後の位置へ進める。
+    Skip(usize),
+}
+
+/// `start`（`$` の位置）からドル引用を走査する（engine の `dollar_quote_scan` と同じ判定）。
+fn dollar_quote_end(sql: &str, start: usize) -> DollarScan {
+    const MAX_TAG_LEN: usize = 63;
+    let b = sql.as_bytes();
+    let tag_start = start + 1;
+    let mut j = tag_start;
+    match b.get(j) {
+        Some(b'$') => {}
+        Some(c) if c.is_ascii_alphabetic() || *c == b'_' => {
+            while b
+                .get(j)
+                .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_')
+            {
+                j += 1;
+            }
+            if b.get(j) != Some(&b'$') || j - tag_start > MAX_TAG_LEN {
+                return DollarScan::NotQuote;
+            }
+        }
+        _ => return DollarScan::NotQuote,
+    }
+    let content_start = j + 1;
+    if let Some(prev) = start.checked_sub(1).and_then(|p| b.get(p)) {
+        if prev.is_ascii_alphanumeric() || *prev == b'_' {
+            return DollarScan::Reject;
+        }
+    }
+    let (Some(delim), Some(rest)) = (sql.get(start..content_start), sql.get(content_start..))
+    else {
+        return DollarScan::Reject;
+    };
+    match rest.find(delim) {
+        Some(pos) => DollarScan::Skip(content_start + pos + delim.len()),
+        None => DollarScan::Reject,
+    }
 }
 
 /// `REFRESH MATERIALIZED VIEW <名前>` の厳密な形か。`CONCURRENTLY`・`WITH [NO] DATA`・複数名・後続の語は
@@ -777,6 +836,28 @@ mod tests {
             "CREATE MATERIALIZED VIEW \"mv\" AS SELECT id FROM t -- WITH NO DATA",
             "CREATE MATERIALIZED VIEW \"mv\" AS SELECT id FROM t /* x */ WITH NO DATA",
             "CREATE MATERIALIZED VIEW \"mv\" AS SELECT id FROM t --\n WITH NO DATA",
+        ] {
+            assert!(!is_create_matview_no_data(sql), "{sql}");
+        }
+    }
+
+    #[test]
+    fn matview_no_data_check_tracks_dollar_quotes() {
+        // ドル引用内の引用符・コメント記号は文字列の一部（許可）。
+        assert!(is_create_matview_no_data(
+            "CREATE MATERIALIZED VIEW \"mv\" AS SELECT $$a'--b$$ FROM t WITH NO DATA"
+        ));
+        assert!(is_create_matview_no_data(
+            "CREATE MATERIALIZED VIEW \"mv\" AS SELECT $q$x\"/*$q$ FROM t WITH NO DATA"
+        ));
+        // ドル引用内の引用符で状態が狂い、後ろのコメントが隠れる形は拒否する。
+        for sql in [
+            "CREATE MATERIALIZED VIEW \"mv\" AS SELECT $$'$$ FROM t -- WITH NO DATA",
+            "CREATE MATERIALIZED VIEW \"mv\" AS SELECT $$\"$$ FROM t /* x */ WITH NO DATA",
+            "CREATE MATERIALIZED VIEW \"mv\" AS SELECT $t$'$t$ FROM t --\n WITH NO DATA",
+            // 終端の無いドル引用・直前が語の開始形は拒否側。
+            "CREATE MATERIALIZED VIEW \"mv\" AS SELECT $$x FROM t WITH NO DATA",
+            "CREATE MATERIALIZED VIEW \"mv\" AS SELECT a$$x$$ FROM t WITH NO DATA",
         ] {
             assert!(!is_create_matview_no_data(sql), "{sql}");
         }

@@ -218,7 +218,7 @@ impl<E> From<redb::Error> for SchemaDdlError<E> {
 }
 
 /// 書き出せないオブジェクトのエラーを作る。
-fn unsupported<E>(kind: &'static str, reason: &'static str) -> SchemaDdlError<E> {
+pub(crate) fn unsupported<E>(kind: &'static str, reason: &'static str) -> SchemaDdlError<E> {
     SchemaDdlError::Unsupported(UnsupportedSchemaObject { kind, reason })
 }
 
@@ -400,6 +400,30 @@ pub struct LogicalDumpSummary {
 }
 
 impl Storage {
+    /// 範囲内のマテリアライズド VIEW の保存済み定義を返す（`EngineCore::export_logical_dump` が、
+    /// 保存済みの列構成と本文から再導出した列構成の一致を確かめるために呼ぶ。Issue #3097）。
+    pub(crate) fn scoped_materialized_view_defs<E>(
+        &self,
+        scope: &SchemaDdlScope,
+    ) -> Result<Vec<crate::catalog::materialized::MaterializedViewDef>, SchemaDdlError<E>> {
+        if let Some(t) = scope.tenant() {
+            super::role::validate_tenant(t).map_err(SchemaDdlError::Catalog)?;
+        }
+        let rt = self.db().begin_read().map_err(CatalogError::from)?;
+        let namer = Namer {
+            schemas: match scope.tenant() {
+                Some(t) => schema_names_for_tenant_in_txn(&rt, t)?,
+                None => BTreeMap::new(),
+            },
+        };
+        let ctx = Ctx {
+            rt: &rt,
+            scope,
+            namer,
+        };
+        object::in_scope_materialized_defs(&ctx)
+    }
+
     /// スキーマ（`PreData`）・表データ・スキーマ（`PostData`）を、読み取りトランザクション 1 つの上で
     /// この順に `sink` へ渡す（RECOVER-16 (1)(2)）。全体が単一の commit 点の内容に対応するため、
     /// 定義とデータが食い違わない。契約・失敗時の扱いは [`Storage::export_schema_ddl`]・

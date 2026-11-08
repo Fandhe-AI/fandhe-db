@@ -613,6 +613,37 @@ fn populated_materialized_view_over_unpopulated_one_fails_the_dump() {
     assert!(matches!(err, SchemaDdlError::Unsupported(_)), "{err:?}");
 }
 
+/// 基表への `ADD COLUMN` で `SELECT *` の出力列が保存済みの列とずれた matview は、復元すると列構成と
+/// `REFRESH` のエラー契約が黙って変わるため、論理ダンプ全体を失敗させる（Issue #3097）。
+#[test]
+fn materialized_view_with_drifted_columns_fails_the_logical_dump() {
+    let p1 = unique_db_path("dump-matview-drifted-columns");
+    let _g1 = CleanupGuard(p1.clone());
+    let src = open_core(&p1);
+    for sql in [
+        "CREATE TABLE base (a INTEGER PRIMARY KEY)",
+        "INSERT INTO base (a) VALUES (1)",
+        "CREATE MATERIALIZED VIEW mv AS SELECT * FROM base",
+    ] {
+        ok(&src, "tenant-a", sql);
+    }
+    let scope = SchemaDdlScope::shared_and_tenant("tenant-a");
+    // ずれる前は出力できる。
+    logical(&src, &scope);
+    ok(&src, "tenant-a", "ALTER TABLE base ADD COLUMN b TEXT");
+    let err = src
+        .export_logical_dump(
+            &scope,
+            engine::catalog::ddl_export::TableDataFormat::Insert,
+            |_| Ok::<(), std::convert::Infallible>(()),
+        )
+        .expect_err("drifted matview must fail the dump");
+    assert!(
+        matches!(&err, SchemaDdlError::Unsupported(u) if u.kind == "materialized view"),
+        "{err:?}"
+    );
+}
+
 #[test]
 fn output_order_does_not_depend_on_internal_schema_ids() {
     // SCHEMA を名前の逆順に作ると内部 ID が名前順と逆になる。復元先では名前順に ID が付き直されるため、
