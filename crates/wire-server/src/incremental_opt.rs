@@ -3,7 +3,8 @@
 //!
 //! 責務境界: untrusted な CLI 文字列（`--db`・`--base`・`--out`）を検証済みの [`IncrementalArgs`] に変換し、
 //! engine の結果を (終了コード, 固定の英語文) へ対応づけるところまで。連鎖検証・書き出しは
-//! `engine::storage::{chain_point_of, ReadOnlyStorage::export_incremental}` で、`main.rs::run_backup_incremental`
+//! `engine::storage::{chain_point_of, ReadOnlyStorage::export_incremental}`（`--change-log-archive-dir` 指定時は
+//! `export_incremental_with_archive`。刈り込み済みの区間をアーカイブから補う）で、`main.rs::run_backup_incremental`
 //! が薄く呼ぶ（停止中の DB を読み取り専用で開く。稼働中のサーバーからの取得は #2169 以降）。
 //! 復元側（ベース＋増分の適用）は `restore --incremental`（[`crate::restore_opt`]）。
 //!
@@ -28,22 +29,26 @@ pub struct IncrementalArgs {
     pub base: PathBuf,
     /// 出力先（まだ存在しない新規パス）。
     pub out: PathBuf,
+    /// 刈り込み済みの区間を補うアーカイブ先（変更ログのアーカイブ。既存のディレクトリ・絶対パス。
+    /// Issue #3099・RECOVER-14）。指定がなければアーカイブを見ない。
+    pub archive_dir: Option<PathBuf>,
 }
 
 /// `backup-incremental` サブコマンドの引数（サブコマンド名より後ろ）を解釈する。未知の引数・値欠落・
 /// 重複指定・必須欠落は拒否する（fail-closed。エラー文は英語で、パスの内容は含めない）。
 pub fn parse(args: &[String]) -> Result<IncrementalArgs, String> {
-    const USAGE: &str =
-        "unknown argument (usage: backup-incremental --db <path> --base <path> --out <path>)";
+    const USAGE: &str = "unknown argument (usage: backup-incremental --db <path> --base <path> --out <path> [--change-log-archive-dir <dir>])";
     let mut db: Option<&str> = None;
     let mut base: Option<&str> = None;
     let mut out: Option<&str> = None;
+    let mut archive: Option<&str> = None;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         let slot = match arg.as_str() {
             "--db" => &mut db,
             "--base" => &mut base,
             "--out" => &mut out,
+            "--change-log-archive-dir" => &mut archive,
             _ => return Err(USAGE.into()),
         };
         if slot.is_some() {
@@ -61,6 +66,9 @@ pub fn parse(args: &[String]) -> Result<IncrementalArgs, String> {
         db: validate_db(db)?,
         base: validate_existing_file("--base", base)?,
         out: validate_new_path("--out", out)?,
+        archive_dir: archive
+            .map(|d| crate::change_log_opt::accept_archive_dir(false, d))
+            .transpose()?,
     })
 }
 
@@ -98,6 +106,36 @@ mod tests {
         assert!(parse(&v(&["--db", "a", "--db", "b", "--base", "c", "--out", "d"])).is_err());
         assert!(parse(&v(&["--db", "a", "--base", "b"])).is_err());
         assert!(parse(&v(&["--db", "a", "--out", "b"])).is_err());
+    }
+
+    #[test]
+    fn archive_dir_is_optional_validated_and_not_repeatable() {
+        let exe = std::env::current_exe().expect("current_exe");
+        let exe = exe.to_str().expect("utf-8 path");
+        let tmp = std::env::temp_dir();
+        let tmp = tmp.to_str().expect("utf-8 path");
+        let out = format!("{tmp}/incremental-opt-test-not-existing-out");
+        let base = ["--db", exe, "--base", exe, "--out", out.as_str()];
+        let with = |extra: &[&str]| {
+            let mut a: Vec<&str> = base.to_vec();
+            a.extend_from_slice(extra);
+            parse(&v(&a))
+        };
+        assert_eq!(with(&[]).expect("no archive").archive_dir, None);
+        let ok = with(&["--change-log-archive-dir", tmp]).expect("archive");
+        assert!(ok.archive_dir.as_deref().is_some_and(|d| d.is_absolute()));
+        // 値欠落・重複・存在しない・ディレクトリでない・`..` 成分は拒否する。
+        assert!(with(&["--change-log-archive-dir"]).is_err());
+        assert!(with(&[
+            "--change-log-archive-dir",
+            tmp,
+            "--change-log-archive-dir",
+            tmp
+        ])
+        .is_err());
+        assert!(with(&["--change-log-archive-dir", "/nonexistent-archive-dir-test"]).is_err());
+        assert!(with(&["--change-log-archive-dir", exe]).is_err());
+        assert!(with(&["--change-log-archive-dir", "../x"]).is_err());
     }
 
     #[test]
