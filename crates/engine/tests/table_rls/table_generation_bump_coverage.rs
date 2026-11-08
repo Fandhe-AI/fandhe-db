@@ -620,6 +620,9 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // （同じ理由で対象外）。
     ("catalog/role/bootstrap.rs", 599),
     ("catalog/role/bootstrap/tests.rs", 42),
+    // Issue #3096: 論理ダンプの復元指示（`Storage::apply_restore_directive`）。ロール・権限・既定権限・
+    // 初期権限・マーカーの専用表だけを書き、表の行・スキーマ・世代に影響しない（同じ理由で対象外）。
+    ("catalog/ddl_export/restore_apply.rs", 320),
     // Issue #2232: メンバーシップの付与・取り消し（`apply_membership_changes`）とロール作成＋付与
     // （`create_role_with_memberships`）。メンバーシップ表だけを書き、表の計画・世代に影響しない（同じ理由）。
     ("catalog/role/membership_apply.rs", 314),

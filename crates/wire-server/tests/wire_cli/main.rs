@@ -16,6 +16,7 @@ mod backup_cli;
 mod batch_max_files_parity;
 mod dump_cli;
 mod dump_roundtrip_cli;
+mod dump_users_cli;
 mod incremental_backup_cli;
 mod incremental_backup_socket_cli;
 mod persist4_second_server_same_db;

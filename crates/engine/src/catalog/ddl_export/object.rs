@@ -135,6 +135,8 @@ pub(super) fn export_post_data<E>(
     export_sequence_values(ctx, out, &seqs)?;
     access::export_triggers(ctx, out)?;
     access::export_row_security_and_policies(ctx, out)?;
+    // ロール・権限の状態は最後に置く（既定権限が復元中に作るオブジェクトへ効かないようにする）。
+    super::privilege::export_access_state(ctx, out)?;
     Ok(())
 }
 
