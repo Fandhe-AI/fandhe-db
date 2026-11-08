@@ -20,7 +20,7 @@
 //!   #2169 の PITR（指定 LSN・時刻での停止。`pitr`）が同じ再生器を共有できるよう、セグメント列の再生を
 //!   1 関数（`replay_segments`）にまとめている（`pitr` が解決した停止 LSN を渡す）
 //!
-//! 呼び出し元は wire-server の `backup-incremental`・`restore --incremental`（`incremental_opt`・
+//! 呼び出し元は wire-server の `backup-incremental`（`--db`）・`backup_socket`（稼働中。#3098）・`restore --incremental`（`incremental_opt`・
 //! `restore_opt`）。出力先・複製の公開手順（一時名 → fsync → `hard_link`）は呼び出し側と engine の
 //! `archive::publish_with` が担う。復元後の世代番号の進行（RECOVER-17・#2446）はここでは行わない。
 //!
@@ -107,6 +107,8 @@ pub enum IncrementalError {
     InvalidDestination,
     /// 出力先のディレクトリが他者に書き込める。
     InsecureDirectory,
+    /// 別のバックアップ書き出し（フル・増分）が稼働中の DB 上で実行中（同時 1 本まで。Issue #3098）。
+    InProgress,
     /// レコードのストレージ形式の版数が、この実装の版数と異なる。
     UnsupportedFormat,
     /// レコードを適用できない（未知の shape・存在しない表への変更・既存の表の作成・記録範囲外の表・
@@ -148,6 +150,7 @@ impl std::fmt::Display for IncrementalError {
             Self::DestinationExists => "incremental backup destination already exists",
             Self::InvalidDestination => "invalid incremental backup destination",
             Self::InsecureDirectory => "incremental backup directory is writable by other users",
+            Self::InProgress => "another backup export is in progress",
             Self::UnsupportedFormat => "record storage format version is not supported",
             Self::BadRecord => "incremental backup holds a record that cannot be applied",
             Self::BadSegmentList => "the list of incremental backups is empty or too long",
@@ -276,6 +279,19 @@ pub fn chain_point_of(path: &Path) -> Result<ChainPoint> {
 // ---------------------------------------------------------------------------
 // 出力
 // ---------------------------------------------------------------------------
+
+/// 稼働中の [`Storage`] からの増分書き出し（Issue #3098）。フルバックアップの書き出しと同じ実行中フラグを
+/// 共有し、フル・増分を通じて同時 1 本に制限する（長い読み取り Tx がページ回収を止めるため。超過は
+/// [`IncrementalError::InProgress`]）。wire-server の運用者専用ソケットが `EngineCore` 経由で呼ぶ。
+pub(in crate::storage) fn export_live(
+    storage: &crate::storage::Storage,
+    base: &ChainPoint,
+    dest: &Path,
+) -> Result<IncrementalSummary> {
+    let _busy = super::super::snapshot::try_acquire_busy(&storage.snapshot_export_busy)
+        .ok_or(IncrementalError::InProgress)?;
+    export_from_read(&storage.db.begin_read()?, base, dest)
+}
 
 /// [`Storage::export_incremental`](crate::storage::Storage::export_incremental) の本体。`read` は出力元の
 /// 読み取りトランザクション（開始時点の単一スナップショット。書き込みを止めない）。アーカイブは見ない

@@ -1077,3 +1077,85 @@ fn export_with_archive_rejects_a_hole_in_the_database_side() {
     ));
     assert!(!dest.exists());
 }
+
+/// 稼働中の書き込みを止めずに増分を取れ、取得時点（末尾 LSN）の状態になること（Issue #3098）。
+/// 書き込みを流し続けながら取った増分をベースへ適用し、その終点から取り直した次の増分を重ねると
+/// 最新と一致する（先頭から欠けなく連続した接頭辞であることの確認）。
+#[test]
+fn live_export_under_concurrent_writes_is_a_consistent_prefix() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    let fx = Fixture::new("inc-live");
+    fx.write_round_1();
+    let (base, base_point) = fx.full_backup("base.redb");
+
+    let stop = AtomicBool::new(false);
+    let done = AtomicU64::new(0);
+    let (inc1, last_lsn) = std::thread::scope(|s| {
+        s.spawn(|| {
+            let mut i = 100;
+            while !stop.load(Ordering::Acquire) {
+                fx.sql(&format!(
+                    "INSERT INTO ev (id, embedding) VALUES ({i}, '[0.1,0.2]')"
+                ));
+                i += 1;
+                done.fetch_add(1, Ordering::Release);
+            }
+        });
+        while done.load(Ordering::Acquire) < 3 {
+            std::thread::yield_now();
+        }
+        let p = fx.path("inc1.seg");
+        let r = fx.core.export_incremental(&base_point, &p);
+        stop.store(true, Ordering::Release);
+        (p, r.expect("live export").last_lsn)
+    });
+    assert!(last_lsn > base_point.end_lsn);
+    assert!(last_lsn <= fx.generation());
+
+    let work = TempDir::new("inc-live-work");
+    let restored = copy_to(&base, &work, "restored.redb");
+    let summary =
+        apply_incremental_segments(&restored, std::slice::from_ref(&inc1)).expect("apply");
+    assert_eq!(summary.last_lsn, last_lsn);
+
+    // 取得時点の終点から最新までを重ねると最新と一致する。
+    let point1 = chain_point_of(&inc1).expect("inc1 point");
+    assert_eq!(point1.end_lsn, last_lsn);
+    if point1.end_lsn < fx.generation() {
+        let inc2 = fx.increment(&point1, "inc2.seg");
+        apply_incremental_segments(&restored, &[inc2]).expect("apply inc2");
+    }
+    assert_matches_latest(&fx, &restored);
+}
+
+/// 書き出しはフル・増分を通じて同時 1 本まで。実行中は `InProgress` で何も作らず、終われば再び取れる。
+#[test]
+fn live_export_is_limited_to_one_at_a_time_shared_with_full_backups() {
+    use std::sync::atomic::Ordering;
+
+    let fx = Fixture::new("inc-busy");
+    fx.write_round_1();
+    let (_, point) = fx.full_backup("base.redb");
+    fx.write_round_2();
+
+    fx.storage()
+        .snapshot_export_busy
+        .store(true, Ordering::Release);
+    let dest = fx.path("busy.seg");
+    assert!(matches!(
+        fx.storage().export_incremental(&point, &dest),
+        Err(IncrementalError::InProgress)
+    ));
+    assert!(std::fs::symlink_metadata(&dest).is_err());
+    // 拒否された側は、他方の実行中フラグを解放しない。
+    assert!(fx.storage().snapshot_export_busy.load(Ordering::Acquire));
+    fx.storage()
+        .snapshot_export_busy
+        .store(false, Ordering::Release);
+
+    fx.storage()
+        .export_incremental(&point, &dest)
+        .expect("export");
+    assert!(!fx.storage().snapshot_export_busy.load(Ordering::Acquire));
+}
