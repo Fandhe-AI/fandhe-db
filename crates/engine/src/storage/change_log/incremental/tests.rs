@@ -799,3 +799,428 @@ fn apply_never_touches_the_restore_generation_table() {
         assert_eq!(s.restore_generation().expect("read"), advanced, "{label}");
     }
 }
+// ---------------------------------------------------------------------------
+// 刈り込み済みの区間をアーカイブから補う増分（Issue #3099・RECOVER-14）
+// ---------------------------------------------------------------------------
+
+use crate::storage::ArchiveOptions;
+
+/// 表の行の LSN 一覧（昇順）。
+fn log_lsns(fx: &Fixture) -> Vec<u64> {
+    let read = fx.storage().db().begin_read().expect("read");
+    let t = read.open_table(CHANGE_LOG_TABLE).expect("table");
+    t.iter()
+        .expect("iter")
+        .map(|e| e.expect("entry").0.value())
+        .collect()
+}
+
+/// 未アーカイブの分を `dir` へ書き出し、`retain` 件を残して刈り込む（実際の保守の経路）。
+fn archive_and_prune(fx: &Fixture, dir: &Path, segment_bytes: usize, retain: u64) {
+    let mut opts = ArchiveOptions::new(dir);
+    opts.segment_bytes = segment_bytes;
+    opts.retain_records = Some(retain);
+    for _ in 0..4 {
+        fx.storage().archive_change_log(&opts).expect("archive");
+    }
+}
+
+/// ベース取得後に更新し、アーカイブして全件を刈り込み、さらに更新した状態を作る。
+/// 戻り値は（フィクスチャ、ベースのファイル、ベースの終点、アーカイブ先）。
+fn pruned_fixture(label: &str, segment_bytes: usize) -> (Fixture, PathBuf, ChainPoint, TempDir) {
+    let fx = Fixture::new(label);
+    fx.write_round_1();
+    let (base, point) = fx.full_backup("base.redb");
+    fx.write_round_2();
+    let archive = private_dir(&format!("{label}-arc"));
+    archive_and_prune(&fx, archive.path(), segment_bytes, 0);
+    fx.write_round_3();
+    (fx, base, point, archive)
+}
+
+fn archive_segments(dir: &Path) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = std::fs::read_dir(dir)
+        .expect("read_dir")
+        .map(|e| e.expect("entry").path())
+        .collect();
+    v.sort();
+    v
+}
+
+/// 1 レコード 1 セグメントのアーカイブから、先頭が `lsn` のセグメントのパス。
+fn needed_segment(dir: &Path, lsn: u64) -> PathBuf {
+    let suffix = format!("-{lsn:020}-{lsn:020}.seg");
+    archive_segments(dir)
+        .into_iter()
+        .find(|p| p.to_string_lossy().ends_with(&suffix))
+        .expect("segment")
+}
+
+#[test]
+fn export_fills_the_pruned_range_from_the_archive() {
+    // セグメントの大きさを変えて、ベースの終点がセグメントの途中・境界に落ちる配置を通す。
+    for segment_bytes in [1usize, 300, 700, 100_000] {
+        let (fx, base, point, archive) = pruned_fixture("inc-fill", segment_bytes);
+        let dest = fx.path("with-archive.seg");
+        assert!(
+            log_lsns(&fx)[0] > point.end_lsn + 1,
+            "the head of the range must be pruned"
+        );
+        // アーカイブを指定しなければ従来どおり拒否する。
+        assert!(matches!(
+            fx.storage()
+                .export_incremental(&point, fx.path("plain.seg")),
+            Err(IncrementalError::RangeUnavailable)
+        ));
+        let summary = fx
+            .storage()
+            .export_incremental_with_archive(&point, archive.path(), &dest)
+            .expect("export with archive");
+        assert_eq!(summary.first_lsn, point.end_lsn + 1);
+        assert_eq!(summary.last_lsn, fx.generation());
+        let info = verify_segment_file(&dest, usize::MAX >> 8).expect("verify");
+        assert_eq!(info.header.record_count, summary.records);
+
+        let work = TempDir::new("inc-fill-work");
+        let restored = copy_to(&base, &work, "restored.redb");
+        apply_incremental_segments(&restored, &[dest]).expect("apply");
+        assert_matches_latest(&fx, &restored);
+    }
+}
+
+#[test]
+fn export_works_when_every_row_is_pruned_and_chains_across_prunes() {
+    let fx = Fixture::new("inc-all-pruned");
+    fx.write_round_1();
+    let (base, point) = fx.full_backup("base.redb");
+    fx.write_round_2();
+    let archive = private_dir("inc-all-pruned-arc");
+    archive_and_prune(&fx, archive.path(), 400, 0);
+    assert!(log_lsns(&fx).is_empty(), "the whole log is pruned");
+    let inc1 = fx.path("inc1.seg");
+    fx.storage()
+        .export_incremental_with_archive(&point, archive.path(), &inc1)
+        .expect("all pruned");
+    let p1 = chain_point_of(&inc1).expect("point");
+
+    // 前回の増分をベースにした次の増分も、刈り込みをまたいで作れる。
+    fx.write_round_3();
+    archive_and_prune(&fx, archive.path(), 400, 0);
+    let inc2 = fx.path("inc2.seg");
+    fx.storage()
+        .export_incremental_with_archive(&p1, archive.path(), &inc2)
+        .expect("second");
+
+    let work = TempDir::new("inc-all-pruned-work");
+    let restored = copy_to(&base, &work, "restored.redb");
+    apply_incremental_segments(&restored, &[inc1, inc2]).expect("apply");
+    assert_matches_latest(&fx, &restored);
+}
+
+#[test]
+fn export_with_archive_matches_the_plain_export_when_nothing_is_pruned() {
+    let fx = Fixture::new("inc-not-pruned");
+    fx.write_round_1();
+    let (_, point) = fx.full_backup("base.redb");
+    fx.write_round_2();
+    let archive = private_dir("inc-not-pruned-arc");
+    let plain = fx.increment(&point, "plain.seg");
+    // 存在しないアーカイブ先でも、補う必要が無ければ開かない。
+    let with = fx.path("with.seg");
+    fx.storage()
+        .export_incremental_with_archive(&point, archive.path().join("missing"), &with)
+        .expect("export");
+    assert_eq!(
+        std::fs::read(&plain).expect("plain"),
+        std::fs::read(&with).expect("with")
+    );
+}
+
+#[test]
+fn export_uses_archive_segments_that_overlap_the_retained_rows() {
+    let fx = Fixture::new("inc-overlap");
+    fx.write_round_1();
+    let (base, point) = fx.full_backup("base.redb");
+    fx.write_round_2();
+    fx.write_round_3();
+    let archive = private_dir("inc-overlap-arc");
+    // 直近 3 件を DB に残す（アーカイブのセグメントは、DB の残りと重なる区間も持つ）。
+    archive_and_prune(&fx, archive.path(), 100_000, 3);
+    assert_eq!(log_lsns(&fx).len(), 3);
+    let dest = fx.path("inc.seg");
+    fx.storage()
+        .export_incremental_with_archive(&point, archive.path(), &dest)
+        .expect("export");
+    let work = TempDir::new("inc-overlap-work");
+    let restored = copy_to(&base, &work, "restored.redb");
+    apply_incremental_segments(&restored, &[dest]).expect("apply");
+    assert_matches_latest(&fx, &restored);
+
+    // 重なる区間の内容が DB の行と食い違う（分岐した系列）ときは拒否する。
+    let lsns = log_lsns(&fx);
+    let other = {
+        let read = fx.storage().db().begin_read().expect("read");
+        let t = read.open_table(CHANGE_LOG_TABLE).expect("table");
+        let v = t.get(lsns[1]).expect("get").expect("row").value().to_vec();
+        v
+    };
+    {
+        let txn = fx.storage().db().begin_write().expect("write");
+        {
+            let mut t = txn.open_table(CHANGE_LOG_TABLE).expect("table");
+            t.insert(lsns[0], other.as_slice()).expect("insert");
+        }
+        txn.commit().expect("commit");
+    }
+    let bad = fx.path("diverged.seg");
+    assert!(matches!(
+        fx.storage()
+            .export_incremental_with_archive(&point, archive.path(), &bad),
+        Err(IncrementalError::ChainBroken)
+    ));
+    assert!(!bad.exists());
+}
+
+#[test]
+fn export_rejects_missing_tampered_foreign_and_shared_archives() {
+    // 必要な区間の先頭のセグメントが欠けている。
+    let (fx, _, point, archive) = pruned_fixture("inc-missing", 1);
+    let dest = fx.path("x.seg");
+    std::fs::remove_file(needed_segment(archive.path(), point.end_lsn + 1)).expect("remove first");
+    assert!(matches!(
+        fx.storage()
+            .export_incremental_with_archive(&point, archive.path(), &dest),
+        Err(IncrementalError::RangeUnavailable)
+    ));
+    assert!(!dest.exists());
+
+    // 途中のセグメントが欠けている。
+    let (fx, _, point, archive) = pruned_fixture("inc-hole", 1);
+    std::fs::remove_file(needed_segment(archive.path(), point.end_lsn + 2)).expect("remove middle");
+    let dest = fx.path("x.seg");
+    assert!(matches!(
+        fx.storage()
+            .export_incremental_with_archive(&point, archive.path(), &dest),
+        Err(IncrementalError::RangeUnavailable)
+    ));
+    assert!(!dest.exists());
+
+    // 末尾側のセグメントが欠けている（刈り込み済みの区間の末尾まで届かない）。
+    let (fx, _, point, archive) = pruned_fixture("inc-tail", 1);
+    let segs = archive_segments(archive.path());
+    std::fs::remove_file(segs.last().expect("last")).expect("remove last");
+    let dest = fx.path("x.seg");
+    assert!(matches!(
+        fx.storage()
+            .export_incremental_with_archive(&point, archive.path(), &dest),
+        Err(IncrementalError::RangeUnavailable)
+    ));
+    assert!(!dest.exists());
+
+    // 1 バイトの改ざん。
+    let (fx, _, point, archive) = pruned_fixture("inc-tamper", 1);
+    flip_byte(&needed_segment(archive.path(), point.end_lsn + 1), 1);
+    let dest = fx.path("x.seg");
+    assert!(matches!(
+        fx.storage()
+            .export_incremental_with_archive(&point, archive.path(), &dest),
+        Err(IncrementalError::Segment(ArchiveError::ChecksumMismatch))
+    ));
+    assert!(!dest.exists());
+
+    // 別の DB のアーカイブ（名前の DB 識別子が違うので、区間を覆うものが無い）。
+    let (fx, _, point, _archive) = pruned_fixture("inc-foreign", 300);
+    let (_other_fx, _, _, other_archive) = pruned_fixture("inc-foreign-other", 300);
+    let dest = fx.path("x.seg");
+    assert!(matches!(
+        fx.storage()
+            .export_incremental_with_archive(&point, other_archive.path(), &dest),
+        Err(IncrementalError::RangeUnavailable)
+    ));
+    assert!(!dest.exists());
+
+    // 他者が書けるアーカイブ先は読み取りでも拒否する。
+    let (fx, _, point, archive) = pruned_fixture("inc-shared-arc", 300);
+    std::fs::set_permissions(archive.path(), std::fs::Permissions::from_mode(0o777))
+        .expect("chmod");
+    let dest = fx.path("x.seg");
+    assert!(matches!(
+        fx.storage()
+            .export_incremental_with_archive(&point, archive.path(), &dest),
+        Err(IncrementalError::InsecureDirectory)
+    ));
+    assert!(!dest.exists());
+    std::fs::set_permissions(archive.path(), std::fs::Permissions::from_mode(0o755))
+        .expect("chmod back");
+}
+
+#[test]
+fn export_with_archive_rejects_a_hole_in_the_database_side() {
+    let (fx, _, point, archive) = pruned_fixture("inc-db-hole", 300);
+    fx.sql("INSERT INTO ev (id, embedding) VALUES (30, '[0.1,0.2]')");
+    fx.sql("INSERT INTO ev (id, embedding) VALUES (31, '[0.1,0.2]')");
+    let lsns = log_lsns(&fx);
+    assert!(lsns.len() >= 3, "round 3 leaves rows in the log");
+    {
+        let txn = fx.storage().db().begin_write().expect("write");
+        {
+            let mut t = txn.open_table(CHANGE_LOG_TABLE).expect("table");
+            assert!(t.remove(lsns[1]).expect("remove").is_some());
+        }
+        txn.commit().expect("commit");
+    }
+    let dest = fx.path("x.seg");
+    assert!(matches!(
+        fx.storage()
+            .export_incremental_with_archive(&point, archive.path(), &dest),
+        Err(IncrementalError::RangeUnavailable)
+    ));
+    assert!(!dest.exists());
+}
+
+/// 稼働中の書き込みを止めずに増分を取れ、取得時点（末尾 LSN）の状態になること（Issue #3098）。
+/// 書き込みを流し続けながら取った増分をベースへ適用し、その終点から取り直した次の増分を重ねると
+/// 最新と一致する（先頭から欠けなく連続した接頭辞であることの確認）。
+#[test]
+fn live_export_under_concurrent_writes_is_a_consistent_prefix() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    let fx = Fixture::new("inc-live");
+    fx.write_round_1();
+    let (base, base_point) = fx.full_backup("base.redb");
+
+    let stop = AtomicBool::new(false);
+    let done = AtomicU64::new(0);
+    let (inc1, last_lsn) = std::thread::scope(|s| {
+        s.spawn(|| {
+            let mut i = 100;
+            while !stop.load(Ordering::Acquire) {
+                fx.sql(&format!(
+                    "INSERT INTO ev (id, embedding) VALUES ({i}, '[0.1,0.2]')"
+                ));
+                i += 1;
+                done.fetch_add(1, Ordering::Release);
+            }
+        });
+        while done.load(Ordering::Acquire) < 3 {
+            std::thread::yield_now();
+        }
+        let p = fx.path("inc1.seg");
+        let r = fx.core.export_incremental(&base_point, &p);
+        stop.store(true, Ordering::Release);
+        (p, r.expect("live export").last_lsn)
+    });
+    assert!(last_lsn > base_point.end_lsn);
+    assert!(last_lsn <= fx.generation());
+
+    let work = TempDir::new("inc-live-work");
+    let restored = copy_to(&base, &work, "restored.redb");
+    let summary =
+        apply_incremental_segments(&restored, std::slice::from_ref(&inc1)).expect("apply");
+    assert_eq!(summary.last_lsn, last_lsn);
+
+    // 取得時点の終点から最新までを重ねると最新と一致する。
+    let point1 = chain_point_of(&inc1).expect("inc1 point");
+    assert_eq!(point1.end_lsn, last_lsn);
+    if point1.end_lsn < fx.generation() {
+        let inc2 = fx.increment(&point1, "inc2.seg");
+        apply_incremental_segments(&restored, &[inc2]).expect("apply inc2");
+    }
+    assert_matches_latest(&fx, &restored);
+}
+
+/// 書き出しはフル・増分を通じて同時 1 本まで。実行中は `InProgress` で何も作らず、終われば再び取れる。
+#[test]
+fn live_export_is_limited_to_one_at_a_time_shared_with_full_backups() {
+    use std::sync::atomic::Ordering;
+
+    let fx = Fixture::new("inc-busy");
+    fx.write_round_1();
+    let (_, point) = fx.full_backup("base.redb");
+    fx.write_round_2();
+
+    fx.storage()
+        .snapshot_export_busy
+        .store(true, Ordering::Release);
+    let dest = fx.path("busy.seg");
+    assert!(matches!(
+        fx.storage().export_incremental(&point, &dest),
+        Err(IncrementalError::InProgress)
+    ));
+    assert!(std::fs::symlink_metadata(&dest).is_err());
+    // 拒否された側は、他方の実行中フラグを解放しない。
+    assert!(fx.storage().snapshot_export_busy.load(Ordering::Acquire));
+    fx.storage()
+        .snapshot_export_busy
+        .store(false, Ordering::Release);
+
+    fx.storage()
+        .export_incremental(&point, &dest)
+        .expect("export");
+    assert!(!fx.storage().snapshot_export_busy.load(Ordering::Acquire));
+}
+
+/// アーカイブ補完付きの書き出しも、フル・増分と同じ実行中フラグで同時 1 本に制限する（補完が不要でも取る）。
+#[test]
+fn live_export_with_archive_shares_the_busy_flag() {
+    use std::sync::atomic::Ordering;
+
+    let fx = Fixture::new("inc-busy-arc");
+    fx.write_round_1();
+    let (_, point) = fx.full_backup("base.redb");
+    fx.write_round_2();
+    let archive = private_dir("inc-busy-arc-dir");
+
+    fx.storage()
+        .snapshot_export_busy
+        .store(true, Ordering::Release);
+    let dest = fx.path("busy.seg");
+    assert!(matches!(
+        fx.storage()
+            .export_incremental_with_archive(&point, archive.path(), &dest),
+        Err(IncrementalError::InProgress)
+    ));
+    assert!(std::fs::symlink_metadata(&dest).is_err());
+    assert!(fx.storage().snapshot_export_busy.load(Ordering::Acquire));
+    fx.storage()
+        .snapshot_export_busy
+        .store(false, Ordering::Release);
+
+    fx.storage()
+        .export_incremental_with_archive(&point, archive.path(), &dest)
+        .expect("export");
+    assert!(!fx.storage().snapshot_export_busy.load(Ordering::Acquire));
+}
+
+/// 要求区間より前の行が DB に残っているとき、区間内の欠けは刈り込みではなく破損なので、アーカイブが
+/// 覆っていても補わず `RangeUnavailable` で拒否する。
+#[test]
+fn export_rejects_an_interior_gap_even_when_the_archive_covers_it() {
+    let fx = Fixture::new("inc-interior-gap");
+    fx.write_round_1();
+    let (_, point) = fx.full_backup("base.redb");
+    fx.write_round_2();
+    fx.write_round_3();
+    let archive = private_dir("inc-interior-gap-arc");
+    // 全件を DB に残したままアーカイブして、水位を最新まで進める。
+    archive_and_prune(&fx, archive.path(), 100_000, 100_000);
+    let lsns = log_lsns(&fx);
+    assert!(lsns[0] <= point.end_lsn, "rows before the range remain");
+    let hole = point.end_lsn + 1;
+    assert!(lsns.contains(&hole) && lsns.iter().any(|l| *l > hole));
+    {
+        let txn = fx.storage().db().begin_write().expect("write");
+        {
+            let mut t = txn.open_table(CHANGE_LOG_TABLE).expect("table");
+            t.remove(hole).expect("remove");
+        }
+        txn.commit().expect("commit");
+    }
+    let dest = fx.path("gap.seg");
+    assert!(matches!(
+        fx.storage()
+            .export_incremental_with_archive(&point, archive.path(), &dest),
+        Err(IncrementalError::RangeUnavailable)
+    ));
+    assert!(!dest.exists());
+}

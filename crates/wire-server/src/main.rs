@@ -544,11 +544,14 @@
 //! `--generation-state <path>` を指定すると、復元をまたぐ世代の高水位を状態ファイルに持ち、繰り返し復元でも
 //! 世代が単調に増える（Issue #3105・RECOVER-17 ポインタ。保持できなければ何も公開せず 1、引数の不正は 2 で終了）。
 //!
+//! `wire-server backup-incremental --socket <path> --base <path> --out <path>`（Issue #3098）は、稼働中のサーバーの
+//! 運用者専用ソケットへ増分を依頼する（`--db` と排他。ベースの終点は CLI が読んで送る）。
 //! `wire-server backup-incremental --db <path> --base <path> --out <path>` サブコマンドは、**停止中**の DB から、
 //! 直前のベース（フルバックアップまたは前回の増分）が終わった commit の次から最新までのログ区間を増分
 //! バックアップとして書き出す（Issue #2168・RECOVER-13・RECOVER-14 ポインタ。変更ログ `--change-log` を有効にした
 //! DB に限る）。終了コード: 0=成功、1=実行時の失敗（連鎖の切断・別 DB・区間が空・稼働中を含む）、2=引数／
-//! 出力先の拒否。詳細は `wire_server::incremental_opt`。
+//! 出力先の拒否。`--change-log-archive-dir <dir>` を足すと、保持設定で刈り込まれた区間をアーカイブから補う
+//! （Issue #3099・RECOVER-14 ポインタ。欠落・改ざんは何も公開せず 1）。詳細は `wire_server::incremental_opt`。
 //!
 //! `wire-server dump --db <path> --out <file> (--tenant <id> | --shared-only) [--schema-only | --data-only]
 //! [--format copy|insert]` サブコマンドは、**停止中**の DB から論理ダンプ（SQL スクリプト形式）を新規ファイルへ
@@ -4443,11 +4446,12 @@ fn run_backup(args: &[String]) -> ExitCode {
     }
 }
 
-/// `backup-incremental --db <path> --base <path> --out <path>` サブコマンド（Issue #2168・RECOVER-13・
+/// `backup-incremental (--db <path> | --socket <path>) --base <path> --out <path>` サブコマンド（Issue #2168・RECOVER-13・
 /// RECOVER-14 ポインタ）。ベースの終点を読み（フルバックアップは読み取り専用で開き、増分は全体を検証する）、
 /// 停止中の DB を読み取り専用で開いて、その次から最新までのログ区間を `--out` へ書き出す。稼働中のサーバーが
 /// 開いている DB は拒否する（終了コード 1）。DB・ベースへは書き込まない。エラー文に行の値・パス・表名・
-/// commit 番号は含めない。
+/// commit 番号は含めない。`--socket`（Issue #3098）は稼働中のサーバーの運用者専用ソケットへ依頼する
+/// （[`run_backup_incremental_via_socket`]）。
 fn run_backup_incremental(args: &[String]) -> ExitCode {
     use engine::storage::{chain_point_of, IncrementalError, ReadOnlyOpenError, ReadOnlyStorage};
     use wire_server::{backup_opt, incremental_opt};
@@ -4459,12 +4463,22 @@ fn run_backup_incremental(args: &[String]) -> ExitCode {
             return ExitCode::from(backup_opt::EXIT_USAGE);
         }
     };
+    let db = match &parsed.target {
+        backup_opt::Target::Db(db) => db,
+        backup_opt::Target::Socket(sock) => {
+            return run_backup_incremental_via_socket(sock, &parsed.base, &parsed.out)
+        }
+    };
     let result = chain_point_of(&parsed.base).and_then(|base| {
-        let ro = ReadOnlyStorage::open(&parsed.db).map_err(|e| match e {
+        let ro = ReadOnlyStorage::open(db).map_err(|e| match e {
             ReadOnlyOpenError::InUse => IncrementalError::InUse,
             _ => IncrementalError::SourceUnreadable,
         })?;
-        ro.export_incremental(&base, &parsed.out)
+        match &parsed.archive_dir {
+            // 刈り込み済みの区間をアーカイブから補う（Issue #3099・RECOVER-14）。
+            Some(dir) => ro.export_incremental_with_archive(&base, dir, &parsed.out),
+            None => ro.export_incremental(&base, &parsed.out),
+        }
     });
     let (code, msg) = incremental_opt::classify(&result);
     match code {
@@ -4994,6 +5008,66 @@ fn run_backup_via_socket(sock: &std::path::Path, out: &std::path::Path) -> ExitC
             ExitCode::from(wire_server::backup_opt::EXIT_FAILURE)
         }
     }
+}
+
+/// `backup-incremental --socket` の経路: ベースの終点（フルバックアップは読み取り専用で開き、増分は全体を
+/// 検証する）を CLI 側で読み、終点と出力先をサーバーへ依頼する。サーバーは運用者指定のファイルを開かない。
+/// 応答の結果コードをそのまま終了コードにし、メッセージは固定文言だけを出す（Issue #3098）。
+#[cfg(unix)]
+fn run_backup_incremental_via_socket(
+    sock: &std::path::Path,
+    base: &std::path::Path,
+    out: &std::path::Path,
+) -> ExitCode {
+    use wire_server::{backup_opt, backup_socket, incremental_opt};
+
+    if let Err(msg) = backup_socket::check_socket_owner(sock) {
+        engine::log_stderr!("wire-server: backup-incremental: {msg}");
+        return ExitCode::from(backup_opt::EXIT_USAGE);
+    }
+    let point = match engine::storage::chain_point_of(base) {
+        Ok(p) => p,
+        Err(e) => {
+            let (code, msg) = incremental_opt::classify(&Err(e));
+            engine::log_stderr!("wire-server: backup-incremental: {msg}");
+            return ExitCode::from(code);
+        }
+    };
+    match backup_socket::request_incremental(sock, &point, out) {
+        Ok(r) => match r.records {
+            Some(records) if r.code == 0 => {
+                if write_stdout(&format!("backup-incremental written: records={records}\n"))
+                    .is_err()
+                {
+                    return ExitCode::from(backup_opt::EXIT_FAILURE);
+                }
+                ExitCode::SUCCESS
+            }
+            _ => {
+                engine::log_stderr!(
+                    "wire-server: backup-incremental: {}",
+                    backup_socket::incremental_code_message(r.code)
+                );
+                ExitCode::from(r.code)
+            }
+        },
+        Err(msg) => {
+            engine::log_stderr!("wire-server: backup-incremental: {msg}");
+            ExitCode::from(backup_opt::EXIT_FAILURE)
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn run_backup_incremental_via_socket(
+    _sock: &std::path::Path,
+    _base: &std::path::Path,
+    _out: &std::path::Path,
+) -> ExitCode {
+    engine::log_stderr!(
+        "wire-server: backup-incremental: --socket is supported only on unix platforms"
+    );
+    ExitCode::from(wire_server::backup_opt::EXIT_USAGE)
 }
 
 #[cfg(not(unix))]

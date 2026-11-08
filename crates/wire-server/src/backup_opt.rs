@@ -103,15 +103,20 @@ pub fn parse(args: &[String]) -> Result<BackupArgs, String> {
     };
     let mut out = validate_out(out)?;
     if matches!(target, Target::Socket(_)) {
-        // サーバーの作業ディレクトリは CLI と異なるため、絶対パスで渡す。
-        // 行プロトコルの区切りと衝突する改行を含むパスは拒否する。
-        out = std::path::absolute(&out)
-            .map_err(|_| "cannot resolve --out to an absolute path".to_string())?;
-        if out.to_string_lossy().contains('\n') || out.to_str().is_none() {
-            return Err("--out must be valid UTF-8 without line breaks".into());
-        }
+        out = absolutize_for_socket(out)?;
     }
     Ok(BackupArgs { target, out })
+}
+
+/// ソケットへ渡す出力先を絶対パスに直す（サーバーの作業ディレクトリは CLI と異なるため）。行プロトコルの
+/// 区切りと衝突する改行を含むパス・UTF-8 でないパスは拒否する。`backup`・`backup-incremental` が使う。
+pub fn absolutize_for_socket(out: PathBuf) -> Result<PathBuf, String> {
+    let out = std::path::absolute(&out)
+        .map_err(|_| "cannot resolve --out to an absolute path".to_string())?;
+    if out.to_string_lossy().contains('\n') || out.to_str().is_none() {
+        return Err("--out must be valid UTF-8 without line breaks".into());
+    }
+    Ok(out)
 }
 
 /// `Storage::open` の失敗が「別プロセスが開いている」ことによるかを判定する（`backup`・`verify` が

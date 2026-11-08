@@ -92,9 +92,9 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // `catalog/*.rs` の各エントリも同じ理由で移動している）。
     // Issue #3069（`change_log_on_disk`・連続性検査・保留した移行の追加）で行番号が移動したための追随。
     // Issue #2167（アーカイブ・保持の公開 API と `begin_maintenance_txn` の追加。+44 行）で追随（旧: 1348／1382）。
-    ("storage.rs", 1571), // Issue #3093 で追随（旧: 1566）。Issue #3092 で追随（旧: 1543）。Issue #3091 で追随（旧: 1477）。Issue #2174（begin_replica_apply_txn 等。+22 行）で追随（旧: 1420／1454） // Issue #3094 で +4 行追随
+    ("storage.rs", 1596), // Issue #3094 で +4 行追随（旧: 1592）。 base 取り込み（Issue #3125 系の +3 行）で追随（旧: 1589）。Issue #3099（export_incremental_with_archive。+22 行）で追随（旧: 1567）。Issue #3093 で追随（旧: 1566）。Issue #3092 で追随（旧: 1543）。Issue #3091 で追随（旧: 1477）。Issue #2174（begin_replica_apply_txn 等。+22 行）で追随（旧: 1420／1454）
     // Issue #2175（読み取りレプリカの `read_replica` フラグ等。+35 行）で追随（旧: 1442／1476／1200）。対象は変わらない。
-    ("storage.rs", 1605), // Issue #3093 で追随（旧: 1600）。Issue #3092 で追随（旧: 1577）。Issue #3091 で追随（旧: 1511） // Issue #3094 で +4 行追随
+    ("storage.rs", 1630), // Issue #3094 で +4 行追随（旧: 1626）。 base 取り込み（Issue #3125 系の +3 行）で追随（旧: 1623）。Issue #3099 で追随（旧: 1601）。Issue #3093 で追随（旧: 1600）。Issue #3092 で追随（旧: 1577）。Issue #3091 で追随（旧: 1511）
     // Issue #3067: `Storage::enable_change_log` が DB 識別子の永続化に使う保守 commit
     // （`commit_boundary::commit_maintenance`）。書き込むのは `change_log_meta` 表だけで、`CATALOG_TABLE`・
     // `user_rows` には触れず、世代も進めない（バンプ対象の表が構造的に存在しない）。
@@ -110,7 +110,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #2167: `storage/change_log/archive.rs` の保守 commit（アーカイブ済み水位の更新と水位以下の
     // 刈り込み）。書き込むのは `change_log_meta`・`change_log` 表だけで、`CATALOG_TABLE`・`user_rows` には
     // 触れず、世代も進めない（バンプ対象の表が構造的に存在しない）。
-    ("storage/change_log/archive.rs", 1226), // Issue #3094（一時名の掃除の追加）で追随（旧: 1170）
+    ("storage/change_log/archive.rs", 1227), // Issue #3094（一時名の掃除の追加）で追随（旧: 1170）。base 取り込みで +1 行（1226 から）
     // Issue #3093: `Storage::disable_change_log` の保守 commit。削除するのは `change_log`・`change_log_meta`
     // 表だけで、`CATALOG_TABLE`・`user_rows` には触れず、世代も進めない（バンプ対象の表が構造的に存在しない）。
     ("storage/change_log/disable.rs", 165),
@@ -620,6 +620,9 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // （同じ理由で対象外）。
     ("catalog/role/bootstrap.rs", 599),
     ("catalog/role/bootstrap/tests.rs", 42),
+    // Issue #3096: 論理ダンプの復元指示（`Storage::apply_restore_directive`）。ロール・権限・既定権限・
+    // 初期権限・マーカーの専用表だけを書き、表の行・スキーマ・世代に影響しない（同じ理由で対象外）。
+    ("catalog/ddl_export/restore_apply.rs", 320),
     // Issue #2232: メンバーシップの付与・取り消し（`apply_membership_changes`）とロール作成＋付与
     // （`create_role_with_memberships`）。メンバーシップ表だけを書き、表の計画・世代に影響しない（同じ理由）。
     ("catalog/role/membership_apply.rs", 314),

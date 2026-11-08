@@ -20,7 +20,7 @@
 //!   #2169 の PITR（指定 LSN・時刻での停止。`pitr`）が同じ再生器を共有できるよう、セグメント列の再生を
 //!   1 関数（`replay_segments`）にまとめている（`pitr` が解決した停止 LSN を渡す）
 //!
-//! 呼び出し元は wire-server の `backup-incremental`・`restore --incremental`（`incremental_opt`・
+//! 呼び出し元は wire-server の `backup-incremental`（`--db`）・`backup_socket`（稼働中。#3098）・`restore --incremental`（`incremental_opt`・
 //! `restore_opt`）。出力先・複製の公開手順（一時名 → fsync → `hard_link`）は呼び出し側と engine の
 //! `archive::publish_with` が担う。復元後の世代番号の進行（RECOVER-17・#2446）はここでは行わない。
 //!
@@ -46,12 +46,12 @@ use std::path::{Path, PathBuf};
 use redb::{ReadableDatabase, ReadableTable};
 
 use super::archive::{
-    check_dir_not_shared, check_row, map_decode, publish_with, read_meta_u64, verify_segment_file,
-    ArchiveError, SegmentHeader, SegmentInfo, SegmentReader, SEG_MAGIC,
+    check_dir_not_shared, check_row, map_decode, publish_with, read_meta_u64, segments_covering,
+    verify_segment_file, ArchiveError, SegmentHeader, SegmentInfo, SegmentReader, SEG_MAGIC,
 };
 use super::{
     decode_record, is_excluded_table, peek_record, CaptureLimits, CHANGE_LOG_TABLE, DB_ID_LEN,
-    META_KEY_DB_ID, META_KEY_TIMELINE, META_TABLE, STORAGE_FORMAT_VERSION,
+    META_KEY_ARCHIVED_LSN, META_KEY_DB_ID, META_KEY_TIMELINE, META_TABLE, STORAGE_FORMAT_VERSION,
 };
 use crate::crypto::sha256::Sha256;
 use crate::storage::table_image;
@@ -106,6 +106,8 @@ pub enum IncrementalError {
     InvalidDestination,
     /// 出力先のディレクトリが他者に書き込める。
     InsecureDirectory,
+    /// 別のバックアップ書き出し（フル・増分）が稼働中の DB 上で実行中（同時 1 本まで。Issue #3098）。
+    InProgress,
     /// レコードのストレージ形式の版数が、この実装の版数と異なる。
     UnsupportedFormat,
     /// レコードを適用できない（未知の shape・存在しない表への変更・既存の表の作成・記録範囲外の表・
@@ -147,6 +149,7 @@ impl std::fmt::Display for IncrementalError {
             Self::DestinationExists => "incremental backup destination already exists",
             Self::InvalidDestination => "invalid incremental backup destination",
             Self::InsecureDirectory => "incremental backup directory is writable by other users",
+            Self::InProgress => "another backup export is in progress",
             Self::UnsupportedFormat => "record storage format version is not supported",
             Self::BadRecord => "incremental backup holds a record that cannot be applied",
             Self::BadSegmentList => "the list of incremental backups is empty or too long",
@@ -276,12 +279,44 @@ pub fn chain_point_of(path: &Path) -> Result<ChainPoint> {
 // 出力
 // ---------------------------------------------------------------------------
 
+/// 稼働中の [`Storage`] からの増分書き出し（Issue #3098）。フルバックアップの書き出しと同じ実行中フラグを
+/// 共有し、フル・増分を通じて同時 1 本に制限する（長い読み取り Tx がページ回収を止めるため。超過は
+/// [`IncrementalError::InProgress`]）。wire-server の運用者専用ソケットが `EngineCore` 経由で呼ぶ。
+pub(in crate::storage) fn export_live(
+    storage: &crate::storage::Storage,
+    base: &ChainPoint,
+    dest: &Path,
+) -> Result<IncrementalSummary> {
+    let _busy = super::super::snapshot::try_acquire_busy(&storage.snapshot_export_busy)
+        .ok_or(IncrementalError::InProgress)?;
+    export_from_read(&storage.db.begin_read()?, base, dest)
+}
+
 /// [`Storage::export_incremental`](crate::storage::Storage::export_incremental) の本体。`read` は出力元の
-/// 読み取りトランザクション（開始時点の単一スナップショット。書き込みを止めない）。
+/// 読み取りトランザクション（開始時点の単一スナップショット。書き込みを止めない）。アーカイブは見ない
+/// （刈り込み済みの区間があれば `RangeUnavailable`）。
 pub(in crate::storage) fn export_from_read(
     read: &redb::ReadTransaction,
     base: &ChainPoint,
     dest: &Path,
+) -> Result<IncrementalSummary> {
+    export_from_read_with(read, base, dest, None)
+}
+
+/// [`export_from_read`] の一般化（Issue #3099・RECOVER-14）。`archive` が `Some` で、`change_log` 表の
+/// 先頭側が刈り込まれている（アーカイブ水位以下）ときは、刈り込み済みの区間をアーカイブのセグメントから
+/// 補い、DB 側の残りとつないで 1 ファイルの増分にする。呼び出し元は `Storage`・`ReadOnlyStorage` の
+/// `export_incremental_with_archive`（wire-server の `backup-incremental --change-log-archive-dir`）。
+///
+/// fail-closed: アーカイブのセグメントは untrusted 入力として検証し（ヘッダ・レコード・全体のチェックサム、
+/// LSN の連続、同一 DB・timeline、名前とヘッダの一致）、DB 側と重なる区間は `change_log` 表の行とバイト列で
+/// 照合する（分岐した系列を混ぜない）。補えない（欠落）・壊れている場合は何も公開しない。チェックサムは
+/// 破損検出であって認証ではないため、アーカイブ先はベース・増分と同じ信頼境界で扱う。
+pub(in crate::storage) fn export_from_read_with(
+    read: &redb::ReadTransaction,
+    base: &ChainPoint,
+    dest: &Path,
+    archive: Option<&Path>,
 ) -> Result<IncrementalSummary> {
     dest.file_name()
         .ok_or(IncrementalError::InvalidDestination)?;
@@ -319,6 +354,7 @@ pub(in crate::storage) fn export_from_read(
         .checked_add(1)
         .ok_or(IncrementalError::ChainBroken)?;
     let count = latest - base.end_lsn;
+    let after_latest = latest.checked_add(1).ok_or(ArchiveError::LogCorrupt)?;
 
     let log = match read.open_table(CHANGE_LOG_TABLE) {
         Ok(t) => t,
@@ -328,11 +364,58 @@ pub(in crate::storage) fn export_from_read(
         Err(e) => return Err(e.into()),
     };
     let max_payload = CaptureLimits::default().max_payload_bytes;
+
+    // DB 側が持つ先頭の LSN（全件が刈り込まれていれば最新の次）。`first` より後ろなら、先頭側が
+    // 刈り込み済みで、アーカイブから補う。
+    let db_first = match log.range(first..=latest)?.next() {
+        Some(entry) => entry?.0.value(),
+        None => after_latest,
+    };
+    // 要求区間より前の行が残っているなら先頭側は刈り込まれていない。区間内の欠けは刈り込みではなく
+    // 破損なので、アーカイブで補わず拒否する。
+    if db_first > first && log.first()?.is_some_and(|(k, _)| k.value() < first) {
+        return Err(IncrementalError::RangeUnavailable);
+    }
+    let mut segments: Vec<(PathBuf, SegmentInfo)> = Vec::new();
+    if db_first > first {
+        let dir = archive.ok_or(IncrementalError::RangeUnavailable)?;
+        // 刈り込みは水位以下だけを消す。水位を超える欠けは、アーカイブがあっても補わない（破損）。
+        let pruned_to = db_first - 1;
+        match read_meta_u64(read, META_KEY_ARCHIVED_LSN)? {
+            Some(w) if pruned_to <= w => {}
+            _ => return Err(IncrementalError::RangeUnavailable),
+        }
+        check_dir_not_shared(dir)?;
+        // 件数の上限は一覧の列挙（`MAX_SEGMENT_FILES`）が担う。`MAX_APPLY_SEGMENTS` は untrusted な復元ファイル
+        // 一覧向けの上限で、補完対象の区間を覆うセグメントだけを検証するこの経路には当てない。
+        segments = match segments_covering(dir, &db_id, timeline, first, pruned_to, max_payload) {
+            Ok(s) => s,
+            Err(ArchiveError::ArchiveIncomplete) => return Err(IncrementalError::RangeUnavailable),
+            Err(e) => return Err(e.into()),
+        };
+    }
+    let walk = ArchiveWalk {
+        log: &log,
+        segments: &segments,
+        first,
+        db_first,
+        latest,
+        db_id,
+        timeline,
+        max_payload,
+    };
+
     // 1 周目: 区間が欠けなく連続していることと、本体のバイト数・ストレージ形式を確かめる。
     let mut body_len = 0u64;
     let mut format: Option<u32> = None;
-    let mut expect = first;
-    for entry in log.range(first..=latest)? {
+    walk.run(&mut format, &mut |rec| {
+        body_len = body_len
+            .checked_add(rec.len() as u64)
+            .ok_or(ArchiveError::LogCorrupt)?;
+        Ok(())
+    })?;
+    let mut expect = db_first;
+    for entry in log.range(db_first..=latest)? {
         let (k, v) = entry?;
         let (key, value) = (k.value(), v.value());
         if key != expect {
@@ -352,7 +435,7 @@ pub(in crate::storage) fn export_from_read(
             .ok_or(ArchiveError::LogCorrupt)?;
         expect = expect.checked_add(1).ok_or(ArchiveError::LogCorrupt)?;
     }
-    if expect != latest.checked_add(1).ok_or(ArchiveError::LogCorrupt)? {
+    if expect != after_latest {
         return Err(IncrementalError::RangeUnavailable);
     }
     let storage_format = format.ok_or(IncrementalError::RangeUnavailable)?;
@@ -369,7 +452,8 @@ pub(in crate::storage) fn export_from_read(
         body_len,
     };
 
-    // 2 周目: 同じスナップショットを逐次に書く（メモリは 1 レコード分）。
+    // 2 周目: 同じスナップショットとアーカイブを逐次に書く（メモリは 1 レコード分）。アーカイブは
+    // 開き直してヘッダ・トレーラを 1 周目の検証結果と照合し、差し替えを検出したら公開しない。
     let published = publish_with(parent, dest, |file| {
         let other = |_| std::io::Error::other("change log changed while exporting");
         let mut out = std::io::BufWriter::new(file);
@@ -378,7 +462,19 @@ pub(in crate::storage) fn export_from_read(
         hasher.update(&prefix);
         out.write_all(&prefix)?;
         let mut written = 0u64;
-        for entry in log.range(first..=latest).map_err(other)? {
+        let mut format_again: Option<u32> = None;
+        let mut io_err: Option<std::io::Error> = None;
+        walk.run(&mut format_again, &mut |rec| {
+            hasher.update(rec);
+            if let Err(e) = out.write_all(rec) {
+                io_err = Some(e);
+                return Err(ArchiveError::LogCorrupt.into());
+            }
+            written += rec.len() as u64;
+            Ok(())
+        })
+        .map_err(|e| io_err.take().unwrap_or_else(|| std::io::Error::other(e)))?;
+        for entry in log.range(db_first..=latest).map_err(other)? {
             let (_, v) = entry.map_err(other)?;
             let value = v.value();
             hasher.update(value);
@@ -401,6 +497,77 @@ pub(in crate::storage) fn export_from_read(
     })
 }
 
+/// 刈り込み済みの区間 `first..db_first` を補うアーカイブのセグメント列（検証済み）と、検証に使う文脈。
+/// `export_from_read_with` の 1 周目（検査と長さの集計）と 2 周目（書き出し）が同じ走査 [`Self::run`] を
+/// 共有する（検査の基準を 2 周で揃え、検証後の差し替えを 2 周目でも検出するため）。
+struct ArchiveWalk<'a> {
+    log: &'a redb::ReadOnlyTable<u64, &'static [u8]>,
+    segments: &'a [(PathBuf, SegmentInfo)],
+    first: u64,
+    db_first: u64,
+    latest: u64,
+    db_id: [u8; DB_ID_LEN],
+    timeline: u64,
+    max_payload: usize,
+}
+
+impl ArchiveWalk<'_> {
+    /// 各セグメントを開き直し、ヘッダが選択時の検証結果と同一であることを確かめてレコードを読む。
+    /// `first <= lsn < db_first` のレコードは連続・同一 DB・timeline・ストレージ形式を検査して `emit` へ
+    /// 渡す。`db_first..=latest` に掛かる分は DB の行とバイト列で照合し（不一致は `ChainBroken`）、
+    /// `latest` を超えるレコードは `ChainBroken`。読み切ったらトレーラを選択時の値と照合する。
+    /// セグメントが 0 本（刈り込みなし）なら何もしない。
+    fn run(
+        &self,
+        format: &mut Option<u32>,
+        emit: &mut dyn FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
+        let mut expect = self.first;
+        for (path, info) in self.segments {
+            let mut reader = SegmentReader::open(path, self.max_payload)?;
+            if reader.header() != &info.header {
+                return Err(ArchiveError::BadFormat.into());
+            }
+            while let Some(rec) = reader.next_record()? {
+                let h = peek_record(&rec, self.max_payload).map_err(map_decode)?;
+                if h.lsn < self.first {
+                    continue;
+                }
+                if h.lsn > self.latest {
+                    return Err(IncrementalError::ChainBroken);
+                }
+                if h.lsn < self.db_first {
+                    // 重複・飛び・別 DB・別 timeline・形式の不一致はいずれも拒否する。
+                    check_row(
+                        h.lsn,
+                        &rec,
+                        expect,
+                        &self.db_id,
+                        self.timeline,
+                        format,
+                        self.max_payload,
+                    )
+                    .map_err(|_| ArchiveError::LsnGap)?;
+                    emit(&rec)?;
+                    expect = expect.checked_add(1).ok_or(ArchiveError::LsnGap)?;
+                } else {
+                    match self.log.get(h.lsn)? {
+                        Some(v) if v.value() == rec.as_slice() => {}
+                        _ => return Err(IncrementalError::ChainBroken),
+                    }
+                }
+            }
+            let trailer = reader.finish()?;
+            if trailer != info.trailer {
+                return Err(ArchiveError::ChecksumMismatch.into());
+            }
+        }
+        if !self.segments.is_empty() && expect != self.db_first {
+            return Err(IncrementalError::RangeUnavailable);
+        }
+        Ok(())
+    }
+}
 // ---------------------------------------------------------------------------
 // 適用
 // ---------------------------------------------------------------------------

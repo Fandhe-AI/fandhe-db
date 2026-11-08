@@ -4310,6 +4310,19 @@ impl EngineCore {
         self.storage.export_snapshot(dest)
     }
 
+    /// 稼働中の永続ストレージから増分バックアップ（`base` の終点の次から最新まで）を `dest` の新規ファイルへ
+    /// 書き出す（RECOVER-13・RECOVER-14・Issue #3098）。wire-server の運用者専用ソケットの接続処理から
+    /// 呼ばれる入口で、[`Storage::export_incremental`] へ委譲する（読み取り Tx 1 本で書き込みを止めない。
+    /// フルの書き出しと合わせ同時 1 本。SQL・NoSQL の表層からは呼べない）。
+    pub fn export_incremental(
+        &self,
+        base: &crate::storage::ChainPoint,
+        dest: impl AsRef<std::path::Path>,
+    ) -> std::result::Result<crate::storage::IncrementalSummary, crate::storage::IncrementalError>
+    {
+        self.storage.export_incremental(base, dest)
+    }
+
     /// 稼働中の永続ストレージのスキーマを DDL 文として書き出す（RECOVER-16 (1)・Issue #2160）。
     /// 運用者の CLI（#2162）から呼ぶ入口で、[`Storage::export_schema_ddl`] へそのまま委譲する
     /// （読み取りスナップショット上で動き、書き込みを止めない。SQL・NoSQL の表層からは呼べない）。
@@ -4352,6 +4365,17 @@ impl EngineCore {
         crate::catalog::ddl_export::SchemaDdlError<E>,
     > {
         self.storage.export_logical_dump(scope, format, sink)
+    }
+
+    /// 論理ダンプの復元指示（`RESTORE ...`。ロール・権限の状態。RECOVER-16・Issue #3096）を 1 件、`tenant` へ
+    /// 単一 write txn で適用する。wire-server の `dump-restore`（空の一時 DB への復元）だけが呼ぶ入口で、
+    /// SQL・NoSQL の表層・認証済みセッションからは呼べない。[`Storage::apply_restore_directive`] へ委譲する。
+    pub fn apply_restore_directive(
+        &self,
+        tenant: &str,
+        directive: &str,
+    ) -> std::result::Result<(), crate::catalog::ddl_export::RestoreDirectiveError> {
+        self.storage.apply_restore_directive(tenant, directive)
     }
 
     /// 変更ログの未アーカイブのレコードを外部セグメントへ書き出し、保持設定があれば刈り込む
