@@ -2268,6 +2268,15 @@ fn show_row_security_columns() -> Vec<crate::sql::exec::ColumnMeta> {
     }]
 }
 
+/// `SHOW restore_generation` の結果列（列名 `restore_generation`・bigint の 1 列。実行と Describe が
+/// 共有する。RECOVER-17・Issue #2449）。
+fn show_restore_generation_columns() -> Vec<crate::sql::exec::ColumnMeta> {
+    vec![crate::sql::exec::ColumnMeta::Computed {
+        name: "restore_generation".to_string(),
+        ty: Some(crate::catalog::ColumnType::BigInt),
+    }]
+}
+
 /// `SHOW statement_timeout` の結果列（列名 `statement_timeout`・text の 1 列。実行と Describe が共有する。
 /// SQL-71・Issue #1954）。
 fn show_statement_timeout_columns() -> Vec<crate::sql::exec::ColumnMeta> {
@@ -2874,6 +2883,7 @@ fn read_only_permits(parsed: &ParsedSql) -> bool {
                 | Statement::ShowSearchPath
                 | Statement::SetRowSecurity { .. }
                 | Statement::ShowRowSecurity
+                | Statement::ShowRestoreGeneration
                 | Statement::SetStatementTimeout { .. }
                 | Statement::ShowStatementTimeout
                 | Statement::SetHnswEfSearch { .. }
@@ -5096,6 +5106,12 @@ impl EngineCore {
                     "SET/SHOW row_security requires a session-aware entry point",
                 ))
             }
+            // RECOVER-17・Issue #2449: `SHOW restore_generation` もセッション入口専用（同じ決定的な契約）。
+            crate::sql::allowlist::Statement::ShowRestoreGeneration => {
+                Err(crate::sql::allowlist::SqlSurfaceError::unsupported(
+                    "SHOW restore_generation requires a session-aware entry point",
+                ))
+            }
             // SQL-71・Issue #1954: `statement_timeout` もセッション変数（同じ決定的な契約）。
             crate::sql::allowlist::Statement::SetStatementTimeout { .. }
             | crate::sql::allowlist::Statement::ShowStatementTimeout => {
@@ -6804,6 +6820,13 @@ impl EngineCore {
         if crate::sql::allowlist::is_show_row_security(&tokens) {
             return Ok(ParsedSql::Statement(
                 crate::sql::allowlist::Statement::ShowRowSecurity,
+            ));
+        }
+
+        // RECOVER-17・Issue #2449: `SHOW restore_generation` も厳密一致のみ先に取り出す。
+        if crate::sql::allowlist::is_show_restore_generation(&tokens) {
+            return Ok(ParsedSql::Statement(
+                crate::sql::allowlist::Statement::ShowRestoreGeneration,
             ));
         }
 
@@ -10156,6 +10179,7 @@ impl EngineCore {
                 | Statement::ShowSearchPath
                 | Statement::SetRowSecurity { .. }
                 | Statement::ShowRowSecurity
+                | Statement::ShowRestoreGeneration
                 | Statement::SetStatementTimeout { .. }
                 | Statement::ShowStatementTimeout
                 | Statement::SetHnswEfSearch { .. }
@@ -10757,6 +10781,7 @@ impl EngineCore {
             | Statement::ShowSearchPath
             | Statement::SetRowSecurity { .. }
             | Statement::ShowRowSecurity
+            | Statement::ShowRestoreGeneration
             | Statement::SetStatementTimeout { .. }
             | Statement::ShowStatementTimeout
             | Statement::SetHnswEfSearch { .. }
@@ -11717,6 +11742,10 @@ impl EngineCore {
             ParsedSql::Statement(Statement::ShowRowSecurity) => {
                 Ok(Some(show_row_security_columns()))
             }
+            // RECOVER-17・Issue #2449: `SHOW restore_generation` は bigint の 1 列固定。
+            ParsedSql::Statement(Statement::ShowRestoreGeneration) => {
+                Ok(Some(show_restore_generation_columns()))
+            }
             // SQL-71・Issue #1954: `SET`／`RESET statement_timeout` は結果列なし、`SHOW` は 1 列固定。
             ParsedSql::Statement(Statement::SetStatementTimeout { .. }) => Ok(None),
             ParsedSql::Statement(Statement::ShowStatementTimeout) => {
@@ -12371,6 +12400,29 @@ impl EngineCore {
                     }],
                 }),
             ),
+            // RECOVER-17・Issue #2449: 復元の世代番号は DB 全体で 1 つの値（テナント非依存）。毎回
+            // 永続値を読み（キャッシュしない）、読めない・bigint に収まらない場合は値を返さず固定文言で
+            // 拒否する（fail-closed。0 や古い値へ丸めない）。
+            crate::sql::allowlist::Statement::ShowRestoreGeneration => {
+                let generation = self
+                    .storage
+                    .restore_generation()
+                    .ok()
+                    .and_then(|g| i64::try_from(g).ok())
+                    .ok_or_else(|| crate::sql::allowlist::SqlSurfaceError::Internal {
+                        detail: "could not read restore generation".to_string(),
+                    })?;
+                Ok(crate::sql::SqlOutcome::Show(
+                    crate::sql::exec::QueryResult {
+                        columns: show_restore_generation_columns(),
+                        rows: vec![crate::sql::exec::ResultRow {
+                            id: 0,
+                            score: 0.0,
+                            cells: vec![crate::sql::exec::Cell::SignedInteger(generation)],
+                        }],
+                    },
+                ))
+            }
             crate::sql::allowlist::Statement::ShowRowSecurity => Ok(crate::sql::SqlOutcome::Show(
                 crate::sql::exec::QueryResult {
                     columns: show_row_security_columns(),

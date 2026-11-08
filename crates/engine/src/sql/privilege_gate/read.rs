@@ -183,6 +183,7 @@ fn classify_statement(s: &Statement) -> ReadRequirement {
         | Statement::ShowSearchPath
         | Statement::SetRowSecurity { .. }
         | Statement::ShowRowSecurity
+        | Statement::ShowRestoreGeneration
         | Statement::SetStatementTimeout { .. }
         | Statement::ShowStatementTimeout
         | Statement::SetHnswEfSearch { .. }
