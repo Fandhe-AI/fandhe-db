@@ -382,3 +382,161 @@ fn applies_on_non_immediate_storage() {
     let r2 = Storage::open(&p).expect("reopen");
     assert_eq!(r2.replica_applied_lsn().unwrap(), f.generation());
 }
+// ---- 読み取りレプリカモード（Issue #2175）----
+
+fn read_replica_ctx() -> PolicyContext {
+    PolicyContext::with_visibilities(TENANT, [Visibility::Public, Visibility::Private])
+        .expect("tenant")
+}
+
+fn code(
+    r: std::result::Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError>,
+) -> String {
+    match r {
+        Ok(_) => "ok".to_string(),
+        Err(e) => e.wire_code().to_string(),
+    }
+}
+
+fn row_count(core: &EngineCore, sql: &str) -> usize {
+    let mut session = SessionState::default();
+    match core
+        .execute_sql_in_session(&read_replica_ctx(), &mut session, sql)
+        .expect("select")
+    {
+        crate::sql::SqlOutcome::Query(q) => q.rows.len(),
+        _ => panic!("not a query"),
+    }
+}
+
+/// 適用済みのデータが読め、書き込み・DDL・READ WRITE の要求がすべて `25006` で拒否され、
+/// 拒否後も適用が続けられること（レプリカの内容は変わらない）。
+#[test]
+fn read_replica_serves_reads_and_rejects_writes_with_25006() {
+    let (_f, p, r, base, recs) = setup("rep-ro");
+    drop(r);
+    let core = EngineCore::open(&p)
+        .expect("open")
+        .with_read_replica()
+        .expect("replica base");
+    assert!(core.is_read_replica());
+    // 適用前はベースの時点（round 1: ev に 4 行）。
+    assert_eq!(row_count(&core, "SELECT id FROM ev"), 4);
+    let ctx = read_replica_ctx();
+    let mut s = SessionState::default();
+    s.allow_ddl();
+    for sql in [
+        "INSERT INTO ev (id, embedding) VALUES (99, '[0.1,0.2]')",
+        "UPDATE ev SET embedding = '[0.9,0.9]' WHERE id = 1",
+        "DELETE FROM ev WHERE id = 1",
+        "CREATE TABLE zz (id BIGINT PRIMARY KEY, embedding VECTOR(2))",
+        "DROP TABLE ev",
+        "SELECT id FROM ev FOR UPDATE",
+    ] {
+        assert_eq!(
+            code(core.execute_sql_in_session(&ctx, &mut s, sql)),
+            "25006",
+            "autocommit: {sql}"
+        );
+    }
+    // 明示トランザクション。
+    let mut txn = core.new_session_transaction();
+    for sql in [
+        "BEGIN READ WRITE",
+        "SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE",
+    ] {
+        assert_eq!(
+            code(core.execute_sql_in_txn(&ctx, &mut s, &mut txn, sql)),
+            "25006",
+            "{sql}"
+        );
+    }
+    // 修飾子なしの BEGIN は READ ONLY で始まり、読み取りは通り、書き込みは 25006 になる。
+    assert_eq!(
+        code(core.execute_sql_in_txn(&ctx, &mut s, &mut txn, "BEGIN")),
+        "ok"
+    );
+    assert_eq!(
+        code(core.execute_sql_in_txn(&ctx, &mut s, &mut txn, "SELECT id FROM ev")),
+        "ok"
+    );
+    assert_eq!(
+        code(core.execute_sql_in_txn(
+            &ctx,
+            &mut s,
+            &mut txn,
+            "INSERT INTO ev (id, embedding) VALUES (98, '[0.1,0.2]')"
+        )),
+        "25006"
+    );
+    assert_eq!(
+        code(core.execute_sql_in_txn(&ctx, &mut s, &mut txn, "ROLLBACK")),
+        "ok"
+    );
+    // 暗黙トランザクション（複数文メッセージ）は writer を取らず、読み取りは通る。
+    let mut s2 = SessionState::default();
+    core.begin_implicit_transaction(&mut txn, &s2)
+        .expect("implicit");
+    assert_eq!(
+        code(core.execute_sql_in_txn(&ctx, &mut s2, &mut txn, "SELECT id FROM ev")),
+        "ok"
+    );
+    assert_eq!(
+        code(core.execute_sql_in_txn(&ctx, &mut s2, &mut txn, "DELETE FROM ev WHERE id = 1")),
+        "25006"
+    );
+    txn.abort_implicit();
+    drop(txn);
+    // 拒否では何も変わらず、適用は従来どおり動く。
+    assert_eq!(row_count(&core, "SELECT id FROM ev"), 4);
+    assert_eq!(core.replica_applied_lsn().unwrap(), base);
+    let rep = core.apply_replicated_records(&recs).expect("apply");
+    assert_eq!(rep.applied, recs.len() as u64);
+    // round 2 の適用後: id=2 が消え id=10 が増える（4 - 1 + 1）。
+    assert_eq!(row_count(&core, "SELECT id FROM ev"), 4);
+    assert_eq!(row_count(&core, "SELECT id FROM ev WHERE id = 10"), 1);
+    assert_eq!(row_count(&core, "SELECT id FROM ev WHERE id = 2"), 0);
+}
+
+/// ベースでない DB は読み取りレプリカにできない（起動拒否の根拠）。
+#[test]
+fn read_replica_requires_a_replica_base() {
+    let dir = TempDir::new("rep-ro-plain");
+    let core = EngineCore::open(dir.db_path()).expect("open");
+    assert!(core.with_read_replica().is_err());
+}
+
+/// 複製の適用が確定すると全スコープの UDF 世代が進み、既存接続が次の文で定義を再ロードする
+/// （適用が永続表だけを更新して世代を据え置くと、古い関数定義が残るため）。
+#[test]
+fn applying_records_advances_function_generation() {
+    let (_f, _p, r, _base, recs) = setup("rep-udfgen");
+    let before = r.function_generation(TENANT);
+    r.apply_replicated_records(&recs).expect("apply");
+    assert!(r.function_generation(TENANT) > before);
+    // 何も適用しない再送では進めない。
+    let mid = r.function_generation(TENANT);
+    r.apply_replicated_records(&recs).expect("resend");
+    assert_eq!(r.function_generation(TENANT), mid);
+}
+
+/// NoSQL の書き込み入口も、束縛・書き込み前に `25006` で拒否する（`54000` ではない）。
+#[test]
+fn read_replica_rejects_nosql_writes_with_25006() {
+    let (_f, p, r, _base, _recs) = setup("rep-ro-nosql");
+    drop(r);
+    let core = EngineCore::open(&p)
+        .expect("open")
+        .with_read_replica()
+        .expect("replica base");
+    let ctx = read_replica_ctx();
+    let s = SessionState::default();
+    let r = core.execute_bound_insert_in_session(&ctx, &s, "ev", 1, None, |_| {
+        panic!("bind must not run on a read replica")
+    });
+    assert_eq!(r.expect_err("rejected").wire_code(), "25006");
+    let r = core.execute_bound_upsert_in_session(&ctx, &s, "ev", 1, None, |_| {
+        panic!("bind must not run on a read replica")
+    });
+    assert_eq!(r.expect_err("rejected").wire_code(), "25006");
+}
