@@ -335,14 +335,17 @@ fn recover17_pitr_restore_advances_the_generation_monotonically() {
         .filter(|(l, _)| *l > p.base_lsn)
         .collect();
     let (_, t) = times[1];
-    if let Some(n) = times.iter().position(|(_, ct)| *ct > t) {
-        let dest = p.root.join("gen-time.redb");
-        let o = p.restore_archive(&dest, &["--until-time", &rfc3339(t)]);
-        assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
-        assert_eq!(row_ids(&dest), (1..=3 + n as u64).collect::<Vec<_>>());
-        assert!(generation_of(&dest) > previous);
-        previous = generation_of(&dest);
-    }
+    let n = times
+        .iter()
+        .position(|(_, ct)| *ct > t)
+        .expect("a later commit exists after the target time");
+    let dest = p.root.join("gen-time.redb");
+    let o = p.restore_archive(&dest, &["--until-time", &rfc3339(t)]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert_eq!(row_ids(&dest), (1..=3 + n as u64).collect::<Vec<_>>());
+    let generation = generation_of(&dest);
+    assert!(generation > previous);
+    previous = generation;
 
     // 増分 + PITR の併用でも進む。
     let db = PathBuf::from(p._fx.db_path_str());

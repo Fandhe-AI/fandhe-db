@@ -262,7 +262,7 @@ fn recover17_advancing_the_generation_after_pitr_keeps_the_state_and_lsn() {
         st.enable_change_log().expect("continuity holds");
         assert_eq!(st.current_generation().expect("gen"), stop);
         let g = st.restore_generation().expect("read");
-        assert!(g >= previous);
+        assert!(g > previous, "{g} must exceed {previous}");
         previous = g;
     }
 }
