@@ -61,6 +61,7 @@ use redb::{
 };
 
 pub(crate) mod archive;
+pub(crate) mod backlog;
 pub(crate) mod incremental;
 #[cfg(any(test, feature = "change-log-oracle"))]
 pub(crate) mod oracle;
@@ -140,6 +141,8 @@ pub(crate) enum Unrecordable {
     Clock,
     /// 変更ログを有効にしていない起動が、有効化済みの DB へ書こうとした。
     DisabledOnEnabledDb,
+    /// 未アーカイブの変更ログ量が上限に達している（Issue #3091。アーカイブが進めば再開する）。
+    UnarchivedLimit,
 }
 
 impl Unrecordable {
@@ -154,13 +157,16 @@ impl Unrecordable {
             Self::DisabledOnEnabledDb => {
                 "this database has a change log but it is not enabled for this process"
             }
+            Self::UnarchivedLimit => {
+                "unarchived change log is at its limit; writes resume once the archive catches up"
+            }
         }
     }
 
     /// 原因を stderr へ（同じ秒に 1 回まで）出して、クライアントへ返すエラーを作る。
     pub(crate) fn refuse(self) -> StorageError {
         // 抑止は原因ごと（ある原因の連続拒否で、別の原因の最初の 1 行が隠れない）。
-        const CAUSES: usize = 7;
+        const CAUSES: usize = 8;
         static LAST_LOG_SECS: [std::sync::atomic::AtomicU64; CAUSES] =
             [const { std::sync::atomic::AtomicU64::new(0) }; CAUSES];
         let now = std::time::SystemTime::now()
@@ -627,6 +633,10 @@ pub(crate) struct ChangeLogState {
     pub(crate) db_id: [u8; DB_ID_LEN],
     pub(crate) timeline: u64,
     pub(crate) limits: CaptureLimits,
+    /// 未アーカイブ量の上限（Issue #3091。既定は無制限）。移行が終わった後に設定する。
+    pub(crate) unarchived_limit: backlog::UnarchivedLimit,
+    /// 直近の commit が上限で拒否されたことの印（保守 commit のゲートの取り方に使う）。
+    pub(crate) rejected: backlog::RejectFlag,
 }
 
 /// メタ表から DB 識別子と timeline を読む。無ければ生成して書く（既存 DB は変更ログを初めて
@@ -689,6 +699,8 @@ pub(crate) fn load_or_init_identity(
             db_id,
             timeline,
             limits,
+            unarchived_limit: backlog::UnarchivedLimit::default(),
+            rejected: backlog::RejectFlag::default(),
         },
         wrote,
     ))
@@ -999,6 +1011,8 @@ impl CaptureSession {
     /// `g_c` は `prepare_generation_bump` が採番した世代（= LSN）。`GENERATION_TABLE` の書き込みは
     /// 登録簿に載らないため、ここで固定のエントリとして積む（D1）。
     pub(crate) fn prepare(&self, write_txn: &redb::WriteTransaction, g_c: u64) -> Result<()> {
+        // 未アーカイブ量が上限以上なら、after-image を組む前に拒否する（Issue #3091）。
+        backlog::admit(write_txn, &self.state, g_c)?;
         self.frame
             .note_key(GENERATION_TABLE.name(), generation_key_bytes());
         let body = self.build_body(write_txn)?;
@@ -1027,6 +1041,7 @@ impl CaptureSession {
         let mut table = write_txn.open_table(CHANGE_LOG_TABLE)?;
         table.insert(g_c, bytes.as_slice())?;
         drop(table);
+        backlog::account(write_txn, &self.state, g_c, bytes.len())?;
         // D1 の層 3: テストと oracle feature のビルドでは、追記したレコードを実差分と突き合わせる。
         // 不一致は計装漏れ（fail-open）なので、隠さず panic で落とす（製品ビルドには存在しない）。
         #[cfg(any(test, feature = "change-log-oracle"))]

@@ -943,7 +943,12 @@ enum Plan {
         bytes: Vec<u8>,
     },
     /// 同じ先頭 LSN の検証済みセグメントが既に在り、表のレコードと一致した（書き直さない）。
-    Adopt { last_lsn: u64, path: PathBuf },
+    Adopt {
+        last_lsn: u64,
+        path: PathBuf,
+        /// 検証済みヘッダの本体バイト数（未アーカイブ量の合計から引く）。
+        body_len: u64,
+    },
 }
 
 pub(super) fn read_meta_u64(read: &redb::ReadTransaction, key: &str) -> Result<Option<u64>> {
@@ -1042,6 +1047,7 @@ fn plan_next(
             Ok(Plan::Adopt {
                 last_lsn: h.last_lsn,
                 path,
+                body_len: h.body_len,
             })
         } else {
             Err(ArchiveError::Conflict)
@@ -1080,18 +1086,22 @@ enum Step {
 /// 水位を `new_w` へ進め（`expect_w` から変わっていなければ）、保持設定があれば水位以下を上限つきで
 /// 刈り込む保守 commit。世代を進めずレコードも生まない（D6）。通常の書き込みが待機している間は
 /// ゲートを譲り、見送ったら [`Step::Skipped`]。`prune_cap` は刈り込める LSN の上限（[`prune_cap_for`] が
-/// アーカイブ先を検証して求める。0 は刈り込まない）。
+/// アーカイブ先を検証して求める。0 は刈り込まない）。`body_bytes` は今回書き出した本体バイト数
+/// （未アーカイブ量の合計から引く。Issue #3091）。`at_limit` が真（未アーカイブ量が上限に達している）
+/// のときはゲートを譲らず通常の書き込みと並んで取る（拒否された書き手の再試行で飢えないため）。
 fn maintenance_commit(
     storage: &Storage,
     expect_w: u64,
     new_w: u64,
     opts: &ArchiveOptions,
     prune_cap: u64,
+    body_bytes: u64,
+    at_limit: bool,
 ) -> Result<Step> {
     // 書き込みゲートを先に取る（待機中は登録簿を持たない。ゲート待ちの間もレプリカの ack の更新・登録・解除が
     // 止まらないようにするため）。ロックの順序は常に「ゲート → 登録簿」で、登録簿を持ったままゲートを待つ
     // 経路は無い（登録・ack 更新・解除はゲートを取らず、登録簿のロックだけで済む）ので、逆転によるデッドロックは無い。
-    let Some(txn) = storage.begin_maintenance_txn()? else {
+    let Some(txn) = storage.begin_maintenance_txn(at_limit)? else {
         return Ok(Step::Skipped);
     };
     // レプリカの保持位置（Issue #2173）。ゲートを得てから登録簿のロックを取り、刈り込みの commit まで保持する。
@@ -1126,6 +1136,9 @@ fn maintenance_commit(
         }
         if new_w != expect_w {
             meta.insert(META_KEY_ARCHIVED_LSN, new_w.to_le_bytes().as_slice())?;
+            if let Some(state) = storage.change_log.as_ref() {
+                super::backlog::on_watermark_advance(&mut meta, state, new_w, body_bytes)?;
+            }
         }
         if let Some(retain) = opts.retain_records {
             // 削除は水位以下に構造的に限る（水位より後は未アーカイブで、決して消さない）。
@@ -1155,6 +1168,11 @@ fn maintenance_commit(
         return Ok(Step::Done { pruned: 0 });
     }
     crate::recovery::commit_boundary::commit_maintenance(txn)?;
+    if new_w != expect_w {
+        if let Some(state) = storage.change_log.as_ref() {
+            state.rejected.lower();
+        }
+    }
     Ok(Step::Done { pruned: deleted })
 }
 
@@ -1304,11 +1322,15 @@ pub(in crate::storage) fn run_cycle(
     for _ in 0..MAX_SEGMENTS_PER_CYCLE {
         let w = watermark(&storage.db.begin_read()?)?;
         report.archived_through = w;
-        let (last_lsn, adopted) = match plan_next(storage, &state, opts, &index, w)? {
+        let (last_lsn, adopted, body_bytes) = match plan_next(storage, &state, opts, &index, w)? {
             Plan::Nothing => break,
-            Plan::Adopt { last_lsn, path } => {
+            Plan::Adopt {
+                last_lsn,
+                path,
+                body_len,
+            } => {
                 sync_adopted(&opts.dir, &path)?;
-                (last_lsn, true)
+                (last_lsn, true, body_len)
             }
             Plan::Write { header, bytes } => {
                 let name = segment_name(
@@ -1331,10 +1353,10 @@ pub(in crate::storage) fn run_cycle(
                     }
                     sync_adopted(&opts.dir, &path)?;
                     index_insert(&mut index, path, entry);
-                    (header.last_lsn, true)
+                    (header.last_lsn, true, header.body_len)
                 } else {
                     index_insert(&mut index, path, entry);
-                    (header.last_lsn, false)
+                    (header.last_lsn, false, header.body_len)
                 }
             }
         };
@@ -1346,7 +1368,8 @@ pub(in crate::storage) fn run_cycle(
                 0
             }
         };
-        match maintenance_commit(storage, w, last_lsn, opts, cap)? {
+        let full = super::backlog::at_limit(&storage.db.begin_read()?, &state)?;
+        match maintenance_commit(storage, w, last_lsn, opts, cap, body_bytes, full)? {
             Step::Skipped => {
                 report.skipped = true;
                 return Ok(report);
@@ -1372,7 +1395,8 @@ pub(in crate::storage) fn run_cycle(
                     break;
                 }
             };
-            match maintenance_commit(storage, w, w, opts, cap)? {
+            let full = super::backlog::at_limit(&storage.db.begin_read()?, &state)?;
+            match maintenance_commit(storage, w, w, opts, cap, 0, full)? {
                 Step::Skipped => {
                     report.skipped = true;
                     break;
