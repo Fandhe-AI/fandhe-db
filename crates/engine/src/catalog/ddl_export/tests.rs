@@ -304,10 +304,10 @@ fn matviews_and_enums_are_scoped_by_owner_and_never_leak_across_tenants() {
     for (s, b) in scopes.iter().zip(&before) {
         assert_eq!(&dump_sql(&storage, s).expect("unchanged by tenant-b"), b);
     }
-    // 持ち主の B のダンプは、黙って落とさず失敗する。
+    // 持ち主の B のダンプは、黙って落とさず失敗する（matview の検査が ENUM より先に走る）。
     assert_eq!(
         unsupported_kind(dump_sql(&storage, &SchemaDdlScope::tenant_only("tenant-b"))),
-        "enum type"
+        "materialized view"
     );
     // A 自身の SCHEMA 配下の matview・ENUM も黙って落とさない。
     inject(&storage, "materialized_views", &format!("#{id_a}.mv"), b"x");
@@ -315,10 +315,11 @@ fn matviews_and_enums_are_scoped_by_owner_and_never_leak_across_tenants() {
         unsupported_kind(dump_sql(&storage, &SchemaDdlScope::tenant_only("tenant-a"))),
         "materialized view"
     );
+    // ENUM も加えると失敗は続く（matview の検査が先に走るため種別は matview のまま）。
     inject(&storage, "enum_types", &format!("#{id_a}.en"), b"x");
     assert_eq!(
         unsupported_kind(dump_sql(&storage, &SchemaDdlScope::tenant_only("tenant-a"))),
-        "enum type"
+        "materialized view"
     );
     // 共有分だけの書き出しは、テナント固有の行に影響されない。
     dump_sql(&storage, &SchemaDdlScope::shared_only()).expect("shared only");

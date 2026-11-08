@@ -42,6 +42,7 @@ use std::fmt;
 
 use redb::{ReadableDatabase, TableHandle};
 
+use super::materialized::MaterializedViewDef;
 use super::namespace::schema_names_for_tenant_in_txn;
 use super::{CatalogError, Storage};
 use quote::Namer;
@@ -348,9 +349,26 @@ impl Storage {
     /// `sink` が `Err` を返した場合はそこで中止して [`SchemaDdlError::Sink`] を返す。
     ///
     /// 運用者の CLI（#2162）専用の入口で、テナントの認可は呼び出し側（運用者の操作）が担う。
+    ///
+    /// 範囲内にマテリアライズド VIEW があると、保存済みの列構成が本文と一致するか（復元で列構成が
+    /// 変わらないか）を SQL 層なしでは確かめられないため、固定文言の `Unsupported` で失敗する
+    /// （fail-closed。Issue #3097）。マテリアライズド VIEW を含む書き出しは、検査を持つ
+    /// `EngineCore::export_schema_ddl` を使う。
     pub fn export_schema_ddl<E>(
         &self,
         scope: &SchemaDdlScope,
+        sink: impl FnMut(&DdlStatement<'_>) -> Result<(), E>,
+    ) -> Result<SchemaDdlSummary, SchemaDdlError<E>> {
+        self.export_schema_ddl_checked(scope, reject_unverifiable_matviews, sink)
+    }
+
+    /// [`Storage::export_schema_ddl`] の本体。範囲内のマテリアライズド VIEW の保存済み定義を、
+    /// 出力と同じ読み取りスナップショットから読んで `check` に渡し、`check` が失敗したら何も出さずに
+    /// 失敗する（EngineCore が列構成の再導出を差し込む。Issue #3097）。
+    pub(crate) fn export_schema_ddl_checked<E>(
+        &self,
+        scope: &SchemaDdlScope,
+        check: impl FnOnce(&[MaterializedViewDef]) -> Result<(), SchemaDdlError<E>>,
         mut sink: impl FnMut(&DdlStatement<'_>) -> Result<(), E>,
     ) -> Result<SchemaDdlSummary, SchemaDdlError<E>> {
         if let Some(t) = scope.tenant() {
@@ -369,6 +387,7 @@ impl Storage {
             scope,
             namer,
         };
+        check(&object::in_scope_materialized_defs(&ctx)?)?;
         let mut out = Emitter {
             sink: &mut sink,
             count: 0,
@@ -400,40 +419,32 @@ pub struct LogicalDumpSummary {
 }
 
 impl Storage {
-    /// 範囲内のマテリアライズド VIEW の保存済み定義を返す（`EngineCore::export_logical_dump` が、
-    /// 保存済みの列構成と本文から再導出した列構成の一致を確かめるために呼ぶ。Issue #3097）。
-    pub(crate) fn scoped_materialized_view_defs<E>(
-        &self,
-        scope: &SchemaDdlScope,
-    ) -> Result<Vec<crate::catalog::materialized::MaterializedViewDef>, SchemaDdlError<E>> {
-        if let Some(t) = scope.tenant() {
-            super::role::validate_tenant(t).map_err(SchemaDdlError::Catalog)?;
-        }
-        let rt = self.db().begin_read().map_err(CatalogError::from)?;
-        let namer = Namer {
-            schemas: match scope.tenant() {
-                Some(t) => schema_names_for_tenant_in_txn(&rt, t)?,
-                None => BTreeMap::new(),
-            },
-        };
-        let ctx = Ctx {
-            rt: &rt,
-            scope,
-            namer,
-        };
-        object::in_scope_materialized_defs(&ctx)
-    }
-
     /// スキーマ（`PreData`）・表データ・スキーマ（`PostData`）を、読み取りトランザクション 1 つの上で
     /// この順に `sink` へ渡す（RECOVER-16 (1)(2)）。全体が単一の commit 点の内容に対応するため、
     /// 定義とデータが食い違わない。契約・失敗時の扱いは [`Storage::export_schema_ddl`]・
     /// [`Storage::export_table_data`] と同じ（一部でも失敗したら出力全体を破棄すること）。
     ///
     /// 運用者の CLI（#2162）専用の入口で、テナントの認可は呼び出し側が担う。
+    ///
+    /// 範囲内にマテリアライズド VIEW があると、列構成の一致を SQL 層なしでは確かめられないため
+    /// 固定文言の `Unsupported` で失敗する（fail-closed。[`Storage::export_schema_ddl`] と同じ）。
+    /// マテリアライズド VIEW を含む書き出しは `EngineCore::export_logical_dump` を使う。
     pub fn export_logical_dump<E>(
         &self,
         scope: &SchemaDdlScope,
         format: TableDataFormat,
+        sink: impl FnMut(&LogicalDumpItem<'_>) -> Result<(), E>,
+    ) -> Result<LogicalDumpSummary, SchemaDdlError<E>> {
+        self.export_logical_dump_checked(scope, format, reject_unverifiable_matviews, sink)
+    }
+
+    /// [`Storage::export_logical_dump`] の本体。`check` は出力と同じ読み取りスナップショットから
+    /// 読んだ範囲内のマテリアライズド VIEW 定義を受け取り、何かを出す前に呼ばれる（Issue #3097）。
+    pub(crate) fn export_logical_dump_checked<E>(
+        &self,
+        scope: &SchemaDdlScope,
+        format: TableDataFormat,
+        check: impl FnOnce(&[MaterializedViewDef]) -> Result<(), SchemaDdlError<E>>,
         mut sink: impl FnMut(&LogicalDumpItem<'_>) -> Result<(), E>,
     ) -> Result<LogicalDumpSummary, SchemaDdlError<E>> {
         if let Some(t) = scope.tenant() {
@@ -452,6 +463,7 @@ impl Storage {
             scope,
             namer,
         };
+        check(&object::in_scope_materialized_defs(&ctx)?)?;
         let mut schema_count: u64 = 0;
         {
             let mut schema_sink = |st: &DdlStatement<'_>| sink(&LogicalDumpItem::Schema(*st));
@@ -482,6 +494,18 @@ impl Storage {
             data,
         })
     }
+}
+
+/// SQL 層を持たない書き出し入口（[`Storage::export_schema_ddl`]・[`Storage::export_logical_dump`]）が
+/// 渡す検査。範囲内にマテリアライズド VIEW があれば、列構成の一致を確かめられないため拒否する。
+fn reject_unverifiable_matviews<E>(defs: &[MaterializedViewDef]) -> Result<(), SchemaDdlError<E>> {
+    if defs.is_empty() {
+        return Ok(());
+    }
+    Err(unsupported(
+        "materialized view",
+        "materialized view column check requires the SQL engine",
+    ))
 }
 
 /// スナップショット内のすべての redb 表が分類済みであることを確かめる（未知の表・multimap 表があれば

@@ -644,6 +644,68 @@ fn materialized_view_with_drifted_columns_fails_the_logical_dump() {
     );
 }
 
+/// 列構成のずれた matview は、スキーマだけの書き出し（dump CLI の `--schema-only`）も拒否する
+/// （検査は論理ダンプだけの入口ではなく、書き出し経路に共通。Issue #3097）。
+#[test]
+fn materialized_view_with_drifted_columns_fails_the_schema_only_dump() {
+    let p1 = unique_db_path("dump-matview-drifted-schema-only");
+    let _g1 = CleanupGuard(p1.clone());
+    let src = open_core(&p1);
+    for sql in [
+        "CREATE TABLE base (a INTEGER PRIMARY KEY)",
+        "CREATE MATERIALIZED VIEW mv AS SELECT * FROM base",
+    ] {
+        ok(&src, "tenant-a", sql);
+    }
+    let scope = SchemaDdlScope::shared_and_tenant("tenant-a");
+    dump(&src, &scope).expect("undrifted schema dump");
+    ok(&src, "tenant-a", "ALTER TABLE base ADD COLUMN b TEXT");
+    let err = dump(&src, &scope).expect_err("drifted matview must fail the schema dump");
+    assert!(
+        matches!(&err, SchemaDdlError::Unsupported(u) if u.kind == "materialized view"),
+        "{err:?}"
+    );
+}
+
+/// SQL 層を持たない `Storage` の公開入口は、列構成を確かめられないため、範囲内に matview が
+/// あれば（ずれの有無に関わらず）書き出しを拒否する。検査つきの `EngineCore` を使う
+/// （fail-closed。Issue #3097）。
+#[test]
+fn storage_level_exports_reject_materialized_views_they_cannot_verify() {
+    let p1 = unique_db_path("dump-matview-storage-level");
+    let _g1 = CleanupGuard(p1.clone());
+    {
+        let src = open_core(&p1);
+        for sql in [
+            "CREATE TABLE base (a INTEGER PRIMARY KEY)",
+            "CREATE MATERIALIZED VIEW mv AS SELECT * FROM base",
+            "ALTER TABLE base ADD COLUMN b TEXT",
+        ] {
+            ok(&src, "tenant-a", sql);
+        }
+    }
+    let storage = Storage::open(&p1).expect("reopen storage");
+    let scope = SchemaDdlScope::shared_and_tenant("tenant-a");
+    let err = storage
+        .export_schema_ddl(&scope, |_| Ok::<(), std::convert::Infallible>(()))
+        .expect_err("storage-level schema export must refuse");
+    assert!(
+        matches!(&err, SchemaDdlError::Unsupported(u) if u.kind == "materialized view"),
+        "{err:?}"
+    );
+    let err = storage
+        .export_logical_dump(
+            &scope,
+            engine::catalog::ddl_export::TableDataFormat::Insert,
+            |_| Ok::<(), std::convert::Infallible>(()),
+        )
+        .expect_err("storage-level logical dump must refuse");
+    assert!(
+        matches!(&err, SchemaDdlError::Unsupported(u) if u.kind == "materialized view"),
+        "{err:?}"
+    );
+}
+
 #[test]
 fn output_order_does_not_depend_on_internal_schema_ids() {
     // SCHEMA を名前の逆順に作ると内部 ID が名前順と逆になる。復元先では名前順に ID が付き直されるため、

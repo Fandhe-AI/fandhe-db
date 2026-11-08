@@ -4310,20 +4310,6 @@ impl EngineCore {
         self.storage.export_snapshot(dest)
     }
 
-    /// 稼働中の永続ストレージのスキーマを DDL 文として書き出す（RECOVER-16 (1)・Issue #2160）。
-    /// 運用者の CLI（#2162）から呼ぶ入口で、[`Storage::export_schema_ddl`] へそのまま委譲する
-    /// （読み取りスナップショット上で動き、書き込みを止めない。SQL・NoSQL の表層からは呼べない）。
-    pub fn export_schema_ddl<E>(
-        &self,
-        scope: &crate::catalog::ddl_export::SchemaDdlScope,
-        sink: impl FnMut(&crate::catalog::ddl_export::DdlStatement<'_>) -> std::result::Result<(), E>,
-    ) -> std::result::Result<
-        crate::catalog::ddl_export::SchemaDdlSummary,
-        crate::catalog::ddl_export::SchemaDdlError<E>,
-    > {
-        self.storage.export_schema_ddl(scope, sink)
-    }
-
     /// 稼働中の永続ストレージの表データ（行）を COPY／INSERT 形式で書き出す（RECOVER-16・Issue #2161）。
     /// 運用者の CLI（#2162）から呼ぶ入口で、[`Storage::export_table_data`] へそのまま委譲する
     /// （読み取りスナップショット上で行を順に走査し、書き込みを止めない。SQL・NoSQL の表層からは呼べない）。
@@ -4339,13 +4325,35 @@ impl EngineCore {
         self.storage.export_table_data(scope, format, sink)
     }
 
-    /// 論理ダンプの範囲内のマテリアライズド VIEW について、保存済みの列と本文から再導出した列の
-    /// 一致を確かめる。不一致・再導出の失敗は固定文言の `Unsupported`（存在を示す情報は含めない）。
-    fn check_matview_columns_for_dump<E>(
+    /// 稼働中の永続ストレージのスキーマを DDL 文として書き出す（RECOVER-16 (1)・Issue #2160）。
+    /// 運用者の CLI（#2162）から呼ぶ入口。読み取りスナップショット上で動き（書き込みを止めない）、
+    /// マテリアライズド VIEW の列構成の検査（Issue #3097）を同じスナップショットの定義に対して挟む。
+    /// SQL・NoSQL の表層からは呼べない。
+    pub fn export_schema_ddl<E>(
         &self,
         scope: &crate::catalog::ddl_export::SchemaDdlScope,
+        sink: impl FnMut(&crate::catalog::ddl_export::DdlStatement<'_>) -> std::result::Result<(), E>,
+    ) -> std::result::Result<
+        crate::catalog::ddl_export::SchemaDdlSummary,
+        crate::catalog::ddl_export::SchemaDdlError<E>,
+    > {
+        self.storage.export_schema_ddl_checked(
+            scope,
+            |defs| self.check_matview_columns_for_dump(defs),
+            sink,
+        )
+    }
+
+    /// 論理ダンプの範囲内のマテリアライズド VIEW について、保存済みの列と本文から再導出した列の
+    /// 一致を確かめる。不一致・再導出の失敗は固定文言の `Unsupported`（存在を示す情報は含めない）。
+    ///
+    /// `defs` は書き出しと同じ読み取りスナップショットから読んだ定義（Storage の書き出し入口が、
+    /// 何かを出す前に渡す。Issue #3097）。基表の列の再導出は別の読み取りで行うため、スナップショット
+    /// 取得後に基表の列が変わった場合は不一致として拒否側に倒れる（出力は破棄される）。
+    fn check_matview_columns_for_dump<E>(
+        &self,
+        defs: &[crate::catalog::materialized::MaterializedViewDef],
     ) -> std::result::Result<(), crate::catalog::ddl_export::SchemaDdlError<E>> {
-        let defs = self.storage.scoped_materialized_view_defs::<E>(scope)?;
         if defs.is_empty() {
             return Ok(());
         }
@@ -4383,9 +4391,14 @@ impl EngineCore {
     > {
         // マテリアライズド VIEW は本文を `WITH NO DATA` で再実行して復元するため、保存済みの列構成と
         // 本文から再導出した列構成がずれる定義（基表への `ADD COLUMN` 後の `SELECT *` 等）は、復元で
-        // 列構成・`REFRESH` のエラー契約が黙って変わる。ダンプ全体を拒否する（fail-closed。Issue #3097）。
-        self.check_matview_columns_for_dump(scope)?;
-        self.storage.export_logical_dump(scope, format, sink)
+        // 列構成・`REFRESH` のエラー契約が黙って変わる。出力と同じスナップショットの定義を検査し、
+        // ずれがあればダンプ全体を拒否する（fail-closed。Issue #3097）。
+        self.storage.export_logical_dump_checked(
+            scope,
+            format,
+            |defs| self.check_matview_columns_for_dump(defs),
+            sink,
+        )
     }
 
     /// 変更ログの未アーカイブのレコードを外部セグメントへ書き出し、保持設定があれば刈り込む
