@@ -10,6 +10,7 @@ mod legacy_table;
 #[path = "../../src/test_util/temp_db.rs"]
 mod temp_db;
 
+mod recover17_restore_generation_show;
 mod sql1797_early_stop;
 mod sql1798_interrupt;
 mod sql1951_statement_deadline;
