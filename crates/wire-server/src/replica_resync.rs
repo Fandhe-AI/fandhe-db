@@ -214,9 +214,9 @@ fn temp_name(out: &Path) -> Result<PathBuf, ResyncError> {
 
 /// サーバーが一時名を残したままの失敗に備え、あれば消す（自分が決めた名前だけ。リンクはたどらない）。
 /// 消せなかったときは `leftover` に入れ、呼び出し元が通知できるようにする。
-fn discard_temp_name(tmp_path: PathBuf, leftover: &mut Option<PathBuf>) {
+fn discard_temp_name(tmp_path: PathBuf, leftover: &mut Vec<PathBuf>) {
     if std::fs::symlink_metadata(&tmp_path).is_ok() && std::fs::remove_file(&tmp_path).is_err() {
-        *leftover = Some(tmp_path);
+        leftover.push(tmp_path);
     }
 }
 
@@ -224,7 +224,7 @@ fn discard_temp_name(tmp_path: PathBuf, leftover: &mut Option<PathBuf>) {
 /// スナップショットが残らないよう一時名を片付ける。
 fn adopt_or_discard(
     tmp_path: PathBuf,
-    leftover: &mut Option<PathBuf>,
+    leftover: &mut Vec<PathBuf>,
 ) -> Result<TempBase, ResyncError> {
     match TempBase::adopt(tmp_path.clone()) {
         Ok(t) => Ok(t),
@@ -239,7 +239,7 @@ fn adopt_or_discard(
 /// 残ったパスを `leftover` に入れる（全テナントのデータが残るので、呼び出し元が通知する）。
 pub fn resync(
     opts: &ReplicaResyncOptions,
-    leftover: &mut Option<PathBuf>,
+    leftover: &mut Vec<PathBuf>,
 ) -> Result<u64, ResyncError> {
     // 早期失敗のための確認。最終判定は公開の `hard_link`（確認後の競合を残さない）。
     if std::fs::symlink_metadata(&opts.out).is_ok() {
@@ -262,9 +262,8 @@ pub fn resync(
     let mut tmp = adopt_or_discard(tmp_path, leftover)?;
     let outcome = check_and_publish(opts, &mut tmp, leftover);
     tmp.remove();
-    if leftover.is_none() {
-        *leftover = tmp.leftover.take();
-    }
+    // 検査用コピーの残置と一時名の残置は別物なので、上書きせず両方を報告に残す。
+    leftover.extend(tmp.leftover.take());
     outcome
 }
 
@@ -272,11 +271,17 @@ pub fn resync(
 fn check_and_publish(
     opts: &ReplicaResyncOptions,
     tmp: &mut TempBase,
-    leftover: &mut Option<PathBuf>,
+    leftover: &mut Vec<PathBuf>,
 ) -> Result<u64, ResyncError> {
     // 2. 整合検査。
-    let (report, _mode) = restore_opt::verify_db(&tmp.path, &IntegrityOptions::default(), leftover)
-        .map_err(|_| ResyncError::VerifyFailed)?;
+    let mut verify_leftover = None;
+    let verified = restore_opt::verify_db(
+        &tmp.path,
+        &IntegrityOptions::default(),
+        &mut verify_leftover,
+    );
+    leftover.extend(verify_leftover);
+    let (report, _mode) = verified.map_err(|_| ResyncError::VerifyFailed)?;
     match verify_opt::classify(&report) {
         0 => {}
         c => return Err(ResyncError::NotConsistent(c)),
@@ -428,11 +433,11 @@ mod adopt_cleanup_tests {
         let dir = scratch("empty");
         let tmp = dir.join(".fandhe-replica-resync-test.redb");
         std::fs::write(&tmp, b"").expect("write");
-        let mut leftover = None;
+        let mut leftover = Vec::new();
         let r = adopt_or_discard(tmp.clone(), &mut leftover);
         assert!(matches!(r, Err(ResyncError::TempReplaced)));
         assert!(std::fs::symlink_metadata(&tmp).is_err());
-        assert!(leftover.is_none());
+        assert!(leftover.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -442,10 +447,23 @@ mod adopt_cleanup_tests {
         let tmp = dir.join(".fandhe-replica-resync-test.redb");
         std::fs::create_dir(&tmp).expect("mkdir");
         std::fs::write(tmp.join("x"), b"x").expect("write");
-        let mut leftover = None;
+        let mut leftover = Vec::new();
         let r = adopt_or_discard(tmp.clone(), &mut leftover);
         assert!(r.is_err());
-        assert_eq!(leftover.as_deref(), Some(tmp.as_path()));
+        assert_eq!(leftover, vec![tmp.clone()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn leftovers_accumulate_without_overwrite() {
+        let dir = scratch("accumulate");
+        let a = dir.join(".fandhe-replica-resync-a.redb");
+        std::fs::create_dir(&a).expect("mkdir");
+        std::fs::write(a.join("x"), b"x").expect("write");
+        // 検査用コピーの残置が先にある状態で一時名も消せなくても、両方が残る。
+        let mut leftover = vec![PathBuf::from("verify-copy")];
+        discard_temp_name(a.clone(), &mut leftover);
+        assert_eq!(leftover, vec![PathBuf::from("verify-copy"), a]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -4677,9 +4677,9 @@ fn run_replica_resync(args: &[String]) -> ExitCode {
             return ExitCode::from(replica_resync_opt::EXIT_USAGE);
         }
     };
-    let mut leftover = None;
+    let mut leftover = Vec::new();
     let result = replica_resync::resync(&opts, &mut leftover);
-    if let Some(p) = &leftover {
+    for p in &leftover {
         report_leftover("replica-resync", p);
     }
     match result {
