@@ -741,3 +741,61 @@ fn apply_rejects_an_increment_that_overlaps_the_applied_range() {
     apply_incremental_segments(&restored, &[inc2]).expect("apply inc2");
     assert_matches_latest(&fx, &restored);
 }
+
+/// 復元の世代の表を指すレコード(変更・削除・作成)は、表が存在する適用先でも拒否され、値は変わらない
+/// (増分・PITR の再生がこの表を書き換え・削除できない。RECOVER-17・Issue #2448)。
+#[test]
+fn apply_never_touches_the_restore_generation_table() {
+    use super::super::super::restore_generation::RESTORE_GENERATION_TABLE_NAME as NAME;
+    let fx = Fixture::new("inc-restore-gen");
+    fx.write_round_1();
+    let (base, point) = fx.full_backup("base.redb");
+    let work = TempDir::new("inc-restore-gen-work");
+    let change = TableChange {
+        name: NAME.to_string(),
+        shape: 1,
+        upserts: vec![(b"generation".to_vec(), 7u64.to_le_bytes().to_vec())],
+        removes: Vec::new(),
+    };
+    let cases: Vec<(&str, RecordBody)> = vec![
+        (
+            "changed",
+            RecordBody {
+                tables: vec![change],
+                ..RecordBody::default()
+            },
+        ),
+        (
+            "dropped",
+            RecordBody {
+                dropped: vec![NAME.to_string()],
+                ..RecordBody::default()
+            },
+        ),
+        (
+            "created",
+            RecordBody {
+                created: vec![(NAME.to_string(), 1)],
+                ..RecordBody::default()
+            },
+        ),
+    ];
+    for (label, body) in cases {
+        let restored = copy_to(&base, &work, &format!("{label}.redb"));
+        let advanced = {
+            let mut s = Storage::open(&restored).expect("open copy");
+            s.advance_restore_generation().expect("advance")
+        };
+        let seg = forge_segment(
+            &work.path().join(format!("{label}.seg")),
+            &point,
+            vec![body],
+            STORAGE_FORMAT_VERSION,
+        );
+        let r = apply_incremental_segments(&restored, &[seg]);
+        let got = format!("{:?}", r.expect_err("must be rejected"));
+        assert!(got.starts_with("BadRecord"), "case {label}: {got}");
+        let s = Storage::open(&restored).expect("reopen");
+        assert_eq!(s.restore_generation().expect("read"), advanced, "{label}");
+    }
+}

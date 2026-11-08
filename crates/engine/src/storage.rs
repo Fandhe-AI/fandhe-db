@@ -37,6 +37,7 @@ pub mod integrity;
 mod power_loss_model;
 pub mod read_only;
 pub(crate) mod read_source;
+pub(crate) mod restore_generation;
 pub(crate) mod rowid;
 pub mod snapshot;
 pub(crate) mod table_image;

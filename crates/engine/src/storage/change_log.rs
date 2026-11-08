@@ -105,9 +105,13 @@ const CHECKSUM_LEN: usize = 32;
 /// ストレージ版数 4 + ペイロード長 4。
 const HEADER_LEN: usize = 4 + 2 + DB_ID_LEN + 8 + 8 + 8 + 8 + 4 + 4;
 
-/// 変更ログが記録対象から外す redb 表か（本体表とメタ表。D3 の記録範囲の例外）。
+/// 変更ログが記録対象から外す redb 表か（本体表・メタ表と復元の世代の表。D3 の記録範囲の例外）。
 pub(crate) fn is_excluded_table(name: &str) -> bool {
-    name == CHANGE_LOG_TABLE_NAME || name == CHANGE_LOG_META_TABLE_NAME
+    name == CHANGE_LOG_TABLE_NAME
+        || name == CHANGE_LOG_META_TABLE_NAME
+        // 復元の世代番号の表は復元の完了点の保守 commit だけが書く。記録・再生の対象にせず、
+        // 増分・PITR のレコードから書き換え・削除させない（RECOVER-17・Issue #2448）。
+        || name == super::restore_generation::RESTORE_GENERATION_TABLE_NAME
 }
 
 // ---------------------------------------------------------------------------

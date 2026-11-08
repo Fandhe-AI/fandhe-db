@@ -14,7 +14,8 @@
 //!    コピーし、サイズ一致を確かめて fsync する。元のバックアップには一切書かない
 //! 3. 一時ファイルを `Storage::open` して `verify_integrity` を実行する。Error・Incomplete が 1 件でも
 //!    あれば公開せず一時ファイルを消す（検査できなかったものも整合とは扱わない）
-//! 4. 検査が通ったら一時ファイルを fsync し直し、`hard_link` で最終名へ公開する（既存の宛先は
+//!    通ったら、一時ファイルを開き直して復元の世代番号を進める（RECOVER-17。失敗したら公開しない）
+//! 4. 世代を進めた一時ファイルを fsync し直し、`hard_link` で最終名へ公開する（既存の宛先は
 //!    `EEXIST` で原子的に拒否。`rename` は置換するため使わない）。一時名を消し、親ディレクトリを fsync する
 //!
 //! 既存の DB を上書きする明示フラグは設けない（置換には稼働中の判定と原子的な置換の両方が要り、
@@ -23,9 +24,9 @@
 //! # 注意
 //!
 //! 検査のために一時ファイルを `Storage::open` するため、旧形式の DB の一方向移行など `open` の
-//! 書き込みが一時ファイル側にだけ入りうる（バックアップは変わらない）。復元後の世代番号を進める
-//! 処理（RECOVER-17・#2446。設計は `docs/design/restore-generation.md`）は未実装で、呼び出し位置を
-//! [`restore`] の公開直前に示してある。
+//! 書き込みが一時ファイル側にだけ入りうる（バックアップは変わらない）。復元後の世代番号
+//! （RECOVER-17・#2446・#2448。設計は `docs/design/restore-generation.md`）は、検査を通った一時ファイルへ
+//! `Storage::advance_restore_generation` で公開の直前に 1 回だけ書く（手順 3 と 4 の間）。
 
 use std::path::{Path, PathBuf};
 
@@ -204,6 +205,9 @@ pub enum RestoreError {
     OpenFailed,
     /// 検査を始められなかった。
     VerifyFailed,
+    /// 復元の世代番号を進められなかった（値の破損・上限到達・書き込み失敗。RECOVER-17・Issue #2448）。
+    /// 世代が進まない復元は公開しない（古い世代を返す復元先を作らない。fail-closed）。
+    GenerationFailed,
     /// 検査用の一時コピーのパスが、作成した fd と別のファイルに差し替えられた・消えた・長さが合わない
     /// （空 DB が整合扱いで公開されるのを防ぐ。公開しない）。
     TempReplaced,
@@ -238,6 +242,9 @@ impl std::fmt::Display for RestoreError {
             }
             Self::TempReplaced => "temporary copy was replaced or removed; nothing was published",
             Self::VerifyFailed => "integrity check could not be started; nothing was published",
+            Self::GenerationFailed => {
+                "restore generation could not be advanced; nothing was published"
+            }
             Self::NotConsistent(_) => "backup failed the integrity check; nothing was published",
             Self::Unsupported => "restore is not supported in this environment",
             Self::UncheckedContentPublished => {
@@ -632,6 +639,19 @@ mod unix_impl {
         Ok(report)
     }
 
+    /// 検査を通った一時コピーを開き直して復元の世代番号を進める（開いた `Storage` は閉じてから返す。
+    /// 書き込みで長さが変わるため、パスの同一性だけを確かめる）。
+    fn advance_generation(tmp: &TempCopy) -> Result<(), RestoreError> {
+        tmp.check_path(None)?;
+        {
+            let mut storage = Storage::open(&tmp.path).map_err(|_| RestoreError::OpenFailed)?;
+            storage
+                .advance_restore_generation()
+                .map_err(|_| RestoreError::GenerationFailed)?;
+        }
+        tmp.check_path(None)
+    }
+
     fn parent_of(path: &Path) -> Result<&Path, RestoreError> {
         path.file_name().ok_or(RestoreError::InvalidDestination)?;
         let parent: &Path = match path.parent() {
@@ -745,9 +765,11 @@ mod unix_impl {
             return Err(RestoreError::NotConsistent(report));
         }
 
-        // 復元の世代番号を進める処理の呼び出し位置（RECOVER-17・#2446。設計は
-        // docs/design/restore-generation.md、実装は #2448）。公開前の一時ファイルへ書く必要がある
-        // ため、API ができたらここ（検査の通過後・fsync と公開の前）で呼ぶ。現在は未実装。
+        // 復元の世代番号を進める（RECOVER-17・Issue #2448。設計は docs/design/restore-generation.md）。
+        // 検査を通った一時ファイルへ、公開の前に 1 回だけ書く。公開後に古い世代の復元先が見える
+        // 時間帯を作らない。失敗したら何も公開しない（一時ファイルは破棄される）。
+        // 進めた後に整合検査を再実行しない: 書き込みは世代の 1 表のみで、同じ inode のまま公開する。
+        advance_generation(tmp)?;
 
         // 4. open・クローズ後の最終内容を保持 fd で fsync し直す。fsync は長くかかりうるため、
         //    パスの同一性は fsync の「後」、hard_link の直前に確かめる（hard_link は fd ではなく

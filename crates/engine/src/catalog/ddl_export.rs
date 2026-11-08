@@ -276,6 +276,7 @@ const NOT_SCHEMA_TABLES: &[&str] = &[
     "partitioned_dml_job_active",
     "change_log",
     "change_log_meta",
+    "restore_generation",
 ];
 
 /// DDL の対象ではない動的な表の名前接頭辞（行ストア・索引の物理表現）。
