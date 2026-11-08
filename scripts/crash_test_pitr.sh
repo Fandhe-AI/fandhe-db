@@ -291,7 +291,7 @@ count_tmp() {
 # ディレクトリ直下の restore の一時名（厳密な形式。decoy は数えない）の個数。
 count_restore_tmp() {
   find "$1" -maxdepth 1 -type f -regextype posix-extended \
-    -regex '.*/\.fandhe-restore-[0-9]+-[0-9]+\.tmp' | wc -l
+    -regex '.*/\.fandhe-restore-[0-9]+(-[0-9a-f]{16})?-[0-9]+\.tmp' | wc -l
 }
 
 # ディレクトリ直下のファイルの「名前・サイズ・更新時刻」の一覧（入力が変わっていないことの比較用）。
