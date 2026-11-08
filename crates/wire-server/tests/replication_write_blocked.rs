@@ -184,15 +184,9 @@ impl Primary {
 
     /// `replica-1` の切断の行（`replica 'replica-1' disconnected (<理由>)`）を待ち、理由と観測時刻を返す。
     fn wait_disconnect(&self, timeout: Duration) -> (String, Instant) {
-        let marker = format!("replica '{ROLE}' disconnected (");
         let deadline = Instant::now() + timeout;
         loop {
-            let found = self.drain.tail_lines().iter().find_map(|l| {
-                l.split(marker.as_str())
-                    .nth(1)
-                    .map(|r| r.trim_end().trim_end_matches(')').to_string())
-            });
-            if let Some(reason) = found {
+            if let Some(reason) = self.disconnect_reason() {
                 return (reason, Instant::now());
             }
             assert!(
@@ -202,6 +196,16 @@ impl Primary {
             );
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    /// 切断の行が既に出ていれば理由を返す（待たない）。期限前に切られていないことの直接確認に使う。
+    fn disconnect_reason(&self) -> Option<String> {
+        let marker = format!("replica '{ROLE}' disconnected (");
+        self.drain.tail_lines().iter().find_map(|l| {
+            l.split(marker.as_str())
+                .nth(1)
+                .map(|r| r.trim_end().trim_end_matches(')').to_string())
+        })
     }
 
     /// 保持位置からの Start が刈り込み済み（再同期が必要）か。受け付けられたら偽。`probe-1` で確かめる。
@@ -390,13 +394,21 @@ fn recover15_ack_timeout_cuts_a_write_blocked_replica_and_releases_retention() {
     );
     let (mut r, base, mut alice) = p.begin_blocked_target();
     let t0 = p.fill(&mut alice);
+    // 未 ack の時計は COMMIT 後に始まるので、`t0 + T` より前に切られていてはならない。ログの発見時刻ではなく、
+    // 期限前に切断の行が無いことを直接確認する（余裕は時計の起点の差と取りこぼしの分）。
+    let early_limit = t0 + T - Duration::from_millis(300);
+    while Instant::now() < early_limit {
+        assert_eq!(
+            p.disconnect_reason(),
+            None,
+            "cut before the ack timeout: {:?}",
+            t0.elapsed()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
     alice.assert_small_writes_flow(0..5, Duration::from_secs(15));
     let (reason, seen) = p.wait_disconnect(Duration::from_secs(30));
     let elapsed = seen.duration_since(t0);
-    assert!(
-        elapsed >= T - Duration::from_millis(1500),
-        "not cut before the ack timeout: {elapsed:?}"
-    );
     assert!(
         elapsed < T + Duration::from_secs(10),
         "cut at the ack timeout bound: {elapsed:?}"
