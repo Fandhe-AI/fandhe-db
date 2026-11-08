@@ -54,6 +54,9 @@ pub enum ResyncError {
     Request,
     /// バックアップソケットの応答が失敗（結果コード）。
     Backup(u8),
+    /// バックアップ側が「公開済みだが後始末を確認できない」（結果 3）を返した。公開先は一時名で、
+    /// `--out` は作られないため、終了コード 3（`--out` 公開済み）とは区別して再試行可能な失敗にする。
+    BackupTempNotFinalized,
     /// 整合検査を実行できなかった・一時ファイルを検査できなかった。
     VerifyFailed,
     /// 整合検査で矛盾（4）または検査できない項目（5）。
@@ -83,6 +86,9 @@ impl std::fmt::Display for ResyncError {
                 "cannot take the base backup from the primary (is it running with --backup-socket?)"
             }
             Self::Backup(c) => backup_socket::code_message(*c),
+            Self::BackupTempNotFinalized => {
+                "the base backup could not be finalized; nothing was published to --out, retry"
+            }
             Self::VerifyFailed => "the base could not be checked; nothing was published",
             Self::NotConsistent(_) => "the base failed the integrity check; nothing was published",
             Self::BaseRejected => {
@@ -120,6 +126,7 @@ impl ResyncError {
             Self::InvalidDestination => EXIT_USAGE,
             Self::NotFinalized => EXIT_NOT_FINALIZED,
             Self::Request
+            | Self::BackupTempNotFinalized
             | Self::VerifyFailed
             | Self::PrimaryUnreachable
             | Self::TempReplaced
@@ -220,6 +227,8 @@ pub fn resync(
     // 1. ベースの取得（プライマリのサーバー側が 0600 の一時名から原子的に公開する）。
     let result = match backup_socket::request(&opts.socket, &tmp_path) {
         Ok(r) if r.code == 0 => Ok(()),
+        // 結果 3 は一時名への公開のみ。`--out` は未作成なので、終了コード 3 として転送しない。
+        Ok(r) if r.code == 3 => Err(ResyncError::BackupTempNotFinalized),
         Ok(r) => Err(ResyncError::Backup(r.code)),
         Err(_) => Err(ResyncError::Request),
     };

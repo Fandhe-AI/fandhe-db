@@ -106,6 +106,7 @@ pub fn parse(args: &[String]) -> Result<ReplicaResyncOptions, String> {
     if out.to_str().is_none_or(|s| s.contains('\n')) {
         return Err("--out must be valid UTF-8 without line breaks".to_string());
     }
+    check_out_parent(&out)?;
     crate::backup_socket::check_socket_owner(Path::new(socket))?;
     Ok(ReplicaResyncOptions {
         socket: PathBuf::from(socket),
@@ -114,6 +115,24 @@ pub fn parse(args: &[String]) -> Result<ReplicaResyncOptions, String> {
         role,
         password,
     })
+}
+
+/// `--out` の親ディレクトリが自分の所有で、group/other から書き込めないことを取得前に確かめる
+/// （fail-closed）。他者が書ける場所では、検査前の一時ベースを差し替えられ、同一長の改変が
+/// `TempBase` の同一性確認（dev・ino・長さ）をすり抜けるため、競合の前提そのものを断つ。
+fn check_out_parent(out: &Path) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    const MSG: &str = "the parent directory of --out must be owned by the current user and not writable by group/other";
+    let parent = out.parent().ok_or_else(|| MSG.to_string())?;
+    let m = std::fs::metadata(parent).map_err(|_| MSG.to_string())?;
+    if !m.is_dir() || m.mode() & 0o022 != 0 {
+        return Err(MSG.to_string());
+    }
+    let own = crate::backup_socket::probe_uid(parent).map_err(|_| MSG.to_string())?;
+    if m.uid() != own {
+        return Err(MSG.to_string());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -156,5 +175,17 @@ mod tests {
         ]))
         .expect_err("rejected");
         assert!(e.contains("loopback"));
+    }
+
+    #[test]
+    fn rejects_a_group_writable_out_parent() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = std::env::temp_dir().join(format!("resync-opt-parent-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o770)).unwrap();
+        assert!(check_out_parent(&d.join("o.redb")).is_err());
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(check_out_parent(&d.join("o.redb")).is_ok());
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
