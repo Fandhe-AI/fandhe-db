@@ -359,3 +359,151 @@ fn recover14_archive_dir_writable_by_others_is_refused() {
     );
     assert!(!Path::new(&db).exists(), "refused before the DB is created");
 }
+/// 未アーカイブ量の上限のフラグ（Issue #3091・RECOVER-14 (2) ポインタ）の不備は、DB を作る前に固定文言で
+/// 拒否され、文言に値・パスを含まない。
+#[test]
+fn recover14_unarchived_limit_flags_are_validated_before_the_database_is_opened() {
+    let fx = common::TempFixtureDir::new("cl-lim-flags");
+    common::write_empty_user_store(&fx.users_path_str());
+    let arc = fx.db_path_str() + ".arc";
+    make_archive_dir(&arc);
+    let base = |extra: &[&str]| -> Output {
+        let users = fx.users_path_str();
+        let db = fx.db_path_str();
+        let mut args = vec!["--users", &users, "--db", &db, "--bind", "127.0.0.1:0"];
+        args.extend_from_slice(extra);
+        run(&args)
+    };
+    let bytes = "--change-log-max-unarchived-bytes";
+    let records = "--change-log-max-unarchived-records";
+    let cases: Vec<(Vec<&str>, &str)> = vec![
+        (vec![bytes, "100"], "require --change-log"),
+        (
+            vec!["--change-log", bytes, "100"],
+            "require --change-log-archive-dir",
+        ),
+        (
+            vec!["--change-log", "--change-log-archive-dir", &arc, bytes, "0"],
+            "must be at least 1",
+        ),
+        (
+            vec![
+                "--change-log",
+                "--change-log-archive-dir",
+                &arc,
+                records,
+                "0",
+            ],
+            "must be at least 1",
+        ),
+        (
+            vec![
+                "--change-log",
+                "--change-log-archive-dir",
+                &arc,
+                records,
+                "12x",
+            ],
+            "must be a non-negative integer",
+        ),
+        (
+            vec![
+                "--change-log",
+                "--change-log-archive-dir",
+                &arc,
+                bytes,
+                "5",
+                bytes,
+                "6",
+            ],
+            "specified more than once",
+        ),
+        (
+            vec!["--change-log", "--change-log-archive-dir", &arc, records],
+            "requires a value",
+        ),
+    ];
+    for (extra, expect) in cases {
+        let out = base(&extra);
+        assert_ne!(out.status.code(), Some(0), "{extra:?}");
+        let err = stderr(&out);
+        assert!(err.contains(expect), "{extra:?}: {err}");
+        assert!(!err.contains("listening on"), "{err}");
+        assert!(!err.contains("12x") && !err.contains(&arc), "{err}");
+    }
+    assert!(
+        !Path::new(&fx.db_path_str()).exists(),
+        "every refusal happens before the DB file is created"
+    );
+}
+
+/// 上限に達すると書き込みは `54000` で拒否され、アーカイブが進めば再開する。周期を最大にして、起動直後の
+/// 1 周期だけが走るようにする（時間計測に依存しない）。止めて同じ DB で再起動すると、起動直後の周期が
+/// アーカイブして挿入が通る。
+#[test]
+fn recover14_unarchived_limit_refuses_writes_with_54000_and_resumes_after_restart() {
+    let fx = common::TempFixtureDir::new("cl-lim-e2e");
+    let users = fx.users_path_str();
+    let db = fx.db_path_str();
+    write_user_store_with_alice(&users);
+    let arc = PathBuf::from(db.clone() + ".arc");
+    make_archive_dir(&arc);
+    let arc_s = arc.to_str().expect("utf-8").to_string();
+    let flags = [
+        "--change-log",
+        "--change-log-archive-dir",
+        &arc_s,
+        "--change-log-archive-interval-secs",
+        "86400",
+        "--change-log-max-unarchived-records",
+        "3",
+    ];
+
+    let mut stderr_text = String::new();
+    {
+        let mut server = spawn_server(&users, &db, &flags);
+        let mut drain = common::drain_stderr(&mut server.0);
+        let (addr, _lines) = drain.wait_for_listening(Duration::from_secs(10));
+        let addr = addr.expect("listening");
+        let mut alice = common::authenticate_to_ready_for_query(addr, "alice", "pw-alice");
+        common::send_simple_query(
+            &mut alice,
+            "CREATE TABLE docs (id BIGINT PRIMARY KEY, embedding VECTOR(3))",
+        );
+        let _ = common::read_command_complete(&mut alice);
+        common::read_ready_for_query(&mut alice);
+        insert(&mut alice, 1);
+        insert(&mut alice, 2);
+        // 未アーカイブが 3 件（上限）に達したので、次の書き込みは拒否される。
+        common::send_simple_query(
+            &mut alice,
+            "INSERT INTO docs (id, embedding) VALUES (3, '[0.1,0.2,0.3]')",
+        );
+        common::expect_error_response_with_sqlstate(&mut alice, "54000");
+        common::read_ready_for_query(&mut alice);
+        let _ = server.0.kill();
+        let _ = server.0.wait();
+        // 読み取りスレッドが EOF まで流し切るのを期限つきで待つ。
+        wait_until("the refusal line", Duration::from_secs(10), || {
+            stderr_text = drain.tail_lines().join("\n");
+            stderr_text.contains("unarchived change log is at its limit")
+        });
+    }
+    assert!(
+        stderr_text.contains("unarchived change log is at its limit"),
+        "{stderr_text}"
+    );
+    // 起動時の周期はまだ書き出していない（CREATE 以降の分）。
+    let before = segments(&arc).len();
+
+    // 再起動すると起動直後の周期がアーカイブし、書き込みが通る。
+    repair(&db);
+    let mut server = spawn_server(&users, &db, &flags);
+    let (addr, _lines) =
+        common::wait_for_listening_addr_and_lines(&mut server.0, Duration::from_secs(10));
+    wait_until("the startup archive pass", Duration::from_secs(20), || {
+        segments(&arc).len() > before
+    });
+    let mut alice = common::authenticate_to_ready_for_query(addr, "alice", "pw-alice");
+    insert(&mut alice, 3);
+}
