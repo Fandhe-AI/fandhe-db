@@ -458,6 +458,10 @@ impl ReplicationArgs {
             self.sync_timeout.as_deref(),
             self.sync_on_timeout.as_deref(),
         )?;
+        // 調停役は同期対象の全ロールが同時に接続中であることを要求する。接続上限が対象ロール数を
+        // 下回ると送信側が BUSY で拒否し、確認条件が永久に満たされない（書き込みが無期限待機または
+        // 常時タイムアウトになる）ため、DB を開く前に起動時エラーで拒否する（fail-closed）。
+        Self::check_sync_fits_connections(sync.as_ref(), max_connections)?;
         Ok(Some(ReplicationSettings {
             bind,
             roles,
@@ -468,6 +472,19 @@ impl ReplicationArgs {
             max_lag_records,
             sync,
         }))
+    }
+
+    /// 同期対象ロール数が接続上限を超える設定を拒否する（超えると確認条件が永久に満たされない）。
+    fn check_sync_fits_connections(
+        sync: Option<&engine::storage::SyncCommitConfig>,
+        max_connections: usize,
+    ) -> Result<(), String> {
+        match sync {
+            Some(cfg) if cfg.standbys.len() > max_connections => Err(format!(
+                "{MAX_CONNECTIONS_FLAG} must be at least the number of sync standbys"
+            )),
+            _ => Ok(()),
+        }
     }
 
     /// 同期レプリケーションの 4 フラグを検証する（`--replication-sync-standby` が無ければ他は指定できない）。
@@ -696,6 +713,14 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn sync_standbys_exceeding_max_connections_are_rejected() {
+        let two = sync(&["r1", "r2"], None, None, None).expect("ok");
+        assert!(ReplicationArgs::check_sync_fits_connections(two.as_ref(), 1).is_err());
+        assert!(ReplicationArgs::check_sync_fits_connections(two.as_ref(), 2).is_ok());
+        assert!(ReplicationArgs::check_sync_fits_connections(None, 1).is_ok());
     }
 
     #[test]

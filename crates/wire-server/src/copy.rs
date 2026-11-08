@@ -1070,7 +1070,11 @@ fn finish_copy_from<'e, S: WireStream>(
     // 同期レプリケーション（Issue #2245）: COPY FROM の commit の確認を、`CommandComplete` を書く前に待つ。
     if crate::sync_commit_wait::await_sync_commit(engine, || false).is_err() {
         crate::sync_commit_wait::write_not_confirmed(stream)?;
-        return Ok(CopyStep::Failed);
+        return Ok(if role == StatementRole::ImplicitFinal && outcome.is_ok() {
+            CopyStep::FailedAfterCommit
+        } else {
+            CopyStep::Failed
+        });
     }
     match outcome {
         Ok(insert_outcome) => {
@@ -1110,6 +1114,10 @@ pub(crate) enum CopyStep {
     Completed { tag: String },
     /// ErrorResponse を書き終えた（`ReadyForQuery` は呼び出し元が復元後に送る）。呼び出し元は以降の文を実行しない。
     Failed,
+    /// 暗黙トランザクションの最後の COPY が commit 済みで、同期レプリケーションの確認だけが取れず
+    /// ErrorResponse（`may_be_committed`）を書き終えた（Issue #2245）。呼び出し元はセッション状態を
+    /// 巻き戻さない（`ReadyForQuery` は `Failed` と同じく呼び出し元が送る）。
+    FailedAfterCommit,
     /// Terminate（'X'）受信・早期 EOF。呼び出し元は接続ループを終了させる。
     Closed,
 }
@@ -1176,7 +1184,14 @@ pub(crate) fn run<'e, S: WireStream>(
     // CopyOutResponse を書く前に待つ。取れなければ `may_be_committed` のエラーを返す。
     if crate::sync_commit_wait::await_sync_commit(engine, || false).is_err() {
         crate::sync_commit_wait::write_not_confirmed(stream)?;
-        return Ok(CopyStep::Failed);
+        // commit 済み（COPY TO の最後の文で plan が受理された）ならセッションを巻き戻さない。
+        return Ok(
+            if role == StatementRole::ImplicitFinal && matches!(plan, Ok(Ok(CopyPlan::To(..)))) {
+                CopyStep::FailedAfterCommit
+            } else {
+                CopyStep::Failed
+            },
+        );
     }
     let plan = match plan {
         Ok(Ok(plan)) => Ok(plan),

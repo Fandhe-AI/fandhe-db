@@ -2289,7 +2289,7 @@ fn run_copy_portal<'e, S: WireStream>(
             stream.flush()?;
             Ok(LoopSignal::Continue)
         }
-        crate::copy::CopyStep::Failed => {
+        crate::copy::CopyStep::Failed | crate::copy::CopyStep::FailedAfterCommit => {
             // ErrorResponse は `copy.rs` が書き済み。`respond_error_and_await_sync` の
             // 例外経路として、旗だけを立てて Sync で回復する（二重送出しない）。
             engine::log_stderr!("wire-server: extended query COPY failed, awaiting Sync");

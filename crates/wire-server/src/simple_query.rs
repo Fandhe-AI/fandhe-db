@@ -134,6 +134,10 @@ enum StatementStatus {
     /// エンコード失敗時のフォールバックのいずれか）。呼び出し元は以降の文を
     /// 実行せず、セッション状態を巻き戻す。
     Failed,
+    /// 暗黙トランザクションの最後の文が commit 済みで、同期レプリケーションの確認だけが取れず
+    /// `may_be_committed` のエラーを書き終えた（Issue #2245）。commit 済みの永続効果と食い違わないよう、
+    /// 呼び出し元はセッション状態を巻き戻さず commit 後のまま保つ。
+    FailedAfterCommit,
 }
 
 /// 簡易クエリ本文を実行し、成功／失敗いずれの場合も応答（`ReadyForQuery` 込み）を
@@ -204,7 +208,10 @@ pub(crate) fn execute_and_respond<'e, S: WireStream>(
                     sql,
                     Finish::ReadyForQuery,
                 )?;
-                if matches!(step, crate::copy::CopyStep::Failed) {
+                if matches!(
+                    step,
+                    crate::copy::CopyStep::Failed | crate::copy::CopyStep::FailedAfterCommit
+                ) {
                     finish_failed(stream, session, txn)?;
                 }
                 return Ok(copy_step_to_signal(step));
@@ -218,7 +225,7 @@ pub(crate) fn execute_and_respond<'e, S: WireStream>(
                 sql,
                 Finish::ReadyForQuery,
             )?;
-            if status == StatementStatus::Failed {
+            if status != StatementStatus::Completed {
                 finish_failed(stream, session, txn)?;
             }
             Ok(LoopSignal::Continue)
@@ -253,9 +260,9 @@ pub(crate) fn execute_and_respond<'e, S: WireStream>(
 fn copy_step_to_signal(step: crate::copy::CopyStep) -> LoopSignal {
     match step {
         crate::copy::CopyStep::Closed => LoopSignal::Closed,
-        crate::copy::CopyStep::Completed { .. } | crate::copy::CopyStep::Failed => {
-            LoopSignal::Continue
-        }
+        crate::copy::CopyStep::Completed { .. }
+        | crate::copy::CopyStep::Failed
+        | crate::copy::CopyStep::FailedAfterCommit => LoopSignal::Continue,
     }
 }
 
@@ -293,7 +300,9 @@ fn run_sequential_statements<'e, S: WireStream>(
         let status = if engine::sql::copy::is_copy_statement(stmt) {
             match run_copy_statement(stream, engine, ctx, session, txn, stmt, finish)? {
                 crate::copy::CopyStep::Completed { .. } => StatementStatus::Completed,
-                crate::copy::CopyStep::Failed => StatementStatus::Failed,
+                crate::copy::CopyStep::Failed | crate::copy::CopyStep::FailedAfterCommit => {
+                    StatementStatus::Failed
+                }
                 crate::copy::CopyStep::Closed => return Ok(LoopSignal::Closed),
             }
         } else {
@@ -303,7 +312,7 @@ fn run_sequential_statements<'e, S: WireStream>(
             StatementStatus::Completed => {
                 snapshot.after_completed(before, txn.status(), session);
             }
-            StatementStatus::Failed => {
+            StatementStatus::Failed | StatementStatus::FailedAfterCommit => {
                 // ErrorResponse＋ReadyForQuery は run_statement 内で
                 // 送出済み。残りの文は実行せず、セッション状態を復元する。
                 snapshot.restore_after_failure(before, txn.status(), session);
@@ -388,6 +397,11 @@ fn run_implicit_statements<'e, S: WireStream>(
                     }
                     continue;
                 }
+                crate::copy::CopyStep::FailedAfterCommit => {
+                    // commit 済みで同期確認だけが失敗。セッションは巻き戻さない。
+                    finish_failed(stream, session, txn)?;
+                    return Ok(LoopSignal::Continue);
+                }
                 crate::copy::CopyStep::Failed => {
                     *session = snapshot.clone();
                     finish_failed(stream, session, txn)?;
@@ -407,6 +421,12 @@ fn run_implicit_statements<'e, S: WireStream>(
                     finish_failed(stream, session, txn)?;
                     return Ok(LoopSignal::Continue);
                 }
+            }
+            StatementStatus::FailedAfterCommit => {
+                // commit 済みで同期確認だけが失敗した。永続効果（カタログ等）は残るため、
+                // セッション状態は巻き戻さず commit 後のまま保つ。
+                finish_failed(stream, session, txn)?;
+                return Ok(LoopSignal::Continue);
             }
             StatementStatus::Failed => {
                 // ErrorResponse＋ReadyForQuery('I') は送出済み。先行する書き込みは
@@ -696,7 +716,12 @@ fn run_statement_as<'e, S: WireStream>(
     // 応答を `state=may_be_committed` のエラーへ差し替える。
     if crate::sync_commit_wait::await_sync_commit(engine, || false).is_err() {
         crate::sync_commit_wait::write_not_confirmed(stream)?;
-        return Ok(StatementStatus::Failed);
+        // commit が成功した暗黙トランザクションの最後の文は、セッションを巻き戻さない。
+        return Ok(if role == StatementRole::ImplicitFinal && outcome.is_ok() {
+            StatementStatus::FailedAfterCommit
+        } else {
+            StatementStatus::Failed
+        });
     }
     crate::error_response::write_notices(stream, &pending_notices)?;
 
