@@ -4688,7 +4688,12 @@ fn run_restore(args: &[String]) -> ExitCode {
     };
     // Issue #3094: 前回の異常終了が復元先の親に残した一時名を、自分の一時コピーを作る前に掃除する。
     // 掃除の失敗・見送りで復元は失敗させない（終了コードの意味は変えない）。
-    if let Some((dir, s)) = restore_opt::sweep_stale_restore_temps(&parsed.db) {
+    // 明示された入力（--from・--incremental・--generation-state）が一時名の形式なら掃除を見送る。
+    let protected: Vec<&std::path::Path> = std::iter::once(parsed.from.as_path())
+        .chain(parsed.incrementals.iter().map(|p| p.as_path()))
+        .chain(parsed.generation_state.as_deref())
+        .collect();
+    if let Some((dir, s)) = restore_opt::sweep_stale_restore_temps(&parsed.db, &protected) {
         for line in wire_server::change_log_archive::stale_temp_report_lines("restore", &dir, &s) {
             engine::log_stderr!("{line}");
         }

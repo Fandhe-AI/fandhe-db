@@ -470,10 +470,22 @@ pub fn restore_with_pitr(
 /// RECOVER-14 のポインタ）。`main.rs::run_restore` が [`restore_with_args`] の前に呼ぶ。消す条件は engine の
 /// `storage::stale_temp`（形式に厳密一致・通常ファイル・0600 系・自分の所有・使用中でない）。宛先が既に在る・
 /// 親が不正なときは `None`。結果は報告のためだけで、復元の成否には影響させない。
+///
+/// `protected`（`--from`・`--incremental`・`--generation-state` の明示パス）のどれかが復元の一時名の形式なら、
+/// 入力の消失（復元元の変更・高水位の再作成）を避けるため掃除ごと見送って `None` を返す（fail-closed）。
 #[cfg(unix)]
 pub fn sweep_stale_restore_temps(
     dest: &Path,
+    protected: &[&Path],
 ) -> Option<(PathBuf, engine::storage::StaleTempSweep)> {
+    let reserved = protected.iter().any(|p| {
+        p.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(unix_impl::is_restore_temp_name)
+    });
+    if reserved {
+        return None;
+    }
     unix_impl::sweep_stale_restore_temps(dest)
 }
 
@@ -481,6 +493,7 @@ pub fn sweep_stale_restore_temps(
 #[cfg(not(unix))]
 pub fn sweep_stale_restore_temps(
     _dest: &Path,
+    _protected: &[&Path],
 ) -> Option<(PathBuf, engine::storage::StaleTempSweep)> {
     None
 }
@@ -1380,6 +1393,22 @@ mod tests {
         ] {
             assert!(!unix_impl::is_restore_temp_name(bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn sweep_is_skipped_when_an_input_has_a_reserved_name() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("restore-opt-protect-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let input = dir.join(".fandhe-restore-1-2.tmp");
+        std::fs::write(&input, b"input").expect("write");
+        std::fs::set_permissions(&input, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        let dest = dir.join("restored.db");
+        // 予約名の入力を明示すると掃除は見送られ、入力は残る。
+        assert!(sweep_stale_restore_temps(&dest, &[input.as_path()]).is_none());
+        assert!(input.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
