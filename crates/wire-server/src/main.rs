@@ -631,6 +631,9 @@ fn main() -> ExitCode {
     if args.get(1).map(String::as_str) == Some("change-log-verify") {
         return run_change_log_verify(&args[2..]);
     }
+    if args.get(1).map(String::as_str) == Some("change-log-cleanup") {
+        return run_change_log_cleanup(&args[2..]);
+    }
     if args.get(1).map(String::as_str) == Some("change-log-disable") {
         return run_change_log_disable(&args[2..]);
     }
@@ -4758,9 +4761,25 @@ fn run_change_log_verify(args: &[String]) -> ExitCode {
             return ExitCode::from(change_log_opt::EXIT_VERIFY_USAGE);
         }
     };
+    // `--base`: 保持しているフルバックアップの最も古い終点より前を、意図して消したアーカイブとして検査する
+    // （Issue #3092）。DB を読み取り専用で開く前に、DB と各バックアップの位置を読む（同じファイルを
+    // 二重に開かない）。DB 識別子・timeline が食い違うバックアップは拒否する（検査の緩和に使わせない）。
+    let retained_from = match (&parsed.db, parsed.bases.is_empty()) {
+        (Some(db), false) => match retained_from_bases(db, &parsed.bases) {
+            Ok(l) => Some(l),
+            Err(msg) => {
+                engine::log_stderr!("wire-server: change-log-verify: {msg}");
+                return ExitCode::from(change_log_opt::EXIT_VERIFY_FAILED);
+            }
+        },
+        _ => None,
+    };
     let result = match &parsed.db {
         Some(db) => match engine::storage::ReadOnlyStorage::open(db) {
-            Ok(ro) => ro.verify_change_log_archive(&parsed.dir),
+            Ok(ro) => match retained_from {
+                Some(l) => ro.verify_change_log_archive_from(&parsed.dir, l),
+                None => ro.verify_change_log_archive(&parsed.dir),
+            },
             Err(e) => {
                 let msg = match e {
                     engine::storage::ReadOnlyOpenError::InUse => {
@@ -4796,6 +4815,109 @@ fn run_change_log_verify(args: &[String]) -> ExitCode {
         Err(e) => {
             engine::log_stderr!("wire-server: change-log-verify: {e}");
             ExitCode::from(change_log_opt::EXIT_VERIFY_FAILED)
+        }
+    }
+}
+
+/// `change-log-verify --base` の始点（保持しているフルバックアップの最も古い終点の次）を求める。
+/// DB と各バックアップの DB 識別子・timeline が一致しなければ拒否する。エラー文は固定の英語。
+fn retained_from_bases(
+    db: &std::path::Path,
+    bases: &[std::path::PathBuf],
+) -> Result<u64, &'static str> {
+    let db_point = engine::storage::retention_point_of(db)
+        .map_err(|_| "failed to read the database position (stop the server first)")?;
+    let mut min_end = u64::MAX;
+    for b in bases {
+        let p = engine::storage::retention_point_of(b)
+            .map_err(|_| "failed to read a --base backup as a full backup")?;
+        if p.db_id != db_point.db_id || p.timeline != db_point.timeline {
+            return Err("a --base backup belongs to a different database or timeline");
+        }
+        min_end = min_end.min(p.end_lsn);
+    }
+    min_end
+        .checked_add(1)
+        .ok_or("a --base backup position is out of range")
+}
+
+/// `change-log-cleanup` サブコマンド（Issue #3092・RECOVER-14 (7) のポインタ）。保持しているフルバックアップ
+/// （`--backup`）から PITR するのに要らないアーカイブ済みセグメントだけを、先頭から連続して消す。既定は
+/// dry-run（消す予定の件数と LSN 範囲を出力するだけ）で、`--execute` を付けたときだけ消す。バックアップが
+/// 1 つも無い・識別子の不一致・アーカイブの検証失敗・他者が書けるアーカイブ先では何も消さない。
+/// 出力は運用者向けの標準出力（パス・テナント情報を含まない）。終了コード: 0 成功・1 失敗・2 引数の不備。
+fn run_change_log_cleanup(args: &[String]) -> ExitCode {
+    use wire_server::change_log_cleanup_opt as opt;
+
+    let parsed = match opt::parse(args) {
+        Ok(p) => p,
+        Err(msg) => {
+            engine::log_stderr!("wire-server: change-log-cleanup: {msg}");
+            return ExitCode::from(opt::EXIT_USAGE);
+        }
+    };
+    let fail = |e: &dyn std::fmt::Display| {
+        engine::log_stderr!("wire-server: change-log-cleanup: {e}");
+        ExitCode::from(opt::EXIT_FAILED)
+    };
+    let mut backups = Vec::with_capacity(parsed.backups.len());
+    for b in &parsed.backups {
+        match engine::storage::retention_point_of(b) {
+            Ok(p) => backups.push(p),
+            Err(e) => return fail(&e),
+        }
+    }
+    let db = match &parsed.db {
+        Some(path) => match engine::storage::retention_point_of(path) {
+            Ok(p) => Some(p),
+            Err(e) => return fail(&e),
+        },
+        None => None,
+    };
+    let now_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_micros()).ok());
+    let Some(now_us) = now_us else {
+        return fail(&"system clock is out of range");
+    };
+    let policy = engine::storage::CleanupPolicy {
+        backups,
+        db,
+        keep_secs: parsed.keep_secs,
+        keep_segments: parsed.keep_segments,
+        now_us,
+    };
+    let plan = match engine::storage::plan_archive_cleanup(&parsed.dir, &policy) {
+        Ok(p) => p,
+        Err(e) => return fail(&e),
+    };
+    let range = match plan.lsn_range() {
+        Some((a, b)) => format!("{a}..{b}"),
+        None => "none".to_string(),
+    };
+    if !parsed.execute {
+        println!(
+            "change log cleanup (dry-run): segments={} lsn={range} cutoff={}",
+            plan.segments(),
+            plan.cutoff()
+        );
+        return ExitCode::SUCCESS;
+    }
+    match engine::storage::execute_archive_cleanup(&parsed.dir, &plan) {
+        Ok(r) => {
+            println!(
+                "change log cleanup (removed): segments={} lsn={range} cutoff={}",
+                r.removed,
+                plan.cutoff()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            if let engine::storage::CleanupError::Partial { removed } = &e {
+                println!("change log cleanup (partial): segments={removed}");
+            }
+            fail(&e)
         }
     }
 }

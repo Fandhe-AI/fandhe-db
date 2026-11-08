@@ -22,6 +22,9 @@
 //! [`apply_record`]・[`dump_writer`] は、レコード列を空の状態から順に適用した結果が最終状態と一致する
 //! ことを確かめるテスト（LSN の連鎖・符号化・正規化の通し検証）が使う小さな適用器である。
 //! 後続の復元（#2169）の再生器の参照実装も兼ねる。
+//! 刈り込み（#2167）後のログは先頭が起点の次にならないため、刈り込まれた区間をベースのスナップショット
+//! （LSN B 時点の全表の内容）で補い、B より後のレコードだけを再生する [`verify_log_replay_from`] を使う
+//! （Issue #3095）。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::LazyLock;
@@ -336,9 +339,44 @@ pub(super) fn verify_record(
     Ok(())
 }
 
+/// `records` のうち、ベース（LSN `base_lsn` 時点の全表の内容）が既に含む区間（`lsn <= base_lsn`）を捨てて、
+/// ベース以後のレコードだけを返す。残りの先頭が `base_lsn + 1` でなければ `Err`（刈り込みがベースを
+/// 越えて進み、間の区間をどこも持たない状態を黙って通さない fail-closed）。残りの連鎖は [`replay`] が検査する。
+pub(crate) fn records_after_base(
+    records: Vec<ChangeRecord>,
+    base_lsn: u64,
+) -> Result<Vec<ChangeRecord>, String> {
+    let rest: Vec<ChangeRecord> = records
+        .into_iter()
+        .filter(|r| r.header.lsn > base_lsn)
+        .collect();
+    if let Some(first) = rest.first() {
+        if base_lsn.checked_add(1) != Some(first.header.lsn) {
+            return Err(
+                "the log does not continue from the base (pruned beyond the base)".to_string(),
+            );
+        }
+    }
+    Ok(rest)
+}
+
 /// 全レコードを空の状態から LSN 順に再生した結果が `storage` の実表と一致することを確かめる
 /// （有効化時の世代が 0 で、有効化の時点で表が無い DB 用。クラッシュ試験が kill のたびに呼ぶ）。
+/// 刈り込み後の DB には [`verify_log_replay_from`] を使う。
 pub(crate) fn verify_log_replay(storage: &crate::storage::Storage) -> Result<(), String> {
+    verify_log_replay_from(storage, Model::new(), 0)
+}
+
+/// `change_log` 表の全行を読んで、ベース（LSN `base_lsn` 時点の全表の内容 `base`）へ `base_lsn` より後の
+/// レコードを再生した結果が `storage` の実表と一致することを確かめる（RECOVER-14 のポインタ。Issue #3095）。
+/// 刈り込み（#2167）後の DB では、刈り込まれた区間をベースのスナップショットで補うために使う。
+/// 再生の終点が現在の世代と一致すること（末尾の commit の取りこぼしがない）も確かめる。
+/// `oracle_tests` とクラッシュ試験（[`verify_log_replay`] 経由）から呼ばれる。
+pub(crate) fn verify_log_replay_from(
+    storage: &crate::storage::Storage,
+    base: Model,
+    base_lsn: u64,
+) -> Result<(), String> {
     use redb::{ReadableDatabase, ReadableTable};
     let read = storage.db.begin_read().map_err(|e| e.to_string())?;
     let mut records = Vec::new();
@@ -353,7 +391,13 @@ pub(crate) fn verify_log_replay(storage: &crate::storage::Storage) -> Result<(),
         Err(e) => return Err(e.to_string()),
     }
     drop(read);
-    let replayed = replay(Model::new(), 0, &records)?;
+    let rest = records_after_base(records, base_lsn)?;
+    let end_lsn = rest.last().map_or(base_lsn, |r| r.header.lsn);
+    let replayed = replay(base, base_lsn, &rest)?;
+    let generation = storage.current_generation().map_err(|e| e.to_string())?;
+    if end_lsn != generation {
+        return Err("the replay does not reach the current generation".to_string());
+    }
     let txn = storage.db.begin_write().map_err(|e| e.to_string())?;
     let actual = dump_writer(&txn);
     txn.abort().map_err(|e| e.to_string())?;

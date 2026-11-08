@@ -51,8 +51,10 @@ pub(crate) mod writer_gate;
 pub use stale_temp::{sweep_stale_temps, StaleTempSweep, SweepOutcome, TempDirLock};
 
 pub use change_log::archive::{
+    execute_archive_cleanup, plan_archive_cleanup, retention_point_of,
     sweep_change_log_archive_temps, verify_archive_dir, ArchiveError, ArchiveExpectation,
-    ArchiveOptions, ArchiveReport, ArchiveSummary, DEFAULT_PRUNE_BYTES, DEFAULT_PRUNE_RECORDS,
+    ArchiveOptions, ArchiveReport, ArchiveSummary, CleanupError, CleanupPlan, CleanupPolicy,
+    CleanupReport, RetentionPoint, DEFAULT_PRUNE_BYTES, DEFAULT_PRUNE_RECORDS,
     DEFAULT_SEGMENT_BYTES, SEGMENT_FORMAT_VERSION,
 };
 pub use change_log::backlog::{UnarchivedLimit, UnarchivedStatus};
@@ -1347,6 +1349,21 @@ impl Storage {
         dir: impl AsRef<Path>,
     ) -> std::result::Result<ArchiveSummary, ArchiveError> {
         change_log::archive::verify_against_db(self, dir.as_ref())
+    }
+
+    /// [`Self::verify_change_log_archive`] の保持管理版（Issue #3092）。`retained_from` より前のセグメントを
+    /// 意図して消したアーカイブを検証する（先頭は `retained_from` 以下から始まること、水位に届く末尾が
+    /// あることを要求する。契約は `archive::verify_against_read_from`）。
+    pub fn verify_change_log_archive_from(
+        &self,
+        dir: impl AsRef<Path>,
+        retained_from: u64,
+    ) -> std::result::Result<ArchiveSummary, ArchiveError> {
+        change_log::archive::verify_against_read_from(
+            &self.db.begin_read()?,
+            dir.as_ref(),
+            Some(retained_from),
+        )
     }
 
     /// ベース（`base`。フルバックアップまたは前回の増分の終点。[`chain_point_of`]）が終わった commit の
