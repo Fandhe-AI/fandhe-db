@@ -274,7 +274,7 @@ fn sweep_work_dir(
     };
     let skip = |sweep: &mut StaleTempSweep| sweep.skipped = sweep.skipped.saturating_add(1);
     if !meta.is_dir()
-        || meta.mode() & 0o7777 != 0o700
+        || meta.mode() & 0o777 != 0o700
         || meta.uid() != ctx.own_uid
         || ctx.is_protected(&meta, &path)
     {

@@ -283,6 +283,18 @@ fn removes_work_dirs_with_temp_files_and_empty_ones() {
 }
 
 #[test]
+fn removes_setgid_work_dirs_like_work_dir_check() {
+    // 親が setgid だと mkdir(0700) の作業ディレクトリは 2700 になる。特殊ビットだけの差は掃除対象。
+    let d = tdir("wd-setgid");
+    let w = mk_wd(&d, ".w-1.d", 0o2700);
+    put(&w, ".t-1.tmp", 0o600);
+    let s = sweep_wd(&d, &[]);
+    assert_eq!((s.removed, s.skipped, s.failed), (1, 0, 0));
+    assert!(!d.join(".w-1.d").exists());
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
 fn leaves_unexpected_work_dirs_and_counts_them() {
     let d = tdir("wd-skip");
     // モードが違う。
