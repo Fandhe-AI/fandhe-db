@@ -245,6 +245,9 @@ fn recover14_broken_chains_are_refused_without_publishing() {
     let n = bytes.len();
     bytes[n - 40] ^= 0xff;
     std::fs::write(&bad, bytes).expect("write");
+    // 読み取り器は他者が書けるファイルを拒否する（Issue #3103）ため、umask に依らず 0600 にする。
+    std::fs::set_permissions(&bad, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+        .expect("chmod");
     let o = restore(&c, &dest, &[&bad]);
     assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
     assert!(stderr(&o).contains("checksum mismatch"), "{}", stderr(&o));
