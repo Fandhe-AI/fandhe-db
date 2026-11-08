@@ -189,33 +189,30 @@ fn export_standalone_sequences<E>(
     out: &mut Emitter<'_, E>,
     seqs: &SequenceMap,
 ) -> Result<(), SchemaDdlError<E>> {
+    // 出力順は SCHEMA の内部 ID ではなく描画名（SCHEMA 名, 名前）で決める（往復で同じ DDL 列にする）。
+    let mut targets = Vec::new();
     for (key, (def, owner)) in seqs {
         if owner.is_some() || !in_scope(ctx, key)? {
             continue;
         }
-        if !matches!(ctx.namer.scope::<E>(key)?, KeyScope::Shared) {
-            // `CREATE SEQUENCE` は SCHEMA 修飾名を受理しないため、SCHEMA 配下の単独 SEQUENCE は戻せない。
-            return Err(unsupported(
-                "sequence",
-                "schema-scoped standalone sequence cannot be recreated by SQL",
-            ));
-        }
+        targets.push((ctx.namer.sort_key::<E>(key)?, key, def));
+    }
+    targets.sort_by(|a, b| a.0.cmp(&b.0));
+    for (_, key, def) in targets {
+        // 共有は `"name"`、SCHEMA 配下は引用符なしの `schema.name`（SCHEMA 修飾名は引用符付きを受理しない）。
+        let name = ctx.namer.qualified_required::<E>(key)?;
         let p = &def.params;
-        let mut s = String::from("CREATE SEQUENCE ");
-        push_ident(&mut s, key)?;
-        s.push_str(&format!(
-            " START WITH {} INCREMENT BY {} MINVALUE {} MAXVALUE {} {}",
+        let s = format!(
+            "CREATE SEQUENCE {name} START WITH {} INCREMENT BY {} MINVALUE {} MAXVALUE {} {}",
             p.start,
             p.increment,
             p.min_value,
             p.max_value,
             if p.cycle { "CYCLE" } else { "NO CYCLE" }
-        ));
+        );
         out.emit(DdlSection::PreData, DdlObjectKind::Sequence, &s)?;
         if def.restart_value != p.start {
-            let mut r = String::from("ALTER SEQUENCE ");
-            push_ident(&mut r, key)?;
-            r.push_str(&format!(" RESTART WITH {}", def.restart_value));
+            let r = format!("ALTER SEQUENCE {name} RESTART WITH {}", def.restart_value);
             out.emit(DdlSection::PreData, DdlObjectKind::Sequence, &r)?;
         }
     }
@@ -368,17 +365,22 @@ fn export_sequence_values<E>(
     let Some(tenant) = ctx.scope.tenant() else {
         return Ok(());
     };
+    let mut targets = Vec::new();
     for (key, (def, _)) in seqs {
         // 他テナントの SCHEMA 配下の SEQUENCE は存在を示さず飛ばす。
         if matches!(ctx.namer.scope::<E>(key)?, KeyScope::Foreign) {
             continue;
         }
-        // 共有の SEQUENCE は共有分を選んでいなくても、選択したテナントの現在値は出す。
+        targets.push((ctx.namer.sort_key::<E>(key)?, key, def));
+    }
+    // 出力順は描画名で決める（SCHEMA の内部 ID に依存させない）。
+    targets.sort_by(|a, b| a.0.cmp(&b.0));
+    for (_, key, def) in targets {
+        // 共有の SEQUENCE は共有分を選んでいなくても、選択したテナントの現在値は出す。状態行は
+        // テナント指定で引くため、他テナントの現在値は読まない。
         let Some((last, called)) = sequence_state_in(ctx.rt, tenant, def.id)? else {
             continue;
         };
-        // `setval` は SCHEMA 修飾名・引用符付きの名前を受理しないため、現在値を持つ SCHEMA 配下の
-        // SEQUENCE の現在値は戻せない（現在値を持たなければ出す文が無く、省略にならない）。
         let arg = ctx
             .namer
             .sequence_arg::<E>(key)?
