@@ -5,7 +5,8 @@
 //! 済み（不一致は panic。`oracle::verify_record`）。さらに本ファイルの [`finish`] が、有効化した時点の
 //! 全表の内容へ、記録されたレコードを LSN 順にすべて適用した結果が最終状態と一致すること
 //! （符号化・LSN の連鎖・正規化を通した再生の検証）と、レコードの数が世代の進みと一致すること
-//! （commit の取りこぼしがない）を確かめる。
+//! （commit の取りこぼしがない）を確かめる。刈り込み（#2167）を挟む場面では、刈り込まれた区間を
+//! ベースのスナップショットで補う [`finish_from`] を使う（Issue #3095）。
 
 use super::oracle::{self, Model};
 use super::{decode_record, ChangeRecord, CHANGE_LOG_TABLE};
@@ -90,6 +91,38 @@ fn finish(s: Scenario) -> usize {
         panic!("replay differs from the final state: {diff}");
     }
     recs.len()
+}
+
+/// LSN B 時点のベース（全表の内容）と B を返す。刈り込み後の再生で、刈り込まれた区間の代わりになる。
+fn base_point(storage: &Storage) -> (Model, u64) {
+    (
+        dump(storage),
+        storage.current_generation().expect("generation"),
+    )
+}
+
+/// 刈り込み後の場面の後始末。再度開いて、ベース以後のレコードだけを再生して実表と突き合わせ、
+/// 適用したレコード数を返す（場面が空振りでないことの確認用）。
+fn finish_from(s: Scenario, base: Model, base_lsn: u64) -> usize {
+    let storage = Storage::open(&s.path).expect("reopen");
+    oracle::verify_log_replay_from(&storage, base, base_lsn).expect("replay from base");
+    records(&storage)
+        .iter()
+        .filter(|r| r.header.lsn > base_lsn)
+        .count()
+}
+
+/// `change_log` 表に残っている行の LSN。
+fn row_lsns(storage: &Storage) -> Vec<u64> {
+    records(storage).iter().map(|r| r.header.lsn).collect()
+}
+
+/// 書き出し先に使える（他者が書けない）一時ディレクトリ。umask に依らず 0755 にする。
+fn private_dir(label: &str) -> crate::test_util::temp_db::TempDir {
+    use std::os::unix::fs::PermissionsExt;
+    let d = crate::test_util::temp_db::TempDir::new(label);
+    std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    d
 }
 
 /// SQL を 1 文ずつ流す。すべて成功しなければならない（vacuous な場面にしない）。
@@ -806,4 +839,194 @@ fn replayed_row_store_matches_a_direct_raw_redb_read() {
     drop(read);
     drop(db);
     finish(s);
+}
+// ---- 刈り込みを挟む場面（Issue #3095。ベースのスナップショットから再生する） ----
+
+/// 刈り込み場面の結果。
+struct Pruned {
+    applied: usize,
+    pruned: u64,
+    first_lsn: Option<u64>,
+    base_lsn: u64,
+    old_path_replay_failed: bool,
+}
+
+/// W1（作成と INSERT）→ ベース B → W2（4 件）→ アーカイブ（保持 `retain` 件）→ W3（4 件）→ 後始末。
+fn pruned_scenario(label: &str, retain: u64) -> Pruned {
+    let (s, storage) = begin(label);
+    let archive = private_dir("oracle-prune-arc");
+    let mut session = SessionState::default();
+    session.allow_ddl();
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    run_sql(
+        &core,
+        "tenant-a",
+        &mut session,
+        &[
+            "CREATE TABLE ev (id BIGINT PRIMARY KEY, v VECTOR(2), note TEXT)",
+            "INSERT INTO ev (id, v, note) VALUES (1, '[0.1,0.2]', 'a')",
+            "INSERT INTO ev (id, v, note) VALUES (2, '[0.3,0.4]', 'b')",
+        ],
+    );
+    let (base, base_lsn) = base_point(core.storage_for_test());
+    run_sql(
+        &core,
+        "tenant-a",
+        &mut session,
+        &[
+            "UPDATE ev SET note = 'u' WHERE id = 1",
+            "DELETE FROM ev WHERE id = 2",
+            "INSERT INTO ev (id, v, note) VALUES (3, '[0.5,0.6]', 'c')",
+            "INSERT INTO ev (id, v, note) VALUES (4, '[0.7,0.8]', 'd')",
+        ],
+    );
+    let mut opts = crate::storage::ArchiveOptions::new(archive.path());
+    opts.retain_records = Some(retain);
+    let report = core
+        .storage_for_test()
+        .archive_change_log(&opts)
+        .expect("archive");
+    let first_lsn = row_lsns(core.storage_for_test()).first().copied();
+    run_sql(
+        &core,
+        "tenant-a",
+        &mut session,
+        &[
+            "ALTER TABLE ev ADD COLUMN extra TEXT",
+            "CREATE TABLE tmp2 (id BIGINT PRIMARY KEY)",
+            "INSERT INTO tmp2 (id) VALUES (1)",
+            "DROP TABLE tmp2",
+        ],
+    );
+    let old_path_replay_failed = oracle::replay(
+        s.start.clone(),
+        s.start_gen,
+        &records(core.storage_for_test()),
+    )
+    .is_err();
+    drop(core);
+    let applied = finish_from(s, base, base_lsn);
+    Pruned {
+        applied,
+        pruned: report.pruned_records,
+        first_lsn,
+        base_lsn,
+        old_path_replay_failed,
+    }
+}
+
+/// 保持 6 件でベースと保持行が重なる場面。従来の全行再生は成り立たず、ベースからの再生が通る。
+#[test]
+fn replay_from_base_after_pruning_with_overlap() {
+    let p = pruned_scenario("oracle-prune-overlap", 6);
+    assert!(p.pruned > 0, "something was pruned");
+    assert!(p.first_lsn.is_some_and(|l| l <= p.base_lsn));
+    assert!(
+        p.old_path_replay_failed,
+        "the full-log replay no longer holds"
+    );
+    assert_eq!(p.applied, 4 + 4, "W2 (4) and W3 (4) after the base");
+}
+
+/// 検出力の負例。刈り込みがベースを越えると、ベースからの再生は拒否される（黙って通さない）。
+#[test]
+fn replay_from_base_rejects_pruning_beyond_the_base() {
+    let (s, storage) = begin("oracle-prune-beyond");
+    let archive = private_dir("oracle-prune-beyond-arc");
+    let mut session = SessionState::default();
+    session.allow_ddl();
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    run_sql(
+        &core,
+        "tenant-a",
+        &mut session,
+        &[
+            "CREATE TABLE ev (id BIGINT PRIMARY KEY, v VECTOR(2))",
+            "INSERT INTO ev (id, v) VALUES (1, '[0.1,0.2]')",
+        ],
+    );
+    let (base, base_lsn) = base_point(core.storage_for_test());
+    run_sql(
+        &core,
+        "tenant-a",
+        &mut session,
+        &[
+            "INSERT INTO ev (id, v) VALUES (2, '[0.3,0.4]')",
+            "INSERT INTO ev (id, v) VALUES (3, '[0.5,0.6]')",
+        ],
+    );
+    let mut opts = crate::storage::ArchiveOptions::new(archive.path());
+    // 保持 1 件: B + 1 も刈り込まれ、先頭は B + 2 になる。
+    opts.retain_records = Some(1);
+    core.storage_for_test()
+        .archive_change_log(&opts)
+        .expect("archive");
+    assert_eq!(row_lsns(core.storage_for_test()), vec![base_lsn + 2]);
+    let err = oracle::verify_log_replay_from(core.storage_for_test(), base.clone(), base_lsn)
+        .expect_err("a gap after the base must be rejected");
+    assert!(err.contains("pruned beyond the base"), "{err}");
+    // ベースの内容が B と食い違う場合も一致しない。
+    let mut wrong = base;
+    for (_, rows) in wrong.values_mut() {
+        rows.clear();
+    }
+    assert!(
+        oracle::verify_log_replay_from(core.storage_for_test(), wrong, base_lsn + 1).is_err(),
+        "a wrong base must not pass"
+    );
+    drop(core);
+    drop(s);
+}
+
+/// 全件刈り込み（保持 0 件）と利用者の commit を交互に 2 往復挟んでも通る。
+#[test]
+fn replay_from_base_after_full_pruning_repeated() {
+    let (s, storage) = begin("oracle-prune-full");
+    let archive = private_dir("oracle-prune-full-arc");
+    let mut session = SessionState::default();
+    session.allow_ddl();
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    run_sql(
+        &core,
+        "tenant-a",
+        &mut session,
+        &[
+            "CREATE TABLE ev (id BIGINT PRIMARY KEY, v VECTOR(2), note TEXT)",
+            "INSERT INTO ev (id, v, note) VALUES (1, '[0.1,0.2]', 'a')",
+            "UPDATE ev SET note = 'u' WHERE id = 1",
+        ],
+    );
+    let (base, base_lsn) = base_point(core.storage_for_test());
+    let mut opts = crate::storage::ArchiveOptions::new(archive.path());
+    opts.retain_records = Some(0);
+    let r = core
+        .storage_for_test()
+        .archive_change_log(&opts)
+        .expect("archive");
+    assert!(r.pruned_records > 0);
+    assert!(row_lsns(core.storage_for_test()).is_empty());
+    oracle::verify_log_replay_from(core.storage_for_test(), base.clone(), base_lsn)
+        .expect("an empty log replays to the base");
+    // 刈り込みのたびに、刈り込む直前の状態を新しいベースにする（古いベースだと間の区間が欠ける）。
+    let (mut base, mut base_lsn) = (base, base_lsn);
+    for i in 0..2 {
+        let sql = format!(
+            "INSERT INTO ev (id, v, note) VALUES ({}, '[0.5,0.6]', 'w')",
+            10 + i
+        );
+        run_sql(&core, "tenant-a", &mut session, &[&sql]);
+        (base, base_lsn) = base_point(core.storage_for_test());
+        core.storage_for_test()
+            .archive_change_log(&opts)
+            .expect("archive again");
+    }
+    run_sql(
+        &core,
+        "tenant-a",
+        &mut session,
+        &["INSERT INTO ev (id, v, note) VALUES (99, '[0.1,0.1]', 'z')"],
+    );
+    drop(core);
+    let applied = finish_from(s, base, base_lsn);
+    assert!(applied >= 1, "records after the base: {applied}");
 }
