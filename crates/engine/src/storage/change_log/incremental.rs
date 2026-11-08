@@ -220,7 +220,7 @@ pub struct ApplySummary {
 // ---------------------------------------------------------------------------
 
 /// メタ表の DB 識別子と timeline。無ければ `NotEnabled`。
-fn read_identity(read: &redb::ReadTransaction) -> Result<([u8; DB_ID_LEN], u64)> {
+pub(super) fn read_identity(read: &redb::ReadTransaction) -> Result<([u8; DB_ID_LEN], u64)> {
     let id: Option<[u8; DB_ID_LEN]> = match read.open_table(META_TABLE) {
         Ok(t) => match t.get(META_KEY_DB_ID)? {
             Some(v) => Some(v.value().try_into().map_err(|_| ArchiveError::LogCorrupt)?),
@@ -586,18 +586,7 @@ pub(super) fn replay_segments(
                 .map_err(map_decode)
                 .map_err(IncrementalError::from)?;
             let h = rec.header;
-            if h.db_id != info.header.db_id {
-                return Err(IncrementalError::ForeignDatabase);
-            }
-            if h.timeline != info.header.timeline {
-                return Err(IncrementalError::ForeignTimeline);
-            }
-            if h.storage_format != STORAGE_FORMAT_VERSION {
-                return Err(IncrementalError::UnsupportedFormat);
-            }
-            if h.prev_lsn != current || current.checked_add(1) != Some(h.lsn) {
-                return Err(IncrementalError::ChainBroken);
-            }
+            check_record_chain(&h, &info.header.db_id, info.header.timeline, current)?;
             if batch.is_none() {
                 let mut txn = db.begin_write()?;
                 txn.set_durability(redb::Durability::None)?;
@@ -654,6 +643,31 @@ pub(super) fn replay_segments(
     })
 }
 
+/// 1 レコードのヘッダが、適用先（DB 識別子 `db_id`・`timeline`・現在の世代 `current`）に続くものか
+/// を検査する（DB 識別子 → timeline → ストレージ形式 → `prev_lsn == current` かつ `lsn == current + 1`）。
+/// ファイル再生（[`replay_segments`]）と、レプリカのストリーム適用（`replica_apply`。RECOVER-15・
+/// Issue #2174）が共有する。食い違いは fail-closed に拒否する。
+pub(super) fn check_record_chain(
+    h: &super::RecordHeader,
+    db_id: &[u8; DB_ID_LEN],
+    timeline: u64,
+    current: u64,
+) -> Result<()> {
+    if h.db_id != *db_id {
+        return Err(IncrementalError::ForeignDatabase);
+    }
+    if h.timeline != timeline {
+        return Err(IncrementalError::ForeignTimeline);
+    }
+    if h.storage_format != STORAGE_FORMAT_VERSION {
+        return Err(IncrementalError::UnsupportedFormat);
+    }
+    if h.prev_lsn != current || current.checked_add(1) != Some(h.lsn) {
+        return Err(IncrementalError::ChainBroken);
+    }
+    Ok(())
+}
+
 /// 適用済みの LSN と重なるアーカイブのレコード `raw`（ヘッダ `h`）が、適用先に既にある内容と一致することを
 /// 確かめる。適用先の `change_log` 表（書き込み中のバッチ、無ければコミット済みの状態）の同じ LSN の行と
 /// バイト列で照合し、不一致は `ChainBroken`。行が無い（刈り込み済みなど）場合は照合の基準がないので、
@@ -701,7 +715,7 @@ fn check_overlap(
 /// レコード本体を writer へ適用する（`dropped` の削除 → `created` の作成 → `tables` の反映。参照実装は
 /// `oracle::apply_record`）。表の有無の整合（無い表の削除・既存の表の作成・無い表への変更）と、記録範囲外の
 /// 表（`change_log`・`change_log_meta`）への言及は `BadRecord` で拒否する。
-fn apply_body(
+pub(super) fn apply_body(
     txn: &redb::WriteTransaction,
     names: &mut BTreeSet<String>,
     body: super::RecordBody,
@@ -735,7 +749,7 @@ fn apply_body(
 
 /// 適用してよい表名か。空の名前は redb の `TableDefinition::new` が panic するため拒否し(`dropped`・
 /// `created`・`tables` のすべての経路で共通)、記録範囲外の表(`change_log`・`change_log_meta`)も拒否する。
-fn table_name_ok(name: &str) -> bool {
+pub(super) fn table_name_ok(name: &str) -> bool {
     !name.is_empty() && !is_excluded_table(name)
 }
 
@@ -745,7 +759,7 @@ fn bad_conv(_: std::num::TryFromIntError) -> IncrementalError {
 
 /// 適用したレコードを、適用先の `change_log` 表へ（キー = LSN）そのまま追記する。最新の DB と同じ
 /// 連続性（最後のレコードの LSN == 世代）を保つため。同じ LSN の行が既にあれば `ChainBroken`。
-fn append_log_row(txn: &redb::WriteTransaction, lsn: u64, raw: &[u8]) -> Result<()> {
+pub(super) fn append_log_row(txn: &redb::WriteTransaction, lsn: u64, raw: &[u8]) -> Result<()> {
     // 許可（clippy::disallowed_methods）: 本体表は記録範囲の例外（D3）で、捕捉の対象外。
     #[allow(clippy::disallowed_methods)]
     let mut log = txn.open_table(CHANGE_LOG_TABLE)?;

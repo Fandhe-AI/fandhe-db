@@ -187,6 +187,10 @@ pub mod protocol_dispatch;
 pub mod recursive_cte_limits_opt;
 pub mod regex_limits_opt;
 #[cfg(unix)]
+pub mod replica;
+#[cfg(unix)]
+pub mod replica_opt;
+#[cfg(unix)]
 pub mod replication;
 pub mod replication_opt;
 pub mod require_operation_id_opt;
