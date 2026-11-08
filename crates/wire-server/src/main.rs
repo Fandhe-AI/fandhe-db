@@ -3624,9 +3624,21 @@ fn run_server(args: &[String]) -> ExitCode {
         let spawned = std::thread::Builder::new()
             .name("replica-apply".to_string())
             .spawn(move || {
-                let halt = wire_server::replica::run(&apply_core, &opts);
-                engine::log_stderr!("wire-server: replica: apply loop stopped, exiting");
-                std::process::exit(i32::from(halt.exit_code()));
+                // 適用スレッドの panic でも listener だけが生き残って古いデータを配り続けないよう、
+                // panic を捕捉してプロセスごと終える（fail-closed）。
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    wire_server::replica::run(&apply_core, &opts)
+                }));
+                match outcome {
+                    Ok(halt) => {
+                        engine::log_stderr!("wire-server: replica: apply loop stopped, exiting");
+                        std::process::exit(i32::from(halt.exit_code()));
+                    }
+                    Err(_) => {
+                        engine::log_stderr!("wire-server: replica: apply loop panicked, exiting");
+                        std::process::exit(1);
+                    }
+                }
             });
         if spawned.is_err() {
             engine::log_stderr!("wire-server: failed to start the replica apply thread");
