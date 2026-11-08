@@ -197,6 +197,8 @@ pub mod replica_resync;
 pub mod replica_resync_opt;
 #[cfg(unix)]
 pub mod replication;
+#[cfg(unix)]
+pub mod replication_conn;
 pub mod replication_opt;
 pub mod require_operation_id_opt;
 pub mod require_where_for_dml_opt;

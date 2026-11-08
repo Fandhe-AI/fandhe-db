@@ -6,8 +6,12 @@
 //! [`ReplicationArgs::resolve`] を呼ぶ（不正値・組み合わせの不備は listen へ進まず起動拒否にする）。
 //!
 //! - `--replication-bind <addr>`: レプリケーション専用リスナーのアドレス。テナント向けの `--bind` とは
-//!   別のポートで、テナントのセッションは一切受け付けない。**ループバックだけ**（TLS の配線は #2177 の
-//!   担当で、それまで非ループバックの平文は fail-closed に起動拒否する）
+//!   別のポートで、テナントのセッションは一切受け付けない。TLS を構成しない場合は**ループバックだけ**
+//!   （非ループバックの平文は fail-closed に起動拒否する）。TLS を構成すれば非ループバックも使える
+//! - `--replication-tls-cert <pem>`／`--replication-tls-key <pem>`（Issue #2177・RECOVER-15 (3)・WIRE-9
+//!   ポインタ。両方指定か両方なし）: レプリケーション専用の TLS 1.3 の証明書・秘密鍵（Ed25519。テナント向けの
+//!   `--tls-cert`／`--tls-key` とは独立）。構成すると**全接続が TLS 必須**になり（ループバックの送信元も平文に
+//!   降格しない）、平文の接続は何も返さずに閉じる。受信側は同じ証明書を `--primary-tls-cert` でピン留めする
 //! - `--replication-roles <file>`: 認証ロールの資格情報ファイル（`name:phc` の行。`--users` とは別の
 //!   名前空間で、テナントのロールではレプリケーションに接続できない）
 //! - `--replication-allow <ip|cidr>`: 接続を受け付けるレプリカの送信元アドレス（繰り返し指定可。1 つ以上が必須）
@@ -33,6 +37,8 @@ use std::time::Duration;
 
 use crate::auth::argon2id;
 use crate::bind_guard::{GuardedBindAddrs, TransportSecurity};
+use crate::tls::server_handshake::TlsServerConfig;
+use std::sync::Arc;
 
 /// リスナーのアドレスのフラグ名。
 pub const BIND_FLAG: &str = "--replication-bind";
@@ -40,6 +46,10 @@ pub const BIND_FLAG: &str = "--replication-bind";
 pub const ROLES_FLAG: &str = "--replication-roles";
 /// 許可リストのフラグ名（繰り返し可）。
 pub const ALLOW_FLAG: &str = "--replication-allow";
+/// レプリケーション専用の TLS 証明書（PEM）のフラグ名（Issue #2177）。
+pub const TLS_CERT_FLAG: &str = "--replication-tls-cert";
+/// レプリケーション専用の TLS 秘密鍵（PEM）のフラグ名（Issue #2177）。
+pub const TLS_KEY_FLAG: &str = "--replication-tls-key";
 /// 同時接続数の上限のフラグ名。
 pub const MAX_CONNECTIONS_FLAG: &str = "--replication-max-connections";
 /// 未確認量の上限のフラグ名。
@@ -60,8 +70,10 @@ pub const SYNC_TIMEOUT_FLAG: &str = "--replication-sync-timeout-secs";
 pub const SYNC_ON_TIMEOUT_FLAG: &str = "--replication-sync-on-timeout";
 
 /// すべての `--replication-*` フラグ名（`main.rs` の引数ループが 1 本の分岐で受けるための一覧）。
-pub const ALL_FLAGS: [&str; 11] = [
+pub const ALL_FLAGS: [&str; 13] = [
     BIND_FLAG,
+    TLS_CERT_FLAG,
+    TLS_KEY_FLAG,
     ROLES_FLAG,
     ALLOW_FLAG,
     MAX_CONNECTIONS_FLAG,
@@ -113,7 +125,9 @@ pub const SYNC_ON_TIMEOUT_REQUIRED_MESSAGE: &str =
 pub const SYNC_ON_TIMEOUT_NEEDS_TIMEOUT_MESSAGE: &str =
     "--replication-sync-on-timeout requires --replication-sync-timeout-secs";
 pub const LOOPBACK_ONLY_MESSAGE: &str =
-    "--replication-bind must be a loopback address (TLS for the replication endpoint is not available yet)";
+    "--replication-bind must be a loopback address unless --replication-tls-cert and --replication-tls-key are given";
+pub const TLS_PAIR_MESSAGE: &str =
+    "--replication-tls-cert and --replication-tls-key must be given together";
 
 /// 許可リストの 1 項目（IP アドレスまたは CIDR）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,9 +191,18 @@ impl AllowList {
 }
 
 /// レプリケーション専用の認証ロール（`name → Argon2id の PHC`）。テナントのユーザーストアとは別物。
-#[derive(Debug, Clone, Default)]
+/// `Debug` は手書きで PHC を出さない（ロール数だけ。Issue #2177）。
+#[derive(Clone, Default)]
 pub struct ReplicationRoles {
     roles: HashMap<String, String>,
+}
+
+impl std::fmt::Debug for ReplicationRoles {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReplicationRoles")
+            .field("roles", &self.roles.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl ReplicationRoles {
@@ -244,11 +267,15 @@ impl ReplicationRoles {
     }
 }
 
-/// 検証済みのレプリケーション設定。
-#[derive(Debug, Clone)]
+/// 検証済みのレプリケーション設定。`Debug` は手書きで、認証ロールの PHC・TLS の鍵材料を出さない
+/// （Issue #2177。`{:?}` でログへ流れても秘密が出ない）。
+#[derive(Clone)]
 pub struct ReplicationSettings {
-    /// 検証済みの bind 先（ループバックだけ）。
+    /// 検証済みの bind 先（TLS 未構成ならループバックだけ）。
     pub bind: SocketAddr,
+    /// レプリケーション専用の TLS 設定（Issue #2177）。`Some` なら全接続が TLS 必須（平文は閉じる）、
+    /// `None` ならループバックの平文だけ。
+    pub tls: Option<Arc<TlsServerConfig>>,
     /// 認証ロール。
     pub roles: ReplicationRoles,
     /// 送信元の許可リスト。
@@ -265,11 +292,41 @@ pub struct ReplicationSettings {
     pub sync: Option<engine::storage::SyncCommitConfig>,
 }
 
+impl std::fmt::Debug for ReplicationSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReplicationSettings")
+            .field("bind", &self.bind)
+            .field("tls", &self.tls.is_some())
+            .field("roles", &self.roles.roles.len())
+            .field("allow", &self.allow)
+            .field("max_connections", &self.max_connections)
+            .field("max_unacked_bytes", &self.max_unacked_bytes)
+            .field("ack_timeout", &self.ack_timeout)
+            .field("max_lag_records", &self.max_lag_records)
+            .field("sync", &self.sync.is_some())
+            .finish()
+    }
+}
+
+/// TLS 材料の読み込み失敗を固定の英語へ写す（パス・鍵・証明書の中身・長さを含めない）。
+fn tls_load_failure(e: crate::tls_opt::TlsConfigLoadError) -> String {
+    use crate::tls_opt::TlsConfigLoadError as E;
+    let what = match e {
+        E::Key(_) => "the private key could not be loaded",
+        E::Certificate(_) => "the certificate could not be loaded or is not currently valid",
+        E::Mismatch(_) => "the certificate and the private key do not match",
+        E::Clock => "the system clock could not be read",
+    };
+    format!("{TLS_CERT_FLAG}/{TLS_KEY_FLAG}: {what}")
+}
+
 /// `--replication-*` の受け取り中の値。`main.rs` の引数ループが [`Self::accept`] を呼び、全引数の後に
 /// [`Self::resolve`] で検証済みの設定へ変換する。
 #[derive(Debug, Default)]
 pub struct ReplicationArgs {
     bind: Option<String>,
+    tls_cert: Option<PathBuf>,
+    tls_key: Option<PathBuf>,
     roles: Option<PathBuf>,
     allow: Vec<String>,
     max_connections: Option<String>,
@@ -298,6 +355,8 @@ impl ReplicationArgs {
     /// 1 つでも `--replication-*` が指定されたか。
     pub fn is_set(&self) -> bool {
         self.bind.is_some()
+            || self.tls_cert.is_some()
+            || self.tls_key.is_some()
             || self.roles.is_some()
             || !self.allow.is_empty()
             || self.max_connections.is_some()
@@ -327,6 +386,18 @@ impl ReplicationArgs {
             BIND_FLAG => {
                 slot_taken(self.bind.is_some())?;
                 self.bind = Some(value.to_string());
+            }
+            TLS_CERT_FLAG => {
+                slot_taken(self.tls_cert.is_some())?;
+                let path = PathBuf::from(value);
+                crate::backup_opt::reject_reserved_name(TLS_CERT_FLAG, &path)?;
+                self.tls_cert = Some(path);
+            }
+            TLS_KEY_FLAG => {
+                slot_taken(self.tls_key.is_some())?;
+                let path = PathBuf::from(value);
+                crate::backup_opt::reject_reserved_name(TLS_KEY_FLAG, &path)?;
+                self.tls_key = Some(path);
             }
             ROLES_FLAG => {
                 slot_taken(self.roles.is_some())?;
@@ -446,8 +517,23 @@ impl ReplicationArgs {
                 n
             }
         };
-        // ループバックだけを受け付ける（TLS の配線は #2177。それまで平文を外へ晒す経路を作らない）。
-        let guarded = GuardedBindAddrs::resolve(&bind_raw, TransportSecurity::Cleartext)
+        // TLS の構成は両方指定か両方なし（片方だけは起動拒否）。構成すれば全接続が TLS 必須になるので
+        // 非ループバックの bind も許す。未構成なら従来どおりループバックだけ（平文を外へ晒さない）。
+        let tls = match (self.tls_cert.as_deref(), self.tls_key.as_deref()) {
+            (None, None) => None,
+            (Some(cert), Some(key)) => Some(
+                crate::tls_opt::load_server_config_arc_with_options(cert, key, false)
+                    // 分類だけを固定文言で返す（`TlsConfigLoadError` の `Display` はファイルのパスを含みうる）。
+                    .map_err(tls_load_failure)?,
+            ),
+            _ => return Err(TLS_PAIR_MESSAGE.to_string()),
+        };
+        let security = if tls.is_some() {
+            TransportSecurity::TlsRequired
+        } else {
+            TransportSecurity::Cleartext
+        };
+        let guarded = GuardedBindAddrs::resolve(&bind_raw, security)
             .map_err(|_| LOOPBACK_ONLY_MESSAGE.to_string())?;
         let bind = match guarded.addrs() {
             [only] => *only,
@@ -467,6 +553,7 @@ impl ReplicationArgs {
         Self::check_sync_fits_connections(sync.as_ref(), max_connections)?;
         Ok(Some(ReplicationSettings {
             bind,
+            tls,
             roles,
             allow: AllowList { nets },
             max_connections,
@@ -636,6 +723,44 @@ mod tests {
             a.resolve(true).expect_err("loopback"),
             LOOPBACK_ONLY_MESSAGE
         );
+    }
+
+    #[test]
+    fn tls_flags_must_be_given_together() {
+        for flag in [TLS_CERT_FLAG, TLS_KEY_FLAG] {
+            let mut a = ReplicationArgs::default();
+            a.accept(BIND_FLAG, "127.0.0.1:0").expect("bind");
+            a.accept(ROLES_FLAG, "/nonexistent").expect("roles");
+            a.accept(ALLOW_FLAG, "127.0.0.1").expect("allow");
+            a.accept(flag, "/nonexistent.pem").expect("tls flag");
+            assert_eq!(a.resolve(true).expect_err("pair"), TLS_PAIR_MESSAGE);
+        }
+        let mut dup = ReplicationArgs::default();
+        dup.accept(TLS_CERT_FLAG, "a.pem").expect("first");
+        assert!(dup.accept(TLS_CERT_FLAG, "b.pem").is_err());
+        assert!(dup.accept(TLS_KEY_FLAG, "").is_err());
+    }
+
+    #[test]
+    fn unreadable_tls_material_is_refused_without_leaking_the_path() {
+        let mut a = ReplicationArgs::default();
+        a.accept(BIND_FLAG, "0.0.0.0:0").expect("bind");
+        a.accept(ROLES_FLAG, "/nonexistent").expect("roles");
+        a.accept(ALLOW_FLAG, "127.0.0.1").expect("allow");
+        a.accept(TLS_CERT_FLAG, "/secret-dir/cert.pem")
+            .expect("cert");
+        a.accept(TLS_KEY_FLAG, "/secret-dir/key.pem").expect("key");
+        let err = a.resolve(true).expect_err("unreadable");
+        assert!(!err.contains("secret-dir"), "{err}");
+    }
+
+    #[test]
+    fn debug_output_never_contains_credentials() {
+        let roles = ReplicationRoles {
+            roles: [("r1".to_string(), "$argon2id$secret-hash".to_string())].into(),
+        };
+        assert!(!format!("{roles:?}").contains("secret-hash"));
+        assert!(!format!("{roles:?}").contains("argon2"));
     }
 
     fn roles_of(names: &[&str]) -> ReplicationRoles {

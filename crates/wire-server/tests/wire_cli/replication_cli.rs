@@ -87,14 +87,16 @@ impl Primary {
             "--ddl-allowed-users",
             "alice",
             "--change-log",
-            "--replication-bind",
-            "127.0.0.1:0",
             "--replication-roles",
             roles.to_str().expect("utf-8"),
         ]
         .iter()
         .map(|s| s.to_string())
         .collect();
+        // bind は既定でループバック。`extra` が指定すれば（TLS 構成の非ループバック試験）それを使う。
+        if !extra.contains(&"--replication-bind") {
+            args.extend(["--replication-bind".into(), "127.0.0.1:0".into()]);
+        }
         let mut archive_dir = None;
         if archive {
             use std::os::unix::fs::PermissionsExt;
@@ -130,6 +132,12 @@ impl Primary {
             .find_map(|l| l.split("replication endpoint bound to ").nth(1))
             .and_then(|a| a.trim().parse::<SocketAddr>().ok())
             .unwrap_or_else(|| panic!("no replication address: {lines:?}"));
+        // ワイルドカードで bind した場合、接続先はループバックにする。
+        let repl = if repl.ip().is_unspecified() {
+            SocketAddr::from(([127, 0, 0, 1], repl.port()))
+        } else {
+            repl
+        };
         Self {
             _fx: fx,
             _child: ChildGuard(child),

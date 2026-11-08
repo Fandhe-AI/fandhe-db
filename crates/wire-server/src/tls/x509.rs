@@ -719,14 +719,15 @@ fn check_validity(certificate: &ParsedCertificate, now_unix_secs: i64) -> Result
     Ok(())
 }
 
-/// 葉証明書の SPKI が Ed25519 で、その公開鍵が `expected` と一致することを
-/// 検査する（受入基準 2・#961 との seam。モジュール doc 参照）。
-fn check_leaf_public_key(
+/// SPKI が Ed25519 であることを検査して公開鍵 32 バイトを取り出す。
+/// [`check_leaf_public_key`]（サーバー側の起動時検査）と
+/// [`ed25519_leaf_public_key`]（レプリケーションの受信側が証明書をピン留めする
+/// 経路。Issue #2177）が共有する。
+fn extract_ed25519_public_key(
     spki_oid: &[u8],
     spki_has_parameters: bool,
     spki_key_bits: &[u8],
-    expected: &[u8; 32],
-) -> Result<(), X509Error> {
+) -> Result<[u8; 32], X509Error> {
     if spki_oid != OID_ED25519 {
         return Err(X509Error::UnsupportedPublicKeyAlgorithm(classify_spki_oid(
             spki_oid,
@@ -743,9 +744,20 @@ fn check_leaf_public_key(
     if *unused_bits != 0 {
         return Err(X509Error::InvalidPublicKey);
     }
-    let key_array: [u8; 32] = key_value
+    key_value
         .try_into()
-        .map_err(|_| X509Error::InvalidPublicKey)?;
+        .map_err(|_| X509Error::InvalidPublicKey)
+}
+
+/// 葉証明書の SPKI が Ed25519 で、その公開鍵が `expected` と一致することを
+/// 検査する（受入基準 2・#961 との seam。モジュール doc 参照）。
+fn check_leaf_public_key(
+    spki_oid: &[u8],
+    spki_has_parameters: bool,
+    spki_key_bits: &[u8],
+    expected: &[u8; 32],
+) -> Result<(), X509Error> {
+    let key_array = extract_ed25519_public_key(spki_oid, spki_has_parameters, spki_key_bits)?;
     // 公開鍵は秘密鍵から導出された値だが公開データそのものであり秘密では
     // ない。それでも導出元が秘密値であるため保守的に定数時間比較する
     // （モジュール doc「定数時間性」参照）。
@@ -753,6 +765,23 @@ fn check_leaf_public_key(
         return Err(X509Error::PublicKeyMismatch);
     }
     Ok(())
+}
+
+/// 証明書 1 枚（DER）を検査し、有効期間内の Ed25519 葉証明書なら公開鍵を返す
+/// （Issue #2177。レプリケーションの受信側が `--primary-tls-cert` の証明書を
+/// ピンとして読み込む入口。署名の検証は行わない。ピンは DER の完全一致で
+/// 照合するため、発行者鍵の検証は不要）。
+pub fn ed25519_leaf_public_key(
+    der_bytes: &[u8],
+    now_unix_secs: i64,
+) -> Result<[u8; 32], X509Error> {
+    let certificate = parse_certificate(der_bytes)?;
+    check_validity(&certificate, now_unix_secs)?;
+    extract_ed25519_public_key(
+        &certificate.spki_oid,
+        certificate.spki_has_parameters,
+        &certificate.spki_key_bits,
+    )
 }
 
 /// 1970-01-01 からの経過日数を求める（Howard Hinnant の

@@ -520,6 +520,13 @@ impl RecordBuffer {
         }))
     }
 
+    /// 未処理のバイト列（完成済みレコード・断片）を保持しているか
+    /// （レプリケーションの受信側が「続きが既に届いているか」を、ソケットを
+    /// `peek` する前に判定するために使う。Issue #2177）。
+    pub fn has_buffered(&self) -> bool {
+        !self.buf.is_empty()
+    }
+
     /// 接続の EOF で呼ぶ。バッファに部分的なバイト列（次のレコードの断片）が
     /// 残っていれば `Truncated`、何も残っていなければ `Ok(())`。
     pub fn finish(&self) -> Result<(), RecordError> {

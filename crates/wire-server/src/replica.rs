@@ -22,6 +22,12 @@
 //! - **一時障害**: 切断・タイムアウト・I/O エラー・ハートビート途絶・プライマリの `BUSY`／`INTERNAL`。
 //!   上限つき指数バックオフ（抖動つき）で再接続し、再開位置は常に DB の世代から取り直す
 //!
+//! TLS（Issue #2177・RECOVER-15 (3)・WIRE-9 ポインタ）: `--primary-tls-cert`（[`crate::replica_opt`]）でピンを
+//! 渡すと、接続直後に TLS 1.3 のハンドシェイクを行い（[`crate::tls::client_handshake`]）、プライマリの証明書が
+//! ピンと一致して初めて Hello（ロール名・パスワード）を書く。ピン不一致・検証失敗・不正な応答は**要報告**
+//! （中間者の疑いなので再試行し続けない）、接続・I/O の失敗は一時障害。平文・TLS の差は
+//! [`crate::replication_conn`] の読み書きの半分が吸収する。
+//!
 //! 入力（プライマリから届くフレーム）も untrusted: 本体長は確保前に上限検証し、受信データの経路で
 //! `unwrap`／`expect`／添字アクセスを使わない。資格情報・LSN 以外の内容をログへ出さない（進捗の LSN は
 //! 運用者向けの標準エラーだけで、テナントのセッションからは参照できない）。
@@ -30,6 +36,9 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
+
+use crate::replication_conn::{self, ConnReader, ConnWriter};
+use crate::tls::client_handshake::{perform_client_handshake, PinnedServerCertificate};
 
 use engine::core::EngineCore;
 use engine::storage::{ReplicaApplyError, MAX_RECORD_BYTES};
@@ -133,7 +142,11 @@ pub(crate) fn be_u64(bytes: &[u8]) -> Option<u64> {
 }
 
 /// `buf` を満たすまで読む。`deadline` を過ぎる、または切断されたら `Closed`。
-fn read_exact_by(stream: &TcpStream, buf: &mut [u8], deadline: Instant) -> Result<(), FrameError> {
+fn read_exact_by(
+    stream: &mut ConnReader,
+    buf: &mut [u8],
+    deadline: Instant,
+) -> Result<(), FrameError> {
     let mut filled = 0usize;
     while filled < buf.len() {
         let rem = deadline.saturating_duration_since(Instant::now());
@@ -144,7 +157,7 @@ fn read_exact_by(stream: &TcpStream, buf: &mut [u8], deadline: Instant) -> Resul
             .set_read_timeout(Some(rem))
             .map_err(|_| FrameError::Closed)?;
         let dst = buf.get_mut(filled..).ok_or(FrameError::Closed)?;
-        match (&*stream).read(dst) {
+        match stream.read(dst) {
             Ok(0) | Err(_) => return Err(FrameError::Closed),
             Ok(n) => filled = filled.checked_add(n).ok_or(FrameError::Closed)?,
         }
@@ -155,7 +168,7 @@ fn read_exact_by(stream: &TcpStream, buf: &mut [u8], deadline: Instant) -> Resul
 /// 1 フレームを読む。本体長は `max_body` 以内でなければ確保せずに `TooLarge`。本体は宣言長を一度に
 /// 確保せず、受け取った分ずつ伸ばす。
 pub(crate) fn read_frame(
-    stream: &TcpStream,
+    stream: &mut ConnReader,
     max_body: usize,
     wait: Duration,
 ) -> Result<(u8, Vec<u8>), FrameError> {
@@ -179,33 +192,13 @@ pub(crate) fn read_frame(
     Ok((ty, body))
 }
 
-/// 続きのフレームが `wait` 以内に届き始めるか（読み出しは消費しない）。
-fn data_ready(stream: &TcpStream, wait: Duration) -> Option<bool> {
-    stream.set_read_timeout(Some(wait)).ok()?;
-    let mut probe = [0u8; 1];
-    match stream.peek(&mut probe) {
-        Ok(0) => None,
-        Ok(_) => Some(true),
-        Err(e)
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-            ) =>
-        {
-            Some(false)
-        }
-        Err(_) => None,
-    }
-}
-
 /// 1 フレームを書いて flush する。
-pub(crate) fn write_frame(stream: &TcpStream, ty: u8, parts: &[&[u8]]) -> std::io::Result<()> {
+pub(crate) fn write_frame(w: &mut ConnWriter, ty: u8, parts: &[&[u8]]) -> std::io::Result<()> {
     let total = parts
         .iter()
         .try_fold(0usize, |acc, p| acc.checked_add(p.len()))
         .and_then(|n| u32::try_from(n).ok())
         .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
-    let mut w = stream;
     w.write_all(&[ty])?;
     w.write_all(&total.to_be_bytes())?;
     for p in parts {
@@ -242,7 +235,12 @@ fn session(core: &EngineCore, opts: &ReplicaOptions) -> SessionEnd {
         Err(_) => return transient(false),
     };
     let _ = stream.set_nodelay(true);
-    if stream.set_write_timeout(Some(WRITE_TIMEOUT)).is_err() {
+    // ピンがあれば TLS を確立し、証明書の一致を確かめる。資格情報（Hello）は**この後**にだけ書く。
+    let (mut rd, mut wr) = match open_conn(stream, opts.primary_tls.as_deref()) {
+        Ok(halves) => halves,
+        Err(end) => return end,
+    };
+    if wr.set_write_timeout(Some(WRITE_TIMEOUT)).is_err() {
         return transient(false);
     }
 
@@ -251,7 +249,7 @@ fn session(core: &EngineCore, opts: &ReplicaOptions) -> SessionEnd {
         return SessionEnd::Halt(Halt::PrimaryRejected);
     };
     if write_frame(
-        &stream,
+        &mut wr,
         T_HELLO,
         &[
             &PROTOCOL_VERSION_RECEIVED.to_be_bytes(),
@@ -266,7 +264,7 @@ fn session(core: &EngineCore, opts: &ReplicaOptions) -> SessionEnd {
     }
 
     // Identity（DB 識別子 16B | timeline | プライマリの最新 LSN）。ローカルと照合してから Start を送る。
-    let (primary_identity_ok, mut primary_latest) = match read_handshake(&stream, T_IDENTITY) {
+    let (primary_identity_ok, mut primary_latest) = match read_handshake(&mut rd, T_IDENTITY) {
         Handshake::Frame(body) => {
             let ok = body.get(..16) == Some(&local.db_id[..])
                 && body.get(16..24).and_then(be_u64) == Some(local.timeline);
@@ -286,7 +284,7 @@ fn session(core: &EngineCore, opts: &ReplicaOptions) -> SessionEnd {
         Err(e) => return SessionEnd::Halt(apply_failure(&e)),
     };
     if write_frame(
-        &stream,
+        &mut wr,
         T_START,
         &[
             &local.db_id,
@@ -298,7 +296,7 @@ fn session(core: &EngineCore, opts: &ReplicaOptions) -> SessionEnd {
     {
         return transient(false);
     }
-    match read_handshake(&stream, T_OK) {
+    match read_handshake(&mut rd, T_OK) {
         Handshake::Frame(body) => {
             if let Some(latest) = body.get(24..32).and_then(be_u64) {
                 primary_latest = latest;
@@ -308,8 +306,34 @@ fn session(core: &EngineCore, opts: &ReplicaOptions) -> SessionEnd {
         Handshake::Transient => return transient(false),
     }
     engine::log_stderr!("wire-server: replica: connected (applied lsn={applied})");
-    stream_loop(core, opts, &stream, applied, primary_latest)
+    stream_loop(core, opts, &mut rd, &mut wr, applied, primary_latest)
 }
+
+/// プライマリとの通信路を作る（Issue #2177）。ピンなしは平文。ピンありは TLS 1.3 のハンドシェイクを行い、
+/// 提示された証明書がピンと一致しなければ接続を閉じて返す。ピン不一致・検証失敗・不正な応答は**要報告**
+/// （`Halt::PrimaryRejected`。中間者の疑いなので再接続し続けない）、接続・I/O の失敗は一時障害。
+fn open_conn(
+    mut stream: TcpStream,
+    pin: Option<&PinnedServerCertificate>,
+) -> Result<(ConnReader, ConnWriter), SessionEnd> {
+    let transient = || SessionEnd::Transient { progressed: false };
+    let Some(pin) = pin else {
+        return replication_conn::plain(stream).map_err(|_| transient());
+    };
+    match perform_client_handshake(&mut stream, pin) {
+        Ok(session) => replication_conn::tls(stream, session).map_err(|_| transient()),
+        Err(e) if e.is_rejection() => {
+            engine::log_stderr!("{TLS_REJECTED_MESSAGE}");
+            Err(SessionEnd::Halt(Halt::PrimaryRejected))
+        }
+        Err(_) => Err(transient()),
+    }
+}
+
+/// TLS の検証に失敗した（ピン不一致・不正なハンドシェイク）ときの運用者向けの固定文言（Issue #2177）。
+/// 原因（どの検査か・相手の証明書の中身）は出さない。
+pub(crate) const TLS_REJECTED_MESSAGE: &str =
+    "wire-server: replica: the primary's TLS handshake was rejected (check --primary-tls-cert)";
 
 pub(crate) enum Handshake {
     /// 期待した型のフレームの本体。
@@ -321,7 +345,7 @@ pub(crate) enum Handshake {
 }
 
 /// ハンドシェイクのフレームを 1 つ読む。期待した型、または `E`。それ以外は停止（プロトコル違反）。
-pub(crate) fn read_handshake(stream: &TcpStream, expect: u8) -> Handshake {
+pub(crate) fn read_handshake(stream: &mut ConnReader, expect: u8) -> Handshake {
     match read_frame(stream, 64, HANDSHAKE_TIMEOUT) {
         Ok((ty, body)) if ty == expect && body.len() == 32 => Handshake::Frame(body),
         Ok((T_ERROR, body)) => match body.first().copied().and_then(classify_error) {
@@ -349,7 +373,8 @@ pub(crate) fn read_handshake(stream: &TcpStream, expect: u8) -> Handshake {
 fn stream_loop(
     core: &EngineCore,
     opts: &ReplicaOptions,
-    stream: &TcpStream,
+    rd: &mut ConnReader,
+    wr: &mut ConnWriter,
     mut acked: u64,
     mut primary_latest: u64,
 ) -> SessionEnd {
@@ -368,13 +393,13 @@ fn stream_loop(
         let ready = if batch.is_empty() {
             true
         } else {
-            match data_ready(stream, wait) {
+            match rd.data_ready(wait) {
                 Some(r) => r,
                 None => {
                     // 切断を検出した。溜めた分を適用してから再接続する。
                     if let Err(h) = flush(
                         core,
-                        stream,
+                        wr,
                         &mut batch,
                         &mut batch_bytes,
                         &mut acked,
@@ -389,7 +414,7 @@ fn stream_loop(
         if !ready || batch.len() >= opts.batch_records || batch_bytes >= opts.batch_bytes {
             if let Err(h) = flush(
                 core,
-                stream,
+                wr,
                 &mut batch,
                 &mut batch_bytes,
                 &mut acked,
@@ -401,12 +426,12 @@ fn stream_loop(
                 continue;
             }
         }
-        let (ty, body) = match read_frame(stream, max_body, wait.max(IDLE_TIMEOUT)) {
+        let (ty, body) = match read_frame(rd, max_body, wait.max(IDLE_TIMEOUT)) {
             Ok(f) => f,
             Err(FrameError::Closed) => {
                 if let Err(h) = flush(
                     core,
-                    stream,
+                    wr,
                     &mut batch,
                     &mut batch_bytes,
                     &mut acked,
@@ -436,7 +461,7 @@ fn stream_loop(
                 // 溜めた分を先に確定する（ハートビートは暇な印）。
                 if let Err(h) = flush(
                     core,
-                    stream,
+                    wr,
                     &mut batch,
                     &mut batch_bytes,
                     &mut acked,
@@ -448,7 +473,7 @@ fn stream_loop(
             T_ERROR => {
                 if let Err(h) = flush(
                     core,
-                    stream,
+                    wr,
                     &mut batch,
                     &mut batch_bytes,
                     &mut acked,
@@ -482,7 +507,7 @@ fn stream_loop(
 /// 適用の失敗は停止。Ack の書き込み失敗は接続の障害だが、適用は確定済みなので次の接続で再開位置が進む。
 fn flush(
     core: &EngineCore,
-    stream: &TcpStream,
+    stream: &mut ConnWriter,
     batch: &mut Vec<(u64, Vec<u8>)>,
     batch_bytes: &mut usize,
     acked: &mut u64,

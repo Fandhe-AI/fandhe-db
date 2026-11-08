@@ -579,7 +579,7 @@ fn recover15_replica_rejects_bad_arguments_before_connecting() {
 // ---- 読み取りレプリカモード（Issue #2175）----
 
 /// simple query を送り、DataRow の件数（成功）または ErrorResponse の SQLSTATE（失敗）を返す。
-fn query_outcome(stream: &mut TcpStream, sql: &str) -> Result<usize, String> {
+pub(crate) fn query_outcome(stream: &mut TcpStream, sql: &str) -> Result<usize, String> {
     common::send_simple_query(stream, sql);
     let mut rows = 0;
     let mut error: Option<String> = None;

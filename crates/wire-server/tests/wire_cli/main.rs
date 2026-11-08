@@ -27,6 +27,7 @@ mod replica_cli;
 mod replica_resync_cli;
 mod replication_cli;
 mod replication_sync_cli;
+mod replication_tls_cli;
 mod restore_generation_state_cli;
 mod transaction_limits_parity;
 mod verify_restore_cli;

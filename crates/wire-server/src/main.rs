@@ -440,9 +440,15 @@
 //! `--replication-max-connections <n>`・`--replication-max-unacked-bytes <n>`・
 //! `--replication-ack-timeout-secs <n>`・`--replication-max-lag-records <n>`（Issue #2173・RECOVER-15・WIRE-9 ポインタ）: ストリーミング
 //! レプリケーションの送信側（プライマリ）の opt-in。テナント向けとは別のリスナーを作り、専用ロールで認証した
-//! 許可リスト内のレプリカへ変更ログを送る。`--change-log` が前提で、bind はループバックだけ（非ループバックは
-//! 起動エラー。TLS は #2177）。重複指定・不正値・前提の欠落は DB を開く前に起動エラー
+//! 許可リスト内のレプリカへ変更ログを送る。`--change-log` が前提で、bind は TLS 未構成ならループバックだけ
+//! （非ループバックは起動エラー）。重複指定・不正値・前提の欠落は DB を開く前に起動エラー
 //! （`wire_server::replication_opt`・`wire_server::replication`。`docs/design/replication-streaming.md` 参照）。
+//!
+//! `--replication-tls-cert <pem>`・`--replication-tls-key <pem>`（Issue #2177・RECOVER-15 (3)・WIRE-9 ポインタ。
+//! 両方指定か両方なし）: レプリケーション専用の TLS 1.3（Ed25519 の証明書・鍵。テナント向けの `--tls-*` とは独立）。
+//! 構成すると全接続が TLS 必須になり、非ループバックの bind が使える（平文の接続は何も返さず閉じる）。
+//! 受信側は `--primary-tls-cert <pem>`（`replica`・`replica-resync`）／`--replica-primary-tls-cert <pem>`（読み取り
+//! レプリカモード）で同じ証明書をピン留めし、一致を確かめてから資格情報を送る。ピンなしの非ループバックは起動拒否。
 //!
 //! `--replication-sync-standby <role>`（繰り返し可）・`--replication-sync-commit <remote_write|on|remote_apply>`・
 //! `--replication-sync-timeout-secs <n>`・`--replication-sync-on-timeout <degrade|reject>`（Issue #2245・
@@ -455,7 +461,8 @@
 //! `replica --db <path> --primary <ip:port> --credentials <file>`（Issue #2174・RECOVER-15 ポインタ）:
 //! ストリーミングレプリケーションの受信側のサブコマンド。ベースのコピーをプライマリの `--replication-bind` に
 //! 追従させ、変更を commit 番号順に原子的に適用する（`wire_server::replica_opt`・`wire_server::replica`）。
-//! 接続先はループバックのみ。終了コード 10＝適用停止、11＝プライマリの拒否、2＝引数の不備。
+//! 接続先は `--primary-tls-cert` なしではループバックのみ。終了コード 10＝適用停止、11＝プライマリの拒否（TLS
+//! 証明書のピン不一致を含む）、2＝引数の不備。
 //!
 //! `replica-resync --socket <path> --out <path> --primary <ip:port> --credentials <file>`（Issue #2176・
 //! RECOVER-15 ポインタ）: レプリカの再同期。プライマリのバックアップソケットからフルバックアップを取り、整合・
@@ -2510,6 +2517,8 @@ fn run_server(args: &[String]) -> ExitCode {
             // 接続数とバックプレッシャの上限。値の検証と重複指定の拒否は `replication_opt`（エラー文は固定の英語で、
             // 値・パスを含めない）。
             flag @ ("--replication-bind"
+            | "--replication-tls-cert"
+            | "--replication-tls-key"
             | "--replication-roles"
             | "--replication-allow"
             | "--replication-max-connections"
@@ -2531,6 +2540,7 @@ fn run_server(args: &[String]) -> ExitCode {
                 i += 2;
             }
             flag @ ("--replica-primary"
+            | "--replica-primary-tls-cert"
             | "--replica-credentials"
             | "--replica-max-backoff-secs"
             | "--replica-batch-records"
@@ -2541,6 +2551,7 @@ fn run_server(args: &[String]) -> ExitCode {
                 };
                 let mapped = match flag {
                     "--replica-primary" => "--primary",
+                    "--replica-primary-tls-cert" => "--primary-tls-cert",
                     "--replica-credentials" => "--credentials",
                     "--replica-max-backoff-secs" => "--max-backoff-secs",
                     "--replica-batch-records" => "--batch-records",
@@ -3969,6 +3980,10 @@ fn run_server(args: &[String]) -> ExitCode {
         match listener.local_addr() {
             Ok(addr) => engine::log_stderr!("wire-server: replication endpoint bound to {addr}"),
             Err(_) => engine::log_stderr!("wire-server: replication endpoint bound"),
+        }
+        // 行末を変えない別の行で TLS 必須であることを示す（bind の行はテストの待機ヘルパーが解析する）。
+        if settings.tls.is_some() {
+            engine::log_stderr!("wire-server: replication endpoint requires TLS");
         }
         if wire_server::replication::spawn_server(listener, Arc::clone(&core), settings).is_err() {
             engine::log_stderr!("wire-server: failed to start the replication thread");

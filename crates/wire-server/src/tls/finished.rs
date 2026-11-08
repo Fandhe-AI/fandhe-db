@@ -74,6 +74,41 @@ pub fn verify_client_finished(
     }
 }
 
+/// server Finished を検証する（クライアント側。レプリケーションの受信側が
+/// プライマリのハンドシェイクを検証する経路。Issue #2177）。`th_ch_cv` は
+/// `Transcript::hash_through_certificate_verify()` の戻り値。比較は
+/// [`ct_eq`] の定数時間比較のみ。
+pub fn verify_server_finished(
+    server_hs_traffic: &TrafficSecret,
+    th_ch_cv: &[u8; 32],
+    received: &handshake::Finished,
+) -> Result<(), FinishedError> {
+    let key = server_hs_traffic
+        .finished_key()
+        .map_err(FinishedError::Hkdf)?;
+    let expected = compute_verify_data(&key, th_ch_cv);
+    if ct_eq(expected.as_bytes(), &received.verify_data) {
+        Ok(())
+    } else {
+        Err(FinishedError::VerifyDataMismatch)
+    }
+}
+
+/// client Finished を構成する（クライアント側）。`th_ch_sf` は
+/// `Transcript::hash_through_server_finished()` の戻り値。
+pub fn build_client_finished(
+    client_hs_traffic: &TrafficSecret,
+    th_ch_sf: &[u8; 32],
+) -> Result<handshake::Finished, FinishedError> {
+    let key = client_hs_traffic
+        .finished_key()
+        .map_err(FinishedError::Hkdf)?;
+    let verify_data = compute_verify_data(&key, th_ch_sf);
+    Ok(handshake::Finished {
+        verify_data: verify_data.as_bytes().to_vec(),
+    })
+}
+
 /// Finished の生成・検証で起こり得る失敗。受信値・期待値・鍵のバイト列は
 /// 一切保持しない（ログ・エラー経由の漏えい防止。`Display` も固定文字列）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -201,6 +236,41 @@ mod tests {
 
         let too_short = vec![0u8; 31];
         assert!(!ct_eq(expected.as_bytes(), &too_short));
+    }
+
+    // クライアント側の検証（Issue #2177）: server Finished・client Finished の往復と、
+    // 1 ビット違い・別の transcript hash・取り違え（server の値を client として検証）の拒否。
+    #[test]
+    fn client_side_finished_round_trips_and_rejects_mismatch() {
+        use crate::tls::key_schedule::EarlySecret;
+        use crate::tls::x25519::EphemeralSecret;
+        let a = EphemeralSecret::from_bytes([1u8; 32]);
+        let b = EphemeralSecret::from_bytes([2u8; 32]);
+        let shared = a.diffie_hellman(b.public_key().as_bytes()).expect("dh");
+        let hs = EarlySecret::new_without_psk()
+            .into_handshake(&shared)
+            .expect("handshake secret");
+        let traffic = hs.traffic_secrets(&[0x33u8; 32]).expect("traffic");
+        let th = [0x44u8; 32];
+
+        let server = build_server_finished(&traffic.server, &th).expect("server finished");
+        assert!(verify_server_finished(&traffic.server, &th, &server).is_ok());
+        let mut flipped = server.clone();
+        flipped.verify_data[0] ^= 0x01;
+        assert_eq!(
+            verify_server_finished(&traffic.server, &th, &flipped),
+            Err(FinishedError::VerifyDataMismatch)
+        );
+        assert_eq!(
+            verify_server_finished(&traffic.server, &[0x45u8; 32], &server),
+            Err(FinishedError::VerifyDataMismatch)
+        );
+
+        let client = build_client_finished(&traffic.client, &th).expect("client finished");
+        assert!(verify_client_finished(&traffic.client, &th, &client).is_ok());
+        // 方向を取り違えた値は検証を通らない。
+        assert!(verify_client_finished(&traffic.client, &th, &server).is_err());
+        assert!(verify_server_finished(&traffic.server, &th, &client).is_err());
     }
 
     // `Debug`／`Display` に秘密バイト（finished key・期待 verify_data）の

@@ -99,6 +99,8 @@
 //!   [`crate::wire_stream::WireStream`] へ伝搬する。SCRAM-SHA-256-PLUS
 //!   （[`crate::auth::scram`]・WIRE-18）がこの値をチャネルバインディングと
 //!   して使う
+//! - クライアント側ハンドシェイク（[`client_handshake`]。レプリケーションの受信側が
+//!   プライマリへ TLS で接続する経路。ピン留め検証。Issue #2177）
 //!
 //! CLI からの証明書・鍵読み込み（#967）・HTTPS 表層（#968）は実装済み。
 //! 3 クライアント接続テスト（#969）は後続 sub-issue の担当であり、本
@@ -110,6 +112,7 @@ pub mod aes_gcm;
 pub mod alert;
 pub mod certificate_verify;
 pub mod channel_binding;
+pub mod client_handshake;
 pub mod client_hello;
 pub(crate) mod der;
 pub mod ed25519;

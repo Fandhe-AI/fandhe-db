@@ -28,7 +28,8 @@
 
 | フラグ | 内容 | 範囲・既定 |
 | ------ | ---- | ---------- |
-| `--replication-bind <addr>` | レプリカ専用のリスナー（テナント向け `--bind` とは別ポート） | ループバックのみ。非ループバックは起動エラー |
+| `--replication-bind <addr>` | レプリカ専用のリスナー（テナント向け `--bind` とは別ポート） | TLS 未構成ならループバックのみ（非ループバックは起動エラー）。TLS を構成すれば非ループバックも可 |
+| `--replication-tls-cert <pem>`・`--replication-tls-key <pem>` | レプリカ専用の TLS 1.3 の証明書・秘密鍵（Ed25519。テナント向けの `--tls-*` とは別） | 両方指定か両方なし。構成すると全接続が TLS 必須（平文は何も返さず閉じる） |
 | `--replication-roles <file>` | レプリカ専用のロール（`name:phc` の行）。PHC は `wire-server hash-password` で作る | `--users` とは別のファイル |
 | `--replication-allow <ip\|cidr>` | 接続を許す送信元（繰り返し可） | 1 件以上が必須。`/0` は拒否 |
 | `--replication-max-connections` | 同時接続数 | 既定 8、上限 256 |
@@ -67,7 +68,28 @@ wire-server --users <users-file> --db <base.redb> \
 | `--batch-records` | 1 回に適用するレコード数 | 既定 256 |
 | `--batch-bytes` | 1 回に適用するバイト数 | 既定 16 MiB、64 KiB〜256 MiB |
 
-接続先（`--primary`）はループバックのみである。
+接続先（`--primary`）は、`--primary-tls-cert`（読み取りレプリカでは `--replica-primary-tls-cert`）を渡さなければループバックのみである。非ループバックのプライマリへは TLS が必須で、ピンなしは起動エラー（終了コード 2）になる。
+
+### 2.3.1 TLS の構成とピンの配布（Issue #2177）
+
+非ループバックでレプリケーションを使うときは TLS を構成する。受信側はプライマリの証明書を**ピン留め**で検証する（CA チェーン・ホスト名の検証はしない）。
+
+1. プライマリ用に Ed25519 の自己署名の証明書と秘密鍵（PEM）を作り、`--replication-tls-cert`・`--replication-tls-key` で渡す。秘密鍵のファイルは運用者だけが読める権限にする
+2. **同じ証明書ファイル**（秘密鍵は渡さない）を受信側へ安全な経路で配り、`--primary-tls-cert <pem>` で指定する。提示された証明書がこのファイルと完全一致し、署名と Finished が検証できて初めて、資格情報（Hello）が送られる
+3. 証明書を更新したら、プライマリを再起動し、新しい証明書を受信側へ配って受信側も再起動する（再起動なしの更新は未対応）。古いピンの受信側は終了コード 11 で止まる
+
+```text
+wire-server --users <users-file> --db <primary.redb> --change-log \
+  --replication-bind 0.0.0.0:<port> --replication-roles <roles-file> \
+  --replication-allow <replica-ip> \
+  --replication-tls-cert <primary-cert.pem> --replication-tls-key <primary-key.pem>
+wire-server replica --db <base.redb> --primary <primary-ip>:<port> \
+  --primary-tls-cert <primary-cert.pem> --credentials <cred-file>
+```
+
+- TLS を構成したリスナーへの平文の接続は、何も返されずに閉じられる（ループバックの送信元も同じ）
+- 証明書の検証に失敗した受信側は、資格情報を送らずに終了コード 11 と固定文言（`the primary's TLS handshake was rejected (check --primary-tls-cert)`）で止まる。原因（どの検査か）は出さない
+- ピンの有効期間は受信側の起動時にだけ確かめる
 
 ### 2.4 同期レプリケーション（オプション）
 
@@ -105,7 +127,7 @@ wire-server --users <users-file> --db <base.redb> \
 | ------ | ---- |
 | 2 | 引数の不備（起動前に拒否。DB は変わらない） |
 | 10 | 適用停止（整合性違反） |
-| 11 | プライマリの拒否。`FOREIGN`・`RESYNC_REQUIRED`・`AHEAD`・認証失敗など |
+| 11 | プライマリの拒否。`FOREIGN`・`RESYNC_REQUIRED`・`AHEAD`・認証失敗・TLS 証明書のピン不一致など |
 
 一時障害（切断・タイムアウト・`BUSY`・`INTERNAL`）は終了せず自動で再接続する。読み取りレプリカは適用停止でプロセスごと終了するため、systemd などで終了コードを監視し、10・11 で自動再起動を繰り返さない設定にする（再起動しても解消しない）。
 
@@ -145,7 +167,7 @@ wire-server --users <users-file> --db <base.redb> \
 | 自動フェイルオーバー・自動昇格 | 対象外（RECOVER-15 (4) ポインタ） |
 | 運用者の CLI による昇格 | 未実装。追跡 Issue なし |
 | 再同期の専用コマンド | Issue #2176 で追加中。入ったら 4 を更新する |
-| TLS と非ループバック接続 | Issue #2177。それまで外へ出さない |
+| 相互 TLS（レプリカのクライアント証明書）・CA チェーンとホスト名の検証・再起動なしの証明書更新 | 未対応（ピン留めのみ。2.3.1 を参照） |
 | quorum（`ANY n`／`FIRST n`）・セッション単位の同期の水準・待機の cancel | 未対応 |
 | カスケード（レプリカからの再配信）・レプリカからのバックアップ | 未対応 |
 | PostgreSQL 互換の観測口（`pg_is_in_recovery()` など） | 未対応 |
@@ -153,7 +175,8 @@ wire-server --users <users-file> --db <base.redb> \
 
 ## 7. セキュリティ上の注意
 
-- リスナーはループバックのみ。port-forward やプロキシで外へ出すと、資格情報とレコードが平文で流れる。TLS（#2177）が入るまで外へ出さない
+- TLS を構成しないリスナーはループバックのみ。port-forward やプロキシで外へ出すと、資格情報とレコードが平文で流れるので、外へ出すときは TLS を構成する（2.3.1）
+- TLS を構成したリスナーは全接続が TLS 必須で、非ループバックの bind が使える。受信側はピンと一致する証明書にだけ資格情報を送る
 - `--replication-roles` と `--users` は別のファイル・別の名前空間である。テナントのロールではレプリカ用のリスナーに接続できない
 - 資格情報ファイルは group・other から読めない権限にする。認証に失敗し続ける送信元は、バックオフの間（最大 60 秒）何も返されずに閉じられる
 - 許可リストは 1 件以上が必須で、`/0` は拒否される。許可外の送信元には何も返さず閉じる
@@ -172,7 +195,7 @@ wire-server --users <users-file> --db <base.redb> \
 | 5 | プライマリの SIGKILL と再起動。ack 済みの commit が失われず、レプリカが先に進んで停止しない |
 | 6 | 同期レプリケーション。ack を受けた commit が、プライマリの SIGKILL の後もレプリカにある |
 
-確かめていないもの: 遅れの上限超過と再同期、TLS と非ループバック、電源断・カーネル層の分断、quorum、HNSW opt-in との併用。
+確かめていないもの: 遅れの上限超過と再同期、TLS と非ループバック（結合試験では確認済みで、障害注入の対象外）、電源断・カーネル層の分断、quorum、HNSW opt-in との併用。
 
 ## 9. 関連
 
