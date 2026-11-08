@@ -474,3 +474,125 @@ fn backup_incremental_refuses_a_database_in_use() {
     drop(held);
     assert!(leftovers(&c.root).is_empty());
 }
+/// 未アーカイブの分を `dir` へ書き出し、全件を刈り込む（保持 0。`backup-incremental` が補う対象を作る）。
+fn archive_and_prune_all(db: &Path, dir: &Path) {
+    let mut storage = Storage::open(db).expect("open");
+    storage.enable_change_log().expect("enable change log");
+    let mut opts = engine::storage::ArchiveOptions::new(dir);
+    opts.segment_bytes = 1;
+    opts.retain_records = Some(0);
+    for _ in 0..4 {
+        storage.archive_change_log(&opts).expect("archive");
+    }
+}
+
+fn backup_incremental(c: &Chain, archive: Option<&Path>, out: &Path) -> Output {
+    let mut args = vec![
+        "backup-incremental",
+        "--db",
+        s(&c.db),
+        "--base",
+        s(&c.base),
+        "--out",
+        s(out),
+    ];
+    if let Some(a) = archive {
+        args.push("--change-log-archive-dir");
+        args.push(s(a));
+    }
+    run(&args)
+}
+
+/// Issue #3099（RECOVER-14）: 刈り込み済みの区間は、アーカイブを指定すれば補って増分を作れる。
+/// 作った増分をベースへ適用すると最新と一致する。アーカイブの欠落・改ざんは何も公開せず 1 で終了する。
+#[test]
+fn recover14_pruned_range_is_filled_from_the_archive() {
+    let fx = common::TempFixtureDir::new("inc-cli-archive");
+    let root = PathBuf::from(fx.db_path_str())
+        .parent()
+        .expect("parent")
+        .join("out");
+    make_private_dir(&root);
+    let archive = root.join("archive");
+    make_private_dir(&archive);
+    let db = PathBuf::from(fx.db_path_str());
+    let base = root.join("base.redb");
+    write_rows(&db, 1..=3);
+    let o = run(&["backup", "--db", s(&db), "--out", s(&base)]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    write_rows(&db, 4..=5);
+    archive_and_prune_all(&db, &archive);
+    write_rows(&db, 6..=7);
+    let c = Chain {
+        _fx: fx,
+        root: root.clone(),
+        db: db.clone(),
+        base: base.clone(),
+        inc1: root.join("unused1.seg"),
+        inc2: root.join("unused2.seg"),
+    };
+
+    // アーカイブを指定しなければ、刈り込み済みの区間は補えず拒否する。
+    let plain = root.join("plain.seg");
+    let o = backup_incremental(&c, None, &plain);
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    assert!(!plain.exists());
+
+    // アーカイブを指定すると補って書き出せ、復元すると最新と一致する。
+    let inc = root.join("inc.seg");
+    let o = backup_incremental(&c, Some(&archive), &inc);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert!(
+        stdout(&o).contains("backup-incremental written: records="),
+        "{}",
+        stdout(&o)
+    );
+    assert_no_leak(&o, &[s(&root)]);
+    let dest = root.join("restored.redb");
+    let o = restore(&c, &dest, &[&inc]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert_eq!(row_ids(&dest), (1..=7).collect::<Vec<_>>());
+    let o = run(&["verify", "--db", s(&dest)]);
+    assert_eq!(o.status.code(), Some(0), "{}{}", stdout(&o), stderr(&o));
+
+    // 値の不備（存在しないディレクトリ）は使い方の誤りとして 2 で終了する。
+    let missing = root.join("missing-archive");
+    let out = root.join("usage.seg");
+    let o = backup_incremental(&c, Some(&missing), &out);
+    assert_eq!(o.status.code(), Some(2), "{}", stderr(&o));
+    assert!(!out.exists());
+
+    // 改ざん（セグメントの末尾の 1 バイト）。
+    let mut segs: Vec<PathBuf> = std::fs::read_dir(&archive)
+        .expect("read_dir")
+        .map(|e| e.expect("entry").path())
+        .collect();
+    segs.sort();
+    // 1 レコード 1 セグメント。ベースの終点の次（LSN の昇順で、ベース以前の分の次）を選ぶ。
+    let target = segs.get(segs.len() - 2).expect("segment").clone();
+    let original = std::fs::read(&target).expect("read");
+    let mut bytes = original.clone();
+    let n = bytes.len();
+    bytes[n - 1] ^= 0xff;
+    std::fs::write(&target, bytes).expect("write");
+    let bad = root.join("bad.seg");
+    let o = backup_incremental(&c, Some(&archive), &bad);
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    assert!(stderr(&o).contains("checksum mismatch"), "{}", stderr(&o));
+    assert_no_leak(&o, &[s(&root)]);
+    assert!(!bad.exists());
+    assert!(leftovers(&root).is_empty(), "{:?}", leftovers(&root));
+
+    // 欠落（必要な区間のセグメントを消す）。
+    std::fs::remove_file(&target).expect("remove");
+    let o = backup_incremental(&c, Some(&archive), &bad);
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    assert!(
+        stderr(&o).contains("does not cover the range"),
+        "{}",
+        stderr(&o)
+    );
+    assert_no_leak(&o, &[s(&root)]);
+    assert!(!bad.exists());
+    assert!(leftovers(&root).is_empty(), "{:?}", leftovers(&root));
+}

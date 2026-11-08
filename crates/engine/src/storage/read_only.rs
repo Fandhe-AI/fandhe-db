@@ -131,6 +131,22 @@ impl ReadOnlyStorage {
             dest.as_ref(),
         )
     }
+
+    /// [`Storage::export_incremental_with_archive`](super::Storage::export_incremental_with_archive) と同じ
+    /// 書き出しを、読み取り専用で開いた停止中の DB から行う（RECOVER-14・Issue #3099）。DB へ書かない。
+    pub fn export_incremental_with_archive(
+        &self,
+        base: &super::ChainPoint,
+        archive_dir: impl AsRef<Path>,
+        dest: impl AsRef<Path>,
+    ) -> Result<super::IncrementalSummary, super::IncrementalError> {
+        super::change_log::incremental::export_from_read_with(
+            &self.db.begin_read()?,
+            base,
+            dest.as_ref(),
+            Some(archive_dir.as_ref()),
+        )
+    }
 }
 
 #[cfg(test)]
