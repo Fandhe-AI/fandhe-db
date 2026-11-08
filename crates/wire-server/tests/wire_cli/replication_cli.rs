@@ -16,8 +16,8 @@ use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_wire-server");
-const ROLE: &str = "replica-1";
-const ROLE_PW: &str = "pw-replica";
+pub(crate) const ROLE: &str = "replica-1";
+pub(crate) const ROLE_PW: &str = "pw-replica";
 
 const E_BAD_REQUEST: u8 = 1;
 const E_AUTH_FAILED: u8 = 2;
@@ -58,18 +58,18 @@ fn phc_for(password: &str) -> String {
         .to_string()
 }
 
-struct Primary {
+pub(crate) struct Primary {
     _fx: common::TempFixtureDir,
     _child: ChildGuard,
-    tenant: SocketAddr,
-    repl: SocketAddr,
+    pub(crate) tenant: SocketAddr,
+    pub(crate) repl: SocketAddr,
     archive: Option<PathBuf>,
 }
 
 impl Primary {
     /// レプリケーション付きで起動する。`extra` は追加フラグ。`archive` が真ならアーカイブ（1 秒周期・
     /// 保持 0）を有効にする。
-    fn start(label: &str, extra: &[&str], archive: bool) -> Self {
+    pub(crate) fn start(label: &str, extra: &[&str], archive: bool) -> Self {
         let fx = common::TempFixtureDir::new(label);
         let users = fx.users_path_str();
         let db = fx.db_path_str();
@@ -139,7 +139,7 @@ impl Primary {
         }
     }
 
-    fn alice(&self) -> TenantSession {
+    pub(crate) fn alice(&self) -> TenantSession {
         let stream = common::authenticate_to_ready_for_query(self.tenant, "alice", "pw-alice");
         stream
             .set_read_timeout(Some(Duration::from_secs(20)))
@@ -154,16 +154,16 @@ impl Primary {
     }
 }
 
-struct TenantSession(TcpStream);
+pub(crate) struct TenantSession(pub(crate) TcpStream);
 
 impl TenantSession {
-    fn exec(&mut self, sql: &str) {
+    pub(crate) fn exec(&mut self, sql: &str) {
         common::send_simple_query(&mut self.0, sql);
         let _ = common::read_command_complete(&mut self.0);
         common::read_ready_for_query(&mut self.0);
     }
 
-    fn insert(&mut self, id: u32) {
+    pub(crate) fn insert(&mut self, id: u32) {
         self.exec(&format!(
             "INSERT INTO docs (id, embedding) VALUES ({id}, '[0.1,0.2,0.3]')"
         ));
@@ -171,17 +171,22 @@ impl TenantSession {
 }
 
 /// テスト用の最小のレプリカ側クライアント。
-struct Replica(TcpStream);
+pub(crate) struct Replica(pub(crate) TcpStream);
 
-fn hello_body(role: &str, password: &str) -> Vec<u8> {
-    let mut b = 1u16.to_be_bytes().to_vec();
+pub(crate) fn hello_body(role: &str, password: &str) -> Vec<u8> {
+    hello_body_v(role, password, 1)
+}
+
+/// 版数を指定する Hello（版数 2 は `R` を送ってよい。Issue #2245）。
+pub(crate) fn hello_body_v(role: &str, password: &str, version: u16) -> Vec<u8> {
+    let mut b = version.to_be_bytes().to_vec();
     b.push(u8::try_from(role.len()).expect("role len"));
     b.extend_from_slice(role.as_bytes());
     b.extend_from_slice(password.as_bytes());
     b
 }
 
-fn start_body(db_id: &[u8], timeline: u64, applied: u64) -> Vec<u8> {
+pub(crate) fn start_body(db_id: &[u8], timeline: u64, applied: u64) -> Vec<u8> {
     let mut b = db_id.to_vec();
     b.extend_from_slice(&timeline.to_be_bytes());
     b.extend_from_slice(&applied.to_be_bytes());
@@ -189,14 +194,14 @@ fn start_body(db_id: &[u8], timeline: u64, applied: u64) -> Vec<u8> {
 }
 
 impl Replica {
-    fn connect(addr: SocketAddr) -> Self {
+    pub(crate) fn connect(addr: SocketAddr) -> Self {
         let s = TcpStream::connect(addr).expect("connect");
         s.set_read_timeout(Some(Duration::from_secs(20)))
             .expect("timeout");
         Self(s)
     }
 
-    fn send(&mut self, ty: u8, body: &[u8]) {
+    pub(crate) fn send(&mut self, ty: u8, body: &[u8]) {
         let mut f = vec![ty];
         f.extend_from_slice(&u32::try_from(body.len()).expect("len").to_be_bytes());
         f.extend_from_slice(body);
@@ -204,7 +209,7 @@ impl Replica {
     }
 
     /// 1 フレームを読む。切断・タイムアウトは `None`。
-    fn recv(&mut self) -> Option<(u8, Vec<u8>)> {
+    pub(crate) fn recv(&mut self) -> Option<(u8, Vec<u8>)> {
         let mut h = [0u8; 5];
         self.0.read_exact(&mut h).ok()?;
         let len = u32::from_be_bytes([h[1], h[2], h[3], h[4]]) as usize;
@@ -215,7 +220,7 @@ impl Replica {
     }
 
     /// 認証して `I`（識別子）まで進める。(db_id, timeline, current)。
-    fn login(&mut self, role: &str, password: &str) -> ([u8; 16], u64, u64) {
+    pub(crate) fn login(&mut self, role: &str, password: &str) -> ([u8; 16], u64, u64) {
         self.send(b'H', &hello_body(role, password));
         let (ty, body) = self.recv().expect("identity frame");
         assert_eq!(ty, b'I', "expected identity, got {ty} {body:?}");
@@ -226,7 +231,7 @@ impl Replica {
     }
 
     /// 認証 → Start → `O` まで。
-    fn begin(&mut self, applied: u64) -> ([u8; 16], u64) {
+    pub(crate) fn begin(&mut self, applied: u64) -> ([u8; 16], u64) {
         let (db_id, timeline, _) = self.login(ROLE, ROLE_PW);
         self.send(b'S', &start_body(&db_id, timeline, applied));
         let (ty, body) = self.recv().expect("ok frame");
@@ -234,12 +239,12 @@ impl Replica {
         (db_id, timeline)
     }
 
-    fn ack(&mut self, lsn: u64) {
+    pub(crate) fn ack(&mut self, lsn: u64) {
         self.send(b'K', &lsn.to_be_bytes());
     }
 
     /// 次の `W` を読む（`P` は読み飛ばす）。`(lsn, レコード)`。
-    fn next_record(&mut self) -> Option<(u64, Vec<u8>)> {
+    pub(crate) fn next_record(&mut self) -> Option<(u64, Vec<u8>)> {
         loop {
             let (ty, body) = self.recv()?;
             match ty {
@@ -254,7 +259,7 @@ impl Replica {
     }
 
     /// 次のフレームが `E` でコードが `expect` であること。
-    fn expect_error(&mut self, expect: u8) {
+    pub(crate) fn expect_error(&mut self, expect: u8) {
         match self.recv() {
             Some((b'E', body)) => assert_eq!(body, vec![expect]),
             other => panic!("expected error {expect}, got {other:?}"),
@@ -262,7 +267,7 @@ impl Replica {
     }
 
     /// 切断（EOF）されるまで読み捨てる。`E` を見たらそのコードを返す。
-    fn drain_until_closed(&mut self) -> Option<u8> {
+    pub(crate) fn drain_until_closed(&mut self) -> Option<u8> {
         let mut code = None;
         while let Some((ty, body)) = self.recv() {
             if ty == b'E' {
@@ -273,7 +278,7 @@ impl Replica {
     }
 }
 
-fn run(args: &[&str]) -> Output {
+pub(crate) fn run(args: &[&str]) -> Output {
     Command::new(BIN).args(args).output().expect("run")
 }
 
