@@ -15,6 +15,9 @@
 //! 3. 一時ファイルを `Storage::open` して `verify_integrity` を実行する。Error・Incomplete が 1 件でも
 //!    あれば公開せず一時ファイルを消す（検査できなかったものも整合とは扱わない）
 //!    通ったら、一時ファイルを開き直して復元の世代番号を進める（RECOVER-17。失敗したら公開しない）
+//!    `--generation-state` 指定時は、世代を進める直前に状態ファイル（自分所有・0600・親が共有でない通常
+//!    ファイル）を開いて排他ロックし、高水位より大きい値へ進め、新しい値を状態ファイルへ fsync してから
+//!    次へ進む（Issue #3105。ロックは公開の後まで保持。どの失敗でも公開しない）
 //! 4. 世代を進めた一時ファイルを fsync し直し、`hard_link` で最終名へ公開する（既存の宛先は
 //!    `EEXIST` で原子的に拒否。`rename` は置換するため使わない）。一時名を消し、親ディレクトリを fsync する
 //!
@@ -50,6 +53,10 @@ pub struct RestoreArgs {
     /// 指定点までの復元（`--until-lsn`／`--until-time`。Issue #2169・RECOVER-14 のポインタ）。`None` なら
     /// ベース（と増分）の終点まで復元する。
     pub pitr: Option<PitrSpec>,
+    /// 復元をまたぐ世代の高水位を持つ状態ファイル（`--generation-state`。Issue #3105・RECOVER-17 のポインタ）。
+    /// 指定すると、新しい世代がファイルの高水位を超えることを保証し、更新してから公開する。`None` なら
+    /// 時計の下限だけで進める（従来どおり）。同じ DB 系列の復元では毎回同じファイルを指定する。
+    pub generation_state: Option<PathBuf>,
 }
 
 /// 指定点までの復元の指定（変更ログのアーカイブと目標）。
@@ -99,12 +106,14 @@ fn parse_until_lsn(raw: &str) -> Result<u64, String> {
 pub fn parse(args: &[String]) -> Result<RestoreArgs, String> {
     const USAGE: &str = "unknown argument (usage: restore --from <path> --db <path> \
                          [--incremental <path>]... [--change-log-archive-dir <dir>] \
-                         [--until-lsn <n> | --until-time <rfc3339>])";
+                         [--until-lsn <n> | --until-time <rfc3339>] \
+                         [--generation-state <path>])";
     let mut from: Option<&str> = None;
     let mut db: Option<&str> = None;
     let mut archive_dir: Option<&str> = None;
     let mut until_lsn: Option<&str> = None;
     let mut until_time: Option<&str> = None;
+    let mut generation_state: Option<&str> = None;
     let mut incrementals: Vec<&str> = Vec::new();
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -122,6 +131,7 @@ pub fn parse(args: &[String]) -> Result<RestoreArgs, String> {
             "--change-log-archive-dir" => &mut archive_dir,
             "--until-lsn" => &mut until_lsn,
             "--until-time" => &mut until_time,
+            "--generation-state" => &mut generation_state,
             _ => return Err(USAGE.into()),
         };
         if slot.is_some() {
@@ -174,12 +184,91 @@ pub fn parse(args: &[String]) -> Result<RestoreArgs, String> {
             })
         }
     };
+    let generation_state = generation_state
+        .map(|raw| {
+            let mut others: Vec<&Path> = vec![&from, &db];
+            others.extend(incrementals.iter().map(PathBuf::as_path));
+            others.extend(pitr.iter().filter_map(|p| p.archive_dir.as_deref()));
+            validate_generation_state_path(raw, &others)
+        })
+        .transpose()?;
     Ok(RestoreArgs {
         from,
         db,
         incrementals,
         pitr,
+        generation_state,
     })
+}
+
+/// `--generation-state` の検証（開く前の段階。エラー文はパスの内容を含めない）。空・`..` 成分・ファイル名なし・
+/// 親ディレクトリの不在・既存の通常ファイル以外（シンボリックリンク・ディレクトリ等）、および他の引数
+/// （`--from`・`--db`・`--incremental`・アーカイブ先）と同じ位置を拒否する。同じ位置かは、親を実体化した
+/// パスの一致と、存在する場合の (dev, ino) の一致で判定する（別名・ハードリンクで復元元を書かせない）。
+fn validate_generation_state_path(raw: &str, others: &[&Path]) -> Result<PathBuf, String> {
+    const FLAG: &str = "--generation-state";
+    if raw.is_empty() {
+        return Err(format!("{FLAG} must not be empty"));
+    }
+    let path = PathBuf::from(raw);
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(format!("{FLAG} must not contain '..' components"));
+    }
+    let Some(name) = path.file_name() else {
+        return Err(format!("{FLAG} must name a file"));
+    };
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let Ok(real_parent) = std::fs::canonicalize(parent) else {
+        return Err(format!("parent directory of {FLAG} does not exist"));
+    };
+    let existing = match std::fs::symlink_metadata(&path) {
+        Ok(m) if m.is_file() => Some(m),
+        Ok(_) => return Err(format!("{FLAG} must be a regular file")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => return Err(format!("{FLAG} could not be inspected")),
+    };
+    let own = real_parent.join(name);
+    for other in others {
+        let same_path = other
+            .file_name()
+            .zip(
+                other
+                    .parent()
+                    .map(|p| {
+                        if p.as_os_str().is_empty() {
+                            Path::new(".")
+                        } else {
+                            p
+                        }
+                    })
+                    .and_then(|p| std::fs::canonicalize(p).ok()),
+            )
+            .is_some_and(|(n, p)| p.join(n) == own);
+        if same_path || existing.as_ref().is_some_and(|m| same_file(m, other)) {
+            return Err(format!(
+                "{FLAG} must not be the same file as another restore argument"
+            ));
+        }
+    }
+    Ok(path)
+}
+
+/// 既存のメタデータ `m` が `other`（リンクをたどる）と同じファイルか（unix のみ判定できる）。
+#[cfg(unix)]
+fn same_file(m: &std::fs::Metadata, other: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(other).is_ok_and(|o| o.dev() == m.dev() && o.ino() == m.ino())
+}
+
+#[cfg(not(unix))]
+fn same_file(_m: &std::fs::Metadata, _other: &Path) -> bool {
+    false
 }
 
 /// 復元の成功結果（行の値は含めない。CLI の表示用）。
@@ -208,6 +297,12 @@ pub enum RestoreError {
     /// 復元の世代番号を進められなかった（値の破損・上限到達・書き込み失敗。RECOVER-17・Issue #2448）。
     /// 世代が進まない復元は公開しない（古い世代を返す復元先を作らない。fail-closed）。
     GenerationFailed,
+    /// `--generation-state` の状態ファイルを別の復元が握っている（同じ高水位を並行して読ませない。
+    /// Issue #3105）。何も公開しない。
+    GenerationStateInUse,
+    /// `--generation-state` の状態ファイルが、自分所有の 0600 の通常ファイルで有効な状態を持つものでは
+    /// なかった（Issue #3105。別のファイル・破損・上限超過・安全でない親ディレクトリを含む）。何も公開しない。
+    GenerationStateRejected,
     /// 検査用の一時コピーのパスが、作成した fd と別のファイルに差し替えられた・消えた・長さが合わない
     /// （空 DB が整合扱いで公開されるのを防ぐ。公開しない）。
     TempReplaced,
@@ -244,6 +339,13 @@ impl std::fmt::Display for RestoreError {
             Self::VerifyFailed => "integrity check could not be started; nothing was published",
             Self::GenerationFailed => {
                 "restore generation could not be advanced; nothing was published"
+            }
+            Self::GenerationStateInUse => {
+                "restore generation state file is in use by another restore; nothing was published"
+            }
+            Self::GenerationStateRejected => {
+                "restore generation state file is not a private regular file with a valid state; \
+                 nothing was published"
             }
             Self::NotConsistent(_) => "backup failed the integrity check; nothing was published",
             Self::Unsupported => "restore is not supported in this environment",
@@ -341,6 +443,15 @@ pub fn restore_with_incrementals(
     Err(RestoreError::Unsupported)
 }
 
+/// 検証済みの引数 `args` 一式で復元する（`--generation-state` を含む。非 unix では常に `Unsupported`）。
+#[cfg(not(unix))]
+pub fn restore_with_args(
+    _args: &RestoreArgs,
+    _leftover: &mut Option<PathBuf>,
+) -> Result<RestoreSummary, RestoreError> {
+    Err(RestoreError::Unsupported)
+}
+
 /// [`restore_with_incrementals`] の指定点つき版（非 unix では常に `Unsupported`）。
 #[cfg(not(unix))]
 pub fn restore_with_pitr(
@@ -362,7 +473,7 @@ pub fn restore(
     dest: &Path,
     leftover: &mut Option<PathBuf>,
 ) -> Result<RestoreSummary, RestoreError> {
-    unix_impl::restore(from, dest, &[], None, leftover)
+    unix_impl::restore(from, dest, &[], None, None, leftover)
 }
 
 /// ベース `from` へ増分バックアップ `incrementals`（古い順）を適用した状態を、新しい DB `dest` へ復元する
@@ -378,7 +489,7 @@ pub fn restore_with_incrementals(
     incrementals: &[PathBuf],
     leftover: &mut Option<PathBuf>,
 ) -> Result<RestoreSummary, RestoreError> {
-    unix_impl::restore(from, dest, incrementals, None, leftover)
+    unix_impl::restore(from, dest, incrementals, None, None, leftover)
 }
 
 /// ベース `from` に増分 `incrementals` と変更ログのアーカイブを、`pitr` の目標のコミット境界まで適用した状態を、
@@ -395,7 +506,26 @@ pub fn restore_with_pitr(
     pitr: Option<&PitrSpec>,
     leftover: &mut Option<PathBuf>,
 ) -> Result<RestoreSummary, RestoreError> {
-    unix_impl::restore(from, dest, incrementals, pitr, leftover)
+    unix_impl::restore(from, dest, incrementals, pitr, None, leftover)
+}
+
+/// 検証済みの引数 `args` 一式で復元する（`--generation-state` を含む。Issue #3105）。状態ファイルの
+/// 高水位より大きい世代へ進め、高水位を更新してから公開する。状態ファイルを開けない・不正・ロックを
+/// 取れない・更新できないときは何も公開しない。`args.generation_state` が `None` なら
+/// [`restore_with_pitr`] と同じ。
+#[cfg(unix)]
+pub fn restore_with_args(
+    args: &RestoreArgs,
+    leftover: &mut Option<PathBuf>,
+) -> Result<RestoreSummary, RestoreError> {
+    unix_impl::restore(
+        &args.from,
+        &args.db,
+        &args.incrementals,
+        args.pitr.as_ref(),
+        args.generation_state.as_deref(),
+        leftover,
+    )
 }
 
 /// `verify` が検査に使った経路（出力の `verify_mode=` 行の値。固定語で、パス・内容を含まない）。
@@ -486,6 +616,8 @@ mod unix_impl {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use engine::storage::{IntegrityOptions, IntegrityReport, Storage};
+
+    use crate::restore_generation_state::GenerationState;
 
     use super::{PitrSpec, RestoreError, RestoreSummary};
 
@@ -641,15 +773,34 @@ mod unix_impl {
 
     /// 検査を通った一時コピーを開き直して復元の世代番号を進める（開いた `Storage` は閉じてから返す。
     /// 書き込みで長さが変わるため、パスの同一性だけを確かめる）。
-    fn advance_generation(tmp: &TempCopy) -> Result<(), RestoreError> {
+    ///
+    /// `state_path`（`--generation-state`。Issue #3105）があれば、状態ファイルを開いて排他ロックを取り、
+    /// 高水位より大きい世代へ進め、新しい世代を状態ファイルへ書いて fsync する。失敗したら公開しない。
+    /// 返すガードは、並行の復元に同じ高水位を読ませないため、公開（`hard_link`）の後まで保持する。
+    fn advance_generation(
+        tmp: &TempCopy,
+        state_path: Option<&Path>,
+    ) -> Result<Option<GenerationState>, RestoreError> {
         tmp.check_path(None)?;
-        {
+        // 状態ファイルの所有者は一時コピーの所有者（自分）と一致させる（`geteuid` を使わない）。
+        let own_uid = tmp.file.metadata().map_err(io_err)?.uid();
+        let gs = state_path
+            .map(|p| GenerationState::open(p, own_uid))
+            .transpose()?;
+        let high_water = gs.as_ref().map(GenerationState::read).transpose()?;
+        let next = {
             let mut storage = Storage::open(&tmp.path).map_err(|_| RestoreError::OpenFailed)?;
-            storage
-                .advance_restore_generation()
-                .map_err(|_| RestoreError::GenerationFailed)?;
+            match &high_water {
+                Some(h) => storage.advance_restore_generation_above(h.value),
+                None => storage.advance_restore_generation(),
+            }
+            .map_err(|_| RestoreError::GenerationFailed)?
+        };
+        tmp.check_path(None)?;
+        if let (Some(g), Some(h)) = (&gs, &high_water) {
+            g.record(h, next)?;
         }
-        tmp.check_path(None)
+        Ok(gs)
     }
 
     fn parent_of(path: &Path) -> Result<&Path, RestoreError> {
@@ -688,6 +839,7 @@ mod unix_impl {
         dest: &Path,
         incrementals: &[PathBuf],
         pitr: Option<&PitrSpec>,
+        generation_state: Option<&Path>,
         leftover: &mut Option<PathBuf>,
     ) -> Result<RestoreSummary, RestoreError> {
         let parent = parent_of(dest)?;
@@ -706,10 +858,10 @@ mod unix_impl {
             &mut src,
             src_len,
             &mut tmp,
-            dest,
-            parent,
+            (dest, parent),
             incrementals,
             pitr,
+            generation_state,
         );
         drop(src);
         // 公開しなかった経路（公開済みなら armed は false）では、一時コピーを明示的に消し、
@@ -727,10 +879,10 @@ mod unix_impl {
         src: &mut File,
         src_len: u64,
         tmp: &mut TempCopy,
-        dest: &Path,
-        parent: &Path,
+        (dest, parent): (&Path, &Path),
         incrementals: &[PathBuf],
         pitr: Option<&PitrSpec>,
+        generation_state: Option<&Path>,
     ) -> Result<RestoreSummary, RestoreError> {
         copy_into(src, src_len, tmp)?;
 
@@ -770,7 +922,8 @@ mod unix_impl {
         // 検査を通った一時ファイルへ、公開の前に 1 回だけ書く。公開後に古い世代の復元先が見える
         // 時間帯を作らない。失敗したら何も公開しない（一時ファイルは破棄される）。
         // 進めた後に整合検査を再実行しない: 書き込みは世代の 1 表のみで、同じ inode のまま公開する。
-        advance_generation(tmp)?;
+        // 状態ファイルを指定したときは、そのガード（排他ロック）を関数の終わり（公開・後始末の後）まで保持する。
+        let _generation_guard = advance_generation(tmp, generation_state)?;
 
         // 4. open・クローズ後の最終内容を保持 fd で fsync し直す。fsync は長くかかりうるため、
         //    パスの同一性は fsync の「後」、hard_link の直前に確かめる（hard_link は fd ではなく
@@ -863,6 +1016,31 @@ mod tests {
         .expect("repeatable");
         assert_eq!(ok.incrementals.len(), 2);
         assert!(parse(&v(&["--from", exe, "--from", exe, "--db", "x-not-created"])).is_err());
+    }
+
+    #[test]
+    fn generation_state_flag_is_validated_at_parse_time() {
+        let exe = std::env::current_exe().expect("current_exe");
+        let exe = exe.to_str().expect("utf-8 path");
+        let base = ["--from", exe, "--db", "gen-state-test-not-created"];
+        let with = |extra: &[&str]| {
+            let mut a = base.to_vec();
+            a.extend_from_slice(extra);
+            parse(&v(&a))
+        };
+        // 値の欠落・重複・`..`・親の不在・復元元と同じファイルは拒否する。
+        assert!(with(&["--generation-state"]).is_err());
+        assert!(with(&["--generation-state", "a", "--generation-state", "b"]).is_err());
+        assert!(with(&["--generation-state", "../x"]).is_err());
+        assert!(with(&["--generation-state", "/nonexistent-dir-for-gen-state/x"]).is_err());
+        assert!(with(&["--generation-state", exe]).is_err());
+        // 存在しない新規パス（親は存在）は受理され、そのまま保持される。
+        let ok = with(&["--generation-state", "gen-state-test-state.bin"]).expect("accepted");
+        assert_eq!(
+            ok.generation_state.as_deref(),
+            Some(Path::new("gen-state-test-state.bin"))
+        );
+        assert!(parse(&v(&base)).expect("plain").generation_state.is_none());
     }
 
     #[test]
