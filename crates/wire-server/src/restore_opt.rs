@@ -222,6 +222,16 @@ fn validate_generation_state_path(raw: &str, others: &[&Path]) -> Result<PathBuf
     let Some(name) = path.file_name() else {
         return Err(format!("{FLAG} must name a file"));
     };
+    // 掃除（Issue #3094）が消す予約名の形式は、新規・既存を問わず拒否する。既存の状態ファイルが掃除に消され
+    // 空で再作成されると高水位が失われ、世代番号の単調性（RECOVER-17）が崩れるため（fail-closed）。
+    if name
+        .to_str()
+        .is_some_and(engine::storage::is_reserved_temp_name)
+    {
+        return Err(format!(
+            "{FLAG} must not use a reserved temporary file name"
+        ));
+    }
     let parent = match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),
@@ -471,7 +481,8 @@ pub fn restore_with_pitr(
 /// `storage::stale_temp`（形式に厳密一致・通常ファイル・0600 系・自分の所有・使用中でない）。宛先が既に在る・
 /// 親が不正なときは `None`。結果は報告のためだけで、復元の成否には影響させない。
 ///
-/// `protected`（`--from`・`--incremental`・`--generation-state` の明示パス）のどれかが復元の一時名の形式なら、
+/// `protected`（`--from`・`--incremental`・`--generation-state` の明示パス）のどれかが掃除対象の全形式
+/// （engine の `storage::is_reserved_temp_name`。復元の一時名・アーカイブの一時名・確認用ファイル）なら、
 /// 入力の消失（復元元の変更・高水位の再作成）を避けるため掃除ごと見送って `None` を返す（fail-closed）。
 #[cfg(unix)]
 pub fn sweep_stale_restore_temps(
@@ -481,7 +492,7 @@ pub fn sweep_stale_restore_temps(
     let is_temp = |p: &Path| {
         p.file_name()
             .and_then(|n| n.to_str())
-            .is_some_and(unix_impl::is_restore_temp_name)
+            .is_some_and(engine::storage::is_reserved_temp_name)
     };
     // 指定名が別名（シンボリックリンク）でも、実体が一時名なら掃除対象になりうるため、実体のパスでも判定する。
     // 実体を解決できないときは名前だけの判定に留まる（入力として開けないので復元自体も失敗する）。
@@ -1065,6 +1076,31 @@ mod tests {
         let dest = dir.join("restored.redb");
         assert!(sweep_stale_restore_temps(&dest, &[alias.as_path()]).is_none());
         assert!(real.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 入力の保護判定は掃除対象の全形式（確認用ファイル・アーカイブの一時名を含む）に及ぶ（Issue #3094）。
+    #[cfg(unix)]
+    #[test]
+    fn sweep_is_skipped_for_every_reserved_protected_name() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("fandhe-sweep-prot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).expect("mkdir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        let dest = dir.join("restored.redb");
+        for name in [
+            ".fandhe-sweep-probe-4242-0123456789abcdef-0.tmp",
+            ".fandhe-seg-4242-0123456789abcdef-7.tmp",
+            ".fandhe-restore-4242-7.tmp",
+        ] {
+            let p = dir.join(name);
+            assert!(
+                sweep_stale_restore_temps(&dest, &[p.as_path()]).is_none(),
+                "{name}"
+            );
+        }
+        assert!(sweep_stale_restore_temps(&dest, &[dir.join("plain.bin").as_path()]).is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

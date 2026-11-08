@@ -501,6 +501,7 @@ RECOVER-14 (2) のポインタ（上限の超過で書き込みを拒否する�
   `storage::is_reserved_temp_name` に一本化し、出力先の共通検査 `validate_new_path` から呼ぶ。
   すでに予約名で存在する完成済みファイルは、内容で見分けず（部分コピーも redb として開けうる）、
   従来どおり掃除の対象とする（本修正の前に作られた名前への追加の安全策は取らない）
+- `restore --generation-state` も同じ予約名を新規・既存を問わず拒否する（掃除で高水位が失われ RECOVER-17 の単調性が崩れるため）。掃除の入力保護（`--from`・`--incremental`・`--generation-state`）の判定も `is_reserved_temp_name` に合わせ、確認用ファイル・アーカイブの一時名を含む
 - 掃除の uid 確認用ファイルは専用の形式 `.fandhe-sweep-probe-*`（一時名と別）にし、確認中の SIGKILL で
   残っても次の掃除が回収する。呼び出し側（crash-test）の「一時名の残骸の件数」には混ざらない
 - 対象外: `backup` の `.fandhe-snapshot-*`・`verify` の `.fandhe-verify-*`・`dump` 系の一時名・

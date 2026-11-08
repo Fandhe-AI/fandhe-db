@@ -287,3 +287,43 @@ fn recover17_a_locked_state_file_publishes_nothing() {
     let o = restore_with(&f.src, &dest, &f.state);
     assert_eq!(code(&o), Some(0), "stderr: {}", stderr(&o));
 }
+
+/// Issue #3094（Cursor Bugbot・Codex P1）: `--generation-state` に掃除の予約名（復元の一時名・確認用ファイル・
+/// アーカイブの一時名）を渡すと、新規・既存を問わず引数エラー（終了コード 2）で拒否し、既存の状態ファイルを
+/// 消さない（掃除による高水位の喪失を防ぐ。RECOVER-17 のポインタ）。
+#[test]
+fn recover17_reserved_temp_names_are_rejected_as_state_files() {
+    let f = fixture("restore-gen-state-reserved");
+    let src_before = std::fs::read(&f.src).expect("read src");
+    for (i, name) in [
+        ".fandhe-sweep-probe-4242-0123456789abcdef-0.tmp",
+        ".fandhe-restore-4242-7.tmp",
+        ".fandhe-restore-4242-0123456789abcdef-7.tmp",
+        ".fandhe-seg-4242-0123456789abcdef-7.tmp",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let state = f.dir.join(name);
+        let dest = f.dir.join(format!("restored-{i}.redb"));
+        // 既存の状態ファイル（0600）は消されず内容も変わらない。
+        write_high_water(&state, 1_000 + i as u64);
+        let before = std::fs::read(&state).expect("read state");
+        let o = restore_with(&f.src, &dest, &state);
+        assert_eq!(code(&o), Some(2), "{name}: {}", stderr(&o));
+        assert!(
+            stderr(&o).contains("reserved temporary file name"),
+            "{}",
+            stderr(&o)
+        );
+        assert!(!dest.exists(), "nothing is published");
+        assert_eq!(std::fs::read(&state).expect("state kept"), before, "{name}");
+        // 新規でも作らない。
+        std::fs::remove_file(&state).expect("remove");
+        let o = restore_with(&f.src, &dest, &state);
+        assert_eq!(code(&o), Some(2), "{name}: {}", stderr(&o));
+        assert!(!state.exists(), "{name} must not be created");
+        assert!(!dest.exists(), "nothing is published");
+    }
+    assert_eq!(std::fs::read(&f.src).expect("read src"), src_before);
+}
