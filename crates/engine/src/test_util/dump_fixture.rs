@@ -64,6 +64,10 @@ pub const SETUP: &[&str] = &[
      other_label TEXT REFERENCES app.items (label) ON DELETE SET NULL)",
     "CREATE VIEW app.vi AS SELECT label FROM app.items",
     "CREATE INDEX items_label ON app.items (label)",
+    // SCHEMA 配下の SEQUENCE（開始値・増分・RESTART つき）と、それを既定値にする列・SERIAL を持つ表（#3097）。
+    "CREATE SEQUENCE app.counter START WITH 7 INCREMENT BY 3",
+    "ALTER SEQUENCE app.counter RESTART WITH 13",
+    "CREATE TABLE app.tickets (tid SERIAL PRIMARY KEY, n BIGINT DEFAULT nextval('app.counter'))",
     "CREATE FUNCTION app.scoped(x INTEGER) RETURNS INTEGER LANGUAGE sql AS $q$ SELECT x $q$",
     // 関数とトリガ（トリガは後段。復元の行投入中には走らない）。
     "CREATE FUNCTION add_one(x INTEGER, tags TEXT[]) RETURNS INTEGER LANGUAGE sql IMMUTABLE STRICT \
@@ -92,6 +96,15 @@ pub const SETUP: &[&str] = &[
      (1, 1, 'o1', 'eu', 1), (2, 2, NULL, NULL, NULL), (3, NULL, 'o2', 'us', 2)",
     "INSERT INTO node (nid, up) VALUES (1, NULL), (2, 1), (3, 2)",
     "INSERT INTO app.notes (nid, item_label, other_label) VALUES (1, 'first', 'second'), (2, NULL, NULL)",
+    "INSERT INTO app.tickets DEFAULT VALUES",
+    "INSERT INTO app.tickets DEFAULT VALUES",
+    // マテリアライズド VIEW（列別名つき・VIEW を読む・matview を読む・実体化前のまま・索引つき。#3097）。
+    "CREATE MATERIALIZED VIEW mv_pair (pa, pb) AS SELECT a, b FROM pair",
+    "CREATE MATERIALIZED VIEW mv_v3 AS SELECT cid, pid FROM v3",
+    "CREATE MATERIALIZED VIEW mv_of_mv AS SELECT pa FROM mv_pair",
+    "CREATE MATERIALIZED VIEW mv_empty AS SELECT a FROM pair WITH NO DATA",
+    "CREATE UNIQUE INDEX mv_pair_uq ON mv_pair (pa, pb)",
+    "CREATE INDEX mv_v3_pid ON mv_v3 (pid)",
     // 全列型の行: 特殊文字・全 NULL・境界値。
     "INSERT INTO wide (t, v, c, i, n, b, r, d, f, dt, ts, tm, tz, iv, bits, bin, j, jb, u, \
      nm, m, ta, ia, emb) VALUES ('a\tb\nc\rd\\e''f\"g\\N\u{8}\u{c}\u{b}日本語', 'it''s', 'ab', \
@@ -114,6 +127,11 @@ pub const SETUP: &[&str] = &[
     "CREATE POLICY pol_ins ON parent FOR INSERT WITH CHECK (id > 0)",
     "ALTER TABLE parent ENABLE ROW LEVEL SECURITY",
     "ALTER TABLE parent FORCE ROW LEVEL SECURITY",
+    // 実体化済みの matview を最後に再計算する（往復後の値が元と一致することを確かめる。`mv_empty` は
+    // 実体化前のまま残す）。
+    "REFRESH MATERIALIZED VIEW mv_pair",
+    "REFRESH MATERIALIZED VIEW mv_v3",
+    "REFRESH MATERIALIZED VIEW mv_of_mv",
 ];
 
 /// 往復後に値を比べる読み取り（表と VIEW。順序が決まるよう主キーなどで並べる）。
@@ -133,16 +151,22 @@ pub const READBACKS: &[&str] = &[
     "SELECT cid, pid FROM v3 ORDER BY cid",
     "SELECT c FROM v4 ORDER BY c",
     "SELECT label FROM app.vi ORDER BY label",
+    "SELECT tid, n FROM app.tickets ORDER BY tid",
+    "SELECT pa, pb FROM mv_pair ORDER BY pa, pb",
+    "SELECT cid, pid FROM mv_v3 ORDER BY cid",
+    "SELECT pa FROM mv_of_mv ORDER BY pa",
 ];
 
 /// 往復後に同じ値が採番されることを確かめる挿入（SERIAL・IDENTITY・SEQUENCE の次の値）。
 pub const NEXT_VALUE_PROBES: &[&str] = &[
     "INSERT INTO child (pid, note) VALUES (2, 'after')",
     "INSERT INTO app.items (iid, label) VALUES (3, 'third')",
+    "INSERT INTO app.tickets DEFAULT VALUES",
 ];
 
 /// 往復後の採番確認の読み取り。
 pub const NEXT_VALUE_READBACKS: &[&str] = &[
     "SELECT cid, ident, sv FROM child WHERE note = 'after'",
     "SELECT iid, qty FROM app.items WHERE label = 'third'",
+    "SELECT tid, n FROM app.tickets ORDER BY tid DESC LIMIT 1",
 ];

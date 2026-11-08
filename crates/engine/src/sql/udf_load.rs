@@ -174,12 +174,45 @@ fn load_into(
     tenant_id: &str,
     registry: &mut UdfRegistry,
 ) -> Result<(), SqlSurfaceError> {
-    registry.remove_catalog_entries();
     // 世代を先に読む（読み取りの後に別セッションが変更しても、次の確認で必ずリロードされる順序）。
     let generation = storage.function_generation(tenant_id);
-    let mut defs = storage
+    let defs = storage
         .list_functions(tenant_id)
         .map_err(|_| load_failed())?;
+    load_defs_into(defs, generation, tenant_id, registry)
+}
+
+/// 与えた読み取りスナップショットの関数定義だけからテナント `tenant_id` の UDF カタログを `registry`
+/// へロードする（論理ダンプのマテリアライズド VIEW 列構成検査専用。Issue #3097）。[`load`] と同じ登録
+/// 規則だが、定義をダンプの読み取りスナップショットから読むため、検査中に別 writer が関数を変えても
+/// 出力と同じ定義で導出できる。世代は現在値を記録せず「未完了」にする（短命の検査用セッションで、
+/// 通常の refresh の fast path に乗せない）。
+pub(crate) fn load_from_snapshot(
+    read_txn: &redb::ReadTransaction,
+    tenant_id: &str,
+    registry: &mut UdfRegistry,
+) -> Result<(), SqlSurfaceError> {
+    if registry
+        .catalog_scope()
+        .is_some_and(|bound| bound != tenant_id)
+    {
+        registry.remove_catalog_entries();
+        return Err(load_failed());
+    }
+    let defs = crate::catalog::function::list_functions_in_source(read_txn, tenant_id)
+        .map_err(|_| load_failed())?;
+    load_defs_into(defs, STALE_GENERATION, tenant_id, registry)
+}
+
+/// [`load_into`]・[`load_from_snapshot`] が共有する登録本体。`generation` を束縛世代として記録する
+/// （登録を阻む非カタログ登録があれば `STALE_GENERATION` に置き換える）。
+fn load_defs_into(
+    mut defs: Vec<FunctionDef>,
+    generation: u64,
+    tenant_id: &str,
+    registry: &mut UdfRegistry,
+) -> Result<(), SqlSurfaceError> {
+    registry.remove_catalog_entries();
     defs.sort_by_key(|d| d.id);
 
     let mut pending: Vec<Pending> = Vec::new();

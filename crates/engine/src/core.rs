@@ -105,6 +105,9 @@ mod deferred_writer_tests;
 // 明示トランザクションの読み取り集合（SQL-38・Issue #2404）。
 #[cfg(test)]
 mod read_set_tests;
+// ダンプの matview 列構成検査がスナップショットを読むこと（Issue #3097）。
+#[cfg(test)]
+mod matview_dump_snapshot_tests;
 // commit 記録（SQL-38・Issue #2404）。
 #[cfg(test)]
 mod commit_log_tests;
@@ -4323,20 +4326,6 @@ impl EngineCore {
         self.storage.export_incremental(base, dest)
     }
 
-    /// 稼働中の永続ストレージのスキーマを DDL 文として書き出す（RECOVER-16 (1)・Issue #2160）。
-    /// 運用者の CLI（#2162）から呼ぶ入口で、[`Storage::export_schema_ddl`] へそのまま委譲する
-    /// （読み取りスナップショット上で動き、書き込みを止めない。SQL・NoSQL の表層からは呼べない）。
-    pub fn export_schema_ddl<E>(
-        &self,
-        scope: &crate::catalog::ddl_export::SchemaDdlScope,
-        sink: impl FnMut(&crate::catalog::ddl_export::DdlStatement<'_>) -> std::result::Result<(), E>,
-    ) -> std::result::Result<
-        crate::catalog::ddl_export::SchemaDdlSummary,
-        crate::catalog::ddl_export::SchemaDdlError<E>,
-    > {
-        self.storage.export_schema_ddl(scope, sink)
-    }
-
     /// 稼働中の永続ストレージの表データ（行）を COPY／INSERT 形式で書き出す（RECOVER-16・Issue #2161）。
     /// 運用者の CLI（#2162）から呼ぶ入口で、[`Storage::export_table_data`] へそのまま委譲する
     /// （読み取りスナップショット上で行を順に走査し、書き込みを止めない。SQL・NoSQL の表層からは呼べない）。
@@ -4352,6 +4341,74 @@ impl EngineCore {
         self.storage.export_table_data(scope, format, sink)
     }
 
+    /// 稼働中の永続ストレージのスキーマを DDL 文として書き出す（RECOVER-16 (1)・Issue #2160）。
+    /// 運用者の CLI（#2162）から呼ぶ入口。読み取りスナップショット上で動き（書き込みを止めない）、
+    /// マテリアライズド VIEW の列構成の検査（Issue #3097）を同じスナップショットの定義に対して挟む。
+    /// SQL・NoSQL の表層からは呼べない。
+    pub fn export_schema_ddl<E>(
+        &self,
+        scope: &crate::catalog::ddl_export::SchemaDdlScope,
+        sink: impl FnMut(&crate::catalog::ddl_export::DdlStatement<'_>) -> std::result::Result<(), E>,
+    ) -> std::result::Result<
+        crate::catalog::ddl_export::SchemaDdlSummary,
+        crate::catalog::ddl_export::SchemaDdlError<E>,
+    > {
+        self.storage.export_schema_ddl_checked(
+            scope,
+            |snap, defs| self.check_matview_columns_for_dump(snap, scope.tenant(), defs),
+            sink,
+        )
+    }
+
+    /// 論理ダンプの範囲内のマテリアライズド VIEW について、保存済みの列と本文から再導出した列の
+    /// 一致を確かめる。不一致・再導出の失敗は固定文言の `Unsupported`（存在を示す情報は含めない）。
+    ///
+    /// `defs` と `snap` は書き出しと同じ読み取りスナップショット（Storage の書き出し入口が、何かを
+    /// 出す前に渡す。Issue #3097）。基表・依存 VIEW・関数・型の解決も `snap` から行うため、取得後に
+    /// 別 writer が基表や定義を変えても、再導出は出力される旧スナップショットの状態に対して行われる。
+    ///
+    /// 本文がテナントの関数（UDF）を呼ぶ場合に備え、ダンプ対象のテナントを束縛したセッションへ
+    /// そのテナントの UDF カタログを読み込んでから導出する（復元側も文ごとにセッション UDF を
+    /// 更新し、関数を `PreData` でマテリアライズド VIEW より前に出すため、同じ条件になる）。
+    /// テナントを持たない範囲（共有のみ）は既定のセッションで導出する。
+    fn check_matview_columns_for_dump<E>(
+        &self,
+        snap: &redb::ReadTransaction,
+        tenant: Option<&str>,
+        defs: &[crate::catalog::materialized::MaterializedViewDef],
+    ) -> std::result::Result<(), crate::catalog::ddl_export::SchemaDdlError<E>> {
+        if defs.is_empty() {
+            return Ok(());
+        }
+        let mismatch = || {
+            crate::catalog::ddl_export::unsupported::<E>(
+                "materialized view",
+                "materialized view definition no longer matches its source columns",
+            )
+        };
+        let mut session = crate::sql::mode::SessionState::default();
+        if let Some(tenant) = tenant {
+            let ctx = PolicyContext::new(tenant).map_err(|_| mismatch())?;
+            // 関数の定義もダンプのスナップショットから読む（現在のカタログを見ない）。
+            if !session.bind_resolution_tenant(ctx.tenant_id()) {
+                return Err(mismatch());
+            }
+            crate::sql::udf_load::load_from_snapshot(snap, ctx.tenant_id(), session.udfs_mut())
+                .map_err(|_| mismatch())?;
+        }
+        for def in defs {
+            let view_columns = self
+                .view_output_columns_in(&session, &def.body_sql, &def.column_aliases, Some(snap))
+                .map_err(|_| mismatch())?;
+            let current = crate::sql::matview::column_defs_from_view_columns(&view_columns)
+                .map_err(|_| mismatch())?;
+            if current != def.columns {
+                return Err(mismatch());
+            }
+        }
+        Ok(())
+    }
+
     /// スキーマ（`PreData`）・表データ・スキーマ（`PostData`）を単一の読み取りスナップショットから
     /// この順に書き出す（RECOVER-16・Issue #2161）。[`Storage::export_logical_dump`] へそのまま委譲する
     /// （定義とデータが同じ commit 点に対応する。SQL・NoSQL の表層からは呼べない）。
@@ -4364,7 +4421,16 @@ impl EngineCore {
         crate::catalog::ddl_export::LogicalDumpSummary,
         crate::catalog::ddl_export::SchemaDdlError<E>,
     > {
-        self.storage.export_logical_dump(scope, format, sink)
+        // マテリアライズド VIEW は本文を `WITH NO DATA` で再実行して復元するため、保存済みの列構成と
+        // 本文から再導出した列構成がずれる定義（基表への `ADD COLUMN` 後の `SELECT *` 等）は、復元で
+        // 列構成・`REFRESH` のエラー契約が黙って変わる。出力と同じスナップショットの定義を検査し、
+        // ずれがあればダンプ全体を拒否する（fail-closed。Issue #3097）。
+        self.storage.export_logical_dump_checked(
+            scope,
+            format,
+            |snap, defs| self.check_matview_columns_for_dump(snap, scope.tenant(), defs),
+            sink,
+        )
     }
 
     /// 論理ダンプの復元指示（`RESTORE ...`。ロール・権限の状態。RECOVER-16・Issue #3096）を 1 件、`tenant` へ
@@ -11225,6 +11291,47 @@ impl EngineCore {
         column_aliases: &[String],
     ) -> Result<Vec<crate::sql::view_replace::ViewColumn>, crate::sql::allowlist::SqlSurfaceError>
     {
+        self.view_output_columns_in(session, body_sql, column_aliases, None)
+    }
+
+    /// [`Self::view_output_columns`] の本体。`snap` が `Some` のときは、基表・依存 VIEW の解決と
+    /// Describe の両方をその読み取りスナップショットから行う（論理ダンプの列構成検査。Issue #3097）。
+    /// `None` は従来どおり現在のカタログ（呼び出しごとに読み取りを開く）。
+    fn view_output_columns_in(
+        &self,
+        session: &crate::sql::mode::SessionState,
+        body_sql: &str,
+        column_aliases: &[String],
+        snap: Option<&redb::ReadTransaction>,
+    ) -> Result<Vec<crate::sql::view_replace::ViewColumn>, crate::sql::allowlist::SqlSurfaceError>
+    {
+        match snap {
+            Some(rt) => self.view_output_columns_with(
+                &crate::catalog::ViewWriteSnapshot::over(rt),
+                session,
+                body_sql,
+                column_aliases,
+                snap,
+            ),
+            None => self.view_output_columns_with(
+                &self.storage,
+                session,
+                body_sql,
+                column_aliases,
+                None,
+            ),
+        }
+    }
+
+    fn view_output_columns_with(
+        &self,
+        lookup: &impl crate::sql::allowlist::TableLookup,
+        session: &crate::sql::mode::SessionState,
+        body_sql: &str,
+        column_aliases: &[String],
+        snap: Option<&redb::ReadTransaction>,
+    ) -> Result<Vec<crate::sql::view_replace::ViewColumn>, crate::sql::allowlist::SqlSurfaceError>
+    {
         use crate::sql::allowlist::SqlSurfaceError;
         use crate::sql::exec::ColumnMeta;
         use crate::sql::view_replace::ViewColumn;
@@ -11235,11 +11342,10 @@ impl EngineCore {
             crate::sql::lexer::tokenize_stored_view_body(body_sql).map_err(|_| invalid_body())?;
         let kind = crate::sql::allowlist::classify_view_body(
             &tokens,
-            &self.storage,
+            lookup,
             crate::sql::allowlist::ViewBodyCheck::Resolved,
         )?;
-        let (statement, expected_names) = match crate::sql::view::body_output(&self.storage, kind)?
-        {
+        let (statement, expected_names) = match crate::sql::view::body_output(lookup, kind)? {
             crate::sql::view::BodyOutput::Statement(body) => (*body, None),
             // 単純形本文は `LIMIT` を持たず、読み取り文として検証するには `LIMIT` が要る。
             // Describe は本文を実行しないため、検証用に `LIMIT 1` を足した写しで型を得る。
@@ -11250,18 +11356,19 @@ impl EngineCore {
                 ));
                 limited.push(crate::sql::lexer::Token::Number("1".to_string()));
                 (
-                    crate::sql::allowlist::validate_sql_tokens(&limited, &self.storage)?,
+                    crate::sql::allowlist::validate_sql_tokens(&limited, lookup)?,
                     Some(names),
                 )
             }
         };
         let metas = self
-            .describe_parsed_in_session_impl(
+            .describe_parsed_in_session_snap(
                 session,
                 &ParsedSql::Statement(statement),
                 &crate::sql::parser::LiteralSkip::NONE,
                 &[],
                 &crate::result_limits::ResultLimits::default(),
+                snap,
             )?
             .ok_or_else(invalid_body)?;
         let mut columns: Vec<ViewColumn> = metas

@@ -16,6 +16,7 @@ use std::path::PathBuf;
 use engine::catalog::ddl_export::{
     LogicalDumpItem, SchemaDdlError, SchemaDdlScope, TableDataFormat, TableDataPart,
 };
+use engine::core::EngineCore;
 use engine::storage::Storage;
 
 use crate::dump_file::{FileError, FileWriter, Header, StmtKind};
@@ -132,13 +133,15 @@ pub fn dump(args: &DumpArgs, leftover: &mut Option<PathBuf>) -> Result<DumpSumma
     if std::fs::symlink_metadata(&args.out).is_ok() {
         return Err(DumpError::Tmp(TmpError::InvalidDestination));
     }
-    let core = Storage::open(&args.db).map_err(|e| {
+    let storage = Storage::open(&args.db).map_err(|e| {
         if crate::backup_opt::is_already_open(&e) {
             DumpError::InUse
         } else {
             DumpError::OpenFailed
         }
     })?;
+    // マテリアライズド VIEW の列構成の検査（Issue #3097）は SQL 層を持つ `EngineCore` の入口にある。
+    let core = EngineCore::from_storage(storage, engine::search_engine::default_engine());
     let mut tmp = TempFile::create(parent, "fandhe-dump").map_err(DumpError::Tmp)?;
     let result = write_and_publish(&core, args, &mut tmp);
     if let Err(p) = tmp.remove() {
@@ -149,7 +152,7 @@ pub fn dump(args: &DumpArgs, leftover: &mut Option<PathBuf>) -> Result<DumpSumma
 }
 
 fn write_and_publish(
-    core: &Storage,
+    core: &EngineCore,
     args: &DumpArgs,
     tmp: &mut TempFile,
 ) -> Result<DumpSummary, DumpError> {

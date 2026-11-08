@@ -10,6 +10,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use redb::{ReadableTable, TableDefinition};
 
+use super::super::materialized::{
+    decode_materialized_view_def, tenant_has_entity_in, MaterializedViewDef,
+    MATERIALIZED_VIEWS_TABLE,
+};
 use super::super::sequence::{list_sequence_definitions_in, sequence_state_in};
 use super::super::{
     decode_enum_type_def, decode_index_def, decode_view_def, get_table_schema_in_txn_impl,
@@ -18,7 +22,8 @@ use super::super::{
 };
 use super::quote::{literal, push_ident, KeyScope};
 use super::table::{
-    render_create_index, render_create_table, render_create_view, render_foreign_key, SequenceMap,
+    render_create_index, render_create_materialized_view, render_create_table, render_create_view,
+    render_foreign_key, SequenceMap,
 };
 use super::{access, unsupported, Ctx, DdlObjectKind, DdlSection, Emitter, SchemaDdlError};
 
@@ -118,9 +123,60 @@ pub(super) fn export_pre_data<E>(
     export_standalone_sequences(ctx, out, &seqs)?;
     export_tables(ctx, out, &seqs, &mut consumed)?;
     ensure_owned_sequences_consumed(ctx, &seqs, &consumed)?;
-    reject_materialized_views(ctx)?;
-    export_views(ctx, out)?;
+    // マテリアライズド VIEW の `WITH NO DATA` は本文を解析して列型を保存するため、問合せが呼ぶ
+    // テナント関数が先に在る必要がある。マテリアライズド VIEW とそれを読む VIEW は関数の後ろへ回す。
+    export_views(ctx, out, false)?;
     access::export_functions(ctx, out)?;
+    export_views(ctx, out, true)?;
+    Ok(())
+}
+
+/// 論理ダンプの末尾（`PostData` の後）に出す、マテリアライズド VIEW の再計算（`REFRESH`）。
+/// スキーマだけの書き出し（`Storage::export_schema_ddl`）では呼ばない（表が空のまま
+/// 「実体化済み」にすると、元の未実体化の状態より緩くなるため）。Issue #3097。
+pub(super) fn export_matview_refreshes<E>(
+    ctx: &Ctx<'_>,
+    out: &mut Emitter<'_, E>,
+) -> Result<(), SchemaDdlError<E>> {
+    // 共有の `populated` は他テナントの REFRESH でも変わるため使わず、選択したテナント自身の
+    // 実体があるものだけ出す（`export_sequence_values` が自テナントの状態行だけを見るのと同じ扱い）。
+    let Some(tenant) = ctx.scope.tenant() else {
+        return Ok(());
+    };
+    let (ordered, deps) = view_like_order_with_deps::<E>(ctx)?;
+    // 依存先まで含めた再計算可否の検査用。トポロジカル順に、実体を持たない matview か、
+    // そうしたものを（VIEW 経由を含め）読む定義を「未実体化に依存」として印を付ける。
+    // 実体を持つ matview がこの印を持つと、復元先の `REFRESH` が未実体化の relation を読んで
+    // 失敗する（55000）ため、復元不能なダンプを正常出力せず全体を失敗させる。
+    let mut tainted: BTreeSet<String> = BTreeSet::new();
+    for (key, kind) in &ordered {
+        let reads_tainted = deps
+            .get(key)
+            .is_some_and(|ds| ds.iter().any(|r| tainted.contains(r)));
+        if matches!(kind, ViewLike::Materialized(_)) {
+            if tenant_has_entity_in(ctx.rt, key, tenant)? {
+                if reads_tainted {
+                    return Err(unsupported(
+                        "materialized view",
+                        "populated materialized view depends on an unpopulated materialized view",
+                    ));
+                }
+                let sql = format!(
+                    "REFRESH MATERIALIZED VIEW {}",
+                    ctx.namer.qualified_required::<E>(key)?
+                );
+                out.emit(
+                    DdlSection::PostData,
+                    DdlObjectKind::MaterializedViewRefresh,
+                    &sql,
+                )?;
+            } else {
+                tainted.insert(key.clone());
+            }
+        } else if reads_tainted {
+            tainted.insert(key.clone());
+        }
+    }
     Ok(())
 }
 
@@ -191,33 +247,30 @@ fn export_standalone_sequences<E>(
     out: &mut Emitter<'_, E>,
     seqs: &SequenceMap,
 ) -> Result<(), SchemaDdlError<E>> {
+    // 出力順は SCHEMA の内部 ID ではなく描画名（SCHEMA 名, 名前）で決める（往復で同じ DDL 列にする）。
+    let mut targets = Vec::new();
     for (key, (def, owner)) in seqs {
         if owner.is_some() || !in_scope(ctx, key)? {
             continue;
         }
-        if !matches!(ctx.namer.scope::<E>(key)?, KeyScope::Shared) {
-            // `CREATE SEQUENCE` は SCHEMA 修飾名を受理しないため、SCHEMA 配下の単独 SEQUENCE は戻せない。
-            return Err(unsupported(
-                "sequence",
-                "schema-scoped standalone sequence cannot be recreated by SQL",
-            ));
-        }
+        targets.push((ctx.namer.sort_key::<E>(key)?, key, def));
+    }
+    targets.sort_by(|a, b| a.0.cmp(&b.0));
+    for (_, key, def) in targets {
+        // 共有は `"name"`、SCHEMA 配下は引用符なしの `schema.name`（SCHEMA 修飾名は引用符付きを受理しない）。
+        let name = ctx.namer.qualified_required::<E>(key)?;
         let p = &def.params;
-        let mut s = String::from("CREATE SEQUENCE ");
-        push_ident(&mut s, key)?;
-        s.push_str(&format!(
-            " START WITH {} INCREMENT BY {} MINVALUE {} MAXVALUE {} {}",
+        let s = format!(
+            "CREATE SEQUENCE {name} START WITH {} INCREMENT BY {} MINVALUE {} MAXVALUE {} {}",
             p.start,
             p.increment,
             p.min_value,
             p.max_value,
             if p.cycle { "CYCLE" } else { "NO CYCLE" }
-        ));
+        );
         out.emit(DdlSection::PreData, DdlObjectKind::Sequence, &s)?;
         if def.restart_value != p.start {
-            let mut r = String::from("ALTER SEQUENCE ");
-            push_ident(&mut r, key)?;
-            r.push_str(&format!(" RESTART WITH {}", def.restart_value));
+            let r = format!("ALTER SEQUENCE {name} RESTART WITH {}", def.restart_value);
             out.emit(DdlSection::PreData, DdlObjectKind::Sequence, &r)?;
         }
     }
@@ -268,40 +321,57 @@ fn ensure_owned_sequences_consumed<E>(
     Ok(())
 }
 
-/// マテリアライズド VIEW は定義と実体（文脈ごとの行）が別で、実体を DDL へ戻す手段が無いため、
-/// 1 件でもあれば書き出せない（黙って省かない）。
-fn reject_materialized_views<E>(ctx: &Ctx<'_>) -> Result<(), SchemaDdlError<E>> {
-    // 他の種別と同じく relation キーの所属で絞る。範囲内（共有分を選んだときの共有、または選択した
-    // テナントの SCHEMA 配下）に 1 件でもあれば失敗し、範囲外（他テナント）は存在を示さず無視する。
-    for (k, _) in read_str_table::<E>(ctx, super::super::materialized::MATERIALIZED_VIEWS_TABLE)? {
-        if in_scope(ctx, &k)? {
-            return Err(unsupported(
-                "materialized view",
-                "materialized views cannot be recreated by the schema dump",
-            ));
-        }
-    }
-    Ok(())
+/// VIEW とマテリアライズド VIEW のどちらか（依存順の 1 要素）。
+enum ViewLike {
+    View(ViewDef),
+    Materialized(MaterializedViewDef),
 }
 
-/// 範囲内の VIEW。ビューが参照するビューを先に出す（トポロジカル順）。
-fn export_views<E>(ctx: &Ctx<'_>, out: &mut Emitter<'_, E>) -> Result<(), SchemaDdlError<E>> {
-    let mut pending: BTreeMap<String, ViewDef> = BTreeMap::new();
+/// 範囲内の VIEW・マテリアライズド VIEW を、読む relation を先に出すトポロジカル順で返す
+/// （VIEW が matview を、matview が VIEW・matview を読めるため 1 つの依存グラフで並べる）。
+/// 準備できたものは描画名の順に出す。導出できない本文・循環は全体を失敗させる。
+/// 並び順に加えて、各定義が読む relation の一覧（依存辺）も返す。
+/// 出力順の分割（`export_views`）と matview の再計算可否の検査（`export_matview_refreshes`）が使う。
+#[allow(clippy::type_complexity)]
+fn view_like_order_with_deps<E>(
+    ctx: &Ctx<'_>,
+) -> Result<(Vec<(String, ViewLike)>, BTreeMap<String, Vec<String>>), SchemaDdlError<E>> {
+    let mut pending: BTreeMap<String, ViewLike> = BTreeMap::new();
     for (k, v) in read_str_table::<E>(ctx, VIEWS_TABLE)? {
         if in_scope(ctx, &k)? {
-            pending.insert(k, decode_view_def(&v)?);
+            pending.insert(k, ViewLike::View(decode_view_def(&v)?));
         }
     }
-    // 各 VIEW が読む relation をすべて集める。保存済み本文の構文検証（DROP の依存列挙と同じ
+    for (k, v) in read_str_table::<E>(ctx, MATERIALIZED_VIEWS_TABLE)? {
+        if in_scope(ctx, &k)? {
+            // `CREATE MATERIALIZED VIEW` は SCHEMA 修飾名を受理しない（共有にしか作れない）ため、
+            // SCHEMA 配下の定義は戻せない。デコードより前に、固定文言で全体を失敗させる。
+            if matches!(ctx.namer.scope::<E>(&k)?, KeyScope::Tenant { .. }) {
+                return Err(unsupported(
+                    "materialized view",
+                    "schema-scoped materialized view cannot be recreated by SQL",
+                ));
+            }
+            let def = decode_materialized_view_def(&k, &v)?;
+            pending.insert(k, ViewLike::Materialized(def));
+        }
+    }
+    // 各定義が読む relation をすべて集める。保存済み本文の構文検証（DROP の依存列挙と同じ
     // `view_body_relations`）で UNION／INTERSECT／EXCEPT の各枝・JOIN・部分問い合わせ・CTE の参照まで得る。
     // 導出できない本文は、並べ方を推測せず全体を失敗させる。
     let mut deps: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (k, d) in &pending {
-        let mut rels = view_body_relations(&d.body_sql)
-            .map_err(|_| unsupported("view", "view body references cannot be determined"))?;
-        rels.push(d.base_relation.clone());
+        let (body, mut rels) = match d {
+            ViewLike::View(v) => (&v.body_sql, vec![v.base_relation.clone()]),
+            ViewLike::Materialized(m) => (&m.body_sql, m.base_relations.clone()),
+        };
+        rels.extend(
+            view_body_relations(body)
+                .map_err(|_| unsupported("view", "view body references cannot be determined"))?,
+        );
         deps.insert(k.clone(), rels);
     }
+    let mut ordered = Vec::with_capacity(pending.len());
     while !pending.is_empty() {
         let mut ready: Vec<((String, String), String)> = Vec::new();
         for k in pending.keys() {
@@ -318,8 +388,65 @@ fn export_views<E>(ctx: &Ctx<'_>, out: &mut Emitter<'_, E>) -> Result<(), Schema
         ready.sort();
         for (_, key) in ready {
             if let Some(def) = pending.remove(&key) {
-                let sql = render_create_view(ctx, &key, &def)?;
+                ordered.push((key, def));
+            }
+        }
+    }
+    Ok((ordered, deps))
+}
+
+/// 範囲内のマテリアライズド VIEW の定義を返す（論理ダンプ前の列構成の照合用。Issue #3097）。
+/// SCHEMA 配下の定義は戻せないため、`view_like_order_with_deps` と同じく固定文言で全体を失敗させる。
+pub(super) fn in_scope_materialized_defs<E>(
+    ctx: &Ctx<'_>,
+) -> Result<Vec<MaterializedViewDef>, SchemaDdlError<E>> {
+    let mut out = Vec::new();
+    for (k, v) in read_str_table::<E>(ctx, MATERIALIZED_VIEWS_TABLE)? {
+        if in_scope(ctx, &k)? {
+            if matches!(ctx.namer.scope::<E>(&k)?, KeyScope::Tenant { .. }) {
+                return Err(unsupported(
+                    "materialized view",
+                    "schema-scoped materialized view cannot be recreated by SQL",
+                ));
+            }
+            out.push(decode_materialized_view_def(&k, &v)?);
+        }
+    }
+    Ok(out)
+}
+
+/// 範囲内の VIEW とマテリアライズド VIEW。読む relation を先に出す（トポロジカル順）。
+/// マテリアライズド VIEW は `WITH NO DATA`（実体は運ばない）で出す。
+/// `after_functions` が偽なら関数より前に出す分（マテリアライズド VIEW に依存しない VIEW）、
+/// 真なら関数の後ろに出す分（マテリアライズド VIEW と、それを（推移的に）読む VIEW）。
+fn export_views<E>(
+    ctx: &Ctx<'_>,
+    out: &mut Emitter<'_, E>,
+    after_functions: bool,
+) -> Result<(), SchemaDdlError<E>> {
+    let (ordered, deps) = view_like_order_with_deps::<E>(ctx)?;
+    // トポロジカル順に、マテリアライズド VIEW かそれを読む定義へ印を付ける。
+    let mut deferred: BTreeSet<String> = BTreeSet::new();
+    for (key, def) in &ordered {
+        let reads_deferred = deps
+            .get(key)
+            .is_some_and(|ds| ds.iter().any(|r| deferred.contains(r)));
+        if reads_deferred || matches!(def, ViewLike::Materialized(_)) {
+            deferred.insert(key.clone());
+        }
+    }
+    for (key, def) in ordered {
+        if deferred.contains(&key) != after_functions {
+            continue;
+        }
+        match def {
+            ViewLike::View(v) => {
+                let sql = render_create_view(ctx, &key, &v)?;
                 out.emit(DdlSection::PreData, DdlObjectKind::View, &sql)?;
+            }
+            ViewLike::Materialized(m) => {
+                let sql = render_create_materialized_view(ctx, &key, &m)?;
+                out.emit(DdlSection::PreData, DdlObjectKind::MaterializedView, &sql)?;
             }
         }
     }
@@ -343,15 +470,32 @@ fn export_foreign_keys<E>(
 
 /// 範囲内の索引宣言。
 fn export_indexes<E>(ctx: &Ctx<'_>, out: &mut Emitter<'_, E>) -> Result<(), SchemaDdlError<E>> {
+    let mut matviews: Option<BTreeMap<String, MaterializedViewDef>> = None;
     for def in index_defs::<E>(ctx)? {
-        // 対象が表でない索引（マテリアライズド VIEW 上など）は戻せない。
+        // 対象が表でなければマテリアライズド VIEW の定義を引く（どちらでもなければ戻せない）。
         let table = match get_table_schema_in_txn_impl(ctx.rt, &def.table, true) {
             Ok(t) => t,
             Err(CatalogError::TableNotFound(_)) => {
-                return Err(unsupported(
-                    "index",
-                    "index on a relation that is not a table",
-                ));
+                if matviews.is_none() {
+                    let mut m = BTreeMap::new();
+                    for (k, v) in read_str_table::<E>(ctx, MATERIALIZED_VIEWS_TABLE)? {
+                        // 他テナントの SCHEMA 範囲のキーは値を読まずに無視する（壊れた定義で
+                        // このテナントのダンプが失敗しない・存在を示さない）。
+                        if !in_scope(ctx, &k)? {
+                            continue;
+                        }
+                        let d = decode_materialized_view_def(&k, &v)?;
+                        m.insert(k, d);
+                    }
+                    matviews = Some(m);
+                }
+                let Some(mv) = matviews.as_ref().and_then(|m| m.get(&def.table)) else {
+                    return Err(unsupported(
+                        "index",
+                        "index on a relation that is neither a table nor a materialized view",
+                    ));
+                };
+                TableSchema::new(def.table.clone(), mv.columns.clone())
             }
             Err(e) => return Err(e.into()),
         };
@@ -370,17 +514,22 @@ fn export_sequence_values<E>(
     let Some(tenant) = ctx.scope.tenant() else {
         return Ok(());
     };
+    let mut targets = Vec::new();
     for (key, (def, _)) in seqs {
         // 他テナントの SCHEMA 配下の SEQUENCE は存在を示さず飛ばす。
         if matches!(ctx.namer.scope::<E>(key)?, KeyScope::Foreign) {
             continue;
         }
-        // 共有の SEQUENCE は共有分を選んでいなくても、選択したテナントの現在値は出す。
+        targets.push((ctx.namer.sort_key::<E>(key)?, key, def));
+    }
+    // 出力順は描画名で決める（SCHEMA の内部 ID に依存させない）。
+    targets.sort_by(|a, b| a.0.cmp(&b.0));
+    for (_, key, def) in targets {
+        // 共有の SEQUENCE は共有分を選んでいなくても、選択したテナントの現在値は出す。状態行は
+        // テナント指定で引くため、他テナントの現在値は読まない。
         let Some((last, called)) = sequence_state_in(ctx.rt, tenant, def.id)? else {
             continue;
         };
-        // `setval` は SCHEMA 修飾名・引用符付きの名前を受理しないため、現在値を持つ SCHEMA 配下の
-        // SEQUENCE の現在値は戻せない（現在値を持たなければ出す文が無く、省略にならない）。
         let arg = ctx
             .namer
             .sequence_arg::<E>(key)?
