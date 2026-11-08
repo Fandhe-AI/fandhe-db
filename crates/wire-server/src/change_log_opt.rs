@@ -16,6 +16,7 @@
 //!   アーカイブが進めば再開する。`--change-log-archive-dir` なしは起動拒否。アーカイブ先を指定した起動では
 //!   バイト上限に実装既定値（[`DEFAULT_MAX_UNARCHIVED_BYTES`]。spec 由来ではない）を適用する
 //! - `change-log-verify` サブコマンド: アーカイブの欠落・改ざんの検査（[`parse_verify`]）
+//! - `change-log-disable` サブコマンド: 停止中の DB の変更ログの無効化（[`parse_disable`]。Issue #3093・D13）
 //!
 //! 重複指定・不正値・組み合わせの不備は起動拒否で、エラー文は固定の英語（パス・値を含まない）。
 //! 一度有効にした DB をフラグなしで起動すると、レコードが欠けたまま世代が進む（LSN の欠落）ため、
@@ -31,7 +32,7 @@ pub const FLAG: &str = "--change-log";
 pub const DUPLICATE_MESSAGE: &str = "--change-log specified more than once";
 
 /// 一度有効にした DB をフラグなしで起動したときに拒否する固定文言（LSN の欠落を作らない）。
-pub const REQUIRED_MESSAGE: &str = "this database has a change log: restart with --change-log (writing without it would leave a gap in the log)";
+pub const REQUIRED_MESSAGE: &str = "this database has a change log: restart with --change-log (writing without it would leave a gap in the log), or disable the change log with `wire-server change-log-disable`";
 
 /// 有効化に成功したときに stderr へ出す固定文言（運用者向けの状態表示）。
 pub const ENABLED_MESSAGE: &str = "change log enabled (without --change-log-archive-dir the log is not archived and grows inside the database; point-in-time recovery is not available yet)";
@@ -296,6 +297,65 @@ pub fn parse_verify(args: &[String]) -> Result<VerifyArgs, String> {
     Ok(VerifyArgs { dir, db })
 }
 
+/// `change-log-disable` の終了コード: 引数の不備（DB は開いていない）。
+pub const EXIT_DISABLE_USAGE: u8 = 2;
+/// `change-log-disable` の終了コード: 実行時の失敗（未アーカイブ・未有効化・使用中・開けない等）。
+pub const EXIT_DISABLE_FAILED: u8 = 1;
+
+/// 未アーカイブの破棄を許可するスイッチ名。
+pub const DISCARD_UNARCHIVED_FLAG: &str = "--discard-unarchived";
+
+/// 無効化に成功したときに stdout へ出す固定文言（件数・LSN・パスを含めない）。
+pub const DISABLED_MESSAGE: &str = "change log disabled (existing backups and archives no longer chain to this database; take a new full backup, and use a new archive directory if you re-enable)";
+
+/// 検証済みの `change-log-disable` サブコマンド引数。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisableArgs {
+    /// 無効化する停止中の DB。
+    pub db: PathBuf,
+    /// 未アーカイブのレコードを破棄して無効化するか（既定は拒否）。
+    pub discard_unarchived: bool,
+}
+
+/// `change-log-disable` サブコマンドの引数（サブコマンド名より後ろ）を解釈する。未知の引数・値欠落・
+/// 重複・必須欠落は拒否する（エラー文は英語の固定文言で、パスを含まない）。
+pub fn parse_disable(args: &[String]) -> Result<DisableArgs, String> {
+    let mut db: Option<&str> = None;
+    let mut discard = false;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--db" => {
+                if db.is_some() {
+                    return Err(duplicate(arg));
+                }
+                match it.next() {
+                    Some(v) => db = Some(v.as_str()),
+                    None => return Err(format!("{arg} requires a value")),
+                }
+            }
+            DISCARD_UNARCHIVED_FLAG => {
+                if discard {
+                    return Err(duplicate(arg));
+                }
+                discard = true;
+            }
+            _ => return Err(
+                "unknown argument (usage: change-log-disable --db <path> [--discard-unarchived])"
+                    .into(),
+            ),
+        }
+    }
+    let Some(db) = db else {
+        return Err("change-log-disable requires --db".into());
+    };
+    let db = crate::backup_opt::validate_db(db)?;
+    Ok(DisableArgs {
+        db,
+        discard_unarchived: discard,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -364,6 +424,41 @@ mod tests {
             assert!(!m.contains('{') && !m.contains('\n'));
         }
         assert!(REQUIRED_MESSAGE.contains(FLAG));
+        assert!(REQUIRED_MESSAGE.contains("change-log-disable"));
+        assert!(!DISABLED_MESSAGE.contains('{') && !DISABLED_MESSAGE.contains('\n'));
+    }
+
+    fn argv(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn parse_disable_requires_db_and_rejects_bad_arguments() {
+        for bad in [
+            argv(&[]),
+            argv(&["--discard-unarchived"]),
+            argv(&["--db"]),
+            argv(&["--db", "a", "--db", "b"]),
+            argv(&["--db", "a", "--discard-unarchived", "--discard-unarchived"]),
+            argv(&["--db", "a", "--bogus"]),
+            argv(&["--db", "/nonexistent/path/for/test.db"]),
+        ] {
+            assert!(parse_disable(&bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn parse_disable_accepts_an_existing_db_with_optional_discard() {
+        let dir = std::env::temp_dir().join(format!("fandhe-disable-parse-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let db = dir.join("x.db");
+        std::fs::write(&db, b"x").expect("file");
+        let p = db.to_str().expect("utf8");
+        let a = parse_disable(&argv(&["--db", p])).expect("ok");
+        assert!(!a.discard_unarchived);
+        let b = parse_disable(&argv(&["--discard-unarchived", "--db", p])).expect("ok");
+        assert!(b.discard_unarchived);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn v(a: &[&str]) -> Vec<String> {
