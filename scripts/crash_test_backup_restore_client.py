@@ -22,6 +22,7 @@ Issue #2178（RECOVER-15 ポインタ）のレプリケーション障害注入�
 - `fingerprint <table:pk>...`: 表ごとの列名と全行の sha256（キーセット方式でページング）。
 - `sync-append <start-id>`: synclog へ 1 行ずつ INSERT し `ACK <id>`。結果不明は `MAYBE <id>`。
 - `ids-present <table> <lo> <hi>`: lo..hi の id がすべて在るか（`PRESENT=<n>`）。
+- `churn-verify <id-base> <last-ack>`: `churn` の確認済み操作列から導いた docs・kv の期待状態と照合する。
 """
 
 import hashlib
@@ -268,6 +269,54 @@ def cmd_ids_present(sock, table, lo, hi):
     return 0 if n == hi - lo + 1 else 1
 
 
+def _body_value(i):
+    """`_body` が作る SQL リテラルに対応する、読み戻し時の値（NULL は None）。"""
+    lit = _body(i)
+    return None if lit == "NULL" else lit[1:-1].replace("''", "'")
+
+
+def cmd_churn_verify(sock, base, last):
+    """確認済み（ACK 済み）の最後の連番 `last` までの `churn` の結果が残っているかを検査する。
+
+    docs の最終行と kv の最終行の存在、および kv の UPDATE・DELETE 後の状態を照合する。
+    kill 時点で実行中だった次の操作（連番 last+1）が触れうる行（last と last-3）は
+    検査から外し、それ以外を厳密に確認する。
+    """
+    if last < 0:
+        return 0
+    rows = query(sock, "SELECT count(*) FROM docs WHERE id = %d" % (base + last))
+    if int(rows[0][0]) != 1:
+        print("MISSING docs %d" % (base + last), flush=True)
+        return 1
+    rows = query(sock, "SELECT count(*) FROM kv WHERE k = %d" % (base + last))
+    if int(rows[0][0]) != 1:
+        print("MISSING kv %d" % (base + last), flush=True)
+        return 1
+    lo = max(0, last - 12)
+    hi = last - 4
+    if hi < lo:
+        return 0
+    got = {}
+    for r in query(sock, "SELECT k, v, n FROM kv WHERE k >= %d AND k <= %d" % (base + lo, base + hi)):
+        got[int(r[0])] = (r[1], int(r[2]))
+    for j in range(lo, hi + 1):
+        k = base + j
+        if j % 5 == 0:
+            if k in got:
+                print("NOT-DELETED kv %d" % k, flush=True)
+                return 1
+            continue
+        if (j + 1) % 3 == 2:
+            want = ("u%d" % (j + 1), j + 1)
+        else:
+            want = (_body_value(j), j)
+        if got.get(k) != want:
+            print("MISMATCH kv %d got=%r want=%r" % (k, got.get(k), want), flush=True)
+            return 1
+    print("VERIFIED", last, flush=True)
+    return 0
+
+
 def main(argv):
     if len(argv) < 5:
         print("usage: client.py <seed|append|count> <port> <user> <password> [arg]", file=sys.stderr)
@@ -310,6 +359,8 @@ def main(argv):
         return cmd_sync_append(sock, int(argv[5]))
     elif cmd == "ids-present":
         return cmd_ids_present(sock, argv[5], int(argv[6]), int(argv[7]))
+    elif cmd == "churn-verify":
+        return cmd_churn_verify(sock, int(argv[5]), int(argv[6]))
     else:
         print("unknown subcommand", file=sys.stderr)
         return 2
