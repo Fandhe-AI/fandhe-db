@@ -192,6 +192,9 @@ pub(super) fn export_access_state<E>(
     emit_sorted(out, DdlObjectKind::Owner, owners)?;
 
     // ACL と関数 ACL の実体化印。
+    // 関数 ACL の実体化印は ACL 行より必ず先に出す（復元は文ごとに別 txn で commit するため、
+    // 文字列ソートの偶然に頼ると「印なしの関数 ACL 行」という中間状態が生じうる）。
+    let mut acl_init: Vec<String> = Vec::new();
     let mut acl: Vec<String> = Vec::new();
     for (object, e) in list_acl_for_tenant_in_txn(ctx.rt, tenant)? {
         acl.push(render_acl::<E>(
@@ -206,11 +209,14 @@ pub(super) fn export_access_state<E>(
         let sig = fn_sigs
             .get(&id)
             .ok_or_else(|| unsupported("privilege", "function outside the dump scope"))?;
-        acl.push(render_acl_init::<E>(sig)?);
+        acl_init.push(render_acl_init::<E>(sig)?);
     }
+    emit_sorted(out, DdlObjectKind::Privilege, acl_init)?;
     emit_sorted(out, DdlObjectKind::Privilege, acl)?;
 
     // 既定権限と、関数の既定権限の実体化印。
+    // 実体化印を既定権限行より先に出す（ソート順の偶然に依存しない）。
+    let mut defaults_init: Vec<String> = Vec::new();
     let mut defaults: Vec<String> = Vec::new();
     for row in list_default_acl_in_txn(ctx.rt, tenant)? {
         let schema = if row.schema_id == 0 {
@@ -234,8 +240,9 @@ pub(super) fn export_access_state<E>(
         )?);
     }
     for role_id in list_default_acl_init_in_txn(ctx.rt, tenant)? {
-        defaults.push(render_default_acl_init::<E>(role_name(role_id)?)?);
+        defaults_init.push(render_default_acl_init::<E>(role_name(role_id)?)?);
     }
+    emit_sorted(out, DdlObjectKind::DefaultPrivilege, defaults_init)?;
     emit_sorted(out, DdlObjectKind::DefaultPrivilege, defaults)?;
     Ok(())
 }

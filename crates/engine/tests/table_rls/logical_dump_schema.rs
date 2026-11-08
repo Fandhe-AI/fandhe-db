@@ -494,6 +494,39 @@ fn roles_and_privileges_round_trip_to_an_identical_dump() {
     assert!(c.bootstrapped);
 }
 
+/// 実体化印（関数 ACL・既定権限）は対応する ACL 行より必ず先に出力される（Issue #3096。
+/// 復元は文ごとに別 txn で commit するため、印なしの ACL 行という中間状態を作らない）。
+#[test]
+fn acl_init_markers_precede_their_acl_rows_in_the_dump() {
+    let p1 = unique_db_path("dump-priv-order");
+    let _g1 = CleanupGuard(p1.clone());
+    let src = open_core(&p1);
+    populate_access(&src, "tenant-a");
+    let lines: Vec<String> = dump_text(&src, "tenant-a")
+        .into_iter()
+        .map(|(_, s)| s)
+        .collect();
+    let pos = |pred: &dyn Fn(&str) -> bool| lines.iter().position(|l| pred(l));
+    let last_init = lines
+        .iter()
+        .rposition(|l| l.starts_with("RESTORE ACL INIT FUNCTION"))
+        .expect("init marker");
+    let first_fn_acl = pos(&|l| l.starts_with("RESTORE ACL FUNCTION")).expect("function acl row");
+    assert!(
+        last_init < first_fn_acl,
+        "function ACL init must come first"
+    );
+    let last_def_init = lines
+        .iter()
+        .rposition(|l| l.starts_with("RESTORE DEFAULT ACL INIT"))
+        .expect("default init marker");
+    let first_def = pos(&|l| l.starts_with("RESTORE DEFAULT ACL ROLE")).expect("default acl row");
+    assert!(
+        last_def_init < first_def,
+        "default ACL init must come first"
+    );
+}
+
 #[test]
 fn another_tenants_roles_and_privileges_never_reach_the_dump() {
     let p1 = unique_db_path("dump-priv-iso");
