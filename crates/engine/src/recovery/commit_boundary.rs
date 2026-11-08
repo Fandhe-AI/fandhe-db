@@ -42,6 +42,31 @@ thread_local! {
     /// ―― stale フラグによる誤 abort を防ぐための契約。[`ResponseBoundaryGuard`]
     /// のドキュメント参照）。[`ResponseBoundaryGuard`] の drop 時に読み取ってクリアする。
     static COMMIT_PENDING_RESPONSE: Cell<Option<u64>> = const { Cell::new(None) };
+
+    /// 同期レプリケーション（RECOVER-15。Issue #2245）の待機対象にする「この接続スレッドが
+    /// 応答前に commit した最大の LSN」（0 は無し）。変更ログ有効の commit が成功した直後に
+    /// [`record_pending_sync_lsn`] が `max` で記録し、wire 層の応答境界が
+    /// [`take_pending_sync_lsn`] で読み取りと同時にクリアする。非同期の既定経路で増える処理は
+    /// この Cell の書き込み 1 回だけで、待機は engine の外（書き込みゲートの permit 解放後）で行う。
+    static PENDING_SYNC_LSN: Cell<u64> = const { Cell::new(0) };
+}
+
+/// 変更ログ有効の commit が成功した LSN（= 世代 `g_c`）を同期待機の対象として記録する。
+/// 複数回 commit する 1 文（分割 DML 等）では最大値が残る。呼び出しは commit 成功後のみ。
+pub(crate) fn record_pending_sync_lsn(lsn: u64) {
+    PENDING_SYNC_LSN.with(|c| c.set(c.get().max(lsn)));
+}
+
+/// このスレッドが直近の応答境界以降に commit した最大 LSN を読み取りクリアする
+/// （wire-server の応答境界が同期レプリケーションの確認待ちの前に呼ぶ。RECOVER-15）。
+/// 変更ログが無効、または commit が無ければ `None`。
+pub fn take_pending_sync_lsn() -> Option<u64> {
+    let v = PENDING_SYNC_LSN.with(|c| c.replace(0));
+    if v == 0 {
+        None
+    } else {
+        Some(v)
+    }
 }
 
 /// commit 成功から wire 層の応答確定までの区間全体を覆う RAII ガード
@@ -323,6 +348,10 @@ pub(crate) fn commit_and_finish<T>(
                 if let Some(s) = session.as_ref() {
                     s.finish(g_c, record);
                 }
+                // 変更ログ有効の commit だけがレプリカへ流れるため、その LSN だけを同期待機の対象にする。
+                if capture.is_some() {
+                    record_pending_sync_lsn(g_c);
+                }
             }
             post_commit(v)
         },
@@ -483,6 +512,41 @@ mod tests {
         assert!(!should_abort(true, false));
         assert!(!should_abort(false, true));
         assert!(!should_abort(false, false));
+    }
+
+    // --- 同期レプリケーションの待機対象 LSN（Issue #2245・RECOVER-15 ポインタ）---
+
+    fn put_one(storage: &Storage, id: u64) {
+        let row = RowInput {
+            tenant_id: "tenant-a",
+            visibility: Visibility::Public,
+            embedding: &[1.0, 2.0],
+            metadata: &[],
+        };
+        storage.put(id, &row).expect("put");
+    }
+
+    #[test]
+    fn pending_sync_lsn_is_recorded_only_with_change_log_and_taken_once() {
+        let _ = take_pending_sync_lsn();
+        let path = unique_db_path("commit-boundary-sync-lsn-off");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open");
+        put_one(&storage, 1);
+        assert_eq!(take_pending_sync_lsn(), None, "change log disabled");
+
+        let path = unique_db_path("commit-boundary-sync-lsn-on");
+        let _cleanup2 = CleanupGuard(path.clone());
+        let mut storage = Storage::open(&path).expect("open");
+        storage.enable_change_log().expect("enable");
+        put_one(&storage, 1);
+        let first = take_pending_sync_lsn().expect("recorded");
+        assert_eq!(take_pending_sync_lsn(), None, "take clears");
+        // 応答前に 2 回 commit すると最大値が残る。
+        put_one(&storage, 2);
+        put_one(&storage, 3);
+        let max = take_pending_sync_lsn().expect("recorded");
+        assert!(max > first);
     }
 
     // --- ガードの正常系: disarm 済みなら drop しても abort しない ---
