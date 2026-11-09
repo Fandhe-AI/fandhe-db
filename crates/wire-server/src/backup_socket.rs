@@ -313,7 +313,10 @@ pub struct Response {
 /// 結果コードに対応する CLI 側の固定文言（応答の文字列を端末へ出さないため）。
 pub fn code_message(code: u8) -> &'static str {
     match code {
-        backup_opt::EXIT_USAGE => "the server rejected the output path or the destination exists",
+        backup_opt::EXIT_USAGE => {
+            "the server rejected the output path, the destination exists, or the output \
+             directory is shared or not owned by the server user"
+        }
         backup_opt::EXIT_PUBLISHED_UNVERIFIED => {
             "WARNING: the snapshot file was published but its durability could not be confirmed; \
              verify the output file before relying on it"

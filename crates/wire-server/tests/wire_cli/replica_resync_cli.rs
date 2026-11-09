@@ -301,3 +301,65 @@ fn recover15_resync_rejects_bad_arguments_before_doing_anything() {
     assert_eq!(std::fs::read(&existing).expect("read"), b"x");
     assert_no_temp(&ndir);
 }
+
+/// Issue #3135: 前回の異常終了が `--out` の親に残した作業ディレクトリ（0700・自分の所有・中身が `base.redb` だけ）
+/// を、次の `replica-resync` が掃除して報告する。モードが違うもの・未知の項目を含むもの・シンボリックリンクは
+/// 残る。今回の実行（プライマリに届かず失敗）も作業ディレクトリを残さない。
+#[test]
+fn recover15_resync_sweeps_stale_work_dirs_only_when_safe() {
+    use std::os::unix::fs::PermissionsExt;
+    let primary = Primary::start("resync-sweep");
+    let rdir = primary.dir.join("cred");
+    std::fs::create_dir(&rdir).expect("mkdir");
+    let cred = write_credentials(&rdir, 0o600);
+    let ndir = primary.dir.join("out");
+    std::fs::create_dir(&ndir).expect("mkdir");
+    std::fs::set_permissions(&ndir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+
+    let mk = |name: &str, mode: u32, files: &[(&str, u32)]| {
+        let p = ndir.join(name);
+        std::fs::create_dir(&p).expect("mkdir");
+        for (f, fm) in files {
+            let fp = p.join(f);
+            std::fs::write(&fp, b"x").expect("write");
+            std::fs::set_permissions(&fp, std::fs::Permissions::from_mode(*fm)).expect("chmod");
+        }
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).expect("chmod");
+    };
+    let nonce = "0123456789abcdef";
+    let stale = format!(".fandhe-replica-resync-4242-{nonce}-7.d");
+    let empty = format!(".fandhe-replica-resync-4242-{nonce}-8.d");
+    let wide = format!(".fandhe-replica-resync-4242-{nonce}-9.d");
+    let extra = format!(".fandhe-replica-resync-4242-{nonce}-10.d");
+    let link = format!(".fandhe-replica-resync-4242-{nonce}-11.d");
+    mk(&stale, 0o700, &[("base.redb", 0o600)]);
+    mk(&empty, 0o700, &[]);
+    mk(&wide, 0o750, &[("base.redb", 0o600)]);
+    mk(&extra, 0o700, &[("other.bin", 0o600)]);
+    std::os::unix::fs::symlink(ndir.join(&stale), ndir.join(&link)).expect("symlink");
+
+    // 届かない endpoint（閉じたポート）。ベースの取得までは進み、確認接続で失敗する。
+    let closed = {
+        let l = TcpListener::bind("127.0.0.1:0").expect("bind");
+        l.local_addr().expect("addr").to_string()
+    };
+    let new_db = ndir.join("replica.redb");
+    let o = run(&resync_args(&primary.sock, &new_db, &closed, &cred));
+    assert_ne!(o.status.code(), Some(0), "{:?}", o);
+    let err = String::from_utf8_lossy(&o.stderr).into_owned();
+    assert!(err.contains("removed 2 stale temporary file(s)"), "{err}");
+    assert!(err.contains(&stale) && err.contains(&empty), "{err}");
+    assert!(!ndir.join(&stale).exists() && !ndir.join(&empty).exists());
+    assert!(ndir.join(&wide).is_dir() && ndir.join(&extra).is_dir());
+    assert!(std::fs::symlink_metadata(ndir.join(&link)).is_ok());
+    assert!(!new_db.exists(), "nothing may be published");
+    // 今回の作業ディレクトリは残らない（残るのは意図して残した 3 つの項目だけ）。
+    let mut left: Vec<String> = std::fs::read_dir(&ndir)
+        .expect("read_dir")
+        .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+        .collect();
+    left.sort();
+    let mut want = vec![wide, extra, link];
+    want.sort();
+    assert_eq!(left, want);
+}

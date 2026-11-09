@@ -65,7 +65,7 @@ wire-server backup --socket <ソケットのパス> --out <新しい出力先の
 
 ### 2.4 一時名の残骸
 
-- 取得中の一時名は `.fandhe-snapshot-<pid>-<seq>.tmp`（`--out` と同じディレクトリ、0600）である
+- 取得中の一時ファイルは出力先の親に作る 0700 の作業ディレクトリ `.fandhe-snapshot-<pid>-<nonce>-<seq>.d` の中（`.fandhe-snapshot-*.tmp`、0600）に置く。保持 fd 経由で開き、公開の前後に inode を照合する。親が共有・他人所有なら何も作らず拒否する（Issue #3135。RECOVER-13 のポインタ）。残った作業ディレクトリは次の `backup` が自動で掃除する
 - 強制終了や電源断で残りうる。最終名には現れない
 - 残骸が見つかったら、該当の CLI・サーバーが動いていないことを確かめてから手動で削除する。中身は全テナントのデータのコピーである
 - 最終名が存在しなければ、残骸を残したまま同じ `--out` で取り直せる
@@ -315,7 +315,7 @@ wire-server change-log-verify --archive-dir <アーカイブ先> [--db <DB の�
 - 書き込み中のサーバーを SIGKILL して、DB が異常終了した状態を作る
 - `backup --db`・`restore` の実行中に CLI を SIGKILL する反復と、`--backup-socket` 経由の取得中にサーバーを SIGKILL する段を行い、次の点を確かめる
   - 最終名に不完全なファイルが現れないこと
-  - 残骸が一時名（`.fandhe-snapshot-*.tmp`・`.fandhe-restore-*.tmp`）だけであること（`.fandhe-restore-*.d` は次の restore が自動で掃除する）
+  - 残骸が一時名（`.fandhe-snapshot-*.d`・`.fandhe-restore-*.tmp`）だけであること（`.fandhe-restore-*.d` は次の restore が自動で掃除する）
   - 完成したバックアップと復元先が `verify` で終了コード 0 になり、サーバーで同じ件数を読めること
 - 公開前の段階で実際に kill できた回数を段ごとに数え、0 回なら失敗にする（空虚な成功を避けるため）
 

@@ -28,7 +28,9 @@ use crate::tls::client_handshake::PinnedServerCertificate;
 pub const EXIT_OK: u8 = 0;
 /// 終了コード: 実行時の失敗（ソケットへの依頼の失敗・プライマリに届かない・I/O）。
 pub const EXIT_FAILURE: u8 = backup_opt::EXIT_FAILURE;
-/// 終了コード: 引数・パスの拒否（何も開いておらず、どこにも接続していない）。
+/// 終了コード: 引数・パスの拒否（何も開いておらず、どこにも接続していない）。`--out` の親ディレクトリが共有
+/// （グループ・その他が書き込める）か他人所有の場合（`ResyncError::InsecureParent`。Issue #3135）も、何も作らず
+/// ソケットにもプライマリにも触れずにこのコードで拒否する。
 pub const EXIT_USAGE: u8 = backup_opt::EXIT_USAGE;
 /// 終了コード: 公開済みで中身は完全だが、後始末（一時名の削除・親ディレクトリの fsync）を確かめられない。
 pub const EXIT_NOT_FINALIZED: u8 = backup_opt::EXIT_PUBLISHED_UNVERIFIED;

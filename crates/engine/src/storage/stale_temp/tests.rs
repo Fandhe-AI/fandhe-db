@@ -243,6 +243,102 @@ fn mk_wd(dir: &Path, name: &str, mode: u32) -> PathBuf {
 }
 
 #[test]
+fn snapshot_and_resync_names_are_matched_strictly() {
+    for ok in [
+        ".fandhe-snapshot-1-0123456789abcdef-7.d",
+        ".fandhe-snapshot-4242-0123456789abcdef-18446744073709551615.d",
+    ] {
+        assert!(is_snapshot_work_dir_name(ok), "{ok}");
+        assert!(is_reserved_temp_name(ok), "{ok}");
+    }
+    for ok in [
+        ".fandhe-snapshot-1-0123456789abcdef-7.tmp",
+        // 旧形式（親直下に作っていた一時名）も残骸として受理する。
+        ".fandhe-snapshot-1-7.tmp",
+    ] {
+        assert!(is_snapshot_temp_name(ok), "{ok}");
+        assert!(is_reserved_temp_name(ok), "{ok}");
+    }
+    for bad in [
+        ".fandhe-snapshot-1-2.d",
+        ".fandhe-snapshot-1-0123456789ABCDEF-7.d",
+        ".fandhe-snapshot-1-0123456789abcdef-7.d.bak",
+        ".fandhe-snapshot-1-0123456789abcdef-7.tmp",
+        ".fandhe-snapshot-12345678901-0123456789abcdef-7.d",
+        ".fandhe-snapshot-1-0123456789abcdef-.d",
+        ".fandhe-restore-1-0123456789abcdef-7.d",
+    ] {
+        assert!(!is_snapshot_work_dir_name(bad), "{bad}");
+    }
+    for bad in [
+        ".fandhe-snapshot-1-0123456789abcdef-7.d",
+        ".fandhe-snapshot-1-xyz.tmp",
+        ".fandhe-snapshot-1-0123456789abcdef-7-9.tmp",
+        ".fandhe-snapshot-1-0123456789ABCDEF-7.tmp",
+        ".fandhe-snapshot-.tmp",
+        ".fandhe-snapshot-1-.tmp",
+    ] {
+        assert!(!is_snapshot_temp_name(bad), "{bad}");
+    }
+    let resync = ".fandhe-replica-resync-1-0123456789abcdef-7.d";
+    assert!(is_replica_resync_work_dir_name(resync));
+    assert!(is_reserved_temp_name(resync));
+    assert!(!is_replica_resync_work_dir_name(
+        ".fandhe-replica-resync-1-0123456789abcdef-7.redb"
+    ));
+    // 固定名のベースは作業ディレクトリの中だけで使い、予約名にはしない（サーバーの出力先検査に当たらない）。
+    assert!(is_replica_resync_base_name("base.redb"));
+    assert!(!is_replica_resync_base_name("base.redb.bak"));
+    assert!(!is_reserved_temp_name("base.redb"));
+}
+
+#[test]
+fn generated_names_match_their_predicates() {
+    let w = make_temp_name("fandhe-snapshot", 3, "d");
+    let t = make_temp_name("fandhe-snapshot", 4, "tmp");
+    let r = make_temp_name("fandhe-replica-resync", 5, "d");
+    assert!(is_snapshot_work_dir_name(&w), "{w}");
+    assert!(is_snapshot_temp_name(&t), "{t}");
+    assert!(is_replica_resync_work_dir_name(&r), "{r}");
+    assert!(!w.contains('/'));
+}
+
+fn is_base(n: &str) -> bool {
+    n == "base.bin"
+}
+
+fn never_temp(_: &str) -> bool {
+    false
+}
+
+#[test]
+fn work_dir_entries_use_their_own_predicate() {
+    let d = tdir("wd-entries");
+    let w = d.join(".w-1.d");
+    std::fs::create_dir(&w).expect("mkdir");
+    std::fs::set_permissions(&w, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    put(&w, "base.bin", 0o600);
+    // 親直下の項目は直下の判定（一致なし）に従い、触らない。
+    put(&d, "base.bin", 0o600);
+    let s = sweep_stale_temps_with_work_dir_entries(&d, never_temp, is_wd, is_base, &[])
+        .expect("sweep");
+    assert_eq!((s.removed, s.skipped, s.failed), (1, 0, 0));
+    assert!(!w.exists());
+    assert!(d.join("base.bin").exists());
+    // 中身の判定に一致しない項目を含む作業ディレクトリは触らず skipped に数える。
+    let w2 = d.join(".w-2.d");
+    std::fs::create_dir(&w2).expect("mkdir");
+    std::fs::set_permissions(&w2, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    put(&w2, "base.bin", 0o600);
+    put(&w2, "unknown", 0o600);
+    let s = sweep_stale_temps_with_work_dir_entries(&d, never_temp, is_wd, is_base, &[])
+        .expect("sweep");
+    assert_eq!((s.removed, s.skipped), (0, 1));
+    assert!(w2.join("base.bin").exists());
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
 fn restore_work_dir_names_are_matched_strictly() {
     for ok in [
         ".fandhe-restore-1-0123456789abcdef-7.d",

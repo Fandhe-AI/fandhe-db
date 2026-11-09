@@ -2239,8 +2239,9 @@ mod tests {
             t.insert("a", b"1".as_slice()).expect("insert");
         }
         do_commit(txn);
-        let dest = unique_db_path("change-log-snapshot-copy");
-        let _g2 = CleanupGuard(dest.clone());
+        // 出力先の親は共有でない（0700）ディレクトリにする（Issue #3135）。
+        let dest_dir = crate::test_util::temp_db::TempDir::new("change-log-snapshot-copy");
+        let dest = dest_dir.path().join("copy.redb");
         storage.export_snapshot(&dest).expect("export");
         let mut copy = super::super::Storage::open(&dest).expect("open copy");
         copy.enable_change_log().expect("enable on copy");

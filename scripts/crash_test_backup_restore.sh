@@ -14,7 +14,7 @@
 #   2. 基準の `backup`（無中断）を 1 回実行して所要時間を測り、整合・件数を確かめる。
 #   3. 取得中 kill: 基準時間の 0〜1.5 倍のランダム待機後に `backup` を SIGKILL する反復。
 #      最終名は「存在しない」か「存在して verify が通り基準と同じ件数」のどちらかで、
-#      元 DB も verify が通ること、残骸は一時名（`.fandhe-snapshot-*.tmp`）だけであることを検査する。
+#      元 DB も verify が通ること、残骸は 0700 の作業ディレクトリ（`.fandhe-snapshot-*.d`。Issue #3135）だけであることを検査する。
 #   4. 復元: 完成したバックアップを `restore` し、verify 0・サーバーで件数一致を確かめる。
 #   5. 復元中 kill: 手順 3 と同形（残骸は 0700 の作業ディレクトリ `.fandhe-restore-*.d`。Issue #3102）。
 #   6. 稼働中取得中のサーバー kill: `--backup-socket` 経由の取得中にサーバーを SIGKILL し、
@@ -346,7 +346,7 @@ i=0
 while should_continue "${i}" "${backup_hits}"; do
   i=$((i + 1))
   out="${BAK_DIR}/snap-${i}.redb"
-  tmp_before="$(count_tmp "${BAK_DIR}" '.fandhe-snapshot-*.tmp')"
+  tmp_before="$(count_tmp "${BAK_DIR}" '.fandhe-snapshot-*.d')"
   "${BIN}" backup --db "${SRC_DB}" --out "${out}" >/dev/null 2>&1 &
   job_pid=$!
   sleep_ms $((RANDOM % (backup_limit_ms + 1)))
@@ -357,7 +357,7 @@ while should_continue "${i}" "${backup_hits}"; do
   if [ "${status}" -eq 137 ]; then
     backup_killed=$((backup_killed + 1))
     # hit: 一時名が新たに作られていて（処理開始後）、最終名が無い（公開前）。
-    if [ ! -e "${out}" ] && [ "$(count_tmp "${BAK_DIR}" '.fandhe-snapshot-*.tmp')" -gt "${tmp_before}" ]; then
+    if [ ! -e "${out}" ] && [ "$(count_tmp "${BAK_DIR}" '.fandhe-snapshot-*.d')" -gt "${tmp_before}" ]; then
       backup_hits=$((backup_hits + 1))
     fi
   else
@@ -378,8 +378,8 @@ echo "backup kills: iterations=${i} killed=${backup_killed} hit_mid_run=${backup
 if [ "${backup_hits}" -lt 1 ]; then
   fail "no backup was killed after starting and before publishing (test is vacuous)"
 fi
-# 一時名の残骸は運用者が手動で消す前提（README）。ここで数えて報告し、後続のためにファイルは残す。
-backup_residue="$(find "${BAK_DIR}" -maxdepth 1 -name '.fandhe-snapshot-*.tmp' | wc -l)"
+# 作業ディレクトリの残骸は次の backup が自動掃除する（Issue #3135）。ここで数えて報告し、後続のためにファイルは残す。
+backup_residue="$(find "${BAK_DIR}" -maxdepth 1 -name '.fandhe-snapshot-*.d' | wc -l)"
 echo "backup temp residue files: ${backup_residue}"
 
 # ---------------------------------------------------------------------------
@@ -485,7 +485,7 @@ i=0
 while should_continue "${i}" "${live_interrupted}"; do
   i=$((i + 1))
   out="${LIVE_DIR}/live-${i}.redb"
-  tmp_before="$(count_tmp "${LIVE_DIR}" '.fandhe-snapshot-*.tmp')"
+  tmp_before="$(count_tmp "${LIVE_DIR}" '.fandhe-snapshot-*.d')"
   start_server "${LIVE_DB}" --backup-socket "${LIVE_SOCK}"
   "${BIN}" backup --socket "${LIVE_SOCK}" --out "${out}" >/dev/null 2>&1 &
   job_pid=$!
@@ -508,7 +508,7 @@ while should_continue "${i}" "${live_interrupted}"; do
   job_pid=""
   # hit: サーバー側が一時名を新たに作った（書き出し開始後）うえで、公開前（最終名なし）に
   # サーバーが消えた回。CLI の失敗終了だけでは接続前の kill と区別できないため判定に使わない。
-  if [ ! -e "${out}" ] && [ "$(count_tmp "${LIVE_DIR}" '.fandhe-snapshot-*.tmp')" -gt "${tmp_before}" ]; then
+  if [ ! -e "${out}" ] && [ "$(count_tmp "${LIVE_DIR}" '.fandhe-snapshot-*.d')" -gt "${tmp_before}" ]; then
     live_interrupted=$((live_interrupted + 1))
   fi
   if [ -e "${out}" ]; then

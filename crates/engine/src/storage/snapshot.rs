@@ -18,9 +18,14 @@
 //!
 //! - 出力先に何かが既にあれば書かずに拒否する（公開は `hard_link` で、既存の宛先を原子的に
 //!   拒否する。`rename` は置換するため使わない）
-//! - 一時名（同じディレクトリの隠しファイル）へ書き、完成後に最終名へ公開する。公開前の失敗は
-//!   Drop ガードが一時ファイルを消すため、最終名に不完全なファイルは残らない。`SIGKILL`
-//!   では一時名が残りうるが、最終名には残らない
+//! - 一時ファイルは出力先の親に作る 0700 の作業ディレクトリ（`work_dir`。名前は
+//!   `is_snapshot_work_dir_name`）の中へ書き、完成後に最終名へ公開する（Issue #3135）。
+//!   一時ファイルは保持 fd 経由のパス（Linux は `/proc/self/fd/<n>`）で開き、公開の前後に作業
+//!   ディレクトリと一時ファイルの同一性（dev・ino・長さ）を照合する。食い違えば何も公開せず
+//!   `TempReplaced`、公開後なら自分が作ったリンクを取り消す。親が共有か他人所有なら何も作らず
+//!   `InsecureParent`。公開前の失敗は Drop ガードが一時ファイルと（差し替えられていなければ）作業
+//!   ディレクトリを消すため、最終名に不完全なファイルは残らない。`SIGKILL` では作業ディレクトリが
+//!   残りうるが、最終名には残らず、次の `backup` が掃除する（`sweep_stale_temps_with_work_dirs`）
 //! - 未知の型の表・multimap 表があれば中止する（黙って欠落させない）
 //! - エラーの `Display` は固定の英語文言で、パス・表名・行の値を含めない
 
@@ -68,6 +73,14 @@ pub enum SnapshotExportError {
     Io(std::io::ErrorKind),
     /// 最終名への公開は済んだ（中身は完全）が、一時名の削除または親ディレクトリの fsync に失敗した。
     PublishedButNotFinalized,
+    /// 出力先の親ディレクトリにグループ・その他が書き込める（sticky bit があっても同じ）か、親の所有者が
+    /// 自分と異なる。一時ファイルの差し替えを防げないので、何も作らずに拒否した（Issue #3135）。
+    InsecureParent,
+    /// 作業ディレクトリまたは一時ファイルが、書き出し中に差し替えられた・消された。何も公開していない
+    /// （公開の直後に食い違いを見つけた場合は、自分が作ったリンクを取り消した）。
+    TempReplaced,
+    /// 公開先に、書いたものと異なる内容が残った（取り消しの削除にも失敗した）。手で消すこと。
+    UncheckedContentPublished,
 }
 
 impl fmt::Display for SnapshotExportError {
@@ -83,6 +96,13 @@ impl fmt::Display for SnapshotExportError {
             Self::Io(_) => "i/o error during snapshot export",
             Self::PublishedButNotFinalized => {
                 "snapshot published but cleanup of the temporary file failed"
+            }
+            Self::InsecureParent => "snapshot destination directory is shared or not owned by you",
+            Self::TempReplaced => {
+                "temporary snapshot was replaced or removed; nothing was published"
+            }
+            Self::UncheckedContentPublished => {
+                "WARNING: the destination holds content that was not checked; delete it manually"
             }
         })
     }
@@ -166,23 +186,45 @@ pub(super) fn export_snapshot(
 
 #[cfg(unix)]
 mod unix_impl {
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::fs::File;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::{copy_by_shape, BusyGuard, SnapshotExportError, SnapshotSummary};
-    use crate::storage::Storage;
+    use crate::storage::stale_temp::make_temp_name;
+    use crate::storage::work_dir::{WorkDir, WorkDirError};
+    use crate::storage::{Storage, TempDirLock};
     use redb::{ReadableDatabase, TableHandle};
 
     static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
-    /// 一時ファイルの削除ガード。公開（`hard_link`）前に失敗した場合に一時名を消す。
-    struct TempFileGuard {
+    fn io_err(e: std::io::Error) -> SnapshotExportError {
+        SnapshotExportError::Io(e.kind())
+    }
+
+    fn map_work(e: WorkDirError) -> SnapshotExportError {
+        match e {
+            WorkDirError::InsecureParent => SnapshotExportError::InsecureParent,
+            WorkDirError::Replaced => SnapshotExportError::TempReplaced,
+            WorkDirError::Invalid => SnapshotExportError::InvalidDestination,
+            WorkDirError::Io(k) => SnapshotExportError::Io(k),
+        }
+    }
+
+    /// 作業ディレクトリの中の一時ファイル。作成時に開いた fd を保持し、パスが同じ通常ファイルのままか
+    /// を照合する。公開前の drop で一時ファイルを消す。
+    struct TempFile {
+        /// 作業ディレクトリのアクセス用パス（Linux では保持 fd 経由）の下のパス。
         path: PathBuf,
+        /// 書き込みに使った fd と同じ inode を指す保持 fd（長さの照合用）。
+        fd: File,
+        dev: u64,
+        ino: u64,
         armed: bool,
     }
 
-    impl Drop for TempFileGuard {
+    impl Drop for TempFile {
         fn drop(&mut self) {
             if self.armed {
                 let _ = std::fs::remove_file(&self.path);
@@ -190,8 +232,78 @@ mod unix_impl {
         }
     }
 
-    fn io_err(e: std::io::Error) -> SnapshotExportError {
-        SnapshotExportError::Io(e.kind())
+    impl TempFile {
+        /// `access`（作業ディレクトリのアクセス用パス）に 0600 の一時ファイルを排他的に作り、書き込み用の
+        /// `File` と合わせて返す。一時名は最終名に依存させない（最終名が NAME_MAX 近くても収まる）。
+        fn create(access: &Path) -> Result<(Self, File), SnapshotExportError> {
+            let mut attempts = 0u32;
+            loop {
+                let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+                let p = access.join(make_temp_name("fandhe-snapshot", seq, "tmp"));
+                match std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&p)
+                {
+                    Ok(file) => {
+                        let m = file.metadata().map_err(io_err)?;
+                        let fd = file.try_clone().map_err(io_err)?;
+                        return Ok((
+                            Self {
+                                path: p,
+                                fd,
+                                dev: m.dev(),
+                                ino: m.ino(),
+                                armed: true,
+                            },
+                            file,
+                        ));
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempts < 8 => {
+                        attempts += 1;
+                    }
+                    Err(e) => return Err(io_err(e)),
+                }
+            }
+        }
+
+        /// `path`（リンクをたどらない）が保持 fd と同じ (dev, ino)・同じ長さの通常ファイルか。
+        fn is_same_file_at(&self, path: &Path) -> bool {
+            let (Ok(m), Ok(fd)) = (std::fs::symlink_metadata(path), self.fd.metadata()) else {
+                return false;
+            };
+            m.is_file() && m.dev() == self.dev && m.ino() == self.ino && m.len() == fd.len()
+        }
+    }
+
+    /// 親ディレクトリがグループ・その他から書き込めないことを、開いた fd の `fstat` で確かめる。
+    /// 何かを作る前に呼び、共有の親を最初に拒否する（所有者の照合は [`WorkDir::create`]）。
+    fn check_parent_not_shared(parent: &Path) -> Result<(), SnapshotExportError> {
+        let m = File::open(parent)
+            .and_then(|f| f.metadata())
+            .map_err(io_err)?;
+        if m.is_dir() && m.mode() & 0o022 == 0 {
+            Ok(())
+        } else {
+            Err(SnapshotExportError::InsecureParent)
+        }
+    }
+
+    /// テスト専用の差し替え注入点（状態を変えない読み取りだけの hook。本番のビルドには含めない）。
+    #[cfg(test)]
+    #[allow(clippy::items_after_test_module)]
+    pub(super) mod hook {
+        use std::cell::RefCell;
+        use std::path::Path;
+
+        /// 引数は (実パスの作業ディレクトリ, 実パスの一時ファイル)。公開直前の照合の前に呼ばれる。
+        pub(in crate::storage::snapshot) type Hook = Box<dyn Fn(&Path, &Path)>;
+
+        thread_local! {
+            pub(in crate::storage::snapshot) static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+        }
     }
 
     pub(super) fn export(
@@ -209,6 +321,8 @@ mod unix_impl {
             Ok(m) if m.is_dir() => {}
             _ => return Err(SnapshotExportError::InvalidDestination),
         }
+        // 共有の親は、何も作らずに拒否する。
+        check_parent_not_shared(parent)?;
         // 早期失敗のための確認。最終判定は後段の hard_link（確認後の競合を残さない）。
         if std::fs::symlink_metadata(dest).is_ok() {
             return Err(SnapshotExportError::DestinationExists);
@@ -224,35 +338,35 @@ mod unix_impl {
         }
         let _busy = BusyGuard(&storage.snapshot_export_busy);
 
-        // 一時ファイルは最終名と同じディレクトリに、所有者のみ読み書きで排他的に作る。
-        let mut attempts = 0u32;
-        let (file, tmp_path) = loop {
-            let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-            // 一時名は最終名に依存させない（最終名が NAME_MAX 近くても一時名は収まる）。
-            let p = parent.join(format!(".fandhe-snapshot-{}-{seq}.tmp", std::process::id()));
-            match std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&p)
-            {
-                Ok(f) => break (f, p),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempts < 8 => {
-                    attempts += 1;
-                }
-                Err(e) => return Err(io_err(e)),
-            }
-        };
-        let mut guard = TempFileGuard {
-            path: tmp_path.clone(),
-            armed: true,
-        };
+        // 掃除（排他 lock）との相互排他。取れなければ何も作らずに中止する（fail-closed）。
+        // drop の順序は宣言の逆（一時ファイル → 作業ディレクトリ → lock）。
+        let _lock = TempDirLock::shared(parent).map_err(SnapshotExportError::Io)?;
+        let mut work = WorkDir::create(parent, &mut || {
+            make_temp_name(
+                "fandhe-snapshot",
+                TMP_SEQ.fetch_add(1, Ordering::Relaxed),
+                "d",
+            )
+        })
+        .map_err(map_work)?;
+        let (mut tmp, file) = TempFile::create(work.access_path())?;
 
         let summary = write_all_tables(storage, file)?;
 
+        // 公開の直前に、作業ディレクトリと一時ファイルが作成時のままであることを照合する。
+        #[cfg(test)]
+        hook::HOOK.with(|h| {
+            if let Some(f) = h.borrow().as_ref() {
+                f(work.real_path(), &work.real_path_of(&tmp.path));
+            }
+        });
+        work.check().map_err(map_work)?;
+        if !tmp.is_same_file_at(&tmp.path) {
+            return Err(SnapshotExportError::TempReplaced);
+        }
+
         // 公開。宛先が存在すれば原子的に失敗する（上書きしない）。
-        match std::fs::hard_link(&tmp_path, dest) {
+        match std::fs::hard_link(&tmp.path, dest) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 return Err(SnapshotExportError::DestinationExists);
@@ -267,11 +381,27 @@ mod unix_impl {
                 });
             }
         }
-        // 公開済み。以降の失敗でも最終ファイルは完全なので消さない。
-        guard.armed = false;
-        let finalized = std::fs::remove_file(&tmp_path)
-            .and_then(|()| std::fs::File::open(parent).and_then(|d| d.sync_all()));
+        // 公開先が書いたファイルそのものでなければ（作業ディレクトリの差し替え等）、自分が作った
+        // リンクを取り消す。取り消せなければ警告用の種別で知らせる。
+        if !tmp.is_same_file_at(dest) {
+            return match std::fs::remove_file(dest) {
+                Ok(()) => Err(SnapshotExportError::TempReplaced),
+                Err(_) => Err(SnapshotExportError::UncheckedContentPublished),
+            };
+        }
+        // 公開済みで書いたファイルと一致した。以降の失敗でも最終ファイルは完全なので消さない。
+        tmp.armed = false;
+        let finalized = std::fs::remove_file(&tmp.path)
+            .map_err(|_| ())
+            .and_then(|()| work.check().map_err(|_| ()))
+            .and_then(|()| work.remove())
+            .and_then(|()| {
+                File::open(parent)
+                    .and_then(|d| d.sync_all())
+                    .map_err(|_| ())
+            });
         if finalized.is_err() {
+            work.disarm();
             return Err(SnapshotExportError::PublishedButNotFinalized);
         }
         Ok(summary)
@@ -607,5 +737,131 @@ mod tests {
             storage.export_snapshot(dir.path().join("b.redb")),
             Err(SnapshotExportError::TemporaryStorage)
         );
+    }
+
+    /// 親ディレクトリを `mode` の新しい一時ディレクトリにして、その中の `out.redb` を返す。
+    fn dir_with_mode(label: &str, mode: u32) -> (TempDir, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new(label);
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(mode)).unwrap();
+        let out = dir.path().join("out.redb");
+        (dir, out)
+    }
+
+    struct HookReset;
+    impl Drop for HookReset {
+        fn drop(&mut self) {
+            unix_impl::hook::HOOK.with(|h| *h.borrow_mut() = None);
+        }
+    }
+    fn set_hook(f: impl Fn(&std::path::Path, &std::path::Path) + 'static) -> HookReset {
+        unix_impl::hook::HOOK.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+        HookReset
+    }
+
+    #[test]
+    fn shared_parent_is_rejected_without_creating_anything() {
+        // 別のディレクトリに DB を置き、出力先の親だけを共有にする。
+        let src = TempDir::new("snap-shared-src");
+        let storage = open_storage(&src);
+        for mode in [0o777, 0o775, 0o757, 0o1777] {
+            let (dir, out) = dir_with_mode("snap-shared", mode);
+            assert_eq!(
+                storage.export_snapshot(&out),
+                Err(SnapshotExportError::InsecureParent),
+                "{mode:o}"
+            );
+            assert!(dir_entries(dir.path()).is_empty(), "{mode:o}");
+        }
+        // 共有でなければ成功し、親に最終名以外が残らない。
+        let (dir, out) = dir_with_mode("snap-private", 0o755);
+        storage.export_snapshot(&out).unwrap();
+        assert_eq!(dir_entries(dir.path()), ["out.redb"].map(String::from));
+    }
+
+    #[test]
+    fn replaced_temp_file_is_never_published() {
+        let src = TempDir::new("snap-swap-tmp-src");
+        let storage = open_storage(&src);
+        let (dir, out) = dir_with_mode("snap-swap-tmp", 0o700);
+        let _reset = set_hook(|_work, tmp| {
+            // 一時ファイルを別の inode に置き換える（名前の付け替え）。
+            let other = tmp.with_extension("other");
+            std::fs::write(&other, b"decoy").unwrap();
+            std::fs::rename(&other, tmp).unwrap();
+        });
+        assert_eq!(
+            storage.export_snapshot(&out),
+            Err(SnapshotExportError::TempReplaced)
+        );
+        assert!(!out.exists());
+        // 失敗後に一時ファイルも作業ディレクトリも残らない。
+        assert!(dir_entries(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn replaced_work_dir_is_never_published_and_not_removed() {
+        let src = TempDir::new("snap-swap-dir-src");
+        let storage = open_storage(&src);
+        let (dir, out) = dir_with_mode("snap-swap-dir", 0o700);
+        let moved = dir.path().join("moved-away");
+        let moved2 = moved.clone();
+        let _reset = set_hook(move |work, _tmp| {
+            // 作業ディレクトリを名前ごと別の場所へ移し、同名の空ディレクトリ（別の実体）に差し替える。
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::rename(work, &moved2).unwrap();
+            std::fs::create_dir(work).unwrap();
+            std::fs::set_permissions(work, std::fs::Permissions::from_mode(0o700)).unwrap();
+        });
+        assert_eq!(
+            storage.export_snapshot(&out),
+            Err(SnapshotExportError::TempReplaced)
+        );
+        assert!(!out.exists());
+        // 差し替え後の別のディレクトリは消さない（移した本物は一時ファイルごと残る）。
+        let names = dir_entries(dir.path());
+        assert_eq!(names.len(), 2, "{names:?}");
+        assert!(names
+            .iter()
+            .any(|n| crate::storage::is_snapshot_work_dir_name(n)));
+        assert!(moved.is_dir());
+    }
+
+    #[test]
+    fn success_and_failure_leave_no_work_dir() {
+        let src = TempDir::new("snap-clean-src");
+        let storage = open_storage(&src);
+        let (dir, out) = dir_with_mode("snap-clean", 0o700);
+        storage.export_snapshot(&out).unwrap();
+        assert_eq!(dir_entries(dir.path()), ["out.redb"].map(String::from));
+        // 既存の宛先で拒否された後も何も残らない。
+        assert_eq!(
+            storage.export_snapshot(&out),
+            Err(SnapshotExportError::DestinationExists)
+        );
+        assert_eq!(dir_entries(dir.path()), ["out.redb"].map(String::from));
+    }
+
+    #[test]
+    fn leftover_work_dir_is_swept_by_the_shared_cleanup() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, _out) = dir_with_mode("snap-sweep", 0o700);
+        let work = dir
+            .path()
+            .join(crate::storage::make_temp_name("fandhe-snapshot", 7, "d"));
+        let tmp = work.join(crate::storage::make_temp_name("fandhe-snapshot", 8, "tmp"));
+        std::fs::create_dir(&work).unwrap();
+        std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(&tmp, b"x").unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let sweep = crate::storage::sweep_stale_temps_with_work_dirs(
+            dir.path(),
+            crate::storage::is_snapshot_temp_name,
+            crate::storage::is_snapshot_work_dir_name,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(sweep.removed, 1);
+        assert!(dir_entries(dir.path()).is_empty());
     }
 }

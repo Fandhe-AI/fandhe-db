@@ -9,7 +9,10 @@
 //!
 //! 手順（fail-closed。どの失敗でも最終名へ何も公開しない）:
 //!
-//! 1. `--out` と同じディレクトリの一時名へ、バックアップソケット経由でフルバックアップを書かせる
+//! 0. `--out` の親が共有（グループ・その他が書き込める）か他人所有なら、何も作らずに拒否する。そうでなければ
+//!    親に 0700 の作業ディレクトリ（[`WorkDir`]。Issue #3135）を作り、以降の一時ベースへのアクセスは作業
+//!    ディレクトリの保持 fd 経由のパスで行い、各段の前後で作業ディレクトリと一時ベースの同一性を照合する
+//! 1. 作業ディレクトリの中の固定名 `base.redb` へ、バックアップソケット経由でフルバックアップを書かせる
 //! 2. 一時ファイルを整合検査する（矛盾・検査できない項目があれば公開しない）
 //! 3. ベースが変更ログと連続していることを確かめ、切り替え点（終点 LSN）を得る
 //! 4. プライマリへ確認接続する（Hello → Identity を照合 → Start(切り替え点) → Ok を受けたら Ack せず閉じる）。
@@ -24,6 +27,7 @@
 //! `unwrap`／`expect`／添字アクセスを使わない。エラー文は固定の英語で、パス・LSN・資格情報を含まない。
 #![cfg(unix)]
 
+use std::fs::File;
 use std::net::TcpStream;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
@@ -31,6 +35,7 @@ use std::time::Duration;
 
 use engine::storage::{IncrementalError, IntegrityOptions};
 
+use crate::dump_tmp::{self, TmpError, WorkDir};
 use crate::replica::{be_u64, classify_error, read_frame, write_frame, FrameError};
 use crate::replica_resync_opt::{
     ReplicaResyncOptions, EXIT_BASE_REJECTED, EXIT_FAILURE, EXIT_INCOMPLETE, EXIT_INCONSISTENT,
@@ -71,7 +76,11 @@ pub enum ResyncError {
     PrimaryUnreachable,
     /// 公開先が既に存在する・不正（公開直前の競合を含む）。
     InvalidDestination,
-    /// 一時ファイルが検査後に差し替えられた。公開しなかった。
+    /// `--out` の親ディレクトリにグループ・その他が書き込める（sticky bit があっても同じ）か、親の所有者が
+    /// 自分と異なる。一時ベースの差し替えを防げないので、ソケットにもプライマリにも触れず何も作らずに拒否した
+    /// （Issue #3135）。
+    InsecureParent,
+    /// 作業ディレクトリまたは一時ベースが検査後に差し替えられた。公開しなかった。
     TempReplaced,
     /// 検査していない内容が公開先に残った（取り消しの削除に失敗）。
     UncheckedContentPublished,
@@ -102,6 +111,10 @@ impl std::fmt::Display for ResyncError {
                 "cannot reach the primary replication endpoint; nothing was published"
             }
             Self::InvalidDestination => "--out already exists or is not a valid destination",
+            Self::InsecureParent => {
+                "the directory of --out is writable by group or others, or not owned by you; \
+                 nothing was created"
+            }
             Self::TempReplaced => "temporary base was replaced or removed; nothing was published",
             Self::UncheckedContentPublished => {
                 "WARNING: the destination holds content that was not checked; delete it manually"
@@ -125,7 +138,7 @@ impl ResyncError {
             Self::NotConsistent(c) => *c,
             Self::BaseRejected => EXIT_BASE_REJECTED,
             Self::PrimaryRejected(_) => EXIT_PRIMARY_REJECTED,
-            Self::InvalidDestination => EXIT_USAGE,
+            Self::InvalidDestination | Self::InsecureParent => EXIT_USAGE,
             Self::NotFinalized => EXIT_NOT_FINALIZED,
             Self::Request
             | Self::BackupTempNotFinalized
@@ -141,37 +154,74 @@ impl ResyncError {
 // `NotConsistent` の値が表の定数と一致することの静的な固定。
 const _: () = assert!(EXIT_INCONSISTENT == 4 && EXIT_INCOMPLETE == 5);
 
-/// 一時ファイルの保持（dev・ino・長さ）。検査したファイルと公開先の同一性を確かめる。
+/// 作業ディレクトリの中の一時ベースの固定名。サーバーへ依頼する出力先（実パス）の末尾で、
+/// 親直下の予約名には含めない（サーバーは出力先を予約名で拒否するため。`engine::storage::is_replica_resync_base_name`）。
+const BASE_NAME: &str = "base.redb";
+
+/// `dump_tmp` の失敗を再同期の失敗へ対応づける（種別だけ。パスの内容は持ち越さない）。
+fn map_tmp(e: TmpError) -> ResyncError {
+    match e {
+        TmpError::InsecureParent => ResyncError::InsecureParent,
+        TmpError::Replaced => ResyncError::TempReplaced,
+        TmpError::InvalidDestination => ResyncError::InvalidDestination,
+        TmpError::UncheckedContentPublished => ResyncError::UncheckedContentPublished,
+        TmpError::PublishedButNotFinalized => ResyncError::NotFinalized,
+        TmpError::Unsupported | TmpError::Io(_) => ResyncError::Io,
+    }
+}
+
+/// 一時ベースの保持。作業ディレクトリの中の `base.redb` を開いた fd（読み取り）と、その (dev, ino, 長さ) を
+/// 覚え、以降のパスでの開き直し（検査・連続性の確認・`hard_link`）の前後でパスが同じ通常ファイルのままかを
+/// 照合する（Issue #3135・RECOVER-13・RECOVER-15 のポインタ）。パスは作業ディレクトリの保持 fd 経由の
+/// アクセス用パス（Linux は `/proc/self/fd/<n>/base.redb`）で、通知用に実パスを別に持つ。
 struct TempBase {
+    /// 保持 fd（長さの照合用。内容は読まない）。
+    file: File,
+    /// 作業ディレクトリのアクセス用パスの下の一時ベース。
     path: PathBuf,
+    /// 運用者が残骸を探せる実パス（`/proc/self/fd` を見せない）。
+    real: PathBuf,
     dev: u64,
     ino: u64,
     len: u64,
-    /// 真の間は drop で一時名を消す（公開に成功したら偽にする）。
+    /// 真の間は drop で一時ベースを消す（公開に成功したら偽にする）。
     armed: bool,
-    /// 消せなかったときの通知用（呼び出し元の `leftover` へ移す）。
+    /// 消せなかったときの通知用（実パス。呼び出し元の `leftover` へ移す）。
     leftover: Option<PathBuf>,
 }
 
 impl TempBase {
-    /// 一時名のパスが通常ファイル（シンボリックリンクでない）であることを確かめて保持する。
-    fn adopt(path: PathBuf) -> Result<Self, ResyncError> {
+    /// 作業ディレクトリの `base.redb` が通常ファイル（シンボリックリンクでない）で長さ 1 以上であることを
+    /// 確かめ、開いた fd が lstat した実体と同じであることを確かめて保持する。
+    fn adopt(work: &WorkDir) -> Result<Self, ResyncError> {
+        let path = work.access_path().join(BASE_NAME);
         let m = std::fs::symlink_metadata(&path).map_err(|_| ResyncError::Request)?;
         if !m.file_type().is_file() || m.len() == 0 {
             return Err(ResyncError::TempReplaced);
         }
+        let file = File::open(&path).map_err(|_| ResyncError::Io)?;
+        let fm = file.metadata().map_err(|_| ResyncError::Io)?;
+        if !fm.is_file() || fm.dev() != m.dev() || fm.ino() != m.ino() || fm.len() != m.len() {
+            return Err(ResyncError::TempReplaced);
+        }
         Ok(Self {
+            file,
             path,
-            dev: m.dev(),
-            ino: m.ino(),
-            len: m.len(),
+            real: work.real_path_of(Path::new(BASE_NAME)),
+            dev: fm.dev(),
+            ino: fm.ino(),
+            len: fm.len(),
             armed: true,
             leftover: None,
         })
     }
 
-    /// `path`（リンクをたどらない）が、保持している一時ファイルと同じ通常ファイルか。
+    /// `path`（リンクをたどらない）が、保持している一時ベースと同じ通常ファイルか。
     fn is_same_file_at(&self, path: &Path) -> bool {
+        // 保持 fd が生きていること（長さは adopt 時の値で固定。検査中に伸びたら別物として扱う）。
+        if !self.file.metadata().is_ok_and(|m| m.len() == self.len) {
+            return false;
+        }
         match std::fs::symlink_metadata(path) {
             Ok(m) => {
                 m.file_type().is_file()
@@ -183,11 +233,22 @@ impl TempBase {
         }
     }
 
+    /// 一時ベースのパスが保持 fd のままであることを確かめる。
+    fn check(&self) -> Result<(), ResyncError> {
+        if self.is_same_file_at(&self.path) {
+            Ok(())
+        } else {
+            Err(ResyncError::TempReplaced)
+        }
+    }
+
     fn remove(&mut self) {
         if self.armed {
             self.armed = false;
-            if std::fs::remove_file(&self.path).is_err() && self.path.exists() {
-                self.leftover = Some(self.path.clone());
+            if std::fs::remove_file(&self.path).is_err()
+                && std::fs::symlink_metadata(&self.path).is_ok()
+            {
+                self.leftover = Some(self.real.clone());
             }
         }
     }
@@ -199,46 +260,94 @@ impl Drop for TempBase {
     }
 }
 
-/// `--out` と同じディレクトリの、まだ存在しない一時名を決める（0600 の作成はサーバー側）。
-fn temp_name(out: &Path) -> Result<PathBuf, ResyncError> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let parent = out.parent().ok_or(ResyncError::InvalidDestination)?;
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    Ok(parent.join(format!(
-        ".fandhe-replica-resync-{}-{seq}-{nanos}.redb",
-        std::process::id()
-    )))
+/// 作業ディレクトリと一時ベースが作成時のままであることを確かめる。検査・確認接続・公開の各段の前後で
+/// 呼ぶ（差し替えを見つけたら以降へ進まず、何も公開しない）。
+fn check_staging(work: &WorkDir, tmp: &TempBase) -> Result<(), ResyncError> {
+    work.check().map_err(map_tmp)?;
+    tmp.check()
 }
 
-/// サーバーが一時名を残したままの失敗に備え、あれば消す（自分が決めた名前だけ。リンクはたどらない）。
-/// 消せなかったときは `leftover` に入れ、呼び出し元が通知できるようにする。
-fn discard_temp_name(tmp_path: PathBuf, leftover: &mut Vec<PathBuf>) {
-    if std::fs::symlink_metadata(&tmp_path).is_ok() && std::fs::remove_file(&tmp_path).is_err() {
-        leftover.push(tmp_path);
+/// アクセス用パス配下のパスを、運用者が探せる実パスへ直す（`/proc/self/fd/<n>` を見せない）。
+fn to_real(work: &WorkDir, p: &Path) -> PathBuf {
+    match p.strip_prefix(work.access_path()) {
+        Ok(rest) => work.real_path_of(Path::new("")).join(rest),
+        Err(_) => p.to_path_buf(),
     }
 }
 
-/// 一時名を `TempBase` として保持する。保持できない（差し替え・空など）ときも、全テナントの
-/// スナップショットが残らないよう一時名を片付ける。
-fn adopt_or_discard(
-    tmp_path: PathBuf,
-    leftover: &mut Vec<PathBuf>,
-) -> Result<TempBase, ResyncError> {
-    match TempBase::adopt(tmp_path.clone()) {
-        Ok(t) => Ok(t),
-        Err(e) => {
-            discard_temp_name(tmp_path, leftover);
-            Err(e)
+/// テスト専用の差し替え注入点（状態を変えない読み取りだけの hook。本番のビルドには含めない）。
+#[cfg(test)]
+mod hook {
+    use std::cell::RefCell;
+    use std::path::Path;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Stage {
+        /// 整合検査（`verify_db`）の直前。
+        Verify,
+        /// 連続性の確認（`replica_base_point_of`）の直前。
+        BasePoint,
+        /// 公開（`hard_link`）の直前（直前の照合の前）。
+        Publish,
+    }
+
+    /// 引数は (段階, 実パスの作業ディレクトリ, 実パスの一時ベース)。
+    pub(super) type Hook = Box<dyn Fn(Stage, &Path, &Path)>;
+
+    thread_local! {
+        pub(super) static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+}
+
+#[cfg(test)]
+fn run_hook(stage: hook::Stage, work: &WorkDir, tmp: &TempBase) {
+    hook::HOOK.with(|h| {
+        if let Some(f) = h.borrow().as_ref() {
+            f(stage, &work.real_path_of(Path::new("")), &tmp.real);
         }
-    }
+    });
 }
 
-/// 再同期を実行して、切り替え点の LSN を返す。失敗時は何も公開しない。一時名を消せなかったときは、
-/// 残ったパスを `leftover` に入れる（全テナントのデータが残るので、呼び出し元が通知する）。
+/// `--out` の親に残った、前回の異常終了の作業ディレクトリ（`.fandhe-replica-resync-*.d`。中身は `base.redb` と、
+/// サーバーが残した入れ子のスナップショット一時ファイルだけ）を掃除する（Issue #3135）。`main.rs::run_replica_resync`
+/// が再同期の前に呼ぶ。親直下の項目は何も消さず（旧形式の `.fandhe-replica-resync-*.redb` は予約名にできないため
+/// 手動で消す前提）、使用中の作業ディレクトリは書き込み側の共有 lock により `InUse` で見送られる。宛先が既に在る・
+/// 親が不正なときは何もしない。`protected` は消してはならない入力（`--credentials`・`--socket`）のパス。
+pub fn sweep_stale_resync_temps(
+    out: &Path,
+    protected: &[&Path],
+) -> Option<(PathBuf, engine::storage::StaleTempSweep)> {
+    fn never(_: &str) -> bool {
+        false
+    }
+    fn is_entry(name: &str) -> bool {
+        engine::storage::is_replica_resync_base_name(name)
+            || engine::storage::is_snapshot_temp_name(name)
+    }
+    let parent = dump_tmp::parent_of(out).ok()?;
+    if std::fs::symlink_metadata(out).is_ok() {
+        return None;
+    }
+    let s = engine::storage::sweep_stale_temps_with_work_dir_entries(
+        parent,
+        never,
+        engine::storage::is_replica_resync_work_dir_name,
+        is_entry,
+        protected,
+    )
+    .ok()?;
+    Some((parent.to_path_buf(), s))
+}
+
+/// 再同期を実行して、切り替え点の LSN を返す。失敗時は何も公開しない。一時ベースや作業ディレクトリを消せ
+/// なかったときは、残った実パスを `leftover` に入れる（全テナントのデータが残るので、呼び出し元が通知する）。
+///
+/// 一時ベースは `--out` の親に作る 0700 の作業ディレクトリ（[`WorkDir`]。名前は
+/// `engine::storage::is_replica_resync_work_dir_name`）の中に置く。プライマリのサーバーには作業ディレクトリ
+/// の**実パス**を出力先として渡す（`/proc/self/fd/<n>` はこの CLI の fd なのでサーバーには渡せない）。
+/// サーバーの `export_snapshot` は、この作業ディレクトリ（同じ uid の 0700）の中に自分のスナップショット用
+/// 作業ディレクトリを入れ子に作って公開する。親が共有か他人所有なら、ソケットにもプライマリにも触れず、
+/// 何も作らずに拒否する。
 pub fn resync(
     opts: &ReplicaResyncOptions,
     leftover: &mut Vec<PathBuf>,
@@ -247,56 +356,129 @@ pub fn resync(
     if std::fs::symlink_metadata(&opts.out).is_ok() {
         return Err(ResyncError::InvalidDestination);
     }
-    let tmp_path = temp_name(&opts.out)?;
-
-    // 1. ベースの取得（プライマリのサーバー側が 0600 の一時名から原子的に公開する）。
-    let result = match backup_socket::request(&opts.socket, &tmp_path) {
-        Ok(r) if r.code == 0 => Ok(()),
-        // 結果 3 は一時名への公開のみ。`--out` は未作成なので、終了コード 3 として転送しない。
-        Ok(r) if r.code == 3 => Err(ResyncError::BackupTempNotFinalized),
-        Ok(r) => Err(ResyncError::Backup(r.code)),
-        Err(_) => Err(ResyncError::Request),
-    };
-    if let Err(e) = result {
-        discard_temp_name(tmp_path, leftover);
-        return Err(e);
+    let parent = dump_tmp::parent_of(&opts.out).map_err(map_tmp)?;
+    dump_tmp::check_parent_not_shared(parent).map_err(map_tmp)?;
+    // 掃除（排他 lock）との相互排他。取れなければ何も作らずに中止する（fail-closed）。
+    // drop の順序は宣言の逆（作業ディレクトリ → 親の共有 lock）。
+    let _lock = engine::storage::TempDirLock::shared(parent).map_err(|_| ResyncError::Io)?;
+    let mut work = WorkDir::create_named(parent, &mut || {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        engine::storage::make_temp_name(
+            "fandhe-replica-resync",
+            SEQ.fetch_add(1, Ordering::Relaxed),
+            "d",
+        )
+    })
+    .map_err(map_tmp)?;
+    let outcome = run(opts, &mut work, leftover);
+    match &outcome {
+        // 公開の確定まで済んだ。作業ディレクトリは `publish` が消している。
+        Ok(_) => {}
+        // 公開済みで後始末だけ失敗した。残したものは `publish` が `leftover` に入れて disarm 済み。
+        Err(ResyncError::NotFinalized) => {}
+        Err(_) => cleanup_failed(&mut work, leftover),
     }
-    let mut tmp = adopt_or_discard(tmp_path, leftover)?;
-    let outcome = check_and_publish(opts, &mut tmp, leftover);
+    leftover.extend(work.take_probe_leftover());
+    outcome
+}
+
+/// 失敗後の後始末。一時ベース（アクセス用パス経由）と、サーバーが異常終了で残した入れ子のスナップショット用
+/// 作業ディレクトリを消し、作業ディレクトリが作成時のままなら作業ディレクトリも消す。消せなかったもの
+/// （差し替えを見つけて残した作業ディレクトリを含む）は実パスを `leftover` に入れる。
+fn cleanup_failed(work: &mut WorkDir, leftover: &mut Vec<PathBuf>) {
+    let base = work.access_path().join(BASE_NAME);
+    if std::fs::symlink_metadata(&base).is_ok() && std::fs::remove_file(&base).is_err() {
+        leftover.push(work.real_path_of(Path::new(BASE_NAME)));
+    }
+    // サーバーが書いている間は作業ディレクトリに共有 lock があり `InUse` で触れない。使用中でなく、
+    // 形式・権限・所有者が想定どおりの残骸だけが消える。
+    let _ = engine::storage::sweep_stale_temps_with_work_dirs(
+        work.access_path(),
+        engine::storage::is_snapshot_temp_name,
+        engine::storage::is_snapshot_work_dir_name,
+        &[],
+    );
+    match work.check() {
+        Ok(()) => {
+            if let Err(p) = work.remove() {
+                leftover.push(p);
+            }
+        }
+        Err(_) => {
+            work.disarm();
+            leftover.push(work.real_path_of(Path::new("")));
+        }
+    }
+}
+
+/// ベースの取得と、検査・公開。失敗時の後始末は呼び出し元（[`resync`]）の [`cleanup_failed`]。
+fn run(
+    opts: &ReplicaResyncOptions,
+    work: &mut WorkDir,
+    leftover: &mut Vec<PathBuf>,
+) -> Result<u64, ResyncError> {
+    // 1. ベースの取得（プライマリのサーバー側が作業ディレクトリの中の 0600 の一時名から原子的に公開する）。
+    let real_base = work.real_path_of(Path::new(BASE_NAME));
+    match backup_socket::request(&opts.socket, &real_base) {
+        Ok(r) if r.code == 0 => {}
+        // 結果 3 は一時名への公開のみ。`--out` は未作成なので、終了コード 3 として転送しない。
+        Ok(r) if r.code == 3 => return Err(ResyncError::BackupTempNotFinalized),
+        Ok(r) => return Err(ResyncError::Backup(r.code)),
+        Err(_) => return Err(ResyncError::Request),
+    }
+    let mut tmp = TempBase::adopt(work)?;
+    let outcome = check_and_publish(opts, work, &mut tmp, leftover);
     tmp.remove();
-    // 検査用コピーの残置と一時名の残置は別物なので、上書きせず両方を報告に残す。
+    // 検査用コピーの残置と一時ベースの残置は別物なので、上書きせず両方を報告に残す。
     leftover.extend(tmp.leftover.take());
     outcome
 }
 
-/// 検査（整合・連続性・プライマリへの確認）と公開。
+/// 検査（整合・連続性・プライマリへの確認）と公開。各段の前後で作業ディレクトリと一時ベースの同一性を
+/// 照合する。
 fn check_and_publish(
     opts: &ReplicaResyncOptions,
+    work: &mut WorkDir,
     tmp: &mut TempBase,
     leftover: &mut Vec<PathBuf>,
 ) -> Result<u64, ResyncError> {
-    // 2. 整合検査。
+    // 2. 整合検査。コピー経路に入ると作業ディレクトリの中に `.fandhe-verify-*.d` が入れ子で作られて消える
+    //    （親は 0700 の自分の作業ディレクトリなので許容する）。
+    check_staging(work, tmp)?;
+    #[cfg(test)]
+    run_hook(hook::Stage::Verify, work, tmp);
     let mut verify_leftover = None;
     let verified = restore_opt::verify_db(
         &tmp.path,
         &IntegrityOptions::default(),
         &mut verify_leftover,
     );
-    leftover.extend(verify_leftover);
+    leftover.extend(verify_leftover.map(|p| to_real(work, &p)));
+    let after_verify = check_staging(work, tmp);
+    // 差し替えの検出を検査の失敗より優先する（差し替えられたファイルの検査結果は信用しない）。
+    after_verify?;
     let (report, _mode) = verified.map_err(|_| ResyncError::VerifyFailed)?;
     match verify_opt::classify(&report) {
         0 => {}
         c => return Err(ResyncError::NotConsistent(c)),
     }
     // 3. ベースの連続性と切り替え点。
-    let point = engine::storage::replica_base_point_of(&tmp.path).map_err(|e| match e {
+    check_staging(work, tmp)?;
+    #[cfg(test)]
+    run_hook(hook::Stage::BasePoint, work, tmp);
+    let point_result = engine::storage::replica_base_point_of(&tmp.path);
+    check_staging(work, tmp)?;
+    let point = point_result.map_err(|e| match e {
         IncrementalError::BaseUnreadable | IncrementalError::InUse => ResyncError::VerifyFailed,
         _ => ResyncError::BaseRejected,
     })?;
     // 4. プライマリへの確認接続。
     probe_primary(opts, &point)?;
     // 5. 公開。
-    publish(tmp, &opts.out)?;
+    #[cfg(test)]
+    run_hook(hook::Stage::Publish, work, tmp);
+    publish(work, tmp, &opts.out, leftover)?;
     Ok(point.end_lsn)
 }
 
@@ -388,11 +570,16 @@ fn expect_frame(stream: &mut ConnReader, expect: u8) -> Result<Vec<u8>, ResyncEr
     }
 }
 
-/// 一時名から `dest` へ `hard_link` で公開する。公開先が検査したファイルと別なら取り消す。
-fn publish(tmp: &mut TempBase, dest: &Path) -> Result<(), ResyncError> {
-    if !tmp.is_same_file_at(&tmp.path) {
-        return Err(ResyncError::TempReplaced);
-    }
+/// 一時ベースから `dest` へ `hard_link` で公開する。公開の前に作業ディレクトリと一時ベースを照合し、公開の
+/// 直後に公開先が検査したファイルと別なら取り消す。成功したら一時ベースと作業ディレクトリを消して親ディレクトリ
+/// を fsync する（失敗は `NotFinalized`。残したものの実パスを `leftover` に入れ、作業ディレクトリは disarm する）。
+fn publish(
+    work: &mut WorkDir,
+    tmp: &mut TempBase,
+    dest: &Path,
+    leftover: &mut Vec<PathBuf>,
+) -> Result<(), ResyncError> {
+    check_staging(work, tmp)?;
     match std::fs::hard_link(&tmp.path, dest) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -414,10 +601,22 @@ fn publish(tmp: &mut TempBase, dest: &Path) -> Result<(), ResyncError> {
     };
     tmp.armed = false;
     let finalized = std::fs::remove_file(&tmp.path)
-        .and_then(|()| std::fs::File::open(parent).and_then(|d| d.sync_all()));
+        .map_err(|_| ())
+        .and_then(|()| work.check().map_err(|_| ()))
+        .and_then(|()| work.remove().map_err(|_| ()))
+        .and_then(|()| {
+            std::fs::File::open(parent)
+                .and_then(|d| d.sync_all())
+                .map_err(|_| ())
+        });
     if finalized.is_err() {
-        if tmp.path.exists() {
-            tmp.leftover = Some(tmp.path.clone());
+        work.disarm();
+        if std::fs::symlink_metadata(&tmp.path).is_ok() {
+            leftover.push(tmp.real.clone());
+        }
+        let dir = work.real_path_of(Path::new(""));
+        if std::fs::symlink_metadata(&dir).is_ok() {
+            leftover.push(dir);
         }
         return Err(ResyncError::NotFinalized);
     }
@@ -428,57 +627,308 @@ fn publish(tmp: &mut TempBase, dest: &Path) -> Result<(), ResyncError> {
 const _: () = assert!(EXIT_USAGE == backup_opt::EXIT_USAGE);
 
 #[cfg(test)]
-mod adopt_cleanup_tests {
+mod work_dir_tests {
+    //! 作業ディレクトリ方式（Issue #3135）の単体テスト。プライマリへの接続を要する段（検査・確認接続）は
+    //! CLI の結合テスト（`tests/wire_cli/replica_resync_cli.rs`）で確かめ、ここでは一時ベースの保持・
+    //! 差し替えの検出・公開の取り消し・失敗後の後始末を確かめる。
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
-    fn scratch(label: &str) -> PathBuf {
+    fn parent(label: &str, mode: u32) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
         let d = std::env::temp_dir().join(format!(
-            "fandhe-resync-adopt-{label}-{}-{}",
+            "fandhe-resync-wd-{label}-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos())
+            SEQ.fetch_add(1, Ordering::Relaxed)
         ));
-        std::fs::create_dir_all(&d).expect("mkdir");
+        std::fs::create_dir(&d).expect("mkdir");
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(mode)).expect("chmod");
         d
     }
 
+    fn new_work(parent: &Path) -> WorkDir {
+        WorkDir::create_named(parent, &mut || {
+            engine::storage::make_temp_name("fandhe-replica-resync", 1, "d")
+        })
+        .expect("work dir")
+    }
+
+    /// 作業ディレクトリに `base.redb` を置いて保持する。
+    fn base_in(work: &WorkDir, body: &[u8]) -> TempBase {
+        let p = work.access_path().join(BASE_NAME);
+        std::fs::write(&p, body).expect("write base");
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        TempBase::adopt(work).expect("adopt")
+    }
+
+    fn names(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .expect("read")
+            .map(|e| e.expect("e").file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
     #[test]
-    fn adopt_failure_removes_temp_file() {
-        let dir = scratch("empty");
-        let tmp = dir.join(".fandhe-replica-resync-test.redb");
-        std::fs::write(&tmp, b"").expect("write");
+    fn work_dir_name_is_a_recognized_work_dir_and_base_name_is_not_reserved() {
+        let p = parent("names", 0o700);
+        let w = new_work(&p);
+        let n = names(&p);
+        assert_eq!(n.len(), 1);
+        assert!(engine::storage::is_replica_resync_work_dir_name(&n[0]));
+        assert!(engine::storage::is_replica_resync_base_name(BASE_NAME));
+        // サーバーの出力先検査（予約名）に当たらない。
+        assert!(!engine::storage::is_reserved_temp_name(BASE_NAME));
+        drop(w);
+        std::fs::remove_dir(&p).expect("cleanup");
+    }
+
+    #[test]
+    fn adopt_rejects_missing_empty_and_symlinked_base() {
+        let p = parent("adopt", 0o700);
+        let w = new_work(&p);
+        assert!(matches!(TempBase::adopt(&w), Err(ResyncError::Request)));
+        let base = w.access_path().join(BASE_NAME);
+        std::fs::write(&base, b"").expect("write");
+        assert!(matches!(
+            TempBase::adopt(&w),
+            Err(ResyncError::TempReplaced)
+        ));
+        std::fs::remove_file(&base).expect("rm");
+        let other = p.join("other");
+        std::fs::write(&other, b"x").expect("write");
+        std::os::unix::fs::symlink(&other, &base).expect("symlink");
+        assert!(matches!(
+            TempBase::adopt(&w),
+            Err(ResyncError::TempReplaced)
+        ));
+        std::fs::remove_file(&base).expect("rm link");
+        std::fs::remove_file(&other).expect("rm other");
+        drop(w);
+        std::fs::remove_dir(&p).expect("cleanup");
+    }
+
+    #[test]
+    fn publish_succeeds_and_leaves_only_the_destination() {
+        let p = parent("ok", 0o700);
+        let mut w = new_work(&p);
+        let mut tmp = base_in(&w, b"base-bytes");
+        let dest = p.join("replica.redb");
         let mut leftover = Vec::new();
-        let r = adopt_or_discard(tmp.clone(), &mut leftover);
-        assert!(matches!(r, Err(ResyncError::TempReplaced)));
-        assert!(std::fs::symlink_metadata(&tmp).is_err());
+        publish(&mut w, &mut tmp, &dest, &mut leftover).expect("publish");
         assert!(leftover.is_empty());
-        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(std::fs::read(&dest).expect("read"), b"base-bytes");
+        assert_eq!(names(&p), vec!["replica.redb".to_string()]);
+        std::fs::remove_file(&dest).expect("cleanup");
+        std::fs::remove_dir(&p).expect("cleanup");
     }
 
     #[test]
-    fn adopt_failure_records_leftover_when_unremovable() {
-        let dir = scratch("dir");
-        let tmp = dir.join(".fandhe-replica-resync-test.redb");
-        std::fs::create_dir(&tmp).expect("mkdir");
-        std::fs::write(tmp.join("x"), b"x").expect("write");
+    fn publish_refuses_a_replaced_base_and_publishes_nothing() {
+        let p = parent("swap-base", 0o700);
+        let mut w = new_work(&p);
+        let mut tmp = base_in(&w, b"checked");
+        // 検査したファイルを別の inode に置き換える（同じ長さ）。
+        let base = w.access_path().join(BASE_NAME);
+        let decoy = w.access_path().join("decoy");
+        std::fs::write(&decoy, b"swapped").expect("write");
+        std::fs::rename(&decoy, &base).expect("swap");
+        let dest = p.join("replica.redb");
         let mut leftover = Vec::new();
-        let r = adopt_or_discard(tmp.clone(), &mut leftover);
-        assert!(r.is_err());
-        assert_eq!(leftover, vec![tmp.clone()]);
-        let _ = std::fs::remove_dir_all(&dir);
+        let r = publish(&mut w, &mut tmp, &dest, &mut leftover);
+        assert!(matches!(r, Err(ResyncError::TempReplaced)));
+        assert!(!dest.exists());
+        cleanup_failed(&mut w, &mut leftover);
+        drop(tmp);
+        assert!(leftover.is_empty(), "{leftover:?}");
+        assert!(names(&p).is_empty());
+        std::fs::remove_dir(&p).expect("cleanup");
     }
 
     #[test]
-    fn leftovers_accumulate_without_overwrite() {
-        let dir = scratch("accumulate");
-        let a = dir.join(".fandhe-replica-resync-a.redb");
-        std::fs::create_dir(&a).expect("mkdir");
-        std::fs::write(a.join("x"), b"x").expect("write");
-        // 検査用コピーの残置が先にある状態で一時名も消せなくても、両方が残る。
-        let mut leftover = vec![PathBuf::from("verify-copy")];
-        discard_temp_name(a.clone(), &mut leftover);
-        assert_eq!(leftover, vec![PathBuf::from("verify-copy"), a]);
-        let _ = std::fs::remove_dir_all(&dir);
+    fn publish_refuses_a_renamed_work_dir_and_cleanup_keeps_the_foreign_dir() {
+        let p = parent("swap-dir", 0o700);
+        let mut w = new_work(&p);
+        let mut tmp = base_in(&w, b"checked");
+        let real = w.real_path_of(Path::new(""));
+        let moved = p.join("moved-away");
+        std::fs::rename(&real, &moved).expect("rename away");
+        // 同名の別のディレクトリ（0700）に差し替える。
+        std::fs::create_dir(&real).expect("decoy");
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        let dest = p.join("replica.redb");
+        let mut leftover = Vec::new();
+        let r = publish(&mut w, &mut tmp, &dest, &mut leftover);
+        assert!(matches!(r, Err(ResyncError::TempReplaced)));
+        assert!(!dest.exists());
+        cleanup_failed(&mut w, &mut leftover);
+        tmp.remove();
+        // 差し替え後のディレクトリは消さず、実パスを通知する（`/proc/self/fd` は出さない）。
+        assert!(real.is_dir());
+        assert_eq!(leftover, vec![real.clone()]);
+        assert!(leftover
+            .iter()
+            .all(|p| !p.to_string_lossy().contains("/proc/self/fd")));
+        drop(tmp);
+        drop(w);
+        assert!(real.is_dir());
+        std::fs::remove_dir(&real).expect("rm decoy");
+        std::fs::remove_dir_all(&moved).expect("rm moved");
+        std::fs::remove_dir(&p).expect("cleanup");
+    }
+
+    #[test]
+    fn publish_never_overwrites_an_existing_destination() {
+        let p = parent("exists", 0o700);
+        let mut w = new_work(&p);
+        let mut tmp = base_in(&w, b"checked");
+        let dest = p.join("replica.redb");
+        std::fs::write(&dest, b"keep").expect("write");
+        let mut leftover = Vec::new();
+        let r = publish(&mut w, &mut tmp, &dest, &mut leftover);
+        assert!(matches!(r, Err(ResyncError::InvalidDestination)));
+        assert_eq!(std::fs::read(&dest).expect("read"), b"keep");
+        cleanup_failed(&mut w, &mut leftover);
+        drop(tmp);
+        assert!(leftover.is_empty());
+        assert_eq!(names(&p), vec!["replica.redb".to_string()]);
+        std::fs::remove_file(&dest).expect("cleanup");
+        std::fs::remove_dir(&p).expect("cleanup");
+    }
+
+    #[test]
+    fn cleanup_failed_removes_base_and_swept_nested_work_dir() {
+        let p = parent("cleanup", 0o700);
+        let mut w = new_work(&p);
+        let _tmp = base_in(&w, b"x");
+        // サーバーが異常終了で残した入れ子のスナップショット用作業ディレクトリ（0700・中は 0600 の一時名）。
+        let nested =
+            w.access_path()
+                .join(engine::storage::make_temp_name("fandhe-snapshot", 3, "d"));
+        std::fs::create_dir(&nested).expect("mkdir");
+        std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        let inner = nested.join(engine::storage::make_temp_name("fandhe-snapshot", 4, "tmp"));
+        std::fs::write(&inner, b"y").expect("write");
+        std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        let mut leftover = Vec::new();
+        cleanup_failed(&mut w, &mut leftover);
+        assert!(leftover.is_empty(), "{leftover:?}");
+        assert!(names(&p).is_empty());
+        std::fs::remove_dir(&p).expect("cleanup");
+    }
+
+    #[test]
+    fn shared_parent_is_rejected_before_anything_is_created() {
+        for mode in [0o777, 0o775, 0o1777] {
+            let p = parent("shared", mode);
+            assert_eq!(
+                dump_tmp::check_parent_not_shared(&p),
+                Err(TmpError::InsecureParent)
+            );
+            assert!(matches!(
+                map_tmp(TmpError::InsecureParent),
+                ResyncError::InsecureParent
+            ));
+            assert!(names(&p).is_empty());
+            std::fs::remove_dir(&p).expect("cleanup");
+        }
+        assert_eq!(ResyncError::InsecureParent.exit_code(), EXIT_USAGE);
+    }
+
+    #[test]
+    fn hook_stage_swaps_are_detected_by_the_check() {
+        let p = parent("hook", 0o700);
+        let w = new_work(&p);
+        let tmp = base_in(&w, b"checked");
+        assert!(check_staging(&w, &tmp).is_ok());
+        // 作業ディレクトリは同じまま、一時ベースだけ置き換える。
+        let base = w.access_path().join(BASE_NAME);
+        let decoy = w.access_path().join("decoy");
+        std::fs::write(&decoy, b"checked").expect("write");
+        std::fs::rename(&decoy, &base).expect("swap");
+        assert!(matches!(
+            check_staging(&w, &tmp),
+            Err(ResyncError::TempReplaced)
+        ));
+        drop(tmp);
+        drop(w);
+        let _ = std::fs::remove_dir_all(&p);
+    }
+
+    struct HookReset;
+    impl Drop for HookReset {
+        fn drop(&mut self) {
+            hook::HOOK.with(|h| *h.borrow_mut() = None);
+        }
+    }
+
+    fn opts_for(out: PathBuf) -> ReplicaResyncOptions {
+        ReplicaResyncOptions {
+            socket: PathBuf::from("/nonexistent/backup.sock"),
+            out,
+            primary: "127.0.0.1:1".parse().expect("addr"),
+            primary_tls: None,
+            role: "r".to_string(),
+            password: Vec::new(),
+        }
+    }
+
+    /// 空の redb を作業ディレクトリの `base.redb` へ置いて保持する（整合検査を通る正常なベースの代用）。
+    fn valid_base_in(work: &WorkDir, scratch: &Path) -> TempBase {
+        let src = scratch.join("src.redb");
+        drop(engine::storage::Storage::open(&src).expect("open"));
+        let body = std::fs::read(&src).expect("read");
+        std::fs::remove_file(&src).expect("rm");
+        base_in(work, &body)
+    }
+
+    /// 段階ごとに、hook が一時ベースを別の inode へ置き換えると、公開前に `TempReplaced` で止まる。
+    #[test]
+    fn swaps_at_each_stage_stop_before_publishing() {
+        for stage in [hook::Stage::Verify, hook::Stage::BasePoint] {
+            let p = parent("stages", 0o700);
+            let scratch = parent("stages-src", 0o700);
+            let mut w = new_work(&p);
+            let mut tmp = valid_base_in(&w, &scratch);
+            let body = std::fs::read(&tmp.path).expect("read");
+            let opts = opts_for(p.join("o.redb"));
+            hook::HOOK.with(|h| {
+                *h.borrow_mut() = Some(Box::new(move |s, _work, base| {
+                    if s == stage {
+                        let other = base.with_extension("other");
+                        std::fs::write(&other, &body).expect("write");
+                        std::fs::rename(&other, base).expect("swap");
+                    }
+                }));
+            });
+            let _reset = HookReset;
+            let mut leftover = Vec::new();
+            let r = check_and_publish(&opts, &mut w, &mut tmp, &mut leftover);
+            assert!(
+                matches!(r, Err(ResyncError::TempReplaced)),
+                "{stage:?}: {r:?}"
+            );
+            assert!(!opts.out.exists());
+            cleanup_failed(&mut w, &mut leftover);
+            drop(tmp);
+            assert!(names(&p).is_empty(), "{stage:?}: {:?}", names(&p));
+            std::fs::remove_dir(&p).expect("cleanup");
+            let _ = std::fs::remove_dir_all(&scratch);
+        }
+    }
+
+    #[test]
+    fn to_real_maps_nested_paths_without_proc() {
+        let p = parent("real", 0o700);
+        let w = new_work(&p);
+        let nested = w.access_path().join(".fandhe-verify-1-2-3.d").join("x");
+        let shown = to_real(&w, &nested);
+        assert!(!shown.to_string_lossy().contains("/proc/self/fd"));
+        assert!(shown.starts_with(w.real_path_of(Path::new(""))));
+        assert!(shown.ends_with(".fandhe-verify-1-2-3.d/x"));
+        drop(w);
+        std::fs::remove_dir(&p).expect("cleanup");
     }
 }

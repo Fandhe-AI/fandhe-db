@@ -55,7 +55,14 @@ pub fn classify(
              verify the output file before relying on it"
                 .to_string(),
         ),
-        Err(e @ (E::DestinationExists | E::InvalidDestination)) => (EXIT_USAGE, e.to_string()),
+        // 出力先の親が共有か他人所有（Issue #3135）は、運用者が出力先を選び直す利用上の誤りとして 2 にする
+        // （`restore` の `InsecureParent` と同じ扱い）。何も作られていない。
+        Err(e @ (E::DestinationExists | E::InvalidDestination | E::InsecureParent)) => {
+            (EXIT_USAGE, e.to_string())
+        }
+        // 差し替えを見つけたため公開しなかった（`TempReplaced`）、または検査していない内容が公開先に残った
+        // （`UncheckedContentPublished`。`Display` が WARNING 文言）。どちらも実行時の失敗として 1。
+        Err(e @ (E::TempReplaced | E::UncheckedContentPublished)) => (EXIT_FAILURE, e.to_string()),
         Err(e) => (EXIT_FAILURE, e.to_string()),
     }
 }
@@ -117,6 +124,33 @@ pub fn absolutize_for_socket(out: PathBuf) -> Result<PathBuf, String> {
         return Err("--out must be valid UTF-8 without line breaks".into());
     }
     Ok(out)
+}
+
+/// `backup` の出力先 `out` の親に残った、前回の異常終了のスナップショットの作業ディレクトリ・一時ファイル
+/// （Issue #3135・RECOVER-13 のポインタ）を、自分の書き出しの前に掃除する。`main.rs::run_backup` が `--db`・
+/// `--socket` の両方で呼ぶ。宛先が既に在る・親が不正なときは何もしない。掃除できなかった場合も本処理は続ける
+/// （呼び出し元が結果だけ報告する）。`protected` は消してはならない入力（`--db`・ソケット）のパス。書き込み中の
+/// 作業ディレクトリは書き込み側の共有 lock により `InUse` で見送られる。
+pub fn sweep_stale_backup_temps(
+    out: &Path,
+    protected: &[&Path],
+) -> Option<(PathBuf, engine::storage::StaleTempSweep)> {
+    out.file_name()?;
+    let parent: &Path = match out.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    if std::fs::symlink_metadata(out).is_ok() {
+        return None;
+    }
+    let s = engine::storage::sweep_stale_temps_with_work_dirs(
+        parent,
+        engine::storage::is_snapshot_temp_name,
+        engine::storage::is_snapshot_work_dir_name,
+        protected,
+    )
+    .ok()?;
+    Some((parent.to_path_buf(), s))
 }
 
 /// `Storage::open` の失敗が「別プロセスが開いている」ことによるかを判定する（`backup`・`verify` が

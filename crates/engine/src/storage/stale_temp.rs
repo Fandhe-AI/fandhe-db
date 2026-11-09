@@ -133,6 +133,82 @@ pub fn is_restore_work_dir_name(name: &str) -> bool {
     }
 }
 
+/// 名前 `.{prefix}-<pid>-<nonce 16桁hex>-<seq>.{suffix}` を作る（Issue #3135）。nonce は
+/// プロセスごとにランダムな鍵を持つ `RandomState` と時刻・通番を混ぜた値で、PID の再利用や通番の巻き戻りでも
+/// 残骸と名前が衝突しない。スナップショット（engine）と replica-resync（wire-server）の作業ディレクトリ・
+/// 一時ファイルの名前が共有する単一の生成関数で、返す名前は常にパス区切りを含まない 1 成分。
+pub fn make_temp_name(prefix: &str, seq: u64, suffix: &str) -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u128(nanos);
+    h.write_u64(seq);
+    format!(
+        ".{prefix}-{}-{:016x}-{seq}.{suffix}",
+        std::process::id(),
+        h.finish()
+    )
+}
+
+/// `.{prefix}-<pid>-<nonce 16桁小文字hex>-<seq>.{suffix}` の厳密な判定（添字を使わず解析する）。
+fn is_nonce_name(name: &str, prefix: &str, suffix: &str) -> bool {
+    let Some(rest) = name
+        .strip_prefix(prefix)
+        .and_then(|r| r.strip_suffix(suffix))
+    else {
+        return false;
+    };
+    let mut parts = rest.split('-');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(pid), Some(nonce), Some(seq), None) => {
+            is_decimal(pid, 10) && is_lower_hex(nonce, 16) && is_decimal(seq, 20)
+        }
+        _ => false,
+    }
+}
+
+/// スナップショット（`backup`）が一時ファイルを置く作業ディレクトリの名前
+/// `.fandhe-snapshot-<pid>-<nonce 16桁小文字hex>-<seq>.d` の厳密な判定
+/// （Issue #3135・RECOVER-13 のポインタ）。`snapshot` の生成・掃除・[`is_reserved_temp_name`] の単一の真実源。
+pub fn is_snapshot_work_dir_name(name: &str) -> bool {
+    is_nonce_name(name, ".fandhe-snapshot-", ".d")
+}
+
+/// スナップショットの一時ファイル名の厳密な判定。作業ディレクトリの中の
+/// `.fandhe-snapshot-<pid>-<nonce 16桁小文字hex>-<seq>.tmp` と、旧形式（親直下に作っていた）
+/// `.fandhe-snapshot-<pid>-<seq>.tmp` の両方を受理する（旧形式の残骸も掃除で回収するため）。
+pub fn is_snapshot_temp_name(name: &str) -> bool {
+    if is_nonce_name(name, ".fandhe-snapshot-", ".tmp") {
+        return true;
+    }
+    let Some(rest) = name
+        .strip_prefix(".fandhe-snapshot-")
+        .and_then(|r| r.strip_suffix(".tmp"))
+    else {
+        return false;
+    };
+    let mut parts = rest.split('-');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(pid), Some(seq), None) => is_decimal(pid, 10) && is_decimal(seq, 20),
+        _ => false,
+    }
+}
+
+/// `replica-resync` が取得したベースを置く作業ディレクトリの名前
+/// `.fandhe-replica-resync-<pid>-<nonce 16桁小文字hex>-<seq>.d` の厳密な判定
+/// （Issue #3135・RECOVER-15 のポインタ）。
+pub fn is_replica_resync_work_dir_name(name: &str) -> bool {
+    is_nonce_name(name, ".fandhe-replica-resync-", ".d")
+}
+
+/// 作業ディレクトリの中の replica-resync の一時ベースの固定名の判定。作業ディレクトリの中だけで使い、
+/// 親直下の予約名には含めない（プライマリのサーバーは出力先を予約名で拒否するため）。
+pub fn is_replica_resync_base_name(name: &str) -> bool {
+    name == "base.redb"
+}
+
 /// 掃除の uid 確認用ファイルの名前の接頭辞。復元・アーカイブの一時名とは別の形式にして、
 /// 呼び出し側の「一時名の残骸」の数え方と混ざらないようにする（掃除自身は [`is_probe_name`] で回収する）。
 const PROBE_PREFIX: &str = ".fandhe-sweep-probe-";
@@ -179,6 +255,9 @@ fn is_probe_name(name: &str) -> bool {
 pub fn is_reserved_temp_name(name: &str) -> bool {
     is_restore_temp_name(name)
         || is_restore_work_dir_name(name)
+        || is_snapshot_work_dir_name(name)
+        || is_snapshot_temp_name(name)
+        || is_replica_resync_work_dir_name(name)
         || super::change_log::archive::is_segment_temp_name(name)
         || is_probe_name(name)
 }
@@ -233,6 +312,34 @@ pub fn sweep_stale_temps(
     sweep_stale_temps_with_work_dirs(dir, is_temp_name, never, protected)
 }
 
+/// 自プロセスの実効 uid を、`dir` の中へ `create_new` で作った確認用ファイルの所有者として得る
+/// （libc に依存しない。カーネルが作成者の fsuid で付ける）。作れなければ `None`。掃除と、作業ディレクトリ
+/// （`work_dir`）の作成前の親の所有者確認が共有する。確認用ファイルは作成後すぐ消し、異常終了で残っても
+/// 専用の形式（[`is_probe_name`]）なので次の掃除が回収する。
+#[cfg(unix)]
+pub(crate) fn probe_own_uid(dir: &Path) -> Option<u32> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    for attempt in 0..8u64 {
+        let p = dir.join(make_probe_name(attempt));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&p)
+        {
+            Ok(f) => {
+                let uid = f.metadata().ok().map(|m| m.uid());
+                drop(f);
+                let _ = std::fs::remove_file(&p);
+                return uid;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
 /// 作業ディレクトリ 1 つの中に許す項目数の上限（一時 DB 1 つだけが正常。余裕を見て小さく取る）。
 #[cfg(unix)]
 const MAX_WORK_DIR_ENTRIES: usize = 4;
@@ -256,14 +363,14 @@ impl SweepCtx<'_> {
 
 /// 作業ディレクトリ `dir/name`（`restore` が一時コピーを置く 0700 のディレクトリ）の残骸を掃除する。
 /// 消す条件はすべての積: lstat でディレクトリ（リンクをたどらない）・0700・自分の所有・保護対象でない・
-/// 開いた fd の (dev, ino) が lstat と一致・項目数が上限以下・全項目が `is_temp_name` に一致する
+/// 開いた fd の (dev, ino) が lstat と一致・項目数が上限以下・全項目が `is_entry_name` に一致する
 /// 0600 系で自分所有の通常ファイル（保護対象でない）。1 つでも外れれば何も触らず `skipped` に数える。
 /// 空の作業ディレクトリ（mkdir の直後の異常終了）も消す。件数は作業ディレクトリ 1 つを 1 件とする。
 #[cfg(unix)]
 fn sweep_work_dir(
     dir: &Path,
     name: &str,
-    is_temp_name: fn(&str) -> bool,
+    is_entry_name: fn(&str) -> bool,
     ctx: &SweepCtx<'_>,
     sweep: &mut StaleTempSweep,
 ) {
@@ -324,7 +431,7 @@ fn sweep_work_dir(
             skip(sweep);
             return;
         };
-        if !is_temp_name(child_name) {
+        if !is_entry_name(child_name) {
             skip(sweep);
             return;
         }
@@ -383,8 +490,29 @@ pub fn sweep_stale_temps_with_work_dirs(
     is_work_dir_name: fn(&str) -> bool,
     protected: &[&Path],
 ) -> Result<StaleTempSweep, std::io::ErrorKind> {
+    sweep_stale_temps_with_work_dir_entries(
+        dir,
+        is_temp_name,
+        is_work_dir_name,
+        is_temp_name,
+        protected,
+    )
+}
+
+/// [`sweep_stale_temps_with_work_dirs`] に、作業ディレクトリの**中身**の名前の判定
+/// （`is_work_dir_entry_name`）を別に渡せる版（Issue #3135）。`replica-resync` は親直下の一時名を持たず
+/// （`is_temp_name` に何も一致しない関数を渡す）、作業ディレクトリの中だけに固定名のベースを置くため、
+/// 親直下の判定と作業ディレクトリの中の判定を分ける必要がある。
+#[cfg(unix)]
+pub fn sweep_stale_temps_with_work_dir_entries(
+    dir: &Path,
+    is_temp_name: fn(&str) -> bool,
+    is_work_dir_name: fn(&str) -> bool,
+    is_work_dir_entry_name: fn(&str) -> bool,
+    protected: &[&Path],
+) -> Result<StaleTempSweep, std::io::ErrorKind> {
     use std::fs::TryLockError;
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::unix::fs::MetadataExt;
 
     let dir_file = std::fs::File::open(dir).map_err(|e| e.kind())?;
     match dir_file.try_lock() {
@@ -399,26 +527,7 @@ pub fn sweep_stale_temps_with_work_dirs(
         return Ok(StaleTempSweep::empty(SweepOutcome::SharedDirectory));
     }
 
-    // 自分の uid は geteuid ではなく「自分が今作ったファイルの所有者」で得る（libc に依存しない）。
-    let mut own_uid = None;
-    for attempt in 0..8u64 {
-        let p = dir.join(make_probe_name(attempt));
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&p)
-        {
-            Ok(f) => {
-                own_uid = f.metadata().ok().map(|m| m.uid());
-                drop(f);
-                let _ = std::fs::remove_file(&p);
-                break;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(_) => break,
-        }
-    }
+    let own_uid = probe_own_uid(dir);
     let Some(own_uid) = own_uid else {
         return Ok(StaleTempSweep::empty(SweepOutcome::OwnerUnknown));
     };
@@ -451,7 +560,7 @@ pub fn sweep_stale_temps_with_work_dirs(
             continue;
         };
         if is_work_dir_name(name) {
-            sweep_work_dir(dir, name, is_temp_name, &ctx, &mut sweep);
+            sweep_work_dir(dir, name, is_work_dir_entry_name, &ctx, &mut sweep);
             continue;
         }
         if !is_temp_name(name) && !is_probe_name(name) {
@@ -484,6 +593,18 @@ pub fn sweep_stale_temps_with_work_dirs(
         let _ = dir_file.sync_all();
     }
     Ok(sweep)
+}
+
+/// 非 unix では何も消さない。
+#[cfg(not(unix))]
+pub fn sweep_stale_temps_with_work_dir_entries(
+    _dir: &Path,
+    _is_temp_name: fn(&str) -> bool,
+    _is_work_dir_name: fn(&str) -> bool,
+    _is_work_dir_entry_name: fn(&str) -> bool,
+    _protected: &[&Path],
+) -> Result<StaleTempSweep, std::io::ErrorKind> {
+    Ok(StaleTempSweep::empty(SweepOutcome::Unsupported))
 }
 
 /// 非 unix では何も消さない。
