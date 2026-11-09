@@ -201,7 +201,13 @@ fn statement_text_budget(accumulators: &[Accumulator], max_result_bytes: usize) 
 /// before/after 差分から求め、新規キー 1 件の確定時のみ
 /// [`crate::sql::distinct::DistinctBudget::charge`] を呼ぶ（既存キーへの
 /// 再ヒットでは計上しない）。
+///
+/// 集計セル単位（行 × 項目）のホットループから呼ばれ、呼び出し層自体が
+/// 支配的コストだったため `#[inline(always)]` を付ける（Issue #1487）。
+/// 3 箇所の判定（FILTER 短絡・TEXT 予算・`COUNT(DISTINCT)` 予算）は fail-closed
+/// 契約に直結するので、手での展開による重複は避けて本ヘルパを共有し続ける。
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 fn observe_with_budgets(
     accumulator: &mut Accumulator,
     item: &crate::sql::parser::BoundAggregateItem,
