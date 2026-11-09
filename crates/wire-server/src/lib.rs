@@ -221,6 +221,8 @@ pub mod statement_timeout_opt;
 pub mod surface;
 pub mod sync_commit_wait;
 pub mod temp_table_limits_opt;
+#[cfg(test)]
+mod test_util; // src 配下の単体テスト用の一時パス払い出し（Issue #2254）
 pub mod text_analysis_opt;
 pub mod text_query_limits_opt;
 pub mod tls;

@@ -3076,14 +3076,8 @@ mod tests {
             WireType::TextArray
         );
 
-        let db_path = std::env::temp_dir().join(format!(
-            "result-encoder-column-wire-type-matrix-{}-{}.redb",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system clock")
-                .as_nanos()
-        ));
+        let db_path =
+            crate::test_util::unique_temp_path("result-encoder-column-wire-type-matrix", ".redb");
         let storage = engine::storage::Storage::open(&db_path).expect("open throwaway storage");
         let enum_def = storage
             .create_enum_type("mood", vec!["happy".to_string()])

@@ -68,3 +68,32 @@ fn describe_temp_dir_state_reports_the_temp_dir_path_without_panicking() {
     assert!(description.contains("writable="));
     assert!(description.contains("leftover_fandhe_db_entries="));
 }
+
+// Issue #2254: `unique_temp_path` の一意性と label 検査。
+use std::collections::HashSet;
+
+#[test]
+fn unique_temp_path_is_unique_across_threads() {
+    let handles: Vec<_> = (0..8)
+        .map(|_| {
+            std::thread::spawn(|| {
+                (0..256)
+                    .map(|_| unique_temp_path("uniq", ""))
+                    .collect::<Vec<_>>()
+            })
+        })
+        .collect();
+    let mut seen = HashSet::new();
+    for h in handles {
+        for p in h.join().expect("thread") {
+            assert!(seen.insert(p), "duplicate path generated");
+        }
+    }
+    assert_eq!(seen.len(), 8 * 256);
+}
+
+#[test]
+#[should_panic(expected = "must not contain path separators")]
+fn unique_temp_path_rejects_separator_in_label() {
+    let _ = unique_temp_path("a/b", "");
+}

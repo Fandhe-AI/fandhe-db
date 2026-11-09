@@ -121,15 +121,8 @@ mod tests {
     /// 意図的に読み口を閉じることが検証の核心のため、専用の実装を持つ）。
     fn spawn_child_with_closed_stderr(mode: &str) -> (std::process::ExitStatus, String) {
         let exe = std::env::current_exe().expect("current_exe");
-        let signal_path = std::env::temp_dir().join(format!(
-            "engine-stderr-log-signal-{}-{}-{}",
-            std::process::id(),
-            mode,
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or_default()
-        ));
+        let signal_path =
+            crate::test_util::temp_db::unique_temp_path(&format!("stderr-log-signal-{mode}"), "");
         let _ = std::fs::remove_file(&signal_path);
 
         let mut cmd = std::process::Command::new(&exe);
