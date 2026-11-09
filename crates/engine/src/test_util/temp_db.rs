@@ -16,6 +16,8 @@
 //!   意図的に `std` のみに依存し `crate::` を一切参照しない（dependency-policy 準拠、
 //!   外部依存なし）
 //!
+//! 追加 API: `unique_temp_path(label, suffix)` は `.redb` 以外（marker／signal ファイル）用。
+//!
 //! 契約: 呼び出し側 API（`unique_db_path(label)` / `CleanupGuard(path)` /
 //! `TempDir::new(label)` / `TempDir::path()` / `TempDir::db_path()` / `tempdir()`）は
 //! 従来の複製版とシグネチャ互換を維持し、既存の 100 箇所超の呼び出しサイトを
@@ -115,6 +117,23 @@ pub fn unique_db_path(label: &str) -> PathBuf {
     let mut path = std::env::temp_dir();
     path.push(format!(
         "fandhe-db-{}-{label}-{}-{:x}-{seq}.redb",
+        env!("CARGO_CRATE_NAME"),
+        std::process::id(),
+        process_salt(),
+    ));
+    path
+}
+
+/// 拡張子なしの marker／signal ファイル等、`.redb` 以外の用途向けに一意なパスを払い出す
+/// （Issue #2254。`recovery::fail_fast`・`recovery::stderr_log` の子プロセス連携で使う）。
+/// 名前は `fandhe-db-{crate}-{label}-{pid}-{salt}-{seq}{suffix}`。ファイルは作成しない。
+pub fn unique_temp_path(label: &str, suffix: &str) -> PathBuf {
+    validate_label(label);
+    validate_label(suffix);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let mut path = std::env::temp_dir();
+    path.push(format!(
+        "fandhe-db-{}-{label}-{}-{:x}-{seq}{suffix}",
         env!("CARGO_CRATE_NAME"),
         std::process::id(),
         process_salt(),
