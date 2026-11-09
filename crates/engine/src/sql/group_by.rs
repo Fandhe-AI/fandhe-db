@@ -580,7 +580,7 @@ fn accumulate_row(
         }
         // Issue #1488: `COUNT(DISTINCT)` は専用経路で観測し、新規キー確定時に
         // `distinct_budget` へその場で計上する（状態は集合のみで TEXT 予算の対象外）。
-        if matches!(accumulator, Accumulator::CountDistinct { .. }) {
+        if matches!(accumulator, Accumulator::CountDistinct(_)) {
             accumulator.observe_distinct(
                 &item.input,
                 id,
