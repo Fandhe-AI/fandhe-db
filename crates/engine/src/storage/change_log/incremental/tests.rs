@@ -756,7 +756,7 @@ fn apply_never_touches_the_restore_generation_table() {
     use super::super::super::restore_generation::RESTORE_GENERATION_TABLE_NAME as NAME;
     let fx = Fixture::new("inc-restore-gen");
     fx.write_round_1();
-    let (base, point) = fx.full_backup("base.redb");
+    let (base, _) = fx.full_backup("base.redb");
     let work = TempDir::new("inc-restore-gen-work");
     let change = TableChange {
         name: NAME.to_string(),
@@ -793,6 +793,10 @@ fn apply_never_touches_the_restore_generation_table() {
             let mut s = Storage::open(&restored).expect("open copy");
             s.advance_restore_generation().expect("advance")
         };
+        // 世代を進めると timeline が分岐する（Issue #3100）ため、偽造の起点は進めた後の複製から取る。
+        // 古い起点では `ForeignTimeline` が先に拒否してしまい、本試験の意図（復元の世代の表への
+        // レコードによる書き換えの拒否）を確かめられない。
+        let point = chain_point_of(&restored).expect("forked point");
         let seg = forge_segment(
             &work.path().join(format!("{label}.seg")),
             &point,
@@ -1229,5 +1233,126 @@ fn export_rejects_an_interior_gap_even_when_the_archive_covers_it() {
             .export_incremental_with_archive(&point, archive.path(), &dest),
         Err(IncrementalError::RangeUnavailable)
     ));
+    assert!(!dest.exists());
+}
+// ---------------------------------------------------------------------------
+// 復元による履歴の分岐の検出（Issue #3100・RECOVER-14・RECOVER-17）
+// ---------------------------------------------------------------------------
+
+/// 元の DB の系統（T1）と、そのベースを復元して世代を進めた系統（T2）を作る。
+struct Forked {
+    work: TempDir,
+    /// 元の系統のベースと、そこからの増分。
+    base: PathBuf,
+    inc_orig: PathBuf,
+    /// 復元した系統のフルバックアップと、そこからの増分。
+    base_r: PathBuf,
+    inc_r: PathBuf,
+    /// 元の系統の終点。
+    point: ChainPoint,
+}
+
+/// 適用先の全表の内容（拒否時に DB へ触れていないことの確認に使う）。
+fn dump_of(path: &Path) -> oracle::Model {
+    let db = redb::Database::open(path).expect("open");
+    dump_db(&db)
+}
+
+fn forked() -> Forked {
+    let fx = Fixture::new("inc-fork");
+    fx.write_round_1();
+    let (base, point) = fx.full_backup("base.redb");
+    fx.write_round_2();
+    let inc_orig = fx.increment(&point, "orig.seg");
+
+    // 復元した DB（R）。ベースの複製の世代を進める（wire-server の `restore` が通る点と同じ）。
+    let work = private_dir("inc-fork-work");
+    let r_path = copy_to(&base, &work, "r.redb");
+    {
+        let mut s = Storage::open(&r_path).expect("open restored");
+        s.advance_restore_generation().expect("advance");
+    }
+    let mut r = Storage::open(&r_path).expect("reopen restored");
+    r.enable_change_log().expect("continuity after fork");
+    let r = Fixture {
+        _db_dir: private_dir("inc-fork-r-db"),
+        out: private_dir("inc-fork-r-out"),
+        core: EngineCore::from_storage(r, Box::new(CpuScalarProvider)),
+    };
+    let (base_r, point_r) = r.full_backup("base_r.redb");
+    assert!(point_r.timeline > point.timeline, "the timeline forks");
+    assert_eq!(point_r.db_id, point.db_id, "same DB id");
+    r.sql("INSERT INTO ev (id, embedding) VALUES (500, '[0.9,0.9]')");
+    let inc_r = r.increment(&point_r, "r.seg");
+    // R のフィクスチャの出力先が破棄されても残るよう work へ複製する。
+    let base_r = copy_to(&base_r, &work, "base_r.redb");
+    let inc_r = copy_to(&inc_r, &work, "r.seg");
+    let base = copy_to(&base, &work, "base_keep.redb");
+    let inc_orig = copy_to(&inc_orig, &work, "orig_keep.seg");
+    Forked {
+        work,
+        base,
+        inc_orig,
+        base_r,
+        inc_r,
+        point,
+    }
+}
+
+#[test]
+fn fork_original_increment_is_rejected_on_the_restored_base_without_touching_it() {
+    let f = forked();
+    let target = copy_to(&f.base_r, &f.work, "t1.redb");
+    let before = dump_of(&target);
+    let r = apply_incremental_segments(&target, std::slice::from_ref(&f.inc_orig));
+    assert!(matches!(r, Err(IncrementalError::ForeignTimeline)), "{r:?}");
+    assert!(dump_of(&target) == before, "untouched");
+}
+
+#[test]
+fn fork_restored_increment_is_rejected_on_the_original_base() {
+    let f = forked();
+    let target = copy_to(&f.base, &f.work, "t2.redb");
+    let before = dump_of(&target);
+    let r = apply_incremental_segments(&target, std::slice::from_ref(&f.inc_r));
+    assert!(matches!(r, Err(IncrementalError::ForeignTimeline)), "{r:?}");
+    assert!(dump_of(&target) == before, "untouched");
+}
+
+#[test]
+fn fork_mixing_both_lineages_in_one_chain_is_rejected() {
+    let f = forked();
+    for order in [
+        vec![f.inc_orig.clone(), f.inc_r.clone()],
+        vec![f.inc_r.clone(), f.inc_orig.clone()],
+    ] {
+        for base in [&f.base, &f.base_r] {
+            let target = copy_to(base, &f.work, "t3.redb");
+            let before = dump_of(&target);
+            assert!(apply_incremental_segments(&target, &order).is_err());
+            assert!(dump_of(&target) == before, "untouched");
+            std::fs::remove_file(&target).expect("rm");
+        }
+    }
+}
+
+#[test]
+fn fork_restored_lineage_applies_on_its_own_base() {
+    let f = forked();
+    let target = copy_to(&f.base_r, &f.work, "t4.redb");
+    apply_incremental_segments(&target, std::slice::from_ref(&f.inc_r)).expect("own chain");
+}
+
+#[test]
+fn fork_incremental_against_the_original_base_point_is_rejected() {
+    // 復元した系統の DB から、元のベースの終点を基準にした増分は出せない。
+    let f = forked();
+    let r_db = copy_to(&f.base_r, &f.work, "live.redb");
+    let mut s = Storage::open(&r_db).expect("open");
+    s.enable_change_log().expect("enable");
+    let out = private_dir("inc-fork-out");
+    let dest = out.path().join("x.seg");
+    let r = s.export_incremental(&f.point, &dest);
+    assert!(matches!(r, Err(IncrementalError::ForeignTimeline)), "{r:?}");
     assert!(!dest.exists());
 }

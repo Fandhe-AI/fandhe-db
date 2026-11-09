@@ -64,6 +64,7 @@ use redb::{
 pub(crate) mod archive;
 pub(crate) mod backlog;
 pub(crate) mod disable;
+pub(crate) mod fork;
 pub(crate) mod incremental;
 #[cfg(any(test, feature = "change-log-oracle"))]
 pub(crate) mod oracle;
@@ -96,7 +97,7 @@ const META_KEY_BASE_GENERATION: &str = "base_generation";
 /// 最後の LSN を保てるよう、本値を参照する。
 const META_KEY_ARCHIVED_LSN: &str = "archived_lsn";
 
-/// timeline の初期値（PITR・復元のたびに分岐する番号。#2446 と整合させる決め方は後続）。
+/// timeline の初期値。復元のたびに `max(復元の世代, 旧 timeline + 1)` へ分岐する（Issue #3100・[`fork`]）。
 pub(crate) const INITIAL_TIMELINE: u64 = 1;
 /// DB 識別子のバイト数。
 pub(crate) const DB_ID_LEN: usize = 16;
