@@ -538,6 +538,15 @@ redb トランザクションで DB 内の `change_log` 表へ追記されます
   10 ベースの変更ログが連続しない、11 プライマリの拒否（別系統・保持範囲の外・認証失敗）。失敗時は最終名に何も残りません。
 - 復元の世代番号（`SHOW restore_generation`）は進めません（プライマリの値のまま）。出力先にはデータベースと同程度の空きが要ります。
 
+**昇格**（Issue #3132。RECOVER-15 (4)(5) ポインタ。判断は [docs/design/replication-streaming.md](docs/design/replication-streaming.md) の「実装判断（Issue #3132）」、手順は [docs/design/replication-operations.md](docs/design/replication-operations.md) の 5）:
+
+- 運用者の明示操作でレプリカをプライマリへ昇格します（自動フェイルオーバーではありません）。レプリカのプロセスを止めてから
+  `wire-server replica-promote --db <レプリカ DB>` を実行すると、整合検査の後に変更ログの timeline を分岐させ、
+  `replica-promote done: applied_lsn=<N>` と、旧プライマリで受け取っていない commit（`<N>` より後）が失われる旨を標準出力へ出します。
+  昇格した DB は `--change-log`（新しい `--change-log-archive-dir`）付きの通常起動でプライマリになります。
+- 終了コード: 0 成功、1 実行時の失敗（使用中など）、2 引数の拒否、4・5 整合検査の矛盾・検査不能、10 レプリカのベースでない・変更ログが連続しない。
+  失敗時は DB を変えません。旧系統のレプリカ・旧プライマリは別の timeline として拒否され、新しいプライマリからの再同期が要ります。
+
 **読み取りレプリカモード**（Issue #2175。RECOVER-15 ポインタ。判断は [docs/design/replication-streaming.md](docs/design/replication-streaming.md) の「実装判断（Issue #2175）」）:
 
 - `wire-server --users <file> --db <base> --replica-primary <ip:port> --replica-credentials <file>` で、適用ループと通常の
