@@ -71,6 +71,7 @@ pub(crate) mod oracle;
 #[cfg(test)]
 mod oracle_tests;
 pub(crate) mod pitr;
+pub(crate) mod promote;
 pub(crate) mod replica_apply;
 pub(crate) mod replica_base;
 pub(crate) mod stream;

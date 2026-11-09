@@ -63,7 +63,7 @@ pub(crate) fn next_generation(current: u64, floor: u64) -> Result<u64> {
 }
 
 /// 現在時刻に基づく下限。時計が取れない・範囲外の場合は `Err`。
-fn clock_floor() -> Result<u64> {
+pub(crate) fn clock_floor() -> Result<u64> {
     let d = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|_| StorageError::Codec("system clock is before the epoch".to_string()))?;
