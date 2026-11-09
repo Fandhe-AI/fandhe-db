@@ -238,7 +238,7 @@ fn observe_with_budgets(
     // Issue #1488: `COUNT(DISTINCT)` は専用経路で観測し、新規キー確定時にその場で
     // `DistinctBudget` へ計上する（footprint の before/after 差分は不要）。
     // 状態は `CountDistinct` の集合のみで `text_len` は常に 0 のため TEXT 予算の判定は不要。
-    if matches!(accumulator, Accumulator::CountDistinct { .. }) {
+    if matches!(accumulator, Accumulator::CountDistinct(_)) {
         return accumulator.observe_distinct(input, id, vector, scanned, scratch, distinct_budget);
     }
     let text_before = accumulator.text_len();
@@ -277,7 +277,7 @@ impl ObserveBudgetPlan {
             || accumulators.iter().any(|a| {
                 matches!(
                     a,
-                    Accumulator::CountDistinct { .. }
+                    Accumulator::CountDistinct(_)
                         | Accumulator::StringAgg(_)
                         | Accumulator::ArrayAgg(_)
                 )
@@ -902,6 +902,18 @@ pub(crate) fn classify_aggregate_access(
     }
 }
 
+/// `COUNT(DISTINCT)` の集計状態（SQL-25 (c)・TASK-209）。`seen` は正準化済みキー
+/// （[`Accumulator::observe_distinct`]）の集合、`bytes` はそのキーの累計バイト数
+/// （[`Accumulator::distinct_footprint`] が公開する差分の元で、新規キーのときだけ
+/// [`crate::sql::distinct::DistinctBudget`] へ計上される）。`HashSet` は標準の SipHash
+/// （ランダム鍵）で構築され hash flooding に強い。`Accumulator` のサイズを抑えるため
+/// [`Accumulator::CountDistinct`] は本構造体を Box で包んで持つ（Issue #1489）。
+#[derive(Clone, Default)]
+pub(crate) struct CountDistinctState {
+    seen: std::collections::HashSet<Vec<u8>>,
+    bytes: usize,
+}
+
 /// 集計項目 1 つの実行時アキュムレータ（TASK-166・SQL-13）。すべて O(1) 状態
 /// （`TextMin`/`TextMax` のみ、新しい極値を更新するたびに高々 1 本の `String` を
 /// 保持し直す。`.claude/rules/security.md`「不安全な設計｜無制限リソース確保
@@ -1027,18 +1039,10 @@ pub(crate) enum Accumulator {
     /// `MIN`/`MAX(<TIMESTAMPTZ>)`（Issue #1576）。UTC マイクロ秒（`i64`）の全順序比較。
     TimestampTzMin(Option<i64>),
     TimestampTzMax(Option<i64>),
-    /// `COUNT(DISTINCT <expr>)`（SQL-25 (c)・TASK-209）。`seen` は正準化済み
-    /// キー（[`Accumulator::observe_distinct`]）の集合、`bytes` はそのキーの
-    /// 累計バイト数（[`Accumulator::distinct_footprint`] が呼び出し元へ公開する
-    /// before/after 差分の元。`sql::group_by::accumulate_row`／
-    /// `sql::aggregate` の各 observe 呼び出し箇所が、この差分を
-    /// [`crate::sql::distinct::DistinctBudget`] へ計上する）。`HashSet` は
-    /// 標準の SipHash（ランダム鍵）で構築されるため hash flooding に強い
-    /// （`.claude/rules/security.md`「不安全な設計」対応。追加の依存を要しない）。
-    CountDistinct {
-        seen: std::collections::HashSet<Vec<u8>>,
-        bytes: usize,
-    },
+    /// `COUNT(DISTINCT <expr>)`（SQL-25 (c)・TASK-209）。状態は [`CountDistinctState`]。
+    /// Issue #1489: `HashSet` を inline で持つと enum 全体が 64 バイトになるため Box 化し、
+    /// 最大の inline variant（`NumericAvg` 系）の 48 バイトに揃える。
+    CountDistinct(Box<CountDistinctState>),
     /// `string_agg(<値>, <区切り> [ORDER BY ...])`（SQL-57・Issue #1800）。状態と意味論は
     /// [`crate::sql::string_agg`] が持つ。`DISTINCT` もこの variant の内部で扱う
     /// （`COUNT(DISTINCT)` の [`Accumulator::CountDistinct`] とは別物）。
@@ -1098,10 +1102,7 @@ impl Accumulator {
                     "distinct flag set on a non-COUNT aggregate item",
                 ));
             }
-            return Ok(Accumulator::CountDistinct {
-                seen: std::collections::HashSet::new(),
-                bytes: 0,
-            });
+            return Ok(Accumulator::CountDistinct(Box::default()));
         }
         Self::new(item.func, &item.input)
     }
@@ -1114,7 +1115,7 @@ impl Accumulator {
         #[cfg(test)]
         DISTINCT_FOOTPRINT_CALLS.with(|c| c.set(c.get() + 1));
         match self {
-            Accumulator::CountDistinct { seen, bytes } => (seen.len(), *bytes),
+            Accumulator::CountDistinct(state) => (state.seen.len(), state.bytes),
             Accumulator::StringAgg(state) => state.distinct_footprint(),
             Accumulator::ArrayAgg(state) => state.distinct_footprint(),
             _ => (0, 0),
@@ -1341,7 +1342,7 @@ impl Accumulator {
         // （[`crate::sql::distinct::DistinctBudget`]）は `observe_distinct` 内で行う。
         // Issue #1488: 予算計上を伴うため `observe_distinct` 経由でのみ観測する。
         // ここへ来たら呼び出し元の見落としなので fail-closed に拒否する。
-        if matches!(self, Accumulator::CountDistinct { .. }) {
+        if matches!(self, Accumulator::CountDistinct(_)) {
             return Err(accumulator_bug(
                 "COUNT(DISTINCT) accumulator must be observed via the distinct path",
             ));
@@ -1449,7 +1450,10 @@ impl Accumulator {
         let key = eval_aggregate_input(input, id, vector, scanned, scratch)?.distinct_key()?;
 
         let (seen, bytes) = match self {
-            Accumulator::CountDistinct { seen, bytes } => (seen, bytes),
+            Accumulator::CountDistinct(state) => {
+                let CountDistinctState { seen, bytes } = &mut **state;
+                (seen, bytes)
+            }
             _ => {
                 return Err(accumulator_bug(
                     "observe_distinct called on a non-CountDistinct accumulator",
@@ -2294,7 +2298,7 @@ impl Accumulator {
             // SQL-25 (c)・TASK-209: 空集合・全 NULL はいずれも `0`
             // （PostgreSQL の `COUNT(DISTINCT ...)` と同じ契約。`COUNT` 一般の
             // 「空集合で NULL ではなく 0」という既存契約とも一致する）。
-            Accumulator::CountDistinct { seen, .. } => Cell::Integer(seen.len() as u64),
+            Accumulator::CountDistinct(state) => Cell::Integer(state.seen.len() as u64),
             Accumulator::StringAgg(state) => match state.finish()? {
                 Some(text) => Cell::Text(text),
                 None => Cell::Null,
@@ -4159,10 +4163,7 @@ mod tests {
     /// Issue #1488: `observe` に `CountDistinct` が来たら値の有無に関わらず fail-closed。
     #[test]
     fn observe_rejects_count_distinct_accumulator() {
-        let mut acc = Accumulator::CountDistinct {
-            seen: std::collections::HashSet::new(),
-            bytes: 0,
-        };
+        let mut acc = Accumulator::CountDistinct(Box::default());
         let vector = RowVector {
             dim: 0,
             values: None,
@@ -4177,10 +4178,7 @@ mod tests {
     /// Issue #1488: `observe_distinct` は新規キーのときだけ予算へ計上する。
     #[test]
     fn observe_distinct_charges_only_new_keys() {
-        let mut acc = Accumulator::CountDistinct {
-            seen: std::collections::HashSet::new(),
-            bytes: 0,
-        };
+        let mut acc = Accumulator::CountDistinct(Box::default());
         let vector = RowVector {
             dim: 0,
             values: None,
@@ -4701,13 +4699,19 @@ mod tests {
         assert_eq!(acc.observe_vector(&[1.0]).unwrap_err().wire_code(), "XX000");
     }
 
-    /// Issue #1803: 分散系の variant を足しても `Accumulator` は大きくならない（GROUP BY のグループごとに
-    /// 持つため、`join::aggregate` の予算計算の前提）。最大の既存 variant は `CountDistinct`。
+    /// Issue #1489: `CountDistinct` の集合を Box 化して、`Accumulator` を `CountDistinct` 追加前の
+    /// 48 バイト（`NumericAvg` 系 payload: `Option<i128>`＋u64＋u8×2、align 16）に保つ。GROUP BY の
+    /// グループごと・集計項目ごとに持つため、`join::aggregate` の予算計算の前提でもある。
+    #[cfg(target_pointer_width = "64")]
     #[test]
-    fn variance_variants_do_not_grow_accumulator() {
-        let largest_existing =
-            std::mem::size_of::<(std::collections::HashSet<Vec<u8>>, usize)>() + 8;
-        assert!(std::mem::size_of::<Accumulator>() <= largest_existing);
+    fn accumulator_size_matches_pre_count_distinct_layout() {
+        assert_eq!(std::mem::size_of::<Accumulator>(), 48);
+        assert_eq!(std::mem::size_of::<(Option<i128>, u64, u8, u8)>(), 48);
+        // HashSet が inline に戻る退行の検出。
+        assert!(
+            std::mem::size_of::<Accumulator>()
+                < std::mem::size_of::<(std::collections::HashSet<Vec<u8>>, usize)>()
+        );
     }
 
     /// Issue #1803: 分散系の結果型は整数系・numeric 入力が numeric、浮動小数・数値式が double。
