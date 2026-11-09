@@ -326,6 +326,7 @@ fn l2_normalize_corpus_rejects_length_not_multiple_of_dim() {
 
 #[cfg(feature = "contrast-bench")]
 mod usearch_adapter_tests {
+    use super::average_recall_at_k;
     use super::harness::hnsw_compare::usearch_adapter::{
         build_usearch_index_parallel, usearch_index_options, usearch_search_topk,
     };
@@ -346,6 +347,25 @@ mod usearch_adapter_tests {
         assert!(!options.multi);
     }
 
+    /// 並列構築テストが使うクエリ件数。1 件だと 1 つの取りこぼしで閾値に触れるため、
+    /// 複数件の平均 Recall で判定する（Issue #2255）。
+    const RECALL_QUERIES: usize = 32;
+
+    /// 単一・並列それぞれの平均 Recall@k の下限。元の 1 クエリ基準（4/5 = 0.8）を
+    /// 下回らない値で、負荷下の実測最小（0.9125）に余裕を残して決めた。
+    const MIN_AVG_RECALL: f64 = 0.85;
+
+    /// 並列側が単一側からどこまで劣化してよいかの許容幅。
+    const MAX_PARALLEL_DEGRADATION: f64 = 0.1;
+
+    /// usearch の単一スレッド構築と 4 スレッド並列構築が、brute-force 参照
+    /// （`CpuScalarProvider`）に対して近い平均 Recall を保つことの配線確認。
+    ///
+    /// 単一スレッド構築は挿入順とレベル乱数が固定で決定的だが、並列構築は
+    /// 挿入の割り込み順でグラフが実行ごとに変わる（Issue #2255 の実測では 1 クエリ
+    /// の top-5 が 4/5 や 3/5 になる実行が混ざった）。このため 1 クエリの個数一致
+    /// ではなく複数クエリの平均 Recall で判定し、brute-force 比の下限と、
+    /// 単一側に対する並列側の劣化幅の上限の両方を検査する。
     #[test]
     fn build_usearch_index_parallel_with_multiple_threads_matches_single_thread_recall() {
         let mut rng = DeterministicRng::new(11);
@@ -353,7 +373,10 @@ mod usearch_adapter_tests {
         for _ in 0..ROWS {
             vectors.extend(rng.next_vector(DIM));
         }
-        let query = rng.next_vector(DIM);
+        let mut queries = Vec::with_capacity(RECALL_QUERIES * DIM);
+        for _ in 0..RECALL_QUERIES {
+            queries.extend(rng.next_vector(DIM));
+        }
 
         let single = build_usearch_index_parallel(ROWS, DIM, &vectors, 1)
             .expect("single-threaded usearch build succeeds");
@@ -364,41 +387,45 @@ mod usearch_adapter_tests {
         assert_eq!(parallel.size(), ROWS);
 
         let ids: Vec<u64> = (0..ROWS as u64).collect();
-        let reference = CpuScalarProvider
-            .search(SearchInput {
-                ids: &ids,
-                vectors: &vectors,
-                dim: DIM as u32,
-                query: &query,
-                k: TOP_K,
-            })
-            .expect("reference search succeeds");
-        let expected: Vec<u64> = reference.into_iter().map(|hit| hit.id).collect();
+        let mut single_pairs = Vec::with_capacity(RECALL_QUERIES);
+        let mut parallel_pairs = Vec::with_capacity(RECALL_QUERIES);
+        for query in queries.chunks(DIM) {
+            let reference = CpuScalarProvider
+                .search(SearchInput {
+                    ids: &ids,
+                    vectors: &vectors,
+                    dim: DIM as u32,
+                    query,
+                    k: TOP_K,
+                })
+                .expect("reference search succeeds");
+            let expected: Vec<u64> = reference.into_iter().map(|hit| hit.id).collect();
+            let single_topk = usearch_search_topk(&single, query, TOP_K)
+                .expect("single-threaded search succeeds");
+            let parallel_topk =
+                usearch_search_topk(&parallel, query, TOP_K).expect("parallel search succeeds");
+            single_pairs.push((expected.clone(), single_topk));
+            parallel_pairs.push((expected, parallel_topk));
+        }
+        let single_avg = average_recall_at_k(&single_pairs).expect("single recall computes");
+        let parallel_avg = average_recall_at_k(&parallel_pairs).expect("parallel recall computes");
 
-        let single_topk =
-            usearch_search_topk(&single, &query, TOP_K).expect("single-threaded search succeeds");
-        let parallel_topk =
-            usearch_search_topk(&parallel, &query, TOP_K).expect("parallel search succeeds");
-
-        // usearch は近似探索のため厳密一致は要求しないが、この小規模フィクスチャ
-        // （300 点・16 次元）では上位 5 件が brute-force 対照とほぼ一致する
-        // ことを配線確認として使う（`contrast_smoke.rs` と異なり `search`
-        // は近似探索であるため `recall == 1.0` は要求しない）。
-        let single_hits = single_topk
-            .iter()
-            .filter(|id| expected.contains(id))
-            .count();
-        let parallel_hits = parallel_topk
-            .iter()
-            .filter(|id| expected.contains(id))
-            .count();
+        // usearch は近似探索のため厳密一致は要求しない（`contrast_smoke.rs` と異なり
+        // `recall == 1.0` は要求しない）。brute-force 対照との平均 Recall で配線を確認する。
         assert!(
-            single_hits >= TOP_K - 1,
-            "single-threaded usearch top-{TOP_K} should closely match brute-force reference"
+            single_avg >= MIN_AVG_RECALL,
+            "single-threaded avg recall@{TOP_K}={single_avg} < {MIN_AVG_RECALL} \
+             (queries={RECALL_QUERIES})"
         );
         assert!(
-            parallel_hits >= TOP_K - 1,
-            "parallel usearch top-{TOP_K} should closely match brute-force reference"
+            parallel_avg >= MIN_AVG_RECALL,
+            "parallel avg recall@{TOP_K}={parallel_avg} < {MIN_AVG_RECALL} \
+             (queries={RECALL_QUERIES}, single={single_avg})"
+        );
+        assert!(
+            parallel_avg >= single_avg - MAX_PARALLEL_DEGRADATION,
+            "parallel avg recall@{TOP_K}={parallel_avg} degraded more than \
+             {MAX_PARALLEL_DEGRADATION} from single={single_avg}"
         );
     }
 
