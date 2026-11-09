@@ -479,7 +479,12 @@ struct NestedWorkDir {
 /// 自分所有の 0600 系通常ファイルでスナップショット一時名のものだけのときに限り計画を返す。1 段より深い
 /// 入れ子は受理しない。外れれば `None`（呼び出し側が見送りに数える）。
 #[cfg(unix)]
-fn plan_nested_work_dir(access: &Path, real: &Path, ctx: &SweepCtx<'_>) -> Option<NestedWorkDir> {
+fn plan_nested_work_dir(
+    access: &Path,
+    real: &Path,
+    is_inner_name: fn(&str) -> bool,
+    ctx: &SweepCtx<'_>,
+) -> Option<NestedWorkDir> {
     use std::os::unix::fs::MetadataExt;
     let meta = std::fs::symlink_metadata(access).ok()?;
     if !meta.is_dir()
@@ -517,7 +522,7 @@ fn plan_nested_work_dir(access: &Path, real: &Path, ctx: &SweepCtx<'_>) -> Optio
         }
         let fname = entry.file_name();
         let n = fname.to_str()?;
-        if !is_snapshot_temp_name(n) {
+        if !is_inner_name(n) {
             return None;
         }
         let child = inner.join(n);
@@ -613,10 +618,22 @@ fn sweep_work_dir(
             skip(sweep);
             return;
         };
-        if is_snapshot_work_dir_name(child_name) {
-            let Some(n) =
-                plan_nested_work_dir(&access.join(child_name), &path.join(child_name), ctx)
-            else {
+        // 入れ子の作業ディレクトリは、プライマリのサーバーが作るスナップショット用と、
+        // `verify` のコピー経路が作る検証用（Issue #3136）の 2 種類だけを受理する。
+        let inner_pred: Option<fn(&str) -> bool> = if is_snapshot_work_dir_name(child_name) {
+            Some(is_snapshot_temp_name)
+        } else if is_verify_work_dir_name(child_name) {
+            Some(is_verify_temp_name)
+        } else {
+            None
+        };
+        if let Some(inner_pred) = inner_pred {
+            let Some(n) = plan_nested_work_dir(
+                &access.join(child_name),
+                &path.join(child_name),
+                inner_pred,
+                ctx,
+            ) else {
                 skip(sweep);
                 return;
             };
