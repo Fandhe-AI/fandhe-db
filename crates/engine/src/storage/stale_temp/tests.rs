@@ -171,6 +171,11 @@ fn reserved_temp_name_covers_every_swept_format() {
         ".fandhe-restore-4242-0123456789abcdef-7.tmp",
         ".fandhe-seg-4242-0123456789abcdef-7.tmp",
         ".fandhe-sweep-probe-4242-0123456789abcdef-0.tmp",
+        ".fandhe-verify-4242-7.tmp",
+        ".fandhe-verify-4242-0123456789abcdef-7.tmp",
+        ".fandhe-verify-4242-0123456789abcdef-7.d",
+        ".fandhe-dump-4242-7.tmp",
+        ".fandhe-dump-restore-4242-7.d",
     ] {
         assert!(is_reserved_temp_name(n), "{n}");
     }
@@ -179,7 +184,10 @@ fn reserved_temp_name_covers_every_swept_format() {
         ".fandhe-restore-decoy.tmp",
         ".fandhe-restore-4242-7.tmp.bak",
         ".fandhe-seg-4242-7.tmp",
-        ".fandhe-verify-4242-0123456789abcdef-7.tmp",
+        ".fandhe-verify-decoy.tmp",
+        ".fandhe-dump-decoy.tmp",
+        ".fandhe-dump-restore-4242-7.tmp",
+        ".db-4242-7.tmp",
     ] {
         assert!(!is_reserved_temp_name(n), "{n}");
     }
@@ -370,5 +378,102 @@ fn plain_sweep_never_touches_work_dirs() {
     let s = sweep(&d);
     assert_eq!((s.removed, s.skipped), (0, 0));
     assert!(d.join(".w-1.d").exists());
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// verify・dump・dump-restore の各形式は厳密に判定され、互いの形式と取り違えない（Issue #3136）。
+#[test]
+fn verify_and_dump_formats_are_matched_strictly() {
+    for ok in [
+        ".fandhe-verify-1-7.tmp",
+        ".fandhe-verify-4242-0123456789abcdef-18446744073709551615.tmp",
+    ] {
+        assert!(is_verify_temp_name(ok), "{ok}");
+    }
+    for bad in [
+        ".fandhe-verify-1.tmp",
+        ".fandhe-verify-1-0123456789ABCDEF-7.tmp",
+        ".fandhe-verify-1-0123456789abcdef-7.tmp.bak",
+        ".fandhe-verify-1-0123456789abcdef-7.d",
+        ".fandhe-verify-12345678901-7.tmp",
+        ".fandhe-verify--7.tmp",
+        ".fandhe-verify-1-2-3-4.tmp",
+    ] {
+        assert!(!is_verify_temp_name(bad), "{bad}");
+    }
+    assert!(is_verify_work_dir_name(
+        ".fandhe-verify-1-0123456789abcdef-7.d"
+    ));
+    for bad in [
+        ".fandhe-verify-1-7.d",
+        ".fandhe-verify-1-0123456789ABCDEF-7.d",
+        ".fandhe-verify-1-0123456789abcdef-7.d.bak",
+        ".fandhe-restore-1-0123456789abcdef-7.d",
+    ] {
+        assert!(!is_verify_work_dir_name(bad), "{bad}");
+    }
+    assert!(is_dump_temp_name(".fandhe-dump-1-7.tmp"));
+    for bad in [
+        ".fandhe-dump-1.tmp",
+        ".fandhe-dump-1-7.tmp.bak",
+        ".fandhe-dump-1-7-8.tmp",
+        ".fandhe-dump-restore-1-7.tmp",
+        ".fandhe-dump-restore-1-7.d",
+        ".fandhe-dump-a-7.tmp",
+        ".fandhe-dump-1-7.d",
+    ] {
+        assert!(!is_dump_temp_name(bad), "{bad}");
+    }
+    assert!(is_dump_restore_work_dir_name(".fandhe-dump-restore-1-7.d"));
+    for bad in [
+        ".fandhe-dump-restore-1-7.tmp",
+        ".fandhe-dump-restore-1.d",
+        ".fandhe-dump-restore-1-7-8.d",
+        ".fandhe-dump-1-7.d",
+        ".fandhe-dump-restore-1-7.d.bak",
+    ] {
+        assert!(!is_dump_restore_work_dir_name(bad), "{bad}");
+    }
+    assert!(is_dump_restore_db_temp_name(".db-1-7.tmp"));
+    for bad in [
+        ".db-1.tmp",
+        ".db-1-7.tmp.bak",
+        ".db-1-7-8.tmp",
+        "db-1-7.tmp",
+        ".db-a-7.tmp",
+    ] {
+        assert!(!is_dump_restore_db_temp_name(bad), "{bad}");
+    }
+}
+
+fn sweep_wd_children(dir: &Path) -> StaleTempSweep {
+    sweep_stale_temps_with_work_dir_children(dir, is_name, is_wd, is_child, &[]).expect("sweep")
+}
+
+fn is_child(n: &str) -> bool {
+    n.strip_prefix(".c-")
+        .and_then(|r| r.strip_suffix(".tmp"))
+        .is_some_and(|r| is_decimal(r, 10))
+}
+
+/// 中身の判定は親直下の判定と分かれる。中身判定だけに一致するものは作業ディレクトリの中でだけ消え、
+/// 親直下に同名があっても触らず数えない。中身が中身判定に合わなければ作業ディレクトリごと見送る。
+#[test]
+fn work_dir_children_use_their_own_predicate() {
+    let d = tdir("wd-children");
+    let w = mk_wd(&d, ".w-1.d", 0o700);
+    put(&w, ".c-1.tmp", 0o600);
+    put(&d, ".c-9.tmp", 0o600);
+    let s = sweep_wd_children(&d);
+    assert_eq!((s.removed, s.skipped, s.failed), (1, 0, 0));
+    assert!(!d.join(".w-1.d").exists());
+    assert!(d.join(".c-9.tmp").exists());
+
+    // 親直下の判定にだけ一致する名前は、作業ディレクトリの中身としては認めない。
+    let w2 = mk_wd(&d, ".w-2.d", 0o700);
+    put(&w2, ".t-1.tmp", 0o600);
+    let s = sweep_wd_children(&d);
+    assert_eq!((s.removed, s.skipped, s.failed), (0, 1, 0));
+    assert!(w2.join(".t-1.tmp").exists());
     let _ = std::fs::remove_dir_all(&d);
 }
