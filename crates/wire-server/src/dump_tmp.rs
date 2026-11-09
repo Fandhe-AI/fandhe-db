@@ -295,12 +295,21 @@ impl WorkDir {
                 Err(e) => return Err(io_err(e)),
             }
         };
-        let fail = |path: &Path, e: TmpError| {
+        // fd を得る前の失敗には照合の基準が無いので、従来どおり best-effort で消す（空のディレクトリしか消えない）。
+        let fail_unverified = |path: &Path, e: TmpError| {
             let _ = std::fs::remove_dir(path);
             e
         };
-        let dir = File::open(&path).map_err(|e| fail(&path, io_err(e)))?;
-        let m = dir.metadata().map_err(|e| fail(&path, io_err(e)))?;
+        let dir = File::open(&path).map_err(|e| fail_unverified(&path, io_err(e)))?;
+        let m = dir
+            .metadata()
+            .map_err(|e| fail_unverified(&path, io_err(e)))?;
+        // fd を得た後の失敗では、パスが開いた実体のままのときだけ消す（差し替えられた別のディレクトリを消さない。Issue #3137）。
+        let (fd_dev, fd_ino) = (m.dev(), m.ino());
+        let fail = |path: &Path, e: TmpError| {
+            let _ = remove_dir_if_same(path, fd_dev, fd_ino);
+            e
+        };
         // 開いたディレクトリの所有者が mkdir 前に得た自分の uid でなければ（mkdir と open の間の差し替え）、
         // かつ親のパスが mkdir 前に確認した親と同じ実体でなければ拒否する。
         if m.uid() != own_uid || !m.is_dir() {
@@ -348,10 +357,7 @@ impl WorkDir {
         if parent.mode() & 0o022 != 0 {
             return Err(TmpError::InsecureParent);
         }
-        let same = by_path.is_dir()
-            && by_path.dev() == self.dev
-            && by_path.ino() == self.ino
-            && by_path.uid() == self.uid
+        let same = self.path_is_ours(&by_path)
             && fd.is_dir()
             && fd.dev() == self.dev
             && fd.ino() == self.ino
@@ -372,22 +378,42 @@ impl WorkDir {
         }
     }
 
-    /// 以降の drop で作業ディレクトリを消さない（差し替えを検出して別のディレクトリを消さないため。
-    /// Issue #3102。呼び出し側が残ったパスを通知する）。
+    /// 実パスの metadata が、作成時の作業ディレクトリ（通常のディレクトリ・同じ (dev, ino)・同じ所有者）か。
+    /// [`Self::check`] と [`Self::remove`] が同じ条件で判定し、食い違わないようにする（Issue #3137）。
+    fn path_is_ours(&self, by_path: &std::fs::Metadata) -> bool {
+        by_path.is_dir()
+            && by_path.dev() == self.dev
+            && by_path.ino() == self.ino
+            && by_path.uid() == self.uid
+    }
+
+    /// 以降の drop で作業ディレクトリを消さない（後始末を意図的に止めたいときに使う）。
+    /// [`Self::remove`]・drop は自ら実パスを照合するので、差し替えを理由に呼ぶ必要は無い（Issue #3137）。
     pub fn disarm(&mut self) {
         self.armed = false;
     }
 
-    /// 作業ディレクトリを消す（空でなければ消さず、残ったパスを返す）。
+    /// 作業ディレクトリを消す。削除の前に実パスが作成時の実体（(dev, ino)・所有者）のままかを
+    /// 照合し、差し替え（別のディレクトリ・リンク）や照合不能なら消さずに残ったパスを返す
+    /// （fail-closed。Issue #3137。drop も同じ経路）。空でなければ消さず、同じく残ったパスを返す。
+    /// パスが既に無ければ `Ok`。
+    ///
+    /// 照合から `remove_dir` までの窓は残るが、親にグループ・その他が書き込めず所有者も自分という
+    /// 前提（[`check_parent_not_shared`]）のもとでは名前空間を変えられるのは自分だけで、悪用できない。
+    /// `remove_dir` は空のディレクトリしか消さないので、被害の範囲も限られる。
     pub fn remove(&mut self) -> Result<(), PathBuf> {
         if !self.armed {
             return Ok(());
         }
         self.armed = false;
-        match std::fs::remove_dir(&self.path) {
-            Ok(()) => Ok(()),
+        match std::fs::symlink_metadata(&self.path) {
+            Ok(m) if self.path_is_ours(&m) => match std::fs::remove_dir(&self.path) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+                Err(_) => Err(self.path.clone()),
+            },
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
-            Err(_) => Err(self.path.clone()),
+            _ => Err(self.path.clone()),
         }
     }
 
@@ -401,6 +427,17 @@ impl WorkDir {
             Err(e) if e.kind() == ErrorKind::NotFound => None,
             Err(_) => Some(p),
         }
+    }
+}
+
+/// `path` がリンクをたどらずに (dev, ino) の通常のディレクトリを指すときだけ `remove_dir` する。
+/// 差し替え・照合不能・削除失敗は `Err(())`（消さない）。`create_named` の失敗経路から呼ばれる。
+fn remove_dir_if_same(path: &Path, dev: u64, ino: u64) -> Result<(), ()> {
+    let m = std::fs::symlink_metadata(path).map_err(|_| ())?;
+    if m.is_dir() && m.dev() == dev && m.ino() == ino {
+        std::fs::remove_dir(path).map_err(|_| ())
+    } else {
+        Err(())
     }
 }
 
@@ -568,6 +605,93 @@ mod tests {
         assert!(w.check().is_ok());
         drop(w);
         std::fs::remove_dir(&victim).expect("cleanup victim");
+        std::fs::remove_dir(&parent).expect("cleanup");
+    }
+
+    /// 作業ディレクトリを退避し、同じパスに別 inode の空ディレクトリを置く。
+    fn swap_in_decoy(w: &WorkDir, parent: &Path) -> (PathBuf, PathBuf) {
+        let moved = parent.join("moved");
+        std::fs::rename(&w.path, &moved).expect("rename away");
+        std::fs::create_dir(&w.path).expect("decoy");
+        (moved, w.path.clone())
+    }
+
+    #[test]
+    fn work_dir_remove_refuses_a_replaced_directory() {
+        let parent = unique_parent("rmswap");
+        let mut w = WorkDir::create(&parent, "t").expect("create");
+        let (moved, decoy) = swap_in_decoy(&w, &parent);
+        assert_eq!(w.remove(), Err(decoy.clone()));
+        assert!(decoy.is_dir(), "decoy must survive remove");
+        drop(w);
+        assert!(decoy.is_dir(), "decoy must survive drop after remove");
+        std::fs::remove_dir(&decoy).expect("cleanup decoy");
+        std::fs::remove_dir(&moved).expect("cleanup moved");
+        std::fs::remove_dir(&parent).expect("cleanup");
+    }
+
+    #[test]
+    fn work_dir_drop_refuses_a_replaced_directory() {
+        let parent = unique_parent("dropswap");
+        let w = WorkDir::create(&parent, "t").expect("create");
+        let (moved, decoy) = swap_in_decoy(&w, &parent);
+        drop(w);
+        assert!(decoy.is_dir(), "decoy must survive drop");
+        std::fs::remove_dir(&decoy).expect("cleanup decoy");
+        std::fs::remove_dir(&moved).expect("cleanup moved");
+        std::fs::remove_dir(&parent).expect("cleanup");
+    }
+
+    #[test]
+    fn work_dir_remove_refuses_a_symlink_replacement() {
+        let parent = unique_parent("rmlink");
+        let mut w = WorkDir::create(&parent, "t").expect("create");
+        let moved = parent.join("moved");
+        std::fs::rename(&w.path, &moved).expect("rename away");
+        let victim = parent.join("victim");
+        std::fs::create_dir(&victim).expect("victim");
+        std::os::unix::fs::symlink(&victim, &w.path).expect("symlink");
+        assert_eq!(w.remove(), Err(w.path.clone()));
+        assert!(victim.is_dir(), "victim must survive");
+        assert!(std::fs::symlink_metadata(&w.path).is_ok(), "link must stay");
+        let link = w.path.clone();
+        drop(w);
+        std::fs::remove_file(&link).expect("rm link");
+        std::fs::remove_dir(&victim).expect("cleanup victim");
+        std::fs::remove_dir(&moved).expect("cleanup moved");
+        std::fs::remove_dir(&parent).expect("cleanup");
+    }
+
+    #[test]
+    fn work_dir_remove_is_ok_when_path_is_gone() {
+        let parent = unique_parent("rmgone");
+        let mut w = WorkDir::create(&parent, "t").expect("create");
+        let moved = parent.join("moved");
+        std::fs::rename(&w.path, &moved).expect("rename away");
+        assert_eq!(w.remove(), Ok(()));
+        assert!(moved.is_dir());
+        std::fs::remove_dir(&moved).expect("cleanup moved");
+        std::fs::remove_dir(&parent).expect("cleanup");
+    }
+
+    #[test]
+    fn remove_dir_if_same_checks_identity() {
+        let parent = unique_parent("ifsame");
+        let d = parent.join("d");
+        std::fs::create_dir(&d).expect("d");
+        let m = std::fs::metadata(&d).expect("meta");
+        // 別 inode を指す値では消さない。
+        assert!(remove_dir_if_same(&d, m.dev(), m.ino().wrapping_add(1)).is_err());
+        assert!(d.is_dir());
+        // リンクは消さない。
+        let link = parent.join("l");
+        std::os::unix::fs::symlink(&d, &link).expect("link");
+        assert!(remove_dir_if_same(&link, m.dev(), m.ino()).is_err());
+        assert!(link.exists());
+        std::fs::remove_file(&link).expect("rm link");
+        // 一致すれば消す。
+        assert!(remove_dir_if_same(&d, m.dev(), m.ino()).is_ok());
+        assert!(!d.exists());
         std::fs::remove_dir(&parent).expect("cleanup");
     }
 }
