@@ -12,6 +12,10 @@
   （呼び出し側がサーバーを SIGKILL する直前までの確認済み最大 id を知るための同期点）。
 - `count`: `COUNT=<n> MAXID=<m>` を 1 行で出す（行が飛んでいないかの検査用）。
 
+Issue #3153（RECOVER-14 ポインタ）の PITR 試験向けに `clock` を追加している:
+- `clock`: server の `clock_timestamp()` を 1 本読み、`CLOCK_US=<UTC エポックからの µs>` を出す。
+  変更ログの commit 時刻と同じ時計（server の壁時計）で時刻指定の復元点を決めるために使う。
+
 Issue #2178（RECOVER-15 ポインタ）のレプリケーション障害注入試験
 （`scripts/crash_test_replication.sh`）向けに、以下を追加している（上の 3 つの挙動は変えない）:
 - `rsetup`: 3 表（docs・kv・markers）を作り、種の行を入れる（alice 用。DDL 権限が要る）。
@@ -25,7 +29,9 @@ Issue #2178（RECOVER-15 ポインタ）のレプリケーション障害注入�
 - `churn-verify <id-base> <last-ack>`: `churn` の確認済み操作列から導いた docs・kv の期待状態と照合する。
 """
 
+import calendar
 import hashlib
+import re
 import socket
 import struct
 import sys
@@ -122,6 +128,49 @@ def query_cols(sock, sql):
             if err is not None:
                 raise RuntimeError("server error: " + _error_message(err))
             return cols, rows
+
+
+_TS_RE = re.compile(
+    r"^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,6}))?(?:([+-])(\d{2})(?::?(\d{2}))?)?$"
+)
+
+
+def parse_timestamptz_us(text):
+    """`YYYY-MM-DD HH:MM:SS[.f][+HH[:MM]]` を UTC エポックからの µs へ変換する。形式外・範囲外は ValueError。
+
+    この server の timestamp はゾーン表記を付けず UTC の壁時計で返す（実測）ため、ゾーン省略は UTC と読む。
+
+    server が返す時刻の文字列を厳密に解析し、黙って丸めない（fail-closed）。float は使わない。
+    """
+    m = _TS_RE.match(text)
+    if m is None:
+        raise ValueError("unexpected timestamptz format: %r" % (text,))
+    year, mon, day, hour, minute, sec = (int(m.group(i)) for i in range(1, 7))
+    frac = (m.group(7) or "").ljust(6, "0")
+    off_h = int(m.group(9) or 0)
+    off_m = int(m.group(10) or 0)
+    if not (1 <= mon <= 12 and 1 <= day <= calendar.monthrange(year, mon)[1]):
+        raise ValueError("date out of range: %r" % (text,))
+    if hour > 23 or minute > 59 or sec > 59 or off_h > 23 or off_m > 59:
+        raise ValueError("time out of range: %r" % (text,))
+    secs = calendar.timegm((year, mon, day, hour, minute, sec, 0, 0, 0))
+    offset = (off_h * 3600 + off_m * 60) * (-1 if m.group(8) == "-" else 1)
+    return (secs - offset) * 1000000 + int(frac)
+
+
+def cmd_clock(sock):
+    """server の壁時計を読んで `CLOCK_US=<µs>` を出す。結果が 1 行 1 列でなければ終了コード 1。"""
+    rows = query(sock, "SELECT clock_timestamp() FROM docs WHERE id >= 0 LIMIT 1")
+    if len(rows) != 1 or len(rows[0]) != 1 or rows[0][0] is None:
+        print("clock: unexpected result shape: %r" % (rows,), file=sys.stderr)
+        return 1
+    try:
+        us = parse_timestamptz_us(rows[0][0])
+    except ValueError as e:
+        print("clock: %s" % e, file=sys.stderr)
+        return 1
+    print("CLOCK_US=%d" % us, flush=True)
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -341,6 +390,8 @@ def main(argv):
     elif cmd == "count":
         rows = query(sock, "SELECT count(*), max(id) FROM docs")
         print("COUNT=%s MAXID=%s" % rows[0], flush=True)
+    elif cmd == "clock":
+        return cmd_clock(sock)
     elif cmd == "rsetup":
         cmd_rsetup(sock)
     elif cmd == "rseed":
