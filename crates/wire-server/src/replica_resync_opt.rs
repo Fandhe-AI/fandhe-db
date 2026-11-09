@@ -9,16 +9,20 @@
 //!   フルバックアップを取る
 //! - `--out <path>`: 新しいレプリカ DB のパス。**まだ存在しない新規パスに限る**（上書きのフラグは設けない。
 //!   古いレプリカ DB は運用者が退避または削除する）
-//! - `--primary <ip:port>`・`--credentials <file>`: プライマリのレプリケーション endpoint（ループバックのみ）と
-//!   資格情報ファイル（`replica` と同じ検証。[`crate::replica_opt`]）
+//! - `--primary <ip:port>`・`--credentials <file>`: プライマリのレプリケーション endpoint（ピンなしならループバック
+//!   のみ）と資格情報ファイル（`replica` と同じ検証。[`crate::replica_opt`]）
+//! - `--primary-tls-cert <pem>`（Issue #2177）: プライマリの証明書のピン（`replica` と同じ。指定すると確認接続を
+//!   TLS で行い、証明書が一致しなければ何も公開しない）
 //!
 //! 重複指定・不正値・未知のフラグは拒否で、エラー文は固定の英語（値・パス・資格情報を含まない）。
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::backup_opt;
 use crate::replica_opt;
+use crate::tls::client_handshake::PinnedServerCertificate;
 
 /// 終了コード: 成功（`replica-resync written: ...`）。
 pub const EXIT_OK: u8 = 0;
@@ -43,8 +47,10 @@ pub struct ReplicaResyncOptions {
     pub socket: PathBuf,
     /// 新しいレプリカ DB の絶対パス（まだ存在しない）。
     pub out: PathBuf,
-    /// プライマリのレプリケーション endpoint（ループバック）。
+    /// プライマリのレプリケーション endpoint（ピンがなければループバック）。
     pub primary: SocketAddr,
+    /// プライマリの証明書のピン（Issue #2177。`replica` と同じ）。`Some` なら確認接続を TLS で行う。
+    pub primary_tls: Option<Arc<PinnedServerCertificate>>,
     /// 認証ロール名。
     pub role: String,
     /// パスワード（ログ・エラー文・`Debug` に出さない）。
@@ -56,6 +62,7 @@ impl std::fmt::Debug for ReplicaResyncOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ReplicaResyncOptions")
             .field("primary", &self.primary)
+            .field("tls", &self.primary_tls.is_some())
             .field("role", &self.role)
             .finish_non_exhaustive()
     }
@@ -67,12 +74,14 @@ pub fn parse(args: &[String]) -> Result<ReplicaResyncOptions, String> {
     let mut out: Option<&str> = None;
     let mut primary: Option<&str> = None;
     let mut credentials: Option<&str> = None;
+    let mut primary_tls: Option<&str> = None;
     let mut it = args.iter();
     while let Some(flag) = it.next() {
         let slot = match flag.as_str() {
             "--socket" => &mut socket,
             "--out" => &mut out,
             "--primary" => &mut primary,
+            "--primary-tls-cert" => &mut primary_tls,
             "--credentials" => &mut credentials,
             _ => return Err("unknown argument for replica-resync".to_string()),
         };
@@ -95,7 +104,8 @@ pub fn parse(args: &[String]) -> Result<ReplicaResyncOptions, String> {
     let primary: SocketAddr = primary
         .parse()
         .map_err(|_| "--primary must be an ip:port address".to_string())?;
-    replica_opt::check_primary_loopback(&primary)?;
+    let primary_tls = replica_opt::load_primary_pin(primary_tls.map(Path::new))?;
+    replica_opt::check_primary_transport(&primary, primary_tls.is_some())?;
     let (role, password) = replica_opt::load_credentials(Path::new(credentials))?;
 
     let out = backup_opt::validate_new_path("--out", out)?;
@@ -112,6 +122,7 @@ pub fn parse(args: &[String]) -> Result<ReplicaResyncOptions, String> {
         socket: PathBuf::from(socket),
         out,
         primary,
+        primary_tls,
         role,
         password,
     })
