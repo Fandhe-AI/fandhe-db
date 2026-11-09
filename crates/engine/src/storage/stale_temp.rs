@@ -24,6 +24,10 @@
 //! [`sweep_stale_temps_with_work_dirs`] は、ディレクトリ・0700・自分の所有・保護対象でない・項目数が小さい上限
 //! 以下・中身がすべて一時名の 0600 系通常ファイル、の積を満たす作業ディレクトリだけを、中身ごと消す。
 //!
+//! Issue #3136 で `verify`（`.fandhe-verify-…d`）と `dump-restore`（`.fandhe-dump-restore-…d`、中身は
+//! `.db-…tmp`）の作業ディレクトリ、`dump` の一時名（`.fandhe-dump-…tmp`）も対象に加えた。作業ディレクトリの
+//! 中身の判定は親直下の判定と分けられる（[`sweep_stale_temps_with_work_dir_children`]）。
+//!
 //! 残るリスク: この lock を使わない古いバイナリと同時に動かした場合は使用中の判定ができない。
 //! その場合も相手側の差し替え検出（`TempReplaced`）が公開を止める（不完全な内容は公開されない）。
 
@@ -133,6 +137,94 @@ pub fn is_restore_work_dir_name(name: &str) -> bool {
     }
 }
 
+/// `.fandhe-verify-<pid>-<seq>.tmp`（旧形式）または `.fandhe-verify-<pid>-<nonce 16桁小文字hex>-<seq>.tmp`
+/// の厳密な判定（Issue #3136・RECOVER-13 のポインタ）。`verify` のコピー経路が作業ディレクトリの中に置く
+/// 一時コピーの名前（Issue #3102 以前は親直下にできたため旧形式も回収する）。wire-server の `restore_opt`
+/// （掃除）と [`is_reserved_temp_name`] が使う単一の真実源。名前は untrusted として添字を使わずに解析する。
+pub fn is_verify_temp_name(name: &str) -> bool {
+    let Some(rest) = name
+        .strip_prefix(".fandhe-verify-")
+        .and_then(|r| r.strip_suffix(".tmp"))
+    else {
+        return false;
+    };
+    let mut parts = rest.split('-');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(pid), Some(seq), None, None) => is_decimal(pid, 10) && is_decimal(seq, 20),
+        (Some(pid), Some(nonce), Some(seq), None) => {
+            is_decimal(pid, 10) && is_lower_hex(nonce, 16) && is_decimal(seq, 20)
+        }
+        _ => false,
+    }
+}
+
+/// `verify` のコピー経路の作業ディレクトリ `.fandhe-verify-<pid>-<nonce 16桁小文字hex>-<seq>.d` の
+/// 厳密な判定（Issue #3136・RECOVER-13 のポインタ）。
+pub fn is_verify_work_dir_name(name: &str) -> bool {
+    let Some(rest) = name
+        .strip_prefix(".fandhe-verify-")
+        .and_then(|r| r.strip_suffix(".d"))
+    else {
+        return false;
+    };
+    let mut parts = rest.split('-');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(pid), Some(nonce), Some(seq), None) => {
+            is_decimal(pid, 10) && is_lower_hex(nonce, 16) && is_decimal(seq, 20)
+        }
+        _ => false,
+    }
+}
+
+/// `dump` の一時名 `.fandhe-dump-<pid>-<seq>.tmp` の厳密な判定（Issue #3136・RECOVER-16 のポインタ）。
+/// `.fandhe-dump-restore-…` は先頭成分が 10 進でないため一致しない。
+pub fn is_dump_temp_name(name: &str) -> bool {
+    let Some(rest) = name
+        .strip_prefix(".fandhe-dump-")
+        .and_then(|r| r.strip_suffix(".tmp"))
+    else {
+        return false;
+    };
+    let mut parts = rest.split('-');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(pid), Some(seq), None) => is_decimal(pid, 10) && is_decimal(seq, 20),
+        _ => false,
+    }
+}
+
+/// `dump-restore` の作業ディレクトリ `.fandhe-dump-restore-<pid>-<seq>.d` の厳密な判定
+/// （Issue #3136・RECOVER-16 のポインタ）。
+pub fn is_dump_restore_work_dir_name(name: &str) -> bool {
+    let Some(rest) = name
+        .strip_prefix(".fandhe-dump-restore-")
+        .and_then(|r| r.strip_suffix(".d"))
+    else {
+        return false;
+    };
+    let mut parts = rest.split('-');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(pid), Some(seq), None) => is_decimal(pid, 10) && is_decimal(seq, 20),
+        _ => false,
+    }
+}
+
+/// `dump-restore` の作業ディレクトリの中身 `.db-<pid>-<seq>.tmp` の厳密な判定（Issue #3136）。
+/// 作業ディレクトリの中身専用で、[`is_reserved_temp_name`] には含めない（親直下では掃除せず、
+/// 利用者の普通のファイル名を予約して拒否しないため）。
+pub fn is_dump_restore_db_temp_name(name: &str) -> bool {
+    let Some(rest) = name
+        .strip_prefix(".db-")
+        .and_then(|r| r.strip_suffix(".tmp"))
+    else {
+        return false;
+    };
+    let mut parts = rest.split('-');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(pid), Some(seq), None) => is_decimal(pid, 10) && is_decimal(seq, 20),
+        _ => false,
+    }
+}
+
 /// 掃除の uid 確認用ファイルの名前の接頭辞。復元・アーカイブの一時名とは別の形式にして、
 /// 呼び出し側の「一時名の残骸」の数え方と混ざらないようにする（掃除自身は [`is_probe_name`] で回収する）。
 const PROBE_PREFIX: &str = ".fandhe-sweep-probe-";
@@ -173,12 +265,17 @@ fn is_probe_name(name: &str) -> bool {
     }
 }
 
-/// `name` が掃除の対象になりうる予約名（復元の一時名・アーカイブの一時名・掃除の確認用ファイル）の形式か。
+/// `name` が掃除の対象になりうる予約名（復元・verify・dump・dump-restore の一時名と作業ディレクトリ・
+/// アーカイブの一時名・掃除の確認用ファイル）の形式か。
 /// 永続ファイル（`restore --db`・`backup --out` 等の出力先）がこの形式だと、同じ親ディレクトリでの
 /// 掃除に完成済みのファイルが消されうるため、wire-server の出力先の検証がこの判定で拒否する（fail-closed）。
 pub fn is_reserved_temp_name(name: &str) -> bool {
     is_restore_temp_name(name)
         || is_restore_work_dir_name(name)
+        || is_verify_temp_name(name)
+        || is_verify_work_dir_name(name)
+        || is_dump_temp_name(name)
+        || is_dump_restore_work_dir_name(name)
         || super::change_log::archive::is_segment_temp_name(name)
         || is_probe_name(name)
 }
@@ -256,14 +353,15 @@ impl SweepCtx<'_> {
 
 /// 作業ディレクトリ `dir/name`（`restore` が一時コピーを置く 0700 のディレクトリ）の残骸を掃除する。
 /// 消す条件はすべての積: lstat でディレクトリ（リンクをたどらない）・0700・自分の所有・保護対象でない・
-/// 開いた fd の (dev, ino) が lstat と一致・項目数が上限以下・全項目が `is_temp_name` に一致する
-/// 0600 系で自分所有の通常ファイル（保護対象でない）。1 つでも外れれば何も触らず `skipped` に数える。
+/// 開いた fd の (dev, ino) が lstat と一致・項目数が上限以下・全項目が `is_child_name` に一致する
+/// 0600 系で自分所有の通常ファイル（保護対象でない）。中身の名前は `is_child_name` で判定する。
+/// 1 つでも外れれば何も触らず `skipped` に数える。
 /// 空の作業ディレクトリ（mkdir の直後の異常終了）も消す。件数は作業ディレクトリ 1 つを 1 件とする。
 #[cfg(unix)]
 fn sweep_work_dir(
     dir: &Path,
     name: &str,
-    is_temp_name: fn(&str) -> bool,
+    is_child_name: fn(&str) -> bool,
     ctx: &SweepCtx<'_>,
     sweep: &mut StaleTempSweep,
 ) {
@@ -324,7 +422,7 @@ fn sweep_work_dir(
             skip(sweep);
             return;
         };
-        if !is_temp_name(child_name) {
+        if !is_child_name(child_name) {
             skip(sweep);
             return;
         }
@@ -381,6 +479,26 @@ pub fn sweep_stale_temps_with_work_dirs(
     dir: &Path,
     is_temp_name: fn(&str) -> bool,
     is_work_dir_name: fn(&str) -> bool,
+    protected: &[&Path],
+) -> Result<StaleTempSweep, std::io::ErrorKind> {
+    sweep_stale_temps_with_work_dir_children(
+        dir,
+        is_temp_name,
+        is_work_dir_name,
+        is_temp_name,
+        protected,
+    )
+}
+
+/// [`sweep_stale_temps_with_work_dirs`] の、作業ディレクトリの中身の名前判定 `is_work_dir_child_name` を
+/// 親直下の一時名判定 `is_temp_name` と分けられる版（Issue #3136）。`dump-restore` の作業ディレクトリの
+/// 中身 `.db-<pid>-<seq>.tmp` は親直下では掃除したくない形式のため、判定を分ける。安全条件は同じ。
+#[cfg(unix)]
+pub fn sweep_stale_temps_with_work_dir_children(
+    dir: &Path,
+    is_temp_name: fn(&str) -> bool,
+    is_work_dir_name: fn(&str) -> bool,
+    is_work_dir_child_name: fn(&str) -> bool,
     protected: &[&Path],
 ) -> Result<StaleTempSweep, std::io::ErrorKind> {
     use std::fs::TryLockError;
@@ -451,7 +569,7 @@ pub fn sweep_stale_temps_with_work_dirs(
             continue;
         };
         if is_work_dir_name(name) {
-            sweep_work_dir(dir, name, is_temp_name, &ctx, &mut sweep);
+            sweep_work_dir(dir, name, is_work_dir_child_name, &ctx, &mut sweep);
             continue;
         }
         if !is_temp_name(name) && !is_probe_name(name) {
@@ -492,6 +610,18 @@ pub fn sweep_stale_temps_with_work_dirs(
     _dir: &Path,
     _is_temp_name: fn(&str) -> bool,
     _is_work_dir_name: fn(&str) -> bool,
+    _protected: &[&Path],
+) -> Result<StaleTempSweep, std::io::ErrorKind> {
+    Ok(StaleTempSweep::empty(SweepOutcome::Unsupported))
+}
+
+/// 非 unix では何も消さない。
+#[cfg(not(unix))]
+pub fn sweep_stale_temps_with_work_dir_children(
+    _dir: &Path,
+    _is_temp_name: fn(&str) -> bool,
+    _is_work_dir_name: fn(&str) -> bool,
+    _is_work_dir_child_name: fn(&str) -> bool,
     _protected: &[&Path],
 ) -> Result<StaleTempSweep, std::io::ErrorKind> {
     Ok(StaleTempSweep::empty(SweepOutcome::Unsupported))
