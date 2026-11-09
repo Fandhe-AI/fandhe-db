@@ -152,6 +152,11 @@ pub fn dump(args: &DumpArgs, leftover: &mut Option<PathBuf>) -> Result<DumpSumma
         .map_err(|_| DumpError::Generation)?;
     // マテリアライズド VIEW の列構成の検査（Issue #3097）は SQL 層を持つ `EngineCore` の入口にある。
     let core = EngineCore::from_storage(storage, engine::search_engine::default_engine());
+    // 親ディレクトリの共有 lock（Issue #3136）。次回の dump の掃除が、書き込み中の一時名を使用中と
+    // 判断して消さないための相互排他。一時名を作る前に取り、削除の後まで保持する。取れなければ一時名を
+    // 作らずに中止する（fail-closed）。
+    let _parent_lock = engine::storage::TempDirLock::shared(parent)
+        .map_err(|k| DumpError::Tmp(TmpError::Io(k)))?;
     let mut tmp = TempFile::create(parent, "fandhe-dump").map_err(DumpError::Tmp)?;
     let result = write_and_publish(&core, args, &mut tmp, restore_generation);
     if let Err(p) = tmp.remove() {
@@ -159,6 +164,34 @@ pub fn dump(args: &DumpArgs, leftover: &mut Option<PathBuf>) -> Result<DumpSumma
         *leftover = Some(p);
     }
     result
+}
+
+/// 前回の異常終了が `out` の親ディレクトリに残した dump の一時名を掃除する（Issue #3136・RECOVER-16 の
+/// ポインタ）。`main.rs::run_dump` が [`dump`] の前に呼ぶ（掃除は親の排他 lock を取るため、自分の共有 lock を
+/// 取る前でなければならない）。消す条件は engine の `storage::stale_temp`。`out` が既に在る・親が不正・
+/// `protected`（`--db`）のどれかが予約名のときは `None`（fail-closed）。結果は報告のためだけ。
+pub fn sweep_stale_dump_temps(
+    out: &std::path::Path,
+    protected: &[&std::path::Path],
+) -> Option<(PathBuf, engine::storage::StaleTempSweep)> {
+    if crate::restore_opt::any_reserved_temp_path(protected) {
+        return None;
+    }
+    let parent = parent_of(out).ok()?;
+    if std::fs::symlink_metadata(out).is_ok() {
+        return None;
+    }
+    fn never(_: &str) -> bool {
+        false
+    }
+    let s = engine::storage::sweep_stale_temps_with_work_dirs(
+        parent,
+        engine::storage::is_dump_temp_name,
+        never,
+        protected,
+    )
+    .ok()?;
+    Some((parent.to_path_buf(), s))
 }
 
 fn write_and_publish(

@@ -140,7 +140,7 @@ pub fn spawn(core: Arc<EngineCore>, settings: &ArchiveSettings) -> std::io::Resu
 
 /// 一時名の残骸の掃除結果（Issue #3094・RECOVER-13・RECOVER-14 のポインタ）を運用者向けの stderr 行にする。
 /// `label` は `change log archive` や `restore` のような出所。`main.rs::run_server`（アーカイブのスレッドを
-/// 起動する前）と `run_restore` が呼ぶ。名前は pid・nonce・通番だけで、テナントのデータ・LSN を含まない。
+/// 起動する前）と `run_restore`・`run_verify`・`run_dump`・`run_dump_restore`（Issue #3136）が呼ぶ。名前は pid・nonce・通番だけで、テナントのデータ・LSN を含まない。
 /// 何も起きなかった（消さず・残さず・失敗もなし）ときは空。
 pub fn stale_temp_report_lines(
     label: &str,

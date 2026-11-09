@@ -433,6 +433,44 @@ fn restore_sweeps_stale_restore_temp_names_only() {
     assert!(restored.exists());
 }
 
+/// Issue #3136（RECOVER-13）: verify は経路によらず、`--db` の親に残った verify の作業ディレクトリと
+/// 一時名だけを掃除する。権限が想定外のもの・形式に一致しないもの・他サブコマンドの形式には触れない。
+/// 終了コードと標準出力は変わらない。
+#[test]
+fn verify_sweeps_stale_verify_work_dirs_and_temp_names_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let fx = common::TempFixtureDir::new("verify-sweep");
+    let (_users, db) = populate(&fx);
+    let dir = parent_of(&db).to_path_buf();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod dir");
+
+    let stale_wd = ".fandhe-verify-4242-0123456789abcdef-7.d";
+    let wd = dir.join(stale_wd);
+    std::fs::create_dir(&wd).expect("mkdir wd");
+    std::fs::set_permissions(&wd, std::fs::Permissions::from_mode(0o700)).expect("chmod wd");
+    let inner = wd.join(".fandhe-verify-4242-0123456789abcdef-7.tmp");
+    std::fs::write(&inner, b"x").expect("write");
+    std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    let wide = ".fandhe-verify-4242-8.tmp";
+    let decoy = ".fandhe-verify-decoy.tmp";
+    let other = ".fandhe-restore-4242-7.tmp";
+    for (name, mode) in [(wide, 0o644), (decoy, 0o600), (other, 0o600)] {
+        let p = dir.join(name);
+        std::fs::write(&p, b"x").expect("write");
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).expect("chmod");
+    }
+    let o = verify(&["--db", &db]);
+    assert_eq!(code(&o), Some(0), "stderr: {}", stderr(&o));
+    let err = stderr(&o);
+    assert!(
+        err.contains("removed 1 stale temporary file(s)") && err.contains(stale_wd),
+        "{err}"
+    );
+    assert!(err.contains("left 1 file(s)"), "{err}");
+    assert!(stdout(&o).contains("verify_mode="), "{}", stdout(&o));
+    assert!(!wd.exists());
+    assert!(dir.join(wide).exists() && dir.join(decoy).exists() && dir.join(other).exists());
+}
 /// Issue #3094（Codex P1）: 掃除が消す一時名の形式を永続ファイルの出力先に使うことは、fail-closed で
 /// 引数エラー（終了コード 2）として拒否する。拒否時は何も作らず、同じ親の既存ファイルにも触れない。
 #[test]
@@ -450,6 +488,11 @@ fn restore_and_backup_reject_reserved_temp_names_as_outputs() {
         ".fandhe-restore-4242-0123456789abcdef-7.tmp",
         ".fandhe-seg-4242-0123456789abcdef-7.tmp",
         ".fandhe-sweep-probe-4242-0123456789abcdef-0.tmp",
+        ".fandhe-verify-4242-7.tmp",
+        ".fandhe-verify-4242-0123456789abcdef-7.tmp",
+        ".fandhe-verify-4242-0123456789abcdef-7.d",
+        ".fandhe-dump-4242-7.tmp",
+        ".fandhe-dump-restore-4242-7.d",
     ] {
         let out = dir.join(name);
         let out_s = out.to_str().expect("utf-8 path").to_string();

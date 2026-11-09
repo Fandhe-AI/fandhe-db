@@ -492,6 +492,40 @@ pub fn restore_with_pitr(
     Err(RestoreError::Unsupported)
 }
 
+/// `paths` のどれかが予約名（engine の `storage::is_reserved_temp_name`）か。指定名が別名（シンボリックリンク）
+/// でも実体が一時名なら掃除対象になりうるため、実体のパスでも判定する。実体を解決できないときは名前だけの
+/// 判定に留まる（入力として開けないので後続の処理自体も失敗する）。`restore`・`verify`・`dump`・`dump-restore`
+/// の掃除が、入力の消失を避けるために掃除ごと見送る判断（fail-closed。Issue #3094・#3136）に共有する。
+pub fn any_reserved_temp_path(paths: &[&Path]) -> bool {
+    let is_temp = |p: &Path| {
+        p.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(engine::storage::is_reserved_temp_name)
+    };
+    paths
+        .iter()
+        .any(|p| is_temp(p) || std::fs::canonicalize(p).is_ok_and(|c| is_temp(&c)))
+}
+
+/// `verify` の前に、`db` の親ディレクトリに残った `verify` のコピー経路の作業ディレクトリと一時名を
+/// 掃除する（Issue #3136・RECOVER-13 のポインタ）。`main.rs::run_verify` が `verify_db` の前に呼ぶ。
+/// 消す条件は [`sweep_stale_restore_temps`] と同じ（engine の `storage::stale_temp`）。`db` 自身が予約名なら
+/// 掃除ごと見送って `None`（fail-closed）。`db` は保護対象にも渡す。結果は報告のためだけで、検査の成否には
+/// 影響させない。
+#[cfg(unix)]
+pub fn sweep_stale_verify_temps(db: &Path) -> Option<(PathBuf, engine::storage::StaleTempSweep)> {
+    if any_reserved_temp_path(&[db]) {
+        return None;
+    }
+    unix_impl::sweep_stale_verify_temps(db)
+}
+
+/// 非 unix では掃除しない。
+#[cfg(not(unix))]
+pub fn sweep_stale_verify_temps(_db: &Path) -> Option<(PathBuf, engine::storage::StaleTempSweep)> {
+    None
+}
+
 /// 前回の異常終了が `dest` の親ディレクトリに残した復元の一時名を掃除する（Issue #3094・RECOVER-13・
 /// RECOVER-14 のポインタ）。`main.rs::run_restore` が [`restore_with_args`] の前に呼ぶ。消す条件は engine の
 /// `storage::stale_temp`（形式に厳密一致・通常ファイル・0600 系・自分の所有・使用中でない）。宛先が既に在る・
@@ -505,17 +539,7 @@ pub fn sweep_stale_restore_temps(
     dest: &Path,
     protected: &[&Path],
 ) -> Option<(PathBuf, engine::storage::StaleTempSweep)> {
-    let is_temp = |p: &Path| {
-        p.file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(engine::storage::is_reserved_temp_name)
-    };
-    // 指定名が別名（シンボリックリンク）でも、実体が一時名なら掃除対象になりうるため、実体のパスでも判定する。
-    // 実体を解決できないときは名前だけの判定に留まる（入力として開けないので復元自体も失敗する）。
-    let reserved = protected
-        .iter()
-        .any(|p| is_temp(p) || std::fs::canonicalize(p).is_ok_and(|c| is_temp(&c)));
-    if reserved {
+    if any_reserved_temp_path(protected) {
         return None;
     }
     unix_impl::sweep_stale_restore_temps(dest, protected)
@@ -1016,6 +1040,22 @@ mod unix_impl {
             is_restore_temp_name,
             engine::storage::is_restore_work_dir_name,
             protected,
+        )
+        .ok()?;
+        Some((parent.to_path_buf(), s))
+    }
+
+    /// `db` の親ディレクトリに残った `verify` の作業ディレクトリ・一時名を掃除する（Issue #3136）。
+    /// 親が不正なときは何もしない。`db` は保護対象（消さない）として渡す。
+    pub(super) fn sweep_stale_verify_temps(
+        db: &Path,
+    ) -> Option<(PathBuf, engine::storage::StaleTempSweep)> {
+        let parent = parent_of(db).ok()?;
+        let s = engine::storage::sweep_stale_temps_with_work_dirs(
+            parent,
+            engine::storage::is_verify_temp_name,
+            engine::storage::is_verify_work_dir_name,
+            &[db],
         )
         .ok()?;
         Some((parent.to_path_buf(), s))

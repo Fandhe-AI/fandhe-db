@@ -183,6 +183,11 @@ pub fn restore(
     }
     // 一時 DB は、復元先の親の中に作る 0700 の作業ディレクトリに置く。親に他者が書き込めても、
     // 一時名をパスで開く間に別のファイル（既存 DB へのリンク）へ差し替えられない。
+    // 親ディレクトリの共有 lock（Issue #3136）。次回の dump-restore の掃除が、使用中の作業ディレクトリを
+    // 消さないための相互排他。作業ディレクトリを作る前に取り、後始末の後まで保持する。取れなければ
+    // 何も作らずに中止する（fail-closed）。
+    let _parent_lock = engine::storage::TempDirLock::shared(parent)
+        .map_err(|k| RestoreError::Tmp(TmpError::Io(k)))?;
     let mut work = WorkDir::create(parent, "fandhe-dump-restore").map_err(RestoreError::Tmp)?;
     let mut tmp = match TempFile::create(work.access_path(), "db") {
         Ok(t) => t,
@@ -203,6 +208,36 @@ pub fn restore(
         leftover.get_or_insert(p);
     }
     result
+}
+
+/// 前回の異常終了が `dest` の親ディレクトリに残した dump-restore の作業ディレクトリを掃除する
+/// （Issue #3136・RECOVER-16 のポインタ）。`main.rs::run_dump_restore` が [`restore`] の前に呼ぶ（掃除は親の
+/// 排他 lock を取るため、自分の共有 lock を取る前でなければならない）。作業ディレクトリの中身 `.db-…tmp` は
+/// 作業ディレクトリの中でだけ判定し、親直下では掃除しない。`dest` が既に在る・親が不正・`protected`
+/// （`--from`）が予約名のときは `None`（fail-closed）。結果は報告のためだけ。
+pub fn sweep_stale_dump_restore_temps(
+    dest: &Path,
+    protected: &[&Path],
+) -> Option<(PathBuf, engine::storage::StaleTempSweep)> {
+    if crate::restore_opt::any_reserved_temp_path(protected) {
+        return None;
+    }
+    let parent = parent_of(dest).ok()?;
+    if std::fs::symlink_metadata(dest).is_ok() {
+        return None;
+    }
+    fn never(_: &str) -> bool {
+        false
+    }
+    let s = engine::storage::sweep_stale_temps_with_work_dir_children(
+        parent,
+        never,
+        engine::storage::is_dump_restore_work_dir_name,
+        engine::storage::is_dump_restore_db_temp_name,
+        protected,
+    )
+    .ok()?;
+    Some((parent.to_path_buf(), s))
 }
 
 fn apply_verify_publish(

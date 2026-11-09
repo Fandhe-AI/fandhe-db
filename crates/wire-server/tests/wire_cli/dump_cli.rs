@@ -1185,3 +1185,134 @@ fn restore_splits_copy_by_every_engine_batch_limit() {
     assert!(!Path::new(&dest).exists());
     assert_no_temp_leftovers(&dir);
 }
+/// `dir` に `name` の通常ファイルを `mode` で置く。
+fn put_file(dir: &Path, name: &str, mode: u32) {
+    let p = dir.join(name);
+    std::fs::write(&p, b"x").expect("write");
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).expect("chmod");
+}
+
+/// Issue #3136（RECOVER-16）: dump は `--out` の親に残った dump の一時名の残骸だけを掃除する。
+/// 権限が想定外のもの・形式に一致しないもの・他サブコマンドの形式には触れず、報告は stderr で、
+/// 成功も変わらない。
+#[test]
+fn dump_sweeps_stale_dump_temp_names_only() {
+    let f = populated("dump-sweep", &[]);
+    let dir = f.dir();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod dir");
+    let stale = ".fandhe-dump-4242-7.tmp";
+    let wide = ".fandhe-dump-4242-8.tmp";
+    let decoy = ".fandhe-dump-decoy.tmp";
+    let other = ".fandhe-restore-4242-7.tmp";
+    for (name, mode) in [
+        (stale, 0o600),
+        (wide, 0o644),
+        (decoy, 0o600),
+        (other, 0o600),
+    ] {
+        put_file(&dir, name, mode);
+    }
+    let out = f.path("a.sql");
+    let o = run(&dump_args(&f.db, &out, &["--tenant", "tenant-a"]));
+    assert_eq!(code(&o), Some(0), "stderr: {}", stderr(&o));
+    let err = stderr(&o);
+    assert!(
+        err.contains("removed 1 stale temporary file(s)") && err.contains(stale),
+        "{err}"
+    );
+    assert!(err.contains("left 1 file(s)"), "{err}");
+    assert!(!dir.join(stale).exists());
+    assert!(dir.join(wide).exists() && dir.join(decoy).exists() && dir.join(other).exists());
+    assert!(Path::new(&out).exists());
+}
+
+/// Issue #3136: dump-restore は復元先の親に残った作業ディレクトリを中身ごと掃除する。親直下の `.db-…tmp`
+/// は掃除しない。復元は成功し、一時名は残らない。
+#[test]
+fn dump_restore_sweeps_stale_work_dirs() {
+    let f = populated("dump-restore-sweep", &[]);
+    let dir = f.dir();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod dir");
+    let out = f.path("a.sql");
+    let o = run(&dump_args(&f.db, &out, &["--tenant", "tenant-a"]));
+    assert_eq!(code(&o), Some(0), "stderr: {}", stderr(&o));
+
+    let stale_wd = ".fandhe-dump-restore-4242-7.d";
+    let wd = dir.join(stale_wd);
+    std::fs::create_dir(&wd).expect("mkdir wd");
+    std::fs::set_permissions(&wd, std::fs::Permissions::from_mode(0o700)).expect("chmod wd");
+    put_file(&wd, ".db-4242-7.tmp", 0o600);
+    // 親直下の `.db-…tmp` は利用者のファイルかもしれないため掃除しない。
+    put_file(&dir, ".db-4242-9.tmp", 0o600);
+    let dest = f.path("restored.redb");
+    let o = run(&["dump-restore", "--from", &out, "--db", &dest]);
+    assert_eq!(code(&o), Some(0), "stderr: {}", stderr(&o));
+    let err = stderr(&o);
+    assert!(
+        err.contains("removed 1 stale temporary file(s)") && err.contains(stale_wd),
+        "{err}"
+    );
+    assert!(!wd.exists());
+    assert!(dir.join(".db-4242-9.tmp").exists());
+    assert!(Path::new(&dest).exists());
+    assert_no_temp_leftovers(&dir);
+}
+
+/// Issue #3136: 他の書き込み側が親の共有 lock を持つ間は、掃除は見送られ置かれた一時名は残る。
+/// 共有 lock 同士は両立するので dump 自体は成功する。
+#[test]
+fn dump_sweep_is_skipped_while_another_writer_holds_the_parent() {
+    let f = populated("dump-sweep-busy", &[]);
+    let dir = f.dir();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod dir");
+    let stale = ".fandhe-dump-4242-7.tmp";
+    put_file(&dir, stale, 0o600);
+    let _lock = engine::storage::TempDirLock::shared(&dir).expect("shared lock");
+    let out = f.path("a.sql");
+    let o = run(&dump_args(&f.db, &out, &["--tenant", "tenant-a"]));
+    assert_eq!(code(&o), Some(0), "stderr: {}", stderr(&o));
+    assert!(
+        stderr(&o).contains("another writer is using the directory"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(dir.join(stale).exists());
+}
+
+/// Issue #3136: 新しい予約名の形式を永続ファイルの出力先・入力に使うと、終了コード 2 で拒否され何も作られない。
+#[test]
+fn dump_and_dump_restore_reject_reserved_temp_names() {
+    let f = populated("dump-reserved", &[]);
+    let dir = f.dir();
+    let good = f.path("a.sql");
+    let o = run(&dump_args(&f.db, &good, &["--tenant", "tenant-a"]));
+    assert_eq!(code(&o), Some(0), "stderr: {}", stderr(&o));
+    for name in [
+        ".fandhe-dump-4242-7.tmp",
+        ".fandhe-dump-restore-4242-7.d",
+        ".fandhe-verify-4242-7.tmp",
+        ".fandhe-verify-4242-0123456789abcdef-7.d",
+    ] {
+        let p = f.path(name);
+        let o = run(&dump_args(&f.db, &p, &["--tenant", "tenant-a"]));
+        assert_eq!(code(&o), Some(2), "dump --out {name}: {}", stderr(&o));
+        assert!(!Path::new(&p).exists(), "{name} must not be created");
+        let o = run(&["dump-restore", "--from", &good, "--db", &p]);
+        assert_eq!(
+            code(&o),
+            Some(2),
+            "dump-restore --db {name}: {}",
+            stderr(&o)
+        );
+        assert!(!Path::new(&p).exists(), "{name} must not be created");
+    }
+    // 既存の予約名ファイルを入力にしても拒否され、消えない（掃除も見送られる）。
+    let reserved_in = dir.join(".fandhe-dump-4242-9.tmp");
+    std::fs::copy(&good, &reserved_in).expect("copy");
+    std::fs::set_permissions(&reserved_in, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    let r = s(&reserved_in).to_string();
+    let o = run(&["dump-restore", "--from", &r, "--db", &f.path("x.redb")]);
+    assert_eq!(code(&o), Some(2), "{}", stderr(&o));
+    assert!(reserved_in.exists());
+    assert!(!dir.join("x.redb").exists());
+}
