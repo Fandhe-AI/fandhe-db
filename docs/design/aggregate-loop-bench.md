@@ -6,7 +6,7 @@
 
 ## 対応する Issue・ポインタ
 
-- 本 Issue: #1490。親 #1486、関連 #1204・#1319（関係演算 p95 ベンチ）・#1491（退行の原因と是正前後の設計記録）
+- 本 Issue: #1490。親 #1486、関連 #1204・#1319（関係演算 p95 ベンチ）・#1491（退行の原因と是正前後の設計記録。[aggregate-loop-regression.md](aggregate-loop-regression.md)）
 - 是正は兄弟 Issue #1487・#1488・#1489 が担当する。本ベンチは是正を含まず、検知だけを担う
 - ポインタ: `docs/spec/04-behavior/sql-surface.md` SQL-25（集計表層）。spec 本文は転記しない
 
@@ -101,7 +101,7 @@ ad07bfd 相当の変更を模すため、`sql/aggregate.rs` の `observe_with_bu
 c94dc5d と ad07bfd に新しいベンチを重ねて比べる案は採らなかった。両コミットには EXPLAIN の `access_path:` が無く、
 `OperationId` のモジュール位置も異なり、COUNT(DISTINCT) は c94dc5d に無い。差分を吸収する shim が必要になり、
 HEAD の計測と同じものを測っている保証が弱くなるため。原因の構造分析は #1491 が担当する。
-是正が main に入った後は、是正前後のバイナリで同じ手順を再実施できる。
+是正が main に入った後は、是正前後のバイナリで同じ手順を再実施できる。原因と是正前後の crossdb self exact の記録は [aggregate-loop-regression.md](aggregate-loop-regression.md)。
 
 ## 必須 CI の所要時間（AC2）
 

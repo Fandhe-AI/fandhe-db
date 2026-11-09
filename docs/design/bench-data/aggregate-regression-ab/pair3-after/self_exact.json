@@ -1,0 +1,263 @@
+{
+  "meta": {
+    "db": "self",
+    "version": "wire-server (path=/tmp/claude-1000/-home-fandhe-fandhe-app-vector-db/9f1435ad-5974-4a9d-8222-d581e8c0ceb6/scratchpad/tgt1491/release/wire-server; sha256=489adac864c7)",
+    "connection": "loopback TCP (psycopg simple query protocol)",
+    "config": "exact",
+    "rows": 23000,
+    "dim": 128,
+    "timestamp": "2026-11-09T14:56:53+0000",
+    "nproc": 10,
+    "loadavg": [
+      4.69482421875,
+      4.42822265625,
+      3.681640625
+    ],
+    "python": "3.14.4",
+    "host": "Linux-7.0.0-34-generic-x86_64-with-glibc2.43",
+    "warmup": 5,
+    "iters": 50,
+    "index": "exact (no index)",
+    "search_engine": "default",
+    "hnsw_args": [],
+    "knn_reaches_hnsw": false,
+    "planner": null,
+    "durability": "immediate (default)",
+    "durability_warning_observed": false
+  },
+  "phases": {
+    "vector_knn": {
+      "n": 50,
+      "min_us": 605.2772514522076,
+      "p50_us": 674.5997816324234,
+      "p95_us": 772.8701457381248,
+      "p99_us": 788.1210185587406,
+      "mean_us": 681.9291226565838,
+      "max_us": 788.1210185587406
+    },
+    "vector_knn_where": {
+      "n": 50,
+      "min_us": 252.1849237382412,
+      "p50_us": 284.13673862814903,
+      "p95_us": 331.4106725156307,
+      "p99_us": 359.12590101361275,
+      "mean_us": 286.970054730773,
+      "max_us": 359.12590101361275
+    },
+    "point_where": {
+      "note": "vector_knn_where と同一クエリ形のため統合（task 指示準拠）",
+      "n": 50,
+      "min_us": 252.1849237382412,
+      "p50_us": 284.13673862814903,
+      "p95_us": 331.4106725156307,
+      "p99_us": 359.12590101361275,
+      "mean_us": 286.970054730773,
+      "max_us": 359.12590101361275
+    },
+    "where_compound_count": {
+      "n": 50,
+      "min_us": 119.92873623967171,
+      "p50_us": 125.14786794781685,
+      "p95_us": 148.97529035806656,
+      "p99_us": 213.2258377969265,
+      "mean_us": 128.18951159715652,
+      "max_us": 213.2258377969265,
+      "result": 7599
+    },
+    "agg_count": {
+      "n": 50,
+      "min_us": 383.5149109363556,
+      "p50_us": 396.9022072851658,
+      "p95_us": 497.5642077624798,
+      "p99_us": 547.2921766340733,
+      "mean_us": 407.34395384788513,
+      "max_us": 547.2921766340733,
+      "result": 23000
+    },
+    "agg_multi": {
+      "n": 50,
+      "min_us": 1549.1652302443981,
+      "p50_us": 1584.495883435011,
+      "p95_us": 1698.4809190034866,
+      "p99_us": 1895.872876048088,
+      "mean_us": 1599.7707657516003,
+      "max_us": 1895.872876048088,
+      "result": [
+        23000,
+        283511500.0,
+        12326.58695652174,
+        1.0,
+        25000.0
+      ]
+    },
+    "group_by_having": {
+      "n": 50,
+      "min_us": 49.31492730975151,
+      "p50_us": 51.9859604537487,
+      "p95_us": 57.43931978940964,
+      "p99_us": 61.54226139187813,
+      "mean_us": 52.697546780109406,
+      "max_us": 61.54226139187813,
+      "result": [
+        [
+          "en",
+          15379
+        ],
+        [
+          "ja",
+          7621
+        ]
+      ]
+    },
+    "hybrid_rrf": {
+      "n": 50,
+      "min_us": 2292.758785188198,
+      "p50_us": 2943.7458142638206,
+      "p95_us": 4149.523098021746,
+      "p99_us": 10045.32678052783,
+      "mean_us": 3237.5614624470472,
+      "max_us": 10045.32678052783
+    },
+    "mode_recall": {
+      "n": 50,
+      "min_us": 559.1772496700287,
+      "p50_us": 624.4350224733353,
+      "p95_us": 996.2371550500393,
+      "p99_us": 1063.1461627781391,
+      "mean_us": 670.8524189889431,
+      "max_us": 1063.1461627781391
+    },
+    "mode_precision": {
+      "n": 50,
+      "min_us": 824.4640193879604,
+      "p50_us": 871.4278228580952,
+      "p95_us": 1026.9703343510628,
+      "p99_us": 1052.888110280037,
+      "mean_us": 892.7031792700291,
+      "max_us": 1052.888110280037
+    },
+    "bulk_knn_k200": {
+      "n": 50,
+      "min_us": 840.1828818023205,
+      "p50_us": 982.6379828155041,
+      "p95_us": 2123.632002621889,
+      "p99_us": 2619.110979139805,
+      "mean_us": 1125.5461536347866,
+      "max_us": 2619.110979139805,
+      "k": 200,
+      "rows_returned": 200,
+      "ef_search": null,
+      "ef_effective": null
+    },
+    "bulk_knn_k1000": {
+      "n": 50,
+      "min_us": 1536.9323082268238,
+      "p50_us": 1715.5883833765984,
+      "p95_us": 2156.6562354564667,
+      "p99_us": 4110.713955014944,
+      "mean_us": 1777.9971659183502,
+      "max_us": 4110.713955014944,
+      "k": 1000,
+      "rows_returned": 1000,
+      "ef_search": null,
+      "ef_effective": null
+    },
+    "bulk_knn_where_k200": {
+      "n": 50,
+      "min_us": 461.0838368535042,
+      "p50_us": 509.52332094311714,
+      "p95_us": 614.6756932139397,
+      "p99_us": 676.0349497199059,
+      "mean_us": 528.5306181758642,
+      "max_us": 676.0349497199059,
+      "k": 200,
+      "rows_returned": 200,
+      "ef_search": null,
+      "ef_effective": null
+    },
+    "bulk_hybrid_k200": {
+      "n": 50,
+      "min_us": 2455.0408124923706,
+      "p50_us": 3268.187865614891,
+      "p95_us": 4714.736249297857,
+      "p99_us": 10889.974888414145,
+      "mean_us": 3450.3930900245905,
+      "max_us": 10889.974888414145,
+      "k": 200,
+      "rows_returned": 200,
+      "ef_search": null,
+      "ef_effective": null,
+      "dense_fetch_k_initial": null,
+      "dense_fetch_k_may_expand": null
+    },
+    "scan_where_nosort_k500": {
+      "n": 50,
+      "min_us": 519.0758965909481,
+      "p50_us": 531.6520109772682,
+      "p95_us": 556.7800253629684,
+      "p99_us": 586.0240198671818,
+      "mean_us": 534.792635589838,
+      "max_us": 586.0240198671818,
+      "k": 500,
+      "rows_returned": 500
+    },
+    "rls_isolation": {
+      "n": 50,
+      "min_us": 410.40685027837753,
+      "p50_us": 413.8518124818802,
+      "p95_us": 417.9850220680237,
+      "p99_us": 419.41413655877113,
+      "mean_us": 414.13881815969944,
+      "max_us": 419.41413655877113,
+      "tenant_b_count": 25000
+    },
+    "udf_call": {
+      "n": 50,
+      "min_us": 752.6432164013386,
+      "p50_us": 1002.4127550423145,
+      "p95_us": 1973.7849943339825,
+      "p99_us": 2327.432855963707,
+      "mean_us": 1077.313106507063,
+      "max_us": 2327.432855963707
+    },
+    "explain": {
+      "n": 50,
+      "min_us": 40.86596891283989,
+      "p50_us": 44.446904212236404,
+      "p95_us": 76.83131843805313,
+      "p99_us": 113.41273784637451,
+      "mean_us": 49.40510727465153,
+      "max_us": 113.41273784637451,
+      "sample_output": [
+        "mode: recall",
+        "mode_source: default",
+        "engine: parallel_brute_force",
+        "ann_plan: plain_scan_engine",
+        "scalar_plan: plain_scan"
+      ]
+    },
+    "ingest_bulk": {
+      "rows": 25000,
+      "seconds": 0.7577091152779758,
+      "rows_per_sec": 32994.191960893084,
+      "copies": 391,
+      "rows_per_copy": 64,
+      "last_copy_rows": 40,
+      "format": "csv",
+      "table": "docs_bulk",
+      "commit_granularity": "per_copy",
+      "note": "391 回の COPY FROM STDIN（CSV・各 64 行以下。INDEX-4 ① の既定上限に合わせて分割）。commit は COPY ごと（pgvector は単一 COPY）。投入先は専用テーブル docs_bulk（fixture の docs は不変）で tenant／visibility は接続テナントの tenant-a／private に固定（fixture 値は投入しない）。計測区間は CSV 化＋COPY のみで、pgvector が含める tsvector 補完・索引作成に相当する処理は無い"
+    },
+    "ingest_single_stmt": {
+      "rows": 1000,
+      "seconds": 0.13961169077083468,
+      "rows_per_sec": 7162.723941517533,
+      "commit_granularity": "per_statement"
+    },
+    "recall_at_10": {
+      "recall_at_10": 1.0,
+      "recall_at_10_strict": 1.0,
+      "queries": 200
+    }
+  }
+}
