@@ -4795,7 +4795,8 @@ fn run_replica_resync(_args: &[String]) -> ExitCode {
 /// `replica-promote --db <path>` サブコマンド（Issue #3132・RECOVER-15 (4)(5) ポインタ。運用手順は
 /// `docs/design/replication-operations.md` §5）。停止中のレプリカ DB を整合検査し、排他で開いて
 /// `Storage::promote_replica`（1 本の保守 commit で timeline を分岐）を実行する。昇格した DB は
-/// `--change-log` 付きの通常起動でプライマリになる。どの失敗でも DB は変わらない（fail-closed）。
+/// `--change-log` 付きの通常起動でプライマリになる。昇格前の失敗では DB は変わらない（fail-closed）。昇格後に標準出力へ書けなかったときだけ
+/// 専用の終了コード（`EXIT_PROMOTED_OUTPUT_FAILED`）で、DB は昇格済みである。
 /// 標準出力は成功時の 2 行（適用済みの commit 番号と、失われる範囲）だけで、失敗の報告は標準エラーへ出す。
 /// 引数・出力・終了コードは `wire_server::replica_promote_opt`。
 #[cfg(unix)]
@@ -4862,8 +4863,11 @@ fn run_replica_promote(args: &[String]) -> ExitCode {
     };
     match storage.promote_replica() {
         Ok(report) => {
+            // 昇格は確定済み。報告の書き込み失敗を「DB は変わらない」終了コード 1 にしてはならない
+            // （運用者が再実行すると timeline がさらに分岐する）。専用の終了コードと診断で知らせる。
             if write_stdout(&opt::success_report(report.applied_lsn)).is_err() {
-                return ExitCode::from(opt::EXIT_FAILURE);
+                engine::log_stderr!("{}", opt::output_failed_message(report.applied_lsn));
+                return ExitCode::from(opt::EXIT_PROMOTED_OUTPUT_FAILED);
             }
             ExitCode::SUCCESS
         }

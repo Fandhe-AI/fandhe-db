@@ -22,6 +22,7 @@ use engine::storage::{chain_point_of, Storage};
 const BIN: &str = env!("CARGO_BIN_EXE_wire-server");
 const EXIT_FAILURE: i32 = 1;
 const EXIT_USAGE: i32 = 2;
+const EXIT_PROMOTED_OUTPUT_FAILED: i32 = 6;
 const EXIT_NOT_REPLICA_BASE: i32 = 10;
 const EXIT_PRIMARY_REJECTED: i32 = 11;
 
@@ -284,4 +285,39 @@ fn recover15_promote_rejects_bad_arguments() {
         std::fs::read(&db).expect("read"),
         b"not a real database".to_vec()
     );
+}
+
+/// 昇格は確定したが標準出力へ書けないとき（`/dev/full`）は、「DB は変わらない」終了コード 1 ではなく専用の 6 を返し、
+/// DB は昇格済みで、標準エラーが再実行しないよう知らせる。
+#[cfg(target_os = "linux")]
+#[test]
+fn recover15_promote_output_failure_after_promotion_is_not_exit_1() {
+    let mut st = setup("promote-outfail", 3);
+    let (mut replica, lines) = spawn_replica(&st.rdb, st.primary.repl, &st.cred, &[]);
+    lines.wait_applied(st.base_lsn);
+    stop(&mut replica);
+    let base_point = chain_point_of(&st.primary.dir.join("base.redb")).expect("base point");
+    let full = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .expect("open /dev/full");
+    let o = Command::new(BIN)
+        .args(["replica-promote", "--db", s(&st.rdb)])
+        .stdout(Stdio::from(full))
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run");
+    assert_eq!(
+        o.status.code(),
+        Some(EXIT_PROMOTED_OUTPUT_FAILED),
+        "{:?}",
+        o
+    );
+    assert_ne!(o.status.code(), Some(EXIT_FAILURE));
+    let err = stderr_of(&o);
+    assert!(err.contains("WAS promoted"), "{err}");
+    assert!(err.contains("do not run replica-promote again"), "{err}");
+    let promoted = chain_point_of(&st.rdb).expect("promoted point");
+    assert!(promoted.timeline > base_point.timeline);
+    stop(&mut st.primary._child);
 }

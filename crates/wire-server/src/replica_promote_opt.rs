@@ -29,6 +29,10 @@ pub const EXIT_INCOMPLETE: u8 = crate::verify_opt::EXIT_INCOMPLETE;
 /// 終了コード: レプリカのベースでない・変更ログが連続しない（`replica` の適用停止と同じ値）。
 pub const EXIT_NOT_REPLICA_BASE: u8 = replica_opt::EXIT_APPLY_HALTED;
 
+/// 終了コード: 昇格は確定したが、成功の報告（標準出力）を書けなかった。DB はすでに昇格済み（timeline は
+/// 分岐済み）なので、再実行してはならない。終了コード 1（DB は変わらない）とは区別する。
+pub const EXIT_PROMOTED_OUTPUT_FAILED: u8 = 6;
+
 /// 検証済みの引数。
 pub struct ReplicaPromoteOptions {
     /// 昇格する停止中のレプリカ DB。
@@ -63,6 +67,14 @@ pub fn parse(args: &[String]) -> Result<ReplicaPromoteOptions, String> {
     Ok(ReplicaPromoteOptions {
         db: backup_opt::validate_db(db)?,
     })
+}
+
+/// 昇格後に報告を書けなかったときの標準エラーの固定文言（適用済みの commit 番号を含める。再実行しない旨を明記）。
+pub fn output_failed_message(applied_lsn: u64) -> String {
+    format!(
+        "replica-promote: the database WAS promoted (applied_lsn={applied_lsn}) but the report could not be \
+         written to stdout; do not run replica-promote again (exit code {EXIT_PROMOTED_OUTPUT_FAILED})"
+    )
 }
 
 /// 成功時の標準出力（運用者向け。テナントのセッションには見せない）。確定した適用済みの commit 番号と、
