@@ -361,6 +361,73 @@ impl SweepCtx<'_> {
     }
 }
 
+/// 作業ディレクトリの中に入れ子で残ったスナップショット作業ディレクトリの削除計画（Issue #3135）。
+/// `_fd` は検証から削除まで開いたままにして、検証した実体を指し続ける。
+#[cfg(unix)]
+struct NestedWorkDir {
+    _fd: std::fs::File,
+    access: std::path::PathBuf,
+    files: Vec<std::path::PathBuf>,
+}
+
+/// 入れ子のスナップショット作業ディレクトリ（`access` は親の保持 fd 経由のパス、`real` は実パス）を検証する。
+/// 親と同じ条件（ディレクトリ・0700・自分所有・保護対象でない・fd 照合・項目数上限）に加え、中身が
+/// 自分所有の 0600 系通常ファイルでスナップショット一時名のものだけのときに限り計画を返す。1 段より深い
+/// 入れ子は受理しない。外れれば `None`（呼び出し側が見送りに数える）。
+#[cfg(unix)]
+fn plan_nested_work_dir(access: &Path, real: &Path, ctx: &SweepCtx<'_>) -> Option<NestedWorkDir> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::symlink_metadata(access).ok()?;
+    if !meta.is_dir()
+        || meta.mode() & 0o777 != 0o700
+        || meta.uid() != ctx.own_uid
+        || ctx.is_protected(&meta, real)
+    {
+        return None;
+    }
+    let fd = std::fs::File::open(access).ok()?;
+    let fm = fd.metadata().ok()?;
+    if !fm.is_dir() || fm.dev() != meta.dev() || fm.ino() != meta.ino() {
+        return None;
+    }
+    let proc_path = std::path::PathBuf::from(format!(
+        "/proc/self/fd/{}",
+        std::os::fd::AsRawFd::as_raw_fd(&fd)
+    ));
+    let inner = if cfg!(target_os = "linux") && proc_path.is_dir() {
+        proc_path
+    } else {
+        access.to_path_buf()
+    };
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(&inner).ok()? {
+        let entry = entry.ok()?;
+        if files.len() >= MAX_WORK_DIR_ENTRIES {
+            return None;
+        }
+        let fname = entry.file_name();
+        let n = fname.to_str()?;
+        if !is_snapshot_temp_name(n) {
+            return None;
+        }
+        let child = inner.join(n);
+        let cm = std::fs::symlink_metadata(&child).ok()?;
+        if !cm.is_file()
+            || cm.mode() & 0o7077 != 0
+            || cm.uid() != ctx.own_uid
+            || ctx.is_protected(&cm, &real.join(n))
+        {
+            return None;
+        }
+        files.push(child);
+    }
+    Some(NestedWorkDir {
+        _fd: fd,
+        access: access.to_path_buf(),
+        files,
+    })
+}
+
 /// 作業ディレクトリ `dir/name`（`restore` が一時コピーを置く 0700 のディレクトリ）の残骸を掃除する。
 /// 消す条件はすべての積: lstat でディレクトリ（リンクをたどらない）・0700・自分の所有・保護対象でない・
 /// 開いた fd の (dev, ino) が lstat と一致・項目数が上限以下・全項目が `is_entry_name` に一致する
@@ -417,6 +484,9 @@ fn sweep_work_dir(
         return;
     };
     let mut children: Vec<std::path::PathBuf> = Vec::new();
+    // 入れ子のスナップショット作業ディレクトリ（プライマリのサーバーが作業ディレクトリの中に作る）。
+    // 検証を全部終えてから、保持 fd とともに中身→ディレクトリの順で消す。
+    let mut nested: Vec<NestedWorkDir> = Vec::new();
     for entry in rd {
         let Ok(entry) = entry else {
             skip(sweep);
@@ -431,6 +501,16 @@ fn sweep_work_dir(
             skip(sweep);
             return;
         };
+        if is_snapshot_work_dir_name(child_name) {
+            let Some(n) =
+                plan_nested_work_dir(&access.join(child_name), &path.join(child_name), ctx)
+            else {
+                skip(sweep);
+                return;
+            };
+            nested.push(n);
+            continue;
+        }
         if !is_entry_name(child_name) {
             skip(sweep);
             return;
@@ -450,6 +530,26 @@ fn sweep_work_dir(
             return;
         }
         children.push(child);
+    }
+    for n in &nested {
+        for child in &n.files {
+            match std::fs::remove_file(child) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => {
+                    sweep.failed = sweep.failed.saturating_add(1);
+                    return;
+                }
+            }
+        }
+        match std::fs::remove_dir(&n.access) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {
+                sweep.failed = sweep.failed.saturating_add(1);
+                return;
+            }
+        }
     }
     for child in &children {
         match std::fs::remove_file(child) {

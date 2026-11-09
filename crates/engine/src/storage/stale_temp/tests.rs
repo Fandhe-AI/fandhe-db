@@ -339,6 +339,36 @@ fn work_dir_entries_use_their_own_predicate() {
 }
 
 #[test]
+fn removes_nested_snapshot_work_dirs_left_inside_a_work_dir() {
+    let d = tdir("wd-nested");
+    let mk = |p: &Path| {
+        std::fs::create_dir(p).expect("mkdir");
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    };
+    let w = d.join(".w-1.d");
+    mk(&w);
+    put(&w, "base.bin", 0o600);
+    let nested = w.join(".fandhe-snapshot-1-0123456789abcdef-0.d");
+    mk(&nested);
+    put(&nested, ".fandhe-snapshot-1-0123456789abcdef-0.tmp", 0o600);
+    let s = sweep_stale_temps_with_work_dir_entries(&d, never_temp, is_wd, is_base, &[])
+        .expect("sweep");
+    assert_eq!((s.removed, s.skipped, s.failed), (1, 0, 0));
+    assert!(!w.exists());
+    // 入れ子の中に想定外の項目があれば、親ごと触らず見送る。
+    let w2 = d.join(".w-2.d");
+    mk(&w2);
+    let n2 = w2.join(".fandhe-snapshot-1-0123456789abcdef-1.d");
+    mk(&n2);
+    put(&n2, "unknown", 0o600);
+    let s = sweep_stale_temps_with_work_dir_entries(&d, never_temp, is_wd, is_base, &[])
+        .expect("sweep");
+    assert_eq!((s.removed, s.skipped), (0, 1));
+    assert!(n2.join("unknown").exists());
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
 fn restore_work_dir_names_are_matched_strictly() {
     for ok in [
         ".fandhe-restore-1-0123456789abcdef-7.d",
