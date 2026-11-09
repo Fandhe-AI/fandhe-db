@@ -251,6 +251,209 @@ fn mk_wd(dir: &Path, name: &str, mode: u32) -> PathBuf {
 }
 
 #[test]
+fn snapshot_and_resync_names_are_matched_strictly() {
+    for ok in [
+        ".fandhe-snapshot-1-0123456789abcdef-7.d",
+        ".fandhe-snapshot-4242-0123456789abcdef-18446744073709551615.d",
+    ] {
+        assert!(is_snapshot_work_dir_name(ok), "{ok}");
+        assert!(is_reserved_temp_name(ok), "{ok}");
+    }
+    for ok in [
+        ".fandhe-snapshot-1-0123456789abcdef-7.tmp",
+        // 旧形式（親直下に作っていた一時名）も残骸として受理する。
+        ".fandhe-snapshot-1-7.tmp",
+    ] {
+        assert!(is_snapshot_temp_name(ok), "{ok}");
+        assert!(is_reserved_temp_name(ok), "{ok}");
+    }
+    for bad in [
+        ".fandhe-snapshot-1-2.d",
+        ".fandhe-snapshot-1-0123456789ABCDEF-7.d",
+        ".fandhe-snapshot-1-0123456789abcdef-7.d.bak",
+        ".fandhe-snapshot-1-0123456789abcdef-7.tmp",
+        ".fandhe-snapshot-12345678901-0123456789abcdef-7.d",
+        ".fandhe-snapshot-1-0123456789abcdef-.d",
+        ".fandhe-restore-1-0123456789abcdef-7.d",
+    ] {
+        assert!(!is_snapshot_work_dir_name(bad), "{bad}");
+    }
+    for bad in [
+        ".fandhe-snapshot-1-0123456789abcdef-7.d",
+        ".fandhe-snapshot-1-xyz.tmp",
+        ".fandhe-snapshot-1-0123456789abcdef-7-9.tmp",
+        ".fandhe-snapshot-1-0123456789ABCDEF-7.tmp",
+        ".fandhe-snapshot-.tmp",
+        ".fandhe-snapshot-1-.tmp",
+    ] {
+        assert!(!is_snapshot_temp_name(bad), "{bad}");
+    }
+    let resync = ".fandhe-replica-resync-1-0123456789abcdef-7.d";
+    assert!(is_replica_resync_work_dir_name(resync));
+    assert!(is_reserved_temp_name(resync));
+    assert!(!is_replica_resync_work_dir_name(
+        ".fandhe-replica-resync-1-0123456789abcdef-7.redb"
+    ));
+    // 固定名のベースは作業ディレクトリの中だけで使い、予約名にはしない（サーバーの出力先検査に当たらない）。
+    assert!(is_replica_resync_base_name("base.redb"));
+    assert!(!is_replica_resync_base_name("base.redb.bak"));
+    assert!(!is_reserved_temp_name("base.redb"));
+}
+
+#[test]
+fn generated_names_match_their_predicates() {
+    let w = make_temp_name("fandhe-snapshot", 3, "d");
+    let t = make_temp_name("fandhe-snapshot", 4, "tmp");
+    let r = make_temp_name("fandhe-replica-resync", 5, "d");
+    assert!(is_snapshot_work_dir_name(&w), "{w}");
+    assert!(is_snapshot_temp_name(&t), "{t}");
+    assert!(is_replica_resync_work_dir_name(&r), "{r}");
+    assert!(!w.contains('/'));
+}
+
+fn is_base(n: &str) -> bool {
+    n == "base.bin"
+}
+
+fn never_temp(_: &str) -> bool {
+    false
+}
+
+#[test]
+fn work_dir_entries_use_their_own_predicate() {
+    let d = tdir("wd-entries");
+    let w = d.join(".w-1.d");
+    std::fs::create_dir(&w).expect("mkdir");
+    std::fs::set_permissions(&w, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    put(&w, "base.bin", 0o600);
+    // 親直下の項目は直下の判定（一致なし）に従い、触らない。
+    put(&d, "base.bin", 0o600);
+    let s = sweep_stale_temps_with_work_dir_children(&d, never_temp, is_wd, is_base, &[])
+        .expect("sweep");
+    assert_eq!((s.removed, s.skipped, s.failed), (1, 0, 0));
+    assert!(!w.exists());
+    assert!(d.join("base.bin").exists());
+    // 中身の判定に一致しない項目を含む作業ディレクトリは触らず skipped に数える。
+    let w2 = d.join(".w-2.d");
+    std::fs::create_dir(&w2).expect("mkdir");
+    std::fs::set_permissions(&w2, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    put(&w2, "base.bin", 0o600);
+    put(&w2, "unknown", 0o600);
+    let s = sweep_stale_temps_with_work_dir_children(&d, never_temp, is_wd, is_base, &[])
+        .expect("sweep");
+    assert_eq!((s.removed, s.skipped), (0, 1));
+    assert!(w2.join("base.bin").exists());
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn removes_nested_snapshot_work_dirs_left_inside_a_work_dir() {
+    let d = tdir("wd-nested");
+    let mk = |p: &Path| {
+        std::fs::create_dir(p).expect("mkdir");
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    };
+    let w = d.join(".w-1.d");
+    mk(&w);
+    put(&w, "base.bin", 0o600);
+    let nested = w.join(".fandhe-snapshot-1-0123456789abcdef-0.d");
+    mk(&nested);
+    put(&nested, ".fandhe-snapshot-1-0123456789abcdef-0.tmp", 0o600);
+    let s = sweep_stale_temps_with_work_dir_children(&d, never_temp, is_wd, is_base, &[])
+        .expect("sweep");
+    assert_eq!((s.removed, s.skipped, s.failed), (1, 0, 0));
+    assert!(!w.exists());
+    // 入れ子の中に想定外の項目があれば、親ごと触らず見送る。
+    let w2 = d.join(".w-2.d");
+    mk(&w2);
+    let n2 = w2.join(".fandhe-snapshot-1-0123456789abcdef-1.d");
+    mk(&n2);
+    put(&n2, "unknown", 0o600);
+    let s = sweep_stale_temps_with_work_dir_children(&d, never_temp, is_wd, is_base, &[])
+        .expect("sweep");
+    assert_eq!((s.removed, s.skipped), (0, 1));
+    assert!(n2.join("unknown").exists());
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn removes_nested_verify_work_dirs_left_inside_a_work_dir() {
+    let d = tdir("wd-nested-verify");
+    let mk = |p: &Path| {
+        std::fs::create_dir(p).expect("mkdir");
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    };
+    let w = d.join(".w-1.d");
+    mk(&w);
+    put(&w, "base.bin", 0o600);
+    let nested = w.join(".fandhe-verify-1-0123456789abcdef-0.d");
+    mk(&nested);
+    put(&nested, ".fandhe-verify-1-0123456789abcdef-0.tmp", 0o600);
+    let s = sweep_stale_temps_with_work_dir_children(&d, never_temp, is_wd, is_base, &[])
+        .expect("sweep");
+    assert_eq!((s.removed, s.skipped, s.failed), (1, 0, 0));
+    assert!(!w.exists());
+    // 検証用の作業ディレクトリに想定外の項目があれば、親ごと触らず見送る。
+    let w2 = d.join(".w-2.d");
+    mk(&w2);
+    let n2 = w2.join(".fandhe-verify-1-0123456789abcdef-1.d");
+    mk(&n2);
+    put(&n2, "unknown", 0o600);
+    let s = sweep_stale_temps_with_work_dir_children(&d, never_temp, is_wd, is_base, &[])
+        .expect("sweep");
+    assert_eq!((s.removed, s.skipped), (0, 1));
+    assert!(n2.join("unknown").exists());
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn skips_whole_work_dir_when_nested_dir_is_locked_by_a_writer() {
+    let d = tdir("wd-nested-lock");
+    let mk = |p: &Path| {
+        std::fs::create_dir(p).expect("mkdir");
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    };
+    let w = d.join(".w-1.d");
+    mk(&w);
+    let nested = w.join(".fandhe-snapshot-1-0123456789abcdef-0.d");
+    mk(&nested);
+    put(&nested, ".fandhe-snapshot-1-0123456789abcdef-0.tmp", 0o600);
+    // 書き込み側は自分の作業ディレクトリ fd に共有 lock を持つ。
+    let writer = std::fs::File::open(&nested).expect("open");
+    writer.lock_shared().expect("lock");
+    let s = sweep_stale_temps_with_work_dir_children(&d, never_temp, is_wd, is_base, &[])
+        .expect("sweep");
+    assert_eq!((s.removed, s.skipped), (0, 1));
+    assert!(nested
+        .join(".fandhe-snapshot-1-0123456789abcdef-0.tmp")
+        .exists());
+    drop(writer);
+    let s = sweep_stale_temps_with_work_dir_children(&d, never_temp, is_wd, is_base, &[])
+        .expect("sweep");
+    assert_eq!((s.removed, s.skipped), (1, 0));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn nested_work_dirs_count_toward_the_entry_limit() {
+    let d = tdir("wd-nested-limit");
+    let mk = |p: &Path| {
+        std::fs::create_dir(p).expect("mkdir");
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    };
+    let w = d.join(".w-1.d");
+    mk(&w);
+    for i in 0..(MAX_WORK_DIR_ENTRIES + 1) {
+        mk(&w.join(format!(".fandhe-snapshot-1-0123456789abcdef-{i}.d")));
+    }
+    let s = sweep_stale_temps_with_work_dir_children(&d, never_temp, is_wd, is_base, &[])
+        .expect("sweep");
+    assert_eq!((s.removed, s.skipped), (0, 1));
+    assert!(w.exists());
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
 fn restore_work_dir_names_are_matched_strictly() {
     for ok in [
         ".fandhe-restore-1-0123456789abcdef-7.d",

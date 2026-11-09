@@ -759,8 +759,9 @@ fn every_write_path_is_refused_without_the_flag_but_reads_and_snapshots_pass() {
         err,
         crate::storage::StorageError::CommitFootprintUnrecordable
     ));
-    let snap = unique_db_path("oracle-refusal-snapshot");
-    let _snap_guard = CleanupGuard(snap.clone());
+    // 出力先の親は共有でない（0700）ディレクトリにする（Issue #3135）。
+    let snap_dir = private_dir("oracle-refusal-snapshot");
+    let snap = snap_dir.path().join("snap.redb");
     plain.export_snapshot(&snap).expect("snapshot is a read");
     drop(plain);
 

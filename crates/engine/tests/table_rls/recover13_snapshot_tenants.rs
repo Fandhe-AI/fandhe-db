@@ -98,8 +98,9 @@ fn hex(bytes: &[u8]) -> String {
 fn snapshot_reopens_with_all_tenants_policies_roles_and_opaque_bytes() {
     let src_path = unique_db_path("recover13-tenants-src");
     let _g1 = CleanupGuard(src_path.clone());
-    let out_path = unique_db_path("recover13-tenants-out");
-    let _g2 = CleanupGuard(out_path.clone());
+    // 出力先の親は共有でない（0700）ディレクトリにする（Issue #3135）。
+    let out_dir = temp_db::TempDir::new("recover13-tenants-out");
+    let out_path = out_dir.path().join("out.redb");
     let src = open_core(&src_path);
 
     // tenant-a: 行セキュリティ有効・ポリシーで tag = 'vis' の行だけが見える。

@@ -568,8 +568,9 @@ fn finding_group_cap_truncates_the_list_but_not_the_totals() {
 #[test]
 fn exported_snapshot_passes_the_check() {
     let (path, _g) = build_db("integrity-snapshot-src");
-    let out = unique_db_path("integrity-snapshot-out");
-    let _g2 = CleanupGuard(out.clone());
+    // 出力先の親は共有でない（0700）ディレクトリにする（Issue #3135）。
+    let out_dir = crate::temp_db::TempDir::new("integrity-snapshot-out");
+    let out = out_dir.path().join("out.redb");
     {
         let storage = Storage::open(&path).expect("open");
         storage.export_snapshot(&out).expect("export");
@@ -589,8 +590,9 @@ fn corrupt_snapshot_derived_from_a_corrupt_db_is_still_reported() {
         t.insert((TENANTS[0], 900_040u64), value.as_slice())
             .expect("dup");
     });
-    let out = unique_db_path("integrity-snapshot-corrupt-out");
-    let _g2 = CleanupGuard(out.clone());
+    // 出力先の親は共有でない（0700）ディレクトリにする（Issue #3135）。
+    let out_dir = crate::temp_db::TempDir::new("integrity-snapshot-corrupt-out");
+    let out = out_dir.path().join("out.redb");
     {
         let storage = Storage::open(&path).expect("open");
         storage.export_snapshot(&out).expect("export");

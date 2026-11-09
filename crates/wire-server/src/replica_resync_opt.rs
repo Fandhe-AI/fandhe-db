@@ -28,7 +28,9 @@ use crate::tls::client_handshake::PinnedServerCertificate;
 pub const EXIT_OK: u8 = 0;
 /// 終了コード: 実行時の失敗（ソケットへの依頼の失敗・プライマリに届かない・I/O）。
 pub const EXIT_FAILURE: u8 = backup_opt::EXIT_FAILURE;
-/// 終了コード: 引数・パスの拒否（何も開いておらず、どこにも接続していない）。
+/// 終了コード: 引数・パスの拒否（何も開いておらず、どこにも接続していない）。`--out` の親ディレクトリが共有
+/// （グループ・その他が書き込める）か他人所有の場合（`ResyncError::InsecureParent`。Issue #3135）も、何も作らず
+/// ソケットにもプライマリにも触れずにこのコードで拒否する。
 pub const EXIT_USAGE: u8 = backup_opt::EXIT_USAGE;
 /// 終了コード: 公開済みで中身は完全だが、後始末（一時名の削除・親ディレクトリの fsync）を確かめられない。
 pub const EXIT_NOT_FINALIZED: u8 = backup_opt::EXIT_PUBLISHED_UNVERIFIED;
@@ -55,6 +57,9 @@ pub struct ReplicaResyncOptions {
     pub role: String,
     /// パスワード（ログ・エラー文・`Debug` に出さない）。
     pub password: Vec<u8>,
+    /// 読み込み済みの入力ファイル（`--credentials`・`--primary-tls-cert`）のパス。起動時の自動掃除が
+    /// 予約名ディレクトリ配下やシンボリックリンク経由のこれらを消さないよう、`protected` に渡す（Issue #3135）。
+    pub input_files: Vec<PathBuf>,
 }
 
 impl std::fmt::Debug for ReplicaResyncOptions {
@@ -104,6 +109,8 @@ pub fn parse(args: &[String]) -> Result<ReplicaResyncOptions, String> {
     let primary: SocketAddr = primary
         .parse()
         .map_err(|_| "--primary must be an ip:port address".to_string())?;
+    let mut input_files = vec![PathBuf::from(credentials)];
+    input_files.extend(primary_tls.map(PathBuf::from));
     let primary_tls = replica_opt::load_primary_pin(primary_tls.map(Path::new))?;
     replica_opt::check_primary_transport(&primary, primary_tls.is_some())?;
     let (role, password) = replica_opt::load_credentials(Path::new(credentials))?;
@@ -125,6 +132,7 @@ pub fn parse(args: &[String]) -> Result<ReplicaResyncOptions, String> {
         primary_tls,
         role,
         password,
+        input_files,
     })
 }
 

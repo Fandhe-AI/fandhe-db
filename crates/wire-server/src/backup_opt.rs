@@ -19,6 +19,9 @@ pub const EXIT_USAGE: u8 = 2;
 /// fsync）が確かめられなかった。バックアップは存在するので検証を促す（再実行は
 /// 出力先の重複で拒否される）。
 pub const EXIT_PUBLISHED_UNVERIFIED: u8 = 3;
+/// 終了コード: 公開先に検査していない内容が残り、取り消しの削除にも失敗した（Issue #3135）。手で消す必要が
+/// あるため通常の失敗（1）と分ける。`--socket` の応答でも同じコードで区別し、CLI が固定の警告を出す。
+pub const EXIT_UNCHECKED_PUBLISHED: u8 = 4;
 
 /// サーバー側のフラグ名（運用者専用のバックアップ用ソケットを opt-in で作る。既定は無効）。
 pub const SOCKET_FLAG: &str = "--backup-socket";
@@ -55,7 +58,15 @@ pub fn classify(
              verify the output file before relying on it"
                 .to_string(),
         ),
-        Err(e @ (E::DestinationExists | E::InvalidDestination)) => (EXIT_USAGE, e.to_string()),
+        // 出力先の親が共有か他人所有（Issue #3135）は、運用者が出力先を選び直す利用上の誤りとして 2 にする
+        // （`restore` の `InsecureParent` と同じ扱い）。何も作られていない。
+        Err(e @ (E::DestinationExists | E::InvalidDestination | E::InsecureParent)) => {
+            (EXIT_USAGE, e.to_string())
+        }
+        // 差し替えを見つけたため公開しなかった（`TempReplaced`）は実行時の失敗として 1。
+        Err(e @ E::TempReplaced) => (EXIT_FAILURE, e.to_string()),
+        // 検査していない内容が公開先に残った（`Display` が WARNING 文言）。手で消す案内が要るので専用コード。
+        Err(e @ E::UncheckedContentPublished) => (EXIT_UNCHECKED_PUBLISHED, e.to_string()),
         Err(e) => (EXIT_FAILURE, e.to_string()),
     }
 }
@@ -117,6 +128,33 @@ pub fn absolutize_for_socket(out: PathBuf) -> Result<PathBuf, String> {
         return Err("--out must be valid UTF-8 without line breaks".into());
     }
     Ok(out)
+}
+
+/// `backup` の出力先 `out` の親に残った、前回の異常終了のスナップショットの作業ディレクトリ・一時ファイル
+/// （Issue #3135・RECOVER-13 のポインタ）を、自分の書き出しの前に掃除する。`main.rs::run_backup` が `--db`・
+/// `--socket` の両方で呼ぶ。宛先が既に在る・親が不正なときは何もしない。掃除できなかった場合も本処理は続ける
+/// （呼び出し元が結果だけ報告する）。`protected` は消してはならない入力（`--db`・ソケット）のパス。書き込み中の
+/// 作業ディレクトリは書き込み側の共有 lock により `InUse` で見送られる。
+pub fn sweep_stale_backup_temps(
+    out: &Path,
+    protected: &[&Path],
+) -> Option<(PathBuf, engine::storage::StaleTempSweep)> {
+    out.file_name()?;
+    let parent: &Path = match out.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    if std::fs::symlink_metadata(out).is_ok() {
+        return None;
+    }
+    let s = engine::storage::sweep_stale_temps_with_work_dirs(
+        parent,
+        engine::storage::is_snapshot_temp_name,
+        engine::storage::is_snapshot_work_dir_name,
+        protected,
+    )
+    .ok()?;
+    Some((parent.to_path_buf(), s))
 }
 
 /// `Storage::open` の失敗が「別プロセスが開いている」ことによるかを判定する（`backup`・`verify` が
@@ -230,6 +268,15 @@ mod tests {
         assert!(validate_out("/nonexistent-dir-for-backup-test/x").is_err());
         assert!(validate_out("/").is_err());
         assert!(parse(&v(&["--db", db, "--out", "../x"])).is_err());
+    }
+
+    #[test]
+    fn unchecked_content_published_has_its_own_exit_code() {
+        let (code, msg) = classify(&Err(
+            engine::storage::SnapshotExportError::UncheckedContentPublished,
+        ));
+        assert_eq!(code, EXIT_UNCHECKED_PUBLISHED);
+        assert!(msg.starts_with("WARNING:"));
     }
 
     #[test]

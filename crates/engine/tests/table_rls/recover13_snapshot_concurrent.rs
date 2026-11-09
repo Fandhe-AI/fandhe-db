@@ -282,10 +282,10 @@ fn snapshot_under_concurrent_writes_is_a_single_commit_point() {
             "writer must keep committing during exports"
         );
         let before_committed = committed.load(Ordering::SeqCst);
-        let out = unique_db_path(&format!("recover13-concurrent-out{i}"));
-        outputs.push(CleanupGuard(out.clone()));
-        // 取得ファイルが出力先として未存在であること。
-        let _ = std::fs::remove_file(&out);
+        // 出力先の親は共有でない（0700）ディレクトリにする（Issue #3135）。
+        let out_dir = temp_db::TempDir::new(&format!("recover13-concurrent-out{i}"));
+        let out = out_dir.path().join("out.redb");
+        outputs.push(out_dir);
         core.export_snapshot(&out).expect("export snapshot");
         let after_committed = committed.load(Ordering::SeqCst);
         let after_started = started.load(Ordering::SeqCst);

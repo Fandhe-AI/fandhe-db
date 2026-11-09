@@ -712,3 +712,101 @@ fn socket_backup_under_two_tenant_writers_restores_prefixes_and_keeps_boundary()
     assert!(!bob_ids.iter().any(|i| [1, 2, 3].contains(i)));
     assert!(!alice_ids.iter().any(|i| [10, 11].contains(i)));
 }
+
+/// Issue #3135: 出力先の親が共有（グループ・その他が書き込める。sticky bit があっても同じ）なら、何も作らず
+/// 終了コード 2 で拒否する。共有でない親では成功し、作業ディレクトリ・一時ファイルは残らない。
+#[test]
+fn backup_rejects_shared_output_parent_and_leaves_no_work_dir_on_success() {
+    let fx = common::TempFixtureDir::new("backup-shared-parent");
+    let db = fx.db_path_str();
+    drop(engine::storage::Storage::open(&db).expect("create db"));
+    let base = parent_of(&db).to_path_buf();
+    let names = |d: &Path| -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(d)
+            .expect("read_dir")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    };
+    for (i, mode) in [0o777, 0o775, 0o1777].into_iter().enumerate() {
+        let out_dir = base.join(format!("shared{i}"));
+        std::fs::create_dir(&out_dir).expect("mkdir");
+        std::fs::set_permissions(&out_dir, std::fs::Permissions::from_mode(mode)).expect("chmod");
+        let out = out_dir.join("snap.redb");
+        let o = backup(&db, out.to_str().expect("utf-8 path"));
+        assert_eq!(code(&o), Some(2), "mode {mode:o}: {}", stderr(&o));
+        assert!(names(&out_dir).is_empty(), "mode {mode:o}");
+    }
+    let ok_dir = base.join("private");
+    std::fs::create_dir(&ok_dir).expect("mkdir");
+    std::fs::set_permissions(&ok_dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    let out = ok_dir.join("snap.redb");
+    let o = backup(&db, out.to_str().expect("utf-8 path"));
+    assert_eq!(code(&o), Some(0), "{}", stderr(&o));
+    assert_eq!(names(&ok_dir), vec!["snap.redb".to_string()]);
+}
+
+/// Issue #3135: 前回の異常終了が残したスナップショットの作業ディレクトリ（0700・自分の所有・中身が 0600 の
+/// 一時名だけ）と旧形式の一時名を、次の `backup` が掃除して報告する。モードが違うもの・未知の項目を含むもの・
+/// シンボリックリンクは残る。
+#[test]
+fn backup_sweeps_stale_work_dirs_only_when_safe() {
+    let fx = common::TempFixtureDir::new("backup-sweep-workdir");
+    let db = fx.db_path_str();
+    drop(engine::storage::Storage::open(&db).expect("create db"));
+    let dir = parent_of(&db).join("out");
+    std::fs::create_dir(&dir).expect("mkdir");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+
+    let mk = |name: &str, mode: u32, files: &[(&str, u32)]| {
+        let p = dir.join(name);
+        std::fs::create_dir(&p).expect("mkdir");
+        for (f, fm) in files {
+            let fp = p.join(f);
+            std::fs::write(&fp, b"x").expect("write");
+            std::fs::set_permissions(&fp, std::fs::Permissions::from_mode(*fm)).expect("chmod");
+        }
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).expect("chmod");
+    };
+    let nonce = "0123456789abcdef";
+    let stale = format!(".fandhe-snapshot-4242-{nonce}-7.d");
+    let stale_tmp = format!(".fandhe-snapshot-4242-{nonce}-7.tmp");
+    let empty = format!(".fandhe-snapshot-4242-{nonce}-8.d");
+    let wide = format!(".fandhe-snapshot-4242-{nonce}-9.d");
+    let extra = format!(".fandhe-snapshot-4242-{nonce}-10.d");
+    let link = format!(".fandhe-snapshot-4242-{nonce}-11.d");
+    mk(&stale, 0o700, &[(&stale_tmp, 0o600)]);
+    mk(&empty, 0o700, &[]);
+    mk(&wide, 0o750, &[(&stale_tmp, 0o600)]);
+    mk(&extra, 0o700, &[("other.bin", 0o600)]);
+    std::os::unix::fs::symlink(dir.join(&stale), dir.join(&link)).expect("symlink");
+    // 旧形式（親直下の一時名）の残骸。
+    let old = ".fandhe-snapshot-4242-5.tmp";
+    std::fs::write(dir.join(old), b"x").expect("write");
+    std::fs::set_permissions(dir.join(old), std::fs::Permissions::from_mode(0o600)).expect("chmod");
+
+    let out = dir.join("snap.redb");
+    let o = backup(&db, out.to_str().expect("utf-8 path"));
+    assert_eq!(code(&o), Some(0), "stderr: {}", stderr(&o));
+    let err = stderr(&o);
+    assert!(err.contains("removed 3 stale temporary file(s)"), "{err}");
+    assert!(
+        err.contains(&stale) && err.contains(&empty) && err.contains(old),
+        "{err}"
+    );
+    assert!(!dir.join(&stale).exists() && !dir.join(&empty).exists());
+    assert!(!dir.join(old).exists());
+    assert!(dir.join(&wide).is_dir() && dir.join(&extra).is_dir());
+    assert!(std::fs::symlink_metadata(dir.join(&link)).is_ok());
+    assert!(out.exists());
+    // 今回の作業ディレクトリは残らない（残るのは意図して残した 3 つの項目と成果物だけ）。
+    let mut left: Vec<String> = std::fs::read_dir(&dir)
+        .expect("read_dir")
+        .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+        .collect();
+    left.sort();
+    let mut want = vec![wide, extra, link, "snap.redb".to_string()];
+    want.sort();
+    assert_eq!(left, want);
+}

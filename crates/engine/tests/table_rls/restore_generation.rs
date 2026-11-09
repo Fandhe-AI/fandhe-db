@@ -31,8 +31,9 @@ fn recover17_a_restore_is_larger_than_its_source_and_repeats_are_monotonic() {
         let src = Storage::open(&src_path).expect("open src");
         assert_eq!(src.restore_generation().expect("fresh"), 0);
     }
-    let backup = unique_db_path("rg-backup");
-    let _gb = CleanupGuard(backup.clone());
+    // 出力先の親は共有でない（0700）ディレクトリにする（Issue #3135）。
+    let backup_dir = temp_db::TempDir::new("rg-backup");
+    let backup = backup_dir.path().join("backup.redb");
     Storage::open(&src_path)
         .expect("open")
         .export_snapshot(&backup)
@@ -64,8 +65,8 @@ fn recover13_a_database_with_a_generation_passes_export_verify_and_dump() {
     let generation = storage.advance_restore_generation().expect("advance");
 
     // 書き出し（表の型分類）と再度の復元（世代を持つバックアップの複製）。
-    let backup = unique_db_path("rg-classified-backup");
-    let _gb = CleanupGuard(backup.clone());
+    let backup_dir = temp_db::TempDir::new("rg-classified-backup");
+    let backup = backup_dir.path().join("backup.redb");
     storage
         .export_snapshot(&backup)
         .expect("export with generation");

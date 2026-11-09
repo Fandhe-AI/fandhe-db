@@ -4470,6 +4470,17 @@ fn run_backup(args: &[String]) -> ExitCode {
             return ExitCode::from(backup_opt::EXIT_USAGE);
         }
     };
+    // Issue #3135: 前回の異常終了が `--out` の親に残したスナップショットの作業ディレクトリ・一時ファイルを、
+    // 自分の書き出しの前に掃除する（`--db`・`--socket` の両方）。掃除の失敗・見送りで書き出しは失敗させない
+    // （終了コードの意味は変えない）。入力（`--db`・ソケット）が一時名の形式なら掃除を見送る。
+    let protected_input = match &parsed.target {
+        backup_opt::Target::Db(p) | backup_opt::Target::Socket(p) => p.as_path(),
+    };
+    if let Some((dir, s)) = backup_opt::sweep_stale_backup_temps(&parsed.out, &[protected_input]) {
+        for line in wire_server::change_log_archive::stale_temp_report_lines("backup", &dir, &s) {
+            engine::log_stderr!("{line}");
+        }
+    }
     let db = match &parsed.target {
         backup_opt::Target::Db(db) => db,
         backup_opt::Target::Socket(sock) => return run_backup_via_socket(sock, &parsed.out),
@@ -4792,6 +4803,18 @@ fn run_replica_resync(args: &[String]) -> ExitCode {
             return ExitCode::from(replica_resync_opt::EXIT_USAGE);
         }
     };
+    // Issue #3135: 前回の異常終了が `--out` の親に残した作業ディレクトリを、自分の作業ディレクトリを作る前に
+    // 掃除する。掃除の失敗・見送りで再同期は失敗させない（終了コードの意味は変えない）。
+    let protected: Vec<&std::path::Path> = std::iter::once(opts.socket.as_path())
+        .chain(opts.input_files.iter().map(|p| p.as_path()))
+        .collect();
+    if let Some((dir, s)) = replica_resync::sweep_stale_resync_temps(&opts.out, &protected) {
+        for line in
+            wire_server::change_log_archive::stale_temp_report_lines("replica-resync", &dir, &s)
+        {
+            engine::log_stderr!("{line}");
+        }
+    }
     let mut leftover = Vec::new();
     let result = replica_resync::resync(&opts, &mut leftover);
     for p in &leftover {

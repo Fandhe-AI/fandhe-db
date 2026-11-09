@@ -200,7 +200,19 @@ impl TempDir {
                 process_salt(),
             ));
             match std::fs::create_dir(&dir) {
-                Ok(()) => return TempDir(dir),
+                Ok(()) => {
+                    // umask に依存させない。スナップショットの出力先（Issue #3135）は、グループ・
+                    // その他が書き込めるディレクトリを拒否するため、テストの一時ディレクトリは 0700 にする。
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+                            .unwrap_or_else(|e| {
+                                panic!("failed to chmod temp dir {}: {e}", dir.display())
+                            });
+                    }
+                    return TempDir(dir);
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     last_err = Some(e);
                 }
