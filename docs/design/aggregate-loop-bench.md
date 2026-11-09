@@ -41,6 +41,7 @@ engine 単体の計測が無く、約 3 週間後の再計測まで気づけな�
 | `agg_count_distinct` | `COUNT(DISTINCT lang)` | 1 | `full_scan` |
 
 - 文は crossdb の agg_count・agg_multi と同形
+- 注記: `agg_count` は可視ビットマップの件数取得で済み、行ごとの observe ループを通らない経路の可能性がある。参考値の解釈では agg_multi（5 項目）を行ループの主指標とし、agg_count は経路全体の下限の目安として扱う
 - 自テナントの Public 行 25,000（id 連番・`lang` は 16 種・次元 128）に、他テナントの Private 行（`lang` は語彙外の定数）を混ぜる
 - 経路の期待値は静的な `EXPLAIN` の `access_path:` で自己検査する。経路が変わると計測の意味が変わるため、不一致は非 0 終了にする
 
