@@ -246,8 +246,8 @@ pub struct WorkDir {
     dev: u64,
     ino: u64,
     uid: u32,
-    /// uid 確認用ファイルを消せなかったときの実パス（[`Self::remove`] が再試行し、消せなければ通知する）。
-    probe_left: Option<PathBuf>,
+    /// uid 確認用ファイルを消せなかったときの実パス（[`Self::take_probe_leftover`] が再試行して通知する）。
+    pub(crate) probe_left: Option<PathBuf>,
     armed: bool,
 }
 
@@ -384,14 +384,22 @@ impl WorkDir {
             return Ok(());
         }
         self.armed = false;
-        // 確認用ファイルの削除失敗は握りつぶさず、再試行して消せなければ残ったパスとして通知する。
-        let probe_left = self.probe_left.take().filter(|p| {
-            !matches!(std::fs::remove_file(p), Ok(())) && std::fs::symlink_metadata(p).is_ok()
-        });
         match std::fs::remove_dir(&self.path) {
-            Ok(()) => probe_left.map_or(Ok(()), Err),
-            Err(e) if e.kind() == ErrorKind::NotFound => probe_left.map_or(Ok(()), Err),
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
             Err(_) => Err(self.path.clone()),
+        }
+    }
+
+    /// uid 確認用ファイルが残っていれば削除を再試行し、それでも消せなければ残った実パスを返す。
+    /// 作業ディレクトリの削除（[`Self::remove`]）の成否とは独立で、公開の確定（親の fsync）を妨げない。
+    /// 呼び出し側は返ったパスを既存の残骸の通知経路（`leftover`）へ載せる。
+    pub fn take_probe_leftover(&mut self) -> Option<PathBuf> {
+        let p = self.probe_left.take()?;
+        match std::fs::remove_file(&p) {
+            Ok(()) => None,
+            Err(e) if e.kind() == ErrorKind::NotFound => None,
+            Err(_) => Some(p),
         }
     }
 }
@@ -491,14 +499,17 @@ mod tests {
     }
 
     #[test]
-    fn probe_removal_failure_is_reported_by_remove() {
+    fn probe_removal_failure_is_reported_separately_from_dir_removal() {
         let parent = unique_parent("probefail");
         let mut w = WorkDir::create(&parent, "t").expect("create");
         // ファイルでないものは remove_file で消せない（削除失敗の代用）。
         let stuck = parent.join(engine::storage::make_probe_name(9));
         std::fs::create_dir(&stuck).expect("mkdir");
         w.probe_left = Some(stuck.clone());
-        assert_eq!(w.remove(), Err(stuck.clone()));
+        // 確認用ファイルが残っていても、作業ディレクトリの削除は成功する。
+        assert_eq!(w.remove(), Ok(()));
+        assert_eq!(w.take_probe_leftover(), Some(stuck.clone()));
+        assert_eq!(w.take_probe_leftover(), None);
         std::fs::remove_dir(&stuck).expect("cleanup stuck");
         std::fs::remove_dir(&parent).expect("cleanup");
     }

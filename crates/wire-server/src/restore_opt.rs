@@ -831,7 +831,7 @@ mod unix_impl {
     /// フィールドの宣言順が drop の順序（一時ファイル → 作業ディレクトリ → 親の共有 lock）。
     pub(super) struct Staging {
         pub(super) tmp: TempCopy,
-        work: WorkDir,
+        pub(super) work: WorkDir,
         /// 親ディレクトリの共有 lock（Issue #3094。掃除が使用中の一時名・作業ディレクトリを消さないための
         /// 相互排他）。作業ディレクトリを作る前に取り、消した後まで保持する。
         _parent_lock: engine::storage::TempDirLock,
@@ -887,9 +887,14 @@ mod unix_impl {
             }
         }
 
+        /// uid 確認用ファイルの残りの実パス（消せなければ。公開の確定には影響しない）。
+        pub(super) fn take_probe_leftover(&mut self) -> Option<PathBuf> {
+            self.work.take_probe_leftover()
+        }
+
         /// 公開後の後始末（一時名と作業ディレクトリの削除・親ディレクトリの fsync）。公開は済み中身は完全なので、
         /// 失敗は `PublishedButNotFinalized`。
-        fn finalize_published(&mut self, parent: &Path) -> Result<(), RestoreError> {
+        pub(super) fn finalize_published(&mut self, parent: &Path) -> Result<(), RestoreError> {
             self.tmp.armed = false;
             let finalized = std::fs::remove_file(&self.tmp.path)
                 .map_err(|_| ())
@@ -1045,6 +1050,9 @@ mod unix_impl {
         if let Some(p) = staging.cleanup() {
             *leftover = Some(p);
         }
+        if let Some(p) = staging.take_probe_leftover() {
+            leftover.get_or_insert(p);
+        }
         result
     }
 
@@ -1088,6 +1096,10 @@ mod unix_impl {
             if let Some(p) = staging.cleanup() {
                 *leftover = Some(p);
             }
+        }
+        // uid 確認用ファイルの残りは公開の確定とは独立に通知する（公開済みでも親の fsync は済んでいる）。
+        if let Some(p) = staging.take_probe_leftover() {
+            leftover.get_or_insert(p);
         }
         result
     }
@@ -1918,6 +1930,22 @@ mod tests {
             assert!(victim.is_dir());
             std::fs::remove_file(&w).expect("rm link");
             std::fs::rename(&moved, &w).expect("restore");
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn probe_leftover_does_not_block_finalize_and_is_reported() {
+            let d = dir("probeleft");
+            let mut s = Staging::create(&d, "fandhe-restore").expect("create");
+            // 確認用ファイルを消せない状況（ディレクトリで代用）を作る。
+            let stuck = d.join(engine::storage::make_probe_name(7));
+            std::fs::create_dir(&stuck).expect("mkdir");
+            s.work.probe_left = Some(stuck.clone());
+            // 一時ファイルは公開済み（hard_link 後）の想定で、確認用ファイルが残っていても確定は成功する。
+            assert!(s.finalize_published(&d).is_ok());
+            assert_eq!(s.take_probe_leftover(), Some(stuck.clone()));
+            std::fs::remove_dir(&stuck).expect("rm stuck");
+            assert!(names(&d).is_empty());
             let _ = std::fs::remove_dir_all(&d);
         }
 
