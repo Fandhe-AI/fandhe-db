@@ -66,6 +66,9 @@ if [ "${BASH_VERSINFO[0]}" -lt 5 ]; then
 fi
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# $EPOCHREALTIME の小数点はロケール依存（. または ,）。ロケールに依存せず解析するヘルパーを読み込む（Issue #3138）。
+# shellcheck source=epoch_time.sh
+source "${REPO_ROOT}/scripts/epoch_time.sh" || { echo "ERROR: cannot load epoch_time.sh" >&2; exit 1; }
 BIN="${REPO_ROOT}/target/release/wire-server"
 CLIENT="${REPO_ROOT}/scripts/crash_test_backup_restore_client.py"
 
@@ -345,6 +348,10 @@ PT_TIME=()
 # 壁時計（エポックからの ms）と単調時計（/proc/uptime。ms）。
 PT_RT_MS=()
 PT_MONO_MS=()
+# 同じ検査点の採取終了時点（次の周期の開始直前）の壁時計と単調時計。採取から終了までの間の壁時計の飛びを
+# 検出し、時刻指定の点（採取の 300ms 後）が次の周期の commit より前にあるという前提を守るために使う。
+PT_RT_END_MS=()
+PT_MONO_END_MS=()
 
 # サーバーを停止した直後に呼ぶ。時刻を採り、サーバーを再起動（修復・起動直後のアーカイブ）して件数を
 # 読み、アーカイブの末尾 LSN が期待値に一致するまで待ってから停止し、検査点を追加する。
@@ -354,7 +361,8 @@ capture_point() {
   local idx="${#PT_LSN[@]}" t up _ rt_us
   # 単調時計と壁時計を fork なしで連続して採る（間に外部コマンドを挟まず、採取のゆらぎを避ける）。
   read -r up _ < /proc/uptime || fail "cannot read /proc/uptime"
-  rt_us="${EPOCHREALTIME/./}"
+  read_epoch_us || fail "cannot parse EPOCHREALTIME (unexpected format): ${EPOCHREALTIME-}"
+  rt_us="${EPOCH_US}"
   PT_RT_MS+=($((rt_us / 1000)))
   PT_MONO_MS+=($((${up/./} * 10)))
   # 時刻指定の点は採取時刻の 300ms 後にする。直前の commit（採取より前）との余裕を広げるため。
@@ -404,10 +412,17 @@ capture_point() {
   echo "point ${idx}: lsn=${CLV_LAST} count=${COUNT} max_id=${MAXID} time=${t}"
   # 次の周期の commit を時刻指定の点（採取の 300ms 後）より 300ms 以上後にする。
   local now_us
-  now_us="${EPOCHREALTIME/./}"
+  read_epoch_us || fail "cannot parse EPOCHREALTIME (unexpected format): ${EPOCHREALTIME-}"
+  now_us="${EPOCH_US}"
   if [ "${now_us}" -lt $((rt_us + 600000)) ]; then
     sleep_ms $(((rt_us + 600000 - now_us) / 1000 + 1))
   fi
+  # 採取終了時点の壁時計と単調時計を控える（find_time_point が採取中の壁時計の飛びを検出する）。
+  local up_end
+  read -r up_end _ < /proc/uptime || fail "cannot read /proc/uptime"
+  read_epoch_us || fail "cannot parse EPOCHREALTIME (unexpected format): ${EPOCHREALTIME-}"
+  PT_RT_END_MS+=($((EPOCH_US / 1000)))
+  PT_MONO_END_MS+=($((${up_end/./} * 10)))
 }
 
 # ---------------------------------------------------------------------------
@@ -482,6 +497,9 @@ find_time_point() {
   TIME_K=""
   for k in $(seq 1 $((last - 1))); do
     ok=1
+    # 採取の開始から終了までの間（時刻指定の点を含む）にも壁時計が飛んでいないこと。
+    drift=$(((PT_RT_END_MS[k] - PT_RT_MS[k]) - (PT_MONO_END_MS[k] - PT_MONO_MS[k])))
+    [ "${drift#-}" -le 30 ] || ok=0
     for j in $((k - 1)) "${k}"; do
       drift=$(((PT_RT_MS[j + 1] - PT_RT_MS[j]) - (PT_MONO_MS[j + 1] - PT_MONO_MS[j])))
       [ "${drift#-}" -le 30 ] || ok=0
