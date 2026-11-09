@@ -817,3 +817,138 @@ fn recover17_restore_with_a_corrupt_source_generation_publishes_nothing() {
     assert!(leftovers(&dir).is_empty(), "{:?}", leftovers(&dir));
     assert_eq!(std::fs::read(&src).expect("read src"), bytes);
 }
+/// Issue #3102: 前回の異常終了が残した作業ディレクトリ（0700・自分の所有・中身が 0600 の一時名だけ）を、
+/// 次の `restore` が中身ごと掃除して報告する。モードが違うもの・未知の項目を含むもの・シンボリックリンクは残る。
+#[test]
+fn restore_sweeps_stale_work_dirs_only_when_safe() {
+    use std::os::unix::fs::PermissionsExt;
+    let fx = common::TempFixtureDir::new("restore-sweep-workdir");
+    let (_users, db) = populate(&fx);
+    let dir = parent_of(&db).to_path_buf();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod dir");
+    let snap = dir.join("snap.redb");
+    let snap_s = snap.to_str().expect("utf-8 path").to_string();
+    let o = backup(&db, &snap_s);
+    assert_eq!(code(&o), Some(0), "stderr: {}", stderr(&o));
+
+    let mk = |name: &str, mode: u32, files: &[(&str, u32)]| {
+        let p = dir.join(name);
+        std::fs::create_dir(&p).expect("mkdir");
+        for (f, fm) in files {
+            let fp = p.join(f);
+            std::fs::write(&fp, b"x").expect("write");
+            std::fs::set_permissions(&fp, std::fs::Permissions::from_mode(*fm)).expect("chmod");
+        }
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).expect("chmod");
+    };
+    let nonce = "0123456789abcdef";
+    let stale = format!(".fandhe-restore-4242-{nonce}-7.d");
+    let stale_tmp = format!(".fandhe-restore-4242-{nonce}-7.tmp");
+    let empty = format!(".fandhe-restore-4242-{nonce}-8.d");
+    let wide = format!(".fandhe-restore-4242-{nonce}-9.d");
+    let extra = format!(".fandhe-restore-4242-{nonce}-10.d");
+    let link = format!(".fandhe-restore-4242-{nonce}-11.d");
+    mk(&stale, 0o700, &[(&stale_tmp, 0o600)]);
+    mk(&empty, 0o700, &[]);
+    mk(&wide, 0o750, &[(&stale_tmp, 0o600)]);
+    mk(&extra, 0o700, &[("other.bin", 0o600)]);
+    std::os::unix::fs::symlink(dir.join(&stale), dir.join(&link)).expect("symlink");
+
+    let restored = dir.join("restored.redb");
+    let restored_s = restored.to_str().expect("utf-8 path").to_string();
+    let o = restore(&snap_s, &restored_s);
+    assert_eq!(code(&o), Some(0), "stderr: {}", stderr(&o));
+    let err = stderr(&o);
+    assert!(err.contains("removed 2 stale temporary file(s)"), "{err}");
+    assert!(err.contains(&stale) && err.contains(&empty), "{err}");
+    assert!(!dir.join(&stale).exists() && !dir.join(&empty).exists());
+    assert!(dir.join(&wide).is_dir() && dir.join(&extra).is_dir());
+    assert!(std::fs::symlink_metadata(dir.join(&link)).is_ok());
+    assert!(restored.exists());
+    // 今回の作業ディレクトリは残らない（残るのは意図して残した 3 つの作業ディレクトリだけ）。
+    let mut left = leftovers(&dir);
+    left.sort();
+    let mut want = vec![wide, extra, link];
+    want.sort();
+    assert_eq!(left, want);
+}
+
+/// Issue #3102: 復元先の親がグループ・その他から書き込めるなら、`restore` は何も作らず終了コード 2 で
+/// 拒否する（一時コピーの差し替えを防げない）。固定の文言で、パスを含めない。
+#[test]
+fn restore_refuses_a_shared_parent_without_creating_anything() {
+    use std::os::unix::fs::PermissionsExt;
+    let fx = common::TempFixtureDir::new("restore-shared-parent");
+    let (_users, db) = populate(&fx);
+    let src_dir = parent_of(&db).to_path_buf();
+    let snap = src_dir.join("snap.redb");
+    let snap_s = snap.to_str().expect("utf-8 path").to_string();
+    let o = backup(&db, &snap_s);
+    assert_eq!(code(&o), Some(0), "stderr: {}", stderr(&o));
+
+    let fx2 = common::TempFixtureDir::new("restore-shared-parent-out");
+    let out_dir = parent_of(&fx2.db_path_str()).to_path_buf();
+    for mode in [0o775, 0o777, 0o757, 0o1777] {
+        std::fs::set_permissions(&out_dir, std::fs::Permissions::from_mode(mode)).expect("chmod");
+        let restored = out_dir.join("restored.redb");
+        let o = restore(&snap_s, restored.to_str().expect("utf-8 path"));
+        assert_eq!(code(&o), Some(2), "{mode:o}: {}", stderr(&o));
+        let err = stderr(&o);
+        assert!(err.contains("writable by group or others"), "{err}");
+        // 拒否の文言そのものはパスを含まない（掃除の見送り通知は運用者が指定したパスを出す）。
+        let last = err.lines().last().unwrap_or_default();
+        assert!(
+            !last.contains(out_dir.to_str().expect("utf-8 path")),
+            "{err}"
+        );
+        assert!(!restored.exists());
+        assert!(leftovers(&out_dir).is_empty(), "{:?}", leftovers(&out_dir));
+    }
+    std::fs::set_permissions(&out_dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+}
+
+/// Issue #3102: `verify` は、読み取り専用で開ける DB なら親が共有でも検査できる（コピーを作らない）。
+/// 書き込みを要する DB のコピー経路だけが、共有の親で終了コード 2 になり、何も作らない。
+#[test]
+fn verify_copy_path_refuses_a_shared_parent_but_read_only_path_does_not() {
+    use std::os::unix::fs::PermissionsExt;
+    let fx = common::TempFixtureDir::new("verify-shared-parent");
+    let live = fx.db_path_str();
+    let storage = Storage::open(&live).expect("open");
+    storage
+        .put(
+            1,
+            &RowInput {
+                tenant_id: "tnt",
+                visibility: Visibility::Public,
+                embedding: &[0.5],
+                metadata: b"m",
+            },
+        )
+        .expect("put");
+    let dir = parent_of(&live).to_path_buf();
+    let crashed = dir.join("crashed.redb");
+    std::fs::copy(&live, &crashed).expect("copy while open");
+    drop(storage);
+    let clean = dir.join("clean.redb");
+    std::fs::copy(&live, &clean).expect("copy closed");
+    // 一度コピー経路で開いて整える前の、書き込みを要する状態のファイルを別に保つ。
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o775)).expect("chmod");
+    let o = verify(&["--db", crashed.to_str().expect("utf-8 path")]);
+    assert_eq!(code(&o), Some(2), "stderr: {}", stderr(&o));
+    assert!(
+        stderr(&o).contains("writable by group or others"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(leftovers(&dir).is_empty(), "{:?}", leftovers(&dir));
+    // 閉じて整った DB は読み取り専用で開けるので、共有の親でも終了コード 0。
+    let o = verify(&["--db", clean.to_str().expect("utf-8 path")]);
+    assert_eq!(code(&o), Some(0), "stderr: {}", stderr(&o));
+    assert!(
+        stdout(&o).ends_with("verify_mode=read_only\n"),
+        "{}",
+        stdout(&o)
+    );
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+}

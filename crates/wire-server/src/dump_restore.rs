@@ -199,6 +199,9 @@ pub fn restore(
     if let Err(p) = work.remove() {
         leftover.get_or_insert(p);
     }
+    if let Some(p) = work.take_probe_leftover() {
+        leftover.get_or_insert(p);
+    }
     result
 }
 

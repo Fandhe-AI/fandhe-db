@@ -225,3 +225,150 @@ fn unprotected_siblings_are_still_removed_and_missing_protected_is_ignored() {
     assert!(!d.join(".t-2.tmp").exists());
     let _ = std::fs::remove_dir_all(&d);
 }
+fn is_wd(n: &str) -> bool {
+    n.strip_prefix(".w-")
+        .and_then(|r| r.strip_suffix(".d"))
+        .is_some_and(|r| is_decimal(r, 10))
+}
+
+fn sweep_wd(dir: &Path, protected: &[&Path]) -> StaleTempSweep {
+    sweep_stale_temps_with_work_dirs(dir, is_name, is_wd, protected).expect("sweep")
+}
+
+fn mk_wd(dir: &Path, name: &str, mode: u32) -> PathBuf {
+    let p = dir.join(name);
+    std::fs::create_dir(&p).expect("mkdir wd");
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).expect("chmod");
+    p
+}
+
+#[test]
+fn restore_work_dir_names_are_matched_strictly() {
+    for ok in [
+        ".fandhe-restore-1-0123456789abcdef-7.d",
+        ".fandhe-restore-4242-0123456789abcdef-18446744073709551615.d",
+    ] {
+        assert!(is_restore_work_dir_name(ok), "{ok}");
+        assert!(is_reserved_temp_name(ok), "{ok}");
+    }
+    for bad in [
+        ".fandhe-restore-1-2.d",
+        ".fandhe-restore-1-0123456789ABCDEF-7.d",
+        ".fandhe-restore-1-0123456789abcdef-7.d.bak",
+        ".fandhe-restore-1-0123456789abcdef-7.tmp",
+        ".fandhe-restore-12345678901-0123456789abcdef-7.d",
+        ".fandhe-restore-1-0123456789abcdef-123456789012345678901.d",
+        ".fandhe-verify-1-0123456789abcdef-7.d",
+        ".fandhe-restore-1-0123456789abcdef-.d",
+    ] {
+        assert!(!is_restore_work_dir_name(bad), "{bad}");
+    }
+}
+
+#[test]
+fn removes_work_dirs_with_temp_files_and_empty_ones() {
+    let d = tdir("wd-basic");
+    let w1 = mk_wd(&d, ".w-1.d", 0o700);
+    put(&w1, ".t-1.tmp", 0o600);
+    mk_wd(&d, ".w-2.d", 0o700);
+    // 一時名の通常ファイルは従来どおり消える。
+    put(&d, ".t-3.tmp", 0o600);
+    let s = sweep_wd(&d, &[]);
+    assert_eq!((s.removed, s.skipped, s.failed), (3, 0, 0));
+    assert!(!d.join(".w-1.d").exists() && !d.join(".w-2.d").exists());
+    let mut names = s.removed_names.clone();
+    names.sort();
+    assert_eq!(names, vec![".t-3.tmp", ".w-1.d", ".w-2.d"]);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn removes_setgid_work_dirs_like_work_dir_check() {
+    // 親が setgid だと mkdir(0700) の作業ディレクトリは 2700 になる。特殊ビットだけの差は掃除対象。
+    let d = tdir("wd-setgid");
+    let w = mk_wd(&d, ".w-1.d", 0o2700);
+    put(&w, ".t-1.tmp", 0o600);
+    let s = sweep_wd(&d, &[]);
+    assert_eq!((s.removed, s.skipped, s.failed), (1, 0, 0));
+    assert!(!d.join(".w-1.d").exists());
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn leaves_unexpected_work_dirs_and_counts_them() {
+    let d = tdir("wd-skip");
+    // モードが違う。
+    let w = mk_wd(&d, ".w-1.d", 0o750);
+    put(&w, ".t-1.tmp", 0o600);
+    // 未知の項目を含む。
+    let w = mk_wd(&d, ".w-2.d", 0o700);
+    put(&w, "other.bin", 0o600);
+    put(&w, ".t-1.tmp", 0o600);
+    // 項目数が上限を超える。
+    let w = mk_wd(&d, ".w-3.d", 0o700);
+    for i in 0..=MAX_WORK_DIR_ENTRIES {
+        put(&w, &format!(".t-{i}.tmp"), 0o600);
+    }
+    // ファイルのモードが 0644。
+    let w = mk_wd(&d, ".w-4.d", 0o700);
+    put(&w, ".t-1.tmp", 0o644);
+    // シンボリックリンク。
+    let target = mk_wd(&d, "victim", 0o700);
+    put(&target, ".t-1.tmp", 0o600);
+    symlink(&target, d.join(".w-5.d")).expect("ln");
+    // 中身がシンボリックリンク。
+    let w = mk_wd(&d, ".w-6.d", 0o700);
+    symlink(target.join(".t-1.tmp"), w.join(".t-9.tmp")).expect("ln");
+    let s = sweep_wd(&d, &[]);
+    assert_eq!((s.removed, s.skipped), (0, 6));
+    for n in [".w-1.d", ".w-2.d", ".w-3.d", ".w-4.d", "victim", ".w-6.d"] {
+        assert!(d.join(n).exists(), "{n}");
+    }
+    assert!(target.join(".t-1.tmp").exists());
+    assert!(std::fs::symlink_metadata(d.join(".w-5.d")).is_ok());
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn keeps_work_dirs_holding_protected_files() {
+    let d = tdir("wd-prot");
+    let w = mk_wd(&d, ".w-1.d", 0o700);
+    put(&w, ".t-1.tmp", 0o600);
+    let prot = w.join(".t-1.tmp");
+    let s = sweep_wd(&d, &[prot.as_path()]);
+    assert_eq!((s.removed, s.skipped), (0, 1));
+    assert!(prot.exists());
+    // 作業ディレクトリ自身が保護対象でも残る。
+    let s = sweep_wd(&d, &[w.as_path()]);
+    assert_eq!((s.removed, s.skipped), (0, 1));
+    assert!(w.exists());
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn work_dir_sweep_is_skipped_for_shared_parent_and_held_lock() {
+    let d = tdir("wd-shared");
+    mk_wd(&d, ".w-1.d", 0o700);
+    std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o775)).expect("chmod");
+    let s = sweep_wd(&d, &[]);
+    assert_eq!(s.outcome, SweepOutcome::SharedDirectory);
+    assert!(d.join(".w-1.d").exists());
+    std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    let guard = TempDirLock::shared(&d).expect("lock");
+    let s = sweep_wd(&d, &[]);
+    assert_eq!(s.outcome, SweepOutcome::InUse);
+    assert!(d.join(".w-1.d").exists());
+    drop(guard);
+    assert_eq!(sweep_wd(&d, &[]).removed, 1);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn plain_sweep_never_touches_work_dirs() {
+    let d = tdir("wd-plain");
+    mk_wd(&d, ".w-1.d", 0o700);
+    let s = sweep(&d);
+    assert_eq!((s.removed, s.skipped), (0, 0));
+    assert!(d.join(".w-1.d").exists());
+    let _ = std::fs::remove_dir_all(&d);
+}

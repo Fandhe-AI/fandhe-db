@@ -50,8 +50,8 @@ pub(crate) mod table_image;
 pub(crate) mod writer_gate;
 
 pub use stale_temp::{
-    is_reserved_temp_name, is_restore_temp_name, sweep_stale_temps, StaleTempSweep, SweepOutcome,
-    TempDirLock,
+    is_reserved_temp_name, is_restore_temp_name, is_restore_work_dir_name, make_probe_name,
+    sweep_stale_temps, sweep_stale_temps_with_work_dirs, StaleTempSweep, SweepOutcome, TempDirLock,
 };
 
 pub use change_log::archive::{
