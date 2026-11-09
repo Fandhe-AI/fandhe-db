@@ -165,7 +165,9 @@ def cmd_bisect(base):
     steps = {}
     for d in sorted(glob.glob(os.path.join(base, "step*-run*"))):
         name = os.path.basename(d)
-        step, sha, _ = name.split("-", 2)
+        # 端点は step00-(good|bad)-<sha>-runN、通常は stepNN-<sha>-runN。末尾の -runN を除き最後の要素を commit とする
+        step, rest = name.split("-", 1)
+        sha = rest.rsplit("-run", 1)[0].rsplit("-", 1)[-1]
         steps.setdefault((step, sha), []).append(d)
     for (step, sha), ds in sorted(steps.items()):
         am = [p50(d, "agg_multi") for d in ds]
