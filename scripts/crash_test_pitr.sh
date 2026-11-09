@@ -30,9 +30,17 @@
 #      突き合わせで拒否）も `restore --until-lsn` も終了コード 1 で拒否し、復元先に何も作らないこと（無改ざんの対照は成功する）。
 #   7. 増分併用: 途中の検査点の DB から取った増分バックアップ + アーカイブで最新まで復元できること、
 #      増分だけで増分内の LSN まで復元できること、増分の反転を拒否すること。
-# 時刻指定の検査は壁時計に依存する。開発機では別ジョブの影響で壁時計が数百 ms 単位で前後に飛ぶことが
-# あったため、検査点の前後で壁時計が単調時計（/proc/uptime）から 30ms を超えてずれた場合は、飛びの無い
-# 検査点が採れるまでクラッシュ周期を足す（上限あり。採れなければ失敗）。
+# 時刻指定の検査は壁時計に依存する。復元側（変更ログの commit 時刻）は server の SystemTime で記録するため、
+# 時刻指定の点は bash の壁時計ではなく server の `clock_timestamp()` から決める（Issue #3153）。点 k の
+# 採取で server を再起動した直後の時刻 T_srv[k]（前の周期の commit はすべて kill 前に済んでいる）と、
+# 次の周期で server を起動した直後・追記クライアント起動前の時刻 T_next[k]（次の周期の最初の commit より前）
+# を読み、中点を点の時刻とする。kill → 再起動 → 読み取りの因果の順序で、中点は前後の commit の間に入る。
+# 従来の点（bash の時刻 + 300ms）は、GNU date の `%6N` が小数 0.1 秒未満で値を 10 倍にする癖で最大 0.9 秒
+# 後ろへずれ、次周期の commit を含んで失敗していた（format_rfc3339_us 参照）。server の時計にすることで
+# 時計間のずれにも依らない（診断のために点ごとの差 skew_ms を出す）。あわせて、開発機で壁時計が数百 ms 単位で前後に飛んだ実績が
+# あるため、server の時刻が T_srv[k] < T_next[k] < T_srv[k+1] を満たさない点と、bash の壁時計が単調時計
+# （/proc/uptime）から 30ms を超えてずれた点は選ばず、条件を満たす点が採れるまでクラッシュ周期を足す
+# （上限あり。採れなければ失敗）。
 # 空虚な成功を避けるため、書き込み中にサーバーを kill できた周期数と、PITR の restore を公開前
 # （一時名が新たにあり最終名が無い）に kill できた回数を数え、0 回なら失敗とする（反復を延長する。上限あり）。
 # Makefile の crash-test-pitr ターゲット（crash-test の前提）から呼ばれ、CI では既存の crash-test
@@ -352,6 +360,38 @@ PT_MONO_MS=()
 # 検出し、時刻指定の点（採取の 300ms 後）が次の周期の commit より前にあるという前提を守るために使う。
 PT_RT_END_MS=()
 PT_MONO_END_MS=()
+# server の `clock_timestamp()`（µs）。PT_SRV_US[k] は点 k の採取で server を再起動した直後の値、
+# PT_NEXT_US[k] は点 k の次の周期で server を起動した直後（追記クライアント起動前）の値（Issue #3153）。
+# PT_SKEW_MS[k] は PT_SRV_US[k] と bash の壁時計の差（server - bash。診断専用）。
+PT_SRV_US=()
+PT_NEXT_US=()
+PT_SKEW_MS=()
+
+# µs のエポック時刻を RFC 3339（UTC・小数 6 桁）へ整形する。秒は date で、小数は printf で組む。
+# GNU date の `%6N` は小数が 0.1 秒未満（先頭が 0）のとき 10 倍の値（0.091589 → .915890）を返すため使わない。
+# これが Issue #3153 の失敗の根本原因（点の時刻が最大 0.9 秒後ろへずれ、次周期の commit を含んだ）。
+format_rfc3339_us() {
+  local us="$1" sec
+  sec="$(date -u -d "@$((us / 1000000))" +%Y-%m-%dT%H:%M:%S)" || return 1
+  printf '%s.%06dZ' "${sec}" $((us % 1000000))
+}
+
+# 起動中のサーバーの壁時計（commit 時刻と同じ時計）を SRV_US に、同時刻の bash の壁時計との差を SKEW_MS に設定する。
+# 読み取りの SELECT は commit ではなく LSN を進めない。仮に進めたら次の capture_point の期待 LSN の検査が拒否する。
+SRV_US=""
+SKEW_MS=""
+read_server_clock() {
+  local before after line
+  read_epoch_us || fail "cannot parse EPOCHREALTIME (unexpected format): ${EPOCHREALTIME-}"
+  before="${EPOCH_US}"
+  line="$(python3 -I "${CLIENT}" clock "${SERVER_PORT}" "${USER_NAME}" "${USER_PASS}")" \
+    || fail "server clock query failed"
+  read_epoch_us || fail "cannot parse EPOCHREALTIME (unexpected format): ${EPOCHREALTIME-}"
+  after="${EPOCH_US}"
+  SRV_US="${line#CLOCK_US=}"
+  [[ "${SRV_US}" =~ ^[0-9]+$ ]] || fail "could not parse server clock: ${line}"
+  SKEW_MS=$(((SRV_US - (before + after) / 2) / 1000))
+}
 
 # サーバーを停止した直後に呼ぶ。時刻を採り、サーバーを再起動（修復・起動直後のアーカイブ）して件数を
 # 読み、アーカイブの末尾 LSN が期待値に一致するまで待ってから停止し、検査点を追加する。
@@ -368,9 +408,11 @@ capture_point() {
   # 時刻指定の点は採取時刻の 300ms 後にする。直前の commit（採取より前）との余裕を広げるため。
   # 次の周期の最初の commit がこの点より後になることは、関数の末尾で採取から 600ms 経つまで待って
   # 保証する（再起動・アーカイブ待ちが速い環境では、待たないと次周期の commit が点より前に入る）。
-  t="$(date -u -d "@$(((rt_us + 300000) / 1000000)).$(printf '%06d' $(((rt_us + 300000) % 1000000)))" +%Y-%m-%dT%H:%M:%S.%6NZ)" \
-    || fail "date could not format the checkpoint time"
+  t="$(format_rfc3339_us $((rt_us + 300000)))" || fail "date could not format the checkpoint time"
   start_src_server
+  read_server_clock
+  PT_SRV_US[idx]="${SRV_US}"
+  PT_SKEW_MS[idx]="${SKEW_MS}"
   read_counts
   local expect="" waited=0 stable=0 last=""
   if [ "${idx}" -gt 0 ]; then
@@ -409,7 +451,7 @@ capture_point() {
   PT_COUNT+=("${COUNT}")
   PT_MAXID+=("${MAXID}")
   PT_TIME+=("${t}")
-  echo "point ${idx}: lsn=${CLV_LAST} count=${COUNT} max_id=${MAXID} time=${t}"
+  echo "point ${idx}: lsn=${CLV_LAST} count=${COUNT} max_id=${MAXID} shell_time=${t} srv_us=${PT_SRV_US[idx]} skew_ms=${PT_SKEW_MS[idx]}"
   # 次の周期の commit を時刻指定の点（採取の 300ms 後）より 300ms 以上後にする。
   local now_us
   read_epoch_us || fail "cannot parse EPOCHREALTIME (unexpected format): ${EPOCHREALTIME-}"
@@ -450,6 +492,9 @@ crash_cycle() {
   prev=$((${#PT_LSN[@]} - 1))
   start_id=$((PT_MAXID[prev] + 1))
   start_src_server
+  # 追記クライアントの起動前に server の時計を読む（この周期の最初の commit はこれより後）。
+  read_server_clock
+  PT_NEXT_US[prev]="${SRV_US}"
   : > "${CLIENT_LOG}"
   python3 -I "${CLIENT}" append "${SERVER_PORT}" "${USER_NAME}" "${USER_PASS}" "${start_id}" \
     >> "${CLIENT_LOG}" 2>&1 &
@@ -497,6 +542,8 @@ find_time_point() {
   TIME_K=""
   for k in $(seq 1 $((last - 1))); do
     ok=1
+    # server の時計で、点 k の前後の commit の間に時刻指定の点が入ること。
+    [ "${PT_SRV_US[k]}" -lt "${PT_NEXT_US[k]}" ] && [ "${PT_NEXT_US[k]}" -lt "${PT_SRV_US[k + 1]}" ] || ok=0
     # 採取の開始から終了までの間（時刻指定の点を含む）にも壁時計が飛んでいないこと。
     drift=$(((PT_RT_END_MS[k] - PT_RT_MS[k]) - (PT_MONO_END_MS[k] - PT_MONO_MS[k])))
     [ "${drift#-}" -le 30 ] || ok=0
@@ -615,11 +662,30 @@ done
 RESTORE_MS=$(($(now_ms) - t0))
 echo "restored ${LAST} points and ${LAST} mid-cycle points in ${RESTORE_MS}ms"
 
-# 時刻指定: 検査点 TIME_K の時刻（その周期の停止後・次の周期の開始前）まで。
+# 時刻指定: 検査点 TIME_K の時刻（その周期の停止後・次の周期の開始前）まで。時刻は server の時計で
+# 読んだ T_srv と T_next の中点（Issue #3153）。
+TIME_US=$(((PT_SRV_US[TIME_K] + PT_NEXT_US[TIME_K]) / 2))
+TIME_ARG="$(format_rfc3339_us "${TIME_US}")" || fail "date could not format the checkpoint time"
 dest="${RST_DIR}/time-${TIME_K}.redb"
-restore_to "${dest}" --change-log-archive-dir "${ARCH}" --until-time "${PT_TIME[TIME_K]}"
-[ "${RESTORE_RC}" -eq 0 ] || restore_fail "restore --until-time ${PT_TIME[TIME_K]} exit ${RESTORE_RC} (expected 0)"
-expect_state "${dest}" "restore until time of point ${TIME_K}" "${PT_COUNT[TIME_K]}" "${PT_MAXID[TIME_K]}"
+restore_to "${dest}" --change-log-archive-dir "${ARCH}" --until-time "${TIME_ARG}"
+[ "${RESTORE_RC}" -eq 0 ] || restore_fail "restore --until-time ${TIME_ARG} exit ${RESTORE_RC} (expected 0)"
+# 一致しないときに、点の時刻と前後の時計を出して原因を確かめられるようにする（期待値は緩めない）。
+time_diag() {
+  {
+    echo "time-point diagnostics: k=${TIME_K} until_time=${TIME_ARG} time_us=${TIME_US}"
+    echo "  srv_us[k]=${PT_SRV_US[TIME_K]} next_us[k]=${PT_NEXT_US[TIME_K]} srv_us[k+1]=${PT_SRV_US[TIME_K + 1]}"
+    echo "  shell rt_ms[k]=${PT_RT_MS[TIME_K]} rt_end_ms[k]=${PT_RT_END_MS[TIME_K]} mono_ms[k]=${PT_MONO_MS[TIME_K]} mono_end_ms[k]=${PT_MONO_END_MS[TIME_K]}"
+    echo "  skew_ms (server - shell): ${PT_SKEW_MS[*]}"
+    echo "  expected count=${PT_COUNT[TIME_K]} max_id=${PT_MAXID[TIME_K]}; extra rows: $((COUNT - PT_COUNT[TIME_K])), ids ${PT_MAXID[TIME_K]}+1..${MAXID}"
+  } >&2
+}
+expect_verify_ok "${dest}" "restore until time of point ${TIME_K}"
+count_via_server "${dest}"
+if [ "${COUNT}" != "${PT_COUNT[TIME_K]}" ] || [ "${MAXID}" != "${PT_MAXID[TIME_K]}" ]; then
+  time_diag
+  fail "restore until time of point ${TIME_K}: count=${COUNT} max_id=${MAXID}, expected ${PT_COUNT[TIME_K]}/${PT_MAXID[TIME_K]}"
+fi
+rm -f "${dest}"
 # 最後のコミットより後の時刻（遠い未来）は、範囲外として拒否される（末尾まで黙って適用しない）。
 dest="${RST_DIR}/time-late.redb"
 restore_to "${dest}" --change-log-archive-dir "${ARCH}" --until-time "2999-01-01T00:00:00Z"
