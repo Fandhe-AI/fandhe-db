@@ -1031,14 +1031,7 @@ mod tests {
 
     #[test]
     fn read_bounded_file_rejects_missing_file() {
-        let path = std::env::temp_dir().join(format!(
-            "tls-pem-missing-{}-{}.pem",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
+        let path = crate::test_util::unique_temp_path("tls-pem-missing", ".pem");
         let err = read_bounded_file(&path, MAX_PRIVATE_KEY_FILE_LEN).unwrap_err();
         assert_eq!(err.error, TlsFileError::NotFound);
     }
@@ -1064,14 +1057,7 @@ mod tests {
 
     #[test]
     fn read_bounded_file_rejects_oversized_file() {
-        let path = std::env::temp_dir().join(format!(
-            "tls-pem-oversized-{}-{}.pem",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
+        let path = crate::test_util::unique_temp_path("tls-pem-oversized", ".pem");
         std::fs::write(&path, vec![b'a'; 16]).expect("write temp file");
         let result = read_bounded_file(&path, 8);
         let _ = std::fs::remove_file(&path);
@@ -1081,14 +1067,7 @@ mod tests {
 
     #[test]
     fn read_bounded_file_reads_within_limit() {
-        let path = std::env::temp_dir().join(format!(
-            "tls-pem-ok-{}-{}.pem",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
+        let path = crate::test_util::unique_temp_path("tls-pem-ok", ".pem");
         std::fs::write(&path, ED25519_V1_PEM.as_bytes()).expect("write temp file");
         let result = read_bounded_file(&path, MAX_PRIVATE_KEY_FILE_LEN);
         let _ = std::fs::remove_file(&path);
@@ -1100,14 +1079,7 @@ mod tests {
     #[test]
     fn read_bounded_file_rejects_permission_denied() {
         use std::os::unix::fs::PermissionsExt;
-        let path = std::env::temp_dir().join(format!(
-            "tls-pem-denied-{}-{}.pem",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
+        let path = crate::test_util::unique_temp_path("tls-pem-denied", ".pem");
         std::fs::write(&path, b"secret").expect("write temp file");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000))
             .expect("set permissions");

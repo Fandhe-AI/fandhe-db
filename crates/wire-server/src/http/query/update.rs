@@ -922,15 +922,7 @@ mod tests {
     fn open_core() -> (EngineCore, std::path::PathBuf) {
         use engine::kernel::CpuScalarProvider;
         use engine::storage::Storage;
-        let dir = std::env::temp_dir();
-        let path = dir.join(format!(
-            "wire-update-typed-{}-{}.redb",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
+        let path = crate::test_util::unique_temp_path("wire-update-typed", ".redb");
         let storage = Storage::open(&path).expect("open storage");
         storage
             .create_table(&TableSchema::new(

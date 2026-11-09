@@ -639,14 +639,7 @@ mod tests {
 
     #[test]
     fn load_ed25519_private_key_file_reads_valid_key() {
-        let path = std::env::temp_dir().join(format!(
-            "tls-pkcs8-ok-{}-{}.pem",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
+        let path = crate::test_util::unique_temp_path("tls-pkcs8-ok", ".pem");
         std::fs::write(&path, ED25519_V1_PEM.as_bytes()).expect("write temp file");
         let result = load_ed25519_private_key_file(&path);
         let _ = std::fs::remove_file(&path);
@@ -657,14 +650,7 @@ mod tests {
 
     #[test]
     fn load_ed25519_private_key_file_reports_missing_file() {
-        let path = std::env::temp_dir().join(format!(
-            "tls-pkcs8-missing-{}-{}.pem",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
+        let path = crate::test_util::unique_temp_path("tls-pkcs8-missing", ".pem");
         let err = load_ed25519_private_key_file(&path).unwrap_err();
         assert!(matches!(err, PrivateKeyLoadError::File(_)));
     }

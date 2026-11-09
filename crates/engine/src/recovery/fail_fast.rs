@@ -286,14 +286,8 @@ mod tests {
 
     #[test]
     fn install_calls_previous_hook_before_aborting() {
-        let marker_path = std::env::temp_dir().join(format!(
-            "engine-fail-fast-hook-chain-marker-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or_default()
-        ));
+        let marker_path =
+            crate::test_util::temp_db::unique_temp_path("fail-fast-hook-chain-marker", "");
         let _ = std::fs::remove_file(&marker_path);
 
         let (status, stdout_buf) = spawn_child(

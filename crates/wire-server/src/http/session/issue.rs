@@ -295,14 +295,7 @@ mod tests {
                     .expect("valid phc encoding");
             content.push_str(&format!("{username}:{tenant_id}:{phc}\n"));
         }
-        let dir = std::env::temp_dir().join(format!(
-            "wire-server-session-issue-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system clock")
-                .as_nanos()
-        ));
+        let dir = crate::test_util::unique_temp_path("wire-server-session-issue-test", "");
         std::fs::create_dir(&dir).expect("create unique fixture dir");
         let _dir_cleanup = DirCleanup(dir.clone());
         let path = dir.join("users.txt");

@@ -782,14 +782,7 @@ mod tests {
     fn rejects_null_for_enum_column_even_when_nullable() {
         // `EnumTypeDef` はフィールドが private で `Storage::create_enum_type`
         // 経由でのみ構築できる（`result_encoder.rs` の既存テストと同じ判断）。
-        let db_path = std::env::temp_dir().join(format!(
-            "typed-json-enum-null-{}-{}.redb",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system clock")
-                .as_nanos()
-        ));
+        let db_path = crate::test_util::unique_temp_path("typed-json-enum-null", ".redb");
         let storage = engine::storage::Storage::open(&db_path).expect("open throwaway storage");
         let enum_def = storage
             .create_enum_type("mood", vec!["happy".to_string(), "sad".to_string()])

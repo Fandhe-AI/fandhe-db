@@ -838,15 +838,7 @@ mod tests {
     fn open_core_with_mode(
         mode: engine::recovery::required_op_id::LedgerMode,
     ) -> (EngineCore, std::path::PathBuf) {
-        let dir = std::env::temp_dir();
-        let path = dir.join(format!(
-            "wire-insert-{}-{}.redb",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
+        let path = crate::test_util::unique_temp_path("wire-insert", ".redb");
         let storage = Storage::open(&path).expect("open storage");
         storage.create_table(&schema()).expect("create table");
         (
