@@ -369,6 +369,53 @@ fn removes_nested_snapshot_work_dirs_left_inside_a_work_dir() {
 }
 
 #[test]
+fn skips_whole_work_dir_when_nested_dir_is_locked_by_a_writer() {
+    let d = tdir("wd-nested-lock");
+    let mk = |p: &Path| {
+        std::fs::create_dir(p).expect("mkdir");
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    };
+    let w = d.join(".w-1.d");
+    mk(&w);
+    let nested = w.join(".fandhe-snapshot-1-0123456789abcdef-0.d");
+    mk(&nested);
+    put(&nested, ".fandhe-snapshot-1-0123456789abcdef-0.tmp", 0o600);
+    // 書き込み側は自分の作業ディレクトリ fd に共有 lock を持つ。
+    let writer = std::fs::File::open(&nested).expect("open");
+    writer.lock_shared().expect("lock");
+    let s = sweep_stale_temps_with_work_dir_entries(&d, never_temp, is_wd, is_base, &[])
+        .expect("sweep");
+    assert_eq!((s.removed, s.skipped), (0, 1));
+    assert!(nested
+        .join(".fandhe-snapshot-1-0123456789abcdef-0.tmp")
+        .exists());
+    drop(writer);
+    let s = sweep_stale_temps_with_work_dir_entries(&d, never_temp, is_wd, is_base, &[])
+        .expect("sweep");
+    assert_eq!((s.removed, s.skipped), (1, 0));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn nested_work_dirs_count_toward_the_entry_limit() {
+    let d = tdir("wd-nested-limit");
+    let mk = |p: &Path| {
+        std::fs::create_dir(p).expect("mkdir");
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    };
+    let w = d.join(".w-1.d");
+    mk(&w);
+    for i in 0..(MAX_WORK_DIR_ENTRIES + 1) {
+        mk(&w.join(format!(".fandhe-snapshot-1-0123456789abcdef-{i}.d")));
+    }
+    let s = sweep_stale_temps_with_work_dir_entries(&d, never_temp, is_wd, is_base, &[])
+        .expect("sweep");
+    assert_eq!((s.removed, s.skipped), (0, 1));
+    assert!(w.exists());
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
 fn restore_work_dir_names_are_matched_strictly() {
     for ok in [
         ".fandhe-restore-1-0123456789abcdef-7.d",

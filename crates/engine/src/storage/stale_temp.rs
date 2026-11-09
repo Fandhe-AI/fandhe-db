@@ -318,6 +318,13 @@ pub fn sweep_stale_temps(
 /// 専用の形式（[`is_probe_name`]）なので次の掃除が回収する。
 #[cfg(unix)]
 pub(crate) fn probe_own_uid(dir: &Path) -> Option<u32> {
+    probe_own_uid_kind(dir).ok()
+}
+
+/// [`probe_own_uid`] の失敗理由つき版。`PermissionDenied` は「書き込めない親（他人所有の 0755 等）」を
+/// 呼び出し側が区別するために使う。
+#[cfg(unix)]
+pub(crate) fn probe_own_uid_kind(dir: &Path) -> Result<u32, std::io::ErrorKind> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     for attempt in 0..8u64 {
         let p = dir.join(make_probe_name(attempt));
@@ -328,16 +335,16 @@ pub(crate) fn probe_own_uid(dir: &Path) -> Option<u32> {
             .open(&p)
         {
             Ok(f) => {
-                let uid = f.metadata().ok().map(|m| m.uid());
+                let uid = f.metadata().map(|m| m.uid());
                 drop(f);
                 let _ = std::fs::remove_file(&p);
-                return uid;
+                return uid.map_err(|e| e.kind());
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(_) => return None,
+            Err(e) => return Err(e.kind()),
         }
     }
-    None
+    Err(std::io::ErrorKind::AlreadyExists)
 }
 
 /// 作業ディレクトリ 1 つの中に許す項目数の上限（一時 DB 1 つだけが正常。余裕を見て小さく取る）。
@@ -388,6 +395,12 @@ fn plan_nested_work_dir(access: &Path, real: &Path, ctx: &SweepCtx<'_>) -> Optio
     let fd = std::fs::File::open(access).ok()?;
     let fm = fd.metadata().ok()?;
     if !fm.is_dir() || fm.dev() != meta.dev() || fm.ino() != meta.ino() {
+        return None;
+    }
+    // 入れ子の作業ディレクトリ自身の fd にも排他 lock を取る（書き込み側は自分の作業ディレクトリの fd に
+    // 共有 lock を保持する）。取れない（書き込み中・lock 非対応）なら受理せず、呼び出し側が全体を見送る。
+    // lock は `_fd` が生きている間（削除まで）保持される。
+    if fd.try_lock().is_err() {
         return None;
     }
     let proc_path = std::path::PathBuf::from(format!(
@@ -492,7 +505,8 @@ fn sweep_work_dir(
             skip(sweep);
             return;
         };
-        if children.len() >= MAX_WORK_DIR_ENTRIES {
+        // 入れ子の作業ディレクトリも項目数の上限に数える（Issue #3135）。
+        if children.len().saturating_add(nested.len()) >= MAX_WORK_DIR_ENTRIES {
             skip(sweep);
             return;
         }

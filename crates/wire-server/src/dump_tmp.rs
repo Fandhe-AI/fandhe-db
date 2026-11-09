@@ -210,6 +210,10 @@ fn probe_own_uid(parent: &Path, parent_fd: &File) -> Result<(u32, Option<PathBuf
                 return uid.map(|u| (u, left)).map_err(io_err);
             }
             Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
+            // 書き込めない親（他人所有の 0755 等）は自分の親ではない。I/O 失敗でなく利用上の誤り（Issue #3135）。
+            Err(e) if e.kind() == ErrorKind::PermissionDenied => {
+                return Err(TmpError::InsecureParent)
+            }
             Err(e) => return Err(io_err(e)),
         }
     }

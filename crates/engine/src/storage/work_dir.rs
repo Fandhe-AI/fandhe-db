@@ -79,8 +79,14 @@ impl WorkDir {
         }
         // 自分の uid は mkdir 前に親の中へ作った確認用ファイルの所有者から得る
         // （mkdir 後に開いたディレクトリの所有者は差し替えられうるので基準にしない）。
-        let own_uid = super::stale_temp::probe_own_uid(&access_path_of(&parent_fd, parent))
-            .ok_or(WorkDirError::Io(ErrorKind::Other))?;
+        // 書き込めない親（他人所有の 0755 等）は確認用ファイルを作れず PermissionDenied になる。
+        // 書き込めない時点で自分の親ではないので、I/O 失敗でなく InsecureParent（利用上の誤り）に倒す。
+        let own_uid =
+            match super::stale_temp::probe_own_uid_kind(&access_path_of(&parent_fd, parent)) {
+                Ok(u) => u,
+                Err(ErrorKind::PermissionDenied) => return Err(WorkDirError::InsecureParent),
+                Err(k) => return Err(WorkDirError::Io(k)),
+            };
         if !parent_is_acceptable(pm.mode(), pm.uid(), own_uid) {
             return Err(WorkDirError::InsecureParent);
         }
@@ -113,6 +119,9 @@ impl WorkDir {
             Ok(now) if now.dev() == pm.dev() && now.ino() == pm.ino() => {}
             _ => return Err(fail(&path, WorkDirError::Replaced)),
         }
+        // 掃除（入れ子の作業ディレクトリの排他 lock）との相互排他のため、自分の作業ディレクトリ fd に
+        // 共有 lock を保持する（drop で解放）。取れなければ使わない（fail-closed）。
+        dir.lock_shared().map_err(|e| fail(&path, io_err(e)))?;
         let access = access_path_of(&dir, &path);
         let this = Self {
             dir,
@@ -239,6 +248,20 @@ mod tests {
         assert!(w.remove().is_ok());
         assert_eq!(std::fs::read_dir(&parent).expect("read").count(), 0);
         std::fs::remove_dir(&parent).expect("cleanup");
+    }
+
+    #[test]
+    fn unwritable_foreign_parent_is_insecure_parent_not_io() {
+        // root は書き込めてしまうので、root 以外のときだけ検査する（root 所有の 0755 の `/usr`）。
+        let me = std::fs::metadata("/proc/self")
+            .map(|m| m.uid())
+            .unwrap_or(0);
+        let usr = Path::new("/usr");
+        if me == 0 || !usr.is_dir() {
+            return;
+        }
+        let r = WorkDir::create(usr, &mut || "x".to_string());
+        assert!(matches!(r, Err(WorkDirError::InsecureParent)));
     }
 
     #[test]

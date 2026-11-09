@@ -19,6 +19,9 @@ pub const EXIT_USAGE: u8 = 2;
 /// fsync）が確かめられなかった。バックアップは存在するので検証を促す（再実行は
 /// 出力先の重複で拒否される）。
 pub const EXIT_PUBLISHED_UNVERIFIED: u8 = 3;
+/// 終了コード: 公開先に検査していない内容が残り、取り消しの削除にも失敗した（Issue #3135）。手で消す必要が
+/// あるため通常の失敗（1）と分ける。`--socket` の応答でも同じコードで区別し、CLI が固定の警告を出す。
+pub const EXIT_UNCHECKED_PUBLISHED: u8 = 4;
 
 /// サーバー側のフラグ名（運用者専用のバックアップ用ソケットを opt-in で作る。既定は無効）。
 pub const SOCKET_FLAG: &str = "--backup-socket";
@@ -60,9 +63,10 @@ pub fn classify(
         Err(e @ (E::DestinationExists | E::InvalidDestination | E::InsecureParent)) => {
             (EXIT_USAGE, e.to_string())
         }
-        // 差し替えを見つけたため公開しなかった（`TempReplaced`）、または検査していない内容が公開先に残った
-        // （`UncheckedContentPublished`。`Display` が WARNING 文言）。どちらも実行時の失敗として 1。
-        Err(e @ (E::TempReplaced | E::UncheckedContentPublished)) => (EXIT_FAILURE, e.to_string()),
+        // 差し替えを見つけたため公開しなかった（`TempReplaced`）は実行時の失敗として 1。
+        Err(e @ E::TempReplaced) => (EXIT_FAILURE, e.to_string()),
+        // 検査していない内容が公開先に残った（`Display` が WARNING 文言）。手で消す案内が要るので専用コード。
+        Err(e @ E::UncheckedContentPublished) => (EXIT_UNCHECKED_PUBLISHED, e.to_string()),
         Err(e) => (EXIT_FAILURE, e.to_string()),
     }
 }
@@ -264,6 +268,15 @@ mod tests {
         assert!(validate_out("/nonexistent-dir-for-backup-test/x").is_err());
         assert!(validate_out("/").is_err());
         assert!(parse(&v(&["--db", db, "--out", "../x"])).is_err());
+    }
+
+    #[test]
+    fn unchecked_content_published_has_its_own_exit_code() {
+        let (code, msg) = classify(&Err(
+            engine::storage::SnapshotExportError::UncheckedContentPublished,
+        ));
+        assert_eq!(code, EXIT_UNCHECKED_PUBLISHED);
+        assert!(msg.starts_with("WARNING:"));
     }
 
     #[test]

@@ -304,7 +304,7 @@ pub fn check_socket_owner(socket: &Path) -> Result<(), String> {
 /// サーバーの応答（検証済み）。メッセージは信用せず、結果コードと数値だけを取り出す。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Response {
-    /// 結果コード（終了コードと同一。0〜3）。
+    /// 結果コード（終了コードと同一。0〜4）。
     pub code: u8,
     /// 成功時の (tables, entries)。
     pub counts: Option<(u64, u64)>,
@@ -320,6 +320,9 @@ pub fn code_message(code: u8) -> &'static str {
         backup_opt::EXIT_PUBLISHED_UNVERIFIED => {
             "WARNING: the snapshot file was published but its durability could not be confirmed; \
              verify the output file before relying on it"
+        }
+        backup_opt::EXIT_UNCHECKED_PUBLISHED => {
+            "WARNING: the destination holds content that was not checked; delete it manually"
         }
         _ => "the server failed to write the snapshot",
     }
@@ -345,7 +348,7 @@ pub fn request(socket: &Path, out: &Path) -> Result<Response, String> {
             code: 0,
             counts: Some(parse_counts(&msg).ok_or_else(bad)?),
         }),
-        Ok(c) if c <= backup_opt::EXIT_PUBLISHED_UNVERIFIED => Ok(Response {
+        Ok(c) if c <= backup_opt::EXIT_UNCHECKED_PUBLISHED => Ok(Response {
             code: c,
             counts: None,
         }),
