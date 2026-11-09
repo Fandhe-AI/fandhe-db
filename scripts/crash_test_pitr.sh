@@ -66,6 +66,9 @@ if [ "${BASH_VERSINFO[0]}" -lt 5 ]; then
 fi
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# $EPOCHREALTIME の小数点はロケール依存（. または ,）。ロケールに依存せず解析するヘルパーを読み込む（Issue #3138）。
+# shellcheck source=epoch_time.sh
+source "${REPO_ROOT}/scripts/epoch_time.sh" || { echo "ERROR: cannot load epoch_time.sh" >&2; exit 1; }
 BIN="${REPO_ROOT}/target/release/wire-server"
 CLIENT="${REPO_ROOT}/scripts/crash_test_backup_restore_client.py"
 
@@ -354,7 +357,8 @@ capture_point() {
   local idx="${#PT_LSN[@]}" t up _ rt_us
   # 単調時計と壁時計を fork なしで連続して採る（間に外部コマンドを挟まず、採取のゆらぎを避ける）。
   read -r up _ < /proc/uptime || fail "cannot read /proc/uptime"
-  rt_us="${EPOCHREALTIME/./}"
+  read_epoch_us || fail "cannot parse EPOCHREALTIME (unexpected format): ${EPOCHREALTIME-}"
+  rt_us="${EPOCH_US}"
   PT_RT_MS+=($((rt_us / 1000)))
   PT_MONO_MS+=($((${up/./} * 10)))
   # 時刻指定の点は採取時刻の 300ms 後にする。直前の commit（採取より前）との余裕を広げるため。
@@ -404,7 +408,8 @@ capture_point() {
   echo "point ${idx}: lsn=${CLV_LAST} count=${COUNT} max_id=${MAXID} time=${t}"
   # 次の周期の commit を時刻指定の点（採取の 300ms 後）より 300ms 以上後にする。
   local now_us
-  now_us="${EPOCHREALTIME/./}"
+  read_epoch_us || fail "cannot parse EPOCHREALTIME (unexpected format): ${EPOCHREALTIME-}"
+  now_us="${EPOCH_US}"
   if [ "${now_us}" -lt $((rt_us + 600000)) ]; then
     sleep_ms $(((rt_us + 600000 - now_us) / 1000 + 1))
   fi
