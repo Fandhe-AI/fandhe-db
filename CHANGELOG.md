@@ -102,6 +102,8 @@
 
 ### Added
 
+- レプリカを運用者の明示操作で昇格する `wire-server replica-promote --db <path>` を追加した（Issue #3132・RECOVER-15 (4)(5) ポインタ。親 #2171。判断は [replication-streaming.md](docs/design/replication-streaming.md) の「実装判断（Issue #3132）」）。engine に `Storage::promote_replica` と公開型 `storage::{PromoteReport, PromoteError}`（`PromoteError` は `#[non_exhaustive]`）を、wire-server に公開モジュール `replica_promote_opt` を追加した。破壊的変更はない。
+
 - SQL 組み込み関数 `ts_headline(doc, query[, options])` を追加した（Issue #2125・SEARCH-14 ポインタ）。一致箇所を `StartSel`／`StopSel` で囲んだ抜粋を返す。オプション 8 種（`StartSel`・`StopSel`・`MaxWords`・`MinWords`・`ShortWord`・`HighlightAll`・`MaxFragments`・`FragmentDelimiter`）と既定値は PostgreSQL 17 に合わせ、ASCII の英字・空白・基本的な句読点では出力が一致する。HTML などはエスケープしない（表示側の責務）。未知のオプション・不正な値は `22023`、書式エラーは `42601`、出力長・断片数・仕事量の上限超過は切り詰めずに `54000`。出力長と断片数の上限は新フラグ `--max-ts-headline-bytes`／`--max-ts-headline-fragments` で下げられる。公開モジュール `headline_limits`・`sparse::headline` と `EngineCore::with_headline_limits`／`headline_limits` を追加した。式索引・生成列には置けない（`42P17`）。
   BREAKING CHANGE: 公開 enum `sql::udf_call::BuiltinFn` に variant `TsHeadline2`／`TsHeadline3` を追加した（網羅的 `match` の下流は追随が必要）。
 - 除外語・前方一致・`or` を可視集合の BM25 へ結線する評価経路を追加した（Issue #2115・SEARCH-12／RLS-8 ポインタ）。`SparseIndex::score_text_query_within`／`score_text_query_str_within`・`sparse::text_eval::TextSearchError`・`text_query_limits::TextQueryLimits`・`EngineCore::with_text_query_limits`、wire-server の起動フラグ `--max-text-query-terms`・`--max-text-query-prefix-expansions`（範囲 `1`〜`1024`）。上限超過は `54000`。SQL／NoSQL への配線は #2116。

@@ -27,7 +27,7 @@ use crate::storage::Storage;
 
 /// 読み取りトランザクション上で連続性を判定し、切り替え点を返す。変更ログのメタ情報が無ければ
 /// `NotEnabled`、最後の LSN が世代と一致しなければ `ChainBroken`。
-fn check_in_read(read: &redb::ReadTransaction) -> Result<ChainPoint, IncrementalError> {
+pub(super) fn check_in_read(read: &redb::ReadTransaction) -> Result<ChainPoint, IncrementalError> {
     let (db_id, timeline) = read_identity(read)?;
     let generation = crate::storage::current_generation_in_txn(read)?;
     // 識別子はあるが起点が無いのは想定外の不整合。fail-closed に拒否する。

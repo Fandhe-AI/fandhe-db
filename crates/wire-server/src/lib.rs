@@ -192,6 +192,8 @@ pub mod replica;
 #[cfg(unix)]
 pub mod replica_opt;
 #[cfg(unix)]
+pub mod replica_promote_opt;
+#[cfg(unix)]
 pub mod replica_resync;
 #[cfg(unix)]
 pub mod replica_resync_opt;

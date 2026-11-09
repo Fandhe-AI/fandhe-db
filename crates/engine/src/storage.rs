@@ -68,6 +68,7 @@ pub use change_log::incremental::{
     IncrementalSummary,
 };
 pub use change_log::pitr::{restore_to_point, PitrTarget};
+pub use change_log::promote::{PromoteError, PromoteReport};
 pub use change_log::replica_apply::{ReplicaApplyError, ReplicaApplyReport, MAX_APPLY_RECORDS};
 pub use change_log::replica_base::replica_base_point_of;
 pub use change_log::stream::{

@@ -468,6 +468,11 @@
 //! RECOVER-15 ポインタ）: レプリカの再同期。プライマリのバックアップソケットからフルバックアップを取り、整合・
 //! 変更ログの連続性・プライマリへの確認を通ったものだけを新しいレプリカ DB として公開する
 //! （`wire_server::replica_resync_opt`・`wire_server::replica_resync`）。
+//!
+//! `replica-promote --db <path>`（Issue #3132・RECOVER-15 (4)(5) ポインタ）: 停止中のレプリカ DB を運用者の明示操作で
+//! 昇格する（自動フェイルオーバーではない）。整合検査の後に timeline を分岐させ、確定した適用済みの commit 番号と
+//! 失われる範囲を標準出力へ出す。昇格した DB は `--change-log` 付きの通常起動でプライマリになる
+//! （`wire_server::replica_promote_opt`。終了コードは `replica-resync` と揃える）。
 //! `--replica-primary <ip:port>`・`--replica-credentials <file>`（任意で `--replica-max-backoff-secs`・
 //! `--replica-batch-records`・`--replica-batch-bytes`。Issue #2175・RECOVER-15 ポインタ）: 読み取りレプリカモード。
 //! 通常のテナント向けリスナーと `replica` サブコマンドの適用ループを同じプロセスで動かし、書き込み・DDL・`COPY FROM` は
@@ -662,6 +667,9 @@ fn main() -> ExitCode {
     }
     if args.get(1).map(String::as_str) == Some("replica-resync") {
         return run_replica_resync(&args[2..]);
+    }
+    if args.get(1).map(String::as_str) == Some("replica-promote") {
+        return run_replica_promote(&args[2..]);
     }
 
     run_server(&args)
@@ -4781,6 +4789,103 @@ fn run_replica_resync(args: &[String]) -> ExitCode {
 #[cfg(not(unix))]
 fn run_replica_resync(_args: &[String]) -> ExitCode {
     engine::log_stderr!("wire-server: replica-resync is supported only on unix platforms");
+    ExitCode::from(wire_server::backup_opt::EXIT_USAGE)
+}
+
+/// `replica-promote --db <path>` サブコマンド（Issue #3132・RECOVER-15 (4)(5) ポインタ。運用手順は
+/// `docs/design/replication-operations.md` §5）。停止中のレプリカ DB を整合検査し、排他で開いて
+/// `Storage::promote_replica`（1 本の保守 commit で timeline を分岐）を実行する。昇格した DB は
+/// `--change-log` 付きの通常起動でプライマリになる。昇格前の失敗では DB は変わらない（fail-closed）。昇格後に標準出力へ書けなかったときだけ
+/// 専用の終了コード（`EXIT_PROMOTED_OUTPUT_FAILED`）で、DB は昇格済みである。
+/// 標準出力は成功時の 2 行（適用済みの commit 番号と、失われる範囲）だけで、失敗の報告は標準エラーへ出す。
+/// 引数・出力・終了コードは `wire_server::replica_promote_opt`。
+#[cfg(unix)]
+fn run_replica_promote(args: &[String]) -> ExitCode {
+    use engine::storage::{PromoteError, Storage};
+    use wire_server::{backup_opt, replica_promote_opt as opt, restore_opt, verify_opt};
+
+    let parsed = match opt::parse(args) {
+        Ok(o) => o,
+        Err(msg) => {
+            engine::log_stderr!("wire-server: replica-promote: {msg}");
+            return ExitCode::from(opt::EXIT_USAGE);
+        }
+    };
+    // 整合検査（元ファイルへは書き込まない）。矛盾・検査できない項目があれば昇格しない。
+    let mut leftover = None;
+    let verified = restore_opt::verify_db(
+        &parsed.db,
+        &engine::storage::IntegrityOptions::default(),
+        &mut leftover,
+    );
+    if let Some(p) = &leftover {
+        report_leftover("replica-promote", p);
+    }
+    match verified {
+        Ok((report, _)) => {
+            let code = verify_opt::classify(&report);
+            if code != 0 {
+                engine::log_stderr!(
+                    "wire-server: replica-promote: integrity check did not pass; \
+                     the database was not changed (run verify for details)"
+                );
+                return ExitCode::from(code);
+            }
+        }
+        Err(e) => {
+            // 使用中だけは、運用手順（レプリカの停止）に合わせた文言にする。
+            let msg = match e {
+                restore_opt::RestoreError::SourceInUse => {
+                    "database is in use by another process (stop the replica first)"
+                }
+                _ => restore_opt::verify_failure_message(&e),
+            };
+            engine::log_stderr!("wire-server: replica-promote: {msg}");
+            return ExitCode::from(match e {
+                restore_opt::RestoreError::InvalidSource => opt::EXIT_USAGE,
+                _ => opt::EXIT_FAILURE,
+            });
+        }
+    }
+    let mut storage = match Storage::open(&parsed.db) {
+        Ok(s) => s,
+        Err(e) => {
+            if backup_opt::is_already_open(&e) {
+                engine::log_stderr!(
+                    "wire-server: replica-promote: database is in use by another process \
+                     (stop the replica first)"
+                );
+            } else {
+                engine::log_stderr!("wire-server: replica-promote: failed to open database");
+            }
+            return ExitCode::from(opt::EXIT_FAILURE);
+        }
+    };
+    match storage.promote_replica() {
+        Ok(report) => {
+            // 昇格は確定済み。報告の書き込み失敗を「DB は変わらない」終了コード 1 にしてはならない
+            // （運用者が再実行すると timeline がさらに分岐する）。専用の終了コードと診断で知らせる。
+            if write_stdout(&opt::success_report(report.applied_lsn)).is_err() {
+                engine::log_stderr!("{}", opt::output_failed_message(report.applied_lsn));
+                return ExitCode::from(opt::EXIT_PROMOTED_OUTPUT_FAILED);
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            engine::log_stderr!("wire-server: replica-promote: {e}");
+            ExitCode::from(match e {
+                PromoteError::NotReplicaBase | PromoteError::BaseDiscontinuous => {
+                    opt::EXIT_NOT_REPLICA_BASE
+                }
+                _ => opt::EXIT_FAILURE,
+            })
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn run_replica_promote(_args: &[String]) -> ExitCode {
+    engine::log_stderr!("wire-server: replica-promote is supported only on unix platforms");
     ExitCode::from(wire_server::backup_opt::EXIT_USAGE)
 }
 
