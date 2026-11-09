@@ -496,3 +496,100 @@ fn stage_lines_have_keys_and_no_tenant() {
     assert_eq!(StagePath::Current.label(), "current");
     assert_eq!(StagePath::PlainScanRef.label(), "plain_scan_ref");
 }
+
+// --- 集計の行ループ計測（Issue #1490。`harness::aggregate_loop`） ---
+
+mod aggregate_loop_accept {
+    use super::harness::aggregate_loop as al;
+    use super::harness::relational_p95::summarize_rounds;
+    use super::ms;
+    use std::time::Duration;
+
+    #[test]
+    fn parse_rounds_and_rows_boundaries() {
+        assert_eq!(al::parse_rounds(None), Ok(al::DEFAULT_ROUNDS));
+        assert_eq!(al::parse_rounds(Some("")), Ok(al::DEFAULT_ROUNDS));
+        assert_eq!(al::parse_rounds(Some("5")), Ok(5));
+        assert_eq!(al::parse_rounds(Some("50")), Ok(50));
+        for bad in ["4", "51", "abc", "-1", "5.5"] {
+            assert!(al::parse_rounds(Some(bad)).is_err(), "{bad}");
+        }
+        assert_eq!(al::parse_rows(None), Ok(al::AGG_ROWS));
+        assert_eq!(al::parse_rows(Some("1000")), Ok(1_000));
+        assert_eq!(al::parse_rows(Some("25000")), Ok(25_000));
+        for bad in ["999", "25001", "x", "-5", "1e3", "1000.5"] {
+            assert!(al::parse_rows(Some(bad)).is_err(), "{bad}");
+        }
+        assert_eq!(al::scale_label(25_000), "full");
+        assert_eq!(al::scale_label(1_000), "reduced");
+    }
+
+    #[test]
+    fn dedicated_attestation_is_refused_only_under_github_actions() {
+        assert!(al::refuse_dedicated_under_github_actions(true, true).is_err());
+        assert!(al::refuse_dedicated_under_github_actions(true, false).is_ok());
+        assert!(al::refuse_dedicated_under_github_actions(false, true).is_ok());
+        assert!(al::refuse_dedicated_under_github_actions(false, false).is_ok());
+    }
+
+    #[test]
+    fn arms_are_pinned_to_crossdb_shapes() {
+        let by = |l: &str| al::ARMS.iter().find(|a| a.label == l).copied().unwrap();
+        assert_eq!(by("agg_count").sql, "SELECT COUNT(*) FROM docs");
+        assert_eq!(by("agg_count").items, 1);
+        assert_eq!(
+            by("agg_multi").sql,
+            "SELECT COUNT(*), SUM(id), AVG(id), MIN(id), MAX(id) FROM docs"
+        );
+        assert_eq!(by("agg_multi").items, 5);
+        assert_eq!(
+            by("agg_count_distinct").sql,
+            "SELECT COUNT(DISTINCT lang) FROM docs"
+        );
+        assert_eq!(al::ARMS.len(), 3);
+    }
+
+    #[test]
+    fn expected_aggregates_derive_from_fixture_rules() {
+        let a = al::expected_aggregates(1_000, 100, al::Viewer::Own).unwrap();
+        assert_eq!((a.count, a.sum, a.min, a.max), (1_000, 499_500, 0, 999));
+        assert_eq!(a.distinct_lang, 16);
+        assert!((a.avg - 499.5).abs() < 1e-9);
+        let b = al::expected_aggregates(1_000, 100, al::Viewer::Other).unwrap();
+        assert_eq!((b.count, b.sum, b.max), (1_100, 604_450, 1_099));
+        assert_eq!(b.distinct_lang, 17);
+        let full = al::expected_aggregates(25_000, 500, al::Viewer::Own).unwrap();
+        assert_eq!(full.sum, 312_487_500);
+        assert!(al::expected_aggregates(0, 0, al::Viewer::Own).is_none());
+        assert!(al::expected_aggregates(u64::MAX, 1, al::Viewer::Other).is_none());
+        assert!(al::other_rows(25_000) >= 100);
+    }
+
+    #[test]
+    fn per_cell_ns_values_and_degenerate_inputs() {
+        let v = al::per_cell_ns(ms(1), 1_000, 5).unwrap();
+        assert!((v - 200.0).abs() < 1e-6);
+        assert!(al::per_cell_ns(ms(1), 0, 5).is_none());
+        assert!(al::per_cell_ns(ms(1), 5, 0).is_none());
+        assert!(al::per_cell_ns(ms(1), usize::MAX, 2).is_none());
+    }
+
+    #[test]
+    fn rendered_lines_are_leak_free_and_threshold_is_never_judged() {
+        let s = summarize_rounds(&[ms(2), ms(3), ms(4), ms(5), ms(6)]).unwrap();
+        let arm = al::ARMS[1];
+        let lines = [
+            al::render_round_line(arm.label, 1, ms(2), Duration::from_micros(1500), "0.10"),
+            al::render_summary_line(arm.label, 25_000, "full", &s),
+            al::render_derived_line(&arm, 25_000, &s),
+            al::render_threshold_line(),
+        ];
+        assert!(lines[0].starts_with("aggregate_loop: group=aggregate arm=agg_multi round=1"));
+        assert!(lines[1].contains("min_of_n=") && lines[1].contains("run_to_run_band="));
+        assert!(lines[2].contains("cells=125000") && lines[2].contains("ns_per_cell_min="));
+        assert!(lines[3].contains("not evaluated"));
+        for l in &lines {
+            assert!(!l.contains("tenant") && !l.contains("SELECT"), "{l}");
+        }
+    }
+}

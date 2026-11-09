@@ -208,6 +208,9 @@ cat <<'EOF'
       衝突有無で応答時間分布を比較するベンチ（Issue #2079・#2080。判定行は参考値で終了コード非反映。
       BENCH_RLS_TIMING_REJUDGE=<raw.json> で再判定のみ）
       $ cargo bench --bench rls_timing_bench -p fandhe-db-engine
+  bench-aggregate-loop
+      集計の行ループ（COUNT/SUM/AVG/MIN/MAX・COUNT(*)・COUNT(DISTINCT)）の p95 計測（Issue #1490）
+      $ cargo bench --bench aggregate_loop_bench -p fandhe-db-engine
   bench-hybrid-profile
       hybrid_rrf クエリの段別内訳プロファイル（Issue #356 ほか）
       $ cargo bench --bench hybrid_profile_bench -p fandhe-db-engine --features bench-internals

@@ -353,6 +353,20 @@ harness = false
 test = false
 
 [[bench]]
+# Issue #1490（親 #1486。ポインタ: `docs/spec/04-behavior/sql-surface.md` SQL-25）の実測入口。
+# 25,000 行 fixture で集計の行ループ（COUNT(*)・COUNT/SUM/AVG/MIN/MAX・COUNT(DISTINCT)）の p95 を
+# relational_p95_bench と同じプロトコル・出力形式で測り、セルあたり ns を参考値として併記する。
+# relational_p95_bench と違い GitHub Actions 上でも起動でき、bench.yml の bench-aggregate-loop
+# （workflow_dispatch・週次 schedule。verdict 非ゲート・secrets 不要）から実行する。
+# harness = false / test = false は上記ベンチと同一方針（cargo test ではビルドしない）。
+# `make bench-aggregate-loop` から実行する。判定ロジック自体（時間非依存）は
+# harness/aggregate_loop.rs にあり tests/relational_p95_accept.rs で make ci 側から回帰検証する。
+# 依存・feature は変更しない。
+name = "aggregate_loop_bench"
+harness = false
+test = false
+
+[[bench]]
 # Issue #2079（親 #2078。ポインタ: `docs/spec/04-behavior/` RLS-9・RLS-10）の実測入口。
 # 他テナントにだけ UNIQUE 値・FK 親がある状態（flooded）とどこにも無い状態（baseline）で、
 # 同一の書き込み文（UNIQUE 違反・FK 親不在・正常）の応答時間分布を取り、生サンプル入りの

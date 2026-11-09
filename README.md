@@ -1048,6 +1048,8 @@ variables のままです。
 使わず、Environment `bench-gate` も付けません（`if: github.ref == 'refs/heads/main'`・
 `checkout ref: main` は維持）。判定結果は終了コードに反映せず既定ゲートに含めません
 （事前検査の失敗・2 arm の応答不一致・計測中の期待外応答だけがジョブを red にします）。
+`bench-aggregate-loop`（Issue #1490。集計の行ループ計測。`docs/design/aggregate-loop-bench.md`）も
+同様に secrets・Environment を使わない非ゲートの参考実測ジョブです。
 
 > [!WARNING]
 > **workflow を一度でも実行する前に、必ず deployment branch policy（`main` のみ）付きで Environment `bench-gate` を作成してください。** 未作成のまま `environment: bench-gate` を指定した job が走ると、GitHub は branch policy なしの environment を自動作成してしまい、`main` 以外の ref からもアクセスできる状態になります（`recall-gate` と同じ注意点）。**本リポジトリでは Environment `bench-gate` は作成済みです**（branch policy `main` 付き）。
@@ -1362,6 +1364,15 @@ GPU 対照（FAISS・Qdrant GPU）の詳細は `scripts/crossdb_bench/gpu/README
 ### `vector_knn` の wire／SQL／カーネル内訳プロファイル（Issue #463）
 
 `make bench-knn-wire-profile`（`crates/wire-server/benches/knn_wire_profile_bench.rs`）は、`docs/design/crossdb-bench.md` の `vector_knn` 786µs を wire／SQL 表層／距離カーネル・Top-k の 4 区分へ切り分けます。`BENCH_KNN_WIRE_ROUNDS`（既定 5・5〜50）でラウンド数、`BENCH_DEDICATED_ENV=1` で専有環境自己申告を指定できます。spec 由来の閾値なし・情報提供専用・手動実行・CI 非配線（`GITHUB_ACTIONS` 環境下では起動直後に拒否します）。判定ロジック自体（rounds パース・帰属計算・ノイズ帯判定）は `crates/wire-server/tests/knn_wire_profile_accept.rs` で `make ci` から回帰検証します。実測結果・計測設計の詳細は `docs/design/knn-wire-stage-profile.md` を参照してください。
+
+### 集計の行ループ計測（Issue #1490）
+
+`make bench-aggregate-loop`（`crates/engine/benches/aggregate_loop_bench.rs`）は、25,000 行 fixture で
+`COUNT(*)`・`COUNT/SUM/AVG/MIN/MAX`・`COUNT(DISTINCT)` の p95 とセルあたり ns を参考値として出力します
+（`relational_p95_bench` と同じ計測プロトコル・出力形式）。env は `BENCH_AGGREGATE_LOOP_ROUNDS`（5〜50・既定 5）と
+`BENCH_AGGREGATE_LOOP_ROWS`（1000〜25000・縮小は `scale=reduced`）。性能は終了コードに反映せず、
+`.github/workflows/bench.yml` の `bench-aggregate-loop`（workflow_dispatch・週次 schedule）で見られます。`make ci` には含めません。
+詳細・退行の検知力の確認結果は `docs/design/aggregate-loop-bench.md` を参照してください。
 
 ### 全行走査経路の段別プロファイル（Issue #464）
 
