@@ -336,7 +336,7 @@ pub fn sweep_stale_resync_temps(
     if std::fs::symlink_metadata(out).is_ok() {
         return None;
     }
-    let s = engine::storage::sweep_stale_temps_with_work_dir_entries(
+    let s = engine::storage::sweep_stale_temps_with_work_dir_children(
         parent,
         never,
         engine::storage::is_replica_resync_work_dir_name,

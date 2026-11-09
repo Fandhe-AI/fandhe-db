@@ -51,11 +51,12 @@ mod work_dir;
 pub(crate) mod writer_gate;
 
 pub use stale_temp::{
+    is_dump_restore_db_temp_name, is_dump_restore_work_dir_name, is_dump_temp_name,
     is_replica_resync_base_name, is_replica_resync_work_dir_name, is_reserved_temp_name,
     is_restore_temp_name, is_restore_work_dir_name, is_snapshot_temp_name,
-    is_snapshot_work_dir_name, make_probe_name, make_temp_name, sweep_stale_temps,
-    sweep_stale_temps_with_work_dir_entries, sweep_stale_temps_with_work_dirs, StaleTempSweep,
-    SweepOutcome, TempDirLock,
+    is_snapshot_work_dir_name, is_verify_temp_name, is_verify_work_dir_name, make_probe_name,
+    make_temp_name, sweep_stale_temps, sweep_stale_temps_with_work_dir_children,
+    sweep_stale_temps_with_work_dirs, StaleTempSweep, SweepOutcome, TempDirLock,
 };
 
 pub use change_log::archive::{

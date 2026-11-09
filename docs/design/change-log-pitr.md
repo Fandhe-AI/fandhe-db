@@ -492,9 +492,31 @@ Issue #3102（RECOVER-13 のポインタ）: `restore` と `verify` のコピー
 消す条件は、ディレクトリ（リンクをたどらない）・0700・自分の所有・保護対象でない・開いた fd が lstat と一致・
 項目数が上限（4）以下・中身がすべて一時名の 0600 系通常ファイル、の積。外れれば触らず `skipped` に数える。
 判断: restore の親が共有（グループ・その他が書き込める）なら、`dump-restore`・`--generation-state` と揃えて
-拒否する（終了コード 2）。`verify` の作業ディレクトリ（`.fandhe-verify-*.d`）は従来どおり手動で消す。
+拒否する（終了コード 2）。
 Issue #3137: 作業ディレクトリの削除は `WorkDir::remove`（drop も同じ）が実パスの (dev, ino) を照合してから行い、
 差し替えなら消さずに実パスを残骸として通知する。
+
+Issue #3136（RECOVER-13・RECOVER-16 のポインタ）: `verify` のコピー経路の作業ディレクトリ
+（`.fandhe-verify-<pid>-<nonce>-<seq>.d`。中は `.fandhe-verify-…tmp`。#3102 以前の親直下の
+`.fandhe-verify-<pid>-<seq>.tmp` も）、`dump` の一時名（`.fandhe-dump-<pid>-<seq>.tmp`）、
+`dump-restore` の作業ディレクトリ（`.fandhe-dump-restore-<pid>-<seq>.d`。中は `.db-<pid>-<seq>.tmp`）も、
+同じ安全条件で次の実行が掃除する。
+
+- 呼び出し: 起動時の掃除は `--change-log-archive-dir` 向けで、これらの一時名は DB・出力先の隣にできるため、
+  **実行時の掃除だけ**が当てはまる。`verify`（`--db` の親）・`dump`（`--out` の親）・`dump-restore`
+  （`--db` の親）が、書き込み本体の前に 1 回だけ掃除して stderr へ報告する（終了コード・標準出力は変えない）。
+  `verify` は次の実行がどの経路（読み取り専用／コピー）になるかに依存させないため、経路によらず掃除する
+- 各サブコマンドは自分の形式だけを掃除する（`restore` が `restore` の形式だけを掃除するのと同じ）
+- 作業ディレクトリの中身の判定は親直下の判定と分ける（engine の `sweep_stale_temps_with_work_dir_children`）。
+  `dump-restore` の中身 `.db-…tmp` は親直下では掃除せず、予約名にも含めない（利用者の普通のファイル名を
+  拒否しないため）。`is_reserved_temp_name` には `verify` の一時名・作業ディレクトリ、`dump` の一時名、
+  `dump-restore` の作業ディレクトリが加わり、永続ファイルの出力先・入力としての拒否にも自動で効く
+  （既存のファイル名が偶然この形式だと以後は拒否される）
+- 使用中の保護: `dump`・`dump-restore` は一時名・作業ディレクトリを作る前に親へ共有 lock を取り、後始末の後まで
+  保持する（`restore`・`verify` と同じ。`verify` は元から持つ）。取れなければ何も作らず中止する（fail-closed）。
+  これを欠くと並行する別の実行の書き込み中の一時名を掃除が消す
+- 入力（`verify --db`・`dump --db`・`dump-restore --from`）が予約名なら掃除ごと見送り、さらに保護パスとして渡す
+- 対象外: `replica-resync` の一時ベース・`backup` の `.fandhe-snapshot-*.tmp`、`dump`・`dump-restore` の生成名の nonce 化
 
 公開前の一時名（アーカイブの `.fandhe-seg-<pid>-<nonce>-<seq>.tmp`、`restore` の
 `.fandhe-restore-<pid>-<nonce>-<seq>.tmp`。Issue #3102 以降は 0700 の作業ディレクトリ `.fandhe-restore-<pid>-<nonce>-<seq>.d` の中）は、SIGKILL などで残ると全テナントのデータのコピーが残る。
@@ -529,7 +551,7 @@ Issue #3137: 作業ディレクトリの削除は `WorkDir::remove`（drop も�
   | ---- | -------------------- | ---------- |
   | 通常起動 `--db`・`--users`・TLS 証明書/鍵・SCRAM モック鍵・ストップワード/同義語・リランカーのモデル/トークナイザ | 起動前に新規・既存を問わず拒否 | 起動時の掃除（アーカイブ先）に全件を保護として渡す |
   | `--replication-roles`・`--credentials`（`replica`・`replica-resync`・`--replica-credentials`） | 解析時に拒否 | 掃除を行わない経路 |
-  | `restore --db` `backup --out` `backup-incremental --out` dump 系 `--out`・`--db`・`replica-resync --out`（新規パス） | `validate_new_path` | 復元の掃除に入力を保護として渡す（`--db` は未作成） |
+  | `restore --db` `backup --out` `backup-incremental --out` dump 系 `--out`・`--db`・`replica-resync --out`（新規パス） | `validate_new_path` | 復元の掃除に入力を保護として渡す（`--db` は未作成）。`verify --db`・`dump --db`・`dump-restore --from` も各掃除に保護として渡す（Issue #3136） |
   | `--db`（既存）・`--from`・`--base`・`--backup`・`--incremental`（既存ファイル） | `validate_existing_file`（`validate_db` 経由を含む） | `restore` の掃除に `--from`・`--incremental`・`--generation-state` を保護として渡す |
   | `restore --generation-state` | 専用検査で新規・既存を問わず拒否 | 同上 |
 

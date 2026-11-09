@@ -4577,6 +4577,12 @@ fn run_dump(args: &[String]) -> ExitCode {
             return ExitCode::from(dump_opt::EXIT_USAGE);
         }
     };
+    // 前回の異常終了が残した一時名を、自分の一時名を作る前に掃除する（Issue #3136。報告のみで成否に影響させない）。
+    if let Some((dir, sweep)) = dump_run::sweep_stale_dump_temps(&parsed.out, &[&parsed.db]) {
+        for line in wire_server::change_log_archive::stale_temp_report_lines("dump", &dir, &sweep) {
+            engine::log_stderr!("{line}");
+        }
+    }
     let mut leftover = None;
     let result = dump_run::dump(&parsed, &mut leftover);
     if let Some(p) = &leftover {
@@ -4617,6 +4623,17 @@ fn run_dump_restore(args: &[String]) -> ExitCode {
             return ExitCode::from(dump_opt::EXIT_USAGE);
         }
     };
+    // 前回の異常終了が残した作業ディレクトリを、自分の作業ディレクトリを作る前に掃除する（Issue #3136。
+    // 報告のみで成否に影響させない）。
+    if let Some((dir, sweep)) =
+        dump_restore::sweep_stale_dump_restore_temps(&parsed.db, &[&parsed.from])
+    {
+        for line in
+            wire_server::change_log_archive::stale_temp_report_lines("dump-restore", &dir, &sweep)
+        {
+            engine::log_stderr!("{line}");
+        }
+    }
     let mut leftover = None;
     let result = dump_restore::restore(
         &parsed.from,
@@ -4694,6 +4711,14 @@ fn run_verify(args: &[String]) -> ExitCode {
             return ExitCode::from(backup_opt::EXIT_USAGE);
         }
     };
+    // 前回の異常終了が残したコピー経路の作業ディレクトリ・一時名を、経路によらず先に掃除する
+    // （Issue #3136。次の verify がどの経路になるかに依存させない。報告のみで成否・標準出力に影響させない）。
+    if let Some((dir, sweep)) = wire_server::restore_opt::sweep_stale_verify_temps(&parsed.db) {
+        for line in wire_server::change_log_archive::stale_temp_report_lines("verify", &dir, &sweep)
+        {
+            engine::log_stderr!("{line}");
+        }
+    }
     // 元ファイルへは書き込まない。まず読み取り専用で開いて直接検査し（コピーなし）、修復・形式更新が
     // 要るときだけ排他ロックを保持した一時コピーの検査へ切り替える（`restore_opt::verify_db`）。
     let mut leftover = None;
