@@ -26,6 +26,7 @@ mod persist4_second_server_same_db;
 mod pitr_restore_cli;
 mod recover12_explicit_txn_resend;
 mod replica_cli;
+mod replica_promote_cli;
 mod replica_resync_cli;
 mod replication_cli;
 mod replication_sync_cli;
