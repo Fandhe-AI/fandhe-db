@@ -15,6 +15,9 @@ PORT="${3:-15491}"
 [[ "${SHA}" =~ ^[0-9a-f]{7,40}$ ]] || { echo "invalid sha: ${SHA}" >&2; exit 2; }
 [[ "${PORT}" =~ ^[0-9]+$ ]] || { echo "invalid port: ${PORT}" >&2; exit 2; }
 : "${BENCH_TARGET:?BENCH_TARGET (shared CARGO_TARGET_DIR) must be set}"
+# 後段の cd で一時ソース配下へ解決されないよう、相対パスはここで絶対パスへ正規化する
+mkdir -p "${BENCH_TARGET}"
+BENCH_TARGET="$(cd "${BENCH_TARGET}" && pwd)"
 PY="${CROSSDB_PYTHON:-$(command -v python3)}"
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 
