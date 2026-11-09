@@ -97,7 +97,7 @@ BENCH_RELATIONAL_P95_ROWS=5000 make bench-relational-p95
 ## スコープ外と申し送り
 
 - 専有環境での再測定と spec 閾値の確定判定（オーナー作業。未了）。Issue #1321 で本規模・専有申告ありの計測を行ったが、GUI 常駐プロセスと CPU を共有していたため参考値に留めた（下記「本規模・専有申告ありの計測結果（Issue #1321。参考値）」）
-- `bench.yml` への配線（本ベンチは手動実行専用）
+- `bench.yml` への配線（本ベンチは手動実行専用）。集計の行ループ計測は GitHub Actions で回せるよう別バイナリにした（[aggregate-loop-bench.md](aggregate-loop-bench.md)・Issue #1490）
 - 3 テーブル以上の結合と、結合でのスカラー `ORDER BY`／`OR`／`IN`
 - `OFFSET`・`DISTINCT`・集計文の `ORDER BY` 形の p95
 - NoSQL 表層の同等計測

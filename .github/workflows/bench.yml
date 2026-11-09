@@ -40,6 +40,9 @@ name: Bench
 # schedule / workflow_dispatch の両方で実行する。判定結果は既定ゲートに含めない
 # （ジョブ前のコメント参照）。
 #
+# bench-aggregate-loop（Issue #1490）も同様に secrets・environment を使わない参考実測ジョブで、
+# schedule / workflow_dispatch の両方で実行する（性能は終了コードに反映しない）。
+#
 # secrets を repo レベルに置くだけでは不十分（codex-review P0 指摘）: `workflow_dispatch`
 # は任意の ref を選んで起動でき、選択した ref の workflow YAML・`run` ステップが
 # そのまま実行される。そのため write 権限者が別ブランチで `run` ステップを書き換えて
@@ -306,6 +309,41 @@ jobs:
       - name: Run bench-rls-timing
         # ROUNDS・ITERS は既定値（5・1000）。BENCH_RLS_TIMING_REJUDGE は GITHUB_ACTIONS 下で拒否される。
         run: make bench-rls-timing
+
+  # --------------------------------------------------
+  # bench-aggregate-loop（Issue #1490。集計の行ループ性能の退行の早期検知）
+  # --------------------------------------------------
+  # 25,000 行 fixture で COUNT(*)・COUNT/SUM/AVG/MIN/MAX・COUNT(DISTINCT) の p95 とセルあたり ns を
+  # 参考値として Actions ログへ出す（`crates/engine/benches/aggregate_loop_bench.rs`。手順は
+  # `docs/design/aggregate-loop-bench.md`）。2026-10 の集計退行を約 3 週間気づけなかった反省から、
+  # 週次で値の推移を見られるようにする。
+  #
+  # 既定ゲートに含めない: 性能の良し悪しは終了コードに反映せず、共有 runner の値は採否の根拠に
+  # しない（`BENCH_DEDICATED_ENV` は注入しない。渡されても GITHUB_ACTIONS 下では拒否される）。
+  # 一方、事前検査の失敗（越境・結果不一致・経路不一致）は非 0 終了でジョブが red になる。
+  # 正しさの検出を隠さないよう `continue-on-error` は使わない。
+  #
+  # spec 由来の閾値を持たないため secrets も `environment: bench-gate` も付けない。実測値の
+  # ログ出力は spec-confidentiality の公開可の範囲（数値基準・実測値）に当たる。`if` と `ref: main`
+  # は他ジョブとの一貫性と defense-in-depth のために維持する。
+  bench-aggregate-loop:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          # dispatch 側の ref 選択に依存させず、常に main を checkout する。
+          ref: main
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        run: rustup show
+      - name: Run bench-aggregate-loop
+        run: make bench-aggregate-loop
 
   # bench-tier（TASK-116 PLAN-4/6/7 のティア別レイテンシ受け入れ基準）は本
   # workflow に置かない。GitHub ホステッド runner には常駐 Ollama がなく、

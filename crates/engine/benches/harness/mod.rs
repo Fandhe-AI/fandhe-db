@@ -45,7 +45,9 @@
 // 各利用側はサブモジュール経由（`harness::protocol::...` 等）で必要な識別子のみ
 // 個別に import する。
 pub mod ab;
+// Issue #1490: 集計の行ループ計測（aggregate_loop_bench.rs）向けの時間非依存ロジック。
 pub mod accept;
+pub mod aggregate_loop;
 pub mod bench_engine;
 pub mod chip;
 #[cfg(feature = "contrast-bench")]
