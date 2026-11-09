@@ -137,9 +137,10 @@ pub fn is_restore_work_dir_name(name: &str) -> bool {
 /// 呼び出し側の「一時名の残骸」の数え方と混ざらないようにする（掃除自身は [`is_probe_name`] で回収する）。
 const PROBE_PREFIX: &str = ".fandhe-sweep-probe-";
 
-/// 掃除の uid 確認用ファイルの名前 `.fandhe-sweep-probe-<pid>-<nonce 16桁hex>-<試行番号>.tmp` を作る。
-#[cfg(unix)]
-fn make_probe_name(attempt: u64) -> String {
+/// uid 確認用ファイルの名前 `.fandhe-sweep-probe-<pid>-<nonce 16桁hex>-<試行番号>.tmp` を作る。
+/// 掃除自身と、wire-server の作業ディレクトリ作成前の uid 確認（Issue #3102）が共有する単一の生成関数で、
+/// 異常終了で残った確認用ファイルは [`is_reserved_temp_name`]・掃除の対象（[`is_probe_name`]）になる。
+pub fn make_probe_name(attempt: u64) -> String {
     use std::hash::{BuildHasher, Hasher};
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

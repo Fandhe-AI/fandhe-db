@@ -178,11 +178,10 @@ fn parent_is_acceptable(parent_mode: u32, parent_uid: u32, own_uid: u32) -> bool
 
 /// 自プロセスの実効 uid を、親ディレクトリの中へ `create_new` で作った一時ファイルの所有者として得る
 /// （libc に依存しない。親は開いた fd の `fstat` で確認済みの実体であること）。作れなければ拒否する。
-fn probe_own_uid(
-    parent: &Path,
-    parent_fd: &File,
-    make_name: &mut dyn FnMut() -> String,
-) -> Result<u32, TmpError> {
+///
+/// 確認用ファイルの名前は engine の掃除と共有する専用形式（`engine::storage::make_probe_name`）で、異常終了で
+/// 残っても次の掃除・予約名の検査が扱う。削除に失敗したときは、残った実パスを併せて返す（呼び出し側が通知する）。
+fn probe_own_uid(parent: &Path, parent_fd: &File) -> Result<(u32, Option<PathBuf>), TmpError> {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::OpenOptionsExt;
     let proc_path = PathBuf::from(format!("/proc/self/fd/{}", parent_fd.as_raw_fd()));
@@ -191,12 +190,9 @@ fn probe_own_uid(
     } else {
         parent.to_path_buf()
     };
-    for _ in 0..8 {
-        let name = format!("{}.uid-probe", make_name());
-        if name.contains('/') {
-            return Err(TmpError::InvalidDestination);
-        }
-        let p = base.join(name);
+    for attempt in 0..8u64 {
+        let name = engine::storage::make_probe_name(attempt);
+        let p = base.join(&name);
         match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -206,8 +202,12 @@ fn probe_own_uid(
             Ok(f) => {
                 let uid = f.metadata().map(|m| m.uid());
                 drop(f);
-                let _ = std::fs::remove_file(&p);
-                return uid.map_err(io_err);
+                let left = match std::fs::remove_file(&p) {
+                    Ok(()) => None,
+                    Err(e) if e.kind() == ErrorKind::NotFound => None,
+                    Err(_) => Some(parent.join(&name)),
+                };
+                return uid.map(|u| (u, left)).map_err(io_err);
             }
             Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
             Err(e) => return Err(io_err(e)),
@@ -246,6 +246,8 @@ pub struct WorkDir {
     dev: u64,
     ino: u64,
     uid: u32,
+    /// uid 確認用ファイルを消せなかったときの実パス（[`Self::remove`] が再試行し、消せなければ通知する）。
+    probe_left: Option<PathBuf>,
     armed: bool,
 }
 
@@ -274,7 +276,7 @@ impl WorkDir {
         }
         // 自分の実効 uid は、mkdir 前に親の中へ作った一時ファイルの所有者（カーネルが作成者の fsuid で付ける）
         // から得る。mkdir 後に開いたディレクトリの所有者は差し替えられうるので基準にしない。
-        let own_uid = probe_own_uid(parent, &parent_fd, make_name)?;
+        let (own_uid, probe_left) = probe_own_uid(parent, &parent_fd)?;
         if !parent_is_acceptable(pm.mode(), pm.uid(), own_uid) {
             return Err(TmpError::InsecureParent);
         }
@@ -322,6 +324,7 @@ impl WorkDir {
             dev: m.dev(),
             ino: m.ino(),
             uid: m.uid(),
+            probe_left,
             armed: true,
         };
         // 想定の実体・権限・所有者でなければ（umask の異常や作成直後の差し替え）使わない。
@@ -381,9 +384,13 @@ impl WorkDir {
             return Ok(());
         }
         self.armed = false;
+        // 確認用ファイルの削除失敗は握りつぶさず、再試行して消せなければ残ったパスとして通知する。
+        let probe_left = self.probe_left.take().filter(|p| {
+            !matches!(std::fs::remove_file(p), Ok(())) && std::fs::symlink_metadata(p).is_ok()
+        });
         match std::fs::remove_dir(&self.path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+            Ok(()) => probe_left.map_or(Ok(()), Err),
+            Err(e) if e.kind() == ErrorKind::NotFound => probe_left.map_or(Ok(()), Err),
             Err(_) => Err(self.path.clone()),
         }
     }
@@ -446,13 +453,9 @@ mod tests {
     #[test]
     fn probed_uid_matches_created_dir_owner() {
         let parent = unique_parent("uid");
-        let mut n = 0u32;
         let f = File::open(&parent).expect("open");
-        let uid = probe_own_uid(&parent, &f, &mut || {
-            n += 1;
-            format!(".p-{n}")
-        })
-        .expect("probe");
+        let (uid, left) = probe_own_uid(&parent, &f).expect("probe");
+        assert!(left.is_none());
         let w = WorkDir::create(&parent, "t").expect("create");
         assert_eq!(w.uid, uid);
         assert_eq!(
@@ -461,6 +464,42 @@ mod tests {
             "probe removed"
         );
         drop(w);
+        std::fs::remove_dir(&parent).expect("cleanup");
+    }
+
+    #[test]
+    fn leftover_probe_is_reserved_and_swept() {
+        let parent = unique_parent("probeswept");
+        let name = engine::storage::make_probe_name(3);
+        assert!(engine::storage::is_reserved_temp_name(&name));
+        let p = parent.join(&name);
+        std::fs::write(&p, b"").expect("write");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        }
+        let sweep = engine::storage::sweep_stale_temps_with_work_dirs(
+            &parent,
+            engine::storage::is_restore_temp_name,
+            engine::storage::is_restore_work_dir_name,
+            &[],
+        )
+        .expect("sweep");
+        assert_eq!(sweep.removed, 1);
+        assert!(!p.exists());
+        std::fs::remove_dir(&parent).expect("cleanup");
+    }
+
+    #[test]
+    fn probe_removal_failure_is_reported_by_remove() {
+        let parent = unique_parent("probefail");
+        let mut w = WorkDir::create(&parent, "t").expect("create");
+        // ファイルでないものは remove_file で消せない（削除失敗の代用）。
+        let stuck = parent.join(engine::storage::make_probe_name(9));
+        std::fs::create_dir(&stuck).expect("mkdir");
+        w.probe_left = Some(stuck.clone());
+        assert_eq!(w.remove(), Err(stuck.clone()));
+        std::fs::remove_dir(&stuck).expect("cleanup stuck");
         std::fs::remove_dir(&parent).expect("cleanup");
     }
 

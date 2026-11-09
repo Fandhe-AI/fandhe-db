@@ -222,6 +222,11 @@ check_residue() {
         mode="$(stat -c '%a' "${entry}")"
         [ "${mode}" = "600" ] || fail "temp residue ${entry} has mode ${mode}, expected 600"
         ;;
+      .fandhe-sweep-probe-*.tmp)
+        # 作業ディレクトリ作成前の uid 確認用ファイルの残骸（Issue #3102）。0600 の空ファイル。
+        mode="$(stat -c '%a' "${entry}")"
+        [ "${mode}" = "600" ] || fail "probe residue ${entry} has mode ${mode}, expected 600"
+        ;;
       "${tmp_prefix}"*.d)
         # 復元の作業ディレクトリ（Issue #3102）。0700 で、中身は 0600 の一時名だけ（空も可）。
         [ -d "${entry}" ] && [ ! -L "${entry}" ] || fail "work dir residue ${entry} is not a directory"
