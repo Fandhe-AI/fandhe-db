@@ -249,14 +249,8 @@ mod tests {
     use std::os::unix::fs::PermissionsExt as _;
 
     fn dir(label: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!(
-            "replica-opt-{label}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos())
-        ));
-        std::fs::create_dir_all(&d).expect("mkdir");
+        let d = crate::test_util::unique_temp_path(&format!("replica-opt-{label}"), "");
+        std::fs::create_dir(&d).expect("create unique fixture dir");
         d
     }
 

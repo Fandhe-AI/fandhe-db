@@ -2049,14 +2049,7 @@ mod tests {
         use engine::policy::PolicyContext;
         use engine::storage::Storage;
 
-        let path = std::env::temp_dir().join(format!(
-            "wire-ddl-temp-{}-{}.redb",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
+        let path = crate::test_util::unique_temp_path("wire-ddl-temp", ".redb");
         let storage = Storage::open(&path).expect("open storage");
         let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
         let parsed = core
