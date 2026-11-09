@@ -49,8 +49,8 @@ fn new_core_with_rows() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
     new_core_with_rows_and_write_lock_wait(None)
 }
 
-/// [`new_core_with_rows`] の書き込みゲート待機上限指定版（Issue #1178。他接続の
-/// 書き込みが `55P03` へ倒れるまでの時間を短縮し、テストを決定的にする）。
+/// [`new_core_with_rows`] の書き込みゲート待機上限指定版（Issue #1178・#3152。待たされる
+/// 退行が入ったときに `55P03` へ早く倒して検出するため、上限を短くする）。
 fn new_core_with_rows_and_write_lock_wait(
     wait: Option<std::time::Duration>,
 ) -> (Arc<EngineCore>, temp_db::CleanupGuard) {
@@ -448,7 +448,8 @@ fn insert_row_sql(id: u64, op: &str) -> String {
 /// 読み取りだけの明示トランザクションは単一ライタの permit を取らない（Issue #2400）ため、
 /// 他セッション（同一テナント・別テナントとも）の書き込みは待たされず成功する。カーソルの
 /// 行集合は DECLARE 時点で確定しており、他接続の commit の影響を受けない。`COMMIT` 後の
-/// 新しいトランザクションで初めて他接続の行が見える。
+/// 新しいトランザクションで初めて他接続の行が見える。待機の有無は実時間の閾値ではなく
+/// 「INSERT が `55P03` にならず成功タグで返る」ことで判定する（Issue #3152）。
 #[test]
 fn wire15_cursor_row_set_is_unaffected_by_other_session_write_during_fetch() {
     let (core, _guard) =
@@ -470,12 +471,18 @@ fn wire15_cursor_row_set_is_unaffected_by_other_session_write_during_fetch() {
     let mut b = authenticate_to_ready_for_query(addr, "alice2", "correct-horse");
     let mut c = authenticate_to_ready_for_query(addr, "bob", "battery-staple");
     for (stream, id, op) in [(&mut b, 99u64, "op-1178-b"), (&mut c, 98u64, "op-1178-c")] {
-        let started = std::time::Instant::now();
-        simple_ok(stream, &insert_row_sql(id, op), "INSERT 0 1");
-        assert!(
-            started.elapsed() < std::time::Duration::from_millis(300),
-            "write must not wait for a read-only explicit transaction"
+        // 待たされたかは実時間ではなく応答の種別で判定する（Issue #3152）。a は idle で
+        // permit を手放す契機が無いため、退行時の INSERT は必ず `write_lock_wait` を超えて
+        // `55P03` の ErrorResponse になる。空いているゲートは負荷に関係なく即時取得される。
+        send_simple_query(stream, &insert_row_sql(id, op));
+        assert_eq!(
+            peek_message_type(stream),
+            b'C',
+            "write must not wait for a read-only explicit transaction \
+             (an ErrorResponse such as 55P03 means it waited for the writer gate)"
         );
+        assert_eq!(read_command_complete(stream), "INSERT 0 1");
+        read_ready_for_query(stream);
     }
 
     // 残りのカーソル行は元の集合の残りだけ（他セッションの行を含まない）。
