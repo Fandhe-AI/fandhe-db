@@ -64,6 +64,10 @@ pub enum ResyncError {
     /// バックアップ側が「公開済みだが後始末を確認できない」（結果 3）を返した。公開先は一時名で、
     /// `--out` は作られないため、終了コード 3（`--out` 公開済み）とは区別して再試行可能な失敗にする。
     BackupTempNotFinalized,
+    /// バックアップ側が「公開先に検査していない内容が残った」（結果 4）を返した。公開先は作業ディレクトリ内の
+    /// 一時ベースで、整合検査には到達していない。`NotConsistent(4)`（整合検査の矛盾）と衝突させないため、
+    /// 終了コード 1 の実行時エラーとして扱う（`--out` は作られない）。
+    BackupTempUnchecked,
     /// 整合検査を実行できなかった・一時ファイルを検査できなかった。
     VerifyFailed,
     /// 整合検査で矛盾（4）または検査できない項目（5）。
@@ -99,6 +103,9 @@ impl std::fmt::Display for ResyncError {
             Self::Backup(c) => backup_socket::code_message(*c),
             Self::BackupTempNotFinalized => {
                 "the base backup could not be finalized; nothing was published to --out, retry"
+            }
+            Self::BackupTempUnchecked => {
+                "the base backup could not be taken cleanly; nothing was published to --out, retry"
             }
             Self::VerifyFailed => "the base could not be checked; nothing was published",
             Self::NotConsistent(_) => "the base failed the integrity check; nothing was published",
@@ -142,6 +149,7 @@ impl ResyncError {
             Self::NotFinalized => EXIT_NOT_FINALIZED,
             Self::Request
             | Self::BackupTempNotFinalized
+            | Self::BackupTempUnchecked
             | Self::VerifyFailed
             | Self::PrimaryUnreachable
             | Self::TempReplaced
@@ -424,6 +432,10 @@ fn run(
         Ok(r) if r.code == 0 => {}
         // 結果 3 は一時名への公開のみ。`--out` は未作成なので、終了コード 3 として転送しない。
         Ok(r) if r.code == 3 => return Err(ResyncError::BackupTempNotFinalized),
+        // 結果 4 も一時ベースの取得失敗。整合検査の矛盾（4）と混同しないよう実行時エラー（1）にする。
+        Ok(r) if r.code == crate::backup_opt::EXIT_UNCHECKED_PUBLISHED => {
+            return Err(ResyncError::BackupTempUnchecked);
+        }
         Ok(r) => return Err(ResyncError::Backup(r.code)),
         Err(_) => return Err(ResyncError::Request),
     }
@@ -835,6 +847,8 @@ mod work_dir_tests {
             std::fs::remove_dir(&p).expect("cleanup");
         }
         assert_eq!(ResyncError::InsecureParent.exit_code(), EXIT_USAGE);
+        // 回帰: バックアップ結果 4 は整合検査矛盾（4）として転送しない。
+        assert_eq!(ResyncError::BackupTempUnchecked.exit_code(), EXIT_FAILURE);
     }
 
     #[test]
