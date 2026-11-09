@@ -57,6 +57,9 @@ pub struct ReplicaResyncOptions {
     pub role: String,
     /// パスワード（ログ・エラー文・`Debug` に出さない）。
     pub password: Vec<u8>,
+    /// 読み込み済みの入力ファイル（`--credentials`・`--primary-tls-cert`）のパス。起動時の自動掃除が
+    /// 予約名ディレクトリ配下やシンボリックリンク経由のこれらを消さないよう、`protected` に渡す（Issue #3135）。
+    pub input_files: Vec<PathBuf>,
 }
 
 impl std::fmt::Debug for ReplicaResyncOptions {
@@ -106,6 +109,8 @@ pub fn parse(args: &[String]) -> Result<ReplicaResyncOptions, String> {
     let primary: SocketAddr = primary
         .parse()
         .map_err(|_| "--primary must be an ip:port address".to_string())?;
+    let mut input_files = vec![PathBuf::from(credentials)];
+    input_files.extend(primary_tls.map(PathBuf::from));
     let primary_tls = replica_opt::load_primary_pin(primary_tls.map(Path::new))?;
     replica_opt::check_primary_transport(&primary, primary_tls.is_some())?;
     let (role, password) = replica_opt::load_credentials(Path::new(credentials))?;
@@ -127,6 +132,7 @@ pub fn parse(args: &[String]) -> Result<ReplicaResyncOptions, String> {
         primary_tls,
         role,
         password,
+        input_files,
     })
 }
 

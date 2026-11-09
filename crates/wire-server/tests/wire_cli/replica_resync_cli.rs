@@ -363,3 +363,46 @@ fn recover15_resync_sweeps_stale_work_dirs_only_when_safe() {
     want.sort();
     assert_eq!(left, want);
 }
+
+/// Issue #3135: `--credentials` が `--out` の親にある予約名ディレクトリ配下の `base.redb`（0600）や、そこへの
+/// シンボリックリンクでも、起動時の自動掃除は入力ファイルを消さない（資格情報は読み込み済みで、掃除の
+/// `protected` に入力パスが含まれる）。直接指定とリンク指定を、別々の `--out` 親で確かめる。
+#[test]
+fn recover15_resync_sweep_keeps_credentials_input_in_reserved_dir() {
+    use std::os::unix::fs::PermissionsExt;
+    let primary = Primary::start("resync-sweep-cred");
+    let nonce = "0123456789abcdef";
+    let closed = {
+        let l = TcpListener::bind("127.0.0.1:0").expect("bind");
+        l.local_addr().expect("addr").to_string()
+    };
+    for (case, via_link) in [("direct", false), ("link", true)] {
+        let ndir = primary.dir.join(format!("out-{case}"));
+        std::fs::create_dir(&ndir).expect("mkdir");
+        std::fs::set_permissions(&ndir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        let work = ndir.join(format!(".fandhe-replica-resync-1-{nonce}-7.d"));
+        std::fs::create_dir(&work).expect("mkdir");
+        std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        let src = write_credentials(&work, 0o600);
+        let real = work.join("base.redb");
+        std::fs::rename(&src, &real).expect("rename");
+        let cred = if via_link {
+            let link_dir = primary.dir.join(format!("cred-{case}"));
+            std::fs::create_dir(&link_dir).expect("mkdir");
+            let link = link_dir.join("cred-link");
+            std::os::unix::fs::symlink(&real, &link).expect("symlink");
+            link
+        } else {
+            real.clone()
+        };
+        let new_db = ndir.join("replica.redb");
+        let o = run(&resync_args(&primary.sock, &new_db, &closed, &cred));
+        assert_ne!(o.status.code(), Some(0), "{case}: {:?}", o);
+        assert!(real.exists(), "{case}: credentials input must survive");
+        assert!(
+            std::fs::symlink_metadata(&cred).is_ok(),
+            "{case}: credentials path must survive"
+        );
+        assert!(!new_db.exists());
+    }
+}

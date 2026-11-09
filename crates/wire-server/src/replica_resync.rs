@@ -886,6 +886,7 @@ mod work_dir_tests {
             primary_tls: None,
             role: "r".to_string(),
             password: Vec::new(),
+            input_files: Vec::new(),
         }
     }
 

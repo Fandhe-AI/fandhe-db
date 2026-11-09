@@ -4780,9 +4780,10 @@ fn run_replica_resync(args: &[String]) -> ExitCode {
     };
     // Issue #3135: 前回の異常終了が `--out` の親に残した作業ディレクトリを、自分の作業ディレクトリを作る前に
     // 掃除する。掃除の失敗・見送りで再同期は失敗させない（終了コードの意味は変えない）。
-    if let Some((dir, s)) =
-        replica_resync::sweep_stale_resync_temps(&opts.out, &[opts.socket.as_path()])
-    {
+    let protected: Vec<&std::path::Path> = std::iter::once(opts.socket.as_path())
+        .chain(opts.input_files.iter().map(|p| p.as_path()))
+        .collect();
+    if let Some((dir, s)) = replica_resync::sweep_stale_resync_temps(&opts.out, &protected) {
         for line in
             wire_server::change_log_archive::stale_temp_report_lines("replica-resync", &dir, &s)
         {
