@@ -493,6 +493,8 @@ Issue #3102（RECOVER-13 のポインタ）: `restore` と `verify` のコピー
 項目数が上限（4）以下・中身がすべて一時名の 0600 系通常ファイル、の積。外れれば触らず `skipped` に数える。
 判断: restore の親が共有（グループ・その他が書き込める）なら、`dump-restore`・`--generation-state` と揃えて
 拒否する（終了コード 2）。
+Issue #3137: 作業ディレクトリの削除は `WorkDir::remove`（drop も同じ）が実パスの (dev, ino) を照合してから行い、
+差し替えなら消さずに実パスを残骸として通知する。
 
 Issue #3136（RECOVER-13・RECOVER-16 のポインタ）: `verify` のコピー経路の作業ディレクトリ
 （`.fandhe-verify-<pid>-<nonce>-<seq>.d`。中は `.fandhe-verify-…tmp`。#3102 以前の親直下の

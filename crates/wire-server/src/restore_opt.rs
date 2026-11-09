@@ -896,19 +896,14 @@ mod unix_impl {
             self.work.real_path_of(Path::new(""))
         }
 
-        /// 一時ファイルを消し、作業ディレクトリが作成時のままなら作業ディレクトリも消す。消せなかった
-        /// ものの実パスを返す（作業ディレクトリが差し替えられていれば、別のディレクトリを消さずに残す）。
+        /// 一時ファイルを消し、作業ディレクトリも消す。消せなかったものの実パスを返す（作業ディレクトリが
+        /// 差し替えられていれば、`WorkDir::remove` が照合で拒否し、別のディレクトリを消さずに残す）。
         pub(super) fn cleanup(&mut self) -> Option<PathBuf> {
             if let Err(p) = self.tmp.remove() {
                 return Some(self.work.real_path_of(&p));
             }
-            match self.work.check() {
-                Ok(()) => self.work.remove().err(),
-                Err(_) => {
-                    self.work.disarm();
-                    Some(self.work.real_path_of(Path::new("")))
-                }
-            }
+            // 差し替えの照合は `WorkDir::remove` が行い、拒否時は実パスを返す（Issue #3137）。
+            self.work.remove().err()
         }
 
         /// uid 確認用ファイルの残りの実パス（消せなければ。公開の確定には影響しない）。
@@ -922,7 +917,6 @@ mod unix_impl {
             self.tmp.armed = false;
             let finalized = std::fs::remove_file(&self.tmp.path)
                 .map_err(|_| ())
-                .and_then(|()| self.work.check().map_err(|_| ()))
                 .and_then(|()| self.work.remove().map_err(|_| ()))
                 .and_then(|()| {
                     File::open(parent)
