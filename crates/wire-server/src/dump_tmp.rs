@@ -171,9 +171,49 @@ impl TempFile {
 /// 親ディレクトリの権限と所有者が、作業ディレクトリを安全に作れる条件を満たすか（純関数）。
 /// グループ・その他の書き込み権限（sticky bit の有無によらず）があれば不可。親の所有者は、そこへ
 /// 作業ディレクトリを作る自分（作成直後のディレクトリの所有者）と同じでなければ不可
-/// （所有者は名前を差し替えられる。`geteuid` を使わず、自分が作ったものの uid と比べる）。
+/// （所有者は名前を差し替えられる。`geteuid` を使わず、mkdir 前に親の中へ作った一時ファイルの所有者である自分の uid と比べる）。
 fn parent_is_acceptable(parent_mode: u32, parent_uid: u32, own_uid: u32) -> bool {
     parent_mode & 0o022 == 0 && parent_uid == own_uid
+}
+
+/// 自プロセスの実効 uid を、親ディレクトリの中へ `create_new` で作った一時ファイルの所有者として得る
+/// （libc に依存しない。親は開いた fd の `fstat` で確認済みの実体であること）。作れなければ拒否する。
+fn probe_own_uid(
+    parent: &Path,
+    parent_fd: &File,
+    make_name: &mut dyn FnMut() -> String,
+) -> Result<u32, TmpError> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    let proc_path = PathBuf::from(format!("/proc/self/fd/{}", parent_fd.as_raw_fd()));
+    let base = if cfg!(target_os = "linux") && proc_path.is_dir() {
+        proc_path
+    } else {
+        parent.to_path_buf()
+    };
+    for _ in 0..8 {
+        let name = format!("{}.uid-probe", make_name());
+        if name.contains('/') {
+            return Err(TmpError::InvalidDestination);
+        }
+        let p = base.join(name);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&p)
+        {
+            Ok(f) => {
+                let uid = f.metadata().map(|m| m.uid());
+                drop(f);
+                let _ = std::fs::remove_file(&p);
+                return uid.map_err(io_err);
+            }
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(io_err(e)),
+        }
+    }
+    Err(TmpError::InvalidDestination)
 }
 
 /// 復元先の親ディレクトリがグループ・その他から書き込めないことを、開いた fd の `fstat` で確かめる
@@ -232,6 +272,12 @@ impl WorkDir {
         if !pm.is_dir() || pm.mode() & 0o022 != 0 {
             return Err(TmpError::InsecureParent);
         }
+        // 自分の実効 uid は、mkdir 前に親の中へ作った一時ファイルの所有者（カーネルが作成者の fsuid で付ける）
+        // から得る。mkdir 後に開いたディレクトリの所有者は差し替えられうるので基準にしない。
+        let own_uid = probe_own_uid(parent, &parent_fd, make_name)?;
+        if !parent_is_acceptable(pm.mode(), pm.uid(), own_uid) {
+            return Err(TmpError::InsecureParent);
+        }
         let mut attempts = 0u32;
         let path = loop {
             let name = make_name();
@@ -253,9 +299,14 @@ impl WorkDir {
         };
         let dir = File::open(&path).map_err(|e| fail(&path, io_err(e)))?;
         let m = dir.metadata().map_err(|e| fail(&path, io_err(e)))?;
-        // 作成直後のディレクトリの所有者が自分の uid。親の所有者が違えば拒否する。
-        if !parent_is_acceptable(pm.mode(), pm.uid(), m.uid()) {
-            return Err(fail(&path, TmpError::InsecureParent));
+        // 開いたディレクトリの所有者が mkdir 前に得た自分の uid でなければ（mkdir と open の間の差し替え）、
+        // かつ親のパスが mkdir 前に確認した親と同じ実体でなければ拒否する。
+        if m.uid() != own_uid || !m.is_dir() {
+            return Err(fail(&path, TmpError::Replaced));
+        }
+        match std::fs::metadata(parent) {
+            Ok(now) if now.dev() == pm.dev() && now.ino() == pm.ino() => {}
+            _ => return Err(fail(&path, TmpError::Replaced)),
         }
         let proc_path = PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()));
         let access = if cfg!(target_os = "linux") && proc_path.is_dir() {
@@ -389,6 +440,28 @@ mod tests {
         assert!(!parent_is_acceptable(0o757, 1000, 1000));
         // 所有者が異なる親（root 所有など）は、書き込めても拒否する。
         assert!(!parent_is_acceptable(0o755, 0, 1000));
+        assert!(!parent_is_acceptable(0o700, 1000, 0));
+    }
+
+    #[test]
+    fn probed_uid_matches_created_dir_owner() {
+        let parent = unique_parent("uid");
+        let mut n = 0u32;
+        let f = File::open(&parent).expect("open");
+        let uid = probe_own_uid(&parent, &f, &mut || {
+            n += 1;
+            format!(".p-{n}")
+        })
+        .expect("probe");
+        let w = WorkDir::create(&parent, "t").expect("create");
+        assert_eq!(w.uid, uid);
+        assert_eq!(
+            std::fs::read_dir(&parent).expect("read").count(),
+            1,
+            "probe removed"
+        );
+        drop(w);
+        std::fs::remove_dir(&parent).expect("cleanup");
     }
 
     #[test]
