@@ -191,16 +191,24 @@ fn statement_text_budget(accumulators: &[Accumulator], max_result_bytes: usize) 
     budget
 }
 
+#[cfg(test)]
+thread_local! {
+    /// テスト専用: `distinct_footprint` の呼び出し回数（Issue #1488。DISTINCT を含まない
+    /// 集計で呼ばれないことの固定用。並列テスト対策でスレッドローカル）。
+    static DISTINCT_FOOTPRINT_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// `Accumulator::observe` 1 回分の呼び出しと、`MIN`/`MAX(<TEXT 列>)`・
 /// `COUNT(DISTINCT)`（SQL-25 (c)・TASK-209）の両方の累計予算判定をまとめた
 /// 薄いヘルパ。`sql::aggregate` 内の 3 つの observe 呼び出し箇所
 /// （`execute_aggregate_with_cache` の Fast 経路・全走査、
 /// `observe_candidate_slots`）が共有する（`sql::group_by::accumulate_row` は
 /// 独自のグループキー累計・`ResultBudget` 判定を持つため別実装のまま）。
-/// `COUNT(DISTINCT)` の増分は [`Accumulator::distinct_footprint`] の
-/// before/after 差分から求め、新規キー 1 件の確定時のみ
-/// [`crate::sql::distinct::DistinctBudget::charge`] を呼ぶ（既存キーへの
-/// 再ヒットでは計上しない）。
+/// `COUNT(DISTINCT)` は [`Accumulator::observe_distinct`] が新規キー 1 件の確定時のみ
+/// [`crate::sql::distinct::DistinctBudget::charge`] を呼ぶ（既存キーへの再ヒットでは
+/// 計上しない。Issue #1488）。`string_agg`／`array_agg` の DISTINCT 状態は
+/// [`Accumulator::distinct_footprint`] の before/after 差分で計上する。DISTINCT 系を
+/// 含まないクエリは [`ObserveBudgetPlan`] により [`observe_light`] へ振り分けられる。
 ///
 /// 集計セル単位（行 × 項目）のホットループから呼ばれ、呼び出し層自体が
 /// 支配的コストだったため `#[inline(always)]` を付ける（Issue #1487）。
@@ -227,6 +235,12 @@ fn observe_with_budgets(
         }
     }
     let input = &item.input;
+    // Issue #1488: `COUNT(DISTINCT)` は専用経路で観測し、新規キー確定時にその場で
+    // `DistinctBudget` へ計上する（footprint の before/after 差分は不要）。
+    // 状態は `CountDistinct` の集合のみで `text_len` は常に 0 のため TEXT 予算の判定は不要。
+    if matches!(accumulator, Accumulator::CountDistinct { .. }) {
+        return accumulator.observe_distinct(input, id, vector, scanned, scratch, distinct_budget);
+    }
     let text_before = accumulator.text_len();
     let (entries_before, bytes_before) = accumulator.distinct_footprint();
     accumulator.observe(input, id, vector, scanned, scratch)?;
@@ -239,12 +253,70 @@ fn observe_with_budgets(
     )?;
     let (entries_after, bytes_after) = accumulator.distinct_footprint();
     if entries_after > entries_before {
-        let delta = bytes_after.checked_sub(bytes_before).ok_or_else(|| {
-            accumulator_bug("COUNT(DISTINCT) footprint bytes decreased unexpectedly")
-        })?;
+        let delta = bytes_after
+            .checked_sub(bytes_before)
+            .ok_or_else(|| accumulator_bug("DISTINCT footprint bytes decreased unexpectedly"))?;
         distinct_budget.charge(delta)?;
     }
     Ok(())
+}
+
+/// クエリ単位で 1 回だけ作る「DISTINCT 系の予算計上が要るか」の計画（Issue #1488）。
+/// `execute_aggregate_with_cache`／`observe_candidate_slots` が行ループの外で作り、
+/// 行ごとに [`observe_with_budgets`]（重い経路）と [`observe_light`]（軽量経路）を選ぶ。
+/// 判定は fail-closed 側に倒す: `item.distinct` か DISTINCT footprint を持ち得る
+/// アキュムレータ（`CountDistinct`・`StringAgg`・`ArrayAgg`）が 1 つでもあれば重い経路。
+#[derive(Clone, Copy)]
+struct ObserveBudgetPlan {
+    needs_distinct_budget: bool,
+}
+
+impl ObserveBudgetPlan {
+    fn new(items: &[crate::sql::parser::BoundAggregateItem], accumulators: &[Accumulator]) -> Self {
+        let needs_distinct_budget = items.iter().any(|item| item.distinct)
+            || accumulators.iter().any(|a| {
+                matches!(
+                    a,
+                    Accumulator::CountDistinct { .. }
+                        | Accumulator::StringAgg(_)
+                        | Accumulator::ArrayAgg(_)
+                )
+            });
+        Self {
+            needs_distinct_budget,
+        }
+    }
+}
+
+/// DISTINCT 系の予算計上が不要なクエリ（[`ObserveBudgetPlan`]）向けの軽量版
+/// （FILTER → `observe` → `text_len` 差分）。`distinct_footprint` を呼ばない。
+/// 判定順・SQLSTATE は [`observe_with_budgets`] の DISTINCT 以外の部分と同一。
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn observe_light(
+    accumulator: &mut Accumulator,
+    item: &crate::sql::parser::BoundAggregateItem,
+    id: u64,
+    vector: &RowVector<'_>,
+    scanned: &[Option<row_codec::ScalarRef<'_>>],
+    scratch: &mut Vec<StackValue>,
+    total_text_accumulator_bytes: &mut usize,
+    max_result_bytes: usize,
+) -> Result<(), SqlSurfaceError> {
+    if let Some(filter) = &item.filter {
+        if !item_filter_matches(filter, id, vector, scanned, scratch)? {
+            return Ok(());
+        }
+    }
+    let text_before = accumulator.text_len();
+    accumulator.observe(&item.input, id, vector, scanned, scratch)?;
+    let text_after = accumulator.text_len();
+    accumulate_text_budget(
+        text_before,
+        text_after,
+        total_text_accumulator_bytes,
+        max_result_bytes,
+    )
 }
 
 /// 集計項目の `FILTER (WHERE ...)` を 1 行について評価する（SQL-57・Issue #1806）。
@@ -1035,10 +1107,12 @@ impl Accumulator {
     }
 
     /// `CountDistinct` が現在保持しているエントリ数・累計バイト数（それ以外の
-    /// 集計種別は常に `(0, 0)`）。呼び出し元が `observe` 前後でこの値を比較し、
-    /// 新規に確定した増分だけを [`crate::sql::distinct::DistinctBudget::charge`]
-    /// へ計上する（`Self::text_len` の before/after パターンと同じ設計）。
+    /// 集計種別は常に `(0, 0)`）。`string_agg`／`array_agg` の DISTINCT 状態は呼び出し元が
+    /// `observe` 前後でこの値を比較し、増分を [`crate::sql::distinct::DistinctBudget::charge`]
+    /// へ計上する（`COUNT(DISTINCT)` は Issue #1488 以降 `observe_distinct` 内で計上）。
     pub(crate) fn distinct_footprint(&self) -> (usize, usize) {
+        #[cfg(test)]
+        DISTINCT_FOOTPRINT_CALLS.with(|c| c.set(c.get() + 1));
         match self {
             Accumulator::CountDistinct { seen, bytes } => (seen.len(), *bytes),
             Accumulator::StringAgg(state) => state.distinct_footprint(),
@@ -1264,11 +1338,13 @@ impl Accumulator {
         // SQL-25 (c)・TASK-209: `CountDistinct` は「存在のみを数える」既存の
         // `observe_present` 系ではなく、実値を正準化したキーの集合で異なり数を
         // 判定する独立経路（[`Self::observe_distinct`]）を使う。予算計上
-        // （[`crate::sql::distinct::DistinctBudget`]）は呼び出し元が
-        // [`Self::distinct_footprint`] の before/after 差分で行う（本メソッドは
-        // 予算超過を判定しない）。
+        // （[`crate::sql::distinct::DistinctBudget`]）は `observe_distinct` 内で行う。
+        // Issue #1488: 予算計上を伴うため `observe_distinct` 経由でのみ観測する。
+        // ここへ来たら呼び出し元の見落としなので fail-closed に拒否する。
         if matches!(self, Accumulator::CountDistinct { .. }) {
-            return self.observe_distinct(input, id, vector, scanned, scratch);
+            return Err(accumulator_bug(
+                "COUNT(DISTINCT) accumulator must be observed via the distinct path",
+            ));
         }
         // Issue #1823: `GROUPING()` は行を観測しない（値は `finish_groups` が計算する）。
         if matches!(self, Accumulator::Grouping) {
@@ -1339,17 +1415,17 @@ impl Accumulator {
     /// [`Accumulator::CountDistinct`] 専用の観測経路（SQL-25 (c)・TASK-209）。
     /// `input` の型ごとに実値を正準化した `Vec<u8>` キー（NULL は `None`。
     /// `COUNT(DISTINCT)` は NULL を除外する PostgreSQL 互換契約）を作り、集合へ
-    /// 挿入する。予算判定はここでは行わず、挿入後のサイズ・累計バイト数の増分
-    /// （[`Self::distinct_footprint`]）を呼び出し元
-    /// （`sql::aggregate`／`sql::group_by::accumulate_row`）が
-    /// [`crate::sql::distinct::DistinctBudget::charge`] へ計上する。
-    fn observe_distinct(
+    /// 挿入する。新規キー確定時に限り、その場で
+    /// [`crate::sql::distinct::DistinctBudget::charge`] へ計上する（Issue #1488。
+    /// 呼び出し元の footprint 差分は不要）。`observe` からは到達しない。
+    pub(crate) fn observe_distinct(
         &mut self,
         input: &AggregateInput,
         id: u64,
         vector: &RowVector<'_>,
         scanned: &[Option<row_codec::ScalarRef<'_>>],
         scratch: &mut Vec<StackValue>,
+        distinct_budget: &mut crate::sql::distinct::DistinctBudget,
     ) -> Result<(), SqlSurfaceError> {
         // `resolve_count_distinct_input` は `AllVisible`／`VectorColumnPresence`／
         // `ArrayColumn`／`JsonColumn` を生成しない。到達したら束縛層の実装バグ。
@@ -1382,9 +1458,12 @@ impl Accumulator {
         };
         if let Some(key) = key {
             if seen.insert(key.clone()) {
-                *bytes = bytes.checked_add(key.len()).ok_or_else(|| {
+                let key_len = key.len();
+                *bytes = bytes.checked_add(key_len).ok_or_else(|| {
                     accumulator_bug("COUNT(DISTINCT) accumulated byte count overflowed")
                 })?;
+                // 新規キー確定時のみ計上（既存キーへの再ヒットは計上しない）。
+                distinct_budget.charge(key_len)?;
             }
         }
         Ok(())
@@ -2482,6 +2561,7 @@ pub(crate) fn execute_aggregate_with_group_limits(
         accumulators.push(Accumulator::for_item(item)?);
     }
     let max_result_bytes = statement_text_budget(&accumulators, max_result_bytes);
+    let budget_plan = ObserveBudgetPlan::new(&bound.items, &accumulators);
     // SQL-25 (c)・TASK-209: `COUNT(DISTINCT)` の中間状態はクエリ全体
     // （`GROUP BY` なしの単一行集計なので `accumulators` の全項目の合計）で
     // 1 つ。Fast 経路（`visible_ids` のみ走査）・全走査のどちらから observe
@@ -2598,18 +2678,33 @@ pub(crate) fn execute_aggregate_with_group_limits(
                     // Issue #1952: 協調的中断の確認点（スナップショット可視行の集約ループ。
                     // commit 前の読み取り経路）。
                     crate::interrupt::check()?;
-                    for (accumulator, item) in accumulators.iter_mut().zip(&bound.items) {
-                        observe_with_budgets(
-                            accumulator,
-                            item,
-                            id,
-                            &empty_vector,
-                            &[],
-                            &mut expr_scratch,
-                            &mut fast_path_text_accumulator_bytes,
-                            max_result_bytes,
-                            &mut distinct_budget,
-                        )?;
+                    if budget_plan.needs_distinct_budget {
+                        for (accumulator, item) in accumulators.iter_mut().zip(&bound.items) {
+                            observe_with_budgets(
+                                accumulator,
+                                item,
+                                id,
+                                &empty_vector,
+                                &[],
+                                &mut expr_scratch,
+                                &mut fast_path_text_accumulator_bytes,
+                                max_result_bytes,
+                                &mut distinct_budget,
+                            )?;
+                        }
+                    } else {
+                        for (accumulator, item) in accumulators.iter_mut().zip(&bound.items) {
+                            observe_light(
+                                accumulator,
+                                item,
+                                id,
+                                &empty_vector,
+                                &[],
+                                &mut expr_scratch,
+                                &mut fast_path_text_accumulator_bytes,
+                                max_result_bytes,
+                            )?;
+                        }
                     }
                 }
                 return finish_aggregate_result(
@@ -2880,18 +2975,33 @@ pub(crate) fn execute_aggregate_with_group_limits(
                     DecodeTier::Fast | DecodeTier::DimAndScalar => None,
                 },
             };
-            for (accumulator, item) in accumulators.iter_mut().zip(&bound.items) {
-                observe_with_budgets(
-                    accumulator,
-                    item,
-                    id,
-                    &vector,
-                    &scanned,
-                    &mut expr_scratch,
-                    &mut total_text_accumulator_bytes,
-                    max_result_bytes,
-                    &mut distinct_budget,
-                )?;
+            if budget_plan.needs_distinct_budget {
+                for (accumulator, item) in accumulators.iter_mut().zip(&bound.items) {
+                    observe_with_budgets(
+                        accumulator,
+                        item,
+                        id,
+                        &vector,
+                        &scanned,
+                        &mut expr_scratch,
+                        &mut total_text_accumulator_bytes,
+                        max_result_bytes,
+                        &mut distinct_budget,
+                    )?;
+                }
+            } else {
+                for (accumulator, item) in accumulators.iter_mut().zip(&bound.items) {
+                    observe_light(
+                        accumulator,
+                        item,
+                        id,
+                        &vector,
+                        &scanned,
+                        &mut expr_scratch,
+                        &mut total_text_accumulator_bytes,
+                        max_result_bytes,
+                    )?;
+                }
             }
         }
     }
@@ -3561,6 +3671,7 @@ pub(crate) fn observe_candidate_slots(
     max_result_bytes: usize,
 ) -> Result<usize, SqlSurfaceError> {
     let max_result_bytes = statement_text_budget(accumulators, max_result_bytes);
+    let budget_plan = ObserveBudgetPlan::new(&bound.items, accumulators);
     let arena = snapshot.arena();
     let mut expr_scratch: Vec<StackValue> = Vec::new();
     let mut total_text_accumulator_bytes: usize = 0;
@@ -3658,18 +3769,33 @@ pub(crate) fn observe_candidate_slots(
                 None
             },
         };
-        for (accumulator, item) in accumulators.iter_mut().zip(&bound.items) {
-            observe_with_budgets(
-                accumulator,
-                item,
-                id,
-                &vector,
-                &scanned,
-                &mut expr_scratch,
-                &mut total_text_accumulator_bytes,
-                max_result_bytes,
-                &mut distinct_budget,
-            )?;
+        if budget_plan.needs_distinct_budget {
+            for (accumulator, item) in accumulators.iter_mut().zip(&bound.items) {
+                observe_with_budgets(
+                    accumulator,
+                    item,
+                    id,
+                    &vector,
+                    &scanned,
+                    &mut expr_scratch,
+                    &mut total_text_accumulator_bytes,
+                    max_result_bytes,
+                    &mut distinct_budget,
+                )?;
+            }
+        } else {
+            for (accumulator, item) in accumulators.iter_mut().zip(&bound.items) {
+                observe_light(
+                    accumulator,
+                    item,
+                    id,
+                    &vector,
+                    &scanned,
+                    &mut expr_scratch,
+                    &mut total_text_accumulator_bytes,
+                    max_result_bytes,
+                )?;
+            }
         }
     }
     // 確定時点の TEXT 集計状態の累計バイト数。呼び出し元が式列の結果バイト予算と同じプールで
@@ -3932,6 +4058,153 @@ mod tests {
             group_by: None,
             ungrouped_having: None,
         }
+    }
+
+    fn footprint_calls() -> u64 {
+        DISTINCT_FOOTPRINT_CALLS.with(|c| c.get())
+    }
+
+    fn reset_footprint_calls() {
+        DISTINCT_FOOTPRINT_CALLS.with(|c| c.set(0));
+    }
+
+    fn two_row_storage(name: &str) -> (Storage, CleanupGuard, TableSchema) {
+        let path = unique_db_path(name);
+        let guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = nullable_vector_schema();
+        storage.create_table(&schema).expect("create table");
+        write_row_direct(&storage, "docs", "tenant-a", 1, &[1.0, 2.0, 3.0]);
+        write_row_direct(&storage, "docs", "tenant-a", 2, &[4.0, 5.0, 6.0]);
+        (storage, guard, schema)
+    }
+
+    /// Issue #1488: DISTINCT を含まない集計は全走査で `distinct_footprint` を呼ばない。
+    #[test]
+    fn non_distinct_aggregate_does_not_call_distinct_footprint() {
+        let (storage, _guard, schema) = two_row_storage("agg-1488-light");
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        use redb::ReadableDatabase;
+        let read_txn = storage.db().begin_read().expect("begin_read");
+        let mut bound = bound_multi(AggregateFunc::Count, AggregateInput::AllVisible, 1);
+        for func in [
+            AggregateFunc::Sum,
+            AggregateFunc::Avg,
+            AggregateFunc::Min,
+            AggregateFunc::Max,
+        ] {
+            let mut item = bound.items[0].clone();
+            item.func = func;
+            item.input = AggregateInput::IdU64;
+            bound.items.push(item);
+        }
+        bound.projection = (0..bound.items.len())
+            .map(|i| crate::sql::parser::ProjectionColumn::Aggregate {
+                item_index: i,
+                name: format!("c{i}"),
+            })
+            .collect();
+        reset_footprint_calls();
+        let result = execute_aggregate_with_cache(
+            &read_txn,
+            &ctx,
+            &schema,
+            &bound,
+            MAX_AGGREGATE_RESULT_BYTES,
+            None,
+            None,
+            None,
+        )
+        .expect("aggregate");
+        assert_eq!(result.rows[0].cells[0], Cell::Integer(2));
+        assert_eq!(footprint_calls(), 0);
+    }
+
+    /// Issue #1488: 陽性対照。DISTINCT を含むクエリでは重い経路が残り、
+    /// 非 DISTINCT 項目の footprint 取得が行われる（カウンタが空振りしないことの確認）。
+    /// `COUNT(DISTINCT)` 自体は結果も正しい。
+    #[test]
+    fn distinct_query_keeps_heavy_path_and_counts_distinct() {
+        let (storage, _guard, schema) = two_row_storage("agg-1488-heavy");
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        use redb::ReadableDatabase;
+        let read_txn = storage.db().begin_read().expect("begin_read");
+        let mut bound = bound_multi(AggregateFunc::Count, AggregateInput::AllVisible, 1);
+        let mut item = bound.items[0].clone();
+        item.input = AggregateInput::IdU64;
+        item.distinct = true;
+        bound.items.push(item);
+        bound.projection = (0..2)
+            .map(|i| crate::sql::parser::ProjectionColumn::Aggregate {
+                item_index: i,
+                name: format!("c{i}"),
+            })
+            .collect();
+        reset_footprint_calls();
+        let result = execute_aggregate_with_cache(
+            &read_txn,
+            &ctx,
+            &schema,
+            &bound,
+            MAX_AGGREGATE_RESULT_BYTES,
+            None,
+            None,
+            None,
+        )
+        .expect("aggregate");
+        assert_eq!(result.rows[0].cells[1], Cell::Integer(2));
+        assert!(footprint_calls() > 0);
+    }
+
+    /// Issue #1488: `observe` に `CountDistinct` が来たら値の有無に関わらず fail-closed。
+    #[test]
+    fn observe_rejects_count_distinct_accumulator() {
+        let mut acc = Accumulator::CountDistinct {
+            seen: std::collections::HashSet::new(),
+            bytes: 0,
+        };
+        let vector = RowVector {
+            dim: 0,
+            values: None,
+        };
+        let mut scratch = Vec::new();
+        let err = acc
+            .observe(&AggregateInput::IdU64, 1, &vector, &[], &mut scratch)
+            .expect_err("must be rejected");
+        assert!(format!("{err:?}").contains("distinct path"), "{err:?}");
+    }
+
+    /// Issue #1488: `observe_distinct` は新規キーのときだけ予算へ計上する。
+    #[test]
+    fn observe_distinct_charges_only_new_keys() {
+        let mut acc = Accumulator::CountDistinct {
+            seen: std::collections::HashSet::new(),
+            bytes: 0,
+        };
+        let vector = RowVector {
+            dim: 0,
+            values: None,
+        };
+        let mut scratch = Vec::new();
+        let mut budget = crate::sql::distinct::DistinctBudget::new();
+        for id in [1u64, 1, 2] {
+            acc.observe_distinct(
+                &AggregateInput::IdU64,
+                id,
+                &vector,
+                &[],
+                &mut scratch,
+                &mut budget,
+            )
+            .expect("observe_distinct");
+        }
+        assert_eq!(acc.distinct_footprint().0, 2);
+        // 同じ予算へ追加で計上した 2 件目のバイト数と一致する（再ヒットは未計上）。
+        let mut expected = crate::sql::distinct::DistinctBudget::new();
+        let bytes = acc.distinct_footprint().1;
+        expected.charge(bytes / 2).expect("charge");
+        expected.charge(bytes / 2).expect("charge");
+        assert_eq!(format!("{budget:?}"), format!("{expected:?}"));
     }
 
     /// PR #1049 レビュー指摘 P0 対応の回帰テスト用: 同一 `(func, input)` の組を

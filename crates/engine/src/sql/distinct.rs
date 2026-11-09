@@ -53,6 +53,7 @@ const DISTINCT_BUDGET_OVERFLOW_DETAIL: &str = "COUNT(DISTINCT) budget accounting
 /// `COUNT(DISTINCT <expr>)` の中間状態（クエリ全体で 1 つ。`GROUP BY` を伴う
 /// 場合は全グループ・全項目の合計を管理する）。新規キー 1 件の挿入が確定した
 /// 時点でのみ [`Self::charge`] を呼ぶ（既存キーへの再ヒットでは呼ばない）。
+#[derive(Debug)]
 pub(crate) struct DistinctBudget {
     entries: usize,
     bytes: usize,

@@ -578,6 +578,19 @@ fn accumulate_row(
                 continue;
             }
         }
+        // Issue #1488: `COUNT(DISTINCT)` は専用経路で観測し、新規キー確定時に
+        // `distinct_budget` へその場で計上する（状態は集合のみで TEXT 予算の対象外）。
+        if matches!(accumulator, Accumulator::CountDistinct { .. }) {
+            accumulator.observe_distinct(
+                &item.input,
+                id,
+                vector,
+                scanned,
+                expr_scratch,
+                distinct_budget,
+            )?;
+            continue;
+        }
         let before = accumulator.text_len();
         let (distinct_entries_before, distinct_bytes_before) = accumulator.distinct_footprint();
         accumulator.observe(&item.input, id, vector, scanned, expr_scratch)?;
