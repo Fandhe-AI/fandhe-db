@@ -118,15 +118,15 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // 書き込むのは `restore_generation` 専用表だけで、`CATALOG_TABLE`・`user_rows` には触れず、
     // 世代も進めない（バンプ対象の表が構造的に存在しない）。
     // Issue #3105: モジュール doc の追記で行が動いた（commit 内容は不変）。
-    ("storage/restore_generation.rs", 147),
+    ("storage/restore_generation.rs", 153), // Issue #3100: timeline 分岐（`change_log_meta`・`change_log` 表の書き換え。`CATALOG_TABLE`・`user_rows` には触れず世代も進めない）の呼び出し追加で追随（旧: 147・151）
     // Issue #2174（レプリカの適用ループ。RECOVER-15）: `Storage::apply_replicated_records` の保守 commit。
     // 適用するのはプライマリが commit したレコード本体（表の物理的な差分）で、`CATALOG_TABLE` 内の
     // テーブル世代もプライマリ側のバンプ結果が同じレコードに含まれて複製される。レプリカ側で
     // 独自にバンプするとプライマリとの世代が食い違うため、ここでは呼ばない（`user_rows/{table}` の変更は
     // 必ず同じレコードの世代更新を伴う。伴わない場合の検出はプライマリ側の本テストが担う）。
     ("storage/change_log/replica_apply.rs", 219), // Issue #2176 で追随（旧: 214）
-    ("storage/change_log.rs", 1601), // Issue #2176・Issue #2245 の mod 宣言追加で追随（旧: 1597）。Issue #3091 のテスト fixture 追加で追随（旧: 1582）
-    ("storage/change_log.rs", 1609), // Issue #2176（+1）・Issue #2245 で追随（旧: 1605）。Issue #3091 で追随（旧: 1590）
+    ("storage/change_log.rs", 1602), // Issue #3100 の mod 宣言追加で追随（旧: 1601）。 Issue #2176・Issue #2245 の mod 宣言追加で追随（旧: 1597）。Issue #3091 のテスト fixture 追加で追随（旧: 1582）
+    ("storage/change_log.rs", 1610), // Issue #3100 で追随（旧: 1609）。 Issue #2176（+1）・Issue #2245 で追随（旧: 1605）。Issue #3091 で追随（旧: 1590）
     ("recovery/panic_hook.rs", 404),
     ("txn.rs", 211),
     ("txn.rs", 388),

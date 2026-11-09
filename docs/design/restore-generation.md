@@ -6,6 +6,8 @@
 - ビヘイビア ID ポインタ: RECOVER-17（`docs/spec/04-behavior/recovery.md`）、
   関連 RECOVER-13・RECOVER-14・RECOVER-16、TASK-340（`docs/spec/05-tasks.md`）
 
+- 補足: 復元の世代番号は、変更ログの timeline の分岐（Issue #3100・RECOVER-14）の値としても使われる（[change-log-pitr.md](change-log-pitr.md)）。
+
 ## 位置づけ
 
 本書は public リポのため、世代番号の決め方・永続化の順序・エラー契約・参照構文の比較と不採用理由の

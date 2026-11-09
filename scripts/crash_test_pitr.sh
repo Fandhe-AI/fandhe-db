@@ -367,6 +367,11 @@ capture_point() {
     waited=$((waited + 5))
   done
   stop_server
+  # 検査点 1 の時点の元の系統の DB を複製しておく（phase 7 の増分の取得元。復元した DB は timeline が
+  # 分岐する（Issue #3100）ため、元のベースへの増分は元の系統の DB からしか取れない）。
+  if [ "${idx}" -eq 1 ]; then
+    cp "${SRC_DB}" "${WORKDIR}/inc-src-original.redb" || fail "cannot copy the source DB at point 1"
+  fi
   PT_LSN+=("${CLV_LAST}")
   PT_COUNT+=("${COUNT}")
   PT_MAXID+=("${MAXID}")
@@ -773,13 +778,18 @@ tamper_case delete-last "${PT_LSN[LAST]}" tail mutate_delete_last "outside the r
 # 7. 増分バックアップの併用
 # ---------------------------------------------------------------------------
 echo "=== phase 7: incremental backup combined with the archive ==="
-MIDPT=$((LAST / 2))
-[ "${MIDPT}" -ge 1 ] || MIDPT=1
-# 途中の検査点の DB から増分を取る。停止中の DB が要るため、サーバーを起動していない新しい復元先を使う。
+# 検査点 1 の時点の元の系統の DB（phase 2 で複製済み）から増分を取る。復元した DB は timeline が分岐し
+# ベースと別の系統になるため、増分の取得元には使えない。
+MIDPT=1
 INC="${BAK_DIR}/inc.seg"
-INC_SRC="${RST_DIR}/inc-src.redb"
-restore_to "${INC_SRC}" --change-log-archive-dir "${ARCH}" --until-lsn "${PT_LSN[MIDPT]}"
-[ "${RESTORE_RC}" -eq 0 ] || restore_fail "restore for the incremental source exit ${RESTORE_RC}"
+INC_SRC="${WORKDIR}/inc-src-original.redb"
+[ -f "${INC_SRC}" ] || fail "the original-line source copy at point 1 is missing"
+# 複製元はサーバーを SIGKILL した後の DB で、読み取り専用では開けない。フルバックアップ（元の系統のまま
+# 整合した複製を作る）を通して停止中の DB にする。
+INC_SRC_CLEAN="${WORKDIR}/inc-src-clean.redb"
+"${BIN}" backup --db "${INC_SRC}" --out "${INC_SRC_CLEAN}" >/dev/null \
+  || fail "cannot take a clean copy of the point ${MIDPT} source"
+INC_SRC="${INC_SRC_CLEAN}"
 "${BIN}" backup-incremental --db "${INC_SRC}" --base "${BASE}" --out "${INC}" >/dev/null \
   || fail "backup-incremental from point ${MIDPT} failed"
 # 増分の末尾（検査点 MIDPT）より後ろをアーカイブから補って最新まで。
