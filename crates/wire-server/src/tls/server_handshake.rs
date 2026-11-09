@@ -1125,6 +1125,22 @@ impl TlsSession {
 }
 
 impl TlsSession {
+    /// クライアント側ハンドシェイク（[`super::client_handshake`]。Issue #2177）が
+    /// application epoch へ切り替え済みの `Sealer`／`Opener` から組み立てる。
+    /// クライアントは `tls-server-end-point` を提示しない（`None`）。
+    pub(crate) fn from_client_handshake(sealer: Sealer, opener: Opener) -> Self {
+        Self {
+            sealer,
+            opener,
+            poisoned: false,
+            sent_close_notify: false,
+            received_close_notify: false,
+            received_user_canceled: false,
+            fatal_alert_sent: false,
+            channel_binding: None,
+        }
+    }
+
     /// この接続で SCRAM-SHA-256-PLUS へ提示すべき `tls-server-end-point`
     /// （Issue #970）。`TlsServerConfig::scram_channel_binding_enabled`
     /// が無効化されている場合は算出済みの値があっても `None`（提示無効化を
@@ -1330,9 +1346,9 @@ impl HandshakeTransport for std::net::TcpStream {
 /// 個々の低レベル `read` 呼び出しの粒度で絶対期限を強制する。期限切れ
 /// 後は OS を呼ばず即座に `TimedOut` を返す（`set_read_timeout` へ
 /// ゼロ Duration を渡すとプラットフォームによってはエラーになるため）。
-struct DeadlineReader<'a, S: HandshakeTransport> {
-    stream: &'a mut S,
-    deadline: Instant,
+pub(super) struct DeadlineReader<'a, S: HandshakeTransport> {
+    pub(super) stream: &'a mut S,
+    pub(super) deadline: Instant,
 }
 
 impl<S: HandshakeTransport> Read for DeadlineReader<'_, S> {
@@ -1362,9 +1378,9 @@ impl<S: HandshakeTransport> Read for DeadlineReader<'_, S> {
 /// 絶対期限強制を送信側にも与える。期限切れ後は OS を呼ばず即座に
 /// `TimedOut` を返す（`DeadlineReader` と同じ理由でゼロ Duration は
 /// 渡さない）。
-struct DeadlineWriter<'a, S: HandshakeTransport> {
-    stream: &'a mut S,
-    deadline: Instant,
+pub(super) struct DeadlineWriter<'a, S: HandshakeTransport> {
+    pub(super) stream: &'a mut S,
+    pub(super) deadline: Instant,
 }
 
 impl<S: HandshakeTransport> Write for DeadlineWriter<'_, S> {

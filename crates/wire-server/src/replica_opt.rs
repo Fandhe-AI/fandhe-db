@@ -8,7 +8,11 @@
 //! - `--db <path>`: レプリカの DB ファイル（`backup` で作ったベースのコピー。**既に存在すること**。
 //!   存在しない場合に空の DB を新規作成しない）
 //! - `--primary <ip:port>`: プライマリのレプリケーション endpoint（`--replication-bind` のアドレス）。
-//!   **ループバックのみ**で、非ループバックの平文は fail-closed に起動拒否する（TLS は #2177 の担当）
+//!   `--primary-tls-cert` なしではループバックのみで、非ループバックの平文は fail-closed に起動拒否する
+//! - `--primary-tls-cert <pem>`（Issue #2177・RECOVER-15 (3)・WIRE-9 ポインタ）: プライマリの TLS 証明書
+//!   （プライマリの `--replication-tls-cert` と同じファイルを配る）。指定すると TLS 1.3 で接続し、提示された
+//!   証明書がこのピンと完全一致することを確かめてから資格情報を送る（CA チェーン・ホスト名の検証はしない）。
+//!   ループバックでも TLS を使う。起動時に読み込み、不正・期限切れ・Ed25519 でない証明書は起動拒否
 //! - `--credentials <file>`: `role:password` の 1 行。パスワードは CLI 引数に置かない。ファイルが
 //!   group／other から読める権限なら拒否する
 //! - `--max-backoff-secs <n>`: 再接続のバックオフの上限（秒。既定 30）
@@ -19,9 +23,11 @@
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::replication_opt::{ReplicationRoles, MAX_ROLE_NAME_LEN};
+use crate::tls::client_handshake::PinnedServerCertificate;
 
 /// 適用の停止（整合性違反）の終了コード。再接続して飛ばして進めない。運用者の調査が必要。
 pub const EXIT_APPLY_HALTED: u8 = 10;
@@ -48,8 +54,11 @@ const MAX_PASSWORD_LEN: usize = 1024;
 pub struct ReplicaOptions {
     /// レプリカの DB ファイル。
     pub db: PathBuf,
-    /// プライマリの endpoint（ループバック）。
+    /// プライマリの endpoint（ピンがなければループバック）。
     pub primary: SocketAddr,
+    /// プライマリの証明書のピン（Issue #2177）。`Some` なら TLS で接続し、証明書の一致を確かめてから
+    /// 資格情報を送る。`None` はループバックの平文。
+    pub primary_tls: Option<Arc<PinnedServerCertificate>>,
     /// 認証ロール名。
     pub role: String,
     /// パスワード（ログ・エラー文に出さない）。
@@ -67,6 +76,7 @@ impl std::fmt::Debug for ReplicaOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ReplicaOptions")
             .field("primary", &self.primary)
+            .field("tls", &self.primary_tls.is_some())
             .field("role", &self.role)
             .finish_non_exhaustive()
     }
@@ -97,6 +107,7 @@ pub fn parse(args: &[String]) -> Result<ReplicaOptions, String> {
     let mut db: Option<String> = None;
     let mut primary: Option<String> = None;
     let mut credentials: Option<String> = None;
+    let mut primary_tls: Option<String> = None;
     let mut backoff: Option<String> = None;
     let mut records: Option<String> = None;
     let mut bytes: Option<String> = None;
@@ -105,6 +116,7 @@ pub fn parse(args: &[String]) -> Result<ReplicaOptions, String> {
         let slot = match flag.as_str() {
             "--db" => &mut db,
             "--primary" => &mut primary,
+            "--primary-tls-cert" => &mut primary_tls,
             "--credentials" => &mut credentials,
             "--max-backoff-secs" => &mut backoff,
             "--batch-records" => &mut records,
@@ -135,7 +147,8 @@ pub fn parse(args: &[String]) -> Result<ReplicaOptions, String> {
     let primary: SocketAddr = primary
         .parse()
         .map_err(|_| "--primary must be an ip:port address".to_string())?;
-    check_primary_loopback(&primary)?;
+    let primary_tls = load_primary_pin(primary_tls.as_deref().map(Path::new))?;
+    check_primary_transport(&primary, primary_tls.is_some())?;
     let (role, password) = load_credentials(Path::new(&credentials))?;
     let max_backoff = match &backoff {
         Some(v) => bounded("--max-backoff-secs", v, 1, MAX_MAX_BACKOFF_SECS)?,
@@ -163,6 +176,7 @@ pub fn parse(args: &[String]) -> Result<ReplicaOptions, String> {
     Ok(ReplicaOptions {
         db,
         primary,
+        primary_tls,
         role,
         password,
         max_backoff: Duration::from_secs(max_backoff),
@@ -171,13 +185,31 @@ pub fn parse(args: &[String]) -> Result<ReplicaOptions, String> {
     })
 }
 
-/// `--primary` がループバックであることを確かめる（平文のレプリケーションはループバックに限る。TLS は #2177）。
-/// `replica` と `replica-resync` で共有する。
-pub(crate) fn check_primary_loopback(primary: &SocketAddr) -> Result<(), String> {
-    if !primary.ip().is_loopback() {
-        return Err("--primary must be a loopback address until TLS is supported".to_string());
+/// `--primary` の通信路の保護を確かめる（Issue #2177）。ピン（`--primary-tls-cert`）が無ければ平文なので
+/// ループバックに限り、非ループバックは TLS 必須として起動拒否する（fail-closed）。`replica` と
+/// `replica-resync` で共有する。
+pub(crate) fn check_primary_transport(primary: &SocketAddr, pinned: bool) -> Result<(), String> {
+    if !pinned && !primary.ip().is_loopback() {
+        return Err(
+            "--primary must be a loopback address unless --primary-tls-cert is given".to_string(),
+        );
     }
     Ok(())
+}
+
+/// `--primary-tls-cert` のピンを読み込む（`replica`・`replica-resync` で共有）。未指定は `None`。
+/// エラー文は固定で、パス・証明書の中身を含まない。
+pub(crate) fn load_primary_pin(
+    path: Option<&Path>,
+) -> Result<Option<Arc<PinnedServerCertificate>>, String> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    // 掃除（Issue #3094）が消す予約名の形式のファイルは拒否する（fail-closed）。
+    crate::backup_opt::reject_reserved_name("--primary-tls-cert", path)?;
+    PinnedServerCertificate::load_file(path)
+        .map(|pin| Some(Arc::new(pin)))
+        .map_err(|e| format!("--primary-tls-cert: {e}"))
 }
 
 /// `role:password` の 1 行を読む。通常ファイルで小さく、group／other に読める権限が無いこと。
@@ -262,6 +294,33 @@ mod tests {
         assert_eq!(o.password, b"pw:with:colons");
         assert_eq!(o.max_backoff, Duration::from_secs(5));
         assert!(!format!("{o:?}").contains("colons"));
+        std::fs::remove_dir_all(d).ok();
+    }
+
+    #[test]
+    fn primary_transport_requires_tls_off_loopback() {
+        let lo: SocketAddr = "127.0.0.1:1".parse().expect("addr");
+        let wan: SocketAddr = "10.0.0.5:1".parse().expect("addr");
+        assert!(check_primary_transport(&lo, false).is_ok());
+        assert!(check_primary_transport(&lo, true).is_ok());
+        assert!(check_primary_transport(&wan, true).is_ok());
+        assert!(check_primary_transport(&wan, false).is_err());
+    }
+
+    #[test]
+    fn an_unreadable_pin_is_refused_without_leaking_the_path() {
+        let (d, db, cred) = fixture("pin", 0o600);
+        let mut a = args(&db, &cred, &["--primary-tls-cert", "/secret-dir/pin.pem"]);
+        a[3] = "10.0.0.5:5999".to_string();
+        let e = parse(&a).expect_err("unreadable pin");
+        assert!(!e.contains("secret-dir"), "{e}");
+        // 重複指定も拒否される。
+        assert!(parse(&args(
+            &db,
+            &cred,
+            &["--primary-tls-cert", "a.pem", "--primary-tls-cert", "b.pem"]
+        ))
+        .is_err());
         std::fs::remove_dir_all(d).ok();
     }
 

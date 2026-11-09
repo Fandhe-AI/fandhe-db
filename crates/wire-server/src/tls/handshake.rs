@@ -809,6 +809,8 @@ impl HandshakeMessage {
 /// （fail-closed な有界バッファ）。
 pub struct HandshakeBuffer {
     buf: Vec<u8>,
+    /// このバッファが受理するメッセージ本文長の上限（既定は [`MAX_HANDSHAKE_MESSAGE_LEN`]）。
+    max_message_len: usize,
     /// 一度 [`HandshakeBuffer::next_message`] 等がエラーを返したら、
     /// 以後の呼び出しは同じ理由のエラーを返し続ける（poison。エラー後に
     /// バッファの残骸を引き続き解釈しない fail-closed な設計）。
@@ -823,10 +825,23 @@ impl Default for HandshakeBuffer {
 
 impl HandshakeBuffer {
     pub fn new() -> Self {
+        Self::with_max_message_len(MAX_HANDSHAKE_MESSAGE_LEN)
+    }
+
+    /// 受理するメッセージ本文長の上限を指定して作る。レプリカ側 TLS クライアントが
+    /// サーバーの `Certificate` チェーン（既定上限を超え得る）を受ける用途。
+    /// 上限は 24bit 長フィールドの最大値に丸め、バッファ容量も上限に合わせて広げる。
+    pub fn with_max_message_len(max_message_len: usize) -> Self {
         Self {
             buf: Vec::new(),
+            max_message_len: max_message_len.min(MAX_HANDSHAKE_WIRE_BODY_LEN as usize),
             poison: None,
         }
+    }
+
+    /// 内部バッファ容量の上限（ヘッダ + 本文上限 + レコード平文 1 個分）。
+    fn buffer_capacity_limit(&self) -> usize {
+        HANDSHAKE_HEADER_LEN + self.max_message_len + record::MAX_PLAINTEXT_LEN
     }
 
     /// レコード層から 1 レコードを受け取る。`ContentType::Handshake`
@@ -858,7 +873,7 @@ impl HandshakeBuffer {
         if let Some(poison) = self.poison {
             return Err(poison);
         }
-        if self.buf.len() + input.len() > MAX_HANDSHAKE_BUFFER_LEN {
+        if self.buf.len().saturating_add(input.len()) > self.buffer_capacity_limit() {
             let err = HandshakeError::Decode("handshake reassembly buffer capacity exceeded");
             self.poison = Some(err);
             return Err(err);
@@ -907,10 +922,10 @@ impl HandshakeBuffer {
             }
         };
         let declared = (usize::from(l0) << 16) | (usize::from(l1) << 8) | usize::from(l2);
-        if declared > MAX_HANDSHAKE_MESSAGE_LEN {
+        if declared > self.max_message_len {
             let err = HandshakeError::MessageTooLarge {
                 declared,
-                max: MAX_HANDSHAKE_MESSAGE_LEN,
+                max: self.max_message_len,
             };
             self.poison = Some(err);
             return Err(err);
@@ -1553,6 +1568,36 @@ mod tests {
                 Some(record::AlertDescription::UnexpectedMessage)
             );
         }
+    }
+
+    #[test]
+    fn raised_limit_accepts_message_over_default_and_rejects_over_raised_limit() {
+        let big = MAX_HANDSHAKE_MESSAGE_LEN + 10;
+        let mut msg = header(11, big as u32).to_vec();
+        msg.extend(std::iter::repeat_n(0u8, big));
+        // 既定上限では拒否される。
+        let mut default_buf = HandshakeBuffer::new();
+        default_buf
+            .feed(&msg[..record::MAX_PLAINTEXT_LEN])
+            .expect("feed");
+        assert!(matches!(
+            default_buf.next_message(),
+            Err(HandshakeError::MessageTooLarge { .. })
+        ));
+        // 引き上げた上限では受理される（複数 fragment に分けて投入）。
+        let mut raised = HandshakeBuffer::with_max_message_len(big);
+        for chunk in msg.chunks(record::MAX_PLAINTEXT_LEN) {
+            raised.feed(chunk).expect("feed");
+        }
+        let m = raised.next_message().expect("ok").expect("complete");
+        assert_eq!(m.body.len(), big);
+        // 引き上げた上限を 1 でも超えれば fail-closed。
+        let mut over = HandshakeBuffer::with_max_message_len(big);
+        over.feed(&header(11, big as u32 + 1)).expect("feed");
+        assert!(matches!(
+            over.next_message(),
+            Err(HandshakeError::MessageTooLarge { .. })
+        ));
     }
 
     #[test]

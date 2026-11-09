@@ -144,7 +144,8 @@ cargo run -p fandhe-db-wire-server -- --users <ユーザーストアのパス> -
   [--change-log] [--change-log-archive-dir <dir>] [--change-log-retain-records <n>] \
   [--change-log-archive-interval-secs <1-86400>] \
   [--change-log-max-unarchived-bytes <n>] [--change-log-max-unarchived-records <n>] \
-  [--replication-bind <loopback addr>] [--replication-roles <file>] [--replication-allow <ip|cidr>]... \
+  [--replication-bind <addr>] [--replication-tls-cert <pem> --replication-tls-key <pem>] \
+  [--replication-roles <file>] [--replication-allow <ip|cidr>]... \
   [--replication-max-connections <1-256>] [--replication-max-unacked-bytes <1024-4294967296>] \
   [--replication-ack-timeout-secs <1-3600>] [--replication-max-lag-records <1-1000000000>] \
   [--replication-sync-standby <role>]... [--replication-sync-commit remote_write|on|remote_apply] \
@@ -520,8 +521,9 @@ redb トランザクションで DB 内の `change_log` 表へ追記されます
 - `wire-server replica --db <path> --primary <ip:port> --credentials <file>` で、`backup` で取ったベースのコピーを
   プライマリの `--replication-bind` に追従させます。受け取った変更を commit 番号順に原子的に適用して適用位置を永続化し、
   再接続・再起動では適用位置から再開します。順序違反・分岐・識別子や版数の不一致は何も適用せず終了コード 10 で停止し、
-  プライマリの拒否は終了コード 11 で報告します。接続先は**ループバックのみ**（TLS は #2177）、資格情報は
-  `role:password` の 1 行のファイル（group／other から読めない権限）で渡します。
+  プライマリの拒否は終了コード 11 で報告します。接続先は、`--primary-tls-cert <pem>`（プライマリの `--replication-tls-cert` と同じ
+  証明書。ピン留めで検証し、一致を確かめてから資格情報を送る。Issue #2177）なしでは**ループバックのみ**で、非ループバックはピンがなければ
+  起動拒否です。資格情報は `role:password` の 1 行のファイル（group／other から読めない権限）で渡します。
 
 **再同期**（Issue #2176。RECOVER-15・RECOVER-13 ポインタ。判断は [docs/design/replication-streaming.md](docs/design/replication-streaming.md) の「実装判断（Issue #2176）」）:
 
@@ -530,7 +532,8 @@ redb トランザクションで DB 内の `change_log` 表へ追記されます
   `wire-server replica-resync --socket <プライマリの --backup-socket> --out <新しいレプリカ DB> --primary <ip:port> --credentials <file>`
   です。稼働中のプライマリからフルバックアップを取り、整合検査・変更ログの連続性・プライマリへの確認を通ったものだけを `--out`
   （新規パスに限る。古い DB は上書きしない）へ公開し、`replica-resync written: base_lsn=<N>` を出します。続けて
-  `replica --db <--out>` を**すぐに**起動してください（保持位置は起動まで登録されません）。
+  `replica --db <--out>` を**すぐに**起動してください（保持位置は起動まで登録されません）。確認接続も `--primary-tls-cert` で TLS にでき、
+  ピン不一致なら何も公開しません。
 - 終了コード: 0 成功、1 実行時の失敗、2 引数・パスの拒否、3 公開済みだが後始末を確かめられない、4・5 整合検査の矛盾・検査不能、
   10 ベースの変更ログが連続しない、11 プライマリの拒否（別系統・保持範囲の外・認証失敗）。失敗時は最終名に何も残りません。
 - 復元の世代番号（`SHOW restore_generation`）は進めません（プライマリの値のまま）。出力先にはデータベースと同程度の空きが要ります。
@@ -542,12 +545,17 @@ redb トランザクションで DB 内の `change_log` 表へ追記されます
   書き込み・DDL・`COPY FROM`・明示 `READ WRITE` は `25006` で拒否します（行・カタログ・採番は変わりません）。
 - 適用の遅延は標準エラーだけで観測できます（テナントのセッションからは参照できません）。適用が停止したらプロセスを終了します
   （終了コード 10・11）。`--change-log`・`--replication-*`・`--backup-socket` とは併用できず、ベースでない DB は起動拒否です。
+  プライマリが TLS なら `--replica-primary-tls-cert <pem>` でピンを渡します。
 
 **レプリケーション送信側**（Issue #2173。RECOVER-15・WIRE-9 ポインタ。判断は [docs/design/replication-streaming.md](docs/design/replication-streaming.md) の「実装判断（Issue #2173）」）:
 
 - `--replication-bind <addr>` で、テナント向けの `--bind` とは別のポートに専用のリスナーを作り、承認済みのレプリカへ変更ログの
-  レコードを commit 番号順に送ります（非同期。レプリカの切断・遅延・停止はプライマリの書き込みを止めません）。**ループバック
-  だけ**を受け付け、非ループバックは起動エラーです（TLS は #2177。それまで平文を外へ晒しません）。`--change-log` が前提です。
+  レコードを commit 番号順に送ります（非同期。レプリカの切断・遅延・停止はプライマリの書き込みを止めません）。TLS を構成しない場合は
+  **ループバックだけ**を受け付け、非ループバックは起動エラーです（平文を外へ晒しません）。`--change-log` が前提です。
+- **TLS（Issue #2177）**: `--replication-tls-cert <pem>`・`--replication-tls-key <pem>`（両方指定か両方なし。Ed25519 の証明書・鍵。
+  テナント向けの `--tls-*` とは別）を構成すると、**全接続が TLS 1.3 必須**になり、非ループバックの bind が使えます。平文の接続は何も返さず
+  閉じます。受信側は同じ証明書を `--primary-tls-cert` でピン留めし、提示された証明書が一致して初めて資格情報を送ります（CA チェーン・
+  ホスト名の検証はしません）。手順は [docs/design/replication-operations.md](docs/design/replication-operations.md) の 2.3.1 にあります。
 - 認証は専用のロール（`--replication-roles <file>`。`name:phc` の行。PHC は `wire-server hash-password` で作る）で行い、
   `--users` のテナントのロールでは接続できません。送信元は `--replication-allow <ip|cidr>`（繰り返し可・1 件以上が必須）で
   許可したものだけで、許可外には何も返さず閉じます。
@@ -559,8 +567,8 @@ redb トランザクションで DB 内の `change_log` 表へ追記されます
   プライマリの最新までの遅れ。超えたレプリカは切断され保持位置が外れる）。不正値は DB を開く前に起動エラーです。
 - 切断されたレプリカが再接続したとき、開始位置が刈り込み済み、または遅れの上限を超える位置なら `RESYNC_REQUIRED` で拒否されます
   （期待どおりの挙動。再同期は `replica-resync`。#2176）。認証に失敗し続ける送信元は、バックオフの間（最大 60 秒）何も返されずに閉じられます。
-- **注意**: リスナーはループバック限定ですが、port-forward やプロキシで外へ出すと資格情報とレコードが平文で流れます。外へ出す構成は
-  TLS が入る（#2177）まで使わないでください。`--replication-roles` は `--users` とは別のファイルを使ってください（形式が異なり、
+- **注意**: TLS を構成しないリスナーはループバック限定ですが、port-forward やプロキシで外へ出すと資格情報とレコードが平文で流れます。
+  外へ出す構成は TLS を構成してください。`--replication-roles` は `--users` とは別のファイルを使ってください（形式が異なり、
   互いのファイルでは起動できません）。
 - **同期レプリケーション（オプション。Issue #2245）**: `--replication-sync-standby <role>`（繰り返し可。`--replication-roles` に存在するロール）を
   指定すると、commit の成功応答を返す前に、指定した全ロールのレプリカの確認を待ちます（既定は非同期）。待つ段階は

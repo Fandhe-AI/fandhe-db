@@ -37,6 +37,8 @@ use crate::replica_resync_opt::{
     EXIT_NOT_FINALIZED, EXIT_PRIMARY_REJECTED, EXIT_USAGE,
 };
 use crate::replication::{code, PROTOCOL_VERSION, T_ERROR, T_HELLO, T_IDENTITY, T_OK, T_START};
+use crate::replication_conn::{self, ConnReader};
+use crate::tls::client_handshake::perform_client_handshake;
 use crate::{backup_opt, backup_socket, restore_opt, verify_opt};
 
 /// 確認接続の接続・ハンドシェイク・書き込みの期限。
@@ -303,17 +305,30 @@ fn probe_primary(
     opts: &ReplicaResyncOptions,
     point: &engine::storage::ChainPoint,
 ) -> Result<(), ResyncError> {
-    let stream = TcpStream::connect_timeout(&opts.primary, CONNECT_TIMEOUT)
+    let mut stream = TcpStream::connect_timeout(&opts.primary, CONNECT_TIMEOUT)
         .map_err(|_| ResyncError::PrimaryUnreachable)?;
     let _ = stream.set_nodelay(true);
-    stream
-        .set_write_timeout(Some(WRITE_TIMEOUT))
+    // ピンがあれば TLS を確立し、証明書の一致を確かめる（資格情報は一致の後にだけ送る。Issue #2177）。
+    let (mut rd, mut wr) = match opts.primary_tls.as_deref() {
+        None => replication_conn::plain(stream).map_err(|_| ResyncError::PrimaryUnreachable)?,
+        Some(pin) => match perform_client_handshake(&mut stream, pin) {
+            Ok(session) => replication_conn::tls(stream, session)
+                .map_err(|_| ResyncError::PrimaryUnreachable)?,
+            Err(e) if e.is_rejection() => {
+                return Err(ResyncError::PrimaryRejected(
+                    "the primary's TLS handshake was rejected (check --primary-tls-cert); nothing was published",
+                ))
+            }
+            Err(_) => return Err(ResyncError::PrimaryUnreachable),
+        },
+    };
+    wr.set_write_timeout(Some(WRITE_TIMEOUT))
         .map_err(|_| ResyncError::PrimaryUnreachable)?;
     let role_len = u8::try_from(opts.role.len()).map_err(|_| {
         ResyncError::PrimaryRejected("the primary rejected the connection; nothing was published")
     })?;
     write_frame(
-        &stream,
+        &mut wr,
         T_HELLO,
         &[
             &PROTOCOL_VERSION.to_be_bytes(),
@@ -324,7 +339,7 @@ fn probe_primary(
     )
     .map_err(|_| ResyncError::PrimaryUnreachable)?;
 
-    let identity = expect_frame(&stream, T_IDENTITY)?;
+    let identity = expect_frame(&mut rd, T_IDENTITY)?;
     let same = identity.get(..16) == Some(&point.db_id[..])
         && identity.get(16..24).and_then(be_u64) == Some(point.timeline);
     if !same {
@@ -333,7 +348,7 @@ fn probe_primary(
         ));
     }
     write_frame(
-        &stream,
+        &mut wr,
         T_START,
         &[
             &point.db_id,
@@ -342,13 +357,13 @@ fn probe_primary(
         ],
     )
     .map_err(|_| ResyncError::PrimaryUnreachable)?;
-    expect_frame(&stream, T_OK)?;
+    expect_frame(&mut rd, T_OK)?;
     // Ack を送らず閉じる（保持位置の登録は切断で外れる）。
     Ok(())
 }
 
 /// ハンドシェイクのフレームを 1 つ読む。期待した型（本体 32 バイト）か `E`。それ以外はプロトコル違反。
-fn expect_frame(stream: &TcpStream, expect: u8) -> Result<Vec<u8>, ResyncError> {
+fn expect_frame(stream: &mut ConnReader, expect: u8) -> Result<Vec<u8>, ResyncError> {
     match read_frame(stream, MAX_HANDSHAKE_BODY, HANDSHAKE_TIMEOUT) {
         Ok((ty, body)) if ty == expect && body.len() == 32 => Ok(body),
         Ok((T_ERROR, body)) => {

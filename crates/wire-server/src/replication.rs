@@ -21,6 +21,12 @@
 //! | C→S | `R` Received | 受け取り済み（適用前）の最後の LSN u64（版数 2 のみ。単調増加・送信済み以下。保持位置は進めない） |
 //! | S→C | `E` Error | コード u8（文言は載せない） |
 //!
+//! TLS（Issue #2177・RECOVER-15 (3)・WIRE-9 ポインタ）: `--replication-tls-cert`／`--replication-tls-key` を構成すると
+//! リスナーは**全接続を TLS 1.3 必須**にする（ループバックの送信元も含む。平文への降格経路は無い）。接続の順序は
+//! 許可リスト → 失敗バックオフ → 認証前の枠 → 先頭 1 バイトが TLS の handshake レコードか確認（違えば何も返さず閉じる。
+//! 平文の Hello は解釈しない）→ TLS ハンドシェイク → 上記のフレーム（Hello 以降）。資格情報は TLS 確立後にだけ読む。
+//! 平文・TLS の差は [`crate::replication_conn`] の読み書きの半分が吸収する。
+//!
 //! 入力は untrusted: 長さは確保前に上限検証し、フレームの型・長さ・値（ack の単調性と上限）を検証して、
 //! 違反は固定コードの `E` を返して切断する。認証失敗は未知のロールと誤パスワードで同じ KDF コストと固定遅延
 //! （`auth::AUTH_FAILURE_DELAY`）を課し、区別できる応答を返さない。許可リスト外の送信元には何も返さず閉じる。
@@ -38,7 +44,7 @@
 
 use std::collections::VecDeque;
 use std::io::{BufWriter, Read, Write};
-use std::net::{Shutdown, TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -47,7 +53,9 @@ use engine::core::EngineCore;
 use engine::storage::StreamError;
 
 use crate::auth::{argon2id, AUTH_FAILURE_DELAY};
+use crate::replication_conn::{self, ConnReader, ConnWriter, ShutdownHandle};
 use crate::replication_opt::{ReplicationRoles, ReplicationSettings, MAX_ROLE_NAME_LEN};
+use crate::tls::server_handshake::perform_server_handshake_with_timeout;
 
 /// プロトコルの最小の版数（Hello で受け取る。`K` だけを送る）。
 pub const PROTOCOL_VERSION: u16 = 1;
@@ -94,6 +102,10 @@ const ACK_BODY_LEN: usize = 8;
 /// 延びない）。認証前の接続が枠を占有し続けないよう短くする。
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 const START_TIMEOUT: Duration = Duration::from_secs(5);
+/// TLS ハンドシェイク全体の絶対期限（認証前の枠を占有できる時間の上限）。
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// TLS の handshake レコードの先頭バイト（content type 22）。
+const TLS_HANDSHAKE_RECORD: u8 = 0x16;
 /// 認証前の同時接続数の上限（認証済みの枠 `max_connections` とは別枠）。
 const MAX_PRE_AUTH: usize = 16;
 /// 1 バッチで読むバイト数の上限（`max_unacked` とは別の固定上限。1 件でこれを超えるレコードは 1 件だけ返す）。
@@ -203,7 +215,7 @@ impl Server {
 
 /// `buf` を満たすまで読む。`deadline` を過ぎる、または切断されたら `Closed`。
 fn read_exact_by(
-    stream: &TcpStream,
+    stream: &mut ConnReader,
     buf: &mut [u8],
     deadline: Option<Instant>,
 ) -> Result<(), FrameError> {
@@ -223,7 +235,7 @@ fn read_exact_by(
             .set_read_timeout(timeout)
             .map_err(|_| FrameError::Closed)?;
         let dst = buf.get_mut(filled..).ok_or(FrameError::Closed)?;
-        match (&*stream).read(dst) {
+        match stream.read(dst) {
             Ok(0) | Err(_) => return Err(FrameError::Closed),
             Ok(n) => filled = filled.checked_add(n).ok_or(FrameError::Closed)?,
         }
@@ -233,7 +245,7 @@ fn read_exact_by(
 
 /// 1 フレームを読む。本体長は `max_body` 以内でなければ確保せずに `TooLarge`。
 fn read_frame(
-    stream: &TcpStream,
+    stream: &mut ConnReader,
     max_body: usize,
     deadline: Option<Instant>,
 ) -> Result<(u8, Vec<u8>), FrameError> {
@@ -266,10 +278,9 @@ fn write_frame(w: &mut impl Write, ty: u8, parts: &[&[u8]]) -> std::io::Result<(
 }
 
 /// 固定コードの `E` を書く（失敗は無視。切断直前の通知）。
-fn send_error(stream: &TcpStream, code: u8) {
-    let _ = stream.set_write_timeout(Some(NOTICE_TIMEOUT));
-    let mut w = stream;
-    let _ = write_frame(&mut w, T_ERROR, &[&[code]]);
+fn send_error(w: &mut ConnWriter, code: u8) {
+    let _ = w.set_write_timeout(Some(NOTICE_TIMEOUT));
+    let _ = write_frame(w, T_ERROR, &[&[code]]);
     let _ = w.flush();
 }
 
@@ -353,7 +364,8 @@ impl Shared {
 
 /// ack を読み続ける（レプリカ→プライマリの方向。別スレッド）。違反・切断で `failed` を立てて終わる。
 fn read_acks(
-    stream: &TcpStream,
+    mut stream: ConnReader,
+    closer: ShutdownHandle,
     shared: &Shared,
     pin: &engine::storage::ReplicaPin,
     version: u16,
@@ -362,7 +374,7 @@ fn read_acks(
     // 通常の切断（`Closed`）とプロトコル違反（型・長さ・値）を区別する。違反は理由を立てて抜け、送信ループが
     // `BAD_REQUEST` を書いてから切る（書き込みは送信ループだけが行うので、フレームは交錯しない）。
     let violation = loop {
-        let (is_received, lsn) = match read_frame(stream, ACK_BODY_LEN, None) {
+        let (is_received, lsn) = match read_frame(&mut stream, ACK_BODY_LEN, None) {
             Ok((T_ACK, body)) if body.len() == ACK_BODY_LEN => match be_u64(&body) {
                 Some(l) => (false, l),
                 None => break true,
@@ -421,14 +433,14 @@ fn read_acks(
         return;
     }
     shared.failed.store(true, Ordering::Release);
-    let _ = stream.shutdown(Shutdown::Both);
+    closer.shutdown();
 }
 
 /// 監視（別スレッド）。書き込みが `write`／`flush` でブロックしても判定できるよう、送信ループとは独立に動く。
 /// 最も古い未確認レコードが送信を始めてから `ack_timeout` を超えた、またはプライマリの最新との差（確認応答済みの
 /// 位置からの遅れ）が `max_lag_records` を超えたら切断の理由を立てる。送信ループが [`NOTICE_TIMEOUT`] の
 /// うちに通知を書いて抜けなければ、`shutdown` でブロックを解く。
-fn watchdog(stream: &TcpStream, core: &EngineCore, shared: &Shared, cfg: &ReplicationSettings) {
+fn watchdog(closer: ShutdownHandle, core: &EngineCore, shared: &Shared, cfg: &ReplicationSettings) {
     // プライマリの最新 LSN は送信ループのキャッシュに頼らず、この監視が read トランザクションで自分で読む
     // （窓が満杯・書き込みが塞がって送信ループが読まない間も遅れを判定するため）。取得に失敗したら
     // 保持位置を無期限に残さないよう、fail-closed に切断する。
@@ -474,7 +486,7 @@ fn watchdog(stream: &TcpStream, core: &EngineCore, shared: &Shared, cfg: &Replic
         while Instant::now() < grace && !shared.done.load(Ordering::Acquire) {
             std::thread::sleep(WATCHDOG_STEP);
         }
-        let _ = stream.shutdown(Shutdown::Both);
+        closer.shutdown();
         return;
     }
 }
@@ -493,18 +505,59 @@ fn stream_error_code(e: &StreamError) -> u8 {
     }
 }
 
-/// 1 接続を処理する（認証 → 開始位置 → 送信ループ）。
+/// TLS リスナーで、先頭 1 バイトが TLS の handshake レコードか（読み出しは消費しない）。平文の Hello を
+/// TLS ハンドシェイクへ渡して平文の alert を返したりしないよう、違えば呼び出し側が何も返さずに閉じる。
+fn starts_like_tls(stream: &TcpStream) -> bool {
+    if stream.set_read_timeout(Some(HELLO_TIMEOUT)).is_err() {
+        return false;
+    }
+    let mut probe = [0u8; 1];
+    matches!(stream.peek(&mut probe), Ok(1)) && probe == [TLS_HANDSHAKE_RECORD]
+}
+
+/// 受け付けた接続を読み書きの半分にする。TLS 構成なら TLS ハンドシェイクまでをここで終える（失敗は `None`。
+/// 何も返さずに閉じる。ハンドシェイクの失敗は認証失敗の表へ数えない: 資格情報の総当たりではなく、
+/// 認証前の枠と絶対期限で資源は有界）。資格情報を読むのは TLS 確立後だけ。
+fn open_conn(stream: TcpStream, cfg: &ReplicationSettings) -> Option<(ConnReader, ConnWriter)> {
+    let Some(tls) = cfg.tls.as_ref() else {
+        return replication_conn::plain(stream).ok();
+    };
+    let mut stream = stream;
+    if !starts_like_tls(&stream) {
+        engine::log_stderr!(
+            "wire-server: replication: refused a connection that did not start TLS"
+        );
+        return None;
+    }
+    let session = match perform_server_handshake_with_timeout(
+        &mut stream,
+        Arc::clone(tls),
+        TLS_HANDSHAKE_TIMEOUT,
+    ) {
+        Ok(s) => s,
+        Err(_) => {
+            engine::log_stderr!("wire-server: replication: TLS handshake failed");
+            return None;
+        }
+    };
+    replication_conn::tls(stream, session).ok()
+}
+
+/// 1 接続を処理する（TLS 確立 → 認証 → 開始位置 → 送信ループ）。
 fn handle(stream: TcpStream, peer: std::net::IpAddr, srv: &Server, pre_auth: SlotGuard) {
     let (core, cfg) = (&*srv.core, &srv.cfg);
     let _ = stream.set_nodelay(true);
-    if stream.set_write_timeout(Some(cfg.ack_timeout)).is_err() {
+    let Some((mut rd, mut wr)) = open_conn(stream, cfg) else {
+        return;
+    };
+    if wr.set_write_timeout(Some(cfg.ack_timeout)).is_err() {
         return;
     }
     let auth_start = Instant::now();
     let deadline = Some(Instant::now() + HELLO_TIMEOUT);
-    let (ty, body) = match read_frame(&stream, MAX_HELLO_BODY, deadline) {
+    let (ty, body) = match read_frame(&mut rd, MAX_HELLO_BODY, deadline) {
         Ok(f) => f,
-        Err(_) => return send_error(&stream, code::BAD_REQUEST),
+        Err(_) => return send_error(&mut wr, code::BAD_REQUEST),
     };
     let parsed = if ty == T_HELLO {
         parse_hello(&body)
@@ -512,11 +565,11 @@ fn handle(stream: TcpStream, peer: std::net::IpAddr, srv: &Server, pre_auth: Slo
         None
     };
     let Some((version, role, password)) = parsed else {
-        return send_error(&stream, code::BAD_REQUEST);
+        return send_error(&mut wr, code::BAD_REQUEST);
     };
     if !authenticate(&cfg.roles, role, password, auth_start) {
         srv.failures().record_failure(peer, Instant::now());
-        return send_error(&stream, code::AUTH_FAILED);
+        return send_error(&mut wr, code::AUTH_FAILED);
     }
     srv.failures().clear(peer);
     let role = role.to_string();
@@ -524,23 +577,22 @@ fn handle(stream: TcpStream, peer: std::net::IpAddr, srv: &Server, pre_auth: Slo
     drop(pre_auth);
     if srv.active.fetch_add(1, Ordering::AcqRel) >= cfg.max_connections {
         srv.active.fetch_sub(1, Ordering::AcqRel);
-        return send_error(&stream, code::BUSY);
+        return send_error(&mut wr, code::BUSY);
     }
     let _slot = SlotGuard(Arc::clone(&srv.active));
 
     // 認証成功の直後に識別子と最新 LSN を知らせる。レプリカは自分のベース（バックアップ）の識別子と
     // 照合してから Start を送る（サーバー側も Start で再度照合する）。
     let Some(identity) = core.change_log_stream_identity() else {
-        return send_error(&stream, code::INTERNAL);
+        return send_error(&mut wr, code::INTERNAL);
     };
     let first_current = match core.read_change_log_from(0, 0, 0) {
         Ok(b) => b.current_lsn,
-        Err(e) => return send_error(&stream, stream_error_code(&e)),
+        Err(e) => return send_error(&mut wr, stream_error_code(&e)),
     };
     {
-        let mut w = &stream;
         let ok = write_frame(
-            &mut w,
+            &mut wr,
             T_IDENTITY,
             &[
                 &identity.db_id,
@@ -548,64 +600,63 @@ fn handle(stream: TcpStream, peer: std::net::IpAddr, srv: &Server, pre_auth: Slo
                 &first_current.to_be_bytes(),
             ],
         )
-        .and_then(|()| w.flush());
+        .and_then(|()| wr.flush());
         if ok.is_err() {
             return;
         }
     }
 
     let deadline = Some(Instant::now() + START_TIMEOUT);
-    let start = match read_frame(&stream, START_BODY_LEN, deadline) {
+    let start = match read_frame(&mut rd, START_BODY_LEN, deadline) {
         Ok((T_START, body)) if body.len() == START_BODY_LEN => body,
-        _ => return send_error(&stream, code::BAD_REQUEST),
+        _ => return send_error(&mut wr, code::BAD_REQUEST),
     };
     let (Some(db_id), Some(timeline), Some(applied)) = (
         start.get(..16),
         start.get(16..24).and_then(be_u64),
         start.get(24..32).and_then(be_u64),
     ) else {
-        return send_error(&stream, code::BAD_REQUEST);
+        return send_error(&mut wr, code::BAD_REQUEST);
     };
     if db_id != identity.db_id || timeline != identity.timeline {
-        return send_error(&stream, code::FOREIGN);
+        return send_error(&mut wr, code::FOREIGN);
     }
     // 最初から遅れの上限を超えている位置からは始めさせない（保持を引き延ばさない。再同期が必要）。
     if first_current.saturating_sub(applied) > cfg.max_lag_records {
-        return send_error(&stream, code::RESYNC_REQUIRED);
+        return send_error(&mut wr, code::RESYNC_REQUIRED);
     }
     // 保持位置を登録してから、開始位置の存在を確かめる（engine が刈り込みとの競合を閉じる）。
     let pin = match core.pin_change_log_for_replica(applied) {
         Ok(p) => Arc::new(p),
-        Err(e) => return send_error(&stream, stream_error_code(&e)),
+        Err(e) => return send_error(&mut wr, stream_error_code(&e)),
     };
     let current = match applied
         .checked_add(1)
         .map(|next| core.read_change_log_from(next, 0, 0))
     {
         Some(Ok(b)) => b.current_lsn,
-        Some(Err(e)) => return send_error(&stream, stream_error_code(&e)),
-        None => return send_error(&stream, code::AHEAD),
+        Some(Err(e)) => return send_error(&mut wr, stream_error_code(&e)),
+        None => return send_error(&mut wr, code::AHEAD),
     };
     // Identity から Start までの間（最大 START_TIMEOUT）に commit が進みうる。保持位置を登録した直後に取り直した
     // 最新 LSN で遅れを再判定し、超えていれば登録（`pin`）を外して再同期を促す。
     if current.saturating_sub(applied) > cfg.max_lag_records {
-        return send_error(&stream, code::RESYNC_REQUIRED);
+        return send_error(&mut wr, code::RESYNC_REQUIRED);
     }
     // 同期レプリケーションの対象ロールなら、位置の追跡を始める（同じロールの 2 本目は断る）。ハンドルは
     // 接続の終わりまで持ち、`Drop` で位置を外して待機側を起こす。非対象のロール・同期無効では何もしない。
     let standby = match core.sync_commit().map(|c| c.attach_standby(&role, applied)) {
-        Some(Err(_)) => return send_error(&stream, code::BUSY),
+        Some(Err(_)) => return send_error(&mut wr, code::BUSY),
         Some(Ok(h)) => h,
         None => None,
     };
     // Ok の書き込みは短い期限にする（読まないレプリカで、監視が動き出す前に保持位置が残り続けない）。
-    if stream.set_write_timeout(Some(START_TIMEOUT)).is_err() {
+    if wr.set_write_timeout(Some(START_TIMEOUT)).is_err() {
         return;
     }
     {
-        let mut w = &stream;
         let ok = write_frame(
-            &mut w,
+            &mut wr,
             T_OK,
             &[
                 &identity.db_id,
@@ -613,23 +664,25 @@ fn handle(stream: TcpStream, peer: std::net::IpAddr, srv: &Server, pre_auth: Slo
                 &current.to_be_bytes(),
             ],
         )
-        .and_then(|()| w.flush());
+        .and_then(|()| wr.flush());
         if ok.is_err() {
             return;
         }
     }
-    if stream.set_write_timeout(Some(cfg.ack_timeout)).is_err() {
+    if wr.set_write_timeout(Some(cfg.ack_timeout)).is_err() {
         return;
     }
     engine::log_stderr!("wire-server: replication: replica '{role}' connected");
-    let reason = stream_loop(&stream, core, cfg, applied, &pin, version, standby.as_ref());
+    let reason = stream_loop(rd, wr, core, cfg, applied, &pin, version, standby.as_ref());
     engine::log_stderr!("wire-server: replication: replica '{role}' disconnected ({reason})");
 }
 
 /// 送信ループ。終了理由（運用者向けの固定語）を返す。ack の読み取りと監視を同じ接続の別スレッドで動かし、
 /// 抜けるときは必ず `shutdown` でそれらを止めてから返す。
+#[allow(clippy::too_many_arguments)]
 fn stream_loop(
-    stream: &TcpStream,
+    reader: ConnReader,
+    mut writer: ConnWriter,
     core: &EngineCore,
     cfg: &ReplicationSettings,
     applied: u64,
@@ -649,29 +702,31 @@ fn stream_loop(
         done: AtomicBool::new(false),
         cut: std::sync::atomic::AtomicU8::new(CUT_NONE),
     };
-    let Ok(clone) = stream.try_clone() else {
+    // 監視・ack の読み取りは、同じソケットを閉じるハンドルで送信ループのブロックを解く。
+    let (Ok(ack_closer), Ok(watch_closer)) = (reader.shutdown_handle(), reader.shutdown_handle())
+    else {
         return "internal error";
     };
     std::thread::scope(|scope| {
-        let (shared, clone) = (&shared, &clone);
-        scope.spawn(move || read_acks(clone, shared, pin, version, standby));
-        scope.spawn(move || watchdog(clone, core, shared, cfg));
-        let reason = send_records(stream, core, cfg, applied, shared);
+        let shared = &shared;
+        scope.spawn(move || read_acks(reader, ack_closer, shared, pin, version, standby));
+        scope.spawn(move || watchdog(watch_closer, core, shared, cfg));
+        let reason = send_records(&mut writer, core, cfg, applied, shared);
         shared.done.store(true, Ordering::Release);
-        let _ = stream.shutdown(Shutdown::Both);
+        writer.shutdown();
         reason
     })
 }
 
 /// レコードを送り続ける（書き込み側）。
 fn send_records(
-    stream: &TcpStream,
+    stream: &mut ConnWriter,
     core: &EngineCore,
     cfg: &ReplicationSettings,
     applied: u64,
     shared: &Shared,
 ) -> &'static str {
-    let mut out = BufWriter::with_capacity(64 * 1024, stream);
+    let mut out = BufWriter::with_capacity(64 * 1024, &mut *stream);
     let mut next = match applied.checked_add(1) {
         Some(n) => n,
         None => return "internal error",
@@ -687,19 +742,19 @@ fn send_records(
         // 監視が切断を決めたら、通知を書いて抜ける（ack の待機上限・遅れの上限）。
         match shared.cut.load(Ordering::Acquire) {
             CUT_ACK_TIMEOUT => {
-                send_error(stream, code::BACKPRESSURE);
+                send_error(out.get_mut(), code::BACKPRESSURE);
                 return "unacknowledged data timed out";
             }
             CUT_LAG => {
-                send_error(stream, code::RESYNC_REQUIRED);
+                send_error(out.get_mut(), code::RESYNC_REQUIRED);
                 return "replica lag limit exceeded";
             }
             CUT_INTERNAL => {
-                send_error(stream, code::INTERNAL);
+                send_error(out.get_mut(), code::INTERNAL);
                 return "log position unavailable";
             }
             CUT_PROTOCOL => {
-                send_error(stream, code::BAD_REQUEST);
+                send_error(out.get_mut(), code::BAD_REQUEST);
                 return "replica violated the protocol";
             }
             _ => {}
@@ -728,7 +783,7 @@ fn send_records(
                     b.records
                 }
                 Err(e) => {
-                    send_error(stream, stream_error_code(&e));
+                    send_error(out.get_mut(), stream_error_code(&e));
                     return "log read failed";
                 }
             }
@@ -820,7 +875,12 @@ pub fn spawn_server(
                 // 認証前の枠（認証済みの枠とは別）。満杯なら断る。
                 if srv.pre_auth.fetch_add(1, Ordering::AcqRel) >= MAX_PRE_AUTH {
                     srv.pre_auth.fetch_sub(1, Ordering::AcqRel);
-                    send_error(&conn, code::BUSY);
+                    // TLS リスナーは平文のフレームを書かない（何も返さずに閉じる）。
+                    if srv.cfg.tls.is_none() {
+                        if let Ok((_, mut w)) = replication_conn::plain(conn) {
+                            send_error(&mut w, code::BUSY);
+                        }
+                    }
                     continue;
                 }
                 let pre = SlotGuard(Arc::clone(&srv.pre_auth));
@@ -874,11 +934,12 @@ mod tests {
         let addr = l.local_addr().expect("addr");
         let mut c = TcpStream::connect(addr).expect("connect");
         let (s, _) = l.accept().expect("accept");
+        let (mut sr, _sw) = replication_conn::plain(s).expect("split");
         write_frame(&mut c, T_ACK, &[&7u64.to_be_bytes()]).expect("write");
-        let (ty, body) = read_frame(&s, 8, None).expect("read");
+        let (ty, body) = read_frame(&mut sr, 8, None).expect("read");
         assert_eq!((ty, be_u64(&body)), (T_ACK, Some(7)));
         write_frame(&mut c, T_ACK, &[&[0u8; 9]]).expect("write");
-        assert_eq!(read_frame(&s, 8, None), Err(FrameError::TooLarge));
+        assert_eq!(read_frame(&mut sr, 8, None), Err(FrameError::TooLarge));
     }
 
     #[test]
