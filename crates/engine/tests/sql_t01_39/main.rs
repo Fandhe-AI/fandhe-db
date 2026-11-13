@@ -42,6 +42,7 @@ mod sql31_serialization_failure;
 mod sql31_serialization_failure_concurrent;
 mod sql31_serialization_failure_tenants;
 mod sql31_snapshot_switch;
+mod sql31_trailing_semicolon;
 mod sql31_transaction;
 mod sql31_txn_dml;
 mod sql31_txn_file_insert_using_plan;
