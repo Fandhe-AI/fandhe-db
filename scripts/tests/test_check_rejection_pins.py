@@ -181,6 +181,33 @@ class FindTestsTest(unittest.TestCase):
         v = run_check(P, "fn base() {\n}\n", "fn base() {\n}\n" + body)
         self.assertEqual(kinds(v), ["missing-annotation"])
 
+    def test_test_attr_with_trailing_block_comment(self):
+        (t,) = crp.find_tests("#[test] /* regression */\nfn a() {\n}\n")
+        self.assertEqual(t.name, "a")
+        body = '#[test] /* regression */\nfn a() {\n    f("0A000");\n}\n'
+        v = run_check(P, "fn base() {\n}\n", "fn base() {\n}\n" + body)
+        self.assertEqual(kinds(v), ["missing-annotation"])
+
+    def test_test_attr_with_multiline_block_comment(self):
+        (t,) = crp.find_tests("#[test] /* a\n b */\nfn a() {\n}\n")
+        self.assertEqual(t.name, "a")
+
+    def test_block_comment_opener_inside_raw_string_does_not_hide_later_tests(self):
+        base = 'fn s() {\n    let x = r#"\n/* not a comment\n"#;\n}\n'
+        new = base + '#[test]\nfn pin() {\n    f("0A000");\n}\n'
+        (t,) = crp.find_tests(new)
+        self.assertEqual(t.name, "pin")
+        v = run_check(P, base, new)
+        self.assertEqual(kinds(v), ["missing-annotation"])
+
+    def test_block_comment_opener_inside_plain_multiline_string(self):
+        src = 'const S: &str = "a\n/* b";\n#[test]\nfn pin() {\n}\n'
+        (t,) = crp.find_tests(src)
+        self.assertEqual(t.name, "pin")
+
+    def test_test_inside_real_block_comment_is_ignored(self):
+        self.assertEqual(crp.find_tests("/*\n#[test]\nfn a() {\n}\n*/\n"), [])
+
 
 class CheckTest(unittest.TestCase):
     def added(self, new, **kw):

@@ -57,7 +57,10 @@ _FN_RE = re.compile(
     r'(?:extern\s+"[^"]*"\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)',
     _A,
 )
-_TEST_ATTR_RE = re.compile(r"^\s*#\[test\]\s*(?://.*)?$", _A)
+# コメントを除いた属性テキスト全体が `#[test]` のときだけテスト属性とみなす（D4）
+_TEST_ATTR_RE = re.compile(r"^\s*#\s*\[\s*test\s*\]\s*$", _A)
+_RAW_OPEN_RE = re.compile(r'b?r(#*)"', _A)
+_CHAR_LIT_RE = re.compile(r"'(?:\\.[^']*|[^'\\])'", _A)
 _ONE_LINE_FN_RE = re.compile(r"\{\s*\}\s*$", _A)
 
 _DIFF_HEADER_RE = re.compile(r"^diff --git a/(.+) b/(.+)$")
@@ -277,6 +280,98 @@ def _scan_attribute(lines: List[str], start: int) -> int:
     raise DiffParseError("cannot find the end of an attribute (unterminated string/bracket)")
 
 
+def _lex(text: str) -> Tuple[str, List[str]]:
+    """Rust ソースを走査し (コメントを空白化した同長テキスト, 各行頭の状態) を返す。
+
+    状態は "code" / "comment"（ブロックコメント内）/ "string"（文字列・raw 文字列内）。
+    行単位の判定が文字列内の `/*` をコメント開始と誤認して後続を読み飛ばすのを防ぐ（fail-closed）。
+    """
+    out: List[str] = []
+    states: List[str] = ["code"]
+    n = len(text)
+    i = 0
+    depth = 0
+    raw: Optional[int] = None
+    in_str = False
+
+    def state() -> str:
+        if depth:
+            return "comment"
+        return "string" if (raw is not None or in_str) else "code"
+
+    def emit(chunk: str, masked: str) -> None:
+        out.append(masked)
+        if chunk.endswith("\n"):
+            states.append(state())
+
+    while i < n:
+        c = text[i]
+        if depth:
+            if text.startswith("*/", i):
+                depth -= 1
+                emit("*/", "  ")
+                i += 2
+            elif text.startswith("/*", i):
+                depth += 1
+                emit("/*", "  ")
+                i += 2
+            else:
+                emit(c, "\n" if c == "\n" else " ")
+                i += 1
+            continue
+        if raw is not None:
+            if c == '"' and text.startswith("#" * raw, i + 1):
+                raw_len = 1 + raw
+                raw = None
+                emit(text[i:i + raw_len], text[i:i + raw_len])
+                i += raw_len
+            else:
+                emit(c, c)
+                i += 1
+            continue
+        if in_str:
+            if c == "\\" and i + 1 < n:
+                emit(text[i:i + 2], text[i:i + 2])
+                i += 2
+            else:
+                if c == '"':
+                    in_str = False
+                emit(c, c)
+                i += 1
+            continue
+        if text.startswith("//", i):
+            j = text.find("\n", i)
+            j = n if j < 0 else j
+            out.append(" " * (j - i))
+            i = j
+            continue
+        if text.startswith("/*", i):
+            depth += 1
+            emit("/*", "  ")
+            i += 2
+            continue
+        rm = _RAW_OPEN_RE.match(text, i)
+        if rm and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")):
+            raw = len(rm.group(1))
+            emit(rm.group(0), rm.group(0))
+            i = rm.end()
+            continue
+        if c == '"':
+            in_str = True
+            emit(c, c)
+            i += 1
+            continue
+        if c == "'":
+            cm = _CHAR_LIT_RE.match(text, i)
+            if cm:
+                emit(cm.group(0), cm.group(0))
+                i = cm.end()
+                continue
+        emit(c, c)
+        i += 1
+    return "".join(out), states
+
+
 _MOD_RE = re.compile(
     r"^(\s*)(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{"
     r"\s*(?://.*|/\*.*?\*/\s*)?$"
@@ -321,7 +416,8 @@ def find_tests(text: str) -> List[TestRange]:
     # （空行を挟んでも有効なテストが検査対象から消えない）。
     has_test = False
     test_line = 0
-    in_block_cmt = False
+    masked_lines, line_states = _lex(text)
+    masked = masked_lines.split("\n")
     mod_stack: List[Tuple[str, str]] = []  # (インデント, モジュール名)
     i = 0
     n = len(lines)
@@ -329,9 +425,8 @@ def find_tests(text: str) -> List[TestRange]:
         ln = i + 1
         line = lines[i]
         stripped = line.strip()
-        if in_block_cmt:
-            if "*/" in line:
-                in_block_cmt = False
+        if i < len(line_states) and line_states[i] != "code":
+            # ブロックコメント・文字列（raw 含む）の内側の行。コード・注記として解釈しない
             block = []
             i += 1
             continue
@@ -340,8 +435,6 @@ def find_tests(text: str) -> List[TestRange]:
             i += 1
             continue
         if stripped.startswith("/*"):
-            if "*/" not in stripped[2:]:
-                in_block_cmt = True
             block = []
             i += 1
             continue
@@ -368,10 +461,11 @@ def find_tests(text: str) -> List[TestRange]:
             end_i = _scan_attribute(lines, i)
             for k in range(i, end_i + 1):
                 block.append((k + 1, lines[k]))
-                if _TEST_ATTR_RE.match(lines[k]):
-                    if not has_test:
-                        test_line = k + 1
-                    has_test = True
+            # コメントを除いた属性全体の構造で `#[test]` を判定する（末尾のブロックコメントを許容）
+            if _TEST_ATTR_RE.match(" ".join(masked[i:end_i + 1])):
+                if not has_test:
+                    test_line = i + 1
+                has_test = True
             i = end_i + 1
             continue
         m = _FN_RE.match(line)
