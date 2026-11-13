@@ -293,3 +293,57 @@ fn error_contract_matches_scalar_reference() {
         .expect("simd ok");
     assert!(simd_k0.is_empty());
 }
+
+/// Issue #3216（ポインタ: SQL-33・CORE-3）: `search_cosine`／`search_cosine_subset` の並列版が
+/// 参照 provider（単一スレッド）と距離のビットまで一致する。n は並列経路に入る規模。
+#[test]
+fn cosine_parallel_matches_scalar_reference_bitwise() {
+    use engine::kernel::{CosineSearchInput, DistanceHit, SubsetSearchInput};
+
+    let bits = |h: &[DistanceHit]| -> Vec<(u64, u64)> {
+        h.iter().map(|x| (x.id, x.distance.to_bits())).collect()
+    };
+    for (n, dim) in [(5000usize, 32usize), (23000, 128)] {
+        let (ids, mut vectors, query) = synth_case(0xC051_0000 + n as u64, n, dim);
+        // 同点・ゼロノルム・オーバーフロー行を境界をまたぐ位置に置く。
+        let dup: Vec<f32> = vectors[..dim].to_vec();
+        for r in [n / 3, n / 2, n - 1] {
+            vectors[r * dim..(r + 1) * dim].copy_from_slice(&dup);
+        }
+        vectors[7 * dim..8 * dim].fill(0.0);
+        vectors[9 * dim..10 * dim].fill(1.0e30);
+        let norms = engine::kernel::row_norms_sq(&vectors, dim as u32).expect("norms");
+        let slots: Vec<u32> = (0..n as u32).filter(|s| s % 5 != 2).collect();
+        for k in [1usize, 10, 400, n + 5] {
+            for row_norms_sq in [None, Some(&norms[..])] {
+                let mk = || CosineSearchInput {
+                    ids: &ids,
+                    vectors: &vectors,
+                    row_norms_sq,
+                    dim: dim as u32,
+                    query: &query,
+                    k,
+                };
+                let want = CpuScalarProvider.search_cosine(mk()).expect("scalar");
+                let got = ParallelSearchProvider
+                    .search_cosine(mk())
+                    .expect("parallel");
+                assert_eq!(bits(&got), bits(&want), "n={n} dim={dim} k={k}");
+            }
+            let mk = || SubsetSearchInput {
+                slots: &slots,
+                vectors: &vectors,
+                dim: dim as u32,
+                query: &query,
+                k,
+            };
+            let want = CpuScalarProvider
+                .search_cosine_subset(mk())
+                .expect("scalar");
+            let got = ParallelSearchProvider
+                .search_cosine_subset(mk())
+                .expect("parallel");
+            assert_eq!(bits(&got), bits(&want), "subset n={n} dim={dim} k={k}");
+        }
+    }
+}

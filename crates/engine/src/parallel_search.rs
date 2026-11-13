@@ -31,9 +31,14 @@
 //! ワーカー予算調停」を単一の実装に統一するため（構築側は `MAX_BUILD_THREADS`
 //! という別名の定数で同値を持つ）。本モジュール自身の並列検索の挙動・
 //! エラー契約は変わらない。
+//!
+//! コサイン距離（`<=>`）の経路も同じ分割方針（`MIN_ROWS_PER_THREAD`・`MAX_THREADS_PER_QUERY`・
+//! `GLOBAL_WORKER_BUDGET`）で並列化する（Issue #3216。`search_cosine`／`search_cosine_subset`）。
+//! 行ループは `kernel/cosine.rs` の `cosine_range` を単一版と共有し、結果はビット一致する。
 
 use crate::kernel::{
-    CandidateHit, KernelError, SearchInput, SearchProvider, SubsetSearchInput, TopKSelector,
+    cosine_range, cosine_range_by_slots, dot, AscDistanceTopK, CandidateHit, CosineSearchInput,
+    DistanceHit, KernelError, SearchInput, SearchProvider, SubsetSearchInput, TopKSelector,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -245,6 +250,150 @@ impl SearchProvider for ParallelSearchProvider {
         }
         Ok(merged.into_sorted_vec())
     }
+
+    /// コサイン距離（`<=>`）の並列 Top-k（Issue #3216。ポインタ: SQL-33・CORE-3）。
+    /// 並列度・ワーカー予算調停は [`SearchProvider::search`] と共通で、各ワーカーは
+    /// 単一スレッド版 [`crate::kernel::cosine_top_k`] と同じ行ループ（`cosine_range`）を担当範囲に
+    /// 対して実行する。部分 Top-k は距離昇順・同点 id 昇順・NaN 末尾の全順序で再マージするため、
+    /// 分割数に依らず結果は単一版とビット一致する。
+    fn search_cosine(&self, input: CosineSearchInput<'_>) -> Result<Vec<DistanceHit>, KernelError> {
+        let (effective_threads, _budget_guard) = acquire_execution_threads(input.ids.len());
+        search_cosine_partitioned(input, effective_threads)
+    }
+
+    /// [`Self::search_cosine`] のスロット指定版（スカラー索引の候補マスク・NULL を含む VECTOR 列の
+    /// 経路。Issue #3216）。既定実装の gather（スロット数 × dim のコピー）を避け、`slots` を
+    /// ワーカー数分に分割して `cosine_range_by_slots` を実行する。
+    fn search_cosine_subset(
+        &self,
+        input: SubsetSearchInput<'_>,
+    ) -> Result<Vec<DistanceHit>, KernelError> {
+        let (effective_threads, _budget_guard) = acquire_execution_threads(input.slots.len());
+        search_cosine_subset_partitioned(input, effective_threads)
+    }
+}
+
+/// 部分 Top-k を `AscDistanceTopK` へ再投入してマージし、距離昇順で確定する。
+fn merge_cosine_partials(partials: Vec<AscDistanceTopK>, k: usize) -> Vec<DistanceHit> {
+    let mut merged = AscDistanceTopK::new(k);
+    for partial in partials {
+        for hit in partial.into_sorted_vec() {
+            merged.push(hit);
+        }
+    }
+    merged.into_sorted_vec()
+}
+
+/// 分割数 `partitions` を明示して [`ParallelSearchProvider::search_cosine`] の本体を実行する
+/// （予算確保は呼び出し元。単体テストがコア数に依らず分割数を振るために分離している）。
+/// 検証順は `cosine_top_k` と同一（次元 → 非有限クエリ → k==0/空 → norms 長）。
+pub(crate) fn search_cosine_partitioned(
+    input: CosineSearchInput<'_>,
+    partitions: usize,
+) -> Result<Vec<DistanceHit>, KernelError> {
+    let dim = input.dim as usize;
+    if input.query.len() != dim {
+        return Err(KernelError::DimMismatch {
+            expected: input.dim,
+            found: input.query.len(),
+        });
+    }
+    if input.query.iter().any(|v| !v.is_finite()) {
+        return Err(KernelError::NonFiniteQuery);
+    }
+    if input.k == 0 || input.ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let q_norm_sq = dot(input.query, input.query);
+    // 長さ不一致の norms は分割前に一度だけ無視する（C1 へ縮退。結果はビット一致）。
+    let norms = input.row_norms_sq.filter(|n| n.len() == input.ids.len());
+    let row_count = input.ids.len();
+    let partitions = partitions.clamp(1, row_count);
+
+    if partitions == 1 {
+        return Ok(cosine_range(
+            input.ids,
+            input.vectors,
+            0,
+            dim,
+            input.query,
+            q_norm_sq,
+            norms,
+            input.k,
+        )
+        .into_sorted_vec());
+    }
+
+    let rows_per_thread = row_count.div_ceil(partitions);
+    let partials = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(partitions);
+        let mut row_start = 0usize;
+        while row_start < row_count {
+            let row_end = row_start.saturating_add(rows_per_thread).min(row_count);
+            let ids_slice = input.ids.get(row_start..row_end).unwrap_or(&[]);
+            let (vectors, query, k) = (input.vectors, input.query, input.k);
+            handles.push(scope.spawn(move || {
+                cosine_range(
+                    ids_slice, vectors, row_start, dim, query, q_norm_sq, norms, k,
+                )
+            }));
+            row_start = row_end;
+        }
+        join_all_or_panicked(handles)
+    })?;
+    Ok(merge_cosine_partials(partials, input.k))
+}
+
+/// [`search_cosine_partitioned`] のスロット指定版。
+pub(crate) fn search_cosine_subset_partitioned(
+    input: SubsetSearchInput<'_>,
+    partitions: usize,
+) -> Result<Vec<DistanceHit>, KernelError> {
+    let dim = input.dim as usize;
+    if input.query.len() != dim {
+        return Err(KernelError::DimMismatch {
+            expected: input.dim,
+            found: input.query.len(),
+        });
+    }
+    if input.query.iter().any(|v| !v.is_finite()) {
+        return Err(KernelError::NonFiniteQuery);
+    }
+    if input.k == 0 || input.slots.is_empty() {
+        return Ok(Vec::new());
+    }
+    let q_norm_sq = dot(input.query, input.query);
+    let slot_count = input.slots.len();
+    let partitions = partitions.clamp(1, slot_count);
+
+    if partitions == 1 {
+        return Ok(cosine_range_by_slots(
+            input.slots,
+            input.vectors,
+            dim,
+            input.query,
+            q_norm_sq,
+            input.k,
+        )
+        .into_sorted_vec());
+    }
+
+    let slots_per_thread = slot_count.div_ceil(partitions);
+    let partials = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(partitions);
+        let mut start = 0usize;
+        while start < slot_count {
+            let end = start.saturating_add(slots_per_thread).min(slot_count);
+            let slots_slice = input.slots.get(start..end).unwrap_or(&[]);
+            let (vectors, query, k) = (input.vectors, input.query, input.k);
+            handles.push(scope.spawn(move || {
+                cosine_range_by_slots(slots_slice, vectors, dim, query, q_norm_sq, k)
+            }));
+            start = end;
+        }
+        join_all_or_panicked(handles)
+    })?;
+    Ok(merge_cosine_partials(partials, input.k))
 }
 
 /// [`ParallelSearchProvider::search`]・[`ParallelSearchProvider::search_subset`]
@@ -344,9 +493,9 @@ fn search_range_by_slots(
 /// `KernelError::WorkerPanicked` へのマッピング（fail-closed）に到達せず、呼び出し元まで
 /// panic が伝播してしまう（Cursor Bugbot 指摘対応）。本関数は先に全ハンドルを `join()` し
 /// 尽くしてから判定することでこれを避ける。
-fn join_all_or_panicked(
-    handles: Vec<std::thread::ScopedJoinHandle<'_, TopKSelector>>,
-) -> Result<Vec<TopKSelector>, KernelError> {
+fn join_all_or_panicked<T>(
+    handles: Vec<std::thread::ScopedJoinHandle<'_, T>>,
+) -> Result<Vec<T>, KernelError> {
     let join_results: Vec<_> = handles.into_iter().map(|h| h.join()).collect();
     let mut partials = Vec::with_capacity(join_results.len());
     let mut any_panicked = false;
@@ -1032,5 +1181,155 @@ mod tests {
                 CandidateHit { id: 0, score: 1.0 },
             ]
         );
+    }
+    /// Issue #3216: コサイン並列版の単体テスト用の決定的な疑似乱数（外部クレート非依存）。
+    fn cosine_fixture(rows: usize, dim: usize) -> (Vec<u64>, Vec<f32>) {
+        let mut x: u32 = 0x9E37_79B9;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            (x % 2001) as f32 / 1000.0 - 1.0
+        };
+        let ids: Vec<u64> = (0..rows as u64).map(|i| i + 100).collect();
+        let mut vectors: Vec<f32> = (0..rows * dim).map(|_| next()).collect();
+        // 同点（重複ベクトル）・ゼロノルム・f32 オーバーフロー行を境界をまたぐ位置へ混ぜる。
+        if rows > 40 {
+            let dup: Vec<f32> = vectors[3 * dim..4 * dim].to_vec();
+            for r in [13usize, 21, 22, 37] {
+                vectors[r * dim..(r + 1) * dim].copy_from_slice(&dup);
+            }
+            vectors[5 * dim..6 * dim].fill(0.0);
+            vectors[17 * dim..18 * dim].fill(1.0e30);
+        }
+        (ids, vectors)
+    }
+
+    fn bits(hits: &[DistanceHit]) -> Vec<(u64, u64)> {
+        hits.iter().map(|h| (h.id, h.distance.to_bits())).collect()
+    }
+
+    #[test]
+    fn cosine_partitioned_is_bit_identical_to_single_thread() {
+        let dim = 7usize;
+        let query: Vec<f32> = (0..dim).map(|i| i as f32 * 0.3 - 0.7).collect();
+        for rows in [0usize, 1, 3, 4, 5, 41, 63, 130] {
+            let (ids, vectors) = cosine_fixture(rows, dim);
+            let norms = crate::kernel::row_norms_sq(&vectors, dim as u32).expect("norms");
+            let short_norms = vec![1.0f32; rows.saturating_add(1)];
+            for k in [0usize, 1, 5, rows, rows + 9] {
+                for norms_opt in [None, Some(&norms[..]), Some(&short_norms[..])] {
+                    let mk = || CosineSearchInput {
+                        ids: &ids,
+                        vectors: &vectors,
+                        row_norms_sq: norms_opt,
+                        dim: dim as u32,
+                        query: &query,
+                        k,
+                    };
+                    let reference = crate::kernel::cosine_top_k(mk()).expect("ref");
+                    for parts in [1usize, 2, 3, 16] {
+                        let got = search_cosine_partitioned(mk(), parts).expect("par");
+                        assert_eq!(
+                            bits(&got),
+                            bits(&reference),
+                            "rows={rows} k={k} parts={parts}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cosine_partitioned_skips_only_missing_rows() {
+        let dim = 4usize;
+        let (ids, mut vectors) = cosine_fixture(50, dim);
+        vectors.truncate(30 * dim + 2); // 末尾が欠ける（行 30 以降が範囲外）
+        let query = [0.5f32, -0.25, 1.0, 0.125];
+        let mk = || CosineSearchInput {
+            ids: &ids,
+            vectors: &vectors,
+            row_norms_sq: None,
+            dim: dim as u32,
+            query: &query,
+            k: 100,
+        };
+        let reference = crate::kernel::cosine_top_k(mk()).expect("ref");
+        assert_eq!(reference.len(), 30);
+        for parts in [2usize, 3, 16] {
+            let got = search_cosine_partitioned(mk(), parts).expect("par");
+            assert_eq!(bits(&got), bits(&reference), "parts={parts}");
+        }
+    }
+
+    #[test]
+    fn cosine_subset_partitioned_is_bit_identical_to_slots_kernel() {
+        let dim = 6usize;
+        let (_, vectors) = cosine_fixture(120, dim);
+        let query: Vec<f32> = (0..dim).map(|i| 0.4 - i as f32 * 0.1).collect();
+        // 範囲外スロット（200 以降）と 4 の倍数でない件数を含める。
+        let slots: Vec<u32> = (0..120u32).filter(|s| s % 3 != 1).chain(200..203).collect();
+        for k in [0usize, 1, 10, 1000] {
+            let mk = || SubsetSearchInput {
+                slots: &slots,
+                vectors: &vectors,
+                dim: dim as u32,
+                query: &query,
+                k,
+            };
+            let reference = crate::kernel::cosine_top_k_slots(mk()).expect("ref");
+            for parts in [1usize, 2, 3, 16] {
+                let got = search_cosine_subset_partitioned(mk(), parts).expect("par");
+                assert_eq!(bits(&got), bits(&reference), "k={k} parts={parts}");
+            }
+        }
+    }
+
+    #[test]
+    fn cosine_error_contract_matches_single_thread() {
+        let ids = [1u64, 2];
+        let vectors = [1.0f32, 0.0, 0.0, 1.0];
+        let mk = |query: &'static [f32], k: usize| CosineSearchInput {
+            ids: &ids,
+            vectors: &vectors,
+            row_norms_sq: None,
+            dim: 2,
+            query,
+            k,
+        };
+        assert_eq!(
+            search_cosine_partitioned(mk(&[1.0], 1), 2),
+            Err(KernelError::DimMismatch {
+                expected: 2,
+                found: 1
+            })
+        );
+        assert_eq!(
+            search_cosine_partitioned(mk(&[f32::NAN, 0.0], 1), 2),
+            Err(KernelError::NonFiniteQuery)
+        );
+        assert_eq!(search_cosine_partitioned(mk(&[1.0, 0.0], 0), 2), Ok(vec![]));
+    }
+
+    #[test]
+    fn cosine_real_parallel_path_is_deterministic_and_matches_reference() {
+        let dim = 8usize;
+        let rows = MIN_ROWS_PER_THREAD * 4 + 7;
+        let (ids, vectors) = cosine_fixture(rows, dim);
+        let query: Vec<f32> = (0..dim).map(|i| (i as f32).sin()).collect();
+        let mk = || CosineSearchInput {
+            ids: &ids,
+            vectors: &vectors,
+            row_norms_sq: None,
+            dim: dim as u32,
+            query: &query,
+            k: 25,
+        };
+        let a = ParallelSearchProvider.search_cosine(mk()).expect("a");
+        let b = ParallelSearchProvider.search_cosine(mk()).expect("b");
+        let reference = crate::kernel::cosine_top_k(mk()).expect("ref");
+        assert_eq!(bits(&a), bits(&b));
+        assert_eq!(bits(&a), bits(&reference));
     }
 }

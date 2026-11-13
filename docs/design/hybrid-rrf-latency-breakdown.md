@@ -1905,3 +1905,22 @@ warmup 20・measured 30 × rounds 5 = 250）であり、`sql_arena_hits`／
 - 改善候補 P1〜P4 の実装は本 Issue では行わない
 - production コード（`crates/engine/src/`・`crates/wire-server/src/`）は
   無変更・テスト・ベンチ・docs 専任
+
+## Issue #3216: コサイン経路の並列化の A/B
+
+`ParallelSearchProvider` に `search_cosine`／`search_cosine_subset` を実装し、`<=>` の行ループを
+内積経路と同じ分割方針（`MIN_ROWS_PER_THREAD`・`MAX_THREADS_PER_QUERY`・`GLOBAL_WORKER_BUDGET`）で
+並列化した。結果は単一スレッド版とビット一致する。
+
+計測は `aggregate-regression-bisect/run_bisect_step.sh`（25,000 行・128 次元・self exact）で、
+変更前 `3c8056a9` を 3 回、変更後を 2 回。Apple M4 Max の共有機（loadavg 約 20〜23）で取った
+**参考値**で、判定は min-of-N。生データは `bench-data/cosine-parallel-3216/`。
+
+| phase | 対応する形 | 変更前 p50（各回, min） | 変更後 p50（各回, min） |
+| ----- | ---------- | ----------------------- | ----------------------- |
+| `mode_precision` | k10 | 872 / 901 / 909 µs（872） | 542 / 555 µs（542） |
+| `hybrid_rrf` | k400（密側） | 2567 / 2814 / 2808 µs（2567） | 2487 / 2472 µs（2472） |
+| `bulk_hybrid_k200` | k400（密側） | 2699 / 4842 / 2821 µs（2699） | 2607 / 2535 µs（2535） |
+
+3 phase とも p50 の min は変更前より下がった。k10 の改善（約 330 µs）が最も大きい。hybrid 系は
+BM25・RRF 融合などコサイン以外の段が支配的なため、下げ幅は小さい。
