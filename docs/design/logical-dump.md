@@ -100,7 +100,7 @@ DDL へ戻す手段が無い種別・属性があれば `Unsupported` でダン�
 ## 10. 残課題
 
 - 権限の書き出しは第 14 節で対応済み（Issue #3096）
-- 外部キー: 参照先の列名が `id` のものは SQL 表層が暗黙 id への参照として `0A000` で拒否するため、ダンプには現れない。それ以外の外部キーは SQL で作れ、SQL 経由の往復を第 13 節の試験が確かめる
+- 外部キー: 親が採番方式の `id` 参照（Issue #3178 で受理）は通常の列参照としてダンプへ書き出す。従来方式の親の `id` 疑似列への参照は戻せないため `Unsupported`。SQL 経由の往復を第 13 節の試験が確かめる
 - マテリアライズド VIEW・SCHEMA 配下の SEQUENCE は §15 で対応済み（既知の制約も §15）
 
 ## 11. 表データの書き出し（Issue #2161）
@@ -303,7 +303,7 @@ COPY <表> (<列>, ...) FROM STDIN;
 
 | 要素 | 現状 | 固定する試験 |
 | ---- | ---- | ------------ |
-| 参照先の列名が `id` の外部キー | SQL 表層が `0A000` で拒否する（列 `id` を明示した表でも同じ）。ダンプには現れない | `foreign_key_to_a_column_named_id_is_rejected_so_it_never_reaches_the_dump` |
+| 参照先の列名が `id` の外部キー | 親が採番方式なら通常の列参照として往復する。疑似列を持つ親への参照は `Unsupported`（`ddl_export/tests.rs` の単体試験）。fixture 本体へデータ入りで加えるのは #3179・#3182 の後 | `foreign_key_to_a_column_named_id_round_trips_through_the_dump` |
 | 従来方式（暗黙 id）の表が持つ外部キー | 暗黙 id の表そのものが `Unsupported`（外部キーだけを落として戻すことはしない） | `dump_fails_closed_when_a_legacy_table_carries_a_foreign_key` |
 | `GENERATED ALWAYS` の IDENTITY | INSERT 形式では `Unsupported`、COPY 形式では往復する（§11.6） | `logical_dump_data.rs` の `identity_columns_round_trip_through_copy_and_fail_closed_for_insert`。fixture の IDENTITY は `BY DEFAULT` |
 | 暗黙 id の表 | `Unsupported`（§4） | `logical_dump_schema.rs` の既存試験（`table_with_implicit_id_row_identity_fails_the_whole_dump`） |
