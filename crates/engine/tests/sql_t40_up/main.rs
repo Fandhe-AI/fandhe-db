@@ -51,6 +51,7 @@ mod sql51_insert_select_on_conflict;
 mod sql51_insert_select_on_conflict_describe;
 mod sql52_ctas_exec;
 mod sql53_dml_from_using_bind;
+mod sql53_dml_from_using_exec;
 mod sql53_dml_where_subquery;
 mod sql54_ilike;
 mod sql54_is_distinct_from;

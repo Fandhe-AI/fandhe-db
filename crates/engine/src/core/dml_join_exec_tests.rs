@@ -1042,8 +1042,8 @@ fn parse_sql_carries_statement_hash_without_operation_id() {
     assert_ne!(del(&d1), upd(&u1));
 }
 
-/// SQL 文字列を構文・束縛・変換（Issue #3201）に通して結合 DML の実行入力にする。dispatch（#3202）が
-/// 結線されるまでの間、変換器の出力が実行器でそのまま動くことを engine 内で検証するための入口。
+/// SQL 文字列を構文・束縛・変換（Issue #3201）に通して結合 DML の実行入力にする。SQL 経路の dispatch は
+/// #3202 で結線済みで、ここは変換器の出力が実行器でそのまま動くことを engine 内で検証するための入口。
 fn plan_from_sql(core: &EngineCore, sql: &str) -> JoinedDmlPlan {
     use crate::core::ParsedSql;
     let session = SessionState::default();

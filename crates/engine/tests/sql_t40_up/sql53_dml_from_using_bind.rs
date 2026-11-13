@@ -1,10 +1,10 @@
-//! `UPDATE ... FROM`／`DELETE ... USING` の parser と束縛（SQL-53 (b)・Issue #1754。親 #1753）の
+//! `UPDATE ... FROM`／`DELETE ... USING` の parser・束縛・dispatch（SQL-53 (b)・Issue #1754・#3202。親 #1753）の
 //! 結合テスト。
 //!
 //! 契約: 構文・表の存在確認・列解決・型照合が `EngineCore` の入口（`parse_sql`・Describe・
-//! autocommit／明示トランザクションの実行・拡張クエリの Parse）で一貫して働き、束縛を通った文も
-//! 実行腕が `0A000` で止まる（副作用ゼロ。結合の実行は #1755、RLS と `RETURNING` は #1756、
-//! 台帳の content_hash は #1757 の担当）。未対応の形は fail-closed（`42601`／`0A000`）で拒否する。
+//! autocommit／明示トランザクションの実行・拡張クエリの Parse）で一貫して働く。束縛と変換を通った文は
+//! 結合実行器へ dispatch され（#3202）、変換できない形と `USING OPERATION_ID` 付き（#3203 まで）は
+//! 副作用ゼロの `0A000` で fail-closed に拒否する。`RETURNING` は #3204 の担当。
 //! 既存の単一表 DML（`DELETE ... USING OPERATION_ID` を含む）は挙動を変えない。
 //! ポインタ: `docs/design/update-from-delete-using.md`。
 
@@ -86,30 +86,38 @@ fn code(r: Result<impl std::fmt::Debug, SqlSurfaceError>) -> String {
     }
 }
 
-/// 束縛まで通る受理形（SQL-53 (b)）。
-const ACCEPTED: &[&str] = &[
-    "UPDATE docs SET lang = langs.lang FROM langs WHERE docs.lang = langs.lang",
-    "UPDATE docs AS d SET lang = l.lang FROM langs l WHERE d.lang = l.lang",
-    "UPDATE docs SET lang = 'x' FROM langs WHERE docs.lang = langs.lang AND langs.label = 'Japanese'",
-    "UPDATE docs SET lang = 'x', n = 1 FROM langs WHERE docs.lang = langs.lang OR (docs.id = langs.id)",
+/// 実行できる形と、`seed` 直後の新しいコアでの影響行数（`UPDATE n`／`DELETE n` の `n`）。
+const EXECUTABLE: &[(&str, u64)] = &[
+    ("UPDATE docs SET lang = langs.lang FROM langs WHERE docs.lang = langs.lang", 1),
+    ("UPDATE docs AS d SET lang = l.lang FROM langs l WHERE d.lang = l.lang", 1),
+    (
+        "UPDATE docs SET lang = 'x' FROM langs WHERE docs.lang = langs.lang AND langs.label = 'Japanese'",
+        1,
+    ),
     // 自己結合（別名で公開名を分ける）
-    "UPDATE docs SET lang = d2.lang FROM docs AS d2 WHERE docs.id = d2.id",
-    // 2 表以上
-    "UPDATE docs SET lang = 'x' FROM langs a, langs b WHERE docs.lang = a.lang AND a.lang = b.lang",
+    ("UPDATE docs SET lang = d2.lang FROM docs AS d2 WHERE docs.id = d2.id", 2),
     // 対象表の列だけを使う式
-    "UPDATE docs SET n = n + 1 FROM langs WHERE docs.lang = langs.lang",
+    ("UPDATE docs SET n = n + 1 FROM langs WHERE docs.lang = langs.lang", 1),
     // 対象表修飾つき列の式は両表に同名列があっても曖昧にならない（Issue #1754 レビュー対応）
-    "UPDATE docs SET lang = upper(docs.lang) FROM langs WHERE docs.lang = langs.lang",
-    "UPDATE docs SET n = docs.id + 1 FROM langs WHERE docs.lang = langs.lang",
-    "UPDATE docs SET lang = upper(docs.lang) FROM docs AS d2 WHERE docs.id = d2.id",
-    "UPDATE docs SET lang = 'x' FROM langs WHERE docs.lang = langs.lang USING OPERATION_ID 'op-u1'",
-    "UPDATE docs SET lang = 'x' FROM langs USING OPERATION_ID NULL",
-    "UPDATE docs SET lang = 'x' FROM langs WHERE docs.lang = langs.lang;",
-    "DELETE FROM docs USING langs WHERE docs.lang = langs.lang",
-    "DELETE FROM docs d USING langs AS l WHERE d.lang = l.lang",
+    ("UPDATE docs SET lang = upper(docs.lang) FROM langs WHERE docs.lang = langs.lang", 1),
+    ("UPDATE docs SET n = docs.id + 1 FROM langs WHERE docs.lang = langs.lang", 1),
+    ("UPDATE docs SET lang = upper(docs.lang) FROM docs AS d2 WHERE docs.id = d2.id", 2),
+    // 末尾 `;`（psql の入力）
+    ("UPDATE docs SET lang = 'x' FROM langs WHERE docs.lang = langs.lang;", 1),
+    ("DELETE FROM docs USING langs WHERE docs.lang = langs.lang", 1),
+    ("DELETE FROM docs d USING langs AS l WHERE d.lang = l.lang", 1),
+    ("DELETE FROM docs USING docs AS d2 WHERE docs.id = d2.id", 2),
+];
+
+/// 束縛は通るが、変換器が `0A000` で拒否する形（第 1 弾の対象外。設計記録の変換器節）。
+const CONVERTER_REJECTED: &[&str] = &[
+    // relation をまたぐ OR
+    "UPDATE docs SET lang = 'x', n = 1 FROM langs WHERE docs.lang = langs.lang OR (docs.id = langs.id)",
+    // FROM／USING が 2 表以上
+    "UPDATE docs SET lang = 'x' FROM langs a, langs b WHERE docs.lang = a.lang AND a.lang = b.lang",
     "DELETE FROM docs USING langs a, langs b WHERE docs.lang = a.lang AND a.lang = b.lang",
-    "DELETE FROM docs USING docs AS d2 WHERE docs.id = d2.id",
-    "DELETE FROM docs USING langs WHERE docs.lang = langs.lang USING OPERATION_ID 'op-d1'",
+    // 等値結合キーなし・WHERE 省略（op id の有無によらず変換器が先に拒否する）
+    "UPDATE docs SET lang = 'x' FROM langs USING OPERATION_ID NULL",
     "DELETE FROM docs USING langs USING OPERATION_ID 'op-d2'",
     "DELETE FROM docs USING langs",
     // 裸の bool 列 WHERE の後ろに DML の後続句が続く形（同上）
@@ -119,12 +127,28 @@ const ACCEPTED: &[&str] = &[
     "DELETE FROM docs USING langs WHERE langs.flag;",
 ];
 
+/// 実行できる形に `USING OPERATION_ID` が付いた形。台帳の SQL 経路結線（#3203）まで `0A000`。
+const OPERATION_ID_FORMS: &[&str] = &[
+    "UPDATE docs SET lang = 'x' FROM langs WHERE docs.lang = langs.lang USING OPERATION_ID 'op-u1'",
+    "DELETE FROM docs USING langs WHERE docs.lang = langs.lang USING OPERATION_ID 'op-d1'",
+];
+
+/// 束縛まで通る受理形（SQL-53 (b)）の全体。
+fn accepted() -> Vec<&'static str> {
+    EXECUTABLE
+        .iter()
+        .map(|(sql, _)| *sql)
+        .chain(CONVERTER_REJECTED.iter().copied())
+        .chain(OPERATION_ID_FORMS.iter().copied())
+        .collect()
+}
+
 /// 受理形は `parse_sql` が専用 variant を返す。
 #[test]
 fn parse_returns_dedicated_variants() {
     let (core, path) = new_core("sql53-from-parse", false);
     let _g = CleanupGuard(path);
-    for sql in ACCEPTED {
+    for sql in accepted() {
         let parsed = core
             .parse_sql(sql)
             .unwrap_or_else(|e| panic!("parse failed for {sql}: {e:?}"));
@@ -137,19 +161,70 @@ fn parse_returns_dedicated_variants() {
     }
 }
 
-/// 受理形は束縛を通った後に `0A000` で止まり、行・台帳に副作用がない（operation_id も消費しない）。
+/// 実行できる形は厳密な `UPDATE n`／`DELETE n` を返し、対象行だけが変わる（SQL-53 (b)・Issue #3202）。
 #[test]
-fn accepted_forms_bind_then_stop_with_0a000_without_side_effects() {
-    let (core, path) = new_core("sql53-from-exec", false);
+fn executable_forms_run_with_exact_tags_and_rows() {
+    for (sql, want) in EXECUTABLE {
+        let (core, path) = new_core("sql53-from-exec", false);
+        let _g = CleanupGuard(path);
+        seed(&core);
+        let out = run(&core, sql).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+        let tag = if sql.starts_with("UPDATE") {
+            format!("Update(UpdateOutcome {{ rows_affected: {want} }})")
+        } else {
+            format!("Delete(DeleteOutcome {{ rows_affected: {want} }})")
+        };
+        assert_eq!(out, tag, "{sql}");
+    }
+    // 行の中身: ja にだけ一致する UPDATE は ja の行だけを変え、en は変えない。
+    let (core, path) = new_core("sql53-from-exec-rows", false);
+    let _g = CleanupGuard(path);
+    seed(&core);
+    run(
+        &core,
+        "UPDATE docs SET lang = 'x' FROM langs WHERE docs.lang = langs.lang",
+    )
+    .expect("update");
+    let rows = doc_rows(&core);
+    assert!(rows.contains("\"x\"") && rows.contains("\"en\""), "{rows}");
+    assert!(!rows.contains("\"ja\""), "{rows}");
+}
+
+/// 変換器が拒否する形は `0A000` で、行も台帳も変えない。
+// intentional: docs/design/update-from-delete-using.md
+#[test]
+fn converter_rejected_forms_fail_closed_without_side_effects() {
+    let (core, path) = new_core("sql53-from-conv-reject", false);
     let _g = CleanupGuard(path);
     seed(&core);
     let before = doc_rows(&core);
-    for sql in ACCEPTED {
+    for sql in CONVERTER_REJECTED {
         assert_eq!(code(run(&core, sql)), "0A000", "{sql}");
         assert_eq!(before, doc_rows(&core), "rows changed by {sql}");
     }
     // 拒否された文の operation_id は台帳に残らない（別の文が同じ ID で通常どおり実行できる）。
-    for id in ["op-u1", "op-d1", "op-d2"] {
+    for id in ["op-d2", "op-u3", "op-d3"] {
+        run(
+            &core,
+            &format!("UPDATE docs SET n = 7 WHERE lang = 'en' USING OPERATION_ID '{id}'"),
+        )
+        .unwrap_or_else(|e| panic!("operation_id {id} should be unused: {e:?}"));
+    }
+}
+
+/// `USING OPERATION_ID` 付きは、台帳の SQL 経路結線までは黙って捨てずに `0A000` で拒否する（再送の二重適用を防ぐ）。
+// tracked: #3203
+#[test]
+fn operation_id_forms_are_rejected_until_ledger_wiring() {
+    let (core, path) = new_core("sql53-from-opid", false);
+    let _g = CleanupGuard(path);
+    seed(&core);
+    let before = doc_rows(&core);
+    for sql in OPERATION_ID_FORMS {
+        assert_eq!(code(run(&core, sql)), "0A000", "{sql}");
+        assert_eq!(before, doc_rows(&core), "rows changed by {sql}");
+    }
+    for id in ["op-u1", "op-d1"] {
         run(
             &core,
             &format!("UPDATE docs SET n = 7 WHERE lang = 'en' USING OPERATION_ID '{id}'"),
@@ -429,18 +504,29 @@ fn search_path_gate_covers_from_and_using_relations() {
     }
 }
 
-/// Describe は束縛エラーを実行と同じコードで返し、通った文は結果列なし。
+/// Describe は Execute と同じ準備段を通す。実行できる形は結果列なし、束縛エラーは実行と同じコード、
+/// 変換器が拒否する形と op id 付きの形は `0A000`。
+// intentional: docs/design/update-from-delete-using.md
+// tracked: #3203
 #[test]
 fn describe_reports_bind_errors_and_no_columns_for_valid_forms() {
     let (core, path) = new_core("sql53-from-describe", false);
     let _g = CleanupGuard(path);
     let session = SessionState::default();
-    for sql in ACCEPTED {
+    for (sql, _) in EXECUTABLE {
         let parsed = core.parse_sql(sql).expect("parse");
         let meta = core
             .describe_parsed_in_session(&session, &parsed)
             .unwrap_or_else(|e| panic!("describe failed for {sql}: {e:?}"));
         assert!(meta.is_none(), "{sql}");
+    }
+    for sql in CONVERTER_REJECTED.iter().chain(OPERATION_ID_FORMS) {
+        let parsed = core.parse_sql(sql).expect("parse");
+        assert_eq!(
+            code(core.describe_parsed_in_session(&session, &parsed)),
+            "0A000",
+            "{sql}"
+        );
     }
     let parsed = core
         .parse_sql("UPDATE docs SET lang = 'x' FROM langs WHERE lang = 'ja'")
@@ -451,9 +537,10 @@ fn describe_reports_bind_errors_and_no_columns_for_valid_forms() {
     );
 }
 
-/// 明示トランザクション内でも束縛の後に `0A000`（書き込みなし）。ROLLBACK で通常どおり抜けられる。
+/// 明示トランザクション内でも実行され、COMMIT で永続化・ROLLBACK で巻き戻る（`mark_written` の実証）。
+/// 束縛エラーは `Failed` へ遷移させる。
 #[test]
-fn explicit_transaction_binds_then_fails_with_0a000() {
+fn explicit_transaction_executes_and_respects_commit_and_rollback() {
     let (core, path) = new_core("sql53-from-txn", false);
     let _g = CleanupGuard(path);
     seed(&core);
@@ -471,21 +558,50 @@ fn explicit_transaction_binds_then_fails_with_0a000() {
         )
         .expect_err("bind error");
     assert_eq!(err.wire_code(), "42702");
+    core.execute_sql_in_txn(&ctx(), &mut session, &mut txn, "ROLLBACK")
+        .expect("rollback failed tx");
+    assert_eq!(before, doc_rows(&core));
+
+    // DELETE ... USING は ROLLBACK で元に戻る。
     let mut txn = core.new_session_transaction();
     core.execute_sql_in_txn(&ctx(), &mut session, &mut txn, "BEGIN")
         .expect("begin");
-    let err = core
+    let out = core
         .execute_sql_in_txn(
             &ctx(),
             &mut session,
             &mut txn,
             "DELETE FROM docs USING langs WHERE docs.lang = langs.lang",
         )
-        .expect_err("not supported");
-    assert_eq!(err.wire_code(), "0A000");
+        .expect("delete using");
+    assert_eq!(
+        format!("{out:?}"),
+        "Delete(DeleteOutcome { rows_affected: 1 })"
+    );
     core.execute_sql_in_txn(&ctx(), &mut session, &mut txn, "ROLLBACK")
         .expect("rollback");
     assert_eq!(before, doc_rows(&core));
+
+    // UPDATE ... FROM は COMMIT で永続化する。
+    let mut txn = core.new_session_transaction();
+    core.execute_sql_in_txn(&ctx(), &mut session, &mut txn, "BEGIN")
+        .expect("begin");
+    let out = core
+        .execute_sql_in_txn(
+            &ctx(),
+            &mut session,
+            &mut txn,
+            "UPDATE docs SET lang = 'x' FROM langs WHERE docs.lang = langs.lang;",
+        )
+        .expect("update from");
+    assert_eq!(
+        format!("{out:?}"),
+        "Update(UpdateOutcome { rows_affected: 1 })"
+    );
+    core.execute_sql_in_txn(&ctx(), &mut session, &mut txn, "COMMIT")
+        .expect("commit");
+    assert_ne!(before, doc_rows(&core));
+    assert!(doc_rows(&core).contains("\"x\""), "{}", doc_rows(&core));
 }
 
 /// 拡張クエリの Parse は `$n` を含む FROM／USING 形を `42601` で拒否する。
