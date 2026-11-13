@@ -19,6 +19,7 @@ engine には中断の仕組みが無かったため、実行中の文を外か�
 
 - `InterruptScope::install(poll)` が thread-local に `poll` を積み、RAII ガードの drop で外す（入れ子可）
 - 走査ループは `interrupt::check()?` を呼ぶ。スコープが無ければ何もしない。`CHECK_STRIDE`（1024）回に 1 回、導入後の初回は必ず `poll` を評価する。中断が確定したら以降はラッチして同じ理由で失敗させる
+- 集計の 3 つの行ループ（#3208）は `interrupt::RowCheck`（ループ局所のカウンタ）経由で、`ROW_CHECK_INTERVAL`（`CHECK_STRIDE` と同じ 1024）行ごとに間引きを通さず即時評価する。行ごとの thread-local アクセスを避けるための変更で、遅延の上限の記述は不変（[aggregate-loop-regression.md](aggregate-loop-regression.md)）
 - `poll` が返す `InterruptReason` は `ClientGone`（本件）・`UserCancel`・`StatementTimeout`（#1951 の `DeadlineScope` が発生させる）
 - エラーは `SqlSurfaceError::QueryCanceled` から `ErrorClass::QueryCanceled`（`57014`、ラベル `QUERY_CANCELED`）。文言は PostgreSQL と同じ固定の英語で、理由・件数・テナント・行の内容を含めない。HTTP への射影は 503
 - 確認点: `sql::scan::with_visible_row`（全走査経路が通る入口。順序なし・経路 (A)・(B) の両パス・PK 点検索・GIN 候補）、`sql::window` の実体化ループ、`sql::group_by`・`sql::aggregate` の行取り込みループ、`sql::relation_snapshot` の入力読み込み、`sql::join::exec` のプローブと一致ペアのループ
