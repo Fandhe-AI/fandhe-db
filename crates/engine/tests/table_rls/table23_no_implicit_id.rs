@@ -831,19 +831,94 @@ fn foreign_keys_between_tables_without_id_use_declared_keys() {
         ),
         "42830"
     );
-    // 親が宣言した `id` 列（主キー）への FK は、物理キーの `id` 参照と区別できないため未対応（`0A000`）。
+    // 親が宣言した `id` 列（主キー）への FK は、普通の列参照として DDL 束縛で受理する（Issue #3178）。
     run(
         &core,
         &alice,
         "CREATE TABLE users (id BIGINT PRIMARY KEY, name TEXT)",
     );
+    for sql in [
+        "CREATE TABLE posts (author BIGINT REFERENCES users (id), body TEXT)",
+        "CREATE TABLE posts2 (author BIGINT REFERENCES users, body TEXT)",
+        "CREATE TABLE posts3 (author BIGINT REFERENCES users (id), body TEXT);",
+        "CREATE TABLE selfref (id BIGINT PRIMARY KEY, up BIGINT REFERENCES selfref (id))",
+    ] {
+        run(&core, &alice, sql);
+    }
+    run(
+        &core,
+        &alice,
+        "CREATE TABLE late (author BIGINT, body TEXT)",
+    );
+    run(
+        &core,
+        &alice,
+        "ALTER TABLE late ADD CONSTRAINT late_fk FOREIGN KEY (author) REFERENCES users (id);",
+    );
+}
+
+/// 採番方式の親の `id` 参照を受理した後の中間状態（Issue #3178）。DDL は通るが、NULL 以外の子の値は
+/// 実行時に拒否されて保存されない（fail-closed）。親の存在検査は #3179、連鎖・遅延検査は #3180。
+/// tracked: #3179
+#[test]
+fn allocated_parent_id_reference_rejects_non_null_child_values_for_now() {
+    let (core, _g) = new_core("t23-fk-id-interim");
+    let alice = ctx("alice");
+    run(
+        &core,
+        &alice,
+        "CREATE TABLE users (id BIGINT PRIMARY KEY, name TEXT)",
+    );
+    run(
+        &core,
+        &alice,
+        "CREATE TABLE posts (author BIGINT REFERENCES users (id), body TEXT)",
+    );
+    // NULL の子は孤児にならないので成功する。
+    run(
+        &core,
+        &alice,
+        "INSERT INTO posts (author, body) VALUES (NULL, 'ok')",
+    );
+    // NULL 以外は 0A000（親の行ストアが無ければ 23503）で拒否され、保存されない。
+    run(
+        &core,
+        &alice,
+        "INSERT INTO users (id, name) VALUES (1, 'a')",
+    );
+    let code = code_of(
+        &core,
+        &alice,
+        "INSERT INTO posts (author, body) VALUES (1, 'x')",
+    );
+    assert!(code == "0A000" || code == "23503", "{code}");
+    let rows = query(&core, &alice, "SELECT body FROM posts LIMIT 10");
+    assert_eq!(texts(&rows, 0), vec!["ok"]);
+}
+
+/// 親側 DDL の依存検査は、採番方式の親でも `id` 参照を依存として拒否する（Issue #3178）。
+#[test]
+fn allocated_parent_ddl_is_blocked_while_id_reference_exists() {
+    let (core, _g) = new_core("t23-fk-id-parent-ddl");
+    let alice = ctx("alice");
+    run(
+        &core,
+        &alice,
+        "CREATE TABLE users (id BIGINT PRIMARY KEY, name TEXT)",
+    );
+    run(
+        &core,
+        &alice,
+        "CREATE TABLE posts (author BIGINT REFERENCES users (id), body TEXT)",
+    );
+    assert_eq!(code_of(&core, &alice, "DROP TABLE users"), "2BP01");
     assert_eq!(
         code_of(
             &core,
             &alice,
-            "CREATE TABLE posts (author BIGINT REFERENCES users (id), body TEXT)"
+            "ALTER TABLE users DROP CONSTRAINT users_pkey"
         ),
-        "0A000"
+        "2BP01"
     );
 }
 
