@@ -2009,4 +2009,6 @@ main に無く現行の `parse_order_by` は `<=>` のみ受理するため、�
 
 **Issue #3208（perf(engine): 集計の行ループの interrupt::check を N 行ごとにする。#2888 の是正。SQL-71 ポインタ）**: 依存の変更なし。`interrupt::RowCheck` と `ROW_CHECK_INTERVAL`（1024）を追加し、`sql/aggregate.rs` の 3 つの行ループの確認をループ局所のカウンタに置き換えた。中断の意味（commit 前の `Err` のみ・ラッチ・最初の行で必ず確認・RLS の `continue` より前）は不変。結合テストは `sql3208_aggregate_row_check.rs`。A/B の壁時計は未検証。詳細は [aggregate-loop-regression.md](aggregate-loop-regression.md)。
 
+**Issue #3211（perf(engine): 集計入力の 2 段構成の行ごとの負担を軽減。#2684 の是正。SQL-57・SQL-71 ポインタ）**: 依存の変更なし。`Accumulator::observe` に、式を含まない入力（`*`・id・列参照）を `AggregateRowValue` なしで直接観測する分岐を追加し、列の取り出し・型検査を `aggregate_input.rs` の `cell_*` に集約した。式・`VectorColumn` は従来の 2 段経路のまま。結合テストは `sql3211_aggregate_direct_observe.rs`、単体の差分テストは `direct_observe_matches_two_stage_path`。A/B の壁時計は未検証。詳細は [aggregate-loop-regression.md](aggregate-loop-regression.md)。
+
 **Issue #3169（docs: 親 Issue close 前の突合手順を out-of-scope-tracking に追記）**: production コード・スクリプト・CI・依存の変更なし。`.claude/rules/out-of-scope-tracking.md` に「対象外の書き方（作法）」節と「親 Issue close 前の突合」節（`scripts/check_issue_closeout.sh` の使い方・出力ごとの対処・終了コード 3 で close しない fail-closed）を追加し、フロー 5 を PR 本文の対象外節へ絞った。`CLAUDE.md` の Rules 表の説明を更新した。
