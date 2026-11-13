@@ -15,20 +15,30 @@
 //!
 //! # 現時点で実際に変わる挙動
 //!
-//! テナント SCHEMA の中にはまだオブジェクトを作れない（#1717）ため、未修飾名の解決結果は
-//! 「実効 path に `public` が含まれるか」だけで決まる。含まれなければ一時表以外の未修飾名は
-//! `42P01`、作成先が `public` 以外になる文は `3F000`／`0A000`。実効 path に `public` が含まれる
-//! 既定のセッションは一切コストを払わず、従来の挙動とバイト列が一致する。
+//! - 読み取り先頭の文（SELECT 系・VIEW 参照）の未修飾名は、path の要素順に自テナントの SCHEMA まで
+//!   含めて解決し、見つかれば内部キー（`#<schema_id>.<name>`）へ置換して修飾名 `q1.x` と同じ経路に乗せる
+//!   （[`resolve_path_refs`]。Issue #3195）。一時表が最優先で、`public` は裸の名前の存在で判定し、
+//!   USAGE の無い SCHEMA・不在の SCHEMA・組み込み要素は飛ばす。
+//! - 読み取り以外の文（DML・DDL・COPY）と拡張クエリ（Parse・Bind・Describe）は、SCHEMA に解決される
+//!   参照を検出したら固定文言の `0A000` にする（public 側へ黙って向けない。作成先・DML の対象の解決は
+//!   #3196、準備済み文の再解決は #3197）。
+//! - 一時表以外の未修飾名が解決できず、実効 path に `public` が含まれなければ `42P01`、作成先が
+//!   `public` 以外になる文は `3F000`／`0A000`（従来どおり）。
+//! - 自テナントの SCHEMA が path に無い既定のセッション（username 無し）はカタログを引かない。wire の
+//!   既定セッションは `$user` の SCHEMA 1 件の get だけが文ごとに増える。
 //!
 //! # セキュリティ
 //!
 //! - 要素数・要素長はアロケーション前に上限検査する（`22023`）。入力値はエラーへ反射しない。
-//! - 参照ゲートはカタログを引かない（存在オラクルにならない）。作成先の SCHEMA 照会は
-//!   `(呼び出し元テナント, 名前)` の 1 回の get だけで、他テナントの SCHEMA は存在しない名前と
-//!   同じに扱う。
+//! - 解決の照会は `(呼び出し元テナント, 名前)` だけで、他テナントの SCHEMA は存在しない名前と
+//!   同じに扱う（`42P01` の文言は利用者が書いた名前だけ）。参照ゲート（[`check_unqualified_refs`]）自体は
+//!   カタログを引かない。
+//! - 書き換えは権限ゲートより前（`core::EngineCore::parse_tokens_gated` の先頭）に行い、ACL 検査と実行が
+//!   同じ対象を見る。免除形（権限の無い DDL・未束縛の `GRANT`／`REVOKE` 等）は `42501` を先に返すため
+//!   解決も検出もしない（[`gate_exempt`]）。
 //! - `$user` は handshake が認証成功後に確定した username だけから展開する（SQL から変える経路なし）。
 
-use crate::catalog::namespace::is_builtin_schema_name;
+use crate::catalog::namespace::{is_builtin_schema_name, RelationKey};
 use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::lexer::Token;
 use crate::sql::mode::SessionState;
@@ -189,6 +199,21 @@ impl SearchPath {
         out
     }
 
+    /// 展開後の要素に `public`・`pg_catalog`・`information_schema`・`pg_temp` 以外の名前があるか
+    /// （`$user` は `session_user` から展開し、未設定なら飛ばす）。
+    pub(crate) fn may_contain_tenant_schema(&self, session_user: Option<&str>) -> bool {
+        self.elems.iter().any(|e| {
+            let name = match e {
+                SearchPathElem::Name(n) => n.clone(),
+                SearchPathElem::User => match session_user {
+                    Some(u) => normalize_name(u),
+                    None => return false,
+                },
+            };
+            name != PUBLIC && !is_builtin_schema_name(&name) && name != "pg_temp"
+        })
+    }
+
     /// 実効 path に `public` が含まれないか。`$user` は `session_user` が ASCII 大小無視で `public` の
     /// ときだけ public とみなす。真のセッションだけが参照ゲート・作成先判定の対象になる。
     pub(crate) fn hides_public(&self, session_user: Option<&str>) -> bool {
@@ -221,6 +246,8 @@ fn quote_identifier(name: &str) -> String {
 /// ゲート対象の未修飾名 1 件。
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct GateRef {
+    /// 参照名のトークン添字（`resolve_path_refs` が内部キーへ置換する位置）。
+    index: usize,
     name: String,
     /// `DROP INDEX`／`ALTER INDEX` の対象名か（一時表の索引は一時 DB の索引カタログで照会する）。
     is_index: bool,
@@ -395,6 +422,7 @@ fn relation_refs(tokens: &[Token], skip: &[usize], keep_internal_keys: bool) -> 
             continue;
         }
         out.push(GateRef {
+            index: pos.index,
             name: name.to_string(),
             is_index: false,
         });
@@ -446,6 +474,7 @@ fn object_ddl_names(tokens: &[Token]) -> Vec<(usize, GateRef)> {
         out.push((
             i,
             GateRef {
+                index: i,
                 name: name.to_string(),
                 is_index,
             },
@@ -478,12 +507,39 @@ fn is_grant_head(tokens: &[Token]) -> bool {
     )
 }
 
+/// 未修飾名の参照ゲート（[`check_unqualified_refs`]）と `search_path` の解決（[`resolve_path_refs`]）が
+/// 共有する免除条件。真なら、この文では未修飾名を一切解決も検出もしない。
+///
+/// 免除するのは、権限の無い主体が `42501` より先に状態依存の応答（名前解決の結果）を受け取らないための形
+/// （SQL-40・Issue #2236）と、関係を参照しない文である。
+/// - DDL 実行権限の無いセッションの DDL 先頭（`ALTER ... OWNER TO` は束縛ロールが所有者経路で実行できる
+///   ので、運用者権限も束縛ロールも無いセッションだけを免除する）
+/// - 現在ロールが未束縛の `GRANT`／`REVOKE`
+/// - `SET`／`RESET`／`SHOW`（設定値を文種と誤解釈して関係名として走査しない）
+fn gate_exempt(session: &SessionState, tokens: &[Token]) -> bool {
+    if is_ddl_head(tokens)
+        && crate::sql::ddl::require_ddl_permission(session).is_err()
+        && !(crate::sql::allowlist::is_alter_owner_statement(tokens)
+            && crate::sql::privilege_gate::bound_principal(session).is_ok())
+    {
+        return true;
+    }
+    if is_grant_head(tokens) && crate::sql::privilege_gate::bound_principal(session).is_err() {
+        return true;
+    }
+    matches!(
+        tokens.first(),
+        Some(Token::Ident(w)) if ["SET", "RESET", "SHOW"].iter().any(|k| w.eq_ignore_ascii_case(k))
+    )
+}
+
 /// `public` が見えない `search_path` のセッションで、未修飾のテーブル参照が一時表以外なら `42P01` に
 /// する参照ゲート。実効 path に `public` が含まれる（既定の）セッションは何もせず、トークン走査もしない。
 ///
-/// 現時点でテナント SCHEMA にオブジェクトは作れない（#1717）ため、`public` 以外の path 要素は
-/// 参照を解決できない。カタログを引かないので存在オラクルにならない。エラーは利用者が書いた名前だけを
-/// 含む。`skip` は準備済み文で `public.` 修飾を外した位置。
+/// 自テナントの SCHEMA に解決される参照は [`resolve_path_refs`] が先に内部キーへ置換する（`#` 始まりの
+/// 名前は本ゲートが数えない）ため、ここで `42P01` になるのはどの要素にも無い名前だけ。カタログを引かない
+/// ので存在オラクルにならない。エラーは利用者が書いた名前だけを含む。`skip` は準備済み文で `public.` 修飾を
+/// 外した位置。
 pub(crate) fn check_unqualified_refs(
     session: &SessionState,
     tokens: &[Token],
@@ -492,29 +548,7 @@ pub(crate) fn check_unqualified_refs(
     if !session.search_path_hides_public() {
         return Ok(());
     }
-    if is_ddl_head(tokens)
-        && crate::sql::ddl::require_ddl_permission(session).is_err()
-        // `ALTER ... OWNER TO` は運用者権限が無くても、束縛ロールが対象の所有者なら実行できる（所有者経路。
-        // Issue #2236）。ロールが束縛されている間は参照ゲートを適用し、運用者権限も束縛ロールも無い
-        // （`42501` を受け取る）セッションだけを免除する。
-        && !(crate::sql::allowlist::is_alter_owner_statement(tokens)
-            && crate::sql::privilege_gate::bound_principal(session).is_ok())
-    {
-        return Ok(());
-    }
-    // `GRANT`／`REVOKE`（SQL-40・Issue #1965）は現在ロールが束縛されていないセッションが `42501` を受け取る
-    // 契約（`sql::grant_ddl::require_grant_principal`。カタログ照会・名前解決より前）を保つため、
-    // その場合は参照ゲートを飛ばす。束縛済みのセッションでは未修飾の表名は他の文と同じく `42P01` になる
-    // （カタログを引かない判定のため存在オラクルにならない）。
-    if is_grant_head(tokens) && crate::sql::privilege_gate::bound_principal(session).is_err() {
-        return Ok(());
-    }
-    // `SET`／`RESET`／`SHOW` は関係を参照しない。設定値（例 `truncate`）を文種と誤解釈して
-    // 関係名として走査すると、同じ設定が現在の path 次第で拒否されるため走査対象から除く。
-    if matches!(
-        tokens.first(),
-        Some(Token::Ident(w)) if ["SET", "RESET", "SHOW"].iter().any(|k| w.eq_ignore_ascii_case(k))
-    ) {
+    if gate_exempt(session, tokens) {
         return Ok(());
     }
     let temp = session.temp_tables();
@@ -542,6 +576,199 @@ fn temp_index_exists(session: &SessionState, name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// 解決する名前の種別（存在判定の名前空間）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NameKind {
+    /// 表・ビュー・matview・SEQUENCE（relation の名前空間）。
+    Relation,
+    /// 索引（`DROP INDEX`／`ALTER INDEX` の対象名）。
+    Index,
+    /// `nextval('q')` 等の文字列引数（SEQUENCE だけ）。
+    Sequence,
+}
+
+/// 未修飾名の解決（[`resolve_path_refs`]）が使うカタログ照会。呼び出し元（`core::EngineCore`）が
+/// 自テナントに束縛して組み立てる。他テナントを引く経路はここに存在しない。
+pub(crate) struct PathLookup<'a> {
+    /// 自テナントの SCHEMA の内部 ID。USAGE が無い SCHEMA と存在しない名前は `None`（飛ばす）。
+    pub schema_id: &'a dyn Fn(&str) -> Result<Option<u64>, SqlSurfaceError>,
+    /// `key`（裸の名前または内部キー）が `kind` の名前空間に存在するか。
+    pub exists: &'a dyn Fn(&str, NameKind) -> Result<bool, SqlSurfaceError>,
+}
+
+/// [`resolve_path_refs`] の結果。
+#[derive(Debug, Default)]
+pub(crate) struct PathResolution {
+    /// 内部キーへ置き換えるトークン（添字, 置換後）。関係位置と SEQUENCE 文字列引数の両方を含む。
+    pub rewrites: Vec<(usize, Token)>,
+    /// 関係位置の参照が 1 件でもテナント SCHEMA に解決されたか。
+    pub relation_in_schema: bool,
+    /// 構文エラー `42601` に劣後して返す解決エラー（`public` が隠れた path で見つからない
+    /// SEQUENCE 文字列引数。判定順 `42601` → `42P01`）。
+    pub deferred_error: Option<SqlSurfaceError>,
+}
+
+/// path を展開した 1 要素。
+#[derive(Debug, Clone, Copy)]
+enum PathSlot {
+    Public,
+    Schema(u64),
+}
+
+/// 未修飾名が解決された先。
+enum Placement {
+    Public,
+    InSchema(String),
+    Missing,
+}
+
+/// path の要素を先頭から見て `name` の置き場所を決める。`public` は裸の名前、自テナントの SCHEMA は
+/// 内部キー（`#<id>.<name>`）で存在を引く。どちらにも無ければ [`Placement::Missing`]（書き換えない）。
+fn find_in_slots(
+    slots: &[PathSlot],
+    name: &str,
+    kind: NameKind,
+    lookup: &PathLookup<'_>,
+) -> Result<Placement, SqlSurfaceError> {
+    for slot in slots {
+        match slot {
+            PathSlot::Public => {
+                if (lookup.exists)(name, kind)? {
+                    return Ok(Placement::Public);
+                }
+            }
+            PathSlot::Schema(schema_id) => {
+                let key = RelationKey::InSchema {
+                    schema_id: *schema_id,
+                    name: name.to_string(),
+                }
+                .encode();
+                if (lookup.exists)(&key, kind)? {
+                    return Ok(Placement::InSchema(key));
+                }
+            }
+        }
+    }
+    Ok(Placement::Missing)
+}
+
+/// 未修飾の読み取り名を `search_path` の要素順に引き、自テナントの SCHEMA に解決される位置を内部キー
+/// （`#<schema_id>.<name>`。修飾名 `q1.x` の解決後と同じ形）への置換として返す（TABLE-27・Issue #3195、
+/// ADR D5）。トークン列は書き換えない。呼び出し元は `core::EngineCore::parse_tokens_gated` の先頭
+/// （権限ゲート・一時表の振り分けより前）と、拡張クエリの Parse・Bind・Describe の検出。
+///
+/// - 一時表は最優先（暗黙の `pg_temp`）で、一時表に当たる名前は解決しない。
+/// - 要素は順に見る。`public` は裸の名前が在れば `public`、自テナントの可視 SCHEMA は内部キーが在れば
+///   そこ。`pg_temp`・組み込み SCHEMA・不在・USAGE の無い SCHEMA・`$user` 未設定は飛ばす。
+/// - どれにも無い名前は書き換えない。`public` が隠れていれば後段の参照ゲートが固定文言で `42P01` にする。
+/// - [`gate_exempt`] の形は解決も検出もしない。
+/// - 自テナントの SCHEMA が path に 1 つも無ければ関係名のカタログ照会をしない（既定の path で SCHEMA が
+///   無いテナントは、文ごとに `$user` の SCHEMA 1 件の get だけが増える）。
+///
+/// `skip` は準備済み文で `public.` 修飾を外した位置。存在オラクルにならない: 照会は
+/// `(自テナント, 名前)` だけで、エラー文言は利用者が書いた名前だけを含む。
+pub(crate) fn resolve_path_refs(
+    session: &SessionState,
+    tokens: &[Token],
+    skip: &[usize],
+    lookup: &PathLookup<'_>,
+) -> Result<PathResolution, SqlSurfaceError> {
+    let mut out = PathResolution::default();
+    let hides_public = session.search_path_hides_public();
+    if !(session.search_path_may_hold_tenant_schema() || hides_public)
+        || gate_exempt(session, tokens)
+    {
+        return Ok(out);
+    }
+    let mut slots: Vec<PathSlot> = Vec::new();
+    for elem in session.search_path().elems() {
+        let Some(name) = expand_elem(session, elem) else {
+            continue;
+        };
+        if name == PUBLIC {
+            slots.push(PathSlot::Public);
+        } else if is_builtin_schema_name(&name) || name == "pg_temp" {
+            continue;
+        } else if let Some(id) = (lookup.schema_id)(&name)? {
+            slots.push(PathSlot::Schema(id));
+        }
+    }
+    let has_schema = slots.iter().any(|s| matches!(s, PathSlot::Schema(_)));
+    if has_schema {
+        let temp = session.temp_tables();
+        // 同じ名前の再照会を避ける（種別ごと）。
+        let mut seen: Vec<(String, bool, Option<String>)> = Vec::new();
+        for r in relation_refs(tokens, skip, false) {
+            let temp_hit = if r.is_index {
+                temp_index_exists(session, &r.name)
+            } else {
+                temp.contains(&r.name)
+            };
+            if temp_hit {
+                continue;
+            }
+            let key = match seen
+                .iter()
+                .find(|(n, idx, _)| *n == r.name && *idx == r.is_index)
+            {
+                Some((_, _, key)) => key.clone(),
+                None => {
+                    let kind = if r.is_index {
+                        NameKind::Index
+                    } else {
+                        NameKind::Relation
+                    };
+                    let key = match find_in_slots(&slots, &r.name, kind, lookup)? {
+                        Placement::InSchema(key) => Some(key),
+                        Placement::Public | Placement::Missing => None,
+                    };
+                    seen.push((r.name.clone(), r.is_index, key.clone()));
+                    key
+                }
+            };
+            if let Some(key) = key {
+                out.rewrites.push((r.index, Token::Ident(key)));
+                out.relation_in_schema = true;
+            }
+        }
+    }
+    // `nextval('q')`・`currval('q')`・`setval('q', ..)` の未修飾の文字列引数（regclass 相当）。
+    for i in 0..tokens.len() {
+        let is_call = matches!(tokens.get(i), Some(Token::Ident(w))
+            if ["nextval", "currval", "setval"].iter().any(|k| w.eq_ignore_ascii_case(k)))
+            && matches!(tokens.get(i.saturating_add(1)), Some(Token::Punct('(')));
+        if !is_call {
+            continue;
+        }
+        let lit_index = i.saturating_add(2);
+        let Some(Token::StringLiteral(lit)) = tokens.get(lit_index) else {
+            continue;
+        };
+        // 修飾名・不正な名前は従来の経路（解決器・構文検証）に任せる。
+        if lit.contains('.') || crate::catalog::validate_identifier(lit).is_err() {
+            continue;
+        }
+        match find_in_slots(&slots, lit, NameKind::Sequence, lookup)? {
+            Placement::InSchema(key) => out.rewrites.push((lit_index, Token::Ident(key))),
+            Placement::Public => {}
+            Placement::Missing => {
+                if hides_public && out.deferred_error.is_none() {
+                    out.deferred_error = Some(SqlSurfaceError::undefined_table(lit.clone()));
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// トークン列へ [`PathResolution::rewrites`] を適用する（1 対 1 の置換だけ。文字列は組み立てない）。
+pub(crate) fn apply_rewrites(tokens: &mut [Token], rewrites: Vec<(usize, Token)>) {
+    for (i, t) in rewrites {
+        if let Some(slot) = tokens.get_mut(i) {
+            *slot = t;
+        }
+    }
+}
 /// 作成系 DDL の作成先（現時点では `public` だけ）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CreateTarget {
@@ -954,6 +1181,176 @@ mod tests {
         assert_eq!(names("GRANT r1 TO r2"), Vec::<String>::new());
     }
 
+    /// モック lookup: SCHEMA 名 → ID と、存在するキーの集合。照会回数を数える。
+    struct Mock {
+        schemas: Vec<(&'static str, u64)>,
+        keys: Vec<&'static str>,
+        calls: std::cell::Cell<usize>,
+    }
+
+    impl Mock {
+        fn new(schemas: &[(&'static str, u64)], keys: &[&'static str]) -> Self {
+            Self {
+                schemas: schemas.to_vec(),
+                keys: keys.to_vec(),
+                calls: std::cell::Cell::new(0),
+            }
+        }
+
+        fn run(
+            &self,
+            session: &SessionState,
+            sql: &str,
+        ) -> Result<PathResolution, SqlSurfaceError> {
+            let toks = tokenize(sql).expect("lex");
+            let schema_id = |n: &str| {
+                self.calls.set(self.calls.get() + 1);
+                Ok(self.schemas.iter().find(|(s, _)| *s == n).map(|(_, i)| *i))
+            };
+            let exists = |k: &str, _kind: NameKind| {
+                self.calls.set(self.calls.get() + 1);
+                Ok(self.keys.contains(&k))
+            };
+            resolve_path_refs(
+                session,
+                &toks,
+                &[],
+                &PathLookup {
+                    schema_id: &schema_id,
+                    exists: &exists,
+                },
+            )
+        }
+    }
+
+    fn session_with(path: &[&str]) -> SessionState {
+        let mut s = SessionState::default();
+        let elems = path
+            .iter()
+            .map(|n| SearchPathElem::from_ident(n).unwrap())
+            .collect();
+        s.set_search_path(SearchPath::new(elems).unwrap())
+            .expect("path");
+        s
+    }
+
+    fn rewritten(r: &PathResolution) -> Vec<(usize, String)> {
+        r.rewrites
+            .iter()
+            .map(|(i, t)| match t {
+                Token::Ident(k) => (*i, k.clone()),
+                other => panic!("unexpected token {other:?}"),
+            })
+            .collect()
+    }
+
+    /// Issue #3195: path の要素順に解決し、先に見つかった SCHEMA（または public）が勝つ。
+    #[test]
+    fn resolves_in_path_order() {
+        let m = Mock::new(&[("q1", 7)], &["t", "#7.t", "u"]);
+        let r = m
+            .run(&session_with(&["q1", "public"]), "SELECT id FROM t")
+            .unwrap();
+        assert_eq!(rewritten(&r), vec![(3, "#7.t".to_string())]);
+        assert!(r.relation_in_schema);
+        // public が先なら public（書き換えない）。
+        let r = m
+            .run(&session_with(&["public", "q1"]), "SELECT id FROM t")
+            .unwrap();
+        assert!(r.rewrites.is_empty());
+        // public に無い名前は後ろの SCHEMA。
+        let m2 = Mock::new(&[("q1", 7)], &["#7.u"]);
+        let r = m2
+            .run(&session_with(&["public", "q1"]), "SELECT id FROM u")
+            .unwrap();
+        assert_eq!(rewritten(&r), vec![(3, "#7.u".to_string())]);
+    }
+
+    /// どこにも無い名前・不在の SCHEMA・組み込み要素は書き換えない（後段のゲートが `42P01`）。
+    #[test]
+    fn missing_names_and_builtin_elements_are_left_alone() {
+        let m = Mock::new(&[("q1", 7)], &["#7.t"]);
+        let r = m
+            .run(
+                &session_with(&["pg_catalog", "nosuch", "q1"]),
+                "SELECT id FROM t, zzz",
+            )
+            .unwrap();
+        assert_eq!(rewritten(&r).len(), 1);
+        // 自テナントの SCHEMA が 1 つも無い path は関係名のカタログを引かない。
+        let m = Mock::new(&[], &["t"]);
+        let r = m
+            .run(&session_with(&["nosuch", "public"]), "SELECT id FROM t")
+            .unwrap();
+        assert!(r.rewrites.is_empty());
+        assert_eq!(m.calls.get(), 1, "only the schema probe for `nosuch`");
+        // 既定の path で username 未設定、または組み込みだけなら一切引かない。
+        let m = Mock::new(&[("q1", 7)], &["#7.t"]);
+        let _ = m.run(&SessionState::default(), "SELECT id FROM t").unwrap();
+        let _ = m
+            .run(&session_with(&["pg_catalog", "public"]), "SELECT id FROM t")
+            .unwrap();
+        assert_eq!(m.calls.get(), 0);
+    }
+
+    /// CTE 名・解決済みの内部キー・一時表は解決の対象にしない。
+    #[test]
+    fn cte_internal_keys_and_temp_tables_are_not_resolved() {
+        let m = Mock::new(&[("q1", 7)], &["#7.c", "#7.t"]);
+        let s = session_with(&["q1"]);
+        let r = m.run(&s, "WITH c AS (SELECT 1) SELECT id FROM c").unwrap();
+        assert!(r.rewrites.is_empty());
+        let mut toks = tokenize("SELECT id FROM t").expect("lex");
+        if let Some(slot) = toks.get_mut(3) {
+            *slot = Token::Ident("#7.t".to_string());
+        }
+        let r = resolve_path_refs(
+            &s,
+            &toks,
+            &[],
+            &PathLookup {
+                schema_id: &|_| Ok(Some(7)),
+                exists: &|_, _| Ok(true),
+            },
+        )
+        .unwrap();
+        assert!(r.rewrites.is_empty());
+    }
+
+    /// 権限の無い主体への `42501` を状態依存の応答より先に返す契約（免除）と、SET／SHOW の免除。
+    #[test]
+    fn exempt_statements_are_not_resolved() {
+        let m = Mock::new(&[("q1", 7)], &["#7.t"]);
+        // DDL 権限の無いセッションの DDL 先頭。
+        let s = session_with(&["q1", "public"]);
+        let r = m.run(&s, "DROP TABLE t").unwrap();
+        assert!(r.rewrites.is_empty());
+        let r = m.run(&s, "SET search_path TO truncate").unwrap();
+        assert!(r.rewrites.is_empty());
+        assert_eq!(m.calls.get(), 0);
+    }
+
+    /// SEQUENCE の未修飾文字列引数: SCHEMA に解決されれば内部キーへ。public が隠れて見つからなければ
+    /// 解決エラー（`42601` に劣後して返す）。
+    #[test]
+    fn sequence_literals_are_resolved_or_deferred() {
+        let m = Mock::new(&[("q1", 7)], &["#7.q"]);
+        let r = m
+            .run(&session_with(&["q1", "public"]), "SELECT nextval('q')")
+            .unwrap();
+        assert_eq!(rewritten(&r), vec![(3, "#7.q".to_string())]);
+        assert!(!r.relation_in_schema);
+        let r = m
+            .run(&session_with(&["q1"]), "SELECT nextval('nosuch')")
+            .unwrap();
+        assert_eq!(r.deferred_error.map(|e| e.wire_code()), Some("42P01"));
+        // 修飾名は触らない。
+        let r = m
+            .run(&session_with(&["q1"]), "SELECT nextval('q1.q')")
+            .unwrap();
+        assert!(r.rewrites.is_empty() && r.deferred_error.is_none());
+    }
+
     #[test]
     fn index_ddl_names_are_marked_as_index() {
         let toks = tokenize("DROP INDEX i").expect("lex");
@@ -961,6 +1358,7 @@ mod tests {
         assert_eq!(
             refs,
             vec![GateRef {
+                index: 2,
                 name: "i".to_string(),
                 is_index: true
             }]

@@ -48,7 +48,7 @@ pub(crate) use function::{
     remove_function_acl_in_txn,
 };
 pub(crate) use owner::list_owners_for_tenant_in_txn;
-pub(crate) use schema::remove_schema_acl_in_txn;
+pub(crate) use schema::{remove_schema_acl_in_txn, schema_privileges_in_txn};
 pub(crate) use sequence::{remove_sequence_acl_in_txn, sequence_privileges_in_txn};
 
 /// ACL の専用カタログ表。キーは `(tenant_id, object_kind, object_key, column, grantee_id, grantor_id)`。

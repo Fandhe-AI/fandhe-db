@@ -17533,6 +17533,55 @@ pub(crate) fn table_lookup_error(e: CatalogError) -> SqlSurfaceError {
     }
 }
 
+/// `key` が表・ビュー・matview・SEQUENCE のいずれかとして登録済みかを読み取り源で判定する
+/// （Issue #3195。`sql::search_path` が未修飾名を path の各要素で解決するための読み取り専用の照会。
+/// 未作成のカタログ表は「無い」として扱い、表を作らない）。`key` は裸の名前または内部キー
+/// （`#<schema_id>.<name>`）。
+pub(crate) fn relation_or_sequence_exists_in<R: crate::storage::read_source::ReadSource>(
+    src: &R,
+    key: &str,
+) -> Result<bool> {
+    if relation_exists_in_source(src, key)? {
+        return Ok(true);
+    }
+    sequence::sequence_exists_in(src, key)
+}
+
+/// `key` が表・ビュー・matview のいずれかとして登録済みかを読み取り源で判定する。
+fn relation_exists_in_source<R: crate::storage::read_source::ReadSource>(
+    src: &R,
+    key: &str,
+) -> Result<bool> {
+    for def in [
+        CATALOG_TABLE,
+        VIEWS_TABLE,
+        materialized::MATERIALIZED_VIEWS_TABLE,
+    ] {
+        match src.open_table(def) {
+            Ok(t) => {
+                if t.get(key)?.is_some() {
+                    return Ok(true);
+                }
+            }
+            Err(redb::TableError::TableDoesNotExist(_)) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(false)
+}
+
+/// `name` が索引カタログに登録済みかを読み取り源で判定する（Issue #3195。`DROP INDEX` 等の対象名の解決用）。
+pub(crate) fn index_exists_in_source<R: crate::storage::read_source::ReadSource>(
+    src: &R,
+    name: &str,
+) -> Result<bool> {
+    match src.open_table(INDEX_CATALOG_TABLE) {
+        Ok(t) => Ok(t.get(name)?.is_some()),
+        Err(redb::TableError::TableDoesNotExist(_)) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// [`Storage::get_table_schema`]・[`crate::arena::VectorArena::build`]（TASK-87、
 /// 対象ビヘイビア: TABLE-8）が共有するトランザクションスコープの実装本体。
 /// `pub(crate)` で公開し、`arena.rs` が単一の `read_txn` 上でスキーマ取得と
