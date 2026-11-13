@@ -107,6 +107,7 @@ fn skip_stops_the_chain() {
     assert!(out.is_none());
 }
 
+// テスト専用の未結線 invoker（`cfg(test)` の `TriggerRuntime::unwired`）の単体。本番の既定ではない。
 #[test]
 fn unwired_runtime_is_0a000() {
     handle!(h);

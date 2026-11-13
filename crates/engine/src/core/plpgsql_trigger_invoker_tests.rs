@@ -1,13 +1,11 @@
 //! 本番のトリガ関数 invoker と、セッション無しのホスト（`core::plpgsql_trigger_host`）の結合テスト
 //! （TABLE-45・SQL-68・RLS-10。Issue #3184）。
 //!
-//! 本番の `PlpgsqlTriggerInvoker` を `with_trigger_invoker_for_test` で注入し、SQL の
+//! 既定の invoker（本番の `PlpgsqlTriggerInvoker`。Issue #3185 で既定になった）のコアで、SQL の
 //! `CREATE FUNCTION ... RETURNS trigger LANGUAGE plpgsql` と `CREATE TRIGGER`・`INSERT` だけで発火を通す。
-//! 既定の差し替えと wire 経由の E2E は #3185 の担当。期待値は PostgreSQL 17 のトリガの挙動
+//! 期待値は PostgreSQL 17 のトリガの挙動
 //! （BEFORE ROW の戻り値・NULL による行スキップ・エラーでの文全体の取り消し）。設計記録は
 //! `docs/design/plpgsql-subset.md` の「Issue #3184 追記」。
-
-use std::sync::Arc;
 
 use super::EngineCore;
 use crate::kernel::CpuScalarProvider;
@@ -19,7 +17,6 @@ use crate::sql::mode::SessionState;
 use crate::sql::SqlOutcome;
 use crate::storage::{Storage, Visibility};
 use crate::test_util::temp_db::{unique_db_path, CleanupGuard};
-use crate::trigger::call::PlpgsqlTriggerInvoker;
 
 fn ctx(tenant: &str) -> PolicyContext {
     PolicyContext::with_visibilities(tenant, [Visibility::Public, Visibility::Private])
@@ -29,9 +26,8 @@ fn ctx(tenant: &str) -> PolicyContext {
 fn core_with(label: &str, mode: LedgerMode) -> (EngineCore, CleanupGuard) {
     let path = unique_db_path(label);
     let storage = Storage::open(&path).expect("open storage");
-    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
-        .with_ledger_mode(mode)
-        .with_trigger_invoker_for_test(Arc::new(PlpgsqlTriggerInvoker));
+    let core =
+        EngineCore::from_storage(storage, Box::new(CpuScalarProvider)).with_ledger_mode(mode);
     (core, CleanupGuard(path))
 }
 
@@ -646,8 +642,7 @@ fn body_writes_are_checked_against_the_firing_role() {
     let storage = Storage::open(&path).expect("open");
     let admin = make_role(&storage, "admin_r");
     let alice = make_role(&storage, "alice");
-    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
-        .with_trigger_invoker_for_test(Arc::new(PlpgsqlTriggerInvoker));
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
     let c = ctx("t1");
     let admin_run = |sql: &str| {
         let mut s = bound_session(admin, true);

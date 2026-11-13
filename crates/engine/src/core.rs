@@ -3544,7 +3544,7 @@ impl EngineCore {
             incremental_config: crate::incremental::IncrementalConfig::default(),
             ledger_mode: LedgerMode::default(),
             sync_commit: None,
-            trigger_runtime: crate::trigger::TriggerRuntime::unwired(),
+            trigger_runtime: crate::trigger::TriggerRuntime::production(),
             require_where_for_dml: false,
             batch_limits: crate::batch_limits::BatchLimits::default(),
             transaction_limits: crate::sql::transaction::TransactionLimits::default(),
@@ -3834,8 +3834,8 @@ impl EngineCore {
         self.sync_commit.as_ref()
     }
 
-    /// テスト専用: トリガ関数の呼び出し口を差し替える（本番の invoker 結線〔#1720〕が未整備のため、
-    /// 発火側の意味論を注入した呼び出し口で固定する。内部 API は #2228）。
+    /// テスト専用: トリガ関数の呼び出し口を差し替える。本番の既定は `PlpgsqlTriggerInvoker`（Issue #3185）で、
+    /// 発火側の意味論（呼び出し回数・戻り値の注入・crash 注入）を PL/pgSQL から切り離して固定するテストだけが使う。
     #[cfg(test)]
     pub(crate) fn with_trigger_invoker_for_test(
         mut self,
