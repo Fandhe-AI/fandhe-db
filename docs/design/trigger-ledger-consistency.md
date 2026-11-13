@@ -38,8 +38,8 @@ Issue #1723〜#1727 の実装はこの順序のまま完了している。
 
 ## crash 注入の方式
 
-トリガ関数の呼び出し口を差し替えられるのは `cfg(test)` の `with_trigger_invoker_for_test` だけで、
-公開 API だけを使う example・結合テストではトリガを発火できない。公開 API や feature ゲートを
+本ファイルのテストは `cfg(test)` の `with_trigger_invoker_for_test` で注入した invoker を使う（既定は #3185 で本番の
+invoker になり、公開 API の結合テストでも SQL だけで発火できる。注入 invoker の網羅の本物の invoker での再実行は #3188）。公開 API や feature ゲートを
 増やさないため、`recovery::commit_boundary` と同じ自己再帰（`current_exe()` を `--exact` と環境
 変数付きで子として再実行）をテストに置いた。新しい example・script・CI ジョブは作らない。
 
@@ -55,6 +55,6 @@ Issue #1723〜#1727 の実装はこの順序のまま完了している。
 - 台帳の記録を全トリガの副作用の後へ移す分離（D10 の順序との差の解消）は未実施
 - script／CI 形の `crash-test-trigger` は、トリガの本番結線（#2228）・#2229 の後で実現できる
 - PL/pgSQL 本体の `nextval()` を含む再送・越境の検証は #2228 以降
-- wire 経由の E2E は本番の結線の後
+- wire 経由の INSERT 発火の E2E は #3185（`wire_trigger_fire.rs`）。crash・網羅は #3188
 - 共有 `public` 表のトリガの全テナント発火は未決定（[trigger-after-insert.md](trigger-after-insert.md)）
 - トリガ定義を置換・削除した後の再送（D10 の既知の性質）は、定義の置換経路の整備後に固定する

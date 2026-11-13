@@ -1,6 +1,6 @@
 # BEFORE ROW INSERT トリガの発火（TABLE-45・Issue #1723）
 
-- ステータス: 実装記録（発火側の意味論は engine 水準で固定。SQL だけで通す E2E は #2228 の後）
+- ステータス: 実装記録（発火側の意味論は engine 水準で固定。SQL だけで通す E2E は #3185 で追加済み）
 - 対応 Issue: #1723（親 #1720。前提 #1722・実行モデルの ADR は [trigger-execution-model.md](trigger-execution-model.md)）
 - 仕様ポインタ: `docs/spec/04-behavior/` の TABLE-45（本文は転記しない）
 
@@ -10,6 +10,7 @@
 を返してその行の挿入をやめる、という PostgreSQL 17 と同じ意味を engine に入れる。実行モデルの D2（DEFAULT
 の順序）・D3・D4 の段 1〜4・D5・D8（ガードの土台）のうち INSERT に関する部分を担当する。
 
+（記録時点の記述。#2228・#3184・#3185 で実体の結線と既定の本番化は済み、SQL・wire の E2E は #3185。）
 トリガ関数の実体（`RETURNS trigger` の PL/pgSQL 関数）は #2228 の担当で、まだ無い。したがって
 `catalog::trigger::returns_trigger` は常に `false` のままで、SQL の `CREATE TRIGGER` は `42P17` で止まる。
 本 Issue は「呼び出し口」のトレイトだけを定義し（`trigger::call`）、既定の実装は固定文言の `0A000` を返す
@@ -88,7 +89,7 @@
 
 ## 後続への引き継ぎ
 
-- トリガ関数の実体・`returns_trigger` の結線・SQL E2E は #2228。**実体を結線する前に、入れ子の深さ上限
+- トリガ関数の実体・`returns_trigger` の結線は #2228、SQL・wire の E2E は #3185 で済み。**実体を結線する前に、入れ子の深さ上限
   （D11・#1727）が要る**（同じ表に INSERT するトリガは無限再帰になりうる）
 - `RETURNING` の最終値での投影（txn 内の投影コールバック）、文トリガ（#1726）、
   UPSERT・UPDATE／DELETE（#1725）、crash-test と越境マトリクス（#1728）
