@@ -648,3 +648,33 @@ fn body_select_through_a_simple_view_reads_the_base_table() {
     ok(&core, "t1", "INSERT INTO tt (n) VALUES (0)");
     assert_eq!(ints(&core, "t1", "SELECT n FROM tt"), vec![2]);
 }
+
+// 行ループ進行中の表へ FK 参照アクション（ON DELETE CASCADE）で波及する本体の `DELETE` も拒否される（D6 の暫定ガード）。
+// 子表への外側 INSERT の BEFORE ROW が親表を消すと、子の行が連鎖で消えるため `0A000`。
+//
+// intentional: docs/design/trigger-update-delete.md
+#[test]
+fn delete_cascading_into_the_table_in_a_row_loop_is_rejected() {
+    let (core, _g) = core_with("trgdel-fkcascade", LedgerMode::Optional);
+    ok(&core, "t1", "CREATE TABLE parent (k BIGINT PRIMARY KEY)");
+    ok(
+        &core,
+        "t1",
+        "CREATE TABLE child (n BIGINT, pid BIGINT REFERENCES parent ON DELETE CASCADE)",
+    );
+    ok(&core, "t1", "INSERT INTO parent (k) VALUES (1), (2)");
+    ok(&core, "t1", "INSERT INTO child (n, pid) VALUES (10, 1)");
+    create_fn(
+        &core,
+        "t1",
+        "eat_parent",
+        "BEGIN DELETE FROM parent WHERE k = 1; RETURN NEW; END",
+    );
+    trigger(&core, "tb", "BEFORE INSERT", "child", "ROW", "eat_parent");
+    assert_eq!(
+        code(&core, "t1", "INSERT INTO child (n, pid) VALUES (11, 2)"),
+        "0A000"
+    );
+    assert_eq!(ints(&core, "t1", "SELECT n FROM child"), vec![10]);
+    assert_eq!(ints(&core, "t1", "SELECT k FROM parent").len(), 2);
+}

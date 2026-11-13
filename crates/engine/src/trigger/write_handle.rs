@@ -204,6 +204,39 @@ impl<'a> TriggerWriteHandle<'a> {
         f(&TriggerReadSource(self.write_txn))
     }
 
+    /// `table` の行の `DELETE` が参照アクション（`CASCADE`／`SET NULL`／`SET DEFAULT`）で波及しうる表のうち、
+    /// `is_blocked` が真になるものがあるか（行ループ進行中の表の検出に使う。Issue #3187 の D6 ガードの拡張）。
+    /// 参照元 FK を外側と同じ write txn のカタログから推移的に辿る（`NoAction` の FK は波及しない）。循環は
+    /// 訪問済み集合で止める。カタログを読めない場合は検出できないので `Err`（呼び出し側は fail-closed で拒否する）。
+    pub(crate) fn delete_reaches_table(
+        &self,
+        table: &str,
+        is_blocked: impl Fn(&str) -> bool,
+    ) -> Result<bool, SqlSurfaceError> {
+        let mut seen: Vec<String> = vec![table.to_ascii_lowercase()];
+        let mut stack: Vec<String> = vec![table.to_string()];
+        while let Some(parent) = stack.pop() {
+            let referencing =
+                crate::catalog::referencing_foreign_keys_in_txn(self.write_txn, &parent).map_err(
+                    |e| crate::sql::exec::map_insert_write_error(TenantWriteError::from(e)),
+                )?;
+            for (child, fk) in referencing {
+                if matches!(fk.on_delete(), crate::catalog::ReferentialAction::NoAction) {
+                    continue;
+                }
+                if is_blocked(&child.name) {
+                    return Ok(true);
+                }
+                let key = child.name.to_ascii_lowercase();
+                if !seen.contains(&key) {
+                    seen.push(key);
+                    stack.push(child.name.clone());
+                }
+            }
+        }
+        Ok(false)
+    }
+
     /// 書いた表として記録する（重複なし。書いた順）。
     fn note_written(&self, table: &str) {
         let mut written = self.written_tables.borrow_mut();

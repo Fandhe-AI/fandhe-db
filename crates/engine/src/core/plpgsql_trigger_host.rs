@@ -282,6 +282,12 @@ impl EngineCore {
         if crate::trigger::row_loop::is_active(ctx.tenant_id(), table) {
             return Err(unsupported(SELF_MODIFY_UNSUPPORTED));
         }
+        // 参照アクション（CASCADE／SET NULL／SET DEFAULT）が行ループ進行中の表へ波及する形も同じ理由で拒否する
+        // （カタログを読めない場合も検出できないので fail-closed）。
+        let tenant = ctx.tenant_id();
+        if handle.delete_reaches_table(table, |t| crate::trigger::row_loop::is_active(tenant, t))? {
+            return Err(unsupported(SELF_MODIFY_UNSUPPORTED));
+        }
         let _scopes = self.trigger_bind_scopes(session);
         let runtime = self.trigger_runtime.bind(self);
         match stmt {
