@@ -361,9 +361,12 @@ fn trigger_function_can_be_created_and_used_by_create_trigger() {
         "CREATE FUNCTION trg() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$",
     )
     .expect("trigger fn");
+    // 共有 public 表へのトリガは定義時に `0A000`（Issue #3361）。対象は SCHEMA 配下の表に置く。
+    run(&core, "CREATE SCHEMA s").expect("schema");
+    run(&core, "CREATE TABLE s.t (id BIGINT)").expect("table");
     run(
         &core,
-        "CREATE TRIGGER tt BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION trg()",
+        "CREATE TRIGGER tt BEFORE INSERT ON s.t FOR EACH ROW EXECUTE FUNCTION trg()",
     )
     .expect("create trigger");
 }

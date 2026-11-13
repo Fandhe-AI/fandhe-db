@@ -2,8 +2,9 @@
 //!
 //! エラー契約・テナント境界は `crates/engine/tests/table_rls/table45_trigger_ddl.rs`（in-process）が
 //! 確定オラクルで、本ファイルは固定コマンドタグ・SQLSTATE が wire フレーミング越しに観測できることの確認に
-//! 徹する（`wire_udf_call.rs` と同じ流儀）。`RETURNS trigger` 関数は #2228 までないため、成功経路の
-//! `CREATE TRIGGER` タグは engine の単体テスト側で担保する。
+//! 徹する（`wire_udf_call.rs` と同じ流儀）。共有 `public` 表への `CREATE TRIGGER` は定義時に `0A000`
+//! （Issue #3361）で、関数の判定（`42883`）は SCHEMA 配下の表で確かめる。成功経路の `CREATE TRIGGER` タグは
+//! engine 側のテストで担保する。
 
 use crate::common;
 
@@ -57,8 +58,11 @@ fn serve(ddl_user: bool) -> (std::net::SocketAddr, temp_db::CleanupGuard) {
     (addr, guard)
 }
 
-/// DDL 権限のあるユーザー: `DROP TRIGGER IF EXISTS` は固定タグ、`CREATE TRIGGER` の関数不在は `42883`、
-/// `DROP TRIGGER` の不在は `42704`。
+/// DDL 権限のあるユーザー: `DROP TRIGGER IF EXISTS` は固定タグ、共有 public 表への `CREATE TRIGGER` は
+/// `0A000`、SCHEMA 配下の表への `CREATE TRIGGER` の関数不在は `42883`、`DROP TRIGGER` の不在は `42704`。
+///
+/// intentional: docs/design/trigger-catalog.md
+/// 共有 public 表のトリガは、作成後に書き込みだけが失敗する状態を作らないよう定義時に拒否する。
 #[test]
 fn wire_trigger_ddl_tags_and_sqlstates_for_ddl_user() {
     let (addr, _guard) = serve(true);
@@ -71,6 +75,19 @@ fn wire_trigger_ddl_tags_and_sqlstates_for_ddl_user() {
     send_simple_query(
         &mut stream,
         "CREATE TRIGGER g BEFORE INSERT ON docs FOR EACH ROW EXECUTE FUNCTION nosuch()",
+    );
+    expect_error_response_with_sqlstate(&mut stream, "0A000");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(&mut stream, "CREATE SCHEMA s");
+    assert_eq!(read_command_complete(&mut stream), "CREATE SCHEMA");
+    read_ready_for_query(&mut stream);
+    send_simple_query(&mut stream, "CREATE TABLE s.d (a INTEGER)");
+    assert_eq!(read_command_complete(&mut stream), "CREATE TABLE");
+    read_ready_for_query(&mut stream);
+    send_simple_query(
+        &mut stream,
+        "CREATE TRIGGER g BEFORE INSERT ON s.d FOR EACH ROW EXECUTE FUNCTION nosuch()",
     );
     expect_error_response_with_sqlstate(&mut stream, "42883");
     read_ready_for_query(&mut stream);

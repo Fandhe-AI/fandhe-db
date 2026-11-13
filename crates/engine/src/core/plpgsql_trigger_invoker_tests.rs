@@ -89,9 +89,12 @@ fn affected(out: SqlOutcome) -> u64 {
     }
 }
 
-/// 表 `tt (n)`・`audit (n)` を作る。
+/// SCHEMA `s` の表 `s.tt (n)` と、public の `audit (n)` を作る。
 fn base_tables(core: &EngineCore) {
-    ok(core, "t1", "CREATE TABLE tt (n INTEGER)");
+    // 共有 public 表へのトリガは定義時に拒否される（Issue #3361）ため、対象表はテナントの SCHEMA `s` に置く。
+    // 本体が書く監査表は public のまま（本体の INSERT は SCHEMA 修飾の書き込み先を受けない）。
+    ok(core, "t1", "CREATE SCHEMA s");
+    ok(core, "t1", "CREATE TABLE s.tt (n INTEGER)");
     ok(core, "t1", "CREATE TABLE audit (n INTEGER)");
 }
 
@@ -128,9 +131,9 @@ fn before_row_rewrite_applies_to_every_row() {
         "bump",
         "BEGIN NEW.n := NEW.n + 100; RETURN NEW; END",
     );
-    create_trigger(&core, "t1", "tb", "BEFORE", "tt", "bump");
-    ok(&core, "t1", "INSERT INTO tt (n) VALUES (1), (2)");
-    let mut v = ints(&core, "t1", "SELECT n FROM tt");
+    create_trigger(&core, "t1", "tb", "BEFORE", "s.tt", "bump");
+    ok(&core, "t1", "INSERT INTO s.tt (n) VALUES (1), (2)");
+    let mut v = ints(&core, "t1", "SELECT n FROM s.tt");
     v.sort_unstable();
     assert_eq!(v, vec![101, 102]);
 }
@@ -152,11 +155,11 @@ fn before_row_null_skips_the_row() {
         "log_after",
         "BEGIN INSERT INTO audit (n) VALUES (NEW.n); RETURN NULL; END",
     );
-    create_trigger(&core, "t1", "tb", "BEFORE", "tt", "skip2");
-    create_trigger(&core, "t1", "ta", "AFTER", "tt", "log_after");
-    let out = run(&core, "t1", "INSERT INTO tt (n) VALUES (1), (2), (3)").expect("insert");
+    create_trigger(&core, "t1", "tb", "BEFORE", "s.tt", "skip2");
+    create_trigger(&core, "t1", "ta", "AFTER", "s.tt", "log_after");
+    let out = run(&core, "t1", "INSERT INTO s.tt (n) VALUES (1), (2), (3)").expect("insert");
     assert_eq!(affected(out), 2);
-    let mut v = ints(&core, "t1", "SELECT n FROM tt");
+    let mut v = ints(&core, "t1", "SELECT n FROM s.tt");
     v.sort_unstable();
     assert_eq!(v, vec![1, 3]);
     let mut a = ints(&core, "t1", "SELECT n FROM audit");
@@ -164,11 +167,39 @@ fn before_row_null_skips_the_row() {
     assert_eq!(a, vec![1, 3], "skipped row must not reach AFTER ROW");
 }
 
+// INSERT トリガー（BEFORE／AFTER ROW）のある表でも nullable VECTOR の省略・明示 NULL を受理する
+// （トリガーの有無で NULL 保存契約が変わらないこと。PR #2963 レビュー指摘。もとは
+// `tests/sql_named/table26_nullable_vector_storage.rs`。共有 public 表のトリガが作れなくなった
+// Issue #3361 で、本番の invoker を注入できるここへ移した）。
+#[test]
+fn nullable_vector_accepted_on_trigger_tables() {
+    let (core, _g) = core_with("trginv-nullable-vec", LedgerMode::Optional);
+    ok(&core, "t1", "CREATE SCHEMA s");
+    ok(
+        &core,
+        "t1",
+        "CREATE TABLE s.t (id BIGINT PRIMARY KEY, v VECTOR(3), n TEXT)",
+    );
+    create_fn(&core, "t1", "trg", "BEGIN RETURN NEW; END");
+    create_trigger(&core, "t1", "tb", "BEFORE", "s.t", "trg");
+    create_trigger(&core, "t1", "ta", "AFTER", "s.t", "trg");
+    ok(&core, "t1", "INSERT INTO s.t (id, n) VALUES (1, 'omitted')");
+    ok(
+        &core,
+        "t1",
+        "INSERT INTO s.t (id, v, n) VALUES (2, NULL, 'null')",
+    );
+    let stored = rows(&core, "t1", "SELECT id, v FROM s.t LIMIT 100");
+    assert_eq!(stored.len(), 2);
+    assert!(stored.iter().all(|r| matches!(r[1], Cell::Null)));
+}
+
 // (3) AFTER ROW・AFTER STATEMENT が本体の INSERT で監査表へ書く。TG_* が正しい。
 #[test]
 fn after_triggers_write_audit_with_tg_variables() {
     let (core, _g) = core_with("trginv-tgvars", LedgerMode::Optional);
-    ok(&core, "t1", "CREATE TABLE tt (n INTEGER)");
+    ok(&core, "t1", "CREATE SCHEMA s");
+    ok(&core, "t1", "CREATE TABLE s.tt (n INTEGER)");
     ok(
         &core,
         "t1",
@@ -193,14 +224,14 @@ fn after_triggers_write_audit_with_tg_variables() {
     ok(
         &core,
         "t1",
-        "CREATE TRIGGER t_row AFTER INSERT ON tt FOR EACH ROW EXECUTE FUNCTION row_audit('a', 'b')",
+        "CREATE TRIGGER t_row AFTER INSERT ON s.tt FOR EACH ROW EXECUTE FUNCTION row_audit('a', 'b')",
     );
     ok(
         &core,
         "t1",
-        "CREATE TRIGGER t_stmt AFTER INSERT ON tt FOR EACH STATEMENT EXECUTE FUNCTION stmt_audit()",
+        "CREATE TRIGGER t_stmt AFTER INSERT ON s.tt FOR EACH STATEMENT EXECUTE FUNCTION stmt_audit()",
     );
-    ok(&core, "t1", "INSERT INTO tt (n) VALUES (7)");
+    ok(&core, "t1", "INSERT INTO s.tt (n) VALUES (7)");
     let r = rows(
         &core,
         "t1",
@@ -217,7 +248,7 @@ fn after_triggers_write_audit_with_tg_variables() {
     assert_eq!(text(&row[2]), "t_row");
     assert_eq!(text(&row[3]), "AFTER");
     assert_eq!(text(&row[5]), "tt");
-    assert_eq!(text(&row[6]), "public");
+    assert_eq!(text(&row[6]), "s");
     assert!(matches!(&row[7], Cell::SignedInteger(2) | Cell::Integer(2)));
     let stmt = find("STATEMENT");
     assert_eq!(text(&stmt[2]), "t_stmt");
@@ -256,14 +287,14 @@ fn body_errors_abort_the_whole_statement() {
         "BEGIN INSERT INTO strict_audit (n) VALUES (NULL); RETURN NEW; END",
     );
     for (f, expected) in [("boom", "P0001"), ("divz", "22012"), ("nn", "23502")] {
-        ok(&core, "t1", "DROP TRIGGER IF EXISTS tb ON tt");
-        create_trigger(&core, "t1", "tb", "BEFORE", "tt", f);
+        ok(&core, "t1", "DROP TRIGGER IF EXISTS tb ON s.tt");
+        create_trigger(&core, "t1", "tb", "BEFORE", "s.tt", f);
         assert_eq!(
-            code(&core, "t1", "INSERT INTO tt (n) VALUES (1), (2)"),
+            code(&core, "t1", "INSERT INTO s.tt (n) VALUES (1), (2)"),
             expected,
             "{f}"
         );
-        assert!(ints(&core, "t1", "SELECT n FROM tt").is_empty(), "{f}");
+        assert!(ints(&core, "t1", "SELECT n FROM s.tt").is_empty(), "{f}");
         assert_eq!(audit_count(&core, "t1"), 0, "{f}");
         assert!(
             ints(&core, "t1", "SELECT n FROM strict_audit").is_empty(),
@@ -283,14 +314,14 @@ fn body_error_in_explicit_transaction_fails_the_transaction() {
         "boom",
         "BEGIN INSERT INTO audit (n) VALUES (NEW.n); RAISE EXCEPTION 'boom'; END",
     );
-    create_trigger(&core, "t1", "tb", "BEFORE", "tt", "boom");
+    create_trigger(&core, "t1", "tb", "BEFORE", "s.tt", "boom");
     let c = ctx("t1");
     let mut s = session();
     let mut txn = core.new_session_transaction();
     core.execute_sql_in_txn(&c, &mut s, &mut txn, "BEGIN")
         .expect("begin");
     let e = core
-        .execute_sql_in_txn(&c, &mut s, &mut txn, "INSERT INTO tt (n) VALUES (1)")
+        .execute_sql_in_txn(&c, &mut s, &mut txn, "INSERT INTO s.tt (n) VALUES (1)")
         .expect_err("trigger body raises");
     assert_eq!(e.wire_code(), "P0001");
     let e = core
@@ -299,7 +330,7 @@ fn body_error_in_explicit_transaction_fails_the_transaction() {
     assert_eq!(e.wire_code(), "25P02");
     core.execute_sql_in_txn(&c, &mut s, &mut txn, "ROLLBACK")
         .expect("rollback");
-    assert!(ints(&core, "t1", "SELECT n FROM tt").is_empty());
+    assert!(ints(&core, "t1", "SELECT n FROM s.tt").is_empty());
     assert_eq!(audit_count(&core, "t1"), 0);
 }
 
@@ -327,14 +358,14 @@ fn update_delete_and_table_select_in_body_are_rejected_for_now() {
             &f,
             &format!("DECLARE x INTEGER; BEGIN INSERT INTO audit (n) VALUES (50); {stmt}; RETURN NEW; END"),
         );
-        ok(&core, "t1", "DROP TRIGGER IF EXISTS tb ON tt");
-        create_trigger(&core, "t1", "tb", "BEFORE", "tt", &f);
+        ok(&core, "t1", "DROP TRIGGER IF EXISTS tb ON s.tt");
+        create_trigger(&core, "t1", "tb", "BEFORE", "s.tt", &f);
         assert_eq!(
-            code(&core, "t1", "INSERT INTO tt (n) VALUES (1)"),
+            code(&core, "t1", "INSERT INTO s.tt (n) VALUES (1)"),
             "0A000",
             "{stmt}"
         );
-        assert!(ints(&core, "t1", "SELECT n FROM tt").is_empty(), "{stmt}");
+        assert!(ints(&core, "t1", "SELECT n FROM s.tt").is_empty(), "{stmt}");
         assert_eq!(ints(&core, "t1", "SELECT n FROM audit"), vec![1], "{stmt}");
     }
 }
@@ -352,39 +383,42 @@ fn insert_forms_outside_the_write_handle_are_rejected() {
         "INSERT INTO audit (n) VALUES (1) ON CONFLICT (id) DO NOTHING",
         "INSERT INTO audit (n) VALUES (1) RETURNING n",
         "INSERT INTO audit (n) SELECT 1",
-        "INSERT INTO audit (n) SELECT n FROM tt",
+        "INSERT INTO audit (n) SELECT n FROM audit",
     ];
     for (i, stmt) in forms.iter().enumerate() {
         let f = format!("form{i}");
         create_fn(&core, "t1", &f, &format!("BEGIN {stmt}; RETURN NEW; END"));
-        ok(&core, "t1", "DROP TRIGGER IF EXISTS tb ON tt");
-        create_trigger(&core, "t1", "tb", "BEFORE", "tt", &f);
+        ok(&core, "t1", "DROP TRIGGER IF EXISTS tb ON s.tt");
+        create_trigger(&core, "t1", "tb", "BEFORE", "s.tt", &f);
         assert_eq!(
-            code(&core, "t1", "INSERT INTO tt (n) VALUES (1)"),
+            code(&core, "t1", "INSERT INTO s.tt (n) VALUES (1)"),
             "0A000",
             "{stmt}"
         );
-        assert!(ints(&core, "t1", "SELECT n FROM tt").is_empty(), "{stmt}");
+        assert!(ints(&core, "t1", "SELECT n FROM s.tt").is_empty(), "{stmt}");
         assert_eq!(audit_count(&core, "t1"), 0, "{stmt}");
     }
 }
 
 // (6) テナント境界: t1 のトリガは t2 の挿入で発火せず、t1 の書いた監査行は t2 から見えない。
+// 対象表はテナントごとの SCHEMA 配下（共有 public 表のトリガは定義できない。Issue #3361）。
 #[test]
 fn trigger_and_its_writes_stay_inside_the_tenant() {
     let (core, _g) = core_with("trginv-tenant", LedgerMode::Optional);
     base_tables(&core);
+    ok(&core, "t2", "CREATE SCHEMA s");
+    ok(&core, "t2", "CREATE TABLE s.tt (n INTEGER)");
     create_fn(
         &core,
         "t1",
         "log_n",
         "BEGIN INSERT INTO audit (n) VALUES (NEW.n); RETURN NEW; END",
     );
-    create_trigger(&core, "t1", "tb", "BEFORE", "tt", "log_n");
-    ok(&core, "t1", "INSERT INTO tt (n) VALUES (1)");
+    create_trigger(&core, "t1", "tb", "BEFORE", "s.tt", "log_n");
+    ok(&core, "t1", "INSERT INTO s.tt (n) VALUES (1)");
     assert_eq!(audit_count(&core, "t1"), 1);
     assert_eq!(audit_count(&core, "t2"), 0, "t2 must not see t1 audit rows");
-    ok(&core, "t2", "INSERT INTO tt (n) VALUES (2)");
+    ok(&core, "t2", "INSERT INTO s.tt (n) VALUES (2)");
     assert_eq!(
         audit_count(&core, "t1"),
         1,
@@ -399,12 +433,12 @@ fn error_text_does_not_depend_on_other_tenants() {
     let (core, _g) = core_with("trginv-errtext", LedgerMode::Optional);
     base_tables(&core);
     create_fn(&core, "t1", "boom", "BEGIN RAISE EXCEPTION 'boom'; END");
-    create_trigger(&core, "t1", "tb", "BEFORE", "tt", "boom");
-    let before = run(&core, "t1", "INSERT INTO tt (n) VALUES (1)")
+    create_trigger(&core, "t1", "tb", "BEFORE", "s.tt", "boom");
+    let before = run(&core, "t1", "INSERT INTO s.tt (n) VALUES (1)")
         .unwrap_err()
         .client_message();
     create_fn(&core, "t2", "boom", "BEGIN RETURN NEW; END");
-    let after = run(&core, "t1", "INSERT INTO tt (n) VALUES (1)")
+    let after = run(&core, "t1", "INSERT INTO s.tt (n) VALUES (1)")
         .unwrap_err()
         .client_message();
     assert_eq!(before, after);
@@ -422,8 +456,8 @@ fn ledgered_core_records_only_the_outer_statement() {
         "log_n",
         "BEGIN INSERT INTO audit (n) VALUES (NEW.n); RETURN NEW; END",
     );
-    create_trigger(&core, "t1", "ta", "AFTER", "tt", "log_n");
-    let sql = "INSERT INTO tt (n) VALUES (1) USING OPERATION_ID 'op-1'";
+    create_trigger(&core, "t1", "ta", "AFTER", "s.tt", "log_n");
+    let sql = "INSERT INTO s.tt (n) VALUES (1) USING OPERATION_ID 'op-1'";
     ok(&core, "t1", sql);
     assert_eq!(audit_count(&core, "t1"), 1);
     assert_eq!(code(&core, "t1", sql), "23505");
@@ -433,73 +467,136 @@ fn ledgered_core_records_only_the_outer_statement() {
         "resend must not rerun the body"
     );
     // operation_id の無い外側の文は、トリガを呼ぶ前に `23502` で拒否される。
-    assert_eq!(code(&core, "t1", "INSERT INTO tt (n) VALUES (2)"), "23502");
+    assert_eq!(
+        code(&core, "t1", "INSERT INTO s.tt (n) VALUES (2)"),
+        "23502"
+    );
     assert_eq!(audit_count(&core, "t1"), 1);
 }
 
-// (10) 入れ子: 監査表のトリガも発火する。自己再帰は深さ上限で `54001`、何も残らない。
+// (10) 入れ子: 本体が書く先は public の監査表で、その表へのトリガは定義時に `0A000` で拒否される
+// （Issue #3361。共有 public 表のトリガを作れない）。以前の「監査表のトリガも発火する」「自己再帰は深さ上限
+// `54001`」は SQL から作れないため、深さ上限は注入 invoker の `core/trigger_depth_tests.rs` が担う。
+//
+// intentional: docs/design/trigger-catalog.md
+// 共有 public 表への `CREATE TRIGGER` は、後で書き込みだけが失敗する状態を作らないよう定義時に拒否する。
 #[test]
-fn nested_triggers_fire_and_recursion_is_bounded() {
+fn triggers_on_shared_public_tables_cannot_be_defined_for_nesting() {
     let (core, _g) = core_with("trginv-nested", LedgerMode::Optional);
     base_tables(&core);
-    ok(&core, "t1", "CREATE TABLE audit2 (n INTEGER)");
+    create_fn(
+        &core,
+        "t1",
+        "to_audit2",
+        "BEGIN INSERT INTO audit (n) VALUES (NEW.n); RETURN NEW; END",
+    );
+    for form in [
+        "CREATE TRIGGER t2a AFTER INSERT ON audit FOR EACH ROW EXECUTE FUNCTION to_audit2()",
+        "CREATE OR REPLACE TRIGGER t2a AFTER INSERT ON audit FOR EACH ROW EXECUTE FUNCTION to_audit2()",
+        "CREATE TRIGGER t2a AFTER INSERT ON public.audit FOR EACH ROW EXECUTE FUNCTION to_audit2()",
+    ] {
+        assert_eq!(code(&core, "t1", form), "0A000", "{form}");
+        // カタログには何も残らない。
+        assert_eq!(code(&core, "t1", "DROP TRIGGER t2a ON audit"), "42704");
+    }
+}
+
+// (10) 入れ子の保険: 共有 public 表に既存のカタログ定義が残っていても（導入前の DB を `create_trigger_for_test`
+// で模す）、本体の書き込みが起こす入れ子の発火は固定の `0A000` で文全体を取り消す。本体の書き込みも
+// 外側の行も残らない（fail-closed。Issue #3361）。
+//
+// intentional: docs/design/trigger-execution-model.md
+// 共有 public 表のトリガは発火させない（他テナントの書き込みでの挙動が定義できないため）。
+#[test]
+fn legacy_trigger_on_shared_public_table_is_rejected_when_nested() {
+    use super::trigger_insert_tests::{add_trigger, trigger_def};
+    use crate::catalog::trigger::{TriggerLevel, TriggerTiming};
+    let (core, _g) = core_with("trginv-nested-legacy", LedgerMode::Optional);
+    base_tables(&core);
     create_fn(
         &core,
         "t1",
         "to_audit",
         "BEGIN INSERT INTO audit (n) VALUES (NEW.n); RETURN NEW; END",
     );
-    create_fn(
-        &core,
+    create_trigger(&core, "t1", "t1a", "AFTER", "s.tt", "to_audit");
+    ok(&core, "t1", "INSERT INTO s.tt (n) VALUES (4)");
+    assert_eq!(ints(&core, "t1", "SELECT n FROM audit"), vec![4]);
+    add_trigger(
+        &core.storage,
         "t1",
-        "to_audit2",
-        "BEGIN INSERT INTO audit2 (n) VALUES (NEW.n); RETURN NEW; END",
+        "audit",
+        &trigger_def("legacy", TriggerTiming::After, TriggerLevel::Row),
     );
-    create_trigger(&core, "t1", "t1a", "AFTER", "tt", "to_audit");
-    create_trigger(&core, "t1", "t2a", "AFTER", "audit", "to_audit2");
-    ok(&core, "t1", "INSERT INTO tt (n) VALUES (5)");
-    assert_eq!(ints(&core, "t1", "SELECT n FROM audit2"), vec![5]);
-
-    ok(&core, "t1", "CREATE TABLE rec (n INTEGER)");
-    create_fn(
-        &core,
-        "t1",
-        "again",
-        "BEGIN INSERT INTO rec (n) VALUES (NEW.n + 1); RETURN NEW; END",
+    assert_eq!(
+        code(&core, "t1", "INSERT INTO s.tt (n) VALUES (5)"),
+        "0A000"
     );
-    create_trigger(&core, "t1", "tr", "AFTER", "rec", "again");
-    assert_eq!(code(&core, "t1", "INSERT INTO rec (n) VALUES (0)"), "54001");
-    assert!(ints(&core, "t1", "SELECT n FROM rec").is_empty());
+    assert_eq!(ints(&core, "t1", "SELECT n FROM s.tt"), vec![4]);
+    assert_eq!(ints(&core, "t1", "SELECT n FROM audit"), vec![4]);
 }
 
-// 入れ子のトリガ発火は、文数の予算を外側のトリガと合算する（実行モデル D11）。1 段だけなら収まる上限でも、
-// 3 段連鎖すると合算で超過し `54000` になり、文全体が取り消される。
+// 保険（Issue #3361）: 共有 public 表に既存のカタログ定義が残っていても、本番の invoker は
+// BEFORE／AFTER・ROW／STATEMENT のいずれも INSERT・UPDATE・DELETE・TRUNCATE で固定の `0A000` を返し、
+// 行・台帳を残さない。明示 Tx は `25P02` を経て ROLLBACK で戻る。
+//
+// intentional: docs/design/trigger-execution-model.md
+// 発火時の拒否は fail-closed のまま維持する（定義時の拒否の導入前に残った定義への保険）。
 #[test]
-fn nested_triggers_share_the_statement_budget() {
-    let limits = crate::plpgsql_limits::PlpgsqlLimits::new(4, 1_000, 32, 65_536, 32);
-    let (core, _g) = core_with("trginv-budget", LedgerMode::Optional);
-    let core = core.with_plpgsql_limits(limits);
-    base_tables(&core);
-    ok(&core, "t1", "CREATE TABLE audit2 (n INTEGER)");
-    ok(&core, "t1", "CREATE TABLE audit3 (n INTEGER)");
-    for (name, dst) in [("f1", "audit"), ("f2", "audit2"), ("f3", "audit3")] {
-        create_fn(
-            &core,
-            "t1",
-            name,
-            &format!("BEGIN INSERT INTO {dst} (n) VALUES (NEW.n); RETURN NEW; END"),
-        );
+fn legacy_triggers_on_shared_public_tables_never_fire() {
+    use super::trigger_insert_tests::{add_trigger, trigger_def};
+    use crate::catalog::trigger::{TriggerEvents, TriggerLevel, TriggerTiming};
+    let (core, _g) = core_with("trginv-legacy-fire", LedgerMode::Optional);
+    ok(&core, "t1", "CREATE TABLE pub (n INTEGER)");
+    ok(&core, "t1", "INSERT INTO pub (n) VALUES (1)");
+    for (timing, level) in [
+        (TriggerTiming::Before, TriggerLevel::Row),
+        (TriggerTiming::After, TriggerLevel::Row),
+        (TriggerTiming::Before, TriggerLevel::Statement),
+        (TriggerTiming::After, TriggerLevel::Statement),
+    ] {
+        let mut def = trigger_def("legacy", timing, level);
+        def.events = TriggerEvents::from_bits(
+            TriggerEvents::INSERT | TriggerEvents::UPDATE | TriggerEvents::DELETE,
+        )
+        .expect("events");
+        add_trigger(&core.storage, "t1", "pub", &def);
+        for sql in [
+            "INSERT INTO pub (n) VALUES (2)",
+            "UPDATE pub SET n = 9",
+            "DELETE FROM pub",
+        ] {
+            assert_eq!(code(&core, "t1", sql), "0A000", "{sql}");
+        }
+        assert_eq!(ints(&core, "t1", "SELECT n FROM pub"), vec![1]);
+        assert!(core
+            .storage
+            .drop_trigger("t1", "pub", "legacy")
+            .expect("drop"));
     }
-    // 1 段（tt -> audit）は単独の本体 1 回分で上限内。
-    create_trigger(&core, "t1", "g1", "AFTER", "tt", "f1");
-    ok(&core, "t1", "INSERT INTO tt (n) VALUES (1)");
-    assert_eq!(ints(&core, "t1", "SELECT n FROM audit"), vec![1]);
-    // 3 段へ伸ばすと、子の文数が親に計上され合算で上限へ達する。
-    create_trigger(&core, "t1", "g2", "AFTER", "audit", "f2");
-    create_trigger(&core, "t1", "g3", "AFTER", "audit2", "f3");
-    assert_eq!(code(&core, "t1", "INSERT INTO tt (n) VALUES (2)"), "54000");
-    assert_eq!(ints(&core, "t1", "SELECT n FROM audit"), vec![1]);
-    assert!(ints(&core, "t1", "SELECT n FROM audit3").is_empty());
+    // 明示 Tx: 失敗後は `25P02`、ROLLBACK で戻る。
+    add_trigger(
+        &core.storage,
+        "t1",
+        "pub",
+        &trigger_def("legacy", TriggerTiming::After, TriggerLevel::Row),
+    );
+    let c = ctx("t1");
+    let mut s = session();
+    let mut txn = core.new_session_transaction();
+    core.execute_sql_in_txn(&c, &mut s, &mut txn, "BEGIN")
+        .expect("begin");
+    let e = core
+        .execute_sql_in_txn(&c, &mut s, &mut txn, "INSERT INTO pub (n) VALUES (3)")
+        .expect_err("legacy trigger is rejected");
+    assert_eq!(e.wire_code(), "0A000");
+    let e = core
+        .execute_sql_in_txn(&c, &mut s, &mut txn, "SELECT 1")
+        .expect_err("failed transaction");
+    assert_eq!(e.wire_code(), "25P02");
+    core.execute_sql_in_txn(&c, &mut s, &mut txn, "ROLLBACK")
+        .expect("rollback");
+    assert_eq!(ints(&core, "t1", "SELECT n FROM pub"), vec![1]);
 }
 
 // (12) STABLE のトリガ関数は書き込めない（揮発性ゲート）。
@@ -516,9 +613,12 @@ fn stable_trigger_function_cannot_write() {
         "CREATE FUNCTION st() RETURNS trigger LANGUAGE plpgsql STABLE AS $$ \
          BEGIN INSERT INTO audit (n) VALUES (NEW.n); RETURN NEW; END $$",
     );
-    create_trigger(&core, "t1", "tb", "BEFORE", "tt", "st");
-    assert_eq!(code(&core, "t1", "INSERT INTO tt (n) VALUES (1)"), "0A000");
-    assert!(ints(&core, "t1", "SELECT n FROM tt").is_empty());
+    create_trigger(&core, "t1", "tb", "BEFORE", "s.tt", "st");
+    assert_eq!(
+        code(&core, "t1", "INSERT INTO s.tt (n) VALUES (1)"),
+        "0A000"
+    );
+    assert!(ints(&core, "t1", "SELECT n FROM s.tt").is_empty());
     assert_eq!(audit_count(&core, "t1"), 0);
 }
 
@@ -537,9 +637,9 @@ fn exception_block_catches_only_when_nothing_was_written() {
         "catch_eval",
         "DECLARE z INTEGER; BEGIN BEGIN z := 1 / 0; EXCEPTION WHEN division_by_zero THEN NEW.n := -1; END; RETURN NEW; END",
     );
-    create_trigger(&core, "t1", "tb", "BEFORE", "tt", "catch_eval");
-    ok(&core, "t1", "INSERT INTO tt (n) VALUES (1)");
-    assert_eq!(ints(&core, "t1", "SELECT n FROM tt"), vec![-1]);
+    create_trigger(&core, "t1", "tb", "BEFORE", "s.tt", "catch_eval");
+    ok(&core, "t1", "INSERT INTO s.tt (n) VALUES (1)");
+    assert_eq!(ints(&core, "t1", "SELECT n FROM s.tt"), vec![-1]);
 
     create_fn(
         &core,
@@ -548,10 +648,13 @@ fn exception_block_catches_only_when_nothing_was_written() {
         "BEGIN BEGIN INSERT INTO audit (n) VALUES (NEW.n); RAISE EXCEPTION 'x'; \
          EXCEPTION WHEN OTHERS THEN NEW.n := -2; END; RETURN NEW; END",
     );
-    ok(&core, "t1", "DROP TRIGGER tb ON tt");
-    create_trigger(&core, "t1", "tb", "BEFORE", "tt", "catch_after_write");
-    assert_eq!(code(&core, "t1", "INSERT INTO tt (n) VALUES (2)"), "0A000");
-    assert_eq!(ints(&core, "t1", "SELECT n FROM tt"), vec![-1]);
+    ok(&core, "t1", "DROP TRIGGER tb ON s.tt");
+    create_trigger(&core, "t1", "tb", "BEFORE", "s.tt", "catch_after_write");
+    assert_eq!(
+        code(&core, "t1", "INSERT INTO s.tt (n) VALUES (2)"),
+        "0A000"
+    );
+    assert_eq!(ints(&core, "t1", "SELECT n FROM s.tt"), vec![-1]);
     assert_eq!(audit_count(&core, "t1"), 0);
 }
 
@@ -566,8 +669,8 @@ fn trailing_semicolon_statement_fires() {
         "log_n",
         "BEGIN INSERT INTO audit (n) VALUES (NEW.n); RETURN NEW; END",
     );
-    create_trigger(&core, "t1", "ta", "AFTER", "tt", "log_n");
-    ok(&core, "t1", "INSERT INTO tt (n) VALUES (3);");
+    create_trigger(&core, "t1", "ta", "AFTER", "s.tt", "log_n");
+    ok(&core, "t1", "INSERT INTO s.tt (n) VALUES (3);");
     assert_eq!(ints(&core, "t1", "SELECT n FROM audit"), vec![3]);
 }
 
@@ -661,19 +764,21 @@ fn body_writes_are_checked_against_the_firing_role() {
             Err(e) => e.wire_code().to_string(),
         }
     };
-    admin_run("CREATE TABLE tt (n INTEGER)");
+    admin_run("CREATE SCHEMA s");
+    admin_run("CREATE TABLE s.tt (n INTEGER)");
     admin_run("CREATE TABLE audit (n INTEGER)");
     admin_run(
         "CREATE FUNCTION log_n() RETURNS trigger LANGUAGE plpgsql AS $$ \
          BEGIN INSERT INTO audit (n) VALUES (NEW.n); RETURN NEW; END $$",
     );
-    admin_run("CREATE TRIGGER ta AFTER INSERT ON tt FOR EACH ROW EXECUTE FUNCTION log_n()");
-    admin_run("GRANT INSERT ON tt TO alice");
-    assert_eq!(alice_code("INSERT INTO tt (n) VALUES (1)"), "42501");
-    assert!(ints(&core, "t1", "SELECT n FROM tt").is_empty());
+    admin_run("CREATE TRIGGER ta AFTER INSERT ON s.tt FOR EACH ROW EXECUTE FUNCTION log_n()");
+    admin_run("GRANT USAGE ON SCHEMA s TO alice");
+    admin_run("GRANT INSERT ON s.tt TO alice");
+    assert_eq!(alice_code("INSERT INTO s.tt (n) VALUES (1)"), "42501");
+    assert!(ints(&core, "t1", "SELECT n FROM s.tt").is_empty());
     assert_eq!(audit_count(&core, "t1"), 0);
     admin_run("GRANT INSERT ON audit TO alice");
-    assert_eq!(alice_code("INSERT INTO tt (n) VALUES (1)"), "ok");
+    assert_eq!(alice_code("INSERT INTO s.tt (n) VALUES (1)"), "ok");
     assert_eq!(audit_count(&core, "t1"), 1);
 }
 
@@ -682,7 +787,8 @@ fn body_writes_are_checked_against_the_firing_role() {
 #[test]
 fn body_insert_has_sequence_and_clock_scopes_when_outer_is_delete() {
     let (core, _g) = core_with("trginv-scopes", LedgerMode::Optional);
-    ok(&core, "t1", "CREATE TABLE tt (n INTEGER)");
+    ok(&core, "t1", "CREATE SCHEMA s");
+    ok(&core, "t1", "CREATE TABLE s.tt (n INTEGER)");
     ok(&core, "t1", "CREATE TABLE audit (n INTEGER, ts TIMESTAMP)");
     ok(&core, "t1", "CREATE SEQUENCE aq");
     create_fn(
@@ -694,12 +800,12 @@ fn body_insert_has_sequence_and_clock_scopes_when_outer_is_delete() {
     ok(
         &core,
         "t1",
-        "CREATE TRIGGER t_del AFTER DELETE ON tt FOR EACH ROW EXECUTE FUNCTION del_audit()",
+        "CREATE TRIGGER t_del AFTER DELETE ON s.tt FOR EACH ROW EXECUTE FUNCTION del_audit()",
     );
-    ok(&core, "t1", "INSERT INTO tt (n) VALUES (1)");
-    ok(&core, "t1", "INSERT INTO tt (n) VALUES (2)");
-    ok(&core, "t1", "DELETE FROM tt WHERE n = 1");
-    ok(&core, "t1", "DELETE FROM tt WHERE n = 2");
+    ok(&core, "t1", "INSERT INTO s.tt (n) VALUES (1)");
+    ok(&core, "t1", "INSERT INTO s.tt (n) VALUES (2)");
+    ok(&core, "t1", "DELETE FROM s.tt WHERE n = 1");
+    ok(&core, "t1", "DELETE FROM s.tt WHERE n = 2");
     assert_eq!(ints(&core, "t1", "SELECT n FROM audit"), vec![1, 2]);
 }
 
@@ -708,7 +814,8 @@ fn body_insert_has_sequence_and_clock_scopes_when_outer_is_delete() {
 #[test]
 fn body_now_outside_values_is_accepted_when_outer_is_delete() {
     let (core, _g) = core_with("trginv-now-forms", LedgerMode::Optional);
-    ok(&core, "t1", "CREATE TABLE tt (n INTEGER)");
+    ok(&core, "t1", "CREATE SCHEMA s");
+    ok(&core, "t1", "CREATE TABLE s.tt (n INTEGER)");
     ok(&core, "t1", "CREATE TABLE audit (n INTEGER)");
     for (i, body) in [
         "DECLARE t TIMESTAMP; BEGIN t := now(); INSERT INTO audit (n) VALUES (1); RETURN NULL; END",
@@ -722,11 +829,11 @@ fn body_now_outside_values_is_accepted_when_outer_is_delete() {
         ok(
             &core,
             "t1",
-            &format!("CREATE TRIGGER g{i} AFTER DELETE ON tt FOR EACH ROW EXECUTE FUNCTION {f}()"),
+            &format!("CREATE TRIGGER g{i} AFTER DELETE ON s.tt FOR EACH ROW EXECUTE FUNCTION {f}()"),
         );
     }
-    ok(&core, "t1", "INSERT INTO tt (n) VALUES (1)");
-    ok(&core, "t1", "DELETE FROM tt WHERE n = 1");
+    ok(&core, "t1", "INSERT INTO s.tt (n) VALUES (1)");
+    ok(&core, "t1", "DELETE FROM s.tt WHERE n = 1");
     assert_eq!(ints(&core, "t1", "SELECT n FROM audit"), vec![1, 2]);
 }
 /// 明示 Tx 内で `stmts` を実行し、続けて `SELECT now()` を返す（`BEGIN` の時刻と本体の時刻を比べる）。
@@ -758,7 +865,8 @@ fn in_txn_then_now(core: &EngineCore, stmts: &[&str]) -> Cell {
 #[test]
 fn truncate_trigger_shares_explicit_txn_start_time() {
     let (core, _g) = core_with("trginv-trunc-clock", LedgerMode::Optional);
-    ok(&core, "t1", "CREATE TABLE tt (n INTEGER)");
+    ok(&core, "t1", "CREATE SCHEMA s");
+    ok(&core, "t1", "CREATE TABLE s.tt (n INTEGER)");
     ok(&core, "t1", "CREATE TABLE audit_ts (ts TIMESTAMP)");
     create_fn(
         &core,
@@ -769,9 +877,9 @@ fn truncate_trigger_shares_explicit_txn_start_time() {
     ok(
         &core,
         "t1",
-        "CREATE TRIGGER t_trunc AFTER TRUNCATE ON tt FOR EACH STATEMENT EXECUTE FUNCTION trunc_audit()",
+        "CREATE TRIGGER t_trunc AFTER TRUNCATE ON s.tt FOR EACH STATEMENT EXECUTE FUNCTION trunc_audit()",
     );
-    let now = in_txn_then_now(&core, &["TRUNCATE tt"]);
+    let now = in_txn_then_now(&core, &["TRUNCATE s.tt"]);
     let r = rows(&core, "t1", "SELECT ts FROM audit_ts");
     assert_eq!(r.len(), 1);
     assert_eq!(r[0][0], now, "trigger now() must equal the BEGIN time");
@@ -781,7 +889,8 @@ fn truncate_trigger_shares_explicit_txn_start_time() {
 #[test]
 fn delete_trigger_inserts_share_one_time_in_explicit_txn() {
     let (core, _g) = core_with("trginv-del-clock", LedgerMode::Optional);
-    ok(&core, "t1", "CREATE TABLE tt (n INTEGER)");
+    ok(&core, "t1", "CREATE SCHEMA s");
+    ok(&core, "t1", "CREATE TABLE s.tt (n INTEGER)");
     ok(&core, "t1", "CREATE TABLE audit_ts (ts TIMESTAMP)");
     create_fn(
         &core,
@@ -793,10 +902,10 @@ fn delete_trigger_inserts_share_one_time_in_explicit_txn() {
     ok(
         &core,
         "t1",
-        "CREATE TRIGGER t_del AFTER DELETE ON tt FOR EACH STATEMENT EXECUTE FUNCTION del_audit()",
+        "CREATE TRIGGER t_del AFTER DELETE ON s.tt FOR EACH STATEMENT EXECUTE FUNCTION del_audit()",
     );
-    ok(&core, "t1", "INSERT INTO tt (n) VALUES (1)");
-    let now = in_txn_then_now(&core, &["DELETE FROM tt WHERE n = 1"]);
+    ok(&core, "t1", "INSERT INTO s.tt (n) VALUES (1)");
+    let now = in_txn_then_now(&core, &["DELETE FROM s.tt WHERE n = 1"]);
     let r = rows(&core, "t1", "SELECT ts FROM audit_ts");
     assert_eq!(r.len(), 2);
     assert_eq!(r[0][0], now);

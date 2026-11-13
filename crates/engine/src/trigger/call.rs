@@ -183,11 +183,20 @@ pub(crate) trait TriggerHost: Sync {
 /// 本番の呼び出し口（Issue #3184）。`call.host`（`EngineCore`）へ委譲するだけで状態を持たない。
 /// 既定への差し替え（`EngineCore::new`）と wire 経由の検証は #3185 の担当で、それまではテストが
 /// `with_trigger_invoker_for_test` で注入する。ホスト未束縛の経路は固定文言の `0A000`（fail-closed）。
+///
+/// 共有 `public` 表のトリガは定義時に拒否する（Issue #3361）。それ以前にカタログへ残った定義への保険として、
+/// 対象が共有 `public` 表なら（内部キーの解析失敗も含め）ホストへ委譲せず `0A000` を返す。判定は書き込み
+/// テナント自身の scope の定義にだけ作用し、他テナントの定義の有無に依存しない。
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct PlpgsqlTriggerInvoker;
 
 impl TriggerFunctionInvoker for PlpgsqlTriggerInvoker {
     fn invoke(&self, call: &TriggerCall<'_>) -> Result<TriggerOutcome, SqlSurfaceError> {
+        if crate::catalog::trigger::is_shared_public_table_key(call.table) {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "triggers on shared public tables are not supported",
+            ));
+        }
         match call.host {
             Some(host) => host.invoke_trigger(call),
             None => Err(SqlSurfaceError::FeatureNotSupported {

@@ -100,7 +100,7 @@ fn populate(core: &EngineCore, t: &str) {
          AS $q$ SELECT n, 'it''s' $q$",
         "CREATE FUNCTION app.scoped(x INTEGER) RETURNS INTEGER LANGUAGE sql AS $q$ SELECT x $q$",
         "CREATE FUNCTION trg() RETURNS trigger LANGUAGE plpgsql AS $q$ BEGIN RETURN NEW; END $q$",
-        "CREATE TRIGGER parent_trg BEFORE INSERT OR UPDATE OF name ON parent \
+        "CREATE TRIGGER parent_trg BEFORE INSERT OR UPDATE OF label ON app.items \
          FOR EACH ROW EXECUTE FUNCTION trg('a', 'it''s')",
         "CREATE POLICY pol_sel ON parent AS RESTRICTIVE FOR SELECT USING (id > 0)",
         "CREATE POLICY pol_ins ON parent FOR INSERT WITH CHECK (id > 0)",
