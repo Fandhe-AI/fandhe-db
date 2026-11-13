@@ -482,3 +482,83 @@ fn sparse_text_eval_duplicate_filters_are_deduplicated_before_evaluation() {
         ))
     );
 }
+
+/// `merge_add_sorted` は入力順の加算（`(a + b) + c`）を保ち、片側のみの文書をそのまま残す。
+#[test]
+fn merge_add_sorted_keeps_input_order_and_unions() {
+    let (a, b, c) = (0.1_f64, 0.2_f64, 0.3_f64);
+    assert_ne!((a + b) + c, a + (b + c));
+    let r1 = super::merge_add_sorted(&[], &[(2, a), (5, a)]);
+    let r2 = super::merge_add_sorted(&r1, &[(1, b), (5, b)]);
+    let r3 = super::merge_add_sorted(&r2, &[(5, c), (9, c)]);
+    let bits: Vec<(u32, u64)> = r3.iter().map(|&(d, s)| (d, s.to_bits())).collect();
+    assert_eq!(
+        bits,
+        vec![
+            (1, b.to_bits()),
+            (2, a.to_bits()),
+            (5, ((a + b) + c).to_bits()),
+            (9, c.to_bits()),
+        ]
+    );
+    assert!(super::merge_add_sorted(&[], &[]).is_empty());
+}
+
+/// 全候補（`top` の上限に依らず）を `(doc_id, to_bits)` の写像として取り出す。
+fn all_bits(idx: &SparseIndex, q: &str, vis: &BTreeSet<DocId>) -> BTreeMap<DocId, u64> {
+    let mut s = idx
+        .score_text_query_str_within(q, vis, idx.params(), &TextQueryLimits::default())
+        .unwrap();
+    let n = s.len();
+    s.top(n.max(1))
+        .into_iter()
+        .map(|d| (d.doc_id, d.score.to_bits()))
+        .collect()
+}
+
+/// 複数グループの累積は、各グループを独立に評価して入力順に `0.0 + s` から加算した値と
+/// ビット一致する（旧 BTreeMap 累積のオラクル）。単一グループ（演算子あり）も同様。
+#[test]
+fn sparse_text_eval_accumulation_matches_per_group_oracle() {
+    let idx = index();
+    for vis in [all(), BTreeSet::new()] {
+        for q in [
+            "alpha or beta",
+            "alpha or beta or gamma",
+            "alpha or alpha",
+            "-alpha or beta",
+            "alpha or unknownterm",
+            "unknownterm or other_unknown",
+            "alpha -beta",
+            "foo* or alpha",
+            "alpha beta or beta gamma or tokyo alpha",
+        ] {
+            let mut oracle: BTreeMap<DocId, f64> = BTreeMap::new();
+            for g in q.split(" or ") {
+                for (d, s) in all_bits(&idx, g, &vis) {
+                    *oracle.entry(d).or_insert(0.0) += f64::from_bits(s);
+                }
+            }
+            let expect: BTreeMap<DocId, u64> =
+                oracle.into_iter().map(|(d, s)| (d, s.to_bits())).collect();
+            assert_eq!(all_bits(&idx, q, &vis), expect, "query {q:?}");
+        }
+    }
+}
+
+/// 演算子なしの検索語は全候補までビット一致する（D8）。
+#[test]
+fn sparse_text_eval_plain_query_all_candidates_bit_identical() {
+    let idx = index();
+    let vis = all();
+    for q in ["alpha", "alpha beta", "foo food foobar", "alpha 東京"] {
+        let mut a = idx.score_within_with_params(q, &vis, idx.params()).unwrap();
+        let n = a.len();
+        let ta: BTreeMap<DocId, u64> = a
+            .top(n.max(1))
+            .into_iter()
+            .map(|d| (d.doc_id, d.score.to_bits()))
+            .collect();
+        assert_eq!(ta, all_bits(&idx, q, &vis), "query {q:?}");
+    }
+}

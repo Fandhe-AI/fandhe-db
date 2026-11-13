@@ -374,6 +374,14 @@ impl SessionState {
         self.search_path.hides_public(self.session_user.as_deref())
     }
 
+    /// 実効 `search_path` の展開後の要素に、`public`・組み込み SCHEMA・`pg_temp` 以外の名前（自テナントの
+    /// SCHEMA かもしれない名前）があるか。偽なら未修飾名の解決（`sql::search_path::resolve_path_refs`）は
+    /// カタログを引かない（Rust API の既定セッション〔username 無し〕がこれに当たる。Issue #3195）。
+    pub(crate) fn search_path_may_hold_tenant_schema(&self) -> bool {
+        self.search_path
+            .may_contain_tenant_schema(self.session_user.as_deref())
+    }
+
     /// `"$user"` の展開に使う username（未設定なら `None`）。
     pub(crate) fn session_user(&self) -> Option<&str> {
         self.session_user.as_deref()

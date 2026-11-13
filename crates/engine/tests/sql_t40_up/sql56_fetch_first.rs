@@ -511,12 +511,17 @@ fn prepared_statements_accept_the_same_forms() {
 fn cursor_fetch_statements_still_parse() {
     let (core, _g) = build("sql56f-cursor", None);
     // 文頭の `FETCH` はカーソル文のまま（書き換えない）。
-    for sql in ["FETCH 2 FROM c", "FETCH FORWARD 3 FROM c"] {
+    for sql in [
+        "FETCH 2 FROM c",
+        "FETCH FORWARD 3 FROM c",
+        "FETCH NEXT FROM c",
+        "FETCH 1 IN c",
+    ] {
         let parsed = core.parse_sql(sql);
         assert!(parsed.is_ok(), "{sql}: {:?}", parsed.err());
     }
-    // カーソル文の文法外（件数が数値でない）は従来どおり構文エラー。
-    for sql in ["FETCH NEXT FROM c", "FETCH FIRST FROM c"] {
+    // カーソル文の文法外（前方向以外の方向指定）は従来どおり構文エラー。
+    for sql in ["FETCH FIRST FROM c", "FETCH PRIOR FROM c"] {
         assert_eq!(
             core.parse_sql(sql).err().map(|e| e.wire_code()),
             Some("42601"),
