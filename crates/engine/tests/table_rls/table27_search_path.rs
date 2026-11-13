@@ -937,6 +937,28 @@ fn snapshot_txn_resolves_path_schema_from_the_begin_snapshot() {
     }
 }
 
+/// 明示 Tx の `BEGIN` 後に別セッションが SCHEMA を改名・DROP しても、`COPY` の安全弁は `BEGIN` 時点の
+/// スナップショットで判定し、public 側へ黙って向けず `0A000` にする（Issue #3195 レビュー指摘）。
+#[test]
+fn copy_in_txn_rejects_path_schema_from_the_begin_snapshot() {
+    for ddl in ["ALTER SCHEMA q1 RENAME TO q9", "DROP SCHEMA q1 CASCADE"] {
+        let (core, _g, mut s) = q1_world("sp-copy-snap-schema");
+        ok(&core, &mut s, "SET search_path TO q1, public");
+        let c = ctx(TENANT);
+        let mut txn = core.new_session_transaction();
+        core.execute_sql_in_txn(&c, &mut s, &mut txn, "BEGIN")
+            .expect("begin");
+        let mut other = ddl_session();
+        ok(&core, &mut other, ddl);
+        match core.begin_copy_in_txn(&c, &s, &mut txn, "COPY t TO STDOUT") {
+            Err(e) => assert_eq!(e.wire_code(), "0A000", "{ddl}"),
+            Ok(_) => panic!("{ddl}: COPY must be rejected"),
+        }
+        core.execute_sql_in_txn(&c, &mut s, &mut txn, "ROLLBACK")
+            .expect("rollback");
+    }
+}
+
 #[test]
 fn path_elements_are_resolved_in_order() {
     let (core, _g, mut s) = q1_world("sp-read-order");

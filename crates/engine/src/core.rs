@@ -17138,7 +17138,7 @@ impl EngineCore {
         session: &crate::sql::mode::SessionState,
         sql: &str,
     ) -> Result<CopyPlan, crate::sql::allowlist::SqlSurfaceError> {
-        self.check_copy_search_path(ctx, session, sql)?;
+        self.check_copy_search_path(ctx, session, sql, None)?;
         if let Some(plan) = self.begin_copy_temp(
             ctx,
             session,
@@ -17180,6 +17180,7 @@ impl EngineCore {
         ctx: &PolicyContext,
         session: &crate::sql::mode::SessionState,
         sql: &str,
+        read_snap: Option<&redb::ReadTransaction>,
     ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
         if !(session.search_path_hides_public() || session.search_path_may_hold_tenant_schema()) {
             return Ok(());
@@ -17187,7 +17188,7 @@ impl EngineCore {
         let Ok(tokens) = crate::sql::lexer::tokenize_marked(sql) else {
             return Ok(());
         };
-        self.reject_path_resolved_refs(Some(ctx.tenant_id()), session, &tokens, &[], None)?;
+        self.reject_path_resolved_refs(Some(ctx.tenant_id()), session, &tokens, &[], read_snap)?;
         if !session.search_path_hides_public() {
             return Ok(());
         }
@@ -17348,7 +17349,20 @@ impl EngineCore {
         txn: &mut crate::sql::transaction::SessionTransaction<'e>,
         sql: &str,
     ) -> Result<CopyPlan, crate::sql::allowlist::SqlSurfaceError> {
-        self.check_copy_search_path(ctx, session, sql)?;
+        // 明示 Tx の途中（writer 取得前）は `COPY TO` の検証・実行と同じ `BEGIN` 時点のスナップショットで
+        // 安全弁を判定する（最新カタログだと BEGIN 後の DROP・RENAME で SCHEMA を飛ばし public 側へ向く）。
+        {
+            let snap = if txn.status() == crate::sql::transaction::TransactionStatus::InTransaction
+            {
+                match txn.read_source()? {
+                    crate::sql::transaction::TxnReadSource::BeginSnapshot(snap) => Some(snap),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            self.check_copy_search_path(ctx, session, sql, snap)?;
+        }
         if let Some(plan) = self.begin_copy_temp(ctx, session, Some(&mut *txn), sql)? {
             return Ok(plan);
         }
