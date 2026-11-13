@@ -2517,8 +2517,10 @@ fn statement_clock_scope(
         | ParsedSql::ExplainAnalyzeDml(_)
         // Issue #2060: 中身の計画段・列の導出が同じ束縛を行うため同様に張る。
         | ParsedSql::ExplainVerbose(_) => true,
-        ParsedSql::Truncate(_)
-        | ParsedSql::Transaction(_)
+        // Issue #3184: `TRUNCATE` 文トリガの本体が `now()` 系を外側の文・Tx と同じ時刻で評価できるよう、
+        // 文の開始時刻（明示 Tx では BEGIN 時刻）を入口で束縛する（トリガ側は現在時刻を発明しない）。
+        ParsedSql::Truncate(_) => true,
+        ParsedSql::Transaction(_)
         | ParsedSql::SetTransaction(_)
         | ParsedSql::DropTable(_)
         | ParsedSql::CreateTable(_)

@@ -729,3 +729,76 @@ fn body_now_outside_values_is_accepted_when_outer_is_delete() {
     ok(&core, "t1", "DELETE FROM tt WHERE n = 1");
     assert_eq!(ints(&core, "t1", "SELECT n FROM audit"), vec![1, 2]);
 }
+/// 明示 Tx 内で `stmts` を実行し、続けて `SELECT now()` を返す（`BEGIN` の時刻と本体の時刻を比べる）。
+fn in_txn_then_now(core: &EngineCore, stmts: &[&str]) -> Cell {
+    let c = ctx("t1");
+    let mut s = session();
+    let mut txn = core.new_session_transaction();
+    core.execute_sql_in_txn(&c, &mut s, &mut txn, "BEGIN")
+        .expect("begin");
+    // `BEGIN` との時刻差が出るよう、本体の実行まで少し待つ。
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    for sql in stmts {
+        core.execute_sql_in_txn(&c, &mut s, &mut txn, sql)
+            .unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+    }
+    let now = match core
+        .execute_sql_in_txn(&c, &mut s, &mut txn, "SELECT now()")
+        .expect("now")
+    {
+        SqlOutcome::Query(q) => q.rows[0].cells[0].clone(),
+        other => panic!("expected query, got {other:?}"),
+    };
+    core.execute_sql_in_txn(&c, &mut s, &mut txn, "COMMIT")
+        .expect("commit");
+    now
+}
+
+// Issue #3184（レビュー指摘）: `TRUNCATE` の文トリガ本体の `now()` は明示 Tx の `BEGIN` 時刻と一致する。
+#[test]
+fn truncate_trigger_shares_explicit_txn_start_time() {
+    let (core, _g) = core_with("trginv-trunc-clock", LedgerMode::Optional);
+    ok(&core, "t1", "CREATE TABLE tt (n INTEGER)");
+    ok(&core, "t1", "CREATE TABLE audit_ts (ts TIMESTAMP)");
+    create_fn(
+        &core,
+        "t1",
+        "trunc_audit",
+        "BEGIN INSERT INTO audit_ts (ts) VALUES (now()); RETURN NULL; END",
+    );
+    ok(
+        &core,
+        "t1",
+        "CREATE TRIGGER t_trunc AFTER TRUNCATE ON tt FOR EACH STATEMENT EXECUTE FUNCTION trunc_audit()",
+    );
+    let now = in_txn_then_now(&core, &["TRUNCATE tt"]);
+    let r = rows(&core, "t1", "SELECT ts FROM audit_ts");
+    assert_eq!(r.len(), 1);
+    assert_eq!(r[0][0], now, "trigger now() must equal the BEGIN time");
+}
+
+// Issue #3184（レビュー指摘）: 1 本体内の複数 `INSERT` は同じ `now()` を共有し、`DELETE` 起点でも `BEGIN` 時刻になる。
+#[test]
+fn delete_trigger_inserts_share_one_time_in_explicit_txn() {
+    let (core, _g) = core_with("trginv-del-clock", LedgerMode::Optional);
+    ok(&core, "t1", "CREATE TABLE tt (n INTEGER)");
+    ok(&core, "t1", "CREATE TABLE audit_ts (ts TIMESTAMP)");
+    create_fn(
+        &core,
+        "t1",
+        "del_audit",
+        "BEGIN INSERT INTO audit_ts (ts) VALUES (now()); \
+         INSERT INTO audit_ts (ts) VALUES (now()); RETURN NULL; END",
+    );
+    ok(
+        &core,
+        "t1",
+        "CREATE TRIGGER t_del AFTER DELETE ON tt FOR EACH STATEMENT EXECUTE FUNCTION del_audit()",
+    );
+    ok(&core, "t1", "INSERT INTO tt (n) VALUES (1)");
+    let now = in_txn_then_now(&core, &["DELETE FROM tt WHERE n = 1"]);
+    let r = rows(&core, "t1", "SELECT ts FROM audit_ts");
+    assert_eq!(r.len(), 2);
+    assert_eq!(r[0][0], now);
+    assert_eq!(r[1][0], now);
+}

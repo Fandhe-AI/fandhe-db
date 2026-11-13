@@ -1495,6 +1495,9 @@ impl EngineCore {
         // 入れ子の発火で作るこの予算は、そのカウンタへ合算される（実行モデル D11。テストは
         // `nested_triggers_share_the_statement_budget`）。
         let mut budget = ExecBudget::new(self.plpgsql_limits, self.result_limits.max_result_rows());
+        // 本体全体（複数文・入れ子の発火）で時刻を 1 つに揃える（SQL-37）。外側の文が式スコープの時刻を
+        // 張っていなければここで 1 回だけ確定して張る（本体の文ごとに張り直さない）。
+        let _firing_clock_scope = self.trigger_firing_clock_scope()?;
         let mut host = CorePlHost {
             core: self,
             ctx,

@@ -252,6 +252,21 @@ fn trigger_fallback_clock() -> Result<crate::sql::time_fn::StatementClock, SqlSu
     })
 }
 
+impl EngineCore {
+    /// トリガ発火 1 回の式スコープの時刻。既に張られていれば `None`（外側の文・上位の発火と共有）、
+    /// 無ければ [`trigger_fallback_clock`] で 1 度だけ確定した時刻を張って返す。
+    pub(super) fn trigger_firing_clock_scope(
+        &self,
+    ) -> Result<Option<crate::sql::time_fn::ClockScope>, SqlSurfaceError> {
+        match crate::sql::time_fn::current_clock() {
+            Some(_) => Ok(None),
+            None => Ok(Some(crate::sql::time_fn::ClockScope::enter(
+                trigger_fallback_clock()?,
+            ))),
+        }
+    }
+}
+
 impl CorePlHost<'_, '_> {
     /// トリガ発火文脈（[`HostTxn::Trigger`]）の 1 文の実行。許可リスト解析（権限ゲートは派生セッションの
     /// ロールで効く）→ 共通ゲート（文種・`USING OPERATION_ID`／`PARTITIONED`・揮発性）→ 本モジュールの
@@ -266,14 +281,9 @@ impl CorePlHost<'_, '_> {
             });
         };
         let handle = backend.handle;
-        // 外側の文が式スコープの時刻を張っていなければ、`FROM` なしの `SELECT`・代入式の `now()` も
-        // `INSERT` と同じ時刻で受理できるよう、本体の 1 文の実行全体へ式スコープも張る。
-        let _clock_scope = match crate::sql::time_fn::current_clock() {
-            Some(_) => None,
-            None => Some(crate::sql::time_fn::ClockScope::enter(
-                trigger_fallback_clock()?,
-            )),
-        };
+        // 式スコープの時刻は発火 1 回の入口（`trigger_firing_clock_scope`）が張っている。無い入口から直接
+        // 呼ばれた場合に備え、ここでは無ければ補う（通常は張り済みで何もしない）。
+        let _clock_scope = self.core.trigger_firing_clock_scope()?;
         let parsed = {
             // parse 中の定数式畳み込みがセッション TimeZone を読む。
             let _scopes = session_time_zone_scope(self.session);
