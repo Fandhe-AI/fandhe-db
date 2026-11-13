@@ -107,6 +107,7 @@ RLS-7 の暗黙適用がそのまま効く。カーソルは接続ごとの `Ses
   `WITHOUT HOLD` はいずれも `42601`（規範形のみ受理。`name` の直後が必ず
   `CURSOR` であることを要求する構造上、これらの修飾語が割り込むと自然に
   拒否される）。
+- **末尾の `;`（Issue #3171）**: `FETCH`・`CLOSE` は末尾の単一 `;` を受理する（`sql::lexer::strip_one_trailing_semicolon`）。`;;` は `42601`。`DECLARE` は内側 SELECT の検証が末尾 `;` を 1 個受理する。判断は [explicit-transaction.md](explicit-transaction.md) の「末尾 `;` の扱い」節。
 - **`DECLARE` のカタログ照合の遅延とビュー**: 構文解析段（`core.rs::parse_tokens`）
   は内側 `SELECT` の構造検証のみを行い、カタログを参照しない（トランザクション
   外の `DECLARE` を常に `25P01` にするため）。`Active` なトランザクション内の
