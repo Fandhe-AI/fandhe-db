@@ -516,3 +516,8 @@ SCHEMA 導入（#1713〜#1717）後もテナント境界が保たれることの
 
 SCHEMA の所有者は、上記の blob の予約領域ではなく `object_owners` 表（kind=SCHEMA・内部 ID キー）に保持する。blob の形式は変えていない
 （[role-privilege-model.md](role-privilege-model.md) §14 O7）。
+
+## 追記（Issue #3195）
+
+読み取りの未修飾名は `search_path` の要素順に自テナントの SCHEMA まで解決する（D5 の実装。親 #3194）。§12 の「現状の挙動として固定したもの」のうち、未修飾名の読み取りの解決は本追記で置き換わった。
+作成・DML・DDL・`COPY`・拡張クエリで SCHEMA に解決される参照は `0A000`（受け皿: #3196・#3197）。テナント SCHEMA 間の `SET SCHEMA` は #3198。本書の全面改訂と横断回帰の総点検は #3199。
