@@ -401,6 +401,11 @@ def _walk_back_over_comments(lines: List[str], start: int) -> int:
     return sel
 
 
+def _masked_line(masked: List[str], i: int) -> str:
+    """コメントを空白化した `i` 行目（0 始まり）を返す。終端 `}` の判定を末尾コメントに依存させない。"""
+    return masked[i] if i < len(masked) else ""
+
+
 def find_tests(text: str) -> List[TestRange]:
     """ファイル内容から `#[test]` 付き fn の範囲を抽出する。
 
@@ -438,7 +443,7 @@ def find_tests(text: str) -> List[TestRange]:
             block = []
             i += 1
             continue
-        if mod_stack and line.rstrip() == mod_stack[-1][0] + "}":
+        if mod_stack and _masked_line(masked, i).rstrip() == mod_stack[-1][0] + "}":
             mod_stack.pop()
             block = []
             has_test = False
@@ -480,7 +485,7 @@ def find_tests(text: str) -> List[TestRange]:
             else:
                 closer = indent + "}"
                 for j in range(i + 1, n):
-                    if lines[j].rstrip() == closer:
+                    if _masked_line(masked, j).rstrip() == closer:
                         end = j + 1
                         break
             start = block[0][0] if block else ln

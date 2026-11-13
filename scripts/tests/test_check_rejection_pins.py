@@ -469,6 +469,20 @@ class TrailingCommentModTest(unittest.TestCase):
         b = "mod b { // group b\n    #[test]\n    fn reject_x() {\n" + body + "    }\n}\n"
         self.assertEqual(run_check(P, a + b, b), [])
 
+    def test_trailing_comment_on_mod_closer_pops_module(self):
+        # `} // end a` でも mod_stack が戻り、兄弟 b の所属が a::b にならない
+        src = (
+            "mod a {\n    #[test]\n    fn t() {\n    } // end t\n} // end a\n"
+            "mod b {\n    #[test]\n    fn t() {\n    }\n} /* end b */\n"
+        )
+        self.assertEqual([t.module for t in crp.find_tests(src)], [("a",), ("b",)])
+
+    def test_deleting_a_with_closer_comment_does_not_target_b(self):
+        body = "        assert_eq!(err.wire_code(), \"0A000\");\n"
+        a = "mod a {\n    // tracked: #1\n    #[test]\n    fn reject_x() {\n" + body + "    }\n} // end a\n"
+        b = "mod b {\n    #[test]\n    fn reject_x() {\n" + body + "    }\n}\n"
+        self.assertEqual(run_check(P, a + b, b), [])
+
 
 class DetachedAnnotationTest(unittest.TestCase):
     """注記とテストの間への空行挿入・削除をテストの変更として扱う（D5）。"""
