@@ -684,3 +684,106 @@ fn wire15_cursors_split_around_writer_acquire_in_one_transaction() {
     );
     simple_ok(&mut a, "COMMIT", "COMMIT");
 }
+// --- DECLARE の内側 SELECT への JOIN（Issue #3175） ------------------------------
+
+/// `docs`（tenant-a の id 1..=5）と `notes`（tenant-a の id 1..=2・tenant-b の id 1..=5。
+/// 結合キーが衝突する他テナント行）を持つ `EngineCore`。
+fn new_core_with_join_rows() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
+    let path = temp_db::unique_db_path("wire15-cursor-join");
+    let guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    for name in [TABLE, "notes"] {
+        storage
+            .create_table(&TableSchema::new(
+                name,
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(3), false),
+                    ColumnDef::new("lang", ColumnType::Text, false),
+                ],
+            ))
+            .expect("create table");
+    }
+    // `Public` 行は全テナントから見える設計のため、他テナント分は `Private`（所有テナントのみ可視）で入れる。
+    let seed =
+        |tenant: &str, table: &str, ids: std::ops::RangeInclusive<u64>, visibility: Visibility| {
+            let ctx =
+                PolicyContext::with_visibilities(tenant, [Visibility::Public, Visibility::Private])
+                    .expect("valid tenant");
+            for id in ids {
+                let op_id = engine::recovery::required_op_id::OperationId::parse(&format!(
+                    "seed-{tenant}-{table}-{id}"
+                ))
+                .expect("valid operation_id");
+                engine::tenant::insert_typed_row(
+                    &storage,
+                    table,
+                    &ctx,
+                    id,
+                    visibility,
+                    &[
+                        Value::Vector(vec![1.0, 0.0, 0.0]),
+                        Value::Text(format!("{tenant}-{table}")),
+                    ],
+                    &op_id,
+                )
+                .expect("insert row");
+            }
+        };
+    seed("tenant-a", TABLE, 1..=5, Visibility::Private);
+    seed("tenant-a", "notes", 1..=2, Visibility::Private);
+    seed("tenant-b", "notes", 1..=5, Visibility::Private);
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    (Arc::new(core), guard)
+}
+
+/// 簡易クエリで `DECLARE ... FOR SELECT ... JOIN ...;`（末尾 `;` 付きの単独送信）→ `FETCH NEXT IN`／
+/// `FETCH FORWARD n`／`FETCH n` → `CLOSE` が通り、他テナントの行は結果に現れない。
+#[test]
+fn wire15_declare_join_fetch_close_over_simple_query_isolates_tenants() {
+    let (core, _guard) = new_core_with_join_rows();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, core);
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    send_simple_query(&mut stream, "BEGIN");
+    assert_eq!(read_command_complete(&mut stream), "BEGIN");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(
+        &mut stream,
+        "DECLARE c CURSOR FOR SELECT d.id, n.lang FROM docs d JOIN notes n ON d.id = n.id LIMIT 100;",
+    );
+    assert_eq!(read_command_complete(&mut stream), "DECLARE CURSOR");
+    read_ready_for_query(&mut stream);
+
+    let mut rows: Vec<Vec<Option<String>>> = Vec::new();
+    for (fetch, expect_rows) in [
+        ("FETCH NEXT IN c;", 1usize),
+        ("FETCH FORWARD 1 FROM c", 1),
+        ("FETCH 10 FROM c", 0),
+    ] {
+        send_simple_query(&mut stream, fetch);
+        let columns = read_row_description(&mut stream);
+        assert_eq!(columns, vec!["id", "lang"]);
+        let mut page = Vec::new();
+        while peek_message_type(&mut stream) == b'D' {
+            page.push(read_data_row(&mut stream));
+        }
+        let tag = read_command_complete(&mut stream);
+        read_ready_for_query(&mut stream);
+        assert_eq!(page.len(), expect_rows, "{fetch}");
+        assert_eq!(tag, format!("FETCH {}", page.len()));
+        rows.extend(page);
+    }
+    assert_eq!(rows.len(), 2);
+    for row in &rows {
+        assert_eq!(row[1].as_deref(), Some("tenant-a-notes"));
+    }
+
+    send_simple_query(&mut stream, "CLOSE c");
+    assert_eq!(read_command_complete(&mut stream), "CLOSE CURSOR");
+    read_ready_for_query(&mut stream);
+    send_simple_query(&mut stream, "COMMIT");
+    assert_eq!(read_command_complete(&mut stream), "COMMIT");
+    read_ready_for_query(&mut stream);
+}
