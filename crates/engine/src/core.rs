@@ -9076,8 +9076,8 @@ impl EngineCore {
                 }
             },
             // SQL-53 (b)・Issue #1754: 束縛（列解決・型照合）を通した後に `0A000` で止める。実行は #1755 以降。
-            ParsedSql::UpdateFrom(stmt) => self.execute_update_from_stub(stmt),
-            ParsedSql::DeleteUsing(stmt) => self.execute_delete_using_stub(stmt),
+            ParsedSql::UpdateFrom(stmt) => self.execute_update_from_stub(stmt, session.udfs()),
+            ParsedSql::DeleteUsing(stmt) => self.execute_delete_using_stub(stmt, session.udfs()),
             ParsedSql::Update(stmt) => {
                 // Issue #1129: `PARTITIONED` 付きは分割実行（非原子・autocommit 専用）。
                 if let crate::sql::allowlist::ValidatedUpdateForm::Predicate(v) = stmt {
@@ -10681,8 +10681,8 @@ impl EngineCore {
             }
             // SQL-53 (b)・Issue #1754: 書き込みトランザクションに触れず、束縛の後に `0A000` で止める。
             // 呼び出し元が明示トランザクションを `Failed` へ遷移させる（他の失敗文と同じ契約）。
-            ParsedSql::UpdateFrom(stmt) => self.execute_update_from_stub(stmt),
-            ParsedSql::DeleteUsing(stmt) => self.execute_delete_using_stub(stmt),
+            ParsedSql::UpdateFrom(stmt) => self.execute_update_from_stub(stmt, session.udfs()),
+            ParsedSql::DeleteUsing(stmt) => self.execute_delete_using_stub(stmt, session.udfs()),
             // SQL-51・Issue #1732・#1733: autocommit と同じ実行本体へ共有 write txn を渡す
             // （読み取り源にも書き込み先にもなる）。台帳・世代の単位は挿入先の表。
             // SQL-63・Issue #1876: 全副文・台帳記録・主クエリを共有 write txn で実行する。書いた全表へ
