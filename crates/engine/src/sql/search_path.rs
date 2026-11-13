@@ -19,11 +19,15 @@
 //!   含めて解決し、見つかれば内部キー（`#<schema_id>.<name>`）へ置換して修飾名 `q1.x` と同じ経路に乗せる
 //!   （[`resolve_path_refs`]。Issue #3195）。一時表が最優先で、`public` は裸の名前の存在で判定し、
 //!   USAGE の無い SCHEMA・不在の SCHEMA・組み込み要素は飛ばす。
-//! - 読み取り以外の文（DML・DDL・COPY）と拡張クエリ（Parse・Bind・Describe）は、SCHEMA に解決される
-//!   参照を検出したら固定文言の `0A000` にする（public 側へ黙って向けない。作成先・DML の対象の解決は
-//!   #3196、準備済み文の再解決は #3197）。
+//! - 読み取り以外の文（DML・DDL・`COPY`）の未修飾名も同じ規則で解決し、修飾名と同じ内部キーへ置換する
+//!   （Issue #3196）。作成系 DDL の作成対象名は path の先頭の要素に置く（自テナントの SCHEMA なら内部キー、
+//!   `public` なら裸のまま。[`creation_target`]・[`resolve_statement_refs`]）。作成先の SCHEMA は USAGE が無ければ
+//!   飛ばさず `42501`。拡張クエリ（Parse・Bind・Describe）は SCHEMA に解決される参照を固定文言の `0A000` に
+//!   する（再解決は #3197）。`ALTER .. SET SCHEMA` の未修飾の対象が SCHEMA に解決される形は `0A000`（#3198）。
+//!   SCHEMA 配置が未対応の作成（`CREATE TYPE`・`CREATE MATERIALIZED VIEW`）は、path 先頭が SCHEMA なら
+//!   `public` へ黙って作らず `0A000`。
 //! - 一時表以外の未修飾名が解決できず、実効 path に `public` が含まれなければ `42P01`、作成先が
-//!   `public` 以外になる文は `3F000`／`0A000`（従来どおり）。
+//!   組み込み SCHEMA・`pg_temp` になる文は `0A000`、どの要素にも作れなければ `3F000`。
 //! - 自テナントの SCHEMA が path に無い既定のセッション（username 無し）はカタログを引かない。wire の
 //!   既定セッションは `$user` の SCHEMA 1 件の get だけが文ごとに増える。
 //!
@@ -592,6 +596,9 @@ pub(crate) enum NameKind {
 pub(crate) struct PathLookup<'a> {
     /// 自テナントの SCHEMA の内部 ID。USAGE が無い SCHEMA と存在しない名前は `None`（飛ばす）。
     pub schema_id: &'a dyn Fn(&str) -> Result<Option<u64>, SqlSurfaceError>,
+    /// 作成先の判定用。自テナントの SCHEMA の内部 ID。USAGE が無い SCHEMA は飛ばさず `42501`、他テナント・
+    /// 不在は `None`（作成先は飛ばさない。設計記録 K4。[`creation_target`] の probe と同じ規則）。
+    pub creation_schema_id: &'a dyn Fn(&str) -> Result<Option<u64>, SqlSurfaceError>,
     /// `key`（裸の名前または内部キー）が `kind` の名前空間に存在するか。
     pub exists: &'a dyn Fn(&str, NameKind) -> Result<bool, SqlSurfaceError>,
 }
@@ -673,6 +680,28 @@ pub(crate) fn resolve_path_refs(
     skip: &[usize],
     lookup: &PathLookup<'_>,
 ) -> Result<PathResolution, SqlSurfaceError> {
+    resolve_path_refs_inner(session, tokens, skip, lookup, false)
+}
+
+/// [`resolve_path_refs`] に作成系 DDL の作成対象名の解決（[`resolve_creation_name`]。Issue #3196）を加えた版。
+/// 通常（単純クエリ）の 1 文の解析入口（`core::EngineCore::parse_tokens_gated`）だけが使う。拡張クエリの
+/// Parse・Bind・Describe と `COPY` は作成名を解決せず、従来どおり [`resolve_path_refs`] で検出する。
+pub(crate) fn resolve_statement_refs(
+    session: &SessionState,
+    tokens: &[Token],
+    skip: &[usize],
+    lookup: &PathLookup<'_>,
+) -> Result<PathResolution, SqlSurfaceError> {
+    resolve_path_refs_inner(session, tokens, skip, lookup, true)
+}
+
+fn resolve_path_refs_inner(
+    session: &SessionState,
+    tokens: &[Token],
+    skip: &[usize],
+    lookup: &PathLookup<'_>,
+    with_creation: bool,
+) -> Result<PathResolution, SqlSurfaceError> {
     let mut out = PathResolution::default();
     let hides_public = session.search_path_hides_public();
     if !(session.search_path_may_hold_tenant_schema() || hides_public)
@@ -680,6 +709,20 @@ pub(crate) fn resolve_path_refs(
     {
         return Ok(out);
     }
+    // 作成対象名の解決。自己参照 `REFERENCES <作成名>` の位置は通常の照会から外し、作成先に合わせる。
+    let mut skip_with_self: Vec<usize> = skip.to_vec();
+    if with_creation {
+        if let Some(c) = resolve_creation_name(session, tokens, lookup)? {
+            skip_with_self.extend(c.self_refs.iter().copied());
+            if let Some(key) = c.key {
+                out.rewrites.push((c.index, Token::Ident(key.clone())));
+                for i in c.self_refs {
+                    out.rewrites.push((i, Token::Ident(key.clone())));
+                }
+            }
+        }
+    }
+    let skip: &[usize] = &skip_with_self;
     let mut slots: Vec<PathSlot> = Vec::new();
     for elem in session.search_path().elems() {
         let Some(name) = expand_elem(session, elem) else {
@@ -769,27 +812,27 @@ pub(crate) fn apply_rewrites(tokens: &mut [Token], rewrites: Vec<(usize, Token)>
         }
     }
 }
-/// 作成系 DDL の作成先（現時点では `public` だけ）。
+/// 作成系 DDL の作成先。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CreateTarget {
     /// 共有の `public`（従来どおりの作成）。
     Public,
+    /// 自テナントの SCHEMA（内部 ID。USAGE を確認済み。Issue #3196）。
+    Schema(u64),
 }
 
-/// 作成先を `search_path` の先頭から判定する。`probe` は呼び出し元テナントの SCHEMA 存在照会。
+/// 作成先を `search_path` の先頭から判定する。`probe` は呼び出し元テナントの SCHEMA の照会
+/// （自テナントに在り USAGE があれば `Some(内部 ID)`、他テナント・不在は `None`、USAGE が無ければ `42501`）。
 ///
 /// - `public`: 従来どおり作成する。
 /// - `pg_catalog`／`information_schema`／`pg_temp`: `0A000`（`pg_temp` は PostgreSQL では一時表になるため、
 ///   永続側へ黙って作らない）。
-/// - 自テナントの既存 SCHEMA: `0A000`（テナント SCHEMA への作成は #1717）。
+/// - 自テナントの既存 SCHEMA: [`CreateTarget::Schema`]（PostgreSQL と同じく `$user` が優先。ADR D5）。
 /// - 存在しない名前（他テナントの SCHEMA を含む）・`$user` が未設定: 次の要素へ。
 /// - どれも無ければ `3F000`（固定文言）。
-///
-/// 既定の path では `public` へ到達する前に自 username と同名の SCHEMA が見つかれば `0A000` になる
-/// （PostgreSQL と同じく `$user` が優先。#1717 まで。ADR D5）。
 pub(crate) fn creation_target(
     session: &SessionState,
-    probe: &dyn Fn(&str) -> Result<bool, SqlSurfaceError>,
+    probe: &dyn Fn(&str) -> Result<Option<u64>, SqlSurfaceError>,
 ) -> Result<CreateTarget, SqlSurfaceError> {
     for elem in session.search_path().elems() {
         let Some(name) = expand_elem(session, elem) else {
@@ -803,13 +846,105 @@ pub(crate) fn creation_target(
                 "creating relations in this schema is not supported",
             ));
         }
-        if probe(&name)? {
-            return Err(SqlSurfaceError::feature_not_supported(
-                "creating relations inside a schema is not supported",
-            ));
+        if let Some(id) = probe(&name)? {
+            return Ok(CreateTarget::Schema(id));
         }
     }
     Err(SqlSurfaceError::NoSchemaSelected)
+}
+
+/// [`resolve_creation_name`] の結果。
+struct CreationResolution {
+    /// 作成対象名のトークン添字。
+    index: usize,
+    /// 作成先が自テナントの SCHEMA のときの内部キー（`public` なら `None` で、名前は裸のまま）。
+    key: Option<String>,
+    /// 自己参照 `REFERENCES <作成名>` の位置（作成先に合わせて扱う。PostgreSQL では新しい表が path 上で先に見つかる）。
+    self_refs: Vec<usize>,
+}
+
+/// 作成系 DDL（`CREATE TABLE`／`VIEW`／`SEQUENCE`・CTAS）の未修飾の作成対象名を、`search_path` の先頭が
+/// 自テナントの SCHEMA なら内部キー（`#<schema_id>.<name>`）へ置き換える対象として返す（Issue #3196）。
+/// 修飾名 `q1.t` の解決後と同じトークン列になるので、以降の ACL・実行は修飾形と同じ経路に乗る。
+///
+/// 解決しない（`None`）形: 作成名が未修飾の `Ident` ではない・一時表の作成・MATERIALIZED VIEW・構文語と
+/// 衝突する名前・作成先の判定が `42501`／`3F000`／`0A000` になる形。最後の 3 つは解析時には返さず、実行腕の
+/// `require_creation_target` が同じエラーを（権限ゲート `42501` の後に）再現する。他の照会エラーは伝播する。
+fn resolve_creation_name(
+    session: &SessionState,
+    tokens: &[Token],
+    lookup: &PathLookup<'_>,
+) -> Result<Option<CreationResolution>, SqlSurfaceError> {
+    if !session.search_path_may_hold_tenant_schema()
+        || !matches!(tokens.first(), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("CREATE"))
+        || crate::sql::allowlist::is_create_temp_table_statement(tokens)
+    {
+        return Ok(None);
+    }
+    let walk = crate::sql::relation_name::relation_positions(tokens);
+    // `IF NOT EXISTS` の `IF` も作成名の位置として数えられるため、構文語の `IF`（直後が `NOT`）は飛ばす。
+    let is_if_clause = |i: usize| {
+        matches!(tokens.get(i), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("IF"))
+            && matches!(tokens.get(i.saturating_add(1)),
+                Some(Token::Ident(w)) if w.eq_ignore_ascii_case("NOT"))
+    };
+    let Some(pos) = walk
+        .positions
+        .iter()
+        .find(|p| p.create_name && !p.matview && !is_if_clause(p.index))
+    else {
+        return Ok(None);
+    };
+    let Some(Token::Ident(name)) = tokens.get(pos.index) else {
+        return Ok(None);
+    };
+    if name.starts_with('#') || crate::sql::relation_name::collides_with_syntax_word(name) {
+        return Ok(None);
+    }
+    let target = match creation_target(session, lookup.creation_schema_id) {
+        Ok(t) => t,
+        Err(e) if ["42501", "3F000", "0A000"].contains(&e.wire_code()) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let key = match target {
+        CreateTarget::Public => None,
+        CreateTarget::Schema(schema_id) => Some(
+            RelationKey::InSchema {
+                schema_id,
+                name: name.clone(),
+            }
+            .encode(),
+        ),
+    };
+    // 自己参照 FK は `CREATE TABLE` の `REFERENCES <作成名>` だけ（ビュー・SEQUENCE には無い）。
+    let create_table = tokens
+        .iter()
+        .take(4)
+        .any(|t| matches!(t, Token::Ident(w) if w.eq_ignore_ascii_case("TABLE")));
+    let mut self_refs = Vec::new();
+    if create_table {
+        for p in &walk.positions {
+            if p.create_name || p.index == pos.index {
+                continue;
+            }
+            let after_references = p
+                .index
+                .checked_sub(1)
+                .and_then(|i| tokens.get(i))
+                .is_some_and(
+                    |t| matches!(t, Token::Ident(w) if w.eq_ignore_ascii_case("REFERENCES")),
+                );
+            if after_references && matches!(tokens.get(p.index), Some(Token::Ident(n)) if n == name)
+            {
+                self_refs.push(p.index);
+            }
+        }
+    }
+    Ok(Some(CreationResolution {
+        index: pos.index,
+        key,
+        self_refs,
+    }))
 }
 
 /// path の要素 1 件を正規化した SCHEMA 名へ展開する。`$user` は handshake が確定した username
@@ -1217,6 +1352,7 @@ mod tests {
                 &[],
                 &PathLookup {
                     schema_id: &schema_id,
+                    creation_schema_id: &schema_id,
                     exists: &exists,
                 },
             )
@@ -1310,6 +1446,7 @@ mod tests {
             &[],
             &PathLookup {
                 schema_id: &|_| Ok(Some(7)),
+                creation_schema_id: &|_| Ok(Some(7)),
                 exists: &|_, _| Ok(true),
             },
         )
@@ -1365,5 +1502,167 @@ mod tests {
         );
         let toks = tokenize("DROP VIEW v").expect("lex");
         assert!(!unqualified_relation_refs(&toks, &[])[0].is_index);
+    }
+
+    /// 作成系 DDL の解決（Issue #3196）用の lookup。`schemas` は USAGE のある自テナントの SCHEMA、
+    /// `denied` は USAGE の無い SCHEMA（作成先の照会は `42501`）。
+    fn run_stmt(
+        session: &SessionState,
+        sql: &str,
+        schemas: &[(&'static str, u64)],
+        denied: &[&'static str],
+        keys: &[&'static str],
+    ) -> Result<PathResolution, SqlSurfaceError> {
+        let toks = tokenize(sql).expect("lex");
+        let schema_id = |n: &str| Ok(schemas.iter().find(|(s, _)| *s == n).map(|(_, i)| *i));
+        let creation = |n: &str| {
+            if denied.contains(&n) {
+                return Err(SqlSurfaceError::InsufficientPrivilege);
+            }
+            Ok(schemas.iter().find(|(s, _)| *s == n).map(|(_, i)| *i))
+        };
+        let exists = |k: &str, _kind: NameKind| Ok(keys.contains(&k));
+        resolve_statement_refs(
+            session,
+            &toks,
+            &[],
+            &PathLookup {
+                schema_id: &schema_id,
+                creation_schema_id: &creation,
+                exists: &exists,
+            },
+        )
+    }
+
+    fn ddl_session_with(path: &[&str]) -> SessionState {
+        let mut s = session_with(path);
+        s.allow_ddl();
+        s
+    }
+
+    /// 作成対象名は path の先頭が自テナントの SCHEMA なら内部キーへ、`public` が先なら書き換えない。
+    #[test]
+    fn creation_name_follows_the_first_path_element() {
+        let s = ddl_session_with(&["q1", "public"]);
+        for (sql, idx) in [
+            ("CREATE TABLE t (id BIGINT PRIMARY KEY)", 2),
+            ("CREATE TABLE IF NOT EXISTS t (id BIGINT PRIMARY KEY)", 5),
+            ("CREATE SEQUENCE t", 2),
+            ("CREATE VIEW t AS SELECT 1", 2),
+            ("CREATE OR REPLACE VIEW t AS SELECT 1", 4),
+        ] {
+            let r = run_stmt(&s, sql, &[("q1", 7)], &[], &[]).unwrap();
+            assert_eq!(rewritten(&r), vec![(idx, "#7.t".to_string())], "{sql}");
+        }
+        let s = ddl_session_with(&["public", "q1"]);
+        let r = run_stmt(&s, "CREATE TABLE t (id BIGINT)", &[("q1", 7)], &[], &[]).unwrap();
+        assert!(r.rewrites.is_empty());
+        // 他テナント・不在の SCHEMA は次の要素へ飛ばし、最後は public。
+        let s = ddl_session_with(&["nosuch", "public"]);
+        let r = run_stmt(&s, "CREATE TABLE t (id BIGINT)", &[], &[], &[]).unwrap();
+        assert!(r.rewrites.is_empty());
+    }
+
+    /// 解決しない形: 一時表・MATERIALIZED VIEW・修飾名・作成先のエラー（実行腕が同じエラーを再現する）。
+    #[test]
+    fn creation_name_is_left_alone_for_unsupported_forms() {
+        let s = ddl_session_with(&["q1", "public"]);
+        for sql in [
+            "CREATE TEMP TABLE t (id BIGINT)",
+            "CREATE MATERIALIZED VIEW t AS SELECT 1",
+            "CREATE TABLE q1.t (id BIGINT)",
+            "CREATE TYPE t AS ENUM ('a')",
+        ] {
+            let r = run_stmt(&s, sql, &[("q1", 7)], &[], &[]).unwrap();
+            assert!(r.rewrites.is_empty(), "{sql}");
+        }
+        // USAGE の無い SCHEMA は飛ばさない: 解析時は書き換えず（`public` へ向けない）、実行腕が `42501`。
+        let r = run_stmt(&s, "CREATE TABLE t (id BIGINT)", &[("q1", 7)], &["q1"], &[]).unwrap();
+        assert!(r.rewrites.is_empty());
+        // 組み込み SCHEMA が先頭の path・`public` の無い path で SCHEMA も無い場合も同じ。
+        let s = ddl_session_with(&["pg_catalog", "q1"]);
+        let r = run_stmt(&s, "CREATE TABLE t (id BIGINT)", &[("q1", 7)], &[], &[]).unwrap();
+        assert!(r.rewrites.is_empty());
+        // DDL 権限の無いセッションは解決しない（`42501` を先に返す契約）。
+        let s = session_with(&["q1", "public"]);
+        let r = run_stmt(&s, "CREATE TABLE t (id BIGINT)", &[("q1", 7)], &[], &[]).unwrap();
+        assert!(r.rewrites.is_empty());
+    }
+
+    /// 作成と同時に参照する本文（ビューの参照先・CTAS の元表）も path で解決する。
+    #[test]
+    fn create_view_and_ctas_resolve_their_sources_too() {
+        let s = ddl_session_with(&["q1", "public"]);
+        let r = run_stmt(
+            &s,
+            "CREATE VIEW v AS SELECT id FROM src",
+            &[("q1", 7)],
+            &[],
+            &["#7.src"],
+        )
+        .unwrap();
+        assert_eq!(
+            rewritten(&r),
+            vec![(2, "#7.v".to_string()), (7, "#7.src".to_string())]
+        );
+    }
+
+    /// 自己参照 `REFERENCES <作成名>` は作成先に合わせる（Schema なら同じキー、Public なら裸のまま）。
+    #[test]
+    fn self_reference_follows_the_creation_target() {
+        let sql = "CREATE TABLE t (id BIGINT PRIMARY KEY, p BIGINT REFERENCES t (id))";
+        let s = ddl_session_with(&["q1", "public"]);
+        // public に同名の表があっても、作成先の q1 の自己参照になる。
+        let r = run_stmt(&s, sql, &[("q1", 7)], &[], &["t"]).unwrap();
+        let rw = rewritten(&r);
+        assert_eq!(rw.len(), 2, "{rw:?}");
+        assert!(rw.iter().all(|(_, k)| k == "#7.t"));
+        // 作成先が public なら、q1 に同名の表があっても裸のまま（q1.t への FK にしない）。
+        let s = ddl_session_with(&["public", "q1"]);
+        let r = run_stmt(&s, sql, &[("q1", 7)], &[], &["#7.t"]).unwrap();
+        assert!(r.rewrites.is_empty(), "{:?}", r.rewrites);
+        // 別の表への参照は通常どおり path で解決する。
+        let s = ddl_session_with(&["q1", "public"]);
+        let r = run_stmt(
+            &s,
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, p BIGINT REFERENCES u (id))",
+            &[("q1", 7)],
+            &[],
+            &["#7.u"],
+        )
+        .unwrap();
+        assert_eq!(rewritten(&r).len(), 2);
+    }
+
+    /// 既定の path（username 無し）は作成でもカタログを引かない。
+    #[test]
+    fn default_path_does_not_probe_for_creation() {
+        let calls = std::cell::Cell::new(0usize);
+        let s = {
+            let mut s = SessionState::default();
+            s.allow_ddl();
+            s
+        };
+        let toks = tokenize("CREATE TABLE t (id BIGINT)").expect("lex");
+        let probe = |_: &str| {
+            calls.set(calls.get() + 1);
+            Ok(None)
+        };
+        let r = resolve_statement_refs(
+            &s,
+            &toks,
+            &[],
+            &PathLookup {
+                schema_id: &probe,
+                creation_schema_id: &probe,
+                exists: &|_, _| {
+                    calls.set(calls.get() + 1);
+                    Ok(false)
+                },
+            },
+        )
+        .unwrap();
+        assert!(r.rewrites.is_empty());
+        assert_eq!(calls.get(), 0);
     }
 }

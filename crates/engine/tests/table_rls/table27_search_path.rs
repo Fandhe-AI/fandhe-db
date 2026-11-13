@@ -302,6 +302,7 @@ fn copy_is_gated_by_search_path() {
         .is_ok());
 }
 
+// intentional: docs/design/schema-tenant-namespace.md（ENUM 型・MATERIALIZED VIEW・組み込み SCHEMA への作成は対象外）
 #[test]
 fn creation_target_follows_the_path() {
     let (core, _g, mut s) = with_table("sp-create");
@@ -333,17 +334,35 @@ fn creation_target_follows_the_path() {
         "CREATE TEMP TABLE tmp (id BIGINT PRIMARY KEY)",
     );
 
-    // 自テナントの既存 SCHEMA が先頭なら、テナント SCHEMA への作成は #1717 まで `0A000`。
+    // 自テナントの既存 SCHEMA が先頭なら、その SCHEMA へ作る（Issue #3196）。
     ok(&core, &mut s, "RESET search_path");
     ok(&core, &mut s, "CREATE SCHEMA s");
     ok(&core, &mut s, "SET search_path = s, public");
+    ok(&core, &mut s, "CREATE TABLE w (id BIGINT PRIMARY KEY)");
+    ok(&core, &mut s, "CREATE SEQUENCE sq2");
+    // 作った表・SEQUENCE は s の中にあり、public には無い。
+    ok(&core, &mut s, "SELECT id FROM s.w LIMIT 5");
     assert_eq!(
-        code(&core, &mut s, "CREATE TABLE w (id BIGINT PRIMARY KEY)"),
+        code(&core, &mut s, "SELECT id FROM public.w LIMIT 5"),
+        "42P01"
+    );
+    assert_eq!(code(&core, &mut s, "DROP SEQUENCE public.sq2"), "42P01");
+    ok(&core, &mut s, "DROP SEQUENCE s.sq2");
+    // 読み取りは public の表を引ける（空でない s に無い名前は後ろの public へ落ちる）。
+    ok(&core, &mut s, "SELECT id FROM t LIMIT 5");
+    // SCHEMA 配置が未対応の作成（ENUM 型・MATERIALIZED VIEW）は public へ黙って作らず `0A000`。
+    assert_eq!(
+        code(&core, &mut s, "CREATE TYPE ty2 AS ENUM ('a')"),
         "0A000"
     );
-    assert_eq!(code(&core, &mut s, "CREATE SEQUENCE sq2"), "0A000");
-    // 読み取りは public の表を引ける（空の SCHEMA は飛ばされる）。
-    ok(&core, &mut s, "SELECT id FROM t LIMIT 5");
+    assert_eq!(
+        code(
+            &core,
+            &mut s,
+            "CREATE MATERIALIZED VIEW mv AS SELECT id FROM t"
+        ),
+        "0A000"
+    );
     // 組み込み SCHEMA・pg_temp への作成は拒否する。
     ok(&core, &mut s, "SET search_path = pg_catalog, public");
     assert_eq!(
@@ -377,11 +396,13 @@ fn dollar_user_expands_from_the_session_user_only() {
     ok(&core, &mut s, "CREATE SCHEMA alice");
     ok(&core, &mut s, "CREATE TABLE u0 (id BIGINT PRIMARY KEY)");
     ok(&core, &mut s, "DROP TABLE u0");
-    // username と同名の SCHEMA が既定の path で先に見つかる（#1717 まで `0A000`）。
+    // username と同名の SCHEMA が既定の path で先に見つかり、そこへ作られる（Issue #3196）。
     s.set_session_user("alice");
+    ok(&core, &mut s, "CREATE TABLE u1 (id BIGINT PRIMARY KEY)");
+    ok(&core, &mut s, "SELECT id FROM alice.u1 LIMIT 5");
     assert_eq!(
-        code(&core, &mut s, "CREATE TABLE u1 (id BIGINT PRIMARY KEY)"),
-        "0A000"
+        code(&core, &mut s, "SELECT id FROM public.u1 LIMIT 5"),
+        "42P01"
     );
     // 同名の SCHEMA が無いユーザーは `public` へ作る。
     let mut other = ddl_session();
@@ -723,12 +744,15 @@ fn public_qualified_object_ddl_ignores_the_path_in_simple_queries() {
     ok(&core, &mut s, "DROP VIEW public.v");
     ok(&core, &mut s, "DROP MATERIALIZED VIEW public.m");
 
-    // 自 username と同名の SCHEMA がある既定の path でも、明示修飾の作成は `0A000` にならない。
+    // 自 username と同名の SCHEMA がある既定の path では、未修飾の作成はその SCHEMA へ行き（Issue #3196）、
+    // 明示修飾の作成は path に依らず public へ行く。両者は独立している。
     ok(&core, &mut s, "RESET search_path");
     ok(&core, &mut s, "CREATE SCHEMA bob");
     s.set_session_user("bob");
-    assert_eq!(code(&core, &mut s, "CREATE SEQUENCE q2"), "0A000");
+    ok(&core, &mut s, "CREATE SEQUENCE q2");
     ok(&core, &mut s, "CREATE SEQUENCE public.q2");
+    ok(&core, &mut s, "DROP SEQUENCE bob.q2");
+    ok(&core, &mut s, "DROP SEQUENCE public.q2");
     ok(
         &core,
         &mut s,
@@ -937,10 +961,10 @@ fn snapshot_txn_resolves_path_schema_from_the_begin_snapshot() {
     }
 }
 
-/// 明示 Tx の `BEGIN` 後に別セッションが SCHEMA を改名・DROP しても、`COPY` の安全弁は `BEGIN` 時点の
-/// スナップショットで判定し、public 側へ黙って向けず `0A000` にする（Issue #3195 レビュー指摘）。
+/// 明示 Tx の `BEGIN` 後に別セッションが SCHEMA を改名・DROP しても、`COPY` の未修飾名は `BEGIN` 時点の
+/// スナップショットで解決する。public の同名表（1 行）へは決して落ちない（Issue #3195 レビュー指摘・#3196）。
 #[test]
-fn copy_in_txn_rejects_path_schema_from_the_begin_snapshot() {
+fn copy_in_txn_resolves_path_schema_from_the_begin_snapshot() {
     for ddl in ["ALTER SCHEMA q1 RENAME TO q9", "DROP SCHEMA q1 CASCADE"] {
         let (core, _g, mut s) = q1_world("sp-copy-snap-schema");
         ok(&core, &mut s, "SET search_path TO q1, public");
@@ -951,8 +975,20 @@ fn copy_in_txn_rejects_path_schema_from_the_begin_snapshot() {
         let mut other = ddl_session();
         ok(&core, &mut other, ddl);
         match core.begin_copy_in_txn(&c, &s, &mut txn, "COPY t TO STDOUT") {
-            Err(e) => assert_eq!(e.wire_code(), "0A000", "{ddl}"),
-            Ok(_) => panic!("{ddl}: COPY must be rejected"),
+            Ok(engine::core::CopyPlan::To(_, r, _)) => {
+                let mut v: Vec<String> = r
+                    .rows
+                    .iter()
+                    .map(|row| format!("{:?}", row.cells[0]))
+                    .collect();
+                v.sort_unstable();
+                assert_eq!(v.len(), 2, "{ddl}: must read the snapshot q1.t, got {v:?}");
+            }
+            Ok(_) => panic!("{ddl}: expected a COPY TO plan"),
+            Err(e) => {
+                // 実装上 BEGIN 時点で読めない形は `42P01`（public.t の行へは落ちない）。
+                assert_eq!(e.wire_code(), "42P01", "{ddl}: {e}");
+            }
         }
         core.execute_sql_in_txn(&c, &mut s, &mut txn, "ROLLBACK")
             .expect("rollback");
@@ -1049,31 +1085,34 @@ fn views_resolve_through_the_path() {
     assert_eq!(ids(&core, &mut s, "SELECT id FROM vw LIMIT 100"), vec![1]);
 }
 
-/// SEQUENCE の未修飾の文字列引数（`DEFAULT nextval('q')`）も path で解決する。SCHEMA に解決される
-/// DDL は作成先の解決（#3196）まで `0A000`。public へ解決される場合は従来どおり。
-// tracked: #3196
+/// SEQUENCE の未修飾の文字列引数（`DEFAULT nextval('q')`）も path で解決する。作成先（表）も path の
+/// 先頭の SCHEMA になる（Issue #3196）。
 #[test]
 fn sequence_literals_follow_the_path() {
     let (core, _g, mut s) = q1_world("sp-seq-literal");
     ok(&core, &mut s, "CREATE SEQUENCE q1.q START 100");
     ok(&core, &mut s, "CREATE SEQUENCE public.q START 5");
     ok(&core, &mut s, "SET search_path TO q1, public");
-    assert_eq!(
-        code(
-            &core,
-            &mut s,
-            "CREATE TABLE w (id BIGINT PRIMARY KEY, n BIGINT DEFAULT nextval('q'))"
-        ),
-        "0A000"
-    );
-    ok(&core, &mut s, "SET search_path TO public, q1");
     ok(
         &core,
         &mut s,
         "CREATE TABLE w (id BIGINT PRIMARY KEY, n BIGINT DEFAULT nextval('q'))",
     );
+    // w は q1 に作られ、採番は q1.q の 100。
     ok(&core, &mut s, "INSERT INTO w (id) VALUES (1)");
-    assert_eq!(ids(&core, &mut s, "SELECT n FROM w LIMIT 5"), vec![5]);
+    assert_eq!(ids(&core, &mut s, "SELECT n FROM q1.w LIMIT 5"), vec![100]);
+    assert_eq!(
+        code(&core, &mut s, "SELECT n FROM public.w LIMIT 5"),
+        "42P01"
+    );
+    ok(&core, &mut s, "SET search_path TO public, q1");
+    ok(
+        &core,
+        &mut s,
+        "CREATE TABLE w2 (id BIGINT PRIMARY KEY, n BIGINT DEFAULT nextval('q'))",
+    );
+    ok(&core, &mut s, "INSERT INTO w2 (id) VALUES (1)");
+    assert_eq!(ids(&core, &mut s, "SELECT n FROM w2 LIMIT 5"), vec![5]);
 }
 
 #[test]
@@ -1114,54 +1153,203 @@ fn dollar_user_schema_is_searched_first_on_the_default_path() {
     );
 }
 
-/// 読み取り以外の文は、SCHEMA に解決される未修飾名を黙って public 側へ向けず `0A000` にする
-/// （作成先・DML の対象の解決は #3196）。拒否された文は public.t を変えない。
-// tracked: #3196
+/// 読み取り以外の文（DML・TRUNCATE・DROP・データ変更 CTE・COPY）も、未修飾名を path の要素順に自テナントの
+/// SCHEMA まで解決し、修飾名 `q1.t` と同じ対象に効く（Issue #3196）。public.t の行・定義は変わらない。
 #[test]
-fn non_read_statements_resolving_into_a_schema_are_rejected_unsupported() {
-    let (core, _g, mut s) = q1_world("sp-write-0a000");
+fn non_read_statements_resolve_into_the_path_schema() {
+    let (core, _g, mut s) = q1_world("sp-write-q1");
     ok(&core, &mut s, "SET search_path TO q1, public");
-    for sql in [
-        "INSERT INTO t (id, name) VALUES (2, 'z')",
-        "UPDATE t SET name = 'u' WHERE id = 1",
-        "DELETE FROM t WHERE id = 1",
-        "TRUNCATE t",
-        "DROP TABLE t",
+    ok(&core, &mut s, "INSERT INTO t (id, name) VALUES (2, 'z')");
+    ok(&core, &mut s, "UPDATE t SET name = 'u' WHERE id = 10");
+    ok(&core, &mut s, "DELETE FROM t WHERE id = 20");
+    ok(
+        &core,
+        &mut s,
         "WITH x AS (INSERT INTO t (id, name) VALUES (3, 'w') RETURNING id) SELECT id FROM x",
-    ] {
-        let (c, msg) = err(&core, &mut s, sql);
-        assert_eq!(c, "0A000", "{sql}");
-        assert!(!msg.contains('#') && !msg.contains("q1"), "{sql}: {msg}");
-    }
-    // public.t の行・定義は変わらない（修飾名で確認）。
+    );
+    assert_eq!(
+        ids(&core, &mut s, "SELECT id FROM q1.t LIMIT 100"),
+        vec![2, 3, 10]
+    );
+    // public.t は変わらない。
     assert_eq!(
         ids(&core, &mut s, "SELECT id FROM public.t LIMIT 100"),
         vec![1]
     );
+    // COPY TO は q1.t を読む。
+    match core
+        .begin_copy(
+            &ctx(TENANT),
+            &s,
+            "COPY (SELECT id FROM t LIMIT 5) TO STDOUT",
+        )
+        .expect("COPY resolves into q1")
+    {
+        engine::core::CopyPlan::To(_, r, _) => assert_eq!(r.rows.len(), 3),
+        _ => panic!("expected a COPY TO plan"),
+    }
+    ok(&core, &mut s, "TRUNCATE t");
+    assert!(ids(&core, &mut s, "SELECT id FROM q1.t LIMIT 100").is_empty());
+    assert_eq!(
+        ids(&core, &mut s, "SELECT id FROM public.t LIMIT 100"),
+        vec![1]
+    );
+    ok(&core, &mut s, "DROP TABLE t");
+    assert_eq!(code(&core, &mut s, "SELECT id FROM q1.t LIMIT 5"), "42P01");
+    // public.t は残っている（path 上に q1.t が無くなったので、未修飾の `t` は public へ落ちる）。
+    assert_eq!(ids(&core, &mut s, "SELECT id FROM t LIMIT 100"), vec![1]);
+}
+
+/// 未修飾の作成・DML・DDL が、path の先頭の SCHEMA だけで完結する（public に同名が無い構成）。
+#[test]
+fn create_and_dml_complete_inside_the_path_schema() {
+    let (core, _g, mut s) = q1_world("sp-create-q1-only");
+    ok(&core, &mut s, "SET search_path TO q1");
+    ok(
+        &core,
+        &mut s,
+        "CREATE TABLE t2 (id BIGINT PRIMARY KEY, name TEXT)",
+    );
+    ok(&core, &mut s, "INSERT INTO t2 (id, name) VALUES (1, 'a')");
+    ok(&core, &mut s, "INSERT INTO t2 (id, name) VALUES (2, 'b')");
+    ok(&core, &mut s, "UPDATE t2 SET name = 'c' WHERE id = 1");
+    ok(&core, &mut s, "DELETE FROM t2 WHERE id = 2");
+    assert_eq!(
+        ids(&core, &mut s, "SELECT id FROM q1.t2 LIMIT 100"),
+        vec![1]
+    );
+    assert_eq!(ids(&core, &mut s, "SELECT id FROM t2 LIMIT 100"), vec![1]);
+    // public には作られていない。
+    assert_eq!(
+        code(&core, &mut s, "SELECT id FROM public.t2 LIMIT 5"),
+        "42P01"
+    );
+    // 索引・列追加・ビュー・CTAS・UPDATE FROM／DELETE USING・ON CONFLICT も同じ SCHEMA に効く。
+    ok(&core, &mut s, "CREATE INDEX i2 ON t2 (name)");
+    ok(&core, &mut s, "ALTER TABLE t2 ADD COLUMN extra BIGINT");
+    ok(&core, &mut s, "CREATE VIEW v2 AS SELECT id FROM t2");
+    ok(&core, &mut s, "CREATE TABLE t3 AS SELECT id FROM t2");
+    assert_eq!(
+        ids(&core, &mut s, "SELECT id FROM q1.v2 LIMIT 100"),
+        vec![1]
+    );
+    assert_eq!(
+        ids(&core, &mut s, "SELECT id FROM q1.t3 LIMIT 100"),
+        vec![1]
+    );
+    ok(
+        &core,
+        &mut s,
+        "UPDATE t2 SET extra = 7 FROM t3 WHERE t2.id = t3.id",
+    );
+    ok(
+        &core,
+        &mut s,
+        "INSERT INTO t2 (id, name) VALUES (1, 'dup') ON CONFLICT (id) DO UPDATE SET name = 'upd'",
+    );
+    ok(&core, &mut s, "DELETE FROM t3 USING t2 WHERE t3.id = t2.id");
+    assert!(ids(&core, &mut s, "SELECT id FROM q1.t3 LIMIT 100").is_empty());
+    ok(&core, &mut s, "DROP INDEX i2");
+    ok(&core, &mut s, "DROP TABLE t3");
+    // 重複作成のエラー文言に内部 ID を出さない。
+    let (c, msg) = err(&core, &mut s, "CREATE TABLE t2 (id BIGINT PRIMARY KEY)");
+    assert_eq!(c, "42P07");
+    assert!(!msg.contains('#'), "{msg}");
+    ok(
+        &core,
+        &mut s,
+        "CREATE TABLE IF NOT EXISTS t2 (id BIGINT PRIMARY KEY)",
+    );
+}
+
+/// 自己参照 FK は、現状は修飾形でも未修飾形でも同じ理由（行 ID モード未対応）で `0A000`。作成先に合わせた
+/// 自己参照の書き換え自体は `sql::search_path` の単体テストで固定している。
+#[test]
+fn self_referencing_foreign_key_behaves_like_the_qualified_form() {
+    let (core, _g, mut s) = q1_world("sp-self-fk");
+    let (qc, qmsg) = err(
+        &core,
+        &mut s,
+        "CREATE TABLE q1.t3 (id BIGINT PRIMARY KEY, parent BIGINT REFERENCES q1.t3 (id))",
+    );
+    ok(&core, &mut s, "SET search_path TO q1, public");
+    let (c, msg) = err(
+        &core,
+        &mut s,
+        "CREATE TABLE t3 (id BIGINT PRIMARY KEY, parent BIGINT REFERENCES t3 (id))",
+    );
+    assert_eq!((c, msg), (qc, qmsg));
+}
+
+/// 作成・DML は自テナントの SCHEMA にだけ解決される。他テナントの同名 SCHEMA は不在と同じで、
+/// 文言に内部 ID を出さない。
+#[test]
+fn other_tenant_with_the_same_path_cannot_create_or_write_into_the_schema() {
+    let (core, _g, mut s) = q1_world("sp-write-other-tenant");
+    let mut bob = ddl_session();
+    let bob_ctx = ctx("bob");
+    core.execute_sql_in_session(&bob_ctx, &mut bob, "SET search_path TO q1")
+        .expect("set");
+    for sql in [
+        "CREATE TABLE t (id BIGINT PRIMARY KEY)",
+        "CREATE SEQUENCE sq",
+    ] {
+        let e = core
+            .execute_sql_in_session(&bob_ctx, &mut bob, sql)
+            .expect_err(sql);
+        assert_eq!(e.wire_code(), "3F000", "{sql}");
+        assert!(!e.to_string().contains('#'), "{sql}: {e}");
+    }
+    let e = core
+        .execute_sql_in_session(
+            &bob_ctx,
+            &mut bob,
+            "INSERT INTO t (id, name) VALUES (5, 'b')",
+        )
+        .expect_err("insert");
+    assert_eq!(e.wire_code(), "42P01");
+    assert!(!e.to_string().contains('#'));
+    // alice の q1.t は変わらない。
     assert_eq!(
         ids(&core, &mut s, "SELECT id FROM q1.t LIMIT 100"),
         vec![10, 20]
     );
-    // COPY も同じ。
-    match core.begin_copy(
-        &ctx(TENANT),
-        &s,
-        "COPY (SELECT id FROM t LIMIT 5) TO STDOUT",
-    ) {
-        Err(e) => assert_eq!(e.wire_code(), "0A000"),
-        Ok(_) => panic!("COPY must be rejected"),
-    }
-    // 修飾名・public だけに解決される文は従来どおり通る。
-    ok(
-        &core,
-        &mut s,
-        "INSERT INTO public.t (id, name) VALUES (2, 'z')",
-    );
-    ok(&core, &mut s, "SET search_path TO public, q1");
-    ok(&core, &mut s, "INSERT INTO t (id, name) VALUES (3, 'w')");
+}
+
+/// 明示トランザクション内の DDL は、path 形でも従来どおり `0A000`（この前提を固定する）。
+#[test]
+fn ddl_in_an_explicit_transaction_stays_unsupported_with_a_path_schema() {
+    let (core, _g, mut s) = q1_world("sp-ddl-in-txn");
+    ok(&core, &mut s, "SET search_path TO q1, public");
+    let c = ctx(TENANT);
+    let mut txn = core.new_session_transaction();
+    core.execute_sql_in_txn(&c, &mut s, &mut txn, "BEGIN")
+        .expect("begin");
+    let e = core
+        .execute_sql_in_txn(
+            &c,
+            &mut s,
+            &mut txn,
+            "CREATE TABLE tx1 (id BIGINT PRIMARY KEY)",
+        )
+        .expect_err("DDL in txn");
+    assert_eq!(e.wire_code(), "0A000");
+    core.execute_sql_in_txn(&c, &mut s, &mut txn, "ROLLBACK")
+        .expect("rollback");
+}
+
+/// `ALTER TABLE <未修飾> SET SCHEMA ..` で対象が SCHEMA に解決される形は固定文言の `0A000`。
+// tracked: #3198
+#[test]
+fn set_schema_on_a_path_resolved_table_is_unsupported() {
+    let (core, _g, mut s) = q1_world("sp-set-schema");
+    ok(&core, &mut s, "SET search_path TO q1, public");
+    let (c, msg) = err(&core, &mut s, "ALTER TABLE t SET SCHEMA public");
+    assert_eq!(c, "0A000");
+    assert!(!msg.contains('#'), "{msg}");
     assert_eq!(
-        ids(&core, &mut s, "SELECT id FROM public.t LIMIT 100"),
-        vec![1, 2, 3]
+        ids(&core, &mut s, "SELECT id FROM q1.t LIMIT 100"),
+        vec![10, 20]
     );
 }
 
@@ -1173,6 +1361,11 @@ fn unprivileged_ddl_and_unbound_grant_keep_42501_ahead_of_resolution() {
     let mut plain = SessionState::default();
     ok(&core, &mut plain, "SET search_path TO q1, public");
     assert_eq!(code(&core, &mut plain, "DROP TABLE t"), "42501");
+    assert_eq!(
+        code(&core, &mut plain, "CREATE TABLE w (id BIGINT PRIMARY KEY)"),
+        "42501"
+    );
+    assert_eq!(code(&core, &mut plain, "CREATE SEQUENCE w"), "42501");
     assert_eq!(
         code(&core, &mut plain, "GRANT SELECT ON t TO alice"),
         "42501"
