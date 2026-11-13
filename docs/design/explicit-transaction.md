@@ -1218,3 +1218,24 @@ crash 道具 `crates/engine/examples/crash_tool_cross_table.rs` の `txn` モー
 - NOT NULL 違反（`23502`）は台帳照合の後に起きうるため、失敗した文の台帳が共有 write txn に書かれうる。Tx が `Failed` から `ROLLBACK` で破棄されるので残らない。
 - 読み取り文（kNN・走査・集約・定数・`EXPLAIN SELECT`）に付けた `USING OPERATION_ID` は、autocommit・明示 Tx・`BEGIN READ ONLY` のすべてで `42601` により拒否される（無視されて受理される形は無い）。kNN の形は USING 句の未対応、それ以外は文末の余剰トークンとして拒否される。明示 Tx は `Failed` へ遷移し、ID は台帳にも Tx 内の使用済み ID にも登録されない。READ ONLY の Tx でも parse の段で `42601` になり `25006` には届かない。
 - 範囲外: `ROLLBACK TO` 後の再利用（`sql69_savepoint_*` が担当）・wire 層越しの射影・暗黙トランザクション（`wire16_implicit_txn.rs`）。
+
+## 末尾 `;` の扱い（Issue #3171・SQL-31・SQL-38・SQL-69・WIRE-15・WIRE-16 ポインタ）
+
+本節は判断の記録のみで、spec 本文は転記しない。
+
+- 背景: psql の `-f`／`-c` は文末に `;` を付けて 1 メッセージに 1 文ずつ送る。簡易クエリの分割器は
+  唯一の `;` が文末にあるとき元テキストをそのまま engine へ渡すため、Tx 制御文・`SET TRANSACTION`・
+  `FETCH`・`CLOSE` の専用検証器が末尾の `;` を余剰トークンとして `42601` にしていた。`BEGIN;` が失敗すると
+  後続の文が autocommit で実行される。拡張クエリの `Parse("BEGIN;")` も同じ検証器を通る。
+- 判断 1: 末尾の単一 `;` は各検証器の入口で外す（`sql::lexer::strip_one_trailing_semicolon`）。
+  検証器の呼び出し元は `core.rs` の 1 か所で、振り分けは先頭語だけを見るため `core.rs` は変えない。
+  `is_rollback_statement`／`is_allowed_while_failed` も先頭語しか見ないので、`Failed` 中の `ROLLBACK;` が戻れる。
+- 判断 2: 外すのは 1 個だけにする。`BEGIN;;`・`BEGIN; ;`、途中の `;`（`BEGIN; COMMIT`）は
+  engine 入口では `42601`（fail-closed）。一般の文（`expect_end_of_statement`）と `LOCK` も末尾 1 個しか
+  受理しないため、文の種類で受理範囲がずれないようにそろえた。簡易クエリでは分割器が空文を捨てるので
+  `BEGIN;;` は従来どおり通る。
+- 判断 3: `COMMIT AND CHAIN;`・`PREPARE TRANSACTION ...;` は `;` を外したあとも従来どおり `0A000`。
+- `DECLARE ... FOR SELECT ...;` は内側 SELECT の検証が末尾 `;` を 1 個受理するため、検証器は変えていない。
+- テスト: `crates/engine/tests/sql_t01_39/sql31_trailing_semicolon.rs`・
+  `crates/wire-server/tests/wire_proto/sql31_trailing_semicolon.rs`、単体テストは `sql/transaction.rs`・
+  `sql/cursor.rs`・`sql/lexer.rs`。

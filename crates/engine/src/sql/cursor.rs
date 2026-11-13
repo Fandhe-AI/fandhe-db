@@ -219,6 +219,8 @@ pub(crate) fn validate_fetch_tokens(
     tokens: &[Token],
     result_limits: &crate::result_limits::ResultLimits,
 ) -> Result<CursorStatement, SqlSurfaceError> {
+    // 末尾の単一 `;` を受理する（Issue #3171）。
+    let tokens = crate::sql::lexer::strip_one_trailing_semicolon(tokens);
     let rest = tokens.split_first().map_or(&[][..], |(_, tail)| tail);
     let rest = match rest.split_first() {
         Some((Token::Ident(w), tail)) if w.eq_ignore_ascii_case("FORWARD") => tail,
@@ -256,6 +258,8 @@ pub(crate) fn validate_fetch_tokens(
 /// `CLOSE <name>`（規範形のみ）。先頭トークンが `CLOSE`（大小無視）であることは
 /// 呼び出し元（`core.rs::parse_tokens`）が確認済みの前提。
 pub(crate) fn validate_close_tokens(tokens: &[Token]) -> Result<CursorStatement, SqlSurfaceError> {
+    // 末尾の単一 `;` を受理する（Issue #3171）。
+    let tokens = crate::sql::lexer::strip_one_trailing_semicolon(tokens);
     let rest = tokens.split_first().map_or(&[][..], |(_, tail)| tail);
     let (name_token, rest) = rest
         .split_first()
@@ -845,5 +849,42 @@ mod tests {
         assert_eq!(err.wire_code(), "34000");
         let err = registry.close("missing").expect_err("not found");
         assert_eq!(err.wire_code(), "34000");
+    }
+
+    /// Issue #3171: 末尾の単一 `;` を受理し、`;;` は 42601 のまま。
+    #[test]
+    fn trailing_semicolon_is_accepted_for_cursor_statements() {
+        assert_eq!(
+            validate_fetch_tokens(&tokens_of("FETCH 1 FROM c;"), &Default::default())
+                .expect("fetch"),
+            CursorStatement::Fetch {
+                name: "c".to_string(),
+                count: 1
+            }
+        );
+        assert!(
+            validate_fetch_tokens(&tokens_of("FETCH FORWARD 1 FROM c;"), &Default::default())
+                .is_ok()
+        );
+        assert_eq!(
+            validate_close_tokens(&tokens_of("CLOSE c;")).expect("close"),
+            CursorStatement::Close {
+                name: "c".to_string()
+            }
+        );
+        let declare = validate_declare_tokens(
+            &tokens_of("DECLARE c CURSOR FOR SELECT COUNT(*) FROM documents;"),
+            &FakeCatalog,
+            Default::default(),
+        );
+        assert!(declare.is_ok(), "{declare:?}");
+        for sql in ["CLOSE c;;", "CLOSE ALL;"] {
+            let err = validate_close_tokens(&tokens_of(sql)).expect_err(sql);
+            assert_eq!(err.wire_code(), "42601", "{sql}");
+        }
+        for sql in ["FETCH 1 FROM c;;", "FETCH ALL FROM c;"] {
+            let err = validate_fetch_tokens(&tokens_of(sql), &Default::default()).expect_err(sql);
+            assert_eq!(err.wire_code(), "42601", "{sql}");
+        }
     }
 }
