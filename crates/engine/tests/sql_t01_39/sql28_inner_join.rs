@@ -973,28 +973,47 @@ fn describe_rejects_type_mismatch_like_execute() {
 
 // ---------- JOIN と他構文の組み合わせ（対象外事項の防御的確認） ----------
 
-/// Issue #925 §2.6・対象外事項: `DECLARE ... FOR` の内側は `Statement::Scan`／
-/// `Statement::Aggregate` のみを受理するため（`sql::cursor::
-/// validate_declare_inner`）、JOIN を含む内側は `42601`。
+/// Issue #3175: `DECLARE ... FOR` の内側に JOIN を書ける。明示 Tx 内の DECLARE → FETCH → CLOSE の
+/// 結果は、同じ JOIN の直接実行と一致する（INSENSITIVE。RLS は参照セッションの `ctx` で両辺に適用）。
 #[test]
-fn declare_cursor_for_join_is_rejected() {
+fn declare_cursor_for_join_matches_direct_execution() {
     let (storage, path) = seeded_basic();
     let _guard = CleanupGuard(path);
     let core = new_core(storage);
     let caller = ctx("tenant-a");
+    let join_sql = "SELECT documents.title FROM documents JOIN authors ON documents.author_id = authors.id LIMIT 10";
+    let direct = run(&core, "tenant-a", join_sql);
+    assert!(!titles(&direct).is_empty());
+
     let mut session = SessionState::default();
     let mut txn = core.new_session_transaction();
     core.execute_sql_in_txn(&caller, &mut session, &mut txn, "BEGIN")
         .expect("begin");
-    let err = core
-        .execute_sql_in_txn(
-            &caller,
-            &mut session,
-            &mut txn,
-            "DECLARE c CURSOR FOR SELECT * FROM documents JOIN authors ON documents.author_id = authors.id LIMIT 10",
-        )
-        .expect_err("DECLARE ... FOR JOIN must be rejected");
-    assert_eq!(err.wire_code(), "42601");
+    core.execute_sql_in_txn(
+        &caller,
+        &mut session,
+        &mut txn,
+        &format!("DECLARE c CURSOR FOR {join_sql}"),
+    )
+    .expect("DECLARE ... FOR JOIN must be accepted");
+    let mut fetched = Vec::new();
+    loop {
+        let out = core
+            .execute_sql_in_txn(&caller, &mut session, &mut txn, "FETCH FORWARD 2 IN c")
+            .expect("fetch");
+        let SqlOutcome::Fetch(result) = out else {
+            panic!("expected Fetch outcome");
+        };
+        if result.rows.is_empty() {
+            break;
+        }
+        fetched.extend(titles(&result));
+    }
+    assert_eq!(fetched, titles(&direct));
+    core.execute_sql_in_txn(&caller, &mut session, &mut txn, "CLOSE c")
+        .expect("close");
+    core.execute_sql_in_txn(&caller, &mut session, &mut txn, "COMMIT")
+        .expect("commit");
 }
 
 /// Issue #1192（TABLE-18）: `CREATE VIEW` 本文に JOIN を書けるようになった
