@@ -55,6 +55,8 @@
 mod aggregate;
 // `UPDATE ... FROM`/`DELETE ... USING` の結合実行（Issue #1755・SQL-53）。
 pub(crate) mod dml;
+// 束縛済み `UPDATE ... FROM`／`DELETE ... USING` から `JoinedDmlPlan` への変換（Issue #3201・SQL-53 (b)）。
+pub(crate) mod dml_plan;
 mod exec;
 mod explain;
 mod nlj;

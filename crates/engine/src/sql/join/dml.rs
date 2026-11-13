@@ -91,9 +91,27 @@ pub(crate) struct JoinedSetItem {
     pub(crate) set: BoundSetExpr,
 }
 
+/// source 列をそのまま対象列へ写す SET 項（`SET t.c = s.c`）。式評価（`bind_set_expr`）が受理しない
+/// 列型（JSONB／JSON／UUID／BYTEA／NUMERIC／ENUM 等）の単純コピーを、型を制限せず運ぶ。
+/// 対象列型と source 列型は変換段階で一致を確認済み（不一致は計画に載らない）。
+#[derive(Debug, Clone)]
+pub(crate) struct JoinedCopyItem {
+    pub(crate) column_index: usize,
+    /// [`JoinedDmlPlan::source_columns`] の並び位置。
+    pub(crate) source_pos: usize,
+    /// 代入先の列型（セルから行値への変換に使う）。
+    pub(crate) target_ty: ColumnType,
+    /// 代入先の列が NULL を許すか。
+    pub(crate) nullable: bool,
+    /// 代入先の列名（`23502` の文言用）。
+    pub(crate) column_name: String,
+}
+
 /// `UPDATE` の SET 句。
 #[derive(Debug, Clone, Default)]
 pub(crate) struct JoinedUpdateSet {
+    /// source 列の単純コピー項。
+    pub(crate) copies: Vec<JoinedCopyItem>,
     /// 行によらず定まる代入（リテラル）。
     pub(crate) literal_assignments: Vec<(usize, Value)>,
     /// 結合ビュー上の式項。
@@ -171,7 +189,11 @@ impl JoinedDmlPlan {
         }
         if let Some(u) = &self.update {
             let in_range = |i: usize| i < t_len;
+            let src_len = self.source_columns().len();
             if u.items.iter().any(|it| !in_range(it.column_index))
+                || u.copies
+                    .iter()
+                    .any(|c| !in_range(c.column_index) || c.source_pos >= src_len)
                 || u.literal_assignments.iter().any(|(i, _)| !in_range(*i))
             {
                 return Err(internal("SET column out of range"));
@@ -460,7 +482,12 @@ impl<'a> JoinedProbe<'a> {
         };
         self.budget
             .charge(std::mem::size_of::<Vec<(usize, Value)>>())?;
-        if items.is_empty() {
+        let copies = self
+            .plan
+            .update
+            .as_ref()
+            .map_or(&[][..], |u| u.copies.as_slice());
+        if items.is_empty() && copies.is_empty() {
             return Ok(Some(Vec::new()));
         }
         let row = self
@@ -506,7 +533,20 @@ impl<'a> JoinedProbe<'a> {
         for ((cell, ty), payload) in source_cells.iter().zip(&array_payloads) {
             view.push(source_scalar(cell, ty, payload.as_deref())?);
         }
-        let mut out: Vec<(usize, Value)> = Vec::with_capacity(items.len());
+        let mut out: Vec<(usize, Value)> = Vec::with_capacity(items.len() + copies.len());
+        for copy in copies {
+            let (cell, _) = source_cells
+                .get(copy.source_pos)
+                .ok_or_else(|| internal("source copy position out of range"))?;
+            if matches!(cell, Cell::Null) && !copy.nullable {
+                return Err(SqlSurfaceError::not_null_violation(&copy.column_name));
+            }
+            let value = copy_cell_to_value((*cell).clone(), &copy.target_ty)?;
+            self.budget.charge(
+                std::mem::size_of::<(usize, Value)>().saturating_add(value_bytes(&value)),
+            )?;
+            out.push((copy.column_index, value));
+        }
         for item in items {
             let value =
                 crate::sql::set_expr::eval_set_expr_to_value(&item.set, c.id, c.embedding, &view)?;
@@ -516,6 +556,23 @@ impl<'a> JoinedProbe<'a> {
             out.push((item.column_index, value));
         }
         Ok(Some(out))
+    }
+}
+
+/// 単純コピーのセルを対象列型の行値へ変換する。`matview::cell_to_value` は ENUM のセルを扱わないため、
+/// ここで語彙検証して `Value::Enum` にする（語彙外は `22P02`。行の値は固定文言に含めない）。
+/// それ以外の型は `matview::cell_to_value` に委ねる。
+fn copy_cell_to_value(cell: Cell, ty: &ColumnType) -> Result<Value, SqlSurfaceError> {
+    match (ty, cell) {
+        (ColumnType::Enum(def), Cell::Text(label)) => {
+            if def.validate_label(&label).is_err() {
+                return Err(SqlSurfaceError::invalid_text_representation(
+                    "invalid input value for enum type",
+                ));
+            }
+            Ok(Value::Enum(label))
+        }
+        (_, cell) => crate::sql::matview::cell_to_value(cell, ty),
     }
 }
 
