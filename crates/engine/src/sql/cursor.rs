@@ -207,11 +207,17 @@ pub(crate) fn validate_declare_tokens_structure_only(
     validate_declare_tokens(tokens, &AlwaysExistsLookup, limits)
 }
 
-/// `FETCH [FORWARD] <n> FROM <name>`（規範形のみ。`IN`／`ALL`／`NEXT`／
-/// `BACKWARD`／`ABSOLUTE` はいずれも `n` の位置に `Token::Number` を要求する
-/// 構造上、自然に `42601` へ落ちる）。`$n`（拡張クエリプロトコルのパラメータ
-/// プレースホルダ）は本バージョンのスコープ外（`sql::params::
-/// validate_param_positions` が先頭トークンで判定し fail-closed に拒否する）。
+/// `FETCH [ NEXT | [FORWARD] <n> ] { FROM | IN } <name>`（Issue #3173・WIRE-15）。
+///
+/// `NEXT` は 1 件、`IN` は `FROM` の別名、`FORWARD` の後ろは件数が必須。
+/// `ALL`／`BACKWARD`／`PRIOR`／`FIRST`／`LAST`／`ABSOLUTE`／`RELATIVE`・件数なしの
+/// `FORWARD`・`FROM`／`IN` の省略は `42601` で fail-closed に拒否する（前方向以外を
+/// 前方向へ読み替える fail-open 経路を作らない）。件数は `NEXT` を含め
+/// `validate_search_limit_with` を通し、上限設定との整合を 1 経路に揃える。
+/// 方向語と `IN` は `Token::Ident`（大小無視）のみ受理する。字句解析は `IN` 等の引用を
+/// 区別しない（`FORWARD` の従来挙動と同じ）が、受理後の意味は引用なしと同一で無害。
+/// `$n`（拡張クエリのパラメータ）は `sql::params::validate_param_positions` が
+/// 先頭トークンで判定し fail-closed に拒否する。
 ///
 /// 先頭トークンが `FETCH`（大小無視）であることは呼び出し元
 /// （`core.rs::parse_tokens`）が確認済みの前提。
@@ -222,23 +228,11 @@ pub(crate) fn validate_fetch_tokens(
     // 末尾の単一 `;` を受理する（Issue #3171）。
     let tokens = crate::sql::lexer::strip_one_trailing_semicolon(tokens);
     let rest = tokens.split_first().map_or(&[][..], |(_, tail)| tail);
-    let rest = match rest.split_first() {
-        Some((Token::Ident(w), tail)) if w.eq_ignore_ascii_case("FORWARD") => tail,
-        _ => rest,
-    };
-    let (count_token, rest) = rest
-        .split_first()
-        .ok_or_else(|| SqlSurfaceError::unsupported("malformed FETCH statement"))?;
-    let Token::Number(raw_count) = count_token else {
-        return Err(SqlSurfaceError::unsupported("malformed FETCH statement"));
-    };
-    let raw: u32 = raw_count
-        .parse()
-        .map_err(|_| SqlSurfaceError::unsupported(format!("malformed FETCH count: {raw_count}")))?;
-    let count = crate::sql::parser::validate_search_limit_with(raw, result_limits)?;
+    let (count, rest) = parse_fetch_count(rest, result_limits)?;
     let rest = match rest.split_first() {
         Some((Token::Keyword(Keyword::From), tail)) => tail,
-        _ => return Err(SqlSurfaceError::unsupported("expected FROM")),
+        Some((Token::Ident(w), tail)) if w.eq_ignore_ascii_case("IN") => tail,
+        _ => return Err(SqlSurfaceError::unsupported("expected FROM or IN")),
     };
     let (name_token, rest) = rest
         .split_first()
@@ -253,6 +247,34 @@ pub(crate) fn validate_fetch_tokens(
         ));
     }
     Ok(CursorStatement::Fetch { name, count })
+}
+
+/// FETCH の方向・件数部（`NEXT` / `[FORWARD] <n>`）を読み、件数と残りトークンを返す。
+/// `validate_fetch_tokens` 専用。`ALL` 対応（#3174）は `FORWARD` 分岐と数値分岐へ足す。
+fn parse_fetch_count<'a>(
+    rest: &'a [Token],
+    result_limits: &crate::result_limits::ResultLimits,
+) -> Result<(usize, &'a [Token]), SqlSurfaceError> {
+    let malformed = || SqlSurfaceError::unsupported("malformed FETCH statement");
+    let (first, tail) = rest.split_first().ok_or_else(malformed)?;
+    let (number_token, after) = match first {
+        Token::Ident(w) if w.eq_ignore_ascii_case("NEXT") => {
+            let count = crate::sql::parser::validate_search_limit_with(1, result_limits)?;
+            return Ok((count, tail));
+        }
+        Token::Ident(w) if w.eq_ignore_ascii_case("FORWARD") => {
+            tail.split_first().ok_or_else(malformed)?
+        }
+        _ => (first, tail),
+    };
+    let Token::Number(raw_count) = number_token else {
+        return Err(malformed());
+    };
+    let raw: u32 = raw_count
+        .parse()
+        .map_err(|_| SqlSurfaceError::unsupported(format!("malformed FETCH count: {raw_count}")))?;
+    let count = crate::sql::parser::validate_search_limit_with(raw, result_limits)?;
+    Ok((count, after))
 }
 
 /// `CLOSE <name>`（規範形のみ）。先頭トークンが `CLOSE`（大小無視）であることは
@@ -636,16 +658,53 @@ mod tests {
             }
         );
 
+        for (sql, count) in [
+            ("FETCH NEXT FROM c", 1),
+            ("FETCH NEXT IN c", 1),
+            ("fetch next in c", 1),
+            ("FETCH 1 IN c", 1),
+            ("FETCH FORWARD 3 FROM c", 3),
+            ("FETCH FORWARD 3 IN c", 3),
+        ] {
+            let stmt = validate_fetch_tokens(&tokens_of(sql), &Default::default()).expect(sql);
+            assert_eq!(
+                stmt,
+                CursorStatement::Fetch {
+                    name: "c".to_string(),
+                    count
+                },
+                "{sql}"
+            );
+        }
+
         for sql in [
             "FETCH ALL FROM c",
-            "FETCH NEXT FROM c",
+            "FETCH FORWARD ALL FROM c",
             "FETCH BACKWARD 1 FROM c",
-            "FETCH 0 FROM c",
+            "FETCH PRIOR FROM c",
+            "FETCH FIRST FROM c",
+            "FETCH LAST FROM c",
+            "FETCH ABSOLUTE 1 FROM c",
+            "FETCH RELATIVE 1 FROM c",
+            "FETCH NEXT 3 FROM c",
+            "FETCH FORWARD NEXT FROM c",
+            "FETCH FORWARD FROM c",
+            "FETCH FORWARD FORWARD 1 FROM c",
+            "FETCH FROM c",
+            "FETCH IN c",
+            "FETCH c",
+            "FETCH NEXT c",
+            "FETCH 1 c",
+            "FETCH 1 IN FROM c",
+            "FETCH 1 FROM IN c",
+            "FETCH 1 FROM c extra",
         ] {
-            let err =
-                validate_fetch_tokens(&tokens_of(sql), &Default::default()).expect_err("rejected");
-            assert!(matches!(err.wire_code(), "42601" | "22000"));
+            let err = validate_fetch_tokens(&tokens_of(sql), &Default::default()).expect_err(sql);
+            assert_eq!(err.wire_code(), "42601", "{sql}");
         }
+        let err = validate_fetch_tokens(&tokens_of("FETCH 0 FROM c"), &Default::default())
+            .expect_err("zero");
+        assert_eq!(err.wire_code(), "22000");
     }
 
     #[test]
@@ -866,6 +925,12 @@ mod tests {
             validate_fetch_tokens(&tokens_of("FETCH FORWARD 1 FROM c;"), &Default::default())
                 .is_ok()
         );
+        for sql in ["FETCH NEXT FROM c;", "FETCH 1 IN c;"] {
+            assert!(
+                validate_fetch_tokens(&tokens_of(sql), &Default::default()).is_ok(),
+                "{sql}"
+            );
+        }
         assert_eq!(
             validate_close_tokens(&tokens_of("CLOSE c;")).expect("close"),
             CursorStatement::Close {
