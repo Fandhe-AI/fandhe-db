@@ -341,7 +341,16 @@ impl SparseIndex {
             for plan in &plans {
                 let mut run = self.eval_group(plan, &expansion, &bitmap, params)?;
                 run.sort_by_key(|&(d, _)| d);
-                merged = merge_add_sorted(&merged, &run);
+                // 空 run はマージ不要（既存 merged の再コピーを避ける）。merged が空なら run を
+                // そのまま移す（`0.0 + s` は有限・正の `s` とビット一致。非有限は後段で拒否される）。
+                if run.is_empty() {
+                    continue;
+                }
+                if merged.is_empty() {
+                    merged = run;
+                } else {
+                    merged = merge_add_sorted(&merged, &run);
+                }
             }
         }
         let hits = if plans.len() == 1 { &single } else { &merged };
