@@ -19,6 +19,7 @@ mod search15_rerank_explain;
 mod search15_rerank_wiring;
 mod search17_hybrid_explain_score;
 mod sql33_cosine_negip_execution;
+mod sql33_cosine_parallel_parity;
 mod sql33_crossdb_self_shapes;
 mod sql33_distance_kind_acceptance;
 mod sql33_hnsw_opclass_ddl;
