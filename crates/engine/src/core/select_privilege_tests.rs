@@ -365,6 +365,48 @@ fn cursor_is_checked_at_declare_and_not_at_fetch() {
         .expect("rollback");
 }
 
+/// Issue #3175: 内側が JOIN の DECLARE は全 relation（別名付き含む）の SELECT 権限を DECLARE の
+/// 時点で検査する。片側だけの付与は `42501`（Tx は `Failed`）、両側付与で成功し、後の REVOKE は
+/// 開いているカーソルへ影響しない。
+#[test]
+fn join_cursor_is_checked_on_every_relation_at_declare() {
+    let f = fx("selpriv-cursor-join");
+    let mut s = bound(f.alice, A, false);
+    for decl in [
+        "DECLARE c CURSOR FOR SELECT ca.id FROM ca JOIN cb ON ca.id = cb.id LIMIT 5",
+        "DECLARE c CURSOR FOR SELECT x.id FROM ca x JOIN cb y ON x.id = y.id LIMIT 5",
+    ] {
+        f.admin_run("GRANT SELECT ON ca TO alice");
+        let mut txn = f.core.new_session_transaction();
+        f.core
+            .execute_sql_in_txn(&ctx(A), &mut s, &mut txn, "BEGIN")
+            .expect("begin");
+        let r = f.core.execute_sql_in_txn(&ctx(A), &mut s, &mut txn, decl);
+        assert_eq!(code(r), "42501", "{decl}");
+        assert_eq!(txn.status(), TransactionStatus::Failed);
+        f.core
+            .execute_sql_in_txn(&ctx(A), &mut s, &mut txn, "ROLLBACK")
+            .expect("rollback");
+
+        f.admin_run("GRANT SELECT ON cb TO alice");
+        f.core
+            .execute_sql_in_txn(&ctx(A), &mut s, &mut txn, "BEGIN")
+            .expect("begin");
+        f.core
+            .execute_sql_in_txn(&ctx(A), &mut s, &mut txn, decl)
+            .expect("declare with both granted");
+        f.admin_run("REVOKE SELECT ON ca FROM alice");
+        f.admin_run("REVOKE SELECT ON cb FROM alice");
+        let r = f
+            .core
+            .execute_sql_in_txn(&ctx(A), &mut s, &mut txn, "FETCH 1 FROM c");
+        assert_eq!(code(r), "ok");
+        f.core
+            .execute_sql_in_txn(&ctx(A), &mut s, &mut txn, "ROLLBACK")
+            .expect("rollback");
+    }
+}
+
 #[test]
 fn extended_query_is_checked_at_parse_bind_and_describe() {
     let f = fx("selpriv-extended");

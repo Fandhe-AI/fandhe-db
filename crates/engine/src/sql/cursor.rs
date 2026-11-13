@@ -133,7 +133,7 @@ pub(crate) fn validate_declare_tokens(
 
 /// `DECLARE` の内側 SELECT（`FOR` より後ろのトークン列）を
 /// [`crate::sql::allowlist::validate_sql_tokens`] で検証し、検証済み
-/// [`Statement`] とその読み取り対象の基底テーブル名を返す。
+/// [`Statement`] を返す（受理は集計・広域取得・CTE 入力なしの JOIN。Issue #3175）。
 ///
 /// 呼び出し元は 2 つ: (1) [`validate_declare_tokens`]（構文解析段。
 /// [`AlwaysExistsLookup`] による構造検証のみ）、(2) `core.rs::EngineCore::
@@ -142,32 +142,32 @@ pub(crate) fn validate_declare_tokens(
 /// 完全に同じ `validate_sql_tokens` の `Statement::Scan` 分岐を通るため、
 /// FROM がビューを指す場合は `sql::view::resolve_from` による連鎖の畳み込み
 /// （基底テーブル名＋ビュー由来 `WHERE` 述語・列スコープ検査）がそのまま
-/// 適用される（第 2 のビュー展開を作らない）。返すテーブル名はビュー展開後の
-/// 基底テーブル名であり、明示トランザクション内の `written_tables` 判定
-/// （`sql::transaction` モジュールドキュメント「読み取りの既知の逸脱」参照）
-/// にはこの名前を使う——ビュー名で判定すると、書き込み済みの基底テーブルを
-/// ビュー越しに読む経路が判定をすり抜けるため。
+/// 適用される（第 2 のビュー展開を作らない）。読み取り源は呼び出し元が
+/// `SessionTransaction::read_source` の三分岐で選ぶため、基底テーブル名は返さない
+/// （JOIN は複数表で単一名を返せない）。
 pub(crate) fn validate_declare_inner(
     query: &[Token],
     lookup: &impl TableLookup,
     limits: crate::nesting_limits::NestingLimits,
-) -> Result<(Statement, String), SqlSurfaceError> {
+) -> Result<Statement, SqlSurfaceError> {
     if query.is_empty() {
         return Err(SqlSurfaceError::unsupported(
             "DECLARE requires a query after FOR",
         ));
     }
     let inner = crate::sql::allowlist::validate_sql_tokens_with_limits(query, lookup, limits)?;
-    let table = match &inner {
-        Statement::Aggregate(v) => v.table_name().to_string(),
-        Statement::Scan(v) => v.table_name().to_string(),
+    match &inner {
+        Statement::Aggregate(_) | Statement::Scan(_) => {}
+        // Issue #3175: JOIN 形（INNER／OUTER／CROSS／NATURAL／USING・集計形・LIMIT 省略形）。
+        // CTE を入力に持つ JOIN は #3176 の範囲として `42601` で拒否する（fail-closed）。
+        Statement::Join(v) if v.cte_inputs.is_none() => {}
         _ => {
             return Err(SqlSurfaceError::unsupported(
-                "DECLARE only supports aggregate or wide-retrieval SELECT statements",
+                "DECLARE only supports aggregate, wide-retrieval or JOIN SELECT statements",
             ));
         }
-    };
-    Ok((inner, table))
+    }
+    Ok(inner)
 }
 
 /// 構造検証だけを行い、実カタログへは一切問い合わせない
@@ -592,11 +592,9 @@ mod tests {
         match stmt {
             CursorStatement::Declare { name, query } => {
                 assert_eq!(name, "c");
-                let (inner, table) =
-                    validate_declare_inner(&query, &FakeCatalog, Default::default())
-                        .expect("inner revalidates");
+                let inner = validate_declare_inner(&query, &FakeCatalog, Default::default())
+                    .expect("inner revalidates");
                 assert!(matches!(inner, Statement::Scan(_)));
-                assert_eq!(table, "documents");
             }
             _ => panic!("expected Declare"),
         }
@@ -608,6 +606,36 @@ mod tests {
         )
         .expect("aggregate form accepted");
         assert!(matches!(stmt, CursorStatement::Declare { .. }));
+    }
+
+    /// Issue #3175: JOIN 形の内側を受理し、CTE 入力の JOIN は #3176 の範囲として拒否する。
+    #[test]
+    fn declare_accepts_join_inner_select_and_rejects_cte_join() {
+        let stmt = validate_declare_tokens(
+            &tokens_of(
+                "DECLARE c CURSOR FOR SELECT a.id FROM documents a JOIN documents b ON a.id = b.id LIMIT 5",
+            ),
+            &FakeCatalog,
+            Default::default(),
+        )
+        .expect("join form accepted");
+        let CursorStatement::Declare { query, .. } = stmt else {
+            panic!("expected Declare");
+        };
+        let inner = validate_declare_inner(&query, &FakeCatalog, Default::default())
+            .expect("inner revalidates");
+        assert!(matches!(inner, Statement::Join(_)));
+
+        // tracked: #3176
+        let err = validate_declare_tokens(
+            &tokens_of(
+                "DECLARE c CURSOR FOR WITH w AS (SELECT id FROM documents LIMIT 5) SELECT w.id FROM w JOIN documents b ON w.id = b.id LIMIT 5",
+            ),
+            &FakeCatalog,
+            Default::default(),
+        )
+        .expect_err("cte join rejected");
+        assert_eq!(err.wire_code(), "42601");
     }
 
     #[test]
