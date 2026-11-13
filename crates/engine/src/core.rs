@@ -2018,8 +2018,9 @@ pub enum ParsedSql {
     Update(crate::sql::allowlist::ValidatedUpdateForm),
     /// `UPDATE <表> [[AS] <別名>] SET ... FROM <表の並び> [WHERE ...]`（SQL-53 (b)・Issue #1754）。
     /// 構文と表の存在確認までを担い、列の解決・型照合は束縛（`sql::dml_from::bind_update_from`）が
-    /// 実行腕・Describe 腕で行う。実行腕は束縛の後に `0A000` で止める（副作用ゼロ。結合の実行は
-    /// #1755、RLS と `RETURNING` は #1756、台帳の content_hash は #1757 で構文段に実装済み）。既存の [`Self::Update`] に
+    /// 実行腕・Describe 腕で行う。束縛・変換を通った文は結合実行器へ dispatch される（Issue #3202。
+    /// autocommit は暗黙 Tx、明示 Tx は共有 write txn。`USING OPERATION_ID` 付きは #3203 まで `0A000`、
+    /// `RETURNING` は #3204）。台帳の content_hash は #1757 で構文段に実装済み。既存の [`Self::Update`] に
     /// フィールドを足さず別 variant にしているのは、FROM を黙って無視する実行経路（fail-open）を
     /// 作らず、網羅 `match` の追随漏れをコンパイラに検出させるため。
     ///
@@ -2891,9 +2892,9 @@ fn parsed_operation_id(parsed: &ParsedSql) -> Option<&str> {
         ParsedSql::Update(crate::sql::allowlist::ValidatedUpdateForm::Predicate(v)) => {
             v.operation_id().map(|id| id.as_str())
         }
-        // SQL-53 (b)・Issue #1754: 実行腕が束縛後に必ず `0A000` で拒否する間は、同一トランザクションの
-        // operation_id 登録を変えない（拒否される文が再利用検査の状態を汚さない）。実行を結線する
-        // SQL 経路の dispatch 結線時にここを見直す（#1755・#1757 は実行入口と台帳ハッシュまで）。
+        // SQL-53 (b)・Issue #3202: `USING OPERATION_ID` 付きは台帳の SQL 経路結線（#3203）まで実行腕が
+        // `0A000` で拒否するため、同一トランザクションの operation_id 登録は変えない（拒否される文が再利用検査の
+        // 状態を汚さない）。#3203 でここを実値にする。
         ParsedSql::UpdateFrom(_) | ParsedSql::DeleteUsing(_) => None,
         // Issue #2050: `EXPLAIN UPDATE|DELETE` は台帳に記録せず operation_id もトランザクションへ
         // 登録しない（登録すると同じ operation_id の本実行が誤って再利用扱いになる）。
@@ -9091,7 +9092,9 @@ impl EngineCore {
         // 乗り、失敗時は副作用ゼロ）。
         // SQL-67 (5)・Issue #2218: `LANGUAGE sql|plpgsql` の関数を呼ぶ `FROM` なし `SELECT` も同じ暗黙
         // トランザクションで実行する（本体の書き込みが外側の文と同じ write txn に乗り、失敗時は副作用ゼロ）。
+        // SQL-53 (b)・Issue #3202: `UPDATE ... FROM`／`DELETE ... USING` も同じ暗黙トランザクションで実行する。
         if Self::is_subquery_predicate_dml(parsed)
+            || dml_from_exec::is_joined_dml(parsed)
             || matches!(parsed, ParsedSql::DataModifyingCte(_) | ParsedSql::Do(_))
             || Self::calls_session_routine(session, parsed)
         {
@@ -9266,9 +9269,13 @@ impl EngineCore {
                     Ok(crate::sql::SqlOutcome::Delete(outcome))
                 }
             },
-            // SQL-53 (b)・Issue #1754: 束縛（列解決・型照合）を通した後に `0A000` で止める。実行は #1755 以降。
-            ParsedSql::UpdateFrom(stmt) => self.execute_update_from_stub(stmt, session.udfs()),
-            ParsedSql::DeleteUsing(stmt) => self.execute_delete_using_stub(stmt, session.udfs()),
+            // SQL-53 (b)・Issue #3202: 通常の autocommit は暗黙 Tx（`execute_subquery_dml_autocommit`）で実行し、
+            // 明示 Tx と同じ腕に入る。暗黙 Tx を通らない経路（`EXPLAIN` 等のネスト）は fail-closed で拒否する。
+            ParsedSql::UpdateFrom(_) | ParsedSql::DeleteUsing(_) => Err(
+                crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
+                    dml_from_exec::JOINED_DML_UNSUPPORTED_HERE,
+                ),
+            ),
             ParsedSql::Update(stmt) => {
                 // Issue #1129: `PARTITIONED` 付きは分割実行（非原子・autocommit 専用）。
                 if let crate::sql::allowlist::ValidatedUpdateForm::Predicate(v) = stmt {
@@ -10870,10 +10877,12 @@ impl EngineCore {
                 }
                 Ok(crate::sql::SqlOutcome::Query(result))
             }
-            // SQL-53 (b)・Issue #1754: 書き込みトランザクションに触れず、束縛の後に `0A000` で止める。
-            // 呼び出し元が明示トランザクションを `Failed` へ遷移させる（他の失敗文と同じ契約）。
-            ParsedSql::UpdateFrom(stmt) => self.execute_update_from_stub(stmt, session.udfs()),
-            ParsedSql::DeleteUsing(stmt) => self.execute_delete_using_stub(stmt, session.udfs()),
+            // SQL-53 (b)・Issue #3202: 共有 write txn 上で結合実行器へ dispatch し、`mark_written` する。
+            // 失敗時は呼び出し元が明示トランザクションを `Failed` へ遷移させる（他の失敗文と同じ契約）。
+            ParsedSql::UpdateFrom(stmt) => self.execute_update_from_in_txn(ctx, session, txn, stmt),
+            ParsedSql::DeleteUsing(stmt) => {
+                self.execute_delete_using_in_txn(ctx, session, txn, stmt)
+            }
             // SQL-51・Issue #1732・#1733: autocommit と同じ実行本体へ共有 write txn を渡す
             // （読み取り源にも書き込み先にもなる）。台帳・世代の単位は挿入先の表。
             // SQL-63・Issue #1876: 全副文・台帳記録・主クエリを共有 write txn で実行する。書いた全表へ
@@ -12189,14 +12198,14 @@ impl EngineCore {
                     None => Ok(None),
                 }
             }
-            // SQL-53 (b)・Issue #1754: 束縛エラーは Execute と同じコードで返す。`RETURNING` は未対応
-            // （Parse で `0A000`）のため結果列は無い。
+            // SQL-53 (b)・Issue #3202: Execute と同じ準備段（束縛・変換・op id ゲート）を通し、エラーコードを
+            // 揃える。`RETURNING` は未対応（Parse で `0A000`）のため結果列は無い。
             ParsedSql::UpdateFrom(stmt) => {
-                self.bind_update_from_stmt(stmt)?;
+                self.prepare_update_from(stmt, session.udfs())?;
                 Ok(None)
             }
             ParsedSql::DeleteUsing(stmt) => {
-                self.bind_delete_using_stmt(stmt)?;
+                self.prepare_delete_using(stmt, session.udfs())?;
                 Ok(None)
             }
             // Issue #1129: `SHOW`／`CANCEL` は `status`・`rows` の 2 列、`EXPLAIN` は

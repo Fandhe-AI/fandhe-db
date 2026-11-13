@@ -4230,7 +4230,6 @@ pub struct ValidatedUpdateFrom {
 
 impl ValidatedUpdateFrom {
     /// 台帳（RECOVER-11）の content_hash に使う正規化済みの文ハッシュ。
-    #[allow(dead_code)] // SQL 経路の dispatch 結線（実行腕）で使う。
     pub(crate) fn statement_hash(&self) -> &crate::recovery::content_hash::ContentHash {
         &self.statement_hash
     }
@@ -4265,7 +4264,6 @@ pub struct ValidatedDeleteUsing {
 
 impl ValidatedDeleteUsing {
     /// 台帳（RECOVER-11）の content_hash に使う正規化済みの文ハッシュ。
-    #[allow(dead_code)] // SQL 経路の dispatch 結線（実行腕）で使う。
     pub(crate) fn statement_hash(&self) -> &crate::recovery::content_hash::ContentHash {
         &self.statement_hash
     }
