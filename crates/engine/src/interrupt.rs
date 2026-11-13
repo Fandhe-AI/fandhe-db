@@ -16,6 +16,8 @@
 //!   走査・DISTANCE 段）・GPU バッチの確認点と、書き込みロック待ちの期限内計上
 //!   （[`effective_lock_wait`]・[`lock_wait_error`]）を足した。分割実行 DML は [`suppressed`] を
 //!   維持しつつ、期限だけ注入時計で明示評価する（`tenant/partitioned_dml.rs`）。
+//! - 集計の 3 つの行ループ（#3208）は [`RowCheck`] 経由で確認し、行ごとのコストをループ局所の
+//!   カウンタだけにする（[`ROW_CHECK_INTERVAL`] 行ごとに即時評価）。
 //!
 //! 安全性: 中断は commit 前の `Err` としてしか起きない（確認点を commit 処理・台帳・成功境界
 //! より後ろに置かない）。このため autocommit は副作用ゼロ、明示トランザクションは `Failed`
@@ -163,11 +165,17 @@ pub(crate) fn check() -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
 /// `BatchSearchError` など。#1953）が自分のエラー型へ写すための確認点で、判定は [`check`] と
 /// 同一（ビット同一の挙動）。
 pub(crate) fn check_reason() -> Result<(), InterruptReason> {
+    check_reason_inner(false)
+}
+
+/// [`check_reason`] の本体。`force` が真なら内部の [`CHECK_STRIDE`] 間引きを飛ばして、
+/// 抑止 → 期限 → poll スタックの順に即時評価する（Issue #3208。[`RowCheck`] 専用）。
+fn check_reason_inner(force: bool) -> Result<(), InterruptReason> {
     if SUPPRESSED.with(Cell::get) > 0 {
         return Ok(());
     }
     // デッドラインは poll スタックと独立に評価する（無効時は時計を読まない）。
-    if let Some(reason) = deadline::poll() {
+    if let Some(reason) = deadline::poll(force) {
         return Err(reason);
     }
     let fired = STACK.with(|s| {
@@ -179,7 +187,7 @@ pub(crate) fn check_reason() -> Result<(), InterruptReason> {
         if let Some(r) = scope.fired {
             return Some(r);
         }
-        if scope.countdown > 0 {
+        if !force && scope.countdown > 0 {
             scope.countdown -= 1;
             return None;
         }
@@ -192,6 +200,47 @@ pub(crate) fn check_reason() -> Result<(), InterruptReason> {
         Some(reason) => Err(reason),
         None => Ok(()),
     }
+}
+
+/// 行ループ局所の間引き間隔（Issue #3208）。[`CHECK_STRIDE`] と同じ値にして、中断が効くまでの
+/// 最大遅延（最も重い 1 反復 × この行数）を従来の契約から変えない。根拠は
+/// `docs/design/aggregate-loop-regression.md`。
+pub(crate) const ROW_CHECK_INTERVAL: u32 = CHECK_STRIDE;
+
+/// 行ループ局所の中断確認ティッカー（Issue #3208。#2888 の是正）。
+///
+/// 役割: 集計の行ループが行ごとに [`check`] を呼ぶと thread-local を毎行触るため、間引きカウンタを
+/// ループ側の局所値に持ち、[`ROW_CHECK_INTERVAL`] 行に 1 回だけ即時評価（[`check_due`]）する。
+/// 最初の `tick` は必ず評価する（先頭行での確認に依存する既存契約を維持）。抑止・ラッチ・
+/// 再入無視の意味は [`check`] と同一で、エラー型・文言も同じ。
+pub(crate) struct RowCheck {
+    left: u32,
+}
+
+impl RowCheck {
+    /// 最初の `tick` で必ず評価する状態で作る。
+    pub(crate) fn new() -> Self {
+        Self { left: 0 }
+    }
+
+    /// 1 行分の確認。通常は局所カウンタの減算と分岐だけで thread-local に触らない。
+    #[inline(always)]
+    pub(crate) fn tick(&mut self) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+        if self.left > 0 {
+            self.left -= 1;
+            return Ok(());
+        }
+        self.left = ROW_CHECK_INTERVAL - 1;
+        check_due()
+    }
+}
+
+/// [`RowCheck::tick`] の評価点。間引きを通さず即時に判定する。
+#[cold]
+#[inline(never)]
+fn check_due() -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+    check_reason_inner(true)
+        .map_err(|reason| crate::sql::allowlist::SqlSurfaceError::QueryCanceled { reason })
 }
 
 /// 粗い境界（点更新の入口・GPU の group／tile／chunk 境界など、通過回数が [`CHECK_STRIDE`] に
@@ -250,6 +299,53 @@ mod tests {
         assert_eq!(check_now_reason(), Err(InterruptReason::StatementTimeout));
         // suppressed 区間では no-op。
         assert!(suppressed(check_now_reason).is_ok());
+    }
+
+    /// #3208: `RowCheck` は最初の tick で poll を 1 回呼び、以後は `ROW_CHECK_INTERVAL` 行ごとに 1 回。
+    #[test]
+    fn row_check_polls_first_then_once_per_interval() {
+        let calls = Rc::new(Cell::new(0));
+        let _g = InterruptScope::install(counting_poll(Rc::clone(&calls), u32::MAX));
+        let mut rc = RowCheck::new();
+        assert!(rc.tick().is_ok());
+        assert_eq!(calls.get(), 1);
+        for _ in 0..(ROW_CHECK_INTERVAL - 1) {
+            assert!(rc.tick().is_ok());
+        }
+        assert_eq!(calls.get(), 1);
+        assert!(rc.tick().is_ok());
+        assert_eq!(calls.get(), 2);
+        for k in 3..=4u32 {
+            for _ in 0..ROW_CHECK_INTERVAL {
+                assert!(rc.tick().is_ok());
+            }
+            assert_eq!(calls.get(), k);
+        }
+    }
+
+    /// #3208: 発火後はラッチされ、`tick` も `check` も同じ理由で失敗し続ける。
+    #[test]
+    fn row_check_latches_and_shares_state_with_check() {
+        let calls = Rc::new(Cell::new(0));
+        let _g = InterruptScope::install(counting_poll(Rc::clone(&calls), 1));
+        let mut rc = RowCheck::new();
+        assert!(rc.tick().is_err());
+        assert!(check().is_err());
+        assert_eq!(calls.get(), 1);
+    }
+
+    /// #3208: `suppressed` 区間では発火済みでも期限切れでも `tick` は通る。スコープ無しは no-op。
+    #[test]
+    fn row_check_respects_suppressed_and_no_scope() {
+        let mut rc = RowCheck::new();
+        for _ in 0..(ROW_CHECK_INTERVAL * 2) {
+            assert!(rc.tick().is_ok());
+        }
+        let calls = Rc::new(Cell::new(0));
+        let _g = InterruptScope::install(counting_poll(Rc::clone(&calls), 1));
+        let mut rc = RowCheck::new();
+        assert!(suppressed(|| rc.tick()).is_ok());
+        assert_eq!(calls.get(), 0);
     }
 
     #[test]
