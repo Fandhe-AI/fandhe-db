@@ -292,6 +292,8 @@ pub(crate) fn is_set_transaction_head(tokens: &[Token]) -> bool {
 pub(crate) fn validate_set_transaction_tokens(
     tokens: &[Token],
 ) -> Result<ValidatedSetTransaction, SqlSurfaceError> {
+    // 末尾の単一 `;` を受理する（Issue #3171）。
+    let tokens = crate::sql::lexer::strip_one_trailing_semicolon(tokens);
     let rest = match tokens.split_first() {
         Some((first, tail)) if ident_is(Some(first), "SET") => tail,
         _ => return Err(unsupported_txn_mode()),
@@ -335,6 +337,8 @@ pub(crate) fn validate_set_transaction_tokens(
 pub(crate) fn validate_transaction_control_tokens(
     tokens: &[Token],
 ) -> Result<ValidatedTxnControl, SqlSurfaceError> {
+    // 末尾の単一 `;` を受理する（Issue #3171）。`;;`・途中の `;` は従来どおり 42601。
+    let tokens = crate::sql::lexer::strip_one_trailing_semicolon(tokens);
     let Some((Token::Ident(head), tail)) = tokens.split_first() else {
         return Err(SqlSurfaceError::unsupported(
             "malformed transaction control statement",
@@ -3767,5 +3771,85 @@ mod tests {
     fn session_transaction_stays_send() {
         fn assert_send<T: Send>() {}
         assert_send::<SessionTransaction<'static>>();
+    }
+
+    /// Issue #3171: psql 由来の末尾 `;` 付き Tx 制御文を受理する。
+    #[test]
+    fn trailing_semicolon_is_accepted_for_txn_control() {
+        for (sql, control) in [
+            ("BEGIN;", TxnControl::Begin),
+            ("begin ;", TxnControl::Begin),
+            ("BEGIN; -- c", TxnControl::Begin),
+            ("BEGIN WORK;", TxnControl::Begin),
+            ("BEGIN READ ONLY;", TxnControl::Begin),
+            ("BEGIN ISOLATION LEVEL SERIALIZABLE;", TxnControl::Begin),
+            ("COMMIT;", TxnControl::Commit),
+            ("END;", TxnControl::Commit),
+            ("ROLLBACK;", TxnControl::Rollback),
+            ("ABORT;", TxnControl::Rollback),
+            ("START TRANSACTION;", TxnControl::StartTransaction),
+            ("SAVEPOINT s1;", TxnControl::Savepoint),
+            ("RELEASE s1;", TxnControl::ReleaseSavepoint),
+            ("RELEASE SAVEPOINT s1;", TxnControl::ReleaseSavepoint),
+            ("ROLLBACK TO s1;", TxnControl::RollbackToSavepoint),
+            ("ROLLBACK TO SAVEPOINT s1;", TxnControl::RollbackToSavepoint),
+        ] {
+            let v = validated(sql).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+            assert_eq!(v.control, control, "{sql}");
+        }
+        let v = validated("SAVEPOINT s1;").expect("accepted");
+        assert_eq!(v.savepoint_name.as_deref(), Some("s1"));
+    }
+
+    #[test]
+    fn trailing_semicolon_rejects_multiple_or_embedded() {
+        for sql in [
+            "BEGIN;;",
+            "BEGIN; ;",
+            "COMMIT;;",
+            "SAVEPOINT s1;;",
+            "BEGIN; COMMIT",
+            "SAVEPOINT;",
+            "SAVEPOINT s1 s2;",
+            "START TRANSACTION READ ONLY;",
+            "BEGIN READ ONLY,;",
+        ] {
+            let err = validated(sql).expect_err(sql);
+            assert_eq!(err.wire_code(), "42601", "{sql}");
+        }
+    }
+
+    #[test]
+    // intentional: docs/design/explicit-transaction.md
+    // 根拠: 「末尾 `;` の扱い（Issue #3171）」節。`;` を外したあとも未対応の句は従来どおり 0A000。
+    fn trailing_semicolon_keeps_unsupported_forms_rejected() {
+        for sql in ["COMMIT AND CHAIN;", "PREPARE TRANSACTION 'x';"] {
+            let err = validated(sql).expect_err(sql);
+            assert_eq!(err.wire_code(), "0A000", "{sql}");
+        }
+    }
+
+    #[test]
+    fn trailing_semicolon_is_accepted_for_set_transaction() {
+        for sql in [
+            "SET TRANSACTION READ ONLY;",
+            "SET TRANSACTION ISOLATION LEVEL READ COMMITTED;",
+            "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY;",
+        ] {
+            validate_set_transaction_tokens(&tokens_of(sql))
+                .unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+        }
+        for sql in ["SET TRANSACTION;", "SET TRANSACTION READ ONLY;;"] {
+            let err = validate_set_transaction_tokens(&tokens_of(sql)).expect_err(sql);
+            assert_eq!(err.wire_code(), "42601", "{sql}");
+        }
+    }
+
+    #[test]
+    fn rollback_with_trailing_semicolon_is_allowed_while_failed() {
+        assert!(is_rollback_statement("ROLLBACK;"));
+        assert!(is_rollback_statement("ABORT;"));
+        assert!(is_allowed_while_failed("ROLLBACK TO s1;"));
+        assert!(!is_rollback_statement("COMMIT;"));
     }
 }
