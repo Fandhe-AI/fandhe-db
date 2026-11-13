@@ -521,3 +521,15 @@ SCHEMA の所有者は、上記の blob の予約領域ではなく `object_owne
 
 読み取りの未修飾名は `search_path` の要素順に自テナントの SCHEMA まで解決する（D5 の実装。親 #3194）。§12 の「現状の挙動として固定したもの」のうち、未修飾名の読み取りの解決は本追記で置き換わった。
 作成・DML・DDL・`COPY`・拡張クエリで SCHEMA に解決される参照は `0A000`（受け皿: #3196・#3197）。テナント SCHEMA 間の `SET SCHEMA` は #3198。本書の全面改訂と横断回帰の総点検は #3199。
+
+## 追記（Issue #3198）
+
+テナント SCHEMA 間の `ALTER TABLE <s1.t> SET SCHEMA <s2>` を実装した（§9 の申し送りの解消。ポインタ: TABLE-27 (7)）。
+
+- **移るもの**: 表（行ストア・制約・FK・TRIGGER・POLICY・ACL・所有者・台帳等。`ALTER TABLE ... RENAME TO` と同じ付け替えを共有する実装 `rename_table_key_in_txn`）、表に属する索引（宣言のキー `#<旧>.<索引>` → `#<新>.<索引>`、GIN の物理表 `user_gin/{索引キー}` を含む）、表が所有する SEQUENCE（定義キーのみ。内部 ID・採番状態・ACL は ID キーなので不変）と、表自身の `DEFAULT nextval`・IDENTITY の参照名。**ビューは移さない**（ビュー本文は表の新しい名前へ追随する）
+- **単一 txn・1 回の commit**: 判定をすべて書き込みの前に終え、失敗は txn ごと破棄する。移動元・移動先が呼び出し元テナントの生存 SCHEMA であることを write txn 内で再確認する（不在・他テナントは区別なく `TableNotFound`）
+- **判定順**: DDL 権限ゲート → 表の存在（`42P01`／`42809`）→ 移動先の解決（不在・他テナントは同一の `3F000`、システム SCHEMA・`pg_temp` は `0A000`）→ `public` との境界（`42501`）→ 同一 SCHEMA は何も書かない成功 → 移動先の CREATE 権限（`42501`）→ 実移動
+- **エラー**: 移動先での名前の衝突（表・ビュー・索引・matview・SEQUENCE。移る索引名・SEQUENCE 名を含む）は `42P07`。関数・matview の依存は `ALTER TABLE ... RENAME TO` と同じ `2BP01`。`OWNED BY` の SEQUENCE を他の表が `DEFAULT` で参照しているときも `2BP01`
+- **意図的な拒否（`intentional`）**: `public` とテナント SCHEMA の間の移動は両方向とも `42501` のまま。共有の `public` の表は全テナントの行を持つため、移動で他テナントの行の所有が移りうる（D7・TABLE-27 (7) のポインタ）。システム SCHEMA・一時表への移動の `0A000` も従来どおり
+- **残した `0A000`**: `search_path` で未修飾名として解決される移動元の DDL（#3195 の受け皿は #3196）。`ALTER SEQUENCE／VIEW／INDEX ... SET SCHEMA` は未対応のまま
+- **診断 API**: `verify_gin_index_read_only` は SCHEMA 配下の索引キー（`#<id>.<名>`）も引けるようにした（検証用。読み取り専用）

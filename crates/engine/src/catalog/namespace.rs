@@ -1270,6 +1270,75 @@ mod tests {
         assert!(s.list_indexes().expect("list").is_empty());
     }
 
+    /// `alter_table_set_schema`（Issue #3198）は、移動元・移動先のどちらかが呼び出し元テナントの SCHEMA
+    /// でなければ `TableNotFound` で拒否し（他テナントの SCHEMA と不在を区別しない）、何も変えない。
+    /// 自テナントの SCHEMA 間なら索引キーも付け替わる。
+    #[test]
+    fn alter_table_set_schema_rejects_foreign_schemas_and_moves_indexes() {
+        use crate::catalog::{
+            AlterCheckError, ColumnDef, ColumnType, IndexDef, IndexKind, TableSchema,
+        };
+        let (s, _g) = tmp_storage("ns-set-schema");
+        for (tenant, name) in [("alice", "a1"), ("alice", "a2"), ("bob", "b1")] {
+            s.create_schema(tenant, name, false).expect("schema");
+        }
+        let key = |tenant: &str, schema: &str, name: &str| {
+            RelationKey::InSchema {
+                schema_id: s.schema_id(tenant, schema).expect("id").expect("exists"),
+                name: name.to_string(),
+            }
+            .encode()
+        };
+        let (a1t, a2t, b1t) = (
+            key("alice", "a1", "t"),
+            key("alice", "a2", "t"),
+            key("bob", "b1", "t"),
+        );
+        s.create_table(&TableSchema::new(
+            a1t.clone(),
+            vec![ColumnDef::new("name", ColumnType::Text, true)],
+        ))
+        .expect("table");
+        s.create_index(&IndexDef::new(
+            key("alice", "a1", "i"),
+            a1t.clone(),
+            IndexKind::Scalar,
+            vec!["name".to_string()],
+        ))
+        .expect("index");
+        let before = dump_non_schema_state(&s);
+        for (tenant, old, new) in [
+            ("bob", &a1t, &b1t),
+            ("alice", &a1t, &b1t),
+            ("bob", &a1t, &key("bob", "b1", "t")),
+        ] {
+            assert!(
+                matches!(
+                    s.alter_table_set_schema(tenant, old, new),
+                    Err(AlterCheckError::Catalog(CatalogError::TableNotFound(_)))
+                ),
+                "{tenant}: {old} -> {new}"
+            );
+        }
+        assert_eq!(
+            dump_non_schema_state(&s),
+            before,
+            "rejections must not write"
+        );
+        s.alter_table_set_schema("alice", &a1t, &a2t).expect("move");
+        let after = dump_non_schema_state(&s);
+        assert!(after
+            .iter()
+            .any(|l| l.starts_with(&format!("catalog {a2t} "))));
+        assert!(!after
+            .iter()
+            .any(|l| l.starts_with(&format!("catalog {a1t} "))));
+        assert!(after.iter().any(|l| l.contains(&key("alice", "a2", "i"))));
+        assert!(!after
+            .iter()
+            .any(|l| l.starts_with(&format!("index_catalog {} ", key("alice", "a1", "i")))));
+    }
+
     /// 全 redb 表の (名前, 件数) と、型付きで読める SCHEMA 以外のカタログ表の全 key/value を dump する。
     fn dump_non_schema_state(s: &Storage) -> Vec<String> {
         use redb::{ReadableTableMetadata, TableHandle};

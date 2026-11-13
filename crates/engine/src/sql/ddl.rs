@@ -1008,6 +1008,7 @@ pub(crate) fn execute_alter_table(
     tenant_id: &str,
     validated: &crate::sql::allowlist::ValidatedAlterTable,
     limits: &SchemaLimits,
+    check_create: &dyn Fn(u64) -> Result<(), SqlSurfaceError>,
 ) -> Result<AlterTableOutcome, SqlSurfaceError> {
     match validated {
         crate::sql::allowlist::ValidatedAlterTable::Multiple(stmt) => {
@@ -1056,7 +1057,7 @@ pub(crate) fn execute_alter_table(
             execute_alter_table_rename_table(storage, stmt)
         }
         crate::sql::allowlist::ValidatedAlterTable::SetSchema(stmt) => {
-            execute_alter_table_set_schema(storage, tenant_id, stmt)
+            execute_alter_table_set_schema(storage, tenant_id, stmt, check_create)
         }
         crate::sql::allowlist::ValidatedAlterTable::RowSecurity(stmt) => {
             execute_alter_table_row_security(storage, tenant_id, stmt)
@@ -1608,26 +1609,28 @@ pub(crate) fn execute_alter_table_row_security(
     })
 }
 
-/// `ALTER TABLE <table> SET SCHEMA <schema>` の実行本体（TABLE-27 のポインタ、Issue #1716。
+/// `ALTER TABLE <table> SET SCHEMA <schema>` の実行本体（TABLE-27 (7) のポインタ、Issue #1716・#3198。
 /// 設計記録 D7）。呼び出し元（`core.rs`）は [`require_ddl_permission`] を必ず先に通している前提。
+/// `check_create` は移動先 SCHEMA（内部 ID）への CREATE 権限の検査（`core.rs` が
+/// `schema_privilege::check_schema_create` を束縛して渡す）。
 ///
-/// 判定順序（決定的）: 表の存在確認（`42P01`／`42809`）→ 移動先の解決（`public` は ASCII の大小を
-/// 無視。`pg_temp`・`pg_catalog`・`information_schema` は `0A000`。それ以外は
+/// 判定順序（決定的。権限の無い主体へ存在情報を返さない）: 表の存在確認（`42P01`／`42809`）→ 移動先の
+/// 解決（`public` は ASCII の大小を無視。`pg_temp`・`pg_catalog`・`information_schema` は `0A000`。それ以外は
 /// `(tenant_id, name)` の 1 回 get で、無い名前〔他テナントの SCHEMA を含む〕は同一の `3F000`）→
-/// テナント境界（共有の `public` の表をテナントの SCHEMA へ移す経路は `42501`。fail-closed）→
-/// `public` から `public` は何も書かない成功（no-op）。
-///
-/// 現状はテナント SCHEMA に表を置く経路（#1717）が無く、移動元は常に `public` のため、
-/// テナント SCHEMA 間の実移動は未実装（到達不能な分岐を作らない）。
+/// 境界（`public` とテナント SCHEMA の間は双方向とも `42501`。fail-closed）→ 移動元と移動先が同じなら
+/// 何も書かない成功（no-op）→ 移動先の CREATE 権限（`42501`）→ [`Storage::alter_table_set_schema`]
+/// （表・索引・制約・`OWNED BY` の SEQUENCE を単一 txn で移す。名前の衝突は `42P07`、関数・matview の依存と
+/// SEQUENCE の外部参照は `2BP01`。ビューは移さない）。
 pub(crate) fn execute_alter_table_set_schema(
     storage: &Storage,
     tenant_id: &str,
     stmt: &ValidatedAlterTableSetSchema,
+    check_create: &dyn Fn(u64) -> Result<(), SqlSurfaceError>,
 ) -> Result<AlterTableOutcome, SqlSurfaceError> {
     ensure_table_exists(storage, &stmt.table_name)?;
     let target = stmt.schema_name.as_str();
-    let to_public = if target.eq_ignore_ascii_case("public") {
-        true
+    let target_id: Option<u64> = if target.eq_ignore_ascii_case("public") {
+        None
     } else if target.eq_ignore_ascii_case("pg_temp")
         || target.eq_ignore_ascii_case("pg_catalog")
         || target.eq_ignore_ascii_case("information_schema")
@@ -1637,7 +1640,7 @@ pub(crate) fn execute_alter_table_set_schema(
         ));
     } else {
         match storage.schema_id(tenant_id, target) {
-            Ok(Some(_)) => false,
+            Ok(Some(id)) => Some(id),
             Ok(None) => {
                 return Err(SqlSurfaceError::InvalidSchemaName {
                     name: target.to_string(),
@@ -1646,25 +1649,56 @@ pub(crate) fn execute_alter_table_set_schema(
             Err(e) => return Err(map_schema_error(e, "ALTER TABLE SET SCHEMA failed")),
         }
     };
-    if to_public {
-        // SCHEMA 配下の表を共有の `public` へ戻す経路は未実装。何も変えずに成功させず拒否する。
-        if matches!(
-            crate::catalog::namespace::RelationKey::parse(&stmt.table_name),
-            Ok(crate::catalog::namespace::RelationKey::InSchema { .. })
-        ) {
-            return Err(SqlSurfaceError::InsufficientPrivilege);
-        }
-    }
-    if !to_public {
-        // 共有の `public` の表の行をテナントの SCHEMA 側へ移さない（設計記録 D7）。
-        return Err(SqlSurfaceError::InsufficientPrivilege);
-    }
-    Ok(AlterTableOutcome {
+    let source = crate::catalog::namespace::RelationKey::parse(&stmt.table_name)
+        .map_err(crate::catalog::table_lookup_error)?;
+    let outcome = || AlterTableOutcome {
         table_name: stmt.table_name.clone(),
         action: AlterTableAction::SetSchema {
             schema_name: stmt.schema_name.clone(),
         },
-    })
+    };
+    match (source, target_id) {
+        // `public` から `public`: 何も書かない成功（PostgreSQL と同じ）。
+        (crate::catalog::namespace::RelationKey::Public(_), None) => Ok(outcome()),
+        // 意図的な拒否: 共有の `public` の表（全テナントの行を持つ）をテナントの SCHEMA へ移すと他テナントの
+        // 行の所有が移りうる。逆向き（SCHEMA 配下の表を共有の `public` へ戻す）も同じ境界の越境になるため、
+        // 両方向とも拒否する（設計記録 D7・TABLE-27 (7) のポインタ。fail-closed）。
+        (crate::catalog::namespace::RelationKey::Public(_), Some(_))
+        | (crate::catalog::namespace::RelationKey::InSchema { .. }, None) => {
+            Err(SqlSurfaceError::InsufficientPrivilege)
+        }
+        (
+            crate::catalog::namespace::RelationKey::InSchema {
+                schema_id: from_id,
+                name,
+            },
+            Some(to_id),
+        ) => {
+            // 同じ SCHEMA への移動は何も書かない成功（権限・衝突も判定しない。PostgreSQL と同じ）。
+            if from_id == to_id {
+                return Ok(outcome());
+            }
+            check_create(to_id)?;
+            let new_key = crate::catalog::namespace::RelationKey::InSchema {
+                schema_id: to_id,
+                name,
+            }
+            .encode();
+            storage
+                .alter_table_set_schema(tenant_id, &stmt.table_name, &new_key)
+                .map_err(|e| match e {
+                    AlterCheckError::Catalog(CatalogError::TableNotFound(_)) => {
+                        undefined_table_or_view(storage, &stmt.table_name)
+                    }
+                    AlterCheckError::Catalog(CatalogError::TableAlreadyExists(name)) => {
+                        SqlSurfaceError::duplicate_table(name)
+                    }
+                    AlterCheckError::Catalog(other) => map_drop_alter_column_error(other),
+                    AlterCheckError::Sql(sql_err) => sql_err,
+                })?;
+            Ok(outcome())
+        }
+    }
 }
 
 /// `ALTER TABLE <table> ALTER COLUMN <column> TYPE <型>` の実行本体（TABLE-19・
@@ -4218,7 +4252,7 @@ mod tests {
         let limits = SchemaLimits::default();
         let run = |sql: &str| {
             let v = validate_alter_table(sql).expect("valid shape");
-            execute_alter_table(&storage, "t", &v, &limits)
+            execute_alter_table(&storage, "t", &v, &limits, &|_| Ok(()))
         };
         let generation = || storage.table_generation("docs").expect("generation");
         let schema = || storage.get_table_schema("docs").expect("schema");
