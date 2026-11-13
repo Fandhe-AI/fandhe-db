@@ -1491,6 +1491,9 @@ impl EngineCore {
         handle: &TriggerWriteHandle<'_>,
         inv: TriggerInvocation<'_>,
     ) -> Result<TriggerOutcome, SqlSurfaceError> {
+        // 文数・反復の計数は `ExecBudget` の現スレッド共有カウンタで、外側のトリガ本体の `ExecBudget` が生きている間に
+        // 入れ子の発火で作るこの予算は、そのカウンタへ合算される（実行モデル D11。テストは
+        // `nested_triggers_share_the_statement_budget`）。
         let mut budget = ExecBudget::new(self.plpgsql_limits, self.result_limits.max_result_rows());
         let mut host = CorePlHost {
             core: self,

@@ -472,6 +472,36 @@ fn nested_triggers_fire_and_recursion_is_bounded() {
     assert!(ints(&core, "t1", "SELECT n FROM rec").is_empty());
 }
 
+// 入れ子のトリガ発火は、文数の予算を外側のトリガと合算する（実行モデル D11）。1 段だけなら収まる上限でも、
+// 3 段連鎖すると合算で超過し `54000` になり、文全体が取り消される。
+#[test]
+fn nested_triggers_share_the_statement_budget() {
+    let limits = crate::plpgsql_limits::PlpgsqlLimits::new(4, 1_000, 32, 65_536, 32);
+    let (core, _g) = core_with("trginv-budget", LedgerMode::Optional);
+    let core = core.with_plpgsql_limits(limits);
+    base_tables(&core);
+    ok(&core, "t1", "CREATE TABLE audit2 (n INTEGER)");
+    ok(&core, "t1", "CREATE TABLE audit3 (n INTEGER)");
+    for (name, dst) in [("f1", "audit"), ("f2", "audit2"), ("f3", "audit3")] {
+        create_fn(
+            &core,
+            "t1",
+            name,
+            &format!("BEGIN INSERT INTO {dst} (n) VALUES (NEW.n); RETURN NEW; END"),
+        );
+    }
+    // 1 段（tt -> audit）は単独の本体 1 回分で上限内。
+    create_trigger(&core, "t1", "g1", "AFTER", "tt", "f1");
+    ok(&core, "t1", "INSERT INTO tt (n) VALUES (1)");
+    assert_eq!(ints(&core, "t1", "SELECT n FROM audit"), vec![1]);
+    // 3 段へ伸ばすと、子の文数が親に計上され合算で上限へ達する。
+    create_trigger(&core, "t1", "g2", "AFTER", "audit", "f2");
+    create_trigger(&core, "t1", "g3", "AFTER", "audit2", "f3");
+    assert_eq!(code(&core, "t1", "INSERT INTO tt (n) VALUES (2)"), "54000");
+    assert_eq!(ints(&core, "t1", "SELECT n FROM audit"), vec![1]);
+    assert!(ints(&core, "t1", "SELECT n FROM audit3").is_empty());
+}
+
 // (12) STABLE のトリガ関数は書き込めない（揮発性ゲート）。
 //
 // intentional: docs/design/plpgsql-subset.md
