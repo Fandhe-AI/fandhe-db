@@ -183,6 +183,31 @@ fn cursor_statements_with_semicolons_work_and_respect_tenant_boundary() {
     }
 }
 
+/// Issue #3175: 内側が JOIN の `DECLARE` も末尾 `;` を 1 個だけ受理する（`;;` は拒否）。
+#[test]
+fn declare_join_accepts_one_trailing_semicolon() {
+    let (engine, path) = new_core();
+    let _cleanup = CleanupGuard(path);
+    let mut h = Harness::new(&engine);
+    h.ok("BEGIN;");
+    h.ok(&insert_sql(1));
+    h.ok("COMMIT;");
+    h.ok("BEGIN;");
+    let join = format!("SELECT a.id FROM {TABLE} a JOIN {TABLE} b ON a.id = b.id LIMIT 10");
+    assert_eq!(
+        h.ok(&format!("DECLARE c CURSOR FOR {join};")),
+        SqlOutcome::DeclareCursor
+    );
+    match h.ok("FETCH NEXT IN c;") {
+        SqlOutcome::Fetch(r) => assert_eq!(r.rows.len(), 1),
+        other => panic!("expected Fetch, got {other:?}"),
+    }
+    let err = h
+        .run(&format!("DECLARE d CURSOR FOR {join};;"))
+        .expect_err("double semicolon rejected");
+    assert_eq!(err.wire_code(), "42601");
+}
+
 #[test]
 fn double_trailing_semicolon_is_rejected_with_42601() {
     let (engine, path) = new_core();

@@ -332,6 +332,53 @@ fn declare_rejects_over_cap_and_registers_nothing() {
     assert_eq!(result.rows.len(), CAP);
 }
 
+/// Issue #3175: JOIN の `DECLARE`（LIMIT 省略）も全件を数え、超過なら `54000` で拒否する。
+/// 上限以内なら全件を FETCH で読める。
+#[test]
+fn declare_join_omitted_enforces_the_cap() {
+    let caller = ctx("alice");
+    let (core, _g) = open("sql34-cursor-join");
+    seed_t(&core, "alice", 1..=4);
+    seed_u(&core, "alice", 1..=4);
+    let mut session = SessionState::default();
+    let mut txn = core.new_session_transaction();
+    core.execute_sql_in_txn(&caller, &mut session, &mut txn, "BEGIN")
+        .expect("begin");
+    let err = core
+        .execute_sql_in_txn(
+            &caller,
+            &mut session,
+            &mut txn,
+            "DECLARE c CURSOR FOR SELECT t.id, u.w FROM t JOIN u ON t.k = u.k",
+        )
+        .expect_err("declare over cap");
+    assert_eq!(err.wire_code(), "54000");
+
+    let (core2, _g2) = open("sql34-cursor-join-ok");
+    seed_t(&core2, "alice", 1..=3);
+    seed_u(&core2, "alice", 1..=3);
+    let mut session2 = SessionState::default();
+    let mut txn2 = core2.new_session_transaction();
+    core2
+        .execute_sql_in_txn(&caller, &mut session2, &mut txn2, "BEGIN")
+        .expect("begin");
+    core2
+        .execute_sql_in_txn(
+            &caller,
+            &mut session2,
+            &mut txn2,
+            "DECLARE c CURSOR FOR SELECT t.id, u.w FROM t JOIN u ON t.k = u.k",
+        )
+        .expect("declare within cap");
+    let SqlOutcome::Fetch(result) = core2
+        .execute_sql_in_txn(&caller, &mut session2, &mut txn2, "FETCH 3 FROM c")
+        .expect("fetch")
+    else {
+        panic!("expected Fetch outcome");
+    };
+    assert_eq!(result.rows.len(), CAP);
+}
+
 /// Describe（拡張クエリプロトコル）でも省略形が `22000` にならない。
 #[test]
 fn describe_accepts_omitted_forms() {
