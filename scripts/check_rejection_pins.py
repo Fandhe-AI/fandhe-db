@@ -93,6 +93,9 @@ class TestRange:
     lines: List[Tuple[int, str]]
     # 所属する `mod x {` のパス（外側から順）。同名テストの別モジュール取り違え防止（D5）に使う。
     module: Tuple[str, ...] = ()
+    # 選択用の開始行。注記ブロックとの間に挟まった空行・コメント行も含める（空行で注記が外れる改変を
+    # テストの変更として扱うため。D5）。判定用の `start`・`lines` には影響しない。
+    select_start: int = 0
 
 
 @dataclass
@@ -275,7 +278,8 @@ def _scan_attribute(lines: List[str], start: int) -> int:
 
 
 _MOD_RE = re.compile(
-    r"^(\s*)(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{\s*$"
+    r"^(\s*)(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{"
+    r"\s*(?://.*|/\*.*?\*/\s*)?$"
 )
 
 
@@ -336,6 +340,11 @@ def find_tests(text: str) -> List[TestRange]:
                         break
             start = block[0][0] if block else ln
             last = end if end is not None else n
+            sel = start
+            while sel > 1 and (
+                not lines[sel - 2].strip() or lines[sel - 2].strip().startswith("//")
+            ):
+                sel -= 1
             tests.append(
                 TestRange(
                     name=name,
@@ -345,6 +354,7 @@ def find_tests(text: str) -> List[TestRange]:
                     block=list(block),
                     lines=[(k + 1, lines[k]) for k in range(start - 1, last)],
                     module=tuple(m_[1] for m_ in mod_stack),
+                    select_start=sel,
                 )
             )
         block = []
@@ -382,7 +392,7 @@ def select_targets(
         head_tests = find_tests(head_text)
         for t in head_tests:
             last = t.end if t.end is not None else t.fn_line
-            if any(t.start <= a <= last for a in fd.added):
+            if any(t.select_start <= a <= last for a in fd.added):
                 out[(fd.new_path, t.fn_line)] = (fd.new_path, t)
         if fd.deleted and fd.old_path is not None:
             base_text = read_base(fd.old_path)
@@ -390,7 +400,7 @@ def select_targets(
                 names = set()  # (モジュールパス, 関数名)
                 for bt in find_tests(base_text):
                     last = bt.end if bt.end is not None else bt.fn_line
-                    if any(bt.start <= d <= last for d in fd.deleted):
+                    if any(bt.select_start <= d <= last for d in fd.deleted):
                         names.add((bt.module, bt.name))
                 base_keys = {(bt.module, bt.name) for bt in find_tests(base_text)}
                 # 親 mod のリネームでモジュールパスが変わっても注記削除を逃さないため、

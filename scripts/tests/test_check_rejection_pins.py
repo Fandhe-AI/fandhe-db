@@ -416,5 +416,40 @@ class EndToEndTest(unittest.TestCase):
         self.assertIn("unknown base ref", r.stderr)
 
 
+class TrailingCommentModTest(unittest.TestCase):
+    """末尾コメント付き `mod x {` も識別し、同名テストの取り違えを防ぐ。"""
+
+    def test_mod_with_trailing_comment_recorded(self):
+        src = (
+            "mod a { // group a\n    #[test]\n    fn t() {\n    }\n}\n"
+            "mod b { /* group b */\n    #[test]\n    fn t() {\n    }\n}\n"
+        )
+        self.assertEqual([t.module for t in crp.find_tests(src)], [("a",), ("b",)])
+
+    def test_deleting_a_does_not_target_b(self):
+        body = "        assert_eq!(err.wire_code(), \"0A000\");\n"
+        a = "mod a { // group a\n    // tracked: #1\n    #[test]\n    fn reject_x() {\n" + body + "    }\n}\n"
+        b = "mod b { // group b\n    #[test]\n    fn reject_x() {\n" + body + "    }\n}\n"
+        self.assertEqual(run_check(P, a + b, b), [])
+
+
+class DetachedAnnotationTest(unittest.TestCase):
+    """注記とテストの間への空行挿入・削除をテストの変更として扱う（D5）。"""
+
+    ANN = "// tracked: #1\n"
+    FN = "#[test]\nfn reject_x() {\n    assert_eq!(err.wire_code(), \"0A000\");\n}\n"
+
+    def test_blank_line_insertion_detected(self):
+        old = self.ANN + self.FN
+        new = self.ANN + "\n" + self.FN
+        for ctx in (0, 3):
+            self.assertEqual(kinds(run_check(P, old, new, context=ctx)), ["missing-annotation"])
+
+    def test_blank_line_removal_not_flagged_when_reattached(self):
+        old = self.ANN + "\n" + self.FN
+        new = self.ANN + self.FN
+        self.assertEqual(run_check(P, old, new), [])
+
+
 if __name__ == "__main__":
     unittest.main()
