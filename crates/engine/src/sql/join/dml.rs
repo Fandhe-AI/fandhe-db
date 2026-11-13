@@ -541,7 +541,7 @@ impl<'a> JoinedProbe<'a> {
             if matches!(cell, Cell::Null) && !copy.nullable {
                 return Err(SqlSurfaceError::not_null_violation(&copy.column_name));
             }
-            let value = crate::sql::matview::cell_to_value((*cell).clone(), &copy.target_ty)?;
+            let value = copy_cell_to_value((*cell).clone(), &copy.target_ty)?;
             self.budget.charge(
                 std::mem::size_of::<(usize, Value)>().saturating_add(value_bytes(&value)),
             )?;
@@ -556,6 +556,23 @@ impl<'a> JoinedProbe<'a> {
             out.push((item.column_index, value));
         }
         Ok(Some(out))
+    }
+}
+
+/// 単純コピーのセルを対象列型の行値へ変換する。`matview::cell_to_value` は ENUM のセルを扱わないため、
+/// ここで語彙検証して `Value::Enum` にする（語彙外は `22P02`。行の値は固定文言に含めない）。
+/// それ以外の型は `matview::cell_to_value` に委ねる。
+fn copy_cell_to_value(cell: Cell, ty: &ColumnType) -> Result<Value, SqlSurfaceError> {
+    match (ty, cell) {
+        (ColumnType::Enum(def), Cell::Text(label)) => {
+            if def.validate_label(&label).is_err() {
+                return Err(SqlSurfaceError::invalid_text_representation(
+                    "invalid input value for enum type",
+                ));
+            }
+            Ok(Value::Enum(label))
+        }
+        (_, cell) => crate::sql::matview::cell_to_value(cell, ty),
     }
 }
 
