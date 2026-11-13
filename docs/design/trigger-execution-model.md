@@ -156,6 +156,9 @@
 > UPSERT は INSERT・UPDATE のどちらかのトリガがあれば `0A000` のまま。ビュー経由・データ変更 CTE の副文は
 > 共有のフォーム関数を通るため INSERT と同様に発火する。
 >
+> Issue #3186 の実装記録: [plpgsql-subset.md](plpgsql-subset.md)「Issue #3186 追記」（窓口の UPDATE と、D6 の
+> 安全弁としての表単位の `0A000`。`27000` の variant 追加は見送り）。
+>
 > Issue #1726 の実装記録: [trigger-statement-truncate.md](trigger-statement-truncate.md)（段 2・段 7 の文トリガ・
 > 対象 0 行での発火・TRUNCATE トリガの順序と PostgreSQL との差分）。
 

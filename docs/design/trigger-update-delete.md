@@ -66,7 +66,9 @@ AFTER の失敗は文全体の失敗で、同じ write txn の単一 commit な�
 
 - 同じ文で複数トリガが同じ行を触る場合の自己変更の衝突（27000。D6）は今回入れない。
   `TriggerWriteHandle` は `insert_row` しか持たず、外側の文の対象行をトリガが変更・削除する状態を作れない
-  ためで、窓口に UPDATE／DELETE が入る #2226 に引き継ぐ
+  ためで、窓口に UPDATE／DELETE が入る #2226 に引き継ぐ。Issue #3186 で窓口に UPDATE が入ったため、BEFORE ROW の
+  行ごとループの最中の同表 `UPDATE` だけは表単位の `0A000` で塞いだ（`27000` は未実装。
+  [plpgsql-subset.md](plpgsql-subset.md) の「Issue #3186 追記」）
 - 制約検査・FK 検査は全行の書き込み後にまとめて行う（BEFORE と AFTER の間）
 
 ## 引き継ぎ

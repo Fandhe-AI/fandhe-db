@@ -8697,6 +8697,7 @@ pub(crate) mod partitioned_dml;
 pub(crate) mod statement_writes;
 mod trigger_dml;
 mod trigger_insert;
+pub(crate) mod trigger_row_loop;
 pub(crate) mod trigger_writes;
 
 #[cfg(test)]
