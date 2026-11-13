@@ -11052,6 +11052,28 @@ impl EngineCore {
             let result = Self::enforce_group_result_cap(validated, result, &self.result_limits)?;
             return Ok(crate::sql::SqlOutcome::Query(result));
         }
+        if let crate::sql::allowlist::Statement::Join(validated) = inner {
+            // Issue #3175: CTE 入力の JOIN は #3176 の範囲。構造検証段で弾き済みだが多層防御。
+            if validated.cte_inputs.is_some() {
+                return Err(crate::sql::allowlist::SqlSurfaceError::Internal {
+                    detail: "internal error".to_string(),
+                });
+            }
+            let names = crate::sql::join::collect_join_tables(validated);
+            let schemas = table_schemas_in(read_txn, &names)?;
+            let result = crate::sql::join::execute_with_result_byte_cap(
+                read_txn,
+                ctx,
+                &schemas,
+                validated,
+                session.udfs(),
+                self.group_by_limits,
+                self.join_limits,
+                self.result_limits,
+                max_result_bytes,
+            )?;
+            return Ok(crate::sql::SqlOutcome::Query(result));
+        }
         self.execute_read_statement(ctx, session, inner.clone(), read_txn)
     }
 
@@ -11090,7 +11112,7 @@ impl EngineCore {
                 // `table` はビュー展開後の基底テーブル名。
                 // 検証のカタログ引き先は実行の読み取り源（`BEGIN` 時点のスナップショット／共有
                 // write txn／確定状態）と一致させる（Issue #2403。同時 DDL でも検証と実行が食い違わない）。
-                let (inner, _table) = match txn.read_source()? {
+                let inner = match txn.read_source()? {
                     TxnReadSource::BeginSnapshot(snap) => {
                         crate::sql::cursor::validate_declare_inner(
                             query,
@@ -11150,7 +11172,7 @@ impl EngineCore {
                 let result = match outcome {
                     crate::sql::SqlOutcome::Query(result) => result,
                     // `inner` は構造検証段で `Statement::Aggregate`／
-                    // `Statement::Scan` のいずれかであることを保証済み
+                    // `Statement::Scan`／CTE 入力なしの `Statement::Join` のいずれかであることを保証済み
                     // （`sql::cursor::validate_declare_tokens` 参照）。いずれも
                     // `execute_validated_in_session` は必ず `SqlOutcome::Query`
                     // を返すため、この分岐は公開 API の誤用時のみの防御的経路。
