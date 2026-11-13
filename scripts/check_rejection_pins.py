@@ -57,7 +57,7 @@ _FN_RE = re.compile(
     r'(?:extern\s+"[^"]*"\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)',
     _A,
 )
-_TEST_ATTR_RE = re.compile(r"^\s*#\[test\]\s*$", _A)
+_TEST_ATTR_RE = re.compile(r"^\s*#\[test\]\s*(?://.*)?$", _A)
 _ONE_LINE_FN_RE = re.compile(r"\{\s*\}\s*$", _A)
 
 _DIFF_HEADER_RE = re.compile(r"^diff --git a/(.+) b/(.+)$")
@@ -196,6 +196,82 @@ def parse_diff(text: str) -> List[FileDiff]:
 # ---------------------------------------------------------------------------
 
 
+def _scan_attribute(lines: List[str], start: int) -> int:
+    """`#[` で始まる属性の終端行（0 始まり）を返す。
+
+    文字列・raw 文字列・文字リテラル・行/ブロックコメント内の角括弧は深さに数えない。
+    終端を解釈できない場合は DiffParseError（fail-closed で検査失敗）。
+    """
+    depth = 0
+    seen_open = False
+    in_str = False
+    raw_hashes: Optional[int] = None  # raw 文字列内のとき `#` の個数
+    block_cmt = 0
+    i = start
+    n = len(lines)
+    while i < n:
+        s = lines[i]
+        j = 0
+        m = len(s)
+        while j < m:
+            c = s[j]
+            if block_cmt:
+                if s.startswith("*/", j):
+                    block_cmt -= 1
+                    j += 2
+                elif s.startswith("/*", j):
+                    block_cmt += 1
+                    j += 2
+                else:
+                    j += 1
+                continue
+            if raw_hashes is not None:
+                if c == '"' and s.startswith("#" * raw_hashes, j + 1):
+                    j += 1 + raw_hashes
+                    raw_hashes = None
+                else:
+                    j += 1
+                continue
+            if in_str:
+                if c == "\\":
+                    j += 2
+                elif c == '"':
+                    in_str = False
+                    j += 1
+                else:
+                    j += 1
+                continue
+            if s.startswith("//", j):
+                break
+            if s.startswith("/*", j):
+                block_cmt += 1
+                j += 2
+                continue
+            rm = re.compile(r'b?r(#*)"', _A).match(s, j)
+            if rm and (j == 0 or not (s[j - 1].isalnum() or s[j - 1] == "_")):
+                raw_hashes = len(rm.group(1))
+                j = rm.end()
+                continue
+            if c == '"':
+                in_str = True
+                j += 1
+                continue
+            if c == "'":
+                cm = re.compile(r"'(?:\\.[^']*|[^'\\])'", _A).match(s, j)
+                j = cm.end() if cm else j + 1  # 一致しなければライフタイム等
+                continue
+            if c == "[":
+                depth += 1
+                seen_open = True
+            elif c == "]":
+                depth -= 1
+                if seen_open and depth <= 0:
+                    return i
+            j += 1
+        i += 1
+    raise DiffParseError("cannot find the end of an attribute (unterminated string/bracket)")
+
+
 def find_tests(text: str) -> List[TestRange]:
     """ファイル内容から `#[test]` 付き fn の範囲を抽出する。
 
@@ -218,16 +294,12 @@ def find_tests(text: str) -> List[TestRange]:
             i += 1
             continue
         if stripped.startswith("#[") or stripped.startswith("#!["):
-            depth = 0
-            while i < n:
-                seg = lines[i]
-                block.append((i + 1, seg))
-                if _TEST_ATTR_RE.match(seg):
+            end_i = _scan_attribute(lines, i)
+            for k in range(i, end_i + 1):
+                block.append((k + 1, lines[k]))
+                if _TEST_ATTR_RE.match(lines[k]):
                     has_test = True
-                depth += seg.count("[") - seg.count("]")
-                i += 1
-                if depth <= 0:
-                    break
+            i = end_i + 1
             continue
         m = _FN_RE.match(line)
         if m and has_test:

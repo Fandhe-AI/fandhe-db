@@ -152,6 +152,35 @@ class FindTestsTest(unittest.TestCase):
     def test_non_test_fn_ignored(self):
         self.assertEqual(crp.find_tests("fn a() {\n}\n"), [])
 
+    def test_bracket_in_attr_string_does_not_swallow_fn(self):
+        src = '#[test]\n#[should_panic(expected = "[")]\nfn a() {\n}\n'
+        (t,) = crp.find_tests(src)
+        self.assertEqual((t.name, t.fn_line, t.end), ("a", 3, 4))
+        src = '#[test]\n#[should_panic(expected = r#"]["#)]\nfn a() {\n}\n'
+        (t,) = crp.find_tests(src)
+        self.assertEqual(t.fn_line, 3)
+        src = '#[test]\n#[should_panic(/* [ */ expected = "x")] // [\nfn a() {\n}\n'
+        (t,) = crp.find_tests(src)
+        self.assertEqual(t.fn_line, 3)
+
+    def test_unterminated_attr_is_error(self):
+        with self.assertRaises(crp.DiffParseError):
+            crp.find_tests('#[test]\n#[should_panic(expected = "x)]\nfn a() {\n}\n')
+        with self.assertRaises(crp.DiffParseError):
+            crp.find_tests("#[test]\n#[cfg(\nfn a() {\n}\n")
+
+    def test_bracket_attr_pin_is_detected(self):
+        body = '#[test]\n#[should_panic(expected = "[")]\nfn a() {\n    f("0A000");\n}\n'
+        v = run_check(P, "fn base() {\n}\n", "fn base() {\n}\n" + body)
+        self.assertEqual(kinds(v), ["missing-annotation"])
+
+    def test_test_attr_with_trailing_comment(self):
+        (t,) = crp.find_tests("#[test] // regression\nfn a() {\n}\n")
+        self.assertEqual(t.name, "a")
+        body = '#[test] // regression\nfn a() {\n    f("0A000");\n}\n'
+        v = run_check(P, "fn base() {\n}\n", "fn base() {\n}\n" + body)
+        self.assertEqual(kinds(v), ["missing-annotation"])
+
 
 class CheckTest(unittest.TestCase):
     def added(self, new, **kw):
