@@ -18,7 +18,8 @@
 //! - 書いた表名を記録し、発火側が遅延 FK の検査対象にする
 //!
 //! 本番の結線（トリガ関数の本体の SQL をこの窓口経由で実行する経路）は Issue #3184 の
-//! `core::plpgsql_trigger_host`（`run_insert` で `INSERT ... VALUES` を、`function_def`・`table_schema` で
+//! `core::plpgsql_trigger_host`（`run_insert` で `INSERT ... VALUES` を、Issue #3186 で `run_write` から
+//! `UPDATE` も同じ契約で、`function_def`・`table_schema` で
 //! 同じ txn のカタログを読む。通常の関数・`DO` の本体を同じ Tx で実行するホストは Issue #2226 の
 //! `core::plpgsql_host`）。
 
@@ -142,11 +143,12 @@ impl<'a> TriggerWriteHandle<'a> {
             .map_err(|e| crate::sql::exec::map_insert_write_error(TenantWriteError::from(e)))
     }
 
-    /// 外側の write txn を書き込み先にして `f` を実行し、成功したら `table`（`INSERT` の対象表）を書いた表として
-    /// 記録する（Issue #3184）。トリガ本体の `INSERT ... VALUES` が SQL `INSERT` と同じ実行本体
-    /// （`EngineCore::execute_insert_form` 系）を通すための口で、raw な write txn は `f` の中の
-    /// `WriteTarget` としてだけ見える。記録は遅延 FK の確定対象にする（漏れると fail-open）。
-    pub(crate) fn run_insert<T>(
+    /// 外側の write txn を書き込み先にして `f` を実行し、成功したら `table`（書き込みの対象表）を書いた表として
+    /// 記録する（Issue #3184・#3186）。トリガ本体の `INSERT ... VALUES`・`UPDATE` が SQL の同じ文と同じ実行本体
+    /// （`sql::exec` の `execute_*_in`）を通すための口で、raw な write txn は `f` の中の `WriteTarget` としてだけ
+    /// 見える。記録は遅延 FK の確定対象・世代の更新・明示 Tx の書き込み印に使われる（漏れると fail-open）。
+    /// 台帳は呼び出し側が `CompareOnlyWithoutLedger` を明示して記録させない（D10）。
+    pub(crate) fn run_write<T>(
         &self,
         table: &str,
         f: impl FnOnce(WriteTarget<'_>) -> Result<T, SqlSurfaceError>,
@@ -157,6 +159,15 @@ impl<'a> TriggerWriteHandle<'a> {
             written.push(table.to_string());
         }
         Ok(out)
+    }
+
+    /// [`Self::run_write`] の `INSERT` 向けの別名（Issue #3184 からの呼び出し元を保つ）。
+    pub(crate) fn run_insert<T>(
+        &self,
+        table: &str,
+        f: impl FnOnce(WriteTarget<'_>) -> Result<T, SqlSurfaceError>,
+    ) -> Result<T, SqlSurfaceError> {
+        self.run_write(table, f)
     }
 
     /// これまでにトリガが書いた表名（重複なし。書いた順）。
