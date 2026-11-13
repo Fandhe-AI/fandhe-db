@@ -15,7 +15,13 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/lib.sh
 source "${DIR}/lib.sh"
 
-have_cmd gh || die "gh CLI is required (https://cli.github.com/)"
-have_cmd python3 || die "python3 is required"
+# 必須コマンド欠落は「検査を実行できなかった」ので、終了コード契約どおり 3 を返す
+# （lib.sh の die は常に 1=検出あり になるため使わない）
+for cmd in gh python3; do
+    if ! have_cmd "${cmd}"; then
+        echo "ERROR: ${cmd} is required" >&2
+        exit 3
+    fi
+done
 
 exec python3 "${ROOT_DIR}/scripts/check_issue_closeout.py" --root "${ROOT_DIR}" "$@"

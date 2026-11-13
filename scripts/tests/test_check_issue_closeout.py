@@ -48,6 +48,16 @@ class ParseTests(unittest.TestCase):
             cic.extract_out_of_scope_sections(text)[0].items, ["a - sub #5 continuation", "b"]
         )
 
+    def test_paragraph_mixed_with_bullets_kept(self):
+        text = "## 対象外\n残作業 #600\n\n- 別の作業 #601\n\n後続の段落 #602\n"
+        items = cic.extract_out_of_scope_sections(text)[0].items
+        self.assertEqual(items, ["残作業 #600", "別の作業 #601", "後続の段落 #602"])
+
+    def test_unindented_continuation_joins_item(self):
+        text = "## 対象外\n- 別の作業\n続きの参照 #600\n- 次\n"
+        items = cic.extract_out_of_scope_sections(text)[0].items
+        self.assertEqual(items, ["別の作業 続きの参照 #600", "次"])
+
     def test_empty_marker(self):
         for m in ("なし", "特になし", "None", "N/A"):
             self.assertEqual(cic.extract_out_of_scope_sections(f"## 対象外\n- {m}\n")[0].items, [])

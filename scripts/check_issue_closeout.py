@@ -115,35 +115,35 @@ def is_empty_marker(text: str) -> bool:
 
 
 def _split_items(lines: list[str]) -> list[str]:
-    """節内の行から、最小インデントのリスト項目を 1 件として結合した項目本文を返す。"""
-    parsed = []
+    """節内の行を項目本文へ分ける。箇条書きの有無にかかわらず全行を走査する。
+
+    最小インデントのリスト項目は 1 件ずつ、リストに属さない空行区切りの通常段落は独立項目、
+    直前行に続くインデントなしの継続行（Markdown の lazy continuation）と深い行は直前の
+    項目へ結合する。どの行も黙って捨てない（受け皿参照の見落とし防止）。
+    """
+    bases = []
+    for line in lines:
+        if line.strip() and LIST_ITEM_RE.match(line):
+            bases.append(len(line) - len(line.lstrip()))
+    base = min(bases) if bases else 0
+    items: list[list[str]] = []
+    current: list[str] | None = None
+    prev_blank = True
     for line in lines:
         if not line.strip():
+            prev_blank = True
             continue
         m = LIST_ITEM_RE.match(line)
         indent = len(line) - len(line.lstrip())
-        parsed.append((indent, m.group(2) if m else None, line.strip()))
-    bases = [ind for ind, txt, _ in parsed if txt is not None]
-    if not bases:
-        # 箇条書きの無い節は、空行区切りの段落を 1 項目として扱う（黙って捨てない）
-        paragraphs: list[list[str]] = [[]]
-        for line in lines:
-            if line.strip():
-                paragraphs[-1].append(line.strip())
-            elif paragraphs[-1]:
-                paragraphs.append([])
-        return [" ".join(p) for p in paragraphs if p]
-    base = min(bases)
-    items: list[list[str]] = []
-    current: list[str] | None = None
-    for indent, txt, raw in parsed:
-        if txt is not None and indent == base:
-            current = [txt]
+        if m and indent <= base:
+            current = [m.group(2)]
             items.append(current)
-        elif current is not None and indent > base:
-            current.append(raw)
-        elif txt is None and current is not None and indent <= base:
-            current = None
+        elif current is None or (indent <= base and prev_blank):
+            current = [line.strip()]
+            items.append(current)
+        else:
+            current.append(line.strip())
+        prev_blank = False
     return [" ".join(parts) for parts in items]
 
 
