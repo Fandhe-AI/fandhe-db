@@ -305,6 +305,49 @@ fn wire15_fetch_next_in_and_forward_over_simple_query() {
     read_ready_for_query(&mut stream);
 }
 
+/// `FETCH ALL`／`FETCH FORWARD ALL`（末尾 `;` 付きの単独送信）が単純問い合わせで受理され、
+/// 残り全行がタグ `FETCH n`（実際の行数）で返り、続く `FETCH ALL` は `FETCH 0`
+/// （Issue #3174・WIRE-15）。`BACKWARD ALL` は `42601` で Tx が `Failed`（`'E'`）になる。
+// tracked: #3172
+#[test]
+fn wire15_fetch_all_over_simple_query() {
+    let (core, _guard) = new_core_with_rows();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, core);
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    simple_ok(&mut stream, "BEGIN;", "BEGIN");
+    simple_ok(
+        &mut stream,
+        "DECLARE c CURSOR FOR SELECT id FROM docs LIMIT 100;",
+        "DECLARE CURSOR",
+    );
+
+    let mut ids: Vec<String> = Vec::new();
+    for (sql, expected_tag) in [
+        ("FETCH 1 FROM c;", "FETCH 1"),
+        ("FETCH ALL FROM c;", "FETCH 4"),
+        ("FETCH FORWARD ALL IN c;", "FETCH 0"),
+    ] {
+        send_simple_query(&mut stream, sql);
+        let (page, tag) = read_fetch_page(&mut stream);
+        assert_eq!(tag, expected_tag, "{sql}");
+        ids.extend(page);
+    }
+    let mut sorted = ids.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(sorted, vec!["1", "2", "3", "4", "5"], "no dup or gap");
+    assert_eq!(ids.len(), 5);
+
+    send_simple_query(&mut stream, "FETCH BACKWARD ALL FROM c;");
+    expect_error_response_with_sqlstate(&mut stream, "42601");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'E');
+
+    send_simple_query(&mut stream, "ROLLBACK");
+    assert_eq!(read_command_complete(&mut stream), "ROLLBACK");
+    read_ready_for_query(&mut stream);
+}
 /// RLS: 他テナントのカーソル名は不在と同一の応答（`34000`）になり、存在情報を
 /// 漏らさない。
 #[test]

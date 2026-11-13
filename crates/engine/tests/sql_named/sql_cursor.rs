@@ -980,3 +980,97 @@ fn fetch_next_in_respect_tenant_boundary_and_reject_unsupported_direction() {
         assert_eq!(err.wire_code(), "34000", "{sql}");
     }
 }
+/// `FETCH ALL`／`FETCH FORWARD ALL`（Issue #3174・WIRE-15）は残り全行を返して末尾へ
+/// 進み、続く `FETCH ALL`・`FETCH NEXT` は 0 行。連結は参照カーソルと一致する。
+#[test]
+fn fetch_all_returns_rest_and_then_zero_rows() {
+    let (engine, path) = new_core();
+    let _cleanup = CleanupGuard(path);
+    let caller = ctx("tenant-a");
+    seed_rows(&engine, &caller, 5);
+
+    let mut session = SessionState::default();
+    let mut txn = engine.new_session_transaction();
+    engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "BEGIN")
+        .expect("begin");
+    for name in ["c", "ref"] {
+        engine
+            .execute_sql_in_txn(
+                &caller,
+                &mut session,
+                &mut txn,
+                &format!("DECLARE {name} CURSOR FOR SELECT id FROM {TABLE} LIMIT 100"),
+            )
+            .expect("declare");
+    }
+
+    let mut fetch = |sql: &str, expected_rows: usize| -> Vec<u64> {
+        let outcome = engine
+            .execute_sql_in_txn(&caller, &mut session, &mut txn, sql)
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        let SqlOutcome::Fetch(result) = outcome else {
+            panic!("expected Fetch outcome for {sql}");
+        };
+        assert_eq!(result.rows.len(), expected_rows, "{sql}");
+        row_ids(&result)
+    };
+    let mut got = fetch("FETCH 2 FROM c", 2);
+    got.extend(fetch("FETCH ALL FROM c;", 3));
+    assert!(fetch("FETCH FORWARD ALL IN c", 0).is_empty());
+    assert!(fetch("FETCH NEXT FROM c", 0).is_empty());
+    let reference = fetch("FETCH 10 FROM ref", 5);
+    assert_eq!(got, reference);
+}
+
+/// `FETCH ALL` でも別テナントは他者のカーソルを参照できず（`34000`・未定義と同一応答）、
+/// 未対応の方向（`BACKWARD ALL`）は `42601` で Tx を `Failed` にする。
+// tracked: #3172
+#[test]
+fn fetch_all_respects_tenant_boundary() {
+    let (engine, path) = new_core();
+    let _cleanup = CleanupGuard(path);
+    let alice = ctx("alice");
+    let bob = ctx("bob");
+    seed_rows(&engine, &alice, 2);
+
+    let mut a_session = SessionState::default();
+    let mut a_txn = engine.new_session_transaction();
+    engine
+        .execute_sql_in_txn(&alice, &mut a_session, &mut a_txn, "BEGIN")
+        .expect("begin");
+    engine
+        .execute_sql_in_txn(
+            &alice,
+            &mut a_session,
+            &mut a_txn,
+            &format!("DECLARE c CURSOR FOR SELECT id FROM {TABLE} LIMIT 10"),
+        )
+        .expect("declare");
+    let err = engine
+        .execute_sql_in_txn(
+            &alice,
+            &mut a_session,
+            &mut a_txn,
+            "FETCH BACKWARD ALL FROM c",
+        )
+        .expect_err("BACKWARD ALL is rejected");
+    assert_eq!(err.wire_code(), "42601");
+    assert_eq!(a_txn.status(), TransactionStatus::Failed);
+
+    for sql in [
+        "FETCH ALL FROM c",
+        "FETCH FORWARD ALL FROM c",
+        "FETCH ALL FROM missing_cursor",
+    ] {
+        let mut b_session = SessionState::default();
+        let mut b_txn = engine.new_session_transaction();
+        engine
+            .execute_sql_in_txn(&bob, &mut b_session, &mut b_txn, "BEGIN")
+            .expect("bob begin");
+        let err = engine
+            .execute_sql_in_txn(&bob, &mut b_session, &mut b_txn, sql)
+            .expect_err(sql);
+        assert_eq!(err.wire_code(), "34000", "{sql}");
+    }
+}
