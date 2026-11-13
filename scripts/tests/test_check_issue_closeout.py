@@ -35,7 +35,7 @@ class ParseTests(unittest.TestCase):
     def test_nested_heading_and_same_level_end(self):
         text = "## 対象外\n- a\n### 詳細\n- b\n## 次\n- c\n"
         secs = cic.extract_out_of_scope_sections(text)
-        self.assertEqual(secs[0].items, ["a", "b"])
+        self.assertEqual(secs[0].items, ["a", "詳細", "b"])
 
     def test_fence_ignored(self):
         text = "```\n## 対象外\n- fake\n```\n## 対象外\n- real\n```\n- fenced\n```\n"
@@ -131,7 +131,7 @@ class ParseTests(unittest.TestCase):
     def test_deep_heading_with_ref_kept(self):
         text = "## 対象外\n- a #1\n### 残作業 #600\n- b\n### 詳細\n"
         secs = cic.extract_out_of_scope_sections(text)
-        self.assertEqual(secs[0].items, ["a #1", "残作業 #600", "b"])
+        self.assertEqual(secs[0].items, ["a #1", "残作業 #600", "b", "詳細"])
 
     def test_heading_sanitized(self):
         h = cic.sanitize_heading('a\x1b[31m"b' + "x" * 200)
@@ -236,6 +236,13 @@ class IntegrationTests(unittest.TestCase):
         code, out, _ = run_cli(g, ["100"])
         self.assertEqual(code, 1, out)
         self.assertIn("CLOSED-ONLY issue #101", out)
+
+    def test_deep_heading_without_ref_is_untracked(self):
+        g = FakeGh(bodies={101: (901, "## 対象外\n### リトライ処理の実装\n")},
+                   states={}, tree={100: [101], 101: []})
+        code, out, _ = run_cli(g, ["100"])
+        self.assertEqual(code, 1, out)
+        self.assertIn("UNTRACKED", out)
 
     def test_qualified_ref_to_open_issue_is_ok(self):
         g = FakeGh(bodies={101: (901, body(f"see {REPO}#600"))},

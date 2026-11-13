@@ -110,11 +110,6 @@ def is_out_of_scope_heading(text: str) -> bool:
     return "対象外" in text or OUT_OF_SCOPE_RE.search(text) is not None
 
 
-def has_ref_syntax(text: str) -> bool:
-    """見出し本文に Issue/PR 参照（`#N`・修飾付き・URL）らしき記述があるか。"""
-    return re.search(r"(?:^|[^A-Za-z0-9_&])#[1-9]|/(?:issues|pull)/[1-9]", text) is not None
-
-
 def is_empty_marker(text: str) -> bool:
     return re.sub(r"[\W_]+", "", text.lower()) in EMPTY_MARKERS
 
@@ -189,8 +184,9 @@ def extract_out_of_scope_sections(body: str) -> list[Section]:
                 if is_out_of_scope_heading(m.group(2)):
                     active = Section(heading=sanitize_heading(m.group(2)))
                     active_level = level
-            elif has_ref_syntax(m.group(2)):
-                # 節内の深い見出しに書かれた参照・残作業も独立項目として保持する
+            else:
+                # 節内の深い見出しの残作業は参照番号の有無に依存せず独立項目として保持する
+                # （参照のない見出しこそ受け皿なしの UNTRACKED として報告する）
                 buf.append("")
                 buf.append(m.group(2))
                 buf.append("")
