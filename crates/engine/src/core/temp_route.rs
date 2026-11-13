@@ -785,6 +785,22 @@ impl EngineCore {
         declared: &[Option<crate::sql::params::DeclaredParamType>],
     ) -> Result<super::PreparedSql, SqlSurfaceError> {
         let result = self.parse_sql_prepared_in_session_inner(session, sql, declared);
+        // Issue #3195: 未修飾名が `search_path` で自テナントの SCHEMA に解決される形は、Parse の結果を path の
+        // 世代が変わった後の Bind・Describe で使い回さないよう固定文言の `0A000` にする（再解決は #3197）。
+        // 構文エラー `42601` は優先する。参照ゲートより先に判定する（SCHEMA 側に在る名前を `42P01` にしない）。
+        if !matches!(&result, Err(e) if e.wire_code() == "42601")
+            && (session.search_path_hides_public() || session.search_path_may_hold_tenant_schema())
+        {
+            if let Ok(tokens) = crate::sql::lexer::tokenize_with_params(sql) {
+                self.reject_path_resolved_refs(
+                    session.resolution_tenant(),
+                    session,
+                    &tokens,
+                    &[],
+                    None,
+                )?;
+            }
+        }
         // TABLE-27・Issue #1715: `public` が見えない `search_path` のセッションは、一時表以外の未修飾の
         // テーブル参照を `42P01` にする。判定順は構文エラー `42601` → 参照ゲート → 権限 → その他の検証エラー。
         // 既定の path のセッションは何も足さない。権限検査より前に行うのは、権限の無いロールへ `42501` で
@@ -1127,6 +1143,15 @@ impl EngineCore {
                     &prepared.public_qualified,
                     temp,
                 )?;
+                // Issue #3195: Parse 後に変わった path で未修飾名が自テナントの SCHEMA に解決される形は
+                // 固定文言の `0A000`（Parse で解決したキーを使い回さない。再解決は #3197）。
+                self.reject_path_resolved_refs(
+                    session.resolution_tenant(),
+                    session,
+                    &prepared.tokens,
+                    &prepared.qualified_positions,
+                    read_snap,
+                )?;
                 // `public` が見えない `search_path` では、Parse 後に変わった path でも一時表以外の
                 // 未修飾名を `42P01` にする（TABLE-27・Issue #1715。既定の path では何もしない）。
                 crate::sql::search_path::check_unqualified_refs(
@@ -1402,7 +1427,7 @@ impl EngineCore {
                         ctx,
                         stmt,
                         self.ledger_mode,
-                        Some(&self.trigger_runtime),
+                        Some(&self.trigger_runtime.bind(self)),
                         privilege_recheck.as_ref(),
                     )?,
                 ))

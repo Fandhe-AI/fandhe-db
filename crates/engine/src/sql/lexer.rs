@@ -1651,6 +1651,19 @@ fn lex_word(input: &str, start: usize) -> (String, usize) {
     (word, start + end)
 }
 
+/// 末尾の単一 `;`（`Token::Punct(';')`）を 1 個だけ外したスライスを返す。
+///
+/// Tx 制御文・`SET TRANSACTION`・`FETCH`・`CLOSE` の専用検証器（`sql/transaction.rs`・`sql/cursor.rs`）が
+/// 入口で呼ぶ。psql は文末に `;` を付けて 1 文ずつ送るため、検証器が余剰トークンとして 42601 にしないよう
+/// 吸収する（Issue #3171）。外すのは 1 個だけで、`;;` や途中の `;` は残るので従来どおり fail-closed で拒否される。
+/// `allowlist::strip_trailing_semicolons`（連続分を外すビュー本文の正規化用）とは意味が異なるため流用しない。
+pub(crate) fn strip_one_trailing_semicolon(tokens: &[Token]) -> &[Token] {
+    match tokens.split_last() {
+        Some((Token::Punct(';'), head)) => head,
+        _ => tokens,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -2998,5 +3011,21 @@ mod bit_distance_op_tests {
             let rendered = render_tokens(&tokens).expect("render");
             assert_eq!(toks(&rendered), tokens, "{sql}");
         }
+    }
+
+    #[test]
+    fn strip_one_trailing_semicolon_removes_only_one() {
+        let one = tokenize("BEGIN;").unwrap();
+        assert_eq!(strip_one_trailing_semicolon(&one).len(), one.len() - 1);
+        let two = tokenize("BEGIN;;").unwrap();
+        assert_eq!(strip_one_trailing_semicolon(&two).len(), two.len() - 1);
+        assert_eq!(
+            strip_one_trailing_semicolon(&two).last(),
+            Some(&Token::Punct(';'))
+        );
+        let none = tokenize("BEGIN").unwrap();
+        assert_eq!(strip_one_trailing_semicolon(&none).len(), none.len());
+        assert!(strip_one_trailing_semicolon(&[]).is_empty());
+        assert!(strip_one_trailing_semicolon(&[Token::Punct(';')]).is_empty());
     }
 }

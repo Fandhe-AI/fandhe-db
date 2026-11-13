@@ -15,7 +15,7 @@
 明示トランザクション（Issue #942）の中で次の 3 文を受理できるようにする。
 
 - `DECLARE <name> CURSOR FOR <SELECT>`
-- `FETCH [FORWARD] <n> FROM <name>`
+- `FETCH [ NEXT | [FORWARD] <n> ] { FROM | IN } <name>`
 - `CLOSE <name>`
 
 ## 設計の要点（判断記録）
@@ -107,6 +107,7 @@ RLS-7 の暗黙適用がそのまま効く。カーソルは接続ごとの `Ses
   `WITHOUT HOLD` はいずれも `42601`（規範形のみ受理。`name` の直後が必ず
   `CURSOR` であることを要求する構造上、これらの修飾語が割り込むと自然に
   拒否される）。
+- **末尾の `;`（Issue #3171）**: `FETCH`・`CLOSE` は末尾の単一 `;` を受理する（`sql::lexer::strip_one_trailing_semicolon`）。`;;` は `42601`。`DECLARE` は内側 SELECT の検証が末尾 `;` を 1 個受理する。判断は [explicit-transaction.md](explicit-transaction.md) の「末尾 `;` の扱い」節。
 - **`DECLARE` のカタログ照合の遅延とビュー**: 構文解析段（`core.rs::parse_tokens`）
   は内側 `SELECT` の構造検証のみを行い、カタログを参照しない（トランザクション
   外の `DECLARE` を常に `25P01` にするため）。`Active` なトランザクション内の
@@ -118,10 +119,11 @@ RLS-7 の暗黙適用がそのまま効く。カーソルは接続ごとの `Ses
   （§3）。同一トランザクション内の dirty 判定もビュー展開後の基底テーブル
   名で行う（PR #1049 レビュー指摘対応。Issue #1179 で `0A000` 拒否から未 commit
   変更の反映へ変更）。
-- **`FETCH`**: 受理するのは `FETCH [FORWARD] <n> FROM <name>` のみ。`n` は
-  `sql::parser::validate_search_limit`（`1..=MAX_SEARCH_K`）を再利用する。
-  `IN`／`ALL`／`NEXT`／`BACKWARD`／`ABSOLUTE` はいずれも `n` の位置に
-  `Token::Number` を要求する構造上、自然に `42601` へ落ちる。
+- **`FETCH`**（Issue #3173）: 受理するのは `FETCH [ NEXT | [FORWARD] <n> ] { FROM | IN } <name>`。
+  `NEXT` は 1 件、`IN` は `FROM` の別名、`FORWARD` の後ろは件数必須。件数は `NEXT`
+  を含め `sql::parser::validate_search_limit_with`（`1..=MAX_SEARCH_K`）を通す。
+  `ALL`／`BACKWARD`／`PRIOR`／`FIRST`／`LAST`／`ABSOLUTE`／`RELATIVE`・件数なしの
+  `FORWARD`・`FROM`／`IN` の省略は前方向へ読み替えず `42601` で拒否する（fail-closed）。
 - **`CLOSE`**: 受理するのは `CLOSE <name>` のみ。`CLOSE ALL` は明示的に
   拒否する（`ALL` 自体は識別子として妥当な形のため、拒否しないと「たまたま
   `ALL` という名前のカーソルが存在する場合にだけ動く曖昧な構文」になって
@@ -233,7 +235,8 @@ execute_portal`）で以下の 2 つを portal へ束縛し、再開前に突き
 
 ## 対象外・申し送り
 
-- `SCROLL`／`WITH HOLD`／`BINARY`／`FETCH ALL`／`BACKWARD`／`CLOSE ALL`／
+- `SCROLL`／`WITH HOLD`／`BINARY`／`FETCH ALL`／`BACKWARD`／`PRIOR`／`FIRST`／`LAST`／
+  `ABSOLUTE`／`RELATIVE`／件数なし `FORWARD`／`FROM`・`IN` 省略の `FETCH`／`CLOSE ALL`／
   `MOVE`、二重引用符のカーソル名（psycopg 3 の `ServerCursor` はこの形式を
   使うため非対応になる）。
 - ベクトル順位付けの `SELECT`（SQL-1〜4）のカーソル化（WIRE-15 の対象外）。

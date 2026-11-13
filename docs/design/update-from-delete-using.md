@@ -5,7 +5,7 @@ spec 本文は転記せず、ID のポインタのみを記す。
 
 ## 範囲
 
-本 Issue は **構文と束縛だけ**を担当する。束縛まで通った文は、実行腕が `0A000` で止める（副作用ゼロのスタブ）。
+本 Issue（#1754）は **構文と束縛だけ**を担当した。束縛・変換（#3201）を通った文は、#3202 で結合実行器へ dispatch される（下記「dispatch」節）。
 
 | 担当 | 内容 |
 | ---- | ---- |
@@ -62,12 +62,42 @@ FROM を黙って無視する（単一表として処理する）fail-open 経�
 
 結合条件の抽出・プッシュダウン・実行計画は #1755 の担当。
 
+## 変換器（Issue #3201。`sql::join::dml_plan`）
+
+束縛結果（`BoundUpdateFrom`／`BoundDeleteUsing`）を結合 DML の実行入力（`JoinedDmlPlan`）へ変換する純関数。行・RLS・台帳・書き込みトランザクションには触れない。SQL 経路の dispatch は #3202（`core::dml_from_exec::plan_*_stmt` が入口。下記「dispatch」節）。
+
+WHERE は最上位の `AND` で conjunct に平坦化し、解決済みの relation 添字だけで（表名では判定せず）次のとおり全域に振り分ける。
+
+| conjunct | 行き先 |
+| -------- | ------ |
+| 別 relation の列同士の等値 | 結合キー（対象側・source 側へ向きを正規化。複合キー可） |
+| 対象側だけを参照（`OR` 可） | 対象側フィルタ（既存の述語形 DML と同じ束縛器） |
+| source 側だけを参照（`OR` 可） | source の走査へ押し下げる述語 |
+| 上記以外 | `0A000` |
+
+`0A000` で拒否する形（第 1 弾の設計上の対象外・fail-closed の安全弁。取りこぼした述語は書き込み範囲を広げるため、未分類は必ず拒否する）: WHERE 省略・等値結合キー無し、relation をまたぐ非等値・`OR`、同じ relation 内の列比較、FROM／USING が 2 表以上、キー化できない型（REAL／DOUBLE／NUMERIC 等）の結合キー、非バイト列順の照合つきキー列、embedding を参照する対象側述語、SET 右辺の source 疑似列 `id`・結合ビューへ写像できない型の source 列。キー列の型クラスが比較できない組は `42804`。
+
+SET は、リテラルと対象表の列だけを使う式をそのまま運び、列参照（source 列を含む）を「対象列 ++ source の取り出し列」の合成スキーマ上の式として束縛する（合成名は利用者の識別子と衝突しない綴り）。Describe 経路で変換エラーを返すかどうかは #3202 の方針の範囲。
+
 ## セキュリティ
 
-- 行を一切読まず書かない。実行腕は束縛後に必ず `0A000` で止まり、書き込みトランザクション・台帳・世代に触れない
-- RLS は #1755／#1756 が JOIN 実行器を経由して適用する。本 Issue ではバイパス経路を作らない
+- 束縛・変換の段は行を読まず書かない。実行は #3202 の dispatch 経由で結合実行器だけが行い、`0A000`（変換できない形・op id 付き・暗黙 Tx を通らない経路）では書き込みトランザクション・台帳・世代に触れない
+- RLS は結合実行器が適用する。dispatch でもバイパス経路を作らない
 - 修飾子の不一致は、カタログを引かない `42P01`（存在オラクルにならない）
 - `search_path` ゲート（TABLE-27）: `relation_positions` が `DELETE ... USING` の表参照リストを認識し、非修飾参照のゲート素通り（fail-open）を防ぐ
+
+## dispatch（Issue #3202）
+
+SQL の入口を結合実行器（`execute_joined_dml_in`）へ結線した。ポインタ: SQL-53 (b)・RLS-10・RECOVER-10/11・SQL-28。
+
+- **autocommit**: `execute_parsed_in_session_inner` が `is_joined_dml` を見て、サブクエリ付き述語 DML と同じ文単位の暗黙 Tx（`execute_subquery_dml_autocommit`）へ振り分ける。実行本体は明示 Tx と共通
+- **明示 Tx**: 共有 write txn 上で実行し、対象表とトリガが書いた表へ `mark_written` する（漏れると COMMIT が write txn を破棄し、遅延 FK の検査も取りこぼす）。コマンドタグは autocommit と同じ `UPDATE n`／`DELETE n`
+- **暗黙 Tx を通らない経路**（`EXPLAIN` 等のネスト）: `execute_parsed_statement` の腕は固定文言の `0A000`（fail-closed）
+- **Describe**: Execute と同じ準備段（束縛・変換・op id ゲート）を通す。実行できる形は結果列なし、変換器が拒否する形と op id 付きは `0A000`、束縛エラーは従来のコード。これで Describe と Execute のコードがそろう
+- **`USING OPERATION_ID` 付き**: 台帳の SQL 経路結線（#3203）まで固定文言の `0A000` で拒否する（黙って捨てると再送が二重適用される fail-open になるため）。ゲートは `prepare_update_from`／`prepare_delete_using` の 1 か所で、#3203 が撤去する。`parsed_operation_id` は拒否される文を Tx に登録しないため `None` のまま。`--require-operation-id` 構成では #3203 まで UPDATE FROM／DELETE USING を使えない
+- **`PARTITIONED`**: 構文段が `42601` で拒否する。`ValidatedUpdateFrom`／`ValidatedDeleteUsing` は `partitioned` を持たず、`run_partitioned_*` は述語形だけを受け取るため、結合形が分割実行器へ入る経路は構造上存在しない（autocommit・明示 Tx の両方を結合テストで固定）
+- **多重一致**: 実行器の規約どおり、対象行ごとに 1 回だけ更新・削除し、UPDATE の値は走査順で最初の source 行を採る
+- **まだ拒否する形**: 変換器の対象外（上記の変換器節。`0A000`）、`RETURNING`（#3204。Parse で `0A000`）、ビュー・一時表が関与する形、データ変更 CTE の本文と `EXPLAIN`。いずれも第 1 弾の設計上の対象外で、fail-closed の安全弁
 
 ## テスト
 

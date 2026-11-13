@@ -363,3 +363,45 @@ fn wire_extended_query_current_schema_follows_set() {
     simple_ok(&mut stream, "RESET search_path");
     assert_eq!(run(&mut stream, "p2").as_deref(), Some("public"));
 }
+/// Issue #3195: 簡易クエリの末尾 `;` 付き単独送信（psql 形）でも、`SET search_path TO q1` の後の未修飾名が
+/// 自テナントの SCHEMA に解決される。他テナントの同名 SCHEMA には解決されず、`42P01` に内部 ID・
+/// 他テナントの名前は出ない。
+#[test]
+fn wire_unqualified_read_resolves_into_own_schema_with_trailing_semicolon() {
+    let (core, _guard) = new_core();
+    let store = allowed_store(
+        &[
+            ("alice", "tenant-a", "correct-horse"),
+            ("bob", "tenant-b", "battery-staple"),
+        ],
+        &["alice", "bob"],
+    );
+    let addr = spawn_server(store, core);
+    let mut alice = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+    let mut bob = authenticate_to_ready_for_query(addr, "bob", "battery-staple");
+
+    // alice だけが q1.t を持つ。
+    simple_ok(&mut alice, "CREATE SCHEMA q1");
+    simple_ok(&mut alice, "CREATE TABLE q1.t (id BIGINT PRIMARY KEY)");
+    simple_ok(&mut alice, "INSERT INTO q1.t (id) VALUES (10)");
+    simple_ok(&mut alice, "SET search_path TO q1;");
+
+    send_simple_query(&mut alice, "SELECT id FROM t;");
+    let _ = read_row_description(&mut alice);
+    assert_eq!(
+        read_data_row(&mut alice).first().cloned().flatten(),
+        Some("10".to_string())
+    );
+    assert_eq!(read_command_complete(&mut alice), "SELECT 1");
+    read_ready_for_query(&mut alice);
+
+    // bob は同名の SCHEMA・表を持たない。alice の q1.t へは解決されず、不在と同じ `42P01`。
+    simple_ok(&mut bob, "SET search_path TO q1;");
+    send_simple_query(&mut bob, "SELECT id FROM t;");
+    let (kind, body) = read_message(&mut bob);
+    assert_eq!(kind, b'E', "ErrorResponse");
+    let text = String::from_utf8_lossy(&body).into_owned();
+    assert!(text.contains("C42P01"), "{text}");
+    assert!(!text.contains('#'), "{text}");
+    read_ready_for_query(&mut bob);
+}

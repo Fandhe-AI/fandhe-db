@@ -99,7 +99,7 @@ main セッションはオーケストレーションに徹し、調査・実装
 | [japanese-style.md](.claude/rules/japanese-style.md) | 日本語出力スタイル |
 | [conventional-commits.md](.claude/rules/conventional-commits.md) | Conventional Commits 詳細規約（type/scope 一覧） |
 | [code-comment-style.md](.claude/rules/code-comment-style.md) | コメント規約（役割・責務・呼び出し文脈の埋め込み） |
-| [out-of-scope-tracking.md](.claude/rules/out-of-scope-tracking.md) | スコープ外事項の Issue 追跡フロー |
+| [out-of-scope-tracking.md](.claude/rules/out-of-scope-tracking.md) | スコープ外事項の Issue 追跡フロー・対象外の書き方・親 Issue close 前の突合（`scripts/check_issue_closeout.sh`） |
 | [spec-confidentiality.md](.claude/rules/spec-confidentiality.md) | **リポ固有・P0**: private spec のポインタ表記運用 |
 | [dependency-policy.md](.claude/rules/dependency-policy.md) | **リポ固有**: 依存最小・`=x.y.z` 固定・ユーザー承認制 |
 | [git-hooks.md](.claude/rules/git-hooks.md) | lefthook の編集方針（時間予算・CI と重複する検査を置かない・例外の rustfmt-check） |
