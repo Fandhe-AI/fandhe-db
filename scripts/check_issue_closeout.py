@@ -60,7 +60,7 @@ SCAN_PATH = re.compile(
 )
 
 FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
-HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*#*\s*$")
+HEADING_RE = re.compile(r"^ {0,3}(#{1,6})\s+(.+?)\s*#*\s*$")
 OUT_OF_SCOPE_RE = re.compile(r"out[- ]of[- ]scope", re.IGNORECASE)
 LIST_ITEM_RE = re.compile(r"^(\s*)(?:[-*+]|[0-9]{1,9}[.)])\s+(.*)$")
 EMPTY_MARKERS = {"なし", "特になし", "none", "na"}
@@ -108,6 +108,11 @@ def sanitize_heading(text: str) -> str:
 
 def is_out_of_scope_heading(text: str) -> bool:
     return "対象外" in text or OUT_OF_SCOPE_RE.search(text) is not None
+
+
+def has_ref_syntax(text: str) -> bool:
+    """見出し本文に Issue/PR 参照（`#N`・修飾付き・URL）らしき記述があるか。"""
+    return re.search(r"(?:^|[^A-Za-z0-9_&])#[1-9]|/(?:issues|pull)/[1-9]", text) is not None
 
 
 def is_empty_marker(text: str) -> bool:
@@ -180,9 +185,15 @@ def extract_out_of_scope_sections(body: str) -> list[Section]:
             level = len(m.group(1))
             if active is not None and level <= active_level:
                 close()
-            if active is None and is_out_of_scope_heading(m.group(2)):
-                active = Section(heading=sanitize_heading(m.group(2)))
-                active_level = level
+            if active is None:
+                if is_out_of_scope_heading(m.group(2)):
+                    active = Section(heading=sanitize_heading(m.group(2)))
+                    active_level = level
+            elif has_ref_syntax(m.group(2)):
+                # 節内の深い見出しに書かれた参照・残作業も独立項目として保持する
+                buf.append("")
+                buf.append(m.group(2))
+                buf.append("")
             continue
         if active is not None:
             buf.append(line)
@@ -192,6 +203,13 @@ def extract_out_of_scope_sections(body: str) -> list[Section]:
 
 def extract_refs(text: str, repo: str, exclude: set[int] | None = None) -> list[int]:
     """項目本文から同一リポの Issue/PR 参照番号を重複なく抽出する。"""
+    # 同一リポの修飾付き参照 `OWNER/NAME#N` は `#N` に正規化する（他リポ参照は REF_RE が除外）
+    text = re.sub(
+        r"(?<![A-Za-z0-9_/.&#-])" + re.escape(repo) + r"#([1-9][0-9]{0,9})(?![0-9])",
+        lambda m: f" #{m.group(1)} ",
+        text,
+        flags=re.IGNORECASE,
+    )
     text = re.sub(
         r"https://github\.com/" + re.escape(repo) + r"/(?:issues|pull)/([0-9]{1,10})(?![0-9])",
         lambda m: f" #{m.group(1)} ",

@@ -114,6 +114,25 @@ class ParseTests(unittest.TestCase):
         secs = cic.extract_out_of_scope_sections(text)
         self.assertEqual([s.items for s in secs], [["real"]])
 
+    def test_indented_heading_recognized(self):
+        for h in ("  ## 対象外", "   ## 対象外"):
+            secs = cic.extract_out_of_scope_sections(f"{h}\n- a #1\n")
+            self.assertEqual([s.items for s in secs], [["a #1"]], h)
+        # 4 スペース以上はコードブロック扱いで見出しではない
+        self.assertEqual(cic.extract_out_of_scope_sections("    ## 対象外\n- a\n"), [])
+
+    def test_qualified_same_repo_ref_normalized(self):
+        r = cic.extract_refs
+        self.assertEqual(r(f"see {REPO}#600", REPO), [600])
+        self.assertEqual(r(f"see {REPO.lower()}#600", REPO), [600])
+        self.assertEqual(r(f"{REPO}#5〜#7", REPO), [5, 6, 7])
+        self.assertEqual(r(f"other/repo#9 {REPO}x#3 x{REPO}#4", REPO), [])
+
+    def test_deep_heading_with_ref_kept(self):
+        text = "## 対象外\n- a #1\n### 残作業 #600\n- b\n### 詳細\n"
+        secs = cic.extract_out_of_scope_sections(text)
+        self.assertEqual(secs[0].items, ["a #1", "残作業 #600", "b"])
+
     def test_heading_sanitized(self):
         h = cic.sanitize_heading('a\x1b[31m"b' + "x" * 200)
         self.assertNotIn("\x1b", h)
@@ -210,6 +229,19 @@ class IntegrationTests(unittest.TestCase):
         code, out, _ = run_cli(g, ["100"])
         self.assertEqual(code, 1, out)
         self.assertIn("CYCLE       #102 -> #103 -> #102", out)
+
+    def test_deep_heading_ref_closed_is_detected(self):
+        g = FakeGh(bodies={101: (901, "## 対象外\n### 残作業 #600\n")},
+                   states={600: "CLOSED"}, tree={100: [101], 101: []})
+        code, out, _ = run_cli(g, ["100"])
+        self.assertEqual(code, 1, out)
+        self.assertIn("CLOSED-ONLY issue #101", out)
+
+    def test_qualified_ref_to_open_issue_is_ok(self):
+        g = FakeGh(bodies={101: (901, body(f"see {REPO}#600"))},
+                   states={600: "OPEN"}, tree={100: [101], 101: []})
+        code, out, _ = run_cli(g, ["100"])
+        self.assertEqual(code, 0, out)
 
     def test_parent_only_reference_is_closed_only(self):
         g = FakeGh(bodies={101: (901, body("see #100"))}, states={100: "OPEN"},
