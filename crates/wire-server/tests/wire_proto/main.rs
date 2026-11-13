@@ -11,6 +11,7 @@ use http_common::temp_db;
 mod legacy_table;
 
 mod rls11_read_your_writes;
+mod sql31_trailing_semicolon;
 mod sql38_set_transaction;
 mod sql69_savepoint_syntax;
 mod sql69_txn_aliases;
