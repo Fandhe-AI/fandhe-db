@@ -788,8 +788,8 @@ fn t0_t3_reads_through_every_reference_form_match_the_independent_oracle() {
                 );
                 trials += 1;
             }
-            // `search_path = s, public` の下の未修飾 `t` は public.t と同じ集合（`s` の中の `t` へは
-            // 解決されない現状も fail-closed 側。§4.3）。
+            // `search_path = s, public` の下の未修飾 `t` は、自テナントの SCHEMA `s` の `t` へ解決される
+            // （Issue #3195。修飾した `s.t` と同じ集合。他テナントの `s` の行は混ざらない）。
             ok_mode(
                 &core,
                 tenant,
@@ -804,11 +804,10 @@ fn t0_t3_reads_through_every_reference_form_match_the_independent_oracle() {
                 &mut s,
                 "SELECT id, v FROM t LIMIT 1000",
             ));
-            let want = pairs_of(&expected(&truths, viewer, private, Table::Public));
             let sch = pairs_of(&expected(&truths, viewer, private, Table::Schema));
-            assert!(
-                got == want || got == sch,
-                "{tenant} private={private} search_path form: got {got:?}, public {want:?}, schema {sch:?}"
+            assert_eq!(
+                got, sch,
+                "{tenant} private={private} search_path form must resolve to the viewer's own schema"
             );
             trials += 1;
         }
@@ -1319,11 +1318,17 @@ fn t3_public_rows_follow_the_oracle_through_every_reference_form() {
                 public_seen += got.len();
                 trials += 1;
             }
-            // 他テナントの SCHEMA 名や自分の SCHEMA を path に置いても、集合は変わらない。
-            for path_sql in [
-                "SET search_path = s, public",
-                "SET search_path = public, s",
-                "SET search_path = tenant_other, public",
+            let sch_want: BTreeSet<u64> = if private {
+                BTreeSet::from([1])
+            } else {
+                BTreeSet::new()
+            };
+            // path の要素順に解決する（Issue #3195）。自分の SCHEMA `s` が先なら `s.docs`、`public` が先なら
+            // public の docs。他テナントの SCHEMA 名は自テナントに無いので飛ばされ、集合は変わらない。
+            for (path_sql, path_want) in [
+                ("SET search_path = s, public", &sch_want),
+                ("SET search_path = public, s", &want),
+                ("SET search_path = tenant_other, public", &want),
             ] {
                 ok_mode(&core, tenant, private, &mut s, path_sql);
                 let got = query_ids(&ok_mode(
@@ -1333,7 +1338,7 @@ fn t3_public_rows_follow_the_oracle_through_every_reference_form() {
                     &mut s,
                     "SELECT id FROM docs LIMIT 1000",
                 ));
-                assert_eq!(got, want, "{tenant} private={private}: {path_sql}");
+                assert_eq!(&got, path_want, "{tenant} private={private}: {path_sql}");
                 trials += 1;
             }
             // 修飾した s.docs は自分の SCHEMA の表で、public の docs の行は混ざらない。
@@ -1345,11 +1350,6 @@ fn t3_public_rows_follow_the_oracle_through_every_reference_form() {
                 &mut s,
                 "SELECT id FROM s.docs LIMIT 1000",
             ));
-            let sch_want: BTreeSet<u64> = if private {
-                BTreeSet::from([1])
-            } else {
-                BTreeSet::new()
-            };
             assert_eq!(sch, sch_want, "{tenant} private={private}: s.docs");
             trials += 1;
         }

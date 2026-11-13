@@ -660,14 +660,14 @@ const ALLOWLIST: &[(&str, u32)] = &[
     ("catalog/sequence.rs", 1586),
     ("catalog/sequence.rs", 1625),
     ("catalog/sequence.rs", 1645),
-    ("catalog/sequence.rs", 1766),
-    ("catalog/sequence.rs", 2040),
-    ("catalog/sequence.rs", 2130),
-    ("catalog/sequence.rs", 2170),
-    ("catalog/sequence.rs", 2223),
-    ("catalog/sequence.rs", 2491),
-    ("catalog/sequence.rs", 2537),
-    ("catalog/sequence.rs", 2804),
+    ("catalog/sequence.rs", 1778),
+    ("catalog/sequence.rs", 2052),
+    ("catalog/sequence.rs", 2142),
+    ("catalog/sequence.rs", 2182),
+    ("catalog/sequence.rs", 2235),
+    ("catalog/sequence.rs", 2503),
+    ("catalog/sequence.rs", 2549),
+    ("catalog/sequence.rs", 2816),
     // `Storage::create_function`／`Storage::drop_function`（UDF カタログ・Issue #1919）:
     // UDF 定義は専用の関数カタログ表のみを書き、`CATALOG_TABLE`／`user_rows/{table_name}`
     // のいずれにも触れない（行を持たない定義メタデータのため、世代照合の対象テーブルが

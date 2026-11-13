@@ -6406,12 +6406,20 @@ impl EngineCore {
         // Issue #2125: 構文解析中の定数式評価（INSERT VALUES・列 DEFAULT の `ts_headline` 畳み込み）にも
         // 設定済みの上限を効かせる（束縛区間より前に評価されるため、ここで張らないとハード上限に戻る）。
         let _bind_limits_scope = self.sparsevec_limits_scope();
+        // TABLE-27・Issue #3195: 未修飾名を `search_path` の自テナント SCHEMA まで含めて解決する。権限ゲート・
+        // 一時表の振り分け・参照記録・ビュー本文の保存が同じ内部キーを見るよう、`gate_tokens` の複製より前に、
+        // 読み取り先頭の文だけトークン列を書き換える（ACL 検査は SCHEMA 側、実行は public 側、という食い違いを
+        // 作らない）。読み取り以外の文は書き換えず検出だけ行い、解決される参照があれば解析の後で `0A000`。
+        let mut tokens = tokens;
+        let path_gate =
+            self.resolve_search_path_for_statement(&mut tokens, session, tenant, read_snap)?;
         let gate_tokens = session.object_privileges_enforced().then(|| tokens.clone());
         // parse 中に実在を確認した relation 名の記録先。ACL 照会の時点で見つからない名前を、解析後に
         // DROP された参照先として権限ゲートが拒否する根拠になる（通常 SQL でも省略しない）。
         let hits = crate::sql::temp_catalog::RelationHits::default();
         let parsed =
-            self.parse_tokens_gated_grant_aware(tokens, session, resolver, read_snap, &hits)?;
+            self.parse_tokens_gated_grant_aware(tokens, session, resolver, read_snap, &hits);
+        let parsed = path_gate.finish(parsed)?;
         if let Some(t) = gate_tokens {
             crate::sql::privilege_gate::read::require_read_privileges(
                 &self.storage,
@@ -6440,6 +6448,188 @@ impl EngineCore {
             )?;
         }
         Ok(parsed)
+    }
+
+    /// 未修飾名の解決用カタログ照会（[`crate::sql::search_path::PathLookup`]）を自テナントに束縛して組み立て、
+    /// `f` へ渡す（Issue #3195）。SCHEMA の内部 ID は USAGE の有る自テナントのものだけ（無い SCHEMA は飛ばす。
+    /// `current_schema()` と同じ規則）。存在判定は `read_snap`（明示 Tx の `BEGIN` 時点のスナップショット）が
+    /// あればそれ、無ければ最初に必要になった時点の確定済みスナップショット 1 つを共有する（1 文で 1 read txn）。
+    /// 照会は `(tenant, 名前)` だけで、他テナントを引く経路は無い。
+    pub(crate) fn with_search_path_lookup<T>(
+        &self,
+        tenant: &str,
+        session: &crate::sql::mode::SessionState,
+        read_snap: Option<&redb::ReadTransaction>,
+        f: impl FnOnce(
+            &crate::sql::search_path::PathLookup<'_>,
+        ) -> Result<T, crate::sql::allowlist::SqlSurfaceError>,
+    ) -> Result<T, crate::sql::allowlist::SqlSurfaceError> {
+        use crate::sql::search_path::NameKind;
+        let lazy: std::cell::RefCell<Option<redb::ReadTransaction>> = std::cell::RefCell::new(None);
+        // 存在判定・SCHEMA の ID・USAGE の 3 つとも同じ読み取り源（`read_snap`、無ければ文ごとの lazy txn）で
+        // 引く。混在させると BEGIN 後の RENAME・DROP SCHEMA・REVOKE で SCHEMA を飛ばし public の別表を返す。
+        let with_snap =
+            |op: &dyn Fn(
+                &redb::ReadTransaction,
+            )
+                -> Result<Option<u64>, crate::sql::allowlist::SqlSurfaceError>|
+             -> Result<Option<u64>, crate::sql::allowlist::SqlSurfaceError> {
+                if let Some(snap) = read_snap {
+                    return op(snap);
+                }
+                let mut slot = lazy.borrow_mut();
+                if slot.is_none() {
+                    *slot = Some(self.begin_read_txn()?);
+                }
+                match slot.as_ref() {
+                    Some(snap) => op(snap),
+                    None => Err(crate::sql::allowlist::SqlSurfaceError::Internal {
+                        detail: "search_path lookup snapshot unavailable".to_string(),
+                    }),
+                }
+            };
+        let schema_id = |name: &str| {
+            with_snap(&|snap| {
+                let Some(id) = crate::catalog::namespace::schema_id_in_txn(snap, tenant, name)
+                    .map_err(crate::catalog::table_lookup_error)?
+                else {
+                    return Ok(None);
+                };
+                let usage = crate::sql::schema_privilege::check_schema_usage(session, &|role| {
+                    crate::catalog::privilege::schema_privileges_in_txn(snap, tenant, id, &[role])
+                        .map_err(crate::catalog::table_lookup_error)
+                });
+                match usage {
+                    Ok(()) => Ok(Some(id)),
+                    Err(crate::sql::allowlist::SqlSurfaceError::InsufficientPrivilege) => Ok(None),
+                    Err(e) => Err(e),
+                }
+            })
+        };
+        let exists = |key: &str, kind: NameKind| {
+            let probe = |src: &redb::ReadTransaction| match kind {
+                NameKind::Relation => crate::catalog::relation_or_sequence_exists_in(src, key),
+                NameKind::Index => crate::catalog::index_exists_in_source(src, key),
+                NameKind::Sequence => crate::catalog::sequence::sequence_exists_in(src, key),
+            };
+            if let Some(snap) = read_snap {
+                return probe(snap).map_err(crate::catalog::table_lookup_error);
+            }
+            let mut slot = lazy.borrow_mut();
+            if slot.is_none() {
+                *slot = Some(self.begin_read_txn()?);
+            }
+            match slot.as_ref() {
+                Some(snap) => probe(snap).map_err(crate::catalog::table_lookup_error),
+                None => Err(crate::sql::allowlist::SqlSurfaceError::Internal {
+                    detail: "search_path lookup snapshot unavailable".to_string(),
+                }),
+            }
+        };
+        f(&crate::sql::search_path::PathLookup {
+            schema_id: &schema_id,
+            exists: &exists,
+        })
+    }
+
+    /// 1 文の未修飾名を `search_path` で解決する（[`Self::parse_tokens_gated`] の先頭。Issue #3195）。
+    /// 読み取り先頭の文は `tokens` を内部キーへ書き換え、それ以外は検出だけ行う（結果は
+    /// [`PathGate::finish`] が解析の後で判定する）。解決対象が無い既定の path ではカタログを引かない。
+    fn resolve_search_path_for_statement(
+        &self,
+        tokens: &mut [crate::sql::lexer::Token],
+        session: &crate::sql::mode::SessionState,
+        tenant: &str,
+        read_snap: Option<&redb::ReadTransaction>,
+    ) -> Result<PathGate, crate::sql::allowlist::SqlSurfaceError> {
+        if !(session.search_path_may_hold_tenant_schema() || session.search_path_hides_public()) {
+            return Ok(PathGate::default());
+        }
+        let resolution = self.with_search_path_lookup(tenant, session, read_snap, |lookup| {
+            crate::sql::search_path::resolve_path_refs(session, tokens, &[], lookup)
+        })?;
+        let read_head = Self::is_read_head(tokens);
+        let mut gate = PathGate {
+            deferred: resolution.deferred_error,
+            read_head,
+            relation_in_schema: resolution.relation_in_schema,
+            detected_unsupported: false,
+        };
+        if read_head {
+            crate::sql::search_path::apply_rewrites(tokens, resolution.rewrites);
+        } else {
+            gate.detected_unsupported = !resolution.rewrites.is_empty();
+        }
+        Ok(gate)
+    }
+
+    /// 拡張クエリの Parse・Bind・Describe と `COPY` が、未修飾名が `search_path` で自テナントの SCHEMA に
+    /// 解決される形を検出して固定文言の `0A000` にする（Issue #3195）。解決した内部キーを、path の世代が
+    /// 変わった後の Bind・Describe で使い回したり、`COPY` が public 側へ黙って向いたりしないための
+    /// fail-closed の安全弁で、書き換えはしない（再解決は準備済み文: #3197、`COPY`: #3196）。
+    /// `skip` は準備済み文で `public.` 修飾を外した位置。`tenant` が無い（未束縛の）入口は何もしない。
+    pub(crate) fn reject_path_resolved_refs(
+        &self,
+        tenant: Option<&str>,
+        session: &crate::sql::mode::SessionState,
+        tokens: &[crate::sql::lexer::Token],
+        skip: &[usize],
+        read_snap: Option<&redb::ReadTransaction>,
+    ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+        let Some(tenant) = tenant else {
+            return Ok(());
+        };
+        if !(session.search_path_may_hold_tenant_schema() || session.search_path_hides_public()) {
+            return Ok(());
+        }
+        let resolution = self.with_search_path_lookup(tenant, session, read_snap, |lookup| {
+            crate::sql::search_path::resolve_path_refs(session, tokens, skip, lookup)
+        })?;
+        if let Some(e) = resolution.deferred_error {
+            return Err(e);
+        }
+        if resolution.rewrites.is_empty() {
+            Ok(())
+        } else {
+            Err(PathGate::unsupported())
+        }
+    }
+
+    /// 準備済み文（通常経路）の未修飾名が `search_path` で SCHEMA に解決されないことを確かめる
+    /// （Bind・Describe。[`Self::reject_path_resolved_refs`] の準備済み文版。一時表の経路は対象外）。
+    pub(crate) fn reject_prepared_path_resolved_refs(
+        &self,
+        session: &crate::sql::mode::SessionState,
+        prepared: &PreparedSql,
+        read_snap: Option<&redb::ReadTransaction>,
+    ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+        if !matches!(
+            prepared.route,
+            crate::core::temp_route::PreparedRoute::Plain
+        ) {
+            return Ok(());
+        }
+        self.reject_path_resolved_refs(
+            session.resolution_tenant(),
+            session,
+            &prepared.tokens,
+            &prepared.qualified_positions,
+            read_snap,
+        )
+    }
+
+    /// 読み取り先頭の文か（未修飾名を書き換えて解析してよい形。それ以外は検出だけ。Issue #3195）。
+    fn is_read_head(tokens: &[crate::sql::lexer::Token]) -> bool {
+        match tokens.first() {
+            Some(crate::sql::lexer::Token::Keyword(crate::sql::lexer::Keyword::Select)) => true,
+            Some(crate::sql::lexer::Token::Punct('(')) => true,
+            Some(crate::sql::lexer::Token::Ident(w)) => {
+                ["WITH", "VALUES", "TABLE", "EXPLAIN", "DECLARE"]
+                    .iter()
+                    .any(|k| w.eq_ignore_ascii_case(k))
+            }
+            _ => false,
+        }
     }
 
     /// [`Self::parse_tokens_gated`] の構文解析部（未束縛 `GRANT`／`REVOKE` のエラー正規化を持つ）。
@@ -8862,6 +9052,7 @@ impl EngineCore {
         // `bind_aggregate_with_dummy_flags`／`bind_projection_for_describe`／
         // `bind_scan_with_dummy_flags` の
         // いずれが呼ばれても同じ配列を共有する）。
+        self.reject_prepared_path_resolved_refs(session, prepared, None)?;
         Self::check_prepared_for_session(session, prepared)?;
         // SQL-40・Issue #1967: 権限の無い主体に列の型情報を返さない（fail-closed）。
         self.require_prepared_read_privileges(session, prepared, &prepared.dummy_parsed, None)?;
@@ -11266,6 +11457,7 @@ impl EngineCore {
     {
         let result = (|| {
             let snap = Self::describe_snapshot(txn)?;
+            self.reject_prepared_path_resolved_refs(session, prepared, snap)?;
             Self::check_prepared_for_session(session, prepared)?;
             // SQL-40・Issue #1967: 権限の無い主体に列の型情報を返さない（fail-closed）。
             self.require_prepared_read_privileges(session, prepared, &prepared.dummy_parsed, snap)?;
@@ -17055,7 +17247,7 @@ impl EngineCore {
         session: &crate::sql::mode::SessionState,
         sql: &str,
     ) -> Result<CopyPlan, crate::sql::allowlist::SqlSurfaceError> {
-        Self::check_copy_search_path(session, sql)?;
+        self.check_copy_search_path(ctx, session, sql, None)?;
         if let Some(plan) = self.begin_copy_temp(
             ctx,
             session,
@@ -17089,16 +17281,26 @@ impl EngineCore {
     /// `COPY` の未修飾テーブル参照に対する `search_path` の参照ゲート（TABLE-27・Issue #1715）。
     /// 実効 path に `public` が含まれる既定のセッションは字句解析もしない。字句解析に失敗する入力は
     /// 通常の検証へ任せる。
+    ///
+    /// Issue #3195: 未修飾の参照が `search_path` で自テナントの SCHEMA に解決される形は、`COPY` の実行が
+    /// その SCHEMA を扱えない（受け皿は #3196）ため、public 側へ黙って向けず固定文言の `0A000` にする。
     fn check_copy_search_path(
+        &self,
+        ctx: &PolicyContext,
         session: &crate::sql::mode::SessionState,
         sql: &str,
+        read_snap: Option<&redb::ReadTransaction>,
     ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
-        if !session.search_path_hides_public() {
+        if !(session.search_path_hides_public() || session.search_path_may_hold_tenant_schema()) {
             return Ok(());
         }
         let Ok(tokens) = crate::sql::lexer::tokenize_marked(sql) else {
             return Ok(());
         };
+        self.reject_path_resolved_refs(Some(ctx.tenant_id()), session, &tokens, &[], read_snap)?;
+        if !session.search_path_hides_public() {
+            return Ok(());
+        }
         crate::sql::search_path::check_unqualified_refs(session, &tokens, &[])
     }
 
@@ -17256,7 +17458,20 @@ impl EngineCore {
         txn: &mut crate::sql::transaction::SessionTransaction<'e>,
         sql: &str,
     ) -> Result<CopyPlan, crate::sql::allowlist::SqlSurfaceError> {
-        Self::check_copy_search_path(session, sql)?;
+        // 明示 Tx の途中（writer 取得前）は `COPY TO` の検証・実行と同じ `BEGIN` 時点のスナップショットで
+        // 安全弁を判定する（最新カタログだと BEGIN 後の DROP・RENAME で SCHEMA を飛ばし public 側へ向く）。
+        {
+            let snap = if txn.status() == crate::sql::transaction::TransactionStatus::InTransaction
+            {
+                match txn.read_source()? {
+                    crate::sql::transaction::TxnReadSource::BeginSnapshot(snap) => Some(snap),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            self.check_copy_search_path(ctx, session, sql, snap)?;
+        }
         if let Some(plan) = self.begin_copy_temp(ctx, session, Some(&mut *txn), sql)? {
             return Ok(plan);
         }
@@ -21203,6 +21418,60 @@ impl VectorCore for EngineCore {
         Ok(row)
     }
 }
+/// 未修飾名の `search_path` 解決（[`EngineCore::resolve_search_path_for_statement`]）の、解析後に判定する結果
+/// （Issue #3195）。判定順は構文 `42601` → 解決エラー（`42P01`）→ 未対応形の `0A000` → その他。
+#[derive(Debug, Default)]
+struct PathGate {
+    /// `42601` に劣後して返す解決エラー。
+    deferred: Option<crate::sql::allowlist::SqlSurfaceError>,
+    /// 書き換えて解析した読み取り先頭の文か。
+    read_head: bool,
+    /// 関係位置の参照が自テナントの SCHEMA に解決されたか。
+    relation_in_schema: bool,
+    /// 読み取り以外の文で、SCHEMA に解決される参照を検出したか（作成先・DML の対象の解決は #3196）。
+    detected_unsupported: bool,
+}
+
+impl PathGate {
+    /// 固定文言の `0A000`（参照名・SCHEMA 名を含めない）。
+    fn unsupported() -> crate::sql::allowlist::SqlSurfaceError {
+        crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
+            "unqualified references resolved through search_path into a schema are not supported in this statement",
+        )
+    }
+
+    /// 解析結果へ解決の判定を重ねる。構文エラー `42601` は常に優先し、解決エラー、未対応形の順で続く。
+    /// 読み取り先頭の文でも、解析の結果が読み取りではない（データ変更 CTE・`EXPLAIN` の DML 等）のに
+    /// SCHEMA へ書き換えていれば `0A000`（public 側を黙って読み書きさせない。fail-closed）。
+    fn finish(
+        self,
+        parsed: Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError>,
+    ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
+        if let Err(e) = &parsed {
+            if e.wire_code() == "42601" {
+                return parsed;
+            }
+        }
+        if let Some(e) = self.deferred {
+            return Err(e);
+        }
+        if self.detected_unsupported {
+            return Err(Self::unsupported());
+        }
+        let parsed = parsed?;
+        if self.read_head
+            && self.relation_in_schema
+            && matches!(
+                crate::sql::privilege_gate::read::classify(&parsed),
+                crate::sql::privilege_gate::read::ReadRequirement::NotApplicable
+            )
+        {
+            return Err(Self::unsupported());
+        }
+        Ok(parsed)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

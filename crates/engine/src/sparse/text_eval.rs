@@ -21,6 +21,9 @@
 //! 展開数は可視集合で df > 0 の語だけを数え、不可視テナントの語の存在を上限超過の有無から
 //! 推測させない（RLS-8）。時間差のサイドチャネルは既知の制約として設計記録に残す。
 //!
+//! 累積: グループ 1 つは追加の累積をせず `touched` 順のまま候補にする（`0.0 + s == s`）。
+//! 複数グループは `doc_idx` 昇順 run の 2 ポインタマージで、加算順は入力順のまま。確保量は可視文書数で有界。
+//!
 //! 計算量: 前方一致の展開は語幹の範囲の和集合を 1 回だけ走査し `O(V_ascii + Σ|postings|)`
 //! （語幹の数に比例して増えない）。グループの評価は同時に `ScorePass` を 1 つだけ保持する。
 
@@ -320,20 +323,41 @@ impl SparseIndex {
             }
         }
 
-        // グループの入力順に逐次評価し、文書ごとに加算する（加算順が決定的）。
-        let mut acc: BTreeMap<u32, f64> = BTreeMap::new();
-        for plan in &plans {
-            for (doc_idx, score) in self.eval_group(plan, &expansion, &bitmap, params)? {
-                *acc.entry(doc_idx).or_insert(0.0) += score;
+        // グループの入力順に評価し、文書ごとに加算する（加算順が決定的）。
+        // グループ 1 つなら旧実装の `0.0 + s` は `s` とビット一致する（`s` は有限かつ正）ため、
+        // 累積を挟まず `touched` 順のまま候補にする。`top` は `Candidate::Ord` で整列するので
+        // 候補の並びは出力に影響しない。
+        let invalid = || TextSearchError::InvalidParams {
+            k1: params.k1(),
+            b: params.b(),
+        };
+        let mut merged: Vec<(u32, f64)> = Vec::new();
+        let mut single: Vec<(u32, f64)> = Vec::new();
+        if let [plan] = plans.as_slice() {
+            single = self.eval_group(plan, &expansion, &bitmap, params)?;
+        } else {
+            // 複数グループ: doc_idx 昇順の run を入力順にマージ加算する。
+            // 文書ごとの加算順・初期値は従来の BTreeMap 版と同じ。確保量は可視文書数で有界。
+            for plan in &plans {
+                let mut run = self.eval_group(plan, &expansion, &bitmap, params)?;
+                run.sort_by_key(|&(d, _)| d);
+                // 空 run はマージ不要（既存 merged の再コピーを避ける）。merged が空なら run を
+                // そのまま移す（`0.0 + s` は有限・正の `s` とビット一致。非有限は後段で拒否される）。
+                if run.is_empty() {
+                    continue;
+                }
+                if merged.is_empty() {
+                    merged = run;
+                } else {
+                    merged = merge_add_sorted(&merged, &run);
+                }
             }
         }
-        let mut candidates = Vec::with_capacity(acc.len());
-        for (doc_idx, score) in acc {
+        let hits = if plans.len() == 1 { &single } else { &merged };
+        let mut candidates = Vec::with_capacity(hits.len());
+        for &(doc_idx, score) in hits {
             if !score.is_finite() {
-                return Err(TextSearchError::InvalidParams {
-                    k1: params.k1(),
-                    b: params.b(),
-                });
+                return Err(invalid());
             }
             if let Some(&doc_id) = self.doc_ids.get(doc_idx as usize) {
                 candidates.push(Candidate { score, doc_id });
@@ -461,7 +485,17 @@ impl SparseIndex {
         }
         // 前方一致の除外は展開語ごとに文書番号を積まず、ビットセットへ直接立てる
         // （保持量を展開語数ではなく文書数に比例させる）。
-        let mut excluded_bits: Vec<u64> = vec![0; self.doc_ids.len().div_ceil(64)];
+        // 除外が 1 つも無いグループではビットセットを確保しない（遅延確保）。
+        let has_excl_prefix = plan
+            .group
+            .clauses()
+            .iter()
+            .any(|c| matches!(c, Clause::Exclude(Excluded::Prefix(_))));
+        let mut excluded_bits: Option<Vec<u64>> = if has_excl_prefix || !excluded_docs.is_empty() {
+            Some(vec![0; self.doc_ids.len().div_ceil(64)])
+        } else {
+            None
+        };
         let mut excluded_stems: BTreeSet<Cow<'_, str>> = BTreeSet::new();
         for c in plan.group.clauses() {
             if let Clause::Exclude(Excluded::Prefix(stem)) = c {
@@ -476,14 +510,18 @@ impl SparseIndex {
                 if let Some(list) = self.postings.get(tid.0 as usize) {
                     for &(d, _) in list {
                         if bitmap.contains(d) {
-                            set_bit(&mut excluded_bits, d);
+                            if let Some(bits) = excluded_bits.as_mut() {
+                                set_bit(bits, d);
+                            }
                         }
                     }
                 }
             }
         }
-        for &d in &excluded_docs {
-            set_bit(&mut excluded_bits, d);
+        if let Some(bits) = excluded_bits.as_mut() {
+            for &d in &excluded_docs {
+                set_bit(bits, d);
+            }
         }
         drop(excluded_docs);
 
@@ -539,7 +577,10 @@ impl SparseIndex {
             if score <= 0.0 {
                 continue;
             }
-            if test_bit(&excluded_bits, doc_idx) {
+            if excluded_bits
+                .as_deref()
+                .is_some_and(|bits| test_bit(bits, doc_idx))
+            {
                 continue;
             }
             let all_required = required
@@ -555,6 +596,42 @@ impl SparseIndex {
 
 #[cfg(test)]
 mod tests;
+
+/// `doc_idx` 昇順の 2 列を 2 ポインタでマージし、同じ `doc_idx` は `acc + run` で加える。
+///
+/// 複数グループの累積用。加算は「累積側 + 新しい run 側」の順で、最初のグループは `0.0 + s`
+/// と同じ値になる（旧 BTreeMap 版と文書ごとにビット一致）。容量は両列の長さの和で有界。
+fn merge_add_sorted(acc: &[(u32, f64)], run: &[(u32, f64)]) -> Vec<(u32, f64)> {
+    let mut out = Vec::with_capacity(acc.len().saturating_add(run.len()));
+    let (mut i, mut j) = (0usize, 0usize);
+    loop {
+        match (acc.get(i), run.get(j)) {
+            (Some(&(da, sa)), Some(&(dr, sr))) => {
+                if da < dr {
+                    out.push((da, 0.0 + sa));
+                    i += 1;
+                } else if dr < da {
+                    out.push((dr, 0.0 + sr));
+                    j += 1;
+                } else {
+                    out.push((da, sa + sr));
+                    i += 1;
+                    j += 1;
+                }
+            }
+            (Some(&(da, sa)), None) => {
+                out.push((da, sa));
+                i += 1;
+            }
+            (None, Some(&(dr, sr))) => {
+                out.push((dr, 0.0 + sr));
+                j += 1;
+            }
+            (None, None) => break,
+        }
+    }
+    out
+}
 
 /// 文書番号 `d` のビットを立てる（範囲外は無視。ビットセットは文書数で確保済み）。
 fn set_bit(bits: &mut [u64], d: u32) {
