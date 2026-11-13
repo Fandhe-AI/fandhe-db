@@ -17297,9 +17297,13 @@ impl EngineCore {
             return Ok(plan);
         }
         let resolver = self.schema_resolver_for(ctx, session);
-        let mut copy_tokens =
-            crate::sql::relation_name::tokenize_resolved_with(sql, false, Some(&resolver))?;
-        self.resolve_copy_tokens_path(ctx.tenant_id(), session, &mut copy_tokens, None)?;
+        // 未修飾名の解決は修飾名の解決より前（明示修飾 `public.t` を再解決しない。Issue #3196）。
+        let copy_tokens = crate::sql::relation_name::tokenize_resolved_with_pre(
+            sql,
+            false,
+            Some(&resolver),
+            |t| self.resolve_copy_tokens_path(ctx.tenant_id(), session, t, None),
+        )?;
         let stmt = crate::sql::allowlist::validate_copy_tokens(
             &copy_tokens,
             &self.storage,
@@ -17542,9 +17546,8 @@ impl EngineCore {
             return Ok(plan);
         }
         let resolver = self.schema_resolver_for(ctx, session);
-        let mut copy_tokens =
-            crate::sql::relation_name::tokenize_resolved_with(sql, false, Some(&resolver))?;
-        {
+        // 未修飾名の解決は修飾名の解決より前（明示修飾 `public.t` を再解決しない。Issue #3196）。
+        let copy_tokens = {
             let snap = if txn.status() == crate::sql::transaction::TransactionStatus::InTransaction
             {
                 match txn.read_source()? {
@@ -17554,8 +17557,13 @@ impl EngineCore {
             } else {
                 None
             };
-            self.resolve_copy_tokens_path(ctx.tenant_id(), session, &mut copy_tokens, snap)?;
-        }
+            crate::sql::relation_name::tokenize_resolved_with_pre(
+                sql,
+                false,
+                Some(&resolver),
+                |t| self.resolve_copy_tokens_path(ctx.tenant_id(), session, t, snap),
+            )?
+        };
         // `COPY FROM`（書き込み）の検証・schema lookup は読み取りではないので読み取り集合へ記録しない
         // （記録すると write-only の COPY が先行 read 扱いになり、BEGIN 後の可視 commit で `40001` に
         // なる。#2405。`LOCK TABLE` の存在確認・INSERT の writer 先取りと同じ扱い）。関数末尾まで有効。

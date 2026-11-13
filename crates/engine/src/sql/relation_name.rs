@@ -1163,6 +1163,18 @@ pub(crate) fn tokenize_resolved_with(
     marked: bool,
     resolver: Option<SchemaResolver<'_>>,
 ) -> Result<Vec<Token>, SqlSurfaceError> {
+    tokenize_resolved_with_pre(sql, marked, resolver, |_| Ok(()))
+}
+
+/// [`tokenize_resolved_with`] に、修飾名の解決（`public.t` の修飾除去・SCHEMA 修飾の内部キー化）の直前で
+/// 字句列へ掛ける処理 `pre` を加えた版。`COPY` が `search_path` による未修飾名の解決を、明示修飾
+/// （`public.t` 等。この時点では `QualifiedIdent` のまま）を再解決しない順序で行うために使う（Issue #3196）。
+pub(crate) fn tokenize_resolved_with_pre(
+    sql: &str,
+    marked: bool,
+    resolver: Option<SchemaResolver<'_>>,
+    pre: impl FnOnce(&mut [Token]) -> Result<(), SqlSurfaceError>,
+) -> Result<Vec<Token>, SqlSurfaceError> {
     let tokens = if marked {
         crate::sql::lexer::tokenize_marked(sql)?
     } else {
@@ -1170,6 +1182,7 @@ pub(crate) fn tokenize_resolved_with(
     };
     // 標準 SQL の行数制限句（`FETCH FIRST n ROWS ONLY` 等）を正規形へ書き換える（Issue #1793）。
     let mut tokens = crate::sql::fetch_clause::normalize_statement_tokens(tokens)?;
+    pre(&mut tokens)?;
     rewrite_relation_names(&mut tokens, resolver)?;
     Ok(tokens)
 }

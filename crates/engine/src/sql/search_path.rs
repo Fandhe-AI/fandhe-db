@@ -867,7 +867,7 @@ struct CreationResolution {
 /// 自テナントの SCHEMA なら内部キー（`#<schema_id>.<name>`）へ置き換える対象として返す（Issue #3196）。
 /// 修飾名 `q1.t` の解決後と同じトークン列になるので、以降の ACL・実行は修飾形と同じ経路に乗る。
 ///
-/// 解決しない（`None`）形: 作成名が未修飾の `Ident` ではない・一時表の作成・MATERIALIZED VIEW・構文語と
+/// 解決しない（`None`）形: 作成名が未修飾の `Ident` ではない・MATERIALIZED VIEW・構文語と
 /// 衝突する名前・作成先の判定が `42501`／`3F000`／`0A000` になる形。最後の 3 つは解析時には返さず、実行腕の
 /// `require_creation_target` が同じエラーを（権限ゲート `42501` の後に）再現する。他の照会エラーは伝播する。
 fn resolve_creation_name(
@@ -877,7 +877,6 @@ fn resolve_creation_name(
 ) -> Result<Option<CreationResolution>, SqlSurfaceError> {
     if !session.search_path_may_hold_tenant_schema()
         || !matches!(tokens.first(), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("CREATE"))
-        || crate::sql::allowlist::is_create_temp_table_statement(tokens)
     {
         return Ok(None);
     }
@@ -901,20 +900,27 @@ fn resolve_creation_name(
     if name.starts_with('#') || crate::sql::relation_name::collides_with_syntax_word(name) {
         return Ok(None);
     }
-    let target = match creation_target(session, lookup.creation_schema_id) {
-        Ok(t) => t,
-        Err(e) if ["42501", "3F000", "0A000"].contains(&e.wire_code()) => return Ok(None),
-        Err(e) => return Err(e),
-    };
-    let key = match target {
-        CreateTarget::Public => None,
-        CreateTarget::Schema(schema_id) => Some(
-            RelationKey::InSchema {
-                schema_id,
-                name: name.clone(),
-            }
-            .encode(),
-        ),
+    // 一時表の作成は pg_temp に作るので作成名は書き換えない（`key: None`）。ただし自己参照
+    // `REFERENCES <同名>` は新しい一時表を指すため、path 前方の同名の永続表へ解決しないよう位置を返す。
+    let is_temp = crate::sql::allowlist::is_create_temp_table_statement(tokens);
+    let key = if is_temp {
+        None
+    } else {
+        let target = match creation_target(session, lookup.creation_schema_id) {
+            Ok(t) => t,
+            Err(e) if ["42501", "3F000", "0A000"].contains(&e.wire_code()) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        match target {
+            CreateTarget::Public => None,
+            CreateTarget::Schema(schema_id) => Some(
+                RelationKey::InSchema {
+                    schema_id,
+                    name: name.clone(),
+                }
+                .encode(),
+            ),
+        }
     };
     // 自己参照 FK は `CREATE TABLE` の `REFERENCES <作成名>` だけ（ビュー・SEQUENCE には無い）。
     let create_table = tokens

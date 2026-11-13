@@ -1200,6 +1200,71 @@ fn non_read_statements_resolve_into_the_path_schema() {
     assert_eq!(ids(&core, &mut s, "SELECT id FROM t LIMIT 100"), vec![1]);
 }
 
+/// 明示修飾 `public.t` の `COPY` は、path の前方に同名の `q1.t` があっても public.t を対象にする
+/// （修飾を外した後で未修飾名として再解決しない。Issue #3196）。自動コミット・明示 Tx の両方で、
+/// `TO STDOUT`・`FROM STDIN`・`COPY (SELECT ...)` の 3 形を確かめる。
+#[test]
+fn copy_keeps_explicit_public_qualification() {
+    let (core, _g, mut s) = q1_world("sp-copy-public-qualified");
+    ok(&core, &mut s, "SET search_path TO q1, public");
+    let c = ctx(TENANT);
+    let rows = |plan: engine::core::CopyPlan| match plan {
+        engine::core::CopyPlan::To(_, r, _) => r.rows.len(),
+        _ => panic!("expected a COPY TO plan"),
+    };
+    let table = |plan: engine::core::CopyPlan| match plan {
+        engine::core::CopyPlan::From(sess) => sess.table().to_string(),
+        _ => panic!("expected a COPY FROM plan"),
+    };
+    let to_sqls = [
+        ("COPY public.t TO STDOUT", 1usize),
+        ("COPY (SELECT id FROM public.t LIMIT 5) TO STDOUT", 1),
+        ("COPY t TO STDOUT", 2),
+        ("COPY (SELECT id FROM t LIMIT 5) TO STDOUT", 2),
+    ];
+    let mut txn = core.new_session_transaction();
+    core.execute_sql_in_txn(&c, &mut s, &mut txn, "BEGIN")
+        .expect("begin");
+    for (sql, n) in to_sqls {
+        assert_eq!(rows(core.begin_copy(&c, &s, sql).expect(sql)), n, "{sql}");
+        assert_eq!(
+            rows(core.begin_copy_in_txn(&c, &s, &mut txn, sql).expect(sql)),
+            n,
+            "txn {sql}"
+        );
+    }
+    let public_from = table(
+        core.begin_copy(&c, &s, "COPY public.t (id, name) FROM STDIN")
+            .expect("copy from public"),
+    );
+    let bare_from = table(
+        core.begin_copy(&c, &s, "COPY t (id, name) FROM STDIN")
+            .expect("copy from path"),
+    );
+    assert_ne!(public_from, bare_from, "public.t must not resolve to q1.t");
+    let public_txn = table(
+        core.begin_copy_in_txn(&c, &s, &mut txn, "COPY public.t (id, name) FROM STDIN")
+            .expect("txn copy from public"),
+    );
+    assert_eq!(public_txn, public_from);
+}
+
+/// `CREATE TEMP TABLE t (.. REFERENCES t ..)` の自己参照は、path 前方の永続表 `q1.t` ではなく新しい
+/// 一時表を指す（Issue #3196）。
+#[test]
+fn temp_table_self_reference_ignores_persistent_table_in_path() {
+    let (core, _g, mut s) = q1_world("sp-temp-self-fk");
+    ok(&core, &mut s, "SET search_path TO q1, public");
+    // 自己参照は一時表同士の FK として扱われ（未対応で `0A000`）、q1.t への FK へ化けない。
+    let (c, msg) = err(
+        &core,
+        &mut s,
+        "CREATE TEMP TABLE t (id BIGINT PRIMARY KEY, parent BIGINT REFERENCES t (id))",
+    );
+    assert_eq!(c, "0A000");
+    assert!(msg.contains("between temporary tables"), "{msg}");
+}
+
 /// 未修飾の作成・DML・DDL が、path の先頭の SCHEMA だけで完結する（public に同名が無い構成）。
 #[test]
 fn create_and_dml_complete_inside_the_path_schema() {
