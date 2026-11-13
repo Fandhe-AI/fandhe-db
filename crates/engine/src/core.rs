@@ -6377,19 +6377,45 @@ impl EngineCore {
     ) -> Result<T, crate::sql::allowlist::SqlSurfaceError> {
         use crate::sql::search_path::NameKind;
         let lazy: std::cell::RefCell<Option<redb::ReadTransaction>> = std::cell::RefCell::new(None);
-        let schema_id = |name: &str| {
-            let Some(id) = self
-                .storage
-                .schema_id(tenant, name)
-                .map_err(crate::catalog::table_lookup_error)?
-            else {
-                return Ok(None);
+        // 存在判定・SCHEMA の ID・USAGE の 3 つとも同じ読み取り源（`read_snap`、無ければ文ごとの lazy txn）で
+        // 引く。混在させると BEGIN 後の RENAME・DROP SCHEMA・REVOKE で SCHEMA を飛ばし public の別表を返す。
+        let with_snap =
+            |op: &dyn Fn(
+                &redb::ReadTransaction,
+            )
+                -> Result<Option<u64>, crate::sql::allowlist::SqlSurfaceError>|
+             -> Result<Option<u64>, crate::sql::allowlist::SqlSurfaceError> {
+                if let Some(snap) = read_snap {
+                    return op(snap);
+                }
+                let mut slot = lazy.borrow_mut();
+                if slot.is_none() {
+                    *slot = Some(self.begin_read_txn()?);
+                }
+                match slot.as_ref() {
+                    Some(snap) => op(snap),
+                    None => Err(crate::sql::allowlist::SqlSurfaceError::Internal {
+                        detail: "search_path lookup snapshot unavailable".to_string(),
+                    }),
+                }
             };
-            match self.check_schema_usage_for(tenant, session, id) {
-                Ok(()) => Ok(Some(id)),
-                Err(crate::sql::allowlist::SqlSurfaceError::InsufficientPrivilege) => Ok(None),
-                Err(e) => Err(e),
-            }
+        let schema_id = |name: &str| {
+            with_snap(&|snap| {
+                let Some(id) = crate::catalog::namespace::schema_id_in_txn(snap, tenant, name)
+                    .map_err(crate::catalog::table_lookup_error)?
+                else {
+                    return Ok(None);
+                };
+                let usage = crate::sql::schema_privilege::check_schema_usage(session, &|role| {
+                    crate::catalog::privilege::schema_privileges_in_txn(snap, tenant, id, &[role])
+                        .map_err(crate::catalog::table_lookup_error)
+                });
+                match usage {
+                    Ok(()) => Ok(Some(id)),
+                    Err(crate::sql::allowlist::SqlSurfaceError::InsufficientPrivilege) => Ok(None),
+                    Err(e) => Err(e),
+                }
+            })
         };
         let exists = |key: &str, kind: NameKind| {
             let probe = |src: &redb::ReadTransaction| match kind {

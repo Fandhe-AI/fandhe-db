@@ -899,6 +899,44 @@ fn unqualified_reads_resolve_into_the_path_schema() {
     assert!(!msg.contains('#'), "{msg}");
 }
 
+/// 明示 Tx の `BEGIN` 後に別セッションが SCHEMA を改名・DROP しても、SCHEMA の ID 解決も存在判定と
+/// 同じスナップショットで行い、public へ誤って落ちない（Issue #3195 レビュー指摘）。
+#[test]
+fn snapshot_txn_resolves_path_schema_from_the_begin_snapshot() {
+    for ddl in ["ALTER SCHEMA q1 RENAME TO q9", "DROP SCHEMA q1 CASCADE"] {
+        let (core, _g, mut s) = q1_world("sp-read-snap-schema");
+        ok(&core, &mut s, "SET search_path TO q1, public");
+        let c = ctx(TENANT);
+        let mut txn = core.new_session_transaction();
+        core.execute_sql_in_txn(&c, &mut s, &mut txn, "BEGIN")
+            .expect("begin");
+        // BEGIN 後に別セッションが q1 を変更して commit する。
+        let mut other = ddl_session();
+        ok(&core, &mut other, ddl);
+        match core
+            .execute_sql_in_txn(&c, &mut s, &mut txn, "SELECT id FROM t LIMIT 100")
+            .expect("select in txn")
+        {
+            SqlOutcome::Query(r) => {
+                let mut v: Vec<i64> = r
+                    .rows
+                    .iter()
+                    .map(|row| match &row.cells[0] {
+                        Cell::Integer(u) => i64::try_from(*u).expect("fits"),
+                        Cell::SignedInteger(i) => *i,
+                        other => panic!("not an integer cell: {other:?}"),
+                    })
+                    .collect();
+                v.sort_unstable();
+                assert_eq!(v, vec![10, 20], "{ddl}: must read the snapshot q1.t");
+            }
+            other => panic!("expected Query, got {other:?}"),
+        }
+        core.execute_sql_in_txn(&c, &mut s, &mut txn, "ROLLBACK")
+            .expect("rollback");
+    }
+}
+
 #[test]
 fn path_elements_are_resolved_in_order() {
     let (core, _g, mut s) = q1_world("sp-read-order");
