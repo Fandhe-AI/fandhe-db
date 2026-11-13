@@ -101,7 +101,10 @@ RLS-7 の暗黙適用がそのまま効く。カーソルは接続ごとの `Ses
   `FOR` より後のトークン列は再トークナイズせず
   `sql::allowlist::validate_sql_tokens` へそのまま渡す（第 2 のパーサを
   作らない設計）。受理する内側 `SELECT` は集計 `SELECT`（SQL-13・SQL-14）・
-  広域取得 `SELECT`（SQL-15）のみ。ベクトル順位付けの検索 `SELECT`・
+  広域取得 `SELECT`（SQL-15）・CTE 入力を持たない JOIN `SELECT`（Issue #3175。
+  INNER／OUTER／CROSS／NATURAL／USING・集計形・`LIMIT` 省略形〔SQL-34〕）のみ。
+  CTE を入力に持つ JOIN・集合演算・CTE は #3176 の範囲として `42601`。
+  ベクトル順位付けの検索 `SELECT`・
   `EXPLAIN`・`SET`／`CREATE FUNCTION` は許可形状に一致せず `42601`。
   `SCROLL`／`NO SCROLL`／`BINARY`／`INSENSITIVE`／`ASENSITIVE`／`WITH HOLD`／
   `WITHOUT HOLD` はいずれも `42601`（規範形のみ受理。`name` の直後が必ず
@@ -116,9 +119,16 @@ RLS-7 の暗黙適用がそのまま効く。カーソルは接続ごとの `Ses
   通常の広域取得 `SELECT` と同じ経路を通るため、FROM がビュー（TABLE-18・
   SQL-23）を指す場合も同じビュー展開（基底テーブル＋ビュー由来述語・列スコープ
   検査）が適用され、RLS は参照セッション自身の `PolicyContext` で暗黙適用される
-  （§3）。同一トランザクション内の dirty 判定もビュー展開後の基底テーブル
-  名で行う（PR #1049 レビュー指摘対応。Issue #1179 で `0A000` 拒否から未 commit
-  変更の反映へ変更）。
+  （§3）。読み取り源（`BEGIN` 時点のスナップショット／共有 write txn／確定状態）は
+  `SessionTransaction::read_source` の三分岐で選ぶ（Issue #1179 で `0A000` 拒否から
+  未 commit 変更の反映へ変更）。
+- **JOIN の内側（Issue #3175）**: 実行は通常の SELECT と同じ `sql::join` の実行器
+  （参照セッション自身の `PolicyContext` を各辺へ独立に適用）を使い、第 2 の実行器を作らない。
+  カーソルの残容量（§1）は JOIN の累計バイト予算の上限として渡し、生成中に打ち切る
+  （`sql::join::execute_with_result_byte_cap`）。JOIN の予算は中間行も計上するため、
+  カーソル内の JOIN は通常の SELECT より早く `54000` に達しうる（安全側の差）。
+  リレーション数・入出力行数・比較回数・結果行数の上限は起動時設定のまま。
+  SELECT 権限（#1967）は全 relation を `DECLARE` の時点で検査し、`FETCH` では再検査しない。
 - **`FETCH`**（Issue #3173）: 受理するのは `FETCH [ NEXT | [FORWARD] <n> ] { FROM | IN } <name>`。
   `NEXT` は 1 件、`IN` は `FROM` の別名、`FORWARD` の後ろは件数必須。件数は `NEXT`
   を含め `sql::parser::validate_search_limit_with`（`1..=MAX_SEARCH_K`）を通す。
@@ -240,6 +250,9 @@ execute_portal`）で以下の 2 つを portal へ束縛し、再開前に突き
   `MOVE`、二重引用符のカーソル名（psycopg 3 の `ServerCursor` はこの形式を
   使うため非対応になる）。
 - ベクトル順位付けの `SELECT`（SQL-1〜4）のカーソル化（WIRE-15 の対象外）。
+- 内側が集合演算・CTE（CTE 入力の JOIN を含む）の `DECLARE`（#3176）、評価後射影形ビュー
+  （JOIN 本文のビュー・派生表）の `DECLARE`（`42601` のまま）。一時表を含む `DECLARE` は
+  一時表の振り分け経路の対象外で受理されない（fail-closed）。
 - スカラー `ORDER BY`（SQL-25 (a)。未実装）の形のカーソル化。`OFFSET`
   （SQL-25 (b)・TASK-209、Issue #916）は広域取得・`GROUP BY` 集計の `LIMIT`
   経由で実装済みで、本カーソル経路（`bind_scan`／`bind_group_by_clause` を
