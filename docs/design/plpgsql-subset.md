@@ -1009,7 +1009,7 @@ Issue #2228 の内部 API（`invoke_trigger_function_in_txn`）は両方を要�
 
 | 文 | 扱い |
 | -- | ---- |
-| `FROM` なしの `SELECT`（式評価・条件） | 実行（ルーチン呼び出しを含むものは `0A000`） |
+| `FROM` なしの `SELECT`（式評価・条件） | 実行（派生セッションは UDF を持たないため、ルーチン呼び出しは未定義関数として `42883` で失敗する。fail-closed） |
 | `INSERT ... VALUES`（単一行・複数行） | 実行。SQL `INSERT` と同じ束縛・実行関数を通す。行数・バッチの上限は通常と同じ。入れ子の発火には束縛済みの通過証を引き継ぐ（深さ上限 `54001`） |
 | `UPDATE`／`DELETE`・表を読む `SELECT`（`SELECT INTO`・`PERFORM`・`FOR` を含む） | `0A000`。窓口の拡張は #3186・#3187 |
 | `INSERT` の `ON CONFLICT`・`RETURNING`・`INSERT ... SELECT`・ビュー・データ変更 CTE・SCHEMA 修飾の書き込み先・一時表への振り分け | `0A000`（許可リストに無い形。既知の差） |
@@ -1029,8 +1029,8 @@ Issue #2228 の内部 API（`invoke_trigger_function_in_txn`）は両方を要�
 ### 既知の差・対象外
 
 - `UPDATE`／`DELETE`・表を読む `SELECT`: #3186・#3187（窓口の拡張）
-- 一時表・SCHEMA 修飾の書き込み先・`ON CONFLICT`・`RETURNING`・`INSERT ... SELECT`・ビュー・本体からのルーチン呼び出し:
-  本 Issue では `0A000`（受け皿の Issue は無い。要対応事項）
+- 一時表・SCHEMA 修飾の書き込み先・`ON CONFLICT`・`RETURNING`・`INSERT ... SELECT`・ビュー:
+  本 Issue では `0A000`（本体からのルーチン呼び出しは上記のとおり `42883`）（受け皿の Issue は無い。要対応事項）
 - 書き込み後の `EXCEPTION` 捕捉は `0A000`（上記）
 - 構文解析は確定済みのカタログで行う。同じ Tx 内で作ったばかりの表を本体が参照すると、解析段で不在になる（fail-closed）
 - 本体は発火のたびに解析・検証する（キャッシュなし。性能は本 Issue の対象外）

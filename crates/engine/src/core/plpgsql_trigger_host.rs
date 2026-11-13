@@ -65,6 +65,18 @@ impl Drop for BodyParseScope {
     }
 }
 
+/// 本体の `INSERT` が張った採番文脈の破棄後に、外側の文の払い出し値の記録を戻す RAII ガード。
+/// `SequenceScope` より先に宣言して使う（drop は宣言の逆順）。
+struct RestoreAssigned(Option<Vec<(usize, usize, i64)>>);
+
+impl Drop for RestoreAssigned {
+    fn drop(&mut self) {
+        for (row, col, v) in self.0.take().unwrap_or_default() {
+            crate::sql::sequence_scope::record_assigned(row, col, v);
+        }
+    }
+}
+
 fn unsupported(detail: &str) -> SqlSurfaceError {
     SqlSurfaceError::feature_not_supported(detail)
 }
@@ -168,6 +180,7 @@ impl EngineCore {
         &self,
         handle: &TriggerWriteHandle<'_>,
         ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
         stmt: &ValidatedInsert,
     ) -> Result<crate::sql::exec::InsertOutcome, SqlSurfaceError> {
         // 窓口が受けない形（`insert_row` と同じく、SCHEMA 修飾の内部キー・`ON CONFLICT`・`RETURNING`）。
@@ -181,6 +194,30 @@ impl EngineCore {
         // スキーマは外側と同じ write txn から読む（同じ Tx 内の DDL を取り込む）。
         let schema = handle.table_schema(&stmt.table_name)?;
         let _sparsevec_limits_scope = self.sparsevec_limits_scope();
+        // 通常の `INSERT` と同じ契約で、束縛前に既定時刻の文脈を張る。外側の文が張った時刻（`INSERT` の
+        // 既定時刻・式スコープの時刻）があれば引き継ぎ、無ければ（`UPDATE`／`DELETE` 等）ここで確定する。
+        let clock = match crate::sql::time_fn::current_default_clock()
+            .or_else(crate::sql::time_fn::current_clock)
+        {
+            Some(c) => c,
+            None => {
+                let now = crate::sql::time_fn::now_micros()?;
+                crate::sql::time_fn::StatementClock {
+                    txn_start_micros: now,
+                    stmt_start_micros: now,
+                }
+            }
+        };
+        let _default_clock_scope = crate::sql::time_fn::DefaultClockScope::enter(clock);
+        // 採番の文脈（`nextval`・`id` 省略）は派生セッションの採番状態と発火元ロールで張る。外側の文が
+        // 払い出した値の記録（`RETURNING` 用）は張り直しで消えるため、退避して戻す。
+        // 先に宣言したガードが後に drop されるため、`SequenceScope` の破棄の後に戻る。
+        let _restore_assigned = RestoreAssigned(Some(crate::sql::sequence_scope::take_assigned()));
+        let _sequence_scope = crate::sql::sequence_scope::SequenceScope::enter(
+            std::sync::Arc::clone(self.storage.sequence_allocator()),
+            session.sequences_handle(),
+            crate::sql::schema_privilege::acl_checked_principal(session),
+        );
         let bound = crate::sql::parser::bind_insert_form(stmt, &schema)?;
         let runtime = self.trigger_runtime.bind(self);
         handle.run_insert(&stmt.table_name, |target| match bound {
@@ -242,7 +279,8 @@ impl CorePlHost<'_, '_> {
         let writes = self.gate_parsed(&parsed)?;
         match parsed {
             // `FROM` なしの定数式 `SELECT`（式評価・条件の `where_probe`）。表を読まず、ルーチン呼び出しも
-            // 含まない形に限る。
+            // 含まない形に限る。派生セッションの UDF 登録は空なので、ルーチン呼び出しは解析段で `42883` になる
+            // （fail-closed。下の判定は登録が非空になる将来の変更への保険）。
             ParsedSql::Statement(Statement::ConstSelect(validated)) if !writes => {
                 if crate::sql::const_select::calls_routine(&validated, self.session.udfs()) {
                     return Err(unsupported(BODY_UNSUPPORTED));
@@ -259,7 +297,7 @@ impl CorePlHost<'_, '_> {
                     b.write_attempts = b.write_attempts.saturating_add(1);
                 }
                 self.core
-                    .execute_trigger_insert(handle, self.ctx, &stmt)
+                    .execute_trigger_insert(handle, self.ctx, self.session, &stmt)
                     .map(CoreOutcome::Insert)
             }
             // `UPDATE`／`DELETE`・表を読む `SELECT`・`INSERT ... SELECT`・ビュー・データ変更 CTE・一時表への

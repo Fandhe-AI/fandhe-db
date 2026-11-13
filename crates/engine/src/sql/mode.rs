@@ -310,7 +310,7 @@ impl SessionState {
     /// 発火点（`trigger::fire`）はセッションを持たないため、文の実行入口が `trigger::subject` の区間へこの
     /// 写しを張り、`EngineCore` のトリガ用ホストが読む。ロール・権限・`search_path`・TimeZone・一時カタログ・
     /// `row_security`・解決テナントは発火元のまま引き継ぎ（権限を広げも狭めもしない）、セッションの宣言的
-    /// UDF だけは持ち込まない（本体からのルーチン呼び出しは `0A000`）。全フィールドを明示的に列挙して
+    /// UDF だけは持ち込まない（本体からのルーチン呼び出しは未定義関数の `42883` で失敗する）。全フィールドを明示的に列挙して
     /// いるため、フィールドを足すとここがコンパイルエラーになり、引き継ぎの要否を決める必要がある。
     pub(crate) fn trigger_subject_snapshot(&self) -> SessionState {
         let Self {

@@ -646,3 +646,29 @@ fn body_writes_are_checked_against_the_firing_role() {
     assert_eq!(alice_code("INSERT INTO tt (n) VALUES (1)"), "ok");
     assert_eq!(audit_count(&core, "t1"), 1);
 }
+
+// 外側が DELETE でも、本体の INSERT は通常の INSERT と同じく採番文脈（`nextval`）と既定時刻の文脈
+// （VALUES の `now()`）を持つ（PR #3369 レビュー指摘）。
+#[test]
+fn body_insert_has_sequence_and_clock_scopes_when_outer_is_delete() {
+    let (core, _g) = core_with("trginv-scopes", LedgerMode::Optional);
+    ok(&core, "t1", "CREATE TABLE tt (n INTEGER)");
+    ok(&core, "t1", "CREATE TABLE audit (n INTEGER, ts TIMESTAMP)");
+    ok(&core, "t1", "CREATE SEQUENCE aq");
+    create_fn(
+        &core,
+        "t1",
+        "del_audit",
+        "BEGIN INSERT INTO audit (n, ts) VALUES (nextval('aq'), now()); RETURN NULL; END",
+    );
+    ok(
+        &core,
+        "t1",
+        "CREATE TRIGGER t_del AFTER DELETE ON tt FOR EACH ROW EXECUTE FUNCTION del_audit()",
+    );
+    ok(&core, "t1", "INSERT INTO tt (n) VALUES (1)");
+    ok(&core, "t1", "INSERT INTO tt (n) VALUES (2)");
+    ok(&core, "t1", "DELETE FROM tt WHERE n = 1");
+    ok(&core, "t1", "DELETE FROM tt WHERE n = 2");
+    assert_eq!(ints(&core, "t1", "SELECT n FROM audit"), vec![1, 2]);
+}
