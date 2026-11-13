@@ -261,7 +261,7 @@ impl JoinPlan<'_> {
 }
 
 /// 解決済み列参照を、そのテーブルの列名（疑似列 `id` を含む）へ写像する。
-fn slot_name(slot: ColumnSlot, schema: &TableSchema) -> Result<String, SqlSurfaceError> {
+pub(super) fn slot_name(slot: ColumnSlot, schema: &TableSchema) -> Result<String, SqlSurfaceError> {
     match slot {
         ColumnSlot::Id => Ok("id".to_string()),
         ColumnSlot::Column(idx) => {
@@ -615,7 +615,7 @@ fn leaf_to_where(
 
 /// 単一 relation で完結し列同士の比較を含まない式を、非修飾の [`WherePredicate`] 列へ
 /// 変換する（`OR` は分岐ごとの `Vec` を持つ [`WherePredicate::Or`]）。
-fn to_where_predicates(
+pub(super) fn to_where_predicates(
     expr: &JoinWhereExpr,
     scope: &JoinScope<'_>,
     schemas: &[&TableSchema],

@@ -1038,3 +1038,64 @@ fn parse_sql_carries_statement_hash_without_operation_id() {
     assert_eq!(del(&d1), del_hash(DEL_SQL));
     assert_ne!(del(&d1), upd(&u1));
 }
+
+/// SQL 文字列を構文・束縛・変換（Issue #3201）に通して結合 DML の実行入力にする。dispatch（#3202）が
+/// 結線されるまでの間、変換器の出力が実行器でそのまま動くことを engine 内で検証するための入口。
+fn plan_from_sql(core: &EngineCore, sql: &str) -> JoinedDmlPlan {
+    use crate::core::ParsedSql;
+    let session = SessionState::default();
+    match core.parse_sql(sql).expect("parse") {
+        ParsedSql::UpdateFrom(s) => core
+            .plan_update_from_stmt(&s, session.udfs())
+            .expect("plan update"),
+        ParsedSql::DeleteUsing(s) => core
+            .plan_delete_using_stmt(&s, session.udfs())
+            .expect("plan delete"),
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+#[test]
+fn converted_update_from_sql_matches_the_hand_built_plan() {
+    // 末尾 `;`（psql の入力）の有無で結果が変わらない。
+    for sql in [UPD_SQL.to_string(), format!("{UPD_SQL};")] {
+        let (core, _g, alice) = setup();
+        let plan = plan_from_sql(&core, &sql);
+        let out = exec(&core, &alice, &plan).expect("update");
+        assert_eq!(out.rows_affected, 2);
+        assert_eq!(xs(&core, &alice), vec![(1, 100), (2, 300), (3, 30)]);
+    }
+}
+
+#[test]
+fn converted_delete_using_sql_matches_the_hand_built_plan() {
+    let (core, _g, alice) = setup();
+    let plan = plan_from_sql(&core, &format!("{DEL_SQL};"));
+    let out = exec(&core, &alice, &plan).expect("delete");
+    assert_eq!(out.rows_affected, 2);
+    assert_eq!(xs(&core, &alice), vec![(3, 30)]);
+}
+
+#[test]
+fn converted_plan_applies_source_side_predicates() {
+    let (core, _g, alice) = setup();
+    let plan = plan_from_sql(
+        &core,
+        "UPDATE t SET x = s.v FROM s WHERE t.k = s.k AND s.v = '200'",
+    );
+    let out = exec(&core, &alice, &plan).expect("update");
+    // source は (a,200) だけが残るので、k = a の対象行 1 件だけが更新される。
+    assert_eq!(out.rows_affected, 1);
+    assert_eq!(xs(&core, &alice), vec![(1, 200), (2, 20), (3, 30)]);
+}
+
+#[test]
+fn converted_plan_ignores_other_tenants_private_source_rows() {
+    let (core, _g, alice) = setup();
+    // bob の Private な source 行は alice の一致に効かない（変換は RLS を緩めない）。
+    seed_s(&core, &ctx("bob"), 10, "c", 999);
+    let plan = plan_from_sql(&core, UPD_SQL);
+    let out = exec(&core, &alice, &plan).expect("update");
+    assert_eq!(out.rows_affected, 2);
+    assert_eq!(xs(&core, &alice), vec![(1, 100), (2, 300), (3, 30)]);
+}

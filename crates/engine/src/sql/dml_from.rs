@@ -7,7 +7,8 @@
 //! 全参照への RLS 適用と `RETURNING` は #1756、台帳の content_hash は #1757（構文段で算出済み）で、
 //! 本 Issue の範囲では束縛を通った文も実行腕が `0A000` で止める（副作用ゼロ）。
 //!
-//! 呼び出し元: `core/dml_from_exec.rs`（autocommit・明示トランザクション・Describe の各腕）。
+//! 呼び出し元: `core/dml_from_exec.rs`（autocommit・明示トランザクション・Describe の各腕）と、
+//! 束縛結果を `JoinedDmlPlan` へ変換する `sql::join::dml_plan`（Issue #3201）。
 //!
 //! 列解決の契約（`BindingScope::resolve` と同じ）:
 //! - 修飾子が公開名（別名があれば別名）に一致しない → `42P01`（カタログを引かないので存在オラクルに
@@ -39,6 +40,7 @@ pub struct BoundUpdateFrom {
     set_columns: Vec<(usize, ResolvedColumn)>,
     set_literals: Vec<(usize, Value)>,
     set_exprs: Vec<(usize, BoundSetExpr)>,
+    where_clause: Option<JoinWhereExpr>,
     operation_id: Option<OperationId>,
 }
 
@@ -69,6 +71,16 @@ impl BoundUpdateFrom {
         self.set_exprs.len()
     }
 
+    /// 束縛に使った `WHERE` の論理木（変換器 `sql::join::dml_plan` が conjunct を振り分ける）。
+    pub(crate) fn where_clause(&self) -> Option<&JoinWhereExpr> {
+        self.where_clause.as_ref()
+    }
+
+    /// 対象表の列だけを使う式・`DEFAULT` の SET 項目（(対象表の列添字, 束縛済み式)）。
+    pub(crate) fn set_exprs(&self) -> &[(usize, BoundSetExpr)] {
+        &self.set_exprs
+    }
+
     /// 検証済みの `operation_id`。
     pub fn operation_id(&self) -> Option<&OperationId> {
         self.operation_id.as_ref()
@@ -81,10 +93,16 @@ impl BoundUpdateFrom {
 pub struct BoundDeleteUsing {
     relations: Vec<TableRef>,
     where_columns: Vec<ResolvedColumn>,
+    where_clause: Option<JoinWhereExpr>,
     operation_id: Option<OperationId>,
 }
 
 impl BoundDeleteUsing {
+    /// 束縛に使った `WHERE` の論理木（変換器 `sql::join::dml_plan` が conjunct を振り分ける）。
+    pub(crate) fn where_clause(&self) -> Option<&JoinWhereExpr> {
+        self.where_clause.as_ref()
+    }
+
     /// 参照の並び（先頭が削除対象、続いて USING 側の宣言順）。
     pub fn relations(&self) -> &[TableRef] {
         &self.relations
@@ -102,7 +120,7 @@ impl BoundDeleteUsing {
 }
 
 /// 対象表と FROM／USING 側の表から束縛スコープを作る。参照数の超過は `54000`、公開名の重複は `42601`。
-fn build_scope<'a>(
+pub(crate) fn build_scope<'a>(
     target: &TableRef,
     target_schema: &'a TableSchema,
     others: &[TableRef],
@@ -265,6 +283,7 @@ pub fn bind_update_from(
         set_columns,
         set_literals,
         set_exprs,
+        where_clause: stmt.where_clause.as_deref().cloned(),
         operation_id: stmt.operation_id.clone(),
     })
 }
@@ -282,6 +301,7 @@ pub fn bind_delete_using(
             .chain(stmt.using.iter().cloned())
             .collect(),
         where_columns,
+        where_clause: stmt.where_clause.as_deref().cloned(),
         operation_id: stmt.operation_id.clone(),
     })
 }
