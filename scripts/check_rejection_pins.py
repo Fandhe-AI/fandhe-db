@@ -1,0 +1,776 @@
+#!/usr/bin/env python3
+"""拒否固定テストの注記検査の中核（Issue #3164。check_rejection_pins.sh から呼ばれる）。
+
+ADR docs/design/rejection-pin-annotation.md の D2〜D9 を実装する。
+`git diff <base>...HEAD` の差分から、変更に触れた `#[test]` 関数のうち拒否（0A000・
+not supported・unsupported）を固定するものを選び、`tracked:` / `intentional:` 注記の
+欠落・書式不正・根拠ファイルの不在を違反として報告する。
+
+- 判定本体（parse_diff / find_tests / select_targets / check）は差分テキストと読み取り関数を
+  受け取る純関数で、単体テスト（scripts/tests/test_check_rejection_pins.py）が直接呼ぶ
+- git を叩くのは main() だけ（配列引数・shell=False。オフライン）
+- fail-closed: 差分の解析不能・テスト範囲の終端なし・git の失敗はすべて終了コード 1
+- 終了コード: 0 = 違反なし / 1 = 違反あり・検査不能 / 2 = 引数の誤り
+- 出力文字列は英語（運用ツール連携のため）
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from typing import Callable, Dict, List, Optional, Set, Tuple
+
+# ---------------------------------------------------------------------------
+# 定数・正規表現（ASCII 意味論に固定し、全角空白などを \s が受けないようにする）
+# ---------------------------------------------------------------------------
+
+_A = re.ASCII
+
+# D4: 対象パス
+_TARGET_RE = re.compile(r"^crates/(?:engine|wire-server)/tests/.+\.rs$|^crates/[^/]+/src/.+\.rs$", _A)
+PATHSPECS = [
+    ":(glob)crates/*/src/**/*.rs",
+    ":(glob)crates/engine/tests/**/*.rs",
+    ":(glob)crates/wire-server/tests/**/*.rs",
+]
+
+# D2: 注記らしい行（緩い判定）と厳密な文法
+_LOOSE_RE = re.compile(r"^\s*///?\s*(tracked|intentional)", _A | re.IGNORECASE)
+_TRACKED_RE = re.compile(r"^\s*///?\s*tracked:\s+(#[1-9][0-9]*(?:, #[1-9][0-9]*)*)\s*$", _A)
+_INTENTIONAL_RE = re.compile(
+    r"^\s*///?\s*intentional:\s+"
+    r"(docs/design/[A-Za-z0-9._-]+\.md(?:, docs/design/[A-Za-z0-9._-]+\.md)*)\s*$",
+    _A,
+)
+
+# D6: 拒否の語彙
+_VOCAB_RE = re.compile(r"0a000|not[ _]?supported|unsupported", _A | re.IGNORECASE)
+
+# D9: 根拠にできない設計記録
+_DISALLOWED_DOCS = {"docs/design/implementation-status.md"}
+
+_FN_RE = re.compile(
+    r"^(\s*)(?:pub(?:\([^)]*\))?\s+)?(?:const\s+)?(?:async\s+)?(?:unsafe\s+)?"
+    r'(?:extern\s+"[^"]*"\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)',
+    _A,
+)
+# コメントを除いた属性テキスト全体が `#[test]` のときだけテスト属性とみなす（D4）
+_TEST_ATTR_RE = re.compile(r"^\s*#\s*\[\s*test\s*\]\s*$", _A)
+_RAW_OPEN_RE = re.compile(r'b?r(#*)"', _A)
+_CHAR_LIT_RE = re.compile(r"'(?:\\.[^']*|[^'\\])'", _A)
+_ONE_LINE_FN_RE = re.compile(r"\{\s*\}\s*$", _A)
+
+_DIFF_HEADER_RE = re.compile(r"^diff --git a/(.+) b/(.+)$")
+_HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+_SHA_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+
+
+class DiffParseError(Exception):
+    """差分を解釈できない（fail-closed で検査失敗にする）。"""
+
+
+@dataclass
+class FileDiff:
+    """1 ファイル分の差分。行番号は新側（added）と旧側（deleted）。"""
+
+    old_path: Optional[str] = None
+    new_path: Optional[str] = None
+    added: Set[int] = field(default_factory=set)
+    deleted: Set[int] = field(default_factory=set)
+
+
+@dataclass
+class TestRange:
+    """`#[test]` 関数 1 件の範囲（D3・D4）。end が None なら終端が見つからない。"""
+
+    __test__ = False  # unittest/pytest に収集させない
+
+    name: str
+    fn_line: int
+    start: int
+    end: Optional[int]
+    block: List[Tuple[int, str]]
+    lines: List[Tuple[int, str]]
+    # 所属する `mod x {` のパス（外側から順）。同名テストの別モジュール取り違え防止（D5）に使う。
+    module: Tuple[str, ...] = ()
+    # 選択用の開始行。注記ブロックとの間に挟まった空行・コメント行も含める（空行で注記が外れる改変を
+    # テストの変更として扱うため。D5）。判定用の `start`・`lines` には影響しない。
+    select_start: int = 0
+
+
+@dataclass
+class Violation:
+    path: str
+    line: int
+    test: Optional[str]
+    kind: str
+    message: str
+
+    def render(self) -> str:
+        who = f"test '{self.test}': " if self.test else ""
+        return f"{self.path}:{self.line}: {who}{self.message} [{self.kind}]"
+
+
+def is_target_path(path: Optional[str]) -> bool:
+    return bool(path) and bool(_TARGET_RE.match(path or ""))
+
+
+# ---------------------------------------------------------------------------
+# 差分の解析
+# ---------------------------------------------------------------------------
+
+
+def _strip_prefix(p: str, prefix: str) -> str:
+    p = p.split("\t", 1)[0]
+    return p[len(prefix):] if p.startswith(prefix) else p
+
+
+def parse_diff(text: str) -> List[FileDiff]:
+    """unified diff（-U0 を想定。context 行付きも可）を FileDiff の列へ解釈する。"""
+    files: List[FileDiff] = []
+    cur: Optional[FileDiff] = None
+    old_rem = new_rem = 0
+    old_ln = new_ln = 0
+    for raw in text.split("\n"):
+        if old_rem > 0 or new_rem > 0:
+            # hunk 内は先頭 1 文字で種別を決める（本文が `+++` や `---` で始まっても本文）
+            tag = raw[:1]
+            if cur is None:
+                raise DiffParseError("hunk without file header")
+            if tag == "+":
+                cur.added.add(new_ln)
+                new_ln += 1
+                new_rem -= 1
+            elif tag == "-":
+                cur.deleted.add(old_ln)
+                old_ln += 1
+                old_rem -= 1
+            elif tag == " " or raw == "":
+                old_ln += 1
+                new_ln += 1
+                old_rem -= 1
+                new_rem -= 1
+            elif tag == "\\":
+                pass
+            else:
+                raise DiffParseError(f"unexpected line inside hunk: {raw[:40]!r}")
+            continue
+        if raw.startswith("diff --git "):
+            if raw.startswith('diff --git "') or raw.startswith('diff --git a/"'):
+                raise DiffParseError("quoted path in diff header")
+            m = _DIFF_HEADER_RE.match(raw)
+            if not m:
+                raise DiffParseError(f"unparsable diff header: {raw[:80]!r}")
+            cur = FileDiff(old_path=m.group(1), new_path=m.group(2))
+            files.append(cur)
+        elif cur is None:
+            continue
+        elif raw.startswith("rename from "):
+            cur.old_path = raw[len("rename from "):]
+        elif raw.startswith("rename to "):
+            cur.new_path = raw[len("rename to "):]
+        elif raw.startswith("new file mode"):
+            cur.old_path = None
+        elif raw.startswith("deleted file mode"):
+            cur.new_path = None
+        elif raw.startswith("--- "):
+            rest = raw[4:]
+            if rest.startswith('"'):
+                raise DiffParseError("quoted path in diff")
+            cur.old_path = None if rest.startswith("/dev/null") else _strip_prefix(rest, "a/")
+        elif raw.startswith("+++ "):
+            rest = raw[4:]
+            if rest.startswith('"'):
+                raise DiffParseError("quoted path in diff")
+            cur.new_path = None if rest.startswith("/dev/null") else _strip_prefix(rest, "b/")
+        elif raw.startswith("@@"):
+            m = _HUNK_RE.match(raw)
+            if not m:
+                raise DiffParseError(f"unparsable hunk header: {raw[:80]!r}")
+            old_ln = int(m.group(1))
+            old_rem = int(m.group(2)) if m.group(2) is not None else 1
+            new_ln = int(m.group(3))
+            new_rem = int(m.group(4)) if m.group(4) is not None else 1
+        elif raw.startswith("Binary files") or raw.startswith("GIT binary patch"):
+            raise DiffParseError("binary diff for a checked path")
+    return files
+
+
+# ---------------------------------------------------------------------------
+# テスト範囲の抽出（D3・D4）
+# ---------------------------------------------------------------------------
+
+
+def _scan_attribute(lines: List[str], start: int) -> int:
+    """`#[` で始まる属性の終端行（0 始まり）を返す。
+
+    文字列・raw 文字列・文字リテラル・行/ブロックコメント内の角括弧は深さに数えない。
+    終端を解釈できない場合は DiffParseError（fail-closed で検査失敗）。
+    """
+    depth = 0
+    seen_open = False
+    in_str = False
+    raw_hashes: Optional[int] = None  # raw 文字列内のとき `#` の個数
+    block_cmt = 0
+    i = start
+    n = len(lines)
+    while i < n:
+        s = lines[i]
+        j = 0
+        m = len(s)
+        while j < m:
+            c = s[j]
+            if block_cmt:
+                if s.startswith("*/", j):
+                    block_cmt -= 1
+                    j += 2
+                elif s.startswith("/*", j):
+                    block_cmt += 1
+                    j += 2
+                else:
+                    j += 1
+                continue
+            if raw_hashes is not None:
+                if c == '"' and s.startswith("#" * raw_hashes, j + 1):
+                    j += 1 + raw_hashes
+                    raw_hashes = None
+                else:
+                    j += 1
+                continue
+            if in_str:
+                if c == "\\":
+                    j += 2
+                elif c == '"':
+                    in_str = False
+                    j += 1
+                else:
+                    j += 1
+                continue
+            if s.startswith("//", j):
+                break
+            if s.startswith("/*", j):
+                block_cmt += 1
+                j += 2
+                continue
+            rm = re.compile(r'b?r(#*)"', _A).match(s, j)
+            if rm and (j == 0 or not (s[j - 1].isalnum() or s[j - 1] == "_")):
+                raw_hashes = len(rm.group(1))
+                j = rm.end()
+                continue
+            if c == '"':
+                in_str = True
+                j += 1
+                continue
+            if c == "'":
+                cm = re.compile(r"'(?:\\.[^']*|[^'\\])'", _A).match(s, j)
+                j = cm.end() if cm else j + 1  # 一致しなければライフタイム等
+                continue
+            if c == "[":
+                depth += 1
+                seen_open = True
+            elif c == "]":
+                depth -= 1
+                if seen_open and depth <= 0:
+                    return i
+            j += 1
+        i += 1
+    raise DiffParseError("cannot find the end of an attribute (unterminated string/bracket)")
+
+
+def _lex(text: str) -> Tuple[str, List[str]]:
+    """Rust ソースを走査し (コメントを空白化した同長テキスト, 各行頭の状態) を返す。
+
+    状態は "code" / "comment"（ブロックコメント内）/ "string"（文字列・raw 文字列内）。
+    行単位の判定が文字列内の `/*` をコメント開始と誤認して後続を読み飛ばすのを防ぐ（fail-closed）。
+    """
+    out: List[str] = []
+    states: List[str] = ["code"]
+    n = len(text)
+    i = 0
+    depth = 0
+    raw: Optional[int] = None
+    in_str = False
+
+    def state() -> str:
+        if depth:
+            return "comment"
+        return "string" if (raw is not None or in_str) else "code"
+
+    def emit(chunk: str, masked: str) -> None:
+        out.append(masked)
+        if chunk.endswith("\n"):
+            states.append(state())
+
+    while i < n:
+        c = text[i]
+        if depth:
+            if text.startswith("*/", i):
+                depth -= 1
+                emit("*/", "  ")
+                i += 2
+            elif text.startswith("/*", i):
+                depth += 1
+                emit("/*", "  ")
+                i += 2
+            else:
+                emit(c, "\n" if c == "\n" else " ")
+                i += 1
+            continue
+        if raw is not None:
+            if c == '"' and text.startswith("#" * raw, i + 1):
+                raw_len = 1 + raw
+                raw = None
+                emit(text[i:i + raw_len], text[i:i + raw_len])
+                i += raw_len
+            else:
+                emit(c, c)
+                i += 1
+            continue
+        if in_str:
+            if c == "\\" and i + 1 < n:
+                emit(text[i:i + 2], text[i:i + 2])
+                i += 2
+            else:
+                if c == '"':
+                    in_str = False
+                emit(c, c)
+                i += 1
+            continue
+        if text.startswith("//", i):
+            j = text.find("\n", i)
+            j = n if j < 0 else j
+            out.append(" " * (j - i))
+            i = j
+            continue
+        if text.startswith("/*", i):
+            depth += 1
+            emit("/*", "  ")
+            i += 2
+            continue
+        rm = _RAW_OPEN_RE.match(text, i)
+        if rm and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")):
+            raw = len(rm.group(1))
+            emit(rm.group(0), rm.group(0))
+            i = rm.end()
+            continue
+        if c == '"':
+            in_str = True
+            emit(c, c)
+            i += 1
+            continue
+        if c == "'":
+            cm = _CHAR_LIT_RE.match(text, i)
+            if cm:
+                emit(cm.group(0), cm.group(0))
+                i = cm.end()
+                continue
+        emit(c, c)
+        i += 1
+    return "".join(out), states
+
+
+_MOD_RE = re.compile(
+    r"^(\s*)(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{"
+    r"\s*(?://.*|/\*.*?\*/\s*)?$"
+)
+
+
+def _walk_back_over_comments(lines: List[str], start: int) -> int:
+    """`start`（1 始まり）から空行・`//` 行・`/* */` ブロックコメントを遡った先頭行を返す。
+
+    ブロックコメントは D3 で注記ブロックを切り離すため、挿入されても対象テストとして
+    選択できるよう選択範囲へ含める（D5）。開始位置を見つけられない `*/` では遡りを止める。
+    """
+    sel = start
+    while sel > 1:
+        prev = lines[sel - 2].strip()
+        if not prev or prev.startswith("//"):
+            sel -= 1
+        elif prev.endswith("*/"):
+            k = sel - 2
+            while k >= 0 and "/*" not in lines[k]:
+                k -= 1
+            if k < 0:
+                break
+            sel = k + 1
+        else:
+            break
+    return sel
+
+
+def _masked_line(masked: List[str], i: int) -> str:
+    """コメントを空白化した `i` 行目（0 始まり）を返す。終端 `}` の判定を末尾コメントに依存させない。"""
+    return masked[i] if i < len(masked) else ""
+
+
+def find_tests(text: str) -> List[TestRange]:
+    """ファイル内容から `#[test]` 付き fn の範囲を抽出する。
+
+    連続ブロック（コメント行と属性行のみ・空行なし）を `fn` 行の直前で拾い、`#[test]` を
+    含めばテストとして登録する。終端は「fn 行と同じインデントの `}` だけの行」で決める
+    （波括弧の数え上げはしない）。
+    """
+    lines = text.split("\n")
+    tests: List[TestRange] = []
+    block: List[Tuple[int, str]] = []
+    # D4 のテスト属性認識（has_test・test_line）は D3 の注記ブロック連続性（block）と分離する。
+    # 空行・ブロックコメントは block だけを切り離し、`#[test]` 自体の認識は fn まで保持する
+    # （空行を挟んでも有効なテストが検査対象から消えない）。
+    has_test = False
+    test_line = 0
+    masked_lines, line_states = _lex(text)
+    masked = masked_lines.split("\n")
+    mod_stack: List[Tuple[str, str]] = []  # (インデント, モジュール名)
+    i = 0
+    n = len(lines)
+    while i < n:
+        ln = i + 1
+        line = lines[i]
+        stripped = line.strip()
+        if i < len(line_states) and line_states[i] != "code":
+            # ブロックコメント・文字列（raw 含む）の内側の行。コード・注記として解釈しない
+            block = []
+            i += 1
+            continue
+        if not stripped:
+            block = []
+            i += 1
+            continue
+        if stripped.startswith("/*"):
+            block = []
+            i += 1
+            continue
+        if mod_stack and _masked_line(masked, i).rstrip() == mod_stack[-1][0] + "}":
+            mod_stack.pop()
+            block = []
+            has_test = False
+            test_line = 0
+            i += 1
+            continue
+        mm = _MOD_RE.match(line)
+        if mm:
+            mod_stack.append((mm.group(1), mm.group(2)))
+            block = []
+            has_test = False
+            test_line = 0
+            i += 1
+            continue
+        if stripped.startswith("//"):
+            block.append((ln, line))
+            i += 1
+            continue
+        if stripped.startswith("#[") or stripped.startswith("#!["):
+            end_i = _scan_attribute(lines, i)
+            for k in range(i, end_i + 1):
+                # 属性内の文字列・ブロックコメントの継続行は注記候補にしない（実コメント位置のみ）
+                if k < len(line_states) and line_states[k] != "code":
+                    continue
+                block.append((k + 1, lines[k]))
+            # コメントを除いた属性全体の構造で `#[test]` を判定する（末尾のブロックコメントを許容）
+            if _TEST_ATTR_RE.match(" ".join(masked[i:end_i + 1])):
+                if not has_test:
+                    test_line = i + 1
+                has_test = True
+            i = end_i + 1
+            continue
+        m = _FN_RE.match(line)
+        if m and has_test:
+            indent, name = m.group(1), m.group(2)
+            end: Optional[int] = None
+            if _ONE_LINE_FN_RE.search(line):
+                end = ln
+            else:
+                closer = indent + "}"
+                for j in range(i + 1, n):
+                    if _masked_line(masked, j).rstrip() == closer:
+                        end = j + 1
+                        break
+            start = block[0][0] if block else ln
+            if test_line and test_line < start:
+                start = test_line
+            last = end if end is not None else n
+            sel = _walk_back_over_comments(lines, start)
+            tests.append(
+                TestRange(
+                    name=name,
+                    fn_line=ln,
+                    start=start,
+                    end=end,
+                    block=list(block),
+                    lines=[(k + 1, lines[k]) for k in range(start - 1, last)],
+                    module=tuple(m_[1] for m_ in mod_stack),
+                    select_start=sel,
+                )
+            )
+        block = []
+        has_test = False
+        test_line = 0
+        i += 1
+    return tests
+
+
+# ---------------------------------------------------------------------------
+# 対象テストの選択（D5）
+# ---------------------------------------------------------------------------
+
+ReadFn = Callable[[str], Optional[str]]
+
+
+def _common_suffix_len(a: Tuple[str, ...], b: Tuple[str, ...]) -> int:
+    """モジュールパス末尾側から数えた一致要素数（親 mod 名変更の接頭辞置換の近さ）。"""
+    n = 0
+    while n < len(a) and n < len(b) and a[-1 - n] == b[-1 - n]:
+        n += 1
+    return n
+
+
+def _body_text(t: TestRange) -> List[str]:
+    """fn 行以降の本文（注記ブロック・属性を除く）。リネーム前後の同一性判定に使う。"""
+    return [x for k, x in t.lines if k >= t.fn_line]
+
+
+def select_targets(
+    file_diffs: List[FileDiff], read_head: ReadFn, read_base: ReadFn
+) -> List[Tuple[str, TestRange]]:
+    """追加・変更行、または削除行（base 側の範囲）に触れたテストを HEAD 側で選ぶ。"""
+    out: Dict[Tuple[str, int], Tuple[str, TestRange]] = {}
+    for fd in file_diffs:
+        if fd.new_path is None or not is_target_path(fd.new_path):
+            continue
+        head_text = read_head(fd.new_path)
+        if head_text is None:
+            continue
+        head_tests = find_tests(head_text)
+        base_by_key: Dict[Tuple[Tuple[str, ...], str], TestRange] = {}
+        if fd.old_path is not None:
+            base_src = read_base(fd.old_path)
+            if base_src is not None:
+                base_by_key = {(bt.module, bt.name): bt for bt in find_tests(base_src)}
+        for t in head_tests:
+            last = t.end if t.end is not None else t.fn_line
+            if any(t.start <= a <= last for a in fd.added):
+                out[(fd.new_path, t.fn_line)] = (fd.new_path, t)
+            elif any(t.select_start <= a < t.start for a in fd.added):
+                # 注記ブロックの手前（空行・コメント）への追加。無関係な先頭コメントの編集では
+                # 対象にせず、base 側で連続していた注記ブロックが HEAD で切り離された
+                # （ブロック内容が変わった）場合に限り対象にする（D5）
+                bt = base_by_key.get((t.module, t.name))
+                if bt is not None and [x for _, x in bt.block] != [x for _, x in t.block]:
+                    out[(fd.new_path, t.fn_line)] = (fd.new_path, t)
+        if fd.deleted and fd.old_path is not None:
+            base_text = read_base(fd.old_path)
+            if base_text is not None:
+                names = set()  # (モジュールパス, 関数名)
+                for bt in find_tests(base_text):
+                    last = bt.end if bt.end is not None else bt.fn_line
+                    if any(bt.start <= d <= last for d in fd.deleted):
+                        names.add((bt.module, bt.name))
+                base_keys = {(bt.module, bt.name) for bt in find_tests(base_text)}
+                # 親 mod のリネームでモジュールパスが変わっても注記削除を逃さないため、
+                # base 側に同じキーが無い HEAD 側テスト（リネーム後の候補）のうち、
+                # 触れた base テストと同名で、モジュールパスの末尾側が最も長く一致する
+                # 候補が一意に定まる場合だけ対応付ける（定まらなければ兄弟を誤対象化しない）
+                for t in head_tests:
+                    if (t.module, t.name) in names:
+                        out[(fd.new_path, t.fn_line)] = (fd.new_path, t)
+                renamed = [t for t in head_tests if (t.module, t.name) not in base_keys]
+                base_tests = {(bt.module, bt.name): bt for bt in find_tests(base_text)}
+                for bmod, bname in sorted(names):
+                    if any(t.module == bmod and t.name == bname for t in head_tests):
+                        continue
+                    cands = [t for t in renamed if t.name == bname]
+                    if not cands:
+                        continue
+                    scored = [(_common_suffix_len(t.module, bmod), t) for t in cands]
+                    best = max(sc for sc, _ in scored)
+                    top = [t for sc, t in scored if sc == best]
+                    if len(top) > 1:
+                        # 本体（fn 行以降）が base と一致する候補へ絞る
+                        bt0 = base_tests.get((bmod, bname))
+                        if bt0 is not None:
+                            want = _body_text(bt0)
+                            top = [t for t in top if _body_text(t) == want] or top
+                    if len(top) == 1:
+                        out[(fd.new_path, top[0].fn_line)] = (fd.new_path, top[0])
+                    else:
+                        # 対応を確定できないまま黙って除外すると注記削除を見逃すため fail-closed
+                        raise DiffParseError(
+                            f"{fd.new_path}: cannot map deleted test '{bname}' in module "
+                            f"{'::'.join(bmod) or '(root)'} to a unique renamed test "
+                            f"({len(top)} candidates)"
+                        )
+    return sorted(out.values(), key=lambda x: (x[0], x[1].fn_line))
+
+
+# ---------------------------------------------------------------------------
+# 判定（D2・D6・D7・D9）
+# ---------------------------------------------------------------------------
+
+
+def is_rejection_pin(t: TestRange) -> bool:
+    """D6: 行頭 `//` のコメント行を除いた範囲に語彙が現れれば拒否固定。"""
+    for _, line in t.lines:
+        if line.lstrip().startswith("//"):
+            continue
+        if _VOCAB_RE.search(line):
+            return True
+    return False
+
+
+def _check_annotation_line(
+    path: str,
+    ln: int,
+    line: str,
+    test: Optional[str],
+    head_exists: Callable[[str], bool],
+) -> Tuple[List[Violation], Optional[str]]:
+    """注記らしい 1 行を検査する。戻り値は (違反, 有効な種類 'tracked'|'intentional'|None)。"""
+    vs: List[Violation] = []
+    if _TRACKED_RE.match(line):
+        return vs, "tracked"
+    m = _INTENTIONAL_RE.match(line)
+    if m:
+        for doc in m.group(1).split(", "):
+            if doc in _DISALLOWED_DOCS:
+                vs.append(Violation(path, ln, test, "disallowed-design-doc",
+                                    f"{doc} cannot be the basis of an intentional: annotation"))
+            elif not head_exists(doc):
+                vs.append(Violation(path, ln, test, "missing-design-doc",
+                                    f"intentional: annotation points to a missing file {doc}"))
+        return vs, "intentional"
+    vs.append(Violation(path, ln, test, "malformed-annotation",
+                        "malformed tracked:/intentional: annotation"))
+    return vs, None
+
+
+def check(
+    file_diffs: List[FileDiff],
+    read_head: ReadFn,
+    read_base: ReadFn,
+    head_exists: Callable[[str], bool],
+) -> Tuple[List[Violation], int, int]:
+    """違反の一覧と (対象テスト数, 拒否固定テスト数) を返す。"""
+    viol: Dict[Tuple[str, int, str], Violation] = {}
+
+    def add(v: Violation) -> None:
+        viol.setdefault((v.path, v.line, v.kind), v)
+
+    targets = select_targets(file_diffs, read_head, read_base)
+    pins = 0
+    for path, t in targets:
+        if t.end is None:
+            add(Violation(path, t.fn_line, t.name, "unterminated-test",
+                          "cannot find the closing brace of the test (rustfmt layout assumed)"))
+            continue
+        kinds: List[str] = []
+        for ln, line in t.block:
+            if _LOOSE_RE.match(line):
+                vs, kind = _check_annotation_line(path, ln, line, t.name, head_exists)
+                for v in vs:
+                    add(v)
+                if kind:
+                    kinds.append(kind)
+        for k in ("tracked", "intentional"):
+            if kinds.count(k) > 1:
+                add(Violation(path, t.fn_line, t.name, "duplicate-annotation",
+                              f"multiple {k}: annotation lines (merge them into one line)"))
+        if is_rejection_pin(t):
+            pins += 1
+            if not kinds:
+                add(Violation(path, t.fn_line, t.name, "missing-annotation",
+                              "rejection-pinning test has no tracked:/intentional: annotation"))
+
+    # D7: 検出の有無にかかわらず、追加された注記らしい行すべてに書式・値の検査をかける
+    for fd in file_diffs:
+        if fd.new_path is None or not is_target_path(fd.new_path) or not fd.added:
+            continue
+        head_text = read_head(fd.new_path)
+        if head_text is None:
+            continue
+        head_lines = head_text.split("\n")
+        _, head_states = _lex(head_text)
+        for ln in sorted(fd.added):
+            if ln - 1 < len(head_states) and head_states[ln - 1] != "code":
+                continue
+            if 1 <= ln <= len(head_lines) and _LOOSE_RE.match(head_lines[ln - 1]):
+                vs, _ = _check_annotation_line(fd.new_path, ln, head_lines[ln - 1], None, head_exists)
+                for v in vs:
+                    add(v)
+    return sorted(viol.values(), key=lambda v: (v.path, v.line, v.kind)), len(targets), pins
+
+
+# ---------------------------------------------------------------------------
+# git 呼び出しと main
+# ---------------------------------------------------------------------------
+
+
+class GitError(Exception):
+    """git の実行失敗（fail-closed で検査失敗にする）。"""
+
+
+def _git(repo: str, *args: str, ok_codes: Tuple[int, ...] = (0,)) -> "subprocess.CompletedProcess[str]":
+    proc = subprocess.run(
+        ["git", "-C", repo, *args],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        shell=False,
+    )
+    if proc.returncode not in ok_codes:
+        raise GitError(f"git failed: {proc.stderr.strip()}")
+    return proc
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    ap = argparse.ArgumentParser(prog="check_rejection_pins.py")
+    ap.add_argument("--repo", required=True)
+    ap.add_argument("--base", required=True)
+    try:
+        args = ap.parse_args(argv)
+    except SystemExit as e:
+        return 2 if e.code not in (0, None) else 0
+    if not _SHA_RE.match(args.base):
+        print("base must be a full commit SHA", file=sys.stderr)
+        return 2
+    repo = args.repo
+    try:
+        try:
+            mb = _git(repo, "merge-base", args.base, "HEAD").stdout.strip()
+        except GitError as e:
+            raise GitError(f"merge-base failed (shallow clone? fetch full history): {e}")
+        diff = _git(
+            repo, "-c", "core.quotePath=false", "-c", "diff.relative=false",
+            "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--find-renames", "-U0",
+            "--src-prefix=a/", "--dst-prefix=b/", f"{args.base}...HEAD", "--", *PATHSPECS,
+        ).stdout
+
+        def show(rev: str, path: str) -> Optional[str]:
+            p = _git(repo, "show", f"{rev}:{path}", ok_codes=(0, 128))
+            return p.stdout if p.returncode == 0 else None
+
+        def head_exists(path: str) -> bool:
+            p = _git(repo, "cat-file", "-t", f"HEAD:{path}", ok_codes=(0, 128))
+            return p.returncode == 0 and p.stdout.strip() == "blob"
+
+        files = parse_diff(diff)
+        viol, n_tests, n_pins = check(
+            files, lambda p: show("HEAD", p), lambda p: show(mb, p), head_exists
+        )
+    except (GitError, DiffParseError) as e:
+        print(f"check_rejection_pins: error: {e}", file=sys.stderr)
+        return 1
+    for v in viol:
+        print(v.render())
+    if viol:
+        print(f"check_rejection_pins: {len(viol)} violation(s)")
+        return 1
+    print(f"check_rejection_pins: ok ({n_tests} changed test(s), {n_pins} rejection pin(s))")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
