@@ -59,6 +59,7 @@ SCAN_PATH = re.compile(
     r"^crates/(?:(?:engine|wire-server)/tests/|[^/]+/src/).*\.rs$"
 )
 
+FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*#*\s*$")
 OUT_OF_SCOPE_RE = re.compile(r"out[- ]of[- ]scope", re.IGNORECASE)
 LIST_ITEM_RE = re.compile(r"^(\s*)(?:[-*+]|[0-9]{1,9}[.)])\s+(.*)$")
@@ -117,12 +118,21 @@ def _split_items(lines: list[str]) -> list[str]:
     """節内の行から、最小インデントのリスト項目を 1 件として結合した項目本文を返す。"""
     parsed = []
     for line in lines:
+        if not line.strip():
+            continue
         m = LIST_ITEM_RE.match(line)
         indent = len(line) - len(line.lstrip())
         parsed.append((indent, m.group(2) if m else None, line.strip()))
     bases = [ind for ind, txt, _ in parsed if txt is not None]
     if not bases:
-        return []
+        # 箇条書きの無い節は、空行区切りの段落を 1 項目として扱う（黙って捨てない）
+        paragraphs: list[list[str]] = [[]]
+        for line in lines:
+            if line.strip():
+                paragraphs[-1].append(line.strip())
+            elif paragraphs[-1]:
+                paragraphs.append([])
+        return [" ".join(p) for p in paragraphs if p]
     base = min(bases)
     items: list[list[str]] = []
     current: list[str] | None = None
@@ -141,7 +151,7 @@ def extract_out_of_scope_sections(body: str) -> list[Section]:
     """PR 本文から「対象外」節（フェンス外の ATX 見出し）を抽出する。untrusted 入力。"""
     text = body.replace("\r\n", "\n").replace("\r", "\n")
     sections: list[Section] = []
-    fence = False
+    fence: tuple[str, int] | None = None  # (フェンス文字, 開始時の長さ)
     active_level = 0
     active: Section | None = None
     buf: list[str] = []
@@ -154,11 +164,16 @@ def extract_out_of_scope_sections(body: str) -> list[Section]:
         active, buf = None, []
 
     for line in text.split("\n"):
-        stripped = line.lstrip()
-        if stripped.startswith("```") or stripped.startswith("~~~"):
-            fence = not fence
-            continue
-        if fence:
+        fm = FENCE_RE.match(line)
+        if fence is None:
+            if fm:
+                fence = (fm.group(1)[0], len(fm.group(1)))
+                continue
+        else:
+            # 開始と同じ文字で同じ長さ以上、かつ後続が空白のみの行だけが閉じフェンス
+            if fm and fm.group(1)[0] == fence[0] and len(fm.group(1)) >= fence[1] \
+                    and not fm.group(2).strip():
+                fence = None
             continue
         m = HEADING_RE.match(line)
         if m:
@@ -169,7 +184,7 @@ def extract_out_of_scope_sections(body: str) -> list[Section]:
                 active = Section(heading=sanitize_heading(m.group(2)))
                 active_level = level
             continue
-        if active is not None and line.strip():
+        if active is not None:
             buf.append(line)
     close()
     return sections
@@ -199,18 +214,28 @@ def extract_refs(text: str, repo: str, exclude: set[int] | None = None) -> list[
     return seen
 
 
-def classify_item(refs: list[int], infos: dict[int, Info]) -> str:
-    """`untracked` / `ok`（open の Issue を 1 件以上指す） / `closed-only`。"""
+def classify_item(
+    refs: list[int], infos: dict[int, Info], exclude: set[int] | None = None
+) -> str:
+    """`untracked` / `ok`（open の Issue を 1 件以上指す） / `closed-only`。
+
+    `exclude` は受け皿として認めない番号（今回 close する親 Issue。親の close で残作業が
+    消えるため）。除外番号だけを指す項目は `closed-only` になる。
+    """
     if not refs:
         return "untracked"
     for n in refs:
+        if exclude and n in exclude:
+            continue
         info = infos.get(n)
         if info is not None and info.kind == "issue" and info.state == "open":
             return "ok"
     return "closed-only"
 
 
-def describe_ref(n: int, infos: dict[int, Info]) -> str:
+def describe_ref(n: int, infos: dict[int, Info], parent: int | None = None) -> str:
+    if n == parent:
+        return f"#{n}(parent,excluded)"
     info = infos.get(n, Info("missing"))
     if info.kind == "missing":
         return f"#{n}(missing)"
@@ -218,7 +243,7 @@ def describe_ref(n: int, infos: dict[int, Info]) -> str:
 
 
 def find_cycles(edges: dict[int, list[int]]) -> list[list[int]]:
-    """反復版 Tarjan SCC。大きさ 2 以上の強連結成分を昇順・決定的に返す。"""
+    """反復版 Tarjan SCC。大きさ 2 以上の強連結成分ごとに実在する循環経路を決定的に返す。"""
     index: dict[int, int] = {}
     low: dict[int, int] = {}
     on_stack: set[int] = set()
@@ -266,7 +291,27 @@ def find_cycles(edges: dict[int, list[int]]) -> list[list[int]]:
                         break
                 if len(comp) >= 2:
                     result.append(sorted(comp))
-    return sorted(result)
+    return sorted(_cycle_path(comp, edges) for comp in result)
+
+
+def _cycle_path(comp: list[int], edges: dict[int, list[int]]) -> list[int]:
+    """強連結成分の最小番号から出て戻る最短の実在経路（閉じ番号は含めない）を返す。"""
+    members = set(comp)
+    start = comp[0]
+    prev: dict[int, int | None] = {start: None}
+    queue = [start]
+    while queue:
+        node = queue.pop(0)
+        for nxt in sorted(edges.get(node, [])):
+            if nxt == start:
+                path = [node]
+                while prev[path[-1]] is not None:
+                    path.append(prev[path[-1]])  # type: ignore[arg-type]
+                return path[::-1]
+            if nxt in members and nxt not in prev:
+                prev[nxt] = node
+                queue.append(nxt)
+    return comp  # 到達しない（SCC は必ず start へ戻る）
 
 
 # ---------------------------------------------------------------- 取得（I/O 層）
@@ -407,14 +452,16 @@ class Item:
 
 
 def items_from_prs(
-    prs: list[tuple[int, str]], issue: int, repo: str, seen_prs: set[int]
+    prs: list[tuple[int, str]], issue: int, repo: str, seen_prs: set[int] | None = None
 ) -> tuple[list[Item], int]:
+    """PR 本文から項目を作る。`seen_prs` を渡すと既出 PR は結果から省く（報告の重複排除用）。"""
     items: list[Item] = []
     sections = 0
     for pr_number, body in prs:
-        if pr_number in seen_prs:
-            continue
-        seen_prs.add(pr_number)
+        if seen_prs is not None:
+            if pr_number in seen_prs:
+                continue
+            seen_prs.add(pr_number)
         for sec in extract_out_of_scope_sections(body):
             sections += 1
             for idx, text in enumerate(sec.items, 1):
@@ -461,13 +508,18 @@ def closeout(
         elif not node.merged_prs:
             notes.append(f"note: issue #{node.number} has no merged closing PR")
         merged_total += len(node.merged_prs)
+        # 報告は PR 単位で重複排除するが、参照辺は各 Issue の closing PR から必ず作る
+        # （同じ PR が複数 Issue を close しても 2 件目以降の辺を落とさない）
         items, secs = items_from_prs(node.merged_prs, node.number, repo, seen_prs)
         sections_total += secs
         all_items.extend(items)
         edges.setdefault(node.number, [])
-        for it in items:
-            edges[node.number].extend(r for r in it.refs if r not in edges[node.number])
-            edges.setdefault(it.pr, edges[node.number])
+        for it in items_from_prs(node.merged_prs, node.number, repo)[0]:
+            for r in it.refs:
+                if r not in edges[node.number]:
+                    edges[node.number].append(r)
+                if r not in edges.setdefault(it.pr, []):
+                    edges[it.pr].append(r)
 
     cache: dict[int, Info] = {}
     in_tree = visited
@@ -509,15 +561,15 @@ def closeout(
     counts = {"untracked": 0, "closed-only": 0, "ok": 0}
     lines: list[str] = []
     for it in all_items:
-        kind = classify_item(it.refs, cache)
+        kind = classify_item(it.refs, cache, {parent})
         counts[kind] += 1
         base = f'issue #{it.issue} pr #{it.pr} section "{it.heading}" item {it.index}'
         if kind == "untracked":
             lines.append(f"UNTRACKED   {base}")
         elif kind == "closed-only":
-            lines.append(f"CLOSED-ONLY {base} refs " + " ".join(describe_ref(r, cache) for r in it.refs))
+            lines.append(f"CLOSED-ONLY {base} refs " + " ".join(describe_ref(r, cache, parent) for r in it.refs))
         elif verbose:
-            lines.append(f"OK          {base} refs " + " ".join(describe_ref(r, cache) for r in it.refs))
+            lines.append(f"OK          {base} refs " + " ".join(describe_ref(r, cache, parent) for r in it.refs))
     for comp in cycles:
         lines.append("CYCLE       " + " -> ".join(f"#{n}" for n in comp + [comp[0]]))
 
@@ -564,7 +616,11 @@ def check_closed(
             continue
         try:
             with open(path, "rb") as fh:
-                data = fh.read(MAX_SCAN_FILE_BYTES).decode("utf-8", "replace")
+                raw = fh.read(MAX_SCAN_FILE_BYTES + 1)
+            if len(raw) > MAX_SCAN_FILE_BYTES:
+                # 上限先の注記を見落として「検出なし」にしない（fail-closed）
+                raise FetchError(f"scan size limit exceeded for {rel}")
+            data = raw.decode("utf-8", "replace")
         except OSError:
             raise FetchError(f"cannot read {rel}") from None
         for lineno, line in enumerate(data.split("\n"), 1):

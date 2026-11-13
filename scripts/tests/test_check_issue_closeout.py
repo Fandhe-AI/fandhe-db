@@ -82,6 +82,28 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(cic.find_cycles({1: [2], 2: [3]}), [])
         self.assertEqual(cic.find_cycles({1: [1]}), [])
 
+    def test_cycle_path_is_real(self):
+        self.assertEqual(cic.find_cycles({1: [3], 3: [2], 2: [1]}), [[1, 3, 2]])
+
+    def test_classify_excludes_parent(self):
+        infos = {9: cic.Info("issue", "open"), 5: cic.Info("issue", "open")}
+        self.assertEqual(cic.classify_item([9], infos, {9}), "closed-only")
+        self.assertEqual(cic.classify_item([9, 5], infos, {9}), "ok")
+
+    def test_paragraph_section_is_item(self):
+        secs = cic.extract_out_of_scope_sections("## 対象外\n\n残作業あり。\n続き\n\n別段落 #5\n")
+        self.assertEqual(secs[0].items, ["残作業あり。 続き", "別段落 #5"])
+        secs = cic.extract_out_of_scope_sections("## 対象外\n\nなし\n")
+        self.assertEqual(secs[0].items, [])
+
+    def test_fence_kind_and_length(self):
+        text = "```\n~~~\n## 対象外\n- fake\n```\n## 対象外\n- real\n"
+        secs = cic.extract_out_of_scope_sections(text)
+        self.assertEqual([s.items for s in secs], [["real"]])
+        text = "````\n```\n## 対象外\n- fake\n````\n## 対象外\n- real\n"
+        secs = cic.extract_out_of_scope_sections(text)
+        self.assertEqual([s.items for s in secs], [["real"]])
+
     def test_heading_sanitized(self):
         h = cic.sanitize_heading('a\x1b[31m"b' + "x" * 200)
         self.assertNotIn("\x1b", h)
@@ -161,6 +183,32 @@ class IntegrationTests(unittest.TestCase):
         code, out, _ = run_cli(g, ["100", "--max-hops", "0"])
         self.assertNotIn("CYCLE", out)
 
+    def test_shared_closing_pr_keeps_edges(self):
+        # PR 901 が #101 と #102 を close し #103 と open の #600 を参照。#103 の PR は #102 を参照
+        class Shared(FakeGh):
+            def __call__(self, q, v):
+                r = super().__call__(q, v)
+                if "number:$number" in q and v["number"] == 102:
+                    nodes = r["data"]["repository"]["issue"]["closedByPullRequestsReferences"]["nodes"]
+                    nodes.append({"number": 901, "merged": True, "body": body("#103 and #600")})
+                return r
+        g = Shared(
+            bodies={101: (901, body("#103 and #600")), 103: (903, body("#102"))},
+            states={103: "CLOSED", 600: "OPEN"},
+            tree={100: [101, 102, 103], 101: [], 102: [], 103: []},
+        )
+        code, out, _ = run_cli(g, ["100"])
+        self.assertEqual(code, 1, out)
+        self.assertIn("CYCLE       #102 -> #103 -> #102", out)
+
+    def test_parent_only_reference_is_closed_only(self):
+        g = FakeGh(bodies={101: (901, body("see #100"))}, states={100: "OPEN"},
+                   tree={100: [101], 101: []})
+        code, out, _ = run_cli(g, ["100"])
+        self.assertEqual(code, 1, out)
+        self.assertIn("CLOSED-ONLY issue #101", out)
+        self.assertIn("#100(parent,excluded)", out)
+
     def test_fetch_failures_fail_closed(self):
         def boom(q, v):
             raise cic.FetchError("gh api failed")
@@ -204,6 +252,20 @@ class IntegrationTests(unittest.TestCase):
         self.assertIn(f"TRACKED-NOT-ISSUE {rel}:5 #999 (missing)", o)
         self.assertNotIn("#600", o)
         self.assertIn("annotations=4", o)
+
+
+class ScanLimitTests(unittest.TestCase):
+    def test_oversize_file_fails_closed(self):
+        with tempfile.TemporaryDirectory() as d:
+            rel = "crates/engine/tests/a/main.rs"
+            os.makedirs(os.path.join(d, os.path.dirname(rel)))
+            with open(os.path.join(d, rel), "w") as f:
+                f.write("// x\n" * (cic.MAX_SCAN_FILE_BYTES // 5 + 10) + "// tracked: #500\n")
+            args = cic.build_parser().parse_args(["--check-closed", "--root", d])
+            out, err = io.StringIO(), io.StringIO()
+            code = cic.run(args, FakeGh(), lambda r: [rel], out, err)
+        self.assertEqual(code, 3)
+        self.assertIn("scan size limit", err.getvalue())
 
 
 class UsageTests(unittest.TestCase):
