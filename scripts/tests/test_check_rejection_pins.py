@@ -463,6 +463,21 @@ class DetachedAnnotationTest(unittest.TestCase):
         self.assertEqual(kinds(run_check(P, old, new)), ["missing-annotation"])
 
 
+    def test_block_comment_insertion_detected(self):
+        # 注記と #[test] の間へブロックコメントだけを挿入しても検出する（単行・複数行）
+        old = self.ANN + self.FN
+        for cmt in ("/* explanatory comment */\n", "/*\n * multi\n * line\n */\n"):
+            new = self.ANN + cmt + self.FN
+            for ctx in (0, 3):
+                self.assertEqual(
+                    kinds(run_check(P, old, new, context=ctx)), ["missing-annotation"]
+                )
+
+    def test_block_comment_removal_not_flagged_when_reattached(self):
+        old = self.ANN + "/* c */\n" + self.FN
+        new = self.ANN + self.FN
+        self.assertEqual(run_check(P, old, new), [])
+
 class BlankBetweenAttrAndFnTest(unittest.TestCase):
     """`#[test]` と fn の間の空行・ブロックコメントでテスト検出が外れない（D3 と D4 の分離）。"""
 

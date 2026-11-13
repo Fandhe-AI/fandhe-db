@@ -283,6 +283,29 @@ _MOD_RE = re.compile(
 )
 
 
+def _walk_back_over_comments(lines: List[str], start: int) -> int:
+    """`start`（1 始まり）から空行・`//` 行・`/* */` ブロックコメントを遡った先頭行を返す。
+
+    ブロックコメントは D3 で注記ブロックを切り離すため、挿入されても対象テストとして
+    選択できるよう選択範囲へ含める（D5）。開始位置を見つけられない `*/` では遡りを止める。
+    """
+    sel = start
+    while sel > 1:
+        prev = lines[sel - 2].strip()
+        if not prev or prev.startswith("//"):
+            sel -= 1
+        elif prev.endswith("*/"):
+            k = sel - 2
+            while k >= 0 and "/*" not in lines[k]:
+                k -= 1
+            if k < 0:
+                break
+            sel = k + 1
+        else:
+            break
+    return sel
+
+
 def find_tests(text: str) -> List[TestRange]:
     """ファイル内容から `#[test]` 付き fn の範囲を抽出する。
 
@@ -367,11 +390,7 @@ def find_tests(text: str) -> List[TestRange]:
             if test_line and test_line < start:
                 start = test_line
             last = end if end is not None else n
-            sel = start
-            while sel > 1 and (
-                not lines[sel - 2].strip() or lines[sel - 2].strip().startswith("//")
-            ):
-                sel -= 1
+            sel = _walk_back_over_comments(lines, start)
             tests.append(
                 TestRange(
                     name=name,
