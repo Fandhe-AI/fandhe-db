@@ -10,12 +10,17 @@
 //! 適用する（本モジュールは RLS を迂回する経路を作らない）。エラー文言には入力された名前と固定文言
 //! だけを含め、他テナントの情報を含めない。
 //!
+//! Issue #3201: 束縛の後に `sql::join::dml_plan` で `JoinedDmlPlan` へ変換するところまでを通す（変換できない形は
+//! 変換器が `0A000` 等で拒否）。計画は捨てて従来どおり固定の `0A000` を返し、実行器への dispatch は #3202。
+//!
 //! 呼び出し元: `core.rs` の autocommit 腕・明示トランザクション腕・Describe 腕の
 //! `ParsedSql::UpdateFrom`／`ParsedSql::DeleteUsing`。
 
 use super::EngineCore;
 use crate::catalog::TableSchema;
 use crate::sql::allowlist::{SqlSurfaceError, ValidatedDeleteUsing, ValidatedUpdateFrom};
+use crate::sql::join::dml::JoinedDmlPlan;
+use crate::sql::udf_call::UdfRegistry;
 use crate::sql::SqlOutcome;
 
 /// 実行が未対応であることを示す固定文言（`0A000`）。
@@ -70,23 +75,51 @@ impl EngineCore {
         crate::sql::dml_from::bind_delete_using(stmt, &target, &refs).map(|_| ())
     }
 
-    /// `UPDATE ... FROM` の実行腕。束縛を通した後に `0A000` を返す（副作用ゼロ）。
+    /// `UPDATE ... FROM` を束縛し、結合 DML の実行入力へ変換する（Issue #3201）。
+    /// SQL 経路の dispatch（Issue #3202）が実行器へ渡す入口で、スキーマだけを参照する純粋な変換のため
+    /// 行・台帳・書き込みトランザクションには触れない。
+    pub(super) fn plan_update_from_stmt(
+        &self,
+        stmt: &ValidatedUpdateFrom,
+        udfs: &UdfRegistry,
+    ) -> Result<JoinedDmlPlan, SqlSurfaceError> {
+        let (target, others) = self.dml_from_schemas(stmt.target_table(), &stmt.from)?;
+        let refs: Vec<&TableSchema> = others.iter().collect();
+        let bound = crate::sql::dml_from::bind_update_from(stmt, &target, &refs)?;
+        crate::sql::join::dml_plan::plan_update_from(&bound, &target, &refs, udfs)
+    }
+
+    /// `DELETE ... USING` を束縛し、結合 DML の実行入力へ変換する（Issue #3201）。
+    pub(super) fn plan_delete_using_stmt(
+        &self,
+        stmt: &ValidatedDeleteUsing,
+        udfs: &UdfRegistry,
+    ) -> Result<JoinedDmlPlan, SqlSurfaceError> {
+        let (target, others) = self.dml_from_schemas(stmt.target_table(), &stmt.using)?;
+        let refs: Vec<&TableSchema> = others.iter().collect();
+        let bound = crate::sql::dml_from::bind_delete_using(stmt, &target, &refs)?;
+        crate::sql::join::dml_plan::plan_delete_using(&bound, &target, &refs, udfs)
+    }
+
+    /// `UPDATE ... FROM` の実行腕。束縛と変換を通した後に `0A000` を返す（副作用ゼロ。dispatch は #3202）。
     pub(super) fn execute_update_from_stub(
         &self,
         stmt: &ValidatedUpdateFrom,
+        udfs: &UdfRegistry,
     ) -> Result<SqlOutcome, SqlSurfaceError> {
-        self.bind_update_from_stmt(stmt)?;
+        self.plan_update_from_stmt(stmt, udfs)?;
         Err(SqlSurfaceError::feature_not_supported(
             UPDATE_FROM_UNSUPPORTED,
         ))
     }
 
-    /// `DELETE ... USING` の実行腕。束縛を通した後に `0A000` を返す（副作用ゼロ）。
+    /// `DELETE ... USING` の実行腕。束縛と変換を通した後に `0A000` を返す（副作用ゼロ。dispatch は #3202）。
     pub(super) fn execute_delete_using_stub(
         &self,
         stmt: &ValidatedDeleteUsing,
+        udfs: &UdfRegistry,
     ) -> Result<SqlOutcome, SqlSurfaceError> {
-        self.bind_delete_using_stmt(stmt)?;
+        self.plan_delete_using_stmt(stmt, udfs)?;
         Err(SqlSurfaceError::feature_not_supported(
             DELETE_USING_UNSUPPORTED,
         ))
