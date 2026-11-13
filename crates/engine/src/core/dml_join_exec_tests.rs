@@ -174,6 +174,7 @@ fn set_x(expr: Expr) -> JoinedUpdateSet {
     let set = crate::sql::set_expr::bind_set_expr("x", &expr, &col, &combined_schema())
         .expect("bind SET");
     JoinedUpdateSet {
+        copies: Vec::new(),
         literal_assignments: Vec::new(),
         items: vec![JoinedSetItem {
             column_index: 1,
@@ -530,6 +531,7 @@ fn self_join_matches_against_the_statement_start_snapshot() {
     )
     .expect("bind");
     p.update = Some(JoinedUpdateSet {
+        copies: Vec::new(),
         literal_assignments: Vec::new(),
         items: vec![JoinedSetItem {
             column_index: 1,
@@ -996,6 +998,7 @@ fn update_from_assigns_time_timestamptz_interval_bpchar_and_array_source_columns
             source_column: Some(1),
         }],
         update: Some(JoinedUpdateSet {
+            copies: Vec::new(),
             literal_assignments: Vec::new(),
             items,
         }),

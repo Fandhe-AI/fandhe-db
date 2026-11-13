@@ -26,7 +26,8 @@ use crate::sql::relation::{ColumnRef, ColumnSlot, ResolvedColumn, TableRef};
 use crate::sql::udf_call::{BinOp, Expr, UdfRegistry};
 
 use super::dml::{
-    EquiKey, JoinedDmlPlan, JoinedDmlSource, JoinedDmlTarget, JoinedSetItem, JoinedUpdateSet,
+    EquiKey, JoinedCopyItem, JoinedDmlPlan, JoinedDmlSource, JoinedDmlTarget, JoinedSetItem,
+    JoinedUpdateSet,
 };
 use super::plan::{collect_leaf_colrefs, flatten_conjuncts, slot_name, to_where_predicates};
 use super::using::JoinScope;
@@ -263,6 +264,30 @@ fn source_type_supported(ty: &ColumnType) -> bool {
         )
 }
 
+/// 式としての SET 代入（`bind_set_expr`）が受理する代入先の列型か。受理しない型（JSONB／JSON／
+/// UUID／BYTEA／NUMERIC／ENUM 等）への source 列の単純コピーは式を経由せず [`JoinedCopyItem`] で運ぶ。
+fn set_expr_accepts_target(ty: &ColumnType) -> bool {
+    matches!(
+        ty,
+        ColumnType::SmallInt
+            | ColumnType::Integer
+            | ColumnType::BigInt
+            | ColumnType::Real
+            | ColumnType::Double
+            | ColumnType::Text
+            | ColumnType::Varchar(_)
+            | ColumnType::Bpchar(_)
+            | ColumnType::Boolean
+            | ColumnType::Date
+            | ColumnType::Timestamp
+            | ColumnType::TimestampTz
+            | ColumnType::Interval
+            | ColumnType::Time
+            | ColumnType::Array(_)
+            | ColumnType::Bit(_)
+    )
+}
+
 /// 結合ビュー上の source 列の合成名。利用者の識別子と衝突しない綴り（NUL を含む）にする。
 fn synthetic_name(position: usize) -> String {
     format!("\u{0}src{position}")
@@ -275,6 +300,7 @@ fn plan_set(
     source_schema: &TableSchema,
 ) -> Result<(JoinedUpdateSet, Vec<usize>), SqlSurfaceError> {
     let mut set = JoinedUpdateSet {
+        copies: Vec::new(),
         literal_assignments: bound.set_literals().to_vec(),
         items: bound
             .set_exprs()
@@ -293,6 +319,7 @@ fn plan_set(
             .columns
             .get(*target_idx)
             .ok_or_else(|| internal("SET column out of range"))?;
+        let mut copy_pos: Option<usize> = None;
         let name = match resolved.relation() {
             0 => slot_name(resolved.slot(), target_schema)?,
             1 => match resolved.slot() {
@@ -322,11 +349,31 @@ fn plan_set(
                             columns.len() - 1
                         }
                     };
+                    if !set_expr_accepts_target(&target_col.ty) {
+                        // 式経路が受理しない型の単純コピー。型が一致する組だけを運ぶ。
+                        if col.ty != target_col.ty {
+                            return Err(SqlSurfaceError::datatype_mismatch(format!(
+                                "column {:?} cannot be assigned a value of a different type",
+                                target_col.name
+                            )));
+                        }
+                        copy_pos = Some(pos);
+                    }
                     synthetic_name(pos)
                 }
             },
             _ => return Err(internal("SET relation index out of range")),
         };
+        if let Some(source_pos) = copy_pos {
+            set.copies.push(JoinedCopyItem {
+                column_index: *target_idx,
+                source_pos,
+                target_ty: target_col.ty.clone(),
+                nullable: target_col.nullable,
+                column_name: target_col.name.clone(),
+            });
+            continue;
+        }
         let bound_set = crate::sql::set_expr::bind_set_expr(
             &target_col.name,
             &Expr::Ident(name),

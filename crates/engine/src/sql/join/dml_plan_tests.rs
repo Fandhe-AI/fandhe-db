@@ -234,3 +234,56 @@ fn key_type_class_mismatch_is_datatype_mismatch() {
 fn target_filter_count(p: &JoinedDmlPlan) -> usize {
     p.target.metadata_filters.len() + p.target.expr_filters.len() + p.target.or_filters.len()
 }
+
+/// 式経路（`bind_set_expr`）が受理しない列型への source 列の単純コピーは、型を制限せず
+/// 単純コピー項（`copies`）として変換される（SET が式を経由しないため 0A000 にならない）。
+#[test]
+fn plain_set_copy_of_non_expression_types_is_planned_as_copy() {
+    let types = [
+        ColumnType::Json,
+        ColumnType::Jsonb,
+        ColumnType::Uuid,
+        ColumnType::Bytea,
+        ColumnType::Numeric {
+            precision: 10,
+            scale: 2,
+        },
+    ];
+    for ty in types {
+        let target = TableSchema::new(
+            "tt",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("k", ColumnType::Text, false),
+                ColumnDef::new("c", ty.clone(), true),
+            ],
+        );
+        let source = TableSchema::new(
+            "ss",
+            vec![
+                ColumnDef::new("k", ColumnType::Text, false),
+                ColumnDef::new("c", ty.clone(), true),
+            ],
+        );
+        let toks = crate::sql::lexer::tokenize("UPDATE tt SET c = ss.c FROM ss WHERE tt.k = ss.k")
+            .expect("tokenize");
+        let stmt = validate_update_from_tokens_with_limits(
+            &toks,
+            LedgerMode::default(),
+            false,
+            crate::nesting_limits::NestingLimits::default(),
+            &StructuralOnlyLookup,
+        )
+        .unwrap();
+        let refs = [&source];
+        let bound = crate::sql::dml_from::bind_update_from(&stmt, &target, &refs).unwrap();
+        let p = plan_update_from(&bound, &target, &refs, &UdfRegistry::default())
+            .unwrap_or_else(|e| panic!("{ty:?}: {e:?}"));
+        let u = p.update.as_ref().unwrap();
+        assert!(u.items.is_empty(), "{ty:?}");
+        assert_eq!(u.copies.len(), 1, "{ty:?}");
+        assert_eq!(u.copies[0].column_index, 2);
+        assert_eq!(u.copies[0].target_ty, ty);
+        assert_eq!(p.source.columns, vec![1]);
+    }
+}
