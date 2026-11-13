@@ -188,6 +188,8 @@ pub(super) fn update_rows_with_triggers(
             .try_reserve_exact(candidate_ids.len())
             .map_err(|_| reserve_err())?;
     }
+    // 行ループの間は、トリガ本体が同じ表の行を消せない（`trigger::row_loop`。D6 の暫定ガード）。
+    let row_loop_guard = crate::trigger::row_loop::RowLoopGuard::enter(ctx.tenant_id(), table);
     for (pos, id) in candidate_ids.iter().enumerate() {
         crate::interrupt::check().map_err(TenantWriteError::TriggerFailed)?;
         let row_extra: &[(usize, Value)] = match spec.row_overrides {
@@ -284,6 +286,7 @@ pub(super) fn update_rows_with_triggers(
             after_queue.push((old_values, final_row));
         }
     }
+    drop(row_loop_guard);
     if !written.is_empty() {
         let delta = crate::constraint::enforce_row_constraints_in_txn(
             write_txn,
@@ -395,6 +398,8 @@ pub(super) fn delete_rows_with_triggers(
             .try_reserve_exact(candidate_ids.len())
             .map_err(|_| reserve_err())?;
     }
+    // 行ループの間は、トリガ本体が同じ表の行を消せない（`trigger::row_loop`。D6 の暫定ガード）。
+    let row_loop_guard = crate::trigger::row_loop::RowLoopGuard::enter(ctx.tenant_id(), table);
     for id in candidate_ids {
         crate::interrupt::check().map_err(TenantWriteError::TriggerFailed)?;
         let existing = read_row(write_txn, table, ctx, *id)?;
@@ -435,6 +440,7 @@ pub(super) fn delete_rows_with_triggers(
             after_queue.push(old_values);
         }
     }
+    drop(row_loop_guard);
     if !removed.is_empty() {
         crate::constraint::forget_unique_index_rows_in_txn(
             write_txn,

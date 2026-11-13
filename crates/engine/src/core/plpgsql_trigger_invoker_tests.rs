@@ -305,21 +305,15 @@ fn body_error_in_explicit_transaction_fails_the_transaction() {
 
 // (5) 未対応の形は固定の `0A000` で拒否され、副作用が残らない。
 //
-// tracked: #3186, #3187
-// 本体の `UPDATE`・`DELETE`・表を読む `SELECT` は、窓口を広げる #3186・#3187 までの暫定の拒否。
+// tracked: #3186
+// 本体の `UPDATE` は、窓口を広げる #3186 までの暫定の拒否（`DELETE`・表を読む `SELECT` は #3187 で対応済み。
+// 新挙動は `plpgsql_trigger_delete_select_tests`）。
 #[test]
-fn update_delete_and_table_select_in_body_are_rejected_for_now() {
+fn update_in_body_is_rejected_for_now() {
     let (core, _g) = core_with("trginv-pending", LedgerMode::Optional);
     base_tables(&core);
     ok(&core, "t1", "INSERT INTO audit (n) VALUES (1)");
-    for (i, stmt) in [
-        "UPDATE audit SET n = 9",
-        "DELETE FROM audit",
-        "SELECT n INTO x FROM audit",
-    ]
-    .iter()
-    .enumerate()
-    {
+    for (i, stmt) in ["UPDATE audit SET n = 9"].iter().enumerate() {
         let f = format!("pend{i}");
         create_fn(
             &core,

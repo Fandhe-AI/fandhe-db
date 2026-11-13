@@ -172,6 +172,9 @@ mod plpgsql_host_tests;
 // 本番のトリガ関数 invoker とセッション無しのホストの結合テスト（Issue #3184・SQL-68）。
 #[cfg(test)]
 mod plpgsql_trigger_invoker_tests;
+// トリガ本体の `DELETE`・表を読む `SELECT` の結合テスト（Issue #3187・SQL-68）。
+#[cfg(test)]
+mod plpgsql_trigger_delete_select_tests;
 // トリガ関数の内部 API の結合テスト（Issue #2228・SQL-68）。
 #[cfg(test)]
 mod plpgsql_trigger_tests;

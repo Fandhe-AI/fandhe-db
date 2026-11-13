@@ -2,8 +2,8 @@
 //!
 //! 発火側（`tenant/trigger_insert.rs`）が、外側の文と同じ write txn・同じ呼び出しテナントの
 //! `PolicyContext` を借用して作り、[`TriggerCall`](super::call::TriggerCall) に載せてトリガ関数の実体へ
-//! 渡す。実体は raw な `redb::WriteTransaction` を持たず、この窓口の [`TriggerWriteHandle::insert_row`]
-//! だけで書く。
+//! 渡す。実体は raw な `redb::WriteTransaction` を持たず、この窓口の [`TriggerWriteHandle::insert_row`]・
+//! `run_insert`・`run_delete`（Issue #3187）だけで書き、`with_read_source`（同 Issue）の読み取り専用の源だけで読む。
 //!
 //! 契約（fail-closed）:
 //! - 書き込みは SQL `INSERT` と同じ `tenant::insert_typed_row_unchecked` を通る（第 2 の書き込み経路を
@@ -18,9 +18,10 @@
 //! - 書いた表名を記録し、発火側が遅延 FK の検査対象にする
 //!
 //! 本番の結線（トリガ関数の本体の SQL をこの窓口経由で実行する経路）は Issue #3184 の
-//! `core::plpgsql_trigger_host`（`run_insert` で `INSERT ... VALUES` を、`function_def`・`table_schema` で
-//! 同じ txn のカタログを読む。通常の関数・`DO` の本体を同じ Tx で実行するホストは Issue #2226 の
-//! `core::plpgsql_host`）。
+//! `core::plpgsql_trigger_host`（`run_insert` で `INSERT ... VALUES` を、`run_delete` で `DELETE` を、
+//! `with_read_source` で表を読む `SELECT` を、`function_def`・`table_schema` で同じ txn のカタログを読む。
+//! 外側の行ループが進行中の表への `DELETE` は `trigger::row_loop` の暫定ガードで拒否する。`UPDATE` は #3186。
+//! 通常の関数・`DO` の本体を同じ Tx で実行するホストは Issue #2226 の `core::plpgsql_host`）。
 
 use std::cell::RefCell;
 
@@ -28,7 +29,31 @@ use crate::catalog::TableSchema;
 use crate::policy::PolicyContext;
 use crate::row_codec::Value;
 use crate::sql::allowlist::SqlSurfaceError;
+use crate::storage::read_source::ReadSource;
 use crate::tenant::{TenantWriteError, WriteTarget};
+
+/// トリガ本体の読み取り専用の読み取り源（外側の write txn の薄い包み。Issue #3187）。
+/// [`ReadSource`] だけを公開し、書き込みハンドルへ到達できない（変更ログの捕捉を経ない裏口にならない）。
+/// 確定済みスナップショットではないため `snapshot()` は `None` で、キャッシュ経路へは落ちない。
+pub(crate) struct TriggerReadSource<'a>(&'a redb::WriteTransaction);
+
+impl ReadSource for TriggerReadSource<'_> {
+    type Table<'s, K: redb::Key + 'static, V: redb::Value + 'static>
+        = <redb::WriteTransaction as ReadSource>::Table<'s, K, V>
+    where
+        Self: 's;
+
+    fn open_table<'s, K: redb::Key + 'static, V: redb::Value + 'static>(
+        &'s self,
+        def: redb::TableDefinition<'_, K, V>,
+    ) -> Result<Self::Table<'s, K, V>, redb::TableError> {
+        ReadSource::open_table(self.0, def)
+    }
+
+    fn snapshot(&self) -> Option<&redb::ReadTransaction> {
+        None
+    }
+}
 
 /// トリガ内書き込みの窓口。フィールドはすべて非公開で、構築は発火側（`tenant`）だけが行う。
 pub(crate) struct TriggerWriteHandle<'a> {
@@ -152,11 +177,39 @@ impl<'a> TriggerWriteHandle<'a> {
         f: impl FnOnce(WriteTarget<'_>) -> Result<T, SqlSurfaceError>,
     ) -> Result<T, SqlSurfaceError> {
         let out = f(WriteTarget::InTxn(self.write_txn))?;
+        self.note_written(table);
+        Ok(out)
+    }
+
+    /// [`Self::run_insert`] の `DELETE` 版（Issue #3187）。契約は同じで、成功時に `table`（`DELETE` の対象表）を
+    /// 書いた表として記録する。親行の削除で子が宙に浮く遅延 FK を COMMIT 時（Autocommit は文の終わり）に
+    /// 検査させるための記録で、漏れると fail-open になる。
+    pub(crate) fn run_delete<T>(
+        &self,
+        table: &str,
+        f: impl FnOnce(WriteTarget<'_>) -> Result<T, SqlSurfaceError>,
+    ) -> Result<T, SqlSurfaceError> {
+        let out = f(WriteTarget::InTxn(self.write_txn))?;
+        self.note_written(table);
+        Ok(out)
+    }
+
+    /// 外側と同じ write txn を読み取り源として `f` を実行する（トリガ本体の表を読む `SELECT`。Issue #3187）。
+    /// 自 txn の未 commit の変更（外側の文が先に書いた行を含む）が見える。`f` へ渡すのは読み取り専用の
+    /// [`TriggerReadSource`] だけで、raw な `WriteTransaction` は出さない。
+    pub(crate) fn with_read_source<T>(
+        &self,
+        f: impl FnOnce(&TriggerReadSource<'_>) -> Result<T, SqlSurfaceError>,
+    ) -> Result<T, SqlSurfaceError> {
+        f(&TriggerReadSource(self.write_txn))
+    }
+
+    /// 書いた表として記録する（重複なし。書いた順）。
+    fn note_written(&self, table: &str) {
         let mut written = self.written_tables.borrow_mut();
         if !written.iter().any(|t| t == table) {
             written.push(table.to_string());
         }
-        Ok(out)
     }
 
     /// これまでにトリガが書いた表名（重複なし。書いた順）。
