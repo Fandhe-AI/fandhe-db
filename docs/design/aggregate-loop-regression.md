@@ -258,3 +258,14 @@ bisect 本体は `git rev-list --bisect <bad> ^<good>` で中点を選び、`run
 - 中断までの最大遅延: 期限到達または切断の検出から、最大 `ROW_CHECK_INTERVAL` 行分の処理（最も重い 1 反復 × 1024）＋確認点を持たない区間＋`Err` の巻き戻し。従来の `check()` と同じ上限で、変わらない。liveness の probe は wire 側の `PROBE_INTERVAL`（250ms）で抑えているため、評価の回数が変わっても probe の頻度は変わらない
 - 固定した検査: 確認回数が行数ではなく ⌈行数/1024⌉ の水準になること、後方の確認点・2 回目の poll でも `57014` になること、結果が（NULL・空集合を含め）スコープの有無で一致すること、RLS で他テナントの行が続いても自テナント分だけになること（`sql3208_aggregate_row_check.rs`）
 - A/B（同一ホストの壁時計）: 未検証。本変更の作成環境では実施していない。受け入れ条件のうち「#2888 の増分が消える」は、決定的な根拠（行ごとの thread-local アクセスの除去）までで、実測の回収率は後続の計測で確認する
+
+## #2684 の是正（Issue #3211）
+
+- 原因（コード差分からの推論）: #2684 で `Accumulator::observe` が「`eval_aggregate_input` が行ごとに `AggregateRowValue` を作る → `observe_value` が読んで振り分ける」の 2 段になった。式を含まない入力（`COUNT(*)`・id・列参照）でも行ごとに中間値の生成と 2 回目の `match` が入る。前後を分けた実験は未実施（下記）
+- 変更: `Accumulator::observe` の先頭ガード（`CountDistinct`・`Grouping`・`StringAgg`・`ArrayAgg`）の後に、式を含まない入力を中間値なしで直接観測する分岐を足した。対象は `AllVisible`・`GroupingKeys`・`VectorColumnPresence`・`IdU64` と各列参照（TEXT・整数系・REAL・DOUBLE・NUMERIC・日付時刻系・BOOLEAN・BYTEA・ENUM・UUID・ARRAY・JSON）
+- 従来経路へ戻る条件: 式（`ScalarExpr`・`BoolExpr`・`TypedExpr`・`VectorExpr`）・`VectorColumn`・今後足される variant は `_` の腕で従来の 2 段経路へ戻る（fail-closed）。`StringAgg`／`ArrayAgg` の入力は先頭ガードのまま
+- 意味の基準: 現行の「`eval_aggregate_input` → `observe_value`」の合成。NULL は種別確認より前に `Ok(())`、型不一致は同じ `accumulator_bug`（XX000）の文言。列の取り出しと型検査は `aggregate_input.rs` の `cell_*` に集約し、2 経路で共有する
+- 変えないもの: `observe_value`・`observe_distinct`・`window.rs` の直接呼び出し・`observe_with_budgets`・FILTER・RLS／TABLE-12 の検査位置。実行時の切替は入れていない
+- 固定した検査: 単体の差分テスト `direct_observe_matches_two_stage_path`（入力 × 関数 × 値で、`Ok`／`Err` の文言・`finish`・`text_len` が 2 経路で一致）、結合テスト `sql3211_aggregate_direct_observe.rs`（結果型・値・NULL・空集合・GROUP BY・FILTER・window・テナント境界）
+- A/B（同一ホストの壁時計）: 未検証。本変更の作成環境では実施していない。受け入れ条件のうち「#2684 の増分が消える」は、中間値の生成と 2 回目の `match` の除去までが根拠で、実測の回収率は後続の計測で確認する。因果を前後で分ける実験（#2684 以前の直接 match の手移植との比較）も未実施
+- スコープ外: `observe_value` のインライン化の復元（#3209）、agg_multi の残差（#3210）、`VectorColumn` の 1 段化
