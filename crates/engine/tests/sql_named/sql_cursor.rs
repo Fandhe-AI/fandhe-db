@@ -980,6 +980,7 @@ fn fetch_next_in_respect_tenant_boundary_and_reject_unsupported_direction() {
         assert_eq!(err.wire_code(), "34000", "{sql}");
     }
 }
+
 /// `FETCH ALL`／`FETCH FORWARD ALL`（Issue #3174・WIRE-15）は残り全行を返して末尾へ
 /// 進み、続く `FETCH ALL`・`FETCH NEXT` は 0 行。連結は参照カーソルと一致する。
 #[test]

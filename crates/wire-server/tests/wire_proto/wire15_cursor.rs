@@ -348,6 +348,7 @@ fn wire15_fetch_all_over_simple_query() {
     assert_eq!(read_command_complete(&mut stream), "ROLLBACK");
     read_ready_for_query(&mut stream);
 }
+
 /// RLS: 他テナントのカーソル名は不在と同一の応答（`34000`）になり、存在情報を
 /// 漏らさない。
 #[test]
