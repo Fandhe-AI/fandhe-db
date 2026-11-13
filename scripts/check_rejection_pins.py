@@ -390,17 +390,29 @@ def select_targets(
         if head_text is None:
             continue
         head_tests = find_tests(head_text)
+        base_by_key: Dict[Tuple[Tuple[str, ...], str], TestRange] = {}
+        if fd.old_path is not None:
+            base_src = read_base(fd.old_path)
+            if base_src is not None:
+                base_by_key = {(bt.module, bt.name): bt for bt in find_tests(base_src)}
         for t in head_tests:
             last = t.end if t.end is not None else t.fn_line
-            if any(t.select_start <= a <= last for a in fd.added):
+            if any(t.start <= a <= last for a in fd.added):
                 out[(fd.new_path, t.fn_line)] = (fd.new_path, t)
+            elif any(t.select_start <= a < t.start for a in fd.added):
+                # 注記ブロックの手前（空行・コメント）への追加。無関係な先頭コメントの編集では
+                # 対象にせず、base 側で連続していた注記ブロックが HEAD で切り離された
+                # （ブロック内容が変わった）場合に限り対象にする（D5）
+                bt = base_by_key.get((t.module, t.name))
+                if bt is not None and [x for _, x in bt.block] != [x for _, x in t.block]:
+                    out[(fd.new_path, t.fn_line)] = (fd.new_path, t)
         if fd.deleted and fd.old_path is not None:
             base_text = read_base(fd.old_path)
             if base_text is not None:
                 names = set()  # (モジュールパス, 関数名)
                 for bt in find_tests(base_text):
                     last = bt.end if bt.end is not None else bt.fn_line
-                    if any(bt.select_start <= d <= last for d in fd.deleted):
+                    if any(bt.start <= d <= last for d in fd.deleted):
                         names.add((bt.module, bt.name))
                 base_keys = {(bt.module, bt.name) for bt in find_tests(base_text)}
                 # 親 mod のリネームでモジュールパスが変わっても注記削除を逃さないため、

@@ -450,6 +450,18 @@ class DetachedAnnotationTest(unittest.TestCase):
         new = self.ANN + self.FN
         self.assertEqual(run_check(P, old, new), [])
 
+    def test_unrelated_header_comment_edit_not_flagged(self):
+        # 空行で隔てられたファイル先頭コメントだけの変更は未変更テストを対象にしない
+        old = "// module overview\n\n" + self.FN
+        new = "// module overview (edited)\n\n" + self.FN
+        for ctx in (0, 3):
+            self.assertEqual(run_check(P, old, new, context=ctx), [])
+
+    def test_detaching_existing_annotation_still_detected_with_header(self):
+        old = "// module overview\n\n" + self.ANN + self.FN
+        new = "// module overview\n\n" + self.ANN + "\n" + self.FN
+        self.assertEqual(kinds(run_check(P, old, new)), ["missing-annotation"])
+
 
 if __name__ == "__main__":
     unittest.main()
