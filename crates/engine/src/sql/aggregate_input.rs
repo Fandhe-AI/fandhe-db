@@ -11,7 +11,8 @@
 //! 呼び出し文脈: `sql::aggregate`／`group_by`／`join::aggregate`／`window` の行ループが
 //! RLS 可視性判定と TABLE-12 のテナント整合検査を通過した行についてだけ
 //! `Accumulator::observe` を呼び、その内部から本モジュールが呼ばれる（呼び出し位置は
-//! 変えていない）。型不一致は従来どおり [`accumulator_bug`]（XX000）で fail-closed に
+//! 変えていない）。式を含まない入力（Issue #3211）は `Accumulator::observe` が中間値を
+//! 作らず直接観測し、取り出し・型検査は本モジュールの `cell_*` を共有する。型不一致は従来どおり [`accumulator_bug`]（XX000）で fail-closed に
 //! 拒否し、受信データ経路のため添字アクセス・`unwrap` は使わない。
 
 use std::borrow::Cow;
@@ -96,6 +97,150 @@ fn expr_embedding<'v>(
     }
 }
 
+/// 走査済み行から `index` 番目の列を取り出す（範囲外・NULL は `None`）。
+/// 受信データ経路のため添字アクセスは使わない。
+#[inline(always)]
+pub(crate) fn cell_at<'a>(
+    scanned: &'a [Option<ScalarRef<'a>>],
+    index: usize,
+) -> Option<ScalarRef<'a>> {
+    scanned.get(index).copied().flatten()
+}
+
+/// 列の型検査つき取り出しを 1 か所に集約する（Issue #3211）。
+/// 従来の 2 段経路（[`eval_aggregate_input`]）と、式を含まない入力を中間値なしで
+/// 観測する 1 段経路（`Accumulator::observe`）の両方から使い、型不一致の拒否
+/// （[`accumulator_bug`]・XX000）の文言と条件が 2 経路でずれないようにする。
+macro_rules! typed_cell {
+    ($name:ident, $ret:ty, $as:ident, $msg:expr) => {
+        #[inline(always)]
+        pub(crate) fn $name<'a>(
+            scanned: &'a [Option<ScalarRef<'a>>],
+            index: usize,
+        ) -> Result<Option<$ret>, SqlSurfaceError> {
+            match cell_at(scanned, index) {
+                Some(v) => v.$as().map(Some).ok_or_else(|| accumulator_bug($msg)),
+                None => Ok(None),
+            }
+        }
+    };
+}
+
+typed_cell!(
+    cell_date,
+    i32,
+    as_date,
+    "DateColumn observed a ScalarRef that is not Date"
+);
+typed_cell!(
+    cell_timestamp,
+    i64,
+    as_timestamp,
+    "TimestampColumn observed a ScalarRef that is not Timestamp"
+);
+typed_cell!(
+    cell_time,
+    i64,
+    as_time,
+    "TimeColumn observed a ScalarRef that is not Time"
+);
+typed_cell!(
+    cell_interval,
+    Interval,
+    as_interval,
+    "IntervalColumn observed a ScalarRef that is not Interval"
+);
+typed_cell!(
+    cell_timestamptz,
+    i64,
+    as_timestamptz,
+    "TimestampTzColumn observed a ScalarRef that is not TimestampTz"
+);
+
+/// `INTEGER`／`SMALLINT` 列の値。
+#[inline(always)]
+pub(crate) fn cell_i32<'a>(
+    scanned: &'a [Option<ScalarRef<'a>>],
+    index: usize,
+) -> Result<Option<i32>, SqlSurfaceError> {
+    match cell_at(scanned, index) {
+        Some(ScalarRef::Integer(v)) => Ok(Some(v)),
+        Some(_) => Err(accumulator_bug(
+            "IntegerColumn observed a ScalarRef that is not Integer",
+        )),
+        None => Ok(None),
+    }
+}
+
+/// `BIGINT` 列の値。
+#[inline(always)]
+pub(crate) fn cell_i64<'a>(
+    scanned: &'a [Option<ScalarRef<'a>>],
+    index: usize,
+) -> Result<Option<i64>, SqlSurfaceError> {
+    match cell_at(scanned, index) {
+        Some(ScalarRef::BigInt(v)) => Ok(Some(v)),
+        Some(_) => Err(accumulator_bug(
+            "BigIntColumn observed a ScalarRef that is not BigInt",
+        )),
+        None => Ok(None),
+    }
+}
+
+/// `REAL` 列の値（f64 へ拡張）。
+#[inline(always)]
+pub(crate) fn cell_real<'a>(
+    scanned: &'a [Option<ScalarRef<'a>>],
+    index: usize,
+) -> Result<Option<f64>, SqlSurfaceError> {
+    match cell_at(scanned, index) {
+        Some(ScalarRef::Real(v)) => Ok(Some(f64::from(v))),
+        Some(_) => Err(accumulator_bug(
+            "RealColumn observed a ScalarRef that is not Real",
+        )),
+        None => Ok(None),
+    }
+}
+
+/// `DOUBLE PRECISION` 列の値。
+#[inline(always)]
+pub(crate) fn cell_double<'a>(
+    scanned: &'a [Option<ScalarRef<'a>>],
+    index: usize,
+) -> Result<Option<f64>, SqlSurfaceError> {
+    match cell_at(scanned, index) {
+        Some(ScalarRef::Double(v)) => Ok(Some(v)),
+        Some(_) => Err(accumulator_bug(
+            "DoubleColumn observed a ScalarRef that is not Double",
+        )),
+        None => Ok(None),
+    }
+}
+
+/// `NUMERIC` 列の unscaled 値。格納された Decimal の scale は列の scale と一致する契約で、
+/// 不一致はデコード側の実装バグとして fail-closed に拒否する。
+#[inline(always)]
+pub(crate) fn cell_numeric<'a>(
+    scanned: &'a [Option<ScalarRef<'a>>],
+    index: usize,
+    scale: u8,
+) -> Result<Option<i128>, SqlSurfaceError> {
+    match cell_at(scanned, index) {
+        Some(ScalarRef::Numeric(d)) => {
+            if d.scale() != scale {
+                return Err(accumulator_bug(
+                    "NumericColumn observed a Decimal whose scale does not match the column",
+                ));
+            }
+            Ok(Some(d.unscaled()))
+        }
+        Some(_) => Err(accumulator_bug(
+            "NumericColumn observed a ScalarRef that is not Numeric",
+        )),
+        None => Ok(None),
+    }
+}
+
 /// `input` を 1 行分評価する。`scanned`／`vector`／`scratch` の意味は
 /// [`crate::sql::aggregate::Accumulator::observe`] と同じ。
 pub(crate) fn eval_aggregate_input<'a>(
@@ -106,7 +251,7 @@ pub(crate) fn eval_aggregate_input<'a>(
     scratch: &mut Vec<StackValue>,
 ) -> Result<AggregateRowValue<'a>, SqlSurfaceError> {
     use AggregateRowValue as V;
-    let cell = |index: &usize| scanned.get(*index).copied().flatten();
+    let cell = |index: &usize| cell_at(scanned, *index);
     let count_only = |index: &usize, kind: CountOnlyKind| match cell(index) {
         Some(value) => V::CountOnly { kind, value },
         None => V::Null,
@@ -181,92 +326,28 @@ pub(crate) fn eval_aggregate_input<'a>(
                 V::Null
             }
         }
-        AggregateInput::DateColumn(index) => match cell(index) {
-            Some(v) => V::Date(v.as_date().ok_or_else(|| {
-                accumulator_bug("DateColumn observed a ScalarRef that is not Date")
-            })?),
-            None => V::Null,
-        },
-        AggregateInput::TimestampColumn(index) => match cell(index) {
-            Some(v) => V::Timestamp(v.as_timestamp().ok_or_else(|| {
-                accumulator_bug("TimestampColumn observed a ScalarRef that is not Timestamp")
-            })?),
-            None => V::Null,
-        },
-        AggregateInput::TimeColumn(index) => match cell(index) {
-            Some(v) => V::Time(v.as_time().ok_or_else(|| {
-                accumulator_bug("TimeColumn observed a ScalarRef that is not Time")
-            })?),
-            None => V::Null,
-        },
-        AggregateInput::IntervalColumn(index) => match cell(index) {
-            Some(v) => V::Interval(v.as_interval().ok_or_else(|| {
-                accumulator_bug("IntervalColumn observed a ScalarRef that is not Interval")
-            })?),
-            None => V::Null,
-        },
-        AggregateInput::TimestampTzColumn(index) => match cell(index) {
-            Some(v) => V::TimestampTz(v.as_timestamptz().ok_or_else(|| {
-                accumulator_bug("TimestampTzColumn observed a ScalarRef that is not TimestampTz")
-            })?),
-            None => V::Null,
-        },
-        AggregateInput::IntegerColumn(index) | AggregateInput::SmallIntColumn(index) => {
-            match cell(index) {
-                Some(ScalarRef::Integer(v)) => V::Int32(v),
-                Some(_) => {
-                    return Err(accumulator_bug(
-                        "IntegerColumn observed a ScalarRef that is not Integer",
-                    ))
-                }
-                None => V::Null,
-            }
+        AggregateInput::DateColumn(index) => cell_date(scanned, *index)?.map_or(V::Null, V::Date),
+        AggregateInput::TimestampColumn(index) => {
+            cell_timestamp(scanned, *index)?.map_or(V::Null, V::Timestamp)
         }
-        AggregateInput::BigIntColumn(index) => match cell(index) {
-            Some(ScalarRef::BigInt(v)) => V::Int64(v),
-            Some(_) => {
-                return Err(accumulator_bug(
-                    "BigIntColumn observed a ScalarRef that is not BigInt",
-                ))
-            }
-            None => V::Null,
-        },
-        AggregateInput::RealColumn(index) => match cell(index) {
-            Some(ScalarRef::Real(v)) => V::Float(f64::from(v)),
-            Some(_) => {
-                return Err(accumulator_bug(
-                    "RealColumn observed a ScalarRef that is not Real",
-                ))
-            }
-            None => V::Null,
-        },
-        AggregateInput::DoubleColumn(index) => match cell(index) {
-            Some(ScalarRef::Double(v)) => V::Float(v),
-            Some(_) => {
-                return Err(accumulator_bug(
-                    "DoubleColumn observed a ScalarRef that is not Double",
-                ))
-            }
-            None => V::Null,
-        },
-        // 格納された Decimal の scale は列の scale と一致する契約。不一致は
-        // デコード側の実装バグとして fail-closed に拒否する。
-        AggregateInput::NumericColumn { index, scale, .. } => match cell(index) {
-            Some(ScalarRef::Numeric(d)) => {
-                if d.scale() != *scale {
-                    return Err(accumulator_bug(
-                        "NumericColumn observed a Decimal whose scale does not match the column",
-                    ));
-                }
-                V::Numeric(d.unscaled())
-            }
-            Some(_) => {
-                return Err(accumulator_bug(
-                    "NumericColumn observed a ScalarRef that is not Numeric",
-                ))
-            }
-            None => V::Null,
-        },
+        AggregateInput::TimeColumn(index) => cell_time(scanned, *index)?.map_or(V::Null, V::Time),
+        AggregateInput::IntervalColumn(index) => {
+            cell_interval(scanned, *index)?.map_or(V::Null, V::Interval)
+        }
+        AggregateInput::TimestampTzColumn(index) => {
+            cell_timestamptz(scanned, *index)?.map_or(V::Null, V::TimestampTz)
+        }
+        AggregateInput::IntegerColumn(index) | AggregateInput::SmallIntColumn(index) => {
+            cell_i32(scanned, *index)?.map_or(V::Null, V::Int32)
+        }
+        AggregateInput::BigIntColumn(index) => cell_i64(scanned, *index)?.map_or(V::Null, V::Int64),
+        AggregateInput::RealColumn(index) => cell_real(scanned, *index)?.map_or(V::Null, V::Float),
+        AggregateInput::DoubleColumn(index) => {
+            cell_double(scanned, *index)?.map_or(V::Null, V::Float)
+        }
+        AggregateInput::NumericColumn { index, scale, .. } => {
+            cell_numeric(scanned, *index, *scale)?.map_or(V::Null, V::Numeric)
+        }
         AggregateInput::BoolExpr { source, program } => {
             let embedding = expr_embedding(source, vector, "BoolExpr")?;
             match program.eval(id, embedding, scanned, scratch)? {

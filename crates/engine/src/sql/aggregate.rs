@@ -1327,7 +1327,9 @@ impl Accumulator {
     /// 外から使い回せる。`ScalarExpr` 以外の入力では参照されない。
     ///
     /// Issue #1808: 「行ごとの入力評価（[`eval_aggregate_input`]）→ 観測
-    /// （`observe_value`）」の 2 段構成。値の取り出しは評価ステージに集約している。
+    /// （`observe_value`）」の 2 段構成。Issue #3211: 式を含まない入力（`*`・id・列参照）は
+    /// 中間値 `AggregateRowValue` を作らず 1 段で観測し、式・`VectorColumn` など列挙しない
+    /// 入力は従来の 2 段経路へ戻る。値の取り出しと型検査は `aggregate_input::cell_*` を共有する。
     pub(crate) fn observe(
         &mut self,
         input: &AggregateInput,
@@ -1369,8 +1371,99 @@ impl Accumulator {
                 )),
             };
         }
-        let value = eval_aggregate_input(input, id, vector, scanned, scratch)?;
-        self.observe_value(value)
+        // Issue #3211（#2684 の是正）: 式を含まない入力（`*`・id・列参照）は
+        // `AggregateRowValue` を作らず直接観測する。意味の基準は現行の
+        // 「`eval_aggregate_input` → `observe_value`」の合成で、NULL は種別確認より前に
+        // `Ok(())`、型不一致は `cell_*` 経由で同じ `accumulator_bug` 文言に揃う。
+        // 列挙しない入力（式・VectorColumn・今後の variant）は `_` で従来の 2 段経路へ戻し、
+        // fail-closed を保つ。
+        use crate::sql::aggregate_input as ai;
+        match input {
+            AggregateInput::AllVisible | AggregateInput::GroupingKeys(_) => self.observe_present(),
+            AggregateInput::VectorColumnPresence => {
+                if vector.dim == 0 {
+                    Ok(())
+                } else {
+                    self.observe_present()
+                }
+            }
+            AggregateInput::IdU64 => self.observe_id(id),
+            AggregateInput::TextColumn(index)
+            | AggregateInput::CollatedTextColumn { index, .. } => {
+                match ai::cell_at(scanned, *index).and_then(|v| v.as_text()) {
+                    Some(s) => self.observe_text(Some(s)),
+                    None => Ok(()),
+                }
+            }
+            AggregateInput::IntegerColumn(index) | AggregateInput::SmallIntColumn(index) => {
+                match ai::cell_i32(scanned, *index)? {
+                    Some(v) => self.observe_int(Some(i64::from(v))),
+                    None => Ok(()),
+                }
+            }
+            AggregateInput::BigIntColumn(index) => match ai::cell_i64(scanned, *index)? {
+                Some(v) => self.observe_int(Some(v)),
+                None => Ok(()),
+            },
+            AggregateInput::RealColumn(index) => match ai::cell_real(scanned, *index)? {
+                Some(v) => self.observe_float(v),
+                None => Ok(()),
+            },
+            AggregateInput::DoubleColumn(index) => match ai::cell_double(scanned, *index)? {
+                Some(v) => self.observe_float(v),
+                None => Ok(()),
+            },
+            AggregateInput::NumericColumn { index, scale, .. } => {
+                match ai::cell_numeric(scanned, *index, *scale)? {
+                    Some(v) => self.observe_numeric(Some(v)),
+                    None => Ok(()),
+                }
+            }
+            AggregateInput::DateColumn(index) => match ai::cell_date(scanned, *index)? {
+                Some(v) => self.observe_date(Some(v)),
+                None => Ok(()),
+            },
+            AggregateInput::TimestampColumn(index) => match ai::cell_timestamp(scanned, *index)? {
+                Some(v) => self.observe_timestamp(Some(v)),
+                None => Ok(()),
+            },
+            AggregateInput::TimeColumn(index) => match ai::cell_time(scanned, *index)? {
+                Some(v) => self.observe_time(Some(v)),
+                None => Ok(()),
+            },
+            AggregateInput::IntervalColumn(index) => match ai::cell_interval(scanned, *index)? {
+                Some(v) => self.observe_interval(Some(v)),
+                None => Ok(()),
+            },
+            AggregateInput::TimestampTzColumn(index) => {
+                match ai::cell_timestamptz(scanned, *index)? {
+                    Some(v) => self.observe_timestamptz(Some(v)),
+                    None => Ok(()),
+                }
+            }
+            AggregateInput::BooleanColumn(index) => match ai::cell_at(scanned, *index) {
+                Some(row_codec::ScalarRef::Bool(b)) => self.observe_bool(Some(b)),
+                Some(_) => Err(accumulator_bug(
+                    "BooleanColumn observed a ScalarRef that is not Bool",
+                )),
+                None => Ok(()),
+            },
+            AggregateInput::ByteaColumn(index)
+            | AggregateInput::EnumColumn(index)
+            | AggregateInput::UuidColumn(index)
+            | AggregateInput::ArrayColumn(index)
+            | AggregateInput::JsonColumn(index) => {
+                if ai::cell_at(scanned, *index).is_some() {
+                    self.observe_present()
+                } else {
+                    Ok(())
+                }
+            }
+            _ => {
+                let value = eval_aggregate_input(input, id, vector, scanned, scratch)?;
+                self.observe_value(value)
+            }
+        }
     }
 
     /// 評価済みの行値をアキュムレータの入口（`observe_*`）へ振り分ける
@@ -5834,5 +5927,107 @@ mod tests {
             "COUNT(*) must fail closed on corrupted REAL metadata even with no scalar column referenced",
         );
         assert_eq!(err.wire_code(), "XX000");
+    }
+
+    /// Issue #3211: 式を含まない入力の 1 段観測（`observe`）が、従来の 2 段経路
+    /// （`eval_aggregate_input` → `observe_value`）と、`Ok`／`Err`（SQLSTATE・文言）・`finish`
+    /// の結果・`text_len` まで一致することを、入力 × 関数 × 値の組で固定する。
+    #[test]
+    fn direct_observe_matches_two_stage_path() {
+        use crate::numeric::Decimal;
+        use crate::row_codec::ScalarRef as R;
+        use AggregateFunc::{
+            Avg, BoolAnd, BoolOr, Count, Max, Min, StddevPop, Sum, VarSamp, Variance,
+        };
+        let iv = crate::datetime::Interval {
+            months: 1,
+            days: 2,
+            micros: 3,
+        };
+        let dec = |u: i128, sc: u8| Decimal::from_parts(u, sc).expect("decimal");
+        let inputs = [
+            AggregateInput::AllVisible,
+            AggregateInput::VectorColumnPresence,
+            AggregateInput::IdU64,
+            AggregateInput::TextColumn(0),
+            AggregateInput::IntegerColumn(0),
+            AggregateInput::SmallIntColumn(0),
+            AggregateInput::BigIntColumn(0),
+            AggregateInput::RealColumn(0),
+            AggregateInput::DoubleColumn(0),
+            AggregateInput::NumericColumn {
+                index: 0,
+                precision: 10,
+                scale: 2,
+            },
+            AggregateInput::DateColumn(0),
+            AggregateInput::TimestampColumn(0),
+            AggregateInput::TimeColumn(0),
+            AggregateInput::IntervalColumn(0),
+            AggregateInput::TimestampTzColumn(0),
+            AggregateInput::BooleanColumn(0),
+            AggregateInput::ByteaColumn(0),
+            AggregateInput::UuidColumn(0),
+            AggregateInput::ArrayColumn(0),
+            AggregateInput::JsonColumn(0),
+            // 範囲外の添字は NULL 扱い（従来どおり）。
+            AggregateInput::IntegerColumn(9),
+        ];
+        let cells: Vec<Option<R<'static>>> = vec![
+            None,
+            Some(R::Text("b")),
+            Some(R::Text("a")),
+            Some(R::Integer(i32::MAX)),
+            Some(R::Integer(-3)),
+            Some(R::BigInt(i64::MAX)),
+            Some(R::BigInt(7)),
+            Some(R::Real(1.5)),
+            Some(R::Double(-0.0)),
+            Some(R::Double(f64::MAX)),
+            Some(R::Numeric(dec(12345, 2))),
+            Some(R::Numeric(dec(5, 0))),
+            Some(R::Date(10)),
+            Some(R::Timestamp(11)),
+            Some(R::Time(12)),
+            Some(R::TimestampTz(13)),
+            Some(R::Interval(iv)),
+            Some(R::Bool(true)),
+            Some(R::Bool(false)),
+        ];
+        let funcs = [
+            Count, Sum, Avg, Min, Max, BoolAnd, BoolOr, Variance, VarSamp, StddevPop,
+        ];
+        let mut combos = 0usize;
+        for input in &inputs {
+            for func in funcs {
+                if Accumulator::new(func, input).is_err() {
+                    continue;
+                }
+                for dim in [0u32, 3] {
+                    let vector = RowVector { dim, values: None };
+                    let mut fast = Accumulator::new(func, input).expect("new");
+                    let mut slow = Accumulator::new(func, input).expect("new");
+                    let mut scratch = Vec::new();
+                    for (n, cell) in cells.iter().chain(cells.iter()).enumerate() {
+                        let scanned = [*cell];
+                        let id = u64::MAX - n as u64;
+                        let a = fast.observe(input, id, &vector, &scanned, &mut scratch);
+                        let b = eval_aggregate_input(input, id, &vector, &scanned, &mut scratch)
+                            .and_then(|v| slow.observe_value(v));
+                        assert_eq!(
+                            format!("{a:?}"),
+                            format!("{b:?}"),
+                            "{func:?} {input:?} cell {cell:?}"
+                        );
+                        assert_eq!(fast.text_len(), slow.text_len());
+                    }
+                    let fa = format!("{:?}", fast.finish());
+                    let fb = format!("{:?}", slow.finish());
+                    assert_eq!(fa, fb, "{func:?} {input:?}");
+                    combos += 1;
+                }
+            }
+        }
+        assert!(combos > 100, "combos={combos}");
     }
 }
