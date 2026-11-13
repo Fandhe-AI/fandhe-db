@@ -522,11 +522,10 @@ fn set_schema_name_collisions_are_rejected_without_side_effects() {
         ("CREATE SEQUENCE s2.t_id_seq", "sequence name"),
     ] {
         ok_as(&core, "alice", &mut s, setup);
-        assert_eq!(
-            code_as(&core, "alice", &mut s, "ALTER TABLE s1.t SET SCHEMA s2"),
-            "42P07",
-            "{label}"
-        );
+        let e = err_as(&core, "alice", &mut s, "ALTER TABLE s1.t SET SCHEMA s2");
+        assert_eq!(e.wire_code(), "42P07", "{label}");
+        // 内部リレーションキー（`#<id>.`）を利用者向けエラーへ出さない。
+        assert!(!format!("{e:?}").contains('#'), "{label}: {e:?}");
         let cleanup = match label {
             "table" => "DROP TABLE s2.t",
             "index name" => "DROP TABLE s2.ti",
@@ -561,10 +560,9 @@ fn set_schema_rejects_when_owned_sequence_is_used_by_another_table() {
         &mut s,
         "CREATE TABLE s1.u (k BIGINT DEFAULT nextval('s1.t_id_seq'))",
     );
-    assert_eq!(
-        code_as(&core, "alice", &mut s, "ALTER TABLE s1.t SET SCHEMA s2"),
-        "2BP01"
-    );
+    let e = err_as(&core, "alice", &mut s, "ALTER TABLE s1.t SET SCHEMA s2");
+    assert_eq!(e.wire_code(), "2BP01");
+    assert!(!format!("{e:?}").contains('#'), "{e:?}");
     assert_eq!(
         count(&core, "alice", &mut s, "s1.t"),
         "Integer(2)".to_string()

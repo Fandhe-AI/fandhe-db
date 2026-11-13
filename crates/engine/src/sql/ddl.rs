@@ -1691,7 +1691,14 @@ pub(crate) fn execute_alter_table_set_schema(
                         undefined_table_or_view(storage, &stmt.table_name)
                     }
                     AlterCheckError::Catalog(CatalogError::TableAlreadyExists(name)) => {
-                        SqlSurfaceError::duplicate_table(name)
+                        SqlSurfaceError::duplicate_table(
+                            crate::catalog::namespace::relation_name_part(&name).to_string(),
+                        )
+                    }
+                    AlterCheckError::Catalog(CatalogError::DependentObjectsStillExist(name)) => {
+                        SqlSurfaceError::DependentObjectsStillExist {
+                            name: crate::catalog::namespace::relation_name_part(&name).to_string(),
+                        }
                     }
                     AlterCheckError::Catalog(other) => map_drop_alter_column_error(other),
                     AlterCheckError::Sql(sql_err) => sql_err,

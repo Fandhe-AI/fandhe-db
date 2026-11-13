@@ -1484,7 +1484,10 @@ pub(crate) fn plan_owned_sequence_moves_in_txn(
         let new_name = format!("{to_prefix}{bare}");
         validate_relation_key(&new_name)?;
         if super::relation_name_exists_in_txn(write_txn, &new_name)? {
-            return Err(CatalogError::TableAlreadyExists(new_name));
+            // 利用者向けエラーに内部キー（`#<id>.`）を出さない。
+            return Err(CatalogError::TableAlreadyExists(
+                super::namespace::relation_name_part(&new_name).to_string(),
+            ));
         }
         moves.push((name, new_name));
     }
@@ -1502,7 +1505,9 @@ pub(crate) fn plan_owned_sequence_moves_in_txn(
                     .as_ref()
                     .is_some_and(|d| column_default_references_sequence(d, old_name))
             }) {
-                return Err(CatalogError::DependentObjectsStillExist(old_name.clone()));
+                return Err(CatalogError::DependentObjectsStillExist(
+                    super::namespace::relation_name_part(old_name).to_string(),
+                ));
             }
         }
     }

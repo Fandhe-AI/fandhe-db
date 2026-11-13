@@ -266,7 +266,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1651（式索引の UNIQUE・列変更への追随。`catalog.rs` に行が追加）で一括追随（旧: 10597／12994／13075／13184／13257／13779）。
     // Issue #1651（式索引の UNIQUE・失効管理。`catalog.rs` に行が追加）で一括追随（旧: 13274／13355／13464／13537／14080／10874）。
     // Issue #2206（GIN 相当索引の宣言。`catalog.rs` に行が追加）で catalog.rs 全エントリを追随。
-    ("catalog.rs", 15728),
+    ("catalog.rs", 15944),
     // `Storage::drop_enum_type`（同上）: 削除前に依存列（当該型を参照する
     // `ColumnType::Enum` 列）が 1 つも無いことを `dependent_tables_in_txn`
     // で検証済みのため、こちらも `CATALOG_TABLE`／`user_rows/{table_name}`
@@ -333,7 +333,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1639（DROP TABLE の複数指定。`catalog.rs` に行が追加）で追随（+118 行）。
     // Issue #1624（RENAME TO の索引・FK・制約追随。`catalog.rs` に行が追加）で一括追随（+79 行。旧: 11412/11493/11632/11665）。
     // Issue #1659（CREATE VIEW の列別名。`catalog.rs` に行が追加）で追随（+101 行。旧: 11250）。
-    ("catalog.rs", 15811),
+    ("catalog.rs", 16027),
     // `Storage::create_view`（TABLE-18・SQL-23・TASK-205、Issue #909）: ビューは
     // `[VIEWS_TABLE]` のみを書き、`CATALOG_TABLE`／`user_rows/{table_name}` の
     // いずれにも触れない（行を持たない非マテリアライズド定義のため対象
@@ -393,7 +393,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1639（DROP TABLE の複数指定。`catalog.rs` に行が追加）で追随（+118 行）。
     // Issue #1624（RENAME TO の索引・FK・制約追随。`catalog.rs` に行が追加）で一括追随（+79 行。旧: 11412/11493/11632/11665）。
     // Issue #1659（CREATE VIEW の列別名。`catalog.rs` に行が追加）で追随（+131 行。旧: 11389）。
-    ("catalog.rs", 15947),
+    ("catalog.rs", 16163),
     // `Storage::drop_view`（同上）: 削除前に依存するビューが 1 つも無いことを
     // `views_depending_on_in_txn` で検証済みのうえで `[VIEWS_TABLE]` のみを
     // 書く。同じ理由でバンプ対象がない。PR #1048 レビュー対応（同上）で
@@ -462,11 +462,11 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1644（TRUNCATE CASCADE／RESTRICT）で catalog.rs 全エントリ +1・tenant.rs 506→516 に追随。
     // Issue #1663（MATERIALIZED VIEW のカタログ追加）の base 取り込みで追随（旧: 13013）。
     // Issue #1671（ビュー INSERT 書き換えで `catalog.rs` に行が追加）で全エントリを追随。
-    ("catalog.rs", 16029),
+    ("catalog.rs", 16245),
     // `Storage::create_or_replace_view_checked`（TABLE-41 (2)、Issue #1660。`create_or_replace_view` の本体）: `create_view` と同じく
     // `[VIEWS_TABLE]` のみを書く（上書き）。ビューは行ストア・世代を持たないためバンプ対象がない。
     // Issue #1737（`is_unique_index_of_table` の追加。`catalog.rs` に +22 行）で追随（旧: 15666）。
-    ("catalog.rs", 16753),
+    ("catalog.rs", 16969),
     // `Storage::drop_tables`（Issue #1684 で本体を `drop_tables_in_txn` へ切り出した）: 世代 bump は
     // 同一 write txn で先に呼ばれる `drop_tables_in_txn` 内（削除する各表と FK を外した参照元表）で
     // 行われ、本呼び出しはその結果（`dropped > 0`）を単一 commit で確定させるだけ。`bump` が
@@ -480,7 +480,12 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #2018（INT8VEC 型導入。catalog.rs +39 行）で追随（旧: 12588）。
     // Issue #2025（SPARSEVEC 型導入。catalog.rs +58 行）で追随（旧: 12627）。
     // Issue #3201（`EnumTypeDef::for_test` 追加。catalog.rs +10 行）で追随（旧: 13000）。
-    ("catalog.rs", 13010),
+    ("catalog.rs", 13208),
+    // `Storage::alter_table_rename`／`Storage::alter_table_set_schema`（Issue #3198）: 世代 bump は同一 write txn で
+    // 先に呼ばれる共有実装 `rename_table_key_in_txn`（旧名・新名・FK 参照元表の世代を進める）が行い、
+    // 本呼び出しはその結果を単一 commit で確定させるだけ（`alter_table_rename` は #3198 で本体を切り出した）。
+    ("catalog.rs", 14124),
+    ("catalog.rs", 14319),
     // 上記 `drop_tables_in_txn` 切り出し（+18 行）に伴い、以降の catalog.rs エントリ（12419／12500／12609／12681／13063）を追随（旧: 12401／12482／12591／12663／13045）。
     // `sql::transaction::SessionTransaction::commit`（SQL-31・TASK-221）:
     // ここで commit する共有 `write_txn` に対象テーブルの `user_rows/{table}`
@@ -654,20 +659,20 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // 作成時の適用は作成本体の txn に相乗りし、作成側が世代を進める）。単体テストの `write_txn` ヘルパはテスト専用の commit。
     ("catalog/privilege/default_acl.rs", 479),
     ("catalog/privilege/default_acl/tests.rs", 98),
-    ("catalog/sequence.rs", 1476),
-    ("catalog/sequence.rs", 1496),
-    ("catalog/sequence.rs", 1537),
-    ("catalog/sequence.rs", 1586),
-    ("catalog/sequence.rs", 1625),
-    ("catalog/sequence.rs", 1645),
-    ("catalog/sequence.rs", 1778),
-    ("catalog/sequence.rs", 2052),
-    ("catalog/sequence.rs", 2142),
-    ("catalog/sequence.rs", 2182),
-    ("catalog/sequence.rs", 2235),
-    ("catalog/sequence.rs", 2503),
-    ("catalog/sequence.rs", 2549),
-    ("catalog/sequence.rs", 2816),
+    ("catalog/sequence.rs", 1576),
+    ("catalog/sequence.rs", 1596),
+    ("catalog/sequence.rs", 1637),
+    ("catalog/sequence.rs", 1686),
+    ("catalog/sequence.rs", 1725),
+    ("catalog/sequence.rs", 1745),
+    ("catalog/sequence.rs", 1878),
+    ("catalog/sequence.rs", 2152),
+    ("catalog/sequence.rs", 2242),
+    ("catalog/sequence.rs", 2282),
+    ("catalog/sequence.rs", 2335),
+    ("catalog/sequence.rs", 2603),
+    ("catalog/sequence.rs", 2649),
+    ("catalog/sequence.rs", 2916),
     // `Storage::create_function`／`Storage::drop_function`（UDF カタログ・Issue #1919）:
     // UDF 定義は専用の関数カタログ表のみを書き、`CATALOG_TABLE`／`user_rows/{table_name}`
     // のいずれにも触れない（行を持たない定義メタデータのため、世代照合の対象テーブルが

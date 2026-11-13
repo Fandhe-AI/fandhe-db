@@ -14218,7 +14218,10 @@ impl Storage {
         }
         for (_, new_index, _) in &index_moves {
             if relation_name_exists_in_txn(&write_txn, new_index)? {
-                return Err(CatalogError::TableAlreadyExists(new_index.clone()).into());
+                return Err(CatalogError::TableAlreadyExists(
+                    namespace::relation_name_part(new_index).to_string(),
+                )
+                .into());
             }
         }
         let sequence_moves =
