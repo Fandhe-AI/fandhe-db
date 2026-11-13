@@ -606,8 +606,8 @@ SQL-68 ポインタ。D9 の内部 API と `DO` を実装した。公開 enum `S
 
 ### 既知の差・対象外
 
-- 本番の `TriggerFunctionInvoker` とトリガ文脈（`TriggerWriteHandle`・セッションなし）で本体を実行するホスト、
-  入れ子トリガ間の `ExecBudget` の合算（D11）は #1720。
+- 本番の `TriggerFunctionInvoker` とトリガ文脈（`TriggerWriteHandle`・セッションなし）で本体を実行するホストは #1720。
+  入れ子トリガ間の `ExecBudget` の合算（D11）は共有カウンタで実装済み（下記「既知の差」参照）。
 - SQL の `CREATE FUNCTION ... RETURNS trigger LANGUAGE plpgsql` は #2217（ドル引用は #2216）。
 - `TG_ARGV`・`TG_RELID` 等は未宣言。参照は通常の識別子扱いで、列として解決できず失敗する（fail-closed）。
   `TG_NARGS` は使える。
@@ -1034,5 +1034,6 @@ Issue #2228 の内部 API（`invoke_trigger_function_in_txn`）は両方を要�
 - 書き込み後の `EXCEPTION` 捕捉は `0A000`（上記）
 - 構文解析は確定済みのカタログで行う。同じ Tx 内で作ったばかりの表を本体が参照すると、解析段で不在になる（fail-closed）
 - 本体は発火のたびに解析・検証する（キャッシュなし。性能は本 Issue の対象外）
-- 入れ子のトリガ間の `ExecBudget` の合算（D11）は、本 Issue では呼び出しごとに予算を作るだけで、テストで固定していない（受け皿の Issue は無い。要対応事項）
+- 入れ子のトリガ間の `ExecBudget` の合算（D11）は、`run_trigger_with_handle` が作る `ExecBudget` が、外側の予算が生きている間
+  `interp.rs` の共有カウンタへ文数・反復数を合算する（テストでの固定は受け皿の Issue が無い。要対応事項）
 - 既定の差し替え・wire 経由の E2E は #3185、RLS・台帳・crash の網羅的な再検証は #3188

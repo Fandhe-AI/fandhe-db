@@ -702,3 +702,30 @@ fn body_insert_has_sequence_and_clock_scopes_when_outer_is_delete() {
     ok(&core, "t1", "DELETE FROM tt WHERE n = 2");
     assert_eq!(ints(&core, "t1", "SELECT n FROM audit"), vec![1, 2]);
 }
+
+// 外側が DELETE（時刻の文脈なし）でも、本体の `now()` は VALUES だけでなく代入・`FROM` なしの
+// `SELECT` でも同じく受理される（PR #3369 レビュー指摘。式スコープの時刻もフォールバックで張る）。
+#[test]
+fn body_now_outside_values_is_accepted_when_outer_is_delete() {
+    let (core, _g) = core_with("trginv-now-forms", LedgerMode::Optional);
+    ok(&core, "t1", "CREATE TABLE tt (n INTEGER)");
+    ok(&core, "t1", "CREATE TABLE audit (n INTEGER)");
+    for (i, body) in [
+        "DECLARE t TIMESTAMP; BEGIN t := now(); INSERT INTO audit (n) VALUES (1); RETURN NULL; END",
+        "BEGIN PERFORM now(); EXECUTE 'SELECT now()'; INSERT INTO audit (n) VALUES (2); RETURN NULL; END",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let f = format!("f{i}");
+        create_fn(&core, "t1", &f, body);
+        ok(
+            &core,
+            "t1",
+            &format!("CREATE TRIGGER g{i} AFTER DELETE ON tt FOR EACH ROW EXECUTE FUNCTION {f}()"),
+        );
+    }
+    ok(&core, "t1", "INSERT INTO tt (n) VALUES (1)");
+    ok(&core, "t1", "DELETE FROM tt WHERE n = 1");
+    assert_eq!(ints(&core, "t1", "SELECT n FROM audit"), vec![1, 2]);
+}
