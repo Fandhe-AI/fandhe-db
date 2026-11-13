@@ -463,5 +463,52 @@ class DetachedAnnotationTest(unittest.TestCase):
         self.assertEqual(kinds(run_check(P, old, new)), ["missing-annotation"])
 
 
+class BlankBetweenAttrAndFnTest(unittest.TestCase):
+    """`#[test]` と fn の間の空行・ブロックコメントでテスト検出が外れない（D3 と D4 の分離）。"""
+
+    BODY = "fn reject_x() {\n    assert_eq!(err.wire_code(), \"0A000\");\n}\n"
+
+    def test_blank_line_between_attr_and_fn_still_detected(self):
+        src = "#[test]\n\n" + self.BODY
+        self.assertEqual([t.name for t in crp.find_tests(src)], ["reject_x"])
+        self.assertEqual(kinds(run_check(P, None, src)), ["missing-annotation"])
+
+    def test_block_comment_between_attr_and_fn_still_detected(self):
+        src = "#[test]\n/* note\n   more */\n" + self.BODY
+        self.assertEqual(kinds(run_check(P, None, src)), ["missing-annotation"])
+
+    def test_annotation_before_blank_is_not_contiguous(self):
+        src = "// tracked: #1\n#[test]\n\n" + self.BODY
+        self.assertEqual(kinds(run_check(P, None, src)), ["missing-annotation"])
+
+    def test_attr_then_non_fn_code_resets(self):
+        src = "#[test]\nstruct S;\n" + self.BODY
+        self.assertEqual(crp.find_tests(src), [])
+
+
+class AmbiguousRenameTest(unittest.TestCase):
+    """同名テストを持つ複数モジュールのリネームで対応を確定できなければ検査不能で失敗（D5）。"""
+
+    BODY = "        assert_eq!(err.wire_code(), \"0A000\");\n"
+
+    def mod(self, name, ann):
+        return (f"mod {name} {{\n{ann}    #[test]\n    fn reject_x() {{\n{self.BODY}    }}\n}}\n")
+
+    def test_tie_fails_closed(self):
+        old = self.mod("a", "    // tracked: #1\n") + self.mod("b", "    // tracked: #2\n")
+        new = self.mod("c", "") + self.mod("d", "    // tracked: #2\n")
+        for ctx in (0, 3):
+            with self.assertRaises(crp.DiffParseError):
+                run_check(P, old, new, context=ctx)
+
+    def test_unique_body_disambiguates(self):
+        other = "        let y = 2;\n" + self.BODY
+        def m(name, ann, body):
+            return f"mod {name} {{\n{ann}    #[test]\n    fn reject_x() {{\n{body}    }}\n}}\n"
+        old = m("a", "    // tracked: #1\n", self.BODY) + m("b", "    // tracked: #2\n", other)
+        new = m("c", "", self.BODY) + m("d", "    // tracked: #2\n", other)
+        self.assertEqual(kinds(run_check(P, old, new)), ["missing-annotation"])
+
+
 if __name__ == "__main__":
     unittest.main()

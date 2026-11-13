@@ -293,7 +293,12 @@ def find_tests(text: str) -> List[TestRange]:
     lines = text.split("\n")
     tests: List[TestRange] = []
     block: List[Tuple[int, str]] = []
+    # D4 のテスト属性認識（has_test・test_line）は D3 の注記ブロック連続性（block）と分離する。
+    # 空行・ブロックコメントは block だけを切り離し、`#[test]` 自体の認識は fn まで保持する
+    # （空行を挟んでも有効なテストが検査対象から消えない）。
     has_test = False
+    test_line = 0
+    in_block_cmt = False
     mod_stack: List[Tuple[str, str]] = []  # (インデント, モジュール名)
     i = 0
     n = len(lines)
@@ -301,10 +306,27 @@ def find_tests(text: str) -> List[TestRange]:
         ln = i + 1
         line = lines[i]
         stripped = line.strip()
+        if in_block_cmt:
+            if "*/" in line:
+                in_block_cmt = False
+            block = []
+            i += 1
+            continue
+        if not stripped:
+            block = []
+            i += 1
+            continue
+        if stripped.startswith("/*"):
+            if "*/" not in stripped[2:]:
+                in_block_cmt = True
+            block = []
+            i += 1
+            continue
         if mod_stack and line.rstrip() == mod_stack[-1][0] + "}":
             mod_stack.pop()
             block = []
             has_test = False
+            test_line = 0
             i += 1
             continue
         mm = _MOD_RE.match(line)
@@ -312,6 +334,7 @@ def find_tests(text: str) -> List[TestRange]:
             mod_stack.append((mm.group(1), mm.group(2)))
             block = []
             has_test = False
+            test_line = 0
             i += 1
             continue
         if stripped.startswith("//"):
@@ -323,6 +346,8 @@ def find_tests(text: str) -> List[TestRange]:
             for k in range(i, end_i + 1):
                 block.append((k + 1, lines[k]))
                 if _TEST_ATTR_RE.match(lines[k]):
+                    if not has_test:
+                        test_line = k + 1
                     has_test = True
             i = end_i + 1
             continue
@@ -339,6 +364,8 @@ def find_tests(text: str) -> List[TestRange]:
                         end = j + 1
                         break
             start = block[0][0] if block else ln
+            if test_line and test_line < start:
+                start = test_line
             last = end if end is not None else n
             sel = start
             while sel > 1 and (
@@ -359,6 +386,7 @@ def find_tests(text: str) -> List[TestRange]:
             )
         block = []
         has_test = False
+        test_line = 0
         i += 1
     return tests
 
@@ -376,6 +404,11 @@ def _common_suffix_len(a: Tuple[str, ...], b: Tuple[str, ...]) -> int:
     while n < len(a) and n < len(b) and a[-1 - n] == b[-1 - n]:
         n += 1
     return n
+
+
+def _body_text(t: TestRange) -> List[str]:
+    """fn 行以降の本文（注記ブロック・属性を除く）。リネーム前後の同一性判定に使う。"""
+    return [x for k, x in t.lines if k >= t.fn_line]
 
 
 def select_targets(
@@ -423,7 +456,8 @@ def select_targets(
                     if (t.module, t.name) in names:
                         out[(fd.new_path, t.fn_line)] = (fd.new_path, t)
                 renamed = [t for t in head_tests if (t.module, t.name) not in base_keys]
-                for bmod, bname in names:
+                base_tests = {(bt.module, bt.name): bt for bt in find_tests(base_text)}
+                for bmod, bname in sorted(names):
                     if any(t.module == bmod and t.name == bname for t in head_tests):
                         continue
                     cands = [t for t in renamed if t.name == bname]
@@ -432,8 +466,21 @@ def select_targets(
                     scored = [(_common_suffix_len(t.module, bmod), t) for t in cands]
                     best = max(sc for sc, _ in scored)
                     top = [t for sc, t in scored if sc == best]
+                    if len(top) > 1:
+                        # 本体（fn 行以降）が base と一致する候補へ絞る
+                        bt0 = base_tests.get((bmod, bname))
+                        if bt0 is not None:
+                            want = _body_text(bt0)
+                            top = [t for t in top if _body_text(t) == want] or top
                     if len(top) == 1:
                         out[(fd.new_path, top[0].fn_line)] = (fd.new_path, top[0])
+                    else:
+                        # 対応を確定できないまま黙って除外すると注記削除を見逃すため fail-closed
+                        raise DiffParseError(
+                            f"{fd.new_path}: cannot map deleted test '{bname}' in module "
+                            f"{'::'.join(bmod) or '(root)'} to a unique renamed test "
+                            f"({len(top)} candidates)"
+                        )
     return sorted(out.values(), key=lambda x: (x[0], x[1].fn_line))
 
 
