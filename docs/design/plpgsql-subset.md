@@ -967,3 +967,72 @@ SQL-67 の (2)(3)(5)(6)(7) のポインタ。仕様本文は転記しない。
 - 未対応の形は `where_probe` で NULL を偽に潰さず、固定文言の `0A000` で拒否する
 - 既知の差: 短絡評価のため、評価されなかった右辺の型不一致や定数畳み込みのエラー（例 `IF false AND 1`）は
   PostgreSQL（計画時にエラー）と違い起きない場合がある。`IN`／`BETWEEN` の `NULL` リテラルは定義時に `0A000`
+
+## Issue #3184 追記（本番のトリガ関数 invoker とセッション無しのホスト。TABLE-45・SQL-68・RLS-10 ポインタ）
+
+トリガの発火点は `SessionState`・`SessionTransaction` を持たない（外側の write txn と `PolicyContext` の借用だけ）。
+Issue #2228 の内部 API（`invoke_trigger_function_in_txn`）は両方を要求するため、発火経路から呼べなかった。本 Issue で
+`TriggerFunctionInvoker` の本番実装（`PlpgsqlTriggerInvoker`）と、セッション無しで本体を実行するホストを用意した。
+`EngineCore::new` の既定（未結線の `0A000`）の差し替えと wire・psql 経由の E2E は #3185 の担当で、本 Issue では
+既定を変えない（テストが `with_trigger_invoker_for_test` で注入して確かめる）。
+
+### 構成
+
+| 要素 | 置き場 | 役割 |
+| ---- | ------ | ---- |
+| `TriggerHost`（trait。`Sync`） | `trigger::call` | 発火文脈でトリガ関数を 1 回実行する口。`EngineCore` が実装する |
+| `TriggerRuntime<'h>::bind` | `trigger::runtime` | 文の実行の間だけホストを束縛した通過証を作る（`Arc` の複製と上限の複写だけ）。`core` は書き込み経路へ `Some(&self.trigger_runtime.bind(self))` を渡す。`unsafe` もスレッドローカルへの参照格納も使わない |
+| `PlpgsqlTriggerInvoker` | `trigger::call` | 本番の invoker。`TriggerCall::host` へ委譲するだけで、ホストが無い（未束縛の）経路は固定文言の `0A000` |
+| 主体の写し | `trigger::subject`・`SessionState::trigger_subject_snapshot` | 文の実行入口（`session_time_zone_scope`）が発火元セッションの主体を現スレッドへ張る RAII 区間。ロール・`search_path`・TimeZone・一時カタログ・`row_security`・解決テナントは発火元のまま、セッションの宣言的 UDF だけ持ち込まない。全フィールドを明示列挙しており、フィールド追加時にコンパイルエラーで引き継ぎの要否を決めさせる |
+| `TriggerWriteHandle` の拡張 | `trigger::write_handle` | `PolicyContext` の読み取りアクセサ・同じ write txn での関数定義と表スキーマの読み取り・`INSERT` の実行口（`run_insert`）。raw な write txn は外へ出さず、書いた表名を記録して遅延 FK の確定対象にする |
+| ホスト本体 | `core::plpgsql_trigger_host` | `impl TriggerHost for EngineCore` と、トリガ発火文脈の文種ゲート |
+| `CorePlHost` のバックエンド化 | `core::plpgsql_host` | 実行先を `HostTxn`（`Session`＝呼び出し元の Tx、`Trigger`＝窓口）の列挙にした。式評価・条件評価・`42702` 検査・`%TYPE` 解決・戻り値の写像（`map_trigger_return`）は両者で共有し、第 2 のホストを作らない |
+
+### 実行の順序（`invoke_trigger`）
+
+1. 主体の写しから派生セッションを作る。区間が無ければ固定文言の `0A000`（既定セッションで実行する fail-open を作らない）。
+   解決テナントが発火文脈のテナントと食い違えば `Internal`
+2. 関数定義を呼び出しテナントの scope から同じ write txn で引く（他テナントの定義は構造上引けず、不在と同じ `42883`）。
+   `RETURNS trigger` の PL/pgSQL でない・`SECURITY DEFINER` は `0A000`（D9）
+3. 定義時と同じ検証（`parse_body`・`validate_embedded`・本体長と入れ子の上限）を毎回行う（解析のキャッシュは持たない）
+4. `trigger_vars_from_call` で `NEW`／`OLD`／`TG_*` を作る。`TG_TABLE_SCHEMA` は、SCHEMA 配下の内部キーを呼び出しテナントの
+   SCHEMA 名へ逆引きし、裸の名前は `public`
+5. トリガ用バックエンドで本体を実行し、戻り値を `TriggerOutcome`（NULL は `Skip`・行は表の列と照合して `Proceed`）へ写す。
+   エラーは `scrub_error` を通す。文の取り消しは発火側が write txn ごと破棄して行い、明示 Tx の `Failed` 化（`25P02`）は
+   既存の経路が担う
+
+### 文種ゲート（トリガ発火文脈）
+
+解析は通常の本体と同じ許可リスト解析・権限ゲート（派生セッションのロールで効く。権限は広がらない）。共通ゲート
+（DDL・Tx 制御・`SET` 等・`USING OPERATION_ID`／`PARTITIONED`・揮発性）の後に、次の許可リストだけを実行する。
+それ以外は固定の英語文言の `0A000`（値・表名・他テナントの情報を含めない）で、既存の `execute_in_active_txn` へは流さない。
+
+| 文 | 扱い |
+| -- | ---- |
+| `FROM` なしの `SELECT`（式評価・条件） | 実行（ルーチン呼び出しを含むものは `0A000`） |
+| `INSERT ... VALUES`（単一行・複数行） | 実行。SQL `INSERT` と同じ束縛・実行関数を通す。行数・バッチの上限は通常と同じ。入れ子の発火には束縛済みの通過証を引き継ぐ（深さ上限 `54001`） |
+| `UPDATE`／`DELETE`・表を読む `SELECT`（`SELECT INTO`・`PERFORM`・`FOR` を含む） | `0A000`。窓口の拡張は #3186・#3187 |
+| `INSERT` の `ON CONFLICT`・`RETURNING`・`INSERT ... SELECT`・ビュー・データ変更 CTE・SCHEMA 修飾の書き込み先・一時表への振り分け | `0A000`（許可リストに無い形。既知の差） |
+
+### 台帳（D10）
+
+本体の書き込みは台帳に記録せず、要求もしない。実行は `LedgerMode::CompareOnlyWithoutLedger`（台帳に触れない `Disabled`）で行い、
+構文解析中だけ書き込み文の `operation_id` 必須化（台帳必須の構成の `23502`）を外す（`parse_ledger_mode`）。外側の文の必須検査は
+トリガを呼ぶ前に済んでおり、外側の 1 エントリだけが台帳に載る。再送は `23505` でトリガ本体を再実行しない。
+
+### `EXCEPTION` 節
+
+窓口は savepoint を持てない。既定の `rollback_block` は `Ok(())` を返すため、そのまま使うと書き込みを残したまま捕捉する fail-open に
+なる。そこでブロックに入った時点の「書き込みの試行回数」（成功・失敗を問わない）を印にし、ブロック内で書き込みを試みていれば
+捕捉せず `0A000` を伝える。書き込み前の純粋な評価エラー（0 除算等）だけ捕捉できる。
+
+### 既知の差・対象外
+
+- `UPDATE`／`DELETE`・表を読む `SELECT`: #3186・#3187（窓口の拡張）
+- 一時表・SCHEMA 修飾の書き込み先・`ON CONFLICT`・`RETURNING`・`INSERT ... SELECT`・ビュー・本体からのルーチン呼び出し:
+  本 Issue では `0A000`（受け皿の Issue は無い。要対応事項）
+- 書き込み後の `EXCEPTION` 捕捉は `0A000`（上記）
+- 構文解析は確定済みのカタログで行う。同じ Tx 内で作ったばかりの表を本体が参照すると、解析段で不在になる（fail-closed）
+- 本体は発火のたびに解析・検証する（キャッシュなし。性能は本 Issue の対象外）
+- 入れ子のトリガ間の `ExecBudget` の合算（D11）は、本 Issue では呼び出しごとに予算を作るだけで、テストで固定していない（受け皿の Issue は無い。要対応事項）
+- 既定の差し替え・wire 経由の E2E は #3185、RLS・台帳・crash の網羅的な再検証は #3188

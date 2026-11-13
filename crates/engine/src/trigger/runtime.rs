@@ -9,32 +9,41 @@
 
 use std::sync::Arc;
 
-use super::call::{TriggerCall, TriggerFunctionInvoker, TriggerOutcome, UnwiredInvoker};
+use super::call::{
+    TriggerCall, TriggerFunctionInvoker, TriggerHost, TriggerOutcome, UnwiredInvoker,
+};
 use super::depth;
 use crate::sql::allowlist::SqlSurfaceError;
 use crate::trigger_limits::TriggerLimits;
 
 /// 呼び出し口と深さ上限を保持する通過証。フィールドは非公開で、構築はこのモジュールだけが行う。
-pub(crate) struct TriggerRuntime {
+///
+/// `'h` は束縛されたホスト（[`TriggerHost`]）の借用の寿命。`EngineCore` が保持する値は未束縛
+/// （`'static`・`host` なし）で、書き込み経路へ渡すときだけ [`TriggerRuntime::bind`] で文ごとに
+/// ホストを束縛する（Issue #3184。本番の invoker が `&EngineCore` を要するため）。
+pub(crate) struct TriggerRuntime<'h> {
     invoker: Arc<dyn TriggerFunctionInvoker>,
     limits: TriggerLimits,
+    host: Option<&'h dyn TriggerHost>,
 }
 
-impl TriggerRuntime {
+impl TriggerRuntime<'static> {
     /// 既定（未結線。トリガ関数の実行は `0A000`。深さ上限は既定）。
     pub(crate) fn unwired() -> Self {
         Self {
             invoker: Arc::new(UnwiredInvoker),
             limits: TriggerLimits::default(),
+            host: None,
         }
     }
 
-    /// 呼び出し口を差し替えた通過証（本番の結線は #1720。内部 API は #2228。テストが使う）。
+    /// 呼び出し口を差し替えた通過証（本番の invoker は `PlpgsqlTriggerInvoker`（Issue #3184）、既定への差し替えは #3185。テストが使う）。
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn with_invoker(invoker: Arc<dyn TriggerFunctionInvoker>) -> Self {
         Self {
             invoker,
             limits: TriggerLimits::default(),
+            host: None,
         }
     }
 
@@ -47,6 +56,24 @@ impl TriggerRuntime {
     /// 現在の深さ上限。
     pub(crate) fn limits(&self) -> TriggerLimits {
         self.limits
+    }
+}
+
+impl<'h> TriggerRuntime<'h> {
+    /// 呼び出し口と上限を保ったまま、文の実行の間だけ `host` を束縛した通過証を返す（`Arc` の複製と
+    /// 上限の複写だけ）。`EngineCore` の書き込み経路が `Some(&self.trigger_runtime.bind(self))` の形で
+    /// 渡す。ホストが無い（未束縛の）通過証で本番の invoker が呼ばれたら `0A000`（fail-closed）。
+    pub(crate) fn bind<'b>(&self, host: &'b dyn TriggerHost) -> TriggerRuntime<'b> {
+        TriggerRuntime {
+            invoker: Arc::clone(&self.invoker),
+            limits: self.limits,
+            host: Some(host),
+        }
+    }
+
+    /// 束縛済みのホスト（未束縛なら `None`）。`trigger::fire` が [`TriggerCall`] へ載せる。
+    pub(crate) fn host(&self) -> Option<&'h dyn TriggerHost> {
+        self.host
     }
 
     /// トリガ関数を 1 回呼ぶ唯一の入口。深さが上限に達していれば呼び出し口に触れず `54001`。

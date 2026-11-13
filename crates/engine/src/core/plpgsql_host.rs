@@ -11,7 +11,7 @@
 //! 入口は [`EngineCore::run_plpgsql_in_txn`]（既に開いている Tx に参加する）と
 //! [`EngineCore::run_plpgsql_autocommit`]（Tx が無ければ暗黙 Tx を開き、成功で commit・失敗で abort
 //! する）。関数の呼び出し位置は [`EngineCore::run_routine_active`]（Issue #2218。`core::routine_call`
-//! が式の畳み込みから呼ぶ）、`DO` は #2228、トリガ関数は #1720 が結線する。
+//! が式の畳み込みから呼ぶ）、`DO` は #2228、トリガ関数は発火文脈用のバックエンド（`HostTxn::Trigger`。Issue #3184）が担う。
 //!
 //! 再入の不変条件（ADR D5）: 入口は、外側の実行器が同じ write txn の表ハンドルを開いていない時点
 //! からだけ呼ぶこと（同じ表を二重に開くと `TableAlreadyOpen`）。外側の対象行・可視行は呼び出しの前に
@@ -58,6 +58,7 @@ use crate::sql::transaction::{SessionTransaction, TransactionStatus, TxnReadSour
 use crate::sql::udf_call::{RoutineDefinition, RoutineReturn};
 use crate::sql::SqlOutcome as CoreOutcome;
 use crate::trigger::call::TriggerOutcome;
+use crate::trigger::write_handle::TriggerWriteHandle;
 
 /// 呼び出しごとの実行オプション。
 #[derive(Debug, Clone, Copy)]
@@ -228,17 +229,33 @@ fn bare_literal(expr: &SqlExpr) -> Option<PlScalar> {
 }
 
 /// `PlHost` の core 実装。1 回の起動の間だけ生きる（`'e` は `EngineCore` と Tx の寿命）。
-struct CorePlHost<'a, 'e> {
-    core: &'e EngineCore,
-    ctx: &'a PolicyContext,
-    session: &'a mut SessionState,
-    txn: &'a mut SessionTransaction<'e>,
-    opts: PlCallOptions,
+pub(super) struct CorePlHost<'a, 'e> {
+    pub(super) core: &'e EngineCore,
+    pub(super) ctx: &'a PolicyContext,
+    pub(super) session: &'a mut SessionState,
+    pub(super) txn: HostTxn<'a, 'e>,
+    pub(super) opts: PlCallOptions,
     /// `42702` の検査済みの文・式（種別（式 0・埋め込み SQL 1）とアドレスをキーにする。本体の AST は起動の間不変で、ループで検査を
     /// 繰り返さない）。値は読み出さないので、アドレスの再利用で誤って参照されることはない。
     conflict_checked: HashSet<(u8, usize)>,
     /// `DO` ブロックの実行か（`W` の呼び出し文脈を `inline_code_block` と表示する。Issue #2227）。
     inline_block: bool,
+}
+
+/// 本体の SQL の実行先（Issue #3184）。通常（関数・`DO`・セッション経由の呼び出し）は呼び出し元の Tx、
+/// トリガ関数の発火文脈はセッションも `SessionTransaction` も持たないため、外側の write txn を借用する
+/// 窓口（[`TriggerWriteHandle`]）。式評価・条件評価・`42702` 検査・`%TYPE` 解決は両者で共有する。
+pub(super) enum HostTxn<'a, 'e> {
+    Session(&'a mut SessionTransaction<'e>),
+    Trigger(TriggerBackend<'a>),
+}
+
+/// トリガ発火文脈の実行先。本体が実行できる文は `core::plpgsql_trigger_host` の文種ゲートが決める。
+pub(super) struct TriggerBackend<'a> {
+    pub(super) handle: &'a TriggerWriteHandle<'a>,
+    /// 本体が書き込みを試みた回数（成功・失敗を問わない）。`EXCEPTION` 節が、書き込みを巻き戻せない
+    /// ブロックで捕捉する fail-open を作らないための印（`rollback_block` が比べる）。
+    pub(super) write_attempts: usize,
 }
 
 /// 条件の比較オペランド。リテラルのトークン（SQL を経由しない）か、SQL で求めた型付きの値。
@@ -417,16 +434,23 @@ fn is_column_capable(role: VarRole) -> bool {
 }
 
 impl<'a, 'e> CorePlHost<'a, 'e> {
-    /// 許可リスト解析 → 文種・書き込みのゲート → 既存の実行本体、の順で 1 文を実行する。
+    /// 許可リスト解析 → 文種・書き込みのゲート → 既存の実行本体、の順で 1 文を実行する。トリガ発火文脈
+    /// （[`HostTxn::Trigger`]）は `core::plpgsql_trigger_host` の文種ゲート付きの経路へ回す（Issue #3184）。
     fn run_tokens(&mut self, tokens: Vec<Token>) -> Result<CoreOutcome, SqlSurfaceError> {
+        if matches!(self.txn, HostTxn::Trigger(_)) {
+            return self.run_tokens_trigger(tokens);
+        }
+        let HostTxn::Session(txn) = &mut self.txn else {
+            return Err(internal("PL/pgSQL host backend changed during a statement"));
+        };
         let parsed = {
             // parse 中の定数式畳み込みがセッション TimeZone を読む。
             let _tz = session_time_zone_scope(self.session);
             let resolver = self.core.schema_resolver_for(self.ctx, self.session);
             // 明示トランザクションの writer 取得前は、検証・ビュー展開を `BEGIN` 時点の
             // スナップショットのカタログで行い、後続の実行の読み取り元と揃える（Issue #2403）。
-            let read_snap = if self.txn.status() == TransactionStatus::InTransaction {
-                match self.txn.read_source()? {
+            let read_snap = if txn.status() == TransactionStatus::InTransaction {
+                match txn.read_source()? {
                     TxnReadSource::BeginSnapshot(snap) => Some(snap),
                     _ => None,
                 }
@@ -441,26 +465,36 @@ impl<'a, 'e> CorePlHost<'a, 'e> {
                 read_snap,
             )?
         };
-        let writes = classify(&parsed)?;
-        if parsed_operation_id(&parsed).is_some() || is_partitioned_write(&parsed) {
-            return Err(unsupported(
-                "USING OPERATION_ID and PARTITIONED are not supported inside a PL/pgSQL body",
-            ));
-        }
+        let writes = self.gate_parsed(&parsed)?;
         if writes {
-            if !self.opts.may_write {
-                return Err(unsupported(
-                    "a non-volatile PL/pgSQL function cannot modify data",
-                ));
-            }
             // 本体の文は operation_id を持たない。台帳必須の構成では書き込みを実行前に拒否する
             // （副作用ゼロ。D8）。
             if self.core.ledger_mode == LedgerMode::Ledgered {
                 return Err(SqlSurfaceError::missing_operation_id());
             }
         }
+        let HostTxn::Session(txn) = &mut self.txn else {
+            return Err(internal("PL/pgSQL host backend changed during a statement"));
+        };
         self.core
-            .execute_in_active_txn(self.ctx, self.session, self.txn, &parsed)
+            .execute_in_active_txn(self.ctx, self.session, txn, &parsed)
+    }
+
+    /// 解析済みの文が本体で許す形か（文種・`USING OPERATION_ID`／`PARTITIONED`・揮発性）を検査し、
+    /// 書き込む文なら `true`（両バックエンド共通のゲート）。
+    pub(super) fn gate_parsed(&self, parsed: &ParsedSql) -> Result<bool, SqlSurfaceError> {
+        let writes = classify(parsed)?;
+        if parsed_operation_id(parsed).is_some() || is_partitioned_write(parsed) {
+            return Err(unsupported(
+                "USING OPERATION_ID and PARTITIONED are not supported inside a PL/pgSQL body",
+            ));
+        }
+        if writes && !self.opts.may_write {
+            return Err(unsupported(
+                "a non-volatile PL/pgSQL function cannot modify data",
+            ));
+        }
+        Ok(writes)
     }
 
     /// `42702`（変数名と列名の衝突。D3）の検出。参照する表（`FROM` 等の関係位置）のスキーマを引き、
@@ -1066,19 +1100,42 @@ impl PlHost for CorePlHost<'_, '_> {
     // ---- `EXCEPTION` 節（Issue #2227・SQL-70）。Tx の内部 savepoint API へ委ねる ----
 
     fn block_savepoint(&mut self) -> Result<PlSavepoint, SqlSurfaceError> {
-        self.txn.pl_savepoint_push(&*self.session).map(PlSavepoint)
+        match &mut self.txn {
+            HostTxn::Session(txn) => txn.pl_savepoint_push(&*self.session).map(PlSavepoint),
+            // トリガ発火文脈は savepoint を持てない。印には、ブロックに入った時点の書き込み試行回数を
+            // 入れ、`rollback_block` が「ブロック内で書き込みを試みたか」を判定する。
+            HostTxn::Trigger(b) => Ok(PlSavepoint(b.write_attempts)),
+        }
     }
 
     fn rollback_block(&mut self, sp: &PlSavepoint) -> Result<(), SqlSurfaceError> {
-        self.txn.pl_rollback_to(sp.0, self.session)
+        match &mut self.txn {
+            HostTxn::Session(txn) => txn.pl_rollback_to(sp.0, self.session),
+            // 書き込みを試みたブロックは巻き戻せない（既定の `Ok(())` で捕捉すると、書き込みを残したまま
+            // 続行する fail-open になる）。捕捉せずに `0A000` を伝える。純粋な評価エラーだけ捕捉できる。
+            HostTxn::Trigger(b) => {
+                if b.write_attempts > sp.0 {
+                    Err(unsupported(
+                        "an EXCEPTION block after a data modification is not supported inside a trigger function",
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+        }
     }
 
     fn release_block(&mut self, sp: PlSavepoint) {
-        self.txn.pl_release(sp.0);
+        if let HostTxn::Session(txn) = &mut self.txn {
+            txn.pl_release(sp.0);
+        }
     }
 
     fn can_catch(&self) -> bool {
-        self.txn.status() == TransactionStatus::InTransaction
+        match &self.txn {
+            HostTxn::Session(txn) => txn.status() == TransactionStatus::InTransaction,
+            HostTxn::Trigger(_) => true,
+        }
     }
 
     /// `SQLERRM` は、入口の出口と同じ `scrub_error`（SCHEMA 配下の内部キー `#<id>.` を利用者向けの
@@ -1136,6 +1193,53 @@ impl PlHost for CorePlHost<'_, '_> {
                 );
                 Ok(ResolvedType::Record(Some(fields)))
             }
+        }
+    }
+}
+
+/// トリガ関数の戻り値を発火側の [`TriggerOutcome`] へ写す（Tx 版・発火文脈版で共有）。NULL は `Skip`、行は
+/// 表の列と名前・数・型で照合して `Proceed`。
+fn map_trigger_return(
+    schema: &TableSchema,
+    ret: TriggerReturn,
+) -> Result<TriggerOutcome, SqlSurfaceError> {
+    match ret {
+        TriggerReturn::Null => Ok(TriggerOutcome::Skip),
+        TriggerReturn::Row(mut fields) => {
+            // `%ROWTYPE`／`SELECT *` は可視の `id` 疑似列を先頭に含める。`id` はトリガから書き換えられず
+            // 元の行 ID を保つため、戻り値に先頭の `id` があれば構造検査の前に取り除く。
+            if schema.has_pseudo_id()
+                && fields.len() == schema.columns.len().saturating_add(1)
+                && fields
+                    .first()
+                    .is_some_and(|(n, _)| n.eq_ignore_ascii_case("id"))
+            {
+                fields.remove(0);
+            }
+            let mismatch = || {
+                SqlSurfaceError::datatype_mismatch(
+                    "returned row structure does not match the structure of the triggering table",
+                )
+            };
+            if fields.len() != schema.columns.len() {
+                return Err(mismatch());
+            }
+            let mut row = Vec::with_capacity(fields.len());
+            for ((name, v), col) in fields.into_iter().zip(&schema.columns) {
+                if name != col.name {
+                    return Err(mismatch());
+                }
+                let v = crate::plpgsql::value::assign_cast(v, &col.ty)?;
+                row.push(
+                    crate::sql::matview::cell_to_value(v.cell, &col.ty).map_err(|_| {
+                        SqlSurfaceError::feature_not_supported(
+                            "trigger row has a column type unsupported in PL/pgSQL",
+                        )
+                    })?,
+                );
+            }
+            crate::trigger::fire::check_returned_row(schema, &row)?;
+            Ok(TriggerOutcome::Proceed(row))
         }
     }
 }
@@ -1214,7 +1318,7 @@ impl EngineCore {
             core: self,
             ctx,
             session,
-            txn,
+            txn: HostTxn::Session(txn),
             opts,
             conflict_checked: HashSet::new(),
             inline_block: true,
@@ -1252,7 +1356,7 @@ impl EngineCore {
             core: self,
             ctx,
             session,
-            txn,
+            txn: HostTxn::Session(txn),
             opts: PlCallOptions { may_write },
             conflict_checked: HashSet::new(),
             inline_block: false,
@@ -1318,7 +1422,7 @@ impl EngineCore {
             core: self,
             ctx,
             session,
-            txn,
+            txn: HostTxn::Session(txn),
             opts: PlCallOptions { may_write },
             conflict_checked: HashSet::new(),
             inline_block: false,
@@ -1332,7 +1436,7 @@ impl EngineCore {
     /// 既に開いている Tx の上でトリガ関数を 1 回実行する内部 API（Issue #2228・ADR D9）。状態ゲートと
     /// エラー時の `Failed` 化は [`Self::run_plpgsql_in_txn`] と同じ。戻り値は発火側の
     /// [`TriggerOutcome`]（NULL は `Skip`、行は表の列と照合して `Proceed`）。本番の
-    /// `TriggerFunctionInvoker`（発火時はセッション・Tx を持たない）は #1720 が結線する。
+    /// `TriggerFunctionInvoker`（発火時はセッション・Tx を持たない）は [`Self::run_trigger_with_handle`]（Issue #3184）が担う。
     pub(crate) fn invoke_trigger_function_in_txn<'e>(
         &'e self,
         ctx: &PolicyContext,
@@ -1367,49 +1471,40 @@ impl EngineCore {
             core: self,
             ctx,
             session,
-            txn,
+            txn: HostTxn::Session(txn),
             opts: inv.opts,
             conflict_checked: HashSet::new(),
             inline_block: false,
         };
-        match run_trigger_function(inv.body, &inv.vars, &mut host, &mut budget)? {
-            TriggerReturn::Null => Ok(TriggerOutcome::Skip),
-            TriggerReturn::Row(mut fields) => {
-                // `%ROWTYPE`／`SELECT *` は可視の `id` 疑似列を先頭に含める。`id` はトリガから書き換えられず
-                // 元の行 ID を保つため、戻り値に先頭の `id` があれば構造検査の前に取り除く。
-                if inv.schema.has_pseudo_id()
-                    && fields.len() == inv.schema.columns.len().saturating_add(1)
-                    && fields
-                        .first()
-                        .is_some_and(|(n, _)| n.eq_ignore_ascii_case("id"))
-                {
-                    fields.remove(0);
-                }
-                let mismatch = || {
-                    SqlSurfaceError::datatype_mismatch(
-                        "returned row structure does not match the structure of the triggering table",
-                    )
-                };
-                if fields.len() != inv.schema.columns.len() {
-                    return Err(mismatch());
-                }
-                let mut row = Vec::with_capacity(fields.len());
-                for ((name, v), col) in fields.into_iter().zip(&inv.schema.columns) {
-                    if name != col.name {
-                        return Err(mismatch());
-                    }
-                    let v = crate::plpgsql::value::assign_cast(v, &col.ty)?;
-                    row.push(crate::sql::matview::cell_to_value(v.cell, &col.ty).map_err(
-                        |_| {
-                            SqlSurfaceError::feature_not_supported(
-                                "trigger row has a column type unsupported in PL/pgSQL",
-                            )
-                        },
-                    )?);
-                }
-                crate::trigger::fire::check_returned_row(inv.schema, &row)?;
-                Ok(TriggerOutcome::Proceed(row))
-            }
-        }
+        let ret = run_trigger_function(inv.body, &inv.vars, &mut host, &mut budget)?;
+        map_trigger_return(inv.schema, ret)
+    }
+    /// セッションも `SessionTransaction` も持たない発火文脈で、トリガ関数の本体を実行する（Issue #3184）。
+    /// `handle` は外側の文の write txn と呼び出しテナントの `PolicyContext` の借用で、本体の SQL はこれを
+    /// 通して同じ txn・同じ RLS で実行される（[`HostTxn::Trigger`]）。`session` は発火元の主体の写しから
+    /// 作った派生セッション（`core::plpgsql_trigger_host`）。Tx の状態遷移は持たない（文の取り消しは
+    /// 発火側が txn ごと破棄して行う）。呼び出し元は `TriggerHost for EngineCore` だけ。
+    pub(super) fn run_trigger_with_handle(
+        &self,
+        ctx: &PolicyContext,
+        session: &mut SessionState,
+        handle: &TriggerWriteHandle<'_>,
+        inv: TriggerInvocation<'_>,
+    ) -> Result<TriggerOutcome, SqlSurfaceError> {
+        let mut budget = ExecBudget::new(self.plpgsql_limits, self.result_limits.max_result_rows());
+        let mut host = CorePlHost {
+            core: self,
+            ctx,
+            session,
+            txn: HostTxn::Trigger(TriggerBackend {
+                handle,
+                write_attempts: 0,
+            }),
+            opts: inv.opts,
+            conflict_checked: HashSet::new(),
+            inline_block: false,
+        };
+        let ret = run_trigger_function(inv.body, &inv.vars, &mut host, &mut budget)?;
+        map_trigger_return(inv.schema, ret)
     }
 }

@@ -305,6 +305,74 @@ pub struct SessionState {
 static NEXT_SEARCH_PATH_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl SessionState {
+    /// トリガ関数の本体を実行する派生セッションの元になる、発火元セッションの主体の写し（Issue #3184）。
+    ///
+    /// 発火点（`trigger::fire`）はセッションを持たないため、文の実行入口が `trigger::subject` の区間へこの
+    /// 写しを張り、`EngineCore` のトリガ用ホストが読む。ロール・権限・`search_path`・TimeZone・一時カタログ・
+    /// `row_security`・解決テナントは発火元のまま引き継ぎ（権限を広げも狭めもしない）、セッションの宣言的
+    /// UDF だけは持ち込まない（本体からのルーチン呼び出しは `0A000`）。全フィールドを明示的に列挙して
+    /// いるため、フィールドを足すとここがコンパイルエラーになり、引き継ぎの要否を決める必要がある。
+    pub(crate) fn trigger_subject_snapshot(&self) -> SessionState {
+        let Self {
+            search_mode,
+            ddl_allowed,
+            bootstrap_all_privileges,
+            udfs: _,
+            time_zone,
+            time_zone_reset,
+            temp_tables,
+            temp_rows,
+            sequences,
+            search_path,
+            search_path_epoch,
+            session_user,
+            resolution_tenant,
+            row_security_off,
+            row_security_reset_off,
+            statement_timeout_ms,
+            statement_timeout_reset_ms,
+            hnsw_ef_search,
+            hnsw_iterative_scan,
+            hnsw_max_scan_tuples,
+            in_txn_block,
+            hnsw_iterative_scan_local_restore,
+            hnsw_max_scan_tuples_local_restore,
+            current_role_id,
+            session_role_id,
+            default_access_mode,
+            default_isolation_level,
+        } = self;
+        SessionState {
+            search_mode: *search_mode,
+            ddl_allowed: *ddl_allowed,
+            bootstrap_all_privileges: *bootstrap_all_privileges,
+            udfs: crate::sql::udf_call::UdfRegistry::default(),
+            time_zone: time_zone.clone(),
+            time_zone_reset: time_zone_reset.clone(),
+            temp_tables: temp_tables.clone(),
+            temp_rows: temp_rows.clone(),
+            sequences: sequences.clone(),
+            search_path: search_path.clone(),
+            search_path_epoch: *search_path_epoch,
+            session_user: session_user.clone(),
+            resolution_tenant: resolution_tenant.clone(),
+            row_security_off: *row_security_off,
+            row_security_reset_off: *row_security_reset_off,
+            statement_timeout_ms: *statement_timeout_ms,
+            statement_timeout_reset_ms: *statement_timeout_reset_ms,
+            hnsw_ef_search: *hnsw_ef_search,
+            hnsw_iterative_scan: *hnsw_iterative_scan,
+            hnsw_max_scan_tuples: *hnsw_max_scan_tuples,
+            in_txn_block: *in_txn_block,
+            hnsw_iterative_scan_local_restore: *hnsw_iterative_scan_local_restore,
+            hnsw_max_scan_tuples_local_restore: *hnsw_max_scan_tuples_local_restore,
+            current_role_id: *current_role_id,
+            session_role_id: *session_role_id,
+            default_access_mode: *default_access_mode,
+            default_isolation_level: *default_isolation_level,
+        }
+    }
+
     /// `SET SESSION CHARACTERISTICS` が設定した既定アクセスモード（未設定は `None`。Issue #1939）。
     pub fn default_access_mode(&self) -> Option<crate::sql::transaction::TxnAccessMode> {
         self.default_access_mode
