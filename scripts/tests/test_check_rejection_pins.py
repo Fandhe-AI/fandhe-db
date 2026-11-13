@@ -305,6 +305,31 @@ GIT_FLAGS = [
 ]
 
 
+class SameNameModuleTest(unittest.TestCase):
+    """同名テストが別モジュールにあっても、削除は同じモジュールのものにだけ作用する（D5）。"""
+
+    SRC = (
+        "mod a {\n    #[test]\n    fn reject_unsupported() {\n        let x = 1;\n    }\n}\n"
+        "mod b {\n    #[test]\n    fn reject_unsupported() {\n        assert_eq!(err.wire_code(), \"0A000\");\n    }\n}\n"
+    )
+
+    def test_module_path_recorded(self):
+        ts = crp.find_tests(self.SRC)
+        self.assertEqual([(t.module, t.name) for t in ts],
+                         [(("a",), "reject_unsupported"), (("b",), "reject_unsupported")])
+
+    def test_deleting_a_does_not_target_b(self):
+        new = self.SRC.replace(
+            "mod a {\n    #[test]\n    fn reject_unsupported() {\n        let x = 1;\n    }\n}\n", "")
+        viol = run_check(P, self.SRC, new)
+        self.assertEqual(viol, [])
+
+    def test_deleting_b_targets_nothing_in_a(self):
+        # b を削除しても a（未変更・拒否固定でもない）は対象にならない
+        new = self.SRC[: self.SRC.index("mod b")]
+        self.assertEqual(run_check(P, self.SRC, new), [])
+
+
 class EndToEndTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

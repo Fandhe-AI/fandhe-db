@@ -91,6 +91,8 @@ class TestRange:
     end: Optional[int]
     block: List[Tuple[int, str]]
     lines: List[Tuple[int, str]]
+    # 所属する `mod x {` のパス（外側から順）。同名テストの別モジュール取り違え防止（D5）に使う。
+    module: Tuple[str, ...] = ()
 
 
 @dataclass
@@ -272,6 +274,11 @@ def _scan_attribute(lines: List[str], start: int) -> int:
     raise DiffParseError("cannot find the end of an attribute (unterminated string/bracket)")
 
 
+_MOD_RE = re.compile(
+    r"^(\s*)(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{\s*$"
+)
+
+
 def find_tests(text: str) -> List[TestRange]:
     """ファイル内容から `#[test]` 付き fn の範囲を抽出する。
 
@@ -283,12 +290,26 @@ def find_tests(text: str) -> List[TestRange]:
     tests: List[TestRange] = []
     block: List[Tuple[int, str]] = []
     has_test = False
+    mod_stack: List[Tuple[str, str]] = []  # (インデント, モジュール名)
     i = 0
     n = len(lines)
     while i < n:
         ln = i + 1
         line = lines[i]
         stripped = line.strip()
+        if mod_stack and line.rstrip() == mod_stack[-1][0] + "}":
+            mod_stack.pop()
+            block = []
+            has_test = False
+            i += 1
+            continue
+        mm = _MOD_RE.match(line)
+        if mm:
+            mod_stack.append((mm.group(1), mm.group(2)))
+            block = []
+            has_test = False
+            i += 1
+            continue
         if stripped.startswith("//"):
             block.append((ln, line))
             i += 1
@@ -323,6 +344,7 @@ def find_tests(text: str) -> List[TestRange]:
                     end=end,
                     block=list(block),
                     lines=[(k + 1, lines[k]) for k in range(start - 1, last)],
+                    module=tuple(m_[1] for m_ in mod_stack),
                 )
             )
         block = []
@@ -357,13 +379,13 @@ def select_targets(
         if fd.deleted and fd.old_path is not None:
             base_text = read_base(fd.old_path)
             if base_text is not None:
-                names = set()
+                names = set()  # (モジュールパス, 関数名)
                 for bt in find_tests(base_text):
                     last = bt.end if bt.end is not None else bt.fn_line
                     if any(bt.start <= d <= last for d in fd.deleted):
-                        names.add(bt.name)
+                        names.add((bt.module, bt.name))
                 for t in head_tests:
-                    if t.name in names:
+                    if (t.module, t.name) in names:
                         out[(fd.new_path, t.fn_line)] = (fd.new_path, t)
     return sorted(out.values(), key=lambda x: (x[0], x[1].fn_line))
 
