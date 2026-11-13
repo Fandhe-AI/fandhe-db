@@ -187,7 +187,7 @@ impl EngineCore {
                         max_scanned_rows,
                         predicate,
                         project,
-                        Some(&self.trigger_runtime),
+                        Some(&self.trigger_runtime.bind(self)),
                     )
                 }
                 None => {
@@ -209,7 +209,7 @@ impl EngineCore {
                             max_affected_rows,
                             max_scanned_rows,
                             predicate,
-                            Some(&self.trigger_runtime),
+                            Some(&self.trigger_runtime.bind(self)),
                             // 結合形は USING 側の列を参照する述語を必ず持つので既存行を読む（RLS-13）。
                             true,
                         ),

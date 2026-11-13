@@ -2330,7 +2330,7 @@ fn insert_typed_row_impl(
 fn trigger_insert_writes<'a>(
     write_txn: &'a redb::WriteTransaction,
     ctx: &'a PolicyContext,
-    triggers: Option<&'a crate::trigger::TriggerRuntime>,
+    triggers: Option<&'a crate::trigger::TriggerRuntime<'a>>,
 ) -> crate::trigger::write_handle::TriggerWriteHandle<'a> {
     crate::trigger::write_handle::TriggerWriteHandle::new(write_txn, ctx, triggers)
 }
@@ -2415,7 +2415,7 @@ fn plan_update_triggers<'a>(
     assignments: &[(usize, crate::row_codec::Value)],
     set_exprs: &[(usize, crate::sql::set_expr::BoundSetExpr)],
     override_columns: &[usize],
-    triggers: Option<&'a crate::trigger::TriggerRuntime>,
+    triggers: Option<&'a crate::trigger::TriggerRuntime<'a>>,
 ) -> Result<Option<crate::trigger::plan::RowTriggerPlan<'a>>, TenantWriteError> {
     let mut set_columns: Vec<usize> = assignments
         .iter()
@@ -2481,7 +2481,7 @@ pub(crate) enum LedgerOnlyTriggers<'a> {
     /// トリガを見ない純粋な台帳記録。
     Skip,
     /// 0 行 INSERT 文としてトリガを分類・発火する（`None` は未結線で INSERT トリガがあれば `0A000`）。
-    Insert(Option<&'a crate::trigger::TriggerRuntime>),
+    Insert(Option<&'a crate::trigger::TriggerRuntime<'a>>),
     /// 0 行 UPSERT。INSERT・UPDATE トリガがあれば未結線として `0A000`。
     Upsert,
 }

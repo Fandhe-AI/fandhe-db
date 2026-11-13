@@ -52,6 +52,8 @@
 
 ### D1. トリガ関数の結線と呼び出し口
 
+> 本番の呼び出し口とセッション無しのホストの実装記録は [plpgsql-subset.md](plpgsql-subset.md) の「Issue #3184 追記」（D9 の主体の引き継ぎを含む）。
+
 - トリガ本体は #2228 の内部 API（`TriggerCall`／`TriggerOutcome`）だけで呼ぶ。発火側
   （新モジュール。配置案は `crates/engine/src/trigger/` の `fire`／`queue`／`guard`）は
   PL/pgSQL インタプリタを直接触らない

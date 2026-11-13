@@ -256,6 +256,8 @@ impl EngineCore {
         // 0 行は行を書かないが、台帳には記録する（後日の同一 `operation_id` 再送が新たに挿入される
         // 事故を防ぐ。既存のバッチ経路は空を `22000` にするためここで分岐）。
         if bounds.is_empty() {
+            // 束縛済みの通過証は引数の間だけ生かす必要がある（`LedgerOnlyTriggers` が借用する）。
+            let bound_triggers = self.trigger_runtime.bind(self);
             crate::sql::exec::record_insert_select_ledger_only(
                 make_target(),
                 ctx,
@@ -272,7 +274,7 @@ impl EngineCore {
                 } else if returning.is_some() {
                     crate::tenant::LedgerOnlyTriggers::Insert(None)
                 } else {
-                    crate::tenant::LedgerOnlyTriggers::Insert(Some(&self.trigger_runtime))
+                    crate::tenant::LedgerOnlyTriggers::Insert(Some(&bound_triggers))
                 },
             )?;
             return Ok(match returning {
@@ -348,7 +350,7 @@ impl EngineCore {
                 &bounds,
                 self.ledger_mode,
                 Some(&schema),
-                Some(&self.trigger_runtime),
+                Some(&self.trigger_runtime.bind(self)),
             )
             .map(SqlOutcome::Insert),
             Some(projection) => crate::sql::exec::execute_insert_returning_in(

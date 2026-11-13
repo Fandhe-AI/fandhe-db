@@ -1427,7 +1427,7 @@ impl EngineCore {
                         ctx,
                         stmt,
                         self.ledger_mode,
-                        Some(&self.trigger_runtime),
+                        Some(&self.trigger_runtime.bind(self)),
                         privilege_recheck.as_ref(),
                     )?,
                 ))

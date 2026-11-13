@@ -150,6 +150,7 @@ mod standard_body_binding;
 // 呼び出し元は #2217・#2218（`routine_call`）・#2228（`DO`）。
 #[allow(dead_code)]
 mod plpgsql_host;
+mod plpgsql_trigger_host;
 // `DO` ブロックの実行（SQL-68・Issue #2228）。
 mod do_block;
 // `LOCK TABLE` の実行（SQL-38・Issue #1958）。
@@ -168,6 +169,9 @@ mod function_define;
 mod plpgsql_boundary_tests;
 #[cfg(test)]
 mod plpgsql_host_tests;
+// 本番のトリガ関数 invoker とセッション無しのホストの結合テスト（Issue #3184・SQL-68）。
+#[cfg(test)]
+mod plpgsql_trigger_invoker_tests;
 // トリガ関数の内部 API の結合テスト（Issue #2228・SQL-68）。
 #[cfg(test)]
 mod plpgsql_trigger_tests;
@@ -1518,7 +1522,7 @@ pub struct EngineCore {
     /// INSERT 経路（SQL の `INSERT ... VALUES`・`INSERT ... SELECT`）だけが `tenant` へ渡す。既定は
     /// 未結線（トリガ関数の実行は `0A000`）で、本番の結線は Issue #1720（内部 API は #2228）。入れ子の深さ上限
     /// （Issue #1727）も保持し、`with_trigger_limits` が起動時に 1 回だけ差し替える。
-    trigger_runtime: crate::trigger::TriggerRuntime,
+    trigger_runtime: crate::trigger::TriggerRuntime<'static>,
     /// `WHERE` 省略の `UPDATE`／`DELETE` を `42601` で拒否する opt-in のサーバー側構成
     /// （Issue #2210・SQL-36 ポインタ。既定 `false`）。クエリ・セッション変数・HTTP から
     /// 到達できる経路を持たない（差し替えは [`Self::with_require_where_for_dml`] のみ）。
@@ -2457,12 +2461,16 @@ fn session_time_zone_scope(
 ) -> (
     crate::datetime::SessionTimeZoneScope,
     crate::sql::policy_applicability::RowSecurityScope,
+    crate::trigger::subject::TriggerSubjectScope,
 ) {
     (
         crate::datetime::SessionTimeZoneScope::enter(session.time_zone().clone()),
         // RLS-13・Issue #2278: 書き込みの検査点が `SessionState` を持たないため、`row_security` も
         // 同じ区間へ束縛する（off かつ RLS 有効な表への書き込みは行を書く前に `42501`）。
         crate::sql::policy_applicability::RowSecurityScope::enter(session.row_security()),
+        // Issue #3184: トリガ発火点もセッションを持たないため、発火元の主体の写しを同じ区間へ束縛する
+        // （トリガ関数の本体を発火元と同じロール・`search_path` で解析・権限判定する）。
+        crate::trigger::subject::TriggerSubjectScope::enter(session),
     )
 }
 
@@ -2510,8 +2518,10 @@ fn statement_clock_scope(
         | ParsedSql::ExplainAnalyzeDml(_)
         // Issue #2060: 中身の計画段・列の導出が同じ束縛を行うため同様に張る。
         | ParsedSql::ExplainVerbose(_) => true,
-        ParsedSql::Truncate(_)
-        | ParsedSql::Transaction(_)
+        // Issue #3184: `TRUNCATE` 文トリガの本体が `now()` 系を外側の文・Tx と同じ時刻で評価できるよう、
+        // 文の開始時刻（明示 Tx では BEGIN 時刻）を入口で束縛する（トリガ側は現在時刻を発明しない）。
+        ParsedSql::Truncate(_) => true,
+        ParsedSql::Transaction(_)
         | ParsedSql::SetTransaction(_)
         | ParsedSql::DropTable(_)
         | ParsedSql::CreateTable(_)
@@ -6754,8 +6764,14 @@ impl EngineCore {
             || crate::sql::allowlist::is_reset_role_statement(&tokens);
         if txn_control_head || scan_exempt {
             let hits = crate::sql::temp_catalog::RelationHits::default();
-            let parsed =
-                self.parse_tokens_in(tokens, temp, &hits, self.ledger_mode, resolver, read_snap)?;
+            let parsed = self.parse_tokens_in(
+                tokens,
+                temp,
+                &hits,
+                self.parse_ledger_mode(),
+                resolver,
+                read_snap,
+            )?;
             if hits.temp_hit() {
                 return Err(crate::sql::temp_catalog::temp_table_unsupported());
             }
@@ -6935,7 +6951,14 @@ impl EngineCore {
         hits: &crate::sql::temp_catalog::RelationHits,
     ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
         let temp = crate::sql::temp_catalog::SessionTempCatalog::default();
-        self.parse_tokens_in(tokens, &temp, hits, self.ledger_mode, resolver, read_snap)
+        self.parse_tokens_in(
+            tokens,
+            &temp,
+            hits,
+            self.parse_ledger_mode(),
+            resolver,
+            read_snap,
+        )
     }
 
     /// 同上（参照先の記録を持たない版）。
@@ -6949,7 +6972,14 @@ impl EngineCore {
         // 解決する（挙動は一時カタログ導入前と同一。TABLE-44・Issue #1681）。
         let temp = crate::sql::temp_catalog::SessionTempCatalog::default();
         let hits = crate::sql::temp_catalog::RelationHits::default();
-        self.parse_tokens_in(tokens, &temp, &hits, self.ledger_mode, resolver, read_snap)
+        self.parse_tokens_in(
+            tokens,
+            &temp,
+            &hits,
+            self.parse_ledger_mode(),
+            resolver,
+            read_snap,
+        )
     }
 
     /// [`Self::parse_tokens`] のセッション一時カタログ対応版（TABLE-44・Issue #1681）。
@@ -10614,7 +10644,7 @@ impl EngineCore {
                     ctx,
                     stmt,
                     self.ledger_mode,
-                    Some(&self.trigger_runtime),
+                    Some(&self.trigger_runtime.bind(self)),
                     recheck.as_ref(),
                 )?;
                 // 全表に印を付ける（漏れると遅延 FK の COMMIT 時検査が取りこぼす。P0）。
@@ -19587,7 +19617,7 @@ impl EngineCore {
                     &bound,
                     self.dml_ledger_mode(),
                     None,
-                    Some(&self.trigger_runtime),
+                    Some(&self.trigger_runtime.bind(self)),
                 )
             }
             // 複数行 `VALUES`（SQL-16、TASK-190）。NoSQL 表層の `rows[]`
@@ -19613,7 +19643,7 @@ impl EngineCore {
                     &bounds,
                     self.dml_ledger_mode(),
                     Some(&schema),
-                    Some(&self.trigger_runtime),
+                    Some(&self.trigger_runtime.bind(self)),
                 )
             }
             crate::sql::parser::BoundInsertForm::File(bound) => {
@@ -19791,7 +19821,7 @@ impl EngineCore {
             stmt,
             self.ledger_mode,
             // TRUNCATE トリガ（Issue #1726）は通過証を渡す結線済み経路だけが発火する。
-            Some(&self.trigger_runtime),
+            Some(&self.trigger_runtime.bind(self)),
             privilege_recheck,
         )
     }
@@ -19843,7 +19873,7 @@ impl EngineCore {
             ctx,
             &bound,
             self.dml_ledger_mode(),
-            Some(&self.trigger_runtime),
+            Some(&self.trigger_runtime.bind(self)),
         )
     }
 
@@ -19908,7 +19938,7 @@ impl EngineCore {
             resolved.as_ref().unwrap_or(stmt),
             stmt,
             &schema,
-            Some(&self.trigger_runtime),
+            Some(&self.trigger_runtime.bind(self)),
         )
     }
 
@@ -20602,7 +20632,7 @@ impl EngineCore {
             &bound,
             self.dml_ledger_mode(),
             Some(&schema),
-            Some(&self.trigger_runtime),
+            Some(&self.trigger_runtime.bind(self)),
         )
     }
 
@@ -20687,7 +20717,7 @@ impl EngineCore {
                 &bound,
                 self.dml_ledger_mode(),
                 Some(&schema),
-                Some(&self.trigger_runtime),
+                Some(&self.trigger_runtime.bind(self)),
             );
         };
         // SQL-53（Issue #1751）: WHERE 内のサブクエリは束縛の前に書き込み txn のスナップショットで解決する。
@@ -20704,7 +20734,7 @@ impl EngineCore {
             resolved.as_ref().unwrap_or(validated),
             validated,
             &schema,
-            Some(&self.trigger_runtime),
+            Some(&self.trigger_runtime.bind(self)),
         )
     }
 

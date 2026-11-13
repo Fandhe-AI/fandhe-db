@@ -28,7 +28,7 @@ use crate::tenant::TenantWriteError;
 /// （イベントごとに [`plan_row_triggers`] が絞り込む）。型名は ROW 時代のまま残す（Issue #1726 で
 /// 文トリガの群を足した）。
 pub(crate) struct RowTriggerPlan<'a> {
-    pub(crate) runtime: &'a TriggerRuntime,
+    pub(crate) runtime: &'a TriggerRuntime<'a>,
     /// BEFORE ROW（行ごとに書き込みの前に発火する。Issue #1723）。
     pub(crate) before: Vec<TriggerDef>,
     /// AFTER ROW（文の終わりに、書いた行ごとに発火する。Issue #1724）。
@@ -54,7 +54,7 @@ pub(crate) fn plan_insert<'a>(
     write_txn: &redb::WriteTransaction,
     tenant: &str,
     table: &str,
-    runtime: Option<&'a TriggerRuntime>,
+    runtime: Option<&'a TriggerRuntime<'a>>,
 ) -> Result<Option<InsertTriggerPlan<'a>>, TenantWriteError> {
     plan_row_triggers(
         write_txn,
@@ -90,7 +90,7 @@ pub(crate) fn plan_row_triggers<'a>(
     table: &str,
     event: u8,
     update: Option<&UpdateTarget<'_>>,
-    runtime: Option<&'a TriggerRuntime>,
+    runtime: Option<&'a TriggerRuntime<'a>>,
 ) -> Result<Option<RowTriggerPlan<'a>>, TenantWriteError> {
     // トリガが 1 件も無い環境では以降（子表の走査を含む）を一切行わない（従来経路・性能不変）。
     if !any_triggers_exist(write_txn)? {

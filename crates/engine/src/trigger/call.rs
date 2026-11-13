@@ -50,6 +50,9 @@ pub(crate) struct TriggerCall<'a> {
     pub(crate) timing: TriggerTiming,
     /// 他表への書き込みの窓口（外側の文と同じ write txn・呼び出しテナントの文脈。Issue #1724）。
     pub(crate) writes: &'a TriggerWriteHandle<'a>,
+    /// 束縛済みのトリガ関数ホスト（`TriggerRuntime::bind`。Issue #3184）。本番の
+    /// [`PlpgsqlTriggerInvoker`] だけが読む。未束縛（`None`）の経路では本番の invoker は `0A000`。
+    pub(crate) host: Option<&'a dyn TriggerHost>,
 }
 
 #[allow(dead_code)] // 実体（#2228）が参照する。
@@ -93,11 +96,11 @@ pub(crate) enum TriggerOutcome {
 
 /// [`TriggerCall`] からトリガ関数へ渡す変数（`NEW`・`OLD`・`TG_*`）を作る純粋関数（Issue #2228）。
 ///
-/// 発火側（#1720 の本番 invoker）が呼ぶ。`table_name`・`table_schema` は利用者向けの名前（内部キー
+/// 発火側（本番の invoker `PlpgsqlTriggerInvoker`。Issue #3184）が呼ぶ。`table_name`・`table_schema` は利用者向けの名前（内部キー
 /// `#<id>.<name>` を `TG_TABLE_NAME` に出さないため、呼び出し側が解決して渡す）。NEW／OLD は行トリガ
 /// の該当する側だけ値を持ち、それ以外（INSERT の OLD・DELETE の NEW・文トリガ）は未代入にする。
 /// 値の変換ができない列型（表現できない型）は固定文言の `0A000`（fail-closed）。
-// 本番の invoker（#1720）が結線するまでは、結合テストだけが呼ぶ。
+// 本番の invoker は既定への差し替え（#3185）まで未結線のため、通常ビルドでは未使用になる。
 #[allow(dead_code)]
 pub(crate) fn trigger_vars_from_call(
     call: &TriggerCall<'_>,
@@ -165,6 +168,33 @@ pub(crate) fn trigger_vars_from_call(
 pub(crate) trait TriggerFunctionInvoker: Send + Sync {
     /// 関数を 1 回実行する。エラーは [`SqlSurfaceError`] のまま呼び出し元へ透過する。
     fn invoke(&self, call: &TriggerCall<'_>) -> Result<TriggerOutcome, SqlSurfaceError>;
+}
+
+/// セッション・Tx を持たない発火文脈でトリガ関数の本体を実行する実体（Issue #3184）。`EngineCore` が
+/// 実装し、`TriggerRuntime::bind` が文ごとに束縛する。`Sync` を要求するのは、未束縛の通過証
+/// （`TriggerRuntime<'static>`）を持つ `EngineCore` の `Send`／`Sync` を保つため。
+pub(crate) trait TriggerHost: Sync {
+    #[cfg_attr(not(test), allow(dead_code))] // 呼び出し元の本番 invoker が #3185 まで未構築。
+    /// `call` のトリガ関数を、`call.writes` が借用する外側の write txn・呼び出しテナントの文脈の上で
+    /// 1 回実行する。エラーは [`SqlSurfaceError`] のまま返し、文の取り消しは発火側が担う。
+    fn invoke_trigger(&self, call: &TriggerCall<'_>) -> Result<TriggerOutcome, SqlSurfaceError>;
+}
+
+/// 本番の呼び出し口（Issue #3184）。`call.host`（`EngineCore`）へ委譲するだけで状態を持たない。
+/// 既定への差し替え（`EngineCore::new`）と wire 経由の検証は #3185 の担当で、それまではテストが
+/// `with_trigger_invoker_for_test` で注入する。ホスト未束縛の経路は固定文言の `0A000`（fail-closed）。
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct PlpgsqlTriggerInvoker;
+
+impl TriggerFunctionInvoker for PlpgsqlTriggerInvoker {
+    fn invoke(&self, call: &TriggerCall<'_>) -> Result<TriggerOutcome, SqlSurfaceError> {
+        match call.host {
+            Some(host) => host.invoke_trigger(call),
+            None => Err(SqlSurfaceError::FeatureNotSupported {
+                detail: "trigger function execution is not supported".to_string(),
+            }),
+        }
+    }
 }
 
 /// 実体が結線されていない間の既定の呼び出し口（常に固定文言の `0A000`）。
