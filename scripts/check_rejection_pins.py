@@ -460,6 +460,9 @@ def find_tests(text: str) -> List[TestRange]:
         if stripped.startswith("#[") or stripped.startswith("#!["):
             end_i = _scan_attribute(lines, i)
             for k in range(i, end_i + 1):
+                # 属性内の文字列・ブロックコメントの継続行は注記候補にしない（実コメント位置のみ）
+                if k < len(line_states) and line_states[k] != "code":
+                    continue
                 block.append((k + 1, lines[k]))
             # コメントを除いた属性全体の構造で `#[test]` を判定する（末尾のブロックコメントを許容）
             if _TEST_ATTR_RE.match(" ".join(masked[i:end_i + 1])):
@@ -683,7 +686,10 @@ def check(
         if head_text is None:
             continue
         head_lines = head_text.split("\n")
+        _, head_states = _lex(head_text)
         for ln in sorted(fd.added):
+            if ln - 1 < len(head_states) and head_states[ln - 1] != "code":
+                continue
             if 1 <= ln <= len(head_lines) and _LOOSE_RE.match(head_lines[ln - 1]):
                 vs, _ = _check_annotation_line(fd.new_path, ln, head_lines[ln - 1], None, head_exists)
                 for v in vs:

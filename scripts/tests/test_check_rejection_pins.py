@@ -220,6 +220,16 @@ class CheckTest(unittest.TestCase):
         self.assertEqual(v[0].path, P)
         self.assertIn(P, v[0].render())
 
+    def test_annotation_inside_attr_string_is_not_accepted(self):
+        # 属性の raw 文字列内・ブロックコメント内の注記風の行は実注記として数えない
+        for attr in (
+            '#[should_panic(expected = r#"x\n// tracked: #1\n"#)]',
+            '#[should_panic(expected = "x\n// tracked: #1\n")]',
+            '#[should_panic(expected = "x") /*\n// tracked: #1\n*/]',
+        ):
+            v = self.added(attr + "\n" + REJECT_BODY)
+            self.assertEqual(kinds(v), ["missing-annotation"], attr)
+
     def test_malformed_forms(self):
         for bad in (
             "// Tracked: #3171",
