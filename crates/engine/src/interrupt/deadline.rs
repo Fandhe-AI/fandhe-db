@@ -234,7 +234,11 @@ pub(crate) fn lock_wait_error() -> SqlSurfaceError {
 
 /// `interrupt::check()` から呼ばれる確認点本体。無効時のコストは thread-local の読み出しと
 /// 分岐 1 つだけで、時計は読まない。有効時は [`CHECK_STRIDE`] 回に 1 回だけ時計を読む。
-pub(super) fn poll() -> Option<InterruptReason> {
+///
+/// `force` が真なら countdown の間引きを飛ばして即時に評価する（Issue #3208。行ループ局所の
+/// カウンタ `RowCheck` が間引き済みのため、ここで二重に間引かない）。ラッチと `fire_after`
+/// プローブは `force` に関係なく同じに評価する。
+pub(super) fn poll(force: bool) -> Option<InterruptReason> {
     DEADLINE.with(|c| {
         let mut s = c.get();
         let at = s.at?;
@@ -251,7 +255,7 @@ pub(super) fn poll() -> Option<InterruptReason> {
             c.set(s);
             return None;
         }
-        if s.countdown > 0 {
+        if !force && s.countdown > 0 {
             s.countdown -= 1;
             c.set(s);
             return None;

@@ -2678,10 +2678,12 @@ pub(crate) fn execute_aggregate_with_group_limits(
                 // 独立）。`COUNT(DISTINCT)` の予算（`distinct_budget`）は関数
                 // 全体で共有する。
                 let mut fast_path_text_accumulator_bytes: usize = 0;
+                // Issue #3208: 確認は行ループ局所のカウンタで N 行ごと（最初の行は必ず評価）。
+                let mut row_check = crate::interrupt::RowCheck::new();
                 for &id in snapshot.visible_ids() {
                     // Issue #1952: 協調的中断の確認点（スナップショット可視行の集約ループ。
                     // commit 前の読み取り経路）。
-                    crate::interrupt::check()?;
+                    row_check.tick()?;
                     if budget_plan.needs_distinct_budget {
                         for (accumulator, item) in accumulators.iter_mut().zip(&bound.items) {
                             observe_with_budgets(
@@ -2770,13 +2772,15 @@ pub(crate) fn execute_aggregate_with_group_limits(
     };
 
     if let Some(table) = table {
+        // Issue #3208: 確認は行ループ局所のカウンタで N 行ごと。物理行ごとに進める。
+        let mut row_check = crate::interrupt::RowCheck::new();
         'rows: for entry in table.iter().map_err(storage_internal)? {
             let (k, v) = entry.map_err(storage_internal)?;
             let (key_tenant, id) = k.value();
             let buf = v.value();
 
-            // Issue #1798: 協調的中断の確認点（commit 前の読み取りループ）。
-            crate::interrupt::check()?;
+            // Issue #1798: 協調的中断の確認点（commit 前の読み取りループ。RLS の continue より前）。
+            row_check.tick()?;
 
             // RLS 段（無条件・デコード前）: `arena.rs` の走査ループと同一の順序
             // （ヘッダのみ読み `predicate` 相当を通過しない行は embedding・
@@ -3686,10 +3690,12 @@ pub(crate) fn observe_candidate_slots(
     // `54000` を返す（異なり値の集合は処理順序に依存しない単調増加のため、
     // 索引経路と全走査で成否が変わってはならない）。
     let mut distinct_budget = crate::sql::distinct::DistinctBudget::new();
+    // Issue #3208: 確認は行ループ局所のカウンタで N 行ごと。
+    let mut row_check = crate::interrupt::RowCheck::new();
     'candidates: for &slot in slots {
         // Issue #1952: 協調的中断の確認点（索引候補スロットごと。`with_visible_row` を通らない
         // 索引経路。中断は `54000` 以外のため呼び出し元で全走査へ退避せずそのまま伝播する）。
-        crate::interrupt::check()?;
+        row_check.tick()?;
         let slot_idx = usize::try_from(slot)
             .map_err(|_| accumulator_bug("candidate slot does not fit in usize"))?;
         // 集計 `id` 値は rowid → 応答境界（従来方式の表の `id` 列値）を明示的に通す
