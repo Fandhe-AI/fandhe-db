@@ -210,6 +210,7 @@ def extract_refs(text: str, repo: str, exclude: set[int] | None = None) -> list[
         r"https://github\.com/" + re.escape(repo) + r"/(?:issues|pull)/([0-9]{1,10})(?![0-9])",
         lambda m: f" #{m.group(1)} ",
         text,
+        flags=re.IGNORECASE,
     )
 
     def expand(m: re.Match) -> str:

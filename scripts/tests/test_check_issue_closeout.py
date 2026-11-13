@@ -68,6 +68,8 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(r("other/repo#9 &#123; #<id>.", REPO), [])
         self.assertEqual(r(f"see https://github.com/{REPO}/issues/33", REPO), [33])
         self.assertEqual(r("https://github.com/other/repo/issues/33", REPO), [])
+        self.assertEqual(r(f"https://github.com/{REPO.lower()}/issues/600", REPO), [600])
+        self.assertEqual(r(f"https://github.com/{REPO.upper()}/pull/601", REPO), [601])
         self.assertEqual(r("#1698〜#1700", REPO), [1698, 1699, 1700])
         self.assertEqual(r("#1〜#100", REPO), [1, 100])
         self.assertEqual(r("#5 #6", REPO, {5}), [6])
