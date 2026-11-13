@@ -121,3 +121,27 @@ fn value_bytes_counts_array_heap() {
     ]));
     assert!(value_bytes(&arr) >= 1000);
 }
+
+#[test]
+fn copy_cell_to_value_converts_enum_labels_and_rejects_unknown_ones() {
+    let ty = ColumnType::Enum(crate::catalog::EnumTypeDef::for_test(
+        "mood",
+        &["sad", "happy"],
+    ));
+    // 非 NULL の語彙内ラベルは Value::Enum になる（以前は XX000 で拒否されていた）。
+    match copy_cell_to_value(Cell::Text("happy".to_string()), &ty) {
+        Ok(Value::Enum(l)) => assert_eq!(l, "happy"),
+        other => panic!("unexpected: {other:?}"),
+    }
+    assert!(matches!(
+        copy_cell_to_value(Cell::Null, &ty),
+        Ok(Value::Null)
+    ));
+    // 語彙外は 22P02 系で拒否し、値を文言に含めない。
+    let err = copy_cell_to_value(Cell::Text("angry".to_string()), &ty).unwrap_err();
+    assert!(matches!(
+        err,
+        SqlSurfaceError::InvalidTextRepresentation { .. }
+    ));
+    assert!(!format!("{err:?}").contains("angry"));
+}

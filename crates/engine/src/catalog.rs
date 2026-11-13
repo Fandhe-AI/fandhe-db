@@ -5180,6 +5180,16 @@ impl EnumTypeDef {
         })
     }
 
+    /// 他モジュールの単体テストが語彙付きの ENUM 型を組み立てるための生成器（永続化・
+    /// 名前検証を経ない。テスト専用）。
+    #[cfg(test)]
+    pub(crate) fn for_test(name: &str, labels: &[&str]) -> Arc<Self> {
+        Arc::new(Self {
+            name: name.to_string(),
+            labels: labels.iter().map(|l| (*l).to_string()).collect(),
+        })
+    }
+
     /// 型名。
     pub fn name(&self) -> &str {
         &self.name
