@@ -324,6 +324,12 @@ class SameNameModuleTest(unittest.TestCase):
         viol = run_check(P, self.SRC, new)
         self.assertEqual(viol, [])
 
+    def test_parent_mod_rename_with_annotation_removal_is_caught(self):
+        old = "mod a {\n    // tracked: #1\n    #[test]\n    fn reject_x() {\n        assert_eq!(err.wire_code(), \"0A000\");\n    }\n}\n"
+        new = "mod c {\n    #[test]\n    fn reject_x() {\n        assert_eq!(err.wire_code(), \"0A000\");\n    }\n}\n"
+        for ctx in (0, 3):
+            self.assertEqual(kinds(run_check(P, old, new, context=ctx)), ["missing-annotation"])
+
     def test_deleting_b_targets_nothing_in_a(self):
         # b を削除しても a（未変更・拒否固定でもない）は対象にならない
         new = self.SRC[: self.SRC.index("mod b")]

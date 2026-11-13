@@ -384,8 +384,13 @@ def select_targets(
                     last = bt.end if bt.end is not None else bt.fn_line
                     if any(bt.start <= d <= last for d in fd.deleted):
                         names.add((bt.module, bt.name))
+                base_keys = {(bt.module, bt.name) for bt in find_tests(base_text)}
+                # 親 mod のリネームでモジュールパスが変わっても注記削除を逃さないため、
+                # base 側に同じキーが無い HEAD 側テスト（リネーム後の候補）は関数名だけで対応付ける
+                loose = {nm for (_, nm) in names}
                 for t in head_tests:
-                    if (t.module, t.name) in names:
+                    renamed = (t.module, t.name) not in base_keys
+                    if (t.module, t.name) in names or (renamed and t.name in loose):
                         out[(fd.new_path, t.fn_line)] = (fd.new_path, t)
     return sorted(out.values(), key=lambda x: (x[0], x[1].fn_line))
 
