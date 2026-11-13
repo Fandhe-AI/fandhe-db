@@ -896,6 +896,52 @@ fn allocated_parent_id_reference_rejects_non_null_child_values_for_now() {
     assert_eq!(texts(&rows, 0), vec!["ok"]);
 }
 
+/// 採番方式の親の `id` 参照を受理した後の中間状態の親側操作（Issue #3178）。子の参照有無にかかわらず、
+/// 親の行を除く DELETE は参照先の値を解決できないため 0A000 で拒否して行を残す（fail-closed。
+/// 連鎖・遅延検査は #3180）。自己参照表も同様。
+/// tracked: #3180
+#[test]
+fn allocated_parent_delete_is_rejected_while_id_reference_exists_for_now() {
+    let (core, _g) = new_core("t23-fk-id-parent-delete");
+    let alice = ctx("alice");
+    run(
+        &core,
+        &alice,
+        "CREATE TABLE users (id BIGINT PRIMARY KEY, name TEXT)",
+    );
+    run(
+        &core,
+        &alice,
+        "CREATE TABLE posts (author BIGINT REFERENCES users (id), body TEXT)",
+    );
+    run(
+        &core,
+        &alice,
+        "INSERT INTO users (id, name) VALUES (1, 'a')",
+    );
+    assert_eq!(
+        code_of(&core, &alice, "DELETE FROM users WHERE id = 1"),
+        "0A000"
+    );
+    let rows = query(&core, &alice, "SELECT name FROM users LIMIT 10");
+    assert_eq!(texts(&rows, 0), vec!["a"]);
+    // 自己参照表も親側 DELETE は同じ中間状態で拒否される。
+    run(
+        &core,
+        &alice,
+        "CREATE TABLE selfref (id BIGINT PRIMARY KEY, up BIGINT REFERENCES selfref (id))",
+    );
+    run(
+        &core,
+        &alice,
+        "INSERT INTO selfref (id, up) VALUES (1, NULL)",
+    );
+    assert_eq!(
+        code_of(&core, &alice, "DELETE FROM selfref WHERE id = 1"),
+        "0A000"
+    );
+}
+
 /// 親側 DDL の依存検査は、採番方式の親でも `id` 参照を依存として拒否する（Issue #3178）。
 #[test]
 fn allocated_parent_ddl_is_blocked_while_id_reference_exists() {

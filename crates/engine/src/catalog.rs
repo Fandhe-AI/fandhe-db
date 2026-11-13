@@ -8154,7 +8154,9 @@ impl ForeignKeyDef {
 
     /// 参照先列名が `id` 単独の形か（親を見ない形だけの判定）。永続値 `["id"]` の解釈は親の
     /// 行識別方式で決まる（従来方式は物理キーの疑似列、採番方式は宣言した普通の列。Issue #3178）。
-    /// 実行時の経路は #3179・#3180 が [`Self::references_parent_pseudo_id`] へ移す。
+    /// 実行時の経路（`catalog.rs`・`tenant.rs`・`constraint.rs` の既存呼び出し）は
+    /// 現状この述語のままで、採番方式の親では `constraint.rs` の集約点が 0A000 で拒否して塞ぐ。
+    /// 親を見て分岐する [`Self::references_parent_pseudo_id`] への移行は #3179・#3180 が担う。
     pub(crate) fn references_parent_id(&self) -> bool {
         matches!(self.parent_columns.as_slice(), [only] if only == FOREIGN_KEY_PARENT_ID_COLUMN)
     }
