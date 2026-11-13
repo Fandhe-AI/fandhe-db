@@ -888,3 +888,95 @@ fn describe_fetch_in_failed_transaction_is_25p02() {
         .expect_err("execute in Failed must be rejected");
     assert_eq!(err.wire_code(), "25P02", "describe and execute must agree");
 }
+
+/// `FETCH` の拡張形（Issue #3173・WIRE-15）。`NEXT`・`IN`・`FORWARD n` と末尾 `;` を
+/// 混ぜて払い出しても、同一スナップショットの参照カーソルと同じ並びで重複・欠落なく
+/// 単調に進むこと。
+#[test]
+fn fetch_next_in_and_forward_advance_cursor_monotonically() {
+    let (engine, path) = new_core();
+    let _cleanup = CleanupGuard(path);
+    let caller = ctx("tenant-a");
+    seed_rows(&engine, &caller, 5);
+
+    let mut session = SessionState::default();
+    let mut txn = engine.new_session_transaction();
+    engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "BEGIN")
+        .expect("begin");
+    for name in ["c", "ref"] {
+        engine
+            .execute_sql_in_txn(
+                &caller,
+                &mut session,
+                &mut txn,
+                &format!("DECLARE {name} CURSOR FOR SELECT id FROM {TABLE} LIMIT 100"),
+            )
+            .expect("declare");
+    }
+
+    let mut fetch = |sql: &str, expected_rows: usize| -> Vec<u64> {
+        let outcome = engine
+            .execute_sql_in_txn(&caller, &mut session, &mut txn, sql)
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        let SqlOutcome::Fetch(result) = outcome else {
+            panic!("expected Fetch outcome for {sql}");
+        };
+        assert_eq!(result.rows.len(), expected_rows, "{sql}");
+        row_ids(&result)
+    };
+    let mut got = Vec::new();
+    got.extend(fetch("FETCH NEXT FROM c", 1));
+    got.extend(fetch("FETCH 1 IN c", 1));
+    got.extend(fetch("FETCH FORWARD 2 FROM c;", 2));
+    got.extend(fetch("fetch next in c;", 1));
+    assert!(fetch("FETCH NEXT FROM c", 0).is_empty());
+    let reference = fetch("FETCH 10 FROM ref", 5);
+    assert_eq!(got, reference);
+}
+
+/// 新しい形の `FETCH` でも別テナントは他者のカーソルを参照できず（`34000`・未定義と
+/// 同一応答）、未対応の方向（`PRIOR`）は `42601` で Tx を `Failed` にする。
+#[test]
+fn fetch_next_in_respect_tenant_boundary_and_reject_unsupported_direction() {
+    let (engine, path) = new_core();
+    let _cleanup = CleanupGuard(path);
+    let alice = ctx("alice");
+    let bob = ctx("bob");
+    seed_rows(&engine, &alice, 2);
+
+    let mut a_session = SessionState::default();
+    let mut a_txn = engine.new_session_transaction();
+    engine
+        .execute_sql_in_txn(&alice, &mut a_session, &mut a_txn, "BEGIN")
+        .expect("begin");
+    engine
+        .execute_sql_in_txn(
+            &alice,
+            &mut a_session,
+            &mut a_txn,
+            &format!("DECLARE c CURSOR FOR SELECT id FROM {TABLE} LIMIT 10"),
+        )
+        .expect("declare");
+    let err = engine
+        .execute_sql_in_txn(&alice, &mut a_session, &mut a_txn, "FETCH PRIOR FROM c")
+        .expect_err("PRIOR is unsupported");
+    assert_eq!(err.wire_code(), "42601");
+    assert_eq!(a_txn.status(), TransactionStatus::Failed);
+
+    for sql in [
+        "FETCH NEXT FROM c",
+        "FETCH 1 IN c",
+        "FETCH NEXT FROM missing_cursor",
+    ] {
+        let mut b_session = SessionState::default();
+        let mut b_txn = engine.new_session_transaction();
+        engine
+            .execute_sql_in_txn(&bob, &mut b_session, &mut b_txn, "BEGIN")
+            .expect("bob begin");
+        let err = engine
+            .execute_sql_in_txn(&bob, &mut b_session, &mut b_txn, sql)
+            .expect_err(sql);
+        assert_eq!(err.wire_code(), "34000", "{sql}");
+    }
+}

@@ -1018,8 +1018,8 @@ impl SearchProvider for CosineDenseAdapter<'_> {
         // （件数・可視 id の多重集合・距離昇順・NaN 末尾）を検証し、違反は fail-closed に拒否する。
         // Issue #2043: 実際に渡した候補（`dense_slots`。NULL 行を除く）の集合で検証し、範囲外の
         // id（NULL 行など）の返却を fail-closed に拒否する。
-        let visible_id_counts = crate::core::searched_id_counts(input.ids, self.dense_slots);
-        if !crate::core::distance_result_is_valid(&hits, input.k, &visible_id_counts) {
+        let visible_ids = crate::core::SearchedIds::from_ids_checked(input.ids, self.dense_slots);
+        if !crate::core::distance_result_is_valid_with(&hits, input.k, &visible_ids) {
             return Err(KernelError::WorkerPanicked);
         }
         let mut out: Vec<crate::kernel::CandidateHit> = hits
@@ -2772,7 +2772,9 @@ pub(crate) fn execute_statement_with_cache_observed(
     // Issue #2043: 密側（NULL 行除外後）の返却 id 検証用の多重集合。provider へ実際に渡した候補
     // （`dense_slots`、無ければ全スロット）に限定する。疎側・hybrid の可視集合は
     // 全スロット（`slot_ids`）のまま保持する。
-    let dense_id_counts = core::searched_id_counts(&slot_ids, dense_slots.as_deref());
+    // Issue #3220: `slot_ids` が実際に 0..n の恒等列で `dense_slots` が無いときだけ HashMap を
+    // 作らず O(1) 判定にする（mask で絞った kept・NULL 行除外は従来の多重集合へ倒す）。
+    let dense_id_counts = core::SearchedIds::from_ids_checked(&slot_ids, dense_slots.as_deref());
     let has_null_rows = arena.null_row_count() != 0;
     // 静的には HNSW 適格だったのに実行時の NULL 行で外れた縮退は、`EXPLAIN ANALYZE` の観測へ
     // 厳密走査への切り替えとして記録する（Issue #2056。`has_null_rows` は自テナントの可視行だけで決まる）。
@@ -3042,8 +3044,7 @@ pub(crate) fn execute_statement_with_cache_observed(
                         bound.distance_descending,
                         bound.distance_kind,
                     )?;
-                    if raw.len() > k_eff || raw.iter().any(|h| !dense_id_counts.contains_key(&h.0))
-                    {
+                    if raw.len() > k_eff || raw.iter().any(|h| !dense_id_counts.contains(h.0)) {
                         return Err(SqlSurfaceError::Internal {
                             detail: "exact scan returned a result violating its contract"
                                 .to_string(),
@@ -3086,7 +3087,7 @@ pub(crate) fn execute_statement_with_cache_observed(
                             })
                             .map_err(map_kernel_error)?
                     };
-                    if !core::distance_result_is_valid(&raw, k_eff, &dense_id_counts) {
+                    if !core::distance_result_is_valid_with(&raw, k_eff, &dense_id_counts) {
                         return Err(SqlSurfaceError::Internal {
                             detail:
                                 "search provider returned a result violating the top-k contract"
@@ -3280,7 +3281,7 @@ pub(crate) fn execute_statement_with_cache_observed(
                         };
                         provider.search(input).map_err(map_kernel_error)?
                     };
-                    if !core::provider_result_is_valid(&raw, k_eff, &dense_id_counts) {
+                    if !core::provider_result_is_valid_with(&raw, k_eff, &dense_id_counts) {
                         return Err(SqlSurfaceError::Internal {
                             detail:
                                 "search provider returned a result violating the top-k contract"
@@ -3482,10 +3483,7 @@ pub(crate) fn execute_statement_with_cache_observed(
                             // 可視集合への包含判定（件数ではなく所属のみを見るため多重集合の
                             // キー存在で判定する。TABLE-12 の重複 id については
                             // `core::provider_result_is_valid` のドキュメント参照）。
-                            if dense_hits
-                                .iter()
-                                .any(|h| !dense_id_counts.contains_key(&h.id))
-                            {
+                            if dense_hits.iter().any(|h| !dense_id_counts.contains(h.id)) {
                                 return Err(SqlSurfaceError::Internal {
                                     detail:
                                         "search provider returned a hit outside the visible id set"
@@ -7580,6 +7578,30 @@ mod tests {
         assert!(run(vec![dh(1, 0.1), dh(2, f64::NAN), dh(2, f64::NAN)], 2).is_err());
         assert!(run(vec![dh(1, 0.9), dh(2, 0.1)], 2).is_err());
         assert!(run(vec![dh(1, 0.1), dh(2, f64::NAN)], 2).is_ok());
+    }
+
+    /// Issue #3220: 恒等スロット列（高速経路）でも範囲外 id・重複・NaN 重複を拒否し、正常な並びを受理する。
+    #[test]
+    fn cosine_dense_adapter_identity_ids_reject_contract_violations() {
+        let run = |hits: Vec<crate::kernel::DistanceHit>, k: usize| {
+            let inner = CosineOnly(hits);
+            let adapter = CosineDenseAdapter {
+                inner: &inner,
+                dense_slots: None,
+            };
+            adapter.search(SearchInput {
+                ids: &[0_u64, 1, 2],
+                vectors: &[0.0, 0.0, 0.0],
+                dim: 1,
+                query: &[1.0],
+                k,
+            })
+        };
+        assert!(run(vec![dh(0, 0.1), dh(3, 0.2)], 3).is_err());
+        assert!(run(vec![dh(u64::MAX, 0.1)], 3).is_err());
+        assert!(run(vec![dh(1, 0.1), dh(1, 0.1)], 3).is_err());
+        assert!(run(vec![dh(1, f64::NAN), dh(1, f64::NAN)], 3).is_err());
+        assert!(run(vec![dh(0, 0.1), dh(1, 0.2), dh(2, f64::NAN)], 3).is_ok());
     }
 
     struct CosineSubsetOnly(Vec<crate::kernel::DistanceHit>);

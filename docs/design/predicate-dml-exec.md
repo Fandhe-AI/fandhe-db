@@ -517,7 +517,7 @@ Issue #1757（実装済み）。
   - 台帳（#1757・実装済み）: 構文段で算出した正規化文ハッシュ（結合結果は材料外）を `execute_joined_dml_in` が
     受け取り、source 走査の前に `precheck_in_write_txn` で事前照合する。暫定ゲートは撤去した
     （詳細は [multi-row-dml-operation-id.md](multi-row-dml-operation-id.md) の「Issue #1757 追記」）。
-  - 結線（#1754）: 構文段は従来どおり FROM／USING を拒否しており、SQL 経路への dispatch はまだ無い。#1754 の
+  - 結線（#3202 で実装済み。[update-from-delete-using.md](update-from-delete-using.md) の「dispatch」節）。当初計画: #1754 の
     マージ後に `core.rs` の UPDATE／DELETE 分岐から `execute_joined_dml_in` を呼び（autocommit は
     `execute_subquery_dml_autocommit` と同じ暗黙トランザクション）、書き込み後に `mark_written` を呼ぶ。
     `PARTITIONED` との併用は構文段で拒否し、`run_partitioned_*` に結合形の多層防御を足す。SQL 文字列による

@@ -2,7 +2,7 @@
 //! ADR D9）。本物の `EngineCore`（許可リスト解析・同一 Tx・RLS）に対して、トリガ変数を与えて直接
 //! 呼んだトリガ関数の戻り値の意味（行の書き換え・NULL による取りやめ・DELETE の OLD 返却）と、
 //! 本体の副作用が呼び出し元の Tx に乗ることを確かめる。発火を通した検証（本番の
-//! `TriggerFunctionInvoker`）は #1720 の担当。期待値は PostgreSQL 17 の PL/pgSQL トリガ関数の挙動。
+//! `TriggerFunctionInvoker`）は Issue #3184 の `plpgsql_trigger_invoker_tests`。期待値は PostgreSQL 17 の PL/pgSQL トリガ関数の挙動。
 
 use super::plpgsql_host::{PlCallOptions, TriggerInvocation};
 use super::EngineCore;

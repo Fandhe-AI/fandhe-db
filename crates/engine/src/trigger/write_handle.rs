@@ -17,8 +17,10 @@
 //!   （内部 ID から他テナントの SCHEMA の表を指せない。本番の SCHEMA 修飾の解決は #2228）
 //! - 書いた表名を記録し、発火側が遅延 FK の検査対象にする
 //!
-//! 本番の結線（トリガ関数の本体の SQL をこの窓口経由で実行する経路）は #2228 の担当（通常の関数・`DO` の
-//! 本体を同じ Tx で実行するホストは Issue #2226 の `core::plpgsql_host`）。
+//! 本番の結線（トリガ関数の本体の SQL をこの窓口経由で実行する経路）は Issue #3184 の
+//! `core::plpgsql_trigger_host`（`run_insert` で `INSERT ... VALUES` を、`function_def`・`table_schema` で
+//! 同じ txn のカタログを読む。通常の関数・`DO` の本体を同じ Tx で実行するホストは Issue #2226 の
+//! `core::plpgsql_host`）。
 
 use std::cell::RefCell;
 
@@ -33,7 +35,7 @@ pub(crate) struct TriggerWriteHandle<'a> {
     write_txn: &'a redb::WriteTransaction,
     ctx: &'a PolicyContext,
     /// 入れ子の発火に使う通過証。`None`（未結線の経路）なら入れ子は従来どおり `0A000`。
-    runtime: Option<&'a super::TriggerRuntime>,
+    runtime: Option<&'a super::TriggerRuntime<'a>>,
     written_tables: RefCell<Vec<String>>,
 }
 
@@ -43,7 +45,7 @@ impl<'a> TriggerWriteHandle<'a> {
     pub(crate) fn new(
         write_txn: &'a redb::WriteTransaction,
         ctx: &'a PolicyContext,
-        runtime: Option<&'a super::TriggerRuntime>,
+        runtime: Option<&'a super::TriggerRuntime<'a>>,
     ) -> Self {
         Self {
             write_txn,
@@ -105,6 +107,56 @@ impl<'a> TriggerWriteHandle<'a> {
             written.push(table.to_string());
         }
         Ok(())
+    }
+
+    /// 呼び出しテナントの文脈（読み取り専用の借用。差し替える手段は無い）。トリガ用ホストが、主体の写しの
+    /// 解決テナントと照合するのと、`CorePlHost` の `ctx` に使う（Issue #3184）。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn policy_context(&self) -> &'a PolicyContext {
+        self.ctx
+    }
+
+    /// 呼び出しテナントの scope から、同じ write txn 内で関数定義を 1 件引く（引数なしの関数。トリガ関数は
+    /// 引数を持たない）。不在・他テナントの関数は区別のない `None`（scope が構造上テナントに固定される）。
+    /// カタログの I/O 失敗は固定文言の `Internal` に丸める（Issue #3184）。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn function_def(
+        &self,
+        function_key: &str,
+    ) -> Result<Option<crate::catalog::function::FunctionDef>, SqlSurfaceError> {
+        crate::catalog::function::get_function_in_txn(
+            self.write_txn,
+            self.ctx.tenant_id(),
+            function_key,
+            "",
+        )
+        .map_err(|_| SqlSurfaceError::Internal {
+            detail: "failed to load trigger function".to_string(),
+        })
+    }
+
+    /// 表 `table` のスキーマを、外側と同じ write txn から読む（同じ Tx 内の DDL を取り込む。`insert_row` と同じ
+    /// 読み方）。トリガ本体の `INSERT ... VALUES` の束縛に使う（Issue #3184）。
+    pub(crate) fn table_schema(&self, table: &str) -> Result<TableSchema, SqlSurfaceError> {
+        crate::catalog::require_table_schema_write_any_identity(self.write_txn, table)
+            .map_err(|e| crate::sql::exec::map_insert_write_error(TenantWriteError::from(e)))
+    }
+
+    /// 外側の write txn を書き込み先にして `f` を実行し、成功したら `table`（`INSERT` の対象表）を書いた表として
+    /// 記録する（Issue #3184）。トリガ本体の `INSERT ... VALUES` が SQL `INSERT` と同じ実行本体
+    /// （`EngineCore::execute_insert_form` 系）を通すための口で、raw な write txn は `f` の中の
+    /// `WriteTarget` としてだけ見える。記録は遅延 FK の確定対象にする（漏れると fail-open）。
+    pub(crate) fn run_insert<T>(
+        &self,
+        table: &str,
+        f: impl FnOnce(WriteTarget<'_>) -> Result<T, SqlSurfaceError>,
+    ) -> Result<T, SqlSurfaceError> {
+        let out = f(WriteTarget::InTxn(self.write_txn))?;
+        let mut written = self.written_tables.borrow_mut();
+        if !written.iter().any(|t| t == table) {
+            written.push(table.to_string());
+        }
+        Ok(out)
     }
 
     /// これまでにトリガが書いた表名（重複なし。書いた順）。

@@ -266,7 +266,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1651（式索引の UNIQUE・列変更への追随。`catalog.rs` に行が追加）で一括追随（旧: 10597／12994／13075／13184／13257／13779）。
     // Issue #1651（式索引の UNIQUE・失効管理。`catalog.rs` に行が追加）で一括追随（旧: 13274／13355／13464／13537／14080／10874）。
     // Issue #2206（GIN 相当索引の宣言。`catalog.rs` に行が追加）で catalog.rs 全エントリを追随。
-    ("catalog.rs", 15718),
+    ("catalog.rs", 15728),
     // `Storage::drop_enum_type`（同上）: 削除前に依存列（当該型を参照する
     // `ColumnType::Enum` 列）が 1 つも無いことを `dependent_tables_in_txn`
     // で検証済みのため、こちらも `CATALOG_TABLE`／`user_rows/{table_name}`
@@ -333,7 +333,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1639（DROP TABLE の複数指定。`catalog.rs` に行が追加）で追随（+118 行）。
     // Issue #1624（RENAME TO の索引・FK・制約追随。`catalog.rs` に行が追加）で一括追随（+79 行。旧: 11412/11493/11632/11665）。
     // Issue #1659（CREATE VIEW の列別名。`catalog.rs` に行が追加）で追随（+101 行。旧: 11250）。
-    ("catalog.rs", 15801),
+    ("catalog.rs", 15811),
     // `Storage::create_view`（TABLE-18・SQL-23・TASK-205、Issue #909）: ビューは
     // `[VIEWS_TABLE]` のみを書き、`CATALOG_TABLE`／`user_rows/{table_name}` の
     // いずれにも触れない（行を持たない非マテリアライズド定義のため対象
@@ -393,7 +393,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1639（DROP TABLE の複数指定。`catalog.rs` に行が追加）で追随（+118 行）。
     // Issue #1624（RENAME TO の索引・FK・制約追随。`catalog.rs` に行が追加）で一括追随（+79 行。旧: 11412/11493/11632/11665）。
     // Issue #1659（CREATE VIEW の列別名。`catalog.rs` に行が追加）で追随（+131 行。旧: 11389）。
-    ("catalog.rs", 15937),
+    ("catalog.rs", 15947),
     // `Storage::drop_view`（同上）: 削除前に依存するビューが 1 つも無いことを
     // `views_depending_on_in_txn` で検証済みのうえで `[VIEWS_TABLE]` のみを
     // 書く。同じ理由でバンプ対象がない。PR #1048 レビュー対応（同上）で
@@ -462,11 +462,11 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1644（TRUNCATE CASCADE／RESTRICT）で catalog.rs 全エントリ +1・tenant.rs 506→516 に追随。
     // Issue #1663（MATERIALIZED VIEW のカタログ追加）の base 取り込みで追随（旧: 13013）。
     // Issue #1671（ビュー INSERT 書き換えで `catalog.rs` に行が追加）で全エントリを追随。
-    ("catalog.rs", 16019),
+    ("catalog.rs", 16029),
     // `Storage::create_or_replace_view_checked`（TABLE-41 (2)、Issue #1660。`create_or_replace_view` の本体）: `create_view` と同じく
     // `[VIEWS_TABLE]` のみを書く（上書き）。ビューは行ストア・世代を持たないためバンプ対象がない。
     // Issue #1737（`is_unique_index_of_table` の追加。`catalog.rs` に +22 行）で追随（旧: 15666）。
-    ("catalog.rs", 16743),
+    ("catalog.rs", 16753),
     // `Storage::drop_tables`（Issue #1684 で本体を `drop_tables_in_txn` へ切り出した）: 世代 bump は
     // 同一 write txn で先に呼ばれる `drop_tables_in_txn` 内（削除する各表と FK を外した参照元表）で
     // 行われ、本呼び出しはその結果（`dropped > 0`）を単一 commit で確定させるだけ。`bump` が
@@ -479,7 +479,8 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #2014（HALFVEC 型導入。catalog.rs +43 行）で追随（旧: 12545）。
     // Issue #2018（INT8VEC 型導入。catalog.rs +39 行）で追随（旧: 12588）。
     // Issue #2025（SPARSEVEC 型導入。catalog.rs +58 行）で追随（旧: 12627）。
-    ("catalog.rs", 13000),
+    // Issue #3201（`EnumTypeDef::for_test` 追加。catalog.rs +10 行）で追随（旧: 13000）。
+    ("catalog.rs", 13010),
     // 上記 `drop_tables_in_txn` 切り出し（+18 行）に伴い、以降の catalog.rs エントリ（12419／12500／12609／12681／13063）を追随（旧: 12401／12482／12591／12663／13045）。
     // `sql::transaction::SessionTransaction::commit`（SQL-31・TASK-221）:
     // ここで commit する共有 `write_txn` に対象テーブルの `user_rows/{table}`
@@ -516,7 +517,8 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1944（savepoint 巻き戻しでの冪等台帳の整合）の行追加でさらに移動（旧: 1978）。書き込み内容・commit の意味は不変。
     // Issue #1947（失敗状態からの ROLLBACK TO 復帰）の行追加でさらに移動（旧: 2060）。書き込み内容・commit の意味は不変。
     // Issue #2231（`SKIP LOCKED` の取得入口 `try_ensure_writer`・`try_begin_implicit` と取得方針 `WriterAcquire` の追加）の行追加でさらに移動（旧: 2230）。書き込み内容・commit の意味は不変。
-    ("sql/transaction.rs", 2600),
+    // Issue #3171（末尾 `;` 付き Tx 制御文の受理）の行追加でさらに移動（旧: 2600）。書き込み内容・commit の意味は不変。
+    ("sql/transaction.rs", 2604),
     // TABLE-44・Issue #1684: 一時表ストア（セッション専用のインメモリ DB。永続 DB とは別インスタンス）の
     // 書き込みトランザクションの確定口（`TempRowStore::commit`）。確定するのは、一時コアの書き込み本体
     // （`tenant::*`・`catalog::*`。いずれも自分の DB の表世代を `bump_table_generation_in_txn` で進める）が
@@ -658,14 +660,14 @@ const ALLOWLIST: &[(&str, u32)] = &[
     ("catalog/sequence.rs", 1586),
     ("catalog/sequence.rs", 1625),
     ("catalog/sequence.rs", 1645),
-    ("catalog/sequence.rs", 1766),
-    ("catalog/sequence.rs", 2040),
-    ("catalog/sequence.rs", 2130),
-    ("catalog/sequence.rs", 2170),
-    ("catalog/sequence.rs", 2223),
-    ("catalog/sequence.rs", 2491),
-    ("catalog/sequence.rs", 2537),
-    ("catalog/sequence.rs", 2804),
+    ("catalog/sequence.rs", 1778),
+    ("catalog/sequence.rs", 2052),
+    ("catalog/sequence.rs", 2142),
+    ("catalog/sequence.rs", 2182),
+    ("catalog/sequence.rs", 2235),
+    ("catalog/sequence.rs", 2503),
+    ("catalog/sequence.rs", 2549),
+    ("catalog/sequence.rs", 2816),
     // `Storage::create_function`／`Storage::drop_function`（UDF カタログ・Issue #1919）:
     // UDF 定義は専用の関数カタログ表のみを書き、`CATALOG_TABLE`／`user_rows/{table_name}`
     // のいずれにも触れない（行を持たない定義メタデータのため、世代照合の対象テーブルが
@@ -692,11 +694,11 @@ const ALLOWLIST: &[(&str, u32)] = &[
     ("catalog/function.rs", 1599),
     // Issue #1689（ALTER SEQUENCE）: `alter_sequence`／`rename_sequence`（803・842）も同じ表だけを書く
     // （定義 blob の上書き・キーの付け替え・状態行の削除）ため同じ理由で対象外。
-    // Issue #1733（INSERT ... SELECT）: `core/insert_select_exec.rs` の 1012・1144 行（Issue #2613・#2614・#2615・#2212・#1726 で追随）は `#[cfg(test)]` 内の
+    // Issue #1733（INSERT ... SELECT）: `core/insert_select_exec.rs` の 1014・1146 行（Issue #2613・#2614・#2615・#2212・#1726・#3184 で追随）は `#[cfg(test)]` 内の
     // 明示トランザクション検証で共有 write txn を commit するだけの呼び出し。行の書き込みと世代 bump は
     // 既存の `sql::exec::execute_insert_*_in` 経路が同じ txn 内で済ませており、ここで追加の bump は不要。
-    ("core/insert_select_exec.rs", 1012),
-    ("core/insert_select_exec.rs", 1144),
+    ("core/insert_select_exec.rs", 1014),
+    ("core/insert_select_exec.rs", 1146),
     // Issue #1679（CTAS の台帳）: `core/ctas_exec.rs` の 302 行は `IF NOT EXISTS` の no-op（既存の表がある）で
     // `operation_id` の台帳だけを記録する commit。表の中身・定義は変えないため世代 bump は不要
     // （表を作る commit 側の 235 行は直前で bump 済み）。

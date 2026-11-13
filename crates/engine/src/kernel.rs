@@ -56,7 +56,8 @@ pub use cosine::{
     CosineSearchInput, DistanceHit,
 };
 pub(crate) use cosine::{
-    inverse_norm, normalize_into, select_farthest_distance_k, AscDistanceTopK,
+    cosine_range, cosine_range_by_slots, inverse_norm, normalize_into, select_farthest_distance_k,
+    AscDistanceTopK,
 };
 
 /// **候補**検索結果 1 件（候補識別子とスコア）。[`SearchProvider`] の戻り値型。
@@ -249,7 +250,8 @@ pub trait SearchProvider: Send + Sync {
     /// 契約: 距離昇順、同点は候補識別子（`input.ids`）の昇順、ゼロノルム等の NaN 行は末尾に置き
     /// `k` の枠を消費する。返す件数は `k` 以下で、`id` は `input.ids` の値をそのまま返す。
     /// 入力は呼び出し元が可視行だけへ絞り込み済みであること（テナント境界は呼び出し元で完結する）。
-    /// 既定実装は [`cosine_top_k`]（単一スレッド・ノルム²をその場で計算する C1）。内積用
+    /// 既定実装は [`cosine_top_k`]（単一スレッド・ノルム²をその場で計算する C1）。既定エンジンの
+    /// `ParallelSearchProvider` は行範囲分割の並列版で上書きする（Issue #3216）。内積用
     /// [`Self::search`] とは別メソッドなので、既存のカスタム provider は無変更で動き、`<=>` は
     /// 参照カーネルで評価される。差し替えたい実装はこのメソッドを上書きする。
     fn search_cosine(&self, input: CosineSearchInput<'_>) -> Result<Vec<DistanceHit>, KernelError> {
@@ -261,7 +263,8 @@ pub trait SearchProvider: Send + Sync {
     /// [`DistanceHit::id`] は `slots[i] as u64`（呼び出し元がスロット番号として解釈する）。
     /// 既定実装は `slots` の行を gather してから [`Self::search_cosine`] へ委譲する（`search_subset` が
     /// `search` へ委譲するのと同型。`search_cosine` だけを上書きした provider もマスク経路で効く）。
-    /// 複製を避ける最適化は [`CpuScalarProvider`] が [`cosine_top_k_slots`] で提供する。
+    /// 複製を避ける最適化は [`CpuScalarProvider`] が [`cosine_top_k_slots`] で、`ParallelSearchProvider` が
+    /// スロット分割の並列版で提供する。
     fn search_cosine_subset(
         &self,
         input: SubsetSearchInput<'_>,

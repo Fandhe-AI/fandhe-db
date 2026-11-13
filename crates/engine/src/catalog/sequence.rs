@@ -1698,6 +1698,18 @@ impl Storage {
     }
 }
 
+/// `name`（裸の名前、または内部キー `#<schema_id>.<name>`）の SEQUENCE が登録済みかを、読み取り源
+/// （確定済みスナップショットまたは明示 Tx の書き込み Tx）で判定する（Issue #3195）。`search_path`
+/// による未修飾名の解決（`sql::search_path`）が、path の各要素で名前の有無を引くために使う読み取り専用の
+/// 照会で、表が未作成なら `false` を返し表を作らない。
+pub(crate) fn sequence_exists_in<R: ReadSource>(src: &R, name: &str) -> Result<bool> {
+    match src.open_table(SEQUENCES_TABLE) {
+        Ok(t) => Ok(t.get(sequence_key(name))?.is_some()),
+        Err(redb::TableError::TableDoesNotExist(_)) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     /// 所有者部の列名は厳格な識別子検証を通す（relation key 形式の列名は破損扱い）。

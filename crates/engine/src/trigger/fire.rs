@@ -96,6 +96,7 @@ fn fire_before_chain(
             args: &trigger.tg_args,
             timing: TriggerTiming::Before,
             writes,
+            host: runtime.host(),
         })?;
         match outcome {
             TriggerOutcome::Skip => return Ok(None),
@@ -216,6 +217,7 @@ pub(crate) fn fire_after_row(
             args: &trigger.tg_args,
             timing: TriggerTiming::After,
             writes,
+            host: runtime.host(),
         })?;
     }
     Ok(())
@@ -275,6 +277,7 @@ pub(crate) fn fire_statement(
             args: &trigger.tg_args,
             timing,
             writes,
+            host: runtime.host(),
         })?;
     }
     Ok(())

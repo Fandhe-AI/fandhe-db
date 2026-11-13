@@ -116,6 +116,20 @@ fn unwired_runtime_is_0a000() {
     assert_eq!(err.wire_code(), "0A000");
 }
 
+// 本番の invoker はホスト未束縛（`TriggerRuntime::bind` を通らない経路）では固定文言の `0A000`
+// （Issue #3184。黙って飛ばさず、ホスト無しで本体を実行もしない）。
+//
+// intentional: docs/design/plpgsql-subset.md
+// 未束縛の経路の拒否は fail-closed の安全弁（設計記録「Issue #3184 追記」）。
+#[test]
+fn production_invoker_without_host_is_rejected() {
+    handle!(h);
+    let rt = TriggerRuntime::with_invoker(Arc::new(super::call::PlpgsqlTriggerInvoker));
+    let err =
+        fire_before_row_insert(&rt, &h, "t", &schema(), &[trig("a", None)], row()).unwrap_err();
+    assert_eq!(err.wire_code(), "0A000");
+}
+
 #[test]
 fn when_condition_is_rejected_at_fire_time() {
     handle!(h);
