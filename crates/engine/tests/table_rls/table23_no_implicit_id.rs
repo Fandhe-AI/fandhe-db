@@ -880,7 +880,7 @@ fn allocated_parent_id_reference_rejects_non_null_child_values_for_now() {
         &alice,
         "INSERT INTO posts (author, body) VALUES (NULL, 'ok')",
     );
-    // NULL 以外は 0A000（親の行ストアが無ければ 23503）で拒否され、保存されない。
+    // NULL 以外は 0A000 で拒否され、保存されない（#3179 実装時はここを更新する）。
     run(
         &core,
         &alice,
@@ -891,7 +891,7 @@ fn allocated_parent_id_reference_rejects_non_null_child_values_for_now() {
         &alice,
         "INSERT INTO posts (author, body) VALUES (1, 'x')",
     );
-    assert!(code == "0A000" || code == "23503", "{code}");
+    assert_eq!(code, "0A000");
     let rows = query(&core, &alice, "SELECT body FROM posts LIMIT 10");
     assert_eq!(texts(&rows, 0), vec!["ok"]);
 }
