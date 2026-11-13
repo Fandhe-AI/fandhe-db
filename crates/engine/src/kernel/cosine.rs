@@ -4,8 +4,10 @@
 //! 責務境界: 正規化していない入力でも `1 - cos` を返す距離計算と、距離昇順の総当たり
 //! Top-k を提供する。内積経路（`kernel.rs::CpuScalarProvider`、スコア降順・f32）とは
 //! 別系統で、距離は昇順・f64 で扱う。`<=>` の実行は #1991 でこのカーネルへ切り替わり、
-//! `SearchProvider::search_cosine`／`search_cosine_subset` の既定実装経由で `sql::exec` の
-//! DISTANCE 段が呼ぶ。HNSW／GPU の metric 対応は #1996〜#2005 の担当。
+//! `SearchProvider::search_cosine`／`search_cosine_subset` の既定実装（単一スレッド）経由で
+//! `sql::exec` の DISTANCE 段が呼ぶ。既定エンジンの `ParallelSearchProvider` は行範囲／スロットを
+//! 分割する並列版で上書きし、ワーカーは [`cosine_range`]／[`cosine_range_by_slots`] を共有する
+//! （Issue #3216）。HNSW／GPU の metric 対応は #1996〜#2005 の担当。
 //!
 //! 計算式は [`cosine_distance_from_parts`] に一本化する。内積と各ノルム² は
 //! `kernel::dot`（ISA 別 SIMD）で f32 累積し、除算以降を f64 で行う。行ノルム²は
@@ -184,9 +186,40 @@ pub fn cosine_top_k(input: CosineSearchInput<'_>) -> Result<Vec<DistanceHit>, Ke
 
     let q_norm_sq = dot(input.query, input.query);
     let norms = input.row_norms_sq.filter(|n| n.len() == input.ids.len());
+    Ok(cosine_range(
+        input.ids,
+        input.vectors,
+        0,
+        dim,
+        input.query,
+        q_norm_sq,
+        norms,
+        input.k,
+    )
+    .into_sorted_vec())
+}
+
+/// [`cosine_top_k`] の行ループ本体（担当範囲 1 つ分の部分 Top-k を返す）。
+///
+/// 単一スレッド経路（[`cosine_top_k`]）と `ParallelSearchProvider::search_cosine` の各ワーカーが
+/// 同じこの関数を呼ぶことで、加算順序・距離式を構造的に一致させる（Issue #3216）。
+/// `ids` は担当範囲だけ、`vectors`・`norms` は全行分で、`row_offset + i` の絶対行番号で参照する
+/// （範囲で事前に切り出さず、範囲外の行だけを行単位の `get()` 失敗として skip する。Issue #34 と同じ理由）。
+/// 検証（次元・非有限クエリ・norms 長）は呼び出し元で済ませていること。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn cosine_range(
+    ids: &[u64],
+    vectors: &[f32],
+    row_offset: usize,
+    dim: usize,
+    query: &[f32],
+    q_norm_sq: f32,
+    norms: Option<&[f32]>,
+    k: usize,
+) -> AscDistanceTopK {
     let row = |idx: usize| -> Option<&[f32]> {
         let start = idx.checked_mul(dim)?;
-        input.vectors.get(start..start.checked_add(dim)?)
+        vectors.get(start..start.checked_add(dim)?)
     };
     let row_norm = |idx: usize, v: &[f32]| -> f32 {
         norms
@@ -194,9 +227,9 @@ pub fn cosine_top_k(input: CosineSearchInput<'_>) -> Result<Vec<DistanceHit>, Ke
             .unwrap_or_else(|| dot(v, v))
     };
 
-    let mut selector = AscDistanceTopK::new(input.k);
-    let mut base = 0usize;
-    for ids4 in input.ids.chunks(4) {
+    let mut selector = AscDistanceTopK::new(k);
+    let mut base = row_offset;
+    for ids4 in ids.chunks(4) {
         // 4 行そろって範囲内のときだけブロックカーネルへ回す。端数・範囲外を含む塊は 1 行ずつ。
         let rows4 = if ids4.len() == 4 {
             match (row(base), row(base + 1), row(base + 2), row(base + 3)) {
@@ -207,7 +240,7 @@ pub fn cosine_top_k(input: CosineSearchInput<'_>) -> Result<Vec<DistanceHit>, Ke
             None
         };
         if let Some(rows) = rows4 {
-            let dots = dot_block4(rows, input.query);
+            let dots = dot_block4(rows, query);
             for (i, (&id, v)) in ids4.iter().zip(rows).enumerate() {
                 let d = cosine_distance_from_parts(
                     dots.get(i).copied().unwrap_or(f32::NAN),
@@ -219,17 +252,13 @@ pub fn cosine_top_k(input: CosineSearchInput<'_>) -> Result<Vec<DistanceHit>, Ke
         } else {
             for (i, &id) in ids4.iter().enumerate() {
                 let Some(v) = row(base + i) else { continue };
-                let d = cosine_distance_from_parts(
-                    dot(v, input.query),
-                    row_norm(base + i, v),
-                    q_norm_sq,
-                );
+                let d = cosine_distance_from_parts(dot(v, query), row_norm(base + i, v), q_norm_sq);
                 selector.push(DistanceHit { id, distance: d });
             }
         }
         base += ids4.len();
     }
-    Ok(selector.into_sorted_vec())
+    selector
 }
 
 /// 行列全体を借用したまま `input.slots` の行だけを候補にするコサイン距離 Top-k（Issue #1991。
@@ -253,24 +282,46 @@ pub fn cosine_top_k_slots(input: SubsetSearchInput<'_>) -> Result<Vec<DistanceHi
         return Ok(Vec::new());
     }
     let q_norm_sq = dot(input.query, input.query);
-    let mut selector = AscDistanceTopK::new(input.k);
-    for &slot in input.slots {
+    Ok(cosine_range_by_slots(
+        input.slots,
+        input.vectors,
+        dim,
+        input.query,
+        q_norm_sq,
+        input.k,
+    )
+    .into_sorted_vec())
+}
+
+/// [`cosine_top_k_slots`] のスロットループ本体（`slots` の担当範囲 1 つ分の部分 Top-k を返す）。
+/// `ParallelSearchProvider::search_cosine_subset` の各ワーカーと単一経路が共有する（Issue #3216）。
+/// 範囲外のスロットは skip する。検証は呼び出し元で済ませていること。
+pub(crate) fn cosine_range_by_slots(
+    slots: &[u32],
+    vectors: &[f32],
+    dim: usize,
+    query: &[f32],
+    q_norm_sq: f32,
+    k: usize,
+) -> AscDistanceTopK {
+    let mut selector = AscDistanceTopK::new(k);
+    for &slot in slots {
         let Some(start) = (slot as usize).checked_mul(dim) else {
             continue;
         };
         let Some(v) = start
             .checked_add(dim)
-            .and_then(|end| input.vectors.get(start..end))
+            .and_then(|end| vectors.get(start..end))
         else {
             continue;
         };
-        let d = cosine_distance_from_parts(dot(v, input.query), dot(v, v), q_norm_sq);
+        let d = cosine_distance_from_parts(dot(v, query), dot(v, v), q_norm_sq);
         selector.push(DistanceHit {
             id: u64::from(slot),
             distance: d,
         });
     }
-    Ok(selector.into_sorted_vec())
+    selector
 }
 
 /// 最大ヒープ用の要素（遠い順の選出で、距離が小さいほど「劣る」＝ヒープ頂点）。

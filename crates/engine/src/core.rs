@@ -306,6 +306,16 @@ pub(crate) fn provider_result_is_valid(
     k: usize,
     visible_id_counts: &HashMap<u64, usize>,
 ) -> bool {
+    provider_result_is_valid_with(hits, k, visible_id_counts)
+}
+
+/// [`provider_result_is_valid`] の本体。id 多重集合を [`IdMultiset`] として受け取る
+/// （Issue #3220。恒等スロット列では HashMap を作らず [`SearchedIds::Identity`] で検証する）。
+pub(crate) fn provider_result_is_valid_with<S: IdMultiset + ?Sized>(
+    hits: &[CandidateHit],
+    k: usize,
+    visible_id_counts: &S,
+) -> bool {
     // (1) 件数が要求 k を超えない。
     if hits.len() > k {
         return false;
@@ -319,7 +329,7 @@ pub(crate) fn provider_result_is_valid(
             return false;
         }
         // (3) 縮約ビュー（＝可視行）の id 集合に属する（不可視 id・捏造 id の拒否）。
-        let Some(available) = visible_id_counts.get(&hit.id) else {
+        let Some(available) = visible_id_counts.available(hit.id) else {
             return false;
         };
         // (4) 同じ id の出現回数が、その id を持つ可視行の実数を超えない
@@ -330,7 +340,7 @@ pub(crate) fn provider_result_is_valid(
             Some(next) => next,
             None => return false,
         };
-        if *seen > *available {
+        if *seen > available {
             return false;
         }
         // (5) スコア降順・同点は**候補識別子**の昇順（`kernel.rs::CpuScalarProvider` が
@@ -366,10 +376,20 @@ pub(crate) fn provider_result_is_valid(
 /// (3) [`crate::search_order::cmp_distance_asc_then_tie`] で広義単調（距離昇順・同点は識別子昇順）、
 /// (4) NaN は末尾の連続区間にだけ現れる（この比較器が保証する並びそのもの）。`-inf` と `+inf` は
 /// 正常な距離として許す。fail-closed: 1 件でも違反すれば `false` で、呼び出し元は `Internal` で拒否する。
+#[cfg(test)]
 pub(crate) fn distance_result_is_valid(
     hits: &[crate::kernel::DistanceHit],
     k: usize,
     visible_id_counts: &HashMap<u64, usize>,
+) -> bool {
+    distance_result_is_valid_with(hits, k, visible_id_counts)
+}
+
+/// [`distance_result_is_valid`] の本体（Issue #3220。[`IdMultiset`] 版）。
+pub(crate) fn distance_result_is_valid_with<S: IdMultiset + ?Sized>(
+    hits: &[crate::kernel::DistanceHit],
+    k: usize,
+    visible_id_counts: &S,
 ) -> bool {
     if hits.len() > k {
         return false;
@@ -377,7 +397,7 @@ pub(crate) fn distance_result_is_valid(
     let mut seen_ids: HashMap<u64, usize> = HashMap::with_capacity(hits.len());
     let mut prev: Option<&crate::kernel::DistanceHit> = None;
     for hit in hits {
-        let Some(available) = visible_id_counts.get(&hit.id) else {
+        let Some(available) = visible_id_counts.available(hit.id) else {
             return false;
         };
         let seen = seen_ids.entry(hit.id).or_insert(0);
@@ -385,7 +405,7 @@ pub(crate) fn distance_result_is_valid(
             Some(next) => next,
             None => return false,
         };
-        if *seen > *available {
+        if *seen > available {
             return false;
         }
         if let Some(p) = prev {
@@ -487,6 +507,65 @@ pub(crate) fn resolve_slot_hits(
         out.push(SearchHit::new(tenant, id, hit.score));
     }
     Some(out)
+}
+
+/// 返却 id 検証用の「id → 可視件数」多重集合の抽象（Issue #3220）。
+/// [`provider_result_is_valid_with`]・[`distance_result_is_valid_with`] が受け取る。
+/// 属さない id は `None`（fail-closed で拒否される）。
+pub(crate) trait IdMultiset {
+    fn available(&self, id: u64) -> Option<usize>;
+}
+
+impl IdMultiset for HashMap<u64, usize> {
+    fn available(&self, id: u64) -> Option<usize> {
+        self.get(&id).copied()
+    }
+}
+
+/// 密側の返却 id 検証に使う、探索した候補 id の多重集合（Issue #3220）。
+/// `sql/exec.rs` の密側検索（hybrid の fetch_k 再試行ごとのアダプタ・kNN 本体）が使う。
+/// 恒等スロット列（0..n）だけは HashMap を作らず O(1) で判定する（スロット番号は
+/// 可視集合内で一意なので件数は常に 1）。それ以外は従来どおり HashMap（fail-closed）。
+pub(crate) enum SearchedIds {
+    /// 恒等スロット列 `0..len`。各 id の件数は 1。
+    Identity { len: u64 },
+    /// 一般の多重集合（非恒等・mask・NULL 行除外 `dense` ありの経路）。
+    Counts(HashMap<u64, usize>),
+}
+
+impl SearchedIds {
+    /// `dense` が `None` かつ `all_ids` が実際に `0..n` の恒等列だと確認できたときだけ
+    /// `Identity`。それ以外（mask で絞った部分集合・NULL 行除外・変換失敗を含む）は
+    /// 従来の [`searched_id_counts`] へ倒す。構築の仕方を仮定せず毎回線形に確かめる
+    /// （ハッシュ構築より桁違いに安い）。
+    pub(crate) fn from_ids_checked(all_ids: &[u64], dense: Option<&[u32]>) -> Self {
+        if dense.is_none() {
+            let identity = all_ids
+                .iter()
+                .enumerate()
+                .all(|(i, &id)| u64::try_from(i).is_ok_and(|i| i == id));
+            if identity {
+                if let Ok(len) = u64::try_from(all_ids.len()) {
+                    return SearchedIds::Identity { len };
+                }
+            }
+        }
+        SearchedIds::Counts(searched_id_counts(all_ids, dense))
+    }
+
+    /// id が候補集合に属するか。
+    pub(crate) fn contains(&self, id: u64) -> bool {
+        self.available(id).is_some()
+    }
+}
+
+impl IdMultiset for SearchedIds {
+    fn available(&self, id: u64) -> Option<usize> {
+        match self {
+            SearchedIds::Identity { len } => (id < *len).then_some(1),
+            SearchedIds::Counts(c) => c.get(&id).copied(),
+        }
+    }
 }
 
 /// 密側検証用の id 多重集合を作る（Issue #2043）。`dense` が `Some` のとき、provider へ実際に渡した
@@ -9188,8 +9267,8 @@ impl EngineCore {
                 }
             },
             // SQL-53 (b)・Issue #1754: 束縛（列解決・型照合）を通した後に `0A000` で止める。実行は #1755 以降。
-            ParsedSql::UpdateFrom(stmt) => self.execute_update_from_stub(stmt),
-            ParsedSql::DeleteUsing(stmt) => self.execute_delete_using_stub(stmt),
+            ParsedSql::UpdateFrom(stmt) => self.execute_update_from_stub(stmt, session.udfs()),
+            ParsedSql::DeleteUsing(stmt) => self.execute_delete_using_stub(stmt, session.udfs()),
             ParsedSql::Update(stmt) => {
                 // Issue #1129: `PARTITIONED` 付きは分割実行（非原子・autocommit 専用）。
                 if let crate::sql::allowlist::ValidatedUpdateForm::Predicate(v) = stmt {
@@ -10793,8 +10872,8 @@ impl EngineCore {
             }
             // SQL-53 (b)・Issue #1754: 書き込みトランザクションに触れず、束縛の後に `0A000` で止める。
             // 呼び出し元が明示トランザクションを `Failed` へ遷移させる（他の失敗文と同じ契約）。
-            ParsedSql::UpdateFrom(stmt) => self.execute_update_from_stub(stmt),
-            ParsedSql::DeleteUsing(stmt) => self.execute_delete_using_stub(stmt),
+            ParsedSql::UpdateFrom(stmt) => self.execute_update_from_stub(stmt, session.udfs()),
+            ParsedSql::DeleteUsing(stmt) => self.execute_delete_using_stub(stmt, session.udfs()),
             // SQL-51・Issue #1732・#1733: autocommit と同じ実行本体へ共有 write txn を渡す
             // （読み取り源にも書き込み先にもなる）。台帳・世代の単位は挿入先の表。
             // SQL-63・Issue #1876: 全副文・台帳記録・主クエリを共有 write txn で実行する。書いた全表へ
@@ -23690,5 +23769,89 @@ mod like_lhs_expr_gate_tests {
         assert!(reject_unsupported_predicate_dml_conjunction(&[like(expr.clone())], 0).is_err());
         let negated = WherePredicate::Not(Box::new(like(expr)));
         assert!(reject_unsupported_predicate_dml_conjunction(&[negated], 0).is_err());
+    }
+}
+
+/// Issue #3220: 恒等スロット列の [`SearchedIds::Identity`] が従来の HashMap 多重集合と
+/// 検証結果まで一致することの固定（受入基準: 拒否契約を変えない）。
+#[cfg(test)]
+mod searched_ids_tests {
+    use super::*;
+    use crate::kernel::DistanceHit;
+
+    fn identity_ids(n: u64) -> Vec<u64> {
+        (0..n).collect()
+    }
+
+    #[test]
+    fn from_ids_checked_picks_identity_only_for_exact_identity() {
+        let id = |ids: &[u64], dense: Option<&[u32]>| {
+            matches!(
+                SearchedIds::from_ids_checked(ids, dense),
+                SearchedIds::Identity { .. }
+            )
+        };
+        assert!(id(&[], None));
+        assert!(id(&[0, 1, 2], None));
+        assert!(!id(&[1, 2], None));
+        assert!(!id(&[0, 2], None));
+        assert!(!id(&[1, 0], None));
+        assert!(!id(&[0, 1, 2], Some(&[0, 2])));
+    }
+
+    #[test]
+    fn identity_matches_hashmap_for_all_short_sequences() {
+        for n in 0..=4_u64 {
+            let ids = identity_ids(n);
+            let counts = visible_id_counts(&ids);
+            let identity = SearchedIds::from_ids_checked(&ids, None);
+            assert!(matches!(identity, SearchedIds::Identity { .. }));
+            let pool: Vec<u64> = (0..=n + 1).chain([u64::MAX]).collect();
+            for k in 0..=4_usize {
+                // 長さ 0..=k+1 の id 列を全列挙する。
+                let mut seqs: Vec<Vec<u64>> = vec![vec![]];
+                let mut frontier: Vec<Vec<u64>> = vec![vec![]];
+                for _ in 0..=k {
+                    let mut next = Vec::new();
+                    for f in &frontier {
+                        for &p in &pool {
+                            let mut v = f.clone();
+                            v.push(p);
+                            next.push(v);
+                        }
+                    }
+                    seqs.extend(next.iter().cloned());
+                    frontier = next;
+                }
+                for seq in seqs {
+                    let dist: Vec<DistanceHit> = seq
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &id)| DistanceHit {
+                            id,
+                            distance: i as f64 * 0.1,
+                        })
+                        .collect();
+                    assert_eq!(
+                        distance_result_is_valid_with(&dist, k, &identity),
+                        distance_result_is_valid_with(&dist, k, &counts),
+                        "distance n={n} k={k} seq={seq:?}"
+                    );
+                    let cand: Vec<CandidateHit> = seq
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &id)| CandidateHit {
+                            id,
+                            score: 1.0 - i as f32 * 0.1,
+                        })
+                        .collect();
+                    assert_eq!(
+                        provider_result_is_valid_with(&cand, k, &identity),
+                        provider_result_is_valid_with(&cand, k, &counts),
+                        "provider n={n} k={k} seq={seq:?}"
+                    );
+                }
+            }
+        }
     }
 }
