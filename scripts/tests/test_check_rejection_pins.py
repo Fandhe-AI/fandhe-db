@@ -330,6 +330,19 @@ class SameNameModuleTest(unittest.TestCase):
         for ctx in (0, 3):
             self.assertEqual(kinds(run_check(P, old, new, context=ctx)), ["missing-annotation"])
 
+    def test_parent_mod_rename_does_not_target_untouched_sibling(self):
+        body = "        assert_eq!(err.wire_code(), \"0A000\");\n"
+        def mod(top, ann):
+            return (f"mod {top} {{\n"
+                    f"    mod p {{\n{ann}        #[test]\n        fn reject_x() {{\n{body}        }}\n    }}\n"
+                    f"    mod q {{\n        // tracked: #2\n        #[test]\n        fn reject_x() {{\n{body}        }}\n    }}\n"
+                    "}\n")
+        old = mod("a", "        // tracked: #1\n")
+        new = mod("c", "")
+        v = run_check(P, old, new, context=0)
+        self.assertEqual(kinds(v), ["missing-annotation"])
+        self.assertEqual(len(v), 1)
+
     def test_deleting_b_targets_nothing_in_a(self):
         # b を削除しても a（未変更・拒否固定でもない）は対象にならない
         new = self.SRC[: self.SRC.index("mod b")]

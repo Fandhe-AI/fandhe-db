@@ -360,6 +360,14 @@ def find_tests(text: str) -> List[TestRange]:
 ReadFn = Callable[[str], Optional[str]]
 
 
+def _common_suffix_len(a: Tuple[str, ...], b: Tuple[str, ...]) -> int:
+    """モジュールパス末尾側から数えた一致要素数（親 mod 名変更の接頭辞置換の近さ）。"""
+    n = 0
+    while n < len(a) and n < len(b) and a[-1 - n] == b[-1 - n]:
+        n += 1
+    return n
+
+
 def select_targets(
     file_diffs: List[FileDiff], read_head: ReadFn, read_base: ReadFn
 ) -> List[Tuple[str, TestRange]]:
@@ -386,12 +394,24 @@ def select_targets(
                         names.add((bt.module, bt.name))
                 base_keys = {(bt.module, bt.name) for bt in find_tests(base_text)}
                 # 親 mod のリネームでモジュールパスが変わっても注記削除を逃さないため、
-                # base 側に同じキーが無い HEAD 側テスト（リネーム後の候補）は関数名だけで対応付ける
-                loose = {nm for (_, nm) in names}
+                # base 側に同じキーが無い HEAD 側テスト（リネーム後の候補）のうち、
+                # 触れた base テストと同名で、モジュールパスの末尾側が最も長く一致する
+                # 候補が一意に定まる場合だけ対応付ける（定まらなければ兄弟を誤対象化しない）
                 for t in head_tests:
-                    renamed = (t.module, t.name) not in base_keys
-                    if (t.module, t.name) in names or (renamed and t.name in loose):
+                    if (t.module, t.name) in names:
                         out[(fd.new_path, t.fn_line)] = (fd.new_path, t)
+                renamed = [t for t in head_tests if (t.module, t.name) not in base_keys]
+                for bmod, bname in names:
+                    if any(t.module == bmod and t.name == bname for t in head_tests):
+                        continue
+                    cands = [t for t in renamed if t.name == bname]
+                    if not cands:
+                        continue
+                    scored = [(_common_suffix_len(t.module, bmod), t) for t in cands]
+                    best = max(sc for sc, _ in scored)
+                    top = [t for sc, t in scored if sc == best]
+                    if len(top) == 1:
+                        out[(fd.new_path, top[0].fn_line)] = (fd.new_path, top[0])
     return sorted(out.values(), key=lambda x: (x[0], x[1].fn_line))
 
 
