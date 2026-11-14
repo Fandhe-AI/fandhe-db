@@ -32,7 +32,7 @@ DELETE FROM <表> [[AS] <別名>] USING <rel>[, <rel>]* [WHERE <join_where>]
   - それ以外（`DmlFromSetValue::Value`）: 既存の `SetValue`。式中の修飾列参照は、対象表の公開名で修飾されたものだけを非修飾へ正規化し、FROM 側を指す修飾は `0A000`
 - 参照数（対象表を含む）は `MAX_TABLE_REFS` で積む前に検査する（超過は `54000`）。公開名の重複は `42601`（`BindingScope::new` と同じ契約）。別名で公開名を分ければ自己結合は受理する
 - `FROM` 内の `JOIN ... ON`・派生表・関数呼び出しは `42601`
-- `PARTITIONED` 併用は `42601`、`RETURNING` 併用は `0A000`（#1756）、`$n` は拡張クエリの Parse 段で `42601`
+- `PARTITIONED` 併用は `42601`、`RETURNING` は `*`・`<公開名>.*`・列参照を受理する（#3204。式・関数・`AS` 別名は `42601`。束縛・実行は [sql-returning.md](sql-returning.md) の「結線」節）、`$n` は拡張クエリの Parse 段で `42601`
 - `--require-where-for-dml` は FROM／USING 形でも `WHERE` 省略を `42601` で拒否する（opt-in のときだけ）
 
 ## 既存解析器との振り分け
@@ -97,7 +97,7 @@ SQL の入口を結合実行器（`execute_joined_dml_in`）へ結線した。�
 - **`USING OPERATION_ID` 付き**（Issue #3203・RECOVER-10/11）: 台帳へ結線済み。構文段で検証した `operation_id` と content_hash を実行器へ渡し、FROM／USING 側の走査より前の事前照合で再送は `23505`、別文への再利用は `22023`、確定記録は書き込み本体と同じ txn で行う。束縛・変換・実行のエラーは txn が commit されないため台帳を消費しない。`parsed_operation_id` は実値を返し、同一 Tx 内の再利用は既存 DML と同じく拒否される（Tx は `Failed`）。`READ ONLY` Tx・一時表ルーティング・PL/pgSQL 本体は op id 付きを拒否側に倒す。`--require-operation-id` 構成でも使える（省略は `23502`）
 - **`PARTITIONED`**: 構文段が `42601` で拒否する。`ValidatedUpdateFrom`／`ValidatedDeleteUsing` は `partitioned` を持たず、`run_partitioned_*` は述語形だけを受け取るため、結合形が分割実行器へ入る経路は構造上存在しない（autocommit・明示 Tx の両方を結合テストで固定）
 - **多重一致**: 実行器の規約どおり、対象行ごとに 1 回だけ更新・削除し、UPDATE の値は走査順で最初の source 行を採る
-- **まだ拒否する形**: 変換器の対象外（上記の変換器節。`0A000`）、`RETURNING`（#3204。Parse で `0A000`）、ビュー・一時表が関与する形、データ変更 CTE の本文と `EXPLAIN`。いずれも第 1 弾の設計上の対象外で、fail-closed の安全弁
+- **まだ拒否する形**: 変換器の対象外（上記の変換器節。`0A000`）、ビュー・一時表が関与する形、データ変更 CTE の本文と `EXPLAIN`。いずれも第 1 弾の設計上の対象外で、fail-closed の安全弁
 
 ## テスト
 

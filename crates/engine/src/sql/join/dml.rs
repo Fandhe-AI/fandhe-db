@@ -32,14 +32,18 @@
 //! 暫定事項: 台帳（RECOVER-11）の結線は Issue #1757 の担当。呼び出し元が暫定ゲートで台帳記録を
 //! 伴う構成を拒否する。
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use crate::catalog::{ColumnType, TableSchema};
 use crate::declarative_filter::MetadataFilter;
 use crate::policy::PolicyContext;
 use crate::row_codec::{ScalarRef, Value};
 use crate::sql::allowlist::{Projection, SqlSurfaceError, ValidatedScan, WherePredicate};
+use crate::sql::dml_from_returning::BoundFromReturning;
 use crate::sql::exec::{Cell, ResultRow};
+use crate::sql::relation::ColumnSlot;
 use crate::sql::set_expr::BoundSetExpr;
 use crate::sql::udf_call::{BoundExpr, UdfRegistry};
 use crate::tenant::DmlCandidate;
@@ -73,6 +77,13 @@ pub(crate) struct JoinedDmlSource {
     /// 走査で取り出す source の列（`schema.columns` の添字）。SET 右辺が参照する列を並べる。
     /// 結合キーの列は不足分が末尾へ自動追加される（[`JoinedDmlPlan::source_columns`]）。
     pub(crate) columns: Vec<usize>,
+    /// `RETURNING` だけが読む source の列（Issue #3204）。SET の式評価ビュー（`source_scalar`）へは
+    /// 載せず、走査投影（[`JoinedDmlPlan::scan_columns`]）の末尾へだけ追記する。VECTOR 等の
+    /// 式評価できない型でも、セルを複製して返せる。
+    pub(crate) returning_columns: Vec<usize>,
+    /// `RETURNING` が source の疑似列 `id` を参照するため、結合キーが使わなくても走査で `id` を
+    /// 取り出すか（Issue #3204）。
+    pub(crate) include_pseudo_id: bool,
 }
 
 /// 等値結合キー 1 本。`None` は疑似列 `id`（`has_pseudo_id` の表のみ）。
@@ -127,8 +138,9 @@ pub(crate) struct JoinedDmlPlan {
     pub(crate) keys: Vec<EquiKey>,
     /// `Some` なら `UPDATE`、`None` なら `DELETE`。
     pub(crate) update: Option<JoinedUpdateSet>,
-    /// `RETURNING` が source の列を参照するか（Issue #1756 の担当。それまでは実行入口で `0A000`）。
-    pub(crate) returning_references_source: bool,
+    /// 束縛済みの `RETURNING`（Issue #3204）。source 側の列は計画段で
+    /// [`Self::source_cell_position`] により位置が確定済み。
+    pub(crate) returning: Option<BoundFromReturning>,
 }
 
 fn internal(detail: &str) -> SqlSurfaceError {
@@ -150,6 +162,41 @@ impl JoinedDmlPlan {
             }
         }
         cols
+    }
+
+    /// 走査で実際に取り出す列。[`Self::source_columns`]（SET の式評価ビューと同じ並び）の後ろへ、
+    /// `RETURNING` 専用の列で未含のものを追記したもの。セル位置の解決（`RETURNING`・結合キー）は
+    /// これを基準にし、SET ビューは [`Self::source_columns`] のみを使う。
+    pub(crate) fn scan_columns(&self) -> Vec<usize> {
+        let mut cols = self.source_columns();
+        for &c in &self.source.returning_columns {
+            if !cols.contains(&c) {
+                cols.push(c);
+            }
+        }
+        cols
+    }
+
+    /// 走査結果の `cells` が先頭に疑似列 `id` を持つか。`build_source_index`（結合キーの位置）・
+    /// [`JoinedProbe`]（SET 用のセル開始位置）・`RETURNING`（[`Self::source_cell_position`]）が
+    /// 同じ判定を共有し、位置のずれを構造的に防ぐ。
+    pub(crate) fn source_id_in_cells(&self) -> bool {
+        self.source.include_pseudo_id || self.keys.iter().any(|k| k.source_column.is_none())
+    }
+
+    /// source の列スロットが走査結果の `cells` 内で占める位置。走査で取り出していない列は `XX000`。
+    pub(crate) fn source_cell_position(&self, slot: ColumnSlot) -> Result<usize, SqlSurfaceError> {
+        let id_offset = usize::from(self.source_id_in_cells());
+        match slot {
+            ColumnSlot::Id if self.source_id_in_cells() => Ok(0),
+            ColumnSlot::Id => Err(internal("source pseudo id is not in the scan projection")),
+            ColumnSlot::Column(c) => self
+                .scan_columns()
+                .iter()
+                .position(|&x| x == c)
+                .and_then(|p| p.checked_add(id_offset))
+                .ok_or_else(|| internal("source column is not in the scan projection")),
+        }
     }
 
     /// データに依存しない形の検証。走査より前に呼ぶ（fail-closed）。
@@ -184,7 +231,13 @@ impl JoinedDmlPlan {
                 _ => {}
             }
         }
-        if self.source.columns.iter().any(|&c| c >= s_len) {
+        if self
+            .source
+            .columns
+            .iter()
+            .chain(&self.source.returning_columns)
+            .any(|&c| c >= s_len)
+        {
             return Err(internal("source column out of range"));
         }
         if let Some(u) = &self.update {
@@ -236,7 +289,7 @@ impl JoinedDmlPlan {
 
 /// FROM／USING 側の可視行とその結合キーのハッシュ表（値は走査位置の昇順＝決定的）。
 pub(crate) struct SourceIndex {
-    rows: Vec<ResultRow>,
+    pub(crate) rows: Vec<ResultRow>,
     table: HashMap<Vec<u8>, Vec<u32>>,
 }
 
@@ -256,8 +309,8 @@ fn build_source_index(
     budget: &mut JoinBudget,
 ) -> Result<SourceIndex, SqlSurfaceError> {
     let schema = &plan.source.schema;
-    let columns = plan.source_columns();
-    let id_needed = plan.keys.iter().any(|k| k.source_column.is_none());
+    let columns = plan.scan_columns();
+    let id_needed = plan.source_id_in_cells();
     let id_offset = usize::from(id_needed);
     let mut names: Vec<String> = Vec::with_capacity(columns.len().saturating_add(id_offset));
     if id_needed {
@@ -363,7 +416,8 @@ fn value_bytes(v: &Value) -> usize {
 pub(crate) struct JoinedProbe<'a> {
     plan: &'a JoinedDmlPlan,
     classes: Vec<JoinKeyClass>,
-    index: SourceIndex,
+    /// `RETURNING` の収集側（[`Self::index_handle`]）と共有する。probe 本体は読み取りしかしない。
+    index: Rc<SourceIndex>,
     /// 結合ビューの source 列（[`JoinedDmlPlan::source_columns`]）と、そのセル開始位置。
     source_columns: Vec<usize>,
     cell_offset: usize,
@@ -371,8 +425,10 @@ pub(crate) struct JoinedProbe<'a> {
     max_output_rows: usize,
     /// 一意化の前の一致ペアの累計（`max_output_rows` の判定対象）。
     pairs: usize,
-    /// 一致した対象行 id と採った source の走査位置（Issue #1756 が RETURNING で使う）。
-    matches: Vec<(u64, u32)>,
+    /// 一致した対象行 id と採った source の走査位置（`RETURNING` の収集側と共有する。Issue #3204）。
+    /// 述語クロージャ（書き込み）と収集クロージャ（読み取り）が同じ文内で別々に借用するため
+    /// `RefCell` に置く。借用の重なりは起きない設計だが、起きても panic せず `XX000` にする。
+    matches: Rc<RefCell<HashMap<u64, u32>>>,
 }
 
 impl<'a> JoinedProbe<'a> {
@@ -390,17 +446,17 @@ impl<'a> JoinedProbe<'a> {
         let mut budget = JoinBudget::new(limits.budget_cap);
         let index = build_source_index(read_txn, ctx, plan, &classes, udfs, limits, &mut budget)?;
         let source_columns = plan.source_columns();
-        let cell_offset = usize::from(plan.keys.iter().any(|k| k.source_column.is_none()));
+        let cell_offset = usize::from(plan.source_id_in_cells());
         Ok(Self {
             plan,
             classes,
-            index,
+            index: Rc::new(index),
             source_columns,
             cell_offset,
             budget,
             max_output_rows: limits.max_output_rows,
             pairs: 0,
-            matches: Vec::new(),
+            matches: Rc::new(RefCell::new(HashMap::new())),
         })
     }
 
@@ -413,9 +469,25 @@ impl<'a> JoinedProbe<'a> {
         })
     }
 
-    /// 一致した対象行 id と採った source の走査位置（候補列挙順）。
-    pub(crate) fn matches(&self) -> &[(u64, u32)] {
-        &self.matches
+    /// 走査結果の共有ハンドル（`RETURNING` の収集側が一致行を引くのに使う）。
+    pub(crate) fn index_handle(&self) -> Rc<SourceIndex> {
+        Rc::clone(&self.index)
+    }
+
+    /// 一致記録の共有ハンドル（対象行 id → source の走査位置）。
+    pub(crate) fn matches_handle(&self) -> Rc<RefCell<HashMap<u64, u32>>> {
+        Rc::clone(&self.matches)
+    }
+
+    /// 一致した対象行 id と採った source の走査位置（対象行 id 昇順＝候補列挙順）。
+    pub(crate) fn matches_sorted(&self) -> Result<Vec<(u64, u32)>, SqlSurfaceError> {
+        let map = self
+            .matches
+            .try_borrow()
+            .map_err(|_| internal("joined DML match log is busy"))?;
+        let mut out: Vec<(u64, u32)> = map.iter().map(|(&k, &v)| (k, v)).collect();
+        out.sort_unstable();
+        Ok(out)
     }
 
     /// 一致した source 行の走査位置の先頭（決定的）を返す。一致なしは `None`。
@@ -451,7 +523,14 @@ impl<'a> JoinedProbe<'a> {
         let first = matched.first().copied();
         if let Some(pos) = first {
             self.budget.charge(std::mem::size_of::<(u64, u32)>())?;
-            self.matches.push((c.id, pos));
+            let mut log = self
+                .matches
+                .try_borrow_mut()
+                .map_err(|_| internal("joined DML match log is busy"))?;
+            log.try_reserve(1).map_err(|_| {
+                SqlSurfaceError::payload_too_large("JOIN result exceeds the row limit")
+            })?;
+            log.insert(c.id, pos);
         }
         Ok(first)
     }

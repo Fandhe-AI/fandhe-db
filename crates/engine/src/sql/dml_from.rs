@@ -4,8 +4,8 @@
 //! 本モジュールは対象表と FROM／USING 側の表を 1 つの [`BindingScope`] にまとめて、`WHERE` と
 //! `SET` 右辺の列参照を解決・型検証する純関数だけを持つ。カタログ照会・行の読み取り・RLS・
 //! 台帳には一切触れない（スキーマは呼び出し元が渡す）。結合の実行・影響行数上限は #1755、
-//! 全参照への RLS 適用と `RETURNING` は #1756、台帳の content_hash は #1757（構文段で算出済み）で、
-//! 本 Issue の範囲では束縛を通った文も実行腕が `0A000` で止める（副作用ゼロ）。
+//! 全参照への RLS 適用は #1756、台帳の content_hash は #1757（構文段で算出済み）が担う。
+//! `RETURNING` の列解決は `sql::dml_from_returning` へ委譲して同じスコープで束縛する（Issue #3204）。
 //!
 //! 呼び出し元: `core/dml_from_exec.rs`（autocommit・明示トランザクション・Describe の各腕）と、
 //! 束縛結果を `JoinedDmlPlan` へ変換する `sql::join::dml_plan`（Issue #3201）。
@@ -27,6 +27,7 @@ use crate::sql::allowlist::{
     DmlFromSetValue, JoinWhereExpr, JoinWherePredicate, SetValue, SqlSurfaceError,
     ValidatedDeleteUsing, ValidatedUpdateFrom,
 };
+use crate::sql::dml_from_returning::{bind_from_returning, BoundFromReturning};
 use crate::sql::relation::{BindingScope, ColumnRef, ResolvedColumn, TableRef};
 use crate::sql::set_expr::BoundSetExpr;
 
@@ -41,6 +42,7 @@ pub struct BoundUpdateFrom {
     set_literals: Vec<(usize, Value)>,
     set_exprs: Vec<(usize, BoundSetExpr)>,
     where_clause: Option<JoinWhereExpr>,
+    returning: Option<BoundFromReturning>,
     operation_id: Option<OperationId>,
 }
 
@@ -81,6 +83,11 @@ impl BoundUpdateFrom {
         &self.set_exprs
     }
 
+    /// 束縛済みの `RETURNING`（Issue #3204）。変換器が source 側の参照列を計画へ載せる。
+    pub(crate) fn returning(&self) -> Option<&BoundFromReturning> {
+        self.returning.as_ref()
+    }
+
     /// 検証済みの `operation_id`。
     pub fn operation_id(&self) -> Option<&OperationId> {
         self.operation_id.as_ref()
@@ -94,10 +101,16 @@ pub struct BoundDeleteUsing {
     relations: Vec<TableRef>,
     where_columns: Vec<ResolvedColumn>,
     where_clause: Option<JoinWhereExpr>,
+    returning: Option<BoundFromReturning>,
     operation_id: Option<OperationId>,
 }
 
 impl BoundDeleteUsing {
+    /// 束縛済みの `RETURNING`（Issue #3204）。変換器が source 側の参照列を計画へ載せる。
+    pub(crate) fn returning(&self) -> Option<&BoundFromReturning> {
+        self.returning.as_ref()
+    }
+
     /// 束縛に使った `WHERE` の論理木（変換器 `sql::join::dml_plan` が conjunct を振り分ける）。
     pub(crate) fn where_clause(&self) -> Option<&JoinWhereExpr> {
         self.where_clause.as_ref()
@@ -274,6 +287,12 @@ pub fn bind_update_from(
     }
     let (set_literals, set_exprs) =
         crate::sql::parser::bind_set_assignments(&plain, target_schema)?;
+    // RETURNING は SET の束縛の後に同じスコープで束縛する（束縛エラーは変換器の 0A000 より先に返る）。
+    let returning = stmt
+        .returning
+        .as_ref()
+        .map(|r| bind_from_returning(r, &scope))
+        .transpose()?;
 
     Ok(BoundUpdateFrom {
         relations: std::iter::once(stmt.target.clone())
@@ -284,6 +303,7 @@ pub fn bind_update_from(
         set_literals,
         set_exprs,
         where_clause: stmt.where_clause.as_deref().cloned(),
+        returning,
         operation_id: stmt.operation_id.clone(),
     })
 }
@@ -296,12 +316,18 @@ pub fn bind_delete_using(
 ) -> Result<BoundDeleteUsing, SqlSurfaceError> {
     let scope = build_scope(&stmt.target, target_schema, &stmt.using, using_schemas)?;
     let where_columns = resolve_where_columns(&scope, stmt.where_clause.as_deref())?;
+    let returning = stmt
+        .returning
+        .as_ref()
+        .map(|r| bind_from_returning(r, &scope))
+        .transpose()?;
     Ok(BoundDeleteUsing {
         relations: std::iter::once(stmt.target.clone())
             .chain(stmt.using.iter().cloned())
             .collect(),
         where_columns,
         where_clause: stmt.where_clause.as_deref().cloned(),
+        returning,
         operation_id: stmt.operation_id.clone(),
     })
 }

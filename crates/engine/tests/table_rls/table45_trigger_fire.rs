@@ -1,7 +1,7 @@
 //! 既定の invoker（本番の PL/pgSQL トリガ実行）で INSERT トリガが発火することの、公開 API だけを使う
 //! 結合テスト（TABLE-45・SQL-68・RLS-10。Issue #3185）。注入 invoker を使わず、SQL の
 //! `CREATE FUNCTION ... RETURNS trigger LANGUAGE plpgsql` と `CREATE TRIGGER`・`INSERT` だけで通す。
-//! 設計記録は `docs/design/plpgsql-subset.md` の「Issue #3185 追記」。網羅的な再検証（RLS 越境・crash）は #3188。
+//! 設計記録は `docs/design/plpgsql-subset.md` の「Issue #3185 追記」。網羅的な再検証は `table45_trigger_prod_invoker.rs`（越境・台帳）と `crash_tool_sequence` の `*-trigger`（crash）で実施済み（Issue #3188）。
 
 use engine::core::EngineCore;
 use engine::kernel::CpuScalarProvider;
@@ -217,7 +217,7 @@ fn explicit_transaction_commit_and_rollback() {
 }
 
 // 台帳: operation_id つき INSERT の再送は `23505` で、トリガ本体は再実行されない。
-// 網羅的な再検証（Disabled 整合・crash）は #3188。
+// 網羅的な再検証（モード別の台帳・再オープン・crash）は `table45_trigger_prod_invoker.rs` と `*-trigger`（Issue #3188）。
 #[test]
 fn replay_with_operation_id_does_not_refire() {
     let (_g, core) = open("t45fire-ledger");

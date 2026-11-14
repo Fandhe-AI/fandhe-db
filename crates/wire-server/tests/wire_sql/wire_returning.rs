@@ -404,3 +404,82 @@ fn wire_update_returning_response_is_byte_identical_for_other_tenant_row_and_non
     read_command_complete(&mut bob_stream);
     read_ready_for_query(&mut bob_stream);
 }
+fn new_core_with_docs_and_langs() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
+    let path = temp_db::unique_db_path("wire-returning-from-using");
+    let guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(3), false),
+                ColumnDef::new("lang", ColumnType::Text, true),
+            ],
+        ))
+        .expect("create docs");
+    storage
+        .create_table(&TableSchema::new(
+            "langs",
+            vec![
+                ColumnDef::new("lang", ColumnType::Text, false),
+                ColumnDef::new("label", ColumnType::Text, true),
+            ],
+        ))
+        .expect("create langs");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    (Arc::new(core), guard)
+}
+
+/// `UPDATE ... FROM`／`DELETE ... USING ... RETURNING`（Issue #3204・SQL-53）が psql と同じ末尾 `;` 付きの
+/// 単独送信で、`RowDescription`→`DataRow`*→`CommandComplete`（`UPDATE n`／`DELETE n`）の順に届く。
+#[test]
+fn wire_update_from_and_delete_using_returning_emit_rows_and_tags() {
+    let (core, _guard) = new_core_with_docs_and_langs();
+    let addrs = spawn_with_users(core, &[("alice", "tenant-a", "pw-alice")]);
+    let mut stream = connect_as(addrs[0], "alice", "pw-alice");
+
+    for sql in [
+        insert_sql(1, "ja", "wire-from-1"),
+        insert_sql(2, "en", "wire-from-2"),
+        "INSERT INTO langs (id, lang, label) VALUES (1, 'ja', 'Japanese') \
+         USING OPERATION_ID 'wire-from-l1'"
+            .to_string(),
+    ] {
+        send_simple_query(&mut stream, &sql);
+        assert!(read_command_complete(&mut stream).starts_with("INSERT"));
+        read_ready_for_query(&mut stream);
+    }
+
+    send_simple_query(
+        &mut stream,
+        "UPDATE docs SET lang = 'x' FROM langs WHERE docs.lang = langs.lang \
+         RETURNING docs.id, docs.lang, langs.label;",
+    );
+    let columns = read_row_description(&mut stream);
+    assert_eq!(
+        columns,
+        vec!["id".to_string(), "lang".to_string(), "label".to_string()]
+    );
+    let row = read_data_row(&mut stream);
+    assert_eq!(
+        row,
+        vec![
+            Some("1".to_string()),
+            Some("x".to_string()),
+            Some("Japanese".to_string())
+        ]
+    );
+    assert_eq!(read_command_complete(&mut stream), "UPDATE 1");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(
+        &mut stream,
+        "DELETE FROM docs USING langs WHERE docs.id = langs.id RETURNING langs.label;",
+    );
+    let columns = read_row_description(&mut stream);
+    assert_eq!(columns, vec!["label".to_string()]);
+    let row = read_data_row(&mut stream);
+    assert_eq!(row, vec![Some("Japanese".to_string())]);
+    assert_eq!(read_command_complete(&mut stream), "DELETE 1");
+    read_ready_for_query(&mut stream);
+}

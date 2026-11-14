@@ -4221,6 +4221,8 @@ pub struct ValidatedUpdateFrom {
     pub(crate) assignments: Vec<(String, DmlFromSetValue)>,
     /// `WHERE` 句（JOIN と同じ文法）。省略は `None`。
     pub(crate) where_clause: Option<Box<JoinWhereExpr>>,
+    /// `RETURNING` 句（Issue #3204）。省略は `None`。項目の束縛は `sql::dml_from` が行う。
+    pub(crate) returning: Option<crate::sql::dml_from_returning::DmlFromReturning>,
     /// 文末の `USING OPERATION_ID` で搬送された検証済みの operation_id。
     pub(crate) operation_id: Option<OperationId>,
     /// 台帳照合用の文ハッシュ（Issue #1757。`USING OPERATION_ID` 句と末尾 `;` を除いたトークン列だけが
@@ -4256,6 +4258,8 @@ pub struct ValidatedDeleteUsing {
     pub(crate) using: Vec<TableRef>,
     /// `WHERE` 句（JOIN と同じ文法）。省略は `None`。
     pub(crate) where_clause: Option<Box<JoinWhereExpr>>,
+    /// `RETURNING` 句（Issue #3204）。省略は `None`。
+    pub(crate) returning: Option<crate::sql::dml_from_returning::DmlFromReturning>,
     /// 文末の `USING OPERATION_ID` で搬送された検証済みの operation_id。
     pub(crate) operation_id: Option<OperationId>,
     /// 台帳照合用の文ハッシュ（[`ValidatedUpdateFrom::statement_hash`] と同じ規則）。
@@ -15275,9 +15279,8 @@ impl<'a> Parser<'a> {
     /// FROM／USING つき UPDATE／DELETE 専用の `RETURNING` 句（Issue #1756・SQL-53 のポインタ）。
     /// `*`・`<公開名>.*`・列参照（修飾あり・なし）の並びだけを受理し、式・関数呼び出し・
     /// `AS` 別名は従来の `RETURNING` と同じく `42601`（受理範囲を従来より広げない）。
-    /// FROM／USING の構文本体（#1754）が結線されるまで呼び出し元は無い
-    /// （`sql::dml_from_returning` が束縛する）。
-    #[allow(dead_code)]
+    /// 呼び出し元は `parse_update_from`／`parse_delete_using`（Issue #3204 で結線）で、
+    /// 項目の束縛は `sql::dml_from_returning` が行う。
     pub(crate) fn parse_dml_from_returning_clause(
         &mut self,
     ) -> Result<Option<crate::sql::dml_from_returning::DmlFromReturning>, SqlSurfaceError> {
@@ -22237,7 +22240,7 @@ impl<'a> Parser<'a> {
         self.expect_keyword(Keyword::From)?;
         let from = self.parse_dml_relation_list(&target)?;
         let where_clause = self.parse_dml_from_where()?;
-        let returning = self.parse_returning_clause()?;
+        let returning = self.parse_dml_from_returning_clause()?;
         let operation_id = self.parse_operation_id_clause()?;
         // 文ハッシュは検証入口が元のトークン列から算出して差し替える（QuotedNull 正規化前の列を使うため）。
         let statement_hash = placeholder_statement_hash()?;
@@ -22247,10 +22250,10 @@ impl<'a> Parser<'a> {
                 from,
                 assignments,
                 where_clause,
+                returning,
                 operation_id,
                 statement_hash,
             },
-            has_returning: returning.is_some(),
         })
     }
 
@@ -22263,7 +22266,7 @@ impl<'a> Parser<'a> {
         self.expect_contextual_keyword("USING")?;
         let using = self.parse_dml_relation_list(&target)?;
         let where_clause = self.parse_dml_from_where()?;
-        let returning = self.parse_returning_clause()?;
+        let returning = self.parse_dml_from_returning_clause()?;
         let operation_id = self.parse_operation_id_clause()?;
         let statement_hash = placeholder_statement_hash()?;
         Ok(ParsedDeleteUsing {
@@ -22271,10 +22274,10 @@ impl<'a> Parser<'a> {
                 target,
                 using,
                 where_clause,
+                returning,
                 operation_id,
                 statement_hash,
             },
-            has_returning: returning.is_some(),
         })
     }
 }
@@ -22287,16 +22290,14 @@ fn placeholder_statement_hash(
     })
 }
 
-/// [`Parser::parse_update_from`] の結果。`RETURNING` は構造だけ解析し、`0A000` の拒否は検証入口が行う。
+/// [`Parser::parse_update_from`] の結果。
 struct ParsedUpdateFrom {
     stmt: ValidatedUpdateFrom,
-    has_returning: bool,
 }
 
 /// [`Parser::parse_delete_using`] の結果（[`ParsedUpdateFrom`] と同じ）。
 struct ParsedDeleteUsing {
     stmt: ValidatedDeleteUsing,
-    has_returning: bool,
 }
 
 /// FROM／USING 形の `WHERE` 省略を opt-in のスイッチが有効なときだけ `42601` で拒否する
@@ -22332,8 +22333,9 @@ fn resolve_dml_from_relations(
     Ok(())
 }
 
-/// `UPDATE ... FROM` の検証入口（SQL-53 (b)、Issue #1754）。検証順序: 構造（`42601`）→ `RETURNING`
-/// （`0A000`。#1756）→ `operation_id` 必須化 → `WHERE` 省略ガード（opt-in）→ 各表のカタログ確認。
+/// `UPDATE ... FROM` の検証入口（SQL-53 (b)、Issue #1754）。検証順序: 構造（`42601`。`RETURNING` の構造を含む）→
+/// `operation_id` 必須化 → `WHERE` 省略ガード（opt-in）→ 各表のカタログ確認。`RETURNING` の束縛は
+/// `sql::dml_from`（Issue #3204）。
 /// `core.rs` の文解析が [`looks_like_update_from`] 真のときだけ呼ぶ。
 pub(crate) fn validate_update_from_tokens_with_limits(
     tokens: &[Token],
@@ -22345,11 +22347,6 @@ pub(crate) fn validate_update_from_tokens_with_limits(
     let mut p = Parser::new(tokens).with_nesting_limits(limits);
     let parsed = p.parse_update_from()?;
     p.expect_end_of_statement()?;
-    if parsed.has_returning {
-        return Err(SqlSurfaceError::feature_not_supported(
-            "RETURNING is not supported in UPDATE ... FROM yet",
-        ));
-    }
     let mut stmt = parsed.stmt;
     mode.require(stmt.operation_id.as_ref())?;
     reject_omitted_join_where_for_dml(require_where_for_dml, stmt.where_clause.is_some())?;
@@ -22376,11 +22373,6 @@ pub(crate) fn validate_delete_using_tokens_with_limits(
     let mut p = Parser::new(tokens).with_nesting_limits(limits);
     let parsed = p.parse_delete_using()?;
     p.expect_end_of_statement()?;
-    if parsed.has_returning {
-        return Err(SqlSurfaceError::feature_not_supported(
-            "RETURNING is not supported in DELETE ... USING yet",
-        ));
-    }
     let mut stmt = parsed.stmt;
     mode.require(stmt.operation_id.as_ref())?;
     reject_omitted_join_where_for_dml(require_where_for_dml, stmt.where_clause.is_some())?;

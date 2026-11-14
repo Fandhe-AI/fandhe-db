@@ -2030,7 +2030,7 @@ pub enum ParsedSql {
     /// 構文と表の存在確認までを担い、列の解決・型照合は束縛（`sql::dml_from::bind_update_from`）が
     /// 実行腕・Describe 腕で行う。束縛・変換を通った文は結合実行器へ dispatch される（Issue #3202。
     /// autocommit は暗黙 Tx、明示 Tx は共有 write txn。`USING OPERATION_ID` 付きの台帳は Issue #3203 で結線済み、
-    /// `RETURNING` は #3204）。台帳の content_hash は #1757 で構文段に実装済み。既存の [`Self::Update`] に
+    /// `RETURNING` は #3204 で結線済み）。台帳の content_hash は #1757 で構文段に実装済み。既存の [`Self::Update`] に
     /// フィールドを足さず別 variant にしているのは、FROM を黙って無視する実行経路（fail-open）を
     /// 作らず、網羅 `match` の追随漏れをコンパイラに検出させるため。
     ///
@@ -12658,15 +12658,21 @@ impl EngineCore {
                     None => Ok(None),
                 }
             }
-            // SQL-53 (b)・Issue #3202: Execute と同じ準備段（束縛・変換）を通し、エラーコードを
-            // 揃える。`RETURNING` は未対応（Parse で `0A000`）のため結果列は無い。
+            // SQL-53 (b)・Issue #3202・#3204: Execute と同じ準備段（束縛・変換）を通し、
+            // エラーコードを揃える。`RETURNING` つきなら Execute の `QueryResult.columns` と同じ列を返す。
             ParsedSql::UpdateFrom(stmt) => {
-                self.plan_update_from_stmt(stmt, session.udfs())?;
-                Ok(None)
+                let plan = self.plan_update_from_stmt(stmt, session.udfs())?;
+                Ok(plan
+                    .returning
+                    .as_ref()
+                    .map(crate::sql::dml_from_returning::column_meta))
             }
             ParsedSql::DeleteUsing(stmt) => {
-                self.plan_delete_using_stmt(stmt, session.udfs())?;
-                Ok(None)
+                let plan = self.plan_delete_using_stmt(stmt, session.udfs())?;
+                Ok(plan
+                    .returning
+                    .as_ref()
+                    .map(crate::sql::dml_from_returning::column_meta))
             }
             // Issue #1129: `SHOW`／`CANCEL` は `status`・`rows` の 2 列、`EXPLAIN` は
             // `QUERY PLAN` 単一列（いずれも入力文の内容によらず固定のため実行しない）。
