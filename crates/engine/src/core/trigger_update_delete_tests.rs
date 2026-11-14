@@ -838,7 +838,8 @@ fn partitioned_trigger_failure_aborts_only_that_chunk_and_resend_resumes() {
     assert!(read_rows(&core, &a, "trg").iter().all(|r| r.2 == 7));
 }
 
-// 発火に未対応の経路（RETURNING・UPSERT・生の行 API）は 0A000。台帳は消費されない。
+// 発火に未対応の経路（UPSERT・生の行 API）は 0A000。台帳は消費されない。RETURNING 付きの UPDATE／DELETE は
+// 発火する（Issue #3192。`trigger_returning_tests.rs`）。
 #[test]
 fn unwired_paths_are_guarded() {
     let dir = tempdir();
@@ -851,16 +852,9 @@ fn unwired_paths_are_guarded() {
         &dml_trigger("t", TriggerTiming::Before, UPD | DEL, &[]),
     );
 
-    for sql in [
-        "UPDATE trg SET n = 1 WHERE id = 1 RETURNING id USING OPERATION_ID 'g1'",
-        "UPDATE trg SET n = 1 WHERE n > 0 RETURNING id USING OPERATION_ID 'g2'",
-        "DELETE FROM trg WHERE id = 1 RETURNING id USING OPERATION_ID 'g3'",
-        "DELETE FROM trg WHERE n > 0 RETURNING id USING OPERATION_ID 'g4'",
-        "INSERT INTO trg (id, embedding, a, n) VALUES (1, '[1.0,0.0]', 'x', 1) \
-         ON CONFLICT (id) DO UPDATE SET n = 2 USING OPERATION_ID 'g5'",
-    ] {
-        assert_eq!(code(&core, &a, sql), "0A000", "{sql}");
-    }
+    let upsert = "INSERT INTO trg (id, embedding, a, n) VALUES (1, '[1.0,0.0]', 'x', 1) \
+                  ON CONFLICT (id) DO UPDATE SET n = 2 USING OPERATION_ID 'g5'";
+    assert_eq!(code(&core, &a, upsert), "0A000", "{upsert}");
     let op = crate::recovery::required_op_id::OperationId::parse("op-raw").expect("op");
     let err = crate::tenant::delete_row(&core.storage, "trg", &a, 1, &op).unwrap_err();
     assert_eq!(
@@ -873,7 +867,7 @@ fn unwired_paths_are_guarded() {
     run(
         &core,
         &a,
-        "UPDATE trg SET n = 1 WHERE id = 1 USING OPERATION_ID 'g1'",
+        "UPDATE trg SET n = 1 WHERE id = 1 USING OPERATION_ID 'g5'",
     )
     .expect("ledger not consumed");
 }

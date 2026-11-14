@@ -5244,6 +5244,30 @@ pub(crate) fn execute_insert_with_schema_in(
     expected_schema: Option<&crate::catalog::TableSchema>,
     triggers: Option<&crate::trigger::TriggerRuntime>,
 ) -> Result<InsertOutcome, SqlSurfaceError> {
+    execute_insert_with_schema_in_projecting(
+        target,
+        ctx,
+        bound,
+        ledger_mode,
+        expected_schema,
+        triggers,
+        None,
+    )
+    .map(|(outcome, _)| outcome)
+}
+
+/// [`execute_insert_with_schema_in`] の `RETURNING` 投影つき本体（Issue #3192）。`project` は INSERT トリガ
+/// 経路が書いた行の最終 NEW を commit 前に受け取る。戻りの `bool` は、その経路を通ったか
+/// （[`crate::tenant::InsertWriteReport::trigger_path`]）。偽なら `project` は呼ばれていない。
+pub(crate) fn execute_insert_with_schema_in_projecting(
+    target: crate::tenant::WriteTarget<'_>,
+    ctx: &PolicyContext,
+    bound: &crate::sql::parser::BoundInsert,
+    ledger_mode: crate::recovery::required_op_id::LedgerMode,
+    expected_schema: Option<&crate::catalog::TableSchema>,
+    triggers: Option<&crate::trigger::TriggerRuntime>,
+    project: Option<&mut crate::tenant::ReturningProjectFn<'_>>,
+) -> Result<(InsertOutcome, bool), SqlSurfaceError> {
     use crate::storage::Visibility;
 
     let ledger_write = ledger_mode
@@ -5262,13 +5286,17 @@ pub(crate) fn execute_insert_with_schema_in(
         &bound.volatile_default_columns,
         bound.id_omitted,
         triggers,
+        project,
     )
     .map_err(map_insert_write_error)?;
 
-    Ok(InsertOutcome {
-        rows_affected: report.rows_written,
-        incremental: None,
-    })
+    Ok((
+        InsertOutcome {
+            rows_affected: report.rows_written,
+            incremental: None,
+        },
+        report.trigger_path,
+    ))
 }
 
 /// SQL 表層 `TRUNCATE [TABLE] [ONLY] <table> [*] [, ...] USING OPERATION_ID '<id>'`（複数テーブルは SQL-48 (4)、Issue #1643）
@@ -5519,6 +5547,7 @@ pub fn execute_delete_returning(
         ledger_mode,
         returning,
         schema,
+        None,
     )
 }
 
@@ -5534,6 +5563,8 @@ pub(crate) fn execute_delete_returning_in(
     ledger_mode: crate::recovery::required_op_id::LedgerMode,
     returning: &[crate::sql::parser::ProjectedColumn],
     schema: &TableSchema,
+    // トリガの通過証（Issue #3192）。`RETURNING` 付きでも該当トリガを発火する。公開の非セッション入口は `None`。
+    triggers: Option<&crate::trigger::TriggerRuntime>,
 ) -> Result<ReturningOutcome, SqlSurfaceError> {
     let ledger_write = ledger_mode
         .resolve(bound.operation_id.as_ref())
@@ -5561,6 +5592,7 @@ pub(crate) fn execute_delete_returning_in(
         ledger_write,
         Some(schema),
         Some(&mut project),
+        triggers,
     )
     // [`execute_delete`]（RETURNING なし）と同じ `"delete"` 語彙で写像する
     // （Cursor Bugbot Low 指摘・PR #991）。本関数は DELETE の実行であり、
@@ -5690,6 +5722,7 @@ pub fn execute_update_returning(
         ledger_mode,
         returning,
         schema,
+        None,
     )
 }
 
@@ -5702,6 +5735,8 @@ pub(crate) fn execute_update_returning_in(
     ledger_mode: crate::recovery::required_op_id::LedgerMode,
     returning: &[crate::sql::parser::ProjectedColumn],
     schema: &TableSchema,
+    // トリガの通過証（Issue #3192）。`RETURNING` 付きでも該当トリガを発火する。公開の非セッション入口は `None`。
+    triggers: Option<&crate::trigger::TriggerRuntime>,
 ) -> Result<ReturningOutcome, SqlSurfaceError> {
     let ledger_write = ledger_mode
         .resolve(bound.operation_id.as_ref())
@@ -5728,6 +5763,7 @@ pub(crate) fn execute_update_returning_in(
         ledger_write,
         Some(schema),
         Some(&mut project),
+        triggers,
     )
     .map_err(|e| map_write_error(e, "update"))?;
 
@@ -6016,6 +6052,8 @@ pub(crate) fn execute_predicate_delete_returning(
     max_affected_rows: Option<std::num::NonZeroUsize>,
     max_scanned_rows: usize,
     returning: &[crate::sql::parser::ProjectedColumn],
+    // トリガの通過証（Issue #3192）。`RETURNING` 付きでも該当トリガを発火する。公開の非セッション入口は `None`。
+    triggers: Option<&crate::trigger::TriggerRuntime>,
 ) -> Result<ReturningOutcome, SqlSurfaceError> {
     let columns = crate::sql::returning::column_meta(returning, schema)?;
     let mut rows: Vec<ResultRow> = Vec::new();
@@ -6037,7 +6075,7 @@ pub(crate) fn execute_predicate_delete_returning(
         max_affected_rows,
         max_scanned_rows,
         Some(&mut project),
-        None,
+        triggers,
     )?;
     drop(project);
     Ok(ReturningOutcome {
@@ -6143,7 +6181,7 @@ fn execute_predicate_delete_inner(
     max_affected_rows: Option<std::num::NonZeroUsize>,
     max_scanned_rows: usize,
     project: Option<&mut crate::tenant::ReturningProjectFn<'_>>,
-    // DELETE トリガの通過証（Issue #1725）。`RETURNING` 付き（`project: Some`）は渡さない（`0A000`）。
+    // DELETE トリガの通過証（Issue #1725）。`RETURNING` 付き（`project: Some`）でも発火する（Issue #3192）。
     triggers: Option<&crate::trigger::TriggerRuntime>,
 ) -> Result<u64, SqlSurfaceError> {
     let ledger_write = ledger_mode
@@ -6193,6 +6231,7 @@ fn execute_predicate_delete_inner(
                 predicate,
                 project,
                 reads_existing,
+                triggers,
             ),
         },
     );
@@ -6282,6 +6321,8 @@ pub(crate) fn execute_predicate_update_returning(
     max_affected_rows: Option<std::num::NonZeroUsize>,
     max_scanned_rows: usize,
     returning: &[crate::sql::parser::ProjectedColumn],
+    // トリガの通過証（Issue #3192）。`RETURNING` 付きでも該当トリガを発火する。公開の非セッション入口は `None`。
+    triggers: Option<&crate::trigger::TriggerRuntime>,
 ) -> Result<ReturningOutcome, SqlSurfaceError> {
     let columns = crate::sql::returning::column_meta(returning, schema)?;
     let mut rows: Vec<ResultRow> = Vec::new();
@@ -6304,7 +6345,7 @@ pub(crate) fn execute_predicate_update_returning(
         max_affected_rows,
         max_scanned_rows,
         Some(&mut project),
-        None,
+        triggers,
     )?;
     drop(project);
     Ok(ReturningOutcome {
@@ -6328,7 +6369,7 @@ fn execute_predicate_update_inner(
     max_affected_rows: Option<std::num::NonZeroUsize>,
     max_scanned_rows: usize,
     project: Option<&mut crate::tenant::ReturningProjectFn<'_>>,
-    // UPDATE トリガの通過証（Issue #1725）。`RETURNING` 付き（`project: Some`）は渡さない（`0A000`）。
+    // UPDATE トリガの通過証（Issue #1725）。`RETURNING` 付き（`project: Some`）でも発火する（Issue #3192）。
     triggers: Option<&crate::trigger::TriggerRuntime>,
 ) -> Result<u64, SqlSurfaceError> {
     let ledger_write = ledger_mode
@@ -6386,6 +6427,7 @@ fn execute_predicate_update_inner(
                 predicate,
                 project,
                 reads_existing,
+                triggers,
             ),
         },
     );
@@ -6607,19 +6649,43 @@ pub(crate) fn execute_insert_batch_with_schema_in(
     expected_schema: Option<&crate::catalog::TableSchema>,
     triggers: Option<&crate::trigger::TriggerRuntime>,
 ) -> Result<InsertOutcome, SqlSurfaceError> {
+    execute_insert_batch_with_schema_in_projecting(
+        target,
+        ctx,
+        bounds,
+        ledger_mode,
+        expected_schema,
+        triggers,
+        None,
+    )
+    .map(|(outcome, _)| outcome)
+}
+
+/// [`execute_insert_batch_with_schema_in`] の `RETURNING` 投影つき本体（Issue #3192）。`project` と戻りの
+/// `bool` の契約は [`execute_insert_with_schema_in_projecting`] と同じ。
+pub(crate) fn execute_insert_batch_with_schema_in_projecting(
+    target: crate::tenant::WriteTarget<'_>,
+    ctx: &PolicyContext,
+    bounds: &[crate::sql::parser::BoundInsert],
+    ledger_mode: crate::recovery::required_op_id::LedgerMode,
+    expected_schema: Option<&crate::catalog::TableSchema>,
+    triggers: Option<&crate::trigger::TriggerRuntime>,
+    project: Option<&mut crate::tenant::ReturningProjectFn<'_>>,
+) -> Result<(InsertOutcome, bool), SqlSurfaceError> {
     let Some(first) = bounds.first() else {
         return Err(SqlSurfaceError::invalid_input(
             "INSERT batch must contain at least one row",
         ));
     };
     if bounds.len() == 1 {
-        return execute_insert_with_schema_in(
+        return execute_insert_with_schema_in_projecting(
             target,
             ctx,
             first,
             ledger_mode,
             expected_schema,
             triggers,
+            project,
         );
     }
 
@@ -6660,13 +6726,17 @@ pub(crate) fn execute_insert_batch_with_schema_in(
         expected_schema,
         &volatile,
         triggers,
+        project,
     )
     .map_err(map_insert_write_error)?;
 
-    Ok(InsertOutcome {
-        rows_affected: report.rows_written,
-        incremental: None,
-    })
+    Ok((
+        InsertOutcome {
+            rows_affected: report.rows_written,
+            incremental: None,
+        },
+        report.trigger_path,
+    ))
 }
 
 /// `INSERT ... SELECT` の内側 SELECT 評価**前**の台帳事前照合（SQL-51 (5)・Issue #1733）。
@@ -6775,9 +6845,11 @@ fn volatile_default_columns_of(
 /// 呼び出し元（`core.rs`）が束縛段で `42601` 拒否するため本関数へは到達しない
 /// 契約（サーバー側チャンク化行を返す応答形が未定義のため fail-closed）。
 /// 既存の書き込み経路（[`execute_insert_batch_with_schema`]）をそのまま通した
-/// うえで、書き込んだ値そのもの（`bounds[*].values`。既定値・トリガの類は
-/// 存在しないため常に書き込んだ値と一致する）を `RowDescription` へ再読み込み
-/// なしで投影する。
+/// うえで、書き込んだ値そのもの（`bounds[*].values`。INSERT トリガの無い表では
+/// 既定値・トリガの類が無いため常に書き込んだ値と一致する）を `RowDescription` へ再読み込み
+/// なしで投影する。INSERT トリガのある表（Issue #3192）では、トリガ適用後の最終行
+/// （BEFORE が書き換えた NEW）が書き込み後にしか確定しないため、書いた各行を txn 内・commit 前に
+/// 投影コールバックで集めて採用する（`InsertWriteReport::trigger_path`）。
 ///
 /// **RLS 可視性の検査（fail-closed）**: 挿入行の tenant は常に `ctx.tenant_id()`・
 /// visibility は常に `Private` 固定。`ctx` から不可視（`Public` のみの
@@ -6798,6 +6870,7 @@ pub fn execute_insert_returning(
         ledger_mode,
         returning,
         schema,
+        None,
     )
 }
 
@@ -6845,6 +6918,29 @@ fn sequence_patched_values(
     Ok(values)
 }
 
+/// 束縛済み INSERT 群の対象表名（空は空文字。呼び出し元が空でないことを先に保証する）。
+fn schema_table_key(bounds: &[crate::sql::parser::BoundInsert]) -> &str {
+    bounds.first().map(|b| b.table.as_str()).unwrap_or("")
+}
+
+/// `tenant` の表 `table` に INSERT イベントのトリガがあるか（事前投影の要否判定用。読み取りのみ）。
+fn table_has_insert_triggers<R: crate::storage::read_source::ReadSource>(
+    src: &R,
+    tenant: &str,
+    table: &str,
+) -> Result<bool, SqlSurfaceError> {
+    let defs =
+        crate::catalog::trigger::list_triggers_in_source(src, tenant, table).map_err(|e| {
+            SqlSurfaceError::Internal {
+                detail: format!("trigger lookup failed: {e}"),
+            }
+        })?;
+    Ok(defs.iter().any(|t| {
+        t.events
+            .contains(crate::catalog::trigger::TriggerEvents::INSERT)
+    }))
+}
+
 /// `INSERT` の挿入行に固定で付く可視性（書き込み側と RETURNING の可視性検査で共有する）。
 const INSERT_ROW_VISIBILITY: crate::storage::Visibility = crate::storage::Visibility::Private;
 
@@ -6860,6 +6956,9 @@ pub(crate) fn execute_insert_returning_in(
     ledger_mode: crate::recovery::required_op_id::LedgerMode,
     returning: &[crate::sql::parser::ProjectedColumn],
     schema: &TableSchema,
+    // INSERT トリガの通過証（Issue #3192）。`RETURNING` 付きでも該当トリガを発火する。公開の非セッション入口は
+    // `None`（該当トリガがあれば `0A000`）。
+    triggers: Option<&crate::trigger::TriggerRuntime>,
 ) -> Result<ReturningOutcome, SqlSurfaceError> {
     // codex-review Low 指摘（PR #873）対応: `column_meta`・`project_row` は
     // いずれも `bounds`（呼び出し元が既に束縛済みの書き込み予定値）・
@@ -6893,7 +6992,29 @@ pub(crate) fn execute_insert_returning_in(
         .any(|b| b.id_omitted || b.volatile_default_columns.iter().any(is_sequence_mark));
     let mut rows = Vec::new();
     let mut budget = 0usize;
+    // INSERT トリガがある表では、BEFORE が値を短縮したり行をスキップしたりして最終行が入力値より小さく
+    // なり得るため、入力値の事前投影による予算拒否（`54000`）を行わない。実際に返す行の予算は txn 内の
+    // 収集（下の `returning_collector`）が検査する（Issue #3192）。トリガの無い表は従来どおり。
+    let skip_pre_projection = match (&target, triggers) {
+        (_, None) => false,
+        (crate::tenant::WriteTarget::InTxn(txn), Some(_)) => {
+            table_has_insert_triggers(*txn, ctx.tenant_id(), schema_table_key(bounds))?
+        }
+        (crate::tenant::WriteTarget::Autocommit(storage), Some(_)) => {
+            use redb::ReadableDatabase as _;
+            let read = storage
+                .db()
+                .begin_read()
+                .map_err(|e| SqlSurfaceError::Internal {
+                    detail: format!("trigger lookup failed: {e}"),
+                })?;
+            table_has_insert_triggers(&read, ctx.tenant_id(), schema_table_key(bounds))?
+        }
+    };
     for bound in bounds {
+        if skip_pre_projection {
+            break;
+        }
         if has_sequence {
             let probe = sequence_patched_values(bound, schema, |_| Some(0))?;
             rows.push(mask_returning_row_id(
@@ -6932,25 +7053,72 @@ pub(crate) fn execute_insert_returning_in(
         }
         _ => None,
     };
-    let insert_outcome =
-        execute_insert_batch_with_schema_in(target, ctx, bounds, ledger_mode, Some(schema), None)?;
+    // トリガ経路では最終行（BEFORE が書き換えた後の NEW）が書き込み後にしか確定しないため、書いた各行を
+    // txn 内・commit 前に集める（投影の失敗は txn の abort。台帳・行・トリガの書き込みは残らない）。
+    // 事前投影（上）は fail-fast の予算検査として残し、トリガ経路ではこちらの結果を採用する。
+    let mut trigger_rows: Vec<ResultRow> = Vec::new();
+    let mut trigger_budget = 0usize;
+    let mut trigger_project = returning_collector(
+        ctx,
+        returning,
+        schema.is_allocated(),
+        &mut trigger_budget,
+        &mut trigger_rows,
+    );
+    let (insert_outcome, trigger_path) = execute_insert_batch_with_schema_in_projecting(
+        target,
+        ctx,
+        bounds,
+        ledger_mode,
+        Some(schema),
+        triggers,
+        // トリガ判定の確定は書き込み txn 内。事前判定とずれてトリガ無し経路になった場合も、tenant 側が
+        // commit 前にこの収集で予算を検査する（Issue #3192）。トリガ機構が無い構成（`None`）では渡さない。
+        triggers.map(|_| &mut trigger_project as &mut crate::tenant::ReturningProjectFn<'_>),
+    )?;
+    drop(trigger_project);
 
-    if has_sequence {
+    if trigger_path {
+        // 払い出し値は `final_row` に入っているため再投影は不要。ただし採番の受け渡し値は持ち越さない。
+        if has_sequence {
+            let _ = crate::sql::sequence_scope::take_assigned();
+        }
+        return Ok(ReturningOutcome {
+            command: crate::sql::returning::DmlCommand::Insert,
+            rows_affected: insert_outcome.rows_affected,
+            result: QueryResult {
+                columns,
+                rows: trigger_rows,
+            },
+        });
+    }
+
+    // 事前判定（別 snapshot）ではトリガありとして事前投影を省いたが、書き込み txn の計画ではトリガ無し
+    // （判定後に最後の INSERT トリガが DROP された）場合は `trigger_rows` を使わない。トリガが
+    // 走っていないので書き込んだ値は束縛値そのものであり、ここで束縛値から投影し直して行の欠落を防ぐ。
+    // 予算検査は tenant 側が commit 前に同じ収集で済ませているため、ここでの投影は失敗しない。
+    if has_sequence || skip_pre_projection {
         // 行・列をキーにした索引を一度だけ構築し、RETURNING の検索を線形時間に保つ
         // （重複記録は先頭を優先。従来の線形 `find` と同じ意味論）。
         let mut assigned: std::collections::HashMap<(usize, usize), i64> =
             std::collections::HashMap::new();
-        for (r, c, v) in crate::sql::sequence_scope::take_assigned() {
-            assigned.entry((r, c)).or_insert(v);
+        if has_sequence {
+            for (r, c, v) in crate::sql::sequence_scope::take_assigned() {
+                assigned.entry((r, c)).or_insert(v);
+            }
         }
         rows.clear();
         let mut budget = 0usize;
         for (row_idx, bound) in bounds.iter().enumerate() {
             // 払い出し値が記録されていない列は黙って 0 にせず内部不整合として拒否する
             // （fail-closed。書き込みは commit 済みだが、誤った値を返すより失敗を返す）。
-            let values = sequence_patched_values(bound, schema, |col| {
-                assigned.get(&(row_idx, col)).copied()
-            })?;
+            let values = if has_sequence {
+                sequence_patched_values(bound, schema, |col| {
+                    assigned.get(&(row_idx, col)).copied()
+                })?
+            } else {
+                bound.values.clone()
+            };
             let row_id = if bound.id_omitted {
                 let assigned_id = assigned
                     .get(&(row_idx, crate::sql::sequence_scope::PSEUDO_ID_COLUMN))
