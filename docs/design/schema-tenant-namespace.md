@@ -543,5 +543,18 @@ DML・DDL・`COPY` の未修飾名と、作成系 DDL の作成先も `search_pa
 - **安全弁**: 解析時の書き換えを通らない経路（`CREATE TYPE`・`CREATE MATERIALIZED VIEW`・構文語と衝突する名前・解析と実行の間の SCHEMA 作成の競合）は、path 先頭が自テナントの SCHEMA のとき固定文言の `0A000` にし、`public` へ黙って作らない
 - **自己参照 FK**: `REFERENCES <作成名>` は作成先に合わせる（作成先が SCHEMA なら同じ内部キー、`public` なら裸のまま）。現状は修飾形を含めて行 ID モード未対応の `0A000` で、書き換え自体は単体テストで固定している
 - **明示トランザクション**: DDL は従来どおり `0A000`。DML の存在照会は確定済みのスナップショットを見る（`COPY` は `BEGIN` 時点）
-- **残る `0A000`**: 拡張クエリの Parse・Bind・Describe（再解決は #3197）、`ALTER TABLE .. SET SCHEMA` の未修飾の対象が SCHEMA に解決される形（#3198）、`ENUM` 型・`MATERIALIZED VIEW` の SCHEMA 配置と組み込み SCHEMA への作成（本 ADR の対象外。専用の Issue が必要）
+- **残る `0A000`**: `ALTER TABLE .. SET SCHEMA` の未修飾の対象が SCHEMA に解決される形（#3198）、`ENUM` 型・`MATERIALIZED VIEW` の SCHEMA 配置と組み込み SCHEMA への作成（本 ADR の対象外。専用の Issue が必要）
 - **意図的な差**: 重複作成の `42P07` の文言は、PostgreSQL の裸の名前ではなく `q1.t` 形（修飾形と同じ）で出す。内部 ID は出ない
+
+## 追記（Issue #3197）
+
+拡張クエリ（Parse・Bind・Describe）も未修飾名を `search_path` で解決し、`SET search_path` の後の Bind・Describe に反映する（親 #3194。#3195・#3196 が固定文言の `0A000` で拒否していた形の再解決）。
+
+- **Parse**: セッション対応の Parse は、`schema.name` 修飾の解決の直後（`$n` の位置検査・型推論・構造検証より前）に、簡易クエリと同じ `resolve_statement_refs` で未修飾名を内部キーへ置き換える。判定順は 構文 `42601` → 解決エラー → 参照ゲート `42P01`（書き換え後のトークンに対して）→ 解析エラー → `SET SCHEMA` の `0A000` → 権限 `42501`。`public.` で明示修飾した作成名は作成先を path で決めない
+- **刻印**: 準備済み文に、元の SQL・Parse 時の path 世代・path 適用前のトークン列・適用した書き換え（解決の指紋）を持たせる。保持量は SQL とトークン列 1 組分で、wire 層の文あたり・セッションあたりの上限が抑える
+- **Bind・Describe**: 先頭で再解決する（`refresh_prepared_in_txn`。engine の Bind・Describe 系 API も内部で同じ処理を通す）。path 適用前のトークン列を現在の path・カタログ（明示 Tx は `BEGIN` 時点）で解決し直し、指紋と同じなら使い回す。違えば元の SQL を再 Parse する。世代が同じでもカタログが変わると解決先が変わりうるため、path 解決が有効なセッションは毎回この照会を行う（`$user` の SCHEMA 1 件の get と、SCHEMA が在れば名前ごとの存在照会）
+- **再 Parse の互換検査**: `$n` の型・結果列が変わる場合、または一時表の経路へ変わる場合は固定文言の `0A000`（PostgreSQL の cached plan must not change result type と同じ。公告済みの `ParameterDescription`・`RowDescription` と食い違う文を実行しない。名前・SCHEMA を含めない）
+- **portal**: Bind 時の解決のまま実行する（`public` が見える path では PostgreSQL と同じ。`public` が隠れる path は従来どおり世代の食い違いで `0A000`）。portal が保持する準備済み文も再解決後の文にし、Execute の権限・同一性の再検査が実行される本文と同じ解決を見る。`COPY` は Execute で元の SQL を現在の path へ再解決するため、path 解決が有効なセッションでは Bind で世代を刻み、食い違えば `0A000`
+- **互換の安全弁**: セッションを持たない Parse（Rust API の `parse_sql_prepared_with_declared`）の文は path を知らないため、解決が有効なセッションの Bind・Describe では従来どおり `0A000`
+- **テナント境界**: 再解決の照会は既存の `with_search_path_lookup`（自テナントの USAGE の有る SCHEMA だけ）のみ。他テナントの SCHEMA を引く経路は無く、エラー文言は利用者が書いた名前だけで内部キーを含まない
+- **残る未対応**: 再 Parse した文を文のストアへ書き戻す最適化はしない（path・カタログが変わった後の Bind ごとに再 Parse する）

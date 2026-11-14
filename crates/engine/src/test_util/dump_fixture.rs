@@ -76,8 +76,8 @@ pub const SETUP: &[&str] = &[
      AS $q$ SELECT n, 'it''s' $q$",
     // トリガの対象表。トリガ関数の実行は未対応で、この表への書き込みは失敗するため、他の表の
     // 制約・既定値の確認（往復後の挿入）と分けておく。
-    "CREATE TABLE audited (aid BIGINT PRIMARY KEY, note TEXT)",
-    "INSERT INTO audited (aid, note) VALUES (1, 'seed')",
+    "CREATE TABLE app.audited (aid BIGINT PRIMARY KEY, note TEXT)",
+    "INSERT INTO app.audited (aid, note) VALUES (1, 'seed')",
     "CREATE FUNCTION trg() RETURNS trigger LANGUAGE plpgsql AS $q$ BEGIN RETURN NEW; END $q$",
     // ロール（SCRAM 検証子つき）。
     "CREATE ROLE reporter LOGIN PASSWORD 'pw' CONNECTION LIMIT 3",
@@ -120,7 +120,7 @@ pub const SETUP: &[&str] = &[
      '1970-01-01 00:00:00', '00:00:00', '1970-01-01 00:00:00+00', '0', '00000', '\\x', \
      '[]', '{}', '00000000-0000-0000-0000-000000000000', 0, 'sad', '{}', '{}', '[0,0,0]')",
     // 後段のオブジェクト（行の投入後に作る）。
-    "CREATE TRIGGER audited_trg BEFORE INSERT OR UPDATE OF note ON audited \
+    "CREATE TRIGGER audited_trg BEFORE INSERT OR UPDATE OF note ON app.audited \
      FOR EACH ROW EXECUTE FUNCTION trg('a', 'it''s')",
     "CREATE POLICY pol_sel ON parent FOR SELECT USING (id > 0)",
     "CREATE POLICY pol_res ON parent AS RESTRICTIVE FOR SELECT USING (id < 1000)",

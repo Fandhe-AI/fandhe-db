@@ -73,8 +73,15 @@ fn select_col(s: &mut TcpStream, sql: &str) -> Vec<String> {
     out
 }
 
+fn create_tt(s: &mut TcpStream) {
+    exec(s, "CREATE SCHEMA s");
+    exec(s, "CREATE TABLE s.tt (n INTEGER)");
+}
+
+/// 対象表はテナントの SCHEMA `s` の `s.tt`（共有 public 表へのトリガは定義時に拒否される。Issue #3361）。
+/// 監査表 `audit` は public のまま（本体の INSERT は SCHEMA 修飾の書き込み先を受けない）。
 fn setup(s: &mut TcpStream) {
-    exec(s, "CREATE TABLE tt (n INTEGER)");
+    create_tt(s);
     exec(s, "CREATE TABLE audit (lv TEXT)");
     exec(
         s,
@@ -98,20 +105,26 @@ fn wire_simple_query_fires_before_row_and_after_statement() {
     assert_eq!(
         exec(
             &mut s,
-            "CREATE TRIGGER tb BEFORE INSERT ON tt FOR EACH ROW EXECUTE FUNCTION bump()"
+            "CREATE TRIGGER tb BEFORE INSERT ON s.tt FOR EACH ROW EXECUTE FUNCTION bump()"
         ),
         "CREATE TRIGGER"
     );
     assert_eq!(
         exec(
             &mut s,
-            "CREATE TRIGGER ts AFTER INSERT ON tt FOR EACH STATEMENT EXECUTE FUNCTION stmt_audit()"
+            "CREATE TRIGGER ts AFTER INSERT ON s.tt FOR EACH STATEMENT EXECUTE FUNCTION stmt_audit()"
         ),
         "CREATE TRIGGER"
     );
-    assert_eq!(exec(&mut s, "INSERT INTO tt (n) VALUES (1);"), "INSERT 0 1");
-    assert_eq!(exec(&mut s, "INSERT INTO tt (n) VALUES (2)"), "INSERT 0 1");
-    let mut v = select_col(&mut s, "SELECT n FROM tt");
+    assert_eq!(
+        exec(&mut s, "INSERT INTO s.tt (n) VALUES (1);"),
+        "INSERT 0 1"
+    );
+    assert_eq!(
+        exec(&mut s, "INSERT INTO s.tt (n) VALUES (2)"),
+        "INSERT 0 1"
+    );
+    let mut v = select_col(&mut s, "SELECT n FROM s.tt");
     v.sort();
     assert_eq!(v, vec!["101", "102"]);
     assert_eq!(
@@ -128,12 +141,12 @@ fn wire_extended_query_fires_trigger() {
     setup(&mut s);
     exec(
         &mut s,
-        "CREATE TRIGGER tb BEFORE INSERT ON tt FOR EACH ROW EXECUTE FUNCTION bump()",
+        "CREATE TRIGGER tb BEFORE INSERT ON s.tt FOR EACH ROW EXECUTE FUNCTION bump()",
     );
     send_length_prefixed_message(
         &mut s,
         b'P',
-        &parse_body("s1", "INSERT INTO tt (n) VALUES (5)", 0),
+        &parse_body("s1", "INSERT INTO s.tt (n) VALUES (5)", 0),
     );
     assert_eq!(read_message(&mut s).0, b'1');
     send_length_prefixed_message(&mut s, b'B', &bind_body("p1", "s1"));
@@ -142,14 +155,38 @@ fn wire_extended_query_fires_trigger() {
     assert_eq!(read_message(&mut s).0, b'C');
     send_length_prefixed_message(&mut s, b'S', &[]);
     assert_eq!(read_message(&mut s).0, b'Z');
-    assert_eq!(select_col(&mut s, "SELECT n FROM tt"), vec!["105"]);
+    assert_eq!(select_col(&mut s, "SELECT n FROM s.tt"), vec!["105"]);
 }
 
-/// 未対応の本体（本体の DELETE）は `0A000` の ErrorResponse と ReadyForQuery で返り、同じ接続で次の文が
-/// 実行でき、本表・監査に残渣が無い。
-///
-/// tracked: #3187
-/// 本体の `DELETE` は窓口を広げる #3187 までの暫定の拒否（UPDATE は dispatch 済み）。
+/// 本体の `DELETE` と表を読む `SELECT`（Issue #3187）が、psql と同じ末尾 `;` 付きの単独送信でも通る。
+/// `DELETE` は同じ Tx で先に書いた監査行を消し、`SELECT ... INTO` は自 Tx の未 commit の行を読む。
+#[test]
+fn wire_trigger_body_delete_and_select_run() {
+    let (addr, _g) = serve();
+    let mut s = connect(addr, "alice", "pw-alice");
+    setup(&mut s);
+    exec(
+        &mut s,
+        "CREATE FUNCTION dsel() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         DECLARE c INTEGER; \
+         BEGIN INSERT INTO audit (lv) VALUES ('x'); INSERT INTO audit (lv) VALUES ('y'); \
+         DELETE FROM audit WHERE lv = 'x'; \
+         SELECT count(*) INTO c FROM audit; NEW.n := c; RETURN NEW; END $$",
+    );
+    exec(
+        &mut s,
+        "CREATE TRIGGER tb BEFORE INSERT ON s.tt FOR EACH ROW EXECUTE FUNCTION dsel()",
+    );
+    assert_eq!(
+        exec(&mut s, "INSERT INTO s.tt (n) VALUES (9);"),
+        "INSERT 0 1"
+    );
+    assert_eq!(select_col(&mut s, "SELECT n FROM s.tt"), vec!["1"]);
+    assert_eq!(select_col(&mut s, "SELECT lv FROM audit"), vec!["y"]);
+}
+
+/// 窓口の許可リストに無い本体（`INSERT ... SELECT`）は `0A000` の ErrorResponse と ReadyForQuery で返り、
+/// 同じ接続で次の文が実行でき、本表・監査に残渣が無い。
 #[test]
 fn wire_unsupported_body_is_0a000_and_connection_survives() {
     let (addr, _g) = serve();
@@ -158,16 +195,16 @@ fn wire_unsupported_body_is_0a000_and_connection_survives() {
     exec(
         &mut s,
         "CREATE FUNCTION upd() RETURNS trigger LANGUAGE plpgsql AS $$ \
-         BEGIN INSERT INTO audit (lv) VALUES ('x'); DELETE FROM audit WHERE lv = 'x'; RETURN NEW; END $$",
+         BEGIN INSERT INTO audit (lv) VALUES ('x'); INSERT INTO audit (lv) SELECT 'z'; RETURN NEW; END $$",
     );
     exec(
         &mut s,
-        "CREATE TRIGGER tb BEFORE INSERT ON tt FOR EACH ROW EXECUTE FUNCTION upd()",
+        "CREATE TRIGGER tb BEFORE INSERT ON s.tt FOR EACH ROW EXECUTE FUNCTION upd()",
     );
-    send_simple_query(&mut s, "INSERT INTO tt (n) VALUES (1);");
+    send_simple_query(&mut s, "INSERT INTO s.tt (n) VALUES (1);");
     expect_error_response_with_sqlstate(&mut s, "0A000");
     read_ready_for_query(&mut s);
-    assert!(select_col(&mut s, "SELECT n FROM tt").is_empty());
+    assert!(select_col(&mut s, "SELECT n FROM s.tt").is_empty());
     assert!(select_col(&mut s, "SELECT lv FROM audit").is_empty());
 }
 
@@ -179,15 +216,19 @@ fn wire_trigger_does_not_fire_for_other_tenant() {
     setup(&mut a);
     exec(
         &mut a,
-        "CREATE TRIGGER tb BEFORE INSERT ON tt FOR EACH ROW EXECUTE FUNCTION bump()",
+        "CREATE TRIGGER tb BEFORE INSERT ON s.tt FOR EACH ROW EXECUTE FUNCTION bump()",
     );
     exec(
         &mut a,
-        "CREATE TRIGGER ts AFTER INSERT ON tt FOR EACH STATEMENT EXECUTE FUNCTION stmt_audit()",
+        "CREATE TRIGGER ts AFTER INSERT ON s.tt FOR EACH STATEMENT EXECUTE FUNCTION stmt_audit()",
     );
     let mut b = connect(addr, "bob", "pw-bob");
-    assert_eq!(exec(&mut b, "INSERT INTO tt (n) VALUES (1);"), "INSERT 0 1");
-    assert_eq!(select_col(&mut b, "SELECT n FROM tt"), vec!["1"]);
+    create_tt(&mut b);
+    assert_eq!(
+        exec(&mut b, "INSERT INTO s.tt (n) VALUES (1);"),
+        "INSERT 0 1"
+    );
+    assert_eq!(select_col(&mut b, "SELECT n FROM s.tt"), vec!["1"]);
     assert!(select_col(&mut b, "SELECT lv FROM audit").is_empty());
     assert!(select_col(&mut a, "SELECT lv FROM audit").is_empty());
 }

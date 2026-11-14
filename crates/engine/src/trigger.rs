@@ -14,6 +14,7 @@
 //! - [`fire`]: BEFORE ROW トリガの連鎖実行（NEW の受け渡し・NULL 返却による行のスキップ）と、
 //!   文の終わりの AFTER ROW トリガの実行（戻り値は無視。Issue #1724）、文トリガ（STATEMENT。TRUNCATE を
 //!   含む）の文につき 1 回の実行（対象 0 行でも発火。Issue #1726）
+//! - [`row_loop`]: 外側の行ループが進行中の表の記録（本体の同表 `DELETE` を `0A000` で拒否する暫定ガード。Issue #3187）
 //! - [`write_handle`]: トリガ本体が同じ write txn・呼び出しテナントの文脈で他表へ書く狭い窓口
 //!
 //! 呼び出し元は `tenant`（書き込み経路。`tenant/trigger_insert.rs`）と `core`（通過証の保持）。
@@ -24,6 +25,7 @@ pub(crate) mod call;
 pub(crate) mod depth;
 pub(crate) mod fire;
 pub(crate) mod plan;
+pub(crate) mod row_loop;
 pub(crate) mod runtime;
 pub(crate) mod subject;
 pub(crate) mod write_handle;

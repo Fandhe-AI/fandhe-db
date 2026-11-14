@@ -100,6 +100,12 @@ pub struct SessionRoutedSql {
     /// 世代と一致していなければ陳腐化として拒否する（準備・Bind の後に `SET search_path` された文が、
     /// 古い解決結果のまま実行されない。PostgreSQL なら再計画する場面）。
     path_epoch: Option<u64>,
+    /// `public` が見える path でも `path_epoch` の一致を要求する印（Issue #3197）。`COPY` は Execute で元の SQL を
+    /// 現在の `search_path` へ再解決するため、Bind で検証した宛先とずれないよう世代の食い違いを拒否する。
+    path_strict: bool,
+    /// `COPY` の Bind 時に解決した宛先（`search_path` による書き換え。Issue #3197）。Execute が同じ規則で
+    /// 解決し直した結果と照合し、同じ世代のまま path 前方に後から作られた同名の関係へ宛先が化けるのを拒否する。
+    copy_pin: Option<Vec<(usize, crate::sql::lexer::Token)>>,
 }
 
 impl SessionRoutedSql {
@@ -115,6 +121,8 @@ impl SessionRoutedSql {
             route: Route::Temp,
             fresh: false,
             path_epoch: None,
+            path_strict: false,
+            copy_pin: None,
         }
     }
 
@@ -127,6 +135,8 @@ impl SessionRoutedSql {
             route: Route::Persistent,
             fresh: false,
             path_epoch: None,
+            path_strict: false,
+            copy_pin: None,
         }
     }
 
@@ -136,6 +146,20 @@ impl SessionRoutedSql {
         if session.search_path_hides_public() {
             self.path_epoch = Some(session.search_path_epoch());
         }
+        self
+    }
+
+    /// `COPY` 用に、`public` が見えても Bind 時点の世代を刻み、Execute で世代の一致を要求する（Issue #3197）。
+    /// Bind 時に path 解決が無効でも、Bind 後の `SET search_path` で宛先が変わりうるため無条件に刻む。
+    pub(crate) fn stamped_with_path_for_copy(mut self, session: &SessionState) -> Self {
+        self.path_epoch = Some(session.search_path_epoch());
+        self.path_strict = true;
+        self
+    }
+
+    /// `COPY` の Bind 時に解決した宛先を記録する（Issue #3197）。
+    pub(crate) fn with_copy_pin(mut self, pin: Vec<(usize, crate::sql::lexer::Token)>) -> Self {
+        self.copy_pin = Some(pin);
         self
     }
 
@@ -178,7 +202,7 @@ impl SessionRoutedSql {
         // 永続側の文は、`public` が見えない `search_path` のもとで解決した世代と一致するときだけ通す
         // （一時表の経路の文は一時表だけを参照し path に依らない）。
         if self.route == Route::Persistent
-            && session.search_path_hides_public()
+            && (session.search_path_hides_public() || self.path_strict)
             && !is_search_path_exempt(&self.inner)
             && self.path_epoch != Some(session.search_path_epoch())
         {
@@ -784,28 +808,17 @@ impl EngineCore {
         sql: &str,
         declared: &[Option<crate::sql::params::DeclaredParamType>],
     ) -> Result<super::PreparedSql, SqlSurfaceError> {
-        let result = self.parse_sql_prepared_in_session_inner(session, sql, declared);
-        // Issue #3195: 未修飾名が `search_path` で自テナントの SCHEMA に解決される形は、Parse の結果を path の
-        // 世代が変わった後の Bind・Describe で使い回さないよう固定文言の `0A000` にする（再解決は #3197）。
-        // 構文エラー `42601` は優先する。参照ゲートより先に判定する（SCHEMA 側に在る名前を `42P01` にしない）。
-        if !matches!(&result, Err(e) if e.wire_code() == "42601")
-            && (session.search_path_hides_public() || session.search_path_may_hold_tenant_schema())
-        {
-            if let Ok(tokens) = crate::sql::lexer::tokenize_with_params(sql) {
-                self.reject_path_resolved_refs(
-                    session.resolution_tenant(),
-                    session,
-                    &tokens,
-                    &[],
-                    None,
-                )?;
-            }
-        }
-        // TABLE-27・Issue #1715: `public` が見えない `search_path` のセッションは、一時表以外の未修飾の
-        // テーブル参照を `42P01` にする。判定順は構文エラー `42601` → 参照ゲート → 権限 → その他の検証エラー。
-        // 既定の path のセッションは何も足さない。権限検査より前に行うのは、権限の無いロールへ `42501` で
-        // 非可視の表の存在を漏らさないため。
+        let gate_reached = std::cell::Cell::new(false);
+        let result =
+            self.parse_sql_prepared_in_session_inner(session, sql, declared, None, &gate_reached);
+        // Issue #3197: 未修飾名の `search_path` 解決と、TABLE-27・Issue #1715 の参照ゲート（`public` が見えない
+        // path の `42P01`）は、通常の経路では Parse の中で解決済みのトークンに対して行う。ここで元の SQL を
+        // 字句解析して検査するのは、その判定に到達する前に失敗・振り分けられた場合（一時表の経路、字句・修飾名の
+        // 解決エラー等）に限る。
+        // 判定順は構文エラー `42601` → 参照ゲート → 権限 → その他の検証エラー。権限検査より前に行うのは、
+        // 権限の無いロールへ `42501` で非可視の表の存在を漏らさないため。
         if session.search_path_hides_public()
+            && !gate_reached.get()
             && !matches!(&result, Err(e) if e.wire_code() == "42601")
         {
             if let Ok(tokens) = crate::sql::lexer::tokenize_with_params(sql) {
@@ -822,15 +835,26 @@ impl EngineCore {
     }
 
     /// [`Self::parse_sql_prepared_with_declared_in_session`] の一時カタログ対応の本体。
-    fn parse_sql_prepared_in_session_inner(
+    ///
+    /// 通常の経路は [`Self::parse_sql_prepared_for_tenant_in_session`] へ渡し、`search_path` の解決（Issue #3197）を
+    /// 通す。`read_snap` は明示 Tx の `BEGIN` 時点のスナップショット（再 Parse 時。Parse の入口は `None`）。
+    pub(super) fn parse_sql_prepared_in_session_inner(
         &self,
         session: &SessionState,
         sql: &str,
         declared: &[Option<crate::sql::params::DeclaredParamType>],
+        read_snap: Option<&redb::ReadTransaction>,
+        gate_reached: &std::cell::Cell<bool>,
     ) -> Result<super::PreparedSql, SqlSurfaceError> {
         let temp = session.temp_tables();
         if temp.is_empty() {
-            return self.parse_sql_prepared_for_tenant(sql, declared, session.resolution_tenant());
+            return self.parse_sql_prepared_for_tenant_in_session(
+                sql,
+                declared,
+                session,
+                read_snap,
+                gate_reached,
+            );
         }
         let tokens = crate::sql::lexer::tokenize_with_params(sql)?;
         // `public.<一時表の名前>` は解決より前に拒否する（TABLE-27・Issue #1714）。
@@ -847,12 +871,23 @@ impl EngineCore {
                 && !crate::sql::allowlist::is_create_table_as_statement(&tokens))
             || crate::sql::allowlist::is_create_temp_table_statement(&tokens)
         {
-            return self.parse_sql_prepared_for_tenant(sql, declared, session.resolution_tenant());
+            return self.parse_sql_prepared_for_tenant_in_session(
+                sql,
+                declared,
+                session,
+                read_snap,
+                gate_reached,
+            );
         }
         // `DROP INDEX <名前>` は一時表の名前が現れない。一時 DB の索引なら一時コアで検証する。
         if crate::sql::allowlist::is_drop_index_statement(&tokens) {
-            let plain =
-                self.parse_sql_prepared_for_tenant(sql, declared, session.resolution_tenant())?;
+            let plain = self.parse_sql_prepared_for_tenant_in_session(
+                sql,
+                declared,
+                session,
+                read_snap,
+                gate_reached,
+            )?;
             if let (ParsedSql::DropIndex(stmt), Some(store)) =
                 (&plain.dummy_parsed, session.temp_rows_arc())
             {
@@ -871,7 +906,13 @@ impl EngineCore {
             return Ok(plain);
         }
         if !crate::sql::temp_catalog::tokens_reference_temp(&tokens, temp) {
-            return self.parse_sql_prepared_for_tenant(sql, declared, session.resolution_tenant());
+            return self.parse_sql_prepared_for_tenant_in_session(
+                sql,
+                declared,
+                session,
+                read_snap,
+                gate_reached,
+            );
         }
         let store = session.temp_rows_arc().ok_or_else(internal)?;
         match store
@@ -924,7 +965,7 @@ impl EngineCore {
         prepared: &super::PreparedSql,
         values: &[Option<Vec<u8>>],
     ) -> Result<ParsedSql, SqlSurfaceError> {
-        self.bind_prepared_in_session_snap(session, prepared, values, None)
+        self.bind_prepared_in_session_snap(session, prepared, values, None, true)
     }
 
     /// [`Self::bind_prepared_in_session`] の明示トランザクション対応版（拡張クエリの Bind。Issue #2403）。
@@ -937,6 +978,31 @@ impl EngineCore {
         prepared: &super::PreparedSql,
         values: &[Option<Vec<u8>>],
     ) -> Result<ParsedSql, SqlSurfaceError> {
+        self.bind_prepared_in_txn_impl(session, txn, prepared, values, true)
+    }
+
+    /// [`Self::bind_prepared_in_txn`] の再解決なし版（Issue #3197）。呼び出し元が
+    /// [`crate::core::EngineCore::refresh_prepared_in_txn`] で解決し直した文を渡す入口で、Bind の中で再度 refresh しない。
+    /// 検査・束縛・関係の同一性・portal の保持が同じ 1 回の解決結果を見る（refresh を 2 回挟むと、その間に別接続が
+    /// path 前方へ同名の関係を作った場合に、同一性検査の対象と実際の束縛先が食い違う）。
+    pub fn bind_refreshed_in_txn(
+        &self,
+        session: &SessionState,
+        txn: &crate::sql::transaction::SessionTransaction<'_>,
+        prepared: &super::PreparedSql,
+        values: &[Option<Vec<u8>>],
+    ) -> Result<ParsedSql, SqlSurfaceError> {
+        self.bind_prepared_in_txn_impl(session, txn, prepared, values, false)
+    }
+
+    fn bind_prepared_in_txn_impl(
+        &self,
+        session: &SessionState,
+        txn: &crate::sql::transaction::SessionTransaction<'_>,
+        prepared: &super::PreparedSql,
+        values: &[Option<Vec<u8>>],
+        refresh: bool,
+    ) -> Result<ParsedSql, SqlSurfaceError> {
         let read_snap = if txn.status() == crate::sql::transaction::TransactionStatus::InTransaction
         {
             match txn.read_source()? {
@@ -946,7 +1012,7 @@ impl EngineCore {
         } else {
             None
         };
-        self.bind_prepared_in_session_snap(session, prepared, values, read_snap)
+        self.bind_prepared_in_session_snap(session, prepared, values, read_snap, refresh)
     }
 
     /// portal の Execute 直前の読み取り権限の再検査（SQL-40・Issue #1967）。拡張クエリの Execute が、
@@ -1113,6 +1179,7 @@ impl EngineCore {
         prepared: &super::PreparedSql,
         values: &[Option<Vec<u8>>],
         read_snap: Option<&redb::ReadTransaction>,
+        refresh: bool,
     ) -> Result<ParsedSql, SqlSurfaceError> {
         let temp = session.temp_tables();
         match &prepared.route {
@@ -1136,6 +1203,8 @@ impl EngineCore {
                     route: Route::Temp,
                     fresh: false,
                     path_epoch: None,
+                    path_strict: false,
+                    copy_pin: None,
                 })))
             }
             PreparedRoute::Plain => {
@@ -1143,15 +1212,28 @@ impl EngineCore {
                     &prepared.public_qualified,
                     temp,
                 )?;
-                // Issue #3195: Parse 後に変わった path で未修飾名が自テナントの SCHEMA に解決される形は
-                // 固定文言の `0A000`（Parse で解決したキーを使い回さない。再解決は #3197）。
-                self.reject_path_resolved_refs(
-                    session.resolution_tenant(),
-                    session,
-                    &prepared.tokens,
-                    &prepared.qualified_positions,
-                    read_snap,
-                )?;
+                // `COPY` は再解決（refresh）と宛先の記録（pin）を同じ読み取り源で行う。読み取り源が無い入口
+                // （自動コミット）では、ここで 1 つ確定したスナップショットを両方に使い、2 回の照会の間に別接続が
+                // 先行 path へ同名の表を作っても、検証した表と記録する表がずれないようにする（Issue #3197）。
+                let own_snap = if read_snap.is_none()
+                    && matches!(prepared.dummy_parsed, ParsedSql::Copy(_))
+                    && (session.search_path_may_hold_tenant_schema()
+                        || session.search_path_hides_public())
+                {
+                    Some(self.begin_read_txn()?)
+                } else {
+                    None
+                };
+                let read_snap = read_snap.or(own_snap.as_ref());
+                // Issue #3197: Parse 後に変わった path・カタログで解決し直す（解決が変わっていれば再 Parse した
+                // 文を使う。以降の検査・束縛は解決後の文に対して行う）。
+                // `refresh == false` は呼び出し元が解決済みの文を渡した入口（二重解決を避ける）。
+                let refreshed = if refresh {
+                    self.refresh_prepared_snap(session, prepared, read_snap)?
+                } else {
+                    None
+                };
+                let prepared = refreshed.as_ref().unwrap_or(prepared);
                 // `public` が見えない `search_path` では、Parse 後に変わった path でも一時表以外の
                 // 未修飾名を `42P01` にする（TABLE-27・Issue #1715。既定の path では何もしない）。
                 crate::sql::search_path::check_unqualified_refs(
@@ -1176,9 +1258,16 @@ impl EngineCore {
                     if crate::sql::temp_catalog::tokens_reference_temp(&prepared.tokens, temp) {
                         return Err(crate::sql::temp_catalog::temp_statement_stale());
                     }
+                    // Bind 時の宛先の解決結果も記録し、Execute で照合する（同じ世代のまま path 前方に
+                    // 同名の関係が作られても宛先を化けさせない。Issue #3197）。
+                    let ParsedSql::Copy(vc) = &parsed else {
+                        return Err(internal());
+                    };
+                    let pin = self.copy_pin_for_sql(session, vc.sql(), read_snap)?;
                     return Ok(ParsedSql::SessionRouted(Box::new(
                         SessionRoutedSql::persistent_guarded(parsed, temp)
-                            .stamped_with_path(session),
+                            .stamped_with_path_for_copy(session)
+                            .with_copy_pin(pin),
                     )));
                 }
                 // `DROP INDEX <名前>` は一時表の名前トークンが現れない。準備後に同名の一時索引が
@@ -1217,6 +1306,70 @@ impl EngineCore {
                 )))
             }
         }
+    }
+
+    /// `COPY` の元 SQL を現在の `search_path`・カタログで解決した宛先（書き換え）を返す（Issue #3197）。
+    /// 字句解析に失敗する入力は検証済みのはずだが、失敗時は固定の陳腐化として拒否する（fail-closed）。
+    /// path 解決が不要（`search_path` が公開側のみ）なら宛先照会を省略して空の記録を返し、テナント未束縛でも
+    /// 従来の Bind 契約を保つ。解決が必要なのにテナント未束縛なら Execute と同じ `search_path_stale`（`0A000`）。
+    fn copy_pin_for_sql(
+        &self,
+        session: &SessionState,
+        sql: &str,
+        read_snap: Option<&redb::ReadTransaction>,
+    ) -> Result<Vec<(usize, crate::sql::lexer::Token)>, SqlSurfaceError> {
+        if !(session.search_path_may_hold_tenant_schema() || session.search_path_hides_public()) {
+            return Ok(Vec::new());
+        }
+        let tenant = session.resolution_tenant().ok_or_else(search_path_stale)?;
+        let tokens = crate::sql::lexer::tokenize_marked(sql).map_err(|_| search_path_stale())?;
+        self.copy_path_rewrites(tenant, session, &tokens, read_snap)
+    }
+
+    /// Execute 直前に、`COPY` の宛先が Bind 時と同じ関係へ解決されることを確かめる（Issue #3197）。
+    /// 包み（[`SessionRoutedSql`]）が宛先を記録していない文は何もしない。違えば固定文言の `0A000`。
+    /// wire-server の `COPY` 委譲経路が `require_session_current` の直後に呼ぶ。
+    pub fn require_copy_target_current(
+        &self,
+        session: &SessionState,
+        txn: &crate::sql::transaction::SessionTransaction<'_>,
+        parsed: &ParsedSql,
+    ) -> Result<(), SqlSurfaceError> {
+        let ParsedSql::SessionRouted(routed) = parsed else {
+            return Ok(());
+        };
+        let (Some(pin), ParsedSql::Copy(vc)) = (routed.copy_pin.as_ref(), routed.inner()) else {
+            return Ok(());
+        };
+        let snap = Self::describe_snapshot(txn)?;
+        if self.copy_pin_for_sql(session, vc.sql(), snap)? == *pin {
+            Ok(())
+        } else {
+            Err(search_path_stale())
+        }
+    }
+
+    /// [`Self::require_copy_target_current`] で照合した宛先を、直後の `COPY` 開始へ渡すためセッションに置く
+    /// （Issue #3197）。`COPY` 開始（`begin_copy_in_txn_armed`）は再解決せずこの宛先を適用するので、照合から開始までの
+    /// 間に先行 path へ同名の表が作られても、検証した関係とは別の表へ `COPY` されない。記録の無い文は何も置かない。
+    /// 呼び出し元は `COPY` 開始まで進まなかった場合に [`SessionState::clear_copy_target_pin`] で破棄する。
+    pub fn arm_copy_target(
+        &self,
+        session: &mut SessionState,
+        txn: &crate::sql::transaction::SessionTransaction<'_>,
+        parsed: &ParsedSql,
+    ) -> Result<(), SqlSurfaceError> {
+        self.require_copy_target_current(session, txn, parsed)?;
+        session.clear_copy_target_pin();
+        if let ParsedSql::SessionRouted(routed) = parsed {
+            if let (Some(pin), ParsedSql::Copy(vc)) = (routed.copy_pin.as_ref(), routed.inner()) {
+                session.arm_copy_target_pin(crate::sql::mode::CopyTargetPin {
+                    sql: vc.sql().to_owned(),
+                    rewrites: pin.clone(),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// 振り分け済みの文の前提（世代・テナント）を確かめ、一時表ストアを返す。

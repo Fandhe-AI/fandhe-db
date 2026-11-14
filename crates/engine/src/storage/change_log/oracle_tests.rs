@@ -258,7 +258,7 @@ fn gin_index_maintenance() {
     );
 }
 
-/// トリガ関数の呼び出し口（本番の結線は未整備のため、`trg` への INSERT 発火で `audit` に 1 行書く
+/// トリガ関数の呼び出し口（本番の結線は未整備のため、SCHEMA `s` の `trg`（内部キー `#1.trg`）への INSERT 発火で `audit` に 1 行書く
 /// テスト用の実装を注入する）。トリガ内の書き込みも同じ commit のレコードに載ることを確かめる。
 struct AuditInvoker;
 
@@ -268,7 +268,7 @@ impl crate::trigger::call::TriggerFunctionInvoker for AuditInvoker {
         c: &crate::trigger::call::TriggerCall<'_>,
     ) -> Result<crate::trigger::call::TriggerOutcome, crate::sql::allowlist::SqlSurfaceError> {
         use crate::row_codec::Value;
-        if c.table == "trg" {
+        if c.table == "#1.trg" {
             c.writes.insert_row(
                 "audit",
                 None,
@@ -299,7 +299,11 @@ fn triggers_and_functions() {
         )
     };
     let (s, storage) = begin("oracle-trigger");
-    storage.create_table(&schema("trg")).expect("trg");
+    // 共有 public 表へのトリガは定義時に拒否される（Issue #3361）ため、対象表は SCHEMA `s`（新しい DB では ID 1）。
+    storage
+        .create_schema("tenant-a", "s", false)
+        .expect("schema");
+    storage.create_table(&schema("#1.trg")).expect("trg");
     storage
         .create_table(&schema("audit").with_row_identity(RowIdentity::Allocated))
         .expect("audit");
@@ -314,11 +318,11 @@ fn triggers_and_functions() {
             &mut session,
             &[
                 "CREATE FUNCTION trg_fn() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$",
-                "CREATE TRIGGER ta AFTER INSERT ON trg FOR EACH ROW EXECUTE FUNCTION trg_fn()",
-                "INSERT INTO trg (id, embedding, a, n) VALUES (1, '[1.0,0.0]', 'x', 1) USING OPERATION_ID 'tr-0'",
-                "INSERT INTO trg (id, embedding, a, n) VALUES (2, '[0.0,1.0]', 'y', 2) USING OPERATION_ID 'tr-1'",
-                "DROP TRIGGER ta ON trg",
-                "INSERT INTO trg (id, embedding, a, n) VALUES (3, '[0.5,0.5]', 'z', 3) USING OPERATION_ID 'tr-2'",
+                "CREATE TRIGGER ta AFTER INSERT ON s.trg FOR EACH ROW EXECUTE FUNCTION trg_fn()",
+                "INSERT INTO s.trg (id, embedding, a, n) VALUES (1, '[1.0,0.0]', 'x', 1) USING OPERATION_ID 'tr-0'",
+                "INSERT INTO s.trg (id, embedding, a, n) VALUES (2, '[0.0,1.0]', 'y', 2) USING OPERATION_ID 'tr-1'",
+                "DROP TRIGGER ta ON s.trg",
+                "INSERT INTO s.trg (id, embedding, a, n) VALUES (3, '[0.5,0.5]', 'z', 3) USING OPERATION_ID 'tr-2'",
                 "CREATE FUNCTION add1(x int) RETURNS int BEGIN ATOMIC SELECT x + 1; END",
                 "DROP FUNCTION add1",
                 "DROP FUNCTION trg_fn",
