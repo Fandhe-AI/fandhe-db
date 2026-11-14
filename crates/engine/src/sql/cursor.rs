@@ -33,6 +33,16 @@ pub const MAX_CURSORS_PER_SESSION: usize = 16;
 /// 設計根拠）。
 pub const MAX_CURSOR_BYTES_PER_SESSION: usize = 16 * 1024 * 1024;
 
+/// FETCH の件数指定（Issue #3174・WIRE-15）。`ALL` を sentinel の `usize` で
+/// 表さず明示的に区別し、上限判定を実行時（[`CursorRegistry::fetch_all`]）へ寄せる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchCount {
+    /// `validate_search_limit_with` 検証済みの件数（`NEXT` は 1）。
+    Rows(usize),
+    /// `ALL`／`FORWARD ALL`: 残り全行。上限は実行時に判定する。
+    All,
+}
+
 /// `DECLARE`/`FETCH`/`CLOSE`（許可リスト検証済み。TASK-218・WIRE-15）。
 ///
 /// `Declare` の `query` は集計 `SELECT`（[`Statement::Aggregate`]）・広域取得
@@ -54,9 +64,10 @@ pub enum CursorStatement {
     },
     Fetch {
         name: String,
-        /// `1..=`[`crate::core::MAX_SEARCH_K`] の範囲検証済み
+        /// 件数指定。数値は `1..=`[`crate::core::MAX_SEARCH_K`] の範囲検証済み
         /// （[`crate::sql::parser::validate_search_limit`] を再利用する）。
-        count: usize,
+        /// `ALL` は [`FetchCount::All`]。
+        count: FetchCount,
     },
     Close {
         name: String,
@@ -71,7 +82,7 @@ pub enum CursorStatement {
 fn validate_cursor_name(raw: &str) -> Result<String, SqlSurfaceError> {
     if raw.eq_ignore_ascii_case("ALL") {
         return Err(SqlSurfaceError::unsupported(
-            "CLOSE ALL / FETCH ALL are not supported",
+            "ALL is not allowed as a cursor name",
         ));
     }
     crate::catalog::validate_identifier(raw)
@@ -212,10 +223,12 @@ pub(crate) fn validate_declare_tokens_structure_only(
     validate_declare_tokens(tokens, &AlwaysExistsLookup, limits)
 }
 
-/// `FETCH [ NEXT | [FORWARD] <n> ] { FROM | IN } <name>`（Issue #3173・WIRE-15）。
+/// `FETCH [ NEXT | ALL | [FORWARD] { <n> | ALL } ] { FROM | IN } <name>`
+/// （Issue #3173・#3174・WIRE-15）。
 ///
-/// `NEXT` は 1 件、`IN` は `FROM` の別名、`FORWARD` の後ろは件数が必須。
-/// `ALL`／`BACKWARD`／`PRIOR`／`FIRST`／`LAST`／`ABSOLUTE`／`RELATIVE`・件数なしの
+/// `NEXT` は 1 件、`ALL` は残り全行（[`FetchCount::All`]）、`IN` は `FROM` の別名、
+/// `FORWARD` の後ろは件数か `ALL` が必須。
+/// `BACKWARD`／`PRIOR`／`FIRST`／`LAST`／`ABSOLUTE`／`RELATIVE`・件数なしの
 /// `FORWARD`・`FROM`／`IN` の省略は `42601` で fail-closed に拒否する（前方向以外を
 /// 前方向へ読み替える fail-open 経路を作らない）。件数は `NEXT` を含め
 /// `validate_search_limit_with` を通し、上限設定との整合を 1 経路に揃える。
@@ -254,21 +267,29 @@ pub(crate) fn validate_fetch_tokens(
     Ok(CursorStatement::Fetch { name, count })
 }
 
-/// FETCH の方向・件数部（`NEXT` / `[FORWARD] <n>`）を読み、件数と残りトークンを返す。
-/// `validate_fetch_tokens` 専用。`ALL` 対応（#3174）は `FORWARD` 分岐と数値分岐へ足す。
+/// FETCH の方向・件数部（`NEXT` / `ALL` / `[FORWARD] { <n> | ALL }`）を読み、件数と
+/// 残りトークンを返す。`validate_fetch_tokens` 専用。`ALL` は `Token::Ident`（大小無視）
+/// のみ受理し、引用の区別は `IN`／`NEXT` と同じ扱い（意味は引用なしと同一で無害）。
 fn parse_fetch_count<'a>(
     rest: &'a [Token],
     result_limits: &crate::result_limits::ResultLimits,
-) -> Result<(usize, &'a [Token]), SqlSurfaceError> {
+) -> Result<(FetchCount, &'a [Token]), SqlSurfaceError> {
     let malformed = || SqlSurfaceError::unsupported("malformed FETCH statement");
     let (first, tail) = rest.split_first().ok_or_else(malformed)?;
     let (number_token, after) = match first {
         Token::Ident(w) if w.eq_ignore_ascii_case("NEXT") => {
             let count = crate::sql::parser::validate_search_limit_with(1, result_limits)?;
-            return Ok((count, tail));
+            return Ok((FetchCount::Rows(count), tail));
+        }
+        Token::Ident(w) if w.eq_ignore_ascii_case("ALL") => {
+            return Ok((FetchCount::All, tail));
         }
         Token::Ident(w) if w.eq_ignore_ascii_case("FORWARD") => {
-            tail.split_first().ok_or_else(malformed)?
+            let (next, after) = tail.split_first().ok_or_else(malformed)?;
+            if matches!(next, Token::Ident(w) if w.eq_ignore_ascii_case("ALL")) {
+                return Ok((FetchCount::All, after));
+            }
+            (next, after)
         }
         _ => (first, tail),
     };
@@ -279,7 +300,7 @@ fn parse_fetch_count<'a>(
         .parse()
         .map_err(|_| SqlSurfaceError::unsupported(format!("malformed FETCH count: {raw_count}")))?;
     let count = crate::sql::parser::validate_search_limit_with(raw, result_limits)?;
-    Ok((count, after))
+    Ok((FetchCount::Rows(count), after))
 }
 
 /// `CLOSE <name>`（規範形のみ）。先頭トークンが `CLOSE`（大小無視）であることは
@@ -365,6 +386,22 @@ pub(crate) fn estimate_result_bytes(result: &QueryResult) -> usize {
     result.rows.iter().fold(0usize, |acc, row| {
         acc.saturating_add(estimate_row_bytes(row))
     })
+}
+
+/// `cursor` の現在位置から `end`（排他）までを複製して払い出し、位置を `end` へ進める。
+/// [`CursorRegistry::fetch`]／[`CursorRegistry::fetch_all`] が共有する切り出し処理。
+fn take_rows(cursor: &mut OpenCursor, end: usize) -> QueryResult {
+    let rows = cursor
+        .result
+        .rows
+        .get(cursor.next_row..end)
+        .unwrap_or(&[])
+        .to_vec();
+    cursor.next_row = end;
+    QueryResult {
+        columns: cursor.result.columns.clone(),
+        rows,
+    }
 }
 
 /// 1 本の開いているカーソル（確定済み [`QueryResult`] と払い出し済み位置）。
@@ -496,17 +533,30 @@ impl CursorRegistry {
             .ok_or_else(SqlSurfaceError::invalid_cursor_name)?;
         let total_rows = cursor.result.rows.len();
         let end = cursor.next_row.saturating_add(count).min(total_rows);
-        let rows = cursor
-            .result
-            .rows
-            .get(cursor.next_row..end)
-            .unwrap_or(&[])
-            .to_vec();
-        cursor.next_row = end;
-        Ok(QueryResult {
-            columns: cursor.result.columns.clone(),
-            rows,
-        })
+        Ok(take_rows(cursor, end))
+    }
+
+    /// `name` のカーソルから残り全行を払い出し、位置を末尾へ進める（`FETCH ALL`・
+    /// Issue #3174）。残り行数が `max_rows` を超える場合は部分払い出しをせず `54000`
+    /// で fail-closed にし、位置も進めない。行集合は `DECLARE` 時点で
+    /// `max_result_rows` により cap 済みのため SQL 経路からは通常到達しない
+    /// 多層防御。文言は固定で件数・名前を含めない。不在は [`Self::fetch`] と同じ `34000`。
+    pub(crate) fn fetch_all(
+        &mut self,
+        name: &str,
+        max_rows: usize,
+    ) -> Result<QueryResult, SqlSurfaceError> {
+        let cursor = self
+            .cursors
+            .get_mut(name)
+            .ok_or_else(SqlSurfaceError::invalid_cursor_name)?;
+        let total_rows = cursor.result.rows.len();
+        if total_rows.saturating_sub(cursor.next_row) > max_rows {
+            return Err(SqlSurfaceError::payload_too_large(
+                "result exceeds the row limit",
+            ));
+        }
+        Ok(take_rows(cursor, total_rows))
     }
 
     /// `name` のカーソルが存在すれば、その結果列メタデータを返す（Describe
@@ -712,7 +762,7 @@ mod tests {
             stmt,
             CursorStatement::Fetch {
                 name: "c".to_string(),
-                count: 10
+                count: FetchCount::Rows(10)
             }
         );
         let stmt =
@@ -722,17 +772,22 @@ mod tests {
             stmt,
             CursorStatement::Fetch {
                 name: "c".to_string(),
-                count: 10
+                count: FetchCount::Rows(10)
             }
         );
 
         for (sql, count) in [
-            ("FETCH NEXT FROM c", 1),
-            ("FETCH NEXT IN c", 1),
-            ("fetch next in c", 1),
-            ("FETCH 1 IN c", 1),
-            ("FETCH FORWARD 3 FROM c", 3),
-            ("FETCH FORWARD 3 IN c", 3),
+            ("FETCH NEXT FROM c", FetchCount::Rows(1)),
+            ("FETCH NEXT IN c", FetchCount::Rows(1)),
+            ("fetch next in c", FetchCount::Rows(1)),
+            ("FETCH ALL FROM c", FetchCount::All),
+            ("FETCH ALL IN c", FetchCount::All),
+            ("fetch all from c", FetchCount::All),
+            ("FETCH FORWARD ALL FROM c", FetchCount::All),
+            ("FETCH FORWARD ALL IN c", FetchCount::All),
+            ("FETCH 1 IN c", FetchCount::Rows(1)),
+            ("FETCH FORWARD 3 FROM c", FetchCount::Rows(3)),
+            ("FETCH FORWARD 3 IN c", FetchCount::Rows(3)),
         ] {
             let stmt = validate_fetch_tokens(&tokens_of(sql), &Default::default()).expect(sql);
             assert_eq!(
@@ -746,8 +801,14 @@ mod tests {
         }
 
         for sql in [
-            "FETCH ALL FROM c",
-            "FETCH FORWARD ALL FROM c",
+            "FETCH ALL c",
+            "FETCH ALL 3 FROM c",
+            "FETCH ALL ALL FROM c",
+            "FETCH FORWARD ALL ALL FROM c",
+            "FETCH NEXT ALL FROM c",
+            "FETCH BACKWARD ALL FROM c",
+            "FETCH ALL FROM c extra",
+            "FETCH ALL FROM ALL",
             "FETCH BACKWARD 1 FROM c",
             "FETCH PRIOR FROM c",
             "FETCH FIRST FROM c",
@@ -969,6 +1030,63 @@ mod tests {
         assert!(page4.rows.is_empty());
     }
 
+    fn registry_with_rows(n: i64) -> CursorRegistry {
+        let mut registry = CursorRegistry::new();
+        let rows: Vec<crate::sql::exec::ResultRow> = (0..n)
+            .map(|i| crate::sql::exec::ResultRow {
+                id: i as _,
+                score: 0.0,
+                cells: vec![],
+            })
+            .collect();
+        registry
+            .declare(
+                "c".to_string(),
+                QueryResult {
+                    columns: vec![],
+                    rows,
+                },
+            )
+            .expect("declare");
+        registry
+    }
+
+    /// Issue #3174: FETCH ALL は残り全行を返して末尾へ進み、以降は 0 行。
+    #[test]
+    fn fetch_all_returns_remaining_rows_and_moves_to_end() {
+        let mut registry = registry_with_rows(5);
+        registry.fetch("c", 2).expect("fetch 2");
+        let rest = registry.fetch_all("c", 10).expect("fetch all");
+        assert_eq!(
+            rest.rows.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![2, 3, 4]
+        );
+        assert!(registry.fetch_all("c", 10).expect("again").rows.is_empty());
+        assert!(registry.fetch("c", 1).expect("next").rows.is_empty());
+    }
+
+    /// Issue #3174: cap 超過は 54000 で部分払い出しも位置変更もしない。
+    #[test]
+    fn fetch_all_over_row_cap_is_54000_without_advancing() {
+        let mut registry = registry_with_rows(5);
+        let err = registry.fetch_all("c", 4).expect_err("over cap");
+        assert_eq!(err.wire_code(), "54000");
+        let page = registry.fetch("c", 2).expect("fetch 2");
+        assert_eq!(
+            page.rows.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        let rest = registry.fetch_all("c", 3).expect("exactly cap");
+        assert_eq!(rest.rows.len(), 3);
+    }
+
+    #[test]
+    fn fetch_all_rejects_unknown_name_with_34000() {
+        let mut registry = CursorRegistry::new();
+        let err = registry.fetch_all("missing", 10).expect_err("not found");
+        assert_eq!(err.wire_code(), "34000");
+    }
+
     #[test]
     fn fetch_and_close_reject_unknown_name_with_34000() {
         let mut registry = CursorRegistry::new();
@@ -986,14 +1104,19 @@ mod tests {
                 .expect("fetch"),
             CursorStatement::Fetch {
                 name: "c".to_string(),
-                count: 1
+                count: FetchCount::Rows(1)
             }
         );
         assert!(
             validate_fetch_tokens(&tokens_of("FETCH FORWARD 1 FROM c;"), &Default::default())
                 .is_ok()
         );
-        for sql in ["FETCH NEXT FROM c;", "FETCH 1 IN c;"] {
+        for sql in [
+            "FETCH NEXT FROM c;",
+            "FETCH 1 IN c;",
+            "FETCH ALL FROM c;",
+            "FETCH FORWARD ALL IN c;",
+        ] {
             assert!(
                 validate_fetch_tokens(&tokens_of(sql), &Default::default()).is_ok(),
                 "{sql}"
@@ -1015,7 +1138,7 @@ mod tests {
             let err = validate_close_tokens(&tokens_of(sql)).expect_err(sql);
             assert_eq!(err.wire_code(), "42601", "{sql}");
         }
-        for sql in ["FETCH 1 FROM c;;", "FETCH ALL FROM c;"] {
+        for sql in ["FETCH 1 FROM c;;", "FETCH ALL FROM c;;"] {
             let err = validate_fetch_tokens(&tokens_of(sql), &Default::default()).expect_err(sql);
             assert_eq!(err.wire_code(), "42601", "{sql}");
         }
