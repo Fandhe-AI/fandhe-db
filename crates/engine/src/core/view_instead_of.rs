@@ -336,13 +336,22 @@ impl EngineCore {
 
         let outcome = match stmt {
             InsteadOfStmt::Insert(v) => {
-                let now = crate::sql::time_fn::now_micros()?;
-                let _default_clock = crate::sql::time_fn::DefaultClockScope::enter(
-                    crate::sql::time_fn::StatementClock {
-                        txn_start_micros: now,
-                        stmt_start_micros: now,
-                    },
-                );
+                // 既存の時刻（INSERT 入口が張った明示 Tx の開始時刻・外側の式スコープの時刻）を引き継ぐ。
+                // 現在時刻で張り直すと、トリガ先の DEFAULT now() が Tx 開始時刻とずれる。
+                // 時刻の文脈が無いときだけ、ここで 1 度確定する。
+                let clock = match crate::sql::time_fn::current_default_clock()
+                    .or_else(crate::sql::time_fn::current_clock)
+                {
+                    Some(c) => c,
+                    None => {
+                        let now = crate::sql::time_fn::now_micros()?;
+                        crate::sql::time_fn::StatementClock {
+                            txn_start_micros: now,
+                            stmt_start_micros: now,
+                        }
+                    }
+                };
+                let _default_clock = crate::sql::time_fn::DefaultClockScope::enter(clock);
                 let rows = self.instead_of_bind_insert(v, schema)?;
                 let mut affected: u64 = 0;
                 for values in rows {

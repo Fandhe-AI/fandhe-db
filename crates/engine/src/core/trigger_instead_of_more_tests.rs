@@ -2,8 +2,8 @@
 //! 原子性・明示 Tx・定義の形・fail-closed・テナント境界。ヘルパーは `trigger_instead_of_tests` と共有する。
 
 use super::trigger_instead_of_tests::{
-    affected, audit, audit_triggers, code, core_with, count, create_fn, ctx, ints, ok, session,
-    setup,
+    affected, audit, audit_triggers, code, core_with, count, create_fn, ctx, ints, ok, rows,
+    session, setup,
 };
 
 // 更新可能ビューでもトリガがあればトリガを優先し、DROP すると自動書き換え経路へ戻る。
@@ -134,6 +134,46 @@ fn explicit_transaction_sees_earlier_writes_and_rolls_back() {
     assert_eq!(affected(out), 2);
     exec(&mut s, "COMMIT").expect("commit");
     assert_eq!(audit(&core, "ins"), vec![9, 10]);
+}
+
+// 明示 Tx 内のビュー INSERT 経由のトリガが書く表の DEFAULT now() は、ビュー INSERT 時点ではなく
+// Tx 開始時刻になる（同一 Tx の通常 INSERT と同じ値。既存の時刻契約を引き継ぐ。Issue #3193）。
+#[test]
+fn explicit_transaction_view_insert_keeps_transaction_start_time() {
+    let (core, _g) = core_with("instof-tx-clock");
+    setup(&core);
+    ok(
+        &core,
+        "t1",
+        "CREATE TABLE ev (tag TEXT, ts TIMESTAMP DEFAULT now())",
+    );
+    create_fn(
+        &core,
+        "t1",
+        "f_ev",
+        "BEGIN INSERT INTO ev (tag) VALUES ('via_view'); RETURN NEW; END",
+    );
+    ok(
+        &core,
+        "t1",
+        "CREATE TRIGGER g_ev INSTEAD OF INSERT ON s.nv FOR EACH ROW EXECUTE FUNCTION f_ev()",
+    );
+    let c = ctx("t1");
+    let mut s = session();
+    let mut txn = core.new_session_transaction();
+    let mut exec = |s: &mut crate::sql::mode::SessionState, sql: &str| {
+        core.execute_sql_in_txn(&c, s, &mut txn, sql)
+    };
+    exec(&mut s, "BEGIN").expect("begin");
+    exec(&mut s, "INSERT INTO ev (tag) VALUES ('direct')").expect("direct insert");
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    exec(&mut s, "INSERT INTO s.nv (n) VALUES (1)").expect("view insert");
+    exec(&mut s, "COMMIT").expect("commit");
+    let direct = rows(&core, "t1", "SELECT ts FROM ev WHERE tag = 'direct'");
+    let via = rows(&core, "t1", "SELECT ts FROM ev WHERE tag = 'via_view'");
+    assert_eq!(direct.len(), 1);
+    assert_eq!(via.len(), 1);
+    assert_eq!(format!("{:?}", direct[0][0]), format!("{:?}", via[0][0]));
 }
 
 // 明示 Tx でトリガ本体が失敗すると Tx は Failed（25P02）になる。
