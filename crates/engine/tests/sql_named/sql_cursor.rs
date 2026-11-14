@@ -1125,16 +1125,123 @@ fn join_cursor_left_side_null_when_other_tenant_has_match() {
     );
 }
 
-/// CTE 入力の JOIN・集合演算の DECLARE は引き続き `42601` で拒否される（fail-closed）。
+fn sorted(mut v: Vec<Vec<String>>) -> Vec<Vec<String>> {
+    v.sort();
+    v
+}
+
+/// Issue #3176: 集合演算（UNION／UNION ALL／INTERSECT／EXCEPT）と CTE 入力の JOIN の
+/// カーソルが、直接実行と一致し、他テナントの行（キーが衝突）が混入しない。
+/// 順序が保証されない形はソートして比べる。
 #[test]
-fn join_cursor_unsupported_forms_stay_rejected() {
+fn set_operation_and_cte_join_cursors_match_direct_execution_and_isolate_tenants() {
     let (engine, path) = new_join_core();
     let _cleanup = CleanupGuard(path);
     let caller = ctx("tenant-a");
-    // tracked: #3176
-    for sql in [
-        "DECLARE c CURSOR FOR WITH w AS (SELECT id FROM documents LIMIT 5) SELECT w.id FROM w JOIN tags t ON w.id = t.id LIMIT 5",
-        "DECLARE c CURSOR FOR SELECT d.id FROM documents d JOIN tags t ON d.id = t.id UNION SELECT id FROM tags LIMIT 5",
+    let selects = [
+        "SELECT id FROM documents UNION SELECT id FROM tags",
+        "SELECT id FROM documents UNION ALL SELECT id FROM tags",
+        "SELECT id FROM documents INTERSECT SELECT id FROM tags",
+        "SELECT id FROM documents EXCEPT SELECT id FROM tags",
+        "SELECT lang FROM documents UNION ALL SELECT lang FROM tags",
+        "WITH w AS (SELECT id, lang FROM documents LIMIT 10) SELECT w.id, w.lang, t.lang FROM w JOIN tags t ON w.id = t.id LIMIT 100",
+        "WITH w AS (SELECT id FROM documents LIMIT 10) SELECT w.id, t.lang FROM w LEFT JOIN tags t ON w.id = t.id LIMIT 100",
+    ];
+    for select in selects {
+        let direct = sorted(direct_rows(&engine, &caller, select));
+        assert!(!direct.is_empty(), "fixture must yield rows: {select}");
+        for fetch in ["FETCH NEXT IN c", "FETCH FORWARD 2 IN c", "FETCH 10 FROM c"] {
+            let got = sorted(fetch_all_via_cursor(&engine, &caller, select, fetch));
+            assert_eq!(got, direct, "{select} via {fetch}");
+            assert!(
+                got.iter().flatten().all(|c| !c.contains("tenant-b")),
+                "other tenant row leaked: {select}"
+            );
+        }
+    }
+}
+
+/// 末尾 `;` を 1 個付けた形は受理し、`;;` は `42601` で拒否する。
+#[test]
+fn set_operation_and_cte_join_cursors_accept_one_trailing_semicolon() {
+    let (engine, path) = new_join_core();
+    let _cleanup = CleanupGuard(path);
+    let caller = ctx("tenant-a");
+    for select in [
+        "SELECT id FROM documents UNION ALL SELECT id FROM tags;",
+        "WITH w AS (SELECT id FROM documents LIMIT 10) SELECT w.id FROM w JOIN tags t ON w.id = t.id LIMIT 100;",
+    ] {
+        let rows = fetch_all_via_cursor(&engine, &caller, select, "FETCH 10 FROM c");
+        assert!(!rows.is_empty(), "{select}");
+    }
+    let mut session = SessionState::default();
+    let mut txn = engine.new_session_transaction();
+    engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "BEGIN")
+        .expect("begin");
+    let err = engine
+        .execute_sql_in_txn(
+            &caller,
+            &mut session,
+            &mut txn,
+            "DECLARE c CURSOR FOR SELECT id FROM documents UNION ALL SELECT id FROM tags;;",
+        )
+        .expect_err("double semicolon");
+    assert_eq!(err.wire_code(), "42601");
+}
+
+/// JOIN を枝に持つ集合演算は通常の SELECT でも未対応。cursor と直接実行で同じ wire_code（`42601`）になる。
+#[test]
+fn join_cursor_unsupported_forms_match_direct_execution_rejection() {
+    let (engine, path) = new_join_core();
+    let _cleanup = CleanupGuard(path);
+    let caller = ctx("tenant-a");
+    for select in [
+        "SELECT d.id FROM documents d JOIN tags t ON d.id = t.id UNION SELECT id FROM tags LIMIT 5",
+        "WITH w AS (SELECT id FROM documents LIMIT 5) SELECT id FROM w UNION SELECT id FROM tags",
+    ] {
+        let mut direct_session = SessionState::default();
+        let direct_err = engine
+            .execute_sql_in_session(&caller, &mut direct_session, select)
+            .expect_err("direct execution rejects the form");
+        let mut session = SessionState::default();
+        let mut txn = engine.new_session_transaction();
+        engine
+            .execute_sql_in_txn(&caller, &mut session, &mut txn, "BEGIN")
+            .expect("begin");
+        let err = engine
+            .execute_sql_in_txn(
+                &caller,
+                &mut session,
+                &mut txn,
+                &format!("DECLARE c CURSOR FOR {select}"),
+            )
+            .expect_err("must be rejected");
+        assert_eq!(err.wire_code(), "42601", "{select}");
+        assert_eq!(err.wire_code(), direct_err.wire_code(), "{select}");
+    }
+}
+
+fn count_rows(engine: &EngineCore, caller: &PolicyContext, table: &str) -> usize {
+    direct_rows(engine, caller, &format!("SELECT id FROM {table} LIMIT 100")).len()
+}
+
+/// データ変更 CTE（書き込みを伴う `WITH`）はカーソルに載せず `0A000` で拒否し、行は変わらない。
+// intentional: docs/design/sql-cursor.md
+// 根拠は同書 §5（データ変更 CTE は PG17 と同じくカーソル不可。書き込みへ到達させない）。
+#[test]
+fn data_modifying_cte_cursor_is_rejected_with_0a000_and_changes_no_rows() {
+    let (engine, path) = new_join_core();
+    let _cleanup = CleanupGuard(path);
+    let caller = ctx("tenant-a");
+    let other = ctx("tenant-b");
+    let before = (
+        count_rows(&engine, &caller, TAGS),
+        count_rows(&engine, &other, TAGS),
+    );
+    for select in [
+        "WITH d AS (DELETE FROM tags RETURNING id) SELECT id FROM d",
+        "WITH d AS (DELETE FROM tags RETURNING id) SELECT d.id FROM d JOIN documents x ON d.id = x.id LIMIT 5",
     ] {
         let mut session = SessionState::default();
         let mut txn = engine.new_session_transaction();
@@ -1142,10 +1249,115 @@ fn join_cursor_unsupported_forms_stay_rejected() {
             .execute_sql_in_txn(&caller, &mut session, &mut txn, "BEGIN")
             .expect("begin");
         let err = engine
-            .execute_sql_in_txn(&caller, &mut session, &mut txn, sql)
-            .expect_err("must be rejected");
-        assert_eq!(err.wire_code(), "42601", "{sql}");
+            .execute_sql_in_txn(
+                &caller,
+                &mut session,
+                &mut txn,
+                &format!("DECLARE c CURSOR FOR {select}"),
+            )
+            .expect_err("data-modifying CTE must be rejected");
+        assert_eq!(err.wire_code(), "0A000", "{select}");
+        engine
+            .execute_sql_in_txn(&caller, &mut session, &mut txn, "ROLLBACK")
+            .expect("rollback");
     }
+    let after = (
+        count_rows(&engine, &caller, TAGS),
+        count_rows(&engine, &other, TAGS),
+    );
+    assert_eq!(before, after, "no rows may change");
+}
+
+/// 集合演算・CTE 入力の JOIN の結果が残容量を超えると生成中に `54000` で打ち切られ、
+/// カーソルは登録されない（LIMIT 省略形も同じ）。
+#[test]
+fn set_operation_and_cte_join_cursors_respect_remaining_byte_budget() {
+    let (engine, path) = new_large_text_core();
+    let _cleanup = CleanupGuard(path);
+    let caller = ctx("tenant-a");
+    for select in [
+        "SELECT lang FROM documents UNION ALL SELECT lang FROM documents",
+        "WITH w AS (SELECT id, lang FROM documents LIMIT 10) SELECT a.lang, b.lang FROM w a CROSS JOIN w b LIMIT 100",
+    ] {
+        let mut session = SessionState::default();
+        let mut txn = engine.new_session_transaction();
+        engine
+            .execute_sql_in_txn(&caller, &mut session, &mut txn, "BEGIN")
+            .expect("begin");
+        let err = engine
+            .execute_sql_in_txn(
+                &caller,
+                &mut session,
+                &mut txn,
+                &format!("DECLARE c CURSOR FOR {select}"),
+            )
+            .expect_err("result exceeds the cursor budget");
+        assert_eq!(err.wire_code(), "54000", "{select}");
+        let err = engine
+            .execute_sql_in_txn(&caller, &mut session, &mut txn, "FETCH 1 FROM c")
+            .expect_err("cursor must not be registered");
+        assert_ne!(err.wire_code(), "54000", "{select}");
+        engine
+            .execute_sql_in_txn(&caller, &mut session, &mut txn, "ROLLBACK")
+            .expect("rollback");
+    }
+}
+
+/// 集合演算カーソルは自分の書き込みを反映し、writer 取得前に宣言したカーソルは BEGIN 時点を保つ。
+#[test]
+fn set_operation_cursor_sees_own_writes_and_snapshot_before_writer() {
+    let (engine, path) = new_join_core();
+    let _cleanup = CleanupGuard(path);
+    let caller = ctx("tenant-a");
+    let select = "SELECT id FROM documents UNION ALL SELECT id FROM tags";
+    let mut session = SessionState::default();
+    let mut txn = engine.new_session_transaction();
+    engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "BEGIN")
+        .expect("begin");
+    engine
+        .execute_sql_in_txn(
+            &caller,
+            &mut session,
+            &mut txn,
+            &format!("DECLARE before CURSOR FOR {select}"),
+        )
+        .expect("declare before");
+    engine
+        .execute_sql_in_txn(
+            &caller,
+            &mut session,
+            &mut txn,
+            "INSERT INTO tags (id, embedding, lang) VALUES (3, '[1.0, 0.0]', 'new') USING OPERATION_ID 'j-own-s3'",
+        )
+        .expect("own write");
+    engine
+        .execute_sql_in_txn(
+            &caller,
+            &mut session,
+            &mut txn,
+            &format!("DECLARE after CURSOR FOR {select}"),
+        )
+        .expect("declare after");
+    let mut counts = Vec::new();
+    for name in ["before", "after"] {
+        let SqlOutcome::Fetch(r) = engine
+            .execute_sql_in_txn(
+                &caller,
+                &mut session,
+                &mut txn,
+                &format!("FETCH 20 FROM {name}"),
+            )
+            .expect("fetch")
+        else {
+            panic!("expected Fetch outcome");
+        };
+        counts.push(r.rows.len());
+    }
+    assert_eq!(counts, vec![5, 6]);
+    engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "ROLLBACK")
+        .expect("rollback");
 }
 
 /// Tx 外の JOIN DECLARE は `25P01`（存在しない表を含んでも同じ）。

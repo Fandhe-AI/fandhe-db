@@ -155,7 +155,8 @@ Describe は検証していなかったため範囲外の値が Describe だけ�
 - `DISTINCT`・ベクトル順位付けを含む枝、集合演算の結果全体に対する `ORDER BY`
   （集計の枝・括弧付き枝の `ORDER BY`／`LIMIT`／`OFFSET` は Issue #1191 で対応済み）
 - `INTERSECT ALL`／`EXCEPT ALL`
-- `DECLARE CURSOR`・`COPY TO`・`EXPLAIN` での集合演算（`EXPLAIN` は Issue #2047 で対応済み。
+- `COPY TO`・`EXPLAIN` での集合演算（`EXPLAIN` は Issue #2047、`DECLARE CURSOR` は Issue #3176 で対応済み。
+  cursor の詳細は [sql-cursor.md](sql-cursor.md)。
   詳細は [explain-search-engine-exposure.md](explain-search-engine-exposure.md)）、明示トランザクション
   内での実行（いずれも既存の既定経路で `42601`／`0A000` に自然に落ちる）
 - NoSQL（HTTP）表層での集合演算（spec 上も非対応）
