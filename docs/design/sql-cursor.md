@@ -101,9 +101,14 @@ RLS-7 の暗黙適用がそのまま効く。カーソルは接続ごとの `Ses
   `FOR` より後のトークン列は再トークナイズせず
   `sql::allowlist::validate_sql_tokens` へそのまま渡す（第 2 のパーサを
   作らない設計）。受理する内側 `SELECT` は集計 `SELECT`（SQL-13・SQL-14）・
-  広域取得 `SELECT`（SQL-15）・CTE 入力を持たない JOIN `SELECT`（Issue #3175。
-  INNER／OUTER／CROSS／NATURAL／USING・集計形・`LIMIT` 省略形〔SQL-34〕）のみ。
-  CTE を入力に持つ JOIN・集合演算・CTE は #3176 の範囲として `42601`。
+  広域取得 `SELECT`（SQL-15）・JOIN `SELECT`（Issue #3175。INNER／OUTER／CROSS／NATURAL／USING・
+  集計形・`LIMIT` 省略形〔SQL-34〕。CTE を入力に持つ JOIN を含む。Issue #3176）・集合演算
+  （UNION／UNION ALL／INTERSECT／EXCEPT。Issue #3176）のみ。検証入口は
+  `sql::allowlist::validate_cursor_query_tokens`（cursor 専用の CTE 評価モード。JOIN 主クエリだけを
+  開き、具体化・派生表・関数呼び出し・再帰 CTE は閉じたまま）。許可リストと
+  `core.rs::execute_cursor_inner_query` の上限付き実行アームは 1 対 1 で、対応の無い形は
+  上限なしの通常経路へ流さず `Internal` で止める（fail-closed）。
+  JOIN を枝に持つ集合演算・`WITH` ＋ 集合演算の主クエリは通常の SELECT でも未対応のため `42601`。
   ベクトル順位付けの検索 `SELECT`・
   `EXPLAIN`・`SET`／`CREATE FUNCTION` は許可形状に一致せず `42601`。
   `SCROLL`／`NO SCROLL`／`BINARY`／`INSENSITIVE`／`ASENSITIVE`／`WITH HOLD`／
@@ -129,6 +134,12 @@ RLS-7 の暗黙適用がそのまま効く。カーソルは接続ごとの `Ses
   カーソル内の JOIN は通常の SELECT より早く `54000` に達しうる（安全側の差）。
   リレーション数・入出力行数・比較回数・結果行数の上限は起動時設定のまま。
   SELECT 権限（#1967）は全 relation を `DECLARE` の時点で検査し、`FETCH` では再検査しない。
+- **集合演算・CTE 入力の JOIN の内側（Issue #3176）**: 集合演算は
+  `sql::set_op::execute_with_budget_and_result_limits`、CTE 入力の JOIN は通常の SELECT と共有する
+  `EngineCore::execute_cte_join`（`sql::join::JoinBudget::capped_at` で文全体の予算を縮める）で
+  実行し、カーソルの残容量を生成中の累計バイト予算の上限にする。いずれも枝・中間行・CTE 本文の
+  評価を計上するため、通常の SELECT より早く `54000` に達しうる（安全側の差）。
+  SELECT 権限は全枝・CTE 本文の基底表・JOIN の相手表を `DECLARE` の時点で検査する。
 - **`FETCH`**（Issue #3173・#3174）: 受理するのは `FETCH [ NEXT | ALL | [FORWARD] { <n> | ALL } ] { FROM | IN } <name>`。
   `NEXT` は 1 件、`ALL` は残り全行（払い出し後は末尾で、続く `ALL` は 0 行。内部では `FetchCount::All`）、
   `IN` は `FROM` の別名、`FORWARD` の後ろは件数か `ALL` が必須。件数は `NEXT`
@@ -166,6 +177,7 @@ RLS-7 の暗黙適用がそのまま効く。カーソルは接続ごとの `Ses
 | ベクトル順位付けの `SELECT`・規範形以外の構文 | `42601` | |
 | 同じトランザクションで書き込み済みのテーブルに対する `DECLARE` | 成功（未 commit 変更を反映） | Issue #1179 で `0A000` から変更 |
 | `Failed` 中の `DECLARE`／`FETCH`／`CLOSE` | `25P02` | 既存の仕組み |
+| 内側がデータ変更 CTE（書き込みを伴う `WITH`。単一表・JOIN の主クエリとも） | `0A000` | 意図的な拒否（PG17 と同じくカーソルに載せない・fail-closed）。検証の段で固定し書き込みへ到達しない。Issue #3176 |
 
 - `Active` 中にエラーが起きた場合は、既存どおり種類を問わず `Failed` へ
   遷移させる（PostgreSQL と同じ）。
@@ -252,7 +264,9 @@ execute_portal`）で以下の 2 つを portal へ束縛し、再開前に突き
   `MOVE`、二重引用符のカーソル名（psycopg 3 の `ServerCursor` はこの形式を
   使うため非対応になる）。
 - ベクトル順位付けの `SELECT`（SQL-1〜4）のカーソル化（WIRE-15 の対象外）。
-- 内側が集合演算・CTE（CTE 入力の JOIN を含む）の `DECLARE`（#3176）、評価後射影形ビュー
+- 主クエリが tail CTE（本文に `ORDER BY`／`LIMIT`／`OFFSET`）を直接読む単一表の `DECLARE`・
+  `WITH RECURSIVE`・FROM の派生表・明示 `MATERIALIZED` の具体化経路（カーソルにバイト上限付きの
+  具体化経路が無いため従来どおり `0A000`／`42601`。Issue #3176 の対象外）。評価後射影形ビュー
   （JOIN 本文のビュー・派生表）の `DECLARE`（`42601` のまま）。一時表を含む `DECLARE` は
   一時表の振り分け経路の対象外で受理されない（fail-closed）。
 - スカラー `ORDER BY`（SQL-25 (a)。未実装）の形のカーソル化。`OFFSET`

@@ -831,3 +831,68 @@ fn wire15_declare_join_fetch_close_over_simple_query_isolates_tenants() {
     assert_eq!(read_command_complete(&mut stream), "COMMIT");
     read_ready_for_query(&mut stream);
 }
+
+// --- DECLARE の内側 SELECT への集合演算・CTE 入力の JOIN（Issue #3176） ----------
+
+/// 簡易クエリで末尾 `;` 付きの `UNION ALL` と `WITH` ＋ JOIN の DECLARE を単独送信し、
+/// `FETCH` → `CLOSE` が通る。他テナントの行（`notes` の tenant-b）は結果に現れない。
+#[test]
+fn wire15_declare_set_operation_and_cte_join_over_simple_query_isolates_tenants() {
+    let (core, _guard) = new_core_with_join_rows();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, core);
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    // (カーソル名, DECLARE 文, 期待行数)。tenant-a は docs 5 行・notes 2 行（tenant-b の notes 5 行は不可視）。
+    let cases = [
+        (
+            "u",
+            "DECLARE u CURSOR FOR SELECT id FROM docs UNION ALL SELECT id FROM notes;",
+            7usize,
+        ),
+        (
+            "j",
+            "DECLARE j CURSOR FOR WITH w AS (SELECT id FROM docs LIMIT 10) \
+             SELECT w.id, n.lang FROM w JOIN notes n ON w.id = n.id LIMIT 100;",
+            2,
+        ),
+    ];
+    for (name, declare, expect_rows) in cases {
+        send_simple_query(&mut stream, "BEGIN");
+        assert_eq!(read_command_complete(&mut stream), "BEGIN");
+        read_ready_for_query(&mut stream);
+
+        send_simple_query(&mut stream, declare);
+        assert_eq!(
+            read_command_complete(&mut stream),
+            "DECLARE CURSOR",
+            "{declare}"
+        );
+        read_ready_for_query(&mut stream);
+
+        send_simple_query(&mut stream, &format!("FETCH 20 FROM {name}"));
+        let columns = read_row_description(&mut stream);
+        assert!(!columns.is_empty());
+        let mut page = Vec::new();
+        while peek_message_type(&mut stream) == b'D' {
+            page.push(read_data_row(&mut stream));
+        }
+        let tag = read_command_complete(&mut stream);
+        read_ready_for_query(&mut stream);
+        assert_eq!(page.len(), expect_rows, "{declare}");
+        assert_eq!(tag, format!("FETCH {}", page.len()));
+        for row in &page {
+            assert!(
+                row.iter().flatten().all(|cell| !cell.contains("tenant-b")),
+                "other tenant row leaked: {row:?}"
+            );
+        }
+
+        send_simple_query(&mut stream, &format!("CLOSE {name}"));
+        assert_eq!(read_command_complete(&mut stream), "CLOSE CURSOR");
+        read_ready_for_query(&mut stream);
+        send_simple_query(&mut stream, "COMMIT");
+        assert_eq!(read_command_complete(&mut stream), "COMMIT");
+        read_ready_for_query(&mut stream);
+    }
+}
