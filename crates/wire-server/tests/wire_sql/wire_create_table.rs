@@ -336,3 +336,50 @@ fn wire_add_foreign_key_to_allocated_parent_id_revalidates_existing_rows() {
         read_ready_for_query(&mut stream);
     }
 }
+
+/// 採番方式の親への `id` 参照 FK の子 INSERT は、末尾 `;` 付きの単独文でも親の存在を検査する。
+/// 存在する親は `INSERT 0 1`、存在しない親は SQLSTATE 23503 で、接続は継続して使える
+/// （TABLE-17・TABLE-23、Issue #3179）。
+#[test]
+fn wire_insert_into_child_of_allocated_parent_id_checks_parent_existence() {
+    let (core, _guard) = new_core_without_tables();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
+    let addr = spawn_with_ddl_allowed_users(&users_path, core, &["alice"]);
+    let mut stream = connect_as(addr, "alice", "pw-alice");
+
+    for (sql, tag) in [
+        (
+            "CREATE TABLE users (id BIGINT PRIMARY KEY, name TEXT);",
+            "CREATE TABLE",
+        ),
+        (
+            "CREATE TABLE posts (author BIGINT REFERENCES users (id), body TEXT);",
+            "CREATE TABLE",
+        ),
+        (
+            "INSERT INTO users (id, name) VALUES (1, 'a');",
+            "INSERT 0 1",
+        ),
+        (
+            "INSERT INTO posts (author, body) VALUES (1, 'ok');",
+            "INSERT 0 1",
+        ),
+    ] {
+        send_simple_query(&mut stream, sql);
+        assert_eq!(read_command_complete(&mut stream), tag, "{sql}");
+        read_ready_for_query(&mut stream);
+    }
+
+    send_simple_query(
+        &mut stream,
+        "INSERT INTO posts (author, body) VALUES (2, 'orphan');",
+    );
+    expect_error_response_with_sqlstate(&mut stream, "23503");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(&mut stream, "SELECT body FROM posts LIMIT 10");
+    assert_eq!(read_row_description(&mut stream), vec!["body"]);
+    let _row = read_data_row(&mut stream);
+    assert_eq!(read_command_complete(&mut stream), "SELECT 1");
+    read_ready_for_query(&mut stream);
+}

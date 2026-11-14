@@ -2405,19 +2405,11 @@ enum RequiredParentKeys {
 }
 
 impl RequiredParentKeys {
-    fn new(fk: &ForeignKeyDef) -> Self {
-        if fk.references_parent_id() {
-            RequiredParentKeys::Ids(BTreeSet::new())
-        } else {
-            RequiredParentKeys::Keys(BTreeSet::new())
-        }
-    }
-
-    /// 親 `parent` の行識別方式まで見て集合の種類を選ぶ。`id` 参照でも採番方式の親
-    /// （`id` は宣言した普通の列）は列参照として正準キーで持つ（Issue #3181。
-    /// ALTER 系の既存行再検証〔`enforce_referencing_rows_by_scan_for_fk`〕が使う）。
-    fn new_for_parent(fk: &ForeignKeyDef, parent: &TableSchema) -> Self {
-        if fk.references_parent_pseudo_id(parent) {
+    /// 疑似列 `id` を参照する FK（親が従来方式）は物理キー点照会の `Ids`、それ以外
+    /// （採番方式の親の `id` 参照を含む普通の列参照）は永続キー索引の `Keys` を選ぶ
+    /// （Issue #3179。`parent_schema` は `fk` の参照先テーブルのスキーマ）。
+    fn new(fk: &ForeignKeyDef, parent_schema: &TableSchema) -> Self {
+        if fk.references_parent_pseudo_id(parent_schema) {
             RequiredParentKeys::Ids(BTreeSet::new())
         } else {
             RequiredParentKeys::Keys(BTreeSet::new())
@@ -3065,9 +3057,16 @@ fn enforce_foreign_keys_in_txn(
     if specs.is_empty() {
         return Ok(());
     }
+    // 参照先スキーマを先に解決する（`Ids`／`Keys` の選択が親の行識別方式に依存するため。
+    // 自己参照は `schema` を使う）。
+    let parents: Vec<Option<TableSchema>> = specs
+        .iter()
+        .map(|spec| parent_schema_for(write_txn, table_name, spec.fk))
+        .collect::<Result<_, _>>()?;
     let mut required: Vec<RequiredParentKeys> = specs
         .iter()
-        .map(|spec| RequiredParentKeys::new(spec.fk))
+        .zip(parents.iter())
+        .map(|(spec, parent)| RequiredParentKeys::new(spec.fk, parent.as_ref().unwrap_or(schema)))
         .collect();
     {
         let row_table_name = crate::catalog::user_rows_table_name(table_name);
@@ -3090,8 +3089,7 @@ fn enforce_foreign_keys_in_txn(
             }
         }
     }
-    for (spec, req) in specs.iter().zip(required) {
-        let parent = parent_schema_for(write_txn, table_name, spec.fk)?;
+    for ((spec, req), parent) in specs.iter().zip(required).zip(parents.iter()) {
         verify_required_parent_keys(
             write_txn,
             spec.fk.parent_table(),
@@ -3474,7 +3472,7 @@ fn enforce_referencing_rows_by_scan_for_fk(
             "referencing foreign key not found in child schema",
         ));
     };
-    let mut required = RequiredParentKeys::new_for_parent(fk, schema);
+    let mut required = RequiredParentKeys::new(fk, schema);
     {
         let row_table_name = crate::catalog::user_rows_table_name(&child_schema.name);
         let row_table = match write_txn
@@ -3613,7 +3611,7 @@ pub(crate) fn prepare_referenced_key_indexes_in_txn(
 ) -> Result<(), TenantWriteError> {
     let referencing = crate::catalog::referencing_foreign_keys_in_txn(write_txn, table_name)?;
     for (_child_schema, fk) in &referencing {
-        if fk.references_parent_id() {
+        if fk.references_parent_pseudo_id(schema) {
             continue;
         }
         crate::key_index::ensure_index_in_txn(
@@ -3743,9 +3741,10 @@ pub(crate) fn enforce_referencing_rows_in_txn(
     let referencing = crate::catalog::referencing_foreign_keys_in_txn(write_txn, table_name)?;
     for (child_schema, fk) in &referencing {
         if let Some(names) = &updated_names {
-            // `id` 参照は更新で失われない。列参照は、参照先列のいずれかが今回
-            // 更新された列に含まれる場合のみ検査する。
-            if fk.references_parent_id()
+            // 疑似列 `id` 参照は更新で失われない。採番方式の親の `id` を含む列参照は、
+            // 参照先列のいずれかが今回更新された列に含まれる場合のみ検査する
+            // （Issue #3179。採番方式の `id` 更新は孤児化し得るため素通りさせない）。
+            if fk.references_parent_pseudo_id(schema)
                 || !fk
                     .parent_columns()
                     .iter()
@@ -3776,10 +3775,14 @@ pub(crate) fn enforce_referencing_rows_in_txn(
                     tenant_id,
                 )?
             }
-        } else if fk.references_parent_id() {
-            // id 参照は `Removed` のときだけ失われ得る（`ColumnsUpdated`／
-            // `AllColumnsReplaced` は上の `updated_names` ガードで既に除外
-            // 済み）。
+        } else if fk.references_parent_id()
+            && (fk.references_parent_pseudo_id(schema)
+                || matches!(change, ReferencedRowsChange::Removed { .. }))
+        {
+            // 疑似列 `id` 参照は `Removed` のときだけ失われ得る（`ColumnsUpdated`／
+            // `AllColumnsReplaced` は上の `updated_names` ガードで既に除外済み）。
+            // 採番方式の親の `id` 参照の DELETE は、`referenced_id_value_of_removed_row`
+            // が 0A000 で拒否する（#3180 が実装するまでの fail-closed）。
             let ReferencedRowsChange::Removed { ids } = change else {
                 continue;
             };
@@ -3866,7 +3869,7 @@ pub(crate) fn enforce_referencing_rows_in_txn(
                 // 物理キー点照会のため対象外。この分岐に `id` 参照が来るのは
                 // `Truncated` 経由のみで、その場合の判定はここではなく
                 // 上の `if fk.references_parent_id()` 分岐が別に処理する）。
-                if !fk.references_parent_id() {
+                if !fk.references_parent_pseudo_id(schema) {
                     crate::key_index::ensure_index_in_txn(
                         write_txn,
                         table_name,
@@ -4580,9 +4583,10 @@ fn collect_action_targets(
 /// （`id` 参照 FK が参照先を引く 2 つの集約点の一方。Issue #2194・TABLE-23）。
 ///
 /// 従来方式（`LegacyId`）の表は rowid と `id` が 1:1 のため、値から rowid への写像は恒等で、
-/// 物理キーの点照会が主キー値による解決そのものになる。採番方式（`Allocated`）の表は主キー索引から
-/// 引く実装が未整備のため、固定文言で fail-closed に拒否する（DDL が受理した採番方式の親への
-/// `id` 参照は実行時にここで 0A000 になる。#3179・#3180 が解消。Issue #3178）。呼び出し元は本 module の `id` 参照 FK の検査・連鎖処理。
+/// 物理キーの点照会が主キー値による解決そのものになる。採番方式（`Allocated`）の表は固定文言で
+/// 0A000 により fail-closed に拒否する。子の存在検査は列参照経路（永続キー索引）へ移行済みで
+/// 本関数に到達しない（Issue #3179）。親の DELETE・連鎖は #3180 が解消する。
+/// 呼び出し元は本 module の `id` 参照 FK の連鎖処理。
 fn parent_row_key_by_id_value<'a>(
     parent_schema: &TableSchema,
     tenant_id: &'a str,
@@ -5193,6 +5197,40 @@ mod tests {
         enforce_unique_keys_in_txn(&write_txn, "docs", &schema, "tenant-a", &[r2000])
             .expect("key is free after the owner row was removed");
         write_txn.abort().expect("abort");
+    }
+
+    /// 子の存在検査の経路は親の行識別方式で決まる: 従来方式の親の `id` 参照は物理キー点照会
+    /// （`Ids`）、採番方式の親の `id` 参照は列参照（`Keys`）になる（Issue #3179）。
+    #[test]
+    fn required_parent_keys_path_depends_on_parent_row_identity() {
+        let fk = ForeignKeyDef::new(
+            vec!["author".to_string()],
+            "parent".to_string(),
+            vec!["id".to_string()],
+            ReferentialAction::NoAction,
+            ReferentialAction::NoAction,
+        );
+        let allocated = TableSchema::new(
+            "parent",
+            vec![ColumnDef::new(
+                "id",
+                crate::catalog::ColumnType::BigInt,
+                false,
+            )],
+        )
+        .with_row_identity(crate::catalog::RowIdentity::Allocated);
+        let legacy = TableSchema::new(
+            "parent",
+            vec![ColumnDef::new("k", crate::catalog::ColumnType::Text, false)],
+        );
+        assert!(matches!(
+            RequiredParentKeys::new(&fk, &allocated),
+            RequiredParentKeys::Keys(_)
+        ));
+        assert!(matches!(
+            RequiredParentKeys::new(&fk, &legacy),
+            RequiredParentKeys::Ids(_)
+        ));
     }
 
     /// `id` 参照 FK の参照先解決は、採番方式の親を固定文言で fail-closed に拒否する（Issue #2194）。
