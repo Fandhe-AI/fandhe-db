@@ -3,8 +3,8 @@
 //!
 //! 契約: 構文・表の存在確認・列解決・型照合が `EngineCore` の入口（`parse_sql`・Describe・
 //! autocommit／明示トランザクションの実行・拡張クエリの Parse）で一貫して働く。束縛と変換を通った文は
-//! 結合実行器へ dispatch され（#3202）、変換できない形と `USING OPERATION_ID` 付き（#3203 まで）は
-//! 副作用ゼロの `0A000` で fail-closed に拒否する。`RETURNING` は #3204 の担当。
+//! 結合実行器へ dispatch され（#3202）、台帳（`USING OPERATION_ID`。再送 `23505`・別文への再利用 `22023`）も
+//! 結線済み（#3203）。変換できない形は副作用ゼロの `0A000` で fail-closed に拒否する。`RETURNING` は #3204 の担当。
 //! 既存の単一表 DML（`DELETE ... USING OPERATION_ID` を含む）は挙動を変えない。
 //! ポインタ: `docs/design/update-from-delete-using.md`。
 
@@ -127,7 +127,7 @@ const CONVERTER_REJECTED: &[&str] = &[
     "DELETE FROM docs USING langs WHERE langs.flag;",
 ];
 
-/// 実行できる形に `USING OPERATION_ID` が付いた形。台帳の SQL 経路結線（#3203）まで `0A000`。
+/// 実行できる形に `USING OPERATION_ID` が付いた形（Issue #3203 で台帳結線済み。初回は `UPDATE n`／`DELETE n`）。
 const OPERATION_ID_FORMS: &[&str] = &[
     "UPDATE docs SET lang = 'x' FROM langs WHERE docs.lang = langs.lang USING OPERATION_ID 'op-u1'",
     "DELETE FROM docs USING langs WHERE docs.lang = langs.lang USING OPERATION_ID 'op-d1'",
@@ -212,25 +212,199 @@ fn converter_rejected_forms_fail_closed_without_side_effects() {
     }
 }
 
-/// `USING OPERATION_ID` 付きは、台帳の SQL 経路結線までは黙って捨てずに `0A000` で拒否する（再送の二重適用を防ぐ）。
-// tracked: #3203
+fn ctx_of(tenant: &str) -> PolicyContext {
+    PolicyContext::with_visibilities(tenant, [Visibility::Public, Visibility::Private])
+        .expect("valid tenant")
+}
+
+fn run_as(core: &EngineCore, tenant: &str, sql: &str) -> Result<String, SqlSurfaceError> {
+    core.execute_sql_in_session(&ctx_of(tenant), &mut SessionState::default(), sql)
+        .map(|o| format!("{o:?}"))
+}
+
+fn tag(kind: &str, n: u64) -> String {
+    format!("{kind}({kind}Outcome {{ rows_affected: {n} }})")
+}
+
+const UPD: &str = "UPDATE docs SET lang = 'x' FROM langs WHERE docs.lang = langs.lang";
+const DEL: &str = "DELETE FROM docs USING langs WHERE docs.lang = langs.lang";
+
+fn add_doc(core: &EngineCore, id: u64, op: &str) {
+    run(
+        core,
+        &format!(
+            "INSERT INTO docs (id, embedding, lang) VALUES ({id}, '[0.5,0.1]', 'ja') USING OPERATION_ID '{op}'"
+        ),
+    )
+    .expect("add doc");
+}
+
+/// `USING OPERATION_ID` 付きの結合形 DML は実行され、同一文の再送は `23505` で再適用されない
+/// （RECOVER-10/11。末尾 `;` の有無でハッシュは変わらない）。
 #[test]
-fn operation_id_forms_are_rejected_until_ledger_wiring() {
-    let (core, path) = new_core("sql53-from-opid", false);
+fn operation_id_forms_run_and_resend_is_23505_without_reapply() {
+    for (kind, base) in [("Update", UPD), ("Delete", DEL)] {
+        let (core, path) = new_core("sql53-from-opid", false);
+        let _g = CleanupGuard(path);
+        seed(&core);
+        let sql = format!("{base} USING OPERATION_ID 'op-1'");
+        assert_eq!(run(&core, &sql).expect("first"), tag(kind, 1));
+        // 再送の間に新しい一致行を足す。再送が適用されると増えた行が変わる。
+        add_doc(&core, 3, "doc-3");
+        let after_first = doc_rows(&core);
+        assert_eq!(code(run(&core, &sql)), "23505", "{kind}");
+        assert_eq!(
+            code(run(&core, &format!("{sql};"))),
+            "23505",
+            "{kind} with semicolon"
+        );
+        assert_eq!(
+            after_first,
+            doc_rows(&core),
+            "{kind} resend must not reapply"
+        );
+    }
+}
+
+/// 末尾 `;` 付き単独送信（psql 形）が初回から通り、`;` なしの再送が同一文として `23505` になる。
+#[test]
+fn operation_id_form_with_trailing_semicolon_is_ledgered() {
+    let (core, path) = new_core("sql53-from-opid-semi", false);
+    let _g = CleanupGuard(path);
+    seed(&core);
+    let sql = format!("{DEL} USING OPERATION_ID 'op-s'");
+    assert_eq!(
+        run(&core, &format!("{sql};")).expect("first"),
+        tag("Delete", 1)
+    );
+    assert_eq!(code(run(&core, &sql)), "23505");
+}
+
+/// 同じ operation_id を別の文へ再利用すると `22023`（UPDATE と DELETE の間も同様）。
+#[test]
+fn operation_id_reuse_for_a_different_statement_is_22023() {
+    let (core, path) = new_core("sql53-from-opid-reuse", false);
+    let _g = CleanupGuard(path);
+    seed(&core);
+    run(&core, &format!("{UPD} USING OPERATION_ID 'op-r'")).expect("first");
+    assert_eq!(
+        code(run(&core, &format!("{DEL} USING OPERATION_ID 'op-r'"))),
+        "22023"
+    );
+    assert_eq!(
+        code(run(
+            &core,
+            "UPDATE docs SET lang = 'y' FROM langs WHERE docs.lang = langs.lang USING OPERATION_ID 'op-r'"
+        )),
+        "22023"
+    );
+}
+
+/// 束縛エラー・変換器拒否の文は台帳を消費せず、同じ ID を別の文が通常どおり使える。
+#[test]
+fn bind_and_converter_errors_do_not_consume_the_ledger() {
+    let (core, path) = new_core("sql53-from-opid-unused", false);
     let _g = CleanupGuard(path);
     seed(&core);
     let before = doc_rows(&core);
-    for sql in OPERATION_ID_FORMS {
-        assert_eq!(code(run(&core, sql)), "0A000", "{sql}");
-        assert_eq!(before, doc_rows(&core), "rows changed by {sql}");
+    for (sql, want) in [
+        ("UPDATE docs SET lang = 'x' FROM langs WHERE lang = 'ja' USING OPERATION_ID 'op-e'", "42702"),
+        ("UPDATE docs SET lang = 'x' FROM nope WHERE docs.lang = nope.lang USING OPERATION_ID 'op-e'", "42P01"),
+        ("DELETE FROM docs USING langs USING OPERATION_ID 'op-e'", "0A000"),
+    ] {
+        assert_eq!(code(run(&core, sql)), want, "{sql}");
+        assert_eq!(before, doc_rows(&core));
     }
-    for id in ["op-u1", "op-d1"] {
-        run(
-            &core,
-            &format!("UPDATE docs SET n = 7 WHERE lang = 'en' USING OPERATION_ID '{id}'"),
+    assert_eq!(
+        run(&core, &format!("{DEL} USING OPERATION_ID 'op-e'")).expect("id unused"),
+        tag("Delete", 1)
+    );
+}
+
+/// 明示 Tx: 同一 Tx 内の同 ID 再利用は拒否されて `Failed`、ROLLBACK 後は未消費、COMMIT 後の再送は `23505`。
+#[test]
+fn operation_id_in_explicit_transaction_follows_commit_and_rollback() {
+    let (core, path) = new_core("sql53-from-opid-txn", false);
+    let _g = CleanupGuard(path);
+    seed(&core);
+    let mut session = SessionState::default();
+    let sql = format!("{UPD} USING OPERATION_ID 'op-t'");
+    let mut step = |txn: &mut _, q: &str| core.execute_sql_in_txn(&ctx(), &mut session, txn, q);
+
+    let mut txn = core.new_session_transaction();
+    step(&mut txn, "BEGIN").expect("begin");
+    assert_eq!(
+        format!("{:?}", step(&mut txn, &sql).expect("in tx")),
+        tag("Update", 1)
+    );
+    let err = step(&mut txn, &format!("{DEL} USING OPERATION_ID 'op-t'")).expect_err("reuse in tx");
+    assert_eq!(err.wire_code(), "25000");
+    step(&mut txn, "ROLLBACK").expect("rollback");
+
+    // ROLLBACK 後は未消費。COMMIT すると消費される。
+    let mut txn = core.new_session_transaction();
+    step(&mut txn, "BEGIN").expect("begin");
+    step(&mut txn, &sql).expect("after rollback");
+    step(&mut txn, "COMMIT").expect("commit");
+    assert_eq!(code(run(&core, &sql)), "23505");
+}
+
+/// 別テナントが同じ operation_id を独立に使える（台帳キーはテナントを含む。RLS-10）。
+#[test]
+fn operation_id_is_scoped_per_tenant() {
+    let (core, path) = new_core("sql53-from-opid-tenant", false);
+    let _g = CleanupGuard(path);
+    seed(&core);
+    for (id, tbl, extra) in [(1, "docs", "[0.1,0.1]', 'ja"), (1, "langs", "ja', 'L")] {
+        let sql = if tbl == "docs" {
+            format!("INSERT INTO docs (id, embedding, lang) VALUES ({id}, '{extra}') USING OPERATION_ID 'b-{tbl}'")
+        } else {
+            format!("INSERT INTO langs (id, lang, label) VALUES ({id}, '{extra}') USING OPERATION_ID 'b-{tbl}'")
+        };
+        run_as(&core, "tenant-b", &sql).expect("seed b");
+    }
+    let sql = format!("{DEL} USING OPERATION_ID 'shared-op'");
+    assert_eq!(run(&core, &sql).expect("a"), tag("Delete", 1));
+    assert_eq!(
+        run_as(&core, "tenant-b", &sql).expect("b"),
+        tag("Delete", 1)
+    );
+    assert_eq!(code(run_as(&core, "tenant-b", &sql)), "23505");
+}
+
+/// `--require-operation-id` 構成: 省略は `23502`、指定した結合形 DML は成功する。
+#[test]
+fn ledgered_mode_requires_and_accepts_operation_id() {
+    let (core, path) = new_core("sql53-from-opid-ledgered", false);
+    let _g = CleanupGuard(path);
+    let core = core.with_ledger_mode(engine::recovery::required_op_id::LedgerMode::Ledgered);
+    seed(&core);
+    assert_eq!(code(run(&core, UPD)), "23502");
+    assert_eq!(
+        run(&core, &format!("{UPD} USING OPERATION_ID 'op-l'")).expect("ledgered"),
+        tag("Update", 1)
+    );
+}
+
+/// `READ ONLY` Tx は op id 付きの結合形を書き込みとして拒否する（`25006`）。
+#[test]
+fn operation_id_form_is_rejected_in_read_only_transaction() {
+    let (core, path) = new_core("sql53-from-opid-ro", false);
+    let _g = CleanupGuard(path);
+    seed(&core);
+    let mut session = SessionState::default();
+    let mut txn = core.new_session_transaction();
+    core.execute_sql_in_txn(&ctx(), &mut session, &mut txn, "BEGIN READ ONLY")
+        .expect("begin");
+    let err = core
+        .execute_sql_in_txn(
+            &ctx(),
+            &mut session,
+            &mut txn,
+            &format!("{UPD} USING OPERATION_ID 'op-ro'"),
         )
-        .unwrap_or_else(|e| panic!("operation_id {id} should be unused: {e:?}"));
-    }
+        .expect_err("read only");
+    assert_eq!(err.wire_code(), "25006");
 }
 
 /// 拒否形と期待コード。
@@ -505,9 +679,8 @@ fn search_path_gate_covers_from_and_using_relations() {
 }
 
 /// Describe は Execute と同じ準備段を通す。実行できる形は結果列なし、束縛エラーは実行と同じコード、
-/// 変換器が拒否する形と op id 付きの形は `0A000`。
+/// 変換器が拒否する形は `0A000`。op id 付きの実行できる形も結果列なし（台帳は消費しない）。
 // intentional: docs/design/update-from-delete-using.md
-// tracked: #3203
 #[test]
 fn describe_reports_bind_errors_and_no_columns_for_valid_forms() {
     let (core, path) = new_core("sql53-from-describe", false);
@@ -520,7 +693,14 @@ fn describe_reports_bind_errors_and_no_columns_for_valid_forms() {
             .unwrap_or_else(|e| panic!("describe failed for {sql}: {e:?}"));
         assert!(meta.is_none(), "{sql}");
     }
-    for sql in CONVERTER_REJECTED.iter().chain(OPERATION_ID_FORMS) {
+    for sql in OPERATION_ID_FORMS {
+        let parsed = core.parse_sql(sql).expect("parse");
+        let meta = core
+            .describe_parsed_in_session(&session, &parsed)
+            .unwrap_or_else(|e| panic!("describe failed for {sql}: {e:?}"));
+        assert!(meta.is_none(), "{sql}");
+    }
+    for sql in CONVERTER_REJECTED {
         let parsed = core.parse_sql(sql).expect("parse");
         assert_eq!(
             code(core.describe_parsed_in_session(&session, &parsed)),

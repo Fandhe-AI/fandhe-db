@@ -7,10 +7,8 @@
 //! 結合・一意化・上限の本体は `sql::join::dml`、書き込み・制約検査・世代 bump は `tenant` が担い、
 //! 本モジュールはゲート（`WriteTarget`・台帳・未対応形）と結果・エラーの写像だけを持つ。
 //!
-//! 結線状況（分岐 B）: Issue #1754（構文・束縛）が未マージのため SQL 文字列からの dispatch は
-//! まだ無く、構文段は従来どおり FROM／USING を拒否する（挙動不変）。#1754 のマージ後に `core.rs` の
-//! UPDATE／DELETE 分岐から本入口を呼ぶ（autocommit は `execute_subquery_dml_autocommit` と同じ
-//! 文単位の暗黙トランザクションに流す）。それまで本モジュールは単体テストからのみ到達する。
+//! 結線状況: SQL 入口（`core/dml_from_exec.rs`。Issue #3202）が autocommit の暗黙 Tx・明示 Tx の両方から本入口を
+//! 呼び、台帳（`operation_id`）も Issue #3203 で SQL 経路から渡される。
 //!
 //! テナント境界（P0）: 対象側は既存の候補列挙（テナントのキー範囲に閉じた走査・所有かつ可視）だけ、
 //! FROM／USING 側は書き込むセッションの `PolicyContext`（RLS 暗黙適用）で走査する。エラー文言に
@@ -25,9 +23,6 @@
 //! （`ValidatedUpdateFrom::statement_hash`／`ValidatedDeleteUsing::statement_hash`。結合結果は材料外）を
 //! 受け取り、FROM／USING 側の走査より**前**に台帳を事前照合する（再送は結果・上限・データ変化に
 //! 左右されず `23505`、別文への `operation_id` 再利用は `22023`）。確定記録は書き込み本体が同じ txn で行う。
-
-// 分岐 B では SQL 経路からの呼び出しが無い。#1754 の結線時に撤去する。
-#![allow(dead_code)]
 
 use super::EngineCore;
 use crate::policy::PolicyContext;
@@ -49,6 +44,8 @@ fn not_supported(detail: &str) -> SqlSurfaceError {
 /// （Issue #1756 が FROM 側列参照の RETURNING で使う内部値）。
 pub(crate) struct JoinedDmlOutcome {
     pub(crate) rows_affected: u64,
+    // Issue #3204（FROM 側列参照の RETURNING）が読むまで SQL 経路では未使用。
+    #[allow(dead_code)]
     pub(crate) matches: Vec<(u64, u32)>,
 }
 
