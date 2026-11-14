@@ -675,10 +675,14 @@ mod tests {
     #[test]
     fn bind_rows_rejects_missing_non_nullable_column() {
         let items = rows_from(r#"[{"id":1,"embedding":[1,0,0,0]}]"#);
-        let err = bind_rows(&items, "docs", None, &schema()).expect_err("must reject");
-        // TABLE-16・TASK-204、Issue #904: NOT NULL 違反は `23502`
-        // （`NotNullViolation`）へ写像する（旧 `22000` から契約変更）。
-        assert_eq!(err.wire_code(), "23502");
+        // Issue #3282: 省略された非 nullable 列の `23502` は SQL 行 INSERT と同じく書き込み段へ延期する
+        // （BEFORE ROW トリガが補えるように。書き込み段が補われなければ `23502` で拒否する）。束縛は成功し、
+        // 省略列を `VolatileColumn::MissingNotNull` として運ぶ。
+        let bounds = bind_rows(&items, "docs", None, &schema()).expect("deferred");
+        assert!(bounds[0]
+            .volatile_default_columns
+            .iter()
+            .any(|c| matches!(c, engine::sql::parser::VolatileColumn::MissingNotNull(_))));
     }
 
     #[test]

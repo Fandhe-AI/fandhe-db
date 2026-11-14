@@ -269,3 +269,12 @@ bisect 本体は `git rev-list --bisect <bad> ^<good>` で中点を選び、`run
 - 固定した検査: 単体の差分テスト `direct_observe_matches_two_stage_path`（入力 × 関数 × 値で、`Ok`／`Err` の文言・`finish`・`text_len` が 2 経路で一致）、結合テスト `sql3211_aggregate_direct_observe.rs`（結果型・値・NULL・空集合・GROUP BY・FILTER・window・テナント境界）
 - A/B（同一ホストの壁時計）: 未検証。本変更の作成環境では実施していない。受け入れ条件のうち「#2684 の増分が消える」は、中間値の生成と 2 回目の `match` の除去までが根拠で、実測の回収率は後続の計測で確認する。因果を前後で分ける実験（#2684 以前の直接 match の手移植との比較）も未実施
 - スコープ外: `observe_value` のインライン化の復元（#3209）、agg_multi の残差（#3210）、`VectorColumn` の 1 段化
+
+## #2761 の是正（Issue #3209）
+
+- 原因（コード差分からの推論）: #2761 で `Accumulator::observe_value` が `pub(crate)` になり `sql/window.rs` が 2 つ目の呼び出し元になった。以降、集計の行ループへインライン化されなくなったと見られる。`#[inline(always)]` を付けた実験で元の水準へ戻ったという報告があるが、アセンブリでの確認は未実施
+- 変更: 本体を非公開の `observe_value_inline`（`#[inline(always)]`）へ移し、`observe_value` はそれを呼ぶだけの薄い入口にした。`Accumulator::observe` の `_` 腕は inline 版を直接呼ぶ。`window.rs` は従来どおり入口を呼ぶ。match の分岐・エラー文言は不変
+- 採らなかった案: `observe_value` 自体に `#[inline(always)]` を付ける案。`window.rs` 側にも本体が展開されコードが膨らむため。分離で回復しない場合のフォールバックとする
+- 注記: #3211 により式を含まない入力は `observe_value` を通らない。本変更の対象は式・`VectorColumn` などの `_` 腕に限る
+- 固定した検査: `sql3209_observe_value_inline.rs`（式入力の集計・ウィンドウ集計・整数オーバーフロー・テナント境界）と既存の `direct_observe_matches_two_stage_path`
+- A/B（同一ホストの壁時計）: 未検証。本変更の作成環境では実施していない。受け入れ条件のうち性能回復は充足を主張しない。アセンブリでのインライン確認も未確認
