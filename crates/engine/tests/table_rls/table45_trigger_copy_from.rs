@@ -617,3 +617,43 @@ fn without_trigger_not_null_is_still_23502() {
     let e2 = copy(&core, "t1", &mut a, "COPY nn (a) FROM STDIN", b"1\n").expect_err("omitted");
     assert_eq!(e2.wire_code(), "23502");
 }
+
+// writer を取得済みの明示 Tx（先行の書き込み後）でも、COPY の NOT NULL 検査の遅延は writer 側のトリガ参照で
+// 判定され、INSERT と同じく BEFORE ROW が補える（Issue #3281）。なお `CREATE TRIGGER` 自体は明示 Tx では
+// 未対応のため、同一 Tx で作ったトリガが COPY に見えない状況は現状では起こらない（writer 側参照は将来の
+// 明示 Tx 内 DDL 対応でも食い違わないための備え）。
+#[test]
+fn writer_txn_before_trigger_defers_not_null_for_copy() {
+    let (_g, core) = open("t3281-nn-writer");
+    audit_table(&core);
+    let mut a = tenant_session(&core, "t1");
+    not_null_table(&core, "t1", &mut a, true);
+    let c = ctx("t1");
+    let mut txn = core.new_session_transaction();
+    core.execute_sql_in_txn(&c, &mut a, &mut txn, "BEGIN")
+        .expect("begin");
+    core.execute_sql_in_txn(&c, &mut a, &mut txn, "INSERT INTO audit (n) VALUES (9)")
+        .expect("first write acquires the writer");
+    copy_in(
+        &core,
+        "t1",
+        &mut a,
+        &mut txn,
+        "COPY nn (a, b) FROM STDIN",
+        b"1\t\\N\n",
+    )
+    .expect("null marker filled by BEFORE trigger");
+    copy_in(
+        &core,
+        "t1",
+        &mut a,
+        &mut txn,
+        "COPY nn (a) FROM STDIN",
+        b"2\n",
+    )
+    .expect("omitted column filled by BEFORE trigger");
+    core.execute_sql_in_txn(&c, &mut a, &mut txn, "COMMIT")
+        .expect("commit");
+    assert_eq!(ints(&core, "t1", &mut a, "SELECT a FROM nn"), vec![1, 2]);
+    assert_eq!(ints(&core, "t1", &mut a, "SELECT b FROM nn"), vec![7, 7]);
+}

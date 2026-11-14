@@ -17751,7 +17751,7 @@ impl EngineCore {
             &copy_tokens,
             None,
         )?;
-        self.begin_copy_validated(ctx, session, stmt, None)
+        self.begin_copy_validated(ctx, session, stmt, None, None)
     }
 
     /// `COPY` の未修飾テーブル参照に対する `search_path` の参照ゲート（TABLE-27・Issue #1715）。
@@ -17857,6 +17857,7 @@ impl EngineCore {
         session: &crate::sql::mode::SessionState,
         stmt: crate::sql::allowlist::CopyStatement,
         txn_start_micros: Option<i64>,
+        defer_override: Option<bool>,
     ) -> Result<CopyPlan, crate::sql::allowlist::SqlSurfaceError> {
         match stmt {
             crate::sql::allowlist::CopyStatement::From(v) => {
@@ -17880,18 +17881,9 @@ impl EngineCore {
                 let copy_cols = crate::sql::privilege_gate::copy::copy_from_columns(&v.columns);
                 // BEFORE ROW INSERT トリガのある表は、NOT NULL 検査をトリガ適用後の書き込み段へ遅らせる
                 // （トリガが `\N`・省略列を補えるように。Issue #3281）。読めなければ遅らせない（fail-closed）。
-                let defer_not_null = crate::catalog::trigger::list_triggers_in_source(
-                    &_read_txn,
-                    ctx.tenant_id(),
-                    &v.table_name,
-                )
-                .is_ok_and(|defs| {
-                    defs.iter().any(|t| {
-                        t.events
-                            .contains(crate::catalog::trigger::TriggerEvents::INSERT)
-                            && t.level == crate::catalog::trigger::TriggerLevel::Row
-                            && t.timing == crate::catalog::trigger::TriggerTiming::Before
-                    })
+                // 同一明示 Tx の未 commit DDL（`CREATE TRIGGER`）は writer 側の判定を `defer_override` で受ける。
+                let defer_not_null = defer_override.unwrap_or_else(|| {
+                    Self::has_before_row_insert_trigger(&_read_txn, ctx.tenant_id(), &v.table_name)
                 });
                 Ok(CopyPlan::From(
                     crate::sql::copy::CopyInSession::new(
@@ -18161,7 +18153,36 @@ impl EngineCore {
                 crate::sql::transaction::TxnReadSource::Committed => {}
             }
         }
-        self.begin_copy_validated(ctx, session, stmt, txn.txn_start_micros())
+        // 同一 Tx が writer を持つとき、そこで作った BEFORE ROW INSERT トリガはコミット済みの読み取りには
+        // 見えない。INSERT と同じく writer 側で判定して NOT NULL 検査の遅延を決める（Issue #3281）。
+        let defer_override = match (&stmt, txn.read_source()?) {
+            (
+                crate::sql::allowlist::CopyStatement::From(v),
+                crate::sql::transaction::TxnReadSource::Writer(w),
+            ) => Some(Self::has_before_row_insert_trigger(
+                w,
+                ctx.tenant_id(),
+                &v.table_name,
+            )),
+            _ => None,
+        };
+        self.begin_copy_validated(ctx, session, stmt, txn.txn_start_micros(), defer_override)
+    }
+
+    /// 表に BEFORE ROW INSERT トリガがあるか（COPY の NOT NULL 検査の遅延判定）。読めなければ偽（fail-closed）。
+    fn has_before_row_insert_trigger<R: crate::storage::read_source::ReadSource>(
+        src: &R,
+        tenant: &str,
+        table: &str,
+    ) -> bool {
+        crate::catalog::trigger::list_triggers_in_source(src, tenant, table).is_ok_and(|defs| {
+            defs.iter().any(|t| {
+                t.events
+                    .contains(crate::catalog::trigger::TriggerEvents::INSERT)
+                    && t.level == crate::catalog::trigger::TriggerLevel::Row
+                    && t.timing == crate::catalog::trigger::TriggerTiming::Before
+            })
+        })
     }
 
     /// [`Self::begin_copy`] が返した `CopyPlan::From` セッションへ、CopyDone

@@ -549,6 +549,7 @@ impl EngineCore {
                     session,
                     crate::sql::allowlist::CopyStatement::From(v),
                     txn_start,
+                    None,
                 )?;
                 Ok(Some(match plan {
                     super::CopyPlan::From(copy) => super::CopyPlan::From(copy.with_temp(
@@ -575,6 +576,7 @@ impl EngineCore {
                     ctx,
                     session,
                     crate::sql::allowlist::CopyStatement::To(v),
+                    None,
                     None,
                 )?)),
             },
