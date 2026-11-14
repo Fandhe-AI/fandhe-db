@@ -76,8 +76,11 @@ pub(crate) struct JoinedDmlSource {
     pub(crate) where_predicates: Vec<WherePredicate>,
     /// 走査で取り出す source の列（`schema.columns` の添字）。SET 右辺が参照する列を並べる。
     /// 結合キーの列は不足分が末尾へ自動追加される（[`JoinedDmlPlan::source_columns`]）。
-    /// `RETURNING` が参照する列は SET の列の後ろへ追記される（SET の位置を動かさない。Issue #3204）。
     pub(crate) columns: Vec<usize>,
+    /// `RETURNING` だけが読む source の列（Issue #3204）。SET の式評価ビュー（`source_scalar`）へは
+    /// 載せず、走査投影（[`JoinedDmlPlan::scan_columns`]）の末尾へだけ追記する。VECTOR 等の
+    /// 式評価できない型でも、セルを複製して返せる。
+    pub(crate) returning_columns: Vec<usize>,
     /// `RETURNING` が source の疑似列 `id` を参照するため、結合キーが使わなくても走査で `id` を
     /// 取り出すか（Issue #3204）。
     pub(crate) include_pseudo_id: bool,
@@ -161,6 +164,19 @@ impl JoinedDmlPlan {
         cols
     }
 
+    /// 走査で実際に取り出す列。[`Self::source_columns`]（SET の式評価ビューと同じ並び）の後ろへ、
+    /// `RETURNING` 専用の列で未含のものを追記したもの。セル位置の解決（`RETURNING`・結合キー）は
+    /// これを基準にし、SET ビューは [`Self::source_columns`] のみを使う。
+    pub(crate) fn scan_columns(&self) -> Vec<usize> {
+        let mut cols = self.source_columns();
+        for &c in &self.source.returning_columns {
+            if !cols.contains(&c) {
+                cols.push(c);
+            }
+        }
+        cols
+    }
+
     /// 走査結果の `cells` が先頭に疑似列 `id` を持つか。`build_source_index`（結合キーの位置）・
     /// [`JoinedProbe`]（SET 用のセル開始位置）・`RETURNING`（[`Self::source_cell_position`]）が
     /// 同じ判定を共有し、位置のずれを構造的に防ぐ。
@@ -175,7 +191,7 @@ impl JoinedDmlPlan {
             ColumnSlot::Id if self.source_id_in_cells() => Ok(0),
             ColumnSlot::Id => Err(internal("source pseudo id is not in the scan projection")),
             ColumnSlot::Column(c) => self
-                .source_columns()
+                .scan_columns()
                 .iter()
                 .position(|&x| x == c)
                 .and_then(|p| p.checked_add(id_offset))
@@ -215,7 +231,13 @@ impl JoinedDmlPlan {
                 _ => {}
             }
         }
-        if self.source.columns.iter().any(|&c| c >= s_len) {
+        if self
+            .source
+            .columns
+            .iter()
+            .chain(&self.source.returning_columns)
+            .any(|&c| c >= s_len)
+        {
             return Err(internal("source column out of range"));
         }
         if let Some(u) = &self.update {
@@ -287,7 +309,7 @@ fn build_source_index(
     budget: &mut JoinBudget,
 ) -> Result<SourceIndex, SqlSurfaceError> {
     let schema = &plan.source.schema;
-    let columns = plan.source_columns();
+    let columns = plan.scan_columns();
     let id_needed = plan.source_id_in_cells();
     let id_offset = usize::from(id_needed);
     let mut names: Vec<String> = Vec::with_capacity(columns.len().saturating_add(id_offset));

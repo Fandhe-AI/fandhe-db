@@ -30,6 +30,7 @@ fn plan(keys: Vec<EquiKey>) -> JoinedDmlPlan {
             schema: schema("s", ColumnType::Text),
             where_predicates: Vec::new(),
             columns: vec![2],
+            returning_columns: Vec::new(),
             include_pseudo_id: false,
         },
         keys,

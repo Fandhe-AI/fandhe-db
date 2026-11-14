@@ -239,6 +239,7 @@ fn build_source(
     schema: &TableSchema,
     preds: Vec<WherePredicate>,
     columns: Vec<usize>,
+    returning_columns: Vec<usize>,
     include_pseudo_id: bool,
     udfs: &UdfRegistry,
 ) -> Result<JoinedDmlSource, SqlSurfaceError> {
@@ -249,16 +250,18 @@ fn build_source(
         schema: schema.clone(),
         where_predicates: preds,
         columns,
+        returning_columns,
         include_pseudo_id,
     })
 }
 
-/// `RETURNING` が参照する source（relation 1）の列を、SET の列の後ろへ重複なしで追記する
-/// （SET の位置を動かさない）。疑似列 `id` が参照されていれば真を返す。SET とは違い列型は制限しない
-/// （セルを複製して返すだけで、式評価の入力にしないため）。relation 2 以上は `Internal`。
+/// `RETURNING` が参照する source（relation 1）の列を、SET 用の列とは別の `returning_columns` へ
+/// 重複なしで集める。SET の式評価ビュー（`source_scalar`。VECTOR 等は写像できない）へ載せないため
+/// 分離する。疑似列 `id` が参照されていれば真を返す。列型は制限しない（セルを複製して返すだけ）。
+/// relation 2 以上は `Internal`。
 fn returning_source_columns(
     returning: Option<&BoundFromReturning>,
-    columns: &mut Vec<usize>,
+    returning_columns: &mut Vec<usize>,
 ) -> Result<bool, SqlSurfaceError> {
     let mut include_pseudo_id = false;
     let Some(ret) = returning else {
@@ -270,8 +273,8 @@ fn returning_source_columns(
             1 => match col.slot {
                 ColumnSlot::Id => include_pseudo_id = true,
                 ColumnSlot::Column(i) => {
-                    if !columns.contains(&i) {
-                        columns.push(i);
+                    if !returning_columns.contains(&i) {
+                        returning_columns.push(i);
                     }
                 }
             },
@@ -463,13 +466,15 @@ pub(crate) fn plan_update_from(
         return Err(SqlSurfaceError::feature_not_supported(MULTI_FROM));
     };
     let target = build_target(target_ref.table(), target_schema, &split.target, udfs)?;
-    let (update, mut columns) = plan_set(bound, target_schema, source_schema)?;
-    let include_pseudo_id = returning_source_columns(bound.returning(), &mut columns)?;
+    let (update, columns) = plan_set(bound, target_schema, source_schema)?;
+    let mut returning_columns = Vec::new();
+    let include_pseudo_id = returning_source_columns(bound.returning(), &mut returning_columns)?;
     let source = build_source(
         source_ref.table(),
         source_schema,
         split.source,
         columns,
+        returning_columns,
         include_pseudo_id,
         udfs,
     )?;
@@ -501,13 +506,15 @@ pub(crate) fn plan_delete_using(
         return Err(SqlSurfaceError::feature_not_supported(MULTI_FROM));
     };
     let target = build_target(target_ref.table(), target_schema, &split.target, udfs)?;
-    let mut columns = Vec::new();
-    let include_pseudo_id = returning_source_columns(bound.returning(), &mut columns)?;
+    let columns = Vec::new();
+    let mut returning_columns = Vec::new();
+    let include_pseudo_id = returning_source_columns(bound.returning(), &mut returning_columns)?;
     let source = build_source(
         source_ref.table(),
         source_schema,
         split.source,
         columns,
+        returning_columns,
         include_pseudo_id,
         udfs,
     )?;

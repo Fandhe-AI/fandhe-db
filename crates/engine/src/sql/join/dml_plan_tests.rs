@@ -297,10 +297,13 @@ fn returning_appends_source_columns_after_set_without_moving_them() {
          RETURNING langs.cnt, langs.label, langs.id, docs.n",
     )
     .unwrap();
-    // SET 由来の cnt(5) が先頭、RETURNING 由来の label(1) が続き、キーの lang(0) が最後。
-    assert_eq!(p.source.columns, vec![5, 1]);
+    // SET 由来の cnt(5) だけが式評価ビューの列。RETURNING 専用の列は別に持つ。
+    assert_eq!(p.source.columns, vec![5]);
+    assert_eq!(p.source.returning_columns, vec![5, 1]);
     assert!(p.source.include_pseudo_id);
-    assert_eq!(p.source_columns(), vec![5, 1, 0]);
+    // 式評価ビューの並びは SET + キー（lang(0)）。走査投影はその後ろへ RETURNING 専用の label(1)。
+    assert_eq!(p.source_columns(), vec![5, 0]);
+    assert_eq!(p.scan_columns(), vec![5, 0, 1]);
     let ret = p.returning.as_ref().expect("returning");
     let cells: Vec<Option<usize>> = ret
         .columns
@@ -311,8 +314,8 @@ fn returning_appends_source_columns_after_set_without_moving_them() {
                 .filter(|_| c.relation == 1)
         })
         .collect();
-    // 疑似列 id が位置 0、列は +1（cnt = 1、label = 2）。対象表の列は None。
-    assert_eq!(cells, vec![Some(1), Some(2), Some(0), None]);
+    // 疑似列 id が位置 0、列は +1（cnt = 1、label = 3）。対象表の列は None。
+    assert_eq!(cells, vec![Some(1), Some(3), Some(0), None]);
     assert_eq!(p.update.as_ref().expect("update").items[0].column_index, 2);
 }
 
@@ -321,7 +324,9 @@ fn returning_appends_source_columns_after_set_without_moving_them() {
 fn delete_returning_projects_only_referenced_source_columns() {
     let p = del("DELETE FROM docs USING langs WHERE docs.lang = langs.lang RETURNING langs.label")
         .unwrap();
-    assert_eq!(p.source.columns, vec![1]);
+    assert!(p.source.columns.is_empty());
+    assert_eq!(p.source.returning_columns, vec![1]);
+    assert_eq!(p.scan_columns(), vec![0, 1]);
     assert!(!p.source.include_pseudo_id);
     assert!(p.returning.is_some());
     let none = del("DELETE FROM docs USING langs WHERE docs.lang = langs.lang").unwrap();

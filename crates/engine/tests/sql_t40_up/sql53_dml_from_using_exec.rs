@@ -330,6 +330,32 @@ fn star_expands_target_then_from_and_delete_returns_pre_delete_values() {
     assert_eq!(r.result.rows.len(), 2);
 }
 
+/// `RETURNING` 専用の source 列（VECTOR）は SET の式評価ビューを通らない。SET が source の
+/// 整数列を読む UPDATE・対象表の式だけの UPDATE・DELETE のいずれでも、非 NULL の VECTOR 列を返せる。
+#[test]
+fn returning_source_vector_column_does_not_enter_set_expression_view() {
+    use engine::sql::exec::Cell;
+    let alice = ctx("alice");
+    for sql in [
+        "UPDATE t SET x = s.v FROM s WHERE t.k = s.k RETURNING s.*",
+        "UPDATE t SET x = x + 1 FROM s WHERE t.k = s.k RETURNING s.*",
+        "DELETE FROM t USING s WHERE t.k = s.k RETURNING s.*",
+    ] {
+        let (core, _g) = new_core("sql53-ret-vec");
+        seed(&core, &alice);
+        let r = returning(&core, &alice, sql).expect(sql);
+        assert_eq!(r.rows_affected, 2, "{sql}");
+        assert_eq!(names(&r), vec!["id", "embedding", "k", "v"], "{sql}");
+        assert_eq!(r.result.rows.len(), 2, "{sql}");
+        for row in &r.result.rows {
+            assert!(
+                !matches!(row.cells.get(1), Some(Cell::Null) | None),
+                "{sql}: embedding cell must be returned"
+            );
+        }
+    }
+}
+
 /// 明示 Tx でも同じ結果になり、ROLLBACK で巻き戻る。Describe は Execute と同じ列を返す。
 #[test]
 fn explicit_transaction_and_describe_agree_with_autocommit() {

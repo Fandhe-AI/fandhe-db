@@ -164,6 +164,7 @@ fn plan(keys: Vec<EquiKey>, update: Option<JoinedUpdateSet>) -> JoinedDmlPlan {
             where_predicates: Vec::new(),
             // 結合ビュー上の位置: s_k = 3、s_v = 4。
             columns: vec![1, 2],
+            returning_columns: Vec::new(),
             include_pseudo_id: false,
         },
         keys,
@@ -1077,6 +1078,7 @@ fn update_from_assigns_time_timestamptz_interval_bpchar_and_array_source_columns
             schema: ss,
             where_predicates: Vec::new(),
             columns: vec![2, 3, 4, 5, 6],
+            returning_columns: Vec::new(),
             include_pseudo_id: false,
         },
         keys: vec![EquiKey {
