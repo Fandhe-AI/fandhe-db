@@ -7739,6 +7739,9 @@ impl EngineCore {
                     | Err(crate::sql::allowlist::SqlSurfaceError::ViewNotAutoUpdatable {
                         ..
                     }) => {}
+                    // `WHERE` 内サブクエリの拒否は自動書き換え固有の検証。INSTEAD OF トリガがあれば不要なので
+                    // 実行段（トリガ有無の確定後）へ回す。
+                    Err(e) if crate::sql::view_dml::is_where_subquery_rejection(&e) => {}
                     Err(e) => return Err(e),
                 }
                 return Ok(ParsedSql::ViewDelete(view_stmt));
@@ -7811,6 +7814,9 @@ impl EngineCore {
                     | Err(crate::sql::allowlist::SqlSurfaceError::ViewNotAutoUpdatable {
                         ..
                     }) => {}
+                    // `WHERE` 内サブクエリの拒否は自動書き換え固有の検証。INSTEAD OF トリガがあれば不要なので
+                    // 実行段（トリガ有無の確定後）へ回す。
+                    Err(e) if crate::sql::view_dml::is_where_subquery_rejection(&e) => {}
                     Err(e) => return Err(e),
                 }
                 return Ok(ParsedSql::ViewUpdate(view_stmt));
@@ -9630,11 +9636,12 @@ impl EngineCore {
             ParsedSql::ViewInsert(stmt) => {
                 // 書き込みテナント自身の INSTEAD OF トリガがあれば、更新可能ビューでもトリガを優先する
                 // （Issue #3193）。無ければ従来の自動書き換え経路。
-                if self.view_has_instead_of(
+                // writer を取得したうえで、その同じカタログからトリガの有無を決める（取得前の判定だと、判定後に
+                // commit した並行 `CREATE TRIGGER` を見落として基表へ直接書く）。
+                if self.autocommit_view_has_instead_of(
                     ctx,
                     stmt.view_name(),
                     crate::catalog::trigger::TriggerEvents::INSERT,
-                    None,
                 )? {
                     return self
                         .execute_view_instead_of(
@@ -9649,16 +9656,21 @@ impl EngineCore {
                     || crate::tenant::WriteTarget::Autocommit(&self.storage),
                     ctx,
                     stmt,
+                    Some(crate::sql::view_write_scope::InsteadOfGuard::new(
+                        ctx.tenant_id(),
+                        crate::catalog::trigger::TriggerEvents::INSERT,
+                    )),
                 )
                 .map(|(outcome, _base_table)| outcome)
             }
             // ビューへの DELETE／UPDATE（TABLE-43・Issue #1672）。基表形へ書き換えて既存の基表 DML 経路へ流す。
             ParsedSql::ViewDelete(stmt) => {
-                if self.view_has_instead_of(
+                // writer を取得したうえで、その同じカタログからトリガの有無を決める（取得前の判定だと、判定後に
+                // commit した並行 `CREATE TRIGGER` を見落として基表へ直接書く）。
+                if self.autocommit_view_has_instead_of(
                     ctx,
                     stmt.view_name(),
                     crate::catalog::trigger::TriggerEvents::DELETE,
-                    None,
                 )? {
                     return self
                         .execute_view_instead_of(
@@ -9674,15 +9686,20 @@ impl EngineCore {
                     ctx,
                     session,
                     stmt,
+                    Some(crate::sql::view_write_scope::InsteadOfGuard::new(
+                        ctx.tenant_id(),
+                        crate::catalog::trigger::TriggerEvents::DELETE,
+                    )),
                 )
                 .map(|(outcome, _base_table)| outcome)
             }
             ParsedSql::ViewUpdate(stmt) => {
-                if self.view_has_instead_of(
+                // writer を取得したうえで、その同じカタログからトリガの有無を決める（取得前の判定だと、判定後に
+                // commit した並行 `CREATE TRIGGER` を見落として基表へ直接書く）。
+                if self.autocommit_view_has_instead_of(
                     ctx,
                     stmt.view_name(),
                     crate::catalog::trigger::TriggerEvents::UPDATE,
-                    None,
                 )? {
                     return self
                         .execute_view_instead_of(
@@ -9698,6 +9715,10 @@ impl EngineCore {
                     ctx,
                     session,
                     stmt,
+                    Some(crate::sql::view_write_scope::InsteadOfGuard::new(
+                        ctx.tenant_id(),
+                        crate::catalog::trigger::TriggerEvents::UPDATE,
+                    )),
                 )
                 .map(|(outcome, _base_table)| outcome)
             }
@@ -10992,6 +11013,7 @@ impl EngineCore {
                     || crate::tenant::WriteTarget::InTxn(write_txn),
                     ctx,
                     stmt,
+                    None,
                 )?;
                 txn.mark_written(ctx.tenant_id(), &base_table);
                 Ok(outcome)
@@ -11026,6 +11048,7 @@ impl EngineCore {
                     ctx,
                     session,
                     stmt,
+                    None,
                 )?;
                 txn.mark_written(ctx.tenant_id(), &base_table);
                 Ok(outcome)
@@ -11058,6 +11081,7 @@ impl EngineCore {
                     ctx,
                     session,
                     stmt,
+                    None,
                 )?;
                 txn.mark_written(ctx.tenant_id(), &base_table);
                 Ok(outcome)
@@ -20209,6 +20233,7 @@ impl EngineCore {
             crate::sql::SqlOutcome,
             crate::sql::allowlist::SqlSurfaceError,
         >,
+        instead_of_guard: Option<crate::sql::view_write_scope::InsteadOfGuard>,
     ) -> Result<(crate::sql::SqlOutcome, String), crate::sql::allowlist::SqlSurfaceError> {
         use crate::sql::allowlist::SqlSurfaceError;
         // 並行 DDL による再試行の上限（`CREATE OR REPLACE VIEW` の再試行と同じ小さな固定値の考え方）。
@@ -20234,7 +20259,15 @@ impl EngineCore {
                 &base_table,
                 check_predicates,
             );
+            if let Some(guard) = &instead_of_guard {
+                scope.require_no_instead_of(guard.clone());
+            }
             let result = execute(prepared);
+            // 書き込み txn の中で、振り分け後に INSTEAD OF トリガが commit されていたと分かった。基表へは書かず
+            // （書き込み前に中断）、再試行を促す（`55P03`）。トリガ経路へは振り分け直さない。
+            if scope.trigger_appeared() {
+                return Err(SqlSurfaceError::LockNotAvailable);
+            }
             if scope.mismatched() {
                 continue;
             }
@@ -20264,6 +20297,7 @@ impl EngineCore {
         make_target: impl Fn() -> crate::tenant::WriteTarget<'t>,
         ctx: &PolicyContext,
         stmt: &crate::sql::allowlist::ValidatedViewInsert,
+        instead_of_guard: Option<crate::sql::view_write_scope::InsteadOfGuard>,
     ) -> Result<(crate::sql::SqlOutcome, String), crate::sql::allowlist::SqlSurfaceError> {
         use crate::sql::allowlist::SqlSurfaceError;
         self.run_view_write(
@@ -20317,6 +20351,7 @@ impl EngineCore {
                         .map(crate::sql::SqlOutcome::Insert)
                 }
             },
+            instead_of_guard,
         )
     }
 
@@ -20332,6 +20367,7 @@ impl EngineCore {
         ctx: &PolicyContext,
         session: &crate::sql::mode::SessionState,
         stmt: &crate::sql::allowlist::ValidatedViewDelete,
+        instead_of_guard: Option<crate::sql::view_write_scope::InsteadOfGuard>,
     ) -> Result<(crate::sql::SqlOutcome, String), crate::sql::allowlist::SqlSurfaceError> {
         use crate::sql::allowlist::DeleteStatement;
         self.run_view_write(
@@ -20364,6 +20400,7 @@ impl EngineCore {
                         .map(crate::sql::SqlOutcome::Delete),
                 }
             },
+            instead_of_guard,
         )
     }
 
@@ -20376,6 +20413,7 @@ impl EngineCore {
         ctx: &PolicyContext,
         session: &crate::sql::mode::SessionState,
         stmt: &crate::sql::allowlist::ValidatedViewUpdate,
+        instead_of_guard: Option<crate::sql::view_write_scope::InsteadOfGuard>,
     ) -> Result<(crate::sql::SqlOutcome, String), crate::sql::allowlist::SqlSurfaceError> {
         use crate::sql::allowlist::ValidatedUpdateForm;
         self.run_view_write(
@@ -20415,6 +20453,7 @@ impl EngineCore {
                     .map(crate::sql::SqlOutcome::Update)
                 }
             },
+            instead_of_guard,
         )
     }
 

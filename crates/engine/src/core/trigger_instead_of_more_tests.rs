@@ -348,3 +348,27 @@ fn other_tenants_rows_never_reach_old() {
     assert_eq!(count(&core, "t1", "DELETE FROM s.nv"), 1);
     assert_eq!(audit(&core, "del"), vec![1]);
 }
+
+// 更新可能ビューでも、INSTEAD OF トリガがあれば `WHERE` 内サブクエリ付きの UPDATE・DELETE が構文解析段で
+// 拒否されず、トリガへ届く。トリガが無ければ自動書き換えの固定の拒否（`42601`）のまま。
+#[test]
+fn where_subquery_reaches_trigger_on_updatable_view() {
+    let (core, _g) = core_with("instof-subq");
+    setup(&core);
+    ok(&core, "t1", "INSERT INTO s.tt (n) VALUES (1)");
+    ok(&core, "t1", "INSERT INTO s.tt (n) VALUES (2)");
+    let upd = "UPDATE s.uv SET n = 9 WHERE n IN (SELECT n FROM s.tt WHERE n = 1)";
+    let del = "DELETE FROM s.uv WHERE n IN (SELECT n FROM s.tt WHERE n = 2)";
+    assert_eq!(code(&core, "t1", upd), "42601");
+    assert_eq!(code(&core, "t1", del), "42601");
+    audit_triggers(&core, "t1", "s.uv");
+    assert_eq!(count(&core, "t1", upd), 1);
+    assert_eq!(count(&core, "t1", del), 1);
+    assert_eq!(audit(&core, "upd"), vec![9]);
+    assert_eq!(audit(&core, "del"), vec![2]);
+    // 基表には直接書かれない。
+    assert_eq!(
+        ints(&core, "t1", "SELECT n FROM s.tt ORDER BY n"),
+        vec![1, 2]
+    );
+}

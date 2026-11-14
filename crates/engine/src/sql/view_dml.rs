@@ -134,6 +134,18 @@ fn reject_partitioned() -> SqlSurfaceError {
     SqlSurfaceError::feature_not_supported("PARTITIONED is not supported on views")
 }
 
+/// ビュー経由の DML の `WHERE` 内サブクエリを拒否する固定文言（自動書き換え固有の検証。
+/// INSTEAD OF トリガ〔Issue #3193〕の経路ではこの制限は掛からない）。
+const WHERE_SUBQUERY_UNSUPPORTED: &str =
+    "subquery in WHERE is not supported for DML through a view";
+
+/// `e` が [`merge_predicates`] の `WHERE` 内サブクエリ拒否か。構文解析段は、この拒否を実行段へ回す
+/// （トリガの有無は書き込みテナントの scope の確定済みカタログでしか決まらず、トリガが有れば自動書き換えの
+/// 検証は不要なため。トリガが無ければ実行段の書き換えが同じ拒否を返す）。
+pub(crate) fn is_where_subquery_rejection(e: &SqlSurfaceError) -> bool {
+    matches!(e, SqlSurfaceError::UnsupportedSyntax { detail } if detail == WHERE_SUBQUERY_UNSUPPORTED)
+}
+
 /// 述語形 `WHERE` を公開名で検査してから物理名へ写し、ビューの述語を前に合成する。
 fn merge_predicates(
     rv: &ResolvedView,
@@ -145,9 +157,7 @@ fn merge_predicates(
         .iter()
         .any(crate::sql::subquery::predicate_contains_subquery)
     {
-        return Err(SqlSurfaceError::unsupported(
-            "subquery in WHERE is not supported for DML through a view",
-        ));
+        return Err(SqlSurfaceError::unsupported(WHERE_SUBQUERY_UNSUPPORTED));
     }
     check_columns_within_view(
         rv.view_columns.as_deref(),

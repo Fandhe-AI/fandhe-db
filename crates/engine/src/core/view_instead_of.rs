@@ -126,6 +126,26 @@ impl EngineCore {
         }))
     }
 
+    /// autocommit 用: 書き込みゲート（単一ライタ）を取得してから、その同じカタログで [`Self::view_has_instead_of`]
+    /// と同じ判定を行う（取得前の確定済みカタログで判定すると、判定後に commit した並行 `CREATE TRIGGER` を
+    /// 見落として基表へ直接書く。D3・D5）。判定後は書き込み txn を abort で閉じる。残る隙間は、基表書き込み側の
+    /// 書き込み txn 冒頭の再照合（[`crate::sql::view_write_scope::InsteadOfGuard`]）が塞ぐ。
+    pub(super) fn autocommit_view_has_instead_of(
+        &self,
+        ctx: &PolicyContext,
+        view_key: &str,
+        event: u8,
+    ) -> Result<bool, SqlSurfaceError> {
+        let write_txn = self
+            .storage
+            .begin_write_txn()
+            .map_err(crate::catalog::convert_storage_error)
+            .map_err(instead_of_catalog_error)?;
+        let hit = self.view_has_instead_of(ctx, view_key, event, Some(&write_txn))?;
+        drop(write_txn);
+        Ok(hit)
+    }
+
     /// Describe（拡張クエリの Bind・Describe）用: セッション自身のテナントの scope に該当イベントの INSTEAD OF
     /// トリガがあるビューなら、`RETURNING` なしの文として列メタ無しで受理してよい（`true`）。`RETURNING` 付きは
     /// 未対応形として固定文言の `0A000`。トリガが無い、またはテナントが未束縛なら `false`（従来どおり自動書き換えの
