@@ -324,7 +324,7 @@ MAX_SCAN_RESULT_BYTES`・`sql::exec::MAX_CANDIDATE_SCALAR_BYTES` と同じ
 - **応答**: `SqlOutcome::Returning`。`rows_affected` は書き込み層の実変更行数で、RLS 再判定で返却行数が減っても独立。Describe は同じ列を返す。
 - **PG 17.11 との照合**: 非修飾の両表共通列は `42702`、`<公開名>.*` は該当表の全列、`AS` 別名は本リポでは `42601`（受理範囲を広げない）。
 - **併用**: `RETURNING ... USING OPERATION_ID` は台帳結線済み（#3203）で受理する。
-- **まだ拒否する形**: トリガのある対象表は単一表の `RETURNING` と同じ契約で `0A000`。
+- **まだ拒否する形**: トリガのある対象表は `0A000`（単一表の `RETURNING` は Issue #3192 で発火するが、結合形は通過証を渡さない）。
   FROM／USING が 2 表以上は変換器の `0A000`、式・関数・別名は `42601`（Phase 3）。FROM 側表の `SELECT` 権限が無いロールは `42501`（結合テストで固定）。
 
 ## 対象外・申し送り
@@ -337,3 +337,22 @@ MAX_SCAN_RESULT_BYTES`・`sql::exec::MAX_CANDIDATE_SCALAR_BYTES` と同じ
   列権限は SQL より厳しい側（fail-closed）に倒れる（精密化は #3003 の申し送り）。`search`／`scan`／
   `aggregate` に `returning` は無い。`upsert` の `returning` は実行器（#2087）の結線後。
 - **3 クライアント層 B**: Issue #1347 で `three_client_e2e.rs::three_clients_receive_returning_rows_and_command_tags` を追加済み（`make e2e-three-client`・opt-in。詳細は `three-client-e2e-harness.md`「RETURNING」節）。拡張クエリ・明示トランザクション内は対象外。
+
+## トリガ付き表の RETURNING（Issue #3192・TABLE-45・SQL-21 のポインタ）
+
+INSERT／UPDATE／DELETE の該当イベントにトリガのある表でも、`RETURNING` 付きの文はトリガを発火する。
+
+- **返る行**: 投影は txn 内・commit 前に、トリガ適用段の行ごとループが書き込み直後に呼ぶ。INSERT・UPDATE は BEFORE の連鎖後・
+  NOT NULL 検査後・行書き込み後の最終 NEW、DELETE は BEFORE を通って実際に削除した行の削除前の値を返す。BEFORE が `NULL` を返して
+  スキップした行は影響行数にも返却にも出ない。AFTER 系（ROW・STATEMENT）は返却へ影響しない。
+- **投影の実体は 1 つ**: 既存の `returning_collector`（RLS 再判定・文全体のバイト予算・`try_reserve`）をそのまま使い、第 2 の
+  投影実装を作らない。投影の失敗は write txn の abort で、行・台帳・トリガが書いた行は残らない。
+- **INSERT の 2 経路**: トリガの無い表は従来どおり書き込み前に束縛値を投影する（バイト不変）。トリガ経路は
+  `InsertWriteReport::trigger_path` が真のとき、txn 内コールバックで集めた行を採用する（事前投影は fail-fast の予算検査として残す。
+  採番値は `final_row` に入っているため書き込み後の再投影は行わず、採番の受け渡し値だけ排出する）。
+- **テナント境界**: トリガの分類は書き込みテナント自身の定義だけを見る。不在・他テナント・不可視の id は空の候補で同じ経路を通り、
+  応答に存在差を出さない（RLS-9・RLS-10）。
+- **範囲外（`0A000` のまま・台帳を消費しない）**: UPSERT、結合形（`UPDATE ... FROM`／`DELETE ... USING`）の `RETURNING`、
+  分割実行 DML、COPY、NoSQL、生の行 API、トリガ本体内の `RETURNING`。
+- **テスト**: `core/trigger_returning_tests.rs`、`tests/table_rls/table45_trigger_fire.rs`、
+  `crates/wire-server/tests/wire_sql/wire_trigger_fire.rs`（末尾 `;` の単独送信・拡張クエリ）。

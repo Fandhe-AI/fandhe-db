@@ -797,6 +797,7 @@ fn chunk_loop<E>(
                     &candidate_ids,
                     plan,
                     &writes,
+                    None,
                     Some(&mut stop_by_hold),
                 ),
                 Kind::Update {
@@ -816,6 +817,7 @@ fn chunk_loop<E>(
                     },
                     plan,
                     &writes,
+                    None,
                     Some(&mut stop_by_hold),
                 ),
             }

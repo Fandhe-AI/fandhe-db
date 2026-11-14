@@ -530,7 +530,7 @@ fn sibling_branch_trigger_does_not_inflate_cousin_depth() {
     }
 }
 
-// 子表の文トリガ・結線の無い経路（RETURNING 付き）は、固定文言の `0A000` のまま。
+// 子表の文トリガ・結線の無い経路（結合形の RETURNING 付き）は、固定文言の `0A000` のまま。
 #[test]
 fn statement_trigger_on_child_and_unwired_paths_are_rejected() {
     let dir = tempdir();
@@ -548,7 +548,7 @@ fn statement_trigger_on_child_and_unwired_paths_are_rejected() {
         code(
             &core,
             "tenant-a",
-            "DELETE FROM par WHERE k = 1 RETURNING k USING OPERATION_ID 'u1'"
+            "DELETE FROM par USING ch WHERE par.k = ch.parent_id RETURNING ch.parent_id"
         ),
         "0A000"
     );

@@ -2039,6 +2039,7 @@ pub fn insert_typed_row(
         &[],
         false,
         None,
+        None,
     )
     .map(|_| ())
 }
@@ -2081,6 +2082,10 @@ pub(crate) fn insert_typed_row_unchecked(
     volatile_default_columns: &[VolatileColumn],
     id_omitted: bool,
     triggers: Option<&crate::trigger::TriggerRuntime>,
+    // `RETURNING` の投影（Issue #3192）。`triggers` で INSERT トリガを発火する経路だけが使い、書いた行の
+    // 最終 NEW を commit 前に渡す（[`trigger_insert::write_rows_with_triggers`]）。トリガの無い表では
+    // 呼ばない（呼び出し元の事前投影が有効。[`InsertWriteReport::trigger_path`] で判別する）。
+    project: Option<&mut ReturningProjectFn<'_>>,
 ) -> Result<InsertWriteReport, TenantWriteError> {
     insert_typed_row_impl(
         false,
@@ -2095,6 +2100,7 @@ pub(crate) fn insert_typed_row_unchecked(
         volatile_default_columns,
         id_omitted,
         triggers,
+        project,
     )
 }
 
@@ -2114,6 +2120,7 @@ fn insert_typed_row_impl(
     volatile_default_columns: &[VolatileColumn],
     id_omitted: bool,
     triggers: Option<&crate::trigger::TriggerRuntime>,
+    project: Option<&mut ReturningProjectFn<'_>>,
 ) -> Result<InsertWriteReport, TenantWriteError> {
     validate_relation_key(table)?;
     target.with_txn(|write_txn| {
@@ -2271,6 +2278,7 @@ fn insert_typed_row_impl(
                 &[(row_id, values)],
                 chain,
                 &trigger_writes,
+                project,
             )?;
             return finish_trigger_insert(
                 write_txn,
@@ -2324,8 +2332,26 @@ fn insert_typed_row_impl(
             target.fk_check_mode(),
             crate::constraint::RowPolicyWrite::Insert,
         )?;
+        // 呼び出し元が事前投影を省いた後に最後の INSERT トリガが DROP されると、この非トリガ経路へ来る
+        // （Issue #3192）。commit 後に予算超過（`54000`）で失敗して行・台帳だけが残るのを防ぐため、
+        // 書いた値の投影（予算検査）を commit 前のこの txn 内で行う（失敗は txn の abort）。
+        if let Some(project) = project {
+            project(&CapturedRow {
+                id: row_id.legacy_id(),
+                tenant_id: ctx.tenant_id().to_string(),
+                visibility,
+                origin: CapturedRowOrigin::Inserted,
+                values: values.to_vec(),
+            })?;
+        }
         crate::catalog::bump_table_generation_in_txn(write_txn, table)?;
-        Ok((InsertWriteReport { rows_written: 1 }, TxnEffect::Wrote))
+        Ok((
+            InsertWriteReport {
+                rows_written: 1,
+                trigger_path: false,
+            },
+            TxnEffect::Wrote,
+        ))
     })
 }
 
@@ -2363,7 +2389,13 @@ fn finish_trigger_insert(
     } else {
         TxnEffect::NoOp
     };
-    Ok((InsertWriteReport { rows_written }, effect))
+    Ok((
+        InsertWriteReport {
+            rows_written,
+            trigger_path: true,
+        },
+        effect,
+    ))
 }
 
 /// 型付き INSERT の書き込み結果（Issue #1723）。BEFORE ROW トリガが `NULL` を返した行は書かれないため、
@@ -2373,6 +2405,10 @@ fn finish_trigger_insert(
 pub(crate) struct InsertWriteReport {
     /// 実際に行ストアへ書いた行数。
     pub(crate) rows_written: u64,
+    /// INSERT トリガ経路（[`trigger_insert::write_rows_with_triggers`]）で書いたか（Issue #3192）。
+    /// 真なら `RETURNING` の行は呼び出し元が渡した `project` が txn 内で受け取った最終 NEW で、
+    /// 呼び出し元の事前投影（書き込み予定値）は使わない。全行 `NULL` 返却でスキップした場合も真。
+    pub(crate) trigger_path: bool,
 }
 
 /// INSERT トリガのある表への、発火に未対応の書き込み経路を固定文言の `0A000` で拒否する
@@ -2612,6 +2648,8 @@ pub(crate) fn insert_typed_rows_unchecked(
     expected_schema: Option<&crate::catalog::TableSchema>,
     volatile_default_columns: VolatileDefaultColumns<'_>,
     triggers: Option<&crate::trigger::TriggerRuntime>,
+    // `RETURNING` の投影（Issue #3192）。[`insert_typed_row_unchecked`] の同名引数と同じ契約。
+    mut project: Option<&mut ReturningProjectFn<'_>>,
 ) -> Result<InsertWriteReport, TenantWriteError> {
     validate_relation_key(table)?;
     if !rows.is_empty() {
@@ -2855,6 +2893,7 @@ pub(crate) fn insert_typed_rows_unchecked(
                     &trigger_rows,
                     chain,
                     &trigger_writes,
+                    project,
                 )?;
                 return finish_trigger_insert(
                     write_txn,
@@ -2897,6 +2936,17 @@ pub(crate) fn insert_typed_rows_unchecked(
                 let key = row_key(ctx.tenant_id(), row_id);
                 let encoded = encode_row(&row)?;
                 insert_unique_row(write_txn, table, &mut row_table, key, encoded.as_slice())?;
+                // トリガ判定後の並行 DROP でこの非トリガ経路へ来た場合の予算検査を commit 前に行う
+                // （単一行経路と同じ理由。Issue #3192）。
+                if let Some(project) = project.as_mut() {
+                    project(&CapturedRow {
+                        id: row_id.legacy_id(),
+                        tenant_id: ctx.tenant_id().to_string(),
+                        visibility,
+                        origin: CapturedRowOrigin::Inserted,
+                        values: values.to_vec(),
+                    })?;
+                }
             }
             drop(row_table);
             row_ids
@@ -2923,7 +2973,13 @@ pub(crate) fn insert_typed_rows_unchecked(
                 "insert row count overflow".to_string(),
             ))
         })?;
-        Ok((InsertWriteReport { rows_written }, TxnEffect::Wrote))
+        Ok((
+            InsertWriteReport {
+                rows_written,
+                trigger_path: false,
+            },
+            TxnEffect::Wrote,
+        ))
     })
 }
 
@@ -5225,6 +5281,7 @@ pub(crate) fn update_row_columns_unchecked(
         ledger_write,
         expected_schema,
         None,
+        None,
     )
 }
 
@@ -5250,6 +5307,8 @@ pub(crate) fn update_row_columns_capturing_unchecked(
     ledger_write: LedgerWrite<'_>,
     expected_schema: Option<&crate::catalog::TableSchema>,
     project: Option<&mut ReturningProjectFn<'_>>,
+    // UPDATE トリガの通過証（Issue #3192）。`RETURNING` 付きでも該当トリガを発火する。
+    triggers: Option<&crate::trigger::TriggerRuntime>,
 ) -> Result<usize, TenantWriteError> {
     update_row_columns_impl(
         target,
@@ -5261,7 +5320,7 @@ pub(crate) fn update_row_columns_capturing_unchecked(
         ledger_write,
         expected_schema,
         project,
-        None,
+        triggers,
     )
 }
 
@@ -5294,7 +5353,8 @@ pub(crate) fn update_row_columns_with_triggers(
 }
 
 /// [`update_row_columns_capturing_unchecked`]・[`update_row_columns_with_triggers`] の共有実体。
-/// `triggers` は `project`（`RETURNING`）が `Some` のとき常に未結線として扱う（`0A000`）。
+/// `project`（`RETURNING`）は UPDATE トリガ経路でも、書いた最終 NEW を commit 前に受け取る
+/// （[`trigger_dml::update_rows_with_triggers`]。Issue #3192）。
 #[allow(clippy::too_many_arguments)]
 fn update_row_columns_impl(
     target: WriteTarget<'_>,
@@ -5311,7 +5371,6 @@ fn update_row_columns_impl(
     triggers: Option<&crate::trigger::TriggerRuntime>,
 ) -> Result<usize, TenantWriteError> {
     validate_relation_key(table)?;
-    let triggers = if project.is_some() { None } else { triggers };
     target.with_txn(|write_txn| {
         let rows_affected: usize;
         let mut captured_row: Option<CapturedRow> = None;
@@ -5541,6 +5600,7 @@ fn update_row_columns_impl(
                     },
                     &plan,
                     &writes,
+                    project.as_deref_mut(),
                     None,
                 )?;
                 // commit 記録（SQL-38・Issue #2404）: 0 行でも世代を進める経路のため表を記録する。
@@ -5990,14 +6050,13 @@ fn delete_row_impl(
     not_found_ledger: DeleteNotFoundLedger,
     scope: DeleteScope,
     mut capture: Option<DeleteCapture<'_>>,
-    // DELETE トリガの通過証（Issue #1725）。`capture`（`RETURNING`）が `Some` のときは常に未結線として扱う
-    // （`0A000`）。
+    // DELETE トリガの通過証（Issue #1725）。`capture`（`RETURNING`）付きでも発火し、`capture.project` は
+    // 削除した行の削除前の値を commit 前に受け取る（Issue #3192）。
     triggers: Option<&crate::trigger::TriggerRuntime>,
     // 束縛時スキーマとの照合だけを行う引数（`capture` と独立。Issue #3282）。不一致は `capture` と同じ扱い。
     expected_schema: Option<&crate::catalog::TableSchema>,
 ) -> Result<(DeleteRowOutcome, Option<CapturedRow>), TenantWriteError> {
     validate_relation_key(table)?;
-    let triggers = if capture.is_some() { None } else { triggers };
     target.with_txn(|write_txn| {
         let mut captured_row: Option<CapturedRow> = None;
         // `ON DELETE` 参照アクション（Issue #1076 A14）の連鎖起点。削除された行が
@@ -6117,7 +6176,16 @@ fn delete_row_impl(
                 // 不在・他テナント・不可視の id でも空の対象で同じ経路を通す（AFTER STATEMENT を発火）。
                 let candidates: &[u64] = if is_target { &[id] } else { &[] };
                 let done = trigger_dml::delete_rows_with_triggers(
-                    write_txn, &target, table, ctx, &schema, candidates, &plan, &writes, None,
+                    write_txn,
+                    &target,
+                    table,
+                    ctx,
+                    &schema,
+                    candidates,
+                    &plan,
+                    &writes,
+                    capture.as_mut().and_then(|c| c.project.as_deref_mut()),
+                    None,
                 )?;
                 if done.applied > 0 || done.trigger_wrote {
                     // commit 記録（SQL-38・Issue #2404）: 0 行でも世代を進める経路のため表を記録する。
@@ -6351,7 +6419,7 @@ pub(crate) fn delete_row_ledgered_unchecked(
     id: u64,
     ledger_write: LedgerWrite<'_>,
 ) -> Result<DeleteRowOutcome, TenantWriteError> {
-    delete_row_ledgered_capturing_unchecked(target, table, ctx, id, ledger_write, None, None)
+    delete_row_ledgered_capturing_unchecked(target, table, ctx, id, ledger_write, None, None, None)
         .map(|(outcome, _)| outcome)
 }
 
@@ -6363,6 +6431,7 @@ pub(crate) fn delete_row_ledgered_unchecked(
 /// ための注入点。`delete_row_impl` ドキュメント参照）。`sql::exec::
 /// execute_delete_returning` の唯一の到達経路。`capture: None`・`project: None`
 /// を渡すと [`delete_row_ledgered_unchecked`] とビット同一。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn delete_row_ledgered_capturing_unchecked<'a>(
     target: WriteTarget<'_>,
     table: &str,
@@ -6371,6 +6440,8 @@ pub(crate) fn delete_row_ledgered_capturing_unchecked<'a>(
     ledger_write: LedgerWrite<'_>,
     capture: Option<&'a crate::catalog::TableSchema>,
     project: Option<&'a mut ReturningProjectFn<'a>>,
+    // DELETE トリガの通過証（Issue #3192）。`RETURNING` 付きでも該当トリガを発火する。
+    triggers: Option<&crate::trigger::TriggerRuntime>,
 ) -> Result<(DeleteRowOutcome, Option<CapturedRow>), TenantWriteError> {
     delete_row_impl(
         target,
@@ -6381,7 +6452,7 @@ pub(crate) fn delete_row_ledgered_capturing_unchecked<'a>(
         DeleteNotFoundLedger::Record,
         DeleteScope::OwnedVisible,
         capture.map(|schema| DeleteCapture { schema, project }),
-        None,
+        triggers,
         None,
     )
 }
@@ -6899,6 +6970,8 @@ pub(crate) fn delete_rows_where_capturing_unchecked<E>(
     predicate: impl FnMut(&DmlCandidate<'_>) -> Result<bool, E>,
     project: &mut ReturningProjectFn<'_>,
     reads_existing: bool,
+    // トリガの通過証（Issue #3192）。`RETURNING` 付きでも該当トリガを発火する。
+    triggers: Option<&crate::trigger::TriggerRuntime>,
 ) -> Result<PredicateDmlOutcome, PredicateDmlError<E>> {
     delete_rows_where_impl(
         target,
@@ -6912,7 +6985,7 @@ pub(crate) fn delete_rows_where_capturing_unchecked<E>(
         max_scanned_rows,
         predicate,
         Some(project),
-        None,
+        triggers,
         reads_existing,
     )
 }
@@ -6931,13 +7004,13 @@ fn delete_rows_where_impl<E>(
     limit: Option<std::num::NonZeroUsize>,
     max_scanned_rows: usize,
     mut predicate: impl FnMut(&DmlCandidate<'_>) -> Result<bool, E>,
-    project: Option<&mut ReturningProjectFn<'_>>,
-    // DELETE トリガの通過証（Issue #1725）。`RETURNING` 付きは常に未結線として扱う（`0A000`）。
+    mut project: Option<&mut ReturningProjectFn<'_>>,
+    // DELETE トリガの通過証（Issue #1725）。`RETURNING` 付きでも発火し、`project` は削除した行の削除前の値を
+    // commit 前に受け取る（Issue #3192）。
     triggers: Option<&crate::trigger::TriggerRuntime>,
     reads_existing: bool,
 ) -> Result<PredicateDmlOutcome, PredicateDmlError<E>> {
     validate_relation_key(table).map_err(dml_write_err)?;
-    let triggers = if project.is_some() { None } else { triggers };
     target.with_txn(|write_txn| {
         // 文ごとに 1 個の書き込み窓口（BEFORE STATEMENT・行トリガ・AFTER STATEMENT が共有。Issue #1726）。
         let trigger_writes = trigger_insert_writes(write_txn, ctx, triggers);
@@ -7043,6 +7116,7 @@ fn delete_rows_where_impl<E>(
                 &candidate_ids,
                 &plan,
                 &trigger_writes,
+                project.as_deref_mut(),
                 None,
             )?;
             if done.applied > 0 || done.trigger_wrote {
@@ -7210,6 +7284,8 @@ pub(crate) fn update_rows_where_capturing_unchecked<E>(
     predicate: impl FnMut(&DmlCandidate<'_>) -> Result<bool, E>,
     project: &mut ReturningProjectFn<'_>,
     reads_existing: bool,
+    // トリガの通過証（Issue #3192）。`RETURNING` 付きでも該当トリガを発火する。
+    triggers: Option<&crate::trigger::TriggerRuntime>,
 ) -> Result<PredicateDmlOutcome, PredicateDmlError<E>> {
     update_rows_where_impl(
         target,
@@ -7226,7 +7302,7 @@ pub(crate) fn update_rows_where_capturing_unchecked<E>(
         max_scanned_rows,
         predicate,
         Some(project),
-        None,
+        triggers,
         reads_existing,
     )
 }
@@ -7248,13 +7324,13 @@ fn update_rows_where_impl<E>(
     limit: Option<std::num::NonZeroUsize>,
     max_scanned_rows: usize,
     mut predicate: impl FnMut(&DmlCandidate<'_>) -> Result<bool, E>,
-    project: Option<&mut ReturningProjectFn<'_>>,
-    // UPDATE トリガの通過証（Issue #1725）。`RETURNING` 付きは常に未結線として扱う（`0A000`）。
+    mut project: Option<&mut ReturningProjectFn<'_>>,
+    // UPDATE トリガの通過証（Issue #1725）。`RETURNING` 付きでも発火し、`project` は書いた最終 NEW を
+    // commit 前に受け取る（Issue #3192）。
     triggers: Option<&crate::trigger::TriggerRuntime>,
     reads_existing: bool,
 ) -> Result<PredicateDmlOutcome, PredicateDmlError<E>> {
     validate_relation_key(table).map_err(dml_write_err)?;
-    let triggers = if project.is_some() { None } else { triggers };
     target.with_txn(|write_txn| {
         // 文ごとに 1 個の書き込み窓口（BEFORE STATEMENT・行トリガ・AFTER STATEMENT が共有。Issue #1726）。
         let trigger_writes = trigger_insert_writes(write_txn, ctx, triggers);
@@ -7371,6 +7447,7 @@ fn update_rows_where_impl<E>(
                 },
                 &plan,
                 &trigger_writes,
+                project.as_deref_mut(),
                 None,
             )?;
             if done.applied > 0 || done.trigger_wrote {
@@ -7444,7 +7521,8 @@ pub(crate) fn update_rows_joined_unchecked<E>(
         &DmlCandidate<'_>,
     ) -> Result<Option<Vec<(usize, crate::row_codec::Value)>>, E>,
     project: Option<&mut ReturningProjectFn<'_>>,
-    // UPDATE トリガの通過証（Issue #1725）。`RETURNING` 付きは常に未結線として扱う（`0A000`）。
+    // UPDATE トリガの通過証（Issue #1725）。結合形の `RETURNING` 付き（`project: Some`）は常に未結線として扱う（`0A000`。
+    // 単一表の `RETURNING` は Issue #3192 で発火する）。
     triggers: Option<&crate::trigger::TriggerRuntime>,
 ) -> Result<PredicateDmlOutcome, PredicateDmlError<E>> {
     validate_relation_key(table).map_err(dml_write_err)?;
@@ -7577,6 +7655,8 @@ pub(crate) fn update_rows_joined_unchecked<E>(
                 },
                 &plan,
                 &trigger_writes,
+                // 結合形の `RETURNING` は未対応（`project` は常に `None`。Issue #3192 の対象外）。
+                None,
                 None,
             )?;
             if done.applied > 0 || done.trigger_wrote {
@@ -11197,6 +11277,7 @@ mod tests {
             None,
             &[],
             None,
+            None,
         )
         .expect("insert_typed_rows_unchecked");
         expected += 1;
@@ -11368,6 +11449,7 @@ mod tests {
             ledger_write,
             Some(&schema),
             Some(&mut project),
+            None,
         );
         assert!(
             matches!(result, Err(TenantWriteError::ReturningProjectionFailed(_))),
@@ -11398,6 +11480,7 @@ mod tests {
             &ctx,
             1,
             ledger_write2,
+            None,
             None,
             None,
         );
@@ -11681,6 +11764,7 @@ mod tests {
             |_c| Ok(true),
             &mut project,
             true,
+            None,
         );
         assert!(
             matches!(
@@ -11745,6 +11829,7 @@ mod tests {
             |_c| Ok(true),
             &mut project,
             true,
+            None,
         );
         assert!(matches!(
             result,
@@ -11803,6 +11888,7 @@ mod tests {
             ledger(),
             None,
             Some(&mut project),
+            None,
         );
         assert!(matches!(
             result,
@@ -11856,6 +11942,7 @@ mod tests {
                 LedgerMode::Ledgered.resolve(Some(&op)).expect("resolve"),
                 None,
                 None,
+                None,
             )
         };
         assert!(run().is_err(), "未正規化値は対象行なしでも拒否");
@@ -11869,6 +11956,7 @@ mod tests {
             &ok,
             &[],
             LedgerMode::Ledgered.resolve(Some(&op)).expect("resolve"),
+            None,
             None,
             None,
         );
@@ -11900,6 +11988,7 @@ mod tests {
             LedgerMode::Ledgered.resolve(Some(&op)).expect("resolve"),
             None,
             Some(&mut project),
+            None,
         );
         assert!(matches!(result, Ok(0)));
         assert_eq!(calls, 0, "不存在 id では project を呼ばない（内容無参照）");
@@ -12242,6 +12331,7 @@ mod tests {
             None,
             &[],
             None,
+            None,
         )
         .expect("seed unique row");
         truncate_row_body(&storage, 1);
@@ -12307,6 +12397,7 @@ mod tests {
             LedgerMode::Ledgered.resolve(Some(&op)).expect("resolve"),
             None,
             &[],
+            None,
             None,
         )
         .expect("seed unique row");
@@ -12392,6 +12483,7 @@ mod tests {
             LedgerMode::Ledgered.resolve(Some(&op)).expect("resolve"),
             None,
             &[],
+            None,
             None,
         )
         .expect("seed unique row");
