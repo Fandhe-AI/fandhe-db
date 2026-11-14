@@ -6,9 +6,10 @@
 //! 束縛・変換の拒否（`42702`・`42P01`・`42804`・`0A000` 等）は Execute でも Describe でも同じコードで返る。
 //! `RETURNING` つき（Issue #3204）は `SqlOutcome::Returning` を返し、Describe は同じ列メタデータを返す。
 //!
-//! `USING OPERATION_ID` 付きの文は、台帳の SQL 経路結線（Issue #3203）まで固定文言の `0A000` で拒否する
-//! （黙って捨てると再送が二重適用される fail-open になるため）。ゲートは `prepare_update_from`／
-//! `prepare_delete_using` の 1 か所に集約しており、#3203 がここを撤去する。
+//! 台帳（Issue #3203・RECOVER-10/11）: `USING OPERATION_ID` 付きの文は `operation_id` を実行器へ渡す。
+//! 台帳の事前照合（再送 `23505`・別文への再利用 `22023`）と確定記録は実行器が同じ write txn で行い、
+//! 束縛・変換のエラーや実行の失敗は txn が commit されないため台帳を消費しない。同一トランザクション内の
+//! 再利用検査は `core.rs` の `parsed_operation_id` が担う。
 //!
 //! テナント境界（P0）: 行の走査・RLS 適用は実行器の契約に従い、本モジュールは RLS を迂回する経路を
 //! 作らない。エラー文言には入力された名前と固定文言だけを含め、他テナントの情報を含めない。
@@ -29,12 +30,6 @@ use crate::sql::transaction::SessionTransaction;
 use crate::sql::udf_call::UdfRegistry;
 use crate::sql::SqlOutcome;
 use crate::tenant::WriteTarget;
-
-/// `USING OPERATION_ID` 付きを #3203 まで拒否する固定文言（`0A000`）。
-const UPDATE_FROM_OPERATION_ID_UNSUPPORTED: &str =
-    "UPDATE ... FROM with USING OPERATION_ID is not supported yet";
-const DELETE_USING_OPERATION_ID_UNSUPPORTED: &str =
-    "DELETE ... USING with USING OPERATION_ID is not supported yet";
 
 /// 暗黙トランザクションを通らない経路（`EXPLAIN` 等のネスト）への固定文言（`0A000`）。
 pub(super) const JOINED_DML_UNSUPPORTED_HERE: &str =
@@ -102,37 +97,6 @@ impl EngineCore {
         crate::sql::join::dml_plan::plan_delete_using(&bound, &target, &refs, udfs)
     }
 
-    /// `UPDATE ... FROM` を計画し、op id ゲートを通す（Describe と Execute が共有）。
-    /// 束縛・変換のエラーを優先し、その後に `USING OPERATION_ID` 付きを `0A000` で拒否する（#3203 で撤去）。
-    pub(super) fn prepare_update_from(
-        &self,
-        stmt: &ValidatedUpdateFrom,
-        udfs: &UdfRegistry,
-    ) -> Result<JoinedDmlPlan, SqlSurfaceError> {
-        let plan = self.plan_update_from_stmt(stmt, udfs)?;
-        if stmt.operation_id().is_some() {
-            return Err(SqlSurfaceError::feature_not_supported(
-                UPDATE_FROM_OPERATION_ID_UNSUPPORTED,
-            ));
-        }
-        Ok(plan)
-    }
-
-    /// `DELETE ... USING` の [`Self::prepare_update_from`] 相当。
-    pub(super) fn prepare_delete_using(
-        &self,
-        stmt: &ValidatedDeleteUsing,
-        udfs: &UdfRegistry,
-    ) -> Result<JoinedDmlPlan, SqlSurfaceError> {
-        let plan = self.plan_delete_using_stmt(stmt, udfs)?;
-        if stmt.operation_id().is_some() {
-            return Err(SqlSurfaceError::feature_not_supported(
-                DELETE_USING_OPERATION_ID_UNSUPPORTED,
-            ));
-        }
-        Ok(plan)
-    }
-
     /// `UPDATE ... FROM` を共有 write txn 上で実行する（autocommit は暗黙 Tx 経由で同じ腕に入る）。
     /// 失敗時は呼び出し元が明示 Tx を `Failed` へ遷移させる。書いた表（対象表・トリガが書いた表）へ
     /// `mark_written` する（漏れると COMMIT が write txn を破棄し遅延 FK 検査も取りこぼす。P0）。
@@ -143,8 +107,15 @@ impl EngineCore {
         txn: &mut SessionTransaction<'_>,
         stmt: &ValidatedUpdateFrom,
     ) -> Result<SqlOutcome, SqlSurfaceError> {
-        let plan = self.prepare_update_from(stmt, session.udfs())?;
-        let out = self.run_joined_in_txn(ctx, session, txn, &plan, stmt.statement_hash())?;
+        let plan = self.plan_update_from_stmt(stmt, session.udfs())?;
+        let out = self.run_joined_in_txn(
+            ctx,
+            session,
+            txn,
+            &plan,
+            stmt.operation_id(),
+            stmt.statement_hash(),
+        )?;
         Ok(joined_outcome(
             &plan,
             out,
@@ -161,8 +132,15 @@ impl EngineCore {
         txn: &mut SessionTransaction<'_>,
         stmt: &ValidatedDeleteUsing,
     ) -> Result<SqlOutcome, SqlSurfaceError> {
-        let plan = self.prepare_delete_using(stmt, session.udfs())?;
-        let out = self.run_joined_in_txn(ctx, session, txn, &plan, stmt.statement_hash())?;
+        let plan = self.plan_delete_using_stmt(stmt, session.udfs())?;
+        let out = self.run_joined_in_txn(
+            ctx,
+            session,
+            txn,
+            &plan,
+            stmt.operation_id(),
+            stmt.statement_hash(),
+        )?;
         Ok(joined_outcome(
             &plan,
             out,
@@ -178,6 +156,7 @@ impl EngineCore {
         session: &SessionState,
         txn: &mut SessionTransaction<'_>,
         plan: &JoinedDmlPlan,
+        operation_id: Option<&crate::recovery::required_op_id::OperationId>,
         content_hash: &crate::recovery::content_hash::ContentHash,
     ) -> Result<JoinedDmlOutcome, SqlSurfaceError> {
         // 最初の書き込み文で writer を取得する（待機超過は `55P03`。呼び出し元が `Failed` へ遷移）。
@@ -187,13 +166,13 @@ impl EngineCore {
         })?;
         // トリガが書いた表も COMMIT 時の遅延 FK 検査の対象にする。
         let trigger_scope = crate::tenant::trigger_writes::TriggerWrittenTablesScope::enter();
-        // operation_id は #3203 まで常に `None`（付き文は prepare 段で拒否済み）。
+        // operation_id は構文段で検証済みの値をそのまま渡す（台帳は実行器が担う）。RETURNING は #3204 で収集する。
         let out = self.execute_joined_dml_in(
             WriteTarget::InTxn(write_txn),
             ctx,
             session,
             plan,
-            None,
+            operation_id,
             content_hash,
         )?;
         txn.mark_written(ctx.tenant_id(), &plan.target.table);

@@ -447,10 +447,6 @@ fn unsupported_returning_forms_fail_closed_without_side_effects() {
             "42703",
         ),
         (
-            "UPDATE t SET x = 1 FROM s WHERE t.k = s.k RETURNING s.v USING OPERATION_ID 'r1'",
-            "0A000",
-        ),
-        (
             "UPDATE t SET x = 1 FROM s WHERE t.k = s.k USING OPERATION_ID 'r2' RETURNING s.v",
             "42601",
         ),
