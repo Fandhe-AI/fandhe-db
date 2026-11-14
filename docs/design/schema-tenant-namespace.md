@@ -1,6 +1,6 @@
 # ADR: SCHEMA とテナントの関係・名前解決規則（Issue #1712）
 
-- ステータス: Accepted（設計記録。後続 #1713〜#1719・#2234 で実装する）
+- ステータス: Accepted（設計記録。後続 #1713〜#1719・#2234・#3195〜#3199 で実装済み。現状は末尾の「追記（Issue #3199）」を参照）
 - 対応 Issue: #1712（親 #1711。後続 #1713・#1714・#1715・#1716・#1717・#1718・#1719、
   Phase 6 の #2234）
 - 関連ポインタ: `docs/spec/04-behavior/data-model.md`（TABLE-6・TABLE-9・TABLE-24・
@@ -508,7 +508,7 @@ SCHEMA 導入（#1713〜#1717）後もテナント境界が保たれることの
 - **内部 ID の接頭辞**: 内部 ID `#1.` と `#10.` 以上の物理表が両方ある並びで、DROP CASCADE・RENAME・TRUNCATE・SEQUENCE の操作が別テナントの SCHEMA に及ばない。物理表名の存在は raw redb の表名で前提確認する
 - **名前の衝突**: 3 テナントが同名の SCHEMA に同名のオブジェクトを作れ（`42P07`／`42710` にならない）、どれかの DROP／RENAME が他テナントに影響しない。UDF はセッション単位で保持される
 - **試行総数の固定と負の対照**: 各テストの末尾で検査した組の数を `assert_eq!` で固定し、検査器（漏えい検出・オラクル・双子比較）へ捏造した違反を与えて検出されることを確かめる
-- **現状の挙動として固定したもの（fail-closed）**: `search_path` に自テナントの SCHEMA だけを置いた未修飾名の解決・作成は未対応（`42P01`／`0A000`）、テナント SCHEMA 間の `SET SCHEMA` は `42501`。受理されるようになったら本テストの期待を更新する
+- **現状の挙動として固定したもの（fail-closed）**: 本節の記述は #1719 時点。未修飾名の解決・作成は #3195〜#3197 で、テナント SCHEMA 間の `SET SCHEMA` は #3198・#3199 で受理に変わった（現状は末尾の「追記（Issue #3199）」）
 - **未カバー**: 物理表へ他テナントの行を直接差し込む多層防御（D3）の検査。SQL 表は採番方式で、`tenant::insert_row` などの公開 API が拒否するため再現できず、raw redb での行エンコードが要る。処理時間の差による存在の推測（D4 の時間的な側面）は決定的に検査できない
 - **対象外**: wire-server の応答（#1718）、SCHEMA 単位の GRANT（#2234）、利用者定義の RLS ポリシー、crash テストの新設
 
@@ -531,7 +531,7 @@ SCHEMA の所有者は、上記の blob の予約領域ではなく `object_owne
 - **判定順**: DDL 権限ゲート → 表の存在（`42P01`／`42809`）→ 移動先の解決（不在・他テナントは同一の `3F000`、システム SCHEMA・`pg_temp` は `0A000`）→ `public` との境界（`42501`）→ 同一 SCHEMA は何も書かない成功 → 移動先の CREATE 権限（`42501`）→ 実移動
 - **エラー**: 移動先での名前の衝突（表・ビュー・索引・matview・SEQUENCE。移る索引名・SEQUENCE 名を含む）は `42P07`。関数・matview の依存は `ALTER TABLE ... RENAME TO` と同じ `2BP01`。`OWNED BY` の SEQUENCE を他の表が `DEFAULT` で参照しているときも `2BP01`
 - **意図的な拒否（`intentional`）**: `public` とテナント SCHEMA の間の移動は両方向とも `42501` のまま。共有の `public` の表は全テナントの行を持つため、移動で他テナントの行の所有が移りうる（D7・TABLE-27 (7) のポインタ）。システム SCHEMA・一時表への移動の `0A000` も従来どおり
-- **残した `0A000`**: `search_path` で未修飾名として解決される移動元の DDL（#3195 の受け皿は #3196）。`ALTER SEQUENCE／VIEW／INDEX ... SET SCHEMA` は未対応のまま
+- **残した `0A000`**: `ALTER SEQUENCE／VIEW／INDEX ... SET SCHEMA` は未対応のまま。未修飾の移動元は #3199 で受理に変えた（末尾の追記）
 - **診断 API**: `verify_gin_index_read_only` は SCHEMA 配下の索引キー（`#<id>.<名>`）も引けるようにした（検証用。読み取り専用）
 
 ## 追記（Issue #3196）
@@ -541,7 +541,7 @@ DML・DDL・`COPY` の未修飾名と、作成系 DDL の作成先も `search_pa
 - **方式**: 未修飾名は、解析の前に修飾名と同じ内部キー（`#<schema_id>.<name>`）へ置き換える。置換後のトークン列は利用者が `q1.t` と書いた文と同じなので、ACL・一時表の振り分け・ビュー本文の保存・実行は修飾形と同じ経路に乗り、受理・拒否も修飾形と一致する（public のビューから SCHEMA の表を参照する形の `42501` など）。文種ごとの個別の実行経路は作らない
 - **作成先**: path の先頭の要素。自テナントの SCHEMA なら内部キー、`public` なら裸のまま。`pg_catalog`・`information_schema`・`pg_temp` は `0A000`、どの要素にも作れなければ `3F000`。USAGE の無い自テナントの SCHEMA は飛ばさず `42501`（K4）。作成先の SCHEMA には CREATE 権限を検査する（K5）。権限ゲート（`42501`）→ 作成先（`3F000`／`0A000`／`42501`）→ 既存名（`42P07`）の順は変えない
 - **安全弁**: 解析時の書き換えを通らない経路（`CREATE TYPE`・`CREATE MATERIALIZED VIEW`・構文語と衝突する名前・解析と実行の間の SCHEMA 作成の競合）は、path 先頭が自テナントの SCHEMA のとき固定文言の `0A000` にし、`public` へ黙って作らない
-- **自己参照 FK**: `REFERENCES <作成名>` は作成先に合わせる（作成先が SCHEMA なら同じ内部キー、`public` なら裸のまま）。現状は修飾形を含めて行 ID モード未対応の `0A000` で、書き換え自体は単体テストで固定している
+- **自己参照 FK**: `REFERENCES <作成名>` は作成先に合わせる（作成先が SCHEMA なら同じ内部キー、`public` なら裸のまま）。書き換え自体は単体テストで固定している（行 ID モードの親への `REFERENCES parent (id)` は #3385 で受理に変わった）
 - **明示トランザクション**: DDL は従来どおり `0A000`。DML の存在照会は確定済みのスナップショットを見る（`COPY` は `BEGIN` 時点）
 - **残る `0A000`**: `ALTER TABLE .. SET SCHEMA` の未修飾の対象が SCHEMA に解決される形（#3198）、`ENUM` 型・`MATERIALIZED VIEW` の SCHEMA 配置と組み込み SCHEMA への作成（本 ADR の対象外。専用の Issue が必要）
 - **意図的な差**: 重複作成の `42P07` の文言は、PostgreSQL の裸の名前ではなく `q1.t` 形（修飾形と同じ）で出す。内部 ID は出ない
@@ -558,3 +558,13 @@ DML・DDL・`COPY` の未修飾名と、作成系 DDL の作成先も `search_pa
 - **互換の安全弁**: セッションを持たない Parse（Rust API の `parse_sql_prepared_with_declared`）の文は path を知らないため、解決が有効なセッションの Bind・Describe では従来どおり `0A000`
 - **テナント境界**: 再解決の照会は既存の `with_search_path_lookup`（自テナントの USAGE の有る SCHEMA だけ）のみ。他テナントの SCHEMA を引く経路は無く、エラー文言は利用者が書いた名前だけで内部キーを含まない
 - **残る未対応**: 再 Parse した文を文のストアへ書き戻す最適化はしない（path・カタログが変わった後の Bind ごとに再 Parse する）
+
+## 追記（Issue #3199）
+
+親 #3194 の締めとして、`search_path` の固定テストを新挙動へ更新し、越境試験を足した（ポインタ: TABLE-27）。
+
+- **未修飾の `ALTER TABLE t SET SCHEMA <s>` を受理に変えた**: 未修飾名は解析前に修飾名と同じ内部キーへ書き換わるため、以降は修飾形（`q1.t SET SCHEMA ..`）と同じ経路に乗る。`PathGate` にあった「対象が SCHEMA に解決された SET SCHEMA は `0A000`」の特例は、修飾形の `42501` に先回りするためだけに残っていたので撤去した。判定順・エラーは #3198 のまま（DDL 権限 → 存在 → 移動先の解決（不在・他テナントは同一の `3F000`）→ `public` 境界の `42501` → CREATE 権限 → 実移動）。移動先の識別子が同名の表に引きずられて書き換わらないことは、結合テスト（`table27_search_path.rs`）で固定した
+- **意図的な拒否（`intentional`）**: `public` とテナント SCHEMA の間の移動の `42501`、他テナントの SCHEMA への移動（不在と同じ `3F000`）、システム SCHEMA・一時表への移動の `0A000`、`ALTER SEQUENCE／VIEW／INDEX ... SET SCHEMA` の `0A000`、明示トランザクション内の DDL の `0A000`、SCHEMA 配置が未対応の作成（`CREATE TYPE`・`CREATE MATERIALIZED VIEW`）の `0A000` は、いずれも fail-closed の安全弁として残す
+- **越境試験（`table27_tenant_boundary.rs` の T9）**: 他テナントだけが持つ SCHEMA 名を `search_path` に置いた閲覧側の未修飾の書き込み・DDL・移動・削除の応答が、その SCHEMA がどこにも無い DB と完全一致する（autocommit・明示トランザクション・可視性 2 モード）。2 テナントが同名の SCHEMA・同名の表・同じ id を持つとき、一方の未修飾の INSERT／UPDATE／UPSERT／DELETE／`CREATE INDEX`／`ADD COLUMN`／TRUNCATE／`SET SCHEMA`／DROP が他方の行・構造を変えない（試行総数の固定と負の対照つき）
+- **wire の結合試験（`wire_search_path.rs`）**: psql 形（末尾 `;` 付き・1 メッセージ 1 文）で、同名 SCHEMA を持つ 2 接続の未修飾の書き込み・`SET SCHEMA`・TRUNCATE・DROP の分離と、他テナントの SCHEMA 名を path に置いた接続の拒否（`#` を含む文言なし）、拒否後も接続が使えることを固定した
+- **全面改訂の扱い**: §12 の「現状の挙動として固定したもの」と #3196 追記の自己参照 FK の記述は、陳腐化した箇所に現状へのポインタを足した（履歴として本文は残す）。D5・D11 の契約自体は変わらない

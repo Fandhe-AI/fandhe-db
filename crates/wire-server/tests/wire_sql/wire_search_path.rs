@@ -611,3 +611,139 @@ fn wire_extended_query_does_not_resolve_into_another_tenants_schema() {
     assert!(!text.contains('#'), "{text}");
     sync(&mut bob);
 }
+/// 1 列の結果を返す SELECT を送り、先頭セルを行ごとに集める（psql 形の単独送信。末尾 `;` 付きで渡してよい）。
+fn select_cells(stream: &mut TcpStream, sql: &str) -> Vec<Option<String>> {
+    send_simple_query(stream, sql);
+    let _ = read_row_description(stream);
+    let mut cells = Vec::new();
+    loop {
+        let (kind, body) = read_message(stream);
+        match kind {
+            b'D' => cells.push(first_cell(&body)),
+            b'C' => break,
+            other => panic!("unexpected message {}", other as char),
+        }
+    }
+    read_ready_for_query(stream);
+    cells
+}
+
+/// Issue #3199: 両テナントが同名 SCHEMA `q1`・同名表 `t` を持つとき、psql 形の未修飾の書き込み・DDL
+/// （`SET SCHEMA`・`TRUNCATE`・`DROP` を含む）は自テナント側だけを変え、他テナントの行・構造に触れない。
+#[test]
+fn wire_unqualified_writes_and_ddl_never_touch_a_same_named_schema_of_another_tenant() {
+    let (core, _guard) = new_core();
+    let store = allowed_store(
+        &[
+            ("alice", "tenant-a", "correct-horse"),
+            ("bob", "tenant-b", "battery-staple"),
+        ],
+        &["alice", "bob"],
+    );
+    let addr = spawn_server(store, core);
+    let mut alice = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+    let mut bob = authenticate_to_ready_for_query(addr, "bob", "battery-staple");
+    for (stream, id) in [(&mut alice, 1), (&mut bob, 2)] {
+        simple_ok(stream, "CREATE SCHEMA q1;");
+        simple_ok(stream, "CREATE SCHEMA q2;");
+        simple_ok(
+            stream,
+            "CREATE TABLE q1.t (id BIGINT PRIMARY KEY, n INTEGER);",
+        );
+        simple_ok(
+            stream,
+            &format!("INSERT INTO q1.t (id, n) VALUES (1, {id});"),
+        );
+        simple_ok(stream, "SET search_path TO q1, public;");
+    }
+    // alice の未修飾の書き込みは alice の q1.t だけに効く。
+    simple_ok(&mut alice, "INSERT INTO t (id, n) VALUES (2, 20);");
+    simple_ok(&mut alice, "UPDATE t SET n = 11 WHERE id = 1;");
+    simple_ok(&mut alice, "DELETE FROM t WHERE id = 2;");
+    assert_eq!(
+        select_cells(&mut alice, "SELECT n FROM t WHERE id = 1;"),
+        vec![Some("11".to_string())]
+    );
+    assert_eq!(
+        select_cells(&mut bob, "SELECT n FROM t;"),
+        vec![Some("2".to_string())]
+    );
+    // 未修飾の SET SCHEMA は同テナントの別 SCHEMA へ移せる。public への移動は修飾形と同じ `42501`。
+    simple_err(&mut alice, "ALTER TABLE t SET SCHEMA public;", "42501");
+    simple_ok(&mut alice, "ALTER TABLE t SET SCHEMA q2;");
+    simple_err(&mut alice, "SELECT n FROM t;", "42P01");
+    assert_eq!(
+        select_cells(&mut alice, "SELECT n FROM q2.t;"),
+        vec![Some("11".to_string())]
+    );
+    // bob の q1.t は移動の影響を受けない。
+    assert_eq!(
+        select_cells(&mut bob, "SELECT n FROM t;"),
+        vec![Some("2".to_string())]
+    );
+    // alice の TRUNCATE・DROP も bob の表を残す。
+    simple_ok(&mut alice, "SET search_path TO q2, public;");
+    simple_ok(&mut alice, "TRUNCATE t;");
+    simple_ok(&mut alice, "DROP TABLE t;");
+    simple_err(&mut alice, "SELECT n FROM q2.t;", "42P01");
+    assert_eq!(
+        select_cells(&mut bob, "SELECT n FROM q1.t;"),
+        vec![Some("2".to_string())]
+    );
+}
+
+/// Issue #3199: 他テナントだけが持つ SCHEMA 名を path に置いた接続は、未修飾の書き込み・DDL・移動が
+/// 不在と同じ拒否になり、内部キー `#` を含む文言を返さない。未対応の作成形も fail-closed で、接続は使い続けられる。
+#[test]
+fn wire_foreign_schema_path_and_unsupported_creates_fail_closed_and_keep_the_connection() {
+    let (core, _guard) = new_core();
+    let store = allowed_store(
+        &[
+            ("alice", "tenant-a", "correct-horse"),
+            ("bob", "tenant-b", "battery-staple"),
+        ],
+        &["alice", "bob"],
+    );
+    let addr = spawn_server(store, core);
+    let mut alice = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+    let mut bob = authenticate_to_ready_for_query(addr, "bob", "battery-staple");
+    simple_ok(&mut alice, "CREATE SCHEMA q1;");
+    simple_ok(&mut alice, "CREATE TABLE q1.t (id BIGINT PRIMARY KEY);");
+    simple_ok(&mut alice, "INSERT INTO q1.t (id) VALUES (10);");
+    simple_ok(&mut bob, "CREATE SCHEMA mine;");
+    simple_ok(&mut bob, "SET search_path TO q1;");
+    for (sql, code) in [
+        ("INSERT INTO t (id) VALUES (5);", "C42P01"),
+        ("UPDATE t SET id = 6 WHERE id = 10;", "C42P01"),
+        ("DELETE FROM t;", "C42P01"),
+        ("TRUNCATE t;", "C42P01"),
+        ("DROP TABLE t;", "C42P01"),
+        ("ALTER TABLE t SET SCHEMA mine;", "C42P01"),
+        ("CREATE TABLE z (id BIGINT PRIMARY KEY);", "C3F000"),
+    ] {
+        send_simple_query(&mut bob, sql);
+        let (kind, body) = read_message(&mut bob);
+        assert_eq!(kind, b'E', "ErrorResponse: {sql}");
+        let text = String::from_utf8_lossy(&body).into_owned();
+        assert!(text.contains(code), "{sql}: {text}");
+        assert!(!text.contains('#'), "{sql}: {text}");
+        read_ready_for_query(&mut bob);
+    }
+    // alice の表は bob の試行の後も無傷。
+    assert_eq!(
+        select_cells(&mut alice, "SELECT id FROM q1.t;"),
+        vec![Some("10".to_string())]
+    );
+    // SCHEMA 配置が未対応の作成は、path 先頭が SCHEMA のとき `public` へ黙って作らず `0A000`。
+    simple_ok(&mut alice, "SET search_path TO q1, public;");
+    simple_err(
+        &mut alice,
+        "CREATE MATERIALIZED VIEW mv AS SELECT id FROM t;",
+        "0A000",
+    );
+    // 拒否の後も同じ接続で読み取りができる。
+    assert_eq!(
+        select_cells(&mut alice, "SELECT id FROM t;"),
+        vec![Some("10".to_string())]
+    );
+}
