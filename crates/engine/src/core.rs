@@ -20766,7 +20766,14 @@ impl EngineCore {
             ctx,
             stmt.table_name(),
             stmt.operation_id(),
-            || crate::sql::parser::bind_predicate_update(stmt, schema, udfs),
+            || {
+                // 通常の UPDATE と同じく、BEFORE ROW が NEW を補正し得る表では NOT NULL 検査を
+                // 発火後へ延期する（束縛時の 23502 を先に返さない。Issue #3283）。
+                let set_columns: Vec<&str> =
+                    stmt.assignments().iter().map(|(n, _)| n.as_str()).collect();
+                let _defer = self.defer_not_null_scope_for_update(ctx, &schema.name, &set_columns);
+                crate::sql::parser::bind_predicate_update(stmt, schema, udfs)
+            },
             || {
                 crate::recovery::content_hash::for_update_where_partitioned(
                     stmt.table_name(),

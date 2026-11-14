@@ -253,6 +253,8 @@ struct JobState {
     cursor: Option<RowId>,
     /// commit 済みの累計処理件数。
     processed: u64,
+    /// 影響行数 0 でもトリガの別表書き込み等の副作用を commit 済みか（再開時は記録の存在から復元）。
+    side_effects_committed: bool,
     /// ジョブ表に `Running` 記録があるか。
     has_record: bool,
     /// 最初のチャンクか（再送判定を行うのは最初のチャンクだけ）。
@@ -401,6 +403,7 @@ fn run_partitioned<E>(
     let mut state = JobState {
         cursor: None,
         processed: 0,
+        side_effects_committed: false,
         has_record: false,
         first_chunk: true,
     };
@@ -423,7 +426,13 @@ fn run_partitioned<E>(
     );
     result.map_err(|cause| PartitionedDmlFailure {
         cause,
-        committed_total: state.processed,
+        // 影響行数が 0 でも副作用（トリガの別表書き込み）を commit 済みなら、部分完了として
+        // 扱わせるため 0 にしない（SQL 表層は `> 0` を `VD001` へ写像する）。
+        committed_total: if state.side_effects_committed {
+            state.processed.max(1)
+        } else {
+            state.processed
+        },
     })
 }
 
@@ -491,6 +500,8 @@ fn chunk_loop<E>(
         {
             if hash.matches(&stored) {
                 state.processed = processed;
+                // Running 記録は commit 済みチャンク（トリガ副作用のみのものを含む）の存在を示す。
+                state.side_effects_committed = true;
             }
         }
     }
@@ -614,6 +625,7 @@ fn chunk_loop<E>(
                     }
                     state.cursor = Some(cursor);
                     state.processed = processed;
+                    state.side_effects_committed = true;
                     state.has_record = true;
                 }
                 ResendDecision::Duplicate => return Err(w(TenantWriteError::DuplicateOperationId)),
@@ -706,11 +718,15 @@ fn chunk_loop<E>(
 
         // ジョブ累計の影響行数上限（明示指定時のみ）。超過するチャンクは適用しない。
         if let Some(limit) = max_affected_total {
-            let total = state
-                .processed
-                .saturating_add(u64::try_from(candidates.len()).unwrap_or(u64::MAX));
-            if total > u64::try_from(limit.get()).unwrap_or(u64::MAX) {
-                return Err(PartitionedStopCause::AffectedRowsLimitExceeded { limit });
+            // 行トリガのある表は BEFORE の `NULL` 返却で候補がスキップされ得るため、上限判定は
+            // 適用後の実適用件数で行う（下の適用段の後）。トリガ無しは従来どおり適用前に判定する。
+            if trigger_plan.is_none() {
+                let total = state
+                    .processed
+                    .saturating_add(u64::try_from(candidates.len()).unwrap_or(u64::MAX));
+                if total > u64::try_from(limit.get()).unwrap_or(u64::MAX) {
+                    return Err(PartitionedStopCause::AffectedRowsLimitExceeded { limit });
+                }
             }
         }
 
@@ -809,6 +825,16 @@ fn chunk_loop<E>(
         if deadline_hit.get() {
             drop(write_txn);
             return Err(PartitionedStopCause::DeadlineExceeded);
+        }
+        // トリガ経路の累計上限判定（Skip を除く実適用件数。超過するチャンクは commit せず破棄する）。
+        if let (Some(limit), Some(_)) = (max_affected_total, &trigger_plan) {
+            let total = state
+                .processed
+                .saturating_add(u64::try_from(applied).unwrap_or(u64::MAX));
+            if total > u64::try_from(limit.get()).unwrap_or(u64::MAX) {
+                drop(write_txn);
+                return Err(PartitionedStopCause::AffectedRowsLimitExceeded { limit });
+            }
         }
 
         // 打ち切った場合のカーソルは「最後に消費した候補の rowid」（それ以降の行は次の
@@ -922,6 +948,9 @@ fn chunk_loop<E>(
 
         // commit 後にだけメモリ上の状態を更新する。
         state.processed = state.processed.saturating_add(rows_changed);
+        if trigger_wrote {
+            state.side_effects_committed = true;
+        }
         if let Some(total) = completed_total {
             state.processed = total;
             return Ok(PartitionedDmlOutcome::Completed { total_rows: total });
