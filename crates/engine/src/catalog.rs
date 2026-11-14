@@ -3519,6 +3519,16 @@ fn validate_dependents_statically_in_txn(
                     return Err(fk_mismatch());
                 }
             }
+            // 採番方式の親の `id` は宣言した普通の列なので、自己参照では親列の型との組も
+            // 照合する（他表の親は `revalidate_keys_after_type_change` が担う。Issue #3181）。
+            if self_ref && !fk.references_parent_pseudo_id(new_schema) {
+                for (child_col, parent_col) in fk.columns.iter().zip(&fk.parent_columns) {
+                    match (new_col_ty(child_col), new_col_ty(parent_col)) {
+                        (Some(c), Some(p)) if ColumnType::fk_types_compatible(c, p) => {}
+                        _ => return Err(fk_mismatch()),
+                    }
+                }
+            }
         } else if self_ref {
             for (child_col, parent_col) in fk.columns.iter().zip(&fk.parent_columns) {
                 match (new_col_ty(child_col), new_col_ty(parent_col)) {
@@ -10127,7 +10137,7 @@ fn revalidate_keys_after_type_change(
         } else {
             require_table_schema_write_any_identity(write_txn, &fk.parent_table)?
         };
-        if fk.references_parent_id() {
+        if fk.references_parent_pseudo_id(&parent) {
             // `id` 疑似列参照は参照元列が整数型であることだけを宣言時と同じ基準で照合し
             // （`resolve_foreign_key_target`）、USING で作られた孤児値を下の全テナント検証で
             // `23503` として拒否する（親側に変更列は無いので `child_side` の場合だけ到達する）。
@@ -18689,7 +18699,7 @@ pub(crate) fn referencing_foreign_keys_in_txn(
 /// 下記 2 種の索引を混同して両方に同じ「`id` 参照は除外」フィルタを掛けると、
 /// 子側索引を誤って取りこぼす）:
 ///
-/// - **親側索引**（`id` 参照は対象外）: `table` を参照する他テーブル
+/// - **親側索引**（疑似列参照の `id` 参照は対象外。採番方式の親の `id` は普通の列なので対象。Issue #3181）: `table` を参照する他テーブル
 ///   （自己参照時は `table` 自身）の列参照 `FOREIGN KEY` の参照先列
 ///   （`fk.parent_columns()`）から構築する（`constraint::verify_required_
 ///   parent_keys` 等が `ensure_index_in_txn` を `table = fk.parent_table()`
