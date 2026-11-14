@@ -597,8 +597,8 @@ const ALLOWLIST: &[(&str, u32)] = &[
     ("catalog/namespace.rs", 756),
     ("catalog/namespace.rs", 812),
     // Issue #1716: `rename_schema` も `schemas` の 1 行付け替えだけで、行ストア・世代を変えない。
-    ("catalog/namespace.rs", 1068),
-    ("catalog/namespace.rs", 1184),
+    ("catalog/namespace.rs", 1079),
+    ("catalog/namespace.rs", 1195),
     // Issue #1645（所有 SEQUENCE の定義 blob 版 3・`commit_and_finish` 経路の追加）と base 取り込みで行が移動したため
     // 全件を現行行へ追随（commit 対象は SEQUENCE 定義・状態表のみで同じ理由により対象外）。
     // Issue #1694（SERIAL の暗黙 SEQUENCE・所有 SEQUENCE の削除と追従）の追加で行番号が移動したための追随
@@ -654,20 +654,20 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // 作成時の適用は作成本体の txn に相乗りし、作成側が世代を進める）。単体テストの `write_txn` ヘルパはテスト専用の commit。
     ("catalog/privilege/default_acl.rs", 479),
     ("catalog/privilege/default_acl/tests.rs", 98),
-    ("catalog/sequence.rs", 1476),
-    ("catalog/sequence.rs", 1496),
-    ("catalog/sequence.rs", 1537),
-    ("catalog/sequence.rs", 1586),
-    ("catalog/sequence.rs", 1625),
-    ("catalog/sequence.rs", 1645),
-    ("catalog/sequence.rs", 1778),
-    ("catalog/sequence.rs", 2052),
-    ("catalog/sequence.rs", 2142),
-    ("catalog/sequence.rs", 2182),
-    ("catalog/sequence.rs", 2235),
-    ("catalog/sequence.rs", 2503),
-    ("catalog/sequence.rs", 2549),
-    ("catalog/sequence.rs", 2816),
+    ("catalog/sequence.rs", 1576),
+    ("catalog/sequence.rs", 1596),
+    ("catalog/sequence.rs", 1637),
+    ("catalog/sequence.rs", 1686),
+    ("catalog/sequence.rs", 1725),
+    ("catalog/sequence.rs", 1745),
+    ("catalog/sequence.rs", 1878),
+    ("catalog/sequence.rs", 2152),
+    ("catalog/sequence.rs", 2242),
+    ("catalog/sequence.rs", 2282),
+    ("catalog/sequence.rs", 2335),
+    ("catalog/sequence.rs", 2603),
+    ("catalog/sequence.rs", 2649),
+    ("catalog/sequence.rs", 2916),
     // `Storage::create_function`／`Storage::drop_function`（UDF カタログ・Issue #1919）:
     // UDF 定義は専用の関数カタログ表のみを書き、`CATALOG_TABLE`／`user_rows/{table_name}`
     // のいずれにも触れない（行を持たない定義メタデータのため、世代照合の対象テーブルが

@@ -137,7 +137,7 @@ Full}` の場合に限り、non-strict な述語を検出したら簡約せず `
   なった）
 - WHERE の `IS NULL`／`NOT`（導入する場合は `is_null_rejecting` と簡約規則の再設計が必要）
 - ON 句の中に書くリテラル条件（Issue #1830 で解消。下記「Issue #1830 追記」）
-- JOIN を含む VIEW・CTE・サブクエリ・`EXPLAIN`・カーソル・`COPY`・`$n`
+- JOIN を含む VIEW・CTE・サブクエリ・`EXPLAIN`・カーソル（`DECLARE` の内側は Issue #3175 で対応済み。[sql-cursor.md](sql-cursor.md)）・`COPY`・`$n`
 - JOIN 経路の RLS 境界の網羅検証（#931）
 - 専有環境での性能計測
 

@@ -392,9 +392,13 @@ fn duplicate_id_is_23505() {
     assert_eq!(count(&core, &a, "trg"), 1);
 }
 
-// 呼び出し口が未結線（既定）なら、トリガのある表への INSERT は固定文言の `0A000`・副作用ゼロ。
+// 既定の invoker は本番の `PlpgsqlTriggerInvoker`（Issue #3185）。PL/pgSQL のトリガ関数でない関数
+// （`LANGUAGE sql`）は本番ホストの検査で固定文言の `0A000` になり、副作用はゼロ。
+//
+// intentional: docs/design/plpgsql-subset.md
+// トリガ関数でない関数の拒否は fail-closed の安全弁（設計記録「Issue #3184 追記」・「Issue #3185 追記」）。
 #[test]
-fn unwired_invoker_is_0a000() {
+fn default_invoker_rejects_non_trigger_function() {
     let dir = tempdir();
     let core = EngineCore::from_storage(
         open_storage(dir.path()),
@@ -404,6 +408,11 @@ fn unwired_invoker_is_0a000() {
     add_trigger(&core.storage, "tenant-a", "trg", &before_row("t"));
     let err = run(&core, &a, INSERT_A1).unwrap_err();
     assert_eq!(err.wire_code(), "0A000");
+    assert!(
+        err.to_string()
+            .contains("the function is not a PL/pgSQL trigger function"),
+        "{err}"
+    );
     assert_eq!(count(&core, &a, "trg"), 0);
 }
 
