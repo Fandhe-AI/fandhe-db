@@ -4570,8 +4570,8 @@ fn collect_action_targets(
 ///
 /// 従来方式（`LegacyId`）の表は rowid と `id` が 1:1 のため、値から rowid への写像は恒等で、
 /// 物理キーの点照会が主キー値による解決そのものになる。採番方式（`Allocated`）の表は主キー索引から
-/// 引く実装が未整備のため、固定文言で fail-closed に拒否する（ゲートで到達しない想定だが、
-/// 後続作業の一覧として明示する）。呼び出し元は本 module の `id` 参照 FK の検査・連鎖処理。
+/// 引く実装が未整備のため、固定文言で fail-closed に拒否する（DDL が受理した採番方式の親への
+/// `id` 参照は実行時にここで 0A000 になる。#3179・#3180 が解消。Issue #3178）。呼び出し元は本 module の `id` 参照 FK の検査・連鎖処理。
 fn parent_row_key_by_id_value<'a>(
     parent_schema: &TableSchema,
     tenant_id: &'a str,
