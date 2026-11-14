@@ -185,7 +185,10 @@ CTE は原則として実体化しない（インライン展開。明示 `MATER
 - 発火条件: セッションの最上位 SELECT の入口（`validate_session_sql_tokens`）で、`WITH`（非再帰）の
   主クエリが JOIN の形のとき。FROM の各リレーションを**カタログより先に**大文字小文字を区別せず CTE 名と
   照合する（CTE は同名の表・ビューを隠す）。CTE を 1 つも参照しない JOIN は通常の JOIN として返す。
-  ビュー本文・cursor・COPY・CTAS・`INSERT ... SELECT`・サブクエリ内側・`EXPLAIN` は従来どおり `42601`。
+  ビュー本文・COPY・CTAS・`INSERT ... SELECT`・サブクエリ内側・`EXPLAIN` は従来どおり `42601`。
+  `DECLARE CURSOR` の内側は cursor 専用の評価モードで JOIN 主クエリだけを受理する（Issue #3176。
+  予算はカーソル残容量で縛る。tail CTE・具体化・派生表・再帰は cursor では従来どおり。
+  [sql-cursor.md](sql-cursor.md)）。
   データ変更 CTE を含む文は、検証を通した後に固定 `0A000`（SQL-63 の契約）で止める。
 - 評価計画: `ValidatedJoin` に `cte_inputs`（`pub(crate)`。`None` なら従来の JOIN）を足し、到達できる CTE を
   slot（`Scan` 起点＝実表を読む本文、`Derived` 起点＝別 CTE の評価済みの行へ層を重ねる本文）にする。
