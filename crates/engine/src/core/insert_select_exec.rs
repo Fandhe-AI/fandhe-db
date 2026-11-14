@@ -276,10 +276,13 @@ impl EngineCore {
                         } else {
                             Some(&bound_triggers)
                         },
-                        do_update: matches!(
-                            conflict_action,
-                            crate::sql::parser::BoundConflictAction::DoUpdate { .. }
-                        ),
+                        update_set_columns: match conflict_action {
+                            crate::sql::parser::BoundConflictAction::DoUpdate {
+                                assignments,
+                                ..
+                            } => Some(assignments.iter().map(|(idx, _)| *idx).collect()),
+                            crate::sql::parser::BoundConflictAction::DoNothing => None,
+                        },
                     }
                 } else if returning.is_some() {
                     crate::tenant::LedgerOnlyTriggers::Insert(None)

@@ -2526,11 +2526,12 @@ pub(crate) enum LedgerOnlyTriggers<'a> {
     Skip,
     /// 0 行 INSERT 文としてトリガを分類・発火する（`None` は未結線で INSERT トリガがあれば `0A000`）。
     Insert(Option<&'a crate::trigger::TriggerRuntime<'a>>),
-    /// 0 行 UPSERT（Issue #3191）。INSERT 文トリガと、`do_update` のときは UPDATE 文トリガも 1 回ずつ発火する
-    /// （`None` の通過証は未結線で、該当トリガがあれば `0A000`。`UPDATE OF` 付きは SET 列が無いため `0A000`）。
+    /// 0 行 UPSERT（Issue #3191）。INSERT 文トリガと、`update_set_columns` が `Some` のとき（`DO UPDATE`）は
+    /// UPDATE 文トリガも 1 回ずつ発火する（`None` の通過証は未結線で、該当トリガがあれば `0A000`）。
+    /// `Some` の中身は `DO UPDATE SET` の対象列添字で、`UPDATE OF` の判定に使う（非空経路と同じ結果にする）。
     Upsert {
         triggers: Option<&'a crate::trigger::TriggerRuntime<'a>>,
-        do_update: bool,
+        update_set_columns: Option<Vec<usize>>,
     },
 }
 
@@ -2579,16 +2580,22 @@ pub(crate) fn record_ledger_only_unchecked(
             // UPDATE トリガを見ない）。
             LedgerOnlyTriggers::Upsert {
                 triggers,
-                do_update,
+                update_set_columns,
             } => (
                 crate::trigger::plan::plan_insert(write_txn, ctx.tenant_id(), table, triggers)?,
-                if do_update {
+                if let Some(mut set_columns) = update_set_columns {
+                    set_columns.sort_unstable();
+                    set_columns.dedup();
+                    let schema = require_table_schema_write_any_identity(write_txn, table)?;
                     crate::trigger::plan::plan_row_triggers(
                         write_txn,
                         ctx.tenant_id(),
                         table,
                         crate::catalog::trigger::TriggerEvents::UPDATE,
-                        None,
+                        Some(&crate::trigger::plan::UpdateTarget {
+                            schema: &schema,
+                            set_columns: &set_columns,
+                        }),
                         triggers,
                     )?
                 } else {

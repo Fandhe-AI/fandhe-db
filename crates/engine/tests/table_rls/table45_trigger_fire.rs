@@ -397,6 +397,37 @@ fn upsert_statement_triggers_and_replay() {
     assert_eq!(ints(&core, "t1", "SELECT n FROM s.uq"), vec![1]);
 }
 
+// 0 行の `INSERT ... SELECT ... ON CONFLICT DO UPDATE` でも、`UPDATE OF` 付き文トリガは `SET` 列で判定される
+// （0A000 にならず、行ありの経路と同じ結果。SET 列と交差しない `UPDATE OF` は発火しない）。
+#[test]
+fn upsert_zero_row_update_of_statement_trigger() {
+    let (_g, core) = open("t45fire-upsert-zero-update-of");
+    upsert_tables(&core, "t1");
+    func(&core, "t1", "stmt_audit", STMT_AUDIT);
+    upsert_trigger(
+        &core,
+        "t1",
+        "tn",
+        "AFTER UPDATE OF n FOR EACH STATEMENT",
+        "stmt_audit",
+    );
+    upsert_trigger(
+        &core,
+        "t1",
+        "tk",
+        "AFTER UPDATE OF k FOR EACH STATEMENT",
+        "stmt_audit",
+    );
+    ok(
+        &core,
+        "t1",
+        "INSERT INTO s.uq (k, n) SELECT k, n FROM s.uq WHERE k > 100 \
+         ON CONFLICT (k) DO UPDATE SET n = EXCLUDED.n",
+    );
+    // `UPDATE OF n` だけが 1 回発火する。
+    assert_eq!(texts(&core, "t1", "SELECT op FROM audit"), vec!["UPDATE"]);
+}
+
 // 明示 Tx の ROLLBACK では本表・トリガの書いた監査行がともに残らない。RETURNING 付きは `0A000`。
 #[test]
 fn upsert_rollback_and_returning_guard() {
