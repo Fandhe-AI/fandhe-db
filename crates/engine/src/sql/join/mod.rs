@@ -214,6 +214,14 @@ impl JoinBudget {
         Self::new(JoinLimits::default().budget_cap)
     }
 
+    /// 上限を `max` 以下に縮める（`min`）。`DECLARE CURSOR` が CTE 入力の JOIN を生成する際、
+    /// 文全体の予算をカーソル残容量で縛り、登録前に大きな結果を確保し切らないために使う
+    /// （Issue #3176）。使用済み量は変えない。
+    pub(crate) fn capped_at(mut self, max: usize) -> Self {
+        self.cap = self.cap.min(max);
+        self
+    }
+
     /// 上限を指定して作る（テスト専用。実行経路は [`Self::for_statement`] を使う）。
     #[cfg(test)]
     pub(crate) fn with_cap(cap: usize) -> Self {

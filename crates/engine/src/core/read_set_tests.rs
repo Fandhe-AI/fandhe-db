@@ -200,6 +200,31 @@ fn cursor_declare_records_the_inner_select() {
     assert_reads(&set, &["rf"]);
 }
 
+/// Issue #3176: 集合演算・CTE 入力の JOIN のカーソルも、読んだ全表を読み取り集合へ記録する。
+#[test]
+fn cursor_declare_records_set_operation_and_cte_join_tables() {
+    let (core, _g) = new_core("readset-cursor-setop-cte");
+    let mut session = SessionState::default();
+    seed(&core, &mut session);
+    let set = read_set_after(
+        &core,
+        &mut session,
+        &["DECLARE c CURSOR FOR SELECT id FROM rb UNION ALL SELECT id FROM rc"],
+    );
+    assert_reads(&set, &["rb", "rc"]);
+    assert_not_reads(&set, &["ra"]);
+    let set = read_set_after(
+        &core,
+        &mut session,
+        &[
+            "DECLARE c CURSOR FOR WITH w AS (SELECT id FROM rb LIMIT 10) \
+           SELECT w.id FROM w JOIN rc ON w.id = rc.id LIMIT 10",
+        ],
+    );
+    assert_reads(&set, &["rb", "rc"]);
+    assert_not_reads(&set, &["ra"]);
+}
+
 #[test]
 fn copy_to_stdout_records_the_inner_select() {
     let (core, _g) = new_core("readset-copy");
