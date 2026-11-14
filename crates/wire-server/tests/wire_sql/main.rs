@@ -89,6 +89,7 @@ mod wire_statement_timeout_setting;
 mod wire_trigger_copy;
 mod wire_trigger_ddl;
 mod wire_trigger_fire;
+mod wire_trigger_partitioned;
 mod wire_truncate_table;
 mod wire_type_name_alias_oid;
 mod wire_udf_call;
