@@ -107,6 +107,16 @@ pub(crate) fn plan_row_triggers<'a>(
     if matching.is_empty() {
         return Ok(None);
     }
+    // INSTEAD OF はビューにだけ定義できる（定義の段で表は `42809`）。表の経路でこの状態が見えたら、黙って
+    // AFTER 群へ振らず固定文言の `0A000` で拒否する（fail-closed。Issue #3193）。
+    if matching
+        .iter()
+        .any(|t| t.timing == TriggerTiming::InsteadOf)
+    {
+        return Err(unsupported(
+            "INSTEAD OF triggers are only supported on views",
+        ));
+    }
     let Some(runtime) = runtime else {
         return Err(unsupported(
             "triggers are not supported for this write path",
@@ -135,6 +145,46 @@ pub(crate) fn plan_row_triggers<'a>(
         before_stmt,
         after_stmt,
     }))
+}
+
+/// ビューへの INSTEAD OF ROW トリガの発火計画（名前のバイト順。Issue #3193）。
+pub(crate) struct InsteadOfPlan<'a> {
+    pub(crate) runtime: &'a TriggerRuntime<'a>,
+    pub(crate) triggers: Vec<TriggerDef>,
+}
+
+/// `tenant` のビュー `view_key` の `event`（`TriggerEvents::INSERT`・`UPDATE`・`DELETE`）に該当する
+/// INSTEAD OF ROW トリガを、書き込み txn の中で 1 回だけ読んで分類する（文の開始時に同じ txn から決める。
+/// 実行モデルの D5）。該当なしは `Ok(None)`（従来の自動書き換え経路）。該当があり `runtime` が `None`
+/// （未結線の経路）なら `0A000`。判定は書き込みテナント自身の scope のカタログだけで行い、他テナントの
+/// 定義・行の有無に依存しない（存在情報を応答の差に出さない）。
+pub(crate) fn plan_instead_of<'a>(
+    write_txn: &redb::WriteTransaction,
+    tenant: &str,
+    view_key: &str,
+    event: u8,
+    runtime: Option<&'a TriggerRuntime<'a>>,
+) -> Result<Option<InsteadOfPlan<'a>>, TenantWriteError> {
+    if !any_triggers_exist(write_txn)? {
+        return Ok(None);
+    }
+    let triggers: Vec<TriggerDef> = list_triggers_in_txn(write_txn, tenant, view_key)?
+        .into_iter()
+        .filter(|t| {
+            t.timing == TriggerTiming::InsteadOf
+                && t.level == TriggerLevel::Row
+                && t.events.contains(event)
+        })
+        .collect();
+    if triggers.is_empty() {
+        return Ok(None);
+    }
+    let Some(runtime) = runtime else {
+        return Err(unsupported(
+            "triggers are not supported for this write path",
+        ));
+    };
+    Ok(Some(InsteadOfPlan { runtime, triggers }))
 }
 
 /// TRUNCATE の発火計画（表ごと。BEFORE／AFTER 別のトリガ。Issue #1726）。

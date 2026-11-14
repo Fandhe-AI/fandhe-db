@@ -803,3 +803,9 @@ SQL-49・RLS-10 (b)・ERR-6 の `55000`。本節は設計判断の記録でコ�
 
 > Issue #2199 注記: 基表が採番方式の表（暗黙の `id` を持たない）のときの単一行形 `WHERE id = <n>` は、基表の通常の列への述語形へ
 > 書き換える（宣言の無い `id` は `42703`）。詳細は [rowid-primary-key-separation.md](rowid-primary-key-separation.md) の §11。
+
+## Issue #3193 追記（INSTEAD OF トリガとの優先順位）
+
+ビューに書き込みテナント自身の `INSTEAD OF` トリガ（該当イベント）があれば、更新可能性の判定より先にトリガへ
+振り分ける（自動書き換えより優先。更新可能ビューでも同じ）。自動更新不可（`55000`）の判定は、テナントを
+持てる実行段・Describe へ移した。詳細は [trigger-instead-of.md](trigger-instead-of.md)。

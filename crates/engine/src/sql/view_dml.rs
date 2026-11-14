@@ -5,6 +5,8 @@
 //! [`ValidatedUpdateForm`]・[`DeleteStatement`] へ名前の写像と述語の合成だけで書き換える。SQL 文字列は
 //! 組み立てず、書き換え後の束縛・RLS・制約・影響行数の上限・台帳・`RETURNING` の捕捉は既存の基表 DML
 //! 経路（`core.rs` の `execute_*_form` 系）にそのまま乗る（第 2 の書き込み経路を作らない）。
+//! INSTEAD OF トリガ（TABLE-45・Issue #3193）を持つビューへの書き込みは本モジュールを通らずトリガへ振り分けられる
+//! （`core::view_instead_of`。自動更新可能でもトリガを優先する）。
 //! 呼び出し元は `core.rs`: Parse 時は [`check_view_update`]／[`check_view_delete`]（判定だけ）、
 //! Execute／Describe 時は [`rewrite_view_update`]／[`rewrite_view_delete`]（現在のカタログで書き換え）
 //! を呼ぶ。Parse 時の写像は持ち越さない。INSERT 側は `sql::view_insert` で、写像器と `RETURNING` の

@@ -6487,6 +6487,9 @@ fn drop_view_in_txn(write_txn: &redb::WriteTransaction, name: &str) -> Result<()
     drop(views_table);
     privilege::remove_relation_acl_in_txn(write_txn, name)?;
     privilege::owner::remove_relation_owners_in_txn(write_txn, name)?;
+    // INSTEAD OF トリガ定義（全テナント分。TABLE-45・Issue #3193）。残置すると同名の表・ビューの再作成で
+    // 旧定義が復活する。
+    trigger::remove_triggers_for_table_in_txn(write_txn, name)?;
     // commit 記録（SQL-38・Issue #2404）: ビュー定義の変更は表世代を進めないため DDL として記録する。
     crate::storage::commit_log::note_ddl(write_txn, name);
     Ok(())
@@ -16256,6 +16259,8 @@ impl Storage {
                 drop(views_table);
                 privilege::remove_relation_acl_in_txn(&write_txn, name)?;
                 privilege::owner::remove_relation_owners_in_txn(&write_txn, name)?;
+                // INSTEAD OF トリガ定義（全テナント分。TABLE-45・Issue #3193）。
+                trigger::remove_triggers_for_table_in_txn(&write_txn, name)?;
                 // commit 記録（SQL-38・Issue #2404）: ビュー定義の変更は表世代を進めないため DDL として記録する。
                 crate::storage::commit_log::note_ddl(&write_txn, name);
                 Vec::new()

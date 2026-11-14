@@ -4,6 +4,8 @@
 //! の構造検証済みの形（[`ValidatedViewInsert`]）を、基表への [`ValidatedInsert`] へ名前の写像だけで
 //! 書き換える。SQL 文字列は組み立てず、書き換え後の束縛・実行・制約・RLS・台帳は既存の基表 INSERT
 //! 経路（`core.rs` の `execute_insert_form` 等）にそのまま乗る（第 2 の書き込み経路を作らない）。
+//! INSTEAD OF トリガ（TABLE-45・Issue #3193）を持つビューへの書き込みは本モジュールを通らずトリガへ振り分けられる
+//! （`core::view_instead_of`。自動更新可能でもトリガを優先する）。トリガの無いビューの挙動は変えない。
 //! 呼び出し元は `core.rs`: Parse 時は [`check_view_insert`]（判定だけ）、Execute／Describe 時は
 //! [`rewrite_view_insert`]（現在のカタログで書き換え）を呼ぶ。Parse 時の写像は持ち越さない。
 //!
