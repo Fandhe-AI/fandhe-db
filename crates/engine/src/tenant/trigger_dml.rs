@@ -18,6 +18,10 @@
 //! 全列を更新済みとして行う（fail-closed）。AFTER の失敗は文全体の失敗で、呼び出し元の txn が commit
 //! されないため行・トリガの書いた行・台帳・索引はいずれも残らない。トリガが書いた表の遅延 FK は
 //! [`super::trigger_insert`] と同じ規則で扱う。エラーは `TenantWriteError`（トリガ由来は `TriggerFailed`）。
+//!
+//! `RETURNING`（Issue #3192）: 適用段は行ごとのループの中で、書いた最終 NEW（UPDATE）・削除前の値（DELETE）を
+//! 呼び出し元の投影コールバックへ commit 前に渡す（`NULL` 返却でスキップした行は渡さない）。結合形は
+//! `RETURNING` を渡さない（`0A000` のまま）。
 
 use crate::storage::change_log::CaptureWriteTxn as _;
 use redb::ReadableTable;
@@ -26,8 +30,8 @@ use super::trigger_insert::settle_trigger_written_tables;
 use super::trigger_row_loop::RowLoopScope;
 use super::{
     captured_values_from_parts, encode_row, merge_row_for_update_set, resolve_update_set_values,
-    row_key, statement_writes, user_rows_table_def, user_rows_table_name, RowId, TenantWriteError,
-    WriteTarget,
+    row_key, statement_writes, user_rows_table_def, user_rows_table_name, CapturedRow,
+    CapturedRowOrigin, ReturningProjectFn, RowId, TenantWriteError, WriteTarget,
 };
 use crate::catalog::{map_row_table_error, CatalogError, ColumnType, TableSchema};
 use crate::policy::PolicyContext;
@@ -158,6 +162,10 @@ fn encode_final_row(
 
 /// `candidate_ids`（列挙済みの対象行）を、BEFORE UPDATE トリガを通して更新し、全行の後に制約検査・FK
 /// 検査・AFTER UPDATE トリガを行う。書き込み後の世代 bump・commit は呼び出し元の責務。
+///
+/// `project`（`RETURNING`。Issue #3192）が `Some` なら、書いた各行の最終 NEW を行ごとに commit 前・この
+/// write txn の中で 1 回ずつ渡す（BEFORE が `NULL` を返してスキップした行は渡さない。AFTER の影響は受けない）。
+/// 行ストアのハンドルは行ごとのブロックで閉じ済みの位置で呼ぶ。`Err` は txn の abort になる。
 #[allow(clippy::too_many_arguments)]
 pub(super) fn update_rows_with_triggers(
     write_txn: &redb::WriteTransaction,
@@ -169,6 +177,7 @@ pub(super) fn update_rows_with_triggers(
     spec: &UpdateSpec<'_>,
     plan: &RowTriggerPlan<'_>,
     writes: &TriggerWriteHandle<'_>,
+    mut project: Option<&mut ReturningProjectFn<'_>>,
     mut should_stop: Option<&mut dyn FnMut() -> bool>,
 ) -> Result<TriggeredDml, TenantWriteError> {
     // 対象行が 0 件でも `row_security = off` の拒否を文の開始時点で適用する（RLS-13・Issue #2278）。
@@ -298,6 +307,15 @@ pub(super) fn update_rows_with_triggers(
             pre_images.record(RowId::from_legacy_id(*id), old_values.clone());
         }
         written.push(RowId::from_legacy_id(*id));
+        if let Some(project) = project.as_mut() {
+            project(&CapturedRow {
+                id: *id,
+                tenant_id: ctx.tenant_id().to_string(),
+                visibility,
+                origin: CapturedRowOrigin::Updated,
+                values: final_row.clone(),
+            })?;
+        }
         if !plan.after.is_empty() {
             after_queue.push((old_values, final_row));
         }
@@ -389,6 +407,9 @@ pub(super) fn update_set_columns(spec: &UpdateSpec<'_>) -> Vec<usize> {
 
 /// `candidate_ids`（列挙済みの対象行）を、BEFORE DELETE トリガを通して削除し、全行の後に索引の後片付け・
 /// 参照先 FK 検査・AFTER DELETE トリガを行う。世代 bump・commit は呼び出し元の責務。
+///
+/// `project`（`RETURNING`。Issue #3192）が `Some` なら、BEFORE を通って実際に削除した各行の削除前の値を、
+/// 行ごとに commit 前・この write txn の中で 1 回ずつ渡す（`NULL` 相当でスキップした行は渡さない）。
 #[allow(clippy::too_many_arguments)]
 pub(super) fn delete_rows_with_triggers(
     write_txn: &redb::WriteTransaction,
@@ -399,6 +420,7 @@ pub(super) fn delete_rows_with_triggers(
     candidate_ids: &[u64],
     plan: &RowTriggerPlan<'_>,
     writes: &TriggerWriteHandle<'_>,
+    mut project: Option<&mut ReturningProjectFn<'_>>,
     mut should_stop: Option<&mut dyn FnMut() -> bool>,
 ) -> Result<TriggeredDml, TenantWriteError> {
     // `delete_row_impl` と同じ判定条件（`id` 参照 FK を含む）で、参照アクションの起点の旧値を残す。
@@ -431,6 +453,7 @@ pub(super) fn delete_rows_with_triggers(
         consumed = pos + 1;
         crate::interrupt::check().map_err(TenantWriteError::TriggerFailed)?;
         let existing = read_row(write_txn, table, ctx, *id)?;
+        let existing_visibility = existing.visibility;
         let old_values =
             captured_values_from_parts(schema, existing.embedding, &existing.metadata)?;
         if !plan.before.is_empty() {
@@ -464,6 +487,15 @@ pub(super) fn delete_rows_with_triggers(
             removed_pre_images.record(RowId::from_legacy_id(*id), old_values.clone());
         }
         removed.push(RowId::from_legacy_id(*id));
+        if let Some(project) = project.as_mut() {
+            project(&CapturedRow {
+                id: *id,
+                tenant_id: ctx.tenant_id().to_string(),
+                visibility: existing_visibility,
+                origin: CapturedRowOrigin::Deleted,
+                values: old_values.clone(),
+            })?;
+        }
         if !plan.after.is_empty() {
             after_queue.push(old_values);
         }

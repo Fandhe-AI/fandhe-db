@@ -23,8 +23,8 @@
 //! 呼び出し元は `tenant.rs` のみ。エラーは `TenantWriteError`（トリガ由来は `TriggerFailed`）。
 
 use super::{
-    encode_row, insert_unique_row, row_key, user_rows_table_def, user_rows_table_name, RowId,
-    TenantWriteError, WriteTarget,
+    encode_row, insert_unique_row, row_key, user_rows_table_def, user_rows_table_name, CapturedRow,
+    CapturedRowOrigin, ReturningProjectFn, RowId, TenantWriteError, WriteTarget,
 };
 use crate::catalog::{map_row_table_error, CatalogError, ColumnType, TableSchema};
 use crate::policy::PolicyContext;
@@ -46,6 +46,11 @@ const ROW_ENCODE_MISMATCH: &str = "trigger function returned a row that does not
 /// `writes` は文ごとに 1 個、呼び出し元が作って BEFORE STATEMENT から共有する（文トリガ・行トリガが
 /// 書いた表をまとめて遅延 FK の確定対象にするため。Issue #1726）。BEFORE STATEMENT は呼び出し元が
 /// 台帳の記録の後・SEQUENCE の採番の前に発火済みで、本関数は AFTER STATEMENT までを担う。
+///
+/// `project`（`RETURNING`。Issue #3192）が `Some` なら、BEFORE 連鎖・制約検査を通って書いた各行の
+/// 最終 NEW を、行ごとに commit 前・この write txn の中で 1 回ずつ渡す（`NULL` 返却でスキップした行は
+/// 渡さない。AFTER の書き換えは投影に影響しない）。表ハンドルは行ごとのブロックで閉じ済みのため、
+/// 投影コールバックは再入の不変条件を壊さない。`Err` は txn の abort（行・台帳・トリガの書き込みは残らない）。
 #[allow(clippy::too_many_arguments)]
 pub(super) fn write_rows_with_triggers(
     write_txn: &redb::WriteTransaction,
@@ -57,6 +62,7 @@ pub(super) fn write_rows_with_triggers(
     rows: &[(RowId, &[Value])],
     plan: &InsertTriggerPlan<'_>,
     writes: &TriggerWriteHandle<'_>,
+    mut project: Option<&mut ReturningProjectFn<'_>>,
 ) -> Result<(Vec<RowId>, bool), TenantWriteError> {
     // 行数が 0 でも `row_security = off` の拒否を開始時点で適用する（RLS-13・Issue #2278）。
     crate::sql::policy_eval::reject_row_security_off_in_txn(write_txn, ctx.tenant_id(), table)?;
@@ -140,6 +146,15 @@ pub(super) fn write_rows_with_triggers(
             crate::constraint::RowPolicyWrite::Insert,
         )?;
         written.push(*row_id);
+        if let Some(project) = project.as_mut() {
+            project(&CapturedRow {
+                id: row_id.legacy_id(),
+                tenant_id: ctx.tenant_id().to_string(),
+                visibility,
+                origin: CapturedRowOrigin::Inserted,
+                values: final_row.clone(),
+            })?;
+        }
         if !plan.after.is_empty() {
             after_queue.push(final_row);
         }

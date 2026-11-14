@@ -9,7 +9,7 @@ Issue #1724（親 #1720）の実装記録。上位の決定は [trigger-executio
 
 - SQL `INSERT ... VALUES`（単一行・複数行。autocommit・明示 Tx）と `INSERT ... SELECT` が、書き込み
   テナント自身の AFTER ROW トリガを文の終わりに発火する
-- 発火しない経路（UPSERT・RETURNING・NoSQL・ファイル形・生の行挿入・ビュー経由・データ変更 CTE の
+- 発火しない経路（UPSERT・NoSQL の RETURNING・ファイル形・生の行挿入・ビュー経由・データ変更 CTE の
   副文）は、INSERT トリガのある表で従来どおり `0A000`（台帳に触れない）。文トリガは Issue #1726 で結線済み
 - 受け入れ条件: 監査表への自動記録が動く。トリガ内でエラーが起きたら文全体がロールバックされる
   （行・監査行・台帳・索引とも残らない）
@@ -85,4 +85,4 @@ AFTER が失敗すれば台帳エントリも破棄され、D10 の「全トリ�
   #2226・#2228。入れ子の深さ上限（D11）は #1727 で実装済み
 - `WHEN` の評価・UPDATE／DELETE・UPSERT は #1725、文トリガ・TRUNCATE は #1726
 - crash-test・越境マトリクス・台帳との整合の強化は #1728
-- `RETURNING` の最終値投影・共有 `public` 表の全テナント発火（D9）は要判断
+- `RETURNING` の最終値投影は Issue #3192 で結線済み（AFTER 系は返却へ影響しない）。共有 `public` 表の全テナント発火（D9）は要判断

@@ -248,6 +248,8 @@ impl EngineCore {
                             predicate,
                             project,
                             true,
+                            // 結合形の `RETURNING` はトリガを発火しない（Issue #3192 の対象外。0A000 のまま）。
+                            None,
                         ),
                     }
                 }

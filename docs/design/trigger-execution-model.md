@@ -177,7 +177,7 @@
 | 分割実行 DML（SQL-32 ポインタ） | 行トリガ（BEFORE／AFTER ROW）はチャンクごとに発火し、文トリガ・子表のトリガ・NoSQL は `0A000`（Issue #3283。[trigger-partitioned-dml.md](trigger-partitioned-dml.md)）。文の途中で commit するため文トリガは原子性を保てない |
 | FK の参照アクションが、該当イベントのトリガを持つ子表に及ぶ形 | 文の開始時にカタログから静的に判定して `0A000`（PG は子表のトリガを発火させる。差分として記録） |
 | `COPY ... FROM STDIN`（永続表） | 結線（#3281）。セッション入口 `commit_copy_in_txn_in_session` だけが主体の写しと通過証を渡す。セッションなしの公開入口（`commit_copy_in`・ダンプ復元）は `0A000` のまま |
-| NoSQL（HTTP）表層の `insert`・単一行／述語形の `update`・`delete`（Issue #3282） | 結線済み。入口が `Some(&runtime.bind(self))` と発火元の主体の写し（`TriggerSubjectScope`）を渡す。`RETURNING` 付き・分割実行・UPSERT は未結線で `0A000` |
+| NoSQL（HTTP）表層の `insert`・単一行／述語形の `update`・`delete`（Issue #3282） | 結線済み。入口が `Some(&runtime.bind(self))` と発火元の主体の写し（`TriggerSubjectScope`）を渡す。`RETURNING` 付き・分割実行・UPSERT は未結線で `0A000`（SQL 表層の `RETURNING` 付きは Issue #3192 で結線済み） |
 | ビュー経由の書き込み・データ変更 CTE の副文 | 初版はガードにより `0A000`。結線は追跡候補 |
 | `ALTER TABLE` による行の書き換え・CTAS・マテリアライズドビューの更新 | 発火しない（PG と同じ。ガード対象外と明示） |
 
@@ -290,7 +290,7 @@
 | ---- | ------------ |
 | FK の検査と参照アクションを AFTER ROW のユーザートリガより前にまとめて行う | 単一検査点の維持（#1724・#1725） |
 | 参照アクションが及ぶ子表のトリガは `0A000` | 結線が未定のため。追跡候補 |
-| ビュー経由・データ変更 CTE の経路と、NoSQL の `RETURNING`・分割実行・UPSERT・生の行 API は `0A000` | 黙って発火しない経路を作らない（D8）。追跡候補 |
+| ビュー経由・データ変更 CTE の経路と、NoSQL の `RETURNING`・結合形の `RETURNING`・UPSERT・生の行 API は `0A000` | 黙って発火しない経路を作らない（D8）。追跡候補 |
 | 分割実行 DML では文トリガは `0A000`（行トリガは発火。Issue #3283） | 文の途中 commit で原子性を保てない |
 | 0 行の COPY では文トリガが発火しない（`finish()` が `22000` で拒否するため。PG は 0 行でも発火） | 既存の空 COPY 拒否を変えない（#3281）。追跡候補 |
 | ビューの文トリガ・一時表へのトリガは `0A000` | 初版の範囲外。追跡候補 |
