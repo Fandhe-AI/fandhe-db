@@ -26434,16 +26434,23 @@ pub(crate) fn validate_sql_tokens(
     )
 }
 
-/// [`validate_sql_tokens`] の入れ子系上限指定版（サブクエリ文脈なし。Issue #1552）。
-/// `DECLARE CURSOR ... FOR WITH ...` のように、サブクエリは許可しないが CTE 定義数・
-/// CTE 連鎖深さの起動時設定値（[`crate::nesting_limits::NestingLimits`]）を効かせたい
-/// 入口（`sql::cursor`）が呼ぶ。
-pub(crate) fn validate_sql_tokens_with_limits(
+/// `DECLARE CURSOR` の内側 SELECT 専用の検証入口（Issue #3176）。
+/// 通常の入口（`InlineOnly`。CTE 定義数・連鎖深さの起動時設定値を効かせる）と同じ検証に加え、`WITH` の JOIN 主クエリ（CTE を入力に
+/// 持つ JOIN）を受理する。集合演算・集計・広域取得・CTE 入力なしの JOIN は通常の入口と同じ。
+/// 具体化・派生表・関数呼び出し・再帰 CTE は開かない（[`CteEvaluation::CursorJoinInputs`]）。
+/// `sql::cursor::validate_declare_inner` だけが呼ぶ。
+pub(crate) fn validate_cursor_query_tokens(
     tokens: &[Token],
     lookup: &impl TableLookup,
     limits: crate::nesting_limits::NestingLimits,
 ) -> Result<Statement, SqlSurfaceError> {
-    validate_sql_tokens_impl(tokens, lookup, None, limits, CteEvaluation::InlineOnly)
+    validate_sql_tokens_impl(
+        tokens,
+        lookup,
+        None,
+        limits,
+        CteEvaluation::CursorJoinInputs,
+    )
 }
 
 /// [`validate_sql_tokens`] のサブクエリ許可版（Issue #927・TASK-213）。
@@ -27942,7 +27949,13 @@ fn validate_with_statement(
     // 参照できる。InlineOnly（ビュー本文・cursor・COPY・CTAS・サブクエリ内側）は従来どおり下の単一表の
     // 主クエリ解析へ流す（JOIN は `42601` のまま。fail-closed）。データ変更 CTE を含む JOIN 主クエリは、
     // 検証後に固定 `0A000` で止める（`validate_with_join_main`。書き込みを発生させない）。
-    if cte_evaluation == CteEvaluation::AllowMaterialize && looks_like_join(main_src) {
+    // Issue #3176: `DECLARE CURSOR` の内側（`CursorJoinInputs`）も JOIN 主クエリだけは受理する
+    // （データ変更 CTE を含む場合は同じく固定 `0A000`。書き込みへ到達しない）。
+    if matches!(
+        cte_evaluation,
+        CteEvaluation::AllowMaterialize | CteEvaluation::CursorJoinInputs
+    ) && looks_like_join(main_src)
+    {
         return Ok(WithOutcome::Read(validate_with_join_main(
             main_src, &ctes, lookup, limits,
         )?));
@@ -28328,6 +28341,12 @@ pub(crate) fn validate_window_spec_tokens(tokens: &[Token]) -> Result<(), SqlSur
 enum CteEvaluation {
     InlineOnly,
     AllowMaterialize,
+    /// `DECLARE CURSOR` の内側 SELECT 専用（Issue #3176）。`InlineOnly` と同じ扱いに加えて、
+    /// `WITH` の JOIN 主クエリ（CTE を入力に持つ JOIN）だけを許す。cursor の実行器は JOIN の
+    /// 文全体バイト予算をカーソル残容量で縛れるが、具体化（`BufferedView`）・派生表・FROM の
+    /// 関数呼び出し・再帰 CTE にはその経路が無いため、`AllowMaterialize` 専用の他のゲートは
+    /// すべて `InlineOnly` と同じく閉じたままにする（fail-closed）。
+    CursorJoinInputs,
 }
 
 /// トークン列に部分クエリ（`(SELECT`／`(WITH`／`(VALUES`）が含まれるか（再帰項の機能ゲート用）。
