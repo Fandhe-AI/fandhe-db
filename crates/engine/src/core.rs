@@ -189,6 +189,9 @@ mod trigger_after_insert_tests;
 // BEFORE・AFTER ROW UPDATE／DELETE トリガの発火の結合テスト（TABLE-45・Issue #1725）。
 #[cfg(test)]
 mod trigger_update_delete_tests;
+// `RETURNING` を伴う文でのトリガ発火の結合テスト（TABLE-45・SQL-21・Issue #3192）。
+#[cfg(test)]
+mod trigger_returning_tests;
 // NoSQL（HTTP）表層の書き込み入口でのトリガ発火の結合テスト（TABLE-45・Issue #3282）。
 #[cfg(test)]
 mod trigger_nosql_tests;
@@ -17428,6 +17431,7 @@ impl EngineCore {
                     self.ledger_mode,
                     projected,
                     schema,
+                    None,
                 )
             },
         )
@@ -18841,6 +18845,7 @@ impl EngineCore {
             self.ledger_mode,
             &projected,
             &schema,
+            None,
         )
     }
 
@@ -18886,6 +18891,7 @@ impl EngineCore {
             self.ledger_mode,
             &projected,
             &schema,
+            None,
         )
     }
 
@@ -20440,6 +20446,7 @@ impl EngineCore {
                     self.dml_ledger_mode(),
                     &returning,
                     &schema,
+                    Some(&self.trigger_runtime.bind(self)),
                 )
             }
             crate::sql::parser::BoundInsertForm::RowBatch(bounds) => {
@@ -20451,6 +20458,7 @@ impl EngineCore {
                     self.dml_ledger_mode(),
                     &returning,
                     &schema,
+                    Some(&self.trigger_runtime.bind(self)),
                 )
             }
             crate::sql::parser::BoundInsertForm::File(_) => {
@@ -20749,6 +20757,7 @@ impl EngineCore {
             self.dml_limits.max_affected_rows,
             self.scan_limits.max_scanned_rows(),
             returning,
+            None,
         )
     }
 
@@ -21263,6 +21272,7 @@ impl EngineCore {
             self.dml_limits.max_affected_rows,
             self.scan_limits.max_scanned_rows(),
             &returning,
+            Some(&self.trigger_runtime.bind(self)),
         )
     }
 
@@ -21301,6 +21311,7 @@ impl EngineCore {
             self.dml_ledger_mode(),
             &returning,
             &schema,
+            Some(&self.trigger_runtime.bind(self)),
         )
     }
 
@@ -21611,6 +21622,7 @@ impl EngineCore {
                     self.dml_ledger_mode(),
                     &returning,
                     &schema,
+                    Some(&self.trigger_runtime.bind(self)),
                 )
             }
             ValidatedUpdateForm::Predicate(validated) => {
@@ -21638,6 +21650,7 @@ impl EngineCore {
                     self.dml_limits.max_affected_rows,
                     self.scan_limits.max_scanned_rows(),
                     &returning,
+                    Some(&self.trigger_runtime.bind(self)),
                 )
             }
         }
@@ -21702,6 +21715,7 @@ impl EngineCore {
             self.dml_limits.max_affected_rows,
             self.scan_limits.max_scanned_rows(),
             returning,
+            None,
         )
     }
 

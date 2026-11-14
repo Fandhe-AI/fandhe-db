@@ -33,7 +33,7 @@
 | ---- | ---- |
 | SQL `INSERT ... VALUES`（単一行・複数行。autocommit・明示 Tx） | 発火 |
 | `INSERT ... SELECT` | 発火（BEFORE ROW。AFTER ROW は [trigger-after-insert.md](trigger-after-insert.md)） |
-| `INSERT ... RETURNING` | INSERT トリガのある表は `0A000`（最終値での投影は後続。下記） |
+| `INSERT ... RETURNING` | 発火（Issue #3192。返る行は BEFORE の連鎖後・制約検査後の最終 NEW。[sql-returning.md](sql-returning.md)） |
 | UPSERT（`ON CONFLICT`） | INSERT トリガのある表は `0A000`（#1725 で結線） |
 | NoSQL（HTTP）表層の `insert`（単行・`rows[]`。Issue #3282 で結線） | 発火する（入口が通過証と発火元の主体の写しを渡す） |
 | NoSQL の `RETURNING` 付き `insert`・ファイル形 INSERT・生の `RowInput` 挿入・ビュー経由・データ変更 CTE の副文 | INSERT トリガのある表は `0A000` |
@@ -92,6 +92,6 @@
 
 - トリガ関数の実体・`returns_trigger` の結線は #2228、SQL・wire の E2E は #3185 で済み。**実体を結線する前に、入れ子の深さ上限
   （D11・#1727）が要る**（同じ表に INSERT するトリガは無限再帰になりうる）
-- `RETURNING` の最終値での投影（txn 内の投影コールバック）、文トリガ（#1726）、
+- 文トリガ（#1726）、
   UPSERT・UPDATE／DELETE（#1725）、crash-test と越境マトリクス（#1728）
 - D9 の共有 `public` 表の全テナント発火（オーナー・spec 側の判断）

@@ -443,7 +443,8 @@ fn default_invoker_rejects_non_trigger_function() {
 
 // 文トリガ（INSERT）の発火は `trigger_statement_tests.rs`（Issue #1726）で固定する。
 
-// 発火に未対応の経路（RETURNING・生の型付き挿入・UPSERT）は、INSERT トリガのある表で `0A000`。
+// 発火に未対応の経路（生の型付き挿入・UPSERT）は、INSERT トリガのある表で `0A000`。RETURNING 付きの INSERT は
+// 発火する（Issue #3192。`trigger_returning_tests.rs`）。
 // 台帳は消費されない（同じ operation_id を、トリガを消した後の経路で使える）。
 #[test]
 fn unwired_paths_are_guarded_without_consuming_ledger() {
@@ -451,15 +452,6 @@ fn unwired_paths_are_guarded_without_consuming_ledger() {
     let (core, calls) = core_with(dir.path(), fill_n());
     let a = ctx("tenant-a");
     add_trigger(&core.storage, "tenant-a", "trg", &before_row("fill"));
-
-    let err = run(
-        &core,
-        &a,
-        "INSERT INTO trg (id, embedding, a, n) VALUES (1, '[1.0,0.0]', 'x', 1) \
-         RETURNING id USING OPERATION_ID 'op-ret'",
-    )
-    .unwrap_err();
-    assert_eq!(err.wire_code(), "0A000");
 
     let err = run(
         &core,
@@ -497,7 +489,7 @@ fn unwired_paths_are_guarded_without_consuming_ledger() {
         &core,
         &a,
         "INSERT INTO trg (id, embedding, a) VALUES (1, '[1.0,0.0]', 'x') \
-         USING OPERATION_ID 'op-ret'",
+         USING OPERATION_ID 'op-ups'",
     )
     .expect("operation id is not consumed by the guarded path");
 }

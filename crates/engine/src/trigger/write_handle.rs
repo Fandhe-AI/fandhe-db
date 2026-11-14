@@ -127,6 +127,7 @@ impl<'a> TriggerWriteHandle<'a> {
             // 入れ子で発火する。深さは `trigger::depth` が数え、超過は `54001`。通過証が無い
             // （未結線の）経路では書き込み先に INSERT トリガがあれば `0A000`（fail-closed）。
             self.runtime,
+            None,
         )
         .map_err(crate::sql::exec::map_insert_write_error)?;
         let mut written = self.written_tables.borrow_mut();
