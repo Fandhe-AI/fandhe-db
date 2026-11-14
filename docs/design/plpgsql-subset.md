@@ -973,8 +973,8 @@ SQL-67 の (2)(3)(5)(6)(7) のポインタ。仕様本文は転記しない。
 トリガの発火点は `SessionState`・`SessionTransaction` を持たない（外側の write txn と `PolicyContext` の借用だけ）。
 Issue #2228 の内部 API（`invoke_trigger_function_in_txn`）は両方を要求するため、発火経路から呼べなかった。本 Issue で
 `TriggerFunctionInvoker` の本番実装（`PlpgsqlTriggerInvoker`）と、セッション無しで本体を実行するホストを用意した。
-`EngineCore::new` の既定（未結線の `0A000`）の差し替えと wire・psql 経由の E2E は #3185 の担当で、本 Issue では
-既定を変えない（テストが `with_trigger_invoker_for_test` で注入して確かめる）。
+`EngineCore` の既定の差し替えと wire 経由の E2E は #3185 の担当で、本 Issue では
+既定を変えない（テストが `with_trigger_invoker_for_test` で注入して確かめる。差し替えは「Issue #3185 追記」）。
 
 ### 構成
 
@@ -1038,6 +1038,20 @@ Issue #2228 の内部 API（`invoke_trigger_function_in_txn`）は両方を要�
 - 入れ子のトリガ間の `ExecBudget` の合算（D11）は、`run_trigger_with_handle` が作る `ExecBudget` が、外側の予算が生きている間
   `interp.rs` の共有カウンタへ文数・反復数を合算する（テストでの固定は受け皿の Issue が無い。要対応事項）
 - 既定の差し替え・wire 経由の E2E は #3185、RLS・台帳・crash の網羅的な再検証は #3188
+
+## Issue #3185 追記（既定 invoker の本番への差し替えと INSERT 発火の E2E。TABLE-45・SQL-68・RLS-10 ポインタ）
+
+`EngineCore` の既定の呼び出し口を `PlpgsqlTriggerInvoker` に差し替えた（`TriggerRuntime::production`・`assemble` の 1 箇所）。
+トリガのある表への INSERT は、SQL・wire のどちらからも `0A000` にならず BEFORE ROW・AFTER STATEMENT が発火する。
+Issue #3184 節の「#3185 の担当」はこれで解消した。
+
+- 未結線の `UnwiredInvoker`・`TriggerRuntime::unwired`・`with_invoker`・`EngineCore::with_trigger_invoker_for_test` は
+  `cfg(test)` 限定のテスト専用口（発火側の意味論を invoker から切り離して固定する）。起動フラグ・セッション変数で
+  invoker を差し替える経路は無い。
+- セッションを持たない入口からの発火は、主体の写しが無いため固定文言の `0A000` のまま（fail-closed）。
+- 経路ガード（D8）・本体の未対応形（#3186・#3187 ほか）の `0A000` は変えない。
+- 検証: `tests/table_rls/table45_trigger_fire.rs`（公開 API のみ）・`wire_sql/wire_trigger_fire.rs`（簡易・拡張クエリ、
+  末尾 `;` 付き単独文を含む）。台帳・RLS 越境・crash の網羅的な再検証は #3188。
 
 ## Issue #3186 追記（トリガ本体の `UPDATE`。TABLE-45・SQL-68・RLS-10・SQL-19 ポインタ）
 

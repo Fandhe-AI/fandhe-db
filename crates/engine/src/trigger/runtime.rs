@@ -9,8 +9,10 @@
 
 use std::sync::Arc;
 
+#[cfg(test)]
+use super::call::UnwiredInvoker;
 use super::call::{
-    TriggerCall, TriggerFunctionInvoker, TriggerHost, TriggerOutcome, UnwiredInvoker,
+    PlpgsqlTriggerInvoker, TriggerCall, TriggerFunctionInvoker, TriggerHost, TriggerOutcome,
 };
 use super::depth;
 use crate::sql::allowlist::SqlSurfaceError;
@@ -28,7 +30,19 @@ pub(crate) struct TriggerRuntime<'h> {
 }
 
 impl TriggerRuntime<'static> {
-    /// 既定（未結線。トリガ関数の実行は `0A000`。深さ上限は既定）。
+    /// 本番の既定（Issue #3185）。invoker は `PlpgsqlTriggerInvoker`、ホスト未束縛、深さ上限は既定。
+    /// `EngineCore::assemble` が全構築子の共通点で 1 回だけ使う。
+    pub(crate) fn production() -> Self {
+        Self {
+            invoker: Arc::new(PlpgsqlTriggerInvoker),
+            limits: TriggerLimits::default(),
+            host: None,
+        }
+    }
+
+    /// テスト専用の未結線（トリガ関数の実行は常に `0A000`）。発火側の意味論を invoker から切り離して
+    /// 固定するための差し替え口で、本番のビルドからは到達できない。
+    #[cfg(test)]
     pub(crate) fn unwired() -> Self {
         Self {
             invoker: Arc::new(UnwiredInvoker),
@@ -37,8 +51,8 @@ impl TriggerRuntime<'static> {
         }
     }
 
-    /// 呼び出し口を差し替えた通過証（本番の invoker は `PlpgsqlTriggerInvoker`（Issue #3184）、既定への差し替えは #3185。テストが使う）。
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// 呼び出し口を差し替えた通過証（テスト専用。本番の既定は [`Self::production`]）。
+    #[cfg(test)]
     pub(crate) fn with_invoker(invoker: Arc<dyn TriggerFunctionInvoker>) -> Self {
         Self {
             invoker,
