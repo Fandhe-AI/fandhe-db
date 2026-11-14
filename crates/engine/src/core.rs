@@ -18249,6 +18249,7 @@ impl EngineCore {
             bounds,
             schema: bound_schema,
             evaluated_at,
+            clock,
             // 一時表向けの印は呼び出し元（`commit_copy_in*` の各入口）が振り分け済み。ここでは使わない。
             temp: _,
             row_security,
@@ -18279,6 +18280,11 @@ impl EngineCore {
             allowed
                 .map_err(|()| crate::sql::allowlist::SqlSurfaceError::RelationPermissionDenied)?;
         }
+        // Issue #3281・SQL-37: トリガ発火時の `now()` 等を、COPY 開始時に確定した単一の文時刻
+        // （明示 Tx はトランザクション開始時刻）で全発火に共有させる。トリガ無しの経路は従来どおり。
+        let _trigger_clock_scope = triggers
+            .is_some()
+            .then(|| crate::sql::time_fn::ClockScope::enter(clock));
         self.execute_bound_insert_with_target(
             target,
             ctx,

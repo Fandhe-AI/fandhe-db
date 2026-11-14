@@ -1261,6 +1261,7 @@ impl CopyInSession {
             bounds: sink.bounds,
             schema: *sink.schema,
             evaluated_at: sink.clock_used.then_some(sink.clock.txn_start_micros),
+            clock: sink.clock,
             temp,
             row_security,
             privilege_recheck,
@@ -1279,6 +1280,9 @@ pub struct CopyInBatch {
     pub(crate) schema: TableSchema,
     /// 時刻 DEFAULT を評価した場合の台帳 v3 評価時刻（トランザクション開始時刻。Issue #2188）。
     pub(crate) evaluated_at: Option<i64>,
+    /// COPY 開始時に確定した文・トランザクション時刻（明示 Tx ではトランザクション開始時刻。
+    /// SQL-37・Issue #3281）。トリガ発火時に全発火で共有させるため commit 経路へ引き継ぐ。
+    pub(crate) clock: crate::sql::time_fn::StatementClock,
     /// 一時表向けのバッチなら対象ストアと準備時の一時カタログ世代（`CopyInSession::with_temp`）。
     pub(crate) temp: Option<crate::sql::temp_rows::TempCopyTarget>,
     /// COPY 開始時のセッションの `row_security`（[`CopyInSession`] から引き継ぐ。RLS-13・Issue #2278）。

@@ -165,7 +165,7 @@ fn copy_in<'e>(
     data: &[u8],
 ) -> Result<InsertOutcome, SqlSurfaceError> {
     let policy = ctx(tenant);
-    let plan = core.begin_copy(&policy, s, sql)?;
+    let plan = core.begin_copy_in_txn(&policy, s, txn, sql)?;
     let CopyPlan::From(mut cs) = plan else {
         panic!("expected COPY FROM STDIN plan");
     };
@@ -386,10 +386,10 @@ fn trigger_does_not_cross_tenants() {
     assert_eq!(ints(&core, "t2", &mut b, "SELECT n FROM tt"), vec![1, 3]);
 }
 
-// 未対応の本体（本体の DELETE）は `0A000` で、残骸を残さない。
+// 窓口の許可リストに無い本体（`INSERT ... SELECT`）は `0A000` で、残骸を残さない。
+// 本体の `DELETE`・表を読む `SELECT` は Issue #3187 で対応済み。
 //
-// tracked: #3187
-// 本体の `DELETE` は窓口を広げる #3187 までの暫定の拒否。
+// intentional: docs/design/plpgsql-subset.md
 #[test]
 fn unsupported_body_is_0a000_without_residue() {
     let (_g, core) = open("t3281-unsupported");
@@ -401,7 +401,7 @@ fn unsupported_body_is_0a000_without_residue() {
         "t1",
         &mut a,
         "upd",
-        "BEGIN INSERT INTO audit (n) VALUES (50); DELETE FROM audit WHERE n = 50; RETURN NEW; END",
+        "BEGIN INSERT INTO audit (n) VALUES (50); INSERT INTO audit (n) SELECT 51; RETURN NEW; END",
     );
     trig(
         &core,
@@ -438,4 +438,94 @@ fn sessionless_entry_stays_0a000() {
     let e = core.commit_copy_in(&policy, batch).expect_err("0A000");
     assert_eq!(e.wire_code(), "0A000");
     assert!(ints(&core, "t1", &mut a, "SELECT n FROM tt").is_empty());
+}
+
+/// 本体が `now()` を `audit_ts` へ記録する BEFORE ROW トリガを付ける（Issue #3281・SQL-37）。
+fn clock_trigger(core: &EngineCore, tenant: &str, s: &mut SessionState) {
+    setup(core, tenant, s);
+    // 監査表は共有 `public`（トリガ本体は SCHEMA 修飾の書き込み先を受けない）へ作る。
+    let mut ddl = SessionState::default();
+    ddl.allow_ddl();
+    core.execute_sql_in_session(
+        &ctx(tenant),
+        &mut ddl,
+        "CREATE TABLE audit_ts (ts TIMESTAMP)",
+    )
+    .expect("create audit_ts");
+    func(
+        core,
+        tenant,
+        s,
+        "clk",
+        "BEGIN INSERT INTO audit_ts (ts) VALUES (now()); RETURN NEW; END",
+    );
+    trig(core, tenant, s, "BEFORE INSERT FOR EACH ROW", "clk", "tc");
+}
+
+fn ts_cells(core: &EngineCore, tenant: &str, s: &mut SessionState) -> Vec<Cell> {
+    match ok(core, tenant, s, "SELECT ts FROM audit_ts") {
+        SqlOutcome::Query(q) => q
+            .rows
+            .into_iter()
+            .filter_map(|r| r.cells.into_iter().next())
+            .collect(),
+        other => panic!("expected query, got {other:?}"),
+    }
+}
+
+// 複数行 COPY のトリガ本体の `now()` は全行で同一（COPY 開始時に確定した文時刻を共有する）。
+#[test]
+fn copy_trigger_now_is_same_for_all_rows() {
+    let (_g, core) = open("t3281-clock");
+    let mut a = tenant_session(&core, "t1");
+    clock_trigger(&core, "t1", &mut a);
+    let rows: String = (0..20).map(|i| format!("{i}\n")).collect();
+    copy(
+        &core,
+        "t1",
+        &mut a,
+        "COPY tt (n) FROM STDIN",
+        rows.as_bytes(),
+    )
+    .expect("copy");
+    let ts = ts_cells(&core, "t1", &mut a);
+    assert_eq!(ts.len(), 20);
+    assert!(ts.iter().all(|c| c == &ts[0]), "now() must be shared");
+}
+
+// 明示 Tx の COPY のトリガ本体の `now()` は BEGIN 時点（トランザクション開始時刻）になる。
+#[test]
+fn copy_trigger_now_is_txn_start_in_explicit_txn() {
+    let (_g, core) = open("t3281-clock-txn");
+    let mut a = tenant_session(&core, "t1");
+    clock_trigger(&core, "t1", &mut a);
+    let c = ctx("t1");
+    let mut txn = core.new_session_transaction();
+    core.execute_sql_in_txn(&c, &mut a, &mut txn, "BEGIN")
+        .expect("begin");
+    let begin_now = match core
+        .execute_sql_in_txn(&c, &mut a, &mut txn, "SELECT now()")
+        .expect("now")
+    {
+        SqlOutcome::Query(q) => q.rows[0].cells[0].clone(),
+        other => panic!("expected query, got {other:?}"),
+    };
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    copy_in(
+        &core,
+        "t1",
+        &mut a,
+        &mut txn,
+        "COPY tt (n) FROM STDIN",
+        b"1\n2\n3\n",
+    )
+    .expect("copy in txn");
+    core.execute_sql_in_txn(&c, &mut a, &mut txn, "COMMIT")
+        .expect("commit");
+    let ts = ts_cells(&core, "t1", &mut a);
+    assert_eq!(ts.len(), 3);
+    assert!(
+        ts.iter().all(|c| c == &begin_now),
+        "now() must be BEGIN time"
+    );
 }

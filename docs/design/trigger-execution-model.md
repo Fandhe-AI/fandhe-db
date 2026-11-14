@@ -230,7 +230,9 @@
 > （`TriggerSubjectScope`）と通過証を張り、INSERT と同じ実行器・同じ順序で BEFORE／AFTER の行・文トリガを発火させる。
 > 台帳・原子性・テナント境界は INSERT と共通。明示 Tx ではトリガが書いた表も遅延 FK 検査の対象にする。
 > 一時表の COPY・セッションなしの入口は通過証なし（`0A000`）。
-
+> トリガ本体の `now()` 等は、COPY 開始時に確定した単一の文時刻（明示 Tx はトランザクション開始時刻。
+> SQL-37）を全発火で共有する。0 行の COPY は `finish()` が `22000` で拒否するため文トリガは発火しない。
+>
 > Issue #1728 の実装記録: [trigger-ledger-consistency.md](trigger-ledger-consistency.md)
 > （再送・越境・クラッシュ注入のテストで D10 を固定。本番コードの変更なし）。
 
