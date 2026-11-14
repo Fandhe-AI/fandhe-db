@@ -1461,7 +1461,7 @@ impl Accumulator {
             }
             _ => {
                 let value = eval_aggregate_input(input, id, vector, scanned, scratch)?;
-                self.observe_value(value)
+                self.observe_value_inline(value)
             }
         }
     }
@@ -1471,7 +1471,22 @@ impl Accumulator {
     ///
     /// ウィンドウ評価段（`sql::window`）も、行ごとに先に評価した式入力（Issue #1895）を
     /// この入口へ渡す。
+    ///
+    /// 本体は [`Self::observe_value_inline`] にあり、これは `sql::window` 向けの薄い入口。
+    /// 呼び出し元が 2 つになった #2761 で本体が集計の行ループへインライン化されなくなり
+    /// 退行したため、集計経路（[`Self::observe`] の `_` 腕）は inline 版を直接呼ぶ
+    /// （Issue #3209）。この入口へ呼び出し元を足してもインライン化は外れない。
     pub(crate) fn observe_value(
+        &mut self,
+        value: AggregateRowValue<'_>,
+    ) -> Result<(), SqlSurfaceError> {
+        self.observe_value_inline(value)
+    }
+
+    /// [`Self::observe_value`] の本体。集計の行ループへ確実にインライン化する
+    /// （Issue #3209。#2761 の是正）。意味論は `observe_value` と同一。
+    #[inline(always)]
+    fn observe_value_inline(
         &mut self,
         value: AggregateRowValue<'_>,
     ) -> Result<(), SqlSurfaceError> {

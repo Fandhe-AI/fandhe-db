@@ -30,7 +30,8 @@ Issue #1725（親 #1720）の実装記録。上位の決定は [trigger-executio
 | 分割実行 DML | 該当イベントのトリガがあれば `0A000` |
 | `RETURNING` 付きの UPDATE／DELETE | 該当イベントのトリガがあれば `0A000`（最終値の投影は後続） |
 | UPSERT（`ON CONFLICT`） | INSERT・UPDATE のどちらかのトリガがあれば `0A000`（`DO UPDATE` を発火させるのは後続） |
-| NoSQL の更新・削除（述語形を含む。入口で通過証を渡さず `None` で分類する）、生の行 API、`replace_typed_rows_by_text_key` | 該当イベントのトリガがあれば `0A000` |
+| NoSQL（HTTP）表層の単一行・述語形の更新・削除（Issue #3282 で結線。入口が通過証と発火元の主体の写しを渡し、SQL 表層と同じ実行器・発火計画を使う） | 発火する |
+| NoSQL の `RETURNING` 付き更新・削除、生の行 API、`replace_typed_rows_by_text_key` | 該当イベントのトリガがあれば `0A000`（`RETURNING` の受け皿は #3189。他は意図的に未結線） |
 | 参照アクション（CASCADE・SET NULL・SET DEFAULT）が及ぶ子表に該当イベントのトリガ | ROW トリガは子行ごとに発火（Issue #3284 の実装記録。`constraint/referential_triggers.rs`）。親にトリガが無くても、文の開始時にカタログの FK 宣言から静的に判定して発火経路に載せる。自己参照 FK の対象表自身も子表に数える。子表の文トリガと、結線の無い経路は `0A000` |
 | 文トリガ（UPDATE・DELETE の STATEMENT） | 発火（[trigger-statement-truncate.md](trigger-statement-truncate.md)。Issue #1726） |
 | `WHEN` 付き | `0A000` のまま（発火時にも二重に拒否。評価は後続） |

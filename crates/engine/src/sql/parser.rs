@@ -4068,7 +4068,9 @@ pub fn bind_insert_identity(
     stmt: &ValidatedInsert,
     schema: &TableSchema,
 ) -> Result<BoundInsert, SqlSurfaceError> {
-    bind_insert_impl(stmt, schema, false, IdOmission::Identity)
+    // NOT NULL 検査は SQL 行 INSERT と同じく書き込み段へ延期する（BEFORE ROW トリガが省略列を補えるように。
+    // トリガが無い・補われないときは書き込み段が `23502` で fail-closed。Issue #3282）。
+    bind_insert_impl(stmt, schema, true, IdOmission::Identity)
 }
 
 /// [`bind_insert`] の本体。`defer_not_null` が真なら、省略された非 nullable 列（DEFAULT なし）の

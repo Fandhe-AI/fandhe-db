@@ -292,59 +292,6 @@ fn self_referencing_table_triggers_fire() {
     assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
 
-// NoSQL の述語形 update・delete は、該当イベントのトリガがあれば 0A000（発火経路に載せない）。
-#[test]
-fn nosql_predicate_paths_are_rejected_when_triggers_exist() {
-    let dir = tempdir();
-    let (core, calls) = seeded(dir.path(), passthrough());
-    let a = ctx("tenant-a");
-    add_trigger(
-        &core.storage,
-        "tenant-a",
-        "trg",
-        &dml_trigger("t", TriggerTiming::Before, UPD | DEL, &[]),
-    );
-    let op = crate::recovery::required_op_id::OperationId::parse("op-nosql").expect("op");
-    let err = core
-        .execute_bound_predicate_update_in_session(
-            &a,
-            &crate::sql::mode::SessionState::default(),
-            "trg",
-            Some(&op),
-            |_| {
-                Ok((
-                    vec![(
-                        "n".to_string(),
-                        crate::sql::allowlist::InsertLiteral::Number("1".to_string()),
-                    )],
-                    vec![crate::sql::allowlist::WherePredicate::Equality {
-                        column: "a".to_string(),
-                        value: "x".to_string(),
-                    }],
-                ))
-            },
-        )
-        .expect_err("update");
-    assert_eq!(err.wire_code(), "0A000");
-    let err = core
-        .execute_bound_predicate_delete_in_session(
-            &a,
-            &crate::sql::mode::SessionState::default(),
-            "trg",
-            Some(&op),
-            |_| {
-                Ok(vec![crate::sql::allowlist::WherePredicate::Equality {
-                    column: "a".to_string(),
-                    value: "x".to_string(),
-                }])
-            },
-        )
-        .expect_err("delete");
-    assert_eq!(err.wire_code(), "0A000");
-    assert_eq!(calls.load(Ordering::SeqCst), 0);
-    assert_eq!(count(&core, &a, "trg"), 3);
-}
-
 // AFTER だけのトリガ・値を書き換え得ない構成では、NOT NULL 違反は束縛時に 23502（行の有無で分かれない）。
 #[test]
 fn not_null_is_checked_at_bind_without_before_trigger() {
