@@ -265,8 +265,8 @@ impl EngineCore {
                 req.operation_id.as_ref(),
                 self.ledger_mode,
                 &req.statement_hash,
-                // INSERT 文トリガは 0 行でも 1 回発火する（Issue #1726）。RETURNING 付きは未結線
-                // （INSERT トリガがあれば `0A000`）。
+                // INSERT 文トリガは 0 行でも 1 回発火する（Issue #1726）。RETURNING 付きでも同様で、
+                // 0 行を返しつつ文トリガを発火する（非空経路と同じ runtime を渡す）。
                 // `ON CONFLICT` 付きは非空と同じく INSERT 文トリガと（`DO UPDATE` なら）UPDATE 文トリガを
                 // 1 回ずつ発火する（Issue #3191）。`RETURNING` 付きは未結線（トリガがあれば `0A000`）。
                 if let Some((_, conflict_action)) = &upsert_plan {
@@ -284,8 +284,6 @@ impl EngineCore {
                             crate::sql::parser::BoundConflictAction::DoNothing => None,
                         },
                     }
-                } else if returning.is_some() {
-                    crate::tenant::LedgerOnlyTriggers::Insert(None)
                 } else {
                     crate::tenant::LedgerOnlyTriggers::Insert(Some(&bound_triggers))
                 },
@@ -377,6 +375,7 @@ impl EngineCore {
                 self.ledger_mode,
                 &projection,
                 &schema,
+                Some(&self.trigger_runtime.bind(self)),
             )
             .map(SqlOutcome::Returning),
         }
