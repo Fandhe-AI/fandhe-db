@@ -478,3 +478,136 @@ fn wire_create_and_dml_resolve_into_own_schema_with_trailing_semicolon() {
         read_ready_for_query(&mut bob);
     }
 }
+/// Bind 済みの portal を Execute し、DataRow の先頭セルを集める。
+fn execute_first_cells(stream: &mut TcpStream, portal: &str) -> Vec<Option<String>> {
+    send_length_prefixed_message(stream, b'E', &execute_body(portal, 0));
+    let mut cells = Vec::new();
+    loop {
+        let (kind, body) = read_message(stream);
+        match kind {
+            b'D' => cells.push(first_cell(&body)),
+            b'C' => break,
+            other => panic!("unexpected message {}", other as char),
+        }
+    }
+    cells
+}
+
+/// Issue #3197: Parse 後に（psql 形の末尾 `;` 付きで）`SET search_path` すると、`public` が見える path でも
+/// 同じ準備済み文（`$n` あり・なし・Describe）が新しい path で解決し直される。`RESET` で元へ戻る。
+#[test]
+fn wire_extended_query_re_resolves_after_search_path_change() {
+    let (core, _guard) = new_core();
+    let store = allowed_store(&[("alice", "tenant-a", "correct-horse")], &["alice"]);
+    let addr = spawn_server(store, core);
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+    simple_ok(&mut stream, "CREATE SCHEMA q1");
+    simple_ok(
+        &mut stream,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, name TEXT)",
+    );
+    simple_ok(&mut stream, "INSERT INTO t (id, name) VALUES (1, 'a')");
+    simple_ok(
+        &mut stream,
+        "CREATE TABLE q1.t (id BIGINT PRIMARY KEY, name TEXT)",
+    );
+    simple_ok(&mut stream, "INSERT INTO q1.t (id, name) VALUES (10, 'x')");
+
+    send_length_prefixed_message(
+        &mut stream,
+        b'P',
+        &parse_body("plain", "SELECT id FROM t LIMIT 5", 0),
+    );
+    assert_eq!(read_message(&mut stream).0, b'1');
+    send_length_prefixed_message(
+        &mut stream,
+        b'P',
+        &parse_body("param", "SELECT id FROM t WHERE id > $1 LIMIT 5", 0),
+    );
+    assert_eq!(read_message(&mut stream).0, b'1');
+    sync(&mut stream);
+
+    let run_both = |stream: &mut TcpStream, expected: &str| {
+        send_length_prefixed_message(stream, b'B', &bind_body("p0", "plain"));
+        assert_eq!(read_message(stream).0, b'2');
+        assert_eq!(
+            execute_first_cells(stream, "p0"),
+            vec![Some(expected.to_string())]
+        );
+        sync(stream);
+        send_length_prefixed_message(stream, b'B', &bind_body_one_param("p1", "param", "0"));
+        assert_eq!(read_message(stream).0, b'2');
+        assert_eq!(
+            execute_first_cells(stream, "p1"),
+            vec![Some(expected.to_string())]
+        );
+        sync(stream);
+    };
+    run_both(&mut stream, "1");
+
+    // `public` が見える path へ変えても、Parse 時の解決結果を使い回さず q1.t へ解決される。
+    assert_eq!(
+        simple_ok(&mut stream, "SET search_path TO q1, public;"),
+        "SET"
+    );
+    run_both(&mut stream, "10");
+    // Describe(Statement) も再解決後の文で応答する（ParameterDescription の後に RowDescription）。
+    send_length_prefixed_message(&mut stream, b'D', b"Splain\0");
+    assert_eq!(read_message(&mut stream).0, b't');
+    assert_eq!(read_message(&mut stream).0, b'T');
+    sync(&mut stream);
+
+    // 拡張クエリの INSERT（`$n`）も path の先頭の SCHEMA に入る。
+    send_length_prefixed_message(
+        &mut stream,
+        b'P',
+        &parse_body("ins", "INSERT INTO t (id, name) VALUES ($1, 'n')", 0),
+    );
+    assert_eq!(read_message(&mut stream).0, b'1');
+    send_length_prefixed_message(&mut stream, b'B', &bind_body_one_param("p2", "ins", "11"));
+    assert_eq!(read_message(&mut stream).0, b'2');
+    send_length_prefixed_message(&mut stream, b'E', &execute_body("p2", 0));
+    assert_eq!(read_message(&mut stream).0, b'C');
+    sync(&mut stream);
+    send_simple_query(&mut stream, "SELECT id FROM q1.t ORDER BY id;");
+    let _ = read_row_description(&mut stream);
+    assert_eq!(read_data_row(&mut stream), vec![Some("10".to_string())]);
+    assert_eq!(read_data_row(&mut stream), vec![Some("11".to_string())]);
+    assert_eq!(read_command_complete(&mut stream), "SELECT 2");
+    read_ready_for_query(&mut stream);
+
+    assert_eq!(simple_ok(&mut stream, "RESET search_path;"), "RESET");
+    run_both(&mut stream, "1");
+}
+
+/// Issue #3197: 他テナントの SCHEMA には解決されず、`42P01` の文言に内部キー・他テナントの名前が出ない。
+#[test]
+fn wire_extended_query_does_not_resolve_into_another_tenants_schema() {
+    let (core, _guard) = new_core();
+    let store = allowed_store(
+        &[
+            ("alice", "tenant-a", "correct-horse"),
+            ("bob", "tenant-b", "battery-staple"),
+        ],
+        &["alice", "bob"],
+    );
+    let addr = spawn_server(store, core);
+    let mut alice = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+    let mut bob = authenticate_to_ready_for_query(addr, "bob", "battery-staple");
+    simple_ok(&mut alice, "CREATE SCHEMA q1");
+    simple_ok(&mut alice, "CREATE TABLE q1.t (id BIGINT PRIMARY KEY)");
+    simple_ok(&mut alice, "INSERT INTO q1.t (id) VALUES (10)");
+
+    simple_ok(&mut bob, "SET search_path TO q1;");
+    send_length_prefixed_message(
+        &mut bob,
+        b'P',
+        &parse_body("s", "SELECT id FROM t LIMIT 5", 0),
+    );
+    let (kind, body) = read_message(&mut bob);
+    assert_eq!(kind, b'E', "ErrorResponse");
+    let text = String::from_utf8_lossy(&body).into_owned();
+    assert!(text.contains("C42P01"), "{text}");
+    assert!(!text.contains('#'), "{text}");
+    sync(&mut bob);
+}
