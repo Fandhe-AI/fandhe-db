@@ -163,6 +163,26 @@ fn insert_needs_insert_and_returning_needs_select() {
     assert_eq!(f.count("ca"), 2);
 }
 
+/// `UPDATE ... FROM`／`DELETE ... USING` の `RETURNING` は FROM／USING 側の列を直接返す（Issue #3204）。
+/// 書き込み先の権限だけでは足りず、読み取り側の表への `SELECT` が無いロールは `42501` で拒否され、
+/// 行は変化しない。付与後は同じ文が通る。
+#[test]
+fn joined_dml_returning_needs_select_on_the_from_table() {
+    let f = fx("dmlpriv-joined-returning");
+    f.admin_run(&ins("ca", 1, "j1"));
+    f.admin_run(&ins("cb", 1, "j2"));
+    f.admin_run("GRANT SELECT, UPDATE, DELETE ON ca TO alice");
+    let upd = "UPDATE ca SET n = 7 FROM cb WHERE ca.id = cb.id RETURNING cb.n";
+    let del = "DELETE FROM ca USING cb WHERE ca.id = cb.id RETURNING cb.n";
+    assert_eq!(f.alice_run(upd), "42501");
+    assert_eq!(f.alice_run(del), "42501");
+    assert_eq!(f.count("ca"), 1);
+    f.admin_run("GRANT SELECT ON cb TO alice");
+    assert_eq!(f.alice_run(upd), "ok");
+    assert_eq!(f.alice_run(del), "ok");
+    assert_eq!(f.count("ca"), 0);
+}
+
 /// HTTP（NoSQL）表層の `RETURNING` 付き束縛済み入口（NOSQL-22・Issue #2091）は、書き込み権限に加えて
 /// `SELECT` を要求する（SQL 表層の `RETURNING` 付き文と同じ。全列要求で SQL より厳しい側）。
 /// 拒否時は行・台帳とも変化せず、`SELECT` 付与後の同じ `operation_id` の再送は新規として成功する。

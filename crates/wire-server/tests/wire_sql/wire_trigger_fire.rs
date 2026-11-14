@@ -264,3 +264,49 @@ fn wire_trigger_does_not_fire_for_other_tenant() {
     assert!(select_col(&mut b, "SELECT lv FROM audit").is_empty());
     assert!(select_col(&mut a, "SELECT lv FROM audit").is_empty());
 }
+
+/// 台帳（Issue #3188）: `USING OPERATION_ID` つきの INSERT（末尾 `;` 付きの単独送信）の再送は `23505` で、
+/// トリガ本体は再実行されず、同じ接続で次の文が実行できる。内容違いの再送は `22023`。他テナントが同じ
+/// operation_id を使っても alice のトリガは発火しない。
+#[test]
+fn wire_replay_with_operation_id_is_rejected_without_refiring() {
+    let (addr, _g) = serve();
+    let mut a = connect(addr, "alice", "pw-alice");
+    setup(&mut a);
+    exec(
+        &mut a,
+        "CREATE TRIGGER ts AFTER INSERT ON s.tt FOR EACH STATEMENT EXECUTE FUNCTION stmt_audit()",
+    );
+    let sql = "INSERT INTO s.tt (n) VALUES (1) USING OPERATION_ID 'op-w';";
+    assert_eq!(exec(&mut a, sql), "INSERT 0 1");
+    for _ in 0..2 {
+        send_simple_query(&mut a, sql);
+        expect_error_response_with_sqlstate(&mut a, "23505");
+        read_ready_for_query(&mut a);
+    }
+    send_simple_query(
+        &mut a,
+        "INSERT INTO s.tt (n) VALUES (2) USING OPERATION_ID 'op-w';",
+    );
+    expect_error_response_with_sqlstate(&mut a, "22023");
+    read_ready_for_query(&mut a);
+    assert_eq!(select_col(&mut a, "SELECT n FROM s.tt"), vec!["1"]);
+    assert_eq!(
+        select_col(&mut a, "SELECT lv FROM audit"),
+        vec!["STATEMENT"]
+    );
+    let mut b = connect(addr, "bob", "pw-bob");
+    create_tt(&mut b);
+    assert_eq!(
+        exec(
+            &mut b,
+            "INSERT INTO s.tt (n) VALUES (1) USING OPERATION_ID 'op-w';"
+        ),
+        "INSERT 0 1"
+    );
+    assert_eq!(
+        select_col(&mut a, "SELECT lv FROM audit"),
+        vec!["STATEMENT"]
+    );
+    assert!(select_col(&mut b, "SELECT lv FROM audit").is_empty());
+}
