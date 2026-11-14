@@ -1327,23 +1327,25 @@ fn create_and_dml_complete_inside_the_path_schema() {
     );
 }
 
-/// 自己参照 FK は、現状は修飾形でも未修飾形でも同じ理由（行 ID モード未対応）で `0A000`。作成先に合わせた
-/// 自己参照の書き換え自体は `sql::search_path` の単体テストで固定している。
+/// 自己参照 FK は、修飾形でも未修飾形でも同じく受理される（Issue #3178。親が宣言した `id` 列の参照は
+/// DDL 束縛で通る）。未修飾形は `search_path` の作成先 SCHEMA（`q1`）へ書き換わった自己参照になる。
+/// 書き換え自体は `sql::search_path` の単体テストでも固定している。
 #[test]
 fn self_referencing_foreign_key_behaves_like_the_qualified_form() {
     let (core, _g, mut s) = q1_world("sp-self-fk");
-    let (qc, qmsg) = err(
+    ok(
         &core,
         &mut s,
         "CREATE TABLE q1.t3 (id BIGINT PRIMARY KEY, parent BIGINT REFERENCES q1.t3 (id))",
     );
     ok(&core, &mut s, "SET search_path TO q1, public");
-    let (c, msg) = err(
+    ok(
         &core,
         &mut s,
-        "CREATE TABLE t3 (id BIGINT PRIMARY KEY, parent BIGINT REFERENCES t3 (id))",
+        "CREATE TABLE t4 (id BIGINT PRIMARY KEY, parent BIGINT REFERENCES t4 (id))",
     );
-    assert_eq!((c, msg), (qc, qmsg));
+    // 未修飾の t4 は作成先の q1 に実在する。
+    ok(&core, &mut s, "SELECT id FROM q1.t4");
 }
 
 /// 作成・DML は自テナントの SCHEMA にだけ解決される。他テナントの同名 SCHEMA は不在と同じで、
