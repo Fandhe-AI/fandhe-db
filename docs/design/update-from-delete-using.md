@@ -101,4 +101,9 @@ SQL の入口を結合実行器（`execute_joined_dml_in`）へ結線した。�
 
 ## テスト
 
-`crates/engine/tests/sql53_dml_from_using_bind.rs`（結合）と、`allowlist.rs`・`relation_name.rs` の単体テスト。
+- `crates/engine/tests/sql_t40_up/sql53_dml_from_using_bind.rs`: 構文・束縛・変換器の拒否表・台帳の基本
+- `crates/engine/tests/sql_t40_up/sql53_dml_from_using_exec.rs`: dispatch の最小固定と RETURNING
+- `crates/engine/tests/sql_t40_up/sql53_dml_from_using_acceptance.rs`（Issue #3205）: SQL 経由の受け入れ。多重一致・RLS（他テナントの件数が漏れない）・上限（`54000`・副作用ゼロ）・再送冪等・明示 Tx（COMMIT／ROLLBACK・read-your-writes・Failed）・自己結合・末尾 `;`・未対応形の fail-closed
+- `crates/engine/src/core/dml_join_exec_tests.rs`: 実行器の単体テスト（走査位置 `matches` の固定を含む）
+- `crates/wire-server/tests/wire_sql/wire_sql53_dml_from_using.rs`: 末尾 `;` 付き単独送信・タグ・op id
+- `allowlist.rs`・`relation_name.rs` の単体テスト
