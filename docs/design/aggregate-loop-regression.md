@@ -278,3 +278,21 @@ bisect 本体は `git rev-list --bisect <bad> ^<good>` で中点を選び、`run
 - 注記: #3211 により式を含まない入力は `observe_value` を通らない。本変更の対象は式・`VectorColumn` などの `_` 腕に限る
 - 固定した検査: `sql3209_observe_value_inline.rs`（式入力の集計・ウィンドウ集計・整数オーバーフロー・テナント境界）と既存の `direct_observe_matches_two_stage_path`
 - A/B（同一ホストの壁時計）: 未検証。本変更の作成環境では実施していない。受け入れ条件のうち性能回復は充足を主張しない。アセンブリでのインライン確認も未確認
+
+## #2761 後の agg_multi の残差（Issue #3210）
+
+- 目的: #2761 の直前（99fb6d690）に届かない残差があるかを、#3208・#3209・#3211 が入った後の main で測り直す
+- 計測: `run_bisect_step.sh` で 99fb6d690 と main（5a24e8f2c）を交互に 5 回ずつ。そのコミット自身のソース・fixture（25,000 行・128 次元）・ハーネスを使い、同一ホスト・同一セッションの比で判定した
+- 結果（`agg_multi` の p50、単位 us。出典: [bench-data/aggregate-residual-3210/](bench-data/aggregate-residual-3210/NOTES.md)）
+
+| コミット | 各 run | min | median | max | 幅 |
+| -------- | ------ | --- | ------ | --- | -- |
+| 99fb6d690 | 876.7 / 877.6 / 954.8 / 884.6 / 1069.7 | 876.7 | 884.6 | 1069.7 | 22.0% |
+| 5a24e8f2c | 793.2 / 814.3 / 803.7 / 802.1 / 792.5 | 792.5 | 802.1 | 814.3 | 2.8% |
+
+- 比（main / 99fb6d690）: min-of-N 0.904、median 0.907。main の最悪値（814.3）も 99fb6d690 の最良値（876.7）より速い
+- 参照区間の `agg_count`・`rls_isolation` は両者で同水準（比 0.97〜1.00）で、機械・時間帯の差ではない
+- 結論: 残差は解消済み。main の `agg_multi` は #2761 の直前より約 9.6% 速く、劣っていない。直接観測（#3211）・`observe_value` の分離（#3209）・行ごとの確認の局所化（#3208）の合算の結果と見られる。どの変更がどれだけ寄与したかの分離は未実施
+- コードは変更しない。最適化の候補（`needs_text_budget` による軽量経路・先頭ガードの 1 判定化・overflow 生成部の `#[cold]` 化）は、残差が無いため採用しない。このため追加テストも無い
+- 制約: 環境が #1486 と違う（x86_64 の Linux・共有機）。絶対値は Issue 作成時の計測機と比べない。アセンブリ・`perf` での確認は、残差が無いため実施していない（未検証）。個別の寄与と `agg_multi` 以外の集計・GROUP BY・索引経路の同等計測は未実施
+- 再実行: `BENCH_TARGET=<dir> bash docs/design/bench-data/aggregate-regression-bisect/run_bisect_step.sh <sha> <out>` を交互に N≥5 回走らせ、`python3 -I docs/design/bench-data/aggregate-regression-bisect/summarize.py compare` で集計する
