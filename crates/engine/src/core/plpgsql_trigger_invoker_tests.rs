@@ -946,8 +946,8 @@ fn body_update_applies_for_predicate_and_single_row_forms() {
         "bump",
         "BEGIN UPDATE counters SET c = c + 1 WHERE k = NEW.n; RETURN NEW; END",
     );
-    create_trigger(&core, "t1", "ta", "AFTER", "tt", "bump");
-    ok(&core, "t1", "INSERT INTO tt (n) VALUES (1), (1), (2);");
+    create_trigger(&core, "t1", "ta", "AFTER", "s.tt", "bump");
+    ok(&core, "t1", "INSERT INTO s.tt (n) VALUES (1), (1), (2);");
     assert_eq!(counter_of(&core, "t1", 1), 2);
     assert_eq!(counter_of(&core, "t1", 2), 1);
 
@@ -969,9 +969,9 @@ fn body_update_applies_for_predicate_and_single_row_forms() {
         "by_id",
         "BEGIN UPDATE sid SET n = 7 WHERE id = 5; RETURN NEW; END",
     );
-    ok(&core, "t1", "DROP TRIGGER ta ON tt");
-    create_trigger(&core, "t1", "tb", "AFTER", "tt", "by_id");
-    ok(&core, "t1", "INSERT INTO tt (n) VALUES (9)");
+    ok(&core, "t1", "DROP TRIGGER ta ON s.tt");
+    create_trigger(&core, "t1", "tb", "AFTER", "s.tt", "by_id");
+    ok(&core, "t1", "INSERT INTO s.tt (n) VALUES (9)");
     assert_eq!(ints(&core, "t1", "SELECT n FROM sid"), vec![7]);
 }
 
@@ -988,10 +988,10 @@ fn body_update_sets_found_for_upsert() {
         "BEGIN UPDATE counters SET c = c + 1 WHERE k = NEW.n; \
          IF NOT FOUND THEN INSERT INTO counters (k, c) VALUES (NEW.n, 1); END IF; RETURN NEW; END",
     );
-    create_trigger(&core, "t1", "ta", "AFTER", "tt", "upsert");
-    ok(&core, "t1", "INSERT INTO tt (n) VALUES (5)");
-    ok(&core, "t1", "INSERT INTO tt (n) VALUES (5)");
-    ok(&core, "t1", "INSERT INTO tt (n) VALUES (6)");
+    create_trigger(&core, "t1", "ta", "AFTER", "s.tt", "upsert");
+    ok(&core, "t1", "INSERT INTO s.tt (n) VALUES (5)");
+    ok(&core, "t1", "INSERT INTO s.tt (n) VALUES (5)");
+    ok(&core, "t1", "INSERT INTO s.tt (n) VALUES (6)");
     assert_eq!(counter_of(&core, "t1", 5), 2);
     assert_eq!(counter_of(&core, "t1", 6), 1);
 }
@@ -1001,8 +1001,8 @@ fn body_update_sets_found_for_upsert() {
 fn body_update_from_update_and_delete_triggers_rolls_back_with_the_txn() {
     let (core, _g) = core_with("trginv-upd-outer", LedgerMode::Optional);
     base_tables(&core);
-    ok(&core, "t1", "INSERT INTO tt (n) VALUES (1)");
-    ok(&core, "t1", "INSERT INTO tt (n) VALUES (2)");
+    ok(&core, "t1", "INSERT INTO s.tt (n) VALUES (1)");
+    ok(&core, "t1", "INSERT INTO s.tt (n) VALUES (2)");
     ok(&core, "t1", "INSERT INTO audit (n) VALUES (1)");
     ok(&core, "t1", "INSERT INTO audit (n) VALUES (2)");
     create_fn(
@@ -1017,15 +1017,15 @@ fn body_update_from_update_and_delete_triggers_rolls_back_with_the_txn() {
         "on_del",
         "BEGIN UPDATE audit SET n = -1 WHERE n = OLD.n; RETURN OLD; END",
     );
-    create_trigger_on(&core, "t1", "tu", "AFTER UPDATE", "tt", "on_upd");
-    create_trigger_on(&core, "t1", "td", "AFTER DELETE", "tt", "on_del");
+    create_trigger_on(&core, "t1", "tu", "AFTER UPDATE", "s.tt", "on_upd");
+    create_trigger_on(&core, "t1", "td", "AFTER DELETE", "s.tt", "on_del");
     let sorted = |core: &EngineCore| {
         let mut v = ints(core, "t1", "SELECT n FROM audit");
         v.sort_unstable();
         v
     };
-    ok(&core, "t1", "UPDATE tt SET n = 10 WHERE n = 1");
-    ok(&core, "t1", "DELETE FROM tt WHERE n = 2");
+    ok(&core, "t1", "UPDATE s.tt SET n = 10 WHERE n = 1");
+    ok(&core, "t1", "DELETE FROM s.tt WHERE n = 2");
     assert_eq!(sorted(&core), vec![-1, 10]);
 
     let c = ctx("t1");
@@ -1033,7 +1033,7 @@ fn body_update_from_update_and_delete_triggers_rolls_back_with_the_txn() {
     let mut txn = core.new_session_transaction();
     core.execute_sql_in_txn(&c, &mut s, &mut txn, "BEGIN")
         .expect("begin");
-    core.execute_sql_in_txn(&c, &mut s, &mut txn, "UPDATE tt SET n = 20 WHERE n = 10")
+    core.execute_sql_in_txn(&c, &mut s, &mut txn, "UPDATE s.tt SET n = 20 WHERE n = 10")
         .expect("update in txn");
     core.execute_sql_in_txn(&c, &mut s, &mut txn, "ROLLBACK")
         .expect("rollback");
@@ -1053,11 +1053,13 @@ fn body_update_never_touches_another_tenant() {
         "zero",
         "BEGIN UPDATE audit SET n = 0 WHERE n > 0; RETURN NEW; END",
     );
-    create_trigger(&core, "t1", "ta", "AFTER", "tt", "zero");
-    ok(&core, "t2", "INSERT INTO tt (n) VALUES (1)");
+    create_trigger(&core, "t1", "ta", "AFTER", "s.tt", "zero");
+    ok(&core, "t2", "CREATE SCHEMA s");
+    ok(&core, "t2", "CREATE TABLE s.tt (n INTEGER)");
+    ok(&core, "t2", "INSERT INTO s.tt (n) VALUES (1)");
     assert_eq!(ints(&core, "t1", "SELECT n FROM audit"), vec![1]);
     assert_eq!(ints(&core, "t2", "SELECT n FROM audit"), vec![1]);
-    ok(&core, "t1", "INSERT INTO tt (n) VALUES (1)");
+    ok(&core, "t1", "INSERT INTO s.tt (n) VALUES (1)");
     assert_eq!(ints(&core, "t1", "SELECT n FROM audit"), vec![0]);
     assert_eq!(ints(&core, "t2", "SELECT n FROM audit"), vec![1]);
 }
@@ -1087,8 +1089,8 @@ fn body_update_honors_row_policies() {
         "inc",
         "BEGIN UPDATE audit SET n = n + 1 WHERE n >= 0; RETURN NEW; END",
     );
-    create_trigger(&core, "t1", "ta", "AFTER", "tt", "inc");
-    ok(&core, "t1", "INSERT INTO tt (n) VALUES (1)");
+    create_trigger(&core, "t1", "ta", "AFTER", "s.tt", "inc");
+    ok(&core, "t1", "INSERT INTO s.tt (n) VALUES (1)");
     let mut v = ints(&core, "t1", "SELECT n FROM audit");
     v.sort_unstable();
     assert_eq!(v, vec![2, 200], "the invisible row must not be updated");
@@ -1099,13 +1101,16 @@ fn body_update_honors_row_policies() {
         "bad",
         "BEGIN UPDATE audit SET n = 500 WHERE n < 100; RETURN NEW; END",
     );
-    ok(&core, "t1", "DROP TRIGGER ta ON tt");
-    create_trigger(&core, "t1", "tb", "AFTER", "tt", "bad");
-    assert_eq!(code(&core, "t1", "INSERT INTO tt (n) VALUES (2)"), "42501");
+    ok(&core, "t1", "DROP TRIGGER ta ON s.tt");
+    create_trigger(&core, "t1", "tb", "AFTER", "s.tt", "bad");
+    assert_eq!(
+        code(&core, "t1", "INSERT INTO s.tt (n) VALUES (2)"),
+        "42501"
+    );
     let mut v = ints(&core, "t1", "SELECT n FROM audit");
     v.sort_unstable();
     assert_eq!(v, vec![2, 200]);
-    assert_eq!(ints(&core, "t1", "SELECT n FROM tt").len(), 1);
+    assert_eq!(ints(&core, "t1", "SELECT n FROM s.tt").len(), 1);
 }
 
 // (5) 権限: 本体の `UPDATE` は発火元ロールで判定される。権限が無ければ `42501` で文全体が失敗し、付与すれば成功する。
@@ -1130,21 +1135,23 @@ fn body_update_is_checked_against_the_firing_role() {
             Err(e) => e.wire_code().to_string(),
         }
     };
-    admin_run("CREATE TABLE tt (n INTEGER)");
+    admin_run("CREATE SCHEMA s");
+    admin_run("CREATE TABLE s.tt (n INTEGER)");
     admin_run("CREATE TABLE audit (n INTEGER)");
     admin_run("INSERT INTO audit (n) VALUES (1)");
     admin_run(
         "CREATE FUNCTION inc() RETURNS trigger LANGUAGE plpgsql AS $$ \
          BEGIN UPDATE audit SET n = n + 1 WHERE n >= 0; RETURN NEW; END $$",
     );
-    admin_run("CREATE TRIGGER ta AFTER INSERT ON tt FOR EACH ROW EXECUTE FUNCTION inc()");
-    admin_run("GRANT INSERT ON tt TO alice");
-    assert_eq!(alice_code("INSERT INTO tt (n) VALUES (1)"), "42501");
-    assert!(ints(&core, "t1", "SELECT n FROM tt").is_empty());
+    admin_run("CREATE TRIGGER ta AFTER INSERT ON s.tt FOR EACH ROW EXECUTE FUNCTION inc()");
+    admin_run("GRANT USAGE ON SCHEMA s TO alice");
+    admin_run("GRANT INSERT ON s.tt TO alice");
+    assert_eq!(alice_code("INSERT INTO s.tt (n) VALUES (1)"), "42501");
+    assert!(ints(&core, "t1", "SELECT n FROM s.tt").is_empty());
     assert_eq!(ints(&core, "t1", "SELECT n FROM audit"), vec![1]);
     admin_run("GRANT UPDATE ON audit TO alice");
     admin_run("GRANT SELECT ON audit TO alice");
-    assert_eq!(alice_code("INSERT INTO tt (n) VALUES (1)"), "ok");
+    assert_eq!(alice_code("INSERT INTO s.tt (n) VALUES (1)"), "ok");
     assert_eq!(ints(&core, "t1", "SELECT n FROM audit"), vec![2]);
 }
 
@@ -1163,55 +1170,20 @@ fn stable_trigger_function_cannot_update() {
         "CREATE FUNCTION st() RETURNS trigger LANGUAGE plpgsql STABLE AS $$ \
          BEGIN UPDATE audit SET n = 9 WHERE n >= 0; RETURN NEW; END $$",
     );
-    create_trigger(&core, "t1", "tb", "BEFORE", "tt", "st");
-    assert_eq!(code(&core, "t1", "INSERT INTO tt (n) VALUES (1)"), "0A000");
+    create_trigger(&core, "t1", "tb", "BEFORE", "s.tt", "st");
+    assert_eq!(
+        code(&core, "t1", "INSERT INTO s.tt (n) VALUES (1)"),
+        "0A000"
+    );
     assert_eq!(ints(&core, "t1", "SELECT n FROM audit"), vec![1]);
 }
 
-// (2) 自己再帰・相互再帰は深さ上限で `54001` になり、副作用が残らない。
-#[test]
-fn body_update_recursion_is_bounded() {
-    let (core, _g) = core_with("trginv-upd-depth", LedgerMode::Optional);
-    ok(&core, "t1", "CREATE TABLE rec (n INTEGER)");
-    ok(&core, "t1", "INSERT INTO rec (n) VALUES (0)");
-    create_fn(
-        &core,
-        "t1",
-        "again",
-        "BEGIN UPDATE rec SET n = n + 1 WHERE n >= 0; RETURN NEW; END",
-    );
-    create_trigger_on(&core, "t1", "tr", "AFTER UPDATE", "rec", "again");
-    assert_eq!(
-        code(&core, "t1", "UPDATE rec SET n = 10 WHERE n >= 0"),
-        "54001"
-    );
-    assert_eq!(ints(&core, "t1", "SELECT n FROM rec"), vec![0]);
-
-    ok(&core, "t1", "CREATE TABLE ma (n INTEGER)");
-    ok(&core, "t1", "CREATE TABLE mb (n INTEGER)");
-    ok(&core, "t1", "INSERT INTO ma (n) VALUES (0)");
-    ok(&core, "t1", "INSERT INTO mb (n) VALUES (0)");
-    create_fn(
-        &core,
-        "t1",
-        "a2b",
-        "BEGIN UPDATE mb SET n = n + 1 WHERE n >= 0; RETURN NEW; END",
-    );
-    create_fn(
-        &core,
-        "t1",
-        "b2a",
-        "BEGIN UPDATE ma SET n = n + 1 WHERE n >= 0; RETURN NEW; END",
-    );
-    create_trigger_on(&core, "t1", "ta", "AFTER UPDATE", "ma", "a2b");
-    create_trigger_on(&core, "t1", "tb", "AFTER UPDATE", "mb", "b2a");
-    assert_eq!(
-        code(&core, "t1", "UPDATE ma SET n = 5 WHERE n >= 0"),
-        "54001"
-    );
-    assert_eq!(ints(&core, "t1", "SELECT n FROM ma"), vec![0]);
-    assert_eq!(ints(&core, "t1", "SELECT n FROM mb"), vec![0]);
-}
+// 注記（Issue #3361）: 本体の `UPDATE` の書き込み先は共有 `public` 表の裸の名前に限られる（SCHEMA 修飾は窓口の
+// 許可リスト外）一方、共有 `public` 表のトリガは定義時に拒否される。そのため「トリガ表と本体の更新先が同じ表」
+// になる形（自己・相互再帰の深さ上限 `54001`、BEFORE ROW の行ごとループ中の同表 `UPDATE` の D6 安全弁）は
+// SQL から構成できない。深さ上限は注入 invoker の `core/trigger_depth_tests.rs` が、D6 の判定は
+// `tenant/trigger_row_loop.rs` が担う。本体の書き込み先に SCHEMA 修飾を許す拡張が入った時点で、本体 SQL 経由の
+// 検証をここへ戻す（スコープ外。返却の outOfScope に記録）。
 
 // (3) 台帳: 外側の `operation_id` の 1 エントリだけが載る。本体の `UPDATE` は `operation_id` を要求も記録もせず、
 // 再送は `23505` で本体を再実行しない。
@@ -1231,8 +1203,8 @@ fn ledgered_core_body_update_does_not_touch_the_ledger() {
         "bump",
         "BEGIN UPDATE counters SET c = c + 1 WHERE k >= 0; RETURN NEW; END",
     );
-    create_trigger(&core, "t1", "ta", "AFTER", "tt", "bump");
-    let sql = "INSERT INTO tt (n) VALUES (1) USING OPERATION_ID 'op-1'";
+    create_trigger(&core, "t1", "ta", "AFTER", "s.tt", "bump");
+    let sql = "INSERT INTO s.tt (n) VALUES (1) USING OPERATION_ID 'op-1'";
     ok(&core, "t1", sql);
     assert_eq!(counter_of(&core, "t1", 1), 1);
     assert_eq!(code(&core, "t1", sql), "23505");
@@ -1259,9 +1231,12 @@ fn exception_block_does_not_catch_after_a_body_update() {
         "BEGIN BEGIN UPDATE audit SET n = 9 WHERE n >= 0; RAISE EXCEPTION 'x'; \
          EXCEPTION WHEN OTHERS THEN NEW.n := -2; END; RETURN NEW; END",
     );
-    create_trigger(&core, "t1", "tb", "BEFORE", "tt", "catch_after_update");
-    assert_eq!(code(&core, "t1", "INSERT INTO tt (n) VALUES (2)"), "0A000");
-    assert!(ints(&core, "t1", "SELECT n FROM tt").is_empty());
+    create_trigger(&core, "t1", "tb", "BEFORE", "s.tt", "catch_after_update");
+    assert_eq!(
+        code(&core, "t1", "INSERT INTO s.tt (n) VALUES (2)"),
+        "0A000"
+    );
+    assert!(ints(&core, "t1", "SELECT n FROM s.tt").is_empty());
     assert_eq!(ints(&core, "t1", "SELECT n FROM audit"), vec![1]);
 }
 
@@ -1276,102 +1251,26 @@ fn update_forms_outside_the_write_handle_are_rejected() {
     base_tables(&core);
     ok(&core, "t1", "INSERT INTO audit (n) VALUES (1)");
     ok(&core, "t1", "CREATE VIEW va AS SELECT id, n FROM audit");
+    ok(&core, "t1", "CREATE TABLE src (n INTEGER)");
     let forms = [
         "UPDATE audit SET n = 9 WHERE n >= 0 RETURNING n",
-        "UPDATE audit SET n = 9 WHERE n IN (SELECT n FROM tt)",
-        "UPDATE audit SET n = 9 FROM tt WHERE audit.n = tt.n",
+        "UPDATE audit SET n = 9 WHERE n IN (SELECT n FROM src)",
+        "UPDATE audit SET n = 9 FROM src WHERE audit.n = src.n",
         "UPDATE va SET n = 9 WHERE n >= 0",
     ];
     for (i, stmt) in forms.iter().enumerate() {
         let f = format!("uform{i}");
         create_fn(&core, "t1", &f, &format!("BEGIN {stmt}; RETURN NEW; END"));
-        ok(&core, "t1", "DROP TRIGGER IF EXISTS tb ON tt");
-        create_trigger(&core, "t1", "tb", "BEFORE", "tt", &f);
+        ok(&core, "t1", "DROP TRIGGER IF EXISTS tb ON s.tt");
+        create_trigger(&core, "t1", "tb", "BEFORE", "s.tt", &f);
         assert_eq!(
-            code(&core, "t1", "INSERT INTO tt (n) VALUES (1)"),
+            code(&core, "t1", "INSERT INTO s.tt (n) VALUES (1)"),
             "0A000",
             "{stmt}"
         );
-        assert!(ints(&core, "t1", "SELECT n FROM tt").is_empty(), "{stmt}");
+        assert!(ints(&core, "t1", "SELECT n FROM s.tt").is_empty(), "{stmt}");
         assert_eq!(ints(&core, "t1", "SELECT n FROM audit"), vec![1], "{stmt}");
     }
-}
-
-// (5) D6 の安全弁: BEFORE ROW の行ごとループの最中に同じ表を書く `UPDATE` は `0A000`（失われた更新を作らない）。
-// 入れ子でも検出し、AFTER の段（ループの外）からの同表 `UPDATE` は許す。
-//
-// intentional: docs/design/plpgsql-subset.md
-// PG は `27000`（行単位の検出）。本実装は表単位の `0A000`（設計記録「Issue #3186 追記」の既知の差）。
-#[test]
-fn body_update_of_the_row_loop_table_is_rejected_only_inside_the_loop() {
-    let (core, _g) = core_with("trginv-upd-d6", LedgerMode::Optional);
-    base_tables(&core);
-    ok(&core, "t1", "INSERT INTO tt (n) VALUES (1)");
-    ok(&core, "t1", "INSERT INTO tt (n) VALUES (2)");
-    create_fn(
-        &core,
-        "t1",
-        "self_upd",
-        "BEGIN UPDATE tt SET n = n + 100 WHERE n >= 0; RETURN NEW; END",
-    );
-    create_fn(
-        &core,
-        "t1",
-        "self_del",
-        "BEGIN UPDATE tt SET n = 0 WHERE n >= 0; RETURN OLD; END",
-    );
-    let sorted = |core: &EngineCore| {
-        let mut v = ints(core, "t1", "SELECT n FROM tt");
-        v.sort_unstable();
-        v
-    };
-    create_trigger_on(&core, "t1", "bu", "BEFORE UPDATE", "tt", "self_upd");
-    assert_eq!(
-        code(&core, "t1", "UPDATE tt SET n = 5 WHERE n = 1"),
-        "0A000"
-    );
-    assert_eq!(sorted(&core), vec![1, 2]);
-    ok(&core, "t1", "DROP TRIGGER bu ON tt");
-
-    create_trigger_on(&core, "t1", "bd", "BEFORE DELETE", "tt", "self_del");
-    assert_eq!(code(&core, "t1", "DELETE FROM tt WHERE n = 1"), "0A000");
-    assert_eq!(sorted(&core), vec![1, 2]);
-    ok(&core, "t1", "DROP TRIGGER bd ON tt");
-
-    // 入れ子: BEFORE UPDATE ON tt -> INSERT INTO audit -> audit の AFTER INSERT -> UPDATE tt。
-    create_fn(
-        &core,
-        "t1",
-        "via_audit",
-        "BEGIN INSERT INTO audit (n) VALUES (1); RETURN NEW; END",
-    );
-    create_fn(
-        &core,
-        "t1",
-        "back_to_tt",
-        "BEGIN UPDATE tt SET n = 0 WHERE n >= 0; RETURN NEW; END",
-    );
-    create_trigger_on(&core, "t1", "bn", "BEFORE UPDATE", "tt", "via_audit");
-    create_trigger_on(&core, "t1", "an", "AFTER INSERT", "audit", "back_to_tt");
-    assert_eq!(
-        code(&core, "t1", "UPDATE tt SET n = 5 WHERE n = 1"),
-        "0A000"
-    );
-    assert_eq!(sorted(&core), vec![1, 2]);
-    assert_eq!(audit_count(&core, "t1"), 0);
-    ok(&core, "t1", "DROP TRIGGER bn ON tt");
-    ok(&core, "t1", "DROP TRIGGER an ON audit");
-
-    // AFTER ROW（ループの外）からの同表 `UPDATE`（別の行）は成功する。
-    create_fn(
-        &core,
-        "t1",
-        "after_self",
-        "BEGIN IF NEW.n = 1 THEN UPDATE tt SET n = 100 WHERE n = 2; END IF; RETURN NEW; END",
-    );
-    create_trigger_on(&core, "t1", "au", "AFTER UPDATE", "tt", "after_self");
-    ok(&core, "t1", "UPDATE tt SET n = 1 WHERE n = 1");
-    assert_eq!(sorted(&core), vec![1, 100]);
 }
 
 // (1)(5) 遅延 FK: 本体の `UPDATE` が子の FK 列を存在しない親キーへ変える、または参照中の親キーを変えると、
@@ -1397,14 +1296,14 @@ fn body_update_is_checked_by_deferred_foreign_keys() {
     {
         let f = format!("fk{i}");
         create_fn(&core, "t1", &f, &format!("BEGIN {body}; RETURN NEW; END"));
-        ok(&core, "t1", "DROP TRIGGER IF EXISTS ta ON tt");
-        create_trigger(&core, "t1", "ta", "AFTER", "tt", &f);
+        ok(&core, "t1", "DROP TRIGGER IF EXISTS ta ON s.tt");
+        create_trigger(&core, "t1", "ta", "AFTER", "s.tt", &f);
         assert_eq!(
-            code(&core, "t1", "INSERT INTO tt (n) VALUES (1)"),
+            code(&core, "t1", "INSERT INTO s.tt (n) VALUES (1)"),
             "23503",
             "{body}"
         );
-        assert!(ints(&core, "t1", "SELECT n FROM tt").is_empty(), "{body}");
+        assert!(ints(&core, "t1", "SELECT n FROM s.tt").is_empty(), "{body}");
         assert_eq!(ints(&core, "t1", "SELECT parent_id FROM fk_child"), vec![1]);
 
         let c = ctx("t1");
@@ -1412,13 +1311,13 @@ fn body_update_is_checked_by_deferred_foreign_keys() {
         let mut txn = core.new_session_transaction();
         core.execute_sql_in_txn(&c, &mut s, &mut txn, "BEGIN")
             .expect("begin");
-        core.execute_sql_in_txn(&c, &mut s, &mut txn, "INSERT INTO tt (n) VALUES (1)")
+        core.execute_sql_in_txn(&c, &mut s, &mut txn, "INSERT INTO s.tt (n) VALUES (1)")
             .expect("deferred check waits for COMMIT");
         let e = core
             .execute_sql_in_txn(&c, &mut s, &mut txn, "COMMIT")
             .expect_err("deferred FK violation");
         assert_eq!(e.wire_code(), "23503", "{body}");
-        assert!(ints(&core, "t1", "SELECT n FROM tt").is_empty(), "{body}");
+        assert!(ints(&core, "t1", "SELECT n FROM s.tt").is_empty(), "{body}");
     }
 }
 
@@ -1433,13 +1332,13 @@ fn update_rejection_text_does_not_depend_on_other_tenants() {
         "ret",
         "BEGIN UPDATE audit SET n = 9 WHERE n >= 0 RETURNING n; RETURN NEW; END",
     );
-    create_trigger(&core, "t1", "tb", "BEFORE", "tt", "ret");
-    let before = run(&core, "t1", "INSERT INTO tt (n) VALUES (1)")
+    create_trigger(&core, "t1", "tb", "BEFORE", "s.tt", "ret");
+    let before = run(&core, "t1", "INSERT INTO s.tt (n) VALUES (1)")
         .unwrap_err()
         .client_message();
     ok(&core, "t2", "INSERT INTO audit (n) VALUES (1)");
     create_fn(&core, "t2", "ret", "BEGIN RETURN NEW; END");
-    let after = run(&core, "t1", "INSERT INTO tt (n) VALUES (1)")
+    let after = run(&core, "t1", "INSERT INTO s.tt (n) VALUES (1)")
         .unwrap_err()
         .client_message();
     assert_eq!(before, after);
