@@ -7091,22 +7091,31 @@ pub(crate) fn execute_insert_returning_in(
         });
     }
 
-    if has_sequence {
+    // 事前判定（別 snapshot）ではトリガありとして事前投影を省いたが、書き込み txn の計画ではトリガ無し
+    // （判定後に最後の INSERT トリガが DROP された）場合は `trigger_rows` が空のままになる。トリガが
+    // 走っていないので書き込んだ値は束縛値そのものであり、ここで束縛値から投影し直して行の欠落を防ぐ。
+    if has_sequence || skip_pre_projection {
         // 行・列をキーにした索引を一度だけ構築し、RETURNING の検索を線形時間に保つ
         // （重複記録は先頭を優先。従来の線形 `find` と同じ意味論）。
         let mut assigned: std::collections::HashMap<(usize, usize), i64> =
             std::collections::HashMap::new();
-        for (r, c, v) in crate::sql::sequence_scope::take_assigned() {
-            assigned.entry((r, c)).or_insert(v);
+        if has_sequence {
+            for (r, c, v) in crate::sql::sequence_scope::take_assigned() {
+                assigned.entry((r, c)).or_insert(v);
+            }
         }
         rows.clear();
         let mut budget = 0usize;
         for (row_idx, bound) in bounds.iter().enumerate() {
             // 払い出し値が記録されていない列は黙って 0 にせず内部不整合として拒否する
             // （fail-closed。書き込みは commit 済みだが、誤った値を返すより失敗を返す）。
-            let values = sequence_patched_values(bound, schema, |col| {
-                assigned.get(&(row_idx, col)).copied()
-            })?;
+            let values = if has_sequence {
+                sequence_patched_values(bound, schema, |col| {
+                    assigned.get(&(row_idx, col)).copied()
+                })?
+            } else {
+                bound.values.clone()
+            };
             let row_id = if bound.id_omitted {
                 let assigned_id = assigned
                     .get(&(row_idx, crate::sql::sequence_scope::PSEUDO_ID_COLUMN))
