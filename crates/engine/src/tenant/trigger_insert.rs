@@ -71,7 +71,7 @@ pub(super) fn write_rows_with_triggers(
         ))
     })?;
     // AFTER ROW に渡す最終 NEW（書いた順）。確保は行数（呼び出し元がバッチ上限で検証済み）に抑える。
-    let mut after_queue: Vec<Vec<Value>> = Vec::new();
+    let mut after_queue: Vec<(Vec<Value>, Vec<usize>)> = Vec::new();
     if !plan.after.is_empty() {
         after_queue.try_reserve_exact(rows.len()).map_err(|_| {
             TenantWriteError::Storage(crate::storage::StorageError::Codec(
@@ -140,8 +140,22 @@ pub(super) fn write_rows_with_triggers(
             crate::constraint::RowPolicyWrite::Insert,
         )?;
         written.push(*row_id);
+        // AFTER ROW の WHEN は行の変更時に評価し、TRUE のトリガだけをキューへ積む（D7）。
         if !plan.after.is_empty() {
-            after_queue.push(final_row);
+            let selected = crate::trigger::fire::select_after_row(
+                plan.runtime,
+                writes,
+                table,
+                schema,
+                &plan.after,
+                crate::trigger::call::TriggerOp::Insert,
+                None,
+                &final_row,
+            )
+            .map_err(TenantWriteError::TriggerFailed)?;
+            if !selected.is_empty() {
+                after_queue.push((final_row, selected));
+            }
         }
     }
     drop(row_loop_guard);
@@ -156,13 +170,16 @@ pub(super) fn write_rows_with_triggers(
         )?;
     }
     // AFTER ROW（段 6）。変更の順（書いた順）× トリガ名のバイト順。
-    for new_row in &after_queue {
-        crate::trigger::fire::fire_after_row_insert(
+    for (new_row, selected) in &after_queue {
+        crate::trigger::fire::invoke_after_row(
             plan.runtime,
             writes,
             table,
             schema,
             &plan.after,
+            selected,
+            crate::trigger::call::TriggerOp::Insert,
+            None,
             new_row,
         )
         .map_err(TenantWriteError::TriggerFailed)?;

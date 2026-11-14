@@ -313,3 +313,43 @@ fn when_referenced_column_is_protected_from_alter() {
     ok(&core, "t1", "INSERT INTO s.tt (n) VALUES (5)");
     assert_eq!(audit_vals(&core, "t1").len(), 1);
 }
+
+/// AFTER ROW の WHEN は行の変更時に評価する（D7）。2 行目の WHEN が評価エラーになる文では、1 行目の
+/// AFTER 本体（失敗する本体）が先に走らず、WHEN 評価エラー（`22012`）が文の結果になる。
+#[test]
+fn after_when_evaluated_at_row_change_not_at_queue_drain() {
+    let (_g, core) = open("trgwhen-order", LedgerMode::Optional);
+    setup(&core, "t1");
+    func(
+        &core,
+        "t1",
+        "failbody",
+        "BEGIN INSERT INTO no_such_table (n) VALUES (1); RETURN NEW; END",
+    );
+    ok(&core, "t1", "CREATE TRIGGER g AFTER INSERT ON s.tt FOR EACH ROW WHEN (1 / NEW.n > 0) EXECUTE FUNCTION failbody()");
+    assert_eq!(
+        code(&core, "t1", "INSERT INTO s.tt (n) VALUES (1), (0)"),
+        "22012"
+    );
+    assert!(ints(&core, "t1", "SELECT n FROM s.tt").is_empty());
+}
+
+/// 全行で WHEN が FALSE なら、AFTER 本体は一度も走らない（キューが空）。UPDATE・DELETE も同じ。
+#[test]
+fn after_when_all_false_never_invokes_body() {
+    let (_g, core) = open("trgwhen-allfalse", LedgerMode::Optional);
+    setup(&core, "t1");
+    func(
+        &core,
+        "t1",
+        "failbody",
+        "BEGIN INSERT INTO no_such_table (n) VALUES (1); RETURN NEW; END",
+    );
+    ok(&core, "t1", "CREATE TRIGGER gi AFTER INSERT ON s.tt FOR EACH ROW WHEN (NEW.n > 100) EXECUTE FUNCTION failbody()");
+    ok(&core, "t1", "CREATE TRIGGER gu AFTER UPDATE ON s.tt FOR EACH ROW WHEN (NEW.n > 100) EXECUTE FUNCTION failbody()");
+    ok(&core, "t1", "CREATE TRIGGER gd AFTER DELETE ON s.tt FOR EACH ROW WHEN (OLD.n > 100) EXECUTE FUNCTION failbody()");
+    ok(&core, "t1", "INSERT INTO s.tt (n) VALUES (1), (2)");
+    ok(&core, "t1", "UPDATE s.tt SET n = n + 1");
+    ok(&core, "t1", "DELETE FROM s.tt");
+    assert!(ints(&core, "t1", "SELECT n FROM s.tt").is_empty());
+}

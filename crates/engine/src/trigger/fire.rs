@@ -233,13 +233,12 @@ pub(crate) fn fire_before_row_delete(
     Ok(outcome.is_some())
 }
 
-/// `triggers`（AFTER・ROW のみ。カタログ順）を、変更した 1 行に対して順に発火する（Issue #1724・#1725）。
-/// INSERT は `old = None`・`new_row` が最終 NEW、UPDATE は `(OLD, 最終 NEW)`、DELETE は `old = Some` と
-/// 空の `new_row`。戻り値（`Proceed`・`Skip`）は無視し、返却行の構造も検査しない（実行モデルの D3）。
-/// エラーは [`SqlSurfaceError`] のまま返し、呼び出し側（`tenant/trigger_insert.rs`・`trigger_dml.rs`）が
-/// 文全体を失敗させる。呼び出し元は redb の表ハンドルを 1 つも開かずに呼ぶこと。
+/// AFTER ROW トリガのうち、変更した 1 行で `WHEN` が TRUE のもののインデックス（`triggers` 内の位置。
+/// カタログ順）を返す（Issue #3190。実行モデルの D7: 行の変更の時点で評価し、偽ならキューに積まない）。
+/// 評価エラーはそのまま返し、呼び出し側が文全体を失敗させる（fail-closed）。呼び出し元は行の変更の
+/// 直後（表ハンドルを開いていない区間）で呼ぶこと。
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn fire_after_row(
+pub(crate) fn select_after_row(
     runtime: &TriggerRuntime,
     writes: &TriggerWriteHandle<'_>,
     table: &str,
@@ -248,10 +247,11 @@ pub(crate) fn fire_after_row(
     op: TriggerOp,
     old: Option<&[Value]>,
     new_row: &[Value],
-) -> Result<(), SqlSurfaceError> {
-    for trigger in triggers {
+) -> Result<Vec<usize>, SqlSurfaceError> {
+    let mut selected = Vec::new();
+    for (idx, trigger) in triggers.iter().enumerate() {
         crate::interrupt::check()?;
-        if !when_passes(
+        if when_passes(
             runtime,
             writes,
             table,
@@ -263,8 +263,30 @@ pub(crate) fn fire_after_row(
             new_row,
             TriggerTiming::After,
         )? {
-            continue;
+            selected.push(idx);
         }
+    }
+    Ok(selected)
+}
+
+/// [`select_after_row`] が選んだ AFTER ROW トリガ（`selected` は `triggers` 内の位置）の本体だけを順に
+/// 実行する。`WHEN` は再評価しない（D7）。戻り値（`Proceed`・`Skip`）は無視し、返却行の構造も検査しない
+/// （実行モデルの D3）。エラーは呼び出し側（`tenant/trigger_insert.rs`・`trigger_dml.rs`）が文全体の
+/// 失敗にする。呼び出し元は redb の表ハンドルを 1 つも開かずに呼ぶこと。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn invoke_after_row(
+    runtime: &TriggerRuntime,
+    writes: &TriggerWriteHandle<'_>,
+    table: &str,
+    schema: &TableSchema,
+    triggers: &[TriggerDef],
+    selected: &[usize],
+    op: TriggerOp,
+    old: Option<&[Value]>,
+    new_row: &[Value],
+) -> Result<(), SqlSurfaceError> {
+    for trigger in selected.iter().filter_map(|i| triggers.get(*i)) {
+        crate::interrupt::check()?;
         let _ignored = runtime.invoke(&TriggerCall {
             trigger_name: &trigger.name,
             function_key: &trigger.function_key,
@@ -283,7 +305,30 @@ pub(crate) fn fire_after_row(
     Ok(())
 }
 
+/// `triggers`（AFTER・ROW のみ。カタログ順）を、変更した 1 行に対して `WHEN` の評価と本体の実行を続けて
+/// 行う（Issue #1724・#1725）。行の変更時に評価してキューへ積む経路は [`select_after_row`] と
+/// [`invoke_after_row`] を使う。INSERT は `old = None`・`new_row` が最終 NEW、UPDATE は `(OLD, 最終 NEW)`、
+/// DELETE は `old = Some` と空の `new_row`。
+#[allow(clippy::too_many_arguments)]
+#[cfg(test)]
+pub(crate) fn fire_after_row(
+    runtime: &TriggerRuntime,
+    writes: &TriggerWriteHandle<'_>,
+    table: &str,
+    schema: &TableSchema,
+    triggers: &[TriggerDef],
+    op: TriggerOp,
+    old: Option<&[Value]>,
+    new_row: &[Value],
+) -> Result<(), SqlSurfaceError> {
+    let selected = select_after_row(runtime, writes, table, schema, triggers, op, old, new_row)?;
+    invoke_after_row(
+        runtime, writes, table, schema, triggers, &selected, op, old, new_row,
+    )
+}
+
 /// `triggers`（INSERT・AFTER・ROW のみ）を、書いた 1 行の最終 NEW に対して順に発火する（Issue #1724）。
+#[cfg(test)]
 pub(crate) fn fire_after_row_insert(
     runtime: &TriggerRuntime,
     writes: &TriggerWriteHandle<'_>,
