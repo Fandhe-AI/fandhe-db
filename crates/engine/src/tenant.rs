@@ -3239,6 +3239,7 @@ fn apply_upsert_assignments(
     values: &[crate::row_codec::Value],
     existing: &crate::storage::Row,
     write_id: u64,
+    defer_value_validation: bool,
 ) -> Result<AppliedUpsertAssignments, TenantWriteError> {
     let pre_image_values = crate::row_codec::decode_scalar_columns(schema, &existing.metadata)
         .map_err(|e| CatalogError::Invalid(e.to_string()))?;
@@ -3285,14 +3286,28 @@ fn apply_upsert_assignments(
                     })?;
                 combined.extend(pre);
                 combined.extend(excluded);
-                let v = crate::sql::set_expr::eval_set_expr_to_value(
-                    set,
-                    write_id,
-                    &existing.embedding,
-                    &combined,
-                )
-                .map_err(TenantWriteError::SetExpressionEvaluationFailed)?;
-                validate_set_assignments(schema, &[(*col_idx, v.clone())])?;
+                // 遅延時は NOT NULL 検査も後回しにする（BEFORE が NULL を補正・スキップできる）。
+                let evaluated = if defer_value_validation {
+                    crate::sql::set_expr::eval_set_expr_to_value_deferred_not_null(
+                        set,
+                        write_id,
+                        &existing.embedding,
+                        &combined,
+                    )
+                } else {
+                    crate::sql::set_expr::eval_set_expr_to_value(
+                        set,
+                        write_id,
+                        &existing.embedding,
+                        &combined,
+                    )
+                };
+                let v = evaluated.map_err(TenantWriteError::SetExpressionEvaluationFailed)?;
+                // BEFORE ROW UPDATE を持つ経路では、SET 値の型・長さ・次元の検証を BEFORE の後
+                // （BEFORE が確定した NEW 行の encode 時）へ遅らせる（通常の UPDATE と同順）。
+                if !defer_value_validation {
+                    validate_set_assignments(schema, &[(*col_idx, v.clone())])?;
+                }
                 v
             }
             UpsertSetValue::Add(operand) => {
@@ -3330,8 +3345,12 @@ fn apply_upsert_assignments(
         // `VARCHAR(n)` 長さ検証（`22001`。TABLE-31・Issue #1564）。
         // encode・commit の前に返すため txn は abort し副作用は残らない。
         if let Some(column) = schema.columns.get(*col_idx) {
-            crate::row_codec::normalize_char_length_value(column, &mut new_value)
-                .map_err(|e| TenantWriteError::SetExpressionEvaluationFailed(e.into()))?;
+            let normalized = crate::row_codec::normalize_char_length_value(column, &mut new_value);
+            // 遅延時の超過は値が変更されないまま残り、BEFORE 後の encode が厳格に拒否する。
+            if !defer_value_validation {
+                normalized
+                    .map_err(|e| TenantWriteError::SetExpressionEvaluationFailed(e.into()))?;
+            }
         }
         if Some(*col_idx) == vector_idx {
             match new_value {
@@ -3353,7 +3372,9 @@ fn apply_upsert_assignments(
             *slot = new_value;
         }
     }
-    schema.validate_row_embedding_dim(embedding_value.len())?;
+    if !defer_value_validation {
+        schema.validate_row_embedding_dim(embedding_value.len())?;
+    }
     Ok((pre_image_values, merged_values, embedding_value))
 }
 
@@ -4057,6 +4078,7 @@ fn upsert_typed_rows_impl(
                                     values,
                                     &existing,
                                     write_id,
+                                    false,
                                 )?;
                             // 書き換える前の全列値を ON UPDATE 連鎖の pre-image として
                             // 積む（Issue #1076）。UNIQUE 対象の衝突では実際に書き換える

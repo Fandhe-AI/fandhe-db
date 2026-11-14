@@ -460,3 +460,62 @@ fn before_insert_only_table_marks_row_loop_active() {
     assert_eq!(*seen.lock().expect("seen"), vec![true, true]);
     assert!(!crate::tenant::trigger_row_loop::is_row_loop_active("trg"));
 }
+// DO UPDATE の SET 式の結果（NOT NULL 列への NULL）は BEFORE ROW UPDATE の後に検査される。BEFORE が NEW を
+// 補正すれば成功し、BEFORE が NULL を返して行をスキップすれば検証・書き込みとも行わない（通常の UPDATE と同順）。
+const UPSERT_NULLING: &str =
+    "INSERT INTO trg (id, embedding, a, n) VALUES (1, '[9.0,0.0]', 'x', 1) \
+    ON CONFLICT (id) DO UPDATE SET n = NULLIF(EXCLUDED.n, 1)";
+
+#[test]
+fn set_result_is_validated_after_before_update() {
+    let a = ctx("tenant-a");
+    // BEFORE ROW UPDATE が NULL の n を 7 へ補正する。
+    let dir = crate::test_util::temp_db::tempdir();
+    let (core, _c) = core_with(
+        dir.path(),
+        Box::new(|c| {
+            let mut row = c.new_row.to_vec();
+            if c.tg_when() == "BEFORE"
+                && c.tg_level() == "ROW"
+                && c.tg_op() == "UPDATE"
+                && matches!(row.get(2), Some(Value::Null))
+            {
+                row[2] = Value::BigInt(7);
+            }
+            Ok(TriggerOutcome::Proceed(row))
+        }),
+    );
+    seed(&core);
+    all_triggers(&core, 0, UPD);
+    let out = run(&core, &a, UPSERT_NULLING).expect("fixed by BEFORE UPDATE");
+    assert_eq!(super::trigger_insert_tests::rows_affected(out), 1);
+    assert_eq!(read_rows(&core, &a, "trg"), vec![(1, "x".to_string(), 7)]);
+
+    // BEFORE ROW UPDATE が NULL 返却で行をスキップする: SET 結果は検証されず、行は更新されない。
+    let dir2 = crate::test_util::temp_db::tempdir();
+    let (core2, _c2) = core_with(
+        dir2.path(),
+        Box::new(|c| {
+            if c.tg_when() == "BEFORE" && c.tg_level() == "ROW" && c.tg_op() == "UPDATE" {
+                return Ok(TriggerOutcome::Skip);
+            }
+            Ok(TriggerOutcome::Proceed(c.new_row.to_vec()))
+        }),
+    );
+    seed(&core2);
+    all_triggers(&core2, 0, UPD);
+    let out = run(&core2, &a, UPSERT_NULLING).expect("skipped by BEFORE UPDATE");
+    assert_eq!(super::trigger_insert_tests::rows_affected(out), 0);
+    assert_eq!(read_rows(&core2, &a, "trg"), vec![(1, "x".to_string(), 10)]);
+
+    // 補正しなければ最終 NEW が NOT NULL 違反（23502）で拒否され、行は残る。
+    let dir3 = crate::test_util::temp_db::tempdir();
+    let (core3, _c3) = core_with(
+        dir3.path(),
+        Box::new(|c| Ok(TriggerOutcome::Proceed(c.new_row.to_vec()))),
+    );
+    seed(&core3);
+    all_triggers(&core3, 0, UPD);
+    assert_eq!(code(&core3, &a, UPSERT_NULLING), "23502");
+    assert_eq!(read_rows(&core3, &a, "trg"), vec![(1, "x".to_string(), 10)]);
+}

@@ -345,6 +345,10 @@ pub(super) fn upsert_rows_with_triggers(
                     }
                 }
                 // SET 適用（従来経路と共有）。`EXCLUDED` は BEFORE INSERT 適用後の NEW。
+                // BEFORE ROW UPDATE を持つ場合、SET 値の検証・encode は BEFORE が確定した NEW に対して
+                // 行う（通常の UPDATE と同順。BEFORE の NULL スキップ・NEW 書き換えを SET 検証が先回りで
+                // 拒否しない）。
+                let defer = update_before.is_some();
                 let (pre_image_values, merged_values, merged_embedding) = apply_upsert_assignments(
                     schema,
                     vector_idx,
@@ -352,14 +356,8 @@ pub(super) fn upsert_rows_with_triggers(
                     &new_values,
                     &existing,
                     write_id,
+                    defer,
                 )?;
-                schema.validate_row_embedding_dim(merged_embedding.len())?;
-                if schema.primary_key().is_some() || !schema.unique_constraints().is_empty() {
-                    pre_images.record(RowId::from_legacy_id(write_id), pre_image_values);
-                }
-                let merged_metadata =
-                    crate::row_codec::encode_scalar_columns(schema, &merged_values)
-                        .map_err(|e| CatalogError::Invalid(e.to_string()))?;
                 let old_values = if update_before.is_some() || update_after.is_some() {
                     captured_values_from_parts(
                         schema,
@@ -370,12 +368,26 @@ pub(super) fn upsert_rows_with_triggers(
                     Vec::new()
                 };
                 let mut new_candidate: Vec<Value> = Vec::new();
-                if update_before.is_some() || update_after.is_some() {
-                    new_candidate = captured_values_from_parts(
-                        schema,
-                        merged_embedding.clone(),
-                        &merged_metadata,
-                    )?;
+                let mut eager_encoded: Option<Vec<u8>> = None;
+                if defer {
+                    // encode せず、SET 適用後の値をそのまま BEFORE の NEW 候補にする。
+                    new_candidate = merged_values.clone();
+                    if !merged_embedding.is_empty() {
+                        if let Some(vi) = vector_idx {
+                            if let Some(slot) = new_candidate.get_mut(vi) {
+                                *slot = Value::Vector(merged_embedding.clone());
+                            }
+                        }
+                    }
+                } else {
+                    schema.validate_row_embedding_dim(merged_embedding.len())?;
+                    let md = crate::row_codec::encode_scalar_columns(schema, &merged_values)
+                        .map_err(|e| CatalogError::Invalid(e.to_string()))?;
+                    if update_after.is_some() {
+                        new_candidate =
+                            captured_values_from_parts(schema, merged_embedding.clone(), &md)?;
+                    }
+                    eager_encoded = Some(md);
                 }
                 // BEFORE ROW UPDATE（OLD = 既存行、NEW = SET 適用後。表ハンドルを開く前に発火する）。
                 let (final_embedding, final_metadata, final_row) = match update_before {
@@ -396,8 +408,16 @@ pub(super) fn upsert_rows_with_triggers(
                         let (e, m) = encode_final_row(schema, &final_row)?;
                         (e, m, final_row)
                     }
-                    None => (merged_embedding, merged_metadata, new_candidate),
+                    None => (
+                        merged_embedding,
+                        eager_encoded.ok_or_else(|| internal("internal: missing encoded row"))?,
+                        new_candidate,
+                    ),
                 };
+                // 更新が確定した行だけ ON UPDATE 連鎖の pre-image を積む（BEFORE の NULL スキップ行は積まない）。
+                if schema.primary_key().is_some() || !schema.unique_constraints().is_empty() {
+                    pre_images.record(RowId::from_legacy_id(write_id), pre_image_values);
+                }
                 let row = RowInput {
                     tenant_id: ctx.tenant_id(),
                     // 既存行の可視性を保持する（SET で触れない列と同じ扱い）。
