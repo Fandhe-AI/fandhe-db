@@ -45,6 +45,23 @@ fn setup(s: &Storage, scope: &str, table: &str, fkey: &str) {
     s.create_function(scope, &func(fkey)).expect("fn");
 }
 
+/// テナント `scope` の SCHEMA `s`（新しい DB では ID 1）配下に表 `docs` を作り、内部キー `#1.docs` を返す
+/// （Issue #3361 以降、本番の `create_trigger` が受けるのは SCHEMA 配下の表だけ）。
+fn setup_in_schema(s: &Storage, scope: &str, fkey: &str) -> String {
+    s.create_schema(scope, "s", false).expect("schema");
+    let key = "#1.docs";
+    s.create_table(&TableSchema::new(
+        key,
+        vec![
+            ColumnDef::new("a", ColumnType::Text, true),
+            ColumnDef::new("b", ColumnType::Text, true),
+        ],
+    ))
+    .expect("table");
+    s.create_function(scope, &func(fkey)).expect("fn");
+    key.to_string()
+}
+
 fn tdef(name: &str, fkey: &str) -> TriggerDef {
     TriggerDef {
         id: 0,
@@ -68,6 +85,7 @@ fn create(s: &Storage, scope: &str, table: &str, def: &TriggerDef) -> Result<u64
         false,
         MAX_TRIGGERS_PER_TABLE,
         always_trigger,
+        SharedPublicTables::AllowLegacyForTest,
     )
 }
 
@@ -202,7 +220,7 @@ fn other_tenants_cannot_see_or_drop_definitions() {
 fn create_judgement_order_and_errors() {
     let (path, _g) = tmp_path("trg_errors");
     let s = Storage::open(&path).expect("open");
-    setup(&s, "t1", "docs", "f");
+    let key = setup_in_schema(&s, "t1", "f");
     // 表なし。
     assert!(matches!(
         create(&s, "t1", "nope", &tdef("trg", "f")),
@@ -212,26 +230,87 @@ fn create_judgement_order_and_errors() {
     let mut d = tdef("trg", "f");
     d.update_of = vec!["zzz".to_string()];
     assert!(matches!(
-        create(&s, "t1", "docs", &d),
+        create(&s, "t1", &key, &d),
         Err(CatalogError::ColumnNotFound(_))
     ));
     // 関数なし（他テナントにしか無い関数も同じ）。
     s.create_function("t2", &func("g")).expect("g");
-    match create(&s, "t1", "docs", &tdef("trg", "g")) {
+    match create(&s, "t1", &key, &tdef("trg", "g")) {
         Err(CatalogError::Invalid(m)) => assert_eq!(m, TRIGGER_FUNCTION_NOT_FOUND_MESSAGE),
         other => panic!("{other:?}"),
     }
     // 関数はあるが RETURNS trigger ではない（現状は常に）。
-    match s.create_trigger("t1", "docs", &tdef("trg", "f"), false) {
+    match s.create_trigger("t1", &key, &tdef("trg", "f"), false) {
         Err(CatalogError::Invalid(m)) => assert_eq!(m, TRIGGER_FUNCTION_NOT_TRIGGER_MESSAGE),
         other => panic!("{other:?}"),
     }
     // 同名の既存。
-    create(&s, "t1", "docs", &tdef("trg", "f")).expect("create");
-    match create(&s, "t1", "docs", &tdef("trg", "f")) {
+    create(&s, "t1", &key, &tdef("trg", "f")).expect("create");
+    match create(&s, "t1", &key, &tdef("trg", "f")) {
         Err(CatalogError::Invalid(m)) => assert_eq!(m, TRIGGER_ALREADY_EXISTS_MESSAGE),
         other => panic!("{other:?}"),
     }
+}
+
+/// Issue #3361: 共有 public 表への定義は、同名・上限・関数の判定より前に固定文言の `Invalid` で拒む。
+/// 副作用（トリガ表・ID カウンタ・表の世代）は残さず、他テナントや自分の既存定義の有無で応答が変わらない。
+#[test]
+fn shared_public_table_is_rejected_without_side_effects() {
+    let (path, _g) = tmp_path("trg_shared_public");
+    let s = Storage::open(&path).expect("open");
+    setup(&s, "t1", "docs", "f");
+    s.create_function("t2", &func("f")).expect("fn2");
+    let generation = s.table_generation("docs").expect("gen");
+    let rejected = |scope: &str, name: &str, or_replace: bool| match s.create_trigger(
+        scope,
+        "docs",
+        &tdef(name, "f"),
+        or_replace,
+    ) {
+        Err(CatalogError::Invalid(m)) => m,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        rejected("t1", "trg", false),
+        TRIGGER_ON_SHARED_PUBLIC_TABLE_MESSAGE
+    );
+    assert_eq!(
+        rejected("t1", "trg", true),
+        TRIGGER_ON_SHARED_PUBLIC_TABLE_MESSAGE
+    );
+    assert!(s.list_triggers("t1", "docs").expect("list").is_empty());
+    assert_eq!(s.table_generation("docs").expect("gen"), generation);
+    {
+        let read = s.db().begin_read().expect("read");
+        assert!(matches!(
+            ReadSource::open_table(&read, TRIGGERS_TABLE),
+            Err(redb::TableError::TableDoesNotExist(_))
+        ));
+        assert!(matches!(
+            ReadSource::open_table(&read, TRIGGER_ID_COUNTER_TABLE),
+            Err(redb::TableError::TableDoesNotExist(_))
+        ));
+    }
+    // 既存カタログに残った定義（自分・他テナントの同名を含む）があっても応答は同じ（42710・54000 に化けない）。
+    create(&s, "t1", "docs", &tdef("trg", "f")).expect("legacy t1");
+    create(&s, "t2", "docs", &tdef("trg", "f")).expect("legacy t2");
+    assert_eq!(
+        rejected("t1", "trg", false),
+        TRIGGER_ON_SHARED_PUBLIC_TABLE_MESSAGE
+    );
+    assert_eq!(
+        rejected("t2", "trg", false),
+        TRIGGER_ON_SHARED_PUBLIC_TABLE_MESSAGE
+    );
+    assert_eq!(
+        rejected("t1", "other", false),
+        TRIGGER_ON_SHARED_PUBLIC_TABLE_MESSAGE
+    );
+    // 判定順: 存在しない名前は 42P01、ビューは 42809 のまま。
+    assert!(matches!(
+        s.create_trigger("t1", "nope", &tdef("trg", "f"), false),
+        Err(CatalogError::TableNotFound(_))
+    ));
 }
 
 #[test]
@@ -251,6 +330,7 @@ fn or_replace_is_atomic_and_keeps_id() {
             true,
             MAX_TRIGGERS_PER_TABLE,
             always_trigger,
+            SharedPublicTables::AllowLegacyForTest,
         )
         .expect("replace");
     assert_eq!(id, id2);
@@ -273,16 +353,33 @@ fn per_table_limit_is_enforced_and_ids_are_not_reused() {
             false,
             2,
             always_trigger,
+            SharedPublicTables::AllowLegacyForTest,
         )
         .expect("create");
     }
     assert!(matches!(
-        s.create_trigger_inner("t1", "docs", &tdef("t9", "f"), false, 2, always_trigger),
+        s.create_trigger_inner(
+            "t1",
+            "docs",
+            &tdef("t9", "f"),
+            false,
+            2,
+            always_trigger,
+            SharedPublicTables::AllowLegacyForTest,
+        ),
         Err(CatalogError::ViewLimitExceeded(_))
     ));
     assert!(s.drop_trigger("t1", "docs", "t0").expect("drop"));
     let id = s
-        .create_trigger_inner("t1", "docs", &tdef("t3", "f"), false, 2, always_trigger)
+        .create_trigger_inner(
+            "t1",
+            "docs",
+            &tdef("t3", "f"),
+            false,
+            2,
+            always_trigger,
+            SharedPublicTables::AllowLegacyForTest,
+        )
         .expect("create");
     assert_eq!(id, 3);
 }
@@ -477,17 +574,17 @@ fn trigger_pseudo_type_is_valid_only_as_a_return_type() {
 fn create_trigger_accepts_a_real_trigger_function_and_rejects_others() {
     let (path, _g) = tmp_path("trg-real-fn");
     let s = Storage::open(&path).expect("open");
-    setup(&s, "t1", "docs", "plain");
+    let key = setup_in_schema(&s, "t1", "plain");
     s.create_function("t1", &trigger_func("tf")).expect("tf");
-    s.create_trigger("t1", "docs", &tdef("ok", "tf"), false)
+    s.create_trigger("t1", &key, &tdef("ok", "tf"), false)
         .expect("trigger function is accepted");
     // 非トリガ関数は `Invalid`（`42P17`）。
     assert!(matches!(
-        s.create_trigger("t1", "docs", &tdef("bad", "plain"), false),
+        s.create_trigger("t1", &key, &tdef("bad", "plain"), false),
         Err(CatalogError::Invalid(_))
     ));
     // 他テナントのトリガ関数は不在と同じ扱い（存在を区別しない）。
     assert!(s
-        .create_trigger("t2", "docs", &tdef("x", "tf"), false)
+        .create_trigger("t2", &key, &tdef("x", "tf"), false)
         .is_err());
 }
