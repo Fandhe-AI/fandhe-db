@@ -79,6 +79,8 @@ pub(super) fn write_rows_with_triggers(
             ))
         })?;
     }
+    // 行ループの間は、トリガ本体が同じ表の行を消せない（`trigger::row_loop`。D6 の暫定ガード）。
+    let row_loop_guard = crate::trigger::row_loop::RowLoopGuard::enter(ctx.tenant_id(), table);
     for (row_id, values) in rows {
         crate::interrupt::check().map_err(TenantWriteError::TriggerFailed)?;
         // 表ハンドルを開く前に発火する（再入の不変条件）。
@@ -142,6 +144,7 @@ pub(super) fn write_rows_with_triggers(
             after_queue.push(final_row);
         }
     }
+    drop(row_loop_guard);
     if !written.is_empty() {
         crate::constraint::enforce_foreign_keys_for_rows_in_txn(
             write_txn,

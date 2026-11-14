@@ -405,15 +405,40 @@ fn default_invoker_rejects_non_trigger_function() {
         Box::new(crate::kernel::CpuScalarProvider),
     );
     let a = ctx("tenant-a");
-    add_trigger(&core.storage, "tenant-a", "trg", &before_row("t"));
-    let err = run(&core, &a, INSERT_A1).unwrap_err();
+    // 共有 public 表のトリガは本番の invoker が先に拒否する（Issue #3361）ため、対象表はテナントの SCHEMA 配下に置く。
+    let mut ddl = SessionState::default();
+    ddl.allow_ddl();
+    for sql in [
+        "CREATE SCHEMA s",
+        "CREATE TABLE s.trg (embedding VECTOR(2) NOT NULL, a TEXT, n BIGINT NOT NULL)",
+    ] {
+        core.execute_sql_in_session(&a, &mut ddl, sql)
+            .unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+    }
+    let schema_id = core
+        .storage
+        .schema_id("tenant-a", "s")
+        .expect("schema id")
+        .expect("schema exists");
+    add_trigger(
+        &core.storage,
+        "tenant-a",
+        &format!("#{schema_id}.trg"),
+        &before_row("t"),
+    );
+    let err = run(
+        &core,
+        &a,
+        "INSERT INTO s.trg (embedding, a, n) VALUES ('[1.0,0.0]', 'x', 1)",
+    )
+    .unwrap_err();
     assert_eq!(err.wire_code(), "0A000");
     assert!(
         err.to_string()
             .contains("the function is not a PL/pgSQL trigger function"),
         "{err}"
     );
-    assert_eq!(count(&core, &a, "trg"), 0);
+    assert_eq!(count(&core, &a, "s.trg"), 0);
 }
 
 // 文トリガ（INSERT）の発火は `trigger_statement_tests.rs`（Issue #1726）で固定する。
