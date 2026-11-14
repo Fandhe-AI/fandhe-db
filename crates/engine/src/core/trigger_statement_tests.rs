@@ -433,7 +433,7 @@ fn statement_trigger_with_when_is_0a000() {
     assert_eq!(count(&core, &a, "trg"), 0);
 }
 
-// 発火に未対応の経路（RETURNING・UPSERT・分割実行）は文トリガでも `0A000`。呼び出しは 0 回。
+// 発火に未対応の経路（RETURNING・RETURNING 付き UPSERT・分割実行）は文トリガでも `0A000`。呼び出しは 0 回。
 #[test]
 fn unwired_paths_stay_guarded_for_statement_triggers() {
     let dir = tempdir();
@@ -453,7 +453,7 @@ fn unwired_paths_stay_guarded_for_statement_triggers() {
         "UPDATE trg SET n = 1 WHERE id = 1 RETURNING id USING OPERATION_ID 'g1'",
         "DELETE FROM trg WHERE n > 0 RETURNING id USING OPERATION_ID 'g2'",
         "INSERT INTO trg (id, embedding, a, n) VALUES (1, '[1.0,0.0]', 'x', 1) \
-         ON CONFLICT (id) DO UPDATE SET n = 2 USING OPERATION_ID 'g3'",
+         ON CONFLICT (id) DO UPDATE SET n = 2 RETURNING id USING OPERATION_ID 'g3'",
         "UPDATE trg SET n = 1 WHERE n > 0 USING OPERATION_ID 'g4' PARTITIONED CHUNK 1",
         "DELETE FROM trg WHERE n > 0 USING OPERATION_ID 'g5' PARTITIONED CHUNK 1",
     ] {
@@ -463,11 +463,18 @@ fn unwired_paths_stay_guarded_for_statement_triggers() {
     assert_eq!(count(&core, &a, "trg"), 3);
 }
 
-// 0 行の `INSERT ... SELECT ... ON CONFLICT` も非空と同じく UPSERT 未結線として `0A000`。INSERT・UPDATE
-// どちらの文トリガでも呼び出しは 0 回で、台帳も残らない（同じ operation_id を後でトリガ無しに再送できる）。
+// 0 行の `INSERT ... SELECT ... ON CONFLICT` でも、INSERT 文トリガは 1 回、`DO UPDATE` なら UPDATE 文トリガも
+// 1 回発火する（`DO NOTHING` は UPDATE 文トリガを呼ばない。Issue #3191）。台帳は発火の前に残り、同じ
+// operation_id の再送ではトリガを呼ばず `23505`。
 #[test]
-fn zero_row_insert_select_upsert_stays_guarded() {
-    for events in [INS, UPD] {
+fn zero_row_insert_select_upsert_fires_statement_triggers() {
+    let sel = "SELECT id, embedding, a, n FROM trg WHERE n < 0";
+    for (events, action, expected) in [
+        (INS, "DO NOTHING", 1usize),
+        (UPD, "DO NOTHING", 0),
+        (UPD, "DO UPDATE SET n = 2", 1),
+        (INS | UPD, "DO UPDATE SET n = 2", 2),
+    ] {
         let dir = tempdir();
         let (core, calls) = seeded(
             dir.path(),
@@ -481,12 +488,39 @@ fn zero_row_insert_select_upsert_stays_guarded() {
             &stmt("s", TriggerTiming::After, events),
         );
         let before = calls.load(Ordering::SeqCst);
-        let sql = "INSERT INTO trg (id, embedding, a, n) SELECT id, embedding, a, n FROM trg \
-                   WHERE n < 0 ON CONFLICT (id) DO NOTHING USING OPERATION_ID 'z1'";
-        assert_eq!(code(&core, &a, sql), "0A000", "{sql}");
-        assert_eq!(calls.load(Ordering::SeqCst), before);
+        let sql = format!(
+            "INSERT INTO trg (id, embedding, a, n) {sel} ON CONFLICT (id) {action} \
+             USING OPERATION_ID 'z1'"
+        );
+        run(&core, &a, &sql).expect(&sql);
+        assert_eq!(calls.load(Ordering::SeqCst), before + expected, "{sql}");
         assert_eq!(count(&core, &a, "trg"), 3);
+        // 再送: 台帳で止まりトリガは呼ばれない。
+        assert_eq!(code(&core, &a, &sql), "23505", "{sql}");
+        assert_eq!(calls.load(Ordering::SeqCst), before + expected, "{sql}");
     }
+}
+
+// `RETURNING` 付きの 0 行 UPSERT は未結線で、INSERT トリガがあれば `0A000`（台帳は残らない）。
+#[test]
+fn zero_row_insert_select_upsert_with_returning_stays_guarded() {
+    let dir = tempdir();
+    let (core, calls) = seeded(
+        dir.path(),
+        Box::new(|c| Ok(TriggerOutcome::Proceed(c.new_row.to_vec()))),
+    );
+    let a = ctx("tenant-a");
+    add_trigger(
+        &core.storage,
+        "tenant-a",
+        "trg",
+        &stmt("s", TriggerTiming::After, INS),
+    );
+    let before = calls.load(Ordering::SeqCst);
+    let sql = "INSERT INTO trg (id, embedding, a, n) SELECT id, embedding, a, n FROM trg \
+               WHERE n < 0 ON CONFLICT (id) DO NOTHING RETURNING id USING OPERATION_ID 'z2'";
+    assert_eq!(code(&core, &a, sql), "0A000", "{sql}");
+    assert_eq!(calls.load(Ordering::SeqCst), before);
 }
 
 // BEFORE STATEMENT UPDATE しか無い表では、NOT NULL の検査を延期しない（`23502` と `UPDATE 0` の差で

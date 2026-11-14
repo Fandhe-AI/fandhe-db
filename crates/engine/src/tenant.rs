@@ -2406,6 +2406,47 @@ pub(crate) fn guard_no_delete_triggers(
     crate::trigger::plan::guard_unwired_dml(write_txn, tenant, table, true)
 }
 
+/// UPSERT の発火計画（Issue #3191）。INSERT の計画と、`DO UPDATE` のときだけ UPDATE の計画（`UPDATE OF`
+/// の判定に使う SET 列は `DO UPDATE SET` の列。実行モデルの D7）を返す。`DO NOTHING` は UPDATE を行わない
+/// ため UPDATE トリガ・子表の参照アクションのトリガを見ない（PostgreSQL と同じ）。通過証が無い（`triggers`
+/// が `None`）のに該当トリガがあれば固定文言の `0A000`。
+fn plan_upsert_triggers<'a>(
+    write_txn: &redb::WriteTransaction,
+    ctx: &PolicyContext,
+    table: &str,
+    schema: &crate::catalog::TableSchema,
+    action: &UpsertAction<'_>,
+    triggers: Option<&'a crate::trigger::TriggerRuntime<'a>>,
+) -> Result<
+    (
+        Option<crate::trigger::plan::RowTriggerPlan<'a>>,
+        Option<crate::trigger::plan::RowTriggerPlan<'a>>,
+    ),
+    TenantWriteError,
+> {
+    let insert = crate::trigger::plan::plan_insert(write_txn, ctx.tenant_id(), table, triggers)?;
+    let update = match action {
+        UpsertAction::DoNothing => None,
+        UpsertAction::DoUpdate(assignments, _) => {
+            let mut set_columns: Vec<usize> = assignments.iter().map(|(idx, _)| *idx).collect();
+            set_columns.sort_unstable();
+            set_columns.dedup();
+            crate::trigger::plan::plan_row_triggers(
+                write_txn,
+                ctx.tenant_id(),
+                table,
+                crate::catalog::trigger::TriggerEvents::UPDATE,
+                Some(&crate::trigger::plan::UpdateTarget {
+                    schema,
+                    set_columns: &set_columns,
+                }),
+                triggers,
+            )?
+        }
+    };
+    Ok((insert, update))
+}
+
 /// UPDATE の発火計画（Issue #1725）。`UPDATE OF` の判定に使う SET 列は `assignments`・`set_exprs`・
 /// 結合形の行ごとの上書き列（`override_columns`）の和集合（BEFORE トリガが書き換える列は含めない。
 /// 実行モデルの D7）。
@@ -2485,8 +2526,13 @@ pub(crate) enum LedgerOnlyTriggers<'a> {
     Skip,
     /// 0 行 INSERT 文としてトリガを分類・発火する（`None` は未結線で INSERT トリガがあれば `0A000`）。
     Insert(Option<&'a crate::trigger::TriggerRuntime<'a>>),
-    /// 0 行 UPSERT。INSERT・UPDATE トリガがあれば未結線として `0A000`。
-    Upsert,
+    /// 0 行 UPSERT（Issue #3191）。INSERT 文トリガと、`update_set_columns` が `Some` のとき（`DO UPDATE`）は
+    /// UPDATE 文トリガも 1 回ずつ発火する（`None` の通過証は未結線で、該当トリガがあれば `0A000`）。
+    /// `Some` の中身は `DO UPDATE SET` の対象列添字で、`UPDATE OF` の判定に使う（非空経路と同じ結果にする）。
+    Upsert {
+        triggers: Option<&'a crate::trigger::TriggerRuntime<'a>>,
+        update_set_columns: Option<Vec<usize>>,
+    },
 }
 
 /// 行を書かずに台帳だけを記録する（`INSERT ... SELECT` が 0 行だった場合。SQL-51 (5)・RECOVER-10/11・
@@ -2521,20 +2567,41 @@ pub(crate) fn record_ledger_only_unchecked(
         // （再送ではトリガを呼ばない）。行トリガは 0 行では発火しない。
         let triggers = match &trigger_mode {
             LedgerOnlyTriggers::Insert(t) => *t,
-            _ => None,
-        };
-        let plan = match trigger_mode {
+            LedgerOnlyTriggers::Upsert { triggers, .. } => *triggers,
             LedgerOnlyTriggers::Skip => None,
-            LedgerOnlyTriggers::Insert(triggers) => {
-                crate::trigger::plan::plan_insert(write_txn, ctx.tenant_id(), table, triggers)?
-            }
-            // 0 行の `ON CONFLICT` 付き `INSERT ... SELECT`。非空の UPSERT 経路と同じく INSERT・UPDATE
-            // どちらのトリガがあっても未結線として `0A000` にする（台帳より前。何も書かない）。
-            LedgerOnlyTriggers::Upsert => {
-                guard_no_insert_triggers(write_txn, ctx.tenant_id(), table)?;
-                guard_no_update_triggers(write_txn, ctx.tenant_id(), table)?;
-                None
-            }
+        };
+        let (plan, update_plan) = match trigger_mode {
+            LedgerOnlyTriggers::Skip => (None, None),
+            LedgerOnlyTriggers::Insert(triggers) => (
+                crate::trigger::plan::plan_insert(write_txn, ctx.tenant_id(), table, triggers)?,
+                None,
+            ),
+            // 0 行の `ON CONFLICT` 付き `INSERT ... SELECT`。非空の UPSERT 経路と同じ分類（`DO NOTHING` は
+            // UPDATE トリガを見ない）。
+            LedgerOnlyTriggers::Upsert {
+                triggers,
+                update_set_columns,
+            } => (
+                crate::trigger::plan::plan_insert(write_txn, ctx.tenant_id(), table, triggers)?,
+                if let Some(mut set_columns) = update_set_columns {
+                    set_columns.sort_unstable();
+                    set_columns.dedup();
+                    let schema = require_table_schema_write_any_identity(write_txn, table)?;
+                    crate::trigger::plan::plan_row_triggers(
+                        write_txn,
+                        ctx.tenant_id(),
+                        table,
+                        crate::catalog::trigger::TriggerEvents::UPDATE,
+                        Some(&crate::trigger::plan::UpdateTarget {
+                            schema: &schema,
+                            set_columns: &set_columns,
+                        }),
+                        triggers,
+                    )?
+                } else {
+                    None
+                },
+            ),
         };
         let outcome = ledger::record_in_txn(
             write_txn,
@@ -2544,26 +2611,50 @@ pub(crate) fn record_ledger_only_unchecked(
             content_hash,
         )?;
         let mut trigger_wrote = false;
-        if let Some(plan) = &plan {
+        if plan.is_some() || update_plan.is_some() {
             let schema = require_table_schema_write_any_identity(write_txn, table)?;
             let writes = trigger_insert_writes(write_txn, ctx, triggers);
-            trigger_dml::fire_before_statement(
-                plan,
-                &writes,
-                table,
-                &schema,
-                crate::trigger::call::TriggerOp::Insert,
-            )?;
-            crate::trigger::fire::fire_statement(
-                plan.runtime,
-                &writes,
-                table,
-                &schema,
-                &plan.after_stmt,
-                crate::trigger::call::TriggerOp::Insert,
-                crate::catalog::trigger::TriggerTiming::After,
-            )
-            .map_err(TenantWriteError::TriggerFailed)?;
+            // BEFORE は INSERT → UPDATE、AFTER は UPDATE → INSERT の順（PostgreSQL と同じ）。
+            if let Some(plan) = &plan {
+                trigger_dml::fire_before_statement(
+                    plan,
+                    &writes,
+                    table,
+                    &schema,
+                    crate::trigger::call::TriggerOp::Insert,
+                )?;
+            }
+            if let Some(plan) = &update_plan {
+                trigger_dml::fire_before_statement(
+                    plan,
+                    &writes,
+                    table,
+                    &schema,
+                    crate::trigger::call::TriggerOp::Update,
+                )?;
+                crate::trigger::fire::fire_statement(
+                    plan.runtime,
+                    &writes,
+                    table,
+                    &schema,
+                    &plan.after_stmt,
+                    crate::trigger::call::TriggerOp::Update,
+                    crate::catalog::trigger::TriggerTiming::After,
+                )
+                .map_err(TenantWriteError::TriggerFailed)?;
+            }
+            if let Some(plan) = &plan {
+                crate::trigger::fire::fire_statement(
+                    plan.runtime,
+                    &writes,
+                    table,
+                    &schema,
+                    &plan.after_stmt,
+                    crate::trigger::call::TriggerOp::Insert,
+                    crate::catalog::trigger::TriggerTiming::After,
+                )
+                .map_err(TenantWriteError::TriggerFailed)?;
+            }
             trigger_insert::settle_trigger_written_tables(write_txn, &target, ctx, &writes)?;
             trigger_wrote = !writes.written_tables().is_empty();
         }
@@ -3071,6 +3162,7 @@ pub(crate) fn upsert_typed_rows_unchecked(
     ledger_write: LedgerWrite<'_>,
     expected_schema: Option<&crate::catalog::TableSchema>,
     volatile_default_columns: VolatileDefaultColumns<'_>,
+    triggers: Option<&crate::trigger::TriggerRuntime>,
 ) -> Result<UpsertOutcome, TenantWriteError> {
     upsert_typed_rows_impl(
         write_target,
@@ -3083,6 +3175,7 @@ pub(crate) fn upsert_typed_rows_unchecked(
         ledger_write,
         expected_schema,
         volatile_default_columns,
+        triggers,
         None,
     )
 }
@@ -3106,6 +3199,7 @@ pub(crate) fn upsert_typed_rows_capturing_unchecked(
     ledger_write: LedgerWrite<'_>,
     expected_schema: Option<&crate::catalog::TableSchema>,
     volatile_default_columns: VolatileDefaultColumns<'_>,
+    triggers: Option<&crate::trigger::TriggerRuntime>,
     project: &mut ReturningProjectFn<'_>,
 ) -> Result<UpsertOutcome, TenantWriteError> {
     upsert_typed_rows_impl(
@@ -3119,8 +3213,169 @@ pub(crate) fn upsert_typed_rows_capturing_unchecked(
         ledger_write,
         expected_schema,
         volatile_default_columns,
+        triggers,
         Some(project),
     )
+}
+
+/// [`apply_upsert_assignments`] の結果（書き換え前の全列値・SET 適用後の全列値・SET 適用後の embedding）。
+type AppliedUpsertAssignments = (
+    Vec<crate::row_codec::Value>,
+    Vec<crate::row_codec::Value>,
+    Vec<f32>,
+);
+
+/// UPSERT の `DO UPDATE` の SET 適用（`upsert_typed_rows_impl` の従来経路と、トリガ経路
+/// [`trigger_upsert`] が共有する。第 2 の SET 評価を作らない）。
+///
+/// `existing` は所有・可視と確定した衝突先の既存行、`values` は `EXCLUDED` 側の行（トリガ経路では
+/// BEFORE INSERT 適用後の NEW）、`write_id` は衝突判定で確定した既存行の id。戻り値は
+/// `(書き換え前の全列値, SET 適用後の全列値, SET 適用後の embedding)`。書き換え前の値は ON UPDATE 連鎖の
+/// pre-image と加算式の左辺に使う（全代入が更新前の行を見る。PG と同じ）。
+fn apply_upsert_assignments(
+    schema: &crate::catalog::TableSchema,
+    vector_idx: Option<usize>,
+    assignments: &[(usize, UpsertSetValue<'_>)],
+    values: &[crate::row_codec::Value],
+    existing: &crate::storage::Row,
+    write_id: u64,
+    defer_value_validation: bool,
+) -> Result<AppliedUpsertAssignments, TenantWriteError> {
+    let pre_image_values = crate::row_codec::decode_scalar_columns(schema, &existing.metadata)
+        .map_err(|e| CatalogError::Invalid(e.to_string()))?;
+    let mut merged_values = pre_image_values.clone();
+    let mut embedding_value: Vec<f32> = existing.embedding.clone();
+    for (col_idx, value) in assignments.iter() {
+        // `src_idx`／`col_idx` は束縛時点のスキーマ（`bind_upsert_assignments`）
+        // が `schema.columns` に対して検証済みの位置インデックスであり、
+        // `expected_schema` 照合（`Some` の場合。呼び出し元
+        // `sql::exec::execute_upsert` ドキュメント参照）によって
+        // 本 write トランザクション内の `schema` と一致することが
+        // 保証されている。したがって範囲外・型不一致はいずれも
+        // 到達しないはずの内部不変条件違反であり、値を黙って
+        // `Null` へ差し替えたり SET を無視したりせず fail-closed に
+        // 拒否する（cursor bugbot 指摘・PR #990。黙って無視すると
+        // `updated` カウント・テーブル世代だけが進み、実際には
+        // 適用されなかった SET が適用されたかのような不整合が
+        // 生じる）。
+        let mut new_value = match value {
+            UpsertSetValue::Excluded(src_idx) => {
+                values.get(*src_idx).cloned().ok_or_else(|| {
+                    CatalogError::Invalid(
+                        "internal: EXCLUDED source column index out of range".to_string(),
+                    )
+                })?
+            }
+            UpsertSetValue::Literal(v) => (*v).clone(),
+            UpsertSetValue::Expr(set) => {
+                // 所有・可視と確定した衝突行に対してだけ評価する（値に依存する
+                // エラーを他テナントの存在オラクルにしない）。全代入が更新前の
+                // 行を見る（PG と同じ）よう、書き換え前のスカラービューを使う。
+                let pre = crate::row_codec::scan_scalar_columns(schema, &existing.metadata)
+                    .map_err(|e| CatalogError::CorruptSchema(e.to_string()))?;
+                let scratch = crate::sql::exec::array_payload_scratch(values)
+                    .map_err(TenantWriteError::SetExpressionEvaluationFailed)?;
+                let excluded = crate::sql::exec::candidate_scalar_view(values, &scratch);
+                let mut combined: Vec<Option<crate::row_codec::ScalarRef<'_>>> = Vec::new();
+                combined
+                    .try_reserve_exact(pre.len().saturating_add(excluded.len()))
+                    .map_err(|_| {
+                        TenantWriteError::Storage(StorageError::Codec(
+                            "failed to reserve upsert expression row view".to_string(),
+                        ))
+                    })?;
+                combined.extend(pre);
+                combined.extend(excluded);
+                // 遅延時は NOT NULL 検査も後回しにする（BEFORE が NULL を補正・スキップできる）。
+                let evaluated = if defer_value_validation {
+                    crate::sql::set_expr::eval_set_expr_to_value_deferred_not_null(
+                        set,
+                        write_id,
+                        &existing.embedding,
+                        &combined,
+                    )
+                } else {
+                    crate::sql::set_expr::eval_set_expr_to_value(
+                        set,
+                        write_id,
+                        &existing.embedding,
+                        &combined,
+                    )
+                };
+                let v = evaluated.map_err(TenantWriteError::SetExpressionEvaluationFailed)?;
+                // BEFORE ROW UPDATE を持つ経路では、SET 値の型・長さ・次元の検証を BEFORE の後
+                // （BEFORE が確定した NEW 行の encode 時）へ遅らせる（通常の UPDATE と同順）。
+                if !defer_value_validation {
+                    validate_set_assignments(schema, &[(*col_idx, v.clone())])?;
+                }
+                v
+            }
+            UpsertSetValue::Add(operand) => {
+                let rhs = match operand {
+                    UpsertAddOperandRef::Literal(v) => *v,
+                    UpsertAddOperandRef::Excluded(src_idx) => {
+                        values.get(*src_idx).ok_or_else(|| {
+                            CatalogError::Invalid(
+                                "internal: EXCLUDED source column index out of range".to_string(),
+                            )
+                        })?
+                    }
+                };
+                let column = schema.columns.get(*col_idx).ok_or_else(|| {
+                    CatalogError::Invalid(
+                        "internal: SET target column index out of range".to_string(),
+                    )
+                })?;
+                let current = pre_image_values.get(*col_idx).ok_or_else(|| {
+                    CatalogError::Invalid(
+                        "internal: SET target column index out of range".to_string(),
+                    )
+                })?;
+                crate::sql::upsert_add::eval_upsert_add(
+                    &column.ty,
+                    column.nullable,
+                    &column.name,
+                    current,
+                    rhs,
+                )
+                .map_err(TenantWriteError::SetExpressionEvaluationFailed)?
+            }
+        };
+        // `EXCLUDED.<列>` 等、値が実行時にしか決まらない代入の
+        // `VARCHAR(n)` 長さ検証（`22001`。TABLE-31・Issue #1564）。
+        // encode・commit の前に返すため txn は abort し副作用は残らない。
+        if let Some(column) = schema.columns.get(*col_idx) {
+            let normalized = crate::row_codec::normalize_char_length_value(column, &mut new_value);
+            // 遅延時の超過は値が変更されないまま残り、BEFORE 後の encode が厳格に拒否する。
+            if !defer_value_validation {
+                normalized
+                    .map_err(|e| TenantWriteError::SetExpressionEvaluationFailed(e.into()))?;
+            }
+        }
+        if Some(*col_idx) == vector_idx {
+            match new_value {
+                crate::row_codec::Value::Vector(v) => embedding_value = v,
+                // nullable な VECTOR 列への NULL は空 embedding（NOT NULL は
+                // `validate_set_assignments` が先に `23502` で拒否済み。
+                // Issue #2042・TABLE-26 (3)）。
+                crate::row_codec::Value::Null => embedding_value = Vec::new(),
+                _ => {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(
+                        "VECTOR column SET value must be a vector".to_string(),
+                    )))
+                }
+            }
+        } else {
+            let slot = merged_values.get_mut(*col_idx).ok_or_else(|| {
+                CatalogError::Invalid("internal: SET target column index out of range".to_string())
+            })?;
+            *slot = new_value;
+        }
+    }
+    if !defer_value_validation {
+        schema.validate_row_embedding_dim(embedding_value.len())?;
+    }
+    Ok((pre_image_values, merged_values, embedding_value))
 }
 
 /// UPSERT の衝突先の状態（Issue #1254）。`upsert_typed_rows_impl` の内部表現。
@@ -3149,6 +3404,7 @@ fn upsert_typed_rows_impl(
     ledger_write: LedgerWrite<'_>,
     expected_schema: Option<&crate::catalog::TableSchema>,
     volatile_default_columns: VolatileDefaultColumns<'_>,
+    triggers: Option<&crate::trigger::TriggerRuntime>,
     mut project: Option<&mut ReturningProjectFn<'_>>,
 ) -> Result<UpsertOutcome, TenantWriteError> {
     validate_relation_key(table)?;
@@ -3230,11 +3486,20 @@ fn upsert_typed_rows_impl(
         let mut updated: u64 = 0;
         {
             let schema = require_table_schema_write_any_identity(write_txn, table)?;
-            // INSERT トリガのある表への UPSERT の発火は未対応（#1725）。黙って飛ばさず `0A000`
-            // （台帳より前に判定する。Issue #1723・実行モデルの D8）。
-            guard_no_insert_triggers(write_txn, ctx.tenant_id(), table)?;
-            // `DO UPDATE` は UPDATE トリガを発火できないため、UPDATE トリガのある表も `0A000`（Issue #1725）。
-            guard_no_update_triggers(write_txn, ctx.tenant_id(), table)?;
+            // INSERT・UPDATE トリガの分類（Issue #3191。台帳より前・同じ write txn 内で読む）。通過証が
+            // 無い経路（`triggers` が `None`）でトリガがあれば固定文言の `0A000`（実行モデルの D8）。
+            // `DO NOTHING` は UPDATE を行わないため UPDATE トリガを見ない。
+            let (insert_plan, update_plan) =
+                plan_upsert_triggers(write_txn, ctx, table, &schema, action, triggers)?;
+            let has_triggers = insert_plan.is_some() || update_plan.is_some();
+            // `RETURNING` 付きの最終値投影はトリガ経路では未結線（INSERT の `RETURNING` と同じ方針）。
+            if has_triggers && project.is_some() {
+                return Err(TenantWriteError::TriggerFailed(
+                    SqlSurfaceError::FeatureNotSupported {
+                        detail: "triggers are not supported for this write path".to_string(),
+                    },
+                ));
+            }
             if let Some(expected) = expected_schema {
                 if expected != &schema {
                     return Err(TenantWriteError::Catalog(CatalogError::Invalid(
@@ -3465,6 +3730,28 @@ fn upsert_typed_rows_impl(
                 &content_hash_value,
             )?;
 
+            // 文ごとに 1 個の書き込み窓口（BEFORE STATEMENT・行トリガ・AFTER STATEMENT が共有する）。
+            let trigger_writes = trigger_insert_writes(write_txn, ctx, triggers);
+            // BEFORE STATEMENT（段 2）は台帳の記録の後（再送ではトリガを呼ばない）、rowid の払い出しの前、
+            // 行ストアを開く前に発火する。`DO UPDATE` は INSERT → UPDATE の順（Issue #3191）。
+            if let Some(plan) = &insert_plan {
+                trigger_dml::fire_before_statement(
+                    plan,
+                    &trigger_writes,
+                    table,
+                    &schema,
+                    crate::trigger::call::TriggerOp::Insert,
+                )?;
+            }
+            if let Some(plan) = &update_plan {
+                trigger_dml::fire_before_statement(
+                    plan,
+                    &trigger_writes,
+                    table,
+                    &schema,
+                    crate::trigger::call::TriggerOp::Update,
+                )?;
+            }
             // 採番方式の表の新規挿入行に使う rowid は、台帳照合の後・行ストアを開く前に行の数だけ
             // まとめて払い出す（衝突して使わなかった分は欠番になる。Issue #2199）。従来方式の表は
             // `VALUES` 自身の `id` を使う。
@@ -3478,6 +3765,29 @@ fn upsert_typed_rows_impl(
             } else {
                 None
             };
+            // トリガ経路（Issue #3191）: 行を書くループだけを差し替える。トリガの無い表は従来のループ。
+            if has_triggers {
+                let triggered = trigger_upsert::upsert_rows_with_triggers(
+                    write_txn,
+                    &write_target,
+                    table,
+                    ctx,
+                    &schema,
+                    insert_visibility,
+                    rows,
+                    new_row_ids.as_deref(),
+                    target,
+                    action,
+                    insert_plan.as_ref(),
+                    update_plan.as_ref(),
+                    &trigger_writes,
+                )?;
+                if triggered.outcome.inserted > 0 || triggered.outcome.updated > 0 {
+                    crate::catalog::bump_table_generation_in_txn(write_txn, table)?;
+                }
+                // 全行スキップ・採番・トリガの別表書き込みのいずれでも `Wrote`（台帳・払い出し済みの値を保つ）。
+                return Ok((triggered.outcome, TxnEffect::Wrote));
+            }
             let row_table_name = user_rows_table_name(table);
             let mut row_table = write_txn
                 .open_table_logged(user_rows_table_def(&row_table_name))
@@ -3523,30 +3833,27 @@ fn upsert_typed_rows_impl(
             // - 提案行（VALUES の行）への INSERT 側 `WITH CHECK`: 衝突の有無・`DO NOTHING` を問わず
             //   衝突判定の前に評価する（PostgreSQL の `ExecInsert` と同順）。
             // - 既存行への `USING`（UPDATE 側・SELECT 側）: `DO UPDATE` で更新する可視な衝突先に掛ける。
-            let policy_proposed =
-                crate::sql::policy_eval::compile_in_txn(
-                    write_txn,
-                    ctx.tenant_id(),
-                    table,
-                    &schema,
-                    crate::sql::policy_eval::PolicyCheckKind::InsertCheck,
-                )?;
-            let policy_conflict_update =
-                crate::sql::policy_eval::compile_in_txn(
-                    write_txn,
-                    ctx.tenant_id(),
-                    table,
-                    &schema,
-                    crate::sql::policy_eval::PolicyCheckKind::ConflictUpdateUsing,
-                )?;
-            let policy_conflict_select =
-                crate::sql::policy_eval::compile_in_txn(
-                    write_txn,
-                    ctx.tenant_id(),
-                    table,
-                    &schema,
-                    crate::sql::policy_eval::PolicyCheckKind::ConflictSelectUsing,
-                )?;
+            let policy_proposed = crate::sql::policy_eval::compile_in_txn(
+                write_txn,
+                ctx.tenant_id(),
+                table,
+                &schema,
+                crate::sql::policy_eval::PolicyCheckKind::InsertCheck,
+            )?;
+            let policy_conflict_update = crate::sql::policy_eval::compile_in_txn(
+                write_txn,
+                ctx.tenant_id(),
+                table,
+                &schema,
+                crate::sql::policy_eval::PolicyCheckKind::ConflictUpdateUsing,
+            )?;
+            let policy_conflict_select = crate::sql::policy_eval::compile_in_txn(
+                write_txn,
+                ctx.tenant_id(),
+                table,
+                &schema,
+                crate::sql::policy_eval::PolicyCheckKind::ConflictSelectUsing,
+            )?;
             // 対象省略（SQL-49、Issue #1736）の衝突判定器。行の書き込み前に永続索引を最新にする。
             // 索引テーブルのハンドルは `enforce_row_constraints_in_txn` の前に drop する。
             let mut any_unique_probe: Option<crate::constraint::AnyUniqueProbe<'_>> =
@@ -3727,9 +4034,12 @@ fn upsert_typed_rows_impl(
                             // 既存行への利用者定義ポリシーの `USING`（RLS-13・Issue #2277）。テナント境界
                             // （所有 ∩ 可視。上の `Invisible` 分岐）の後、`DO UPDATE ... WHERE` の前に評価する
                             // （`WHERE` の評価結果・エラーが既存行の内容を漏らさないため。fail-closed）。
-                            for checks in [policy_conflict_update.as_ref(), policy_conflict_select.as_ref()]
-                                .into_iter()
-                                .flatten()
+                            for checks in [
+                                policy_conflict_update.as_ref(),
+                                policy_conflict_select.as_ref(),
+                            ]
+                            .into_iter()
+                            .flatten()
                             {
                                 checks.enforce(
                                     &schema,
@@ -3760,176 +4070,28 @@ fn upsert_typed_rows_impl(
                             // ない——最終的な行内容は適用順に依存しない一意な値へ
                             // 収束する。同一列への重複代入は `bind_upsert_assignments`
                             // が束縛時に `22000` で拒否済み）。
-                            let mut merged_values = crate::row_codec::decode_scalar_columns(
-                                &schema,
-                                &existing.metadata,
-                            )
-                            .map_err(|e| CatalogError::Invalid(e.to_string()))?;
+                            let (pre_image_values, merged_values, embedding_value) =
+                                apply_upsert_assignments(
+                                    &schema,
+                                    vector_idx,
+                                    assignments,
+                                    values,
+                                    &existing,
+                                    write_id,
+                                    false,
+                                )?;
                             // 書き換える前の全列値を ON UPDATE 連鎖の pre-image として
                             // 積む（Issue #1076）。UNIQUE 対象の衝突では実際に書き換える
                             // 既存行が VALUES 自身の `id`（`*id`）と異なり得るため、必ず
-                            // 衝突判定で確定した `write_id` をキーに記録する（`*id` で
-                            // 記録すると、連鎖側の `collect_action_targets` が入力 id で
-                            // 親行を読み直して新キーを取得できず、`ON UPDATE CASCADE` 等が
-                            // 発火せず参照元行が残留し `23503` で失敗する。codex/review・
-                            // cursor bugbot 指摘）。`id` 参照 FK は ON UPDATE で発火しない
-                            // （A7）ため、主キー・UNIQUE を宣言しないテーブルは複製コストを
-                            // 払わない（早期 return と同じ判定条件）。
+                            // 衝突判定で確定した `write_id` をキーに記録する。`id` 参照 FK は
+                            // ON UPDATE で発火しない（A7）ため、主キー・UNIQUE を宣言しない
+                            // テーブルは複製コストを払わない。
                             if schema.primary_key().is_some()
                                 || !schema.unique_constraints().is_empty()
                             {
                                 pre_images
-                                    .record(RowId::from_legacy_id(write_id), merged_values.clone());
+                                    .record(RowId::from_legacy_id(write_id), pre_image_values);
                             }
-                            let mut embedding_value: Vec<f32> = existing.embedding.clone();
-                            // 加算式（Issue #2425）の左辺は、全代入が更新前の行を見る（PG と同じ）よう
-                            // 書き換え前の値を別に保持する。
-                            let pre_image_values = merged_values.clone();
-
-                            for (col_idx, value) in assignments.iter() {
-                                // `src_idx`／`col_idx` は束縛時点のスキーマ（`bind_upsert_assignments`）
-                                // が `schema.columns` に対して検証済みの位置インデックスであり、
-                                // `expected_schema` 照合（`Some` の場合。呼び出し元
-                                // `sql::exec::execute_upsert` ドキュメント参照）によって
-                                // 本 write トランザクション内の `schema` と一致することが
-                                // 保証されている。したがって範囲外・型不一致はいずれも
-                                // 到達しないはずの内部不変条件違反であり、値を黙って
-                                // `Null` へ差し替えたり SET を無視したりせず fail-closed に
-                                // 拒否する（cursor bugbot 指摘・PR #990。黙って無視すると
-                                // `updated` カウント・テーブル世代だけが進み、実際には
-                                // 適用されなかった SET が適用されたかのような不整合が
-                                // 生じる）。
-                                let mut new_value = match value {
-                                    UpsertSetValue::Excluded(src_idx) => {
-                                        values.get(*src_idx).cloned().ok_or_else(|| {
-                                            CatalogError::Invalid(
-                                            "internal: EXCLUDED source column index out of range"
-                                                .to_string(),
-                                        )
-                                        })?
-                                    }
-                                    UpsertSetValue::Literal(v) => (*v).clone(),
-                                    UpsertSetValue::Expr(set) => {
-                                        // 所有・可視と確定した衝突行に対してだけ評価する（値に依存する
-                                        // エラーを他テナントの存在オラクルにしない）。全代入が更新前の
-                                        // 行を見る（PG と同じ）よう、書き換え前のスカラービューを使う。
-                                        let pre = crate::row_codec::scan_scalar_columns(
-                                            &schema,
-                                            &existing.metadata,
-                                        )
-                                        .map_err(|e| CatalogError::CorruptSchema(e.to_string()))?;
-                                        let scratch =
-                                            crate::sql::exec::array_payload_scratch(values)
-                                                .map_err(
-                                                    TenantWriteError::SetExpressionEvaluationFailed,
-                                                )?;
-                                        let excluded =
-                                            crate::sql::exec::candidate_scalar_view(values, &scratch);
-                                        let mut combined: Vec<Option<crate::row_codec::ScalarRef<'_>>> =
-                                            Vec::new();
-                                        combined
-                                            .try_reserve_exact(pre.len().saturating_add(excluded.len()))
-                                            .map_err(|_| {
-                                                TenantWriteError::Storage(StorageError::Codec(
-                                                    "failed to reserve upsert expression row view"
-                                                        .to_string(),
-                                                ))
-                                            })?;
-                                        combined.extend(pre);
-                                        combined.extend(excluded);
-                                        let v = crate::sql::set_expr::eval_set_expr_to_value(
-                                            set,
-                                            write_id,
-                                            &existing.embedding,
-                                            &combined,
-                                        )
-                                        .map_err(TenantWriteError::SetExpressionEvaluationFailed)?;
-                                        validate_set_assignments(
-                                            &schema,
-                                            &[(*col_idx, v.clone())],
-                                        )?;
-                                        v
-                                    }
-                                    UpsertSetValue::Add(operand) => {
-                                        let rhs = match operand {
-                                            UpsertAddOperandRef::Literal(v) => *v,
-                                            UpsertAddOperandRef::Excluded(src_idx) => {
-                                                values.get(*src_idx).ok_or_else(|| {
-                                                    CatalogError::Invalid(
-                                                        "internal: EXCLUDED source column index out of range"
-                                                            .to_string(),
-                                                    )
-                                                })?
-                                            }
-                                        };
-                                        let column =
-                                            schema.columns.get(*col_idx).ok_or_else(|| {
-                                                CatalogError::Invalid(
-                                                    "internal: SET target column index out of range"
-                                                        .to_string(),
-                                                )
-                                            })?;
-                                        let current =
-                                            pre_image_values.get(*col_idx).ok_or_else(|| {
-                                                CatalogError::Invalid(
-                                                    "internal: SET target column index out of range"
-                                                        .to_string(),
-                                                )
-                                            })?;
-                                        crate::sql::upsert_add::eval_upsert_add(
-                                            &column.ty,
-                                            column.nullable,
-                                            &column.name,
-                                            current,
-                                            rhs,
-                                        )
-                                        .map_err(|e| {
-                                            TenantWriteError::SetExpressionEvaluationFailed(e)
-                                        })?
-                                    }
-                                };
-                                // `EXCLUDED.<列>` 等、値が実行時にしか決まらない代入の
-                                // `VARCHAR(n)` 長さ検証（`22001`。TABLE-31・Issue #1564）。
-                                // encode・commit の前に返すため txn は abort し副作用は残らない。
-                                if let Some(column) = schema.columns.get(*col_idx) {
-                                    crate::row_codec::normalize_char_length_value(
-                                        column,
-                                        &mut new_value,
-                                    )
-                                    .map_err(|e| {
-                                        TenantWriteError::SetExpressionEvaluationFailed(e.into())
-                                    })?;
-                                }
-                                if Some(*col_idx) == vector_idx {
-                                    match new_value {
-                                        crate::row_codec::Value::Vector(v) => embedding_value = v,
-                                        // nullable な VECTOR 列への NULL は空 embedding（NOT NULL は
-                                        // `validate_set_assignments` が先に `23502` で拒否済み。
-                                        // Issue #2042・TABLE-26 (3)）。
-                                        crate::row_codec::Value::Null => {
-                                            embedding_value = Vec::new()
-                                        }
-                                        _ => {
-                                            return Err(TenantWriteError::Catalog(
-                                                CatalogError::Invalid(
-                                                    "VECTOR column SET value must be a vector"
-                                                        .to_string(),
-                                                ),
-                                            ))
-                                        }
-                                    }
-                                } else {
-                                    let slot =
-                                        merged_values.get_mut(*col_idx).ok_or_else(|| {
-                                            CatalogError::Invalid(
-                                                "internal: SET target column index out of range"
-                                                    .to_string(),
-                                            )
-                                        })?;
-                                    *slot = new_value;
-                                }
-                            }
-                            schema.validate_row_embedding_dim(embedding_value.len())?;
                             let metadata =
                                 crate::row_codec::encode_scalar_columns(&schema, &merged_values)
                                     .map_err(|e| CatalogError::Invalid(e.to_string()))?;
@@ -4044,7 +4206,9 @@ fn upsert_typed_rows_impl(
                     ctx.tenant_id(),
                     &written_rowids,
                     write_target.fk_check_mode(),
-                    crate::constraint::RowPolicyWrite::Upsert { updated_ids: &updated_rowids },
+                    crate::constraint::RowPolicyWrite::Upsert {
+                        updated_ids: &updated_rowids,
+                    },
                 )?;
                 // `DO UPDATE` で既存行を更新した場合、このテーブルを参照先とする
                 // `FOREIGN KEY`（TABLE-17・TASK-205、Issue #907）の参照先側を検査
@@ -8738,6 +8902,7 @@ pub(crate) mod statement_writes;
 mod trigger_dml;
 mod trigger_insert;
 pub(crate) mod trigger_row_loop;
+mod trigger_upsert;
 pub(crate) mod trigger_writes;
 
 #[cfg(test)]
@@ -11475,6 +11640,7 @@ mod tests {
             LedgerWrite::Disabled,
             None,
             &[],
+            None,
         );
         assert!(
             matches!(result, Err(TenantWriteError::Catalog(_))),
@@ -11546,6 +11712,7 @@ mod tests {
             LedgerWrite::Disabled,
             Some(&schema("docs")),
             &[],
+            None,
         )
         .expect("skipped upsert succeeds");
         assert_eq!((outcome.inserted, outcome.updated), (0, 0));
@@ -11585,6 +11752,7 @@ mod tests {
             LedgerWrite::Disabled,
             Some(&schema("docs")),
             &[],
+            None,
         )
         .expect_err("evaluation error aborts");
         assert!(matches!(
@@ -11610,6 +11778,7 @@ mod tests {
             LedgerWrite::Disabled,
             None,
             &[],
+            None,
         )
         .expect_err("condition requires the bound schema");
         assert!(matches!(err, TenantWriteError::Catalog(_)));
@@ -11934,6 +12103,7 @@ mod tests {
             ledger(),
             None,
             &[],
+            None,
             &mut project,
         );
         assert!(matches!(
@@ -11952,6 +12122,7 @@ mod tests {
             ledger(),
             None,
             &[],
+            None,
         );
         assert_eq!(
             retry.expect("台帳が巻き戻っていること"),
@@ -11979,6 +12150,7 @@ mod tests {
             ledger2(),
             None,
             &[],
+            None,
             &mut project,
         );
         assert!(matches!(
@@ -12067,6 +12239,7 @@ mod tests {
             ledger,
             None,
             &[],
+            None,
             &mut project,
         );
         *projected = count;

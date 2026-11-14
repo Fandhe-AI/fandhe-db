@@ -152,9 +152,12 @@
 > 経路ごとのガード・PostgreSQL との差分）。
 >
 > Issue #1725 の実装記録: [trigger-update-delete.md](trigger-update-delete.md)（UPDATE／DELETE の行トリガ・
-> `UPDATE OF`・分割実行と未結線経路のガード）。UPSERT の発火・`WHEN` の評価・D6（`27000`）は今回見送り、
-> UPSERT は INSERT・UPDATE のどちらかのトリガがあれば `0A000` のまま。ビュー経由・データ変更 CTE の副文は
-> 共有のフォーム関数を通るため INSERT と同様に発火する。
+> `UPDATE OF`・分割実行と未結線経路のガード）。`WHEN` の評価・D6（`27000`）は今回見送り。ビュー経由・
+> データ変更 CTE の副文は共有のフォーム関数を通るため INSERT と同様に発火する。UPSERT の発火は
+> Issue #3191 で結線した（下記「Issue #3191 の実装記録」）。
+>
+> Issue #3191 の実装記録: [trigger-upsert.md](trigger-upsert.md)（UPSERT の発火順序・DO NOTHING／DO UPDATE の
+> 分岐・PostgreSQL との差分。`RETURNING` 付き・NoSQL・COPY・分割実行は `0A000` のまま）。
 >
 > Issue #3186 の実装記録: [plpgsql-subset.md](plpgsql-subset.md)「Issue #3186 追記」（窓口の UPDATE と、D6 の
 > 安全弁としての表単位の `0A000`。`27000` の variant 追加は見送り）。
@@ -172,7 +175,7 @@
 | ---- | ---- |
 | `INSERT ... VALUES`／`INSERT ... SELECT` | 結線（#1723・#1724） |
 | 単一行・述語形の `UPDATE`／`DELETE`、`UPDATE ... FROM`／`DELETE ... USING`、サブクエリ形 | 結線（#1725） |
-| UPSERT | 結線（#1725） |
+| UPSERT（SQL 表層の `INSERT ... ON CONFLICT`。`INSERT ... SELECT ... ON CONFLICT` の 0 行も含む） | 結線（#3191）。`RETURNING` 付きは `0A000`（#3192） |
 | `TRUNCATE` | 文トリガだけ（#1726）。行トリガは定義時に `0A000`、DELETE トリガは発火しない（PG と同じ）。複数表・`CASCADE` では対象表ごとに発火 |
 | 分割実行 DML（SQL-32 ポインタ） | 行トリガ（BEFORE／AFTER ROW）はチャンクごとに発火し、文トリガ・子表のトリガ・NoSQL は `0A000`（Issue #3283。[trigger-partitioned-dml.md](trigger-partitioned-dml.md)）。文の途中で commit するため文トリガは原子性を保てない |
 | FK の参照アクションが、該当イベントのトリガを持つ子表に及ぶ形 | 文の開始時にカタログから静的に判定して `0A000`（PG は子表のトリガを発火させる。差分として記録） |
@@ -182,8 +185,8 @@
 | `ALTER TABLE` による行の書き換え・CTAS・マテリアライズドビューの更新 | 発火しない（PG と同じ。ガード対象外と明示） |
 
 - UPSERT の順序（PG と同じ）: INSERT の BEFORE ROW を呼んでから衝突を判定し、衝突すれば
-  UPDATE の BEFORE／AFTER ROW、衝突しなければ INSERT の AFTER ROW を呼ぶ。文トリガの
-  発火の細部は PG 17 の挙動と突き合わせて #1725 で確定する
+  UPDATE の BEFORE／AFTER ROW、衝突しなければ INSERT の AFTER ROW を呼ぶ（#3191 で結線。
+  文トリガは BEFORE INSERT → BEFORE UPDATE（`DO UPDATE` のみ）、AFTER UPDATE → AFTER INSERT の順）
 - 定義対象の制限: ビューの行トリガとマテリアライズドビューへの定義は `42809`（PG と同じ）、
   ビューの文トリガは `0A000`（PG との差分）、INSTEAD OF・REFERENCING・CONSTRAINT TRIGGER・
   DEFERRABLE は `0A000`、一時表へのトリガは初版では `0A000`、NoSQL 表層からは定義できない

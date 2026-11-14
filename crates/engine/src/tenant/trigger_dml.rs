@@ -119,7 +119,7 @@ fn read_row(
 
 /// BEFORE が返した最終 NEW を検査して `(embedding, metadata)` へ encode する（NOT NULL・VECTOR 次元・
 /// 行 codec）。
-fn encode_final_row(
+pub(super) fn encode_final_row(
     schema: &TableSchema,
     final_row: &[Value],
 ) -> Result<(Vec<f32>, Vec<u8>), TenantWriteError> {

@@ -188,6 +188,12 @@ const TABLE: &[(&str, usize, Class, &str)] = &[
         Class::NonRead,
         "トリガの INSERT 書き込み窓口（#2277 の WITH CHECK で扱う）",
     ),
+    (
+        "tenant/trigger_upsert.rs",
+        5,
+        Class::Applied,
+        "トリガ付き UPSERT の行ループ。衝突先は所有 ∩ 可視（is_visible）で判定し、利用者定義ポリシーの INSERT 側 WITH CHECK・既存行の USING を従来経路と同順で適用する（Issue #3191）",
+    ),
 ];
 
 const PATTERNS: [&str; 3] = [
