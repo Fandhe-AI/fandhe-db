@@ -786,11 +786,25 @@ impl Storage {
         if shared_public == SharedPublicTables::Reject && is_shared_public_table_key(table_key) {
             return Err(invalid(TRIGGER_ON_SHARED_PUBLIC_TABLE_MESSAGE));
         }
-        if !stored.update_of.is_empty() {
+        if !stored.update_of.is_empty() || stored.when_sql.is_some() {
             let schema = require_table_schema_write_any_identity(&write_txn, table_key)?;
             for col in &stored.update_of {
                 if !schema.columns.iter().any(|c| &c.name == col) {
                     return Err(CatalogError::ColumnNotFound(col.clone()));
+                }
+            }
+            // WHEN 条件が NEW／OLD 経由で参照する列も同じ write txn で再検査する（Issue #3190。D7）。
+            // 事前検査（`core::trigger_when`）と保存の間に並行する DROP／RENAME COLUMN が commit しても、
+            // 存在しない列を参照するトリガを保存しない。字句解析できない保存値は fail-closed で拒否する。
+            if let Some(w) = stored.when_sql.as_deref() {
+                let tokens = crate::sql::lexer::tokenize(w)
+                    .map_err(|_| invalid("trigger WHEN condition is not supported"))?;
+                for t in &tokens {
+                    if let crate::sql::lexer::Token::QualifiedIdent { name, .. } = t {
+                        if !schema.columns.iter().any(|c| &c.name == name) {
+                            return Err(CatalogError::ColumnNotFound(name.clone()));
+                        }
+                    }
                 }
             }
         }
