@@ -19101,7 +19101,7 @@ impl EngineCore {
             bits,
         );
         let udfs = crate::sql::udf_call::UdfRegistry::default();
-        self.run_partitioned_update(ctx, &udfs, &validated, &schema, &limits, recheck)
+        self.run_partitioned_update(ctx, &udfs, &validated, &schema, &limits, recheck, None)
     }
 
     /// NoSQL 表層 `delete` op の分割実行修飾（Issue #1130）。
@@ -19155,7 +19155,7 @@ impl EngineCore {
             bits,
         );
         let udfs = crate::sql::udf_call::UdfRegistry::default();
-        self.run_partitioned_delete(ctx, &udfs, &validated, &schema, &limits, recheck)
+        self.run_partitioned_delete(ctx, &udfs, &validated, &schema, &limits, recheck, None)
     }
 
     /// NoSQL 表層 `show_partitioned_dml` op（Issue #1130・RLS-9・RECOVER-11）。
@@ -20776,7 +20776,15 @@ impl EngineCore {
             ctx.tenant_id(),
             crate::sql::privilege_gate::write::partitioned_delete_bits(stmt),
         );
-        self.run_partitioned_delete(ctx, session.udfs(), stmt, &schema, &limits, recheck)
+        self.run_partitioned_delete(
+            ctx,
+            session.udfs(),
+            stmt,
+            &schema,
+            &limits,
+            recheck,
+            Some(&self.trigger_runtime.bind(self)),
+        )
     }
 
     /// 述語形 `UPDATE ... PARTITIONED [CHUNK n]`（Issue #1129・SQL-19）の実行 form。
@@ -20802,7 +20810,15 @@ impl EngineCore {
             ctx.tenant_id(),
             crate::sql::privilege_gate::write::partitioned_update_bits(stmt),
         );
-        self.run_partitioned_update(ctx, session.udfs(), stmt, &schema, &limits, recheck)
+        self.run_partitioned_update(
+            ctx,
+            session.udfs(),
+            stmt,
+            &schema,
+            &limits,
+            recheck,
+            Some(&self.trigger_runtime.bind(self)),
+        )
     }
 
     /// 分割実行 DELETE の束縛以降の共通本体（Issue #1130）。SQL 表層
@@ -20811,6 +20827,7 @@ impl EngineCore {
     /// 述語束縛・内容照合ハッシュ（ドメイン共有。RECOVER-11）・分割実行器・上限を
     /// 1 箇所に集約し、表層を跨いだ同一 `operation_id` の再送判定を構造的に一致させる。
     /// `limits` は呼び出し元が `apply_chunk_override` 済みの値を渡す。
+    #[allow(clippy::too_many_arguments)]
     fn run_partitioned_delete(
         &self,
         ctx: &PolicyContext,
@@ -20819,6 +20836,8 @@ impl EngineCore {
         schema: &crate::catalog::TableSchema,
         limits: &crate::sql::parser::PartitionedDmlLimits,
         privilege_recheck: Option<crate::sql::privilege_gate::write::RelationPrivilegeRecheck>,
+        // 行トリガの通過証（Issue #3283）。SQL 表層だけが `Some`、NoSQL 表層は `None`（該当トリガは `0A000`）。
+        triggers: Option<&crate::trigger::TriggerRuntime>,
     ) -> Result<crate::sql::exec::DeleteOutcome, crate::sql::allowlist::SqlSurfaceError> {
         // 多層防御: 外部で組み立てた文でも構成に関わらず operation_id 必須（Issue #1704）。
         crate::recovery::required_op_id::require_partitioned(stmt.operation_id())
@@ -20857,11 +20876,13 @@ impl EngineCore {
             self.dml_limits.max_affected_rows,
             fixed_time,
             privilege_recheck,
+            triggers,
         )
     }
 
     /// 分割実行 UPDATE の束縛以降の共通本体（Issue #1130）。
     /// [`Self::run_partitioned_delete`] と同じ位置付け（SQL・NoSQL 両表層の共有本体）。
+    #[allow(clippy::too_many_arguments)]
     fn run_partitioned_update(
         &self,
         ctx: &PolicyContext,
@@ -20870,6 +20891,8 @@ impl EngineCore {
         schema: &crate::catalog::TableSchema,
         limits: &crate::sql::parser::PartitionedDmlLimits,
         privilege_recheck: Option<crate::sql::privilege_gate::write::RelationPrivilegeRecheck>,
+        // 行トリガの通過証（Issue #3283。`run_partitioned_delete` と同じ）。
+        triggers: Option<&crate::trigger::TriggerRuntime>,
     ) -> Result<crate::sql::exec::UpdateOutcome, crate::sql::allowlist::SqlSurfaceError> {
         // 多層防御: 外部で組み立てた文でも構成に関わらず operation_id 必須（Issue #1704）。
         crate::recovery::required_op_id::require_partitioned(stmt.operation_id())
@@ -20890,7 +20913,14 @@ impl EngineCore {
             ctx,
             stmt.table_name(),
             stmt.operation_id(),
-            || crate::sql::parser::bind_predicate_update(stmt, schema, udfs),
+            || {
+                // 通常の UPDATE と同じく、BEFORE ROW が NEW を補正し得る表では NOT NULL 検査を
+                // 発火後へ延期する（束縛時の 23502 を先に返さない。Issue #3283）。
+                let set_columns: Vec<&str> =
+                    stmt.assignments().iter().map(|(n, _)| n.as_str()).collect();
+                let _defer = self.defer_not_null_scope_for_update(ctx, &schema.name, &set_columns);
+                crate::sql::parser::bind_predicate_update(stmt, schema, udfs)
+            },
             || {
                 crate::recovery::content_hash::for_update_where_partitioned(
                     stmt.table_name(),
@@ -20912,6 +20942,7 @@ impl EngineCore {
             self.dml_limits.max_affected_rows,
             fixed_time,
             privilege_recheck,
+            triggers,
         )
     }
 

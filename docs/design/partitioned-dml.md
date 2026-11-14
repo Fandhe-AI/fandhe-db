@@ -642,3 +642,5 @@ SQL-77 (1)・(3)・(4) のポインタ。設定値は `PartitionedDmlLimits::max
 - `docs/design/table-generation-rejection-granularity.md`（Issue #285）
 - `docs/design/simd-intrinsics-adoption.md`（Issue #508。判断記録欄の書式先例）
 - `docs/design/multi-row-dml-operation-id.md` 10 節（Accepted ADR の判断記録の書式先例）
+
+- 対象表の行トリガの扱い（Issue #3283）: [trigger-partitioned-dml.md](trigger-partitioned-dml.md)

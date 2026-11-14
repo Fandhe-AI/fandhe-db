@@ -217,6 +217,7 @@ fn drive_delete_with(
         None,
         None,
         Kind::Delete,
+        None,
         |c: &DmlCandidate<'_>| {
             let cols = crate::row_codec::scan_scalar_columns(&schema, c.metadata).expect("scan");
             Ok::<bool, Infallible>(

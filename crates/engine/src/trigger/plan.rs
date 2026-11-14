@@ -217,6 +217,19 @@ fn filter_update_of(
     Ok(out)
 }
 
+/// 分割実行 DML（Issue #3283）が、該当イベントの文トリガ（BEFORE／AFTER STATEMENT）を持つ表を固定文言の
+/// `0A000` で拒否するための検査。「文につき 1 回・全行の前後」は、チャンクごとに commit し再開もある
+/// 非原子実行では保証できない（毎チャンク発火か初回・最終のみかが再開・取消・上限停止で曖昧になる）ため、
+/// 黙って飛ばさず拒否する（実行モデルの D8）。行トリガだけの計画は通す。
+pub(crate) fn reject_statement_triggers(plan: &RowTriggerPlan<'_>) -> Result<(), TenantWriteError> {
+    if plan.before_stmt.is_empty() && plan.after_stmt.is_empty() {
+        return Ok(());
+    }
+    Err(unsupported(
+        "statement triggers are not supported for partitioned DML",
+    ))
+}
+
 /// 任意のイベント集合（`events_mask`）に該当するトリガ（行・文を問わない）が表にあれば `0A000`。
 /// 分割実行 DML・NoSQL・UPSERT など、トリガを発火できない経路が黙って飛ばさないための検査
 /// （カタログだけを見る。他テナントの定義は構造上引けない）。
