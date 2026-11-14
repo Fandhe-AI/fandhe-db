@@ -3,7 +3,8 @@
 //! 契約: autocommit（暗黙トランザクション）と明示トランザクションで `UPDATE n`／`DELETE n` が一致する。
 //! 多重一致は対象行ごとに 1 回だけ、走査順で最初の source 行を採る。他テナントの Private な行は
 //! source にも対象にもならない。`PARTITIONED` 併用は構文段で `42601`、`READ ONLY` Tx は `25006`。
-//! 網羅的な受け入れは #3205 の担当で、本ファイルは dispatch の最小固定に留める。
+//! 本ファイルは dispatch の最小固定に留め、網羅的な受け入れ（上限・再送冪等・明示 Tx・自己結合・
+//! fail-closed）は `sql53_dml_from_using_acceptance.rs`（Issue #3205）が担う。
 //! ポインタ: `docs/design/update-from-delete-using.md`。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
