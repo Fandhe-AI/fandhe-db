@@ -102,7 +102,7 @@ fn sql3209_window_aggregate_through_entry_point() {
 }
 
 #[test]
-fn sql3209_integer_overflow_is_still_fail_closed() {
+fn sql3209_wide_integer_sums_widen_without_wrapping() {
     let (core, _g) = open("sql3209-overflow");
     for id in 1..=2u64 {
         core.execute_insert_sql(
@@ -114,6 +114,11 @@ fn sql3209_integer_overflow_is_still_fail_closed() {
         .expect("seed");
     }
     assert!(run(&core, "alice", "SELECT SUM(i + 1) FROM t").is_ok());
+    // BIGINT 最大値 2 行の SUM は i64 を超えるが、エラーにも wrap にもならず Numeric へ拡幅される。
+    assert_eq!(
+        run(&core, "alice", "SELECT SUM(b) FROM t").expect("sum b"),
+        "[Numeric(Decimal { unscaled: 18446744073709551614, scale: 0 })]"
+    );
     assert!(run(&core, "alice", "SELECT SUM(i) FROM t")
         .expect("sum")
         .contains("4294967294"));
