@@ -41,6 +41,8 @@ pub(super) struct QueuedAfter {
     op: TriggerOp,
     old: Option<Vec<Value>>,
     new: Vec<Value>,
+    /// 連鎖の段の深さ（最外段が 0。BEFORE が発火時に見る入れ子の深さと同じ）。発火時に同じ深さへ揃える。
+    depth: usize,
 }
 
 /// 子表 `child_schema` の、この参照アクションが書き換えるイベントの ROW トリガを分類する。
@@ -183,6 +185,7 @@ pub(super) fn apply_with_triggers(
                     op: TriggerOp::Delete,
                     old: Some(old_values),
                     new: Vec::new(),
+                    depth: state.depth_guards.len().saturating_sub(1),
                 });
             }
             continue;
@@ -258,6 +261,7 @@ pub(super) fn apply_with_triggers(
                 op: TriggerOp::Update,
                 old: Some(old_values),
                 new: final_row,
+                depth: state.depth_guards.len().saturating_sub(1),
             });
         }
     }
@@ -290,6 +294,15 @@ pub(super) fn flush_after(state: &mut ActionState<'_, '_>) -> Result<(), TenantW
     };
     let queue = std::mem::take(&mut state.after_queue);
     for q in &queue {
+        // 連鎖の段の深さを再現する。`invoke` が自前で 1 加算するため、段の深さ分だけ先に積めば BEFORE と
+        // 同じく「段の深さ + 1」が上限を超えたとき `54001` になり、AFTER 本体の再入も同じ深さから始まる。
+        let mut _depth_guards = Vec::with_capacity(q.depth.min(64));
+        for _ in 0..q.depth {
+            _depth_guards.push(
+                crate::trigger::depth::enter(ctx.runtime.limits().max_trigger_depth())
+                    .map_err(TenantWriteError::TriggerFailed)?,
+            );
+        }
         crate::trigger::fire::fire_after_row(
             ctx.runtime,
             ctx.writes,

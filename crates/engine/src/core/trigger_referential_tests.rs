@@ -430,36 +430,69 @@ fn single_stage_child_trigger_succeeds_at_depth_limit_one() {
     }
 }
 
-// 深さ上限 1: 実際に 2 段になる連鎖は引き続き `54001`（副作用なし）。
+// 深さ上限 1: 実際に 2 段になる連鎖は引き続き `54001`（副作用なし）。BEFORE のみ・AFTER のみで
+// 挙動が一致する（AFTER は待ち行列に連鎖の深さを持たせ、発火時に同じ深さへ揃える）。
 #[test]
 fn two_stage_chain_still_rejected_at_depth_limit_one() {
+    for timing in [TriggerTiming::Before, TriggerTiming::After] {
+        let dir = tempdir();
+        let log: Log = Arc::default();
+        let (core, _calls) = core_with(dir.path(), recording(&log));
+        let core = core.with_trigger_limits(crate::trigger_limits::TriggerLimits::new(1));
+        ddl(
+            &core,
+            &["CREATE TABLE tr (k BIGINT PRIMARY KEY, p BIGINT REFERENCES tr(k) ON DELETE CASCADE)"],
+        );
+        for (k, p) in [("1", "NULL"), ("2", "1"), ("3", "2")] {
+            run(
+                &core,
+                &ctx("tenant-a"),
+                &format!("INSERT INTO tr (k, p) VALUES ({k}, {p})"),
+            )
+            .expect("seed");
+        }
+        add_trigger(&core.storage, "tenant-a", "tr", &row("t", timing, DEL));
+        assert_eq!(
+            code(&core, "tenant-a", "DELETE FROM tr WHERE k = 1"),
+            "54001"
+        );
+        assert_eq!(rows_of(&core, "tenant-a", "SELECT k FROM tr"), 3);
+    }
+}
+
+// 深さ上限 1: 子・孫の双方に AFTER DELETE があり、親にトリガが無い二段連鎖も `54001`（副作用なし）。
+#[test]
+fn after_only_two_level_chain_rejected_at_depth_limit_one() {
     let dir = tempdir();
     let log: Log = Arc::default();
     let (core, _calls) = core_with(dir.path(), recording(&log));
     let core = core.with_trigger_limits(crate::trigger_limits::TriggerLimits::new(1));
     ddl(
         &core,
-        &["CREATE TABLE tr (k BIGINT PRIMARY KEY, p BIGINT REFERENCES tr(k) ON DELETE CASCADE)"],
+        &[
+            "CREATE TABLE a1 (k BIGINT PRIMARY KEY)",
+            "CREATE TABLE b1 (k BIGINT PRIMARY KEY, pa BIGINT REFERENCES a1 ON DELETE CASCADE)",
+            "CREATE TABLE c1 (w TEXT, pb BIGINT REFERENCES b1 ON DELETE CASCADE)",
+        ],
     );
-    for (k, p) in [("1", "NULL"), ("2", "1"), ("3", "2")] {
-        run(
-            &core,
-            &ctx("tenant-a"),
-            &format!("INSERT INTO tr (k, p) VALUES ({k}, {p})"),
-        )
-        .expect("seed");
+    let a = ctx("tenant-a");
+    run(&core, &a, "INSERT INTO a1 (k) VALUES (1)").expect("a1");
+    run(&core, &a, "INSERT INTO b1 (k, pa) VALUES (10, 1)").expect("b1");
+    run(&core, &a, "INSERT INTO c1 (w, pb) VALUES ('x', 10)").expect("c1");
+    for t in ["b1", "c1"] {
+        add_trigger(
+            &core.storage,
+            "tenant-a",
+            t,
+            &row("t", TriggerTiming::After, DEL),
+        );
     }
-    add_trigger(
-        &core.storage,
-        "tenant-a",
-        "tr",
-        &row("t", TriggerTiming::Before, DEL),
-    );
     assert_eq!(
-        code(&core, "tenant-a", "DELETE FROM tr WHERE k = 1"),
+        code(&core, "tenant-a", "DELETE FROM a1 WHERE k = 1"),
         "54001"
     );
-    assert_eq!(rows_of(&core, "tenant-a", "SELECT k FROM tr"), 3);
+    assert_eq!(rows_of(&core, "tenant-a", "SELECT k FROM b1"), 1);
+    assert_eq!(rows_of(&core, "tenant-a", "SELECT w FROM c1"), 1);
 }
 
 // 子表の文トリガ・結線の無い経路（RETURNING 付き）は、固定文言の `0A000` のまま。
