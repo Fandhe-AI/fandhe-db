@@ -3434,7 +3434,7 @@ struct ActionState<'r, 'w> {
     /// 子表の AFTER ROW の待ち行列（連鎖・事後検証の後に適用順で発火する）。
     after_queue: Vec<referential_triggers::QueuedAfter>,
     /// 子表のトリガを発火した段ごとの入れ子の深さ（`trigger_limits`）の証。
-    depth_guards: Vec<crate::trigger::depth::DepthGuard>,
+    depth_guards: Vec<Option<crate::trigger::depth::DepthGuard>>,
 }
 
 /// 参照アクションが書き換える子行ごとにトリガを発火するための文脈（Issue #3284）。親の UPDATE／DELETE の
@@ -4233,11 +4233,18 @@ fn propagate_referential_actions(
         };
         let (child_change, child_pre_images) = match (child_plan, state.child) {
             (Some(plan), Some(ctx)) => {
-                // トリガを発火する段は、入れ子の深さ（`trigger_limits`）を 1 つ進める（段ごとに 1 つ）。
+                // トリガを発火する段ごとに 1 つ積む。最外段（入れ子が無い）は `TriggerRuntime::invoke` が
+                // 自前で深さを 1 加算するため計数しない（`None`。二重加算すると最小値 1 の契約に反する）。
+                // 2 段目以降は外側の段が発火中の入れ子なので、段ごとに深さを 1 つ進めて保持する。
                 if state.depth_guards.len() == guards_at_entry {
-                    let guard =
-                        crate::trigger::depth::enter(ctx.runtime.limits().max_trigger_depth())
-                            .map_err(TenantWriteError::TriggerFailed)?;
+                    let guard = if guards_at_entry == 0 {
+                        None
+                    } else {
+                        Some(
+                            crate::trigger::depth::enter(ctx.runtime.limits().max_trigger_depth())
+                                .map_err(TenantWriteError::TriggerFailed)?,
+                        )
+                    };
                     state.depth_guards.push(guard);
                 }
                 referential_triggers::apply_with_triggers(

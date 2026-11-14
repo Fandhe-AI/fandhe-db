@@ -414,6 +414,54 @@ fn chained_triggers_respect_trigger_depth_limit() {
     assert_eq!(rows_of(&core, "tenant-a", "SELECT k FROM tr"), 4);
 }
 
+// 深さ上限 1: 親にトリガが無く子表の BEFORE／AFTER が 1 段だけ発火する連鎖は、段の計数と
+// `TriggerRuntime::invoke` の計数が二重にならず成功する（最小値 1 の契約）。
+#[test]
+fn single_stage_child_trigger_succeeds_at_depth_limit_one() {
+    for timing in [TriggerTiming::Before, TriggerTiming::After] {
+        let dir = tempdir();
+        let log: Log = Arc::default();
+        let (core, _calls) = family(dir.path(), recording(&log));
+        let core = core.with_trigger_limits(crate::trigger_limits::TriggerLimits::new(1));
+        add_trigger(&core.storage, "tenant-a", "ch", &row("t", timing, DEL));
+        run(&core, &ctx("tenant-a"), "DELETE FROM par WHERE k = 2").expect("delete");
+        assert_eq!(take(&log).len(), 1);
+        assert_eq!(rows_of(&core, "tenant-a", "SELECT v FROM ch"), 2);
+    }
+}
+
+// 深さ上限 1: 実際に 2 段になる連鎖は引き続き `54001`（副作用なし）。
+#[test]
+fn two_stage_chain_still_rejected_at_depth_limit_one() {
+    let dir = tempdir();
+    let log: Log = Arc::default();
+    let (core, _calls) = core_with(dir.path(), recording(&log));
+    let core = core.with_trigger_limits(crate::trigger_limits::TriggerLimits::new(1));
+    ddl(
+        &core,
+        &["CREATE TABLE tr (k BIGINT PRIMARY KEY, p BIGINT REFERENCES tr(k) ON DELETE CASCADE)"],
+    );
+    for (k, p) in [("1", "NULL"), ("2", "1"), ("3", "2")] {
+        run(
+            &core,
+            &ctx("tenant-a"),
+            &format!("INSERT INTO tr (k, p) VALUES ({k}, {p})"),
+        )
+        .expect("seed");
+    }
+    add_trigger(
+        &core.storage,
+        "tenant-a",
+        "tr",
+        &row("t", TriggerTiming::Before, DEL),
+    );
+    assert_eq!(
+        code(&core, "tenant-a", "DELETE FROM tr WHERE k = 1"),
+        "54001"
+    );
+    assert_eq!(rows_of(&core, "tenant-a", "SELECT k FROM tr"), 3);
+}
+
 // 子表の文トリガ・結線の無い経路（RETURNING 付き）は、固定文言の `0A000` のまま。
 #[test]
 fn statement_trigger_on_child_and_unwired_paths_are_rejected() {
