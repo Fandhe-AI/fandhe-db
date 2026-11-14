@@ -86,6 +86,8 @@ for set_no in $(seq 1 "${SETS}"); do
   WRITE_LOG="${WORKDIR}/write.log"
 
   last_rows=0
+  # 連鎖削除まで成功した一時組の通番（write.log の確認済み進捗行から累積。カンマ区切り）。
+  completed_tseqs=""
 
   for i in $(seq 1 "${ITERATIONS}"); do
     echo "=== set ${set_no}/${SETS} iteration ${i}/${ITERATIONS} ==="
@@ -146,7 +148,14 @@ for set_no in $(seq 1 "${SETS}"); do
       exit 1
     fi
 
-    verify_output="$("${BIN}" verify "${DB_PATH}")"
+    # kill 前に完全に書き切られた全進捗行の idfk_tdone を累積する（切れた行は `$` 固定でマッチしない）。
+    # 後続の反復の verify でも、これらの組が親子とも存在しないことを確かめる。
+    new_tseqs="$(grep -o '^COMMITTED batch=[0-9]* rows=[0-9]* idfk_parent=[0-9]* idfk_child=[0-9]* idfk_tdone=[0-9]*$' "${WRITE_LOG}" | sed -n 's/.* idfk_tdone=\([0-9]*\)$/\1/p' | paste -sd, -)"
+    if [ -n "${new_tseqs}" ]; then
+      completed_tseqs="${completed_tseqs:+${completed_tseqs},}${new_tseqs}"
+    fi
+
+    verify_output="$("${BIN}" verify "${DB_PATH}" "${completed_tseqs}")"
     echo "${verify_output}"
 
     if [[ "${verify_output}" != RESULT\ ok=true* ]]; then
@@ -170,10 +179,10 @@ for set_no in $(seq 1 "${SETS}"); do
     # 完全な行が採用される（acked は実際より小さくなることはあっても大きくならない
     # ＝false-fail しない。`crash_test_cross_table.sh` と同方針）。
     # 行は `COMMITTED batch=<seq> rows=<total> idfk_parent=<n> idfk_child=<n>`（FK 親子表の確認済み件数を併記）。
-    acked_line="$(grep -o '^COMMITTED batch=[0-9]* rows=[0-9]* idfk_parent=[0-9]* idfk_child=[0-9]*$' "${WRITE_LOG}" | tail -1)"
+    acked_line="$(grep -o '^COMMITTED batch=[0-9]* rows=[0-9]* idfk_parent=[0-9]* idfk_child=[0-9]* idfk_tdone=[0-9]*$' "${WRITE_LOG}" | tail -1)"
     acked="$(echo "${acked_line}" | sed -n 's/.* rows=\([0-9]*\) .*/\1/p')"
     acked_idfk_parent="$(echo "${acked_line}" | sed -n 's/.* idfk_parent=\([0-9]*\) .*/\1/p')"
-    acked_idfk_child="$(echo "${acked_line}" | sed -n 's/.* idfk_child=\([0-9]*\)$/\1/p')"
+    acked_idfk_child="$(echo "${acked_line}" | sed -n 's/.* idfk_child=\([0-9]*\) .*/\1/p')"
     idfk_parent="$(echo "${verify_output}" | sed -n 's/.* idfk_parent=\([0-9]*\).*/\1/p')"
     idfk_child="$(echo "${verify_output}" | sed -n 's/.* idfk_child=\([0-9]*\).*/\1/p')"
     if ! [[ "${idfk_parent}" =~ ^[0-9]+$ && "${idfk_child}" =~ ^[0-9]+$ ]]; then

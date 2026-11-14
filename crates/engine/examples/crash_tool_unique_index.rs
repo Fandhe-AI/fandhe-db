@@ -145,17 +145,19 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let sub = args.next();
     let path = args.next();
+    // verify のみ: 確認済みの一時組の通番（カンマ区切り）。省略時は検査しない。
+    let completed_arg = args.next();
     let (sub, path) = match (sub, path) {
         (Some(sub), Some(path)) => (sub, path),
         _ => {
-            eprintln!("usage: crash_tool_unique_index <write|verify> <db_path>");
+            eprintln!("usage: crash_tool_unique_index <write|verify> <db_path> [completed_tseqs]");
             std::process::exit(2);
         }
     };
 
     let exit_code = match sub.as_str() {
         "write" => run_write(&path),
-        "verify" => run_verify(&path),
+        "verify" => run_verify(&path, completed_arg.as_deref()),
         other => {
             eprintln!("ERROR: unknown subcommand: {other}");
             2
@@ -486,7 +488,7 @@ fn write_idfk_batch(
     ctx: &PolicyContext,
     parent_next: &mut u64,
     child_next: &mut u64,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     let mut session = SessionState::default();
     if *parent_next == *child_next {
         let seq = *parent_next / BATCH;
@@ -558,7 +560,8 @@ fn write_idfk_batch(
         core.execute_sql_in_session(ctx, &mut session, &sql)
             .map_err(|e| format!("{what} failed at idfk tseq={tseq}: {e}"))?;
     }
-    Ok(())
+    // 連鎖削除まで成功した一時組の通番。進捗行へ併記し、復旧後に親子とも存在しないことを検証させる。
+    Ok(tseq)
 }
 
 fn run_write(path: &str) -> i32 {
@@ -672,7 +675,8 @@ fn write_inner(path: &str) -> Result<(), String> {
         }
 
         write_allocated_batch(&core, &ctx, &mut pk_next, &mut nopk_next)?;
-        write_idfk_batch(&core, &ctx, &mut idfk_parent_next, &mut idfk_child_next)?;
+        let idfk_tdone =
+            write_idfk_batch(&core, &ctx, &mut idfk_parent_next, &mut idfk_child_next)?;
 
         // 進捗行はスクリプト側が「書き込みが実際に進み始めた」ことを検知する同期点
         // なので、バッファリングで遅延しないよう毎回明示的に flush する
@@ -681,8 +685,8 @@ fn write_inner(path: &str) -> Result<(), String> {
         // 件数がこれを下回らないことを確かめ、確認済みの最終バッチ消失（親子の末尾が揃って消える場合を含む）を検出する。
         writeln!(
             handle,
-            "COMMITTED batch={} rows={} idfk_parent={} idfk_child={}",
-            progress.0, progress.1, idfk_parent_next, idfk_child_next
+            "COMMITTED batch={} rows={} idfk_parent={} idfk_child={} idfk_tdone={}",
+            progress.0, progress.1, idfk_parent_next, idfk_child_next, idfk_tdone
         )
         .map_err(|e| format!("stdout write failed: {e}"))?;
         handle
@@ -702,8 +706,15 @@ fn write_inner(path: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn run_verify(path: &str) -> i32 {
-    match verify_inner(path) {
+fn run_verify(path: &str, completed_arg: Option<&str>) -> i32 {
+    let completed = match parse_completed_tseqs(completed_arg) {
+        Ok(v) => v,
+        Err(reason) => {
+            println!("RESULT ok=false reason={reason}");
+            return 1;
+        }
+    };
+    match verify_inner(path, &completed) {
         Ok((rows, batches, idfk_parent, idfk_child)) => {
             println!(
                 "RESULT ok=true rows={rows} batches={batches} idfk_parent={idfk_parent} idfk_child={idfk_child}"
@@ -717,7 +728,21 @@ fn run_verify(path: &str) -> i32 {
     }
 }
 
-fn verify_inner(path: &str) -> Result<(u64, u64, u64, u64), String> {
+/// verify の第 3 引数（確認済みの一時組の通番のカンマ区切り）を解析する。不正値は拒否する（fail-closed）。
+fn parse_completed_tseqs(arg: Option<&str>) -> Result<Vec<u64>, String> {
+    let Some(arg) = arg else {
+        return Ok(Vec::new());
+    };
+    arg.split(',')
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            part.parse::<u64>()
+                .map_err(|_| format!("invalid completed transient seq: {part}"))
+        })
+        .collect()
+}
+
+fn verify_inner(path: &str, completed: &[u64]) -> Result<(u64, u64, u64, u64), String> {
     let core = open_core(path)?;
     let ctx = tenant_ctx()?;
     // 両表に同じオラクルを適用する。報告する行数・バッチ数は `docs` のもの。
@@ -731,7 +756,7 @@ fn verify_inner(path: &str) -> Result<(u64, u64, u64, u64), String> {
     }
     verify_pk_table(&core, &ctx)?;
     verify_nopk_table(&core, &ctx)?;
-    let (idfk_parent, idfk_child) = verify_idfk_tables(&core, &ctx)?;
+    let (idfk_parent, idfk_child) = verify_idfk_tables(&core, &ctx, completed)?;
     let counts = verify_migrated_id_contract(&core, &ctx)?;
     // 開き直しを繰り返しても件数が変わらない（移行は 2 回目以降は何もしない）。同一 DB を二重に開けない
     // ため、先に開いている `core` を手放してから確かめる。
@@ -862,7 +887,11 @@ fn verify_nopk_table(core: &EngineCore, ctx: &PolicyContext) -> Result<(), Strin
 /// 採番方式の親子表（親の `id` 列への FK。Issue #3182・TABLE-17・TABLE-23）の検証。
 /// 通常行の連続性・BATCH 整合、孤児が無いこと、一時の組の連鎖が全部残る／全部消えるのどちらかである
 /// こと、FK・PK の拒否プローブ（常に拒否される前提で成功時は副作用なし）、読み取り専用の一意索引検証。
-fn verify_idfk_tables(core: &EngineCore, ctx: &PolicyContext) -> Result<(u64, u64), String> {
+fn verify_idfk_tables(
+    core: &EngineCore,
+    ctx: &PolicyContext,
+    completed: &[u64],
+) -> Result<(u64, u64), String> {
     let parents_main = read_idfk_main_column(core, ctx, IDFK_PARENT, "id")
         .map_err(|e| format!("{IDFK_PARENT}: {e}"))?;
     let children_main = read_idfk_main_column(core, ctx, IDFK_CHILD, "cid")
@@ -904,7 +933,28 @@ fn verify_idfk_tables(core: &EngineCore, ctx: &PolicyContext) -> Result<(u64, u6
         }
     }
     // 一時の組は連鎖削除の途中で kill されても、子だけが残ることはない（上の孤児検査が固定する）。
-    // 一時の親が残っていても高々 1 組ずつ（再開ごとに通番が進む）なので、通常行との混在だけを確かめる。
+    // 連鎖削除まで成功し進捗行に出力済みの組（`completed`）は、復旧後に親子とも存在してはならない
+    // （確認済みの DELETE の消失を検出する。未完了だった反復の組はここに含まれず許容される）。
+    for tseq in completed {
+        let t = i64::try_from(*tseq)
+            .ok()
+            .and_then(|v| IDFK_TRANSIENT_BASE.checked_add(v))
+            .ok_or_else(|| "completed transient id overflow".to_string())?;
+        if parents_all.binary_search(&t).is_ok() {
+            return Err(format!(
+                "{IDFK_PARENT}: acknowledged transient parent id={t} (tseq={tseq}) reappeared after recovery; a committed cascade delete was lost"
+            ));
+        }
+        let child_present = pairs
+            .rows
+            .iter()
+            .any(|row| matches!(row.cells.as_slice(), [Cell::SignedInteger(c), _] if *c == t));
+        if child_present {
+            return Err(format!(
+                "{IDFK_CHILD}: acknowledged transient child cid={t} (tseq={tseq}) reappeared after recovery; a committed cascade delete was lost"
+            ));
+        }
+    }
     // 読み取り専用の一意索引検証（PK の永続索引と FK 用の `k:id` 索引がクラッシュ後も生存している）。
     core.verify_unique_index_read_only(ctx, IDFK_PARENT)
         .map_err(|e| format!("{IDFK_PARENT}: read-only unique index verification failed: {e}"))?;
