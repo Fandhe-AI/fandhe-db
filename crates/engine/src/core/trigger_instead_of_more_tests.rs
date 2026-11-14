@@ -372,3 +372,37 @@ fn where_subquery_reaches_trigger_on_updatable_view() {
         vec![1, 2]
     );
 }
+
+// 2 つの公開列が同じ基表の列へ写るビューでも、INSTEAD OF トリガがあれば INSERT・UPDATE は構文解析段で
+// `42701` にならずトリガへ届く（各列は独立した NEW の列）。トリガが無ければ自動書き換えの `42701` のまま。
+#[test]
+fn duplicate_mapped_columns_reach_trigger() {
+    let (core, _g) = core_with("instof-dup");
+    setup(&core);
+    ok(
+        &core,
+        "t1",
+        "CREATE VIEW s.dv (a, b) AS SELECT n, n FROM s.tt",
+    );
+    let ins = "INSERT INTO s.dv (a, b) VALUES (1, 2)";
+    let upd = "UPDATE s.dv SET a = 1, b = 2";
+    assert_eq!(code(&core, "t1", ins), "42701");
+    assert_eq!(code(&core, "t1", upd), "42701");
+    create_fn(
+        &core,
+        "t1",
+        "f_dup",
+        "BEGIN INSERT INTO audit (tag, n) VALUES ('dup', NEW.a + NEW.b); RETURN NEW; END",
+    );
+    for ev in ["INSERT", "UPDATE"] {
+        ok(
+            &core,
+            "t1",
+            &format!(
+                "CREATE TRIGGER g_{ev} INSTEAD OF {ev} ON s.dv FOR EACH ROW EXECUTE FUNCTION f_dup()"
+            ),
+        );
+    }
+    assert_eq!(count(&core, "t1", ins), 1);
+    assert_eq!(audit(&core, "dup"), vec![3]);
+}

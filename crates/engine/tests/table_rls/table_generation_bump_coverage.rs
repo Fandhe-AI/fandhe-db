@@ -712,7 +712,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // ビューは行ストア・世代を持たないため bump しない。トリガ本体が書いた表（1 つ以上書いたときだけ commit
     // する）の世代は、本体の書き込み経路（`TriggerWriteHandle` 経由の既存の INSERT／UPDATE／DELETE）が同じ
     // txn 内で bump 済み。
-    ("core/view_instead_of.rs", 185),
+    ("core/view_instead_of.rs", 205),
 ];
 
 /// `recovery/commit_boundary.rs` の `pub(crate) fn`/`pub fn` シグネチャを

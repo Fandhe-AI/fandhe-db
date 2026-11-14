@@ -7626,6 +7626,10 @@ impl EngineCore {
                     | Err(crate::sql::allowlist::SqlSurfaceError::ViewNotAutoUpdatable {
                         ..
                     }) => {}
+                    // 基表への写像先の重複（`42701`）は自動書き換え固有の検証。INSTEAD OF トリガ経路では各列が
+                    // 独立した `NEW` の列なので不要。実行段（トリガ有無の確定後）へ回す（トリガが無ければ実行段の
+                    // 書き換えが同じ拒否を返す）。
+                    Err(crate::sql::allowlist::SqlSurfaceError::DuplicateColumn { .. }) => {}
                     Err(e) => return Err(e),
                 }
                 return Ok(ParsedSql::ViewInsert(view_stmt));
@@ -7742,6 +7746,8 @@ impl EngineCore {
                     // `WHERE` 内サブクエリの拒否は自動書き換え固有の検証。INSTEAD OF トリガがあれば不要なので
                     // 実行段（トリガ有無の確定後）へ回す。
                     Err(e) if crate::sql::view_dml::is_where_subquery_rejection(&e) => {}
+                    // 写像先の重複（`42701`）も同様に実行段へ回す（INSERT の腕と同じ理由）。
+                    Err(crate::sql::allowlist::SqlSurfaceError::DuplicateColumn { .. }) => {}
                     Err(e) => return Err(e),
                 }
                 return Ok(ParsedSql::ViewDelete(view_stmt));
@@ -7817,6 +7823,8 @@ impl EngineCore {
                     // `WHERE` 内サブクエリの拒否は自動書き換え固有の検証。INSTEAD OF トリガがあれば不要なので
                     // 実行段（トリガ有無の確定後）へ回す。
                     Err(e) if crate::sql::view_dml::is_where_subquery_rejection(&e) => {}
+                    // 写像先の重複（`42701`）も同様に実行段へ回す（INSERT の腕と同じ理由）。
+                    Err(crate::sql::allowlist::SqlSurfaceError::DuplicateColumn { .. }) => {}
                     Err(e) => return Err(e),
                 }
                 return Ok(ParsedSql::ViewUpdate(view_stmt));

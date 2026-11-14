@@ -468,7 +468,14 @@ impl EngineCore {
             tokens.push(Token::Keyword(Keyword::Where));
             tokens.extend(where_tail.iter().cloned());
         }
-        let stmt = match self.parse_tokens(tokens)? {
+        // 通常の SELECT と同じ入口（SCHEMA 解決器・`search_path` の書き換え・現在ロールの SELECT 権限ゲート）で
+        // 解析する。`parse_tokens`（ゲートなし・解決器なし）だと `WHERE` 内サブクエリの参照先が権限ゲートを
+        // 通らず、解決器が要る名前は `3F000` になる。権限不足は固定文言の `42501`。
+        let parsed = {
+            let resolver = self.schema_resolver_for(ctx, session);
+            self.parse_tokens_gated(tokens, session, ctx.tenant_id(), Some(&resolver), None)?
+        };
+        let stmt = match parsed {
             ParsedSql::Statement(stmt) => stmt,
             _ => return Err(unsupported(FORM_UNSUPPORTED)),
         };
