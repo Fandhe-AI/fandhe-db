@@ -433,7 +433,8 @@ fn statement_trigger_with_when_is_0a000() {
     assert_eq!(count(&core, &a, "trg"), 0);
 }
 
-// 発火に未対応の経路（RETURNING・UPSERT・分割実行）は文トリガでも `0A000`。呼び出しは 0 回。
+// 発火に未対応の経路（UPSERT・分割実行）は文トリガでも `0A000`。呼び出しは 0 回。RETURNING 付きの文は
+// 発火する（Issue #3192。`trigger_returning_tests.rs`）。
 #[test]
 fn unwired_paths_stay_guarded_for_statement_triggers() {
     let dir = tempdir();
@@ -450,8 +451,6 @@ fn unwired_paths_stay_guarded_for_statement_triggers() {
     );
     let before = calls.load(Ordering::SeqCst);
     for sql in [
-        "UPDATE trg SET n = 1 WHERE id = 1 RETURNING id USING OPERATION_ID 'g1'",
-        "DELETE FROM trg WHERE n > 0 RETURNING id USING OPERATION_ID 'g2'",
         "INSERT INTO trg (id, embedding, a, n) VALUES (1, '[1.0,0.0]', 'x', 1) \
          ON CONFLICT (id) DO UPDATE SET n = 2 USING OPERATION_ID 'g3'",
         "UPDATE trg SET n = 1 WHERE n > 0 USING OPERATION_ID 'g4' PARTITIONED CHUNK 1",

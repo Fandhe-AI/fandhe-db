@@ -283,3 +283,96 @@ fn unsupported_body_is_0a000_without_residue() {
     assert!(ints(&core, "t1", "SELECT n FROM s.tt").is_empty());
     assert!(ints(&core, "t1", "SELECT n FROM audit").is_empty());
 }
+/// `RETURNING` の 1 列目を整数として集める（返却順を保つ）。
+fn returned_ints(core: &EngineCore, tenant: &str, sql: &str) -> Vec<i64> {
+    match ok(core, tenant, sql) {
+        SqlOutcome::Returning(o) => o
+            .result
+            .rows
+            .into_iter()
+            .filter_map(|r| r.cells.into_iter().next())
+            .map(|c| match c {
+                Cell::SignedInteger(v) => v,
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect(),
+        other => panic!("expected returning, got {other:?}"),
+    }
+}
+
+// RETURNING 付きの INSERT／UPDATE／DELETE でも発火し、返る行は BEFORE ROW の適用後（DELETE は削除前）の値。
+// 末尾 `;` 付きでも同じ。AFTER ROW の別表への書き込みは返却へ影響しない（Issue #3192）。
+#[test]
+fn returning_fires_triggers_and_returns_final_rows() {
+    let (_g, core) = open("t45fire-returning");
+    tables(&core, "t1");
+    func(&core, "t1", "bump", BUMP);
+    func(
+        &core,
+        "t1",
+        "log_after",
+        "BEGIN INSERT INTO audit (n) VALUES (NEW.n); RETURN NULL; END",
+    );
+    trigger(
+        &core,
+        "t1",
+        "tb",
+        "BEFORE INSERT OR UPDATE FOR EACH ROW",
+        "bump",
+    );
+    trigger(&core, "t1", "ta", "AFTER INSERT FOR EACH ROW", "log_after");
+    assert_eq!(
+        returned_ints(
+            &core,
+            "t1",
+            "INSERT INTO s.tt (n) VALUES (1), (2) RETURNING n"
+        ),
+        vec![101, 102]
+    );
+    assert_eq!(
+        returned_ints(&core, "t1", "INSERT INTO s.tt (n) VALUES (3) RETURNING n;"),
+        vec![103]
+    );
+    assert_eq!(
+        ints(&core, "t1", "SELECT n FROM audit"),
+        vec![101, 102, 103]
+    );
+    assert_eq!(
+        returned_ints(
+            &core,
+            "t1",
+            "UPDATE s.tt SET n = 5 WHERE n = 101 RETURNING n"
+        ),
+        vec![105]
+    );
+    assert_eq!(ints(&core, "t1", "SELECT n FROM s.tt"), vec![102, 103, 105]);
+    assert_eq!(
+        returned_ints(&core, "t1", "DELETE FROM s.tt WHERE n > 104 RETURNING n"),
+        vec![105]
+    );
+    assert_eq!(ints(&core, "t1", "SELECT n FROM s.tt"), vec![102, 103]);
+}
+
+// RETURNING 付きでも他テナントのトリガは発火せず、未対応の形（UPSERT）は `0A000` のまま行を残さない。
+#[test]
+fn returning_is_tenant_scoped_and_upsert_stays_guarded() {
+    let (_g, core) = open("t45fire-returning-guard");
+    tables(&core, "t1");
+    ok(&core, "t2", "CREATE SCHEMA s");
+    ok(&core, "t2", "CREATE TABLE s.tt (n INTEGER)");
+    func(&core, "t1", "bump", BUMP);
+    trigger(&core, "t1", "tb", "BEFORE INSERT FOR EACH ROW", "bump");
+    assert_eq!(
+        returned_ints(&core, "t2", "INSERT INTO s.tt (n) VALUES (1) RETURNING n"),
+        vec![1]
+    );
+    assert_eq!(
+        code(
+            &core,
+            "t1",
+            "INSERT INTO s.tt (n) VALUES (1) ON CONFLICT DO NOTHING RETURNING n"
+        ),
+        "0A000"
+    );
+    assert!(ints(&core, "t1", "SELECT n FROM s.tt").is_empty());
+}

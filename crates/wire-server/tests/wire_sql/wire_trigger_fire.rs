@@ -310,3 +310,121 @@ fn wire_replay_with_operation_id_is_rejected_without_refiring() {
     );
     assert!(select_col(&mut b, "SELECT lv FROM audit").is_empty());
 }
+/// `RETURNING` 付きの文を送り、1 列目の全行とコマンドタグを返す（RowDescription・DataRow・CommandComplete）。
+fn returning_col(s: &mut TcpStream, sql: &str) -> (Vec<String>, String) {
+    send_simple_query(s, sql);
+    let _ = read_row_description(s);
+    let mut out = Vec::new();
+    let tag = loop {
+        let (kind, body) = read_message(s);
+        match kind {
+            b'D' => {
+                let len = body
+                    .get(2..6)
+                    .and_then(|b| <[u8; 4]>::try_from(b).ok())
+                    .map(i32::from_be_bytes)
+                    .expect("column length");
+                let n = usize::try_from(len).expect("non-null column");
+                let v = body.get(6..6 + n).expect("column value");
+                out.push(String::from_utf8_lossy(v).to_string());
+            }
+            b'C' => {
+                let end = body.iter().position(|b| *b == 0).unwrap_or(body.len());
+                break String::from_utf8_lossy(body.get(..end).unwrap_or(&[])).to_string();
+            }
+            other => panic!("unexpected message {other}"),
+        }
+    };
+    read_ready_for_query(s);
+    (out, tag)
+}
+
+/// RETURNING 付きの INSERT／UPDATE／DELETE が、psql と同じ末尾 `;` 付きの単独送信でも発火し、DataRow が
+/// トリガ適用後（DELETE は削除前）の値になる（Issue #3192）。
+#[test]
+fn wire_returning_fires_triggers_with_trailing_semicolon() {
+    let (addr, _g) = serve();
+    let mut s = connect(addr, "alice", "pw-alice");
+    setup(&mut s);
+    exec(
+        &mut s,
+        "CREATE TRIGGER tb BEFORE INSERT OR UPDATE ON s.tt FOR EACH ROW EXECUTE FUNCTION bump()",
+    );
+    exec(
+        &mut s,
+        "CREATE TRIGGER ts AFTER INSERT ON s.tt FOR EACH STATEMENT EXECUTE FUNCTION stmt_audit()",
+    );
+    assert_eq!(
+        returning_col(&mut s, "INSERT INTO s.tt (n) VALUES (1) RETURNING n;"),
+        (vec!["101".to_string()], "INSERT 0 1".to_string())
+    );
+    assert_eq!(
+        returning_col(&mut s, "UPDATE s.tt SET n = 5 WHERE n = 101 RETURNING n;"),
+        (vec!["105".to_string()], "UPDATE 1".to_string())
+    );
+    assert_eq!(
+        returning_col(&mut s, "DELETE FROM s.tt WHERE n = 105 RETURNING n;"),
+        (vec!["105".to_string()], "DELETE 1".to_string())
+    );
+    assert_eq!(
+        select_col(&mut s, "SELECT lv FROM audit"),
+        vec!["STATEMENT"]
+    );
+}
+
+/// 拡張クエリ（Parse/Bind/Execute/Sync）の INSERT ... RETURNING でも、トリガ適用後の値が DataRow で返る。
+#[test]
+fn wire_extended_query_returning_fires_trigger() {
+    let (addr, _g) = serve();
+    let mut s = connect(addr, "alice", "pw-alice");
+    setup(&mut s);
+    exec(
+        &mut s,
+        "CREATE TRIGGER tb BEFORE INSERT ON s.tt FOR EACH ROW EXECUTE FUNCTION bump()",
+    );
+    send_length_prefixed_message(
+        &mut s,
+        b'P',
+        &parse_body("s1", "INSERT INTO s.tt (n) VALUES (5) RETURNING n", 0),
+    );
+    assert_eq!(read_message(&mut s).0, b'1');
+    send_length_prefixed_message(&mut s, b'B', &bind_body("p1", "s1"));
+    assert_eq!(read_message(&mut s).0, b'2');
+    send_length_prefixed_message(&mut s, b'E', &execute_body("p1", 0));
+    let (kind, body) = read_message(&mut s);
+    assert_eq!(kind, b'D');
+    assert!(
+        body.windows(3).any(|w| w == b"105"),
+        "DataRow carries the trigger-applied value"
+    );
+    assert_eq!(read_message(&mut s).0, b'C');
+    send_length_prefixed_message(&mut s, b'S', &[]);
+    assert_eq!(read_message(&mut s).0, b'Z');
+    assert_eq!(select_col(&mut s, "SELECT n FROM s.tt"), vec!["105"]);
+}
+
+/// 別テナント（bob）の RETURNING 付き INSERT では alice のトリガが発火せず、未対応の形（ON CONFLICT）は
+/// `0A000` の ErrorResponse と ReadyForQuery で返り、接続は生きたまま行も残らない。
+#[test]
+fn wire_returning_is_tenant_scoped_and_unsupported_form_keeps_connection() {
+    let (addr, _g) = serve();
+    let mut a = connect(addr, "alice", "pw-alice");
+    setup(&mut a);
+    exec(
+        &mut a,
+        "CREATE TRIGGER tb BEFORE INSERT ON s.tt FOR EACH ROW EXECUTE FUNCTION bump()",
+    );
+    let mut b = connect(addr, "bob", "pw-bob");
+    create_tt(&mut b);
+    assert_eq!(
+        returning_col(&mut b, "INSERT INTO s.tt (n) VALUES (1) RETURNING n;"),
+        (vec!["1".to_string()], "INSERT 0 1".to_string())
+    );
+    send_simple_query(
+        &mut a,
+        "INSERT INTO s.tt (n) VALUES (1) ON CONFLICT DO NOTHING RETURNING n;",
+    );
+    expect_error_response_with_sqlstate(&mut a, "0A000");
+    read_ready_for_query(&mut a);
+    assert!(select_col(&mut a, "SELECT n FROM s.tt").is_empty());
+}

@@ -40,7 +40,7 @@ Issue #1726（親 #1720）の実装記録。上位の決定は [trigger-executio
 | UPDATE／DELETE の述語形 | 発火。BEFORE STATEMENT が書いた行は対象に入り、AFTER STATEMENT が書いた行は入らない（D5） |
 | 結合形 UPDATE の内部実行器 | UPDATE 文トリガがあれば `0A000`（S10: SET 列が列挙の後でしか確定せず、BEFORE STATEMENT を前に置けない） |
 | TRUNCATE（Autocommit・明示 Tx） | 発火（下記） |
-| 公開の `sql::exec::execute_truncate`・RETURNING 付き・UPSERT・分割実行・NoSQL・生の行 API・参照アクションが及ぶ子表 | 文トリガ（TRUNCATE を含む）があれば `0A000`（通過証を渡さない） |
+| 公開の `sql::exec::execute_truncate`・UPSERT・分割実行・NoSQL・生の行 API・参照アクションが及ぶ子表（SQL 表層の RETURNING 付きは Issue #3192 で発火する） | 文トリガ（TRUNCATE を含む）があれば `0A000`（通過証を渡さない） |
 | 一時表 | トリガを定義できない（定義の段で `0A000`） |
 
 ## TRUNCATE の順序
@@ -80,7 +80,7 @@ PostgreSQL と同じく、全表の BEFORE → 削除 → 全表の AFTER の順
 
 ## 対象外・引き継ぎ
 
-- UPSERT・RETURNING 付き・NoSQL・COPY・分割実行・参照アクションの子表での文トリガの発火（`0A000` のまま）
+- UPSERT・NoSQL・COPY・分割実行・参照アクションの子表での文トリガの発火（`0A000` のまま）
 - 結合形 UPDATE の文トリガ（SQL の dispatch の結線と一緒に行う）
 - `RESTART IDENTITY` と TRUNCATE トリガの組み合わせ
 - 入れ子の深さの上限（#1727）、台帳と crash-test の整合（#1728）、自己変更の衝突 `27000` と窓口の拡張（#2226）、

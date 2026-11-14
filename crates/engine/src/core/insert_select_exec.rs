@@ -360,6 +360,7 @@ impl EngineCore {
                 self.ledger_mode,
                 &projection,
                 &schema,
+                Some(&self.trigger_runtime.bind(self)),
             )
             .map(SqlOutcome::Returning),
         }

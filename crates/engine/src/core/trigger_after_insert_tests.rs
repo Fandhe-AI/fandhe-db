@@ -492,21 +492,14 @@ fn when_is_0a000() {
     assert_eq!(count(&core2, &a, "trg"), 0);
 }
 
-// 発火に未対応の経路（RETURNING・UPSERT）は AFTER ROW のある表でも `0A000`。台帳は消費されない。
+// 発火に未対応の経路（UPSERT）は AFTER ROW のある表でも `0A000`。台帳は消費されない。RETURNING 付きの INSERT は
+// 発火する（Issue #3192。`trigger_returning_tests.rs`）。
 #[test]
 fn unwired_paths_stay_guarded_for_after_triggers() {
     let dir = tempdir();
     let (core, calls) = core_with(dir.path(), audit_after());
     let a = ctx("tenant-a");
     add_trigger(&core.storage, "tenant-a", "trg", &after_row("audit_t"));
-    let err = run(
-        &core,
-        &a,
-        "INSERT INTO trg (id, embedding, a, n) VALUES (1, '[1.0,0.0]', 'x', 1) \
-         RETURNING id USING OPERATION_ID 'op-g'",
-    )
-    .unwrap_err();
-    assert_eq!(err.wire_code(), "0A000");
     let err = run(
         &core,
         &a,
