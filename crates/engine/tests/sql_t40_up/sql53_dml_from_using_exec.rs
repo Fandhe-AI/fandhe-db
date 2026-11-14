@@ -418,9 +418,32 @@ fn returning_never_exposes_other_tenant_private_rows() {
     assert!(xs(&core, &bob).contains('5'), "bob's row must remain");
 }
 
-/// 未対応の形は fail-closed（副作用ゼロ）: 別名・関数呼び出し・項目なし・曖昧な列・`USING OPERATION_ID` 併用。
-// intentional: docs/design/sql-returning.md
-// tracked: #3203
+/// 併用（`RETURNING ... USING OPERATION_ID`）は台帳結線済み（#3203）: 返却行と確定記録が同時に得られ、
+/// 同一内容の再送は 23505、別文への再利用は 22023 で副作用なく拒否される。
+#[test]
+fn returning_with_operation_id_commits_ledger_and_rejects_resend() {
+    let (core, _g) = new_core("sql53-ret-opid");
+    let alice = ctx("alice");
+    seed(&core, &alice);
+    let sql =
+        "UPDATE t SET x = s.v FROM s WHERE t.k = s.k RETURNING t.id, s.v USING OPERATION_ID 'r-ok'";
+    let r = returning(&core, &alice, sql).expect("first");
+    assert_eq!(r.rows_affected, 2);
+    assert_eq!(r.result.rows.len(), 2);
+    let after = xs(&core, &alice);
+    let err = run(&core, &alice, sql).expect_err("resend");
+    assert_eq!(err.wire_code(), "23505");
+    let err = run(
+        &core,
+        &alice,
+        "DELETE FROM t USING s WHERE t.k = s.k RETURNING s.v USING OPERATION_ID 'r-ok'",
+    )
+    .expect_err("reuse");
+    assert_eq!(err.wire_code(), "22023");
+    assert_eq!(after, xs(&core, &alice));
+}
+
+/// 未対応の形は fail-closed（副作用ゼロ）: 別名・関数呼び出し・項目なし・曖昧な列・句順の誤り。
 #[test]
 fn unsupported_returning_forms_fail_closed_without_side_effects() {
     let (core, _g) = new_core("sql53-ret-reject");
@@ -446,6 +469,7 @@ fn unsupported_returning_forms_fail_closed_without_side_effects() {
             "UPDATE t SET x = 1 FROM s WHERE t.k = s.k RETURNING s.nope",
             "42703",
         ),
+        // 句順が逆（`USING OPERATION_ID` の後ろの `RETURNING`）は余剰トークンで 42601。
         (
             "UPDATE t SET x = 1 FROM s WHERE t.k = s.k USING OPERATION_ID 'r2' RETURNING s.v",
             "42601",

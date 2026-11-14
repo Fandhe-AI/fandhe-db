@@ -323,7 +323,8 @@ MAX_SCAN_RESULT_BYTES`・`sql::exec::MAX_CANDIDATE_SCALAR_BYTES` と同じ
 - **値の意味論**: UPDATE は更新後の対象値と一致した source 行、DELETE は削除前の対象値。source の列型は SET と違い制限しない（セルの複製のため）。
 - **応答**: `SqlOutcome::Returning`。`rows_affected` は書き込み層の実変更行数で、RLS 再判定で返却行数が減っても独立。Describe は同じ列を返す。
 - **PG 17.11 との照合**: 非修飾の両表共通列は `42702`、`<公開名>.*` は該当表の全列、`AS` 別名は本リポでは `42601`（受理範囲を広げない）。
-- **まだ拒否する形**: `USING OPERATION_ID` との併用は台帳結線（#3203）まで `0A000`。トリガのある対象表は単一表の `RETURNING` と同じ契約で `0A000`。
+- **併用**: `RETURNING ... USING OPERATION_ID` は台帳結線済み（#3203）で受理する。
+- **まだ拒否する形**: トリガのある対象表は単一表の `RETURNING` と同じ契約で `0A000`。
   FROM／USING が 2 表以上は変換器の `0A000`、式・関数・別名は `42601`（Phase 3）。FROM 側表の `SELECT` 権限が無いロールは `42501`（結合テストで固定）。
 
 ## 対象外・申し送り
