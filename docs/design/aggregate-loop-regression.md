@@ -306,3 +306,13 @@ bisect 本体は `git rev-list --bisect <bad> ^<good>` で中点を選び、`run
 - 固定した検査: `sql3213_count_star_visible_len.rs`（初回と命中の一致・`COUNT(id)`／`FILTER`／`DISTINCT` とのオラクル・複数 `COUNT(*)`・NULL・空集合・テナント境界・書き込み後の無効化・対象外の形・命中時の中断）。既存の `sql3208_*`・`sql_visible_cache`・`visible_cache_oracle` は無変更で通る
 - A/B（同一ホストの壁時計）: 未検証。本変更の作成環境では実施していない。受け入れ条件のうち性能の回復は充足を主張しない
 - スコープ外: `observe_value` のインライン化の復元（#3209）、agg_multi の残差（#3210）
+
+## SUM／AVG／MIN／MAX(id) の畳み込み（Issue #3214）
+
+- 原因: 可視 id キャッシュ命中時の Fast 経路は、`COUNT(*)` 以外の id 集計では可視 id を 1 件ずつ回し、行 × 項目ごとに `observe_light` を呼んでいた（#3213 は純粋な `COUNT(*)` だけを O(1) にした）
+- 変更: 同じ分岐に、`is_visible_id_fold` を満たす形の畳み込み分岐を足した。可視 id スライスを `ROW_CHECK_INTERVAL` 件のチャンクで 1 パスに畳み込み（件数・総和 `u128`・最小・最大。必要な統計だけ計算）、結果を `Accumulator::absorb_id_stats` で項目順に各アキュムレータへ反映し、`finish_aggregate_result` へ合流する
+- 適用条件: 全項目が `DISTINCT`・`FILTER` なしで、`COUNT(*)`／`COUNT(id)`／`SUM`／`AVG`／`MIN`／`MAX(id)` のいずれか。`GROUPING()`・分散系・式・列・文字列集計が 1 つでもあれば従来の行ループ。`SUM(id)` 等が `IdU64` に束縛されるのは疑似列 `id` を持つ従来方式の表だけで、`id` を宣言した採番方式の表は列集計の経路のまま
+- 等価性: id は非負なので、逐次 `checked_add` の失敗は総和が u64 を超えることと同値（`22003`・文言も同じ）。SUM と AVG が併存するときの文言は項目順で先のものが出る。結果型・AVG の丸めは `finish` を共有するため不変
+- 不変条件: 可視 id スライスは RLS・TABLE-12 検査済みの正確な集合で、キャッシュは同一テーブル世代・同一 ctx でのみ命中する（#3213 と同じ。ポリシー適用表・書き込み Tx は上流でキャッシュ無効）。中断確認（#3208）はチャンク先頭ごとに即時評価し、非空なら必ず 1 回通る
+- 固定した検査: `fold_visible_ids`＋`absorb_id_stats` と逐次 `observe_id` の差分テスト（空・1 行・u64 上限付近・チャンク境界の前後・項目順の文言。`aggregate.rs` の単体テスト）と、`sql3214_id_fold.rs`（初回と命中の一致・`WHERE`／`FILTER` とのオラクル・id 0・テナント境界・書き込み後の無効化・`22003`・対象外の形・命中時の中断）
+- 計測（参考・本変更後のみ）: `make bench-aggregate-loop` 相当（rounds=5・25,000 行・x86_64 共有機・loadavg 8 前後）で `agg_multi` の min-of-N 0.022 ms（0.175 ns/セル）。crossdb 側のハーネス・A/B（受け入れ条件の 637 us 比較）は未検証
