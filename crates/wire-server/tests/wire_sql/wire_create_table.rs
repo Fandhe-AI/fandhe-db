@@ -240,3 +240,38 @@ fn wire_select_star_on_a_table_without_id_lists_declared_columns_only() {
     expect_error_response_with_sqlstate(&mut stream, "42703");
     read_ready_for_query(&mut stream);
 }
+
+/// 親が採番方式（宣言した `id BIGINT PRIMARY KEY`）の `REFERENCES parent (id)`／`REFERENCES parent` は
+/// DDL 束縛で受理される。psql が送る末尾 `;` 付きの単独文でも通り、接続は継続して使える
+/// （TABLE-17・TABLE-23、Issue #3178）。
+#[test]
+fn wire_create_table_accepts_foreign_key_to_allocated_parent_id_with_trailing_semicolon() {
+    let (core, _guard) = new_core_without_tables();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
+    let addr = spawn_with_ddl_allowed_users(&users_path, core, &["alice"]);
+    let mut stream = connect_as(addr, "alice", "pw-alice");
+
+    for (sql, tag) in [
+        (
+            "CREATE TABLE users (id BIGINT PRIMARY KEY, name TEXT);",
+            "CREATE TABLE",
+        ),
+        (
+            "CREATE TABLE posts (author BIGINT REFERENCES users (id), body TEXT);",
+            "CREATE TABLE",
+        ),
+        (
+            "CREATE TABLE posts2 (author BIGINT REFERENCES users);",
+            "CREATE TABLE",
+        ),
+        ("CREATE TABLE late (author BIGINT);", "CREATE TABLE"),
+        (
+            "ALTER TABLE late ADD CONSTRAINT late_fk FOREIGN KEY (author) REFERENCES users (id);",
+            "ALTER TABLE",
+        ),
+    ] {
+        send_simple_query(&mut stream, sql);
+        assert_eq!(read_command_complete(&mut stream), tag, "{sql}");
+        read_ready_for_query(&mut stream);
+    }
+}

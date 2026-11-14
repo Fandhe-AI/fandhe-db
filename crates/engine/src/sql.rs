@@ -648,7 +648,7 @@ pub enum SqlOutcome {
     /// `wire-server::simple_query`）はすべて更新済み。クレート外で `SqlOutcome`
     /// を網羅的にマッチするコードがあれば追随が必要。
     DeclareCursor,
-    /// `FETCH [ NEXT | [FORWARD] <n> ] { FROM | IN } <name>`（WIRE-15・TASK-218）が成功したことを
+    /// `FETCH [ NEXT | ALL | [FORWARD] { <n> | ALL } ] { FROM | IN } <name>`（WIRE-15・TASK-218）が成功したことを
     /// 示す応答。内側 `DECLARE` 時点で確定済みの行から未取得分を払い出すのみで
     /// 検索本体は再実行しない。`wire-server::simple_query` は `RowDescription`／
     /// `DataRow`* に続けて `CommandComplete` タグ `FETCH <実際に送出した行数>`

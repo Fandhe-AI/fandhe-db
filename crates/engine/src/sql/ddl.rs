@@ -333,7 +333,7 @@ pub(crate) fn map_create_table_catalog_error(e: CatalogError) -> SqlSurfaceError
         CatalogError::TableNotFound(name) => SqlSurfaceError::UndefinedTable { name },
         CatalogError::WrongObjectKind(name) => SqlSurfaceError::WrongObjectType { name },
         CatalogError::InvalidForeignKey(detail) => SqlSurfaceError::invalid_foreign_key(detail),
-        // 採番方式の親への `id` 参照など、行識別方式が未対応の組み合わせは固定文言の `0A000`
+        // 行識別方式が未対応の組み合わせ（採番方式の表の暗黙 id 前提の経路など）は固定文言の `0A000`
         // （TABLE-23・Issue #2199。入力不正ではない）。
         CatalogError::Invalid(detail)
             if detail == crate::catalog::ROW_IDENTITY_UNSUPPORTED_MESSAGE =>
@@ -489,7 +489,7 @@ pub(crate) fn execute_create_temp_table(
         ));
     }
     let schema = crate::catalog::prepare_temp_table_schema(&schema).map_err(|e| match e {
-        // 採番方式の親への `id` 参照など、行識別方式が未対応の組み合わせは固定文言の `0A000`
+        // 行識別方式が未対応の組み合わせ（採番方式の表の暗黙 id 前提の経路など）は固定文言の `0A000`
         // （TABLE-23・Issue #2199。入力不正ではない）。
         CatalogError::Invalid(detail)
             if detail == crate::catalog::ROW_IDENTITY_UNSUPPORTED_MESSAGE =>
@@ -1439,7 +1439,7 @@ fn map_alter_constraint_error(e: CatalogError) -> SqlSurfaceError {
         CatalogError::NotNullConstraintViolation(column) => {
             SqlSurfaceError::not_null_violation(column)
         }
-        // 採番方式の親への `id` 参照など、行識別方式が未対応の組み合わせは固定文言の `0A000`
+        // 行識別方式が未対応の組み合わせ（採番方式の表の暗黙 id 前提の経路など）は固定文言の `0A000`
         // （TABLE-23・Issue #2199。入力不正ではない）。
         CatalogError::Invalid(detail)
             if detail == crate::catalog::ROW_IDENTITY_UNSUPPORTED_MESSAGE =>
@@ -2057,7 +2057,7 @@ fn map_drop_alter_column_error(e: CatalogError) -> SqlSurfaceError {
         CatalogError::ProtectedColumn(name) => {
             SqlSurfaceError::unsupported(format!("column {name:?} cannot be dropped or altered"))
         }
-        // 採番方式の親への `id` 参照など、行識別方式が未対応の組み合わせは固定文言の `0A000`
+        // 行識別方式が未対応の組み合わせ（採番方式の表の暗黙 id 前提の経路など）は固定文言の `0A000`
         // （TABLE-23・Issue #2199。入力不正ではない）。
         CatalogError::Invalid(detail)
             if detail == crate::catalog::ROW_IDENTITY_UNSUPPORTED_MESSAGE =>
@@ -2751,7 +2751,7 @@ fn map_add_column_error(e: CatalogError) -> SqlSurfaceError {
         CatalogError::TooManyColumns { count } => {
             SqlSurfaceError::payload_too_large(format!("too many columns: {count}"))
         }
-        // 採番方式の親への `id` 参照など、行識別方式が未対応の組み合わせは固定文言の `0A000`
+        // 行識別方式が未対応の組み合わせ（採番方式の表の暗黙 id 前提の経路など）は固定文言の `0A000`
         // （TABLE-23・Issue #2199。入力不正ではない）。
         CatalogError::Invalid(detail)
             if detail == crate::catalog::ROW_IDENTITY_UNSUPPORTED_MESSAGE =>

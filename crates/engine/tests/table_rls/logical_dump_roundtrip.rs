@@ -346,29 +346,42 @@ fn restored_constraints_and_defaults_are_enforced() {
     );
 }
 
-/// 参照先の列名が `id` の外部キーは、SQL 表層が暗黙 id への参照として扱い `0A000` で拒否する
-/// （列 `id` を明示した表でも同じ）。そのためダンプには現れない外部キーの形で、fixture は参照先を
-/// `id` 以外の列にしている。受理されるようになったら、fixture に加えて往復させる（設計メモ第 13 節）。
+/// 採番方式の親の宣言済み `id` 列への外部キー（列制約と ADD CONSTRAINT の両形）は、ダンプに現れ、
+/// 空の DB へ流して再ダンプしてもバイト列が一致する（Issue #3178）。fixture 本体へデータ入りで加えるのは
+/// NULL 以外の子の値を入れられるようになった後（#3179・#3182）。
 #[test]
-fn foreign_key_to_a_column_named_id_is_rejected_so_it_never_reaches_the_dump() {
-    let p = unique_db_path("dump-rt-fk-id");
-    let _g = CleanupGuard(p.clone());
-    let core = open_core(&p);
+fn foreign_key_to_a_column_named_id_round_trips_through_the_dump() {
+    let p1 = unique_db_path("dump-rt-fk-id-src");
+    let _g1 = CleanupGuard(p1.clone());
+    let p2 = unique_db_path("dump-rt-fk-id-dst");
+    let _g2 = CleanupGuard(p2.clone());
+    let src = open_core(&p1);
     ok(
-        &core,
+        &src,
         "CREATE TABLE par (id BIGINT PRIMARY KEY, code TEXT, UNIQUE (code))",
     );
+    ok(&src, "CREATE TABLE ch (cid BIGINT PRIMARY KEY, pid BIGINT)");
     ok(
-        &core,
-        "CREATE TABLE ch (cid BIGINT PRIMARY KEY, pid BIGINT)",
-    );
-    for sql in [
+        &src,
         "ALTER TABLE ch ADD CONSTRAINT fk1 FOREIGN KEY (pid) REFERENCES par (id) ON DELETE CASCADE",
+    );
+    ok(
+        &src,
         "CREATE TABLE ch2 (cid BIGINT PRIMARY KEY, pid BIGINT REFERENCES par (id))",
-    ] {
-        let err = run(&core, sql).map(|_| ()).expect_err(sql);
-        assert_eq!(err.wire_code(), "0A000", "{sql}");
-    }
+    );
+    let pieces = dump(&src, TableDataFormat::Insert).expect("dump");
+    let ddl: String = pieces
+        .iter()
+        .filter_map(|p| match p {
+            Piece::Ddl(s) => Some(s.as_str()),
+            Piece::Data(..) => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(ddl.contains("FOREIGN KEY"), "{ddl}");
+    let dst = open_core(&p2);
+    replay(&dst, &pieces);
+    assert_eq!(pieces, dump(&dst, TableDataFormat::Insert).expect("redump"));
 }
 
 /// 従来方式（暗黙 id）の表が外部キーを持つ DB は、書き出しが `Unsupported` で全体を失敗させる。
