@@ -118,7 +118,7 @@ fn unsupported_and_malformed_forms_are_rejected_before_the_catalog() {
             "0A000",
         ),
         (
-            "CREATE TRIGGER g AFTER INSERT ON t FOR EACH ROW WHEN (a = 'x') EXECUTE FUNCTION f()",
+            "CREATE TRIGGER g AFTER INSERT ON t FOR EACH ROW WHEN (NEW.a = (SELECT 1)) EXECUTE FUNCTION f()",
             "0A000",
         ),
         (

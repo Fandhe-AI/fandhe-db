@@ -63,7 +63,7 @@ pub(crate) fn execute_create_trigger(
         update_of: stmt.update_of.clone(),
         function_key: stmt.function.clone(),
         tg_args: stmt.tg_args.clone(),
-        when_sql: None,
+        when_sql: stmt.when_sql.clone(),
     };
     storage
         .create_trigger(tenant_id, &stmt.table, &def, stmt.or_replace)

@@ -35,7 +35,7 @@ Issue #1725（親 #1720）の実装記録。上位の決定は [trigger-executio
 | NoSQL の `RETURNING` 付き更新・削除、生の行 API、`replace_typed_rows_by_text_key` | 該当イベントのトリガがあれば `0A000`（`RETURNING` の受け皿は #3189。他は意図的に未結線） |
 | 参照アクション（CASCADE・SET NULL・SET DEFAULT）が及ぶ子表に該当イベントのトリガ | `0A000`（カタログの FK 宣言だけから静的に判定。親にトリガが無くても拒否する）。自己参照 FK の対象表自身も子表に数える（参照アクションで書き換わる同表の別行ではトリガを発火できないため、黙って飛ばさず `0A000`） |
 | 文トリガ（UPDATE・DELETE の STATEMENT） | 発火（[trigger-statement-truncate.md](trigger-statement-truncate.md)。Issue #1726） |
-| `WHEN` 付き | `0A000` のまま（発火時にも二重に拒否。評価は後続） |
+| `WHEN` 付き | 当時は `0A000`。Issue #3190 で評価を結線済み（実行モデルの D7 の実装記録） |
 
 判定はすべて、同じ write txn の中でカタログだけを見て行う。書き込みテナントの scope のトリガだけを見るので、
 他テナントの定義・行の有無は応答の差に出ない。文言は固定の英語で、トリガ名・表名・値を含めない。

@@ -310,3 +310,66 @@ fn wire_replay_with_operation_id_is_rejected_without_refiring() {
     );
     assert!(select_col(&mut b, "SELECT lv FROM audit").is_empty());
 }
+/// `WHEN (<条件>)` 付きの `CREATE TRIGGER`（末尾 `;` 付き単独送信を含む。Issue #3190）は
+/// コマンドタグ `CREATE TRIGGER` を返し、条件が TRUE の行でだけ発火する（簡易クエリ）。
+#[test]
+fn wire_simple_query_when_condition_fires_only_for_true_rows() {
+    let (addr, _g) = serve();
+    let mut s = connect(addr, "alice", "pw-alice");
+    setup(&mut s);
+    assert_eq!(
+        exec(
+            &mut s,
+            "CREATE TRIGGER tw BEFORE INSERT ON s.tt FOR EACH ROW WHEN (NEW.n > 1) \
+             EXECUTE FUNCTION bump();"
+        ),
+        "CREATE TRIGGER"
+    );
+    assert_eq!(
+        exec(&mut s, "INSERT INTO s.tt (n) VALUES (1), (2);"),
+        "INSERT 0 2"
+    );
+    let mut v = select_col(&mut s, "SELECT n FROM s.tt");
+    v.sort();
+    assert_eq!(v, vec!["1", "102"]);
+    // 定義時に拒否される条件（サブクエリ）は `0A000` で、接続は生き続ける。
+    send_simple_query(
+        &mut s,
+        "CREATE TRIGGER tx BEFORE INSERT ON s.tt FOR EACH ROW WHEN (NEW.n > (SELECT 1)) \
+         EXECUTE FUNCTION bump()",
+    );
+    let (kind, body) = read_message(&mut s);
+    assert_eq!(kind, b'E');
+    assert!(String::from_utf8_lossy(&body).contains("0A000"));
+    read_ready_for_query(&mut s);
+}
+
+/// 拡張クエリで送った INSERT でも WHEN 付きトリガが評価される。
+#[test]
+fn wire_extended_query_when_condition_is_evaluated() {
+    let (addr, _g) = serve();
+    let mut s = connect(addr, "alice", "pw-alice");
+    setup(&mut s);
+    exec(
+        &mut s,
+        "CREATE TRIGGER tw BEFORE INSERT ON s.tt FOR EACH ROW WHEN (NEW.n = 5) \
+         EXECUTE FUNCTION bump()",
+    );
+    for (name, n) in [("s1", "5"), ("s2", "6")] {
+        send_length_prefixed_message(
+            &mut s,
+            b'P',
+            &parse_body(name, &format!("INSERT INTO s.tt (n) VALUES ({n})"), 0),
+        );
+        assert_eq!(read_message(&mut s).0, b'1');
+        send_length_prefixed_message(&mut s, b'B', &bind_body("p1", name));
+        assert_eq!(read_message(&mut s).0, b'2');
+        send_length_prefixed_message(&mut s, b'E', &execute_body("p1", 0));
+        assert_eq!(read_message(&mut s).0, b'C');
+        send_length_prefixed_message(&mut s, b'S', &[]);
+        assert_eq!(read_message(&mut s).0, b'Z');
+    }
+    let mut v = select_col(&mut s, "SELECT n FROM s.tt");
+    v.sort();
+    assert_eq!(v, vec!["105", "6"]);
+}

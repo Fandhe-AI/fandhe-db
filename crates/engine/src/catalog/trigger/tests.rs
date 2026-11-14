@@ -233,6 +233,17 @@ fn create_judgement_order_and_errors() {
         create(&s, "t1", &key, &d),
         Err(CatalogError::ColumnNotFound(_))
     ));
+    // WHEN が参照する未知の列（定義時検査と保存の間に列が消えた場合と同じ。同一 write txn で拒否）。
+    let mut d = tdef("trg", "f");
+    d.update_of.clear();
+    d.when_sql = Some("NEW.zzz > 1".to_string());
+    assert!(matches!(
+        create(&s, "t1", &key, &d),
+        Err(CatalogError::ColumnNotFound(_))
+    ));
+    d.when_sql = Some("NEW.a > 1".to_string());
+    create(&s, "t1", &key, &d).expect("known column accepted");
+    assert!(s.drop_trigger("t1", &key, "trg").expect("drop"));
     // 関数なし（他テナントにしか無い関数も同じ）。
     s.create_function("t2", &func("g")).expect("g");
     match create(&s, "t1", &key, &tdef("trg", "g")) {

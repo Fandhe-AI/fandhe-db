@@ -128,6 +128,7 @@ mod table45_trigger_ddl;
 mod table45_trigger_fire;
 mod table45_trigger_partitioned;
 mod table45_trigger_prod_invoker;
+mod table45_trigger_when;
 mod table_generation_bump_coverage;
 mod tenant_breach;
 mod tenant_isolation;

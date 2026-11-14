@@ -6,8 +6,10 @@
 //! `sql::trigger_ddl` が権限ゲートの後で行う）。呼び出し元は `core.rs` の `parse_sql` 内の分岐だけ。
 //!
 //! 受理しない形（`INSTEAD OF`・`REFERENCING`・`CONSTRAINT TRIGGER`・`DEFERRABLE`・`FROM <表>`・
-//! `WHEN`・`TRUNCATE` の行トリガ）は黙って無視せず `0A000` で拒否する（fail-closed。D8）。`TG_ARGV` の
-//! 引数は値として読み、SQL テキストへ連結しない。
+//! `TRUNCATE` の行トリガ）は黙って無視せず `0A000` で拒否する（fail-closed。D8）。
+//!
+//! 注記: `WHEN (<条件>)` は Issue #3190 で受理する。条件のトークン検査は [`validate_when_tokens`]。
+//! `TG_ARGV` の引数は値として読み、SQL テキストへ連結しない。
 
 use super::*;
 use crate::catalog::trigger::{TriggerEvents, TriggerLevel, TriggerTiming, MAX_TRIGGER_ARGS};
@@ -28,6 +30,211 @@ pub struct ValidatedCreateTrigger {
     pub(crate) update_of: Vec<String>,
     pub(crate) function: String,
     pub(crate) tg_args: Vec<String>,
+    /// `WHEN (<条件>)` の正規化テキスト（括弧の内側。Issue #3190）。`None` は WHEN なし。
+    pub(crate) when_sql: Option<String>,
+}
+
+/// `WHEN` 条件の括弧の深さ上限（untrusted 入力の再帰・走査量を抑える。DoS 対策）。
+const MAX_WHEN_PAREN_DEPTH: usize = 32;
+
+/// `WHEN` 条件のトークン数上限（同上）。
+const MAX_WHEN_TOKENS: usize = 2048;
+
+/// 関数呼び出し形（直後が `(`）に見えるが構文語・演算子である語（大小無視）。これ以外の
+/// 「識別子 + `(`」は関数呼び出しとして組み込み関数かを検査する。
+const WHEN_SYNTAX_WORDS: &[&str] = &[
+    "AND",
+    "OR",
+    "NOT",
+    "IN",
+    "ANY",
+    "ALL",
+    "SOME",
+    "IS",
+    "LIKE",
+    "ILIKE",
+    "BETWEEN",
+    "DISTINCT",
+    "CASE",
+    "WHEN",
+    "THEN",
+    "ELSE",
+    "END",
+    "AS",
+    "CAST",
+    "COALESCE",
+    "NULLIF",
+    "EXTRACT",
+    "SIMILAR",
+    "TO",
+    "ESCAPE",
+    "SYMMETRIC",
+    "ASYMMETRIC",
+    "NULL",
+    "TRUE",
+    "FALSE",
+    "UNKNOWN",
+];
+
+/// `DOUBLE`・`CHARACTER` のように、続き語（`PRECISION`・`VARYING`）を伴う型名の先頭語か。
+fn is_type_head_word(tok: &Token) -> bool {
+    matches!(tok, Token::Ident(w) if w.eq_ignore_ascii_case("DOUBLE") || w.eq_ignore_ascii_case("CHARACTER"))
+}
+
+/// `tokens[i]` が `DOUBLE PRECISION`・`CHARACTER VARYING` の続き語（直前が先頭語）か。
+fn is_type_continuation(tokens: &[Token], i: usize) -> bool {
+    let is_tail = matches!(tokens.get(i), Some(Token::Ident(w))
+        if w.eq_ignore_ascii_case("PRECISION") || w.eq_ignore_ascii_case("VARYING"));
+    is_tail
+        && i.checked_sub(1)
+            .and_then(|j| tokens.get(j))
+            .is_some_and(is_type_head_word)
+}
+
+/// 型名追跡の状態遷移。`::`・`AS` の直後から型名で、型名は 1 語
+/// （`DOUBLE`・`CHARACTER` の直後だけ続き語のため継続する）。
+fn next_in_type(tok: &Token, in_type: bool) -> bool {
+    match tok {
+        Token::TypeCast | Token::Punct(':') => true,
+        Token::Ident(w) if w.eq_ignore_ascii_case("AS") => true,
+        Token::Ident(_) => in_type && is_type_head_word(tok),
+        _ => false,
+    }
+}
+
+/// `WHEN` 条件のトークン列（括弧の内側）を検査する純粋関数（TABLE-45・SQL-68、Issue #3190。
+/// 実行モデルの D7）。カタログ・セッションには触れない。構文段（本ファイル）が定義時に、
+/// 発火側（`core::plpgsql_trigger_host`）が保存値の再検査として呼ぶ。
+///
+/// 拒否: `;`・`$n`（`42601`）、サブクエリ（`SELECT`・`WITH`・`VALUES`・`TABLE`）、組み込み以外の
+/// 関数・現在時刻関数（揮発性）・`NEW`/`OLD` 以外の修飾名（いずれも `0A000`）。値・列名は文言に含めない。
+pub(crate) fn validate_when_tokens(tokens: &[Token]) -> Result<(), SqlSurfaceError> {
+    if tokens.is_empty() {
+        return Err(SqlSurfaceError::unsupported("empty trigger WHEN condition"));
+    }
+    if tokens.len() > MAX_WHEN_TOKENS {
+        return Err(SqlSurfaceError::payload_too_large(
+            "trigger WHEN condition is too long",
+        ));
+    }
+    let mut depth: usize = 0;
+    // `::` または `AS` の直後の識別子は型名（`::int`・`AS double precision`）。
+    let mut in_type = false;
+    for (i, tok) in tokens.iter().enumerate() {
+        // この語が型名の一部か（直前までの状態、または `DOUBLE PRECISION`・`CHARACTER VARYING` の続き語）。
+        let is_type_word = in_type || is_type_continuation(tokens, i);
+        in_type = next_in_type(tok, in_type);
+        match tok {
+            Token::Punct('(') => {
+                depth += 1;
+                if depth > MAX_WHEN_PAREN_DEPTH {
+                    return Err(SqlSurfaceError::payload_too_large(
+                        "trigger WHEN condition is nested too deeply",
+                    ));
+                }
+            }
+            Token::Punct(')') => {
+                depth = depth.checked_sub(1).ok_or_else(|| {
+                    SqlSurfaceError::unsupported("unbalanced parentheses in trigger WHEN")
+                })?;
+            }
+            Token::Punct(';') | Token::Param(_) => {
+                return Err(SqlSurfaceError::unsupported(
+                    "invalid token in trigger WHEN condition",
+                ));
+            }
+            Token::Keyword(Keyword::Select) => {
+                return Err(SqlSurfaceError::feature_not_supported(
+                    "subqueries in trigger WHEN conditions are not supported",
+                ));
+            }
+            Token::QualifiedIdent { qualifier, .. } => {
+                if !(qualifier.eq_ignore_ascii_case("NEW") || qualifier.eq_ignore_ascii_case("OLD"))
+                {
+                    return Err(SqlSurfaceError::feature_not_supported(
+                        "trigger WHEN conditions may only reference NEW and OLD",
+                    ));
+                }
+            }
+            Token::Ident(name) => {
+                let is_call = matches!(tokens.get(i + 1), Some(Token::Punct('(')));
+                if ["WITH", "VALUES", "TABLE"]
+                    .iter()
+                    .any(|w| name.eq_ignore_ascii_case(w))
+                {
+                    return Err(SqlSurfaceError::feature_not_supported(
+                        "subqueries in trigger WHEN conditions are not supported",
+                    ));
+                }
+                // 裸の列名は PostgreSQL と同じく拒否する（列は `NEW.<列>`／`OLD.<列>` で参照する）。
+                if !is_call
+                    && !is_type_word
+                    && !WHEN_SYNTAX_WORDS
+                        .iter()
+                        .any(|w| name.eq_ignore_ascii_case(w))
+                {
+                    return Err(SqlSurfaceError::feature_not_supported(
+                        "trigger WHEN conditions must reference columns as NEW.<column> or OLD.<column>",
+                    ));
+                }
+                if is_call
+                    && !WHEN_SYNTAX_WORDS
+                        .iter()
+                        .any(|w| name.eq_ignore_ascii_case(w))
+                    && (!crate::sql::udf_call::is_builtin_function_name(name)
+                        || crate::sql::udf_call::is_current_time_function_name(name))
+                {
+                    return Err(SqlSurfaceError::feature_not_supported(
+                        "trigger WHEN conditions may only call built-in functions",
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    if depth != 0 {
+        return Err(SqlSurfaceError::unsupported(
+            "unbalanced parentheses in trigger WHEN",
+        ));
+    }
+    Ok(())
+}
+
+/// `WHEN` の `(` 直後から対応する `)` までを読み、検査済みの正規化テキストを返す。
+fn parse_when_clause(p: &mut Parser<'_>) -> Result<String, SqlSurfaceError> {
+    p.expect_punct('(')?;
+    let mut inner: Vec<Token> = Vec::new();
+    let mut depth: usize = 1;
+    loop {
+        let tok = p
+            .advance()
+            .ok_or_else(|| SqlSurfaceError::unsupported("unterminated trigger WHEN condition"))?;
+        match tok {
+            Token::Punct('(') => depth += 1,
+            Token::Punct(')') => {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            _ => {}
+        }
+        if inner.len() >= MAX_WHEN_TOKENS {
+            return Err(SqlSurfaceError::payload_too_large(
+                "trigger WHEN condition is too long",
+            ));
+        }
+        inner.push(tok.clone());
+    }
+    validate_when_tokens(&inner)?;
+    let text = crate::sql::lexer::render_tokens(&inner)
+        .ok_or_else(|| SqlSurfaceError::unsupported("invalid token in trigger WHEN condition"))?;
+    if text.len() > crate::catalog::trigger::MAX_TRIGGER_WHEN_BYTES {
+        return Err(SqlSurfaceError::payload_too_large(
+            "trigger WHEN condition is too long",
+        ));
+    }
+    Ok(text)
 }
 
 /// 構造検証済みの `DROP TRIGGER [IF EXISTS] <名前> ON <表> [CASCADE|RESTRICT]`（TABLE-45、Issue #1722）。
@@ -218,6 +425,7 @@ pub(crate) fn validate_create_trigger_tokens(
     let table = expect_relation_ident(&mut p, "table")?;
 
     let mut level: Option<TriggerLevel> = None;
+    let mut when_sql: Option<String> = None;
     loop {
         if p.peek_ident_matches("REFERENCING") {
             return Err(SqlSurfaceError::feature_not_supported(
@@ -251,11 +459,14 @@ pub(crate) fn validate_create_trigger_tokens(
             });
             continue;
         }
-        if p.peek_ident_matches("WHEN") {
-            // D7（定義時検査）の束縛は未実装のため、黙って受理・保存しない。
-            return Err(SqlSurfaceError::feature_not_supported(
-                "trigger WHEN conditions are not supported yet",
-            ));
+        if p.eat_word("WHEN") {
+            if when_sql.is_some() {
+                return Err(SqlSurfaceError::unsupported(
+                    "WHEN clause specified more than once",
+                ));
+            }
+            when_sql = Some(parse_when_clause(&mut p)?);
+            continue;
         }
         break;
     }
@@ -288,6 +499,7 @@ pub(crate) fn validate_create_trigger_tokens(
         update_of,
         function,
         tg_args,
+        when_sql,
     })
 }
 
@@ -385,10 +597,62 @@ mod tests {
             "CREATE TRIGGER g AFTER INSERT ON t DEFERRABLE EXECUTE FUNCTION f()",
             "CREATE TRIGGER g AFTER INSERT ON t FROM u EXECUTE FUNCTION f()",
             "CREATE TRIGGER g AFTER INSERT ON t FOR EACH ROW WHEN (a > 1) EXECUTE FUNCTION f()",
+            "CREATE TRIGGER g AFTER INSERT ON t FOR EACH ROW WHEN (NEW.a > (SELECT 1)) EXECUTE FUNCTION f()",
+            "CREATE TRIGGER g AFTER INSERT ON t FOR EACH ROW WHEN (myudf(NEW.a)) EXECUTE FUNCTION f()",
+            "CREATE TRIGGER g AFTER INSERT ON t FOR EACH ROW WHEN (now() > NEW.a) EXECUTE FUNCTION f()",
+            "CREATE TRIGGER g AFTER INSERT ON t FOR EACH ROW WHEN (x.a > 1) EXECUTE FUNCTION f()",
             "CREATE TRIGGER g AFTER TRUNCATE ON t FOR EACH ROW EXECUTE FUNCTION f()",
         ] {
             assert_eq!(code(sql), "0A000", "{sql}");
         }
+    }
+
+    #[test]
+    fn when_condition_is_parsed_and_normalized() {
+        let v = create(
+            "CREATE TRIGGER g AFTER UPDATE ON t FOR EACH ROW \
+             WHEN (NEW.a <> OLD.a AND (new.b IS NOT NULL OR NEW.c::int BETWEEN 1 AND 3)) \
+             EXECUTE FUNCTION f()",
+        )
+        .expect("parse");
+        let when = v.when_sql.expect("when");
+        assert!(when.contains("NEW.a") && when.contains("OLD.a"), "{when}");
+        assert!(!when.starts_with('('));
+        assert!(
+            create("CREATE TRIGGER g AFTER INSERT ON t EXECUTE FUNCTION f()")
+                .expect("parse")
+                .when_sql
+                .is_none()
+        );
+        // 組み込み関数と CASE は構文段で受理する。
+        create(
+            "CREATE TRIGGER g AFTER INSERT ON t FOR EACH ROW \
+             WHEN (length(NEW.a) > 1 AND CASE WHEN NEW.b > 1 THEN true ELSE false END) \
+             EXECUTE FUNCTION f()",
+        )
+        .expect("parse");
+    }
+
+    #[test]
+    fn when_malformed_forms_are_42601() {
+        for sql in [
+            "CREATE TRIGGER g AFTER INSERT ON t FOR EACH ROW WHEN () EXECUTE FUNCTION f()",
+            "CREATE TRIGGER g AFTER INSERT ON t FOR EACH ROW WHEN (NEW.a > 1 EXECUTE FUNCTION f()",
+            "CREATE TRIGGER g AFTER INSERT ON t FOR EACH ROW WHEN (NEW.a > 1; ) EXECUTE FUNCTION f()",
+            "CREATE TRIGGER g AFTER INSERT ON t FOR EACH ROW WHEN NEW.a > 1 EXECUTE FUNCTION f()",
+            "CREATE TRIGGER g AFTER INSERT ON t FOR EACH ROW WHEN (true) WHEN (true) EXECUTE FUNCTION f()",
+        ] {
+            assert_eq!(code(sql), "42601", "{sql}");
+        }
+    }
+
+    #[test]
+    fn when_depth_is_bounded() {
+        let deep = format!("{}true{}", "(".repeat(40), ")".repeat(40));
+        let sql = format!(
+            "CREATE TRIGGER g AFTER INSERT ON t FOR EACH ROW WHEN ({deep}) EXECUTE FUNCTION f()"
+        );
+        assert_eq!(code(&sql), "54000");
     }
 
     #[test]

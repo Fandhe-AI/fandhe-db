@@ -11,6 +11,9 @@
 //! 戻り値は無視し（実行モデルの D3）、他表への書き込みは
 //! [`TriggerWriteHandle`](super::write_handle::TriggerWriteHandle) 経由で行う。
 //!
+//! 行トリガの `WHEN` は呼び出しの直前に [`TriggerRuntime::eval_when`] で評価し、TRUE のときだけ関数を呼ぶ
+//! （Issue #3190。実行モデルの D7）。
+//!
 //! 文トリガ（FOR EACH STATEMENT。TRUNCATE を含む）は [`fire_statement`] が文につき 1 回、対象行が
 //! 0 件でも発火する（Issue #1726）。
 
@@ -25,8 +28,46 @@ use crate::sql::allowlist::SqlSurfaceError;
 /// 返却行の構造違いの固定文言（値・列名・行を含めない）。
 const RETURNED_ROW_MISMATCH: &str = "trigger function returned a row that does not match the table";
 
-/// 発火時にも `WHEN` 条件を実行できないことの固定文言（定義時に拒否済みだが fail-closed に二重化する）。
+/// 文トリガで `WHEN` 条件を実行できないことの固定文言（定義時に拒否済みだが fail-closed に二重化する）。
 const WHEN_UNSUPPORTED: &str = "trigger WHEN condition is not supported";
+
+/// 行トリガ 1 つの `WHEN` 条件を評価し、発火してよいかを返す（Issue #3190。実行モデルの D7）。
+/// `when_sql` が無ければ常に `true`。TRUE だけが発火で、FALSE・NULL は不発火（次のトリガへ進む）。
+/// 評価エラーはそのまま返し、呼び出し側が文全体を失敗させる（fail-closed）。
+#[allow(clippy::too_many_arguments)]
+fn when_passes(
+    runtime: &TriggerRuntime,
+    writes: &TriggerWriteHandle<'_>,
+    table: &str,
+    schema: &TableSchema,
+    trigger: &TriggerDef,
+    op: TriggerOp,
+    level: TriggerLevel,
+    old: Option<&[Value]>,
+    new_row: &[Value],
+    timing: TriggerTiming,
+) -> Result<bool, SqlSurfaceError> {
+    let Some(when_sql) = trigger.when_sql.as_deref() else {
+        return Ok(true);
+    };
+    runtime.eval_when(
+        &TriggerCall {
+            trigger_name: &trigger.name,
+            function_key: &trigger.function_key,
+            table,
+            schema,
+            op,
+            level,
+            old_row: old,
+            new_row,
+            args: &trigger.tg_args,
+            timing,
+            writes,
+            host: runtime.host(),
+        },
+        when_sql,
+    )
+}
 
 fn returned_row_mismatch() -> SqlSurfaceError {
     SqlSurfaceError::DatatypeMismatch {
@@ -79,10 +120,20 @@ fn fire_before_chain(
     for trigger in triggers {
         // 行ごと・呼び出しごとに割り込み（`57014`）を確認する。
         crate::interrupt::check()?;
-        if trigger.when_sql.is_some() {
-            return Err(SqlSurfaceError::FeatureNotSupported {
-                detail: WHEN_UNSUPPORTED.to_string(),
-            });
+        // WHEN は呼び出し直前の NEW（前のトリガが書き換えた最新の行）で評価する（D7）。
+        if !when_passes(
+            runtime,
+            writes,
+            table,
+            schema,
+            trigger,
+            op,
+            TriggerLevel::Row,
+            old,
+            &row,
+            TriggerTiming::Before,
+        )? {
+            continue;
         }
         let outcome = runtime.invoke(&TriggerCall {
             trigger_name: &trigger.name,
@@ -182,13 +233,12 @@ pub(crate) fn fire_before_row_delete(
     Ok(outcome.is_some())
 }
 
-/// `triggers`（AFTER・ROW のみ。カタログ順）を、変更した 1 行に対して順に発火する（Issue #1724・#1725）。
-/// INSERT は `old = None`・`new_row` が最終 NEW、UPDATE は `(OLD, 最終 NEW)`、DELETE は `old = Some` と
-/// 空の `new_row`。戻り値（`Proceed`・`Skip`）は無視し、返却行の構造も検査しない（実行モデルの D3）。
-/// エラーは [`SqlSurfaceError`] のまま返し、呼び出し側（`tenant/trigger_insert.rs`・`trigger_dml.rs`）が
-/// 文全体を失敗させる。呼び出し元は redb の表ハンドルを 1 つも開かずに呼ぶこと。
+/// AFTER ROW トリガのうち、変更した 1 行で `WHEN` が TRUE のもののインデックス（`triggers` 内の位置。
+/// カタログ順）を返す（Issue #3190。実行モデルの D7: 行の変更の時点で評価し、偽ならキューに積まない）。
+/// 評価エラーはそのまま返し、呼び出し側が文全体を失敗させる（fail-closed）。呼び出し元は行の変更の
+/// 直後（表ハンドルを開いていない区間）で呼ぶこと。
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn fire_after_row(
+pub(crate) fn select_after_row(
     runtime: &TriggerRuntime,
     writes: &TriggerWriteHandle<'_>,
     table: &str,
@@ -197,14 +247,46 @@ pub(crate) fn fire_after_row(
     op: TriggerOp,
     old: Option<&[Value]>,
     new_row: &[Value],
-) -> Result<(), SqlSurfaceError> {
-    for trigger in triggers {
+) -> Result<Vec<usize>, SqlSurfaceError> {
+    let mut selected = Vec::new();
+    for (idx, trigger) in triggers.iter().enumerate() {
         crate::interrupt::check()?;
-        if trigger.when_sql.is_some() {
-            return Err(SqlSurfaceError::FeatureNotSupported {
-                detail: WHEN_UNSUPPORTED.to_string(),
-            });
+        if when_passes(
+            runtime,
+            writes,
+            table,
+            schema,
+            trigger,
+            op,
+            TriggerLevel::Row,
+            old,
+            new_row,
+            TriggerTiming::After,
+        )? {
+            selected.push(idx);
         }
+    }
+    Ok(selected)
+}
+
+/// [`select_after_row`] が選んだ AFTER ROW トリガ（`selected` は `triggers` 内の位置）の本体だけを順に
+/// 実行する。`WHEN` は再評価しない（D7）。戻り値（`Proceed`・`Skip`）は無視し、返却行の構造も検査しない
+/// （実行モデルの D3）。エラーは呼び出し側（`tenant/trigger_insert.rs`・`trigger_dml.rs`）が文全体の
+/// 失敗にする。呼び出し元は redb の表ハンドルを 1 つも開かずに呼ぶこと。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn invoke_after_row(
+    runtime: &TriggerRuntime,
+    writes: &TriggerWriteHandle<'_>,
+    table: &str,
+    schema: &TableSchema,
+    triggers: &[TriggerDef],
+    selected: &[usize],
+    op: TriggerOp,
+    old: Option<&[Value]>,
+    new_row: &[Value],
+) -> Result<(), SqlSurfaceError> {
+    for trigger in selected.iter().filter_map(|i| triggers.get(*i)) {
+        crate::interrupt::check()?;
         let _ignored = runtime.invoke(&TriggerCall {
             trigger_name: &trigger.name,
             function_key: &trigger.function_key,
@@ -223,7 +305,30 @@ pub(crate) fn fire_after_row(
     Ok(())
 }
 
+/// `triggers`（AFTER・ROW のみ。カタログ順）を、変更した 1 行に対して `WHEN` の評価と本体の実行を続けて
+/// 行う（Issue #1724・#1725）。行の変更時に評価してキューへ積む経路は [`select_after_row`] と
+/// [`invoke_after_row`] を使う。INSERT は `old = None`・`new_row` が最終 NEW、UPDATE は `(OLD, 最終 NEW)`、
+/// DELETE は `old = Some` と空の `new_row`。
+#[allow(clippy::too_many_arguments)]
+#[cfg(test)]
+pub(crate) fn fire_after_row(
+    runtime: &TriggerRuntime,
+    writes: &TriggerWriteHandle<'_>,
+    table: &str,
+    schema: &TableSchema,
+    triggers: &[TriggerDef],
+    op: TriggerOp,
+    old: Option<&[Value]>,
+    new_row: &[Value],
+) -> Result<(), SqlSurfaceError> {
+    let selected = select_after_row(runtime, writes, table, schema, triggers, op, old, new_row)?;
+    invoke_after_row(
+        runtime, writes, table, schema, triggers, &selected, op, old, new_row,
+    )
+}
+
 /// `triggers`（INSERT・AFTER・ROW のみ）を、書いた 1 行の最終 NEW に対して順に発火する（Issue #1724）。
+#[cfg(test)]
 pub(crate) fn fire_after_row_insert(
     runtime: &TriggerRuntime,
     writes: &TriggerWriteHandle<'_>,

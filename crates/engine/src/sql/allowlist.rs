@@ -43,7 +43,7 @@ pub(crate) use do_block::{is_do_statement, validate_do_tokens};
 mod trigger;
 pub(crate) use trigger::{
     is_create_trigger_statement, is_drop_trigger_statement, validate_create_trigger_tokens,
-    validate_drop_trigger_tokens,
+    validate_drop_trigger_tokens, validate_when_tokens,
 };
 pub use trigger::{ValidatedCreateTrigger, ValidatedDropTrigger};
 // POLICY DDL の構文検証（RLS-13・Issue #2274）。

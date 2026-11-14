@@ -188,7 +188,7 @@ pub(super) fn update_rows_with_triggers(
     written
         .try_reserve_exact(candidate_ids.len())
         .map_err(|_| reserve_err())?;
-    let mut after_queue: Vec<(Vec<Value>, Vec<Value>)> = Vec::new();
+    let mut after_queue: Vec<(Vec<Value>, Vec<Value>, Vec<usize>)> = Vec::new();
     if !plan.after.is_empty() {
         after_queue
             .try_reserve_exact(candidate_ids.len())
@@ -298,8 +298,22 @@ pub(super) fn update_rows_with_triggers(
             pre_images.record(RowId::from_legacy_id(*id), old_values.clone());
         }
         written.push(RowId::from_legacy_id(*id));
+        // AFTER ROW の WHEN は行の変更時に評価し、TRUE のトリガだけをキューへ積む（D7）。
         if !plan.after.is_empty() {
-            after_queue.push((old_values, final_row));
+            let selected = crate::trigger::fire::select_after_row(
+                plan.runtime,
+                writes,
+                table,
+                schema,
+                &plan.after,
+                TriggerOp::Update,
+                Some(&old_values),
+                &final_row,
+            )
+            .map_err(TenantWriteError::TriggerFailed)?;
+            if !selected.is_empty() {
+                after_queue.push((old_values, final_row, selected));
+            }
         }
     }
     drop(row_loop_guard);
@@ -340,13 +354,14 @@ pub(super) fn update_rows_with_triggers(
         )?;
     }
     // AFTER ROW（段 6）。変更の順 × トリガ名のバイト順。
-    for (old, new) in &after_queue {
-        crate::trigger::fire::fire_after_row(
+    for (old, new, selected) in &after_queue {
+        crate::trigger::fire::invoke_after_row(
             plan.runtime,
             writes,
             table,
             schema,
             &plan.after,
+            selected,
             TriggerOp::Update,
             Some(old),
             new,
@@ -412,7 +427,7 @@ pub(super) fn delete_rows_with_triggers(
     removed
         .try_reserve_exact(candidate_ids.len())
         .map_err(|_| reserve_err())?;
-    let mut after_queue: Vec<Vec<Value>> = Vec::new();
+    let mut after_queue: Vec<(Vec<Value>, Vec<usize>)> = Vec::new();
     if !plan.after.is_empty() {
         after_queue
             .try_reserve_exact(candidate_ids.len())
@@ -464,8 +479,22 @@ pub(super) fn delete_rows_with_triggers(
             removed_pre_images.record(RowId::from_legacy_id(*id), old_values.clone());
         }
         removed.push(RowId::from_legacy_id(*id));
+        // AFTER ROW の WHEN は行の変更時に評価し、TRUE のトリガだけをキューへ積む（D7）。
         if !plan.after.is_empty() {
-            after_queue.push(old_values);
+            let selected = crate::trigger::fire::select_after_row(
+                plan.runtime,
+                writes,
+                table,
+                schema,
+                &plan.after,
+                TriggerOp::Delete,
+                Some(&old_values),
+                &[],
+            )
+            .map_err(TenantWriteError::TriggerFailed)?;
+            if !selected.is_empty() {
+                after_queue.push((old_values, selected));
+            }
         }
     }
     drop(row_loop_guard);
@@ -494,13 +523,14 @@ pub(super) fn delete_rows_with_triggers(
             target.fk_check_mode(),
         )?;
     }
-    for old in &after_queue {
-        crate::trigger::fire::fire_after_row(
+    for (old, selected) in &after_queue {
+        crate::trigger::fire::invoke_after_row(
             plan.runtime,
             writes,
             table,
             schema,
             &plan.after,
+            selected,
             TriggerOp::Delete,
             Some(old),
             &[],
