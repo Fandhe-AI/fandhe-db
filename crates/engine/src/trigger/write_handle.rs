@@ -201,7 +201,8 @@ impl<'a> TriggerWriteHandle<'a> {
     }
 
     /// `table` の行の `DELETE` が参照アクション（`CASCADE`／`SET NULL`／`SET DEFAULT`）で波及しうる表の
-    /// 名前を推移的に集める（`table` 自身は含まない。`NoAction` の FK は波及しない。循環は訪問済みで止める）。
+    /// 名前を集める（`table` 自身は含まない。`NoAction` の FK は波及しない。直接の子は CASCADE・SET NULL・SET DEFAULT
+    /// のいずれでも含め、孫以降へは CASCADE だけ辿る。循環は訪問済みで止める）。
     /// カタログを読めない場合は `Err`（fail-closed）。
     fn cascaded_delete_tables(&self, table: &str) -> Result<Vec<String>, SqlSurfaceError> {
         let mut seen: Vec<String> = vec![table.to_ascii_lowercase()];
@@ -220,7 +221,11 @@ impl<'a> TriggerWriteHandle<'a> {
                 if !seen.contains(&key) {
                     seen.push(key);
                     out.push(child.name.clone());
-                    stack.push(child.name.clone());
+                    // 子孫へ波及するのは CASCADE（子行を削除する）だけ。SET NULL・SET DEFAULT は子行を更新する
+                    // だけで削除しないので、その先の ON DELETE は発火しない。
+                    if matches!(fk.on_delete(), crate::catalog::ReferentialAction::Cascade) {
+                        stack.push(child.name.clone());
+                    }
                 }
             }
         }
@@ -259,6 +264,10 @@ impl<'a> TriggerWriteHandle<'a> {
                 }
                 if is_blocked(&child.name) {
                     return Ok(true);
+                }
+                // 子孫へ辿るのは CASCADE だけ（SET NULL・SET DEFAULT は子行を更新するのみ）。
+                if !matches!(fk.on_delete(), crate::catalog::ReferentialAction::Cascade) {
+                    continue;
                 }
                 let key = child.name.to_ascii_lowercase();
                 if !seen.contains(&key) {

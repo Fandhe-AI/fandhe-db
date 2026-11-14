@@ -725,3 +725,41 @@ fn body_delete_cascade_target_is_checked_by_deferred_foreign_keys() {
     assert!(ints(&core, "t1", "SELECT n FROM tt").is_empty());
     assert_eq!(ints(&core, "t1", "SELECT k FROM gc"), vec![10]);
 }
+
+// Cursor Bugbot 指摘の回帰: `SET NULL` は子行を更新するだけで削除しないので、その先の子孫表の `ON DELETE` は
+// 発火しない。本体の `DELETE` が `SET NULL` 連鎖越しに行ループ中の表へ「届く」扱いで `0A000` にならず、
+// 子孫表の行も変わらない。直接の子（`sc`）への `SET NULL` は従来どおり反映される。
+#[test]
+fn delete_through_set_null_does_not_reach_grandchild_in_a_row_loop() {
+    let (core, _g) = core_with("trgdel-setnull-chain", LedgerMode::Optional);
+    ok(&core, "t1", "CREATE TABLE sp (k BIGINT PRIMARY KEY)");
+    ok(
+        &core,
+        "t1",
+        "CREATE TABLE sc (k BIGINT PRIMARY KEY, pid BIGINT REFERENCES sp ON DELETE SET NULL)",
+    );
+    ok(
+        &core,
+        "t1",
+        "CREATE TABLE sg (n BIGINT, cid BIGINT REFERENCES sc ON DELETE CASCADE)",
+    );
+    ok(&core, "t1", "INSERT INTO sp (k) VALUES (1), (2)");
+    ok(&core, "t1", "INSERT INTO sc (k, pid) VALUES (10, 1)");
+    ok(&core, "t1", "INSERT INTO sg (n, cid) VALUES (100, 10)");
+    create_fn(
+        &core,
+        "t1",
+        "eat_sp",
+        "BEGIN DELETE FROM sp WHERE k = 1; RETURN NEW; END",
+    );
+    // 行ループ中の表は sg。sp の削除は sc を SET NULL するだけで sg には届かない。
+    trigger(&core, "tb", "BEFORE INSERT", "sg", "ROW", "eat_sp");
+    ok(&core, "t1", "INSERT INTO sg (n, cid) VALUES (101, 10)");
+    assert_eq!(
+        sorted(ints(&core, "t1", "SELECT n FROM sg")),
+        vec![100, 101]
+    );
+    assert_eq!(ints(&core, "t1", "SELECT k FROM sc"), vec![10]);
+    assert_eq!(ints(&core, "t1", "SELECT k FROM sp"), vec![2]);
+    assert!(ints(&core, "t1", "SELECT k FROM sc WHERE pid IS NOT NULL").is_empty());
+}
