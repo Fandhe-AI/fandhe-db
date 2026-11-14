@@ -1780,6 +1780,25 @@ fn extended_copy_rejects_a_same_name_relation_created_ahead_in_path_after_bind()
     assert_eq!(e.wire_code(), "0A000");
 }
 
+/// Issue #3197: public の表へ解決した準備済み文は、path から `public` が消えて名前がどの要素にも無くなれば、
+/// Bind だけでなく Describe(S) でも `42P01` になる（public の表の列を公告し続けない）。
+// intentional: docs/design/schema-tenant-namespace.md
+#[test]
+fn extended_query_describe_rejects_miss_after_public_dropped_from_path() {
+    let (core, _g, mut s) = q1_world("sp-ext-describe-miss");
+    assert!(s.bind_resolution_tenant(TENANT));
+    ok(&core, &mut s, "SET search_path TO public");
+    let plain = parse_ext(&core, &s, "SELECT id FROM t LIMIT 5").expect("parse under public");
+    ok(&core, &mut s, "DROP TABLE q1.t");
+    ok(&core, &mut s, "SET search_path TO q1");
+    let e = core
+        .describe_prepared_in_session(&s, &plain)
+        .expect_err("describe must fail on miss");
+    assert_eq!(e.wire_code(), "42P01");
+    let e = run_prepared(&core, &mut s, &plain, &[]).expect_err("bind must fail on miss");
+    assert_eq!(e.wire_code(), "42P01");
+}
+
 /// Issue #3197: 再解決後の結果列は、Parse 時に公告した列と比べる。旧参照先（q1.t）が DROP されても、
 /// 解決先（public.t）の結果列が同じなら通る（現在のカタログから旧側を再導出して常に拒否しない）。
 // intentional: docs/design/schema-tenant-namespace.md

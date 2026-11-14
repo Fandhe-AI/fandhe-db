@@ -2080,7 +2080,7 @@ fn handle_bind_body(
                 let _session_tz_scope =
                     engine::datetime::SessionTimeZoneScope::enter(session.time_zone().clone());
                 engine
-                    .bind_prepared_in_txn(session, txn, prepared, &decoded)
+                    .bind_refreshed_in_txn(session, txn, prepared, &decoded)
                     .map_err(HandlerError::Sql)?
             };
             let columns = engine
@@ -2117,7 +2117,7 @@ fn handle_bind_body(
                 let _session_tz_scope =
                     engine::datetime::SessionTimeZoneScope::enter(session.time_zone().clone());
                 engine
-                    .bind_prepared_in_txn(session, txn, prepared, &[])
+                    .bind_refreshed_in_txn(session, txn, prepared, &[])
                     .map_err(HandlerError::Sql)?
             } else {
                 // 解決結果を使い回す分岐でも、SCHEMA 修飾の USAGE は Bind 時点の ACL で再検査する

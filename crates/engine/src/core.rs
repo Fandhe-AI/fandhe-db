@@ -6744,6 +6744,14 @@ impl EngineCore {
             return Err(e);
         }
         if resolution.rewrites == stamp.rewrites {
+            // 書き換えが空のままでは「public 表への hit」と「どの要素にも無い miss」を区別できない。
+            // `public` が見えない path に変わったときの miss は、Bind と同じ参照ゲートで `42P01` にする
+            // （Describe(S) が public の表の列を公告し続けない）。
+            crate::sql::search_path::check_unqualified_refs(
+                session,
+                &prepared.tokens,
+                &prepared.qualified_positions,
+            )?;
             return Ok(None);
         }
         let reparsed = {
@@ -8556,12 +8564,17 @@ impl EngineCore {
         // `schema.table` のテーブル参照を解決して未修飾の名前（public）または内部キー（テナントの
         // SCHEMA 配下）へ置き換える（TABLE-27・Issue #1714・#1717）。位置推論・型推論・Bind の再
         // parse が同じ（解決済みの）トークン列を見るよう、最初に行う。
-        let probe = |schema: &str| match tenant {
-            Some(t) => self
+        // 明示 Tx の再 Parse（`read_snap` あり）は、`BEGIN` 時点のスナップショットで SCHEMA を解決する
+        // （live の最新カタログで引くと、BEGIN 後の RENAME・DROP SCHEMA と食い違う。Issue #3197）。
+        let probe_snap = path.as_ref().and_then(|p| p.read_snap);
+        let probe = |schema: &str| match (tenant, probe_snap) {
+            (Some(t), Some(snap)) => crate::catalog::namespace::schema_id_in_txn(snap, t, schema)
+                .map_err(crate::catalog::table_lookup_error),
+            (Some(t), None) => self
                 .storage
                 .schema_id(t, schema)
                 .map_err(crate::catalog::table_lookup_error),
-            None => Ok(None),
+            (None, _) => Ok(None),
         };
         let resolver: Option<crate::sql::relation_name::SchemaResolver<'_>> =
             tenant.map(|_| &probe as crate::sql::relation_name::SchemaResolver<'_>);

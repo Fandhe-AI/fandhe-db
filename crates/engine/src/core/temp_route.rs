@@ -965,7 +965,7 @@ impl EngineCore {
         prepared: &super::PreparedSql,
         values: &[Option<Vec<u8>>],
     ) -> Result<ParsedSql, SqlSurfaceError> {
-        self.bind_prepared_in_session_snap(session, prepared, values, None)
+        self.bind_prepared_in_session_snap(session, prepared, values, None, true)
     }
 
     /// [`Self::bind_prepared_in_session`] の明示トランザクション対応版（拡張クエリの Bind。Issue #2403）。
@@ -978,6 +978,31 @@ impl EngineCore {
         prepared: &super::PreparedSql,
         values: &[Option<Vec<u8>>],
     ) -> Result<ParsedSql, SqlSurfaceError> {
+        self.bind_prepared_in_txn_impl(session, txn, prepared, values, true)
+    }
+
+    /// [`Self::bind_prepared_in_txn`] の再解決なし版（Issue #3197）。呼び出し元が
+    /// [`crate::core::EngineCore::refresh_prepared_in_txn`] で解決し直した文を渡す入口で、Bind の中で再度 refresh しない。
+    /// 検査・束縛・関係の同一性・portal の保持が同じ 1 回の解決結果を見る（refresh を 2 回挟むと、その間に別接続が
+    /// path 前方へ同名の関係を作った場合に、同一性検査の対象と実際の束縛先が食い違う）。
+    pub fn bind_refreshed_in_txn(
+        &self,
+        session: &SessionState,
+        txn: &crate::sql::transaction::SessionTransaction<'_>,
+        prepared: &super::PreparedSql,
+        values: &[Option<Vec<u8>>],
+    ) -> Result<ParsedSql, SqlSurfaceError> {
+        self.bind_prepared_in_txn_impl(session, txn, prepared, values, false)
+    }
+
+    fn bind_prepared_in_txn_impl(
+        &self,
+        session: &SessionState,
+        txn: &crate::sql::transaction::SessionTransaction<'_>,
+        prepared: &super::PreparedSql,
+        values: &[Option<Vec<u8>>],
+        refresh: bool,
+    ) -> Result<ParsedSql, SqlSurfaceError> {
         let read_snap = if txn.status() == crate::sql::transaction::TransactionStatus::InTransaction
         {
             match txn.read_source()? {
@@ -987,7 +1012,7 @@ impl EngineCore {
         } else {
             None
         };
-        self.bind_prepared_in_session_snap(session, prepared, values, read_snap)
+        self.bind_prepared_in_session_snap(session, prepared, values, read_snap, refresh)
     }
 
     /// portal の Execute 直前の読み取り権限の再検査（SQL-40・Issue #1967）。拡張クエリの Execute が、
@@ -1154,6 +1179,7 @@ impl EngineCore {
         prepared: &super::PreparedSql,
         values: &[Option<Vec<u8>>],
         read_snap: Option<&redb::ReadTransaction>,
+        refresh: bool,
     ) -> Result<ParsedSql, SqlSurfaceError> {
         let temp = session.temp_tables();
         match &prepared.route {
@@ -1188,7 +1214,12 @@ impl EngineCore {
                 )?;
                 // Issue #3197: Parse 後に変わった path・カタログで解決し直す（解決が変わっていれば再 Parse した
                 // 文を使う。以降の検査・束縛は解決後の文に対して行う）。
-                let refreshed = self.refresh_prepared_snap(session, prepared, read_snap)?;
+                // `refresh == false` は呼び出し元が解決済みの文を渡した入口（二重解決を避ける）。
+                let refreshed = if refresh {
+                    self.refresh_prepared_snap(session, prepared, read_snap)?
+                } else {
+                    None
+                };
                 let prepared = refreshed.as_ref().unwrap_or(prepared);
                 // `public` が見えない `search_path` では、Parse 後に変わった path でも一時表以外の
                 // 未修飾名を `42P01` にする（TABLE-27・Issue #1715。既定の path では何もしない）。
