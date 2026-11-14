@@ -320,3 +320,41 @@ fn search_path_creation_target_requires_usage() {
         .expect_err("denied");
     assert_eq!(err.wire_code(), "42501");
 }
+/// Issue #3196: 未修飾名を path で解決した作成は内部キーで `require_creation_target` に届く。USAGE の無い
+/// 束縛ロールは、飛ばされず `42501`（CREATE の検査の前に USAGE を見る。多層防御）。USAGE を付けても
+/// CREATE が無ければ `42501`、両方付けると通る。裸の名前のまま path 先頭が SCHEMA になる形は `0A000`。
+#[test]
+fn path_resolved_creation_requires_usage_and_create() {
+    let (core, _g, mut o, a) = fixture("sacl_ct_key");
+    let id = core
+        .storage
+        .schema_id("t1", "s")
+        .expect("lookup")
+        .expect("schema s exists");
+    let key = crate::catalog::namespace::RelationKey::InSchema {
+        schema_id: id,
+        name: "x".to_string(),
+    }
+    .encode();
+    let denied = |core: &EngineCore| {
+        core.require_creation_target(&ctx("t1"), &a, false, &key)
+            .expect_err("denied")
+            .wire_code()
+    };
+    assert_eq!(denied(&core), "42501");
+    ok(&core, "t1", &mut o, "GRANT USAGE ON SCHEMA s TO alice");
+    assert_eq!(denied(&core), "42501");
+    ok(&core, "t1", &mut o, "GRANT CREATE ON SCHEMA s TO alice");
+    assert!(core
+        .require_creation_target(&ctx("t1"), &a, false, &key)
+        .is_ok());
+    // 裸の名前のまま届き、作成先が SCHEMA になる形は public へ黙って作らず `0A000`。
+    let mut a2 = a.clone();
+    ok(&core, "t1", &mut a2, "SET search_path = s, public");
+    assert_eq!(
+        core.require_creation_target(&ctx("t1"), &a2, false, "x")
+            .expect_err("bare")
+            .wire_code(),
+        "0A000"
+    );
+}

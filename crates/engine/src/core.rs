@@ -6125,21 +6125,21 @@ impl EngineCore {
 
     /// `creation_target` 用の probe。自テナントに在る SCHEMA に USAGE が無ければ `42501`（飛ばさない。
     /// 他テナント・不在は `false` で、権限の有無が存在オラクルにならない。Issue #2234、設計記録 K4）。
-    fn schema_exists_requiring_usage(
+    fn schema_id_requiring_usage(
         &self,
         ctx: &PolicyContext,
         session: &crate::sql::mode::SessionState,
         schema: &str,
-    ) -> Result<bool, crate::sql::allowlist::SqlSurfaceError> {
+    ) -> Result<Option<u64>, crate::sql::allowlist::SqlSurfaceError> {
         let Some(id) = self
             .storage
             .schema_id(ctx.tenant_id(), schema)
             .map_err(crate::catalog::table_lookup_error)?
         else {
-            return Ok(false);
+            return Ok(None);
         };
         self.check_schema_usage_for(ctx.tenant_id(), session, id)?;
-        Ok(true)
+        Ok(Some(id))
     }
 
     /// 新規作成する relation の所有者として、束縛中のロールを作成と同じ write txn で書くよう予約する
@@ -6192,12 +6192,14 @@ impl EngineCore {
         // `schema.name` で明示修飾された作成（解決済みの内部キー `#<id>.<name>`。キーを作れるのは
         // 名前解決器だけ）は作成先が文中で確定しているので、`search_path` による作成先判定を飛ばす。
         if created_name.starts_with('#') {
-            // 作成先が SCHEMA で確定している作成は CREATE 権限を検査する（Issue #2234、設計記録 K5）。
+            // 作成先が SCHEMA で確定している作成は USAGE と CREATE 権限を検査する（Issue #2234、設計記録 K5。
+            // 未修飾名を path で解決した作成〔Issue #3196〕も同じ内部キーで来る。USAGE は多層防御）。
             // `ServerDdl` ゲートが必要条件として先に通るため現時点では所有者相当だけが来て観測上は
             // 変わらない。置き換えは所有者の機構（#2236）・認証主体の束縛（#1971）の後。
             if let Ok(crate::catalog::namespace::RelationKey::InSchema { schema_id, .. }) =
                 crate::catalog::namespace::RelationKey::parse(created_name)
             {
+                self.check_schema_usage_for(ctx.tenant_id(), session, schema_id)?;
                 crate::sql::schema_privilege::check_schema_create(session, &|role| {
                     self.storage
                         .schema_privileges(ctx.tenant_id(), schema_id, &[role])
@@ -6210,8 +6212,18 @@ impl EngineCore {
             return Ok(());
         }
         // 作成先の判定では、path 上の USAGE の無い SCHEMA を飛ばさず `42501` にする（受入基準。K4）。
-        let probe = |schema: &str| self.schema_exists_requiring_usage(ctx, session, schema);
-        crate::sql::search_path::creation_target(session, &probe).map(|_| ())
+        // ここへ裸の名前のまま届いて作成先が自テナントの SCHEMA になるのは、解析時の書き換えを通らない経路
+        // （構文語と衝突する名前・`CREATE TYPE`・`CREATE MATERIALIZED VIEW`・解析と実行の間の SCHEMA 作成の
+        // 競合）。`public` へ黙って作らないよう、固定文言の `0A000` にする（fail-closed）。
+        let probe = |schema: &str| self.schema_id_requiring_usage(ctx, session, schema);
+        match crate::sql::search_path::creation_target(session, &probe)? {
+            crate::sql::search_path::CreateTarget::Public => Ok(()),
+            crate::sql::search_path::CreateTarget::Schema(_) => Err(
+                crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
+                    "creating relations inside a schema is not supported for this statement",
+                ),
+            ),
+        }
     }
 
     /// [`Self::reclassify_write_to_view_error`] の文種別つき版（TABLE-43 (3)・Issue #1670）。
@@ -6507,6 +6519,22 @@ impl EngineCore {
                 }
             })
         };
+        // 作成先の照会（Issue #3196）。USAGE の無い自テナントの SCHEMA は飛ばさず `42501`、他テナント・不在は
+        // `None`（権限の有無が存在オラクルにならない。設計記録 K4）。
+        let creation_schema_id = |name: &str| {
+            with_snap(&|snap| {
+                let Some(id) = crate::catalog::namespace::schema_id_in_txn(snap, tenant, name)
+                    .map_err(crate::catalog::table_lookup_error)?
+                else {
+                    return Ok(None);
+                };
+                crate::sql::schema_privilege::check_schema_usage(session, &|role| {
+                    crate::catalog::privilege::schema_privileges_in_txn(snap, tenant, id, &[role])
+                        .map_err(crate::catalog::table_lookup_error)
+                })?;
+                Ok(Some(id))
+            })
+        };
         let exists = |key: &str, kind: NameKind| {
             let probe = |src: &redb::ReadTransaction| match kind {
                 NameKind::Relation => crate::catalog::relation_or_sequence_exists_in(src, key),
@@ -6529,6 +6557,7 @@ impl EngineCore {
         };
         f(&crate::sql::search_path::PathLookup {
             schema_id: &schema_id,
+            creation_schema_id: &creation_schema_id,
             exists: &exists,
         })
     }
@@ -6547,27 +6576,21 @@ impl EngineCore {
             return Ok(PathGate::default());
         }
         let resolution = self.with_search_path_lookup(tenant, session, read_snap, |lookup| {
-            crate::sql::search_path::resolve_path_refs(session, tokens, &[], lookup)
+            crate::sql::search_path::resolve_statement_refs(session, tokens, &[], lookup)
         })?;
-        let read_head = Self::is_read_head(tokens);
-        let mut gate = PathGate {
+        let gate = PathGate {
             deferred: resolution.deferred_error,
-            read_head,
             relation_in_schema: resolution.relation_in_schema,
-            detected_unsupported: false,
+            set_schema: PathGate::is_set_schema_statement(tokens),
         };
-        if read_head {
-            crate::sql::search_path::apply_rewrites(tokens, resolution.rewrites);
-        } else {
-            gate.detected_unsupported = !resolution.rewrites.is_empty();
-        }
+        crate::sql::search_path::apply_rewrites(tokens, resolution.rewrites);
         Ok(gate)
     }
 
     /// 拡張クエリの Parse・Bind・Describe と `COPY` が、未修飾名が `search_path` で自テナントの SCHEMA に
     /// 解決される形を検出して固定文言の `0A000` にする（Issue #3195）。解決した内部キーを、path の世代が
     /// 変わった後の Bind・Describe で使い回したり、`COPY` が public 側へ黙って向いたりしないための
-    /// fail-closed の安全弁で、書き換えはしない（再解決は準備済み文: #3197、`COPY`: #3196）。
+    /// fail-closed の安全弁で、書き換えはしない（再解決は準備済み文: #3197）。
     /// `skip` は準備済み文で `public.` 修飾を外した位置。`tenant` が無い（未束縛の）入口は何もしない。
     pub(crate) fn reject_path_resolved_refs(
         &self,
@@ -6617,20 +6640,6 @@ impl EngineCore {
             &prepared.qualified_positions,
             read_snap,
         )
-    }
-
-    /// 読み取り先頭の文か（未修飾名を書き換えて解析してよい形。それ以外は検出だけ。Issue #3195）。
-    fn is_read_head(tokens: &[crate::sql::lexer::Token]) -> bool {
-        match tokens.first() {
-            Some(crate::sql::lexer::Token::Keyword(crate::sql::lexer::Keyword::Select)) => true,
-            Some(crate::sql::lexer::Token::Punct('(')) => true,
-            Some(crate::sql::lexer::Token::Ident(w)) => {
-                ["WITH", "VALUES", "TABLE", "EXPLAIN", "DECLARE"]
-                    .iter()
-                    .any(|k| w.eq_ignore_ascii_case(k))
-            }
-            _ => false,
-        }
     }
 
     /// [`Self::parse_tokens_gated`] の構文解析部（未束縛 `GRANT`／`REVOKE` のエラー正規化を持つ）。
@@ -17296,8 +17305,13 @@ impl EngineCore {
             return Ok(plan);
         }
         let resolver = self.schema_resolver_for(ctx, session);
-        let copy_tokens =
-            crate::sql::relation_name::tokenize_resolved_with(sql, false, Some(&resolver))?;
+        // 未修飾名の解決は修飾名の解決より前（明示修飾 `public.t` を再解決しない。Issue #3196）。
+        let copy_tokens = crate::sql::relation_name::tokenize_resolved_with_pre(
+            sql,
+            false,
+            Some(&resolver),
+            |t| self.resolve_copy_tokens_path(ctx.tenant_id(), session, t, None),
+        )?;
         let stmt = crate::sql::allowlist::validate_copy_tokens(
             &copy_tokens,
             &self.storage,
@@ -17321,8 +17335,9 @@ impl EngineCore {
     /// 実効 path に `public` が含まれる既定のセッションは字句解析もしない。字句解析に失敗する入力は
     /// 通常の検証へ任せる。
     ///
-    /// Issue #3195: 未修飾の参照が `search_path` で自テナントの SCHEMA に解決される形は、`COPY` の実行が
-    /// その SCHEMA を扱えない（受け皿は #3196）ため、public 側へ黙って向けず固定文言の `0A000` にする。
+    /// Issue #3196: 未修飾の参照が `search_path` で自テナントの SCHEMA に解決される形は、内部キーへ置き換えた
+    /// 字句列に対してゲートを掛ける（解決された名前は `42P01` にならない）。実行に渡す字句列への書き換えは
+    /// [`Self::resolve_copy_tokens_path`] が行う。
     fn check_copy_search_path(
         &self,
         ctx: &PolicyContext,
@@ -17333,14 +17348,38 @@ impl EngineCore {
         if !(session.search_path_hides_public() || session.search_path_may_hold_tenant_schema()) {
             return Ok(());
         }
-        let Ok(tokens) = crate::sql::lexer::tokenize_marked(sql) else {
+        let Ok(mut tokens) = crate::sql::lexer::tokenize_marked(sql) else {
             return Ok(());
         };
-        self.reject_path_resolved_refs(Some(ctx.tenant_id()), session, &tokens, &[], read_snap)?;
+        self.resolve_copy_tokens_path(ctx.tenant_id(), session, &mut tokens, read_snap)?;
         if !session.search_path_hides_public() {
             return Ok(());
         }
         crate::sql::search_path::check_unqualified_refs(session, &tokens, &[])
+    }
+
+    /// `COPY` の字句列の未修飾名を `search_path` で解決し、自テナントの SCHEMA に解決される位置を内部キーへ
+    /// 置き換える（修飾名 `q1.t` の解決後と同じ形。Issue #3196）。一時表は最優先で解決しない。解決エラー
+    /// （`public` が隠れた path で見つからない SEQUENCE 引数）は返す。`read_snap` は明示 Tx の `BEGIN` 時点の
+    /// スナップショット（無ければ文ごとの確定済みスナップショット）。
+    fn resolve_copy_tokens_path(
+        &self,
+        tenant: &str,
+        session: &crate::sql::mode::SessionState,
+        tokens: &mut [crate::sql::lexer::Token],
+        read_snap: Option<&redb::ReadTransaction>,
+    ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+        if !(session.search_path_may_hold_tenant_schema() || session.search_path_hides_public()) {
+            return Ok(());
+        }
+        let resolution = self.with_search_path_lookup(tenant, session, read_snap, |lookup| {
+            crate::sql::search_path::resolve_path_refs(session, tokens, &[], lookup)
+        })?;
+        if let Some(e) = resolution.deferred_error {
+            return Err(e);
+        }
+        crate::sql::search_path::apply_rewrites(tokens, resolution.rewrites);
+        Ok(())
     }
 
     /// `begin_copy_unscrubbed` の公開入口。判定順序・エラー契約・実行結果は同関数と同一で、
@@ -17515,8 +17554,24 @@ impl EngineCore {
             return Ok(plan);
         }
         let resolver = self.schema_resolver_for(ctx, session);
-        let copy_tokens =
-            crate::sql::relation_name::tokenize_resolved_with(sql, false, Some(&resolver))?;
+        // 未修飾名の解決は修飾名の解決より前（明示修飾 `public.t` を再解決しない。Issue #3196）。
+        let copy_tokens = {
+            let snap = if txn.status() == crate::sql::transaction::TransactionStatus::InTransaction
+            {
+                match txn.read_source()? {
+                    crate::sql::transaction::TxnReadSource::BeginSnapshot(snap) => Some(snap),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            crate::sql::relation_name::tokenize_resolved_with_pre(
+                sql,
+                false,
+                Some(&resolver),
+                |t| self.resolve_copy_tokens_path(ctx.tenant_id(), session, t, snap),
+            )?
+        };
         // `COPY FROM`（書き込み）の検証・schema lookup は読み取りではないので読み取り集合へ記録しない
         // （記録すると write-only の COPY が先行 read 扱いになり、BEGIN 後の可視 commit で `40001` に
         // なる。#2405。`LOCK TABLE` の存在確認・INSERT の writer 先取りと同じ扱い）。関数末尾まで有効。
@@ -21471,17 +21526,15 @@ impl VectorCore for EngineCore {
     }
 }
 /// 未修飾名の `search_path` 解決（[`EngineCore::resolve_search_path_for_statement`]）の、解析後に判定する結果
-/// （Issue #3195）。判定順は構文 `42601` → 解決エラー（`42P01`）→ 未対応形の `0A000` → その他。
+/// （Issue #3195・#3196）。判定順は構文 `42601` → 解決エラー（`42P01`）→ SET SCHEMA の `0A000` → その他。
 #[derive(Debug, Default)]
 struct PathGate {
     /// `42601` に劣後して返す解決エラー。
     deferred: Option<crate::sql::allowlist::SqlSurfaceError>,
-    /// 書き換えて解析した読み取り先頭の文か。
-    read_head: bool,
     /// 関係位置の参照が自テナントの SCHEMA に解決されたか。
     relation_in_schema: bool,
-    /// 読み取り以外の文で、SCHEMA に解決される参照を検出したか（作成先・DML の対象の解決は #3196）。
-    detected_unsupported: bool,
+    /// `ALTER .. SET SCHEMA ..` の文か（未修飾の対象が SCHEMA に解決されたら `0A000`。tracked: #3198）。
+    set_schema: bool,
 }
 
 impl PathGate {
@@ -21493,8 +21546,9 @@ impl PathGate {
     }
 
     /// 解析結果へ解決の判定を重ねる。構文エラー `42601` は常に優先し、解決エラー、未対応形の順で続く。
-    /// 読み取り先頭の文でも、解析の結果が読み取りではない（データ変更 CTE・`EXPLAIN` の DML 等）のに
-    /// SCHEMA へ書き換えていれば `0A000`（public 側を黙って読み書きさせない。fail-closed）。
+    /// 未修飾名は修飾名と同じ内部キーへ書き換え済みなので、受理・拒否は修飾形と同じになる。例外は、
+    /// 未修飾の対象が SCHEMA に解決された `ALTER TABLE .. SET SCHEMA`（テナント SCHEMA 間の移動は
+    /// tracked: #3198）で、修飾形の `42501` に先回りせず固定文言の `0A000` にする（fail-closed）。
     fn finish(
         self,
         parsed: Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError>,
@@ -21507,20 +21561,21 @@ impl PathGate {
         if let Some(e) = self.deferred {
             return Err(e);
         }
-        if self.detected_unsupported {
-            return Err(Self::unsupported());
-        }
         let parsed = parsed?;
-        if self.read_head
-            && self.relation_in_schema
-            && matches!(
-                crate::sql::privilege_gate::read::classify(&parsed),
-                crate::sql::privilege_gate::read::ReadRequirement::NotApplicable
-            )
-        {
+        if self.relation_in_schema && self.set_schema {
             return Err(Self::unsupported());
         }
         Ok(parsed)
+    }
+
+    /// 文が `ALTER .. SET SCHEMA ..` の形か（字句だけで判定する。保守的で、誤検出は拒否側）。
+    fn is_set_schema_statement(tokens: &[crate::sql::lexer::Token]) -> bool {
+        use crate::sql::lexer::Token;
+        let word = |t: Option<&Token>, k: &str| matches!(t, Some(Token::Ident(w)) if w.eq_ignore_ascii_case(k));
+        word(tokens.first(), "ALTER")
+            && tokens
+                .windows(2)
+                .any(|w| word(w.first(), "SET") && word(w.get(1), "SCHEMA"))
     }
 }
 
