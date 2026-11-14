@@ -1037,7 +1037,7 @@ Issue #2228 の内部 API（`invoke_trigger_function_in_txn`）は両方を要�
 - 本体は発火のたびに解析・検証する（キャッシュなし。性能は本 Issue の対象外）
 - 入れ子のトリガ間の `ExecBudget` の合算（D11）は、`run_trigger_with_handle` が作る `ExecBudget` が、外側の予算が生きている間
   `interp.rs` の共有カウンタへ文数・反復数を合算する（テストでの固定は受け皿の Issue が無い。要対応事項）
-- 既定の差し替え・wire 経由の E2E は #3185、RLS・台帳・crash の網羅的な再検証は #3188
+- 既定の差し替え・wire 経由の E2E は #3185、RLS・台帳・crash の網羅的な再検証は #3188 で実施済み（[trigger-ledger-consistency.md](trigger-ledger-consistency.md)）
 
 ## Issue #3185 追記（既定 invoker の本番への差し替えと INSERT 発火の E2E。TABLE-45・SQL-68・RLS-10 ポインタ）
 
@@ -1051,7 +1051,7 @@ Issue #3184 節の「#3185 の担当」はこれで解消した。
 - セッションを持たない入口からの発火は、主体の写しが無いため固定文言の `0A000` のまま（fail-closed）。
 - 経路ガード（D8）・本体の未対応形（#3186・#3187 ほか）の `0A000` は変えない。
 - 検証: `tests/table_rls/table45_trigger_fire.rs`（公開 API のみ）・`wire_sql/wire_trigger_fire.rs`（簡易・拡張クエリ、
-  末尾 `;` 付き単独文を含む）。台帳・RLS 越境・crash の網羅的な再検証は #3188。
+  末尾 `;` 付き単独文を含む）。台帳・RLS 越境・crash の網羅的な再検証は #3188 で実施済み。
 
 ## Issue #3186 追記（トリガ本体の `UPDATE`。TABLE-45・SQL-68・RLS-10・SQL-19 ポインタ）
 
@@ -1085,7 +1085,7 @@ AFTER STATEMENT からの同表 `UPDATE` は許す。入れ子（BEFORE UPDATE O
 - 本体の `UPDATE ... RETURNING`・`UPDATE ... FROM`・ビュー・一時表・SCHEMA 修飾の書き込み先は `0A000`（受け皿の Issue は無い）
 - SCHEMA 修飾の書き込み先は、関数定義時の埋め込み SQL の検証で拒否される場合がある（実行時の拒否は多重防御）
 - 一時表を持つ発火元セッションからの本体 `UPDATE` の `0A000` 固定テストは未整備（解析段で一時表の経路に振り分けられ、許可リストに無い）
-- wire・psql 経由の E2E は #3185、RLS・台帳・crash の網羅的な再検証は #3188
+- wire・psql 経由の E2E は #3185、RLS・台帳・crash の網羅的な再検証は #3188 で実施済み（[trigger-ledger-consistency.md](trigger-ledger-consistency.md)）
 
 ## Issue #3187 追記（トリガ本体の `DELETE` と表を読む `SELECT`。TABLE-45・SQL-68・RLS-10 ポインタ）
 
@@ -1114,4 +1114,4 @@ BEFORE STATEMENT・ループ後の AFTER ROW・AFTER STATEMENT・別表への `D
 
 - 同じ表の行ループ中の本体 `DELETE` は `0A000`（BEFORE INSERT で同じ表の既存行を消す「置換」パターンを含む）
 - `DELETE ... RETURNING`・`USING`・ビュー・データ変更 CTE・一時表・SCHEMA 修飾の対象のトリガ本体での対応（受け皿の Issue は無い。要対応事項）
-- 本体 `UPDATE` は #3186、wire 経由の E2E は #3185、RLS・台帳・crash の網羅的な再検証は #3188
+- 本体 `UPDATE` は #3186、wire 経由の E2E は #3185、RLS・台帳・crash の網羅的な再検証は #3188 で実施済み（[trigger-ledger-consistency.md](trigger-ledger-consistency.md)）
