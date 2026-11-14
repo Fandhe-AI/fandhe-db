@@ -7630,6 +7630,8 @@ impl EngineCore {
                     // 独立した `NEW` の列なので不要。実行段（トリガ有無の確定後）へ回す（トリガが無ければ実行段の
                     // 書き換えが同じ拒否を返す）。
                     Err(crate::sql::allowlist::SqlSurfaceError::DuplicateColumn { .. }) => {}
+                    // 疑似列 `id` を別名で公開する写像の拒否（`0A000`）も自動書き換え固有。実行段へ回す。
+                    Err(e) if crate::sql::view_insert::is_id_alias_rejection(&e) => {}
                     Err(e) => return Err(e),
                 }
                 return Ok(ParsedSql::ViewInsert(view_stmt));
@@ -7748,6 +7750,8 @@ impl EngineCore {
                     Err(e) if crate::sql::view_dml::is_where_subquery_rejection(&e) => {}
                     // 写像先の重複（`42701`）も同様に実行段へ回す（INSERT の腕と同じ理由）。
                     Err(crate::sql::allowlist::SqlSurfaceError::DuplicateColumn { .. }) => {}
+                    // 疑似列 `id` を別名で公開する写像の拒否（`0A000`）も自動書き換え固有。実行段へ回す。
+                    Err(e) if crate::sql::view_insert::is_id_alias_rejection(&e) => {}
                     Err(e) => return Err(e),
                 }
                 return Ok(ParsedSql::ViewDelete(view_stmt));
@@ -7825,6 +7829,8 @@ impl EngineCore {
                     Err(e) if crate::sql::view_dml::is_where_subquery_rejection(&e) => {}
                     // 写像先の重複（`42701`）も同様に実行段へ回す（INSERT の腕と同じ理由）。
                     Err(crate::sql::allowlist::SqlSurfaceError::DuplicateColumn { .. }) => {}
+                    // 疑似列 `id` を別名で公開する写像の拒否（`0A000`）も自動書き換え固有。実行段へ回す。
+                    Err(e) if crate::sql::view_insert::is_id_alias_rejection(&e) => {}
                     Err(e) => return Err(e),
                 }
                 return Ok(ParsedSql::ViewUpdate(view_stmt));

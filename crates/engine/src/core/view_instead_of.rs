@@ -185,6 +185,15 @@ impl EngineCore {
     ) -> Result<(SqlOutcome, Vec<String>), SqlSurfaceError> {
         Self::reject_unsupported_instead_of_form(&stmt)?;
         let view_key = stmt.view_name().to_string();
+        let recheck = crate::sql::privilege_gate::write::RelationPrivilegeRecheck::for_session(
+            session,
+            ctx.tenant_id(),
+            match &stmt {
+                InsteadOfStmt::Insert(_) => crate::catalog::privilege::PRIV_INSERT,
+                InsteadOfStmt::Update(_) => crate::catalog::privilege::PRIV_UPDATE,
+                InsteadOfStmt::Delete(_) => crate::catalog::privilege::PRIV_DELETE,
+            },
+        );
         match mode {
             InsteadOfMode::Autocommit => {
                 // 書き込みゲート（単一ライタ）を取ってからビューの行型を導く（カタログが書き込み中に変わらない。
@@ -194,6 +203,9 @@ impl EngineCore {
                     .begin_write_txn()
                     .map_err(crate::catalog::convert_storage_error)
                     .map_err(instead_of_catalog_error)?;
+                // Parse 後・書き込みゲート取得前の REVOKE を書き込みの直前に検出する（他の DML 経路と同じ。
+                // 照会失敗も拒否側。fail-closed）。要求ビットは書き込み権限のみ（OLD 行の内部取得は SELECT を要求しない）。
+                Self::recheck_view_write_privilege(recheck.as_ref(), &write_txn, &view_key)?;
                 let schema = self.instead_of_view_schema(session, &view_key)?;
                 let (outcome, tables) = self
                     .run_instead_of(&write_txn, false, ctx, session, &stmt, &view_key, &schema)?;
@@ -209,10 +221,26 @@ impl EngineCore {
                 Ok((outcome, tables))
             }
             InsteadOfMode::InTxn(write_txn) => {
+                Self::recheck_view_write_privilege(recheck.as_ref(), write_txn, &view_key)?;
                 let schema = self.instead_of_view_schema(session, &view_key)?;
                 self.run_instead_of(write_txn, true, ctx, session, &stmt, &view_key, &schema)
             }
         }
+    }
+
+    /// 書き込み txn の内側で、ビューへの書き込み権限（INSERT／UPDATE／DELETE のいずれか 1 ビット）を再判定する。
+    /// `recheck` が `None`（未束縛・運用者権限）なら従来どおり何もしない。権限不足・照会失敗は `42501` 系の
+    /// 固定拒否（他テナントの情報を含めない）。
+    fn recheck_view_write_privilege(
+        recheck: Option<&crate::sql::privilege_gate::write::RelationPrivilegeRecheck>,
+        write_txn: &redb::WriteTransaction,
+        view_key: &str,
+    ) -> Result<(), SqlSurfaceError> {
+        if let Some(r) = recheck {
+            r.check_in_txn(write_txn, &[view_key.to_string()])
+                .map_err(|()| SqlSurfaceError::RelationPermissionDenied)?;
+        }
+        Ok(())
     }
 
     /// D4: 初版で対応しない形を固定文言の `0A000` で拒否する（`RETURNING`・`ON CONFLICT`・`PARTITIONED`・
@@ -468,12 +496,15 @@ impl EngineCore {
             tokens.push(Token::Keyword(Keyword::Where));
             tokens.extend(where_tail.iter().cloned());
         }
-        // 通常の SELECT と同じ入口（SCHEMA 解決器・`search_path` の書き換え・現在ロールの SELECT 権限ゲート）で
-        // 解析する。`parse_tokens`（ゲートなし・解決器なし）だと `WHERE` 内サブクエリの参照先が権限ゲートを
-        // 通らず、解決器が要る名前は `3F000` になる。権限不足は固定文言の `42501`。
+        // OLD 行の取得は内部処理であり、利用者の権限検査は元の DML 文の入口（書き込み先ビューの
+        // INSERT／UPDATE／DELETE ビットと `WHERE` 内サブクエリ参照先の SELECT）で済んでいる。ここで通常の
+        // SELECT ゲート（ビューへの SELECT 権限・全列要求）を通すと、DELETE／UPDATE 権限だけの主体や列単位付与が
+        // 元の文が読まない列まで要求されて `42501` になるため、ゲートなしの解析入口を使う。SCHEMA 解決器・一時カタログ
+        // の扱いは通常入口と同じ。ビュー本文は呼び出しセッション自身の `PolicyContext` で評価する（RLS-10 (b)）。
         let parsed = {
             let resolver = self.schema_resolver_for(ctx, session);
-            self.parse_tokens_gated(tokens, session, ctx.tenant_id(), Some(&resolver), None)?
+            let hits = crate::sql::temp_catalog::RelationHits::default();
+            self.parse_tokens_gated_grant_aware(tokens, session, Some(&resolver), None, &hits)?
         };
         let stmt = match parsed {
             ParsedSql::Statement(stmt) => stmt,

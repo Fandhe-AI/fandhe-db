@@ -32,6 +32,19 @@ use super::exec::ColumnMeta;
 use super::view::{resolve_from, Resolved};
 use super::view_updatable::{view_updatability, ViewUpdatability};
 
+/// 別名で疑似列 `id` へ写る公開名への書き込みの拒否文言（自動書き換え固有。INSTEAD OF トリガ経路では
+/// 公開名は `NEW`／`OLD` の独立した列なので不要）。
+const ID_ALIAS_WRITE_UNSUPPORTED: &str =
+    "writing to a view column aliased to the row id is not supported";
+
+/// `e` が [`ID_ALIAS_WRITE_UNSUPPORTED`] か。構文解析段は、この拒否を実行段（トリガ有無の確定後）へ回す
+/// （トリガが無ければ実行段の書き換えが同じ拒否を返す）。
+pub(crate) fn is_id_alias_rejection(e: &SqlSurfaceError) -> bool {
+    matches!(e, SqlSurfaceError::FeatureNotSupported { detail }
+        if detail == ID_ALIAS_WRITE_UNSUPPORTED
+            || detail == crate::sql::view_dml::ID_USER_COLUMN_WHERE_UNSUPPORTED)
+}
+
 /// 書き換え結果。
 #[derive(Debug)]
 pub(crate) struct RewrittenViewInsert {
@@ -332,7 +345,7 @@ impl Mapper<'_> {
         };
         if !self.base_allocated && physical == "id" && public != "id" {
             return Err(SqlSurfaceError::feature_not_supported(
-                "writing to a view column aliased to the row id is not supported",
+                ID_ALIAS_WRITE_UNSUPPORTED,
             ));
         }
         Ok(physical)

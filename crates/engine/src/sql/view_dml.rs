@@ -139,6 +139,10 @@ fn reject_partitioned() -> SqlSurfaceError {
 const WHERE_SUBQUERY_UNSUPPORTED: &str =
     "subquery in WHERE is not supported for DML through a view";
 
+/// 利用者列を公開名 `id` で公開するビューの単一行形（`WHERE id = <n>`）の拒否文言（自動書き換え固有）。
+pub(crate) const ID_USER_COLUMN_WHERE_UNSUPPORTED: &str =
+    "WHERE id = <n> on a view that exposes a user column as id is not supported";
+
 /// `e` が [`merge_predicates`] の `WHERE` 内サブクエリ拒否か。構文解析段は、この拒否を実行段へ回す
 /// （トリガの有無は書き込みテナントの scope の確定済みカタログでしか決まらず、トリガが有れば自動書き換えの
 /// 検証は不要なため。トリガが無ければ実行段の書き換えが同じ拒否を返す）。
@@ -197,7 +201,7 @@ fn rewrite_id_form(
     }
     if rv.exposes_user_column_as_id() {
         return Err(SqlSurfaceError::feature_not_supported(
-            "WHERE id = <n> on a view that exposes a user column as id is not supported",
+            ID_USER_COLUMN_WHERE_UNSUPPORTED,
         ));
     }
     // 基表が採番方式（暗黙の `id` を持たない。TABLE-23・Issue #2199）なら、`id` は基表の通常の列なので
