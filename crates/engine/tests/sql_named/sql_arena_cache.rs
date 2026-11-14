@@ -544,3 +544,145 @@ fn hybrid_scalar_projection_cache_hit_takes_borrowed_fast_path() {
     );
     assert_eq!(cold, warm, "遅延デコードの投影値は複製経路と完全一致する");
 }
+// --- Issue #3217: 行ノルム² のスナップショット常駐キャッシュ ---
+
+/// `(id, score のビット列)` の列。NaN（ゼロノルム行）もビット単位で比較するために使う。
+fn id_score_bits(result: &QueryResult) -> Vec<(u64, u64)> {
+    result
+        .rows
+        .iter()
+        .map(|r| (r.id, r.score.to_bits()))
+        .collect()
+}
+
+/// ゼロベクトル（NaN 距離）・巨大値（ノルム² が inf）・同点を含む表で、キャッシュヒット（常駐
+/// ノルム² 使用）が初回（ノルム² 未使用）と距離のビットまで一致する。
+#[test]
+fn resident_row_norms_cache_hit_is_bit_identical_to_cold() {
+    let path = unique_db_path("sql-arena-cache-norms-bits");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    create_docs_table(&storage);
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    let rows: [(u64, [f32; 2]); 7] = [
+        (1, [1.0, 0.0]),
+        (2, [0.0, 0.0]),
+        (3, [3.0e30, 3.0e30]),
+        (4, [2.0, 0.0]),
+        (5, [0.3, 0.7]),
+        (6, [0.0, 1.0]),
+        (7, [-1.0, 0.0]),
+    ];
+    for (id, emb) in rows {
+        insert_row(&storage, &ctx, id, emb, "k", Visibility::Public);
+    }
+    let core = new_core(storage);
+    for sql in [
+        "SELECT * FROM docs ORDER BY embedding <=> '[1.0,0.0]' LIMIT 10",
+        "SELECT id FROM docs ORDER BY embedding <=> '[1.0,0.0]' LIMIT 3",
+        "SELECT id FROM docs ORDER BY embedding <=> '[1.0,0.0]' LIMIT 50",
+    ] {
+        let first = core.execute_sql(&ctx, sql).expect("first");
+        let second = core.execute_sql(&ctx, sql).expect("second");
+        let third = core.execute_sql(&ctx, sql).expect("third");
+        assert_eq!(id_score_bits(&first), id_score_bits(&second), "{sql}");
+        assert_eq!(id_score_bits(&second), id_score_bits(&third), "{sql}");
+    }
+    assert!(core.sql_arena_cache_stats().hits >= 2);
+}
+
+/// 世代が進んだ後（INSERT）は stale なノルム² が残らず、新しい行を含む正しい順序になる。
+#[test]
+fn resident_row_norms_are_recomputed_after_generation_change() {
+    let path = unique_db_path("sql-arena-cache-norms-generation");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    create_docs_table(&storage);
+    let ctx =
+        PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+            .expect("valid tenant");
+    insert_row(&storage, &ctx, 1, [1.0, 1.0], "k", Visibility::Public);
+    insert_row(&storage, &ctx, 2, [0.0, 1.0], "k", Visibility::Public);
+    let core = new_core(storage);
+    let sql = "SELECT id FROM docs ORDER BY embedding <=> '[1.0,0.0]' LIMIT 10";
+    let _ = core.execute_sql(&ctx, sql).expect("cold");
+    let warm = core.execute_sql(&ctx, sql).expect("warm");
+    assert_eq!(result_ids(&warm), vec![1, 2]);
+
+    core.execute_insert_sql(
+        &ctx,
+        "INSERT INTO docs (id, embedding, kind) VALUES (3, '[5.0,0.0]', 'k') \
+         USING OPERATION_ID 'post-norms-insert'",
+    )
+    .expect("insert after warm");
+    let after = core.execute_sql(&ctx, sql).expect("after write");
+    assert_eq!(result_ids(&after), vec![3, 1, 2]);
+    let again = core.execute_sql(&ctx, sql).expect("hit on new generation");
+    assert_eq!(id_score_bits(&after), id_score_bits(&again));
+}
+
+/// WHERE あり（縮約 arena）でも、ノルム² の位置ずれによる誤結果にならない。
+#[test]
+fn resident_row_norms_not_misapplied_to_where_reduced_arena() {
+    let path = unique_db_path("sql-arena-cache-norms-where");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    create_docs_table(&storage);
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    insert_row(&storage, &ctx, 1, [10.0, 0.0], "a", Visibility::Public);
+    insert_row(&storage, &ctx, 2, [1.0, 1.0], "b", Visibility::Public);
+    insert_row(&storage, &ctx, 3, [0.0, 7.0], "b", Visibility::Public);
+    let core = new_core(storage);
+    let plain = "SELECT id FROM docs ORDER BY embedding <=> '[1.0,0.0]' LIMIT 10";
+    let _ = core.execute_sql(&ctx, plain).expect("warm-up");
+    let _ = core.execute_sql(&ctx, plain).expect("warm-up 2");
+    let sql = "SELECT id FROM docs WHERE kind = 'b' ORDER BY embedding <=> '[1.0,0.0]' LIMIT 10";
+    let first = core.execute_sql(&ctx, sql).expect("where first");
+    let second = core.execute_sql(&ctx, sql).expect("where second");
+    assert_eq!(result_ids(&first), vec![2, 3]);
+    assert_eq!(id_score_bits(&first), id_score_bits(&second));
+    let expected = 1.0 - (1.0_f64 / 2.0_f64.sqrt());
+    assert!((first.rows[0].score - expected).abs() < 1e-6);
+}
+
+/// 別テナントの ctx は別スナップショットで、可視行とその距離は各自の行だけで決まる。
+#[test]
+fn resident_row_norms_do_not_cross_tenants() {
+    let path = unique_db_path("sql-arena-cache-norms-tenants");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    create_docs_table(&storage);
+    let a =
+        PolicyContext::with_visibilities("tenant-a", [Visibility::Private]).expect("valid tenant");
+    let b =
+        PolicyContext::with_visibilities("tenant-b", [Visibility::Private]).expect("valid tenant");
+    insert_row(&storage, &a, 1, [4.0, 3.0], "k", Visibility::Private);
+    insert_row(&storage, &b, 2, [0.0, 2.0], "k", Visibility::Private);
+    insert_row(&storage, &b, 3, [1.0, 0.0], "k", Visibility::Private);
+    let core = new_core(storage);
+    let sql = "SELECT id FROM docs ORDER BY embedding <=> '[1.0,0.0]' LIMIT 10";
+    for _ in 0..3 {
+        let ra = core.execute_sql(&a, sql).expect("tenant a");
+        assert_eq!(result_ids(&ra), vec![1]);
+        assert!((ra.rows[0].score - (1.0 - 0.8)).abs() < 1e-6);
+        let rb = core.execute_sql(&b, sql).expect("tenant b");
+        assert_eq!(result_ids(&rb), vec![3, 2]);
+    }
+}
+
+/// hybrid（`CosineDenseAdapter` 経路）でもキャッシュヒット結果が初回とビット一致する。
+#[test]
+fn resident_row_norms_hybrid_matches_cold_bits() {
+    let path = unique_db_path("sql-arena-cache-norms-hybrid");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    setup_hybrid_docs_table(&storage);
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    let core = new_core(storage);
+    let sql = "SELECT id FROM docs ORDER BY hybrid_rrf(embedding, '[1.0,0.0]', body, 'vector database') LIMIT 4";
+    let cold = core.execute_sql(&ctx, sql).expect("cold");
+    let warm = core.execute_sql(&ctx, sql).expect("warm");
+    let warm2 = core.execute_sql(&ctx, sql).expect("warm2");
+    assert_eq!(id_score_bits(&cold), id_score_bits(&warm));
+    assert_eq!(id_score_bits(&warm), id_score_bits(&warm2));
+}

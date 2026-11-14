@@ -977,9 +977,34 @@ fn rescore_cosine(
 /// NULL 行を除いた候補スロットだけを走査する（疎側の `input.ids` は全スロットのまま呼び出し元が
 /// 持つため、NULL 行は疎側の候補に残る）。`input` が当該 arena のバッファ（`ids` が恒等スロット列で
 /// `vectors.len() == ids.len() * dim`）でなければ、黙って全体を走査せず `KernelError` で拒否する。
+///
+/// Issue #3217: `row_norms_sq` はスナップショット常駐のノルム²（`snapshot_norms_for_full_scan` が
+/// 位置対応を確認した場合のみ `Some`）。`dense_slots: None` の全走査でだけ使い、長さが `ids` と
+/// 不一致なら kernel 側が C1 へ縮退する。
 struct CosineDenseAdapter<'a> {
     inner: &'a dyn SearchProvider,
     dense_slots: Option<&'a [u32]>,
+    row_norms_sq: Option<&'a [f32]>,
+}
+
+/// Issue #3217: 全走査が走査する `arena` がキャッシュ済みスナップショット自身の arena で、候補マスク
+/// が無く、長さが slot 数と一致するときだけスナップショット常駐のノルム² を返す。縮約 arena・
+/// 新規構築 arena・マスク経路は位置が対応しないため `None`（別行のノルムを使う誤結果を防ぐ fail-closed）。
+fn snapshot_norms_for_full_scan<'a>(
+    snapshot: Option<&'a std::sync::Arc<crate::sql::arena_cache::SqlArenaSnapshot>>,
+    arena: &VectorArena,
+    mask_kept_slots: Option<&Vec<u32>>,
+    slot_count: usize,
+) -> Option<&'a [f32]> {
+    if mask_kept_slots.is_some() {
+        return None;
+    }
+    let snap = snapshot?;
+    if !std::ptr::eq(snap.arena(), arena) {
+        return None;
+    }
+    let norms = snap.row_norms_sq()?;
+    (norms.len() == slot_count).then_some(norms)
 }
 
 impl SearchProvider for CosineDenseAdapter<'_> {
@@ -991,7 +1016,7 @@ impl SearchProvider for CosineDenseAdapter<'_> {
             None => self.inner.search_cosine(crate::kernel::CosineSearchInput {
                 ids: input.ids,
                 vectors: input.vectors,
-                row_norms_sq: None,
+                row_norms_sq: self.row_norms_sq,
                 dim: input.dim,
                 query: input.query,
                 k: input.k,
@@ -3080,7 +3105,12 @@ pub(crate) fn execute_statement_with_cache_observed(
                             .search_cosine(crate::kernel::CosineSearchInput {
                                 ids: &slot_ids,
                                 vectors: arena.vectors(),
-                                row_norms_sq: None,
+                                row_norms_sq: snapshot_norms_for_full_scan(
+                                    cache_hit_snapshot.as_ref(),
+                                    arena,
+                                    mask_kept_slots.as_ref(),
+                                    slot_ids.len(),
+                                ),
                                 dim: arena.dim(),
                                 query,
                                 k: k_eff,
@@ -3379,6 +3409,12 @@ pub(crate) fn execute_statement_with_cache_observed(
                     let cosine_dense = CosineDenseAdapter {
                         inner: provider,
                         dense_slots: dense_slots.as_deref(),
+                        row_norms_sq: snapshot_norms_for_full_scan(
+                            cache_hit_snapshot.as_ref(),
+                            arena,
+                            mask_kept_slots.as_ref(),
+                            slot_ids.len(),
+                        ),
                     };
                     let dense_provider: &dyn SearchProvider = match &hnsw_dense_provider {
                         Some(adapter) => adapter,
@@ -7739,6 +7775,7 @@ mod tests {
             let adapter = CosineDenseAdapter {
                 inner: &inner,
                 dense_slots: None,
+                row_norms_sq: None,
             };
             adapter.search(SearchInput {
                 ids: &[1_u64, 2],
@@ -7762,6 +7799,7 @@ mod tests {
             let adapter = CosineDenseAdapter {
                 inner: &inner,
                 dense_slots: None,
+                row_norms_sq: None,
             };
             adapter.search(SearchInput {
                 ids: &[0_u64, 1, 2],
@@ -7803,6 +7841,7 @@ mod tests {
             let adapter = CosineDenseAdapter {
                 inner: &inner,
                 dense_slots: Some(&[1_u32]),
+                row_norms_sq: None,
             };
             adapter.search(SearchInput {
                 ids: &[0_u64, 1],
@@ -7830,6 +7869,7 @@ mod tests {
         let adapter = CosineDenseAdapter {
             inner: &inner,
             dense_slots: None,
+            row_norms_sq: None,
         };
         let ids = [4_u64, 2, 7, 1, 9];
         let hits = adapter
