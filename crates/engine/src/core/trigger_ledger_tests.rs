@@ -6,8 +6,9 @@
 //!
 //! 本ファイルは `cfg(test)` の `EngineCore::with_trigger_invoker_for_test` で注入した invoker を使う。
 //! 既定は本番の invoker になった（Issue #3185）ため、公開 API の結合テストでも SQL だけで発火できる
-//! （最小形は `tests/table_rls/table45_trigger_fire.rs`）。注入 invoker の網羅（crash 注入を含む）を
-//! 本物の invoker で再実行するのは #3188。クラッシュ注入は `recovery::commit_boundary` と同じ
+//! （最小形は `tests/table_rls/table45_trigger_fire.rs`）。注入 invoker は発火側の意味論（呼び出し回数・
+//! 戻り値・abort の注入）を固定するために残し、本物の invoker での越境・台帳・crash の再検証は #3188 で
+//! `tests/table_rls/table45_trigger_prod_invoker.rs` と `examples/crash_tool_sequence.rs` の `*-trigger` に置いた。クラッシュ注入は `recovery::commit_boundary` と同じ
 //! 「テストバイナリ自身を子プロセスとして再実行する」形で本ファイルに置く。
 //! 設計記録は `docs/design/trigger-ledger-consistency.md`。
 
