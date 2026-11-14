@@ -485,3 +485,65 @@ fn cascade_never_touches_another_tenants_rows_with_same_id() {
     assert_eq!(count(&core, &bob, "SELECT body FROM posts LIMIT 10"), 1);
     assert_eq!(count(&core, &bob, "SELECT name FROM users LIMIT 10"), 1);
 }
+
+/// 遅延 FK の COMMIT 時検査も他テナントの親を見つけない（Issue #3182）。他テナントだけが持つ `id` を
+/// 指した `INITIALLY DEFERRED` の子は COMMIT で `23503` になり、どこにも無い `id` の場合と応答が一致する
+/// （他テナントの存在を示さない）。自テナントの親を指す子は COMMIT できる。
+#[test]
+fn deferred_fk_commit_never_sees_another_tenants_parent() {
+    let (core, _g) = new_core("t23-act-deferred-tenant");
+    let alice = ctx("alice");
+    let bob = ctx("bob");
+    run(
+        &core,
+        &alice,
+        "CREATE TABLE users (id BIGINT PRIMARY KEY, name TEXT)",
+    );
+    run(
+        &core,
+        &alice,
+        "CREATE TABLE posts (author BIGINT, body TEXT, FOREIGN KEY (author) REFERENCES users (id) DEFERRABLE INITIALLY DEFERRED)",
+    );
+    run(
+        &core,
+        &alice,
+        "INSERT INTO users (id, name) VALUES (1, 'a')",
+    );
+    run(
+        &core,
+        &bob,
+        "INSERT INTO users (id, name) VALUES (777, 'b')",
+    );
+
+    let commit_code = |c: &PolicyContext, insert: &str| -> String {
+        let mut s = SessionState::default();
+        let mut txn = core.new_session_transaction();
+        let mut last = String::from("ok");
+        for sql in ["BEGIN", insert, "COMMIT"] {
+            if let Err(e) = core.execute_sql_in_txn(c, &mut s, &mut txn, sql) {
+                last = e.wire_code().to_string();
+                break;
+            }
+        }
+        last
+    };
+    let hidden = commit_code(&alice, "INSERT INTO posts (author, body) VALUES (777, 'x')");
+    let nowhere = commit_code(
+        &alice,
+        "INSERT INTO posts (author, body) VALUES (4242, 'x')",
+    );
+    assert_eq!(hidden, "23503");
+    assert_eq!(hidden, nowhere);
+    assert_eq!(count(&core, &alice, "SELECT body FROM posts LIMIT 10"), 0);
+    assert_eq!(
+        commit_code(&alice, "INSERT INTO posts (author, body) VALUES (1, 'x')"),
+        "ok"
+    );
+    assert_eq!(count(&core, &alice, "SELECT body FROM posts LIMIT 10"), 1);
+    // 他テナント（bob）は alice の id=1 を指せない（bob には id=1 の親が無い）。
+    assert_eq!(
+        commit_code(&bob, "INSERT INTO posts (author, body) VALUES (1, 'y')"),
+        "23503"
+    );
+    assert_eq!(count(&core, &bob, "SELECT body FROM posts LIMIT 10"), 0);
+}

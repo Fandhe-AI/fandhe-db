@@ -90,6 +90,7 @@ mod table18_buffered_outer;
 mod table18_view;
 mod table19_drop_alter_column;
 mod table23_id_ref_fk_actions;
+mod table23_id_ref_fk_ledger;
 mod table23_index_rowid_reference;
 mod table23_legacy_fixture_migration;
 mod table23_legacy_id_migration;
