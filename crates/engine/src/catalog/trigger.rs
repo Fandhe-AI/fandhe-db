@@ -71,8 +71,33 @@ pub(crate) const TRIGGER_FUNCTION_NOT_FOUND_MESSAGE: &str = "trigger function do
 /// 関数はあるが `RETURNS trigger` ではないときの `Invalid` 文言（`42P17`）。
 pub(crate) const TRIGGER_FUNCTION_NOT_TRIGGER_MESSAGE: &str = "function is not a trigger function";
 
+/// 共有 `public` 表へのトリガ定義を拒む `Invalid` 文言。`sql::trigger_ddl` が `0A000` へ写す。発火時の
+/// 保険（`trigger::call::PlpgsqlTriggerInvoker`）も同じ文言を使う（Issue #3361）。固定で、内部キー・
+/// tenant_id・他テナントの定義の有無を含めない。
+pub(crate) const TRIGGER_ON_SHARED_PUBLIC_TABLE_MESSAGE: &str =
+    "triggers on shared public tables are not supported";
+
 /// 件数上限超過の `ViewLimitExceeded` 文言（`54000`）。
 pub(crate) const TRIGGER_LIMIT_MESSAGE: &str = "too many triggers";
+
+/// 表キーが共有 `public` 表（裸の名前）か。解析に失敗するキーも拒否側（`true`）に倒す（fail-closed）。
+/// 定義時の拒否と発火時の保険（`trigger::call`）が同じ判定を使う。
+pub(crate) fn is_shared_public_table_key(table_key: &str) -> bool {
+    !matches!(
+        super::namespace::RelationKey::parse(table_key),
+        Ok(super::namespace::RelationKey::InSchema { .. })
+    )
+}
+
+/// `create_trigger_inner` が共有 `public` 表をどう扱うか。本番経路は常に `Reject`。
+/// `AllowLegacyForTest` は「この拒否の導入前にカタログへ残った定義」を模すテスト専用の注入口で、
+/// テストコードからしか作らない（本番に bypass を作らない）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SharedPublicTables {
+    Reject,
+    #[cfg(test)]
+    AllowLegacyForTest,
+}
 
 /// 所有者の予約値（ロール機構が入るまで常に 0）。
 const OWNER_TAG_NONE: u8 = 0;
@@ -675,7 +700,9 @@ impl Storage {
     /// commit で行い、判定順は次のとおり（すべて commit 前に返るため副作用ゼロ）。
     ///
     /// 形状 → SCHEMA の現存 → 対象の種別（ビュー・索引・SEQUENCE・マテリアライズドビューは
-    /// `WrongObjectKind`）→ 表の存在（`TableNotFound`）→ `UPDATE OF` の列（`ColumnNotFound`）→ 関数
+    /// `WrongObjectKind`）→ 表の存在（`TableNotFound`）→ 共有 `public` 表
+    /// （`Invalid(TRIGGER_ON_SHARED_PUBLIC_TABLE_MESSAGE)`。Issue #3361。同名・上限・関数の判定より前で
+    /// 止め、他テナントの定義の有無で応答を変えない）→ `UPDATE OF` の列（`ColumnNotFound`）→ 関数
     /// （`Invalid(TRIGGER_FUNCTION_NOT_FOUND_MESSAGE)`／`Invalid(TRIGGER_FUNCTION_NOT_TRIGGER_MESSAGE)`）→
     /// 同名の既存（`or_replace` でなければ `Invalid(TRIGGER_ALREADY_EXISTS_MESSAGE)`）→ 件数上限
     /// （`ViewLimitExceeded`）。`or_replace` の置き換えは既存の内部 ID を引き継ぐ。成功時は対象表の世代を進める。
@@ -694,11 +721,14 @@ impl Storage {
             or_replace,
             MAX_TRIGGERS_PER_TABLE,
             returns_trigger,
+            SharedPublicTables::Reject,
         )
     }
 
     /// [`Self::create_trigger`] の本体。件数上限とトリガ関数の判定を引数にし、テストが小さい上限と
     /// 「`RETURNS trigger` の関数がある」状況（保存形式の追加は #2228）を注入できるようにする。
+    // 件数上限・関数判定・共有 public 表の扱いはテストの注入口で、本番の呼び出し元は `create_trigger` だけ。
+    #[allow(clippy::too_many_arguments)]
     fn create_trigger_inner(
         &self,
         scope: &str,
@@ -707,6 +737,7 @@ impl Storage {
         or_replace: bool,
         max_triggers: usize,
         is_trigger_fn: fn(&FunctionDef) -> bool,
+        shared_public: SharedPublicTables,
     ) -> Result<u64> {
         validate_scope(scope)?;
         validate_relation_key(table_key)?;
@@ -738,6 +769,10 @@ impl Storage {
         };
         if !table_exists {
             return Err(CatalogError::TableNotFound(table_key.to_string()));
+        }
+        // 共有 public 表は全テナントの書き込みが通るため、特定テナントのトリガを持たせない（Issue #3361）。
+        if shared_public == SharedPublicTables::Reject && is_shared_public_table_key(table_key) {
+            return Err(invalid(TRIGGER_ON_SHARED_PUBLIC_TABLE_MESSAGE));
         }
         if !stored.update_of.is_empty() {
             let schema = require_table_schema_write_any_identity(&write_txn, table_key)?;
@@ -792,9 +827,15 @@ impl Storage {
         table_key: &str,
         def: &TriggerDef,
     ) -> Result<u64> {
-        self.create_trigger_inner(scope, table_key, def, false, MAX_TRIGGERS_PER_TABLE, |_| {
-            true
-        })
+        self.create_trigger_inner(
+            scope,
+            table_key,
+            def,
+            false,
+            MAX_TRIGGERS_PER_TABLE,
+            |_| true,
+            SharedPublicTables::AllowLegacyForTest,
+        )
     }
 
     /// `scope` のトリガ `name` を削除し、存在して削除したら `true`。表が無ければ `TableNotFound`、トリガが
