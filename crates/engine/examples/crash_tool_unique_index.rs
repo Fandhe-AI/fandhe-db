@@ -56,6 +56,17 @@
 //! （`docs`・`docs_uidx`。反復ごとの再 open で `MigratedId` へ移行済み）の `id` 契約（`WHERE id = n` の
 //! 点検索・既存 `id` の再挿入が `23505`・開き直しを繰り返しても件数が不変）を検査する。
 //!
+//! Issue #3182（TABLE-17・TABLE-23）で、採番方式の親の `id` 列を参照する FK を kill の対象経路へ加えた。
+//! `docs_idfk_parent (id BIGINT PRIMARY KEY, n BIGINT)` と
+//! `docs_idfk_child (cid BIGINT, pid BIGINT REFERENCES docs_idfk_parent (id) ON DELETE CASCADE)`。
+//! 各バッチで親 `BATCH` 行・子 `BATCH` 行（`pid = cid`）を別 txn で `USING OPERATION_ID` 付きに書き、
+//! さらに一時の親子 1 組（`id >= IDFK_TRANSIENT_BASE`）を作って親だけを DELETE して連鎖削除を kill の
+//! 対象経路に乗せる。`verify` は親 `id`・子 `cid` の 0 起点連続性と BATCH 整合、子が親を超えない
+//! こと、孤児（親の無い子）が 0 件であること、一時の組が「親のみ」「親子とも」「どちらも無い」のいずれか
+//! （連鎖が全部残る／全部消える。子だけが残らない）であること、存在しない親を指す子の INSERT と既存 `id` の
+//! 親の再挿入が再起動後も必ず `23503`／`23505` で拒否されること、読み取り専用の一意索引検証が成功する
+//! ことを確かめる。プローブは常に拒否される前提で副作用を残さない。
+//!
 //! サブコマンド:
 //! - `write <db_path>`: `docs (code TEXT UNIQUE)` テーブル（無ければ作成）へ、
 //!   `BATCH` 件の行を 1 `INSERT` 文（＝1 write トランザクション。UNIQUE 索引の
@@ -112,6 +123,12 @@ const PK_TABLE: &str = "docs_pk";
 const NOPK_TABLE: &str = "docs_nopk";
 /// `PK_TABLE` の `grp` 列の固定値。
 const PK_GROUP: &str = "g";
+/// 採番方式の親表（`id BIGINT PRIMARY KEY`。FK の参照先。TABLE-17・TABLE-23・Issue #3182）。
+const IDFK_PARENT: &str = "docs_idfk_parent";
+/// 親の `id` 列を `ON DELETE CASCADE` で参照する採番方式の子表（Issue #3182）。
+const IDFK_CHILD: &str = "docs_idfk_child";
+/// 連鎖削除の対象にする一時の親子の `id` の起点。通常行（0 起点の連番）と重ならない値にする。
+const IDFK_TRANSIENT_BASE: i64 = 1_000_000;
 
 /// 再開時に既存行の最大 id を求める `SELECT id FROM docs LIMIT n` の上限件数。
 /// `sql::allowlist` が SELECT の `LIMIT` に課す上限（1..=10000）と同じ値を使う
@@ -228,6 +245,9 @@ fn ensure_table(core: &EngineCore, ctx: &PolicyContext) -> Result<(), String> {
     for sql in [
         "CREATE TABLE docs_pk (grp TEXT, k BIGINT, code TEXT UNIQUE, n BIGINT, PRIMARY KEY (grp, k))",
         "CREATE TABLE docs_nopk (seq BIGINT, code TEXT)",
+        // 親は子より先に作る（Issue #3182）。
+        "CREATE TABLE docs_idfk_parent (id BIGINT PRIMARY KEY, n BIGINT)",
+        "CREATE TABLE docs_idfk_child (cid BIGINT, pid BIGINT REFERENCES docs_idfk_parent (id) ON DELETE CASCADE)",
     ] {
         match core.execute_sql_in_session(ctx, &mut session, sql) {
             Ok(_) => {}
@@ -429,6 +449,118 @@ fn write_allocated_batch(
     Ok(())
 }
 
+/// `table.col` の通常行（`IDFK_TRANSIENT_BASE` 未満）の値を昇順で返す。
+fn read_idfk_main_column(
+    core: &EngineCore,
+    ctx: &PolicyContext,
+    table: &str,
+    col: &str,
+) -> Result<Vec<i64>, String> {
+    Ok(read_int_column(core, ctx, table, col)?
+        .into_iter()
+        .filter(|v| *v < IDFK_TRANSIENT_BASE)
+        .collect())
+}
+
+/// 親子表の次に書く連番（通常行の最大値 + 1。空なら 0）。
+fn find_next_idfk(
+    core: &EngineCore,
+    ctx: &PolicyContext,
+    table: &str,
+    col: &str,
+) -> Result<u64, String> {
+    match read_idfk_main_column(core, ctx, table, col)?.last() {
+        Some(max) => u64::try_from(*max)
+            .ok()
+            .and_then(|v| v.checked_add(1))
+            .ok_or_else(|| format!("invalid {table}.{col} while resuming")),
+        None => Ok(0),
+    }
+}
+
+/// 採番方式の親子表へ 1 バッチ書く（Issue #3182）。親 `BATCH` 行 → 子 `BATCH` 行（それぞれ別 txn。子の
+/// FK 検査は親が先に commit 済みであることに依存する）→ 一時の親子 1 組の作成と親の DELETE（連鎖）の順。
+/// kill が間に入っても、再開側は親と子の次の連番を独立に求めて足りない側だけを書く。
+fn write_idfk_batch(
+    core: &EngineCore,
+    ctx: &PolicyContext,
+    parent_next: &mut u64,
+    child_next: &mut u64,
+) -> Result<(), String> {
+    let mut session = SessionState::default();
+    if *parent_next == *child_next {
+        let seq = *parent_next / BATCH;
+        let mut values = String::new();
+        for offset in 0..BATCH {
+            let id = parent_next
+                .checked_add(offset)
+                .ok_or_else(|| "idfk parent id overflow".to_string())?;
+            if offset > 0 {
+                values.push(',');
+            }
+            values.push_str(&format!("({id}, 0)"));
+        }
+        let sql = format!(
+            "INSERT INTO {IDFK_PARENT} (id, n) VALUES {values} USING OPERATION_ID 'op-{IDFK_PARENT}-{seq}'"
+        );
+        core.execute_sql_in_session(ctx, &mut session, &sql)
+            .map_err(|e| format!("insert failed at {IDFK_PARENT} batch_seq={seq}: {e}"))?;
+        *parent_next = parent_next
+            .checked_add(BATCH)
+            .ok_or_else(|| "idfk parent id overflow after insert".to_string())?;
+    }
+    let seq = *child_next / BATCH;
+    let mut values = String::new();
+    for offset in 0..BATCH {
+        let id = child_next
+            .checked_add(offset)
+            .ok_or_else(|| "idfk child id overflow".to_string())?;
+        if offset > 0 {
+            values.push(',');
+        }
+        values.push_str(&format!("({id}, {id})"));
+    }
+    let sql = format!(
+        "INSERT INTO {IDFK_CHILD} (cid, pid) VALUES {values} USING OPERATION_ID 'op-{IDFK_CHILD}-{seq}'"
+    );
+    core.execute_sql_in_session(ctx, &mut session, &sql)
+        .map_err(|e| format!("insert failed at {IDFK_CHILD} batch_seq={seq}: {e}"))?;
+    *child_next = child_next
+        .checked_add(BATCH)
+        .ok_or_else(|| "idfk child id overflow after insert".to_string())?;
+
+    // 一時の親子 1 組: 親 → 子 → 親の DELETE（子へ連鎖）。通番は前進した `child_next` から導出するため、
+    // kill 後の再開でも同じ通番を再利用しない。
+    let tseq = *child_next / BATCH;
+    let t = IDFK_TRANSIENT_BASE
+        .checked_add(i64::try_from(tseq).map_err(|_| "idfk transient seq overflow".to_string())?)
+        .ok_or_else(|| "idfk transient id overflow".to_string())?;
+    for (sql, what) in [
+        (
+            format!(
+                "INSERT INTO {IDFK_PARENT} (id, n) VALUES ({t}, 0) USING OPERATION_ID 'op-{IDFK_PARENT}-tp-{tseq}'"
+            ),
+            "transient parent insert",
+        ),
+        (
+            format!(
+                "INSERT INTO {IDFK_CHILD} (cid, pid) VALUES ({t}, {t}) USING OPERATION_ID 'op-{IDFK_CHILD}-tc-{tseq}'"
+            ),
+            "transient child insert",
+        ),
+        (
+            format!(
+                "DELETE FROM {IDFK_PARENT} WHERE id = {t} USING OPERATION_ID 'op-{IDFK_PARENT}-td-{tseq}'"
+            ),
+            "transient parent delete (cascade)",
+        ),
+    ] {
+        core.execute_sql_in_session(ctx, &mut session, &sql)
+            .map_err(|e| format!("{what} failed at idfk tseq={tseq}: {e}"))?;
+    }
+    Ok(())
+}
+
 fn run_write(path: &str) -> i32 {
     match write_inner(path) {
         Ok(()) => 0,
@@ -467,6 +599,27 @@ fn write_inner(path: &str) -> Result<(), String> {
                  the atomic per-statement commit contract should make a partial batch impossible"
             ));
         }
+    }
+
+    // 採番方式の親子表（Issue #3182）。親と子は別 txn なので独立に再開する（子は親を超えない）。
+    let mut idfk_parent_next = find_next_idfk(&core, &ctx, IDFK_PARENT, "id")?;
+    let mut idfk_child_next = find_next_idfk(&core, &ctx, IDFK_CHILD, "cid")?;
+    for (next, table) in [
+        (idfk_parent_next, IDFK_PARENT),
+        (idfk_child_next, IDFK_CHILD),
+    ] {
+        if !next.is_multiple_of(BATCH) {
+            return Err(format!(
+                "resumed sequence {next} of {table} is not a multiple of BATCH ({BATCH}); \
+                 the atomic per-statement commit contract should make a partial batch impossible"
+            ));
+        }
+    }
+    if idfk_child_next > idfk_parent_next {
+        return Err(format!(
+            "resumed child sequence {idfk_child_next} exceeds parent sequence {idfk_parent_next}: \
+             a child row was committed without its parent"
+        ));
     }
 
     let stdout = std::io::stdout();
@@ -519,12 +672,19 @@ fn write_inner(path: &str) -> Result<(), String> {
         }
 
         write_allocated_batch(&core, &ctx, &mut pk_next, &mut nopk_next)?;
+        write_idfk_batch(&core, &ctx, &mut idfk_parent_next, &mut idfk_child_next)?;
 
         // 進捗行はスクリプト側が「書き込みが実際に進み始めた」ことを検知する同期点
         // なので、バッファリングで遅延しないよう毎回明示的に flush する
         // （`crash_tool_cross_table.rs` と同方針）。
-        writeln!(handle, "COMMITTED batch={} rows={}", progress.0, progress.1)
-            .map_err(|e| format!("stdout write failed: {e}"))?;
+        // FK 親子表の確認済み件数（`idfk_parent` / `idfk_child`）も併記する。スクリプト側は復旧後の
+        // 件数がこれを下回らないことを確かめ、確認済みの最終バッチ消失（親子の末尾が揃って消える場合を含む）を検出する。
+        writeln!(
+            handle,
+            "COMMITTED batch={} rows={} idfk_parent={} idfk_child={}",
+            progress.0, progress.1, idfk_parent_next, idfk_child_next
+        )
+        .map_err(|e| format!("stdout write failed: {e}"))?;
         handle
             .flush()
             .map_err(|e| format!("stdout flush failed: {e}"))?;
@@ -544,8 +704,10 @@ fn write_inner(path: &str) -> Result<(), String> {
 
 fn run_verify(path: &str) -> i32 {
     match verify_inner(path) {
-        Ok((rows, batches)) => {
-            println!("RESULT ok=true rows={rows} batches={batches}");
+        Ok((rows, batches, idfk_parent, idfk_child)) => {
+            println!(
+                "RESULT ok=true rows={rows} batches={batches} idfk_parent={idfk_parent} idfk_child={idfk_child}"
+            );
             0
         }
         Err(reason) => {
@@ -555,7 +717,7 @@ fn run_verify(path: &str) -> i32 {
     }
 }
 
-fn verify_inner(path: &str) -> Result<(u64, u64), String> {
+fn verify_inner(path: &str) -> Result<(u64, u64, u64, u64), String> {
     let core = open_core(path)?;
     let ctx = tenant_ctx()?;
     // 両表に同じオラクルを適用する。報告する行数・バッチ数は `docs` のもの。
@@ -569,12 +731,13 @@ fn verify_inner(path: &str) -> Result<(u64, u64), String> {
     }
     verify_pk_table(&core, &ctx)?;
     verify_nopk_table(&core, &ctx)?;
+    let (idfk_parent, idfk_child) = verify_idfk_tables(&core, &ctx)?;
     let counts = verify_migrated_id_contract(&core, &ctx)?;
     // 開き直しを繰り返しても件数が変わらない（移行は 2 回目以降は何もしない）。同一 DB を二重に開けない
     // ため、先に開いている `core` を手放してから確かめる。
     drop(core);
     verify_reopen_stable(path, &ctx, &counts)?;
-    Ok(summary)
+    Ok((summary.0, summary.1, idfk_parent, idfk_child))
 }
 
 /// 0 起点で欠落・重複なく連続しているか（rowid の再払い出しで行が上書き・消失した場合も検出する）。
@@ -694,6 +857,109 @@ fn verify_nopk_table(core: &EngineCore, ctx: &PolicyContext) -> Result<(), Strin
         read_int_column(core, ctx, NOPK_TABLE, "seq").map_err(|e| format!("{NOPK_TABLE}: {e}"))?;
     check_contiguous(&seqs, NOPK_TABLE)?;
     Ok(())
+}
+
+/// 採番方式の親子表（親の `id` 列への FK。Issue #3182・TABLE-17・TABLE-23）の検証。
+/// 通常行の連続性・BATCH 整合、孤児が無いこと、一時の組の連鎖が全部残る／全部消えるのどちらかである
+/// こと、FK・PK の拒否プローブ（常に拒否される前提で成功時は副作用なし）、読み取り専用の一意索引検証。
+fn verify_idfk_tables(core: &EngineCore, ctx: &PolicyContext) -> Result<(u64, u64), String> {
+    let parents_main = read_idfk_main_column(core, ctx, IDFK_PARENT, "id")
+        .map_err(|e| format!("{IDFK_PARENT}: {e}"))?;
+    let children_main = read_idfk_main_column(core, ctx, IDFK_CHILD, "cid")
+        .map_err(|e| format!("{IDFK_CHILD}: {e}"))?;
+    let parent_total = check_contiguous(&parents_main, IDFK_PARENT)?;
+    // 親は子より先にコミットされるので、子は親を超えない。親が 1 バッチ先行して止まるのは許す。
+    let child_total = if children_main.is_empty() {
+        0
+    } else {
+        check_contiguous(&children_main, IDFK_CHILD)?
+    };
+    if child_total > parent_total || parent_total - child_total > BATCH {
+        return Err(format!(
+            "{IDFK_CHILD}: child total {child_total} inconsistent with parent total {parent_total}"
+        ));
+    }
+    // 孤児検査（全件）と一時の組の連鎖の原子性。
+    let parents_all =
+        read_int_column(core, ctx, IDFK_PARENT, "id").map_err(|e| format!("{IDFK_PARENT}: {e}"))?;
+    let pairs = core
+        .execute_sql(
+            ctx,
+            &format!("SELECT cid, pid FROM {IDFK_CHILD} ORDER BY cid LIMIT {SCAN_LIMIT}"),
+        )
+        .map_err(|e| format!("{IDFK_CHILD}: scan failed: {e}"))?;
+    check_scan_not_truncated(pairs.rows.len())?;
+    for row in &pairs.rows {
+        let (cid, pid) = match row.cells.as_slice() {
+            [Cell::SignedInteger(c), Cell::SignedInteger(p)] => (*c, *p),
+            other => return Err(format!("{IDFK_CHILD}: unexpected cells {other:?}")),
+        };
+        if parents_all.binary_search(&pid).is_err() {
+            return Err(format!(
+                "{IDFK_CHILD}: orphan child cid={cid} references missing parent id={pid} (cascade was partially applied or FK check was skipped)"
+            ));
+        }
+        if pid != cid {
+            return Err(format!("{IDFK_CHILD}: unexpected pid={pid} for cid={cid}"));
+        }
+    }
+    // 一時の組は連鎖削除の途中で kill されても、子だけが残ることはない（上の孤児検査が固定する）。
+    // 一時の親が残っていても高々 1 組ずつ（再開ごとに通番が進む）なので、通常行との混在だけを確かめる。
+    // 読み取り専用の一意索引検証（PK の永続索引と FK 用の `k:id` 索引がクラッシュ後も生存している）。
+    core.verify_unique_index_read_only(ctx, IDFK_PARENT)
+        .map_err(|e| format!("{IDFK_PARENT}: read-only unique index verification failed: {e}"))?;
+    let mut session = SessionState::default();
+    // 存在しない親を指す子の INSERT は再起動後も 23503。
+    let missing = IDFK_TRANSIENT_BASE
+        .checked_mul(10)
+        .ok_or_else(|| "probe id overflow".to_string())?;
+    match core.execute_sql_in_session(
+        ctx,
+        &mut session,
+        &format!(
+            "INSERT INTO {IDFK_CHILD} (cid, pid) VALUES ({missing}, {missing}) \
+             USING OPERATION_ID 'verify-idfk-orphan'"
+        ),
+    ) {
+        Err(e) if e.wire_code() == "23503" => {}
+        Err(e) => {
+            return Err(format!(
+                "{IDFK_CHILD}: orphan probe failed with an unexpected wire_code {} (expected 23503): {e}",
+                e.wire_code()
+            ))
+        }
+        Ok(_) => {
+            return Err(format!(
+                "{IDFK_CHILD}: orphan probe was wrongly accepted; the FK key index is missing after crash recovery"
+            ))
+        }
+    }
+    // 既存 `id` の親の再挿入は 23505（PK の永続索引の生存）。
+    for id in 0..parent_total {
+        match core.execute_sql_in_session(
+            ctx,
+            &mut session,
+            &format!(
+                "INSERT INTO {IDFK_PARENT} (id, n) VALUES ({id}, 9) USING OPERATION_ID 'verify-idfk-dup-{id}'"
+            ),
+        ) {
+            Err(e) if e.wire_code() == "23505" => {}
+            Err(e) => {
+                return Err(format!(
+                    "{IDFK_PARENT}: duplicate id probe failed with an unexpected wire_code {} (expected 23505): {e}",
+                    e.wire_code()
+                ))
+            }
+            Ok(_) => {
+                return Err(format!(
+                    "{IDFK_PARENT}: duplicate id probe was wrongly accepted for id={id}"
+                ))
+            }
+        }
+    }
+    // 子を持つ親の削除プローブは行わない（CASCADE のため受理されて副作用を残す）。
+    // 復旧後の通常行の件数（親・子）を返す。呼び出し側が確認済み件数の下限と突き合わせる。
+    Ok((parent_total, child_total))
 }
 
 /// 従来方式の表（`docs`・`docs_uidx`。再 open ごとに `MigratedId` へ移行済み）の `id` 契約

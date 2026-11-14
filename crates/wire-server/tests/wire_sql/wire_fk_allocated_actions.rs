@@ -155,3 +155,131 @@ fn wire_allocated_parent_deferred_violation_fails_at_commit() {
 
     select_count(&mut stream, "SELECT name FROM users LIMIT 10", 1);
 }
+
+/// 台帳（Issue #3182）: `USING OPERATION_ID` つきの子 INSERT と親 DELETE（CASCADE）を末尾 `;` 付きの
+/// 単独送信で再送すると `23505` になり、行も連鎖も二重にならず、同じ接続で次の文が実行できる。FK 違反で
+/// 失敗した文は台帳を消費せず、親を作った後の同一 operation_id の再試行が成功する。
+#[test]
+fn wire_allocated_fk_resend_with_operation_id_is_idempotent() {
+    let (core, _guard) = new_core_without_tables();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
+    let addr = spawn_with_ddl_allowed_users(&users_path, core, &["alice"]);
+    let mut stream = connect_as(addr, "alice", "pw-alice");
+
+    for (sql, tag) in [
+        ("CREATE TABLE users (id BIGINT PRIMARY KEY, name TEXT);", "CREATE TABLE"),
+        (
+            "CREATE TABLE posts (author BIGINT REFERENCES users (id) ON DELETE CASCADE, body TEXT);",
+            "CREATE TABLE",
+        ),
+    ] {
+        exec_ok(&mut stream, sql, tag);
+    }
+    let child = "INSERT INTO posts (author, body) VALUES (1, 'p') USING OPERATION_ID 'op-child';";
+    // 親が無いので 23503。台帳は消費されない。
+    send_simple_query(&mut stream, child);
+    expect_error_response_with_sqlstate(&mut stream, "23503");
+    read_ready_for_query(&mut stream);
+    exec_ok(
+        &mut stream,
+        "INSERT INTO users (id, name) VALUES (1, 'a') USING OPERATION_ID 'op-parent';",
+        "INSERT 0 1",
+    );
+    exec_ok(&mut stream, child, "INSERT 0 1");
+    for _ in 0..2 {
+        send_simple_query(&mut stream, child);
+        expect_error_response_with_sqlstate(&mut stream, "23505");
+        read_ready_for_query(&mut stream);
+    }
+    select_count(&mut stream, "SELECT body FROM posts LIMIT 10", 1);
+
+    let del = "DELETE FROM users WHERE id = 1 USING OPERATION_ID 'op-del';";
+    exec_ok(&mut stream, del, "DELETE 1");
+    select_count(&mut stream, "SELECT body FROM posts LIMIT 10", 0);
+    // 同じ id の親・子を作り直しても、DELETE の再送は 23505 で新しい行を巻き込まない。
+    exec_ok(
+        &mut stream,
+        "INSERT INTO users (id, name) VALUES (1, 'again') USING OPERATION_ID 'op-parent2';",
+        "INSERT 0 1",
+    );
+    exec_ok(
+        &mut stream,
+        "INSERT INTO posts (author, body) VALUES (1, 'q') USING OPERATION_ID 'op-child2';",
+        "INSERT 0 1",
+    );
+    send_simple_query(&mut stream, del);
+    expect_error_response_with_sqlstate(&mut stream, "23505");
+    read_ready_for_query(&mut stream);
+    select_count(&mut stream, "SELECT name FROM users LIMIT 10", 1);
+    select_count(&mut stream, "SELECT body FROM posts LIMIT 10", 1);
+}
+
+/// 越境（Issue #3182）: 別テナントの 2 ユーザーが同一の `id` の親を持つとき、他テナントだけが持つ `id`
+/// を指す子の INSERT は `23503` で、どこにも無い `id` の場合と応答（エラー本文）が一致し、他テナントの
+/// 存在を示さない。親の DELETE の連鎖は自テナントの子だけに及ぶ。
+#[test]
+fn wire_allocated_fk_is_tenant_scoped_and_hides_foreign_parents() {
+    let (core, _guard) = new_core_without_tables();
+    let users_path = write_user_store_file(&[
+        ("alice", "tenant-a", "pw-alice"),
+        ("bob", "tenant-b", "pw-bob"),
+    ]);
+    let addr = spawn_with_ddl_allowed_users(&users_path, core, &["alice"]);
+    let mut a = connect_as(addr, "alice", "pw-alice");
+    let mut b = connect_as(addr, "bob", "pw-bob");
+
+    for (sql, tag) in [
+        ("CREATE TABLE users (id BIGINT PRIMARY KEY, name TEXT);", "CREATE TABLE"),
+        (
+            "CREATE TABLE posts (author BIGINT REFERENCES users (id) ON DELETE CASCADE, body TEXT);",
+            "CREATE TABLE",
+        ),
+    ] {
+        exec_ok(&mut a, sql, tag);
+    }
+    exec_ok(
+        &mut a,
+        "INSERT INTO users (id, name) VALUES (1, 'a');",
+        "INSERT 0 1",
+    );
+    exec_ok(
+        &mut a,
+        "INSERT INTO posts (author, body) VALUES (1, 'pa');",
+        "INSERT 0 1",
+    );
+    exec_ok(
+        &mut b,
+        "INSERT INTO users (id, name) VALUES (1, 'b'), (777, 'b7');",
+        "INSERT 0 2",
+    );
+    exec_ok(
+        &mut b,
+        "INSERT INTO posts (author, body) VALUES (1, 'pb');",
+        "INSERT 0 1",
+    );
+
+    // alice から見て 777 は他テナントだけが持つ id。どこにも無い id（4242）と応答が一致する。
+    let mut bodies = Vec::new();
+    for id in [777, 4242] {
+        send_simple_query(
+            &mut a,
+            &format!("INSERT INTO posts (author, body) VALUES ({id}, 'x');"),
+        );
+        let (ty, body) = read_message(&mut a);
+        assert_eq!(ty, b'E');
+        let text = String::from_utf8_lossy(&body).to_string();
+        assert!(text.contains("23503"), "{text:?}");
+        assert!(
+            !text.contains("tenant-b") && !text.contains("b7"),
+            "{text:?}"
+        );
+        bodies.push(text.replace(&id.to_string(), "<id>"));
+        read_ready_for_query(&mut a);
+    }
+    assert_eq!(bodies[0], bodies[1]);
+
+    // alice の親の削除は alice の子だけを連鎖で消し、bob の同値 id の子は残る。
+    exec_ok(&mut a, "DELETE FROM users WHERE id = 1;", "DELETE 1");
+    select_count(&mut a, "SELECT body FROM posts LIMIT 10", 0);
+    select_count(&mut b, "SELECT body FROM posts LIMIT 10", 1);
+}

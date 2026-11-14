@@ -26,6 +26,9 @@
 # の `docs_pk`（複合 PRIMARY KEY＋UNIQUE。`ON CONFLICT` の UPSERT を含む）と PK なしの `docs_nopk` を
 # 加えた（verify が、`k`／`seq` の連続性・PK／UNIQUE 重複の `23505`・点検索を確かめ、従来方式から移行済みの
 # 表の `id` 契約も確かめる。本スクリプトのロジックは変えない）。
+# Issue #3182（TABLE-17・TABLE-23）で、採番方式の親の `id` 列を参照する FK の親子表 `docs_idfk_parent`・
+# `docs_idfk_child`（ON DELETE CASCADE の連鎖削除を含む）を加えた（verify が、連続性・孤児ゼロ・連鎖の原子性・
+# FK／PK 違反の拒否を確かめる。本スクリプトのロジックは変えない）。
 # Makefile の crash-test-unique-index ターゲット・CI の crash-test-unique-index
 # ジョブから呼ばれる。
 #
@@ -166,7 +169,28 @@ for set_no in $(seq 1 "${SETS}"); do
     # しているため、kill が出力の途中で当たって行が切れた場合はマッチせず 1 つ前の
     # 完全な行が採用される（acked は実際より小さくなることはあっても大きくならない
     # ＝false-fail しない。`crash_test_cross_table.sh` と同方針）。
-    acked="$(grep -o '^COMMITTED batch=[0-9]* rows=[0-9]*$' "${WRITE_LOG}" | tail -1 | sed -n 's/.*rows=\([0-9]*\)$/\1/p')"
+    # 行は `COMMITTED batch=<seq> rows=<total> idfk_parent=<n> idfk_child=<n>`（FK 親子表の確認済み件数を併記）。
+    acked_line="$(grep -o '^COMMITTED batch=[0-9]* rows=[0-9]* idfk_parent=[0-9]* idfk_child=[0-9]*$' "${WRITE_LOG}" | tail -1)"
+    acked="$(echo "${acked_line}" | sed -n 's/.* rows=\([0-9]*\) .*/\1/p')"
+    acked_idfk_parent="$(echo "${acked_line}" | sed -n 's/.* idfk_parent=\([0-9]*\) .*/\1/p')"
+    acked_idfk_child="$(echo "${acked_line}" | sed -n 's/.* idfk_child=\([0-9]*\)$/\1/p')"
+    idfk_parent="$(echo "${verify_output}" | sed -n 's/.* idfk_parent=\([0-9]*\).*/\1/p')"
+    idfk_child="$(echo "${verify_output}" | sed -n 's/.* idfk_child=\([0-9]*\).*/\1/p')"
+    if ! [[ "${idfk_parent}" =~ ^[0-9]+$ && "${idfk_child}" =~ ^[0-9]+$ ]]; then
+      echo "ERROR: could not parse FK table counts from verify output: ${verify_output}" >&2
+      rm -rf "${WORKDIR}"
+      trap - EXIT
+      exit 1
+    fi
+    if [ -n "${acked_idfk_parent}" ] && [ -n "${acked_idfk_child}" ]; then
+      # 確認済みの FK 親子表の件数を下回れば、確認済みの最終バッチが（親子の末尾が揃って消える場合を含め）失われている。
+      if [ "${idfk_parent}" -lt "${acked_idfk_parent}" ] || [ "${idfk_child}" -lt "${acked_idfk_child}" ]; then
+        echo "ERROR: FK table counts (parent=${idfk_parent} child=${idfk_child}) are below the last acknowledged commit (parent=${acked_idfk_parent} child=${acked_idfk_child}), data loss suspected (set ${set_no} iteration ${i})" >&2
+        rm -rf "${WORKDIR}"
+        trap - EXIT
+        exit 1
+      fi
+    fi
     if [ -n "${acked}" ]; then
       # 「started」で確認した COMMITTED はコミット成功後にのみ出力されるため、
       # 再オープン後の rows はその時点で確認済みだった acked 行数を下回ってはならない

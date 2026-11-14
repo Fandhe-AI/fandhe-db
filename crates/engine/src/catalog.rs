@@ -8374,7 +8374,9 @@ impl ForeignKeyDef {
     /// 行識別方式で決まる（従来方式は物理キーの疑似列、採番方式は宣言した普通の列。Issue #3178）。
     /// 子の INSERT／UPDATE の存在検査と親の UPDATE 検査は親を見て分岐する
     /// [`Self::references_parent_pseudo_id`] へ移行済み（Issue #3179）。親の DELETE・参照アクション・
-    /// ALTER 系の経路は現状この述語のままで、採番方式の親では 0A000 で拒否して塞ぐ（#3180・#3181 が担う）。
+    /// ALTER 系の経路も親スキーマ付きの分岐へ移行済みで（Issue #3180・#3181）、採番方式の親は列参照経路で
+    /// 処理される。この述語を直接使う疑似列用の集約点は、採番方式の親に到達したときの `0A000`（多層防御）に
+    /// 限られる。
     pub(crate) fn references_parent_id(&self) -> bool {
         matches!(self.parent_columns.as_slice(), [only] if only == FOREIGN_KEY_PARENT_ID_COLUMN)
     }
@@ -9839,8 +9841,8 @@ fn resolve_foreign_key_target(
         return Ok(resolved);
     }
     // 採番方式の親（TABLE-23）の `id` は宣言した普通の列なので、以降の列参照の検証へ流す
-    // （Issue #3178。実行時の親の存在検査・連鎖は #3179〜#3181 が担い、それまでは constraint 側が
-    // 0A000／23503 で拒否する）。
+    // （Issue #3178。実行時の親の存在検査・連鎖・ALTER 系の追随は #3179〜#3181 で実装済みで、越境・再送・
+    // crash の試験は #3182。設計記録は foreign-key.md D24）。
     let same_set = |key: &[String]| -> bool {
         key.len() == resolved.parent_columns.len()
             && key.iter().all(|k| resolved.parent_columns.contains(k))
