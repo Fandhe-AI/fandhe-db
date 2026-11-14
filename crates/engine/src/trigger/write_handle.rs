@@ -2,8 +2,8 @@
 //!
 //! 発火側（`tenant/trigger_insert.rs`）が、外側の文と同じ write txn・同じ呼び出しテナントの
 //! `PolicyContext` を借用して作り、[`TriggerCall`](super::call::TriggerCall) に載せてトリガ関数の実体へ
-//! 渡す。実体は raw な `redb::WriteTransaction` を持たず、この窓口の [`TriggerWriteHandle::insert_row`]
-//! だけで書く。
+//! 渡す。実体は raw な `redb::WriteTransaction` を持たず、この窓口の [`TriggerWriteHandle::insert_row`]・
+//! `run_insert`・`run_delete`（Issue #3187）だけで書き、`with_read_source`（同 Issue）の読み取り専用の源だけで読む。
 //!
 //! 契約（fail-closed）:
 //! - 書き込みは SQL `INSERT` と同じ `tenant::insert_typed_row_unchecked` を通る（第 2 の書き込み経路を
@@ -19,9 +19,10 @@
 //!
 //! 本番の結線（トリガ関数の本体の SQL をこの窓口経由で実行する経路）は Issue #3184 の
 //! `core::plpgsql_trigger_host`（`run_insert` で `INSERT ... VALUES` を、Issue #3186 で `run_write` から
-//! `UPDATE` も同じ契約で、`function_def`・`table_schema` で
-//! 同じ txn のカタログを読む。通常の関数・`DO` の本体を同じ Tx で実行するホストは Issue #2226 の
-//! `core::plpgsql_host`）。
+//! `UPDATE` も同じ契約で、`run_delete` で `DELETE` を、`with_read_source` で表を読む `SELECT` を、
+//! `function_def`・`table_schema` で同じ txn のカタログを読む。外側の行ループが進行中の表への `DELETE` は
+//! `trigger::row_loop` の暫定ガードで拒否する。通常の関数・`DO` の本体を同じ Tx で実行するホストは
+//! Issue #2226 の `core::plpgsql_host`）。
 
 use std::cell::RefCell;
 
@@ -29,7 +30,31 @@ use crate::catalog::TableSchema;
 use crate::policy::PolicyContext;
 use crate::row_codec::Value;
 use crate::sql::allowlist::SqlSurfaceError;
+use crate::storage::read_source::ReadSource;
 use crate::tenant::{TenantWriteError, WriteTarget};
+
+/// トリガ本体の読み取り専用の読み取り源（外側の write txn の薄い包み。Issue #3187）。
+/// [`ReadSource`] だけを公開し、書き込みハンドルへ到達できない（変更ログの捕捉を経ない裏口にならない）。
+/// 確定済みスナップショットではないため `snapshot()` は `None` で、キャッシュ経路へは落ちない。
+pub(crate) struct TriggerReadSource<'a>(&'a redb::WriteTransaction);
+
+impl ReadSource for TriggerReadSource<'_> {
+    type Table<'s, K: redb::Key + 'static, V: redb::Value + 'static>
+        = <redb::WriteTransaction as ReadSource>::Table<'s, K, V>
+    where
+        Self: 's;
+
+    fn open_table<'s, K: redb::Key + 'static, V: redb::Value + 'static>(
+        &'s self,
+        def: redb::TableDefinition<'_, K, V>,
+    ) -> Result<Self::Table<'s, K, V>, redb::TableError> {
+        ReadSource::open_table(self.0, def)
+    }
+
+    fn snapshot(&self) -> Option<&redb::ReadTransaction> {
+        None
+    }
+}
 
 /// トリガ内書き込みの窓口。フィールドはすべて非公開で、構築は発火側（`tenant`）だけが行う。
 pub(crate) struct TriggerWriteHandle<'a> {
@@ -153,11 +178,128 @@ impl<'a> TriggerWriteHandle<'a> {
         f: impl FnOnce(WriteTarget<'_>) -> Result<T, SqlSurfaceError>,
     ) -> Result<T, SqlSurfaceError> {
         let out = f(WriteTarget::InTxn(self.write_txn))?;
+        self.note_written(table);
+        Ok(out)
+    }
+
+    /// [`Self::run_insert`] の `DELETE` 版（Issue #3187）。契約は同じで、成功時に `table`（`DELETE` の対象表）を
+    /// 書いた表として記録する。親行の削除で子が宙に浮く遅延 FK を COMMIT 時（Autocommit は文の終わり）に
+    /// 検査させるための記録で、漏れると fail-open になる。
+    pub(crate) fn run_delete<T>(
+        &self,
+        table: &str,
+        f: impl FnOnce(WriteTarget<'_>) -> Result<T, SqlSurfaceError>,
+    ) -> Result<T, SqlSurfaceError> {
+        let out = f(WriteTarget::InTxn(self.write_txn))?;
+        self.note_written(table);
+        // 参照アクションで書き換わった連鎖先の表（孫以降を含む）も書いた表へ記録する。記録しないと、
+        // 連鎖先を親とする遅延 FK が autocommit・COMMIT のどちらでも検査されず fail-open になる。
+        for cascaded in self.cascaded_delete_tables(table)? {
+            self.note_written(&cascaded);
+        }
+        Ok(out)
+    }
+
+    /// `table` の行の `DELETE` が参照アクションで波及しうる表の名前を集める（`table` 自身は含まない）。
+    /// 連鎖は「削除された表」と「キー列が更新された表」の 2 状態で追う（`constraint` の
+    /// `propagate_referential_actions` と同じ規則）。削除された親は `ON DELETE` で、`CASCADE` なら子も削除、
+    /// `SET NULL`／`SET DEFAULT` なら子の FK 列が更新される。キー列が更新された親は、更新列を参照する FK の
+    /// `ON UPDATE`（`NoAction` 以外）で子の FK 列が更新され、その先へ続く。訪問済みは (表, 状態) 単位で持つので、
+    /// 同じ子へ SET NULL と CASCADE の別 FK で到達しても、CASCADE 側の孫以降を必ず再探索する。循環も止まる。
+    /// カタログを読めない場合は `Err`（fail-closed）。
+    fn cascaded_delete_tables(&self, table: &str) -> Result<Vec<String>, SqlSurfaceError> {
+        use crate::catalog::ReferentialAction as Ra;
+        // 状態の訪問済み: (表名の小文字, None=削除 / Some(列名)=その列が更新)。
+        let mut seen: Vec<(String, Option<String>)> = vec![(table.to_ascii_lowercase(), None)];
+        // 探索待ち: (表名, None=削除 / Some(更新された列名の一覧))。
+        let mut stack: Vec<(String, Option<Vec<String>>)> = vec![(table.to_string(), None)];
+        let mut out: Vec<String> = Vec::new();
+        let start = table.to_ascii_lowercase();
+        while let Some((parent, change)) = stack.pop() {
+            let referencing =
+                crate::catalog::referencing_foreign_keys_in_txn(self.write_txn, &parent).map_err(
+                    |e| crate::sql::exec::map_insert_write_error(TenantWriteError::from(e)),
+                )?;
+            for (child, fk) in referencing {
+                // この FK が発火するアクションと、子で変わるもの（None=子行の削除 / Some=FK 列の更新）。
+                let (action, child_change) = match &change {
+                    None => (fk.on_delete(), None),
+                    Some(cols) => {
+                        // `id` 参照は ON UPDATE で発火しない。更新列を参照しない FK も発火しない。
+                        if fk.references_parent_id()
+                            || !fk.parent_columns().iter().any(|c| cols.contains(c))
+                        {
+                            continue;
+                        }
+                        (fk.on_update(), Some(fk.columns().to_vec()))
+                    }
+                };
+                let child_change = match action {
+                    Ra::NoAction => continue,
+                    Ra::Cascade => child_change,
+                    // SET NULL・SET DEFAULT は、どちらの経路でも子の FK 列の更新になる。
+                    _ => Some(fk.columns().to_vec()),
+                };
+                let key = child.name.to_ascii_lowercase();
+                if key != start && !out.iter().any(|t| t.eq_ignore_ascii_case(&child.name)) {
+                    out.push(child.name.clone());
+                }
+                match child_change {
+                    None => {
+                        if !seen.contains(&(key.clone(), None)) {
+                            seen.push((key, None));
+                            stack.push((child.name.clone(), None));
+                        }
+                    }
+                    Some(cols) => {
+                        let mut fresh: Vec<String> = Vec::new();
+                        for c in cols {
+                            if !seen.contains(&(key.clone(), Some(c.clone()))) {
+                                seen.push((key.clone(), Some(c.clone())));
+                                fresh.push(c);
+                            }
+                        }
+                        if !fresh.is_empty() {
+                            stack.push((child.name.clone(), Some(fresh)));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// 外側と同じ write txn を読み取り源として `f` を実行する（トリガ本体の表を読む `SELECT`。Issue #3187）。
+    /// 自 txn の未 commit の変更（外側の文が先に書いた行を含む）が見える。`f` へ渡すのは読み取り専用の
+    /// [`TriggerReadSource`] だけで、raw な `WriteTransaction` は出さない。
+    pub(crate) fn with_read_source<T>(
+        &self,
+        f: impl FnOnce(&TriggerReadSource<'_>) -> Result<T, SqlSurfaceError>,
+    ) -> Result<T, SqlSurfaceError> {
+        f(&TriggerReadSource(self.write_txn))
+    }
+
+    /// `table` の行の `DELETE` が参照アクションで波及しうる表（[`Self::cascaded_delete_tables`] と同じ追跡。
+    /// ON UPDATE の連鎖を含む）のうち、`is_blocked` が真になるものがあるか（行ループ進行中の表の検出に使う。
+    /// Issue #3187 の D6 ガードの拡張）。カタログを読めない場合は検出できないので `Err`（呼び出し側は
+    /// fail-closed で拒否する）。
+    pub(crate) fn delete_reaches_table(
+        &self,
+        table: &str,
+        is_blocked: impl Fn(&str) -> bool,
+    ) -> Result<bool, SqlSurfaceError> {
+        Ok(self
+            .cascaded_delete_tables(table)?
+            .iter()
+            .any(|t| is_blocked(t)))
+    }
+
+    /// 書いた表として記録する（重複なし。書いた順）。
+    fn note_written(&self, table: &str) {
         let mut written = self.written_tables.borrow_mut();
         if !written.iter().any(|t| t == table) {
             written.push(table.to_string());
         }
-        Ok(out)
     }
 
     /// [`Self::run_write`] の `INSERT` 向けの別名（Issue #3184 からの呼び出し元を保つ）。

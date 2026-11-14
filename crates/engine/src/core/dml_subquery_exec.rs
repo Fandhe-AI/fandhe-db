@@ -62,7 +62,7 @@ fn not_supported(detail: &str) -> SqlSurfaceError {
 impl EngineCore {
     /// 述語列のサブクエリを `target`（`InTxn` の共有 write txn）で解決して返す。
     /// 予算は 1 文につき 1 組を新しく初期化する（SELECT 腕と同じ。SQL-29）。
-    fn resolve_dml_where(
+    pub(super) fn resolve_dml_where(
         &self,
         target: &WriteTarget<'_>,
         ctx: &PolicyContext,

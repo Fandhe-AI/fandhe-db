@@ -172,6 +172,9 @@ mod plpgsql_host_tests;
 // 本番のトリガ関数 invoker とセッション無しのホストの結合テスト（Issue #3184・SQL-68）。
 #[cfg(test)]
 mod plpgsql_trigger_invoker_tests;
+// トリガ本体の `DELETE`・表を読む `SELECT` の結合テスト（Issue #3187・SQL-68）。
+#[cfg(test)]
+mod plpgsql_trigger_delete_select_tests;
 // トリガ関数の内部 API の結合テスト（Issue #2228・SQL-68）。
 #[cfg(test)]
 mod plpgsql_trigger_tests;
@@ -3085,6 +3088,35 @@ pub struct PreparedSql {
     /// の時点で見つからない場合だけ「Parse 後に消えた参照先」として拒否する（通常 SQL と同じ規則。
     /// 別名などの誤収集は対象外。Issue #1967）。
     parsed_relations: Vec<String>,
+    /// セッション対応の Parse（[`EngineCore::parse_sql_prepared_with_declared_in_session`]）が刻む
+    /// `search_path` の解決情報（Issue #3197）。セッションを持たない Parse は `None`。Bind・Describe が
+    /// Parse 後の `SET search_path`・カタログ変更を検出して再解決・再 Parse する根拠になる。
+    path_stamp: Option<PreparedPathStamp>,
+}
+
+/// 準備済み文に刻む `search_path` の解決情報（Issue #3197）。[`EngineCore::refresh_prepared_in_txn`] が
+/// 使う。保持量は SQL テキストとトークン列 1 組分で、wire 層の文あたり・セッションあたりの上限が抑える。
+#[derive(Debug, Clone)]
+struct PreparedPathStamp {
+    /// 再 Parse の入力（元の SQL テキスト）。
+    source_sql: std::sync::Arc<str>,
+    /// Parse 時点の `search_path` の世代。
+    epoch: u64,
+    /// `search_path` による書き換えを適用する前のトークン列（`schema.name` 修飾の解決済み）。
+    base_tokens: Vec<crate::sql::lexer::Token>,
+    /// Parse 時に適用した `search_path` による書き換え（解決結果の指紋）。
+    rewrites: Vec<(usize, crate::sql::lexer::Token)>,
+    /// Parse 時点で公告する結果列（`RowDescription` の元。`Ok(None)` は結果列を持たない文、`None` は導出に
+    /// 失敗した文）。再解決後の結果列との比較は現在のカタログからの再導出ではなく、この保存値で行う
+    /// （旧参照先の型変更・DROP の後でも公告済みの内容と照合できる）。
+    columns: Option<Option<Vec<crate::sql::exec::ColumnMeta>>>,
+}
+
+/// 準備済み文の Parse へ渡す `search_path` 解決の入力（セッション対応の Parse だけが渡す。Issue #3197）。
+#[derive(Clone, Copy)]
+struct PreparedPathInput<'a> {
+    session: &'a crate::sql::mode::SessionState,
+    read_snap: Option<&'a redb::ReadTransaction>,
 }
 
 /// 解決済みトークンから再 parse した `DROP TABLE` に、Parse 時に外した `public.` 修飾の
@@ -3108,6 +3140,12 @@ fn attach_public_qualified(
 }
 
 impl PreparedSql {
+    /// 再解決のために保持している元の SQL のバイト長（刻印の無い文は 0）。wire-server が、ストアに無い再解決後の
+    /// 文を保持する portal の保持量へ算入するために使う（Issue #3197）。
+    pub fn retained_sql_bytes(&self) -> usize {
+        self.path_stamp.as_ref().map_or(0, |s| s.source_sql.len())
+    }
+
     /// `$n` ごとの宣言型（`param_count()` と同じ長さ。宣言なしは `None`）。
     pub fn declared_param_types(&self) -> &[Option<crate::sql::params::DeclaredParamType>] {
         &self.declared
@@ -6582,16 +6620,18 @@ impl EngineCore {
             deferred: resolution.deferred_error,
             relation_in_schema: resolution.relation_in_schema,
             set_schema: PathGate::is_set_schema_statement(tokens),
+            unqualified: None,
+            reached: false,
         };
         crate::sql::search_path::apply_rewrites(tokens, resolution.rewrites);
         Ok(gate)
     }
 
-    /// 拡張クエリの Parse・Bind・Describe と `COPY` が、未修飾名が `search_path` で自テナントの SCHEMA に
-    /// 解決される形を検出して固定文言の `0A000` にする（Issue #3195）。解決した内部キーを、path の世代が
-    /// 変わった後の Bind・Describe で使い回したり、`COPY` が public 側へ黙って向いたりしないための
-    /// fail-closed の安全弁で、書き換えはしない（再解決は準備済み文: #3197）。
-    /// `skip` は準備済み文で `public.` 修飾を外した位置。`tenant` が無い（未束縛の）入口は何もしない。
+    /// セッションを持たない Parse（[`Self::parse_sql_prepared_with_declared`]）の準備済み文が、現在の `search_path`
+    /// で未修飾名が自テナントの SCHEMA に解決される形を検出して固定文言の `0A000` にする（Issue #3195）。
+    /// この文は `search_path` を知らない入口で解決済みのため、解決結果を使い回さず書き換えもしない互換の
+    /// fail-closed の安全弁（セッション対応の Parse の文は [`Self::refresh_prepared_in_txn`] が再解決する。
+    /// Issue #3197）。`skip` は準備済み文で `public.` 修飾を外した位置。`tenant` が無い（未束縛の）入口は何もしない。
     pub(crate) fn reject_path_resolved_refs(
         &self,
         tenant: Option<&str>,
@@ -6620,7 +6660,7 @@ impl EngineCore {
     }
 
     /// 準備済み文（通常経路）の未修飾名が `search_path` で SCHEMA に解決されないことを確かめる
-    /// （Bind・Describe。[`Self::reject_path_resolved_refs`] の準備済み文版。一時表の経路は対象外）。
+    /// （[`Self::reject_path_resolved_refs`] の準備済み文版。一時表の経路は対象外）。
     pub(crate) fn reject_prepared_path_resolved_refs(
         &self,
         session: &crate::sql::mode::SessionState,
@@ -6640,6 +6680,158 @@ impl EngineCore {
             &prepared.qualified_positions,
             read_snap,
         )
+    }
+
+    /// 準備済み文を Bind・Describe の時点の `search_path` とカタログで解決し直す（Issue #3197）。
+    /// 解決が Parse 時と同じなら `None`（そのまま使う）、変わっていれば元の SQL を再 Parse した新しい
+    /// 準備済み文を返す（PostgreSQL の再計画に当たる）。wire-server の Bind・Describe と、engine の
+    /// [`Self::bind_prepared_in_session`] 系・Describe 系の先頭が呼ぶ。
+    ///
+    /// - 一時表の経路は何もしない（一時表が最優先で path に依らない）。
+    /// - セッションを持たない Parse の文は [`Self::reject_prepared_path_resolved_refs`] の安全弁を通す。
+    /// - Parse 後に `SET search_path` された（世代が違う）、または path 解決が有効な（自テナントの SCHEMA が
+    ///   path に入り得る・`public` が隠れる）セッションでは、書き換え前のトークン列を現在の path・カタログで
+    ///   解決し直す（同じ世代でも `CREATE TABLE` 等でカタログが変わりうるため）。結果が Parse 時と同じなら使い回す。
+    /// - 再 Parse の結果、`$n` の型・結果列が変わる、または一時表の経路へ変わる場合は固定文言の `0A000`
+    ///   （公告済みの `ParameterDescription`・`RowDescription` と食い違う文を黙って実行しない。fail-closed）。
+    pub(crate) fn refresh_prepared_snap(
+        &self,
+        session: &crate::sql::mode::SessionState,
+        prepared: &PreparedSql,
+        read_snap: Option<&redb::ReadTransaction>,
+    ) -> Result<Option<PreparedSql>, crate::sql::allowlist::SqlSurfaceError> {
+        if !matches!(
+            prepared.route,
+            crate::core::temp_route::PreparedRoute::Plain
+        ) {
+            return Ok(None);
+        }
+        let Some(stamp) = prepared.path_stamp.as_ref() else {
+            self.reject_prepared_path_resolved_refs(session, prepared, read_snap)?;
+            return Ok(None);
+        };
+        // 刻印したテナントと現在のセッションの束縛が食い違う入口は解決しない（fail-closed）。
+        let Some(tenant) = session.resolution_tenant() else {
+            return Err(PathGate::unsupported());
+        };
+        if prepared.resolution_tenant.as_deref() != Some(tenant) {
+            return Err(PathGate::unsupported());
+        }
+        let active =
+            session.search_path_may_hold_tenant_schema() || session.search_path_hides_public();
+        if stamp.epoch == session.search_path_epoch() && !active && stamp.rewrites.is_empty() {
+            return Ok(None);
+        }
+        let resolution = if active {
+            self.with_search_path_lookup(tenant, session, read_snap, |lookup| {
+                if prepared.create_public {
+                    crate::sql::search_path::resolve_path_refs(
+                        session,
+                        &stamp.base_tokens,
+                        &prepared.qualified_positions,
+                        lookup,
+                    )
+                } else {
+                    crate::sql::search_path::resolve_statement_refs(
+                        session,
+                        &stamp.base_tokens,
+                        &prepared.qualified_positions,
+                        lookup,
+                    )
+                }
+            })?
+        } else {
+            crate::sql::search_path::PathResolution::default()
+        };
+        if let Some(e) = resolution.deferred_error {
+            return Err(e);
+        }
+        if resolution.rewrites == stamp.rewrites {
+            // 書き換えが空のままでは「public 表への hit」と「どの要素にも無い miss」を区別できない。
+            // `public` が見えない path に変わったときの miss は、Bind と同じ参照ゲートで `42P01` にする
+            // （Describe(S) が public の表の列を公告し続けない）。
+            crate::sql::search_path::check_unqualified_refs(
+                session,
+                &prepared.tokens,
+                &prepared.qualified_positions,
+            )?;
+            return Ok(None);
+        }
+        let reparsed = {
+            let _session_tz_scope =
+                crate::datetime::SessionTimeZoneScope::enter(session.time_zone().clone());
+            self.parse_sql_prepared_in_session_inner(
+                session,
+                &stamp.source_sql,
+                &prepared.declared,
+                read_snap,
+                &std::cell::Cell::new(false),
+            )?
+        };
+        if !matches!(
+            reparsed.route,
+            crate::core::temp_route::PreparedRoute::Plain
+        ) {
+            return Err(crate::sql::temp_catalog::temp_statement_stale());
+        }
+        if reparsed.param_count != prepared.param_count
+            || reparsed.param_types != prepared.param_types
+        {
+            return Err(Self::refresh_incompatible());
+        }
+        // 旧側は Parse 時に保存した公告済みの結果列。新側は BEGIN 時点（無ければ最新）のカタログで導出する。
+        let Some(old_columns) = stamp.columns.as_ref() else {
+            return Err(Self::refresh_incompatible());
+        };
+        let Ok(new_columns) = self.describe_parsed_in_session_snap(
+            session,
+            &reparsed.dummy_parsed,
+            &reparsed.literal_skip,
+            &reparsed.where_equality_dummy_flags,
+            &self.result_limits,
+            read_snap,
+        ) else {
+            return Err(Self::refresh_incompatible());
+        };
+        if *old_columns != new_columns {
+            return Err(Self::refresh_incompatible());
+        }
+        // 再 Parse した文の刻印は、保存済みの公告列を引き継ぐ（以後の再解決も同じ公告と比較する）。
+        let mut reparsed = reparsed;
+        if let Some(new_stamp) = reparsed.path_stamp.as_mut() {
+            new_stamp.columns = Some(old_columns.clone());
+        }
+        Ok(Some(reparsed))
+    }
+
+    /// 再解決で準備済み文のパラメータ型・結果列が変わるときの固定文言の `0A000`（名前・SCHEMA を含めない）。
+    fn refresh_incompatible() -> crate::sql::allowlist::SqlSurfaceError {
+        crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
+            "cached plan must not change result type or parameter types; re-prepare the statement",
+        )
+    }
+
+    /// [`Self::refresh_prepared_snap`] の明示トランザクション対応版（拡張クエリの Bind・Describe(S)。wire-server が
+    /// 文を引いた直後に 1 度呼び、返った文を関係の同一性・Bind・portal の保持に一貫して使う。Issue #3197）。
+    /// 解決が変わらなければ同じ `Arc` を返す（`Arc::ptr_eq` で判定できる）。
+    pub fn refresh_prepared_in_txn(
+        &self,
+        session: &crate::sql::mode::SessionState,
+        txn: &crate::sql::transaction::SessionTransaction<'_>,
+        prepared: &std::sync::Arc<PreparedSql>,
+    ) -> Result<std::sync::Arc<PreparedSql>, crate::sql::allowlist::SqlSurfaceError> {
+        let result = (|| {
+            let snap = Self::describe_snapshot(txn)?;
+            self.refresh_prepared_snap(session, prepared, snap)
+        })();
+        match result {
+            Ok(Some(fresh)) => Ok(std::sync::Arc::new(fresh)),
+            Ok(None) => Ok(std::sync::Arc::clone(prepared)),
+            Err(e) => Err(match session.resolution_tenant() {
+                Some(t) => self.scrub_error_for_tenant(t, e),
+                None => e,
+            }),
+        }
     }
 
     /// [`Self::parse_tokens_gated`] の構文解析部（未束縛 `GRANT`／`REVOKE` のエラー正規化を持つ）。
@@ -8312,7 +8504,46 @@ impl EngineCore {
         declared: &[Option<crate::sql::params::DeclaredParamType>],
         tenant: Option<&str>,
     ) -> Result<PreparedSql, crate::sql::allowlist::SqlSurfaceError> {
-        self.parse_sql_prepared_for_tenant_impl(sql, declared, tenant)
+        self.parse_sql_prepared_for_tenant_impl(
+            sql,
+            declared,
+            tenant,
+            None,
+            &mut PathGate::default(),
+        )
+        .map(|mut prepared| {
+            prepared.resolution_tenant = tenant.map(Into::into);
+            prepared
+        })
+        .map_err(|e| match tenant {
+            Some(t) => self.scrub_error_for_tenant(t, e),
+            None => e,
+        })
+    }
+
+    /// セッション対応の Parse の本体（拡張クエリ。Issue #3197）。未修飾名を `search_path` で自テナントの
+    /// SCHEMA まで解決し、解決結果を準備済み文に刻む。判定順は構文 `42601` → 解決エラー → 参照ゲート `42P01` →
+    /// 解析エラー → SET SCHEMA の `0A000`（簡易クエリの [`PathGate::finish`] と同じ）。`read_snap` は
+    /// 明示 Tx の `BEGIN` 時点のスナップショット（無ければ最新）。
+    pub(crate) fn parse_sql_prepared_for_tenant_in_session(
+        &self,
+        sql: &str,
+        declared: &[Option<crate::sql::params::DeclaredParamType>],
+        session: &crate::sql::mode::SessionState,
+        read_snap: Option<&redb::ReadTransaction>,
+        gate_reached: &std::cell::Cell<bool>,
+    ) -> Result<PreparedSql, crate::sql::allowlist::SqlSurfaceError> {
+        let tenant = session.resolution_tenant();
+        let mut gate = PathGate::default();
+        let result = self.parse_sql_prepared_for_tenant_impl(
+            sql,
+            declared,
+            tenant,
+            Some(PreparedPathInput { session, read_snap }),
+            &mut gate,
+        );
+        gate_reached.set(gate.reached);
+        gate.finish(result)
             .map(|mut prepared| {
                 prepared.resolution_tenant = tenant.map(Into::into);
                 prepared
@@ -8328,18 +8559,25 @@ impl EngineCore {
         sql: &str,
         declared: &[Option<crate::sql::params::DeclaredParamType>],
         tenant: Option<&str>,
+        path: Option<PreparedPathInput<'_>>,
+        gate: &mut PathGate,
     ) -> Result<PreparedSql, crate::sql::allowlist::SqlSurfaceError> {
         let mut tokens =
             Self::normalize_row_count_clauses(crate::sql::lexer::tokenize_with_params(sql)?)?;
         // `schema.table` のテーブル参照を解決して未修飾の名前（public）または内部キー（テナントの
         // SCHEMA 配下）へ置き換える（TABLE-27・Issue #1714・#1717）。位置推論・型推論・Bind の再
         // parse が同じ（解決済みの）トークン列を見るよう、最初に行う。
-        let probe = |schema: &str| match tenant {
-            Some(t) => self
+        // 明示 Tx の再 Parse（`read_snap` あり）は、`BEGIN` 時点のスナップショットで SCHEMA を解決する
+        // （live の最新カタログで引くと、BEGIN 後の RENAME・DROP SCHEMA と食い違う。Issue #3197）。
+        let probe_snap = path.as_ref().and_then(|p| p.read_snap);
+        let probe = |schema: &str| match (tenant, probe_snap) {
+            (Some(t), Some(snap)) => crate::catalog::namespace::schema_id_in_txn(snap, t, schema)
+                .map_err(crate::catalog::table_lookup_error),
+            (Some(t), None) => self
                 .storage
                 .schema_id(t, schema)
                 .map_err(crate::catalog::table_lookup_error),
-            None => Ok(None),
+            (None, _) => Ok(None),
         };
         let resolver: Option<crate::sql::relation_name::SchemaResolver<'_>> =
             tenant.map(|_| &probe as crate::sql::relation_name::SchemaResolver<'_>);
@@ -8348,6 +8586,60 @@ impl EngineCore {
         let public_qualified = rewrite.names;
         let qualified_positions = rewrite.positions;
         let create_public = rewrite.create_public;
+        // Issue #3197: 未修飾名を `search_path` で自テナントの SCHEMA まで解決し、簡易クエリと同じ内部キーへ
+        // 書き換える（位置推論・型推論・構造検証 parse・ACL 検査が同じ解決済みトークンを見るよう、`$n` の検査より
+        // 前に行う）。書き換え前のトークン列と書き換えを刻み、Bind・Describe の再解決に使う。
+        let mut path_stamp: Option<PreparedPathStamp> = None;
+        if let Some(p) = path {
+            // 解決テナントが未束縛の入口は解決せず（刻印もせず）、参照ゲートだけを判定する。
+            if let Some(t) = tenant {
+                let base_tokens = tokens.clone();
+                let mut rewrites = Vec::new();
+                if p.session.search_path_may_hold_tenant_schema()
+                    || p.session.search_path_hides_public()
+                {
+                    let resolution =
+                        self.with_search_path_lookup(t, p.session, p.read_snap, |lookup| {
+                            // `public.` で明示修飾された作成名は作成先を `search_path` で決めない。
+                            if create_public {
+                                crate::sql::search_path::resolve_path_refs(
+                                    p.session,
+                                    &tokens,
+                                    &qualified_positions,
+                                    lookup,
+                                )
+                            } else {
+                                crate::sql::search_path::resolve_statement_refs(
+                                    p.session,
+                                    &tokens,
+                                    &qualified_positions,
+                                    lookup,
+                                )
+                            }
+                        })?;
+                    gate.deferred = resolution.deferred_error;
+                    gate.relation_in_schema = resolution.relation_in_schema;
+                    gate.set_schema = PathGate::is_set_schema_statement(&tokens);
+                    rewrites = resolution.rewrites.clone();
+                    crate::sql::search_path::apply_rewrites(&mut tokens, resolution.rewrites);
+                }
+                path_stamp = Some(PreparedPathStamp {
+                    source_sql: std::sync::Arc::from(sql),
+                    epoch: p.session.search_path_epoch(),
+                    base_tokens,
+                    rewrites,
+                    columns: None,
+                });
+            }
+            // `public` が見えない path の未修飾名ゲート（解決後のトークンに対して判定する。TABLE-27・Issue #1715）。
+            gate.unqualified = crate::sql::search_path::check_unqualified_refs(
+                p.session,
+                &tokens,
+                &qualified_positions,
+            )
+            .err();
+            gate.reached = true;
+        }
         // TABLE-18・SQL-23・TASK-205（Issue #909）: `CREATE VIEW`／`DROP VIEW`
         // は DDL であり、`sql::params` が受理する `$n` の許可位置一覧
         // （WHERE 等号右辺・VALUES 節等）はいずれも DML 向けの規範形のため、
@@ -8457,11 +8749,25 @@ impl EngineCore {
                     other => other,
                 })
                 .collect();
-            let stmt = crate::sql::allowlist::validate_copy_tokens(
-                &copy_tokens,
-                &self.storage,
-                self.ledger_mode,
-            )
+            // 明示 Tx の再 Parse（`read_snap` あり）では、読み取りの `COPY TO` の宛先を `BEGIN` 時点の
+            // スナップショットで検証する（名前解決と同じ読み取り源。簡易クエリの `begin_copy` と同じ規則で、
+            // `COPY FROM`〔書き込み〕は最新のカタログ。Issue #2403）。
+            let copy_snap = path
+                .as_ref()
+                .and_then(|p| p.read_snap)
+                .filter(|_| crate::sql::allowlist::is_copy_to_statement(&copy_tokens));
+            let stmt = match copy_snap {
+                Some(snap) => crate::sql::allowlist::validate_copy_tokens(
+                    &copy_tokens,
+                    &crate::catalog::ViewWriteSnapshot::over(snap),
+                    self.ledger_mode,
+                ),
+                None => crate::sql::allowlist::validate_copy_tokens(
+                    &copy_tokens,
+                    &self.storage,
+                    self.ledger_mode,
+                ),
+            }
             .map_err(|e| self.reclassify_matview_write_error(e))?;
             return Ok(PreparedSql {
                 resolution_tenant: None,
@@ -8482,6 +8788,11 @@ impl EngineCore {
                 create_public,
                 parsed_relations: Vec::new(),
                 route: temp_route::PreparedRoute::Plain,
+                path_stamp: path_stamp.take().map(|mut st| {
+                    // `COPY` は結果列を持たない（Describe は `NoData`）。
+                    st.columns = Some(None);
+                    st
+                }),
             });
         }
         let param_count = crate::sql::params::validate_param_positions(&tokens)?;
@@ -8522,24 +8833,28 @@ impl EngineCore {
         // 式内 `$n`（`1 + $1` 等）は文字列ダミーでは定数畳み込み／束縛の型検査に落ちるため、
         // 推論を parse より前に置く。推論不能（`42P18`）のときだけ、構文エラー（`42601`）を
         // 先に返す（PostgreSQL と同じ優先順位）ため文字列ダミーで parse を試す。
-        let (param_types, param_checks) =
-            match self.infer_param_types(&tokens, param_count, declared) {
-                Ok(inferred) => inferred,
-                Err(e @ crate::sql::allowlist::SqlSurfaceError::IndeterminateDatatype { .. }) => {
-                    // 文字列ダミーの定数畳み込みで型エラーになっても途中終了しないよう、
-                    // 構文エラー以外を無視して文全体を走査する。
-                    let _guard = crate::sql::const_expr::defer_all_non_syntax_errors();
-                    if let Err(syntax) =
-                        self.parse_tokens(crate::sql::params::substitute_dummy(&tokens))
-                    {
-                        if syntax.wire_code() == "42601" {
-                            return Err(syntax);
-                        }
+        let (param_types, param_checks) = match self.infer_param_types(
+            &tokens,
+            param_count,
+            declared,
+            path.and_then(|p| p.read_snap),
+        ) {
+            Ok(inferred) => inferred,
+            Err(e @ crate::sql::allowlist::SqlSurfaceError::IndeterminateDatatype { .. }) => {
+                // 文字列ダミーの定数畳み込みで型エラーになっても途中終了しないよう、
+                // 構文エラー以外を無視して文全体を走査する。
+                let _guard = crate::sql::const_expr::defer_all_non_syntax_errors();
+                if let Err(syntax) =
+                    self.parse_tokens(crate::sql::params::substitute_dummy(&tokens))
+                {
+                    if syntax.wire_code() == "42601" {
+                        return Err(syntax);
                     }
-                    return Err(e);
                 }
-                Err(e) => return Err(e),
-            };
+                return Err(e);
+            }
+            Err(e) => return Err(e),
+        };
         let kinds: Vec<crate::sql::params::ParamLiteralKind> =
             param_types.iter().map(|t| t.literal_kind()).collect();
         // 等価述語のダミーフラグは種別確定後に求める（非 String 種別は
@@ -8560,7 +8875,12 @@ impl EngineCore {
             let _guard = crate::sql::const_expr::defer_param_value_errors(positions);
             crate::datetime::reset_session_time_zone_read();
             let dummy_tokens = Self::normalize_row_count_clauses(dummy_tokens)?;
-            let mut parsed = self.parse_tokens_recorded(dummy_tokens, None, None, &parse_hits)?;
+            let mut parsed = self.parse_tokens_recorded(
+                dummy_tokens,
+                None,
+                path.and_then(|p| p.read_snap),
+                &parse_hits,
+            )?;
             // 解決済みトークンの再 parse は `public.` 修飾の情報を持たない。`$n` を含まない文の
             // 実行は `dummy_parsed` を複製するため、ここで保持して実行時の衝突検査を通す。
             attach_public_qualified(&mut parsed, &public_qualified, create_public);
@@ -8591,6 +8911,19 @@ impl EngineCore {
             })
             .collect();
         let typed_positions = crate::sql::params::TypedPositions::build(&tokens, &typed_numeric);
+        // Issue #3197: 公告する結果列を Parse 時点で保存する（再解決後の互換性比較の基準）。
+        if let (Some(stamp), Some(p)) = (path_stamp.as_mut(), path) {
+            stamp.columns = self
+                .describe_parsed_in_session_snap(
+                    p.session,
+                    &dummy_parsed,
+                    &literal_skip,
+                    &where_equality_dummy_flags,
+                    &self.result_limits,
+                    p.read_snap,
+                )
+                .ok();
+        }
         Ok(PreparedSql {
             resolution_tenant: None,
             tokens,
@@ -8609,6 +8942,7 @@ impl EngineCore {
             create_public,
             parsed_relations: parse_hits.recorded_names(),
             route: temp_route::PreparedRoute::Plain,
+            path_stamp: path_stamp.take(),
         })
     }
 
@@ -8636,6 +8970,7 @@ impl EngineCore {
         tokens: &[crate::sql::lexer::Token],
         param_count: u16,
         declared: &[Option<crate::sql::params::DeclaredParamType>],
+        read_snap: Option<&redb::ReadTransaction>,
     ) -> Result<
         (
             Vec<crate::sql::params::PreparedParamType>,
@@ -8663,6 +8998,13 @@ impl EngineCore {
                 _ => None,
             }),
         };
+        // 表スキーマの引き先。再 Parse は `BEGIN` 時点のスナップショット、通常の Parse は最新カタログ。
+        let schema_of = |table: &str| -> Option<crate::catalog::TableSchema> {
+            match read_snap {
+                Some(rs) => crate::catalog::get_table_schema_in_txn_impl(rs, table, true).ok(),
+                None => self.storage.get_table_schema(table).ok(),
+            }
+        };
         // `INSERT INTO <表> ( <列> {, <列>} ) VALUES`（構文は `Parser::parse_insert` が
         // 保証する形。ここでは型の引き当てだけに使い、崩れていれば未解決として扱う）。
         // 列リスト省略（`INSERT INTO <表> VALUES (...)`。SQL-50・Issue #1730）は、表のスキーマから
@@ -8671,12 +9013,12 @@ impl EngineCore {
         let insert_target: Option<(String, Vec<String>)> = insert_target_from_tokens(tokens)
             .or_else(|| {
                 let table = insert_table_without_column_list(tokens)?;
-                let schema = self.storage.get_table_schema(&table).ok()?;
+                let schema = schema_of(&table)?;
                 Some((table, crate::catalog::lookup_star_columns_of(&schema)))
             });
         let column_type = |table: &str, column: &str| -> Option<PreparedParamType> {
             let id_type = || Some(PreparedParamType::Column(ColumnMeta::Id));
-            let (schema, column) = match self.storage.get_table_schema(table) {
+            let (schema, column) = match schema_of(table).ok_or(()) {
                 Ok(schema) if column == "id" && schema.has_pseudo_id() => return id_type(),
                 Ok(schema) => (schema, column.to_string()),
                 // 表でなければ、ビューの公開列を基表の列へ解決して型を引く（書き込み文・読み取り文とも。
@@ -8684,16 +9026,27 @@ impl EngineCore {
                 // 判定する（TEXT 列を `id` として公開するビューで `$n` を整数と誤推論しない）。
                 // 解決できなければ、`id` は従来どおり疑似列、他は未解決（`Text`）。
                 Err(_) => {
-                    let resolved = self
-                        .storage
-                        .with_view_write_snapshot(table, |snap, _| {
-                            let (base, physical) = crate::sql::view_insert::resolve_insert_column(
-                                snap, table, column,
-                            )?;
-                            snap.table_schema(&base).ok().map(|s| (s, physical))
-                        })
-                        .ok()
-                        .flatten();
+                    let resolved = match read_snap {
+                        // 再 Parse（Issue #3197）は BEGIN 時点のスナップショットでビューを引く。
+                        Some(rs) => {
+                            let view = crate::catalog::ViewWriteSnapshot::over(rs);
+                            crate::sql::view_insert::resolve_insert_column(&view, table, column)
+                                .and_then(|(base, physical)| {
+                                    view.table_schema(&base).ok().map(|s| (s, physical))
+                                })
+                        }
+                        None => self
+                            .storage
+                            .with_view_write_snapshot(table, |snap, _| {
+                                let (base, physical) =
+                                    crate::sql::view_insert::resolve_insert_column(
+                                        snap, table, column,
+                                    )?;
+                                snap.table_schema(&base).ok().map(|s| (s, physical))
+                            })
+                            .ok()
+                            .flatten(),
+                    };
                     match resolved {
                         Some(r) => r,
                         None if column == "id" => return id_type(),
@@ -9062,7 +9415,8 @@ impl EngineCore {
         // `bind_aggregate_with_dummy_flags`／`bind_projection_for_describe`／
         // `bind_scan_with_dummy_flags` の
         // いずれが呼ばれても同じ配列を共有する）。
-        self.reject_prepared_path_resolved_refs(session, prepared, None)?;
+        let refreshed = self.refresh_prepared_snap(session, prepared, None)?;
+        let prepared = refreshed.as_ref().unwrap_or(prepared);
         Self::check_prepared_for_session(session, prepared)?;
         // SQL-40・Issue #1967: 権限の無い主体に列の型情報を返さない（fail-closed）。
         self.require_prepared_read_privileges(session, prepared, &prepared.dummy_parsed, None)?;
@@ -11542,7 +11896,8 @@ impl EngineCore {
     {
         let result = (|| {
             let snap = Self::describe_snapshot(txn)?;
-            self.reject_prepared_path_resolved_refs(session, prepared, snap)?;
+            let refreshed = self.refresh_prepared_snap(session, prepared, snap)?;
+            let prepared = refreshed.as_ref().unwrap_or(prepared);
             Self::check_prepared_for_session(session, prepared)?;
             // SQL-40・Issue #1967: 権限の無い主体に列の型情報を返さない（fail-closed）。
             self.require_prepared_read_privileges(session, prepared, &prepared.dummy_parsed, snap)?;
@@ -17357,8 +17712,9 @@ impl EngineCore {
         ctx: &PolicyContext,
         session: &crate::sql::mode::SessionState,
         sql: &str,
+        pin: Option<&[(usize, crate::sql::lexer::Token)]>,
     ) -> Result<CopyPlan, crate::sql::allowlist::SqlSurfaceError> {
-        self.check_copy_search_path(ctx, session, sql, None)?;
+        self.check_copy_search_path(ctx, session, sql, None, pin)?;
         if let Some(plan) = self.begin_copy_temp(
             ctx,
             session,
@@ -17373,7 +17729,7 @@ impl EngineCore {
             sql,
             false,
             Some(&resolver),
-            |t| self.resolve_copy_tokens_path(ctx.tenant_id(), session, t, None),
+            |t| self.resolve_copy_tokens_path(ctx.tenant_id(), session, t, None, pin),
         )?;
         let stmt = crate::sql::allowlist::validate_copy_tokens(
             &copy_tokens,
@@ -17407,6 +17763,7 @@ impl EngineCore {
         session: &crate::sql::mode::SessionState,
         sql: &str,
         read_snap: Option<&redb::ReadTransaction>,
+        pin: Option<&[(usize, crate::sql::lexer::Token)]>,
     ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
         if !(session.search_path_hides_public() || session.search_path_may_hold_tenant_schema()) {
             return Ok(());
@@ -17414,7 +17771,7 @@ impl EngineCore {
         let Ok(mut tokens) = crate::sql::lexer::tokenize_marked(sql) else {
             return Ok(());
         };
-        self.resolve_copy_tokens_path(ctx.tenant_id(), session, &mut tokens, read_snap)?;
+        self.resolve_copy_tokens_path(ctx.tenant_id(), session, &mut tokens, read_snap, pin)?;
         if !session.search_path_hides_public() {
             return Ok(());
         }
@@ -17431,9 +17788,35 @@ impl EngineCore {
         session: &crate::sql::mode::SessionState,
         tokens: &mut [crate::sql::lexer::Token],
         read_snap: Option<&redb::ReadTransaction>,
+        pin: Option<&[(usize, crate::sql::lexer::Token)]>,
     ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+        // 検証済みの宛先が渡されていれば、再解決せずそのまま適用する（照合から開始までの間に先行 path へ
+        // 同名の表が作られても宛先が変わらない。Issue #3197）。
+        if let Some(pin) = pin {
+            crate::sql::search_path::apply_rewrites(tokens, pin.to_vec());
+            return Ok(());
+        }
         if !(session.search_path_may_hold_tenant_schema() || session.search_path_hides_public()) {
             return Ok(());
+        }
+        let rewrites = self.copy_path_rewrites(tenant, session, tokens, read_snap)?;
+        crate::sql::search_path::apply_rewrites(tokens, rewrites);
+        Ok(())
+    }
+
+    /// `COPY` の字句列に対する `search_path` の書き換え（位置と置換後トークン）を求める。
+    /// [`Self::resolve_copy_tokens_path`] の解決部で、Bind 時の宛先の同一性の記録・Execute での照合
+    /// （Issue #3197）にも共有する。path 解決が無効なセッションは空。
+    pub(crate) fn copy_path_rewrites(
+        &self,
+        tenant: &str,
+        session: &crate::sql::mode::SessionState,
+        tokens: &[crate::sql::lexer::Token],
+        read_snap: Option<&redb::ReadTransaction>,
+    ) -> Result<Vec<(usize, crate::sql::lexer::Token)>, crate::sql::allowlist::SqlSurfaceError>
+    {
+        if !(session.search_path_may_hold_tenant_schema() || session.search_path_hides_public()) {
+            return Ok(Vec::new());
         }
         let resolution = self.with_search_path_lookup(tenant, session, read_snap, |lookup| {
             crate::sql::search_path::resolve_path_refs(session, tokens, &[], lookup)
@@ -17441,8 +17824,7 @@ impl EngineCore {
         if let Some(e) = resolution.deferred_error {
             return Err(e);
         }
-        crate::sql::search_path::apply_rewrites(tokens, resolution.rewrites);
-        Ok(())
+        Ok(resolution.rewrites)
     }
 
     /// `begin_copy_unscrubbed` の公開入口。判定順序・エラー契約・実行結果は同関数と同一で、
@@ -17460,7 +17842,7 @@ impl EngineCore {
         // の後でも既定の on として絞った結果を黙って返さない（RLS 有効な表は走査前に `42501`）。
         let _row_security_scope =
             crate::sql::policy_applicability::RowSecurityScope::enter(session.row_security());
-        self.begin_copy_unscrubbed(ctx, session, sql)
+        self.begin_copy_unscrubbed(ctx, session, sql, None)
             .map_err(|e| self.scrub_error(ctx, e))
     }
 
@@ -17540,13 +17922,14 @@ impl EngineCore {
         session: &crate::sql::mode::SessionState,
         txn: &mut crate::sql::transaction::SessionTransaction<'e>,
         sql: &str,
+        pin: Option<&[(usize, crate::sql::lexer::Token)]>,
     ) -> Result<CopyPlan, crate::sql::allowlist::SqlSurfaceError> {
         use crate::sql::transaction::TransactionStatus;
         match txn.status() {
-            TransactionStatus::Idle => self.begin_copy(ctx, session, sql),
+            TransactionStatus::Idle => self.begin_copy_unscrubbed(ctx, session, sql, pin),
             TransactionStatus::Failed => Err(txn.take_failed_error()),
             TransactionStatus::InTransaction => {
-                let result = self.begin_copy_active(ctx, session, txn, sql);
+                let result = self.begin_copy_active(ctx, session, txn, sql, pin);
                 if let Err(e) = &result {
                     txn.fail_for(e);
                 }
@@ -17565,12 +17948,43 @@ impl EngineCore {
         txn: &mut crate::sql::transaction::SessionTransaction<'e>,
         sql: &str,
     ) -> Result<CopyPlan, crate::sql::allowlist::SqlSurfaceError> {
+        self.begin_copy_in_txn_with_pin(ctx, session, txn, sql, None)
+    }
+
+    /// [`Self::begin_copy_in_txn`] の、拡張クエリの Execute が [`Self::arm_copy_target`] で置いた検証済みの
+    /// 宛先を使う版（Issue #3197）。`wire-server` の `COPY` 入口が呼ぶ。置かれた宛先は元 SQL が一致するときだけ
+    /// 使い（簡易クエリや別の文は従来どおり再解決）、一致の有無にかかわらず取り出して空にする。
+    pub fn begin_copy_in_txn_armed<'e>(
+        &'e self,
+        ctx: &PolicyContext,
+        session: &mut crate::sql::mode::SessionState,
+        txn: &mut crate::sql::transaction::SessionTransaction<'e>,
+        sql: &str,
+    ) -> Result<CopyPlan, crate::sql::allowlist::SqlSurfaceError> {
+        let pin = session.take_copy_target_pin(sql);
+        self.begin_copy_in_txn_with_pin(
+            ctx,
+            session,
+            txn,
+            sql,
+            pin.as_deref().map(|p| p.rewrites.as_slice()),
+        )
+    }
+
+    fn begin_copy_in_txn_with_pin<'e>(
+        &'e self,
+        ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
+        txn: &mut crate::sql::transaction::SessionTransaction<'e>,
+        sql: &str,
+        pin: Option<&[(usize, crate::sql::lexer::Token)]>,
+    ) -> Result<CopyPlan, crate::sql::allowlist::SqlSurfaceError> {
         Self::check_resolution_tenant(session, ctx)?;
         // 自動コミット（`Idle`）・明示トランザクションのどちらの `COPY ... TO` 走査にも束縛する
         // （[`Self::begin_copy`] と同じ理由）。
         let _row_security_scope =
             crate::sql::policy_applicability::RowSecurityScope::enter(session.row_security());
-        self.begin_copy_in_txn_unscrubbed(ctx, session, txn, sql)
+        self.begin_copy_in_txn_unscrubbed(ctx, session, txn, sql, pin)
             .map_err(|e| self.scrub_error(ctx, e))
     }
 
@@ -17580,11 +17994,12 @@ impl EngineCore {
         session: &crate::sql::mode::SessionState,
         txn: &mut crate::sql::transaction::SessionTransaction<'e>,
         sql: &str,
+        pin: Option<&[(usize, crate::sql::lexer::Token)]>,
     ) -> Result<CopyPlan, crate::sql::allowlist::SqlSurfaceError> {
         // `COPY (...) TO STDOUT` も明示トランザクションの文として読んだ基底表を記録する
         // （SQL-38・Issue #2404。[`Self::execute_in_active_txn`] と同じ区間）。
         let read_scope = txn.read_set_scope();
-        let result = self.begin_copy_active_inner(ctx, session, txn, sql);
+        let result = self.begin_copy_active_inner(ctx, session, txn, sql, pin);
         if let Some(scope) = read_scope {
             txn.absorb_read_set(scope.finish());
         }
@@ -17598,6 +18013,7 @@ impl EngineCore {
         session: &crate::sql::mode::SessionState,
         txn: &mut crate::sql::transaction::SessionTransaction<'e>,
         sql: &str,
+        pin: Option<&[(usize, crate::sql::lexer::Token)]>,
     ) -> Result<CopyPlan, crate::sql::allowlist::SqlSurfaceError> {
         // 明示 Tx の途中（writer 取得前）は `COPY TO` の検証・実行と同じ `BEGIN` 時点のスナップショットで
         // 安全弁を判定する（最新カタログだと BEGIN 後の DROP・RENAME で SCHEMA を飛ばし public 側へ向く）。
@@ -17611,7 +18027,7 @@ impl EngineCore {
             } else {
                 None
             };
-            self.check_copy_search_path(ctx, session, sql, snap)?;
+            self.check_copy_search_path(ctx, session, sql, snap, pin)?;
         }
         if let Some(plan) = self.begin_copy_temp(ctx, session, Some(&mut *txn), sql)? {
             return Ok(plan);
@@ -17632,7 +18048,7 @@ impl EngineCore {
                 sql,
                 false,
                 Some(&resolver),
-                |t| self.resolve_copy_tokens_path(ctx.tenant_id(), session, t, snap),
+                |t| self.resolve_copy_tokens_path(ctx.tenant_id(), session, t, snap, pin),
             )?
         };
         // `COPY FROM`（書き込み）の検証・schema lookup は読み取りではないので読み取り集合へ記録しない
@@ -21602,6 +22018,11 @@ struct PathGate {
     relation_in_schema: bool,
     /// `ALTER .. SET SCHEMA ..` の文か（未修飾の対象が SCHEMA に解決されたら `0A000`。tracked: #3198）。
     set_schema: bool,
+    /// 拡張クエリの Parse だけが使う。解決後のトークンに対する参照ゲートの `42P01`（解析エラーに優先する）。
+    unqualified: Option<crate::sql::allowlist::SqlSurfaceError>,
+    /// 拡張クエリの Parse で、解決・参照ゲートの判定まで到達したか（到達前に失敗した場合だけ、呼び出し側が
+    /// 元の SQL の字句に対する参照ゲートで補う）。
+    reached: bool,
 }
 
 impl PathGate {
@@ -21616,16 +22037,19 @@ impl PathGate {
     /// 未修飾名は修飾名と同じ内部キーへ書き換え済みなので、受理・拒否は修飾形と同じになる。例外は、
     /// 未修飾の対象が SCHEMA に解決された `ALTER TABLE .. SET SCHEMA`（テナント SCHEMA 間の移動は
     /// tracked: #3198）で、修飾形の `42501` に先回りせず固定文言の `0A000` にする（fail-closed）。
-    fn finish(
+    fn finish<T>(
         self,
-        parsed: Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError>,
-    ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
+        parsed: Result<T, crate::sql::allowlist::SqlSurfaceError>,
+    ) -> Result<T, crate::sql::allowlist::SqlSurfaceError> {
         if let Err(e) = &parsed {
             if e.wire_code() == "42601" {
                 return parsed;
             }
         }
         if let Some(e) = self.deferred {
+            return Err(e);
+        }
+        if let Some(e) = self.unqualified {
             return Err(e);
         }
         let parsed = parsed?;

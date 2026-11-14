@@ -299,6 +299,18 @@ pub struct SessionState {
     default_access_mode: Option<crate::sql::transaction::TxnAccessMode>,
     /// 同じく既定の要求分離レベル（記録のみ。実行の保証は変えない）。
     default_isolation_level: Option<crate::sql::transaction::RequestedIsolationLevel>,
+    /// 拡張クエリの Execute が `COPY` の開始へ渡す、Bind で検証した宛先の解決結果（Issue #3197）。
+    /// 照合直後に [`crate::EngineCore::arm_copy_target`] が置き、`COPY` 開始（`begin_copy_in_txn_armed`）が
+    /// 取り出して再解決の代わりに適用する（照合と開始の間に先行 path へ同名の表が作られても宛先が変わらない）。
+    /// 実行ごとに必ず取り除かれ、トリガ用の写しへは引き継がない。
+    copy_target_pin: Option<Box<CopyTargetPin>>,
+}
+
+/// 検証済みの `COPY` 宛先（Issue #3197）。元 SQL と、その字句列への `search_path` の書き換えの組。
+#[derive(Debug, Clone)]
+pub(crate) struct CopyTargetPin {
+    pub(crate) sql: String,
+    pub(crate) rewrites: Vec<(usize, crate::sql::lexer::Token)>,
 }
 
 /// `search_path` の世代の採番元。0 は採番されない。
@@ -341,6 +353,7 @@ impl SessionState {
             session_role_id,
             default_access_mode,
             default_isolation_level,
+            copy_target_pin: _,
         } = self;
         SessionState {
             search_mode: *search_mode,
@@ -370,7 +383,23 @@ impl SessionState {
             session_role_id: *session_role_id,
             default_access_mode: *default_access_mode,
             default_isolation_level: *default_isolation_level,
+            copy_target_pin: None,
         }
+    }
+
+    /// 検証済みの `COPY` 宛先を次の `COPY` 開始のために置く（Issue #3197。engine 内部用）。
+    pub(crate) fn arm_copy_target_pin(&mut self, pin: CopyTargetPin) {
+        self.copy_target_pin = Some(Box::new(pin));
+    }
+
+    /// 置かれた宛先を取り出す。元 SQL が一致するものだけ返し、いずれにせよ空にする。
+    pub(crate) fn take_copy_target_pin(&mut self, sql: &str) -> Option<Box<CopyTargetPin>> {
+        self.copy_target_pin.take().filter(|p| p.sql == sql)
+    }
+
+    /// 置かれた `COPY` 宛先を破棄する（実行が `COPY` 開始まで進まなかった場合に呼び出し元が残さない）。
+    pub fn clear_copy_target_pin(&mut self) {
+        self.copy_target_pin = None;
     }
 
     /// `SET SESSION CHARACTERISTICS` が設定した既定アクセスモード（未設定は `None`。Issue #1939）。

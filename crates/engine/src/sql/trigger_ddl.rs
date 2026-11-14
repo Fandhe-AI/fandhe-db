@@ -8,7 +8,8 @@
 //! `0A000` を通過した後にだけ来る。
 //!
 //! 判定順（決定的・fail-closed）: 構文（`allowlist`）→ 権限 → 明示 Tx → カタログの単一 write txn 内で
-//! 対象の種別（ビュー等は `42809`）→ 表の存在（`42P01`）→ `UPDATE OF` の列（`42703`）→ 関数
+//! 対象の種別（ビュー等は `42809`）→ 表の存在（`42P01`）→ 共有 `public` 表（`0A000`。Issue #3361）→
+//! `UPDATE OF` の列（`42703`）→ 関数
 //! （不在 `42883`・トリガ関数でない `42P17`）→ 同名の既存（`42710`）→ 件数上限（`54000`）。
 //!
 //! テナント境界（P0）: scope は呼び出し元が渡す検証済みの `tenant_id` だけ。他テナントのトリガは不在と
@@ -16,7 +17,7 @@
 
 use crate::catalog::trigger::{
     TriggerDef, TriggerEvents, TRIGGER_ALREADY_EXISTS_MESSAGE, TRIGGER_FUNCTION_NOT_FOUND_MESSAGE,
-    TRIGGER_FUNCTION_NOT_TRIGGER_MESSAGE,
+    TRIGGER_FUNCTION_NOT_TRIGGER_MESSAGE, TRIGGER_ON_SHARED_PUBLIC_TABLE_MESSAGE,
 };
 use crate::catalog::CatalogError;
 use crate::sql::allowlist::{SqlSurfaceError, ValidatedCreateTrigger, ValidatedDropTrigger};
@@ -45,7 +46,8 @@ impl DropTriggerOutcome {
 /// `RETURNS trigger` の PL/pgSQL 関数（#2228 が保存形式を追加し、#2217 が SQL の
 /// `CREATE FUNCTION ... RETURNS trigger LANGUAGE plpgsql` の受理で作れるようにした）だけが成功する。
 /// それ以外は `42883`／`42P17` で止まる（`catalog::trigger::returns_trigger`。fail-closed）。
-/// 発火側の本番 invoker は #1720 が結線するまで未結線で、該当表への DML は `0A000` で止まる。
+/// 共有 `public` 表への定義は `0A000`（Issue #3361。作成後に書き込みだけが失敗する状態を作らない）。
+/// テナントの SCHEMA 配下の表へは作れる。
 pub(crate) fn execute_create_trigger(
     storage: &Storage,
     tenant_id: &str,
@@ -105,6 +107,11 @@ fn map_trigger_error(e: CatalogError, trigger_name: &str) -> SqlSurfaceError {
                 detail: "function must return type trigger",
             }
         }
+        CatalogError::Invalid(m) if m == TRIGGER_ON_SHARED_PUBLIC_TABLE_MESSAGE => {
+            SqlSurfaceError::feature_not_supported(
+                "triggers on shared public tables are not supported",
+            )
+        }
         CatalogError::Invalid(_) => SqlSurfaceError::invalid_input("invalid trigger definition"),
         CatalogError::ViewLimitExceeded(_) => {
             SqlSurfaceError::payload_too_large("too many triggers")
@@ -143,6 +150,12 @@ mod tests {
                 TRIGGER_FUNCTION_NOT_TRIGGER_MESSAGE.to_string()
             )),
             "42P17"
+        );
+        assert_eq!(
+            code(CatalogError::Invalid(
+                TRIGGER_ON_SHARED_PUBLIC_TABLE_MESSAGE.to_string()
+            )),
+            "0A000"
         );
         assert_eq!(code(CatalogError::Invalid("x".to_string())), "22000");
         assert_eq!(

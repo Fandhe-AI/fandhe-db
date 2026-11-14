@@ -112,9 +112,56 @@ fn skip_stops_the_chain() {
 fn unwired_runtime_is_0a000() {
     handle!(h);
     let rt = TriggerRuntime::unwired();
+    // SCHEMA 配下の表（共有 public 表は別の拒否。下のテスト）。
     let err =
-        fire_before_row_insert(&rt, &h, "t", &schema(), &[trig("a", None)], row()).unwrap_err();
+        fire_before_row_insert(&rt, &h, "#1.t", &schema(), &[trig("a", None)], row()).unwrap_err();
     assert_eq!(err.wire_code(), "0A000");
+}
+
+/// 成功を返し、呼ばれた回数を数えるテスト用ホスト。
+struct CountingHost(std::sync::atomic::AtomicUsize);
+
+impl super::call::TriggerHost for CountingHost {
+    fn invoke_trigger(&self, call: &TriggerCall<'_>) -> Result<TriggerOutcome, SqlSurfaceError> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(TriggerOutcome::Proceed(call.new_row.to_vec()))
+    }
+}
+
+// 共有 public 表（裸の表キー）では、成功するホストが束縛されていても本番の invoker は委譲せず固定文言の
+// `0A000` を返す（定義時の拒否の導入前に残った定義への保険。Issue #3361）。SCHEMA 配下の表（`#1.t`）は
+// ホストへ委譲する。
+//
+// intentional: docs/design/trigger-execution-model.md
+// 共有 public 表のトリガは発火させない（fail-closed の保険。設計記録 D9 の改訂注記）。
+#[test]
+fn production_invoker_rejects_shared_public_tables_without_calling_host() {
+    use super::call::{PlpgsqlTriggerInvoker, TriggerOp};
+    handle!(h);
+    let host = CountingHost(std::sync::atomic::AtomicUsize::new(0));
+    let schema = schema();
+    let new_row = row();
+    let call = |table: &'static str| TriggerCall {
+        trigger_name: "g",
+        function_key: "f",
+        table,
+        schema: &schema,
+        op: TriggerOp::Insert,
+        level: TriggerLevel::Row,
+        old_row: None,
+        new_row: &new_row,
+        args: &[],
+        timing: TriggerTiming::Before,
+        writes: &h,
+        host: Some(&host),
+    };
+    for key in ["t", "not a key", ""] {
+        let err = PlpgsqlTriggerInvoker.invoke(&call(key)).unwrap_err();
+        assert_eq!(err.wire_code(), "0A000", "{key}");
+    }
+    assert_eq!(host.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(PlpgsqlTriggerInvoker.invoke(&call("#1.t")).is_ok());
+    assert_eq!(host.0.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
 // 本番の invoker はホスト未束縛（`TriggerRuntime::bind` を通らない経路）では固定文言の `0A000`
