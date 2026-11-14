@@ -495,6 +495,41 @@ fn after_only_two_level_chain_rejected_at_depth_limit_one() {
     assert_eq!(rows_of(&core, "tenant-a", "SELECT w FROM c1"), 1);
 }
 
+// 深さ上限 1: 兄弟の枝（P→B）にトリガがあっても、別の枝（P→C→D）の従兄弟 D は深さ 1 で発火し成功する
+// （深さは枝の祖先で発火した段だけを数え、兄弟へ引き継がない。BEFORE・AFTER の双方）。
+#[test]
+fn sibling_branch_trigger_does_not_inflate_cousin_depth() {
+    for timing in [TriggerTiming::Before, TriggerTiming::After] {
+        let dir = tempdir();
+        let log: Log = Arc::default();
+        let (core, _calls) = core_with(dir.path(), recording(&log));
+        let core = core.with_trigger_limits(crate::trigger_limits::TriggerLimits::new(1));
+        ddl(
+            &core,
+            &[
+                "CREATE TABLE pp (k BIGINT PRIMARY KEY)",
+                "CREATE TABLE bb (k BIGINT PRIMARY KEY, pk BIGINT REFERENCES pp ON DELETE CASCADE)",
+                "CREATE TABLE cc (k BIGINT PRIMARY KEY, pk BIGINT REFERENCES pp ON DELETE CASCADE)",
+                "CREATE TABLE dd (w TEXT, ck BIGINT REFERENCES cc ON DELETE CASCADE)",
+            ],
+        );
+        let a = ctx("tenant-a");
+        run(&core, &a, "INSERT INTO pp (k) VALUES (1)").expect("pp");
+        run(&core, &a, "INSERT INTO bb (k, pk) VALUES (10, 1)").expect("bb");
+        run(&core, &a, "INSERT INTO cc (k, pk) VALUES (20, 1)").expect("cc");
+        run(&core, &a, "INSERT INTO dd (w, ck) VALUES ('x', 20)").expect("dd");
+        for t in ["bb", "dd"] {
+            add_trigger(&core.storage, "tenant-a", t, &row("t", timing, DEL));
+        }
+        run(&core, &a, "DELETE FROM pp WHERE k = 1").expect("delete");
+        let mut got = take(&log);
+        got.sort();
+        assert_eq!(got.len(), 2);
+        assert_eq!(rows_of(&core, "tenant-a", "SELECT k FROM bb"), 0);
+        assert_eq!(rows_of(&core, "tenant-a", "SELECT w FROM dd"), 0);
+    }
+}
+
 // 子表の文トリガ・結線の無い経路（RETURNING 付き）は、固定文言の `0A000` のまま。
 #[test]
 fn statement_trigger_on_child_and_unwired_paths_are_rejected() {

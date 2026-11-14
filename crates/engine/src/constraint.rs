@@ -3433,8 +3433,9 @@ struct ActionState<'r, 'w> {
     child: Option<&'w ChildTriggers<'r, 'w>>,
     /// 子表の AFTER ROW の待ち行列（連鎖・事後検証の後に適用順で発火する）。
     after_queue: Vec<referential_triggers::QueuedAfter>,
-    /// 子表のトリガを発火した段ごとの入れ子の深さ（`trigger_limits`）の証。
-    depth_guards: Vec<Option<crate::trigger::depth::DepthGuard>>,
+    /// 現在の連鎖の枝で、祖先の段のうち子表のトリガを発火した段の数（`trigger_limits` の入れ子の深さ。
+    /// 兄弟の枝の発火は数えない。枝ごとに再帰の前後で設定・復元する）。
+    branch_depth: usize,
 }
 
 /// 参照アクションが書き換える子行ごとにトリガを発火するための文脈（Issue #3284）。親の UPDATE／DELETE の
@@ -3773,7 +3774,7 @@ pub(crate) fn enforce_referencing_rows_with_triggers_in_txn(
         touched: Vec::new(),
         child: child_triggers,
         after_queue: Vec::new(),
-        depth_guards: Vec::new(),
+        branch_depth: 0,
     };
     if let Some(propagated) = PropagatedChange::from_public(change, schema) {
         propagate_referential_actions(
@@ -3937,9 +3938,7 @@ pub(crate) fn enforce_referencing_rows_with_triggers_in_txn(
             fk_mode,
         )?;
     }
-    // 子表の AFTER ROW（Issue #3284）。連鎖・事後検証がすべて済んだ後に適用順で発火する。入れ子の深さの
-    // 証は、AFTER 本体が深さを余分に数えないよう先に外す。
-    state.depth_guards.clear();
+    // 子表の AFTER ROW（Issue #3284）。連鎖・事後検証がすべて済んだ後に適用順で発火する。
     referential_triggers::flush_after(&mut state)?;
     Ok(())
 }
@@ -4078,8 +4077,6 @@ fn propagate_referential_actions(
 ) -> Result<(), TenantWriteError> {
     // 協調キャンセルポイント（Issue #1953）。連鎖の段ごとに確認する（commit 前の `Err` のみ）。
     crate::tenant::check_interrupt()?;
-    // 子表のトリガを発火する段が積む深さの証の、この段に入る前の個数（段を抜けるときに戻す。Issue #3284）。
-    let guards_at_entry = state.depth_guards.len();
     let referencing = crate::catalog::referencing_foreign_keys_in_txn(write_txn, table_name)?;
 
     // Pass 1（対象特定。codex-review 指摘・PR #1138）: このテーブルを参照する
@@ -4215,7 +4212,10 @@ fn propagate_referential_actions(
         PropagatedChange,
         Option<UpdatedKeyPreImages>,
         u32,
+        bool,
     )> = Vec::new();
+    // この段の適用中だけ保持する入れ子の深さの証（祖先で発火した段の数ぶん。兄弟の枝へは引き継がない）。
+    let mut level_guards: Option<Vec<crate::trigger::depth::DepthGuard>> = None;
     for (child_schema, fk, action, affected, original_snapshot) in pending_actions {
         let is_delete = matches!(change, PropagatedChange::Removed);
         // 子表に該当イベントの ROW トリガがあるときだけ、子行ごとの適用へ分岐する（Issue #3284）。
@@ -4231,21 +4231,20 @@ fn propagate_referential_actions(
             )?,
             None => None,
         };
+        let fired = child_plan.is_some() && state.child.is_some();
         let (child_change, child_pre_images) = match (child_plan, state.child) {
             (Some(plan), Some(ctx)) => {
-                // トリガを発火する段ごとに 1 つ積む。最外段（入れ子が無い）は `TriggerRuntime::invoke` が
-                // 自前で深さを 1 加算するため計数しない（`None`。二重加算すると最小値 1 の契約に反する）。
-                // 2 段目以降は外側の段が発火中の入れ子なので、段ごとに深さを 1 つ進めて保持する。
-                if state.depth_guards.len() == guards_at_entry {
-                    let guard = if guards_at_entry == 0 {
-                        None
-                    } else {
-                        Some(
+                // 祖先の発火段の数ぶんだけ深さを進める（最外段は 0。`TriggerRuntime::invoke` が自前で 1 加算する
+                // ため二重加算しない）。兄弟の枝の発火は数えない（枝ごとの `branch_depth`）。
+                if level_guards.is_none() {
+                    let mut guards = Vec::with_capacity(state.branch_depth.min(64));
+                    for _ in 0..state.branch_depth {
+                        guards.push(
                             crate::trigger::depth::enter(ctx.runtime.limits().max_trigger_depth())
                                 .map_err(TenantWriteError::TriggerFailed)?,
-                        )
-                    };
-                    state.depth_guards.push(guard);
+                        );
+                    }
+                    level_guards = Some(guards);
                 }
                 referential_triggers::apply_with_triggers(
                     write_txn,
@@ -4297,8 +4296,11 @@ fn propagate_referential_actions(
             child_change,
             child_pre_images,
             new_depth,
+            fired,
         ));
     }
+    // 深さの証は子孫段へ引き継がない（子孫段が自分の枝の深さで積み直す）。
+    drop(level_guards);
 
     // 蓄積した検証をここでまとめて行う（同じ子テーブルへ複数 FK が action を
     // 適用していても、全アクション適用後の最終値を 1 回だけ検査する）。
@@ -4317,7 +4319,10 @@ fn propagate_referential_actions(
     // 検証後に子孫段の連鎖を辿る（親段の全 FK 適用・検証が確定した状態で
     // 再帰するため、孫段の `collect_action_targets` が中途半端な親状態を
     // 読むことはない）。
-    for (child_schema, child_change, child_pre_images, new_depth) in pending_recursions {
+    let saved_branch_depth = state.branch_depth;
+    for (child_schema, child_change, child_pre_images, new_depth, fired) in pending_recursions {
+        // この枝の祖先で発火した段だけを数える（発火した子表の下なら 1 段進める）。
+        state.branch_depth = saved_branch_depth + usize::from(fired);
         propagate_referential_actions(
             write_txn,
             &child_schema.name,
@@ -4330,7 +4335,7 @@ fn propagate_referential_actions(
             state,
         )?;
     }
-    state.depth_guards.truncate(guards_at_entry);
+    state.branch_depth = saved_branch_depth;
     Ok(())
 }
 

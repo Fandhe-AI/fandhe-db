@@ -185,7 +185,7 @@ pub(super) fn apply_with_triggers(
                     op: TriggerOp::Delete,
                     old: Some(old_values),
                     new: Vec::new(),
-                    depth: state.depth_guards.len().saturating_sub(1),
+                    depth: state.branch_depth,
                 });
             }
             continue;
@@ -261,7 +261,7 @@ pub(super) fn apply_with_triggers(
                 op: TriggerOp::Update,
                 old: Some(old_values),
                 new: final_row,
-                depth: state.depth_guards.len().saturating_sub(1),
+                depth: state.branch_depth,
             });
         }
     }
