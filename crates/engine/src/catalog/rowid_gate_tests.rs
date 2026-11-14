@@ -271,7 +271,7 @@ fn table23_only_v15_carries_rowmode_and_is_caught_by_read_gate() {
 /// 永続化する参照先列名が物理キーの `id` 参照と区別できないため未対応。Issue #2194・#2199・TABLE-23）。
 /// 採番方式の親への FK の DDL 束縛（TABLE-17・TABLE-23、Issue #3178）。主キーを持たない親への列省略
 /// FK は PG と同じ `42830`。宣言した `id` 列（主キー）を持つ親への `id` 参照は普通の列参照として
-/// 受理され、永続化した参照先列名 `["id"]` は再オープン後も読める。実行時の存在検査は #3179 以降。
+/// 受理され、永続化した参照先列名 `["id"]` は再オープン後も読める。子の存在検査は列参照経路で行う（Issue #3179）。
 #[test]
 fn table23_id_reference_foreign_key_to_allocated_parent_is_accepted() {
     use crate::catalog::{CatalogError, ForeignKeyDef, ReferentialAction};
