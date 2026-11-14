@@ -8360,9 +8360,20 @@ impl ForeignKeyDef {
         )
     }
 
-    /// 参照先が `id` 疑似列（物理キー）であるか。
+    /// 参照先列名が `id` 単独の形か（親を見ない形だけの判定）。永続値 `["id"]` の解釈は親の
+    /// 行識別方式で決まる（従来方式は物理キーの疑似列、採番方式は宣言した普通の列。Issue #3178）。
+    /// 実行時の経路（`catalog.rs`・`tenant.rs`・`constraint.rs` の既存呼び出し）は
+    /// 現状この述語のままで、採番方式の親では `constraint.rs` の集約点が 0A000 で拒否して塞ぐ。
+    /// 親を見て分岐する [`Self::references_parent_pseudo_id`] への移行は #3179・#3180 が担う。
     pub(crate) fn references_parent_id(&self) -> bool {
         matches!(self.parent_columns.as_slice(), [only] if only == FOREIGN_KEY_PARENT_ID_COLUMN)
+    }
+
+    /// 参照先が親の `id` 疑似列（物理キー）であるか。`id` 単独参照かつ親が疑似列を持つ
+    /// （LegacyId／MigratedId）ときだけ真。採番方式の親の `id` は宣言した普通の列なので偽
+    /// （Issue #3178。永続形式は増やさず、解釈を親の行識別方式で決める）。
+    pub(crate) fn references_parent_pseudo_id(&self, parent: &TableSchema) -> bool {
+        self.references_parent_id() && parent.has_pseudo_id()
     }
 
     /// `MATCH`・遅延属性・参照アクションを無視した参照形状（参照元列・参照先
@@ -9806,7 +9817,7 @@ fn resolve_foreign_key_target(
     )
     .with_options(fk.match_type(), fk.deferrability())
     .with_name(fk.name.clone());
-    if resolved.references_parent_id() {
+    if resolved.references_parent_pseudo_id(parent) {
         for name in &resolved.columns {
             if child_type(name)?.integer_rank().is_none() {
                 return Err(CatalogError::InvalidForeignKey(format!(
@@ -9815,12 +9826,11 @@ fn resolve_foreign_key_target(
             }
         }
         // `id` は常に非 NULL・ON UPDATE は A7 で発火しないため (c) の nullable 検査は不要。
-        // 採番方式の親（`id` を宣言した列として持つ場合を含む）への `id` 参照は DDL 段で拒否する。永続化する
-        // 参照先列名 `id` は物理キーの `id` を指す宣言と区別できず、宣言した列への FK の対応は
-        // 後続 Issue（未起票。#2197 配下で追跡。#2200 の移行は従来方式の表だけが対象）が担う（実行時は constraint 側が対。Issue #2194・#2199）。
-        parent.require_legacy_row_identity()?;
         return Ok(resolved);
     }
+    // 採番方式の親（TABLE-23）の `id` は宣言した普通の列なので、以降の列参照の検証へ流す
+    // （Issue #3178。実行時の親の存在検査・連鎖は #3179〜#3181 が担い、それまでは constraint 側が
+    // 0A000／23503 で拒否する）。
     let same_set = |key: &[String]| -> bool {
         key.len() == resolved.parent_columns.len()
             && key.iter().all(|k| resolved.parent_columns.contains(k))
@@ -9857,6 +9867,17 @@ fn resolve_foreign_key_target(
             return Err(CatalogError::InvalidForeignKey(format!(
                 "foreign key column {child_name} and referenced column {parent_name} are of incompatible types"
             )));
+        }
+    }
+    // 採番方式の親の `id` 参照は、実行時のキー復元が整数を前提にするため参照元列も整数に限る
+    // （スキーマだけを見る `validate_foreign_keys` と同じ 42830。Issue #3178）。
+    if resolved.references_parent_id() {
+        for name in &resolved.columns {
+            if child_type(name)?.integer_rank().is_none() {
+                return Err(CatalogError::InvalidForeignKey(format!(
+                    "column {name} must be an integer type to reference id"
+                )));
+            }
         }
     }
     // 参照アクションの宣言時検査（Issue #1076 A8 (c)）: `ON UPDATE CASCADE` は
@@ -15360,7 +15381,7 @@ impl Storage {
                 let pk_set: std::collections::HashSet<&str> =
                     pk_columns.iter().map(|s| s.as_str()).collect();
                 for (_referencing_schema, fk) in &referencing {
-                    if fk.references_parent_id() {
+                    if fk.references_parent_pseudo_id(&schema) {
                         continue;
                     }
                     let parent_set: std::collections::HashSet<&str> =

@@ -516,6 +516,8 @@ fn cursor_fetch_statements_still_parse() {
         "FETCH FORWARD 3 FROM c",
         "FETCH NEXT FROM c",
         "FETCH 1 IN c",
+        "FETCH ALL FROM c",
+        "FETCH FORWARD ALL FROM c",
     ] {
         let parsed = core.parse_sql(sql);
         assert!(parsed.is_ok(), "{sql}: {:?}", parsed.err());

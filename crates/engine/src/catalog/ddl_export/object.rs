@@ -461,7 +461,16 @@ fn export_foreign_keys<E>(
     for key in table_keys::<E>(ctx)? {
         let schema: TableSchema = get_table_schema_in_txn_impl(ctx.rt, &key, true)?;
         for fk in schema.foreign_keys() {
-            let sql = render_foreign_key(ctx, &key, fk)?;
+            // 参照先列名 `id` の解釈は親の行識別方式で決まる（Issue #3178）。`id` 単独参照のときだけ
+            // 親のスキーマを引き、取れなければ fail-closed でダンプ全体を失敗させる。
+            let parent_uses_pseudo_id = if fk.references_parent_id() {
+                let parent: TableSchema =
+                    get_table_schema_in_txn_impl(ctx.rt, fk.parent_table(), true)?;
+                parent.has_pseudo_id()
+            } else {
+                false
+            };
+            let sql = render_foreign_key(ctx, &key, fk, parent_uses_pseudo_id)?;
             out.emit(DdlSection::PostData, DdlObjectKind::ForeignKey, &sql)?;
         }
     }

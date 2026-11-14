@@ -227,7 +227,8 @@ fn foreign_key_statement_lists_every_option_and_never_concatenates_raw_names() {
         ForeignKeyMatch::Full,
         ForeignKeyDeferrability::DeferrableInitiallyDeferred,
     );
-    let sql = table::render_foreign_key::<Infallible>(&ctx, "#7.child", &fk).expect("render");
+    let sql =
+        table::render_foreign_key::<Infallible>(&ctx, "#7.child", &fk, false).expect("render");
     assert_eq!(
         sql,
         "ALTER TABLE app.child ADD CONSTRAINT \"fk_child_parent\" FOREIGN KEY (\"pid\") \
@@ -246,10 +247,14 @@ fn foreign_key_statement_lists_every_option_and_never_concatenates_raw_names() {
     assert!(to_id.references_parent_id());
     assert_eq!(
         unsupported_kind(table::render_foreign_key::<Infallible>(
-            &ctx, "child", &to_id
+            &ctx, "child", &to_id, true
         )),
         "foreign key"
     );
+    // 採番方式の親（疑似列なし）の宣言済み `id` 列への参照は通常の列参照として戻せる（Issue #3178）。
+    let sql =
+        table::render_foreign_key::<Infallible>(&ctx, "child", &to_id, false).expect("render");
+    assert!(sql.contains("REFERENCES \"parents\" (\"id\")"), "{sql}");
 }
 
 fn dump_sql(s: &Storage, scope: &SchemaDdlScope) -> Result<Vec<String>, Err0> {

@@ -381,12 +381,16 @@ fn render_action(a: ReferentialAction) -> Option<&'static str> {
 }
 
 /// 外部キー 1 件の `ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY` 文を作る。
+/// `parent_uses_pseudo_id` は親が `id` 疑似列（従来方式）を持つか。疑似列への参照は SQL で
+/// 宣言し直せないため戻せないが、採番方式の親の宣言済み `id` 列への参照は通常の列参照として戻す
+/// （Issue #3178。復元は `ALTER TABLE ... ADD CONSTRAINT` を流し、DDL 束縛が同じ規則で検証する）。
 pub(super) fn render_foreign_key<E>(
     ctx: &Ctx<'_>,
     table_key: &str,
     fk: &ForeignKeyDef,
+    parent_uses_pseudo_id: bool,
 ) -> Result<String, SchemaDdlError<E>> {
-    if fk.references_parent_id() {
+    if fk.references_parent_id() && parent_uses_pseudo_id {
         return Err(unsupported(
             "foreign key",
             "reference to an implicit id row identity",

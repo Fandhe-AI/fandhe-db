@@ -11202,12 +11202,16 @@ impl EngineCore {
                 Ok(crate::sql::SqlOutcome::DeclareCursor)
             }
             CursorStatement::Fetch { name, count } => {
-                let result = txn
-                    .cursors_mut()
-                    .ok_or_else(|| SqlSurfaceError::Internal {
-                        detail: "internal error".to_string(),
-                    })?
-                    .fetch(name, *count)?;
+                let registry = txn.cursors_mut().ok_or_else(|| SqlSurfaceError::Internal {
+                    detail: "internal error".to_string(),
+                })?;
+                // `ALL` は残り全行。上限は結果行数 cap と同じ値で多層防御として判定する（Issue #3174）。
+                let result = match count {
+                    crate::sql::cursor::FetchCount::Rows(n) => registry.fetch(name, *n)?,
+                    crate::sql::cursor::FetchCount::All => {
+                        registry.fetch_all(name, self.result_limits.max_result_rows())?
+                    }
+                };
                 Ok(crate::sql::SqlOutcome::Fetch(result))
             }
             CursorStatement::Close { name } => {
