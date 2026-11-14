@@ -981,10 +981,34 @@ fn rescore_cosine(
 /// Issue #3217: `row_norms_sq` はスナップショット常駐のノルム²（`snapshot_norms_for_full_scan` が
 /// 位置対応を確認した場合のみ `Some`）。`dense_slots: None` の全走査でだけ使い、長さが `ids` と
 /// 不一致なら kernel 側が C1 へ縮退する。
+///
+/// ノルム² の計算は構築時ではなく `search` の全走査経路（`dense_slots: None`）に入った時点まで
+/// 遅延する（`norms`。HNSW 選択時・`dense_slots` の部分集合経路では adapter が使われない／ノルムを
+/// 使わないため、O(n·dim) の走査コストを払わない）。
 struct CosineDenseAdapter<'a> {
     inner: &'a dyn SearchProvider,
     dense_slots: Option<&'a [u32]>,
-    row_norms_sq: Option<&'a [f32]>,
+    norms: Option<FullScanNormsSource<'a>>,
+}
+
+/// `snapshot_norms_for_full_scan` の引数一式。全走査が必要になるまで評価を遅延させるための束。
+#[derive(Clone, Copy)]
+struct FullScanNormsSource<'a> {
+    snapshot: Option<&'a std::sync::Arc<crate::sql::arena_cache::SqlArenaSnapshot>>,
+    arena: &'a VectorArena,
+    mask_kept_slots: Option<&'a Vec<u32>>,
+    slot_count: usize,
+}
+
+impl<'a> FullScanNormsSource<'a> {
+    fn resolve(self) -> Option<&'a [f32]> {
+        snapshot_norms_for_full_scan(
+            self.snapshot,
+            self.arena,
+            self.mask_kept_slots,
+            self.slot_count,
+        )
+    }
 }
 
 /// Issue #3217: 全走査が走査する `arena` がキャッシュ済みスナップショット自身の arena で、候補マスク
@@ -1016,7 +1040,7 @@ impl SearchProvider for CosineDenseAdapter<'_> {
             None => self.inner.search_cosine(crate::kernel::CosineSearchInput {
                 ids: input.ids,
                 vectors: input.vectors,
-                row_norms_sq: self.row_norms_sq,
+                row_norms_sq: self.norms.and_then(FullScanNormsSource::resolve),
                 dim: input.dim,
                 query: input.query,
                 k: input.k,
@@ -3409,12 +3433,12 @@ pub(crate) fn execute_statement_with_cache_observed(
                     let cosine_dense = CosineDenseAdapter {
                         inner: provider,
                         dense_slots: dense_slots.as_deref(),
-                        row_norms_sq: snapshot_norms_for_full_scan(
-                            cache_hit_snapshot.as_ref(),
+                        norms: Some(FullScanNormsSource {
+                            snapshot: cache_hit_snapshot.as_ref(),
                             arena,
-                            mask_kept_slots.as_ref(),
-                            slot_ids.len(),
-                        ),
+                            mask_kept_slots: mask_kept_slots.as_ref(),
+                            slot_count: slot_ids.len(),
+                        }),
                     };
                     let dense_provider: &dyn SearchProvider = match &hnsw_dense_provider {
                         Some(adapter) => adapter,
@@ -7775,7 +7799,7 @@ mod tests {
             let adapter = CosineDenseAdapter {
                 inner: &inner,
                 dense_slots: None,
-                row_norms_sq: None,
+                norms: None,
             };
             adapter.search(SearchInput {
                 ids: &[1_u64, 2],
@@ -7799,7 +7823,7 @@ mod tests {
             let adapter = CosineDenseAdapter {
                 inner: &inner,
                 dense_slots: None,
-                row_norms_sq: None,
+                norms: None,
             };
             adapter.search(SearchInput {
                 ids: &[0_u64, 1, 2],
@@ -7841,7 +7865,7 @@ mod tests {
             let adapter = CosineDenseAdapter {
                 inner: &inner,
                 dense_slots: Some(&[1_u32]),
-                row_norms_sq: None,
+                norms: None,
             };
             adapter.search(SearchInput {
                 ids: &[0_u64, 1],
@@ -7854,6 +7878,70 @@ mod tests {
         assert!(run(vec![dh(0, 0.1)]).is_err());
         assert!(run(vec![dh(0, 0.1), dh(1, 0.2)]).is_err());
         assert!(run(vec![dh(1, 0.2)]).is_ok());
+    }
+
+    /// Issue #3217 レビュー指摘: ノルム² は adapter 構築では計算せず、全走査経路に入った時点で
+    /// 初めて計算する（構築のみ・`dense_slots` 部分集合経路では計算しない）。
+    #[test]
+    fn cosine_dense_adapter_computes_norms_lazily_only_on_full_scan() {
+        use crate::test_util::temp_db::{unique_db_path, CleanupGuard};
+        let path = unique_db_path("exec-norms-lazy");
+        let _guard = CleanupGuard(path.clone());
+        let storage = crate::storage::Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&crate::catalog::TableSchema::new(
+                "docs",
+                vec![
+                    crate::catalog::ColumnDef::new("path", crate::catalog::ColumnType::Text, false),
+                    crate::catalog::ColumnDef::new(
+                        "embedding",
+                        crate::catalog::ColumnType::Vector(2),
+                        false,
+                    ),
+                ],
+            ))
+            .expect("create table");
+        let arena = VectorArena::build(&storage, "docs").expect("arena");
+        let ctx = crate::policy::PolicyContext::new("tenant-a").expect("ctx");
+        let snap = std::sync::Arc::new(crate::sql::arena_cache::SqlArenaSnapshot::new(
+            arena,
+            Vec::new(),
+            ctx,
+            0,
+        ));
+        let src = FullScanNormsSource {
+            snapshot: Some(&snap),
+            arena: snap.arena(),
+            mask_kept_slots: None,
+            slot_count: 0,
+        };
+        let inner = CosineOnly(Vec::new());
+        let input = || SearchInput {
+            ids: &[],
+            vectors: &[],
+            dim: 2,
+            query: &[1.0, 0.0],
+            k: 1,
+        };
+        // 構築のみ（HNSW 選択時に相当）: 計算されない。
+        let adapter = CosineDenseAdapter {
+            inner: &inner,
+            dense_slots: None,
+            norms: Some(src),
+        };
+        assert!(!snap.row_norms_sq_is_computed());
+        // 部分集合経路: 計算されない。
+        let subset_inner = CosineSubsetOnly(Vec::new());
+        let subset = CosineDenseAdapter {
+            inner: &subset_inner,
+            dense_slots: Some(&[]),
+            norms: Some(src),
+        };
+        subset.search(input()).expect("subset search");
+        assert!(!snap.row_norms_sq_is_computed());
+        // 全走査経路: ここで初めて計算される。
+        adapter.search(input()).expect("full scan");
+        assert!(snap.row_norms_sq_is_computed());
     }
 
     /// Issue #1991: HYBRID 密側アダプタは NaN 行を除き、`1 - d` のスコア降順・同点は id 昇順で返す。
@@ -7869,7 +7957,7 @@ mod tests {
         let adapter = CosineDenseAdapter {
             inner: &inner,
             dense_slots: None,
-            row_norms_sq: None,
+            norms: None,
         };
         let ids = [4_u64, 2, 7, 1, 9];
         let hits = adapter

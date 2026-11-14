@@ -140,6 +140,12 @@ impl SqlArenaSnapshot {
             .as_deref()
     }
 
+    /// テスト専用: ノルム² が既に計算・常駐済みか（遅延計算の検証用。Issue #3217）。
+    #[cfg(test)]
+    pub(crate) fn row_norms_sq_is_computed(&self) -> bool {
+        self.row_norms_sq.get().is_some()
+    }
+
     pub(crate) fn arena(&self) -> &VectorArena {
         &self.arena
     }
