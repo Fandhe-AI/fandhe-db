@@ -20,6 +20,8 @@
 //! - T5 内部 ID の接頭辞（`#1.` と `#10.`）をテナントをまたいで混同しない
 //! - T6 3 テナントが同名の SCHEMA 配下に同名のオブジェクトを作っても衝突しない
 //! - T7 試行総数の固定（各テストの末尾）、T8 検査器自身への負の対照
+//! - T9 未修飾名（`search_path` 経由）の書き込み・DDL の存在秘匿（双子 DB）と、同名 SCHEMA・同名表の
+//!   テナント間の書き込み分離（Issue #3199）
 //!
 //! オラクルは production の `PolicyContext::is_visible`／`is_owner` を呼ばず、テスト側が持つ真実値
 //! （どのテナントが何を入れたか）から期待集合を自前で計算する。
@@ -1167,6 +1169,183 @@ fn t6_same_named_objects_in_same_named_schemas_do_not_collide() {
         let r = run(&core, TENANTS[i], true, s, "SELECT COUNT(*) FROM s_b.t");
         assert_eq!(r.expect_err("s_b is invisible").0, "3F000");
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// T9: 未修飾名（search_path 経由）の書き込み・DDL の存在秘匿と、同名 SCHEMA 同士の書き込み分離（Issue #3199）
+// ---------------------------------------------------------------------------------------------
+
+/// 閲覧側が `SET search_path = a` の下で実行する未修飾の書き込み・DDL・移動・削除。`a` は tenant-a だけが持つ。
+const UNQUALIFIED_WRITES: &[&str] = &[
+    "INSERT INTO t (id, name) VALUES (2, 'y')",
+    "UPDATE t SET name = 'y' WHERE id = 1",
+    "DELETE FROM t WHERE id = 1",
+    "TRUNCATE t",
+    "CREATE INDEX i2 ON t (name)",
+    "ALTER TABLE t ADD COLUMN c TEXT",
+    "ALTER TABLE t SET SCHEMA mine_schema",
+    "ALTER TABLE t SET SCHEMA a",
+    "DROP TABLE t",
+    "DROP VIEW v",
+    "DROP SEQUENCE q",
+    "SELECT nextval('q')",
+];
+
+#[test]
+fn t9_unqualified_writes_through_a_foreign_schema_name_match_a_world_without_it() {
+    let mut trials = 0usize;
+    let (x, _gx, y, _gy) = twin_worlds("t27-tb-t9-twin");
+    let c = ctx(TENANTS[1], true);
+    for private in [false, true] {
+        let mut sx = session(TENANTS[1]);
+        let mut sy = session(TENANTS[1]);
+        run(&x, TENANTS[1], private, &mut sx, "SET search_path = a").expect("set x");
+        run(&y, TENANTS[1], private, &mut sy, "SET search_path = a").expect("set y");
+        // autocommit。
+        for sql in UNQUALIFIED_WRITES {
+            let rx = run(&x, TENANTS[1], private, &mut sx, sql);
+            let ry = run(&y, TENANTS[1], private, &mut sy, sql);
+            assert_eq!(shape(&rx), shape(&ry), "{sql} (private={private})");
+            let (code, _) = rx.as_ref().expect_err(sql);
+            assert!(FAIL_CODES.contains(&code.as_str()), "{sql}: {code}");
+            assert_no_leak(sql, &rx);
+            trials += 1;
+        }
+        // 明示トランザクション（BEGIN 後の最初の失敗応答まで同じ）。
+        for sql in UNQUALIFIED_WRITES {
+            let mut chains = Vec::new();
+            for (core, s) in [(&x, &mut sx), (&y, &mut sy)] {
+                let mut txn = core.new_session_transaction();
+                let mut out = Vec::new();
+                for step in ["BEGIN", sql, "ROLLBACK"] {
+                    let r = core
+                        .execute_sql_in_txn(&c, s, &mut txn, step)
+                        .map_err(|e| (e.wire_code().to_string(), e.to_string()));
+                    assert_no_leak(sql, &r);
+                    out.push(shape(&r));
+                }
+                chains.push(out);
+            }
+            assert_eq!(chains[0], chains[1], "{sql} (txn, private={private})");
+            assert!(chains[0][1].starts_with("ERR"), "{sql}: {:?}", chains[0]);
+            trials += 1;
+        }
+    }
+    assert_eq!(trials, UNQUALIFIED_WRITES.len() * 4, "trial count drifted");
+    // tenant-a 側の `a.t` は閲覧側の試行の後も不変（独立オラクル: 最初に入れた 1 行だけ）。
+    let mut a = session(TENANTS[0]);
+    let o = ok(&x, TENANTS[0], &mut a, "SELECT id FROM a.t LIMIT 10");
+    assert_eq!(query_ids(&o), BTreeSet::from([1]));
+}
+
+#[test]
+fn t9_same_named_schemas_keep_unqualified_writes_isolated_between_tenants() {
+    let mut trials = 0usize;
+    let (core, _g) = new_core("t27-tb-t9-same");
+    let mut sess: Vec<SessionState> = TENANTS.iter().map(|t| session(t)).collect();
+    // 各テナントが同名 SCHEMA `s` と同名表 `s.t` を持ち、同じ id に別の値（100 * (i + 1)）を入れる。
+    for (i, tenant) in TENANTS.iter().enumerate() {
+        let s = &mut sess[i];
+        ok(&core, tenant, s, "CREATE SCHEMA s");
+        ok(&core, tenant, s, "CREATE SCHEMA s2");
+        ok(
+            &core,
+            tenant,
+            s,
+            "CREATE TABLE s.t (id BIGINT PRIMARY KEY, v INTEGER)",
+        );
+        ok(
+            &core,
+            tenant,
+            s,
+            &format!("INSERT INTO s.t (id, v) VALUES (1, {})", 100 * (i + 1)),
+        );
+    }
+    // tenant-a だけが path `s, public` の未修飾で書き込む。tenant-b・c の `s.t` は不変でなければならない。
+    let writer = 0usize;
+    ok(
+        &core,
+        TENANTS[writer],
+        &mut sess[writer],
+        "SET search_path = s, public",
+    );
+    for sql in [
+        "INSERT INTO t (id, v) VALUES (2, 7)",
+        "UPDATE t SET v = 9 WHERE id = 1",
+        "INSERT INTO t (id, v) VALUES (1, 5) ON CONFLICT (id) DO UPDATE SET v = 6",
+        "DELETE FROM t WHERE id = 2",
+        "CREATE INDEX ix_v ON t (v)",
+        "ALTER TABLE t ADD COLUMN w INTEGER",
+        "TRUNCATE t",
+        "INSERT INTO t (id, v) VALUES (3, 3)",
+        "ALTER TABLE t SET SCHEMA s2",
+    ] {
+        ok(&core, TENANTS[writer], &mut sess[writer], sql);
+        trials += 1;
+        for other in [1usize, 2] {
+            let o = ok(
+                &core,
+                TENANTS[other],
+                &mut sess[other],
+                "SELECT id, v FROM s.t LIMIT 10",
+            );
+            assert_eq!(
+                query_pairs(&o),
+                vec![(1, (100 * (other + 1)) as u64)],
+                "{sql}: tenant {other} changed"
+            );
+            trials += 1;
+        }
+    }
+    // 書き込み側は移動後の `s2.t` に自分の行だけを持ち、`s.t` は消えている。
+    let o = ok(
+        &core,
+        TENANTS[writer],
+        &mut sess[writer],
+        "SELECT id, v FROM s2.t LIMIT 10",
+    );
+    assert_eq!(query_pairs(&o), vec![(3, 3)]);
+    let gone = run(
+        &core,
+        TENANTS[writer],
+        true,
+        &mut sess[writer],
+        "SELECT id FROM s.t LIMIT 10",
+    );
+    assert_eq!(gone.expect_err("moved away").0, "42P01");
+    // 書き込み側の DROP も他テナントの `s.t` に影響しない。
+    ok(
+        &core,
+        TENANTS[writer],
+        &mut sess[writer],
+        "SET search_path = s2, public",
+    );
+    ok(&core, TENANTS[writer], &mut sess[writer], "DROP TABLE t");
+    trials += 1;
+    for other in [1usize, 2] {
+        let o = ok(
+            &core,
+            TENANTS[other],
+            &mut sess[other],
+            "SELECT id, v FROM s.t LIMIT 10",
+        );
+        assert_eq!(query_pairs(&o), vec![(1, (100 * (other + 1)) as u64)]);
+        trials += 1;
+    }
+    // 検査器自身への負の対照: 取り違えた期待（tenant-a の値）では検出される。
+    let o = ok(
+        &core,
+        TENANTS[1],
+        &mut sess[1],
+        "SELECT id, v FROM s.t LIMIT 10",
+    );
+    assert_ne!(
+        query_pairs(&o),
+        vec![(1, 100)],
+        "negative control must differ"
+    );
+    trials += 1;
+    assert_eq!(trials, 9 * 3 + 1 + 2 + 1, "trial count drifted");
 }
 
 // ---------------------------------------------------------------------------------------------

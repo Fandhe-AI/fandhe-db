@@ -1405,18 +1405,36 @@ fn ddl_in_an_explicit_transaction_stays_unsupported_with_a_path_schema() {
         .expect("rollback");
 }
 
-/// `ALTER TABLE <未修飾> SET SCHEMA ..` で対象が SCHEMA に解決される形は固定文言の `0A000`。
-// tracked: #3198
+/// Issue #3199: 未修飾の `ALTER TABLE t SET SCHEMA ..` は修飾形（`q1.t`）と同じ経路に乗る。
+/// 同テナントの別 SCHEMA へは移動でき、`public` 境界は修飾形と同じ `42501`、不在名は `3F000`。
 #[test]
-fn set_schema_on_a_path_resolved_table_is_unsupported() {
+fn set_schema_on_a_path_resolved_table_moves_within_the_tenant() {
     let (core, _g, mut s) = q1_world("sp-set-schema");
+    ok(&core, &mut s, "CREATE SCHEMA q2");
+    // 移動先の識別子と同名の表が path 上にあっても、移動先は関係名として書き換えられない。
+    ok(&core, &mut s, "CREATE TABLE q1.q2 (id BIGINT PRIMARY KEY)");
     ok(&core, &mut s, "SET search_path TO q1, public");
+    // public との間の移動は意図的拒否（修飾形と同じ。intentional: docs/design/schema-tenant-namespace.md）。
     let (c, msg) = err(&core, &mut s, "ALTER TABLE t SET SCHEMA public");
-    assert_eq!(c, "0A000");
+    assert_eq!(c, "42501");
+    assert!(!msg.contains('#'), "{msg}");
+    // 不在の移動先は修飾形と同じ 3F000 で、エラー文に内部キーを含めない。
+    let (c, msg) = err(&core, &mut s, "ALTER TABLE t SET SCHEMA nosuch");
+    assert_eq!(c, "3F000");
     assert!(!msg.contains('#'), "{msg}");
     assert_eq!(
         ids(&core, &mut s, "SELECT id FROM q1.t LIMIT 100"),
         vec![10, 20]
+    );
+    ok(&core, &mut s, "ALTER TABLE t SET SCHEMA q2");
+    assert_eq!(
+        ids(&core, &mut s, "SELECT id FROM q2.t LIMIT 100"),
+        vec![10, 20]
+    );
+    // 移動元からは消える（path に q2 が無いので未修飾の t は解決できない）。
+    assert_eq!(
+        code(&core, &mut s, "SELECT id FROM q1.t LIMIT 100"),
+        "42P01"
     );
 }
 
