@@ -175,10 +175,13 @@ fn wire_trigger_body_delete_and_select_run() {
     );
     exec(
         &mut s,
-        "CREATE TRIGGER tb BEFORE INSERT ON tt FOR EACH ROW EXECUTE FUNCTION dsel()",
+        "CREATE TRIGGER tb BEFORE INSERT ON s.tt FOR EACH ROW EXECUTE FUNCTION dsel()",
     );
-    assert_eq!(exec(&mut s, "INSERT INTO tt (n) VALUES (9);"), "INSERT 0 1");
-    assert_eq!(select_col(&mut s, "SELECT n FROM tt"), vec!["1"]);
+    assert_eq!(
+        exec(&mut s, "INSERT INTO s.tt (n) VALUES (9);"),
+        "INSERT 0 1"
+    );
+    assert_eq!(select_col(&mut s, "SELECT n FROM s.tt"), vec!["1"]);
     assert_eq!(select_col(&mut s, "SELECT lv FROM audit"), vec!["y"]);
 }
 
