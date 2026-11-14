@@ -264,10 +264,10 @@ fn update_of_non_intersecting_set_keeps_bind_time_not_null_error() {
     assert_eq!(affected(out), 0);
 }
 
-// 自己参照 FK（CASCADE）を持つ表の UPDATE・DELETE トリガは、参照アクションで同表の別行が書き換わり
-// 発火できないため、黙って飛ばさず 0A000（D8）。トリガは 1 度も呼ばれない。
+// 自己参照 FK（CASCADE）を持つ表の UPDATE・DELETE トリガは、親側の行に発火する（Issue #3284 で子行ごとの
+// 発火に結線済み。連鎖で消える別行への発火は `trigger_referential_tests`）。
 #[test]
-fn self_referencing_table_triggers_are_rejected() {
+fn self_referencing_table_triggers_fire() {
     let dir = tempdir();
     let (core, calls) = seeded(dir.path(), passthrough());
     let a = ctx("tenant-a");
@@ -286,12 +286,10 @@ fn self_referencing_table_triggers_are_rejected() {
         &dml_trigger("t", TriggerTiming::Before, UPD | DEL, &[]),
     );
     run(&core, &a, "INSERT INTO selfr (k) VALUES (1)").expect("insert");
-    assert_eq!(
-        code(&core, &a, "UPDATE selfr SET p = NULL WHERE k = 1"),
-        "0A000"
-    );
-    assert_eq!(code(&core, &a, "DELETE FROM selfr WHERE k = 1"), "0A000");
-    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    run(&core, &a, "UPDATE selfr SET p = NULL WHERE k = 1").expect("update");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    run(&core, &a, "DELETE FROM selfr WHERE k = 1").expect("delete");
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
 
 // AFTER だけのトリガ・値を書き換え得ない構成では、NOT NULL 違反は束縛時に 23502（行の有無で分かれない）。
@@ -878,9 +876,10 @@ fn unwired_paths_are_guarded() {
     .expect("ledger not consumed");
 }
 
-// 参照アクションが及ぶ子表に該当イベントのトリガがあれば、親にトリガが無くても 0A000。
+// 参照アクションが及ぶ子表に該当イベントのトリガがあれば、親にトリガが無くても子行ごとに発火する
+// （Issue #3284。発火の詳細は `trigger_referential_tests`）。結線の無い経路（RETURNING 付き）は 0A000。
 #[test]
-fn referential_action_to_triggered_child_is_rejected() {
+fn referential_action_to_triggered_child_fires_and_unwired_path_is_rejected() {
     let dir = tempdir();
     let (core, calls) = seeded(dir.path(), passthrough());
     let a = ctx("tenant-a");
@@ -892,6 +891,8 @@ fn referential_action_to_triggered_child_is_rejected() {
     ] {
         core.execute_sql_in_session(&a, &mut s, ddl).expect(ddl);
     }
+    run(&core, &a, "INSERT INTO par (k) VALUES (1)").expect("par");
+    run(&core, &a, "INSERT INTO ch (parent_id) VALUES (1), (1)").expect("ch");
     add_trigger(
         &core.storage,
         "tenant-a",
@@ -902,11 +903,11 @@ fn referential_action_to_triggered_child_is_rejected() {
         code(
             &core,
             &a,
-            "DELETE FROM par WHERE k = 1 USING OPERATION_ID 'f1'"
+            "DELETE FROM par WHERE k = 1 RETURNING k USING OPERATION_ID 'f1'"
         ),
         "0A000"
     );
-    // DELETE トリガしか無い子表へ及ぶのは UPDATE の CASCADE だが、UPDATE イベントのトリガは無いので通る。
+    // DELETE トリガしか無い子表へ及ぶのは UPDATE の CASCADE だが、UPDATE イベントのトリガは無いので発火しない。
     run(
         &core,
         &a,
@@ -914,6 +915,14 @@ fn referential_action_to_triggered_child_is_rejected() {
     )
     .expect("update cascade without update trigger on child");
     assert_eq!(calls.load(Ordering::SeqCst), 0);
+    // DELETE の CASCADE は子の DELETE トリガを子行ごとに発火する。
+    run(
+        &core,
+        &a,
+        "DELETE FROM par WHERE k = 2 USING OPERATION_ID 'f3'",
+    )
+    .expect("delete cascade fires child trigger");
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
 
 // テナント境界: 別テナントが同じ表へ作ったトリガは発火せず、応答にも現れない。
