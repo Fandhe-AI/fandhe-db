@@ -19,7 +19,7 @@
 | -- | ---- | ---- |
 | BEFORE／AFTER ROW（UPDATE・DELETE。SQL 表層） | **発火** | 各チャンクは 1 write txn で、チャンク内は通常経路と同じ「BEFORE → 書込 → 制約・FK → AFTER」を保てる |
 | BEFORE／AFTER STATEMENT（該当イベント。`UPDATE OF` で外れたものを除く） | `0A000`（固定文言 `statement triggers are not supported for partitioned DML`） | 「文につき 1 回・全行の前後」を、チャンクごとに commit し再開もある非原子実行では保証できない（毎チャンクか初回・最終のみかが再開・取消・上限停止で曖昧になる） |
-| 参照アクションが及ぶ子表に該当トリガがある形 | `0A000` | 通常経路と同じ静的判定（`plan_row_triggers` 内）を流用 |
+| 参照アクションが及ぶ子表に該当トリガがある形 | `0A000` | `reject_referential_child_triggers`（`plan_row_triggers` の子表走査を共用。子トリガは供給しない） |
 | NoSQL 表層の分割実行 | `0A000` | NoSQL は未結線（D8）。共有本体は通過証を `Option` で受け、SQL 表層だけ `Some` を渡す |
 | トリガ本体内の `PARTITIONED`・明示 Tx 内の分割実行 | 従来どおり拒否 | 変更しない |
 

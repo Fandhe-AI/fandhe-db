@@ -66,11 +66,6 @@ impl TriggerRuntime<'static> {
         self.limits = limits;
         self
     }
-
-    /// 現在の深さ上限。
-    pub(crate) fn limits(&self) -> TriggerLimits {
-        self.limits
-    }
 }
 
 impl<'h> TriggerRuntime<'h> {
@@ -83,6 +78,11 @@ impl<'h> TriggerRuntime<'h> {
             limits: self.limits,
             host: Some(host),
         }
+    }
+
+    /// 現在の深さ上限。
+    pub(crate) fn limits(&self) -> TriggerLimits {
+        self.limits
     }
 
     /// 束縛済みのホスト（未束縛なら `None`）。`trigger::fire` が [`TriggerCall`] へ載せる。

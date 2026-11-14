@@ -265,6 +265,50 @@ fn wire_trigger_does_not_fire_for_other_tenant() {
     assert!(select_col(&mut a, "SELECT lv FROM audit").is_empty());
 }
 
+/// 親の `DELETE`（psql と同じ末尾 `;` 付きの単独送信を含む）が参照アクションで子表の行を消すとき、
+/// 子表の DELETE トリガが子行ごとに発火して監査行が増える（Issue #3284）。別テナント（bob）の同名の表・
+/// 行は変わらず、alice のトリガも発火しない。
+#[test]
+fn wire_referential_cascade_fires_child_row_trigger() {
+    let (addr, _g) = serve();
+    let mut a = connect(addr, "alice", "pw-alice");
+    exec(&mut a, "CREATE SCHEMA s");
+    exec(&mut a, "CREATE TABLE s.par (k BIGINT PRIMARY KEY)");
+    exec(
+        &mut a,
+        "CREATE TABLE s.ch (pk BIGINT REFERENCES s.par ON DELETE CASCADE)",
+    );
+    exec(&mut a, "CREATE TABLE audit (lv TEXT)");
+    exec(
+        &mut a,
+        "CREATE FUNCTION child_audit() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN INSERT INTO audit (lv) VALUES (TG_OP); RETURN OLD; END $$",
+    );
+    exec(
+        &mut a,
+        "CREATE TRIGGER tc AFTER DELETE ON s.ch FOR EACH ROW EXECUTE FUNCTION child_audit()",
+    );
+    exec(&mut a, "INSERT INTO s.par (k) VALUES (1), (2)");
+    exec(&mut a, "INSERT INTO s.ch (pk) VALUES (1), (1), (2)");
+    let mut b = connect(addr, "bob", "pw-bob");
+    exec(&mut b, "CREATE SCHEMA s");
+    exec(&mut b, "CREATE TABLE s.par (k BIGINT PRIMARY KEY)");
+    exec(
+        &mut b,
+        "CREATE TABLE s.ch (pk BIGINT REFERENCES s.par ON DELETE CASCADE)",
+    );
+    exec(&mut b, "INSERT INTO s.par (k) VALUES (1)");
+    exec(&mut b, "INSERT INTO s.ch (pk) VALUES (1)");
+    assert_eq!(exec(&mut b, "DELETE FROM s.par WHERE k = 1;"), "DELETE 1");
+    assert!(select_col(&mut a, "SELECT lv FROM audit").is_empty());
+    assert_eq!(exec(&mut a, "DELETE FROM s.par WHERE k = 1;"), "DELETE 1");
+    assert_eq!(
+        select_col(&mut a, "SELECT lv FROM audit"),
+        vec!["DELETE", "DELETE"]
+    );
+    assert_eq!(select_col(&mut a, "SELECT pk FROM s.ch"), vec!["2"]);
+}
+
 /// 台帳（Issue #3188）: `USING OPERATION_ID` つきの INSERT（末尾 `;` 付きの単独送信）の再送は `23505` で、
 /// トリガ本体は再実行されず、同じ接続で次の文が実行できる。内容違いの再送は `22023`。他テナントが同じ
 /// operation_id を使っても alice のトリガは発火しない。

@@ -280,6 +280,41 @@ fn nosql_single_row_update_and_delete_fire() {
     assert!(take(&log).is_empty());
 }
 
+// 参照アクションが及ぶ子表の ROW トリガ（Issue #3284）も、NoSQL の `delete` は SQL と同じ経路で発火する
+// （入口が `plan_row_triggers` と同じ runtime を渡すため。`0A000` にならない）。
+#[test]
+fn nosql_delete_fires_child_table_trigger_via_referential_action() {
+    let dir = tempdir();
+    let log: Log = Arc::default();
+    let (core, _calls) = core_with(dir.path(), recording(&log));
+    seed(&core);
+    let a = ctx("tenant-a");
+    let mut s = SessionState::default();
+    s.allow_ddl();
+    core.execute_sql_in_session(
+        &a,
+        &mut s,
+        "CREATE TABLE kid (w TEXT, pid BIGINT REFERENCES trg (id) ON DELETE CASCADE)",
+    )
+    .expect("kid");
+    run(
+        &core,
+        &a,
+        "INSERT INTO kid (w, pid) VALUES ('p', 2), ('q', 2)",
+    )
+    .expect("kid rows");
+    add_trigger(
+        &core.storage,
+        "tenant-a",
+        "kid",
+        &dml_trigger("k", TriggerTiming::After, TriggerLevel::Row, DEL),
+    );
+    let _ = take(&log);
+    assert_eq!(nosql_delete_by_id(&core, 2, &op("d1")).expect("delete"), 1);
+    assert_eq!(take(&log).len(), 2);
+    assert_eq!(count(&core, &a, "kid"), 0);
+}
+
 // 述語形 update・delete は 0A000 にならず発火し、同じ状態への SQL 表層と結果・呼び出し記録が一致する。
 #[test]
 fn nosql_predicate_paths_match_sql_surface() {
