@@ -17653,8 +17653,9 @@ impl EngineCore {
         ctx: &PolicyContext,
         session: &crate::sql::mode::SessionState,
         sql: &str,
+        pin: Option<&[(usize, crate::sql::lexer::Token)]>,
     ) -> Result<CopyPlan, crate::sql::allowlist::SqlSurfaceError> {
-        self.check_copy_search_path(ctx, session, sql, None)?;
+        self.check_copy_search_path(ctx, session, sql, None, pin)?;
         if let Some(plan) = self.begin_copy_temp(
             ctx,
             session,
@@ -17669,7 +17670,7 @@ impl EngineCore {
             sql,
             false,
             Some(&resolver),
-            |t| self.resolve_copy_tokens_path(ctx.tenant_id(), session, t, None),
+            |t| self.resolve_copy_tokens_path(ctx.tenant_id(), session, t, None, pin),
         )?;
         let stmt = crate::sql::allowlist::validate_copy_tokens(
             &copy_tokens,
@@ -17703,6 +17704,7 @@ impl EngineCore {
         session: &crate::sql::mode::SessionState,
         sql: &str,
         read_snap: Option<&redb::ReadTransaction>,
+        pin: Option<&[(usize, crate::sql::lexer::Token)]>,
     ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
         if !(session.search_path_hides_public() || session.search_path_may_hold_tenant_schema()) {
             return Ok(());
@@ -17710,7 +17712,7 @@ impl EngineCore {
         let Ok(mut tokens) = crate::sql::lexer::tokenize_marked(sql) else {
             return Ok(());
         };
-        self.resolve_copy_tokens_path(ctx.tenant_id(), session, &mut tokens, read_snap)?;
+        self.resolve_copy_tokens_path(ctx.tenant_id(), session, &mut tokens, read_snap, pin)?;
         if !session.search_path_hides_public() {
             return Ok(());
         }
@@ -17727,7 +17729,14 @@ impl EngineCore {
         session: &crate::sql::mode::SessionState,
         tokens: &mut [crate::sql::lexer::Token],
         read_snap: Option<&redb::ReadTransaction>,
+        pin: Option<&[(usize, crate::sql::lexer::Token)]>,
     ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+        // 検証済みの宛先が渡されていれば、再解決せずそのまま適用する（照合から開始までの間に先行 path へ
+        // 同名の表が作られても宛先が変わらない。Issue #3197）。
+        if let Some(pin) = pin {
+            crate::sql::search_path::apply_rewrites(tokens, pin.to_vec());
+            return Ok(());
+        }
         if !(session.search_path_may_hold_tenant_schema() || session.search_path_hides_public()) {
             return Ok(());
         }
@@ -17774,7 +17783,7 @@ impl EngineCore {
         // の後でも既定の on として絞った結果を黙って返さない（RLS 有効な表は走査前に `42501`）。
         let _row_security_scope =
             crate::sql::policy_applicability::RowSecurityScope::enter(session.row_security());
-        self.begin_copy_unscrubbed(ctx, session, sql)
+        self.begin_copy_unscrubbed(ctx, session, sql, None)
             .map_err(|e| self.scrub_error(ctx, e))
     }
 
@@ -17854,13 +17863,14 @@ impl EngineCore {
         session: &crate::sql::mode::SessionState,
         txn: &mut crate::sql::transaction::SessionTransaction<'e>,
         sql: &str,
+        pin: Option<&[(usize, crate::sql::lexer::Token)]>,
     ) -> Result<CopyPlan, crate::sql::allowlist::SqlSurfaceError> {
         use crate::sql::transaction::TransactionStatus;
         match txn.status() {
-            TransactionStatus::Idle => self.begin_copy(ctx, session, sql),
+            TransactionStatus::Idle => self.begin_copy_unscrubbed(ctx, session, sql, pin),
             TransactionStatus::Failed => Err(txn.take_failed_error()),
             TransactionStatus::InTransaction => {
-                let result = self.begin_copy_active(ctx, session, txn, sql);
+                let result = self.begin_copy_active(ctx, session, txn, sql, pin);
                 if let Err(e) = &result {
                     txn.fail_for(e);
                 }
@@ -17879,12 +17889,43 @@ impl EngineCore {
         txn: &mut crate::sql::transaction::SessionTransaction<'e>,
         sql: &str,
     ) -> Result<CopyPlan, crate::sql::allowlist::SqlSurfaceError> {
+        self.begin_copy_in_txn_with_pin(ctx, session, txn, sql, None)
+    }
+
+    /// [`Self::begin_copy_in_txn`] の、拡張クエリの Execute が [`Self::arm_copy_target`] で置いた検証済みの
+    /// 宛先を使う版（Issue #3197）。`wire-server` の `COPY` 入口が呼ぶ。置かれた宛先は元 SQL が一致するときだけ
+    /// 使い（簡易クエリや別の文は従来どおり再解決）、一致の有無にかかわらず取り出して空にする。
+    pub fn begin_copy_in_txn_armed<'e>(
+        &'e self,
+        ctx: &PolicyContext,
+        session: &mut crate::sql::mode::SessionState,
+        txn: &mut crate::sql::transaction::SessionTransaction<'e>,
+        sql: &str,
+    ) -> Result<CopyPlan, crate::sql::allowlist::SqlSurfaceError> {
+        let pin = session.take_copy_target_pin(sql);
+        self.begin_copy_in_txn_with_pin(
+            ctx,
+            session,
+            txn,
+            sql,
+            pin.as_deref().map(|p| p.rewrites.as_slice()),
+        )
+    }
+
+    fn begin_copy_in_txn_with_pin<'e>(
+        &'e self,
+        ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
+        txn: &mut crate::sql::transaction::SessionTransaction<'e>,
+        sql: &str,
+        pin: Option<&[(usize, crate::sql::lexer::Token)]>,
+    ) -> Result<CopyPlan, crate::sql::allowlist::SqlSurfaceError> {
         Self::check_resolution_tenant(session, ctx)?;
         // 自動コミット（`Idle`）・明示トランザクションのどちらの `COPY ... TO` 走査にも束縛する
         // （[`Self::begin_copy`] と同じ理由）。
         let _row_security_scope =
             crate::sql::policy_applicability::RowSecurityScope::enter(session.row_security());
-        self.begin_copy_in_txn_unscrubbed(ctx, session, txn, sql)
+        self.begin_copy_in_txn_unscrubbed(ctx, session, txn, sql, pin)
             .map_err(|e| self.scrub_error(ctx, e))
     }
 
@@ -17894,11 +17935,12 @@ impl EngineCore {
         session: &crate::sql::mode::SessionState,
         txn: &mut crate::sql::transaction::SessionTransaction<'e>,
         sql: &str,
+        pin: Option<&[(usize, crate::sql::lexer::Token)]>,
     ) -> Result<CopyPlan, crate::sql::allowlist::SqlSurfaceError> {
         // `COPY (...) TO STDOUT` も明示トランザクションの文として読んだ基底表を記録する
         // （SQL-38・Issue #2404。[`Self::execute_in_active_txn`] と同じ区間）。
         let read_scope = txn.read_set_scope();
-        let result = self.begin_copy_active_inner(ctx, session, txn, sql);
+        let result = self.begin_copy_active_inner(ctx, session, txn, sql, pin);
         if let Some(scope) = read_scope {
             txn.absorb_read_set(scope.finish());
         }
@@ -17912,6 +17954,7 @@ impl EngineCore {
         session: &crate::sql::mode::SessionState,
         txn: &mut crate::sql::transaction::SessionTransaction<'e>,
         sql: &str,
+        pin: Option<&[(usize, crate::sql::lexer::Token)]>,
     ) -> Result<CopyPlan, crate::sql::allowlist::SqlSurfaceError> {
         // 明示 Tx の途中（writer 取得前）は `COPY TO` の検証・実行と同じ `BEGIN` 時点のスナップショットで
         // 安全弁を判定する（最新カタログだと BEGIN 後の DROP・RENAME で SCHEMA を飛ばし public 側へ向く）。
@@ -17925,7 +17968,7 @@ impl EngineCore {
             } else {
                 None
             };
-            self.check_copy_search_path(ctx, session, sql, snap)?;
+            self.check_copy_search_path(ctx, session, sql, snap, pin)?;
         }
         if let Some(plan) = self.begin_copy_temp(ctx, session, Some(&mut *txn), sql)? {
             return Ok(plan);
@@ -17946,7 +17989,7 @@ impl EngineCore {
                 sql,
                 false,
                 Some(&resolver),
-                |t| self.resolve_copy_tokens_path(ctx.tenant_id(), session, t, snap),
+                |t| self.resolve_copy_tokens_path(ctx.tenant_id(), session, t, snap, pin),
             )?
         };
         // `COPY FROM`（書き込み）の検証・schema lookup は読み取りではないので読み取り集合へ記録しない

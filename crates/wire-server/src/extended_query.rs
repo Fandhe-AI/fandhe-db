@@ -2254,16 +2254,21 @@ pub(crate) fn handle_execute<'e, S: WireStream>(
         msg.max_rows,
     ) {
         Ok(PortalExecution::Responded) => Ok(LoopSignal::Continue),
-        Ok(PortalExecution::Copy { sql }) => run_copy_portal(
-            stream,
-            engine,
-            ctx,
-            session,
-            txn,
-            state,
-            &msg.portal_name,
-            &sql,
-        ),
+        Ok(PortalExecution::Copy { sql }) => {
+            let result = run_copy_portal(
+                stream,
+                engine,
+                ctx,
+                session,
+                txn,
+                state,
+                &msg.portal_name,
+                &sql,
+            );
+            // 検証済みの宛先は `COPY` 開始が取り出すが、開始まで進まなかった場合に次の文へ残さない。
+            session.clear_copy_target_pin();
+            result
+        }
         Err(err) => {
             respond_error_and_await_sync(stream, &err, state)?;
             Ok(LoopSignal::Continue)
@@ -2540,7 +2545,7 @@ fn execute_portal<'e, S: WireStream>(
             }
             // Bind 時に解決した宛先が現在の `search_path`・カタログでも同じ関係を指すかを照合する
             // （同じ世代のまま path 前方に同名の関係が作られた場合の化けを拒否。Issue #3197）。
-            if let Err(e) = engine.require_copy_target_current(session, txn, &parsed) {
+            if let Err(e) = engine.arm_copy_target(session, txn, &parsed) {
                 txn.fail();
                 return Err(HandlerError::Sql(e));
             }

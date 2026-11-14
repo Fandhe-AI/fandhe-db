@@ -1212,6 +1212,19 @@ impl EngineCore {
                     &prepared.public_qualified,
                     temp,
                 )?;
+                // `COPY` は再解決（refresh）と宛先の記録（pin）を同じ読み取り源で行う。読み取り源が無い入口
+                // （自動コミット）では、ここで 1 つ確定したスナップショットを両方に使い、2 回の照会の間に別接続が
+                // 先行 path へ同名の表を作っても、検証した表と記録する表がずれないようにする（Issue #3197）。
+                let own_snap = if read_snap.is_none()
+                    && matches!(prepared.dummy_parsed, ParsedSql::Copy(_))
+                    && (session.search_path_may_hold_tenant_schema()
+                        || session.search_path_hides_public())
+                {
+                    Some(self.begin_read_txn()?)
+                } else {
+                    None
+                };
+                let read_snap = read_snap.or(own_snap.as_ref());
                 // Issue #3197: Parse 後に変わった path・カタログで解決し直す（解決が変わっていれば再 Parse した
                 // 文を使う。以降の検査・束縛は解決後の文に対して行う）。
                 // `refresh == false` は呼び出し元が解決済みの文を渡した入口（二重解決を避ける）。
@@ -1334,6 +1347,29 @@ impl EngineCore {
         } else {
             Err(search_path_stale())
         }
+    }
+
+    /// [`Self::require_copy_target_current`] で照合した宛先を、直後の `COPY` 開始へ渡すためセッションに置く
+    /// （Issue #3197）。`COPY` 開始（`begin_copy_in_txn_armed`）は再解決せずこの宛先を適用するので、照合から開始までの
+    /// 間に先行 path へ同名の表が作られても、検証した関係とは別の表へ `COPY` されない。記録の無い文は何も置かない。
+    /// 呼び出し元は `COPY` 開始まで進まなかった場合に [`SessionState::clear_copy_target_pin`] で破棄する。
+    pub fn arm_copy_target(
+        &self,
+        session: &mut SessionState,
+        txn: &crate::sql::transaction::SessionTransaction<'_>,
+        parsed: &ParsedSql,
+    ) -> Result<(), SqlSurfaceError> {
+        self.require_copy_target_current(session, txn, parsed)?;
+        session.clear_copy_target_pin();
+        if let ParsedSql::SessionRouted(routed) = parsed {
+            if let (Some(pin), ParsedSql::Copy(vc)) = (routed.copy_pin.as_ref(), routed.inner()) {
+                session.arm_copy_target_pin(crate::sql::mode::CopyTargetPin {
+                    sql: vc.sql().to_owned(),
+                    rewrites: pin.clone(),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// 振り分け済みの文の前提（世代・テナント）を確かめ、一時表ストアを返す。

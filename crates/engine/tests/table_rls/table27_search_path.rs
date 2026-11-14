@@ -1780,6 +1780,46 @@ fn extended_copy_rejects_a_same_name_relation_created_ahead_in_path_after_bind()
     assert_eq!(e.wire_code(), "0A000");
 }
 
+/// Issue #3197: 照合した宛先は `COPY` 開始へそのまま渡る。照合の後、同じ世代のまま path の前方（q2）へ同名の表が
+/// 作られても、`COPY` 開始は検証した `public.t`（1 行）を読み、後から作られた `q2.t`（3 行）へ化けない。
+// intentional: docs/design/schema-tenant-namespace.md
+#[test]
+fn extended_copy_start_uses_the_verified_target_not_a_table_created_after_the_check() {
+    let (core, _g, mut s) = q1_world("sp-ext-copy-armed");
+    assert!(s.bind_resolution_tenant(TENANT));
+    ok(&core, &mut s, "CREATE SCHEMA q2");
+    ok(&core, &mut s, "SET search_path TO q2, public");
+    let copy = parse_ext(&core, &s, "COPY t TO STDOUT").expect("extended COPY parses");
+    let bound = core
+        .bind_prepared_in_session(&s, &copy, &[])
+        .expect("extended COPY binds");
+    let mut txn = core.new_session_transaction();
+    core.arm_copy_target(&mut s, &txn, &bound)
+        .expect("target unchanged");
+    ok(&core, &mut s, "CREATE TABLE q2.t (id BIGINT PRIMARY KEY)");
+    for id in [30, 31, 32] {
+        ok(
+            &core,
+            &mut s,
+            &format!("INSERT INTO q2.t (id) VALUES ({id})"),
+        );
+    }
+    let copy_sql = "COPY t TO STDOUT";
+    match core.begin_copy_in_txn_armed(&ctx(TENANT), &mut s, &mut txn, copy_sql) {
+        Ok(engine::core::CopyPlan::To(_, r, _)) => {
+            assert_eq!(r.rows.len(), 1, "must read the verified public.t");
+        }
+        Ok(_) => panic!("expected a COPY TO plan"),
+        Err(e) => panic!("armed COPY must start: {e}"),
+    }
+    // 置かれた宛先は 1 回で消える。次の同じ文は現在の path で再解決する（q2.t の 3 行）。
+    match core.begin_copy_in_txn_armed(&ctx(TENANT), &mut s, &mut txn, copy_sql) {
+        Ok(engine::core::CopyPlan::To(_, r, _)) => assert_eq!(r.rows.len(), 3),
+        Ok(_) => panic!("expected a COPY TO plan"),
+        Err(e) => panic!("unarmed COPY must start: {e}"),
+    }
+}
+
 /// Issue #3197: public の表へ解決した準備済み文は、path から `public` が消えて名前がどの要素にも無くなれば、
 /// Bind だけでなく Describe(S) でも `42P01` になる（public の表の列を公告し続けない）。
 // intentional: docs/design/schema-tenant-namespace.md
