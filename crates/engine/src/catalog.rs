@@ -8362,9 +8362,9 @@ impl ForeignKeyDef {
 
     /// 参照先列名が `id` 単独の形か（親を見ない形だけの判定）。永続値 `["id"]` の解釈は親の
     /// 行識別方式で決まる（従来方式は物理キーの疑似列、採番方式は宣言した普通の列。Issue #3178）。
-    /// 実行時の経路（`catalog.rs`・`tenant.rs`・`constraint.rs` の既存呼び出し）は
-    /// 現状この述語のままで、採番方式の親では `constraint.rs` の集約点が 0A000 で拒否して塞ぐ。
-    /// 親を見て分岐する [`Self::references_parent_pseudo_id`] への移行は #3179・#3180 が担う。
+    /// 子の INSERT／UPDATE の存在検査と親の UPDATE 検査は親を見て分岐する
+    /// [`Self::references_parent_pseudo_id`] へ移行済み（Issue #3179）。親の DELETE・参照アクション・
+    /// ALTER 系の経路は現状この述語のままで、採番方式の親では 0A000 で拒否して塞ぐ（#3180・#3181 が担う）。
     pub(crate) fn references_parent_id(&self) -> bool {
         matches!(self.parent_columns.as_slice(), [only] if only == FOREIGN_KEY_PARENT_ID_COLUMN)
     }
@@ -18728,18 +18728,20 @@ pub(crate) fn required_key_index_names_in_txn(
     write_txn: &redb::WriteTransaction,
     table: &str,
 ) -> Result<std::collections::BTreeSet<String>> {
-    // 親側索引: `id` 参照 FK は `table` 自身の索引を使わないため除外する。
+    // 親側索引: 疑似列 `id` を参照する FK は `table` 自身の索引を使わないため除外する。
+    // 採番方式の親の `id` は宣言した普通の列で、子の存在検査が `k:id` 索引を使うため
+    // 除外しない（Issue #3179）。
+    let own_schema = require_table_schema_write_any_identity(write_txn, table)?;
     let referencing = referencing_foreign_keys_in_txn(write_txn, table)?;
     let mut names: std::collections::BTreeSet<String> = referencing
         .iter()
-        .filter(|(_, fk)| !fk.references_parent_id())
+        .filter(|(_, fk)| !fk.references_parent_pseudo_id(&own_schema))
         .map(|(_, fk)| crate::key_index::index_name_for_columns(fk.parent_columns()))
         .collect();
     // 子側索引: `id` 参照 FK も `table` 自身の参照元列索引を構築・使用する
     // ため除外しない（`constraint::enforce_referencing_rows_in_txn` の
     // `fk.references_parent_id()` 分岐が `none_referenced_in_txn` 経由で
     // 同じ索引を照会する）。
-    let own_schema = require_table_schema_write_any_identity(write_txn, table)?;
     names.extend(
         own_schema
             .foreign_keys
