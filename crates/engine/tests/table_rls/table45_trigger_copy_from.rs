@@ -529,3 +529,91 @@ fn copy_trigger_now_is_txn_start_in_explicit_txn() {
         "now() must be BEGIN time"
     );
 }
+
+/// NOT NULL 列 `b` を持つ表 `s.nn (a, b)` に BEFORE ROW INSERT トリガ（`fill` が真なら `b` を 7 で補う）を付ける。
+fn not_null_table(core: &EngineCore, tenant: &str, s: &mut SessionState, fill: bool) {
+    ok(
+        core,
+        tenant,
+        s,
+        "CREATE TABLE s.nn (a INTEGER NOT NULL, b INTEGER NOT NULL)",
+    );
+    let body = if fill {
+        "BEGIN IF NEW.b IS NULL THEN NEW.b := 7; END IF; RETURN NEW; END"
+    } else {
+        "BEGIN RETURN NEW; END"
+    };
+    func(core, tenant, s, "fillb", body);
+    ok(
+        core,
+        tenant,
+        s,
+        "CREATE TRIGGER tn BEFORE INSERT ON s.nn FOR EACH ROW EXECUTE FUNCTION fillb()",
+    );
+}
+
+// BEFORE ROW が NOT NULL 列を補う表では、`\N`・列省略のどちらも束縛・列リスト検査で `23502` にならず、
+// トリガ適用後の値で書かれる（Issue #3281。INSERT の省略列の遅延と同じ契約）。
+#[test]
+fn before_trigger_fills_not_null_for_null_marker_and_omitted_column() {
+    let (_g, core) = open("t3281-nn-fill");
+    let mut a = tenant_session(&core, "t1");
+    not_null_table(&core, "t1", &mut a, true);
+    copy(
+        &core,
+        "t1",
+        &mut a,
+        "COPY nn (a, b) FROM STDIN",
+        b"1\t\\N\n2\t5\n",
+    )
+    .expect("null marker filled by BEFORE trigger");
+    copy(&core, "t1", &mut a, "COPY nn (a) FROM STDIN", b"3\n")
+        .expect("omitted column filled by BEFORE trigger");
+    assert_eq!(ints(&core, "t1", &mut a, "SELECT a FROM nn"), vec![1, 2, 3]);
+    assert_eq!(ints(&core, "t1", &mut a, "SELECT b FROM nn"), vec![5, 7, 7]);
+}
+
+// BEFORE ROW が補わない場合は最終 NEW の検査で `23502` になり、行は残らない。
+#[test]
+fn before_trigger_not_filling_not_null_is_23502_without_residue() {
+    let (_g, core) = open("t3281-nn-nofill");
+    let mut a = tenant_session(&core, "t1");
+    not_null_table(&core, "t1", &mut a, false);
+    let e1 = copy(
+        &core,
+        "t1",
+        &mut a,
+        "COPY nn (a, b) FROM STDIN",
+        b"1\t\\N\n",
+    )
+    .expect_err("null marker not filled");
+    assert_eq!(e1.wire_code(), "23502");
+    let e2 = copy(&core, "t1", &mut a, "COPY nn (a) FROM STDIN", b"1\n")
+        .expect_err("omitted not filled");
+    assert_eq!(e2.wire_code(), "23502");
+    assert!(ints(&core, "t1", &mut a, "SELECT a FROM nn").is_empty());
+}
+
+// トリガの無い表は従来どおり束縛時に `23502`。
+#[test]
+fn without_trigger_not_null_is_still_23502() {
+    let (_g, core) = open("t3281-nn-plain");
+    let mut a = tenant_session(&core, "t1");
+    ok(
+        &core,
+        "t1",
+        &mut a,
+        "CREATE TABLE s.nn (a INTEGER NOT NULL, b INTEGER NOT NULL)",
+    );
+    let e1 = copy(
+        &core,
+        "t1",
+        &mut a,
+        "COPY nn (a, b) FROM STDIN",
+        b"1\t\\N\n",
+    )
+    .expect_err("null marker");
+    assert_eq!(e1.wire_code(), "23502");
+    let e2 = copy(&core, "t1", &mut a, "COPY nn (a) FROM STDIN", b"1\n").expect_err("omitted");
+    assert_eq!(e2.wire_code(), "23502");
+}

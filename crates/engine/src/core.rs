@@ -17882,6 +17882,21 @@ impl EngineCore {
                 };
                 // 開始時の判定（`require_copy_privileges`）と同じ列集合で commit 時にも再検査する。
                 let copy_cols = crate::sql::privilege_gate::copy::copy_from_columns(&v.columns);
+                // BEFORE ROW INSERT トリガのある表は、NOT NULL 検査をトリガ適用後の書き込み段へ遅らせる
+                // （トリガが `\N`・省略列を補えるように。Issue #3281）。読めなければ遅らせない（fail-closed）。
+                let defer_not_null = crate::catalog::trigger::list_triggers_in_source(
+                    &_read_txn,
+                    ctx.tenant_id(),
+                    &v.table_name,
+                )
+                .is_ok_and(|defs| {
+                    defs.iter().any(|t| {
+                        t.events
+                            .contains(crate::catalog::trigger::TriggerEvents::INSERT)
+                            && t.level == crate::catalog::trigger::TriggerLevel::Row
+                            && t.timing == crate::catalog::trigger::TriggerTiming::Before
+                    })
+                });
                 Ok(CopyPlan::From(
                     crate::sql::copy::CopyInSession::new(
                         v.table_name,
@@ -17893,6 +17908,7 @@ impl EngineCore {
                         self.batch_limits,
                         clock,
                         session.time_zone().clone(),
+                        defer_not_null,
                     )?
                     .with_row_security(session.row_security())
                     .with_privilege_recheck(
