@@ -2413,6 +2413,17 @@ impl RequiredParentKeys {
         }
     }
 
+    /// 親 `parent` の行識別方式まで見て集合の種類を選ぶ。`id` 参照でも採番方式の親
+    /// （`id` は宣言した普通の列）は列参照として正準キーで持つ（Issue #3181。
+    /// ALTER 系の既存行再検証〔`enforce_referencing_rows_by_scan_for_fk`〕が使う）。
+    fn new_for_parent(fk: &ForeignKeyDef, parent: &TableSchema) -> Self {
+        if fk.references_parent_pseudo_id(parent) {
+            RequiredParentKeys::Ids(BTreeSet::new())
+        } else {
+            RequiredParentKeys::Keys(BTreeSet::new())
+        }
+    }
+
     fn is_empty(&self) -> bool {
         match self {
             RequiredParentKeys::Ids(ids) => ids.is_empty(),
@@ -2725,7 +2736,7 @@ impl<'a> FkKeyRecoder<'a> {
         parent_schema: &'a TableSchema,
         fk: &ForeignKeyDef,
     ) -> Result<Self, TenantWriteError> {
-        if fk.references_parent_id() {
+        if fk.references_parent_pseudo_id(parent_schema) {
             return Ok(Self {
                 child: Vec::new(),
                 parent: Vec::new(),
@@ -3463,7 +3474,7 @@ fn enforce_referencing_rows_by_scan_for_fk(
             "referencing foreign key not found in child schema",
         ));
     };
-    let mut required = RequiredParentKeys::new(fk);
+    let mut required = RequiredParentKeys::new_for_parent(fk, schema);
     {
         let row_table_name = crate::catalog::user_rows_table_name(&child_schema.name);
         let row_table = match write_txn

@@ -1365,3 +1365,234 @@ fn checked_single_row_delete_rejects_before_touching_an_allocated_table() {
         .expect_err("undefined table");
     assert_eq!(err.wire_code(), "42P01");
 }
+
+/// 採番方式の親への `ADD CONSTRAINT ... FOREIGN KEY (..) REFERENCES parent (id)` は、既存行を
+/// 親の宣言した `id` 列（普通の列）への参照として再検証する（Issue #3181）。成功・孤児（23503）・
+/// NULL のみ・型の組違い・別テナントの同値 id を親と見なさない、をまとめて固定する。
+#[test]
+fn allocated_parent_add_constraint_revalidates_existing_rows_as_column_reference() {
+    let (core, _g) = new_core("t23-fk-id-add-constraint");
+    let alice = ctx("alice");
+    let bob = ctx("bob");
+    run(
+        &core,
+        &alice,
+        "CREATE TABLE users (id BIGINT PRIMARY KEY, name TEXT)",
+    );
+    run(
+        &core,
+        &alice,
+        "INSERT INTO users (id, name) VALUES (1, 'a')",
+    );
+    run(
+        &core,
+        &alice,
+        "INSERT INTO users (id, name) VALUES (2, 'b')",
+    );
+    // 親に全値が存在する（型の組違い: 子 INTEGER・親 BIGINT を含む）。
+    run(
+        &core,
+        &alice,
+        "CREATE TABLE posts (author INTEGER, body TEXT)",
+    );
+    run(
+        &core,
+        &alice,
+        "INSERT INTO posts (author, body) VALUES (1, 'x')",
+    );
+    run(
+        &core,
+        &alice,
+        "INSERT INTO posts (author, body) VALUES (NULL, 'n')",
+    );
+    run(
+        &core,
+        &alice,
+        "ALTER TABLE posts ADD CONSTRAINT posts_fk FOREIGN KEY (author) REFERENCES users (id)",
+    );
+    let rows = query(&core, &alice, "SELECT body FROM posts LIMIT 10");
+    assert_eq!(texts(&rows, 0).len(), 2);
+
+    // 孤児を含むと 23503 で拒否され、副作用ゼロ（修正後に再度 ADD できる）。
+    run(
+        &core,
+        &alice,
+        "CREATE TABLE posts2 (author BIGINT, body TEXT)",
+    );
+    run(
+        &core,
+        &alice,
+        "INSERT INTO posts2 (author, body) VALUES (1, 'x')",
+    );
+    run(
+        &core,
+        &alice,
+        "INSERT INTO posts2 (author, body) VALUES (99, 'orphan')",
+    );
+    let add =
+        "ALTER TABLE posts2 ADD CONSTRAINT posts2_fk FOREIGN KEY (author) REFERENCES users (id)";
+    assert_eq!(code_of(&core, &alice, add), "23503");
+    run(&core, &alice, "DELETE FROM posts2 WHERE body = 'orphan'");
+    assert!(code_of(&core, &alice, add).starts_with("ok"));
+
+    // NULL のみの子は成功する。
+    run(
+        &core,
+        &alice,
+        "CREATE TABLE posts3 (author BIGINT, body TEXT)",
+    );
+    run(
+        &core,
+        &alice,
+        "INSERT INTO posts3 (author, body) VALUES (NULL, 'n')",
+    );
+    assert!(code_of(
+        &core,
+        &alice,
+        "ALTER TABLE posts3 ADD CONSTRAINT posts3_fk FOREIGN KEY (author) REFERENCES users (id)"
+    )
+    .starts_with("ok"));
+
+    // 別テナントの同値 id は親と見なさない（bob の親 id=7 は alice の子から見えない）。
+    run(
+        &core,
+        &bob,
+        "INSERT INTO users (id, name) VALUES (7, 'bob')",
+    );
+    run(
+        &core,
+        &alice,
+        "CREATE TABLE posts4 (author BIGINT, body TEXT)",
+    );
+    run(
+        &core,
+        &alice,
+        "INSERT INTO posts4 (author, body) VALUES (7, 'x')",
+    );
+    assert_eq!(
+        code_of(
+            &core,
+            &alice,
+            "ALTER TABLE posts4 ADD CONSTRAINT posts4_fk FOREIGN KEY (author) REFERENCES users (id)"
+        ),
+        "23503"
+    );
+}
+
+/// 自己参照・親の行ストア未作成・末尾 `;` 付きの ADD CONSTRAINT（Issue #3181）。
+#[test]
+fn allocated_self_reference_and_empty_parent_add_constraint() {
+    let (core, _g) = new_core("t23-fk-id-add-selfref");
+    let alice = ctx("alice");
+    run(
+        &core,
+        &alice,
+        "CREATE TABLE selfref (id BIGINT PRIMARY KEY, up BIGINT)",
+    );
+    run(
+        &core,
+        &alice,
+        "INSERT INTO selfref (id, up) VALUES (1, NULL)",
+    );
+    run(&core, &alice, "INSERT INTO selfref (id, up) VALUES (2, 1)");
+    assert!(code_of(
+        &core,
+        &alice,
+        "ALTER TABLE selfref ADD CONSTRAINT selfref_fk FOREIGN KEY (up) REFERENCES selfref (id);"
+    )
+    .starts_with("ok"));
+
+    run(
+        &core,
+        &alice,
+        "CREATE TABLE selfref2 (id BIGINT PRIMARY KEY, up BIGINT)",
+    );
+    run(&core, &alice, "INSERT INTO selfref2 (id, up) VALUES (2, 5)");
+    assert_eq!(
+        code_of(
+            &core,
+            &alice,
+            "ALTER TABLE selfref2 ADD CONSTRAINT s2_fk FOREIGN KEY (up) REFERENCES selfref2 (id)"
+        ),
+        "23503"
+    );
+
+    // 親に 1 行も無いとき、非 NULL の子は 23503。
+    run(
+        &core,
+        &alice,
+        "CREATE TABLE empty_parent (id BIGINT PRIMARY KEY)",
+    );
+    run(&core, &alice, "CREATE TABLE kids (p BIGINT)");
+    run(&core, &alice, "INSERT INTO kids (p) VALUES (1)");
+    assert_eq!(
+        code_of(
+            &core,
+            &alice,
+            "ALTER TABLE kids ADD CONSTRAINT kids_fk FOREIGN KEY (p) REFERENCES empty_parent (id)"
+        ),
+        "23503"
+    );
+}
+
+/// 採番方式の親・子の id 参照 FK を持つ表の `ALTER COLUMN TYPE`・`RENAME COLUMN` の追随（Issue #3181）。
+#[test]
+fn allocated_id_reference_follows_alter_type_and_rename() {
+    let (core, _g) = new_core("t23-fk-id-alter-follow");
+    let alice = ctx("alice");
+    run(
+        &core,
+        &alice,
+        "CREATE TABLE users (id BIGINT PRIMARY KEY, name TEXT)",
+    );
+    run(
+        &core,
+        &alice,
+        "INSERT INTO users (id, name) VALUES (1, 'a')",
+    );
+    run(
+        &core,
+        &alice,
+        "CREATE TABLE posts (author BIGINT, body TEXT)",
+    );
+    run(
+        &core,
+        &alice,
+        "INSERT INTO posts (author, body) VALUES (1, 'x')",
+    );
+    run(
+        &core,
+        &alice,
+        "ALTER TABLE posts ADD CONSTRAINT posts_fk FOREIGN KEY (author) REFERENCES users (id)",
+    );
+    // 子の参照元列の型変更（INTEGER へ。値は収まる）は通り、FK は保たれる。
+    assert!(code_of(
+        &core,
+        &alice,
+        "ALTER TABLE posts ALTER COLUMN author TYPE INTEGER"
+    )
+    .starts_with("ok"));
+    // 非整数への変更は 42804。
+    assert_eq!(
+        code_of(
+            &core,
+            &alice,
+            "ALTER TABLE posts ALTER COLUMN author TYPE TEXT USING author::text"
+        ),
+        "42804"
+    );
+    // 親の `id` 列の型変更・改名は SQL 構文段が予約名として 42601／42703 で拒否する
+    // （カタログを見ない存在オラクル対策。採番方式の `id` への緩和は別途。対象外節参照）。
+    assert_eq!(
+        code_of(&core, &alice, "ALTER TABLE users ALTER COLUMN id TYPE TEXT"),
+        "42601"
+    );
+    // 参照元列の改名は FK に追随し、改名後も FK 宣言は残る（依存拒否が効く）。
+    assert!(code_of(
+        &core,
+        &alice,
+        "ALTER TABLE posts RENAME COLUMN author TO writer"
+    )
+    .starts_with("ok"));
+    assert_eq!(code_of(&core, &alice, "DROP TABLE users"), "2BP01");
+}
