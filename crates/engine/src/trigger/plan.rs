@@ -427,6 +427,21 @@ fn walk_referential_children(
     Ok(found_row)
 }
 
+/// 分割実行 DML（チャンクごとに commit する非原子実行）向けの入口。参照アクションが及ぶ子表に該当
+/// イベントのトリガがあれば `0A000`（子トリガの副作用がチャンク commit で文の途中に永続化され、再開で
+/// 再発火・欠落しうるため結線しない。Issue #3284 の対象外）。`event` は `UPDATE` か `DELETE`。
+pub(crate) fn reject_referential_child_triggers(
+    write_txn: &redb::WriteTransaction,
+    tenant: &str,
+    table: &str,
+    event: u8,
+) -> Result<(), TenantWriteError> {
+    if !any_triggers_exist(write_txn)? {
+        return Ok(());
+    }
+    guard_referential_children(write_txn, tenant, table, event == TriggerEvents::DELETE)
+}
+
 /// 未結線の経路（`runtime` なし・[`guard_unwired_dml`]）向け。子表に該当イベントのトリガがあれば `0A000`
 /// （子表の行は参照アクション内で書き換わりトリガが発火しないため、黙って飛ばさない）。
 fn guard_referential_children(
