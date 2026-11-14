@@ -518,12 +518,14 @@ fn deferred_fk_commit_never_sees_another_tenants_parent() {
     let commit_code = |c: &PolicyContext, insert: &str| -> String {
         let mut s = SessionState::default();
         let mut txn = core.new_session_transaction();
+        // BEGIN と INSERT は遅延 FK なので必ず成功する。エラーは COMMIT の検査だけで比較する。
+        for sql in ["BEGIN", insert] {
+            core.execute_sql_in_txn(c, &mut s, &mut txn, sql)
+                .unwrap_or_else(|e| panic!("{sql} must succeed: {}", e.wire_code()));
+        }
         let mut last = String::from("ok");
-        for sql in ["BEGIN", insert, "COMMIT"] {
-            if let Err(e) = core.execute_sql_in_txn(c, &mut s, &mut txn, sql) {
-                last = e.wire_code().to_string();
-                break;
-            }
+        if let Err(e) = core.execute_sql_in_txn(c, &mut s, &mut txn, "COMMIT") {
+            last = e.wire_code().to_string();
         }
         last
     };
