@@ -158,11 +158,35 @@ fn wire_extended_query_fires_trigger() {
     assert_eq!(select_col(&mut s, "SELECT n FROM s.tt"), vec!["105"]);
 }
 
-/// 未対応の本体（本体の DELETE）は `0A000` の ErrorResponse と ReadyForQuery で返り、同じ接続で次の文が
-/// 実行でき、本表・監査に残渣が無い。
-///
-/// tracked: #3187
-/// 本体の `DELETE` は窓口を広げる #3187 までの暫定の拒否（UPDATE は dispatch 済み）。
+/// 本体の `DELETE` と表を読む `SELECT`（Issue #3187）が、psql と同じ末尾 `;` 付きの単独送信でも通る。
+/// `DELETE` は同じ Tx で先に書いた監査行を消し、`SELECT ... INTO` は自 Tx の未 commit の行を読む。
+#[test]
+fn wire_trigger_body_delete_and_select_run() {
+    let (addr, _g) = serve();
+    let mut s = connect(addr, "alice", "pw-alice");
+    setup(&mut s);
+    exec(
+        &mut s,
+        "CREATE FUNCTION dsel() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         DECLARE c INTEGER; \
+         BEGIN INSERT INTO audit (lv) VALUES ('x'); INSERT INTO audit (lv) VALUES ('y'); \
+         DELETE FROM audit WHERE lv = 'x'; \
+         SELECT count(*) INTO c FROM audit; NEW.n := c; RETURN NEW; END $$",
+    );
+    exec(
+        &mut s,
+        "CREATE TRIGGER tb BEFORE INSERT ON s.tt FOR EACH ROW EXECUTE FUNCTION dsel()",
+    );
+    assert_eq!(
+        exec(&mut s, "INSERT INTO s.tt (n) VALUES (9);"),
+        "INSERT 0 1"
+    );
+    assert_eq!(select_col(&mut s, "SELECT n FROM s.tt"), vec!["1"]);
+    assert_eq!(select_col(&mut s, "SELECT lv FROM audit"), vec!["y"]);
+}
+
+/// 窓口の許可リストに無い本体（`INSERT ... SELECT`）は `0A000` の ErrorResponse と ReadyForQuery で返り、
+/// 同じ接続で次の文が実行でき、本表・監査に残渣が無い。
 #[test]
 fn wire_unsupported_body_is_0a000_and_connection_survives() {
     let (addr, _g) = serve();
@@ -171,7 +195,7 @@ fn wire_unsupported_body_is_0a000_and_connection_survives() {
     exec(
         &mut s,
         "CREATE FUNCTION upd() RETURNS trigger LANGUAGE plpgsql AS $$ \
-         BEGIN INSERT INTO audit (lv) VALUES ('x'); DELETE FROM audit WHERE lv = 'x'; RETURN NEW; END $$",
+         BEGIN INSERT INTO audit (lv) VALUES ('x'); INSERT INTO audit (lv) SELECT 'z'; RETURN NEW; END $$",
     );
     exec(
         &mut s,
