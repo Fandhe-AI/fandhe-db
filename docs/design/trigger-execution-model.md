@@ -156,6 +156,9 @@
 > UPSERT は INSERT・UPDATE のどちらかのトリガがあれば `0A000` のまま。ビュー経由・データ変更 CTE の副文は
 > 共有のフォーム関数を通るため INSERT と同様に発火する。
 >
+> Issue #3186 の実装記録: [plpgsql-subset.md](plpgsql-subset.md)「Issue #3186 追記」（窓口の UPDATE と、D6 の
+> 安全弁としての表単位の `0A000`。`27000` の variant 追加は見送り）。
+>
 > Issue #1726 の実装記録: [trigger-statement-truncate.md](trigger-statement-truncate.md)（段 2・段 7 の文トリガ・
 > 対象 0 行での発火・TRUNCATE トリガの順序と PostgreSQL との差分）。
 
@@ -310,6 +313,7 @@
 
 | Issue | 前提とする決定 |
 | ----- | -------------- |
+| #3185 | 既定 invoker の本番化（D8 の経路ガードは不変）。INSERT 発火の SQL・wire E2E |
 | #2228 | D1（`TriggerCall` に渡す変数）・D2（NEW／OLD に出さない列）・D3（戻り値の意味） |
 | #2226 | D9・D10（トリガ内の文は台帳に記録しない。台帳モードのスコープ共通化） |
 | #1722 | D8 の定義対象の制限・D12・D2 の型検査・D7 の `WHEN` の定義時検査（#2228・PR #2775 に依存） |

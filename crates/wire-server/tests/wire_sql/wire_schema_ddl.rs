@@ -160,6 +160,49 @@ fn wire_alter_schema_and_set_schema_tags_and_sqlstates() {
     }
 }
 
+/// テナント SCHEMA 間の `ALTER TABLE a.t SET SCHEMA b;`（末尾 `;` つきの単独送信。Issue #3198）が
+/// `ALTER TABLE` で完了し、移動後は新しい修飾名で読め、旧名は `42P01`、`public` との間は `42501`。
+#[test]
+fn wire_set_schema_between_tenant_schemas() {
+    let (core, _guard) = new_core();
+    let store = allowed_store(&[("alice", "tenant-a", "correct-horse")], &["alice"]);
+    let addr = spawn_server(store, core);
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    for (sql, tag) in [
+        ("CREATE SCHEMA a", "CREATE SCHEMA"),
+        ("CREATE SCHEMA b", "CREATE SCHEMA"),
+        (
+            "CREATE TABLE a.t (id BIGINT PRIMARY KEY, qty INTEGER)",
+            "CREATE TABLE",
+        ),
+        ("INSERT INTO a.t (id, qty) VALUES (1, 10)", "INSERT 0 1"),
+        ("ALTER TABLE a.t SET SCHEMA b;", "ALTER TABLE"),
+    ] {
+        send_simple_query(&mut stream, sql);
+        assert_eq!(read_command_complete(&mut stream), tag, "{sql}");
+        read_ready_for_query(&mut stream);
+    }
+
+    send_simple_query(&mut stream, "SELECT id, qty FROM b.t");
+    let columns = read_row_description(&mut stream);
+    assert_eq!(columns, vec!["id", "qty"]);
+    let row = read_data_row(&mut stream);
+    assert_eq!(row, vec![Some("1".to_string()), Some("10".to_string())]);
+    assert_eq!(read_command_complete(&mut stream), "SELECT 1");
+    read_ready_for_query(&mut stream);
+
+    for (sql, sqlstate) in [
+        ("SELECT id FROM a.t", "42P01"),
+        ("ALTER TABLE b.t SET SCHEMA public", "42501"),
+        ("ALTER TABLE b.t SET SCHEMA ghost", "3F000"),
+    ] {
+        send_simple_query(&mut stream, sql);
+        expect_error_response_with_sqlstate(&mut stream, sqlstate);
+        read_ready_for_query(&mut stream);
+    }
+}
+
 /// 2 テナントの接続で同名が独立し、他テナントにしか無い名前の DROP は存在しない名前と
 /// 同じ SQLSTATE・同じ文言になる（存在の秘匿）。
 #[test]

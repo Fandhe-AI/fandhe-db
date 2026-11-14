@@ -4,9 +4,10 @@
 //! （`23505`）。(b) クラッシュしても「文の書き込み・トリガの副作用・台帳」が全部残るか全部残らない。
 //! (c) トリガ内の書き込みが他テナントへ届かず、エラーが他テナントの情報を含まない。
 //!
-//! トリガ関数の実体（Issue #2228）が未整備で、呼び出し口を差し替えられるのは `cfg(test)` の
-//! `EngineCore::with_trigger_invoker_for_test` だけである。このため公開 API だけを使う example や
-//! 結合テストではトリガを発火できず、クラッシュ注入も `recovery::commit_boundary` と同じ
+//! 本ファイルは `cfg(test)` の `EngineCore::with_trigger_invoker_for_test` で注入した invoker を使う。
+//! 既定は本番の invoker になった（Issue #3185）ため、公開 API の結合テストでも SQL だけで発火できる
+//! （最小形は `tests/table_rls/table45_trigger_fire.rs`）。注入 invoker の網羅（crash 注入を含む）を
+//! 本物の invoker で再実行するのは #3188。クラッシュ注入は `recovery::commit_boundary` と同じ
 //! 「テストバイナリ自身を子プロセスとして再実行する」形で本ファイルに置く。
 //! 設計記録は `docs/design/trigger-ledger-consistency.md`。
 

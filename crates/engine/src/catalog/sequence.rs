@@ -1461,6 +1461,106 @@ pub(crate) fn rewrite_sequence_owners_in_txn(
     Ok(())
 }
 
+/// `ALTER TABLE <s1.t> SET SCHEMA <s2>`（Issue #3198）で表 `table_key` と一緒に移す SEQUENCE の
+/// `(旧キー, 新キー)` を決める（書き込みはしない。`catalog::Storage::alter_table_set_schema` が、表の付け替えより
+/// 前に呼ぶ）。対象は「`table_key` が所有し、かつ移動元 SCHEMA 配下（`#<from>.`）にある」もの。別 SCHEMA・`public`
+/// の SEQUENCE を所有していても動かさない（名前の所属は表と独立）。判定順は移動先での名前の衝突
+/// （`TableAlreadyExists`。表・ビュー・索引・matview・SEQUENCE の共有名前空間）→ 他の表の `DEFAULT`／IDENTITY
+/// による参照（`DependentObjectsStillExist`。`2BP01`。表自身の参照は書き換えるので数えない）。
+pub(crate) fn plan_owned_sequence_moves_in_txn(
+    write_txn: &redb::WriteTransaction,
+    table_key: &str,
+    from_schema: u64,
+    to_schema: u64,
+) -> Result<Vec<(String, String)>> {
+    let from_prefix = RelationKey::schema_prefix(from_schema);
+    let to_prefix = RelationKey::schema_prefix(to_schema);
+    let owned = owned_sequence_entries_in_txn(write_txn, &|o| o.table == table_key)?;
+    let mut moves: Vec<(String, String)> = Vec::new();
+    for (name, _, _) in owned {
+        let Some(bare) = name.strip_prefix(from_prefix.as_str()) else {
+            continue;
+        };
+        let new_name = format!("{to_prefix}{bare}");
+        validate_relation_key(&new_name)?;
+        if super::relation_name_exists_in_txn(write_txn, &new_name)? {
+            // 利用者向けエラーに内部キー（`#<id>.`）を出さない。
+            return Err(CatalogError::TableAlreadyExists(
+                super::namespace::relation_name_part(&new_name).to_string(),
+            ));
+        }
+        moves.push((name, new_name));
+    }
+    if moves.is_empty() {
+        return Ok(moves);
+    }
+    for table_name in list_tables_in_txn(write_txn)? {
+        if table_name == table_key {
+            continue;
+        }
+        let schema = get_table_schema_in_txn_impl(write_txn, &table_name, false)?;
+        for (old_name, _) in &moves {
+            if schema.columns.iter().any(|c| {
+                c.default_expr
+                    .as_ref()
+                    .is_some_and(|d| column_default_references_sequence(d, old_name))
+            }) {
+                return Err(CatalogError::DependentObjectsStillExist(
+                    super::namespace::relation_name_part(old_name).to_string(),
+                ));
+            }
+        }
+    }
+    Ok(moves)
+}
+
+/// [`plan_owned_sequence_moves_in_txn`] が決めた SEQUENCE の定義キーを付け替える。定義 blob（内部 ID・
+/// パラメータ・所有者）は変えない。採番状態・ACL は内部 ID をキーに持つため触らず、現在値と権限はそのまま
+/// 引き継がれる。
+pub(crate) fn apply_sequence_moves_in_txn(
+    write_txn: &redb::WriteTransaction,
+    moves: &[(String, String)],
+) -> Result<()> {
+    for (old_name, new_name) in moves {
+        let mut table = write_txn.open_table_logged(SEQUENCES_TABLE)?;
+        let blob: Vec<u8> = {
+            let guard = table
+                .get(sequence_key(old_name))?
+                .ok_or_else(|| CatalogError::CorruptSchema("sequence disappeared".to_string()))?;
+            guard.value().to_vec()
+        };
+        table.remove(sequence_key(old_name))?;
+        table.insert(sequence_key(new_name), blob.as_slice())?;
+    }
+    Ok(())
+}
+
+/// 表のカタログ内の `DEFAULT nextval`／IDENTITY の SEQUENCE 名を `moves` に従って書き換える
+/// （[`apply_sequence_moves_in_txn`] と対で、移した表自身の列にだけ使う）。
+pub(crate) fn rewrite_default_sequence_names(schema: &mut TableSchema, moves: &[(String, String)]) {
+    let map = |d: &mut ColumnDefault| match d {
+        ColumnDefault::Sequence(seq) => {
+            if let Some((_, new)) = moves.iter().find(|(old, _)| old == seq) {
+                *seq = new.clone();
+            }
+        }
+        ColumnDefault::Identity { sequence, .. } => {
+            if let Some((_, new)) = moves.iter().find(|(old, _)| old == sequence) {
+                *sequence = new.clone();
+            }
+        }
+        _ => {}
+    };
+    for column in &mut schema.columns {
+        if let Some(d) = column.default_expr.as_mut() {
+            map(d);
+        }
+        if let Some(d) = column.fill_value.as_mut() {
+            map(d);
+        }
+    }
+}
+
 impl Storage {
     /// [`set_sequence_owner_in_txn`] を単独の write txn で実行する。
     #[cfg_attr(not(test), allow(dead_code))] // 結線は `*_in_txn` 経由。単独版は SQL の `OWNED BY` が入るまでテストのみ。

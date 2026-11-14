@@ -3,8 +3,8 @@
 //! エラー契約・テナント境界は `crates/engine/tests/table_rls/table45_trigger_ddl.rs`（in-process）が
 //! 確定オラクルで、本ファイルは固定コマンドタグ・SQLSTATE が wire フレーミング越しに観測できることの確認に
 //! 徹する（`wire_udf_call.rs` と同じ流儀）。共有 `public` 表への `CREATE TRIGGER` は定義時に `0A000`
-//! （Issue #3361）で、関数の判定（`42883`）は SCHEMA 配下の表で確かめる。成功経路の `CREATE TRIGGER` タグは
-//! engine 側のテストで担保する。
+//! （Issue #3361）で、関数の判定（`42883`）は SCHEMA 配下の表で確かめる。成功経路の `CREATE TRIGGER` タグと
+//! INSERT の発火は `wire_trigger_fire.rs`（Issue #3185）で固定する。
 
 use crate::common;
 

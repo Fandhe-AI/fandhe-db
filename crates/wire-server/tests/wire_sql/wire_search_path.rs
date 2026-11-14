@@ -139,8 +139,8 @@ fn wire_simple_query_set_show_reset_and_rollback() {
     assert_eq!(show(&mut stream), "\"$user\", public");
 }
 
-/// handshake の username が `"$user"` に展開される（同名の SCHEMA があれば作成先は `0A000`、無ければ
-/// `public`）。`public` を含まない path では一時表以外の未修飾名が `42P01` で届く。
+/// handshake の username が `"$user"` に展開される（同名の SCHEMA があれば作成先はその SCHEMA、無ければ
+/// `public`。Issue #3196）。`public` を含まない path では一時表以外の未修飾名が `42P01` で届く。
 #[test]
 fn wire_dollar_user_expands_from_the_authenticated_username() {
     let (core, _guard) = new_core();
@@ -159,11 +159,15 @@ fn wire_dollar_user_expands_from_the_authenticated_username() {
         simple_ok(&mut stream, "CREATE SCHEMA alice"),
         "CREATE SCHEMA"
     );
-    simple_err(
-        &mut stream,
-        "CREATE TABLE u (id BIGINT PRIMARY KEY)",
-        "0A000",
+    assert_eq!(
+        simple_ok(&mut stream, "CREATE TABLE u (id BIGINT PRIMARY KEY)"),
+        "CREATE TABLE"
     );
+    // `alice.u` に作られ、`public.u` とは独立している（同名で作れる）。
+    send_simple_query(&mut stream, "SELECT id FROM alice.u LIMIT 1");
+    let _ = read_row_description(&mut stream);
+    assert_eq!(read_command_complete(&mut stream), "SELECT 0");
+    read_ready_for_query(&mut stream);
     assert_eq!(
         simple_ok(&mut stream, "CREATE TABLE public.u (id BIGINT PRIMARY KEY)"),
         "CREATE TABLE"
@@ -404,4 +408,73 @@ fn wire_unqualified_read_resolves_into_own_schema_with_trailing_semicolon() {
     assert!(text.contains("C42P01"), "{text}");
     assert!(!text.contains('#'), "{text}");
     read_ready_for_query(&mut bob);
+}
+
+/// Issue #3196: psql 形（末尾 `;` 付きの単独送信）で、`SET search_path TO q1` の後の作成・DML・読み取りが
+/// 自テナントの SCHEMA に解決される。他テナントの同名 path では作成が `3F000`、DML が `42P01` で、
+/// 内部 ID を含む文言は出ない。
+#[test]
+fn wire_create_and_dml_resolve_into_own_schema_with_trailing_semicolon() {
+    let (core, _guard) = new_core();
+    let store = allowed_store(
+        &[
+            ("alice", "tenant-a", "correct-horse"),
+            ("bob", "tenant-b", "battery-staple"),
+        ],
+        &["alice", "bob"],
+    );
+    let addr = spawn_server(store, core);
+    let mut alice = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+    let mut bob = authenticate_to_ready_for_query(addr, "bob", "battery-staple");
+
+    simple_ok(&mut alice, "CREATE SCHEMA q1;");
+    simple_ok(&mut alice, "SET search_path TO q1;");
+    assert_eq!(
+        simple_ok(
+            &mut alice,
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, name TEXT);"
+        ),
+        "CREATE TABLE"
+    );
+    assert_eq!(
+        simple_ok(&mut alice, "INSERT INTO t (id, name) VALUES (1, 'a');"),
+        "INSERT 0 1"
+    );
+    assert_eq!(
+        simple_ok(&mut alice, "INSERT INTO t (id, name) VALUES (2, 'b');"),
+        "INSERT 0 1"
+    );
+    assert_eq!(
+        simple_ok(&mut alice, "UPDATE t SET name = 'c' WHERE id = 1;"),
+        "UPDATE 1"
+    );
+    assert_eq!(
+        simple_ok(&mut alice, "DELETE FROM t WHERE id = 2;"),
+        "DELETE 1"
+    );
+    send_simple_query(&mut alice, "SELECT id, name FROM q1.t;");
+    let _ = read_row_description(&mut alice);
+    assert_eq!(
+        read_data_row(&mut alice),
+        vec![Some("1".to_string()), Some("c".to_string())]
+    );
+    assert_eq!(read_command_complete(&mut alice), "SELECT 1");
+    read_ready_for_query(&mut alice);
+    // public には作られていない。
+    simple_err(&mut alice, "SELECT id FROM public.t;", "42P01");
+
+    // bob は q1 を持たない。作成は `3F000`、DML は `42P01`（内部 ID・名前を出さない）。
+    simple_ok(&mut bob, "SET search_path TO q1;");
+    for (sql, code) in [
+        ("CREATE TABLE t (id BIGINT PRIMARY KEY);", "C3F000"),
+        ("INSERT INTO t (id, name) VALUES (5, 'z');", "C42P01"),
+    ] {
+        send_simple_query(&mut bob, sql);
+        let (kind, body) = read_message(&mut bob);
+        assert_eq!(kind, b'E', "ErrorResponse");
+        let text = String::from_utf8_lossy(&body).into_owned();
+        assert!(text.contains(code), "{sql}: {text}");
+        assert!(!text.contains('#'), "{sql}: {text}");
+        read_ready_for_query(&mut bob);
+    }
 }
