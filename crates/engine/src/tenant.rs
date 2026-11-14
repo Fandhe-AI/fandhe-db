@@ -5578,6 +5578,7 @@ fn update_row_columns_impl(
                     &plan,
                     &writes,
                     project.as_deref_mut(),
+                    None,
                 )?;
                 // commit 記録（SQL-38・Issue #2404）: 0 行でも世代を進める経路のため表を記録する。
                 if done.applied == 0 {
@@ -6161,6 +6162,7 @@ fn delete_row_impl(
                     &plan,
                     &writes,
                     capture.as_mut().and_then(|c| c.project.as_deref_mut()),
+                    None,
                 )?;
                 if done.applied > 0 || done.trigger_wrote {
                     // commit 記録（SQL-38・Issue #2404）: 0 行でも世代を進める経路のため表を記録する。
@@ -7092,6 +7094,7 @@ fn delete_rows_where_impl<E>(
                 &plan,
                 &trigger_writes,
                 project.as_deref_mut(),
+                None,
             )?;
             if done.applied > 0 || done.trigger_wrote {
                 // commit 記録（SQL-38・Issue #2404）: 0 行でも世代を進める経路のため表を記録する。
@@ -7422,6 +7425,7 @@ fn update_rows_where_impl<E>(
                 &plan,
                 &trigger_writes,
                 project.as_deref_mut(),
+                None,
             )?;
             if done.applied > 0 || done.trigger_wrote {
                 // commit 記録（SQL-38・Issue #2404）: 0 行でも世代を進める経路のため表を記録する。
@@ -7629,6 +7633,7 @@ pub(crate) fn update_rows_joined_unchecked<E>(
                 &plan,
                 &trigger_writes,
                 // 結合形の `RETURNING` は未対応（`project` は常に `None`。Issue #3192 の対象外）。
+                None,
                 None,
             )?;
             if done.applied > 0 || done.trigger_wrote {
@@ -12570,6 +12575,7 @@ mod tests {
                 crate::storage::rowid::RowId::from_legacy_id(1),
                 10,
                 None,
+                false,
             )
             .expect("running");
             txn.commit_raw_for_test().expect("commit");
@@ -12618,6 +12624,7 @@ mod tests {
                 crate::storage::rowid::RowId::from_legacy_id(1),
                 10,
                 None,
+                false,
             )
             .expect("running");
             txn.commit_raw_for_test().expect("commit");

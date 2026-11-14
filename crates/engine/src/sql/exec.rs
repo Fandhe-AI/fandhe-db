@@ -6466,6 +6466,8 @@ pub(crate) fn execute_predicate_delete_partitioned(
     max_affected_rows: Option<std::num::NonZeroUsize>,
     fixed_time: Option<i64>,
     privilege_recheck: Option<crate::sql::privilege_gate::write::RelationPrivilegeRecheck>,
+    // 行トリガの通過証（Issue #3283）。`None` は該当トリガのある表を `0A000` で拒否する。
+    triggers: Option<&crate::trigger::TriggerRuntime>,
 ) -> Result<DeleteOutcome, SqlSurfaceError> {
     let ledger_write = ledger_mode
         .resolve(bound.operation_id())
@@ -6489,6 +6491,7 @@ pub(crate) fn execute_predicate_delete_partitioned(
                 max_affected_rows,
                 fixed_time,
                 privilege_recheck.clone(),
+                triggers,
                 predicate,
             )
         },
@@ -6523,6 +6526,8 @@ pub(crate) fn execute_predicate_update_partitioned(
     max_affected_rows: Option<std::num::NonZeroUsize>,
     fixed_time: Option<i64>,
     privilege_recheck: Option<crate::sql::privilege_gate::write::RelationPrivilegeRecheck>,
+    // 行トリガの通過証（Issue #3283）。`None` は該当トリガのある表を `0A000` で拒否する。
+    triggers: Option<&crate::trigger::TriggerRuntime>,
 ) -> Result<UpdateOutcome, SqlSurfaceError> {
     let ledger_write = ledger_mode
         .resolve(bound.operation_id())
@@ -6548,6 +6553,7 @@ pub(crate) fn execute_predicate_update_partitioned(
                 max_affected_rows,
                 fixed_time,
                 privilege_recheck.clone(),
+                triggers,
                 predicate,
             )
         },
