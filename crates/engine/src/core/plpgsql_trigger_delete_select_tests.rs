@@ -6,7 +6,8 @@
 //! （`core::plpgsql_trigger_host`）、外側の行ループ中の同表 `DELETE` を拒否する暫定ガード
 //! （`trigger::row_loop`）の振る舞いを固定する。期待値は PostgreSQL 17 の挙動。既知の差は
 //! `docs/design/plpgsql-subset.md` の「Issue #3187 追記」と `docs/design/trigger-update-delete.md`。
-//! 本体 `UPDATE` は #3186、wire 経由の E2E は #3185、RLS・台帳・crash の網羅的な再検証は #3188 の担当。
+//! 本体 `UPDATE` は #3186、wire 経由の E2E は #3185 で実施済み。RLS・台帳・crash の網羅的な再検証は #3188
+//! （`tests/table_rls/table45_trigger_prod_invoker.rs`・`examples/crash_tool_sequence.rs` の `*-trigger`）で実施済み。
 
 use std::sync::Arc;
 
