@@ -420,7 +420,7 @@ const RICH_SCHEMA: &[&str] = &[
     "CREATE FUNCTION add_one(x INTEGER, tags TEXT[]) RETURNS INTEGER LANGUAGE sql IMMUTABLE STRICT \
      PARALLEL SAFE COST 5 AS $q$ SELECT x + 1; $q$",
     "CREATE FUNCTION trg() RETURNS trigger LANGUAGE plpgsql AS $q$ BEGIN RETURN NEW; END $q$",
-    "CREATE TRIGGER parent_trg BEFORE INSERT OR UPDATE OF name ON parent \
+    "CREATE TRIGGER parent_trg BEFORE INSERT OR UPDATE OF label ON app.items \
      FOR EACH ROW EXECUTE FUNCTION trg('a', 'it''s')",
     "CREATE POLICY pol_sel ON parent AS RESTRICTIVE FOR SELECT USING (id > 0)",
     "ALTER TABLE parent ENABLE ROW LEVEL SECURITY",
@@ -809,18 +809,24 @@ fn restore_enforces_frame_order() {
     let dir = dir_of(&fx.db_path_str());
     let from = s(&dir.join("o.sql")).to_string();
     let h = || header(DumpScope::Tenant("t1".into()), DumpParts::All);
-    let trg = "CREATE TRIGGER tg BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION trg()";
+    // トリガの対象は SCHEMA 配下の表（共有 public 表のトリガは定義時に `0A000`。Issue #3361）。
+    let trg = "CREATE TRIGGER tg BEFORE INSERT ON s.t FOR EACH ROW EXECUTE FUNCTION trg()";
     let func =
         "CREATE FUNCTION trg() RETURNS trigger LANGUAGE plpgsql AS $q$ BEGIN RETURN NEW; END $q$";
     write_dump_with(&from, h(), |w| {
-        w.statement(StmtKind::Table, T_SQL).expect("s");
+        w.statement(StmtKind::Schema, "CREATE SCHEMA s").expect("s");
+        w.statement(
+            StmtKind::Table,
+            "CREATE TABLE s.t (id BIGINT PRIMARY KEY, b TEXT)",
+        )
+        .expect("s");
         w.statement(StmtKind::Function, func).expect("s");
         w.statement(StmtKind::Trigger, trg).expect("s");
-        w.statement(StmtKind::Insert, "INSERT INTO t (id, b) VALUES (1, 'x')")
+        w.statement(StmtKind::Insert, "INSERT INTO s.t (id, b) VALUES (1, 'x')")
             .expect("s");
     });
     let err = assert_restore_rejected(&dir, &from, &[], 4, "trigger before data");
-    assert!(err.contains("dump item 4"), "{err}");
+    assert!(err.contains("dump item 5"), "{err}");
     // COPY も同じ。
     write_dump_with(&from, h(), |w| {
         w.statement(StmtKind::Table, T_SQL).expect("s");

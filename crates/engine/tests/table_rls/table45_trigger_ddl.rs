@@ -2,9 +2,9 @@
 //! ポインタ: `docs/spec/04-behavior/` の TABLE-45、設計記録は `docs/design/trigger-catalog.md`・
 //! `docs/design/trigger-execution-model.md`（D8・D12）。
 //!
-//! `RETURNS trigger` 関数の保存形式（#2228）が未整備のため、SQL からは成功経路に到達できない（実在する
-//! 関数でも `42P17`）。本ファイルはエラー契約の判定順・テナント境界・fail-closed を固定する。成功経路と
-//! 再起動後の保持は `catalog::trigger` の単体テスト（Storage 水準）が担う。
+//! 本ファイルはエラー契約の判定順・テナント境界・fail-closed を固定する。共有 `public` 表への定義は
+//! 定義時に `0A000`（Issue #3361）で、トリガの対象は各テナントの SCHEMA 配下の表（`sa.t`・`sb.t`）に置く。
+//! 再起動後の保持など Storage 水準の成功経路は `catalog::trigger` の単体テストが担う。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
@@ -69,6 +69,25 @@ fn code_as(core: &EngineCore, tenant: &str, session: &mut SessionState, sql: &st
 }
 
 const CREATE: &str = "CREATE TRIGGER g BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION f()";
+/// SCHEMA 配下の表（[`schema_tables`] が作る `sa.t`・`sb.t`）への定義。
+const CREATE_A: &str = "CREATE TRIGGER g BEFORE INSERT ON sa.t FOR EACH ROW EXECUTE FUNCTION f()";
+const CREATE_B: &str = "CREATE TRIGGER g BEFORE INSERT ON sb.t FOR EACH ROW EXECUTE FUNCTION f()";
+
+/// alice に SCHEMA `sa`・bob に SCHEMA `sb` を作り、それぞれ表 `t` を置く（セッションは呼び出し側が渡す）。
+fn schema_tables(core: &EngineCore, alice: &mut SessionState, bob: &mut SessionState) {
+    for (tenant, s, schema) in [("alice", alice, "sa"), ("bob", bob, "sb")] {
+        ok_as(core, tenant, s, &format!("CREATE SCHEMA {schema}"));
+        ok_as(
+            core,
+            tenant,
+            s,
+            &format!("CREATE TABLE {schema}.t (a TEXT, b TEXT)"),
+        );
+    }
+}
+
+const TRIGGER_FN: &str =
+    "CREATE FUNCTION f() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$";
 
 /// 権限の無い主体には、対象表・関数・トリガの有無を問わず常に `42501`（存在オラクルにしない）。
 #[test]
@@ -134,11 +153,13 @@ fn explicit_transaction_rejects_trigger_ddl() {
     }
 }
 
-/// 判定順: 表の不在 `42P01`・列の不在 `42703`・関数の不在 `42883`。
+/// 判定順: 表の不在 `42P01`・列の不在 `42703`・関数の不在 `42883`（対象は SCHEMA 配下の表）。
 #[test]
 fn judgement_order_table_then_column_then_function() {
     let (_g, core) = open_fixture("trg-order");
     let mut s = allowed_session();
+    let mut b = allowed_session();
+    schema_tables(&core, &mut s, &mut b);
     assert_eq!(
         code_as(
             &core,
@@ -153,11 +174,11 @@ fn judgement_order_table_then_column_then_function() {
             &core,
             "alice",
             &mut s,
-            "CREATE TRIGGER g BEFORE UPDATE OF zzz ON t EXECUTE FUNCTION f()"
+            "CREATE TRIGGER g BEFORE UPDATE OF zzz ON sa.t EXECUTE FUNCTION f()"
         ),
         "42703"
     );
-    assert_eq!(code_as(&core, "alice", &mut s, CREATE), "42883");
+    assert_eq!(code_as(&core, "alice", &mut s, CREATE_A), "42883");
 }
 
 /// ビュー・マテリアライズドビューへのトリガは `42809`。
@@ -177,15 +198,82 @@ fn views_are_rejected_with_wrong_object_type() {
     );
 }
 
-/// 関数はあるが `RETURNS trigger` ではない（現状は常に）→ `42P17`。他テナントの関数は不在と同じ `42883`。
+/// 関数はあるが `RETURNS trigger` ではない → `42P17`。他テナントの関数は不在と同じ `42883`。
 #[test]
-fn existing_function_is_not_a_trigger_function_yet() {
+fn existing_function_is_not_a_trigger_function() {
     let (_g, core) = open_fixture("trg-fn");
     let mut alice = allowed_session();
     let mut bob = allowed_session();
+    schema_tables(&core, &mut alice, &mut bob);
     ok_as(&core, "alice", &mut alice, "CREATE FUNCTION f() AS 1");
-    assert_eq!(code_as(&core, "alice", &mut alice, CREATE), "42P17");
-    assert_eq!(code_as(&core, "bob", &mut bob, CREATE), "42883");
+    assert_eq!(code_as(&core, "alice", &mut alice, CREATE_A), "42P17");
+    assert_eq!(code_as(&core, "bob", &mut bob, CREATE_B), "42883");
+}
+
+/// 共有 `public` 表への `CREATE [OR REPLACE] TRIGGER`（`public.` 修飾を含む）は、実在するトリガ関数があっても
+/// 定義時に `0A000`（Issue #3361）。カタログには何も残らず、`DROP TRIGGER` は不在の `42704`。
+///
+/// intentional: docs/design/trigger-catalog.md
+/// 共有 public 表のトリガは、作成後に書き込みだけが失敗する状態を作るため定義時に拒否する（オーナー判断 2026-11-13）。
+#[test]
+fn shared_public_table_is_rejected_at_definition() {
+    let (_g, core) = open_fixture("trg-public");
+    let mut s = allowed_session();
+    ok_as(&core, "alice", &mut s, TRIGGER_FN);
+    for sql in [
+        "CREATE TRIGGER g BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION f()",
+        "CREATE OR REPLACE TRIGGER g BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION f()",
+        "CREATE TRIGGER g BEFORE INSERT ON public.t FOR EACH ROW EXECUTE FUNCTION f()",
+    ] {
+        assert_eq!(code_as(&core, "alice", &mut s, sql), "0A000", "{sql}");
+        assert_eq!(
+            code_as(&core, "alice", &mut s, "DROP TRIGGER g ON t"),
+            "42704",
+            "{sql}"
+        );
+    }
+}
+
+/// テナントの SCHEMA 配下の表へは作成でき、`DROP TRIGGER` で消せる。
+#[test]
+fn schema_table_accepts_triggers() {
+    let (_g, core) = open_fixture("trg-schema-ok");
+    let mut alice = allowed_session();
+    let mut bob = allowed_session();
+    schema_tables(&core, &mut alice, &mut bob);
+    ok_as(&core, "alice", &mut alice, TRIGGER_FN);
+    assert!(matches!(
+        ok_as(&core, "alice", &mut alice, CREATE_A),
+        SqlOutcome::CreateTrigger(_)
+    ));
+    assert!(matches!(
+        ok_as(&core, "alice", &mut alice, "DROP TRIGGER g ON sa.t"),
+        SqlOutcome::DropTrigger(_)
+    ));
+}
+
+/// 共有 public 表への拒否の応答は、他テナントの存在・定義の有無で変わらない（code・message がバイト単位で同じ）。
+///
+/// intentional: docs/design/trigger-catalog.md
+/// 判定は表キーの形だけで決まり、他テナントのトリガを読まない（同名の `42710` に化けない）。
+#[test]
+fn shared_public_rejection_does_not_reveal_other_tenants() {
+    let (_g, core) = open_fixture("trg-public-oracle");
+    let mut alice = allowed_session();
+    let mut bob = allowed_session();
+    schema_tables(&core, &mut alice, &mut bob);
+    ok_as(&core, "alice", &mut alice, TRIGGER_FN);
+    ok_as(&core, "bob", &mut bob, TRIGGER_FN);
+    let reject = |core: &EngineCore, s: &mut SessionState| {
+        let e = run_as(core, "bob", s, CREATE).expect_err("shared public table");
+        (e.wire_code(), e.client_message())
+    };
+    let before = reject(&core, &mut bob);
+    assert_eq!(before.0, "0A000");
+    // alice も同じ名前で拒否され（何も作られない）、alice の SCHEMA にトリガがあっても bob の応答は同じ。
+    assert_eq!(code_as(&core, "alice", &mut alice, CREATE), "0A000");
+    ok_as(&core, "alice", &mut alice, CREATE_A);
+    assert_eq!(reject(&core, &mut bob), before);
 }
 
 /// `DROP TRIGGER`: 不在は `42704`、`IF EXISTS` は no-op、表の不在は `42P01`（`IF EXISTS` は no-op）。
