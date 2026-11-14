@@ -667,6 +667,7 @@ pub(crate) fn remove_triggers_referencing_function_in_txn(
 }
 
 /// 表 `table_key` のいずれかのテナントのトリガが `UPDATE OF` で列 `column` を参照しているか
+/// または `WHEN` 条件の `NEW`／`OLD` 参照で列 `column` を使っているか
 /// （`RENAME COLUMN`・`DROP COLUMN`・`ALTER COLUMN TYPE` の暫定ガード用。表が無ければ `false`）。
 pub(crate) fn triggers_referencing_column_in_txn<R: ReadSource>(
     src: &R,
@@ -684,12 +685,23 @@ pub(crate) fn triggers_referencing_column_in_txn<R: ReadSource>(
         if t != table_key {
             break;
         }
-        if decode_trigger_def(name, v.value())?
-            .update_of
-            .iter()
-            .any(|c| c == column)
-        {
+        let def = decode_trigger_def(name, v.value())?;
+        if def.update_of.iter().any(|c| c == column) {
             return Ok(true);
+        }
+        // WHEN 条件が NEW／OLD 経由で参照する列も依存として扱う（Issue #3190）。
+        if let Some(w) = def.when_sql.as_deref() {
+            match crate::sql::lexer::tokenize(w) {
+                Ok(ts) => {
+                    if ts.iter().any(|t| {
+                        matches!(t, crate::sql::lexer::Token::QualifiedIdent { name, .. } if name == column)
+                    }) {
+                        return Ok(true);
+                    }
+                }
+                // 字句解析できない保存値は fail-closed で依存ありとみなす。
+                Err(_) => return Ok(true),
+            }
         }
     }
     Ok(false)

@@ -228,6 +228,7 @@ fn definition_time_rejections() {
         ("(EXISTS (SELECT 1))", "0A000"),
         ("(OLD.n > 1)", "42P17"),
         ("(NEW.nope > 1)", "42703"),
+        ("(NEW.id IS NOT NULL)", "42703"),
         ("(n > 1)", "0A000"),
         ("()", "42601"),
         ("(NEW.n > 1", "42601"),
@@ -297,4 +298,18 @@ fn unsupported_condition_form_fails_closed_at_fire_time() {
         "0A000"
     );
     assert!(ints(&core, "t1", "SELECT n FROM s.tt").is_empty());
+}
+
+/// WHEN が参照する列の RENAME／DROP は依存保護で拒否され、無関係の列は変更できる。
+#[test]
+fn when_referenced_column_is_protected_from_alter() {
+    let (_g, core) = open("trgwhen-dep", LedgerMode::Optional);
+    setup(&core, "t1");
+    ok(&core, "t1", "ALTER TABLE s.tt ADD COLUMN m INTEGER");
+    ok(&core, "t1", "CREATE TRIGGER g AFTER INSERT ON s.tt FOR EACH ROW WHEN (NEW.n > 0) EXECUTE FUNCTION rec()");
+    assert!(run(&core, "t1", "ALTER TABLE s.tt RENAME COLUMN n TO n2").is_err());
+    assert!(run(&core, "t1", "ALTER TABLE s.tt DROP COLUMN n").is_err());
+    ok(&core, "t1", "ALTER TABLE s.tt DROP COLUMN m");
+    ok(&core, "t1", "INSERT INTO s.tt (n) VALUES (5)");
+    assert_eq!(audit_vals(&core, "t1").len(), 1);
 }

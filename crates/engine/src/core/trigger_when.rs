@@ -96,8 +96,9 @@ impl EngineCore {
             if let Ok(tokens) = crate::sql::lexer::tokenize(when_sql) {
                 for t in &tokens {
                     if let Token::QualifiedIdent { name, .. } = t {
-                        let known = schema.columns.iter().any(|c| &c.name == name)
-                            || (schema.has_pseudo_id() && name.eq_ignore_ascii_case("id"));
+                        // 発火時の NEW／OLD は利用者列だけが束縛される（`trigger_vars_from_call`）。
+                        // 疑似列 `id` は束縛されないため、定義時に拒否する。
+                        let known = schema.columns.iter().any(|c| &c.name == name);
                         if !known {
                             return Err(SqlSurfaceError::undefined_column(
                                 "column in trigger WHEN condition",
