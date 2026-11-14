@@ -1717,7 +1717,7 @@ pub(crate) fn gin_decl_in_read_txn(
     read_txn: &redb::ReadTransaction,
     index_name: &str,
 ) -> Result<Option<(String, DeclaredGinIndex)>> {
-    validate_identifier(index_name)?;
+    validate_relation_key(index_name)?;
     let table = match read_txn.open_table(INDEX_CATALOG_TABLE) {
         Ok(t) => t,
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
@@ -2434,6 +2434,19 @@ fn index_name_exists_in_txn(write_txn: &redb::WriteTransaction, name: &str) -> R
     }
 }
 
+/// relation の名前空間（表・ビュー・索引・matview・SEQUENCE）で `name` が使用済みかを write txn 内で
+/// 判定する（`ALTER TABLE ... SET SCHEMA` の移動先衝突判定。Issue #3198）。
+pub(crate) fn relation_name_exists_in_txn(
+    write_txn: &redb::WriteTransaction,
+    name: &str,
+) -> Result<bool> {
+    Ok(table_exists_in_txn(write_txn, name)?
+        || view_exists_in_txn(write_txn, name)?
+        || index_name_exists_in_txn(write_txn, name)?
+        || materialized_view_exists_in_txn(write_txn, name)?
+        || sequence::sequence_exists_in_txn(write_txn, name)?)
+}
+
 /// `name` が [`CATALOG_TABLE`] に表として登録済みかを write txn 内で判定する
 /// （relation 名前空間の衝突・存在確認用。表が未作成なら `false` で、表を作らない）。
 pub(crate) fn table_exists_in_txn(write_txn: &redb::WriteTransaction, name: &str) -> Result<bool> {
@@ -2883,6 +2896,191 @@ fn rename_index_def_columns_in_txn(
         bump_index_catalog_generation_in_txn(write_txn)?;
     }
     Ok(unique_expression_touched)
+}
+
+/// 表のキーを `table_name` から `new_table_name` へ付け替える本体（commit はしない）。
+/// [`Storage::alter_table_rename`]（`ALTER TABLE ... RENAME TO`）と
+/// [`Storage::alter_table_set_schema`]（`ALTER TABLE ... SET SCHEMA`。Issue #3198）が共有する唯一の実装で、
+/// 呼び出し元が単一の write txn を開き、成功後に 1 回だけ commit する（失敗時は txn ごと破棄）。
+/// 判定・付け替えの内容は [`Storage::alter_table_rename`] のドキュメントに従う。
+fn rename_table_key_in_txn(
+    write_txn: &redb::WriteTransaction,
+    table_name: &str,
+    new_table_name: &str,
+) -> std::result::Result<(), AlterCheckError> {
+    let mut schema = {
+        let table = write_txn
+            .open_table_logged(CATALOG_TABLE)
+            .map_err(CatalogError::from)?;
+        let existing: Vec<u8> = {
+            let guard = table
+                .get(table_name)
+                .map_err(CatalogError::from)?
+                .ok_or_else(|| CatalogError::TableNotFound(table_name.to_string()))?;
+            guard.value().to_vec()
+        };
+        let mut resolve = |name: &str| get_enum_type_in_write_txn(write_txn, name);
+        decode_schema_with_resolver(table_name, &existing, &mut resolve)?
+    };
+    // 改名先の衝突判定（`create_table` と同じ名前空間: 表・ビュー・索引）。
+    {
+        let table = write_txn
+            .open_table_logged(CATALOG_TABLE)
+            .map_err(CatalogError::from)?;
+        if table
+            .get(new_table_name)
+            .map_err(CatalogError::from)?
+            .is_some()
+        {
+            return Err(CatalogError::TableAlreadyExists(new_table_name.to_string()).into());
+        }
+    }
+    match write_txn.open_table_logged(VIEWS_TABLE) {
+        Ok(views_table) => {
+            if views_table
+                .get(new_table_name)
+                .map_err(CatalogError::from)?
+                .is_some()
+            {
+                return Err(CatalogError::TableAlreadyExists(new_table_name.to_string()).into());
+            }
+        }
+        Err(redb::TableError::TableDoesNotExist(_)) => {}
+        Err(e) => return Err(CatalogError::from(e).into()),
+    }
+    if index_name_exists_in_txn(write_txn, new_table_name)?
+        || materialized_view_exists_in_txn(write_txn, new_table_name)?
+        || sequence::sequence_exists_in_txn(write_txn, new_table_name)?
+    {
+        return Err(CatalogError::TableAlreadyExists(new_table_name.to_string()).into());
+    }
+    // 標準形の関数本体が表を名前で保存しているため、改名は追随が入るまで拒否する（`2BP01`。Issue #2219）。
+    reject_relation_with_function_dependents_in_txn(write_txn, table_name)?;
+    // 暫定ガード（Issue #1663）: matview の参照元の改名は、追随が入るまで拒否する（別 Issue で追跡。Issue #1667 でも対象外）。
+    if !materialized::materialized_views_referencing_in_txn(write_txn, table_name)?.is_empty() {
+        return Err(CatalogError::DependentViewsExist(table_name.to_string()).into());
+    }
+    rewrite_views_for_renamed_table_in_txn(write_txn, table_name, new_table_name)?;
+
+    // 他表から参照される FK の付け替え（Issue #1624）。自表のカタログを書き換える前に、
+    // `CATALOG_TABLE` のハンドルを解放した状態で列挙する（`referencing_foreign_keys_in_txn`
+    // の契約）。自己参照は自表の書き換えで済むため除外し、同じ子は 1 回だけ書く。
+    let referencing = referencing_foreign_keys_in_txn(write_txn, table_name)?;
+    let mut seen_children: std::collections::BTreeSet<String> = Default::default();
+    for (child, _) in referencing {
+        if child.name == table_name || !seen_children.insert(child.name.clone()) {
+            continue;
+        }
+        let mut child = child;
+        child.rename_parent_table_references(table_name, new_table_name);
+        let child_encoded = encode_schema(&child)?;
+        {
+            let mut table = write_txn
+                .open_table_logged(CATALOG_TABLE)
+                .map_err(CatalogError::from)?;
+            table
+                .insert(child.name.as_str(), child_encoded.as_slice())
+                .map_err(CatalogError::from)?;
+        }
+        // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログを変える書き込みは DDL として記録する。
+        crate::storage::commit_log::note_ddl(write_txn, &child.name);
+        bump_table_generation_in_txn(write_txn, &child.name)?;
+    }
+    // 索引宣言の所有テーブル名の付け替え（索引カタログ世代も bump する）。
+    rename_index_def_table_in_txn(write_txn, table_name, new_table_name)?;
+    // TRIGGER 定義（全テナント分）も新しい表キーへ移す（TABLE-45・Issue #1722）。
+    trigger::rename_table_in_txn(write_txn, table_name, new_table_name)?;
+    // 行セキュリティポリシー（全テナント分）も新しい表キーへ移す（RLS-13・Issue #2274）。
+    policy::rename_table_in_txn(write_txn, table_name, new_table_name)?;
+    // 行セキュリティ有効化状態（全テナント分）も新しい表キーへ移す（RLS-13・Issue #2275）。
+    row_security::rename_row_security_table_in_txn(write_txn, table_name, new_table_name)?;
+    // 権限（ACL。全テナント分）も新しい表キーへ移す（SQL-40・Issue #1961）。
+    privilege::rename_relation_acl_in_txn(write_txn, table_name, new_table_name)?;
+    privilege::owner::rename_relation_owners_in_txn(write_txn, table_name, new_table_name)?;
+
+    // カタログの付け替え（`encode_schema` が不変条件を再検証する）。
+    schema.rename_table_references(new_table_name);
+    let encoded = encode_schema(&schema)?;
+    {
+        let mut table = write_txn
+            .open_table_logged(CATALOG_TABLE)
+            .map_err(CatalogError::from)?;
+        table
+            .insert(new_table_name, encoded.as_slice())
+            .map_err(CatalogError::from)?;
+        let removed = table.remove(table_name).map_err(CatalogError::from)?;
+        if removed.is_none() {
+            return Err(
+                CatalogError::CorruptSchema("table disappeared during rename".to_string()).into(),
+            );
+        }
+    }
+    // 行ストアの付け替え。行テーブルは遅延作成のため未作成（`TableDoesNotExist`）は成功扱い。
+    // 改名先に行テーブルが既に在る（`TableExists`）のは孤児であり、統合も削除もしない。
+    let old_rows = user_rows_table_name(table_name);
+    let new_rows = user_rows_table_name(new_table_name);
+    match write_txn.rename_table_logged(
+        user_rows_table_def(&old_rows),
+        user_rows_table_def(&new_rows),
+    ) {
+        Ok(()) => {}
+        Err(redb::TableError::TableDoesNotExist(_)) => {
+            // 改名元が未作成でも、改名先の孤児行テーブルは露出させない。
+            // `open_table` は未存在を作成してしまうため `list_tables` で存在確認する。
+            let target_exists = {
+                use redb::TableHandle;
+                write_txn
+                    .list_tables()
+                    .map_err(CatalogError::from)?
+                    .any(|handle| handle.name() == new_rows)
+            };
+            if target_exists {
+                return Err(CatalogError::CorruptSchema(
+                    "row store already exists for rename target".to_string(),
+                )
+                .into());
+            }
+        }
+        Err(redb::TableError::TableExists(_)) => {
+            return Err(CatalogError::CorruptSchema(
+                "row store already exists for rename target".to_string(),
+            )
+            .into());
+        }
+        Err(e) => return Err(map_row_table_error(e).into()),
+    }
+    // 派生データ（永続一意索引・キー索引）は旧名・新名とも掃除する。遅延再構築されるため
+    // 消して安全で、残留が同名の再作成後に「構築済み」と誤認される fail-open を防ぐ。
+    // 表名キーの台帳・分割実行ジョブは、新名側の孤児だけを掃除してから旧名の記録を移す
+    // （移送で旧名のキーは消える。削除すると改名後の再送が未記録と誤判定される）。
+    for name in [table_name, new_table_name] {
+        write_txn
+            .delete_table_logged(user_uniq_table_def(&user_uniq_table_name(name)))
+            .map_err(CatalogError::from)?;
+        crate::key_index::drop_indexes_for_table_in_txn(write_txn, name)?;
+        // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログを変える書き込みは DDL として記録する。
+        crate::storage::commit_log::note_ddl(write_txn, name);
+        bump_table_generation_in_txn(write_txn, name)?;
+    }
+    crate::recovery::ledger::delete_table_in_txn(write_txn, new_table_name)
+        .map_err(convert_storage_error)?;
+    crate::recovery::partitioned_job::delete_table_in_txn(write_txn, new_table_name)
+        .map_err(convert_storage_error)?;
+    crate::recovery::ledger::rename_table_in_txn(write_txn, table_name, new_table_name)
+        .map_err(convert_storage_error)?;
+    // rowid 採番状態（TABLE-23・Issue #2193）も旧名から新名へ移す（再利用しないため）。
+    rowid_alloc::rename_table_in_txn(write_txn, table_name, new_table_name)?;
+    crate::recovery::partitioned_job::rename_table_in_txn(write_txn, table_name, new_table_name)
+        .map_err(convert_storage_error)?;
+    // 表が所有する SEQUENCE の所有者（表名）を追従させる（TABLE-24・Issue #1694）。SEQUENCE 自体の
+    // 名前・`DEFAULT nextval` の参照名は変えない（PostgreSQL と同じ）。
+    sequence::rewrite_sequence_owners_in_txn(write_txn, |owner| {
+        (owner.table == table_name).then(|| sequence::SequenceOwner {
+            table: new_table_name.to_string(),
+            column: owner.column.clone(),
+        })
+    })?;
+    Ok(())
 }
 
 /// 表改名（[`Storage::alter_table_rename`]、Issue #1624）が同一 write txn から呼ぶ。
@@ -13922,184 +14120,202 @@ impl Storage {
         validate_relation_key(table_name)?;
         validate_relation_key(new_table_name)?;
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
-        let mut schema = {
-            let table = write_txn
-                .open_table_logged(CATALOG_TABLE)
-                .map_err(CatalogError::from)?;
-            let existing: Vec<u8> = {
-                let guard = table
-                    .get(table_name)
-                    .map_err(CatalogError::from)?
-                    .ok_or_else(|| CatalogError::TableNotFound(table_name.to_string()))?;
-                guard.value().to_vec()
-            };
-            let mut resolve = |name: &str| get_enum_type_in_write_txn(&write_txn, name);
-            decode_schema_with_resolver(table_name, &existing, &mut resolve)?
+        rename_table_key_in_txn(&write_txn, table_name, new_table_name)?;
+        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)?;
+        Ok(())
+    }
+
+    /// 表をテナントの SCHEMA 間で移す（`ALTER TABLE <s1.t> SET SCHEMA <s2>`。TABLE-27 (7) のポインタ、
+    /// Issue #3198）。`sql::ddl::execute_alter_table_set_schema` が唯一の呼び出し元で、`public` との
+    /// 間の移動・同一 SCHEMA への移動・移動先の解決・CREATE 権限の検査は呼び出し元が済ませている前提。
+    ///
+    /// 単一の write txn・1 回の commit で、表（[`rename_table_key_in_txn`] が行ストア・制約・FK・ビュー本文・
+    /// TRIGGER・POLICY・ACL・台帳等を付け替える）に加えて、索引宣言のキー（`#<旧>.<索引>` →
+    /// `#<新>.<索引>`）・GIN の物理テーブル（`user_gin/{索引キー}`）・表が所有する SEQUENCE の定義キーと
+    /// 表自身の `DEFAULT nextval`／IDENTITY の参照名を移す。ビューは移さない。
+    ///
+    /// 判定順序（決定的。すべて書き込みの前に判定し、失敗は txn ごと破棄）: キー形式（移動元・移動先とも
+    /// SCHEMA 配下で名前部が同一）→ 両 SCHEMA が `tenant_id` のもので生存していること（不在・他テナントは
+    /// 区別なく `TableNotFound`）→ 移動先での名前の衝突（表・ビュー・索引・matview・SEQUENCE。
+    /// `TableAlreadyExists`）→ 関数・matview の依存（`2BP01`）→ SEQUENCE の外部参照（`2BP01`）。
+    /// テナント境界: 行キー `(tenant_id, rowid)` は redb の `rename_table` で保たれ、暗黙 RLS は SCHEMA に
+    /// 依存しない。
+    pub(crate) fn alter_table_set_schema(
+        &self,
+        tenant_id: &str,
+        old_key: &str,
+        new_key: &str,
+    ) -> std::result::Result<(), AlterCheckError> {
+        validate_relation_key(old_key)?;
+        validate_relation_key(new_key)?;
+        let (
+            namespace::RelationKey::InSchema {
+                schema_id: from_id,
+                name: from_name,
+            },
+            namespace::RelationKey::InSchema {
+                schema_id: to_id,
+                name: to_name,
+            },
+        ) = (
+            namespace::RelationKey::parse(old_key)?,
+            namespace::RelationKey::parse(new_key)?,
+        )
+        else {
+            return Err(CatalogError::Invalid(
+                "SET SCHEMA requires schema-qualified keys".to_string(),
+            )
+            .into());
         };
-        // 改名先の衝突判定（`create_table` と同じ名前空間: 表・ビュー・索引）。
-        {
-            let table = write_txn
-                .open_table_logged(CATALOG_TABLE)
-                .map_err(CatalogError::from)?;
-            if table
-                .get(new_table_name)
-                .map_err(CatalogError::from)?
-                .is_some()
-            {
-                return Err(CatalogError::TableAlreadyExists(new_table_name.to_string()).into());
-            }
+        if from_name != to_name || from_id == to_id {
+            return Err(CatalogError::Invalid("malformed SET SCHEMA request".to_string()).into());
         }
-        match write_txn.open_table_logged(VIEWS_TABLE) {
-            Ok(views_table) => {
-                if views_table
-                    .get(new_table_name)
-                    .map_err(CatalogError::from)?
-                    .is_some()
+        let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
+        // 両 SCHEMA が呼び出し元テナントのもので生存していること（DROP SCHEMA との競合・越境の多層防御）。
+        namespace::ensure_tenant_key_schema_alive_in_txn(&*write_txn, tenant_id, old_key)?;
+        namespace::ensure_tenant_key_schema_alive_in_txn(&*write_txn, tenant_id, new_key)?;
+        if !table_exists_in_txn(&write_txn, old_key)? {
+            return Err(CatalogError::TableNotFound(old_key.to_string()).into());
+        }
+        // 移す索引（宣言の所有表が移動元で、キーが移動元 SCHEMA 配下のもの）と移動先の衝突判定。
+        let from_prefix = namespace::RelationKey::schema_prefix(from_id);
+        let to_prefix = namespace::RelationKey::schema_prefix(to_id);
+        let mut index_moves: Vec<(String, String, bool)> = Vec::new();
+        {
+            let index_table = match write_txn.open_table_logged(INDEX_CATALOG_TABLE) {
+                Ok(t) => Some(t),
+                Err(redb::TableError::TableDoesNotExist(_)) => None,
+                Err(e) => return Err(CatalogError::from(e).into()),
+            };
+            if let Some(index_table) = index_table {
+                for (scanned, entry) in index_table.iter().map_err(CatalogError::from)?.enumerate()
                 {
-                    return Err(CatalogError::TableAlreadyExists(new_table_name.to_string()).into());
+                    if scanned >= MAX_INDEX_COUNT {
+                        return Err(CatalogError::CorruptSchema(format!(
+                            "index catalog exceeds {MAX_INDEX_COUNT} entries"
+                        ))
+                        .into());
+                    }
+                    let (key, value) = entry.map_err(CatalogError::from)?;
+                    let name = key.value().to_string();
+                    let def = decode_index_def(&name, value.value())?;
+                    if def.table != old_key {
+                        continue;
+                    }
+                    let Some(bare) = name.strip_prefix(from_prefix.as_str()) else {
+                        return Err(CatalogError::CorruptSchema(
+                            "index key is outside its table's schema".to_string(),
+                        )
+                        .into());
+                    };
+                    index_moves.push((
+                        name.clone(),
+                        format!("{to_prefix}{bare}"),
+                        matches!(def.kind, IndexKind::Gin(_)),
+                    ));
                 }
             }
-            Err(redb::TableError::TableDoesNotExist(_)) => {}
-            Err(e) => return Err(CatalogError::from(e).into()),
         }
-        if index_name_exists_in_txn(&write_txn, new_table_name)?
-            || materialized_view_exists_in_txn(&write_txn, new_table_name)?
-            || sequence::sequence_exists_in_txn(&write_txn, new_table_name)?
-        {
-            return Err(CatalogError::TableAlreadyExists(new_table_name.to_string()).into());
-        }
-        // 標準形の関数本体が表を名前で保存しているため、改名は追随が入るまで拒否する（`2BP01`。Issue #2219）。
-        reject_relation_with_function_dependents_in_txn(&write_txn, table_name)?;
-        // 暫定ガード（Issue #1663）: matview の参照元の改名は、追随が入るまで拒否する（別 Issue で追跡。Issue #1667 でも対象外）。
-        if !materialized::materialized_views_referencing_in_txn(&write_txn, table_name)?.is_empty()
-        {
-            return Err(CatalogError::DependentViewsExist(table_name.to_string()).into());
-        }
-        rewrite_views_for_renamed_table_in_txn(&write_txn, table_name, new_table_name)?;
-
-        // 他表から参照される FK の付け替え（Issue #1624）。自表のカタログを書き換える前に、
-        // `CATALOG_TABLE` のハンドルを解放した状態で列挙する（`referencing_foreign_keys_in_txn`
-        // の契約）。自己参照は自表の書き換えで済むため除外し、同じ子は 1 回だけ書く。
-        let referencing = referencing_foreign_keys_in_txn(&write_txn, table_name)?;
-        let mut seen_children: std::collections::BTreeSet<String> = Default::default();
-        for (child, _) in referencing {
-            if child.name == table_name || !seen_children.insert(child.name.clone()) {
-                continue;
+        for (_, new_index, _) in &index_moves {
+            if relation_name_exists_in_txn(&write_txn, new_index)? {
+                return Err(CatalogError::TableAlreadyExists(
+                    namespace::relation_name_part(new_index).to_string(),
+                )
+                .into());
             }
-            let mut child = child;
-            child.rename_parent_table_references(table_name, new_table_name);
-            let child_encoded = encode_schema(&child)?;
-            {
-                let mut table = write_txn
+        }
+        let sequence_moves =
+            sequence::plan_owned_sequence_moves_in_txn(&write_txn, old_key, from_id, to_id)?;
+
+        // 表本体（行ストア・制約・FK・ビュー本文・TRIGGER・POLICY・ACL・台帳・SEQUENCE の所有者を含む）。
+        rename_table_key_in_txn(&write_txn, old_key, new_key)?;
+
+        // 索引宣言のキー付け替え（blob に索引名は含まれない）と GIN の物理テーブル。
+        if !index_moves.is_empty() {
+            for (old_index, new_index, is_gin) in &index_moves {
+                {
+                    let mut index_table = write_txn
+                        .open_table_logged(INDEX_CATALOG_TABLE)
+                        .map_err(CatalogError::from)?;
+                    let blob: Vec<u8> = {
+                        let guard = index_table
+                            .get(old_index.as_str())
+                            .map_err(CatalogError::from)?
+                            .ok_or_else(|| {
+                                CatalogError::CorruptSchema("index disappeared".to_string())
+                            })?;
+                        guard.value().to_vec()
+                    };
+                    index_table
+                        .remove(old_index.as_str())
+                        .map_err(CatalogError::from)?;
+                    index_table
+                        .insert(new_index.as_str(), blob.as_slice())
+                        .map_err(CatalogError::from)?;
+                }
+                if *is_gin {
+                    let old_gin = user_gin_table_name(old_index);
+                    let new_gin = user_gin_table_name(new_index);
+                    match write_txn.rename_table_logged(
+                        user_gin_table_def(&old_gin),
+                        user_gin_table_def(&new_gin),
+                    ) {
+                        Ok(()) => {}
+                        Err(redb::TableError::TableDoesNotExist(_)) => {
+                            // 改名元が未作成でも、改名先の孤児は露出させない。
+                            let target_exists = {
+                                use redb::TableHandle;
+                                write_txn
+                                    .list_tables()
+                                    .map_err(CatalogError::from)?
+                                    .any(|handle| handle.name() == new_gin)
+                            };
+                            if target_exists {
+                                return Err(CatalogError::CorruptSchema(
+                                    "index store already exists for move target".to_string(),
+                                )
+                                .into());
+                            }
+                        }
+                        Err(redb::TableError::TableExists(_)) => {
+                            return Err(CatalogError::CorruptSchema(
+                                "index store already exists for move target".to_string(),
+                            )
+                            .into());
+                        }
+                        Err(e) => return Err(map_row_table_error(e).into()),
+                    }
+                }
+            }
+            bump_index_catalog_generation_in_txn(&write_txn)?;
+        }
+
+        // SEQUENCE の定義キーと、移した表自身の DEFAULT／IDENTITY の参照名。
+        if !sequence_moves.is_empty() {
+            sequence::apply_sequence_moves_in_txn(&write_txn, &sequence_moves)?;
+            let mut schema = {
+                let table = write_txn
                     .open_table_logged(CATALOG_TABLE)
                     .map_err(CatalogError::from)?;
-                table
-                    .insert(child.name.as_str(), child_encoded.as_slice())
-                    .map_err(CatalogError::from)?;
-            }
-            // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログを変える書き込みは DDL として記録する。
-            crate::storage::commit_log::note_ddl(&write_txn, &child.name);
-            bump_table_generation_in_txn(&write_txn, &child.name)?;
-        }
-        // 索引宣言の所有テーブル名の付け替え（索引カタログ世代も bump する）。
-        rename_index_def_table_in_txn(&write_txn, table_name, new_table_name)?;
-        // TRIGGER 定義（全テナント分）も新しい表キーへ移す（TABLE-45・Issue #1722）。
-        trigger::rename_table_in_txn(&write_txn, table_name, new_table_name)?;
-        // 行セキュリティポリシー（全テナント分）も新しい表キーへ移す（RLS-13・Issue #2274）。
-        policy::rename_table_in_txn(&write_txn, table_name, new_table_name)?;
-        // 行セキュリティ有効化状態（全テナント分）も新しい表キーへ移す（RLS-13・Issue #2275）。
-        row_security::rename_row_security_table_in_txn(&write_txn, table_name, new_table_name)?;
-        // 権限（ACL。全テナント分）も新しい表キーへ移す（SQL-40・Issue #1961）。
-        privilege::rename_relation_acl_in_txn(&write_txn, table_name, new_table_name)?;
-        privilege::owner::rename_relation_owners_in_txn(&write_txn, table_name, new_table_name)?;
-
-        // カタログの付け替え（`encode_schema` が不変条件を再検証する）。
-        schema.rename_table_references(new_table_name);
-        let encoded = encode_schema(&schema)?;
-        {
+                let existing: Vec<u8> = {
+                    let guard = table
+                        .get(new_key)
+                        .map_err(CatalogError::from)?
+                        .ok_or_else(|| CatalogError::TableNotFound(new_key.to_string()))?;
+                    guard.value().to_vec()
+                };
+                let mut resolve = |name: &str| get_enum_type_in_write_txn(&write_txn, name);
+                decode_schema_with_resolver(new_key, &existing, &mut resolve)?
+            };
+            sequence::rewrite_default_sequence_names(&mut schema, &sequence_moves);
+            let encoded = encode_schema(&schema)?;
             let mut table = write_txn
                 .open_table_logged(CATALOG_TABLE)
                 .map_err(CatalogError::from)?;
             table
-                .insert(new_table_name, encoded.as_slice())
+                .insert(new_key, encoded.as_slice())
                 .map_err(CatalogError::from)?;
-            let removed = table.remove(table_name).map_err(CatalogError::from)?;
-            if removed.is_none() {
-                return Err(CatalogError::CorruptSchema(
-                    "table disappeared during rename".to_string(),
-                )
-                .into());
-            }
         }
-        // 行ストアの付け替え。行テーブルは遅延作成のため未作成（`TableDoesNotExist`）は成功扱い。
-        // 改名先に行テーブルが既に在る（`TableExists`）のは孤児であり、統合も削除もしない。
-        let old_rows = user_rows_table_name(table_name);
-        let new_rows = user_rows_table_name(new_table_name);
-        match write_txn.rename_table_logged(
-            user_rows_table_def(&old_rows),
-            user_rows_table_def(&new_rows),
-        ) {
-            Ok(()) => {}
-            Err(redb::TableError::TableDoesNotExist(_)) => {
-                // 改名元が未作成でも、改名先の孤児行テーブルは露出させない。
-                // `open_table` は未存在を作成してしまうため `list_tables` で存在確認する。
-                let target_exists = {
-                    use redb::TableHandle;
-                    write_txn
-                        .list_tables()
-                        .map_err(CatalogError::from)?
-                        .any(|handle| handle.name() == new_rows)
-                };
-                if target_exists {
-                    return Err(CatalogError::CorruptSchema(
-                        "row store already exists for rename target".to_string(),
-                    )
-                    .into());
-                }
-            }
-            Err(redb::TableError::TableExists(_)) => {
-                return Err(CatalogError::CorruptSchema(
-                    "row store already exists for rename target".to_string(),
-                )
-                .into());
-            }
-            Err(e) => return Err(map_row_table_error(e).into()),
-        }
-        // 派生データ（永続一意索引・キー索引）は旧名・新名とも掃除する。遅延再構築されるため
-        // 消して安全で、残留が同名の再作成後に「構築済み」と誤認される fail-open を防ぐ。
-        // 表名キーの台帳・分割実行ジョブは、新名側の孤児だけを掃除してから旧名の記録を移す
-        // （移送で旧名のキーは消える。削除すると改名後の再送が未記録と誤判定される）。
-        for name in [table_name, new_table_name] {
-            write_txn
-                .delete_table_logged(user_uniq_table_def(&user_uniq_table_name(name)))
-                .map_err(CatalogError::from)?;
-            crate::key_index::drop_indexes_for_table_in_txn(&write_txn, name)?;
-            // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログを変える書き込みは DDL として記録する。
-            crate::storage::commit_log::note_ddl(&write_txn, name);
-            bump_table_generation_in_txn(&write_txn, name)?;
-        }
-        crate::recovery::ledger::delete_table_in_txn(&write_txn, new_table_name)
-            .map_err(convert_storage_error)?;
-        crate::recovery::partitioned_job::delete_table_in_txn(&write_txn, new_table_name)
-            .map_err(convert_storage_error)?;
-        crate::recovery::ledger::rename_table_in_txn(&write_txn, table_name, new_table_name)
-            .map_err(convert_storage_error)?;
-        // rowid 採番状態（TABLE-23・Issue #2193）も旧名から新名へ移す（再利用しないため）。
-        rowid_alloc::rename_table_in_txn(&write_txn, table_name, new_table_name)?;
-        crate::recovery::partitioned_job::rename_table_in_txn(
-            &write_txn,
-            table_name,
-            new_table_name,
-        )
-        .map_err(convert_storage_error)?;
-        // 表が所有する SEQUENCE の所有者（表名）を追従させる（TABLE-24・Issue #1694）。SEQUENCE 自体の
-        // 名前・`DEFAULT nextval` の参照名は変えない（PostgreSQL と同じ）。
-        sequence::rewrite_sequence_owners_in_txn(&write_txn, |owner| {
-            (owner.table == table_name).then(|| sequence::SequenceOwner {
-                table: new_table_name.to_string(),
-                column: owner.column.clone(),
-            })
-        })?;
         crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)?;
         Ok(())
     }

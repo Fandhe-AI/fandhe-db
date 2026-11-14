@@ -700,3 +700,58 @@ fn temp_table_with_gin_matches_the_full_scan() {
         assert!(!a.is_empty(), "{w}");
     }
 }
+
+/// `ALTER TABLE s1.d SET SCHEMA s2`（Issue #3198）で GIN 索引の物理テーブルも一緒に移り、移動後の
+/// 書き込みでも索引が維持される（再オープン後も）。SCHEMA 配下の索引の内部キーは `#<SCHEMA ID>.<名>` で、
+/// 新規 DB の SCHEMA ID は作成順に 1・2 になる（`s2` は 2）。検証は読み取り専用の診断 API で行う。
+#[test]
+fn set_schema_moves_the_gin_index_with_its_table() {
+    let path = unique_db_path("gin-set-schema");
+    let _guard = CleanupGuard(path.clone());
+    let c = ctx("alice");
+    let mut s = ddl_session();
+    let probe = "SELECT id FROM s2.d WHERE doc @> '{\"a\":1}' ORDER BY id";
+    let assert_clean = |core: &EngineCore| {
+        let a = core
+            .verify_gin_index_read_only(&c, "#2.g")
+            .expect("index must live under the destination schema");
+        assert!(a.marker_valid && a.missing == 0 && a.stale == 0, "{a:?}");
+        assert!(core.verify_gin_index_read_only(&c, "#1.g").is_err());
+        // 他テナントは同じ内部キーを引けない。
+        assert!(core
+            .verify_gin_index_read_only(&ctx("bob"), "#2.g")
+            .is_err());
+    };
+    {
+        let core = EngineCore::from_storage(
+            Storage::open(&path).expect("open storage"),
+            Box::new(CpuScalarProvider),
+        );
+        for sql in [
+            "CREATE SCHEMA s1",
+            "CREATE SCHEMA s2",
+            "CREATE TABLE s1.d (id BIGINT PRIMARY KEY, doc JSONB)",
+            "CREATE INDEX g ON s1.d USING gin (doc)",
+            "INSERT INTO s1.d (id, doc) VALUES (1, '{\"a\":1}'), (2, '{\"a\":2}'), (3, '{\"a\":1,\"b\":2}')",
+            "ALTER TABLE s1.d SET SCHEMA s2",
+        ] {
+            run(&core, &c, &mut s, sql);
+        }
+        assert_clean(&core);
+        assert_eq!(rows_of(&core, &c, probe).len(), 2);
+        run(
+            &core,
+            &c,
+            &mut s,
+            "INSERT INTO s2.d (id, doc) VALUES (4, '{\"a\":1}')",
+        );
+        assert_eq!(rows_of(&core, &c, probe).len(), 3);
+        assert_clean(&core);
+    }
+    let core = EngineCore::from_storage(
+        Storage::open(&path).expect("reopen storage"),
+        Box::new(CpuScalarProvider),
+    );
+    assert_eq!(rows_of(&core, &c, probe).len(), 3);
+    assert_clean(&core);
+}

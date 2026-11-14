@@ -9534,6 +9534,14 @@ impl EngineCore {
                     ctx.tenant_id(),
                     stmt,
                     &self.schema_limits,
+                    // 移動先 SCHEMA の CREATE 権限（SET SCHEMA だけが使う。`require_creation_target` と同じ検査）。
+                    &|schema_id| {
+                        crate::sql::schema_privilege::check_schema_create(session, &|role| {
+                            self.storage
+                                .schema_privileges(ctx.tenant_id(), schema_id, &[role])
+                                .map_err(crate::catalog::table_lookup_error)
+                        })
+                    },
                 )?;
                 Ok(crate::sql::SqlOutcome::AlterTable(outcome))
             }
@@ -19034,6 +19042,23 @@ impl EngineCore {
     ) -> Result<crate::catalog::GinIndexAudit, crate::tenant::TenantWriteError> {
         let snapshot = self.storage.begin_read()?;
         let read_txn = snapshot.raw_txn();
+        // SCHEMA 配下の索引キー（`#<id>.<名>`）は呼び出し元テナントの SCHEMA のものだけを引く
+        // （他テナントの SCHEMA は不在と同じ `IndexNotFound`。存在オラクルにしない。Issue #3198）。
+        match crate::catalog::namespace::ensure_tenant_key_schema_alive_in_txn(
+            read_txn,
+            ctx.tenant_id(),
+            index_name,
+        ) {
+            Ok(()) => {}
+            // SCHEMA 不在（他テナント含む）だけを `IndexNotFound` へ潰す。それ以外
+            // （ストレージ・カタログ破損等）は fail-closed のまま伝播する。
+            Err(crate::catalog::CatalogError::TableNotFound(_)) => {
+                return Err(crate::tenant::TenantWriteError::Catalog(
+                    crate::catalog::CatalogError::IndexNotFound(index_name.to_string()),
+                ));
+            }
+            Err(other) => return Err(other.into()),
+        }
         let Some((table, decl)) = crate::catalog::gin_decl_in_read_txn(read_txn, index_name)?
         else {
             return Err(crate::tenant::TenantWriteError::Catalog(
