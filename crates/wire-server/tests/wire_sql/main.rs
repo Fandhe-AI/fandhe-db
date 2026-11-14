@@ -85,6 +85,7 @@ mod wire_sql67_dollar_quoting;
 mod wire_sql78_noneq_between_param;
 mod wire_sql78_noneq_between_rls;
 mod wire_statement_timeout_setting;
+mod wire_trigger_copy;
 mod wire_trigger_ddl;
 mod wire_trigger_fire;
 mod wire_truncate_table;

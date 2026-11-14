@@ -193,6 +193,9 @@ mod trigger_depth_tests;
 // トリガ副作用と operation_id 台帳の整合（再送・越境・クラッシュ注入）のテスト（TABLE-45・Issue #1728）。
 #[cfg(test)]
 mod trigger_ledger_tests;
+// COPY FROM STDIN の確定処理でのトリガ発火の結合テスト（TABLE-45・Issue #3281）。
+#[cfg(test)]
+mod trigger_copy_tests;
 
 /// 検索 `k` の上限（直接 Rust API 用）。明示 `LIMIT` の既定値と同値だが、SQL／NoSQL の
 /// `LIMIT` 範囲は起動時設定（`result_limits::ResultLimits`。Issue #1555）が決め、本定数は
@@ -16927,6 +16930,8 @@ impl EngineCore {
             table,
             row_count,
             operation_id,
+            // NoSQL 表層はトリガの発火に未対応（通過証なし。INSERT トリガのある表は `0A000`。Issue #3282）。
+            None,
             bind,
         )
     }
@@ -17016,6 +17021,9 @@ impl EngineCore {
         table: &str,
         row_count: usize,
         operation_id: Option<&crate::recovery::required_op_id::OperationId>,
+        // トリガの通過証。`Some` は COPY の確定処理（セッション入口が主体の写しを張った上で渡す。
+        // Issue #3281）、`None` は NoSQL 表層・セッションなしの入口（INSERT トリガのある表は `0A000`）。
+        triggers: Option<&crate::trigger::TriggerRuntime<'_>>,
         bind: F,
     ) -> Result<crate::sql::exec::InsertOutcome, crate::sql::allowlist::SqlSurfaceError>
     where
@@ -17035,15 +17043,15 @@ impl EngineCore {
             operation_id,
             bind,
             |target, bounds, schema| {
-                // 判定 7: 実書き込み。NoSQL 表層はトリガの発火に未対応（`None`。INSERT トリガのある表は
-                // `0A000`。Issue #1723）。
+                // 判定 7: 実書き込み。通過証 `triggers` は COPY の確定処理だけが渡す（Issue #3281）。
+                // NoSQL 表層は `None`（INSERT トリガのある表は `0A000`。Issue #1723・#3282）。
                 crate::sql::exec::execute_insert_batch_with_schema_in(
                     target,
                     ctx,
                     bounds,
                     self.ledger_mode,
                     Some(schema),
-                    None,
+                    triggers,
                 )
             },
         )
@@ -17674,10 +17682,25 @@ impl EngineCore {
     /// スキーマが commit 時点のスキーマと一致することを検証してから
     /// （不一致は fail-closed `22000`。CopyData 受信中の DDL によるスキーマ
     /// 食い違いを防ぐ）束縛済み行をそのまま返す。
+    ///
+    /// セッションを持たない入口のため、発火元の主体の写しを張れずトリガは発火できない。INSERT トリガの
+    /// ある表は副作用の前に `0A000` で拒否する（fail-closed）。トリガを発火させる COPY の確定は
+    /// セッション入口 [`Self::commit_copy_in_txn_in_session`] だけが担う（Issue #3281）。
     pub fn commit_copy_in(
         &self,
         ctx: &PolicyContext,
         batch: crate::sql::copy::CopyInBatch,
+    ) -> Result<crate::sql::exec::InsertOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        self.commit_copy_in_inner(ctx, batch, None)
+    }
+
+    /// [`Self::commit_copy_in`] の本体。`triggers` は通過証（`Some` はセッション入口が主体の写しを張った
+    /// 場合だけ。Issue #3281）。
+    fn commit_copy_in_inner(
+        &self,
+        ctx: &PolicyContext,
+        batch: crate::sql::copy::CopyInBatch,
+        triggers: Option<&crate::trigger::TriggerRuntime<'_>>,
     ) -> Result<crate::sql::exec::InsertOutcome, crate::sql::allowlist::SqlSurfaceError> {
         // 一時表向けのバッチはセッションを要する `commit_copy_in_txn_in_session` だけが扱う
         // （`ON COMMIT` の適用に `SessionState` が要る。永続 DB へ書く経路には絶対に載せない）。
@@ -17698,6 +17721,7 @@ impl EngineCore {
             crate::tenant::WriteTarget::Autocommit(&self.storage),
             ctx,
             batch,
+            triggers,
         )
         .map_err(|e| self.scrub_error(ctx, e))
     }
@@ -17717,7 +17741,19 @@ impl EngineCore {
         txn: &mut crate::sql::transaction::SessionTransaction<'e>,
         batch: crate::sql::copy::CopyInBatch,
     ) -> Result<crate::sql::exec::InsertOutcome, crate::sql::allowlist::SqlSurfaceError> {
-        self.commit_copy_in_txn_unscrubbed(ctx, txn, batch)
+        self.commit_copy_in_txn_inner(ctx, txn, batch, None)
+    }
+
+    /// [`Self::commit_copy_in_txn`] の本体。`triggers` は通過証（セッション入口だけが `Some` を渡す。
+    /// Issue #3281）。
+    pub(crate) fn commit_copy_in_txn_inner<'e>(
+        &'e self,
+        ctx: &PolicyContext,
+        txn: &mut crate::sql::transaction::SessionTransaction<'e>,
+        batch: crate::sql::copy::CopyInBatch,
+        triggers: Option<&crate::trigger::TriggerRuntime<'_>>,
+    ) -> Result<crate::sql::exec::InsertOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        self.commit_copy_in_txn_unscrubbed(ctx, txn, batch, triggers)
             .map_err(|e| self.scrub_error(ctx, e))
     }
 
@@ -17727,13 +17763,14 @@ impl EngineCore {
         ctx: &PolicyContext,
         txn: &mut crate::sql::transaction::SessionTransaction<'e>,
         batch: crate::sql::copy::CopyInBatch,
+        triggers: Option<&crate::trigger::TriggerRuntime<'_>>,
     ) -> Result<crate::sql::exec::InsertOutcome, crate::sql::allowlist::SqlSurfaceError> {
         use crate::sql::transaction::TransactionStatus;
         if batch.temp.is_some() {
             return Err(crate::sql::temp_catalog::temp_table_unsupported());
         }
         match txn.status() {
-            TransactionStatus::Idle => self.commit_copy_in(ctx, batch),
+            TransactionStatus::Idle => self.commit_copy_in_inner(ctx, batch, triggers),
             TransactionStatus::Failed => Err(txn.take_failed_error()),
             TransactionStatus::InTransaction => {
                 txn.check_and_register_statement(
@@ -17742,6 +17779,9 @@ impl EngineCore {
                 let table = batch.table.clone();
                 // Issue #1953（SQL-71）: COPY 開始時の期限を writer 取得と行ループへ効かせる。
                 let _deadline_scope = crate::interrupt::DeadlineScope::install(batch.deadline);
+                // AFTER ROW トリガが書いた表も COMMIT 時の遅延 FK 検査の対象にする（INSERT と同じ。Issue #3281）。
+                let trigger_scope =
+                    crate::tenant::trigger_writes::TriggerWrittenTablesScope::enter();
                 // writer は COPY の確定処理（CopyDone 後）で初めて取得する（Issue #2400。データ受信中は
                 // 持たない）。取得失敗（`55P03`。期限が先なら `57014`）も下の `Err` 腕で `fail()` を通す。
                 let result = match batch.deadline.check().and_then(|()| txn.ensure_writer(ctx)) {
@@ -17751,6 +17791,7 @@ impl EngineCore {
                             crate::tenant::WriteTarget::InTxn(write_txn),
                             ctx,
                             batch,
+                            triggers,
                         ),
                         None => Err(crate::sql::allowlist::SqlSurfaceError::Internal {
                             detail: "internal error".to_string(),
@@ -17760,6 +17801,9 @@ impl EngineCore {
                 match result {
                     Ok(outcome) => {
                         txn.mark_written(ctx.tenant_id(), &table);
+                        for written in trigger_scope.take() {
+                            txn.mark_written(ctx.tenant_id(), &written);
+                        }
                         Ok(outcome)
                     }
                     Err(e) => {
@@ -17776,6 +17820,7 @@ impl EngineCore {
         target: crate::tenant::WriteTarget<'_>,
         ctx: &PolicyContext,
         batch: crate::sql::copy::CopyInBatch,
+        triggers: Option<&crate::trigger::TriggerRuntime<'_>>,
     ) -> Result<crate::sql::exec::InsertOutcome, crate::sql::allowlist::SqlSurfaceError> {
         let crate::sql::copy::CopyInBatch {
             table,
@@ -17821,6 +17866,7 @@ impl EngineCore {
             &table,
             row_count,
             operation_id.as_ref(),
+            triggers,
             |schema| {
                 if schema != &bound_schema {
                     return Err(crate::sql::allowlist::SqlSurfaceError::invalid_input(
