@@ -9,7 +9,7 @@ Issue #1724（親 #1720）の実装記録。上位の決定は [trigger-executio
 
 - SQL `INSERT ... VALUES`（単一行・複数行。autocommit・明示 Tx）と `INSERT ... SELECT` が、書き込み
   テナント自身の AFTER ROW トリガを文の終わりに発火する
-- 発火しない経路（UPSERT・RETURNING・NoSQL・ファイル形・生の行挿入・ビュー経由・データ変更 CTE の
+- UPSERT は Issue #3191 で結線済み（[trigger-upsert.md](trigger-upsert.md)）。発火しない経路（RETURNING・NoSQL・ファイル形・生の行挿入・ビュー経由・データ変更 CTE の
   副文）は、INSERT トリガのある表で従来どおり `0A000`（台帳に触れない）。文トリガは Issue #1726 で結線済み
 - 受け入れ条件: 監査表への自動記録が動く。トリガ内でエラーが起きたら文全体がロールバックされる
   （行・監査行・台帳・索引とも残らない）

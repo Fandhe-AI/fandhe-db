@@ -278,3 +278,53 @@ fn wire_replay_with_operation_id_is_rejected_without_refiring() {
     );
     assert!(select_col(&mut b, "SELECT lv FROM audit").is_empty());
 }
+/// `INSERT ... ON CONFLICT`（Issue #3191）が、簡易クエリ（psql と同じ末尾 `;` 付きの単独送信を含む）と
+/// 拡張クエリの双方でトリガを発火する。これまでは固定文言の `0A000` で拒否されていた形。
+#[test]
+fn wire_upsert_fires_triggers_simple_and_extended() {
+    let (addr, _g) = serve();
+    let mut s = connect(addr, "alice", "pw-alice");
+    setup(&mut s);
+    exec(
+        &mut s,
+        "CREATE TABLE s.uq (k INTEGER PRIMARY KEY, n INTEGER)",
+    );
+    exec(
+        &mut s,
+        "CREATE TRIGGER tb BEFORE INSERT ON s.uq FOR EACH ROW EXECUTE FUNCTION bump()",
+    );
+    exec(
+        &mut s,
+        "CREATE TRIGGER ts AFTER INSERT OR UPDATE ON s.uq FOR EACH STATEMENT \
+         EXECUTE FUNCTION stmt_audit()",
+    );
+    assert_eq!(
+        exec(
+            &mut s,
+            "INSERT INTO s.uq (k, n) VALUES (1, 1) \
+             ON CONFLICT (k) DO UPDATE SET n = EXCLUDED.n;"
+        ),
+        "INSERT 0 1"
+    );
+    assert_eq!(select_col(&mut s, "SELECT n FROM s.uq"), vec!["101"]);
+    // 拡張クエリ: 競合行（k = 1）の更新側。BEFORE INSERT の書き換えは EXCLUDED に効く。
+    send_length_prefixed_message(
+        &mut s,
+        b'P',
+        &parse_body(
+            "u1",
+            "INSERT INTO s.uq (k, n) VALUES (1, 5) ON CONFLICT (k) DO UPDATE SET n = EXCLUDED.n",
+            0,
+        ),
+    );
+    assert_eq!(read_message(&mut s).0, b'1');
+    send_length_prefixed_message(&mut s, b'B', &bind_body("p1", "u1"));
+    assert_eq!(read_message(&mut s).0, b'2');
+    send_length_prefixed_message(&mut s, b'E', &execute_body("p1", 0));
+    assert_eq!(read_message(&mut s).0, b'C');
+    send_length_prefixed_message(&mut s, b'S', &[]);
+    assert_eq!(read_message(&mut s).0, b'Z');
+    assert_eq!(select_col(&mut s, "SELECT n FROM s.uq"), vec!["105"]);
+    // 文トリガ: 2 文 × （UPDATE・INSERT）の 4 回。
+    assert_eq!(select_col(&mut s, "SELECT lv FROM audit").len(), 4);
+}

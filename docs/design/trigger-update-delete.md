@@ -29,7 +29,7 @@ Issue #1725（親 #1720）の実装記録。上位の決定は [trigger-executio
 | SQL の UPDATE／DELETE（上記 3 形。ビュー経由・データ変更 CTE の副文も同じフォーム関数を通るため INSERT と同様に発火する） | 発火 |
 | 分割実行 DML | 該当イベントのトリガがあれば `0A000` |
 | `RETURNING` 付きの UPDATE／DELETE | 該当イベントのトリガがあれば `0A000`（最終値の投影は後続） |
-| UPSERT（`ON CONFLICT`） | INSERT・UPDATE のどちらかのトリガがあれば `0A000`（`DO UPDATE` を発火させるのは後続） |
+| UPSERT（`ON CONFLICT`） | 発火（#3191。`DO UPDATE` の更新側で BEFORE／AFTER ROW UPDATE。[trigger-upsert.md](trigger-upsert.md)）。`RETURNING` 付きは `0A000` |
 | NoSQL の更新・削除（述語形を含む。入口で通過証を渡さず `None` で分類する）、生の行 API、`replace_typed_rows_by_text_key` | 該当イベントのトリガがあれば `0A000` |
 | 参照アクション（CASCADE・SET NULL・SET DEFAULT）が及ぶ子表に該当イベントのトリガ | `0A000`（カタログの FK 宣言だけから静的に判定。親にトリガが無くても拒否する）。自己参照 FK の対象表自身も子表に数える（参照アクションで書き換わる同表の別行ではトリガを発火できないため、黙って飛ばさず `0A000`） |
 | 文トリガ（UPDATE・DELETE の STATEMENT） | 発火（[trigger-statement-truncate.md](trigger-statement-truncate.md)。Issue #1726） |
@@ -74,7 +74,7 @@ AFTER の失敗は文全体の失敗で、同じ write txn の単一 commit な�
 
 ## 引き継ぎ
 
-- UPSERT の発火、`RETURNING` の最終値の投影、`WHEN` の評価（NEW／OLD の列修飾の束縛を要する）
+- `RETURNING` の最終値の投影、`WHEN` の評価（UPSERT の発火は #3191 で結線済み）（NEW／OLD の列修飾の束縛を要する）
 - 結合形 DML の SQL dispatch の結線（現状は `0A000`）
 - 入れ子の深さ上限（#1727）、自己変更の衝突 27000 と窓口の UPDATE／DELETE（#2226）
 - 分割実行の途中のチャンクで DDL によりトリガが追加された場合は、既存の部分完了の写像に従う

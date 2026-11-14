@@ -34,7 +34,7 @@
 | SQL `INSERT ... VALUES`（単一行・複数行。autocommit・明示 Tx） | 発火 |
 | `INSERT ... SELECT` | 発火（BEFORE ROW。AFTER ROW は [trigger-after-insert.md](trigger-after-insert.md)） |
 | `INSERT ... RETURNING` | INSERT トリガのある表は `0A000`（最終値での投影は後続。下記） |
-| UPSERT（`ON CONFLICT`） | INSERT トリガのある表は `0A000`（#1725 で結線） |
+| UPSERT（`ON CONFLICT`） | 発火（#3191。[trigger-upsert.md](trigger-upsert.md)）。`RETURNING` 付きは `0A000` |
 | NoSQL 表層・ファイル形 INSERT・生の `RowInput` 挿入・ビュー経由・データ変更 CTE の副文 | INSERT トリガのある表は `0A000` |
 | 一時表・CTAS | 通過証なし（トリガの無い表のみ。ガードは常に通る） |
 

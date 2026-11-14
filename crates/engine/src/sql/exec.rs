@@ -7014,6 +7014,7 @@ pub fn execute_upsert(
         bound,
         ledger_mode,
         bound_schema,
+        None,
     )
 }
 
@@ -7028,8 +7029,17 @@ pub(crate) fn execute_upsert_in(
     bound: &BoundUpsert,
     ledger_mode: crate::recovery::required_op_id::LedgerMode,
     bound_schema: &crate::catalog::TableSchema,
+    triggers: Option<&crate::trigger::TriggerRuntime>,
 ) -> Result<InsertOutcome, SqlSurfaceError> {
-    let rows_affected = execute_upsert_inner(target, ctx, bound, ledger_mode, bound_schema, None)?;
+    let rows_affected = execute_upsert_inner(
+        target,
+        ctx,
+        bound,
+        ledger_mode,
+        bound_schema,
+        triggers,
+        None,
+    )?;
     Ok(InsertOutcome {
         rows_affected,
         incremental: None,
@@ -7058,6 +7068,7 @@ pub fn execute_upsert_returning(
         ledger_mode,
         returning,
         bound_schema,
+        None,
     )
 }
 
@@ -7072,6 +7083,7 @@ pub(crate) fn execute_upsert_returning_in(
     ledger_mode: crate::recovery::required_op_id::LedgerMode,
     returning: &[crate::sql::parser::ProjectedColumn],
     bound_schema: &crate::catalog::TableSchema,
+    triggers: Option<&crate::trigger::TriggerRuntime>,
 ) -> Result<ReturningOutcome, SqlSurfaceError> {
     let columns = crate::sql::returning::column_meta(returning, bound_schema)?;
     let mut rows: Vec<ResultRow> = Vec::new();
@@ -7089,6 +7101,7 @@ pub(crate) fn execute_upsert_returning_in(
         bound,
         ledger_mode,
         bound_schema,
+        triggers,
         Some(&mut project),
     )?;
     drop(project);
@@ -7108,6 +7121,7 @@ fn execute_upsert_inner(
     bound: &BoundUpsert,
     ledger_mode: crate::recovery::required_op_id::LedgerMode,
     bound_schema: &crate::catalog::TableSchema,
+    triggers: Option<&crate::trigger::TriggerRuntime>,
     project: Option<&mut crate::tenant::ReturningProjectFn<'_>>,
 ) -> Result<u64, SqlSurfaceError> {
     use crate::storage::Visibility;
@@ -7214,6 +7228,7 @@ fn execute_upsert_inner(
             ledger_write,
             Some(bound_schema),
             &volatile,
+            triggers,
         ),
         Some(project) => crate::tenant::upsert_typed_rows_capturing_unchecked(
             target,
@@ -7226,6 +7241,7 @@ fn execute_upsert_inner(
             ledger_write,
             Some(bound_schema),
             &volatile,
+            triggers,
             project,
         ),
     }

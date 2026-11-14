@@ -652,7 +652,7 @@ fn partitioned_dml_is_rejected_when_triggers_exist() {
     assert_eq!(count(&core, &a, "trg"), 2);
 }
 
-// 発火に未対応の経路（RETURNING・UPSERT・生の行 API）は 0A000。台帳は消費されない。
+// 発火に未対応の経路（RETURNING・RETURNING 付き UPSERT・生の行 API）は 0A000。台帳は消費されない。
 #[test]
 fn unwired_paths_are_guarded() {
     let dir = tempdir();
@@ -671,7 +671,7 @@ fn unwired_paths_are_guarded() {
         "DELETE FROM trg WHERE id = 1 RETURNING id USING OPERATION_ID 'g3'",
         "DELETE FROM trg WHERE n > 0 RETURNING id USING OPERATION_ID 'g4'",
         "INSERT INTO trg (id, embedding, a, n) VALUES (1, '[1.0,0.0]', 'x', 1) \
-         ON CONFLICT (id) DO UPDATE SET n = 2 USING OPERATION_ID 'g5'",
+         ON CONFLICT (id) DO UPDATE SET n = 2 RETURNING id USING OPERATION_ID 'g5'",
     ] {
         assert_eq!(code(&core, &a, sql), "0A000", "{sql}");
     }

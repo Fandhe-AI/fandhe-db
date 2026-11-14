@@ -190,6 +190,9 @@ mod trigger_update_delete_tests;
 // 文レベルトリガと TRUNCATE トリガの発火の結合テスト（TABLE-45・Issue #1726）。
 #[cfg(test)]
 mod trigger_statement_tests;
+// `INSERT ... ON CONFLICT` でのトリガ発火の結合テスト（TABLE-45・Issue #3191）。
+#[cfg(test)]
+mod trigger_upsert_tests;
 // トリガの入れ子の発火と深さ上限（`54001`）の結合テスト（TABLE-45 (5)・Issue #1727）。
 #[cfg(test)]
 mod trigger_depth_tests;
@@ -17691,6 +17694,8 @@ impl EngineCore {
             &bound,
             self.dml_ledger_mode(),
             &schema,
+            // NoSQL 表層のトリガ発火は別 Issue（#3396）の対象。通過証が無いのでトリガがあれば `0A000`。
+            None,
         )
     }
 
@@ -20256,6 +20261,8 @@ impl EngineCore {
                     &bound,
                     self.dml_ledger_mode(),
                     &schema,
+                    // INSERT・UPDATE トリガを発火する（Issue #3191）。
+                    Some(&self.trigger_runtime.bind(self)),
                 )
             }
         }
@@ -20343,6 +20350,8 @@ impl EngineCore {
                     self.dml_ledger_mode(),
                     &returning,
                     &schema,
+                    // `RETURNING` 付きのトリガ発火は未結線（通過証なし。トリガがあれば `0A000`）。
+                    None,
                 )
             }
         }
