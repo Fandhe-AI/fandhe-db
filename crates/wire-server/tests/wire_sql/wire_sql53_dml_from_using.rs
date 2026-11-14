@@ -130,3 +130,39 @@ fn explicit_transaction_commits_and_rolls_back() {
     expect_tag(&mut stream, "COMMIT;", "COMMIT", b'I');
     assert_eq!(count(&mut stream, UPDATED), 2);
 }
+
+/// 末尾 `;` 付き単独送信（psql 形）の `USING OPERATION_ID`（Issue #3203・RECOVER-10/11）: 初回は正確なタグ、
+/// 再送は `23505`、別文への再利用は `22023` で、エラー後も接続は ReadyForQuery（`I`）へ戻り使い続けられる。
+#[test]
+fn operation_id_forms_report_tags_resend_and_reuse_errors() {
+    let (core, _g) = new_core();
+    let mut stream = connect(core);
+    seed(&mut stream);
+
+    let upd =
+        "UPDATE docs SET n = 9 FROM langs WHERE docs.lang = langs.lang USING OPERATION_ID 'w-x';";
+    let del = "DELETE FROM docs USING langs WHERE docs.lang = langs.lang USING OPERATION_ID 'w-y';";
+    expect_tag(&mut stream, upd, "UPDATE 2", b'I');
+    // 再送は再適用されない（再送の間に一致行を増やしても n=9 の行数は変わらない）。
+    expect_tag(
+        &mut stream,
+        "INSERT INTO docs (id, embedding, lang, n) VALUES (4, '[0.4,0.1]', 'ja', 0) USING OPERATION_ID 'doc-4';",
+        "INSERT 0 1",
+        b'I',
+    );
+    send_simple_query(&mut stream, upd);
+    expect_error_response_with_sqlstate(&mut stream, "23505");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'I');
+    assert_eq!(count(&mut stream, UPDATED), 2);
+
+    // 別文へ同じ ID を再利用すると 22023。
+    send_simple_query(&mut stream, &del.replace("'w-y'", "'w-x'"));
+    expect_error_response_with_sqlstate(&mut stream, "22023");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'I');
+
+    expect_tag(&mut stream, del, "DELETE 3", b'I');
+    send_simple_query(&mut stream, del);
+    expect_error_response_with_sqlstate(&mut stream, "23505");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'I');
+    assert_eq!(count(&mut stream, ALL), 1);
+}
