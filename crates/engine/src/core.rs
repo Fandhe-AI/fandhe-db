@@ -187,6 +187,9 @@ mod trigger_after_insert_tests;
 // BEFORE・AFTER ROW UPDATE／DELETE トリガの発火の結合テスト（TABLE-45・Issue #1725）。
 #[cfg(test)]
 mod trigger_update_delete_tests;
+// NoSQL（HTTP）表層の書き込み入口でのトリガ発火の結合テスト（TABLE-45・Issue #3282）。
+#[cfg(test)]
+mod trigger_nosql_tests;
 // 文レベルトリガと TRUNCATE トリガの発火の結合テスト（TABLE-45・Issue #1726）。
 #[cfg(test)]
 mod trigger_statement_tests;
@@ -17446,6 +17449,12 @@ impl EngineCore {
             crate::sql::allowlist::SqlSurfaceError,
         >,
     {
+        // Issue #3282: セッションを持つ HTTP 表層の入口だけがトリガを発火させる（発火元の主体の写しを
+        // 書き込み区間へ張る。SQL 表層の `session_time_zone_scope` と同じ）。セッションの無い COPY の
+        // commit 経路は主体を持たないため通過証を渡さず、INSERT トリガのある表は従来どおり `0A000`。
+        let _trigger_subject =
+            privilege_session.map(crate::trigger::subject::TriggerSubjectScope::enter);
+        let fire_triggers = privilege_session.is_some();
         self.execute_bound_insert_core(
             target,
             ctx,
@@ -17455,15 +17464,15 @@ impl EngineCore {
             operation_id,
             bind,
             |target, bounds, schema| {
-                // 判定 7: 実書き込み。NoSQL 表層はトリガの発火に未対応（`None`。INSERT トリガのある表は
-                // `0A000`。Issue #1723）。
+                // 判定 7: 実書き込み。
+                let runtime = self.trigger_runtime.bind(self);
                 crate::sql::exec::execute_insert_batch_with_schema_in(
                     target,
                     ctx,
                     bounds,
                     self.ledger_mode,
                     Some(schema),
-                    None,
+                    fire_triggers.then_some(&runtime),
                 )
             },
         )
@@ -18349,6 +18358,9 @@ impl EngineCore {
         ctx: &PolicyContext,
         session: &crate::sql::mode::SessionState,
         table: &str,
+        // 発火する BEFORE UPDATE トリガの NOT NULL 検査延期の判定に使う SET 列名（Issue #3282。
+        // `bind` が束縛する SET と同じ列）。
+        set_columns: &[&str],
         operation_id: Option<&crate::recovery::required_op_id::OperationId>,
         bind: F,
     ) -> Result<crate::sql::exec::UpdateOutcome, crate::sql::allowlist::SqlSurfaceError>
@@ -18362,6 +18374,8 @@ impl EngineCore {
     {
         // RECOVER-15・Issue #2175: 読み取りレプリカでは NoSQL の書き込みも副作用の前に `25006` で拒否する。
         self.reject_if_read_replica()?;
+        // Issue #3282: 発火元の主体の写しを書き込み区間へ張る（SQL 表層と同じ実行器・同じ発火計画）。
+        let _trigger_subject = crate::trigger::subject::TriggerSubjectScope::enter(session);
         // 判定 1: `operation_id` 必須化ガード（スキーマ取得より前）。
         self.ledger_mode
             .resolve(operation_id)
@@ -18370,7 +18384,12 @@ impl EngineCore {
         // 判定 2・3: スキーマ取得 → 束縛（同一 read_txn 下）。
         let (read_txn, schema) = self.read_txn_with_schema(table)?;
         let _sparsevec_limits_scope = self.sparsevec_limits_scope();
-        let bound = bind(&schema)?;
+        let bound = {
+            // BEFORE UPDATE 行トリガのある表だけ、束縛時の NOT NULL 検査を最終 NEW まで後回しにする
+            // （SQL 表層の単一行 UPDATE と同じ。トリガ無し・AFTER のみは従来どおり束縛時に `23502`）。
+            let _defer = self.defer_not_null_scope_for_update(ctx, &schema.name, set_columns);
+            bind(&schema)?
+        };
         if bound.table != table || bound.operation_id.as_ref() != operation_id {
             // `bound.operation_id` は判定 1 の早期ガードと独立に `bind` closure
             // （呼び出し元）が構築するため、一致検証なしでは判定 1 が通過させた
@@ -18389,13 +18408,15 @@ impl EngineCore {
         )?;
         drop(read_txn);
 
-        // 判定 4: 実書き込み（独自の write トランザクション）。
-        crate::sql::exec::execute_update_with_schema(
-            &self.storage,
+        // 判定 4: 実書き込み（独自の write トランザクション）。UPDATE トリガは通過証を渡して発火させる
+        // （Issue #3282）。
+        crate::sql::exec::execute_update_with_schema_in(
+            crate::tenant::WriteTarget::Autocommit(&self.storage),
             ctx,
             &bound,
             self.ledger_mode,
             Some(&schema),
+            Some(&self.trigger_runtime.bind(self)),
         )
     }
 
@@ -18421,6 +18442,8 @@ impl EngineCore {
     ) -> Result<crate::sql::exec::DeleteOutcome, crate::sql::allowlist::SqlSurfaceError> {
         // RECOVER-15・Issue #2175: 読み取りレプリカでは NoSQL の書き込みも副作用の前に `25006` で拒否する。
         self.reject_if_read_replica()?;
+        // Issue #3282: 発火元の主体の写しを書き込み区間へ張る。
+        let _trigger_subject = crate::trigger::subject::TriggerSubjectScope::enter(session);
         // SQL-40・Issue #1969: 判定順は「名前解決 `42P01` → 権限 `42501`」。束縛済みの主体のときだけ
         // 表の存在確認を先に行う（未束縛は従来と同一で追加の読み取りをしない）。
         if session.object_privileges_enforced() {
@@ -18432,7 +18455,13 @@ impl EngineCore {
             &bound.table,
             crate::catalog::privilege::PRIV_DELETE | crate::catalog::privilege::PRIV_SELECT,
         )?;
-        crate::sql::exec::execute_delete(&self.storage, ctx, bound, self.ledger_mode)
+        crate::sql::exec::execute_delete_in(
+            crate::tenant::WriteTarget::Autocommit(&self.storage),
+            ctx,
+            bound,
+            self.ledger_mode,
+            Some(&self.trigger_runtime.bind(self)),
+        )
     }
 
     /// [`Self::execute_bound_delete_in_session`] の束縛時スキーマ検査付き版（Issue #2199）。
@@ -18455,6 +18484,8 @@ impl EngineCore {
     {
         // RECOVER-15・Issue #2175: 読み取りレプリカでは NoSQL の書き込みも副作用の前に `25006` で拒否する。
         self.reject_if_read_replica()?;
+        // Issue #3282: 発火元の主体の写しを書き込み区間へ張る。
+        let _trigger_subject = crate::trigger::subject::TriggerSubjectScope::enter(session);
         let ledger_write = self
             .ledger_mode
             .resolve(bound.operation_id.as_ref())
@@ -18469,19 +18500,21 @@ impl EngineCore {
             crate::catalog::privilege::PRIV_DELETE | crate::catalog::privilege::PRIV_SELECT,
         )?;
         drop(read_txn);
-        match crate::tenant::delete_row_ledgered_capturing_unchecked(
+        // 束縛時スキーマとの照合は `RETURNING` の `capture` と独立に渡す（`capture` ありは DELETE トリガ
+        // 未結線扱いのため、照合だけの用途で `capture` を流用しない。Issue #3282）。
+        match crate::tenant::delete_row_ledgered_with_triggers_expecting(
             crate::tenant::WriteTarget::Autocommit(&self.storage),
             &bound.table,
             ctx,
             bound.id,
             ledger_write,
-            Some(&schema),
-            None,
+            &schema,
+            Some(&self.trigger_runtime.bind(self)),
         ) {
-            Ok((crate::tenant::DeleteRowOutcome::Deleted, _)) => {
+            Ok(crate::tenant::DeleteRowOutcome::Deleted) => {
                 Ok(crate::sql::exec::DeleteOutcome { rows_affected: 1 })
             }
-            Ok((crate::tenant::DeleteRowOutcome::NotFound, _)) => {
+            Ok(crate::tenant::DeleteRowOutcome::NotFound) => {
                 Ok(crate::sql::exec::DeleteOutcome { rows_affected: 0 })
             }
             Err(e) => Err(crate::sql::exec::map_write_error(e, "delete")),
@@ -18547,6 +18580,8 @@ impl EngineCore {
     {
         // RECOVER-15・Issue #2175: 読み取りレプリカでは NoSQL の書き込みも副作用の前に `25006` で拒否する。
         self.reject_if_read_replica()?;
+        // Issue #3282: 発火元の主体の写しを書き込み区間へ張る。
+        let _trigger_subject = crate::trigger::subject::TriggerSubjectScope::enter(session);
         // 判定 1: `operation_id` 必須化ガード（スキーマ取得より前）。
         self.ledger_mode
             .resolve(operation_id)
@@ -18619,6 +18654,8 @@ impl EngineCore {
     {
         // RECOVER-15・Issue #2175: 読み取りレプリカでは NoSQL の書き込みも副作用の前に `25006` で拒否する。
         self.reject_if_read_replica()?;
+        // Issue #3282: 発火元の主体の写しを書き込み区間へ張る。
+        let _trigger_subject = crate::trigger::subject::TriggerSubjectScope::enter(session);
         self.ledger_mode
             .resolve(operation_id)
             .map_err(|_| crate::sql::allowlist::SqlSurfaceError::MissingOperationId)?;
@@ -20543,7 +20580,16 @@ impl EngineCore {
         stmt: &crate::sql::allowlist::ValidatedPredicateDelete,
         schema: &crate::catalog::TableSchema,
     ) -> Result<crate::sql::exec::DeleteOutcome, crate::sql::allowlist::SqlSurfaceError> {
-        self.run_predicate_delete_resolved(target, ctx, udfs, stmt, stmt, schema, None)
+        self.run_predicate_delete_resolved(
+            target,
+            ctx,
+            udfs,
+            stmt,
+            stmt,
+            schema,
+            // Issue #3282: NoSQL 表層の述語形 DELETE（唯一の呼び出し元）が通過証を渡して発火させる。
+            Some(&self.trigger_runtime.bind(self)),
+        )
     }
 
     /// [`Self::run_predicate_delete`] の本体。`bind_stmt` は束縛に使う文（サブクエリ解決済み）、
@@ -21520,7 +21566,16 @@ impl EngineCore {
         validated: &crate::sql::allowlist::ValidatedPredicateUpdate,
         schema: &crate::catalog::TableSchema,
     ) -> Result<crate::sql::exec::UpdateOutcome, crate::sql::allowlist::SqlSurfaceError> {
-        self.run_predicate_update_resolved(target, ctx, udfs, validated, validated, schema, None)
+        self.run_predicate_update_resolved(
+            target,
+            ctx,
+            udfs,
+            validated,
+            validated,
+            schema,
+            // Issue #3282: NoSQL 表層の述語形 UPDATE（唯一の呼び出し元）が通過証を渡して発火させる。
+            Some(&self.trigger_runtime.bind(self)),
+        )
     }
 
     /// [`Self::run_predicate_update`] の `RETURNING` 付き版（NOSQL-22・Issue #2091。

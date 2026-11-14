@@ -23,6 +23,7 @@ mod sql2033_hnsw_iterative_scan_behavior;
 mod sql2033_hnsw_iterative_scan_setting;
 mod sql24_expr_lhs_null_between_in;
 mod sql3208_aggregate_row_check;
+mod sql3209_observe_value_inline;
 mod sql3211_aggregate_direct_observe;
 mod sql41_bool_literal_where;
 mod sql42_aggregate_arith_projection;
