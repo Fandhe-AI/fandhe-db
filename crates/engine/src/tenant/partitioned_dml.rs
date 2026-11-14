@@ -135,6 +135,8 @@ pub(crate) fn delete_rows_where_partitioned_unchecked<E>(
     max_affected_total: Option<NonZeroUsize>,
     fixed_time: Option<i64>,
     privilege_recheck: Option<RelationPrivilegeRecheck>,
+    // 行トリガの通過証（Issue #3283）。SQL 表層だけが `Some`、NoSQL 表層は `None`（該当トリガがあれば `0A000`）。
+    triggers: Option<&crate::trigger::TriggerRuntime>,
     predicate: impl FnMut(&DmlCandidate<'_>) -> Result<bool, E>,
 ) -> Result<PartitionedDmlOutcome, PartitionedDmlFailure<E>> {
     // Issue #1798: チャンク commit 後に 57014 を返すと SQL-32／SQL-71 (4) の契約（commit 済みなら
@@ -153,6 +155,7 @@ pub(crate) fn delete_rows_where_partitioned_unchecked<E>(
             max_affected_total,
             fixed_time,
             Kind::Delete,
+            triggers,
             predicate,
             &mut Hooks::production(privilege_recheck),
         )
@@ -179,6 +182,8 @@ pub(crate) fn update_rows_where_partitioned_unchecked<E>(
     max_affected_total: Option<NonZeroUsize>,
     fixed_time: Option<i64>,
     privilege_recheck: Option<RelationPrivilegeRecheck>,
+    // 行トリガの通過証（Issue #3283）。SQL 表層だけが `Some`、NoSQL 表層は `None`（該当トリガがあれば `0A000`）。
+    triggers: Option<&crate::trigger::TriggerRuntime>,
     predicate: impl FnMut(&DmlCandidate<'_>) -> Result<bool, E>,
 ) -> Result<PartitionedDmlOutcome, PartitionedDmlFailure<E>> {
     // Issue #1798: チャンク commit 後に 57014 を返すと SQL-32／SQL-71 (4) の契約（commit 済みなら
@@ -200,6 +205,7 @@ pub(crate) fn update_rows_where_partitioned_unchecked<E>(
                 assignments,
                 set_exprs,
             },
+            triggers,
             predicate,
             &mut Hooks::production(privilege_recheck),
         )
@@ -388,6 +394,7 @@ fn run_partitioned<E>(
     max_affected_total: Option<NonZeroUsize>,
     fixed_time: Option<i64>,
     kind: Kind<'_>,
+    triggers: Option<&crate::trigger::TriggerRuntime>,
     predicate: impl FnMut(&DmlCandidate<'_>) -> Result<bool, E>,
     hooks: &mut Hooks<'_>,
 ) -> Result<PartitionedDmlOutcome, PartitionedDmlFailure<E>> {
@@ -409,6 +416,7 @@ fn run_partitioned<E>(
         max_affected_total,
         fixed_time,
         kind,
+        triggers,
         predicate,
         hooks,
         &mut state,
@@ -432,6 +440,7 @@ fn chunk_loop<E>(
     max_affected_total: Option<NonZeroUsize>,
     fixed_time: Option<i64>,
     kind: Kind<'_>,
+    triggers: Option<&crate::trigger::TriggerRuntime>,
     mut predicate: impl FnMut(&DmlCandidate<'_>) -> Result<bool, E>,
     hooks: &mut Hooks<'_>,
     state: &mut JobState,
@@ -537,18 +546,40 @@ fn chunk_loop<E>(
             require_expected_schema_for_set_exprs(set_exprs, expected_schema).map_err(w)?;
         }
 
-        // 該当イベントのトリガ（行・文を問わない）と、参照アクションが及ぶ子表のトリガがあれば `0A000`
-        // （Issue #1725・実行モデルの D8）。チャンクは複数 txn に分かれトリガの文脈（`OLD`・`NEW` の
-        // 一貫した文単位）を保てないため、黙って飛ばさず拒否する。ジョブ記録・台帳照合より前に判定
-        // するので、第 1 チャンクでは commit 前に止まり副作用はゼロ（登録簿の登録は drop で外れる）。
-        // 途中のチャンクで DDL によりトリガが追加された場合は、既存の部分完了の写像に従う。
-        crate::trigger::plan::guard_unwired_dml(
-            &write_txn,
-            tenant,
-            table,
-            matches!(kind, Kind::Delete),
-        )
+        // トリガの分類（Issue #3283・実行モデルの D8）。行トリガ（BEFORE／AFTER ROW）は各チャンクの
+        // write txn の中で通常経路と同じ段取りで発火する。文トリガ・参照アクションが及ぶ子表のトリガ・
+        // 通過証なし（NoSQL 表層）は固定文言の `0A000` で拒否し、黙って飛ばさない（文トリガの「文につき
+        // 1 回・全行の前後」は、チャンクごとに commit し再開もある非原子実行では保証できない）。
+        // ジョブ記録・台帳照合より前に判定するので、第 1 チャンクでは commit 前に止まり副作用はゼロ
+        // （登録簿の登録は drop で外れる）。途中のチャンクで DDL によりトリガが追加された場合は、次の
+        // チャンクで同じ判定が働き、既存の部分完了の写像（`VD001`）に従う。
+        let trigger_plan = match kind {
+            Kind::Delete => crate::trigger::plan::plan_row_triggers(
+                &write_txn,
+                tenant,
+                table,
+                crate::catalog::trigger::TriggerEvents::DELETE,
+                None,
+                triggers,
+            ),
+            Kind::Update {
+                assignments,
+                set_exprs,
+            } => plan_update_triggers(
+                &write_txn,
+                ctx,
+                table,
+                &schema,
+                assignments,
+                set_exprs,
+                &[],
+                triggers,
+            ),
+        }
         .map_err(w)?;
+        if let Some(plan) = &trigger_plan {
+            crate::trigger::plan::reject_statement_triggers(plan).map_err(w)?;
+        }
 
         // ジョブ記録の照合。最初のチャンクは再送判定、以降はメモリ上の状態との一致確認。
         let record = partitioned_job::lookup_in_write_txn(&write_txn, &key).map_err(map_job_err)?;
@@ -701,45 +732,90 @@ fn chunk_loop<E>(
             now.saturating_duration_since(start) >= limits.max_writer_hold
         };
         let fk_mode = crate::constraint::FkCheckMode::All;
-        let applied = match kind {
-            Kind::Delete => apply_predicate_delete_in_txn::<E>(
-                &write_txn,
-                table,
-                ctx,
-                &schema,
-                &candidate_ids,
-                fk_mode,
-                None,
-                Some(&mut stop_by_hold),
-            ),
-            Kind::Update {
-                assignments,
-                set_exprs,
-            } => apply_predicate_update_in_txn::<E>(
-                &write_txn,
-                table,
-                ctx,
-                &schema,
-                &candidate_ids,
-                assignments,
-                set_exprs,
-                None,
-                fk_mode,
-                None,
-                Some(&mut stop_by_hold),
-            ),
-        }
-        .map_err(from_predicate_err)?;
+        // 行トリガのある表は、行ストアのハンドルを開かない別の適用段（通常経路と共有）へ回す。分割実行は
+        // autocommit 専用なので `Autocommit` を渡す（トリガが書いた表の遅延 FK を各チャンクの末尾で確定する。
+        // `InTxn` を渡すと COMMIT まで先送りされ fail-open になる）。`consumed` は BEFORE の `NULL` 返却で
+        // スキップした行を含む消費件数で、カーソルの根拠になる（`applied` は書いた行数）。
+        let (applied, consumed, trigger_wrote) = if let Some(plan) = &trigger_plan {
+            let writes =
+                crate::trigger::write_handle::TriggerWriteHandle::new(&write_txn, ctx, triggers);
+            let target = WriteTarget::Autocommit(storage);
+            let done = match kind {
+                Kind::Delete => trigger_dml::delete_rows_with_triggers(
+                    &write_txn,
+                    &target,
+                    table,
+                    ctx,
+                    &schema,
+                    &candidate_ids,
+                    plan,
+                    &writes,
+                    Some(&mut stop_by_hold),
+                ),
+                Kind::Update {
+                    assignments,
+                    set_exprs,
+                } => trigger_dml::update_rows_with_triggers(
+                    &write_txn,
+                    &target,
+                    table,
+                    ctx,
+                    &schema,
+                    &candidate_ids,
+                    &trigger_dml::UpdateSpec {
+                        assignments,
+                        set_exprs,
+                        row_overrides: None,
+                    },
+                    plan,
+                    &writes,
+                    Some(&mut stop_by_hold),
+                ),
+            }
+            .map_err(w)?;
+            (done.applied, done.consumed, done.trigger_wrote)
+        } else {
+            let applied = match kind {
+                Kind::Delete => apply_predicate_delete_in_txn::<E>(
+                    &write_txn,
+                    table,
+                    ctx,
+                    &schema,
+                    &candidate_ids,
+                    fk_mode,
+                    None,
+                    Some(&mut stop_by_hold),
+                ),
+                Kind::Update {
+                    assignments,
+                    set_exprs,
+                } => apply_predicate_update_in_txn::<E>(
+                    &write_txn,
+                    table,
+                    ctx,
+                    &schema,
+                    &candidate_ids,
+                    assignments,
+                    set_exprs,
+                    None,
+                    fk_mode,
+                    None,
+                    Some(&mut stop_by_hold),
+                ),
+            }
+            .map_err(from_predicate_err)?;
+            (applied, applied, false)
+        };
         if deadline_hit.get() {
             drop(write_txn);
             return Err(PartitionedStopCause::DeadlineExceeded);
         }
 
-        // 打ち切った場合のカーソルは「最後に適用した候補の rowid」（それ以降の行は次の
+        // 打ち切った場合のカーソルは「最後に消費した候補の rowid」（それ以降の行は次の
         // チャンクで再走査・再評価される）。
-        let new_cursor = if applied < candidates.len() {
+        let new_cursor = if consumed < candidates.len() {
             exhausted = false;
-            applied
+            consumed
                 .checked_sub(1)
                 .and_then(|i| candidates.get(i))
                 .copied()
@@ -771,7 +847,10 @@ fn chunk_loop<E>(
                 return Err(map_job_err(PartitionedJobError::StateConflict));
             };
             // 上限停止の境界だけは、変更 0 件でも再開用の記録を作る（SQL-77 (3)）。
-            let record_progress = if stop_by_run_time {
+            // BEFORE トリガが別表へ書いて行をスキップしたチャンク（`applied == 0` かつ `trigger_wrote`）は、
+            // 書き込みを破棄しないよう再開用の記録を作って commit する（Issue #3283）。
+            let persist_without_changes = stop_by_run_time || (trigger_wrote && applied == 0);
+            let record_progress = if persist_without_changes {
                 partitioned_job::record_stop_point_in_txn
             } else {
                 partitioned_job::record_chunk_progress_in_txn
@@ -790,7 +869,7 @@ fn chunk_loop<E>(
                 ChunkCommitOutcome::NoRecord => {
                     // 停止点用は `NoRecord` を返さない。万一返れば再開用の記録がないまま
                     // 止まることになるため、fail-closed で止める。
-                    if stop_by_run_time {
+                    if persist_without_changes {
                         return Err(map_job_err(PartitionedJobError::StateConflict));
                     }
                     // 記録がなく変更も 0 件: 何も書かずカーソルだけメモリ上で進める。
@@ -831,7 +910,11 @@ fn chunk_loop<E>(
 
         // テーブル世代のバンプは commit 直前に置く（取り消し・期限の確認で txn を破棄する
         // 経路ではバンプも破棄される。`table_generation_bump_coverage` の近傍検査にも対応）。
-        if applied > 0 {
+        if applied > 0 || trigger_wrote {
+            // commit 記録（SQL-38）: 0 行でも世代を進める経路（トリガの別表書き込みのみ）は表を記録する。
+            if applied == 0 {
+                crate::storage::commit_log::note_table(&write_txn, table);
+            }
             crate::catalog::bump_table_generation_in_txn(&write_txn, table).map_err(w)?;
         }
         crate::recovery::commit_boundary::commit(write_txn)
