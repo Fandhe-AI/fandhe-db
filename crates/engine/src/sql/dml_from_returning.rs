@@ -11,11 +11,11 @@
 //! 各表を独立に評価することで担保し、ここでは対象行の再判定
 //! （[`joined_returning_collector`]）だけを行う。
 //!
-//! 現状は #1754／#1755 の結線待ちで、`core.rs` からは未接続（結線までは未使用のため
-//! モジュール全体で `dead_code` を許可している）。未接続の入口は固定文言の `0A000` で
-//! fail-closed のまま残し、仮の成功経路は作らない。
-
-#![allow(dead_code)]
+//! 結線（Issue #3204）: 構文段（`sql::allowlist` の `parse_dml_from_returning_clause`）→ 束縛
+//! （`sql::dml_from`）→ 計画（`sql::join::dml_plan` が source 側の参照列を走査へ載せ、
+//! [`BoundFromReturning::assign_source_cells`] でセル位置を確定）→ 実行（`core::dml_join_exec` が
+//! [`joined_returning_collector`] を組み立てる）の順に使われる。式・関数呼び出し・`AS` 別名は
+//! 構文段で `42601` のまま（Phase 3 の担当）。
 
 use crate::policy::PolicyContext;
 use crate::row_codec::Value;
@@ -54,19 +54,36 @@ pub(crate) struct FromReturningColumn {
     pub(crate) meta: ColumnMeta,
     /// 対象表（`relation == 0`）の列だけが持つ従来形の投影（`returning::project_row` へ委譲する）。
     target_projection: Option<ProjectedColumn>,
+    /// FROM／USING 側の列が読む、一致行 `cells` 内の位置。計画段（[`BoundFromReturning::assign_source_cells`]）
+    /// が確定する。未確定のまま射影すると `XX000`（fail-closed）。
+    source_cell: Option<usize>,
 }
 
 /// 束縛済みの `RETURNING`。
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct BoundFromReturning {
     pub(crate) columns: Vec<FromReturningColumn>,
-    /// relation ごとの「FROM／USING 側セル列の先頭に疑似列 `id` を持つか」
-    /// （従来方式の表だけ `true`。`FromRowRef::cells` の並び規約の判定に使う）。
-    id_offsets: Vec<bool>,
 }
 
-/// FROM／USING 側の 1 行。`cells` の並びは JOIN の `SideProjection::All` と同じ
-/// （疑似列 `id` は従来方式の表だけ位置 0、列は `id_offset + index`）。
+impl BoundFromReturning {
+    /// FROM／USING 側（`relation >= 1`）の各出力列が読むセル位置を確定する。`locate` は
+    /// （relation, 列スロット）から一致行 `cells` 内の位置を返す（呼び出し元の走査投影の
+    /// 並びだけが知っている。ここに全列レイアウトの前提を持ち込まない）。
+    pub(crate) fn assign_source_cells(
+        &mut self,
+        mut locate: impl FnMut(usize, ColumnSlot) -> Result<usize, SqlSurfaceError>,
+    ) -> Result<(), SqlSurfaceError> {
+        for col in &mut self.columns {
+            if col.relation != 0 {
+                col.source_cell = Some(locate(col.relation, col.slot)?);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// FROM／USING 側の 1 行。`cells` の並びは走査の投影順
+/// （[`BoundFromReturning::assign_source_cells`] で確定した位置が指す）。
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct FromRowRef<'a> {
     pub(crate) cells: &'a [Cell],
@@ -120,6 +137,7 @@ fn push_column(
         slot,
         meta,
         target_projection: (relation == 0).then_some(projected),
+        source_cell: None,
     });
     Ok(())
 }
@@ -177,15 +195,7 @@ pub(crate) fn bind_from_returning(
             }
         }
     }
-    let id_offsets = scope
-        .relations()
-        .iter()
-        .map(|(_, schema)| schema.has_pseudo_id())
-        .collect();
-    Ok(BoundFromReturning {
-        columns,
-        id_offsets,
-    })
+    Ok(BoundFromReturning { columns })
 }
 
 /// 列メタデータ（`RowDescription` 相当）。
@@ -245,21 +255,9 @@ pub(crate) fn project_joined_row(
         let side = from_rows
             .get(col.relation.saturating_sub(1))
             .ok_or_else(|| bug("FROM/USING row missing"))?;
-        let pos = match col.slot {
-            ColumnSlot::Id => 0,
-            ColumnSlot::Column(index) => {
-                let id_offset = usize::from(
-                    bound
-                        .id_offsets
-                        .get(col.relation)
-                        .copied()
-                        .ok_or_else(|| bug("relation offset missing"))?,
-                );
-                index
-                    .checked_add(id_offset)
-                    .ok_or_else(|| bug("cell position overflow"))?
-            }
-        };
+        let pos = col
+            .source_cell
+            .ok_or_else(|| bug("FROM/USING cell position unresolved"))?;
         let cell = side
             .cells
             .get(pos)
@@ -352,6 +350,18 @@ mod tests {
 
     fn ret(items: Vec<DmlFromReturningItem>) -> DmlFromReturning {
         DmlFromReturning { items }
+    }
+
+    /// テスト用の位置解決: 疑似列 `id` を位置 0、列を `index + 1` に置く走査投影を想定する。
+    fn with_cells(mut b: BoundFromReturning) -> BoundFromReturning {
+        b.assign_source_cells(|_, slot| {
+            Ok(match slot {
+                ColumnSlot::Id => 0,
+                ColumnSlot::Column(i) => i + 1,
+            })
+        })
+        .expect("assign");
+        b
     }
 
     fn two_scope<'a>(t: &'a TableSchema, s: &'a TableSchema) -> BindingScope<'a> {
@@ -486,6 +496,7 @@ mod tests {
             &ret(vec![colref(Some("b"), "y"), colref(Some("b"), "id")]),
             &scope,
         )
+        .map(with_cells)
         .expect("bind");
         let cells = [Cell::Integer(5), Cell::Text("hello".into())];
         let from = [FromRowRef { cells: &cells }];
@@ -496,6 +507,12 @@ mod tests {
             vec![Cell::Text("hello".into()), Cell::Integer(5)]
         );
         assert_eq!(budget, 5);
+        // 位置が未解決の列は XX000（fail-closed）。
+        let unresolved =
+            bind_from_returning(&ret(vec![colref(Some("b"), "y")]), &scope).expect("b");
+        let err = project_joined_row(1, &[Value::Null], &from, &unresolved, &mut 0)
+            .expect_err("unresolved");
+        assert_eq!(err.wire_code(), "XX000");
         // FROM 行なし／セル範囲外は XX000。
         let err = project_joined_row(1, &[Value::Null], &[], &b, &mut 0).expect_err("missing");
         assert_eq!(err.wire_code(), "XX000");
@@ -513,7 +530,9 @@ mod tests {
         let t = schema("t", &["x"]);
         let s = schema("s", &["y"]);
         let scope = two_scope(&t, &s);
-        let b = bind_from_returning(&ret(vec![colref(Some("b"), "y")]), &scope).expect("bind");
+        let b = bind_from_returning(&ret(vec![colref(Some("b"), "y")]), &scope)
+            .map(with_cells)
+            .expect("bind");
         let ctx = PolicyContext::new("alice").expect("ctx");
         let cells = [Cell::Integer(1), Cell::Text("v".into())];
         let lookup = |id: u64| (id == 1).then(|| vec![FromRowRef { cells: &cells }]);

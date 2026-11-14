@@ -22,6 +22,7 @@
 use crate::catalog::{ColumnDef, ColumnType, TableSchema};
 use crate::sql::allowlist::{JoinWhereExpr, JoinWherePredicate, SqlSurfaceError, WherePredicate};
 use crate::sql::dml_from::{build_scope, BoundDeleteUsing, BoundUpdateFrom};
+use crate::sql::dml_from_returning::BoundFromReturning;
 use crate::sql::relation::{ColumnRef, ColumnSlot, ResolvedColumn, TableRef};
 use crate::sql::udf_call::{BinOp, Expr, UdfRegistry};
 
@@ -238,6 +239,8 @@ fn build_source(
     schema: &TableSchema,
     preds: Vec<WherePredicate>,
     columns: Vec<usize>,
+    returning_columns: Vec<usize>,
+    include_pseudo_id: bool,
     udfs: &UdfRegistry,
 ) -> Result<JoinedDmlSource, SqlSurfaceError> {
     let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
@@ -247,7 +250,58 @@ fn build_source(
         schema: schema.clone(),
         where_predicates: preds,
         columns,
+        returning_columns,
+        include_pseudo_id,
     })
+}
+
+/// `RETURNING` が参照する source（relation 1）の列を、SET 用の列とは別の `returning_columns` へ
+/// 重複なしで集める。SET の式評価ビュー（`source_scalar`。VECTOR 等は写像できない）へ載せないため
+/// 分離する。疑似列 `id` が参照されていれば真を返す。列型は制限しない（セルを複製して返すだけ）。
+/// relation 2 以上は `Internal`。
+fn returning_source_columns(
+    returning: Option<&BoundFromReturning>,
+    returning_columns: &mut Vec<usize>,
+) -> Result<bool, SqlSurfaceError> {
+    let mut include_pseudo_id = false;
+    let Some(ret) = returning else {
+        return Ok(include_pseudo_id);
+    };
+    for col in &ret.columns {
+        match col.relation {
+            0 => {}
+            1 => match col.slot {
+                ColumnSlot::Id => include_pseudo_id = true,
+                ColumnSlot::Column(i) => {
+                    if !returning_columns.contains(&i) {
+                        returning_columns.push(i);
+                    }
+                }
+            },
+            _ => return Err(internal("RETURNING relation index out of range")),
+        }
+    }
+    Ok(include_pseudo_id)
+}
+
+/// 計画の走査投影が確定した後に、`RETURNING` の source 側の列が読むセル位置を確定する。
+fn resolve_returning(
+    plan: &mut JoinedDmlPlan,
+    returning: Option<BoundFromReturning>,
+) -> Result<(), SqlSurfaceError> {
+    plan.returning = match returning {
+        None => None,
+        Some(mut ret) => {
+            ret.assign_source_cells(|relation, slot| {
+                if relation != 1 {
+                    return Err(internal("RETURNING relation index out of range"));
+                }
+                plan.source_cell_position(slot)
+            })?;
+            Some(ret)
+        }
+    };
+    Ok(())
 }
 
 /// source 列が SET 式の入力として結合ビューへ写像できる型か（`sql::join::dml::source_scalar` が
@@ -413,20 +467,26 @@ pub(crate) fn plan_update_from(
     };
     let target = build_target(target_ref.table(), target_schema, &split.target, udfs)?;
     let (update, columns) = plan_set(bound, target_schema, source_schema)?;
+    let mut returning_columns = Vec::new();
+    let include_pseudo_id = returning_source_columns(bound.returning(), &mut returning_columns)?;
     let source = build_source(
         source_ref.table(),
         source_schema,
         split.source,
         columns,
+        returning_columns,
+        include_pseudo_id,
         udfs,
     )?;
-    finish(JoinedDmlPlan {
+    let mut plan = JoinedDmlPlan {
         target,
         source,
         keys: split.keys,
         update: Some(update),
-        returning_references_source: false,
-    })
+        returning: None,
+    };
+    resolve_returning(&mut plan, bound.returning().cloned())?;
+    finish(plan)
 }
 
 /// 束縛済みの `DELETE ... USING` を [`JoinedDmlPlan`] へ変換する（`update` は `None`）。
@@ -446,20 +506,27 @@ pub(crate) fn plan_delete_using(
         return Err(SqlSurfaceError::feature_not_supported(MULTI_FROM));
     };
     let target = build_target(target_ref.table(), target_schema, &split.target, udfs)?;
+    let columns = Vec::new();
+    let mut returning_columns = Vec::new();
+    let include_pseudo_id = returning_source_columns(bound.returning(), &mut returning_columns)?;
     let source = build_source(
         source_ref.table(),
         source_schema,
         split.source,
-        Vec::new(),
+        columns,
+        returning_columns,
+        include_pseudo_id,
         udfs,
     )?;
-    finish(JoinedDmlPlan {
+    let mut plan = JoinedDmlPlan {
         target,
         source,
         keys: split.keys,
         update: None,
-        returning_references_source: false,
-    })
+        returning: None,
+    };
+    resolve_returning(&mut plan, bound.returning().cloned())?;
+    finish(plan)
 }
 
 #[cfg(test)]
