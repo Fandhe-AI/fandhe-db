@@ -11344,8 +11344,9 @@ impl EngineCore {
     }
 
     /// `DECLARE` の内側 SELECT（`sql::cursor::validate_declare_tokens` により
-    /// `Statement::Aggregate`／`Statement::Scan` のいずれかであることが構造
-    /// 検証段で保証済み）専用の実行入口（PR #1049 レビュー指摘 P1 対応）。
+    /// `Statement::Aggregate`／`Statement::Scan`／`Statement::Join`（CTE 入力を含む）／
+    /// `Statement::SetOperation` のいずれかであることが構造検証段で保証済み。
+    /// Issue #3176 で JOIN の CTE 入力と集合演算を追加）専用の実行入口（PR #1049 レビュー指摘 P1 対応）。
     ///
     /// `Statement::Scan` は [`crate::sql::scan::execute_scan_with_budget`] を、
     /// `Statement::Aggregate` は [`Self::run_aggregate_plan`] を、いずれも
@@ -11370,8 +11371,8 @@ impl EngineCore {
     /// 自体に `max_result_bytes` を明示的に渡すことで、`sql::aggregate::
     /// execute_aggregate_with_cache`／`sql::group_by::execute_grouped_aggregate`
     /// の行生成ループが 16 MiB 予算を生成中に検査するようにする）。それ以外の
-    /// `Statement` 種別への到達は構造検証段の保証により起き得ないが、防御的に
-    /// 通常の [`Self::execute_validated_in_session`] へ委譲する。
+    /// `Statement` 種別への到達は構造検証段の保証により起き得ないが、上限なしの通常経路へは
+    /// 委譲せず `Internal` で fail-closed にする（Issue #3176。許可リストと上限付きアームは 1 対 1）。
     ///
     /// `max_result_bytes` は呼び出し元（[`Self::execute_cursor_in_active_txn`]）が
     /// 実行前に求めたセッションのカーソル残容量（[`crate::sql::cursor::
@@ -11416,28 +11417,60 @@ impl EngineCore {
             return Ok(crate::sql::SqlOutcome::Query(result));
         }
         if let crate::sql::allowlist::Statement::Join(validated) = inner {
-            // Issue #3175: CTE 入力の JOIN は #3176 の範囲。構造検証段で弾き済みだが多層防御。
-            if validated.cte_inputs.is_some() {
-                return Err(crate::sql::allowlist::SqlSurfaceError::Internal {
-                    detail: "internal error".to_string(),
-                });
-            }
             let names = crate::sql::join::collect_join_tables(validated);
             let schemas = table_schemas_in(read_txn, &names)?;
-            let result = crate::sql::join::execute_with_result_byte_cap(
+            let result = match validated.cte_inputs.as_deref() {
+                None => crate::sql::join::execute_with_result_byte_cap(
+                    read_txn,
+                    ctx,
+                    &schemas,
+                    validated,
+                    session.udfs(),
+                    self.group_by_limits,
+                    self.join_limits,
+                    self.result_limits,
+                    max_result_bytes,
+                )?,
+                // Issue #3176: CTE 入力の JOIN。文全体の予算（CTE 本文の評価・キャッシュ・複製・
+                // JOIN の生成）をカーソル残容量で縛り、生成中に `54000` で打ち切る。
+                Some(cte) => self.execute_cte_join(
+                    ctx,
+                    session,
+                    read_txn,
+                    validated,
+                    cte,
+                    self.result_limits,
+                    schemas,
+                    self.cte_join_budget().capped_at(max_result_bytes),
+                )?,
+            };
+            return Ok(crate::sql::SqlOutcome::Query(result));
+        }
+        // Issue #3176: 集合演算。各枝・合成・行キーの累計予算をカーソル残容量（と既定の上限の
+        // 小さい方）で縛る。通常の SELECT より早く `54000` になりうる（安全側の差）。
+        if let crate::sql::allowlist::Statement::SetOperation(validated) = inner {
+            let mut table_names = Vec::new();
+            crate::sql::set_op::collect_branch_tables(&validated.tree, &mut table_names);
+            let schemas = table_schemas_in(read_txn, &table_names)?;
+            let result = crate::sql::set_op::execute_with_budget_and_result_limits(
                 read_txn,
                 ctx,
                 &schemas,
-                validated,
+                &validated.tree,
                 session.udfs(),
+                validated.limit,
+                validated.offset,
+                max_result_bytes.min(crate::arena::MAX_ARENA_TOTAL_BYTES),
                 self.group_by_limits,
-                self.join_limits,
-                self.result_limits,
-                max_result_bytes,
+                &self.result_limits,
             )?;
             return Ok(crate::sql::SqlOutcome::Query(result));
         }
-        self.execute_read_statement(ctx, session, inner.clone(), read_txn)
+        // 許可リスト（`sql::cursor::validate_declare_inner`）に無い形は、上限なしの通常経路へ
+        // 流さず fail-closed で止める。
+        Err(crate::sql::allowlist::SqlSurfaceError::Internal {
+            detail: "internal error".to_string(),
+        })
     }
 
     /// [`Self::execute_in_active_txn`] の `ParsedSql::Cursor` 分岐本体
@@ -11535,7 +11568,7 @@ impl EngineCore {
                 let result = match outcome {
                     crate::sql::SqlOutcome::Query(result) => result,
                     // `inner` は構造検証段で `Statement::Aggregate`／
-                    // `Statement::Scan`／CTE 入力なしの `Statement::Join` のいずれかであることを保証済み
+                    // `Statement::Scan`／`Statement::Join`／`Statement::SetOperation` のいずれかであることを保証済み
                     // （`sql::cursor::validate_declare_tokens` 参照）。いずれも
                     // `execute_validated_in_session` は必ず `SqlOutcome::Query`
                     // を返すため、この分岐は公開 API の誤用時のみの防御的経路。
@@ -14052,7 +14085,7 @@ impl EngineCore {
             }
             crate::sql::allowlist::Statement::Join(validated) => {
                 let table_names = crate::sql::join::collect_join_tables(&validated);
-                let mut schemas = table_schemas_in(read_txn, &table_names)?;
+                let schemas = table_schemas_in(read_txn, &table_names)?;
                 let result = match validated.cte_inputs.as_deref() {
                     None => crate::sql::join::execute(
                         read_txn,
@@ -14066,34 +14099,16 @@ impl EngineCore {
                     )?,
                     // SQL-62・Issue #1861: CTE を入力に持つ JOIN。slot（CTE 本文）を参照者自身の
                     // `ctx`・同一の `read_txn` で評価し、評価済みの行を側入力として渡す。
-                    Some(cte) => {
-                        // CTE 本文の評価・共有キャッシュ・参照ごとの複製と、続く JOIN の走査・結合・
-                        // 出力生成は、1 つの文全体のバイト予算を共有する（確保の前に計上する）。
-                        let mut budget = self.cte_join_budget();
-                        let (inputs, cte_ids) = self.evaluate_join_cte_inputs(
-                            ctx,
-                            session,
-                            read_txn,
-                            &validated,
-                            cte,
-                            limits,
-                            &mut schemas,
-                            &mut budget,
-                        )?;
-                        crate::sql::join::execute_with_cte_inputs(
-                            read_txn,
-                            ctx,
-                            &schemas,
-                            &validated,
-                            session.udfs(),
-                            self.group_by_limits,
-                            self.join_limits,
-                            limits,
-                            &cte_ids,
-                            inputs,
-                            budget,
-                        )?
-                    }
+                    Some(cte) => self.execute_cte_join(
+                        ctx,
+                        session,
+                        read_txn,
+                        &validated,
+                        cte,
+                        limits,
+                        schemas,
+                        self.cte_join_budget(),
+                    )?,
                 };
                 Ok(crate::sql::SqlOutcome::Query(result))
             }
@@ -14257,6 +14272,50 @@ impl EngineCore {
     fn count_materialized_cte_eval(&self) {
         self.materialized_cte_evals
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// CTE を入力に持つ JOIN の評価と実行（SQL-62・Issue #1861）。通常の SELECT
+    /// （[`Self::execute_read_statement_with_limits`]）と `DECLARE CURSOR` の内側
+    /// （[`Self::execute_cursor_inner_query`]。Issue #3176）が共有する唯一の実装で、
+    /// 文全体のバイト予算 `budget` だけが呼び出し元で異なる（cursor は残容量で縮めた予算を渡す）。
+    ///
+    /// CTE 本文の評価・共有キャッシュ・参照ごとの複製と、続く JOIN の走査・結合・出力生成は、
+    /// 1 つの文全体のバイト予算を共有する（確保の前に計上する）。
+    #[allow(clippy::too_many_arguments)]
+    fn execute_cte_join<R: crate::storage::read_source::ReadSource>(
+        &self,
+        ctx: &PolicyContext,
+        session: &mut crate::sql::mode::SessionState,
+        read_txn: &R,
+        validated: &crate::sql::allowlist::ValidatedJoin,
+        cte: &crate::sql::allowlist::JoinCteInputs,
+        limits: crate::result_limits::ResultLimits,
+        mut schemas: std::collections::HashMap<String, crate::catalog::TableSchema>,
+        mut budget: crate::sql::join::JoinBudget,
+    ) -> Result<crate::sql::exec::QueryResult, crate::sql::allowlist::SqlSurfaceError> {
+        let (inputs, cte_ids) = self.evaluate_join_cte_inputs(
+            ctx,
+            session,
+            read_txn,
+            validated,
+            cte,
+            limits,
+            &mut schemas,
+            &mut budget,
+        )?;
+        crate::sql::join::execute_with_cte_inputs(
+            read_txn,
+            ctx,
+            &schemas,
+            validated,
+            session.udfs(),
+            self.group_by_limits,
+            self.join_limits,
+            limits,
+            &cte_ids,
+            inputs,
+            budget,
+        )
     }
 
     /// JOIN の CTE 入力（SQL-62・Issue #1861）を評価し、リレーションごとの評価済みの行
