@@ -296,3 +296,13 @@ bisect 本体は `git rev-list --bisect <bad> ^<good>` で中点を選び、`run
 - コードは変更しない。最適化の候補（`needs_text_budget` による軽量経路・先頭ガードの 1 判定化・overflow 生成部の `#[cold]` 化）は、残差が無いため採用しない。このため追加テストも無い
 - 制約: 環境が #1486 と違う（x86_64 の Linux・共有機）。絶対値は Issue 作成時の計測機と比べない。アセンブリ・`perf` での確認は、残差が無いため実施していない（未検証）。個別の寄与と `agg_multi` 以外の集計・GROUP BY・索引経路の同等計測は未実施
 - 再実行: `BENCH_TARGET=<dir> bash docs/design/bench-data/aggregate-regression-bisect/run_bisect_step.sh <sha> <out>` を交互に N≥5 回走らせ、`python3 -I docs/design/bench-data/aggregate-regression-bisect/summarize.py compare` で集計する
+
+## COUNT(*) の可視 id 集計の O(1) 化（Issue #3213）
+
+- 原因: 可視 id キャッシュ命中時の Fast 経路は、`COUNT(*)` だけでも可視 id を 1 件ずつ回し、行ごとに中断確認と `observe_light` を呼んでいた（約 10 ns/行の見込み）。件数は id スライスの長さで確定する
+- 変更: `execute_aggregate_with_cache` の Fast 経路のキャッシュ命中分岐に、純粋な `COUNT(*)` 専用の分岐を足した。非空のとき中断確認を先頭 1 回だけ行い、スライス長を `Accumulator::observe_present_n` で一括加算し、`finish_aggregate_result` へ合流する（HAVING・射影・結果予算は従来と同じ）
+- 適用条件: 全項目が `COUNT(*)`（`DISTINCT`・`FILTER` なし）で、全アキュムレータが `Count`。`GROUPING()` 混在は対象外（`is_pure_count_star`）。WHERE つき・ポリシー適用表（RLS-13）・書き込み Tx は従来どおりキャッシュ経路に入らない
+- 不変条件: 可視 id スライスは RLS 検査済みの可視行の正確な集合で、キャッシュは同一テーブル世代・同一 ctx でのみ命中する。件数加算は `checked_add`（超過は `22003`）、`usize` から `u64` への変換失敗は `XX000` で拒否する。中断確認（#3208）は非空のとき 1 回維持する（空スライスは従来どおり確認なし）
+- 固定した検査: `sql3213_count_star_visible_len.rs`（初回と命中の一致・`COUNT(id)`／`FILTER`／`DISTINCT` とのオラクル・複数 `COUNT(*)`・NULL・空集合・テナント境界・書き込み後の無効化・対象外の形・命中時の中断）。既存の `sql3208_*`・`sql_visible_cache`・`visible_cache_oracle` は無変更で通る
+- A/B（同一ホストの壁時計）: 未検証。本変更の作成環境では実施していない。受け入れ条件のうち性能の回復は充足を主張しない
+- スコープ外: `observe_value` のインライン化の復元（#3209）、agg_multi の残差（#3210）

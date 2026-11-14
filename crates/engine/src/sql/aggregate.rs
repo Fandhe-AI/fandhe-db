@@ -2775,6 +2775,29 @@ pub(crate) fn execute_aggregate_with_group_limits(
                 .snapshot()
                 .and_then(|snap| access.cache.lookup(access.storage, snap, &bound.table, ctx))
             {
+                // Issue #3213: 純粋な `COUNT(*)` だけなら件数は可視 id スライス長で確定する。
+                // スライスは RLS・TABLE-12 検査済みの可視行の正確な集合で、キャッシュは同一
+                // テーブル世代・同一 ctx でのみ命中する（`VisibleCacheAccess::lookup` の契約。
+                // ポリシー適用表と書き込み Tx は上流で `visible_cache = None`）。行ごとの
+                // 観測を省き、中断確認（Issue #3208）は非空のとき先頭の 1 回だけ維持する。
+                if is_pure_count_star(bound, &accumulators) {
+                    let ids = snapshot.visible_ids();
+                    if !ids.is_empty() {
+                        crate::interrupt::RowCheck::new().tick()?;
+                    }
+                    let n = u64::try_from(ids.len())
+                        .map_err(|_| accumulator_bug("visible id count exceeds u64 range"))?;
+                    for accumulator in accumulators.iter_mut() {
+                        accumulator.observe_present_n(n)?;
+                    }
+                    return finish_aggregate_result(
+                        accumulators,
+                        bound,
+                        schema,
+                        0,
+                        max_result_bytes,
+                    );
+                }
                 let mut expr_scratch: Vec<StackValue> = Vec::new();
                 let empty_vector = RowVector {
                     dim: 0,
@@ -3435,6 +3458,22 @@ fn finish_aggregate_result(
             cells,
         }],
     })
+}
+
+/// Issue #3213: 可視 id キャッシュ経路で件数のみ加算してよい形かの判定。
+/// 全項目が `COUNT(*)`（`DISTINCT`・`FILTER` なし）で、アキュムレータも全て `Count` のとき
+/// だけ真。`count_star_only` が許容する `GROUPING()` はここでは除外する（厳格化）。
+fn is_pure_count_star(
+    bound: &crate::sql::parser::BoundAggregate,
+    accumulators: &[Accumulator],
+) -> bool {
+    count_star_only(&bound.items)
+        && accumulators
+            .iter()
+            .all(|a| matches!(a, Accumulator::Count(_)))
+        && bound.items.iter().all(|i| {
+            matches!(i.input, AggregateInput::AllVisible) && !i.distinct && i.filter.is_none()
+        })
 }
 
 /// Issue #475: `GROUP BY` なし・索引対応述語のみの `WHERE` を持つ集計を、
