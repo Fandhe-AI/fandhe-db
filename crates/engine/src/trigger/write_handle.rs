@@ -225,8 +225,18 @@ impl<'a> TriggerWriteHandle<'a> {
                 let (action, child_change) = match &change {
                     None => (fk.on_delete(), None),
                     Some(cols) => {
-                        // `id` 参照は ON UPDATE で発火しない。更新列を参照しない FK も発火しない。
-                        if fk.references_parent_id()
+                        // 疑似列 `id` 参照は ON UPDATE で発火しない。採番方式の親の `id` は普通の列で
+                        // 更新されうるため列参照と同じ扱いにする（Issue #3180）。親スキーマを読めない場合は
+                        // `Err`（fail-closed）。更新列を参照しない FK も発火しない。
+                        let parent_schema =
+                            crate::catalog::require_table_schema_write_any_identity(
+                                self.write_txn,
+                                &parent,
+                            )
+                            .map_err(|e| {
+                                crate::sql::exec::map_insert_write_error(TenantWriteError::from(e))
+                            })?;
+                        if fk.references_parent_pseudo_id(&parent_schema)
                             || !fk.parent_columns().iter().any(|c| cols.contains(c))
                         {
                             continue;

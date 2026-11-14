@@ -3229,13 +3229,15 @@ enum ChildKey {
 }
 
 /// `fk` の参照元列（`child_schema` 側）の値から [`ChildKey`] を組み立てる。
+/// `by_pseudo_id` は親が疑似列 `id` を持つか（[`ForeignKeyDef::references_parent_pseudo_id`]）。
+/// 採番方式の親（`id` は宣言した普通の列）は偽で、他の列参照 FK と同じバイト列キーになる（Issue #3180）。
 /// いずれかの構成列が NULL の組は `None`（MATCH SIMPLE。参照アクションの対象外）。
 fn child_key_from_values(
-    fk: &ForeignKeyDef,
+    by_pseudo_id: bool,
     indices: &[usize],
     values: &[Option<ScalarRef<'_>>],
 ) -> Result<Option<ChildKey>, TenantWriteError> {
-    if fk.references_parent_id() {
+    if by_pseudo_id {
         let &idx = indices
             .first()
             .ok_or_else(|| internal("id-referencing foreign key must have one column"))?;
@@ -3278,6 +3280,7 @@ fn scan_child_fk_rows_for_keys(
     child_schema: &TableSchema,
     fk: &ForeignKeyDef,
     tenant_id: &str,
+    by_pseudo_id: bool,
     wanted_keys: Option<&HashSet<ChildKey>>,
     remaining_budget: u32,
 ) -> Result<HashMap<ChildKey, Vec<RowId>>, TenantWriteError> {
@@ -3322,7 +3325,7 @@ fn scan_child_fk_rows_for_keys(
             break;
         }
         let values = decode_key_columns(child_schema, &mask, v.value())?;
-        let Some(key) = child_key_from_values(fk, &indices, &values)? else {
+        let Some(key) = child_key_from_values(by_pseudo_id, &indices, &values)? else {
             continue;
         };
         if let Some(wanted) = wanted_keys {
@@ -3775,14 +3778,12 @@ pub(crate) fn enforce_referencing_rows_in_txn(
                     tenant_id,
                 )?
             }
-        } else if fk.references_parent_id()
-            && (fk.references_parent_pseudo_id(schema)
-                || matches!(change, ReferencedRowsChange::Removed { .. }))
-        {
+        } else if fk.references_parent_pseudo_id(schema) {
             // 疑似列 `id` 参照は `Removed` のときだけ失われ得る（`ColumnsUpdated`／
             // `AllColumnsReplaced` は上の `updated_names` ガードで既に除外済み）。
-            // 採番方式の親の `id` 参照の DELETE は、`referenced_id_value_of_removed_row`
-            // が 0A000 で拒否する（#3180 が実装するまでの fail-closed）。
+            // 採番方式の親の `id` は普通の列なので本分岐へ来ず、後続の列参照経路
+            // （キー索引・走査）で処理される（Issue #3180）。仮に到達しても
+            // `referenced_id_value_of_removed_row` が 0A000 で拒否する（多層防御）。
             let ReferencedRowsChange::Removed { ids } = change else {
                 continue;
             };
@@ -4054,8 +4055,10 @@ fn propagate_referential_actions(
         let action = match &change {
             PropagatedChange::Removed => fk.on_delete(),
             PropagatedChange::ColumnsUpdated(indices) => {
-                // `id` 参照は ON UPDATE で発火しない（`id` 疑似列は不変。A7）。
-                if fk.references_parent_id() {
+                // 疑似列 `id` 参照は ON UPDATE で発火しない（`id` 疑似列は不変。A7）。
+                // 採番方式の親の `id` は普通の列で更新できるため、列参照 FK と同じく
+                // 下の `parent_columns` との交差判定に進む（Issue #3180）。
+                if fk.references_parent_pseudo_id(schema) {
                     continue;
                 }
                 let names: Vec<&str> = indices
@@ -4293,7 +4296,7 @@ fn collect_action_targets(
                 // （codex-review・Cursor Bugbot 指摘・Issue #1076）。`parent_indices`
                 // は下記の `old_key` 算出で列参照 FK（`else` 分岐）にのみ使うため、
                 // `id` 参照では検索自体を行わず空のままにする。
-                let parent_indices: Vec<usize> = if fk.references_parent_id() {
+                let parent_indices: Vec<usize> = if fk.references_parent_pseudo_id(parent_schema) {
                     Vec::new()
                 } else {
                     fk.parent_columns()
@@ -4313,17 +4316,18 @@ fn collect_action_targets(
                 // （`ColumnsUpdated` 分岐の点照会 `read_parent_row_values` と異なり、
                 // 削除された行はもう `id` で読み戻せないため、キーバイト列の集合との
                 // 突合せに寄せる。`id` 参照は物理キーの点照会のままにする）。
-                let present_keys: Option<HashSet<Vec<u8>>> = if fk.references_parent_id() {
-                    None
-                } else {
-                    Some(scan_parent_key_bytes(
-                        write_txn,
-                        parent_table,
-                        parent_schema,
-                        fk,
-                        tenant_id,
-                    )?)
-                };
+                let present_keys: Option<HashSet<Vec<u8>>> =
+                    if fk.references_parent_pseudo_id(parent_schema) {
+                        None
+                    } else {
+                        Some(scan_parent_key_bytes(
+                            write_txn,
+                            parent_table,
+                            parent_schema,
+                            fk,
+                            tenant_id,
+                        )?)
+                    };
                 // 削除前キーのうち、現時点でもまだ失われたままのキー（`exists ==
                 // false`）だけを「対象になり得るキー」として先に確定する
                 // （codex-review 指摘・PR #1138: 子テーブルの走査〔次段〕を、
@@ -4333,7 +4337,7 @@ fn collect_action_targets(
                 let mut wanted_keys: HashSet<ChildKey> = HashSet::new();
                 let mut seen_keys: HashSet<ChildKey> = HashSet::new();
                 for (removed_id, old_values) in &pre.old_values {
-                    let old_key = if fk.references_parent_id() {
+                    let old_key = if fk.references_parent_pseudo_id(parent_schema) {
                         Some(ChildKey::Id(referenced_id_value_of_removed_row(
                             parent_schema,
                             *removed_id,
@@ -4394,6 +4398,7 @@ fn collect_action_targets(
                     child_schema,
                     fk,
                     tenant_id,
+                    fk.references_parent_pseudo_id(parent_schema),
                     Some(&wanted_child_keys),
                     remaining_budget,
                 )?;
@@ -4422,6 +4427,7 @@ fn collect_action_targets(
                 child_schema,
                 fk,
                 tenant_id,
+                fk.references_parent_pseudo_id(parent_schema),
                 None,
                 remaining_budget,
             )?;
@@ -4557,6 +4563,7 @@ fn collect_action_targets(
                 child_schema,
                 fk,
                 tenant_id,
+                fk.references_parent_pseudo_id(parent_schema),
                 Some(&wanted_keys),
                 remaining_budget,
             )?;
@@ -4585,7 +4592,8 @@ fn collect_action_targets(
 /// 従来方式（`LegacyId`）の表は rowid と `id` が 1:1 のため、値から rowid への写像は恒等で、
 /// 物理キーの点照会が主キー値による解決そのものになる。採番方式（`Allocated`）の表は固定文言で
 /// 0A000 により fail-closed に拒否する。子の存在検査は列参照経路（永続キー索引）へ移行済みで
-/// 本関数に到達しない（Issue #3179）。親の DELETE・連鎖は #3180 が解消する。
+/// 本関数に到達しない（Issue #3179）。親の DELETE・連鎖・遅延検査も列参照経路で処理する
+/// （Issue #3180）ため、本関数は誤分岐に対する多層防御（0A000）として残す。
 /// 呼び出し元は本 module の `id` 参照 FK の連鎖処理。
 fn parent_row_key_by_id_value<'a>(
     parent_schema: &TableSchema,
@@ -6179,6 +6187,7 @@ mod tests {
             &child_schema,
             &fk,
             "tenant-a",
+            true,
             Some(&wanted_keys),
             2,
         )
@@ -6195,6 +6204,7 @@ mod tests {
             &child_schema,
             &fk,
             "tenant-a",
+            true,
             Some(&wanted_keys),
             3,
         )

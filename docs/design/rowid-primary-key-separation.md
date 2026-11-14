@@ -245,7 +245,7 @@ SQL-17・SQL-18・SQL-20・SQL-32）。契約の詳細は spec を正とし、�
   `update_row`・`delete_row`・`get_row_from_table`・`scan_table_page`・`VectorArena::build*` を使う `search`／`batch_search`）、
   NoSQL 表層の行 op（`wire-server/http/query/gate.rs` が実行前に拒否。後続 #2201）、ファイル形 INSERT（`path`／`body`
   は採番方式の表では通常の列で、行形 INSERT として束縛する）、採番方式の親への `id` 参照 FK の実行時の検査（DDL は
-  Issue #3178 で受理済み。親の存在検査は #3179、連鎖・遅延検査は #3180）。主キーを持たない
+  Issue #3178 で受理済み。親の存在検査は #3179、連鎖・遅延検査は #3180 で対応済み）。主キーを持たない
   採番方式の親への列省略 FK は PG と同じ `42830`。
 - **ALTER**: 採番方式の表でも `ALTER TABLE` の `id` 列そのもの（ADD／DROP／RENAME／TYPE／`ADD PRIMARY KEY (id)`）は構文段で
   従来どおり拒否する（対象外）。`CREATE TABLE` で宣言した `id` は通常の列。
