@@ -200,31 +200,68 @@ impl<'a> TriggerWriteHandle<'a> {
         Ok(out)
     }
 
-    /// `table` の行の `DELETE` が参照アクション（`CASCADE`／`SET NULL`／`SET DEFAULT`）で波及しうる表の
-    /// 名前を集める（`table` 自身は含まない。`NoAction` の FK は波及しない。直接の子は CASCADE・SET NULL・SET DEFAULT
-    /// のいずれでも含め、孫以降へは CASCADE だけ辿る。循環は訪問済みで止める）。
+    /// `table` の行の `DELETE` が参照アクションで波及しうる表の名前を集める（`table` 自身は含まない）。
+    /// 連鎖は「削除された表」と「キー列が更新された表」の 2 状態で追う（`constraint` の
+    /// `propagate_referential_actions` と同じ規則）。削除された親は `ON DELETE` で、`CASCADE` なら子も削除、
+    /// `SET NULL`／`SET DEFAULT` なら子の FK 列が更新される。キー列が更新された親は、更新列を参照する FK の
+    /// `ON UPDATE`（`NoAction` 以外）で子の FK 列が更新され、その先へ続く。訪問済みは (表, 状態) 単位で持つので、
+    /// 同じ子へ SET NULL と CASCADE の別 FK で到達しても、CASCADE 側の孫以降を必ず再探索する。循環も止まる。
     /// カタログを読めない場合は `Err`（fail-closed）。
     fn cascaded_delete_tables(&self, table: &str) -> Result<Vec<String>, SqlSurfaceError> {
-        let mut seen: Vec<String> = vec![table.to_ascii_lowercase()];
-        let mut stack: Vec<String> = vec![table.to_string()];
+        use crate::catalog::ReferentialAction as Ra;
+        // 状態の訪問済み: (表名の小文字, None=削除 / Some(列名)=その列が更新)。
+        let mut seen: Vec<(String, Option<String>)> = vec![(table.to_ascii_lowercase(), None)];
+        // 探索待ち: (表名, None=削除 / Some(更新された列名の一覧))。
+        let mut stack: Vec<(String, Option<Vec<String>>)> = vec![(table.to_string(), None)];
         let mut out: Vec<String> = Vec::new();
-        while let Some(parent) = stack.pop() {
+        let start = table.to_ascii_lowercase();
+        while let Some((parent, change)) = stack.pop() {
             let referencing =
                 crate::catalog::referencing_foreign_keys_in_txn(self.write_txn, &parent).map_err(
                     |e| crate::sql::exec::map_insert_write_error(TenantWriteError::from(e)),
                 )?;
             for (child, fk) in referencing {
-                if matches!(fk.on_delete(), crate::catalog::ReferentialAction::NoAction) {
-                    continue;
-                }
+                // この FK が発火するアクションと、子で変わるもの（None=子行の削除 / Some=FK 列の更新）。
+                let (action, child_change) = match &change {
+                    None => (fk.on_delete(), None),
+                    Some(cols) => {
+                        // `id` 参照は ON UPDATE で発火しない。更新列を参照しない FK も発火しない。
+                        if fk.references_parent_id()
+                            || !fk.parent_columns().iter().any(|c| cols.contains(c))
+                        {
+                            continue;
+                        }
+                        (fk.on_update(), Some(fk.columns().to_vec()))
+                    }
+                };
+                let child_change = match action {
+                    Ra::NoAction => continue,
+                    Ra::Cascade => child_change,
+                    // SET NULL・SET DEFAULT は、どちらの経路でも子の FK 列の更新になる。
+                    _ => Some(fk.columns().to_vec()),
+                };
                 let key = child.name.to_ascii_lowercase();
-                if !seen.contains(&key) {
-                    seen.push(key);
+                if key != start && !out.iter().any(|t| t.eq_ignore_ascii_case(&child.name)) {
                     out.push(child.name.clone());
-                    // 子孫へ波及するのは CASCADE（子行を削除する）だけ。SET NULL・SET DEFAULT は子行を更新する
-                    // だけで削除しないので、その先の ON DELETE は発火しない。
-                    if matches!(fk.on_delete(), crate::catalog::ReferentialAction::Cascade) {
-                        stack.push(child.name.clone());
+                }
+                match child_change {
+                    None => {
+                        if !seen.contains(&(key.clone(), None)) {
+                            seen.push((key, None));
+                            stack.push((child.name.clone(), None));
+                        }
+                    }
+                    Some(cols) => {
+                        let mut fresh: Vec<String> = Vec::new();
+                        for c in cols {
+                            if !seen.contains(&(key.clone(), Some(c.clone()))) {
+                                seen.push((key.clone(), Some(c.clone())));
+                                fresh.push(c);
+                            }
+                        }
+                        if !fresh.is_empty() {
+                            stack.push((child.name.clone(), Some(fresh)));
+                        }
                     }
                 }
             }
@@ -242,41 +279,19 @@ impl<'a> TriggerWriteHandle<'a> {
         f(&TriggerReadSource(self.write_txn))
     }
 
-    /// `table` の行の `DELETE` が参照アクション（`CASCADE`／`SET NULL`／`SET DEFAULT`）で波及しうる表のうち、
-    /// `is_blocked` が真になるものがあるか（行ループ進行中の表の検出に使う。Issue #3187 の D6 ガードの拡張）。
-    /// 参照元 FK を外側と同じ write txn のカタログから推移的に辿る（`NoAction` の FK は波及しない）。循環は
-    /// 訪問済み集合で止める。カタログを読めない場合は検出できないので `Err`（呼び出し側は fail-closed で拒否する）。
+    /// `table` の行の `DELETE` が参照アクションで波及しうる表（[`Self::cascaded_delete_tables`] と同じ追跡。
+    /// ON UPDATE の連鎖を含む）のうち、`is_blocked` が真になるものがあるか（行ループ進行中の表の検出に使う。
+    /// Issue #3187 の D6 ガードの拡張）。カタログを読めない場合は検出できないので `Err`（呼び出し側は
+    /// fail-closed で拒否する）。
     pub(crate) fn delete_reaches_table(
         &self,
         table: &str,
         is_blocked: impl Fn(&str) -> bool,
     ) -> Result<bool, SqlSurfaceError> {
-        let mut seen: Vec<String> = vec![table.to_ascii_lowercase()];
-        let mut stack: Vec<String> = vec![table.to_string()];
-        while let Some(parent) = stack.pop() {
-            let referencing =
-                crate::catalog::referencing_foreign_keys_in_txn(self.write_txn, &parent).map_err(
-                    |e| crate::sql::exec::map_insert_write_error(TenantWriteError::from(e)),
-                )?;
-            for (child, fk) in referencing {
-                if matches!(fk.on_delete(), crate::catalog::ReferentialAction::NoAction) {
-                    continue;
-                }
-                if is_blocked(&child.name) {
-                    return Ok(true);
-                }
-                // 子孫へ辿るのは CASCADE だけ（SET NULL・SET DEFAULT は子行を更新するのみ）。
-                if !matches!(fk.on_delete(), crate::catalog::ReferentialAction::Cascade) {
-                    continue;
-                }
-                let key = child.name.to_ascii_lowercase();
-                if !seen.contains(&key) {
-                    seen.push(key);
-                    stack.push(child.name.clone());
-                }
-            }
-        }
-        Ok(false)
+        Ok(self
+            .cascaded_delete_tables(table)?
+            .iter()
+            .any(|t| is_blocked(t)))
     }
 
     /// 書いた表として記録する（重複なし。書いた順）。

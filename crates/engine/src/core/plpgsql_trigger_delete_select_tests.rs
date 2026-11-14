@@ -94,9 +94,11 @@ fn trigger(core: &EngineCore, trg: &str, spec: &str, table: &str, level: &str, f
     );
 }
 
-/// 表 `tt (n)`・`audit (n)` を作る。
+/// テナントの SCHEMA `s` の表 `s.tt (n)`（トリガの対象）と、public の `audit (n)` を作る。共有 public 表のトリガは
+/// 定義時に拒否される（Issue #3361）。本体の書き込み・読み取り先は public の裸の名前に限られる。
 fn base_tables(core: &EngineCore) {
-    ok(core, "t1", "CREATE TABLE tt (n INTEGER)");
+    ok(core, "t1", "CREATE SCHEMA s");
+    ok(core, "t1", "CREATE TABLE s.tt (n INTEGER)");
     ok(core, "t1", "CREATE TABLE audit (n INTEGER)");
 }
 
@@ -112,8 +114,8 @@ fn body_predicate_delete_applies() {
         "prune",
         "BEGIN DELETE FROM audit WHERE n = NEW.n - 1; RETURN NEW; END",
     );
-    trigger(&core, "ta", "AFTER INSERT", "tt", "ROW", "prune");
-    ok(&core, "t1", "INSERT INTO tt (n) VALUES (3)");
+    trigger(&core, "ta", "AFTER INSERT", "s.tt", "ROW", "prune");
+    ok(&core, "t1", "INSERT INTO s.tt (n) VALUES (3)");
     assert_eq!(sorted(ints(&core, "t1", "SELECT n FROM audit")), vec![1, 3]);
 }
 
@@ -122,7 +124,7 @@ fn body_predicate_delete_applies() {
 fn after_delete_row_cascades_manually() {
     let (core, _g) = core_with("trgdel-cascade", LedgerMode::Optional);
     base_tables(&core);
-    ok(&core, "t1", "INSERT INTO tt (n) VALUES (1), (2)");
+    ok(&core, "t1", "INSERT INTO s.tt (n) VALUES (1), (2)");
     ok(&core, "t1", "INSERT INTO audit (n) VALUES (1), (1), (2)");
     create_fn(
         &core,
@@ -130,13 +132,13 @@ fn after_delete_row_cascades_manually() {
         "cascade",
         "BEGIN DELETE FROM audit WHERE n = OLD.n; RETURN OLD; END",
     );
-    trigger(&core, "tc", "AFTER DELETE", "tt", "ROW", "cascade");
-    ok(&core, "t1", "DELETE FROM tt WHERE n = 1");
+    trigger(&core, "tc", "AFTER DELETE", "s.tt", "ROW", "cascade");
+    ok(&core, "t1", "DELETE FROM s.tt WHERE n = 1");
     assert_eq!(ints(&core, "t1", "SELECT n FROM audit"), vec![2]);
-    assert_eq!(ints(&core, "t1", "SELECT n FROM tt"), vec![2]);
+    assert_eq!(ints(&core, "t1", "SELECT n FROM s.tt"), vec![2]);
 }
 
-// (3) 本体の SELECT が自 txn の未 commit の変更を見る（BEFORE ROW が先の行の書き込みを数える）。
+// (3) 本体の SELECT が自 txn の未 commit の変更を見る（BEFORE ROW が、先の行で本体が書いた監査行を数える）。
 #[test]
 fn body_select_sees_rows_written_by_the_same_statement() {
     let (core, _g) = core_with("trgsel-self", LedgerMode::Optional);
@@ -145,11 +147,18 @@ fn body_select_sees_rows_written_by_the_same_statement() {
         &core,
         "t1",
         "number_rows",
-        "DECLARE c INTEGER; BEGIN SELECT count(*) INTO c FROM tt; NEW.n := c; RETURN NEW; END",
+        "DECLARE c INTEGER; BEGIN SELECT count(*) INTO c FROM audit; INSERT INTO audit (n) VALUES (c); NEW.n := c; RETURN NEW; END",
     );
-    trigger(&core, "tb", "BEFORE INSERT", "tt", "ROW", "number_rows");
-    ok(&core, "t1", "INSERT INTO tt (n) VALUES (10), (10), (10)");
-    assert_eq!(sorted(ints(&core, "t1", "SELECT n FROM tt")), vec![0, 1, 2]);
+    trigger(&core, "tb", "BEFORE INSERT", "s.tt", "ROW", "number_rows");
+    ok(&core, "t1", "INSERT INTO s.tt (n) VALUES (10), (10), (10)");
+    assert_eq!(
+        sorted(ints(&core, "t1", "SELECT n FROM s.tt")),
+        vec![0, 1, 2]
+    );
+    assert_eq!(
+        sorted(ints(&core, "t1", "SELECT n FROM audit")),
+        vec![0, 1, 2]
+    );
 }
 
 // (3) 明示 Tx の中で、先の文の未 commit の行が本体の SELECT から見える。
@@ -161,24 +170,24 @@ fn body_select_sees_uncommitted_rows_of_the_explicit_transaction() {
         &core,
         "t1",
         "log_count",
-        "DECLARE c INTEGER; BEGIN SELECT count(*) INTO c FROM audit; INSERT INTO tt (n) VALUES (c); RETURN NEW; END",
+        "DECLARE c INTEGER; BEGIN SELECT count(*) INTO c FROM audit; INSERT INTO dst (n) VALUES (c); RETURN NEW; END",
     );
-    // `tt` ではなく別表 `src` の INSERT で発火させる（自己再帰を避ける）。
-    ok(&core, "t1", "CREATE TABLE src (n INTEGER)");
-    trigger(&core, "ts", "AFTER INSERT", "src", "ROW", "log_count");
+    ok(&core, "t1", "CREATE TABLE dst (n INTEGER)");
+    ok(&core, "t1", "CREATE TABLE s.src (n INTEGER)");
+    trigger(&core, "ts", "AFTER INSERT", "s.src", "ROW", "log_count");
     let c = ctx("t1");
     let mut s = session();
     let mut txn = core.new_session_transaction();
     for sql in [
         "BEGIN",
         "INSERT INTO audit (n) VALUES (1), (2)",
-        "INSERT INTO src (n) VALUES (9)",
+        "INSERT INTO s.src (n) VALUES (9)",
         "COMMIT",
     ] {
         core.execute_sql_in_txn(&c, &mut s, &mut txn, sql)
             .unwrap_or_else(|e| panic!("{sql}: {e:?}"));
     }
-    assert_eq!(ints(&core, "t1", "SELECT n FROM tt"), vec![2]);
+    assert_eq!(ints(&core, "t1", "SELECT n FROM dst"), vec![2]);
 }
 
 // (3) `PERFORM`・`FOR r IN SELECT ... LOOP` も通る。
@@ -194,56 +203,17 @@ fn perform_and_for_select_loop_work() {
         "DECLARE r RECORD; total INTEGER := 0; BEGIN PERFORM n FROM audit; \
          FOR r IN SELECT n FROM audit LOOP total := total + r.n; END LOOP; NEW.n := total; RETURN NEW; END",
     );
-    trigger(&core, "tb", "BEFORE INSERT", "tt", "ROW", "sum_audit");
-    ok(&core, "t1", "INSERT INTO tt (n) VALUES (0)");
-    assert_eq!(ints(&core, "t1", "SELECT n FROM tt"), vec![6]);
+    trigger(&core, "tb", "BEFORE INSERT", "s.tt", "ROW", "sum_audit");
+    ok(&core, "t1", "INSERT INTO s.tt (n) VALUES (0)");
+    assert_eq!(ints(&core, "t1", "SELECT n FROM s.tt"), vec![6]);
 }
 
-// (4) 発火表そのものを読む・消す（表ハンドルの再入確認）。BEFORE ROW・AFTER ROW・AFTER STATEMENT で読み、
-// ループ後の AFTER ROW・AFTER STATEMENT では同じ表を消せる。
-#[test]
-fn firing_table_can_be_read_everywhere_and_deleted_after_the_loop() {
-    let (core, _g) = core_with("trgdel-self", LedgerMode::Optional);
-    base_tables(&core);
-    ok(&core, "t1", "INSERT INTO tt (n) VALUES (1), (2), (3)");
-    create_fn(
-        &core,
-        "t1",
-        "read_self",
-        "DECLARE c INTEGER; BEGIN SELECT count(*) INTO c FROM tt; INSERT INTO audit (n) VALUES (c); RETURN NEW; END",
-    );
-    trigger(&core, "tb", "BEFORE INSERT", "tt", "ROW", "read_self");
-    trigger(&core, "ta", "AFTER INSERT", "tt", "ROW", "read_self");
-    trigger(&core, "ts", "AFTER INSERT", "tt", "STATEMENT", "read_self");
-    ok(&core, "t1", "INSERT INTO tt (n) VALUES (4)");
-    // BEFORE ROW は 3 行・AFTER ROW と AFTER STATEMENT は 4 行を見る。
-    assert_eq!(
-        sorted(ints(&core, "t1", "SELECT n FROM audit")),
-        vec![3, 4, 4]
-    );
-
-    ok(&core, "t1", "DROP TRIGGER tb ON tt");
-    ok(&core, "t1", "DROP TRIGGER ta ON tt");
-    ok(&core, "t1", "DROP TRIGGER ts ON tt");
-    create_fn(
-        &core,
-        "t1",
-        "prune_self",
-        "BEGIN DELETE FROM tt WHERE n < 3; RETURN NEW; END",
-    );
-    trigger(&core, "tp", "AFTER INSERT", "tt", "ROW", "prune_self");
-    ok(&core, "t1", "INSERT INTO tt (n) VALUES (5)");
-    assert_eq!(sorted(ints(&core, "t1", "SELECT n FROM tt")), vec![3, 4, 5]);
-    create_fn(
-        &core,
-        "t1",
-        "prune_stmt",
-        "BEGIN DELETE FROM tt WHERE n = 5; RETURN NULL; END",
-    );
-    trigger(&core, "tq", "AFTER INSERT", "tt", "STATEMENT", "prune_stmt");
-    ok(&core, "t1", "INSERT INTO tt (n) VALUES (6)");
-    assert_eq!(sorted(ints(&core, "t1", "SELECT n FROM tt")), vec![3, 4, 6]);
-}
+// 注記（Issue #3361）: 本体の `SELECT`・`DELETE` の対象は共有 `public` 表の裸の名前に限られる（SCHEMA 修飾は窓口の
+// 許可リスト外）一方、共有 `public` 表のトリガは定義時に拒否される。そのため「トリガ表と本体の読み書き先が同じ表」
+// になる形（発火表そのものの読み取り・ループ後の削除、自己・相互再帰の深さ上限 `54001`、行ループ中の同表 `DELETE` の
+// D6 安全弁）は SQL から構成できない。D6 の判定は `tenant/trigger_row_loop.rs`、深さ上限は注入 invoker の
+// `core/trigger_depth_tests.rs` が担う。本体の書き込み先に SCHEMA 修飾を許す拡張が入った時点で、本体 SQL 経由の
+// 検証をここへ戻す（スコープ外）。
 
 // (5) 外側の文を末尾 `;` 付きで送っても、本体の DELETE・SELECT が効く。
 #[test]
@@ -258,8 +228,8 @@ fn trailing_semicolon_outer_statements_fire_body_delete_and_select() {
         "DECLARE c INTEGER; BEGIN SELECT count(*) INTO c FROM audit; DELETE FROM audit WHERE n = NEW.n; \
          INSERT INTO audit (n) VALUES (c * 10); RETURN NEW; END",
     );
-    trigger(&core, "ta", "AFTER INSERT", "tt", "ROW", "swap");
-    ok(&core, "t1", "INSERT INTO tt (n) VALUES (1);");
+    trigger(&core, "ta", "AFTER INSERT", "s.tt", "ROW", "swap");
+    ok(&core, "t1", "INSERT INTO s.tt (n) VALUES (1);");
     assert_eq!(
         sorted(ints(&core, "t1", "SELECT n FROM audit")),
         vec![2, 20]
@@ -270,8 +240,8 @@ fn trailing_semicolon_outer_statements_fire_body_delete_and_select() {
         "on_del",
         "BEGIN DELETE FROM audit WHERE n = 2; RETURN OLD; END",
     );
-    trigger(&core, "td", "AFTER DELETE", "tt", "ROW", "on_del");
-    ok(&core, "t1", "DELETE FROM tt WHERE n = 1;");
+    trigger(&core, "td", "AFTER DELETE", "s.tt", "ROW", "on_del");
+    ok(&core, "t1", "DELETE FROM s.tt WHERE n = 1;");
     assert_eq!(ints(&core, "t1", "SELECT n FROM audit"), vec![20]);
 }
 
@@ -290,13 +260,16 @@ fn body_select_and_delete_stay_inside_the_tenant() {
         "DECLARE c INTEGER; BEGIN SELECT count(*) INTO c FROM audit WHERE n = 7; NEW.n := c; \
          DELETE FROM audit WHERE n = 7; RETURN NEW; END",
     );
-    trigger(&core, "tb", "BEFORE INSERT", "tt", "ROW", "wipe");
-    ok(&core, "t1", "INSERT INTO tt (n) VALUES (0)");
-    assert_eq!(ints(&core, "t1", "SELECT n FROM tt"), vec![2]);
+    // t2 にも同じ SCHEMA・表を用意する（トリガは t1 だけが持つ）。
+    ok(&core, "t2", "CREATE SCHEMA s");
+    ok(&core, "t2", "CREATE TABLE s.tt (n INTEGER)");
+    trigger(&core, "tb", "BEFORE INSERT", "s.tt", "ROW", "wipe");
+    ok(&core, "t1", "INSERT INTO s.tt (n) VALUES (0)");
+    assert_eq!(ints(&core, "t1", "SELECT n FROM s.tt"), vec![2]);
     assert!(ints(&core, "t1", "SELECT n FROM audit").is_empty());
     assert_eq!(ints(&core, "t2", "SELECT n FROM audit"), vec![7, 7]);
     // 他テナントの関数は t2 から見えない（トリガも持たない）ので、t2 の挿入は何も消さない。
-    ok(&core, "t2", "INSERT INTO tt (n) VALUES (0)");
+    ok(&core, "t2", "INSERT INTO s.tt (n) VALUES (0)");
     assert_eq!(ints(&core, "t2", "SELECT n FROM audit"), vec![7, 7]);
 }
 
@@ -349,40 +322,25 @@ fn body_delete_and_select_are_checked_against_the_firing_role() {
             Err(e) => e.wire_code().to_string(),
         }
     };
-    admin_run("CREATE TABLE tt (n INTEGER)");
+    admin_run("CREATE SCHEMA s");
+    admin_run("CREATE TABLE s.tt (n INTEGER)");
     admin_run("CREATE TABLE audit (n INTEGER)");
     admin_run("INSERT INTO audit (n) VALUES (1)");
     admin_run(
         "CREATE FUNCTION prune() RETURNS trigger LANGUAGE plpgsql AS $$ \
          DECLARE c INTEGER; BEGIN SELECT count(*) INTO c FROM audit; DELETE FROM audit; RETURN NEW; END $$",
     );
-    admin_run("CREATE TRIGGER tb BEFORE INSERT ON tt FOR EACH ROW EXECUTE FUNCTION prune()");
-    admin_run("GRANT INSERT ON tt TO alice");
-    assert_eq!(alice_code("INSERT INTO tt (n) VALUES (1)"), "42501");
+    admin_run("CREATE TRIGGER tb BEFORE INSERT ON s.tt FOR EACH ROW EXECUTE FUNCTION prune()");
+    admin_run("GRANT USAGE ON SCHEMA s TO alice");
+    admin_run("GRANT INSERT ON s.tt TO alice");
+    assert_eq!(alice_code("INSERT INTO s.tt (n) VALUES (1)"), "42501");
     assert_eq!(ints(&core, "t1", "SELECT n FROM audit"), vec![1]);
     admin_run("GRANT SELECT ON audit TO alice");
-    assert_eq!(alice_code("INSERT INTO tt (n) VALUES (1)"), "42501");
+    assert_eq!(alice_code("INSERT INTO s.tt (n) VALUES (1)"), "42501");
     assert_eq!(ints(&core, "t1", "SELECT n FROM audit"), vec![1]);
     admin_run("GRANT DELETE ON audit TO alice");
-    assert_eq!(alice_code("INSERT INTO tt (n) VALUES (1)"), "ok");
+    assert_eq!(alice_code("INSERT INTO s.tt (n) VALUES (1)"), "ok");
     assert!(ints(&core, "t1", "SELECT n FROM audit").is_empty());
-}
-
-// (9) 深さ上限: AFTER STATEMENT DELETE トリガの本体が同じ表を `DELETE` すると 0 行でも再発火し、`54001`。
-#[test]
-fn recursive_body_delete_hits_the_depth_limit() {
-    let (core, _g) = core_with("trgdel-depth", LedgerMode::Optional);
-    ok(&core, "t1", "CREATE TABLE r (n INTEGER)");
-    ok(&core, "t1", "INSERT INTO r (n) VALUES (1)");
-    create_fn(
-        &core,
-        "t1",
-        "again",
-        "BEGIN DELETE FROM r; RETURN NULL; END",
-    );
-    trigger(&core, "tr", "AFTER DELETE", "r", "STATEMENT", "again");
-    assert_eq!(code(&core, "t1", "DELETE FROM r"), "54001");
-    assert_eq!(ints(&core, "t1", "SELECT n FROM r"), vec![1]);
 }
 
 // (10) 台帳: 台帳必須の構成でも、外側の `USING OPERATION_ID` が発火させた本体の DELETE は `23502` にならず、
@@ -404,7 +362,7 @@ fn ledgered_core_body_delete_records_only_the_outer_statement() {
     ok(
         &core,
         "t1",
-        "INSERT INTO tt (n) VALUES (1) USING OPERATION_ID 'seed-c'",
+        "INSERT INTO s.tt (n) VALUES (1) USING OPERATION_ID 'seed-c'",
     );
     create_fn(
         &core,
@@ -412,8 +370,8 @@ fn ledgered_core_body_delete_records_only_the_outer_statement() {
         "prune",
         "BEGIN DELETE FROM audit WHERE n = OLD.n; DELETE FROM audit WHERE n = 2; RETURN OLD; END",
     );
-    trigger(&core, "td", "AFTER DELETE", "tt", "ROW", "prune");
-    let sql = "DELETE FROM tt WHERE n = 1 USING OPERATION_ID 'op-del'";
+    trigger(&core, "td", "AFTER DELETE", "s.tt", "ROW", "prune");
+    let sql = "DELETE FROM s.tt WHERE n = 1 USING OPERATION_ID 'op-del'";
     ok(&core, "t1", sql);
     assert!(ints(&core, "t1", "SELECT n FROM audit").is_empty());
     ok(
@@ -440,10 +398,11 @@ fn forms_outside_the_allowlist_are_rejected_without_side_effects() {
     let (core, _g) = core_with("trgdel-reject", LedgerMode::Optional);
     base_tables(&core);
     ok(&core, "t1", "CREATE VIEW av AS SELECT n FROM audit");
+    ok(&core, "t1", "CREATE TABLE src (n INTEGER)");
     ok(&core, "t1", "INSERT INTO audit (n) VALUES (1)");
     for (i, stmt) in [
         "DELETE FROM audit RETURNING n",
-        "DELETE FROM audit USING tt WHERE audit.n = tt.n",
+        "DELETE FROM audit USING src WHERE audit.n = src.n",
         "WITH d AS (DELETE FROM audit RETURNING n) SELECT n FROM d",
         "DELETE FROM av",
     ]
@@ -457,69 +416,13 @@ fn forms_outside_the_allowlist_are_rejected_without_side_effects() {
             &f,
             &format!("DECLARE x INTEGER; BEGIN INSERT INTO audit (n) VALUES (50); {stmt}; RETURN NEW; END"),
         );
-        ok(&core, "t1", "DROP TRIGGER IF EXISTS tb ON tt");
-        trigger(&core, "tb", "BEFORE INSERT", "tt", "ROW", &f);
-        let c = code(&core, "t1", "INSERT INTO tt (n) VALUES (1)");
+        ok(&core, "t1", "DROP TRIGGER IF EXISTS tb ON s.tt");
+        trigger(&core, "tb", "BEFORE INSERT", "s.tt", "ROW", &f);
+        let c = code(&core, "t1", "INSERT INTO s.tt (n) VALUES (1)");
         assert!(c == "0A000" || c == "42601", "{stmt}: unexpected code {c}");
-        assert!(ints(&core, "t1", "SELECT n FROM tt").is_empty(), "{stmt}");
+        assert!(ints(&core, "t1", "SELECT n FROM s.tt").is_empty(), "{stmt}");
         assert_eq!(ints(&core, "t1", "SELECT n FROM audit"), vec![1], "{stmt}");
     }
-}
-
-// (12) 自己変更のガード: 外側の行ループが進行中の表への本体の `DELETE` は `0A000` で、外側の文全体が取り消される。
-//
-// intentional: docs/design/trigger-update-delete.md
-// PG は `27000` を返す形（行単位の検出）。本実装は表単位の暫定ガードで `0A000`（D6 の既知の差。`ErrorClass` に
-// 対応 variant が無い）。
-#[test]
-fn deleting_the_table_being_modified_in_a_row_loop_is_rejected() {
-    let (core, _g) = core_with("trgdel-selfmod", LedgerMode::Optional);
-    base_tables(&core);
-    ok(&core, "t1", "INSERT INTO tt (n) VALUES (1), (2)");
-    create_fn(
-        &core,
-        "t1",
-        "eat_self",
-        "BEGIN DELETE FROM tt WHERE n = 2; RETURN NEW; END",
-    );
-    // INSERT の BEFORE ROW。
-    trigger(&core, "tb", "BEFORE INSERT", "tt", "ROW", "eat_self");
-    assert_eq!(
-        code(&core, "t1", "INSERT INTO tt (n) VALUES (3), (4)"),
-        "0A000"
-    );
-    assert_eq!(sorted(ints(&core, "t1", "SELECT n FROM tt")), vec![1, 2]);
-    ok(&core, "t1", "DROP TRIGGER tb ON tt");
-    // DELETE の BEFORE ROW（未処理の候補行を消す形）。
-    create_fn(
-        &core,
-        "t1",
-        "eat_other",
-        "BEGIN DELETE FROM tt WHERE n = 2; RETURN OLD; END",
-    );
-    trigger(&core, "tb", "BEFORE DELETE", "tt", "ROW", "eat_other");
-    assert_eq!(code(&core, "t1", "DELETE FROM tt WHERE n > 0"), "0A000");
-    assert_eq!(sorted(ints(&core, "t1", "SELECT n FROM tt")), vec![1, 2]);
-    // 別表を経由して元の表へ戻る連鎖も拒否される（BEFORE ROW の本体が別表を消し、その AFTER DELETE が元の表を消す）。
-    ok(&core, "t1", "DROP TRIGGER tb ON tt");
-    ok(&core, "t1", "INSERT INTO audit (n) VALUES (1)");
-    create_fn(
-        &core,
-        "t1",
-        "eat_audit",
-        "BEGIN DELETE FROM audit; RETURN OLD; END",
-    );
-    trigger(&core, "tb", "BEFORE DELETE", "tt", "ROW", "eat_audit");
-    create_fn(
-        &core,
-        "t1",
-        "eat_tt",
-        "BEGIN DELETE FROM tt WHERE n = 2; RETURN OLD; END",
-    );
-    trigger(&core, "tc", "AFTER DELETE", "audit", "ROW", "eat_tt");
-    assert_eq!(code(&core, "t1", "DELETE FROM tt WHERE n = 1"), "0A000");
-    assert_eq!(sorted(ints(&core, "t1", "SELECT n FROM tt")), vec![1, 2]);
-    assert_eq!(ints(&core, "t1", "SELECT n FROM audit"), vec![1]);
 }
 
 // (13) EXCEPTION 節: ブロック内で DELETE した後の `RAISE` は捕捉されず `0A000`（書き込みを巻き戻せない）。
@@ -543,13 +446,16 @@ fn exception_block_does_not_catch_after_a_body_delete() {
         &core,
         "tb",
         "BEFORE INSERT",
-        "tt",
+        "s.tt",
         "ROW",
         "catch_after_delete",
     );
-    assert_eq!(code(&core, "t1", "INSERT INTO tt (n) VALUES (2)"), "0A000");
+    assert_eq!(
+        code(&core, "t1", "INSERT INTO s.tt (n) VALUES (2)"),
+        "0A000"
+    );
     assert_eq!(ints(&core, "t1", "SELECT n FROM audit"), vec![1]);
-    assert!(ints(&core, "t1", "SELECT n FROM tt").is_empty());
+    assert!(ints(&core, "t1", "SELECT n FROM s.tt").is_empty());
 }
 
 // (14) 明示 Tx で本体のエラーが起きると Tx は `Failed`（`25P02`）になり、ROLLBACK 後に何も残らない。
@@ -564,14 +470,14 @@ fn body_delete_error_in_explicit_transaction_fails_the_transaction() {
         "boom",
         "BEGIN DELETE FROM audit; RAISE EXCEPTION 'boom'; END",
     );
-    trigger(&core, "tb", "BEFORE INSERT", "tt", "ROW", "boom");
+    trigger(&core, "tb", "BEFORE INSERT", "s.tt", "ROW", "boom");
     let c = ctx("t1");
     let mut s = session();
     let mut txn = core.new_session_transaction();
     core.execute_sql_in_txn(&c, &mut s, &mut txn, "BEGIN")
         .expect("begin");
     let e = core
-        .execute_sql_in_txn(&c, &mut s, &mut txn, "INSERT INTO tt (n) VALUES (1)")
+        .execute_sql_in_txn(&c, &mut s, &mut txn, "INSERT INTO s.tt (n) VALUES (1)")
         .expect_err("trigger body raises");
     assert_eq!(e.wire_code(), "P0001");
     let e = core
@@ -581,7 +487,7 @@ fn body_delete_error_in_explicit_transaction_fails_the_transaction() {
     core.execute_sql_in_txn(&c, &mut s, &mut txn, "ROLLBACK")
         .expect("rollback");
     assert_eq!(ints(&core, "t1", "SELECT n FROM audit"), vec![1]);
-    assert!(ints(&core, "t1", "SELECT n FROM tt").is_empty());
+    assert!(ints(&core, "t1", "SELECT n FROM s.tt").is_empty());
 }
 
 // (16) `42702`: 変数名と列名が衝突する本体の DELETE は拒否される。
@@ -596,8 +502,11 @@ fn body_delete_with_variable_column_clash_is_ambiguous() {
         "clash",
         "DECLARE n INTEGER := 1; BEGIN DELETE FROM audit WHERE n = n; RETURN NEW; END",
     );
-    trigger(&core, "tb", "BEFORE INSERT", "tt", "ROW", "clash");
-    assert_eq!(code(&core, "t1", "INSERT INTO tt (n) VALUES (1)"), "42702");
+    trigger(&core, "tb", "BEFORE INSERT", "s.tt", "ROW", "clash");
+    assert_eq!(
+        code(&core, "t1", "INSERT INTO s.tt (n) VALUES (1)"),
+        "42702"
+    );
     assert_eq!(ints(&core, "t1", "SELECT n FROM audit"), vec![1]);
 }
 
@@ -616,17 +525,18 @@ fn body_delete_where_subquery_sees_uncommitted_rows() {
         "t1",
         "INSERT INTO audit (n) VALUES (2) USING OPERATION_ID 'a2'",
     );
+    ok(&core, "t1", "CREATE TABLE src (n INTEGER)");
     create_fn(
         &core,
         "t1",
         "sub",
-        "BEGIN DELETE FROM audit WHERE n IN (SELECT n FROM tt); RETURN NEW; END",
+        "BEGIN INSERT INTO src (n) VALUES (NEW.n); DELETE FROM audit WHERE n IN (SELECT n FROM src); RETURN NEW; END",
     );
-    trigger(&core, "ta", "AFTER INSERT", "tt", "ROW", "sub");
+    trigger(&core, "ta", "AFTER INSERT", "s.tt", "ROW", "sub");
     ok(
         &core,
         "t1",
-        "INSERT INTO tt (n) VALUES (2) USING OPERATION_ID 'o1'",
+        "INSERT INTO s.tt (n) VALUES (2) USING OPERATION_ID 'o1'",
     );
     assert_eq!(ints(&core, "t1", "SELECT n FROM audit"), vec![1]);
 }
@@ -644,39 +554,9 @@ fn body_select_through_a_simple_view_reads_the_base_table() {
         "via_view",
         "DECLARE c INTEGER; BEGIN SELECT count(*) INTO c FROM av; NEW.n := c; RETURN NEW; END",
     );
-    trigger(&core, "tb", "BEFORE INSERT", "tt", "ROW", "via_view");
-    ok(&core, "t1", "INSERT INTO tt (n) VALUES (0)");
-    assert_eq!(ints(&core, "t1", "SELECT n FROM tt"), vec![2]);
-}
-
-// 行ループ進行中の表へ FK 参照アクション（ON DELETE CASCADE）で波及する本体の `DELETE` も拒否される（D6 の暫定ガード）。
-// 子表への外側 INSERT の BEFORE ROW が親表を消すと、子の行が連鎖で消えるため `0A000`。
-//
-// intentional: docs/design/trigger-update-delete.md
-#[test]
-fn delete_cascading_into_the_table_in_a_row_loop_is_rejected() {
-    let (core, _g) = core_with("trgdel-fkcascade", LedgerMode::Optional);
-    ok(&core, "t1", "CREATE TABLE parent (k BIGINT PRIMARY KEY)");
-    ok(
-        &core,
-        "t1",
-        "CREATE TABLE child (n BIGINT, pid BIGINT REFERENCES parent ON DELETE CASCADE)",
-    );
-    ok(&core, "t1", "INSERT INTO parent (k) VALUES (1), (2)");
-    ok(&core, "t1", "INSERT INTO child (n, pid) VALUES (10, 1)");
-    create_fn(
-        &core,
-        "t1",
-        "eat_parent",
-        "BEGIN DELETE FROM parent WHERE k = 1; RETURN NEW; END",
-    );
-    trigger(&core, "tb", "BEFORE INSERT", "child", "ROW", "eat_parent");
-    assert_eq!(
-        code(&core, "t1", "INSERT INTO child (n, pid) VALUES (11, 2)"),
-        "0A000"
-    );
-    assert_eq!(ints(&core, "t1", "SELECT n FROM child"), vec![10]);
-    assert_eq!(ints(&core, "t1", "SELECT k FROM parent").len(), 2);
+    trigger(&core, "tb", "BEFORE INSERT", "s.tt", "ROW", "via_view");
+    ok(&core, "t1", "INSERT INTO s.tt (n) VALUES (0)");
+    assert_eq!(ints(&core, "t1", "SELECT n FROM s.tt"), vec![2]);
 }
 
 // P0（Cursor Bugbot 指摘）: 本体の `DELETE` が参照アクションで波及させた表（孫以降を含む）も書いた表として
@@ -705,10 +585,13 @@ fn body_delete_cascade_target_is_checked_by_deferred_foreign_keys() {
         "eat_gp",
         "BEGIN DELETE FROM gp WHERE k = 1; RETURN NEW; END",
     );
-    trigger(&core, "ta", "AFTER INSERT", "tt", "ROW", "eat_gp");
+    trigger(&core, "ta", "AFTER INSERT", "s.tt", "ROW", "eat_gp");
 
-    assert_eq!(code(&core, "t1", "INSERT INTO tt (n) VALUES (1)"), "23503");
-    assert!(ints(&core, "t1", "SELECT n FROM tt").is_empty());
+    assert_eq!(
+        code(&core, "t1", "INSERT INTO s.tt (n) VALUES (1)"),
+        "23503"
+    );
+    assert!(ints(&core, "t1", "SELECT n FROM s.tt").is_empty());
     assert_eq!(ints(&core, "t1", "SELECT k FROM gc"), vec![10]);
 
     let c = ctx("t1");
@@ -716,50 +599,143 @@ fn body_delete_cascade_target_is_checked_by_deferred_foreign_keys() {
     let mut txn = core.new_session_transaction();
     core.execute_sql_in_txn(&c, &mut s, &mut txn, "BEGIN")
         .expect("begin");
-    core.execute_sql_in_txn(&c, &mut s, &mut txn, "INSERT INTO tt (n) VALUES (1)")
+    core.execute_sql_in_txn(&c, &mut s, &mut txn, "INSERT INTO s.tt (n) VALUES (1)")
         .expect("deferred check waits for COMMIT");
     let e = core
         .execute_sql_in_txn(&c, &mut s, &mut txn, "COMMIT")
         .expect_err("deferred FK violation on the cascaded table");
     assert_eq!(e.wire_code(), "23503");
-    assert!(ints(&core, "t1", "SELECT n FROM tt").is_empty());
+    assert!(ints(&core, "t1", "SELECT n FROM s.tt").is_empty());
     assert_eq!(ints(&core, "t1", "SELECT k FROM gc"), vec![10]);
 }
 
-// Cursor Bugbot 指摘の回帰: `SET NULL` は子行を更新するだけで削除しないので、その先の子孫表の `ON DELETE` は
-// 発火しない。本体の `DELETE` が `SET NULL` 連鎖越しに行ループ中の表へ「届く」扱いで `0A000` にならず、
-// 子孫表の行も変わらない。直接の子（`sc`）への `SET NULL` は従来どおり反映される。
+// codex・Bugbot 指摘の回帰: 同じ子表へ SET NULL の FK が先に、CASCADE の FK が後に到達しても、CASCADE 側の孫表
+// （遅延 FK の子）が書いた表として記録され、COMMIT 時（autocommit は文末）に `23503` になる。
 #[test]
-fn delete_through_set_null_does_not_reach_grandchild_in_a_row_loop() {
-    let (core, _g) = core_with("trgdel-setnull-chain", LedgerMode::Optional);
-    ok(&core, "t1", "CREATE TABLE sp (k BIGINT PRIMARY KEY)");
+fn set_null_then_cascade_on_same_child_still_records_grandchild() {
+    let (core, _g) = core_with("trgdel-setnull-cascade", LedgerMode::Optional);
+    base_tables(&core);
+    ok(&core, "t1", "CREATE TABLE xp (k BIGINT PRIMARY KEY)");
     ok(
         &core,
         "t1",
-        "CREATE TABLE sc (k BIGINT PRIMARY KEY, pid BIGINT REFERENCES sp ON DELETE SET NULL)",
+        "CREATE TABLE xc (k BIGINT PRIMARY KEY, a BIGINT REFERENCES xp ON DELETE SET NULL, b BIGINT REFERENCES xp ON DELETE CASCADE)",
     );
     ok(
         &core,
         "t1",
-        "CREATE TABLE sg (n BIGINT, cid BIGINT REFERENCES sc ON DELETE CASCADE)",
+        "CREATE TABLE xg (cid BIGINT REFERENCES xc DEFERRABLE INITIALLY DEFERRED)",
     );
-    ok(&core, "t1", "INSERT INTO sp (k) VALUES (1), (2)");
-    ok(&core, "t1", "INSERT INTO sc (k, pid) VALUES (10, 1)");
-    ok(&core, "t1", "INSERT INTO sg (n, cid) VALUES (100, 10)");
+    ok(&core, "t1", "INSERT INTO xp (k) VALUES (1)");
+    ok(&core, "t1", "INSERT INTO xc (k, a, b) VALUES (10, 1, 1)");
+    ok(&core, "t1", "INSERT INTO xg (cid) VALUES (10)");
     create_fn(
         &core,
         "t1",
-        "eat_sp",
-        "BEGIN DELETE FROM sp WHERE k = 1; RETURN NEW; END",
+        "eat_xp",
+        "BEGIN DELETE FROM xp WHERE k = 1; RETURN NEW; END",
     );
-    // 行ループ中の表は sg。sp の削除は sc を SET NULL するだけで sg には届かない。
-    trigger(&core, "tb", "BEFORE INSERT", "sg", "ROW", "eat_sp");
-    ok(&core, "t1", "INSERT INTO sg (n, cid) VALUES (101, 10)");
+    trigger(&core, "ta", "AFTER INSERT", "s.tt", "ROW", "eat_xp");
     assert_eq!(
-        sorted(ints(&core, "t1", "SELECT n FROM sg")),
-        vec![100, 101]
+        code(&core, "t1", "INSERT INTO s.tt (n) VALUES (1)"),
+        "23503"
     );
-    assert_eq!(ints(&core, "t1", "SELECT k FROM sc"), vec![10]);
-    assert_eq!(ints(&core, "t1", "SELECT k FROM sp"), vec![2]);
-    assert!(ints(&core, "t1", "SELECT k FROM sc WHERE pid IS NOT NULL").is_empty());
+    assert!(ints(&core, "t1", "SELECT n FROM s.tt").is_empty());
+    assert_eq!(ints(&core, "t1", "SELECT k FROM xc"), vec![10]);
+}
+
+// 行ループ中の表の検出（D6 ガード）と書いた表の記録が使う参照アクションの追跡を、窓口へ直接当てて固定する。
+// 注記（Issue #3361）: 行ループ中の表はテナント SCHEMA 配下の表で、そこへ波及させる本体の `DELETE` は public 表に
+// 限られるが、SCHEMA 配下の表は public 表を参照できない（`SchemaDependencyForbidden`）ため、SQL からは
+// 組めない。追跡の関数を直接呼ぶ。`setup` の DDL を実行したあと、`start` の `DELETE` が届く表（小文字・整列済み）を返す。
+fn reached_by_delete(core: &EngineCore, setup: &[&str], start: &str) -> Vec<String> {
+    for sql in setup {
+        ok(core, "t1", sql);
+    }
+    let pctx = ctx("t1");
+    let txn = core.storage.begin_write_txn().expect("txn");
+    let handle = crate::trigger::write_handle::TriggerWriteHandle::new(&txn, &pctx, None);
+    let seen = std::cell::RefCell::new(Vec::new());
+    let blocked = handle
+        .delete_reaches_table(start, |t| {
+            seen.borrow_mut().push(t.to_ascii_lowercase());
+            false
+        })
+        .expect("catalog readable");
+    assert!(!blocked);
+    let mut v = seen.into_inner();
+    v.sort();
+    v
+}
+
+// 子行を `CASCADE` で消すと、その先の `ON DELETE CASCADE` の孫表も届く。
+#[test]
+fn delete_cascade_reaches_grandchild() {
+    let (core, _g) = core_with("trgdel-reach-cascade", LedgerMode::Optional);
+    let got = reached_by_delete(
+        &core,
+        &[
+            "CREATE TABLE parent (k BIGINT PRIMARY KEY)",
+            "CREATE TABLE child (k BIGINT PRIMARY KEY, pid BIGINT REFERENCES parent ON DELETE CASCADE)",
+            "CREATE TABLE gchild (n BIGINT, cid BIGINT REFERENCES child ON DELETE CASCADE)",
+            // NO ACTION の子は波及しない。
+            "CREATE TABLE inert (n BIGINT, pid BIGINT REFERENCES parent)",
+        ],
+        "parent",
+    );
+    assert_eq!(got, vec!["child", "gchild"]);
+}
+
+// Cursor Bugbot 指摘の回帰: `SET NULL` は子行を更新するだけで削除しないので、更新された列を参照しない孫表の
+// `ON DELETE` は発火しない（`sg` は `sc.k` を参照し、更新される列は `sc.pid`）。
+#[test]
+fn delete_through_set_null_does_not_reach_grandchild() {
+    let (core, _g) = core_with("trgdel-reach-setnull", LedgerMode::Optional);
+    let got = reached_by_delete(
+        &core,
+        &[
+            "CREATE TABLE sp (k BIGINT PRIMARY KEY)",
+            "CREATE TABLE sc (k BIGINT PRIMARY KEY, pid BIGINT REFERENCES sp ON DELETE SET NULL)",
+            "CREATE TABLE sg (n BIGINT, cid BIGINT REFERENCES sc ON DELETE CASCADE)",
+        ],
+        "sp",
+    );
+    assert_eq!(got, vec!["sc"]);
+}
+
+// codex・Bugbot 指摘の回帰: 同じ子表へ SET NULL の FK が先に、CASCADE の FK が後に到達しても、CASCADE 側の孫表が
+// 探索される（SET NULL で訪問済みにした表を CASCADE で再探索しない欠陥の再発防止）。
+#[test]
+fn set_null_then_cascade_on_same_child_still_reaches_grandchild() {
+    let (core, _g) = core_with("trgdel-reach-setnull-cascade", LedgerMode::Optional);
+    let got = reached_by_delete(
+        &core,
+        &[
+            "CREATE TABLE xp (k BIGINT PRIMARY KEY)",
+            "CREATE TABLE xc (k BIGINT PRIMARY KEY, a BIGINT REFERENCES xp ON DELETE SET NULL, b BIGINT REFERENCES xp ON DELETE CASCADE)",
+            "CREATE TABLE xg (cid BIGINT REFERENCES xc ON DELETE CASCADE)",
+        ],
+        "xp",
+    );
+    assert_eq!(got, vec!["xc", "xg"]);
+}
+
+// codex 指摘の回帰: SET NULL・SET DEFAULT で子のキー列が変わると、そのキーを参照する孫の ON UPDATE の参照アクションが
+// 波及する。`NO ACTION` の孫は波及しない。
+#[test]
+fn delete_through_set_default_reaches_on_update_chain() {
+    let (core, _g) = core_with("trgdel-reach-onupdate", LedgerMode::Optional);
+    let got = reached_by_delete(
+        &core,
+        &[
+            "CREATE TABLE dp (k BIGINT PRIMARY KEY)",
+            "CREATE TABLE dc (k BIGINT PRIMARY KEY, pid BIGINT UNIQUE DEFAULT 99 REFERENCES dp ON DELETE SET DEFAULT)",
+            "CREATE TABLE dg (n BIGINT UNIQUE, cp BIGINT REFERENCES dc (pid) ON UPDATE CASCADE)",
+            // さらにその先（dg.n を参照する表）へは、dg の更新列が cp なので届かないが、cp を参照する表へは届く。
+            "CREATE TABLE dgg (m BIGINT REFERENCES dg (n))",
+            "CREATE TABLE dnone (cp BIGINT REFERENCES dc (pid))",
+        ],
+        "dp",
+    );
+    assert_eq!(got, vec!["dc", "dg"]);
 }
