@@ -65,9 +65,11 @@ AFTER の失敗は文全体の失敗で、同じ write txn の単一 commit な�
 ## PostgreSQL との差
 
 - 同じ文で複数トリガが同じ行を触る場合の自己変更の衝突（27000。D6）は行単位では検出しない。
-  トリガ本体の `DELETE`（Issue #3187）は、外側の行ループが進行中の表を対象にすると、表単位の暫定ガード
-  （`trigger::row_loop`）が固定文言の `0A000` で拒否する。`27000` を返す行単位の検出は、`ErrorClass` への
-  variant 追加（公開 enum の破壊的変更）と合わせた後続の課題。本体の `UPDATE` は #3186
+  Issue #3186 で窓口に UPDATE が入ったため、BEFORE ROW の行ごとループの最中の同表 `UPDATE` は表単位の `0A000` で
+  塞いだ（[plpgsql-subset.md](plpgsql-subset.md) の「Issue #3186 追記」）。トリガ本体の `DELETE`（Issue #3187）も、
+  外側の行ループが進行中の表を対象にすると、表単位の暫定ガード（`trigger::row_loop`）が固定文言の `0A000` で
+  拒否する。`27000` を返す行単位の検出は、`ErrorClass` への variant 追加（公開 enum の破壊的変更）と合わせた
+  後続の課題
 - 制約検査・FK 検査は全行の書き込み後にまとめて行う（BEFORE と AFTER の間）
 
 ## 引き継ぎ

@@ -41,7 +41,6 @@ impl Drop for TriggerSubjectScope {
 }
 
 /// 現在張られている主体の写し（派生セッションの元）。区間が無ければ `None`。
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn current() -> Option<SessionState> {
     SUBJECT.with(|s| s.borrow().clone())
 }

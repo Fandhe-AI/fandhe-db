@@ -973,8 +973,8 @@ SQL-67 の (2)(3)(5)(6)(7) のポインタ。仕様本文は転記しない。
 トリガの発火点は `SessionState`・`SessionTransaction` を持たない（外側の write txn と `PolicyContext` の借用だけ）。
 Issue #2228 の内部 API（`invoke_trigger_function_in_txn`）は両方を要求するため、発火経路から呼べなかった。本 Issue で
 `TriggerFunctionInvoker` の本番実装（`PlpgsqlTriggerInvoker`）と、セッション無しで本体を実行するホストを用意した。
-`EngineCore::new` の既定（未結線の `0A000`）の差し替えと wire・psql 経由の E2E は #3185 の担当で、本 Issue では
-既定を変えない（テストが `with_trigger_invoker_for_test` で注入して確かめる）。
+`EngineCore` の既定の差し替えと wire 経由の E2E は #3185 の担当で、本 Issue では
+既定を変えない（テストが `with_trigger_invoker_for_test` で注入して確かめる。差し替えは「Issue #3185 追記」）。
 
 ### 構成
 
@@ -1011,7 +1011,7 @@ Issue #2228 の内部 API（`invoke_trigger_function_in_txn`）は両方を要�
 | -- | ---- |
 | `FROM` なしの `SELECT`（式評価・条件） | 実行（派生セッションは UDF を持たないため、ルーチン呼び出しは未定義関数として `42883` で失敗する。fail-closed） |
 | `INSERT ... VALUES`（単一行・複数行） | 実行。SQL `INSERT` と同じ束縛・実行関数を通す。行数・バッチの上限は通常と同じ。入れ子の発火には束縛済みの通過証を引き継ぐ（深さ上限 `54001`） |
-| `UPDATE` | `0A000`。窓口の拡張は #3186 |
+| `UPDATE`（単一行 `id` 指定形・述語形） | 実行（Issue #3186。下の「Issue #3186 追記」） |
 | `DELETE`・表を読む `SELECT`（`SELECT INTO`・`PERFORM`・`FOR` を含む） | 実行（「Issue #3187 追記」） |
 | `INSERT` の `ON CONFLICT`・`RETURNING`・`INSERT ... SELECT`・ビュー・データ変更 CTE・SCHEMA 修飾の書き込み先・一時表への振り分け | `0A000`（許可リストに無い形。既知の差） |
 
@@ -1029,7 +1029,7 @@ Issue #2228 の内部 API（`invoke_trigger_function_in_txn`）は両方を要�
 
 ### 既知の差・対象外
 
-- `UPDATE`: #3186（窓口の拡張）。`DELETE`・表を読む `SELECT` は Issue #3187 で対応済み
+- `UPDATE` は #3186、`DELETE`・表を読む `SELECT` は #3187 で対応済み
 - 一時表・SCHEMA 修飾の書き込み先・`ON CONFLICT`・`RETURNING`・`INSERT ... SELECT`・ビュー:
   本 Issue では `0A000`（本体からのルーチン呼び出しは上記のとおり `42883`）（受け皿の Issue は無い。要対応事項）
 - 書き込み後の `EXCEPTION` 捕捉は `0A000`（上記）
@@ -1038,6 +1038,54 @@ Issue #2228 の内部 API（`invoke_trigger_function_in_txn`）は両方を要�
 - 入れ子のトリガ間の `ExecBudget` の合算（D11）は、`run_trigger_with_handle` が作る `ExecBudget` が、外側の予算が生きている間
   `interp.rs` の共有カウンタへ文数・反復数を合算する（テストでの固定は受け皿の Issue が無い。要対応事項）
 - 既定の差し替え・wire 経由の E2E は #3185、RLS・台帳・crash の網羅的な再検証は #3188
+
+## Issue #3185 追記（既定 invoker の本番への差し替えと INSERT 発火の E2E。TABLE-45・SQL-68・RLS-10 ポインタ）
+
+`EngineCore` の既定の呼び出し口を `PlpgsqlTriggerInvoker` に差し替えた（`TriggerRuntime::production`・`assemble` の 1 箇所）。
+トリガのある表への INSERT は、SQL・wire のどちらからも `0A000` にならず BEFORE ROW・AFTER STATEMENT が発火する。
+Issue #3184 節の「#3185 の担当」はこれで解消した。
+
+- 未結線の `UnwiredInvoker`・`TriggerRuntime::unwired`・`with_invoker`・`EngineCore::with_trigger_invoker_for_test` は
+  `cfg(test)` 限定のテスト専用口（発火側の意味論を invoker から切り離して固定する）。起動フラグ・セッション変数で
+  invoker を差し替える経路は無い。
+- セッションを持たない入口からの発火は、主体の写しが無いため固定文言の `0A000` のまま（fail-closed）。
+- 経路ガード（D8）・本体の未対応形（#3186・#3187 ほか）の `0A000` は変えない。
+- 検証: `tests/table_rls/table45_trigger_fire.rs`（公開 API のみ）・`wire_sql/wire_trigger_fire.rs`（簡易・拡張クエリ、
+  末尾 `;` 付き単独文を含む）。台帳・RLS 越境・crash の網羅的な再検証は #3188。
+
+## Issue #3186 追記（トリガ本体の `UPDATE`。TABLE-45・SQL-68・RLS-10・SQL-19 ポインタ）
+
+トリガ関数の本体の `UPDATE` を、窓口（`TriggerWriteHandle`）経由で外側の文と同じ write txn・同じ呼び出しテナントの
+文脈（行ポリシー・権限は発火元の主体のまま）で実行する。実装は `core/plpgsql_trigger_host.rs` の `execute_trigger_update`。
+
+- 受け付ける形: 単一行 `id` 指定形と述語形（`SET` の式・`WHERE` に `NEW.x`／`OLD.x`・変数を使える）。
+  SQL `UPDATE` と同じ束縛・実行関数（`bind_update_form`／`prepare_predicate_update`・`execute_update_with_schema_in`／
+  `execute_predicate_update_in`）を通し、スキーマは窓口の同じ write txn から読む
+- 台帳は `LedgerMode::CompareOnlyWithoutLedger` を明示する（`dml_ledger_mode()` は使わない。D10）。本体の `UPDATE` は
+  `operation_id` を要求も記録もせず、外側の 1 エントリだけが台帳に載る
+- 書いた表は窓口が記録し（`run_write`）、遅延 FK の確定・世代の更新・明示 Tx の書き込み印に使われる
+- 入れ子の発火には束縛済みの通過証を引き継ぐ（深さ上限 `54001`）。書き込み前に `write_attempts` を数え、
+  書き込み後の `EXCEPTION` 捕捉は `0A000` のまま
+- 固定の `0A000` で拒否する形: `RETURNING`・WHERE 内のサブクエリ（#3187 は DELETE のみ対応。UPDATE への拡張は受け皿の Issue なし。要対応事項）・`UPDATE ... FROM`・
+  ビュー・一時表・データ変更 CTE・SCHEMA 修飾の書き込み先（内部キー）・`USING OPERATION_ID`／`PARTITIONED`
+
+### 自己変更の衝突（D6）の安全弁
+
+BEFORE ROW の UPDATE／DELETE の行ごとループの最中に、本体が同じ表を `UPDATE` すると、外側が BEFORE 前に読んだ OLD から
+作った行で上書きする（失われた更新）。PostgreSQL は `27000` で文全体を失敗にするが、`ErrorClass` に該当 variant が無く
+追加は公開 enum の破壊的変更になるため、本 Issue では入れない。代わりに `tenant/trigger_row_loop.rs` が候補ループの区間だけ
+表名を記録し、その表への本体の `UPDATE` を固定文言の `0A000` で拒否する（fail-closed）。区間はループだけで、AFTER ROW・
+AFTER STATEMENT からの同表 `UPDATE` は許す。入れ子（BEFORE UPDATE ON a → INSERT INTO b → b のトリガ → UPDATE a）も検出する。
+
+既知の差: PostgreSQL は外側の文が触れない別の行なら成功するが、本実装は表単位で `0A000`。行単位の検出と `27000` は後続
+（受け皿の Issue は無い。要対応事項）。
+
+### 既知の差・対象外（#3186）
+
+- 本体の `UPDATE ... RETURNING`・`UPDATE ... FROM`・ビュー・一時表・SCHEMA 修飾の書き込み先は `0A000`（受け皿の Issue は無い）
+- SCHEMA 修飾の書き込み先は、関数定義時の埋め込み SQL の検証で拒否される場合がある（実行時の拒否は多重防御）
+- 一時表を持つ発火元セッションからの本体 `UPDATE` の `0A000` 固定テストは未整備（解析段で一時表の経路に振り分けられ、許可リストに無い）
+- wire・psql 経由の E2E は #3185、RLS・台帳・crash の網羅的な再検証は #3188
 
 ## Issue #3187 追記（トリガ本体の `DELETE` と表を読む `SELECT`。TABLE-45・SQL-68・RLS-10 ポインタ）
 

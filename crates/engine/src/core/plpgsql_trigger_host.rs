@@ -13,11 +13,12 @@
 //!   使う。式評価・条件評価・`42702` 検査・`%TYPE` 解決は通常の本体と共有し、SQL の実行（[`run_tokens_trigger`]）
 //!   だけを本モジュールの文種ゲートへ回す
 //!
-//! fail-closed: 受け付ける文は「`FROM` なしの `SELECT`」「`INSERT ... VALUES`（`ON CONFLICT`・`RETURNING`・
-//! ビュー・一時表・SCHEMA 修飾なし）」「`DELETE`（単一行・述語形。`RETURNING`・`USING`・ビュー・一時表・
-//! SCHEMA 修飾なし）」「表を読む `SELECT`（`USING PLAN`・`FOR UPDATE`・ビュー・一時表・SCHEMA 修飾なし。
-//! 外側の write txn を読み取り源にして自 txn の未 commit の変更が見える）」だけの明示的な許可リストで、
-//! それ以外は固定文言の `0A000`（`UPDATE` は #3186 が窓口を広げる）。本体の書き込みは台帳に記録しない
+//! fail-closed: 受け付ける文は「`FROM` なしの `SELECT`」・「`INSERT ... VALUES`（`ON CONFLICT`・`RETURNING`・
+//! ビュー・一時表・SCHEMA 修飾なし）」・「`UPDATE`（単一行 `id` 指定形と述語形。`RETURNING`・`FROM`・WHERE 内
+//! サブクエリ・ビュー・一時表・SCHEMA 修飾なし。Issue #3186）」・「`DELETE`（単一行・述語形。`RETURNING`・
+//! `USING`・ビュー・一時表・SCHEMA 修飾なし。Issue #3187）」・「表を読む `SELECT`（`USING PLAN`・`FOR UPDATE`・
+//! ビュー・一時表・SCHEMA 修飾なし。外側の write txn を読み取り源にして自 txn の未 commit の変更が見える。
+//! Issue #3187）」だけの明示的な許可リストで、それ以外は固定文言の `0A000`。本体の書き込みは台帳に記録しない
 //! （外側の文の 1 エントリだけが台帳に載る。D10）。外側の行ループが進行中の表への本体の `DELETE` は
 //! `trigger::row_loop` の暫定ガード（D6）で `0A000`。
 
@@ -30,14 +31,15 @@ use crate::plpgsql::embedded::validate_embedded;
 use crate::plpgsql::parse_body;
 use crate::policy::PolicyContext;
 use crate::recovery::required_op_id::LedgerMode;
-use crate::sql::allowlist::{DeleteStatement, SqlSurfaceError, Statement, ValidatedInsert};
+use crate::sql::allowlist::{
+    DeleteStatement, SqlSurfaceError, Statement, ValidatedInsert, ValidatedUpdateForm,
+};
 use crate::sql::lexer::Token;
 use crate::sql::SqlOutcome as CoreOutcome;
 use crate::trigger::call::{trigger_vars_from_call, TriggerCall, TriggerHost, TriggerOutcome};
 use crate::trigger::write_handle::TriggerWriteHandle;
 
 /// 発火元の主体の写しが無い（セッションを持たない入口から発火した）ときの固定文言。
-#[cfg_attr(not(test), allow(dead_code))]
 const NO_SUBJECT: &str = "trigger function execution requires a session context";
 
 /// 本体で実行できない形の固定文言（値・表名・他テナントの情報を含めない）。
@@ -98,9 +100,6 @@ impl TriggerHost for EngineCore {
     }
 }
 
-// 本番の invoker は #3185 が既定へ差し替えるまでテストからだけ構築されるため、呼び出し連鎖の末端も
-// 通常ビルドでは未使用になる。
-#[cfg_attr(not(test), allow(dead_code))]
 impl EngineCore {
     /// 構文解析が書き込み文の `operation_id` 必須化の判定に使う台帳モード。通常は構成のとおりで、
     /// トリガ本体の解析中（[`BodyParseScope`]）だけ必須化を外す（`Ledgered` を `Optional` へ。台帳を持たない構成は
@@ -245,6 +244,99 @@ impl EngineCore {
 }
 
 impl EngineCore {
+    /// トリガ本体の `UPDATE` 1 文の実行（Issue #3186。`ValidatedUpdateForm` は許可リスト解析済み）。SQL `UPDATE` と
+    /// 同じ束縛・実行関数（`bind_update_form`／`prepare_predicate_update`・`execute_update_with_schema_in`／
+    /// `execute_predicate_update_in`）を通し、外側の write txn は窓口の中に留める。台帳は
+    /// `CompareOnlyWithoutLedger` を明示して要求も記録もしない（`dml_ledger_mode()` は使わない。D10）。
+    /// 入れ子の発火には束縛済みの通過証を引き継ぐ（深さ上限 `54001`）。
+    fn execute_trigger_update(
+        &self,
+        handle: &TriggerWriteHandle<'_>,
+        ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
+        form: &ValidatedUpdateForm,
+        has_subquery: bool,
+    ) -> Result<crate::sql::exec::UpdateOutcome, SqlSurfaceError> {
+        let (table, has_returning) = match form {
+            ValidatedUpdateForm::Single(v) => (v.table_name.as_str(), v.returning.is_some()),
+            ValidatedUpdateForm::Predicate(v) => (v.table_name(), v.returning().is_some()),
+        };
+        // 窓口が受けない形（SCHEMA 修飾の内部キー・`RETURNING`・UPDATE の WHERE のサブクエリ。DELETE は #3187 で対応済み・UPDATE への拡張は受け皿の Issue なし）。
+        if table.starts_with('#') || has_returning || has_subquery {
+            return Err(unsupported(BODY_UNSUPPORTED));
+        }
+        // 外側の BEFORE ROW の行ごとループの最中に同じ表を書くと、外側が本体の更新を上書きする（D6）。
+        if crate::tenant::trigger_row_loop::is_row_loop_active(table) {
+            return Err(unsupported(BODY_UNSUPPORTED));
+        }
+        // スキーマは外側と同じ write txn から読む（同じ Tx 内の DDL を取り込む）。
+        let schema = handle.table_schema(table)?;
+        let _sparsevec_limits_scope = self.sparsevec_limits_scope();
+        // 既定時刻・採番の文脈は `execute_trigger_insert` と同じ張り方（`SET col = DEFAULT`・`now()`・`nextval`）。
+        let clock = trigger_fallback_clock()?;
+        let _default_clock_scope = crate::sql::time_fn::DefaultClockScope::enter(clock);
+        let _restore_assigned = RestoreAssigned(Some(crate::sql::sequence_scope::take_assigned()));
+        let _sequence_scope = crate::sql::sequence_scope::SequenceScope::enter(
+            std::sync::Arc::clone(self.storage.sequence_allocator()),
+            session.sequences_handle(),
+            crate::sql::schema_privilege::acl_checked_principal(session),
+        );
+        let runtime = self.trigger_runtime.bind(self);
+        match form {
+            ValidatedUpdateForm::Single(stmt) => {
+                let bound = {
+                    let set_columns: Vec<&str> =
+                        stmt.assignments.iter().map(|(n, _)| n.as_str()).collect();
+                    let _defer =
+                        self.defer_not_null_scope_for_update(ctx, &schema.name, &set_columns);
+                    crate::sql::parser::bind_update_form(form, &schema, session.udfs())?
+                };
+                let crate::sql::parser::BoundUpdateForm::Single(bound) = bound else {
+                    return Err(SqlSurfaceError::Internal {
+                        detail: "internal: bound predicate UPDATE from a single-row statement"
+                            .to_string(),
+                    });
+                };
+                handle.run_write(table, |target| {
+                    crate::sql::exec::execute_update_with_schema_in(
+                        target,
+                        ctx,
+                        &bound,
+                        LedgerMode::CompareOnlyWithoutLedger,
+                        Some(&schema),
+                        Some(&runtime),
+                    )
+                })
+            }
+            ValidatedUpdateForm::Predicate(validated) => {
+                let (predicate, hash, legacy) = {
+                    let set_columns: Vec<&str> = validated
+                        .assignments()
+                        .iter()
+                        .map(|(n, _)| n.as_str())
+                        .collect();
+                    let _defer =
+                        self.defer_not_null_scope_for_update(ctx, &schema.name, &set_columns);
+                    Self::prepare_predicate_update(validated, validated, &schema, session.udfs())?
+                };
+                handle.run_write(table, |target| {
+                    crate::sql::exec::execute_predicate_update_in(
+                        target,
+                        ctx,
+                        &predicate,
+                        LedgerMode::CompareOnlyWithoutLedger,
+                        &schema,
+                        &hash,
+                        &legacy,
+                        self.dml_limits.max_affected_rows,
+                        self.scan_limits.max_scanned_rows(),
+                        Some(&runtime),
+                    )
+                })
+            }
+        }
+    }
+
     /// トリガ本体の `DELETE`／`SELECT` の束縛・実行区間に張る文脈（jsonpath・regex・sparsevec の上限と
     /// セッション TimeZone。通常の文の `execute_in_active_txn_inner` と同じ構成。時刻は発火入口が張る）。
     fn trigger_bind_scopes(&self, session: &crate::sql::mode::SessionState) -> impl Sized {
@@ -423,6 +515,8 @@ impl CorePlHost<'_, '_> {
             )?
         };
         let writes = self.gate_parsed(&parsed)?;
+        // UPDATE の WHERE 内のサブクエリは本体の UPDATE では拒否するため、束縛・実行の前に判定しておく。
+        let has_subquery = EngineCore::is_subquery_predicate_dml(&parsed);
         match parsed {
             // `FROM` なしの定数式 `SELECT`（式評価・条件の `where_probe`）。表を読まず、ルーチン呼び出しも
             // 含まない形に限る。派生セッションの UDF 登録は空なので、ルーチン呼び出しは解析段で `42883` になる
@@ -445,6 +539,15 @@ impl CorePlHost<'_, '_> {
                 self.core
                     .execute_trigger_insert(handle, self.ctx, self.session, &stmt)
                     .map(CoreOutcome::Insert)
+            }
+            ParsedSql::Update(form) if writes => {
+                // 書き込みの試行を数える（`INSERT` と同じ理由）。
+                if let HostTxn::Trigger(b) = &mut self.txn {
+                    b.write_attempts = b.write_attempts.saturating_add(1);
+                }
+                self.core
+                    .execute_trigger_update(handle, self.ctx, self.session, &form, has_subquery)
+                    .map(CoreOutcome::Update)
             }
             ParsedSql::Delete(stmt) if writes => {
                 // 書き込みの試行を数える（INSERT の腕と同じ。成功・失敗を問わず、実行の前に数える）。
@@ -469,8 +572,8 @@ impl CorePlHost<'_, '_> {
                 self.core
                     .execute_trigger_select(handle, self.ctx, self.session, stmt)
             }
-            // `UPDATE`・`INSERT ... SELECT`・`DELETE ... RETURNING`／`USING`・ビュー・データ変更 CTE・一時表への
-            // 振り分け等はすべて拒否する（許可リスト。`UPDATE` は #3186 が窓口を広げる）。
+            // `INSERT ... SELECT`・`UPDATE ... FROM`・`DELETE ... RETURNING`／`USING`・ビュー・データ変更 CTE・
+            // 一時表への振り分け等はすべて拒否する（許可リスト）。
             _ => Err(unsupported(BODY_UNSUPPORTED)),
         }
     }
