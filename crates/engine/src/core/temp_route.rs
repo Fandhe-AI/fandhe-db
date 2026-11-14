@@ -549,6 +549,7 @@ impl EngineCore {
                     session,
                     crate::sql::allowlist::CopyStatement::From(v),
                     txn_start,
+                    None,
                 )?;
                 Ok(Some(match plan {
                     super::CopyPlan::From(copy) => super::CopyPlan::From(copy.with_temp(
@@ -575,6 +576,7 @@ impl EngineCore {
                     ctx,
                     session,
                     crate::sql::allowlist::CopyStatement::To(v),
+                    None,
                     None,
                 )?)),
             },
@@ -615,7 +617,15 @@ impl EngineCore {
                     crate::sql::schema_privilege::acl_checked_principal(session),
                 )
             });
-            let outcome = self.commit_copy_in_txn(ctx, txn, batch)?;
+            // Issue #3281: 発火元の主体の写し（COPY を出したセッション）を張り、通過証を渡す。トリガ本体は
+            // 発火元と同じロール・`search_path`・`row_security` で同じ write txn の中で実行される。
+            let _trigger_subject = crate::trigger::subject::TriggerSubjectScope::enter(session);
+            let outcome = self.commit_copy_in_txn_inner(
+                ctx,
+                txn,
+                batch,
+                Some(&self.trigger_runtime.bind(self)),
+            )?;
             if was_idle {
                 session.apply_temp_on_commit()?;
             }
@@ -675,6 +685,8 @@ impl EngineCore {
             crate::tenant::WriteTarget::InTxn(write_txn),
             ctx,
             batch,
+            // 一時表へのトリガは定義時に `0A000` のため発火対象が無い（通過証なし）。
+            None,
         )?;
         store.enforce_budget(write_txn)?;
         store.commit(gated)?;
@@ -703,6 +715,8 @@ impl EngineCore {
             crate::tenant::WriteTarget::InTxn(write_txn),
             ctx,
             batch,
+            // 一時表へのトリガは定義時に `0A000` のため発火対象が無い（通過証なし）。
+            None,
         )?;
         store.enforce_budget(write_txn)?;
         Ok(outcome)

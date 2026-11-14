@@ -609,6 +609,12 @@ pub enum VolatileColumn {
     /// NOT NULL 列の DROP DEFAULT を挟んだ同一文の再送を `23505` にするため）。
     /// 行形 INSERT（単一行・複数行 VALUES）の束縛だけが生成し、他の束縛経路は即時 `23502` のまま。
     MissingNotNull(usize),
+    /// COPY の明示 NULL（`\N`）を受けた非 nullable 列（`schema.columns` 上の位置。Issue #3281）。
+    /// NOT NULL 検査を [`VolatileColumn::MissingNotNull`] と同じく台帳照合・BEFORE ROW トリガの後へ
+    /// 遅らせる点は同じだが、明示 NULL は要求値の一部なので内容照合ハッシュの材料から**除外しない**
+    /// （省略列との区別を保ち、同一 operation_id で省略形の再送を `22023` にするため）。
+    /// COPY の束縛だけが生成する。DEFAULT 付き列にも付く（明示 NULL は DEFAULT を適用しない）。
+    DeferredNull(usize),
     /// `VALUES` の要素が単独の `nextval('<名前>')`／`currval('<名前>')` だった列（位置・関数・名前。
     /// TABLE-24・Issue #1690）。`values` の該当位置は `Null` の仮値で、`tenant` の INSERT 系書き込みが
     /// 台帳照合の後（再送では採番しないため）に書き込み txn 内で採番・解決して差し込む。
@@ -628,6 +634,7 @@ impl VolatileColumn {
             VolatileColumn::Default(i)
             | VolatileColumn::Values(i, _)
             | VolatileColumn::MissingNotNull(i)
+            | VolatileColumn::DeferredNull(i)
             | VolatileColumn::Sequence(i, _, _)
             | VolatileColumn::DefaultSequence(i) => *i,
         }
