@@ -93,7 +93,7 @@ SQL の入口を結合実行器（`execute_joined_dml_in`）へ結線した。�
 - **autocommit**: `execute_parsed_in_session_inner` が `is_joined_dml` を見て、サブクエリ付き述語 DML と同じ文単位の暗黙 Tx（`execute_subquery_dml_autocommit`）へ振り分ける。実行本体は明示 Tx と共通
 - **明示 Tx**: 共有 write txn 上で実行し、対象表とトリガが書いた表へ `mark_written` する（漏れると COMMIT が write txn を破棄し、遅延 FK の検査も取りこぼす）。コマンドタグは autocommit と同じ `UPDATE n`／`DELETE n`
 - **暗黙 Tx を通らない経路**（`EXPLAIN` 等のネスト）: `execute_parsed_statement` の腕は固定文言の `0A000`（fail-closed）
-- **Describe**: Execute と同じ準備段（束縛・変換・op id ゲート）を通す。実行できる形は結果列なし、変換器が拒否する形と op id 付きは `0A000`、束縛エラーは従来のコード。これで Describe と Execute のコードがそろう
+- **Describe**: Execute と同じ準備段（束縛・変換）を通す。実行できる形は結果列なし、変換器が拒否する形は `0A000`（op id 付きも通常の Describe と同じ）、束縛エラーは従来のコード。これで Describe と Execute のコードがそろう
 - **`USING OPERATION_ID` 付き**（Issue #3203・RECOVER-10/11）: 台帳へ結線済み。構文段で検証した `operation_id` と content_hash を実行器へ渡し、FROM／USING 側の走査より前の事前照合で再送は `23505`、別文への再利用は `22023`、確定記録は書き込み本体と同じ txn で行う。束縛・変換・実行のエラーは txn が commit されないため台帳を消費しない。`parsed_operation_id` は実値を返し、同一 Tx 内の再利用は既存 DML と同じく拒否される（Tx は `Failed`）。`READ ONLY` Tx・一時表ルーティング・PL/pgSQL 本体は op id 付きを拒否側に倒す。`--require-operation-id` 構成でも使える（省略は `23502`）
 - **`PARTITIONED`**: 構文段が `42601` で拒否する。`ValidatedUpdateFrom`／`ValidatedDeleteUsing` は `partitioned` を持たず、`run_partitioned_*` は述語形だけを受け取るため、結合形が分割実行器へ入る経路は構造上存在しない（autocommit・明示 Tx の両方を結合テストで固定）
 - **多重一致**: 実行器の規約どおり、対象行ごとに 1 回だけ更新・削除し、UPDATE の値は走査順で最初の source 行を採る
