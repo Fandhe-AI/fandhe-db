@@ -480,6 +480,7 @@ impl<'a> JoinedProbe<'a> {
     }
 
     /// 一致した対象行 id と採った source の走査位置（対象行 id 昇順＝候補列挙順）。
+    #[cfg(test)]
     pub(crate) fn matches_sorted(&self) -> Result<Vec<(u64, u32)>, SqlSurfaceError> {
         let map = self
             .matches
