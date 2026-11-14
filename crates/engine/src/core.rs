@@ -2029,7 +2029,7 @@ pub enum ParsedSql {
     /// `UPDATE <表> [[AS] <別名>] SET ... FROM <表の並び> [WHERE ...]`（SQL-53 (b)・Issue #1754）。
     /// 構文と表の存在確認までを担い、列の解決・型照合は束縛（`sql::dml_from::bind_update_from`）が
     /// 実行腕・Describe 腕で行う。束縛・変換を通った文は結合実行器へ dispatch される（Issue #3202。
-    /// autocommit は暗黙 Tx、明示 Tx は共有 write txn。`USING OPERATION_ID` 付きは #3203 まで `0A000`、
+    /// autocommit は暗黙 Tx、明示 Tx は共有 write txn。`USING OPERATION_ID` 付きの台帳は Issue #3203 で結線済み、
     /// `RETURNING` は #3204）。台帳の content_hash は #1757 で構文段に実装済み。既存の [`Self::Update`] に
     /// フィールドを足さず別 variant にしているのは、FROM を黙って無視する実行経路（fail-open）を
     /// 作らず、網羅 `match` の追随漏れをコンパイラに検出させるため。
@@ -2908,10 +2908,10 @@ fn parsed_operation_id(parsed: &ParsedSql) -> Option<&str> {
         ParsedSql::Update(crate::sql::allowlist::ValidatedUpdateForm::Predicate(v)) => {
             v.operation_id().map(|id| id.as_str())
         }
-        // SQL-53 (b)・Issue #3202: `USING OPERATION_ID` 付きは台帳の SQL 経路結線（#3203）まで実行腕が
-        // `0A000` で拒否するため、同一トランザクションの operation_id 登録は変えない（拒否される文が再利用検査の
-        // 状態を汚さない）。#3203 でここを実値にする。
-        ParsedSql::UpdateFrom(_) | ParsedSql::DeleteUsing(_) => None,
+        // SQL-53 (b)・Issue #3203: 台帳結線済み。同一トランザクション内の再利用検査にも実値を渡す
+        // （`READ ONLY` Tx・一時表ルーティング・PL/pgSQL 本体の各ゲートも operation_id 付きを拒否側に倒す）。
+        ParsedSql::UpdateFrom(stmt) => stmt.operation_id().map(|id| id.as_str()),
+        ParsedSql::DeleteUsing(stmt) => stmt.operation_id().map(|id| id.as_str()),
         // Issue #2050: `EXPLAIN UPDATE|DELETE` は台帳に記録せず operation_id もトランザクションへ
         // 登録しない（登録すると同じ operation_id の本実行が誤って再利用扱いになる）。
         ParsedSql::ExplainDml(_) | ParsedSql::ExplainJson(_) => None,
@@ -12662,14 +12662,14 @@ impl EngineCore {
                     None => Ok(None),
                 }
             }
-            // SQL-53 (b)・Issue #3202: Execute と同じ準備段（束縛・変換・op id ゲート）を通し、エラーコードを
+            // SQL-53 (b)・Issue #3202: Execute と同じ準備段（束縛・変換）を通し、エラーコードを
             // 揃える。`RETURNING` は未対応（Parse で `0A000`）のため結果列は無い。
             ParsedSql::UpdateFrom(stmt) => {
-                self.prepare_update_from(stmt, session.udfs())?;
+                self.plan_update_from_stmt(stmt, session.udfs())?;
                 Ok(None)
             }
             ParsedSql::DeleteUsing(stmt) => {
-                self.prepare_delete_using(stmt, session.udfs())?;
+                self.plan_delete_using_stmt(stmt, session.udfs())?;
                 Ok(None)
             }
             // Issue #1129: `SHOW`／`CANCEL` は `status`・`rows` の 2 列、`EXPLAIN` は
