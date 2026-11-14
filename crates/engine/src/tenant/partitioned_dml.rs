@@ -74,11 +74,14 @@ pub(crate) enum PartitionedDmlOutcome {
 }
 
 /// 分割実行の停止。`committed_total` は commit 済みチャンクの累計件数（再開前の処理済み
-/// 件数を含む）。SQL 表層は `committed_total > 0` なら部分完了（`VD001`）へ写像する。
+/// 件数を含む。実際の影響行数のまま改変しない）。`side_effects_committed` は件数 0 でもトリガの
+/// 別表書き込み等の副作用を commit 済みかを表す。SQL 表層は `committed_total > 0` または
+/// `side_effects_committed` なら部分完了（`VD001`）へ写像する。
 #[derive(Debug)]
 pub(crate) struct PartitionedDmlFailure<E> {
     pub cause: PartitionedStopCause<E>,
     pub committed_total: u64,
+    pub side_effects_committed: bool,
 }
 
 /// 分割実行の停止原因。公開 enum は増やさず `pub(crate)` で閉じる。コードへの写像は
@@ -426,13 +429,10 @@ fn run_partitioned<E>(
     );
     result.map_err(|cause| PartitionedDmlFailure {
         cause,
-        // 影響行数が 0 でも副作用（トリガの別表書き込み）を commit 済みなら、部分完了として
-        // 扱わせるため 0 にしない（SQL 表層は `> 0` を `VD001` へ写像する）。
-        committed_total: if state.side_effects_committed {
-            state.processed.max(1)
-        } else {
-            state.processed
-        },
+        // 件数は実値のまま渡し、影響行数 0 でも副作用を commit 済みかは別フラグで渡す
+        // （ジョブ記録・SHOW・エラー応答の件数を一致させる）。
+        committed_total: state.processed,
+        side_effects_committed: state.side_effects_committed,
     })
 }
 
@@ -753,6 +753,22 @@ fn chunk_loop<E>(
         // `InTxn` を渡すと COMMIT まで先送りされ fail-open になる）。`consumed` は BEFORE の `NULL` 返却で
         // スキップした行を含む消費件数で、カーソルの根拠になる（`applied` は書いた行数）。
         let (applied, consumed, trigger_wrote) = if let Some(plan) = &trigger_plan {
+            // 行トリガ本体の時刻値関数（`now()` 等）がチャンク内の全行で同一の時刻を返すよう、
+            // 通常 DML と同じくトランザクション固定の時計スコープを張る。再送で時刻が記録済みなら
+            // その値（`fixed_time`）を使い、無ければこのチャンクの開始時刻を使う。
+            let clock_micros = match fixed_time {
+                Some(t) => t,
+                None => crate::sql::time_fn::now_micros().map_err(|_| {
+                    w(TenantWriteError::ReturningProjectionFailed(
+                        "system clock unavailable".to_string(),
+                    ))
+                })?,
+            };
+            let _trigger_clock_scope =
+                crate::sql::time_fn::ClockScope::enter(crate::sql::time_fn::StatementClock {
+                    txn_start_micros: clock_micros,
+                    stmt_start_micros: clock_micros,
+                });
             let writes =
                 crate::trigger::write_handle::TriggerWriteHandle::new(&write_txn, ctx, triggers);
             let target = WriteTarget::Autocommit(storage);
