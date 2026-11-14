@@ -686,11 +686,9 @@ fn bind_copy_record(
                 if !column.nullable {
                     // BEFORE ROW INSERT トリガのある表（`defer_not_null`）は、トリガが補えるよう
                     // 最終 NEW の NOT NULL 検査（`tenant` の書き込み段。`23502`）へ遅らせる。
-                    // INSERT の省略列と同じく VECTOR 列・DEFAULT 付き列は遅らせない（Issue #3281）。
-                    if defer_not_null
-                        && column.default_expr.is_none()
-                        && !matches!(column.ty, ColumnType::Vector(_))
-                    {
+                    // 明示 NULL は DEFAULT を適用しないため DEFAULT の有無は問わず遅らせる。
+                    // VECTOR 列は INSERT と同じく遅らせない（Issue #3281）。
+                    if defer_not_null && !matches!(column.ty, ColumnType::Vector(_)) {
                         deferred_null_columns.push(col_idx);
                     } else {
                         return Err(SqlSurfaceError::not_null_violation(name.clone()));

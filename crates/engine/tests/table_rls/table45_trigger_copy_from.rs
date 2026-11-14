@@ -618,6 +618,69 @@ fn without_trigger_not_null_is_still_23502() {
     assert_eq!(e2.wire_code(), "23502");
 }
 
+// DEFAULT 付き NOT NULL 列でも `\N`（明示 NULL。DEFAULT は適用しない）は BEFORE ROW が補える。
+// トリガが無い表は従来どおり `23502`、補わないトリガでも最終 NEW の検査で `23502`（fail-closed）。
+#[test]
+fn null_marker_on_not_null_default_column_deferred_to_before_trigger() {
+    let (_g, core) = open("t3281-nn-default");
+    let mut a = tenant_session(&core, "t1");
+    ok(
+        &core,
+        "t1",
+        &mut a,
+        "CREATE TABLE s.nd (a INTEGER NOT NULL, b INTEGER NOT NULL DEFAULT 3)",
+    );
+    let e = copy(
+        &core,
+        "t1",
+        &mut a,
+        "COPY nd (a, b) FROM STDIN",
+        b"1\t\\N\n",
+    )
+    .expect_err("no trigger");
+    assert_eq!(e.wire_code(), "23502");
+    func(
+        &core,
+        "t1",
+        &mut a,
+        "filld",
+        "BEGIN IF NEW.b IS NULL THEN NEW.b := 7; END IF; RETURN NEW; END",
+    );
+    ok(
+        &core,
+        "t1",
+        &mut a,
+        "CREATE TRIGGER td BEFORE INSERT ON s.nd FOR EACH ROW EXECUTE FUNCTION filld()",
+    );
+    copy(
+        &core,
+        "t1",
+        &mut a,
+        "COPY nd (a, b) FROM STDIN",
+        b"1\t\\N\n",
+    )
+    .expect("filled by trigger");
+    assert_eq!(ints(&core, "t1", &mut a, "SELECT b FROM nd"), vec![7]);
+    func(&core, "t1", &mut a, "keepd", "BEGIN RETURN NEW; END");
+    ok(&core, "t1", &mut a, "DROP TRIGGER td ON s.nd");
+    ok(
+        &core,
+        "t1",
+        &mut a,
+        "CREATE TRIGGER td2 BEFORE INSERT ON s.nd FOR EACH ROW EXECUTE FUNCTION keepd()",
+    );
+    let e = copy(
+        &core,
+        "t1",
+        &mut a,
+        "COPY nd (a, b) FROM STDIN",
+        b"2\t\\N\n",
+    )
+    .expect_err("trigger does not fill");
+    assert_eq!(e.wire_code(), "23502");
+    assert_eq!(ints(&core, "t1", &mut a, "SELECT a FROM nd"), vec![1]);
+}
+
 // writer を取得済みの明示 Tx（先行の書き込み後）でも、COPY の NOT NULL 検査の遅延は writer 側のトリガ参照で
 // 判定され、INSERT と同じく BEFORE ROW が補える（Issue #3281）。なお `CREATE TRIGGER` 自体は明示 Tx では
 // 未対応のため、同一 Tx で作ったトリガが COPY に見えない状況は現状では起こらない（writer 側参照は将来の

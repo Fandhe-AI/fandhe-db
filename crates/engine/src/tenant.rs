@@ -1504,7 +1504,8 @@ fn check_volatile_columns(
             VolatileColumn::MissingNotNull(_) => schema
                 .columns
                 .get(idx)
-                .is_some_and(|c| !c.nullable && c.default_expr.is_none()),
+                // COPY の明示 NULL（`\N`）は DEFAULT を適用しないため、DEFAULT 付き NOT NULL 列も運ぶ（Issue #3281）。
+                .is_some_and(|c| !c.nullable),
             // 採番列は整数型であること（`DefaultSequence` はスキーマ側の DEFAULT も SEQUENCE であること）。
             VolatileColumn::Sequence(..) => schema.columns.get(idx).is_some_and(|c| {
                 matches!(
