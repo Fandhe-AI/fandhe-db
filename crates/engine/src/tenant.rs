@@ -2332,6 +2332,18 @@ fn insert_typed_row_impl(
             target.fk_check_mode(),
             crate::constraint::RowPolicyWrite::Insert,
         )?;
+        // 呼び出し元が事前投影を省いた後に最後の INSERT トリガが DROP されると、この非トリガ経路へ来る
+        // （Issue #3192）。commit 後に予算超過（`54000`）で失敗して行・台帳だけが残るのを防ぐため、
+        // 書いた値の投影（予算検査）を commit 前のこの txn 内で行う（失敗は txn の abort）。
+        if let Some(project) = project {
+            project(&CapturedRow {
+                id: row_id.legacy_id(),
+                tenant_id: ctx.tenant_id().to_string(),
+                visibility,
+                origin: CapturedRowOrigin::Inserted,
+                values: values.to_vec(),
+            })?;
+        }
         crate::catalog::bump_table_generation_in_txn(write_txn, table)?;
         Ok((
             InsertWriteReport {
@@ -2637,7 +2649,7 @@ pub(crate) fn insert_typed_rows_unchecked(
     volatile_default_columns: VolatileDefaultColumns<'_>,
     triggers: Option<&crate::trigger::TriggerRuntime>,
     // `RETURNING` の投影（Issue #3192）。[`insert_typed_row_unchecked`] の同名引数と同じ契約。
-    project: Option<&mut ReturningProjectFn<'_>>,
+    mut project: Option<&mut ReturningProjectFn<'_>>,
 ) -> Result<InsertWriteReport, TenantWriteError> {
     validate_relation_key(table)?;
     if !rows.is_empty() {
@@ -2924,6 +2936,17 @@ pub(crate) fn insert_typed_rows_unchecked(
                 let key = row_key(ctx.tenant_id(), row_id);
                 let encoded = encode_row(&row)?;
                 insert_unique_row(write_txn, table, &mut row_table, key, encoded.as_slice())?;
+                // トリガ判定後の並行 DROP でこの非トリガ経路へ来た場合の予算検査を commit 前に行う
+                // （単一行経路と同じ理由。Issue #3192）。
+                if let Some(project) = project.as_mut() {
+                    project(&CapturedRow {
+                        id: row_id.legacy_id(),
+                        tenant_id: ctx.tenant_id().to_string(),
+                        visibility,
+                        origin: CapturedRowOrigin::Inserted,
+                        values: values.to_vec(),
+                    })?;
+                }
             }
             drop(row_table);
             row_ids

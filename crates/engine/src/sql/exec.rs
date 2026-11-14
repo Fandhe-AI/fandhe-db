@@ -7072,7 +7072,9 @@ pub(crate) fn execute_insert_returning_in(
         ledger_mode,
         Some(schema),
         triggers,
-        Some(&mut trigger_project),
+        // トリガ判定の確定は書き込み txn 内。事前判定とずれてトリガ無し経路になった場合も、tenant 側が
+        // commit 前にこの収集で予算を検査する（Issue #3192）。トリガ機構が無い構成（`None`）では渡さない。
+        triggers.map(|_| &mut trigger_project as &mut crate::tenant::ReturningProjectFn<'_>),
     )?;
     drop(trigger_project);
 
@@ -7092,8 +7094,9 @@ pub(crate) fn execute_insert_returning_in(
     }
 
     // 事前判定（別 snapshot）ではトリガありとして事前投影を省いたが、書き込み txn の計画ではトリガ無し
-    // （判定後に最後の INSERT トリガが DROP された）場合は `trigger_rows` が空のままになる。トリガが
+    // （判定後に最後の INSERT トリガが DROP された）場合は `trigger_rows` を使わない。トリガが
     // 走っていないので書き込んだ値は束縛値そのものであり、ここで束縛値から投影し直して行の欠落を防ぐ。
+    // 予算検査は tenant 側が commit 前に同じ収集で済ませているため、ここでの投影は失敗しない。
     if has_sequence || skip_pre_projection {
         // 行・列をキーにした索引を一度だけ構築し、RETURNING の検索を線形時間に保つ
         // （重複記録は先頭を優先。従来の線形 `find` と同じ意味論）。
