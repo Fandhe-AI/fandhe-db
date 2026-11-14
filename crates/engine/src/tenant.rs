@@ -1505,6 +1505,8 @@ fn check_volatile_columns(
                 .columns
                 .get(idx)
                 .is_some_and(|c| !c.nullable && c.default_expr.is_none()),
+            // COPY の明示 NULL（`\N`）は DEFAULT を適用しないため、DEFAULT 付き NOT NULL 列も運ぶ（Issue #3281）。
+            VolatileColumn::DeferredNull(_) => schema.columns.get(idx).is_some_and(|c| !c.nullable),
             // 採番列は整数型であること（`DefaultSequence` はスキーマ側の DEFAULT も SEQUENCE であること）。
             VolatileColumn::Sequence(..) => schema.columns.get(idx).is_some_and(|c| {
                 matches!(
@@ -1611,7 +1613,8 @@ fn named_expr_columns<'a>(
                     name: seq.as_str(),
                 },
             )),
-            None => {
+            // `DeferredNull`（COPY の明示 NULL）は要求値なので通常列と同じくハッシュへ含める。
+            Some(VolatileColumn::DeferredNull(_)) | None => {
                 if let Some(value) = values.get(idx) {
                     out.push((
                         column.name.as_str(),
@@ -1634,7 +1637,7 @@ fn reject_missing_not_null(
     volatile: &[VolatileColumn],
 ) -> Result<(), TenantWriteError> {
     for col in volatile {
-        if let VolatileColumn::MissingNotNull(idx) = col {
+        if let VolatileColumn::MissingNotNull(idx) | VolatileColumn::DeferredNull(idx) = col {
             let name = schema
                 .columns
                 .get(*idx)
