@@ -1504,8 +1504,9 @@ fn check_volatile_columns(
             VolatileColumn::MissingNotNull(_) => schema
                 .columns
                 .get(idx)
-                // COPY の明示 NULL（`\N`）は DEFAULT を適用しないため、DEFAULT 付き NOT NULL 列も運ぶ（Issue #3281）。
-                .is_some_and(|c| !c.nullable),
+                .is_some_and(|c| !c.nullable && c.default_expr.is_none()),
+            // COPY の明示 NULL（`\N`）は DEFAULT を適用しないため、DEFAULT 付き NOT NULL 列も運ぶ（Issue #3281）。
+            VolatileColumn::DeferredNull(_) => schema.columns.get(idx).is_some_and(|c| !c.nullable),
             // 採番列は整数型であること（`DefaultSequence` はスキーマ側の DEFAULT も SEQUENCE であること）。
             VolatileColumn::Sequence(..) => schema.columns.get(idx).is_some_and(|c| {
                 matches!(
@@ -1612,7 +1613,8 @@ fn named_expr_columns<'a>(
                     name: seq.as_str(),
                 },
             )),
-            None => {
+            // `DeferredNull`（COPY の明示 NULL）は要求値なので通常列と同じくハッシュへ含める。
+            Some(VolatileColumn::DeferredNull(_)) | None => {
                 if let Some(value) = values.get(idx) {
                     out.push((
                         column.name.as_str(),
@@ -1635,7 +1637,7 @@ fn reject_missing_not_null(
     volatile: &[VolatileColumn],
 ) -> Result<(), TenantWriteError> {
     for col in volatile {
-        if let VolatileColumn::MissingNotNull(idx) = col {
+        if let VolatileColumn::MissingNotNull(idx) | VolatileColumn::DeferredNull(idx) = col {
             let name = schema
                 .columns
                 .get(*idx)
@@ -5806,6 +5808,7 @@ pub(crate) fn delete_row_unchecked(
         DeleteScope::Owned,
         None,
         None,
+        None,
     )?
     .0
     {
@@ -5989,6 +5992,8 @@ fn delete_row_impl(
     // DELETE トリガの通過証（Issue #1725）。`capture`（`RETURNING`）が `Some` のときは常に未結線として扱う
     // （`0A000`）。
     triggers: Option<&crate::trigger::TriggerRuntime>,
+    // 束縛時スキーマとの照合だけを行う引数（`capture` と独立。Issue #3282）。不一致は `capture` と同じ扱い。
+    expected_schema: Option<&crate::catalog::TableSchema>,
 ) -> Result<(DeleteRowOutcome, Option<CapturedRow>), TenantWriteError> {
     validate_relation_key(table)?;
     let triggers = if capture.is_some() { None } else { triggers };
@@ -6032,8 +6037,9 @@ fn delete_row_impl(
                 || crate::catalog::referencing_foreign_keys_in_txn(write_txn, table)?
                     .iter()
                     .any(|(_, fk)| fk.references_parent_id());
-            if let Some(expected) = capture.as_ref() {
-                if expected.schema != &schema {
+            let expected_schema = capture.as_ref().map(|c| c.schema).or(expected_schema);
+            if let Some(expected) = expected_schema {
+                if expected != &schema {
                     return Err(TenantWriteError::Catalog(CatalogError::Invalid(
                         "table schema changed after the delete was bound".to_string(),
                     )));
@@ -6375,6 +6381,7 @@ pub(crate) fn delete_row_ledgered_capturing_unchecked<'a>(
         DeleteScope::OwnedVisible,
         capture.map(|schema| DeleteCapture { schema, project }),
         None,
+        None,
     )
 }
 
@@ -6398,6 +6405,34 @@ pub(crate) fn delete_row_ledgered_with_triggers(
         DeleteScope::OwnedVisible,
         None,
         triggers,
+        None,
+    )
+    .map(|(outcome, _)| outcome)
+}
+
+/// [`delete_row_ledgered_with_triggers`] に束縛時スキーマとの照合を足した版（Issue #3282。NoSQL 表層の
+/// 採番方式向け検査付き単一行 DELETE が呼ぶ）。`expected_schema` と write txn 内の現スキーマが
+/// 不一致なら書き込まずに拒否する（`RETURNING` の `capture` とは独立なので DELETE トリガは発火する）。
+pub(crate) fn delete_row_ledgered_with_triggers_expecting(
+    target: WriteTarget<'_>,
+    table: &str,
+    ctx: &PolicyContext,
+    id: u64,
+    ledger_write: LedgerWrite<'_>,
+    expected_schema: &crate::catalog::TableSchema,
+    triggers: Option<&crate::trigger::TriggerRuntime>,
+) -> Result<DeleteRowOutcome, TenantWriteError> {
+    delete_row_impl(
+        target,
+        table,
+        ctx,
+        id,
+        ledger_write,
+        DeleteNotFoundLedger::Record,
+        DeleteScope::OwnedVisible,
+        None,
+        triggers,
+        Some(expected_schema),
     )
     .map(|(outcome, _)| outcome)
 }

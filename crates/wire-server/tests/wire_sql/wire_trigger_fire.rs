@@ -133,6 +133,38 @@ fn wire_simple_query_fires_before_row_and_after_statement() {
     );
 }
 
+/// BEFORE UPDATE ROW の書き換えと AFTER DELETE STATEMENT の監査行が、末尾 `;` 付きの単独送信・
+/// 複数文の簡易クエリで発火する（Issue #3282。NoSQL 表層と同じ実行器・発火計画を SQL 側でも固定する）。
+#[test]
+fn wire_simple_query_fires_update_and_delete_triggers() {
+    let (addr, _g) = serve();
+    let mut s = connect(addr, "alice", "pw-alice");
+    setup(&mut s);
+    exec(&mut s, "INSERT INTO s.tt (n) VALUES (1)");
+    exec(
+        &mut s,
+        "CREATE TRIGGER tu BEFORE UPDATE ON s.tt FOR EACH ROW EXECUTE FUNCTION bump()",
+    );
+    exec(
+        &mut s,
+        "CREATE TRIGGER td AFTER DELETE ON s.tt FOR EACH STATEMENT EXECUTE FUNCTION stmt_audit()",
+    );
+    assert_eq!(
+        exec(&mut s, "UPDATE s.tt SET n = 5 WHERE n = 1;"),
+        "UPDATE 1"
+    );
+    assert_eq!(select_col(&mut s, "SELECT n FROM s.tt"), vec!["105"]);
+    assert_eq!(exec(&mut s, "DELETE FROM s.tt WHERE n = 105;"), "DELETE 1");
+    assert_eq!(
+        select_col(&mut s, "SELECT lv FROM audit"),
+        vec!["STATEMENT"]
+    );
+    assert_eq!(
+        select_col(&mut s, "SELECT n FROM s.tt"),
+        Vec::<String>::new()
+    );
+}
+
 /// 拡張クエリ（Parse/Bind/Execute/Sync）で送った INSERT でも発火する。
 #[test]
 fn wire_extended_query_fires_trigger() {

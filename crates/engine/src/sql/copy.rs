@@ -642,7 +642,7 @@ fn bind_copy_record(
 
     let mut bound_values: Vec<Value> = vec![Value::Null; schema.columns.len()];
     let mut provided = vec![false; schema.columns.len()];
-    // `defer_not_null` の区間で `\N` を受けた NOT NULL 列（`VolatileColumn::MissingNotNull` として運ぶ）。
+    // `defer_not_null` の区間で `\N` を受けた NOT NULL 列（`VolatileColumn::DeferredNull` として運ぶ）。
     let mut deferred_null_columns: Vec<usize> = Vec::new();
 
     for (name, field) in columns.iter().zip(fields.iter()) {
@@ -786,7 +786,7 @@ fn bind_copy_record(
     volatile_default_columns.extend(
         deferred_null_columns
             .into_iter()
-            .map(crate::sql::parser::VolatileColumn::MissingNotNull),
+            .map(crate::sql::parser::VolatileColumn::DeferredNull),
     );
     // `DEFAULT nextval` の列は COPY では採番しない（TABLE-24・Issue #1690。fail-closed）。
     if volatile_default_columns.iter().any(|c| {
