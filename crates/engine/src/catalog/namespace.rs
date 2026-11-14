@@ -935,6 +935,17 @@ mod tests {
         assert!(RelationKey::parse("#18446744073709551615.t").is_ok());
     }
 
+    /// `SET SCHEMA` の所有判定（`strip_prefix(schema_prefix(id))`）は接頭辞に `.` を含むため、
+    /// スキーマ 1 の判定が `#12.`・`#10.` 配下のキーを自分のものと誤認しない（Issue #3198 の回帰）。
+    #[test]
+    fn schema_prefix_strip_does_not_match_longer_ids() {
+        let p = RelationKey::schema_prefix(1);
+        assert_eq!("#1.idx".strip_prefix(p.as_str()), Some("idx"));
+        assert_eq!("#12.idx".strip_prefix(p.as_str()), None);
+        assert_eq!("#10.seq".strip_prefix(p.as_str()), None);
+        assert_eq!("#123.seq".strip_prefix(p.as_str()), None);
+    }
+
     #[test]
     fn schema_prefix_range_excludes_longer_ids() {
         let start = RelationKey::schema_prefix(1);
