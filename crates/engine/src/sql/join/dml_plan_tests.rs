@@ -287,3 +287,49 @@ fn plain_set_copy_of_non_expression_types_is_planned_as_copy() {
         assert_eq!(p.source.columns, vec![1]);
     }
 }
+
+/// `RETURNING` が参照する source 列は SET の列の後ろへ重複なしで追記され、SET の位置は動かない
+/// （Issue #3204）。セル位置は走査投影の並び（疑似列 `id` を使うときは先頭）に一致する。
+#[test]
+fn returning_appends_source_columns_after_set_without_moving_them() {
+    let p = upd(
+        "UPDATE docs SET n = langs.cnt FROM langs WHERE docs.lang = langs.lang \
+         RETURNING langs.cnt, langs.label, langs.id, docs.n",
+    )
+    .unwrap();
+    // SET 由来の cnt(5) だけが式評価ビューの列。RETURNING 専用の列は別に持つ。
+    assert_eq!(p.source.columns, vec![5]);
+    assert_eq!(p.source.returning_columns, vec![5, 1]);
+    assert!(p.source.include_pseudo_id);
+    // 式評価ビューの並びは SET + キー（lang(0)）。走査投影はその後ろへ RETURNING 専用の label(1)。
+    assert_eq!(p.source_columns(), vec![5, 0]);
+    assert_eq!(p.scan_columns(), vec![5, 0, 1]);
+    let ret = p.returning.as_ref().expect("returning");
+    let cells: Vec<Option<usize>> = ret
+        .columns
+        .iter()
+        .map(|c| {
+            p.source_cell_position(c.slot)
+                .ok()
+                .filter(|_| c.relation == 1)
+        })
+        .collect();
+    // 疑似列 id が位置 0、列は +1（cnt = 1、label = 3）。対象表の列は None。
+    assert_eq!(cells, vec![Some(1), Some(3), Some(0), None]);
+    assert_eq!(p.update.as_ref().expect("update").items[0].column_index, 2);
+}
+
+/// DELETE でも RETURNING の列だけが走査へ載り、使わない列は載らない。
+#[test]
+fn delete_returning_projects_only_referenced_source_columns() {
+    let p = del("DELETE FROM docs USING langs WHERE docs.lang = langs.lang RETURNING langs.label")
+        .unwrap();
+    assert!(p.source.columns.is_empty());
+    assert_eq!(p.source.returning_columns, vec![1]);
+    assert_eq!(p.scan_columns(), vec![0, 1]);
+    assert!(!p.source.include_pseudo_id);
+    assert!(p.returning.is_some());
+    let none = del("DELETE FROM docs USING langs WHERE docs.lang = langs.lang").unwrap();
+    assert!(none.source.columns.is_empty());
+    assert!(none.returning.is_none());
+}

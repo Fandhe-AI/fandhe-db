@@ -16,12 +16,14 @@ use crate::recovery::content_hash::{
 use crate::recovery::required_op_id::{LedgerMode, OperationId};
 use crate::row_codec::Value;
 use crate::sql::allowlist::SqlSurfaceError;
+use crate::sql::dml_from_returning::{bind_from_returning, DmlFromReturning, DmlFromReturningItem};
 use crate::sql::exec::Cell;
 use crate::sql::join::dml::{
     EquiKey, JoinedDmlPlan, JoinedDmlSource, JoinedDmlTarget, JoinedSetItem, JoinedUpdateSet,
 };
 use crate::sql::join::JoinLimits;
 use crate::sql::mode::SessionState;
+use crate::sql::relation::{BindingScope, ColumnRef, ColumnSlot, TableRef};
 use crate::sql::udf_call::{BinOp, Expr};
 use crate::storage::{Storage, Visibility};
 use crate::tenant::WriteTarget;
@@ -162,10 +164,12 @@ fn plan(keys: Vec<EquiKey>, update: Option<JoinedUpdateSet>) -> JoinedDmlPlan {
             where_predicates: Vec::new(),
             // 結合ビュー上の位置: s_k = 3、s_v = 4。
             columns: vec![1, 2],
+            returning_columns: Vec::new(),
+            include_pseudo_id: false,
         },
         keys,
         update,
-        returning_references_source: false,
+        returning: None,
     }
 }
 
@@ -244,7 +248,6 @@ fn exec_with(
         plan,
         None,
         &default_hash(plan),
-        None,
         limits,
         max_affected.and_then(std::num::NonZeroUsize::new),
         max_scanned,
@@ -555,7 +558,6 @@ fn autocommit_target_is_rejected_with_0a000() {
             &delete_using(),
             None,
             &del_hash(DEL_SQL),
-            None,
         )
         .err()
         .expect("reject");
@@ -563,14 +565,101 @@ fn autocommit_target_is_rejected_with_0a000() {
     assert_eq!(xs(&core, &alice).len(), 3);
 }
 
+/// `RETURNING` を持つ計画にする（束縛は本番と同じ `bind_from_returning`、セル位置は計画が確定する）。
+fn with_returning(mut p: JoinedDmlPlan, items: Vec<DmlFromReturningItem>) -> JoinedDmlPlan {
+    let (t, s) = (t_schema(), s_schema());
+    let scope =
+        BindingScope::new(vec![(TableRef::new("t"), &t), (TableRef::new("s"), &s)]).expect("scope");
+    let mut bound =
+        bind_from_returning(&DmlFromReturning { items }, &scope).expect("bind RETURNING");
+    bound
+        .assign_source_cells(|_, slot| p.source_cell_position(slot))
+        .expect("assign");
+    p.returning = Some(bound);
+    p
+}
+
+fn col(q: &str, n: &str) -> DmlFromReturningItem {
+    DmlFromReturningItem::Column(ColumnRef::qualified(q, n))
+}
+
 #[test]
-fn returning_that_references_the_source_is_rejected_with_0a000() {
+fn update_returning_returns_new_target_values_with_the_matched_source_row() {
     let (core, _g, alice) = setup();
-    let mut p = delete_using();
-    p.returning_references_source = true;
-    let err = exec(&core, &alice, &p).err().expect("reject");
-    assert_eq!(err.wire_code(), "0A000");
-    assert_eq!(xs(&core, &alice).len(), 3);
+    let p = with_returning(update_from_s_v(), vec![col("t", "x"), col("s", "v")]);
+    let out = exec(&core, &alice, &p).expect("update returning");
+    assert_eq!(out.rows_affected, 2);
+    let rows = out.returning_rows.expect("rows");
+    // 更新後の対象値と、SET に使った一致行（多重一致は走査順の先頭）の値の組。
+    let got: Vec<(u64, Vec<Cell>)> = rows.into_iter().map(|r| (r.id, r.cells)).collect();
+    assert_eq!(
+        got,
+        vec![
+            (1, vec![Cell::SignedInteger(100), Cell::SignedInteger(100)]),
+            (2, vec![Cell::SignedInteger(300), Cell::SignedInteger(300)]),
+        ]
+    );
+    assert_eq!(xs(&core, &alice), vec![(1, 100), (2, 300), (3, 30)]);
+}
+
+#[test]
+fn delete_returning_returns_pre_delete_values_with_source_columns() {
+    let (core, _g, alice) = setup();
+    let p = with_returning(delete_using(), vec![col("t", "x"), col("s", "v")]);
+    let out = exec(&core, &alice, &p).expect("delete returning");
+    assert_eq!(out.rows_affected, 2);
+    let rows = out.returning_rows.expect("rows");
+    let got: Vec<Vec<Cell>> = rows.into_iter().map(|r| r.cells).collect();
+    assert_eq!(
+        got,
+        vec![
+            vec![Cell::SignedInteger(10), Cell::SignedInteger(100)],
+            vec![Cell::SignedInteger(20), Cell::SignedInteger(300)],
+        ]
+    );
+    assert_eq!(xs(&core, &alice), vec![(3, 30)]);
+}
+
+#[test]
+fn returning_with_an_unresolved_source_position_fails_closed_without_side_effects() {
+    let (core, _g, alice) = setup();
+    let mut p = update_from_s_v();
+    let (t, s) = (t_schema(), s_schema());
+    let scope =
+        BindingScope::new(vec![(TableRef::new("t"), &t), (TableRef::new("s"), &s)]).expect("scope");
+    // 位置を確定しないまま実行へ渡すと、副作用なしで XX000。
+    p.returning = Some(
+        bind_from_returning(
+            &DmlFromReturning {
+                items: vec![col("s", "v")],
+            },
+            &scope,
+        )
+        .expect("bind"),
+    );
+    let err = exec(&core, &alice, &p).err().expect("fail closed");
+    assert_eq!(err.wire_code(), "XX000");
+    assert_eq!(xs(&core, &alice), vec![(1, 10), (2, 20), (3, 30)]);
+}
+
+#[test]
+fn source_cell_position_rejects_columns_missing_from_the_scan_projection() {
+    let p = delete_using();
+    // 走査の投影は [s.k(1), s.v(2)] の順。疑似列 id と未取得列は fail-closed。
+    assert_eq!(p.source_cell_position(ColumnSlot::Column(1)).ok(), Some(0));
+    assert_eq!(p.source_cell_position(ColumnSlot::Column(2)).ok(), Some(1));
+    assert_eq!(
+        p.source_cell_position(ColumnSlot::Id)
+            .err()
+            .map(|e| e.wire_code()),
+        Some("XX000")
+    );
+    assert_eq!(
+        p.source_cell_position(ColumnSlot::Column(0))
+            .err()
+            .map(|e| e.wire_code()),
+        Some("XX000")
+    );
 }
 
 /// Ledgered 構成の core。t = {1:(10,a), 2:(20,b), 3:(30,c)}、s = {1:(a,100), 2:(a,200), 3:(b,300)}
@@ -642,7 +731,6 @@ fn exec_op(
         plan,
         op.as_ref(),
         hash,
-        None,
         limits,
         None,
         1_000_000,
@@ -817,7 +905,6 @@ fn same_transaction_replay_is_23505() {
             &update_from_s_v(),
             Some(&op),
             &h,
-            None,
             &JoinLimits::default(),
             None,
             1_000_000,
@@ -911,7 +998,6 @@ fn explicit_transaction_sees_uncommitted_source_rows_and_rolls_back() {
             &update_from_s_v(),
             None,
             &upd_hash(UPD_SQL),
-            None,
             &JoinLimits::default(),
             None,
             1_000_000,
@@ -992,6 +1078,8 @@ fn update_from_assigns_time_timestamptz_interval_bpchar_and_array_source_columns
             schema: ss,
             where_predicates: Vec::new(),
             columns: vec![2, 3, 4, 5, 6],
+            returning_columns: Vec::new(),
+            include_pseudo_id: false,
         },
         keys: vec![EquiKey {
             target_column: Some(1),
@@ -1002,7 +1090,7 @@ fn update_from_assigns_time_timestamptz_interval_bpchar_and_array_source_columns
             literal_assignments: Vec::new(),
             items,
         }),
-        returning_references_source: false,
+        returning: None,
     };
     let out = exec(&core, &alice, &plan).expect("update");
     assert_eq!(out.rows_affected, 1);
