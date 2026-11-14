@@ -2,8 +2,9 @@
 //!
 //! 発火側（`trigger::fire`）が NEW 行などを [`TriggerCall`] に詰めて [`TriggerFunctionInvoker`] を
 //! 呼び、[`TriggerOutcome`] を受け取る。トリガ関数の実体（PL/pgSQL 関数・Issue #2228）はこの
-//! トレイトを実装して差し替える。既定の [`UnwiredInvoker`] は固定文言の `0A000` を返し、実体が
-//! 無い間にトリガを黙って飛ばさない（fail-closed。実行モデルの D8）。
+//! トレイトを実装して差し替える。本番の既定は `PlpgsqlTriggerInvoker`（Issue #3185）。
+//! テスト専用の [`UnwiredInvoker`] は固定文言の `0A000` を返し、発火側の意味論を invoker から切り離して固定する。
+//! 未結線の経路は黙ってトリガを飛ばさない（fail-closed。実行モデルの D8）。
 
 use super::write_handle::TriggerWriteHandle;
 use crate::catalog::trigger::{TriggerLevel, TriggerTiming};
@@ -100,8 +101,6 @@ pub(crate) enum TriggerOutcome {
 /// `#<id>.<name>` を `TG_TABLE_NAME` に出さないため、呼び出し側が解決して渡す）。NEW／OLD は行トリガ
 /// の該当する側だけ値を持ち、それ以外（INSERT の OLD・DELETE の NEW・文トリガ）は未代入にする。
 /// 値の変換ができない列型（表現できない型）は固定文言の `0A000`（fail-closed）。
-// 本番の invoker は既定への差し替え（#3185）まで未結線のため、通常ビルドでは未使用になる。
-#[allow(dead_code)]
 pub(crate) fn trigger_vars_from_call(
     call: &TriggerCall<'_>,
     table_name: &str,
@@ -174,16 +173,13 @@ pub(crate) trait TriggerFunctionInvoker: Send + Sync {
 /// 実装し、`TriggerRuntime::bind` が文ごとに束縛する。`Sync` を要求するのは、未束縛の通過証
 /// （`TriggerRuntime<'static>`）を持つ `EngineCore` の `Send`／`Sync` を保つため。
 pub(crate) trait TriggerHost: Sync {
-    #[cfg_attr(not(test), allow(dead_code))] // 呼び出し元の本番 invoker が #3185 まで未構築。
     /// `call` のトリガ関数を、`call.writes` が借用する外側の write txn・呼び出しテナントの文脈の上で
     /// 1 回実行する。エラーは [`SqlSurfaceError`] のまま返し、文の取り消しは発火側が担う。
     fn invoke_trigger(&self, call: &TriggerCall<'_>) -> Result<TriggerOutcome, SqlSurfaceError>;
 }
 
 /// 本番の呼び出し口（Issue #3184）。`call.host`（`EngineCore`）へ委譲するだけで状態を持たない。
-/// 既定への差し替え（`EngineCore::new`）と wire 経由の検証は #3185 の担当で、それまではテストが
-/// `with_trigger_invoker_for_test` で注入する。ホスト未束縛の経路は固定文言の `0A000`（fail-closed）。
-#[cfg_attr(not(test), allow(dead_code))]
+/// `EngineCore` の既定（Issue #3185。`TriggerRuntime::production`）。ホスト未束縛の経路は固定文言の `0A000`（fail-closed）。
 pub(crate) struct PlpgsqlTriggerInvoker;
 
 impl TriggerFunctionInvoker for PlpgsqlTriggerInvoker {
@@ -197,9 +193,11 @@ impl TriggerFunctionInvoker for PlpgsqlTriggerInvoker {
     }
 }
 
-/// 実体が結線されていない間の既定の呼び出し口（常に固定文言の `0A000`）。
+/// テスト専用の未結線の呼び出し口（常に固定文言の `0A000`）。
+#[cfg(test)]
 pub(crate) struct UnwiredInvoker;
 
+#[cfg(test)]
 impl TriggerFunctionInvoker for UnwiredInvoker {
     fn invoke(&self, _call: &TriggerCall<'_>) -> Result<TriggerOutcome, SqlSurfaceError> {
         Err(SqlSurfaceError::FeatureNotSupported {

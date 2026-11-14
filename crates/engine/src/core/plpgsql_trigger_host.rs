@@ -35,7 +35,6 @@ use crate::trigger::call::{trigger_vars_from_call, TriggerCall, TriggerHost, Tri
 use crate::trigger::write_handle::TriggerWriteHandle;
 
 /// 発火元の主体の写しが無い（セッションを持たない入口から発火した）ときの固定文言。
-#[cfg_attr(not(test), allow(dead_code))]
 const NO_SUBJECT: &str = "trigger function execution requires a session context";
 
 /// 本体で実行できない形の固定文言（値・表名・他テナントの情報を含めない）。
@@ -92,9 +91,6 @@ impl TriggerHost for EngineCore {
     }
 }
 
-// 本番の invoker は #3185 が既定へ差し替えるまでテストからだけ構築されるため、呼び出し連鎖の末端も
-// 通常ビルドでは未使用になる。
-#[cfg_attr(not(test), allow(dead_code))]
 impl EngineCore {
     /// 構文解析が書き込み文の `operation_id` 必須化の判定に使う台帳モード。通常は構成のとおりで、
     /// トリガ本体の解析中（[`BodyParseScope`]）だけ必須化を外す（`Ledgered` を `Optional` へ。台帳を持たない構成は

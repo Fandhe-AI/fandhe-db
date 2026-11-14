@@ -59,7 +59,8 @@ impl<'a> TriggerWriteHandle<'a> {
     /// 表 `table`（裸の識別子）へ 1 行（`values` は `schema.columns` と同じ幅・順）を、呼び出し
     /// テナントの行として書く。`id` は従来方式の表の利用者指定 id（採番方式・移行済みの表では
     /// `None` で払い出す）。制約検査・索引同期・世代の更新は SQL `INSERT` と同じ経路で行う。
-    // 実体（#2228）が使うまでは、本クレート内ではテストだけが呼ぶ。
+    // 本番のホスト（Issue #3184・#3185）は本文の INSERT を SQL 経路で実行するため、この窓口の呼び出し元は
+    // 他表への書き込みを注入するテストだけ。
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn insert_row(
         &self,
@@ -112,7 +113,6 @@ impl<'a> TriggerWriteHandle<'a> {
 
     /// 呼び出しテナントの文脈（読み取り専用の借用。差し替える手段は無い）。トリガ用ホストが、主体の写しの
     /// 解決テナントと照合するのと、`CorePlHost` の `ctx` に使う（Issue #3184）。
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn policy_context(&self) -> &'a PolicyContext {
         self.ctx
     }
@@ -120,7 +120,6 @@ impl<'a> TriggerWriteHandle<'a> {
     /// 呼び出しテナントの scope から、同じ write txn 内で関数定義を 1 件引く（引数なしの関数。トリガ関数は
     /// 引数を持たない）。不在・他テナントの関数は区別のない `None`（scope が構造上テナントに固定される）。
     /// カタログの I/O 失敗は固定文言の `Internal` に丸める（Issue #3184）。
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn function_def(
         &self,
         function_key: &str,
