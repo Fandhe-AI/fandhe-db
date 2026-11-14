@@ -21,13 +21,13 @@ thread_local! {
 }
 
 /// 行ごとループの区間を張る RAII ガード。drop（エラー・早期 return・panic を含む）で必ず戻す。
-pub(super) struct RowLoopScope {
+pub(crate) struct RowLoopScope {
     key: String,
 }
 
 impl RowLoopScope {
     /// 表 `table` の行ごとループの開始時に呼ぶ。
-    pub(super) fn enter(table: &str) -> Self {
+    pub(crate) fn enter(table: &str) -> Self {
         let key = table.to_ascii_lowercase();
         ACTIVE.with(|a| {
             let mut m = a.borrow_mut();
