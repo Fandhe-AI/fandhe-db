@@ -677,8 +677,14 @@ fn write_inner(path: &str) -> Result<(), String> {
         // 進捗行はスクリプト側が「書き込みが実際に進み始めた」ことを検知する同期点
         // なので、バッファリングで遅延しないよう毎回明示的に flush する
         // （`crash_tool_cross_table.rs` と同方針）。
-        writeln!(handle, "COMMITTED batch={} rows={}", progress.0, progress.1)
-            .map_err(|e| format!("stdout write failed: {e}"))?;
+        // FK 親子表の確認済み件数（`idfk_parent` / `idfk_child`）も併記する。スクリプト側は復旧後の
+        // 件数がこれを下回らないことを確かめ、確認済みの最終バッチ消失（親子の末尾が揃って消える場合を含む）を検出する。
+        writeln!(
+            handle,
+            "COMMITTED batch={} rows={} idfk_parent={} idfk_child={}",
+            progress.0, progress.1, idfk_parent_next, idfk_child_next
+        )
+        .map_err(|e| format!("stdout write failed: {e}"))?;
         handle
             .flush()
             .map_err(|e| format!("stdout flush failed: {e}"))?;
@@ -698,8 +704,10 @@ fn write_inner(path: &str) -> Result<(), String> {
 
 fn run_verify(path: &str) -> i32 {
     match verify_inner(path) {
-        Ok((rows, batches)) => {
-            println!("RESULT ok=true rows={rows} batches={batches}");
+        Ok((rows, batches, idfk_parent, idfk_child)) => {
+            println!(
+                "RESULT ok=true rows={rows} batches={batches} idfk_parent={idfk_parent} idfk_child={idfk_child}"
+            );
             0
         }
         Err(reason) => {
@@ -709,7 +717,7 @@ fn run_verify(path: &str) -> i32 {
     }
 }
 
-fn verify_inner(path: &str) -> Result<(u64, u64), String> {
+fn verify_inner(path: &str) -> Result<(u64, u64, u64, u64), String> {
     let core = open_core(path)?;
     let ctx = tenant_ctx()?;
     // 両表に同じオラクルを適用する。報告する行数・バッチ数は `docs` のもの。
@@ -723,13 +731,13 @@ fn verify_inner(path: &str) -> Result<(u64, u64), String> {
     }
     verify_pk_table(&core, &ctx)?;
     verify_nopk_table(&core, &ctx)?;
-    verify_idfk_tables(&core, &ctx)?;
+    let (idfk_parent, idfk_child) = verify_idfk_tables(&core, &ctx)?;
     let counts = verify_migrated_id_contract(&core, &ctx)?;
     // 開き直しを繰り返しても件数が変わらない（移行は 2 回目以降は何もしない）。同一 DB を二重に開けない
     // ため、先に開いている `core` を手放してから確かめる。
     drop(core);
     verify_reopen_stable(path, &ctx, &counts)?;
-    Ok(summary)
+    Ok((summary.0, summary.1, idfk_parent, idfk_child))
 }
 
 /// 0 起点で欠落・重複なく連続しているか（rowid の再払い出しで行が上書き・消失した場合も検出する）。
@@ -854,7 +862,7 @@ fn verify_nopk_table(core: &EngineCore, ctx: &PolicyContext) -> Result<(), Strin
 /// 採番方式の親子表（親の `id` 列への FK。Issue #3182・TABLE-17・TABLE-23）の検証。
 /// 通常行の連続性・BATCH 整合、孤児が無いこと、一時の組の連鎖が全部残る／全部消えるのどちらかである
 /// こと、FK・PK の拒否プローブ（常に拒否される前提で成功時は副作用なし）、読み取り専用の一意索引検証。
-fn verify_idfk_tables(core: &EngineCore, ctx: &PolicyContext) -> Result<(), String> {
+fn verify_idfk_tables(core: &EngineCore, ctx: &PolicyContext) -> Result<(u64, u64), String> {
     let parents_main = read_idfk_main_column(core, ctx, IDFK_PARENT, "id")
         .map_err(|e| format!("{IDFK_PARENT}: {e}"))?;
     let children_main = read_idfk_main_column(core, ctx, IDFK_CHILD, "cid")
@@ -950,7 +958,8 @@ fn verify_idfk_tables(core: &EngineCore, ctx: &PolicyContext) -> Result<(), Stri
         }
     }
     // 子を持つ親の削除プローブは行わない（CASCADE のため受理されて副作用を残す）。
-    Ok(())
+    // 復旧後の通常行の件数（親・子）を返す。呼び出し側が確認済み件数の下限と突き合わせる。
+    Ok((parent_total, child_total))
 }
 
 /// 従来方式の表（`docs`・`docs_uidx`。再 open ごとに `MigratedId` へ移行済み）の `id` 契約
