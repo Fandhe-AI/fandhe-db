@@ -145,11 +145,11 @@ fn wire_extended_query_fires_trigger() {
     assert_eq!(select_col(&mut s, "SELECT n FROM tt"), vec!["105"]);
 }
 
-/// 未対応の本体（本体の UPDATE）は `0A000` の ErrorResponse と ReadyForQuery で返り、同じ接続で次の文が
+/// 未対応の本体（本体の DELETE）は `0A000` の ErrorResponse と ReadyForQuery で返り、同じ接続で次の文が
 /// 実行でき、本表・監査に残渣が無い。
 ///
-/// tracked: #3186, #3187
-/// 本体の `UPDATE`・`DELETE` は窓口を広げる #3186・#3187 までの暫定の拒否。
+/// tracked: #3187
+/// 本体の `DELETE` は窓口を広げる #3187 までの暫定の拒否（UPDATE は dispatch 済み）。
 #[test]
 fn wire_unsupported_body_is_0a000_and_connection_survives() {
     let (addr, _g) = serve();
@@ -158,7 +158,7 @@ fn wire_unsupported_body_is_0a000_and_connection_survives() {
     exec(
         &mut s,
         "CREATE FUNCTION upd() RETURNS trigger LANGUAGE plpgsql AS $$ \
-         BEGIN INSERT INTO audit (lv) VALUES ('x'); UPDATE audit SET lv = 'y'; RETURN NEW; END $$",
+         BEGIN INSERT INTO audit (lv) VALUES ('x'); DELETE FROM audit WHERE lv = 'x'; RETURN NEW; END $$",
     );
     exec(
         &mut s,

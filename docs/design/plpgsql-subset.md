@@ -1043,7 +1043,7 @@ Issue #2228 の内部 API（`invoke_trigger_function_in_txn`）は両方を要�
 
 `EngineCore` の既定の呼び出し口を `PlpgsqlTriggerInvoker` に差し替えた（`TriggerRuntime::production`・`assemble` の 1 箇所）。
 トリガのある表への INSERT は、SQL・wire のどちらからも `0A000` にならず BEFORE ROW・AFTER STATEMENT が発火する。
-#3184 節の「#3185 の担当」はこれで解消した。
+Issue #3184 節の「#3185 の担当」はこれで解消した。
 
 - 未結線の `UnwiredInvoker`・`TriggerRuntime::unwired`・`with_invoker`・`EngineCore::with_trigger_invoker_for_test` は
   `cfg(test)` 限定のテスト専用口（発火側の意味論を invoker から切り離して固定する）。起動フラグ・セッション変数で
