@@ -4,7 +4,7 @@
 //! 契約: 構文・表の存在確認・列解決・型照合が `EngineCore` の入口（`parse_sql`・Describe・
 //! autocommit／明示トランザクションの実行・拡張クエリの Parse）で一貫して働く。束縛と変換を通った文は
 //! 結合実行器へ dispatch され（#3202）、変換できない形と `USING OPERATION_ID` 付き（#3203 まで）は
-//! 副作用ゼロの `0A000` で fail-closed に拒否する。`RETURNING` は #3204 の担当。
+//! 副作用ゼロの `0A000` で fail-closed に拒否する。`RETURNING`（`*`・`<公開名>.*`・列参照）は #3204 で結線済み。
 //! 既存の単一表 DML（`DELETE ... USING OPERATION_ID` を含む）は挙動を変えない。
 //! ポインタ: `docs/design/update-from-delete-using.md`。
 
@@ -310,14 +310,23 @@ fn rejected_forms_fail_closed_with_expected_codes() {
             "UPDATE nope SET lang = 'x' FROM langs WHERE nope.lang = langs.lang",
             "42P01",
         ),
-        // RETURNING 併用（#1756）
+        // RETURNING の非修飾 id は両表が持つ疑似列のため曖昧（PG 17 と同じ。#3204）
         (
             "UPDATE docs SET lang = 'x' FROM langs WHERE docs.lang = langs.lang RETURNING id",
-            "0A000",
+            "42702",
         ),
         (
             "DELETE FROM docs USING langs WHERE docs.lang = langs.lang RETURNING id",
-            "0A000",
+            "42702",
+        ),
+        // RETURNING の式・別名（Phase 3 の担当。従来の RETURNING と同じ 42601）
+        (
+            "UPDATE docs SET lang = 'x' FROM langs WHERE docs.lang = langs.lang RETURNING docs.n AS m",
+            "42601",
+        ),
+        (
+            "DELETE FROM docs USING langs WHERE docs.lang = langs.lang RETURNING lower(langs.label)",
+            "42601",
         ),
         // PARTITIONED 併用
         (
@@ -535,6 +544,33 @@ fn describe_reports_bind_errors_and_no_columns_for_valid_forms() {
         code(core.describe_parsed_in_session(&session, &parsed)),
         "42702"
     );
+}
+
+/// `RETURNING` つきの形は Describe が列名・型を返し、列数は項目の展開結果と一致する（#3204）。
+#[test]
+fn describe_reports_returning_columns() {
+    let (core, path) = new_core("sql53-from-describe-ret", false);
+    let _g = CleanupGuard(path);
+    let session = SessionState::default();
+    let cols = |sql: &str| {
+        let parsed = core.parse_sql(sql).expect("parse");
+        core.describe_parsed_in_session(&session, &parsed)
+            .unwrap_or_else(|e| panic!("describe failed for {sql}: {e:?}"))
+            .map(|m| m.len())
+    };
+    let upd = "UPDATE docs SET lang = langs.lang FROM langs WHERE docs.lang = langs.lang";
+    assert_eq!(
+        cols(&format!("{upd} RETURNING docs.id, langs.label")),
+        Some(2)
+    );
+    // docs: id・embedding・lang・n、langs: id・lang・label・flag（疑似 id を持つ従来方式の表）。
+    assert_eq!(cols(&format!("{upd} RETURNING *")), Some(8));
+    assert_eq!(cols(&format!("{upd} RETURNING langs.*")), Some(4));
+    assert_eq!(
+        cols("DELETE FROM docs USING langs WHERE docs.lang = langs.lang RETURNING langs.label;"),
+        Some(1)
+    );
+    assert_eq!(cols(upd), None);
 }
 
 /// 明示トランザクション内でも実行され、COMMIT で永続化・ROLLBACK で巻き戻る（`mark_written` の実証）。

@@ -4,6 +4,7 @@
 //! （`dml_join_exec::execute_joined_dml_in`）の橋渡しだけを担う。autocommit は `core.rs` が文単位の暗黙
 //! トランザクションへ振り分け、明示トランザクションは共有 write txn 上で実行して `mark_written` する。
 //! 束縛・変換の拒否（`42702`・`42P01`・`42804`・`0A000` 等）は Execute でも Describe でも同じコードで返る。
+//! `RETURNING` つき（Issue #3204）は `SqlOutcome::Returning` を返し、Describe は同じ列メタデータを返す。
 //!
 //! `USING OPERATION_ID` 付きの文は、台帳の SQL 経路結線（Issue #3203）まで固定文言の `0A000` で拒否する
 //! （黙って捨てると再送が二重適用される fail-open になるため）。ゲートは `prepare_update_from`／
@@ -14,13 +15,16 @@
 //!
 //! 呼び出し元: `core.rs` の明示トランザクション腕・Describe 腕の `ParsedSql::UpdateFrom`／`DeleteUsing`。
 
+use super::dml_join_exec::JoinedDmlOutcome;
 use super::EngineCore;
 use crate::catalog::TableSchema;
 use crate::policy::PolicyContext;
 use crate::sql::allowlist::{SqlSurfaceError, ValidatedDeleteUsing, ValidatedUpdateFrom};
-use crate::sql::exec::{DeleteOutcome, UpdateOutcome};
+use crate::sql::dml_from_returning::column_meta;
+use crate::sql::exec::{DeleteOutcome, QueryResult, ReturningOutcome, UpdateOutcome};
 use crate::sql::join::dml::JoinedDmlPlan;
 use crate::sql::mode::SessionState;
+use crate::sql::returning::DmlCommand;
 use crate::sql::transaction::SessionTransaction;
 use crate::sql::udf_call::UdfRegistry;
 use crate::sql::SqlOutcome;
@@ -140,9 +144,13 @@ impl EngineCore {
         stmt: &ValidatedUpdateFrom,
     ) -> Result<SqlOutcome, SqlSurfaceError> {
         let plan = self.prepare_update_from(stmt, session.udfs())?;
-        let rows_affected =
-            self.run_joined_in_txn(ctx, session, txn, &plan, stmt.statement_hash())?;
-        Ok(SqlOutcome::Update(UpdateOutcome { rows_affected }))
+        let out = self.run_joined_in_txn(ctx, session, txn, &plan, stmt.statement_hash())?;
+        Ok(joined_outcome(
+            &plan,
+            out,
+            DmlCommand::Update,
+            |rows_affected| SqlOutcome::Update(UpdateOutcome { rows_affected }),
+        ))
     }
 
     /// `DELETE ... USING` の [`Self::execute_update_from_in_txn`] 相当。
@@ -154,9 +162,13 @@ impl EngineCore {
         stmt: &ValidatedDeleteUsing,
     ) -> Result<SqlOutcome, SqlSurfaceError> {
         let plan = self.prepare_delete_using(stmt, session.udfs())?;
-        let rows_affected =
-            self.run_joined_in_txn(ctx, session, txn, &plan, stmt.statement_hash())?;
-        Ok(SqlOutcome::Delete(DeleteOutcome { rows_affected }))
+        let out = self.run_joined_in_txn(ctx, session, txn, &plan, stmt.statement_hash())?;
+        Ok(joined_outcome(
+            &plan,
+            out,
+            DmlCommand::Delete,
+            |rows_affected| SqlOutcome::Delete(DeleteOutcome { rows_affected }),
+        ))
     }
 
     /// 結合形 DML の共通実行本体。writer 取得 → 実行器 → `mark_written` を行い、影響行数を返す。
@@ -167,7 +179,7 @@ impl EngineCore {
         txn: &mut SessionTransaction<'_>,
         plan: &JoinedDmlPlan,
         content_hash: &crate::recovery::content_hash::ContentHash,
-    ) -> Result<u64, SqlSurfaceError> {
+    ) -> Result<JoinedDmlOutcome, SqlSurfaceError> {
         // 最初の書き込み文で writer を取得する（待機超過は `55P03`。呼び出し元が `Failed` へ遷移）。
         txn.ensure_writer(ctx)?;
         let write_txn = txn.write_txn().ok_or_else(|| SqlSurfaceError::Internal {
@@ -175,7 +187,7 @@ impl EngineCore {
         })?;
         // トリガが書いた表も COMMIT 時の遅延 FK 検査の対象にする。
         let trigger_scope = crate::tenant::trigger_writes::TriggerWrittenTablesScope::enter();
-        // operation_id は #3203 まで常に `None`（付き文は prepare 段で拒否済み）。RETURNING は #3204。
+        // operation_id は #3203 まで常に `None`（付き文は prepare 段で拒否済み）。
         let out = self.execute_joined_dml_in(
             WriteTarget::InTxn(write_txn),
             ctx,
@@ -183,12 +195,33 @@ impl EngineCore {
             plan,
             None,
             content_hash,
-            None,
         )?;
         txn.mark_written(ctx.tenant_id(), &plan.target.table);
         for written in trigger_scope.take() {
             txn.mark_written(ctx.tenant_id(), &written);
         }
-        Ok(out.rows_affected)
+        Ok(out)
+    }
+}
+
+/// 実行結果を SQL 表層の応答へ写す。`RETURNING` つき（計画が持つ）なら `SqlOutcome::Returning`
+/// （列は計画の束縛結果、行は実行器が収集したもの）、なければ従来の件数だけの応答。
+/// `rows_affected` は書き込み層の実変更行数で、返却行数（RLS 再判定で減りうる）ではない。
+fn joined_outcome(
+    plan: &JoinedDmlPlan,
+    out: JoinedDmlOutcome,
+    command: DmlCommand,
+    plain: impl FnOnce(u64) -> SqlOutcome,
+) -> SqlOutcome {
+    match (&plan.returning, out.returning_rows) {
+        (Some(bound), Some(rows)) => SqlOutcome::Returning(ReturningOutcome {
+            command,
+            rows_affected: out.rows_affected,
+            result: QueryResult {
+                columns: column_meta(bound),
+                rows,
+            },
+        }),
+        _ => plain(out.rows_affected),
     }
 }

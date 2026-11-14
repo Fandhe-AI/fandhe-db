@@ -7,10 +7,11 @@
 //! 結合・一意化・上限の本体は `sql::join::dml`、書き込み・制約検査・世代 bump は `tenant` が担い、
 //! 本モジュールはゲート（`WriteTarget`・台帳・未対応形）と結果・エラーの写像だけを持つ。
 //!
-//! 結線状況（分岐 B）: Issue #1754（構文・束縛）が未マージのため SQL 文字列からの dispatch は
-//! まだ無く、構文段は従来どおり FROM／USING を拒否する（挙動不変）。#1754 のマージ後に `core.rs` の
-//! UPDATE／DELETE 分岐から本入口を呼ぶ（autocommit は `execute_subquery_dml_autocommit` と同じ
-//! 文単位の暗黙トランザクションに流す）。それまで本モジュールは単体テストからのみ到達する。
+//! 結線状況: SQL 文字列からの dispatch は `core::dml_from_exec`（Issue #3202）が本入口を呼ぶ
+//! （autocommit は `execute_subquery_dml_autocommit` と同じ文単位の暗黙トランザクション）。
+//! `RETURNING`（Issue #3204）は、計画（[`JoinedDmlPlan::returning`]）が `Some` のとき本入口が
+//! probe の走査結果と一致記録から収集コールバックを組み立てて書き込み経路へ渡し、返却行を
+//! [`JoinedDmlOutcome::returning_rows`] で返す。
 //!
 //! テナント境界（P0）: 対象側は既存の候補列挙（テナントのキー範囲に閉じた走査・所有かつ可視）だけ、
 //! FROM／USING 側は書き込むセッションの `PolicyContext`（RLS 暗黙適用）で走査する。エラー文言に
@@ -34,6 +35,8 @@ use crate::policy::PolicyContext;
 use crate::recovery::content_hash::ContentHash;
 use crate::recovery::required_op_id::OperationId;
 use crate::sql::allowlist::SqlSurfaceError;
+use crate::sql::dml_from_returning::{joined_returning_collector, FromRowRef};
+use crate::sql::exec::ResultRow;
 use crate::sql::join::dml::{JoinedDmlPlan, JoinedProbe};
 use crate::sql::join::JoinLimits;
 use crate::sql::mode::SessionState;
@@ -45,11 +48,12 @@ fn not_supported(detail: &str) -> SqlSurfaceError {
     }
 }
 
-/// 結合形 DML の実行結果。`matches` は一致した対象行 id と採った source の走査位置
-/// （Issue #1756 が FROM 側列参照の RETURNING で使う内部値）。
+/// 結合形 DML の実行結果。`matches` は一致した対象行 id と採った source の走査位置。
+/// `returning_rows` は計画が `RETURNING` を持つときの返却行（持たなければ `None`）。
 pub(crate) struct JoinedDmlOutcome {
     pub(crate) rows_affected: u64,
     pub(crate) matches: Vec<(u64, u32)>,
+    pub(crate) returning_rows: Option<Vec<ResultRow>>,
 }
 
 impl EngineCore {
@@ -64,7 +68,6 @@ impl EngineCore {
         plan: &JoinedDmlPlan,
         operation_id: Option<&OperationId>,
         content_hash: &ContentHash,
-        project: Option<&mut ReturningProjectFn<'_>>,
     ) -> Result<JoinedDmlOutcome, SqlSurfaceError> {
         let limits = JoinLimits {
             max_input_rows: self.join_limits.max_input_rows(),
@@ -79,7 +82,6 @@ impl EngineCore {
             plan,
             operation_id,
             content_hash,
-            project,
             &limits,
             self.dml_limits.max_affected_rows,
             self.scan_limits.max_scanned_rows(),
@@ -97,7 +99,6 @@ impl EngineCore {
         plan: &JoinedDmlPlan,
         operation_id: Option<&OperationId>,
         content_hash: &ContentHash,
-        project: Option<&mut ReturningProjectFn<'_>>,
         limits: &JoinLimits,
         max_affected_rows: Option<std::num::NonZeroUsize>,
         max_scanned_rows: usize,
@@ -108,11 +109,6 @@ impl EngineCore {
                 "UPDATE ... FROM / DELETE ... USING is not supported for this statement",
             ));
         };
-        if plan.returning_references_source {
-            return Err(not_supported(
-                "RETURNING with a column of the FROM / USING table is not supported yet",
-            ));
-        }
         let ledger_write = self
             .ledger_mode
             .resolve(operation_id)
@@ -160,6 +156,33 @@ impl EngineCore {
         let schema = &plan.target.schema;
         let target = WriteTarget::InTxn(write_txn);
         let needs_embedding_extra = probe.needs_embedding();
+
+        // RETURNING の収集（Issue #3204）。述語クロージャが probe を可変借用する一方、収集は
+        // 走査結果と一致記録の共有ハンドルだけを読む（書き込み経路は「候補列挙 → 適用」の順で、
+        // 適用段に入ってから収集を呼ぶため借用は重ならない。重なっても `XX000` で fail-closed）。
+        let index_handle = probe.index_handle();
+        let matches_handle = probe.matches_handle();
+        let index_ref: &crate::sql::join::dml::SourceIndex = &index_handle;
+        let lookup = |id: u64| -> Option<Vec<FromRowRef<'_>>> {
+            let pos = *matches_handle.try_borrow().ok()?.get(&id)?;
+            let row = index_ref.rows.get(usize::try_from(pos).ok()?)?;
+            Some(vec![FromRowRef { cells: &row.cells }])
+        };
+        let mut returning_rows: Vec<ResultRow> = Vec::new();
+        let mut returning_budget = 0usize;
+        let mut collector = plan.returning.as_ref().map(|bound| {
+            joined_returning_collector(
+                ctx,
+                bound,
+                // 採番方式の表は行 id を返さない（単一表の `RETURNING` と同じ規則）。
+                schema.is_allocated(),
+                &lookup,
+                &mut returning_budget,
+                &mut returning_rows,
+            )
+        });
+        let project: Option<&mut ReturningProjectFn<'_>> =
+            collector.as_mut().map(|c| c as &mut ReturningProjectFn<'_>);
 
         let result = crate::sql::exec::run_where_predicate(
             schema,
@@ -231,6 +254,7 @@ impl EngineCore {
                 }
             },
         );
+        drop(collector);
         let rows_affected = match result {
             Ok(PredicateDmlOutcome::Applied { rows_affected }) => rows_affected as u64,
             Ok(PredicateDmlOutcome::LimitExceeded { count }) => {
@@ -247,7 +271,8 @@ impl EngineCore {
         };
         Ok(JoinedDmlOutcome {
             rows_affected,
-            matches: probe.matches().to_vec(),
+            matches: probe.matches_sorted()?,
+            returning_rows: plan.returning.is_some().then_some(returning_rows),
         })
     }
 }

@@ -305,14 +305,26 @@ MAX_SCAN_RESULT_BYTES`・`sql::exec::MAX_CANDIDATE_SCALAR_BYTES` と同じ
 | ---- | ---- |
 | 名前解決 | `sql::relation::BindingScope`（`relations[0]` = 対象表、以降 FROM／USING の宣言順）を再利用。第 2 の解決器は作らない |
 | 受理する形 | `*`・`<公開名>.*`・列参照（修飾あり・なし）の並び。式・関数呼び出し・`AS` 別名は従来どおり `42601` |
-| 裸の `*` | 対象表の展開に続けて FROM／USING の各表を宣言順に並べる（JOIN の `SELECT *` と同規則。採番方式の表は疑似列 `id` なし）。PG 17 の実挙動との照合は結線時に行う |
+| 裸の `*` | 対象表の展開に続けて FROM／USING の各表を宣言順に並べる（JOIN の `SELECT *` と同規則。採番方式の表は疑似列 `id` なし）。PG 17.11 の `RETURNING *`（UPDATE・DELETE とも対象表 → FROM／USING の全列）と列順が一致することを Issue #3204 で照合した |
 | 出力列名・型 | 修飾つきでも列名のみ。型は `ColumnMeta` |
 | 対象表の列 | `returning::project_row` へ委譲。対象表の列だけを参照する場合は従来と同じ列・行（単体テストで完全一致を固定） |
 | RLS | 対象行は収集時に `PolicyContext::is_visible` で再判定。FROM／USING 側の各表は呼び出し側が書き込むセッションの `ctx` で独立に走査する（システム文脈を使わない）。結合の上限は可視行だけで数える |
 | 予算 | FROM／USING 側セルも確保前に `MAX_RETURNING_RESULT_BYTES` で検証（`54000`）。範囲外参照・一致行欠落は `XX000` |
 
-**申し送り（モード B）**: #1754／#1755 が未マージの時点の実装のため、`parse_update`／`parse_delete` と `core.rs` への結線、
-e2e の RLS 回帰テスト（差分比較・独立オラクル・自己結合・明示 txn）は後着側で行う。未接続の入口は従来どおり `42601` で fail-closed。
+**結線（Issue #3204）**: 構文段（`parse_dml_from_returning_clause`）→ 束縛（`sql::dml_from`。SET の束縛の後に同じスコープで束縛し、
+`42702`／`42P01`／`42703` は変換器の `0A000` より先に返る）→ 計画（`sql::join::dml_plan`）→ 実行（`core::dml_join_exec`）の順に接続した。
+
+- **source のセル位置**: 計画が `RETURNING` の参照列を走査の投影（`JoinedDmlSource::columns`）の末尾へ追記し（SET の位置は動かさない）、
+  疑似列 `id` が参照されるときは `include_pseudo_id` で取り出す。セル位置は `JoinedDmlPlan::source_cell_position` に一本化し、
+  結合キー・SET・`RETURNING` が同じ判定を共有する。位置が未確定・範囲外なら `XX000`（副作用ゼロ）。
+- **一致行の引き当て**: probe の走査結果と一致記録（対象行 id → 走査位置）を共有ハンドルで収集側へ渡す。述語クロージャ（書き込み）と
+  収集クロージャ（読み取り）は書き込み経路の「候補列挙 → 適用」の順で重ならず、借用の衝突は panic せず `XX000` にする。
+  返す source 行は SET の評価に使った行と同じ（多重一致は走査順の先頭）。
+- **値の意味論**: UPDATE は更新後の対象値と一致した source 行、DELETE は削除前の対象値。source の列型は SET と違い制限しない（セルの複製のため）。
+- **応答**: `SqlOutcome::Returning`。`rows_affected` は書き込み層の実変更行数で、RLS 再判定で返却行数が減っても独立。Describe は同じ列を返す。
+- **PG 17.11 との照合**: 非修飾の両表共通列は `42702`、`<公開名>.*` は該当表の全列、`AS` 別名は本リポでは `42601`（受理範囲を広げない）。
+- **まだ拒否する形**: `USING OPERATION_ID` との併用は台帳結線（#3203）まで `0A000`。トリガのある対象表は単一表の `RETURNING` と同じ契約で `0A000`。
+  FROM／USING が 2 表以上は変換器の `0A000`、式・関数・別名は `42601`（Phase 3）。FROM 側表の `SELECT` 権限が無いロールは `42501`（結合テストで固定）。
 
 ## 対象外・申し送り
 
