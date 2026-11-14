@@ -181,6 +181,7 @@ fn run_delete(
         max_total,
         None,
         Kind::Delete,
+        None,
         pred,
         hooks,
     )
@@ -253,6 +254,7 @@ fn update_completes_and_leaves_non_matching_rows() {
             assignments: &assignments,
             set_exprs: &[],
         },
+        None,
         match_x as Pred,
         &mut real_hooks(None),
     )
@@ -855,6 +857,7 @@ fn stale_expected_schema_is_rejected_before_any_change() {
         None,
         None,
         Kind::Delete,
+        None,
         match_x as Pred,
         &mut real_hooks(None),
     )
@@ -903,6 +906,7 @@ fn early_failure_on_resumed_first_chunk_still_reports_committed_total() {
         None,
         None,
         Kind::Delete,
+        None,
         match_x as Pred,
         &mut real_hooks(None),
     )
@@ -941,6 +945,7 @@ fn alter_table_between_chunks_stops_the_job() {
         None,
         None,
         Kind::Delete,
+        None,
         match_x as Pred,
         &mut real_hooks(Some(&mut hook)),
     )
@@ -970,6 +975,7 @@ fn disabled_ledger_is_rejected_without_touching_anything() {
         None,
         None,
         Kind::Delete,
+        None,
         match_x as Pred,
         &mut real_hooks(None),
     )
@@ -1053,6 +1059,7 @@ fn unique_violation_rolls_back_only_the_failing_chunk() {
             assignments: &assignments,
             set_exprs: &[],
         },
+        None,
         match_x as Pred,
         &mut real_hooks(None),
     )

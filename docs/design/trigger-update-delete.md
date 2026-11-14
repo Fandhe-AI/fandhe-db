@@ -19,15 +19,16 @@ Issue #1725（親 #1720）の実装記録。上位の決定は [trigger-executio
   後回しの区間（`DeferNotNullBindScope`）は `bind_*` 呼び出しの範囲だけで、表名で限定する
 - `UPDATE OF <列>` は、その列が `SET` の対象として書かれた文でだけ発火する。BEFORE による書き換えは
   判定に含めない（D7）
-- 分割実行 DML（`... PARTITIONED`）は、対象表に該当イベントのトリガ（行・文を問わない）が 1 つでもあれば
-  `0A000`。ジョブ記録・台帳照合より前に判定するので、第 1 チャンクでは commit 前に止まり副作用はゼロ（D8）
+- 分割実行 DML（`... PARTITIONED`）は、行トリガ（BEFORE／AFTER ROW）をチャンクごとに発火する（Issue #3283。
+  [trigger-partitioned-dml.md](trigger-partitioned-dml.md)）。文トリガ・子表のトリガがあれば `0A000`。
+  判定はジョブ記録・台帳照合より前なので、第 1 チャンクでは commit 前に止まり副作用はゼロ（D8）
 
 ## 経路ごとの扱い
 
 | 経路 | 扱い |
 | ---- | ---- |
 | SQL の UPDATE／DELETE（上記 3 形。ビュー経由・データ変更 CTE の副文も同じフォーム関数を通るため INSERT と同様に発火する） | 発火 |
-| 分割実行 DML | 該当イベントのトリガがあれば `0A000` |
+| 分割実行 DML | 行トリガは発火（Issue #3283）。文トリガ・子表のトリガは `0A000` |
 | `RETURNING` 付きの UPDATE／DELETE | 該当イベントのトリガがあれば `0A000`（最終値の投影は後続） |
 | UPSERT（`ON CONFLICT`） | 発火（#3191。`DO UPDATE` の更新側で BEFORE／AFTER ROW UPDATE。[trigger-upsert.md](trigger-upsert.md)）。`RETURNING` 付きは `0A000` |
 | NoSQL（HTTP）表層の単一行・述語形の更新・削除（Issue #3282 で結線。入口が通過証と発火元の主体の写しを渡し、SQL 表層と同じ実行器・発火計画を使う） | 発火する |
