@@ -5,7 +5,8 @@
 //! 取り出す。カタログは一切照会しない（`DROP TABLE` 等と同じ設計。存在・種別・列・関数の検査は
 //! `sql::trigger_ddl` が権限ゲートの後で行う）。呼び出し元は `core.rs` の `parse_sql` 内の分岐だけ。
 //!
-//! 受理しない形（`INSTEAD OF`・`REFERENCING`・`CONSTRAINT TRIGGER`・`DEFERRABLE`・`FROM <表>`・
+//! `INSTEAD OF` は FOR EACH ROW の INSERT／UPDATE／DELETE だけ受理する（ビューへの定義。対象の種別は
+//! `sql::trigger_ddl` 側で検査。Issue #3193）。受理しない形（`REFERENCING`・`CONSTRAINT TRIGGER`・`DEFERRABLE`・`FROM <表>`・
 //! `WHEN`・`TRUNCATE` の行トリガ）は黙って無視せず `0A000` で拒否する（fail-closed。D8）。`TG_ARGV` の
 //! 引数は値として読み、SQL テキストへ連結しない。
 
@@ -160,9 +161,11 @@ pub(crate) fn validate_create_trigger_tokens(
     } else if p.eat_word("AFTER") {
         TriggerTiming::After
     } else if p.peek_ident_matches("INSTEAD") {
-        return Err(SqlSurfaceError::feature_not_supported(
-            "INSTEAD OF triggers are not supported",
-        ));
+        // `INSTEAD OF`（ビューへの行トリガ。Issue #3193）。形の制約（FOR EACH ROW 必須・TRUNCATE と
+        // `UPDATE OF` は不可）は下の検査で固定文言の `0A000` にする。
+        p.advance();
+        p.expect_ident_matching("OF")?;
+        TriggerTiming::InsteadOf
     } else {
         return Err(SqlSurfaceError::unsupported(
             "expected BEFORE or AFTER in CREATE TRIGGER",
@@ -260,6 +263,24 @@ pub(crate) fn validate_create_trigger_tokens(
         break;
     }
     let level = level.unwrap_or(TriggerLevel::Statement);
+    if timing == TriggerTiming::InsteadOf {
+        // PostgreSQL と同じく INSTEAD OF は FOR EACH ROW 必須（省略は既定の STATEMENT になるため拒否）。
+        if level != TriggerLevel::Row {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "INSTEAD OF triggers must be FOR EACH ROW",
+            ));
+        }
+        if events & TriggerEvents::TRUNCATE != 0 {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "INSTEAD OF triggers do not support TRUNCATE",
+            ));
+        }
+        if !update_of.is_empty() {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "INSTEAD OF triggers do not support UPDATE OF",
+            ));
+        }
+    }
     if level == TriggerLevel::Row && events & TriggerEvents::TRUNCATE != 0 {
         return Err(SqlSurfaceError::feature_not_supported(
             "TRUNCATE FOR EACH ROW triggers are not supported",
@@ -377,9 +398,33 @@ mod tests {
     }
 
     #[test]
+    fn instead_of_row_triggers_are_accepted() {
+        let v = create(
+            "CREATE TRIGGER g INSTEAD OF INSERT OR UPDATE OR DELETE ON v FOR EACH ROW EXECUTE FUNCTION f()",
+        )
+        .expect("parse");
+        assert_eq!(v.timing, TriggerTiming::InsteadOf);
+        assert_eq!(v.level, TriggerLevel::Row);
+        assert_eq!(
+            v.events,
+            TriggerEvents::INSERT | TriggerEvents::UPDATE | TriggerEvents::DELETE
+        );
+        // `INSTEAD` の後に `OF` が無い形は構文エラー。
+        assert_eq!(
+            code("CREATE TRIGGER g INSTEAD INSERT ON v FOR EACH ROW EXECUTE FUNCTION f()"),
+            "42601"
+        );
+    }
+
+    #[test]
     fn unsupported_forms_are_0a000() {
         for sql in [
+            // INSTEAD OF は FOR EACH ROW 必須・TRUNCATE と UPDATE OF は不可（Issue #3193）。
             "CREATE TRIGGER g INSTEAD OF INSERT ON t EXECUTE FUNCTION f()",
+            "CREATE TRIGGER g INSTEAD OF INSERT ON t FOR EACH STATEMENT EXECUTE FUNCTION f()",
+            "CREATE TRIGGER g INSTEAD OF TRUNCATE ON t FOR EACH STATEMENT EXECUTE FUNCTION f()",
+            "CREATE TRIGGER g INSTEAD OF UPDATE OF a ON t FOR EACH ROW EXECUTE FUNCTION f()",
+            "CREATE TRIGGER g INSTEAD OF INSERT ON t FOR EACH ROW WHEN (a > 1) EXECUTE FUNCTION f()",
             "CREATE CONSTRAINT TRIGGER g AFTER INSERT ON t EXECUTE FUNCTION f()",
             "CREATE TRIGGER g AFTER INSERT ON t REFERENCING NEW TABLE AS n EXECUTE FUNCTION f()",
             "CREATE TRIGGER g AFTER INSERT ON t DEFERRABLE EXECUTE FUNCTION f()",

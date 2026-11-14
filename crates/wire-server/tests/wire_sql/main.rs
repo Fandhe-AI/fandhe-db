@@ -99,5 +99,6 @@ mod wire_upsert;
 mod wire_using_plan;
 mod wire_view_check_option;
 mod wire_view_insert;
+mod wire_view_instead_of;
 mod wire_view_update_delete;
 mod wire_view_write_tenant;

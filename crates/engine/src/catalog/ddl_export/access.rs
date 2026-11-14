@@ -17,7 +17,7 @@ use super::super::row_security::row_security_state_in_txn;
 use super::super::trigger::{
     list_triggers_in_source, TriggerDef, TriggerEvents, TriggerLevel, TriggerTiming,
 };
-use super::super::{CatalogError, ColumnType, CATALOG_TABLE};
+use super::super::{CatalogError, ColumnType, CATALOG_TABLE, VIEWS_TABLE};
 use super::quote::{ident, literal, push_ident, KeyScope};
 use super::table::render_column_type;
 use super::{unsupported, Ctx, DdlObjectKind, DdlSection, Emitter, SchemaDdlError};
@@ -25,7 +25,20 @@ use super::{unsupported, Ctx, DdlObjectKind, DdlSection, Emitter, SchemaDdlError
 /// 選択したテナントの表（共有の表 + そのテナントの SCHEMA 配下の表）のキー一覧。テナント固有の
 /// トリガ・ポリシー・行セキュリティは、共有の表に対しても各テナントが別々に持つ。
 fn tenant_table_keys<E>(ctx: &Ctx<'_>) -> Result<Vec<String>, SchemaDdlError<E>> {
-    let table = match ctx.rt.open_table(CATALOG_TABLE) {
+    relation_keys_in::<E, &[u8]>(ctx, CATALOG_TABLE)
+}
+
+/// 選択したテナントのビューのキー一覧（INSTEAD OF トリガの書き出し用。Issue #3193）。
+fn tenant_view_keys<E>(ctx: &Ctx<'_>) -> Result<Vec<String>, SchemaDdlError<E>> {
+    relation_keys_in::<E, &[u8]>(ctx, VIEWS_TABLE)
+}
+
+/// `def`（表カタログ・ビューカタログ）から、共有・選択テナントの SCHEMA 配下のキーを描画名の順で返す。
+fn relation_keys_in<E, V: redb::Value + 'static>(
+    ctx: &Ctx<'_>,
+    def: redb::TableDefinition<'static, &'static str, V>,
+) -> Result<Vec<String>, SchemaDdlError<E>> {
+    let table = match ctx.rt.open_table(def) {
         Ok(t) => t,
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
         Err(e) => return Err(CatalogError::from(e).into()),
@@ -284,6 +297,7 @@ fn render_trigger<E>(
     s.push_str(match def.timing {
         TriggerTiming::Before => " BEFORE ",
         TriggerTiming::After => " AFTER ",
+        TriggerTiming::InsteadOf => " INSTEAD OF ",
     });
     let mut events: Vec<String> = Vec::new();
     if def.events.contains(TriggerEvents::INSERT) {
@@ -334,7 +348,10 @@ pub(super) fn export_triggers<E>(
     let Some(tenant) = ctx.scope.tenant() else {
         return Ok(());
     };
-    for key in tenant_table_keys::<E>(ctx)? {
+    // 表のトリガに続けて、ビューの INSTEAD OF トリガを出す（復元先でビューの CREATE は PreData で済んでいる）。
+    let mut keys = tenant_table_keys::<E>(ctx)?;
+    keys.extend(tenant_view_keys::<E>(ctx)?);
+    for key in keys {
         for def in list_triggers_in_source(ctx.rt, tenant, &key)? {
             let sql = render_trigger(ctx, &key, &def)?;
             out.emit(DdlSection::PostData, DdlObjectKind::Trigger, &sql)?;

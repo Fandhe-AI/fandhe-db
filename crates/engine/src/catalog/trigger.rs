@@ -107,6 +107,11 @@ const OWNER_TAG_NONE: u8 = 0;
 pub(crate) enum TriggerTiming {
     Before,
     After,
+    /// `INSTEAD OF`（ビューへの行トリガ。TABLE-45・Issue #3193）。ビューにだけ定義でき、ビューへの
+    /// INSERT／UPDATE／DELETE を行ごとにトリガ関数へ振り替える。blob の版は据え置きの加法的な追加で、
+    /// このタグを知らない旧バイナリは [`corrupt`] で fail-closed に拒否する
+    /// （設計記録: `docs/design/trigger-instead-of.md`）。
+    InsteadOf,
 }
 
 impl TriggerTiming {
@@ -114,6 +119,7 @@ impl TriggerTiming {
         match self {
             Self::Before => 0,
             Self::After => 1,
+            Self::InsteadOf => 2,
         }
     }
 
@@ -121,6 +127,7 @@ impl TriggerTiming {
         match tag {
             0 => Ok(Self::Before),
             1 => Ok(Self::After),
+            2 => Ok(Self::InsteadOf),
             _ => Err(corrupt()),
         }
     }
@@ -241,6 +248,17 @@ fn validate_shape(def: &TriggerDef) -> Result<()> {
     }
     if def.level == TriggerLevel::Row && def.events.contains(TriggerEvents::TRUNCATE) {
         return Err(invalid("TRUNCATE triggers must be statement-level"));
+    }
+    if def.timing == TriggerTiming::InsteadOf {
+        // INSTEAD OF は行トリガだけ（PostgreSQL と同じ）。`UPDATE OF`・`WHEN` は未対応（定義の段で `0A000`）。
+        if def.level != TriggerLevel::Row {
+            return Err(invalid("INSTEAD OF triggers must be row-level"));
+        }
+        if !def.update_of.is_empty() || def.when_sql.is_some() {
+            return Err(invalid(
+                "INSTEAD OF triggers do not support UPDATE OF or WHEN",
+            ));
+        }
     }
     if !def.update_of.is_empty() {
         if !def.events.contains(TriggerEvents::UPDATE) {
@@ -699,8 +717,9 @@ impl Storage {
     /// `scope` のテナントとして、表 `table_key` にトリガを作り、内部 ID を返す。単一 write txn・1 回の
     /// commit で行い、判定順は次のとおり（すべて commit 前に返るため副作用ゼロ）。
     ///
-    /// 形状 → SCHEMA の現存 → 対象の種別（ビュー・索引・SEQUENCE・マテリアライズドビューは
-    /// `WrongObjectKind`）→ 表の存在（`TableNotFound`）→ 共有 `public` 表
+    /// 形状 → SCHEMA の現存 → 対象の種別（索引・SEQUENCE・マテリアライズドビューは `WrongObjectKind`。
+    /// BEFORE／AFTER のビュー、INSTEAD OF の表も `WrongObjectKind`。Issue #3193）→ 対象の存在
+    /// （INSTEAD OF はビュー、他は表。`TableNotFound`）→ 共有 `public` 表
     /// （`Invalid(TRIGGER_ON_SHARED_PUBLIC_TABLE_MESSAGE)`。Issue #3361。同名・上限・関数の判定より前で
     /// 止め、他テナントの定義の有無で応答を変えない）→ `UPDATE OF` の列（`ColumnNotFound`）→ 関数
     /// （`Invalid(TRIGGER_FUNCTION_NOT_FOUND_MESSAGE)`／`Invalid(TRIGGER_FUNCTION_NOT_TRIGGER_MESSAGE)`）→
@@ -755,19 +774,27 @@ impl Storage {
             Err(redb::TableError::TableDoesNotExist(_)) => false,
             Err(e) => return Err(e.into()),
         };
-        if in_views
-            || index_name_exists_in_txn(&write_txn, table_key)?
-            || materialized_view_exists_in_txn(&write_txn, table_key)?
-            || super::sequence::sequence_exists_in_txn(&write_txn, table_key)?
-        {
-            return Err(CatalogError::WrongObjectKind(table_key.to_string()));
-        }
         let table_exists = match ReadSource::open_table(&*write_txn, CATALOG_TABLE) {
             Ok(t) => t.get(table_key)?.is_some(),
             Err(redb::TableError::TableDoesNotExist(_)) => false,
             Err(e) => return Err(e.into()),
         };
-        if !table_exists {
+        // 対象の種別: INSTEAD OF はビューだけ、それ以外のタイミングは（実体を持つ）表だけ。
+        let is_instead_of = stored.timing == TriggerTiming::InsteadOf;
+        if index_name_exists_in_txn(&write_txn, table_key)?
+            || materialized_view_exists_in_txn(&write_txn, table_key)?
+            || super::sequence::sequence_exists_in_txn(&write_txn, table_key)?
+            || (is_instead_of && table_exists)
+            || (!is_instead_of && in_views)
+        {
+            return Err(CatalogError::WrongObjectKind(table_key.to_string()));
+        }
+        let target_exists = if is_instead_of {
+            in_views
+        } else {
+            table_exists
+        };
+        if !target_exists {
             return Err(CatalogError::TableNotFound(table_key.to_string()));
         }
         // 共有 public 表は全テナントの書き込みが通るため、特定テナントのトリガを持たせない（Issue #3361）。
@@ -852,7 +879,13 @@ impl Storage {
             Err(redb::TableError::TableDoesNotExist(_)) => false,
             Err(e) => return Err(e.into()),
         };
-        if !table_exists {
+        // INSTEAD OF トリガの対象はビュー（Issue #3193）。表・ビューのどちらでもなければ不在。
+        let view_exists = match ReadSource::open_table(&*write_txn, VIEWS_TABLE) {
+            Ok(t) => t.get(table_key)?.is_some(),
+            Err(redb::TableError::TableDoesNotExist(_)) => false,
+            Err(e) => return Err(e.into()),
+        };
+        if !table_exists && !view_exists {
             return Err(CatalogError::TableNotFound(table_key.to_string()));
         }
         if get_in_txn(&*write_txn, table_key, scope, name)?.is_none() {

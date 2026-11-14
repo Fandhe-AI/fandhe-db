@@ -184,9 +184,10 @@
 - UPSERT の順序（PG と同じ）: INSERT の BEFORE ROW を呼んでから衝突を判定し、衝突すれば
   UPDATE の BEFORE／AFTER ROW、衝突しなければ INSERT の AFTER ROW を呼ぶ。文トリガの
   発火の細部は PG 17 の挙動と突き合わせて #1725 で確定する
-- 定義対象の制限: ビューの行トリガとマテリアライズドビューへの定義は `42809`（PG と同じ）、
-  ビューの文トリガは `0A000`（PG との差分）、INSTEAD OF・REFERENCING・CONSTRAINT TRIGGER・
-  DEFERRABLE は `0A000`、一時表へのトリガは初版では `0A000`、NoSQL 表層からは定義できない
+- 定義対象の制限: ビューへの BEFORE／AFTER の行トリガとマテリアライズドビューへの定義は `42809`（PG と同じ）、
+  ビューの文トリガは `0A000`（PG との差分）、REFERENCING・CONSTRAINT TRIGGER・
+  DEFERRABLE は `0A000`。ビューへの `INSTEAD OF ... FOR EACH ROW` は Issue #3193 で受理した
+  （発火は書き込みテナントの scope のトリガだけ。[trigger-instead-of.md](trigger-instead-of.md)）、一時表へのトリガは初版では `0A000`、NoSQL 表層からは定義できない
 
 ### D9. Tx・テナント文脈（RLS）
 

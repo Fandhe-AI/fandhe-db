@@ -85,11 +85,13 @@ function_key / TG_ARGV リスト / WHEN の有無 + 正規化テキスト`。文
 
 単一 write txn・1 回の `commit_boundary::commit`（クラッシュしても全か無か）。成功時に対象表の世代を進める。
 
-1. 構文（`0A000`: `INSTEAD OF`・`REFERENCING`・`CONSTRAINT`・`DEFERRABLE`・`FROM`・`WHEN`・
-   `TRUNCATE` の行トリガ。`42601`: 構文違反・トリガ名の SCHEMA 修飾・イベント重複）
+1. 構文（`0A000`: `REFERENCING`・`CONSTRAINT`・`DEFERRABLE`・`FROM`・`WHEN`・
+   `TRUNCATE` の行トリガ・`INSTEAD OF` の ROW 以外／TRUNCATE／`UPDATE OF`〔`INSTEAD OF` はビューへの
+   FOR EACH ROW だけ受理。[trigger-instead-of.md](trigger-instead-of.md)〕。`42601`: 構文違反・トリガ名の SCHEMA 修飾・イベント重複）
 2. DDL 権限（`42501`。カタログ照会より前。対象の有無を問わない）
 3. 明示トランザクション内は `0A000`（既存 DDL と同じ）
-4. 以降は txn 内: SCHEMA の現存 → 対象の種別（ビュー・索引・SEQUENCE・マテリアライズドビューは `42809`）→
+4. 以降は txn 内: SCHEMA の現存 → 対象の種別（索引・SEQUENCE・マテリアライズドビューは `42809`。BEFORE／AFTER のビューと
+   INSTEAD OF の表も `42809`。INSTEAD OF の対象はビュー。Issue #3193）→
    表の存在（`42P01`）→ `UPDATE OF` の列（`42703`）→ 関数（不在 `42883`・トリガ関数でない `42P17`）→
    同名（`42710`。`OR REPLACE` は既存の内部 ID を引き継いで置換）→ 件数上限（`54000`）
 
