@@ -1845,10 +1845,19 @@ fn handle_describe_body(
                 // 一時表を持つセッション（または一時表の経路で準備した文）では、一時カタログの
                 // 変化を検出するためセッション対応の検証を通す（カーソル文は従来の経路）。
                 PreparedStatement::Parsed { parsed, prepared } => {
+                    // Issue #3197: Parse 後に変わった `search_path`・カタログで解決し直す。解決が変わっていれば
+                    // Parse 時の `parsed` を使わず、再 Parse した文から列を導く。
+                    let refreshed = engine
+                        .refresh_prepared_in_txn(session, txn, prepared)
+                        .map_err(HandlerError::Sql)?;
                     // writer 取得前の明示トランザクションは、Parse 時（最新カタログ）に展開済みの `parsed` を
                     // 使わず、Bind と同じ `BEGIN` 時点のカタログで再検証した文から列を導く（Issue #2403）。
                     // カーソル文は開いているカーソルから列を引く従来の経路のまま。
-                    if needs_session_revalidation(session, parsed)
+                    if !std::sync::Arc::ptr_eq(&refreshed, prepared) {
+                        engine
+                            .describe_prepared_in_txn(session, txn, &refreshed)
+                            .map_err(HandlerError::Sql)?
+                    } else if needs_session_revalidation(session, parsed)
                         || (EngineCore::txn_reads_begin_snapshot(txn)
                             && !matches!(&**parsed, ParsedSql::Cursor(_)))
                     {
@@ -1990,7 +1999,17 @@ fn handle_bind_body(
 
     // SQL-40・Issue #1967: 文が直接参照する relation の同一性を Bind の前後で取り、portal に保持する
     // （Execute 前に照合する）。Bind が展開するビュー本文と権限の判定対象を同じ定義にそろえる。
-    let relation_identity = match prepared_arc(statement) {
+    // Issue #3197: Parse 後に変わった `search_path`・カタログで準備済み文を解決し直す。同一性・Bind・portal の
+    // 保持が、実行される解決と同じ文（解決が変わっていれば再 Parse した文）を見るよう、ここで 1 度だけ行う。
+    let refreshed: Option<std::sync::Arc<PreparedSql>> = match prepared_arc(statement) {
+        Some(prepared) => Some(
+            engine
+                .refresh_prepared_in_txn(session, txn, prepared)
+                .map_err(HandlerError::Sql)?,
+        ),
+        None => None,
+    };
+    let relation_identity = match refreshed.as_deref() {
         Some(prepared) => engine
             .prepared_relation_identity_in_txn(session, txn, prepared)
             .map_err(HandlerError::Sql)?,
@@ -1999,7 +2018,10 @@ fn handle_bind_body(
     let mut bound_bytes = 0usize;
     let (portal_body, columns) = match statement {
         PreparedStatement::Empty => (PortalBody::Empty, None),
-        PreparedStatement::Parameterized { prepared, slots } => {
+        PreparedStatement::Parameterized { prepared: _, slots } => {
+            let prepared = refreshed.as_ref().ok_or_else(|| {
+                HandlerError::Internal("refreshed prepared statement missing".to_string())
+            })?;
             // 値ごとの format を解決する（0 件は全 text・1 件は全値へ適用・
             // n 件は個別。件数の整合は `validate_format_codes` が検証済み）。
             // 第 1 パス: binary 指定でスロットが非対応なら、復号は一切行わず
@@ -2067,12 +2089,18 @@ fn handle_bind_body(
             (PortalBody::Parsed(Box::new(bound)), columns)
         }
         PreparedStatement::Parsed { parsed, prepared } => {
+            // Issue #3197: 解決が変わった（再 Parse した）文は、Parse 時の `parsed` を使い回さない。
+            let re_resolved = refreshed
+                .as_ref()
+                .is_some_and(|r| !std::sync::Arc::ptr_eq(r, prepared));
+            let prepared = refreshed.as_ref().unwrap_or(prepared);
             // 一時表（TABLE-44・Issue #1684）を持つセッション、または一時表の経路で準備した文は、
             // Bind のたびにセッション対応の経路で検証し直す（一時カタログが Parse 時から変わって
             // いれば陳腐化として `0A000`）。一時表を持たないセッションは従来どおり `parsed` を使う。
             // TABLE-27・Issue #1715: `public` が見えない `search_path` のセッションも同じく Bind の
             // たびに検証し直す（Parse 後に `SET search_path` された文を古い解決結果で実行しない）。
-            let parsed = if session.has_temp_tables()
+            let parsed = if re_resolved
+                || session.has_temp_tables()
                 || session.search_path_hides_public()
                 // SQL-40・Issue #1967: 束縛済みのロールは Bind のたびに権限を再検査する（Parse 後の
                 // `REVOKE` を Execute 前に反映する。未束縛のセッションは従来の経路のまま）。
@@ -2126,18 +2154,18 @@ fn handle_bind_body(
             .map_err(HandlerError::BinaryFormat)?;
     }
 
-    if let Some(prepared) = prepared_arc(statement) {
+    if let Some(prepared) = refreshed.as_deref() {
         engine
             .check_prepared_relation_identity(session, txn, prepared, &relation_identity)
             .map_err(HandlerError::Sql)?;
     }
-    let prepared_snapshot = match state.statements.get(&msg.statement_name) {
-        Some(PreparedStatement::Parsed { prepared, .. }) => Some(std::sync::Arc::clone(prepared)),
-        Some(PreparedStatement::Parameterized { prepared, .. }) => {
-            Some(std::sync::Arc::clone(prepared))
-        }
-        _ => None,
+    // portal が保持する Bind 時点の準備済み文（Execute の権限・同一性の再検査が、実行する本文と同じ解決を見る）。
+    // 再解決で作り直した文はストアの台帳に無いため、保持する SQL のバイト数を portal の保持量へ算入する。
+    let refreshed_retained = match (refreshed.as_ref(), prepared_arc(statement)) {
+        (Some(r), Some(orig)) if !std::sync::Arc::ptr_eq(r, orig) => r.retained_sql_bytes(),
+        _ => 0,
     };
+    let prepared_snapshot = refreshed;
     let portal = Portal {
         source_statement: msg.statement_name,
         body: portal_body,
@@ -2148,7 +2176,9 @@ fn handle_bind_body(
         bound_txn_generation: txn.active_generation(),
         survived_sync: false,
         // portal ごとに保持する relation 定義のコピーも、束縛値と同じ接続単位の上限へ算入する。
-        bound_bytes: bound_bytes.saturating_add(relation_identity.retained_bytes()),
+        bound_bytes: bound_bytes
+            .saturating_add(relation_identity.retained_bytes())
+            .saturating_add(refreshed_retained),
         prepared_snapshot,
         relation_identity,
     };

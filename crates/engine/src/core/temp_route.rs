@@ -100,6 +100,9 @@ pub struct SessionRoutedSql {
     /// 世代と一致していなければ陳腐化として拒否する（準備・Bind の後に `SET search_path` された文が、
     /// 古い解決結果のまま実行されない。PostgreSQL なら再計画する場面）。
     path_epoch: Option<u64>,
+    /// `public` が見える path でも `path_epoch` の一致を要求する印（Issue #3197）。`COPY` は Execute で元の SQL を
+    /// 現在の `search_path` へ再解決するため、Bind で検証した宛先とずれないよう世代の食い違いを拒否する。
+    path_strict: bool,
 }
 
 impl SessionRoutedSql {
@@ -115,6 +118,7 @@ impl SessionRoutedSql {
             route: Route::Temp,
             fresh: false,
             path_epoch: None,
+            path_strict: false,
         }
     }
 
@@ -127,6 +131,7 @@ impl SessionRoutedSql {
             route: Route::Persistent,
             fresh: false,
             path_epoch: None,
+            path_strict: false,
         }
     }
 
@@ -136,6 +141,14 @@ impl SessionRoutedSql {
         if session.search_path_hides_public() {
             self.path_epoch = Some(session.search_path_epoch());
         }
+        self
+    }
+
+    /// `COPY` 用に、`public` が見えても Bind 時点の世代を刻み、Execute で世代の一致を要求する（Issue #3197）。
+    /// Bind 時に path 解決が無効でも、Bind 後の `SET search_path` で宛先が変わりうるため無条件に刻む。
+    pub(crate) fn stamped_with_path_for_copy(mut self, session: &SessionState) -> Self {
+        self.path_epoch = Some(session.search_path_epoch());
+        self.path_strict = true;
         self
     }
 
@@ -178,7 +191,7 @@ impl SessionRoutedSql {
         // 永続側の文は、`public` が見えない `search_path` のもとで解決した世代と一致するときだけ通す
         // （一時表の経路の文は一時表だけを参照し path に依らない）。
         if self.route == Route::Persistent
-            && session.search_path_hides_public()
+            && (session.search_path_hides_public() || self.path_strict)
             && !is_search_path_exempt(&self.inner)
             && self.path_epoch != Some(session.search_path_epoch())
         {
@@ -784,28 +797,17 @@ impl EngineCore {
         sql: &str,
         declared: &[Option<crate::sql::params::DeclaredParamType>],
     ) -> Result<super::PreparedSql, SqlSurfaceError> {
-        let result = self.parse_sql_prepared_in_session_inner(session, sql, declared);
-        // Issue #3195: 未修飾名が `search_path` で自テナントの SCHEMA に解決される形は、Parse の結果を path の
-        // 世代が変わった後の Bind・Describe で使い回さないよう固定文言の `0A000` にする（再解決は #3197）。
-        // 構文エラー `42601` は優先する。参照ゲートより先に判定する（SCHEMA 側に在る名前を `42P01` にしない）。
-        if !matches!(&result, Err(e) if e.wire_code() == "42601")
-            && (session.search_path_hides_public() || session.search_path_may_hold_tenant_schema())
-        {
-            if let Ok(tokens) = crate::sql::lexer::tokenize_with_params(sql) {
-                self.reject_path_resolved_refs(
-                    session.resolution_tenant(),
-                    session,
-                    &tokens,
-                    &[],
-                    None,
-                )?;
-            }
-        }
-        // TABLE-27・Issue #1715: `public` が見えない `search_path` のセッションは、一時表以外の未修飾の
-        // テーブル参照を `42P01` にする。判定順は構文エラー `42601` → 参照ゲート → 権限 → その他の検証エラー。
-        // 既定の path のセッションは何も足さない。権限検査より前に行うのは、権限の無いロールへ `42501` で
-        // 非可視の表の存在を漏らさないため。
+        let gate_reached = std::cell::Cell::new(false);
+        let result =
+            self.parse_sql_prepared_in_session_inner(session, sql, declared, None, &gate_reached);
+        // Issue #3197: 未修飾名の `search_path` 解決と、TABLE-27・Issue #1715 の参照ゲート（`public` が見えない
+        // path の `42P01`）は、通常の経路では Parse の中で解決済みのトークンに対して行う。ここで元の SQL を
+        // 字句解析して検査するのは、その判定に到達する前に失敗・振り分けられた場合（一時表の経路、字句・修飾名の
+        // 解決エラー等）に限る。
+        // 判定順は構文エラー `42601` → 参照ゲート → 権限 → その他の検証エラー。権限検査より前に行うのは、
+        // 権限の無いロールへ `42501` で非可視の表の存在を漏らさないため。
         if session.search_path_hides_public()
+            && !gate_reached.get()
             && !matches!(&result, Err(e) if e.wire_code() == "42601")
         {
             if let Ok(tokens) = crate::sql::lexer::tokenize_with_params(sql) {
@@ -822,15 +824,26 @@ impl EngineCore {
     }
 
     /// [`Self::parse_sql_prepared_with_declared_in_session`] の一時カタログ対応の本体。
-    fn parse_sql_prepared_in_session_inner(
+    ///
+    /// 通常の経路は [`Self::parse_sql_prepared_for_tenant_in_session`] へ渡し、`search_path` の解決（Issue #3197）を
+    /// 通す。`read_snap` は明示 Tx の `BEGIN` 時点のスナップショット（再 Parse 時。Parse の入口は `None`）。
+    pub(super) fn parse_sql_prepared_in_session_inner(
         &self,
         session: &SessionState,
         sql: &str,
         declared: &[Option<crate::sql::params::DeclaredParamType>],
+        read_snap: Option<&redb::ReadTransaction>,
+        gate_reached: &std::cell::Cell<bool>,
     ) -> Result<super::PreparedSql, SqlSurfaceError> {
         let temp = session.temp_tables();
         if temp.is_empty() {
-            return self.parse_sql_prepared_for_tenant(sql, declared, session.resolution_tenant());
+            return self.parse_sql_prepared_for_tenant_in_session(
+                sql,
+                declared,
+                session,
+                read_snap,
+                gate_reached,
+            );
         }
         let tokens = crate::sql::lexer::tokenize_with_params(sql)?;
         // `public.<一時表の名前>` は解決より前に拒否する（TABLE-27・Issue #1714）。
@@ -847,12 +860,23 @@ impl EngineCore {
                 && !crate::sql::allowlist::is_create_table_as_statement(&tokens))
             || crate::sql::allowlist::is_create_temp_table_statement(&tokens)
         {
-            return self.parse_sql_prepared_for_tenant(sql, declared, session.resolution_tenant());
+            return self.parse_sql_prepared_for_tenant_in_session(
+                sql,
+                declared,
+                session,
+                read_snap,
+                gate_reached,
+            );
         }
         // `DROP INDEX <名前>` は一時表の名前が現れない。一時 DB の索引なら一時コアで検証する。
         if crate::sql::allowlist::is_drop_index_statement(&tokens) {
-            let plain =
-                self.parse_sql_prepared_for_tenant(sql, declared, session.resolution_tenant())?;
+            let plain = self.parse_sql_prepared_for_tenant_in_session(
+                sql,
+                declared,
+                session,
+                read_snap,
+                gate_reached,
+            )?;
             if let (ParsedSql::DropIndex(stmt), Some(store)) =
                 (&plain.dummy_parsed, session.temp_rows_arc())
             {
@@ -871,7 +895,13 @@ impl EngineCore {
             return Ok(plain);
         }
         if !crate::sql::temp_catalog::tokens_reference_temp(&tokens, temp) {
-            return self.parse_sql_prepared_for_tenant(sql, declared, session.resolution_tenant());
+            return self.parse_sql_prepared_for_tenant_in_session(
+                sql,
+                declared,
+                session,
+                read_snap,
+                gate_reached,
+            );
         }
         let store = session.temp_rows_arc().ok_or_else(internal)?;
         match store
@@ -1136,6 +1166,7 @@ impl EngineCore {
                     route: Route::Temp,
                     fresh: false,
                     path_epoch: None,
+                    path_strict: false,
                 })))
             }
             PreparedRoute::Plain => {
@@ -1143,15 +1174,10 @@ impl EngineCore {
                     &prepared.public_qualified,
                     temp,
                 )?;
-                // Issue #3195: Parse 後に変わった path で未修飾名が自テナントの SCHEMA に解決される形は
-                // 固定文言の `0A000`（Parse で解決したキーを使い回さない。再解決は #3197）。
-                self.reject_path_resolved_refs(
-                    session.resolution_tenant(),
-                    session,
-                    &prepared.tokens,
-                    &prepared.qualified_positions,
-                    read_snap,
-                )?;
+                // Issue #3197: Parse 後に変わった path・カタログで解決し直す（解決が変わっていれば再 Parse した
+                // 文を使う。以降の検査・束縛は解決後の文に対して行う）。
+                let refreshed = self.refresh_prepared_snap(session, prepared, read_snap)?;
+                let prepared = refreshed.as_ref().unwrap_or(prepared);
                 // `public` が見えない `search_path` では、Parse 後に変わった path でも一時表以外の
                 // 未修飾名を `42P01` にする（TABLE-27・Issue #1715。既定の path では何もしない）。
                 crate::sql::search_path::check_unqualified_refs(
@@ -1178,7 +1204,7 @@ impl EngineCore {
                     }
                     return Ok(ParsedSql::SessionRouted(Box::new(
                         SessionRoutedSql::persistent_guarded(parsed, temp)
-                            .stamped_with_path(session),
+                            .stamped_with_path_for_copy(session),
                     )));
                 }
                 // `DROP INDEX <名前>` は一時表の名前トークンが現れない。準備後に同名の一時索引が

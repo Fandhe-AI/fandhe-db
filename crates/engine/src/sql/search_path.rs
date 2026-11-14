@@ -22,8 +22,8 @@
 //! - 読み取り以外の文（DML・DDL・`COPY`）の未修飾名も同じ規則で解決し、修飾名と同じ内部キーへ置換する
 //!   （Issue #3196）。作成系 DDL の作成対象名は path の先頭の要素に置く（自テナントの SCHEMA なら内部キー、
 //!   `public` なら裸のまま。[`creation_target`]・[`resolve_statement_refs`]）。作成先の SCHEMA は USAGE が無ければ
-//!   飛ばさず `42501`。拡張クエリ（Parse・Bind・Describe）は SCHEMA に解決される参照を固定文言の `0A000` に
-//!   する（再解決は #3197）。`ALTER .. SET SCHEMA` の未修飾の対象が SCHEMA に解決される形は `0A000`（#3198）。
+//!   飛ばさず `42501`。拡張クエリ（Parse・Bind・Describe）も Parse で同じ規則で解決し、Bind・Describe の時点の
+//!   path・カタログで再解決する（Issue #3197。`core::EngineCore::refresh_prepared_in_txn`）。`ALTER .. SET SCHEMA` の未修飾の対象が SCHEMA に解決される形は `0A000`（#3198）。
 //!   SCHEMA 配置が未対応の作成（`CREATE TYPE`・`CREATE MATERIALIZED VIEW`）は、path 先頭が SCHEMA なら
 //!   `public` へ黙って作らず `0A000`。
 //! - 一時表以外の未修飾名が解決できず、実効 path に `public` が含まれなければ `42P01`、作成先が
@@ -684,8 +684,8 @@ pub(crate) fn resolve_path_refs(
 }
 
 /// [`resolve_path_refs`] に作成系 DDL の作成対象名の解決（[`resolve_creation_name`]。Issue #3196）を加えた版。
-/// 通常（単純クエリ）の 1 文の解析入口（`core::EngineCore::parse_tokens_gated`）だけが使う。拡張クエリの
-/// Parse・Bind・Describe と `COPY` は作成名を解決せず、従来どおり [`resolve_path_refs`] で検出する。
+/// 通常（単純クエリ）の 1 文の解析入口（`core::EngineCore::parse_tokens_gated`）と、拡張クエリのセッション対応の
+/// Parse・再解決（Issue #3197）が使う。
 pub(crate) fn resolve_statement_refs(
     session: &SessionState,
     tokens: &[Token],

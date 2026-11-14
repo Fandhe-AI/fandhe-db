@@ -1437,43 +1437,331 @@ fn unprivileged_ddl_and_unbound_grant_keep_42501_ahead_of_resolution() {
     );
 }
 
-// tracked: #3197
+/// 準備済み文を Bind して実行し、先頭列の整数を昇順で返す（拡張クエリの Bind→Execute 相当）。
+fn run_prepared(
+    core: &EngineCore,
+    s: &mut SessionState,
+    p: &engine::core::PreparedSql,
+    values: &[Option<Vec<u8>>],
+) -> Result<Vec<i64>, engine::sql::allowlist::SqlSurfaceError> {
+    let bound = core.bind_prepared_in_session(s, p, values)?;
+    let mut v: Vec<i64> = match core.execute_parsed_in_session(&ctx(TENANT), s, &bound)? {
+        SqlOutcome::Query(r) => r
+            .rows
+            .iter()
+            .map(|row| match &row.cells[0] {
+                Cell::Integer(u) => i64::try_from(*u).expect("fits"),
+                Cell::SignedInteger(i) => *i,
+                other => panic!("not an integer cell: {other:?}"),
+            })
+            .collect(),
+        other => panic!("expected Query, got {other:?}"),
+    };
+    v.sort_unstable();
+    Ok(v)
+}
+
+fn parse_ext(
+    core: &EngineCore,
+    s: &SessionState,
+    sql: &str,
+) -> Result<engine::core::PreparedSql, engine::sql::allowlist::SqlSurfaceError> {
+    core.parse_sql_prepared_with_declared_in_session(s, sql, &[])
+}
+
+/// Issue #3197: 拡張クエリは Parse・Bind・Describe の時点の `search_path` で未修飾名を解決し直す。
+/// 簡易クエリと同じ形（SCHEMA に解決される Parse）を受理し、`$n` あり・なしの両方で path の往復に追従する。
 #[test]
-fn extended_query_rejects_references_resolved_into_a_schema_unsupported() {
-    let (core, _g, mut s) = q1_world("sp-ext-0a000");
-    let c = ctx(TENANT);
+fn extended_query_re_resolves_references_after_search_path_changes() {
+    let (core, _g, mut s) = q1_world("sp-ext-reresolve");
     // wire-server は handshake で解決テナントを束縛する。
     assert!(s.bind_resolution_tenant(TENANT));
-    // 解決が起きない path（public だけ）で Parse した文。
     ok(&core, &mut s, "SET search_path TO public");
-    let plain = core
-        .parse_sql_prepared_with_declared_in_session(&s, "SELECT id FROM t LIMIT 5", &[])
-        .expect("parse under public");
-    // path を変えると、Bind・Describe は Parse で解決した結果を使い回さず `0A000`。
+    let plain = parse_ext(&core, &s, "SELECT id FROM t LIMIT 5").expect("parse under public");
+    let with_param =
+        parse_ext(&core, &s, "SELECT id FROM t WHERE id > $1 LIMIT 5").expect("parse with param");
+    let zero = Some(b"0".to_vec());
+    assert_eq!(
+        run_prepared(&core, &mut s, &plain, &[]).expect("public"),
+        vec![1]
+    );
+    assert_eq!(
+        run_prepared(&core, &mut s, &with_param, std::slice::from_ref(&zero)).expect("public"),
+        vec![1]
+    );
+
+    // path を変えると、同じ準備済み文が q1.t へ解決される（Bind・Describe・Execute）。
     ok(&core, &mut s, "SET search_path TO q1, public");
-    let e = core
-        .bind_prepared_in_session(&s, &plain, &[])
-        .expect_err("bind after SET");
-    assert_eq!(e.wire_code(), "0A000");
-    let e = core
+    assert_eq!(
+        run_prepared(&core, &mut s, &plain, &[]).expect("q1"),
+        vec![10, 20]
+    );
+    assert_eq!(
+        run_prepared(&core, &mut s, &with_param, std::slice::from_ref(&zero)).expect("q1"),
+        vec![10, 20]
+    );
+    let cols = core
         .describe_prepared_in_session(&s, &plain)
-        .expect_err("describe after SET");
-    assert_eq!(e.wire_code(), "0A000");
-    // SCHEMA に解決される Parse も `0A000`。
-    let e = core
-        .parse_sql_prepared_with_declared_in_session(&s, "SELECT id FROM t LIMIT 5", &[])
-        .expect_err("parse resolving into a schema");
-    assert_eq!(e.wire_code(), "0A000");
+        .expect("describe after SET");
+    assert_eq!(cols.map(|c| c.len()), Some(1));
+
+    // SCHEMA に解決される Parse も受理される（簡易クエリと同じ解決）。
+    let in_q1 = parse_ext(&core, &s, "SELECT id FROM t LIMIT 5").expect("parse resolving");
+    assert_eq!(
+        run_prepared(&core, &mut s, &in_q1, &[]).expect("q1"),
+        vec![10, 20]
+    );
     // 構文エラーは優先する。
-    let e = core
-        .parse_sql_prepared_with_declared_in_session(&s, "SELECT FROM FROM t", &[])
-        .expect_err("syntax first");
+    let e = parse_ext(&core, &s, "SELECT FROM FROM t").expect_err("syntax first");
     assert_eq!(e.wire_code(), "42601");
-    // public が見える path に戻せば、同じ準備済み文を Bind・実行できる。
+
+    // public だけの path へ戻せば public.t へ戻る（q1 で Parse した文も追従する）。
     ok(&core, &mut s, "SET search_path TO public");
+    assert_eq!(
+        run_prepared(&core, &mut s, &plain, &[]).expect("public"),
+        vec![1]
+    );
+    assert_eq!(
+        run_prepared(&core, &mut s, &in_q1, &[]).expect("public"),
+        vec![1]
+    );
+    assert_eq!(
+        run_prepared(&core, &mut s, &with_param, &[zero]).expect("public"),
+        vec![1]
+    );
+}
+
+/// epoch が変わっても解決が同じなら使い回し、ROLLBACK で path が戻れば古い解決結果を使わない。
+#[test]
+fn extended_query_epoch_mismatch_never_reuses_a_stale_resolution() {
+    let (core, _g, mut s) = q1_world("sp-ext-epoch");
+    assert!(s.bind_resolution_tenant(TENANT));
+    let c = ctx(TENANT);
+    // 往復して epoch だけが変わる（解決は同じ）。
+    let plain = parse_ext(&core, &s, "SELECT id FROM t LIMIT 5").expect("parse");
+    ok(&core, &mut s, "SET search_path TO q1, public");
+    ok(&core, &mut s, "SET search_path TO public");
+    assert_eq!(
+        run_prepared(&core, &mut s, &plain, &[]).expect("same"),
+        vec![1]
+    );
+    // BEGIN; SET search_path TO q1; Parse; ROLLBACK 後の Bind は public へ解決される。
+    let mut txn = core.new_session_transaction();
+    core.execute_sql_in_txn(&c, &mut s, &mut txn, "BEGIN")
+        .expect("begin");
+    core.execute_sql_in_txn(&c, &mut s, &mut txn, "SET search_path TO q1")
+        .expect("set in txn");
+    let in_q1 = parse_ext(&core, &s, "SELECT id FROM t LIMIT 5").expect("parse in txn");
+    assert_eq!(
+        run_prepared(&core, &mut s, &in_q1, &[]).expect("q1"),
+        vec![10, 20]
+    );
+    core.execute_sql_in_txn(&c, &mut s, &mut txn, "ROLLBACK")
+        .expect("rollback");
+    assert_eq!(
+        run_prepared(&core, &mut s, &in_q1, &[]).expect("rolled back"),
+        vec![1]
+    );
+}
+
+/// 同じ epoch でも、Parse の後に作られた表（カタログの変化）で解決先が変われば再解決する。
+#[test]
+fn extended_query_re_resolves_when_the_catalog_changes_within_one_epoch() {
+    let (core, _g, mut s) = q1_world("sp-ext-catalog");
+    assert!(s.bind_resolution_tenant(TENANT));
+    ok(&core, &mut s, "CREATE SCHEMA q3");
+    ok(&core, &mut s, "SET search_path TO q3, public");
+    let plain = parse_ext(&core, &s, "SELECT id FROM t LIMIT 5").expect("parse");
+    assert_eq!(
+        run_prepared(&core, &mut s, &plain, &[]).expect("public"),
+        vec![1]
+    );
+    ok(
+        &core,
+        &mut s,
+        "CREATE TABLE q3.t (id BIGINT PRIMARY KEY, name TEXT)",
+    );
+    ok(
+        &core,
+        &mut s,
+        "INSERT INTO q3.t (id, name) VALUES (30, 'z')",
+    );
+    assert_eq!(
+        run_prepared(&core, &mut s, &plain, &[]).expect("q3"),
+        vec![30]
+    );
+}
+
+/// 再 Parse で `$n` の型・結果列が変わる場合は、公告済みの型と食い違う文を実行せず固定文言の `0A000`。
+// intentional: docs/design/schema-tenant-namespace.md
+#[test]
+fn extended_query_rejects_a_re_resolution_that_changes_parameter_or_result_types() {
+    let (core, _g, mut s) = q1_world("sp-ext-type-change");
+    assert!(s.bind_resolution_tenant(TENANT));
+    ok(&core, &mut s, "CREATE SCHEMA q2");
+    ok(
+        &core,
+        &mut s,
+        "CREATE TABLE q2.t (id BIGINT PRIMARY KEY, name BIGINT)",
+    );
+    ok(&core, &mut s, "SET search_path TO public");
+    let by_param = parse_ext(&core, &s, "SELECT id FROM t WHERE name = $1 LIMIT 5").expect("parse");
+    let cols = parse_ext(&core, &s, "SELECT name FROM t LIMIT 5").expect("parse cols");
+    ok(&core, &mut s, "SET search_path TO q2, public");
+    let e = core
+        .bind_prepared_in_session(&s, &by_param, &[Some(b"1".to_vec())])
+        .expect_err("parameter type changed");
+    assert_eq!(e.wire_code(), "0A000");
+    assert!(!e.to_string().contains('#'), "{e}");
+    let e = core
+        .bind_prepared_in_session(&s, &cols, &[])
+        .expect_err("result column type changed");
+    assert_eq!(e.wire_code(), "0A000");
+    let e = core
+        .describe_prepared_in_session(&s, &cols)
+        .expect_err("describe also fails closed");
+    assert_eq!(e.wire_code(), "0A000");
+    assert!(!e.to_string().contains('#'), "{e}");
+}
+
+/// DML・作成系 DDL も拡張クエリで path の自テナント SCHEMA に解決される。
+#[test]
+fn extended_query_dml_and_ddl_resolve_into_the_path_schema() {
+    let (core, _g, mut s) = q1_world("sp-ext-dml");
+    assert!(s.bind_resolution_tenant(TENANT));
+    ok(&core, &mut s, "SET search_path TO q1, public");
+    let run = |core: &EngineCore, s: &mut SessionState, sql: &str, v: &[Option<Vec<u8>>]| {
+        let p = parse_ext(core, s, sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        let b = core
+            .bind_prepared_in_session(s, &p, v)
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        core.execute_parsed_in_session(&ctx(TENANT), s, &b)
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    };
+    run(
+        &core,
+        &mut s,
+        "INSERT INTO t (id, name) VALUES ($1, 'n')",
+        &[Some(b"11".to_vec())],
+    );
+    run(
+        &core,
+        &mut s,
+        "UPDATE t SET name = 'm' WHERE id = $1",
+        &[Some(b"11".to_vec())],
+    );
+    run(&core, &mut s, "DELETE FROM t WHERE id = 20", &[]);
+    run(
+        &core,
+        &mut s,
+        "CREATE TABLE u (id BIGINT PRIMARY KEY, name TEXT)",
+        &[],
+    );
+    assert_eq!(
+        ids(&core, &mut s, "SELECT id FROM q1.t LIMIT 100"),
+        vec![10, 11]
+    );
+    // 作成先は path の先頭の q1。public 側には作られない。
+    ok(&core, &mut s, "SELECT id FROM q1.u LIMIT 1");
+    ok(&core, &mut s, "SET search_path TO public");
+    assert_eq!(code(&core, &mut s, "SELECT id FROM u LIMIT 1"), "42P01");
+    assert_eq!(ids(&core, &mut s, "SELECT id FROM t LIMIT 100"), vec![1]);
+}
+
+/// 別テナントの SCHEMA には解決されず、エラー文言にも内部キーや存在情報を含めない。
+#[test]
+fn extended_query_does_not_resolve_into_another_tenants_schema() {
+    let (core, _g, mut a) = q1_world("sp-ext-boundary");
+    assert!(a.bind_resolution_tenant(TENANT));
+    // 別テナント bob は q1 を持たない。
+    let mut b = ddl_session();
+    assert!(b.bind_resolution_tenant("bob"));
+    let bob = ctx("bob");
+    core.execute_sql_in_session(&bob, &mut b, "SET search_path TO q1, nosuch")
+        .expect("bob set");
+    let e = parse_ext(&core, &b, "SELECT id FROM t LIMIT 5").expect_err("hidden public");
+    assert_eq!(e.wire_code(), "42P01");
+    assert!(!e.to_string().contains('#'), "{e}");
+    core.execute_sql_in_session(&bob, &mut b, "SET search_path TO q1, public")
+        .expect("bob set 2");
+    let p = parse_ext(&core, &b, "SELECT id FROM t LIMIT 5").expect("bob parse");
     let bound = core
-        .bind_prepared_in_session(&s, &plain, &[])
-        .expect("bind after reset");
-    core.execute_parsed_in_session(&c, &mut s, &bound)
-        .expect("execute");
+        .bind_prepared_in_session(&b, &p, &[])
+        .expect("bob bind");
+    match core
+        .execute_parsed_in_session(&bob, &mut b, &bound)
+        .expect("bob exec")
+    {
+        // 解決先は共有の public.t（alice の q1.t の行は決して返らない）。
+        SqlOutcome::Query(r) => assert!(
+            r.rows.iter().all(|row| !matches!(
+                &row.cells[0],
+                Cell::Integer(10 | 20) | Cell::SignedInteger(10 | 20)
+            )),
+            "bob must never see alice's q1.t rows"
+        ),
+        other => panic!("expected Query, got {other:?}"),
+    }
+}
+
+/// セッションを持たない Parse の文は `search_path` を知らないため、解決が有効なセッションでは `0A000`（安全弁）。
+// intentional: docs/design/schema-tenant-namespace.md
+#[test]
+fn sessionless_prepared_statements_stay_rejected_when_a_path_schema_resolves() {
+    let (core, _g, mut s) = q1_world("sp-ext-sessionless");
+    assert!(s.bind_resolution_tenant(TENANT));
+    ok(&core, &mut s, "SET search_path TO q1, public");
+    let p = core
+        .parse_sql_prepared_with_declared("SELECT id FROM t LIMIT 5", &[])
+        .expect("sessionless parse");
+    let e = core
+        .bind_prepared_in_session(&s, &p, &[])
+        .expect_err("sessionless statement");
+    assert_eq!(e.wire_code(), "0A000");
+}
+/// Issue #3197: 拡張クエリの `COPY` も Parse・Bind で受理される。`COPY` は Execute で元の SQL を現在の path へ
+/// 再解決するため、Bind 後に path が変わった（Bind で検証した宛先とずれる）portal は `0A000` で拒否する。
+// intentional: docs/design/schema-tenant-namespace.md
+#[test]
+fn extended_copy_is_accepted_and_rejects_a_path_change_after_bind() {
+    let (core, _g, mut s) = q1_world("sp-ext-copy");
+    assert!(s.bind_resolution_tenant(TENANT));
+    ok(&core, &mut s, "SET search_path TO q1, public");
+    let copy = parse_ext(&core, &s, "COPY t TO STDOUT").expect("extended COPY parses");
+    let bound = core
+        .bind_prepared_in_session(&s, &copy, &[])
+        .expect("extended COPY binds");
+    // path が同じなら Execute へ進める。
+    bound.require_session_current(&s).expect("same path");
+    // Bind 後に path が変わると、Bind で検証した宛先と食い違うため拒否する。
+    ok(&core, &mut s, "SET search_path TO public");
+    let e = bound
+        .require_session_current(&s)
+        .expect_err("path changed after bind");
+    assert_eq!(e.wire_code(), "0A000");
+    // public だけの path で Bind した文も、その後 q1 が見える path へ変わったら拒否する。
+    let bound_public = core
+        .bind_prepared_in_session(&s, &copy, &[])
+        .expect("rebind under public");
+    ok(&core, &mut s, "SET search_path TO q1, public");
+    let e = bound_public
+        .require_session_current(&s)
+        .expect_err("path widened after bind");
+    assert_eq!(e.wire_code(), "0A000");
+}
+
+/// Issue #3197: どの要素にも作れない path の作成系 DDL は、拡張クエリでも簡易クエリと同じ SQLSTATE になる
+/// （作成先を飛ばして `public` へ黙って作らない）。
+#[test]
+fn extended_create_with_no_creation_target_matches_the_simple_query() {
+    let (core, _g, mut s) = q1_world("sp-ext-create-noschema");
+    assert!(s.bind_resolution_tenant(TENANT));
+    ok(&core, &mut s, "SET search_path TO nosuch");
+    let simple = code(&core, &mut s, "CREATE TABLE w (id BIGINT PRIMARY KEY)");
+    let p = parse_ext(&core, &s, "CREATE TABLE w (id BIGINT PRIMARY KEY)").expect("parse");
+    let bound = core.bind_prepared_in_session(&s, &p, &[]).expect("bind");
+    let e = core
+        .execute_parsed_in_session(&ctx(TENANT), &mut s, &bound)
+        .expect_err("must fail like the simple query");
+    assert_eq!(e.wire_code(), simple);
 }
