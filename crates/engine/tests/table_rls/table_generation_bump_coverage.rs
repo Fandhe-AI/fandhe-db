@@ -602,8 +602,8 @@ const ALLOWLIST: &[(&str, u32)] = &[
     ("catalog/namespace.rs", 756),
     ("catalog/namespace.rs", 812),
     // Issue #1716: `rename_schema` も `schemas` の 1 行付け替えだけで、行ストア・世代を変えない。
-    ("catalog/namespace.rs", 1068),
-    ("catalog/namespace.rs", 1184),
+    ("catalog/namespace.rs", 1079),
+    ("catalog/namespace.rs", 1195),
     // Issue #1645（所有 SEQUENCE の定義 blob 版 3・`commit_and_finish` 経路の追加）と base 取り込みで行が移動したため
     // 全件を現行行へ追随（commit 対象は SEQUENCE 定義・状態表のみで同じ理由により対象外）。
     // Issue #1694（SERIAL の暗黙 SEQUENCE・所有 SEQUENCE の削除と追従）の追加で行番号が移動したための追随
