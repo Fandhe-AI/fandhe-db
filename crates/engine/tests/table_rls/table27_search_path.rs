@@ -1815,3 +1815,38 @@ fn extended_create_with_no_creation_target_matches_the_simple_query() {
         .expect_err("must fail like the simple query");
     assert_eq!(e.wire_code(), simple);
 }
+
+/// Issue #3197: テナント未束縛の既定セッションでも、path 解決が不要な `COPY`（public 表）は従来どおり Bind できる。
+/// 宛先照会を省略するだけで、Execute 直前の宛先照合も固定の陳腐化にならない。
+// intentional: docs/design/schema-tenant-namespace.md
+#[test]
+fn extended_copy_binds_in_an_unbound_default_session_when_no_path_resolution_is_needed() {
+    let (core, _g, mut setup) = q1_world("sp-ext-copy-unbound");
+    ok(&core, &mut setup, "CREATE TABLE pt (id BIGINT PRIMARY KEY)");
+    let s = SessionState::default();
+    assert!(s.resolution_tenant().is_none());
+    let copy = parse_ext(&core, &s, "COPY pt TO STDOUT").expect("extended COPY parses");
+    let bound = core
+        .bind_prepared_in_session(&s, &copy, &[])
+        .expect("unbound bind keeps the legacy contract");
+    bound.require_session_current(&s).expect("same epoch");
+    let txn = core.new_session_transaction();
+    core.require_copy_target_current(&s, &txn, &bound)
+        .expect("target check is skipped without path resolution");
+}
+
+/// Issue #3197: テナント未束縛で path 解決が必要な `COPY` の Bind は、internal ではなく Execute 側と同じ
+/// `0A000` で拒否する。
+// intentional: docs/design/schema-tenant-namespace.md
+#[test]
+fn extended_copy_bind_without_tenant_rejects_with_0a000_when_path_resolution_is_needed() {
+    let (core, _g, mut setup) = q1_world("sp-ext-copy-unbound-hide");
+    ok(&core, &mut setup, "CREATE TABLE pt (id BIGINT PRIMARY KEY)");
+    let mut s = SessionState::default();
+    let copy = parse_ext(&core, &s, "COPY pt TO STDOUT").expect("extended COPY parses");
+    ok(&core, &mut s, "SET search_path TO q1, public");
+    let e = core
+        .bind_prepared_in_session(&s, &copy, &[])
+        .expect_err("unbound bind needing resolution");
+    assert_eq!(e.wire_code(), "0A000");
+}

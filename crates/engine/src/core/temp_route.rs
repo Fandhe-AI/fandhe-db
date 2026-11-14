@@ -1219,8 +1219,7 @@ impl EngineCore {
                     let ParsedSql::Copy(vc) = &parsed else {
                         return Err(internal());
                     };
-                    let tenant = session.resolution_tenant().ok_or_else(internal)?;
-                    let pin = self.copy_pin_for_sql(tenant, session, vc.sql(), read_snap)?;
+                    let pin = self.copy_pin_for_sql(session, vc.sql(), read_snap)?;
                     return Ok(ParsedSql::SessionRouted(Box::new(
                         SessionRoutedSql::persistent_guarded(parsed, temp)
                             .stamped_with_path_for_copy(session)
@@ -1267,13 +1266,18 @@ impl EngineCore {
 
     /// `COPY` の元 SQL を現在の `search_path`・カタログで解決した宛先（書き換え）を返す（Issue #3197）。
     /// 字句解析に失敗する入力は検証済みのはずだが、失敗時は固定の陳腐化として拒否する（fail-closed）。
+    /// path 解決が不要（`search_path` が公開側のみ）なら宛先照会を省略して空の記録を返し、テナント未束縛でも
+    /// 従来の Bind 契約を保つ。解決が必要なのにテナント未束縛なら Execute と同じ `search_path_stale`（`0A000`）。
     fn copy_pin_for_sql(
         &self,
-        tenant: &str,
         session: &SessionState,
         sql: &str,
         read_snap: Option<&redb::ReadTransaction>,
     ) -> Result<Vec<(usize, crate::sql::lexer::Token)>, SqlSurfaceError> {
+        if !(session.search_path_may_hold_tenant_schema() || session.search_path_hides_public()) {
+            return Ok(Vec::new());
+        }
+        let tenant = session.resolution_tenant().ok_or_else(search_path_stale)?;
         let tokens = crate::sql::lexer::tokenize_marked(sql).map_err(|_| search_path_stale())?;
         self.copy_path_rewrites(tenant, session, &tokens, read_snap)
     }
@@ -1293,9 +1297,8 @@ impl EngineCore {
         let (Some(pin), ParsedSql::Copy(vc)) = (routed.copy_pin.as_ref(), routed.inner()) else {
             return Ok(());
         };
-        let tenant = session.resolution_tenant().ok_or_else(search_path_stale)?;
         let snap = Self::describe_snapshot(txn)?;
-        if self.copy_pin_for_sql(tenant, session, vc.sql(), snap)? == *pin {
+        if self.copy_pin_for_sql(session, vc.sql(), snap)? == *pin {
             Ok(())
         } else {
             Err(search_path_stale())
