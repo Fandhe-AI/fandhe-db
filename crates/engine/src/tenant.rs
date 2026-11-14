@@ -5893,7 +5893,7 @@ pub(crate) enum CapturedRowOrigin {
 /// 呼び出し元: [`delete_row_impl`]・[`delete_rows_where_impl`]・
 /// [`update_row_columns_capturing_unchecked`]・[`update_rows_where_impl`]・
 /// [`upsert_typed_rows_impl`]。
-fn captured_values_from_parts(
+pub(crate) fn captured_values_from_parts(
     schema: &crate::catalog::TableSchema,
     embedding: Vec<f32>,
     metadata: &[u8],
@@ -8695,7 +8695,7 @@ pub(crate) fn last_operation(
 
 pub(crate) mod partitioned_dml;
 pub(crate) mod statement_writes;
-mod trigger_dml;
+pub(crate) mod trigger_dml;
 mod trigger_insert;
 pub(crate) mod trigger_row_loop;
 pub(crate) mod trigger_writes;

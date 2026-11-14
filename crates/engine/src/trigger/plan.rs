@@ -82,8 +82,13 @@ pub(crate) struct UpdateTarget<'a> {
 /// - UPDATE で `UPDATE OF` を持つトリガは、`update` の SET 列と交差しなければ外す。列名を解決できなければ
 ///   fail-closed に `0A000`
 ///
-/// UPDATE・DELETE では、親側の参照アクションが及ぶ子表に該当イベントのトリガがある場合も `0A000`
-/// （子表の行は参照アクションの内部で書き換わりトリガが発火しないため。実行モデルの D8）。
+/// UPDATE・DELETE では、親側の参照アクションが及ぶ子表（Issue #3284）も見る。
+///
+/// - `runtime` あり: 子表に該当イベントの ROW トリガがあれば、親に該当トリガが無くても 4 群とも空の
+///   `Ok(Some(plan))` を返す（参照アクションが書き換える子行ごとの発火は `constraint` の
+///   `referential_triggers` が担い、親は既存のトリガ経路〔`tenant/trigger_dml.rs`〕へ載せるため）。
+///   子表に FOR EACH STATEMENT トリガがあれば `0A000`（RI 内部クエリごとの文トリガの回数を再現できない）
+/// - `runtime` なし（未結線の経路）: 子表に該当トリガがあれば従来どおり `0A000`（実行モデルの D8）
 pub(crate) fn plan_row_triggers<'a>(
     write_txn: &redb::WriteTransaction,
     tenant: &str,
@@ -96,16 +101,34 @@ pub(crate) fn plan_row_triggers<'a>(
     if !any_triggers_exist(write_txn)? {
         return Ok(None);
     }
+    let mut children_fire = false;
     if event != TriggerEvents::INSERT {
-        guard_referential_children(write_txn, tenant, table, event == TriggerEvents::DELETE)?;
+        let is_delete = event == TriggerEvents::DELETE;
+        if runtime.is_some() {
+            children_fire = inspect_referential_children(write_txn, tenant, table, is_delete)?;
+        } else {
+            guard_referential_children(write_txn, tenant, table, is_delete)?;
+        }
     }
+    // 子表だけがトリガを持つとき、親の群が空の計画で既存のトリガ経路へ載せる。
+    let child_only = |runtime: Option<&'a TriggerRuntime<'a>>| {
+        runtime
+            .filter(|_| children_fire)
+            .map(|runtime| RowTriggerPlan {
+                runtime,
+                before: Vec::new(),
+                after: Vec::new(),
+                before_stmt: Vec::new(),
+                after_stmt: Vec::new(),
+            })
+    };
     let all = list_triggers_in_txn(write_txn, tenant, table)?;
     let mut matching: Vec<TriggerDef> = all
         .into_iter()
         .filter(|t| t.events.contains(event))
         .collect();
     if matching.is_empty() {
-        return Ok(None);
+        return Ok(child_only(runtime));
     }
     let Some(runtime) = runtime else {
         return Err(unsupported(
@@ -126,7 +149,7 @@ pub(crate) fn plan_row_triggers<'a>(
         .partition(|t| t.timing == TriggerTiming::Before);
     // `UPDATE OF` の絞り込みで全て外れたときだけ従来経路（4 群とも空）。
     if before.is_empty() && after.is_empty() && before_stmt.is_empty() && after_stmt.is_empty() {
-        return Ok(None);
+        return Ok(child_only(Some(runtime)));
     }
     Ok(Some(RowTriggerPlan {
         runtime,
@@ -134,6 +157,48 @@ pub(crate) fn plan_row_triggers<'a>(
         after,
         before_stmt,
         after_stmt,
+    }))
+}
+
+/// 参照アクションが書き換える子表 `table` の `event`（`UPDATE` か `DELETE`）の ROW トリガを分類する
+/// （Issue #3284。`constraint` の `referential_triggers` が子行ごとの発火の前に 1 回呼ぶ）。
+///
+/// 該当する ROW トリガが無い（`UPDATE OF` が `update` の列と交差しない場合を含む）ときは `Ok(None)`。
+/// 文トリガは親の計画の段で拒否済みだが、取りこぼしても黙って飛ばさないよう、ここでも `0A000`。
+/// 書き込みテナント自身の scope のカタログだけを見る（他テナントの定義は構造上引けない）。
+pub(crate) fn plan_child_row_triggers<'a>(
+    write_txn: &redb::WriteTransaction,
+    tenant: &str,
+    table: &str,
+    event: u8,
+    update: Option<&UpdateTarget<'_>>,
+    runtime: &'a TriggerRuntime<'a>,
+) -> Result<Option<RowTriggerPlan<'a>>, TenantWriteError> {
+    let mut matching: Vec<TriggerDef> = list_triggers_in_txn(write_txn, tenant, table)?
+        .into_iter()
+        .filter(|t| t.events.contains(event))
+        .collect();
+    if matching.is_empty() {
+        return Ok(None);
+    }
+    if event == TriggerEvents::UPDATE {
+        matching = filter_update_of(matching, update)?;
+    }
+    if matching.iter().any(|t| t.level == TriggerLevel::Statement) {
+        return Err(unsupported(STATEMENT_ON_REFERENTIAL_CHILD));
+    }
+    let (before, after): (Vec<TriggerDef>, Vec<TriggerDef>) = matching
+        .into_iter()
+        .partition(|t| t.timing == TriggerTiming::Before);
+    if before.is_empty() && after.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(RowTriggerPlan {
+        runtime,
+        before,
+        after,
+        before_stmt: Vec::new(),
+        after_stmt: Vec::new(),
     }))
 }
 
@@ -274,15 +339,35 @@ fn any_triggers_exist(write_txn: &redb::WriteTransaction) -> Result<bool, Tenant
     Ok(len > 0)
 }
 
+/// 子表に FOR EACH STATEMENT トリガがあるときの固定文言（値・表名を含めない）。
+const STATEMENT_ON_REFERENTIAL_CHILD: &str =
+    "statement-level triggers on tables affected by referential actions are not supported";
+
+/// 子表に該当イベントのトリガがあるときの固定文言（未結線の経路）。
+const TRIGGER_ON_REFERENTIAL_CHILD: &str =
+    "triggers on tables affected by referential actions are not supported";
+
+/// 参照アクションが及ぶ子表の走査の判定方式。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChildWalk {
+    /// 未結線の経路: 該当イベントのトリガ（行・文）が 1 件でもあれば `0A000`。
+    RejectAny,
+    /// 結線済みの経路: ROW トリガの有無を返し、FOR EACH STATEMENT トリガは `0A000`。
+    FireRow,
+}
+
 /// 参照アクション（CASCADE・SET NULL・SET DEFAULT）が及ぶ子表を、カタログの FK 宣言だけから再帰的に
-/// たどり、該当イベントのトリガがある子表があれば `0A000`（子表の行は参照アクション内で書き換わり
-/// トリガが発火しないため、黙って飛ばさない。実行モデルの D8）。訪問済み集合で循環を断つ。
-fn guard_referential_children(
+/// たどり、該当イベントのトリガがある子表を `mode` に応じて扱う（実行モデルの D8・Issue #3284）。
+/// 訪問済み集合で循環を断つ。過大近似（実際には書き換わらない行も含む）で、拒否側に倒す。
+/// 戻り値は子表に該当イベントの ROW トリガがあったか（`FireRow` のみ意味を持つ）。
+fn walk_referential_children(
     write_txn: &redb::WriteTransaction,
     tenant: &str,
     table: &str,
     is_delete: bool,
-) -> Result<(), TenantWriteError> {
+    mode: ChildWalk,
+) -> Result<bool, TenantWriteError> {
+    let mut found_row = false;
     let mut visited: Vec<(String, bool)> = vec![(table.to_string(), is_delete)];
     let mut stack: Vec<(String, bool)> = vec![(table.to_string(), is_delete)];
     while let Some((parent, delete)) = stack.pop() {
@@ -304,15 +389,20 @@ fn guard_referential_children(
                 TriggerEvents::UPDATE
             };
             let child = child_schema.name.clone();
-            // 対象表自身（自己参照 FK）も子表として数える。参照アクションで書き換わる同表の別行は
-            // トリガを発火できないため、黙って飛ばさず `0A000` にする（D8）。
-            let hit = list_triggers_in_txn(write_txn, tenant, &child)?
+            // 対象表自身（自己参照 FK）も子表として数える。
+            for t in list_triggers_in_txn(write_txn, tenant, &child)?
                 .iter()
-                .any(|t| t.events.contains(event));
-            if hit {
-                return Err(unsupported(
-                    "triggers on tables affected by referential actions are not supported",
-                ));
+                .filter(|t| t.events.contains(event))
+            {
+                match mode {
+                    ChildWalk::RejectAny => {
+                        return Err(unsupported(TRIGGER_ON_REFERENTIAL_CHILD));
+                    }
+                    ChildWalk::FireRow if t.level == TriggerLevel::Statement => {
+                        return Err(unsupported(STATEMENT_ON_REFERENTIAL_CHILD));
+                    }
+                    ChildWalk::FireRow => found_row = true,
+                }
             }
             let key = (child, child_delete);
             if !visited.contains(&key) {
@@ -321,5 +411,27 @@ fn guard_referential_children(
             }
         }
     }
-    Ok(())
+    Ok(found_row)
+}
+
+/// 未結線の経路（`runtime` なし・[`guard_unwired_dml`]）向け。子表に該当イベントのトリガがあれば `0A000`
+/// （子表の行は参照アクション内で書き換わりトリガが発火しないため、黙って飛ばさない）。
+fn guard_referential_children(
+    write_txn: &redb::WriteTransaction,
+    tenant: &str,
+    table: &str,
+    is_delete: bool,
+) -> Result<(), TenantWriteError> {
+    walk_referential_children(write_txn, tenant, table, is_delete, ChildWalk::RejectAny).map(|_| ())
+}
+
+/// 結線済みの経路向け。子表に該当イベントの ROW トリガがあれば `true`（`constraint` が子行ごとに発火する）。
+/// 子表に FOR EACH STATEMENT トリガがあれば、固定文言の `0A000`。
+fn inspect_referential_children(
+    write_txn: &redb::WriteTransaction,
+    tenant: &str,
+    table: &str,
+    is_delete: bool,
+) -> Result<bool, TenantWriteError> {
+    walk_referential_children(write_txn, tenant, table, is_delete, ChildWalk::FireRow)
 }

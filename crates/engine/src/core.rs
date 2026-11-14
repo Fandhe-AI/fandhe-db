@@ -193,6 +193,9 @@ mod trigger_statement_tests;
 // トリガの入れ子の発火と深さ上限（`54001`）の結合テスト（TABLE-45 (5)・Issue #1727）。
 #[cfg(test)]
 mod trigger_depth_tests;
+// FK の参照アクションが書き換える子表の ROW トリガの発火の結合テスト（TABLE-45・Issue #3284）。
+#[cfg(test)]
+mod trigger_referential_tests;
 // トリガ副作用と operation_id 台帳の整合（再送・越境・クラッシュ注入）のテスト（TABLE-45・Issue #1728）。
 #[cfg(test)]
 mod trigger_ledger_tests;

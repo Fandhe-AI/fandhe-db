@@ -14,6 +14,9 @@
 //! 4. 全行の後に制約検査・FK（参照元側・参照先側）を 1 回ずつ行い、そのあと AFTER ROW を
 //!    変更の順 × トリガ名のバイト順で発火する（戻り値は無視。実行モデルの D3）
 //!
+//! 参照アクションが書き換える子表の ROW トリガは、参照先側の FK 検査の段で子行ごとに発火する
+//! （Issue #3284。`constraint::referential_triggers`。子の AFTER は連鎖・事後検証の後、親の AFTER より先）。
+//!
 //! BEFORE が主キー・UNIQUE 列を書き換えうるため、BEFORE UPDATE トリガがある表では参照先側の FK 検査を
 //! 全列を更新済みとして行う（fail-closed）。AFTER の失敗は文全体の失敗で、呼び出し元の txn が commit
 //! されないため行・トリガの書いた行・台帳・索引はいずれも残らない。トリガが書いた表の遅延 FK は
@@ -115,7 +118,7 @@ fn read_row(
 
 /// BEFORE が返した最終 NEW を検査して `(embedding, metadata)` へ encode する（NOT NULL・VECTOR 次元・
 /// 行 codec）。
-fn encode_final_row(
+pub(crate) fn encode_final_row(
     schema: &TableSchema,
     final_row: &[Value],
 ) -> Result<(Vec<f32>, Vec<u8>), TenantWriteError> {
@@ -314,7 +317,8 @@ pub(super) fn update_rows_with_triggers(
         } else {
             (0..schema.columns.len()).collect()
         };
-        crate::constraint::enforce_referencing_rows_in_txn(
+        // 参照アクションが書き換える子表の ROW トリガも、子行ごとに発火する（Issue #3284）。
+        crate::constraint::enforce_referencing_rows_with_triggers_in_txn(
             write_txn,
             table,
             schema,
@@ -325,6 +329,10 @@ pub(super) fn update_rows_with_triggers(
             },
             Some(&pre_images),
             target.fk_check_mode(),
+            Some(&crate::constraint::ChildTriggers {
+                runtime: plan.runtime,
+                writes,
+            }),
         )?;
     }
     // AFTER ROW（段 6）。変更の順 × トリガ名のバイト順。
@@ -464,7 +472,8 @@ pub(super) fn delete_rows_with_triggers(
             ctx.tenant_id(),
             &removed,
         )?;
-        crate::constraint::enforce_referencing_rows_in_txn(
+        // 参照アクションが書き換える子表の ROW トリガも、子行ごとに発火する（Issue #3284）。
+        crate::constraint::enforce_referencing_rows_with_triggers_in_txn(
             write_txn,
             table,
             schema,
@@ -472,6 +481,10 @@ pub(super) fn delete_rows_with_triggers(
             crate::constraint::ReferencedRowsChange::Removed { ids: &removed },
             needs_fk_removed_pre_image.then_some(&removed_pre_images),
             target.fk_check_mode(),
+            Some(&crate::constraint::ChildTriggers {
+                runtime: plan.runtime,
+                writes,
+            }),
         )?;
     }
     for old in &after_queue {
