@@ -495,13 +495,15 @@ fn chunk_loop<E>(
         if let Some(JobRecord::Running {
             hash: stored,
             processed,
+            trigger_effects,
             ..
         }) = partitioned_job::lookup_in_read_txn(&read_txn, &key).map_err(map_job_err)?
         {
             if hash.matches(&stored) {
                 state.processed = processed;
-                // Running 記録は commit 済みチャンク（トリガ副作用のみのものを含む）の存在を示す。
-                state.side_effects_committed = true;
+                // 件数が 0 でも、記録にトリガの別表書き込みの印があれば副作用は commit 済み。
+                // 印のない 0 件の記録（実行時間の上限による停止点）は副作用ゼロのまま（Issue #3283）。
+                state.side_effects_committed = processed > 0 || trigger_effects;
             }
         }
     }
@@ -617,6 +619,7 @@ fn chunk_loop<E>(
                     cursor,
                     processed,
                     fixed_time: recorded_time,
+                    trigger_effects,
                 } => {
                     // 呼び出し元が束縛に使った固定時刻は、ジョブ開始時に永続化した値と一致する
                     // こと（事前読み込みから本 txn までの間の記録の変化を検出する。設計 D6）。
@@ -625,7 +628,7 @@ fn chunk_loop<E>(
                     }
                     state.cursor = Some(cursor);
                     state.processed = processed;
-                    state.side_effects_committed = true;
+                    state.side_effects_committed = processed > 0 || trigger_effects;
                     state.has_record = true;
                 }
                 ResendDecision::Duplicate => return Err(w(TenantWriteError::DuplicateOperationId)),
@@ -647,6 +650,7 @@ fn chunk_loop<E>(
                         cursor,
                         processed,
                         fixed_time: stored_time,
+                        ..
                     }),
                     true,
                 ) => {
@@ -905,6 +909,7 @@ fn chunk_loop<E>(
                 cursor,
                 limits.interrupted_record_limit.get(),
                 fixed_time,
+                trigger_wrote,
             )
             .map_err(map_job_err)?
             {

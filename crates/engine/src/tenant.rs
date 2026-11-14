@@ -12503,6 +12503,7 @@ mod tests {
                 crate::storage::rowid::RowId::from_legacy_id(1),
                 10,
                 None,
+                false,
             )
             .expect("running");
             txn.commit_raw_for_test().expect("commit");
@@ -12551,6 +12552,7 @@ mod tests {
                 crate::storage::rowid::RowId::from_legacy_id(1),
                 10,
                 None,
+                false,
             )
             .expect("running");
             txn.commit_raw_for_test().expect("commit");
