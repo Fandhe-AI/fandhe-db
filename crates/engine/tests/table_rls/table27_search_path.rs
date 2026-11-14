@@ -1869,3 +1869,26 @@ fn extended_copy_bind_without_tenant_rejects_with_0a000_when_path_resolution_is_
         .expect_err("unbound bind needing resolution");
     assert_eq!(e.wire_code(), "0A000");
 }
+
+/// Issue #3197（PR #3389 レビュー指摘）: 明示 Tx 内の準備済み `COPY TO` の再 Parse は、名前解決と同じく
+/// `BEGIN` 時点のスナップショットで宛先を検証する。BEGIN 後に別接続が宛先を DROP しても再 Parse は失敗しない。
+#[test]
+fn extended_copy_reparse_in_txn_validates_against_the_begin_snapshot() {
+    let (core, _g, mut s) = q1_world("sp-ext-copy-snap");
+    assert!(s.bind_resolution_tenant(TENANT));
+    let c = ctx(TENANT);
+    let mut txn = core.new_session_transaction();
+    core.execute_sql_in_txn(&c, &mut s, &mut txn, "BEGIN")
+        .expect("begin");
+    let copy = std::sync::Arc::new(parse_ext(&core, &s, "COPY t TO STDOUT").expect("parse"));
+    // BEGIN 後に別接続が q1.t を DROP する（BEGIN 時点のスナップショットには残っている）。
+    let mut other = ddl_session();
+    assert!(other.bind_resolution_tenant(TENANT));
+    ok(&core, &mut other, "DROP TABLE q1.t");
+    core.execute_sql_in_txn(&c, &mut s, &mut txn, "SET search_path TO q1, public")
+        .expect("set in txn");
+    let fresh = core
+        .refresh_prepared_in_txn(&s, &txn, &copy)
+        .expect("re-parse validates against the BEGIN snapshot");
+    assert!(!std::sync::Arc::ptr_eq(&fresh, &copy), "must re-resolve");
+}

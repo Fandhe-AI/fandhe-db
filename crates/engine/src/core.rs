@@ -8749,11 +8749,25 @@ impl EngineCore {
                     other => other,
                 })
                 .collect();
-            let stmt = crate::sql::allowlist::validate_copy_tokens(
-                &copy_tokens,
-                &self.storage,
-                self.ledger_mode,
-            )
+            // 明示 Tx の再 Parse（`read_snap` あり）では、読み取りの `COPY TO` の宛先を `BEGIN` 時点の
+            // スナップショットで検証する（名前解決と同じ読み取り源。簡易クエリの `begin_copy` と同じ規則で、
+            // `COPY FROM`〔書き込み〕は最新のカタログ。Issue #2403）。
+            let copy_snap = path
+                .as_ref()
+                .and_then(|p| p.read_snap)
+                .filter(|_| crate::sql::allowlist::is_copy_to_statement(&copy_tokens));
+            let stmt = match copy_snap {
+                Some(snap) => crate::sql::allowlist::validate_copy_tokens(
+                    &copy_tokens,
+                    &crate::catalog::ViewWriteSnapshot::over(snap),
+                    self.ledger_mode,
+                ),
+                None => crate::sql::allowlist::validate_copy_tokens(
+                    &copy_tokens,
+                    &self.storage,
+                    self.ledger_mode,
+                ),
+            }
             .map_err(|e| self.reclassify_matview_write_error(e))?;
             return Ok(PreparedSql {
                 resolution_tenant: None,
