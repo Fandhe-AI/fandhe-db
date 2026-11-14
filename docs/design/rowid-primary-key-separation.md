@@ -201,7 +201,7 @@ spec のポインタ（TABLE-23・TABLE-16。関連: RLS-9・RLS-10）を正と�
   マーカーは無効にならず再構築も起きない（バイト列の golden テストと再オープンの結合テストで固定）。
 - **FK の `id` 参照の解決を 2 か所に集約した**（`constraint.rs`）: 参照先の `id` 値から親行の物理キーを得る
   `parent_row_key_by_id_value` と、削除された親行の rowid から失われた `id` 値を得る `referenced_id_value_of_removed_row`。
-  採番方式の親は固定文言（`0A000`）で拒否する。DDL 段（`resolve_foreign_key_target`）でも同じ拒否を行う。
+  採番方式の親は実行時には固定文言（`0A000`）で拒否する。DDL 段（`resolve_foreign_key_target`）は Issue #3178 で改め、採番方式の親の `id` を宣言した列として扱い列参照の検証へ流す（[foreign-key.md](foreign-key.md) D24）。
 - **ゲートは維持した**: 採番方式の表の DML は開放しない（外すのは #2195〜#2197 が揃った後）。
 - **検査順序・テナント境界は不変**: `enforce_row_constraints_impl` と `enforce_referencing_rows_in_txn` の順序、および
   `(tenant, ..)` の範囲は変えていない（RLS-9・RLS-10）。`23503`／`23505` の SQLSTATE・文面も変わらない。
@@ -244,8 +244,8 @@ SQL-17・SQL-18・SQL-20・SQL-32）。契約の詳細は spec を正とし、�
 - **ゲートを残した経路（`0A000` の固定文言）**: 利用者が行 id を指定する Rust API（`insert_typed_row`・`insert_row`・
   `update_row`・`delete_row`・`get_row_from_table`・`scan_table_page`・`VectorArena::build*` を使う `search`／`batch_search`）、
   NoSQL 表層の行 op（`wire-server/http/query/gate.rs` が実行前に拒否。後続 #2201）、ファイル形 INSERT（`path`／`body`
-  は採番方式の表では通常の列で、行形 INSERT として束縛する）、採番方式の親への `id` 参照 FK（親が宣言した `id` 列を
-  参照する場合を含む。永続化する参照先列名が物理キーの `id` 参照と区別できないため。#2200 が扱う）。主キーを持たない
+  は採番方式の表では通常の列で、行形 INSERT として束縛する）、採番方式の親への `id` 参照 FK の実行時の検査（DDL は
+  Issue #3178 で受理済み。親の存在検査は #3179、連鎖・遅延検査は #3180）。主キーを持たない
   採番方式の親への列省略 FK は PG と同じ `42830`。
 - **ALTER**: 採番方式の表でも `ALTER TABLE` の `id` 列そのもの（ADD／DROP／RENAME／TYPE／`ADD PRIMARY KEY (id)`）は構文段で
   従来どおり拒否する（対象外）。`CREATE TABLE` で宣言した `id` は通常の列。
