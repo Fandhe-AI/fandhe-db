@@ -6912,6 +6912,29 @@ fn sequence_patched_values(
     Ok(values)
 }
 
+/// 束縛済み INSERT 群の対象表名（空は空文字。呼び出し元が空でないことを先に保証する）。
+fn schema_table_key(bounds: &[crate::sql::parser::BoundInsert]) -> &str {
+    bounds.first().map(|b| b.table.as_str()).unwrap_or("")
+}
+
+/// `tenant` の表 `table` に INSERT イベントのトリガがあるか（事前投影の要否判定用。読み取りのみ）。
+fn table_has_insert_triggers<R: crate::storage::read_source::ReadSource>(
+    src: &R,
+    tenant: &str,
+    table: &str,
+) -> Result<bool, SqlSurfaceError> {
+    let defs =
+        crate::catalog::trigger::list_triggers_in_source(src, tenant, table).map_err(|e| {
+            SqlSurfaceError::Internal {
+                detail: format!("trigger lookup failed: {e}"),
+            }
+        })?;
+    Ok(defs.iter().any(|t| {
+        t.events
+            .contains(crate::catalog::trigger::TriggerEvents::INSERT)
+    }))
+}
+
 /// `INSERT` の挿入行に固定で付く可視性（書き込み側と RETURNING の可視性検査で共有する）。
 const INSERT_ROW_VISIBILITY: crate::storage::Visibility = crate::storage::Visibility::Private;
 
@@ -6963,7 +6986,29 @@ pub(crate) fn execute_insert_returning_in(
         .any(|b| b.id_omitted || b.volatile_default_columns.iter().any(is_sequence_mark));
     let mut rows = Vec::new();
     let mut budget = 0usize;
+    // INSERT トリガがある表では、BEFORE が値を短縮したり行をスキップしたりして最終行が入力値より小さく
+    // なり得るため、入力値の事前投影による予算拒否（`54000`）を行わない。実際に返す行の予算は txn 内の
+    // 収集（下の `returning_collector`）が検査する（Issue #3192）。トリガの無い表は従来どおり。
+    let skip_pre_projection = match (&target, triggers) {
+        (_, None) => false,
+        (crate::tenant::WriteTarget::InTxn(txn), Some(_)) => {
+            table_has_insert_triggers(*txn, ctx.tenant_id(), schema_table_key(bounds))?
+        }
+        (crate::tenant::WriteTarget::Autocommit(storage), Some(_)) => {
+            use redb::ReadableDatabase as _;
+            let read = storage
+                .db()
+                .begin_read()
+                .map_err(|e| SqlSurfaceError::Internal {
+                    detail: format!("trigger lookup failed: {e}"),
+                })?;
+            table_has_insert_triggers(&read, ctx.tenant_id(), schema_table_key(bounds))?
+        }
+    };
     for bound in bounds {
+        if skip_pre_projection {
+            break;
+        }
         if has_sequence {
             let probe = sequence_patched_values(bound, schema, |_| Some(0))?;
             rows.push(mask_returning_row_id(

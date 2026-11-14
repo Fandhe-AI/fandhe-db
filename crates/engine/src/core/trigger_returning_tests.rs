@@ -333,6 +333,38 @@ fn statement_triggers_fire_once_with_returning() {
     }
 }
 
+// ソースが 0 行の `INSERT ... SELECT ... RETURNING` は `0A000` にせず、0 行を返して INSERT の文トリガを
+// 1 回発火する（Issue #3192）。
+#[test]
+fn insert_select_returning_zero_rows_fires_statement_trigger() {
+    let dir = tempdir();
+    let calls_log = Arc::new(AtomicUsize::new(0));
+    let c2 = Arc::clone(&calls_log);
+    let (core, _calls) = core_with(
+        dir.path(),
+        Box::new(move |c| {
+            if c.tg_level() == "STATEMENT" {
+                c2.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(TriggerOutcome::Proceed(c.new_row.to_vec()))
+        }),
+    );
+    let a = ctx("tenant-a");
+    seed(&core, &a);
+    add_trigger(
+        &core.storage,
+        "tenant-a",
+        "trg",
+        &dml_trigger("sa", TriggerTiming::After, TriggerLevel::Statement, INS),
+    );
+    let sql = format!(
+        "INSERT INTO trg (id, embedding, a, n) SELECT id, embedding, a, n FROM trg \
+         WHERE id = 999 {INS_RET}"
+    );
+    assert_eq!(ret(&core, &a, &sql), (0, vec![]));
+    assert_eq!(calls_log.load(Ordering::SeqCst), 1);
+}
+
 // 明示トランザクション内でも同じ結果になり、ROLLBACK で行・監査行とも残らない。
 #[test]
 fn returning_in_explicit_transaction() {
