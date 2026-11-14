@@ -407,6 +407,73 @@ fn nosql_single_row_update_defers_not_null_like_sql() {
     assert!(read_rows(&core, &a, "trg").contains(&(1, "x".to_string(), 77)));
 }
 
+/// `n`（NOT NULL）を省略した NoSQL insert を、HTTP ハンドラと同じ `bind_insert_identity` で束縛して流す。
+fn nosql_insert_omitting_n(
+    core: &EngineCore,
+    id: u64,
+    operation_id: &OperationId,
+) -> Result<u64, crate::sql::allowlist::SqlSurfaceError> {
+    core.execute_bound_insert_in_session(
+        &ctx("tenant-a"),
+        &SessionState::default(),
+        "trg",
+        1,
+        Some(operation_id),
+        |schema| {
+            let validated = crate::sql::allowlist::ValidatedInsert {
+                table_name: "trg".to_string(),
+                columns: vec!["id".to_string(), "embedding".to_string(), "a".to_string()],
+                columns_omitted: false,
+                rows: vec![vec![
+                    InsertLiteral::Number(id.to_string()),
+                    InsertLiteral::Vector(vec![1.0, 0.0]),
+                    InsertLiteral::String("x".to_string()),
+                ]],
+                operation_id: Some(operation_id.clone()),
+                returning: None,
+                on_conflict: None,
+            };
+            crate::sql::parser::bind_insert_identity(&validated, schema).map(|b| vec![b])
+        },
+    )
+    .map(|o| o.rows_affected)
+}
+
+// NoSQL insert の NOT NULL 検査は SQL 行 INSERT と同じく書き込み段へ延期する（Issue #3282）。
+// BEFORE ROW が省略列を補えば成功し、補われない・トリガ無しなら 23502 のまま（fail-closed）。
+#[test]
+fn nosql_insert_defers_not_null_so_before_row_can_fill() {
+    let dir = tempdir();
+    let (core, _calls) = core_with(dir.path(), fill_null_n());
+    let a = ctx("tenant-a");
+    // トリガ無し: 書き込み段で 23502。
+    let err = nosql_insert_omitting_n(&core, 1, &op("nn-i0")).expect_err("no trigger");
+    assert_eq!(err.wire_code(), "23502");
+    assert_eq!(count(&core, &a, "trg"), 0);
+    // AFTER のみ: 補えないので 23502。
+    add_trigger(
+        &core.storage,
+        "tenant-a",
+        "trg",
+        &dml_trigger("t", TriggerTiming::After, TriggerLevel::Row, INS),
+    );
+    let err = nosql_insert_omitting_n(&core, 2, &op("nn-i1")).expect_err("after only");
+    assert_eq!(err.wire_code(), "23502");
+    assert_eq!(count(&core, &a, "trg"), 0);
+    // BEFORE ROW が補う。
+    add_trigger(
+        &core.storage,
+        "tenant-a",
+        "trg",
+        &dml_trigger("b", TriggerTiming::Before, TriggerLevel::Row, INS),
+    );
+    assert_eq!(
+        nosql_insert_omitting_n(&core, 3, &op("nn-i2")).expect("filled"),
+        1
+    );
+    assert!(read_rows(&core, &a, "trg").contains(&(3, "x".to_string(), 77)));
+}
+
 // 未結線の形（NoSQL の RETURNING）は従来どおり 0A000 のまま。トリガは呼ばれない。
 // tracked: #3189
 #[test]
