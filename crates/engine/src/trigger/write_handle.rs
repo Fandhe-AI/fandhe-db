@@ -192,6 +192,38 @@ impl<'a> TriggerWriteHandle<'a> {
     ) -> Result<T, SqlSurfaceError> {
         let out = f(WriteTarget::InTxn(self.write_txn))?;
         self.note_written(table);
+        // 参照アクションで書き換わった連鎖先の表（孫以降を含む）も書いた表へ記録する。記録しないと、
+        // 連鎖先を親とする遅延 FK が autocommit・COMMIT のどちらでも検査されず fail-open になる。
+        for cascaded in self.cascaded_delete_tables(table)? {
+            self.note_written(&cascaded);
+        }
+        Ok(out)
+    }
+
+    /// `table` の行の `DELETE` が参照アクション（`CASCADE`／`SET NULL`／`SET DEFAULT`）で波及しうる表の
+    /// 名前を推移的に集める（`table` 自身は含まない。`NoAction` の FK は波及しない。循環は訪問済みで止める）。
+    /// カタログを読めない場合は `Err`（fail-closed）。
+    fn cascaded_delete_tables(&self, table: &str) -> Result<Vec<String>, SqlSurfaceError> {
+        let mut seen: Vec<String> = vec![table.to_ascii_lowercase()];
+        let mut stack: Vec<String> = vec![table.to_string()];
+        let mut out: Vec<String> = Vec::new();
+        while let Some(parent) = stack.pop() {
+            let referencing =
+                crate::catalog::referencing_foreign_keys_in_txn(self.write_txn, &parent).map_err(
+                    |e| crate::sql::exec::map_insert_write_error(TenantWriteError::from(e)),
+                )?;
+            for (child, fk) in referencing {
+                if matches!(fk.on_delete(), crate::catalog::ReferentialAction::NoAction) {
+                    continue;
+                }
+                let key = child.name.to_ascii_lowercase();
+                if !seen.contains(&key) {
+                    seen.push(key);
+                    out.push(child.name.clone());
+                    stack.push(child.name.clone());
+                }
+            }
+        }
         Ok(out)
     }
 

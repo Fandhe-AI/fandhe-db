@@ -678,3 +678,50 @@ fn delete_cascading_into_the_table_in_a_row_loop_is_rejected() {
     assert_eq!(ints(&core, "t1", "SELECT n FROM child"), vec![10]);
     assert_eq!(ints(&core, "t1", "SELECT k FROM parent").len(), 2);
 }
+
+// P0（Cursor Bugbot 指摘）: 本体の `DELETE` が参照アクションで波及させた表（孫以降を含む）も書いた表として
+// 記録され、連鎖先を親とする遅延 FK が autocommit は文末、明示 Tx は COMMIT で `23503` になる。
+#[test]
+fn body_delete_cascade_target_is_checked_by_deferred_foreign_keys() {
+    let (core, _g) = core_with("trgdel-cascade-deferred", LedgerMode::Optional);
+    base_tables(&core);
+    ok(&core, "t1", "CREATE TABLE gp (k BIGINT PRIMARY KEY)");
+    ok(
+        &core,
+        "t1",
+        "CREATE TABLE gc (k BIGINT PRIMARY KEY, pid BIGINT REFERENCES gp ON DELETE CASCADE)",
+    );
+    ok(
+        &core,
+        "t1",
+        "CREATE TABLE gg (cid BIGINT REFERENCES gc DEFERRABLE INITIALLY DEFERRED)",
+    );
+    ok(&core, "t1", "INSERT INTO gp (k) VALUES (1)");
+    ok(&core, "t1", "INSERT INTO gc (k, pid) VALUES (10, 1)");
+    ok(&core, "t1", "INSERT INTO gg (cid) VALUES (10)");
+    create_fn(
+        &core,
+        "t1",
+        "eat_gp",
+        "BEGIN DELETE FROM gp WHERE k = 1; RETURN NEW; END",
+    );
+    trigger(&core, "ta", "AFTER INSERT", "tt", "ROW", "eat_gp");
+
+    assert_eq!(code(&core, "t1", "INSERT INTO tt (n) VALUES (1)"), "23503");
+    assert!(ints(&core, "t1", "SELECT n FROM tt").is_empty());
+    assert_eq!(ints(&core, "t1", "SELECT k FROM gc"), vec![10]);
+
+    let c = ctx("t1");
+    let mut s = session();
+    let mut txn = core.new_session_transaction();
+    core.execute_sql_in_txn(&c, &mut s, &mut txn, "BEGIN")
+        .expect("begin");
+    core.execute_sql_in_txn(&c, &mut s, &mut txn, "INSERT INTO tt (n) VALUES (1)")
+        .expect("deferred check waits for COMMIT");
+    let e = core
+        .execute_sql_in_txn(&c, &mut s, &mut txn, "COMMIT")
+        .expect_err("deferred FK violation on the cascaded table");
+    assert_eq!(e.wire_code(), "23503");
+    assert!(ints(&core, "t1", "SELECT n FROM tt").is_empty());
+    assert_eq!(ints(&core, "t1", "SELECT k FROM gc"), vec![10]);
+}
