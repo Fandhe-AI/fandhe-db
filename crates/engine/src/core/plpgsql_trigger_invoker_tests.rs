@@ -330,38 +330,6 @@ fn body_error_in_explicit_transaction_fails_the_transaction() {
     assert_eq!(audit_count(&core, "t1"), 0);
 }
 
-// (5) 未対応の形は固定の `0A000` で拒否され、副作用が残らない。
-//
-// tracked: #3187
-// 本体の `DELETE`・表を読む `SELECT` は、窓口を広げる #3187 までの暫定の拒否（`UPDATE` は #3186 で対応済み）。
-#[test]
-fn delete_and_table_select_in_body_are_rejected_for_now() {
-    let (core, _g) = core_with("trginv-pending", LedgerMode::Optional);
-    base_tables(&core);
-    ok(&core, "t1", "INSERT INTO audit (n) VALUES (1)");
-    for (i, stmt) in ["DELETE FROM audit", "SELECT n INTO x FROM audit"]
-        .iter()
-        .enumerate()
-    {
-        let f = format!("pend{i}");
-        create_fn(
-            &core,
-            "t1",
-            &f,
-            &format!("DECLARE x INTEGER; BEGIN INSERT INTO audit (n) VALUES (50); {stmt}; RETURN NEW; END"),
-        );
-        ok(&core, "t1", "DROP TRIGGER IF EXISTS tb ON s.tt");
-        create_trigger(&core, "t1", "tb", "BEFORE", "s.tt", &f);
-        assert_eq!(
-            code(&core, "t1", "INSERT INTO s.tt (n) VALUES (1)"),
-            "0A000",
-            "{stmt}"
-        );
-        assert!(ints(&core, "t1", "SELECT n FROM s.tt").is_empty(), "{stmt}");
-        assert_eq!(ints(&core, "t1", "SELECT n FROM audit"), vec![1], "{stmt}");
-    }
-}
-
 // (5) 窓口が受けない書き込みの形は、PG とは異なる既知の差として固定の `0A000` で拒否する。
 //
 // intentional: docs/design/plpgsql-subset.md

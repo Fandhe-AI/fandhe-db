@@ -263,10 +263,8 @@ fn trigger_does_not_fire_across_tenants() {
     assert!(texts(&core, "t2", "SELECT lv FROM audit").is_empty());
 }
 
-// 未対応の本体（本体の DELETE）は `0A000` で、本表・監査に残渣を残さない。
-//
-// tracked: #3187
-// 本体の `DELETE` は窓口を広げる #3187 までの暫定の拒否（UPDATE は dispatch 済み）。
+// 窓口の許可リストに無い本体（`INSERT ... SELECT`）は `0A000` で、本表・監査に残渣を残さない。
+// 本体の `DELETE`・表を読む `SELECT` は Issue #3187 で対応済み（`core::plpgsql_trigger_delete_select_tests`）。
 #[test]
 fn unsupported_body_is_0a000_without_residue() {
     let (_g, core) = open("t45fire-unsupported");
@@ -275,7 +273,7 @@ fn unsupported_body_is_0a000_without_residue() {
         &core,
         "t1",
         "upd",
-        "BEGIN INSERT INTO audit (n) VALUES (50); DELETE FROM audit WHERE n = 50; RETURN NEW; END",
+        "BEGIN INSERT INTO audit (n) VALUES (50); INSERT INTO audit (n) SELECT 51; RETURN NEW; END",
     );
     trigger(&core, "t1", "tb", "BEFORE INSERT FOR EACH ROW", "upd");
     assert_eq!(

@@ -189,6 +189,8 @@ pub(super) fn update_rows_with_triggers(
             .try_reserve_exact(candidate_ids.len())
             .map_err(|_| reserve_err())?;
     }
+    // 行ループの間は、トリガ本体が同じ表の行を消せない（`trigger::row_loop`。D6 の暫定ガード）。
+    let row_loop_guard = crate::trigger::row_loop::RowLoopGuard::enter(ctx.tenant_id(), table);
     // BEFORE ROW の本体が同じ表を書き換えると、BEFORE 前に読んだ OLD から作る最終行が黙って上書きする
     // （失われた更新）。候補ループの間だけ表を記録し、トリガ本体の同表 `UPDATE` を拒否させる。
     let row_loop = (!plan.before.is_empty()).then(|| RowLoopScope::enter(table));
@@ -288,6 +290,7 @@ pub(super) fn update_rows_with_triggers(
             after_queue.push((old_values, final_row));
         }
     }
+    drop(row_loop_guard);
     // 外側の書き込みが済んだため、以降（制約検査・AFTER）のトリガ本体の同表 `UPDATE` は許す。
     drop(row_loop);
     if !written.is_empty() {
@@ -401,6 +404,8 @@ pub(super) fn delete_rows_with_triggers(
             .try_reserve_exact(candidate_ids.len())
             .map_err(|_| reserve_err())?;
     }
+    // 行ループの間は、トリガ本体が同じ表の行を消せない（`trigger::row_loop`。D6 の暫定ガード）。
+    let row_loop_guard = crate::trigger::row_loop::RowLoopGuard::enter(ctx.tenant_id(), table);
     // UPDATE 側と同じ理由（BEFORE ROW の本体による同表の書き換えを候補ループの間だけ拒否させる）。
     let row_loop = (!plan.before.is_empty()).then(|| RowLoopScope::enter(table));
     for id in candidate_ids {
@@ -443,6 +448,7 @@ pub(super) fn delete_rows_with_triggers(
             after_queue.push(old_values);
         }
     }
+    drop(row_loop_guard);
     drop(row_loop);
     if !removed.is_empty() {
         crate::constraint::forget_unique_index_rows_in_txn(
