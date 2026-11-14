@@ -29,6 +29,7 @@ mod wire_enum_column;
 mod wire_error_response;
 mod wire_explain;
 mod wire_extended_query;
+mod wire_fk_allocated_actions;
 mod wire_float_columns;
 mod wire_grant_revoke;
 mod wire_hint_order;

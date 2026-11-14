@@ -1073,8 +1073,7 @@ fn allocated_parent_id_reference_is_tenant_scoped() {
 }
 
 /// 参照中の採番方式の親の `id` UPDATE は 23503 で拒否され（孤児化を許さない）、参照のない親の
-/// `id` 更新は成功して索引が追随する。ON UPDATE CASCADE 宣言でも fail-closed（Issue #3179）。
-/// tracked: #3180
+/// `id` 更新は成功して索引が追随する。ON UPDATE CASCADE 宣言の子は連鎖で追随する（Issue #3179・#3180）。
 #[test]
 fn allocated_parent_id_update_is_checked_against_referencing_rows() {
     let (core, _g) = new_core("t23-fk-id-parent-update");
@@ -1120,17 +1119,26 @@ fn allocated_parent_id_update_is_checked_against_referencing_rows() {
         ),
         "23503"
     );
-    // ON UPDATE CASCADE 宣言でも、連鎖は #3180 まで未実装のため事後検証で拒否される。
+    // ON UPDATE CASCADE 宣言の子は、親の id 更新に追随する（Issue #3180）。
     run(
         &core,
         &alice,
-        "CREATE TABLE casc (author BIGINT REFERENCES users (id) ON UPDATE CASCADE)",
+        "CREATE TABLE casc (author BIGINT REFERENCES users (id) ON UPDATE CASCADE, note TEXT)",
     );
-    run(&core, &alice, "INSERT INTO casc (author) VALUES (20)");
+    run(
+        &core,
+        &alice,
+        "INSERT INTO casc (author, note) VALUES (20, 'c')",
+    );
+    // NO ACTION の子（posts.author = 20）が残る間は、連鎖後も事後検証で 23503。
     assert_eq!(
         code_of(&core, &alice, "UPDATE users SET id = 30 WHERE id = 20"),
         "23503"
     );
+    run(&core, &alice, "DELETE FROM posts WHERE author = 20");
+    run(&core, &alice, "UPDATE users SET id = 30 WHERE id = 20");
+    let rows = query(&core, &alice, "SELECT note FROM casc WHERE author = 30");
+    assert_eq!(texts(&rows, 0), vec!["c"]);
 }
 
 /// 明示トランザクション・`INITIALLY DEFERRED` でも、採番方式の親の孤児は COMMIT までに 23503 で
@@ -1176,12 +1184,10 @@ fn allocated_parent_id_reference_deferred_check_rejects_orphans_at_commit() {
     assert_eq!(texts(&rows, 0), vec!["x"]);
 }
 
-/// 採番方式の親の `id` 参照を受理した後の中間状態の親側操作（Issue #3178）。子の参照有無にかかわらず、
-/// 親の行を除く DELETE は参照先の値を解決できないため 0A000 で拒否して行を残す（fail-closed。
-/// 連鎖・遅延検査は #3180）。自己参照表も同様。
-/// tracked: #3180
+/// 採番方式の親の `id` 参照の親側 DELETE（Issue #3178・#3180）。参照されている行の DELETE は
+/// NO ACTION の子が残るため 23503 で拒否して行を残し、参照のない行の DELETE は成功する。自己参照表も同様。
 #[test]
-fn allocated_parent_delete_is_rejected_while_id_reference_exists_for_now() {
+fn allocated_parent_delete_is_checked_against_referencing_rows() {
     let (core, _g) = new_core("t23-fk-id-parent-delete");
     let alice = ctx("alice");
     run(
@@ -1197,15 +1203,23 @@ fn allocated_parent_delete_is_rejected_while_id_reference_exists_for_now() {
     run(
         &core,
         &alice,
-        "INSERT INTO users (id, name) VALUES (1, 'a')",
+        "INSERT INTO users (id, name) VALUES (1, 'a'), (2, 'b')",
+    );
+    run(
+        &core,
+        &alice,
+        "INSERT INTO posts (author, body) VALUES (1, 'x')",
     );
     assert_eq!(
         code_of(&core, &alice, "DELETE FROM users WHERE id = 1"),
-        "0A000"
+        "23503"
     );
     let rows = query(&core, &alice, "SELECT name FROM users LIMIT 10");
+    assert_eq!(texts(&rows, 0), vec!["a", "b"]);
+    run(&core, &alice, "DELETE FROM users WHERE id = 2");
+    let rows = query(&core, &alice, "SELECT name FROM users LIMIT 10");
     assert_eq!(texts(&rows, 0), vec!["a"]);
-    // 自己参照表も親側 DELETE は同じ中間状態で拒否される。
+    // 自己参照表も同じ。
     run(
         &core,
         &alice,
@@ -1214,12 +1228,14 @@ fn allocated_parent_delete_is_rejected_while_id_reference_exists_for_now() {
     run(
         &core,
         &alice,
-        "INSERT INTO selfref (id, up) VALUES (1, NULL)",
+        "INSERT INTO selfref (id, up) VALUES (1, NULL), (2, 1)",
     );
     assert_eq!(
         code_of(&core, &alice, "DELETE FROM selfref WHERE id = 1"),
-        "0A000"
+        "23503"
     );
+    run(&core, &alice, "DELETE FROM selfref WHERE id = 2");
+    run(&core, &alice, "DELETE FROM selfref WHERE id = 1");
 }
 
 /// 親側 DDL の依存検査は、採番方式の親でも `id` 参照を依存として拒否する（Issue #3178）。
