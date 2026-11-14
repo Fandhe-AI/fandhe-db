@@ -15,7 +15,7 @@
 明示トランザクション（Issue #942）の中で次の 3 文を受理できるようにする。
 
 - `DECLARE <name> CURSOR FOR <SELECT>`
-- `FETCH [ NEXT | [FORWARD] <n> ] { FROM | IN } <name>`
+- `FETCH [ NEXT | ALL | [FORWARD] { <n> | ALL } ] { FROM | IN } <name>`
 - `CLOSE <name>`
 
 ## 設計の要点（判断記録）
@@ -129,10 +129,11 @@ RLS-7 の暗黙適用がそのまま効く。カーソルは接続ごとの `Ses
   カーソル内の JOIN は通常の SELECT より早く `54000` に達しうる（安全側の差）。
   リレーション数・入出力行数・比較回数・結果行数の上限は起動時設定のまま。
   SELECT 権限（#1967）は全 relation を `DECLARE` の時点で検査し、`FETCH` では再検査しない。
-- **`FETCH`**（Issue #3173）: 受理するのは `FETCH [ NEXT | [FORWARD] <n> ] { FROM | IN } <name>`。
-  `NEXT` は 1 件、`IN` は `FROM` の別名、`FORWARD` の後ろは件数必須。件数は `NEXT`
+- **`FETCH`**（Issue #3173・#3174）: 受理するのは `FETCH [ NEXT | ALL | [FORWARD] { <n> | ALL } ] { FROM | IN } <name>`。
+  `NEXT` は 1 件、`ALL` は残り全行（払い出し後は末尾で、続く `ALL` は 0 行。内部では `FetchCount::All`）、
+  `IN` は `FROM` の別名、`FORWARD` の後ろは件数か `ALL` が必須。件数は `NEXT`
   を含め `sql::parser::validate_search_limit_with`（`1..=MAX_SEARCH_K`）を通す。
-  `ALL`／`BACKWARD`／`PRIOR`／`FIRST`／`LAST`／`ABSOLUTE`／`RELATIVE`・件数なしの
+  `BACKWARD`／`PRIOR`／`FIRST`／`LAST`／`ABSOLUTE`／`RELATIVE`・件数なしの
   `FORWARD`・`FROM`／`IN` の省略は前方向へ読み替えず `42601` で拒否する（fail-closed）。
 - **`CLOSE`**: 受理するのは `CLOSE <name>` のみ。`CLOSE ALL` は明示的に
   拒否する（`ALL` 自体は識別子として妥当な形のため、拒否しないと「たまたま
@@ -158,6 +159,7 @@ RLS-7 の暗黙適用がそのまま効く。カーソルは接続ごとの `Ses
 | 不在のカーソル名に対する `FETCH`／`CLOSE`（トランザクション外も含む） | `34000` | 新設 `ErrorClass::InvalidCursorName` |
 | `n` の範囲外 | `22000` | `validate_search_limit` を再利用 |
 | `DECLARE` 内側 SELECT の結果行数上限超過（`LIMIT` 省略・`ALL` の受理後） | `54000` | `DECLARE` を拒否しカーソルは登録しない。設計は [limit-omitted-result-cap.md](limit-omitted-result-cap.md) |
+| `FETCH ALL` の残り行数が結果行数上限を超える場合 | `54000` | 部分払い出しをせず位置も進めない多層防御（`DECLARE` で cap 済みのため SQL 経路からは通常到達しない） |
 | 同時カーソル数の上限超過（`MAX_CURSORS_PER_SESSION`＝16 本目の次） | `54000` | 内側の `SELECT` を実行する**前**に判定する |
 | セッション内でカーソルが保持する確定行の合計バイト数の上限超過（`MAX_CURSOR_BYTES_PER_SESSION`＝16 MiB） | `54000` | `wire-server::limits::MAX_SUSPENDED_PORTAL_BYTES_PER_SESSION` と同じ根拠 |
 | カーソル名の重複 | `22000` | PostgreSQL は `42P03` を返すが、本リポは既存の `22000`（`InvalidInput`）へ写像した（実装既定値。ERR-6 ポインタ） |
@@ -245,7 +247,7 @@ execute_portal`）で以下の 2 つを portal へ束縛し、再開前に突き
 
 ## 対象外・申し送り
 
-- `SCROLL`／`WITH HOLD`／`BINARY`／`FETCH ALL`／`BACKWARD`／`PRIOR`／`FIRST`／`LAST`／
+- `SCROLL`／`WITH HOLD`／`BINARY`／`BACKWARD`／`PRIOR`／`FIRST`／`LAST`／
   `ABSOLUTE`／`RELATIVE`／件数なし `FORWARD`／`FROM`・`IN` 省略の `FETCH`／`CLOSE ALL`／
   `MOVE`、二重引用符のカーソル名（psycopg 3 の `ServerCursor` はこの形式を
   使うため非対応になる）。
