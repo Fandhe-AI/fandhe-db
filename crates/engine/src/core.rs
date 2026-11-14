@@ -6618,8 +6618,6 @@ impl EngineCore {
         })?;
         let gate = PathGate {
             deferred: resolution.deferred_error,
-            relation_in_schema: resolution.relation_in_schema,
-            set_schema: PathGate::is_set_schema_statement(tokens),
             unqualified: None,
             reached: false,
         };
@@ -8618,8 +8616,6 @@ impl EngineCore {
                             }
                         })?;
                     gate.deferred = resolution.deferred_error;
-                    gate.relation_in_schema = resolution.relation_in_schema;
-                    gate.set_schema = PathGate::is_set_schema_statement(&tokens);
                     rewrites = resolution.rewrites.clone();
                     crate::sql::search_path::apply_rewrites(&mut tokens, resolution.rewrites);
                 }
@@ -21950,15 +21946,11 @@ impl VectorCore for EngineCore {
     }
 }
 /// 未修飾名の `search_path` 解決（[`EngineCore::resolve_search_path_for_statement`]）の、解析後に判定する結果
-/// （Issue #3195・#3196）。判定順は構文 `42601` → 解決エラー（`42P01`）→ SET SCHEMA の `0A000` → その他。
+/// （Issue #3195・#3196）。判定順は構文 `42601` → 解決エラー（`42P01`）→ その他。
 #[derive(Debug, Default)]
 struct PathGate {
     /// `42601` に劣後して返す解決エラー。
     deferred: Option<crate::sql::allowlist::SqlSurfaceError>,
-    /// 関係位置の参照が自テナントの SCHEMA に解決されたか。
-    relation_in_schema: bool,
-    /// `ALTER .. SET SCHEMA ..` の文か（未修飾の対象が SCHEMA に解決されたら `0A000`。tracked: #3198）。
-    set_schema: bool,
     /// 拡張クエリの Parse だけが使う。解決後のトークンに対する参照ゲートの `42P01`（解析エラーに優先する）。
     unqualified: Option<crate::sql::allowlist::SqlSurfaceError>,
     /// 拡張クエリの Parse で、解決・参照ゲートの判定まで到達したか（到達前に失敗した場合だけ、呼び出し側が
@@ -21975,9 +21967,8 @@ impl PathGate {
     }
 
     /// 解析結果へ解決の判定を重ねる。構文エラー `42601` は常に優先し、解決エラー、未対応形の順で続く。
-    /// 未修飾名は修飾名と同じ内部キーへ書き換え済みなので、受理・拒否は修飾形と同じになる。例外は、
-    /// 未修飾の対象が SCHEMA に解決された `ALTER TABLE .. SET SCHEMA`（テナント SCHEMA 間の移動は
-    /// tracked: #3198）で、修飾形の `42501` に先回りせず固定文言の `0A000` にする（fail-closed）。
+    /// 未修飾名は修飾名と同じ内部キーへ書き換え済みなので、受理・拒否は修飾形と同じになる
+    /// （`ALTER TABLE t SET SCHEMA ..` も修飾形と同じ経路。Issue #3198・#3199）。
     fn finish<T>(
         self,
         parsed: Result<T, crate::sql::allowlist::SqlSurfaceError>,
@@ -21994,20 +21985,7 @@ impl PathGate {
             return Err(e);
         }
         let parsed = parsed?;
-        if self.relation_in_schema && self.set_schema {
-            return Err(Self::unsupported());
-        }
         Ok(parsed)
-    }
-
-    /// 文が `ALTER .. SET SCHEMA ..` の形か（字句だけで判定する。保守的で、誤検出は拒否側）。
-    fn is_set_schema_statement(tokens: &[crate::sql::lexer::Token]) -> bool {
-        use crate::sql::lexer::Token;
-        let word = |t: Option<&Token>, k: &str| matches!(t, Some(Token::Ident(w)) if w.eq_ignore_ascii_case(k));
-        word(tokens.first(), "ALTER")
-            && tokens
-                .windows(2)
-                .any(|w| word(w.first(), "SET") && word(w.get(1), "SCHEMA"))
     }
 }
 
