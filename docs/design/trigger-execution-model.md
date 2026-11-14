@@ -146,6 +146,22 @@
 - `UPDATE OF <列>` は列が `SET` の対象として書かれているときだけ発火する。BEFORE トリガに
   よる書き換えは判定に含めない。UPSERT では `DO UPDATE SET` の列で判定する
 
+> Issue #3190 の実装記録（行トリガの `WHEN`）:
+>
+> - 構文段 `sql/allowlist/trigger.rs` が `WHEN ( <式> )` を読み、トークン検査（`validate_when_tokens`）で
+>   サブクエリ・非組み込み関数・現在時刻関数・`NEW`／`OLD` 以外の修飾名・裸の列名・`;`・`$n` を拒否し
+>   （`0A000`／`42601`）、括弧の深さとトークン数に上限を置く。正規化テキストを `TriggerDef.when_sql` に保存する
+>   （blob の版は変えない）。
+> - 定義時の意味検査 `core/trigger_when.rs` が `42P17`（INSERT と OLD・DELETE と NEW・文トリガと列参照）・
+>   存在しない列（`42703`）・合成本体の分類を行う。
+> - 発火時は `BEGIN IF (<条件>) THEN RETURN NEW; END IF; RETURN NULL; END`（DELETE は `RETURN OLD`）を既存の
+>   PL/pgSQL の条件評価で `may_write: false` として実行する。`Proceed` が TRUE、`Skip` が FALSE・NULL。
+>   評価の前に保存値を再度字句解析して構造を検査する（改ざんされても本体の構造を壊さない）。
+>   BEFORE ROW は直前の NEW、AFTER ROW は行の変更の時点の NEW／OLD で評価する。評価エラーは文全体を失敗させる。
+> - 既知の制限: 文トリガの `WHEN` は参照の有無にかかわらず定義時に `0A000`（本 ADR の D7 より狭い。追跡候補）。
+>   評価器（PL/pgSQL の条件評価）が扱えない形（`IS DISTINCT FROM` 等）は定義時には止められず、発火時に
+>   `0A000` で文を取り消す（fail-closed。黙って不発火にしない）。`WHEN` 付きの UPSERT のトリガは #3189 の範囲。
+
 ### D8. 経路ごとの扱いと「未結線の経路」ガード
 
 > Issue #1723 の実装記録: [trigger-before-insert.md](trigger-before-insert.md)（INSERT の BEFORE ROW 経路・
@@ -284,7 +300,7 @@
 | COPY・NoSQL・ビュー経由・データ変更 CTE の経路は `0A000` | 黙って発火しない経路を作らない（D8）。追跡候補 |
 | 分割実行 DML では文トリガも `0A000` | 文の途中 commit で原子性を保てない |
 | ビューの文トリガ・一時表へのトリガは `0A000` | 初版の範囲外。追跡候補 |
-| `WHEN` でユーザー関数・揮発性関数を受理しない | 宣言的な式に限定。追跡候補 |
+| `WHEN` でユーザー関数・揮発性関数・サブクエリを受理しない。文トリガの `WHEN` も受理しない | 宣言的な式に限定（Issue #3190）。追跡候補 |
 
 ## セキュリティ観点（OWASP Top 10）
 

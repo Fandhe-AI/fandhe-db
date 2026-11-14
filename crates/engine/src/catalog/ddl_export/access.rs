@@ -276,9 +276,6 @@ fn render_trigger<E>(
     table_key: &str,
     def: &TriggerDef,
 ) -> Result<String, SchemaDdlError<E>> {
-    if def.when_sql.is_some() {
-        return Err(unsupported("trigger", "trigger with a WHEN condition"));
-    }
     let mut s = String::from("CREATE TRIGGER ");
     push_ident(&mut s, &def.name)?;
     s.push_str(match def.timing {
@@ -313,6 +310,12 @@ fn render_trigger<E>(
         TriggerLevel::Row => " FOR EACH ROW",
         TriggerLevel::Statement => " FOR EACH STATEMENT",
     });
+    // WHEN 条件は NEW／OLD の参照だけを持つ正規化テキスト（表名・内部キーを含まない。Issue #3190）。
+    if let Some(when) = &def.when_sql {
+        s.push_str(" WHEN (");
+        s.push_str(when);
+        s.push(')');
+    }
     s.push_str(" EXECUTE FUNCTION ");
     s.push_str(&ctx.namer.qualified_required::<E>(&def.function_key)?);
     s.push('(');

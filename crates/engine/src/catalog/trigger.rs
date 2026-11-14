@@ -194,8 +194,8 @@ pub(crate) struct TriggerDef {
     pub(crate) function_key: String,
     /// `EXECUTE FUNCTION f('a', 1)` の引数（`TG_ARGV`。値として保存し SQL へ連結しない）。
     pub(crate) tg_args: Vec<String>,
-    /// `WHEN` 条件の正規化テキスト。現状の SQL 表層は `WHEN` を受理しない（`0A000`）ため常に `None`
-    /// だが、保存形式は将来のために持つ。
+    /// `WHEN` 条件の正規化テキスト（括弧の内側。Issue #3190）。構文段が検査・正規化して保存し、
+    /// 発火側が行ごとに NEW／OLD で評価する（`None` は条件なし）。
     pub(crate) when_sql: Option<String>,
 }
 

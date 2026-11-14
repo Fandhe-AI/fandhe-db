@@ -11,6 +11,9 @@
 //! 戻り値は無視し（実行モデルの D3）、他表への書き込みは
 //! [`TriggerWriteHandle`](super::write_handle::TriggerWriteHandle) 経由で行う。
 //!
+//! 行トリガの `WHEN` は呼び出しの直前に [`TriggerRuntime::eval_when`] で評価し、TRUE のときだけ関数を呼ぶ
+//! （Issue #3190。実行モデルの D7）。
+//!
 //! 文トリガ（FOR EACH STATEMENT。TRUNCATE を含む）は [`fire_statement`] が文につき 1 回、対象行が
 //! 0 件でも発火する（Issue #1726）。
 
@@ -25,8 +28,46 @@ use crate::sql::allowlist::SqlSurfaceError;
 /// 返却行の構造違いの固定文言（値・列名・行を含めない）。
 const RETURNED_ROW_MISMATCH: &str = "trigger function returned a row that does not match the table";
 
-/// 発火時にも `WHEN` 条件を実行できないことの固定文言（定義時に拒否済みだが fail-closed に二重化する）。
+/// 文トリガで `WHEN` 条件を実行できないことの固定文言（定義時に拒否済みだが fail-closed に二重化する）。
 const WHEN_UNSUPPORTED: &str = "trigger WHEN condition is not supported";
+
+/// 行トリガ 1 つの `WHEN` 条件を評価し、発火してよいかを返す（Issue #3190。実行モデルの D7）。
+/// `when_sql` が無ければ常に `true`。TRUE だけが発火で、FALSE・NULL は不発火（次のトリガへ進む）。
+/// 評価エラーはそのまま返し、呼び出し側が文全体を失敗させる（fail-closed）。
+#[allow(clippy::too_many_arguments)]
+fn when_passes(
+    runtime: &TriggerRuntime,
+    writes: &TriggerWriteHandle<'_>,
+    table: &str,
+    schema: &TableSchema,
+    trigger: &TriggerDef,
+    op: TriggerOp,
+    level: TriggerLevel,
+    old: Option<&[Value]>,
+    new_row: &[Value],
+    timing: TriggerTiming,
+) -> Result<bool, SqlSurfaceError> {
+    let Some(when_sql) = trigger.when_sql.as_deref() else {
+        return Ok(true);
+    };
+    runtime.eval_when(
+        &TriggerCall {
+            trigger_name: &trigger.name,
+            function_key: &trigger.function_key,
+            table,
+            schema,
+            op,
+            level,
+            old_row: old,
+            new_row,
+            args: &trigger.tg_args,
+            timing,
+            writes,
+            host: runtime.host(),
+        },
+        when_sql,
+    )
+}
 
 fn returned_row_mismatch() -> SqlSurfaceError {
     SqlSurfaceError::DatatypeMismatch {
@@ -79,10 +120,20 @@ fn fire_before_chain(
     for trigger in triggers {
         // 行ごと・呼び出しごとに割り込み（`57014`）を確認する。
         crate::interrupt::check()?;
-        if trigger.when_sql.is_some() {
-            return Err(SqlSurfaceError::FeatureNotSupported {
-                detail: WHEN_UNSUPPORTED.to_string(),
-            });
+        // WHEN は呼び出し直前の NEW（前のトリガが書き換えた最新の行）で評価する（D7）。
+        if !when_passes(
+            runtime,
+            writes,
+            table,
+            schema,
+            trigger,
+            op,
+            TriggerLevel::Row,
+            old,
+            &row,
+            TriggerTiming::Before,
+        )? {
+            continue;
         }
         let outcome = runtime.invoke(&TriggerCall {
             trigger_name: &trigger.name,
@@ -200,10 +251,19 @@ pub(crate) fn fire_after_row(
 ) -> Result<(), SqlSurfaceError> {
     for trigger in triggers {
         crate::interrupt::check()?;
-        if trigger.when_sql.is_some() {
-            return Err(SqlSurfaceError::FeatureNotSupported {
-                detail: WHEN_UNSUPPORTED.to_string(),
-            });
+        if !when_passes(
+            runtime,
+            writes,
+            table,
+            schema,
+            trigger,
+            op,
+            TriggerLevel::Row,
+            old,
+            new_row,
+            TriggerTiming::After,
+        )? {
+            continue;
         }
         let _ignored = runtime.invoke(&TriggerCall {
             trigger_name: &trigger.name,

@@ -10,7 +10,7 @@
 - 実装した: TRIGGER カタログ（`crates/engine/src/catalog/trigger.rs`）、`CREATE [OR REPLACE] TRIGGER`・
   `DROP TRIGGER [IF EXISTS]` の構文・実行（`sql/allowlist/trigger.rs`・`sql/trigger_ddl.rs`）、
   表・関数・SCHEMA のライフサイクルとの連動（下記）、wire のコマンドタグ。
-- 暫定ガードで止めた（黙って受理しない）: `WHEN`（`0A000`）、`UPDATE OF` が参照する列の
+- 暫定ガードで止めた（黙って受理しない）: `UPDATE OF` が参照する列の
   `RENAME COLUMN`・`ALTER COLUMN TYPE`（`0A000`）・`DROP COLUMN`（`2BP01`。CASCADE の連鎖削除は未対応で
   RESTRICT・CASCADE とも `2BP01`）。
 - 範囲外（後続）: 発火、`RETURNS trigger` 関数の保存形式と成功経路の E2E（#2228・#1723）、
@@ -85,8 +85,8 @@ function_key / TG_ARGV リスト / WHEN の有無 + 正規化テキスト`。文
 
 単一 write txn・1 回の `commit_boundary::commit`（クラッシュしても全か無か）。成功時に対象表の世代を進める。
 
-1. 構文（`0A000`: `INSTEAD OF`・`REFERENCING`・`CONSTRAINT`・`DEFERRABLE`・`FROM`・`WHEN`・
-   `TRUNCATE` の行トリガ。`42601`: 構文違反・トリガ名の SCHEMA 修飾・イベント重複）
+1. 構文（`0A000`: `INSTEAD OF`・`REFERENCING`・`CONSTRAINT`・`DEFERRABLE`・`FROM`・
+   `TRUNCATE` の行トリガ。`WHEN` は Issue #3190 で受理し、条件の検査は実行モデル D7 の実装記録のとおり。`42601`: 構文違反・トリガ名の SCHEMA 修飾・イベント重複）
 2. DDL 権限（`42501`。カタログ照会より前。対象の有無を問わない）
 3. 明示トランザクション内は `0A000`（既存 DDL と同じ）
 4. 以降は txn 内: SCHEMA の現存 → 対象の種別（ビュー・索引・SEQUENCE・マテリアライズドビューは `42809`）→

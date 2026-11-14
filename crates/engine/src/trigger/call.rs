@@ -167,6 +167,14 @@ pub(crate) fn trigger_vars_from_call(
 pub(crate) trait TriggerFunctionInvoker: Send + Sync {
     /// 関数を 1 回実行する。エラーは [`SqlSurfaceError`] のまま呼び出し元へ透過する。
     fn invoke(&self, call: &TriggerCall<'_>) -> Result<TriggerOutcome, SqlSurfaceError>;
+
+    /// 行トリガの `WHEN` 条件を `call` の NEW／OLD で評価する（Issue #3190）。`true` のときだけ発火する
+    /// （FALSE・NULL は不発火）。既定は固定文言の `0A000`（評価を結線していない invoker は黙って発火しない）。
+    fn eval_when(&self, _call: &TriggerCall<'_>, _when_sql: &str) -> Result<bool, SqlSurfaceError> {
+        Err(SqlSurfaceError::feature_not_supported(
+            "trigger WHEN condition is not supported",
+        ))
+    }
 }
 
 /// セッション・Tx を持たない発火文脈でトリガ関数の本体を実行する実体（Issue #3184）。`EngineCore` が
@@ -176,6 +184,14 @@ pub(crate) trait TriggerHost: Sync {
     /// `call` のトリガ関数を、`call.writes` が借用する外側の write txn・呼び出しテナントの文脈の上で
     /// 1 回実行する。エラーは [`SqlSurfaceError`] のまま返し、文の取り消しは発火側が担う。
     fn invoke_trigger(&self, call: &TriggerCall<'_>) -> Result<TriggerOutcome, SqlSurfaceError>;
+
+    /// 行トリガの `WHEN` 条件（保存済みの正規化テキスト）を `call` の NEW／OLD で評価する（Issue #3190）。
+    /// TRUE のときだけ `true`。書き込みはできない読み取り専用の評価で、エラーは [`SqlSurfaceError`] のまま返す。
+    fn eval_trigger_when(
+        &self,
+        call: &TriggerCall<'_>,
+        when_sql: &str,
+    ) -> Result<bool, SqlSurfaceError>;
 }
 
 /// 本番の呼び出し口（Issue #3184）。`call.host`（`EngineCore`）へ委譲するだけで状態を持たない。
@@ -195,6 +211,20 @@ impl TriggerFunctionInvoker for PlpgsqlTriggerInvoker {
         }
         match call.host {
             Some(host) => host.invoke_trigger(call),
+            None => Err(SqlSurfaceError::FeatureNotSupported {
+                detail: "trigger function execution is not supported".to_string(),
+            }),
+        }
+    }
+
+    fn eval_when(&self, call: &TriggerCall<'_>, when_sql: &str) -> Result<bool, SqlSurfaceError> {
+        if crate::catalog::trigger::is_shared_public_table_key(call.table) {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "triggers on shared public tables are not supported",
+            ));
+        }
+        match call.host {
+            Some(host) => host.eval_trigger_when(call, when_sql),
             None => Err(SqlSurfaceError::FeatureNotSupported {
                 detail: "trigger function execution is not supported".to_string(),
             }),
