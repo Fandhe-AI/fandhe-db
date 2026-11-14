@@ -2,8 +2,8 @@
 //! セッション内保持状態を提供する。
 //!
 //! 責務境界: `DECLARE <name> CURSOR FOR <SELECT>` の内側 SELECT（集計
-//! `SELECT`〔SQL-13・SQL-14〕・広域取得 `SELECT`〔SQL-15〕に限る）の構造検証は
-//! 既存の [`crate::sql::allowlist::validate_sql_tokens`] へそのまま委譲する
+//! `SELECT`〔SQL-13・SQL-14〕・広域取得 `SELECT`〔SQL-15〕・JOIN〔CTE 入力を含む〕・集合演算に限る）の
+//! 構造検証は既存の [`crate::sql::allowlist::validate_cursor_query_tokens`] へそのまま委譲する
 //! （第 2 のパーサを作らない設計）。本モジュールは
 //! (1) `DECLARE`/`FETCH`/`CLOSE` 自体の規範形トークン検証、
 //! (2) カーソル名の識別子検証、
@@ -46,7 +46,8 @@ pub enum FetchCount {
 /// `DECLARE`/`FETCH`/`CLOSE`（許可リスト検証済み。TASK-218・WIRE-15）。
 ///
 /// `Declare` の `query` は集計 `SELECT`（[`Statement::Aggregate`]）・広域取得
-/// `SELECT`（[`Statement::Scan`]）のいずれかとして構造検証を通ったトークン列に
+/// `SELECT`（[`Statement::Scan`]）・JOIN（[`Statement::Join`]。CTE 入力を含む）・集合演算
+/// （[`Statement::SetOperation`]）のいずれかとして構造検証を通ったトークン列に
 /// 限る（構造検証段で保証済み。実行時の再検証でも同じ制約を再確認する）。
 #[derive(Debug, Clone, PartialEq)]
 pub enum CursorStatement {
@@ -143,8 +144,8 @@ pub(crate) fn validate_declare_tokens(
 }
 
 /// `DECLARE` の内側 SELECT（`FOR` より後ろのトークン列）を
-/// [`crate::sql::allowlist::validate_sql_tokens`] で検証し、検証済み
-/// [`Statement`] を返す（受理は集計・広域取得・CTE 入力なしの JOIN。Issue #3175）。
+/// [`crate::sql::allowlist::validate_cursor_query_tokens`] で検証し、検証済み
+/// [`Statement`] を返す（受理は集計・広域取得・JOIN〔CTE 入力を含む〕・集合演算。Issue #3175・#3176）。
 ///
 /// 呼び出し元は 2 つ: (1) [`validate_declare_tokens`]（構文解析段。
 /// [`AlwaysExistsLookup`] による構造検証のみ）、(2) `core.rs::EngineCore::
@@ -166,15 +167,19 @@ pub(crate) fn validate_declare_inner(
             "DECLARE requires a query after FOR",
         ));
     }
-    let inner = crate::sql::allowlist::validate_sql_tokens_with_limits(query, lookup, limits)?;
+    let inner = crate::sql::allowlist::validate_cursor_query_tokens(query, lookup, limits)?;
+    // 許可リストは `core.rs::execute_cursor_inner_query` の上限付き実行アームと 1 対 1 に対応する
+    // （ここへ足す形は必ず実行側にも残容量で縛るアームを足す。無いものは `Internal` で止まる）。
     match &inner {
         Statement::Aggregate(_) | Statement::Scan(_) => {}
-        // Issue #3175: JOIN 形（INNER／OUTER／CROSS／NATURAL／USING・集計形・LIMIT 省略形）。
-        // CTE を入力に持つ JOIN は #3176 の範囲として `42601` で拒否する（fail-closed）。
-        Statement::Join(v) if v.cte_inputs.is_none() => {}
+        // Issue #3175・#3176: JOIN 形（INNER／OUTER／CROSS／NATURAL／USING・集計形・LIMIT 省略形）。
+        // CTE を入力に持つ JOIN（`cte_inputs` あり）も含む。
+        Statement::Join(_) => {}
+        // Issue #3176: 集合演算（UNION／UNION ALL／INTERSECT／EXCEPT）。
+        Statement::SetOperation(_) => {}
         _ => {
             return Err(SqlSurfaceError::unsupported(
-                "DECLARE only supports aggregate, wide-retrieval or JOIN SELECT statements",
+                "DECLARE only supports aggregate, wide-retrieval, JOIN or set operation SELECT statements",
             ));
         }
     }
@@ -658,9 +663,9 @@ mod tests {
         assert!(matches!(stmt, CursorStatement::Declare { .. }));
     }
 
-    /// Issue #3175: JOIN 形の内側を受理し、CTE 入力の JOIN は #3176 の範囲として拒否する。
+    /// Issue #3175: JOIN 形の内側を受理する。
     #[test]
-    fn declare_accepts_join_inner_select_and_rejects_cte_join() {
+    fn declare_accepts_join_inner_select() {
         let stmt = validate_declare_tokens(
             &tokens_of(
                 "DECLARE c CURSOR FOR SELECT a.id FROM documents a JOIN documents b ON a.id = b.id LIMIT 5",
@@ -675,17 +680,52 @@ mod tests {
         let inner = validate_declare_inner(&query, &FakeCatalog, Default::default())
             .expect("inner revalidates");
         assert!(matches!(inner, Statement::Join(_)));
+    }
 
-        // tracked: #3176
-        let err = validate_declare_tokens(
-            &tokens_of(
-                "DECLARE c CURSOR FOR WITH w AS (SELECT id FROM documents LIMIT 5) SELECT w.id FROM w JOIN documents b ON w.id = b.id LIMIT 5",
-            ),
-            &FakeCatalog,
-            Default::default(),
+    fn inner_of(sql: &str) -> Result<Statement, SqlSurfaceError> {
+        validate_declare_inner(&tokens_of(sql), &FakeCatalog, Default::default())
+    }
+
+    /// Issue #3176: CTE 入力の JOIN を受理し、`cte_inputs` を保持する。
+    #[test]
+    fn declare_accepts_cte_join_inner_select() {
+        let inner = inner_of(
+            "WITH w AS (SELECT id FROM documents LIMIT 5) SELECT w.id FROM w JOIN documents b ON w.id = b.id LIMIT 5",
         )
-        .expect_err("cte join rejected");
-        assert_eq!(err.wire_code(), "42601");
+        .expect("cte join accepted");
+        match inner {
+            Statement::Join(v) => assert!(v.cte_inputs.is_some()),
+            other => panic!("expected Join, got {other:?}"),
+        }
+    }
+
+    /// Issue #3176: 集合演算（UNION／UNION ALL／INTERSECT／EXCEPT）を受理する。
+    #[test]
+    fn declare_accepts_set_operation_inner_select() {
+        for op in ["UNION", "UNION ALL", "INTERSECT", "EXCEPT"] {
+            let sql = format!("SELECT id FROM documents {op} SELECT id FROM documents LIMIT 5");
+            let inner = inner_of(&sql).unwrap_or_else(|e| panic!("{op} rejected: {e:?}"));
+            assert!(matches!(inner, Statement::SetOperation(_)), "{op}");
+        }
+    }
+
+    /// Issue #3176: 受理範囲外の形は fail-closed。JOIN を枝に持つ集合演算・`WITH` ＋ 集合演算・
+    /// `WITH RECURSIVE`・FROM の派生表は従来どおり拒否する（通常の SELECT でも同じ判定）。
+    #[test]
+    fn declare_rejects_unsupported_forms() {
+        for sql in [
+            "SELECT a.id FROM documents a JOIN documents b ON a.id = b.id UNION SELECT id FROM documents",
+            "WITH w AS (SELECT id FROM documents LIMIT 5) SELECT id FROM w UNION SELECT id FROM documents",
+            "SELECT id FROM (SELECT id FROM documents) AS d",
+        ] {
+            let err = inner_of(sql).expect_err(sql);
+            assert_eq!(err.wire_code(), "42601", "{sql}");
+        }
+        let err = inner_of(
+            "WITH RECURSIVE r AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT n FROM r",
+        )
+        .expect_err("recursive rejected");
+        assert_eq!(err.wire_code(), "0A000");
     }
 
     #[test]
