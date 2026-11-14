@@ -432,3 +432,31 @@ fn returning_upsert_stays_guarded() {
     .expect("ledger not consumed");
     assert_eq!(count(&core, &a, "trg"), 1);
 }
+
+// BEFORE INSERT だけを持つ表でも、行ループの間は同表の行ごとループ保護が有効（Issue #3191 の指摘）。
+// `unique_existing` は BEFORE 前に作るため、本体が既存行の UNIQUE キーを書き換えると衝突先を誤選択する。
+// 本体の同表 `UPDATE` を窓口が拒否できるよう、BEFORE 本体の実行中に保護が立っていることを固定する。
+#[test]
+fn before_insert_only_table_marks_row_loop_active() {
+    let dir = crate::test_util::temp_db::tempdir();
+    let seen = Arc::new(Mutex::new(Vec::<bool>::new()));
+    let seen_in = Arc::clone(&seen);
+    let (core, _calls) = core_with(
+        dir.path(),
+        Box::new(move |c| {
+            if c.tg_when() == "BEFORE" && c.tg_level() == "ROW" {
+                seen_in
+                    .lock()
+                    .expect("seen")
+                    .push(crate::tenant::trigger_row_loop::is_row_loop_active("trg"));
+            }
+            Ok(TriggerOutcome::Proceed(c.new_row.to_vec()))
+        }),
+    );
+    let a = ctx("tenant-a");
+    seed(&core);
+    all_triggers(&core, INS, 0);
+    run(&core, &a, UPSERT_UPDATE).expect("upsert");
+    assert_eq!(*seen.lock().expect("seen"), vec![true, true]);
+    assert!(!crate::tenant::trigger_row_loop::is_row_loop_active("trg"));
+}

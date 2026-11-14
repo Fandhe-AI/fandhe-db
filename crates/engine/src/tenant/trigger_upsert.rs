@@ -173,7 +173,10 @@ pub(super) fn upsert_rows_with_triggers(
     let row_loop_guard = crate::trigger::row_loop::RowLoopGuard::enter(ctx.tenant_id(), table);
     // BEFORE UPDATE の本体が同じ表を書き換えると、BEFORE 前に読んだ OLD から作る最終行が黙って上書きする
     // （失われた更新）。UPDATE 側の BEFORE があるときだけ、ループの間の同表 `UPDATE` を拒否させる。
-    let row_loop = update_before.map(|_| RowLoopScope::enter(table));
+    // BEFORE INSERT 側も同様に拒否する。`unique_existing` は BEFORE ROW INSERT より前に作るため、本体が
+    // 既存行の UNIQUE キーを書き換えると古い対応表で衝突先を誤選択する（fail-closed）。
+    let row_loop =
+        (update_before.is_some() || insert_before.is_some()).then(|| RowLoopScope::enter(table));
 
     for (row_idx, (id, values)) in rows.iter().enumerate() {
         super::check_interrupt()?;
