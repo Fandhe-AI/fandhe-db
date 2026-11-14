@@ -48,6 +48,10 @@ const ROW_ENCODE_MISMATCH: &str = "trigger function returned a row that does not
 pub(super) struct TriggeredDml {
     /// 実際に変更した行数（BEFORE の `NULL` 返却でスキップした行は含まない）。
     pub(super) applied: usize,
+    /// 候補のうち消費した件数（BEFORE の `NULL` 返却でスキップした行を含む。`should_stop` で打ち切った
+    /// ときは `candidate_ids.len()` 未満）。分割実行 DML（Issue #3283）がカーソルを進める根拠で、
+    /// `applied` とは異なる（スキップ行は書かないが、再走査・再発火させないため消費に数える）。
+    pub(super) consumed: usize,
     /// トリガ本体が別表へ書き込んだか。全行スキップでも別表への書き込みがあれば txn を commit 対象にする。
     pub(super) trigger_wrote: bool,
 }
@@ -168,6 +172,7 @@ pub(super) fn update_rows_with_triggers(
     spec: &UpdateSpec<'_>,
     plan: &RowTriggerPlan<'_>,
     writes: &TriggerWriteHandle<'_>,
+    mut should_stop: Option<&mut dyn FnMut() -> bool>,
 ) -> Result<TriggeredDml, TenantWriteError> {
     // 対象行が 0 件でも `row_security = off` の拒否を文の開始時点で適用する（RLS-13・Issue #2278）。
     crate::sql::policy_eval::reject_row_security_off_in_txn(write_txn, ctx.tenant_id(), table)?;
@@ -197,7 +202,14 @@ pub(super) fn update_rows_with_triggers(
     // BEFORE ROW の本体が同じ表を書き換えると、BEFORE 前に読んだ OLD から作る最終行が黙って上書きする
     // （失われた更新）。候補ループの間だけ表を記録し、トリガ本体の同表 `UPDATE` を拒否させる。
     let row_loop = (!plan.before.is_empty()).then(|| RowLoopScope::enter(table));
+    let mut consumed = 0usize;
     for (pos, id) in candidate_ids.iter().enumerate() {
+        // 分割実行 DML（Issue #3283）の writer 保持時間・期限の確認点。1 件以上消費した後の候補の直前でだけ
+        // 判定し、打ち切ったときは消費済みの行だけ後段（制約・FK・AFTER）へ進む。
+        if pos > 0 && should_stop.as_mut().is_some_and(|f| f()) {
+            break;
+        }
+        consumed = pos + 1;
         crate::interrupt::check().map_err(TenantWriteError::TriggerFailed)?;
         let row_extra: &[(usize, Value)] = match spec.row_overrides {
             Some(o) => o.get(pos).map(Vec::as_slice).ok_or_else(|| {
@@ -363,6 +375,7 @@ pub(super) fn update_rows_with_triggers(
     settle_trigger_written_tables(write_txn, target, ctx, writes)?;
     Ok(TriggeredDml {
         applied: written.len(),
+        consumed,
         trigger_wrote: !writes.written_tables().is_empty(),
     })
 }
@@ -394,6 +407,7 @@ pub(super) fn delete_rows_with_triggers(
     candidate_ids: &[u64],
     plan: &RowTriggerPlan<'_>,
     writes: &TriggerWriteHandle<'_>,
+    mut should_stop: Option<&mut dyn FnMut() -> bool>,
 ) -> Result<TriggeredDml, TenantWriteError> {
     // `delete_row_impl` と同じ判定条件（`id` 参照 FK を含む）で、参照アクションの起点の旧値を残す。
     let needs_fk_removed_pre_image = schema.primary_key().is_some()
@@ -416,7 +430,13 @@ pub(super) fn delete_rows_with_triggers(
     let row_loop_guard = crate::trigger::row_loop::RowLoopGuard::enter(ctx.tenant_id(), table);
     // UPDATE 側と同じ理由（BEFORE ROW の本体による同表の書き換えを候補ループの間だけ拒否させる）。
     let row_loop = (!plan.before.is_empty()).then(|| RowLoopScope::enter(table));
-    for id in candidate_ids {
+    let mut consumed = 0usize;
+    for (pos, id) in candidate_ids.iter().enumerate() {
+        // UPDATE 側と同じ確認点（分割実行 DML。Issue #3283）。
+        if pos > 0 && should_stop.as_mut().is_some_and(|f| f()) {
+            break;
+        }
+        consumed = pos + 1;
         crate::interrupt::check().map_err(TenantWriteError::TriggerFailed)?;
         let existing = read_row(write_txn, table, ctx, *id)?;
         let old_values =
@@ -514,6 +534,7 @@ pub(super) fn delete_rows_with_triggers(
     settle_trigger_written_tables(write_txn, target, ctx, writes)?;
     Ok(TriggeredDml {
         applied: removed.len(),
+        consumed,
         trigger_wrote: !writes.written_tables().is_empty(),
     })
 }

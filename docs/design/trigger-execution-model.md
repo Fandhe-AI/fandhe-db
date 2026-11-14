@@ -174,7 +174,7 @@
 | 単一行・述語形の `UPDATE`／`DELETE`、`UPDATE ... FROM`／`DELETE ... USING`、サブクエリ形 | 結線（#1725） |
 | UPSERT | 結線（#1725） |
 | `TRUNCATE` | 文トリガだけ（#1726）。行トリガは定義時に `0A000`、DELETE トリガは発火しない（PG と同じ）。複数表・`CASCADE` では対象表ごとに発火 |
-| 分割実行 DML（SQL-32 ポインタ） | 対象表に該当イベントのトリガが 1 つでもあれば（行・文を問わず）`0A000`。文の途中で commit するため文トリガも原子性を保てず、行トリガだけを拒否するより厳しい側に倒す |
+| 分割実行 DML（SQL-32 ポインタ） | 行トリガ（BEFORE／AFTER ROW）はチャンクごとに発火し、文トリガ・子表のトリガ・NoSQL は `0A000`（Issue #3283。[trigger-partitioned-dml.md](trigger-partitioned-dml.md)）。文の途中で commit するため文トリガは原子性を保てない |
 | FK の参照アクションが、該当イベントのトリガを持つ子表に及ぶ形 | 子表の ROW トリガは子行ごとに発火（Issue #3284。親にトリガが無くても。NoSQL の単一行／述語形 `update`・`delete` も同じ経路で発火する。`constraint/referential_triggers.rs`）。結線の無い経路（RETURNING 付き・分割実行・UPSERT の `DO UPDATE`・NoSQL の `RETURNING`／分割実行／UPSERT・生の行 API）と、子表の FOR EACH STATEMENT トリガは `0A000` |
 | `COPY ... FROM STDIN`（永続表） | 結線（#3281）。セッション入口 `commit_copy_in_txn_in_session` だけが主体の写しと通過証を渡す。セッションなしの公開入口（`commit_copy_in`・ダンプ復元）は `0A000` のまま |
 | NoSQL（HTTP）表層の `insert`・単一行／述語形の `update`・`delete`（Issue #3282） | 結線済み。入口が `Some(&runtime.bind(self))` と発火元の主体の写し（`TriggerSubjectScope`）を渡す。`RETURNING` 付き・分割実行・UPSERT は未結線で `0A000` |
@@ -293,7 +293,7 @@
 | 子表の AFTER ROW は、参照アクションの連鎖と事後検証がすべて済んだ後に適用順で発火する（子の AFTER が親の AFTER より先） | 単一検査点の維持（#3284） |
 | 子表の BEFORE ROW が `NULL` を返して子行が残ると、事後検証が `23503` で文全体を取り消す | 孤児を黙って残さない fail-closed。専用の `wire_code` は足さない。PG 17 の実測は未実施で、差分の有無は未確認（#3284） |
 | ビュー経由・データ変更 CTE の経路と、NoSQL の `RETURNING`・分割実行・UPSERT・生の行 API は `0A000` | 黙って発火しない経路を作らない（D8）。追跡候補 |
-| 分割実行 DML では文トリガも `0A000` | 文の途中 commit で原子性を保てない |
+| 分割実行 DML では文トリガは `0A000`（行トリガは発火。Issue #3283） | 文の途中 commit で原子性を保てない |
 | 0 行の COPY では文トリガが発火しない（`finish()` が `22000` で拒否するため。PG は 0 行でも発火） | 既存の空 COPY 拒否を変えない（#3281）。追跡候補 |
 | ビューの文トリガ・一時表へのトリガは `0A000` | 初版の範囲外。追跡候補 |
 | `WHEN` でユーザー関数・揮発性関数を受理しない | 宣言的な式に限定。追跡候補 |

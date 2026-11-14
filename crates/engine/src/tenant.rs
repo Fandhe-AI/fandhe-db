@@ -5541,6 +5541,7 @@ fn update_row_columns_impl(
                     },
                     &plan,
                     &writes,
+                    None,
                 )?;
                 // commit 記録（SQL-38・Issue #2404）: 0 行でも世代を進める経路のため表を記録する。
                 if done.applied == 0 {
@@ -6116,7 +6117,7 @@ fn delete_row_impl(
                 // 不在・他テナント・不可視の id でも空の対象で同じ経路を通す（AFTER STATEMENT を発火）。
                 let candidates: &[u64] = if is_target { &[id] } else { &[] };
                 let done = trigger_dml::delete_rows_with_triggers(
-                    write_txn, &target, table, ctx, &schema, candidates, &plan, &writes,
+                    write_txn, &target, table, ctx, &schema, candidates, &plan, &writes, None,
                 )?;
                 if done.applied > 0 || done.trigger_wrote {
                     // commit 記録（SQL-38・Issue #2404）: 0 行でも世代を進める経路のため表を記録する。
@@ -7042,6 +7043,7 @@ fn delete_rows_where_impl<E>(
                 &candidate_ids,
                 &plan,
                 &trigger_writes,
+                None,
             )?;
             if done.applied > 0 || done.trigger_wrote {
                 // commit 記録（SQL-38・Issue #2404）: 0 行でも世代を進める経路のため表を記録する。
@@ -7369,6 +7371,7 @@ fn update_rows_where_impl<E>(
                 },
                 &plan,
                 &trigger_writes,
+                None,
             )?;
             if done.applied > 0 || done.trigger_wrote {
                 // commit 記録（SQL-38・Issue #2404）: 0 行でも世代を進める経路のため表を記録する。
@@ -7574,6 +7577,7 @@ pub(crate) fn update_rows_joined_unchecked<E>(
                 },
                 &plan,
                 &trigger_writes,
+                None,
             )?;
             if done.applied > 0 || done.trigger_wrote {
                 // commit 記録（SQL-38・Issue #2404）: 0 行でも世代を進める経路のため表を記録する。
@@ -12502,6 +12506,7 @@ mod tests {
                 crate::storage::rowid::RowId::from_legacy_id(1),
                 10,
                 None,
+                false,
             )
             .expect("running");
             txn.commit_raw_for_test().expect("commit");
@@ -12550,6 +12555,7 @@ mod tests {
                 crate::storage::rowid::RowId::from_legacy_id(1),
                 10,
                 None,
+                false,
             )
             .expect("running");
             txn.commit_raw_for_test().expect("commit");
