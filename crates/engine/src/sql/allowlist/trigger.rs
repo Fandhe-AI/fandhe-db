@@ -6,8 +6,10 @@
 //! `sql::trigger_ddl` が権限ゲートの後で行う）。呼び出し元は `core.rs` の `parse_sql` 内の分岐だけ。
 //!
 //! 受理しない形（`INSTEAD OF`・`REFERENCING`・`CONSTRAINT TRIGGER`・`DEFERRABLE`・`FROM <表>`・
-//! `TRUNCATE` の行トリガ。`WHEN` は Issue #3190 で受理し、条件のトークン検査は [`validate_when_tokens`]）は黙って無視せず `0A000` で拒否する（fail-closed。D8）。`TG_ARGV` の
-//! 引数は値として読み、SQL テキストへ連結しない。
+//! `TRUNCATE` の行トリガ）は黙って無視せず `0A000` で拒否する（fail-closed。D8）。
+//!
+//! 注記: `WHEN (<条件>)` は Issue #3190 で受理する。条件のトークン検査は [`validate_when_tokens`]。
+//! `TG_ARGV` の引数は値として読み、SQL テキストへ連結しない。
 
 use super::*;
 use crate::catalog::trigger::{TriggerEvents, TriggerLevel, TriggerTiming, MAX_TRIGGER_ARGS};
@@ -74,6 +76,32 @@ const WHEN_SYNTAX_WORDS: &[&str] = &[
     "UNKNOWN",
 ];
 
+/// `DOUBLE`・`CHARACTER` のように、続き語（`PRECISION`・`VARYING`）を伴う型名の先頭語か。
+fn is_type_head_word(tok: &Token) -> bool {
+    matches!(tok, Token::Ident(w) if w.eq_ignore_ascii_case("DOUBLE") || w.eq_ignore_ascii_case("CHARACTER"))
+}
+
+/// `tokens[i]` が `DOUBLE PRECISION`・`CHARACTER VARYING` の続き語（直前が先頭語）か。
+fn is_type_continuation(tokens: &[Token], i: usize) -> bool {
+    let is_tail = matches!(tokens.get(i), Some(Token::Ident(w))
+        if w.eq_ignore_ascii_case("PRECISION") || w.eq_ignore_ascii_case("VARYING"));
+    is_tail
+        && i.checked_sub(1)
+            .and_then(|j| tokens.get(j))
+            .is_some_and(is_type_head_word)
+}
+
+/// 型名追跡の状態遷移。`::`・`AS` の直後から型名で、型名は 1 語
+/// （`DOUBLE`・`CHARACTER` の直後だけ続き語のため継続する）。
+fn next_in_type(tok: &Token, in_type: bool) -> bool {
+    match tok {
+        Token::TypeCast | Token::Punct(':') => true,
+        Token::Ident(w) if w.eq_ignore_ascii_case("AS") => true,
+        Token::Ident(_) => in_type && is_type_head_word(tok),
+        _ => false,
+    }
+}
+
 /// `WHEN` 条件のトークン列（括弧の内側）を検査する純粋関数（TABLE-45・SQL-68、Issue #3190。
 /// 実行モデルの D7）。カタログ・セッションには触れない。構文段（本ファイル）が定義時に、
 /// 発火側（`core::plpgsql_trigger_host`）が保存値の再検査として呼ぶ。
@@ -93,20 +121,9 @@ pub(crate) fn validate_when_tokens(tokens: &[Token]) -> Result<(), SqlSurfaceErr
     // `::` または `AS` の直後の識別子は型名（`::int`・`AS double precision`）。
     let mut in_type = false;
     for (i, tok) in tokens.iter().enumerate() {
-        let was_in_type = in_type;
-        in_type = match tok {
-            Token::TypeCast | Token::Punct(':') => true,
-            Token::Ident(w) if w.eq_ignore_ascii_case("AS") => true,
-            // 型名は 1 語（`double precision`・`character varying` の続きの語だけ追加で許す）。
-            Token::Ident(w) => {
-                was_in_type
-                    && (w.eq_ignore_ascii_case("DOUBLE") || w.eq_ignore_ascii_case("CHARACTER"))
-            }
-            _ => false,
-        };
-        let was_in_type = was_in_type
-            || matches!(tok, Token::Ident(w) if ["PRECISION", "VARYING"].iter().any(|x| w.eq_ignore_ascii_case(x)))
-                && matches!(i.checked_sub(1).and_then(|j| tokens.get(j)), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("DOUBLE") || w.eq_ignore_ascii_case("CHARACTER"));
+        // この語が型名の一部か（直前までの状態、または `DOUBLE PRECISION`・`CHARACTER VARYING` の続き語）。
+        let is_type_word = in_type || is_type_continuation(tokens, i);
+        in_type = next_in_type(tok, in_type);
         match tok {
             Token::Punct('(') => {
                 depth += 1;
@@ -151,7 +168,7 @@ pub(crate) fn validate_when_tokens(tokens: &[Token]) -> Result<(), SqlSurfaceErr
                 }
                 // 裸の列名は PostgreSQL と同じく拒否する（列は `NEW.<列>`／`OLD.<列>` で参照する）。
                 if !is_call
-                    && !was_in_type
+                    && !is_type_word
                     && !WHEN_SYNTAX_WORDS
                         .iter()
                         .any(|w| name.eq_ignore_ascii_case(w))
