@@ -193,6 +193,14 @@ fn seed_viewer(core: &EngineCore, s: &mut SessionState) {
         s,
         "INSERT INTO mine (id, n) VALUES (1, 10)",
     );
+    // 閲覧側の自分の SCHEMA（他テナントの表を自分の SCHEMA へ移す試行の移動先。Issue #3198）。
+    ok(core, TENANTS[1], s, "CREATE SCHEMA mine_schema");
+    ok(
+        core,
+        TENANTS[1],
+        s,
+        "CREATE TABLE mine_schema.mt (id BIGINT PRIMARY KEY)",
+    );
 }
 
 /// DB X: tenant-a が SCHEMA `a` と各種オブジェクト（見張り名つき）を持つ。
@@ -235,6 +243,10 @@ const MUST_FAIL: &[&str] = &[
     "ALTER SEQUENCE a.q RESTART",
     "ALTER SCHEMA a RENAME TO b",
     "ALTER TABLE mine SET SCHEMA a",
+    "ALTER TABLE a.t SET SCHEMA a",
+    "ALTER TABLE a.t SET SCHEMA mine_schema",
+    "ALTER TABLE a.t SET SCHEMA public",
+    "ALTER TABLE mine_schema.mt SET SCHEMA a",
     "SELECT id, a.f(n) AS d FROM mine ORDER BY id LIMIT 10",
     "INSERT INTO mine (id, n) VALUES (2, nextval('a.q'))",
     "EXPLAIN SELECT id FROM a.t LIMIT 5",

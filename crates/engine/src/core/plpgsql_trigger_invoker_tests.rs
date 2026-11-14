@@ -1,13 +1,11 @@
 //! 本番のトリガ関数 invoker と、セッション無しのホスト（`core::plpgsql_trigger_host`）の結合テスト
 //! （TABLE-45・SQL-68・RLS-10。Issue #3184）。
 //!
-//! 本番の `PlpgsqlTriggerInvoker` を `with_trigger_invoker_for_test` で注入し、SQL の
+//! 既定の invoker（本番の `PlpgsqlTriggerInvoker`。Issue #3185 で既定になった）のコアで、SQL の
 //! `CREATE FUNCTION ... RETURNS trigger LANGUAGE plpgsql` と `CREATE TRIGGER`・`INSERT` だけで発火を通す。
-//! 既定の差し替えと wire 経由の E2E は #3185 の担当。期待値は PostgreSQL 17 のトリガの挙動
+//! 期待値は PostgreSQL 17 のトリガの挙動
 //! （BEFORE ROW の戻り値・NULL による行スキップ・エラーでの文全体の取り消し）。設計記録は
 //! `docs/design/plpgsql-subset.md` の「Issue #3184 追記」。
-
-use std::sync::Arc;
 
 use super::EngineCore;
 use crate::kernel::CpuScalarProvider;
@@ -19,7 +17,6 @@ use crate::sql::mode::SessionState;
 use crate::sql::SqlOutcome;
 use crate::storage::{Storage, Visibility};
 use crate::test_util::temp_db::{unique_db_path, CleanupGuard};
-use crate::trigger::call::PlpgsqlTriggerInvoker;
 
 fn ctx(tenant: &str) -> PolicyContext {
     PolicyContext::with_visibilities(tenant, [Visibility::Public, Visibility::Private])
@@ -29,9 +26,8 @@ fn ctx(tenant: &str) -> PolicyContext {
 fn core_with(label: &str, mode: LedgerMode) -> (EngineCore, CleanupGuard) {
     let path = unique_db_path(label);
     let storage = Storage::open(&path).expect("open storage");
-    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
-        .with_ledger_mode(mode)
-        .with_trigger_invoker_for_test(Arc::new(PlpgsqlTriggerInvoker));
+    let core =
+        EngineCore::from_storage(storage, Box::new(CpuScalarProvider)).with_ledger_mode(mode);
     (core, CleanupGuard(path))
 }
 
@@ -305,20 +301,16 @@ fn body_error_in_explicit_transaction_fails_the_transaction() {
 
 // (5) 未対応の形は固定の `0A000` で拒否され、副作用が残らない。
 //
-// tracked: #3186, #3187
-// 本体の `UPDATE`・`DELETE`・表を読む `SELECT` は、窓口を広げる #3186・#3187 までの暫定の拒否。
+// tracked: #3187
+// 本体の `DELETE`・表を読む `SELECT` は、窓口を広げる #3187 までの暫定の拒否（`UPDATE` は #3186 で対応済み）。
 #[test]
-fn update_delete_and_table_select_in_body_are_rejected_for_now() {
+fn delete_and_table_select_in_body_are_rejected_for_now() {
     let (core, _g) = core_with("trginv-pending", LedgerMode::Optional);
     base_tables(&core);
     ok(&core, "t1", "INSERT INTO audit (n) VALUES (1)");
-    for (i, stmt) in [
-        "UPDATE audit SET n = 9",
-        "DELETE FROM audit",
-        "SELECT n INTO x FROM audit",
-    ]
-    .iter()
-    .enumerate()
+    for (i, stmt) in ["DELETE FROM audit", "SELECT n INTO x FROM audit"]
+        .iter()
+        .enumerate()
     {
         let f = format!("pend{i}");
         create_fn(
@@ -646,8 +638,7 @@ fn body_writes_are_checked_against_the_firing_role() {
     let storage = Storage::open(&path).expect("open");
     let admin = make_role(&storage, "admin_r");
     let alice = make_role(&storage, "alice");
-    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
-        .with_trigger_invoker_for_test(Arc::new(PlpgsqlTriggerInvoker));
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
     let c = ctx("t1");
     let admin_run = |sql: &str| {
         let mut s = bound_session(admin, true);
@@ -801,4 +792,546 @@ fn delete_trigger_inserts_share_one_time_in_explicit_txn() {
     assert_eq!(r.len(), 2);
     assert_eq!(r[0][0], now);
     assert_eq!(r[1][0], now);
+}
+// ---- Issue #3186: トリガ本体の `UPDATE`（窓口経由）----
+
+/// 任意のイベント（`AFTER UPDATE` 等）を指定して行トリガを作る。
+fn create_trigger_on(core: &EngineCore, tenant: &str, trg: &str, spec: &str, table: &str, f: &str) {
+    ok(
+        core,
+        tenant,
+        &format!("CREATE TRIGGER {trg} {spec} ON {table} FOR EACH ROW EXECUTE FUNCTION {f}()"),
+    );
+}
+
+/// 表 `counters (k, c)` を作り、`k` ごとに 1 行（c = 0）入れる。
+fn counters(core: &EngineCore, keys: &[i64]) {
+    ok(core, "t1", "CREATE TABLE counters (k INTEGER, c INTEGER)");
+    for k in keys {
+        ok(
+            core,
+            "t1",
+            &format!("INSERT INTO counters (k, c) VALUES ({k}, 0)"),
+        );
+    }
+}
+
+fn counter_of(core: &EngineCore, tenant: &str, k: i64) -> i64 {
+    ints(
+        core,
+        tenant,
+        &format!("SELECT c FROM counters WHERE k = {k}"),
+    )[0]
+}
+
+// (1)(4) 本体の `UPDATE`（述語形・変数参照・末尾 `;`）が反映される。複数行 VALUES は行ごとに加算する。
+// 単一行 `id` 指定形も反映される。
+#[test]
+fn body_update_applies_for_predicate_and_single_row_forms() {
+    let (core, _g) = core_with("trginv-upd-basic", LedgerMode::Optional);
+    base_tables(&core);
+    counters(&core, &[1, 2]);
+    create_fn(
+        &core,
+        "t1",
+        "bump",
+        "BEGIN UPDATE counters SET c = c + 1 WHERE k = NEW.n; RETURN NEW; END",
+    );
+    create_trigger(&core, "t1", "ta", "AFTER", "tt", "bump");
+    ok(&core, "t1", "INSERT INTO tt (n) VALUES (1), (1), (2);");
+    assert_eq!(counter_of(&core, "t1", 1), 2);
+    assert_eq!(counter_of(&core, "t1", 2), 1);
+
+    // `id` 指定の単一行形は、`id` を持つ従来方式の表に対して使う（ストレージ経由で作る）。
+    core.storage
+        .create_table(&crate::catalog::TableSchema::new(
+            "sid",
+            vec![crate::catalog::ColumnDef::new(
+                "n",
+                crate::catalog::ColumnType::Integer,
+                true,
+            )],
+        ))
+        .expect("create sid");
+    ok(&core, "t1", "INSERT INTO sid (id, n) VALUES (5, 1)");
+    create_fn(
+        &core,
+        "t1",
+        "by_id",
+        "BEGIN UPDATE sid SET n = 7 WHERE id = 5; RETURN NEW; END",
+    );
+    ok(&core, "t1", "DROP TRIGGER ta ON tt");
+    create_trigger(&core, "t1", "tb", "AFTER", "tt", "by_id");
+    ok(&core, "t1", "INSERT INTO tt (n) VALUES (9)");
+    assert_eq!(ints(&core, "t1", "SELECT n FROM sid"), vec![7]);
+}
+
+// (1) `FOUND` を使う upsert 型の分岐。
+#[test]
+fn body_update_sets_found_for_upsert() {
+    let (core, _g) = core_with("trginv-upd-found", LedgerMode::Optional);
+    base_tables(&core);
+    ok(&core, "t1", "CREATE TABLE counters (k INTEGER, c INTEGER)");
+    create_fn(
+        &core,
+        "t1",
+        "upsert",
+        "BEGIN UPDATE counters SET c = c + 1 WHERE k = NEW.n; \
+         IF NOT FOUND THEN INSERT INTO counters (k, c) VALUES (NEW.n, 1); END IF; RETURN NEW; END",
+    );
+    create_trigger(&core, "t1", "ta", "AFTER", "tt", "upsert");
+    ok(&core, "t1", "INSERT INTO tt (n) VALUES (5)");
+    ok(&core, "t1", "INSERT INTO tt (n) VALUES (5)");
+    ok(&core, "t1", "INSERT INTO tt (n) VALUES (6)");
+    assert_eq!(counter_of(&core, "t1", 5), 2);
+    assert_eq!(counter_of(&core, "t1", 6), 1);
+}
+
+// (1) 外側が UPDATE／DELETE の AFTER ROW から別表を更新する（OLD・NEW 参照）。明示 Tx の ROLLBACK で本体の更新も消える。
+#[test]
+fn body_update_from_update_and_delete_triggers_rolls_back_with_the_txn() {
+    let (core, _g) = core_with("trginv-upd-outer", LedgerMode::Optional);
+    base_tables(&core);
+    ok(&core, "t1", "INSERT INTO tt (n) VALUES (1)");
+    ok(&core, "t1", "INSERT INTO tt (n) VALUES (2)");
+    ok(&core, "t1", "INSERT INTO audit (n) VALUES (1)");
+    ok(&core, "t1", "INSERT INTO audit (n) VALUES (2)");
+    create_fn(
+        &core,
+        "t1",
+        "on_upd",
+        "BEGIN UPDATE audit SET n = NEW.n WHERE n = OLD.n; RETURN NEW; END",
+    );
+    create_fn(
+        &core,
+        "t1",
+        "on_del",
+        "BEGIN UPDATE audit SET n = -1 WHERE n = OLD.n; RETURN OLD; END",
+    );
+    create_trigger_on(&core, "t1", "tu", "AFTER UPDATE", "tt", "on_upd");
+    create_trigger_on(&core, "t1", "td", "AFTER DELETE", "tt", "on_del");
+    let sorted = |core: &EngineCore| {
+        let mut v = ints(core, "t1", "SELECT n FROM audit");
+        v.sort_unstable();
+        v
+    };
+    ok(&core, "t1", "UPDATE tt SET n = 10 WHERE n = 1");
+    ok(&core, "t1", "DELETE FROM tt WHERE n = 2");
+    assert_eq!(sorted(&core), vec![-1, 10]);
+
+    let c = ctx("t1");
+    let mut s = session();
+    let mut txn = core.new_session_transaction();
+    core.execute_sql_in_txn(&c, &mut s, &mut txn, "BEGIN")
+        .expect("begin");
+    core.execute_sql_in_txn(&c, &mut s, &mut txn, "UPDATE tt SET n = 20 WHERE n = 10")
+        .expect("update in txn");
+    core.execute_sql_in_txn(&c, &mut s, &mut txn, "ROLLBACK")
+        .expect("rollback");
+    assert_eq!(sorted(&core), vec![-1, 10]);
+}
+
+// (1)(5) テナント境界: 同名・同値の表を持つ t2 の行は t1 のトリガ本体の `UPDATE` で変わらず、t2 の文では t1 のトリガは発火しない。
+#[test]
+fn body_update_never_touches_another_tenant() {
+    let (core, _g) = core_with("trginv-upd-tenant", LedgerMode::Optional);
+    base_tables(&core);
+    ok(&core, "t1", "INSERT INTO audit (n) VALUES (1)");
+    ok(&core, "t2", "INSERT INTO audit (n) VALUES (1)");
+    create_fn(
+        &core,
+        "t1",
+        "zero",
+        "BEGIN UPDATE audit SET n = 0 WHERE n > 0; RETURN NEW; END",
+    );
+    create_trigger(&core, "t1", "ta", "AFTER", "tt", "zero");
+    ok(&core, "t2", "INSERT INTO tt (n) VALUES (1)");
+    assert_eq!(ints(&core, "t1", "SELECT n FROM audit"), vec![1]);
+    assert_eq!(ints(&core, "t2", "SELECT n FROM audit"), vec![1]);
+    ok(&core, "t1", "INSERT INTO tt (n) VALUES (1)");
+    assert_eq!(ints(&core, "t1", "SELECT n FROM audit"), vec![0]);
+    assert_eq!(ints(&core, "t2", "SELECT n FROM audit"), vec![1]);
+}
+
+// (1)(5) 行ポリシー: 発火元の主体で UPDATE の `USING` が効き、不可視の行は更新されない。`WITH CHECK` 違反は文全体が失敗する。
+#[test]
+fn body_update_honors_row_policies() {
+    let (core, _g) = core_with("trginv-upd-rls", LedgerMode::Optional);
+    base_tables(&core);
+    ok(&core, "t1", "INSERT INTO audit (n) VALUES (1)");
+    ok(&core, "t1", "INSERT INTO audit (n) VALUES (200)");
+    ok(&core, "t1", "ALTER TABLE audit ENABLE ROW LEVEL SECURITY");
+    ok(&core, "t1", "ALTER TABLE audit FORCE ROW LEVEL SECURITY");
+    ok(
+        &core,
+        "t1",
+        "CREATE POLICY sel ON audit FOR SELECT USING (true)",
+    );
+    ok(
+        &core,
+        "t1",
+        "CREATE POLICY upd ON audit FOR UPDATE USING (n < 100) WITH CHECK (n < 100)",
+    );
+    create_fn(
+        &core,
+        "t1",
+        "inc",
+        "BEGIN UPDATE audit SET n = n + 1 WHERE n >= 0; RETURN NEW; END",
+    );
+    create_trigger(&core, "t1", "ta", "AFTER", "tt", "inc");
+    ok(&core, "t1", "INSERT INTO tt (n) VALUES (1)");
+    let mut v = ints(&core, "t1", "SELECT n FROM audit");
+    v.sort_unstable();
+    assert_eq!(v, vec![2, 200], "the invisible row must not be updated");
+
+    create_fn(
+        &core,
+        "t1",
+        "bad",
+        "BEGIN UPDATE audit SET n = 500 WHERE n < 100; RETURN NEW; END",
+    );
+    ok(&core, "t1", "DROP TRIGGER ta ON tt");
+    create_trigger(&core, "t1", "tb", "AFTER", "tt", "bad");
+    assert_eq!(code(&core, "t1", "INSERT INTO tt (n) VALUES (2)"), "42501");
+    let mut v = ints(&core, "t1", "SELECT n FROM audit");
+    v.sort_unstable();
+    assert_eq!(v, vec![2, 200]);
+    assert_eq!(ints(&core, "t1", "SELECT n FROM tt").len(), 1);
+}
+
+// (5) 権限: 本体の `UPDATE` は発火元ロールで判定される。権限が無ければ `42501` で文全体が失敗し、付与すれば成功する。
+#[test]
+fn body_update_is_checked_against_the_firing_role() {
+    let path = unique_db_path("trginv-upd-priv");
+    let _g = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open");
+    let admin = make_role(&storage, "admin_r");
+    let alice = make_role(&storage, "alice");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let c = ctx("t1");
+    let admin_run = |sql: &str| {
+        let mut s = bound_session(admin, true);
+        core.execute_sql_in_session(&c, &mut s, sql)
+            .unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+    };
+    let alice_code = |sql: &str| {
+        let mut s = bound_session(alice, false);
+        match core.execute_sql_in_session(&c, &mut s, sql) {
+            Ok(_) => "ok".to_string(),
+            Err(e) => e.wire_code().to_string(),
+        }
+    };
+    admin_run("CREATE TABLE tt (n INTEGER)");
+    admin_run("CREATE TABLE audit (n INTEGER)");
+    admin_run("INSERT INTO audit (n) VALUES (1)");
+    admin_run(
+        "CREATE FUNCTION inc() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN UPDATE audit SET n = n + 1 WHERE n >= 0; RETURN NEW; END $$",
+    );
+    admin_run("CREATE TRIGGER ta AFTER INSERT ON tt FOR EACH ROW EXECUTE FUNCTION inc()");
+    admin_run("GRANT INSERT ON tt TO alice");
+    assert_eq!(alice_code("INSERT INTO tt (n) VALUES (1)"), "42501");
+    assert!(ints(&core, "t1", "SELECT n FROM tt").is_empty());
+    assert_eq!(ints(&core, "t1", "SELECT n FROM audit"), vec![1]);
+    admin_run("GRANT UPDATE ON audit TO alice");
+    admin_run("GRANT SELECT ON audit TO alice");
+    assert_eq!(alice_code("INSERT INTO tt (n) VALUES (1)"), "ok");
+    assert_eq!(ints(&core, "t1", "SELECT n FROM audit"), vec![2]);
+}
+
+// (5) STABLE のトリガ関数の本体 `UPDATE` は揮発性ゲートで拒否する。
+//
+// intentional: docs/design/plpgsql-subset.md
+// PG17 と同じく、STABLE／IMMUTABLE 関数のデータ変更は拒否する（設計記録の揮発性ゲート）。
+#[test]
+fn stable_trigger_function_cannot_update() {
+    let (core, _g) = core_with("trginv-upd-stable", LedgerMode::Optional);
+    base_tables(&core);
+    ok(&core, "t1", "INSERT INTO audit (n) VALUES (1)");
+    ok(
+        &core,
+        "t1",
+        "CREATE FUNCTION st() RETURNS trigger LANGUAGE plpgsql STABLE AS $$ \
+         BEGIN UPDATE audit SET n = 9 WHERE n >= 0; RETURN NEW; END $$",
+    );
+    create_trigger(&core, "t1", "tb", "BEFORE", "tt", "st");
+    assert_eq!(code(&core, "t1", "INSERT INTO tt (n) VALUES (1)"), "0A000");
+    assert_eq!(ints(&core, "t1", "SELECT n FROM audit"), vec![1]);
+}
+
+// (2) 自己再帰・相互再帰は深さ上限で `54001` になり、副作用が残らない。
+#[test]
+fn body_update_recursion_is_bounded() {
+    let (core, _g) = core_with("trginv-upd-depth", LedgerMode::Optional);
+    ok(&core, "t1", "CREATE TABLE rec (n INTEGER)");
+    ok(&core, "t1", "INSERT INTO rec (n) VALUES (0)");
+    create_fn(
+        &core,
+        "t1",
+        "again",
+        "BEGIN UPDATE rec SET n = n + 1 WHERE n >= 0; RETURN NEW; END",
+    );
+    create_trigger_on(&core, "t1", "tr", "AFTER UPDATE", "rec", "again");
+    assert_eq!(
+        code(&core, "t1", "UPDATE rec SET n = 10 WHERE n >= 0"),
+        "54001"
+    );
+    assert_eq!(ints(&core, "t1", "SELECT n FROM rec"), vec![0]);
+
+    ok(&core, "t1", "CREATE TABLE ma (n INTEGER)");
+    ok(&core, "t1", "CREATE TABLE mb (n INTEGER)");
+    ok(&core, "t1", "INSERT INTO ma (n) VALUES (0)");
+    ok(&core, "t1", "INSERT INTO mb (n) VALUES (0)");
+    create_fn(
+        &core,
+        "t1",
+        "a2b",
+        "BEGIN UPDATE mb SET n = n + 1 WHERE n >= 0; RETURN NEW; END",
+    );
+    create_fn(
+        &core,
+        "t1",
+        "b2a",
+        "BEGIN UPDATE ma SET n = n + 1 WHERE n >= 0; RETURN NEW; END",
+    );
+    create_trigger_on(&core, "t1", "ta", "AFTER UPDATE", "ma", "a2b");
+    create_trigger_on(&core, "t1", "tb", "AFTER UPDATE", "mb", "b2a");
+    assert_eq!(
+        code(&core, "t1", "UPDATE ma SET n = 5 WHERE n >= 0"),
+        "54001"
+    );
+    assert_eq!(ints(&core, "t1", "SELECT n FROM ma"), vec![0]);
+    assert_eq!(ints(&core, "t1", "SELECT n FROM mb"), vec![0]);
+}
+
+// (3) 台帳: 外側の `operation_id` の 1 エントリだけが載る。本体の `UPDATE` は `operation_id` を要求も記録もせず、
+// 再送は `23505` で本体を再実行しない。
+#[test]
+fn ledgered_core_body_update_does_not_touch_the_ledger() {
+    let (core, _g) = core_with("trginv-upd-ledger", LedgerMode::Ledgered);
+    base_tables(&core);
+    ok(&core, "t1", "CREATE TABLE counters (k INTEGER, c INTEGER)");
+    ok(
+        &core,
+        "t1",
+        "INSERT INTO counters (k, c) VALUES (1, 0) USING OPERATION_ID 'seed'",
+    );
+    create_fn(
+        &core,
+        "t1",
+        "bump",
+        "BEGIN UPDATE counters SET c = c + 1 WHERE k >= 0; RETURN NEW; END",
+    );
+    create_trigger(&core, "t1", "ta", "AFTER", "tt", "bump");
+    let sql = "INSERT INTO tt (n) VALUES (1) USING OPERATION_ID 'op-1'";
+    ok(&core, "t1", sql);
+    assert_eq!(counter_of(&core, "t1", 1), 1);
+    assert_eq!(code(&core, "t1", sql), "23505");
+    assert_eq!(
+        counter_of(&core, "t1", 1),
+        1,
+        "resend must not rerun the body"
+    );
+}
+
+// (5) EXCEPTION 節: `UPDATE` を試みた後のエラーは捕捉せず `0A000`、文全体が取り消される。
+//
+// intentional: docs/design/plpgsql-subset.md
+// 書き込み後の EXCEPTION 捕捉は、窓口が savepoint を持たないための既知の差（設計記録「Issue #3184 追記」）。
+#[test]
+fn exception_block_does_not_catch_after_a_body_update() {
+    let (core, _g) = core_with("trginv-upd-exception", LedgerMode::Optional);
+    base_tables(&core);
+    ok(&core, "t1", "INSERT INTO audit (n) VALUES (1)");
+    create_fn(
+        &core,
+        "t1",
+        "catch_after_update",
+        "BEGIN BEGIN UPDATE audit SET n = 9 WHERE n >= 0; RAISE EXCEPTION 'x'; \
+         EXCEPTION WHEN OTHERS THEN NEW.n := -2; END; RETURN NEW; END",
+    );
+    create_trigger(&core, "t1", "tb", "BEFORE", "tt", "catch_after_update");
+    assert_eq!(code(&core, "t1", "INSERT INTO tt (n) VALUES (2)"), "0A000");
+    assert!(ints(&core, "t1", "SELECT n FROM tt").is_empty());
+    assert_eq!(ints(&core, "t1", "SELECT n FROM audit"), vec![1]);
+}
+
+// (5)(6) 窓口が受けない `UPDATE` の形は、PG とは異なる既知の差として固定の `0A000` で拒否し、副作用を残さない。
+//
+// intentional: docs/design/plpgsql-subset.md
+// `RETURNING`・WHERE 内のサブクエリ（表の読み取りは #3187 の範囲）・`UPDATE ... FROM`・ビュー・SCHEMA 修飾の書き込み先は
+// 窓口の許可リストに無い形（設計記録「Issue #3186 追記」）。
+#[test]
+fn update_forms_outside_the_write_handle_are_rejected() {
+    let (core, _g) = core_with("trginv-upd-forms", LedgerMode::Optional);
+    base_tables(&core);
+    ok(&core, "t1", "INSERT INTO audit (n) VALUES (1)");
+    ok(&core, "t1", "CREATE VIEW va AS SELECT id, n FROM audit");
+    let forms = [
+        "UPDATE audit SET n = 9 WHERE n >= 0 RETURNING n",
+        "UPDATE audit SET n = 9 WHERE n IN (SELECT n FROM tt)",
+        "UPDATE audit SET n = 9 FROM tt WHERE audit.n = tt.n",
+        "UPDATE va SET n = 9 WHERE n >= 0",
+    ];
+    for (i, stmt) in forms.iter().enumerate() {
+        let f = format!("uform{i}");
+        create_fn(&core, "t1", &f, &format!("BEGIN {stmt}; RETURN NEW; END"));
+        ok(&core, "t1", "DROP TRIGGER IF EXISTS tb ON tt");
+        create_trigger(&core, "t1", "tb", "BEFORE", "tt", &f);
+        assert_eq!(
+            code(&core, "t1", "INSERT INTO tt (n) VALUES (1)"),
+            "0A000",
+            "{stmt}"
+        );
+        assert!(ints(&core, "t1", "SELECT n FROM tt").is_empty(), "{stmt}");
+        assert_eq!(ints(&core, "t1", "SELECT n FROM audit"), vec![1], "{stmt}");
+    }
+}
+
+// (5) D6 の安全弁: BEFORE ROW の行ごとループの最中に同じ表を書く `UPDATE` は `0A000`（失われた更新を作らない）。
+// 入れ子でも検出し、AFTER の段（ループの外）からの同表 `UPDATE` は許す。
+//
+// intentional: docs/design/plpgsql-subset.md
+// PG は `27000`（行単位の検出）。本実装は表単位の `0A000`（設計記録「Issue #3186 追記」の既知の差）。
+#[test]
+fn body_update_of_the_row_loop_table_is_rejected_only_inside_the_loop() {
+    let (core, _g) = core_with("trginv-upd-d6", LedgerMode::Optional);
+    base_tables(&core);
+    ok(&core, "t1", "INSERT INTO tt (n) VALUES (1)");
+    ok(&core, "t1", "INSERT INTO tt (n) VALUES (2)");
+    create_fn(
+        &core,
+        "t1",
+        "self_upd",
+        "BEGIN UPDATE tt SET n = n + 100 WHERE n >= 0; RETURN NEW; END",
+    );
+    create_fn(
+        &core,
+        "t1",
+        "self_del",
+        "BEGIN UPDATE tt SET n = 0 WHERE n >= 0; RETURN OLD; END",
+    );
+    let sorted = |core: &EngineCore| {
+        let mut v = ints(core, "t1", "SELECT n FROM tt");
+        v.sort_unstable();
+        v
+    };
+    create_trigger_on(&core, "t1", "bu", "BEFORE UPDATE", "tt", "self_upd");
+    assert_eq!(
+        code(&core, "t1", "UPDATE tt SET n = 5 WHERE n = 1"),
+        "0A000"
+    );
+    assert_eq!(sorted(&core), vec![1, 2]);
+    ok(&core, "t1", "DROP TRIGGER bu ON tt");
+
+    create_trigger_on(&core, "t1", "bd", "BEFORE DELETE", "tt", "self_del");
+    assert_eq!(code(&core, "t1", "DELETE FROM tt WHERE n = 1"), "0A000");
+    assert_eq!(sorted(&core), vec![1, 2]);
+    ok(&core, "t1", "DROP TRIGGER bd ON tt");
+
+    // 入れ子: BEFORE UPDATE ON tt -> INSERT INTO audit -> audit の AFTER INSERT -> UPDATE tt。
+    create_fn(
+        &core,
+        "t1",
+        "via_audit",
+        "BEGIN INSERT INTO audit (n) VALUES (1); RETURN NEW; END",
+    );
+    create_fn(
+        &core,
+        "t1",
+        "back_to_tt",
+        "BEGIN UPDATE tt SET n = 0 WHERE n >= 0; RETURN NEW; END",
+    );
+    create_trigger_on(&core, "t1", "bn", "BEFORE UPDATE", "tt", "via_audit");
+    create_trigger_on(&core, "t1", "an", "AFTER INSERT", "audit", "back_to_tt");
+    assert_eq!(
+        code(&core, "t1", "UPDATE tt SET n = 5 WHERE n = 1"),
+        "0A000"
+    );
+    assert_eq!(sorted(&core), vec![1, 2]);
+    assert_eq!(audit_count(&core, "t1"), 0);
+    ok(&core, "t1", "DROP TRIGGER bn ON tt");
+    ok(&core, "t1", "DROP TRIGGER an ON audit");
+
+    // AFTER ROW（ループの外）からの同表 `UPDATE`（別の行）は成功する。
+    create_fn(
+        &core,
+        "t1",
+        "after_self",
+        "BEGIN IF NEW.n = 1 THEN UPDATE tt SET n = 100 WHERE n = 2; END IF; RETURN NEW; END",
+    );
+    create_trigger_on(&core, "t1", "au", "AFTER UPDATE", "tt", "after_self");
+    ok(&core, "t1", "UPDATE tt SET n = 1 WHERE n = 1");
+    assert_eq!(sorted(&core), vec![1, 100]);
+}
+
+// (1)(5) 遅延 FK: 本体の `UPDATE` が子の FK 列を存在しない親キーへ変える、または参照中の親キーを変えると、
+// autocommit は文末、明示 Tx は `COMMIT` で `23503` になる（書いた表の記録漏れの検出）。
+#[test]
+fn body_update_is_checked_by_deferred_foreign_keys() {
+    let (core, _g) = core_with("trginv-upd-fk", LedgerMode::Optional);
+    base_tables(&core);
+    ok(&core, "t1", "CREATE TABLE fk_parent (k BIGINT PRIMARY KEY)");
+    ok(
+        &core,
+        "t1",
+        "CREATE TABLE fk_child (parent_id BIGINT REFERENCES fk_parent DEFERRABLE INITIALLY DEFERRED)",
+    );
+    ok(&core, "t1", "INSERT INTO fk_parent (k) VALUES (1), (2)");
+    ok(&core, "t1", "INSERT INTO fk_child (parent_id) VALUES (1)");
+    for (i, body) in [
+        "UPDATE fk_child SET parent_id = 99 WHERE parent_id >= 0",
+        "UPDATE fk_parent SET k = 50 WHERE k = 1",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let f = format!("fk{i}");
+        create_fn(&core, "t1", &f, &format!("BEGIN {body}; RETURN NEW; END"));
+        ok(&core, "t1", "DROP TRIGGER IF EXISTS ta ON tt");
+        create_trigger(&core, "t1", "ta", "AFTER", "tt", &f);
+        assert_eq!(
+            code(&core, "t1", "INSERT INTO tt (n) VALUES (1)"),
+            "23503",
+            "{body}"
+        );
+        assert!(ints(&core, "t1", "SELECT n FROM tt").is_empty(), "{body}");
+        assert_eq!(ints(&core, "t1", "SELECT parent_id FROM fk_child"), vec![1]);
+
+        let c = ctx("t1");
+        let mut s = session();
+        let mut txn = core.new_session_transaction();
+        core.execute_sql_in_txn(&c, &mut s, &mut txn, "BEGIN")
+            .expect("begin");
+        core.execute_sql_in_txn(&c, &mut s, &mut txn, "INSERT INTO tt (n) VALUES (1)")
+            .expect("deferred check waits for COMMIT");
+        let e = core
+            .execute_sql_in_txn(&c, &mut s, &mut txn, "COMMIT")
+            .expect_err("deferred FK violation");
+        assert_eq!(e.wire_code(), "23503", "{body}");
+        assert!(ints(&core, "t1", "SELECT n FROM tt").is_empty(), "{body}");
+    }
+}
+
+// (5) 拒否のエラー文言は、他テナントの同名の表・関数の有無で変わらない。
+#[test]
+fn update_rejection_text_does_not_depend_on_other_tenants() {
+    let (core, _g) = core_with("trginv-upd-errtext", LedgerMode::Optional);
+    base_tables(&core);
+    create_fn(
+        &core,
+        "t1",
+        "ret",
+        "BEGIN UPDATE audit SET n = 9 WHERE n >= 0 RETURNING n; RETURN NEW; END",
+    );
+    create_trigger(&core, "t1", "tb", "BEFORE", "tt", "ret");
+    let before = run(&core, "t1", "INSERT INTO tt (n) VALUES (1)")
+        .unwrap_err()
+        .client_message();
+    ok(&core, "t2", "INSERT INTO audit (n) VALUES (1)");
+    create_fn(&core, "t2", "ret", "BEGIN RETURN NEW; END");
+    let after = run(&core, "t1", "INSERT INTO tt (n) VALUES (1)")
+        .unwrap_err()
+        .client_message();
+    assert_eq!(before, after);
 }

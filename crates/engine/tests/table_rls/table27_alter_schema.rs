@@ -11,8 +11,10 @@
 //!   不在／他テナントは同一の `3F000`、システム SCHEMA・`pg_temp`・一時表は `0A000`
 //! - 拒否後も表・行・索引が不変で、権限ゲートは対象の有無によらず `42501`
 //!
-//! テナント SCHEMA に表を置く経路は #1717 の担当のため、テナント SCHEMA 間の実移動は本ファイルの
-//! 対象外（設計記録 §8 の申し送り）。
+//! テナント SCHEMA 間の実移動（Issue #3198。表・行・索引・制約・`OWNED BY` の SEQUENCE を移し、ビューは
+//! 移さない。移動先の名前の衝突は `42P07`、関数の依存・SEQUENCE の外部参照は `2BP01`、移動先の CREATE
+//! 権限が無ければ `42501`）も本ファイルで固定する。`public` とテナント SCHEMA の間の移動は意図的な `42501`
+//! （設計記録 D7）。
 
 use engine::core::EngineCore;
 use engine::kernel::CpuScalarProvider;
@@ -377,5 +379,234 @@ fn alter_schema_is_not_blocked_by_session_temp_tables_and_sequence_set_schema_st
             "ALTER SEQUENCE sq SET SCHEMA public"
         ),
         "0A000"
+    );
+}
+
+fn query_cells(core: &EngineCore, tenant: &str, s: &mut SessionState, sql: &str) -> String {
+    match ok_as(core, tenant, s, sql) {
+        SqlOutcome::Query(r) => format!("{:?}", r.rows),
+        other => panic!("expected Query, got {other:?}"),
+    }
+}
+
+/// `s1.t`（SERIAL 主キー・UNIQUE・CHECK・索引つき）を作って 2 行入れる。
+fn setup_schema_table(core: &EngineCore, s: &mut SessionState) {
+    for sql in [
+        "CREATE SCHEMA s1",
+        "CREATE SCHEMA s2",
+        "CREATE TABLE s1.t (id BIGSERIAL PRIMARY KEY, name TEXT UNIQUE, n INTEGER CHECK (n > 0))",
+        "CREATE INDEX ti ON s1.t (n)",
+        "INSERT INTO s1.t (name, n) VALUES ('a', 1), ('b', 2)",
+    ] {
+        ok_as(core, "alice", s, sql);
+    }
+}
+
+/// テナント SCHEMA 間の移動で、行・索引・制約・SERIAL の採番が移動先へ移り、移動元は空になる
+/// （末尾 `;` つきの単独送信。再オープン後も保たれる）。
+#[test]
+fn set_schema_between_tenant_schemas_moves_table_indexes_constraints_and_sequences() {
+    let (p, _g, core) = open_fixture("alt-tbl-move");
+    let mut s = allowed_session();
+    setup_schema_table(&core, &mut s);
+    ok_as(&core, "bob", &mut s, "CREATE SCHEMA s1");
+    ok_as(&core, "alice", &mut s, "ALTER TABLE s1.t SET SCHEMA s2;");
+    let check = |core: &EngineCore, s: &mut SessionState| {
+        assert_eq!(count(core, "alice", s, "s2.t"), "Integer(2)".to_string());
+        assert_eq!(code_as(core, "alice", s, "SELECT * FROM s1.t"), "42P01");
+        assert_eq!(
+            code_as(
+                core,
+                "alice",
+                s,
+                "INSERT INTO s2.t (name, n) VALUES ('a', 5)"
+            ),
+            "23505"
+        );
+        assert_eq!(
+            code_as(
+                core,
+                "alice",
+                s,
+                "INSERT INTO s2.t (name, n) VALUES ('c', 0)"
+            ),
+            "23514"
+        );
+        // SERIAL の採番は巻き戻らず続く。
+        ok_as(
+            core,
+            "alice",
+            s,
+            "INSERT INTO s2.t (name, n) VALUES ('c', 3)",
+        );
+        assert_eq!(
+            count(core, "alice", s, "s2.t WHERE n = 3 AND id > 2"),
+            "Integer(1)".to_string()
+        );
+        ok_as(core, "alice", s, "DELETE FROM s2.t WHERE n = 3");
+    };
+    check(&core, &mut s);
+    let core = reopen(core, &p);
+    let mut s = allowed_session();
+    assert_eq!(
+        count(&core, "alice", &mut s, "s2.t"),
+        "Integer(2)".to_string()
+    );
+    // 索引は移動先の名前で外せる。移動元の名前では 42704。
+    assert_eq!(code_as(&core, "alice", &mut s, "DROP INDEX s1.ti"), "42704");
+    ok_as(&core, "alice", &mut s, "DROP INDEX s2.ti");
+    // 移動元は空になり、DROP SCHEMA（RESTRICT）が通る。移動先は空でない。
+    ok_as(&core, "alice", &mut s, "DROP SCHEMA s1");
+    assert_eq!(code_as(&core, "alice", &mut s, "DROP SCHEMA s2"), "2BP01");
+}
+
+/// ビューは移らず、表への参照だけが追随する。FK・POLICY の追随と、同一 SCHEMA への移動の no-op。
+#[test]
+fn set_schema_keeps_views_and_follows_foreign_keys() {
+    let (_p, _g, core) = open_fixture("alt-tbl-deps");
+    let mut s = allowed_session();
+    setup_schema_table(&core, &mut s);
+    ok_as(&core, "alice", &mut s, "CREATE SCHEMA s3");
+    ok_as(
+        &core,
+        "alice",
+        &mut s,
+        "CREATE VIEW s1.v AS SELECT id, n FROM s1.t",
+    );
+    ok_as(
+        &core,
+        "alice",
+        &mut s,
+        "CREATE TABLE s3.child (cid BIGINT PRIMARY KEY, pname TEXT REFERENCES s1.t (name))",
+    );
+    ok_as(
+        &core,
+        "alice",
+        &mut s,
+        "INSERT INTO s3.child (cid, pname) VALUES (1, 'a')",
+    );
+    ok_as(&core, "alice", &mut s, "ALTER TABLE s1.t SET SCHEMA s1");
+    ok_as(&core, "alice", &mut s, "ALTER TABLE s1.t SET SCHEMA s2");
+    // ビューは s1 に残り、移動先の表を読む。
+    assert_eq!(
+        query_cells(&core, "alice", &mut s, "SELECT COUNT(*) FROM s1.v"),
+        query_cells(&core, "alice", &mut s, "SELECT COUNT(*) FROM s2.t")
+    );
+    // FK は移動先の表を指し続ける。
+    assert_eq!(
+        code_as(
+            &core,
+            "alice",
+            &mut s,
+            "INSERT INTO s3.child (cid, pname) VALUES (2, 'zz')"
+        ),
+        "23503"
+    );
+    ok_as(
+        &core,
+        "alice",
+        &mut s,
+        "INSERT INTO s3.child (cid, pname) VALUES (2, 'b')",
+    );
+}
+
+/// 移動先に同名の表・索引・SEQUENCE があると 42P07 で、表・行・索引は不変（再オープン後も）。
+#[test]
+fn set_schema_name_collisions_are_rejected_without_side_effects() {
+    let (p, _g, core) = open_fixture("alt-tbl-collide");
+    let mut s = allowed_session();
+    setup_schema_table(&core, &mut s);
+    for (setup, label) in [
+        ("CREATE TABLE s2.t (a INTEGER)", "table"),
+        ("CREATE TABLE s2.ti (a INTEGER)", "index name"),
+        ("CREATE SEQUENCE s2.t_id_seq", "sequence name"),
+    ] {
+        ok_as(&core, "alice", &mut s, setup);
+        let e = err_as(&core, "alice", &mut s, "ALTER TABLE s1.t SET SCHEMA s2");
+        assert_eq!(e.wire_code(), "42P07", "{label}");
+        // 内部リレーションキー（`#<id>.`）を利用者向けエラーへ出さない。
+        assert!(!format!("{e:?}").contains('#'), "{label}: {e:?}");
+        let cleanup = match label {
+            "table" => "DROP TABLE s2.t",
+            "index name" => "DROP TABLE s2.ti",
+            _ => "DROP SEQUENCE s2.t_id_seq",
+        };
+        ok_as(&core, "alice", &mut s, cleanup);
+    }
+    assert_eq!(
+        count(&core, "alice", &mut s, "s1.t"),
+        "Integer(2)".to_string()
+    );
+    let core = reopen(core, &p);
+    let mut s = allowed_session();
+    assert_eq!(
+        count(&core, "alice", &mut s, "s1.t"),
+        "Integer(2)".to_string()
+    );
+    ok_as(&core, "alice", &mut s, "DROP INDEX s1.ti");
+    // 衝突が無くなれば移せる。
+    ok_as(&core, "alice", &mut s, "ALTER TABLE s1.t SET SCHEMA s2");
+}
+
+/// OWNED BY の SEQUENCE を別の表が DEFAULT で参照していると 2BP01 で拒否し、何も移らない。
+#[test]
+fn set_schema_rejects_when_owned_sequence_is_used_by_another_table() {
+    let (_p, _g, core) = open_fixture("alt-tbl-seqdep");
+    let mut s = allowed_session();
+    setup_schema_table(&core, &mut s);
+    ok_as(
+        &core,
+        "alice",
+        &mut s,
+        "CREATE TABLE s1.u (k BIGINT DEFAULT nextval('s1.t_id_seq'))",
+    );
+    let e = err_as(&core, "alice", &mut s, "ALTER TABLE s1.t SET SCHEMA s2");
+    assert_eq!(e.wire_code(), "2BP01");
+    assert!(!format!("{e:?}").contains('#'), "{e:?}");
+    assert_eq!(
+        count(&core, "alice", &mut s, "s1.t"),
+        "Integer(2)".to_string()
+    );
+}
+
+/// 越境・不在・権限の判定順。`public` との間は両方向とも 42501、移動先不在は 3F000、権限の無い
+/// セッションは対象の有無によらず 42501。
+#[test]
+fn set_schema_boundaries_and_gate_for_tenant_schema_tables() {
+    let (_p, _g, core) = open_fixture("alt-tbl-bound");
+    let mut s = allowed_session();
+    setup_schema_table(&core, &mut s);
+    assert_eq!(
+        code_as(&core, "alice", &mut s, "ALTER TABLE s1.t SET SCHEMA public"),
+        "42501"
+    );
+    assert_eq!(
+        code_as(&core, "alice", &mut s, "ALTER TABLE s1.t SET SCHEMA ghost"),
+        "3F000"
+    );
+    assert_eq!(
+        code_as(&core, "alice", &mut s, "ALTER TABLE s1.nope SET SCHEMA s2"),
+        "42P01"
+    );
+    ok_as(&core, "bob", &mut s, "CREATE SCHEMA only_bob");
+    assert_eq!(
+        code_as(
+            &core,
+            "alice",
+            &mut s,
+            "ALTER TABLE s1.t SET SCHEMA only_bob"
+        ),
+        "3F000"
+    );
+    let mut denied = SessionState::default();
+    for sql in [
+        "ALTER TABLE s1.t SET SCHEMA s2",
+        "ALTER TABLE s1.nope SET SCHEMA ghost",
+    ] {
+        assert_eq!(code_as(&core, "alice", &mut denied, sql), "42501", "{sql}");
+    }
+    assert_eq!(
+        count(&core, "alice", &mut s, "s1.t"),
+        "Integer(2)".to_string()
     );
 }

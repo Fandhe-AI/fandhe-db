@@ -980,6 +980,279 @@ fn fetch_next_in_respect_tenant_boundary_and_reject_unsupported_direction() {
         assert_eq!(err.wire_code(), "34000", "{sql}");
     }
 }
+// --- DECLARE の内側 SELECT への JOIN（Issue #3175） ------------------------------
+
+const TAGS: &str = "tags";
+
+/// `documents`・`tags` の 2 表を持つ `EngineCore`。両テナントに結合キー（id）が衝突する行を入れる。
+/// tenant-a: documents 1..=3・tags 1..=2（id 3 は tags に無い。LEFT で NULL 側になる）、
+/// tenant-b: documents 1..=3・tags 1..=3（tenant-a の結果へ混入してはならない）。
+fn new_join_core() -> (EngineCore, std::path::PathBuf) {
+    let path = unique_db_path("sql-cursor-join");
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema(TABLE)).expect("create docs");
+    storage.create_table(&schema(TAGS)).expect("create tags");
+    let engine = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let mut session = SessionState::default();
+    let put = |engine: &EngineCore, session: &mut SessionState, tenant: &str, t: &str, id: u64| {
+        engine
+            .execute_sql_in_session(
+                &ctx(tenant),
+                session,
+                &format!(
+                    "INSERT INTO {t} (id, embedding, lang) VALUES ({id}, '[1.0, 0.0]', '{tenant}-{t}-{id}') \
+                     USING OPERATION_ID 'j-{tenant}-{t}-{id}'"
+                ),
+            )
+            .expect("seed insert");
+    };
+    for id in 1..=3 {
+        put(&engine, &mut session, "tenant-a", TABLE, id);
+        put(&engine, &mut session, "tenant-b", TABLE, id);
+        put(&engine, &mut session, "tenant-b", TAGS, id);
+    }
+    for id in 1..=2 {
+        put(&engine, &mut session, "tenant-a", TAGS, id);
+    }
+    (engine, path)
+}
+
+fn cell_texts(result: &engine::sql::exec::QueryResult) -> Vec<Vec<String>> {
+    result
+        .rows
+        .iter()
+        .map(|r| r.cells.iter().map(|c| format!("{c:?}")).collect())
+        .collect()
+}
+
+/// BEGIN → DECLARE → FETCH で全件読み → CLOSE → COMMIT し、読んだ行を返す。
+fn fetch_all_via_cursor(
+    engine: &EngineCore,
+    caller: &PolicyContext,
+    select: &str,
+    fetch: &str,
+) -> Vec<Vec<String>> {
+    let mut session = SessionState::default();
+    let mut txn = engine.new_session_transaction();
+    engine
+        .execute_sql_in_txn(caller, &mut session, &mut txn, "BEGIN")
+        .expect("begin");
+    engine
+        .execute_sql_in_txn(
+            caller,
+            &mut session,
+            &mut txn,
+            &format!("DECLARE c CURSOR FOR {select}"),
+        )
+        .unwrap_or_else(|e| panic!("declare must be accepted: {select}: {e:?}"));
+    let mut out = Vec::new();
+    loop {
+        let SqlOutcome::Fetch(r) = engine
+            .execute_sql_in_txn(caller, &mut session, &mut txn, fetch)
+            .expect("fetch")
+        else {
+            panic!("expected Fetch outcome");
+        };
+        if r.rows.is_empty() {
+            break;
+        }
+        out.extend(cell_texts(&r));
+    }
+    engine
+        .execute_sql_in_txn(caller, &mut session, &mut txn, "CLOSE c")
+        .expect("close");
+    engine
+        .execute_sql_in_txn(caller, &mut session, &mut txn, "COMMIT")
+        .expect("commit");
+    out
+}
+
+fn direct_rows(engine: &EngineCore, caller: &PolicyContext, select: &str) -> Vec<Vec<String>> {
+    let mut session = SessionState::default();
+    let SqlOutcome::Query(r) = engine
+        .execute_sql_in_session(caller, &mut session, select)
+        .expect("direct")
+    else {
+        panic!("expected Query outcome");
+    };
+    cell_texts(&r)
+}
+
+/// INNER／LEFT／CROSS／USING／集計形の JOIN カーソルが、直接実行と一致し、
+/// 他テナントの行（結合キーが衝突）が混入しない（RLS 越境・外部結合を含む）。
+#[test]
+fn join_cursor_matches_direct_execution_and_isolates_tenants() {
+    let (engine, path) = new_join_core();
+    let _cleanup = CleanupGuard(path);
+    let caller = ctx("tenant-a");
+    let selects = [
+        "SELECT d.id, d.lang, t.lang FROM documents d INNER JOIN tags t ON d.id = t.id LIMIT 100",
+        "SELECT d.id, d.lang, t.lang FROM documents d LEFT JOIN tags t ON d.id = t.id LIMIT 100",
+        "SELECT d.id, t.id FROM documents d CROSS JOIN tags t LIMIT 100",
+        "SELECT id, d.lang, t.lang FROM documents d JOIN tags t USING (id) LIMIT 100",
+        "SELECT d.lang, COUNT(*) AS n FROM documents d JOIN tags t ON d.id = t.id GROUP BY d.lang LIMIT 100",
+    ];
+    for select in selects {
+        let direct = direct_rows(&engine, &caller, select);
+        assert!(!direct.is_empty(), "fixture must yield rows: {select}");
+        for fetch in ["FETCH NEXT IN c", "FETCH FORWARD 2 IN c", "FETCH 10 FROM c"] {
+            let got = fetch_all_via_cursor(&engine, &caller, select, fetch);
+            assert_eq!(got, direct, "{select} via {fetch}");
+            assert!(
+                got.iter().flatten().all(|c| !c.contains("tenant-b")),
+                "other tenant row leaked: {select}"
+            );
+        }
+    }
+}
+
+/// LEFT JOIN の右辺は参照セッション自身の RLS で絞られる（tenant-a の id=3 は右辺が NULL）。
+#[test]
+fn join_cursor_left_side_null_when_other_tenant_has_match() {
+    let (engine, path) = new_join_core();
+    let _cleanup = CleanupGuard(path);
+    let caller = ctx("tenant-a");
+    let rows = fetch_all_via_cursor(
+        &engine,
+        &caller,
+        "SELECT d.id, t.lang FROM documents d LEFT JOIN tags t ON d.id = t.id LIMIT 100",
+        "FETCH 10 FROM c",
+    );
+    assert_eq!(rows.len(), 3);
+    assert!(
+        rows.iter().any(|r| r.iter().any(|c| c.contains("Null"))),
+        "tenant-b's tags row must not fill tenant-a's id=3: {rows:?}"
+    );
+}
+
+/// CTE 入力の JOIN・集合演算の DECLARE は引き続き `42601` で拒否される（fail-closed）。
+#[test]
+fn join_cursor_unsupported_forms_stay_rejected() {
+    let (engine, path) = new_join_core();
+    let _cleanup = CleanupGuard(path);
+    let caller = ctx("tenant-a");
+    // tracked: #3176
+    for sql in [
+        "DECLARE c CURSOR FOR WITH w AS (SELECT id FROM documents LIMIT 5) SELECT w.id FROM w JOIN tags t ON w.id = t.id LIMIT 5",
+        "DECLARE c CURSOR FOR SELECT d.id FROM documents d JOIN tags t ON d.id = t.id UNION SELECT id FROM tags LIMIT 5",
+    ] {
+        let mut session = SessionState::default();
+        let mut txn = engine.new_session_transaction();
+        engine
+            .execute_sql_in_txn(&caller, &mut session, &mut txn, "BEGIN")
+            .expect("begin");
+        let err = engine
+            .execute_sql_in_txn(&caller, &mut session, &mut txn, sql)
+            .expect_err("must be rejected");
+        assert_eq!(err.wire_code(), "42601", "{sql}");
+    }
+}
+
+/// Tx 外の JOIN DECLARE は `25P01`（存在しない表を含んでも同じ）。
+#[test]
+fn join_declare_outside_transaction_is_25p01() {
+    let (engine, path) = new_join_core();
+    let _cleanup = CleanupGuard(path);
+    let caller = ctx("tenant-a");
+    for tbl in ["tags", "no_such_table"] {
+        let mut session = SessionState::default();
+        let mut txn = engine.new_session_transaction();
+        let err = engine
+            .execute_sql_in_txn(
+                &caller,
+                &mut session,
+                &mut txn,
+                &format!(
+                    "DECLARE c CURSOR FOR SELECT d.id FROM documents d JOIN {tbl} t ON d.id = t.id LIMIT 5"
+                ),
+            )
+            .expect_err("outside tx");
+        assert_eq!(err.wire_code(), "25P01", "{tbl}");
+    }
+}
+
+/// 同一 Tx 内の自分の書き込みが JOIN カーソルへ反映される。writer 取得前に宣言した
+/// カーソルは BEGIN 時点を保つ。
+#[test]
+fn join_cursor_sees_own_writes_and_snapshot_before_writer() {
+    let (engine, path) = new_join_core();
+    let _cleanup = CleanupGuard(path);
+    let caller = ctx("tenant-a");
+    let select = "SELECT d.id FROM documents d JOIN tags t ON d.id = t.id LIMIT 100";
+    let mut session = SessionState::default();
+    let mut txn = engine.new_session_transaction();
+    engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "BEGIN")
+        .expect("begin");
+    engine
+        .execute_sql_in_txn(
+            &caller,
+            &mut session,
+            &mut txn,
+            &format!("DECLARE before CURSOR FOR {select}"),
+        )
+        .expect("declare before");
+    engine
+        .execute_sql_in_txn(
+            &caller,
+            &mut session,
+            &mut txn,
+            "INSERT INTO tags (id, embedding, lang) VALUES (3, '[1.0, 0.0]', 'new') USING OPERATION_ID 'j-own-3'",
+        )
+        .expect("own write");
+    engine
+        .execute_sql_in_txn(
+            &caller,
+            &mut session,
+            &mut txn,
+            &format!("DECLARE after CURSOR FOR {select}"),
+        )
+        .expect("declare after");
+    let mut counts = Vec::new();
+    for name in ["before", "after"] {
+        let SqlOutcome::Fetch(r) = engine
+            .execute_sql_in_txn(
+                &caller,
+                &mut session,
+                &mut txn,
+                &format!("FETCH 10 FROM {name}"),
+            )
+            .expect("fetch")
+        else {
+            panic!("expected Fetch outcome");
+        };
+        counts.push(r.rows.len());
+    }
+    assert_eq!(counts, vec![2, 3]);
+    engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "ROLLBACK")
+        .expect("rollback");
+}
+
+/// JOIN の結果が残容量を超えると生成中に `54000` で打ち切られ、カーソルは登録されない。
+#[test]
+fn join_cursor_respects_remaining_byte_budget() {
+    let (engine, path) = new_large_text_core();
+    let _cleanup = CleanupGuard(path);
+    let caller = ctx("tenant-a");
+    let mut session = SessionState::default();
+    let mut txn = engine.new_session_transaction();
+    engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "BEGIN")
+        .expect("begin");
+    let err = engine
+        .execute_sql_in_txn(
+            &caller,
+            &mut session,
+            &mut txn,
+            "DECLARE c CURSOR FOR SELECT a.lang, b.lang FROM documents a CROSS JOIN documents b LIMIT 100",
+        )
+        .expect_err("join result exceeds the cursor budget");
+    assert_eq!(err.wire_code(), "54000");
+    engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "ROLLBACK")
+        .expect("rollback");
+}
 
 /// `FETCH ALL`／`FETCH FORWARD ALL`（Issue #3174・WIRE-15）は残り全行を返して末尾へ
 /// 進み、続く `FETCH ALL`・`FETCH NEXT` は 0 行。連結は参照カーソルと一致する。

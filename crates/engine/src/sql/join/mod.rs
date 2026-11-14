@@ -430,6 +430,28 @@ pub(crate) fn execute(
     )
 }
 
+/// [`execute`] と同じ起動時上限に、累計バイト予算だけ `max_result_bytes` を上限として縮めて実行する
+/// （Issue #3175。`core.rs` の DECLARE 内側 JOIN から呼ばれる）。カーソルの残容量を超える結果を
+/// 生成中に打ち切り（`54000`）、登録前に確保し切る fail-open を防ぐ。リレーション数・入出力行数・
+/// 比較回数・結果行数は通常の SELECT と同じ起動時設定のまま。中間行も予算に計上するため通常の
+/// SELECT より早く上限に達しうる（安全側）。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_with_result_byte_cap(
+    read_txn: &impl crate::storage::read_source::ReadSource,
+    ctx: &PolicyContext,
+    schemas: &HashMap<String, TableSchema>,
+    validated: &ValidatedJoin,
+    udfs: &UdfRegistry,
+    group_limits: crate::group_by_limits::GroupByLimits,
+    join_limits: crate::join_limits::JoinSizeLimits,
+    result_limits: crate::result_limits::ResultLimits,
+    max_result_bytes: usize,
+) -> Result<QueryResult, SqlSurfaceError> {
+    let base = startup_limits(group_limits, join_limits, result_limits);
+    let limits = base.with_budget_cap(base.budget_cap.min(max_result_bytes));
+    execute_with_limits(read_txn, ctx, schemas, validated, udfs, &limits)
+}
+
 /// 起動時設定から実行段の上限を組み立てる（[`execute`]・[`execute_with_cte_inputs`] が共有する）。
 fn startup_limits(
     group_limits: crate::group_by_limits::GroupByLimits,
