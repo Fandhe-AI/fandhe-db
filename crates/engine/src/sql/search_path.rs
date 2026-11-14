@@ -23,7 +23,7 @@
 //!   （Issue #3196）。作成系 DDL の作成対象名は path の先頭の要素に置く（自テナントの SCHEMA なら内部キー、
 //!   `public` なら裸のまま。[`creation_target`]・[`resolve_statement_refs`]）。作成先の SCHEMA は USAGE が無ければ
 //!   飛ばさず `42501`。拡張クエリ（Parse・Bind・Describe）も Parse で同じ規則で解決し、Bind・Describe の時点の
-//!   path・カタログで再解決する（Issue #3197。`core::EngineCore::refresh_prepared_in_txn`）。`ALTER .. SET SCHEMA` の未修飾の対象が SCHEMA に解決される形は `0A000`（#3198）。
+//!   path・カタログで再解決する（Issue #3197。`core::EngineCore::refresh_prepared_in_txn`）。`ALTER TABLE t SET SCHEMA ..` の未修飾の対象も同じ書き換えで修飾形と同じ経路に乗る（#3198・#3199）。
 //!   SCHEMA 配置が未対応の作成（`CREATE TYPE`・`CREATE MATERIALIZED VIEW`）は、path 先頭が SCHEMA なら
 //!   `public` へ黙って作らず `0A000`。
 //! - 一時表以外の未修飾名が解決できず、実効 path に `public` が含まれなければ `42P01`、作成先が
