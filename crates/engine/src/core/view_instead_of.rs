@@ -329,6 +329,10 @@ impl EngineCore {
         let writes = TriggerWriteHandle::new(write_txn, ctx, Some(&runtime));
         let _clock_scope = self.trigger_firing_clock_scope()?;
         let _limits_scope = self.sparsevec_limits_scope();
+        // 入れ子のトリガ（INSTEAD OF 本体の書いた表の AFTER ROW トリガが更に別表へ書く場合）が書いた表も
+        // 遅延 FK の記録区間へ収集する。区間が無いと内側の記録が失敗し、遅延 FK をその場で検査して
+        // しまう（明示 Tx は COMMIT 時検査という契約に反する）。
+        let nested_scope = crate::tenant::trigger_writes::TriggerWrittenTablesScope::enter();
 
         let outcome = match stmt {
             InsteadOfStmt::Insert(v) => {
@@ -430,7 +434,12 @@ impl EngineCore {
 
         // トリガ本体が書いた表の遅延 FK を確定する（fail-open の防止）。明示 Tx は COMMIT 時の検査対象
         // （`mark_written`）にし、autocommit は文の終わりに即時検査する。
-        let written = writes.written_tables();
+        let mut written = writes.written_tables();
+        for table in nested_scope.take() {
+            if !written.iter().any(|w| w == &table) {
+                written.push(table);
+            }
+        }
         if !in_txn {
             for table in &written {
                 crate::constraint::enforce_deferred_foreign_keys_in_txn(
