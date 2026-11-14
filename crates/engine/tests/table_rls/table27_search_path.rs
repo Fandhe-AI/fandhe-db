@@ -1752,6 +1752,54 @@ fn extended_copy_is_accepted_and_rejects_a_path_change_after_bind() {
     assert_eq!(e.wire_code(), "0A000");
 }
 
+/// Issue #3197: `COPY` の Bind 後、同じ `search_path` のまま path の前方へ同名の表が作られると、Execute は
+/// Bind で検証した宛先とは別の関係へ解決してしまう。Bind 時の宛先を記録して照合し、`0A000` で拒否する。
+// intentional: docs/design/schema-tenant-namespace.md
+#[test]
+fn extended_copy_rejects_a_same_name_relation_created_ahead_in_path_after_bind() {
+    let (core, _g, mut s) = q1_world("sp-ext-copy-pin");
+    assert!(s.bind_resolution_tenant(TENANT));
+    ok(&core, &mut s, "CREATE SCHEMA q2");
+    ok(&core, &mut s, "SET search_path TO q2, public");
+    let copy = parse_ext(&core, &s, "COPY t TO STDOUT").expect("extended COPY parses");
+    let bound = core
+        .bind_prepared_in_session(&s, &copy, &[])
+        .expect("extended COPY binds");
+    let txn = core.new_session_transaction();
+    bound.require_session_current(&s).expect("same epoch");
+    core.require_copy_target_current(&s, &txn, &bound)
+        .expect("target unchanged");
+    // 同じ世代のまま、path の前方（q2）へ同名の表が作られる。
+    ok(&core, &mut s, "CREATE TABLE q2.t (id BIGINT PRIMARY KEY)");
+    bound
+        .require_session_current(&s)
+        .expect("epoch alone cannot see it");
+    let e = core
+        .require_copy_target_current(&s, &txn, &bound)
+        .expect_err("target retargeted");
+    assert_eq!(e.wire_code(), "0A000");
+}
+
+/// Issue #3197: 再解決後の結果列は、Parse 時に公告した列と比べる。旧参照先（q1.t）が DROP されても、
+/// 解決先（public.t）の結果列が同じなら通る（現在のカタログから旧側を再導出して常に拒否しない）。
+// intentional: docs/design/schema-tenant-namespace.md
+#[test]
+fn extended_query_compares_against_advertised_columns_after_old_target_dropped() {
+    let (core, _g, mut s) = q1_world("sp-ext-cols-dropped");
+    assert!(s.bind_resolution_tenant(TENANT));
+    ok(&core, &mut s, "SET search_path TO q1, public");
+    let plain = parse_ext(&core, &s, "SELECT id FROM t LIMIT 5").expect("parse under q1");
+    assert_eq!(
+        run_prepared(&core, &mut s, &plain, &[]).expect("q1"),
+        vec![10, 20]
+    );
+    ok(&core, &mut s, "DROP TABLE q1.t");
+    assert_eq!(
+        run_prepared(&core, &mut s, &plain, &[]).expect("falls back to public"),
+        vec![1]
+    );
+}
+
 /// Issue #3197: どの要素にも作れない path の作成系 DDL は、拡張クエリでも簡易クエリと同じ SQLSTATE になる
 /// （作成先を飛ばして `public` へ黙って作らない）。
 #[test]

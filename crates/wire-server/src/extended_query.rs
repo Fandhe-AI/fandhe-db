@@ -2538,6 +2538,12 @@ fn execute_portal<'e, S: WireStream>(
                 txn.fail();
                 return Err(HandlerError::Sql(e));
             }
+            // Bind 時に解決した宛先が現在の `search_path`・カタログでも同じ関係を指すかを照合する
+            // （同じ世代のまま path 前方に同名の関係が作られた場合の化けを拒否。Issue #3197）。
+            if let Err(e) = engine.require_copy_target_current(session, txn, &parsed) {
+                txn.fail();
+                return Err(HandlerError::Sql(e));
+            }
             return Ok(PortalExecution::Copy { sql });
         }
 

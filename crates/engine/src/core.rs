@@ -3103,6 +3103,10 @@ struct PreparedPathStamp {
     base_tokens: Vec<crate::sql::lexer::Token>,
     /// Parse 時に適用した `search_path` による書き換え（解決結果の指紋）。
     rewrites: Vec<(usize, crate::sql::lexer::Token)>,
+    /// Parse 時点で公告する結果列（`RowDescription` の元。`Ok(None)` は結果列を持たない文、`None` は導出に
+    /// 失敗した文）。再解決後の結果列との比較は現在のカタログからの再導出ではなく、この保存値で行う
+    /// （旧参照先の型変更・DROP の後でも公告済みの内容と照合できる）。
+    columns: Option<Option<Vec<crate::sql::exec::ColumnMeta>>>,
 }
 
 /// 準備済み文の Parse へ渡す `search_path` 解決の入力（セッション対応の Parse だけが渡す。Issue #3197）。
@@ -6764,22 +6768,27 @@ impl EngineCore {
         {
             return Err(Self::refresh_incompatible());
         }
-        let columns_of = |p: &PreparedSql| {
-            self.describe_parsed_in_session_snap(
-                session,
-                &p.dummy_parsed,
-                &p.literal_skip,
-                &p.where_equality_dummy_flags,
-                &self.result_limits,
-                read_snap,
-            )
-        };
-        let (Ok(old_columns), Ok(new_columns)) = (columns_of(prepared), columns_of(&reparsed))
-        else {
+        // 旧側は Parse 時に保存した公告済みの結果列。新側は BEGIN 時点（無ければ最新）のカタログで導出する。
+        let Some(old_columns) = stamp.columns.as_ref() else {
             return Err(Self::refresh_incompatible());
         };
-        if old_columns != new_columns {
+        let Ok(new_columns) = self.describe_parsed_in_session_snap(
+            session,
+            &reparsed.dummy_parsed,
+            &reparsed.literal_skip,
+            &reparsed.where_equality_dummy_flags,
+            &self.result_limits,
+            read_snap,
+        ) else {
             return Err(Self::refresh_incompatible());
+        };
+        if *old_columns != new_columns {
+            return Err(Self::refresh_incompatible());
+        }
+        // 再 Parse した文の刻印は、保存済みの公告列を引き継ぐ（以後の再解決も同じ公告と比較する）。
+        let mut reparsed = reparsed;
+        if let Some(new_stamp) = reparsed.path_stamp.as_mut() {
+            new_stamp.columns = Some(old_columns.clone());
         }
         Ok(Some(reparsed))
     }
@@ -8603,6 +8612,7 @@ impl EngineCore {
                     epoch: p.session.search_path_epoch(),
                     base_tokens,
                     rewrites,
+                    columns: None,
                 });
             }
             // `public` が見えない path の未修飾名ゲート（解決後のトークンに対して判定する。TABLE-27・Issue #1715）。
@@ -8748,7 +8758,11 @@ impl EngineCore {
                 create_public,
                 parsed_relations: Vec::new(),
                 route: temp_route::PreparedRoute::Plain,
-                path_stamp: path_stamp.take(),
+                path_stamp: path_stamp.take().map(|mut st| {
+                    // `COPY` は結果列を持たない（Describe は `NoData`）。
+                    st.columns = Some(None);
+                    st
+                }),
             });
         }
         let param_count = crate::sql::params::validate_param_positions(&tokens)?;
@@ -8789,24 +8803,28 @@ impl EngineCore {
         // 式内 `$n`（`1 + $1` 等）は文字列ダミーでは定数畳み込み／束縛の型検査に落ちるため、
         // 推論を parse より前に置く。推論不能（`42P18`）のときだけ、構文エラー（`42601`）を
         // 先に返す（PostgreSQL と同じ優先順位）ため文字列ダミーで parse を試す。
-        let (param_types, param_checks) =
-            match self.infer_param_types(&tokens, param_count, declared) {
-                Ok(inferred) => inferred,
-                Err(e @ crate::sql::allowlist::SqlSurfaceError::IndeterminateDatatype { .. }) => {
-                    // 文字列ダミーの定数畳み込みで型エラーになっても途中終了しないよう、
-                    // 構文エラー以外を無視して文全体を走査する。
-                    let _guard = crate::sql::const_expr::defer_all_non_syntax_errors();
-                    if let Err(syntax) =
-                        self.parse_tokens(crate::sql::params::substitute_dummy(&tokens))
-                    {
-                        if syntax.wire_code() == "42601" {
-                            return Err(syntax);
-                        }
+        let (param_types, param_checks) = match self.infer_param_types(
+            &tokens,
+            param_count,
+            declared,
+            path.and_then(|p| p.read_snap),
+        ) {
+            Ok(inferred) => inferred,
+            Err(e @ crate::sql::allowlist::SqlSurfaceError::IndeterminateDatatype { .. }) => {
+                // 文字列ダミーの定数畳み込みで型エラーになっても途中終了しないよう、
+                // 構文エラー以外を無視して文全体を走査する。
+                let _guard = crate::sql::const_expr::defer_all_non_syntax_errors();
+                if let Err(syntax) =
+                    self.parse_tokens(crate::sql::params::substitute_dummy(&tokens))
+                {
+                    if syntax.wire_code() == "42601" {
+                        return Err(syntax);
                     }
-                    return Err(e);
                 }
-                Err(e) => return Err(e),
-            };
+                return Err(e);
+            }
+            Err(e) => return Err(e),
+        };
         let kinds: Vec<crate::sql::params::ParamLiteralKind> =
             param_types.iter().map(|t| t.literal_kind()).collect();
         // 等価述語のダミーフラグは種別確定後に求める（非 String 種別は
@@ -8827,7 +8845,12 @@ impl EngineCore {
             let _guard = crate::sql::const_expr::defer_param_value_errors(positions);
             crate::datetime::reset_session_time_zone_read();
             let dummy_tokens = Self::normalize_row_count_clauses(dummy_tokens)?;
-            let mut parsed = self.parse_tokens_recorded(dummy_tokens, None, None, &parse_hits)?;
+            let mut parsed = self.parse_tokens_recorded(
+                dummy_tokens,
+                None,
+                path.and_then(|p| p.read_snap),
+                &parse_hits,
+            )?;
             // 解決済みトークンの再 parse は `public.` 修飾の情報を持たない。`$n` を含まない文の
             // 実行は `dummy_parsed` を複製するため、ここで保持して実行時の衝突検査を通す。
             attach_public_qualified(&mut parsed, &public_qualified, create_public);
@@ -8858,6 +8881,19 @@ impl EngineCore {
             })
             .collect();
         let typed_positions = crate::sql::params::TypedPositions::build(&tokens, &typed_numeric);
+        // Issue #3197: 公告する結果列を Parse 時点で保存する（再解決後の互換性比較の基準）。
+        if let (Some(stamp), Some(p)) = (path_stamp.as_mut(), path) {
+            stamp.columns = self
+                .describe_parsed_in_session_snap(
+                    p.session,
+                    &dummy_parsed,
+                    &literal_skip,
+                    &where_equality_dummy_flags,
+                    &self.result_limits,
+                    p.read_snap,
+                )
+                .ok();
+        }
         Ok(PreparedSql {
             resolution_tenant: None,
             tokens,
@@ -8904,6 +8940,7 @@ impl EngineCore {
         tokens: &[crate::sql::lexer::Token],
         param_count: u16,
         declared: &[Option<crate::sql::params::DeclaredParamType>],
+        read_snap: Option<&redb::ReadTransaction>,
     ) -> Result<
         (
             Vec<crate::sql::params::PreparedParamType>,
@@ -8931,6 +8968,13 @@ impl EngineCore {
                 _ => None,
             }),
         };
+        // 表スキーマの引き先。再 Parse は `BEGIN` 時点のスナップショット、通常の Parse は最新カタログ。
+        let schema_of = |table: &str| -> Option<crate::catalog::TableSchema> {
+            match read_snap {
+                Some(rs) => crate::catalog::get_table_schema_in_txn_impl(rs, table, true).ok(),
+                None => self.storage.get_table_schema(table).ok(),
+            }
+        };
         // `INSERT INTO <表> ( <列> {, <列>} ) VALUES`（構文は `Parser::parse_insert` が
         // 保証する形。ここでは型の引き当てだけに使い、崩れていれば未解決として扱う）。
         // 列リスト省略（`INSERT INTO <表> VALUES (...)`。SQL-50・Issue #1730）は、表のスキーマから
@@ -8939,12 +8983,12 @@ impl EngineCore {
         let insert_target: Option<(String, Vec<String>)> = insert_target_from_tokens(tokens)
             .or_else(|| {
                 let table = insert_table_without_column_list(tokens)?;
-                let schema = self.storage.get_table_schema(&table).ok()?;
+                let schema = schema_of(&table)?;
                 Some((table, crate::catalog::lookup_star_columns_of(&schema)))
             });
         let column_type = |table: &str, column: &str| -> Option<PreparedParamType> {
             let id_type = || Some(PreparedParamType::Column(ColumnMeta::Id));
-            let (schema, column) = match self.storage.get_table_schema(table) {
+            let (schema, column) = match schema_of(table).ok_or(()) {
                 Ok(schema) if column == "id" && schema.has_pseudo_id() => return id_type(),
                 Ok(schema) => (schema, column.to_string()),
                 // 表でなければ、ビューの公開列を基表の列へ解決して型を引く（書き込み文・読み取り文とも。
@@ -8952,16 +8996,27 @@ impl EngineCore {
                 // 判定する（TEXT 列を `id` として公開するビューで `$n` を整数と誤推論しない）。
                 // 解決できなければ、`id` は従来どおり疑似列、他は未解決（`Text`）。
                 Err(_) => {
-                    let resolved = self
-                        .storage
-                        .with_view_write_snapshot(table, |snap, _| {
-                            let (base, physical) = crate::sql::view_insert::resolve_insert_column(
-                                snap, table, column,
-                            )?;
-                            snap.table_schema(&base).ok().map(|s| (s, physical))
-                        })
-                        .ok()
-                        .flatten();
+                    let resolved = match read_snap {
+                        // 再 Parse（Issue #3197）は BEGIN 時点のスナップショットでビューを引く。
+                        Some(rs) => {
+                            let view = crate::catalog::ViewWriteSnapshot::over(rs);
+                            crate::sql::view_insert::resolve_insert_column(&view, table, column)
+                                .and_then(|(base, physical)| {
+                                    view.table_schema(&base).ok().map(|s| (s, physical))
+                                })
+                        }
+                        None => self
+                            .storage
+                            .with_view_write_snapshot(table, |snap, _| {
+                                let (base, physical) =
+                                    crate::sql::view_insert::resolve_insert_column(
+                                        snap, table, column,
+                                    )?;
+                                snap.table_schema(&base).ok().map(|s| (s, physical))
+                            })
+                            .ok()
+                            .flatten(),
+                    };
                     match resolved {
                         Some(r) => r,
                         None if column == "id" => return id_type(),
@@ -17646,14 +17701,32 @@ impl EngineCore {
         if !(session.search_path_may_hold_tenant_schema() || session.search_path_hides_public()) {
             return Ok(());
         }
+        let rewrites = self.copy_path_rewrites(tenant, session, tokens, read_snap)?;
+        crate::sql::search_path::apply_rewrites(tokens, rewrites);
+        Ok(())
+    }
+
+    /// `COPY` の字句列に対する `search_path` の書き換え（位置と置換後トークン）を求める。
+    /// [`Self::resolve_copy_tokens_path`] の解決部で、Bind 時の宛先の同一性の記録・Execute での照合
+    /// （Issue #3197）にも共有する。path 解決が無効なセッションは空。
+    pub(crate) fn copy_path_rewrites(
+        &self,
+        tenant: &str,
+        session: &crate::sql::mode::SessionState,
+        tokens: &[crate::sql::lexer::Token],
+        read_snap: Option<&redb::ReadTransaction>,
+    ) -> Result<Vec<(usize, crate::sql::lexer::Token)>, crate::sql::allowlist::SqlSurfaceError>
+    {
+        if !(session.search_path_may_hold_tenant_schema() || session.search_path_hides_public()) {
+            return Ok(Vec::new());
+        }
         let resolution = self.with_search_path_lookup(tenant, session, read_snap, |lookup| {
             crate::sql::search_path::resolve_path_refs(session, tokens, &[], lookup)
         })?;
         if let Some(e) = resolution.deferred_error {
             return Err(e);
         }
-        crate::sql::search_path::apply_rewrites(tokens, resolution.rewrites);
-        Ok(())
+        Ok(resolution.rewrites)
     }
 
     /// `begin_copy_unscrubbed` の公開入口。判定順序・エラー契約・実行結果は同関数と同一で、

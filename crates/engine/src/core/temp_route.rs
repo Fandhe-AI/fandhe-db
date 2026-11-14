@@ -103,6 +103,9 @@ pub struct SessionRoutedSql {
     /// `public` が見える path でも `path_epoch` の一致を要求する印（Issue #3197）。`COPY` は Execute で元の SQL を
     /// 現在の `search_path` へ再解決するため、Bind で検証した宛先とずれないよう世代の食い違いを拒否する。
     path_strict: bool,
+    /// `COPY` の Bind 時に解決した宛先（`search_path` による書き換え。Issue #3197）。Execute が同じ規則で
+    /// 解決し直した結果と照合し、同じ世代のまま path 前方に後から作られた同名の関係へ宛先が化けるのを拒否する。
+    copy_pin: Option<Vec<(usize, crate::sql::lexer::Token)>>,
 }
 
 impl SessionRoutedSql {
@@ -119,6 +122,7 @@ impl SessionRoutedSql {
             fresh: false,
             path_epoch: None,
             path_strict: false,
+            copy_pin: None,
         }
     }
 
@@ -132,6 +136,7 @@ impl SessionRoutedSql {
             fresh: false,
             path_epoch: None,
             path_strict: false,
+            copy_pin: None,
         }
     }
 
@@ -149,6 +154,12 @@ impl SessionRoutedSql {
     pub(crate) fn stamped_with_path_for_copy(mut self, session: &SessionState) -> Self {
         self.path_epoch = Some(session.search_path_epoch());
         self.path_strict = true;
+        self
+    }
+
+    /// `COPY` の Bind 時に解決した宛先を記録する（Issue #3197）。
+    pub(crate) fn with_copy_pin(mut self, pin: Vec<(usize, crate::sql::lexer::Token)>) -> Self {
+        self.copy_pin = Some(pin);
         self
     }
 
@@ -1167,6 +1178,7 @@ impl EngineCore {
                     fresh: false,
                     path_epoch: None,
                     path_strict: false,
+                    copy_pin: None,
                 })))
             }
             PreparedRoute::Plain => {
@@ -1202,9 +1214,17 @@ impl EngineCore {
                     if crate::sql::temp_catalog::tokens_reference_temp(&prepared.tokens, temp) {
                         return Err(crate::sql::temp_catalog::temp_statement_stale());
                     }
+                    // Bind 時の宛先の解決結果も記録し、Execute で照合する（同じ世代のまま path 前方に
+                    // 同名の関係が作られても宛先を化けさせない。Issue #3197）。
+                    let ParsedSql::Copy(vc) = &parsed else {
+                        return Err(internal());
+                    };
+                    let tenant = session.resolution_tenant().ok_or_else(internal)?;
+                    let pin = self.copy_pin_for_sql(tenant, session, vc.sql(), read_snap)?;
                     return Ok(ParsedSql::SessionRouted(Box::new(
                         SessionRoutedSql::persistent_guarded(parsed, temp)
-                            .stamped_with_path_for_copy(session),
+                            .stamped_with_path_for_copy(session)
+                            .with_copy_pin(pin),
                     )));
                 }
                 // `DROP INDEX <名前>` は一時表の名前トークンが現れない。準備後に同名の一時索引が
@@ -1242,6 +1262,43 @@ impl EngineCore {
                     SessionRoutedSql::persistent(parsed, temp).stamped_with_path(session),
                 )))
             }
+        }
+    }
+
+    /// `COPY` の元 SQL を現在の `search_path`・カタログで解決した宛先（書き換え）を返す（Issue #3197）。
+    /// 字句解析に失敗する入力は検証済みのはずだが、失敗時は固定の陳腐化として拒否する（fail-closed）。
+    fn copy_pin_for_sql(
+        &self,
+        tenant: &str,
+        session: &SessionState,
+        sql: &str,
+        read_snap: Option<&redb::ReadTransaction>,
+    ) -> Result<Vec<(usize, crate::sql::lexer::Token)>, SqlSurfaceError> {
+        let tokens = crate::sql::lexer::tokenize_marked(sql).map_err(|_| search_path_stale())?;
+        self.copy_path_rewrites(tenant, session, &tokens, read_snap)
+    }
+
+    /// Execute 直前に、`COPY` の宛先が Bind 時と同じ関係へ解決されることを確かめる（Issue #3197）。
+    /// 包み（[`SessionRoutedSql`]）が宛先を記録していない文は何もしない。違えば固定文言の `0A000`。
+    /// wire-server の `COPY` 委譲経路が `require_session_current` の直後に呼ぶ。
+    pub fn require_copy_target_current(
+        &self,
+        session: &SessionState,
+        txn: &crate::sql::transaction::SessionTransaction<'_>,
+        parsed: &ParsedSql,
+    ) -> Result<(), SqlSurfaceError> {
+        let ParsedSql::SessionRouted(routed) = parsed else {
+            return Ok(());
+        };
+        let (Some(pin), ParsedSql::Copy(vc)) = (routed.copy_pin.as_ref(), routed.inner()) else {
+            return Ok(());
+        };
+        let tenant = session.resolution_tenant().ok_or_else(search_path_stale)?;
+        let snap = Self::describe_snapshot(txn)?;
+        if self.copy_pin_for_sql(tenant, session, vc.sql(), snap)? == *pin {
+            Ok(())
+        } else {
+            Err(search_path_stale())
         }
     }
 
