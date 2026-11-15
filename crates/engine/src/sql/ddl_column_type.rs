@@ -133,14 +133,11 @@ pub(crate) fn to_static_column_type_with_array_default(
             };
             let elem_ty = match elem_ty {
                 ColumnType::Text => ArrayElemType::Text,
-                // `varchar[]` は別 OID（1015）のため Text へ写さず拒否する（Issue #2305。
-                // 写すと型の区別が失われ、後で受理へ広げたときに不可逆になる）。
-                ColumnType::Varchar(_) | ColumnType::Bpchar(_) => {
-                    return Err(SqlSurfaceError::FeatureNotSupported {
-                        detail: "this array element type is not supported yet".to_string(),
-                    })
-                }
-                // `smallint[]` は別 OID（1005）のため拒否する（Issue #1558。`varchar[]` と同じ理由）。
+                // `varchar[]`・`varchar(n)[]`・`char(n)[]` は別 OID（1015／1014）の専用要素型として
+                // 受理する（Issue #3231。Text へ写すと型の区別が失われるため写さない）。
+                ColumnType::Varchar(len) => ArrayElemType::Varchar(len),
+                ColumnType::Bpchar(n) => ArrayElemType::Bpchar(n),
+                // `smallint[]` は別 OID（1005）のため拒否する（Issue #1558）。
                 ColumnType::SmallInt => {
                     return Err(SqlSurfaceError::FeatureNotSupported {
                         detail: "this array element type is not supported yet".to_string(),
@@ -1196,10 +1193,18 @@ mod tests {
             let e = parse_type(raw).expect_err(raw);
             assert_eq!(e.wire_code(), "42601", "for {raw:?}");
         }
-        for raw in ["VARCHAR(3)[]", "CHAR(3)[]"] {
+        // 配列要素としての長さ付き型は専用の要素型として受理する（Issue #3231）。
+        for (raw, elem) in [
+            ("VARCHAR(3)[]", ArrayElemType::Varchar(Some(3))),
+            ("CHAR(3)[]", ArrayElemType::Bpchar(3)),
+        ] {
             let (ty, _) = parse_type(raw).expect(raw);
-            let e = to_static_column_type(&ty).expect_err(raw);
-            assert_eq!(e.wire_code(), "0A000", "for {raw:?}");
+            match to_static_column_type(&ty).expect(raw) {
+                StaticColumnType::Resolved(ColumnType::Array(a)) => {
+                    assert_eq!(a.elem(), elem, "for {raw:?}")
+                }
+                other => panic!("{raw}: unexpected {other:?}"),
+            }
         }
     }
 
@@ -1241,13 +1246,19 @@ mod tests {
         }
     }
 
-    /// `varchar[]` は別 OID のため配列要素としては受理せず `0A000`（Issue #2305）。
+    /// `varchar[]` は別 OID（1015）の専用要素型として受理する（Issue #3231。Issue #2305 では
+    /// `0A000` だった）。`[N]` は要素数の上限になる。
     #[test]
-    fn varchar_array_is_rejected_with_0a000() {
-        for raw in ["VARCHAR[]", "CHARACTER VARYING[3]"] {
+    fn varchar_array_is_accepted_as_a_dedicated_element_type() {
+        for (raw, max_len) in [("VARCHAR[]", 1024), ("CHARACTER VARYING[3]", 3)] {
             let (ty, _) = parse_type(raw).expect(raw);
-            let e = to_static_column_type(&ty).expect_err(raw);
-            assert_eq!(e.wire_code(), "0A000", "for {raw:?}");
+            match to_static_column_type(&ty).expect(raw) {
+                StaticColumnType::Resolved(ColumnType::Array(a)) => {
+                    assert_eq!(a.elem(), ArrayElemType::Varchar(None), "for {raw:?}");
+                    assert_eq!(a.max_len(), max_len, "for {raw:?}");
+                }
+                other => panic!("{raw}: unexpected {other:?}"),
+            }
         }
     }
 

@@ -245,6 +245,8 @@ fn comparable_elem(elem: ArrayElemType) -> bool {
     match elem {
         ArrayElemType::Numeric { .. } | ArrayElemType::Json | ArrayElemType::Enum => false,
         ArrayElemType::Text
+        | ArrayElemType::Varchar(_)
+        | ArrayElemType::Bpchar(_)
         | ArrayElemType::Bool
         | ArrayElemType::Integer
         | ArrayElemType::BigInt
@@ -265,6 +267,8 @@ fn is_float_elem(elem: ArrayElemType) -> bool {
     match elem {
         ArrayElemType::Real | ArrayElemType::Double => true,
         ArrayElemType::Text
+        | ArrayElemType::Varchar(_)
+        | ArrayElemType::Bpchar(_)
         | ArrayElemType::Bool
         | ArrayElemType::Integer
         | ArrayElemType::BigInt
@@ -289,7 +293,9 @@ fn lhs_kinds_for(elem: ArrayElemType) -> &'static [CastKind] {
         | ArrayElemType::BigInt
         | ArrayElemType::Real
         | ArrayElemType::Double => &[K::Int2, K::Int4, K::Int8, K::Float4, K::Float8],
-        ArrayElemType::Text => &[K::Text, K::Varchar, K::Bpchar],
+        ArrayElemType::Text | ArrayElemType::Varchar(_) | ArrayElemType::Bpchar(_) => {
+            &[K::Text, K::Varchar, K::Bpchar]
+        }
         ArrayElemType::Bool => &[K::Bool],
         ArrayElemType::Date => &[K::Date],
         ArrayElemType::Timestamp => &[K::Timestamp],
@@ -324,7 +330,24 @@ fn bind_array_operand(
             "array predicates on numeric, json or enum elements are not supported yet",
         ));
     }
-    Ok((bound, elem))
+    // `VARCHAR`／`CHAR(n)` 要素は TEXT と同じ比較系として扱う（Issue #3231。PostgreSQL と同じく
+    // `text[] = varchar[]` を受理する）。`CHAR(n)` は空白詰めで保存されるが比較では末尾の空白を
+    // 無視するため、被演算子を「要素ごとに末尾 U+0020 を除いた `text[]`」へ変換して束縛する
+    // （投影では包まず、空白詰めのまま返る）。
+    match elem {
+        ArrayElemType::Bpchar(n) => {
+            let trimmed = super::cast::cast_node(
+                super::cast_value::CastFn {
+                    from: super::cast_value::CastSrc::Array(ArrayElemType::Bpchar(n)),
+                    to: super::cast_value::CastDst::Array(ArrayElemType::Text),
+                },
+                bound,
+            );
+            Ok((trimmed, ArrayElemType::Text))
+        }
+        ArrayElemType::Varchar(_) => Ok((bound, ArrayElemType::Text)),
+        _ => Ok((bound, elem)),
+    }
 }
 
 /// 型なしリテラル側（文字列リテラル・`NULL`）か。反対側の配列型として解釈する対象。
@@ -897,7 +920,7 @@ mod tests {
                 E::Integer | E::BigInt | E::Real | E::Double => {
                     &[K::Int2, K::Int4, K::Int8, K::Float4, K::Float8]
                 }
-                E::Text => &[K::Text, K::Varchar, K::Bpchar],
+                E::Text | E::Varchar(_) | E::Bpchar(_) => &[K::Text, K::Varchar, K::Bpchar],
                 E::Bool => &[K::Bool],
                 E::Date => &[K::Date],
                 E::Timestamp => &[K::Timestamp],

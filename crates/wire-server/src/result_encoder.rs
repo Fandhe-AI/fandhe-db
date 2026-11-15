@@ -603,6 +603,11 @@ wire_type_enum! {
         /// `ColumnMeta::Scalar{ty: Array(<jsonb>)}`（`_jsonb`。TABLE-35・WIRE-13・Issue #1606）。
         /// 次元数は OID に影響しない（PostgreSQL と同じ）。テキスト表現のみ対応。
         JsonbArray,
+        /// `ColumnMeta::Scalar{ty: Array(<varchar>)}`（`_varchar`。TABLE-14・TABLE-35・Issue #3231）。
+        /// 長さ指定は typmod（`n + 4`。長さなしは -1）で公告する。テキスト表現のみ対応。
+        VarcharArray,
+        /// `ColumnMeta::Scalar{ty: Array(<char(n)>)}`（`_bpchar`。同上）。テキスト表現のみ対応。
+        BpcharArray,
         /// `ColumnMeta::Record{array: false}`（`record`。再帰 CTE の `SEARCH BREADTH FIRST` 順序列。
         /// SQL-35・Issue #2213）。テキスト表現のみ対応（`record_out` 形式）。
         Record,
@@ -651,6 +656,8 @@ impl WireType {
             WireType::ByteaArray => 1001,
             WireType::JsonArray => 199,
             WireType::JsonbArray => 3807,
+            WireType::VarcharArray => 1015,
+            WireType::BpcharArray => 1014,
             WireType::Record => 2249,
             WireType::RecordArray => 2287,
         }
@@ -680,6 +687,8 @@ impl WireType {
             | WireType::ByteaArray
             | WireType::JsonArray
             | WireType::JsonbArray
+            | WireType::VarcharArray
+            | WireType::BpcharArray
             | WireType::Record
             | WireType::RecordArray => -1,
             WireType::Int2 => 2,
@@ -731,6 +740,8 @@ impl WireType {
             WireType::ByteaArray => "_bytea",
             WireType::JsonArray => "_json",
             WireType::JsonbArray => "_jsonb",
+            WireType::VarcharArray => "_varchar",
+            WireType::BpcharArray => "_bpchar",
             WireType::Record => "record",
             WireType::RecordArray => "_record",
         }
@@ -788,6 +799,8 @@ impl WireType {
             | WireType::ByteaArray
             | WireType::JsonArray
             | WireType::JsonbArray
+            | WireType::VarcharArray
+            | WireType::BpcharArray
             | WireType::Record
             | WireType::RecordArray => None,
         }
@@ -846,6 +859,8 @@ impl WireType {
             | WireType::ByteaArray
             | WireType::JsonArray
             | WireType::JsonbArray
+            | WireType::VarcharArray
+            | WireType::BpcharArray
             // レコード・レコード配列のバイナリ形式（`record_send`）は対象外（SQL-35・Issue #2213）。
             | WireType::Record
             | WireType::RecordArray => false,
@@ -946,6 +961,32 @@ fn scalar_type_modifier(ty: &engine::catalog::ColumnType) -> Result<i32, EncodeE
             .ok_or(EncodeError),
         // `BIT(n)` の typmod は PostgreSQL と同じく `n` そのもの（VARHDRSZ を加えない。Issue #2021）。
         ColumnType::Bit(n) => i32::try_from(*n).map_err(|_| EncodeError),
+        // `VARCHAR(n)[]`／`CHAR(n)[]` は要素の長さを typmod（`n + 4`）で公告する（PostgreSQL の
+        // `atttypmod` と同じ。Issue #3231）。それ以外の配列は -1。
+        ColumnType::Array(array_ty) => {
+            use engine::catalog::ArrayElemType as E;
+            match array_ty.elem() {
+                E::Varchar(Some(n)) | E::Bpchar(n) => i32::try_from(n)
+                    .ok()
+                    .and_then(|n| n.checked_add(VARHDRSZ))
+                    .ok_or(EncodeError),
+                E::Varchar(None)
+                | E::Text
+                | E::Bool
+                | E::Integer
+                | E::BigInt
+                | E::Real
+                | E::Double
+                | E::Date
+                | E::Timestamp
+                | E::Uuid
+                | E::Numeric { .. }
+                | E::Bytea
+                | E::Json
+                | E::Jsonb
+                | E::Enum => Ok(-1),
+            }
+        }
         ColumnType::Varchar(None)
         | ColumnType::Text
         | ColumnType::SmallInt
@@ -962,7 +1003,6 @@ fn scalar_type_modifier(ty: &engine::catalog::ColumnType) -> Result<i32, EncodeE
         | ColumnType::Int8Vec(_)
         | ColumnType::SparseVec(_)
         | ColumnType::Enum(_)
-        | ColumnType::Array(_)
         | ColumnType::Json
         | ColumnType::Jsonb
         | ColumnType::Numeric { .. }
@@ -1083,6 +1123,8 @@ fn array_wire_type(elem: engine::catalog::ArrayElemType) -> WireType {
         E::Bytea => WireType::ByteaArray,
         E::Json => WireType::JsonArray,
         E::Jsonb => WireType::JsonbArray,
+        E::Varchar(_) => WireType::VarcharArray,
+        E::Bpchar(_) => WireType::BpcharArray,
         E::Enum => WireType::Text,
     }
 }
@@ -2881,7 +2923,7 @@ mod tests {
     /// 保証はマクロが担う）。
     #[test]
     fn wire_type_all_is_exhaustive() {
-        assert_eq!(WireType::ALL.len(), 35);
+        assert_eq!(WireType::ALL.len(), 37);
     }
 
     /// Parse の宣言 OID 写像（Issue #2436・WIRE-24 ポインタ）: 全 variant が OID から
@@ -2907,7 +2949,7 @@ mod tests {
     /// そのものを外部オラクルで検証する（WIRE-13・TASK-200・Issue #895）。
     #[test]
     fn wire_type_table_matches_postgres_builtin_catalog() {
-        let expected: [(WireType, i32, i16, &str); 35] = [
+        let expected: [(WireType, i32, i16, &str); 37] = [
             (WireType::Numeric, 1700, -1, "numeric"),
             (WireType::Text, 25, -1, "text"),
             (WireType::Varchar, 1043, -1, "varchar"),
@@ -2941,6 +2983,8 @@ mod tests {
             (WireType::ByteaArray, 1001, -1, "_bytea"),
             (WireType::JsonArray, 199, -1, "_json"),
             (WireType::JsonbArray, 3807, -1, "_jsonb"),
+            (WireType::VarcharArray, 1015, -1, "_varchar"),
+            (WireType::BpcharArray, 1014, -1, "_bpchar"),
             (WireType::Record, 2249, -1, "record"),
             (WireType::RecordArray, 2287, -1, "_record"),
         ];
@@ -3001,6 +3045,8 @@ mod tests {
                 E::Bytea => (1001, "_bytea"),
                 E::Json => (199, "_json"),
                 E::Jsonb => (3807, "_jsonb"),
+                E::Varchar(_) => (1015, "_varchar"),
+                E::Bpchar(_) => (1014, "_bpchar"),
                 // ENUM[] は語彙を公告できないため text として公告する。
                 E::Enum => (25, "text"),
             };

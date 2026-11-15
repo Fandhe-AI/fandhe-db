@@ -1124,6 +1124,8 @@ fn array_elem_lacks_equality(elem: crate::catalog::ArrayElemType) -> bool {
     match elem {
         E::Json => true,
         E::Text
+        | E::Varchar(_)
+        | E::Bpchar(_)
         | E::Bool
         | E::Integer
         | E::BigInt

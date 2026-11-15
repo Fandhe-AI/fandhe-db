@@ -268,7 +268,12 @@ pub fn array_literal_text(
         }
         match (array_ty.elem(), item) {
             (_, JsonValue::Null) => push_array_element(&mut out, "NULL", false),
-            (ArrayElemType::Text, JsonValue::String(s)) => push_array_element(&mut out, s, true),
+            // `VARCHAR(n)`／`CHAR(n)` 要素の長さ検査・空白詰めは engine の配列リテラル束縛が担う
+            // （Issue #3231）。ここは構文を壊さないよう必ず引用する。
+            (
+                ArrayElemType::Text | ArrayElemType::Varchar(_) | ArrayElemType::Bpchar(_),
+                JsonValue::String(s),
+            ) => push_array_element(&mut out, s, true),
             (ArrayElemType::Bool, JsonValue::Bool(b)) => {
                 push_array_element(&mut out, if *b { "true" } else { "false" }, true)
             }
@@ -322,7 +327,7 @@ pub fn array_literal_text(
                     "ARRAY column element must be a JSON string",
                 ))
             }
-            (ArrayElemType::Text, _) => {
+            (ArrayElemType::Text | ArrayElemType::Varchar(_) | ArrayElemType::Bpchar(_), _) => {
                 return Err(TypedJsonError::TypeMismatch(
                     "ARRAY column element must be a JSON string",
                 ))
@@ -804,6 +809,30 @@ mod tests {
         ];
         let text = array_literal_text(&items, &array_ty).expect("ok");
         assert_eq!(text, r#"{"a\"b\\c","plain"}"#);
+    }
+
+    /// Issue #3231: `VARCHAR(n)`／`CHAR(n)` 要素も TEXT と同じく必ず引用し、JSON 文字列以外は
+    /// 拒否する（長さ検査・空白詰めは engine の配列リテラル束縛が担う）。
+    #[test]
+    fn array_literal_text_handles_varchar_and_char_elements() {
+        for elem in [
+            ArrayElemType::Varchar(None),
+            ArrayElemType::Varchar(Some(3)),
+            ArrayElemType::Bpchar(3),
+        ] {
+            let array_ty = ArrayType::new(elem, 8).expect("valid array type");
+            let items = vec![JsonValue::String("a\"b".to_string()), JsonValue::Null];
+            assert_eq!(
+                array_literal_text(&items, &array_ty).expect("ok"),
+                r#"{"a\"b",NULL}"#,
+                "{elem:?}"
+            );
+            let bad = vec![JsonValue::Bool(true)];
+            assert!(matches!(
+                array_literal_text(&bad, &array_ty),
+                Err(TypedJsonError::TypeMismatch(_))
+            ));
+        }
     }
 
     #[test]

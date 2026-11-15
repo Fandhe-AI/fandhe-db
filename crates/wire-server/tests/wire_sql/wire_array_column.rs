@@ -554,3 +554,79 @@ fn wire_all_existing_array_elem_types_roundtrip_with_oids_and_tenant_isolation()
     assert_eq!(read_command_complete(&mut bob), "SELECT 0");
     read_ready_for_query(&mut bob);
 }
+
+/// Issue #3231: `VARCHAR[]`・`VARCHAR(n)[]`・`CHAR(n)[]` 列は末尾 `;` 付きの単独簡易クエリ
+/// （psql と同じ送り方）で往復し、`RowDescription` が OID 1015（`_varchar`）／1014（`_bpchar`）と
+/// typmod（`n + 4`。長さなしは -1）を公告する。要素の長さ検査（`22001`）・`CHAR(n)` の空白詰めは
+/// engine の規則どおりで、別テナントには行が見えない（TABLE-14・TABLE-31・WIRE-13）。
+#[test]
+fn wire_varchar_and_char_arrays_advertise_oids_and_typmods() {
+    let path = temp_db::unique_db_path("wire-array-char-elems");
+    let _guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    let array = |elem| ColumnType::Array(ArrayType::new(elem, 4).expect("array ty"));
+    storage
+        .create_table(&TableSchema::new(
+            "chars",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("v3", array(ArrayElemType::Varchar(Some(3))), true),
+                ColumnDef::new("vn", array(ArrayElemType::Varchar(None)), true),
+                ColumnDef::new("c3", array(ArrayElemType::Bpchar(3)), true),
+            ],
+        ))
+        .expect("create table");
+    let core = Arc::new(EngineCore::from_storage(
+        storage,
+        Box::new(CpuScalarProvider),
+    ));
+    let addrs = spawn_with_users(
+        core,
+        &[
+            ("alice", "tenant-alice", "pw-alice"),
+            ("bob", "tenant-bob", "pw-bob"),
+        ],
+    );
+    let select = "SELECT v3, vn, c3 FROM chars WHERE id = 1 LIMIT 1;";
+
+    let mut alice = authenticate_to_ready_for_query(addrs[0], "alice", "pw-alice");
+    send_simple_query(
+        &mut alice,
+        "INSERT INTO chars (id, embedding, v3, vn, c3) VALUES (1, '[0.1,0.2]', '{abc,NULL}', '{a long value}', '{ab}') USING OPERATION_ID 'op-c1';",
+    );
+    assert_eq!(read_command_complete(&mut alice), "INSERT 0 1");
+    read_ready_for_query(&mut alice);
+
+    // 要素が長さを超える INSERT は 22001。値は文言へ反射しない。
+    send_simple_query(
+        &mut alice,
+        "INSERT INTO chars (id, embedding, v3) VALUES (2, '[0.1,0.2]', '{abcd}') USING OPERATION_ID 'op-c2';",
+    );
+    expect_error_response_with_sqlstate(&mut alice, "22001");
+    read_ready_for_query(&mut alice);
+
+    send_simple_query(&mut alice, select);
+    let cols = read_row_description_with_typmods(&mut alice);
+    assert_eq!(
+        cols,
+        vec![
+            ("v3".to_string(), 1015, -1, 7),
+            ("vn".to_string(), 1015, -1, -1),
+            ("c3".to_string(), 1014, -1, 7),
+        ]
+    );
+    let row = read_data_row(&mut alice);
+    assert_eq!(row[0].as_deref(), Some("{abc,NULL}"));
+    assert_eq!(row[1].as_deref(), Some(r#"{"a long value"}"#));
+    assert_eq!(row[2].as_deref(), Some(r#"{"ab "}"#));
+    let _ = read_command_complete(&mut alice);
+    read_ready_for_query(&mut alice);
+
+    // 別テナントは同じ公告を見るが行は見えない。
+    let mut bob = authenticate_to_ready_for_query(addrs[0], "bob", "pw-bob");
+    send_simple_query(&mut bob, select);
+    let cols_bob = read_row_description_with_typmods(&mut bob);
+    assert_eq!(cols_bob, cols);
+    assert_eq!(read_command_complete(&mut bob), "SELECT 0");
+    read_ready_for_query(&mut bob);
+}

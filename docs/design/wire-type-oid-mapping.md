@@ -29,7 +29,7 @@ float／日付／バイナリ／UUID／JSON 列をネイティブ型へ復元で
 | `Id` | `Numeric` | 1700 | -1 | `numeric` |
 | `Text` | `Text` | 25 | -1 | `text` |
 | `Vector(_)`／`Enum(_)`／`Array(<ENUM>)`／`Computed{ty: None}`（ベクトル式など型なしの式列） | `Text` | 25 | -1 | `text` |
-| `Array(<要素型>)`（次元数は無関係。Issue #1606・TABLE-35） | `TextArray`／`BoolArray`／`Int4Array`／`Int8Array`／`Float4Array`／`Float8Array`／`DateArray`／`TimestampArray`／`UuidArray`／`NumericArray`／`ByteaArray`／`JsonArray`／`JsonbArray` | 1009／1000／1007／1016／1021／1022／1182／1115／2951／1231／1001／199／3807 | -1 | `_text`／`_bool`／`_int4`／`_int8`／`_float4`／`_float8`／`_date`／`_timestamp`／`_uuid`／`_numeric`／`_bytea`／`_json`／`_jsonb` |
+| `Array(<要素型>)`（次元数は無関係。Issue #1606・TABLE-35） | `TextArray`／`BoolArray`／`Int4Array`／`Int8Array`／`Float4Array`／`Float8Array`／`DateArray`／`TimestampArray`／`UuidArray`／`NumericArray`／`ByteaArray`／`JsonArray`／`JsonbArray`／`VarcharArray`／`BpcharArray` | 1009／1000／1007／1016／1021／1022／1182／1115／2951／1231／1001／199／3807／1015／1014 | -1（`VARCHAR(n)[]`・`CHAR(n)[]` は `n + 4`。Issue #3231） | `_text`／`_bool`／`_int4`／`_int8`／`_float4`／`_float8`／`_date`／`_timestamp`／`_uuid`／`_numeric`／`_bytea`／`_json`／`_jsonb`／`_varchar`／`_bpchar` |
 | `Computed{ty: Some(t)}` | `t` の写像と同じ（Issue #1173。下記「集計・式列の型」参照） | — | — | — |
 | `SmallInt` | `Int2` | 21 | 2 | `int2`（Issue #1561・TABLE-30） |
 | `Integer` | `Int4` | 23 | 4 | `int4` |

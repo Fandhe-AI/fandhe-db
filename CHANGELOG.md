@@ -9,6 +9,8 @@
 
 ### Changed
 
+- `VARCHAR[]`・`VARCHAR(n)[]`・`CHAR(n)[]` を配列要素型として受理するようにした（Issue #3231・TABLE-14・TABLE-31・TABLE-35 ポインタ。判断は [array-column-type.md](docs/design/array-column-type.md) の「Issue #3231 追記」）。CREATE TABLE・ADD COLUMN・INSERT・UPDATE・SELECT・配列リテラル・`ARRAY[...]`・添字・CAST・比較が通り、要素ごとの長さ検査（超過は `22001`・末尾空白のみの超過は切り詰め・`CHAR(n)` は空白詰め。明示 CAST は黙って切り詰め）はスカラーの `VARCHAR(n)`・`CHAR(n)` と同じ。wire の `RowDescription` は OID 1015（`_varchar`）・1014（`_bpchar`）と typmod（`n + 4`。長さなしは -1）を公告する。**挙動の変更**: これまで `0A000` で拒否していた `VARCHAR[]` 系の宣言・CAST を受理する。長さなしの `CHAR[]` は従来どおり `0A000`。既存の配列型の永続バイト列・一意キー・OID は変えない。
+  BREAKING CHANGE: 公開 enum `catalog::ArrayElemType`（`#[non_exhaustive]` ではない）に variant `Varchar(Option<u32>)`・`Bpchar(u32)` を追加した（網羅 `match` の下流はコンパイルできなくなる。移行は腕の追加）。`ArrayElemType::ALL_KINDS` の要素数は 14 から 16 になる。
 - `RETURNING` がスカラー式と組み込み関数を評価するようにした（Issue #3249・SQL-21 ポインタ。基表への INSERT・UPDATE・DELETE・UPSERT。判断は [sql-returning.md](docs/design/sql-returning.md) の「式・組み込み関数の評価」節）。結果の型・値・列名は同じ式の `SELECT` と一致する。UDF 呼び出し・サブクエリ・集計は従来どおり拒否し、採番列・`id` 省略の INSERT との組み合わせは `0A000` で拒否する。依存の追加はない。
   BREAKING CHANGE: 公開 enum `tenant::TenantWriteError`（`#[non_exhaustive]` ではない）に variant `ReturningExpressionFailed` を追加した（網羅 `match` の下流はコンパイルできなくなる。移行は腕の追加。内側の `SqlSurfaceError` をそのまま透過する）。
 - `RETURNING` が `AS` 別名付きの列参照を受理するようにした（Issue #3248・SQL-21 ポインタ。基表への INSERT・UPDATE・DELETE・UPSERT。判断は [sql-returning.md](docs/design/sql-returning.md) の追記節）。式と `AS` なしの暗黙の別名は従来どおり `42601`。**挙動の変更**: 拒否の文言を原因別に改め、「function-call items」を廃止した。公開 API の変更はない。依存の追加はない。

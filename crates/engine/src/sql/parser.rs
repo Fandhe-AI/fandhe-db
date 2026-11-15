@@ -1650,7 +1650,38 @@ fn convert_array_elements(
 
     const NAME: &str = "array element";
     match elem {
-        E::Text => Ok(ArrayValue::Text(raw_elements)),
+        E::Text | E::Varchar(None) => Ok(ArrayValue::Text(raw_elements)),
+        // `VARCHAR(n)[]`／`CHAR(n)[]`（Issue #3231）。代入（INSERT・UPDATE 等）は要素ごとに
+        // スカラー列と同じ規則（超過は `22001`・末尾空白のみの超過は切り詰め・`CHAR` は空白詰め）、
+        // 明示 CAST は `n` 文字へ黙って切り詰め（`CHAR` は空白詰め）。`CHAR(n)` の空白詰めによる
+        // 巨大確保は、要素数 × n を確保前に配列ペイロード上限で検査して `54000` にする。
+        E::Varchar(Some(n)) | E::Bpchar(n) => {
+            let pads = matches!(elem, E::Bpchar(_));
+            if pads
+                && (raw_elements.len() as u64).saturating_mul(u64::from(n))
+                    > u64::from(crate::row_codec::MAX_TEXT_FIELD_LEN)
+            {
+                return Err(SqlSurfaceError::payload_too_large(
+                    "array of character(n) elements exceeds the maximum array payload length",
+                ));
+            }
+            if cast_input {
+                let dst = if pads {
+                    crate::sql::cast_value::CastDst::Bpchar(n)
+                } else {
+                    crate::sql::cast_value::CastDst::Varchar(Some(n))
+                };
+                map_all(&raw_elements, |raw| {
+                    crate::sql::cast_value::apply_char_typmod(std::borrow::Cow::Borrowed(raw), dst)
+                        .map(std::borrow::Cow::into_owned)
+                })
+                .map(ArrayValue::Text)
+            } else {
+                let mut value = ArrayValue::Text(raw_elements);
+                crate::row_codec::normalize_char_array_value(array_ty, &mut value)?;
+                Ok(value)
+            }
+        }
         E::Bool => map_all(&raw_elements, |raw| {
             if raw.eq_ignore_ascii_case("true") || raw.eq_ignore_ascii_case("t") {
                 Ok(true)
@@ -9182,6 +9213,8 @@ fn resolve_array_agg_input(
             }
             // 比較・順序づけに支障のない要素型。要素型の追加時に判断を強制する（Issue #3229）。
             ArrayElemType::Text
+            | ArrayElemType::Varchar(_)
+            | ArrayElemType::Bpchar(_)
             | ArrayElemType::Bool
             | ArrayElemType::Integer
             | ArrayElemType::BigInt

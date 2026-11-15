@@ -335,7 +335,7 @@ fn unimplemented_conversions_are_rejected_not_evaluated() {
     // 配列への変換が評価されずに拒否されることを固定する。
     for expr in [
         "CAST('{1}' AS smallint[])",
-        "CAST(NULL AS character varying(3)[])",
+        "CAST(NULL AS time[])",
         "CAST(abs(i4) AS integer)",
         "CAST(abs(i4) AS text)",
         "CAST(id AS integer)",

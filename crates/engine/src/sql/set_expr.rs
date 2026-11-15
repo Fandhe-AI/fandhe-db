@@ -386,11 +386,14 @@ pub(crate) fn expr_value_to_column_value(
         },
         // 配列値（TABLE-35・Issue #1602）。束縛段が要素型を列に合わせ済みで、ここでは要素型の一致と
         // 要素数・フレーム長の上限を行ごとの評価結果に対して再検証する（`54000`。encode と同じ上限）。
-        ExprValue::Array(a) => match target_ty {
+        ExprValue::Array(mut a) => match target_ty {
             ColumnType::Array(at) => {
                 if !crate::row_codec::array_elem_kind_eq(a.elem(), at.elem()) {
                     return Err(internal());
                 }
+                // `VARCHAR(n)[]`／`CHAR(n)[]` 列への代入は要素ごとに切り詰め・空白詰め・
+                // `22001` 判定を行う（Issue #3231）。他の要素型では素通し。
+                crate::row_codec::normalize_char_array_value(at, &mut a)?;
                 if a.len() as u64 > u64::from(at.max_len()) {
                     return Err(SqlSurfaceError::payload_too_large(
                         "array element count exceeds the column limit",

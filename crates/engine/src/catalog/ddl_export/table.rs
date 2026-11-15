@@ -71,6 +71,9 @@ pub(super) fn render_column_type<E>(ty: &ColumnType) -> Result<String, SchemaDdl
                 (ArrayElemType::Bytea, _) => "BYTEA".to_string(),
                 (ArrayElemType::Json, _) => "JSON".to_string(),
                 (ArrayElemType::Jsonb, _) => "JSONB".to_string(),
+                (ArrayElemType::Varchar(None), _) => "VARCHAR".to_string(),
+                (ArrayElemType::Varchar(Some(n)), _) => format!("VARCHAR({n})"),
+                (ArrayElemType::Bpchar(n), _) => format!("CHAR({n})"),
             };
             // 要素数の上限 `[N]` は最初の次元にだけ付ける（構文上 `[N]` は全体で高々 1 個）。
             let mut s = format!("{elem}[{}]", a.max_len());
