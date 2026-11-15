@@ -792,6 +792,7 @@ fn user_column_exposed_as_id_binds_the_user_column_everywhere() {
 
 /// 入れ替え別名（`lang` と `body` を取り違える）での `ORDER BY`／`GROUP BY`／`DISTINCT`:
 /// 物理名へ書き換えたキーが生成投影の別名として再解決されず、公開名どおりの列で並ぶ。
+// tracked: #3261
 #[test]
 fn swapped_aliases_order_by_uses_the_public_column() {
     let (core, _g) = open_core("t41-swap-order");
@@ -843,12 +844,22 @@ fn swapped_aliases_order_by_uses_the_public_column() {
     );
     assert_eq!(r.rows[0].cells[0], Cell::Text("b1".into()));
     assert_eq!(r.rows.len(), 5);
+    // DISTINCT ON の整合した文は構文・先頭一致の検証を通過し、行を返す実行段が入るまで 0A000 で
+    // 拒否する（Issue #3260 で 42601 から具体的な分類へ更新。追跡は fn 直前の注記）。
     assert_eq!(
         q_code(
             &core,
             "SELECT DISTINCT ON (lang) lang, body FROM vs ORDER BY lang LIMIT 10"
         ),
-        "42601"
+        "0A000"
+    );
+    // 別名付きビュー上でも、利用者が書いた公開名どうしで先頭一致を比較する。
+    assert_eq!(
+        q_code(
+            &core,
+            "SELECT DISTINCT ON (lang) lang, body FROM vs ORDER BY body, lang LIMIT 10"
+        ),
+        "42P10"
     );
 }
 

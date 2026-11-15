@@ -50,6 +50,7 @@ mod sql_array_char_elements;
 mod sql_array_fn;
 mod sql_array_predicates;
 mod sql_binary_quantize;
+mod sql_bit_array;
 mod sql_bit_column;
 mod sql_bit_distance;
 mod sql_cast_datetime_json_misc;

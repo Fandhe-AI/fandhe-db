@@ -7226,6 +7226,11 @@ pub enum ArrayElemType {
     /// `TIME`（Issue #3232）。行内表現は 0 時起点のマイクロ秒 8 バイト LE（`Timestamp` と同形）。
     /// OID は別（`_time` = 1183）なので `Timestamp` へは丸めない。
     Time,
+    /// `BIT(n)`（Issue #3235・TABLE-14・TABLE-48）。`n` は `1..=`[`crate::bit_string::MAX_BIT_LENGTH`]。
+    /// 行内表現は要素ごとに固定幅 `ceil(n / 8)` バイト（MSB 先頭・詰め物ビットは 0。スカラー
+    /// `BitString` のバイト列と同じ）。OID は別（`_bit` = 1561）なので Text へは丸めない。
+    /// 長さなしの `BIT[]` は `BIT(1)[]`（スカラーと同じ）。`VARBIT[]`（OID 1563）は未対応。
+    Bit(u32),
 }
 
 impl ArrayElemType {
@@ -7233,7 +7238,7 @@ impl ArrayElemType {
     /// 往復・凍結テスト（engine／wire-server）が全種別を走査する唯一の入口。
     /// 要素型を足すときは [`ArrayElemType::kind_ordinal`] の網羅 match（コンパイルエラーで
     /// 気づける）と本定数の両方へ追加する。`Numeric` の代表値は検証を通る精度・位取り。
-    pub const ALL_KINDS: [ArrayElemType; 18] = [
+    pub const ALL_KINDS: [ArrayElemType; 19] = [
         ArrayElemType::Text,
         ArrayElemType::Bool,
         ArrayElemType::Integer,
@@ -7255,6 +7260,7 @@ impl ArrayElemType {
         ArrayElemType::Bpchar(10),
         ArrayElemType::SmallInt,
         ArrayElemType::Time,
+        ArrayElemType::Bit(4),
     ];
 
     /// 種別の序数（[`ArrayElemType::ALL_KINDS`] の添字）。ワイルドカード無しの網羅 match の
@@ -7281,6 +7287,7 @@ impl ArrayElemType {
             ArrayElemType::Bpchar(_) => 15,
             ArrayElemType::SmallInt => 16,
             ArrayElemType::Time => 17,
+            ArrayElemType::Bit(_) => 18,
         }
     }
 
@@ -7307,6 +7314,7 @@ impl ArrayElemType {
             ArrayElemType::Varchar(None) => "varchar",
             ArrayElemType::Varchar(Some(_)) => "varchar_n",
             ArrayElemType::Bpchar(_) => "bpchar",
+            ArrayElemType::Bit(_) => "bit",
             ArrayElemType::SmallInt => "smallint",
             ArrayElemType::Time => "time",
         }
@@ -7389,6 +7397,7 @@ impl ArrayType {
             ArrayElemType::Varchar(Some(n)) | ArrayElemType::Bpchar(n) => {
                 validate_char_type_length(n)?
             }
+            ArrayElemType::Bit(n) => validate_bit_type_length(n)?,
             ArrayElemType::Varchar(None)
             | ArrayElemType::Text
             | ArrayElemType::Bool
@@ -7484,7 +7493,10 @@ impl ArrayType {
                 format!("numeric,{precision},{scale},{}", self.max_len)
             }
             (ArrayElemType::Enum, Some(def)) => format!("enum,{},{}", def.name, self.max_len),
-            (ArrayElemType::Varchar(Some(n)) | ArrayElemType::Bpchar(n), _) => {
+            (
+                ArrayElemType::Varchar(Some(n)) | ArrayElemType::Bpchar(n) | ArrayElemType::Bit(n),
+                _,
+            ) => {
                 format!("{},{n},{}", self.elem.catalog_tag(), self.max_len)
             }
             // `Enum` で語彙が無い組は構築経路（`new_enum` のみ）で作れないが、従来どおり
@@ -7530,7 +7542,7 @@ fn parse_array_param(
     let elem_tag = fields.first().copied().unwrap_or("");
     let expected = match elem_tag {
         "numeric" => 4,
-        "enum" | "varchar_n" | "bpchar" => 3,
+        "enum" | "varchar_n" | "bpchar" | "bit" => 3,
         _ => 2,
     };
     // 末尾の `d<N>`（2 次元以上の宣言。Issue #1605）を先に切り離す。
@@ -7572,6 +7584,10 @@ fn parse_array_param(
         ("bpchar", [_, n, _]) => {
             let n = parse_char_length_param("bpchar", n)?;
             ArrayType::new(ArrayElemType::Bpchar(n), max_len)
+        }
+        ("bit", [_, n, _]) => {
+            let n = parse_bit_length_param(n)?;
+            ArrayType::new(ArrayElemType::Bit(n), max_len)
         }
         (other, _) => ArrayType::new(ArrayElemType::from_catalog_tag(other)?, max_len),
     }?;
@@ -8217,7 +8233,8 @@ fn is_text_framed_array_elem(elem: ArrayElemType) -> bool {
         | ArrayElemType::Varchar(_)
         | ArrayElemType::Bpchar(_)
         | ArrayElemType::SmallInt
-        | ArrayElemType::Time => false,
+        | ArrayElemType::Time
+        | ArrayElemType::Bit(_) => false,
     }
 }
 
@@ -9367,6 +9384,16 @@ fn parse_char_length_param(tag: &str, param: &str) -> Result<u32> {
         )));
     }
     Ok(n)
+}
+
+/// `BIT(n)` の n 検証（Issue #3235）。0 と [`crate::bit_string::MAX_BIT_LENGTH`] 超過を拒否する。
+fn validate_bit_type_length(n: u32) -> Result<()> {
+    if n == 0 || n > crate::bit_string::MAX_BIT_LENGTH {
+        return Err(CatalogError::Invalid(
+            "bit length parameter out of range".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// `bit(n)` のカタログ param を厳密に解釈する（Issue #2021）。`1..=MAX_BIT_LENGTH` の
@@ -21202,6 +21229,57 @@ mod tests {
         );
         let ts = ColumnType::Array(ArrayType::new(ArrayElemType::Timestamp, 4).expect("array ty"));
         assert_eq!(ts.catalog_fields(), ("array", "timestamp,4".to_string()));
+    }
+
+    /// Issue #3235: `BIT(n)` 要素の param は `bit,<n>,<max_len>`（2 次元は末尾 `d2`）で往復し、
+    /// 非正準の長さ・範囲外・フィールドの過不足・2 フィールドの `bit,<n>` は拒否する。
+    #[test]
+    fn array_bit_param_roundtrips_and_rejects_malformed() {
+        let one = ColumnType::Array(ArrayType::new(ArrayElemType::Bit(4), 8).expect("array ty"));
+        assert_eq!(one.catalog_fields(), ("array", "bit,4,8".to_string()));
+        assert_eq!(
+            ColumnType::from_catalog_fields("array", "bit,4,8", &mut array_resolver)
+                .expect("decode"),
+            one
+        );
+        let two = ColumnType::Array(
+            ArrayType::new(ArrayElemType::Bit(4), 8)
+                .and_then(|a| a.with_ndims(2))
+                .expect("array ty"),
+        );
+        assert_eq!(two.catalog_fields(), ("array", "bit,4,8,d2".to_string()));
+        assert_eq!(
+            ColumnType::from_catalog_fields("array", "bit,4,8,d2", &mut array_resolver)
+                .expect("decode 2d"),
+            two
+        );
+        let max = crate::bit_string::MAX_BIT_LENGTH;
+        let beyond = max + 1;
+        let max_ok = format!("bit,{max},8");
+        assert!(ColumnType::from_catalog_fields("array", &max_ok, &mut array_resolver).is_ok());
+        let too_long = format!("bit,{beyond},8");
+        for bad in [
+            "bit,04,8",  // 先頭ゼロ
+            "bit,0,8",   // 範囲外
+            "bit,4",     // max_len 欠落
+            "bit,8",     // 2 フィールド（スカラー bit の param 形）
+            "bit,4,8,1", // 余剰（`d<N>` でない）
+            "bit,4,08",  // max_len 非正準
+            "bit,-,8",   // 符号・非数字
+            "bit",       // 長さ・max_len 欠落
+            too_long.as_str(),
+        ] {
+            assert!(
+                matches!(
+                    ColumnType::from_catalog_fields("array", bad, &mut array_resolver),
+                    Err(CatalogError::Invalid(_))
+                ),
+                "param {bad:?} must be rejected"
+            );
+        }
+        assert_eq!(array_param_enum_name("bit,4,8").ok(), Some(None));
+        assert!(ArrayType::new(ArrayElemType::Bit(0), 8).is_err());
+        assert!(ArrayType::new(ArrayElemType::Bit(beyond), 8).is_err());
     }
 
     /// Issue #1605: 2 次元以上の宣言は param 末尾の `d<N>` で往復し、1 次元の param は従来の

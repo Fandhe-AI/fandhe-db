@@ -289,6 +289,11 @@ pub(super) fn bind_empty_array_as(target: &CastType) -> Result<BoundExpr, SqlSur
 
 /// 要素型に対応する式の型（添字の結果型）。
 fn elem_expr_type(elem: ArrayElemType) -> Result<ExprType, SqlSurfaceError> {
+    // `BIT(n)` 要素の添字は `bit` 値（Issue #3235）。スカラー BIT は cast-only のため比較・CAST は
+    // 後段で `0A000` になる。
+    if matches!(elem, ArrayElemType::Bit(_)) {
+        return Ok(ExprType::Bit);
+    }
     crate::sql::cast::elem_cast_type(elem)
         .and_then(|t| t.expr_type())
         .ok_or_else(|| unsupported("subscripting an array of this element type is not supported"))
@@ -352,7 +357,13 @@ pub(super) fn bind_subscript(
         ));
     }
     let (bound_base, base_ty) = bind_operand(base, env, node_budget)?;
+    let bit_elem = crate::sql::cast::bit_array_elem(&bound_base, env.schema());
     let elem = match source_cast_kind(base, &bound_base, base_ty, env.schema()) {
+        // `BIT(n)[]` は要素の CAST の型を持たず `SourceKind::Bit` になるため、`n` つきの要素型は
+        // 束縛済みの式から取る（Issue #3235）。
+        SourceKind::Bit if bit_elem.is_some() => bit_elem.ok_or_else(|| {
+            unsupported("subscripting an array of this element type is not supported")
+        })?,
         SourceKind::Array(Some(elem_ty)) => CastType::Array(Box::new(elem_ty))
             .array_elem_type()
             .ok_or_else(|| {

@@ -3,8 +3,8 @@
 //! production 経路（`EngineCore::execute_sql_in_session`）で、(1) 型がカタログへ永続化され再オープン後も
 //! 値ごと復元されること、(2) 文字列リテラル `'1010'` が「入力 → 格納 → 出力 → 再入力」で往復一致する
 //! こと、(3) INSERT・UPDATE SET・UPSERT・COPY FROM・列 DEFAULT の束縛が文字種違反を `22P02`、ビット数不一致を
-//! `22026` で拒否し副作用を残さないこと、(4) 型宣言の境界（`BIT(0)`・上限超過・`BIT VARYING`・`VARBIT`・配列）が
-//! 拒否されること、(5) 未解禁の機能（比較・並べ替え・集計・PK/UNIQUE・索引・CAST・`<~>`／`<%>`）が
+//! `22026` で拒否し副作用を残さないこと、(4) 型宣言の境界（`BIT(0)`・上限超過・`BIT VARYING`・`VARBIT`・その配列形）が
+//! 拒否されること（`BIT[]`・`BIT(n)[]` は Issue #3235 で受理）、(5) 未解禁の機能（比較・並べ替え・集計・PK/UNIQUE・索引・CAST・`<~>`／`<%>`）が
 //! fail-closed に拒否されること、(6) テナント境界が不変であることを固定する。距離カーネルへの接続は
 //! 後続 Issue の担当。
 
@@ -435,7 +435,7 @@ fn features_not_yet_enabled_are_rejected_fail_closed() {
     assert_eq!(values(&core, "SELECT id, v FROM t LIMIT 5").len(), 2);
 }
 
-/// 型宣言の境界: `BIT(0)`・上限超過は `22023`、`BIT VARYING`・`VARBIT`・配列は `0A000`、
+/// 型宣言の境界: `BIT(0)`・上限超過は `22023`、`BIT VARYING`・`VARBIT`・それらの配列は `0A000`、
 /// 先頭ゼロ・小数・符号・閉じ括弧の欠落は `42601`。
 #[test]
 fn type_declaration_boundaries() {
@@ -463,11 +463,16 @@ fn type_declaration_boundaries() {
             "CREATE TABLE a (id BIGINT PRIMARY KEY, v VARBIT(4))",
             "0A000",
         ),
+        // `VARBIT`／`BIT VARYING` の配列形はスカラーと同じく未対応のまま（`bit[]`・`bit(n)[]` は
+        // Issue #3235 で受理へ反転した。結合テストは `sql_bit_array`）。
         (
-            "CREATE TABLE a (id BIGINT PRIMARY KEY, v BIT(4)[])",
+            "CREATE TABLE a (id BIGINT PRIMARY KEY, v VARBIT[])",
             "0A000",
         ),
-        ("CREATE TABLE a (id BIGINT PRIMARY KEY, v BIT[])", "0A000"),
+        (
+            "CREATE TABLE a (id BIGINT PRIMARY KEY, v BIT VARYING(4)[])",
+            "0A000",
+        ),
         ("CREATE TABLE a (id BIGINT PRIMARY KEY, v BIT(04))", "42601"),
         (
             "CREATE TABLE a (id BIGINT PRIMARY KEY, v BIT(1.5))",
@@ -482,6 +487,11 @@ fn type_declaration_boundaries() {
     ok(
         &core,
         "CREATE TABLE ok_max (id BIGINT PRIMARY KEY, v BIT(33554392))",
+    );
+    // `BIT[]`・`BIT(n)[]` は専用の要素型として受理する（Issue #3235）。
+    ok(
+        &core,
+        "CREATE TABLE ba (id BIGINT PRIMARY KEY, v BIT(4)[], w BIT[])",
     );
     ok(&core, "CREATE TABLE b (id BIGINT PRIMARY KEY, v INTEGER)");
     assert_eq!(code(&core, "ALTER TABLE b ADD COLUMN w BIT(0)"), "22023");
