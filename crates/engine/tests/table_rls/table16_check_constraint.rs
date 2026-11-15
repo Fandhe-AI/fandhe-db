@@ -721,6 +721,128 @@ fn or_check_is_evaluated_per_row_regardless_of_other_tenants() {
     .expect("bob ok");
 }
 
+/// Issue #3246: IN／BETWEEN／IS NOT NULL／NOT の CHECK も書き込み行の列値だけを評価し、
+/// 別テナントの行・値・テナント名に影響されず、応答にも含めない（テナント境界）。
+#[test]
+fn extended_check_forms_are_evaluated_per_row_regardless_of_other_tenants() {
+    let (core, path) = new_core("check-3246-tenant");
+    let _guard = CleanupGuard(path);
+    let alice = ctx("alice");
+    let bob = ctx("bob");
+    let mut session = granted_session();
+    core.execute_sql_in_session_legacy(
+        &alice,
+        &mut session,
+        "CREATE TABLE docs (n INTEGER, s TEXT, \
+         CONSTRAINT n_in CHECK (n IN (1, 2, 3)), \
+         CONSTRAINT n_range CHECK (n BETWEEN 1 AND 9), \
+         CONSTRAINT s_req CHECK (s IS NOT NULL), \
+         CONSTRAINT n_not2 CHECK (NOT (n = 2)));",
+    )
+    .expect("create table");
+    sql_insert(
+        &core,
+        &alice,
+        "INSERT INTO docs (id, n, s) VALUES (1, 1, 'alice-secret') USING OPERATION_ID 'o1';",
+    )
+    .expect("alice ok");
+
+    // bob の同じ id の違反行は、他テナントの充足行の有無にかかわらず制約ごとに 23514。
+    for (op, values) in [("b-in", "(1, 4, 'x')"), ("b-not", "(1, 2, 'x')")] {
+        assert_eq!(
+            sql_insert(
+                &core,
+                &bob,
+                &format!("INSERT INTO docs (id, n, s) VALUES {values} USING OPERATION_ID '{op}';")
+            ),
+            Err("23514".to_string()),
+            "case {op}"
+        );
+    }
+    let err = core
+        .execute_insert_sql(
+            &bob,
+            "INSERT INTO docs (id, n) VALUES (1, 1) USING OPERATION_ID 'b-null';",
+        )
+        .expect_err("s IS NOT NULL must reject NULL");
+    assert_eq!(err.wire_code(), "23514");
+    let message = err.client_message();
+    assert!(message.contains("s_req"), "names the constraint: {message}");
+    for leaked in ["alice", "bob", "alice-secret"] {
+        assert!(
+            !message.contains(leaked),
+            "must not echo {leaked}: {message}"
+        );
+    }
+
+    sql_insert(
+        &core,
+        &bob,
+        "INSERT INTO docs (id, n, s) VALUES (1, 3, 'x') USING OPERATION_ID 'b-ok';",
+    )
+    .expect("bob ok");
+    // 違反した bob の書き込みの前後で alice 側の件数は不変。
+    assert_eq!(
+        select_count(&core, &alice, "SELECT id FROM docs WHERE n >= 0 LIMIT 100"),
+        1
+    );
+}
+
+/// intentional: docs/design/sql-check-constraint.md
+/// Issue #3246: RLS 述語名（`visible()`）を `OR`／`NOT` の内側へ紛れ込ませる CHECK は
+/// `42601` で拒否され、表は作られない（fail-closed。テナント境界のバイパス経路を作らない）。
+#[test]
+fn check_cannot_smuggle_rls_predicate_through_or_or_not() {
+    let (core, path) = new_core("check-3246-smuggle");
+    let _guard = CleanupGuard(path);
+    let alice = ctx("alice");
+    let mut session = granted_session();
+    for (i, check) in [
+        "CHECK (n > 0 OR visible())",
+        "CHECK (NOT (n = 0 OR visible()))",
+        "CHECK (NOT (visible()))",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let err = core
+            .execute_sql_in_session_legacy(
+                &alice,
+                &mut session,
+                &format!("CREATE TABLE smuggle{i} (n INTEGER, {check});"),
+            )
+            .expect_err("rls predicate in CHECK must be rejected");
+        assert_eq!(err.wire_code(), "42601", "case {check}");
+        // 副作用ゼロ: 表は作られていない。
+        let err = core
+            .execute_sql_in_session_legacy(
+                &alice,
+                &mut SessionState::default(),
+                &format!("SELECT id FROM smuggle{i} LIMIT 1"),
+            )
+            .expect_err("table must not exist");
+        assert_eq!(err.wire_code(), "42P01", "case {check}");
+    }
+}
+
+/// intentional: docs/design/sql-check-constraint.md
+/// Issue #3246: テナント列（`tenant_id`）を参照する CHECK は拒否される（列として存在しない）。
+#[test]
+fn check_referencing_tenant_column_is_rejected() {
+    let (core, path) = new_core("check-3246-tenant-col");
+    let _guard = CleanupGuard(path);
+    let alice = ctx("alice");
+    let mut session = granted_session();
+    let err = core
+        .execute_sql_in_session_legacy(
+            &alice,
+            &mut session,
+            "CREATE TABLE t_tenant (n INTEGER, CHECK (tenant_id = 'alice'));",
+        )
+        .expect_err("tenant column must not be referencable in CHECK");
+    assert_eq!(err.wire_code(), "42703");
+}
+
 // --- 単一行 INSERT --------------------------------------------------------
 
 #[test]
