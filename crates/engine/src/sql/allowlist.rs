@@ -3078,7 +3078,8 @@ pub enum WherePredicate {
     /// 生成する。不変条件は `lhs.len() == rhs.len()` かつ 2 以上 [`MAX_ROW_COMPARE_COMPONENTS`] 以下
     /// （成分 1 個の括弧は従来どおり式として扱い本 variant にしない）。評価（辞書式・三値論理。
     /// Issue #3256）は束縛段（`sql::parser::bind_where_predicates_recursive`）の入口で
-    /// `sql::row_compare` が既存の述語木へ展開する。ポリシー式など未対応の文脈は fail-closed で拒否する。否定は `where_negation` が演算子反転で押し下げる。
+    /// `sql::row_compare` が既存の述語木へ展開する。ポリシー式など未対応の文脈は
+    /// fail-closed で拒否する。否定は `where_negation` が演算子反転で押し下げる。
     ///
     /// **BREAKING CHANGE**: 本 variant の追加は非網羅的 `match` を破壊する
     /// （既存の破壊的変更運用を踏襲）。
@@ -18609,7 +18610,7 @@ fn check_view_body_pred_leaf(pred: &WherePredicate) -> Result<(), SqlSurfaceErro
         | WherePredicate::QuantifiedSubqueryCompare { .. }
         | WherePredicate::IdCompare { .. }
         | WherePredicate::CorrelatedExists(_)
-        // 行値比較はVIEW 本文での評価は未対応のため VIEW 本文では拒否する（tracked: #3254）。
+        // 行値比較は VIEW 本文での評価が未対応のため拒否する（tracked: #3254）。
         | WherePredicate::RowCompare { .. } => Err(rejected()),
     }
 }
