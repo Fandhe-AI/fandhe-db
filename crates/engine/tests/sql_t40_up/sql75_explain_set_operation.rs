@@ -120,6 +120,8 @@ fn each_operator_renders_its_token() {
         ("UNION DISTINCT", "union"),
         ("INTERSECT DISTINCT", "intersect"),
         ("EXCEPT", "except"),
+        ("EXCEPT ALL", "except_all"),
+        ("EXCEPT DISTINCT", "except"),
     ] {
         let sql = format!("EXPLAIN SELECT k FROM a {kw} SELECT k FROM b");
         let want = concat(vec![

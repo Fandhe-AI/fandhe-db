@@ -710,6 +710,8 @@ mod tests {
             "INTERSECT ALL",
             "INTERSECT DISTINCT",
             "EXCEPT",
+            "EXCEPT ALL",
+            "EXCEPT DISTINCT",
         ] {
             let sql = format!("SELECT id FROM documents {op} SELECT id FROM documents LIMIT 5");
             let inner = inner_of(&sql).unwrap_or_else(|e| panic!("{op} rejected: {e:?}"));

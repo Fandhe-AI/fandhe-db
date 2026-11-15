@@ -59,6 +59,7 @@ fn operator_token(op: SetOperator) -> &'static str {
         SetOperator::Intersect => "intersect",
         SetOperator::IntersectAll => "intersect_all",
         SetOperator::Except => "except",
+        SetOperator::ExceptAll => "except_all",
     }
 }
 
