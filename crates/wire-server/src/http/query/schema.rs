@@ -672,6 +672,9 @@ pub static HYBRID_WEIGHTS_SCHEMA: ObjectSchema = ObjectSchema {
 /// （Issue #1199・NOSQL-13。[`super::ddl`] 専用）。`filter` 配列の形検証は
 /// `http::query::filter` へ集約済み（Issue #1197）のため、CHECK の葉だけが
 /// 本スキーマで形を検査する。
+///
+/// Issue #3246 以降 DDL では使わない（`predicate` は `filter` の形検査段へ移行）。
+/// 公開 API 互換のため残置する。
 pub static CHECK_LEAF_SCHEMA: ObjectSchema = ObjectSchema {
     name: "check_leaf",
     fields: &[
@@ -1417,12 +1420,13 @@ pub static DDL_CONSTRAINT_SCHEMA: ObjectSchema = ObjectSchema {
             ty: FieldType::String,
             nullable: false,
         },
-        // `kind == "check"` 専用。`CHECK_LEAF_SCHEMA` 形の葉の配列（要素同士は
-        // AND 結合）。
+        // `kind == "check"` 専用。`filter` と同じ語彙の要素（葉・`or`・`not` 群）の
+        // 配列（要素同士は AND 結合）。要素の形は `http::query::filter` の形検査段が
+        // 判定するため、ここでは配列であることだけを要求する（Issue #3246）。
         FieldSpec {
             key: "predicate",
             presence: Presence::Optional,
-            ty: FieldType::Array(ElementType::Object(&CHECK_LEAF_SCHEMA)),
+            ty: FieldType::Array(ElementType::Any),
             nullable: false,
         },
     ],

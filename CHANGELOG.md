@@ -9,6 +9,7 @@
 
 ### Changed
 
+- NoSQL（HTTP）`create_table` の `constraints[].kind == "check"` が、`predicate` に `filter` と同じ語彙（`ne`・`like`・`in`・`between`・`is_null`・`not_null`・`or`・`not` 群）を受理するようにした（Issue #3246・TABLE-16・NOSQL-13 ポインタ。判断は [nosql-ddl-mapping.md](docs/design/nosql-ddl-mapping.md)）。**挙動の変更**: これまで `42601` で拒否していた `in`・`or` を受理する。TEXT 列の `between` などの列型違反は SQL 表層と同じ `wire_code`（`22000` 等）で拒否する。公開型のシグネチャの変更・依存の追加はない。
 - `VARCHAR[]`・`VARCHAR(n)[]`・`CHAR(n)[]` を配列要素型として受理するようにした（Issue #3231・TABLE-14・TABLE-31・TABLE-35 ポインタ。判断は [array-column-type.md](docs/design/array-column-type.md) の「Issue #3231 追記」）。CREATE TABLE・ADD COLUMN・INSERT・UPDATE・SELECT・配列リテラル・`ARRAY[...]`・添字・CAST・比較が通り、要素ごとの長さ検査（超過は `22001`・末尾空白のみの超過は切り詰め・`CHAR(n)` は空白詰め。明示 CAST は黙って切り詰め）はスカラーの `VARCHAR(n)`・`CHAR(n)` と同じ。wire の `RowDescription` は OID 1015（`_varchar`）・1014（`_bpchar`）と typmod（`n + 4`。長さなしは -1）を公告する。**挙動の変更**: これまで `0A000` で拒否していた `VARCHAR[]` 系の宣言・CAST を受理する。長さなしの `CHAR[]` は従来どおり `0A000`。既存の配列型の永続バイト列・一意キー・OID は変えない。
   BREAKING CHANGE: 公開 enum `catalog::ArrayElemType`（`#[non_exhaustive]` ではない）に variant `Varchar(Option<u32>)`・`Bpchar(u32)` を追加した（網羅 `match` の下流はコンパイルできなくなる。移行は腕の追加）。`ArrayElemType::ALL_KINDS` の要素数は 15 から 17 になる。
 - `RETURNING` がスカラー式と組み込み関数を評価するようにした（Issue #3249・SQL-21 ポインタ。基表への INSERT・UPDATE・DELETE・UPSERT。判断は [sql-returning.md](docs/design/sql-returning.md) の「式・組み込み関数の評価」節）。結果の型・値・列名は同じ式の `SELECT` と一致する。UDF 呼び出し・サブクエリ・集計は従来どおり拒否し、採番列・`id` 省略の INSERT との組み合わせは `0A000` で拒否する。依存の追加はない。
